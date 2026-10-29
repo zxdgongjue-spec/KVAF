@@ -39,6 +39,9 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       : link_(std::move(link)) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
+  void SetAdditionalCandidates(std::vector<std::uint32_t> candidates) {
+    additional_candidates_ = std::move(candidates);
+  }
   bool has_allocation() const { return allocated_.base != 0U; }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
@@ -50,6 +53,14 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
     Status status = link_->AllocateRegion(request.ddr_bytes, request.slot_size, candidate_id_, &allocated_);
     if (!status.ok()) return status;
+    for (const auto candidate : additional_candidates_) {
+      status = link_->RegisterRegionPath(allocated_.base, request.slot_size, candidate);
+      if (!status.ok()) {
+        const Status released = link_->ReleaseRegion(allocated_.base);
+        if (released.ok()) allocated_ = {};
+        return released.ok() ? status : released;
+      }
+    }
     *region = RemoteRegionDesc{allocated_.base, allocated_.length, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
   }
@@ -66,6 +77,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
  private:
   std::shared_ptr<peer::PeerLink> link_;
   std::uint32_t candidate_id_{0U};
+  std::vector<std::uint32_t> additional_candidates_;
   peer::PeerRegion allocated_{};
 };
 
@@ -473,6 +485,10 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
        impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
       impl_->options.batch_get_token_bytes == 0U ||
       impl_->options.batch_get_tokens_per_block == 0U ||
+      (!impl_->options.peer_eids.empty() &&
+       (impl_->options.npu_eids.size() != 1U || impl_->options.adaptive_ub_device ||
+        !impl_->options.peer_ub_device.empty() ||
+        impl_->options.peer_eids.size() > impl_->options.jettys_per_core)) ||
       (impl_->options.adaptive_ub_device &&
        !impl_->options.peer_ub_device.empty()) ||
       (impl_->options.adaptive_ub_device &&
@@ -554,6 +570,35 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
         "npu_eids count exceeds npu_core_count * jettys_per_core workers");
   }
   const bool fixed_peer_device = !impl_->options.peer_ub_device.empty();
+  std::vector<std::uint32_t> strict_peer_candidates;
+  if (!impl_->options.peer_eids.empty()) {
+    std::vector<std::array<std::uint8_t, peer::kEidBytes>> requested;
+    for (const auto& text : impl_->options.peer_eids) {
+      std::array<std::uint8_t, peer::kEidBytes> eid{};
+      if (!ParseEid(text, &eid) ||
+          std::all_of(eid.begin(), eid.end(), [](uint8_t b) { return b == 0U; }) ||
+          std::find(requested.begin(), requested.end(), eid) != requested.end()) {
+        return Status::InvalidArgument("peer_eids must contain unique nonzero 32-digit hex EIDs");
+      }
+      requested.push_back(eid);
+      bool found = false;
+      for (std::uint32_t id = 0U; id < candidate_count; ++id) {
+        peer::PeerCandidateInfo info{};
+        last = impl_->peer_link->GetCandidateInfo(id, &info);
+        if (!last.ok()) return last;
+        if (info.eid != eid) continue;
+        if (found) return Status::InvalidArgument("peer EID is advertised by multiple candidates: " + text);
+        found = true;
+        strict_peer_candidates.push_back(id);
+        std::fprintf(stderr, "[KVAF_AIV] PEER_EID_SELECTED path=%zu candidate=%u ub_device=%s eid=%s\n",
+                     requested.size() - 1U, id, info.device_name.c_str(), EidToHex(eid).c_str());
+      }
+      if (!found) return Status::NotFound("CPU service did not advertise requested peer EID " + text);
+    }
+    impl_->peer_allocator->SetAdditionalCandidates(
+        std::vector<std::uint32_t>(strict_peer_candidates.begin() + 1,
+                                   strict_peer_candidates.end()));
+  }
   const bool has_n_side_allowlist =
       !impl_->options.adaptive_peer_ub_devices.empty();
   const bool tune_candidates = impl_->options.adaptive_ub_device &&
@@ -723,6 +768,13 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::OK();
   };
   if (!tune_candidates) {
+    if (!strict_peer_candidates.empty()) {
+      last = initialize_candidate(
+          detail::StartupCandidate{strict_peer_candidates.front(), 0U}, false, nullptr);
+      if (last.ok()) return last;
+      const Status released = cleanup();
+      return released.ok() ? last : released;
+    }
     for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
          ++peer_candidate) {
       if (fixed_peer_device && !peer_candidate_allowed[peer_candidate]) continue;

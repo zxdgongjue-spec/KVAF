@@ -468,6 +468,7 @@ struct Region {
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
+  std::shared_ptr<void> memory_owner;
   uint64_t bytes = 0U;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
@@ -511,11 +512,12 @@ class CpuService {
     response->eid_index = candidate.eid_index;
     std::memcpy(response->device_name, candidate.device_name.c_str(),
                 candidate.device_name.size());
+    std::memcpy(response->eid, candidate.eid.data(), candidate.eid.size());
     return Result::kOk;
   }
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
-                  AllocateRegionResponse* response) {
+                  AllocateRegionResponse* response, uint64_t shared_session_id) {
     if (response == nullptr || bytes == 0U || slot_size == 0U || bytes % slot_size != 0U ||
         bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
@@ -528,8 +530,16 @@ class CpuService {
     region->candidate_id = candidate_id;
     region->resources = resources;
     region->bytes = bytes;
-    if (!AllocateMemory(region.get())) {
-      return Result::kResourceError;
+    if (shared_session_id != 0U) {
+      const auto source = regions_.find(shared_session_id);
+      if (source == regions_.end() || source->second->bytes != bytes) {
+        return Result::kInvalidRequest;
+      }
+      region->memory_owner = source->second->memory_owner;
+      region->memory = region->memory_owner.get();
+    } else {
+      if (!AllocateMemory(region.get())) return Result::kResourceError;
+      region->memory_owner = std::shared_ptr<void>(region->memory, std::free);
     }
     region->token_value = NextToken();
     region->token_id = urma_alloc_token_id(resources->context());
@@ -807,7 +817,7 @@ class CpuService {
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
-      free(region->memory);
+      region->memory_owner.reset();
       region->memory = nullptr;
     }
   }
@@ -857,7 +867,8 @@ void HandleClient(int fd, CpuService* service) {
       response.header = MakeHeader(command, sizeof(response));
       response.header.command = ResponseCommand(command);
       response.result = static_cast<int32_t>(
-          service->Allocate(request.ddr_bytes, request.slot_size, request.candidate_id, &response));
+          service->Allocate(request.ddr_bytes, request.slot_size, request.candidate_id,
+                            &response, request.shared_session_id));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }

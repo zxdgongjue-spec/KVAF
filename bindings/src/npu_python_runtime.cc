@@ -221,7 +221,8 @@ class NpuPythonRuntime final {
                    std::uint32_t adaptive_ub_miss_count,
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
-                   std::uint32_t batch_get_max_inflight_total) {
+                   std::uint32_t batch_get_max_inflight_total,
+                   std::vector<std::string> peer_eids) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -232,6 +233,7 @@ class NpuPythonRuntime final {
     options.jettys_per_core = jettys_per_core;
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
+    options.peer_eids = std::move(peer_eids);
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
@@ -545,7 +547,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>, std::uint32_t>(),
+                    std::string, std::vector<std::string>, std::uint32_t,
+                    std::vector<std::string>>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -558,7 +561,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("peer_ub_device") = "",
            py::arg("adaptive_peer_ub_devices") =
                std::vector<std::string>{},
-           py::arg("batch_get_max_inflight_total") = 2048)
+           py::arg("batch_get_max_inflight_total") = 2048,
+           py::arg("peer_eids") = std::vector<std::string>{})
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

@@ -19,6 +19,13 @@ add_test(NAME kvaf_batch_get_inflight_config_python
 add_test(NAME kvaf_batch_get_jetty_profile_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_jetty_profile.py")
+add_test(NAME kvaf_peer_eid_sweep_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_peer_eid_sweep.py")
+add_executable(kvaf_peer_link_test peer_link_test.cc)
+target_link_libraries(kvaf_peer_link_test PRIVATE kvaf_peer_link)
+add_test(NAME kvaf_peer_link_test COMMAND kvaf_peer_link_test)
+set_tests_properties(kvaf_peer_link_test PROPERTIES TIMEOUT 20)
 
 add_test(
   NAME kvaf_npu_eid_parser_python

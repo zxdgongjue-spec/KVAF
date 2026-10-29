@@ -46,6 +46,10 @@ struct NpuRuntimeOptions {
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};
+  // Strict CPU EIDs, striped across Jettys in ONE BatchGet kernel. Requires
+  // one explicit local NPU EID and at least one Jetty per peer on each core.
+  // All peers register the same DDR backing; BatchPut uses the first peer.
+  std::vector<std::string> peer_eids{};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and

@@ -38,7 +38,7 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
-adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
+adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048, peer_eids=[])`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
@@ -73,3 +73,10 @@ CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
 K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用于跨进程复用
 选择结果且不重新标定。默认关闭；用法与协议升级要求见
 [Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。
+
+`peer_eids=["CPU_EID_0", "CPU_EID_1"]` 严格选择远端 CPU EID，要求
+`npu_eids` 恰好指定一个本地 EID，且每 core 的 Jetty 数不少于远端 EID 数。
+它与 `adaptive_ub_device`、`peer_ub_device` 互斥。CPU 对同一 DDR 分配建立
+多个设备注册；BatchPut 写第一条路径，BatchGet 在同一次 kernel 中按
+`jetty_slot % len(peer_eids)` 分流。用法及测量口径见
+[双 CPU EID 并发测试](../docs/peer_eid_contention.md)。

@@ -101,7 +101,7 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 656B token、128 tokens-per-block、2 个 AIV core、每 core 2 个 Jetty、1 次预热和
 5 次采样所得 `useful_GiBps` 最高者为最佳设备。K 端指定单个 `--ub-device` 时走原生
 路径；后续正式 shape 均复用选择结果。完整校准日志写入 `ub_device_selection.log`，CSV
-的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v6。
+的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v7。
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
@@ -341,3 +341,7 @@ Jetty 数量可通过
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
 这项控制面性能数据。
+
+双 CPU EID 的单 kernel 并发测试见
+[双 CPU EID 并发测试](../docs/peer_eid_contention.md)。服务默认枚举全部候选，
+由 NPU 的 `peer_eids` 精确选择；同一 DDR 分配可注册到多个 CPU UB device。

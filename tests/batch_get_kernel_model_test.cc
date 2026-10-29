@@ -29,10 +29,13 @@ struct Queue {
   std::vector<uint64_t> observations;
   uint64_t delay_cycles = 0, posts = 0;
   uint32_t local_token_id = 1;
+  uint32_t remote_token_id = 0, remote_token_value = 0;
+  std::array<uint32_t, 4> remote_eid{};
   bool timeout = false, error = false;
 };
 std::vector<Queue> hardware;
 uint64_t doorbells = 0;
+uint32_t require_posts_before_poll = 0;
 
 void Doorbell(uint32_t value, uint32_t* address) {
   for (auto& queue : hardware) {
@@ -53,6 +56,9 @@ void Doorbell(uint32_t value, uint32_t* address) {
       const uint64_t pi = queue.producer++;
       const uint32_t* wqe = queue.sq.data() + (pi % 32768) * 16;
       CHECK(wqe[13] == queue.local_token_id);
+      CHECK(wqe[3] == queue.remote_token_id);
+      CHECK(wqe[8] == queue.remote_token_value);
+      for (uint32_t word = 0; word < 4; ++word) CHECK(wqe[4 + word] == queue.remote_eid[word]);
       CHECK((wqe[0] >> 31U) == 1U - ((pi / 32768) & 1U));
       const bool signal = (wqe[0] & (1U << 21U)) != 0;
       CHECK(((wqe[0] >> 16U) & 3U) == (signal ? 2U : 1U));
@@ -72,6 +78,12 @@ void Poll(void* address) {
   for (auto& queue : hardware) {
     const auto begin = reinterpret_cast<uintptr_t>(queue.cq.data());
     if (probe < begin || probe >= begin + sizeof(queue.cq)) continue;
+    if (require_posts_before_poll != 0U) {
+      for (uint32_t lane = 0; lane < require_posts_before_poll; ++lane) {
+        CHECK(hardware[lane].posts > 0U);
+      }
+      require_posts_before_poll = 0U;
+    }
     // Completion readiness is independent of which Jetty the kernel polls.
     // Publish a ready CQE when observed; this does not model DMA timing.
     if (queue.timeout || queue.checkpoints.empty() ||
@@ -115,6 +127,7 @@ struct Fixture {
         indices(count), offsets(count), rows(count), queues(c * j),
         entities(c * j), statuses(c) {
     aiv_model::hardware.clear();
+    aiv_model::require_posts_before_poll = 0;
     aiv_model::hardware.resize(c * j);
     for (uint32_t i = 0; i < remote.size(); ++i) remote[i] = (i * 7 + 1) % 251;
     for (uint32_t i = 0; i < 16; ++i) {
@@ -245,6 +258,25 @@ struct Fixture {
 };
 
 int main() {
+  for (bool profiling : {false, true}) {
+    Fixture f(8192, 1, 4, 2048);
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      auto& entity = f.entities[lane];
+      auto& queue = aiv_model::hardware[lane];
+      const uint32_t path = lane % 2;
+      entity.eid_path = path;
+      entity.remote_token_id = queue.remote_token_id = 0x101U + path;
+      entity.remote_token_value = queue.remote_token_value = 0x321U + path;
+      entity.local_token_value = 0x456U + path;
+      queue.remote_eid = {path + 1U, 2U, 3U, 4U};
+      std::memcpy(entity.remote_eid, queue.remote_eid.data(), 16);
+    }
+    if (!profiling) f.statuses[0].profile.magic = 0;
+    aiv_model::require_posts_before_poll = 4;
+    f.Run(8192);  // every route must be posted before the first CQ poll
+    CHECK(aiv_model::require_posts_before_poll == 0U);
+    for (const auto& queue : aiv_model::hardware) CHECK(queue.producer == 2048);
+  }
   for (bool profiling : {false, true}) {
     // Reproduce one core striped across two independently registered EID
     // contexts. The tokens are from the failing hardware preflight log.

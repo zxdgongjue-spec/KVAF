@@ -170,6 +170,7 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
   candidate.candidate_id = response.candidate_id;
   candidate.device_id = response.device_id;
   candidate.eid_index = response.eid_index;
+  std::memcpy(candidate.eid.data(), response.eid, candidate.eid.size());
   candidate.device_name.assign(
       response.device_name,
       static_cast<const char*>(name_end) - response.device_name);
@@ -178,7 +179,8 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
 }
 
 bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t slot_size,
-                      uint32_t candidate_id, PeerRegion* region, std::string* error) {
+                      uint32_t candidate_id, PeerRegion* region, std::string* error,
+                      uint64_t shared_session_id = 0U) {
   if (region == nullptr || ddr_bytes == 0U || slot_size == 0U ||
       ddr_bytes % slot_size != 0U) {
     SetError(error, "invalid peer region allocation request");
@@ -189,6 +191,7 @@ bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t 
   request.ddr_bytes = ddr_bytes;
   request.slot_size = slot_size;
   request.candidate_id = candidate_id;
+  request.shared_session_id = shared_session_id;
   AllocateRegionResponse response{};
   if (!Exchange(endpoint, request, &response, error) ||
       !IsValidResponseHeader(response.header, Command::kAllocateRegion, sizeof(response)) ||
@@ -296,7 +299,7 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
   if (!AllocateRegionAt(address_, ddr_bytes, slot_size, candidate_id, &allocated, &error)) {
     return ToStatus("peer DDR allocation failed", std::move(error));
   }
-  regions_[allocated.base] = allocated;
+  regions_[allocated.base] = {allocated};
   if (region != nullptr) *region = allocated;
   return Status::OK();
 }
@@ -305,18 +308,47 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
-  if (!ReleaseRegionAt(address_, found->second, &error)) {
-    return ToStatus("peer DDR release failed", std::move(error));
+  while (!found->second.empty()) {
+    if (!ReleaseRegionAt(address_, found->second.back(), &error)) {
+      return ToStatus("peer DDR release failed", std::move(error));
+    }
+    found->second.pop_back();
   }
   regions_.erase(found);
   return Status::OK();
 }
 
-Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
+Status PeerLink::RegisterRegionPath(uint64_t base, uint64_t slot_size,
+                                    uint32_t candidate_id) {
+  const auto found = regions_.find(base);
+  if (found == regions_.end() || found->second.empty()) {
+    return Status::NotFound("peer region was not found");
+  }
+  const PeerRegion& primary = found->second.front();
+  PeerRegion alias{};
+  std::string error;
+  if (!AllocateRegionAt(address_, primary.length, slot_size, candidate_id,
+                         &alias, &error, primary.session_id)) {
+    return ToStatus("peer DDR path registration failed", std::move(error));
+  }
+  // Retain even a bad descriptor so the caller can release every registration.
+  found->second.push_back(alias);
+  if (alias.base != base) return Status::Internal("shared DDR path changed base address");
+  return Status::OK();
+}
+
+uint32_t PeerLink::RegionPathCount(uint64_t base) const {
+  const auto found = regions_.find(base);
+  return found == regions_.end() ? 0U : static_cast<uint32_t>(found->second.size());
+}
+
+Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region, uint32_t path) const {
   if (region == nullptr) return Status::InvalidArgument("peer region output must not be null");
   const auto found = regions_.find(base);
-  if (found == regions_.end()) return Status::NotFound("peer region was not found");
-  *region = found->second;
+  if (found == regions_.end() || path >= found->second.size()) {
+    return Status::NotFound("peer region path was not found");
+  }
+  *region = found->second[path];
   return Status::OK();
 }
 
@@ -325,11 +357,13 @@ Status PeerLink::CreateChannel(
     uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
     uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
     std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
-    uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn) {
-  const auto found = regions_.find(region_base);
-  if (found == regions_.end()) return Status::NotFound("peer region was not found");
+    uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn,
+    uint32_t path) {
+  PeerRegion region{};
+  const Status lookup = LookupRegion(region_base, &region, path);
+  if (!lookup.ok()) return lookup;
   std::string error;
-  return CreateChannelAt(address_, found->second, local_qp_key, local_qp_key_bytes,
+  return CreateChannelAt(address_, region, local_qp_key, local_qp_key_bytes,
                          local_eid, peer_token_value, local_tp_handle, local_psn,
                          peer_qp_key, peer_qp_key_bytes, peer_tp_handle, peer_psn, &error)
              ? Status::OK()

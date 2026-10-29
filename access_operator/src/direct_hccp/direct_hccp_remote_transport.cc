@@ -285,10 +285,11 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources) {
 
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
                     DirectMemory* memory,
-                    std::array<std::uint8_t, kEidBytes>* peer_eid) {
+                    std::array<std::uint8_t, kEidBytes>* peer_eid,
+                    std::uint32_t peer_path) {
   PeerRegion region{};
   if (link == nullptr || memory == nullptr || peer_eid == nullptr) return false;
-  const Status link_status = link->LookupRegion(peer_base, &region);
+  const Status link_status = link->LookupRegion(peer_base, &region, peer_path);
   if (!link_status.ok() || region.length == 0U || region.token_id == 0U || region.token_value == 0U ||
       region.segment_key_bytes == 0U || region.segment_key_bytes > kMemKeyBytes) {
     const char* reason = link_status.ok() ? "invalid peer region descriptor" : link_status.message().c_str();
@@ -476,7 +477,7 @@ bool CreatePeerChannel(const PeerChannelRequest& request,
       request.peer_base, request.local_jetty_info->key.value,
       request.local_jetty_info->key.size, request.local_eid->data(),
       request.peer_memory->token_value, local_tp_handle, local_psn, &peer_qp_key,
-      &peer_qp_key_bytes, &peer_tp_handle, &peer_psn);
+      &peer_qp_key_bytes, &peer_tp_handle, &peer_psn, request.peer_path);
   if (!status.ok()) {
     std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_CHANNEL_FAILED role=%s reason=%s\n",
                  request.role, status.message().c_str());

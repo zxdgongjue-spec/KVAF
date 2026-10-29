@@ -44,6 +44,7 @@ from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
 import batch_get_jetty_profile as jetty_profile
+import peer_eid_profile
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
@@ -196,6 +197,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="",
         help="strict K-side UB device selected by an earlier process",
     )
+    parser.add_argument("--peer-eids", type=parse_npu_eids, default=[],
+                        help="strict CPU EIDs sharing DDR; concurrent Jetty paths in one kernel")
+    parser.add_argument("--peer-csv", default="",
+                        help="per-sample/core/peer traffic and observed overlap CSV")
     parser.add_argument(
         "--adaptive-calibration-only",
         action="store_true",
@@ -342,6 +347,21 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "kernel-profile-clock-mhz must be positive"
     if args.jetty_csv and not args.kernel_profile:
         return "jetty-csv requires kernel-profile"
+    if args.peer_csv and (not args.peer_eids or not args.kernel_profile):
+        return "peer-csv requires peer-eids and kernel-profile"
+    if args.peer_eids:
+        if len(args.npu_eids) != 1 or args.adaptive_ub_device or args.peer_ub_device:
+            return "peer-eids requires one npu-eid and excludes adaptive/fixed UB device selection"
+        if args.jettys_per_core < len(args.peer_eids):
+            return "peer-eids requires at least one Jetty per peer on each core"
+        # A post carries 128 READs; ensure the first group reaches every Jetty
+        # before completion polling, including with the two-group inflight cap.
+        minimum = args.aiv_cores * args.jettys_per_core * 128
+        if args.miss_count < minimum:
+            return f"peer-eids requires miss-count >= {minimum} to activate every Jetty"
+        if args.max_inflight_total and args.miss_count > args.max_inflight_total:
+            if args.max_inflight_total < 2 * minimum:
+                return f"peer-eids requires max-inflight-total=0 or >= {2 * minimum}"
     return None
 
 
@@ -600,18 +620,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
-            "SKIP: NPU benchmark requires torch_npu; "
+            f"{'FAIL' if args.peer_eids else 'SKIP'}: NPU benchmark requires torch_npu; "
             f"detected {backend.name} ({backend.reason})."
         )
-        return 0
+        return 2 if args.peer_eids else 0
     import kvaf
 
     if not hasattr(kvaf, "NpuRuntime"):
         print(
-            "SKIP: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
+            f"{'FAIL' if args.peer_eids else 'SKIP'}: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
             "and KVAF_BUILD_PYTHON=ON."
         )
-        return 0
+        return 2 if args.peer_eids else 0
     if args.kernel_profile and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in (
@@ -626,8 +646,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
-        print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
-        return 0
+        print(f"{'FAIL' if args.peer_eids else 'SKIP'}: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
+        return 2 if args.peer_eids else 0
 
     kernel = Path(
         os.environ.get(
@@ -691,6 +711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         adaptive_ub_miss_count=args.adaptive_ub_miss_count,
         peer_ub_device=args.peer_ub_device,
         adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
+        peer_eids=args.peer_eids,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -706,11 +727,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
             f"max_inflight_total={args.max_inflight_total} "
-            f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
+            f"jettys_per_core={args.jettys_per_core} "
+            f"eid_paths={len(args.peer_eids) or len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"adaptive_ub_device={int(args.adaptive_ub_device)} "
             f"adaptive_ub_miss_count={args.adaptive_ub_miss_count} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
+            f"peer_eids={','.join(args.peer_eids) or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
@@ -982,6 +1005,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.jetty_csv:
                 jetty_profile.write_csv(args.jetty_csv, jetty_rows)
                 print(f"BATCH_GET_JETTY_CSV_WRITTEN path={args.jetty_csv} rows={len(jetty_rows)}")
+            if args.peer_eids:
+                peer_eid_profile.report(
+                    kernel_profile_samples, args.peer_eids, args.aiv_cores,
+                    args.jettys_per_core, token_bytes, args.peer_csv,
+                )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False
             print("BATCH_GET_KERNEL_PROFILE_DISABLED")

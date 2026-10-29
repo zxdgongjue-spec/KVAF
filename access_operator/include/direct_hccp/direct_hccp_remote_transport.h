@@ -128,6 +128,7 @@ struct PeerChannelRequest {
   const std::array<std::uint8_t, kEidBytes>* peer_eid{nullptr};
   const QpCreateInfo* local_jetty_info{nullptr};
   const char* role{nullptr};
+  std::uint32_t peer_path{0U};
 };
 
 struct PeerChannel {
@@ -144,7 +145,8 @@ void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
 // Converts the Link descriptor's raw UMDK token to the AIV WQE token format.
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
                     DirectMemory* memory,
-                    std::array<std::uint8_t, kEidBytes>* peer_eid);
+                    std::array<std::uint8_t, kEidBytes>* peer_eid,
+                    std::uint32_t peer_path = 0U);
 
 bool ImportPeerJetty(const DirectHccpApi& api, void* context,
                      const std::uint8_t* peer_key, std::uint32_t peer_key_bytes,
