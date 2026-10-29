@@ -1,10 +1,11 @@
-"""Observed concurrent READ windows; cycle comparisons stay within one AIV core."""
+"""Per-peer traffic and optional concurrency evidence within each AIV core."""
 
 import csv
 from pathlib import Path
 
 
 def summarize(samples, peer_eids, cores, jettys, token_bytes):
+    single_peer = len(peer_eids) == 1
     rows = []
     for sample_index, profiles in enumerate(samples):
         if len(profiles) != cores:
@@ -18,6 +19,12 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
                 path = int(lane["eid_path"])
                 if path != slot % len(peer_eids):
                     raise ValueError("peer profile route does not match requested EID order")
+                if single_peer and int(lane["requests"]) == 0:
+                    if any(int(lane[key]) != 0 for key in (
+                            "completion_count", "first_doorbell_cycle", "last_doorbell_cycle",
+                            "first_completion_cycle", "last_completion_cycle")):
+                        raise ValueError("idle peer Jetty has completion or timeline data")
+                    continue
                 if int(lane["requests"]) <= 0 or int(lane["completion_count"]) <= 0:
                     raise ValueError("a configured peer Jetty had no completed traffic")
                 first, last, done_first, done_last = (int(lane[key]) for key in (
@@ -28,7 +35,7 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
                 groups[path].append(lane)
             per_core = []
             for path, group in enumerate(groups):
-                if not group:
+                if not group and not single_peer:
                     raise ValueError("a requested peer EID has no Jetty")
                 requests = sum(int(lane["requests"]) for lane in group)
                 row = dict(sample=sample_index, core=core, peer_path=path,
@@ -38,14 +45,15 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
                                     ("last_doorbell_cycle", max),
                                     ("first_completion_cycle", min),
                                     ("last_completion_cycle", max)):
-                    row[key] = reduce(int(lane[key]) for lane in group)
+                    row[key] = reduce(int(lane[key]) for lane in group) if group else 0
                 per_core.append(row)
             # First-wave overlap is stricter than overlapping whole-run envelopes:
             # every peer was submitted before ANY peer's first observed completion.
-            overlap = min(r["first_completion_cycle"] for r in per_core) - max(
-                r["first_doorbell_cycle"] for r in per_core)
+            overlap = None if single_peer else (
+                min(r["first_completion_cycle"] for r in per_core) -
+                max(r["first_doorbell_cycle"] for r in per_core))
             for row in per_core:
-                row["first_wave_observed_overlap_cycles"] = max(0, overlap)
+                row["first_wave_observed_overlap_cycles"] = "" if single_peer else max(0, overlap)
             rows.extend(per_core)
     if not rows:
         raise ValueError("no peer profile samples")
@@ -64,9 +72,13 @@ def report(samples, peer_eids, cores, jettys, token_bytes, csv_path):
         print(f"PEER_EID_TRAFFIC path={path} eid={eid} "
               f"requests={sum(r['requests'] for r in selected)} "
               f"bytes={sum(r['bytes'] for r in selected)}")
+    if len(peer_eids) == 1:
+        print(f"PEER_EID_BASELINE samples={len(samples)} cores={cores} "
+              "execution=single_kernel concurrency_check=not_applicable")
+        return
     minimum = min(row["first_wave_observed_overlap_cycles"] for row in rows)
     print(f"PEER_EID_CONCURRENCY samples={len(samples)} cores={cores} "
           f"min_first_wave_observed_overlap_cycles={minimum} "
           "execution=single_kernel evidence=doorbell_to_observed_cqe")
-    if minimum <= 0 and len(peer_eids) > 1:
+    if minimum <= 0:
         raise ValueError("concurrent first-wave submission was not observed in every sample/core")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run both CPU EIDs concurrently in a single BatchGet kernel (no serial sweep)."""
+"""Run a single CPU EID baseline or two concurrent EIDs in one BatchGet kernel."""
 
 import argparse
 import csv
@@ -18,33 +18,35 @@ from npu_eids import parse_npu_eids
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=Path)
-    parser.add_argument("--peer-eids", required=True, type=parse_npu_eids)
+    parser.add_argument("--peer-eids", required=True, type=parse_npu_eids,
+                        help="one CPU EID for a baseline, or two distinct comma-separated EIDs")
     parser.add_argument("--npu-eid", required=True, type=parse_npu_eids)
     parser.add_argument("--cores", type=int, default=1, help="total AIV cores in the single kernel")
-    parser.add_argument("--jettys", type=int, default=4, choices=range(2, 65),
-                        help="total Jettys per core, striped alternately over the two CPU EIDs")
+    parser.add_argument("--jettys", type=int, default=4, choices=range(1, 65),
+                        help="total Jettys per core, striped over the selected CPU EIDs")
     parser.add_argument("--table-capacity", type=int, default=16384)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--request-length", type=int, default=32768)
     parser.add_argument("--miss-count", type=int, default=None,
-                        help="active requests shared by both EIDs; defaults to request-length")
+                        help="total active requests across selected EIDs; defaults to request-length")
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--tokens-per-block", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--max-inflight-total", type=int, default=None,
-                        help="default max(2048, cores * Jettys * 256)")
+                        help="default 2048 for one EID; max(2048, cores * Jettys * 256) for two")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=int(os.environ.get("KVAF_BATCH_GET_KERNEL_CLOCK_MHZ", "1000")),
                         help="AIV clock for cycles-to-us conversion, as in the miss-count runner")
     args = parser.parse_args(argv)
-    if len(args.peer_eids) != 2 or len(args.npu_eid) != 1:
-        parser.error("exactly two distinct CPU peer EIDs and one NPU EID are required")
+    if len(args.peer_eids) not in (1, 2) or len(args.npu_eid) != 1:
+        parser.error("one or two distinct CPU peer EIDs and exactly one NPU EID are required")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
     if args.max_inflight_total is None:
-        args.max_inflight_total = max(2048, args.cores * args.jettys * 256)
+        args.max_inflight_total = (2048 if len(args.peer_eids) == 1 else
+                                   max(2048, args.cores * args.jettys * 256))
     if args.miss_count is None:
         args.miss_count = args.request_length
     error = perf.validate_args(perf.parse_args(benchmark_args(args)))
@@ -127,7 +129,7 @@ def write_summary(args, log_text, output, emit):
                 raise ValueError("kernel_total p50_cycles must be positive")
             gbps = args.miss_count * args.token_bytes * args.kernel_profile_clock_mhz / p50_cycles / 1000
             row["p50_GBps"] = f"{gbps:.3f}"
-    # A dual-peer run has no single selected device. EID identities are in
+    # Selection uses exact EIDs, not a device name. Identities are in
     # config.json/peer_samples.csv; keep the original sweep's CSV schema exact.
     row["selected_ub_device"] = ""
     emit("BATCH_GET_MISS_SWEEP_RESULT " + " ".join(f"{key}={value}" for key, value in row.items()) +
@@ -158,6 +160,8 @@ def write_summary(args, log_text, output, emit):
 
 def main(argv=None):
     args = parse_args(argv)
+    single_peer = len(args.peer_eids) == 1
+    mode = "single_eid_baseline" if single_peer else "dual_eid_concurrent"
     build = args.build_dir.resolve()
     kernel = build / "bin/kvaf_execute_batch_get_kernels.o"
     put_kernel = build / "bin/kvaf_execute_batch_put_kernels.o"
@@ -181,7 +185,7 @@ def main(argv=None):
                KVAF_BATCH_PUT_KERNEL=str(put_kernel))
     env["PYTHONPATH"] = str(build / "python") + os.pathsep + env.get("PYTHONPATH", "")
     config = dict(vars(args), command=command, cpu_service=env["KVAF_CPU_SERVICE_ADDR"],
-                  device_id=env.get("DEVICE_ID", "0"), execution="single_kernel",
+                  device_id=env.get("DEVICE_ID", "0"), execution="single_kernel", mode=mode,
                   benchmark=vars(perf.parse_args(benchmark_args(args))),
                   jetty_priorities=env.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "default"))
     (output / "config.json").write_text(json.dumps(config, default=str, indent=2) + "\n", encoding="utf-8")
@@ -195,7 +199,8 @@ def main(argv=None):
         emit("BATCH_GET_MISS_SWEEP_PLAN token_sizes=1 miss_counts=1 aiv_core_counts=1 "
              "jetty_counts=1 combinations=1")
         emit(f"BATCH_GET_PEER_EID_CONFIG peer_eids={','.join(args.peer_eids)} "
-             "execution=single_kernel traffic_scope=both_peers_total")
+             f"peer_count={len(args.peer_eids)} mode={mode} "
+             "execution=single_kernel traffic_scope=all_peers_total")
         shape = (f"token_bytes={args.token_bytes} miss_count={args.miss_count} "
                  f"aiv_cores={args.cores} jettys_per_core={args.jettys}")
         emit(f"BATCH_GET_CONFIG_SWEEP_BEGIN {shape}")
@@ -206,10 +211,11 @@ def main(argv=None):
                 emit(f"BATCH_GET_MISS_SWEEP_FAILED {shape} status={code} reason={reason} log={log}")
                 return code
             text = log.read_text(encoding="utf-8")
+            peer_result = "PEER_EID_BASELINE " if single_peer else "PEER_EID_CONCURRENCY "
             if (not (output / "jettys.csv").is_file() or
                     "BATCH_GET_JETTY_CSV_WRITTEN " not in text or
-                    "PEER_EID_CONCURRENCY " not in text):
-                raise ValueError("missing per-Jetty CSV or peer concurrency result")
+                    peer_result not in text):
+                raise ValueError("missing per-Jetty CSV or peer result")
             summary_lines = []
             write_summary(args, text, output, summary_lines.append)
             emit(f"BATCH_GET_CONFIG_SWEEP_DONE {shape}")

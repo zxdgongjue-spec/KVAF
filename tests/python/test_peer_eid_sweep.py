@@ -57,6 +57,19 @@ class PeerEidTests(unittest.TestCase):
         self.assertEqual(args.max_inflight_total, 4096)
         self.assertIsNone(perf.validate_args(perf.parse_args(sweep.benchmark_args(args))))
 
+    def test_single_peer_uses_original_shape_limits_and_budget(self):
+        for extra in ([], ['--jettys', '1'], ['--miss-count', '1'], ['--miss-count', '0'],
+                      ['--miss-count', '512', '--max-inflight-total', '2'],
+                      ['--cores', '4', '--jettys', '4', '--miss-count', '1']):
+            with self.subTest(extra=extra):
+                args = self.args('--peer-eids', EIDS[0], *extra)
+                parsed = perf.parse_args(sweep.benchmark_args(args))
+                self.assertEqual(parsed.peer_eids, EIDS[:1])
+                self.assertEqual(parsed.npu_eids, ['3' * 32])
+                self.assertIsNone(perf.validate_args(parsed))
+                if '--max-inflight-total' not in extra:
+                    self.assertEqual(parsed.max_inflight_total, 2048)
+
     def test_miss_count_and_clock_are_forwarded(self):
         args = self.args('--miss-count', '2048', '--kernel-profile-clock-mhz', '800')
         parsed = perf.parse_args(sweep.benchmark_args(args))
@@ -71,7 +84,8 @@ class PeerEidTests(unittest.TestCase):
     def test_rejects_serializing_or_idle_shapes(self):
         for extra in [('--request-length', '128'), ('--max-inflight-total', '2'),
                       ('--cores', '0'), ('--iterations', '0'), ('--jettys', '1'),
-                      ('--peer-eids', EIDS[0]), ('--peer-eids', ','.join([EIDS[0]] * 2))]:
+                      ('--peer-eids', ''), ('--peer-eids', ','.join(EIDS + ['4' * 32])),
+                      ('--peer-eids', ','.join([EIDS[0]] * 2))]:
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     self.args(*extra)
@@ -82,6 +96,43 @@ class PeerEidTests(unittest.TestCase):
         self.assertEqual([r['requests'] for r in rows], [256, 256])
         self.assertEqual([r['bytes'] for r in rows], [256 * 656] * 2)
         self.assertTrue(all(r['first_wave_observed_overlap_cycles'] > 0 for r in rows))
+
+    def test_single_peer_allows_idle_lanes_and_cores_without_overlap(self):
+        for requests in (0, 1, 128):
+            with self.subTest(requests=requests), tempfile.TemporaryDirectory() as folder:
+                profiles = sample() + sample()
+                for core, profile in enumerate(profiles):
+                    for slot, lane in enumerate(profile['jettys']):
+                        lane['eid_path'] = 0
+                        if core == 0 and slot == 0 and requests:
+                            lane['requests'] = requests
+                        else:
+                            for key in ('requests', 'completion_count', 'first_doorbell_cycle',
+                                        'last_doorbell_cycle', 'first_completion_cycle',
+                                        'last_completion_cycle'):
+                                lane[key] = 0
+                rows = report.summarize([profiles], EIDS[:1], 2, 4, 656)
+                self.assertEqual([row['requests'] for row in rows], [requests, 0])
+                self.assertEqual([row['bytes'] for row in rows], [requests * 656, 0])
+                self.assertTrue(all(row['first_wave_observed_overlap_cycles'] == '' for row in rows))
+                console = io.StringIO()
+                with contextlib.redirect_stdout(console):
+                    report.report([profiles], EIDS[:1], 2, 4, 656, Path(folder) / 'peer.csv')
+                self.assertIn('PEER_EID_BASELINE', console.getvalue())
+                self.assertIn('concurrency_check=not_applicable', console.getvalue())
+                self.assertNotIn('PEER_EID_CONCURRENCY', console.getvalue())
+                self.assertEqual(console.getvalue().count('PEER_EID_TRAFFIC'), 1)
+
+    def test_single_peer_keeps_route_and_completion_validation(self):
+        profiles = sample()
+        for lane in profiles[0]['jettys']:
+            lane['eid_path'] = 0
+        profiles[0]['jettys'][0]['completion_count'] = 0
+        with self.assertRaisesRegex(ValueError, 'no completed traffic'):
+            report.summarize([profiles], EIDS[:1], 1, 4, 656)
+        profiles[0]['jettys'][0]['eid_path'] = 1
+        with self.assertRaisesRegex(ValueError, 'route'):
+            report.summarize([profiles], EIDS[:1], 1, 4, 656)
 
     def test_serial_evidence_fails_but_preserves_csv(self):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
@@ -166,39 +217,43 @@ class PeerEidTests(unittest.TestCase):
             self.assertIn('p50_GB/s', '\n'.join(lines))
 
     def test_successful_launcher_shows_and_saves_complete_summary(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            (root / 'bin').mkdir()
-            (root / 'python/kvaf').mkdir(parents=True)
-            for name in ('get', 'put'):
-                (root / f'bin/kvaf_execute_batch_{name}_kernels.o').touch()
-            output = root / 'logs'
-            args = [str(root), '--peer-eids', ','.join(EIDS), '--npu-eid', '3' * 32,
-                    '--output-dir', str(output), '--miss-count', '2048']
+        for peers in (EIDS[:1], EIDS):
+            marker = 'PEER_EID_BASELINE' if len(peers) == 1 else 'PEER_EID_CONCURRENCY'
+            with tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / 'bin').mkdir()
+                (root / 'python/kvaf').mkdir(parents=True)
+                for name in ('get', 'put'):
+                    (root / f'bin/kvaf_execute_batch_{name}_kernels.o').touch()
+                output = root / 'logs'
+                args = [str(root), '--peer-eids', ','.join(peers), '--npu-eid', '3' * 32,
+                        '--output-dir', str(output), '--miss-count', '2048']
 
-            def child(command, env, stream, timeout):
-                row = dict.fromkeys(perf.jetty_profile.FIELDS, '0')
-                perf.jetty_profile.write_csv(output / 'jettys.csv', [row])
-                text = ('BATCH_GET_PERF_PHASE_BEGIN phase=initialize\n' + profile_log() +
-                        '\nBATCH_GET_JETTY_CSV_WRITTEN path=jettys.csv rows=1\n'
-                        'PEER_EID_CONCURRENCY samples=100 execution=single_kernel\n')
-                stream.write(text)
-                stream.flush()
-                print(text, end='')
-                return 0
+                def child(command, env, stream, timeout):
+                    row = dict.fromkeys(perf.jetty_profile.FIELDS, '0')
+                    perf.jetty_profile.write_csv(output / 'jettys.csv', [row])
+                    text = ('BATCH_GET_PERF_PHASE_BEGIN phase=initialize\n' + profile_log() +
+                            '\nBATCH_GET_JETTY_CSV_WRITTEN path=jettys.csv rows=1\n'
+                            f'{marker} samples=100 execution=single_kernel\n')
+                    stream.write(text)
+                    stream.flush()
+                    print(text, end='')
+                    return 0
 
-            console = io.StringIO()
-            with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': 'localhost:29000'}, clear=True), \
-                 patch.object(sweep, 'run_logged', side_effect=child), contextlib.redirect_stdout(console):
-                self.assertEqual(sweep.main(args), 0)
-            text = console.getvalue()
-            self.assertEqual(text, (output / 'batch_get.log').read_text())
-            self.assertEqual(text.count('BATCH_GET_MISS_SWEEP_STAGE_SUMMARY'), 3)
-            self.assertEqual(text.count('PEER_EID_CONCURRENCY'), 1)
-            self.assertIn('BATCH_GET_JETTY_SWEEP_CSV_WRITTEN', text)
-            self.assertTrue((output / 'batch_get_miss_sweep_summary.csv').is_file())
-            self.assertEqual((output / 'batch_get_jetty_summary.csv').read_text(),
-                             (output / 'jettys.csv').read_text())
+                console = io.StringIO()
+                with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': 'localhost:29000'}, clear=True), \
+                     patch.object(sweep, 'run_logged', side_effect=child), contextlib.redirect_stdout(console):
+                    self.assertEqual(sweep.main(args), 0)
+                text = console.getvalue()
+                self.assertEqual(text, (output / 'batch_get.log').read_text())
+                self.assertEqual(text.count('BATCH_GET_MISS_SWEEP_STAGE_SUMMARY'), 3)
+                self.assertEqual(text.count(marker), 1)
+                self.assertIn(f'peer_count={len(peers)}', text)
+                self.assertEqual(text.count('PEER_EID_CONCURRENCY'), int(len(peers) == 2))
+                self.assertIn('BATCH_GET_JETTY_SWEEP_CSV_WRITTEN', text)
+                self.assertTrue((output / 'batch_get_miss_sweep_summary.csv').is_file())
+                self.assertEqual((output / 'batch_get_jetty_summary.csv').read_text(),
+                                 (output / 'jettys.csv').read_text())
 
     def test_missing_or_invalid_summary_does_not_create_csv(self):
         for text in ('', profile_log().replace('p50_cycles=400', 'p50_cycles=nan'),

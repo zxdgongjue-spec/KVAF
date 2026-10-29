@@ -354,6 +354,7 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "peer-eids requires one npu-eid and excludes adaptive/fixed UB device selection"
         if args.jettys_per_core < len(args.peer_eids):
             return "peer-eids requires at least one Jetty per peer on each core"
+    if len(args.peer_eids) > 1:
         # A post carries 128 READs; ensure the first group reaches every Jetty
         # before completion polling, including with the two-group inflight cap.
         minimum = args.aiv_cores * args.jettys_per_core * 128
