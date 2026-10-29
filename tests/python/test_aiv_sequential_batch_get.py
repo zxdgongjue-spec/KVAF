@@ -90,7 +90,9 @@ def main() -> int:
             runtime.batch_put(keys, source, [i * block_bytes for i in range(blocks)],
                               [block_bytes] * blocks)
             table = runtime.prepare_access_table(keys)
-            view = runtime.access_table_view(table, capacity=blocks)
+            view = runtime.access_table_view(table, device="npu", capacity=blocks)
+            if not isinstance(view, kvaf.DeviceAccessTable):
+                raise TypeError("NPU access_table_view did not return DeviceAccessTable")
             outputs = [torch.empty((2 * capacity + 2, token), dtype=torch.uint8, device=device)
                        for _ in range(2)]
             for epoch, active in enumerate(counts):
