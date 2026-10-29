@@ -3,8 +3,8 @@
 
 namespace kvaf::ubmem {
 enum class Operation : std::uint32_t { kGet = 0, kPut = 1 };
-// One scalar DCache line per core: publishing a report cannot write back
-// another core's report. The host and kernel are built together.
+// Separate each core's status stores, as in the existing BatchGet status ABI.
+// The host and kernel are built together.
 struct alignas(64) CoreStatus {
   std::uint64_t result, failed_request, completed;
   std::uint64_t reserved[5];

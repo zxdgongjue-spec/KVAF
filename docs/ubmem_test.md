@@ -19,7 +19,7 @@ CPU 节点编译不需要 CANN Toolkit 或 UMDK 头文件：
 `--hal-library /actual/path/libascend_hal.so`。可用 `--numa-node 0` 指定 Host DDR 的 NUMA 节点；
 不指定时使用 HAL 的 Host 分配策略。服务在收到分配请求时才实际测试 DDR 分配和导出能力。
 
-NPU 节点使用匹配 Ascend950 的 CANN Toolkit / asc-devkit：
+NPU 节点沿用现有 KVAF AIV 内核使用的 Ascend950 CANN 工具链：
 
 ```bash
 source /actual/path/to/cann/set_env.sh
@@ -103,23 +103,28 @@ MetaManager 负责按请求顺序分配 Put 目的范围；UBmem adapter 只增�
 每个 core 遇到无效 Get 行时停止自己的循环并报告行号；此前完成的行和其他 core 的工作
 不会回滚。异步 Get 只返回入队结果；需要读取内核错误报告时使用 `synchronize=true`。
 
-缓存维护仅针对 **AIV 标量 DCache**，直接调用 AscendC 的 `DataCacheCleanAndInvalid`：
-
-| 位置 | 范围 | 生产者 → 消费者及理由 |
-| --- | --- | --- |
-| 内核入口、读取元数据前 | 本核整个标量 DCache，一次 | H2D 或前序 kernel → 当前标量读取。复用地址时不能读到此前缓存的请求数组、miss count 或地址表。元数据分散在多个数组，地址表还要间接索引，统一失效避免逐行刷新和额外遍历。 |
-| 内核出口、写入报告后 | 本核独占的 64 字节状态行，一次 | 标量 status store → host `aclrtMemcpy`。将状态写回，使 host 能读取错误码和完成行数；每核按缓存行隔离，避免写回其他 core 的报告。 |
-
-入口没有本 kernel 的待完成工作，因此不加 `PIPE_ALL`。出口的 `PIPE_ALL` 用于等待本核 VF
-工作完成后再发布状态；ACL event/stream 用于 host 等待和后续同 stream 操作排序。
-SIMT payload 使用普通 GM load/store，不对每条 payload 或每行数据添加 DCCI。
-上述标量缓存操作不能用来证明远端 DDR 的写入完成或 CPU/NPU 的缓存一致性。
+元数据和状态沿用现有 `execute_batch_get_aiv.asc` 的 kernel 边界用法：调用方 stream
+先生产元数据，kernel 执行后写状态，host 等待完成事件再读取。UBmem 不额外添加入口或
+出口 DCCI。结束前的 `PIPE_ALL` 保留用于等待本核 VF 工作，SHMEM 的
+`shmem_device_mo.hpp::aclshmemi_quiet` 也使用这一 pipeline 同步；它不是远端完成通知。
 
 CPU oracle 只在 fill 完成后执行内存屏障，保证 DDR store 先于允许 NPU 开始 Get 的 TCP
 响应；只读 check 无需出口屏障。这个屏障不清理 CPU cache。跨节点数据可见性依赖目标
 HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU check 的硬件测试确认。
 驱动的 `SVM_FLAG_BY_PASS_CACHE` 在 `malloc_mng.c` 中控制分配器缓存，不能作为硬件绕过
 缓存的依据。
+
+## 实现依据
+
+- 构建：`access_operator/cmake/aiv_toolchain.cmake` 从已有 BatchGet/BatchPut 构建配置提取，
+  三个内核共享编译器、头文件查找和编译参数。
+- SIMT 搬运：SHMEM `src/device_simt/gm2gm/engine/shmem_device_simt_mte.hpp` 的 GM load/store 循环。
+- HAL ABI：CANN Driver `pkg_inc/ascend_hal_base.h` 的 `drv_mem_prop` 和函数声明，
+  `ascend_hal_define.h` 的内存类型、Host UVA / Device-share 标志和 Fabric handle。
+- Fabric 导出及共享属性：SHMEM `src/host/mem/heap/hybm_vmm_based_segment.cpp::ExportInner`。
+
+独立 CPU 节点使用这组 HAL 接口导出 DDR，是本测试要验证的能力。SHMEM 的 Host DDR
+示例运行在 Ascend runtime 环境，不能据此认定独立 CPU 节点已经支持。
 
 ## 定位不支持的环节
 
