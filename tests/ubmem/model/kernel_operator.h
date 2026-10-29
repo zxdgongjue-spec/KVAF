@@ -9,9 +9,11 @@
 #define LAUNCH_BOUND(n)
 inline struct { unsigned x; } threadIdx;
 inline unsigned model_core;
-enum { PIPE_ALL };
+using event_t = unsigned;
+enum { PIPE_S, PIPE_V };
+inline void set_flag(int, int, event_t) {}
+inline void wait_flag(int, int, event_t) {}
 namespace AscendC {
-template <int> void PipeBarrier() {}
 inline unsigned GetBlockIdx() { return model_core; }
 namespace Simt {
 struct Dim3 { unsigned x, y, z; };

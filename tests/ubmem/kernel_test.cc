@@ -1,5 +1,6 @@
 #include "kernel_operator.h"
 #include "ubmem/batch_abi.h"
+#include "ubmem/test_pattern.h"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -79,5 +80,31 @@ int main() {
   put_offsets[2] = 0; destinations[2] = remote_base + 16384;
   Run(a);
   for (unsigned b = 0; b < lengths[2]; ++b) CHECK(remote[16384 + b] == local[b]);
+
+  // Hardware failure shape: 17 reversed slots, 2 cores, 83968 bytes per row,
+  // and an unaligned input with 13-byte gaps. Row 0 targets offset 1343488.
+  constexpr unsigned rows = 17;
+  constexpr std::uint64_t slot = 656 * 128;
+  std::vector<std::uint8_t> big_remote(rows * slot + 32, 0xCF);
+  std::vector<std::uint8_t> big_local(rows * (slot + 13) + 3, 0xEF);
+  std::array<std::uint64_t, rows> src_offsets{}, dst_addresses{}, row_lengths{};
+  for (unsigned row = 0; row < rows; ++row) {
+    const auto key = rows - 1 - row;
+    src_offsets[row] = row * (slot + 13) + 3;
+    dst_addresses[row] = remote_base + key * slot;
+    row_lengths[row] = slot;
+    for (std::uint64_t b = 0; b < slot; ++b)
+      big_local[src_offsets[row] + b] = TestPattern(key * slot + b, 17);
+  }
+  a.remote_bytes = rows * slot; a.mapped_base = Ptr(big_remote.data());
+  a.local_base = Ptr(big_local.data()); a.local_bytes = big_local.size();
+  a.blocks = 2; a.capacity = rows;
+  a.put_offsets = Ptr(src_offsets.data()); a.put_lengths = Ptr(row_lengths.data());
+  a.put_destinations = Ptr(dst_addresses.data());
+  Run(a);
+  CHECK(statuses[0].result == 0 && statuses[0].completed == 9);
+  CHECK(statuses[1].result == 0 && statuses[1].completed == 8);
+  for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
+  for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
   std::puts("UBmem actual kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed");
 }

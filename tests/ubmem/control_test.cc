@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
   CHECK(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0);
   CHECK(listen(listener, 8) == 0);
   std::thread server([&] {
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
       int connection = accept(listener, nullptr, nullptr); CHECK(connection >= 0);
       (void)provider.ServeConnection(connection); close(connection);
     }
@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < 656; ++i) CHECK(data[i] == static_cast<std::uint8_t>((i * 31) ^ (i >> 8) ^ (i >> 16) ^ 29));
     for (unsigned i = 0; i < 656; ++i) data[i] = static_cast<std::uint8_t>((i * 31) ^ (i >> 8) ^ (i >> 16) ^ 71);
     CHECK(link.UbmemRange(region.base, 0, 656, 71, false).ok());
+    data[0] ^= 1;
+    CHECK(!link.UbmemRange(region.base, 0, 656, 71, false).ok());
     fail("unmap"); CHECK(!imported.Close().ok());
     CHECK(handles() == 2 && maps() == 2);  // failed unmap retains the allocation
     CHECK(imported.Close().ok());

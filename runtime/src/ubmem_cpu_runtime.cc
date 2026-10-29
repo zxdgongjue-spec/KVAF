@@ -81,11 +81,16 @@ struct CpuRuntime::Impl {
     auto* data = reinterpret_cast<volatile std::uint8_t*>(found->second.memory->address());
     for (std::uint64_t i = request.offset; i < request.offset + request.length; ++i) {
       const auto value = TestPattern(i, request.seed);
-      if (fill) data[i] = value;
-      else if (data[i] != value) {
-        std::fprintf(stderr, "[KVAF_UBMEM] CPU_MISMATCH session=%llu offset=%llu\n",
-            static_cast<unsigned long long>(request.session_id), static_cast<unsigned long long>(i));
-        return peer::Result::kResourceError;
+      if (fill) {
+        data[i] = value;
+      } else {
+        const auto actual = data[i];
+        if (actual != value) {
+          std::fprintf(stderr, "[KVAF_UBMEM] CPU_MISMATCH session=%llu offset=%llu expected=0x%02x actual=0x%02x\n",
+              static_cast<unsigned long long>(request.session_id), static_cast<unsigned long long>(i),
+              static_cast<unsigned>(value), static_cast<unsigned>(actual));
+          return peer::Result::kResourceError;
+        }
       }
     }
     // Publish CPU stores before the TCP fill response lets the NPU start GET.

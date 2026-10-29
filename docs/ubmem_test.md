@@ -105,8 +105,9 @@ MetaManager 负责按请求顺序分配 Put 目的范围；UBmem adapter 只增�
 
 元数据和状态沿用现有 `execute_batch_get_aiv.asc` 的 kernel 边界用法：调用方 stream
 先生产元数据，kernel 执行后写状态，host 等待完成事件再读取。UBmem 不额外添加入口或
-出口 DCCI。结束前的 `PIPE_ALL` 保留用于等待本核 VF 工作，SHMEM 的
-`shmem_device_mo.hpp::aclshmemi_quiet` 也使用这一 pipeline 同步；它不是远端完成通知。
+出口 DCCI。每次 VF 调用前使用 `S→V` set/wait，调用后使用 `V→S` set/wait，再处理下一行。
+这沿用 KVAF `RunBatchGetValidation` 和 SHMEM `simt_rma_perftest` 的 `VSSync<Simt>`，
+交接标量准备参数、向量消费参数及标量复用调用状态的顺序；它不是远端完成通知。
 
 CPU oracle 只在 fill 完成后执行内存屏障，保证 DDR store 先于允许 NPU 开始 Get 的 TCP
 响应；只读 check 无需出口屏障。这个屏障不清理 CPU cache。跨节点数据可见性依赖目标
@@ -136,6 +137,11 @@ HAL 映射和 UB 通路，需运行 CPU 改写后 NPU Get、NPU Put 后 CPU chec
 - `halMemExportToShareableHandleV2(FABRIC)`：CPU 端 Fabric 导出失败。
 - `halMemImportFromShareableHandleV2(FABRIC)` / `halMemMap`：NPU 侧导入、路由、权限或映射失败。
 - `CPU_MISMATCH` / `KERNEL_ERROR`：分别为 CPU 内容校验失败、内核请求范围等校验失败。
+
+同步 BatchPut 输出每核 `PUT_CORE`，包含设备报告的 `completed` 和 host 计算的 `expected`。
+默认 17 行、2 核应分别完成 9 行和 8 行；计数不符会在 MetaManager 提交前报错。
+`CPU_MISMATCH` 同时输出 `expected` / `actual` 字节。默认倒序 Put 首先检查 slot 16，
+起点为 `16 × 656 × 128 = 1343488`；该处失败并不表示前面的 slot 已经通过校验。
 
 两端必须具有可达的 UB 内存语义通路；仅 TCP 可达不能建立 UBmem 映射。该测试用于确定当前
 CPU-only 节点是否具备这条 HAL/Fabric 能力；不支持时报告失败，不切换为其他传输方式。

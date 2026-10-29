@@ -131,6 +131,16 @@ struct AccessOperator::Impl {
                                                    ACL_MEMCPY_DEVICE_TO_HOST));
     if (!status.ok()) return status;
     for (std::size_t i = 0; i < reports.size(); ++i) {
+      if (args.operation == Operation::kPut) {
+        const std::uint64_t expected = args.capacity / args.blocks + (i < args.capacity % args.blocks);
+        std::fprintf(stderr, "[KVAF_UBMEM] PUT_CORE core=%zu result=%llu completed=%llu expected=%llu\n", i,
+            static_cast<unsigned long long>(reports[i].result),
+            static_cast<unsigned long long>(reports[i].completed),
+            static_cast<unsigned long long>(expected));
+        if (reports[i].result == 0 && reports[i].completed != expected) {
+          return Status::Internal("UBmem Put completion report does not cover the submitted rows");
+        }
+      }
       if (reports[i].result != 0) {
         std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
             static_cast<unsigned long long>(reports[i].result),
