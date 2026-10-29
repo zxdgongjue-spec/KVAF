@@ -16,6 +16,7 @@
 #include <thread>
 
 namespace p = kvaf::offload;
+constexpr std::uint32_t kRegionToken = 0x13579bdf;
 std::atomic<int> registrations{0}, events{0}, event_waits{0}, reads{0};
 std::atomic<int> sessions{0}, contexts{0}, probe_allocations{0};
 int context_error = 0;
@@ -52,6 +53,7 @@ bool LoadDirectHccp(DirectHccpApi* a){
   a->token_alloc=[](void*,TokenId*,void** p){*p=new int;return 0;};
   a->token_free=DestroyWithContext;
   a->lmem_register=[](void*,MrRegInfo* mr,void** p){
+    Require(mr->in.ub.token_value==kRegionToken,"HBM registration uses CPU region token");
     ++registrations;*p=new int;mr->out.key.size=48;
     // Reproduce the hardware case: route EID 1, exported memory EID 3.
     std::memset(mr->out.key.value,0,48);mr->out.key.value[15]=3;
@@ -65,7 +67,10 @@ bool LoadDirectHccp(DirectHccpApi* a){
   };
   a->lmem_unregister=[](void*,void* p){--registrations;return Destroy(p);};
   a->cq_create=[](void*,CqInfo*,void** p){*p=new int;return 0;};a->cq_destroy=DestroyWithContext;
-  a->qp_create=[](void*,QpCreateAttr*,QpCreateInfo* info,void** p){info->key.size=32;info->key.value[15]=3;*p=new int;return 0;};
+  a->qp_create=[](void*,QpCreateAttr* attr,QpCreateInfo* info,void** p){
+    Require(attr->ub.token_value==kRegionToken,"NPU Jetty uses CPU region token");
+    info->key.size=32;info->key.value[15]=3;*p=new int;return 0;
+  };
   a->qp_destroy=Destroy;a->qp_unimport=DestroyWithContext;
   a->get_tp_info_async=[](void*,GetTpCfg* cfg,TpInfo* info,std::uint32_t* count,void** p){
     Require(cfg->local_eid.raw[15]==1&&cfg->peer_eid.raw[15]==2,"CTP uses route EIDs, not memory EIDs");
@@ -75,9 +80,10 @@ bool LoadDirectHccp(DirectHccpApi* a){
   return true;
 }
 void CloseDirectHccp(DirectHccpApi* a){*a={};}
-bool ImportPeerJetty(const DirectHccpApi&,void*,const std::uint8_t* key,std::uint32_t,std::uint32_t,
+bool ImportPeerJetty(const DirectHccpApi&,void*,const std::uint8_t* key,std::uint32_t,std::uint32_t token,
     std::uint64_t,std::uint64_t,std::uint32_t,std::uint32_t,const char*,QpImportInfoT*,void** p){
   Require(key[15]==4,"CPU Jetty identity is not rewritten with CPU route EID");
+  Require(token==kRegionToken,"NPU imports CPU Jetty with region token");
   *p=new int;return true;
 }
 }
@@ -85,10 +91,12 @@ struct Backend final:p::Backend {
   std::vector<std::uint8_t> memory;
   p::Endpoint source{};
   kvaf::Status Allocate(std::uint64_t bytes,p::Endpoint* e) override {
-    memory.resize(bytes);e->base=reinterpret_cast<std::uint64_t>(memory.data());e->bytes=bytes;e->eid[15]=2;return kvaf::Status::OK();
+    memory.resize(bytes);e->base=reinterpret_cast<std::uint64_t>(memory.data());e->bytes=bytes;
+    e->eid[15]=2;e->token=kRegionToken;return kvaf::Status::OK();
   }
   kvaf::Status Open(const p::Endpoint& s,p::Endpoint* e) override {
     Require(s.eid[15]==1&&s.segment[15]==3&&s.key[15]==3,"wire preserves separate route, memory and Jetty identities");
+    Require(s.token==kRegionToken,"Open echoes allocated region token");
     source=s;e->key_bytes=28;e->key[15]=4;e->tp=1;e->psn=1;return kvaf::Status::OK();
   }
   kvaf::Status Read(const std::vector<p::Span>& spans) override {
@@ -111,6 +119,7 @@ class Server {
   std::thread thread;
   std::atomic<bool> stop{false};
   std::atomic<std::uint16_t> drop{0};
+  std::atomic<std::uint16_t> clear_token{0};
   std::atomic<p::State> query_state{p::State::Empty};
   std::uint16_t port{};
   Server(){
@@ -127,6 +136,7 @@ class Server {
           std::vector<p::Span> spans(request.count);
           if(p::ReadBytes(fd,spans.data(),spans.size()*sizeof(p::Span))){
             auto response=service.Dispatch(request,spans);
+            if(request.header.command==clear_token.load())response.endpoint.token=0;
             const auto state=query_state.load();
             if(request.header.command==static_cast<std::uint16_t>(p::Command::Query)&&state!=p::State::Empty)
               response.state=state;
@@ -141,12 +151,12 @@ class Server {
   ~Server(){stop=true;shutdown(listener,SHUT_RDWR);close(listener);if(thread.joinable())thread.join();}
 };
 void StartupFailureTest(Server& server) {
-  auto fail=[&](const char* diagnostic){
+  auto fail=[&](const char* diagnostic,bool physical=true){
     kvaf::OffloadRuntime runtime({0,"00000000000000000000000000000001",0,1000});
     Require(runtime.LinkTo({"127.0.0.1:"+std::to_string(server.port)}).ok(),"link failed startup");
     const auto status=runtime.Initialize(1024,256);
     Require(!status.ok()&&status.message().find(diagnostic)!=std::string::npos,"startup preserves failure detail");
-    Require(status.message().find("physical=0")!=std::string::npos,"startup identifies physical device");
+    if(physical)Require(status.message().find("physical=0")!=std::string::npos,"startup identifies physical device");
     Require(!runtime.initialized()&&!runtime.pending_offload(),"setup failure is safe, not ready or pending");
     Require(reads==0&&registrations==0&&contexts==0&&sessions==0,"setup failure cleans source before any READ");
     Require(runtime.Shutdown().ok()&&probe_allocations==0,"failed startup releases probe and CPU pool");
@@ -158,6 +168,11 @@ void StartupFailureTest(Server& server) {
   bad_segment=BadSegment::Overflow;fail("address_overflow=1");
   bad_segment=BadSegment::Abi;fail("key_bytes=52 expected=48");
   bad_segment=BadSegment::None;
+  server.clear_token=static_cast<std::uint16_t>(p::Command::Allocate);
+  fail("CPU Allocate omitted region token",false);
+  server.clear_token=static_cast<std::uint16_t>(p::Command::Open);
+  fail("CPU Jetty token differs",false);
+  server.clear_token=0;
 }
 int main(){try{
   Server server;

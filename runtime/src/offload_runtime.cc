@@ -54,6 +54,7 @@ class Exporter {
   ~Exporter() { if (!Close().ok()) std::fprintf(stderr, "OFFLOAD: quarantined HBM export\n"); }
   Status Open(const ConstBufferView& input, const std::string& eid, const p::Endpoint& cpu) {
     std::uint32_t physical{};
+    if (!cpu.token) return Error("CPU Allocate omitted region token; rebuild both Offload peers");
     if (!ParseEid(eid, descriptor.eid)) return Status::InvalidArgument("npu_eid must contain 32 hex digits");
     if (!h::LoadDirectHccp(&api_)) return Error("load Direct HCCP API");
     if (!h::GetCurrentNpuPhysicalDeviceId(&physical)) return Error("resolve NPU physical device");
@@ -73,7 +74,7 @@ class Exporter {
     }
     h::TokenId token{};
     if (api_.token_alloc(context_, &token, &token_) || !token_) return Error("allocate source token");
-    descriptor.token = static_cast<std::uint32_t>(Nonce()) | 1U;
+    descriptor.token = cpu.token;
     h::MrRegInfo mr{};
     mr.in.mem.addr = reinterpret_cast<std::uint64_t>(input.data); mr.in.mem.size = input.bytes;
     // Public 24.12: REMOTE_READ only, non-pinned device HBM, valid token.
@@ -146,6 +147,7 @@ class Exporter {
     return Status::OK();
   }
   Status Bind(const p::Endpoint& cpu) {
+    if (cpu.token != descriptor.token) return Error("CPU Jetty token differs from allocated region token");
     if (cpu.key_bytes != 28 || !h::ImportPeerJetty(api_, context_, cpu.key, cpu.key_bytes,
         cpu.token, descriptor.tp, cpu.tp, descriptor.psn, cpu.psn, "cpu_pull", &import_, &peer_))
       return Error("import CPU initiator");

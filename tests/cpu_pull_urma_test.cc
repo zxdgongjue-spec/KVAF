@@ -12,8 +12,11 @@
 namespace p = kvaf::offload;
 void Require(bool value,const char* text){if(!value)throw std::runtime_error(text);}
 int posts{}, post_calls{}, local_mrs{}, imported_mrs{}, queues{};
-enum class Fault { None, Post, Poll, CqStatus, UserContext };
+enum class Fault { None, Post, Poll, CqStatus, LocalAccess, UserContext };
 Fault fault = Fault::None;
+enum class BadLocalSegment { None, ZeroBase, Short, NoWrite, NonPin };
+BadLocalSegment bad_local_segment = BadLocalSegment::None;
+std::uint32_t registered_token{};
 std::uint64_t pending{};
 urma_seg_t expected_segment{};
 std::uint8_t expected_jetty_key[32]{};
@@ -31,18 +34,30 @@ urma_token_id_t* urma_alloc_token_id(urma_context_t* c){auto* t=new urma_token_i
 urma_status_t urma_free_token_id(urma_token_id_t* t){delete t;return URMA_SUCCESS;}
 urma_target_seg_t* urma_register_seg(urma_context_t*,urma_seg_cfg_t* cfg){
   Require(cfg->flag.bs.access==URMA_ACCESS_LOCAL_WRITE&&!cfg->flag.bs.non_pin,"DDR must be pinned LOCAL_WRITE");
-  auto* mr=new urma_target_seg_t{};mr->seg.ubva.va=cfg->va;mr->seg.len=cfg->len;++local_mrs;return mr;
+  Require(cfg->token_value.token&&cfg->token_id&&cfg->flag.bs.token_id_valid,"explicit DDR token");
+  registered_token=cfg->token_value.token;
+  auto* mr=new urma_target_seg_t{};mr->seg.ubva.va=cfg->va;mr->seg.len=cfg->len;
+  mr->seg.attr.value=cfg->flag.value;mr->seg.token_id=cfg->token_id->token_id;
+  if(bad_local_segment==BadLocalSegment::ZeroBase)mr->seg.ubva.va=0;
+  if(bad_local_segment==BadLocalSegment::Short)--mr->seg.len;
+  if(bad_local_segment==BadLocalSegment::NoWrite)mr->seg.attr.bs.access=0;
+  if(bad_local_segment==BadLocalSegment::NonPin)mr->seg.attr.bs.non_pin=1;
+  ++local_mrs;return mr;
 }
 urma_status_t urma_unregister_seg(urma_target_seg_t* mr){--local_mrs;delete mr;return URMA_SUCCESS;}
-urma_target_seg_t* urma_import_seg(urma_context_t*,urma_seg_t* seg,urma_token_t*,std::uint64_t,urma_import_seg_flag_t flags){
+urma_target_seg_t* urma_import_seg(urma_context_t*,urma_seg_t* seg,urma_token_t* token,std::uint64_t,urma_import_seg_flag_t flags){
   Require(flags.bs.access==URMA_ACCESS_REMOTE_READ,"source must be READ-only");
+  Require(token->token==registered_token,"import HBM with region token");
   Require(!std::memcmp(seg,&expected_segment,sizeof(*seg)),"import exported segment verbatim, including memory EID");
   auto* mr=new urma_target_seg_t{};mr->seg=*seg;++imported_mrs;return mr;
 }
 urma_status_t urma_unimport_seg(urma_target_seg_t* mr){--imported_mrs;delete mr;return URMA_SUCCESS;}
 urma_jfc_t* urma_create_jfc(urma_context_t*,urma_jfc_cfg_t*){++queues;return new urma_jfc_t{};}
 urma_status_t urma_delete_jfc(urma_jfc_t* q){--queues;delete q;return URMA_SUCCESS;}
-urma_jfr_t* urma_create_jfr(urma_context_t*,urma_jfr_cfg_t*){++queues;return new urma_jfr_t{};}
+urma_jfr_t* urma_create_jfr(urma_context_t*,urma_jfr_cfg_t* cfg){
+  Require(cfg->token_value.token==registered_token,"CPU RQ shares DDR region token");
+  ++queues;return new urma_jfr_t{};
+}
 urma_status_t urma_delete_jfr(urma_jfr_t* q){--queues;delete q;return URMA_SUCCESS;}
 urma_jetty_t* urma_create_jetty(urma_context_t*,urma_jetty_cfg_t* cfg){
   Require(cfg->jfs_cfg.max_rsge==1,"initiator remote SGE limit");
@@ -55,8 +70,9 @@ int urma_get_tp_list(void*,void* input,std::uint32_t* count,void* info){
   Require(cfg->local[15]==1&&cfg->remote[15]==2,"CTP uses selected route EIDs, not segment EID");
   *count=1;*static_cast<std::uint64_t*>(info)=9;return 0;
 }
-urma_target_jetty_t* urma_import_jetty_ex(void*,void* remote,void*,void*){
+urma_target_jetty_t* urma_import_jetty_ex(void*,void* remote,void* token,void*){
   Require(!std::memcmp(remote,expected_jetty_key,28),"import provider Jetty identity verbatim");
+  Require(static_cast<urma_token_t*>(token)->token==registered_token,"import Jetty with region token");
   return new urma_target_jetty_t{};
 }
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t*,urma_jfs_wr_t* wr,urma_jfs_wr_t** bad){
@@ -76,6 +92,7 @@ int urma_poll_jfc(urma_jfc_t*,int,urma_cr_t* cr){
   Require(pending!=0,"poll follows post");
   if(fault==Fault::Poll){errno=EIO;return -1;}
   cr->status=fault==Fault::CqStatus?URMA_CR_REM_ACCESS_ABORT_ERR:URMA_CR_SUCCESS;
+  if(fault==Fault::LocalAccess)cr->status=URMA_CR_LOC_ACCESS_ERR;
   cr->user_ctx=fault==Fault::UserContext?pending+1:pending;
   cr->local_id=17;cr->tpn=23;pending=0;return 1;
 }
@@ -84,9 +101,10 @@ void ReadTest(bool distinct_eids){
   urma_device_t device{};urma_context_t context{};context.dev=&device;context.eid.raw[15]=1;
   auto backend=p::CreateUrmaBackend(&context);
   p::Endpoint cpu{};Require(backend->Allocate(32768,&cpu).ok(),"allocate");
+  Require(cpu.token&&cpu.token==registered_token,"Allocate exports DDR authentication value");
   std::vector<std::uint8_t> memory(20000);for(std::size_t i=0;i<memory.size();++i)memory[i]=i%251;
   p::Endpoint source{};source.base=reinterpret_cast<std::uint64_t>(memory.data());source.bytes=memory.size();
-  source.tp=7;source.psn=1;source.token=2;source.key_bytes=32;source.segment_bytes=48;source.eid[15]=2;
+  source.tp=7;source.psn=1;source.token=cpu.token;source.key_bytes=32;source.segment_bytes=48;source.eid[15]=2;
   urma_seg_t segment{};segment.ubva.va=source.base;segment.len=source.bytes;
   segment.ubva.eid.raw[15]=distinct_eids?3:2;
   source.key[15]=segment.ubva.eid.raw[15];
@@ -98,7 +116,11 @@ void ReadTest(bool distinct_eids){
   Require(!backend->Open(invalid,&cpu).ok(),"reject source extending past exported range");
   invalid=source;invalid.base=UINT64_MAX;invalid.bytes=2;
   Require(!backend->Open(invalid,&cpu).ok(),"reject source address overflow");
-  Require(imported_mrs==0&&queues==0,"range errors rejected before resource creation");
+  invalid=source;invalid.token^=2;
+  Require(backend->Open(invalid,&cpu).message().find("source token differs")!=std::string::npos,"reject mismatched region token");
+  invalid=source;invalid.token=0;
+  Require(!backend->Open(invalid,&cpu).ok(),"reject missing token");
+  Require(imported_mrs==0&&queues==0,"range/token errors rejected before resource creation");
   Require(backend->Open(source,&cpu).ok(),"open source");
   std::vector<p::Span> spans{{7,64,10001},{15000,16000,123}};
   const int before=posts;
@@ -111,10 +133,16 @@ void ReadTest(bool distinct_eids){
     if(fault==Fault::Post)
       Require(result.message().find("errno="+std::to_string(EINVAL))!=std::string::npos&&
               result.message().find("bad_wr_is_current=1")!=std::string::npos,"post error keeps errno and bad WR");
-    if(fault==Fault::CqStatus||fault==Fault::UserContext)
+    if(fault==Fault::CqStatus||fault==Fault::LocalAccess||fault==Fault::UserContext)
       Require(result.message().find("cq_status=")!=std::string::npos&&
               result.message().find("cq_user_ctx=")!=std::string::npos&&
               result.message().find("local_id=17 tpn=23")!=std::string::npos,"CQ diagnostics retain completion details");
+    if(fault==Fault::LocalAccess)
+      Require(result.message().find("cq_status=4 cq_status_name=URMA_CR_LOC_ACCESS_ERR")!=std::string::npos,
+              "local access failure is decoded");
+    Require(result.message().find("dst_mr_access=1 dst_mr_token_id=7")!=std::string::npos&&
+            result.message().find("dst_mr_bytes=32768")!=std::string::npos&&
+            result.message().find("src_mr_bytes=20000")!=std::string::npos,"failure retains registered MR details");
     const int calls=post_calls;
     Require(backend->Read(spans).message()==result.message()&&post_calls==calls,"quarantined backend never resubmits READ");
     Require(backend->ReleaseSource().message()==result.message()&&backend->Close().message()==result.message(),
@@ -133,10 +161,23 @@ void ReadTest(bool distinct_eids){
   Require(backend->ReleaseSource().ok()&&imported_mrs==0&&queues==0&&local_mrs==1,"release source before pool");
   Require(backend->Close().ok()&&local_mrs==0,"release pool");
 }
+void RegistrationFailureTest(){
+  urma_context_t context{};
+  for(auto invalid:{BadLocalSegment::ZeroBase,BadLocalSegment::Short,BadLocalSegment::NoWrite,BadLocalSegment::NonPin}){
+    bad_local_segment=invalid;
+    auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+    const auto status=backend->Allocate(4096,&cpu);
+    Require(status.message().find("invalid registered DDR")!=std::string::npos,"reject malformed DDR registration");
+    Require(!cpu.token&&!cpu.base&&imported_mrs==0&&queues==0,"invalid DDR never published or linked");
+    Require(backend->Close().ok()&&local_mrs==0,"failed registration cleans up");
+  }
+  bad_local_segment=BadLocalSegment::None;
+}
 int main(){try{
+  RegistrationFailureTest();
   ReadTest(false);
   ReadTest(true);
-  for(auto injected:{Fault::Post,Fault::Poll,Fault::CqStatus,Fault::UserContext}){
+  for(auto injected:{Fault::Post,Fault::Poll,Fault::CqStatus,Fault::LocalAccess,Fault::UserContext}){
     const auto child=fork();Require(child>=0,"fork failure scenario");
     if(child==0){fault=injected;try{ReadTest(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}
     int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"READ failure scenario passed");

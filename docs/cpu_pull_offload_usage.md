@@ -114,16 +114,22 @@ CQ 错误或超时会隔离该 CPU transport，首版不尝试强制取消/重�
 
 Offload 沿用上述 EID 与导出标识的处理方式，将 READ 来源扩展为调用方的 Tensor HBM；源 MR 只开放远端 READ，任务完成后提交元数据。
 
+token 也沿用参考实现的 region 约定：CPU 在 Allocate 时生成非零 `token_value`，用于 DDR 注册并在响应中返回；NPU 用它注册 HBM、创建 Jetty，CPU 用同一个值导入 HBM 和 Jetty、创建本地接收队列。两端的 `token_id` 仍分别由各自 provider 分配，不能将本地 token ID 当作共享的认证值。Open 会检查 token 一致性。
+
+早期 Offload 的 CPU DDR 使用本地 token ID 作为 token value，而 NPU 每次导出另行生成 token。更新此约定后需要两端重新编译并重启；旧服务缺少 Allocate token 会在注册 HBM 前被拒绝。此对齐消除了一项与可用基线的差异，仍需硬件复测确认是否解决 CQ 错误。
+
 ### READ 未完成时
 
 Jetty 导入成功只代表建链资源已创建，初始化还要用一次 READ 验证 HBM 到 DDR 的数据路径。CPU 服务按 `region`、`task` 打印 `CPU_PULL_TASK_BEGIN` 和 `CPU_PULL_TASK_END`；错误详情包含以下阶段：
 
 - `stage=post_read`：提交失败，保留 URMA 返回值、`errno` 和 bad WR 信息。
 - `stage=poll_cq`：查询 CQ 失败。
-- `stage=cq_completion`：CQ 状态非成功或返回的 `user_ctx` 不匹配；打印 `cq_status`、`cq_user_ctx`、预期 `wr_id`、`local_id`、`tpn`。
+- `stage=cq_completion`：CQ 状态非成功或返回的 `user_ctx` 不匹配；打印 `cq_status`、`cq_status_name`、`cq_user_ctx`、预期 `wr_id`、`local_id`、`tpn`。
 - `stage=cq_timeout`：提交后 15 秒仍未收到有效完成。
 
 每种 READ 错误都保留 `sge_bytes`、源/目标地址和长度。NPU 异常会区分 CPU transport 已隔离和任务仍在运行但调用方等待超时，并给出相同的 `region/task` 以关联 CPU 日志。`resolve_offload()` 只查询原任务，不重发 READ，也不重建已隔离的硬件队列。
+
+公开 UMDK 24.12 中，`cq_status=4` 是 `URMA_CR_LOC_ACCESS_ERR`，表示本地内存访问错误；`ret=1` 表示取到一条 CQ 记录，不表示 READ 成功。优先核对 CPU 接收 MR、SGE ABI 和保护信息，不应仅凭该状态改换 NPU EID。`CPU_PULL_DDR` 记录驱动实际返回的 `registered_base/bytes/attr/access/token_id`、分配的 token ID 和范围/权限检查结果；检查不通过时在提交 DMA 前失败。READ 错误同时附带 `dst_mr_*` 与 `src_mr_*`，用于检查地址是否落在实际注册范围内。日志不输出共享认证 token 的值。
 
 若使用参考分支的 provider，先确认 `sge_bytes=32`，并保留本轮设备、NPU EID、CPU candidate 参数复测，以便区分 ABI 变化和路径变化。当前独立验收进程已经退出且 CPU transport 被隔离时，应停止旧 CPU 服务，再启动新二进制和新的 Python 验收进程。仅凭 `pending/quarantined` 无法判断 ABI 或链路是哪一个出了问题，需要完整的 CPU 任务错误行。
 

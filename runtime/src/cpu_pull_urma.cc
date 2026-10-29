@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <dlfcn.h>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <thread>
 
@@ -38,6 +39,26 @@ static_assert(sizeof(urma_seg_t) == 48 && sizeof(urma_jetty_id_t) == 24);
 static_assert(sizeof(RemoteJetty) == 72 && sizeof(TpQuery) == 40 && sizeof(ActiveTp) == 40);
 static_assert(offsetof(urma_device_attr_t, dev_cap) + offsetof(urma_device_cap_t, max_msg_size) == 72);
 Status Error(const char* operation) { return Status::Internal(std::string("CPU Pull: ") + operation); }
+const char* CompletionName(urma_cr_status_t status) {
+  switch (status) {
+    case URMA_CR_SUCCESS: return "URMA_CR_SUCCESS";
+    case URMA_CR_LOC_LEN_ERR: return "URMA_CR_LOC_LEN_ERR";
+    case URMA_CR_LOC_OPERATION_ERR: return "URMA_CR_LOC_OPERATION_ERR";
+    case URMA_CR_LOC_ACCESS_ERR: return "URMA_CR_LOC_ACCESS_ERR";
+    case URMA_CR_REM_ACCESS_ABORT_ERR: return "URMA_CR_REM_ACCESS_ABORT_ERR";
+    case URMA_CR_ACK_TIMEOUT_ERR: return "URMA_CR_ACK_TIMEOUT_ERR";
+    case URMA_CR_RNR_RETRY_CNT_EXC_ERR: return "URMA_CR_RNR_RETRY_CNT_EXC_ERR";
+    case URMA_CR_WR_FLUSH_ERR: return "URMA_CR_WR_FLUSH_ERR";
+    default: return "other";
+  }
+}
+void DescribeSegment(std::ostream& out, const char* name, const urma_seg_t& segment) {
+  out << ' ' << name << "_base=0x" << std::hex << segment.ubva.va
+      << ' ' << name << "_attr=0x" << segment.attr.value << std::dec
+      << ' ' << name << "_bytes=" << segment.len
+      << ' ' << name << "_access=" << segment.attr.bs.access
+      << ' ' << name << "_token_id=" << segment.token_id;
+}
 
 class UrmaBackend final : public Backend {
  public:
@@ -46,7 +67,11 @@ class UrmaBackend final : public Backend {
     if (!Close().ok()) std::fprintf(stderr, "CPU_PULL: retaining non-quiescent resources\n");
   }
   Status Allocate(std::uint64_t bytes, Endpoint* local) override {
-    if (!context_ || memory_ || !bytes || bytes > SIZE_MAX) return Error("invalid allocation");
+    if (!context_ || !local || memory_ || !bytes || bytes > SIZE_MAX) return Error("invalid allocation");
+    // Match aicpu-urma: one authentication value for the region's DDR, HBM
+    // exports and Jettys. Each registration still owns its local token ID.
+    std::random_device random;
+    region_token_ = static_cast<std::uint32_t>(random()) | 1U;
     if (posix_memalign(&memory_, 4096, bytes)) return Error("allocate DDR");
     bytes_ = bytes;
     std::memset(memory_, 0, bytes);
@@ -54,23 +79,35 @@ class UrmaBackend final : public Backend {
     if (!token_) return Error("allocate DDR token");
     urma_seg_cfg_t cfg{};
     cfg.va = reinterpret_cast<std::uint64_t>(memory_); cfg.len = bytes;
-    cfg.token_id = token_; cfg.token_value.token = token_->token_id;
+    cfg.token_id = token_; cfg.token_value.token = region_token_;
     cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
     cfg.flag.bs.token_id_valid = 1;
     cfg.flag.bs.access = URMA_ACCESS_LOCAL_WRITE;
     cfg.flag.bs.non_pin = 0;
     destination_ = urma_register_seg(context_, &cfg);
     if (!destination_) return Error("register pinned LOCAL_WRITE DDR");
+    const auto& segment = destination_->seg;
+    const bool range_ok = segment.ubva.va && cfg.va <= UINT64_MAX-bytes &&
+        cfg.va >= segment.ubva.va && Contains(segment.len, cfg.va-segment.ubva.va, bytes);
+    const bool access_ok = (segment.attr.bs.access & URMA_ACCESS_LOCAL_WRITE) && !segment.attr.bs.non_pin;
+    std::ostringstream diagnostic;
+    diagnostic << "CPU_PULL_DDR base=0x" << std::hex << cfg.va << std::dec
+               << " bytes=" << bytes << " sge_bytes=" << sizeof(Sge) << " access=LOCAL_WRITE"
+               << " token_scope=region allocated_token_id=" << token_->token_id;
+    DescribeSegment(diagnostic, "registered", segment);
+    diagnostic << " range_ok=" << range_ok << " access_ok=" << access_ok;
+    std::fprintf(stderr, "%s\n", diagnostic.str().c_str());
+    if (!range_ok || !access_ok) return Error("invalid registered DDR range/access; inspect CPU_PULL_DDR");
     local->base = reinterpret_cast<std::uint64_t>(memory_); local->bytes = bytes;
+    local->token = region_token_;
     std::memcpy(local->eid, context_->eid.raw, 16);
-    std::fprintf(stderr, "CPU_PULL_DDR base=%p bytes=%llu sge_bytes=%zu access=LOCAL_WRITE\n",
-                 memory_, static_cast<unsigned long long>(bytes), sizeof(Sge));
     return Status::OK();
   }
   Status Open(const Endpoint& source, Endpoint* local) override {
-    if (source_ || jetty_ || poisoned_ || source.segment_bytes != sizeof(urma_seg_t) ||
+    if (!local || !destination_ || source_ || jetty_ || poisoned_ || source.segment_bytes != sizeof(urma_seg_t) ||
         source.key_bytes != 32 || !source.tp || !source.psn || !source.token)
       return Error("invalid source endpoint");
+    if (source.token != region_token_) return Error("source token differs from allocated region token");
     urma_seg_t segment{}; std::memcpy(&segment, source.segment, sizeof(segment));
     // The CTP route EID and the exported segment's EID need not be equal.
     // Import the provider's segment verbatim, just as aicpu-urma does, while
@@ -99,7 +136,7 @@ class UrmaBackend final : public Backend {
     cq_ = urma_create_jfc(context_, &cq_cfg);
     if (!cq_) return Error("create CQ");
     urma_jfr_cfg_t rq_cfg{}; rq_cfg.depth = 256; rq_cfg.max_sge = 1;
-    rq_cfg.trans_mode = URMA_TM_RM; rq_cfg.jfc = cq_; rq_cfg.token_value.token = source.token;
+    rq_cfg.trans_mode = URMA_TM_RM; rq_cfg.jfc = cq_; rq_cfg.token_value.token = region_token_;
     rq_ = urma_create_jfr(context_, &rq_cfg);
     if (!rq_) return Error("create RQ");
     urma_jetty_cfg_t cfg{}; cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
@@ -124,7 +161,7 @@ class UrmaBackend final : public Backend {
     ActiveTp active{}; active.local = tp.handle; active.remote = source.tp; active.tx = psn; active.rx = source.psn;
     peer_ = import(context_, &remote, &token, &active);
     if (!peer_) return Error("import source Jetty");
-    local->tp = tp.handle; local->psn = psn; local->token = source.token;
+    local->tp = tp.handle; local->psn = psn; local->token = region_token_;
     local->key_bytes = 28;
     std::memcpy(local->key, &jetty_->jetty_id, 24);
     std::memcpy(local->key+24, &jetty_->jetty_cfg.jfs_cfg.trans_mode, 4);
@@ -210,8 +247,11 @@ class UrmaBackend final : public Backend {
             << " bad_wr_is_current=" << (bad == &wr_);
     if (cr)
       message << " cq_status=" << static_cast<unsigned>(cr->status)
+              << " cq_status_name=" << CompletionName(cr->status)
               << " cq_user_ctx=" << cr->user_ctx << " cq_flags=" << unsigned(cr->flag.value)
               << " local_id=" << cr->local_id << " tpn=" << cr->tpn;
+    if (destination_) DescribeSegment(message, "dst_mr", destination_->seg);
+    if (source_) DescribeSegment(message, "src_mr", source_->seg);
     if (std::strcmp(stage, "cq_timeout") == 0) message << " timeout_ms=15000";
     return Poison(message.str());
   }
@@ -225,7 +265,7 @@ class UrmaBackend final : public Backend {
   urma_context_t* context_;
   void* memory_{};
   std::uint64_t bytes_{}, source_base_{}, sequence_{};
-  std::uint32_t max_bytes_{};
+  std::uint32_t max_bytes_{}, region_token_{};
   bool poisoned_{};
   std::string failure_;
   urma_token_id_t* token_{};

@@ -18,6 +18,8 @@ enum class State : std::uint32_t { Empty, Open, Running, Done, Failed, InDoubt, 
 struct Span { std::uint64_t source, destination, bytes; };
 struct Endpoint {
   std::uint64_t base{}, bytes{}, tp{};
+  // Allocate returns a nonzero region authentication token. Open echoes it
+  // for HBM and both Jettys; token IDs remain local provider-owned objects.
   std::uint32_t psn{}, token{}, key_bytes{}, segment_bytes{};
   // eid selects the CTP route. key and segment are opaque provider exports;
   // their embedded EIDs can differ from the route EID and must stay unchanged.
