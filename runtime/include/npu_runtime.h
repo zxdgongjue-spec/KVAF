@@ -11,6 +11,7 @@
 namespace kvaf {
 
 struct BatchGetKernelProfile;
+enum class Transport { kUrma, kUbmem };
 
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
@@ -20,6 +21,8 @@ struct NpuRuntimeOptions {
         batch_get_token_bytes(token_bytes),
         batch_get_tokens_per_block(tokens_per_block) {}
 
+  // KVAF_TRANSPORT=urma|ubmem overrides this when the Runtime is constructed.
+  Transport transport{Transport::kUrma};
   std::string batch_get_kernel_object_path;
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
@@ -69,7 +72,7 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
-  Status SetBatchGetKernelProfiling(bool enabled);
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

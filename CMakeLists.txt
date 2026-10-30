@@ -9,9 +9,8 @@ option(KVAF_ENABLE_AIV_BATCH_PUT
        "Build the CANN-backed Direct-HCCP BatchPut data plane"
        ${KVAF_ENABLE_AIV_BATCH_GET})
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
-       "Build the liburma-only persistent CPU DDR/Jetty service"
+       "Build the persistent CPU DDR service (URMA and UBmem)"
        OFF)
-
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
     "KVAF_ENABLE_AIV_BATCH_PUT requires KVAF_ENABLE_AIV_BATCH_GET because "

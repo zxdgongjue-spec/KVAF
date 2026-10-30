@@ -373,8 +373,8 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
-  void StartBatchGetKernelProfile() {
-    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
+  void StartBatchGetKernelProfile(bool detailed) {
+    ThrowIfError(native_->SetBatchGetKernelProfiling(true, detailed));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
@@ -400,6 +400,11 @@ class NpuPythonRuntime final {
       item["post_active_cycles"] = profile.post_active_cycles;
       item["drain_wait_cycles"] = profile.drain_wait_cycles;
       item["peak_submitted_not_drained"] = profile.peak_submitted_not_drained;
+      item["ubmem_profile_detail"] = profile.ubmem_profile_detail;
+      item["ubmem_setup_cycles"] = profile.ubmem_setup_cycles;
+      item["ubmem_address_cycles"] = profile.ubmem_address_cycles;
+      item["ubmem_submit_cycles"] = profile.ubmem_submit_cycles;
+      item["ubmem_drain_cycles"] = profile.ubmem_drain_cycles;
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
@@ -578,6 +583,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            "CPU torch.int64 Tensor.")
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
+           py::arg("detailed") = false,
            "Enable the per-core BatchGet kernel cycle timeline.")
       .def("batch_get_kernel_profile",
            &NpuPythonRuntime::BatchGetKernelProfileSnapshot,

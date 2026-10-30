@@ -14,12 +14,14 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N] [--without-urma] [--without-python]
 
-cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
+cpu  Builds the unified CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
+     --without-urma includes only the UBmem backend in the same service.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+     --without-python builds NPU C++ libraries and tests without the binding.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -107,6 +109,13 @@ build_cpu() {
   local urma_library
 
   require_command cmake
+  if [[ "$without_urma" == ON ]]; then
+    cmake -S "$KVAF_ROOT" -B "$build_dir" -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+      -DKVAF_CPU_ENABLE_URMA=OFF -DBUILD_TESTING=ON
+    cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
+    echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
+    return
+  fi
   ensure_umdk_source "$umdk_root"
   urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
   if [[ -z "$urma_library" ]]; then
@@ -119,7 +128,7 @@ build_cpu() {
   [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_CPU_ENABLE_URMA=ON -DBUILD_TESTING=ON \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
@@ -145,27 +154,31 @@ build_npu() {
   local jobs="$2"
   local python_bin="${PYTHON:-python3}"
   local cann_root
-  local pybind11_dir
+  local pybind11_dir=""
+  local build_python=OFF
 
   require_command cmake
-  require_command "$python_bin"
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit was not found; source CANN set_env.sh or set ASCEND_CANN_PACKAGE_PATH"
-  if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
-    echo "[KVAF_BUILD] installing pybind11 for $python_bin"
-    "$python_bin" -m pip install --user pybind11
+  if [[ "$without_python" != ON ]]; then
+    build_python=ON
+    require_command "$python_bin"
+    if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
+      echo "[KVAF_BUILD] installing pybind11 for $python_bin"
+      "$python_bin" -m pip install --user pybind11
+    fi
+    pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
   fi
-  pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
-    -DKVAF_BUILD_PYTHON=ON \
+    -DKVAF_BUILD_PYTHON="$build_python" \
     -DKVAF_ENABLE_AIV_BATCH_GET=ON \
     -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     -Dpybind11_DIR="$pybind11_dir"
   cmake --build "$build_dir" --parallel "$jobs"
-  echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
+  if [[ "$build_python" == ON ]]; then echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"; fi
   echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
 }
@@ -179,8 +192,12 @@ esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
+without_urma=OFF
+without_python=OFF
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --without-urma) without_urma=ON; shift ;;
+    --without-python) without_python=ON; shift ;;
     --build-dir)
       [[ $# -ge 2 ]] || die "--build-dir requires a value"
       build_dir="$2"
