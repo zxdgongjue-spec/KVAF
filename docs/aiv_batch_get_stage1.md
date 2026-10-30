@@ -1,33 +1,91 @@
 # AIV BatchGet 第一阶段实现与验证
 
-## 当前临时运行方式：只检查 CPU push / done
+## load 故障的独立诊断入口
 
-为先验证前半段链路及退出，`test_aiv_scatter_batch_get.py` 暂时强制
-`KVAF_AIV_SCATTER_PROBE=done`，覆盖 shell 中残留的 load/dma/copy 设置。
-kernel 确认本轮 done 后通过既有 `AFTER_DONE` 分支提前返回，跳过整个
-`CopyPayload`，包括 staging flush、UB 分配、MTE2 配置/搬运和 MTE3 写出。
-仍执行状态回传、原有最终屏障以及正常 shutdown。
+`tests/python/diagnose_aiv_scatter.py` 默认实际执行 load，不会替换为 done。它为每个
+检查点启动独立 Python 进程，合并保存 stdout/stderr，在首个非零退出码处停止，
+不会在设备异常后继续启动下一个检查点。默认不执行 MTE3 的 copy 或完整回归。
+
+先同时重编 Host 与 kernel（此次所有 scatter 探针增加设备返回的诊断版本 1，
+旧 kernel 不会被新 Host 误认为通过）：
+
+```bash
+cmake --build build-npu -j
+export PYTHONPATH="$PWD/build-npu/python"
+# 沿用 KVAF_CPU_SERVICE_ADDR、KVAF_BATCH_PUT_KERNEL 和有效的 NPU EID。
+KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
+  KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
+  python -u tests/python/diagnose_aiv_scatter.py
+
+# 显式选择一项对照检查点；仍会使用独立进程。
+KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 \
+  python -u tests/python/diagnose_aiv_scatter.py --stages dma
+```
+
+默认只运行 load。需要缩小范围时，显式传入 `--stages setup gm body dma ub load`。
+各项含义如下，所有检查点都保留真实 CPU descriptor/payload/done 协议，
+只有正常同步并核对每核状态之后才打印完成标记：
+
+| 检查点 | 新执行范围 | 成功证据 |
+| --- | --- | --- |
+| done | AIV 读到本轮 done | sequence/result/phase 匹配 |
+| flush | 输出行寻址、静态 UB 构造与 staging flush | output 保持 guard |
+| setup | MTE2 配置与 S→MTE2 同步 | configured_bytes |
+| gm | 标量逐字节读取 staging，不执行 payload DMA/UB 读取 | scalar_bytes、每核 checksum |
+| body | 仅整块 DataCopy 及每次 MTE2→S 同步，不执行尾部 DMA/UB 读取 | body_bytes |
+| dma | 主体和尾部 CopyIn 及 MTE2→S 同步，不读取 UB | dma_bytes |
+| ub | 完整 CopyIn 后逐字节读取 UB，不做 GM 参考比较 | scalar_bytes、每核 checksum |
+| load | 完整 CopyIn 后比较 UB/staging 的有效字节 | verification=gm_ub_byte_compare、verified_bytes |
+
+656 B 对应 640 B 主体和 16 B 尾部。body 成功、dma 失败时，优先核对尾部
+DataCopyPad、同步与该路径收尾；dma 成功、ub 失败时，优先核对 UB 标量读取；
+gm/ub 都成功但 load 失败时，核对组合比较路径和实际异常指令。检查点会改变
+执行范围及编译结果，成败不能直接证明某一条指令是根因。所有路径仍执行状态
+写回、flush 和退出屏障。checksum 只用于保留读取、观察内容，不代表业务数据验收。
+小于 32 B 的 token 无主体，显式选择 body 会被拒绝，应直接用 dma 检查尾部。
+
+默认日志目录为 `scatter-diagnostics-<时间>/`，可用 `--log-dir` 指定新目录。
+`manifest.txt` 保存实际脚本、Get/Put kernel 的 SHA-256 和 checkout commit，
+每个 stage 的日志保留子进程 PID。`SCATTER_KERNEL_READY` 另打印实际加载字节
+的 FNV-1a 指纹和 Host 诊断版本；`SCATTER_LAUNCH` 打印 HBM workspace、
+descriptor、staging、done、output 和 status 地址。Host 的 BEGIN/LAUNCH
+日志只证明准备/提交，不能证明设备到达相应位置。
+
+正常同步后 `SCATTER_STATUS` 包含设备诊断版本、每核 result/phase/requests
+以及 detail0/detail1。gm/ub 中它们分别是 checksum 和读取字节数；内容比较
+失败时错误会打印 `local_request`、token 内的 `byte_offset`、`gm_byte`、
+`ub_byte`。旧 Host 缺少完成版本时，新诊断脚本拒绝通过；旧 kernel 返回版本
+不匹配时，新 Host 拒绝通过。参数仍为 176 B，状态仍为 64 B，CPU 协议不变。
+
+若仍有 507015，不在失败 stream 上尝试额外回读 checkpoint。保留首个失败的
+stage 日志、manifest、对应 `.o`，以及相同 PID/Device/时刻的 CPU 和 Ascend
+设备异常摘要（fault kernel、errcode、fixedPCOffset、MTE_ERROR、SU_ERROR）。
+确认故障进程退出和设备可用后再复测；旧 PC 偏移不能映射到重编后的产物。
+
+## 独立 scatter 测试入口
+
+`test_aiv_scatter_batch_get.py` 已删除临时强制 done 的覆盖，保留调用方指定的
+`KVAF_AIV_SCATTER_PROBE`。设置 load 会执行真正的 GM→UB、同步和内容比较；
+未设置 probe 时执行完整 scatter 回归。只有显式选择 done 才会提前返回。
 
 ```bash
 git pull --ff-only
-DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
+KVAF_AIV_SCATTER_PROBE=load DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
   KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
   python tests/python/test_aiv_scatter_batch_get.py
 ```
 
 沿用已有 CPU 服务、Python、BatchPut kernel 和 `KVAF_RUN_NPU_TESTS=1` 环境。
-当前 Host/kernel 已支持 done 时，这次只需更新 Python，不必重新编译。
+本次诊断版本更新需要同时重编 Host/kernel。
 默认 1 核、656 B 时连续运行 `[1, 3, 1]` 三批，检查序号/工作区复用和
 output 全部保持 `0xAD`；只有正常 shutdown 后才打印：
 
 ```text
-PROBE_COMPLETE: stage=done ... output=unchanged cpu_push=done_seen mte2=skipped mte3=skipped payload_content=not_checked (not a full regression PASS)
+PROBE_COMPLETE: stage=load ... output=unchanged mte2=byte_verified_against_staging (not a full regression PASS)
 ```
 
-这个结果只验收 CPU push/done 链路与退出，不代表 payload 内容或完整 scatter
-输出正确。诊断状态不会被普通 BatchGet 调用当成成功。恢复 MTE2/MTE3 测试时，
-删除 scatter Python 入口中的临时 done 强制设置；下文的 load/dma/copy 命令
-届时才重新生效。gather 独立入口不受影响。
+load 验收 staging→UB 内容一致性，不代表完整 scatter 输出正确。
+诊断状态不会被普通 BatchGet 调用当成成功，gather 独立入口不受影响。
 
 ## 范围
 
@@ -476,8 +534,8 @@ HBM done 轮询和本地 `CopyPayload`，所以这些部分仍需单独定位。
 字段，UBSan 可复现并验证此修正。这是 Host 初始化问题，尚无证据将它与
 AIV kernel 的 507015/errcode 259 联系起来。
 
-`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的六个检查点。flush/copy 各运行
-一个非空批次，done/setup/dma/load 各运行三个批次。保留真实的 descriptor/notify、
+`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的九个检查点。flush/copy 各运行
+一个非空批次，done/setup/gm/body/dma/ub/load 各运行三个批次。保留真实的 descriptor/notify、
 CPU payload WRITE 和 done 协议；不能
 用 CPU 侧 WRITE CQ 成功代替 AIV 读到本轮 done 的证明。
 
@@ -665,7 +723,7 @@ manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，
   output 与 UB 边界 guard。模型不替代真实 CANN 编译和设备异常检查。
 - 真实 Host owner 的延迟 ACL 模型：串行复用、异步错误上报、capture 拒绝、
   部分初始化和关闭失败时资源保留/重试。Host 集成源码使用 ACL 声明替身编译。
-- Scatter 六个检查点的模型覆盖：真实 notify/done 流程、1/3/8 核、656/16385 B
+- Scatter 九个检查点的模型覆盖：真实 notify/done 流程、1/3/8 核、656/16385 B
   token、重复序号、预期 DMA 次数、output guard、空请求/非法模式/超时拒绝；
   分别检查普通模式配置、S→MTE2/MTE2→S 等待次数，以及 UB 标量读取次数；
   注入损坏 UB 时，dma 仅报告搬运完成，load 必须报告内容不匹配。

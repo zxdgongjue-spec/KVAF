@@ -28,6 +28,9 @@ const char* ProbeName(uint32_t probe) {
     case KVAF_SEQ_PROBE_DMA: return "dma";
     case KVAF_SEQ_PROBE_LOAD: return "load";
     case KVAF_SEQ_PROBE_COPY: return "copy";
+    case KVAF_SEQ_PROBE_GM: return "gm";
+    case KVAF_SEQ_PROBE_BODY: return "body";
+    case KVAF_SEQ_PROBE_UB: return "ub";
     default: return "none";
   }
 }
@@ -39,6 +42,9 @@ uint64_t ProbePhase(uint32_t probe) {
     case KVAF_SEQ_PROBE_DMA: return KVAF_SCATTER_AFTER_DMA;
     case KVAF_SEQ_PROBE_LOAD: return KVAF_SCATTER_AFTER_LOAD_VERIFIED;
     case KVAF_SEQ_PROBE_COPY: return KVAF_SEQ_AFTER_COPY;
+    case KVAF_SEQ_PROBE_GM: return KVAF_SCATTER_AFTER_GM;
+    case KVAF_SEQ_PROBE_BODY: return KVAF_SCATTER_AFTER_BODY;
+    case KVAF_SEQ_PROBE_UB: return KVAF_SCATTER_AFTER_UB;
     default: return KVAF_SEQ_COMPLETE;
   }
 }
@@ -106,6 +112,15 @@ struct ScatterBatchGet::Impl {
     uint64_t completed_requests = 0;
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
+      if (args.scatter_probe) {
+        std::fprintf(stderr, "[KVAF_AIV_SCATTER_STATUS] stage=%s core=%u sequence=%llu "
+            "result=%llu phase=%llu requests=%llu diag_revision=%llu "
+            "detail0=0x%llx detail1=0x%llx\n", ProbeName(args.scatter_probe), i,
+            static_cast<unsigned long long>(s.sequence), static_cast<unsigned long long>(s.result),
+            static_cast<unsigned long long>(s.phase), static_cast<unsigned long long>(s.requests),
+            static_cast<unsigned long long>(s.data_wrs), static_cast<unsigned long long>(s.sq_pi),
+            static_cast<unsigned long long>(s.cq_ci));
+      }
       if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != expected_result ||
           s.phase != expected_phase) {
         failed = true;
@@ -115,12 +130,21 @@ struct ScatterBatchGet::Impl {
             " result=" + std::to_string(s.result) + " probe=" + ProbeName(args.scatter_probe) +
             " expected_phase=" + std::to_string(expected_phase) +
             " expected_result=" + std::to_string(expected_result) +
-            (s.result == KVAF_SCATTER_MTE2_MISMATCH ? " detail=MTE2_GM_UB_byte_mismatch" : ""));
+            (s.result == KVAF_SCATTER_MTE2_MISMATCH ?
+                " detail=MTE2_GM_UB_byte_mismatch local_request=" + std::to_string(s.requests) +
+                " byte_offset=" + std::to_string(s.sq_pi) +
+                " gm_byte=" + std::to_string((s.cq_ci >> 8) & 255) +
+                " ub_byte=" + std::to_string(s.cq_ci & 255) : ""));
+      }
+      if (args.scatter_probe && s.data_wrs != KVAF_SCATTER_DIAGNOSTIC_REVISION) {
+        failed = true;
+        return Error("scatter diagnostic revision mismatch; rebuild Host and scatter kernel together");
       }
       completed_requests += s.requests;
     }
     if ((args.scatter_probe == KVAF_SEQ_PROBE_SETUP || args.scatter_probe == KVAF_SEQ_PROBE_DMA ||
-         args.scatter_probe == KVAF_SEQ_PROBE_LOAD) && !completed_requests) {
+         args.scatter_probe == KVAF_SEQ_PROBE_LOAD || args.scatter_probe == KVAF_SEQ_PROBE_GM ||
+         args.scatter_probe == KVAF_SEQ_PROBE_BODY || args.scatter_probe == KVAF_SEQ_PROBE_UB) && !completed_requests) {
       failed = true;
       return Error("MTE2 probe completed no requests");
     }
@@ -134,9 +158,14 @@ struct ScatterBatchGet::Impl {
               " configured_bytes=" + std::to_string(completed_requests * config.batch_get_token_bytes) :
            args.scatter_probe == KVAF_SEQ_PROBE_DMA ?
               " dma_bytes=" + std::to_string(completed_requests * config.batch_get_token_bytes) :
+           args.scatter_probe == KVAF_SEQ_PROBE_BODY ?
+              " body_bytes=" + std::to_string(completed_requests * (config.batch_get_token_bytes / 32 * 32)) :
+           args.scatter_probe == KVAF_SEQ_PROBE_GM || args.scatter_probe == KVAF_SEQ_PROBE_UB ?
+              " scalar_bytes=" + std::to_string(completed_requests * config.batch_get_token_bytes) :
            args.scatter_probe == KVAF_SEQ_PROBE_LOAD ?
               " verification=gm_ub_byte_compare verified_bytes=" +
-                  std::to_string(completed_requests * config.batch_get_token_bytes) : ""));
+                  std::to_string(completed_requests * config.batch_get_token_bytes) : "") +
+          " diag_revision=" + std::to_string(KVAF_SCATTER_DIAGNOSTIC_REVISION));
     }
     return Status::OK();
   }
@@ -260,10 +289,12 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
   const char* probe = std::getenv("KVAF_AIV_SCATTER_PROBE");
   if (probe && *probe) {
-    for (uint32_t value = KVAF_SEQ_PROBE_DONE; value <= KVAF_SEQ_PROBE_DMA; ++value)
+    for (uint32_t value = KVAF_SEQ_PROBE_DONE; value <= KVAF_SEQ_PROBE_UB; ++value)
       if (std::strcmp(probe, ProbeName(value)) == 0) s.args.scatter_probe = value;
     if (!s.args.scatter_probe)
-      return Status::InvalidArgument("KVAF_AIV_SCATTER_PROBE must be done, flush, setup, dma, load or copy");
+      return Status::InvalidArgument("KVAF_AIV_SCATTER_PROBE must be done, flush, setup, gm, body, dma, ub, load or copy");
+    if (s.args.scatter_probe == KVAF_SEQ_PROBE_BODY && s.config.batch_get_token_bytes < 32)
+      return Status::InvalidArgument("scatter body probe needs token_bytes >= 32; no aligned body exists");
   }
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
@@ -315,6 +346,16 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
     std::fprintf(stderr, "[KVAF_AIV_SCATTER_PROBE_BEGIN] stage=%s sequence=%llu cores=%u token_bytes=%u\n",
                  ProbeName(args.scatter_probe), static_cast<unsigned long long>(args.sequence),
                  args.request.block_count, args.request.token_bytes);
+    std::fprintf(stderr, "[KVAF_AIV_SCATTER_LAUNCH] diag_revision=%llu workspace=0x%llx "
+        "workspace_bytes=%llu descriptor=0x%llx staging=0x%llx done=0x%llx "
+        "output=0x%llx status=0x%llx capacity=%u max_polls=%u\n",
+        static_cast<unsigned long long>(KVAF_SCATTER_DIAGNOSTIC_REVISION),
+        static_cast<unsigned long long>(args.workspace), static_cast<unsigned long long>(args.workspace_bytes),
+        static_cast<unsigned long long>(args.workspace + args.descriptor_offset),
+        static_cast<unsigned long long>(args.workspace + args.staging_offset),
+        static_cast<unsigned long long>(args.workspace + 128),
+        static_cast<unsigned long long>(args.request.output),
+        static_cast<unsigned long long>(args.request.core_status), args.request.request_capacity, args.max_polls);
     std::fflush(stderr);
   }
   s.pending = static_cast<aclrtStream>(exec.execution.stream);

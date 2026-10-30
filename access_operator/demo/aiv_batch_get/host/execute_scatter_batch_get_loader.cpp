@@ -63,8 +63,13 @@ extern "C" int32_t KvafScatterBatchGetLoadKernel(const char *kernel_object_path)
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
   g_loaded = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_KERNEL_READY path=%s dyn_ubuf_bytes=%u\n",
-      path.c_str(), kKernelDynamicUbufBytes);
+  uint64_t fingerprint = 14695981039346656037ULL;
+  for (unsigned char byte : g_binary_bytes) fingerprint = (fingerprint ^ byte) * 1099511628211ULL;
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_KERNEL_READY path=%s dyn_ubuf_bytes=%u "
+      "host_diag_revision=%llu kernel_bytes=%zu kernel_fnv1a=0x%016llx\n",
+      path.c_str(), kKernelDynamicUbufBytes,
+      static_cast<unsigned long long>(KVAF_SCATTER_DIAGNOSTIC_REVISION), g_binary_bytes.size(),
+      static_cast<unsigned long long>(fingerprint));
   return KVAF_BATCH_GET_SUCCESS;
 }
 

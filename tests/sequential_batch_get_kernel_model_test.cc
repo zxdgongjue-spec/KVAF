@@ -295,6 +295,8 @@ int main() {
   const std::pair<uint32_t, uint64_t> probes[] = {
       {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_AFTER_DONE}, {KVAF_SEQ_PROBE_FLUSH, KVAF_SEQ_AFTER_FLUSH},
       {KVAF_SEQ_PROBE_SETUP, KVAF_SCATTER_AFTER_SETUP}, {KVAF_SEQ_PROBE_DMA, KVAF_SCATTER_AFTER_DMA},
+      {KVAF_SEQ_PROBE_GM, KVAF_SCATTER_AFTER_GM}, {KVAF_SEQ_PROBE_BODY, KVAF_SCATTER_AFTER_BODY},
+      {KVAF_SEQ_PROBE_UB, KVAF_SCATTER_AFTER_UB},
       {KVAF_SEQ_PROBE_LOAD, KVAF_SCATTER_AFTER_LOAD_VERIFIED}, {KVAF_SEQ_PROBE_COPY, KVAF_SEQ_AFTER_COPY}};
   for (const auto& [probe, phase] : probes)
     for (uint32_t workers : {1U, 3U, 8U})
@@ -321,15 +323,31 @@ int main() {
             assert(s.magic == KVAF_SEQ_STATUS_MAGIC && s.sequence == f.args.sequence);
             assert(s.result == KVAF_SEQ_PROBE_COMPLETE);
             assert(s.phase == phase);
+            assert(s.data_wrs == KVAF_SCATTER_DIAGNOSTIC_REVISION);
+            if (probe == KVAF_SEQ_PROBE_GM || probe == KVAF_SEQ_PROBE_UB) {
+              const uint32_t begin = uint64_t(count) * core / workers;
+              const uint32_t end = uint64_t(count) * (core + 1) / workers;
+              uint64_t checksum = 0;
+              for (uint32_t row = begin; row < end; ++row) {
+                const auto* source = reinterpret_cast<const uint8_t*>(f.addresses[f.indices[row]] + f.offsets[row]);
+                for (uint32_t offset = 0; offset < bytes; offset += kCopyBytes) {
+                  uint64_t part = 0;
+                  for (uint32_t j = offset; j < std::min(bytes, offset + kCopyBytes); ++j)
+                    part += source[j];
+                  checksum ^= part;
+                }
+              }
+              assert(s.sq_pi == checksum && s.cq_ci == uint64_t(end - begin) * bytes);
+            }
           }
           assert(f.push_done);  // Every probe still needs the real notify/done protocol.
           assert(f.output == expected);
           const auto chunks = count * ((bytes + kCopyBytes - 1) / kCopyBytes);
           const bool configured = probe != KVAF_SEQ_PROBE_DONE && probe != KVAF_SEQ_PROBE_FLUSH;
-          const bool copied = configured && probe != KVAF_SEQ_PROBE_SETUP;
+          const bool copied = configured && probe != KVAF_SEQ_PROBE_SETUP && probe != KVAF_SEQ_PROBE_GM;
           const auto expected_aligned = copied ? count * (bytes / kCopyBytes +
               (bytes % kCopyBytes >= 32 ? 1 : 0)) : 0;
-          const auto expected_tail = copied && bytes % 32 ? count : 0;
+          const auto expected_tail = copied && probe != KVAF_SEQ_PROBE_BODY && bytes % 32 ? count : 0;
           const auto expected_reads = expected_aligned + expected_tail;
           assert(aiv_model::out_to_ub_resets - resets == (configured ? chunks : 0));
           assert(aiv_model::event_waits[PIPE_S][PIPE_MTE2] - setup_waits == (configured ? chunks : 0));
@@ -339,7 +357,7 @@ int main() {
           assert(aiv_model::mte2_tail_copies - tail_reads == expected_tail);
           assert(aiv_model::mte3_copies - writes == (probe == KVAF_SEQ_PROBE_COPY ? chunks : 0));
           assert(aiv_model::ub_scalar_reads - scalar_reads ==
-              (probe == KVAF_SEQ_PROBE_LOAD ? uint64_t(count) * bytes : 0));
+              (probe == KVAF_SEQ_PROBE_LOAD || probe == KVAF_SEQ_PROBE_UB ? uint64_t(count) * bytes : 0));
           assert(!aiv_model::mte2.destination && !aiv_model::mte3.destination);
           for (const auto& pipeline : model_events)
             for (const auto& direction : pipeline)
@@ -372,10 +390,14 @@ int main() {
     assert(!aiv_model::corrupt_next_mte2);
     assert(corrupt.status[0].result == KVAF_SCATTER_MTE2_MISMATCH);
     assert(corrupt.status[0].phase == KVAF_SEQ_PAYLOAD);
+    assert(corrupt.status[0].sq_pi == 639);  // Last byte of the 640-byte body was corrupted.
+    const auto packed = corrupt.status[0].cq_ci;
+    assert(((packed >> 8) & 255) == ((packed & 255) ^ 1));
     assert(aiv_model::mte3_copies == writes);
   }
   {
-    for (uint32_t probe : {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_PROBE_SETUP, KVAF_SEQ_PROBE_DMA, KVAF_SEQ_PROBE_LOAD}) {
+    for (uint32_t probe : {KVAF_SEQ_PROBE_DONE, KVAF_SEQ_PROBE_SETUP, KVAF_SEQ_PROBE_DMA, KVAF_SEQ_PROBE_LOAD,
+                           KVAF_SEQ_PROBE_GM, KVAF_SEQ_PROBE_BODY, KVAF_SEQ_PROBE_UB}) {
       Fixture empty(1, 656, 1, KVAF_SEQ_SCATTER, 6);
       empty.args.scatter_probe = probe; empty.active = 0; empty.Run(false);
       assert(empty.status[0].result == KVAF_SEQ_INVALID && !empty.push_requests);
