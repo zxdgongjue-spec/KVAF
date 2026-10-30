@@ -7,16 +7,16 @@ namespace kvaf::ubmem {
 // https://github.com/vllm-project/vllm-ascend/pull/18490
 // Deeper read-ahead follows DeepEP-Ascend's Engram fetch (3b25377):
 // https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377/deep_ep/include/deep_ep/impls/engram/engram_fetch.hpp
-// Keep chunks <= 16 KiB and reduce the stage count for large rows to fit 32 KiB.
+// BufferBytes excludes caller-owned UB scratch. Keep at least two data banks.
 // Event IDs [0, stages_) belong exclusively to this UBmem Get/Put kernel.
-template <uint32_t MaxStages = 2>
+template <uint32_t MaxStages = 2, uint32_t BufferBytes = kMteBufferBytes>
 class MteCopyPipeline {
  public:
   __aicore__ inline explicit MteCopyPipeline(uint64_t row_bytes) {
-    const uint32_t limit = kMteBufferBytes / 2;
+    const uint32_t limit = BufferBytes / 2 / 32 * 32;
     chunk_bytes_ = row_bytes < limit ? row_bytes : limit;
     const uint32_t bank_bytes = (chunk_bytes_ + 31U) / 32U * 32U;
-    const uint32_t available_stages = kMteBufferBytes / bank_bytes;
+    const uint32_t available_stages = BufferBytes / bank_bytes;
     stages_ = available_stages < MaxStages ? available_stages : MaxStages;
     for (uint32_t bank = 0; bank < stages_; ++bank) {
       buffers_[bank].address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);

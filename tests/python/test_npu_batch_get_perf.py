@@ -456,13 +456,14 @@ def print_ubmem_kernel_profile(
         f"clock_mhz={clock_mhz} samples={len(samples)} "
         f"detail={int(detailed)} aggregation=max_elapsed_across_cores "
         "kernel_total=miss_count_address_resolution_mte_copy_and_final_drain "
+        "address_preparation=simt_ub address_batch_rows=128 "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
     if detailed:
         print(
             "KERNEL_PROFILE_DETAIL_CONTRACT "
             "stage_aggregation=on_slowest_total_core_per_sample "
-            "address_prepare=metadata_lookup_validation_and_address_calculation "
+            "address_prepare=simt_lookup_validation_sync_and_scalar_address_loads "
             "mte_submit=copy_call_including_synchronization_not_dma_duration "
             "final_drain=finish_call_through_final_mte3_completion "
             "other=loop_and_timing_bookkeeping "
