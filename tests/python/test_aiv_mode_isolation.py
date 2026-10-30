@@ -45,6 +45,19 @@ class ModeIsolationTests(unittest.TestCase):
                 self.assertEqual(result.exception.code, 0)
                 run.assert_called_once_with(mode)
 
+    def test_scatter_temporarily_skips_payload_even_with_stale_probe(self):
+        for stale_probe in ('', 'load', 'dma', 'copy'):
+            def run(mode):
+                self.assertEqual(mode, 'cpu_push_scatter')
+                self.assertEqual(os.environ['KVAF_AIV_SCATTER_PROBE'], 'done')
+                return 0
+            with patch.dict(os.environ, {'KVAF_AIV_SCATTER_PROBE': stale_probe}), \
+                 patch.object(common, 'run', side_effect=run):
+                with self.assertRaises(SystemExit) as result:
+                    runpy.run_path(str(Path(__file__).with_name('test_aiv_scatter_batch_get.py')),
+                                   run_name='__main__')
+                self.assertEqual(result.exception.code, 0)
+
     def test_suite_runs_next_process_after_failure(self):
         with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1',
                                      'KVAF_AIV_BATCH_GET_MODES': 'cpu_push_scatter,gather_read'}), \

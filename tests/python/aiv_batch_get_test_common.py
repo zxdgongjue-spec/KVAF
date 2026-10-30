@@ -116,9 +116,10 @@ def run(mode: str) -> int:
         # One nonempty request per participating core; keep normal allocation and
         # output placement. Empty requests cannot establish a checkpoint.
         counts = [min(cores, capacity)]
-        if probe in ("setup", "dma", "load"):
-            # Reuse the same per-core UB across rows and launches, with changing
-            # source metadata; include workers with no rows in the first batch.
+        if probe in ("done", "setup", "dma", "load"):
+            # Exercise sequence/workspace reuse with changing source metadata.
+            # Payload probes also reuse UB; done returns before touching UB.
+            # Include workers with no rows in the first batch.
             counts = [1, min(2 * cores + 1, capacity), 1]
     runtime = kvaf.NpuRuntime(
         kernel, token, tokens_per_block, device_id=device_id,
@@ -176,7 +177,8 @@ def run(mode: str) -> int:
         if probe:
             runtime.shutdown()
             output_check = "verified" if probe == "copy" else "unchanged"
-            load_check = {"setup": " mte2=configured_only payload_dma=none",
+            load_check = {"done": " cpu_push=done_seen mte2=skipped mte3=skipped payload_content=not_checked",
+                          "setup": " mte2=configured_only payload_dma=none",
                           "dma": " mte2=completed content=not_checked",
                           "load": " mte2=byte_verified_against_staging"}.get(probe, "")
             print(f"PROBE_COMPLETE: stage={probe} cores={cores} token_bytes={token} "

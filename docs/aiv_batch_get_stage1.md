@@ -1,5 +1,34 @@
 # AIV BatchGet 第一阶段实现与验证
 
+## 当前临时运行方式：只检查 CPU push / done
+
+为先验证前半段链路及退出，`test_aiv_scatter_batch_get.py` 暂时强制
+`KVAF_AIV_SCATTER_PROBE=done`，覆盖 shell 中残留的 load/dma/copy 设置。
+kernel 确认本轮 done 后通过既有 `AFTER_DONE` 分支提前返回，跳过整个
+`CopyPayload`，包括 staging flush、UB 分配、MTE2 配置/搬运和 MTE3 写出。
+仍执行状态回传、原有最终屏障以及正常 shutdown。
+
+```bash
+git pull --ff-only
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
+  KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
+  python tests/python/test_aiv_scatter_batch_get.py
+```
+
+沿用已有 CPU 服务、Python、BatchPut kernel 和 `KVAF_RUN_NPU_TESTS=1` 环境。
+当前 Host/kernel 已支持 done 时，这次只需更新 Python，不必重新编译。
+默认 1 核、656 B 时连续运行 `[1, 3, 1]` 三批，检查序号/工作区复用和
+output 全部保持 `0xAD`；只有正常 shutdown 后才打印：
+
+```text
+PROBE_COMPLETE: stage=done ... output=unchanged cpu_push=done_seen mte2=skipped mte3=skipped payload_content=not_checked (not a full regression PASS)
+```
+
+这个结果只验收 CPU push/done 链路与退出，不代表 payload 内容或完整 scatter
+输出正确。诊断状态不会被普通 BatchGet 调用当成成功。恢复 MTE2/MTE3 测试时，
+删除 scatter Python 入口中的临时 done 强制设置；下文的 load/dma/copy 命令
+届时才重新生效。gather 独立入口不受影响。
+
 ## 范围
 
 在 `codex/aiv-urma-scatter-gather` 实现无流水顺序路径，默认仍为 `direct_read`。
@@ -389,7 +418,7 @@ magic/sequence/result/phase，并拒绝总处理请求数为零的 MTE2 检查�
 [KVAF_AIV_SCATTER_PROBE_COMPLETE] stage=load ... verification=gm_ub_byte_compare verified_bytes=656
 ```
 
-`setup/dma/load` 各在一个 Runtime 中执行 `[1, min(2 * cores + 1, capacity), 1]`
+`done/setup/dma/load` 各在一个 Runtime 中执行 `[1, min(2 * cores + 1, capacity), 1]`
 三个批次。默认 1 核时是 `[1, 3, 1]`，相应字节数为 656、1968、656。
 需要同时重编 Host 与 kernel；旧 Host 会拒绝新开关，旧 kernel 会拒绝
 新增 probe 编号，不能混用。CPU 服务协议没有改变。
@@ -447,8 +476,8 @@ HBM done 轮询和本地 `CopyPayload`，所以这些部分仍需单独定位。
 字段，UBSan 可复现并验证此修正。这是 Host 初始化问题，尚无证据将它与
 AIV kernel 的 507015/errcode 259 联系起来。
 
-`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的六个检查点。done/flush/copy 各运行
-一个非空批次，setup/dma/load 各运行三个批次。保留真实的 descriptor/notify、
+`KVAF_AIV_SCATTER_PROBE` 提供同一 kernel 的六个检查点。flush/copy 各运行
+一个非空批次，done/setup/dma/load 各运行三个批次。保留真实的 descriptor/notify、
 CPU payload WRITE 和 done 协议；不能
 用 CPU 侧 WRITE CQ 成功代替 AIV 读到本轮 done 的证明。
 
@@ -463,7 +492,7 @@ CPU payload WRITE 和 done 协议；不能
 
 `load` 现在验证全部有效 UB 数据与 staging 一致；`copy` 进一步验证最终输出。
 各探针保留普通回归的默认 8193 请求容量、656 B token 和输出行位置。
-done/flush/copy 的 active=min(cores, capacity)；setup/dma/load 的批次数量见上节。
+flush/copy 的 active=min(cores, capacity)；done/setup/dma/load 的批次数量见上节。
 
 先在 NPU 端更新并重编译 Host 和 kernel，保留前文的 Python/kernel/CPU 地址
 环境变量。本次诊断开关不修改 CPU 协议，CPU 端可继续使用已匹配分支的服务。
