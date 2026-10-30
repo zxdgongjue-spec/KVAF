@@ -21,6 +21,7 @@ environment variables:
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
+    --ubmem-profile-detail  per-row diagnostic timing (requires --kernel-profile)
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
@@ -253,6 +254,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="disable AIV kernel cycle profiling",
     )
     parser.add_argument(
+        "--ubmem-profile-detail", action="store_true",
+        help="measure UBmem address preparation, MTE submission and final drain; adds timing overhead",
+    )
+    parser.add_argument(
         "--kernel-profile-clock-mhz",
         type=int,
         default=environment_int(
@@ -291,6 +296,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "KVAF_TRANSPORT must be urma or ubmem"
     if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
         return "adaptive-ub-device and peer-ub-device apply only to URMA"
+    if args.ubmem_profile_detail and (args.transport != "ubmem" or not args.kernel_profile):
+        return "ubmem-profile-detail requires KVAF_TRANSPORT=ubmem and --kernel-profile"
     block_bytes = args.token_bytes * args.tokens_per_block
     ddr_bytes = args.table_capacity * block_bytes
     if args.request_length <= 0 or args.request_length > MAX_INT32:
@@ -418,36 +425,69 @@ def print_ubmem_kernel_profile(
     samples: list[list[dict[str, object]]], warmup: int, clock_mhz: int,
     miss_count: int, token_bytes: int,
 ) -> None:
-    cycles = [
-        max(
-            int(core["kernel_finish_cycle"]) - int(core["kernel_start_cycle"])
-            for core in sample
-        )
+    # Take every stage from the same slowest core in each sample. Independent
+    # stage maxima can come from different cores and would not sum to total.
+    critical = [
+        max(sample, key=lambda core: int(core["kernel_finish_cycle"]) - int(core["kernel_start_cycle"]))
         for sample in samples
     ]
-    milliseconds = [value / clock_mhz / 1000.0 for value in cycles]
-    useful_bytes = len(samples) * miss_count * token_bytes
-    gibps = useful_bytes / (1024.0**3) / (sum(milliseconds) / 1000.0)
+    stages = {"kernel_total": [
+        int(core["kernel_finish_cycle"]) - int(core["kernel_start_cycle"])
+        for core in critical
+    ]}
+    detailed = bool(critical[0].get("ubmem_profile_detail", False))
+    if detailed:
+        for stage, field in (
+            ("kernel_setup", "ubmem_setup_cycles"),
+            ("kernel_address_prepare", "ubmem_address_cycles"),
+            ("kernel_mte_submit", "ubmem_submit_cycles"),
+            ("kernel_final_drain", "ubmem_drain_cycles"),
+        ):
+            stages[stage] = [int(core[field]) for core in critical]
+        measured = list(stages.values())[1:]
+        stages["kernel_other"] = [
+            total - sum(values[i] for values in measured)
+            for i, total in enumerate(stages["kernel_total"])
+        ]
+        if any(value < 0 for value in stages["kernel_other"]):
+            raise AssertionError("UBmem profile stage cycles exceed kernel total")
     print(
         "KERNEL_PROFILE_CONTRACT transport=ubmem "
         f"clock_mhz={clock_mhz} samples={len(samples)} "
-        "aggregation=max_elapsed_across_cores "
+        f"detail={int(detailed)} aggregation=max_elapsed_across_cores "
         "kernel_total=miss_count_address_resolution_mte_copy_and_final_drain "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
-    print(
-        "PERF_RESULT operation=batch_get_kernel_total "
-        f"samples={len(samples)} warmup_excluded={warmup} "
-        f"mean_ms={statistics.mean(milliseconds):.3f} "
-        f"p50_ms={percentile(milliseconds, 0.50):.3f} "
-        f"p90_ms={percentile(milliseconds, 0.90):.3f} "
-        f"p99_ms={percentile(milliseconds, 0.99):.3f} "
-        f"mean_cycles={statistics.mean(cycles):.3f} "
-        f"p50_cycles={percentile(cycles, 0.50):.3f} "
-        f"p90_cycles={percentile(cycles, 0.90):.3f} "
-        f"p99_cycles={percentile(cycles, 0.99):.3f} "
-        f"useful_GiBps={gibps:.3f} transport=ubmem"
-    )
+    if detailed:
+        print(
+            "KERNEL_PROFILE_DETAIL_CONTRACT "
+            "stage_aggregation=on_slowest_total_core_per_sample "
+            "address_prepare=metadata_lookup_validation_and_address_calculation "
+            "mte_submit=copy_call_including_synchronization_not_dma_duration "
+            "final_drain=finish_call_through_final_mte3_completion "
+            "other=loop_and_timing_bookkeeping "
+            "dma_may_overlap_address_prepare=1 per_row_timing_perturbs_pipeline=1"
+        )
+    for stage, cycles in stages.items():
+        milliseconds = [value / clock_mhz / 1000.0 for value in cycles]
+        result = (
+            f"PERF_RESULT operation=batch_get_{stage} "
+            f"samples={len(samples)} warmup_excluded={warmup} "
+            f"mean_ms={statistics.mean(milliseconds):.6f} "
+            f"p50_ms={percentile(milliseconds, 0.50):.6f} "
+            f"p90_ms={percentile(milliseconds, 0.90):.6f} "
+            f"p99_ms={percentile(milliseconds, 0.99):.6f} "
+            f"mean_cycles={statistics.mean(cycles):.3f} "
+            f"p50_cycles={percentile(cycles, 0.50):.3f} "
+            f"p90_cycles={percentile(cycles, 0.90):.3f} "
+            f"p99_cycles={percentile(cycles, 0.99):.3f} "
+            f"detail={int(detailed)} transport=ubmem"
+        )
+        if stage == "kernel_total":
+            useful_bytes = len(samples) * miss_count * token_bytes
+            gibps = useful_bytes / (1024.0**3) / (sum(milliseconds) / 1000.0)
+            result += f" useful_GiBps={gibps:.3f}"
+        print(result)
 
 
 def print_kernel_profile(
@@ -923,7 +963,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return indices, offsets, output_indices
 
         if args.kernel_profile:
-            runtime.start_batch_get_kernel_profile()
+            if args.ubmem_profile_detail:
+                runtime.start_batch_get_kernel_profile(detailed=True)
+            else:
+                runtime.start_batch_get_kernel_profile()
             kernel_profile_started = True
             print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
 

@@ -21,7 +21,7 @@ class AccessOperator final : public kvaf::AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
-  Status SetBatchGetKernelProfiling(bool enabled);
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const;
  private:
   struct Impl;

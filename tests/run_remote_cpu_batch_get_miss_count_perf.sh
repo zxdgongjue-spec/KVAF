@@ -218,6 +218,7 @@ completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 selected_ub_device_values=()
+ubmem_stage_rows=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_BEGIN token_bytes=$token_bytes"
@@ -262,6 +263,20 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           { [[ "$transport" == urma ]] && [[ -z "$post_profile_result" || -z "$completion_wait_profile_result" ]]; }; then
           echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label" >&2
           exit 1
+        fi
+        if [[ "$transport" == ubmem && "$(extract_field "$total_profile_result" detail)" == 1 ]]; then
+          for stage in setup address_prepare mte_submit final_drain other; do
+            stage_result="$(extract_profile_result "$log_file" "batch_get_kernel_$stage")"
+            if [[ -z "$stage_result" ]]; then
+              echo "ERROR: missing UBmem kernel_$stage profile" >&2
+              exit 1
+            fi
+            stage_values=()
+            for statistic in mean p50 p90 p99; do
+              stage_values+=("$(cycles_to_us "$(extract_field "$stage_result" "${statistic}_cycles")")")
+            done
+            ubmem_stage_rows+=("$token_bytes,$miss_count,$aiv_cores,kernel_$stage,${stage_values[0]},${stage_values[1]},${stage_values[2]},${stage_values[3]}")
+          done
         fi
 
         active_record="$(
@@ -469,3 +484,21 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"
+
+if ((${#ubmem_stage_rows[@]} > 0)); then
+  ubmem_stage_csv="${KVAF_BATCH_GET_MISS_SWEEP_CSV%.csv}_ubmem_stages.csv"
+  {
+    echo 'token_bytes,miss_count,aiv_cores,stage,mean_us,p50_us,p90_us,p99_us'
+    printf '%s\n' "${ubmem_stage_rows[@]}"
+  } > "$ubmem_stage_csv"
+  printf '\nBATCH_GET_UBMEM_DETAIL_SUMMARY units=us aggregation=on_slowest_total_core_per_sample profile_overhead_included=1\n'
+  for stage in setup address_prepare mte_submit final_drain other; do
+    printf 'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_%s\n' "$stage"
+    awk -F, -v stage="kernel_$stage" '
+      BEGIN { printf "%-12s %-12s %-12s %15s %15s %15s %15s\n",
+                     "token_bytes", "miss_count", "aiv_cores", "mean_us", "p50_us", "p90_us", "p99_us" }
+      $4 == stage { printf "%-12s %-12s %-12s %15s %15s %15s %15s\n", $1, $2, $3, $5, $6, $7, $8 }
+    ' "$ubmem_stage_csv"
+  done
+  echo "BATCH_GET_UBMEM_DETAIL_CSV_WRITTEN path=$ubmem_stage_csv rows=${#ubmem_stage_rows[@]}"
+fi

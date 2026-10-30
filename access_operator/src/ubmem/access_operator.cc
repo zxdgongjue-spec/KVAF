@@ -35,6 +35,7 @@ struct AccessOperator::Impl {
   bool ready{};
   bool retained{};
   bool profiling{};
+  bool profile_detail{};
   aclrtStream profile_stream{};
 
   Status LoadKernel(unsigned index, const std::string& path, const char* name) {
@@ -90,7 +91,7 @@ struct AccessOperator::Impl {
   }
 
   Status Launch(BatchArgs& args, aclrtStream stream, StreamState& state, bool synchronize) {
-    args.profile = profiling && args.operation == Operation::kGet;
+    args.profile = profiling && args.operation == Operation::kGet ? (profile_detail ? 2 : 1) : 0;
     profile_stream = nullptr;
     const auto size = options.cores * sizeof(CoreStatus);
     if (synchronize) {
@@ -248,9 +249,10 @@ Status AccessOperator::Shutdown() {
   return Status::OK();
 }
 
-Status AccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+Status AccessOperator::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
   if (!impl_->ready) return Status::NotInitialized("UBmem operator is not initialized");
   impl_->profiling = enabled;
+  impl_->profile_detail = enabled && detailed;
   impl_->profile_stream = nullptr;
   return Status::OK();
 }
@@ -275,6 +277,13 @@ Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProf
     profile.kernel_start_cycle = report.start_cycle;
     profile.kernel_finish_cycle = report.finish_cycle;
     profile.active_requests = report.completed;
+    profile.ubmem_profile_detail = report.profile_detail != 0;
+    if (profile.ubmem_profile_detail) {
+      profile.ubmem_setup_cycles = report.setup_cycles;
+      profile.ubmem_address_cycles = report.address_cycles;
+      profile.ubmem_submit_cycles = report.submit_cycles;
+      profile.ubmem_drain_cycles = report.drain_cycles;
+    }
     profiles->push_back(profile);
   }
   return Status::OK();

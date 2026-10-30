@@ -861,13 +861,14 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
-Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
+Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
   if (impl_->options.transport == Transport::kUbmem)
-    return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
+    return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled, detailed);
+  if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBmem");
   return impl_->urma_operator->SetBatchGetKernelProfiling(enabled);
 }
 

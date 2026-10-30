@@ -54,6 +54,53 @@ class InflightConfigTests(unittest.TestCase):
         self.assertEqual(records["batch_get_kernel_completion_wait"]["mean_cycles"], "100.000")
         self.assertIn("peak_submitted_not_drained_mean=2048", output.getvalue())
 
+    def test_ubmem_detail_requires_explicit_profiling(self):
+        with patch.dict(os.environ, {"KVAF_TRANSPORT": "ubmem"}, clear=True):
+            args = perf.parse_args(["--ubmem-profile-detail"])
+            self.assertIn("--kernel-profile", perf.validate_args(args))
+            args = perf.parse_args(["--kernel-profile", "--ubmem-profile-detail"])
+            self.assertIsNone(perf.validate_args(args))
+        args = self.parse("--kernel-profile", "--ubmem-profile-detail")
+        self.assertIn("KVAF_TRANSPORT=ubmem", perf.validate_args(args))
+
+    def test_ubmem_stages_follow_slowest_total_core(self):
+        def core(start, total, setup, address, submit, drain):
+            return {
+                "kernel_start_cycle": start, "kernel_finish_cycle": start + total,
+                "ubmem_profile_detail": True, "ubmem_setup_cycles": setup,
+                "ubmem_address_cycles": address, "ubmem_submit_cycles": submit,
+                "ubmem_drain_cycles": drain,
+            }
+
+        # The faster core has more address work. Taking each stage's maximum
+        # would incorrectly attribute its 150 cycles to the 300-cycle core.
+        samples = [[core(10, 300, 10, 50, 150, 70), core(1000, 200, 10, 150, 20, 10)],
+                   [core(20, 200, 10, 150, 20, 10), core(2000, 400, 20, 100, 180, 80)]]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf.print_kernel_profile(samples, 3, 1000, 2, 1, 17, 17, 656, "ubmem")
+        records = {}
+        for line in output.getvalue().splitlines():
+            if line.startswith("PERF_RESULT "):
+                fields = dict(field.split("=", 1) for field in line.split()[1:])
+                records[fields["operation"]] = fields
+        total = records.pop("batch_get_kernel_total")
+        self.assertEqual(total["mean_cycles"], "350.000")
+        self.assertEqual(records["batch_get_kernel_address_prepare"]["mean_cycles"], "75.000")
+        self.assertEqual(records["batch_get_kernel_other"]["mean_cycles"], "20.000")
+        self.assertEqual(sum(float(r["mean_cycles"]) for r in records.values()), 350)
+        self.assertIn("per_row_timing_perturbs_pipeline=1", output.getvalue())
+
+    def test_ubmem_total_only_remains_available(self):
+        output = io.StringIO()
+        samples = [[{"kernel_start_cycle": 10, "kernel_finish_cycle": 110,
+                     "ubmem_profile_detail": False}]]
+        with contextlib.redirect_stdout(output):
+            perf.print_kernel_profile(samples, 0, 1000, 1, 1, 1, 0, 656, "ubmem")
+        self.assertEqual(output.getvalue().count("PERF_RESULT "), 1)
+        self.assertIn("detail=0", output.getvalue())
+        self.assertIn("useful_GiBps=0.000", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
