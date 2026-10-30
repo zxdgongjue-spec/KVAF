@@ -14,6 +14,10 @@ class Backend {
   // Startup only. A backend may retire a failed, completed probe before
   // returning a non-InDoubt error; unresolved DMA must remain InDoubt.
   virtual Status Probe(const std::vector<Span>& spans) { return Read(spans); }
+  // Shared-pool sources must not overwrite cache slots during link probing.
+  virtual Status ProbeToScratch(std::uint64_t, std::uint64_t, std::uint64_t*) {
+    return Status::NotImplemented("scratch probe is unavailable");
+  }
   virtual Status ReleaseSource() = 0;
   virtual Status Close() = 0;
   virtual std::uint64_t Checksum(const std::vector<Span>& spans) const = 0;

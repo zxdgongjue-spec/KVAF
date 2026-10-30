@@ -28,6 +28,7 @@ struct RuntimeCapabilities {
   bool batch_put{false};
   bool incoming_links{false};
   bool outgoing_links{false};
+  bool cpu_offload{false};
 };
 
 // Role-neutral Runtime interface. RuntimeService dispatches incoming control
@@ -97,6 +98,7 @@ class RuntimeCore {
   // Keep the caller-owned source alive until pending_offload() becomes false.
   // This synchronous API serializes Offload; it is not a concurrent entrypoint.
   Status Offload(const BatchPutRequest& request, OffloadExecutionOptions execution = {});
+  Status OffloadFrom(const RemoteOffloadRequest& request);
   Status ResolveOffload();
   bool pending_offload() const { return offload_context_.id != 0; }
 
@@ -125,8 +127,11 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   bool initialized_{false};
+  bool closing_{false};
   PutContext offload_context_{};
   bool offload_data_ready_{false};
+  bool offload_metadata_finished_{false};
+  Status offload_result_;
   Status FinishOffload(Status status);
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};

@@ -1,5 +1,8 @@
 # CPU Pull / Offload 实现设计
 
+本文记录最初的独立 OffloadRuntime。后续整合版本见
+[共享 DDR 与跨卡 CPU Pull](shared_ddr_remote_offload.md)：NpuRuntime 统一 Meta/DDR，支持 A 提交、CPU 读取 B。
+
 ## 基线与范围
 
 本分支 `codex/cpu-pull-hbm-reference` 从 `main@c4375e1` 创建，传输参考

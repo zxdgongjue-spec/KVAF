@@ -18,6 +18,8 @@
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
 #include "acl_graph_python.h"
+#endif
+#if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_CPU_OFFLOAD)
 #include "npu_python_runtime.h"
 #endif
 
@@ -341,12 +343,13 @@ class PythonRuntime final {
 }  // namespace kvaf
 
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-namespace kvaf { void BindOffloadRuntime(pybind11::module_&); }
+namespace kvaf { void BindOffloadRuntime(pybind11::module_&); void BindHbmSource(pybind11::module_&); }
 #endif
 
 PYBIND11_MODULE(_kvaf, m) {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   kvaf::BindOffloadRuntime(m);
+  kvaf::BindHbmSource(m);
 #endif
   m.doc() = "Synchronous KVAF Runtime Python bindings";
 
@@ -396,8 +399,10 @@ PYBIND11_MODULE(_kvaf, m) {
   m.def_submodule("meta_manager");
   m.def_submodule("access_operator");
 
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_CPU_OFFLOAD)
   kvaf::BindNpuPythonRuntime(m);
+#endif
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
   kvaf::BindAclGraph(m);
 #endif
 }

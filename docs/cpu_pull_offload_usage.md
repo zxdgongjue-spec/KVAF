@@ -1,5 +1,9 @@
 # CPU Pull / Offload 构建与验证
 
+需要与 BatchPut 共用 DDR 或由卡 A 提交、CPU 读取卡 B 时，请使用
+[共享 DDR 与跨卡 CPU Pull](shared_ddr_remote_offload.md) 中的 NpuRuntime / HbmSource 接口。
+下文保留旧独立 OffloadRuntime 的构建与验证方式。
+
 本实现位于 `codex/cpu-pull-hbm-reference`，基于 `main@c4375e1`，参考
 `aicpu-urma@8bc5a2a`。KVOF 协议为版本 2，固定使用参考的 32 字节 SGE 和四路 Jetty。
 请同时重编 CPU 服务和 NPU Python 扩展，使用新构建目录，避免加载旧版本。

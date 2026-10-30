@@ -42,8 +42,15 @@ void Describe(std::ostream& out, const char* name, const urma_seg_t& segment) {
 class UrmaBackend final : public Backend {
  public:
   explicit UrmaBackend(urma_context_t* context) : context_(context) {}
+  UrmaBackend(urma_context_t* context, void* memory, std::uint64_t bytes,
+              std::uint32_t token, std::shared_ptr<void> lease)
+      : context_(context), memory_(memory), bytes_(bytes), region_token_(token),
+        owns_memory_(false), lease_(std::move(lease)) {}
   ~UrmaBackend() override {
-    if (!Close().ok()) std::fprintf(stderr, "CPU_PULL: retaining non-quiescent resources\n");
+    if (!Close().ok()) {
+      std::fprintf(stderr, "CPU_PULL: retaining non-quiescent resources\n");
+      if (lease_) (void)new std::shared_ptr<void>(std::move(lease_));
+    }
   }
   Status Allocate(std::uint64_t bytes, Endpoint* local) override {
     if (!context_ || !local || memory_ || !bytes || bytes > SIZE_MAX) return Error("invalid allocation");
@@ -221,11 +228,43 @@ class UrmaBackend final : public Backend {
   }
   Status Close() override {
     auto status = ReleaseSource(); if (!status.ok()) return status;
+    status = ReleaseScratch(); if (!status.ok()) return status;
     RELEASE(destination_, urma_unregister_seg)
     RELEASE(token_, urma_free_token_id)
 #undef RELEASE
-    std::free(memory_); memory_ = nullptr; bytes_ = 0; destination_valid_ = false;
+    if (owns_memory_) std::free(memory_);
+    memory_ = nullptr; bytes_ = 0; destination_valid_ = false; lease_.reset();
     return Status::OK();
+  }
+  Status ProbeToScratch(std::uint64_t offset, std::uint64_t bytes, std::uint64_t* checksum) override {
+    if (poisoned_) return Status::InDoubt(failure_);
+    if (!ready_ || !checksum || bytes > 64 || !Contains(source_bytes_, offset, bytes))
+      return Error("invalid scratch probe");
+    if (posix_memalign(&scratch_, 4096, 4096)) return Error("allocate scratch probe");
+    std::memset(scratch_, 0, 4096);
+    scratch_token_ = urma_alloc_token_id(context_);
+    if (!scratch_token_) return Error("allocate scratch token");
+    urma_seg_cfg_t cfg{}; cfg.va = reinterpret_cast<std::uint64_t>(scratch_); cfg.len = 4096;
+    cfg.token_id = scratch_token_; cfg.token_value.token = region_token_;
+    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    cfg.flag.bs.access = 1; cfg.flag.bs.token_id_valid = 1; cfg.flag.bs.non_pin = 0;
+    scratch_mr_ = urma_register_seg(context_, &cfg);
+    if (!scratch_mr_) return Error("register scratch probe");
+    if (!scratch_mr_->seg.ubva.va || cfg.va < scratch_mr_->seg.ubva.va ||
+        !Contains(scratch_mr_->seg.len, cfg.va-scratch_mr_->seg.ubva.va, 4096) ||
+        !(scratch_mr_->seg.attr.bs.access & 1U) || scratch_mr_->seg.attr.bs.non_pin)
+      return Error("invalid scratch registration");
+    auto* saved_memory = memory_; const auto saved_bytes = bytes_; auto* saved_mr = destination_;
+    memory_ = scratch_; bytes_ = 4096; destination_ = scratch_mr_;
+    Status status;
+    try { status = Probe({{offset, 0, bytes}}); }
+    catch (...) { status = Poison("exception during scratch READ"); }
+    memory_ = saved_memory; bytes_ = saved_bytes; destination_ = saved_mr;
+    if (status.ok()) *checksum = Hash(static_cast<const std::uint8_t*>(scratch_), bytes);
+    // Unknown DMA retains scratch and pool MR as well as the source lease.
+    if (status.code() == StatusCode::kInDoubt) return status;
+    const auto released = ReleaseScratch();
+    return released.ok() ? status : released;
   }
   std::uint64_t Checksum(const std::vector<Span>& spans) const override {
     std::uint64_t hash = 14695981039346656037ULL;
@@ -234,6 +273,17 @@ class UrmaBackend final : public Backend {
     return hash;
   }
  private:
+  Status ReleaseScratch() {
+    if (scratch_mr_) {
+      if (urma_unregister_seg(scratch_mr_)) return Poison("unregister scratch probe");
+      scratch_mr_ = nullptr;
+    }
+    if (scratch_token_) {
+      if (urma_free_token_id(scratch_token_)) return Poison("free scratch token");
+      scratch_token_ = nullptr;
+    }
+    std::free(scratch_); scratch_ = nullptr; return Status::OK();
+  }
   Status RegisterDestination() {
     if (destination_valid_) return Status::OK();
     if (!token_) token_ = urma_alloc_token_id(context_);
@@ -299,9 +349,19 @@ class UrmaBackend final : public Backend {
   std::array<Queue, kChannelCount> queues_;
   bool ready_{}, poisoned_{}, destination_valid_{}, completed_error_{};
   std::string failure_;
+  bool owns_memory_{true};
+  std::shared_ptr<void> lease_;
+  void* scratch_{};
+  urma_token_id_t* scratch_token_{};
+  urma_target_seg_t* scratch_mr_{};
 };
 }
 std::unique_ptr<Backend> CreateUrmaBackend(urma_context_t* context) {
   return context ? std::make_unique<UrmaBackend>(context) : nullptr;
+}
+std::unique_ptr<Backend> CreateBorrowedUrmaBackend(urma_context_t* context, void* memory,
+    std::uint64_t bytes, std::uint32_t token, std::shared_ptr<void> lease) {
+  return context && memory && bytes && token && lease
+      ? std::make_unique<UrmaBackend>(context, memory, bytes, token, std::move(lease)) : nullptr;
 }
 }

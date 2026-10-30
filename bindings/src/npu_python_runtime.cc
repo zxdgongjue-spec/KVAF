@@ -17,6 +17,9 @@
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+#include "remote_offload_python.h"
+#endif
 
 namespace py = pybind11;
 
@@ -221,7 +224,9 @@ class NpuPythonRuntime final {
                    std::uint32_t adaptive_ub_miss_count,
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
-                   std::uint32_t batch_get_max_inflight_total) {
+                   std::uint32_t batch_get_max_inflight_total,
+                   bool enable_cpu_offload, std::int64_t cpu_candidate,
+                   std::uint32_t offload_timeout_ms) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -236,7 +241,17 @@ class NpuPythonRuntime final {
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
     options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
+    if (cpu_candidate < -1 || cpu_candidate >= UINT32_MAX) throw py::value_error("invalid CPU candidate");
+    options.enable_cpu_offload = enable_cpu_offload;
+    options.cpu_candidate = cpu_candidate < 0 ? UINT32_MAX : static_cast<std::uint32_t>(cpu_candidate);
+    options.offload_timeout_ms = offload_timeout_ms;
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+  }
+
+  ~NpuPythonRuntime() {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    if (!native_->Shutdown().ok()) (void)local_source_.release();
+#endif
   }
 
   void LinkTo(std::string address) {
@@ -246,6 +261,37 @@ class NpuPythonRuntime final {
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
   }
+
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  void Offload(const py::object& keys, py::object source, const py::object& offsets,
+               const py::object& lengths, const py::object& stream) {
+    if (native_->pending_offload()) throw py::value_error("resolve previous Offload first");
+    const auto view = GetNpuTensorView(source, "source");
+    if (source.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
+      throw py::value_error("source is on another NPU; use HbmSource and offload_from");
+    if (!local_source_.is_none() && !local_source_.is(source)) ReleaseOffloadSource();
+    BatchPutRequest request; request.keys = CopyPrepareKeys(keys);
+    CopyCpuUint64SequenceInto(offsets, "input_offsets", &request.input_offsets);
+    CopyCpuUint64SequenceInto(lengths, "lengths", &request.lengths);
+    request.input = {view.data, view.bytes, DeviceKind::kNpu};
+    const auto producer = ResolveStream(stream);
+    if (!stream.is_none() && py::hasattr(stream, "device") &&
+        stream.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
+      throw py::value_error("producer stream belongs to another NPU");
+    local_source_ = source;
+    ThrowIfError(native_->Offload(request, {producer}));
+  }
+  void ReleaseOffloadSource() { ThrowIfError(native_->ReleaseOffloadSource()); local_source_ = py::none(); }
+  py::dict OffloadRegion() const {
+    OffloadRegionTicket ticket; ThrowIfError(native_->GetOffloadRegion(&ticket)); return remote_python::Pack(ticket);
+  }
+  void OffloadFrom(const py::object& keys, const py::dict& batch) {
+    ThrowIfError(native_->OffloadFrom(CopyPrepareKeys(keys), remote_python::Batch(batch)));
+  }
+  void ResolveOffload() { ThrowIfError(native_->ResolveOffload()); }
+  bool PendingOffload() const { return native_->pending_offload(); }
+  std::uint64_t LastChecksum() const { std::uint64_t hash{}; ThrowIfError(native_->LastOffloadChecksum(&hash)); return hash; }
+#endif
 
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
@@ -506,10 +552,16 @@ class NpuPythonRuntime final {
  public:
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    local_source_ = py::none();
+#endif
   }
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  py::object local_source_{py::none()};
+#endif
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
@@ -529,10 +581,10 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>, std::uint32_t>(),
-           py::arg("batch_get_kernel_object_path"),
-           py::arg("batch_get_token_bytes"),
-           py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
+                    std::string, std::vector<std::string>, std::uint32_t, bool, std::int64_t, std::uint32_t>(),
+           py::arg("batch_get_kernel_object_path") = "",
+           py::arg("batch_get_token_bytes") = 0,
+           py::arg("batch_get_tokens_per_block") = 0, py::arg("device_id") = 0,
            py::arg("npu_core_count") = 2,
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2,
@@ -542,7 +594,19 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("peer_ub_device") = "",
            py::arg("adaptive_peer_ub_devices") =
                std::vector<std::string>{},
-           py::arg("batch_get_max_inflight_total") = 2048)
+           py::arg("batch_get_max_inflight_total") = 2048,
+           py::arg("enable_cpu_offload") = false, py::arg("cpu_candidate") = -1,
+           py::arg("offload_timeout_ms") = 30000)
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+      .def("offload", &NpuPythonRuntime::Offload, py::arg("keys"), py::arg("source"),
+           py::arg("input_offsets"), py::arg("lengths"), py::arg("stream") = py::none())
+      .def("release_offload_source", &NpuPythonRuntime::ReleaseOffloadSource)
+      .def("offload_region", &NpuPythonRuntime::OffloadRegion)
+      .def("offload_from", &NpuPythonRuntime::OffloadFrom, py::arg("keys"), py::arg("ready_batch"))
+      .def("resolve_offload", &NpuPythonRuntime::ResolveOffload)
+      .def("last_offload_checksum", &NpuPythonRuntime::LastChecksum)
+      .def_property_readonly("pending_offload", &NpuPythonRuntime::PendingOffload)
+#endif
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

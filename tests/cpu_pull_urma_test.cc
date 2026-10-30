@@ -257,7 +257,23 @@ void ProbeFailureTest(Fault injected, bool teardown_failure=false) {
     _exit(0);
   }
 }
+void BorrowedPoolTest() {
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto pool=std::make_shared<std::vector<std::uint8_t>>(8192,0x5a);
+  auto backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),123,pool);
+  Require(pool.use_count()==2,"borrowed backend holds shared DDR lease");
+  std::vector<std::uint8_t> hbm(4096,0x91);
+  auto source=Source(hbm,123,true);p::Endpoint cpu{};cpu.token=123;
+  Require(backend->Open(source,&cpu).ok()&&local_mrs==1,"borrowed pool registered locally");
+  std::uint64_t hash{};
+  Require(backend->ProbeToScratch(64,64,&hash).ok()&&hash==p::Hash(hbm.data()+64,64),"scratch probe checksum");
+  Require(local_mrs==1&&std::all_of(pool->begin(),pool->end(),[](auto c){return c==0x5a;}),"scratch MR released; all DDR slots unchanged");
+  Require(backend->Read({{32,256,128}}).ok()&&!std::memcmp(pool->data()+256,hbm.data()+32,128),"direct READ into borrowed DDR");
+  Require(backend->Close().ok()&&pool.use_count()==1&&local_mrs==0,"close releases registration and lease, not pool allocation");
+  (*pool)[0]=7;Require((*pool)[0]==7,"A still owns DDR after B detaches");
+}
 int main(){try{
+  BorrowedPoolTest();
   RegistrationFailureTest();
   PartialChannelFailureTest();
   ReadTest(false);

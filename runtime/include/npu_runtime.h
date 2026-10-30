@@ -7,15 +7,16 @@
 #include <vector>
 
 #include "runtime.h"
+#include "remote_offload.h"
 
 namespace kvaf {
 
 struct BatchGetKernelProfile;
 
 struct NpuRuntimeOptions {
-  NpuRuntimeOptions(std::string kernel_object_path,
-                    std::uint32_t token_bytes,
-                    std::uint32_t tokens_per_block)
+  NpuRuntimeOptions(std::string kernel_object_path = "",
+                    std::uint32_t token_bytes = 0,
+                    std::uint32_t tokens_per_block = 0)
       : batch_get_kernel_object_path(std::move(kernel_object_path)),
         batch_get_token_bytes(token_bytes),
         batch_get_tokens_per_block(tokens_per_block) {}
@@ -46,6 +47,9 @@ struct NpuRuntimeOptions {
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};
+  bool enable_cpu_offload{false};
+  std::uint32_t cpu_candidate{UINT32_MAX}; // Pin the shared pool, or discover.
+  std::uint32_t offload_timeout_ms{30000};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -61,6 +65,16 @@ class NpuRuntime final : public Runtime {
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
   RuntimeCore& core();
   const RuntimeCore& core() const;
+  Status GetOffloadRegion(OffloadRegionTicket*) const;
+  // Local-source convenience path uses this same Core and shared DDR pool.
+  // C++ callers retain input storage until ReleaseOffloadSource or Shutdown
+  // succeeds, including after a completed batch (the registration is cached).
+  Status Offload(const BatchPutRequest&, OffloadExecutionOptions = {});
+  Status ReleaseOffloadSource(); // Releases the cached local registration after resolution.
+  Status OffloadFrom(const std::vector<KeyId>& keys, const HbmReadyBatch&);
+  Status ResolveOffload();
+  bool pending_offload() const;
+  Status LastOffloadChecksum(std::uint64_t*) const;
 
   std::uint32_t device_id() const;
   std::uint32_t npu_core_count() const;

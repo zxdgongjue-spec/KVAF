@@ -25,7 +25,6 @@ access_operator = _native.access_operator
 
 if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
-    AclGraph = _native.AclGraph
     DeviceAccessTable = _native.DeviceAccessTable
 
 __all__ = [
@@ -41,10 +40,17 @@ __all__ = [
 if hasattr(_native, "NpuRuntime"):
     __all__ += [
         "NpuRuntime",
-        "AclGraph",
         "DeviceAccessTable",
     ]
 
 if hasattr(_native, "OffloadRuntime"):
     OffloadRuntime = _native.OffloadRuntime
     __all__.append("OffloadRuntime")
+
+if hasattr(_native, "AclGraph"):
+    AclGraph = _native.AclGraph
+    __all__.append("AclGraph")
+
+if hasattr(_native, "HbmSource"):
+    HbmSource = _native.HbmSource
+    __all__.append("HbmSource")

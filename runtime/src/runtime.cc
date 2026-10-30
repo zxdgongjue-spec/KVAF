@@ -107,6 +107,7 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   }
 
   remote_region_ = remote_region;
+  closing_ = false;
   initialized_ = true;
   return Status::OK();
 }
@@ -117,6 +118,8 @@ Status RuntimeCore::Shutdown() {
   }
   if (pending_offload()) return Status::InDoubt("resolve Offload before Shutdown");
 
+  const auto ready = access_operator_.CanShutdown(); if (!ready.ok()) return ready;
+  closing_ = true;
   Status first_error = Status::OK();
   for (const auto& entry : access_tables_) {
     const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
@@ -132,12 +135,15 @@ Status RuntimeCore::Shutdown() {
   if (!release_status.ok()) return release_status;
 
   initialized_ = false;
+  closing_ = false;
   remote_region_ = RemoteRegionDesc{};
   return first_error;
 }
 
 Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
                                        AccessTableHandle* handle) {
+  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
+  if (pending_offload()) return Status::Busy("resolve Offload before accessing DDR");
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -238,6 +244,8 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
+  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
+  if (pending_offload()) return Status::Busy("resolve Offload before accessing DDR");
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -334,6 +342,8 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
 
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
                              BatchPutExecutionOptions execution) {
+  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
+  if (pending_offload()) return Status::Busy("resolve the pending Offload first");
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -376,6 +386,7 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
 }
 
 Status RuntimeCore::Offload(const BatchPutRequest& request, OffloadExecutionOptions execution) {
+  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
   if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
   if (pending_offload()) return Status::Busy("resolve the pending Offload first");
   if (request.keys.empty() || !request.input.data || !request.input.bytes ||
@@ -394,6 +405,7 @@ Status RuntimeCore::Offload(const BatchPutRequest& request, OffloadExecutionOpti
   auto status = meta_manager_.PreparePut(request.keys, request.lengths, &offload_context_, &desc);
   if (!status.ok()) return status;
   offload_data_ready_ = false;
+  offload_metadata_finished_ = false;
   try {
     return FinishOffload(access_operator_.ExecuteOffload({&request, &desc, execution}));
   } catch (const std::exception& e) {
@@ -402,23 +414,52 @@ Status RuntimeCore::Offload(const BatchPutRequest& request, OffloadExecutionOpti
   }
 }
 
+Status RuntimeCore::OffloadFrom(const RemoteOffloadRequest& request) {
+  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  if (pending_offload()) return Status::Busy("resolve the pending Offload first");
+  if (!request.source.region_epoch || !request.source.region_id || !request.source.source_id ||
+      !request.source.sequence || !request.source.source_bytes || request.keys.empty() ||
+      request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
+    return Status::InvalidArgument("invalid remote Offload request");
+  for (std::size_t i = 0; i < request.keys.size(); ++i)
+    if (!request.lengths[i] || request.input_offsets[i] > request.source.source_bytes ||
+        request.lengths[i] > request.source.source_bytes - request.input_offsets[i])
+      return Status::InvalidArgument("remote source range is outside the exported HBM");
+  PutAccessDesc desc;
+  auto status = meta_manager_.PreparePut(request.keys, request.lengths, &offload_context_, &desc);
+  if (!status.ok()) return status;
+  offload_data_ready_ = offload_metadata_finished_ = false;
+  try { return FinishOffload(access_operator_.ExecuteRemoteOffload({&request, &desc})); }
+  catch (const std::exception& e) { return Status::InDoubt(std::string("remote Offload exception: ") + e.what()); }
+}
+
 Status RuntimeCore::FinishOffload(Status status) {
   if (status.code() == StatusCode::kInDoubt) return status;
-  if (status.ok()) offload_data_ready_ = true;
-  const auto finish = offload_data_ready_ ? meta_manager_.CommitPut(offload_context_)
-                                         : meta_manager_.AbortPut(offload_context_);
-  if (!finish.ok()) return Status::InDoubt("Offload metadata pending: " + finish.message());
+  if (!offload_metadata_finished_) {
+    offload_result_ = status;
+    if (status.ok()) offload_data_ready_ = true;
+    const auto finish = offload_data_ready_ ? meta_manager_.CommitPut(offload_context_)
+                                           : meta_manager_.AbortPut(offload_context_);
+    if (!finish.ok()) return Status::InDoubt("Offload metadata pending: " + finish.message());
+    offload_metadata_finished_ = true;
+  }
+  const auto completed = access_operator_.CompleteOffload(offload_data_ready_);
+  if (!completed.ok()) return Status::InDoubt("Offload producer acknowledgement pending: " + completed.message());
   offload_context_ = {};
   offload_data_ready_ = false;
-  return status;
+  offload_metadata_finished_ = false;
+  return offload_result_;
 }
 
 Status RuntimeCore::ResolveOffload() {
   if (!pending_offload()) return Status::InvalidState("no pending Offload");
-  return FinishOffload(offload_data_ready_ ? Status::OK() : access_operator_.ResolveOffload());
+  return FinishOffload(offload_metadata_finished_ || offload_data_ready_ ? Status::OK() : access_operator_.ResolveOffload());
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
+  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
+  if (pending_offload()) return Status::Busy("resolve the pending Offload first");
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }

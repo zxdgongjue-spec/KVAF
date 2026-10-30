@@ -1,6 +1,8 @@
 #include "cpu_runtime.h"
 #include "peer_protocol.h"
 #include "cpu_pull_urma.h"
+#include "remote_pull_service.h"
+#include <random>
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -442,26 +444,27 @@ struct Channel {
 // its completion resources equally independent: sharing one never-polled JFC
 // across all target JFRs allows unrelated AIV lanes to consume each other's
 // completion credits.  The order is the UMDK ownership order.
-void ReleaseChannel(Channel* channel) {
+bool ReleaseChannel(Channel* channel) {
   if (channel == nullptr) {
-    return;
+    return true;
   }
   if (channel->remote_jetty != nullptr) {
-    (void)urma_unimport_jetty(channel->remote_jetty);
+    if (urma_unimport_jetty(channel->remote_jetty)) return false;
     channel->remote_jetty = nullptr;
   }
   if (channel->local_jetty != nullptr) {
-    (void)urma_delete_jetty(channel->local_jetty);
+    if (urma_delete_jetty(channel->local_jetty)) return false;
     channel->local_jetty = nullptr;
   }
   if (channel->local_jfr != nullptr) {
-    (void)urma_delete_jfr(channel->local_jfr);
+    if (urma_delete_jfr(channel->local_jfr)) return false;
     channel->local_jfr = nullptr;
   }
   if (channel->local_jfc != nullptr) {
-    (void)urma_delete_jfc(channel->local_jfc);
+    if (urma_delete_jfc(channel->local_jfc)) return false;
     channel->local_jfc = nullptr;
   }
+  return true;
 }
 
 struct Region {
@@ -469,7 +472,8 @@ struct Region {
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
-  uint64_t bytes = 0U;
+  uint64_t bytes = 0U, slot_size = 0U, exported_base = 0U;
+  bool closing = false;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
@@ -485,10 +489,39 @@ class CpuService {
         pull_service_([resource_pool](std::uint32_t candidate) {
           auto* resources = resource_pool->Get(candidate);
           return offload::CreateUrmaBackend(resources ? resources->context() : nullptr);
-        }) {}
+        }),
+        remote_pull_service_(
+          [this](std::uint64_t id, remote_pull::RegionInfo* info) { return DescribeRegion(id, info); },
+          [this](const remote_pull::RegionInfo& info) -> std::unique_ptr<offload::Backend> {
+            const auto it = regions_.find(info.id);
+            if (it == regions_.end() || info.epoch != epoch_) return nullptr;
+            const auto& region = it->second;
+            return offload::CreateBorrowedUrmaBackend(region->resources->context(), region->memory,
+                region->bytes, region->token_value, region);
+          }) {
+      std::random_device random; epoch_ = (std::uint64_t(random()) << 32) ^ random();
+      if (!epoch_) epoch_ = 1;
+    }
   ~CpuService() { ReleaseAll(); }
   void ServePull(int fd, const MessageHeader& header) { pull_service_.Serve(fd, header); }
-  Status ShutdownPull() { return pull_service_.Shutdown(); }
+  void ServeRemotePull(int fd, const MessageHeader& header) { remote_pull_service_.Serve(fd, header); }
+  Status ShutdownPull() {
+    auto status = remote_pull_service_.Shutdown();
+    if (!status.ok()) return status;
+    status = pull_service_.Shutdown();
+    if (!status.ok()) return status;
+    return ReleaseAll() ? Status::OK() : Status::InDoubt("CPU DDR teardown incomplete; retain contexts");
+  }
+  Status DescribeRegion(std::uint64_t id, remote_pull::RegionInfo* info) {
+    const auto it = regions_.find(id);
+    if (it == regions_.end()) return Status::NotFound("shared DDR region not found");
+    const auto& region = *it->second;
+    *info = {}; info->epoch = epoch_; info->id = id;
+    info->base = region.exported_base; info->closing = region.closing; info->bytes = region.bytes; info->slot_size = region.slot_size;
+    info->candidate = region.candidate_id; info->token = region.token_value;
+    std::memcpy(info->eid, region.resources->context()->eid.raw, 16);
+    return Status::OK();
+  }
 
   uint32_t CandidateCount() const {
     return resource_pool_ == nullptr ? 0U : resource_pool_->CandidateCount();
@@ -531,10 +564,10 @@ class CpuService {
     if (resources == nullptr) {
       return Result::kResourceError;
     }
-    auto region = std::make_unique<Region>();
+    auto region = std::make_shared<Region>();
     region->candidate_id = candidate_id;
     region->resources = resources;
-    region->bytes = bytes;
+    region->bytes = bytes; region->slot_size = slot_size;
     if (!AllocateMemory(region.get())) {
       return Result::kResourceError;
     }
@@ -542,7 +575,7 @@ class CpuService {
     region->token_id = urma_alloc_token_id(resources->context());
     if (region->token_id == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
-      ReleaseRegion(region.get());
+      if (!ReleaseRegion(region.get())) quarantined_regions_.push_back(region);
       return Result::kResourceError;
     }
     urma_reg_seg_flag_t flag{};
@@ -567,13 +600,14 @@ class CpuService {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
           " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
           region->memory, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
-      ReleaseRegion(region.get());
+      if (!ReleaseRegion(region.get())) quarantined_regions_.push_back(region);
       return Result::kResourceError;
     }
     const uint64_t id = next_region_id_++;
     region->id = id;
     response->session_id = id;
-    response->peer_base = region->segment->seg.ubva.va;
+    region->exported_base = region->segment->seg.ubva.va;
+    response->peer_base = region->exported_base;
     response->peer_length = bytes;
     // HCCP's UB resource-service forwards the public UMDK token object value
     // (rather than transforming it through its private TokenId wrapper).
@@ -586,7 +620,7 @@ class CpuService {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
           " token_id=0x%x\n",
         response->peer_base, response->token_id);
-      ReleaseRegion(region.get());
+      if (!ReleaseRegion(region.get())) quarantined_regions_.push_back(region);
       return Result::kResourceError;
     }
     regions_.emplace(id, std::move(region));
@@ -613,6 +647,7 @@ class CpuService {
       return Result::kNotFound;
     }
     Region& region = *found->second;
+    if (region.closing) return Result::kResourceError;
     Log("[KVAF_CPU] CHANNEL_REQUEST session=%" PRIu64 " key_bytes=%u token=0x%x npu_tp=0x%llx npu_psn=0x%x npu_eid=",
         region.id, request.local_qp_key_bytes, request.peer_token_value,
         static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
@@ -628,7 +663,7 @@ class CpuService {
         !region.resources->GetCtpForPeer(request.local_eid, &cpu_tp_handle) ||
         !ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value, cpu_tp_handle,
                            request.local_tp_handle, cpu_psn, request.local_psn, &channel.remote_jetty)) {
-      ReleaseChannel(&channel);
+      if (!ReleaseChannel(&channel)) region.channels.push_back(channel);
       return Result::kResourceError;
     }
     std::memcpy(response->peer_qp_key, &channel.local_jetty->jetty_id,
@@ -659,7 +694,10 @@ class CpuService {
     }
     Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
         found->second->channels.size());
-    ReleaseRegion(found->second.get());
+    if (remote_pull_service_.RegionBusy(id) || found->second.use_count() != 1)
+      return Result::kResourceError;
+    found->second->closing = true;
+    if (!ReleaseRegion(found->second.get())) return Result::kResourceError;
     regions_.erase(found);
     return Result::kOk;
   }
@@ -797,33 +835,39 @@ class CpuService {
     return true;
   }
 
-  void ReleaseRegion(Region* region) {
+  bool ReleaseRegion(Region* region) {
     if (region == nullptr) {
-      return;
+      return true;
     }
     for (auto iterator = region->channels.rbegin(); iterator != region->channels.rend(); ++iterator) {
-      ReleaseChannel(&*iterator);
+      if (!ReleaseChannel(&*iterator)) return false;
     }
     region->channels.clear();
     if (region->segment != nullptr) {
-      (void)urma_unregister_seg(region->segment);
+      if (urma_unregister_seg(region->segment)) return false;
       region->segment = nullptr;
     }
     if (region->token_id != nullptr) {
-      (void)urma_free_token_id(region->token_id);
+      if (urma_free_token_id(region->token_id)) return false;
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
       free(region->memory);
       region->memory = nullptr;
     }
+    return true;
   }
 
-  void ReleaseAll() {
-    for (auto& entry : regions_) {
-      ReleaseRegion(entry.second.get());
+  bool ReleaseAll() {
+    for (auto it = quarantined_regions_.begin(); it != quarantined_regions_.end();) {
+      if (!ReleaseRegion(it->get())) return false;
+      it = quarantined_regions_.erase(it);
     }
-    regions_.clear();
+    for (auto it = regions_.begin(); it != regions_.end();) {
+      if (it->second.use_count() != 1 || !ReleaseRegion(it->second.get())) return false;
+      it = regions_.erase(it);
+    }
+    return true;
   }
 
   UrmaResourcePool* resource_pool_ = nullptr;
@@ -832,8 +876,11 @@ class CpuService {
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
   uint32_t next_psn_ = 1U;
-  std::unordered_map<uint64_t, std::unique_ptr<Region>> regions_;
+  std::uint64_t epoch_{};
+  std::unordered_map<uint64_t, std::shared_ptr<Region>> regions_;
+  std::vector<std::shared_ptr<Region>> quarantined_regions_;
   offload::Service pull_service_;
+  remote_pull::Service remote_pull_service_;
 };
 
 void SendStatus(int fd, Command command, Result result) {
@@ -847,6 +894,7 @@ void SendStatus(int fd, Command command, Result result) {
 void HandleClient(int fd, CpuService* service) {
   MessageHeader header{};
   if (!ReadAll(fd, &header, sizeof(header))) return;
+  if (header.magic == remote_pull::kMagic) { service->ServeRemotePull(fd, header); return; }
   if (header.magic == offload::kMagic) { service->ServePull(fd, header); return; }
   if (header.magic != kvaf::peer::kProtocolMagic ||
       header.version != kvaf::peer::kProtocolVersion) {

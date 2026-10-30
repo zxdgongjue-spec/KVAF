@@ -1,5 +1,8 @@
 #include "npu_runtime.h"
 #include "npu_eid_discovery.h"
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+#include "remote_pull_operator.h"
+#endif
 
 #include <acl/acl.h>
 
@@ -41,6 +44,12 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
+  Status ReleaseAllocation() {
+    if (!has_allocation()) return Status::OK();
+    auto status = link_->ReleaseRegion(allocated_.base);
+    if (status.ok()) allocated_ = {};
+    return status;
+  }
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
     if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
@@ -59,9 +68,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
     if (allocated_.base == 0U || allocated_.base != region.base) {
       return Status::NotFound("peer DDR allocation was not found");
     }
-    const Status status = link_->ReleaseRegion(allocated_.base);
-    if (status.ok()) allocated_ = {};
-    return status;
+    return ReleaseAllocation();
   }
 
  private:
@@ -114,8 +121,18 @@ struct NpuRuntime::Impl {
 
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
-    access_operator = std::make_unique<DefaultAccessOperator>(config);
-    runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+    if (!config.batch_get_kernel_object_path.empty()) access_operator = std::make_unique<DefaultAccessOperator>(config);
+#endif
+    AccessOperator* selected = access_operator.get();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    if (options.enable_cpu_offload) {
+      remote_operator = std::make_unique<RemotePullOperator>(selected, peer_link, options.offload_timeout_ms);
+      selected = remote_operator.get();
+    }
+#endif
+    if (!selected) throw std::logic_error("no enabled NPU data plane");
+    runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *selected, *allocator);
   }
 
   void ReleaseProbe() {
@@ -132,14 +149,44 @@ struct NpuRuntime::Impl {
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
-  std::unique_ptr<DefaultAccessOperator> access_operator;
+  std::unique_ptr<AccessOperator> access_operator;
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  std::unique_ptr<RemotePullOperator> remote_operator;
+  std::unique_ptr<HbmSource> local_source;
+  ConstBufferView local_input{};
+  bool local_pending{};
+  Status local_result;
+  Status FinishLocal() {
+    if (runtime_core->pending_offload()) return local_result;
+    Status status;
+    if (local_source->frozen()) {
+      status = local_result.ok() ? local_source->ReleaseBatch() : local_source->CancelBatch();
+    } else if (!local_source->registered()) status = local_source->Shutdown();
+    if (!status.ok()) return Status::InDoubt("local HBM release pending: " + status.message());
+    local_pending = false;
+    if (!local_source->registered()) { local_source.reset(); local_input = {}; }
+    if (local_result.code() == StatusCode::kInDoubt)
+      return Status::Internal("local batch cancelled without committing: " + local_result.message());
+    return local_result;
+  }
+#endif
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-  if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
+#if !defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (impl_->options.enable_cpu_offload) throw std::invalid_argument("CPU Offload was not built");
+#endif
+#if !defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (!impl_->config.batch_get_kernel_object_path.empty()) throw std::invalid_argument("AIV support was not built");
+#endif
+  if (!impl_->options.offload_timeout_ms) throw std::invalid_argument("offload timeout must be positive");
+  if (impl_->config.batch_get_kernel_object_path.empty()) {
+    if (!impl_->options.enable_cpu_offload || !impl_->config.batch_put_kernel_object_path.empty())
+      throw std::invalid_argument("configure AIV kernels or enable CPU Offload");
+  } else if (impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
@@ -162,8 +209,11 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
-    (void)Shutdown();
+    if (!Shutdown().ok()) { (void)impl_.release(); return; }
     impl_->runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    impl_->remote_operator.reset();
+#endif
     impl_->access_operator.reset();
     impl_->ReleaseProbe();
   }
@@ -173,7 +223,7 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (impl_->config.batch_put_kernel_object_path.empty()) {
+  if (impl_->config.batch_put_kernel_object_path.empty() && !impl_->options.enable_cpu_offload) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
@@ -182,6 +232,9 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
   impl_->runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  impl_->remote_operator.reset();
+#endif
   impl_->access_operator.reset();
   impl_->CreateCore();
   return Status::OK();
@@ -197,6 +250,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
 
+  if (impl_->peer_allocator->has_allocation())
+    return Status::InDoubt("previous DDR cleanup is unresolved; retry Shutdown before Initialize");
   std::uint32_t candidate_count = 0U;
   std::uint32_t device_count = 0U;
   bool device_filter_applied = false;
@@ -206,6 +261,25 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (candidate_count == 0U) {
     return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
   }
+  if (impl_->options.cpu_candidate != UINT32_MAX && impl_->options.cpu_candidate >= candidate_count)
+    return Status::InvalidArgument("CPU candidate is outside the advertised list");
+  if (impl_->config.batch_get_kernel_object_path.empty()) {
+    // Card A can coordinate a card B source without loading any AIV binary.
+    for (std::uint32_t candidate = 0; candidate < candidate_count; ++candidate) {
+      if (impl_->options.cpu_candidate != UINT32_MAX && candidate != impl_->options.cpu_candidate) continue;
+      impl_->peer_allocator->SetCandidate(candidate);
+      impl_->runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+      impl_->remote_operator.reset();
+#endif
+      impl_->access_operator.reset(); impl_->CreateCore();
+      last = impl_->runtime_core->Initialize(request);
+      if (last.ok() || last.code() == StatusCode::kInDoubt) return last;
+      if (impl_->peer_allocator->has_allocation()) return Status::InDoubt("shared DDR allocation cleanup unresolved");
+    }
+    return last;
+  }
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
@@ -231,7 +305,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   const bool has_n_side_allowlist =
       !impl_->options.adaptive_peer_ub_devices.empty();
   const bool tune_candidates = impl_->options.adaptive_ub_device &&
-                               !device_filter_applied && has_n_side_allowlist;
+                               !device_filter_applied && has_n_side_allowlist &&
+                               impl_->options.cpu_candidate == UINT32_MAX;
   if (impl_->options.adaptive_ub_device && !tune_candidates) {
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
@@ -291,6 +366,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       const std::size_t group_begin = explicit_eids ? 0U : npu_group;
       const std::size_t group_size = explicit_eids ? npu_candidates.size() : 1U;
       impl_->runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+      impl_->remote_operator.reset();
+#endif
       impl_->access_operator.reset();
       impl_->ReleaseProbe();
       impl_->config.peer_local_eids.clear();
@@ -351,7 +429,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
             std::make_unique<detail::StartupBandwidthProbe>(probe_config);
-        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
+        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *static_cast<DefaultAccessOperator*>(impl_->access_operator.get()), cycles);
         if (last.ok()) {
           std::fprintf(stderr,
                        "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
@@ -392,18 +470,23 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     }
     // Registered source/output buffers outlive the transports even on errors.
     impl_->runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    impl_->remote_operator.reset();
+#endif
     impl_->access_operator.reset();
     impl_->ReleaseProbe();
     return Status::OK();
   };
   if (!tune_candidates) {
+    last = Status::NotFound("no CPU candidate matches the selected UB device");
     for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
          ++peer_candidate) {
+      if (impl_->options.cpu_candidate != UINT32_MAX && peer_candidate != impl_->options.cpu_candidate) continue;
       if (fixed_peer_device && !peer_candidate_allowed[peer_candidate]) continue;
       for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
         last = initialize_candidate(
             detail::StartupCandidate{peer_candidate, npu_group}, false, nullptr);
-        if (last.ok()) return last;
+        if (last.ok() || last.code() == StatusCode::kInDoubt) return last;
         const Status released = cleanup();
         if (!released.ok()) return released;
       }
@@ -480,6 +563,9 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   return detail::SelectStartupDeviceCandidate(
       device_candidates, initialize_candidate, cleanup);
+#else
+  return Status::NotImplemented("AIV support was not built");
+#endif
 }
 
 RuntimeCore& NpuRuntime::core() {
@@ -512,7 +598,11 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  return static_cast<DefaultAccessOperator*>(impl_->access_operator.get())->SetBatchGetKernelProfiling(enabled);
+#else
+  return Status::NotImplemented("AIV support was not built");
+#endif
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
@@ -521,7 +611,104 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
-  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  return static_cast<DefaultAccessOperator*>(impl_->access_operator.get())->CopyBatchGetKernelProfiles(profiles);
+#else
+  return Status::NotImplemented("AIV support was not built");
+#endif
+}
+
+Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* ticket) const {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (!ticket || !initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
+  *ticket = impl_->remote_operator->ticket(); return Status::OK();
+#else
+  return Status::NotImplemented("CPU Offload was not built");
+#endif
+}
+Status NpuRuntime::OffloadFrom(const std::vector<KeyId>& keys, const HbmReadyBatch& batch) {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (!initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
+  if (pending_offload()) return Status::Busy("resolve previous Offload first");
+  RemoteOffloadRequest request{batch.source, keys, batch.input_offsets, batch.lengths};
+  bool duplicate = false;
+  auto status = impl_->remote_operator->Validate(request, &duplicate);
+  if (!status.ok() || duplicate) return status;
+  return impl_->runtime_core->OffloadFrom(request);
+#else
+  return Status::NotImplemented("CPU Offload was not built");
+#endif
+}
+Status NpuRuntime::Offload(const BatchPutRequest& request, OffloadExecutionOptions execution) {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (!initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
+  if (pending_offload()) return Status::Busy("resolve previous Offload");
+  if (request.input.device != DeviceKind::kNpu) return Status::InvalidArgument("Offload requires NPU input");
+  if (impl_->local_source && (request.input.data != impl_->local_input.data || request.input.bytes != impl_->local_input.bytes)) {
+    auto status = ReleaseOffloadSource(); if (!status.ok()) return status;
+  }
+  if (!impl_->local_source) {
+    impl_->local_source = std::make_unique<HbmSource>(device_id());
+    impl_->local_input = request.input;
+    impl_->local_pending = true;
+    impl_->local_result = impl_->local_source->Register(impl_->remote_operator->ticket(), request.input, execution.stream);
+    if (!impl_->local_result.ok()) {
+      impl_->local_pending = true;
+      return impl_->FinishLocal();
+    }
+  }
+  impl_->local_pending = true;
+  impl_->local_result = Status::InDoubt("local source preparation interrupted");
+  HbmReadyBatch batch;
+  Status status;
+  try {
+    status = impl_->local_source->Ready(request.input_offsets, request.lengths, execution.stream, &batch);
+    if (status.ok()) {
+      impl_->local_pending = false;
+      status = OffloadFrom(request.keys, batch);
+    }
+  } catch (...) { impl_->local_pending = true; throw; }
+  impl_->local_result = status; impl_->local_pending = true;
+  return impl_->FinishLocal();
+#else
+  return Status::NotImplemented("CPU Offload was not built");
+#endif
+}
+Status NpuRuntime::ReleaseOffloadSource() {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (pending_offload()) return Status::InDoubt("resolve Offload before releasing its local source");
+  if (impl_->local_source) {
+    auto status = impl_->local_source->Shutdown(); if (!status.ok()) return status;
+    impl_->local_source.reset(); impl_->local_input = {};
+  }
+#endif
+  return Status::OK();
+}
+Status NpuRuntime::ResolveOffload() {
+  if (!pending_offload()) return Status::InvalidState("no pending Offload");
+  const bool had_core = impl_->runtime_core->pending_offload();
+  auto status = had_core ? impl_->runtime_core->ResolveOffload() : Status::OK();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (impl_->local_pending) {
+    if (impl_->runtime_core->pending_offload()) return status;
+    if (had_core) impl_->local_result = status;
+    return impl_->FinishLocal();
+  }
+#endif
+  return status;
+}
+bool NpuRuntime::pending_offload() const {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (impl_->local_pending) return true;
+#endif
+  return impl_->runtime_core && impl_->runtime_core->pending_offload();
+}
+Status NpuRuntime::LastOffloadChecksum(std::uint64_t* checksum) const {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  return impl_->remote_operator ? impl_->remote_operator->LastChecksum(checksum) : Status::NotInitialized("CPU Offload is not initialized");
+#else
+  return Status::NotImplemented("CPU Offload was not built");
+#endif
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
@@ -539,6 +726,9 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   impl_->peer_allocator = nullptr;
   impl_->allocator.reset();
   impl_->runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  impl_->remote_operator.reset();
+#endif
   impl_->access_operator.reset();
   return Status::OK();
 }
@@ -549,10 +739,21 @@ Status NpuRuntime::ServeConnection(int) {
 
 Status NpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
-  const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
-                            ? impl_->runtime_core->Shutdown()
-                            : Status::OK();
-  impl_->ReleaseProbe();
+  const auto source_status = ReleaseOffloadSource(); if (!source_status.ok()) return source_status;
+  Status status;
+  if (impl_->runtime_core && impl_->runtime_core->initialized()) {
+    status = impl_->runtime_core->Shutdown();
+  } else if (impl_->peer_allocator && impl_->peer_allocator->has_allocation()) {
+    // Core initialization may have failed and its DDR-release reply may have
+    // been lost. Retire any partial operator before retrying that allocation.
+    AccessOperator* selected = impl_->access_operator.get();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    if (impl_->remote_operator) selected = impl_->remote_operator.get();
+#endif
+    if (selected) status = selected->Shutdown();
+    if (status.ok()) status = impl_->peer_allocator->ReleaseAllocation();
+  }
+  if (status.ok()) impl_->ReleaseProbe();
   return status;
 }
 
@@ -561,7 +762,7 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
+  return RuntimeCapabilities{!impl_->config.batch_get_kernel_object_path.empty(), !impl_->config.batch_put_kernel_object_path.empty(), false, true, impl_->options.enable_cpu_offload};
 }
 
 }  // namespace kvaf

@@ -88,3 +88,13 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
+
+add_executable(kvaf_remote_offload_test remote_offload_test.cc
+  ../runtime/src/npu_runtime.cc ../runtime/src/remote_offload.cc ../runtime/src/remote_pull_operator.cc)
+target_include_directories(kvaf_remote_offload_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+target_compile_definitions(kvaf_remote_offload_test PRIVATE KVAF_ENABLE_CPU_OFFLOAD=1)
+target_link_libraries(kvaf_remote_offload_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
+add_test(NAME kvaf_remote_offload_test COMMAND kvaf_remote_offload_test)
+set_tests_properties(kvaf_remote_offload_test PROPERTIES TIMEOUT 30)

@@ -9,6 +9,7 @@
 #include "requests.h"
 #include "status.h"
 #include "types.h"
+#include "remote_offload_types.h"
 
 namespace kvaf::peer {
 class PeerLink;
@@ -30,6 +31,10 @@ struct OffloadExecRequest {
   const PutAccessDesc* put_desc{nullptr};
   OffloadExecutionOptions execution;
 };
+struct RemoteOffloadExecRequest {
+  const RemoteOffloadRequest* request{};
+  const PutAccessDesc* put_desc{};
+};
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
@@ -38,6 +43,7 @@ class AccessOperator {
   virtual ~AccessOperator() = default;
 
   virtual Status Initialize(const RemoteRegionDesc& remote_region) = 0;
+  virtual Status CanShutdown() const { return Status::OK(); }
   virtual Status Shutdown() = 0;
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
@@ -50,6 +56,12 @@ class AccessOperator {
   virtual Status ResolveOffload() {
     return Status::NotImplemented("Offload recovery is unavailable");
   }
+  virtual Status ExecuteRemoteOffload(const RemoteOffloadExecRequest&) {
+    return Status::NotImplemented("Remote source Offload is unavailable");
+  }
+  // Called after metadata commits/aborts. A remote producer can reuse its
+  // frozen batch only after this decision is acknowledged by the CPU.
+  virtual Status CompleteOffload(bool) { return Status::OK(); }
 
 };
 

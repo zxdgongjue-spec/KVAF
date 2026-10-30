@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.18)
 project(kvaf LANGUAGES CXX)
 
 option(KVAF_BUILD_PYTHON "Build the optional Pybind Python registration module" OFF)
-option(KVAF_ENABLE_CPU_OFFLOAD "Build CANN host OffloadRuntime without AIV kernels" OFF)
+option(KVAF_ENABLE_CPU_OFFLOAD "Build CPU Pull and shared-pool NpuRuntime support (AIV kernels optional)" OFF)
 option(KVAF_ENABLE_AIV_BATCH_GET
        "Build the CANN-backed default BatchGet AccessOperator" OFF)
 option(KVAF_ENABLE_AIV_BATCH_PUT

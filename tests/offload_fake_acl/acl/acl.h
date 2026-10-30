@@ -7,7 +7,11 @@ using aclrtStream = void*;
 using aclrtEvent = void*;
 constexpr int ACL_SUCCESS = 0;
 constexpr int ACL_MEM_MALLOC_NORMAL_ONLY = 0;
+constexpr int ACL_MEMCPY_DEVICE_TO_HOST = 2;
+constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
 extern "C" {
+aclError aclrtSetDevice(int32_t);
+aclError aclrtMemcpy(void*, std::size_t, const void*, std::size_t, int);
 aclError aclrtGetDevice(int32_t*);
 aclError aclrtMalloc(void**, std::size_t, int);
 aclError aclrtFree(void*);

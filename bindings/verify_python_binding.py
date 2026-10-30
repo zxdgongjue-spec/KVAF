@@ -20,6 +20,10 @@ def main() -> int:
             for name in ("offload", "resolve_offload", "pending_offload", "last_checksum")
         ):
             raise RuntimeError("KVAF Offload binding is incomplete")
+        for owner, names in (("HbmSource", ("register", "ready", "release_batch", "shutdown")),
+                             ("NpuRuntime", ("offload", "offload_from", "offload_region", "resolve_offload"))):
+            if not hasattr(kvaf, owner) or any(not hasattr(getattr(kvaf, owner), name) for name in names):
+                raise RuntimeError(f"KVAF shared DDR binding is incomplete: {owner}")
 
     if options.require_aiv:
         if (
