@@ -17,6 +17,8 @@ usage() {
 Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
                  [--batch-get-lean-schedule 0|1]
                  [--batch-get-min-tail-reads 0..128]
+                 [--batch-get-single-group-fast-path 0|1|auto]
+                 [--batch-get-single-post-fast-path 0|1|auto]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -24,8 +26,8 @@ npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
 
 --batch-get-lean-schedule 0|1
-     NPU-only: skip idle-Jetty management and use a single-group
-     fast path when the whole call fits the inflight budget (or budget is 0).
+     NPU-only: skip idle-Jetty management. AUTO fast-path switches follow
+     this setting; explicit fast-path switches override it independently.
      Posts use at most 128 READs. If omitted, preserve the CMake cache
      (new builds default 1); use explicit 0/1 for an A/B rebuild.
 
@@ -34,6 +36,12 @@ npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      in a single-group call. 0 disables (default); 32 is an experimental
      candidate. Units are READs per core, not bytes or total miss_count.
      Omission preserves the CMake cache. Posts still use at most 128 READs.
+
+--batch-get-single-group-fast-path 0|1|auto
+--batch-get-single-post-fast-path 0|1|auto
+     NPU-only: independently bypass the group scheduler / single-post pipeline.
+     New builds default AUTO (follow lean schedule); omission preserves cache.
+     Use explicit 0/1 for isolation A/B; use auto to restore inheritance.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -178,6 +186,12 @@ build_npu() {
   if [[ -n "$min_tail_reads" ]]; then
     extra_cmake_options+=("-DKVAF_BATCH_GET_MIN_TAIL_READS=$min_tail_reads")
   fi
+  if [[ -n "$single_group_fast_path" ]]; then
+    extra_cmake_options+=("-DKVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH=$single_group_fast_path")
+  fi
+  if [[ -n "$single_post_fast_path" ]]; then
+    extra_cmake_options+=("-DKVAF_BATCH_GET_SINGLE_POST_FAST_PATH=$single_post_fast_path")
+  fi
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
@@ -204,6 +218,8 @@ build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
 lean_schedule=""
 min_tail_reads=""
+single_group_fast_path=""
+single_post_fast_path=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -229,12 +245,23 @@ while [[ $# -gt 0 ]]; do
       min_tail_reads="$2"
       shift 2
       ;;
+    --batch-get-single-group-fast-path|--batch-get-single-post-fast-path)
+      [[ $# -ge 2 && "$2" =~ ^(0|1|auto|AUTO)$ ]] ||
+        die "$1 requires 0, 1 or auto"
+      if [[ "$1" == --batch-get-single-group-fast-path ]]; then
+        single_group_fast_path="$2"
+      else
+        single_post_fast_path="$2"
+      fi
+      shift 2
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$mode" != npu && ( -n "$lean_schedule" || -n "$min_tail_reads" ) ]]; then
+if [[ "$mode" != npu && ( -n "$lean_schedule" || -n "$min_tail_reads" ||
+                          -n "$single_group_fast_path" || -n "$single_post_fast_path" ) ]]; then
   die "BatchGet scheduling options are supported only for npu"
 fi
 if [[ "$mode" == cpu ]]; then

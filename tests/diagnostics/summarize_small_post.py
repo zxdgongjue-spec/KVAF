@@ -43,17 +43,23 @@ OPTIONAL_STAGES = {
     "batch_get_kernel_setup": "setup_",
     "batch_get_kernel_finalize": "finalize_",
 }
+HOST_OPERATIONS = {"batch_get": "host_", "batch_get_submit": "host_submit_",
+                   "batch_get_synchronize": "host_synchronize_"}
 SCHEDULE_METRICS = ("small_post_groups_per_call", "fused_groups_per_call", "wqe_build_calls_per_call")
 PROOF_METRICS = ("small_post_max_requests", "post_width_min", "post_width_max",
                  "active_jettys_per_call", "schedule_metadata_version",
                  "lean_schedule_enabled", "managed_jettys_per_call",
-                 "single_group_fast_path_calls", "min_tail_reads", "tail_jetty_reuse_calls")
+                 "single_group_fast_path_calls", "min_tail_reads", "tail_jetty_reuse_calls",
+                 "single_group_fast_path_enabled", "single_post_fast_path_enabled",
+                 "single_post_fast_path_calls")
 MANAGEMENT_FIELDS = ("schedule_metadata_version", "lean_schedule_enabled",
                      "configured_jettys", "managed_jettys_min", "managed_jettys_max",
                      "managed_jettys_per_call", "single_group_fast_path_samples")
 TAIL_FIELDS = ("min_tail_reads", "tail_jetty_reuse_samples")
+FAST_PATH_FIELDS = ("single_group_fast_path_enabled", "single_post_fast_path_enabled",
+                    "single_post_fast_path_calls_per_call")
 POLICY_METRICS = ("small_post_max_requests", "schedule_metadata_version", "lean_schedule_enabled",
-                  "min_tail_reads")
+                  "min_tail_reads", "single_group_fast_path_enabled", "single_post_fast_path_enabled")
 JETTY_METRICS = (
     "active_samples", "reads_per_call", "posts_per_call", "completions_per_call",
     "payload_bytes_per_call", "polls_per_call", "probe_active_us_mean",
@@ -66,7 +72,7 @@ SCHEDULE_FIELDS = ("small_post_max_requests", "post_width_min", "post_width_max"
                    "small_post_active_samples") + SCHEDULE_METRICS
 STATS = ("mean", "p50", "p90", "p99")
 RUN_METRICS = tuple(prefix + stat + "_us"
-                    for prefix in (*STAGES.values(), *OPTIONAL_STAGES.values())
+                    for prefix in (*STAGES.values(), *OPTIONAL_STAGES.values(), *HOST_OPERATIONS.values())
                     for stat in STATS)
 PAIR_METRICS = (
     "mean_us", "p50_us", "p90_us", "p99_us", "p50_GBps",
@@ -74,13 +80,15 @@ PAIR_METRICS = (
     "posts_per_call", "completions_per_call",
     "first_doorbell_p50_us", "first_doorbell_p99_us",
     "transfer_window_p50_us", "transfer_window_p99_us",
-    "setup_p50_us", "finalize_p50_us",
+    "setup_p50_us", "finalize_p50_us", "host_p50_us", "host_p99_us", "host_p50_GBps",
+    "host_submit_p50_us", "host_synchronize_p50_us",
 ) + SCHEDULE_METRICS + PROOF_METRICS
 DELTA_FIELDS = (
     "p50_speedup", "p50_latency_reduction_pct", "p99_latency_reduction_pct",
     "p50_bandwidth_gain_pct", "post_p50_change_us", "completion_wait_p50_change_us",
     "first_doorbell_p50_change_us", "transfer_window_p50_change_us",
     "setup_p50_change_us", "finalize_p50_change_us",
+    "host_p50_latency_reduction_pct", "host_p99_latency_reduction_pct",
 )
 PAIR_VALUES = tuple(
     variant + "_" + metric
@@ -222,6 +230,25 @@ def _parse_run(path: Path) -> dict:
         raise ValueError("kernel total P50/P99 must be positive")
     row["payload_bytes"] = int(config["miss_count"]) * int(config["token_bytes"])
     row["p50_GBps"] = row["payload_bytes"] / row["p50_us"] / 1000.0
+    for operation, prefix in HOST_OPERATIONS.items():
+        record = results.get(operation, {})
+        # Old host results round milliseconds to 1 us. Do not manufacture
+        # precision from them when diagnosing sub-microsecond path changes.
+        present = [stat + "_us" in record for stat in STATS]
+        if any(present) and not all(present):
+            raise ValueError(f"incomplete host timing for {operation}")
+        if all(present):
+            if (int(record["samples"]) != int(config["iterations"]) or
+                    int(record["warmup_excluded"]) != int(config["warmup"])):
+                raise ValueError(f"host timing sample count mismatch for {operation}")
+            for stat in STATS:
+                row[prefix + stat + "_us"] = number(record[stat + "_us"])
+                if row[prefix + stat + "_us"] <= 0:
+                    raise ValueError(f"non-positive host timing for {operation}")
+        else:
+            row.update({prefix + stat + "_us": "" for stat in STATS})
+    row["host_p50_GBps"] = (row["payload_bytes"] / row["host_p50_us"] / 1000.0
+                            if row["host_p50_us"] != "" else "")
 
     cores = [fields(line) for line in lines if line.startswith("KERNEL_PROFILE_CORE ")]
     if sorted(int(core["core"]) for core in cores) != list(range(int(config["aiv_cores"]))):
@@ -273,7 +300,7 @@ def _parse_run(path: Path) -> dict:
                 record = dict(core=core_id, jetty=int(trace["jetty"]))
                 record.update({name: number(schedule[name]) for name in SCHEDULE_FIELDS})
                 record.update({name: number(schedule[name]) if name in schedule else ""
-                               for name in MANAGEMENT_FIELDS + TAIL_FIELDS})
+                               for name in MANAGEMENT_FIELDS + TAIL_FIELDS + FAST_PATH_FIELDS})
                 record.update({name: "" if trace[name] == "n/a" and "_us_" in name
                                else number(trace[name])
                                for name in JETTY_METRICS})
@@ -307,7 +334,7 @@ def _parse_run(path: Path) -> dict:
                 raise ValueError("incomplete Jetty management proof")
             versions = {number(s["schedule_metadata_version"]) for s in schedules}
             enabled = {number(s["lean_schedule_enabled"]) for s in schedules}
-            if versions != {1} or len(enabled) != 1 or not enabled <= {0, 1}:
+            if len(versions) != 1 or not versions <= {1, 2} or len(enabled) != 1 or not enabled <= {0, 1}:
                 raise ValueError("invalid or changing Jetty management policy")
             lean = enabled.pop()
             for schedule in schedules:
@@ -322,16 +349,16 @@ def _parse_run(path: Path) -> dict:
                         minimum != int(minimum) or maximum != int(maximum) or
                         actual > managed + 1e-6 or
                         not 0 <= fast <= int(config["iterations"]) or fast != int(fast) or
-                        (not lean and (fast != 0 or minimum != jetty_count)) or
+                        (not lean and (minimum != jetty_count or (versions == {1} and fast != 0))) or
                         any(j["reads_per_call"] > 0 and j["jetty"] >= maximum
                             for j in row["_jettys"] if j["core"] == int(schedule["core"]))):
                     raise ValueError("Jetty management proof differs from actual activity")
-            row.update(schedule_metadata_version=1, lean_schedule_enabled=int(lean),
+            row.update(schedule_metadata_version=int(next(iter(versions))), lean_schedule_enabled=int(lean),
                        managed_jettys_per_call=sum(number(s["managed_jettys_per_call"]) for s in schedules),
                        single_group_fast_path_calls=sum(number(s["single_group_fast_path_samples"])
                                                         for s in schedules) / int(config["iterations"]))
         if any(name in s for s in schedules for name in TAIL_FIELDS):
-            if row["schedule_metadata_version"] != 1 or any(
+            if row["schedule_metadata_version"] not in (1, 2) or any(
                     name not in s for s in schedules for name in TAIL_FIELDS):
                 raise ValueError("incomplete tail-Jetty policy proof")
             thresholds = {number(s["min_tail_reads"]) for s in schedules}
@@ -344,11 +371,32 @@ def _parse_run(path: Path) -> dict:
             for schedule in schedules:
                 reuse = number(schedule["tail_jetty_reuse_samples"])
                 if (reuse != int(reuse) or
-                        not 0 <= reuse <= number(schedule["single_group_fast_path_samples"]) or
+                        not 0 <= reuse <= int(config["iterations"]) or
+                        (row["schedule_metadata_version"] == 1 and
+                         reuse > number(schedule["single_group_fast_path_samples"])) or
                         (threshold <= 1 and reuse != 0)):
                     raise ValueError("invalid tail-Jetty reuse sample count")
             row.update(min_tail_reads=int(threshold), tail_jetty_reuse_calls=sum(
                 number(s["tail_jetty_reuse_samples"]) for s in schedules) / int(config["iterations"]))
+        if row["schedule_metadata_version"] == 2:
+            if any(name not in s for s in schedules for name in FAST_PATH_FIELDS + TAIL_FIELDS):
+                raise ValueError("incomplete independent fast-path proof")
+            for name in FAST_PATH_FIELDS[:2]:
+                values = {number(s[name]) for s in schedules}
+                if len(values) != 1 or not values <= {0, 1}:
+                    raise ValueError("invalid or changing fast-path switches")
+                row[name] = int(values.pop())
+            for schedule in schedules:
+                calls = number(schedule["single_post_fast_path_calls_per_call"])
+                if (calls < 0 or
+                        (not row["single_post_fast_path_enabled"] and calls != 0) or
+                        (not row["single_group_fast_path_enabled"] and
+                         number(schedule["single_group_fast_path_samples"]) != 0)):
+                    raise ValueError("fast-path counters differ from enabled switches")
+            row["single_post_fast_path_calls"] = sum(
+                number(s["single_post_fast_path_calls_per_call"]) for s in schedules)
+        elif any(name in s for s in schedules for name in FAST_PATH_FIELDS):
+            raise ValueError("independent fast-path proof requires metadata version 2")
     return row
 
 
@@ -365,8 +413,23 @@ def validate_fixed_post_assignment(run: dict) -> None:
         if (run["tail_jetty_reuse_calls"] not in ("", 0) or
                 run["single_group_fast_path_calls"] != 0):
             raise ValueError("tail reuse and single-group fast path must be disabled for windowed groups")
+        if run["schedule_metadata_version"] == 2:
+            for core in range(cores):
+                reads = misses * (core + 1) // cores - misses * core // cores
+                local_budget = budget // cores + (core < budget % cores)
+                first, second = local_budget // 2, (local_budget + 1) // 2
+                pairs, rest = divmod(reads, local_budget)
+                calls = pairs * ((first <= 128) + (second <= 128))
+                calls += int(rest > 0 and min(rest, first) <= 128)
+                calls += int(rest > first and rest - first <= 128)
+                expected = calls if run["single_post_fast_path_enabled"] else 0
+                if any(not math.isclose(j["single_post_fast_path_calls_per_call"], expected,
+                                        rel_tol=0, abs_tol=1e-4)
+                       for j in run["_jettys"] if j["core"] == core):
+                    raise ValueError("windowed single-post fast-path count differs from groups")
         return
     lean = bool(run["lean_schedule_enabled"])
+    group_fast = (run["single_group_fast_path_enabled"] if run["schedule_metadata_version"] == 2 else lean)
     threshold = 0 if run["min_tail_reads"] == "" else int(run["min_tail_reads"])
     for core in range(cores):
         reads = misses * (core + 1) // cores - misses * core // cores
@@ -384,7 +447,10 @@ def validate_fixed_post_assignment(run: dict) -> None:
                             active_samples=iterations if assigned_posts else 0,
                             managed_jettys_min=width, managed_jettys_max=width,
                             managed_jettys_per_call=width,
-                            single_group_fast_path_samples=iterations if lean and reads else 0)
+                            single_group_fast_path_samples=iterations if group_fast and reads else 0)
+            if run["schedule_metadata_version"] == 2:
+                expected["single_post_fast_path_calls_per_call"] = int(
+                    run["single_post_fast_path_enabled"] and posts == 1)
             if trace["tail_jetty_reuse_samples"] != "":
                 expected["tail_jetty_reuse_samples"] = iterations if reuse else 0
             if any(not math.isclose(trace[name], value, rel_tol=0, abs_tol=1e-4)
@@ -410,6 +476,11 @@ def comparison_deltas(reference: dict, candidate: dict) -> dict:
             candidate[metric] - reference[metric]
             if reference[metric] != "" and candidate[metric] != "" else ""
         )
+    for stat in ("p50", "p99"):
+        key = f"host_{stat}_us"
+        result[f"host_{stat}_latency_reduction_pct"] = (
+            100 * (1 - candidate[key] / reference[key])
+            if reference[key] != "" and candidate[key] != "" else "")
     return result
 
 
@@ -444,10 +515,8 @@ def compare_runs(runs: list[dict]) -> tuple[list[dict], list[dict]]:
 
     configurations = {}
     for pair in pairs:
-        key = tuple(pair[name] for name in CONFIG_FIELDS) + (
-            pair["baseline_small_post_max_requests"], pair["small_post_small_post_max_requests"],
-            *(pair[prefix + name] for prefix in ("baseline_", "small_post_")
-              for name in ("schedule_metadata_version", "lean_schedule_enabled", "min_tail_reads")))
+        key = tuple(pair[name] for name in CONFIG_FIELDS) + tuple(
+            pair[prefix + name] for prefix in ("baseline_", "small_post_") for name in POLICY_METRICS)
         configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
@@ -509,9 +578,7 @@ def compare_jetty_scaling(runs: list[dict]) -> tuple[list[dict], list[dict]]:
     configurations = {}
     for pair in pairs:
         key = (pair["variant"], *(pair[name] for name in CONFIG_FIELDS),
-               pair["reference_small_post_max_requests"], pair["candidate_small_post_max_requests"],
-               *(pair[prefix + name] for prefix in ("reference_", "candidate_")
-                 for name in ("schedule_metadata_version", "lean_schedule_enabled", "min_tail_reads")))
+               *(pair[prefix + name] for prefix in ("reference_", "candidate_") for name in POLICY_METRICS))
         configurations.setdefault(key, []).append(pair)
     summary = []
     for group in configurations.values():
@@ -546,11 +613,18 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
     parser.add_argument("log_dir", type=Path,
                         help="recursively read r<round>_n<count>_[c<cores>_j<jettys>_|<jettys>_]<variant>.log")
     parser.add_argument("--output-dir", type=Path, help="CSV destination; defaults to log_dir")
+    parser.add_argument("--validate-only", action="store_true", help="validate logs and pairs without writing CSV")
     if lean_experiment:
         parser.add_argument("--reference-lean", action="store_true",
                             help="baseline-labelled logs also use lean=1; isolate tail-threshold changes")
+        parser.add_argument("--fast-path-ab", action="store_true",
+                            help="require no idle Jettys, lean=1, tail=0 and metadata-v2 switches")
+        parser.add_argument("--candidate-fast-paths", choices=("group", "post", "both"),
+                            help="expected candidate switches; requires --fast-path-ab")
     args = parser.parse_args(argv)
     try:
+        if lean_experiment and args.candidate_fast_paths and not args.fast_path_ab:
+            raise ValueError("--candidate-fast-paths requires --fast-path-ab")
         if not args.log_dir.is_dir():
             raise ValueError(f"log directory does not exist: {args.log_dir}")
         paths = sorted(args.log_dir.rglob("r*_n*_*.log"))
@@ -563,12 +637,30 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
             for run in runs:
                 if run["variant"] not in ("baseline", "lean"):
                     raise ValueError("use a separate directory for baseline/lean logs")
-                if (run["schedule_metadata_version"] != 1 or
-                        run["lean_schedule_enabled"] != int(run["variant"] == "lean" or args.reference_lean) or
+                if (run["schedule_metadata_version"] not in (1, 2) or
+                        run["lean_schedule_enabled"] != int(run["variant"] == "lean" or args.reference_lean or args.fast_path_ab) or
                         run["small_post_max_requests"] != 0 or
                         run["post_width_min"] != 128 or run["post_width_max"] != 128):
                     raise ValueError(f"not a fixed-post baseline/lean build: {run['log_file']}")
                 validate_fixed_post_assignment(run)
+                if args.fast_path_ab and (
+                        run["schedule_metadata_version"] != 2 or run["min_tail_reads"] != 0 or
+                        run["active_jettys_per_call"] != run["configured_jettys_total"] or
+                        run["managed_jettys_per_call"] != run["configured_jettys_total"] or
+                        (run["variant"] == "baseline" and
+                         (run["single_group_fast_path_enabled"] or run["single_post_fast_path_enabled"])) or
+                        (run["variant"] == "lean" and not
+                         (run["single_group_fast_path_enabled"] or run["single_post_fast_path_enabled"]))):
+                    raise ValueError(f"not an isolated fast-path experiment: {run['log_file']}")
+                if args.fast_path_ab and args.candidate_fast_paths and run["variant"] == "lean":
+                    expected = (int(args.candidate_fast_paths in ("group", "both")),
+                                int(args.candidate_fast_paths in ("post", "both")))
+                    actual = (run["single_group_fast_path_enabled"], run["single_post_fast_path_enabled"])
+                    if actual != expected:
+                        raise ValueError(f"candidate switches differ from requested experiment: {run['log_file']}")
+            if args.fast_path_ab and len({(r["single_group_fast_path_enabled"], r["single_post_fast_path_enabled"])
+                                          for r in runs if r["variant"] == "lean"}) != 1:
+                raise ValueError("use a separate directory for each candidate fast-path combination")
             # Reuse the historical pair/statistics engine; translate its output
             # column prefixes below. Public filenames and labels remain lean.
             comparison_runs = [dict(run, variant=("small-post" if run["variant"] == "lean"
@@ -607,7 +699,7 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
         outputs = (
             ("small_post_runs.csv", runs,
              ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS + ("payload_bytes",) + RUN_METRICS +
-             ("p50_GBps", "posts_per_call", "completions_per_call") + SCHEDULE_METRICS + PROOF_METRICS + ("log_file",)),
+             ("p50_GBps", "host_p50_GBps", "posts_per_call", "completions_per_call") + SCHEDULE_METRICS + PROOF_METRICS + ("log_file",)),
             ("small_post_pairs.csv", pairs,
              ("round",) + CONFIG_FIELDS + SHAPE_METRICS + PAIR_VALUES + ("baseline_log", "small_post_log")),
             ("small_post_summary.csv", summary,
@@ -615,7 +707,7 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
              tuple("median_" + name for name in PAIR_VALUES)),
             ("small_post_jettys.csv", jettys,
              ("round", "variant") + CONFIG_FIELDS + ("core", "jetty") + SCHEDULE_FIELDS +
-             MANAGEMENT_FIELDS + TAIL_FIELDS + JETTY_METRICS),
+             MANAGEMENT_FIELDS + TAIL_FIELDS + FAST_PATH_FIELDS + JETTY_METRICS),
             ("small_post_jetty_pairs.csv", jetty_pairs,
              ("round", "variant") + CONFIG_FIELDS + SHAPE_METRICS +
              ("reference_variant", "reference_jettys_per_core") + JETTY_PAIR_VALUES +
@@ -642,8 +734,11 @@ def main(argv: list[str] | None = None, *, experiment: str = "small-post") -> in
                                    if not any(name == metric or name.endswith("_" + metric)
                                               for metric in retired_metrics)))
                             for filename, rows, columns in outputs)
-        output.mkdir(parents=True, exist_ok=True)
         log_prefix = "BATCH_GET" if lean_experiment else "SMALL_POST"
+        if args.validate_only:
+            print(f"{log_prefix}_LOGS_VALIDATED runs={len(runs)} pairs={len(pairs)}")
+            return 0
+        output.mkdir(parents=True, exist_ok=True)
         # Validate every log and pair before creating any result CSV.
         for run in runs:
             if run["_native_interleavings_recovered"]:

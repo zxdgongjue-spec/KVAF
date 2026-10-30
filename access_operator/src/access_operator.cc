@@ -585,6 +585,15 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
   }
   profiles->clear();
   profiles->reserve(statuses.size());
+  std::uint64_t total_active_requests = 0;
+  for (const auto& status : statuses) {
+    if (status.profile.active_requests > UINT32_MAX) {
+      return Internal("BatchGet kernel returned invalid active request count");
+    }
+    total_active_requests += status.profile.active_requests;
+  }
+  const bool whole_slice = impl_->config.batch_get_max_inflight_total == 0 ||
+      total_active_requests <= impl_->config.batch_get_max_inflight_total;
   for (const KvafBatchGetCoreStatus& status : statuses) {
     const KvafBatchGetCoreProfile& source = status.profile;
     const bool invalid_doorbell =
@@ -637,18 +646,31 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
     destination.configured_jettys = impl_->config.jettys_per_core;
     destination.managed_jettys = destination.configured_jettys;
     if (source.schedule_metadata != 0) {
-      constexpr std::uint64_t known_bits = KVAF_BATCH_GET_SCHEDULE_METADATA_V1 |
+      const auto version = (source.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_VERSION_SHIFT) &
+          KVAF_BATCH_GET_SCHEDULE_VERSION_MASK;
+      std::uint64_t known_bits =
+          (std::uint64_t(KVAF_BATCH_GET_SCHEDULE_VERSION_MASK) << KVAF_BATCH_GET_SCHEDULE_VERSION_SHIFT) |
           KVAF_BATCH_GET_SCHEDULE_LEAN | KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP |
           KVAF_BATCH_GET_SCHEDULE_TAIL_REUSED |
           (std::uint64_t(KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_MASK) <<
            KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_SHIFT) |
           (std::uint64_t(KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK) <<
            KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT);
-      destination.schedule_metadata_version = 1;
+      if (version == 2) {
+        known_bits |= KVAF_BATCH_GET_SCHEDULE_GROUP_ENABLED | KVAF_BATCH_GET_SCHEDULE_POST_ENABLED |
+            (std::uint64_t(UINT32_MAX) << KVAF_BATCH_GET_SCHEDULE_POST_COUNT_SHIFT);
+      }
+      destination.schedule_metadata_version = version;
       destination.lean_schedule_enabled =
           (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_LEAN) != 0;
       destination.single_group_fast_path =
           (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP) != 0;
+      destination.single_group_fast_path_enabled = version == 1 ? destination.lean_schedule_enabled :
+          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_GROUP_ENABLED) != 0;
+      destination.single_post_fast_path_enabled = version == 1 ? destination.lean_schedule_enabled :
+          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_POST_ENABLED) != 0;
+      destination.single_post_fast_path_count = version == 2 ?
+          source.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_POST_COUNT_SHIFT : 0;
       destination.managed_jettys = static_cast<std::uint32_t>(
           (source.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MANAGED_SHIFT) &
           KVAF_BATCH_GET_SCHEDULE_MANAGED_MASK);
@@ -661,23 +683,35 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
           (source.active_requests % 128U != 0);
       const auto baseline_active = std::min<std::uint64_t>(
           whole_posts, destination.configured_jettys);
-      const bool expect_tail_reuse = destination.single_group_fast_path &&
+      const bool expect_tail_reuse = destination.lean_schedule_enabled && whole_slice &&
           whole_posts > 1 && whole_posts <= destination.configured_jettys &&
           source.active_requests % 128U != 0 &&
           source.active_requests % 128U < destination.min_tail_reads;
+      const auto expected_managed = !destination.lean_schedule_enabled ? destination.configured_jettys :
+          source.active_requests == 0 ? 0 : !whole_slice ? destination.configured_jettys :
+          baseline_active - expect_tail_reuse;
+      const bool expected_fast_group = destination.single_group_fast_path_enabled &&
+          whole_slice && source.active_requests != 0;
+      const auto expected_fast_posts = destination.single_post_fast_path_enabled &&
+          source.active_requests != 0 && whole_posts == 1 ? 1U : 0U;
       if ((source.schedule_metadata & ~known_bits) != 0 ||
-          (source.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_METADATA_V1) == 0 ||
+          (version != 1 && version != 2) ||
           destination.min_tail_reads > 128 ||
           (!destination.lean_schedule_enabled && destination.min_tail_reads != 0) ||
           destination.tail_jetty_reused != expect_tail_reuse ||
-          (destination.single_group_fast_path &&
-           destination.managed_jettys != baseline_active - expect_tail_reuse) ||
+          destination.managed_jettys != expected_managed ||
+          destination.single_group_fast_path != expected_fast_group ||
+          (version == 2 &&
+           ((!destination.single_post_fast_path_enabled && destination.single_post_fast_path_count != 0) ||
+            destination.single_post_fast_path_count > source.submitted_group_count ||
+            destination.single_post_fast_path_count > source.wqe_build_calls ||
+            (whole_slice && destination.single_post_fast_path_count != expected_fast_posts))) ||
           destination.managed_jettys > destination.configured_jettys ||
           (source.active_requests != 0 && destination.managed_jettys == 0) ||
           (!destination.lean_schedule_enabled &&
            destination.managed_jettys != destination.configured_jettys) ||
           (destination.single_group_fast_path &&
-           (!destination.lean_schedule_enabled || source.active_requests == 0 ||
+           (!destination.single_group_fast_path_enabled || source.active_requests == 0 ||
             source.submitted_group_count != 1 || source.completed_group_count != 1))) {
         profiles->clear();
         return Internal("BatchGet kernel returned invalid schedule metadata");

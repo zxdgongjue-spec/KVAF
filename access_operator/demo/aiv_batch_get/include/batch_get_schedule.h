@@ -19,6 +19,21 @@ static_assert(KVAF_BATCH_GET_LEAN_SCHEDULE == 0 || KVAF_BATCH_GET_LEAN_SCHEDULE 
               "KVAF_BATCH_GET_LEAN_SCHEDULE must be 0 or 1");
 constexpr bool kLeanSchedule = KVAF_BATCH_GET_LEAN_SCHEDULE != 0;
 
+// Defaults retain the historical combined switch. Explicit definitions allow
+// either fast path to be measured independently of resource-prefix trimming.
+#ifndef KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH
+#define KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH KVAF_BATCH_GET_LEAN_SCHEDULE
+#endif
+#ifndef KVAF_BATCH_GET_SINGLE_POST_FAST_PATH
+#define KVAF_BATCH_GET_SINGLE_POST_FAST_PATH KVAF_BATCH_GET_LEAN_SCHEDULE
+#endif
+static_assert(KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH == 0 ||
+              KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH == 1, "single-group fast path must be 0 or 1");
+static_assert(KVAF_BATCH_GET_SINGLE_POST_FAST_PATH == 0 ||
+              KVAF_BATCH_GET_SINGLE_POST_FAST_PATH == 1, "single-post fast path must be 0 or 1");
+constexpr bool kSingleGroupFastPath = KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH != 0;
+constexpr bool kSinglePostFastPath = KVAF_BATCH_GET_SINGLE_POST_FAST_PATH != 0;
+
 #ifndef KVAF_BATCH_GET_MIN_TAIL_READS
 #define KVAF_BATCH_GET_MIN_TAIL_READS 0
 #endif

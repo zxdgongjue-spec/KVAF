@@ -413,6 +413,11 @@ class NpuPythonRuntime final {
       item["schedule_metadata_version"] = profile.schedule_metadata_version;
       item["lean_schedule_enabled"] = profile.lean_schedule_enabled;
       item["single_group_fast_path"] = profile.single_group_fast_path;
+      if (profile.schedule_metadata_version >= 2) {
+        item["single_group_fast_path_enabled"] = profile.single_group_fast_path_enabled;
+        item["single_post_fast_path_enabled"] = profile.single_post_fast_path_enabled;
+        item["single_post_fast_path_count"] = profile.single_post_fast_path_count;
+      }
       item["configured_jettys"] = profile.configured_jettys;
       item["managed_jettys"] = profile.managed_jettys;
       item["min_tail_reads"] = profile.min_tail_reads;

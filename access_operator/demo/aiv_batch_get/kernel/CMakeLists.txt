@@ -9,11 +9,26 @@ endif()
 if(NOT DEFINED KVAF_BATCH_GET_MIN_TAIL_READS)
   set(KVAF_BATCH_GET_MIN_TAIL_READS 0)
 endif()
+foreach(fast_path IN ITEMS SINGLE_GROUP_FAST_PATH SINGLE_POST_FAST_PATH)
+  if(NOT DEFINED KVAF_BATCH_GET_${fast_path}_ENABLED)
+    if(NOT DEFINED KVAF_BATCH_GET_${fast_path})
+      set(KVAF_BATCH_GET_${fast_path} AUTO)
+    endif()
+    string(TOUPPER "${KVAF_BATCH_GET_${fast_path}}" fast_path_value)
+    if(fast_path_value STREQUAL "AUTO")
+      set(KVAF_BATCH_GET_${fast_path}_ENABLED ${KVAF_BATCH_GET_LEAN_SCHEDULE})
+    elseif(fast_path_value MATCHES "^(ON|OFF|0|1)$")
+      set(KVAF_BATCH_GET_${fast_path}_ENABLED ${fast_path_value})
+    else()
+      message(FATAL_ERROR "KVAF_BATCH_GET_${fast_path} must be AUTO, ON/OFF or 0/1")
+    endif()
+  endif()
+endforeach()
 # Also invalidate the custom object with Makefile generators when this cached
 # setting changes; a changed command line alone is not a portable dependency.
 set(KVAF_SCHEDULE_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/schedule_config.txt")
 file(GENERATE OUTPUT "${KVAF_SCHEDULE_CONFIG}"
-  CONTENT "lean_schedule=$<BOOL:${KVAF_BATCH_GET_LEAN_SCHEDULE}>\nmin_tail_reads=${KVAF_BATCH_GET_MIN_TAIL_READS}\n")
+  CONTENT "lean_schedule=$<BOOL:${KVAF_BATCH_GET_LEAN_SCHEDULE}>\nmin_tail_reads=${KVAF_BATCH_GET_MIN_TAIL_READS}\nsingle_group=$<BOOL:${KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH_ENABLED}>\nsingle_post=$<BOOL:${KVAF_BATCH_GET_SINGLE_POST_FAST_PATH_ENABLED}>\n")
 
 find_program(KVAF_CCEC NAMES ccec HINTS "${KVAF_CCEC_DIR}")
 find_program(KVAF_LLD NAMES ld.lld HINTS "${KVAF_CCEC_DIR}")
@@ -76,6 +91,8 @@ add_custom_command(
           -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
           -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all
           -DKVAF_BATCH_GET_LEAN_SCHEDULE=$<BOOL:${KVAF_BATCH_GET_LEAN_SCHEDULE}>
+          -DKVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH=$<BOOL:${KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH_ENABLED}>
+          -DKVAF_BATCH_GET_SINGLE_POST_FAST_PATH=$<BOOL:${KVAF_BATCH_GET_SINGLE_POST_FAST_PATH_ENABLED}>
           -DKVAF_BATCH_GET_MIN_TAIL_READS=${KVAF_BATCH_GET_MIN_TAIL_READS}
           ${KVAF_KERNEL_INCLUDES}
   COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_EXECUTE_KERNEL_TMP}" -static

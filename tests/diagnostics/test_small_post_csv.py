@@ -5,7 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from summarize_small_post import JETTY_METRICS, compare_jetty_scaling, compare_runs, main, parse_run
+from summarize_small_post import (JETTY_METRICS, compare_jetty_scaling, compare_runs, main, parse_run,
+                                  validate_fixed_post_assignment)
 from summarize_batch_get import main as lean_main
 
 
@@ -254,7 +255,8 @@ class SmallPostCsvTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(lean_main([str(self.root)]), 2)
 
-    def tail_log(self, name, assignments, threshold, enabled=True, configured=4):
+    def tail_log(self, name, assignments, threshold, enabled=True, configured=4,
+                 metadata_version=1, group_fast=None, post_fast=None):
         """Explicit per-core lane loads, independent of the selection formula."""
         misses = sum(sum(lanes) for lanes in assignments)
         path = self.log(name, miss_count=misses, aiv_cores=len(assignments),
@@ -274,15 +276,21 @@ class SmallPostCsvTests(unittest.TestCase):
             lines.append(f"KERNEL_PROFILE_CORE core={core} samples=1000 "
                          f"active_requests_mean={reads} total_posts_mean={posts} "
                          f"completion_count_mean={active}")
+            group_flag = enabled if group_fast is None else group_fast
+            post_flag = enabled if post_fast is None else post_fast
+            fast_proof = (f" single_group_fast_path_enabled={int(group_flag)} "
+                          f"single_post_fast_path_enabled={int(post_flag)} "
+                          f"single_post_fast_path_calls_per_call={int(post_flag and 0 < reads <= 128)}"
+                          if metadata_version == 2 else "")
             lines.append(f"KERNEL_PROFILE_SCHEDULE core={core} samples=1000 "
                          "small_post_max_requests=0 post_width_min=128 post_width_max=128 "
                          "small_post_active_samples=0 small_post_groups_per_call=0 fused_groups_per_call=0 "
-                         f"wqe_build_calls_per_call={posts} schedule_metadata_version=1 "
+                         f"wqe_build_calls_per_call={posts} schedule_metadata_version={metadata_version} "
                          f"lean_schedule_enabled={int(enabled)} configured_jettys={configured} "
                          f"managed_jettys_min={managed} managed_jettys_max={managed} "
                          f"managed_jettys_per_call={managed} "
-                         f"single_group_fast_path_samples={1000 if enabled and reads else 0} "
-                         f"min_tail_reads={threshold} tail_jetty_reuse_samples={1000 if reuse else 0}")
+                         f"single_group_fast_path_samples={1000 if group_flag and reads else 0} "
+                         f"min_tail_reads={threshold} tail_jetty_reuse_samples={1000 if reuse else 0}" + fast_proof)
             for jetty, n in enumerate(loads):
                 record = {key: "n/a" for key in JETTY_METRICS}
                 record.update(core=core, jetty=jetty, samples=1000, completion_poll_mode="serial",
@@ -353,6 +361,117 @@ class SmallPostCsvTests(unittest.TestCase):
             rows = list(csv.DictReader(stream))
         self.assertEqual(len(rows), 2)
         self.assertEqual(sorted(int(row["rounds"]) for row in rows), [1, 2])
+
+    def test_independent_fast_path_combinations_and_actual_triggers(self):
+        for group_fast, post_fast in ((1, 0), (0, 1), (1, 1)):
+            with self.subTest(group_fast=group_fast, post_fast=post_fast), tempfile.TemporaryDirectory() as directory:
+                self.root = Path(directory)
+                self.tail_log("r1_n32_baseline.log", [[32]], 0, configured=1,
+                              metadata_version=2, group_fast=0, post_fast=0)
+                self.tail_log("r1_n32_lean.log", [[32]], 0, configured=1,
+                              metadata_version=2, group_fast=group_fast, post_fast=post_fast)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(lean_main([str(self.root), "--fast-path-ab", "--validate-only"]), 0)
+                self.assertEqual(list(self.root.glob("*.csv")), [])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(lean_main([str(self.root), "--fast-path-ab"]), 0)
+                with (self.root / "batch_get_pairs.csv").open(encoding="utf-8-sig", newline="") as stream:
+                    row = next(csv.DictReader(stream))
+                self.assertEqual(row["lean_single_group_fast_path_enabled"], str(group_fast))
+                self.assertEqual(row["lean_single_post_fast_path_enabled"], str(post_fast))
+                self.assertEqual(float(row["lean_single_group_fast_path_calls"]), group_fast)
+                self.assertEqual(float(row["lean_single_post_fast_path_calls"]), post_fast)
+                self.assertEqual(row["baseline_active_jettys_per_call"], row["lean_active_jettys_per_call"])
+                self.assertEqual(row["lean_host_p50_us"], "")
+
+    def test_fast_path_experiment_rejects_idle_resources_and_mislabeled_candidate(self):
+        self.tail_log("r1_n32_baseline.log", [[32]], 0, metadata_version=2, group_fast=0, post_fast=0)
+        self.tail_log("r1_n32_lean.log", [[32]], 0, metadata_version=2, group_fast=0, post_fast=1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--fast-path-ab"]), 2)
+        self.tail_log("r1_n32_baseline.log", [[32]], 0, configured=1,
+                      metadata_version=2, group_fast=0, post_fast=0)
+        self.tail_log("r1_n32_lean.log", [[32]], 0, configured=1,
+                      metadata_version=2, group_fast=0, post_fast=1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--fast-path-ab", "--candidate-fast-paths", "group"]), 2)
+        self.assertEqual(list(self.root.glob("*.csv")), [])
+
+    def test_multiple_posts_do_not_trigger_single_post_fast_path(self):
+        self.tail_log("r1_n256_baseline.log", [[128, 128]], 0, configured=2,
+                      metadata_version=2, group_fast=0, post_fast=0)
+        self.tail_log("r1_n256_lean.log", [[128, 128]], 0, configured=2,
+                      metadata_version=2, group_fast=0, post_fast=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--fast-path-ab"]), 0)
+        candidate = parse_run(self.root / "r1_n256_lean.log")
+        self.assertEqual(candidate["single_post_fast_path_calls"], 0)
+
+    def test_fast_path_without_resource_trimming(self):
+        path = self.tail_log("r1_n32_baseline.log", [[32]], 0, enabled=False,
+                             metadata_version=2, group_fast=1, post_fast=1)
+        run = parse_run(path)
+        validate_fixed_post_assignment(run)
+        self.assertEqual(run["managed_jettys_per_call"], 4)
+        self.assertEqual(run["active_jettys_per_call"], 1)
+        self.assertEqual(run["single_group_fast_path_calls"], 1)
+
+    def test_windowed_groups_report_each_single_post_trigger(self):
+        cases = ((385, 256, [[128, 128, 128, 1]], 4),
+                 (258, 256, [[64, 64, 1], [64, 64, 1]], 3))
+        for misses, budget, loads, calls in cases:
+            with self.subTest(misses=misses):
+                path = self.tail_log(f"r1_n{misses}_lean.log", loads, 0,
+                                     metadata_version=2, group_fast=0, post_fast=1)
+                text = path.read_text(encoding="utf-8").replace("max_inflight_total=2048",
+                                                                             f"max_inflight_total={budget}")
+                for old in ("managed_jettys_min=3", "managed_jettys_max=3", "managed_jettys_per_call=3"):
+                    text = text.replace(old, old[:-1] + "4")
+                text = text.replace("single_post_fast_path_calls_per_call=0",
+                                    f"single_post_fast_path_calls_per_call={calls}")
+                path.write_text(text, encoding="utf-8")
+                run = parse_run(path)
+                validate_fixed_post_assignment(run)
+                self.assertEqual(run["single_post_fast_path_calls"], calls * len(loads))
+
+    def test_fast_path_false_trigger_and_wrong_experiment_rejected(self):
+        self.tail_log("r1_n32_baseline.log", [[32]], 0, configured=1,
+                      metadata_version=2, group_fast=0, post_fast=0)
+        path = self.tail_log("r1_n32_lean.log", [[32]], 0, configured=1,
+                             metadata_version=2, group_fast=0, post_fast=1)
+        original = path.read_text(encoding="utf-8")
+        for before, after in (("single_post_fast_path_calls_per_call=1", "single_post_fast_path_calls_per_call=0"),
+                              ("single_post_fast_path_enabled=1", "single_post_fast_path_enabled=0"),
+                              ("single_group_fast_path_samples=0", "single_group_fast_path_samples=1000"),
+                              ("single_group_fast_path_enabled=0 ", ""),
+                              ("schedule_metadata_version=2", "schedule_metadata_version=1"),
+                              ("min_tail_reads=0", "min_tail_reads=32")):
+            with self.subTest(before=before):
+                path.write_text(original.replace(before, after), encoding="utf-8")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(lean_main([str(self.root), "--fast-path-ab"]), 2)
+                self.assertEqual(list(self.root.glob("*.csv")), [])
+
+    def test_high_precision_host_timing_export_and_legacy_missing_values(self):
+        for name, latency, group_fast in (("baseline", 20.125, 0), ("lean", 15.5, 1)):
+            path = self.tail_log(f"r1_n32_{name}.log", [[32]], 0, configured=1, metadata_version=2,
+                                 group_fast=group_fast, post_fast=0)
+            with path.open("a", encoding="utf-8") as stream:
+                for operation in ("batch_get", "batch_get_submit", "batch_get_synchronize"):
+                    stream.write(f"PERF_RESULT operation={operation} samples=1000 warmup_excluded=20 "
+                                 f"mean_us={latency} p50_us={latency} p90_us={latency} p99_us={latency}\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(lean_main([str(self.root), "--fast-path-ab"]), 0)
+        with (self.root / "batch_get_pairs.csv").open(encoding="utf-8-sig", newline="") as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(float(row["baseline_host_p50_us"]), 20.125)
+        self.assertAlmostEqual(float(row["lean_host_p50_GBps"]), 32 * 656 / 15.5 / 1000, places=6)
+        self.assertAlmostEqual(float(row["host_p50_latency_reduction_pct"]), 100 * (1 - 15.5 / 20.125), places=6)
+        legacy = self.log("r2_n32_baseline.log")
+        with legacy.open("a", encoding="utf-8") as stream:
+            stream.write("PERF_RESULT operation=batch_get samples=1000 warmup_excluded=20 "
+                         "mean_ms=0.020 p50_ms=0.020 p90_ms=0.020 p99_ms=0.020\n")
+        self.assertEqual(parse_run(legacy)["host_p50_us"], "")
 
     def test_rejoins_numeric_fields_keys_and_completion_markers(self):
         path = self.timeline_log("r1_n32_baseline.log")

@@ -222,7 +222,8 @@ struct Fixture {
       CHECK(profile.small_post_max_requests == 0);
       CHECK(profile.selected_post_width == 128);
       CHECK(profile.small_post_group_count == 0 && profile.fused_group_count == 0);
-      CHECK((profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_METADATA_V1) != 0);
+      CHECK(((profile.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_VERSION_SHIFT) &
+             KVAF_BATCH_GET_SCHEDULE_VERSION_MASK) == 2);
       CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_LEAN) ==
             kvaf_batch_get::kLeanSchedule);
       const uint32_t core_budget = args.batch_get_max_inflight_total &&
@@ -234,7 +235,23 @@ struct Fixture {
       CHECK(managed == kvaf_batch_get::ManagedJettys(
           static_cast<uint32_t>(profile.active_requests), core_budget, jettys));
       CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_SINGLE_GROUP) ==
-            (kvaf_batch_get::kLeanSchedule && profile.active_requests != 0 && core_budget == 0));
+            (kvaf_batch_get::kSingleGroupFastPath && profile.active_requests != 0 && core_budget == 0));
+      CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_GROUP_ENABLED) ==
+            kvaf_batch_get::kSingleGroupFastPath);
+      CHECK(bool(profile.schedule_metadata & KVAF_BATCH_GET_SCHEDULE_POST_ENABLED) ==
+            kvaf_batch_get::kSinglePostFastPath);
+      uint32_t expected_fast_posts = 0;
+      uint32_t remaining = static_cast<uint32_t>(profile.active_requests);
+      for (uint32_t group = 0; remaining != 0; ++group) {
+        const uint32_t limit = core_budget == 0 ? remaining :
+            core_budget / 2 + (group % 2) * (core_budget % 2);
+        const uint32_t count_in_group = std::min(remaining, limit);
+        CHECK(count_in_group != 0);
+        if (kvaf_batch_get::kSinglePostFastPath && count_in_group <= 128) ++expected_fast_posts;
+        remaining -= count_in_group;
+      }
+      CHECK((profile.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_POST_COUNT_SHIFT) ==
+            expected_fast_posts);
       CHECK(((profile.schedule_metadata >> KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_SHIFT) &
              KVAF_BATCH_GET_SCHEDULE_MIN_TAIL_MASK) ==
             (kvaf_batch_get::kLeanSchedule ? kvaf_batch_get::kMinTailReads : 0U));

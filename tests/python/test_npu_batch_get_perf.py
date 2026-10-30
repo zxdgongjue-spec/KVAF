@@ -401,6 +401,10 @@ def print_samples(
         f"p50_ms={percentile(samples, 0.50):.3f} "
         f"p90_ms={percentile(samples, 0.90):.3f} "
         f"p99_ms={percentile(samples, 0.99):.3f}"
+        f" mean_us={mean_ms * 1000.0:.6f} "
+        f"p50_us={percentile(samples, 0.50) * 1000.0:.6f} "
+        f"p90_us={percentile(samples, 0.90) * 1000.0:.6f} "
+        f"p99_us={percentile(samples, 0.99) * 1000.0:.6f}"
     )
     if operation == "batch_get":
         payload_bytes = miss_count * token_bytes
@@ -439,9 +443,9 @@ def print_jetty_profile(
         widths = [int(record["selected_post_width"]) for record in records]
         management_proof = ""
         versions = {int(r.get("schedule_metadata_version", 0)) for r in records}
-        if len(versions) != 1 or not versions <= {0, 1}:
+        if len(versions) != 1 or not versions <= {0, 1, 2}:
             raise AssertionError("invalid or changing schedule metadata version")
-        if versions == {1}:
+        if versions != {0}:
             enabled = {bool(r["lean_schedule_enabled"]) for r in records}
             managed = [int(r["managed_jettys"]) for r in records]
             tails = {int(r.get("min_tail_reads", 0)) for r in records}
@@ -453,7 +457,7 @@ def print_jetty_profile(
             active_jettys = sum(sum(int(t["submitted_reads"]) > 0 for t in r["jettys"])
                                for r in records) / divisor
             management_proof = (
-                f" schedule_metadata_version=1 lean_schedule_enabled={int(enabled.pop())} "
+                f" schedule_metadata_version={next(iter(versions))} lean_schedule_enabled={int(enabled.pop())} "
                 f"configured_jettys={jettys_per_core} "
                 f"active_jettys_per_call={active_jettys:.6f} "
                 f"managed_jettys_min={min(managed)} managed_jettys_max={max(managed)} "
@@ -462,6 +466,17 @@ def print_jetty_profile(
                 f" min_tail_reads={tails.pop()} "
                 f"tail_jetty_reuse_samples={sum(bool(r.get('tail_jetty_reused', False)) for r in records)}"
             )
+            if versions == {2}:
+                group_flags = {bool(r["single_group_fast_path_enabled"]) for r in records}
+                post_flags = {bool(r["single_post_fast_path_enabled"]) for r in records}
+                if len(group_flags) != 1 or len(post_flags) != 1:
+                    raise AssertionError("fast-path switches changed within a run")
+                management_proof += (
+                    f" single_group_fast_path_enabled={int(group_flags.pop())} "
+                    f"single_post_fast_path_enabled={int(post_flags.pop())} "
+                    f"single_post_fast_path_calls_per_call="
+                    f"{sum(int(r['single_post_fast_path_count']) for r in records) / divisor:.6f}"
+                )
         print(
             f"KERNEL_PROFILE_SCHEDULE core={core} samples={len(samples)} "
             f"small_post_max_requests={limits.pop()} "

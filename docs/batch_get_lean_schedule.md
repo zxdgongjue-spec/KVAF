@@ -1,5 +1,9 @@
 # BatchGet：baseline post 分配与按需 Jetty 管理
 
+单 group / 单 post 快路径现支持独立开关；定位无闲置 Jetty 时的退化请使用
+[快路径隔离 A/B](batch_get_fast_path_ab.md)。本文原 lean 对比按两个快路径均为 AUTO
+（跟随 lean）解释。显式设置快路径后，仅切换 lean 不会覆盖其缓存值。
+
 当前固定使用 baseline 的最多 **128 READ/post** 分配。主动拆小 post 的
 small-post 策略、fused 小 post 构造和 `--batch-get-small-post-max-requests`
 构建参数已移除，不再需要 `post_limit`。
@@ -65,8 +69,10 @@ group，跳过双槽调度器和旧 group 的在途量管理。只有一个 post
 旧 small-post CMake 缓存会被清理，内核不再读取它。
 
 ```bash
-./build.sh npu --build-dir "$PWD/build-npu-baseline" --batch-get-lean-schedule 0
-./build.sh npu --build-dir "$PWD/build-npu-lean" --batch-get-lean-schedule 1
+./build.sh npu --build-dir "$PWD/build-npu-baseline" --batch-get-lean-schedule 0 \
+  --batch-get-single-group-fast-path auto --batch-get-single-post-fast-path auto
+./build.sh npu --build-dir "$PWD/build-npu-lean" --batch-get-lean-schedule 1 \
+  --batch-get-single-group-fast-path auto --batch-get-single-post-fast-path auto
 ```
 
 本轮只比较这两个版本：同样的 baseline post 分配，区别为按需管理和单 group
@@ -232,7 +238,8 @@ python3 tests/diagnostics/summarize_batch_get.py "$log_dir" --reference-lean
 
 六张 CSV 文件名保持不变，汇总按两侧门槛分组。Jetty scaling 表的参考始终是
 同轮同核、baseline 标签的配置 1 Jetty，具体 lean 开关和门槛同时保存在参考列中。
-`p50_GBps` 使用内核 total P50，完整调用延迟另看 wall 指标。
+`p50_GBps` 使用内核 total P50；wall 也是内核跨度，完整调用延迟看新增的
+`host_p50_us` / `host_p99_us`，带宽看 `host_p50_GBps`。
 
 profile 扩展复用 V3 保留字，设备记录大小保持不变；使用新增字段时应整体重建
 host、binding 和 kernel。CPU 模型增加 32/128 门槛目标，覆盖尾部复用、实际 CQ 数、

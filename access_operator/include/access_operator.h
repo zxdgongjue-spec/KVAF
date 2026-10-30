@@ -96,6 +96,9 @@ struct BatchGetKernelProfile {
   std::uint64_t schedule_metadata_version{0};
   bool lean_schedule_enabled{false};
   bool single_group_fast_path{false};
+  bool single_group_fast_path_enabled{false};
+  bool single_post_fast_path_enabled{false};
+  std::uint64_t single_post_fast_path_count{0};
   std::uint32_t configured_jettys{0};
   std::uint32_t managed_jettys{0};
   std::uint32_t min_tail_reads{0};

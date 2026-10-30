@@ -120,6 +120,36 @@ class InflightConfigTests(unittest.TestCase):
         self.assertEqual(records["batch_get_kernel_first_doorbell"]["mean_cycles"], "0.000")
         self.assertEqual(records["batch_get_kernel_transfer_window"]["mean_cycles"], "0.000")
 
+    def test_independent_fast_path_log_flags_and_counts(self):
+        trace = dict(submitted_reads=16, submitted_posts=1, completed_checkpoints=1,
+                     first_doorbell_cycle=1200, last_doorbell_cycle=1200,
+                     first_cqe_seen_cycle=2000, last_cqe_seen_cycle=2000, probe_active_cycles=0)
+        profile = dict(core=0, kernel_start_cycle=1000, setup_done_cycle=1100,
+                       compact_done_cycle=1100, first_doorbell_cycle=1200, post_done_cycle=1300,
+                       completion_done_cycle=2100, kernel_finish_cycle=2200, active_requests=16,
+                       total_posts=1, submitted_group_count=1, completed_group_count=1, completion_count=1,
+                       post_active_cycles=200, drain_wait_cycles=800, peak_submitted_not_drained=16,
+                       jetty_completion_wait_cycles=[900] + [0] * 63, jetty_completion_polls=[5] + [0] * 63,
+                       small_post_max_requests=0, selected_post_width=128, small_post_group_count=0,
+                       fused_group_count=0, wqe_build_calls=1, jetty_timeline_enabled=False, profile_version=3,
+                       schedule_metadata_version=2, lean_schedule_enabled=True, configured_jettys=1,
+                       managed_jettys=1, single_group_fast_path=False, min_tail_reads=0, tail_jetty_reused=False,
+                       single_group_fast_path_enabled=False, single_post_fast_path_enabled=True,
+                       single_post_fast_path_count=1, jettys=[trace])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf.print_kernel_profile([[profile]], 0, 1000, 1, 1, 16, 16, 656)
+        self.assertIn("schedule_metadata_version=2", output.getvalue())
+        self.assertIn("single_group_fast_path_samples=0", output.getvalue())
+        self.assertIn("single_group_fast_path_enabled=0 single_post_fast_path_enabled=1 "
+                      "single_post_fast_path_calls_per_call=1.000000", output.getvalue())
+
+    def test_host_timing_keeps_sub_microsecond_precision(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            perf.print_samples("batch_get", [0.007001, 0.007123, 0.007245], 0, 32, 32, 656)
+        self.assertIn("p50_us=7.123000", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

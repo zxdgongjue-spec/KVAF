@@ -30,6 +30,29 @@ foreach(tail_threshold IN ITEMS 32 128)
     KVAF_BATCH_GET_LEAN_SCHEDULE=1 KVAF_BATCH_GET_MIN_TAIL_READS=${tail_threshold})
   add_test(NAME ${tail_target} COMMAND ${tail_target})
 endforeach()
+foreach(fast_case IN ITEMS trim_only group_only post_only untrimmed_group untrimmed_post untrimmed_both)
+  set(fast_target kvaf_batch_get_${fast_case}_kernel_model_test)
+  add_executable(${fast_target} batch_get_kernel_model_test.cc)
+  target_include_directories(${fast_target} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+  set(trim 1)
+  set(group_fast 0)
+  set(post_fast 0)
+  if(fast_case MATCHES "^untrimmed")
+    set(trim 0)
+  endif()
+  if(fast_case MATCHES "group|both")
+    set(group_fast 1)
+  endif()
+  if(fast_case MATCHES "post|both")
+    set(post_fast 1)
+  endif()
+  target_compile_definitions(${fast_target} PRIVATE KVAF_BATCH_GET_LEAN_SCHEDULE=${trim}
+    KVAF_BATCH_GET_SINGLE_GROUP_FAST_PATH=${group_fast} KVAF_BATCH_GET_SINGLE_POST_FAST_PATH=${post_fast}
+    KVAF_BATCH_GET_MIN_TAIL_READS=32)
+  add_test(NAME ${fast_target} COMMAND ${fast_target})
+endforeach()
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
