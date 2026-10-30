@@ -119,7 +119,8 @@ struct ReleaseRegionRequest {
   uint64_t session_id;
 };
 
-// Additive test command; existing URMA v6 records and entry points stay usable.
+// UBmem allocation shares the service and session namespace with URMA.
+// Existing URMA v6 records and entry points stay usable.
 struct AllocateUbmemRegionRequest {
   MessageHeader header;
   uint64_t ddr_bytes;

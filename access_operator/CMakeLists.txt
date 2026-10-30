@@ -9,6 +9,18 @@ target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
+if(KVAF_ENABLE_AIV_BATCH_GET AND NOT ASCEND_CANN_PACKAGE_PATH)
+  if(DEFINED ENV{ASCEND_CANN_PACKAGE_PATH})
+    set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_CANN_PACKAGE_PATH}")
+  elseif(DEFINED ENV{ASCEND_HOME_PATH})
+    set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_HOME_PATH}")
+  else()
+    set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest")
+  endif()
+  set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_CANN_PACKAGE_PATH}" CACHE PATH "CANN toolkit")
+endif()
+add_subdirectory(src/ubmem)
+
 if(KVAF_ENABLE_AIV_BATCH_GET)
   add_subdirectory(src/direct_hccp)
   add_subdirectory(demo/aiv_batch_get)

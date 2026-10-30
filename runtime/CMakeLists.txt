@@ -27,7 +27,7 @@ target_link_libraries(kvaf_runtime
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
+  add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc src/ubmem_allocator.cc)
   target_include_directories(kvaf_npu_runtime
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -36,7 +36,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE kvaf_peer_link kvaf_default_access_operator
+    PRIVATE kvaf_peer_link kvaf_default_access_operator kvaf_ubmem_operator
             kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
@@ -45,40 +45,35 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   target_compile_features(kvaf_npu_runtime PUBLIC cxx_std_17)
 endif()
 
-if(KVAF_BUILD_REMOTE_CPU_SERVICE)
-  find_package(Threads REQUIRED)
-  set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
-  find_path(KVAF_URMA_INCLUDE_DIR urma_api.h
-    HINTS
-      "${KVAF_URMA_ROOT}/include"
-      "${CMAKE_SOURCE_DIR}/../third_party/umdk/include"
-      /usr/include /usr/local/include
-  )
-  find_library(KVAF_URMA_LIBRARY NAMES urma
-    HINTS
-      "${KVAF_URMA_ROOT}/lib64"
-      "${KVAF_URMA_ROOT}/lib"
-      /lib64 /usr/lib64 /usr/local/lib64
-  )
-  if(NOT KVAF_URMA_INCLUDE_DIR OR NOT KVAF_URMA_LIBRARY)
-    message(FATAL_ERROR
-      "KVAF_BUILD_REMOTE_CPU_SERVICE requires urma_api.h and liburma; set KVAF_URMA_ROOT")
+option(KVAF_CPU_ENABLE_URMA "Include the URMA CPU backend" ON)
+if(KVAF_BUILD_REMOTE_CPU_SERVICE OR BUILD_TESTING)
+  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/ubmem_cpu_backend.cc)
+  target_include_directories(kvaf_cpu_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(kvaf_cpu_runtime PUBLIC kvaf_runtime PRIVATE kvaf_ubmem_hal kvaf_peer_link)
+  if(BUILD_TESTING)
+    target_compile_definitions(kvaf_cpu_runtime PRIVATE KVAF_ENABLE_TEST_COMMANDS=1)
+    target_include_directories(kvaf_cpu_runtime PRIVATE ${PROJECT_SOURCE_DIR}/tests/ubmem)
   endif()
-
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc)
-  target_include_directories(kvaf_cpu_runtime
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE
-      "${KVAF_URMA_INCLUDE_DIR}")
-  target_link_libraries(kvaf_cpu_runtime
-    PUBLIC kvaf_runtime
-    PRIVATE "${KVAF_URMA_LIBRARY}" "${CMAKE_DL_LIBS}" Threads::Threads)
-  target_compile_features(kvaf_cpu_runtime PUBLIC cxx_std_17)
-
+  if(KVAF_BUILD_REMOTE_CPU_SERVICE AND KVAF_CPU_ENABLE_URMA)
+    set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
+    find_path(KVAF_URMA_INCLUDE_DIR urma_api.h HINTS "${KVAF_URMA_ROOT}/include"
+      "${CMAKE_SOURCE_DIR}/../third_party/umdk/include" /usr/include /usr/local/include)
+    find_library(KVAF_URMA_LIBRARY NAMES urma HINTS "${KVAF_URMA_ROOT}/lib64"
+      "${KVAF_URMA_ROOT}/lib" /lib64 /usr/lib64 /usr/local/lib64)
+    if(NOT KVAF_URMA_INCLUDE_DIR OR NOT KVAF_URMA_LIBRARY)
+      message(FATAL_ERROR "URMA requires urma_api.h and liburma; set KVAF_URMA_ROOT or KVAF_CPU_ENABLE_URMA=OFF")
+    endif()
+    target_sources(kvaf_cpu_runtime PRIVATE src/urma_cpu_backend.cc)
+    target_include_directories(kvaf_cpu_runtime PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
+    target_link_libraries(kvaf_cpu_runtime PRIVATE "${KVAF_URMA_LIBRARY}" ${CMAKE_DL_LIBS})
+    target_compile_definitions(kvaf_cpu_runtime PRIVATE KVAF_CPU_HAS_URMA=1)
+  endif()
+endif()
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_executable(kvaf_cpu_service src/cpu_service_main.cc)
-  target_link_libraries(kvaf_cpu_service PRIVATE kvaf_cpu_runtime kvaf_runtime)
-  get_filename_component(KVAF_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)
-  set_property(TARGET kvaf_cpu_service APPEND PROPERTY BUILD_RPATH
-    "${KVAF_URMA_LIBRARY_DIR}")
-  target_compile_features(kvaf_cpu_service PRIVATE cxx_std_17)
+  target_link_libraries(kvaf_cpu_service PRIVATE kvaf_cpu_runtime)
+  if(KVAF_CPU_ENABLE_URMA)
+    get_filename_component(KVAF_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)
+    set_property(TARGET kvaf_cpu_service APPEND PROPERTY BUILD_RPATH "${KVAF_URMA_LIBRARY_DIR}")
+  endif()
 endif()

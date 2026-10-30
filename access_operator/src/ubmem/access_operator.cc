@@ -1,5 +1,5 @@
 #include "ubmem/access_operator.h"
-#include "ubmem/batch_abi.h"
+#include "ubmem_batch_abi.h"
 #include "ubmem/device_mapping.h"
 #include "peer_link.h"
 #include "meta_manager.h"
@@ -28,28 +28,26 @@ struct AccessOperator::Impl {
   OperatorOptions options;
   std::unique_ptr<DeviceMapping> mapping;
   RemoteRegionDesc remote{};
-  aclrtBinHandle binary{};
-  aclrtFuncHandle function{};
-  std::vector<char> binary_bytes;
+  aclrtBinHandle binaries[2]{};
+  aclrtFuncHandle functions[2]{};
+  std::vector<char> binary_bytes[2];
   std::unordered_map<aclrtStream, StreamState> streams;
   bool ready{};
   bool retained{};
 
-  Status LoadKernel() {
-    std::ifstream file(options.kernel_object_path, std::ios::binary | std::ios::ate);
-    if (!file || file.tellg() <= 0) return Status::NotFound("cannot read UBmem kernel object");
-    const auto size = file.tellg();
-    binary_bytes.resize(static_cast<std::size_t>(size));
+  Status LoadKernel(unsigned index, const std::string& path, const char* name) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() <= 0) return Status::NotFound("cannot read UBmem kernel: " + path);
+    auto& bytes = binary_bytes[index];
+    bytes.resize(static_cast<std::size_t>(file.tellg()));
     file.seekg(0);
-    if (!file.read(binary_bytes.data(), size)) return Status::Internal("cannot read complete UBmem kernel object");
-    aclrtBinary input = aclrtCreateBinary(binary_bytes.data(), binary_bytes.size());
-    if (input == nullptr) return Status::Internal("aclrtCreateBinary failed");
-    auto status = Acl("aclrtBinaryLoad", aclrtBinaryLoad(input, &binary));
+    if (!file.read(bytes.data(), bytes.size())) return Status::Internal("incomplete kernel object");
+    aclrtBinary input = aclrtCreateBinary(bytes.data(), bytes.size());
+    if (!input) return Status::Internal("aclrtCreateBinary failed");
+    auto status = Acl("aclrtBinaryLoad", aclrtBinaryLoad(input, &binaries[index]));
     aclrtDestroyBinary(input);
-    const char* name = options.engine == TransferEngine::kSimt
-        ? "KvafUbmemBatchSimtKernel" : "KvafUbmemBatchMteKernel";
     if (status.ok()) status = Acl("aclrtBinaryGetFunction",
-        aclrtBinaryGetFunction(binary, name, &function));
+        aclrtBinaryGetFunction(binaries[index], name, &functions[index]));
     return status;
   }
 
@@ -65,6 +63,7 @@ struct AccessOperator::Impl {
       if (status.ok()) status = Acl("aclrtMallocHost(status)", aclrtMallocHost(
           &state.host_statuses, options.cores * sizeof(CoreStatus)));
       if (!status.ok()) {
+        if (state.host_statuses) aclrtFreeHost(state.host_statuses);
         if (state.statuses) aclrtFree(state.statuses);
         if (state.event) aclrtDestroyEvent(state.event);
         streams.erase(it);
@@ -104,14 +103,11 @@ struct AccessOperator::Impl {
     attrs[1].value.timeoutUs.timeoutLow = 180000000U;
     attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
     attrs[2].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
-    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 3; cfg.attrs = attrs;
-    if (options.engine == TransferEngine::kMte) {
-      attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
-      attrs[3].value.dynUBufSize = kMteBufferBytes;
-      cfg.numAttrs = 4;
-    }
+    attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+    attrs[3].value.dynUBufSize = kMteBufferBytes;
+    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 4; cfg.attrs = attrs;
     auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
-        function, options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
+        functions[static_cast<unsigned>(args.operation)], options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
     state.pending = StreamState::Pending::kStream;
     if (!synchronize) {
@@ -144,28 +140,9 @@ struct AccessOperator::Impl {
     }
     state.pending = StreamState::Pending::kNone;
     const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
-    // Print every Put core before validating, including cores after a failure.
-    for (std::size_t i = 0; i < options.cores; ++i) {
-      if (args.operation == Operation::kPut) {
-        const std::uint64_t expected = args.capacity / args.blocks + (i < args.capacity % args.blocks);
-        std::fprintf(stderr, "[KVAF_UBMEM] PUT_CORE core=%zu result=%llu completed=%llu expected=%llu "
-            "failed_request=%llu seen_capacity=%llu seen_blocks=%llu seen_op=%llu\n", i,
-            static_cast<unsigned long long>(reports[i].result),
-            static_cast<unsigned long long>(reports[i].completed),
-            static_cast<unsigned long long>(expected),
-            static_cast<unsigned long long>(reports[i].failed_request),
-            static_cast<unsigned long long>(reports[i].capacity),
-            static_cast<unsigned long long>(reports[i].blocks),
-            static_cast<unsigned long long>(reports[i].operation));
-      }
-    }
     for (std::size_t i = 0; i < options.cores; ++i) {
       if (reports[i].result == UINT64_MAX) {
         return Status::Internal("UBmem kernel status was not written (still 0xFF)");
-      }
-      if (reports[i].capacity != args.capacity || reports[i].blocks != args.blocks ||
-          reports[i].operation != static_cast<std::uint32_t>(args.operation)) {
-        return Status::Internal("UBmem kernel launch fields differ from the host request");
       }
       if (reports[i].result != 0) {
         std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
@@ -174,7 +151,8 @@ struct AccessOperator::Impl {
         return Status::InvalidArgument("UBmem kernel rejected a request; see KERNEL_ERROR");
       }
       if (args.operation == Operation::kPut &&
-          reports[i].completed != args.capacity / args.blocks + (i < args.capacity % args.blocks)) {
+          reports[i].completed != static_cast<std::uint64_t>(args.capacity) * (i + 1) / args.blocks -
+              static_cast<std::uint64_t>(args.capacity) * i / args.blocks) {
         return Status::Internal("UBmem Put completion report does not cover the submitted rows");
       }
     }
@@ -191,7 +169,7 @@ AccessOperator::~AccessOperator() {
 }
 
 Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
-  if (impl_->mapping || impl_->options.cores == 0 || impl_->options.cores > 32 ||
+  if (impl_->mapping || impl_->options.cores == 0 || impl_->options.cores > 48 ||
       !impl_->options.peer_link || region.device != DeviceKind::kCpu || region.base == 0 ||
       region.length > UINT64_MAX - region.base) {
     return Status::InvalidArgument("invalid UBmem configuration/remote region");
@@ -206,13 +184,16 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
     impl_->mapping = std::make_unique<DeviceMapping>();
     status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
   }
-  if (status.ok()) status = impl_->LoadKernel();
+  if (status.ok()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
+      "KvafExecuteBatchGetUbmemKernel");
+  if (status.ok() && !impl_->options.batch_put_kernel_object_path.empty())
+    status = impl_->LoadKernel(1, impl_->options.batch_put_kernel_object_path,
+        "KvafExecuteBatchPutUbmemKernel");
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
-  const bool simt = impl_->options.engine == TransferEngine::kSimt;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY engine=%s mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
+  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY transport=ubmem mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
       "host_base=0x%llx mapped_base=0x%llx\n",
-      simt ? "simt" : "mte", simt ? 0U : kMteBufferBytes,
+      kMteBufferBytes,
       static_cast<unsigned long long>(region.length), impl_->options.cores,
       impl_->options.device_id,
       static_cast<unsigned long long>(region.base),
@@ -240,11 +221,13 @@ Status AccessOperator::Shutdown() {
     if (s.event) aclrtDestroyEvent(s.event);
   }
   impl_->streams.clear();
-  if (impl_->binary) {
-    auto status = Acl("aclrtBinaryUnLoad", aclrtBinaryUnLoad(impl_->binary));
-    if (!status.ok()) return status;
-    impl_->binary = nullptr;
-    impl_->function = nullptr;
+  for (unsigned i = 0; i < 2; ++i) {
+    if (impl_->binaries[i]) {
+      auto status = Acl("aclrtBinaryUnLoad", aclrtBinaryUnLoad(impl_->binaries[i]));
+      if (!status.ok()) return status;
+      impl_->binaries[i] = nullptr;
+      impl_->functions[i] = nullptr;
+    }
   }
   if (impl_->mapping) {
     auto status = impl_->mapping->Close();
@@ -286,6 +269,7 @@ Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 }
 
 Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  if (!impl_->functions[1]) return Status::NotImplemented("UBmem BatchPut kernel is not configured");
   const auto& r = *exec.request;
   const auto rows = r.keys.size();
   if (r.input.device != DeviceKind::kNpu || rows > UINT32_MAX) {
@@ -321,35 +305,4 @@ Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   return impl_->Launch(a, stream, *state, true);
 }
 
-Status AccessOperator::ProbeLocalCopy(const ConstBufferView& input, const MutableBufferView& output,
-                                     const ConstBufferView& metadata, void* caller_stream) {
-  auto stream = static_cast<aclrtStream>(caller_stream);
-  Impl::StreamState* state;
-  auto status = impl_->State(stream, &state);
-  if (!status.ok()) return status;
-  // Test-only, read-only diagnosis: distinguish absent device permissions
-  // from an access fault despite driver-reported RW permission. A query
-  // unsupported by a deployed driver is logged, not a new transfer prerequisite.
-  aclrtMemLocation location{};
-  location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-  location.id = impl_->options.device_id;
-  std::uint64_t access = 0;
-  const auto ret = aclrtMemGetAccess(reinterpret_cast<void*>(impl_->mapping->address()), &location, &access);
-  if (ret == ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_UBMEM] MAPPING_ACCESS device=%u flags=0x%llx expected_rw=0x%x\n",
-        impl_->options.device_id, static_cast<unsigned long long>(access), ACL_RT_MEM_ACCESS_FLAGS_READWRITE);
-  } else {
-    (void)Acl("aclrtMemGetAccess(diagnostic)", ret);
-  }
-  auto a = impl_->Args(Operation::kPut, const_cast<void*>(input.data), input.bytes, *state);
-  // Keep the CPU base and absolute destinations: the control must exercise
-  // the same 64-bit address subtraction as the mapped-DDR Put.
-  a.remote_bytes = output.bytes;
-  a.mapped_base = AddressOf(output.data);
-  a.capacity = metadata.bytes / (3 * sizeof(std::uint64_t));
-  a.put_offsets = AddressOf(metadata.data);
-  a.put_lengths = a.put_offsets + a.capacity * sizeof(std::uint64_t);
-  a.put_destinations = a.put_lengths + a.capacity * sizeof(std::uint64_t);
-  return impl_->Launch(a, stream, *state, true);
-}
 }  // namespace kvaf::ubmem

@@ -1,6 +1,7 @@
 #include "ubmem/access_operator.h"
-#include "ubmem/test_pattern.h"
-#include "ubmem_runtime.h"
+#include "test_pattern.h"
+#include "ubmem_allocator.h"
+#include "npu_runtime.h"
 #include <acl/acl.h>
 
 #include <algorithm>
@@ -22,15 +23,9 @@ void Acl(aclError result, const char* op) {
 std::uint8_t Pattern(std::uint64_t offset, unsigned seed) { return kvaf::ubmem::TestPattern(offset, seed); }
 
 struct DevicePool {
-  struct VmmAllocation {
-    void* address{};
-    aclrtDrvMemHandle handle{};
-    bool mapped{};
-  };
   aclrtStream stream{};
   std::vector<void*> allocations;
   std::vector<void*> host_allocations;
-  std::vector<VmmAllocation> vmm_allocations;
   DevicePool() { Acl(aclrtCreateStream(&stream), "aclrtCreateStream"); }
   ~DevicePool() {
     const auto ret = aclrtSynchronizeStream(stream);
@@ -42,50 +37,7 @@ struct DevicePool {
     }
     for (void* ptr : allocations) aclrtFree(ptr);
     for (void* ptr : host_allocations) aclrtFreeHost(ptr);
-    for (const auto& vmm : vmm_allocations) {
-      // Keep dependent resources if a cleanup operation fails. No VMM
-      // resources are released at all when the stream cannot be drained.
-      if (vmm.mapped && aclrtUnmapMem(vmm.address) != ACL_SUCCESS) {
-        std::fprintf(stderr, "[KVAF_UBMEM] retaining local VMM allocation after unmap failure\n");
-        continue;
-      }
-      if (vmm.handle && aclrtFreePhysical(vmm.handle) != ACL_SUCCESS) {
-        std::fprintf(stderr, "[KVAF_UBMEM] retaining local VMM allocation after physical release failure\n");
-        continue;
-      }
-      if (vmm.address && aclrtReleaseMemAddress(vmm.address) != ACL_SUCCESS)
-        std::fprintf(stderr, "[KVAF_UBMEM] local VMM address release failed\n");
-    }
     aclrtDestroyStream(stream);
-  }
-  void* Vmm(std::size_t bytes, std::uint32_t device, bool dram) {
-    const auto aligned = (bytes + kvaf::ubmem::kPageBytes - 1) / kvaf::ubmem::kPageBytes * kvaf::ubmem::kPageBytes;
-    vmm_allocations.emplace_back();
-    auto& vmm = vmm_allocations.back();
-    // SHMEM AclMemSegmentDevice::ReserveEachPeMemorySpace / AllocLocalMemory.
-    // Register ownership before calling ACL so exceptions release partial setup.
-    Acl(aclrtReserveMemAddress(&vmm.address, aligned, 0, nullptr, 1), "control aclrtReserveMemAddress");
-    aclrtPhysicalMemProp prop{};
-    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
-    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    prop.memAttr = dram ? ACL_DDR_MEM_P2P_HUGE : ACL_HBM_MEM_HUGE;
-    prop.location.type = dram ? ACL_MEM_LOCATION_TYPE_HOST_NUMA : ACL_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = dram ? UINT32_MAX : device;
-    Acl(aclrtMallocPhysical(&vmm.handle, aligned, &prop, 0), "control aclrtMallocPhysical");
-    Acl(aclrtMapMem(vmm.address, aligned, 0, vmm.handle, 0), "control aclrtMapMem");
-    vmm.mapped = true;
-    if (dram) {
-      // A locally allocated Host handle initially belongs to the CPU. SHMEM
-      // explicitly grants the local NPU access; imported handles differ here.
-      aclrtMemAccessDesc access{};
-      access.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-      access.location.id = device;
-      access.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-      Acl(aclrtMemSetAccess(vmm.address, aligned, &access, 1), "control aclrtMemSetAccess");
-    }
-    std::fprintf(stderr, "[KVAF_UBMEM] VMM_CONTROL_READY kind=%s base=%p bytes=%zu\n",
-        dram ? "dram" : "hbm", vmm.address, aligned);
-    return vmm.address;
   }
   void* Host(std::size_t bytes) {
     void* result = nullptr;
@@ -103,13 +55,11 @@ struct DevicePool {
   }
 };
 struct Config {
-  std::string peer, kernel, probe_vmm;
-  kvaf::ubmem::TransferEngine engine = kvaf::ubmem::TransferEngine::kMte;
+  std::string peer, get_kernel, put_kernel;
   std::uint32_t device = 0, cores = 2, rows = 17, token = 656, tokens = 128, repeat = 2;
 };
 
-void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
-                kvaf::peer::PeerLink& link, DevicePool& pool,
+void FullBlocks(kvaf::RuntimeCore& core, kvaf::peer::PeerLink* link, DevicePool& pool,
                 const Config& c, unsigned seed) {
   const std::uint64_t slot = static_cast<std::uint64_t>(c.token) * c.tokens;
   const auto base = core.remote_region().base;
@@ -121,52 +71,9 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
     for (std::uint64_t b = 0; b < slot; ++b) input[offsets[i] + b] = Pattern(keys[i] * slot + b, seed);
   }
   auto* source = pool.Copy(input);
-  // Control for mapped GM faults: use the same source bytes, per-row offsets,
-  // lengths and cores, but copy into local HBM instead of mapped CPU DDR.
-  std::vector<std::uint64_t> probe_metadata(3 * c.rows);
-  for (std::uint32_t i = 0; i < c.rows; ++i) {
-    probe_metadata[i] = offsets[i];
-    probe_metadata[c.rows + i] = lengths[i];
-    probe_metadata[2 * c.rows + i] = base + keys[i] * slot;
-  }
-  std::vector<std::uint8_t> local_copy(c.rows * slot, 0xD3);
-  auto* local_device = pool.Copy(local_copy);
-  auto* probe_device = pool.Copy(probe_metadata);
-  std::fprintf(stderr, "[KVAF_UBMEM] LOCAL_COPY_BEGIN rows=%u bytes=%zu remote_base=0x%llx\n",
-      c.rows, local_copy.size(), static_cast<unsigned long long>(base));
-  Check(op.ProbeLocalCopy({source, input.size(), kvaf::DeviceKind::kNpu},
-      {local_device, local_copy.size(), kvaf::DeviceKind::kNpu},
-      {probe_device, probe_metadata.size() * sizeof(std::uint64_t), kvaf::DeviceKind::kNpu}, pool.stream));
-  Acl(aclrtMemcpy(local_copy.data(), local_copy.size(), local_device, local_copy.size(),
-                  ACL_MEMCPY_DEVICE_TO_HOST), "D2H local copy probe");
-  for (std::size_t i = 0; i < local_copy.size(); ++i) {
-    if (local_copy[i] != Pattern(i, seed))
-      throw std::runtime_error("local HBM copy payload mismatch at " + std::to_string(i));
-  }
-  std::fprintf(stderr, "[KVAF_UBMEM] LOCAL_COPY_VERIFIED\n");
-  if (!c.probe_vmm.empty()) {
-    std::fprintf(stderr, "[KVAF_UBMEM] VMM_CONTROL_ALLOCATE kind=%s\n", c.probe_vmm.c_str());
-    void* destination = pool.Vmm(local_copy.size(), c.device, c.probe_vmm == "dram");
-    std::fill(local_copy.begin(), local_copy.end(), 0xD3);
-    // Same initialization/readback as SHMEM's rma_d2h_demo, including Host DDR.
-    Acl(aclrtMemcpy(destination, local_copy.size(), local_copy.data(), local_copy.size(),
-        ACL_MEMCPY_HOST_TO_DEVICE), "VMM control H2D initialization");
-    std::fprintf(stderr, "[KVAF_UBMEM] VMM_CONTROL_COPY_BEGIN kind=%s engine=%s\n", c.probe_vmm.c_str(),
-        c.engine == kvaf::ubmem::TransferEngine::kSimt ? "simt" : "mte");
-    Check(op.ProbeLocalCopy({source, input.size(), kvaf::DeviceKind::kNpu},
-        {destination, local_copy.size(), kvaf::DeviceKind::kNpu},
-        {probe_device, probe_metadata.size() * sizeof(std::uint64_t), kvaf::DeviceKind::kNpu}, pool.stream));
-    Acl(aclrtMemcpy(local_copy.data(), local_copy.size(), destination, local_copy.size(),
-        ACL_MEMCPY_DEVICE_TO_HOST), "VMM control D2H verification");
-    for (std::size_t i = 0; i < local_copy.size(); ++i)
-      Require(local_copy[i] == Pattern(i, seed), "local VMM payload mismatch at " + std::to_string(i));
-    std::fprintf(stderr, "[KVAF_UBMEM] VMM_CONTROL_VERIFIED kind=%s\n", c.probe_vmm.c_str());
-    return;
-  }
-  std::fprintf(stderr, "[KVAF_UBMEM] MAPPED_PUT_BEGIN\n");
   Check(core.BatchPut({keys, {source, input.size(), kvaf::DeviceKind::kNpu}, offsets, lengths}, {pool.stream}));
-  for (const auto key : keys) Check(link.UbmemRange(base, key * slot, slot, seed, false));
-  std::puts("[KVAF_UBMEM] BATCH_PUT_CPU_VERIFIED");
+  if (link) for (const auto key : keys) Check(link->UbmemRange(base, key * slot, slot, seed, false));
+  std::puts(link ? "[KVAF_UBMEM] BATCH_PUT_CPU_VERIFIED" : "[KVAF_UBMEM] RUNTIME_BATCH_PUT_COMPLETED");
 
   kvaf::AccessTableHandle handle;
   Check(core.PrepareAccessTable({keys}, &handle));
@@ -176,9 +83,9 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
   std::vector<std::uint8_t> valid(view.valid, view.valid + view.size);
   auto* addresses_device = pool.Copy(table);
   auto* valid_device = pool.Copy(valid);
-  const auto read_seed = seed + 37;
+  const auto read_seed = link ? seed + 37 : seed;
   // Independent writer: CPU changes DDR after NPU PUT before each GET.
-  for (const auto key : keys) Check(link.UbmemRange(base, key * slot, slot, read_seed, true));
+  if (link) for (const auto key : keys) Check(link->UbmemRange(base, key * slot, slot, read_seed, true));
   std::vector<std::int32_t> indices(c.rows + 3, -1), byte_offsets(c.rows + 3, -1), outputs(c.rows + 3, -1);
   for (std::uint32_t i = 0; i < c.rows; ++i) {
     indices[i] = (i * 5U) % c.rows;
@@ -216,15 +123,36 @@ void FullBlocks(kvaf::RuntimeCore& core, kvaf::ubmem::AccessOperator& op,
     }
   }
   for (std::size_t i = c.rows * c.token; i < output.size(); ++i) Require(output[i] == 0xD3, "output guard overwritten");
-  const std::int32_t zero = 0;
-  Acl(aclrtMemcpy(count_device, 4, &zero, 4, ACL_MEMCPY_HOST_TO_DEVICE), "zero miss_count");
-  Check(core.BatchGet(request, {pool.stream, true}));
+  aclmdlRI graph{};
+  Acl(aclmdlRICaptureBegin(pool.stream, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture begin");
+  const auto capture_status = core.BatchGet(request, {pool.stream, false});
+  Acl(aclmdlRICaptureEnd(pool.stream, &graph), "capture end");
+  Check(capture_status);
+  for (const std::int32_t active : {static_cast<std::int32_t>(c.rows), 1, 0}) {
+    Acl(aclrtMemset(output_device, output.size(), 0xD3, output.size()), "reset graph output");
+    Acl(aclrtMemcpy(count_device, 4, &active, 4, ACL_MEMCPY_HOST_TO_DEVICE), "graph miss_count");
+    Acl(aclmdlRIExecuteAsync(graph, pool.stream), "graph replay");
+    Acl(aclrtSynchronizeStream(pool.stream), "graph synchronize");
+    Acl(aclrtMemcpy(output.data(), output.size(), output_device, output.size(),
+                   ACL_MEMCPY_DEVICE_TO_HOST), "graph output");
+    for (std::uint32_t row = 0; row < c.rows + 1; ++row) {
+      const std::uint32_t request_index = c.rows - 1 - row;
+      for (std::uint32_t b = 0; b < c.token; ++b) {
+        const auto expected = request_index < static_cast<std::uint32_t>(active)
+            ? Pattern(keys[indices[request_index]] * slot + byte_offsets[request_index] + b, read_seed)
+            : static_cast<std::uint8_t>(0xD3);
+        Require(output[row * c.token + b] == expected, "graph replay payload/guard mismatch");
+      }
+    }
+  }
+  Acl(aclmdlRIDestroy(graph), "graph destroy");
+  Check(core.BatchGet(request, {pool.stream, true}));  // Zero misses on the eager path too.
   Check(core.ReleaseAccessTable(handle));
   Check(core.BatchFree({keys}));
-  std::puts("[KVAF_UBMEM] BATCH_GET_CPU_SOURCE_VERIFIED (offsets, output permutation, inactive tail, zero misses)");
+  std::puts(link ? "[KVAF_UBMEM] BATCH_GET_CPU_SOURCE_VERIFIED" : "[KVAF_UBMEM] RUNTIME_BATCH_GET_VERIFIED");
 }
 
-void VariablePut(kvaf::RuntimeCore& core, kvaf::peer::PeerLink& link, DevicePool& pool,
+void VariablePut(kvaf::RuntimeCore& core, kvaf::peer::PeerLink* link, DevicePool& pool,
                  const Config& c, unsigned seed) {
   const std::uint64_t slot = static_cast<std::uint64_t>(c.token) * c.tokens;
   std::vector<std::uint64_t> lengths{1, std::min<std::uint64_t>(655, slot), std::min<std::uint64_t>(4097, slot)};
@@ -234,10 +162,10 @@ void VariablePut(kvaf::RuntimeCore& core, kvaf::peer::PeerLink& link, DevicePool
     input[offsets[row] + b] = Pattern(row * slot + b, seed);
   auto* source = pool.Copy(input);
   Check(core.BatchPut({{0, 1, 2}, {source, input.size(), kvaf::DeviceKind::kNpu}, offsets, lengths}, {pool.stream}));
-  for (unsigned row = 0; row < 3; ++row)
-    Check(link.UbmemRange(core.remote_region().base, row * slot, lengths[row], seed, false));
+  if (link) for (unsigned row = 0; row < 3; ++row)
+    Check(link->UbmemRange(core.remote_region().base, row * slot, lengths[row], seed, false));
   Check(core.BatchFree({{0, 1, 2}}));
-  std::puts("[KVAF_UBMEM] VARIABLE_BATCH_PUT_CPU_VERIFIED");
+  std::puts(link ? "[KVAF_UBMEM] VARIABLE_BATCH_PUT_CPU_VERIFIED" : "[KVAF_UBMEM] RUNTIME_VARIABLE_PUT_COMPLETED");
 }
 
 Config Parse(int argc, char** argv) {
@@ -247,16 +175,8 @@ Config Parse(int argc, char** argv) {
     Require(i + 1 < argc, "missing value for " + key);
     const char* value = argv[++i];
     if (key == "--peer") c.peer = value;
-    else if (key == "--kernel") c.kernel = value;
-    else if (key == "--engine") {
-      const std::string engine = value;
-      Require(engine == "mte" || engine == "simt", "--engine must be mte or simt");
-      c.engine = engine == "simt" ? kvaf::ubmem::TransferEngine::kSimt : kvaf::ubmem::TransferEngine::kMte;
-    }
-    else if (key == "--probe-vmm") {
-      c.probe_vmm = value;
-      Require(c.probe_vmm == "hbm" || c.probe_vmm == "dram", "--probe-vmm must be hbm or dram");
-    }
+    else if (key == "--get-kernel") c.get_kernel = value;
+    else if (key == "--put-kernel") c.put_kernel = value;
     else {
       char* end; errno = 0; const auto n = std::strtoul(value, &end, 10);
       Require(!errno && end != value && !*end && n <= UINT32_MAX && value[0] != '-', "invalid " + key);
@@ -269,7 +189,7 @@ Config Parse(int argc, char** argv) {
       else throw std::runtime_error("unknown option " + key);
     }
   }
-  Require(!c.peer.empty() && !c.kernel.empty(), "required: --peer CPU:PORT --kernel PATH");
+  Require(!c.peer.empty() && !c.get_kernel.empty() && !c.put_kernel.empty(), "required: --peer CPU:PORT --get-kernel PATH --put-kernel PATH");
   Require(c.rows >= 3 && c.rows <= 65536 && c.token && c.tokens && c.repeat && c.cores && c.cores <= 32,
           "rows must be 3..65536, cores 1..32, and shape/repeat must be positive");
   Require(static_cast<std::uint64_t>(c.token) * c.tokens <= INT32_MAX &&
@@ -280,9 +200,8 @@ Config Parse(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--help") {
-    std::puts("Usage: kvaf_ubmem_test --peer CPU:PORT --kernel PATH [--device 0] [--cores 2] [--rows 17] "
-              "[--token-bytes 656] [--tokens-per-block 128] [--repeat 2] "
-              "[--engine mte|simt (default: mte)] [--probe-vmm hbm|dram]"); return 0;
+    std::puts("Usage: kvaf_ubmem_test --peer CPU:PORT --get-kernel PATH --put-kernel PATH [--device 0] [--cores 2] [--rows 17] "
+              "[--token-bytes 656] [--tokens-per-block 128] [--repeat 2]"); return 0;
   }
   try {
     const auto c = Parse(argc, argv);
@@ -294,24 +213,37 @@ int main(int argc, char** argv) {
       DevicePool buffers;
       auto link = std::make_shared<kvaf::peer::PeerLink>(c.peer);
       kvaf::ubmem::DdrAllocator allocator(link);
-      kvaf::ubmem::AccessOperator op({c.kernel, c.device, c.cores, link, c.engine});
+      kvaf::ubmem::AccessOperator op({c.get_kernel, c.put_kernel, c.device, c.cores, link});
       auto meta = kvaf::CreateInMemoryMetaManager();
       kvaf::RuntimeCore core(*meta, op, allocator);
       const auto slot = static_cast<std::uint64_t>(c.token) * c.tokens;
       Check(core.Initialize({slot * c.rows, slot, kvaf::DeviceKind::kCpu}));
       for (unsigned iteration = 0; iteration < c.repeat; ++iteration) {
-        FullBlocks(core, op, *link, buffers, c, 17 + iteration * 13);
-        if (c.probe_vmm.empty()) VariablePut(core, *link, buffers, c, 91 + iteration * 13);
+        FullBlocks(core, link.get(), buffers, c, 17 + iteration * 13);
+        VariablePut(core, link.get(), buffers, c, 91 + iteration * 13);
       }
       // RuntimeCore shuts down the operator before releasing remote DDR.
       Check(core.Shutdown());
     }
+    {
+      // Exercise the production NpuRuntime path too, without EID/Jetty discovery.
+      DevicePool buffers;
+      kvaf::NpuRuntimeOptions options(c.get_kernel, c.token, c.tokens);
+      options.batch_put_kernel_object_path = c.put_kernel;
+      options.transport = kvaf::Transport::kUbmem;
+      options.device_id = c.device;
+      options.npu_core_count = c.cores;
+      kvaf::NpuRuntime runtime(options);
+      Check(runtime.LinkTo({c.peer}));
+      const auto slot = static_cast<std::uint64_t>(c.token) * c.tokens;
+      Check(runtime.Initialize(slot * c.rows, slot));
+      FullBlocks(runtime.core(), nullptr, buffers, c, 53);
+      VariablePut(runtime.core(), nullptr, buffers, c, 71);
+      Check(runtime.Shutdown());
+    }
     Acl(aclrtResetDevice(c.device), "aclrtResetDevice");
     Acl(aclFinalize(), "aclFinalize");
-    if (c.probe_vmm.empty())
-      std::puts("[SUCCESS] UBmem BatchPut/BatchGet passed with independent CPU DDR verification");
-    else
-      std::printf("[SUCCESS] local VMM %s control passed\n", c.probe_vmm.c_str());
+    std::puts("[SUCCESS] UBmem CPU verification and NpuRuntime BatchPut/BatchGet passed");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "[KVAF_UBMEM] TEST_FAILED: %s\n", error.what());

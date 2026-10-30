@@ -1,8 +1,8 @@
 #include "bandwidth_utils.h"
 #include "peer_link.h"
-#include "ubmem/batch_abi.h"
+#include "ubmem_batch_abi.h"
 #include "ubmem/device_mapping.h"
-#include "ubmem/test_pattern.h"
+#include "test_pattern.h"
 
 #include <acl/acl.h>
 #include <cerrno>
@@ -19,7 +19,7 @@ void Check(const kvaf::Status& status) { Require(status.ok(), status.message());
 std::uint64_t Address(const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); }
 
 struct Config {
-  std::string peer, kernel, engine = "simt", pattern = "random";
+  std::string peer, kernel, pattern = "random";
   std::uint32_t device = 0, cores = 2, rows = 4096, row_bytes = 656;
   std::uint32_t remote_blocks = 4096, tokens_per_block = 128;
   std::uint32_t warmup = 3, iterations = 100, clock_mhz = 1000, seed = 20260903;
@@ -33,7 +33,6 @@ Config Parse(int argc, char** argv) {
     const char* value = argv[++i];
     if (option == "--peer") c.peer = value;
     else if (option == "--kernel") c.kernel = value;
-    else if (option == "--engine") c.engine = value;
     else if (option == "--pattern") c.pattern = value;
     else {
       char* end = nullptr;
@@ -55,7 +54,6 @@ Config Parse(int argc, char** argv) {
     }
   }
   Require(!c.peer.empty() && !c.kernel.empty(), "required: --peer CPU:PORT --kernel PATH");
-  Require(c.engine == "mte" || c.engine == "simt", "--engine must be mte or simt");
   Require(c.pattern == "random" || c.pattern == "contiguous", "--pattern must be random or contiguous");
   Require(c.rows && c.row_bytes && c.remote_blocks && c.tokens_per_block && c.iterations && c.clock_mhz &&
       c.cores && c.cores <= 32, "positive shape/iterations/clock required; cores must be 1..32");
@@ -136,7 +134,7 @@ struct Benchmark {
     aclrtDestroyBinary(input);
     Check(load);
     Check(Acl("aclrtBinaryGetFunction", aclrtBinaryGetFunction(binary,
-        c.engine == "simt" ? "KvafUbmemRawSimtKernel" : "KvafUbmemRawMteKernel", &function)));
+        "KvafUbmemRawGetKernel", &function)));
   }
   double Copy(const std::vector<RawCopyRequest>& requests) {
     const auto& c = config;
@@ -150,11 +148,8 @@ struct Benchmark {
     attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE; attrs[0].value.schemMode = 1;
     attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE; attrs[1].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
     attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US; attrs[2].value.timeoutUs.timeoutLow = 180000000U;
-    aclrtLaunchKernelCfg cfg{}; cfg.attrs = attrs; cfg.numAttrs = 3;
-    if (c.engine == "mte") {
-      attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE; attrs[3].value.dynUBufSize = kMteBufferBytes;
-      cfg.numAttrs = 4;
-    }
+    attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE; attrs[3].value.dynUBufSize = kMteBufferBytes;
+    aclrtLaunchKernelCfg cfg{}; cfg.attrs = attrs; cfg.numAttrs = 4;
     Check(Acl("bandwidth kernel", aclrtLaunchKernelWithHostArgs(
         function, c.cores, stream, &cfg, &args, sizeof(args), nullptr, 0)));
     Check(Acl("bandwidth synchronize", aclrtSynchronizeStream(stream)));
@@ -190,7 +185,7 @@ struct Benchmark {
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--help") {
     std::puts("Usage: kvaf_ubmem_bandwidth --peer CPU:PORT --kernel PATH\n"
-        "  [--engine simt|mte] [--device 0] [--cores 2] [--rows 4096] [--token-bytes 656]\n"
+        "  [--device 0] [--cores 2] [--rows 4096] [--token-bytes 656]\n"
         "  [--remote-blocks 4096] [--tokens-per-block 128] [--pattern random|contiguous]\n"
         "  [--warmup 3] [--iterations 100] [--clock-mhz 1000] [--seed 20260903]\n"
         "GET only: raw DDR source addresses -> contiguous HBM output. No lookup or Python.\n"
@@ -209,9 +204,9 @@ int main(int argc, char** argv) {
       benchmark.Initialize();
       const auto tokens = static_cast<std::uint64_t>(c.remote_blocks) * c.tokens_per_block;
       const auto payload = static_cast<std::uint64_t>(c.rows) * c.row_bytes;
-      std::printf("UBMEM_BANDWIDTH_CONFIG engine=%s device=%u cores=%u rows=%u token_bytes=%u payload_bytes=%llu "
+      std::printf("UBMEM_BANDWIDTH_CONFIG transport=ubmem device=%u cores=%u rows=%u token_bytes=%u payload_bytes=%llu "
           "remote_bytes=%llu pattern=%s warmup=%u iterations=%u clock_mhz=%u timing=max_core_cycles\n",
-          c.engine.c_str(), c.device, c.cores, c.rows, c.row_bytes, static_cast<unsigned long long>(payload),
+          c.device, c.cores, c.rows, c.row_bytes, static_cast<unsigned long long>(payload),
           static_cast<unsigned long long>(tokens * c.row_bytes), c.pattern.c_str(), c.warmup, c.iterations, c.clock_mhz);
       std::mt19937_64 generator(c.seed);
       std::vector<RawCopyRequest> requests(c.rows);
@@ -236,10 +231,10 @@ int main(int argc, char** argv) {
       std::sort(samples.begin(), samples.end());
       const auto mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
       const auto p50 = perf::Percentile(samples, 0.5);
-      std::printf("PERF_RESULT operation=ubmem_raw_get engine=%s cores=%u rows=%u token_bytes=%u "
+      std::printf("PERF_RESULT operation=ubmem_raw_get transport=ubmem cores=%u rows=%u token_bytes=%u "
           "payload_bytes=%llu mean_us=%.3f p50_us=%.3f p90_us=%.3f p99_us=%.3f "
           "mean_GBps=%.3f p50_GBps=%.3f clock_mhz=%u verified=1\n",
-          c.engine.c_str(), c.cores, c.rows, c.row_bytes, static_cast<unsigned long long>(payload),
+          c.cores, c.rows, c.row_bytes, static_cast<unsigned long long>(payload),
           mean, p50, perf::Percentile(samples, 0.9), perf::Percentile(samples, 0.99),
           perf::GBps(payload, mean), perf::GBps(payload, p50), c.clock_mhz);
     }

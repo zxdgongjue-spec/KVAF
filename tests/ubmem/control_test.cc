@@ -1,4 +1,5 @@
-#include "ubmem_runtime.h"
+#include "cpu_runtime.h"
+#include "peer_link.h"
 #include "ubmem/device_mapping.h"
 
 #include <arpa/inet.h>
@@ -31,8 +32,10 @@ int main(int argc, char** argv) {
       CHECK(!mapping.AllocateHost(kvaf::ubmem::kPageBytes, -1, &descriptor).ok()); }
     CHECK(handles() == 0 && addresses() == 0 && maps() == 0);
   }
-  kvaf::ubmem::CpuRuntime provider;
-  CHECK(provider.Initialize(-1, argv[1]).ok());
+  kvaf::CpuRuntime provider;
+  kvaf::CpuRuntimeOptions options;
+  options.hal_library = argv[1];
+  CHECK(provider.Initialize(options).ok());
   const int listener = socket(AF_INET, SOCK_STREAM, 0);
   CHECK(listener >= 0);
   sockaddr_in address{}; address.sin_family = AF_INET;

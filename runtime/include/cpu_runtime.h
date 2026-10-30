@@ -18,9 +18,11 @@ struct CpuRuntimeOptions {
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
+  int numa_node{-1};
+  std::string hal_library{"libascend_hal.so"};
 };
 
-// CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
+// CPU endpoint Runtime. Allocation requests select URMA or UBmem per session;
 // RuntimeService owns the listening socket and calls ServeConnection.
 class CpuRuntime final : public Runtime {
  public:

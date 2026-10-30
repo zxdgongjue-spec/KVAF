@@ -1,5 +1,8 @@
-#include "ubmem_runtime.h"
-#include "ubmem/test_pattern.h"
+#include "cpu_backends.h"
+#include "ubmem/hal.h"
+#ifdef KVAF_ENABLE_TEST_COMMANDS
+#include "test_pattern.h"
+#endif
 
 #include <sys/socket.h>
 #include <cerrno>
@@ -7,7 +10,8 @@
 #include <cstring>
 #include <unordered_map>
 
-namespace kvaf::ubmem {
+namespace kvaf {
+using namespace ubmem;
 namespace {
 template <typename T>
 bool Transfer(int fd, T* object, std::size_t offset, bool write) {
@@ -23,13 +27,15 @@ bool Transfer(int fd, T* object, std::size_t offset, bool write) {
 }
 }  // namespace
 
-struct CpuRuntime::Impl {
+struct UbmemCpuBackend::Impl {
   struct Region { std::unique_ptr<Mapping> memory; std::uint64_t logical_bytes; };
   std::shared_ptr<Hal> hal = std::make_shared<Hal>();
   std::unordered_map<std::uint64_t, Region> regions;
-  std::uint64_t next_session = 1;
+  std::uint64_t& next_session;
+  std::string library;
+  Impl(const CpuRuntimeOptions& options, std::uint64_t& next)
+      : next_session(next), library(options.hal_library), numa(options.numa_node) {}
   int numa = -1;
-  bool ready = false;
 
   Status Allocate(int fd, const peer::MessageHeader& header) {
     peer::AllocateUbmemRegionRequest request{};
@@ -47,9 +53,9 @@ struct CpuRuntime::Impl {
         request.ddr_bytes > UINT64_MAX - (kPageBytes - 1) ||
         request.ddr_bytes % request.slot_size != 0;
     const auto mapping_bytes = invalid ? 0 : (request.ddr_bytes + kPageBytes - 1) / kPageBytes * kPageBytes;
-    Status status = invalid
-        ? Status::InvalidArgument("DDR bytes must be a multiple of slot_size")
-        : region->AllocateHost(mapping_bytes, numa, &handle);
+    Status status = invalid ? Status::InvalidArgument("DDR bytes must be a multiple of slot_size")
+                            : hal->Load(library);
+    if (status.ok()) status = region->AllocateHost(mapping_bytes, numa, &handle);
     response.result = static_cast<int>(status.ok() ? peer::Result::kOk : peer::Result::kResourceError);
     if (status.ok()) {
       response.session_id = next_session++;
@@ -71,6 +77,7 @@ struct CpuRuntime::Impl {
     return status;
   }
 
+#ifdef KVAF_ENABLE_TEST_COMMANDS
   peer::Result Range(const peer::UbmemRangeRequest& request, bool fill) {
     auto found = regions.find(request.session_id);
     if (found == regions.end()) return peer::Result::kNotFound;
@@ -98,54 +105,34 @@ struct CpuRuntime::Impl {
     if (fill) __sync_synchronize();
     return peer::Result::kOk;
   }
+#endif
 };
 
-CpuRuntime::CpuRuntime() : impl_(std::make_unique<Impl>()) {}
-CpuRuntime::~CpuRuntime() { (void)Shutdown(); }
-Status CpuRuntime::Initialize(int numa, const std::string& library) {
-  if (impl_->ready || numa < -1) return Status::InvalidArgument("invalid UBmem provider state/NUMA node");
-  Status status = impl_->hal->Load(library);
-  if (status.ok()) { impl_->numa = numa; impl_->ready = true; }
-  return status;
-}
-bool CpuRuntime::initialized() const { return impl_->ready; }
-Status CpuRuntime::LinkTo(const LinkTarget&) { return Status::NotImplemented("UBmem provider accepts incoming links"); }
-Status CpuRuntime::AcceptLink(const LinkTarget&) { return Status::OK(); }
-Status CpuRuntime::ReleaseLink(LinkId id) {
+UbmemCpuBackend::UbmemCpuBackend(const CpuRuntimeOptions& options, std::uint64_t& next)
+    : impl_(std::make_unique<Impl>(options, next)) {}
+UbmemCpuBackend::~UbmemCpuBackend() { (void)Shutdown(); }
+Status UbmemCpuBackend::ReleaseLink(LinkId id) {
   auto found = impl_->regions.find(id);
   if (found == impl_->regions.end()) return Status::NotFound("UBmem session was not found");
   Status status = found->second.memory->Close();
   if (status.ok()) impl_->regions.erase(found);
   return status;
 }
-Status CpuRuntime::Shutdown() {
+Status UbmemCpuBackend::Shutdown() {
   for (auto it = impl_->regions.begin(); it != impl_->regions.end();) {
     Status status = it->second.memory->Close();
     if (!status.ok()) return status;
     it = impl_->regions.erase(it);
   }
-  impl_->ready = false;
   return Status::OK();
 }
 
-Status CpuRuntime::ServeConnection(int fd) {
-  if (!impl_->ready) return Status::NotInitialized("UBmem provider is not initialized");
-  peer::MessageHeader header{};
-  if (!Transfer(fd, &header, 0, false)) return Status::Internal("cannot read UBmem request header");
-  if (header.magic != peer::kProtocolMagic || header.version != peer::kProtocolVersion) {
-    return Status::InvalidArgument("UBmem control protocol mismatch");
-  }
+Status UbmemCpuBackend::ServeConnection(int fd, const peer::MessageHeader& header) {
   const auto command = static_cast<peer::Command>(header.command);
   if (command == peer::Command::kAllocateUbmemRegion) return impl_->Allocate(fd, header);
   peer::Result result = peer::Result::kInvalidRequest;
-  if (command == peer::Command::kReleaseRegion) {
-    peer::ReleaseRegionRequest request{};
-    request.header = header;
-    if (peer::IsValidHeader(header, command, sizeof(request)) &&
-        Transfer(fd, &request, sizeof(header), false)) {
-      result = ReleaseLink(request.session_id).ok() ? peer::Result::kOk : peer::Result::kResourceError;
-    }
-  } else if (command == peer::Command::kCheckUbmemRange || command == peer::Command::kFillUbmemRange) {
+#ifdef KVAF_ENABLE_TEST_COMMANDS
+  if (command == peer::Command::kCheckUbmemRange || command == peer::Command::kFillUbmemRange) {
     peer::UbmemRangeRequest request{};
     request.header = header;
     if (peer::IsValidHeader(header, command, sizeof(request)) &&
@@ -153,6 +140,7 @@ Status CpuRuntime::ServeConnection(int fd) {
       result = impl_->Range(request, command == peer::Command::kFillUbmemRange);
     }
   }
+#endif
   peer::StatusResponse response{};
   response.header = peer::MakeHeader(command, sizeof(response));
   response.header.command = peer::ResponseCommand(command);
@@ -160,14 +148,4 @@ Status CpuRuntime::ServeConnection(int fd) {
   return Transfer(fd, &response, 0, true) ? Status::OK() : Status::Internal("cannot send UBmem response");
 }
 
-Status DdrAllocator::Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) {
-  if (region == nullptr || request.ddr_device != DeviceKind::kCpu) {
-    return Status::InvalidArgument("UBmem allocator requires CPU DDR");
-  }
-  peer::PeerRegion allocated;
-  Status status = link_->AllocateUbmemRegion(request.ddr_bytes, request.slot_size, &allocated);
-  if (status.ok()) *region = {allocated.base, allocated.length, request.slot_size, DeviceKind::kCpu};
-  return status;
-}
-Status DdrAllocator::Release(const RemoteRegionDesc& region) { return link_->ReleaseRegion(region.base); }
-}  // namespace kvaf::ubmem
+}  // namespace kvaf

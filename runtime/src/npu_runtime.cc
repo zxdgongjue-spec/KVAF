@@ -23,6 +23,8 @@
 
 #include "batch_get_abi.h"
 #include "access_operator.h"
+#include "ubmem/access_operator.h"
+#include "ubmem_allocator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 #include "startup_bandwidth_probe.h"
@@ -440,7 +442,16 @@ struct NpuRuntime::Impl {
 
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
-    access_operator = std::make_unique<DefaultAccessOperator>(config);
+    urma_operator = nullptr;
+    if (options.transport == Transport::kUbmem) {
+      access_operator = std::make_unique<ubmem::AccessOperator>(ubmem::OperatorOptions{
+          options.batch_get_kernel_object_path, options.batch_put_kernel_object_path,
+          options.device_id, options.npu_core_count, peer_link});
+    } else {
+      auto op = std::make_unique<DefaultAccessOperator>(config);
+      urma_operator = op.get();
+      access_operator = std::move(op);
+    }
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
   }
 
@@ -458,28 +469,28 @@ struct NpuRuntime::Impl {
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
-  std::unique_ptr<DefaultAccessOperator> access_operator;
+  std::unique_ptr<AccessOperator> access_operator;
+  DefaultAccessOperator* urma_operator{nullptr};
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-  if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
-      impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
-      impl_->options.jettys_per_core == 0U ||
-      impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-      (impl_->options.batch_get_max_inflight_total != 0U &&
-       impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
-      impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U ||
-      (impl_->options.adaptive_ub_device &&
-       !impl_->options.peer_ub_device.empty()) ||
-      (impl_->options.adaptive_ub_device &&
-       (impl_->options.adaptive_ub_miss_count == 0U ||
-        impl_->options.adaptive_ub_miss_count >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
+  const auto& config = impl_->options;
+  if (config.batch_get_kernel_object_path.empty() || config.npu_core_count == 0 ||
+      config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
+  }
+  if (config.transport == Transport::kUrma &&
+      (config.jettys_per_core == 0 || config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+       (config.batch_get_max_inflight_total != 0 &&
+        config.batch_get_max_inflight_total < 2 * config.npu_core_count) ||
+       (config.adaptive_ub_device && !config.peer_ub_device.empty()) ||
+       (config.adaptive_ub_device && (config.adaptive_ub_miss_count == 0 ||
+        config.adaptive_ub_miss_count > static_cast<std::uint32_t>(INT32_MAX))))) {
+    throw std::invalid_argument("invalid URMA Runtime configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
@@ -499,14 +510,18 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (impl_->config.batch_put_kernel_object_path.empty()) {
+  if (impl_->options.transport == Transport::kUrma && impl_->config.batch_put_kernel_object_path.empty()) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
-  auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
-  impl_->peer_allocator = allocator.get();
-  impl_->allocator = std::move(allocator);
+  if (impl_->options.transport == Transport::kUbmem) {
+    impl_->allocator = std::make_unique<ubmem::DdrAllocator>(impl_->peer_link);
+  } else {
+    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
+    impl_->peer_allocator = allocator.get();
+    impl_->allocator = std::move(allocator);
+  }
   impl_->runtime_core.reset();
   impl_->access_operator.reset();
   impl_->CreateCore();
@@ -516,12 +531,15 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
-  if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr) {
+  if (impl_->peer_link == nullptr || impl_->allocator == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
   }
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
+
+  if (impl_->options.transport == Transport::kUbmem)
+    return impl_->runtime_core->Initialize(request);
 
   std::uint32_t candidate_count = 0U;
   std::uint32_t device_count = 0U;
@@ -677,7 +695,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
             std::make_unique<detail::StartupBandwidthProbe>(probe_config);
-        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
+        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->urma_operator, cycles);
         if (last.ok()) {
           std::fprintf(stderr,
                        "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
@@ -838,7 +856,8 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
+  if (!impl_->urma_operator) return Status::NotImplemented("URMA queue profiling is unavailable for UBmem");
+  return impl_->urma_operator->SetBatchGetKernelProfiling(enabled);
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
@@ -847,7 +866,8 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
-  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
+  if (!impl_->urma_operator) return Status::NotImplemented("URMA queue profiling is unavailable for UBmem");
+  return impl_->urma_operator->CopyBatchGetKernelProfiles(profiles);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

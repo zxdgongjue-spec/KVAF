@@ -1,5 +1,5 @@
 #include "bandwidth_utils.h"
-#include "ubmem/test_pattern.h"
+#include "test_pattern.h"
 #include "kernel_operator.h"
 
 #include <cmath>
@@ -7,7 +7,8 @@
 #include <cstdlib>
 
 #define __attribute__(...)
-#include "../../access_operator/src/ubmem/batch_kernel.asc"
+#include "../../access_operator/demo/common/include/ubmem_copy.h"
+#include "ubmem_raw_get.h"
 #undef __attribute__
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
@@ -29,11 +30,11 @@ void CheckRawKernel(void (*kernel)(RawCopyArgs), unsigned rows, unsigned cores, 
     model_mte2.peak_pending = 0;
     model_mte_overlap = false;
     kernel(args);
-    CHECK(!model_simt && !model_simt_ready && !model_mte2 && !model_mte3);
+    CHECK(!model_mte2 && !model_mte3);
     CHECK(ModelEventsIdle());
     CHECK(reports[model_core].completed == rows / cores + (model_core < rows % cores));
     CHECK(reports[model_core].cycles == 1);  // Model tick, never a performance estimate.
-    if (kernel == KvafUbmemRawMteKernel &&
+    if (kernel == KvafUbmemRawGetKernel &&
         reports[model_core].completed * ((bytes + kMteBufferBytes / 2 - 1) / (kMteBufferBytes / 2)) >= 2) {
       CHECK(model_mte2.peak_pending == 2);
       CHECK(model_mte_overlap);  // A ready bank can write while the other read is pending.
@@ -56,7 +57,7 @@ void CheckRawKernel(void (*kernel)(RawCopyArgs), unsigned rows, unsigned cores, 
 }
 
 int main() {
-  for (auto kernel : {KvafUbmemRawMteKernel, KvafUbmemRawSimtKernel}) {
+  for (auto kernel : {KvafUbmemRawGetKernel}) {
     CheckRawKernel(kernel, 4096, 3, true);  // Uneven core assignment, random source addresses.
     CheckRawKernel(kernel, 2, 4, false);   // Idle cores still produce reports.
     for (unsigned rows = 0; rows <= 5; ++rows)
@@ -75,5 +76,5 @@ int main() {
   CHECK(perf::Percentile({10, 20, 30, 40}, 0.5) == 25);
   CHECK(perf::Percentile({10, 20, 30, 40}, 0.9) == 37);
   CHECK(perf::Percentile({10}, 0.99) == 10);
-  std::puts("UBmem raw MTE/SIMT GET: 4096x656, double-buffer dependencies, chunk tails, drains, guards and bandwidth units passed");
+  std::puts("UBmem raw MTE GET: 4096x656, double-buffer dependencies, chunk tails, drains, guards and bandwidth units passed");
 }

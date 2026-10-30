@@ -3,15 +3,12 @@
 
 namespace kvaf::ubmem {
 constexpr std::uint32_t kMteBufferBytes = 32 * 1024;
-constexpr std::uint32_t kSimtThreads = 128;
 enum class Operation : std::uint32_t { kGet = 0, kPut = 1 };
 // Separate each core's status stores, as in the existing BatchGet status ABI.
 // The host and kernel are built together.
 struct alignas(64) CoreStatus {
   std::uint64_t result, failed_request, completed;
-  // Echo launch fields so an empty report is distinguishable from zero work.
-  std::uint64_t capacity, blocks, operation;
-  std::uint64_t reserved[2];
+  std::uint64_t reserved[5];
 };
 struct BatchArgs {
   std::uint64_t remote_base, remote_bytes, mapped_base;

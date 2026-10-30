@@ -1,7 +1,7 @@
 #pragma once
-// CPU model for address/tail correctness and MTE/SIMT handoff dependencies.
+// CPU model for address/tail correctness and MTE handoff dependencies.
 // Work runs at the corresponding wait; hardware timing/cache/fabric are unmodeled.
-#include "ubmem/batch_abi.h"
+#include "ubmem_batch_abi.h"
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -12,12 +12,8 @@
 #define __global__
 #define __aicore__
 #define __gm__
-#define __simt_vf__
-#define LAUNCH_BOUND(n)
 inline unsigned model_core;
 inline std::array<std::uint8_t, kvaf::ubmem::kMteBufferBytes> model_ub;
-inline std::function<void()> model_simt;
-inline bool model_simt_ready = false;
 inline void ModelCheck(bool condition) { if (!condition) std::abort(); }
 struct ModelTransfer {
   std::uint64_t begin, end;
@@ -58,43 +54,13 @@ inline bool ModelEventsIdle() {
       if (event.armed) return false;
   return true;
 }
-enum pipe_t { PIPE_S, PIPE_V };
 enum event_t { EVENT_ID0, EVENT_ID1 };
-inline void set_flag(pipe_t, pipe_t, event_t) {}
-inline void wait_flag(pipe_t from, pipe_t to, event_t) {
-  if (from == PIPE_S && to == PIPE_V) {
-    ModelCheck(!model_simt && !model_simt_ready);
-    model_simt_ready = true;
-  } else {
-    ModelCheck(from == PIPE_V && to == PIPE_S && static_cast<bool>(model_simt));
-    auto action = std::move(model_simt); model_simt = {}; action();
-  }
-}
-struct ModelThreadIndex { unsigned x{}; };
-inline ModelThreadIndex threadIdx;
 namespace AscendC {
-namespace Simt {
-struct Dim3 { unsigned x, y, z; };
-template <auto Function, typename... Args>
-void VF_CALL(Dim3 dimensions, Args... args) {
-  ModelCheck(model_simt_ready && !model_simt && !model_mte2 && !model_mte3);
-  ModelCheck(dimensions.x != 0 && dimensions.y == 1 && dimensions.z == 1);
-  model_simt_ready = false;
-  model_simt = [=] {
-    // Reverse lane order also catches accidental dependence on lane 0
-    // publishing data for other lanes without a thread-group barrier.
-    for (unsigned lane = dimensions.x; lane > 0; --lane) {
-      threadIdx.x = lane - 1;
-      Function(args...);
-    }
-  };
-}
-}
 inline unsigned GetBlockIdx() { return model_core; }
 inline std::uint64_t GetSystemCycle() {
   // The ending timestamp must follow a scalar-visible completion fence, not
   // merely cross-pipe waits protecting the two UB banks.
-  ModelCheck(!model_mte2 && !model_mte3 && !model_simt);
+  ModelCheck(!model_mte2 && !model_mte3);
   ModelCheck(model_mte3.scalar_visible == model_mte3.issued);
   static std::uint64_t tick = 0;
   return ++tick;

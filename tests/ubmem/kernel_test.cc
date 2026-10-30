@@ -1,33 +1,33 @@
 #include "kernel_operator.h"
-#include "ubmem/batch_abi.h"
-#include "ubmem/test_pattern.h"
+#include "ubmem_batch_abi.h"
+#include "test_pattern.h"
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #define __attribute__(...)
-#include "../../access_operator/src/ubmem/batch_kernel.asc"
+#include "../../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_ubmem.asc"
+#include "../../access_operator/demo/aiv_batch_put/kernel/execute_batch_put_ubmem.asc"
 #undef __attribute__
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
 using namespace kvaf::ubmem;
-auto run_kernel = KvafUbmemBatchMteKernel;
+void run_kernel(BatchArgs args) {
+  if (args.operation == Operation::kGet) KvafExecuteBatchGetUbmemKernel(args);
+  else KvafExecuteBatchPutUbmemKernel(args);
+}
 template <typename T> std::uint64_t Ptr(T* value) { return reinterpret_cast<std::uintptr_t>(value); }
 void Run(BatchArgs args) {
   auto* reports = reinterpret_cast<CoreStatus*>(args.statuses);
   std::fill_n(reinterpret_cast<unsigned char*>(reports), args.blocks * sizeof(CoreStatus), 0xFF);
   for (model_core = 0; model_core < args.blocks; ++model_core) {
     run_kernel(args);
-    CHECK(!model_mte2 && !model_mte3 && !model_simt && !model_simt_ready);
-    CHECK(reports[model_core].capacity == args.capacity);
-    CHECK(reports[model_core].blocks == args.blocks);
-    CHECK(reports[model_core].operation == static_cast<std::uint32_t>(args.operation));
+    CHECK(!model_mte2 && !model_mte3 && ModelEventsIdle());
+
   }
 }
-int main(int argc, char** argv) {
-  CHECK(argc == 1 || (argc == 2 && std::strcmp(argv[1], "simt") == 0));
-  if (argc == 2) run_kernel = KvafUbmemBatchSimtKernel;
+int main() {
   constexpr std::uint64_t remote_base = 0x100000000ULL;
   std::vector<std::uint8_t> remote(32768, 0xCF), local(5000, 0xD7);
   for (std::size_t i = 0; i < remote.size(); ++i) remote[i] = i * 37 + 3;
@@ -50,6 +50,12 @@ int main(int argc, char** argv) {
       CHECK(local[1 + outputs[r] * 656 + b] == remote[addresses[indices[r]] - remote_base + offsets[r] + b]);
   }
   CHECK(local.front() == 0xD7 && local[1 + 3 * 656] == 0xD7);
+  for (int active : {1, 2}) {
+    count = active; Run(a);
+    for (unsigned core = 0; core < a.blocks; ++core)
+      CHECK(statuses[core].completed == static_cast<unsigned>(active) * (core + 1) / a.blocks -
+          static_cast<unsigned>(active) * core / a.blocks);
+  }
   const auto previous = local;
   count = 0; Run(a);
   CHECK(local == previous);
@@ -113,8 +119,8 @@ int main(int argc, char** argv) {
   a.put_offsets = Ptr(src_offsets.data()); a.put_lengths = Ptr(row_lengths.data());
   a.put_destinations = Ptr(dst_addresses.data());
   Run(a);
-  CHECK(statuses[0].result == 0 && statuses[0].completed == 9);
-  CHECK(statuses[1].result == 0 && statuses[1].completed == 8);
+  CHECK(statuses[0].result == 0 && statuses[0].completed == 8);
+  CHECK(statuses[1].result == 0 && statuses[1].completed == 9);
   for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
   for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
 
@@ -127,9 +133,9 @@ int main(int argc, char** argv) {
   Run(a);
   for (std::uint64_t i = 0; i < rows * slot; ++i) CHECK(big_remote[i] == TestPattern(i, 17));
   for (std::uint64_t i = rows * slot; i < big_remote.size(); ++i) CHECK(big_remote[i] == 0xCF);
-  // SIMT lane / MTE tile boundaries and tails must not reach GM guards.
-  for (const std::uint64_t bytes : {1U, kSimtThreads - 1U, kSimtThreads, kSimtThreads + 1U,
-                                   2 * kSimtThreads - 1U, 2 * kSimtThreads, 2 * kSimtThreads + 1U,
+  // MTE tile boundaries and tails must not reach GM guards.
+  for (const std::uint64_t bytes : {1U, 128U - 1U, 128U, 128U + 1U,
+                                   2 * 128U - 1U, 2 * 128U, 2 * 128U + 1U,
                                    kMteBufferBytes - 1U, kMteBufferBytes,
                                    kMteBufferBytes + 1U, 2 * kMteBufferBytes + 17U}) {
     std::vector<std::uint8_t> source(bytes + 1), destination(bytes + 7, 0xCF);
@@ -146,5 +152,5 @@ int main(int argc, char** argv) {
     for (std::size_t i = 3 + bytes; i < destination.size(); ++i) CHECK(destination[i] == 0xCF);
   }
   std::printf("UBmem %s kernel: mapped addressing, 656-byte reads, variable puts, inactive tail, guards, and invalid ranges passed\n",
-      argc == 2 ? "SIMT" : "MTE");
+      "MTE");
 }

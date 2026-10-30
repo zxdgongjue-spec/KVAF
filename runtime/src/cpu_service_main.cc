@@ -12,10 +12,10 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--memory-page-mode default|thp]\n"
+               "[--memory-page-mode default|thp] [--numa-node N] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. "
-               "The default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
+               "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
                program);
 }
 
@@ -54,7 +54,8 @@ int main(int argc, char** argv) {
       return 0;
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index" || argument == "--memory-page-mode") && index + 1 >= argc) {
+         argument == "--eid-index" || argument == "--memory-page-mode" ||
+         argument == "--numa-node" || argument == "--hal-library") && index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -77,6 +78,12 @@ int main(int argc, char** argv) {
         return 2;
       }
       cpu_options.has_eid_index = true;
+    } else if (argument == "--hal-library") {
+      cpu_options.hal_library = argv[++index];
+    } else if (argument == "--numa-node") {
+      std::uint32_t parsed = 0;
+      if (!ParseUnsigned(argv[++index], INT32_MAX, &parsed)) return 2;
+      cpu_options.numa_node = parsed;
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
         std::fprintf(stderr, "invalid --memory-page-mode; expected default or thp\n");
