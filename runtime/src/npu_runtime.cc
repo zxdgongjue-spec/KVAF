@@ -891,6 +891,15 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
+Status NpuRuntime::SetScatterProfiling(bool enabled) {
+  if (!impl_->access_operator) return Status::NotInitialized("NpuRuntime requires LinkTo before profiling");
+  return impl_->access_operator->SetScatterProfiling(enabled);
+}
+Status NpuRuntime::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const {
+  if (!impl_->access_operator) return Status::NotInitialized("NpuRuntime requires LinkTo before profiling");
+  return impl_->access_operator->CopyScatterProfiles(profiles);
+}
+
 Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(

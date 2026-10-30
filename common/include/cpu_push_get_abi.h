@@ -10,6 +10,12 @@ constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
 // Runtime additionally carries the opt-in profile bit with the request sequence.
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
+// Opt-in report in Completion::reserved, published before the completion token.
+constexpr std::uint32_t kInlineProfile = 1;
+constexpr std::uint64_t kProfileMagic = 0x4b56414650524631ULL;
+inline constexpr std::uint64_t ProfileToken(std::uint64_t sequence) {
+  return kProfileMagic ^ (sequence << 32);
+}
 
 enum class Result : std::uint64_t {
   kPending = 0, kOk = 1, kInvalidRequest = 2, kTimeout = 3,

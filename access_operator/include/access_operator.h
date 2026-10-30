@@ -8,6 +8,7 @@
 
 #include "requests.h"
 #include "status.h"
+#include "scatter_batch_get_profile.h"
 #include "types.h"
 
 namespace kvaf::peer {
@@ -119,6 +120,10 @@ class DefaultAccessOperator final : public AccessOperator {
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+  // Scatter records are separate from the business completion statuses.
+  // Snapshot drains pending work; keep it outside the measured call interval.
+  Status SetScatterProfiling(bool enabled);
+  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
 
  private:
   struct Impl;

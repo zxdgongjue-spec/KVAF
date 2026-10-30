@@ -37,9 +37,10 @@ Host 保留每核 magic、sequence、result、phase 检查，以及 ACL 错误�
 | Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV1` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
-Scatter 参数末尾的旧探针字段恢复为 `reserved=0`，176 B 参数和 64 B 状态布局
-保持不变；非零 reserved 会被 kernel 拒绝。部署时同步更新 Host 与 kernel。
-CPU 服务的协议和布局不变。
+Scatter 参数末尾的保留字段默认是 0，可通过版本化 tag 开启性能计时；旧探针 ID
+仍会被 kernel 拒绝。176 B 参数和 64 B 业务状态布局不变，计时使用独立的每核
+128 B 区域。部署时同步更新 Host/kernel，采集 CPU 通信计时还需更新 CPU 服务。
+控制协议结构大小不变，计时报告按请求 opt in。
 
 原 `direct_read` 继续使用 `kvaf_execute_batch_get_kernels.o`。三个模块独立编译，
 避免重复链接 SDK 全局符号。顺序模式接收标准 direct/旧 sequential 路径时，
@@ -147,16 +148,11 @@ Gather 使用 `test_aiv_gather_batch_get.py` 和对应 gather `.o`。兼容入�
 本地保留生产 kernel 的 CPU 搬运/协议模型、Host 异步生命周期、独立模块构建、
 元数据和 Python 模式隔离回归。模型不代替 CANN 编译或设备测试。
 
-下一阶段为 scatter 增加独立性能入口和可选计时，建议采用以下口径：
+已新增独立性能入口、包装脚本和可关闭的 CPU/AIV 分段计时，见
+[scatter 性能测试与指标口径](aiv_scatter_performance.md)。测试分为关闭打点的
+baseline 和带打点的 profiled 两轮，分别输出端到端、CPU→HBM 通信及本地 scatter
+耗时/有效带宽，并保存 JSON/CSV 原始样本。
 
-- 预热后复用 Runtime、workspace、Tensor 和 stream，分别统计 Host 调用到完成的
-  耗时，以及 NPU event 覆盖的 kernel 时间；初始化、BatchPut、输出回读校验单独统计。
-- AIV 按描述符构建/notify、等待 CPU done、本地 scatter 三段记录周期；各核保留
-  独立结果，吞吐按有效字节数计算。CPU payload WRITE 与 done 发布耗时单独记录。
-- Host、CPU、AIV 时钟分别计算本域时长，不跨域相减；周期转换使用实际频率依据。
-- 计时开关关闭时不读时钟、不额外同步、不回读 profile；热路径不逐请求打印，
-  在测量结束后输出统计。计时数据不复用业务完成状态字段。
-
-现有 `test_npu_batch_get_perf.py`/kernel profile 主要针对 `direct_read`，scatter
-性能入口需显式选择 `aiv_batch_get_mode="cpu_push_scatter"` 并定义对应分段指标。
-本次清理不引入新的性能计时行为。
+现有 `test_npu_batch_get_perf.py`/kernel profile 继续用于 `direct_read`。
+scatter 使用 `tests/run_remote_cpu_scatter_perf.sh` 及 `start_scatter_profile` /
+`scatter_profile` / `stop_scatter_profile` 接口，计时不复用业务完成状态字段。

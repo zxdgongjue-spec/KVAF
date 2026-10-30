@@ -30,6 +30,8 @@ class ScatterBatchGet final : public SequentialBatchGet {
   Status Execute(const BatchGetExecRequest& exec) override;
   Status Drain() override;
   Status Shutdown() override;
+  Status SetScatterProfiling(bool enabled) override;
+  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) override;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -52,8 +54,9 @@ struct ScatterBatchGet::Impl {
   std::array<std::unique_ptr<d::TargetChannel>, 4> channels;
   aclrtStream pending{};
   uint64_t sequence{};
-  bool push_open{}, initialized{}, failed{};
+  bool push_open{}, initialized{}, failed{}, profile_ready{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
+  uint64_t ProfileBytes() const { return config.npu_core_count * sizeof(ScatterBatchGetCoreProfile); }
 
   Status AclFailure(const char* phase, aclError code) const {
     return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
@@ -187,7 +190,7 @@ struct ScatterBatchGet::Impl {
     }
     if (status_host && aclrtFreeHost(status_host) != ACL_SUCCESS) return Error("free status memory");
     status_host = nullptr;
-    initialized = failed = false; sequence = 0; args = {};
+    initialized = failed = profile_ready = false; sequence = 0; args = {};
     return execution_status;
   }
 };
@@ -217,7 +220,7 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("invalid sequential remote region");
   if (KvafScatterBatchGetLoadKernel(s.config.batch_get_kernel_object_path.c_str()))
     return Error("load sequential kernel (rebuild Host and AIV binary together)");
-  if (aclrtMalloc(&s.status_device, s.StatusBytes(), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+  if (aclrtMalloc(&s.status_device, s.StatusBytes() + s.ProfileBytes(), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMallocHost(&s.status_host, s.StatusBytes()) != ACL_SUCCESS)
     return Error("allocate statuses");
   s.args.max_polls = 100000000U;
@@ -251,12 +254,52 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
   args.request.core_status = Ptr(s.status_device); args.request.queue_state = 0;
   args.sequence = ++s.sequence;
+  s.profile_ready = false;
   s.pending = static_cast<aclrtStream>(exec.execution.stream);
   if (aclrtMemsetAsync(s.status_device, s.StatusBytes(), 0, s.StatusBytes(), s.pending) != ACL_SUCCESS ||
       KvafScatterBatchGetLaunch(&args, s.pending)) {
     s.failed = true; return Error("enqueue failed; resources retained");
   }
+  s.profile_ready = args.reserved != 0;
   return exec.execution.synchronize ? s.Drain() : Status::OK();
+}
+Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.initialized) return Status::NotInitialized("scatter is not initialized");
+  auto result = s.Drain();
+  if (!result.ok()) return result;
+  s.args.reserved = enabled ? kScatterProfileFlag : 0U;
+  s.profile_ready = false;
+  return Status::OK();
+}
+Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!profiles) return Status::InvalidArgument("scatter profile output is null");
+  if (!s.initialized || !s.args.reserved || !s.profile_ready)
+    return Status::InvalidState("enable scatter profiling and complete a BatchGet first");
+  auto result = s.Drain();
+  if (!result.ok()) return result;
+  profiles->resize(s.config.npu_core_count);
+  const auto* source = static_cast<const char*>(s.status_device) + s.StatusBytes();
+  const auto copied = aclrtMemcpy(profiles->data(), s.ProfileBytes(), source,
+                                 s.ProfileBytes(), ACL_MEMCPY_DEVICE_TO_HOST);
+  if (copied != ACL_SUCCESS) { s.failed = true; return s.AclFailure("copy_profile", copied); }
+  uint64_t requests = 0;
+  for (uint32_t core = 0; core < profiles->size(); ++core) {
+    const auto& p = (*profiles)[core];
+    if (p.magic != kScatterProfileMagic || p.sequence != s.sequence ||
+        !p.start_cycle || p.inputs_ready_cycle < p.start_cycle ||
+        p.done_cycle < p.inputs_ready_cycle || p.finish_cycle < p.done_cycle ||
+        p.bytes != p.requests * s.config.batch_get_token_bytes ||
+        (!core && p.notify_cycle && (p.notify_cycle < p.inputs_ready_cycle || p.notify_cycle > p.done_cycle)))
+      return Error("invalid scatter profile; rebuild Host and AIV kernel together");
+    requests += p.requests;
+  }
+  if (requests && profiles->front().cpu_magic != cpu_push::ProfileToken(s.sequence))
+    return Error("CPU push profile report missing; rebuild and restart the CPU service");
+  return Status::OK();
 }
 Status ScatterBatchGet::Shutdown() {
   std::lock_guard<std::mutex> lock(impl_->mutex);

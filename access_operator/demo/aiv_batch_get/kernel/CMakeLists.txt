@@ -52,6 +52,9 @@ set(KVAF_KERNEL_INCLUDES
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/interface"
   "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/impl"
   "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
+get_filename_component(KVAF_AIV_COMMON_INCLUDE_DIR
+  "${KVAF_AIV_DEMO_INCLUDE_DIR}/../../../../common/include" ABSOLUTE)
+list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_COMMON_INCLUDE_DIR}")
 
 # AscendC emits SDK globals (including g_tilingKey) in each translation unit.
 # Link each kernel separately; combining the two objects gives duplicate symbols.
@@ -80,10 +83,16 @@ endfunction()
 kvaf_compile_batch_get_kernel(kvaf_execute_batch_get execute_batch_get_aiv.asc
   "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h")
 foreach(mode scatter gather)
+  set(profile_dependencies)
+  if(mode STREQUAL "scatter")
+    list(APPEND profile_dependencies
+      "${KVAF_AIV_COMMON_INCLUDE_DIR}/scatter_batch_get_profile.h"
+      "${KVAF_AIV_COMMON_INCLUDE_DIR}/cpu_push_get_abi.h")
+  endif()
   kvaf_compile_batch_get_kernel(kvaf_${mode}_batch_get execute_${mode}_batch_get_aiv.asc
     "${KVAF_AIV_DEMO_INCLUDE_DIR}/${mode}_batch_get_abi.h"
     "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/batch_get_kernel_common.h")
+    "${CMAKE_CURRENT_SOURCE_DIR}/batch_get_kernel_common.h" ${profile_dependencies})
 endforeach()
 add_custom_target(kvaf_batch_get_kernels ALL)
 add_dependencies(kvaf_batch_get_kernels kvaf_execute_batch_get_kernel

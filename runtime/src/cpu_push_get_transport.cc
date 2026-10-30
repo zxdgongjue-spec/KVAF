@@ -460,6 +460,21 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
+  if (profile_.enabled && (request().reserved & kInlineProfile) &&
+      sequence && result == Result::kOk) {
+    done->reserved[0] = ProfileToken(sequence);
+    done->reserved[1] = profile_.header_read_ns;
+    done->reserved[2] = profile_.address_read_ns;
+    done->reserved[3] = profile_.write_ns;
+    done->reserved[4] = profile_.first_post_ns ? profile_.last_cqe_ns - profile_.first_post_ns : 0;
+    done->reserved[5] = profile_.post_ns;
+    done->reserved[6] = profile_.cq_wait_ns;
+    // A 64-byte WRITE need not make its words visible atomically. Complete the
+    // report WRITE first, then publish the sequence/result using the done WR.
+    // This extra control transfer is profiling overhead, outside cpu_comm_ns.
+    const auto report = Transfer(true, layout_.done + 8, sizeof(done->reserved));
+    if (!report.ok()) return report;
+  }
   auto status = BeginPrepared(done_, UINT64_MAX);
   if (status.ok()) status = PostPrepared(done_.queues[0], 0);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
@@ -467,7 +482,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
 }
 
 void Transport::PrintProfile() const {
-  if (!profile_.enabled) return;
+  if (!profile_.enabled || (request().reserved & kInlineProfile)) return;
 #ifdef __OPTIMIZE__
   constexpr unsigned optimized = 1;
 #else

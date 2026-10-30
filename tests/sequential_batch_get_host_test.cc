@@ -17,6 +17,7 @@ std::vector<std::function<void()>> work;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool wrong_phase{}, wrong_sequence{}, wrong_magic{};
+bool stale_profile{}, missing_cpu_profile{}, bad_profile_cycle{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 }
@@ -34,6 +35,10 @@ int aclrtMemcpyAsync(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind, 
   if (fail_copy) return 507035;
   work.push_back([=] { std::memcpy(d, s, n); }); return 0;
 }
+int aclrtMemcpy(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind) {
+  if (fail_copy) return 507035;
+  std::memcpy(d, s, n); return 0;
+}
 int aclrtSynchronizeStream(aclrtStream) {
   if (fail_sync) return 507034;
   for (auto& f : work) f(); work.clear(); return 0;
@@ -49,7 +54,7 @@ int Launch(const KvafScatterBatchGetArgs* a) {
   assert(completed == launches);
   const auto args = *a;
   ++launches; sequences.push_back(a->sequence);
-  assert(!args.reserved);
+  assert(!args.reserved || args.reserved == kvaf::kScatterProfileFlag);
   work.push_back([=] {
     auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
     const auto active = uint64_t(*reinterpret_cast<const int32_t*>(args.request.miss_count));
@@ -60,6 +65,20 @@ int Launch(const KvafScatterBatchGetArgs* a) {
                    args.sequence + wrong_sequence, kernel_result,
                    kernel_result || wrong_phase ? uint64_t(KVAF_SEQ_WAIT_REMOTE) : uint64_t(KVAF_SEQ_COMPLETE),
                    requests, 0, 0, 0};
+      if (args.reserved) {
+        auto* profiles = reinterpret_cast<kvaf::ScatterBatchGetCoreProfile*>(
+            args.request.core_status + args.request.block_count * sizeof(KvafSequentialStatus));
+        auto& p = profiles[i];
+        p = {}; p.magic = kvaf::kScatterProfileMagic; p.sequence = args.sequence + stale_profile;
+        p.start_cycle = 10; p.inputs_ready_cycle = 20;
+        p.notify_cycle = i || !active ? 0 : 30;
+        p.done_cycle = bad_profile_cycle ? 15 : 40; p.finish_cycle = 50;
+        p.requests = requests; p.bytes = requests * args.request.token_bytes;
+        if (!i && active && !missing_cpu_profile) {
+          p.cpu_magic = kvaf::cpu_push::ProfileToken(args.sequence);
+          p.cpu_write_ns = 1000; p.cpu_comm_ns = 800;
+        }
+      }
     }
     ++completed;
   }); return 0;
@@ -270,6 +289,29 @@ int main() {
     assert(owner->Execute(exec).ok());
     assert(!owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
     assert(owner->Shutdown().ok()); kernel_result = 0;
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(!owner->SetScatterProfiling(true).ok());
+    assert(owner->Initialize(region).ok());
+    assert(owner->SetScatterProfiling(true).ok());
+    std::vector<ScatterBatchGetCoreProfile> profiles;
+    assert(!owner->CopyScatterProfiles(&profiles).ok());
+    // CopyProfile must drain an asynchronous request before reading its records.
+    assert(owner->Execute(exec).ok()); assert(owner->CopyScatterProfiles(&profiles).ok());
+    assert(profiles.size() == config.npu_core_count && profiles[0].sequence == 1);
+    for (uint32_t mismatch = 0; mismatch < 3; ++mismatch) {
+      stale_profile = mismatch == 0; missing_cpu_profile = mismatch == 1; bad_profile_cycle = mismatch == 2;
+      assert(owner->Execute(exec).ok()); assert(!owner->CopyScatterProfiles(&profiles).ok());
+      stale_profile = missing_cpu_profile = bad_profile_cycle = false;
+    }
+    count = 0;
+    assert(owner->Execute(exec).ok()); assert(owner->CopyScatterProfiles(&profiles).ok());
+    count = 1;
+    assert(owner->SetScatterProfiling(false).ok());
+    assert(!owner->CopyScatterProfiles(&profiles).ok());
+    assert(owner->Execute(exec).ok()); assert(owner->Shutdown().ok());
+    assert(!refs && !allocations && !hccp_refs);
   }
   std::cout << "sequential Host lifecycle: PASS\n";
 }

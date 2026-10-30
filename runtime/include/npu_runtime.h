@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "scatter_batch_get_profile.h"
 
 namespace kvaf {
 
@@ -72,6 +73,8 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_tokens_per_block() const;
 
   Status SetBatchGetKernelProfiling(bool enabled);
+  Status SetScatterProfiling(bool enabled);
+  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

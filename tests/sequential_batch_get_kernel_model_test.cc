@@ -160,7 +160,7 @@ struct Fixture {
         Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
     auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(workspace.data());
     uint64_t notify; std::memcpy(&notify, workspace.data() + 64, 8);
-    if (notify != args.sequence) return;
+    if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
     CheckGuard();
     if (timeout || ++push_polls < 4) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
@@ -170,6 +170,11 @@ struct Fixture {
       std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
                   reinterpret_cast<void*>(src[i]), token);
     const uint64_t done = ((args.sequence + (future_done ? 1 : 0)) << 32) | (remote_error ? 5 : 1);
+    if (notify & kvaf::cpu_push::kProfileNotify) {
+      assert(request->reserved == kvaf::cpu_push::kInlineProfile);
+      const uint64_t report[] = {kvaf::cpu_push::ProfileToken(args.sequence), 11, 22, 1000, 800, 200, 500};
+      std::memcpy(workspace.data() + 136, report, sizeof(report));
+    }
     std::memcpy(workspace.data() + 128, &done, 8);
     push_done = true; ++push_requests;
   }
@@ -297,17 +302,43 @@ int main() {
     }
   for (uint32_t workers : {1U, 3U, 8U}) {
     Fixture scatter(19, 656, workers, KVAF_SEQ_SCATTER, 6);
+    const auto cycles = aiv_model::cycle;
     scatter.active = 0; scatter.Run();
     assert(!scatter.push_requests);
     for (const auto& status : scatter.status)
       assert(status.phase == KVAF_SEQ_COMPLETE && !status.requests);
     scatter.Next(1); scatter.Run();
     scatter.Next(19); scatter.Run();
+    assert(aiv_model::cycle == cycles); // No timing reads in the baseline path.
   }
   {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
-    invalid.args.reserved = 1; invalid.Run(false);
+    invalid.args.reserved = 2; invalid.Run(false);
     assert(!invalid.push_requests && invalid.status[0].result == KVAF_SEQ_INVALID);
+  }
+  for (uint32_t workers : {1U, 3U, 8U}) {
+    Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
+    f.status.resize(workers * 3); // 64-byte statuses + 128-byte records.
+    f.args.request.core_status = Address(f.status.data());
+    f.args.reserved = kvaf::kScatterProfileFlag;
+    for (uint32_t count : {1U, 19U, 0U, 7U}) {
+      f.Next(count); f.Run();
+      const auto* profiles = reinterpret_cast<const kvaf::ScatterBatchGetCoreProfile*>(
+          f.args.request.core_status + workers * sizeof(KvafSequentialStatus));
+      for (uint32_t core = 0; core < workers; ++core) {
+        const auto& p = profiles[core];
+        assert(p.magic == kvaf::kScatterProfileMagic && p.sequence == f.args.sequence);
+        assert(p.start_cycle && p.start_cycle <= p.inputs_ready_cycle);
+        assert(p.inputs_ready_cycle <= p.done_cycle && p.done_cycle <= p.finish_cycle);
+        const auto requests = uint64_t(count) * (core + 1) / workers - uint64_t(count) * core / workers;
+        assert(p.requests == requests && p.bytes == requests * 656);
+        if (!core && count) {
+          assert(p.notify_cycle >= p.inputs_ready_cycle && p.done_cycle >= p.notify_cycle);
+          assert(p.cpu_magic == kvaf::cpu_push::ProfileToken(f.args.sequence) && p.cpu_comm_ns == 800);
+          assert(p.cpu_header_ns == 11 && p.cpu_descriptor_ns == 22 && p.cpu_write_ns == 1000);
+        } else assert(!p.cpu_magic && !p.notify_cycle);
+      }
+    }
   }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,

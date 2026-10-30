@@ -376,6 +376,37 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
+  void StartScatterProfile() { ThrowIfError(native_->SetScatterProfiling(true)); }
+  void StopScatterProfile() { ThrowIfError(native_->SetScatterProfiling(false)); }
+  py::list ScatterProfileSnapshot() const {
+    std::vector<kvaf::ScatterBatchGetCoreProfile> profiles;
+    ThrowIfError(native_->CopyScatterProfiles(&profiles));
+    py::list result;
+    for (std::size_t core = 0; core < profiles.size(); ++core) {
+      const auto& profile = profiles[core];
+      py::dict item;
+      item["core"] = core;
+      item["magic"] = profile.magic;
+      item["sequence"] = profile.sequence;
+      item["start_cycle"] = profile.start_cycle;
+      item["inputs_ready_cycle"] = profile.inputs_ready_cycle;
+      item["notify_cycle"] = profile.notify_cycle;
+      item["done_cycle"] = profile.done_cycle;
+      item["finish_cycle"] = profile.finish_cycle;
+      item["requests"] = profile.requests;
+      item["bytes"] = profile.bytes;
+      item["cpu_magic"] = profile.cpu_magic;
+      item["cpu_header_ns"] = profile.cpu_header_ns;
+      item["cpu_descriptor_ns"] = profile.cpu_descriptor_ns;
+      item["cpu_write_ns"] = profile.cpu_write_ns;
+      item["cpu_comm_ns"] = profile.cpu_comm_ns;
+      item["cpu_post_ns"] = profile.cpu_post_ns;
+      item["cpu_cq_wait_ns"] = profile.cpu_cq_wait_ns;
+      result.append(std::move(item));
+    }
+    return result;
+  }
+
   void StartBatchGetKernelProfile() {
     ThrowIfError(native_->SetBatchGetKernelProfiling(true));
   }
@@ -581,6 +612,11 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Release the supplied keys from the Runtime metadata store. keys "
            "accepts a Python key sequence or a contiguous one-dimensional "
            "CPU torch.int64 Tensor.")
+      .def("start_scatter_profile", &NpuPythonRuntime::StartScatterProfile,
+           "Enable optional AIV/CPU scatter timing; call after initialize.")
+      .def("scatter_profile", &NpuPythonRuntime::ScatterProfileSnapshot,
+           "Drain and copy the latest scatter timing records outside the measured call.")
+      .def("stop_scatter_profile", &NpuPythonRuntime::StopScatterProfile)
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
            "Enable the per-core BatchGet kernel cycle timeline.")

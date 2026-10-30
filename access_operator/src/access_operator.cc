@@ -555,6 +555,15 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::SetScatterProfiling(bool enabled) {
+  if (!impl_->sequential) return Status::NotImplemented("scatter profiling requires cpu_push_scatter");
+  return impl_->sequential->SetScatterProfiling(enabled);
+}
+Status DefaultAccessOperator::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const {
+  if (!impl_->sequential) return Status::NotImplemented("scatter profiling requires cpu_push_scatter");
+  return impl_->sequential->CopyScatterProfiles(profiles);
+}
+
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
   if (impl_->sequential) return Status::NotImplemented("direct-read profile is unavailable for sequential modes");
   if (!impl_->initialized || impl_->execution.status == nullptr) {
