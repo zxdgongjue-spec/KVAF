@@ -44,9 +44,7 @@ struct PendingCopy {
 inline PendingCopy mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
 inline uint64_t mte2_aligned_copies{}, mte2_tail_copies{};
-inline uint64_t ub_scalar_reads{};
 inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
-inline bool corrupt_next_mte2{};
 // Optional exact source interval for tests: a padded UB tail must never cause
 // a read outside the requested GM token, even if the allocation has slack.
 inline uintptr_t mte2_source_begin{}, mte2_source_end{};
@@ -65,15 +63,7 @@ inline void wait_flag(int source, int target, event_t event) {
   if (!model_events[source][target][event]) std::abort();
   model_events[source][target][event] = false;
   ++aiv_model::event_waits[source][target];
-  if (source == PIPE_MTE2) {
-    auto* dst = aiv_model::mte2.destination;
-    const auto bytes = aiv_model::mte2.bytes;
-    aiv_model::mte2.Finish();
-    if (dst && bytes && aiv_model::corrupt_next_mte2) {
-      dst[bytes - 1] ^= 1;
-      aiv_model::corrupt_next_mte2 = false;
-    }
-  }
+  if (source == PIPE_MTE2) aiv_model::mte2.Finish();
   if (source == PIPE_MTE3) aiv_model::mte3.Finish();
 }
 inline void set_loop_size_ubtoout(uint64_t) {}
@@ -108,7 +98,7 @@ enum class TPosition : uint8_t { VECIN };
 enum class DataCopyMVType : uint8_t { UB_TO_OUT, OUT_TO_UB };
 inline void ResetLoopModePara(DataCopyMVType type) {
   // Hardware register effects need device validation; model only the selected
-  // direction. The MTE2 probe must not configure the MTE3 pipeline.
+  // direction. The GM->UB setup must not configure the MTE3 pipeline.
   if (type != DataCopyMVType::OUT_TO_UB) std::abort();
   ++aiv_model::out_to_ub_resets;
 }
@@ -133,13 +123,6 @@ template <typename T> struct LocalTensor {
     result.address_.bufferAddr += byte_offset;
     result.address_.dataLen -= byte_offset;
     return result;
-  }
-  T GetValue(uint32_t index) const {
-    // A scalar consumer must wait for MTE2 before reading its destination.
-    if (aiv_model::mte2.destination || uint64_t(index + 1) * sizeof(T) > address_.dataLen)
-      std::abort();
-    ++aiv_model::ub_scalar_reads;
-    return reinterpret_cast<const T*>(address_.bufferAddr)[index];
   }
 };
 struct DataCopyExtParams {

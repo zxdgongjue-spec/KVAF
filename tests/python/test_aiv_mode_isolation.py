@@ -45,19 +45,6 @@ class ModeIsolationTests(unittest.TestCase):
                 self.assertEqual(result.exception.code, 0)
                 run.assert_called_once_with(mode)
 
-    def test_scatter_honors_requested_probe(self):
-        for requested_probe in ('', 'load', 'dma', 'copy', 'done', 'gm', 'body', 'ub'):
-            def run(mode):
-                self.assertEqual(mode, 'cpu_push_scatter')
-                self.assertEqual(os.environ['KVAF_AIV_SCATTER_PROBE'], requested_probe)
-                return 0
-            with patch.dict(os.environ, {'KVAF_AIV_SCATTER_PROBE': requested_probe}), \
-                 patch.object(common, 'run', side_effect=run):
-                with self.assertRaises(SystemExit) as result:
-                    runpy.run_path(str(Path(__file__).with_name('test_aiv_scatter_batch_get.py')),
-                                   run_name='__main__')
-                self.assertEqual(result.exception.code, 0)
-
     def test_suite_runs_next_process_after_failure(self):
         with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1',
                                      'KVAF_AIV_BATCH_GET_MODES': 'cpu_push_scatter,gather_read'}), \
@@ -70,21 +57,18 @@ class ModeIsolationTests(unittest.TestCase):
                              ['test_aiv_scatter_batch_get.py', 'test_aiv_gather_batch_get.py'])
             self.assertTrue(all(c[0] == sys.executable for c in commands))
 
-    def test_gather_ignores_scatter_probe(self):
-        # Stop at the first hardware import. A scatter-only invalid probe must
-        # not reject the gather test before it reaches its hardware setup.
+    def test_gather_does_not_require_scatter_metadata(self):
+        # Stop at the first hardware import; gather has its own binary contract.
         original_import = __import__
         def importing(name, *args, **kwargs):
             if name == 'backend':
                 raise RuntimeError('reached hardware setup')
             return original_import(name, *args, **kwargs)
-        with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1', 'KVAF_AIV_SCATTER_PROBE': 'invalid'}), \
+        with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1'}), \
              patch.object(common, 'kernel_paths', return_value=('gather.o', 'put.o')), \
              patch('builtins.__import__', side_effect=importing):
             with self.assertRaisesRegex(RuntimeError, 'reached hardware setup'):
                 common.run('gather_read')
-            with self.assertRaisesRegex(ValueError, 'scatter probe'):
-                common.run('cpu_push_scatter')
 
 
 if __name__ == '__main__':

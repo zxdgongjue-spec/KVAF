@@ -8,11 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import re
 import sys
-
-SCATTER_PROBES = ("done", "flush", "setup", "gm", "body", "dma", "ub", "load", "copy")
-
 
 def kernel_paths(mode: str) -> tuple[str, str]:
     paths = {}
@@ -52,36 +48,6 @@ def shutdown_runtime(runtime) -> None:
                   file=sys.stderr, flush=True)
 
 
-def expect_scatter_probe(call, stage: str, *, expected_bytes: int | None = None,
-                         diagnostic_revision: int | None = None) -> None:
-    """Only accept an acknowledged checkpoint, never a device/transport failure."""
-    marker = f"[KVAF_AIV_SCATTER_PROBE_COMPLETE] stage={stage} "
-    try:
-        call()
-    except RuntimeError as error:
-        if not str(error).startswith(marker):
-            raise
-        if diagnostic_revision is not None and not re.search(
-                rf"(?:^| )diag_revision={diagnostic_revision}(?: |$)", str(error)):
-            raise AssertionError("scatter diagnostic revision missing/mismatched; rebuild Host and kernel together") from error
-        if stage == "load" and not re.search(r"(?:^| )verification=gm_ub_byte_compare(?: |$)", str(error)):
-            raise AssertionError("load checkpoint has no byte verification; rebuild Host and kernel together") from error
-        byte_fields = {"setup": ("configured_bytes", "configured byte count"),
-                       "dma": ("dma_bytes", "DMA byte count"),
-                       "load": ("verified_bytes", "verified byte count"),
-                       "gm": ("scalar_bytes", "scalar byte count"),
-                       "ub": ("scalar_bytes", "scalar byte count"),
-                       "body": ("body_bytes", "body byte count")}
-        if stage in byte_fields:
-            field, description = byte_fields[stage]
-            match = re.search(rf"(?:^| ){field}=(\d+)(?: |$)", str(error))
-            if not match or int(match[1]) == 0 or (expected_bytes is not None and int(match[1]) != expected_bytes):
-                raise AssertionError(f"{stage} checkpoint {description} does not match the request") from error
-        print(str(error), flush=True)
-    else:
-        raise AssertionError("scatter probe returned ordinary success; rebuild Host and kernel together")
-
-
 def run(mode: str) -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
@@ -91,9 +57,6 @@ def run(mode: str) -> int:
     except ValueError as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 2
-    probe = os.environ.get("KVAF_AIV_SCATTER_PROBE", "") if mode == "cpu_push_scatter" else ""
-    if probe and probe not in SCATTER_PROBES:
-        raise ValueError("scatter probe must be " + "/".join(SCATTER_PROBES))
     if mode == "cpu_push_scatter":
         from aiv_kernel_metadata import check_aiv_kernel_metadata
         try:
@@ -109,10 +72,6 @@ def run(mode: str) -> int:
     from npu_eids import parse_npu_eids
     import kvaf
 
-    diagnostics = mode == "cpu_push_scatter" and os.environ.get("KVAF_AIV_SCATTER_DIAGNOSTICS") == "1"
-    if diagnostics:
-        print(f"[KVAF_TEST] SCATTER_DIAGNOSTIC_INPUT stage={probe} "
-              f"common={Path(__file__).resolve()} kvaf={getattr(kvaf, '__file__', 'unknown')}", flush=True)
     backend = detect_torch_backend()
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware test was requested but NPU Runtime is unavailable")
@@ -122,8 +81,6 @@ def run(mode: str) -> int:
     token = int(os.environ.get("KVAF_NPU_TOKEN_BYTES", "656"))
     capacity = int(os.environ.get("KVAF_NPU_REQUESTS", "8193"))
     assert 1 <= capacity <= 65536 and 1 <= cores <= 8 and 1 <= token <= 65535
-    if probe == "body" and token < 32:
-        raise ValueError("body probe needs token_bytes >= 32; use dma for a tail-only token")
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
@@ -137,15 +94,6 @@ def run(mode: str) -> int:
     keys = build_dsa_keys(blocks, q_capacity=blocks)
     counts = sorted({0, 1, min(7, capacity), min(19, capacity), capacity})
     counts += list(reversed(counts))
-    if probe:
-        # One nonempty request per participating core; keep normal allocation and
-        # output placement. Empty requests cannot establish a checkpoint.
-        counts = [min(cores, capacity)]
-        if probe in ("done", "setup", "gm", "body", "dma", "ub", "load"):
-            # Exercise sequence/workspace reuse with changing source metadata.
-            # Payload probes also reuse UB; done returns before touching UB.
-            # Include workers with no rows in the first batch.
-            counts = [1, min(2 * cores + 1, capacity), 1]
     runtime = kvaf.NpuRuntime(
         kernel, token, tokens_per_block, device_id=device_id,
         npu_core_count=cores, batch_put_kernel_object_path=put_kernel,
@@ -182,43 +130,17 @@ def run(mode: str) -> int:
             count = torch.tensor([active], dtype=torch.int32, device=device)
             output = outputs[epoch % 2]
             output.fill_(0xAD)
-            if diagnostics:
-                print(f"[KVAF_TEST] SCATTER_REQUEST epoch={epoch} active={active} "
-                      f"capacity={capacity} token_bytes={token} "
-                      f"first_indices={index_cpu[:min(active, 3)].tolist()} "
-                      f"first_offsets={offset_cpu[:min(active, 3)].tolist()} "
-                      f"first_output_rows={row_cpu[:min(active, 3)].tolist()}", flush=True)
-            kwargs = dict(synchronize=bool(probe) or bool(epoch % 2))
-            if probe:
-                expect_scatter_probe(lambda: runtime.batch_get(
-                    view, indices, offsets, count, rows, output, **kwargs), probe,
-                    expected_bytes=active * (token // 32 * 32 if probe == "body" else token),
-                    diagnostic_revision=1 if diagnostics else None)
-            elif epoch % 2:
+            kwargs = dict(synchronize=bool(epoch % 2))
+            if epoch % 2:
                 runtime.batch_get(view, indices, offsets, count, rows, output, **kwargs)
             else:
                 runtime.batch_get(view.addresses, view.valid, indices, offsets,
                                   count, rows, output, **kwargs)
             torch.npu.synchronize()
             expected = torch.full_like(output.cpu(), 0xAD)
-            if not probe or probe == "copy":
-                src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
-                expected[row_cpu[:active].long()] = source_cpu[src_rows]
+            src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
+            expected[row_cpu[:active].long()] = source_cpu[src_rows]
             assert torch.equal(output.cpu(), expected), (mode, cores, token, active, epoch)
-
-        if probe:
-            runtime.shutdown()
-            output_check = "verified" if probe == "copy" else "unchanged"
-            load_check = {"done": " cpu_push=done_seen mte2=skipped mte3=skipped payload_content=not_checked",
-                          "gm": " scalar=gm_read mte2=skipped content=not_checked",
-                          "body": " mte2=aligned_body_only tail=skipped content=not_checked",
-                          "ub": " scalar=ub_read mte2=completed content=not_checked",
-                          "setup": " mte2=configured_only payload_dma=none",
-                          "dma": " mte2=completed content=not_checked",
-                          "load": " mte2=byte_verified_against_staging"}.get(probe, "")
-            print(f"PROBE_COMPLETE: stage={probe} cores={cores} token_bytes={token} "
-                  f"counts={counts} output={output_check}{load_check} (not a full regression PASS)", flush=True)
-            return 0
 
         # Enqueue on two caller streams without an intervening caller sync.
         # The owner must drain the first request before reusing workspace.

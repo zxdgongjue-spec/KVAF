@@ -78,7 +78,7 @@ class AivKernelMetadataTests(unittest.TestCase):
 
     def test_invalid_binary_stops_before_hardware_import(self):
         self.binary.write_bytes(elf(FAULT_METADATA))
-        with patch.dict("os.environ", {"KVAF_RUN_NPU_TESTS": "1", "KVAF_AIV_SCATTER_PROBE": "load"}), \
+        with patch.dict("os.environ", {"KVAF_RUN_NPU_TESTS": "1"}), \
              patch.object(common, "kernel_paths", return_value=(str(self.binary), "unused-put.o")):
             with self.assertRaisesRegex(RuntimeError, "scatter AIV metadata check failed"):
                 common.run("cpu_push_scatter")
@@ -92,7 +92,7 @@ class AivKernelMetadataTests(unittest.TestCase):
                 raise RuntimeError("reached hardware setup")
             return original_import(name, *args, **kwargs)
 
-        with patch.dict("os.environ", {"KVAF_RUN_NPU_TESTS": "1", "KVAF_AIV_SCATTER_PROBE": "load"}), \
+        with patch.dict("os.environ", {"KVAF_RUN_NPU_TESTS": "1"}), \
              patch.object(common, "kernel_paths", return_value=(str(self.binary), "unused-put.o")), \
              patch("builtins.__import__", side_effect=importing):
             with self.assertRaisesRegex(RuntimeError, "reached hardware setup"):

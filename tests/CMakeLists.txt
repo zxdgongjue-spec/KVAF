@@ -89,10 +89,6 @@ add_test(NAME kvaf_aiv_mode_isolation_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_mode_isolation.py")
 add_test(NAME kvaf_aiv_kernel_metadata_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_kernel_metadata.py")
-add_test(NAME kvaf_scatter_probe_result_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_probe_result.py")
-add_test(NAME kvaf_scatter_diagnostics_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_diagnostics.py")
 
 # Compile hardware Host sources even on development machines without CANN.
 # Object-only: never link the declaration doubles into the production libraries.
