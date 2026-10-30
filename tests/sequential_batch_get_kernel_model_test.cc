@@ -42,6 +42,7 @@ struct ModelArgs {
   uint32_t sgl_size;
   uint32_t max_polls;
   uint32_t scatter_probe;  // Former reserved word; zero preserves normal execution.
+  uint64_t profile{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -49,10 +50,10 @@ void Launch(const ModelArgs& a) {
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
       a.sequence, a.max_polls, a.scatter_probe});
   } else {
-    KvafGatherBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV2({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
-      a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls});
+      a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile});
   }
 }
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
@@ -87,6 +88,7 @@ struct Fixture {
   std::vector<uint64_t> addresses;
   std::vector<int32_t> indices, offsets, rows;
   std::vector<KvafSequentialStatus> status;
+  std::vector<KvafGatherBatchGetCoreProfile> profiles;
   std::vector<KvafBatchGetQueueState> states;
   std::vector<KvafBatchGetDirectUrmaEntity> control_entities, data_entities;
   std::vector<std::unique_ptr<ModelQueue>> queues;
@@ -98,7 +100,7 @@ struct Fixture {
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
-        indices(n), offsets(n), rows(n), status(cores), states(cores * 2),
+        indices(n), offsets(n), rows(n), status(cores), profiles(cores), states(cores * 2),
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
         ack_reads(cores), cpu_done(cores) {
     fixture = this;
@@ -234,6 +236,7 @@ struct Fixture {
     assert(false && "unknown doorbell");
   }
   void Run(bool success = true, bool allow_partial = false) {
+    const auto cycles = aiv_model::cycle;
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
     expected = output;
     if (success && active >= 0) for (int32_t i = 0; i < active; ++i)
@@ -252,6 +255,30 @@ struct Fixture {
     }
     if (success) assert(output == expected);
     else if (!allow_partial) CheckGuard();
+    if (!args.profile) assert(aiv_model::cycle == cycles);
+  }
+  void EnableProfile() { args.profile = Address(profiles.data()); }
+  void CheckProfiles() {
+    for (uint32_t core = 0; core < workers; ++core) {
+      const auto& p = profiles[core];
+      assert(p.magic == KVAF_GATHER_PROFILE_MAGIC && p.sequence == args.sequence);
+      assert(p.result == KVAF_SEQ_OK && p.valid_mask == KVAF_GATHER_PROFILE_ALL_EVENTS);
+      const uint64_t boundaries[] = {p.kernel_start_cycle, p.input_done_cycle,
+          p.descriptor_done_cycle, p.notify_done_cycle, p.ack_done_cycle,
+          p.read_done_cycle, p.kernel_finish_cycle};
+      assert(boundaries[0] && std::is_sorted(std::begin(boundaries), std::end(boundaries)));
+      const auto rows = uint64_t(active) * (core + 1) / workers - uint64_t(active) * core / workers;
+      assert(p.requests == rows && p.data_wrs == status[core].data_wrs);
+      if (!rows) {
+        assert(p.input_done_cycle == p.read_done_cycle);
+        assert(!p.data_wrs && !p.ack_queries && !p.data_wqebbs && !p.data_doorbells);
+        assert(!p.data_cq_wait_cycles && !p.read_build_cycles);
+      } else {
+        assert(p.ack_queries == 3 && p.data_wqebbs >= p.data_wrs);
+        assert(p.data_doorbells && p.data_cq_wait_cycles && p.read_build_cycles);
+        assert(p.data_cq_wait_cycles + p.read_build_cycles <= p.read_done_cycle - p.ack_done_cycle);
+      }
+    }
   }
   void Next(uint32_t n) {
     ++args.sequence; active = n;
@@ -270,6 +297,46 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  // Profile every lane, including empty lanes and repeated queue wraps. The
+  // disabled executions throughout this fixture assert zero timer reads.
+  for (uint32_t workers : {1U, 3U, 8U})
+    for (uint32_t sgl : {1U, 6U}) {
+      Fixture f(127, 656, workers, KVAF_SEQ_GATHER, sgl);
+      f.EnableProfile();
+      for (uint32_t count : {0U, 1U, 127U, 7U, 0U, 127U}) {
+        f.Next(count);
+        std::vector<uint64_t> old_pi(workers), old_ci(workers);
+        for (uint32_t core = 0; core < workers; ++core) {
+          old_pi[core] = f.states[core * 2].sq_producer_index;
+          old_ci[core] = f.states[core * 2].cq_consumer_index;
+        }
+        f.Run(); f.CheckProfiles();
+        for (uint32_t core = 0; core < workers; ++core) {
+          assert(f.profiles[core].data_wqebbs == f.states[core * 2].sq_producer_index - old_pi[core]);
+          assert(f.profiles[core].data_doorbells == f.states[core * 2].cq_consumer_index - old_ci[core]);
+        }
+      }
+      const auto before = f.profiles;
+      f.args.profile = 0; f.Next(7); f.Run();
+      for (uint32_t core = 0; core < workers; ++core)
+        assert(f.profiles[core].sequence == before[core].sequence);
+    }
+  {
+    Fixture large_token(19, 65535, 3, KVAF_SEQ_GATHER, 6);
+    large_token.EnableProfile(); large_token.Run(); large_token.CheckProfiles();
+    Fixture invalid(7, 656, 1, KVAF_SEQ_GATHER, 6);
+    invalid.EnableProfile(); invalid.rows[0] = -1; invalid.Run(false);
+    assert(invalid.profiles[0].result == KVAF_SEQ_INVALID);
+    assert(invalid.profiles[0].valid_mask == 0x41);
+    Fixture timeout(7, 656, 1, KVAF_SEQ_GATHER, 6);
+    timeout.EnableProfile(); timeout.timeout = true; timeout.Run(false);
+    assert(timeout.profiles[0].result == KVAF_SEQ_TIMEOUT);
+    assert(timeout.profiles[0].valid_mask == 0x4f && timeout.profiles[0].ack_queries == timeout.args.max_polls);
+    Fixture cq(19, 656, 1, KVAF_SEQ_GATHER, 6);
+    cq.EnableProfile(); cq.data_cq_error = true; cq.Run(false, true);
+    assert(cq.profiles[0].result == KVAF_SEQ_CQ_ERROR);
+    assert(cq.profiles[0].valid_mask == 0x5f && cq.profiles[0].data_doorbells);
+  }
   // Match the hardware smoke test: the first launch is empty, followed by
   // nonempty launches on the same queues. Empty work must finish all worker
   // statuses without notifying the CPU or advancing any SQ/CQ state.

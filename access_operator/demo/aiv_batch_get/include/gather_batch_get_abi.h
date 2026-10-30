@@ -1,6 +1,19 @@
 #pragma once
 #include "sequential_batch_get_abi.h"
 
+constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524631ULL;
+// A completed successful profile has all seven boundary timestamps. On error,
+// only the boundaries reached by this launch are marked valid.
+constexpr uint64_t KVAF_GATHER_PROFILE_ALL_EVENTS = 0x7f;
+struct alignas(64) KvafGatherBatchGetCoreProfile {
+  uint64_t magic, sequence, result, valid_mask;
+  uint64_t kernel_start_cycle, input_done_cycle, descriptor_done_cycle;
+  uint64_t notify_done_cycle, ack_done_cycle, read_done_cycle, kernel_finish_cycle;
+  uint64_t requests, data_wrs, ack_queries, data_wqebbs, data_doorbells;
+  uint64_t data_cq_wait_cycles, read_build_cycles;
+};
+static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 192);
+
 struct KvafGatherBatchGetArgs {
   KvafExecuteBatchGetKernelArgs request;
   uint64_t workspace, workspace_bytes, workspace_entity, descriptor_offset;
@@ -8,8 +21,10 @@ struct KvafGatherBatchGetArgs {
   uint64_t remote_staging, remote_descriptor, remote_control;
   uint64_t source_base, source_bytes, sequence;
   uint32_t sgl_size, max_polls;
+  // Optional independent per-core profile array. Zero incurs no clock reads.
+  uint64_t profile;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 216);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 224);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

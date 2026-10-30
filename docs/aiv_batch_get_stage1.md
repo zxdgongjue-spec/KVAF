@@ -1,5 +1,9 @@
 # AIV BatchGet 第一阶段实现与验证
 
+Gather 串行计时新增独立性能入口，参数在脚本顶部修改，见
+[Gather 串行阶段计时](aiv_gather_serial_profile.md)。当前 gather launch ABI 为
+224 B，symbol 为 `KvafGatherBatchGetAivKernelV2`，需要同步更新 Host 和 kernel。
+
 ## 当前临时运行方式：只检查 CPU push / done
 
 为先验证前半段链路及退出，`test_aiv_scatter_batch_get.py` 暂时强制
@@ -82,9 +86,9 @@ Python 继续使用统一的 `kvaf.NpuRuntime(..., aiv_batch_get_mode=...)` 和
 | --- | --- | --- |
 | Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
-| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，216 B |
+| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，224 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV1` |
+| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV2` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 | 独立测试 | `tests/python/test_aiv_scatter_batch_get.py` | `tests/python/test_aiv_gather_batch_get.py` |
 

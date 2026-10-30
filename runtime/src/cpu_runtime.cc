@@ -8,6 +8,7 @@
 #include "cpu_gather_executor.h"
 #include "gather_workspace.h"
 #include "cpu_push_get_worker.h"
+#include "batch_get_profile.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -325,11 +326,15 @@ class CpuGatherWorker {
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t threads, std::size_t min_bytes, bool affinity,
                   CpuGatherMode mode, uint64_t control_address = 0U,
-                  std::size_t cpu_offset = 0U)
+                  std::size_t cpu_offset = 0U, uint64_t session_id = 0U,
+                  uint32_t lane = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
             (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
-        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), affinity, cpu_offset), mode_(mode) {
+        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), affinity, cpu_offset), mode_(mode),
+        session_id_(session_id), lane_(lane) {
+    const char* profile = std::getenv("KVAF_GATHER_PROFILE");
+    profile_enabled_ = profile && std::strcmp(profile, "1") == 0;
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -352,17 +357,34 @@ class CpuGatherWorker {
         continue;
       }
       last = sequence;
+      const auto service_start = profile_enabled_ ? BatchGetProfileNowNs() : 0U;
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
       peer::GatherBarrier();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
       bool valid = false;
+      std::size_t active_threads = 0U;
+      uint64_t prepare_ns = 0U, copy_ns = 0U;
+      peer::GatherDescriptorHeader profile_header{};
       try {
-        valid = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
-        if (valid) executor_.Copy();
+        {
+          BatchGetProfileScope timer(profile_enabled_ ? &prepare_ns : nullptr);
+          active_threads = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
+        }
+        valid = active_threads != 0U;
+        if (valid) {
+          // PrepareDirect validated the address/header; the caller retains this
+          // descriptor until the final ACK. Never dereference an invalid request
+          // just to obtain profile metadata.
+          if (profile_enabled_)
+            std::memcpy(&profile_header, memory_ + (address - base_), sizeof(profile_header));
+          BatchGetProfileScope timer(profile_enabled_ ? &copy_ns : nullptr);
+          executor_.Copy();
+        }
       } catch (const std::exception& error) {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
         valid = false;
       }
+      const auto ack_start = profile_enabled_ ? BatchGetProfileNowNs() : 0U;
       if (!valid && address % 64U == 0U &&
           peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
                             sizeof(peer::GatherDescriptorHeader))) {
@@ -373,6 +395,18 @@ class CpuGatherWorker {
       __atomic_store_n(&control_->ack,
                       sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
       peer::GatherBarrier();
+      if (profile_enabled_) {
+        const auto service_end = BatchGetProfileNowNs();
+        // Print after publishing completion. total_ns starts when this worker
+        // observes notify, not when the remote AIV publishes it; these CPU clock
+        // durations must not be added to the AIV's inclusive ACK wait interval.
+        Log("CPU_GATHER_PROFILE session=%" PRIu64 " lane=%u sequence=%" PRIu64
+            " rows=%u bytes=%u active_threads=%zu prepare_ns=%" PRIu64
+            " copy_ns=%" PRIu64 " ack_ns=%" PRIu64 " total_ns=%" PRIu64 " result=%s\n",
+            session_id_, lane_, sequence, profile_header.span_count, profile_header.total_bytes,
+            active_threads, prepare_ns, copy_ns, service_end - ack_start,
+            service_end - service_start, valid ? "ok" : "error");
+      }
     }
   }
   std::uint8_t* memory_;
@@ -380,6 +414,9 @@ class CpuGatherWorker {
   peer::GatherControl* control_;
   peer::CpuGatherExecutor executor_;
   CpuGatherMode mode_;
+  uint64_t session_id_;
+  uint32_t lane_;
+  bool profile_enabled_{false};
   std::atomic<bool> stop_{false};
   std::thread worker_;
 };
@@ -621,7 +658,7 @@ class CpuService {
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_affinity_, gather_mode_);
+          min_bytes_per_thread_, gather_affinity_, gather_mode_, 0U, 0U, session_id);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -646,7 +683,7 @@ class CpuService {
         created.push_back(std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
             gather_affinity_, gather_mode_, control_address + lane * sizeof(peer::GatherControl),
-            cpu_offset));
+            cpu_offset, session_id, lane));
         cpu_offset += budget;
       }
     } catch (const std::exception& error) {

@@ -16,7 +16,7 @@ std::vector<std::unique_ptr<std::string>> binaries;
 void Check(bool ok) { if (!ok) std::abort(); }
 constexpr char kDirect[] = "KvafExecuteBatchGetAivKernelV2";
 constexpr char kScatter[] = "KvafScatterBatchGetAivKernelV1";
-constexpr char kGather[] = "KvafGatherBatchGetAivKernelV1";
+constexpr char kGather[] = "KvafGatherBatchGetAivKernelV2";
 std::vector<std::string> launched;
 }
 aclrtBinary aclrtCreateBinary(const void* data, size_t bytes) {
@@ -79,6 +79,10 @@ int main(int argc, char** argv) {
   }
   if (scenario == "wrong_symbol") {
     Check(KvafScatterBatchGetLoadKernel(gather.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
+    // V2 appends a profile pointer; an old V1 object must fail before launch.
+    std::ofstream(gather) << "KvafGatherBatchGetAivKernelV1";
+    Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
+    std::ofstream(gather) << kGather;
   }
   Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == 0);
   std::ofstream(scatter) << kScatter;

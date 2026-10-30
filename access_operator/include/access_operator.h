@@ -89,6 +89,26 @@ struct BatchGetKernelProfile {
   std::uint64_t peak_submitted_not_drained{0};
 };
 
+// Serial gather timeline. Device cycles and Host nanoseconds are different
+// clock domains; only differences within one domain may be compared.
+struct GatherBatchGetCoreProfile {
+  std::uint64_t sequence{}, kernel_start_cycle{}, input_done_cycle{};
+  std::uint64_t descriptor_done_cycle{}, notify_done_cycle{}, ack_done_cycle{};
+  std::uint64_t read_done_cycle{}, kernel_finish_cycle{}, requests{}, data_wrs{};
+  std::uint64_t ack_queries{}, data_wqebbs{}, data_doorbells{};
+  std::uint64_t data_cq_wait_cycles{}, read_build_cycles{};
+};
+
+struct GatherBatchGetProfile {
+  std::uint64_t sequence{};
+  // prepare includes input adaptation/output registration in the owner;
+  // launch includes status initialization and launch enqueue. wait measures
+  // remaining device execution and queued status/profile D2H completion.
+  std::uint64_t prepare_ns{}, launch_ns{}, status_enqueue_ns{}, wait_ns{};
+  std::uint64_t finish_ns{}, total_ns{};
+  std::vector<GatherBatchGetCoreProfile> cores;
+};
+
 // Default synchronous NPU data-plane implementation.
 //
 // Initialize creates reusable BatchGet and (when configured) BatchPut
@@ -119,6 +139,8 @@ class DefaultAccessOperator final : public AccessOperator {
   Status SetBatchGetKernelProfiling(bool enabled);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+  Status SetGatherBatchGetProfiling(bool enabled);
+  Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const;
 
  private:
   struct Impl;

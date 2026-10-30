@@ -908,6 +908,18 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
   return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
 }
 
+Status NpuRuntime::SetGatherBatchGetProfiling(bool enabled) {
+  if (!impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime requires LinkTo before configuring gather profiling");
+  return impl_->access_operator->SetGatherBatchGetProfiling(enabled);
+}
+
+Status NpuRuntime::CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const {
+  if (!impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime requires LinkTo before reading gather profiling");
+  return impl_->access_operator->CopyGatherBatchGetProfile(profile);
+}
+
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }

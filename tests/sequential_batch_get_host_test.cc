@@ -18,6 +18,7 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 uint64_t kernel_result{};
+uint32_t profile_fault{};
 std::vector<uint64_t> sequences;
 }
 int aclrtMalloc(void** p, size_t n, int) {
@@ -82,7 +83,34 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   assert(loaded_mode == KVAF_SEQ_GATHER);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
-  return Launch(&model);
+  const auto rc = Launch(&model);
+  if (a->profile) {
+    const auto args = *a;
+    const auto fault = profile_fault;
+    work.push_back([=] {
+      auto* profiles = reinterpret_cast<KvafGatherBatchGetCoreProfile*>(args.profile);
+      const auto* statuses = reinterpret_cast<const KvafSequentialStatus*>(args.request.core_status);
+      for (uint32_t i = 0; i < args.request.block_count; ++i) {
+        auto& p = profiles[i];
+        p = {};
+        if (fault == 1) continue; // Old/missing profile producer must fail closed.
+        p.magic = KVAF_GATHER_PROFILE_MAGIC;
+        p.sequence = args.sequence + (fault == 2);
+        p.result = fault == 5 ? KVAF_SEQ_CQ_ERROR : statuses[i].result;
+        p.valid_mask = fault == 3 ? 1 : KVAF_GATHER_PROFILE_ALL_EVENTS;
+        p.kernel_start_cycle = 100;
+        p.input_done_cycle = 101;
+        p.descriptor_done_cycle = 102;
+        p.notify_done_cycle = 103;
+        p.ack_done_cycle = fault == 4 ? 99 : 104;
+        p.read_done_cycle = 105;
+        p.kernel_finish_cycle = 106;
+        p.requests = statuses[i].requests + (fault == 6);
+        p.data_wrs = statuses[i].data_wrs;
+      }
+    });
+  }
+  return rc;
 }
 struct KvafBatchGetTransport {};
 struct KvafBatchGetLocalBuffer {};
@@ -317,5 +345,66 @@ int main() {
   }
   assert(push_stopped == 17);
   unsetenv("KVAF_AIV_SCATTER_PROBE");
+  config.aiv_batch_get_mode = "gather_read";
+  config.aiv_gather_sgl_size = 6;
+  exec.execution.synchronize = true;
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    GatherBatchGetProfile snapshot;
+    assert(owner->SetGatherProfiling(true).code() == StatusCode::kNotInitialized);
+    assert(owner->Initialize(region).ok());
+    assert(owner->CopyGatherProfile(&snapshot).code() == StatusCode::kInvalidState);
+    assert(owner->CopyGatherProfile(nullptr).code() == StatusCode::kInvalidArgument);
+    assert(owner->SetGatherProfiling(true).ok() && allocations == 6);
+    exec.execution.synchronize = false;
+    const auto before = launches;
+    assert(owner->Execute(exec).code() == StatusCode::kInvalidArgument && launches == before);
+    exec.execution.synchronize = true;
+    for (uint64_t seq = 1; seq <= 2; ++seq) {
+      assert(owner->Execute(exec).ok());
+      assert(owner->CopyGatherProfile(&snapshot).ok());
+      assert(snapshot.sequence == seq && snapshot.cores.size() == 3);
+      uint64_t rows = 0;
+      for (const auto& p : snapshot.cores) {
+        assert(p.sequence == seq && p.kernel_finish_cycle - p.kernel_start_cycle == 6);
+        rows += p.requests;
+      }
+      assert(rows == 1);
+      assert(snapshot.total_ns >= snapshot.prepare_ns + snapshot.launch_ns +
+          snapshot.status_enqueue_ns + snapshot.wait_ns + snapshot.finish_ns);
+    }
+    assert(owner->SetGatherProfiling(false).ok());
+    assert(owner->Execute(exec).ok());
+    assert(owner->CopyGatherProfile(&snapshot).code() == StatusCode::kInvalidState);
+    assert(snapshot.cores.empty());
+    assert(owner->SetGatherProfiling(true).ok());
+    count = 0;
+    assert(owner->Execute(exec).ok() && owner->CopyGatherProfile(&snapshot).ok());
+    for (const auto& p : snapshot.cores) assert(p.requests == 0);
+    count = 1;
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  for (profile_fault = 1; profile_fault <= 6; ++profile_fault) {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    assert(owner->Execute(exec).code() == StatusCode::kInternal);
+    GatherBatchGetProfile snapshot;
+    assert(!owner->CopyGatherProfile(&snapshot).ok());
+    assert(!owner->Execute(exec).ok());
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  profile_fault = 0;
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    fail_sync = true;
+    assert(owner->Execute(exec).code() == StatusCode::kDeviceError);
+    GatherBatchGetProfile snapshot;
+    assert(!owner->CopyGatherProfile(&snapshot).ok());
+    assert(owner->SetGatherProfiling(false).ok()); // Cleanup preserves original failure.
+    assert(!owner->Shutdown().ok() && allocations == 6);
+    fail_sync = false;
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
   std::cout << "sequential Host lifecycle: PASS\n";
 }

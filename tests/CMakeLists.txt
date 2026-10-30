@@ -6,6 +6,8 @@ target_include_directories(kvaf_startup_selection_test PRIVATE
 add_test(NAME kvaf_startup_selection_test COMMAND kvaf_startup_selection_test)
 add_test(NAME kvaf_aiv_test_cleanup_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_test_cleanup.py")
+add_test(NAME kvaf_gather_perf_summary_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_perf_summary.py")
 
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"

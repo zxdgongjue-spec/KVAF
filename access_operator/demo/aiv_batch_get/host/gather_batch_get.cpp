@@ -3,6 +3,7 @@
 #include "kvaf_aiv_batch_get.h"
 #include "cpu_gather.h"
 #include "gather_workspace.h"
+#include "batch_get_profile.h"
 #include "peer_link.h"
 #include <acl/acl.h>
 #include <algorithm>
@@ -32,6 +33,8 @@ class GatherBatchGet final : public SequentialBatchGet {
   Status Execute(const BatchGetExecRequest& exec) override;
   Status Drain() override;
   Status Shutdown() override;
+  Status SetGatherProfiling(bool enabled) override;
+  Status CopyGatherProfile(GatherBatchGetProfile* profile) const override;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -47,6 +50,11 @@ struct GatherBatchGet::Impl {
   void* status_device{};
   void* status_host{};
   void* queues{};
+  void* profile_device{};
+  void* profile_host{};
+  bool profiling{}, pending_profile{}, profile_valid{};
+  uint64_t profile_begin_ns{};
+  GatherBatchGetProfile latest_profile{};
   KvafBatchGetTransport* gather_transport{};
   KvafBatchGetLocalBuffer* workspace_buffer{};
   KvafBatchGetLocalBuffer* output_buffer{};
@@ -54,6 +62,9 @@ struct GatherBatchGet::Impl {
   uint64_t sequence{};
   bool gather_enabled{}, initialized{}, failed{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
+  uint64_t ProfileBytes() const {
+    return config.npu_core_count * sizeof(KvafGatherBatchGetCoreProfile);
+  }
 
   Status AclFailure(const char* phase, aclError code) const {
     return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
@@ -65,15 +76,27 @@ struct GatherBatchGet::Impl {
   Status Drain() {
     if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
     if (!pending) return Status::OK();
+    const auto enqueue_begin = pending_profile ? BatchGetProfileNowNs() : 0;
     const aclError copied = aclrtMemcpyAsync(status_host, StatusBytes(), status_device,
                                             StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, pending);
     if (copied != ACL_SUCCESS) {
       failed = true; return AclFailure("copy_status", copied);
     }
+    if (pending_profile) {
+      const auto profile_copied = aclrtMemcpyAsync(profile_host, ProfileBytes(), profile_device,
+          ProfileBytes(), ACL_MEMCPY_DEVICE_TO_HOST, pending);
+      if (profile_copied != ACL_SUCCESS) {
+        failed = true; return AclFailure("copy_profile", profile_copied);
+      }
+    }
+    const auto wait_begin = pending_profile ? BatchGetProfileNowNs() : 0;
+    if (pending_profile) latest_profile.status_enqueue_ns = wait_begin - enqueue_begin;
     const aclError synchronized = aclrtSynchronizeStream(pending);
     if (synchronized != ACL_SUCCESS) {
       failed = true; return AclFailure("synchronize", synchronized);
     }
+    const auto finish_begin = pending_profile ? BatchGetProfileNowNs() : 0;
+    if (pending_profile) latest_profile.wait_ns = finish_begin - wait_begin;
     pending = nullptr;
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
     const uint64_t expected_result = KVAF_SEQ_OK;
@@ -93,8 +116,19 @@ struct GatherBatchGet::Impl {
     }
     if (output_buffer) KvafBatchGetLocalBufferRelease(output_buffer);
     output_buffer = nullptr;
+    if (pending_profile) {
+      const auto captured = CaptureProfile();
+      if (!captured.ok()) { failed = true; return captured; }
+      const auto finished = BatchGetProfileNowNs();
+      latest_profile.finish_ns = finished - finish_begin;
+      latest_profile.total_ns = finished - profile_begin_ns;
+      profile_valid = true;
+      pending_profile = false;
+    }
     return Status::OK();
   }
+
+  Status CaptureProfile();
 
   Status InitializeGather(const peer::PeerRegion& peer) {
     const auto workers = config.npu_core_count;
@@ -147,16 +181,57 @@ struct GatherBatchGet::Impl {
     output_buffer = workspace_buffer = nullptr;
     if (gather_transport) KvafBatchGetTransportDestroy(gather_transport);
     gather_transport = nullptr;
-    for (auto p : {&workspace, &queues, &status_device}) {
+    for (auto p : {&workspace, &queues, &status_device, &profile_device}) {
       if (*p && aclrtFree(*p) != ACL_SUCCESS) return Error("free device memory");
       *p = nullptr;
     }
     if (status_host && aclrtFreeHost(status_host) != ACL_SUCCESS) return Error("free status memory");
     status_host = nullptr;
+    if (profile_host && aclrtFreeHost(profile_host) != ACL_SUCCESS)
+      return Error("free profile memory");
+    profile_host = nullptr;
+    profiling = pending_profile = profile_valid = false;
+    latest_profile = {};
     initialized = failed = false; sequence = 0; args = {};
     return execution_status;
   }
 };
+
+Status GatherBatchGet::Impl::CaptureProfile() {
+  const auto* profiles = static_cast<const KvafGatherBatchGetCoreProfile*>(profile_host);
+  const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
+  latest_profile.cores.clear();
+  latest_profile.cores.reserve(config.npu_core_count);
+  for (uint32_t i = 0; i < config.npu_core_count; ++i) {
+    const auto& p = profiles[i];
+    if (p.magic != KVAF_GATHER_PROFILE_MAGIC || p.sequence != sequence || p.result != KVAF_SEQ_OK ||
+        p.valid_mask != KVAF_GATHER_PROFILE_ALL_EVENTS ||
+        p.kernel_start_cycle > p.input_done_cycle || p.input_done_cycle > p.descriptor_done_cycle ||
+        p.descriptor_done_cycle > p.notify_done_cycle || p.notify_done_cycle > p.ack_done_cycle ||
+        p.ack_done_cycle > p.read_done_cycle || p.read_done_cycle > p.kernel_finish_cycle ||
+        p.requests != statuses[i].requests || p.data_wrs != statuses[i].data_wrs)
+      return Status::Internal("AIV sequential BatchGet: invalid gather profile worker=" +
+                              std::to_string(i) + " sequence=" + std::to_string(sequence));
+    GatherBatchGetCoreProfile out;
+    out.sequence = p.sequence;
+    out.kernel_start_cycle = p.kernel_start_cycle;
+    out.input_done_cycle = p.input_done_cycle;
+    out.descriptor_done_cycle = p.descriptor_done_cycle;
+    out.notify_done_cycle = p.notify_done_cycle;
+    out.ack_done_cycle = p.ack_done_cycle;
+    out.read_done_cycle = p.read_done_cycle;
+    out.kernel_finish_cycle = p.kernel_finish_cycle;
+    out.requests = p.requests;
+    out.data_wrs = p.data_wrs;
+    out.ack_queries = p.ack_queries;
+    out.data_wqebbs = p.data_wqebbs;
+    out.data_doorbells = p.data_doorbells;
+    out.data_cq_wait_cycles = p.data_cq_wait_cycles;
+    out.read_build_cycles = p.read_build_cycles;
+    latest_profile.cores.push_back(out);
+  }
+  return Status::OK();
+}
 
 GatherBatchGet::GatherBatchGet(AccessOperatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
@@ -200,6 +275,33 @@ Status GatherBatchGet::Drain() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->Drain();
 }
+Status GatherBatchGet::SetGatherProfiling(bool enabled) {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
+  if (!enabled) { s.profiling = false; return Status::OK(); }
+  auto result = s.Drain();
+  if (!result.ok()) return result;
+  if (!s.profile_device &&
+      aclrtMalloc(&s.profile_device, s.ProfileBytes(), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
+    return Error("allocate gather device profile");
+  if (!s.profile_host && aclrtMallocHost(&s.profile_host, s.ProfileBytes()) != ACL_SUCCESS)
+    return Error("allocate gather Host profile");
+  s.profiling = true;
+  s.profile_valid = false;
+  return Status::OK();
+}
+Status GatherBatchGet::CopyGatherProfile(GatherBatchGetProfile* profile) const {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!profile) return Status::InvalidArgument("gather profile output must not be null");
+  *profile = {};
+  if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
+  if (s.failed || !s.profile_valid)
+    return Status::InvalidState("no successful synchronous gather profile is available");
+  *profile = s.latest_profile;
+  return Status::OK();
+}
 Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
@@ -211,8 +313,15 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Error("query stream capture state");
   if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
     return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  if (s.profiling && !exec.execution.synchronize)
+    return Status::InvalidArgument("gather profiling requires synchronize=True");
   auto result = s.Drain();
   if (!result.ok()) return result;
+  s.profile_valid = false;
+  if (s.profiling) {
+    s.profile_begin_ns = BatchGetProfileNowNs();
+    s.latest_profile = {};
+  }
   auto args = s.args;
   result = Input(exec, s.config, &args.request);
   if (!result.ok()) return result;
@@ -222,11 +331,21 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Error("register output");
   args.request.core_status = Ptr(s.status_device); args.request.queue_state = Ptr(s.queues);
   args.sequence = ++s.sequence;
+  args.profile = s.profiling ? Ptr(s.profile_device) : 0;
+  s.pending_profile = s.profiling;
+  const auto launch_begin = s.profiling ? BatchGetProfileNowNs() : 0;
+  if (s.profiling) {
+    s.latest_profile.sequence = s.sequence;
+    s.latest_profile.prepare_ns = launch_begin - s.profile_begin_ns;
+  }
   s.pending = static_cast<aclrtStream>(exec.execution.stream);
-  if (aclrtMemsetAsync(s.status_device, s.StatusBytes(), 0, s.StatusBytes(), s.pending) != ACL_SUCCESS ||
+  if ((s.profiling && aclrtMemsetAsync(s.profile_device, s.ProfileBytes(), 0,
+                                     s.ProfileBytes(), s.pending) != ACL_SUCCESS) ||
+      aclrtMemsetAsync(s.status_device, s.StatusBytes(), 0, s.StatusBytes(), s.pending) != ACL_SUCCESS ||
       KvafGatherBatchGetLaunch(&args, s.pending)) {
     s.failed = true; return Error("enqueue failed; resources retained");
   }
+  if (s.profiling) s.latest_profile.launch_ns = BatchGetProfileNowNs() - launch_begin;
   return exec.execution.synchronize ? s.Drain() : Status::OK();
 }
 Status GatherBatchGet::Shutdown() {

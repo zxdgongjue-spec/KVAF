@@ -417,6 +417,55 @@ class NpuPythonRuntime final {
     return result;
   }
 
+  void StartGatherBatchGetProfile() {
+    ThrowIfError(native_->SetGatherBatchGetProfiling(true));
+  }
+
+  py::dict GatherBatchGetProfileSnapshot() const {
+    kvaf::GatherBatchGetProfile profile;
+    ThrowIfError(native_->CopyGatherBatchGetProfile(&profile));
+    py::dict host;
+    host["prepare_ns"] = profile.prepare_ns;
+    host["launch_ns"] = profile.launch_ns;
+    host["status_enqueue_ns"] = profile.status_enqueue_ns;
+    host["wait_ns"] = profile.wait_ns;
+    host["finish_ns"] = profile.finish_ns;
+    host["total_ns"] = profile.total_ns;
+    py::list cores;
+    for (std::size_t core = 0; core < profile.cores.size(); ++core) {
+      const auto& p = profile.cores[core];
+      py::dict item;
+      item["core"] = core;
+      item["sequence"] = p.sequence;
+      item["kernel_start_cycle"] = p.kernel_start_cycle;
+      item["input_done_cycle"] = p.input_done_cycle;
+      item["descriptor_done_cycle"] = p.descriptor_done_cycle;
+      item["notify_done_cycle"] = p.notify_done_cycle;
+      item["ack_done_cycle"] = p.ack_done_cycle;
+      item["read_done_cycle"] = p.read_done_cycle;
+      item["kernel_finish_cycle"] = p.kernel_finish_cycle;
+      item["requests"] = p.requests;
+      item["data_wrs"] = p.data_wrs;
+      item["ack_queries"] = p.ack_queries;
+      item["data_wqebbs"] = p.data_wqebbs;
+      item["data_doorbells"] = p.data_doorbells;
+      item["data_cq_wait_cycles"] = p.data_cq_wait_cycles;
+      item["read_build_cycles"] = p.read_build_cycles;
+      cores.append(std::move(item));
+    }
+    py::dict result;
+    result["sequence"] = profile.sequence;
+    result["host"] = std::move(host);
+    result["cores"] = std::move(cores);
+    return result;
+  }
+
+  void StopGatherBatchGetProfile() {
+    // Disabling also works before the first sample or after a failed launch.
+    // Snapshot remains explicit so stopping never hides the original error.
+    ThrowIfError(native_->SetGatherBatchGetProfiling(false));
+  }
+
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
@@ -590,6 +639,15 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("stop_batch_get_kernel_profile",
            &NpuPythonRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")
+      .def("start_gather_batch_get_profile",
+           &NpuPythonRuntime::StartGatherBatchGetProfile,
+           "Enable serial gather Host and per-core AIV timelines; use synchronize=True.")
+      .def("gather_batch_get_profile",
+           &NpuPythonRuntime::GatherBatchGetProfileSnapshot,
+           "Read the latest successful synchronous gather profile (Host ns, AIV cycles).")
+      .def("stop_gather_batch_get_profile",
+           &NpuPythonRuntime::StopGatherBatchGetProfile,
+           "Disable gather profiling; reading snapshots is explicit.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"),
