@@ -46,8 +46,6 @@ class PeerLink {
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);
-  Status UbmemRange(uint64_t base, uint64_t offset, uint64_t length,
-                    uint32_t seed, bool fill) const;
   Status RetainUbmemMapping(uint64_t base);
   void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);

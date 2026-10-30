@@ -25,8 +25,7 @@ enum class Command : uint16_t {
   kGetCandidateCount = 4U,
   kGetCandidateInfo = 5U,
   kAllocateUbmemRegion = 6U,
-  kCheckUbmemRange = 7U,
-  kFillUbmemRange = 8U,
+  // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
 
 enum class Result : int32_t {
@@ -138,15 +137,6 @@ struct AllocateUbmemRegionResponse {
   char error_message[256];
 };
 
-// Test oracle: CPU checks/fills its own DDR without sending KV payload over TCP.
-struct UbmemRangeRequest {
-  MessageHeader header;
-  uint64_t session_id;
-  uint64_t offset;
-  uint64_t length;
-  uint32_t seed;
-};
-
 struct StatusResponse {
   MessageHeader header;
   int32_t result;
@@ -156,7 +146,6 @@ struct StatusResponse {
 
 static_assert(sizeof(AllocateUbmemRegionRequest) == 28U, "UBmem allocation ABI changed");
 static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI changed");
-static_assert(sizeof(UbmemRangeRequest) == 40U, "UBmem oracle ABI changed");
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");

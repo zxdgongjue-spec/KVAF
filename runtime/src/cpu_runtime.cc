@@ -75,8 +75,7 @@ Status CpuRuntime::ServeConnection(int fd) {
       header.version != peer::kProtocolVersion)
     return Status::InvalidArgument("invalid CPU control header");
   const auto command = static_cast<peer::Command>(header.command);
-  if (command == peer::Command::kAllocateUbmemRegion ||
-      command == peer::Command::kCheckUbmemRange || command == peer::Command::kFillUbmemRange)
+  if (command == peer::Command::kAllocateUbmemRegion)
     return impl_->ubmem.ServeConnection(fd, header);
   if (command == peer::Command::kReleaseRegion) {
     peer::ReleaseRegionRequest request{};

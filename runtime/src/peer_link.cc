@@ -363,32 +363,6 @@ Status PeerLink::AllocateUbmemRegion(uint64_t bytes, uint64_t slot_size, PeerReg
   return Status::OK();
 }
 
-Status PeerLink::UbmemRange(uint64_t base, uint64_t offset, uint64_t length,
-                           uint32_t seed, bool fill) const {
-  const auto found = regions_.find(base);
-  if (found == regions_.end()) return Status::NotFound("UBmem region was not found");
-  if (length == 0 || offset > found->second.length || length > found->second.length - offset) {
-    return Status::InvalidArgument("UBmem test range is outside DDR");
-  }
-  UbmemRangeRequest request{};
-  const Command command = fill ? Command::kFillUbmemRange : Command::kCheckUbmemRange;
-  request.header = MakeHeader(command, sizeof(request));
-  request.session_id = found->second.session_id;
-  request.offset = offset;
-  request.length = length;
-  request.seed = seed;
-  StatusResponse response{};
-  std::string error;
-  if (!Exchange(address_, request, &response, &error)) {
-    return ToStatus("UBmem CPU oracle exchange failed", std::move(error));
-  }
-  if (!IsValidResponseHeader(response.header, command, sizeof(response)) ||
-      response.result != static_cast<int32_t>(Result::kOk)) {
-    return Status::Internal(fill ? "CPU UBmem fill failed" : "CPU UBmem content mismatch");
-  }
-  return Status::OK();
-}
-
 Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
   if (region == nullptr) return Status::InvalidArgument("peer region output must not be null");
   const auto found = regions_.find(base);

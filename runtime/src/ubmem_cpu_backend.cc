@@ -1,8 +1,5 @@
 #include "cpu_backends.h"
 #include "ubmem/hal.h"
-#ifdef KVAF_ENABLE_TEST_COMMANDS
-#include "test_pattern.h"
-#endif
 
 #include <sys/socket.h>
 #include <cerrno>
@@ -28,9 +25,8 @@ bool Transfer(int fd, T* object, std::size_t offset, bool write) {
 }  // namespace
 
 struct UbmemCpuBackend::Impl {
-  struct Region { std::unique_ptr<Mapping> memory; std::uint64_t logical_bytes; };
   std::shared_ptr<Hal> hal = std::make_shared<Hal>();
-  std::unordered_map<std::uint64_t, Region> regions;
+  std::unordered_map<std::uint64_t, std::unique_ptr<Mapping>> regions;
   std::uint64_t& next_session;
   std::string library;
   Impl(const CpuRuntimeOptions& options, std::uint64_t& next)
@@ -63,7 +59,7 @@ struct UbmemCpuBackend::Impl {
       response.peer_length = request.ddr_bytes;
       response.mapping_bytes = region->bytes();
       std::memcpy(response.fabric_handle, handle.data(), handle.size());
-      regions.emplace(response.session_id, Region{std::move(region), request.ddr_bytes});
+      regions.emplace(response.session_id, std::move(region));
       std::fprintf(stderr, "[KVAF_UBMEM] DDR_EXPORTED session=%llu bytes=%llu numa=%d\n",
           static_cast<unsigned long long>(response.session_id),
           static_cast<unsigned long long>(response.peer_length), numa);
@@ -76,36 +72,6 @@ struct UbmemCpuBackend::Impl {
     }
     return status;
   }
-
-#ifdef KVAF_ENABLE_TEST_COMMANDS
-  peer::Result Range(const peer::UbmemRangeRequest& request, bool fill) {
-    auto found = regions.find(request.session_id);
-    if (found == regions.end()) return peer::Result::kNotFound;
-    const auto bytes = found->second.logical_bytes;
-    if (request.length == 0 || request.offset > bytes || request.length > bytes - request.offset) {
-      return peer::Result::kInvalidRequest;
-    }
-    auto* data = reinterpret_cast<volatile std::uint8_t*>(found->second.memory->address());
-    for (std::uint64_t i = request.offset; i < request.offset + request.length; ++i) {
-      const auto value = TestPattern(i, request.seed);
-      if (fill) {
-        data[i] = value;
-      } else {
-        const auto actual = data[i];
-        if (actual != value) {
-          std::fprintf(stderr, "[KVAF_UBMEM] CPU_MISMATCH session=%llu offset=%llu expected=0x%02x actual=0x%02x\n",
-              static_cast<unsigned long long>(request.session_id), static_cast<unsigned long long>(i),
-              static_cast<unsigned>(value), static_cast<unsigned>(actual));
-          return peer::Result::kResourceError;
-        }
-      }
-    }
-    // Publish CPU stores before the TCP fill response lets the NPU start GET.
-    // This orders stores; it does not clean CPU caches on a noncoherent mapping.
-    if (fill) __sync_synchronize();
-    return peer::Result::kOk;
-  }
-#endif
 };
 
 UbmemCpuBackend::UbmemCpuBackend(const CpuRuntimeOptions& options, std::uint64_t& next)
@@ -114,13 +80,13 @@ UbmemCpuBackend::~UbmemCpuBackend() { (void)Shutdown(); }
 Status UbmemCpuBackend::ReleaseLink(LinkId id) {
   auto found = impl_->regions.find(id);
   if (found == impl_->regions.end()) return Status::NotFound("UBmem session was not found");
-  Status status = found->second.memory->Close();
+  Status status = found->second->Close();
   if (status.ok()) impl_->regions.erase(found);
   return status;
 }
 Status UbmemCpuBackend::Shutdown() {
   for (auto it = impl_->regions.begin(); it != impl_->regions.end();) {
-    Status status = it->second.memory->Close();
+    Status status = it->second->Close();
     if (!status.ok()) return status;
     it = impl_->regions.erase(it);
   }
@@ -128,24 +94,7 @@ Status UbmemCpuBackend::Shutdown() {
 }
 
 Status UbmemCpuBackend::ServeConnection(int fd, const peer::MessageHeader& header) {
-  const auto command = static_cast<peer::Command>(header.command);
-  if (command == peer::Command::kAllocateUbmemRegion) return impl_->Allocate(fd, header);
-  peer::Result result = peer::Result::kInvalidRequest;
-#ifdef KVAF_ENABLE_TEST_COMMANDS
-  if (command == peer::Command::kCheckUbmemRange || command == peer::Command::kFillUbmemRange) {
-    peer::UbmemRangeRequest request{};
-    request.header = header;
-    if (peer::IsValidHeader(header, command, sizeof(request)) &&
-        Transfer(fd, &request, sizeof(header), false)) {
-      result = impl_->Range(request, command == peer::Command::kFillUbmemRange);
-    }
-  }
-#endif
-  peer::StatusResponse response{};
-  response.header = peer::MakeHeader(command, sizeof(response));
-  response.header.command = peer::ResponseCommand(command);
-  response.result = static_cast<int>(result);
-  return Transfer(fd, &response, 0, true) ? Status::OK() : Status::Internal("cannot send UBmem response");
+  return impl_->Allocate(fd, header);
 }
 
 }  // namespace kvaf

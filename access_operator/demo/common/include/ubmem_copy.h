@@ -5,7 +5,7 @@
 namespace kvaf::ubmem {
 // Two-bank scheduling follows UnionCopy in vllm-ascend PR #18490 (1b180deb):
 // https://github.com/vllm-project/vllm-ascend/pull/18490
-// Shared by Get, Put and raw-address tests, with arbitrary row sizes within the existing 32 KiB UB.
+// Shared by Get and Put, with arbitrary row sizes within the existing 32 KiB UB.
 // Event IDs 0/1 belong exclusively to this UBmem Get/Put kernel.
 class MteCopyPipeline {
  public:
