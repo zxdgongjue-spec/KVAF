@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <vector>
 #include <sys/wait.h>
@@ -18,12 +19,21 @@ int fail_create = -1, fail_import = -1;
 bool fail_delete = false;
 bool ctp_queried{};
 std::uint32_t expected_token{};
-enum class Fault { None, Post, Poll, CqStatus, LocalAccess, UserContext, Receive, Multiple };
+enum class Fault { None, Post, PartialPost, Poll, CqStatus, LocalAccess, UserContext, Receive, Multiple, InteriorError };
 Fault fault = Fault::None;
 enum class BadLocalSegment { None, ZeroBase, Short, NoWrite, NonPin };
 BadLocalSegment bad_local_segment = BadLocalSegment::None;
 std::uint32_t registered_token{};
-std::uint64_t pending{};
+struct PendingQueue {
+  std::vector<urma_jfs_wr_t*> wrs;
+  std::uint64_t tail{}, last_context{};
+  std::size_t index{};
+  int delay{};
+};
+std::map<urma_jfc_t*, PendingQueue> pending;
+int cqes{}, required_wave_queues{}, fail_post_call{-1};
+bool check_wave{};
+std::uint32_t returned_depth=8192;
 urma_seg_t expected_segment{};
 std::uint8_t expected_jetty_key[p::kChannelCount][64]{};
 struct TpQuery { std::uint32_t flag, mode; std::uint8_t local[16], remote[16]; };
@@ -64,9 +74,9 @@ urma_target_seg_t* urma_import_seg(urma_context_t*,urma_seg_t* seg,urma_token_t*
 urma_status_t urma_unimport_seg(urma_target_seg_t* mr){--imported_mrs;delete mr;return URMA_SUCCESS;}
 urma_jfc_t* urma_create_jfc(urma_context_t*,urma_jfc_cfg_t* cfg){
   Require(ctp_queried&&cfg->depth==16384&&!cfg->flag.bs.lock_free,"reference CQ config and CTP order");
-  ++queues;return new urma_jfc_t{};
+  auto* q=new urma_jfc_t{};pending.emplace(q,PendingQueue{});++queues;return q;
 }
-urma_status_t urma_delete_jfc(urma_jfc_t* q){--queues;delete q;return URMA_SUCCESS;}
+urma_status_t urma_delete_jfc(urma_jfc_t* q){pending.erase(q);--queues;delete q;return URMA_SUCCESS;}
 urma_jfr_t* urma_create_jfr(urma_context_t*,urma_jfr_cfg_t* cfg){
   Require(cfg->token_value.token==registered_token,"CPU RQ shares DDR region token");
   Require(cfg->depth==8192&&cfg->max_sge==1&&cfg->trans_mode==URMA_TM_RM,"reference RQ config");
@@ -78,7 +88,10 @@ urma_jetty_t* urma_create_jetty(urma_context_t*,urma_jetty_cfg_t* cfg){
   Require(!cfg->jfs_cfg.flag.bs.error_suspend&&!cfg->jfs_cfg.flag.bs.lock_free,"reference CPU queue flags");
   Require(cfg->jfs_cfg.priority==15&&cfg->jfs_cfg.rnr_retry==7&&cfg->jfs_cfg.err_timeout==17,"reference 24.12 retry settings");
   if(imports==fail_create)return nullptr;
-  auto* q=new urma_jetty_t{};q->jetty_cfg=*cfg;q->jetty_id.id=10+imports%p::kChannelCount;++queues;return q;
+  auto* q=new urma_jetty_t{};q->jetty_cfg=*cfg;q->jetty_cfg.jfs_cfg.depth=returned_depth;
+  q->jetty_id.id=10+imports%p::kChannelCount;
+  pending.at(cfg->jfs_cfg.jfc).index=imports%p::kChannelCount;
+  ++queues;return q;
 }
 urma_status_t urma_delete_jetty(urma_jetty_t* q){if(fail_delete)return URMA_EINVAL;--queues;delete q;return URMA_SUCCESS;}
 urma_status_t urma_unimport_jetty(urma_target_jetty_t* q){--peers;delete q;return URMA_SUCCESS;}
@@ -97,30 +110,65 @@ urma_target_jetty_t* urma_import_jetty_ex(void*,void* remote,void* token,void* a
   ++peers;++imports;return new urma_target_jetty_t{};
 }
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t* jetty,urma_jfs_wr_t* wr,urma_jfs_wr_t** bad){
-  Require(jetty->jetty_id.id==10,"READ uses reference queue zero");
   ++post_calls;
   if(fault==Fault::Post){*bad=wr;errno=EINVAL;return URMA_EINVAL;}
-  Require(!pending&&wr->opcode==URMA_OPC_READ&&wr->flag.bs.complete_enable,"one signalled READ at a time");
-  Require(wr->flag.bs.comp_order&&wr->flag.bs.place_order==URMA_STRONG_ORDER&&!wr->next,"ordered single READ");
-  Require(wr->rw.src.num_sge==1&&wr->rw.dst.num_sge==1,"one source and destination");
-  const auto& source=*reinterpret_cast<Sge*>(wr->rw.src.sge);
-  const auto& destination=*reinterpret_cast<Sge*>(wr->rw.dst.sge);
-  Require(!source.user_tseg&&!destination.user_tseg,"reference 32-byte SGE tail is null");
-  Require(source.len==destination.len&&source.len<=4096,"respect provider message limit");
-  Require(p::Contains(destination.tseg->seg.len,destination.addr-destination.tseg->seg.ubva.va,destination.len),"destination range");
-  Require(p::Contains(source.tseg->seg.len,source.addr-source.tseg->seg.ubva.va,source.len),"source range");
-  std::memcpy(reinterpret_cast<void*>(destination.addr),reinterpret_cast<void*>(source.addr),source.len);
-  pending=wr->user_ctx;++posts;return URMA_SUCCESS;
+  auto& q=pending.at(jetty->jetty_cfg.jfs_cfg.jfc);
+  std::size_t chain=0;
+  for(auto* current=wr;current;current=current->next){
+    if(fault==Fault::PartialPost&&post_calls==fail_post_call&&chain==1){
+      *bad=current;errno=EIO;return URMA_EINVAL;
+    }
+    Require(++chain<=32,"doorbell chain bounded to 32 WRs");
+    Require(!q.tail&&current->opcode==URMA_OPC_READ,"new wave cannot overwrite pending tail");
+    Require(current->flag.bs.comp_order,"READ completion order required");
+    Require(current->rw.src.num_sge==1&&current->rw.dst.num_sge==1,"one remote and local SGE; no remote gather");
+    Require(current->user_ctx>q.last_context,"completion IDs never reused across waves/cache hits");
+    q.last_context=current->user_ctx;
+    const auto& source=*reinterpret_cast<Sge*>(current->rw.src.sge);
+    const auto& destination=*reinterpret_cast<Sge*>(current->rw.dst.sge);
+    Require(!source.user_tseg&&!destination.user_tseg,"reference 32-byte SGE tail is null");
+    Require(source.len==destination.len&&source.len<=4096,"respect provider message limit");
+    Require(p::Contains(destination.tseg->seg.len,destination.addr-destination.tseg->seg.ubva.va,destination.len),"destination range");
+    Require(p::Contains(source.tseg->seg.len,source.addr-source.tseg->seg.ubva.va,source.len),"source range");
+    if(current->flag.bs.complete_enable){
+      Require(!current->next&&current->flag.bs.place_order==URMA_STRONG_ORDER,"only wave tail signals completion");
+      Require(q.wrs.empty()||current->flag.bs.fence,"multi-READ tail fences preceding READs");
+      q.tail=current->user_ctx;
+    }else{
+      Require(current->flag.bs.place_order==URMA_RELAX_ORDER&&!current->flag.bs.fence,"interior READs can overlap");
+    }
+    q.wrs.push_back(current);++posts;
+    Require(q.wrs.size()<=std::min(1024U,returned_depth),"bounded in-flight wave and returned SQ depth");
+  }
+  return URMA_SUCCESS;
 }
-int urma_poll_jfc(urma_jfc_t*,int capacity,urma_cr_t* cr){
+int urma_poll_jfc(urma_jfc_t* cq,int capacity,urma_cr_t* cr){
   Require(capacity==8,"reference CQ poll batch");
-  Require(pending!=0,"poll follows post");
+  auto& q=pending.at(cq);
+  Require(q.tail!=0,"poll follows tail post");
+  if(check_wave&&required_wave_queues){
+    int active=0;for(auto& item:pending)active+=item.second.tail!=0;
+    Require(active==required_wave_queues,"all Jettys posted before polling any CQ");
+    check_wave=false;
+  }
+  if(q.delay){--q.delay;return 0;} // Other CQs must progress while this one is delayed.
   if(fault==Fault::Poll){errno=EIO;return -1;}
   cr->status=fault==Fault::CqStatus?URMA_CR_REM_ACCESS_ABORT_ERR:URMA_CR_SUCCESS;
-  if(fault==Fault::LocalAccess||fault==Fault::Receive||fault==Fault::Multiple)cr->status=URMA_CR_LOC_ACCESS_ERR;
+  if(fault==Fault::LocalAccess||fault==Fault::Receive||fault==Fault::Multiple||fault==Fault::InteriorError)cr->status=URMA_CR_LOC_ACCESS_ERR;
   cr->flag.bs.s_r=fault==Fault::Receive;
-  cr->user_ctx=fault==Fault::UserContext?pending+1:pending;
-  cr->local_id=17;cr->tpn=23;pending=0;return fault==Fault::Multiple?2:1;
+  cr->user_ctx=fault==Fault::UserContext?q.tail+1:fault==Fault::InteriorError?q.wrs.front()->user_ctx:q.tail;
+  cr->local_id=17;cr->tpn=23;
+  // DMA is deferred until completion, exercising descriptor lifetime and
+  // ensuring later waves/cache reuse cannot mutate in-flight addresses.
+  if(cr->status==URMA_CR_SUCCESS)for(const auto* wr:q.wrs){
+    const auto& source=*reinterpret_cast<const Sge*>(wr->rw.src.sge);
+    const auto& destination=*reinterpret_cast<const Sge*>(wr->rw.dst.sge);
+    std::memcpy(reinterpret_cast<void*>(destination.addr),reinterpret_cast<void*>(source.addr),source.len);
+  }
+  q.tail=0;q.wrs.clear();++cqes;
+  check_wave=std::all_of(pending.begin(),pending.end(),[](const auto& item){return item.second.wrs.empty();});
+  if(fault==Fault::Multiple)cr[1]=cr[0];
+  return fault==Fault::Multiple?2:1;
 }
 }
 p::Endpoint Source(std::vector<std::uint8_t>& memory,std::uint32_t token,bool distinct_eids){
@@ -272,12 +320,103 @@ void BorrowedPoolTest() {
   Require(backend->Close().ok()&&pool.use_count()==1&&local_mrs==0,"close releases registration and lease, not pool allocation");
   (*pool)[0]=7;Require((*pool)[0]==7,"A still owns DDR after B detaches");
 }
+void BulkReadTest(std::size_t count, std::uint32_t depth, bool serial=false) {
+  returned_depth=depth;
+  if(serial)setenv("KVAF_CPU_PULL_SERIAL","1",1);
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  Require(backend->Allocate((count+1)*4096,&cpu).ok(),"bulk pool");
+  std::vector<std::uint8_t> hbm((count+1)*4099);
+  auto source=Source(hbm,cpu.token,true);
+  Require(backend->Open(source,&cpu).ok(),"bulk link");
+  std::vector<p::Span> spans;
+  for(std::size_t i=0;i<count;++i)
+    spans.push_back({(count-1-i)*4099+7,i*4096+3,65+i%1900});
+  required_wave_queues=serial?1:4;
+  for(unsigned round=0;round<3;++round){
+    for(std::size_t i=0;i<hbm.size();++i)hbm[i]=(i*17+round*31)%251;
+    std::memset(reinterpret_cast<void*>(cpu.base),0xa5,cpu.bytes);
+    if(round==2)for(auto& span:spans){span.source+=7;span.destination+=1;--span.bytes;}
+    const int before_posts=posts,before_calls=post_calls,before_cqes=cqes;
+    check_wave=true;
+    for(auto& item:pending)item.second.delay=item.second.index==0?3:0;
+    Require(backend->Read(spans).ok(),"bulk READ completes");
+    std::size_t calls=0,tails=0;
+    const std::size_t channels=serial?1:4,limit=serial?1:std::min(1024U,depth);
+    for(std::size_t remaining=count;remaining;){
+      const auto n=std::min(remaining,channels*limit);
+      for(std::size_t q=0;q<channels;++q){
+        const auto wrs=n/channels+(q<n%channels);
+        calls+=(wrs+31)/32;tails+=wrs!=0;
+      }
+      remaining-=n;
+    }
+    Require(posts-before_posts==int(count)&&post_calls-before_calls==int(calls)&&cqes-before_cqes==int(tails),
+            "one WR per discontiguous source; 32-WR chains; one CQE per active queue per wave");
+    auto* actual=reinterpret_cast<const std::uint8_t*>(cpu.base);
+    std::uint64_t hash=14695981039346656037ULL;
+    for(const auto& span:spans){
+      Require(!std::memcmp(actual+span.destination,hbm.data()+span.source,span.bytes),"bulk/cache/scattered bytes");
+      Require(actual[span.destination-1]==0xa5&&actual[span.destination+span.bytes]==0xa5,"bulk preserves padding");
+      hash=p::Hash(hbm.data()+span.source,span.bytes,hash);
+    }
+    Require(backend->Checksum(spans)==hash,"checksum waits for ALL queue tails including delayed queue zero");
+    auto invalid=spans;invalid.back().destination=invalid.front().destination;
+    const int calls_before=post_calls;
+    Require(!backend->Read(invalid).ok()&&post_calls==calls_before,"overlapping destinations rejected before parallel DMA");
+  }
+  required_wave_queues=0;
+  Require(backend->Close().ok()&&local_mrs==0&&queues==0&&pending.empty(),"bulk cleanup");
+  returned_depth=8192;unsetenv("KVAF_CPU_PULL_SERIAL");
+}
+void BulkFailureTest(Fault injected) {
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  Require(backend->Allocate(512*128,&cpu).ok(),"fault pool");
+  std::vector<std::uint8_t> hbm(512*256,0x93);
+  auto source=Source(hbm,cpu.token,true);
+  Require(backend->Open(source,&cpu).ok(),"fault link");
+  std::vector<p::Span> spans;
+  for(unsigned i=0;i<512;++i)spans.push_back({i*256U,i*128U,64});
+  fault=injected;
+  // Queue zero has four complete chains posted; queue one's first chain
+  // accepts a prefix and fails, while queue zero may still perform DMA.
+  fail_post_call=post_calls+5;
+  const auto result=backend->Read(spans);
+  Require(result.code()==kvaf::StatusCode::kInDoubt,"bulk error quarantines whole transfer");
+  if(injected==Fault::PartialPost){
+    Require(result.message().find("queue=1")!=std::string::npos&&
+            result.message().find("wr_index=1")!=std::string::npos&&
+            result.message().find("bad_wr_is_current=1")!=std::string::npos,"partial-chain failure identifies actual WR and queue");
+  }
+  if(injected==Fault::InteriorError)
+    Require(result.message().find("wr_index=0")!=std::string::npos,"unsignalled error CQE identifies interior READ");
+  const auto calls=post_calls;
+  Require(!backend->Read(spans).ok()&&post_calls==calls&&!backend->Close().ok(),"no retransmit or resource reuse after multi-queue error");
+  Require(queues==12&&peers==4&&local_mrs==1&&imported_mrs==1,"all queue/MR resources retained");
+  // The backend itself may be destroyed by an exception path: in-flight
+  // descriptor storage and transport resources must still remain valid.
+  backend.reset();
+  std::size_t retained=0;
+  for(const auto& item:pending)for(const auto* wr:item.second.wrs){
+    Require(wr->opcode==URMA_OPC_READ&&wr->rw.src.num_sge==1,"quarantined descriptor remains alive");
+    const auto* src=reinterpret_cast<const Sge*>(wr->rw.src.sge);
+    const auto* dst=reinterpret_cast<const Sge*>(wr->rw.dst.sge);
+    Require(src->len==64&&dst->len==64,"quarantined SGE remains alive");++retained;
+  }
+  Require(retained!=0,"failure scenario retains pending DMA on other queues");
+  _exit(0);
+}
 int main(){try{
   BorrowedPoolTest();
   RegistrationFailureTest();
   PartialChannelFailureTest();
   ReadTest(false);
   ReadTest(true);
+  BulkReadTest(257,8192); // Single wave reused, then changed offsets/lengths.
+  BulkReadTest(4096,8192); // Full protocol limit, 1024 WRs per queue.
+  BulkReadTest(512,64); // Returned SQ depth forces waves and storage reuse.
+  BulkReadTest(33,8192,true); // Identical data/correctness under the serial baseline.
   ProbeFailureTest(Fault::LocalAccess);
   ProbeFailureTest(Fault::CqStatus);
   for(auto injected:{Fault::Post,Fault::Poll,Fault::UserContext,Fault::Receive,Fault::Multiple,Fault::LocalAccess}){
@@ -289,6 +428,12 @@ int main(){try{
     const auto child=fork();Require(child>=0,"fork failure scenario");
     if(child==0){fault=injected;try{ReadTest(true);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}
     int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"READ failure scenario passed");
+  }
+  for(auto injected:{Fault::PartialPost,Fault::Poll,Fault::CqStatus,Fault::LocalAccess,
+                     Fault::UserContext,Fault::Receive,Fault::Multiple,Fault::InteriorError}){
+    const auto child=fork();Require(child>=0,"fork bulk failure scenario");
+    if(child==0){try{BulkFailureTest(injected);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}
+    int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"bulk failure scenario passed");
   }
   std::cout<<"CPU URMA READ provider model passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

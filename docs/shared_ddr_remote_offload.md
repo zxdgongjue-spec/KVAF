@@ -119,9 +119,60 @@ CPU candidate。这一点与旧独立 OffloadRuntime 遍历 CPU×NPU 候选组�
 
 KVRP v1 承载共享池控制消息，KVCP v6 和旧 KVOF v2 保持原格式。CPU 和 NPU 均需重新编译。
 A/B/CPU 都是同步单调用方控制接口；同一共享池一次只接受一个尚未完成/确认的 Pull，
-当前仍为 queue 0 串行 READ，不包含多 Jetty 并行优化。每次最多 4096 spans；单个 READ 按
-provider 消息上限（最多 64 KiB）切分。服务保留已关闭 source 的幂等记录，最多接受 4096 次
+同一批内部使用四个 Jetty 并行 READ。每次最多 4096 spans；单个 READ 按
+provider 消息/READ 上限（最多 64 KiB）切分。每个 WQE 只有一个远端源 SGE 和一个本地目标 SGE。
+服务保留已关闭 source 的幂等记录，最多接受 4096 次
 source 注册（包含失败候选）；推荐长驻注册并复用，达到上限后应清理并重启 service。
+
+## CPU Pull 性能验证
+
+CPU 数据面参考 `aicpu-urma@8bc5a2a` 的批量 WRITE 提交方式：每次最多链接 32 个 WQE，
+先向所有活跃 Jetty 提交，再轮询它们的 CQ。每个 Jetty 每轮最多 1024 个 READ（同时受返回的
+SQ depth 限制），只让本轮尾部 WQE 请求 CQE；comp_order 和尾部 READ fence 保证前面的
+READ 完成后才能正常确认该尾部。所有活跃 Jetty 尾部均成功才允许 CommitPut 和 B 复用源。
+错误 CQE（包括非尾部 WQE 的错误）、部分提交失败、异常 CQE、超时均隔离整个传输，保留
+所有队列、MR、SGE/WR 存储和 DDR lease，不重发 READ。
+
+例如 4096 个不超过单条 READ 上限的离散区间：仍需 4096 个 READ WQE，通常为 128 次
+post 调用、4 个成功尾部 CQE。更大 span 会拆成更多 WQE，超过本轮容量后分轮执行。
+这里不使用 WRITE 的本地多 SGE gather：远端离散地址无法由一个源 SGE 描述。
+
+CPU 服务使用 Release 构建，以下两种模式分别启动服务后运行相同测试；切换模式前结束上一轮
+客户端并重启服务。环境变量在 Open 时读取，对共享池及旧 OffloadRuntime 都生效。
+
+```bash
+cmake -S . -B build-cpu-shared-ddr -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu-shared-ddr -j
+
+# 原有串行行为：queue 0，每条 READ 单独提交并等待。
+KVAF_CPU_PULL_SERIAL=1 KVAF_CPU_PULL_PROFILE=1 \
+  ./build-cpu-shared-ddr/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+
+# 批量模式（默认）：四个 Jetty，多 WQE 在途、每个 Jetty 每轮一个尾部 CQE。
+KVAF_CPU_PULL_SERIAL=0 KVAF_CPU_PULL_PROFILE=1 \
+  ./build-cpu-shared-ddr/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+```
+
+上面的 CMake 命令用于已有构建目录，保留其 URMA 等配置。NPU 侧使用当前 Python 扩展：
+
+```bash
+python tests/python/bench_remote_cpu_offload.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --cpu-candidate 0 \
+  --blocks 4096 --block-bytes 656 --warmup 10 --iterations 100
+```
+
+也可用 `--block-bytes 4096`、`65536`、`100001` 比较大小块和拆分后的表现。
+B 默认自动选择经过 scratch READ 校验的 EID，也可以用 `--npu-eid-b` 固定已验证的 CPU↔B EID；
+此测试不使用 A↔B fullmesh 或 AIV 算子。HBM 长驻注册，每轮改变内容并校验完整有效载荷的
+checksum；B 收到提交确认后才写下一轮。
+
+`CPU_PULL_PROFILE` 显示 build/post/cq_wait/total_us、READ WQE 数、post 次数、尾部 CQE 数、
+waves、活跃 Jetty 数和 plan_reused。该 total_us 包含描述符准备、提交和等待，**不包含**
+服务端 checksum、控制 RPC、线程创建或 Meta 提交。`CPU_PULL_BENCH_PASS` 的 Python 时间
+计量 `offload_from()` 至完成，包含这些控制与校验开销；排除注册、生产者写入/Ready 和 Free。
+共享池服务目前仍对 payload 计算完整 checksum，大批量时可能成为端到端耗时的重要部分。
+两种指标应分别比较；不要将 Python effective_GBps 当作纯 READ 带宽。诊断后将 PROFILE
+关闭再测整体性能，可排除额外日志影响。
 
 ## 未决操作与失败处理
 

@@ -36,12 +36,23 @@
 | NPU 队列 | SQ/RQ=1024、CQ=16384、priority=2、rnr_retry=7、err_timeout=16、error_suspend=1 |
 | CPU 队列 | SQ/RQ=8192、CQ=16384、max_sge=min(16,设备上限)、max_rsge=1、lock_free=0、error_suspend=0 |
 | CPU retry 参数 | 使用参考辅助函数中的 URMA_MAX_PRIORITY、URMA_TYPICAL_RNR_RETRY、URMA_TYPICAL_ERR_TIMEOUT；公共 24.12 头文件对应 15、7、17 |
-| READ | queue 0、单源/目的 SGE、STRONG_ORDER、comp_order=1、每条 WR 请求完成通知 |
-| 单次 READ 大小 | min(64 KiB, 设备 max_msg_size)，更大 span 分段提交 |
-| CQ | 每次最多取 8 条，校验 status 与 user_ctx，单条 READ 最长等待 30 秒 |
+| READ | 正式 payload 分配到 4 个 Jetty；每个 WQE 单源/目的 SGE，每次最多链接 32 个 WQE 提交 |
+| 单次 READ 大小 | min(64 KiB, 设备 max_msg_size, 非零 max_read_size)，更大 span 分段提交 |
+| READ 完成 | 每个 SQ 内 comp_order=1；仅本轮尾部 WQE 开启完成通知、STRONG_ORDER，多 WQE 时尾部设置 READ fence |
+| 在途限制 | 每个 Jetty 每轮最多 min(1024, 返回的 SQ depth) 个 READ；所有尾部完成后才重用描述符和开始下一轮 |
+| CQ | 每次最多取 8 条，轮询全部活跃 CQ，校验 status/user_ctx/发送标志；每轮从开始提交计最长等待 30 秒 |
+| 初始化探测 | 始终 queue 0 单条 READ、单个 CQE，保留原有候选回退逻辑 |
 
 `access=1` 使用参考实现的数值约定，公共 24.12 头文件称为 LOCAL_WRITE；不将此位
 混入 NPU 远端访问权限。HBM 权限按参考保留 READ/WRITE/ATOMIC，但本功能只提交 READ。
+
+CPU WRITE 的本地 gather 优化不能直接套用到这里：远端 HBM 地址离散、`max_rsge=1`，
+每个远端连续区间至少需要一个 READ WQE。本次优化减少提交/等待开销，并让多个 READ 在途，
+不把离散源合并成一个 WQE。单轮可容纳且源/目的偏移、长度完全相同的计划会缓存复用；
+每次提交仍分配新的完成序号，候选释放和 scratch probe 会使计划失效。
+
+串行对照开关、性能日志和硬件测试命令见
+[共享 DDR 性能验证](shared_ddr_remote_offload.md#cpu-pull-性能验证)。
 
 配置 EID 用于选择 CTP 路由；MR 和 Jetty key 内的 EID 是 provider 导出的身份。
 二者可以不同，所有导出字节原样交换，不改写为配置 EID。
@@ -61,8 +72,8 @@
    的首次同步 READ。确认 CQ、释放源连接并检查 CPU DDR 的 FNV-1a 校验和后，初始化完成。
 6. 用户调用 `offload(keys, source, offsets, lengths)`：Runtime 校验输入，调用
    PreparePut 预留目标 slots，按步骤 2–4 注册并连接本次源 Tensor，然后 Submit。
-7. CPU 校验 span 范围、slot 边界及目标不重叠，启动工作线程。每段用 queue 0
-   提交 READ，确认 CQ 后处理下一段。全部成功将状态设为 Done。
+7. CPU 校验 span 范围、slot 边界及目标不重叠，启动工作线程。将 READ WQE 分配到四个
+   Jetty，分轮批量提交；等齐本轮所有尾部 CQE 后继续下一轮。全部成功将状态设为 Done。
 8. NPU Query 看到 Done 后，要求 CPU ReleaseSource，确认 CPU 释放源引用和队列；
    NPU 随后注销 HBM、销毁通道，最后 CommitPut，返回成功。CPU DDR 池保留到 Shutdown。
 
@@ -80,7 +91,7 @@ CPU 候选数量通过现有 KVCP GetCandidateCount 查询，KVOF wire ABI 不�
 - 参考读取固定 HBM workspace 的通知和描述符；这里读取调用者传入的连续 Tensor，
   `offsets` 和 `lengths` 都以字节计，不通过额外 HBM staging buffer 搬运用户数据。
 - 参考首次 READ 的目的地址是 CPU 控制区对应偏移；这里使用 DDR slot 0 起始处。
-- 四路连接与参考一致，但当前 payload READ 仅使用 queue 0；未做多路并行性能优化。
+- 四路连接与参考一致，payload READ 使用四路批量提交；探测及串行对照使用 queue 0。
 - CPU DDR 池长期保留；每次任务单独注册源 HBM并重建连接，以支持不同 Tensor。
 - 使用 TCP Submit/Query 传递任务，不引入参考的 CPU WRITE、AICPU scatter、HBM 轮询通知
   或 Decode 数据返回流程。

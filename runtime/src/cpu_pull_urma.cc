@@ -14,10 +14,19 @@
 namespace kvaf::offload {
 namespace {
 // Data-plane baseline: aicpu-urma@8bc5a2a, cpu_push_get_transport.cc.
-// Use its deployed ABI, queue helpers, registration flags and single-SGE READ
-// path. The Offload protocol supplies tensor ranges instead of HBM controls.
+// Keep its deployed ABI/registration/link setup and batched doorbell scheme.
+// Unlike WRITE gather, each READ describes ONE contiguous remote source.
 constexpr std::uint32_t kDepth = 8192;
+constexpr std::size_t kWaveDepth = 1024, kDoorbellWrs = 32;
 constexpr auto kReadTimeout = std::chrono::seconds(30);
+using Clock = std::chrono::steady_clock;
+bool Enabled(const char* name) {
+  const auto* value = std::getenv(name);
+  return value && std::strcmp(value, "1") == 0;
+}
+double Micros(Clock::duration duration) {
+  return std::chrono::duration<double, std::micro>(duration).count();
+}
 std::atomic<std::uint32_t> next_token{1}, next_psn{1};
 std::uint32_t Next(std::atomic<std::uint32_t>& sequence) {
   auto value = ++sequence;
@@ -50,6 +59,8 @@ class UrmaBackend final : public Backend {
     if (!Close().ok()) {
       std::fprintf(stderr, "CPU_PULL: retaining non-quiescent resources\n");
       if (lease_) (void)new std::shared_ptr<void>(std::move(lease_));
+      // Keep descriptors/SGEs as well as MRs and the pool alive on unknown DMA.
+      for (auto& q : queues_) (void)new Queue(std::move(q));
     }
   }
   Status Allocate(std::uint64_t bytes, Endpoint* local) override {
@@ -87,6 +98,7 @@ class UrmaBackend final : public Backend {
       return Error("query device");
     max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
     max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
+    if (attr.dev_cap.max_read_size) max_bytes_ = std::min(max_bytes_, attr.dev_cap.max_read_size);
     if (!max_sge_ || max_bytes_ < 64) return Error("unsupported SGE/message limits");
 
     // Reference order: import HBM, register the receiving host buffer, query
@@ -113,7 +125,6 @@ class UrmaBackend final : public Backend {
       const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, region_token_,
           {16384, kDepth, max_sge_, false, true}, q.cq, q.rq, q.jetty);
       if (error) return Error(error);
-      q.local.reserve(1); q.remote.reserve(1); q.wrs.reserve(1);
       q.peer = urma::ImportJetty(import, context_, source.key[index], region_token_,
           tp, source.tp, local->psn, source.psn);
       if (!q.peer) return Error("import NPU Jetty " + std::to_string(index));
@@ -121,6 +132,8 @@ class UrmaBackend final : public Backend {
       std::memcpy(local->key[index]+sizeof(urma_jetty_id_t), &q.jetty->jetty_cfg.jfs_cfg.trans_mode,
                   sizeof(urma_transport_mode_t));
     }
+    serial_ = Enabled("KVAF_CPU_PULL_SERIAL");
+    profile_ = Enabled("KVAF_CPU_PULL_PROFILE");
     ready_ = true;
     std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_REFERENCE commit=8bc5a2a protocol=%u sge_bytes=%zu "
         "jettys=%u max_sge=%u max_bytes=%u local_eid=%s peer_eid=%s psn=%u peer_psn=%u\n",
@@ -130,62 +143,19 @@ class UrmaBackend final : public Backend {
   }
 
   Status Read(const std::vector<Span>& spans) override {
-    if (poisoned_) return Status::InDoubt(failure_);
-    if (!ready_ || !source_ || !destination_) return Error("READ transport is not ready");
-    if (!ValidateSpans(spans, source_bytes_, bytes_)) return Error("invalid READ spans");
-    // The reference uses queue 0 for all control READs. Offload uses exactly
-    // that path for payload READs as well; no WRITE/scatter kernel is involved.
-    auto& q = queues_[0];
-    for (const auto& span : spans) {
-      for (std::uint64_t offset = 0; offset < span.bytes;) {
-        const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes_, span.bytes-offset));
-        q.local.clear(); q.remote.clear(); q.wrs.clear();
-        q.local.push_back({reinterpret_cast<std::uint64_t>(memory_)+span.destination+offset, length, destination_, nullptr});
-        q.remote.push_back({source_base_+span.source+offset, length, source_, nullptr});
-        urma_jfs_wr_t wr{};
-        wr.opcode = URMA_OPC_READ;
-        wr.flag.bs.comp_order = 1;
-        wr.flag.bs.place_order = URMA_STRONG_ORDER;
-        wr.flag.bs.complete_enable = 1;
-        wr.tjetty = q.peer;
-        wr.user_ctx = ++q.sequence;
-        wr.rw.src = {reinterpret_cast<urma_sge_t*>(q.remote.data()), 1};
-        wr.rw.dst = {reinterpret_cast<urma_sge_t*>(q.local.data()), 1};
-        q.wrs.push_back(wr);
-        q.pending = wr.user_ctx;
-        urma_jfs_wr_t* bad{};
-        errno = 0;
-        const int ret = urma_post_jetty_send_wr(q.jetty, q.wrs.data(), &bad);
-        const int post_errno = errno;
-        if (ret) return ReadFailure("post_read", ret, post_errno, bad);
-        const auto deadline = std::chrono::steady_clock::now() + kReadTimeout;
-        std::uint32_t polls{};
-        while (q.pending) {
-          std::array<urma_cr_t, 8> records{};
-          errno = 0;
-          const int count = urma_poll_jfc(q.cq, records.size(), records.data());
-          const int poll_errno = errno;
-          if (count < 0 || count > static_cast<int>(records.size())) return ReadFailure("poll_cq", count, poll_errno);
-          if (count > 1) return ReadFailure("unexpected_cq_count", count, poll_errno, nullptr, &records[0]);
-          for (int i = 0; i < count; ++i) {
-            const auto& cr = records[i];
-            if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != q.pending || cr.flag.bs.s_r) {
-              // Only this exact send completion retires our sole outstanding
-              // READ. Unknown completions/post/poll failures cannot authorize
-              // fallback, even during initialization.
-              completed_error_ = count == 1 && cr.user_ctx == q.pending &&
-                                 !cr.flag.bs.s_r && cr.status != URMA_CR_SUCCESS;
-              return ReadFailure("cq_completion", count, poll_errno, nullptr, &cr);
-            }
-            q.pending = 0;
-          }
-          if ((++polls & 31) == 0 && q.pending && std::chrono::steady_clock::now() >= deadline)
-            return ReadFailure("cq_timeout", count, poll_errno);
-        }
-        offset += length;
-      }
+    Profile stats;
+    const auto begin = profile_ ? Clock::now() : Clock::time_point{};
+    const auto status = Transfer(spans, serial_, false, profile_ ? &stats : nullptr);
+    if (profile_) {
+      std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE mode=%s status=%u spans=%zu bytes=%llu "
+          "build_us=%.1f post_us=%.1f cq_wait_us=%.1f total_us=%.1f read_wrs=%zu "
+          "post_calls=%zu tail_cqes=%zu waves=%zu active_jettys=%zu plan_reused=%u cpu_threads=1 "
+          "checksum_included=0\n", serial_ ? "serial" : "batch", unsigned(status.code()), spans.size(),
+          static_cast<unsigned long long>(stats.bytes), stats.build_us, stats.post_us, stats.cq_us,
+          Micros(Clock::now()-begin), stats.wrs, stats.posts, stats.cqes, stats.waves,
+          stats.jettys, unsigned(stats.reused));
     }
-    return Status::OK();
+    return status;
   }
 
   Status Probe(const std::vector<Span>& spans) override {
@@ -193,7 +163,8 @@ class UrmaBackend final : public Backend {
     if (spans.size() != 1 || !spans[0].bytes || spans[0].bytes > 64)
       return Error("probe requires one span of at most 64 bytes");
     completed_error_ = false;
-    auto status = Read(spans);
+    // Candidate recovery relies on exactly one posted WR and its terminal CQE.
+    auto status = Transfer(spans, true, true, nullptr);
     if (status.ok() || !completed_error_) return status;
     const auto failure = failure_;
     // The probe received its terminal CQE. Confirm queue/source destruction
@@ -211,7 +182,10 @@ class UrmaBackend final : public Backend {
 
   Status ReleaseSource() override {
     if (poisoned_) return Status::InDoubt(failure_);
+    for (const auto& q : queues_)
+      if (q.pending) return Poison("release while READ completion is unresolved");
     ready_ = false;
+    cached_spans_.clear();
 #define RELEASE(handle, operation) \
     if (handle) { if (operation(handle)) return Poison(#operation); handle = nullptr; }
     // Same queue-first teardown order as cpu_push::Transport::Shutdown.
@@ -273,6 +247,158 @@ class UrmaBackend final : public Backend {
     return hash;
   }
  private:
+  struct Profile {
+    std::uint64_t bytes{};
+    std::size_t wrs{}, posts{}, cqes{}, waves{}, jettys{};
+    double build_us{}, post_us{}, cq_us{};
+    bool reused{};
+  };
+  bool SamePlan(const std::vector<Span>& spans) const {
+    return !cached_spans_.empty() && cached_spans_.size() == spans.size() &&
+        std::equal(spans.begin(), spans.end(), cached_spans_.begin(), [](const Span& a, const Span& b) {
+          return a.source == b.source && a.destination == b.destination && a.bytes == b.bytes;
+        });
+  }
+  void BuildWave(const std::vector<Span>& spans, std::size_t& cursor,
+                 std::uint64_t& offset, std::size_t channels, std::size_t depth) {
+    for (auto& q : queues_) {
+      q.local.clear(); q.remote.clear(); q.wrs.clear();
+    }
+    for (std::size_t n = 0; n < channels*depth && cursor < spans.size(); ++n) {
+      const auto& span = spans[cursor];
+      const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes_, span.bytes-offset));
+      auto& q = queues_[n % channels];
+      q.local.push_back({reinterpret_cast<std::uint64_t>(memory_)+span.destination+offset,
+                         length, destination_, nullptr});
+      q.remote.push_back({source_base_+span.source+offset, length, source_, nullptr});
+      offset += length;
+      if (offset == span.bytes) { ++cursor; offset = 0; }
+    }
+    for (auto& q : queues_) {
+      q.wrs.resize(q.local.size());
+      // Bind pointers only after vectors stop growing; no reallocation until
+      // ALL queue tails have completed. Remote READ SGLs always have one entry.
+      for (std::size_t i = 0; i < q.wrs.size(); ++i) {
+        auto& wr = q.wrs[i];
+        wr = {};
+        wr.opcode = URMA_OPC_READ;
+        wr.flag.bs.comp_order = 1;
+        const bool tail = i+1 == q.wrs.size();
+        wr.flag.bs.place_order = tail ? URMA_STRONG_ORDER : URMA_RELAX_ORDER;
+        wr.flag.bs.complete_enable = tail;
+        // WRITE's tail signalling alone is not the whole READ contract:
+        // explicitly fence the tail against all preceding READs on this SQ.
+        wr.flag.bs.fence = tail && i != 0;
+        wr.tjetty = q.peer;
+        wr.rw.src = {reinterpret_cast<urma_sge_t*>(&q.remote[i]), 1};
+        wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&q.local[i]), 1};
+        wr.next = !tail && (i+1)%kDoorbellWrs ? &q.wrs[i+1] : nullptr;
+      }
+    }
+  }
+  Status PostWave(Profile* stats) {
+    for (std::size_t index = 0; index < queues_.size(); ++index) {
+      auto& q = queues_[index];
+      for (std::size_t first = 0; first < q.wrs.size(); first += kDoorbellWrs) {
+        urma_jfs_wr_t* bad{};
+        errno = 0;
+        const int ret = urma_post_jetty_send_wr(q.jetty, &q.wrs[first], &bad);
+        const int error_number = errno;
+        if (stats) ++stats->posts;
+        // A failing call may have posted a prefix, including other queues.
+        // Do not reset/rebuild any descriptors or authorize source reuse.
+        if (ret) return ReadFailure(index, "post_read", ret, error_number, bad);
+      }
+    }
+    return Status::OK();
+  }
+  Status PollWave(bool probe, Clock::time_point deadline, Profile* stats) {
+    std::uint32_t sweeps{};
+    for (;;) {
+      std::size_t pending = 0;
+      for (std::size_t n = 0; n < queues_.size(); ++n) {
+        const auto index = (next_poll_+n)%queues_.size();
+        auto& q = queues_[index];
+        if (!q.pending) continue;
+        std::array<urma_cr_t, 8> records{};
+        errno = 0;
+        const int count = urma_poll_jfc(q.cq, records.size(), records.data());
+        const int error_number = errno;
+        if (count < 0 || count > static_cast<int>(records.size()))
+          return ReadFailure(index, "poll_cq", count, error_number);
+        if (count > 1) return ReadFailure(index, "unexpected_cq_count", count, error_number, nullptr, &records[0]);
+        if (count) {
+          const auto& cr = records[0];
+          if (cr.status != URMA_CR_SUCCESS || cr.user_ctx != q.pending || cr.flag.bs.s_r) {
+            // Only a single probe's exact terminal error CQE can allow EID
+            // fallback. Any error in a multi-WR payload quarantines ALL queues.
+            completed_error_ = probe && cr.user_ctx == q.pending &&
+                               !cr.flag.bs.s_r && cr.status != URMA_CR_SUCCESS;
+            return ReadFailure(index, "cq_completion", count, error_number, nullptr, &cr);
+          }
+          q.pending = 0;
+          if (stats) ++stats->cqes;
+        }
+        pending += q.pending != 0;
+      }
+      next_poll_ = (next_poll_+1)%queues_.size();
+      if (!pending) return Status::OK();
+      if ((++sweeps & 31) == 0 && Clock::now() >= deadline) {
+        for (std::size_t i = 0; i < queues_.size(); ++i)
+          if (queues_[i].pending) return ReadFailure(i, "cq_timeout", 0, 0);
+      }
+    }
+  }
+  Status Transfer(const std::vector<Span>& spans, bool serial, bool probe, Profile* stats) {
+    if (poisoned_) return Status::InDoubt(failure_);
+    if (!ready_ || !source_ || !destination_) return Error("READ transport is not ready");
+    const bool reuse = !serial && SamePlan(spans);
+    // A cached plan already passed range/overlap validation against these MRs.
+    // Exact equality avoids sorting thousands of unchanged spans every batch.
+    if (!reuse && !ValidateSpans(spans, source_bytes_, bytes_)) return Error("invalid READ spans");
+    std::size_t depth = serial ? 1 : kWaveDepth;
+    for (const auto& q : queues_) {
+      if (q.pending) return Poison("READ while another wave is pending");
+      depth = std::min<std::size_t>(depth, q.jetty->jetty_cfg.jfs_cfg.depth);
+    }
+    if (!depth) return Error("zero READ SQ depth");
+    if (stats) for (const auto& span : spans) stats->bytes += span.bytes;
+    if (!reuse) cached_spans_.clear();
+    std::size_t cursor = 0;
+    std::uint64_t offset = 0;
+    while (cursor < spans.size()) {
+      const auto build_begin = stats ? Clock::now() : Clock::time_point{};
+      const bool first_wave = cursor == 0 && offset == 0;
+      if (reuse) cursor = spans.size();
+      else BuildWave(spans, cursor, offset, serial ? 1 : queues_.size(), depth);
+      // Cache only a single bounded wave, keyed by ALL offsets and lengths.
+      // Larger requests stream through the same storage without growing it.
+      if (!serial && !reuse && first_wave && cursor == spans.size()) cached_spans_ = spans;
+      for (const auto& q : queues_)
+        if (q.sequence > UINT64_MAX-q.wrs.size()) return Error("READ completion sequence exhausted");
+      std::size_t active = 0;
+      for (auto& q : queues_) {
+        if (q.wrs.empty()) continue;
+        for (auto& wr : q.wrs) wr.user_ctx = ++q.sequence;
+        q.pending = q.wrs.back().user_ctx;
+        ++active;
+        if (stats) stats->wrs += q.wrs.size();
+      }
+      const auto post_begin = Clock::now();
+      if (stats) {
+        stats->build_us += Micros(post_begin-build_begin);
+        ++stats->waves; stats->jettys = std::max(stats->jettys, active); stats->reused = reuse;
+      }
+      auto status = PostWave(stats);  // All four queues are posted before polling any CQ.
+      const auto posted = stats ? Clock::now() : Clock::time_point{};
+      if (stats) stats->post_us += Micros(posted-post_begin);
+      if (!status.ok()) return status;
+      status = PollWave(probe, post_begin+kReadTimeout, stats);
+      if (stats) stats->cq_us += Micros(Clock::now()-posted);
+      if (!status.ok()) return status;
+    }
+    return Status::OK();
+  }
   Status ReleaseScratch() {
     if (scratch_mr_) {
       if (urma_unregister_seg(scratch_mr_)) return Poison("unregister scratch probe");
@@ -310,15 +436,20 @@ class UrmaBackend final : public Backend {
     destination_valid_ = true;
     return Status::OK();
   }
-  Status ReadFailure(const char* stage, int ret, int error_number,
+  Status ReadFailure(std::size_t index, const char* stage, int ret, int error_number,
                      const urma_jfs_wr_t* bad = nullptr, const urma_cr_t* cr = nullptr) {
-    const auto& q = queues_[0];
+    const auto& q = queues_[index];
+    std::size_t failed = q.wrs.size()-1;
+    for (std::size_t i = 0; i < q.wrs.size(); ++i)
+      if (bad == &q.wrs[i] || (cr && cr->user_ctx == q.wrs[i].user_ctx)) { failed = i; break; }
     std::ostringstream message;
     message << "stage=" << stage << " ret=" << ret << " errno=" << error_number
-            << " sge_bytes=" << sizeof(urma::Sge) << " wr_id=" << q.pending
-            << " src=0x" << std::hex << q.remote.front().addr << " dst=0x" << q.local.front().addr << std::dec
-            << " bytes=" << q.remote.front().len << " bad_wr_nonnull=" << (bad != nullptr)
-            << " bad_wr_is_current=" << (bad == q.wrs.data());
+            << " sge_bytes=" << sizeof(urma::Sge) << " queue=" << index
+            << " wr_id=" << q.wrs[failed].user_ctx << " pending_tail=" << q.pending
+            << " wave_wrs=" << q.wrs.size() << " wr_index=" << failed
+            << " src=0x" << std::hex << q.remote[failed].addr << " dst=0x" << q.local[failed].addr << std::dec
+            << " bytes=" << q.remote[failed].len << " bad_wr_nonnull=" << (bad != nullptr)
+            << " bad_wr_is_current=" << (bad == &q.wrs[failed]);
     if (cr) message << " cq_status=" << static_cast<unsigned>(cr->status)
                     << " cq_user_ctx=" << cr->user_ctx << " cq_flags=" << unsigned(cr->flag.value)
                     << " local_id=" << cr->local_id << " tpn=" << cr->tpn;
@@ -347,6 +478,9 @@ class UrmaBackend final : public Backend {
   urma_token_id_t* token_{};
   urma_target_seg_t *destination_{}, *source_{};
   std::array<Queue, kChannelCount> queues_;
+  std::vector<Span> cached_spans_;
+  std::size_t next_poll_{};
+  bool serial_{}, profile_{};
   bool ready_{}, poisoned_{}, destination_valid_{}, completed_error_{};
   std::string failure_;
   bool owns_memory_{true};
