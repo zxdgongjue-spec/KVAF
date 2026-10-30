@@ -11,7 +11,7 @@ from __future__ import annotations
 TOKEN_BYTES = 656
 REQUEST_COUNT = 8193             # Try 1024, 8193, 65536; all requests are active.
 WARMUP = 20                     # Excluded from performance results.
-ITERATIONS = 100                # Profile OFF: end-to-end latency and throughput.
+ITERATIONS = 100                # Profile OFF samples; 0 skips E2E for profile debugging.
 PROFILE_SAMPLES = 10            # Profile ON: diagnostic stage samples, separately.
 TABLE_CAPACITY = 256            # Number of remote source blocks.
 TOKENS_PER_BLOCK = 128
@@ -53,16 +53,19 @@ def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
     positive = {
         "TOKEN_BYTES": TOKEN_BYTES, "REQUEST_COUNT": REQUEST_COUNT,
-        "ITERATIONS": ITERATIONS, "TABLE_CAPACITY": TABLE_CAPACITY,
+        "TABLE_CAPACITY": TABLE_CAPACITY,
         "TOKENS_PER_BLOCK": TOKENS_PER_BLOCK,
         "POPULATE_CHUNK_ENTRIES": POPULATE_CHUNK_ENTRIES,
     }
     for name, value in positive.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
-    for name, value in {"WARMUP": WARMUP, "PROFILE_SAMPLES": PROFILE_SAMPLES}.items():
+    for name, value in {"WARMUP": WARMUP, "ITERATIONS": ITERATIONS,
+                        "PROFILE_SAMPLES": PROFILE_SAMPLES}.items():
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
+    if ITERATIONS == 0 and PROFILE_SAMPLES == 0:
+        raise ValueError("ITERATIONS and PROFILE_SAMPLES cannot both be zero")
     if TOKEN_BYTES > 65535 or REQUEST_COUNT > 65536:
         raise ValueError("TOKEN_BYTES must be <= 65535 and REQUEST_COUNT <= 65536")
     if TABLE_CAPACITY > (1 << 31) - 1:
@@ -270,15 +273,19 @@ def main() -> int:
             begin = time.perf_counter_ns()
             batch_get()
             samples_us.append((time.perf_counter_ns() - begin) / 1000)
-        mean_us = statistics.mean(samples_us)
-        print(
-            f"GATHER_PERF_RESULT profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
-            f"mean_us={mean_us:.3f} p50_us={percentile(samples_us, 0.50):.3f} "
-            f"p95_us={percentile(samples_us, 0.95):.3f} p99_us={percentile(samples_us, 0.99):.3f} "
-            f"useful_GiBps={payload_bytes / (mean_us / 1e6) / 1024**3:.3f}",
-            flush=True,
-        )
+        if samples_us:
+            mean_us = statistics.mean(samples_us)
+            print(
+                f"GATHER_PERF_RESULT profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
+                f"mean_us={mean_us:.3f} p50_us={percentile(samples_us, 0.50):.3f} "
+                f"p95_us={percentile(samples_us, 0.95):.3f} p99_us={percentile(samples_us, 0.99):.3f} "
+                f"useful_GiBps={payload_bytes / (mean_us / 1e6) / 1024**3:.3f}",
+                flush=True,
+            )
+        else:
+            print("GATHER_PERF_SKIPPED profile=off reason=iterations_zero", flush=True)
         if PROFILE_SAMPLES:
+            print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={PROFILE_SAMPLES}", flush=True)
             runtime.start_gather_batch_get_profile()
             batch_get()  # Warm the profiling path; exclude this sample.
             snapshots = []

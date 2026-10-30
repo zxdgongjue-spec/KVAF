@@ -12,7 +12,7 @@
 TOKEN_BYTES = 656       # 每条 token 的字节数，不是请求数
 REQUEST_COUNT = 8193   # 每批有效请求数：可改为 1024 / 8193 / 65536
 WARMUP = 20            # 不计入结果的预热次数
-ITERATIONS = 100       # 关闭 profile 的端到端性能采样次数
+ITERATIONS = 100       # 关闭 profile 的端到端性能采样次数，0 可跳过
 PROFILE_SAMPLES = 10   # 开启 profile 的阶段诊断采样次数
 ```
 
@@ -116,3 +116,44 @@ runtime.stop_gather_batch_get_profile()
 
 本地 CPU 模型和 Host 替身只验证计时记录、生命周期及数据语义；CANN 编译、
 计数器频率、远端 DMA 可见性和真实性能仍需目标双机验证。
+
+## 已有端到端结果与 profile 校验失败
+
+`GATHER_PERF_RESULT` 是关闭 AIV/Host profile 的同步调用端到端带宽。旧脚本的
+`operation=batch_get_kernel_total` 则只使用 kernel 时间，比较前须统一计时范围。
+例如 8192 × 656 B 约 5.37 MB，35 GB/s 对应约 154 us；不能直接拿它与含
+Python/Host、CPU gather、控制握手和状态回收的整批延迟比较。8192 与 8193
+的请求数差异仅约 0.012%，无法解释数量级差距。
+
+资源也要对齐：原 direct 的 2 核 × 每核 2 条 Jetty 是四条数据队列；gather
+每核固定一条数据队列和一条控制队列。`KVAF_NPU_CORE_COUNT=2` 可以对齐
+核数，但 gather 仍只有两条数据队列。当前 gather 还逐项构造清单、标量写
+SQ 及 flush；在全部 READ WQE 能放进物理队列时，数据阶段末尾才敲 doorbell。
+原 direct 则已有 SIMT 校验、分批 WQE 构造、UB/MTE 提交和内部流水。
+这些是已确认的实现差别，实际瓶颈仍以阶段数据为准。
+
+`invalid gather profile` 在同步及普通执行状态检查通过后产生。新异常包含
+`reason`、记录 magic/sequence/result/valid_mask、七个原始 cycle、请求数/WR
+数及其状态对照，且在资源清理前保存到异常文本。校验门槛保持不变。
+
+| reason | 可以确定的失败项 |
+| --- | --- |
+| magic / sequence / result / valid_mask | 记录头或完成标记不符合预期 |
+| timestamp_* | 指定的相邻原始时间戳倒序；尚未进行频率换算 |
+| requests / data_wrs | profile 与普通执行状态的计数不一致 |
+
+没有实际字段时，不能将该错误认定为时钟、缓存或 ABI 的某一种故障。
+新的日志用于区分这些方向；本地模型不复现远端设备上的失败。
+
+快速复测时，只改性能脚本顶部：
+
+```python
+WARMUP = 0
+ITERATIONS = 0
+PROFILE_SAMPLES = 1
+```
+
+脚本仍执行 payload/guard 预检，随后跳过端到端性能循环，打印
+`GATHER_PROFILE_PHASE_BEGIN` 并开始阶段采集。失败时保留完整的
+`invalid gather profile ... reason=...` 行。此次诊断增强只修改 Host 和 Python，
+沿用当前 V2 gather kernel；目标机更新后重新构建 Host 即可。

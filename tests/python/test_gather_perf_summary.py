@@ -32,7 +32,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         for field, value in (
             ("TOKEN_BYTES", 0), ("TOKEN_BYTES", 65536),
             ("REQUEST_COUNT", 65537), ("REQUEST_COUNT", True),
-            ("WARMUP", -1), ("ITERATIONS", 0), ("PROFILE_SAMPLES", -1),
+            ("WARMUP", -1), ("ITERATIONS", -1), ("PROFILE_SAMPLES", -1),
             ("TABLE_CAPACITY", 1 << 31), ("TOKENS_PER_BLOCK", 1 << 31),
             ("GATHER_SGL_SIZE", 7), ("SEED", -1),
         ):
@@ -42,6 +42,13 @@ class GatherPerfSummaryTest(unittest.TestCase):
         for cores in (0, 9):
             with self.assertRaises(ValueError):
                 perf.validate_config(cores)
+
+    def test_profile_only_debugging_and_empty_sampling_rejection(self):
+        with patch.object(perf, "WARMUP", 0), patch.object(perf, "ITERATIONS", 0):
+            perf.validate_config(1)
+            with patch.object(perf, "PROFILE_SAMPLES", 0):
+                with self.assertRaisesRegex(ValueError, "both be zero"):
+                    perf.validate_config(1)
 
     def test_clock_requires_explicit_positive_verified_value(self):
         for clock in (None, 50, 1000.0):

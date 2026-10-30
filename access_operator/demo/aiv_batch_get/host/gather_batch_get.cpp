@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <utility>
 
 namespace kvaf {
@@ -204,14 +205,47 @@ Status GatherBatchGet::Impl::CaptureProfile() {
   latest_profile.cores.reserve(config.npu_core_count);
   for (uint32_t i = 0; i < config.npu_core_count; ++i) {
     const auto& p = profiles[i];
-    if (p.magic != KVAF_GATHER_PROFILE_MAGIC || p.sequence != sequence || p.result != KVAF_SEQ_OK ||
-        p.valid_mask != KVAF_GATHER_PROFILE_ALL_EVENTS ||
-        p.kernel_start_cycle > p.input_done_cycle || p.input_done_cycle > p.descriptor_done_cycle ||
-        p.descriptor_done_cycle > p.notify_done_cycle || p.notify_done_cycle > p.ack_done_cycle ||
-        p.ack_done_cycle > p.read_done_cycle || p.read_done_cycle > p.kernel_finish_cycle ||
-        p.requests != statuses[i].requests || p.data_wrs != statuses[i].data_wrs)
-      return Status::Internal("AIV sequential BatchGet: invalid gather profile worker=" +
-                              std::to_string(i) + " sequence=" + std::to_string(sequence));
+    const char* reason = nullptr;
+    if (p.magic != KVAF_GATHER_PROFILE_MAGIC) reason = "magic";
+    else if (p.sequence != sequence) reason = "sequence";
+    else if (p.result != KVAF_SEQ_OK) reason = "result";
+    else if (p.valid_mask != KVAF_GATHER_PROFILE_ALL_EVENTS) reason = "valid_mask";
+    else if (p.kernel_start_cycle > p.input_done_cycle) reason = "timestamp_start_input";
+    else if (p.input_done_cycle > p.descriptor_done_cycle) reason = "timestamp_input_descriptor";
+    else if (p.descriptor_done_cycle > p.notify_done_cycle) reason = "timestamp_descriptor_notify";
+    else if (p.notify_done_cycle > p.ack_done_cycle) reason = "timestamp_notify_ack";
+    else if (p.ack_done_cycle > p.read_done_cycle) reason = "timestamp_ack_read";
+    else if (p.read_done_cycle > p.kernel_finish_cycle) reason = "timestamp_read_finish";
+    else if (p.requests != statuses[i].requests) reason = "requests";
+    else if (p.data_wrs != statuses[i].data_wrs) reason = "data_wrs";
+    if (reason) {
+      // The stream and normal status already passed. Preserve the actual
+      // record in the exception before Shutdown frees it: a generic error here
+      // cannot distinguish missing publication, ABI mismatch, clock ordering
+      // or duplicate request/WR accounting. Never return a partial snapshot.
+      std::ostringstream detail;
+      detail << "AIV sequential BatchGet: invalid gather profile worker=" << i
+             << " sequence=" << sequence << " reason=" << reason
+             << " magic=0x" << std::hex << p.magic
+             << " expected_magic=0x" << KVAF_GATHER_PROFILE_MAGIC << std::dec
+             << " observed_sequence=" << p.sequence << " result=" << p.result
+             << " expected_result=" << KVAF_SEQ_OK
+             << " valid_mask=0x" << std::hex << p.valid_mask
+             << " expected_mask=0x" << KVAF_GATHER_PROFILE_ALL_EVENTS << std::dec
+             << " cycles=[start:" << p.kernel_start_cycle << ",input:" << p.input_done_cycle
+             << ",descriptor:" << p.descriptor_done_cycle << ",notify:" << p.notify_done_cycle
+             << ",ack:" << p.ack_done_cycle << ",read:" << p.read_done_cycle
+             << ",finish:" << p.kernel_finish_cycle << "]"
+             << " requests=" << p.requests << " status_requests=" << statuses[i].requests
+             << " data_wrs=" << p.data_wrs << " status_data_wrs=" << statuses[i].data_wrs
+             << " ack_queries=" << p.ack_queries << " data_wqebbs=" << p.data_wqebbs
+             << " data_doorbells=" << p.data_doorbells
+             << " data_cq_wait_cycles=" << p.data_cq_wait_cycles
+             << " read_build_cycles=" << p.read_build_cycles
+             << " args_bytes=" << sizeof(KvafGatherBatchGetArgs)
+             << " record_bytes=" << sizeof(p);
+      return Status::Internal(detail.str());
+    }
     GatherBatchGetCoreProfile out;
     out.sequence = p.sequence;
     out.kernel_start_cycle = p.kernel_start_cycle;

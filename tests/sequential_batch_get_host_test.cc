@@ -106,7 +106,12 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         p.read_done_cycle = 105;
         p.kernel_finish_cycle = 106;
         p.requests = statuses[i].requests + (fault == 6);
-        p.data_wrs = statuses[i].data_wrs;
+        p.data_wrs = statuses[i].data_wrs + (fault == 7);
+        if (fault == 8) p.input_done_cycle = 99;
+        if (fault == 9) p.descriptor_done_cycle = 100;
+        if (fault == 10) p.notify_done_cycle = 101;
+        if (fault == 11) p.read_done_cycle = 103;
+        if (fault == 12) p.kernel_finish_cycle = 104;
       }
     });
   }
@@ -384,10 +389,20 @@ int main() {
     count = 1;
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
-  for (profile_fault = 1; profile_fault <= 6; ++profile_fault) {
+  const char* profile_reasons[] = {"", "magic", "sequence", "valid_mask", "timestamp_notify_ack",
+      "result", "requests", "data_wrs", "timestamp_start_input", "timestamp_input_descriptor",
+      "timestamp_descriptor_notify", "timestamp_ack_read", "timestamp_read_finish"};
+  for (profile_fault = 1; profile_fault <= 12; ++profile_fault) {
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
-    assert(owner->Execute(exec).code() == StatusCode::kInternal);
+    const auto failure = owner->Execute(exec);
+    assert(failure.code() == StatusCode::kInternal);
+    assert(failure.message().find(std::string("reason=") + profile_reasons[profile_fault] + " ") != std::string::npos);
+    for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
+        "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
+        ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
+        "data_wrs=", "status_data_wrs=", "args_bytes=224", "record_bytes=192"})
+      assert(failure.message().find(field) != std::string::npos);
     GatherBatchGetProfile snapshot;
     assert(!owner->CopyGatherProfile(&snapshot).ok());
     assert(!owner->Execute(exec).ok());
