@@ -1,6 +1,6 @@
 #pragma once
 #include "kernel_operator.h"
-#include "ubmem_batch_abi.h"
+#include "ubmem/batch_abi.h"
 
 namespace kvaf::ubmem {
 // Two-bank scheduling follows UnionCopy in vllm-ascend PR #18490 (1b180deb):

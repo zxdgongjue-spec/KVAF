@@ -6,8 +6,8 @@ list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
 
 set(KVAF_UBMEM_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_put_ubmem.asc")
 set(KVAF_UBMEM_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_batch_put_ubmem.tmp.o")
-set(KVAF_UBMEM_COMMON "${CMAKE_CURRENT_LIST_DIR}/../../common/include")
-list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_UBMEM_COMMON}")
+set(KVAF_OPERATOR_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/../../../include")
+list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_OPERATOR_INCLUDE}")
 
 add_custom_command(
   OUTPUT "${KVAF_EXECUTE_KERNEL_OBJECT}"
@@ -18,7 +18,7 @@ add_custom_command(
   COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_EXECUTE_KERNEL_TMP}" "${KVAF_UBMEM_TMP}"
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_UBMEM_SOURCE}"
-          "${KVAF_UBMEM_COMMON}/ubmem_copy.h" "${KVAF_UBMEM_COMMON}/ubmem_batch_abi.h"
+          "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_put_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_put_internal.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"

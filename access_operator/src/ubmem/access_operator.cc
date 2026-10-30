@@ -1,5 +1,5 @@
 #include "ubmem/access_operator.h"
-#include "ubmem_batch_abi.h"
+#include "ubmem/batch_abi.h"
 #include "ubmem/device_mapping.h"
 #include "peer_link.h"
 #include "meta_manager.h"
