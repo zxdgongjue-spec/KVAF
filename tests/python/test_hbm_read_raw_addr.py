@@ -22,7 +22,11 @@ def producer(pipe, args, ddr_ticket):
     torch.npu.set_device(args.device_b)
     stream = torch.npu.Stream(device=args.device_b)
     hbm_cpu = torch.zeros(SOURCE_BYTES, dtype=torch.uint8, device=f"npu:{args.device_b}")
-    hbm_a = torch.zeros_like(hbm_cpu)
+    # Exercise a contiguous Tensor whose address is deliberately not page aligned.
+    hbm_a_storage = torch.zeros(SOURCE_BYTES + 8192, dtype=torch.uint8, device=f"npu:{args.device_b}")
+    raw_offset = (-hbm_a_storage.data_ptr()) % 4096 + 0xC00
+    hbm_a = hbm_a_storage[raw_offset:raw_offset + SOURCE_BYTES]
+    assert hbm_a.is_contiguous() and hbm_a.data_ptr() % 4096 == 0xC00
     cpu_source = kvaf.HbmSource(args.device_b, args.npu_eid_b_cpu)
     a_source = kvaf.HbmReadSource(args.device_b, args.npu_eid_b_raw)
     try:
@@ -30,7 +34,12 @@ def producer(pipe, args, ddr_ticket):
         ticket = a_source.register(hbm_a)
         port = a_source.listen("127.0.0.1:0")
         pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
-        receive(pipe, "attached")
+        if receive(pipe, "attached") is False:
+            # A failed before publishing any batch and has no unresolved READ.
+            a_source.shutdown()
+            cpu_source.shutdown()
+            pipe.send(("closed", None))
+            return
         assert a_source.connected
         for round_id in range(args.rounds):
             with torch.npu.stream(stream):
@@ -75,9 +84,9 @@ def main():
     parser.add_argument("--device-b", type=int, default=7)
     parser.add_argument("--cpu-candidate", type=int, default=-1)
     parser.add_argument("--npu-eid-a", default="", help="A-to-DDR EID")
-    parser.add_argument("--npu-eid-a-raw", default="", help="A-to-B EID; selected independently")
+    parser.add_argument("--npu-eid-a-raw", default="", help="A fullmesh EID for A-to-B; automatic discovery does not include fullmesh")
     parser.add_argument("--npu-eid-b-cpu", default="")
-    parser.add_argument("--npu-eid-b-raw", default="")
+    parser.add_argument("--npu-eid-b-raw", default="", help="B fullmesh EID for A-to-B; independent of CPU-to-B")
     parser.add_argument("--batch-get-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_kernels.o")
     parser.add_argument("--batch-put-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o")
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
@@ -109,10 +118,13 @@ def main():
     worker = ctx.Process(target=producer, args=(child, args, ticket))
     worker.start()
     child.close()
+    producer_waiting_for_attach = False
     try:
         address, export = receive(parent, "export")
+        producer_waiting_for_attach = True
         region = runtime.attach_hbm(address, export, local_eid=args.npu_eid_a_raw)
-        parent.send(("attached", None))
+        parent.send(("attached", True))
+        producer_waiting_for_attach = False
         stream = torch.npu.Stream(device=args.device_a)
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
         for round_id in range(args.rounds):
@@ -148,6 +160,13 @@ def main():
         print("HBM_RAW_PASS two_b_buffers=1 shared_runtime=1 no_access_table_for_hbm=1", flush=True)
     except BaseException:
         traceback.print_exc()
+        if producer_waiting_for_attach and not runtime.pending_raw_addr and not runtime.pending_offload:
+            try:
+                parent.send(("attached", False))
+                receive(parent, "closed")
+                worker.join(10)
+            except Exception as cleanup_error:
+                print(f"HBM_RAW_STARTUP_CLEANUP_FAILED: {cleanup_error}", flush=True)
         if runtime.pending_raw_addr or runtime.pending_offload or worker.is_alive():
             retain("A raw READ/offload or B source still retained")
         runtime.shutdown()

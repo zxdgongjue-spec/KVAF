@@ -9,7 +9,7 @@ A 沿用现有 `NpuRuntime`：BatchPut/BatchGet 访问 CPU DDR，
 ### B：HbmReadSource
 
 ```python
-source = kvaf.HbmReadSource(device_id=7, npu_eid="")
+source = kvaf.HbmReadSource(device_id=7, npu_eid=b_fullmesh_eid)
 ticket = source.register(hbm_for_a, stream=producer_stream)
 port = source.listen("127.0.0.1:0")
 # 上层把可从 A 访问的 host:port 和 ticket 传给 A，并等待 attach 完成。
@@ -17,6 +17,8 @@ port = source.listen("127.0.0.1:0")
 
 - `register(source, stream=None)`：保留连续的 B NPU Tensor，等待初始化写入完成，返回区域 ticket。
   实际 HCCP MR/target Jetty 在 A—B 协商 EID 时建立。注册至 attach 完成期间不要改写 HBM。
+  Tensor 起点无需按页对齐：底层按 4 KiB 向下对齐注册起点并覆盖 Tensor 的全部字节，
+  发布的源地址仍是 Tensor 的实际导出起点，范围不包括对齐引入的前缀。
 - `listen(address)`：启动 B 进程内的 C++ 控制线程，返回实际端口；端口 0 自动选择。
   当前为 IPv4 `host:port`。跨主机部署可监听 `0.0.0.0`，交给 A 的地址必须是可达地址。
 - `ready(input_offsets, lengths, stream=None)`：等待该生产 stream 上的写入完成，冻结本批数据。
@@ -33,7 +35,7 @@ Python 持有 source Tensor 的强引用直到 shutdown 成功；C++ 调用者�
 ### A：现有 NpuRuntime
 
 ```python
-region = runtime.attach_hbm(b_address, ticket, local_eid="")
+region = runtime.attach_hbm(b_address, ticket, local_eid=a_fullmesh_eid)
 # B 写完后，上层将 ready_batch 传给 A。
 runtime.batch_get_raw_addr(
     region, ready_batch, output=a_output,
@@ -47,6 +49,9 @@ runtime.detach_hbm(region)
 - `attach_hbm(address, export_ticket, local_eid="") -> region`：独立选择 A—B EID 组合，
   导入 B MR、双向绑定 Jetty，执行覆盖所有配置通道的小块 READ/checksum 探测。
   `local_eid` 只约束 A—B 连接，DDR 的 `npu_eids` 配置仍独立。
+  **NPU—NPU 直连需要双方的 fullmesh EID**：分别在 B 的 `HbmReadSource(npu_eid=...)`
+  和 A 的 `attach_hbm(local_eid=...)` 显式传入。当前自动发现仅包含 CLOS/pair-info，
+  尚未发现 fullmesh；留空的候选探测不能替代 fullmesh 配置。
 - `batch_get_raw_addr(region, ready_batch, output, output_offsets, stream=None)`：同步执行直接 READ。
   每段源地址、长度取自 ready_batch；目的地址为 `output.data_ptr() + output_offsets[i]`。
   所有偏移/长度以字节为单位，变长段超过 64 KiB 会拆分为多个 READ。
@@ -109,21 +114,27 @@ cmake -S . -B build-shared-ddr \
 cmake --build build-shared-ddr -j8
 export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/test_hbm_read_raw_addr.py \
-  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --rounds 3
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --rounds 3 \
+  --npu-eid-a-raw '<A_FULLMESH_EID>' \
+  --npu-eid-b-raw '<B_FULLMESH_EID>'
 ```
+
+运行前将两个占位符替换为对应卡的实际 fullmesh EID。
 
 脚本自动启动 B 子进程和 B 的临时控制监听端口。在同一个 A runtime 中逐轮验证：
 
 1. A BatchPut 写入 DDR 的 marker 保持正确。
 2. CPU Pull B HBM₁ 到共享 DDR，A BatchGet 读回并逐字节比较。
 3. A 直接 READ B HBM₂ 的 1/656/100001 字节三段，检查目的位置间隔、padding 和 NPU 消费者可见性。
+   HBM₂ 使用页内偏移为 `0xc00` 的连续 Tensor view，覆盖非页对齐的注册场景。
 4. B 两块缓冲区分别收到确认后复用，内容每轮变化。
 5. 先释放批次、A detach、B shutdown，最后关闭 A runtime。
 
-可独立指定 `--npu-eid-a`（DDR）、`--npu-eid-a-raw`（A—B）、
-`--npu-eid-b-cpu`（CPU—B）、`--npu-eid-b-raw`（A—B）。
+可独立指定 `--npu-eid-a`（DDR）、`--npu-eid-a-raw`（A—B，A 的 fullmesh）、
+`--npu-eid-b-cpu`（CPU—B）、`--npu-eid-b-raw`（A—B，B 的 fullmesh）。
 成功输出 `HBM_RAW_PASS two_b_buffers=1 shared_runtime=1 no_access_table_for_hbm=1`。
 出现 unresolved 时测试会保留进程/缓冲区，需先检查两端日志和确认传输停止。
+若 attach 已明确失败且没有未解决的传输，A 会通知 B 关闭源，避免 B 等待 attached 超时。
 
 本地无 Ascend 硬件时，`kvaf_batch_get_raw_addr_kernel_model_test` 运行实际 AIV 源码的 CPU 模型；
 `kvaf_hbm_read_test` 使用真实 TCP/source/client 与假 ACL/HCCP 验证状态、分段、丢 ACK 和清理。

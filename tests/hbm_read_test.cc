@@ -68,10 +68,12 @@ class Proxy {
 void Check(const Status& s){if(!s.ok())throw std::runtime_error(s.message());}
 int main(){try{
   raw_mode=true;fake_device=0;
-  std::vector<uint8_t> source(400128),output(300000,0xa5);
-  for(size_t i=0;i<source.size();++i)source[i]=(i*17+3)%251;
+  constexpr size_t source_bytes=400128;
+  std::vector<uint8_t> storage(source_bytes+8192,0xee),output(300000,0xa5);
+  auto* source=reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(storage.data())+4095U)&~uintptr_t(4095U))+0xc00;
+  for(size_t i=0;i<source_bytes;++i)source[i]=(i*17+3)%251;
   kvaf::HbmReadSource b(0,"00000000000000000000000000000001");kvaf::HbmReadTicket ticket;
-  Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&ticket));Check(b.Listen("127.0.0.1:0"));
+  Check(b.Register({source,source_bytes,kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&ticket));Check(b.Listen("127.0.0.1:0"));
   Proxy proxy("127.0.0.1:"+std::to_string(b.port()));
   {kvaf::HbmReader failed(0,2,2,2048,"fake.o");kvaf::LinkId rejected{};
     fail_probe_cq=true;
@@ -81,6 +83,8 @@ int main(){try{
     Check(failed.Shutdown());raw_calls=0;}
   kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::LinkId id;
   Check(a.Attach(proxy.address,ticket,"00000000000000000000000000000002",&id));
+  Require(registered_base==reinterpret_cast<uintptr_t>(source)-0xc00 && registered_bytes==source_bytes+0xc00,
+          "register aligned range covering the unaligned Tensor");
   Require(b.connected() && raw_calls==1,"all-lane probe completed");
   { kvaf::HbmReader other(0,2,2,2048,"fake.o");kvaf::LinkId rejected{};
     Require(!other.Attach(proxy.address,ticket,"00000000000000000000000000000002",&rejected).ok(),"reject second reader");
@@ -88,7 +92,11 @@ int main(){try{
   Require(!b.Shutdown().ok(),"cannot unregister connected source");
   auto ready=[&]{kvaf::HbmReadBatch batch;Check(b.Ready({7,100003,250019},{1,656,100001},reinterpret_cast<void*>(1),&batch));return batch;};
   auto out=kvaf::MutableBufferView{output.data(),output.size(),kvaf::DeviceKind::kNpu};
+  kvaf::HbmReadBatch invalid;
+  Require(!b.Ready({source_bytes},{1},reinterpret_cast<void*>(1),&invalid).ok(),"registration padding is not user data");
   auto batch=ready();auto before=raw_calls.load();
+  Require(batch.source_addresses[0]==reinterpret_cast<uintptr_t>(source)+7 && ticket.bytes==source_bytes,
+          "publish Tensor addresses and size, not the page-aligned MR prefix");
   Require(!a.Read(id,batch,out,{0,0,0},reinterpret_cast<void*>(1)).ok(),"overlap rejected before Acquire");
   auto stale=batch;stale.epoch++;Require(!a.Read(id,stale,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"stale epoch rejected");
   auto corrupt=batch;corrupt.source_addresses[0]++;
@@ -96,8 +104,8 @@ int main(){try{
   Require(raw_calls==before && !a.pending(),"invalid request posts nothing");
   Check(a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)));
   Require(raw_calls==before+1 && raw_wqes>=4,"variable lengths split into READs");
-  Require(output[3]==source[7] && std::memcmp(output.data()+101,source.data()+100003,656)==0 &&
-          std::memcmp(output.data()+2000,source.data()+250019,100001)==0 && output[2]==0xa5 && output[102001]==0xa5,"payload and padding");
+  Require(output[3]==source[7] && std::memcmp(output.data()+101,source+100003,656)==0 &&
+          std::memcmp(output.data()+2000,source+250019,100001)==0 && output[2]==0xa5 && output[102001]==0xa5,"payload and padding");
   Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"consumed sequence cannot replay");Check(b.ReleaseBatch());
   batch=ready();proxy.drop=unsigned(hr::Command::Complete);before=raw_calls;
   Require(a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).code()==kvaf::StatusCode::kInDoubt && a.pending(),"lost Complete ACK retains task");

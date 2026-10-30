@@ -23,6 +23,7 @@ constexpr std::uint32_t kRegionToken = 0x13579bdf;
 std::atomic<int> registrations{0}, events{0}, event_waits{0}, reads{0};
 std::atomic<int> sessions{0}, contexts{0}, probe_allocations{0};
 std::atomic<int> cqs{0}, jetties{0}, peer_imports{0};
+std::atomic<std::uint64_t> registered_base{0}, registered_bytes{0};
 int context_error = 0;
 int fail_jetty_at = 0, fail_peer_at = 0;
 bool null_context = false;
@@ -73,6 +74,9 @@ bool LoadDirectHccp(DirectHccpApi* a){
   a->token_alloc=[](void*,TokenId*,void** p){*p=new int;return 0;};
   a->token_free=DestroyWithContext;
   a->lmem_register=[](void*,MrRegInfo* mr,void** p){
+    registered_base=mr->in.mem.addr;registered_bytes=mr->in.mem.size;
+    // Match a provider requiring page-aligned HBM registration starts.
+    if(mr->in.mem.addr & 4095U){*p=nullptr;return 528101;}
     if(raw_mode) raw_token=mr->in.ub.token_value;
     Require(mr->in.ub.token_value==(raw_mode?raw_token:kRegionToken),"HBM registration uses peer token");
     Require(mr->in.ub.flags==0x29c1,"reference HBM registration flags");
