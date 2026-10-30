@@ -27,6 +27,9 @@ int context_error = 0;
 int fail_jetty_at = 0, fail_peer_at = 0;
 bool null_context = false;
 bool auto_mode = false;
+bool raw_mode = false;
+std::uint32_t raw_token = 0;
+int raw_tp_queries = 0;
 std::atomic<int> failed_route{0}, failed_cpu{-1}, corrupt_route{0};
 std::atomic<int> pools{0}, allocations{0}, candidate_queries{0};
 std::mutex attempts_mutex;
@@ -60,6 +63,7 @@ bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* d){*d=fake_device;return true;
 int Destroy(void* p){delete static_cast<int*>(p);return 0;}
 int DestroyWithContext(void*,void* p){return Destroy(p);}
 bool LoadDirectHccp(DirectHccpApi* a){
+  if(raw_mode) raw_tp_queries=0;
   a->ctx_init=[](CtxInitCfg*,CtxInitAttr* attr,void** p){
     Require(Route(attr->ub.eid.raw[15]),"context uses configured route EID");
     if(context_error || null_context){*p=nullptr;return context_error;}
@@ -69,7 +73,8 @@ bool LoadDirectHccp(DirectHccpApi* a){
   a->token_alloc=[](void*,TokenId*,void** p){*p=new int;return 0;};
   a->token_free=DestroyWithContext;
   a->lmem_register=[](void*,MrRegInfo* mr,void** p){
-    Require(mr->in.ub.token_value==kRegionToken,"HBM registration uses CPU region token");
+    if(raw_mode) raw_token=mr->in.ub.token_value;
+    Require(mr->in.ub.token_value==(raw_mode?raw_token:kRegionToken),"HBM registration uses peer token");
     Require(mr->in.ub.flags==0x29c1,"reference HBM registration flags");
     ++registrations;*p=new int;mr->out.key.size=48;
     // Reproduce the hardware case: route EID 1, exported memory EID 3.
@@ -80,7 +85,9 @@ bool LoadDirectHccp(DirectHccpApi* a){
     if(bad_segment==BadSegment::Overflow)base=UINT64_MAX;
     if(bad_segment==BadSegment::Abi)mr->out.key.size=52;
     std::memcpy(mr->out.key.value+20,&base,8);
-    std::memcpy(mr->out.key.value+32,&bytes,8);return 0;
+    std::memcpy(mr->out.key.value+32,&bytes,8);
+    if(raw_mode){std::uint32_t token=0x110000;std::memcpy(mr->out.key.value+44,&token,4);}
+    return 0;
   };
   a->lmem_unregister=[](void*,void* p){--registrations;return Destroy(p);};
   a->cq_create=[](void*,CqInfo* info,void** p){
@@ -89,7 +96,7 @@ bool LoadDirectHccp(DirectHccpApi* a){
   };
   a->cq_destroy=[](void*,void* p){--cqs;return Destroy(p);};
   a->qp_create=[](void*,QpCreateAttr* attr,QpCreateInfo* info,void** p){
-    Require(attr->ub.token_value==kRegionToken,"NPU Jetty uses CPU region token");
+    Require(attr->ub.token_value==(raw_mode?raw_token:kRegionToken),"NPU Jetty uses CPU region token");
     Require(attr->sq_depth==1024&&attr->rq_depth==1024&&attr->ub.priority==2&&
             attr->ub.rnr_retry==7&&attr->ub.err_timeout==16&&attr->ub.jfs_flag==JfsFlagErrorSuspend(),
             "reference NPU queue configuration");
@@ -100,18 +107,19 @@ bool LoadDirectHccp(DirectHccpApi* a){
   a->qp_unimport=[](void*,void* p){--peer_imports;return Destroy(p);};
   a->get_tp_info_async=[](void*,GetTpCfg* cfg,TpInfo* info,std::uint32_t* count,void** p){
     Require(Route(cfg->local_eid.raw[15])&&cfg->peer_eid.raw[15]==2,"CTP uses route EIDs, not memory EIDs");
-    Require(jetties==0&&cqs==0,"reference queries CTP before creating NPU queues");
-    info->tp_handle=1;*count=1;*p=new int;return 0;
+    Require(raw_mode || (jetties==0&&cqs==0),"reference queries CTP before creating NPU queues");
+    info->tp_handle=raw_mode?1+raw_tp_queries++:1;*count=1;*p=new int;return 0;
   };
   a->get_async_req_result=[](void* p,int* result){*result=0;return Destroy(p);};
   return true;
 }
 void CloseDirectHccp(DirectHccpApi* a){*a={};}
 bool ImportPeerJetty(const DirectHccpApi&,void*,const std::uint8_t* key,std::uint32_t,std::uint32_t token,
-    std::uint64_t,std::uint64_t,std::uint32_t tx,std::uint32_t rx,const char*,QpImportInfoT*,void** p){
+    std::uint64_t local_tp,std::uint64_t peer_tp,std::uint32_t tx,std::uint32_t rx,const char*,QpImportInfoT*,void** p){
   Require(key[15]==4,"CPU Jetty identity is not rewritten with CPU route EID");
-  Require(token==kRegionToken,"NPU imports CPU Jetty with region token");
+  Require(token==(raw_mode?raw_token:kRegionToken),"NPU imports CPU Jetty with region token");
   Require(tx==1&&rx==2,"reference NPU/CPU PSNs");
+  if(raw_mode)Require(local_tp==1+peer_imports && peer_tp==2+peer_imports,"one corresponding TP pair per NPU Jetty");
   Require(key[20]==10+peer_imports,"all four CPU keys imported in order");
   ++peer_imports;
   *p=new int;return peer_imports!=fail_peer_at;

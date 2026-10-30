@@ -47,6 +47,7 @@ struct DirectMemory {
   std::uint32_t token_value{0};
   std::uint8_t key[kMemKeyBytes]{};
   std::uint32_t key_bytes{0};
+  std::array<std::uint8_t, kEidBytes> wqe_eid{};
 };
 
 // NPU-side resources shared by the BatchGet and BatchPut transport teardown.

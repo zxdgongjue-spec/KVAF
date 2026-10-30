@@ -22,8 +22,8 @@ if(KVAF_ENABLE_CPU_OFFLOAD)
 endif()
 
 if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_CPU_OFFLOAD)
-  target_sources(_kvaf PRIVATE src/acl_python_utils.cc src/npu_python_runtime.cc)
-  target_link_libraries(_kvaf PRIVATE kvaf_npu_runtime "${KVAF_ASCENDCL_LIBRARY}")
+  target_sources(_kvaf PRIVATE src/acl_python_utils.cc src/npu_python_runtime.cc src/hbm_read_python.cc)
+  target_link_libraries(_kvaf PRIVATE kvaf_npu_runtime kvaf_hbm_read_source "${KVAF_ASCENDCL_LIBRARY}")
   target_include_directories(_kvaf PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
 endif()
 

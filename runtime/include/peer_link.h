@@ -19,6 +19,9 @@ struct PeerRegion {
   uint32_t token_value = 0U;
   uint32_t segment_key_bytes = 0U;
   std::array<uint8_t, kEidBytes> eid{};
+  // HBM memory identity can differ from its CTP route EID.
+  bool has_memory_eid{false};
+  std::array<uint8_t, kEidBytes> memory_eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
 };
 
@@ -34,6 +37,7 @@ struct PeerCandidateInfo {
 class PeerLink {
  public:
   explicit PeerLink(std::string address);
+  virtual ~PeerLink() = default;
 
   const std::string& address() const { return address_; }
   bool has_region() const { return !regions_.empty(); }
@@ -44,8 +48,8 @@ class PeerLink {
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status ReleaseRegion(uint64_t base);
-  Status LookupRegion(uint64_t base, PeerRegion* region) const;
-  Status CreateChannel(
+  virtual Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  virtual Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
       uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,

@@ -1,4 +1,4 @@
-add_library(kvaf_execute_batch_get_host SHARED batch_get_host.cpp execute_batch_get_loader.cpp)
+add_library(kvaf_execute_batch_get_host SHARED batch_get_host.cpp execute_batch_get_loader.cpp execute_batch_get_raw_addr_loader.cpp)
 target_include_directories(kvaf_execute_batch_get_host
   PUBLIC "${KVAF_AIV_DEMO_INCLUDE_DIR}"
   PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include")
@@ -9,7 +9,7 @@ target_link_libraries(kvaf_execute_batch_get_host PRIVATE
   kvaf_direct_hccp_session
   kvaf_peer_link
   -Wl,--no-as-needed c_sec unified_dlog ascendc_runtime ascendalog ascendcl runtime error_manager dl pthread)
-add_dependencies(kvaf_execute_batch_get_host kvaf_execute_batch_get_kernel)
+add_dependencies(kvaf_execute_batch_get_host kvaf_execute_batch_get_kernel kvaf_execute_batch_get_raw_addr_kernel)
 add_custom_command(TARGET kvaf_execute_batch_get_host POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:kvaf_execute_batch_get_host>"

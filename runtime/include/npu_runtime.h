@@ -8,6 +8,7 @@
 
 #include "runtime.h"
 #include "remote_offload.h"
+#include "hbm_read.h"
 
 namespace kvaf {
 
@@ -25,6 +26,7 @@ struct NpuRuntimeOptions {
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
+  std::string batch_get_raw_addr_kernel_object_path;
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{2U};
   std::uint32_t jettys_per_core{2U};
@@ -75,6 +77,15 @@ class NpuRuntime final : public Runtime {
   Status ResolveOffload();
   bool pending_offload() const;
   Status LastOffloadChecksum(std::uint64_t*) const;
+
+  // B's second HBM: direct READ spans, no AccessTable or DDR metadata.
+  Status AttachHbm(const std::string& address, const HbmReadTicket&, LinkId*,
+                   const std::string& local_eid = "");
+  Status BatchGetRawAddr(LinkId, const HbmReadBatch&, MutableBufferView output,
+                         const std::vector<std::uint64_t>& output_offsets, void* stream);
+  Status ResolveRawAddr(LinkId); // Never resubmits DMA; retries control/cleanup only.
+  Status DetachHbm(LinkId);
+  bool pending_raw_addr() const;
 
   std::uint32_t device_id() const;
   std::uint32_t npu_core_count() const;

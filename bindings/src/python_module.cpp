@@ -1,3 +1,4 @@
+#include "hbm_read_python.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -401,6 +402,7 @@ PYBIND11_MODULE(_kvaf, m) {
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_CPU_OFFLOAD)
   kvaf::BindNpuPythonRuntime(m);
+  kvaf::BindHbmReadSource(m);
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   kvaf::BindAclGraph(m);

@@ -309,6 +309,7 @@ bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
   memory->token_id = wqe_token_id;
   memory->token_value = region.token_value;
   memory->key_bytes = region.segment_key_bytes;
+  memory->wqe_eid = region.has_memory_eid ? region.memory_eid : region.eid;
   std::memcpy(memory->key, region.segment_key.data(), memory->key_bytes);
   std::memcpy(peer_eid->data(), region.eid.data(), peer_eid->size());
   return true;

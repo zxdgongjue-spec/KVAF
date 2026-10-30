@@ -54,3 +54,7 @@ if hasattr(_native, "AclGraph"):
 if hasattr(_native, "HbmSource"):
     HbmSource = _native.HbmSource
     __all__.append("HbmSource")
+
+if hasattr(_native, "HbmReadSource"):
+    HbmReadSource = _native.HbmReadSource
+    __all__.append("HbmReadSource")

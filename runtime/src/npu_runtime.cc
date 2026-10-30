@@ -1,5 +1,8 @@
 #include "npu_runtime.h"
 #include "npu_eid_discovery.h"
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#include "hbm_read_client.h"
+#endif
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
 #include "remote_pull_operator.h"
 #endif
@@ -143,6 +146,9 @@ struct NpuRuntime::Impl {
     }
   }
 
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  std::unique_ptr<HbmReader> hbm_reader;
+#endif
   NpuRuntimeOptions options;
   AccessOperatorConfig config;
   std::unique_ptr<MetaManager> meta_manager;
@@ -711,6 +717,55 @@ Status NpuRuntime::LastOffloadChecksum(std::uint64_t* checksum) const {
 #endif
 }
 
+Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ticket,
+                             LinkId* region, const std::string& local_eid) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (!initialized()) return Status::NotInitialized("initialize NpuRuntime before attach_hbm");
+  if (!impl_->hbm_reader) {
+    auto kernel = impl_->options.batch_get_raw_addr_kernel_object_path;
+    if (kernel.empty()) {
+      const auto& get = impl_->options.batch_get_kernel_object_path;
+      const auto slash = get.find_last_of('/');
+      kernel = (slash == std::string::npos ? std::string{} : get.substr(0, slash + 1)) +
+          "kvaf_execute_batch_get_raw_addr_kernels.o";
+    }
+    impl_->hbm_reader = std::make_unique<HbmReader>(device_id(), npu_core_count(), jettys_per_core(),
+        impl_->options.batch_get_max_inflight_total, kernel);
+  }
+  return impl_->hbm_reader->Attach(address, ticket, local_eid, region);
+#else
+  return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
+#endif
+}
+Status NpuRuntime::BatchGetRawAddr(LinkId region, const HbmReadBatch& batch, MutableBufferView output,
+                                  const std::vector<std::uint64_t>& offsets, void* stream) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach B HBM before raw READ");
+  return impl_->hbm_reader->Read(region, batch, output, offsets, stream);
+#else
+  return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
+#endif
+}
+Status NpuRuntime::ResolveRawAddr(LinkId region) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->hbm_reader) return impl_->hbm_reader->Resolve(region);
+#endif
+  return Status::NotInitialized("no HBM reader");
+}
+Status NpuRuntime::DetachHbm(LinkId region) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->hbm_reader) return impl_->hbm_reader->Detach(region);
+#endif
+  return Status::NotInitialized("no HBM reader");
+}
+bool NpuRuntime::pending_raw_addr() const {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  return impl_->hbm_reader && impl_->hbm_reader->pending();
+#else
+  return false;
+#endif
+}
+
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }
@@ -739,6 +794,9 @@ Status NpuRuntime::ServeConnection(int) {
 
 Status NpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->hbm_reader) { auto status = impl_->hbm_reader->Shutdown(); if (!status.ok()) return status; }
+#endif
   const auto source_status = ReleaseOffloadSource(); if (!source_status.ok()) return source_status;
   Status status;
   if (impl_->runtime_core && impl_->runtime_core->initialized()) {

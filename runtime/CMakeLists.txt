@@ -8,7 +8,7 @@ target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
 add_library(kvaf_offload_control STATIC src/offload_client.cc src/offload_service.cc
-  src/remote_pull_client.cc src/remote_pull_service.cc)
+  src/remote_pull_client.cc src/remote_pull_service.cc src/hbm_read_protocol.cc)
 target_include_directories(kvaf_offload_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kvaf_offload_control PUBLIC kvaf_common pthread)
@@ -47,6 +47,11 @@ if(KVAF_ENABLE_CPU_OFFLOAD)
 endif()
 
 if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_CPU_OFFLOAD)
+  add_library(kvaf_hbm_read_source STATIC src/hbm_read_source.cc)
+  target_include_directories(kvaf_hbm_read_source PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
+  target_link_libraries(kvaf_hbm_read_source PUBLIC kvaf_runtime
+    PRIVATE kvaf_offload_control kvaf_peer_link kvaf_direct_hccp_session "${KVAF_ASCENDCL_LIBRARY}" ${CMAKE_DL_LIBS})
   add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
   target_include_directories(kvaf_npu_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_get/include
@@ -58,6 +63,8 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_CPU_OFFLOAD)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_remote_offload)
   endif()
   if(KVAF_ENABLE_AIV_BATCH_GET)
+    target_sources(kvaf_npu_runtime PRIVATE src/hbm_read_client.cc)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_offload_control kvaf_direct_hccp_session)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator kvaf_execute_batch_get_host)
   endif()

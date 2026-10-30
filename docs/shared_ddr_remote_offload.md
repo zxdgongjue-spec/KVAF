@@ -173,3 +173,8 @@ python tests/python/test_remote_cpu_offload.py \
 本地已覆盖真实 Core/协议/Exporter 编排的模拟测试，以及借用 DDR 的 URMA provider 模型测试。
 这些测试不代替硬件验收；尤其是同一 allocation 的两份 MR 注册、A/B 各自路由和实际 NPU
 cache 可见性，需要在上述双卡环境中验证。
+
+## A 直接读取 B 的第二块 HBM
+
+独立的裸地址读取路径及接口见 [hbm_raw_addr_read.md](hbm_raw_addr_read.md)。
+A 沿用同一个 NpuRuntime；该路径不使用 DDR MetaManager 或 AccessTable。

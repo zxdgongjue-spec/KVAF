@@ -75,3 +75,27 @@ add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_EXECUTE_KERNEL_OBJECT}"
           "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_kernels.o")
+
+set(KVAF_RAW_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_raw_addr_aiv.asc")
+set(KVAF_RAW_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_raw_addr.tmp.o")
+set(KVAF_RAW_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_raw_addr_kernels.o")
+add_custom_command(
+  OUTPUT "${KVAF_RAW_KERNEL_OBJECT}"
+  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${KVAF_RAW_KERNEL_SOURCE}" -o "${KVAF_RAW_KERNEL_TMP}"
+          --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
+          -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
+          -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
+          -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
+  COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${KVAF_RAW_KERNEL_TMP}" -static
+          -o "${KVAF_RAW_KERNEL_OBJECT}"
+  DEPENDS "${KVAF_RAW_KERNEL_SOURCE}"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_raw_addr_abi.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
+          "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+  VERBATIM)
+add_custom_target(kvaf_execute_batch_get_raw_addr_kernel ALL DEPENDS "${KVAF_RAW_KERNEL_OBJECT}")
+add_custom_command(TARGET kvaf_execute_batch_get_raw_addr_kernel POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_RAW_KERNEL_OBJECT}"
+          "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_raw_addr_kernels.o")

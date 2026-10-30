@@ -18,6 +18,7 @@ aclError aclrtFree(void*);
 aclError aclrtMemset(void*, std::size_t, int, std::size_t);
 aclError aclrtCreateStream(aclrtStream*);
 aclError aclrtDestroyStream(aclrtStream);
+aclError aclrtSynchronizeStream(aclrtStream);
 aclError aclrtCreateEvent(aclrtEvent*);
 aclError aclrtRecordEvent(aclrtEvent, aclrtStream);
 aclError aclrtSynchronizeEvent(aclrtEvent);

@@ -435,7 +435,7 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
                             &state->peer_memory, &peer_eid)) {
     goto failed;
   }
-  wqe_remote_eid = ReverseEidForAivWqe(peer_eid);
+  wqe_remote_eid = ReverseEidForAivWqe(state->peer_memory.wqe_eid);
   if (!hccp::LoadDirectHccp(&state->api)) goto failed;
   if (!hccp::AcquireDirectHccpSession(physical_device_id, kPidHdcType, &state->session)) {
     goto failed;
@@ -633,4 +633,91 @@ extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_bu
 
 extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport) {
   ReleaseTransport(transport);
+}
+
+// The raw-address path retires registrations before returning caller buffers.
+// Every successful release nulls its handle, so partial failures are retryable.
+extern "C" int32_t KvafBatchGetLocalBufferDiscard(KvafBatchGetLocalBuffer **handle) {
+  if (!handle || !*handle) return KVAF_BATCH_GET_SUCCESS;
+  auto* local = *handle;
+  auto* t = local->transport;
+  if (!t || local->reference_count > 1) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  for (size_t i = 0; i < local->path_registrations.size(); ++i) {
+    auto& r = local->path_registrations[i];
+    auto* context = t->paths[i].device_context;
+    if (r.memory.handle) {
+      if (t->api.lmem_unregister(context, r.memory.handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      r.memory.handle = nullptr;
+    }
+    if (r.token_handle) {
+      if (t->api.token_free(context, r.token_handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      r.token_handle = nullptr;
+    }
+  }
+  if (local->device_entities) {
+    if (aclrtFree(local->device_entities) != ACL_SUCCESS) return KVAF_BATCH_GET_RUNTIME_ERROR;
+    local->device_entities = nullptr;
+  }
+  auto it = std::find_if(t->local_buffers.begin(), t->local_buffers.end(),
+      [local](const auto& p) { return p.get() == local; });
+  if (it == t->local_buffers.end()) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  t->local_buffers.erase(it);
+  *handle = nullptr;
+  return KVAF_BATCH_GET_SUCCESS;
+}
+
+extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport **handle) {
+  if (!handle || !*handle) return KVAF_BATCH_GET_SUCCESS;
+  auto* t = *handle;
+  for (auto& b : t->local_buffers) if (b->reference_count) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  for (uint32_t i = 0; i < t->worker_count; ++i) {
+    auto& w = t->workers[i];
+    auto* context = t->paths[w.path_index].device_context;
+    if (w.device_peer_target_jetty) {
+      if (t->api.qp_unimport(context, w.device_peer_target_jetty)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      w.device_peer_target_jetty = nullptr;
+    }
+    if (w.device_user_ctl_jetty.handle) {
+      if (t->api.qp_destroy(w.device_user_ctl_jetty.handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      w.device_user_ctl_jetty.handle = nullptr;
+    }
+    if (w.device_user_ctl_cq) {
+      if (t->api.cq_destroy(context, w.device_user_ctl_cq)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      w.device_user_ctl_cq = nullptr;
+    }
+  }
+  while (!t->local_buffers.empty()) {
+    auto* local = t->local_buffers.back().get();
+    if (KvafBatchGetLocalBufferDiscard(&local)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  }
+  for (auto& p : t->paths) {
+    if (p.device_peer_memory_import) {
+      if (t->api.rmem_unimport(p.device_context, p.device_peer_memory_import)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      p.device_peer_memory_import = nullptr;
+    }
+    if (p.device_transport_token_handle) {
+      if (t->api.token_free(p.device_context, p.device_transport_token_handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      p.device_transport_token_handle = nullptr;
+    }
+    if (p.device_context) {
+      if (t->api.ctx_deinit(p.device_context)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      p.device_context = nullptr;
+    }
+  }
+  if (t->session) hccp::ReleaseDirectHccpSession(t->session);
+  hccp::CloseDirectHccp(&t->api);
+  delete t; *handle = nullptr;
+  return KVAF_BATCH_GET_SUCCESS;
+}
+
+extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport *t) {
+  if (!t) return KVAF_BATCH_GET_SUCCESS;
+  for (uint32_t i = 0; i < t->worker_count; ++i) {
+    auto& jetty = t->workers[i].device_user_ctl_jetty;
+    if (jetty.handle) {
+      if (t->api.qp_destroy(jetty.handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      jetty.handle = nullptr;
+    }
+  }
+  return KVAF_BATCH_GET_SUCCESS;
 }

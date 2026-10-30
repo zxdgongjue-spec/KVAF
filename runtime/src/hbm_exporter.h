@@ -56,7 +56,8 @@ class Exporter {
  public:
   p::Endpoint descriptor{};
   ~Exporter() { if (!Close().ok()) std::fprintf(stderr, "OFFLOAD: quarantined HBM export\n"); }
-  Status Open(const ConstBufferView& input, const std::string& eid, const p::Endpoint& cpu) {
+  Status Open(const ConstBufferView& input, const std::string& eid, const p::Endpoint& cpu,
+              bool npu_peer = false) {
     std::uint32_t physical{};
     if (!cpu.token) return Error("CPU Allocate omitted region token; rebuild both Offload peers");
     if (!ParseEid(eid, descriptor.eid)) return Status::InvalidArgument("npu_eid must contain 32 hex digits");
@@ -150,8 +151,9 @@ class Exporter {
       descriptor.key_bytes = key.size;
       std::memcpy(descriptor.key[index], key.value, key.size);
     }
-    std::fprintf(stderr, "[KVAF_NPU] CPU_PULL_REFERENCE commit=8bc5a2a protocol=%u jettys=%u "
+    std::fprintf(stderr, "[KVAF_NPU] %s commit=8bc5a2a protocol=%u jettys=%u "
         "physical=%u npu_eid=%s cpu_eid=%s hbm_flags=0x%x psn=%u\n",
+        npu_peer ? "HBM_READ_EXPORT" : "CPU_PULL_REFERENCE",
         p::kVersion, p::kChannelCount, physical, EidHex(descriptor.eid).c_str(), EidHex(cpu.eid).c_str(),
         mr.in.ub.flags, descriptor.psn);
     return Status::OK();
@@ -167,7 +169,48 @@ class Exporter {
     }
     return Status::OK();
   }
-  Status Ready(void* stream) {
+  // NPU initiators export 32-byte keys, unlike the CPU's 28-byte keys.
+  // Keep both provider identities opaque and use route EIDs only for CTP.
+  Status BindNpuChannel(std::size_t index, const p::Endpoint& peer) {
+    if (index >= channels_.size() || peer.key_bytes != 32 ||
+        peer.token != descriptor.token || !peer.tp || !peer.psn)
+      return Error("invalid NPU READ initiator");
+    // A's BatchGet requests one CTP for every initiator Jetty. Keep the
+    // corresponding B CTP per channel rather than reusing the CPU-pull TP.
+    if (!npu_tp_handles_[index]) {
+      if (index == 0) {
+        npu_tp_handles_[index] = descriptor.tp;
+      } else {
+        tp_info_ = {}; tp_count_ = 1;
+        if (api_.get_tp_info_async(context_, &tp_cfg_, &tp_info_, &tp_count_, &async_) || !async_)
+          return Error("submit NPU channel CTP query");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (async_) {
+          auto status = PollTp();
+          if (status.code() != StatusCode::kBusy) {
+            if (!status.ok()) return status;
+            break;
+          }
+          if (std::chrono::steady_clock::now() >= deadline)
+            return Status::InDoubt("NPU channel CTP query pending");
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        npu_tp_handles_[index] = descriptor.tp;
+      }
+    }
+    h::QpImportInfoT info{};
+    if (!h::ImportPeerJetty(api_, context_, peer.key[0], peer.key_bytes,
+        peer.token, npu_tp_handles_[index], peer.tp, descriptor.psn, peer.psn,
+        "npu_raw_read_target", &info, channels_[index]->peer_jetty_output()))
+      return Error("import NPU READ initiator");
+    return Status::OK();
+  }
+  p::Endpoint NpuChannelDescriptor(std::size_t index) const {
+    auto result = descriptor;
+    if (index < npu_tp_handles_.size()) result.tp = npu_tp_handles_[index];
+    return result;
+  }
+  static Status Ready(void* stream) {
     if (!stream) return Status::InvalidArgument("Offload requires a producer ACL stream");
     aclrtEvent event{};
     if (aclrtCreateEvent(&event) != ACL_SUCCESS) return Error("create producer event");
@@ -205,6 +248,7 @@ class Exporter {
   h::DirectHccpSession* session_{};
   void *context_{}, *token_{}, *mr_{}, *async_{};
   std::array<std::unique_ptr<h::TargetChannel>, p::kChannelCount> channels_;
+  std::array<std::uint64_t, p::kChannelCount> npu_tp_handles_{};
   h::GetTpCfg tp_cfg_{};
   h::TpInfo tp_info_{};
   std::uint32_t tp_count_{1};

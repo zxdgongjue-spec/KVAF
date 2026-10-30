@@ -98,3 +98,18 @@ target_compile_definitions(kvaf_remote_offload_test PRIVATE KVAF_ENABLE_CPU_OFFL
 target_link_libraries(kvaf_remote_offload_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
 add_test(NAME kvaf_remote_offload_test COMMAND kvaf_remote_offload_test)
 set_tests_properties(kvaf_remote_offload_test PROPERTIES TIMEOUT 30)
+
+add_executable(kvaf_batch_get_raw_addr_kernel_model_test batch_get_raw_addr_kernel_model_test.cc)
+target_include_directories(kvaf_batch_get_raw_addr_kernel_model_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+add_test(NAME kvaf_batch_get_raw_addr_kernel_model_test COMMAND kvaf_batch_get_raw_addr_kernel_model_test)
+
+add_executable(kvaf_hbm_read_test hbm_read_test.cc
+  ../runtime/src/hbm_read_source.cc ../runtime/src/hbm_read_client.cc)
+target_include_directories(kvaf_hbm_read_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+target_link_libraries(kvaf_hbm_read_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
+add_test(NAME kvaf_hbm_read_test COMMAND kvaf_hbm_read_test)
+set_tests_properties(kvaf_hbm_read_test PROPERTIES TIMEOUT 45)

@@ -1,3 +1,4 @@
+#include "hbm_read_python.h"
 #include "npu_python_runtime.h"
 
 #include <pybind11/stl.h>
@@ -226,7 +227,7 @@ class NpuPythonRuntime final {
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
                    bool enable_cpu_offload, std::int64_t cpu_candidate,
-                   std::uint32_t offload_timeout_ms) {
+                   std::uint32_t offload_timeout_ms, std::string raw_kernel) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -245,10 +246,12 @@ class NpuPythonRuntime final {
     options.enable_cpu_offload = enable_cpu_offload;
     options.cpu_candidate = cpu_candidate < 0 ? UINT32_MAX : static_cast<std::uint32_t>(cpu_candidate);
     options.offload_timeout_ms = offload_timeout_ms;
+    options.batch_get_raw_addr_kernel_object_path = std::move(raw_kernel);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
 
   ~NpuPythonRuntime() {
+    if (!native_->Shutdown().ok()) (void)raw_retained_.release();
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
     if (!native_->Shutdown().ok()) (void)local_source_.release();
 #endif
@@ -292,6 +295,39 @@ class NpuPythonRuntime final {
   bool PendingOffload() const { return native_->pending_offload(); }
   std::uint64_t LastChecksum() const { std::uint64_t hash{}; ThrowIfError(native_->LastOffloadChecksum(&hash)); return hash; }
 #endif
+
+  std::uint64_t AttachHbm(const std::string& address, const py::dict& ticket, const std::string& eid) {
+    LinkId region{};
+    auto status = native_->AttachHbm(address, hbm_read_python::Ticket(ticket), &region, eid);
+    if (!status.ok()) throw std::runtime_error(status.message() + "; region=" + std::to_string(region));
+    return region;
+  }
+  void BatchGetRawAddr(LinkId region, const py::dict& batch, py::object output,
+                       const py::object& output_offsets, py::object stream) {
+    if (native_->pending_raw_addr()) throw py::value_error("resolve the pending raw READ first");
+    const auto view = GetNpuTensorView(output, "output");
+    if (output.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
+      throw py::value_error("raw READ output belongs to another NPU");
+    std::vector<std::uint64_t> offsets;
+    CopyCpuUint64SequenceInto(output_offsets, "output_offsets", &offsets);
+    const auto ready = hbm_read_python::Batch(batch);
+    if (stream.is_none()) stream = py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
+    if (py::hasattr(stream, "device") && stream.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
+      throw py::value_error("raw READ stream belongs to another NPU");
+    const auto acl_stream = acl_python::StreamFromPython(stream);
+    raw_retained_ = py::make_tuple(output, stream);
+    const auto status = native_->BatchGetRawAddr(region, ready,
+        {const_cast<void*>(view.data), view.bytes, DeviceKind::kNpu}, offsets, acl_stream);
+    if (!native_->pending_raw_addr()) raw_retained_ = py::none();
+    ThrowIfError(status);
+  }
+  void ResolveRawAddr(LinkId region) {
+    const auto status = native_->ResolveRawAddr(region);
+    if (!native_->pending_raw_addr()) raw_retained_ = py::none();
+    ThrowIfError(status);
+  }
+  void DetachHbm(LinkId region) { ThrowIfError(native_->DetachHbm(region)); }
+  bool PendingRawAddr() const { return native_->pending_raw_addr(); }
 
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
@@ -558,6 +594,7 @@ class NpuPythonRuntime final {
   }
 
  private:
+  py::object raw_retained_{py::none()};
   std::unique_ptr<::kvaf::NpuRuntime> native_;
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   py::object local_source_{py::none()};
@@ -581,7 +618,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>, std::uint32_t, bool, std::int64_t, std::uint32_t>(),
+                    std::string, std::vector<std::string>, std::uint32_t, bool, std::int64_t, std::uint32_t, std::string>(),
            py::arg("batch_get_kernel_object_path") = "",
            py::arg("batch_get_token_bytes") = 0,
            py::arg("batch_get_tokens_per_block") = 0, py::arg("device_id") = 0,
@@ -596,7 +633,15 @@ void BindNpuPythonRuntime(py::module_& module) {
                std::vector<std::string>{},
            py::arg("batch_get_max_inflight_total") = 2048,
            py::arg("enable_cpu_offload") = false, py::arg("cpu_candidate") = -1,
-           py::arg("offload_timeout_ms") = 30000)
+           py::arg("offload_timeout_ms") = 30000,
+           py::arg("batch_get_raw_addr_kernel_object_path") = "")
+      .def("attach_hbm", &NpuPythonRuntime::AttachHbm, py::arg("address"), py::arg("export_ticket"), py::arg("local_eid") = "")
+      .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawAddr,
+           py::arg("region"), py::arg("ready_batch"), py::arg("output"), py::arg("output_offsets"), py::arg("stream") = py::none(),
+           "Synchronously READ B HBM into A output using explicit addresses and byte lengths; no AccessTable.")
+      .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("region"))
+      .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("region"))
+      .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
       .def("offload", &NpuPythonRuntime::Offload, py::arg("keys"), py::arg("source"),
            py::arg("input_offsets"), py::arg("lengths"), py::arg("stream") = py::none())
