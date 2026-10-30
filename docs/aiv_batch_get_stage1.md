@@ -1,5 +1,46 @@
 # AIV BatchGet 第一阶段实现与验证
 
+## Scatter 二进制的 AIV 类型声明
+
+PID 44853 的 body 故障二进制（FNV-1a `0x785d2472e65330cf`）虽然包含
+`.ascend.meta.KvafScatterBatchGetAivKernelV1` NOTE section，但其 40 B 内容
+仅有 tag 12、7、8、9、10，缺少 `F_TYPE_KTYPE=1`。独立 AIV kernel 的类型
+条目应为 `tag=1, length=4, value=3 (K_TYPE_AIV)`，小端字节是
+`01000400 03000000`。开头的 `0c000400 01000000` 是 tag 12 的值 1，
+并不声明核类型；section 名存在也不能证明包含类型条目。
+
+Scatter 现在按 [CANN 独立 AIV 下发示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/comm_op_dev_guide/aiv_comm_op_dev/op_dispatch.md)
+显式导出 `FunLevelKType`，与 direct BatchGet/BatchPut 的方式一致。
+本次只修正二进制类型声明，不同时调整 InitSocState、DataCopy 或同步，
+也不覆盖调用方选择的 probe。缺少声明已由实际字节确认；它是否导致此次
+`errcode=78 / MTE_ERROR=0x4000`，仍需按下面的顺序在硬件上验证。
+
+在目标 Linux 机器上，先保留原产物，再重编并检查实际选择的 `.o`：
+
+```bash
+mkdir -p results
+cp -n build-npu/bin/kvaf_scatter_batch_get_kernels.o results/scatter-before-aiv-meta.o
+cmake --build build-npu -j
+python tests/python/aiv_kernel_metadata.py build-npu/bin/kvaf_scatter_batch_get_kernels.o
+readelf -x .ascend.meta.KvafScatterBatchGetAivKernelV1 build-npu/bin/kvaf_scatter_batch_get_kernels.o
+```
+
+检查器无需 CANN，直接解析 ELF section 和 TLV，同时接受 NOTE / PROGBITS，
+要求目标函数恰好含一个 `K_TYPE_AIV(3)`。只有通过才打印 `AIV_METADATA_OK`。
+scatter 测试入口也在导入 NPU 后端之前执行同一检查；这只证明二进制类型
+声明正确，不表示硬件测试通过。新产物指纹会变化，旧的 `fixedPCOffset=0xa24`
+只能用于原产物，不能直接套到重编结果。
+
+沿用有效的 CPU 服务、EID、Get/Put kernel 路径等环境，先复测 32 B body，
+通过后再测默认 656 B load，保留各自日志中的新指纹和设备异常摘要：
+
+```bash
+KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=32 \
+  python -u tests/python/diagnose_aiv_scatter.py --stages setup gm body
+KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
+  python -u tests/python/diagnose_aiv_scatter.py --stages dma ub load
+```
+
 ## load 故障的独立诊断入口
 
 `tests/python/diagnose_aiv_scatter.py` 默认实际执行 load，不会替换为 done。它为每个

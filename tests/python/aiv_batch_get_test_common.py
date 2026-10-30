@@ -94,6 +94,16 @@ def run(mode: str) -> int:
     probe = os.environ.get("KVAF_AIV_SCATTER_PROBE", "") if mode == "cpu_push_scatter" else ""
     if probe and probe not in SCATTER_PROBES:
         raise ValueError("scatter probe must be " + "/".join(SCATTER_PROBES))
+    if mode == "cpu_push_scatter":
+        from aiv_kernel_metadata import check_aiv_kernel_metadata
+        try:
+            check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                f"scatter AIV metadata check failed: {error}; binary={kernel}. "
+                "Rebuild the scatter kernel with its K_TYPE_AIV declaration.") from error
+        print(f"[KVAF_TEST] AIV_METADATA_OK kernel=KvafScatterBatchGetAivKernelV1 "
+              f"type=K_TYPE_AIV(3) binary={kernel}", flush=True)
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids

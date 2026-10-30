@@ -14,8 +14,11 @@
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
 #include "sequential_batch_get_abi.h"
+// The CPU model exercises the kernel body, without Ascend ELF section placement.
+#define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_scatter_batch_get_aiv.asc"
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_gather_batch_get_aiv.asc"
+#undef __attribute__
 
 namespace {
 using namespace kvaf_scatter;

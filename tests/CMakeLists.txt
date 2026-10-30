@@ -87,6 +87,8 @@ foreach(mode scatter gather)
 endforeach()
 add_test(NAME kvaf_aiv_mode_isolation_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_mode_isolation.py")
+add_test(NAME kvaf_aiv_kernel_metadata_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_kernel_metadata.py")
 add_test(NAME kvaf_scatter_probe_result_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_probe_result.py")
 add_test(NAME kvaf_scatter_diagnostics_python
