@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <utility>
 #define __global__
@@ -15,12 +16,50 @@
 #define LAUNCH_BOUND(n)
 inline unsigned model_core;
 inline std::array<std::uint8_t, kvaf::ubmem::kMteBufferBytes> model_ub;
-inline std::function<void()> model_mte2, model_mte3;
 inline std::function<void()> model_simt;
 inline bool model_simt_ready = false;
 inline void ModelCheck(bool condition) { if (!condition) std::abort(); }
+struct ModelTransfer {
+  std::uint64_t begin, end;
+  std::function<void()> execute;
+};
+struct ModelMtePipe {
+  std::deque<ModelTransfer> pending;
+  std::uint64_t issued = 0, completed = 0, scalar_visible = 0;
+  std::size_t peak_pending = 0;
+  explicit operator bool() const { return !pending.empty(); }
+  bool Overlaps(std::uint64_t begin, std::uint64_t end) const {
+    for (const auto& op : pending)
+      if (begin < op.end && op.begin < end) return true;
+    return false;
+  }
+  void Push(std::uint64_t begin, std::uint64_t end, std::function<void()> action) {
+    pending.push_back({begin, end, std::move(action)});
+    ++issued;
+    if (pending.size() > peak_pending) peak_pending = pending.size();
+  }
+  void CompleteThrough(std::uint64_t ticket) {
+    ModelCheck(ticket <= issued);
+    while (completed < ticket) {
+      auto action = std::move(pending.front().execute);
+      pending.pop_front();
+      action();
+      ++completed;
+    }
+  }
+};
+inline ModelMtePipe model_mte2, model_mte3;
+inline bool model_mte_overlap = false;
+struct ModelEvent { bool armed = false; std::uint64_t ticket = 0; };
+inline std::array<std::array<ModelEvent, 2>, 4> model_events;
+inline bool ModelEventsIdle() {
+  for (const auto& direction : model_events)
+    for (const auto& event : direction)
+      if (event.armed) return false;
+  return true;
+}
 enum pipe_t { PIPE_S, PIPE_V };
-enum event_t { EVENT_ID0 };
+enum event_t { EVENT_ID0, EVENT_ID1 };
 inline void set_flag(pipe_t, pipe_t, event_t) {}
 inline void wait_flag(pipe_t from, pipe_t to, event_t) {
   if (from == PIPE_S && to == PIPE_V) {
@@ -52,17 +91,34 @@ void VF_CALL(Dim3 dimensions, Args... args) {
 }
 }
 inline unsigned GetBlockIdx() { return model_core; }
-inline std::uint64_t GetSystemCycle() { static std::uint64_t tick = 0; return ++tick; }
+inline std::uint64_t GetSystemCycle() {
+  // The ending timestamp must follow a scalar-visible completion fence, not
+  // merely cross-pipe waits protecting the two UB banks.
+  ModelCheck(!model_mte2 && !model_mte3 && !model_simt);
+  ModelCheck(model_mte3.scalar_visible == model_mte3.issued);
+  static std::uint64_t tick = 0;
+  return ++tick;
+}
 enum class TPosition { VECIN };
 enum class HardEvent { S_MTE2, MTE2_MTE3, MTE3_MTE2, MTE3_S };
-template <HardEvent> void SetFlag(unsigned) {}
-template <HardEvent event> void WaitFlag(unsigned) {
+template <HardEvent event> void SetFlag(unsigned id) {
+  ModelCheck(id < 2);
+  auto& flag = model_events[static_cast<unsigned>(event)][id];
+  ModelCheck(!flag.armed);
+  flag.armed = true;
+  if constexpr (event == HardEvent::MTE2_MTE3) flag.ticket = model_mte2.issued;
+  else if constexpr (event != HardEvent::S_MTE2) flag.ticket = model_mte3.issued;
+}
+template <HardEvent event> void WaitFlag(unsigned id) {
+  ModelCheck(id < 2);
+  auto& flag = model_events[static_cast<unsigned>(event)][id];
+  ModelCheck(flag.armed);
+  flag.armed = false;
   if constexpr (event == HardEvent::MTE2_MTE3) {
-    ModelCheck(static_cast<bool>(model_mte2));
-    auto action = std::move(model_mte2); model_mte2 = {}; action();
+    model_mte2.CompleteThrough(flag.ticket);
   } else if constexpr (event == HardEvent::MTE3_MTE2 || event == HardEvent::MTE3_S) {
-    ModelCheck(static_cast<bool>(model_mte3));
-    auto action = std::move(model_mte3); model_mte3 = {}; action();
+    model_mte3.CompleteThrough(flag.ticket);
+    if constexpr (event == HardEvent::MTE3_S) model_mte3.scalar_visible = flag.ticket;
   }
 }
 template <typename T> struct GlobalTensor {
@@ -92,18 +148,24 @@ std::uint8_t* UbAddress(const LocalTensor<T>& tensor, const DataCopyExtParams& c
 template <typename T>
 void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
                  const DataCopyExtParams& copy, const DataCopyPadExtParams<T>&) {
-  ModelCheck(!model_mte2 && !model_mte3);  // UB is not still being read by MTE3.
   auto* ub = UbAddress(dst, copy);
-  model_mte2 = [ub, src, copy] {
+  const auto begin = dst.address_.bufferAddr;
+  const auto end = begin + (copy.blockLen + 31U) / 32U * 32U;
+  ModelCheck(!model_mte2.Overlaps(begin, end) && !model_mte3.Overlaps(begin, end));
+  model_mte2.Push(begin, end, [ub, src, copy] {
     std::memcpy(ub, src.data, copy.blockLen);
     std::memset(ub + copy.blockLen, 0xA5, (copy.blockLen + 31U) / 32U * 32U - copy.blockLen);
-  };
+  });
+  model_mte_overlap |= static_cast<bool>(model_mte3);
 }
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src, const DataCopyExtParams& copy) {
-  ModelCheck(!model_mte2 && !model_mte3);  // MTE2 must have finished producing UB.
   auto* ub = UbAddress(src, copy);
-  model_mte3 = [ub, dst, copy] { std::memcpy(dst.data, ub, copy.blockLen); };
+  const auto begin = src.address_.bufferAddr;
+  const auto end = begin + (copy.blockLen + 31U) / 32U * 32U;
+  ModelCheck(!model_mte2.Overlaps(begin, end));  // This bank must be ready.
+  model_mte3.Push(begin, end, [ub, dst, copy] { std::memcpy(dst.data, ub, copy.blockLen); });
+  model_mte_overlap |= static_cast<bool>(model_mte2);
 }
 }
 struct FunLevelKType { struct { unsigned type, bytes, kind; } value; };

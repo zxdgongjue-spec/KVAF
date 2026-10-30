@@ -14,8 +14,8 @@
 using namespace kvaf::ubmem;
 std::uint64_t Address(const void* p) { return reinterpret_cast<std::uintptr_t>(p); }
 
-void CheckRawKernel(void (*kernel)(RawCopyArgs), unsigned rows, unsigned cores, bool random) {
-  constexpr unsigned bytes = 656, tokens = 8192;
+void CheckRawKernel(void (*kernel)(RawCopyArgs), unsigned rows, unsigned cores, bool random,
+                    unsigned bytes = 656, unsigned tokens = 8192) {
   std::vector<std::uint8_t> remote(tokens * bytes), local(rows * bytes + 32, 0xD3);
   for (std::size_t i = 0; i < remote.size(); ++i) remote[i] = TestPattern(i, 19);
   std::mt19937_64 generator(20260903);
@@ -26,10 +26,18 @@ void CheckRawKernel(void (*kernel)(RawCopyArgs), unsigned rows, unsigned cores, 
   RawCopyArgs args{Address(requests.data()), Address(reports.data()), rows, bytes, cores};
   for (model_core = 0; model_core < cores; ++model_core) {
     reports[model_core].cycles = reports[model_core].completed = UINT64_MAX;
+    model_mte2.peak_pending = 0;
+    model_mte_overlap = false;
     kernel(args);
     CHECK(!model_simt && !model_simt_ready && !model_mte2 && !model_mte3);
+    CHECK(ModelEventsIdle());
     CHECK(reports[model_core].completed == rows / cores + (model_core < rows % cores));
     CHECK(reports[model_core].cycles == 1);  // Model tick, never a performance estimate.
+    if (kernel == KvafUbmemRawMteKernel &&
+        reports[model_core].completed * ((bytes + kMteBufferBytes / 2 - 1) / (kMteBufferBytes / 2)) >= 2) {
+      CHECK(model_mte2.peak_pending == 2);
+      CHECK(model_mte_overlap);  // A ready bank can write while the other read is pending.
+    }
   }
   for (std::size_t row = 0; row < rows; ++row) {
     CHECK(offsets[row] % bytes == 0 && offsets[row] <= remote.size() - bytes);
@@ -44,13 +52,19 @@ void CheckRawKernel(void (*kernel)(RawCopyArgs), unsigned rows, unsigned cores, 
   }
   auto next = perf::MakeRequests(requests, Address(remote.data()), Address(local.data() + 16),
       tokens, bytes, random, 2, generator);
-  CHECK(next != offsets);
+  CHECK(rows == 0 || next != offsets);
 }
 
 int main() {
   for (auto kernel : {KvafUbmemRawMteKernel, KvafUbmemRawSimtKernel}) {
     CheckRawKernel(kernel, 4096, 3, true);  // Uneven core assignment, random source addresses.
     CheckRawKernel(kernel, 2, 4, false);   // Idle cores still produce reports.
+    for (unsigned rows = 0; rows <= 5; ++rows)
+      CheckRawKernel(kernel, rows, 1, false);  // Empty, one-bank, odd/even drains and reuse.
+    for (unsigned bytes : {1U, 31U, 32U, 33U, 655U, 657U, kMteBufferBytes / 2 - 1,
+                           kMteBufferBytes / 2, kMteBufferBytes / 2 + 1,
+                           kMteBufferBytes + 17})
+      CheckRawKernel(kernel, 7, 2, true, bytes, 64);  // Padding, chunk tails and cross-row banks.
   }
   std::mt19937_64 generator(0);
   std::vector<RawCopyRequest> requests(3);
@@ -61,5 +75,5 @@ int main() {
   CHECK(perf::Percentile({10, 20, 30, 40}, 0.5) == 25);
   CHECK(perf::Percentile({10, 20, 30, 40}, 0.9) == 37);
   CHECK(perf::Percentile({10}, 0.99) == 10);
-  std::puts("UBmem raw MTE/SIMT GET: 4096x656 bytes, direct address plans, guards, completion and bandwidth units passed");
+  std::puts("UBmem raw MTE/SIMT GET: 4096x656, double-buffer dependencies, chunk tails, drains, guards and bandwidth units passed");
 }
