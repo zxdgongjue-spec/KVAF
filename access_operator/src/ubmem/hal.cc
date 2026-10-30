@@ -63,14 +63,13 @@ Status Mapping::ReserveAndMap() {
   return Status::OK();
 }
 
-Status Mapping::AllocateHost(std::uint64_t bytes, int numa, FabricHandle* descriptor) {
+Status Mapping::AllocateHost(std::uint64_t bytes, FabricHandle* descriptor) {
   if (handle_ != nullptr || descriptor == nullptr || bytes == 0 || bytes % kPageBytes != 0 ||
-      bytes > std::numeric_limits<std::size_t>::max() || numa < -1) {
-    return Status::InvalidArgument("Host DDR requires a 2-MiB-aligned size and numa >= -1");
+      bytes > std::numeric_limits<std::size_t>::max()) {
+    return Status::InvalidArgument("Host DDR requires a 2-MiB-aligned size");
   }
-  // MEM_HOST[_NUMA]_SIDE, MEM_HUGE_PAGE_TYPE, MEM_P2P_DDR_TYPE.
-  MemoryProperty prop{numa < 0 ? 0U : 2U, numa < 0 ? 0U : static_cast<std::uint32_t>(numa),
-                      0, 1, 3, 0};
+  // MEM_HOST_SIDE, MEM_HUGE_PAGE_TYPE, MEM_P2P_DDR_TYPE.
+  MemoryProperty prop{0, 0, 0, 1, 3, 0};
   int ret = hal_->create(&handle_, bytes, &prop, 0);
   if (ret != 0) return HalError("halMemCreate(Host P2P DDR)", ret);
   bytes_ = bytes;

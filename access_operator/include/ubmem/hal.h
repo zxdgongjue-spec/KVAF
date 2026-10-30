@@ -55,7 +55,7 @@ class Mapping {
   Mapping(const Mapping&) = delete;
   Mapping& operator=(const Mapping&) = delete;
 
-  Status AllocateHost(std::uint64_t bytes, int numa_node, FabricHandle* descriptor);
+  Status AllocateHost(std::uint64_t bytes, FabricHandle* descriptor);
   Status Close();
   std::uint64_t address() const { return reinterpret_cast<std::uintptr_t>(address_); }
   std::uint64_t bytes() const { return bytes_; }

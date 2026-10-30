@@ -48,7 +48,7 @@ CpuRuntime::CpuRuntime() = default;
 CpuRuntime::~CpuRuntime() { (void)Shutdown(); }
 Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (impl_) return Status::InvalidState("CpuRuntime already initialized");
-  if ((options.has_eid_index && options.ub_device.empty()) || options.numa_node < -1)
+  if (options.has_eid_index && options.ub_device.empty())
     return Status::InvalidArgument("invalid CPU runtime options");
   impl_ = std::make_unique<Impl>(options);
   return Status::OK();

@@ -30,8 +30,7 @@ struct UbmemCpuBackend::Impl {
   std::uint64_t& next_session;
   std::string library;
   Impl(const CpuRuntimeOptions& options, std::uint64_t& next)
-      : next_session(next), library(options.hal_library), numa(options.numa_node) {}
-  int numa = -1;
+      : next_session(next), library(options.hal_library) {}
 
   Status Allocate(int fd, const peer::MessageHeader& header) {
     peer::AllocateUbmemRegionRequest request{};
@@ -51,7 +50,7 @@ struct UbmemCpuBackend::Impl {
     const auto mapping_bytes = invalid ? 0 : (request.ddr_bytes + kPageBytes - 1) / kPageBytes * kPageBytes;
     Status status = invalid ? Status::InvalidArgument("DDR bytes must be a multiple of slot_size")
                             : hal->Load(library);
-    if (status.ok()) status = region->AllocateHost(mapping_bytes, numa, &handle);
+    if (status.ok()) status = region->AllocateHost(mapping_bytes, &handle);
     response.result = static_cast<int>(status.ok() ? peer::Result::kOk : peer::Result::kResourceError);
     if (status.ok()) {
       response.session_id = next_session++;
@@ -60,9 +59,9 @@ struct UbmemCpuBackend::Impl {
       response.mapping_bytes = region->bytes();
       std::memcpy(response.fabric_handle, handle.data(), handle.size());
       regions.emplace(response.session_id, std::move(region));
-      std::fprintf(stderr, "[KVAF_UBMEM] DDR_EXPORTED session=%llu bytes=%llu numa=%d\n",
+      std::fprintf(stderr, "[KVAF_UBMEM] DDR_EXPORTED session=%llu bytes=%llu\n",
           static_cast<unsigned long long>(response.session_id),
-          static_cast<unsigned long long>(response.peer_length), numa);
+          static_cast<unsigned long long>(response.peer_length));
     } else {
       std::snprintf(response.error_message, sizeof(response.error_message), "%s", status.message().c_str());
     }
