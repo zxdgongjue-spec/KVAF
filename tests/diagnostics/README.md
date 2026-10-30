@@ -1,9 +1,23 @@
-# READ QoS evidence
+# NPU UB port traffic
 
-Use `collect_read_qos.py` to collect the actual server's driver identity, EID-bound
-QoS configuration, live Jetty queries and per-VL TX/RX bandwidth where available.
-See [READ request/response SL and VL confirmation](read_qos.md) for commands,
-the HDC-versus-Host namespace distinction, and the limits of each kind of evidence.
+Use `npu_port_stat.py` alongside BatchGet to sample A5 NPU UB port TX/RX
+bandwidth through `hccn_tool`, with optional CTP packet rates and raw flit rates.
+See [NPU port sampling](npu_port_stat.md) for device discovery, commands and
+measurement scope. CPU-side `ubctl` chip/controller IDs are not NPU device IDs.
+
+# CPU-side URMA information and port/VL bandwidth
+
+Run both tools on the CPU server. Use `collect_read_qos_info.py` once per
+environment/configuration to collect local URMA/UBASE driver identity, EID-bound
+QoS configuration and optional CPU driver source excerpts in `report.json` and
+raw files. Use `collect_read_qos.py` for each workload to sample one or more devices
+concurrently, pairing `--urma-device` and `--eid` values in order. Raw `perf_*.txt`
+and timing/status go under `<output>/<device>/`; the root `sampling.log` records
+overall status. Devices sharing a controller reuse the same samples. Neither tool
+queries NPU/HCCP/Ascend or live Jetty/TP resources. Sampling does not produce a
+JSON report or bandwidth CSV.
+See [CPU information and port/VL sampling](read_qos.md) for commands and output
+details. The old `--role cpu` option is no longer needed or accepted.
 
 # Paired bandwidth timing scopes
 

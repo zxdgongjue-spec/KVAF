@@ -1,173 +1,160 @@
-# READ request / response 的 SL、VL 确认
+# CPU 侧 URMA 信息与 port/VL 带宽采集
 
-此工具采集服务器证据，不把配置映射表当成抓包结果。主程序不修改 QoS、
-不重载驱动、不挂载 debugfs、不生成测试流量。使用 `--device-id` 时会调用已有
-HCCP 查询程序，编译辅助程序并创建临时查询 context；不会创建 Jetty 或提交 READ。
+两个入口均在 CPU 服务所在的 Linux 服务器运行：
 
-## 目前代码能确认到哪里
-
-| 环节 | 证据 | 边界 |
+| 入口 | 使用时机 | 输出 |
 | --- | --- | --- |
-| NPU 配置 | `direct_hccp_remote_transport.cc` 把 priority 写入 `attr.ub.priority`，传给 `RaCtxQpCreate` | 项目没有实际 HCCP/设备固件内部实现 |
-| READ 提交 | `execute_batch_get_aiv.asc` 构造 READ WQE，填写 TP、远端 EID、token、地址、长度；提交到各 Jetty SQ | 构造代码没有按 Jetty priority 单独写入响应 SL/VL |
-| 公开 UDMA 出站配置 | `udma_init_jettyc` 对 RM/RC 执行 `ctx->sl = dev->priority_info[cfg->priority].SL` | 需要与服务器实际驱动匹配；Host 驱动不能自动代表 NPU 内嵌驱动 |
-| CPU 本地 Jetty | `cpu_runtime.cc` 设置 `jfs.priority = kHostJettyPriority`，当前常量 15 | 不等于自动 READ response 采用 CPU 本地 JFS 的 SL |
-| 自动 READ response | CPU 应用没有逐个 READ 提交 SEND 的数据通路 | 响应选级发生在项目以外的驱动/硬件/固件中 |
-| 公开 UBASE 配置 | 收集 `resp_vl = req_vl + ctp_resp_vl_offset` 的请求/响应 VL 对 | 仅证明存在配置配对，不证明具体 READ response 复制请求 SL |
+| `collect_read_qos_info.py` | 首次使用，或设备、内核、驱动、UMDK、QoS 配置变化后 | `report.json`、CPU 环境/驱动/配置原始文件、可选源码片段 |
+| `collect_read_qos.py` | 每轮测试期间，可同时采集多个设备 | 每个设备子目录中的 `perf_*.txt` 和 `sampling.log`，以及总目录的运行日志 |
 
-不要把响应方向强行写成“CPU 再查一遍 NPU priority 数字”：请求方的 priority
-是本地 API 参数。若响应继承请求的服务类别，继承的可能是 SL/事务元数据，
-随后使用响应端的通道规则；它未必存在一个独立的 CPU Jetty priority。
+两个脚本放在同一目录，采样脚本复用信息脚本中的设备校验和命令执行函数。
+采样不要求预先生成信息快照，也不读取旧报告中的设备路径。
+两者均不修改 QoS、不重载驱动、不挂载 debugfs、不生成测试流量。
 
-**新增的硬件查询依据：**公开 `udma_query_res_jetty` 从硬件 mailbox 查询
-Jetty context，再将 `jettyc->sl` 写入结果的 `priority` 字段；公开
-`urma_admin` 将其打印为 `pri`。所以 `pri` 可能是硬件 SL，而不是原始 priority。
-必须对照服务器匹配版本的 `udma_dfx.c`；不能从名字直接解释。
+已移除 `--role`、`--device-id`、`--build-dir`、`--hccp-include`、
+`--jetty-id`。旧 CPU 命令也需要删掉 `--role cpu`。
+这两个入口不再执行 NPU/HCCP/Ascend 查询、辅助程序编译或 Jetty/TP 资源查询。
 
-公开参考（不声称与服务器二进制同版）：
+## 运行前准备
 
-- [UDMA 出站配置](https://github.com/openeuler-mirror/kernel/blob/OLK-6.6/drivers/ub/urma/hw/udma/udma_jetty.c)
-- [UDMA 硬件上下文查询](https://github.com/openeuler-mirror/kernel/blob/OLK-6.6/drivers/ub/urma/hw/udma/udma_dfx.c)
-- [UBASE 请求/响应 VL 配置](https://github.com/openeuler-mirror/kernel/blob/OLK-6.6/drivers/ub/ubase/ubase_qos_hw.c)
-- [UBASE 硬件 SL→VL 读取](https://github.com/openeuler-mirror/kernel/blob/OLK-6.6/drivers/ub/ubase/debugfs/ubase_qos_debugfs.c)
-- [UBASE 分 VL 带宽采样](https://github.com/openeuler-mirror/kernel/blob/OLK-6.6/drivers/ub/ubase/debugfs/ubase_debugfs.c)
-- [urma_admin 的 pri 字段](https://github.com/openeuler-mirror/umdk/blob/master/src/urma/tools/urma_admin/admin_cmd_show_res.c)
+在 KVAF 根目录执行，需要 Python 3 和 CPU 服务器上的 `urma_admin`。
+将 `QOS_CPU_EID` 设置为本轮 CPU 服务实际使用的本地 EID，
+`QOS_CPU_DEVICE` 设置为经完整 EID 核对的本地 URMA 设备名。
+`--urma-device` 可省略，此时每个 EID 必须唯一匹配一个本地设备。
+信息脚本仍一次获取一个设备的信息；采样脚本支持多个设备/EID。
 
-## 第一轮：两端静态采集
+输出目录必须尚不存在。若 debugfs 需要 root，请在有相应读取权限的终端执行；
+脚本不会自动提权，也不会把权限错误或缺失读数当成零带宽。
+换服务器或设备后，需要重新确认 EID 和设备名。
 
-在 KVAF 根目录执行，需要 Python 3。输出目录必须尚不存在。使用当前服务实际
-打印的 EID；以下值来自已有日志。若 debugfs 需要 root，请在具有相应读取权限的
-终端执行。脚本会保留权限错误，不会自动提权或将缺失数据当成 0。
+## 获取 CPU 信息
 
-NPU7 所在服务器：先加载你原来的 CANN 环境，并使用匹配的 `build-npu`：
+```bash
+python3 tests/diagnostics/collect_read_qos_info.py \
+  --urma-device "${QOS_CPU_DEVICE:?先设置本轮 CPU 设备名}" \
+  --eid "${QOS_CPU_EID:?先设置本轮 CPU EID}" \
+  --output qos-cpu-info
+```
+
+采集内容如下：
+
+| 文件 | 内容 |
+| --- | --- |
+| `os_release.txt` | CPU 服务器的操作系统版本 |
+| `urma_version.txt`、`urma_help.txt`、`urma_devices.txt` | URMA 工具信息、本地设备/EID 信息 |
+| `modinfo_<module>.txt`、`loaded_<module>_srcversion.txt` | `ubase`、`udma`、`ubcore`、`uburma` 四个模块的元信息和已加载构建标识 |
+| `caps_info.txt`、`all_adev_name.txt` | 对应 CPU 侧 UBASE 控制器的能力及设备信息 |
+| `qos_*.txt` | `adev_qos`、`sl_vl_map`、`ets_tc`、`ets_tcg`、`ets_port`、`tm_queue`、`tm_qset`、`tm_pri`、`tm_pg`、`tm_port` 原始输出 |
+| `report.json` | CPU 环境、设备关联、配置解析、查询状态和命令起止时间 |
+
+信息脚本不读取 `perf_stats`，不生成采样 CSV；报告也不包含采样数量、采样状态、
+逐次采样记录或预设的请求/响应 SL 判断。配置中的请求/响应 VL 配对仍会从
+`adev_qos` 的 `ctp_req_vl` 与 `ctp_resp_vl_offset` 提取。
+
+有匹配的 CPU 侧内核、驱动或 UMDK 源码时，可追加
+`--source-root /实际源码目录`，支持重复指定。仅扫描指定的 CPU 侧驱动/UMDK 文件，
+保存与 priority、SL、VL、响应及统计相关的源码片段，并记录源文件 SHA256；
+不扫描 HCCP 头文件。提供源码本身不证明与运行中的驱动二进制匹配。
+
+环境与配置未变时可以复用这些文件，不需要随消息大小、迭代次数等普通测试参数
+重复生成。QoS/TM 文件仍是当时的配置/状态快照，不是永久不变的硬件常量。
+`qos_sl_vl_map.txt` 中应同时检查 `sw_vl` 与 `hw_vl`，不一致时不能只采用软件缓存值。
+
+设备/EID 或 debugfs 关联失败时，脚本打印 `INFO_UNAVAILABLE`，保存已有报告并以
+状态码 1 退出。`local_device_eids` 给出解析到的设备/EID，`local_device_error`
+记录关联失败的阶段和原因。其他信息命令的失败、超时、截断记录在 `commands` 中。
+
+## 采集 CPU port/VL 带宽
+
+在测试负载进入需要观察的阶段后，在 CPU 服务器的另一个终端执行：
 
 ```bash
 python3 tests/diagnostics/collect_read_qos.py \
-  --role npu --device-id 7 \
-  --eid 00000000003f030000100000df00eb00 \
-  --build-dir build-npu \
-  --output qos-npu7-static
+  --urma-device "${QOS_CPU_DEVICE:?先设置本轮 CPU 设备名}" \
+  --eid "${QOS_CPU_EID:?先设置本轮 CPU EID}" \
+  --label test-A --samples 60 --interval 0.2 \
+  --output qos-cpu-test-A
 ```
 
-CPU DDR 服务所在服务器：
+同时采集多个设备时，一次传入多个设备名和 EID，两组值按顺序一一对应：
 
 ```bash
 python3 tests/diagnostics/collect_read_qos.py \
-  --role cpu --urma-device udmac0d1e2 \
-  --eid 00000000003f020000100000df080b00 \
-  --output qos-cpu-static
+  --urma-device "${QOS_CPU_DEVICE_A:?先设置设备 A}" "${QOS_CPU_DEVICE_B:?先设置设备 B}" \
+  --eid "${QOS_CPU_EID_A:?先设置设备 A 的 EID}" "${QOS_CPU_EID_B:?先设置设备 B 的 EID}" \
+  --label test-A --samples 60 --interval 0.2 \
+  --output qos-cpu-test-A
 ```
 
-有匹配的内核/驱动/UMDK 源码时，在相应命令追加
-`--source-root /实际源码目录`，可重复。只采集与 priority、SL、VL、响应及查询
-有关的指定源码文件片段，并记录源文件 SHA256；提供源码本身不证明与运行二进制匹配。
-NPU 查询成功输出 HCCP header 路径时，也会采集同目录中相关头文件片段。
+也可以重复写 `--urma-device DEVICE_A --eid EID_A --urma-device DEVICE_B --eid EID_B`。
+设备名与 EID 的数量必须一致，每个设备只能列一次；省略设备名时可用
+`--eid EID_A EID_B` 自动匹配。所有设备共用本轮的 label、samples、interval 和 timeout。
 
-输出包含 `report.json`、各命令原始输出、驱动模块信息、HCCP 映射（NPU）、
-对应控制器的 QoS 文件及 `vl_bandwidth.csv`。所有失败、超时、截断均有记录。
-`qos_sl_vl_map.txt` 中应同时检查 `sw_vl` 与 `hw_vl`，不一致时不要只采用软件缓存值。
+每次运行只查询一次当前设备列表，逐个校验 EID → 本地设备 → UBASE debugfs
+控制器的关联，然后并发读取不同控制器的 `perf_stats`。设备校验在内存中完成，
+不另存 `urma_devices.txt`。多个设备若关联同一个控制器，每轮只读取一次，
+将相同原始数据和读取时间写入各设备目录，并在设备日志标记 `SHARED_CONTROLLER`。
+这些副本仍是同一控制器的汇总读数，不能当作各设备独立的流量再相加。
 
-**NPU 的特殊情况：**HCCP 使用 HDC 查询的 `udmac0d0e3` 不一定出现在 Host
-Linux 的 `/sys/class/ubcore`。脚本必须先验证完整 EID，才会关联本地设备和 debugfs；
-绝不按同名设备替代。若报告 `No local debugfs association`，NPU 侧只取得了
-HCCP 配置表，实际 SL/VL 仍需该版本的 NPU DFX 接口或设备侧诊断环境。
-此时提供报告和 HCCP header 片段，才能选择正确的接口；不能通过 Host 的
-`modinfo udma` 或 Host 同名 debugfs 代替。
-
-## 第二轮：查询仍然存活的 Jetty
-
-工作进程结束会销毁 Jetty，所以必须在测试/服务运行期间采集。
-NPU 日志中的 `BATCH_GET_JETTY_PRIORITY ... jetty_id=...` 是 NPU 本地 ID；
-CPU 日志中的 `CHANNEL_CREATED ... local_jetty=...` 是 CPU 本地 ID。
-分别在对应端命令追加，例如：
+按实际设备名创建子目录，例如：
 
 ```text
---jetty-id 123 --jetty-id 124
+qos-cpu-test-A/
+  sampling.log
+  udmac0d1e2/
+    perf_0000.txt
+    perf_0001.txt
+    ...
+    sampling.log
+  udmac0d0e3/
+    perf_0000.txt
+    perf_0001.txt
+    ...
+    sampling.log
 ```
 
-123/124 是占位示例，必须替换为本轮活跃资源 ID。脚本先用
-`urma_admin show dev DEVICE jetty ID`；不支持时尝试公开旧接口
-`show_res -d DEVICE --resource_type 7 --key ID`。旧版资源枚举可能不同，
-保留原始输出并对照安装版本。Jetty 的 resource key 7 与 statistics key 6 不同。
-若 NPU 资源仅 HDC 可见，这条本地查询不会被执行，更不会拿 CPU Jetty ID 替代。
+单设备命令的参数写法仍然适用，但结果也统一放入 `--output/<设备名>/`，
+不再直接写到总输出目录。
 
-## 第三轮：观察两个方向实际使用的 VL
+- 总目录的 `sampling.log`：设备发现、校验失败、控制器分组及整体完成状态。
+- 设备目录的 `perf_*.txt`：每次读取的原始输出，保留端口及 VL 的 TX/RX 信息。
+- 设备目录的 `sampling.log`：CPU EID、设备/路径、label、主机/内核、采样参数、每次读取的
+  起止 Unix 时间、状态和最终完成数量，不重复保存端口/VL 带宽值。
 
-公开 UBASE 的 `perf_stats` 按端口输出 `vl tx_bw(kbps) rx_bw(kbps)`，UB
-采样窗口为 100 ms；服务器实际输出为准。此处是带宽读数，不是累计计数器，
-不能做前后相减。VL 汇总也不是按 READ opcode 或 Jetty 过滤的抓包。
+`--samples` 默认为每个控制器 1 次，每个关联设备保存同样数量的样本；
+`--interval` 默认为 0.2 秒，最小 0.1 秒，表示同一个控制器两次读取之间的
+等待时间，不包含读取本身耗时；`--timeout` 默认为每条命令 15 秒。
+不同控制器的读取并发执行，不保证硬件采样窗口严格同步，应以日志时间为准。
+`--label` 只是本轮测试标签，不设置或筛选任何优先级。
 
-建议先运行一个 Jetty，将 NPU priority 依次设为 1 和 3，CPU 配置保持不变。
-这两个值来自 NPU7 的 CTP 映射候选，不预设谁更优先。
-在已有 CPU 服务和两端 EID 配置下，用现有 runner 产生足够长的负载，例如：
+采样脚本不生成 `report.json`、`vl_bandwidth.csv` 或驱动配置文件。
+用日志中的 `name=perf_XXXX` 将原始文件与起止时间对应；原始文件本身不添加时间戳。
 
-```bash
-PYTHONUNBUFFERED=1 DEVICE_ID=7 KVAF_BATCH_GET_JETTY_PRIORITIES=1 \
-  bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
-  --npu-eids 00000000003f030000100000df00eb00 \
-  --peer-ub-device udmac0d1e2 \
-  --aiv-cores 1 --jettys-per-core 1 --token-bytes 656 \
-  --request-length 32768 --miss-count 32768 --max-inflight-total 1024 \
-  --warmup 20 --iterations 100000 --no-kernel-profile
-```
+设备关联失败时打印 `SAMPLING_BLOCKED`，原因记录在总日志；通过校验的其他设备
+继续采样。读取失败、超时、截断或无法识别 `vl tx_bw(kbps) rx_bw(kbps)` 表时打印
+`SAMPLING_FAILED`，停止该控制器的后续采样，不影响其他控制器。
+已有原始输出和错误日志会保留。任一设备未完成时整体返回状态码 1，全部完成时返回 0。
+`valid_perf_samples=0` 表示没有有效样本，不代表带宽为 0。
 
-这里保留环境中原有的 `KVAF_CPU_SERVICE_ADDR`；如未设置，请先设为实际服务地址。
-等日志出现 `BATCH_GET_PERF_PHASE_BEGIN phase=batch_get` 后，在两端另一个终端
-采样，排除初始化、BatchPut 数据准备和 warmup 阶段。该测试有请求生成间隙，
-因此目标是观察 VL 分类，不是把采样带宽当成链路线速。
+## 读数范围
 
-CPU 采样示例（NPU 端用自己的 role/EID，并确保本地诊断确实可见 NPU）：
+`perf_stats` 中的 TX/RX 方向均相对于所选 CPU 侧控制器。每个样本可以包含
+多个 port，每个 port 可以包含多个 VL；脚本保留全部原始输出，不按端口或 VL 过滤。
+带宽单位为 kbps，是窗口带宽读数而非累计计数器，不能对相邻读数做差来计算带宽。
 
-```bash
-python3 tests/diagnostics/collect_read_qos.py \
-  --role cpu --urma-device udmac0d1e2 \
-  --eid 00000000003f020000100000df080b00 \
-  --label p1-only --samples 60 --interval 0.2 \
-  --output qos-cpu-p1
-```
-
-先采 idle 基线；然后采 p1-only、p3-only，多轮交替，保持大小、目标内存、EID、
-端口、访问模式及其他网络负载相同。两端原始输出和 CSV 均带时间戳，检查采样
-确实覆盖 READ 稳态；时钟未同步时不能直接按时间戳匹配跨机报文。
-
-| 观测位置 | 重点读数 |
-| --- | --- |
-| NPU 本地正确设备 TX | READ request 的出站 VL 活动 |
-| CPU 正确设备 RX | READ request 到达方向的 VL 活动 |
-| CPU 正确设备 TX | READ response 数据出站方向的 VL 活动 |
-| NPU 本地正确设备 RX | READ response 到达方向的 VL 活动 |
-
-端口还可能承载 ACK、信用/协议控制流量或其他进程流量，不能把任何一个非零 VL
-直接宣布为 READ response。优先结合多轮隔离实验、负载大小变化和硬件 packet trace。
-
-## 哪些结果可以下什么结论
-
-- Jetty context SL 随 NPU priority 变化：确认选级配置已进入上下文，尚非包级证明。
-- 隔离负载时，NPU request 方向的 VL 随 priority 变化：支持请求走了不同类别。
-- CPU priority 固定，CPU response 方向的主要 VL 随 NPU priority 变化：支持响应
-  分类受到请求侧类别影响；还不能唯一证明“直接复制请求 SL”这一具体实现。
-- CPU response VL 不变：不能排除不同 SL 映射到了同一 VL，也不能单凭此判定
-  `kHostJettyPriority` 是响应分类来源。
-- 需要确认响应 **SL 的确切值以及继承规则**：取得可关联同一 READ 的 request /
-  response 报文 trace（opcode、两端、事务标识、SL、VL、方向），或匹配该芯片和
-  固件版本的明确规则。VL→SL 常为多对一，不能从 VL 反推出唯一 SL。
-
-要区分“CPU Jetty 配置”和“请求类别”，最终可做两个独立变量的交叉实验：
-固定 CPU 配置只改变 NPU priority；然后固定 NPU priority，只改变 CPU JFS
-的有效 SL。当前 `kHostJettyPriority` 是编译期常量，采集工具不修改它。
-CPU 端若选择 13 和 15，已有日志显示二者又映射到同一 VL 8，不能作为区分来源
-的有效 VL 对照；必须先确认选用的 CPU 配置实际对应不同类别。
-
-缺少包级证据或匹配的响应选级规则时，报告中的
-`response_inherits_request_sl` 始终为 `unverified`。
+这些读数是端口/VL 上的汇总流量，不按进程、EID、READ opcode 或 Jetty 过滤。
+可以先采 idle 基线，再在负载稳定阶段采样。CPU RX/TX 中可能混有其他负载和控制
+流量，仅凭某个 VL 非零不能确定具体报文类别，也不能从 VL 反推出唯一的 SL。
 
 ## 本地验证
 
 ```bash
-python3 -m unittest discover -s tests/diagnostics -p 'test_collect_read_qos.py'
-python3 tests/diagnostics/collect_read_qos.py --help
+python3 -B -m unittest discover -s tests/diagnostics -p 'test_collect_read_qos.py'
+python3 -B tests/diagnostics/collect_read_qos_info.py --help
+python3 -B tests/diagnostics/collect_read_qos.py --help
 ```
 
-本地测试覆盖 EID/设备错配、嵌套控制器路径、VL 方向及单位解析、缺失与零值的
-区分，并验证配置配对和带宽活动不会被自动升级为 SL 继承结论。Linux/CANN
-硬件接口必须由服务器实测验证。
+测试覆盖 CPU 设备/EID 校验、控制器路径、port/VL 方向和零值、两个入口的输出边界、
+已移除参数的拒绝、源码范围、多控制器并发、共享控制器去重、按设备分目录、
+单个设备失败后的继续采样，以及读取失败和超时后的部分结果。
+测试临时目录会在结束时清理。实际 Linux URMA/UBASE 接口需在 CPU 服务器验证。

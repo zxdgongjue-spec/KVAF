@@ -1,83 +1,20 @@
 #!/usr/bin/env python3
-"""Collect READ QoS evidence on Linux; never infer response SL from a Jetty priority.
+"""Sample CPU-side UBASE perf_stats concurrently for one or more URMA devices.
 
+Outputs <device>/perf_*.txt and <device>/sampling.log under a new output directory.
 No QoS writes, counter resets, driver reloads, debugfs mounts or traffic generation.
-Optional --device-id invokes the existing HCCP query (creates a temporary context).
 """
 import argparse
-import csv
-import hashlib
-import json
-import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import platform
 import re
-import subprocess
 import sys
 import time
 
-
-QOS_FILES = (
-    "adev_qos", "sl_vl_map", "ets_tc", "ets_tcg", "ets_port",
-    "tm_queue", "tm_qset", "tm_pri", "tm_pg", "tm_port",
+from collect_read_qos_info import (
+    Collector, normalize_eid, parse_devices, resolve_debug_dir, select_device,
 )
-SOURCE_NAMES = {
-    "udma_jetty.c", "udma_jfs.c", "udma_dfx.c", "udma_u_jetty.c",
-    "ubase_qos_hw.c", "ubase_qos_debugfs.c", "ubase_debugfs.c",
-    "ubase_stats.c", "ubase_tp.c", "udma_ctrlq_tp.c",
-    "urma_types.h", "ubcore_types.h", "ubase_comm_dev.h",
-    "admin_parameters.h", "admin_cmd_show_res.c",
-}
-SOURCE_PATTERN = re.compile(
-    r"priority|\bsl\b|\bSL\b|resp.*vl|req.*vl|perf_stats|tx_vl_bw|rx_vl_bw|"
-    r"Ra\w*(?:Query|Get|Dfx|Stats)|tpType|tp_type", re.I
-)
-
-
-def normalize_eid(value):
-    value = value.strip().replace(":", "").lower()
-    if not re.fullmatch(r"[0-9a-f]{32}", value):
-        raise ValueError("EID must be exactly 32 hexadecimal digits (colons allowed)")
-    return value
-
-
-def parse_devices(text):
-    """Parse the installed urma_admin show --all --whole format, not device names."""
-    devices, current = {}, None
-    for line in text.splitlines():
-        match = re.match(r"\s*name\s*:\s*(\S+)\s*$", line)
-        if match:
-            current = match[1]
-            devices.setdefault(current, [])
-        match = re.match(r"\s*eid\d+\s*:\s*([0-9a-fA-F:]+)\s*$", line)
-        if match and current:
-            try:
-                devices[current].append(normalize_eid(match[1]))
-            except ValueError:
-                pass
-    return devices
-
-
-def select_device(devices, eid, requested=None):
-    matches = [name for name, eids in devices.items() if eid in eids]
-    if requested:
-        if requested not in matches:
-            raise ValueError(f"{requested} is not verified to own EID {eid}; matches={matches}")
-        return requested
-    if len(matches) != 1:
-        raise ValueError(f"Need exactly one local EID match; found {matches}")
-    return matches[0]
-
-
-def resolve_debug_dir(device_path, debug_root):
-    """Use the device's immediate UB controller, never an arbitrary ancestor."""
-    resolved = device_path.resolve(strict=True)
-    if resolved.parent.name != "ubcore":
-        raise ValueError(f"Unrecognized ubcore sysfs layout: {resolved}")
-    candidate = debug_root / resolved.parent.parent.name
-    if not candidate.is_dir():
-        raise ValueError(f"Controller debugfs unavailable: {candidate}")
-    return candidate
 
 
 def parse_perf_stats(text):
@@ -99,213 +36,171 @@ def parse_perf_stats(text):
     return rows
 
 
-def configured_response_pairs(text):
-    req = re.search(r"^ctp_req_vl:\s*([^\n]*)", text, re.M)
-    offset = re.search(r"^ctp_resp_vl_offset:\s*(\d+)\s*$", text, re.M)
-    if not req or not offset:
-        return None
-    values = req[1].split()
-    if not values or not all(v.isdecimal() for v in values):
-        return None
-    return [[int(v), int(v) + int(offset[1])] for v in values]
+def log_message(path, message, console=True):
+    with path.open("a", encoding="utf-8") as file:
+        file.write(message + "\n")
+    if console:
+        print(message, flush=True)
 
 
-class Collector:
-    def __init__(self, output, timeout):
-        self.output, self.timeout, self.records = output, timeout, []
-        output.mkdir(parents=True, exist_ok=False)
-
-    def run(self, name, argv, timeout=None):
-        start = time.time()
-        try:
-            proc = subprocess.run([str(x) for x in argv], stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, timeout=timeout or self.timeout,
-                                  check=False)
-            data, status = proc.stdout, proc.returncode
-        except subprocess.TimeoutExpired as exc:
-            data, status = (exc.stdout or b"") + b"\nTIMEOUT\n", "timeout"
-        except OSError as exc:
-            data, status = str(exc).encode(), "unavailable"
-        limit = 2 * 1024 * 1024
-        truncated = len(data) > limit
-        text = data[:limit].decode("utf-8", errors="replace")
-        (self.output / (name + ".txt")).write_text(text, encoding="utf-8")
-        self.records.append(dict(name=name, argv=[str(x) for x in argv], status=status,
-                                 start_unix=start, end_unix=time.time(), truncated=truncated))
-        return status, text
-
-    def read(self, name, path):
-        # cat in a timed subprocess prevents a debugfs read from blocking Python forever.
-        return self.run(name, ["cat", str(path)])
+def command_record(record):
+    return (f"COMMAND name={record['name']} status={record['status']} "
+            f"start_unix={record['start_unix']:.6f} end_unix={record['end_unix']:.6f} "
+            f"truncated={record['truncated']}")
 
 
-def collect_sources(collector, roots):
-    """Bounded source excerpts. Supplied source is not automatically the running build."""
-    collected, seen = [], set()
-    for root in roots:
-        root = root.resolve()
-        if not root.is_dir():
-            collected.append(dict(root=str(root), error="not a directory"))
-            continue
-        for parent, dirs, names in os.walk(root):
-            dirs[:] = sorted(d for d in dirs if d not in {".git", "node_modules", "__pycache__"})
-            for name in sorted(names):
-                if name not in SOURCE_NAMES and not (name.startswith("hccp") and name.endswith(".h")):
-                    continue
-                path = Path(parent) / name
-                if path in seen:
-                    continue
-                seen.add(path)
-                if len(seen) > 150:
-                    return collected + [dict(error="source file limit reached")]
+def valid_device_name(name):
+    return re.fullmatch(r"[A-Za-z0-9_.-]+", name) is not None and name not in {".", ".."}
+
+
+def sample_controller(debug, targets, args):
+    """Read each controller once per sample and fan out to its URMA devices."""
+    collector = targets[0]["collector"]
+    for sample in range(args.samples):
+        name = f"perf_{sample:04d}"
+        code, output = collector.run(name, ["cat", debug / "perf_stats"], save=False)
+        record = collector.records[-1]
+        truncated = record["truncated"]
+        rows = parse_perf_stats(output) if code == 0 and not truncated else []
+        reason = (f"Read failed with status={code}" if code != 0 else
+                  "Raw output was truncated" if truncated else
+                  "Read succeeded but no recognized per-VL bandwidth table")
+        stage = "perf_stats_read" if code != 0 or truncated else "perf_stats_parse"
+        for target in targets:
+            if target["failed"]:
+                continue
+            device = target["device"]
+            path = target["collector"].output / f"{name}.txt"
+            try:
+                path.write_text(output, encoding="utf-8")
+                log_message(target["log"], command_record(record), console=False)
+                if rows:
+                    target["count"] += 1
+                else:
+                    target["failed"] = True
+                    log_message(target["log"], f"SAMPLING_FAILED device={device} stage={stage} "
+                                f"reason={reason} details={path.resolve()}")
+            except OSError as exc:
+                target["failed"] = True
+                message = f"SAMPLING_FAILED device={device} stage=output_write reason={exc}"
                 try:
-                    if path.stat().st_size > 2 * 1024 * 1024:
-                        raise ValueError("source file exceeds 2 MiB")
-                    raw = path.read_bytes()
-                    lines = raw.decode("utf-8", errors="replace").splitlines()
-                    selected = set()
-                    for index, line in enumerate(lines):
-                        if SOURCE_PATTERN.search(line):
-                            selected.update(range(max(0, index - 4), min(len(lines), index + 5)))
-                    indices = sorted(selected)
-                    target = f"source_{len(collected):03d}_{name}.txt"
-                    excerpts = "\n".join(f"{i + 1}: {lines[i]}" for i in indices[:1800])
-                    (collector.output / target).write_text(excerpts, encoding="utf-8")
-                    collected.append(dict(path=str(path), file=target,
-                                          sha256=hashlib.sha256(raw).hexdigest(),
-                                          truncated=len(indices) > 1800,
-                                          running_build_match="unverified"))
-                except (OSError, ValueError) as exc:
-                    collected.append(dict(path=str(path), error=str(exc)))
-    return collected
+                    log_message(target["log"], message)
+                except OSError:
+                    print(message, flush=True)
+        if not rows or all(target["failed"] for target in targets):
+            break
+        if sample + 1 < args.samples:
+            time.sleep(args.interval)
+
+    results = {}
+    for target in targets:
+        complete = not target["failed"] and target["count"] == args.samples
+        status = "complete" if complete else "incomplete"
+        try:
+            log_message(target["log"], f"SAMPLING_DONE status={status} device={target['device']} "
+                        f"valid_perf_samples={target['count']} requested_perf_samples={args.samples}")
+        except OSError as exc:
+            complete = False
+            print(f"SAMPLING_FAILED device={target['device']} stage=output_write reason={exc}", flush=True)
+        results[target["device"]] = complete
+    return results
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--role", choices=("npu", "cpu"), required=True)
-    parser.add_argument("--eid", required=True)
-    parser.add_argument("--urma-device", help="Optional local device name; its EID must match")
-    parser.add_argument("--device-id", type=int, help="NPU logical ID; enables the existing HCCP mapping query")
-    parser.add_argument("--build-dir", type=Path, default=Path("build-npu"))
-    parser.add_argument("--hccp-include", type=Path)
-    parser.add_argument("--jetty-id", type=int, action="append", default=[], help="Live local Jetty ID; repeatable")
-    parser.add_argument("--source-root", type=Path, action="append", default=[], help="Matching kernel/UMDK/SDK source tree")
-    parser.add_argument("--samples", type=int, default=1, help="Number of per-VL perf_stats reads")
-    parser.add_argument("--interval", type=float, default=0.2, help="Seconds between reads (read itself also takes time)")
+    parser.add_argument("--eid", required=True, nargs="+", action="append",
+                        help="Local CPU-side EIDs, paired with --urma-device values in order; repeatable")
+    parser.add_argument("--urma-device", nargs="+", action="append", default=[],
+                        help="CPU-side device names paired with EIDs in order; repeatable; otherwise infer from EIDs")
+    parser.add_argument("--samples", type=int, default=1, help="Number of perf_stats reads per controller")
+    parser.add_argument("--interval", type=float, default=0.2, help="Seconds between reads on each controller")
     parser.add_argument("--timeout", type=float, default=15)
-    parser.add_argument("--label", default="snapshot", help="e.g. idle, p1-only, p3-only")
-    parser.add_argument("--output", type=Path, required=True, help="New output directory")
+    parser.add_argument("--label", default="snapshot", help="e.g. idle, test-A, test-B")
+    parser.add_argument("--output", type=Path, required=True, help="New parent output directory; one subdirectory per device")
     args = parser.parse_args(argv)
     try:
-        eid = normalize_eid(args.eid)
+        eids = [normalize_eid(value) for values in args.eid for value in values]
     except ValueError as exc:
         parser.error(str(exc))
-    if args.samples < 1 or args.interval < 0.1 or args.timeout <= 0 or any(i < 0 for i in args.jetty_id):
-        parser.error("samples >= 1, interval >= 0.1, timeout > 0 and nonnegative Jetty IDs required")
-    if args.device_id is not None and (args.role != "npu" or args.device_id < 0):
-        parser.error("--device-id requires --role npu and a nonnegative logical ID")
+    requested = [name for names in args.urma_device for name in names]
+    if requested and len(requested) != len(eids):
+        parser.error("--urma-device and --eid must contain the same number of values, paired in order")
+    if len(set(requested)) != len(requested):
+        parser.error("Each --urma-device must be listed only once")
+    if any(not valid_device_name(name) for name in requested):
+        parser.error("Device names must be simple directory names using letters, digits, _, . or -")
+    if (args.samples < 1 or not 0.1 <= args.interval < float("inf") or
+            not 0 < args.timeout < float("inf")):
+        parser.error("samples >= 1, finite interval >= 0.1 and finite timeout > 0 required")
     if sys.platform != "linux":
         parser.error("Collection runs on the Linux server; parsers can be tested on any OS")
+
     collector = Collector(args.output, args.timeout)
-    report = dict(role=args.role, eid=eid, label=args.label, hostname=platform.node(),
-                  kernel=platform.release(), warnings=[], request_packet_sl="unverified",
-                  response_packet_sl="unverified", response_inherits_request_sl="unverified")
-    collector.read("os_release", "/etc/os-release")
-    collector.read("modules", "/proc/modules")
-    collector.run("urma_version", ["urma_admin", "--version"])
-    collector.run("urma_help", ["urma_admin", "--help"])
-    status, device_text = collector.run("urma_devices", ["urma_admin", "show", "--all", "--whole"])
-    devices = parse_devices(device_text) if status == 0 else {}
-    for module in ("ubase", "udma", "ubcore", "uburma"):
-        collector.run("modinfo_" + module, ["modinfo", module])
-        collector.read("loaded_" + module + "_srcversion", f"/sys/module/{module}/srcversion")
-    collector.run("npu_smi", ["npu-smi", "info"])
-    collector.read("ascend_driver_version", "/usr/local/Ascend/driver/version.info")
-    roots = list(args.source_root)
-    if args.device_id is not None:
-        helper = Path(__file__).with_name("query_npu_priority_sl.py")
-        command = [sys.executable, helper, "--device", str(args.device_id), "--eid", eid,
-                   "--build-dir", args.build_dir]
-        if args.hccp_include:
-            command += ["--hccp-include", args.hccp_include]
-        code, output = collector.run("npu_hccp_mapping", command, timeout=180)
-        report["hccp_query_status"] = code
-        match = re.search(r"^HCCP_HEADER=(.+)$", output, re.M)
-        if match:
-            roots.append(Path(match[1].strip()).parent)
-        for key in ("HCCP_LIBRARY", "KVAF_LIBRARY"):
-            match = re.search(r"^" + key + r"=(.+)$", output, re.M)
-            if match:
-                library = Path(match[1].strip())
-                collector.run(key.lower() + "_sha256", ["sha256sum", library])
-                if key == "HCCP_LIBRARY":
-                    collector.run("hccp_exported_symbols", ["nm", "-D", "--defined-only", library])
-        # The helper uses HDC; local Host modules/sysfs may not describe the NPU driver.
-        report["warnings"].append("Host modinfo is not proof of the NPU embedded driver/firmware version.")
-    debug = None
-    try:
-        device = select_device(devices, eid, args.urma_device)
-        report["local_device"] = device
-        device_path = Path("/sys/class/ubcore") / device
-        report["sysfs_device"] = str(device_path.resolve())
-        collector.run("jetty_list", ["urma_admin", "show", "dev", device, "jetty"])
-        collector.run("tp_list", ["urma_admin", "show", "dev", device, "tp"])
-        for jetty in args.jetty_id:
-            code, _ = collector.run(f"jetty_{jetty}", ["urma_admin", "show", "dev", device, "jetty", str(jetty)])
-            if code != 0:
-                # Public UMDK TOOL_RES_KEY_JETTY == 7 (not stats key type 6).
-                collector.run(f"jetty_{jetty}_legacy", ["urma_admin", "show_res", "-d", device,
-                              "--resource_type", "7", "--key", str(jetty)])
-        report["warnings"].append("Jetty IDs must belong to this live workload; terminated-process IDs can be reused.")
-        debug = resolve_debug_dir(device_path, Path("/sys/kernel/debug/ubase"))
-        report["debugfs_device"] = str(debug)
-        for name in ("caps_info", "all_adev_name"):
-            collector.read(name, debug / name)
-        for name in QOS_FILES:
-            code, output = collector.read("qos_" + name, debug / "qos" / name)
-            if name == "adev_qos" and code == 0:
-                report["configured_ctp_req_resp_vl_pairs"] = configured_response_pairs(output)
-    except (OSError, ValueError) as exc:
-        report["warnings"].append(str(exc))
-        report["warnings"].append("No local debugfs association. An HDC NPU name must NOT be substituted with a same-named Host device.")
-    debug_root = Path("/sys/kernel/debug/ubase")
-    try:
-        report["available_debug_controllers"] = sorted(p.name for p in debug_root.iterdir() if p.is_dir())
-    except OSError as exc:
-        report["warnings"].append(str(exc))
-    report["source_excerpts"] = collect_sources(collector, roots)
-    report["warnings"] += [
-        "Jetty query pri/priority can be hardware SL in UDMA; confirm against the installed driver implementation.",
-        "Configured request/response VL pairs describe capabilities, not observed READ packet routing.",
-        "VL bandwidth is aggregate traffic, not opcode/EID/Jetty-filtered; one VL may correspond to multiple SLs.",
-    ]
-    fields = ["sample", "start_unix", "end_unix", "port", "vl", "tx_kbps", "rx_kbps"]
-    count = 0
-    with (args.output / "vl_bandwidth.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
-        if debug is not None:
-            print(f"SAMPLING_READY role={args.role} label={args.label} path={debug / 'perf_stats'}", flush=True)
-            for sample in range(args.samples):
-                start = time.time()
-                code, output = collector.read(f"perf_{sample:04d}", debug / "perf_stats")
-                end = time.time()
-                rows = parse_perf_stats(output) if code == 0 else []
-                if not rows:
-                    report["warnings"].append(f"Sample {sample}: no recognized per-VL bandwidth; see raw output.")
-                    break
-                for row in rows:
-                    writer.writerow(dict(sample=sample, start_unix=start, end_unix=end, **row))
-                count += 1
-                file.flush()
-                if sample + 1 < args.samples:
-                    time.sleep(args.interval)
-    report["valid_perf_samples"] = count
-    report["commands"] = collector.records
-    (args.output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"REPORT={args.output.resolve() / 'report.json'} valid_perf_samples={count}")
-    print("READ response SL inheritance remains UNVERIFIED; use matching driver/firmware rules or decoded packet evidence.")
-    return 0
+    root_log = args.output / "sampling.log"
+    metadata = (f"role=cpu label={args.label!r} hostname={platform.node()} kernel={platform.release()} "
+                f"requested_perf_samples={args.samples} interval={args.interval} timeout={args.timeout}")
+    log_message(root_log, f"COLLECTION_START devices={len(eids)} {metadata}")
+    code, device_text = collector.run("urma_devices", ["urma_admin", "show", "--all", "--whole"], save=False)
+    log_message(root_log, command_record(collector.records[-1]), console=False)
+    if code != 0 or collector.records[-1]["truncated"]:
+        log_message(root_log, f"SAMPLING_BLOCKED stage=device_identity reason=Device query failed "
+                    f"status={code} truncated={collector.records[-1]['truncated']}; {device_text[-4000:].strip()}")
+        log_message(root_log, f"COLLECTION_DONE status=incomplete completed_devices=0 requested_devices={len(eids)}")
+        return 1
+    devices = parse_devices(device_text)
+    groups, selected = {}, set()
+    for eid, name in zip(eids, requested or [None] * len(eids)):
+        stage = "device_identity"
+        device = name
+        try:
+            device = select_device(devices, eid, name)
+            if not valid_device_name(device):
+                raise ValueError(f"Invalid device directory name: {device}")
+            if device in selected:
+                raise ValueError(f"Multiple EIDs select {device}; list each device only once")
+            selected.add(device)
+            stage = "debugfs_resolution"
+            device_path = Path("/sys/class/ubcore") / device
+            debug = resolve_debug_dir(device_path, Path("/sys/kernel/debug/ubase")).resolve()
+            stage = "output_setup"
+            target_collector = Collector(args.output / device, args.timeout)
+            log = target_collector.output / "sampling.log"
+            log_message(log, f"SAMPLING_START device={device} eid={eid} {metadata}")
+            log_message(log, f"DEVICE local_device={device} sysfs_device={device_path.resolve()} "
+                        f"perf_stats={debug / 'perf_stats'}", console=False)
+            log_message(log, "NOTE: Bandwidth is aggregated per controller/port/VL, not per URMA device.", console=False)
+            groups.setdefault(debug, []).append(dict(device=device, collector=target_collector,
+                                                      log=log, count=0, failed=False))
+        except (OSError, ValueError) as exc:
+            log_message(root_log, f"SAMPLING_BLOCKED device={device or 'auto'} eid={eid} stage={stage} reason={exc}")
+            if stage == "device_identity":
+                log_message(root_log, f"DEVICE_EIDS={devices}", console=False)
+
+    completed = 0
+    if groups:
+        with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+            futures = {}
+            for debug, targets in groups.items():
+                names = ",".join(target["device"] for target in targets)
+                log_message(root_log, f"SAMPLING_READY devices={names} path={debug / 'perf_stats'}")
+                if len(targets) > 1:
+                    for target in targets:
+                        log_message(target["log"], f"SHARED_CONTROLLER devices={names} path={debug / 'perf_stats'}",
+                                    console=False)
+                futures[executor.submit(sample_controller, debug, targets, args)] = names
+            for future in as_completed(futures):
+                try:
+                    results = future.result()
+                    for device, complete in results.items():
+                        completed += int(complete)
+                        status = "complete" if complete else "incomplete"
+                        log_message(root_log, f"DEVICE_DONE device={device} status={status} "
+                                    f"details={args.output.resolve() / device / 'sampling.log'}", console=False)
+                except (OSError, ValueError) as exc:
+                    log_message(root_log, f"SAMPLING_FAILED devices={futures[future]} stage=collection reason={exc}")
+    status = "complete" if completed == len(eids) else "incomplete"
+    log_message(root_log, f"COLLECTION_DONE status={status} completed_devices={completed} requested_devices={len(eids)}")
+    return 0 if completed == len(eids) else 1
 
 
 if __name__ == "__main__":
