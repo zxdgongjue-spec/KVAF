@@ -26,8 +26,6 @@ class MteCopyPipeline {
   }
 
   __aicore__ inline void Copy(uint64_t dst, uint64_t src, uint64_t bytes) {
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
     for (uint64_t offset = 0; offset < bytes;) {
       const uint32_t bank = issued_ % stages_;
       const auto event = static_cast<event_t>(bank);
