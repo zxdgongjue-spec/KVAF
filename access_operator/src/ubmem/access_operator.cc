@@ -34,6 +34,8 @@ struct AccessOperator::Impl {
   std::unordered_map<aclrtStream, StreamState> streams;
   bool ready{};
   bool retained{};
+  bool profiling{};
+  aclrtStream profile_stream{};
 
   Status LoadKernel(unsigned index, const std::string& path, const char* name) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -88,6 +90,8 @@ struct AccessOperator::Impl {
   }
 
   Status Launch(BatchArgs& args, aclrtStream stream, StreamState& state, bool synchronize) {
+    args.profile = profiling && args.operation == Operation::kGet;
+    profile_stream = nullptr;
     const auto size = options.cores * sizeof(CoreStatus);
     if (synchronize) {
       // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
@@ -110,6 +114,7 @@ struct AccessOperator::Impl {
         functions[static_cast<unsigned>(args.operation)], options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
     state.pending = StreamState::Pending::kStream;
+    if (args.profile) profile_stream = stream;
     if (!synchronize) {
       status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
       if (!status.ok()) {
@@ -185,10 +190,10 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
     status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
   }
   if (status.ok()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
-      "KvafExecuteBatchGetUbmemKernel");
+      "KvafExecuteBatchGetUbmemKernelV2");
   if (status.ok() && !impl_->options.batch_put_kernel_object_path.empty())
     status = impl_->LoadKernel(1, impl_->options.batch_put_kernel_object_path,
-        "KvafExecuteBatchPutUbmemKernel");
+        "KvafExecuteBatchPutUbmemKernelV2");
   if (!status.ok()) { (void)Shutdown(); return status; }
   impl_->ready = true;
   std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY transport=ubmem mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
@@ -203,6 +208,8 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
 
 Status AccessOperator::Shutdown() {
   impl_->ready = false;
+  impl_->profiling = false;
+  impl_->profile_stream = nullptr;
   for (auto& entry : impl_->streams) {
     if (entry.second.pending == Impl::StreamState::Pending::kStream) {
       auto status = Acl("aclrtSynchronizeStream(recovery)", aclrtSynchronizeStream(entry.first));
@@ -237,6 +244,38 @@ Status AccessOperator::Shutdown() {
   if (impl_->retained) {
     impl_->options.peer_link->ReleaseUbmemMapping(impl_->remote.base);
     impl_->retained = false;
+  }
+  return Status::OK();
+}
+
+Status AccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (!impl_->ready) return Status::NotInitialized("UBmem operator is not initialized");
+  impl_->profiling = enabled;
+  impl_->profile_stream = nullptr;
+  return Status::OK();
+}
+
+Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  if (!profiles) return Status::InvalidArgument("profile output is null");
+  if (!impl_->ready || !impl_->profiling || !impl_->profile_stream)
+    return Status::InvalidState("no profiled UBmem BatchGet launch");
+  const auto& state = impl_->streams.at(impl_->profile_stream);
+  std::vector<CoreStatus> reports(impl_->options.cores);
+  // As for URMA profiling, the caller completes the stream before this snapshot.
+  auto status = Acl("aclrtMemcpy(profile)", aclrtMemcpy(reports.data(), reports.size() * sizeof(CoreStatus),
+      state.statuses, reports.size() * sizeof(CoreStatus), ACL_MEMCPY_DEVICE_TO_HOST));
+  if (!status.ok()) return status;
+  profiles->clear();
+  for (const auto& report : reports) {
+    if (report.result != 0 || report.profile_magic != kProfileMagic || report.finish_cycle < report.start_cycle) {
+      profiles->clear();
+      return Status::Internal("invalid UBmem BatchGet profile");
+    }
+    BatchGetKernelProfile profile{};
+    profile.kernel_start_cycle = report.start_cycle;
+    profile.kernel_finish_cycle = report.finish_cycle;
+    profile.active_requests = report.completed;
+    profiles->push_back(profile);
   }
   return Status::OK();
 }

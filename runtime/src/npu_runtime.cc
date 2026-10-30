@@ -866,7 +866,8 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
-  if (!impl_->urma_operator) return Status::NotImplemented("URMA queue profiling is unavailable for UBmem");
+  if (impl_->options.transport == Transport::kUbmem)
+    return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
   return impl_->urma_operator->SetBatchGetKernelProfiling(enabled);
 }
 
@@ -876,7 +877,8 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
-  if (!impl_->urma_operator) return Status::NotImplemented("URMA queue profiling is unavailable for UBmem");
+  if (impl_->options.transport == Transport::kUbmem)
+    return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
   return impl_->urma_operator->CopyBatchGetKernelProfiles(profiles);
 }
 

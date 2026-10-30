@@ -265,6 +265,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.set_defaults(
+        transport=os.environ.get("KVAF_TRANSPORT", "urma"),
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
         sort_input_indices=environment_bool(
@@ -286,6 +287,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
+    if args.transport not in {"urma", "ubmem"}:
+        return "KVAF_TRANSPORT must be urma or ubmem"
+    if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
+        return "adaptive-ub-device and peer-ub-device apply only to URMA"
     block_bytes = args.token_bytes * args.tokens_per_block
     ddr_bytes = args.table_capacity * block_bytes
     if args.request_length <= 0 or args.request_length > MAX_INT32:
@@ -409,6 +414,42 @@ def print_samples(
     print(result)
 
 
+def print_ubmem_kernel_profile(
+    samples: list[list[dict[str, object]]], warmup: int, clock_mhz: int,
+    miss_count: int, token_bytes: int,
+) -> None:
+    cycles = [
+        max(
+            int(core["kernel_finish_cycle"]) - int(core["kernel_start_cycle"])
+            for core in sample
+        )
+        for sample in samples
+    ]
+    milliseconds = [value / clock_mhz / 1000.0 for value in cycles]
+    useful_bytes = len(samples) * miss_count * token_bytes
+    gibps = useful_bytes / (1024.0**3) / (sum(milliseconds) / 1000.0)
+    print(
+        "KERNEL_PROFILE_CONTRACT transport=ubmem "
+        f"clock_mhz={clock_mhz} samples={len(samples)} "
+        "aggregation=max_elapsed_across_cores "
+        "kernel_total=miss_count_address_resolution_mte_copy_and_final_drain "
+        "profile_overhead_included=1 d2h_outside_host_metric=1"
+    )
+    print(
+        "PERF_RESULT operation=batch_get_kernel_total "
+        f"samples={len(samples)} warmup_excluded={warmup} "
+        f"mean_ms={statistics.mean(milliseconds):.3f} "
+        f"p50_ms={percentile(milliseconds, 0.50):.3f} "
+        f"p90_ms={percentile(milliseconds, 0.90):.3f} "
+        f"p99_ms={percentile(milliseconds, 0.99):.3f} "
+        f"mean_cycles={statistics.mean(cycles):.3f} "
+        f"p50_cycles={percentile(cycles, 0.50):.3f} "
+        f"p90_cycles={percentile(cycles, 0.90):.3f} "
+        f"p99_cycles={percentile(cycles, 0.99):.3f} "
+        f"useful_GiBps={gibps:.3f} transport=ubmem"
+    )
+
+
 def print_kernel_profile(
     samples: list[list[dict[str, object]]],
     warmup: int,
@@ -418,9 +459,14 @@ def print_kernel_profile(
     request_length: int,
     miss_count: int,
     token_bytes: int,
+    transport: str = "urma",
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
+
+    if transport == "ubmem":
+        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes)
+        return
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
         return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
@@ -695,7 +741,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
             f"source_access_pattern={args.source_access_pattern} "
             f"output_access_pattern={args.output_access_pattern} "
-            f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
+            f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
@@ -961,6 +1007,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 request_length,
                 miss_count_value,
                 token_bytes,
+                args.transport,
             )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

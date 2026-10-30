@@ -12,10 +12,18 @@ KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
-KVAF_BATCH_GET_TOKEN_BYTES=(128 256 512 656 1024 2048 4096)
-KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
-KVAF_BATCH_GET_AIV_CORES=(1 2 4 8 16 32)
-KVAF_BATCH_GET_JETTYS_PER_CORE=(1 2 4 8 16 32 64)
+# Space-separated overrides allow a focused shape without editing the script.
+read -r -a KVAF_BATCH_GET_TOKEN_BYTES <<< "${KVAF_BATCH_GET_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"
+read -r -a KVAF_BATCH_GET_MISS_COUNTS <<< "${KVAF_BATCH_GET_MISS_COUNTS:-32 64 128 256 512 1024 2048 4096 8192}"
+read -r -a KVAF_BATCH_GET_AIV_CORES <<< "${KVAF_BATCH_GET_AIV_CORES:-1 2 4 8 16 32}"
+case "${KVAF_TRANSPORT:-urma}" in
+  urma)
+    read -r -a KVAF_BATCH_GET_JETTYS_PER_CORE <<< "${KVAF_BATCH_GET_JETTYS_PER_CORE:-1 2 4 8 16 32 64}"
+    ;;
+  ubmem) KVAF_BATCH_GET_JETTYS_PER_CORE=(1) ;;  # Unused by MTE; do not repeat identical runs.
+  *) echo "ERROR: KVAF_TRANSPORT must be urma or ubmem" >&2; exit 2 ;;
+esac
+transport="${KVAF_TRANSPORT:-urma}"
 
 [[ -x "$KVAF_BATCH_GET_PERF_RUNNER" ]] || {
   echo "ERROR: BatchGet performance runner is not executable: $KVAF_BATCH_GET_PERF_RUNNER" >&2
@@ -50,7 +58,7 @@ echo "BATCH_GET_MISS_SWEEP_LOG_DIR path=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"
 KVAF_BATCH_GET_SWEEP_COMBINATIONS=$((${#KVAF_BATCH_GET_TOKEN_BYTES[@]} *
   ${#KVAF_BATCH_GET_MISS_COUNTS[@]} * ${#KVAF_BATCH_GET_AIV_CORES[@]} *
   ${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]}))
-echo "BATCH_GET_MISS_SWEEP_PLAN token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
+echo "BATCH_GET_MISS_SWEEP_PLAN transport=$transport token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
 
 extract_field() {
   local record="$1"
@@ -88,6 +96,11 @@ for option in "$@"; do
     base_options+=("$option")
   fi
 done
+
+if [[ "$transport" == ubmem && "$adaptive_requested" == true ]]; then
+  echo "ERROR: --adaptive-ub-device applies only to URMA" >&2
+  exit 2
+fi
 
 selected_ub_device=""
 adaptive_selection_skipped=false
@@ -213,8 +226,12 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     for aiv_cores in "${KVAF_BATCH_GET_AIV_CORES[@]}"; do
       echo "BATCH_GET_CORE_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores"
       for jettys_per_core in "${KVAF_BATCH_GET_JETTYS_PER_CORE[@]}"; do
-        echo "BATCH_GET_CONFIG_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
-        log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}_aiv_cores_${aiv_cores}_jettys_per_core_${jettys_per_core}.log"
+        jetty_label="$jettys_per_core"
+        if [[ "$transport" == ubmem ]]; then jetty_label="n/a"; fi
+        echo "BATCH_GET_CONFIG_SWEEP_BEGIN token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label"
+        log_file="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/token_bytes_${token_bytes}_miss_count_${miss_count}_aiv_cores_${aiv_cores}"
+        if [[ "$transport" == urma ]]; then log_file+="_jettys_per_core_${jettys_per_core}"; fi
+        log_file+=".log"
         run_status=0
         if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
           ${sweep_options[@]+"${sweep_options[@]}"} \
@@ -228,7 +245,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           run_status=$?
         fi
         if ((run_status != 0)); then
-          echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$run_status" >&2
+          echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label status=$run_status" >&2
           exit "$run_status"
         fi
 
@@ -241,9 +258,9 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     completion_wait_profile_result="$(
       extract_profile_result "$log_file" batch_get_kernel_completion_wait
     )"
-        if [[ -z "$total_profile_result" || -z "$post_profile_result" ||
-          -z "$completion_wait_profile_result" ]]; then
-          echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core" >&2
+        if [[ -z "$total_profile_result" ]] ||
+          { [[ "$transport" == urma ]] && [[ -z "$post_profile_result" || -z "$completion_wait_profile_result" ]]; }; then
+          echo "ERROR: incomplete kernel profile results for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label" >&2
           exit 1
         fi
 
@@ -266,7 +283,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         fi
         if [[ "$adaptive_requested" == true && "$adaptive_selection_skipped" == false &&
           -z "$shape_ub_device" ]]; then
-          echo "ERROR: fixed UB device was not reported for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core" >&2
+          echo "ERROR: fixed UB device was not reported for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label" >&2
           exit 1
         fi
 
@@ -278,30 +295,38 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
     p50_cycles="$(extract_field "$total_profile_result" p50_cycles)"
     p90_cycles="$(extract_field "$total_profile_result" p90_cycles)"
     p99_cycles="$(extract_field "$total_profile_result" p99_cycles)"
-    post_mean_cycles="$(extract_field "$post_profile_result" mean_cycles)"
-    post_p50_cycles="$(extract_field "$post_profile_result" p50_cycles)"
-    post_p90_cycles="$(extract_field "$post_profile_result" p90_cycles)"
-    post_p99_cycles="$(extract_field "$post_profile_result" p99_cycles)"
-    completion_wait_mean_cycles="$(extract_field "$completion_wait_profile_result" mean_cycles)"
-    completion_wait_p50_cycles="$(extract_field "$completion_wait_profile_result" p50_cycles)"
-    completion_wait_p90_cycles="$(extract_field "$completion_wait_profile_result" p90_cycles)"
-    completion_wait_p99_cycles="$(extract_field "$completion_wait_profile_result" p99_cycles)"
+    if [[ "$transport" == urma ]]; then
+      post_mean_cycles="$(extract_field "$post_profile_result" mean_cycles)"
+      post_p50_cycles="$(extract_field "$post_profile_result" p50_cycles)"
+      post_p90_cycles="$(extract_field "$post_profile_result" p90_cycles)"
+      post_p99_cycles="$(extract_field "$post_profile_result" p99_cycles)"
+      completion_wait_mean_cycles="$(extract_field "$completion_wait_profile_result" mean_cycles)"
+      completion_wait_p50_cycles="$(extract_field "$completion_wait_profile_result" p50_cycles)"
+      completion_wait_p90_cycles="$(extract_field "$completion_wait_profile_result" p90_cycles)"
+      completion_wait_p99_cycles="$(extract_field "$completion_wait_profile_result" p99_cycles)"
+    fi
         token_bytes_values+=("$token_bytes")
         miss_count_values+=("$miss_count")
         aiv_core_values+=("$aiv_cores")
-        jettys_per_core_values+=("$jettys_per_core")
+        jettys_per_core_values+=("$jetty_label")
     mean_us="$(cycles_to_us "$mean_cycles")"
     p50_us="$(cycles_to_us "$p50_cycles")"
     p90_us="$(cycles_to_us "$p90_cycles")"
     p99_us="$(cycles_to_us "$p99_cycles")"
-    post_mean_us="$(cycles_to_us "$post_mean_cycles")"
-    post_p50_us="$(cycles_to_us "$post_p50_cycles")"
-    post_p90_us="$(cycles_to_us "$post_p90_cycles")"
-    post_p99_us="$(cycles_to_us "$post_p99_cycles")"
-    completion_wait_mean_us="$(cycles_to_us "$completion_wait_mean_cycles")"
-    completion_wait_p50_us="$(cycles_to_us "$completion_wait_p50_cycles")"
-    completion_wait_p90_us="$(cycles_to_us "$completion_wait_p90_cycles")"
-    completion_wait_p99_us="$(cycles_to_us "$completion_wait_p99_cycles")"
+    if [[ "$transport" == urma ]]; then
+      post_mean_us="$(cycles_to_us "$post_mean_cycles")"
+      post_p50_us="$(cycles_to_us "$post_p50_cycles")"
+      post_p90_us="$(cycles_to_us "$post_p90_cycles")"
+      post_p99_us="$(cycles_to_us "$post_p99_cycles")"
+      completion_wait_mean_us="$(cycles_to_us "$completion_wait_mean_cycles")"
+      completion_wait_p50_us="$(cycles_to_us "$completion_wait_p50_cycles")"
+      completion_wait_p90_us="$(cycles_to_us "$completion_wait_p90_cycles")"
+      completion_wait_p99_us="$(cycles_to_us "$completion_wait_p99_cycles")"
+    else
+      post_mean_us="n/a"; post_p50_us="n/a"; post_p90_us="n/a"; post_p99_us="n/a"
+      completion_wait_mean_us="n/a"; completion_wait_p50_us="n/a"
+      completion_wait_p90_us="n/a"; completion_wait_p99_us="n/a"
+    fi
     payload_bytes=$((miss_count * token_bytes))
     p50_gbps="$(awk -v byte_count="$payload_bytes" -v cycle_count="$p50_cycles" \
       -v mhz="$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" \
@@ -323,10 +348,11 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
+      "transport=$transport"
       "token_bytes=$token_bytes"
       "miss_count=$miss_count"
       "aiv_cores=$aiv_cores"
-      "jettys_per_core=$jettys_per_core"
+      "jettys_per_core=$jetty_label"
       "mean_ms=$mean_ms"
       "p50_ms=$p50_ms"
       "p90_ms=$p90_ms"
@@ -353,7 +379,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "selected_ub_device=$shape_ub_device"
     )
     printf '%s\n' "${result[*]}"
-        echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
+        echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label"
       done
       echo "BATCH_GET_CORE_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores"
     done
@@ -380,6 +406,7 @@ for index in "${!mean_us_values[@]}"; do
     "${p50_gbps_values[$index]}"
 done
 
+if [[ "$transport" == urma ]]; then
 printf '\nBATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_post\n'
 printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s\n' \
   token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us
@@ -409,6 +436,8 @@ for index in "${!completion_wait_mean_us_values[@]}"; do
     "${completion_wait_p90_us_values[$index]}" \
     "${completion_wait_p99_us_values[$index]}"
 done
+
+fi
 
 echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conversion=cycles_per_mhz_to_us"
 
