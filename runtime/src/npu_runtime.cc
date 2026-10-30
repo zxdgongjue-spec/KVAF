@@ -429,6 +429,13 @@ std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
 
 struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
+    // Resolve once per Runtime, including callers entering through Python.
+    const char* transport = std::getenv("KVAF_TRANSPORT");
+    if (transport != nullptr) {
+      if (std::strcmp(transport, "urma") == 0) options.transport = Transport::kUrma;
+      else if (std::strcmp(transport, "ubmem") == 0) options.transport = Transport::kUbmem;
+      else throw std::invalid_argument("KVAF_TRANSPORT must be urma or ubmem");
+    }
     config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
     config.npu_core_count = options.npu_core_count;
@@ -495,6 +502,9 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
+  std::fprintf(stderr, "[KVAF] NPU_RUNTIME transport=%s device=%u cores=%u\n",
+      config.transport == Transport::kUbmem ? "ubmem" : "urma",
+      config.device_id, config.npu_core_count);
 }
 
 NpuRuntime::~NpuRuntime() {

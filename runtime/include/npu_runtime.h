@@ -21,6 +21,7 @@ struct NpuRuntimeOptions {
         batch_get_token_bytes(token_bytes),
         batch_get_tokens_per_block(tokens_per_block) {}
 
+  // KVAF_TRANSPORT=urma|ubmem overrides this when the Runtime is constructed.
   Transport transport{Transport::kUrma};
   std::string batch_get_kernel_object_path;
   std::uint32_t batch_get_token_bytes;
