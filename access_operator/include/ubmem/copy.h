@@ -5,15 +5,20 @@
 namespace kvaf::ubmem {
 // Two-bank scheduling follows UnionCopy in vllm-ascend PR #18490 (1b180deb):
 // https://github.com/vllm-project/vllm-ascend/pull/18490
-// Shared by Get and Put, with arbitrary row sizes within the existing 32 KiB UB.
-// Event IDs 0/1 belong exclusively to this UBmem Get/Put kernel.
+// Deeper read-ahead follows DeepEP-Ascend's Engram fetch (3b25377):
+// https://github.com/deepseek-ai/DeepEP-Ascend/blob/3b25377/deep_ep/include/deep_ep/impls/engram/engram_fetch.hpp
+// Keep chunks <= 16 KiB and reduce the stage count for large rows to fit 32 KiB.
+// Event IDs [0, stages_) belong exclusively to this UBmem Get/Put kernel.
+template <uint32_t MaxStages = 2>
 class MteCopyPipeline {
  public:
   __aicore__ inline explicit MteCopyPipeline(uint64_t row_bytes) {
     const uint32_t limit = kMteBufferBytes / 2;
     chunk_bytes_ = row_bytes < limit ? row_bytes : limit;
     const uint32_t bank_bytes = (chunk_bytes_ + 31U) / 32U * 32U;
-    for (uint32_t bank = 0; bank < 2; ++bank) {
+    const uint32_t available_stages = kMteBufferBytes / bank_bytes;
+    stages_ = available_stages < MaxStages ? available_stages : MaxStages;
+    for (uint32_t bank = 0; bank < stages_; ++bank) {
       buffers_[bank].address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECIN);
       buffers_[bank].address_.bufferAddr = bank * bank_bytes;
       buffers_[bank].address_.dataLen = bank_bytes;
@@ -24,9 +29,9 @@ class MteCopyPipeline {
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
     for (uint64_t offset = 0; offset < bytes;) {
-      const uint32_t bank = issued_ % 2;
+      const uint32_t bank = issued_ % stages_;
       const auto event = static_cast<event_t>(bank);
-      // Only wait for the bank being reused; the other bank may still be busy.
+      // Only wait for the bank being reused; other banks may still be busy.
       if (writing_[bank]) {
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
         writing_[bank] = false;
@@ -41,14 +46,15 @@ class MteCopyPipeline {
       lengths_[bank] = length;
       AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
       ++issued_;
-      if (issued_ - written_ == 2) WriteOldest();
+      // Prefill stages_ - 1 reads, then issue one read before each write.
+      if (issued_ - written_ == stages_) WriteOldest();
       offset += length;
     }
   }
 
   __aicore__ inline void Finish() {
     while (written_ < issued_) WriteOldest();
-    for (uint32_t bank = 0; bank < 2; ++bank) {
+    for (uint32_t bank = 0; bank < stages_; ++bank) {
       if (writing_[bank])
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(static_cast<event_t>(bank));
     }
@@ -62,7 +68,7 @@ class MteCopyPipeline {
 
  private:
   __aicore__ inline void WriteOldest() {
-    const uint32_t bank = written_ % 2;
+    const uint32_t bank = written_ % stages_;
     const auto event = static_cast<event_t>(bank);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
     AscendC::GlobalTensor<uint8_t> destination;
@@ -74,10 +80,10 @@ class MteCopyPipeline {
     ++written_;
   }
 
-  AscendC::LocalTensor<uint8_t> buffers_[2];
-  uint64_t destinations_[2];
-  uint32_t lengths_[2], chunk_bytes_;
-  bool writing_[2] = {false, false};
+  AscendC::LocalTensor<uint8_t> buffers_[MaxStages];
+  uint64_t destinations_[MaxStages];
+  uint32_t lengths_[MaxStages], chunk_bytes_, stages_;
+  bool writing_[MaxStages] = {};
   uint64_t issued_ = 0, written_ = 0;
 };
 
