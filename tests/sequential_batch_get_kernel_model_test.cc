@@ -15,7 +15,11 @@
 #include "cpu_push_get_abi.h"
 #include "sequential_batch_get_abi.h"
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_scatter_batch_get_aiv.asc"
+// The production Ascend metadata section is not a valid native Mach-O section.
+// Keep the metadata object/value in this model, as in the direct kernel model.
+#define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_gather_batch_get_aiv.asc"
+#undef __attribute__
 
 namespace {
 using namespace kvaf_scatter;
@@ -385,15 +389,21 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  const auto& metadata = KvafGatherBatchGetAivKernelV3_kernel_type_section.value;
+  assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
   for (uint32_t probe = KVAF_GATHER_PROBE_ACK; probe <= KVAF_GATHER_PROBE_FIRST_READ; ++probe)
     for (uint32_t cores : {1U, 3U, 8U}) {
       Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, 6);
       f.DataQueueDepth(4096); f.args.gather_probe = probe;
       for (uint32_t count : {8193U, 1U, 8193U}) {
         f.Next(count);
+        const auto config_writes = aiv_model::ub_to_out_config_writes;
         std::vector<uint64_t> before(cores);
         for (uint32_t c = 0; c < cores; ++c) before[c] = f.queues[c * 2]->doorbells;
         f.Run();
+        if (probe <= KVAF_GATHER_PROBE_WQE)
+          assert(aiv_model::ub_to_out_config_writes == config_writes);
+        else assert(aiv_model::ub_to_out_config_writes > config_writes);
         for (uint32_t c = 0; c < cores; ++c) {
           const auto rows = uint64_t(count) * (c + 1) / cores - uint64_t(count) * c / cores;
           const auto added = f.queues[c * 2]->doorbells - before[c];

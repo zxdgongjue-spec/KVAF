@@ -67,6 +67,7 @@ inline uint64_t mte2_copies{}, mte3_copies{};
 inline uint64_t mte2_aligned_copies{}, mte2_tail_copies{};
 inline uint64_t ub_scalar_reads{};
 inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
+inline uint64_t ub_to_out_config_writes{};
 inline bool corrupt_next_mte2{};
 // Optional exact source interval for tests: a padded UB tail must never cause
 // a read outside the requested GM token, even if the allocation has slack.
@@ -101,10 +102,10 @@ inline void wait_flag(int source, int target, event_t event) {
     aiv_model::mte3.Finish();
   }
 }
-inline void set_loop_size_ubtoout(uint64_t) {}
-inline void set_loop1_stride_ubtoout(uint64_t) {}
-inline void set_loop2_stride_ubtoout(uint64_t) {}
-inline void set_atomic_none() {}
+inline void set_loop_size_ubtoout(uint64_t) { ++aiv_model::ub_to_out_config_writes; }
+inline void set_loop1_stride_ubtoout(uint64_t) { ++aiv_model::ub_to_out_config_writes; }
+inline void set_loop2_stride_ubtoout(uint64_t) { ++aiv_model::ub_to_out_config_writes; }
+inline void set_atomic_none() { ++aiv_model::ub_to_out_config_writes; }
 inline uintptr_t get_imm(uint32_t offset) {
   return reinterpret_cast<uintptr_t>(aiv_model::ub + offset);
 }

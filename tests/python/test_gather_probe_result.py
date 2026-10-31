@@ -67,7 +67,8 @@ class GatherProbeResultTests(unittest.TestCase):
             self.assertEqual(perf.main(), 2)
 
     def test_debug_stops_on_first_error_and_uses_benchmark_shape(self):
-        with patch.dict(os.environ, {"KVAF_RUN_NPU_TESTS": "1", "KVAF_NPU_CORE_COUNT": "1"}), \
+        with patch.dict(os.environ, {"KVAF_RUN_NPU_TESTS": "1", "KVAF_NPU_CORE_COUNT": "1",
+                                     "ASCEND_SLOG_PRINT_TO_STDOUT": "", "ASCEND_GLOBAL_LOG_LEVEL": ""}), \
              patch.object(debug.subprocess, "run", side_effect=[
                  subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)]) as run, \
              contextlib.redirect_stdout(io.StringIO()):
@@ -77,13 +78,18 @@ class GatherProbeResultTests(unittest.TestCase):
             self.assertEqual(environment["KVAF_AIV_GATHER_PROBE"], "wqe")
             self.assertEqual(environment["KVAF_NPU_REQUESTS"], str(perf.REQUEST_COUNT))
             self.assertEqual(environment["KVAF_NPU_TOKEN_BYTES"], str(perf.TOKEN_BYTES))
+            self.assertEqual(environment["ASCEND_SLOG_PRINT_TO_STDOUT"], "1")
+            self.assertEqual(environment["ASCEND_GLOBAL_LOG_LEVEL"], "3")
 
     def test_full_regression_has_probe_disabled(self):
         stages = []
         def run(command, *, env, check):
             stages.append(env["KVAF_AIV_GATHER_PROBE"])
+            self.assertEqual(env["ASCEND_SLOG_PRINT_TO_STDOUT"], "0")
+            self.assertEqual(env["ASCEND_GLOBAL_LOG_LEVEL"], "2")
             return subprocess.CompletedProcess(command, 0)
-        with patch.dict(os.environ, {"KVAF_RUN_NPU_TESTS": "1"}), \
+        with patch.dict(os.environ, {"KVAF_RUN_NPU_TESTS": "1", "ASCEND_SLOG_PRINT_TO_STDOUT": "0",
+                                     "ASCEND_GLOBAL_LOG_LEVEL": "2"}), \
              patch.object(debug.subprocess, "run", side_effect=run), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(debug.main(), 0)

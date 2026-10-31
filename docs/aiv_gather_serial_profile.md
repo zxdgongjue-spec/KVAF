@@ -222,7 +222,7 @@ UB WQE 区间，并展开最多 6 个 SGE 的写入，避免额外的私有临�
 | stage | 实际完成的范围 | 数据输出 |
 | --- | --- | --- |
 | ack | 输入校验、清单、控制 WRITE、CPU gather 和最终 ACK | 全部保持 guard |
-| wqe | ack + 首批 SIMT WQE 构造，并等待 VF→Scalar 完成 | 全部保持 guard；未写 SQ |
+| wqe | ack + 首批 SIMT WQE 构造，并等待 VF→Scalar 完成；跳过 MTE3 配置 | 全部保持 guard；未写 SQ |
 | sq | ack + 首批 VF 与 UB→SQ MTE3 完成 | 全部保持 guard；未敲数据 doorbell |
 | first_read | ack + 每个非空 lane 首批最多 128 READ WR，等待有序尾 CQ | 核对已读前缀及其余 guard |
 | full | 关闭所有探针，运行原有完整输出回归 | 核对全部数据、guard、批次/stream 复用 |
@@ -284,6 +284,43 @@ DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python -u tests/python/test_aiv_gather_pipelin
 如需单独运行某个检查点，可设置 `KVAF_AIV_GATHER_PROBE=ack/wqe/sq/first_read`
 并执行 `test_aiv_gather_batch_get.py`。正常性能脚本会拒绝非空探针设置，
 避免输出部分数据却被误记成性能结果。
+
+### V3 已加载、ACK 完成后 WQE 检查点异常
+
+新反馈已出现 `GATHER_KERNEL_READY ... V3 args_bytes=232`、
+`GATHER_PROBE_PASS stage=ack`，随后 `probe=wqe` 同步返回 507015。
+因此加载问题已解决，8193 请求的控制链路已到达最终 ACK，尚未通过首批
+WQE 构造检查；没有运行到 SQ payload 搬运、数据 doorbell 或数据 CQ。
+该版本 wqe 检查点仍包含 MTE3 寄存器配置，所以此结果尚不能单独证明
+异常指令就在 SIMT 函数体内。移除私有数组后仍复现，根因仍需验证。
+
+本轮按同一日志中已成功执行的 BatchPut 路径做三项调整：
+
+1. MainScalar 生成 `__ubuf__ uint32_t*` bank 指针并传入 VF；VF 只在该 UB
+   指针上做偏移，不再在 VF 内调用 get_imm 构造地址。
+2. 为 gather 导出显式 `FunLevelKType / K_TYPE_AIV` 元数据，与 BatchPut 和
+   direct_read 一致。独立二进制和 Host launch 配置见
+   [CANN 9.1 官方 AIV 调度示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/comm_op_dev_guide/aiv_comm_op_dev/op_dispatch.md)。
+3. wqe 检查点跳过 MTE3 的 loop/atomic 配置；sq、first_read 和正常流水继续
+   执行原有配置，使 wqe 的故障范围只包含 VF 准备、构造及完成等待。
+
+ABI 仍为 V3 / args 232 B / profile 192 B，已有 V3 Host 可以只重编 gather
+kernel。它们是针对已定位范围的修正，不等于已证明 507015 的具体根因。
+
+```bash
+git pull --ff-only
+cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python -u tests/python/test_aiv_gather_pipeline_debug.py
+```
+
+debug 的子进程默认设置 `ASCEND_SLOG_PRINT_TO_STDOUT=1`、
+`ASCEND_GLOBAL_LOG_LEVEL=3`，将 CANN ERROR 日志打屏；已有显式设置时保持
+调用者的值，BEGIN 行会打印实际值。设置仅作用于诊断子进程，不修改 shell
+和性能脚本环境。日志开关含义见
+[日志打屏](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/maintenref/envvar/envref_07_0121.html) 和
+[全局日志等级](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/maintenref/envvar/envref_07_0122.html)。
+如果仍失败，保留首个失败检查点之前的完整 CANN ERROR 块；若包含 PC、
+SU/MTE/VF 错误位，可继续对照本次二进制定位，不能沿用旧二进制的偏移。
 
 ## 计时范围
 
