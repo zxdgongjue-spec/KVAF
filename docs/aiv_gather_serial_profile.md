@@ -60,6 +60,27 @@ summary 按 `row_kind` 区分：`e2e_summary` 是无打点性能基线，
 `profile_host_mean` 和各核的 `profile_core_mean`。通过 run_label、cores、
 request_count、token_bytes 等列筛选对照，避免把不同核或不同采集口径相加。
 
+列顺序按字段名固定：`clock_mhz`、`clock_source`、`cpu_profile`、`kernel_path`、
+`put_kernel_path`、`request_plan`、`timing_contract` 放在 `mode` 前；summary 的
+`error_type`、`error_message` 放在 `total_us` 后。移动后部分 Excel 列字母会
+变化，整理数据时建议按表头名称定位。
+
+summary 的 Host 和 AIV 行共享表头，但各自只填自己的指标：
+
+| row_kind | 读取哪些时间 | READ 时间在哪里 |
+| --- | --- | --- |
+| e2e_summary / profile_e2e_summary | mean_us、p50_us 等整批统计 | 已包含在整批时间中，不额外拆阶段 |
+| profile_host_mean | prepare_us、launch_us、status_enqueue_us、wait_us、finish_us、total_us | Host 只观察同步等待，没有独立 READ 计时 |
+| profile_core_mean | input / descriptor / publish / wait_cpu / read / finalize / total 的 cycles 和 us | read_cycles，频率核实后有 read_us |
+
+`profile_host_mean` 行的阶段 cycles 列应为空。`wait_us` 是 Host 的剩余同步
+等待，包括设备执行和状态/profile D2H；AIV 的 `wait_cpu_cycles` 只覆盖通知
+完成到最终 ACK，`read_cycles` 从最终 ACK 到数据 CQ 完成。READ 内又有
+`read_build_cycles`（构造和 SQ 写入）与 `data_cq_wait_cycles`（数据 CQ 等待）
+等子计数。Host 等待、AIV 阶段、READ 子计数存在包含关系，不能重复相加。
+当 `clock_source=unverified` 时，AIV 的 read_us 等时间列留空，read_cycles
+仍在 profile_core_mean 行输出。这表示尚缺换算频率，不表示漏采 READ。
+
 CSV schema_version 为 2。所有耗时列以 `_us` 命名，不再导出 `_ns` 列；
 Host 的内部 ns 在导出时除以 1000。AIV 保留原始 cycle 供诊断，六阶段、
 构造及 CQ 等待均有对应 `_us` 列；频率未核实时这些列留空，不猜测频率。

@@ -304,10 +304,18 @@ def export_csv_results(
         except FileExistsError:
             suffix += 1
     metadata = {**metadata, "run_directory": target.name}
+    # Keep less frequently compared transport/timing metadata before mode,
+    # leaving the shape and measurements together on the right. Refer to field
+    # names here: spreadsheet letters change whenever the schema is reordered.
+    before_mode = ("clock_mhz", "clock_source", "cpu_profile", "kernel_path", "put_kernel_path",
+                   "request_plan", "timing_contract")
+    metadata_columns = [key for key in metadata if key not in before_mode]
+    mode_index = metadata_columns.index("mode")
+    metadata_columns[mode_index:mode_index] = before_mode
     outputs = (
-        ("summary", ["row_kind", "sampling_status", "error_type", "error_message", "profile", "core",
+        ("summary", ["row_kind", "sampling_status", "profile", "core",
                      "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
-                     *host_columns, *core_columns], summary),
+                     *host_columns, "error_type", "error_message", *core_columns], summary),
         ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps"], e2e_rows),
         ("profile_host", ["sample_index", "profile", "sequence", "call_e2e_us", *host_columns], host_rows),
         ("profile_core", ["sample_index", "profile", "sequence", "core", *core_columns], core_rows),
@@ -317,7 +325,7 @@ def export_csv_results(
         path = target / f"{name}.csv"
         # A new per-test directory plus exclusive creation protect measurements.
         with path.open("x", encoding="utf-8-sig", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=[*metadata, *dict.fromkeys(columns)])
+            writer = csv.DictWriter(stream, fieldnames=[*metadata_columns, *dict.fromkeys(columns)])
             writer.writeheader()
             writer.writerows({**metadata, **row} for row in rows)
         paths.append(path)

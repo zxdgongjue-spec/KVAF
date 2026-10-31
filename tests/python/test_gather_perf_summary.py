@@ -158,9 +158,14 @@ class GatherPerfSummaryTest(unittest.TestCase):
             self.assertEqual(float(results["e2e_summary"]["p95_us"]), 1950.0)
             self.assertEqual(float(results["profile_e2e_summary"]["mean_us"]), 2150.0)
             self.assertEqual(results["profile_host_mean"]["first_sequence"], "123")
+            # Host wait includes current-batch device/D2H completion. It has no
+            # separately measured READ stage, so never fill AIV cells in it.
+            self.assertEqual(results["profile_host_mean"]["read_cycles"], "")
+            self.assertEqual(results["profile_host_mean"]["read_us"], "")
             core_means = [row for row in summary if row["row_kind"] == "profile_core_mean"]
             self.assertEqual(len(core_means), 3)
             self.assertEqual([float(row["total_cycles"]) for row in core_means], [6, 12, 18])
+            self.assertTrue(all(row["prepare_us"] == "" and row["wait_us"] == "" for row in core_means))
             self.assertTrue(all(row["run_id"] == metadata["run_id"] for row in summary + e2e + host + cores))
 
     def test_csv_clock_conversion_uses_captured_configuration(self):
@@ -175,7 +180,27 @@ class GatherPerfSummaryTest(unittest.TestCase):
             host = self.read_csv(paths[2])
             self.assertAlmostEqual(float(host[0]["prepare_us"]), 0.1)
             self.assertAlmostEqual(float(host[0]["total_us"]), 0.1)
+            summary = self.read_csv(paths[0])
+            core_mean = next(row for row in summary if row["row_kind"] == "profile_core_mean" and row["core"] == "0")
+            self.assertAlmostEqual(float(core_mean["read_us"]), 1 / 50)
             self.assertEqual(self.read_csv(paths[1]), [])
+
+    def test_csv_metadata_and_error_columns_follow_requested_order(self):
+        metadata = self.csv_metadata()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = perf.export_csv_results(directory, metadata, [1000.0], [snapshot()], [1100.0])
+            moved = ["clock_mhz", "clock_source", "cpu_profile", "kernel_path", "put_kernel_path",
+                     "request_plan", "timing_contract"]
+            for path in paths:
+                with path.open(encoding="utf-8-sig", newline="") as stream:
+                    columns = next(csv.reader(stream))
+                mode = columns.index("mode")
+                self.assertEqual(columns[mode - len(moved):mode], moved)
+                self.assertLess(mode, columns.index("cores"))
+                if path.name == "summary.csv":
+                    total = columns.index("total_us")
+                    self.assertEqual(columns[total + 1:total + 3], ["error_type", "error_message"])
+                    self.assertLess(columns.index("profile"), total)
 
     def test_csv_failure_preserves_completed_samples_and_quotes_errors(self):
         metadata = self.csv_metadata()
