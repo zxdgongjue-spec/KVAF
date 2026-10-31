@@ -1,8 +1,9 @@
 # AIV BatchGet 第一阶段实现与验证
 
 Gather 串行计时新增独立性能入口，参数在脚本顶部修改，见
-[Gather 串行阶段计时](aiv_gather_serial_profile.md)。当前 gather launch ABI 为
-224 B，symbol 为 `KvafGatherBatchGetAivKernelV2`，需要同步更新 Host 和 kernel。
+[Gather 阶段计时与内部流水](aiv_gather_serial_profile.md)。当前 gather launch ABI 为
+232 B，symbol 为 `KvafGatherBatchGetAivKernelV3`，需要同步更新 Host 和 kernel。
+V3 增加可选执行检查点，用于定位当前 1 核流水版的 507015；尚未完成硬件验收。
 
 ## 当前临时运行方式：只检查 CPU push / done
 
@@ -36,7 +37,8 @@ PROBE_COMPLETE: stage=done ... output=unchanged cpu_push=done_seen mte2=skipped 
 ## 范围
 
 在 `codex/aiv-urma-scatter-gather` 实现无流水顺序路径，默认仍为 `direct_read`。
-没有接入第二阶段的 chunk 消费、双缓冲或第三阶段的软件在途预算。
+没有接入 CPU chunk 消费或第三阶段的软件在途预算；gather 已加入 AIV 内部的
+SIMT WQE 构造、UB 双缓冲和 MTE3 分批发布。
 总体设计见 [三阶段设计](aiv_batch_get_scatter_gather_design.md)。
 
 | 模式 | 顺序依赖 |
@@ -70,9 +72,10 @@ Scatter kernel 已按硬件故障定位需要撤掉入口的 `InitSocState()`，
 
 Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1～6 个本地 SGE，
 每条 READ 的总长度最多 64 KiB，按 64 B WQEBB 处理变长 WQE 和 SQ 回绕。
-Gather 只使用标量 GM 访问、缓存操作与 USER_CTL 队列，不使用 LocalTensor
-或 MTE payload 拷贝；其入口不调用 `InitSocState()`，退出不附加
-`PipeBarrier<PIPE_ALL>()`，恢复此前通过硬件测试时的执行方式。
+Gather 的控制阶段使用标量 GM 访问、缓存操作与 USER_CTL 队列。数据快速
+路径由 SIMT 编码 WQE、MTE3 搬到 SQ；不使用 LocalTensor 或 MTE payload
+拷贝。入口不调用 `InitSocState()`，退出不附加 `PipeBarrier<PIPE_ALL>()`，
+通过 V/MTE3/S 事件等待完成已发出的 WQE 构造与搬运。
 阶段内部批量提交，只在物理 SQ/WR 容量不足或阶段结束时 drain；
 `batch_get_max_inflight_total` 仅对原 `direct_read` 生效。
 
@@ -86,9 +89,9 @@ Python 继续使用统一的 `kvaf.NpuRuntime(..., aiv_batch_get_mode=...)` 和
 | --- | --- | --- |
 | Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
-| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，224 B |
+| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，232 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV2` |
+| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV3` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 | 独立测试 | `tests/python/test_aiv_scatter_batch_get.py` | `tests/python/test_aiv_gather_batch_get.py` |
 

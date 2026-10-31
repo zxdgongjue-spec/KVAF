@@ -131,10 +131,9 @@ sampling_status 只描述采样阶段，随后 Runtime shutdown 的异常仍单�
 ## 构建与运行
 
 沿用第一阶段的 CANN/Python/CPU 地址环境，在仓库根目录执行。
-gather profiling 使用含 profile 指针的 V2 ABI，loader 要求
-`KvafGatherBatchGetAivKernelV2`，旧 V1 kernel 会加载失败。
-若已部署支持上述 CSV/profile 的 V2 Host，本次 AIV 内部流水只需重编并部署
-gather kernel；从更旧版本更新时，Host/Python 和 kernel 需一起更新。
+当前 gather 使用含可选诊断字段的 V3 ABI，loader 要求
+`KvafGatherBatchGetAivKernelV3`，旧 V1/V2 kernel 会加载失败。
+本次必须同步更新 Host/Python 和 gather kernel，不能只重编 kernel。
 scatter 和 direct 的 kernel ABI 不变。
 
 ```bash
@@ -190,11 +189,11 @@ Jetty、输入校验和六阶段计时边界保持原样。数据仍由 NIC 从 
 物理容量分 wave，不引入额外的软件窗口。
 
 重新编译并部署 `kvaf_gather_batch_get_kernels.o` 后，仍用上面的启动命令和
-CSV 目录格式。Host/kernel 参数 ABI 仍是 V2，224 B args / 192 B profile，
+CSV 目录格式。当前 Host/kernel 参数 ABI 为 V3，232 B args / 192 B profile，
 无需更新 CPU 服务。不要只更新 Python label 而继续加载旧 kernel。
 
 ```bash
-cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+cmake --build build-npu -j
 ```
 
 与串行版对比时，不需要分三步单独跑：保存旧版本的 CSV，固定 token、
@@ -204,6 +203,53 @@ request-count、SGL、seed、CPU 线程数和设备，分别对 1/3/8 核运行�
 多核以最慢 lane 的 read/total 解释整批延迟，不把各核时间相加。
 `data_wrs`、`data_wqebbs` 应与基线一致，`data_doorbells` 增多是提前发布的
 预期行为。实际收益需在 950DT 上测量，本地 CPU 模型只能验证协议与同步。
+
+## 流水版首次调用报 507015 的复测
+
+目前反馈为 1 核、sequence=1 在 Host synchronize 返回 507015，尚无设备侧
+PC/错误位。这个日志不能区分异常来自标量、SIMT 还是 MTE，也不能把
+shutdown 同步失败当成第二个独立原因。
+
+编码器已移除运行期索引的线程私有 `words[48]`，改为各线程直接写自己的
+UB WQE 区间，并展开最多 6 个 SGE 的写入，避免额外的私有临时数组。
+这是针对新代码差异的候选修正，尚未证明私有栈就是此次异常的根因。
+分批发布、双缓冲、队列容量限制和 CPU 协议保持原样。
+
+为在只有 Host 错误码时仍能推进定位，V3 增加四个可选前缀检查点。普通
+运行默认关闭；Host 同步成功并核实本轮 sequence/result/phase 后才报告完成。
+这些检查点不会被当成普通 BatchGet 成功或性能样本。
+
+| stage | 实际完成的范围 | 数据输出 |
+| --- | --- | --- |
+| ack | 输入校验、清单、控制 WRITE、CPU gather 和最终 ACK | 全部保持 guard |
+| wqe | ack + 首批 SIMT WQE 构造，并等待 VF→Scalar 完成 | 全部保持 guard；未写 SQ |
+| sq | ack + 首批 VF 与 UB→SQ MTE3 完成 | 全部保持 guard；未敲数据 doorbell |
+| first_read | ack + 每个非空 lane 首批最多 128 READ WR，等待有序尾 CQ | 核对已读前缀及其余 guard |
+| full | 关闭所有探针，运行原有完整输出回归 | 核对全部数据、guard、批次/stream 复用 |
+
+wqe/sq 检查点验证相应执行单元已完成，不单独声称 WQE 内容已逐字校验；
+first_read/full 进一步验证实际 payload。前缀不留下已发布但未完成的 READ。
+输入为空不会被 Host 当成有效诊断；探针禁止异步调用和性能 profile。
+
+沿用原来的 kernel/Python/CPU 服务环境，更新并完整重编后执行一个命令：
+
+```bash
+git pull --ff-only
+cmake --build build-npu -j
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python -u tests/python/test_aiv_gather_pipeline_debug.py
+```
+
+debug 脚本读取性能脚本顶部的 TOKEN_BYTES、REQUEST_COUNT、GATHER_SGL_SIZE，
+按 ack → wqe → sq → first_read → full 启动独立子进程，只做功能检查，
+不采每一步的性能收益。首个失败后立即停止，打印
+`GATHER_PIPELINE_DEBUG_STOP stage=...`；提供该行及其前面的 traceback 即可
+缩小实际执行范围。全部完成才打印 `GATHER_PIPELINE_DEBUG_PASS`。
+加载日志应包含 `symbol=KvafGatherBatchGetAivKernelV3 args_bytes=232`。
+诊断脚本的源数据使用功能回归的确定性字节模式，不作为吞吐对比工作负载。
+
+如需单独运行某个检查点，可设置 `KVAF_AIV_GATHER_PROBE=ack/wqe/sq/first_read`
+并执行 `test_aiv_gather_batch_get.py`。正常性能脚本会拒绝非空探针设置，
+避免输出部分数据却被误记成性能结果。
 
 ## 计时范围
 
@@ -320,7 +366,8 @@ HBM profile 记录，使用显式 `__gm__ volatile` 指针。入口显式初始�
 结构体整体或逐字段回拷。关闭 profile 时不读时钟、不访问 profile 内存。
 每条记录仍只有一个 AIV 核写入，Host 仍在 stream 完成后读取。
 
-ABI 保持 V2 / args 224 B / profile 192 B，Host 仍要求 `valid_mask=0x7f`，
+该次 GM 时间线修复保持 V2 / args 224 B / profile 192 B；后续诊断升级为 V3。
+Host 仍要求 `valid_mask=0x7f`，
 继续拒绝硬件日志中的不完整形状。此次需在 NPU 目标机运行：
 
 ```bash

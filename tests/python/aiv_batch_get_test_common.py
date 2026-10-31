@@ -73,6 +73,22 @@ def expect_scatter_probe(call, stage: str, *, expected_bytes: int | None = None)
         raise AssertionError("scatter probe returned ordinary success; rebuild Host and kernel together")
 
 
+def expect_gather_probe(call, stage: str, *, requests: int, data_wrs: int) -> None:
+    marker = f"[KVAF_AIV_GATHER_PROBE_COMPLETE] stage={stage} "
+    try:
+        call()
+    except RuntimeError as error:
+        if not str(error).startswith(marker):
+            raise
+        for field, expected in (("requests", requests), ("data_wrs", data_wrs)):
+            match = re.search(rf"(?:^| ){field}=(\d+)(?: |$)", str(error))
+            if not match or int(match[1]) != expected:
+                raise AssertionError(f"gather {stage} checkpoint {field} does not match the request") from error
+        print(str(error), flush=True)
+    else:
+        raise AssertionError("gather probe returned ordinary success; rebuild Host and kernel together")
+
+
 def run(mode: str) -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
@@ -85,6 +101,9 @@ def run(mode: str) -> int:
     probe = os.environ.get("KVAF_AIV_SCATTER_PROBE", "") if mode == "cpu_push_scatter" else ""
     if probe and probe not in ("done", "flush", "setup", "dma", "load", "copy"):
         raise ValueError("scatter probe must be done/flush/setup/dma/load/copy")
+    gather_probe = os.environ.get("KVAF_AIV_GATHER_PROBE", "") if mode == "gather_read" else ""
+    if gather_probe and gather_probe not in ("ack", "wqe", "sq", "first_read"):
+        raise ValueError("gather probe must be ack/wqe/sq/first_read")
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids
@@ -112,6 +131,8 @@ def run(mode: str) -> int:
     keys = build_dsa_keys(blocks, q_capacity=blocks)
     counts = sorted({0, 1, min(7, capacity), min(19, capacity), capacity})
     counts += list(reversed(counts))
+    if gather_probe:
+        counts = [capacity]
     if probe:
         # One nonempty request per participating core; keep normal allocation and
         # output placement. Empty requests cannot establish a checkpoint.
@@ -157,8 +178,15 @@ def run(mode: str) -> int:
             count = torch.tensor([active], dtype=torch.int32, device=device)
             output = outputs[epoch % 2]
             output.fill_(0xAD)
-            kwargs = dict(synchronize=bool(probe) or bool(epoch % 2))
-            if probe:
+            kwargs = dict(synchronize=bool(probe or gather_probe) or bool(epoch % 2))
+            if gather_probe:
+                sgl = int(os.environ.get("KVAF_AIV_GATHER_SGL_SIZE", "6"))
+                wrs = sum(min(128, ((active * (c + 1) // cores - active * c // cores) + sgl - 1) // sgl)
+                          for c in range(cores)) if gather_probe == "first_read" else 0
+                expect_gather_probe(lambda: runtime.batch_get(
+                    view, indices, offsets, count, rows, output, **kwargs), gather_probe,
+                    requests=active, data_wrs=wrs)
+            elif probe:
                 expect_scatter_probe(lambda: runtime.batch_get(
                     view, indices, offsets, count, rows, output, **kwargs), probe,
                     expected_bytes=active * token)
@@ -169,10 +197,23 @@ def run(mode: str) -> int:
                                   count, rows, output, **kwargs)
             torch.npu.synchronize()
             expected = torch.full_like(output.cpu(), 0xAD)
-            if not probe or probe == "copy":
+            if gather_probe == "first_read":
+                for core in range(cores):
+                    first = active * core // cores
+                    last = min(active * (core + 1) // cores, first + 128 * sgl)
+                    src_rows = index_cpu[first:last].long() * 4 + offset_cpu[first:last].long() // token
+                    expected[row_cpu[first:last].long()] = source_cpu[src_rows]
+            elif not gather_probe and (not probe or probe == "copy"):
                 src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
                 expected[row_cpu[:active].long()] = source_cpu[src_rows]
             assert torch.equal(output.cpu(), expected), (mode, cores, token, active, epoch)
+
+        if gather_probe:
+            runtime.shutdown()
+            print(f"GATHER_PROBE_PASS stage={gather_probe} cores={cores} token_bytes={token} "
+                  f"requests={capacity} output={'first_post_verified' if gather_probe == 'first_read' else 'guard_unchanged'}",
+                  flush=True)
+            return 0
 
         if probe:
             runtime.shutdown()

@@ -20,6 +20,23 @@ namespace kvaf {
 using namespace sequential_detail;
 namespace {
 Status Error(const char* what) { return Status::Internal(std::string("AIV sequential BatchGet: ") + what); }
+const char* ProbeName(uint32_t probe) {
+  switch (probe) {
+    case KVAF_GATHER_PROBE_ACK: return "ack";
+    case KVAF_GATHER_PROBE_WQE: return "wqe";
+    case KVAF_GATHER_PROBE_SQ: return "sq";
+    case KVAF_GATHER_PROBE_FIRST_READ: return "first_read";
+    default: return "none";
+  }
+}
+Status ReadProbe(uint32_t* probe) {
+  *probe = KVAF_GATHER_PROBE_NONE;
+  const char* value = std::getenv("KVAF_AIV_GATHER_PROBE");
+  if (!value || !*value) return Status::OK();
+  for (uint32_t p = KVAF_GATHER_PROBE_ACK; p <= KVAF_GATHER_PROBE_FIRST_READ; ++p)
+    if (std::strcmp(value, ProbeName(p)) == 0) { *probe = p; return Status::OK(); }
+  return Status::InvalidArgument("KVAF_AIV_GATHER_PROBE must be ack/wqe/sq/first_read or empty");
+}
 static_assert(sizeof(KvafSequentialGatherHeader) == sizeof(peer::GatherDescriptorHeader));
 static_assert(offsetof(KvafSequentialGatherHeader, ready_bytes) ==
               offsetof(peer::GatherDescriptorHeader, ready_bytes));
@@ -70,7 +87,7 @@ struct GatherBatchGet::Impl {
   Status AclFailure(const char* phase, aclError code) const {
     return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
         " sequence=" + std::to_string(sequence) + " phase=" + phase +
-        " acl=" + std::to_string(code) +
+        " acl=" + std::to_string(code) + " probe=" + ProbeName(args.probe) +
         "; resources retained");
   }
 
@@ -100,8 +117,10 @@ struct GatherBatchGet::Impl {
     if (pending_profile) latest_profile.wait_ns = finish_begin - wait_begin;
     pending = nullptr;
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
-    const uint64_t expected_result = KVAF_SEQ_OK;
-    const uint64_t expected_phase = KVAF_SEQ_COMPLETE;
+    const uint64_t expected_result = args.probe ? KVAF_SEQ_PROBE_COMPLETE : KVAF_SEQ_OK;
+    const uint64_t expected_phase = args.probe ? KVAF_GATHER_AFTER_ACK + args.probe - 1 :
+        uint64_t(KVAF_SEQ_COMPLETE);
+    uint64_t completed_requests = 0, data_wrs = 0;
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
       if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence || s.result != expected_result ||
@@ -114,9 +133,27 @@ struct GatherBatchGet::Impl {
             " expected_phase=" + std::to_string(expected_phase) +
             " expected_result=" + std::to_string(expected_result));
       }
+      const uint64_t expected_wrs = args.probe == KVAF_GATHER_PROBE_FIRST_READ ?
+          std::min<uint64_t>(KVAF_GATHER_WRS_PER_POST,
+              (s.requests + args.sgl_size - 1) / args.sgl_size) : 0;
+      if (args.probe && s.data_wrs != expected_wrs) {
+        failed = true;
+        return Error("gather probe READ WR count mismatch");
+      }
+      completed_requests += s.requests;
+      data_wrs += s.data_wrs;
     }
     if (output_buffer) KvafBatchGetLocalBufferRelease(output_buffer);
     output_buffer = nullptr;
+    if (args.probe) {
+      if (!completed_requests) { failed = true; return Error("gather probe completed no requests"); }
+      // A prefix is a diagnostic, never successful BatchGet or a perf sample.
+      return Status::NotImplemented("[KVAF_AIV_GATHER_PROBE_COMPLETE] stage=" +
+          std::string(ProbeName(args.probe)) + " sequence=" + std::to_string(sequence) +
+          " cores=" + std::to_string(config.npu_core_count) +
+          " requests=" + std::to_string(completed_requests) +
+          " data_wrs=" + std::to_string(data_wrs));
+    }
     if (pending_profile) {
       const auto captured = CaptureProfile();
       if (!captured.ok()) { failed = true; return captured; }
@@ -283,10 +320,15 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.config.aiv_batch_get_mode != "gather_read" ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
+  auto result = ReadProbe(&s.args.probe);
+  if (!result.ok()) return result;
+  if (s.args.probe > KVAF_GATHER_PROBE_ACK &&
+      uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
+    return Status::InvalidArgument("gather WQE/SQ probes require token_bytes * SGL <= 65536");
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
-  auto result = s.config.peer_link->LookupRegion(region.base, &peer);
+  result = s.config.peer_link->LookupRegion(region.base, &peer);
   if (!result.ok()) return result;
   if (!region.base || !region.length || region.base > UINT64_MAX - peer.length ||
       peer.length < region.length)
@@ -314,6 +356,7 @@ Status GatherBatchGet::SetGatherProfiling(bool enabled) {
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
   if (!enabled) { s.profiling = false; return Status::OK(); }
+  if (s.args.probe) return Status::InvalidState("gather prefix probes cannot collect performance profiles");
   auto result = s.Drain();
   if (!result.ok()) return result;
   if (!s.profile_device &&
@@ -349,6 +392,8 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Status::NotImplemented("sequential BatchGet supports eager execution only");
   if (s.profiling && !exec.execution.synchronize)
     return Status::InvalidArgument("gather profiling requires synchronize=True");
+  if (s.args.probe && !exec.execution.synchronize)
+    return Status::InvalidArgument("gather prefix probes require synchronize=True");
   auto result = s.Drain();
   if (!result.ok()) return result;
   s.profile_valid = false;
@@ -373,6 +418,11 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     s.latest_profile.prepare_ns = launch_begin - s.profile_begin_ns;
   }
   s.pending = static_cast<aclrtStream>(exec.execution.stream);
+  if (args.probe)
+    std::fprintf(stderr, "[KVAF_AIV_GATHER_PROBE_BEGIN] stage=%s sequence=%llu cores=%u "
+        "token_bytes=%u request_capacity=%u\n", ProbeName(args.probe),
+        static_cast<unsigned long long>(args.sequence), args.request.block_count,
+        args.request.token_bytes, args.request.request_capacity);
   if ((s.profiling && aclrtMemsetAsync(s.profile_device, s.ProfileBytes(), 0,
                                      s.ProfileBytes(), s.pending) != ACL_SUCCESS) ||
       aclrtMemsetAsync(s.status_device, s.StatusBytes(), 0, s.StatusBytes(), s.pending) != ACL_SUCCESS ||

@@ -11,7 +11,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafGatherBatchGetAivKernelV2";
+constexpr char kKernelName[] = "KvafGatherBatchGetAivKernelV3";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -62,6 +62,8 @@ extern "C" int32_t KvafGatherBatchGetLoadKernel(const char *kernel_object_path) 
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
   g_loaded = true;
+  std::fprintf(stderr, "[KVAF_AIV] GATHER_KERNEL_READY path=%s symbol=%s args_bytes=%zu "
+      "dyn_ubuf_bytes=%u\n", path.c_str(), kKernelName, sizeof(KvafGatherBatchGetArgs), kKernelLocalMemoryBytes);
   return KVAF_BATCH_GET_SUCCESS;
 }
 

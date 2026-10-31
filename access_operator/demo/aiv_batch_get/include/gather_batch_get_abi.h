@@ -14,6 +14,17 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
 };
 static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 192);
 
+enum KvafGatherProbe : uint32_t {
+  KVAF_GATHER_PROBE_NONE = 0, KVAF_GATHER_PROBE_ACK = 1,
+  KVAF_GATHER_PROBE_WQE = 2, KVAF_GATHER_PROBE_SQ = 3,
+  KVAF_GATHER_PROBE_FIRST_READ = 4,
+};
+constexpr uint32_t KVAF_GATHER_WRS_PER_POST = 128;
+enum : uint64_t {
+  KVAF_GATHER_AFTER_ACK = 20, KVAF_GATHER_AFTER_WQE = 21,
+  KVAF_GATHER_AFTER_SQ = 22, KVAF_GATHER_AFTER_FIRST_READ = 23,
+};
+
 struct KvafGatherBatchGetArgs {
   KvafExecuteBatchGetKernelArgs request;
   uint64_t workspace, workspace_bytes, workspace_entity, descriptor_offset;
@@ -23,8 +34,11 @@ struct KvafGatherBatchGetArgs {
   uint32_t sgl_size, max_polls;
   // Optional independent per-core profile array. Zero incurs no clock reads.
   uint64_t profile;
+  // Optional prefix diagnostics. V3 prevents older kernels from silently
+  // ignoring a requested checkpoint. Zero preserves normal execution.
+  uint32_t probe, reserved;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 224);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 232);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

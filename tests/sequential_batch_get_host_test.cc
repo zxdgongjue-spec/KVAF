@@ -5,6 +5,7 @@
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@ std::vector<std::function<void()>> work;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
+bool wrong_gather_probe_wrs{};
 uint64_t kernel_result{};
 uint32_t profile_fault{};
 std::vector<uint64_t> sequences;
@@ -84,6 +86,21 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
   const auto rc = Launch(&model);
+  if (a->probe && !old_probe_kernel && !kernel_result) {
+    const auto args = *a;
+    work.push_back([=] {
+      auto* statuses = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
+      for (uint32_t i = 0; i < args.request.block_count; ++i) {
+        statuses[i].result = KVAF_SEQ_PROBE_COMPLETE;
+        statuses[i].phase = KVAF_GATHER_AFTER_ACK + args.probe - 1 + wrong_probe_phase;
+        if (zero_probe_requests) statuses[i].requests = 0;
+        statuses[i].data_wrs = args.probe == KVAF_GATHER_PROBE_FIRST_READ ?
+            std::min<uint64_t>(KVAF_GATHER_WRS_PER_POST,
+                (statuses[i].requests + args.sgl_size - 1) / args.sgl_size) : 0;
+        statuses[i].data_wrs += wrong_gather_probe_wrs;
+      }
+    });
+  }
   if (a->profile) {
     const auto args = *a;
     const auto fault = profile_fault;
@@ -199,6 +216,7 @@ bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint
 int main() {
   using namespace kvaf;
   unsetenv("KVAF_AIV_SCATTER_PROBE");
+  unsetenv("KVAF_AIV_GATHER_PROBE");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -272,6 +290,45 @@ int main() {
     assert(owner->Shutdown().ok()); kernel_result = 0;
   }
   assert(stopped == 6 && quiesced == 6);
+  {
+    setenv("KVAF_AIV_GATHER_PROBE", "typo", 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
+    assert(!allocations && !refs);
+  }
+  for (const char* probe : {"ack", "wqe", "sq", "first_read"}) {
+    setenv("KVAF_AIV_GATHER_PROBE", probe, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    assert(owner->SetGatherProfiling(true).code() == StatusCode::kInvalidState);
+    exec.execution.synchronize = false;
+    const auto before = launches;
+    assert(owner->Execute(exec).code() == StatusCode::kInvalidArgument && launches == before);
+    exec.execution.synchronize = true;
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto result = owner->Execute(exec);
+      assert(result.code() == StatusCode::kNotImplemented);
+      assert(result.message().find(std::string("[KVAF_AIV_GATHER_PROBE_COMPLETE] stage=") + probe + " ") == 0);
+      assert(owner->Drain().ok());
+    }
+    assert(owner->Shutdown().ok() && !refs && !allocations);
+  }
+  for (uint32_t mismatch = 0; mismatch < 5; ++mismatch) {
+    setenv("KVAF_AIV_GATHER_PROBE", "wqe", 1);
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    old_probe_kernel = mismatch == 0; wrong_probe_phase = mismatch == 1;
+    zero_probe_requests = mismatch == 2;
+    kernel_result = mismatch == 3 ? KVAF_SEQ_TIMEOUT : KVAF_SEQ_OK;
+    wrong_gather_probe_wrs = mismatch == 4;
+    const auto result = owner->Execute(exec);
+    assert(result.code() == StatusCode::kInternal);
+    assert(result.message().find("[KVAF_AIV_GATHER_PROBE_COMPLETE]") == std::string::npos);
+    assert(owner->Shutdown().ok() && !refs && !allocations);
+    old_probe_kernel = wrong_probe_phase = zero_probe_requests = false;
+    wrong_gather_probe_wrs = false;
+    kernel_result = 0;
+  }
+  unsetenv("KVAF_AIV_GATHER_PROBE");
+  exec.execution.synchronize = false;
   {
     setenv("KVAF_AIV_SCATTER_PROBE", "done", 1);
     auto owner = CreateSequentialBatchGet(config);
@@ -410,7 +467,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=224", "record_bytes=192"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=232", "record_bytes=192"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);

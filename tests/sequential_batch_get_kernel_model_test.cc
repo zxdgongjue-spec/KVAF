@@ -43,6 +43,7 @@ struct ModelArgs {
   uint32_t max_polls;
   uint32_t scatter_probe;  // Former reserved word; zero preserves normal execution.
   uint64_t profile{};
+  uint32_t gather_probe{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -50,10 +51,11 @@ void Launch(const ModelArgs& a) {
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
       a.sequence, a.max_polls, a.scatter_probe});
   } else {
-    KvafGatherBatchGetAivKernelV2({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV3({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
-      a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile});
+      a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
+      a.gather_probe, 0});
   }
 }
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
@@ -305,16 +307,29 @@ struct Fixture {
     const auto cycles = aiv_model::cycle;
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
     expected = output;
-    if (success && active >= 0) for (int32_t i = 0; i < active; ++i)
-      std::memcpy(expected.data() + uint64_t(rows[i]) * token,
-                  reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), token);
+    if (success && active >= 0) {
+      for (uint32_t core = 0; core < workers; ++core) {
+        const uint32_t first = uint64_t(active) * core / workers;
+        uint32_t last = uint64_t(active) * (core + 1) / workers;
+        if (args.gather_probe == KVAF_GATHER_PROBE_FIRST_READ)
+          last = std::min(last, first + 128 * args.sgl_size);
+        else if (args.gather_probe) last = first;
+        for (uint32_t i = first; i < last; ++i)
+          std::memcpy(expected.data() + uint64_t(rows[i]) * token,
+                      reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), token);
+      }
+    }
     for (uint32_t core = 0; core < workers; ++core) {
       aiv_model::core = core;
       launch_vf_begin = aiv_model::vf_calls;
       Launch(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
-      assert((status[core].result == KVAF_SEQ_OK) == success);
+      if (success) {
+        assert(status[core].result == (args.gather_probe ? KVAF_SEQ_PROBE_COMPLETE : KVAF_SEQ_OK));
+        if (args.gather_probe)
+          assert(status[core].phase == KVAF_GATHER_AFTER_ACK + args.gather_probe - 1);
+      } else assert(status[core].result != KVAF_SEQ_OK);
       assert(aiv_model::raw_copies.empty());
       for (const auto& source : model_events)
         for (const auto& direction : source)
@@ -370,6 +385,29 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  for (uint32_t probe = KVAF_GATHER_PROBE_ACK; probe <= KVAF_GATHER_PROBE_FIRST_READ; ++probe)
+    for (uint32_t cores : {1U, 3U, 8U}) {
+      Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, 6);
+      f.DataQueueDepth(4096); f.args.gather_probe = probe;
+      for (uint32_t count : {8193U, 1U, 8193U}) {
+        f.Next(count);
+        std::vector<uint64_t> before(cores);
+        for (uint32_t c = 0; c < cores; ++c) before[c] = f.queues[c * 2]->doorbells;
+        f.Run();
+        for (uint32_t c = 0; c < cores; ++c) {
+          const auto rows = uint64_t(count) * (c + 1) / cores - uint64_t(count) * c / cores;
+          const auto added = f.queues[c * 2]->doorbells - before[c];
+          assert(added == uint64_t(probe == KVAF_GATHER_PROBE_FIRST_READ && rows));
+          assert(f.status[c].data_wrs == (added ? std::min<uint64_t>(128, (rows + 5) / 6) : 0));
+        }
+      }
+    }
+  {
+    Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.DataQueueDepth(4096); f.args.gather_probe = KVAF_GATHER_PROBE_FIRST_READ;
+    f.data_cq_error = true; f.Run(false, true);
+    assert(f.status[0].result == KVAF_SEQ_CQ_ERROR && f.states[0].poisoned);
+  }
   // Real queue depth: early doorbells do not introduce per-post CQ waits.
   // VF(next bank) executes while the deferred MTE3(previous bank) is pending.
   {

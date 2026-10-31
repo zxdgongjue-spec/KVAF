@@ -348,6 +348,10 @@ def main() -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
+    if os.environ.get("KVAF_AIV_GATHER_PROBE"):
+        print("FAIL: gather prefix probes cannot collect performance; use test_aiv_gather_pipeline_debug.py",
+              file=sys.stderr)
+        return 2
     try:
         cores = int(os.environ.get("KVAF_NPU_CORE_COUNT", "1"))
         validate_config(cores)
