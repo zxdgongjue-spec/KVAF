@@ -9,7 +9,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchGetRawAddrAivKernelV1";
+constexpr char kKernelName[] = "KvafExecuteBatchGetRawAddrAivKernelV2";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -40,25 +40,16 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLoadKernel(const char *kernel_objec
   const aclError load = aclrtBinaryLoad(binary, &g_binary);
   aclrtDestroyBinary(binary);
   if (load != ACL_SUCCESS || aclrtBinaryGetFunction(g_binary, kKernelName, &g_function) != ACL_SUCCESS) {
+    std::fprintf(stderr, "[KVAF_NPU] rebuild raw-address kernel object: fused READ V2 entry is required\n");
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
   g_loaded = true;
   return KVAF_BATCH_GET_SUCCESS;
 }
 
-extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs *arguments,
-                                                aclrtStream stream) {
-  if (!g_loaded || g_function == nullptr || arguments == nullptr || stream == nullptr ||
-      arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
-      (arguments->batch_get_max_inflight_total != 0U &&
-       arguments->batch_get_max_inflight_total < 2U * arguments->block_count) ||
-      arguments->request_count == 0U || arguments->source_addresses == 0U ||
-      arguments->destination_addresses == 0U || arguments->lengths == 0U ||
-      arguments->output == 0U || arguments->channel_entity == 0U ||
-      arguments->queue_state == 0U || arguments->core_status == 0U ||
-      arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE) {
-    return KVAF_BATCH_GET_INVALID_ARGUMENT;
-  }
+namespace {
+int32_t Launch(aclrtFuncHandle function, const void* arguments, size_t bytes,
+               uint32_t blocks, aclrtStream stream) {
   aclrtLaunchKernelAttr attrs[4]{};
   attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
   attrs[0].value.schemMode = 1;
@@ -72,8 +63,26 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRaw
   aclrtLaunchKernelCfg config{};
   config.numAttrs = 4U;
   config.attrs = attrs;
-  const aclError ret = aclrtLaunchKernelWithHostArgs(g_function, arguments->block_count, stream, &config,
-                                                     const_cast<KvafExecuteBatchGetRawAddrKernelArgs *>(arguments),
-                                                     sizeof(*arguments), nullptr, 0U);
+  const aclError ret = aclrtLaunchKernelWithHostArgs(function, blocks, stream, &config,
+                                                     const_cast<void*>(arguments), bytes, nullptr, 0U);
   return ret == ACL_SUCCESS ? KVAF_BATCH_GET_SUCCESS : KVAF_BATCH_GET_RUNTIME_ERROR;
+}
+}
+
+extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs *arguments,
+                                                aclrtStream stream) {
+  if (!g_loaded || g_function == nullptr || arguments == nullptr || stream == nullptr ||
+      arguments->block_count == 0U || arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      (arguments->batch_get_max_inflight_total != 0U &&
+       arguments->batch_get_max_inflight_total < 2U * arguments->block_count) ||
+      arguments->request_count == 0U || arguments->source_addresses == 0U ||
+      arguments->destination_addresses == 0U || arguments->lengths == 0U ||
+      arguments->output == 0U || arguments->channel_entity == 0U ||
+      arguments->queue_state == 0U || arguments->core_status == 0U ||
+      arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+      arguments->input_mode > KVAF_RAW_NPU_OFFSETS ||
+      arguments->request_count > KVAF_RAW_MAX_WQES ||
+      (arguments->input_mode == KVAF_RAW_NPU_OFFSETS && arguments->request_count > KVAF_RAW_MAX_SPANS))
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  return Launch(g_function, arguments, sizeof(*arguments), arguments->block_count, stream);
 }

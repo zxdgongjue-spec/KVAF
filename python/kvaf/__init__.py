@@ -58,3 +58,10 @@ if hasattr(_native, "HbmSource"):
 if hasattr(_native, "HbmReadSource"):
     HbmReadSource = _native.HbmReadSource
     __all__.append("HbmReadSource")
+
+for _name in ("CpuPullSourceDesc", "NpuPullSourceDesc", "ReadyToken", "CpuPullState",
+              "CpuPullSourceHandle", "PutEntry", "PutHandle", "CpuPullTask",
+              "CpuPullHbmSource", "NpuPullHbmSource"):
+    if hasattr(_native, _name):
+        globals()[_name] = getattr(_native, _name)
+        __all__.append(_name)

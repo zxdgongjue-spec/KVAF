@@ -23,6 +23,10 @@ class RemotePullOperator final : public AccessOperator {
   Status Validate(const RemoteOffloadRequest&, bool* duplicate);
   const OffloadRegionTicket& ticket() const { return ticket_; }
   Status LastChecksum(std::uint64_t*) const;
+  Status ValidateCpuSource(const CpuPullSourceDesc&) override;
+  Status SubmitCpuPull(const CpuPullRequest&) override;
+  Status QueryCpuPull(CpuPullState*) override;
+  std::uint32_t CpuPullTimeoutMs() const override { return timeout_ms_; }
   bool pending() const { return active_; }
  private:
   struct Record { RemoteOffloadRequest request; Status result; };

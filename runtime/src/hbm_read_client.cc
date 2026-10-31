@@ -103,37 +103,74 @@ struct Engine {
     if(src.empty())return Status::InvalidArgument("empty raw READ");
     const std::size_t n=src.size();
     auto s=descriptors.Allocate(n*20);if(!s.ok())return s;
-    s=statuses.Allocate(cores*sizeof(KvafBatchGetCoreStatus));if(!s.ok())return s;
+    auto* d=static_cast<std::uint8_t*>(descriptors.data);
+    if(aclrtMemcpy(d,n*20,src.data(),n*8,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS ||
+        aclrtMemcpy(d+n*8,n*12,dst.data(),n*8,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS ||
+        aclrtMemcpy(d+n*16,n*4,sizes.data(),n*4,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS)
+      return Status::Internal("prepare raw READ descriptors/status");
+    KvafExecuteBatchGetRawAddrKernelArgs args{};
+    args.source_addresses=reinterpret_cast<std::uint64_t>(d);
+    args.destination_addresses=reinterpret_cast<std::uint64_t>(d+n*8);
+    args.lengths=reinterpret_cast<std::uint64_t>(d+n*16);
+    args.request_count=n;
+    return RunKernel(args,output,stream);
+  }
+  Status RunDevice(NpuInt64ArrayView src,NpuInt64ArrayView dst,NpuInt64ArrayView lengths,
+                   MutableBufferView output,void* stream) {
+    if(!transport || !stream || uncertain || local || descriptors.data || statuses.data)
+      return Status::InvalidState("raw READ engine is not idle");
+    KvafExecuteBatchGetRawAddrKernelArgs args{};
+    args.source_addresses=reinterpret_cast<std::uint64_t>(src.data);
+    args.destination_addresses=reinterpret_cast<std::uint64_t>(dst.data);
+    args.lengths=reinterpret_cast<std::uint64_t>(lengths.data);
+    args.request_count=src.size;args.input_mode=KVAF_RAW_NPU_OFFSETS;
+    return RunKernel(args,output,stream);
+  }
+  Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream) {
+    auto s=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!s.ok())return s;
     if(!queues.data) {
       s=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!s.ok())return s;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
     }
-    auto* d=static_cast<std::uint8_t*>(descriptors.data);
-    if(aclrtMemcpy(d,n*20,src.data(),n*8,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS ||
-        aclrtMemcpy(d+n*8,n*12,dst.data(),n*8,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS ||
-        aclrtMemcpy(d+n*16,n*4,sizes.data(),n*4,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS ||
-        aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
-      return Status::Internal("prepare raw READ descriptors/status");
+    if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
+      return Status::Internal("clear raw READ status");
     std::uint64_t entity{};
     if(KvafBatchGetLocalBufferAcquire(transport,output.data,output.bytes,&local,&entity))
       return Status::Internal("register A raw READ output");
-    KvafExecuteBatchGetRawAddrKernelArgs args{};
-    args.source_addresses=reinterpret_cast<std::uint64_t>(d);args.destination_addresses=reinterpret_cast<std::uint64_t>(d+n*8);
-    args.lengths=reinterpret_cast<std::uint64_t>(d+n*16);args.output=reinterpret_cast<std::uint64_t>(output.data);
+    args.output=reinterpret_cast<std::uint64_t>(output.data);
     args.core_status=reinterpret_cast<std::uint64_t>(statuses.data);args.queue_state=reinterpret_cast<std::uint64_t>(queues.data);
-    args.channel_entity=entity;args.request_count=n;args.block_count=cores;args.jettys_per_core=jettys;args.batch_get_max_inflight_total=budget;
+    args.channel_entity=entity;args.block_count=cores;args.jettys_per_core=jettys;args.batch_get_max_inflight_total=budget;
     kernel_finished=false;
     uncertain=true; // Includes launch errors: never assume the device saw no work.
     if(KvafExecuteBatchGetRawAddrLaunch(&args,static_cast<aclrtStream>(stream)) ||
        aclrtSynchronizeStream(static_cast<aclrtStream>(stream))!=ACL_SUCCESS)
       return Status::InDoubt("raw READ launch/stream completion uncertain");
     kernel_finished=true;
-    std::vector<KvafBatchGetCoreStatus> host(cores);
+    std::vector<KvafRawReadCoreStatus> host(cores);
     if(aclrtMemcpy(host.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
       return Status::InDoubt("cannot inspect raw READ completion");
+    // Cancellation is safe only when EVERY core reports the same full-batch
+    // validation failure and explicitly reports zero posted/processed WQEs.
+    const auto& first=host.front().execution;
+    bool rejected=args.input_mode==KVAF_RAW_NPU_OFFSETS &&
+        (first.result==1 || first.result==4 || first.result==8);
+    for(const auto& record:host)
+      rejected=rejected && record.execution.magic==KVAF_AIV_BATCH_GET_STATUS_MAGIC &&
+          record.execution.result==first.result && record.execution.failed_request_index==first.failed_request_index &&
+          !record.total_wqes && !record.posted_wqes && !record.execution.processed_request_count;
+    if(rejected) {
+      uncertain=false;
+      return Status::InvalidArgument("NPU raw READ metadata rejected before DMA: result="+std::to_string(first.result)+
+                                     " span="+std::to_string(first.failed_request_index));
+    }
+    const auto n=host.front().total_wqes;
+    if(!n || n>kMaxWqes || (args.input_mode==KVAF_RAW_NPU_OFFSETS ? n<args.request_count : n!=args.request_count))
+      return Status::InDoubt("invalid raw READ final WQE count");
     for(std::uint32_t c=0;c<cores;++c) {
-      auto& status=host[c];auto expected=n*(c+1)/cores-n*c/cores;
-      if(status.magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result || status.processed_request_count!=expected)
+      const auto& record=host[c];const auto& status=record.execution;
+      const auto expected=n*(c+1)/cores-n*c/cores;
+      if(status.magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result || record.total_wqes!=n ||
+          status.processed_request_count!=expected || record.posted_wqes!=expected)
         return Status::InDoubt("raw READ CQ/kernel failure: core="+std::to_string(c)+" result="+std::to_string(status.result)+
                               " failed_request="+std::to_string(status.failed_request_index));
     }
@@ -259,7 +296,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
   return s;
 }
 Status HbmReader::Read(LinkId id,const HbmReadBatch& b,MutableBufferView output,
-                       const std::vector<std::uint64_t>& offsets,void* stream) {
+                       const std::vector<std::uint64_t>& offsets,void* stream,bool identity_only) {
   auto s=impl_->Device();if(!s.ok())return s;
   auto it=impl_->connections.find(id);if(it==impl_->connections.end())return Status::NotFound("HBM reader region not found");
   auto& c=*it->second;
@@ -280,12 +317,51 @@ Status HbmReader::Read(LinkId id,const HbmReadBatch& b,MutableBufferView output,
   }
   if(!offload::ValidateSpans(relative,c.link->endpoint.bytes,output.bytes))return Status::InvalidArgument("raw READ destinations overlap");
   c.sequence=b.sequence;c.pending=Pending::Acquire;c.result=Status::OK();
-  hr::Response response{};s=c.link->Call(hr::Command::Acquire,spans,&response,b.sequence);
+  hr::Response response{};s=c.link->Call(identity_only?hr::Command::AcquireRaw:hr::Command::Acquire,spans,&response,b.sequence);
   if(!s.ok()) {
     if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;
     return s;
   }
   c.pending=Pending::Dma;s=c.engine.Run(spans,output,stream);
+  if(c.engine.uncertain)return s;
+  c.result=s;c.pending=Pending::Cleanup;
+  return c.Resolve();
+}
+Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
+                       NpuInt64ArrayView lengths,MutableBufferView output,void* stream) {
+  auto s=impl_->Device();if(!s.ok())return s;
+  auto it=impl_->connections.find(id);
+  if(it==impl_->connections.end())return Status::NotFound("HBM reader link not found");
+  auto& c=*it->second;
+  if(!c.ready || c.pending!=Pending::None)return Status::Busy("raw READ region not ready or has unresolved work");
+  const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
+  const auto& ticket=c.link->ticket;
+  if(!source || !SameSource(*source,{ticket.source_id,ticket.bytes,ticket.epoch}) ||
+      !ready.sequence || ready.sequence<=c.last_sequence)
+    return Status::InvalidArgument("NPU Pull ReadyToken belongs to another source or consumed batch");
+  const auto base=reinterpret_cast<std::uint64_t>(output.data);
+  if(!output.valid() || output.device!=DeviceKind::kNpu || !stream || output.bytes>UINT64_MAX-base ||
+      !src.data || !dst.data || !lengths.data || !src.size || src.size>offload::kMaxSpans ||
+      src.size!=dst.size || src.size!=lengths.size ||
+      reinterpret_cast<std::uintptr_t>(src.data)%8 || reinterpret_cast<std::uintptr_t>(dst.data)%8 ||
+      reinterpret_cast<std::uintptr_t>(lengths.data)%8)
+    return Status::InvalidArgument("raw READ requires equally sized aligned NPU int64 arrays and NPU output");
+  // READ must never overwrite metadata that another core is still consuming.
+  // Reject overlap with the entire output allocation before acquiring the batch.
+  for(const auto view:{src,dst,lengths}) {
+    const auto address=reinterpret_cast<std::uint64_t>(view.data);
+    const std::uint64_t bytes=view.size*sizeof(std::int64_t);
+    if(address>UINT64_MAX-bytes || (address<=base ? base-address<bytes : address-base<output.bytes))
+      return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
+  }
+  c.sequence=ready.sequence;c.pending=Pending::Acquire;c.result=Status::OK();
+  hr::Response response{};
+  // The source service leases the identity/batch, not a Host copy of the
+  // device metadata. Each READ core validates the complete metadata before posting DMA.
+  s=c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence);
+  if(!s.ok()) {if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;return s;}
+  c.pending=Pending::Dma;
+  s=c.engine.RunDevice(src,dst,lengths,output,stream);
   if(c.engine.uncertain)return s;
   c.result=s;c.pending=Pending::Cleanup;
   return c.Resolve();

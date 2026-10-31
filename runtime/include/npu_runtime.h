@@ -81,11 +81,22 @@ class NpuRuntime final : public Runtime {
   // or source detach. Synchronous like Offload; not a historical checksum cache.
   Status LastOffloadChecksum(std::uint64_t*) const;
 
-  // B's second HBM: direct READ spans, no AccessTable or DDR metadata.
+  Status AttachCpuSource(const CpuPullSourceDesc&, CpuPullSourceHandle*);
+  Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
+  Status SubmitCpuPull(const CpuPullSourceHandle&, const ReadyToken&, const PutHandle&,
+                       Uint64ArrayView src, Uint64ArrayView dst, Uint64ArrayView lengths, CpuPullTask*);
+  Status QueryCpuPull(const CpuPullTask&, CpuPullState*);
+  Status WaitCpuPull(const CpuPullTask&, std::uint32_t timeout_ms, CpuPullState*);
+  Status CommitPut(const PutHandle&);
+  Status AbortPut(const PutHandle&);
+
+  // Remote producer HBM: direct READ ranges, no AccessTable or DDR metadata.
   Status AttachHbm(const std::string& address, const HbmReadTicket&, LinkId*,
                    const std::string& local_eid = "");
   Status BatchGetRawAddr(LinkId, const HbmReadBatch&, MutableBufferView output,
                          const std::vector<std::uint64_t>& output_offsets, void* stream);
+  Status BatchGetRawAddr(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
+                         NpuInt64ArrayView lengths, MutableBufferView output, void* stream);
   Status ResolveRawAddr(LinkId); // Never resubmits DMA; retries control/cleanup only.
   Status DetachHbm(LinkId);
   bool pending_raw_addr() const;

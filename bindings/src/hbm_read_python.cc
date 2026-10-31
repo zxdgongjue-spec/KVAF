@@ -31,21 +31,25 @@ class PythonReadSource {
     HbmReadBatch batch;Check(source.Ready(offsets,lengths,Stream(stream),&batch));return hbm_read_python::Pack(batch);
   }
   void Shutdown(){Check(source.Shutdown());tensor=py::none();}
-  HbmReadSource source;
+  NpuPullHbmSource source;
   py::object tensor{py::none()};
 };
 }
 void BindHbmReadSource(py::module_& m){
-  py::class_<PythonReadSource>(m,"HbmReadSource")
+  py::class_<PythonReadSource>(m,"NpuPullHbmSource")
     .def(py::init<std::uint32_t,std::string>(),py::arg("device_id"),py::arg("npu_eid")="")
     .def("register",&PythonReadSource::Register,py::arg("source"),py::arg("stream")=py::none())
     .def("listen",[](PythonReadSource& p,const std::string& address){Check(p.source.Listen(address));return p.source.port();},py::arg("address"))
     .def("ready",&PythonReadSource::Ready,py::arg("input_offsets"),py::arg("lengths"),py::arg("stream")=py::none())
+    .def("ready",[](PythonReadSource& p){ReadyToken t;Check(p.source.Ready(&t));return t;})
+    .def("release_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.ReleaseBatch(t));},py::arg("ready_token"))
+    .def("cancel_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.CancelBatch(t));},py::arg("ready_token"))
     .def("release_batch",[](PythonReadSource& p){Check(p.source.ReleaseBatch());})
     .def("cancel_batch",[](PythonReadSource& p){Check(p.source.CancelBatch());})
     .def("shutdown",&PythonReadSource::Shutdown)
     .def_property_readonly("connected",[](PythonReadSource& p){return p.source.connected();})
     .def_property_readonly("frozen",[](PythonReadSource& p){return p.source.frozen();})
     .def_property_readonly("selected_npu_eid",[](PythonReadSource& p){return p.source.selected_npu_eid();});
+  m.attr("HbmReadSource")=m.attr("NpuPullHbmSource");
 }
 }

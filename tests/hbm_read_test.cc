@@ -4,16 +4,24 @@
 #include "hbm_read_protocol.h"
 #include "kvaf_aiv_batch_get_raw_addr.h"
 #include <poll.h>
+#include "aiv_model/kernel_operator.h"
+#define __attribute__(...)
+#include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_raw_addr_aiv.asc"
+#undef __attribute__
+namespace aiv_model {
+void Poll(void*) { std::abort(); }
+void Doorbell(uint32_t, uint32_t*) { std::abort(); }
+}
 
 using kvaf::Status;
 namespace hr=kvaf::hbm_read;
 std::atomic<int> raw_calls{0}, raw_wqes{0}, local_buffers{0}, raw_transports{0};
 int unregister_failures=0;
 bool fail_probe_cq=false;
-int quiesces=0;
-extern "C" aclError aclrtSynchronizeStream(aclrtStream){return 0;}
-struct KvafBatchGetTransport {kvaf::peer::PeerLink* link;};
-struct KvafBatchGetLocalBuffer {std::uint64_t base,bytes;};
+int quiesces=0, raw_syncs=0;
+extern "C" aclError aclrtSynchronizeStream(aclrtStream){++raw_syncs;return 0;}
+struct KvafBatchGetTransport {kvaf::peer::PeerLink* link;std::uint64_t base,bytes;};
+struct KvafBatchGetLocalBuffer {std::uint64_t base,bytes,source_base,source_bytes;};
 extern "C" int32_t KvafExecuteBatchGetRawAddrLoadKernel(const char*){return 0;}
 extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(void* base,std::uint64_t bytes,std::uint32_t cores,
     std::uint32_t jettys,void* peer,const std::uint8_t* eid,KvafBatchGetTransport** out){
@@ -28,10 +36,10 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(void* base,std::uint6
     Require(link->CreateChannel(region.base,key,32,eid,region.token_value,2+i,2,&remote,&remote_bytes,&tp,&psn).ok(),"bind NPU-to-NPU channel");
     Require(remote_bytes==32 && remote[15]==3 && psn==1 && tp==i+1,"NPU target raw descriptor");
   }
-  ++raw_transports;*out=new KvafBatchGetTransport{link};return 0;
+  ++raw_transports;*out=new KvafBatchGetTransport{link,reinterpret_cast<std::uint64_t>(base),bytes};return 0;
 }
-extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport*,void* output,std::uint64_t bytes,
-    KvafBatchGetLocalBuffer** out,std::uint64_t* entity){++local_buffers;*out=new KvafBatchGetLocalBuffer{reinterpret_cast<uint64_t>(output),bytes};*entity=reinterpret_cast<uint64_t>(*out);return 0;}
+extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport* transport,void* output,std::uint64_t bytes,
+    KvafBatchGetLocalBuffer** out,std::uint64_t* entity){++local_buffers;*out=new KvafBatchGetLocalBuffer{reinterpret_cast<uint64_t>(output),bytes,transport->base,transport->bytes};*entity=reinterpret_cast<uint64_t>(*out);return 0;}
 extern "C" int32_t KvafBatchGetLocalBufferDiscard(KvafBatchGetLocalBuffer** p){
   if(!*p)return 0;if(unregister_failures){--unregister_failures;return -1;}--local_buffers;delete *p;*p=nullptr;return 0;}
 extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport*){++quiesces;return 0;}
@@ -39,12 +47,25 @@ extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport** p){if(*p){
 extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs* a,aclrtStream){
   ++raw_calls;auto* src=reinterpret_cast<uint64_t*>(a->source_addresses);auto* dst=reinterpret_cast<uint64_t*>(a->destination_addresses);
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
-  for(unsigned i=0;i<a->request_count;++i){Require(sizes[i] && sizes[i]<=65536,"READ chunk <=64 KiB");
-    Require(dst[i]>=local->base && dst[i]-local->base<=local->bytes-sizes[i],"destination registration");
-    std::memcpy(reinterpret_cast<void*>(dst[i]),reinterpret_cast<void*>(src[i]),sizes[i]);++raw_wqes;}
-  auto* statuses=reinterpret_cast<KvafBatchGetCoreStatus*>(a->core_status);
-  for(unsigned c=0;c<a->block_count;++c){statuses[c].magic=KVAF_AIV_BATCH_GET_STATUS_MAGIC;
-    statuses[c].result=fail_probe_cq?7:0;statuses[c].processed_request_count=uint64_t(a->request_count)*(c+1)/a->block_count-uint64_t(a->request_count)*c/a->block_count;}
+  uint32_t count=a->request_count;uint64_t result=0,failed=UINT64_MAX;
+  if(a->input_mode==KVAF_RAW_NPU_OFFSETS)
+    ValidateAndCountRaw(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
+                        local->source_bytes,local->bytes,&count,&result,&failed);
+  if(!result)for(unsigned i=0;i<a->request_count;++i){
+    const uint64_t n=a->input_mode==KVAF_RAW_NPU_OFFSETS?reinterpret_cast<const int64_t*>(sizes)[i]:sizes[i];
+    const uint64_t source=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->source_base+src[i]:src[i];
+    const uint64_t destination=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->base+dst[i]:dst[i];
+    Require(n && destination>=local->base && n<=local->bytes && destination-local->base<=local->bytes-n,"destination registration");
+    std::memcpy(reinterpret_cast<void*>(destination),reinterpret_cast<void*>(source),n);
+    raw_wqes+=n/65536+(n%65536!=0);
+  }
+  auto* statuses=reinterpret_cast<KvafRawReadCoreStatus*>(a->core_status);
+  for(unsigned c=0;c<a->block_count;++c){auto& status=statuses[c];
+    status.execution.magic=KVAF_AIV_BATCH_GET_STATUS_MAGIC;
+    status.execution.result=fail_probe_cq?7:result;status.execution.failed_request_index=failed;
+    status.execution.processed_request_count=uint64_t(count)*(c+1)/a->block_count-uint64_t(count)*c/a->block_count;
+    status.total_wqes=count;status.posted_wqes=status.execution.processed_request_count;
+  }
   fail_probe_cq=false;return 0;
 }
 class Proxy {
@@ -55,6 +76,7 @@ class Proxy {
     thread=std::thread([this]{while(!stop){pollfd p{fd,POLLIN,0};if(poll(&p,1,20)<=0)continue;int client=accept(fd,nullptr,nullptr);if(client<0)continue;
       kvaf::offload::SetSocketTimeout(client);hr::Request r{};
       if(kvaf::offload::ReadBytes(client,&r,sizeof(r))){std::vector<hr::Span> spans(r.count);
+        if(r.header.command==unsigned(hr::Command::AcquireRaw))Require(r.count==0,"NPU metadata is absent from the control message");
         if(kvaf::offload::ReadBytes(client,spans.data(),spans.size()*sizeof(hr::Span))){
           int server=hr::Connect(upstream);Require(server>=0,"connect source");hr::Response response{};
           Require(kvaf::offload::WriteBytes(server,&r,sizeof(r))&&kvaf::offload::WriteBytes(server,spans.data(),spans.size()*sizeof(hr::Span))&&
@@ -119,6 +141,45 @@ int main(){try{
   Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok() && a.pending(),"unregister failure retains output");
   Check(a.Resolve(id));Check(b.ReleaseBatch());
   batch=ready();Check(b.CancelBatch());Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"cancelled Ready cannot be read");
+  // Connector chooses its own source ranges after identity-only Ready.
+  kvaf::ReadyToken token;Check(b.Ready(&token));
+  std::vector<std::int64_t> sources{9,90001},destinations{7,5000},lengths{67,70001};
+  auto read=[&](const kvaf::ReadyToken& t,const std::vector<std::int64_t>& src,
+                const std::vector<std::int64_t>& dst,const std::vector<std::int64_t>& sizes) {
+    const auto calls=raw_calls.load(),syncs=raw_syncs;
+    const auto status=a.Read(id,t,{src.data(),src.size()},{dst.data(),dst.size()},
+                             {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1));
+    Require(raw_calls-calls<=1 && raw_syncs-syncs==raw_calls-calls,"single fused launch and final synchronization");
+    return status;
+  };
+  const auto saved=token;auto bad=token;std::get<kvaf::NpuPullSourceDesc>(bad.source).source_epoch++;
+  before=raw_calls;const auto before_wqes=raw_wqes.load();
+  Require(!read(bad,sources,destinations,lengths).ok(),"raw-array stale identity rejected");
+  Require(!a.Read(id,token,{reinterpret_cast<const int64_t*>(output.data()),sources.size()},
+                   {destinations.data(),destinations.size()},{lengths.data(),lengths.size()},out,
+                   reinterpret_cast<void*>(1)).ok() && raw_calls==before && !a.pending(),
+          "metadata/output alias is rejected before Acquire");
+  auto overlap=destinations;overlap[1]=8;
+  Require(!read(token,sources,overlap,lengths).ok(),"raw-array overlapping outputs rejected");
+  Require(!a.pending(),"NPU validation failure cancels without unresolved DMA");
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  Require(!read(token,sources,{destinations[0]},lengths).ok(),"raw-array count mismatch rejected");
+  auto overrun=sources;overrun[1]=source_bytes;
+  Require(!read(token,overrun,destinations,lengths).ok(),"raw-array source bounds enforced");
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  Require(raw_calls==before+2 && raw_wqes==before_wqes,"fused validation rejects all invalid ranges before posting DMA");
+  before=raw_calls;
+  proxy.drop=unsigned(hr::Command::Complete);
+  Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"new raw API retains lost Complete");
+  Check(a.Resolve(id));Require(raw_calls==before+1,"new raw API resolve does not replay DMA");
+  Require(!std::memcmp(output.data()+7,source+9,67)&&!std::memcmp(output.data()+5000,source+90001,70001),"raw-array offsets are relative to logical source/output");
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  Require(!b.ReleaseBatch(saved).ok()&&!b.CancelBatch(saved).ok(),"explicit source token rejects delayed notifications");
+  proxy.drop=unsigned(hr::Command::AcquireRaw);before=raw_calls;
+  Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"lost new Acquire response retains batch");
+  Require(!b.CancelBatch(token).ok(),"cannot cancel an acquired identity-only batch");
+  Require(!a.Resolve(id).ok()&&!a.pending()&&raw_calls==before,"unknown Acquire is cancelled without READ replay");
+  Check(b.ReleaseBatch(token));
   proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(id).ok(),"lost detach reply");Check(a.Detach(id));Check(b.Shutdown());
   Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers,"all resources retired");
   std::cout<<"HBM raw READ: real TCP/source/client, split spans, leases, lost ACKs and cleanup passed\n";

@@ -107,6 +107,7 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   }
 
   remote_region_ = remote_region;
+  connector_owner_ = std::make_shared<const int>(0);
   closing_ = false;
   initialized_ = true;
   return Status::OK();
@@ -414,26 +415,6 @@ Status RuntimeCore::Offload(const BatchPutRequest& request, OffloadExecutionOpti
   }
 }
 
-Status RuntimeCore::OffloadFrom(const RemoteOffloadRequest& request) {
-  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
-  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-  if (pending_offload()) return Status::Busy("resolve the pending Offload first");
-  if (!request.source.region_epoch || !request.source.region_id || !request.source.source_id ||
-      !request.source.sequence || !request.source.source_bytes || request.keys.empty() ||
-      request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
-    return Status::InvalidArgument("invalid remote Offload request");
-  for (std::size_t i = 0; i < request.keys.size(); ++i)
-    if (!request.lengths[i] || request.input_offsets[i] > request.source.source_bytes ||
-        request.lengths[i] > request.source.source_bytes - request.input_offsets[i])
-      return Status::InvalidArgument("remote source range is outside the exported HBM");
-  PutAccessDesc desc;
-  auto status = meta_manager_.PreparePut(request.keys, request.lengths, &offload_context_, &desc);
-  if (!status.ok()) return status;
-  offload_data_ready_ = offload_metadata_finished_ = false;
-  try { return FinishOffload(access_operator_.ExecuteRemoteOffload({&request, &desc})); }
-  catch (const std::exception& e) { return Status::InDoubt(std::string("remote Offload exception: ") + e.what()); }
-}
-
 Status RuntimeCore::FinishOffload(Status status) {
   if (status.code() == StatusCode::kInDoubt) return status;
   if (!offload_metadata_finished_) {
@@ -453,6 +434,7 @@ Status RuntimeCore::FinishOffload(Status status) {
 }
 
 Status RuntimeCore::ResolveOffload() {
+  if (connector_put_) return ResolveConnectorOffload();
   if (!pending_offload()) return Status::InvalidState("no pending Offload");
   return FinishOffload(offload_metadata_finished_ || offload_data_ready_ ? Status::OK() : access_operator_.ResolveOffload());
 }

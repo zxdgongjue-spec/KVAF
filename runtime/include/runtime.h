@@ -14,6 +14,37 @@
 
 namespace kvaf {
 
+struct ConnectorPutState;
+class CpuPullTask;
+// Process-local, non-forgeable bindings. These do not own a second DDR pool.
+class CpuPullSourceHandle {
+ public:
+  const CpuPullSourceDesc& source() const { return source_; }
+ private:
+  friend class RuntimeCore;
+  std::shared_ptr<const int> owner_;
+  CpuPullSourceDesc source_;
+};
+class PutHandle {
+ public:
+  std::uint64_t id() const;
+  const std::vector<PutAllocation>& entries() const;
+  CpuPullState state() const;
+  CpuPullTask task() const; // Also available after a lost Submit response.
+ private:
+  friend class RuntimeCore;
+  std::shared_ptr<ConnectorPutState> state_;
+};
+class CpuPullTask {
+ public:
+  std::uint64_t id() const;
+  bool valid() const { return bool(state_); }
+ private:
+  friend class RuntimeCore;
+  friend class PutHandle;
+  std::shared_ptr<ConnectorPutState> state_;
+};
+
 // Runtime roles share Link lifecycle but do not necessarily support the same
 // data-plane operations. A target intentionally carries only host:port for
 // the first CPU--NPU deployment; EID and UB routing stay inside KVAF.
@@ -100,7 +131,16 @@ class RuntimeCore {
   Status Offload(const BatchPutRequest& request, OffloadExecutionOptions execution = {});
   Status OffloadFrom(const RemoteOffloadRequest& request);
   Status ResolveOffload();
-  bool pending_offload() const { return offload_context_.id != 0; }
+  bool pending_offload() const { return offload_context_.id != 0 || bool(connector_put_); }
+
+  Status AttachCpuSource(const CpuPullSourceDesc&, CpuPullSourceHandle*);
+  Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
+  Status SubmitCpuPull(const CpuPullSourceHandle&, const ReadyToken&, const PutHandle&,
+                       Uint64ArrayView src, Uint64ArrayView dst, Uint64ArrayView lengths, CpuPullTask*);
+  Status QueryCpuPull(const CpuPullTask&, CpuPullState*);
+  Status WaitCpuPull(const CpuPullTask&, std::uint32_t timeout_ms, CpuPullState*);
+  Status CommitPut(const PutHandle&);
+  Status AbortPut(const PutHandle&);
 
  protected:
   MetaManager& meta_manager_;
@@ -128,6 +168,11 @@ class RuntimeCore {
 
   bool initialized_{false};
   bool closing_{false};
+  std::shared_ptr<const int> connector_owner_{std::make_shared<const int>(0)};
+  std::shared_ptr<ConnectorPutState> connector_put_;
+  bool connector_convenience_{false};
+  Status FinishConnectorPut(const PutHandle&, bool commit);
+  Status ResolveConnectorOffload();
   PutContext offload_context_{};
   bool offload_data_ready_{false};
   bool offload_metadata_finished_{false};

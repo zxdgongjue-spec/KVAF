@@ -16,6 +16,7 @@ target_compile_features(kvaf_offload_control PUBLIC cxx_std_17)
 
 add_library(kvaf_runtime
   src/runtime.cc
+  src/connector_runtime.cc
   src/runtime_service.cc
 )
 

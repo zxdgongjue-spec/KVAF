@@ -1,4 +1,4 @@
-pybind11_add_module(_kvaf src/python_module.cpp)
+pybind11_add_module(_kvaf src/python_module.cpp src/connector_python.cc)
 
 target_link_libraries(_kvaf PRIVATE kvaf_runtime)
 

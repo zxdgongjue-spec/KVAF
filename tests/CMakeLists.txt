@@ -52,6 +52,9 @@ add_test(
 )
 
 if(KVAF_BUILD_PYTHON)
+  add_test(NAME kvaf_connector_bindings_python
+    COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_connector_bindings.py")
+  set_tests_properties(kvaf_connector_bindings_python PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
   add_test(
     NAME kvaf_runtime_mock_python
     COMMAND "${Python3_EXECUTABLE}"
@@ -108,6 +111,7 @@ add_test(NAME kvaf_batch_get_raw_addr_kernel_model_test COMMAND kvaf_batch_get_r
 add_executable(kvaf_hbm_read_test hbm_read_test.cc
   ../runtime/src/hbm_read_source.cc ../runtime/src/hbm_read_client.cc)
 target_include_directories(kvaf_hbm_read_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
   ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
 target_link_libraries(kvaf_hbm_read_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})

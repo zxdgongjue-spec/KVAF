@@ -4,6 +4,8 @@ A 沿用现有 `NpuRuntime`：BatchPut/BatchGet 访问 CPU DDR，
 `offload_from` 通知 CPU 拉取 B 的 HBM₁；新增 `batch_get_raw_addr` 直接读取 B 的 HBM₂。
 两块 B HBM 独立分配、注册、发布和确认，互不借用 DDR ticket 或冻结状态。
 
+本文下方保留旧 `ready_batch` 接口说明。Connector 的新版 `ReadyToken` 三数组入口见 [Connector 接口设计](connector_pull_api_design.md)：`src_offsets`、`dst_offsets`、`lengths` 必须是一维、连续、位于读取卡的 `torch.int64` NPU Tensor。新版 raw READ V2 在同一次算子中完成整批校验、核内分段、WQE 提交及 CQ 等待，三数组不回传 Host；没有独立准备算子或中间状态同步。元数据 Tensor 不得与 output 分配范围重叠。需同时重编译 NPU 运行库和 raw kernel object。
+
 ## 接口
 
 ### B：HbmReadSource
@@ -75,15 +77,17 @@ runtime.detach_hbm(region)
 
 ## 数据面和控制面
 
-数据面直接传入三个设备数组：`source_addresses:uint64[]`、
-`destination_addresses:uint64[]`、`lengths:uint32[]`。
+旧接口在 Host 展开分段，将三个设备数组 `source_addresses:uint64[]`、
+`destination_addresses:uint64[]`、`lengths:uint32[]` 传给算子。新版 Connector 入口
+直接传三个 NPU int64 Tensor；raw READ V2 在核内从相对偏移和变长段生成 WQE，
+短段直接索引，长段通过 UB 中的前缀表定位，不创建展开的 HBM 描述符数组。
 没有 AccessTable、key/indices/valid 查询，也不经过 DDR MetaManager。
 
 新 AIV 内核复制当前 BatchGet V2 的 READ WQE 编码、双 bank 提交、多 Jetty 调度、
-inflight 窗口和 CQ 处理。独立符号 `KvafExecuteBatchGetRawAddrAivKernelV1` 与独立 object
-使现有 BatchGet ABI 保持不变。裸地址范围同时在 host 和内核检查。
+inflight 窗口和 CQ 处理。独立符号 `KvafExecuteBatchGetRawAddrAivKernelV2` 与独立 object
+使现有 BatchGet ABI 保持不变。旧接口的裸地址范围同时在 Host 和内核检查；新版 NPU Tensor 入口由每个核在发 READ 前检查完整批次范围及目的不重叠。Host 只在 READ 完成后读取最终状态，核验实际 WQE 数和完成情况。
 
-KVHR v1 是独立的 A—B TCP 控制协议，只传 ticket、连接描述、范围和确认；不传 payload。
+KVHR v3 是独立的 A—B TCP 控制协议。旧接口仍传范围；新版 AcquireRaw 只传源/连接身份和批次号，不传三数组；两种接口都不通过控制协议传 payload。
 A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列状态和未完成任务。
 B 的 HbmReadSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份、Ready 范围和版本。
 底层复用 HBM Exporter；NPU 的 32 字节 Jetty key 与 CPU 的 28 字节 key 分开校验。

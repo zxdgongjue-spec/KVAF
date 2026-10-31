@@ -10,6 +10,7 @@
 #include "status.h"
 #include "types.h"
 #include "remote_offload_types.h"
+#include "connector_types.h"
 
 namespace kvaf::peer {
 class PeerLink;
@@ -62,6 +63,17 @@ class AccessOperator {
   // Called after metadata commits/aborts. A remote producer can reuse its
   // frozen batch only after this decision is acknowledged by the CPU.
   virtual Status CompleteOffload(bool) { return Status::OK(); }
+
+  virtual Status ValidateCpuSource(const CpuPullSourceDesc&) {
+    return Status::NotImplemented("CPU Pull source binding is unavailable");
+  }
+  virtual Status SubmitCpuPull(const CpuPullRequest&) {
+    return Status::NotImplemented("CPU Pull submission is unavailable");
+  }
+  virtual Status QueryCpuPull(CpuPullState*) {
+    return Status::NotImplemented("CPU Pull query is unavailable");
+  }
+  virtual std::uint32_t CpuPullTimeoutMs() const { return 30000; }
 
 };
 

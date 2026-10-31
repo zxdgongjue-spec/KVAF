@@ -131,4 +131,61 @@ Status RemotePullOperator::LastChecksum(std::uint64_t* checksum) const {
     return Status::InvalidState("remote Offload checksum unavailable; verify before next Ready or source detach, with DDR slots retained");
   *checksum = response.checksum; return Status::OK();
 }
+Status RemotePullOperator::ValidateCpuSource(const CpuPullSourceDesc& source) {
+  if (!source.source_id || !source.source_bytes || source.region_id != ticket_.region.id ||
+      source.region_epoch != ticket_.region.epoch)
+    return Status::InvalidArgument("CPU source is not bound to this DDR pool");
+  RemoteOffloadRequest current;
+  current.source = {source.region_epoch, source.region_id, source.source_id, 0, source.source_bytes};
+  rp::Response response{};
+  auto status = rp::Exchange(ticket_.address, Request(ticket_, current, rp::Command::InspectSource), {}, &response);
+  if (!status.ok()) return status;
+  if (response.result != rp::Result::Ok || response.endpoint.bytes != source.source_bytes ||
+      response.state == rp::State::Connecting || response.state == rp::State::Failed ||
+      response.state == rp::State::InDoubt || response.state == rp::State::Closed)
+    return Status::InvalidState("CPU source is missing, stale or unavailable");
+  return Status::OK();
+}
+Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {
+  if (active_) return Status::Busy("previous CPU Pull is unresolved");
+  RemoteOffloadRequest current;
+  const auto& source = request.source;
+  current.source = {source.region_epoch, source.region_id, source.source_id, request.sequence, source.source_bytes};
+  current.input_offsets = request.copies.source; current.lengths = request.copies.lengths;
+  current.keys = request.keys;
+  if (source.region_id != ticket_.region.id || source.region_epoch != ticket_.region.epoch ||
+      !request.sequence || !source.source_id || request.copies.source.size() != request.copies.lengths.size() ||
+      request.copies.destination.size() != request.copies.lengths.size())
+    return Status::InvalidArgument("invalid CPU Pull request");
+  std::vector<rp::Span> spans;
+  for (std::size_t i = 0; i < request.copies.lengths.size(); ++i)
+    spans.push_back({request.copies.source[i], request.copies.destination[i], request.copies.lengths[i]});
+  if (!offload::ValidateSpans(spans, source.source_bytes, ticket_.region.bytes))
+    return Status::InvalidArgument("invalid CPU Pull source/destination ranges");
+  rp::Response response{};
+  auto status = rp::Exchange(ticket_.address, Request(ticket_, current, rp::Command::Query), {}, &response);
+  if (!status.ok()) return Status::Internal("CPU Pull pre-submit query failed; no READ submitted: "+status.message());
+  if (response.result != rp::Result::Ok || response.state != rp::State::Ready || response.endpoint.bytes != source.source_bytes)
+    return Status::InvalidState("CPU Pull batch is not Ready");
+  current_ = std::move(current); active_ = true;
+  status = rp::Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Submit), spans, &response);
+  if (!status.ok()) return status;
+  // Even a rejected Submit is resolved by Query before slots are released.
+  if (response.result != rp::Result::Ok) return Status::InDoubt("CPU Pull submit rejected; query the original task before aborting");
+  return Status::OK();
+}
+Status RemotePullOperator::QueryCpuPull(CpuPullState* state) {
+  if (!active_ || !state) return Status::InvalidState("no active CPU Pull task");
+  rp::Response response{};
+  auto status = rp::Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Query), {}, &response);
+  if (!status.ok()) return status;
+  if (response.result != rp::Result::Ok) return Status::InDoubt("cannot identify CPU Pull task");
+  switch (response.state) {
+    case rp::State::Done: *state = CpuPullState::Done; break;
+    case rp::State::Running: *state = CpuPullState::Running; break;
+    case rp::State::Ready: case rp::State::Failed: case rp::State::Cancelled: *state = CpuPullState::Failed; break;
+    default: *state = CpuPullState::InDoubt; break;
+  }
+  return Status::OK();
+}
 }

@@ -27,13 +27,15 @@ def producer(pipe, args, ddr_ticket):
     raw_offset = (-hbm_a_storage.data_ptr()) % 4096 + 0xC00
     hbm_a = hbm_a_storage[raw_offset:raw_offset + SOURCE_BYTES]
     assert hbm_a.is_contiguous() and hbm_a.data_ptr() % 4096 == 0xC00
-    cpu_source = kvaf.HbmSource(args.device_b, args.npu_eid_b_cpu)
-    a_source = kvaf.HbmReadSource(args.device_b, args.npu_eid_b_raw)
+    cpu_source = kvaf.CpuPullHbmSource(args.device_b, args.npu_eid_b_cpu)
+    a_source = kvaf.NpuPullHbmSource(args.device_b, args.npu_eid_b_raw)
     try:
-        cpu_source.register(ddr_ticket, hbm_cpu)
+        cpu_desc = cpu_source.register(ddr_ticket, hbm_cpu)
         ticket = a_source.register(hbm_a)
         port = a_source.listen("127.0.0.1:0")
         pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
+        if args.connector_api:
+            pipe.send(("cpu_source", cpu_desc))
         if receive(pipe, "attached") is False:
             # A failed before publishing any batch and has no unresolved READ.
             a_source.shutdown()
@@ -45,8 +47,13 @@ def producer(pipe, args, ddr_ticket):
             with torch.npu.stream(stream):
                 hbm_cpu.copy_(pattern(torch, round_id), non_blocking=True)
                 hbm_a.copy_(pattern(torch, round_id + 101), non_blocking=True)
-            cpu_batch = cpu_source.ready(OFFSETS, [656] * 3, stream=stream)
-            raw_batch = a_source.ready(OFFSETS, RAW_LENGTHS, stream=stream)
+            if args.connector_api:
+                stream.synchronize()
+                cpu_batch = cpu_source.ready()
+                raw_batch = a_source.ready()
+            else:
+                cpu_batch = cpu_source.ready(OFFSETS, [656] * 3, stream=stream)
+                raw_batch = a_source.ready(OFFSETS, RAW_LENGTHS, stream=stream)
             try:
                 a_source.release_batch()
             except RuntimeError:
@@ -55,8 +62,12 @@ def producer(pipe, args, ddr_ticket):
                 raise AssertionError("B reused HBM before A's READ")
             pipe.send(("ready", (cpu_batch, raw_batch)))
             receive(pipe, "reuse")
-            cpu_source.release_batch()
-            a_source.release_batch()
+            if args.connector_api:
+                cpu_source.release_batch(cpu_batch)
+                a_source.release_batch(raw_batch)
+            else:
+                cpu_source.release_batch()
+                a_source.release_batch()
             assert not cpu_source.frozen and not a_source.frozen
             pipe.send(("released", round_id))
         receive(pipe, "detached")
@@ -91,6 +102,7 @@ def main():
     parser.add_argument("--batch-put-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o")
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--connector-api", action="store_true", help="use three contiguous arrays and public CPU Pull transactions")
     args = parser.parse_args()
     if args.device_a == args.device_b or args.rounds < 2:
         parser.error("use two different NPUs and at least two rounds")
@@ -121,6 +133,8 @@ def main():
     producer_waiting_for_attach = False
     try:
         address, export = receive(parent, "export")
+        if args.connector_api:
+            cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
         producer_waiting_for_attach = True
         region = runtime.attach_hbm(address, export, local_eid=args.npu_eid_a_raw)
         parent.send(("attached", True))
@@ -129,13 +143,31 @@ def main():
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
         for round_id in range(args.rounds):
             cpu_batch, raw_batch = receive(parent, "ready")
-            runtime.offload_from(KEYS, cpu_batch)
+            if args.connector_api:
+                put = runtime.prepare_put(KEYS, [656] * 3)
+                source_offsets = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
+                cpu_destinations = torch.tensor([e.address - ticket["base"] for e in put.entries],
+                                                dtype=torch.int64, device="cpu")
+                task = runtime.submit_cpu_pull(cpu_source, cpu_batch, put, source_offsets,
+                                               cpu_destinations, torch.full((3,), 656, dtype=torch.int64, device="cpu"))
+                runtime.wait_cpu_pull(task, timeout=30000)
+                runtime.commit_put(put)
+            else:
+                runtime.offload_from(KEYS, cpu_batch)
             cpu_expected = pattern(torch, round_id)
             rows = [cpu_expected[o:o + 656] for o in OFFSETS]
             assert runtime.last_offload_checksum() == fnv64(b"".join(bytes(row.tolist()) for row in rows))
             with torch.npu.stream(stream):
                 output.fill_(0xCC)
-            runtime.batch_get_raw_addr(region, raw_batch, output, RAW_DESTINATIONS, stream=stream)
+            if args.connector_api:
+                with torch.npu.stream(stream):
+                    raw_sources = torch.tensor(OFFSETS, dtype=torch.int64, device=output.device)
+                    raw_destinations = torch.tensor(RAW_DESTINATIONS, dtype=torch.int64, device=output.device)
+                    raw_lengths = torch.tensor(RAW_LENGTHS, dtype=torch.int64, device=output.device)
+                runtime.batch_get_raw_addr(region, raw_batch, raw_sources, raw_destinations,
+                                          raw_lengths, output, stream=stream)
+            else:
+                runtime.batch_get_raw_addr(region, raw_batch, output, RAW_DESTINATIONS, stream=stream)
             raw_expected = pattern(torch, round_id + 101)
             expected = torch.full((110000,), 0xCC, dtype=torch.uint8)
             for src, dst, n in zip(OFFSETS, RAW_DESTINATIONS, RAW_LENGTHS):
@@ -157,7 +189,7 @@ def main():
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        print("HBM_RAW_PASS two_b_buffers=1 shared_runtime=1 no_access_table_for_hbm=1", flush=True)
+        print(f"HBM_RAW_PASS two_b_buffers=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api={int(args.connector_api)}", flush=True)
     except BaseException:
         traceback.print_exc()
         if producer_waiting_for_attach and not runtime.pending_raw_addr and not runtime.pending_offload:

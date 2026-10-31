@@ -12,7 +12,7 @@
 
 namespace kvaf {
 namespace hr=hbm_read;
-struct HbmReadSource::Impl {
+struct NpuPullHbmSource::Impl {
   explicit Impl(std::uint32_t d,std::string e):device(d),eid(std::move(e)){}
   std::uint32_t device;
   std::string eid,selected;
@@ -29,7 +29,7 @@ struct HbmReadSource::Impl {
   offload::Endpoint initiator{};
   Status open_result;
   hr::State state{hr::State::Registered};
-  bool confirmed{},frozen{},closing{};
+  bool confirmed{},frozen{},closing{},identity_only{};
   HbmReadBatch batch;
   std::vector<hr::Span> submitted;
   int listener{-1};
@@ -40,7 +40,7 @@ struct HbmReadSource::Impl {
   Status Device() const {
     int current=-1;
     return aclrtGetDevice(&current)==ACL_SUCCESS && current==int(device)?Status::OK():
-        Status::InvalidState("select HbmReadSource device before this operation");
+        Status::InvalidState("select NpuPullHbmSource device before this operation");
   }
   Status Handle(const hr::Request& r,const std::vector<hr::Span>& spans,hr::Response* response) {
     if(closing) return Status::Busy("HBM source is shutting down");
@@ -111,13 +111,18 @@ struct HbmReadSource::Impl {
     if((command==hr::Command::Complete || command==hr::Command::Cancel) &&
         r.sequence && r.sequence==completed) return Status::OK();
     if(!confirmed || !frozen || r.sequence!=sequence) return Status::InvalidState("HBM batch is stale or not ready");
-    if(command==hr::Command::Acquire) {
-      if(spans.size()!=batch.lengths.size()) return Status::InvalidArgument("HBM span count mismatch");
+    if(command==hr::Command::Acquire || command==hr::Command::AcquireRaw) {
+      if ((command==hr::Command::AcquireRaw)!=identity_only || (!identity_only && spans.empty()))
+        return Status::InvalidArgument("HBM Ready/Acquire mode mismatch");
+      if(!identity_only && spans.size()!=batch.lengths.size()) return Status::InvalidArgument("HBM span count mismatch");
       for(size_t i=0;i<spans.size();++i)
-        if(spans[i].source!=batch.source_addresses[i] || spans[i].bytes!=batch.lengths[i])
+        if(spans[i].source<exporter->descriptor.base ||
+           !offload::Contains(input.bytes,spans[i].source-exporter->descriptor.base,spans[i].bytes) ||
+           spans[i].bytes>UINT64_MAX-spans[i].destination ||
+           (!identity_only && (spans[i].source!=batch.source_addresses[i] || spans[i].bytes!=batch.lengths[i])))
           return Status::InvalidArgument("HBM request differs from published ranges");
       if(state==hr::State::Reading) {
-        if(submitted.size()!=spans.size() || std::memcmp(submitted.data(),spans.data(),spans.size()*sizeof(hr::Span)))
+        if(submitted.size()!=spans.size() || (!spans.empty() && std::memcmp(submitted.data(),spans.data(),spans.size()*sizeof(hr::Span))))
           return Status::InvalidArgument("READ retry changed destination");
         return Status::OK();
       }
@@ -156,9 +161,9 @@ struct HbmReadSource::Impl {
     }
   }
 };
-HbmReadSource::HbmReadSource(std::uint32_t d,std::string e):impl_(new Impl(d,std::move(e))){}
-HbmReadSource::~HbmReadSource(){if(!Shutdown().ok()) (void)impl_.release();}
-Status HbmReadSource::Register(ConstBufferView input,void* stream,HbmReadTicket* out) {
+NpuPullHbmSource::NpuPullHbmSource(std::uint32_t d,std::string e):impl_(new Impl(d,std::move(e))){}
+NpuPullHbmSource::~NpuPullHbmSource(){if(!Shutdown().ok()) (void)impl_.release();}
+Status NpuPullHbmSource::Register(ConstBufferView input,void* stream,HbmReadTicket* out) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto s=impl_->Device(); if(!s.ok()) return s;
   if(impl_->input.valid()) return Status::InvalidState("HBM source already registered");
@@ -180,7 +185,7 @@ Status HbmReadSource::Register(ConstBufferView input,void* stream,HbmReadTicket*
   impl_->ticket={detail::Nonce(),detail::Nonce(),input.bytes,std::uint32_t(detail::Nonce())|1U};
   *out=impl_->ticket; return Status::OK();
 }
-Status HbmReadSource::Listen(const std::string& address) {
+Status NpuPullHbmSource::Listen(const std::string& address) {
   if(impl_->listener>=0) return Status::InvalidState("HBM source already listening");
   if(!impl_->input.valid()) return Status::InvalidState("register HBM before listen");
   auto s=hr::Listen(address,&impl_->listener,&impl_->port);if(!s.ok())return s;
@@ -190,7 +195,7 @@ Status HbmReadSource::Listen(const std::string& address) {
   if(!s.ok()){impl_->thread.join();close(impl_->listener);impl_->listener=-1;}
   return s;
 }
-Status HbmReadSource::Ready(const std::vector<std::uint64_t>& offsets,const std::vector<std::uint64_t>& lengths,
+Status NpuPullHbmSource::Ready(const std::vector<std::uint64_t>& offsets,const std::vector<std::uint64_t>& lengths,
                            void* stream,HbmReadBatch* out) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto s=impl_->Device();if(!s.ok())return s;
@@ -202,21 +207,39 @@ Status HbmReadSource::Ready(const std::vector<std::uint64_t>& offsets,const std:
   s=detail::Exporter::Ready(stream);if(!s.ok())return s;
   auto& b=impl_->batch;b={impl_->ticket.source_id,impl_->ticket.epoch,++impl_->sequence,{},lengths};
   for(auto offset:offsets)b.source_addresses.push_back(impl_->exporter->descriptor.base+offset);
-  impl_->frozen=true;impl_->state=hr::State::Ready;impl_->submitted.clear();*out=b;return Status::OK();
+  impl_->identity_only=false;impl_->frozen=true;impl_->state=hr::State::Ready;impl_->submitted.clear();*out=b;return Status::OK();
 }
-Status HbmReadSource::ReleaseBatch(){
+Status NpuPullHbmSource::Ready(ReadyToken* out) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  auto status=impl_->Device();if(!status.ok())return status;
+  if(!out || !impl_->confirmed) return Status::InvalidState("attach reader before Ready");
+  if(impl_->frozen && !impl_->identity_only) return Status::Busy("legacy HBM batch remains frozen");
+  if(!impl_->frozen) {
+    if(impl_->sequence==UINT64_MAX) return Status::InvalidState("HBM sequence exhausted");
+    ++impl_->sequence;impl_->identity_only=true;impl_->frozen=true;
+    impl_->batch={};impl_->state=hr::State::Ready;impl_->submitted.clear();
+  }
+  *out={NpuPullSourceDesc{impl_->ticket.source_id,impl_->input.bytes,impl_->ticket.epoch},impl_->sequence};
+  return Status::OK();
+}
+Status NpuPullHbmSource::FinishBatch(const ReadyToken* token,bool cancel){
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if(token) {
+    const auto* source=std::get_if<NpuPullSourceDesc>(&token->source);
+    const NpuPullSourceDesc own{impl_->ticket.source_id,impl_->input.bytes,impl_->ticket.epoch};
+    if(!source || !SameSource(*source,own) || !token->sequence || token->sequence!=impl_->sequence)
+      return Status::InvalidArgument("stale NPU Pull batch identity");
+  }
   if(!impl_->frozen)return Status::OK();
-  if(impl_->state!=hr::State::Done)return Status::Busy("A has not acknowledged READ completion; retain HBM");
+  if(impl_->state!=(cancel?hr::State::Ready:hr::State::Done))
+    return Status::Busy("HBM batch cannot be released/cancelled in its current state");
   impl_->frozen=false;impl_->state=hr::State::Connected;return Status::OK();
 }
-Status HbmReadSource::CancelBatch(){
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if(!impl_->frozen)return Status::OK();
-  if(impl_->state!=hr::State::Ready)return Status::Busy("READ acquired; cannot cancel producer buffer");
-  impl_->frozen=false;impl_->state=hr::State::Connected;return Status::OK();
-}
-Status HbmReadSource::Shutdown(){
+Status NpuPullHbmSource::ReleaseBatch(){return FinishBatch(nullptr,false);}
+Status NpuPullHbmSource::CancelBatch(){return FinishBatch(nullptr,true);}
+Status NpuPullHbmSource::ReleaseBatch(const ReadyToken& t){return FinishBatch(&t,false);}
+Status NpuPullHbmSource::CancelBatch(const ReadyToken& t){return FinishBatch(&t,true);}
+Status NpuPullHbmSource::Shutdown(){
   {std::lock_guard<std::mutex> lock(impl_->mutex);
    if(impl_->client || impl_->frozen)return Status::Busy("detach A and release HBM batch before shutdown");
    impl_->closing=true;}
@@ -224,9 +247,9 @@ Status HbmReadSource::Shutdown(){
   if(impl_->listener>=0){close(impl_->listener);impl_->listener=-1;}
   impl_->input={};impl_->retired.clear();impl_->ticket={};return Status::OK();
 }
-std::uint16_t HbmReadSource::port()const{return impl_->port;}
-bool HbmReadSource::frozen()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->frozen || (impl_->client && !impl_->confirmed);}
-bool HbmReadSource::connected()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->confirmed;}
-std::uint32_t HbmReadSource::device_id()const{return impl_->device;}
-std::string HbmReadSource::selected_npu_eid()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->selected;}
+std::uint16_t NpuPullHbmSource::port()const{return impl_->port;}
+bool NpuPullHbmSource::frozen()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->frozen || (impl_->client && !impl_->confirmed);}
+bool NpuPullHbmSource::connected()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->confirmed;}
+std::uint32_t NpuPullHbmSource::device_id()const{return impl_->device;}
+std::string NpuPullHbmSource::selected_npu_eid()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->selected;}
 }

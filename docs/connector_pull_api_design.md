@@ -1,0 +1,542 @@
+# 面向应用 Connector 的 CPU Pull 与 NPU Pull 接口设计
+
+状态：第一版已实现，待双卡硬件验收。本文记录当前接口边界、命名和调用流程；Python 接口与恢复方法见第 13 节。
+
+应用在 A、B 两台机器上分别运行 Connector。A 生产 HBM 数据并发送业务元数据，B 根据元数据组织源和目的地址，调用 KVAF 拉取。KVAF 向 B 返回结果，后续业务通知由两个 Connector 自行处理。
+
+本文统一使用 **A 为源端、B 为拉取发起端**。现有 [共享 DDR 文档](shared_ddr_remote_offload.md) 和 [HBM 裸地址读取文档](hbm_raw_addr_read.md) 描述已实现接口，使用的 A/B 角色名称与本文相反；实际数据方向以本文定义为准。
+
+## 1. 已确认的设计约束
+
+- CPU Pull 的目的槽位通过 `PreparePut` 分配，与普通 BatchPut 共用同一个 MetaManager、DDR 池和写事务机制。
+- 应用在 PreparePut 返回的预留范围内计算目的 offset，不设置独立的应用 DDR 分区，不提供 `reserve_raw_ddr()`。
+- 数据是否已准备好、读取期间是否保持不变，由应用保证。`ReadyToken` 不包含 `readable_ranges`，A 不再向 KVAF 发布一份读取范围。
+- 保留 `source_id`、`region_id`、`region_epoch` 等身份信息，由 KVAF 生成、保存和校验。
+- 保留两种源对象，将 `HbmSource` 更名为 `CpuPullHbmSource`，将 `HbmReadSource` 更名为 `NpuPullHbmSource`。
+- B Connector 自己选择 CPU Pull 或 NPU Pull，并计算源 offset、目的 offset、长度。
+- 两条读取接口直接接收 `src_offsets`、`dst_offsets`、`lengths` 三个连续、等长数组，相同下标表示同一段传输。
+- KVAF 的传输完成结果返回 B Connector。A/B Connector 的业务元数据和业务完成消息使用应用自己的通信通道。
+- 保留现有已验证的数据面：CPU 四 Jetty 批量 READ，以及独立的 `batch_get_raw_addr` 算子。
+
+## 2. 组件与职责
+
+| 组件 | 负责的事情 |
+|---|---|
+| A Connector | 调用注册和建链接口、交换描述符、生产数据、保证源数据就绪和稳定、发送业务元数据、接收完成通知 |
+| A 的 `CpuPullHbmSource` | 管理供 CPU 拉取的 HBM 注册、CPU 对端绑定、批次身份及源生命周期 |
+| A 的 `NpuPullHbmSource` | 管理供 B NPU 拉取的 HBM 注册、NPU 对端绑定、控制监听及批次状态 |
+| B Connector | 解析业务元数据、确定 key 和长度、调用 PreparePut、组织三个连续数组、发起拉取、处理结果并通知 A |
+| B 的 `NpuRuntime` | 管理共享 DDR、MetaManager、源绑定和任务，提供两条读取路径及写事务接口 |
+| CPU service | 分配并注册 DDR，保存 CPU Pull 源连接，执行 READ，提供任务状态和完成确认 |
+
+B 的普通 BatchPut、BatchGet、本卡 Offload 和跨卡 CPU Pull 共用一个 RuntimeCore、MetaManager 和 DDR Region。NPU 直接拉取 A HBM 的目的地是 B 的输出 HBM，不经过 DDR 元数据管理。
+
+本设计不增加第二个 OffloadRuntime，也不为应用计算的地址另外分配一块 DDR。
+
+## 3. 两种源对象
+
+| 对比 | `CpuPullHbmSource` | `NpuPullHbmSource` |
+|---|---|---|
+| 原类名 | `HbmSource` | `HbmReadSource` |
+| 所在位置 | A 源端进程 | A 源端进程 |
+| 主动读取方 | CPU service | B 的 NPU |
+| 数据路径 | A HBM → CPU DDR | A HBM → B HBM |
+| 初始化关联 | 指定的 CPU DDR region | NPU reader 连接 |
+| 目的内存确定时机 | 初始化时确定 DDR 池，每批通过 PreparePut 确定槽位 | 每次读取时由 B 提供 output 缓冲 |
+| 完成条件 | READ 完成后，B 提交或撤销写事务并完成 CPU 确认 | NPU READ 结束并完成传输确认 |
+| 路由 | CPU↔NPU 路由 EID | NPU↔NPU fullmesh EID |
+
+两个对象共用底层 `Exporter` 的 HBM 注册、地址对齐、资源创建和清理代码，但分别持有注册、连接和状态。CPU 与 NPU 对端的描述符格式、TP 绑定和控制协议仍分别处理，不合并资源实例。
+
+按当前场景，A 的两块 HBM 分别由这两个对象管理。对象本身留在 A 进程内，不能通过 Connector 序列化发送。
+
+## 4. 描述符、批次和地址结构
+
+以下为应用可见的逻辑结构。Connector 传递 KVAF 返回的描述符，不自行组装 MR、Jetty 或 TP 数据。Python 的两个源描述符及 ReadyToken 为只读对象，支持 pickle 跨进程交换；本地 put/task/source handle 不支持跨进程传递。
+
+### 4.1 长期源身份
+
+```cpp
+struct CpuPullSourceDesc {
+    uint64_t source_id;
+    uint64_t source_bytes;
+    uint64_t region_id;
+    uint64_t region_epoch;
+};
+
+struct NpuPullSourceDesc {
+    uint64_t source_id;
+    uint64_t source_bytes;
+    uint64_t source_epoch;
+};
+```
+
+| 字段 | 含义与用途 |
+|---|---|
+| `source_id` | 一次 HBM 源注册的编号，用来定位源注册和通信资源；不是物理卡号 |
+| `source_bytes` | 已注册源的逻辑长度，用于检查读取是否越界，不包含注册对齐引入的前缀 |
+| `region_id` | CPU service 分配的整个 DDR 池编号，不是 key 或 slot 编号 |
+| `region_epoch` | CPU service 实例代次，拒绝重启前遗留的旧请求；当前实现由服务创建时生成，同一实例的 region 共用 |
+| `source_epoch` | NPU 直读源身份的代次，用于拒绝旧的源描述符 |
+
+CPU Pull 的源在初始化时绑定指定 DDR 池，因此包含 region 身份。NPU Pull 源描述的是 A 上被读取的 HBM，不绑定 B 的某块输出 HBM。
+
+上面的结构只列身份信息。NPU 的 `export_ticket` 还携带必要的访问凭据；B 的 `attach_hbm()` 仍需通过建链交换取得 A HBM 的基址、长度、segment 和通道描述，并保存在连接对象中。源基址及导入信息不会因为简化公开结构而省略。
+
+B 的 `cpu_source_handle` 和 `hbm_link` 是本地绑定句柄。它们关联初始化时收到的描述符，不能当作跨进程句柄传递。
+
+### 4.2 ReadyToken
+
+```text
+ReadyToken {
+    source: CpuPullSourceDesc 或 NpuPullSourceDesc
+    sequence: 本次生产的数据批次编号
+}
+```
+
+`ReadyToken` 不包含 `readable_ranges`、源/目的地址列表、业务 key 或实际数据。这里的 Token 是批次身份描述，不是 URMA 内存访问 token。
+
+`source.ready()` 的作用收敛为登记批次并返回身份信息。应用应在确认生产写入完成后调用它；该接口不再接收 offset/length 列表，也不承担业务层的数据可读性判断。
+
+CPU Pull 的 Ready 状态登记在 CPU service；NPU Pull 的 Ready 状态登记在 A 的源对象中。批次身份用于将读取、完成、取消和释放关联起来。源未完成/未释放时不能发布新批次；Ready 控制请求响应丢失时，重试必须沿用原 sequence，不能另建批次。
+
+A Connector 向 B 发送的是：
+
+```text
+应用业务元数据：逻辑块、数据布局、业务请求标识等
+KVAF ReadyToken：源身份和 sequence
+```
+
+业务元数据由应用解释，KVAF 只校验资源和批次身份。
+
+### 4.3 三个连续、等长数组
+
+对外接口直接接收三个数组，不再传入逐段结构体列表，也不要求额外构造批次包装对象：
+
+```text
+src_offsets[N]
+dst_offsets[N]
+lengths[N]
+
+第 i 段：从 src_offsets[i] 读取 lengths[i] 字节，写入 dst_offsets[i]
+```
+
+所有偏移和长度均以字节为单位。连续指 Tensor 输入及内部三个元数据数组各自在内存中连续，不要求它们相邻，也不要求其描述的源或目的数据区间连续。
+
+| 数组元素 | CPU Pull | NPU Pull |
+|---|---|---|
+| `src_offsets[i]` | 相对 A 注册 HBM 的逻辑起点 | 相对 A 注册 HBM 的逻辑起点 |
+| `dst_offsets[i]` | 相对整个共享 DDR region 起点 | 相对 B 的 output 缓冲起点 |
+| `lengths[i]` | 本段实际传输长度 | 本段实际传输长度 |
+
+两条入口分别采用与执行位置一致的元数据形式：
+
+| 接口 | Python 三数组类型 | C++ 三数组类型 |
+|---|---|---|
+| `submit_cpu_pull()` | 一维、连续 CPU `torch.int64` Tensor；也接受 list、tuple、一维整数 NumPy 数组，与 `batch_put()` 共用转换规则 | Host `Uint64ArrayView` |
+| `batch_get_raw_addr()`（ReadyToken 新入口） | Runtime 当前 NPU 上的一维、连续 `torch.int64` Tensor；不隐式转换 CPU Tensor、list 或 NumPy | `NpuInt64ArrayView`，Host 不解引用其中的设备指针 |
+
+三个数组的元素数量必须相同，范围为 1～4096，偏移非负，每个 `lengths[i]` 大于零。CPU Pull 在 Host 检查数值并保存连续 `uint64_t` 快照，然后通过控制协议发送到 CPU service；接口返回或抛出异常后，应用可以复用这三组 CPU 元数据。
+
+NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数量，Host 另检查元数据存储不与整个 output 分配范围重叠。随后只启动一次 raw READ V2 算子：每个核先检查完整批次的数值、源/目的范围、目的不重叠；全部合法后在填写 WQE 时直接计算基址加偏移。所有段都不超过 64 KiB 时按下标直接生成 WQE；存在长段时，每核在 UB 建立分段数量的前缀表，通过 WQE 序号定位原段和段内偏移。最多 4096 个输入段、1048576 个 WQE。
+
+长段的分配仍按展开后的 WQE 总数划分到各核，避免单个大段集中在一核；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 在同一次算子完成后读取最终状态，检查各核一致的总 WQE 数及各自已提交/处理数量。该实现的真实性能仍需硬件验证。
+
+NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。接口执行期间不得修改或释放它们。Python 绑定保留三数组、output 和 stream 的强引用，正常完成或恢复确认资源安全后释放；如果 `pending_raw_addr` 为真，应用仍不得修改或复用这些存储。C++ 调用者自行保持存储有效。NPU 元数据内容校验失败时不会发 READ，KVAF 取消已获取的批次；生产端释放该批次后才能发布新的 ReadyToken 重试。
+
+应用不再逐段创建对象，原 READ 的 WQE 编码、多 Jetty 调度及 CQ 处理规则保持不变。旧 `ready_batch + output_offsets` 重载仍兼容原来的 Host 元数据路径。
+
+CPU Pull 的地址转换为：
+
+```text
+应用计算 dst_offsets[i] = PreparePut 返回的 address - DDR ticket.base + 槽内偏移
+CPU READ 源地址          = 源描述符中的 HBM 基址 + src_offsets[i]
+CPU READ 目的地址        = CPU 本地 DDR allocation 基址 + dst_offsets[i]
+```
+
+NPU Pull 的地址转换为：
+
+```text
+源地址   = hbm_link 保存的 A HBM 导出基址 + src_offsets[i]
+目的地址 = B output 本地地址 + dst_offsets[i]
+```
+
+B 不解引用 A 的本地指针。注册对齐、导出地址转换和必要的本地内存注册仍由 KVAF 处理。
+
+## 5. 控制服务地址
+
+控制服务地址是 KVAF 用于交换建链信息、查询任务和确认传输状态的 `IP:端口`，与数据面的 EID 和 HBM 地址分别管理。
+
+| 地址 | 用途 |
+|---|---|
+| `cpu_address` | CPU service 的控制地址，用于分配 DDR、注册 CPU Pull 源、提交/查询任务和完成确认 |
+| A 的 NPU 源控制地址 | `NpuPullHbmSource.listen()` 建立的监听，用于发现、建链、Acquire、Complete 和 Detach |
+| Connector 业务地址 | 应用自己的消息通道，由应用选择和管理 |
+
+例如，A 在当前进程内启动控制线程：
+
+```python
+npu_source.listen("0.0.0.0:29001")
+```
+
+A Connector 把可从 B 到达的地址和 export ticket 发给 B，随后 B 调用：
+
+```python
+hbm_link = runtime.attach_hbm(
+    "10.0.0.1:29001", export_ticket, local_eid=b_fullmesh_eid,
+)
+```
+
+这里的地址仅为示例。监听地址 `0.0.0.0` 不作为对端连接地址发送。该监听不要求额外启动一个进程；HBM 数据通过 READ 数据面传输，不经过这个 TCP 控制端点。
+
+NPU 源不提前绑定 B 的目标 HBM，是因为 `batch_get_raw_addr()` 每次接收 `output`。B Runtime 对该缓冲执行范围检查和必要的本地注册，并保持它的生命周期。CPU Pull 当前则在初始化时借用并注册指定 DDR 池；这是两条路径的资源组织差异。
+
+## 6. 初始化接口
+
+下表列出本次新增、调整和更名后的接口。旧类名和带范围的旧调用形式保留为兼容入口。
+
+| 调用方 | 接口 | 返回与作用 | 变更 |
+|---|---|---|---|
+| B Connector | `runtime.link_to(cpu_address)` | 连接 CPU service | 保留 |
+| B Connector | `runtime.initialize(ddr_bytes, slot_size)` | 分配共享 DDR，初始化 MetaManager | 保留 |
+| B Connector | `runtime.offload_region()` | 返回 DDR ticket，由应用发送给 A | 保留 |
+| A Connector | `CpuPullHbmSource(device_id, npu_eid)` | 创建 CPU Pull 源对象 | 原 `HbmSource` 更名 |
+| A Connector | `cpu_source.register(ddr_ticket, hbm_cpu, stream)` | 注册源、建立 CPU→A 链路并探测，返回 CpuPullSourceDesc | 扩展返回描述符 |
+| B Connector | `runtime.attach_cpu_source(source_desc)` | 返回 cpu_source_handle，校验源与本 Runtime 的 DDR 关联 | 新增 |
+| A Connector | `NpuPullHbmSource(device_id, npu_eid)` | 创建 NPU Pull 源对象 | 原 `HbmReadSource` 更名 |
+| A Connector | `npu_source.register(hbm_npu, stream)` | 登记源缓冲，返回 export_ticket | 保留能力 |
+| A Connector | `npu_source.listen(address)` | 启动当前进程内的 KVAF 控制监听 | 保留 |
+| B Connector | `runtime.attach_hbm(address, export_ticket, local_eid)` | 建立 B NPU→A HBM 链路，返回 hbm_link | 保留 |
+
+`attach_cpu_source()` 是 B 侧逻辑绑定，不重复建立 CPU→A 的通信资源。`NpuPullHbmSource.register()` 可以保留现有延迟注册方式，在 B attach、对端参数确定后完成实际 HCCP 注册和绑定。
+
+初始化包含实际 READ 探测，因此应用在注册/attach 完成前应保持探测数据稳定。初始化所用的 `stream` 同步与运行阶段不带范围的 `ready()` 是不同阶段。
+
+CPU Pull 使用其独立的 CPU↔NPU EID 配置。NPU↔NPU 链路在 A 的源对象和 B 的 `attach_hbm(local_eid=...)` 上分别配置 fullmesh EID，不能假定 CPU 路由 EID 可以替代。
+
+初始化时应用交换的内容：
+
+```text
+B Connector → A Connector：DDR ticket
+A Connector → B Connector：CPU Pull source_desc
+A Connector → B Connector：NPU Pull export_ticket、控制服务地址、应用数据布局
+```
+
+源对象、MR、Jetty 和 TP 保存在 KVAF 内部；应用交换的只是票据与业务元数据。
+
+## 7. A 端批次接口
+
+两个源对象提供一致形式的接口：
+
+| 接口 | 语义 |
+|---|---|
+| `source.ready() → ready_token` | 在应用保证生产完成后登记本批身份；不接收地址范围，不发起 READ |
+| `source.release_batch(ready_token)` | 检查对应批次已经安全结束，解除本批占用；不注销长期 HBM 注册 |
+| `source.cancel_batch(ready_token)` | 仅取消尚未被读取方获取或提交的批次 |
+| `source.shutdown()` | 在无未决批次和对端引用后释放连接与注册 |
+
+`release_batch()` 和 `cancel_batch()` 显式匹配源及 sequence，避免旧的应用通知作用于新批次。
+
+```python
+# A Connector；应用自行实现生产和业务通知。
+produce(hbm)
+wait_until_production_complete()  # 应用保证生产写入已经完成
+ready = source.ready()
+connector.send_to_b(business_metadata, ready)
+
+# 等待应用通道的对应批次完成消息。
+completion = connector.receive_completion()
+source.release_batch(completion.ready)
+# 成功后可以覆写下一批；释放底层缓冲还需要 shutdown 成功。
+```
+
+应用负责从数据就绪到读取结束期间不覆写、不释放源。KVAF 可以拒绝提前注销、错误取消和释放错误批次，但不能阻止应用直接通过 Tensor/指针修改内存。
+
+## 8. B 端 CPU Pull 接口
+
+### 8.1 接口与完成边界
+
+| 接口 | 返回与作用 |
+|---|---|
+| `prepare_put(keys, lengths) → put` | 包装现有 MetaManager 的 PreparePut，预留槽位并返回目标地址，此时本批新数据尚未发布为可读 |
+| `submit_cpu_pull(source_handle, ready, put, src_offsets, dst_offsets, lengths) → task` | 校验并提交 CPU READ，返回任务句柄；不代表数据完成 |
+| `query_cpu_pull(task) → status` | 查询同一任务，不重发 READ |
+| `wait_cpu_pull(task, timeout) → result` | 成功表示所有 READ 已完成、数据已落入 DDR，尚未 CommitPut |
+| `commit_put(put) → result` | 检查关联传输完成，提交 MetaManager，并完成 CPU 侧批次确认 |
+| `abort_put(put)` | 在元数据未提交且确认无在途 DMA 时撤销事务 |
+
+`put` 是应用调用 `runtime.prepare_put(keys, lengths)` 得到的 **PutHandle 写事务句柄**。它代表本次为这些 key 预留的 DDR 槽位及后续提交责任，不包含待搬运的数据，也不是一次已经执行完毕的 BatchPut。传入 `submit_cpu_pull()` 不会再次分配槽位。
+
+Runtime 保存真实事务记录，应用得到该记录的本地句柄和只读分配描述：
+
+```text
+PutHandle
+    事务编号
+    所属 Runtime
+    DDR region 身份
+    entries：每个 key 的 address 和有效数据长度 length
+    关联 task 与事务状态
+```
+
+目标槽位仍采用当前 MetaManager 的 DSA 规则；接口公开不改变 key 到槽位的分配策略。应用不能自行构造一个 put 句柄来绕过预留。
+
+三个数组只说明“从哪里搬到哪里、搬多少字节”，`put` 还提供目的槽位的归属和提交上下文。提交时 KVAF 根据它确认 `dst_offsets` 指向本次预留的有效范围，将 task 绑定到该事务，防止其他任务覆盖槽位或在 DMA 未完成时释放槽位。读取成功后 `commit_put(put)` 发布这批 key 的新数据；安全撤销时 `abort_put(put)` 回收本次预留。
+
+`put` 只在创建它的 B Runtime 中使用，不作为对象发给 A 或 CPU service；CPU service 通过控制协议中的 region、源和任务身份执行读取。NPU 直接读取路径的目的地由 `output` 指定，因此不需要 put。
+
+任务在发送控制请求前创建并保存在 Runtime 中，与 put 绑定。提交响应丢失时必须保留并暴露原任务供查询，不能只抛出异常而丢失恢复入口。
+
+### 8.2 地址组织和检查
+
+B Connector 根据业务元数据确定 key、有效长度以及源位置，在 PreparePut 返回的范围内组织传输：
+
+```python
+import torch
+
+metadata, ready = connector.receive_from_a()
+keys, key_lengths, source_offsets = organize_data(metadata)
+
+put = runtime.prepare_put(keys, key_lengths)
+src_offsets = torch.tensor(source_offsets, dtype=torch.int64, device="cpu")
+dst_offsets = torch.tensor(
+    [entry.address - ddr_ticket.base for entry in put.entries],
+    dtype=torch.int64, device="cpu",
+)
+lengths = torch.tensor(key_lengths, dtype=torch.int64, device="cpu")
+
+task = runtime.submit_cpu_pull(
+    cpu_source_handle, ready, put, src_offsets, dst_offsets, lengths,
+)
+result = runtime.wait_cpu_pull(task, timeout)
+runtime.commit_put(put)
+
+# 传输和提交已完成；此后的业务处理及通知由应用决定。
+connector.send_completion_to_a(ready, result)
+```
+
+示例展示成功路径；失败时按第 10 节保留或撤销资源，不能在任意异常后无条件 Abort。
+
+示例中一个 key 对应一段传输，因此 `lengths` 与 `key_lengths` 相同。应用也可以把一个 key 拆成多段：PreparePut 的 lengths 按 key 定义有效数据长度，提交接口的 lengths 按传输段定义长度，两者数量不必相同；提交接口的三个数组之间必须等长。
+
+KVAF 检查源身份和 sequence，检查源区间位于已注册 HBM 中，检查长度非零及地址加法不溢出。它不判断业务元数据所描述的数据是否已经生产完成。
+
+B Runtime 根据 MetaManager 的真实预留记录检查目的范围：
+
+- 所有目的区间属于本次 put，不能只检查它们位于整个 DDR 池内。
+- 目的区间不能相互重叠。
+- 三个数组描述的全部目的区间合起来完整覆盖本次准备提交的有效数据长度，不能留下未写入的空洞。
+- 一个 key 可以拆成多段，源区间可以重排；槽内偏移也必须满足上述检查。
+
+CPU service 保留 region 身份、注册范围、目的不重叠和任务一致性检查。MetaManager 在 B 端，事务归属和覆盖检查在 B Runtime 中完成，不在 CPU 端创建第二套 MetaManager。
+
+### 8.3 CPU Pull 时序
+
+```mermaid
+sequenceDiagram
+    participant AC as A Connector（应用）
+    participant AS as A KVAF 源
+    participant BC as B Connector（应用）
+    participant BR as B Runtime
+    participant CPU as CPU service
+
+    AC->>AC: 生产数据并确认写入完成
+    AC->>AS: ready()
+    AS-->>AC: ReadyToken
+    AC->>BC: 应用消息：业务元数据和 ReadyToken
+    BC->>BR: prepare_put(keys, lengths)
+    BR-->>BC: put 和目标地址描述
+    BC->>BC: 计算三个连续、等长数组
+    BC->>BR: submit_cpu_pull(source, ready, put, src_offsets, dst_offsets, lengths)
+    BR->>CPU: 提交读取任务
+    BR-->>BC: task
+    CPU->>AS: READ A 的 HBM
+    CPU->>CPU: 写入 DDR，等待各队列尾部完成 CQE
+    BC->>BR: wait_cpu_pull(task)
+    BR-->>BC: 数据完成
+    BC->>BR: commit_put(put)
+    BR->>BR: 提交 MetaManager
+    BR->>CPU: 确认批次结束
+    BR-->>BC: 提交完成
+    BC->>AC: 应用自己的业务完成通知
+    AC->>AS: release_batch(ready)
+    AS-->>AC: 允许复用源缓冲
+```
+
+`commit_put()` 包含库内部 CPU 批次确认，不再要求应用调用额外的 `finish_cpu_pull()`。
+
+## 9. B 端 NPU Pull 接口
+
+保留 `batch_get_raw_addr` 名称，调整为由 B 显式提供三个连续、等长数组：
+
+```python
+result = runtime.batch_get_raw_addr(
+    hbm_link, ready, src_offsets, dst_offsets, lengths, output, stream,
+)
+```
+
+| 接口 | 作用 |
+|---|---|
+| `batch_get_raw_addr(...) → result` | 按三个数组描述的区间读取 A HBM 到 B output，第一版同步完成 |
+| `resolve_raw_addr(hbm_link)` | 恢复控制确认或资源清理，不重发 READ |
+| `detach_hbm(hbm_link)` | 无未决读取时解除连接，并确认对端资源释放 |
+
+KVAF 在 Host 检查数组布局、元数据/output 不重叠和批次身份；NPU raw READ V2 在同一次执行内校验完整批次，并直接从三个 Tensor 生成 WQE。不会先生成展开的设备描述符数组。
+
+该路径不需要 PreparePut、CommitPut 或 AccessTable。A 的源描述符无需绑定 B 的目标 HBM；B 每次传入 output，KVAF 管理读取所需的本地注册和缓冲引用。第一版成功返回时，输出已完成且传输控制确认已结束。
+
+### 9.1 output 的含义
+
+`output` 是 **B 应用分配的本地接收 HBM 缓冲**，Python 接口中为位于 B 卡、内存连续的 NPU Tensor。它是输入参数中的目标缓冲，调用会直接写入它；接口返回的 `result` 表示完成状态，数据本身位于 output 中。读取按字节搬运，不进行 Tensor dtype 转换。
+
+每一段的目的地址为 `output.data_ptr() + dst_offsets[i]`，目的范围必须位于 `output.numel() * output.element_size()` 字节以内。偏移相对本次传入 Tensor 的逻辑起点，KVAF 在注册时处理底层对齐。多个目的区间可以有间隔，未覆盖的字节不属于本次读取结果。
+
+例如，B 将 A 上两段不连续的 4 KiB 数据读入一个连续的 8 KiB 缓冲：
+
+```python
+import torch
+
+with torch.npu.stream(stream):
+    output = torch.empty(8192, dtype=torch.uint8, device=b_device)
+    src_offsets = torch.tensor([4096, 12288], dtype=torch.int64, device=b_device)
+    dst_offsets = torch.tensor([0, 4096], dtype=torch.int64, device=b_device)
+    lengths = torch.tensor([4096, 4096], dtype=torch.int64, device=b_device)
+
+result = runtime.batch_get_raw_addr(
+    hbm_link, ready, src_offsets, dst_offsets, lengths, output, stream,
+)
+# 成功返回后，output[0:4096] 和 output[4096:8192] 分别包含上述两段数据。
+```
+
+output 必须在读取完成前保持有效，不得并发覆写、调整大小或释放。若接口因未决传输而失败，KVAF 继续保留对应引用和注册，应用也不得复用该缓冲，直到恢复流程确认可以安全使用或释放。
+
+| 参数 | 表示什么 | 数据最终写入哪里 |
+|---|---|---|
+| CPU Pull 的 `put` | PreparePut 返回的写事务及槽位归属 | CPU DDR 中本次预留的槽位，由 dst_offsets 定位 |
+| NPU Pull 的 `output` | B 应用提供的本地 NPU Tensor | 该 Tensor 的 HBM 范围，由 dst_offsets 定位 |
+
+### 9.2 NPU Pull 时序
+
+```mermaid
+sequenceDiagram
+    participant AC as A Connector（应用）
+    participant AS as A KVAF 源
+    participant BC as B Connector（应用）
+    participant BR as B Runtime
+
+    AC->>AC: 生产数据并确认写入完成
+    AC->>AS: ready()
+    AS-->>AC: ReadyToken
+    AC->>BC: 应用消息：业务元数据和 ReadyToken
+    BC->>BC: 准备 output HBM 和三个连续、等长数组
+    BC->>BR: batch_get_raw_addr(link, ready, src_offsets, dst_offsets, lengths, output, stream)
+    BR->>AS: AcquireRaw：源身份和 sequence，无三数组
+    BR->>BR: 一次 raw READ：整批校验、核内分段、生成 WQE、等待 CQ
+    BR->>BR: Host 检查各核最终状态及 WQE 数量
+    BR->>AS: 库内部传输完成确认
+    BR-->>BC: 输出就绪，返回结果
+    BC->>AC: 应用自己的业务完成通知
+    AC->>AS: release_batch(ready)
+    AS-->>AC: 允许复用源缓冲
+```
+
+NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是让源端维持本批 HBM 的生命周期；三数组只供读取方本地 NPU 使用，真实地址和长度写入数据面的 WQE。CPU Pull 则仍通过 Submit 控制消息将三数组发送给执行 READ 的 CPU service。
+
+两条路径中的 A/B Connector 消息都由应用实现。KVAF 内部的 Acquire、Complete 等控制消息维护传输状态，不代替业务完成通知。第一版使用调用返回值及任务查询交付结果，Connector 可自行转成应用事件。
+
+## 10. 事务、重试和资源生命周期
+
+| 情况 | 允许的处理 |
+|---|---|
+| PreparePut 后尚未提交 READ | 可以 AbortPut |
+| READ 全部完成、尚未 CommitPut | 可以 Commit，或在确认 DMA 结束后撤销写事务 |
+| 提交响应丢失、超时或 DMA 状态不确定 | 保留 task、put、目标槽位和源缓冲，查询原任务；不能释放并复用地址 |
+| Meta 已提交，但 CPU 确认响应丢失 | 重试 commit_put 的确认阶段，不重复 Commit，不改为 Abort |
+| NPU READ 完成但控制确认未完成 | 用 resolve_raw_addr 恢复确认，不重读数据 |
+| A 收到延迟或重复的业务完成消息 | 按源和 sequence 匹配；不能释放另一个批次 |
+
+重复提交必须关联原任务且参数一致。已完成请求返回原结果或明确的已完成状态，不能再次产生 READ；冲突参数必须拒绝。未知 DMA 状态不自动重建链路或重放请求。
+
+公开的 put/task 状态与现有 Offload 的 pending 保护共用，避免拆出接口后普通 BatchPut、BatchFree 或 Shutdown 绕过未决资源保护。句柄超时、退出作用域或异常都不代表 DMA 已结束。
+
+生产端注册持有底层缓冲直到 shutdown 成功。批次 release 只允许覆写下一批，不代表已经可以释放整块注册内存。
+
+正常关闭顺序为：停止新任务并处理完已有批次，A 释放对应批次；NPU Pull 由 B detach_hbm 后再由 A 关闭 NPU 源；CPU Pull 由 A 关闭 CPU 源以释放 CPU service 上的源连接和 DDR lease；最后 B 关闭 Runtime 和共享 DDR。业务协调仍由 Connector 执行。
+
+数据 checksum 保持独立诊断，不纳入传输计时。若应用需要校验，应在目的数据释放/覆写、下一次 Ready 或源注销前完成；校验结束后再通知 A 复用可直接沿用当前验收流程。
+
+## 11. 现有代码的调整范围
+
+| 当前实现 | 目标调整 |
+|---|---|
+| `HbmSource` | 更名为 CpuPullHbmSource，返回长期源描述符 |
+| `HbmReadSource` | 更名为 NpuPullHbmSource，保留独立 NPU 控制协议与绑定实现 |
+| `ready(offsets, lengths, stream)` | 新接口 ready() 只登记批次；应用负责生产完成和数据稳定 |
+| Ready 携带最终源范围，Submit/Acquire 必须逐项匹配 | 具体范围来自 B 的三个数组；CPU Pull 保存 Host 请求快照，NPU Pull 在同一次 READ 算子中校验并直接生成 WQE，控制面只获取批次读取权 |
+| PreparePut/CommitPut 隐藏在 RuntimeCore 的完整 Offload 中 | 增加受 Runtime 状态管理的公开事务接口 |
+| CPU Submit 隐藏在 RemotePullOperator | 增加 submit/query/wait 接口，绑定 put 与 task |
+| CPU 目的地址必须落在 slot 起点 | 支持本次预留有效范围内的拆分和槽内偏移，保持覆盖、归属及不重叠检查 |
+| batch_get_raw_addr 的源地址列表来自 Ready batch | 扩展入口由 B 提供三个连续、等长数组，保留原算子和通信实现 |
+
+CPU Pull 控制协议 KVRP 升级为 v3，NPU 直读控制协议 KVHR 升级为 v3。CPU service 和两个 NPU 应用需要同时重新编译升级；协议版本不符时拒绝通信。升级后的端点仍支持旧的带范围 Ready 和便利接口。独立 OffloadRuntime 使用的 KVOF v2 保持不变。
+
+现有 `offload_from()` 保留为便利接口，内部复用：
+
+```text
+prepare_put → 内部组织三个连续数组 → submit_cpu_pull → wait_cpu_pull → commit_put
+```
+
+兼容层继续从原有携带 input_offsets/lengths 的请求中取得读取范围，再适配为三个连续数组。新的 ReadyToken 不包含范围，不能仅凭 `offload_from(keys, new_ready_token)` 推导源位置和长度。Connector 的新调用直接使用本文拆分接口。
+
+本次接口重构保留了已验证的 CPU 四 Jetty READ 调度和 raw-address 算子，也保留了 CPU 与 NPU 各自的 MR、Jetty 和 TP 资源实例。
+
+## 12. 第一版范围
+
+- 一个源同时一个活动批次；一个 Ready 批次对应一次读取消费。
+- 一个 Put 事务对应一个 CPU Pull 任务，不引入多任务拼接提交。
+- 同一 DDR 池一次只有一个未完成或未确认的 CPU Pull。
+- 同一 Runtime 的这些控制接口按顺序调用，不新增并发调用保证。
+- 保留现有单个 NPU 源绑定一个 reader 的范围；多个源使用不同描述符和本地句柄。
+- 应用负责 A/B 的业务元数据交换、业务完成通知、生产同步和源数据稳定。
+- KVAF 负责注册、建链、地址与事务检查、数据搬运、完成状态和安全清理。
+
+## 13. 实现对接与验收
+
+### 13.1 Python 返回值与恢复入口
+
+- `cpu_source.register(...)` 返回 `CpuPullSourceDesc`，由源端 Connector 发给读取端。
+- `source.ready()` 返回 `ReadyToken`；应用调用前同步生产 stream。旧 `ready(offsets, lengths, stream)` 仍返回原字典结构，并保留原有范围校验。
+- `prepare_put(...)` 返回 `PutHandle`：`entries` 提供只读的 `key/address/length`，`state` 提供事务状态，`task` 提供关联任务。
+- `submit_cpu_pull(...)` 返回 `CpuPullTask`。若响应丢失而抛出异常，通过 `put.task` 取回原任务；`put.task.valid` 表示是否已建立任务上下文。不得重新 PreparePut 来替代未决任务。
+- `query_cpu_pull(task)` 返回 `CpuPullState`；`wait_cpu_pull(task, timeout=30000)` 的 timeout 单位为毫秒，成功返回 `DONE` 或已提交的 `COMMITTED`，不会自动 Commit。
+- `commit_put(put)` 返回 `COMMITTED`，`abort_put(put)` 返回 `ABORTED`。提交响应丢失后重试原 commit，不能反向 Abort。PreparePut 后尚未提交任务时，可以直接 Abort。
+- 新 `batch_get_raw_addr(...)` 成功返回 `{"state": "done", "sequence": ready.sequence}`，实际数据直接写入 output。其未决恢复继续使用 `resolve_raw_addr(hbm_link)`，不会重发 READ。
+
+新事务使用 `query_cpu_pull`、`wait_cpu_pull`、`commit_put`、`abort_put` 恢复；`resolve_offload()` 保留给旧同步便利接口。当前版本从 PreparePut 起保护这笔事务，完成或撤销前会拒绝同一 Runtime 的其他 DDR 访问操作。
+
+如果提交前的参数校验失败，`put.task.valid` 为 false，可以修正数组后继续提交，或撤销 put。若任务已经建立，使用原句柄查询：`DONE` 可提交或撤销，`FAILED` 可撤销，`RUNNING` / `IN_DOUBT` 保留资源。未成功通知 CPU 的失败可能仍让生产批次处于 Ready，应用协调源端调用 `cancel_batch(ready)`；源端会拒绝取消已被获取的批次。
+
+C++ 的共享类型与数组视图在 `common/include/connector_types.h`，事务句柄与 RuntimeCore 接口在 `runtime/include/runtime.h`，NPU 包装接口在 `runtime/include/npu_runtime.h`。CPU 源仍通过 `runtime/include/remote_offload.h` 引入，NPU 源通过 `runtime/include/hbm_read.h` 引入。C++ 调用者在未决期间自行保持源和输出内存有效，Python 绑定保留对应 Tensor 引用。
+
+### 13.2 硬件验收入口
+
+继续使用现有构建选项和 CPU service，重新构建并重启两端程序后，在原双卡验收命令中增加 `--connector-api`：
+
+```bash
+python tests/python/test_remote_cpu_offload.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --connector-api
+
+python tests/python/test_hbm_read_raw_addr.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
+  --npu-eid-a-raw 000000000047050000100000df00d806 \
+  --npu-eid-b-raw 000000000047050000100000df00f807 \
+  --batch-get-kernel build-shared-ddr/bin/kvaf_execute_batch_get_kernels.o \
+  --batch-put-kernel build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o \
+  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o \
+  --connector-api
+```
+
+上述 EID/设备对应此前同机验收配置，构建目录按实际路径替换。两个旧测试脚本的参数名称继续沿用 **device-a 为读取端、device-b 为生产端**，与本文设计中的 A/B 角色命名相反。
+
+CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checksum 和批次复用确认。组合验收同时覆盖共享 DDR 的普通 BatchPut/BatchGet、CPU Pull 和三数组 NPU 直读，包括非页对齐源、输出间隔及 NPU 消费者校验。去掉 `--connector-api` 可以继续验收旧接口兼容性。
+
+需要同时重新编译 NPU 运行库和 raw-address kernel object。当前入口为 `KvafExecuteBatchGetRawAddrAivKernelV2`，使用扩展的参数与最终状态 ABI；旧 V1 object 会拒绝加载。已删除独立准备算子及其状态 ABI。

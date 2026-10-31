@@ -5,14 +5,14 @@ namespace kvaf::remote_pull {
 // Shared-pool, third-party source control. Keep legacy KVOF and KVCP framing
 // separate; old services cannot accidentally interpret these requests.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
-// V2 computes payload checksums only on explicit Checksum requests. V1 clients
-// expect a checksum in Query/Done, so require all three peers to upgrade together.
-constexpr std::uint16_t kVersion = 2;
+// V3 adds identity-only Ready (flags=1) and application-defined Submit ranges.
+// Legacy range-bearing API calls remain supported by upgraded peers (flags=0).
+constexpr std::uint16_t kVersion = 3;
 using Endpoint = offload::Endpoint;
 using Span = offload::Span;
 using Result = offload::Result;
 constexpr auto kMaxSpans = offload::kMaxSpans;
-enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Ready, Submit, Query, Complete, Cancel, Detach, Checksum };
+enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Ready, Submit, Query, Complete, Cancel, Detach, Checksum, InspectSource };
 enum class State : std::uint32_t { Connecting, Idle, Ready, Running, Done, Failed, InDoubt, Committed, Cancelled, Closed };
 struct RegionInfo {
   std::uint64_t epoch{}, id{}, base{}, bytes{}, slot_size{};

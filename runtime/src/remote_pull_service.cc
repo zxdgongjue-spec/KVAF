@@ -14,6 +14,7 @@ struct Session {
   std::unique_ptr<offload::Backend> backend;
   std::uint64_t sequence{};
   std::vector<Span> ready, submitted;
+  bool identity_only{};
   State state{State::Connecting}, terminal{State::Connecting};
   std::mutex mutex;
   std::thread worker;
@@ -119,14 +120,18 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     if (!status.ok()) s.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
     out.state = s.state; out.result = Convert(status); return out;
   }
+  if (cmd == Command::InspectSource && !r.task && s.state != State::Closed) {
+    out.endpoint = s.source; out.result = Result::Ok; return out;
+  }
   if (!r.task) return out;
   if (cmd == Command::Ready) {
-    if (r.task == s.sequence && SameSpans(spans, s.ready) && s.state != State::Closed) { out.result = Result::Ok; return out; }
-    if (r.task != s.sequence + 1 || (s.state != State::Idle && s.state != State::Committed && s.state != State::Cancelled) || spans.empty()) return out;
+    if (r.flags > 1 || (r.flags == 1 ? !spans.empty() : spans.empty())) return out;
+    if (r.task == s.sequence && bool(r.flags) == s.identity_only && SameSpans(spans, s.ready) && s.state != State::Closed) { out.result = Result::Ok; return out; }
+    if (r.task != s.sequence + 1 || (s.state != State::Idle && s.state != State::Committed && s.state != State::Cancelled)) return out;
     for (const auto& span : spans)
       if (span.destination || !offload::Contains(s.source.bytes, span.source, span.bytes)) return out;
     if (s.worker.joinable()) s.worker.join();
-    s.sequence = r.task; s.ready = spans; s.submitted.clear();
+    s.sequence = r.task; s.ready = spans; s.submitted.clear(); s.identity_only = r.flags == 1;
     s.state = out.state = State::Ready; out.result = Result::Ok; return out;
   }
   // A Ready packet may never have reached the service. Cancel also records
@@ -171,9 +176,9 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     if (SameSpans(spans, s.submitted)) out.result = Result::Ok;
     return out;
   }
-  if (s.state != State::Ready || spans.size() != s.ready.size() ||
+  if (s.state != State::Ready || (!s.identity_only && spans.size() != s.ready.size()) ||
       !offload::ValidateSpans(spans, s.source.bytes, region.bytes)) return out;
-  for (std::size_t i = 0; i < spans.size(); ++i)
+  for (std::size_t i = 0; !s.identity_only && i < spans.size(); ++i)
     if (spans[i].source != s.ready[i].source || spans[i].bytes != s.ready[i].bytes ||
         spans[i].destination % region.slot_size || spans[i].bytes > region.slot_size) return out;
   // One unresolved write per pool, including CQ failures with unknown DMA state.

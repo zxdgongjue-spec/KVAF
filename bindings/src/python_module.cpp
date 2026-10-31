@@ -1,4 +1,5 @@
 #include "hbm_read_python.h"
+#include "connector_python.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -348,6 +349,7 @@ namespace kvaf { void BindOffloadRuntime(pybind11::module_&); void BindHbmSource
 #endif
 
 PYBIND11_MODULE(_kvaf, m) {
+  kvaf::BindConnectorTypes(m);
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   kvaf::BindOffloadRuntime(m);
   kvaf::BindHbmSource(m);

@@ -20,6 +20,7 @@
 #include "npu_runtime.h"
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
 #include "remote_offload_python.h"
+#include "connector_python.h"
 #endif
 
 namespace py = pybind11;
@@ -292,6 +293,35 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->OffloadFrom(CopyPrepareKeys(keys), remote_python::Batch(batch)));
   }
   void ResolveOffload() { ThrowIfError(native_->ResolveOffload()); }
+  CpuPullSourceHandle AttachCpuSource(const CpuPullSourceDesc& source) {
+    CpuPullSourceHandle result; ThrowIfError(native_->AttachCpuSource(source,&result)); return result;
+  }
+  PutHandle PreparePut(const py::object& keys,const py::object& lengths) {
+    std::vector<std::uint64_t> sizes;
+    CopyCpuUint64SequenceInto(lengths,"lengths",&sizes);
+    PutHandle put; ThrowIfError(native_->PreparePut(CopyPrepareKeys(keys),sizes,&put)); return put;
+  }
+  CpuPullTask SubmitCpuPull(const CpuPullSourceHandle& source,const ReadyToken& ready,const PutHandle& put,
+                           const py::object& src,const py::object& dst,const py::object& lengths) {
+    std::vector<std::uint64_t> sources, destinations, sizes;
+    CopyCpuUint64SequenceInto(src, "src_offsets", &sources);
+    CopyCpuUint64SequenceInto(dst, "dst_offsets", &destinations);
+    CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
+    CpuPullTask task;
+    const auto status=native_->SubmitCpuPull(source,ready,put,sources,destinations,sizes,&task);
+    if(!status.ok()) throw std::runtime_error(status.message()+"; recover the original task via put.task");
+    return task;
+  }
+  CpuPullState QueryCpuPull(const CpuPullTask& task) {
+    CpuPullState state; ThrowIfError(native_->QueryCpuPull(task,&state)); return state;
+  }
+  CpuPullState WaitCpuPull(const CpuPullTask& task,std::uint32_t timeout) {
+    CpuPullState state; Status status;
+    {py::gil_scoped_release release;status=native_->WaitCpuPull(task,timeout,&state);}
+    ThrowIfError(status); return state;
+  }
+  CpuPullState CommitPut(const PutHandle& put) { ThrowIfError(native_->CommitPut(put)); return put.state(); }
+  CpuPullState AbortPut(const PutHandle& put) { ThrowIfError(native_->AbortPut(put)); return put.state(); }
   bool PendingOffload() const { return native_->pending_offload(); }
   std::uint64_t LastChecksum() const { std::uint64_t hash{}; ThrowIfError(native_->LastOffloadChecksum(&hash)); return hash; }
 #endif
@@ -325,6 +355,37 @@ class NpuPythonRuntime final {
     const auto status = native_->ResolveRawAddr(region);
     if (!native_->pending_raw_addr()) raw_retained_ = py::none();
     ThrowIfError(status);
+  }
+  py::dict BatchGetRawArrays(LinkId region,const ReadyToken& ready,const py::object& src,const py::object& dst,
+                         const py::object& lengths,py::object output,py::object stream) {
+    auto array = [&](const py::object& tensor, const char* name) {
+      const auto view = GetNpuTensorView(tensor, name);
+      if (view.shape.size() != 1 || view.element_bytes != sizeof(std::int64_t) ||
+          !py::hasattr(tensor, "dtype") || py::str(tensor.attr("dtype")).cast<std::string>() != "torch.int64" ||
+          reinterpret_cast<std::uintptr_t>(view.data) % alignof(std::int64_t) ||
+          tensor.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
+        throw py::value_error(std::string(name) + " must be a one-dimensional torch.int64 Tensor on the Runtime NPU");
+      return NpuInt64ArrayView{static_cast<const std::int64_t*>(view.data), view.bytes / sizeof(std::int64_t)};
+    };
+    const auto sources = array(src, "src_offsets");
+    const auto destinations = array(dst, "dst_offsets");
+    const auto sizes = array(lengths, "lengths");
+    if (sources.size != destinations.size || sources.size != sizes.size || sources.size > 4096)
+      throw py::value_error("raw READ metadata must have equal lengths in 1..4096");
+    if(native_->pending_raw_addr())throw py::value_error("resolve the pending raw READ first");
+    const auto view=GetNpuTensorView(output,"output");
+    if(output.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
+      throw py::value_error("raw READ output belongs to another NPU");
+    if(stream.is_none())stream=py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
+    if(py::hasattr(stream,"device") && stream.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
+      throw py::value_error("raw READ stream belongs to another NPU");
+    const auto acl_stream=acl_python::StreamFromPython(stream);
+    raw_retained_=py::make_tuple(src,dst,lengths,output,stream);
+    const auto status=native_->BatchGetRawAddr(region,ready,sources,destinations,sizes,
+        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream);
+    if(!native_->pending_raw_addr())raw_retained_=py::none();
+    ThrowIfError(status);
+    py::dict result; result["state"]="done"; result["sequence"]=ready.sequence; return result;
   }
   void DetachHbm(LinkId region) { ThrowIfError(native_->DetachHbm(region)); }
   bool PendingRawAddr() const { return native_->pending_raw_addr(); }
@@ -636,6 +697,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("offload_timeout_ms") = 30000,
            py::arg("batch_get_raw_addr_kernel_object_path") = "")
       .def("attach_hbm", &NpuPythonRuntime::AttachHbm, py::arg("address"), py::arg("export_ticket"), py::arg("local_eid") = "")
+      .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
+           py::arg("hbm_link"),py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
+           py::arg("output"),py::arg("stream")=py::none())
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawAddr,
            py::arg("region"), py::arg("ready_batch"), py::arg("output"), py::arg("output_offsets"), py::arg("stream") = py::none(),
            "Synchronously READ B HBM into A output using explicit addresses and byte lengths; no AccessTable.")
@@ -648,6 +712,15 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("release_offload_source", &NpuPythonRuntime::ReleaseOffloadSource)
       .def("offload_region", &NpuPythonRuntime::OffloadRegion)
       .def("offload_from", &NpuPythonRuntime::OffloadFrom, py::arg("keys"), py::arg("ready_batch"))
+      .def("attach_cpu_source",&NpuPythonRuntime::AttachCpuSource,py::arg("source_desc"))
+      .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
+      .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("source_handle"),py::arg("ready"),py::arg("put"),
+           py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"))
+      .def("query_cpu_pull",&NpuPythonRuntime::QueryCpuPull,py::arg("task"))
+      .def("wait_cpu_pull",&NpuPythonRuntime::WaitCpuPull,py::arg("task"),py::arg("timeout")=30000,
+           "Wait for DMA only; timeout is in milliseconds. Commit explicitly afterward.")
+      .def("commit_put",&NpuPythonRuntime::CommitPut,py::arg("put"))
+      .def("abort_put",&NpuPythonRuntime::AbortPut,py::arg("put"))
       .def("resolve_offload", &NpuPythonRuntime::ResolveOffload)
       .def("last_offload_checksum", &NpuPythonRuntime::LastChecksum,
            "Hash current CPU DDR via a separate RPC after offload. Call before freeing or "
