@@ -65,9 +65,22 @@ class ConnectorBindings(unittest.TestCase):
         self.assertEqual(pickle.loads(pickle.dumps(npu)).source_epoch, 88)
 
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
-    def test_source_aliases(self):
-        self.assertIs(kvaf.HbmSource, kvaf.CpuPullHbmSource)
-        self.assertIs(kvaf.HbmReadSource, kvaf.NpuPullHbmSource)
+    def test_only_current_pull_interfaces_are_exported(self):
+        for name in ("HbmSource", "HbmReadSource", "OffloadRuntime"):
+            self.assertFalse(hasattr(kvaf, name))
+        for name in ("offload", "offload_from", "resolve_offload", "release_offload_source"):
+            self.assertFalse(hasattr(kvaf.NpuRuntime, name))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "batch_cpu_pull"))
+        for cls in (kvaf.CpuPullHbmSource, kvaf.NpuPullHbmSource):
+            source = cls(0)
+            with self.assertRaises(TypeError):
+                source.ready([0], [8])
+            with self.assertRaises(TypeError):
+                source.release_batch()
+            with self.assertRaises(TypeError):
+                source.cancel_batch()
+        with self.assertRaises(TypeError):
+            kvaf.NpuRuntime(enable_cpu_offload=True).batch_get_raw_addr(1, {}, None, [0])
 
     def call_with_arrays(self, arrays):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)

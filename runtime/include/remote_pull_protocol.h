@@ -2,12 +2,9 @@
 #include "offload_protocol.h"
 
 namespace kvaf::remote_pull {
-// Shared-pool, third-party source control. Keep legacy KVOF and KVCP framing
-// separate; old services cannot accidentally interpret these requests.
+// Shared DDR with identity-only Ready and application-defined Submit ranges.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
-// V3 adds identity-only Ready (flags=1) and application-defined Submit ranges.
-// Legacy range-bearing API calls remain supported by upgraded peers (flags=0).
-constexpr std::uint16_t kVersion = 3;
+constexpr std::uint16_t kVersion = 4;
 using Endpoint = offload::Endpoint;
 using Span = offload::Span;
 using Result = offload::Result;

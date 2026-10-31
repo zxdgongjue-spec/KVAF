@@ -7,49 +7,22 @@
 #include "peer_protocol.h"
 
 namespace kvaf::offload {
-// Separate framing preserves the existing KVCP v6 messages. All peers must
-// use the same little-endian deployment ABI; no native pointers cross the wire.
-constexpr std::uint32_t kMagic = 0x4b564f46; // KVOF
-// V2 carries all four reference Jettys and a synchronous startup probe.
-constexpr std::uint16_t kVersion = 2;
+// Provider endpoint layout shared by CPU Pull and NPU Pull.
+constexpr std::uint16_t kEndpointVersion = 2;
 constexpr std::uint32_t kChannelCount = 4;
 constexpr std::uint32_t kMaxSpans = 4096;
-enum class Command : std::uint16_t { Allocate = 1, Open, Submit, Query, ReleaseSource, Close, Checksum, Probe };
 enum class Result : std::uint32_t { Ok, Invalid, NotFound, Busy, Failed, InDoubt };
-enum class State : std::uint32_t { Empty, Open, Running, Done, Failed, InDoubt, Released };
 struct Span { std::uint64_t source, destination, bytes; };
 struct Endpoint {
   std::uint64_t base{}, bytes{}, tp{};
-  // Allocate returns a nonzero region authentication token. Open echoes it
-  // for HBM and both Jettys; token IDs remain local provider-owned objects.
+  // The shared DDR ticket carries the authentication token; provider token
+  // IDs remain local objects.
   std::uint32_t psn{}, token{}, key_bytes{}, segment_bytes{};
   // eid selects the CTP route. key and segment are opaque provider exports;
   // their embedded EIDs can differ from the route EID and must stay unchanged.
   std::uint8_t eid[16]{}, key[kChannelCount][64]{}, segment[64]{};
 };
-struct Request {
-  peer::MessageHeader header{};
-  std::uint32_t reserved{};
-  std::uint64_t region{}, epoch{}, task{}, bytes{}, slot_size{};
-  std::uint32_t candidate{}, count{};
-  Endpoint source{};
-};
-struct Response {
-  peer::MessageHeader header{};
-  Result result{Result::Invalid};
-  State state{State::Empty};
-  std::uint32_t reserved{};
-  std::uint64_t region{}, epoch{}, task{}, base{}, bytes{}, checksum{};
-  Endpoint endpoint{};
-};
 static_assert(sizeof(Span) == 24 && sizeof(Endpoint) == 376);
-static_assert(sizeof(Request) == 440 && sizeof(Response) == 448);
-static_assert(offsetof(Request, region) == 16 && offsetof(Response, region) == 24);
-inline Request MakeRequest(Command command) {
-  Request r{};
-  r.header = {kMagic, kVersion, static_cast<std::uint16_t>(command), sizeof(Request)};
-  return r;
-}
 inline bool Contains(std::uint64_t size, std::uint64_t offset, std::uint64_t bytes) {
   return bytes && offset <= size && bytes <= size - offset;
 }

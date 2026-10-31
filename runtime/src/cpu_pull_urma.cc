@@ -134,9 +134,9 @@ class UrmaBackend final : public Backend {
     }
     profile_ = Enabled("KVAF_CPU_PULL_PROFILE");
     ready_ = true;
-    std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_REFERENCE commit=8bc5a2a protocol=%u sge_bytes=%zu "
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_REFERENCE commit=8bc5a2a endpoint_layout=%u sge_bytes=%zu "
         "jettys=%u max_sge=%u max_bytes=%u local_eid=%s peer_eid=%s psn=%u peer_psn=%u\n",
-        kVersion, sizeof(urma::Sge), kChannelCount, max_sge_, max_bytes_,
+        kEndpointVersion, sizeof(urma::Sge), kChannelCount, max_sge_, max_bytes_,
         Eid(context_->eid.raw).c_str(), Eid(source.eid).c_str(), local->psn, source.psn);
     return Status::OK();
   }

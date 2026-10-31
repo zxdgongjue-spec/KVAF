@@ -12,7 +12,6 @@ struct ConnectorPutState {
   CpuPullRequest request;
   CpuPullState state{CpuPullState::Prepared};
   bool submitted{}, metadata_finished{}, decision_set{}, commit{};
-  Status result;
 };
 std::uint64_t PutHandle::id() const { return state_ ? state_->context.id : 0; }
 const std::vector<PutAllocation>& PutHandle::entries() const {
@@ -98,7 +97,6 @@ Status RuntimeCore::SubmitCpuPull(const CpuPullSourceHandle& source, const Ready
   }
   if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
   p.request = {*desc, ready.sequence, std::move(copies)};
-  for (const auto& entry : p.allocation.entries) p.request.keys.push_back(entry.key);
   p.submitted = true; p.state = CpuPullState::Submitted;
   out->state_ = put.state_; // Recovery handle exists before the first RPC.
   try { status = access_operator_.SubmitCpuPull(p.request); }
@@ -160,44 +158,10 @@ Status RuntimeCore::FinishConnectorPut(const PutHandle& put, bool commit) {
     if (!status.ok()) return Status::InDoubt("Put completion acknowledgement pending: "+status.message());
   }
   p.state = commit ? CpuPullState::Committed : CpuPullState::Aborted;
-  connector_put_.reset(); connector_convenience_ = false;
+  connector_put_.reset();
   return Status::OK();
 }
 Status RuntimeCore::CommitPut(const PutHandle& put) { return FinishConnectorPut(put, true); }
 Status RuntimeCore::AbortPut(const PutHandle& put) { return FinishConnectorPut(put, false); }
 
-Status RuntimeCore::OffloadFrom(const RemoteOffloadRequest& request) {
-  if (request.keys.empty() || request.keys.size() != request.lengths.size() ||
-      request.keys.size() != request.input_offsets.size() || !request.source.sequence)
-    return Status::InvalidArgument("invalid legacy remote Offload arrays");
-  CpuPullSourceDesc desc{request.source.source_id,request.source.source_bytes,
-                         request.source.region_id,request.source.region_epoch};
-  CpuPullSourceHandle source;
-  auto status=AttachCpuSource(desc,&source);if(!status.ok())return status;
-  PutHandle put;status=PreparePut(request.keys,request.lengths,&put);if(!status.ok())return status;
-  connector_convenience_=true;
-  std::vector<std::uint64_t> destinations;
-  for(const auto& entry:put.entries()) destinations.push_back(entry.address-remote_region_.base);
-  CpuPullTask task;
-  status=SubmitCpuPull(source,{desc,request.source.sequence},put,request.input_offsets,destinations,request.lengths,&task);
-  if(status.code()==StatusCode::kInDoubt)return status;
-  if(status.ok())return ResolveConnectorOffload();
-  put.state_->result=status;
-  const auto finish=AbortPut(put);return finish.ok()?status:finish;
-}
-Status RuntimeCore::ResolveConnectorOffload() {
-  if(!connector_put_ || !connector_convenience_)
-    return Status::InvalidState("use query/wait_cpu_pull and commit/abort_put for a Connector transaction");
-  PutHandle put;put.state_=connector_put_;
-  auto& p=*put.state_;
-  if(!p.decision_set) {
-    CpuPullState state;
-    auto status=WaitCpuPull(put.task(),access_operator_.CpuPullTimeoutMs(),&state);
-    if(status.code()==StatusCode::kInDoubt)return status;
-    p.result=status;
-  }
-  const auto result=p.result;
-  const auto finish=FinishConnectorPut(put,p.decision_set?p.commit:result.ok());
-  return finish.ok()?result:finish;
-}
-}
+}  // namespace kvaf

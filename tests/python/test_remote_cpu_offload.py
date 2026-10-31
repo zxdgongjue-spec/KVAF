@@ -47,23 +47,16 @@ def producer(pipe, args, ticket, lengths):
     try:
         desc = source.register(ticket, hbm)
         pipe.send(("registered", source.selected_npu_eid))
-        if args.connector_api:
-            pipe.send(("cpu_source", desc))
+        pipe.send(("cpu_source", desc))
         for round_id in range(args.rounds):
             with torch.npu.stream(stream):
                 hbm.copy_(pattern(torch, round_id), non_blocking=True)
-            # Ready waits for this stream, records the sequence, and freezes HBM.
-            if args.connector_api:
-                stream.synchronize()  # Producer synchronization belongs to the application.
-                batch = source.ready()
-            else:
-                batch = source.ready(OFFSETS, lengths, stream=stream)
+            # The application waits for production; Ready only publishes batch identity.
+            stream.synchronize()  # Producer synchronization belongs to the application.
+            batch = source.ready()
             pipe.send(("ready", batch))
             receive(pipe, "reuse")
-            if args.connector_api:
-                source.release_batch(batch)
-            else:
-                source.release_batch()  # Confirms A's commit/abort acknowledgement.
+            source.release_batch(batch)
             assert not source.frozen
         source.shutdown()
         pipe.send(("closed", None))
@@ -71,7 +64,7 @@ def producer(pipe, args, ticket, lengths):
         pipe.send(("error", traceback.format_exc()))
         try:
             if source.frozen:
-                source.cancel_batch()  # Refused if any READ may still be active.
+                source.cancel_batch(source.ready())  # Refused if any READ may still be active.
             source.shutdown()
         except Exception as error:
             retain(str(error))
@@ -104,7 +97,6 @@ def main():
     parser.add_argument("--batch-get-kernel", default="")
     parser.add_argument("--batch-put-kernel", default="")
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--connector-api", action="store_true", help="use identity-only Ready and public Put/CPU Pull APIs")
     args = parser.parse_args()
     if args.device_a == args.device_b or args.rounds < 2:
         parser.error("use two distinct NPUs and at least two rounds")
@@ -139,32 +131,25 @@ def main():
     child.close()
     try:
         print(f"B registered: eid={receive(parent, 'registered')}", flush=True)
-        if args.connector_api:
-            cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
+        cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
         for round_id in range(args.rounds):
             batch = receive(parent, "ready")
-            if args.connector_api:
-                put = runtime.prepare_put(KEYS, lengths)
-                src = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
-                dst = torch.tensor([entry.address - ticket["base"] for entry in put.entries],
-                                   dtype=torch.int64, device="cpu")
-                sizes = torch.tensor(lengths, dtype=torch.int64, device="cpu")
-                task = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
-                assert runtime.wait_cpu_pull(task, timeout=30000) == kvaf.CpuPullState.DONE
-                runtime.commit_put(put)
-            else:
-                runtime.offload_from(KEYS, batch)
+            put = runtime.prepare_put(KEYS, lengths)
+            src = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
+            dst = torch.tensor([entry.address - ticket["base"] for entry in put.entries],
+                               dtype=torch.int64, device="cpu")
+            sizes = torch.tensor(lengths, dtype=torch.int64, device="cpu")
+            task = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
+            assert runtime.wait_cpu_pull(task, timeout=30000) == kvaf.CpuPullState.DONE
+            runtime.commit_put(put)
             expected = pattern(torch, round_id)
             rows = [expected[o:o+n] for o, n in zip(OFFSETS, lengths)]
             checksum = fnv64(b"".join(bytes(row.tolist()) for row in rows))
             assert runtime.last_offload_checksum() == checksum, "CPU DDR checksum mismatch"
-            if args.connector_api:
-                duplicate = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
-                assert duplicate.id == task.id
-                assert runtime.query_cpu_pull(task) == kvaf.CpuPullState.COMMITTED
-                runtime.commit_put(put)
-            else:
-                runtime.offload_from(KEYS, batch)  # Duplicate notification must be idempotent.
+            duplicate = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
+            assert duplicate.id == task.id
+            assert runtime.query_cpu_pull(task) == kvaf.CpuPullState.COMMITTED
+            runtime.commit_put(put)
             assert runtime.last_offload_checksum() == checksum
             table = runtime.prepare_access_table(KEYS)
             try:
@@ -183,7 +168,7 @@ def main():
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        print(f"REMOTE_OFFLOAD_PASS shared_pool=1 duplicate_notification=1 producer_reuse_ack=1 connector_api={int(args.connector_api)}", flush=True)
+        print(f"REMOTE_OFFLOAD_PASS shared_pool=1 duplicate_notification=1 producer_reuse_ack=1 connector_api=1", flush=True)
     except BaseException:
         traceback.print_exc()
         if runtime.pending_offload or worker.is_alive():

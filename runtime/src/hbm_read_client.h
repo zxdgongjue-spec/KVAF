@@ -10,8 +10,6 @@ class HbmReader {
             std::uint32_t budget, std::string kernel);
   ~HbmReader();
   Status Attach(const std::string&, const HbmReadTicket&, const std::string& local_eid, LinkId*);
-  Status Read(LinkId, const HbmReadBatch&, MutableBufferView output,
-              const std::vector<std::uint64_t>& offsets, void* stream, bool identity_only = false);
   Status Read(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
               NpuInt64ArrayView lengths, MutableBufferView output, void* stream);
   Status Resolve(LinkId);

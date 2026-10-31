@@ -37,27 +37,29 @@ def producer(pipe, args, ticket):
     patterns = inputs(torch, size)
     stream = torch.npu.Stream(device=args.device_b)
     hbm = torch.empty(size, dtype=torch.uint8, device=f"npu:{args.device_b}")
-    source = kvaf.HbmSource(device_id=args.device_b, npu_eid=args.npu_eid_b)
+    source = kvaf.CpuPullHbmSource(device_id=args.device_b, npu_eid=args.npu_eid_b)
     try:
         # Initialize before registration's scratch READ/checksum probe.
         hbm.copy_(patterns[0])
         torch.npu.synchronize()
-        source.register(ticket, hbm)
+        desc = source.register(ticket, hbm)
+        pipe.send(("cpu_source", desc))
         pipe.send(("registered", source.selected_npu_eid))
         for iteration in range(args.warmup + args.iterations):
             with torch.npu.stream(stream):
                 hbm.copy_(patterns[iteration % 2], non_blocking=True)
-            batch = source.ready(offsets, [args.block_bytes] * args.blocks, stream=stream)
+            stream.synchronize()
+            batch = source.ready()
             pipe.send(("ready", batch))
             receive(pipe, "reuse")
-            source.release_batch()
+            source.release_batch(batch)
         source.shutdown()
         pipe.send(("closed", None))
     except BaseException:
         pipe.send(("error", traceback.format_exc()))
         try:
             if source.frozen:
-                source.cancel_batch()
+                source.cancel_batch(source.ready())
             source.shutdown()
         except Exception as error:
             retain(str(error))
@@ -105,6 +107,9 @@ def main():
         worker = ctx.Process(target=producer, args=(child, args, ticket))
         worker.start()
         child.close()
+        cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
+        src = torch.tensor(offsets, dtype=torch.int64, device="cpu")
+        sizes = torch.full((args.blocks,), args.block_bytes, dtype=torch.int64, device="cpu")
         print(f"CPU_PULL_BENCH_READY cpu_candidate={ticket['cpu_candidate']} "
               f"b_eid={receive(parent, 'registered')} blocks={args.blocks} "
               f"block_bytes={args.block_bytes}", flush=True)
@@ -114,7 +119,11 @@ def main():
         for iteration in range(args.warmup + args.iterations):
             batch = receive(parent, "ready")
             begin = time.perf_counter_ns()
-            runtime.offload_from(keys, batch)
+            put = runtime.prepare_put(keys, sizes)
+            dst = torch.tensor([e.address - ticket["base"] for e in put.entries], dtype=torch.int64, device="cpu")
+            task = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
+            runtime.wait_cpu_pull(task)
+            runtime.commit_put(put)
             duration = (time.perf_counter_ns() - begin) / 1000
             # This RPC now performs the actual CPU scan, outside offload timing.
             verify_begin = time.perf_counter_ns()
@@ -133,7 +142,7 @@ def main():
         ordered = sorted(elapsed)
         percentile = lambda p: ordered[min(len(ordered)-1, int((len(ordered)-1)*p))]
         mean = statistics.mean(elapsed)
-        print("CPU_PULL_BENCH_PASS metric=python_offload_from_to_commit "
+        print("CPU_PULL_BENCH_PASS metric=python_prepare_put_to_commit "
               f"iterations={len(elapsed)} mean_us={mean:.1f} p50_us={percentile(.5):.1f} "
               f"p95_us={percentile(.95):.1f} p99_us={percentile(.99):.1f} "
               f"effective_GBps={args.blocks * args.block_bytes / mean / 1000:.3f} "

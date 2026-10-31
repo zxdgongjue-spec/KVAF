@@ -22,20 +22,4 @@ class Backend {
   virtual Status Close() = 0;
   virtual std::uint64_t Checksum(const std::vector<Span>& spans) const = 0;
 };
-// Control operations are serialized. Probe runs on the service thread;
-// subsequent payload DMA runs on the sole worker of its region.
-// One active task per region, with bounded memory and idempotent retry records.
-class Service {
- public:
-  using Factory = std::function<std::unique_ptr<Backend>(std::uint32_t)>;
-  explicit Service(Factory factory);
-  ~Service();
-  Response Dispatch(const Request&, const std::vector<Span>&);
-  void Serve(int fd, const peer::MessageHeader&);
-  bool Busy() const;
-  Status Shutdown();
- private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
-};
 }

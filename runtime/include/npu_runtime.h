@@ -68,17 +68,16 @@ class NpuRuntime final : public Runtime {
   RuntimeCore& core();
   const RuntimeCore& core() const;
   Status GetOffloadRegion(OffloadRegionTicket*) const;
-  // Local-source convenience path uses this same Core and shared DDR pool.
-  // C++ callers retain input storage until ReleaseOffloadSource or Shutdown
-  // succeeds, including after a completed batch (the registration is cached).
-  Status Offload(const BatchPutRequest&, OffloadExecutionOptions = {});
-  Status ReleaseOffloadSource(); // Releases the cached local registration after resolution.
-  Status OffloadFrom(const std::vector<KeyId>& keys, const HbmReadyBatch&);
-  Status ResolveOffload();
+  // Synchronous local-HBM -> shared-DDR convenience API. Success includes
+  // metadata commit. Failed unresolved DMA retains input/slots and blocks reuse;
+  // Shutdown queries the original task and retries cleanup without resubmitting.
+  // Input registration is cached until a different source or Shutdown; native
+  // callers must keep the input allocation alive for that registration lifetime.
+  Status BatchCpuPull(const BatchPutRequest&, BatchPutExecutionOptions = {});
   bool pending_offload() const;
-  // Diagnostic RPC: hashes current DDR after commit, outside Offload's data path.
+  // Diagnostic RPC: hashes current DDR after commit, outside CPU Pull's data path.
   // Call before freeing/overwriting destination slots, the source's next Ready,
-  // or source detach. Synchronous like Offload; not a historical checksum cache.
+  // or source detach. Synchronous; not a historical checksum cache.
   Status LastOffloadChecksum(std::uint64_t*) const;
 
   Status AttachCpuSource(const CpuPullSourceDesc&, CpuPullSourceHandle*);
@@ -93,8 +92,6 @@ class NpuRuntime final : public Runtime {
   // Remote producer HBM: direct READ ranges, no AccessTable or DDR metadata.
   Status AttachHbm(const std::string& address, const HbmReadTicket&, LinkId*,
                    const std::string& local_eid = "");
-  Status BatchGetRawAddr(LinkId, const HbmReadBatch&, MutableBufferView output,
-                         const std::vector<std::uint64_t>& output_offsets, void* stream);
   Status BatchGetRawAddr(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream);
   Status ResolveRawAddr(LinkId); // Never resubmits DMA; retries control/cleanup only.

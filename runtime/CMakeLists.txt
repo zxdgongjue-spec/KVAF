@@ -7,7 +7,7 @@ target_include_directories(kvaf_peer_link
 target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
-add_library(kvaf_offload_control STATIC src/offload_client.cc src/offload_service.cc
+add_library(kvaf_offload_control STATIC src/offload_client.cc
   src/remote_pull_client.cc src/remote_pull_service.cc src/hbm_read_protocol.cc)
 target_include_directories(kvaf_offload_control PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -39,11 +39,6 @@ if(KVAF_ENABLE_CPU_OFFLOAD)
   target_include_directories(kvaf_remote_offload PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_remote_offload PUBLIC kvaf_runtime
-    PRIVATE kvaf_offload_control kvaf_peer_link kvaf_direct_hccp_session "${KVAF_ASCENDCL_LIBRARY}" ${CMAKE_DL_LIBS})
-  add_library(kvaf_offload_runtime STATIC src/offload_runtime.cc)
-  target_include_directories(kvaf_offload_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/include)
-  target_link_libraries(kvaf_offload_runtime PUBLIC kvaf_runtime
     PRIVATE kvaf_offload_control kvaf_peer_link kvaf_direct_hccp_session "${KVAF_ASCENDCL_LIBRARY}" ${CMAKE_DL_LIBS})
 endif()
 

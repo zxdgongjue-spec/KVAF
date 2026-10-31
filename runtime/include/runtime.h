@@ -126,12 +126,7 @@ class RuntimeCore {
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
 
-  // Keep the caller-owned source alive until pending_offload() becomes false.
-  // This synchronous API serializes Offload; it is not a concurrent entrypoint.
-  Status Offload(const BatchPutRequest& request, OffloadExecutionOptions execution = {});
-  Status OffloadFrom(const RemoteOffloadRequest& request);
-  Status ResolveOffload();
-  bool pending_offload() const { return offload_context_.id != 0 || bool(connector_put_); }
+  bool pending_offload() const { return bool(connector_put_); }
 
   Status AttachCpuSource(const CpuPullSourceDesc&, CpuPullSourceHandle*);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
@@ -170,14 +165,7 @@ class RuntimeCore {
   bool closing_{false};
   std::shared_ptr<const int> connector_owner_{std::make_shared<const int>(0)};
   std::shared_ptr<ConnectorPutState> connector_put_;
-  bool connector_convenience_{false};
   Status FinishConnectorPut(const PutHandle&, bool commit);
-  Status ResolveConnectorOffload();
-  PutContext offload_context_{};
-  bool offload_data_ready_{false};
-  bool offload_metadata_finished_{false};
-  Status offload_result_;
-  Status FinishOffload(Status status);
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>

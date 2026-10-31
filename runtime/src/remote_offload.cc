@@ -25,8 +25,7 @@ struct CpuPullHbmSource::Impl {
   ConstBufferView input{};
   std::unique_ptr<detail::Exporter> exporter;
   std::uint64_t id{}, sequence{};
-  bool attached{}, bound{}, frozen{}, identity_only{};
-  std::vector<rp::Span> ready;
+  bool attached{}, bound{}, frozen{};
   Status Device() const {
     int32_t current = -1;
     return aclrtGetDevice(&current) == ACL_SUCCESS && current == static_cast<int32_t>(device)
@@ -35,7 +34,6 @@ struct CpuPullHbmSource::Impl {
   Status Call(rp::Command cmd, const std::vector<rp::Span>& spans, rp::Response* out, bool use_sequence=true) {
     auto r = Request(ticket, id, use_sequence ? sequence : 0, cmd);
     if (exporter) r.source = exporter->descriptor;
-    if (cmd == rp::Command::Ready && identity_only) r.flags = 1;
     return rp::Exchange(ticket.address, r, spans, out);
   }
   Status Shutdown() {
@@ -120,33 +118,6 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, ConstBuffer
   }
   return status;
 }
-Status CpuPullHbmSource::Ready(const std::vector<std::uint64_t>& offsets, const std::vector<std::uint64_t>& lengths,
-                        void* stream, HbmReadyBatch* batch) {
-  auto status = impl_->Device(); if (!status.ok()) return status;
-  if (!impl_->bound || !batch) return Status::InvalidState("register B HBM before Ready");
-  if (offsets.empty() || offsets.size() != lengths.size() || offsets.size() > rp::kMaxSpans)
-    return Status::InvalidArgument("invalid B batch ranges");
-  std::vector<rp::Span> spans;
-  for (std::size_t i = 0; i < offsets.size(); ++i) {
-    if (!offload::Contains(impl_->input.bytes, offsets[i], lengths[i])) return Status::InvalidArgument("B batch outside registered HBM");
-    spans.push_back({offsets[i], 0, lengths[i]});
-  }
-  if (impl_->frozen) {
-    if (impl_->identity_only || !rp::SameSpans(spans, impl_->ready)) return Status::Busy("previous B batch remains frozen");
-  } else {
-    status = impl_->exporter->Ready(stream); if (!status.ok()) return status;
-    if (impl_->sequence == UINT64_MAX) return Status::InvalidState("B sequence exhausted");
-    ++impl_->sequence; impl_->ready = spans; impl_->frozen = true; impl_->identity_only = false;
-  }
-  // Retrying a lost Ready ACK reuses the same sequence and never rereads HBM.
-  rp::Response response{}; status = impl_->Call(rp::Command::Ready, spans, &response);
-  if (!status.ok()) return status;
-  status = Result(response, "Ready"); if (!status.ok()) return status;
-  batch->source = {impl_->ticket.region.epoch, impl_->ticket.region.id, impl_->id,
-                   impl_->sequence, impl_->input.bytes};
-  batch->input_offsets = offsets; batch->lengths = lengths;
-  return Status::OK();
-}
 Status CpuPullHbmSource::GetDescriptor(CpuPullSourceDesc* out) const {
   if (!out || !impl_->bound) return Status::InvalidState("register CPU Pull HBM before exporting its descriptor");
   *out = {impl_->id, impl_->input.bytes, impl_->ticket.region.id, impl_->ticket.region.epoch};
@@ -157,10 +128,9 @@ Status CpuPullHbmSource::Ready(ReadyToken* out) {
   CpuPullSourceDesc source;
   if (!out) return Status::InvalidArgument("missing ReadyToken output");
   status = GetDescriptor(&source); if (!status.ok()) return status;
-  if (impl_->frozen && !impl_->identity_only) return Status::Busy("legacy batch remains frozen");
   if (!impl_->frozen) {
     if (impl_->sequence == UINT64_MAX) return Status::InvalidState("source sequence exhausted");
-    ++impl_->sequence; impl_->ready.clear(); impl_->identity_only = true; impl_->frozen = true;
+    ++impl_->sequence; impl_->frozen = true;
   }
   *out = {source, impl_->sequence}; // Identity is recoverable even after a lost Ready ACK.
   rp::Response response{};
@@ -172,27 +142,21 @@ Status CpuPullHbmSource::ReleaseBatch(const ReadyToken& token) {
   const auto* source = std::get_if<CpuPullSourceDesc>(&token.source);
   if (!source || !SameSource(own, *source) || !token.sequence || token.sequence != impl_->sequence)
     return Status::InvalidArgument("stale CPU Pull batch release");
-  return ReleaseBatch();
+  if (!impl_->frozen) return Status::OK();
+  rp::Response response{}; status = impl_->Call(rp::Command::Query, {}, &response);
+  if (!status.ok()) return status;
+  status = Result(response, "Query"); if (!status.ok()) return status;
+  if (response.state != rp::State::Committed && response.state != rp::State::Cancelled)
+    return Status::Busy("reader has not acknowledged this batch; keep HBM unchanged");
+  impl_->frozen = false; return Status::OK();
 }
 Status CpuPullHbmSource::CancelBatch(const ReadyToken& token) {
   CpuPullSourceDesc own; auto status = GetDescriptor(&own); if (!status.ok()) return status;
   const auto* source = std::get_if<CpuPullSourceDesc>(&token.source);
   if (!source || !SameSource(own, *source) || !token.sequence || token.sequence != impl_->sequence)
     return Status::InvalidArgument("stale CPU Pull batch cancellation");
-  return CancelBatch();
-}
-Status CpuPullHbmSource::ReleaseBatch() {
   if (!impl_->frozen) return Status::OK();
-  rp::Response response{}; auto status = impl_->Call(rp::Command::Query, {}, &response);
-  if (!status.ok()) return status;
-  status = Result(response, "Query"); if (!status.ok()) return status;
-  if (response.state != rp::State::Committed && response.state != rp::State::Cancelled)
-    return Status::Busy("A has not acknowledged this B batch; keep HBM unchanged");
-  impl_->frozen = false; return Status::OK();
-}
-Status CpuPullHbmSource::CancelBatch() {
-  if (!impl_->frozen) return Status::OK();
-  rp::Response response{}; auto status = impl_->Call(rp::Command::Cancel, {}, &response);
+  rp::Response response{}; status = impl_->Call(rp::Command::Cancel, {}, &response);
   if (!status.ok()) return status;
   status = Result(response, "Cancel"); if (!status.ok()) return status;
   impl_->frozen = false; return Status::OK();

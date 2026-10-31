@@ -6,7 +6,7 @@
 
 ## 共享池 CPU Pull
 
-启用 `KVAF_ENABLE_CPU_OFFLOAD` 后，`NpuRuntime(enable_cpu_offload=True)` 提供
-`offload()`、`offload_region()`、`offload_from()` 和 `resolve_offload()`。
-`HbmSource` 在生产卡注册固定 HBM，支持 `ready()` / `release_batch()` 复用。
-完整时序、地址规则和双卡测试见 [共享 DDR 与跨卡 CPU Pull](../docs/shared_ddr_remote_offload.md)。
+启用 `KVAF_ENABLE_CPU_OFFLOAD` 后，`NpuRuntime(enable_cpu_offload=True)` 提供同步的本卡 `batch_cpu_pull()`，以及跨卡 `attach_cpu_source / prepare_put / submit_cpu_pull / wait_cpu_pull / commit_put / abort_put` 显式事务接口。
+`CpuPullHbmSource` 在生产卡注册 HBM，使用 `ready()`、`release_batch(ready)`、`cancel_batch(ready)` 管理批次。
+NPU 直读使用 `NpuPullHbmSource` 和只接受三个连续 NPU int64 Tensor 的 `batch_get_raw_addr()`。
+旧类名、旧重载及独立 OffloadRuntime 已删除。完整接口见 [Connector 设计](../docs/connector_pull_api_design.md)。

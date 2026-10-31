@@ -5,19 +5,6 @@ target_include_directories(kvaf_npu_eid_discovery_test PRIVATE ${PROJECT_SOURCE_
 target_link_libraries(kvaf_npu_eid_discovery_test PRIVATE kvaf_peer_link ${CMAKE_DL_LIBS})
 add_test(NAME kvaf_npu_eid_discovery_test COMMAND kvaf_npu_eid_discovery_test)
 
-add_executable(kvaf_offload_test offload_test.cc)
-target_include_directories(kvaf_offload_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
-target_link_libraries(kvaf_offload_test PRIVATE kvaf_runtime kvaf_offload_control)
-add_test(NAME kvaf_offload_test COMMAND kvaf_offload_test)
-set_tests_properties(kvaf_offload_test PROPERTIES TIMEOUT 20)
-
-add_executable(kvaf_offload_runtime_test offload_runtime_test.cc ../runtime/src/offload_runtime.cc)
-target_include_directories(kvaf_offload_runtime_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl)
-target_link_libraries(kvaf_offload_runtime_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link)
-add_test(NAME kvaf_offload_runtime_test COMMAND kvaf_offload_runtime_test)
-set_tests_properties(kvaf_offload_runtime_test PROPERTIES TIMEOUT 30)
-
 set(KVAF_TEST_URMA_INCLUDE_DIR "" CACHE PATH "Optional UMDK 24.12 headers for CPU Pull fake-provider test")
 if(KVAF_TEST_URMA_INCLUDE_DIR)
   add_executable(kvaf_cpu_pull_urma_test cpu_pull_urma_test.cc ../runtime/src/cpu_pull_urma.cc)

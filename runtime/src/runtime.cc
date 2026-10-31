@@ -386,59 +386,6 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   return Status::OK();
 }
 
-Status RuntimeCore::Offload(const BatchPutRequest& request, OffloadExecutionOptions execution) {
-  if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
-  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-  if (pending_offload()) return Status::Busy("resolve the pending Offload first");
-  if (request.keys.empty() || !request.input.data || !request.input.bytes ||
-      request.input.device != DeviceKind::kNpu ||
-      request.keys.size() != request.input_offsets.size() ||
-      request.keys.size() != request.lengths.size())
-    return Status::InvalidArgument("Offload requires NPU input and matching non-empty arrays");
-  const auto base = reinterpret_cast<std::uintptr_t>(request.input.data);
-  if (request.input.bytes > UINTPTR_MAX - base)
-    return Status::InvalidArgument("Offload input address overflow");
-  for (std::size_t i = 0; i < request.keys.size(); ++i)
-    if (!request.lengths[i] || request.input_offsets[i] > request.input.bytes ||
-        request.lengths[i] > request.input.bytes - request.input_offsets[i])
-      return Status::InvalidArgument("Offload source range is outside input");
-  PutAccessDesc desc;
-  auto status = meta_manager_.PreparePut(request.keys, request.lengths, &offload_context_, &desc);
-  if (!status.ok()) return status;
-  offload_data_ready_ = false;
-  offload_metadata_finished_ = false;
-  try {
-    return FinishOffload(access_operator_.ExecuteOffload({&request, &desc, execution}));
-  } catch (const std::exception& e) {
-    // The operator may already have submitted a remote request.
-    return Status::InDoubt(std::string("Offload exception; retain source: ") + e.what());
-  }
-}
-
-Status RuntimeCore::FinishOffload(Status status) {
-  if (status.code() == StatusCode::kInDoubt) return status;
-  if (!offload_metadata_finished_) {
-    offload_result_ = status;
-    if (status.ok()) offload_data_ready_ = true;
-    const auto finish = offload_data_ready_ ? meta_manager_.CommitPut(offload_context_)
-                                           : meta_manager_.AbortPut(offload_context_);
-    if (!finish.ok()) return Status::InDoubt("Offload metadata pending: " + finish.message());
-    offload_metadata_finished_ = true;
-  }
-  const auto completed = access_operator_.CompleteOffload(offload_data_ready_);
-  if (!completed.ok()) return Status::InDoubt("Offload producer acknowledgement pending: " + completed.message());
-  offload_context_ = {};
-  offload_data_ready_ = false;
-  offload_metadata_finished_ = false;
-  return offload_result_;
-}
-
-Status RuntimeCore::ResolveOffload() {
-  if (connector_put_) return ResolveConnectorOffload();
-  if (!pending_offload()) return Status::InvalidState("no pending Offload");
-  return FinishOffload(offload_metadata_finished_ || offload_data_ready_ ? Status::OK() : access_operator_.ResolveOffload());
-}
-
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
   if (closing_) return Status::InvalidState("Runtime shutdown is incomplete; retry Shutdown");
   if (pending_offload()) return Status::Busy("resolve the pending Offload first");

@@ -130,7 +130,7 @@ struct NpuRuntime::Impl {
     AccessOperator* selected = access_operator.get();
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
     if (options.enable_cpu_offload) {
-      remote_operator = std::make_unique<RemotePullOperator>(selected, peer_link, options.offload_timeout_ms);
+      remote_operator = std::make_unique<RemotePullOperator>(selected, peer_link);
       selected = remote_operator.get();
     }
 #endif
@@ -158,22 +158,29 @@ struct NpuRuntime::Impl {
   std::unique_ptr<AccessOperator> access_operator;
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   std::unique_ptr<RemotePullOperator> remote_operator;
-  std::unique_ptr<HbmSource> local_source;
+  std::unique_ptr<CpuPullHbmSource> local_source;
   ConstBufferView local_input{};
-  bool local_pending{};
-  Status local_result;
+  PutHandle local_put;
+  ReadyToken local_ready;
+  bool local_commit{}, local_retire{};
+
+  // No new submission is performed here. Shutdown can finish an acknowledged
+  // decision or abort a failed call only after the original DMA is terminal.
   Status FinishLocal() {
-    if (runtime_core->pending_offload()) return local_result;
-    Status status;
-    if (local_source->frozen()) {
-      status = local_result.ok() ? local_source->ReleaseBatch() : local_source->CancelBatch();
-    } else if (!local_source->registered()) status = local_source->Shutdown();
-    if (!status.ok()) return Status::InDoubt("local HBM release pending: " + status.message());
-    local_pending = false;
-    if (!local_source->registered()) { local_source.reset(); local_input = {}; }
-    if (local_result.code() == StatusCode::kInDoubt)
-      return Status::Internal("local batch cancelled without committing: " + local_result.message());
-    return local_result;
+    if (!local_put.id()) return Status::OK();
+    auto status = local_commit ? runtime_core->CommitPut(local_put) : runtime_core->AbortPut(local_put);
+    if (!status.ok()) return Status::InDoubt("local CPU Pull is unresolved; retain source and DDR: " + status.message());
+    if (local_source && local_source->frozen()) {
+      status = local_commit ? local_source->ReleaseBatch(local_ready) : local_source->CancelBatch(local_ready);
+      if (!status.ok()) return Status::InDoubt("local CPU Pull source acknowledgement pending: " + status.message());
+    }
+    if (local_source && (local_retire || !local_source->registered())) {
+      status = local_source->Shutdown();
+      if (!status.ok()) return Status::InDoubt("local CPU Pull source cleanup pending: " + status.message());
+      local_source.reset(); local_input = {};
+    }
+    local_put = {}; local_ready = {}; local_commit = local_retire = false;
+    return Status::OK();
   }
 #endif
   std::unique_ptr<RuntimeCore> runtime_core;
@@ -632,80 +639,73 @@ Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* ticket) const {
   return Status::NotImplemented("CPU Offload was not built");
 #endif
 }
-Status NpuRuntime::OffloadFrom(const std::vector<KeyId>& keys, const HbmReadyBatch& batch) {
+Status NpuRuntime::BatchCpuPull(const BatchPutRequest& request, BatchPutExecutionOptions execution) {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (!initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
-  if (pending_offload()) return Status::Busy("resolve previous Offload first");
-  RemoteOffloadRequest request{batch.source, keys, batch.input_offsets, batch.lengths};
-  bool duplicate = false;
-  auto status = impl_->remote_operator->Validate(request, &duplicate);
-  if (!status.ok() || duplicate) return status;
-  return impl_->runtime_core->OffloadFrom(request);
-#else
-  return Status::NotImplemented("CPU Offload was not built");
-#endif
-}
-Status NpuRuntime::Offload(const BatchPutRequest& request, OffloadExecutionOptions execution) {
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (!initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
-  if (pending_offload()) return Status::Busy("resolve previous Offload");
-  if (request.input.device != DeviceKind::kNpu) return Status::InvalidArgument("Offload requires NPU input");
-  if (impl_->local_source && (request.input.data != impl_->local_input.data || request.input.bytes != impl_->local_input.bytes)) {
-    auto status = ReleaseOffloadSource(); if (!status.ok()) return status;
-  }
-  if (!impl_->local_source) {
-    impl_->local_source = std::make_unique<HbmSource>(device_id());
-    impl_->local_input = request.input;
-    impl_->local_pending = true;
-    impl_->local_result = impl_->local_source->Register(impl_->remote_operator->ticket(), request.input, execution.stream);
-    if (!impl_->local_result.ok()) {
-      impl_->local_pending = true;
-      return impl_->FinishLocal();
+  if (!initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Pull is not initialized");
+  if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
+  int32_t current = -1;
+  if (aclrtGetDevice(&current) != ACL_SUCCESS || current != static_cast<int32_t>(device_id()))
+    return Status::InvalidState("select the Runtime NPU before BatchCpuPull");
+  if (!request.input.valid() || request.input.device != DeviceKind::kNpu || !execution.stream ||
+      request.keys.empty() || request.keys.size() > remote_pull::kMaxSpans ||
+      request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
+    return Status::InvalidArgument("BatchCpuPull requires local NPU input, a stream and equally sized metadata");
+  for (std::size_t i = 0; i < request.keys.size(); ++i)
+    if (!offload::Contains(request.input.bytes, request.input_offsets[i], request.lengths[i]))
+      return Status::InvalidArgument("BatchCpuPull source range is outside its HBM Tensor");
+  auto status = impl_->runtime_core->PreparePut(request.keys, request.lengths, &impl_->local_put);
+  if (!status.ok()) return status;
+  impl_->local_commit = false; impl_->local_ready = {};
+  auto execute = [&]() -> Status {
+    if (impl_->local_source && (request.input.data != impl_->local_input.data || request.input.bytes != impl_->local_input.bytes)) {
+      impl_->local_retire = true;
+      auto result = impl_->local_source->Shutdown(); if (!result.ok()) return result;
+      impl_->local_source.reset(); impl_->local_input = {};
     }
-  }
-  impl_->local_pending = true;
-  impl_->local_result = Status::InDoubt("local source preparation interrupted");
-  HbmReadyBatch batch;
-  Status status;
-  try {
-    status = impl_->local_source->Ready(request.input_offsets, request.lengths, execution.stream, &batch);
-    if (status.ok()) {
-      impl_->local_pending = false;
-      status = OffloadFrom(request.keys, batch);
+    if (!impl_->local_source) {
+      impl_->local_retire = true;
+      impl_->local_source = std::make_unique<CpuPullHbmSource>(device_id(),
+          impl_->options.npu_eids.empty() ? "" : impl_->options.npu_eids.front());
+      impl_->local_input = request.input;
+      auto result = impl_->local_source->Register(impl_->remote_operator->ticket(), request.input, execution.stream);
+      if (!result.ok()) return result;
     }
-  } catch (...) { impl_->local_pending = true; throw; }
-  impl_->local_result = status; impl_->local_pending = true;
-  return impl_->FinishLocal();
+    impl_->local_retire = false;
+    // Like BatchPut, preceding production on the supplied stream must finish
+    // before transport reads the source. Identity-only Ready itself does not wait.
+    if (aclrtSynchronizeStream(static_cast<aclrtStream>(execution.stream)) != ACL_SUCCESS)
+      return Status::Internal("BatchCpuPull producer stream synchronization failed");
+    auto result = impl_->local_source->Ready(&impl_->local_ready); if (!result.ok()) return result;
+    CpuPullSourceDesc desc;
+    result = impl_->local_source->GetDescriptor(&desc); if (!result.ok()) return result;
+    CpuPullSourceHandle source;
+    result = impl_->runtime_core->AttachCpuSource(desc, &source); if (!result.ok()) return result;
+    std::vector<std::uint64_t> destinations;
+    for (const auto& entry : impl_->local_put.entries())
+      destinations.push_back(entry.address - impl_->runtime_core->remote_region().base);
+    CpuPullTask task;
+    result = impl_->runtime_core->SubmitCpuPull(source, impl_->local_ready, impl_->local_put,
+        request.input_offsets, destinations, request.lengths, &task);
+    if (!result.ok()) return result;
+    CpuPullState state;
+    result = impl_->runtime_core->WaitCpuPull(task, impl_->options.offload_timeout_ms, &state);
+    if (!result.ok()) return result;
+    impl_->local_commit = true; // Preserve this decision across a lost Commit ACK.
+    return Status::OK();
+  };
+  try { status = execute(); }
+  catch (const std::exception& e) { status = Status::InDoubt(std::string("BatchCpuPull interrupted: ") + e.what()); }
+  const auto finished = impl_->FinishLocal();
+  // Failed calls never create another READ. If cleanup cannot prove completion,
+  // the retained transaction blocks new work until Shutdown can safely retire it.
+  return finished.ok() ? status : finished;
 #else
-  return Status::NotImplemented("CPU Offload was not built");
+  return Status::NotImplemented("CPU Pull was not built");
 #endif
-}
-Status NpuRuntime::ReleaseOffloadSource() {
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (pending_offload()) return Status::InDoubt("resolve Offload before releasing its local source");
-  if (impl_->local_source) {
-    auto status = impl_->local_source->Shutdown(); if (!status.ok()) return status;
-    impl_->local_source.reset(); impl_->local_input = {};
-  }
-#endif
-  return Status::OK();
-}
-Status NpuRuntime::ResolveOffload() {
-  if (!pending_offload()) return Status::InvalidState("no pending Offload");
-  const bool had_core = impl_->runtime_core->pending_offload();
-  auto status = had_core ? impl_->runtime_core->ResolveOffload() : Status::OK();
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (impl_->local_pending) {
-    if (impl_->runtime_core->pending_offload()) return status;
-    if (had_core) impl_->local_result = status;
-    return impl_->FinishLocal();
-  }
-#endif
-  return status;
 }
 bool NpuRuntime::pending_offload() const {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (impl_->local_pending) return true;
+  if (impl_->local_put.id()) return true;
 #endif
   return impl_->runtime_core && impl_->runtime_core->pending_offload();
 }
@@ -743,7 +743,7 @@ Status NpuRuntime::AttachCpuSource(const CpuPullSourceDesc& source, CpuPullSourc
 }
 Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* put) {
   if (!initialized()) return Status::NotInitialized("initialize Runtime before PreparePut");
-  if (pending_offload()) return Status::Busy("resolve previous Offload/Put first");
+  if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
   return core().PreparePut(keys,lengths,put);
 }
 Status NpuRuntime::SubmitCpuPull(const CpuPullSourceHandle& source,const ReadyToken& ready,const PutHandle& put,
@@ -772,15 +772,6 @@ Status NpuRuntime::BatchGetRawAddr(LinkId link,const ReadyToken& ready,NpuInt64A
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach source HBM before raw READ");
   return impl_->hbm_reader->Read(link,ready,src,dst,lengths,output,stream);
-#else
-  return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
-#endif
-}
-Status NpuRuntime::BatchGetRawAddr(LinkId region, const HbmReadBatch& batch, MutableBufferView output,
-                                  const std::vector<std::uint64_t>& offsets, void* stream) {
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach B HBM before raw READ");
-  return impl_->hbm_reader->Read(region, batch, output, offsets, stream);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif
@@ -836,7 +827,13 @@ Status NpuRuntime::Shutdown() {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (impl_->hbm_reader) { auto status = impl_->hbm_reader->Shutdown(); if (!status.ok()) return status; }
 #endif
-  const auto source_status = ReleaseOffloadSource(); if (!source_status.ok()) return source_status;
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  auto source_status = impl_->FinishLocal(); if (!source_status.ok()) return source_status;
+  if (impl_->local_source) {
+    source_status = impl_->local_source->Shutdown(); if (!source_status.ok()) return source_status;
+    impl_->local_source.reset(); impl_->local_input = {};
+  }
+#endif
   Status status;
   if (impl_->runtime_core && impl_->runtime_core->initialized()) {
     status = impl_->runtime_core->Shutdown();

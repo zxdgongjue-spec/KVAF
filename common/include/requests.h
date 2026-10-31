@@ -87,10 +87,6 @@ struct BatchPutExecutionOptions {
   void* stream{nullptr};
 };
 
-struct OffloadExecutionOptions {
-  void* stream{nullptr};
-};
-
 struct BatchFreeRequest {
   std::vector<KeyId> keys;
 };

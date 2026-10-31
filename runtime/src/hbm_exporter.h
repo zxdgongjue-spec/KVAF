@@ -171,10 +171,10 @@ class Exporter {
       descriptor.key_bytes = key.size;
       std::memcpy(descriptor.key[index], key.value, key.size);
     }
-    std::fprintf(stderr, "[KVAF_NPU] %s commit=8bc5a2a protocol=%u jettys=%u "
+    std::fprintf(stderr, "[KVAF_NPU] %s commit=8bc5a2a endpoint_layout=%u jettys=%u "
         "physical=%u npu_eid=%s cpu_eid=%s hbm_flags=0x%x psn=%u\n",
         npu_peer ? "HBM_READ_EXPORT" : "CPU_PULL_REFERENCE",
-        p::kVersion, p::kChannelCount, physical, EidHex(descriptor.eid).c_str(), EidHex(cpu.eid).c_str(),
+        p::kEndpointVersion, p::kChannelCount, physical, EidHex(descriptor.eid).c_str(), EidHex(cpu.eid).c_str(),
         mr.in.ub.flags, descriptor.psn);
     return Status::OK();
   }

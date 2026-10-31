@@ -1,137 +1,60 @@
-# 共享 DDR：卡 A 提交、CPU 拉取卡 B 的 HBM
+# 共享 DDR 与 CPU Pull
 
-实现分支：`codex/cpu-pull-hbm-reference`。A 的 `NpuRuntime` 同时支持 AIV BatchPut、
-BatchGet、本卡 `offload()` 和跨卡 `offload_from()`。这四个入口共用一个 RuntimeCore、
-MetaManager、PeerDdrAllocator 和 DDR Region。B 的 `HbmSource` 只管理 HBM 注册与冻结批次，
-不创建 RuntimeCore、MetaManager 或第二块 DDR。
+同一个 `NpuRuntime(enable_cpu_offload=True)` 管理普通 BatchPut/BatchGet、本卡 `batch_cpu_pull()` 和跨卡显式 CPU Pull 事务。它们共享 RuntimeCore、MetaManager、DDR allocator 和 DDR region；数据面连接各自独立。
 
-旧 `OffloadRuntime` / KVOF v2 继续兼容原来的独立用法，仍有独立池；需要整合时请改用
-`NpuRuntime(enable_cpu_offload=True)`，不要再额外创建一个 `OffloadRuntime`。
+源由 `CpuPullHbmSource` 注册，可位于 Runtime 本卡或另一张卡。源端不分配第二个 DDR 池，只绑定读取端提供的 DDR ticket。完整应用职责及接口见 [Connector 设计](connector_pull_api_design.md)。本文沿用验收脚本的 A=读取端、B=生产端。
 
-## 角色、地址与时序
-
-```mermaid
-sequenceDiagram
-    participant B as 卡 B / HbmSource
-    participant A as 卡 A / NpuRuntime
-    participant C as CPU service / 同一块 DDR
-    A->>C: 分配共享 DDR，建立 AIV 远端读写链路
-    A-->>B: offload_region() ticket
-    B->>C: 注册固定 HBM，建 CPU→B READ 链路，scratch 探测
-    B->>B: 写 HBM，ready() 等待生产 stream 完成
-    B->>C: Ready 登记 source_id / sequence / ranges（不发起 READ）
-    B-->>A: 应用发送 ready_batch
-    A->>A: PreparePut(keys, lengths)
-    A->>C: Submit(source_id, sequence, src_offset, dst_offset, bytes)
-    C->>B: URMA READ HBM
-    C->>C: 数据直接落入共享 DDR
-    C-->>A: CQ 完成，返回 Done 状态
-    A->>A: CommitPut，公布 metadata
-    A->>C: Complete(已提交)
-    opt 应用需要校验（计时区间外）
-        A->>C: last_offload_checksum() / Checksum
-        C->>C: 扫描本批 DDR 数据
-        C-->>A: 返回校验和
-    end
-    A-->>B: 应用发送复用通知
-    B->>C: release_batch() 确认 Complete
-    B->>B: 允许覆写本批 HBM
-```
-
-A 不解引用 B 的 HBM 地址，不持有 B 的 Tensor。B→A 通知只包含普通整数和列表，适合通过
-现有 RPC、队列或其他业务通道传递。库不替应用选择通知通道；硬件测试使用进程间 Pipe。
-
-提交地址由库计算：
-
-- 源：CPU 保存的 **B 注册 HBM 基址 + B 给出的 input_offset**。
-- 目的：**PreparePut 得到的 DDR 地址 − 共享 Region 导出基址**，作为 dst_offset 提交。
-- CPU 最后使用本地 DDR allocation 基址加 dst_offset，搭配该 allocation 的本地 MR 构造 SGE。
-
-目的地址不由 B 指定，也不使用 A 的 HBM 地址。CPU 校验共享池身份、源代次/批次、源范围、
-目标范围、槽位边界和目标区间不重叠。已取消的批次、旧 service epoch、冲突的重复通知不能启动 READ。
-
-## Python 使用
-
-A 初始化一次，保留既有 AIV 配置，只增加 `enable_cpu_offload=True`。若只验收 Pull，
-可以省略 AIV kernel 参数：
+## 跨卡调用
 
 ```python
-# 卡 A 进程
-runtime = kvaf.NpuRuntime(device_id=device_a, enable_cpu_offload=True)
+# A 初始化并将 ticket 通过应用 Connector 发送给 B。
 runtime.link_to(cpu_address)
 runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
-ticket = runtime.offload_region()    # 普通 dict；通过应用通道交给 B
+ticket = runtime.offload_region()
+
+# B 注册，并将 desc 返回 A。
+source = kvaf.CpuPullHbmSource(device_id=device_b)
+desc = source.register(ticket, hbm_b, stream=producer_stream)
+
+# A 初始化阶段逻辑绑定，不重复建链。
+handle = runtime.attach_cpu_source(desc)
+
+# B 每批生产完成后发布身份，应用将 ready 与业务元数据发送给 A。
+producer_stream.synchronize()
+ready = source.ready()
+
+# A 计算偏移并提交；此处一个源段对应一个目标槽位。
+lengths = torch.tensor([656, 100001], dtype=torch.int64, device="cpu")
+src = torch.tensor([7, 100003], dtype=torch.int64, device="cpu")
+put = runtime.prepare_put([1, 3], lengths)
+dst = torch.tensor([e.address - ticket["base"] for e in put.entries], dtype=torch.int64, device="cpu")
+task = runtime.submit_cpu_pull(handle, ready, put, src, dst, lengths)
+runtime.wait_cpu_pull(task)
+runtime.commit_put(put)
+
+# A 应用发送完成消息；B 确认后可覆写下一批。
+source.release_batch(ready)
 ```
+
+CPU 源偏移相对于注册 HBM 的逻辑起点；目的偏移相对于共享 DDR base。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。
+
+## 本卡便利入口
 
 ```python
-# 卡 B 进程：先 torch.npu.set_device(device_b)
-source = kvaf.HbmSource(device_id=device_b)  # npu_eid 可显式指定；默认自动候选
-source.register(ticket, hbm_tensor, stream=producer_stream)
-
-# 每批：在 producer_stream 上完成所有写入后调用；ready 内部等待其 event。
-ready_batch = source.ready([7, 100003], [656, 100001], stream=producer_stream)
-# 将 ready_batch 交给 A；此时不可覆写、释放或重新绑定 hbm_tensor。
+runtime.batch_cpu_pull(keys, local_npu_tensor, input_offsets, lengths, stream=producer_stream)
 ```
 
-```python
-# 卡 A 收到通知：keys 和 lengths 一一对应，keys 仍遵循现有 DSA slot 规则。
-runtime.offload_from([1, 3], ready_batch)
-# 返回成功表示 CPU READ 完成、Meta 已提交、CPU 已确认该批可复用。
-# 可选诊断：另发 RPC 扫描当前 DDR；性能计时应在此调用之前结束。
-checksum = runtime.last_offload_checksum()
-# 通过应用通道通知 B。重复传入完全相同的 keys / ready_batch 不会再次 READ。
-```
+同步语义与 BatchPut 一致：成功返回时数据和元数据提交均完成。内部注册本卡源、等待生产、PreparePut、组织目的偏移、提交 CPU READ、等待及确认批次复用。应用不管理内部 put/task。源注册缓存至切换 Tensor 或 shutdown；同参数再次调用是新批次。
 
-```python
-# 卡 B 收到 A 的复用通知：再确认 CPU 中记录的提交结果。
-source.release_batch()
-assert not source.frozen
-# 现在可以写下一批，继续使用同一块 HBM 和同一套注册。
+独立 OffloadRuntime、旧类别名、带范围 Ready、offload/offload_from、旧恢复入口已经删除。当前只保留上述便利入口及显式 Connector 事务接口。
 
-# 最终顺序：B release_batch → B shutdown → A shutdown。
-source.shutdown()
-```
+## 建链与协议
 
-`register()` 持有整个 Tensor 的强引用，直到 `shutdown()` 成功。`ready()` 会保守地冻结整个
-注册缓冲；第一版不支持同一 HbmSource 内双缓冲并行。`cancel_batch()` 只允许取消未提交的批次。
-选择 B 对应的当前 NPU 再调用注册、Ready 和 Shutdown；CPU-only 的查询/确认不需要切换设备。
+Runtime 先分配共享 DDR，固定 CPU candidate。源注册在同一池上探测 CPU↔源卡 EID，使用 scratch READ，不覆盖缓存槽位。NPU↔NPU raw READ 的 fullmesh 链路独立配置。
 
-本卡卸载也可直接复用 A 的同一池：
+CPU Pull 控制协议 KVRP v4，NPU Pull 控制协议 KVHR v4。所有端点需同时重编译重启；旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。
 
-```python
-runtime.offload(keys, local_npu_tensor, input_offsets, lengths, stream=producer_stream)
-runtime.release_offload_source()  # 可选：不用该缓冲时释放缓存的本卡 HBM 注册
-```
-
-本卡入口默认缓存同一个 Tensor 的注册；成功返回后可再次写入它。Python 会保留强引用，
-直到切换源 Tensor、显式 release 或 shutdown。需要固定本卡 EID 时也可显式创建本卡 HbmSource，
-再调用同一个 runtime.offload_from()。
-
-## 池与建链约束
-
-CPU 保存原有供 AIV 远端访问的 DDR MR（access=14、non_pin=1），在同一 allocation 上额外
-注册 CPU READ 使用的本地目标 MR（LOCAL_WRITE、non_pin=0）。两者拥有独立 token_id 和注册句柄，
-共享 region token 与实际内存；不复制 payload、不经过第二块暂存池。B 的 READ 链路持有原 Region
-的 lease，先释放所有 B 的链路和本地 MR，才能释放 A 的 DDR。
-
-B 初始化探测读取至独立 4 KiB scratch 的前 64 字节，并与 HBM 的内容比较；不会覆盖共享池 slot 0。
-正式批次直接 READ 到 PreparePut 选定的槽位。HBM、Jetty 原始导出描述符保持 provider 返回值，
-路由 EID 单独用于建链，继续使用 aicpu-urma 参考参数和 32 字节 SGE。
-
-A 有 AIV 配置时沿用现有的候选选择与 AIV 实际 RMA 探测；`cpu_candidate` 可固定共享池。
-只启用 CPU Pull 时，A 初始化选择能成功分配 DDR 的候选，真实 B→CPU 连通性在 B 注册时验证。
-B 对**已经选定的 CPU 池**自动遍历其当前设备的 NPU EID，并校验 scratch READ；它不能静默切换
-CPU candidate 或重分配 A 的池。若 B 所有 EID 都失败，需要应用清理后重新选择三方都能访问的
-CPU candidate。这一点与旧独立 OffloadRuntime 遍历 CPU×NPU 候选组合不同。
-
-KVRP v2 承载共享池控制消息：Query/Done 只返回传输状态，Checksum 才扫描 DDR。
-v1 客户端依赖 Query 中的校验和，因此不混用；CPU 服务及 A、B 的 Python 扩展都需重新编译。
-KVCP v6 和旧 KVOF v2 保持原格式。
-A/B/CPU 都是同步单调用方控制接口；同一共享池一次只接受一个尚未完成/确认的 Pull，
-同一批内部使用四个 Jetty 并行 READ。每次最多 4096 spans；单个 READ 按
-provider 消息/READ 上限（最多 64 KiB）切分。每个 WQE 只有一个远端源 SGE 和一个本地目标 SGE。
-服务保留已关闭 source 的幂等记录，最多接受 4096 次
-source 注册（包含失败候选）；推荐长驻注册并复用，达到上限后应清理并重启 service。
+同一共享池一次只允许一个未完成或未确认的 Pull；每批最多 4096 spans，CPU 内部四 Jetty 并行。服务保留 source 的关闭记录用于确认重试，源注册次数（包括失败候选）上限为 4096，推荐长驻注册复用。
 
 ## CPU Pull 性能验证
 
@@ -147,7 +70,7 @@ post 调用、4 个成功尾部 CQE。更大 span 会拆成更多 WQE，超过�
 这里不使用 WRITE 的本地多 SGE gather：远端离散地址无法由一个源 SGE 描述。
 
 CPU 服务使用 Release 构建，数据传输固定使用四 Jetty 批量模式。PROFILE 环境变量在 Open
-时读取，对共享池及旧 OffloadRuntime 都生效。串行对照模式已移除；启动连通性探测仍保留
+时读取，用于共享池 CPU Pull。串行对照模式已移除；启动连通性探测仍保留
 queue 0 上的单条 READ，以确认失败候选能安全释放后再回退。
 
 ```bash
@@ -175,7 +98,7 @@ checksum；B 收到提交确认后才写下一轮。
 `CPU_PULL_PROFILE` 显示 build/post/cq_wait/total_us、READ WQE 数、post 次数、尾部 CQE 数、
 waves、活跃 Jetty 数和 plan_reused。该 total_us 包含描述符准备、提交和等待，**不包含**
 服务端 checksum、控制 RPC、线程创建或 Meta 提交。`CPU_PULL_BENCH_PASS` 的 Python 时间
-计量 `offload_from()` 至提交完成，包含控制 RPC、线程创建和 Meta 提交；排除数据校验、注册、
+计量 `prepare_put()` 至提交完成（包括目的数组组织），包含控制 RPC、线程创建和 Meta 提交；排除数据校验、注册、
 生产者写入/Ready 和 Free，输出 `cpu_checksum_included=0`。每轮计时结束后显式调用
 `last_offload_checksum()`，服务端此时才计算完整 payload 的校验和；与预期值一致后才 Free
 并通知 B 复用。`verification_mean_us` 单独统计校验 RPC 和比较的耗时，不计入带宽分母。
@@ -188,7 +111,9 @@ waves、活跃 Jetty 数和 plan_reused。该 total_us 包含描述符准备、�
 两种计时指标应分别比较；不要将 Python effective_GBps 当作纯 READ 带宽。每轮校验仍会
 占用实际运行时间，只是与传输计时分开。诊断后将 PROFILE 关闭再测整体性能，可排除日志影响。
 
-### 2026-10-31 记录：1024 个 82 KiB 块
+### 2026-10-31 历史记录：1024 个 82 KiB 块
+
+此记录使用当时的旧便利接口；原始日志和指标保留。当前脚本已迁移到显式事务，指标名为 `python_prepare_put_to_commit`，需重新测量，不能将历史数字标为新接口成绩。
 
 用户硬件实测通过。删除串行对照、拆分校验计时后的版本为
 `codex/cpu-pull-hbm-reference` / `7fc988571e5ddf99f7ba4b9fecd38673b6fab900`。
@@ -239,24 +164,17 @@ GB/s 使用十进制单位。CPU 数据面时间包含描述符准备、提交�
 不代表包含逐轮校验的持续吞吐。当前完成查询在未完成时休眠 1 ms，可作为后续控制流程优化点，
 但尚未通过独立计时验证其具体占比。
 
-## 未决操作与失败处理
+## 未决操作
 
-`pending_offload=True` 时保留 A Runtime 和 B 的 HBM，调用 A `resolve_offload()` 查询已有任务。
-这个接口不会重发 READ。发生提交回包丢失、CQ 超时或 Complete 回包丢失时，slot 锁、源注册和
-共享 DDR lease 均保留；Complete 回包丢失也不会重复 CommitPut。未决期间拒绝新的 Put/Free/
-PrepareAccessTable/BatchGet。B 未收到提交确认时，`release_batch()` 和销毁均拒绝释放缓冲。
+显式事务由应用持有 put/task：Submit 响应丢失后从 `put.task` 查询原任务，使用 query/wait/commit/abort；不可重复 PreparePut 替代未决任务。生产端通过 `release_batch(ready)` 或尚未获取批次时的 `cancel_batch(ready)` 核验身份及状态。
 
-Ready 回包丢失可以对同一 offsets/lengths 重试 `ready()`，仍使用原序号；或在尚未提交时取消。
-A 在 PreparePut 前拒绝非法 key 等请求时，B 仍保持 Ready，调用方可以修正提交或取消。
-硬件错误使传输无法证明停止时，不尝试自动重建链路或覆写源数据。当前没有进程重启后的 Meta
-持久化恢复；A/B 崩溃后的孤立注册需由应用协调停止传输并重建。应用需先完成已提交的异步
-AIV stream，再释放对应槽位、HBM 或 Runtime，沿用现有 BatchGet 约束。
+本卡 `batch_cpu_pull()` 自动处理可确认失败的 Abort。未决 DMA 保留内部事务并阻止新调用；`shutdown()` 只查询、确认并清理，不重发 READ。清理未成功时，源和 DDR 继续保持有效。Commit 已开始后，确认丢失不能逆转已发布的元数据。
 
 ## 构建与双卡验证
 
 CPU 服务按 [原构建说明](cpu_pull_offload_usage.md) 重编并重启。NPU 的纯 Pull 验收仍可使用
 `KVAF_ENABLE_CPU_OFFLOAD=ON`、`KVAF_BUILD_PYTHON=ON`、AIV 两项 OFF；现在该构建也导出
-`NpuRuntime` 和 `HbmSource`。
+`NpuRuntime` 和 `CpuPullHbmSource`。
 
 ```bash
 python tests/python/test_remote_cpu_offload.py \

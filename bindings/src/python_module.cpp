@@ -345,14 +345,13 @@ class PythonRuntime final {
 }  // namespace kvaf
 
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-namespace kvaf { void BindOffloadRuntime(pybind11::module_&); void BindHbmSource(pybind11::module_&); }
+namespace kvaf { void BindCpuPullHbmSource(pybind11::module_&); }
 #endif
 
 PYBIND11_MODULE(_kvaf, m) {
   kvaf::BindConnectorTypes(m);
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  kvaf::BindOffloadRuntime(m);
-  kvaf::BindHbmSource(m);
+  kvaf::BindCpuPullHbmSource(m);
 #endif
   m.doc() = "Synchronous KVAF Runtime Python bindings";
 
@@ -404,7 +403,7 @@ PYBIND11_MODULE(_kvaf, m) {
 
 #if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_CPU_OFFLOAD)
   kvaf::BindNpuPythonRuntime(m);
-  kvaf::BindHbmReadSource(m);
+  kvaf::BindNpuPullHbmSource(m);
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   kvaf::BindAclGraph(m);

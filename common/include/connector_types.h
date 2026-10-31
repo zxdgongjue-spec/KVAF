@@ -66,7 +66,6 @@ struct CpuPullRequest {
   CpuPullSourceDesc source;
   std::uint64_t sequence{};
   CopyArrays copies;
-  std::vector<std::uint64_t> keys; // Internal compatibility/idempotency record.
 };
 enum class CpuPullState { Prepared, Submitted, Running, Done, Failed, InDoubt, Committed, Aborted };
 }

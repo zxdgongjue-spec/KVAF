@@ -94,7 +94,7 @@ int main(){try{
   std::vector<uint8_t> storage(source_bytes+8192,0xee),output(300000,0xa5);
   auto* source=reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(storage.data())+4095U)&~uintptr_t(4095U))+0xc00;
   for(size_t i=0;i<source_bytes;++i)source[i]=(i*17+3)%251;
-  kvaf::HbmReadSource b(0,"00000000000000000000000000000001");kvaf::HbmReadTicket ticket;
+  kvaf::NpuPullHbmSource b(0,"00000000000000000000000000000001");kvaf::HbmReadTicket ticket;
   Check(b.Register({source,source_bytes,kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&ticket));Check(b.Listen("127.0.0.1:0"));
   Proxy proxy("127.0.0.1:"+std::to_string(b.port()));
   {kvaf::HbmReader failed(0,2,2,2048,"fake.o");kvaf::LinkId rejected{};
@@ -112,35 +112,8 @@ int main(){try{
     Require(!other.Attach(proxy.address,ticket,"00000000000000000000000000000002",&rejected).ok(),"reject second reader");
     Check(other.Shutdown()); }
   Require(!b.Shutdown().ok(),"cannot unregister connected source");
-  auto ready=[&]{kvaf::HbmReadBatch batch;Check(b.Ready({7,100003,250019},{1,656,100001},reinterpret_cast<void*>(1),&batch));return batch;};
   auto out=kvaf::MutableBufferView{output.data(),output.size(),kvaf::DeviceKind::kNpu};
-  kvaf::HbmReadBatch invalid;
-  Require(!b.Ready({source_bytes},{1},reinterpret_cast<void*>(1),&invalid).ok(),"registration padding is not user data");
-  auto batch=ready();auto before=raw_calls.load();
-  Require(batch.source_addresses[0]==reinterpret_cast<uintptr_t>(source)+7 && ticket.bytes==source_bytes,
-          "publish Tensor addresses and size, not the page-aligned MR prefix");
-  Require(!a.Read(id,batch,out,{0,0,0},reinterpret_cast<void*>(1)).ok(),"overlap rejected before Acquire");
-  auto stale=batch;stale.epoch++;Require(!a.Read(id,stale,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"stale epoch rejected");
-  auto corrupt=batch;corrupt.source_addresses[0]++;
-  Require(!a.Read(id,corrupt,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"B verifies published address");
-  Require(raw_calls==before && !a.pending(),"invalid request posts nothing");
-  Check(a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)));
-  Require(raw_calls==before+1 && raw_wqes>=4,"variable lengths split into READs");
-  Require(output[3]==source[7] && std::memcmp(output.data()+101,source+100003,656)==0 &&
-          std::memcmp(output.data()+2000,source+250019,100001)==0 && output[2]==0xa5 && output[102001]==0xa5,"payload and padding");
-  Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"consumed sequence cannot replay");Check(b.ReleaseBatch());
-  batch=ready();proxy.drop=unsigned(hr::Command::Complete);before=raw_calls;
-  Require(a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).code()==kvaf::StatusCode::kInDoubt && a.pending(),"lost Complete ACK retains task");
-  Check(b.ReleaseBatch()); // Even an early producer release must leave an ACK tombstone.
-  Check(a.Resolve(id));Require(raw_calls==before+1 && !a.pending(),"resolve ACK does not replay READ");
-  batch=ready();proxy.drop=unsigned(hr::Command::Acquire);before=raw_calls;
-  Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok() && a.pending(),"lost Acquire response");
-  Require(!b.CancelBatch().ok() && !b.ReleaseBatch().ok(),"producer cannot reuse acquired source");
-  Require(!a.Resolve(id).ok() && !a.pending() && raw_calls==before,"resolve cancels before DMA, reports no output");Check(b.ReleaseBatch());
-  batch=ready();unregister_failures=1;
-  Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok() && a.pending(),"unregister failure retains output");
-  Check(a.Resolve(id));Check(b.ReleaseBatch());
-  batch=ready();Check(b.CancelBatch());Require(!a.Read(id,batch,out,{3,101,2000},reinterpret_cast<void*>(1)).ok(),"cancelled Ready cannot be read");
+  int before=0;
   // Connector chooses its own source ranges after identity-only Ready.
   kvaf::ReadyToken token;Check(b.Ready(&token));
   std::vector<std::int64_t> sources{9,90001},destinations{7,5000},lengths{67,70001};
@@ -179,7 +152,12 @@ int main(){try{
   Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"lost new Acquire response retains batch");
   Require(!b.CancelBatch(token).ok(),"cannot cancel an acquired identity-only batch");
   Require(!a.Resolve(id).ok()&&!a.pending()&&raw_calls==before,"unknown Acquire is cancelled without READ replay");
-  Check(b.ReleaseBatch(token));
+  Require(!read(token,sources,destinations,lengths).ok(),"consumed sequence cannot replay");
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  unregister_failures=1;before=raw_calls;
+  Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"unregister failure retains output");
+  Check(a.Resolve(id));Require(raw_calls==before+1,"cleanup retries never replay READ");Check(b.ReleaseBatch(token));
+  Check(b.Ready(&token));Check(b.CancelBatch(token));Require(!read(token,sources,destinations,lengths).ok(),"cancelled batch cannot be read");
   proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(id).ok(),"lost detach reply");Check(a.Detach(id));Check(b.Shutdown());
   Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers,"all resources retired");
   std::cout<<"HBM raw READ: real TCP/source/client, split spans, leases, lost ACKs and cleanup passed\n";

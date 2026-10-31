@@ -13,8 +13,7 @@ struct Session {
   Endpoint source{}, local{};
   std::unique_ptr<offload::Backend> backend;
   std::uint64_t sequence{};
-  std::vector<Span> ready, submitted;
-  bool identity_only{};
+  std::vector<Span> submitted;
   State state{State::Connecting}, terminal{State::Connecting};
   std::mutex mutex;
   std::thread worker;
@@ -125,20 +124,18 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   }
   if (!r.task) return out;
   if (cmd == Command::Ready) {
-    if (r.flags > 1 || (r.flags == 1 ? !spans.empty() : spans.empty())) return out;
-    if (r.task == s.sequence && bool(r.flags) == s.identity_only && SameSpans(spans, s.ready) && s.state != State::Closed) { out.result = Result::Ok; return out; }
+    if (r.flags || !spans.empty()) return out;
+    if (r.task == s.sequence && s.state != State::Closed) { out.result = Result::Ok; return out; }
     if (r.task != s.sequence + 1 || (s.state != State::Idle && s.state != State::Committed && s.state != State::Cancelled)) return out;
-    for (const auto& span : spans)
-      if (span.destination || !offload::Contains(s.source.bytes, span.source, span.bytes)) return out;
     if (s.worker.joinable()) s.worker.join();
-    s.sequence = r.task; s.ready = spans; s.submitted.clear(); s.identity_only = r.flags == 1;
+    s.sequence = r.task; s.submitted.clear();
     s.state = out.state = State::Ready; out.result = Result::Ok; return out;
   }
   // A Ready packet may never have reached the service. Cancel also records
   // the next unused sequence, preventing a delayed Ready from reviving it.
   if (cmd == Command::Cancel && r.task == s.sequence + 1 &&
       (s.state == State::Idle || s.state == State::Committed || s.state == State::Cancelled)) {
-    s.sequence = r.task; s.ready.clear(); s.submitted.clear();
+    s.sequence = r.task; s.submitted.clear();
     s.state = s.terminal = out.state = State::Cancelled; out.result = Result::Ok; return out;
   }
   if (r.task != s.sequence) return out; // Old notifications cannot consume a newer generation.
@@ -176,11 +173,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     if (SameSpans(spans, s.submitted)) out.result = Result::Ok;
     return out;
   }
-  if (s.state != State::Ready || (!s.identity_only && spans.size() != s.ready.size()) ||
-      !offload::ValidateSpans(spans, s.source.bytes, region.bytes)) return out;
-  for (std::size_t i = 0; !s.identity_only && i < spans.size(); ++i)
-    if (spans[i].source != s.ready[i].source || spans[i].bytes != s.ready[i].bytes ||
-        spans[i].destination % region.slot_size || spans[i].bytes > region.slot_size) return out;
+  if (s.state != State::Ready || !offload::ValidateSpans(spans, s.source.bytes, region.bytes)) return out;
   // One unresolved write per pool, including CQ failures with unknown DMA state.
   for (const auto& item : impl_->sources) {
     if (item.second.get() == &s || item.second->region.id != r.region) continue;

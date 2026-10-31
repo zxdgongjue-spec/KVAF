@@ -109,71 +109,31 @@ class SharedServer {
 void NoResources(){Require(leases==0&&registrations==0&&sessions==0&&contexts==0&&jetties==0&&cqs==0&&peer_imports==0,"all registrations and leases released");}
 void Lifecycle(){
   SharedServer server;
-  kvaf::NpuRuntimeOptions options;options.device_id=0;options.enable_cpu_offload=true;options.offload_timeout_ms=20;options.cpu_candidate=1;
+  kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;options.cpu_candidate=1;
   kvaf::NpuRuntime a(options);Ok(a.LinkTo({server.address}));Ok(a.Initialize(1024,256));
-  kvaf::OffloadRegionTicket ticket;Ok(a.GetOffloadRegion(&ticket));Require(ticket.region.candidate==1,"pinned shared pool");
+  kvaf::OffloadRegionTicket ticket;Ok(a.GetOffloadRegion(&ticket));
   std::vector<std::uint8_t> hbm(4096);for(unsigned i=0;i<hbm.size();++i)hbm[i]=i*3+7;
-  aclrtSetDevice(7);kvaf::HbmSource b(7,"00000000000000000000000000000001");
+  aclrtSetDevice(7);kvaf::CpuPullHbmSource b(7,"00000000000000000000000000000001");
   Ok(b.Register(ticket,{hbm.data(),hbm.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
-  Require(server.pool_allocations==1&&leases==1&&scratch_reads==1,"source borrows A pool and probes scratch");
-  Require(std::all_of(server.pool.begin(),server.pool.end(),[](auto c){return c==0xA5;}),"probe cannot overwrite shared slot zero");
-  kvaf::HbmReadyBatch batch;Ok(b.Ready({16,512},{64,128},reinterpret_cast<void*>(1),&batch));
-  Require(!b.ReleaseBatch().ok()&&b.frozen(),"B retained before A submits");
-  Require(!a.Shutdown().ok()&&a.initialized(),"A cannot release shared DDR while B registered");
-  aclrtSetDevice(0);const int before=payload_reads,hashes_before=checksum_calls;Ok(a.OffloadFrom({1,3},batch));
-  Require(payload_reads==before+1&&server.pool_allocations==1,"one direct CPU READ batch, one pool");
-  Require(checksum_calls==hashes_before,"offload returns after commit without scanning payload for checksum");
-  Require(!std::memcmp(server.pool.data()+256,hbm.data()+16,64)&&!std::memcmp(server.pool.data()+768,hbm.data()+512,128),"CPU uses B offsets and PreparePut DDR destinations");
-  std::uint64_t hash{};Ok(a.LastOffloadChecksum(&hash));Require(hash==p::Hash(hbm.data()+512,128,p::Hash(hbm.data()+16,64)),"shared DDR contents hash");
-  Require(checksum_calls==hashes_before+1,"explicit checksum RPC performs verification");
-  // Diagnostics must scan actual DDR, not a transfer-time cached result.
-  server.pool[256]^=0x80;std::uint64_t corrupted{};Ok(a.LastOffloadChecksum(&corrupted));
-  Require(corrupted!=hash,"checksum detects DDR corruption after completion");server.pool[256]^=0x80;
-  server.drop=std::uint16_t(rp::Command::Checksum);
-  Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"lost checksum response does not reopen completed DMA");
-  Ok(a.LastOffloadChecksum(&corrupted));Require(corrupted==hash&&payload_reads==before+1,"diagnostic retry hashes DDR without replaying READ");
-  fail_checksum=true;Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"checksum failure leaves transfer committed");fail_checksum=false;
-  const int hashes_after=checksum_calls;
-  Ok(a.OffloadFrom({1,3},batch));Require(payload_reads==before+1,"duplicate Ready notification does not redo PreparePut/READ");
-  Require(checksum_calls==hashes_after,"duplicate notification does not scan payload");
-  auto conflict=batch;conflict.input_offsets[0]++;Require(!a.OffloadFrom({1,3},conflict).ok(),"conflicting duplicate rejected");
-  kvaf::AccessTableHandle table;Ok(a.core().PrepareAccessTable({{1,3}},&table));Ok(a.core().ReleaseAccessTable(table));
-  Ok(a.core().BatchFree({{1,3}}));
-  aclrtSetDevice(7);Ok(b.ReleaseBatch());Require(!b.frozen(),"only committed batch can be reused");
-  Ok(b.Ready({32},{32},reinterpret_cast<void*>(1),&batch));
-  Require(!a.LastOffloadChecksum(&hash).ok()&&checksum_calls==hashes_after,"next Ready invalidates prior checksum identity without reading reused DDR");
-  auto stale=batch;stale.source.region_epoch++;Require(!a.OffloadFrom({2},stale).ok(),"old service epoch rejected before PreparePut");
-  server.drop=std::uint16_t(rp::Command::Submit);
-  aclrtSetDevice(0);Require(a.OffloadFrom({2},batch).code()==kvaf::StatusCode::kInDoubt&&a.pending_offload(),"lost Submit ACK retains task");
-  const int submitted=payload_reads;
-  Require(!a.core().BatchFree({{2}}).ok()&&!a.core().PrepareAccessTable({{2}},&table).ok(),"pending slots hidden/protected");
-  Ok(a.ResolveOffload());Require(payload_reads==submitted&&!a.pending_offload(),"Resolve queries, never resubmits READ");
-  aclrtSetDevice(7);Ok(b.ReleaseBatch());Ok(a.core().BatchFree({{2}}));
-  Ok(b.Ready({0},{16},reinterpret_cast<void*>(1),&batch));
-  server.drop=std::uint16_t(rp::Command::Complete);
-  aclrtSetDevice(0);Require(a.OffloadFrom({0},batch).code()==kvaf::StatusCode::kInDoubt&&a.pending_offload(),"lost metadata ACK keeps pending state");
-  const int complete_reads=payload_reads;Ok(a.ResolveOffload());Require(payload_reads==complete_reads,"commit ACK retry does not copy again");
-  aclrtSetDevice(7);Ok(b.ReleaseBatch());Ok(a.core().BatchFree({{0}}));
-  // Cancel before submission is safe; a stale A notification cannot read B again.
-  Ok(b.Ready({0},{16},reinterpret_cast<void*>(1),&batch));Ok(b.CancelBatch());
-  Require(!a.OffloadFrom({0},batch).ok(),"cancelled source not submitted");
-  // Timeout remains recoverable while the same worker owns the READ.
-  Ok(b.Ready({0},{16},reinterpret_cast<void*>(1),&batch));hold_read=true;
-  aclrtSetDevice(0);Require(a.OffloadFrom({0},batch).code()==kvaf::StatusCode::kInDoubt,"READ deadline retains operation");
-  Require(!a.LastOffloadChecksum(&hash).ok(),"pending READ cannot be verified");
-  auto checksum_request=rp::MakeRequest(rp::Command::Checksum);
-  checksum_request.region=ticket.region.id;checksum_request.epoch=ticket.region.epoch;checksum_request.token=ticket.region.token;
-  checksum_request.source_id=batch.source.source_id;checksum_request.task=batch.source.sequence;
-  rp::Response checksum_response{};const int pending_hashes=checksum_calls;
-  Ok(rp::Exchange(server.address,checksum_request,{},&checksum_response));
-  Require(checksum_response.result==rp::Result::Busy&&checksum_calls==pending_hashes,"CPU refuses checksum until all READs finish");
-  Require(!b.CancelBatch().ok()&&!b.Shutdown().ok(),"B cannot unregister or cancel an active READ");
-  hold_read=false;Ok(a.ResolveOffload());aclrtSetDevice(7);Ok(b.ReleaseBatch());
-  server.drop=std::uint16_t(rp::Command::Detach);Require(!b.Shutdown().ok(),"lost Detach reply retains exporter");
-  Ok(b.Shutdown());NoResources();Require(!a.LastOffloadChecksum(&hash).ok(),"detached source cannot be verified");aclrtSetDevice(0);server.fail_release=true;
-  Require(!a.Shutdown().ok(),"failed DDR release retains runtime for shutdown retry");
-  Require(!a.core().PrepareAccessTable({{0}},&table).ok(),"partially closed runtime cannot resume data operations");
-  Ok(a.Shutdown());Require(server.pool.empty(),"shared allocation released after detach");
+  Require(std::all_of(server.pool.begin(),server.pool.end(),[](auto c){return c==0xA5;}),"probe preserves shared DDR");
+  kvaf::CpuPullSourceDesc desc;Ok(b.GetDescriptor(&desc));kvaf::CpuPullSourceHandle source;Ok(a.AttachCpuSource(desc,&source));
+  kvaf::ReadyToken ready;Ok(b.Ready(&ready));
+  Require(!b.ReleaseBatch(ready).ok()&&!a.Shutdown().ok(),"source lease blocks premature release");
+  kvaf::PutHandle put;Ok(a.PreparePut({1,3},{64,128},&put));
+  std::vector<std::uint64_t> src{16,512},dst{256,768},sizes{64,128};kvaf::CpuPullTask task;
+  const int before=payload_reads, hashes=checksum_calls;
+  Ok(a.SubmitCpuPull(source,ready,put,src,dst,sizes,&task));kvaf::CpuPullState state;
+  Ok(a.WaitCpuPull(task,1000,&state));Ok(a.CommitPut(put));
+  Require(payload_reads==before+1&&checksum_calls==hashes,"transfer and commit exclude checksum");
+  std::uint64_t hash{},corrupted{};Ok(a.LastOffloadChecksum(&hash));
+  Require(hash==p::Hash(hbm.data()+512,128,p::Hash(hbm.data()+16,64)),"DDR checksum");
+  server.pool[256]^=0x80;Ok(a.LastOffloadChecksum(&corrupted));Require(corrupted!=hash,"diagnostic scans current DDR");server.pool[256]^=0x80;
+  server.drop=unsigned(rp::Command::Checksum);Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"lost diagnostic ACK is not pending DMA");
+  Ok(a.LastOffloadChecksum(&corrupted));Require(corrupted==hash&&payload_reads==before+1,"diagnostic retry never replays READ");
+  fail_checksum=true;Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"diagnostic failure leaves commit intact");fail_checksum=false;
+  Ok(b.ReleaseBatch(ready));Ok(b.Ready(&ready));Require(!a.LastOffloadChecksum(&hash).ok(),"next generation invalidates old checksum");Ok(b.CancelBatch(ready));
+  server.drop=unsigned(rp::Command::Detach);Require(!b.Shutdown().ok(),"lost detach ACK retains exporter");Ok(b.Shutdown());NoResources();
+  server.fail_release=true;Require(!a.Shutdown().ok(),"DDR release can be retried");Ok(a.Shutdown());
 }
 // The dispatcher routes both data planes through one Core/MetaManager/pool.
 struct PoolAllocator : kvaf::DdrMemoryAllocator {
@@ -199,16 +159,19 @@ struct FakeAiv : kvaf::AccessOperator {
 };
 void SharedMetadata(){
   SharedServer server;auto link=std::make_shared<kvaf::peer::PeerLink>(server.address);
-  PoolAllocator allocator(link);FakeAiv aiv;kvaf::RemotePullOperator op(&aiv,link,100);
+  PoolAllocator allocator(link);FakeAiv aiv;kvaf::RemotePullOperator op(&aiv,link);
   auto meta=kvaf::CreateInMemoryMetaManager();kvaf::RuntimeCore core(*meta,op,allocator);Ok(core.Initialize({1024,256,kvaf::DeviceKind::kCpu}));
   std::vector<std::uint8_t> a_data(64,0x23),b_data(1024,0x67);
   Ok(core.BatchPut({{0},{a_data.data(),a_data.size(),kvaf::DeviceKind::kNpu},{0},{64}}));
-  aclrtSetDevice(7);kvaf::HbmSource b(7,"00000000000000000000000000000001");
+  aclrtSetDevice(7);kvaf::CpuPullHbmSource b(7,"00000000000000000000000000000001");
   Ok(b.Register(op.ticket(),{b_data.data(),b_data.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
   Require(!std::memcmp(server.pool.data(),a_data.data(),64),"B registration probe preserves A BatchPut");
-  kvaf::HbmReadyBatch batch;Ok(b.Ready({64},{64},reinterpret_cast<void*>(1),&batch));
-  kvaf::RemoteOffloadRequest request{batch.source,{1},batch.input_offsets,batch.lengths};bool duplicate=false;
-  Ok(op.Validate(request,&duplicate));Ok(core.OffloadFrom(request));
+  kvaf::ReadyToken ready;Ok(b.Ready(&ready));
+  kvaf::CpuPullSourceHandle source;Ok(core.AttachCpuSource(std::get<kvaf::CpuPullSourceDesc>(ready.source),&source));
+  kvaf::PutHandle put;Ok(core.PreparePut({1},{64},&put));kvaf::CpuPullTask task;
+  std::vector<std::uint64_t> src{64},dst{256},sizes{64};
+  Ok(core.SubmitCpuPull(source,ready,put,src,dst,sizes,&task));kvaf::CpuPullState state;
+  Ok(core.WaitCpuPull(task,1000,&state));Ok(core.CommitPut(put));
   Require(aiv.puts==1&&!std::memcmp(server.pool.data()+256,b_data.data()+64,64),"Pull bypasses AIV and shares DDR");
   const int copied=payload_reads;
   Require(!core.BatchPut({{1},{a_data.data(),a_data.size(),kvaf::DeviceKind::kNpu},{0},{64}}).ok(),"same MetaManager prevents duplicate key across data planes");
@@ -217,27 +180,49 @@ void SharedMetadata(){
   kvaf::AccessTableView view;Ok(core.GetAccessTableView(table,&view));
   Require(view.valid[0]&&view.valid[1]&&view.addresses[0]==server.info.base&&view.addresses[1]==server.info.base+256,"one access table sees both writes");
   Require(!core.Shutdown().ok(),"busy B blocks shutdown before unlocking tables");Ok(core.GetAccessTableView(table,&view));
-  Ok(core.ReleaseAccessTable(table));Ok(b.ReleaseBatch());Ok(b.Shutdown());Ok(core.Shutdown());NoResources();
+  Ok(core.ReleaseAccessTable(table));Ok(b.ReleaseBatch(ready));Ok(b.Shutdown());Ok(core.Shutdown());NoResources();
 }
+int producer_syncs=0;
+extern "C" aclError aclrtSynchronizeStream(aclrtStream){++producer_syncs;return 0;}
 void LocalAndFallback(){
   EidFixture fixture;
   const std::string eid1="00000000000000000000000000000001",eid5="00000000000000000000000000000005";
   EidFixture::Write(fixture.paths.rootinfo,EidFixture::Clos(0,eid1)+EidFixture::Clos(0,eid5));
   const char* prior=getenv("KVAF_HCCL_ROOTINFO_PATH");const bool had_prior=prior;const std::string saved=prior?prior:"";
   setenv("KVAF_HCCL_ROOTINFO_PATH",fixture.paths.rootinfo.c_str(),1);auto_mode=true;failed_route=1;
-  SharedServer server;kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;
+  SharedServer server;kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;options.offload_timeout_ms=2;
   kvaf::NpuRuntime a(options);Ok(a.LinkTo({server.address}));Ok(a.Initialize(1024,256));
   std::vector<std::uint8_t> hbm(4096,0x43);kvaf::BatchPutRequest req{{2},{hbm.data(),hbm.size(),kvaf::DeviceKind::kNpu},{32},{64}};
-  Ok(a.Offload(req,{reinterpret_cast<void*>(1)}));
-  Require(server.pool_allocations==1&&leases==1,"local offload and candidate fallback keep A pool");
-  Require(!std::memcmp(server.pool.data()+512,hbm.data()+32,64),"local source offload uses same DDR");
-  Ok(a.core().BatchFree({{2}}));const int probes=scratch_reads;
-  server.drop=std::uint16_t(rp::Command::Submit);
-  Require(!a.Offload(req,{reinterpret_cast<void*>(1)}).ok()&&a.pending_offload(),"local lost Submit retains source");
-  Require(!a.ReleaseOffloadSource().ok(),"cannot unregister pending local source");Ok(a.ResolveOffload());
-  Require(!a.pending_offload()&&scratch_reads==probes,"local registration reused across batches");
-  Ok(a.ReleaseOffloadSource());Ok(a.Shutdown());NoResources();
-  auto_mode=false;failed_route=0;
+  Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));
+  Require(server.pool_allocations==1&&leases==1&&producer_syncs==1,"local Pull shares pool, synchronizes producer and caches source");
+  Require(!std::memcmp(server.pool.data()+512,hbm.data()+32,64),"local Pull payload");
+  kvaf::AccessTableHandle table;Ok(a.core().PrepareAccessTable({{2}},&table));kvaf::AccessTableView view;Ok(a.core().GetAccessTableView(table,&view));
+  Require(view.valid[0],"synchronous success includes metadata commit");Ok(a.core().ReleaseAccessTable(table));
+  const int reads=payload_reads,probes=scratch_reads;
+  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&!a.pending_offload()&&payload_reads==reads,"duplicate occupied key fails before transfer");
+  Ok(a.core().BatchFree({{2}}));hbm[32]=0x88;Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));
+  Require(server.pool[512]==0x88&&payload_reads==reads+1&&scratch_reads==probes,"each call is a new batch and reuses registration");
+  Ok(a.core().BatchFree({{2}}));
+  server.drop=unsigned(rp::Command::Ready);
+  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&!a.pending_offload()&&payload_reads==reads+1,"lost Ready aborts safely before READ");
+  // Metadata commit has happened; retry only its acknowledgement on shutdown.
+  server.drop=unsigned(rp::Command::Complete);
+  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&a.pending_offload(),"lost commit ACK retains the decision");
+  const int committed=payload_reads;Ok(a.Shutdown());Require(payload_reads==committed,"shutdown never replays READ");NoResources();
+  Ok(a.Initialize(1024,256));
+  hold_read=true;server.drop=unsigned(rp::Command::Submit);
+  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&a.pending_offload(),"unresolved READ retains source and slots");
+  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok(),"repeated calls do not implicitly resume a pending operation");
+  Require(!a.Shutdown().ok()&&!a.core().BatchFree({{2}}).ok(),"in-flight DMA blocks cleanup and slot reuse");
+  hold_read=false;
+  Status close;
+  for(int i=0;i<1000;++i){close=a.Shutdown();if(close.ok())break;std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+  Ok(close);NoResources();
+  // A different input replaces the cached registration after the old one retires.
+  Ok(a.Initialize(1024,256));Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));Ok(a.core().BatchFree({{2}}));
+  std::vector<std::uint8_t> replacement(8192,0x94);req.input={replacement.data(),replacement.size(),kvaf::DeviceKind::kNpu};
+  Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));Require(server.pool[512]==0x94&&leases==1,"source replacement retires previous registration");
+  Ok(a.Shutdown());NoResources();auto_mode=false;failed_route=0;
   if(had_prior)setenv("KVAF_HCCL_ROOTINFO_PATH",saved.c_str(),1);else unsetenv("KVAF_HCCL_ROOTINFO_PATH");
 }
 void InitializationRecovery() {

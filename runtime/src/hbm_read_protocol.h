@@ -3,9 +3,9 @@
 #include "offload_protocol.h"
 
 namespace kvaf::hbm_read {
-constexpr std::uint32_t kMagic = 0x4b564852; // KVHR, independent of KVCP/KVRP/KVOF
-constexpr std::uint16_t kVersion = 3; // AcquireRaw may lease identity only; ranges stay on reader NPU.
-enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Acquire, Complete, Cancel, Close, AcquireRaw };
+constexpr std::uint32_t kMagic = 0x4b564852; // KVHR, independent of KVCP/KVRP
+constexpr std::uint16_t kVersion = 4; // Only identity leases; ranges stay on the reader NPU.
+enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Complete=6, Cancel, Close, AcquireRaw };
 enum class State : std::uint32_t { Registered, Connected, Ready, Reading, Done };
 using Span = offload::Span;
 struct Request {

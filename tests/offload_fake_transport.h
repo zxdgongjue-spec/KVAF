@@ -1,7 +1,7 @@
 #pragma once
 // Executes the real CANN-host runtime and TCP protocol against fake ACL/HCCP
 // and a host-memory backend. This tests orchestration, not hardware support.
-#include "offload_runtime.h"
+#include "runtime.h"
 #include "npu_eid_fixture.h"
 #include <mutex>
 #include "offload_service.h"

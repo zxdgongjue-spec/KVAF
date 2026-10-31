@@ -29,9 +29,7 @@ struct NpuPullHbmSource::Impl {
   offload::Endpoint initiator{};
   Status open_result;
   hr::State state{hr::State::Registered};
-  bool confirmed{},frozen{},closing{},identity_only{};
-  HbmReadBatch batch;
-  std::vector<hr::Span> submitted;
+  bool confirmed{},frozen{},closing{};
   int listener{-1};
   std::uint16_t port{};
   std::thread thread;
@@ -111,23 +109,11 @@ struct NpuPullHbmSource::Impl {
     if((command==hr::Command::Complete || command==hr::Command::Cancel) &&
         r.sequence && r.sequence==completed) return Status::OK();
     if(!confirmed || !frozen || r.sequence!=sequence) return Status::InvalidState("HBM batch is stale or not ready");
-    if(command==hr::Command::Acquire || command==hr::Command::AcquireRaw) {
-      if ((command==hr::Command::AcquireRaw)!=identity_only || (!identity_only && spans.empty()))
-        return Status::InvalidArgument("HBM Ready/Acquire mode mismatch");
-      if(!identity_only && spans.size()!=batch.lengths.size()) return Status::InvalidArgument("HBM span count mismatch");
-      for(size_t i=0;i<spans.size();++i)
-        if(spans[i].source<exporter->descriptor.base ||
-           !offload::Contains(input.bytes,spans[i].source-exporter->descriptor.base,spans[i].bytes) ||
-           spans[i].bytes>UINT64_MAX-spans[i].destination ||
-           (!identity_only && (spans[i].source!=batch.source_addresses[i] || spans[i].bytes!=batch.lengths[i])))
-          return Status::InvalidArgument("HBM request differs from published ranges");
-      if(state==hr::State::Reading) {
-        if(submitted.size()!=spans.size() || (!spans.empty() && std::memcmp(submitted.data(),spans.data(),spans.size()*sizeof(hr::Span))))
-          return Status::InvalidArgument("READ retry changed destination");
-        return Status::OK();
-      }
+    if(command==hr::Command::AcquireRaw) {
+      if(!spans.empty()) return Status::InvalidArgument("NPU Pull control carries identity only");
+      if(state==hr::State::Reading) return Status::OK();
       if(state!=hr::State::Ready) return Status::InvalidState("HBM batch already consumed");
-      submitted=spans; state=hr::State::Reading; return Status::OK();
+      state=hr::State::Reading; return Status::OK();
     }
     if(command==hr::Command::Complete || command==hr::Command::Cancel) {
       if(state==hr::State::Done) return Status::OK();
@@ -195,39 +181,23 @@ Status NpuPullHbmSource::Listen(const std::string& address) {
   if(!s.ok()){impl_->thread.join();close(impl_->listener);impl_->listener=-1;}
   return s;
 }
-Status NpuPullHbmSource::Ready(const std::vector<std::uint64_t>& offsets,const std::vector<std::uint64_t>& lengths,
-                           void* stream,HbmReadBatch* out) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  auto s=impl_->Device();if(!s.ok())return s;
-  if(!out || !impl_->confirmed || impl_->frozen) return Status::Busy("attach reader and release previous batch before Ready");
-  if(offsets.empty() || offsets.size()!=lengths.size() || offsets.size()>offload::kMaxSpans || impl_->sequence==UINT64_MAX)
-    return Status::InvalidArgument("invalid raw HBM ranges");
-  for(size_t i=0;i<offsets.size();++i)
-    if(!offload::Contains(impl_->input.bytes,offsets[i],lengths[i]))return Status::InvalidArgument("source outside registered HBM");
-  s=detail::Exporter::Ready(stream);if(!s.ok())return s;
-  auto& b=impl_->batch;b={impl_->ticket.source_id,impl_->ticket.epoch,++impl_->sequence,{},lengths};
-  for(auto offset:offsets)b.source_addresses.push_back(impl_->exporter->descriptor.base+offset);
-  impl_->identity_only=false;impl_->frozen=true;impl_->state=hr::State::Ready;impl_->submitted.clear();*out=b;return Status::OK();
-}
 Status NpuPullHbmSource::Ready(ReadyToken* out) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto status=impl_->Device();if(!status.ok())return status;
   if(!out || !impl_->confirmed) return Status::InvalidState("attach reader before Ready");
-  if(impl_->frozen && !impl_->identity_only) return Status::Busy("legacy HBM batch remains frozen");
   if(!impl_->frozen) {
     if(impl_->sequence==UINT64_MAX) return Status::InvalidState("HBM sequence exhausted");
-    ++impl_->sequence;impl_->identity_only=true;impl_->frozen=true;
-    impl_->batch={};impl_->state=hr::State::Ready;impl_->submitted.clear();
+    ++impl_->sequence;impl_->frozen=true;impl_->state=hr::State::Ready;
   }
   *out={NpuPullSourceDesc{impl_->ticket.source_id,impl_->input.bytes,impl_->ticket.epoch},impl_->sequence};
   return Status::OK();
 }
-Status NpuPullHbmSource::FinishBatch(const ReadyToken* token,bool cancel){
+Status NpuPullHbmSource::FinishBatch(const ReadyToken& token,bool cancel){
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if(token) {
-    const auto* source=std::get_if<NpuPullSourceDesc>(&token->source);
+  {
+    const auto* source=std::get_if<NpuPullSourceDesc>(&token.source);
     const NpuPullSourceDesc own{impl_->ticket.source_id,impl_->input.bytes,impl_->ticket.epoch};
-    if(!source || !SameSource(*source,own) || !token->sequence || token->sequence!=impl_->sequence)
+    if(!source || !SameSource(*source,own) || !token.sequence || token.sequence!=impl_->sequence)
       return Status::InvalidArgument("stale NPU Pull batch identity");
   }
   if(!impl_->frozen)return Status::OK();
@@ -235,10 +205,8 @@ Status NpuPullHbmSource::FinishBatch(const ReadyToken* token,bool cancel){
     return Status::Busy("HBM batch cannot be released/cancelled in its current state");
   impl_->frozen=false;impl_->state=hr::State::Connected;return Status::OK();
 }
-Status NpuPullHbmSource::ReleaseBatch(){return FinishBatch(nullptr,false);}
-Status NpuPullHbmSource::CancelBatch(){return FinishBatch(nullptr,true);}
-Status NpuPullHbmSource::ReleaseBatch(const ReadyToken& t){return FinishBatch(&t,false);}
-Status NpuPullHbmSource::CancelBatch(const ReadyToken& t){return FinishBatch(&t,true);}
+Status NpuPullHbmSource::ReleaseBatch(const ReadyToken& t){return FinishBatch(t,false);}
+Status NpuPullHbmSource::CancelBatch(const ReadyToken& t){return FinishBatch(t,true);}
 Status NpuPullHbmSource::Shutdown(){
   {std::lock_guard<std::mutex> lock(impl_->mutex);
    if(impl_->client || impl_->frozen)return Status::Busy("detach A and release HBM batch before shutdown");

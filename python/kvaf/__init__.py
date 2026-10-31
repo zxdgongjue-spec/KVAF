@@ -43,21 +43,9 @@ if hasattr(_native, "NpuRuntime"):
         "DeviceAccessTable",
     ]
 
-if hasattr(_native, "OffloadRuntime"):
-    OffloadRuntime = _native.OffloadRuntime
-    __all__.append("OffloadRuntime")
-
 if hasattr(_native, "AclGraph"):
     AclGraph = _native.AclGraph
     __all__.append("AclGraph")
-
-if hasattr(_native, "HbmSource"):
-    HbmSource = _native.HbmSource
-    __all__.append("HbmSource")
-
-if hasattr(_native, "HbmReadSource"):
-    HbmReadSource = _native.HbmReadSource
-    __all__.append("HbmReadSource")
 
 for _name in ("CpuPullSourceDesc", "NpuPullSourceDesc", "ReadyToken", "CpuPullState",
               "CpuPullSourceHandle", "PutEntry", "PutHandle", "CpuPullTask",

@@ -144,7 +144,7 @@ NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数
 
 NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。接口执行期间不得修改或释放它们。Python 绑定保留三数组、output 和 stream 的强引用，正常完成或恢复确认资源安全后释放；如果 `pending_raw_addr` 为真，应用仍不得修改或复用这些存储。C++ 调用者自行保持存储有效。NPU 元数据内容校验失败时不会发 READ，KVAF 取消已获取的批次；生产端释放该批次后才能发布新的 ReadyToken 重试。
 
-应用不再逐段创建对象，原 READ 的 WQE 编码、多 Jetty 调度及 CQ 处理规则保持不变。旧 `ready_batch + output_offsets` 重载仍兼容原来的 Host 元数据路径。
+应用不再逐段创建对象，原 READ 的 WQE 编码、多 Jetty 调度及 CQ 处理规则保持不变。公开入口只保留 NPU Tensor 三数组形式；建链探测内部保留专用 Host 描述符路径。
 
 CPU Pull 的地址转换为：
 
@@ -193,7 +193,7 @@ NPU 源不提前绑定 B 的目标 HBM，是因为 `batch_get_raw_addr()` 每次
 
 ## 6. 初始化接口
 
-下表列出本次新增、调整和更名后的接口。旧类名和带范围的旧调用形式保留为兼容入口。
+下表列出当前接口。旧类名、带范围的 Ready 以及旧 raw READ 重载已删除。
 
 | 调用方 | 接口 | 返回与作用 | 变更 |
 |---|---|---|---|
@@ -477,17 +477,28 @@ NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是
 | CPU 目的地址必须落在 slot 起点 | 支持本次预留有效范围内的拆分和槽内偏移，保持覆盖、归属及不重叠检查 |
 | batch_get_raw_addr 的源地址列表来自 Ready batch | 扩展入口由 B 提供三个连续、等长数组，保留原算子和通信实现 |
 
-CPU Pull 控制协议 KVRP 升级为 v3，NPU 直读控制协议 KVHR 升级为 v3。CPU service 和两个 NPU 应用需要同时重新编译升级；协议版本不符时拒绝通信。升级后的端点仍支持旧的带范围 Ready 和便利接口。独立 OffloadRuntime 使用的 KVOF v2 保持不变。
+CPU Pull 控制协议 KVRP 与 NPU 直读控制协议 KVHR 均使用 v4。CPU service 和两个 NPU 应用需要同时重新编译、重启；协议版本不符时拒绝通信。Ready 只发布源身份和批次号。
 
-现有 `offload_from()` 保留为便利接口，内部复用：
+已删除：旧类名别名、`ready(offsets, lengths, stream)`、无 token 的 release/cancel、`offload_from()`、`offload()`、`resolve_offload()`、`release_offload_source()`、旧 raw READ 重载、独立 OffloadRuntime 及 KVOF 服务。
 
-```text
-prepare_put → 内部组织三个连续数组 → submit_cpu_pull → wait_cpu_pull → commit_put
+本卡便利入口为：
+
+```python
+runtime.batch_cpu_pull(keys, source, input_offsets, lengths, stream=None)
 ```
 
-兼容层继续从原有携带 input_offsets/lengths 的请求中取得读取范围，再适配为三个连续数组。新的 ReadyToken 不包含范围，不能仅凭 `offload_from(keys, new_ready_token)` 推导源位置和长度。Connector 的新调用直接使用本文拆分接口。
+该接口与 `batch_put()` 一样同步调用，成功返回 `None`，表示数据搬运及元数据提交完成；失败抛异常，不返回任务句柄。内部使用同一组新事务接口：
 
-本次接口重构保留了已验证的 CPU 四 Jetty READ 调度和 raw-address 算子，也保留了 CPU 与 NPU 各自的 MR、Jetty 和 TP 资源实例。
+```text
+PreparePut → 注册/复用本卡 HBM → 等待生产 stream → Ready
+→ 计算 DDR 目的偏移 → SubmitCpuPull → WaitCpuPull → CommitPut → ReleaseBatch
+```
+
+参数契约与 BatchPut 一致：source 为 Runtime 所在卡的连续 Tensor；keys、input_offsets、lengths 是 Host 整数序列或连续一维 CPU int64 Tensor，偏移和长度以字节计。源和每个目标槽位必须容纳对应数据。HBM 注册缓存到切换 source 或 shutdown；Python 保留 Tensor 引用。手动配置 `npu_eids` 时，本卡便利入口使用首个 EID；为空时自动探测 CPU↔本卡路由。
+
+同参数再次调用表示新批次，不表示恢复。若 key 尚未释放，会像 BatchPut 一样拒绝重复分配。明确失败时内部 Abort；若 DMA 状态不确定，保留源/槽位、拒绝新操作，`shutdown()` 查询原任务并在确认完成后清理，绝不重发 READ。若元数据已 Commit 但 CPU 确认丢失，保持原 Commit 决定并补确认；不能反向 Abort。shutdown 未成功前继续保留相关存储。
+
+跨卡 Connector 继续使用显式 PreparePut/Submit/Wait/Commit/Abort；它们的 task/put 恢复机制不变。CPU 四 Jetty READ 调度和 raw READ V2 算子保持原有数据面实现，各条路径仍持有各自的 MR、Jetty、TP。
 
 ## 12. 第一版范围
 
@@ -504,14 +515,14 @@ prepare_put → 内部组织三个连续数组 → submit_cpu_pull → wait_cpu_
 ### 13.1 Python 返回值与恢复入口
 
 - `cpu_source.register(...)` 返回 `CpuPullSourceDesc`，由源端 Connector 发给读取端。
-- `source.ready()` 返回 `ReadyToken`；应用调用前同步生产 stream。旧 `ready(offsets, lengths, stream)` 仍返回原字典结构，并保留原有范围校验。
+- `source.ready()` 返回 `ReadyToken`；应用调用前同步生产 stream。
 - `prepare_put(...)` 返回 `PutHandle`：`entries` 提供只读的 `key/address/length`，`state` 提供事务状态，`task` 提供关联任务。
 - `submit_cpu_pull(...)` 返回 `CpuPullTask`。若响应丢失而抛出异常，通过 `put.task` 取回原任务；`put.task.valid` 表示是否已建立任务上下文。不得重新 PreparePut 来替代未决任务。
 - `query_cpu_pull(task)` 返回 `CpuPullState`；`wait_cpu_pull(task, timeout=30000)` 的 timeout 单位为毫秒，成功返回 `DONE` 或已提交的 `COMMITTED`，不会自动 Commit。
 - `commit_put(put)` 返回 `COMMITTED`，`abort_put(put)` 返回 `ABORTED`。提交响应丢失后重试原 commit，不能反向 Abort。PreparePut 后尚未提交任务时，可以直接 Abort。
 - 新 `batch_get_raw_addr(...)` 成功返回 `{"state": "done", "sequence": ready.sequence}`，实际数据直接写入 output。其未决恢复继续使用 `resolve_raw_addr(hbm_link)`，不会重发 READ。
 
-新事务使用 `query_cpu_pull`、`wait_cpu_pull`、`commit_put`、`abort_put` 恢复；`resolve_offload()` 保留给旧同步便利接口。当前版本从 PreparePut 起保护这笔事务，完成或撤销前会拒绝同一 Runtime 的其他 DDR 访问操作。
+显式事务使用 `query_cpu_pull`、`wait_cpu_pull`、`commit_put`、`abort_put` 恢复。本卡 `batch_cpu_pull()` 内部管理事务，异常清理由 `shutdown()` 处理。当前版本从 PreparePut 起保护这笔事务，完成或撤销前会拒绝同一 Runtime 的其他 DDR 访问操作。
 
 如果提交前的参数校验失败，`put.task.valid` 为 false，可以修正数组后继续提交，或撤销 put。若任务已经建立，使用原句柄查询：`DONE` 可提交或撤销，`FAILED` 可撤销，`RUNNING` / `IN_DOUBT` 保留资源。未成功通知 CPU 的失败可能仍让生产批次处于 Ready，应用协调源端调用 `cancel_batch(ready)`；源端会拒绝取消已被获取的批次。
 
@@ -519,11 +530,11 @@ C++ 的共享类型与数组视图在 `common/include/connector_types.h`，事�
 
 ### 13.2 硬件验收入口
 
-继续使用现有构建选项和 CPU service，重新构建并重启两端程序后，在原双卡验收命令中增加 `--connector-api`：
+继续使用现有构建选项，重新构建并重启两端程序。脚本现在默认只使用新接口，已移除 `--connector-api` 开关：
 
 ```bash
 python tests/python/test_remote_cpu_offload.py \
-  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --connector-api
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7
 
 python tests/python/test_hbm_read_raw_addr.py \
   --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
@@ -531,12 +542,11 @@ python tests/python/test_hbm_read_raw_addr.py \
   --npu-eid-b-raw 000000000047050000100000df00f807 \
   --batch-get-kernel build-shared-ddr/bin/kvaf_execute_batch_get_kernels.o \
   --batch-put-kernel build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o \
-  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o \
-  --connector-api
+  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
 上述 EID/设备对应此前同机验收配置，构建目录按实际路径替换。两个旧测试脚本的参数名称继续沿用 **device-a 为读取端、device-b 为生产端**，与本文设计中的 A/B 角色命名相反。
 
-CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checksum 和批次复用确认。组合验收同时覆盖共享 DDR 的普通 BatchPut/BatchGet、CPU Pull 和三数组 NPU 直读，包括非页对齐源、输出间隔及 NPU 消费者校验。去掉 `--connector-api` 可以继续验收旧接口兼容性。
+CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checksum 和批次复用确认。组合验收同时覆盖共享 DDR 的普通 BatchPut/BatchGet、CPU Pull 和三数组 NPU 直读，包括非页对齐源、输出间隔及 NPU 消费者校验。本卡便利入口另外通过 `python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7` 验证；该脚本无需 AIV 算子。
 
 需要同时重新编译 NPU 运行库和 raw-address kernel object。当前入口为 `KvafExecuteBatchGetRawAddrAivKernelV2`，使用扩展的参数与最终状态 ABI；旧 V1 object 会拒绝加载。已删除独立准备算子及其状态 ABI。

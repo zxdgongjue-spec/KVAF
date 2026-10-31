@@ -9,7 +9,6 @@
 #include "requests.h"
 #include "status.h"
 #include "types.h"
-#include "remote_offload_types.h"
 #include "connector_types.h"
 
 namespace kvaf::peer {
@@ -27,16 +26,6 @@ struct BatchPutExecRequest {
   BatchPutExecutionOptions execution;
 };
 
-struct OffloadExecRequest {
-  const BatchPutRequest* request{nullptr};
-  const PutAccessDesc* put_desc{nullptr};
-  OffloadExecutionOptions execution;
-};
-struct RemoteOffloadExecRequest {
-  const RemoteOffloadRequest* request{};
-  const PutAccessDesc* put_desc{};
-};
-
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
 // 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
 class AccessOperator {
@@ -50,16 +39,6 @@ class AccessOperator {
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
-  // A non-InDoubt failure guarantees no DMA can still access either buffer.
-  virtual Status ExecuteOffload(const OffloadExecRequest&) {
-    return Status::NotImplemented("Offload is unavailable on this operator");
-  }
-  virtual Status ResolveOffload() {
-    return Status::NotImplemented("Offload recovery is unavailable");
-  }
-  virtual Status ExecuteRemoteOffload(const RemoteOffloadExecRequest&) {
-    return Status::NotImplemented("Remote source Offload is unavailable");
-  }
   // Called after metadata commits/aborts. A remote producer can reuse its
   // frozen batch only after this decision is acknowledged by the CPU.
   virtual Status CompleteOffload(bool) { return Status::OK(); }
@@ -73,8 +52,6 @@ class AccessOperator {
   virtual Status QueryCpuPull(CpuPullState*) {
     return Status::NotImplemented("CPU Pull query is unavailable");
   }
-  virtual std::uint32_t CpuPullTimeoutMs() const { return 30000; }
-
 };
 
 // Configuration for the current NPU-backed default implementation. Transport

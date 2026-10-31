@@ -252,10 +252,12 @@ class NpuPythonRuntime final {
   }
 
   ~NpuPythonRuntime() {
-    if (!native_->Shutdown().ok()) (void)raw_retained_.release();
+    if (!native_->Shutdown().ok()) {
+      (void)raw_retained_.release();
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-    if (!native_->Shutdown().ok()) (void)local_source_.release();
+      (void)local_sources_.release();
 #endif
+    }
   }
 
   void LinkTo(std::string address) {
@@ -267,13 +269,12 @@ class NpuPythonRuntime final {
   }
 
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  void Offload(const py::object& keys, py::object source, const py::object& offsets,
-               const py::object& lengths, const py::object& stream) {
-    if (native_->pending_offload()) throw py::value_error("resolve previous Offload first");
+  void BatchCpuPull(const py::object& keys, py::object source, const py::object& offsets,
+                    const py::object& lengths, const py::object& stream) {
+    if (native_->pending_offload()) throw py::value_error("finish the existing transaction or shutdown the unresolved batch_cpu_pull");
     const auto view = GetNpuTensorView(source, "source");
     if (source.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("source is on another NPU; use HbmSource and offload_from");
-    if (!local_source_.is_none() && !local_source_.is(source)) ReleaseOffloadSource();
+      throw py::value_error("batch_cpu_pull requires local HBM; use CpuPullHbmSource and submit_cpu_pull for another NPU");
     BatchPutRequest request; request.keys = CopyPrepareKeys(keys);
     CopyCpuUint64SequenceInto(offsets, "input_offsets", &request.input_offsets);
     CopyCpuUint64SequenceInto(lengths, "lengths", &request.lengths);
@@ -282,17 +283,16 @@ class NpuPythonRuntime final {
     if (!stream.is_none() && py::hasattr(stream, "device") &&
         stream.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
       throw py::value_error("producer stream belongs to another NPU");
-    local_source_ = source;
-    ThrowIfError(native_->Offload(request, {producer}));
+    bool retained = false;
+    for (auto item : local_sources_) if (item.is(source)) retained = true;
+    if (!retained) local_sources_.append(source);
+    const auto status = native_->BatchCpuPull(request, {producer});
+    if (status.ok()) { local_sources_ = py::list(); local_sources_.append(source); }
+    ThrowIfError(status);
   }
-  void ReleaseOffloadSource() { ThrowIfError(native_->ReleaseOffloadSource()); local_source_ = py::none(); }
   py::dict OffloadRegion() const {
     OffloadRegionTicket ticket; ThrowIfError(native_->GetOffloadRegion(&ticket)); return remote_python::Pack(ticket);
   }
-  void OffloadFrom(const py::object& keys, const py::dict& batch) {
-    ThrowIfError(native_->OffloadFrom(CopyPrepareKeys(keys), remote_python::Batch(batch)));
-  }
-  void ResolveOffload() { ThrowIfError(native_->ResolveOffload()); }
   CpuPullSourceHandle AttachCpuSource(const CpuPullSourceDesc& source) {
     CpuPullSourceHandle result; ThrowIfError(native_->AttachCpuSource(source,&result)); return result;
   }
@@ -331,25 +331,6 @@ class NpuPythonRuntime final {
     auto status = native_->AttachHbm(address, hbm_read_python::Ticket(ticket), &region, eid);
     if (!status.ok()) throw std::runtime_error(status.message() + "; region=" + std::to_string(region));
     return region;
-  }
-  void BatchGetRawAddr(LinkId region, const py::dict& batch, py::object output,
-                       const py::object& output_offsets, py::object stream) {
-    if (native_->pending_raw_addr()) throw py::value_error("resolve the pending raw READ first");
-    const auto view = GetNpuTensorView(output, "output");
-    if (output.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("raw READ output belongs to another NPU");
-    std::vector<std::uint64_t> offsets;
-    CopyCpuUint64SequenceInto(output_offsets, "output_offsets", &offsets);
-    const auto ready = hbm_read_python::Batch(batch);
-    if (stream.is_none()) stream = py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
-    if (py::hasattr(stream, "device") && stream.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("raw READ stream belongs to another NPU");
-    const auto acl_stream = acl_python::StreamFromPython(stream);
-    raw_retained_ = py::make_tuple(output, stream);
-    const auto status = native_->BatchGetRawAddr(region, ready,
-        {const_cast<void*>(view.data), view.bytes, DeviceKind::kNpu}, offsets, acl_stream);
-    if (!native_->pending_raw_addr()) raw_retained_ = py::none();
-    ThrowIfError(status);
   }
   void ResolveRawAddr(LinkId region) {
     const auto status = native_->ResolveRawAddr(region);
@@ -650,7 +631,7 @@ class NpuPythonRuntime final {
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-    local_source_ = py::none();
+    local_sources_ = py::list();
 #endif
   }
 
@@ -658,7 +639,7 @@ class NpuPythonRuntime final {
   py::object raw_retained_{py::none()};
   std::unique_ptr<::kvaf::NpuRuntime> native_;
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  py::object local_source_{py::none()};
+  py::list local_sources_;
 #endif
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
@@ -700,18 +681,16 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("hbm_link"),py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none())
-      .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawAddr,
-           py::arg("region"), py::arg("ready_batch"), py::arg("output"), py::arg("output_offsets"), py::arg("stream") = py::none(),
-           "Synchronously READ B HBM into A output using explicit addresses and byte lengths; no AccessTable.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("region"))
       .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("region"))
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-      .def("offload", &NpuPythonRuntime::Offload, py::arg("keys"), py::arg("source"),
-           py::arg("input_offsets"), py::arg("lengths"), py::arg("stream") = py::none())
-      .def("release_offload_source", &NpuPythonRuntime::ReleaseOffloadSource)
+      .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("source"),
+           py::arg("input_offsets"), py::arg("lengths"), py::arg("stream") = py::none(),
+           "Synchronously pull local NPU HBM into MetaManager-allocated DDR slots and commit. "
+           "Returns None on success. On unresolved failure retain source data and call shutdown(); "
+           "calling batch_cpu_pull again never resumes or resubmits a pending operation.")
       .def("offload_region", &NpuPythonRuntime::OffloadRegion)
-      .def("offload_from", &NpuPythonRuntime::OffloadFrom, py::arg("keys"), py::arg("ready_batch"))
       .def("attach_cpu_source",&NpuPythonRuntime::AttachCpuSource,py::arg("source_desc"))
       .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
       .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("source_handle"),py::arg("ready"),py::arg("put"),
@@ -721,7 +700,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Wait for DMA only; timeout is in milliseconds. Commit explicitly afterward.")
       .def("commit_put",&NpuPythonRuntime::CommitPut,py::arg("put"))
       .def("abort_put",&NpuPythonRuntime::AbortPut,py::arg("put"))
-      .def("resolve_offload", &NpuPythonRuntime::ResolveOffload)
       .def("last_offload_checksum", &NpuPythonRuntime::LastChecksum,
            "Hash current CPU DDR via a separate RPC after offload. Call before freeing or "
            "overwriting the destination slots, the source's next ready(), or source shutdown.")

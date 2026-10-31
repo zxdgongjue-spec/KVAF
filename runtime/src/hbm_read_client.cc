@@ -88,7 +88,7 @@ struct Engine {
     }
     return scratch.Free();
   }
-  Status Run(const std::vector<hr::Span>& spans,MutableBufferView output,void* stream) {
+  Status RunProbe(const std::vector<hr::Span>& spans,MutableBufferView output,void* stream) {
     if(!transport || !stream || uncertain || local || descriptors.data || statuses.data)
       return Status::InvalidState("raw READ engine is not idle");
     std::vector<std::uint64_t> src,dst;std::vector<std::uint32_t> sizes;
@@ -257,7 +257,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
         auto base=reinterpret_cast<std::uint64_t>(c.engine.scratch.data);
         std::vector<hr::Span> probe;
         for(std::uint32_t i=0;i<rows;++i)probe.push_back({c.link->endpoint.base,base+i*bytes,bytes});
-        s=c.engine.Run(probe,{c.engine.scratch.data,c.engine.scratch.bytes,DeviceKind::kNpu},stream);
+        s=c.engine.RunProbe(probe,{c.engine.scratch.data,c.engine.scratch.bytes,DeviceKind::kNpu},stream);
         if(s.ok()) {
           std::vector<std::uint8_t> result(rows*bytes);
           if(aclrtMemcpy(result.data(),result.size(),c.engine.scratch.data,result.size(),ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
@@ -294,38 +294,6 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
     if(!cleanup.ok())return Status::InDoubt("HBM attach cleanup pending; region="+std::to_string(*out)+"; "+cleanup.message());
   }
   return s;
-}
-Status HbmReader::Read(LinkId id,const HbmReadBatch& b,MutableBufferView output,
-                       const std::vector<std::uint64_t>& offsets,void* stream,bool identity_only) {
-  auto s=impl_->Device();if(!s.ok())return s;
-  auto it=impl_->connections.find(id);if(it==impl_->connections.end())return Status::NotFound("HBM reader region not found");
-  auto& c=*it->second;
-  if(!c.ready || c.pending!=Pending::None)return Status::Busy("raw READ region not ready or has unresolved work");
-  auto base=reinterpret_cast<std::uint64_t>(output.data);
-  if(!output.valid() || output.device!=DeviceKind::kNpu || !stream || output.bytes>UINT64_MAX-base ||
-      b.source_id!=c.link->ticket.source_id || b.epoch!=c.link->ticket.epoch || !b.sequence || b.sequence<=c.last_sequence ||
-      b.lengths.empty() || b.lengths.size()>offload::kMaxSpans || b.source_addresses.size()!=b.lengths.size() || offsets.size()!=b.lengths.size())
-    return Status::InvalidArgument("invalid raw READ identity, sequence or output");
-  std::vector<hr::Span> spans,relative;
-  std::size_t wqes=0;
-  for(size_t i=0;i<offsets.size();++i) {
-    auto src=b.source_addresses[i],n=b.lengths[i];
-    if(src<c.link->endpoint.base || !offload::Contains(c.link->endpoint.bytes,src-c.link->endpoint.base,n) ||
-       !offload::Contains(output.bytes,offsets[i],n))return Status::InvalidArgument("raw READ outside source/destination registration");
-    auto count=n/65536+(n%65536!=0);if(count>kMaxWqes-wqes)return Status::InvalidArgument("too many raw READ WQEs");wqes+=count;
-    spans.push_back({src,base+offsets[i],n});relative.push_back({src-c.link->endpoint.base,offsets[i],n});
-  }
-  if(!offload::ValidateSpans(relative,c.link->endpoint.bytes,output.bytes))return Status::InvalidArgument("raw READ destinations overlap");
-  c.sequence=b.sequence;c.pending=Pending::Acquire;c.result=Status::OK();
-  hr::Response response{};s=c.link->Call(identity_only?hr::Command::AcquireRaw:hr::Command::Acquire,spans,&response,b.sequence);
-  if(!s.ok()) {
-    if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;
-    return s;
-  }
-  c.pending=Pending::Dma;s=c.engine.Run(spans,output,stream);
-  if(c.engine.uncertain)return s;
-  c.result=s;c.pending=Pending::Cleanup;
-  return c.Resolve();
 }
 Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
                        NpuInt64ArrayView lengths,MutableBufferView output,void* stream) {

@@ -486,10 +486,6 @@ class CpuService {
              bool device_filter_applied)
       : resource_pool_(resource_pool), memory_page_mode_(memory_page_mode),
         device_filter_applied_(device_filter_applied),
-        pull_service_([resource_pool](std::uint32_t candidate) {
-          auto* resources = resource_pool->Get(candidate);
-          return offload::CreateUrmaBackend(resources ? resources->context() : nullptr);
-        }),
         remote_pull_service_(
           [this](std::uint64_t id, remote_pull::RegionInfo* info) { return DescribeRegion(id, info); },
           [this](const remote_pull::RegionInfo& info) -> std::unique_ptr<offload::Backend> {
@@ -503,12 +499,9 @@ class CpuService {
       if (!epoch_) epoch_ = 1;
     }
   ~CpuService() { ReleaseAll(); }
-  void ServePull(int fd, const MessageHeader& header) { pull_service_.Serve(fd, header); }
   void ServeRemotePull(int fd, const MessageHeader& header) { remote_pull_service_.Serve(fd, header); }
   Status ShutdownPull() {
     auto status = remote_pull_service_.Shutdown();
-    if (!status.ok()) return status;
-    status = pull_service_.Shutdown();
     if (!status.ok()) return status;
     return ReleaseAll() ? Status::OK() : Status::InDoubt("CPU DDR teardown incomplete; retain contexts");
   }
@@ -879,7 +872,6 @@ class CpuService {
   std::uint64_t epoch_{};
   std::unordered_map<uint64_t, std::shared_ptr<Region>> regions_;
   std::vector<std::shared_ptr<Region>> quarantined_regions_;
-  offload::Service pull_service_;
   remote_pull::Service remote_pull_service_;
 };
 
@@ -895,7 +887,6 @@ void HandleClient(int fd, CpuService* service) {
   MessageHeader header{};
   if (!ReadAll(fd, &header, sizeof(header))) return;
   if (header.magic == remote_pull::kMagic) { service->ServeRemotePull(fd, header); return; }
-  if (header.magic == offload::kMagic) { service->ServePull(fd, header); return; }
   if (header.magic != kvaf::peer::kProtocolMagic ||
       header.version != kvaf::peer::kProtocolVersion) {
     return;

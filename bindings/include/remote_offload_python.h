@@ -25,18 +25,4 @@ inline OffloadRegionTicket Ticket(const py::dict& d) {
   if (eid.size() != 16) throw py::value_error("DDR ticket EID must contain 16 bytes");
   std::copy(eid.begin(), eid.end(), t.region.eid); return t;
 }
-inline py::dict Pack(const HbmReadyBatch& b) {
-  py::dict d;
-  d["version"] = 1; d["epoch"] = b.source.region_epoch; d["region_id"] = b.source.region_id;
-  d["source_id"] = b.source.source_id; d["sequence"] = b.source.sequence;
-  d["source_bytes"] = b.source.source_bytes;
-  d["input_offsets"] = b.input_offsets; d["lengths"] = b.lengths; return d;
-}
-inline HbmReadyBatch Batch(const py::dict& d) {
-  if (d["version"].cast<int>() != 1) throw py::value_error("unsupported HBM batch version");
-  return {{d["epoch"].cast<std::uint64_t>(), d["region_id"].cast<std::uint64_t>(),
-           d["source_id"].cast<std::uint64_t>(), d["sequence"].cast<std::uint64_t>(),
-           d["source_bytes"].cast<std::uint64_t>()},
-          d["input_offsets"].cast<std::vector<std::uint64_t>>(), d["lengths"].cast<std::vector<std::uint64_t>>()};
-}
 }
