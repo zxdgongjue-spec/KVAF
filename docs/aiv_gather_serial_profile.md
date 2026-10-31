@@ -14,6 +14,8 @@ REQUEST_COUNT = 8193   # 每批有效请求数：可改为 1024 / 8193 / 65536
 WARMUP = 20            # 不计入结果的预热次数
 ITERATIONS = 100       # 关闭 profile 的端到端性能采样次数，0 可跳过
 PROFILE_SAMPLES = 10   # 开启 profile 的阶段诊断采样次数
+CSV_OUTPUT_DIR = "gather-perf-results"  # 相对执行命令时的工作目录
+RUN_LABEL = "serial"   # 手工标注串行 / chunk 流水等对照版本
 ```
 
 请求数、token 长度、预热和采样次数不需要新增启动参数。核数仍通过
@@ -23,6 +25,37 @@ token 数、SGL 和随机种子；比较不同实现时保持这些值一致。
 `PROFILE_CLOCK_MHZ` 默认不填，只输出 AIV 原始 cycle。确认部署平台的
 `GetSystemCycle()` 计数器频率后才填写 MHz，脚本再额外换算微秒；不能将
 AI Core 主频或某个固定默认值直接作为该频率。
+
+## CSV 输出与后续对比
+
+每次运行结束自动保存四份 CSV，并打印 `GATHER_CSV_FILE path=...` 的绝对
+路径。文件名包含 UTC 时间和随机 run_id，重复运行不会覆盖旧数据。CSV
+使用 UTF-8 BOM，可直接在 Excel 中导入。默认结果目录不进入 Git。
+
+| 文件后缀 | 内容 |
+| --- | --- |
+| `_summary.csv` | 本轮汇总，通常先看这一份 |
+| `_e2e.csv` | 关闭 AIV/Host 打点的逐次端到端样本 |
+| `_profile_host.csv` | 开启打点后的逐次 Host 时间、外层调用时间和 sequence |
+| `_profile_core.csv` | 每次采样、每个核的原始时间戳、六段耗时和计数 |
+
+四份文件均包含配置和 run_id：label、代码 revision/dirty、设备/核数、请求数、
+token 字节数、SGL、表规模、seed、预热/采样次数、计数器频率、kernel 路径
+和 CPU 服务地址。远端 CPU 日志开关仍记作 external，不假定它已经关闭。
+
+summary 按 `row_kind` 区分：`e2e_summary` 是无打点性能基线，
+`profile_e2e_summary` 是有打点、同口径的外层调用统计，另有
+`profile_host_mean` 和各核的 `profile_core_mean`。通过 run_label、cores、
+request_count、token_bytes 等列筛选对照，避免把不同核或不同采集口径相加。
+
+Host 同时保存原始 ns 与 us；AIV 始终保存原始 cycle 和差值，频率未核实
+时 AIV 的 `_us` 列留空。CSV I/O 在测量循环之外进行，不计入样本时间。
+开启打点时的外层调用计时包含本次同步和状态/profile D2H，快照的 Python
+复制在调用计时之外，便于与无打点组比较。
+
+如果采样中途报错，已完成的样本仍会输出，summary 的 `sampling_status`
+行为 failed 并保留异常；没有采到的阶段文件只有表头，不伪造零耗时样本。
+sampling_status 只描述采样阶段，随后 Runtime shutdown 的异常仍单独报告。
 
 ## 构建与运行
 

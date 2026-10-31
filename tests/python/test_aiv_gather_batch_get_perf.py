@@ -19,14 +19,21 @@ GATHER_SGL_SIZE = 6
 SEED = 20261030
 PROFILE_CLOCK_MHZ = None        # Set only after verifying GetSystemCycle frequency.
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
+CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
+RUN_LABEL = "serial"            # Change to identify later pipeline versions.
 # ---------------------------------------------------------------------------
 
+import csv
 import math
 import os
 import statistics
+import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
 
 from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
 
@@ -83,6 +90,10 @@ def validate_config(cores: int) -> None:
         or PROFILE_CLOCK_MHZ <= 0
     ):
         raise ValueError("PROFILE_CLOCK_MHZ must be None or a verified positive frequency")
+    if not isinstance(CSV_OUTPUT_DIR, str) or not CSV_OUTPUT_DIR.strip():
+        raise ValueError("CSV_OUTPUT_DIR must be a non-empty directory path")
+    if not isinstance(RUN_LABEL, str):
+        raise ValueError("RUN_LABEL must be a string")
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -172,6 +183,127 @@ def print_profiles(samples: list[dict[str, object]], cores: int) -> None:
         print("GATHER_PROFILE_CORE " + " ".join(fields))
 
 
+def latency_summary(samples_us: Sequence[float], payload_bytes: int) -> dict[str, float]:
+    mean_us = statistics.mean(samples_us)
+    return {
+        "mean_us": mean_us, "p50_us": percentile(samples_us, 0.50),
+        "p95_us": percentile(samples_us, 0.95), "p99_us": percentile(samples_us, 0.99),
+        "useful_GiBps": payload_bytes / (mean_us / 1e6) / 1024**3,
+    }
+
+
+def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    revision, dirty = "", "unknown"
+    try:
+        repo = Path(__file__).resolve().parents[2]
+        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                                cwd=repo, check=True, capture_output=True, text=True).stdout
+        dirty = int(bool(status.strip()))
+    except (OSError, subprocess.CalledProcessError):
+        pass  # A deployed source bundle need not contain .git.
+    return {
+        "schema_version": 1,
+        "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
+        "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
+        "git_revision": revision, "git_dirty": dirty,
+        "mode": "gather_read", "device_id": device_id, "cores": cores,
+        "token_bytes": TOKEN_BYTES, "request_count": REQUEST_COUNT,
+        "payload_bytes": REQUEST_COUNT * TOKEN_BYTES, "table_capacity": TABLE_CAPACITY,
+        "tokens_per_block": TOKENS_PER_BLOCK, "sgl": GATHER_SGL_SIZE, "seed": SEED,
+        "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
+        "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
+        "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
+        "cpu_profile": "external", "kernel_path": kernel, "put_kernel_path": put_kernel,
+        "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR", ""),
+        "request_plan": "fixed_random", "timing_contract": "synchronous_call_with_status_check",
+    }
+
+
+def export_csv_results(
+    directory: str | Path, metadata: Mapping[str, object], samples_us: Sequence[float],
+    snapshots: Sequence[Mapping[str, object]], profile_calls_us: Sequence[float],
+    error: BaseException | None = None,
+) -> list[Path]:
+    """Write only outside measured loops; preserve completed samples on failure.
+
+    All four files share run_id/config columns. Host and AIV rows are separate
+    so multi-core rows cannot accidentally multiply the Host time in a sum.
+    """
+    if len(snapshots) != len(profile_calls_us):
+        raise ValueError("profile snapshots and synchronous call samples must match")
+    cores, requests = int(metadata["cores"]), int(metadata["request_count"])
+    host_mean, core_means = summarize_profiles(snapshots, cores, requests) if snapshots else ({}, [])
+    clock = metadata["clock_mhz"]
+    stages = [name for name, _, _ in STAGE_BOUNDARIES]
+    boundaries = [STAGE_BOUNDARIES[0][1]] + [end for _, _, end in STAGE_BOUNDARIES[:-1]]
+    host_columns = [*HOST_FIELDS, *(field.removesuffix("_ns") + "_us" for field in HOST_FIELDS)]
+    core_columns = ["requests", *boundaries, *(name + "_cycles" for name in stages),
+                    *(name + "_us" for name in stages), *COUNTERS]
+
+    def core_fields(lane: Mapping[str, object], mean: bool = False) -> dict[str, object]:
+        row = {"requests": lane["requests"], **{key: lane.get(key, 0) for key in COUNTERS}}
+        if not mean:
+            row.update({key: lane[key] for key in boundaries})
+        for name, begin, end in STAGE_BOUNDARIES:
+            cycles = lane[name] if mean else int(lane[end]) - int(lane[begin])
+            row[name + "_cycles"] = cycles
+            row[name + "_us"] = cycles / float(clock) if clock != "" else ""
+        return row
+
+    def host_fields(host: Mapping[str, object]) -> dict[str, object]:
+        return {**host, **{field.removesuffix("_ns") + "_us": float(host[field]) / 1000
+                          for field in HOST_FIELDS}}
+
+    summary = [{"row_kind": "sampling_status", "sampling_status": "failed" if error else "complete",
+                "error_type": type(error).__name__ if error else "", "error_message": str(error) if error else ""}]
+    e2e_rows = []
+    if samples_us:
+        summary.append({"row_kind": "e2e_summary", "profile": "off", "samples": len(samples_us),
+                        **latency_summary(samples_us, int(metadata["payload_bytes"]))})
+        e2e_rows = [{"sample_index": index, "profile": "off", "e2e_us": elapsed,
+                     "useful_GiBps": int(metadata["payload_bytes"]) / (elapsed / 1e6) / 1024**3}
+                    for index, elapsed in enumerate(samples_us, 1)]
+    host_rows, core_rows = [], []
+    if snapshots:
+        sequence_range = {"first_sequence": snapshots[0]["sequence"],
+                          "last_sequence": snapshots[-1]["sequence"]}
+        summary.append({"row_kind": "profile_e2e_summary", "profile": "on", "samples": len(snapshots),
+                        **sequence_range, **latency_summary(profile_calls_us, int(metadata["payload_bytes"]))})
+        summary.append({"row_kind": "profile_host_mean", "profile": "on", "samples": len(snapshots),
+                        **sequence_range, **host_fields(host_mean)})
+        for core, lane in enumerate(core_means):
+            summary.append({"row_kind": "profile_core_mean", "profile": "on", "core": core,
+                            "samples": len(snapshots), **sequence_range, **core_fields(lane, mean=True)})
+        for index, (snapshot, elapsed) in enumerate(zip(snapshots, profile_calls_us), 1):
+            key = {"sample_index": index, "profile": "on", "sequence": snapshot["sequence"]}
+            host_rows.append({**key, "call_e2e_us": elapsed, **host_fields(snapshot["host"])})
+            for lane in snapshot["cores"]:
+                core_rows.append({**key, "core": lane["core"], **core_fields(lane)})
+    target = Path(directory).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    outputs = (
+        ("summary", ["row_kind", "sampling_status", "error_type", "error_message", "profile", "core",
+                     "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
+                     *host_columns, *core_columns], summary),
+        ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps"], e2e_rows),
+        ("profile_host", ["sample_index", "profile", "sequence", "call_e2e_us", *host_columns], host_rows),
+        ("profile_core", ["sample_index", "profile", "sequence", "core", *core_columns], core_rows),
+    )
+    paths = []
+    for name, columns, rows in outputs:
+        path = target / f"gather_{metadata['run_id']}_{name}.csv"
+        # Unique run IDs plus exclusive creation protect earlier measurements.
+        with path.open("x", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=[*metadata, *dict.fromkeys(columns)])
+            writer.writeheader()
+            writer.writerows({**metadata, **row} for row in rows)
+        paths.append(path)
+    return paths
+
+
 def token_pattern(torch, token_ids, token_bytes: int):
     """Deterministic bytes depend on the source token as well as its byte offset."""
     x = token_ids.to(torch.int64).unsqueeze(1)
@@ -220,8 +352,10 @@ def main() -> int:
         aiv_batch_get_mode="gather_read", aiv_gather_sgl_size=GATHER_SGL_SIZE,
         batch_get_max_inflight_total=0,
     )
-    runtime.link_to(endpoint)
+    metadata = csv_metadata(cores, device_id, kernel, put_kernel)
+    samples_us, snapshots, profile_calls_us = [], [], []
     try:
+        runtime.link_to(endpoint)
         print(
             f"GATHER_PERF_CONFIG mode=gather_read cores={cores} token_bytes={TOKEN_BYTES} "
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
@@ -268,7 +402,6 @@ def main() -> int:
 
         for _ in range(WARMUP):
             batch_get()
-        samples_us = []
         for _ in range(ITERATIONS):
             begin = time.perf_counter_ns()
             batch_get()
@@ -288,16 +421,32 @@ def main() -> int:
             print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={PROFILE_SAMPLES}", flush=True)
             runtime.start_gather_batch_get_profile()
             batch_get()  # Warm the profiling path; exclude this sample.
-            snapshots = []
             for _ in range(PROFILE_SAMPLES):
+                begin = time.perf_counter_ns()
                 batch_get()
+                elapsed = (time.perf_counter_ns() - begin) / 1000
                 snapshots.append(dict(runtime.gather_batch_get_profile()))
+                profile_calls_us.append(elapsed)
             runtime.stop_gather_batch_get_profile()
             print_profiles(snapshots, cores)
         return 0
     finally:
-        # Keep all request/output tensors alive through transport shutdown.
-        shutdown_runtime(runtime)
+        # CSV I/O is outside both timed groups. Preserve successful baseline or
+        # profile samples even when a later sample fails; retain the original
+        # device exception if export or shutdown fails as well.
+        original = sys.exc_info()[1]
+        try:
+            paths = export_csv_results(CSV_OUTPUT_DIR, metadata, samples_us, snapshots,
+                                       profile_calls_us, original)
+            for path in paths:
+                print(f"GATHER_CSV_FILE path={path}", flush=True)
+        except Exception as export_error:
+            if original is None:
+                raise
+            print(f"GATHER_CSV_ERROR preserving original exception: {export_error}", file=sys.stderr)
+        finally:
+            # Keep all request/output tensors alive through transport shutdown.
+            shutdown_runtime(runtime)
 
 
 if __name__ == "__main__":
