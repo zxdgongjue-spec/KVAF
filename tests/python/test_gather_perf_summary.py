@@ -199,11 +199,12 @@ class GatherPerfSummaryTest(unittest.TestCase):
                 self.assertLess(mode, columns.index("cores"))
                 if path.name == "summary.csv":
                     total = columns.index("total_us")
+                    times = [name + "_us" for name, _, _ in perf.STAGE_BOUNDARIES if name != "total"]
                     cycles = [name + "_cycles" for name, _, _ in perf.STAGE_BOUNDARIES]
-                    self.assertEqual(columns[total + 1:total + 1 + len(cycles)], cycles)
+                    self.assertEqual(columns[total + 1:total + 1 + len(times) + len(cycles)], times + cycles)
                     error = columns.index("error_type")
                     self.assertEqual(columns[error - 2:error], ["sampling_status", "core"])
-                    self.assertEqual(error, total + 1 + len(cycles) + 2)
+                    self.assertEqual(error, total + 1 + len(times) + len(cycles) + 2)
                     self.assertEqual(columns[error + 1], "error_message")
                     self.assertLess(columns.index("profile"), total)
 

@@ -88,8 +88,9 @@ request_count、token_bytes 等列筛选对照，避免把不同核或不同采�
 
 列顺序按字段名固定：`clock_mhz`、`clock_source`、`cpu_profile`、`kernel_path`、
 `put_kernel_path`、`request_plan`、`timing_contract` 放在 `mode` 前；summary 的
-`total_us` 后紧跟 input/descriptor/publish/wait_cpu/read/finalize/total 七列
-cycles，再放 `sampling_status`、`core`，然后 `error_type`、`error_message`。
+`total_us` 后紧跟 input/descriptor/publish/wait_cpu/read/finalize 六列 us，
+随后是 input/descriptor/publish/wait_cpu/read/finalize/total 七列 cycles，
+再放 `sampling_status`、`core`，然后 `error_type`、`error_message`。
 移动后部分 Excel 列字母会变化，整理数据时建议按表头名称定位。
 
 summary 的 Host 和 AIV 行共享表头，但各自只填自己的指标：
