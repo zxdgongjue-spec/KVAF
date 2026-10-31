@@ -27,6 +27,48 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 旧 `--requests` 现为 `--request-length` 的别名，不再隐式决定有效前缀。
 旧脚本的 `--requests 8194` 则确实代表一次调用完成 8194 项，其结果不能直接当成新默认形状的性能。
 
+## UB 批量 scatter 版本对比
+
+本轮 kernel 使用 32 KiB 静态 UB、最多 32 行的单 bank tile。
+656 B 的 UB 行距为 672 B，每批最多 32 行；4096 B 每批 8 行。
+每批一次多块 GM→UB，按映射连续发出精确长度的 UB→output，再统一等待这批写完。
+尾批按实际行数搬运，超过 32 KiB 的单行使用原有精确分段路径。
+仍在整批 CPU done 后开始 scatter，现有 CPU/AIV 计时边界可以直接对比。
+
+验收直接使用本页的完整端到端测试。重编译前保存已跑通的基线 kernel，
+用两个独立进程、相同参数比较；loader 在进程内缓存首次加载的函数。
+示例沿用下文已配置好的 CANN/PyTorch、服务地址、EID、DEVICE_ID 和 PYTHONPATH：
+
+```bash
+mkdir -p results
+cp build-npu/bin/kvaf_scatter_batch_get_kernels.o results/scatter-reference.o
+cmake --build build-npu --target kvaf_scatter_batch_get_kernel -j
+export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+
+for variant in reference ub-batch; do
+  if [[ "$variant" == reference ]]; then
+    kernel="$PWD/results/scatter-reference.o"
+  else
+    kernel="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o"
+  fi
+  KVAF_RUN_NPU_TESTS=1 KVAF_BATCH_GET_KERNEL="$kernel" \
+    python -u tests/python/test_aiv_scatter_perf.py \
+      --cores 4 --workload full-blocks --input-mode changing \
+      --blocks 1024 --tokens-per-block 4 --token-bytes 656 \
+      --request-length 8192 --miss-count 4096 \
+      --source-pattern random --output-row-step 1 --output-order random --seed 1234 \
+      --warmup 50 --iterations 1000 --profile-rounds 100 \
+      --json "results/scatter-${variant}-656.json" \
+      --csv "results/scatter-${variant}-656.csv"
+done
+```
+
+两份文件中 `phase=baseline` 都表示关闭细分打点，不表示旧算法。
+通过文件名和 JSON 的 kernel SHA256 区分算法版本，先比较这部分的端到端 p50/p95、
+有效带宽，再用 `profiled` 的 `aiv_scatter_ns` 和 `cpu_comm_ns` 归因。
+两个版本均须通过完整 output/guard 校验。再以相同方法测 4096 B、非整除前缀和其他核数，
+不要只依据一个形状决定全局替换。
+
 ## 构建与运行
 
 首次使用计时需要同时更新 CPU 服务、NPU Host/Python binding 和 scatter kernel。

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #define __aicore__
 #define __global__
@@ -41,7 +42,33 @@ struct PendingCopy {
     *this = {};
   }
 };
-inline PendingCopy mte2, mte3;
+struct CopyQueue {
+  std::vector<PendingCopy> copies;
+  bool empty() const { return copies.empty(); }
+  static bool Overlap(const void* first, uint64_t bytes,
+                      const void* other, uint64_t other_bytes) {
+    if (!bytes || !other_bytes) return false;
+    const auto a = reinterpret_cast<uintptr_t>(first);
+    const auto b = reinterpret_cast<uintptr_t>(other);
+    return a <= b ? b - a < bytes : a - b < other_bytes;
+  }
+  bool Writes(const void* address, uint64_t bytes) const {
+    for (const auto& c : copies)
+      if (Overlap(address, bytes, c.destination, c.padded_bytes ? c.padded_bytes : c.bytes))
+        return true;
+    return false;
+  }
+  bool Reads(const void* address, uint64_t bytes) const {
+    for (const auto& c : copies)
+      if (Overlap(address, bytes, c.source, c.bytes)) return true;
+    return false;
+  }
+  void Finish() {
+    for (auto& copy : copies) copy.Finish();
+    copies.clear();
+  }
+};
+inline CopyQueue mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
 inline uint64_t mte2_aligned_copies{}, mte2_tail_copies{};
 inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
@@ -142,9 +169,10 @@ void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t co
   aiv_model::CheckMte2Source(src.data, bytes);
   if (!bytes || bytes % 32 || dst.address_.bufferAddr % 32 ||
       reinterpret_cast<uintptr_t>(src.data) % sizeof(T) || bytes > dst.address_.dataLen ||
-      aiv_model::mte2.destination || aiv_model::mte3.destination) std::abort();
-  aiv_model::mte2 = {reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
-                    reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)};
+      !aiv_model::mte2.empty() || aiv_model::mte3.Reads(
+          reinterpret_cast<void*>(dst.address_.bufferAddr), bytes)) std::abort();
+  aiv_model::mte2.copies.push_back({reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
+      reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)});
   ++aiv_model::mte2_copies;
   ++aiv_model::mte2_aligned_copies;
 }
@@ -152,24 +180,32 @@ template <typename T>
 void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
                  const DataCopyExtParams& p, const DataCopyPadExtParams<T>& pad) {
   const uint32_t padded = (p.blockLen + 31) & ~31U;
-  aiv_model::CheckMte2Source(src.data, p.blockLen);
-  if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv || pad.isPad ||
-      pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
-      padded > dst.address_.dataLen || aiv_model::mte2.destination ||
-      aiv_model::mte3.destination) std::abort();
-  aiv_model::mte2 = {reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
-                    reinterpret_cast<const uint8_t*>(src.data), p.blockLen, padded};
+  const uint64_t ub_bytes = uint64_t(p.blockCount) * padded;
+  if (!p.blockCount || p.blockCount > 4095 || !p.blockLen || p.srcStride || p.dstStride ||
+      p.rsv || pad.isPad || pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
+      ub_bytes > dst.address_.dataLen || !aiv_model::mte2.empty() ||
+      aiv_model::mte3.Reads(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes))
+    std::abort();
+  for (uint32_t block = 0; block < p.blockCount; ++block) {
+    const auto* source = reinterpret_cast<const uint8_t*>(src.data) + uint64_t(block) * p.blockLen;
+    aiv_model::CheckMte2Source(source, p.blockLen);
+    aiv_model::mte2.copies.push_back({
+        reinterpret_cast<uint8_t*>(dst.address_.bufferAddr) + uint64_t(block) * padded,
+        source, p.blockLen, padded});
+  }
   ++aiv_model::mte2_copies;
   ++aiv_model::mte2_tail_copies;
 }
 template <typename T>
 void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
                  const DataCopyExtParams& p) {
-  if (p.blockCount != 1 || p.srcStride || p.dstStride || p.rsv ||
+  if (p.blockCount != 1 || !p.blockLen || p.srcStride || p.dstStride || p.rsv ||
       src.address_.bufferAddr % 32 || p.blockLen > src.address_.dataLen ||
-      aiv_model::mte2.destination || aiv_model::mte3.destination) std::abort();
-  aiv_model::mte3 = {reinterpret_cast<uint8_t*>(dst.data),
-                    reinterpret_cast<const uint8_t*>(src.address_.bufferAddr), p.blockLen, 0};
+      aiv_model::mte2.Writes(reinterpret_cast<void*>(src.address_.bufferAddr), p.blockLen) ||
+      aiv_model::mte3.Writes(dst.data, p.blockLen))
+    std::abort();
+  aiv_model::mte3.copies.push_back({reinterpret_cast<uint8_t*>(dst.data),
+      reinterpret_cast<const uint8_t*>(src.address_.bufferAddr), p.blockLen, 0});
   ++aiv_model::mte3_copies;
 }
 template <typename T, CacheLine, DcciDst>
