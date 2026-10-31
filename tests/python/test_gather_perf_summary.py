@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import csv
+from datetime import datetime, timezone
 import io
 import os
 from pathlib import Path
@@ -35,6 +36,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         with path.open(encoding="utf-8-sig", newline="") as stream:
             reader = csv.DictReader(stream)
             assert len(reader.fieldnames) == len(set(reader.fieldnames)), reader.fieldnames
+            assert not any(name.endswith("_ns") for name in reader.fieldnames), reader.fieldnames
             return list(reader)
 
     def test_default_config_and_supported_shapes(self):
@@ -163,10 +165,16 @@ class GatherPerfSummaryTest(unittest.TestCase):
 
     def test_csv_clock_conversion_uses_captured_configuration(self):
         metadata = self.csv_metadata(clock=50)
+        sample = snapshot()
+        sample["cores"][0]["read_build_cycles"] = 1
         with tempfile.TemporaryDirectory() as directory:
-            paths = perf.export_csv_results(directory, metadata, [], [snapshot()], [100.0])
+            paths = perf.export_csv_results(directory, metadata, [], [sample], [100.0])
             cores = self.read_csv(paths[3])
             self.assertAlmostEqual(float(cores[0]["total_us"]), 6 / 50)
+            self.assertAlmostEqual(float(cores[0]["read_build_us"]), 1 / 50)
+            host = self.read_csv(paths[2])
+            self.assertAlmostEqual(float(host[0]["prepare_us"]), 0.1)
+            self.assertAlmostEqual(float(host[0]["total_us"]), 0.1)
             self.assertEqual(self.read_csv(paths[1]), [])
 
     def test_csv_failure_preserves_completed_samples_and_quotes_errors(self):
@@ -183,16 +191,28 @@ class GatherPerfSummaryTest(unittest.TestCase):
 
     def test_csv_unique_runs_and_no_overwrite(self):
         first, second = self.csv_metadata(), self.csv_metadata()
+        second["run_directory"] = first["run_directory"]  # Same second/config.
         self.assertNotEqual(first["run_id"], second["run_id"])
         self.assertEqual(first["git_dirty"], "unknown")
         with tempfile.TemporaryDirectory() as directory:
             paths = perf.export_csv_results(Path(directory) / "nested", first, [1000.0], [], [])
+            self.assertEqual(len({path.parent for path in paths}), 1)
+            self.assertEqual({path.name for path in paths}, {"summary.csv", "e2e.csv", "profile_host.csv", "profile_core.csv"})
             before = paths[0].read_bytes()
             second_paths = perf.export_csv_results(Path(directory) / "nested", second, [], [snapshot()], [100.0])
             self.assertNotEqual(paths[0], second_paths[0])
-            with self.assertRaises(FileExistsError):
-                perf.export_csv_results(paths[0].parent, first, [2000.0], [], [])
+            self.assertEqual(second_paths[0].parent.name, first["run_directory"] + "_2")
             self.assertEqual(paths[0].read_bytes(), before)
+            self.assertEqual(self.read_csv(second_paths[0])[0]["run_directory"], second_paths[0].parent.name)
+
+    def test_csv_directory_name_contains_beijing_time_and_shape(self):
+        with patch.object(perf, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 31, 1, 32, 35, tzinfo=timezone.utc)
+            metadata = self.csv_metadata()
+        self.assertEqual(metadata["run_directory"], "20261031_093235-cores3-token-bytes656-request-count1")
+        self.assertEqual(metadata["started_at_local"], "2026-10-31T09:32:35+08:00")
+        self.assertEqual(metadata["timezone"], "Asia/Shanghai")
+        self.assertEqual(metadata["schema_version"], 2)
 
     def test_csv_rejects_partial_or_invalid_profile_batches(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -28,16 +28,28 @@ AI Core 主频或某个固定默认值直接作为该频率。
 
 ## CSV 输出与后续对比
 
-每次运行结束自动保存四份 CSV，并打印 `GATHER_CSV_FILE path=...` 的绝对
-路径。文件名包含 UTC 时间和随机 run_id，重复运行不会覆盖旧数据。CSV
-使用 UTF-8 BOM，可直接在 Excel 中导入。默认结果目录不进入 Git。
+每次运行结束自动创建一个测试目录，将四份 CSV 放在一起，并打印
+`GATHER_CSV_FILE path=...` 的绝对路径。目录按北京时间（Asia/Shanghai、
+UTC+08:00）命名，包含年月日、时分秒、核数、token bytes、request-count：
 
-| 文件后缀 | 内容 |
+```text
+gather-perf-results/
+  20261031_093235-cores1-token-bytes656-request-count8193/
+    summary.csv
+    e2e.csv
+    profile_host.csv
+    profile_core.csv
+```
+
+同一秒、同一配置重复运行时，目录自动追加 `_2`、`_3`，不会覆盖或混入旧
+测试。CSV 使用 UTF-8 BOM，可直接在 Excel 中导入。默认结果目录不进入 Git。
+
+| 文件 | 内容 |
 | --- | --- |
-| `_summary.csv` | 本轮汇总，通常先看这一份 |
-| `_e2e.csv` | 关闭 AIV/Host 打点的逐次端到端样本 |
-| `_profile_host.csv` | 开启打点后的逐次 Host 时间、外层调用时间和 sequence |
-| `_profile_core.csv` | 每次采样、每个核的原始时间戳、六段耗时和计数 |
+| `summary.csv` | 本轮汇总，通常先看这一份 |
+| `e2e.csv` | 关闭 AIV/Host 打点的逐次端到端样本 |
+| `profile_host.csv` | 开启打点后的逐次 Host 时间、外层调用时间和 sequence |
+| `profile_core.csv` | 每次采样、每个核的原始时间戳、六段耗时和计数 |
 
 四份文件均包含配置和 run_id：label、代码 revision/dirty、设备/核数、请求数、
 token 字节数、SGL、表规模、seed、预热/采样次数、计数器频率、kernel 路径
@@ -48,8 +60,11 @@ summary 按 `row_kind` 区分：`e2e_summary` 是无打点性能基线，
 `profile_host_mean` 和各核的 `profile_core_mean`。通过 run_label、cores、
 request_count、token_bytes 等列筛选对照，避免把不同核或不同采集口径相加。
 
-Host 同时保存原始 ns 与 us；AIV 始终保存原始 cycle 和差值，频率未核实
-时 AIV 的 `_us` 列留空。CSV I/O 在测量循环之外进行，不计入样本时间。
+CSV schema_version 为 2。所有耗时列以 `_us` 命名，不再导出 `_ns` 列；
+Host 的内部 ns 在导出时除以 1000。AIV 保留原始 cycle 供诊断，六阶段、
+构造及 CQ 等待均有对应 `_us` 列；频率未核实时这些列留空，不猜测频率。
+测试开始时间仍以带时区的日期文本保存，便于对应目录。
+CSV I/O 在测量循环之外进行，不计入样本时间。
 开启打点时的外层调用计时包含本次同步和状态/profile D2H，快照的 Python
 复制在调用计时之外，便于与无打点组比较。
 

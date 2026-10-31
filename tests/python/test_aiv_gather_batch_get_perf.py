@@ -32,7 +32,7 @@ import sys
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
@@ -194,6 +194,7 @@ def latency_summary(samples_us: Sequence[float], payload_bytes: int) -> dict[str
 
 def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> dict[str, object]:
     now = datetime.now(timezone.utc)
+    local = now.astimezone(timezone(timedelta(hours=8)))
     revision, dirty = "", "unknown"
     try:
         repo = Path(__file__).resolve().parents[2]
@@ -205,9 +206,12 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
+        "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
+        "run_directory": (local.strftime("%Y%m%d_%H%M%S") +
+                          f"-cores{cores}-token-bytes{TOKEN_BYTES}-request-count{REQUEST_COUNT}"),
         "git_revision": revision, "git_dirty": dirty,
         "mode": "gather_read", "device_id": device_id, "cores": cores,
         "token_bytes": TOKEN_BYTES, "request_count": REQUEST_COUNT,
@@ -239,9 +243,11 @@ def export_csv_results(
     clock = metadata["clock_mhz"]
     stages = [name for name, _, _ in STAGE_BOUNDARIES]
     boundaries = [STAGE_BOUNDARIES[0][1]] + [end for _, _, end in STAGE_BOUNDARIES[:-1]]
-    host_columns = [*HOST_FIELDS, *(field.removesuffix("_ns") + "_us" for field in HOST_FIELDS)]
+    host_columns = [field.removesuffix("_ns") + "_us" for field in HOST_FIELDS]
+    timed_counters = [field for field in COUNTERS if field.endswith("_cycles")]
     core_columns = ["requests", *boundaries, *(name + "_cycles" for name in stages),
-                    *(name + "_us" for name in stages), *COUNTERS]
+                    *(name + "_us" for name in stages), *COUNTERS,
+                    *(field.removesuffix("_cycles") + "_us" for field in timed_counters)]
 
     def core_fields(lane: Mapping[str, object], mean: bool = False) -> dict[str, object]:
         row = {"requests": lane["requests"], **{key: lane.get(key, 0) for key in COUNTERS}}
@@ -251,11 +257,12 @@ def export_csv_results(
             cycles = lane[name] if mean else int(lane[end]) - int(lane[begin])
             row[name + "_cycles"] = cycles
             row[name + "_us"] = cycles / float(clock) if clock != "" else ""
+        for field in timed_counters:
+            row[field.removesuffix("_cycles") + "_us"] = float(row[field]) / float(clock) if clock != "" else ""
         return row
 
     def host_fields(host: Mapping[str, object]) -> dict[str, object]:
-        return {**host, **{field.removesuffix("_ns") + "_us": float(host[field]) / 1000
-                          for field in HOST_FIELDS}}
+        return {field.removesuffix("_ns") + "_us": float(host[field]) / 1000 for field in HOST_FIELDS}
 
     summary = [{"row_kind": "sampling_status", "sampling_status": "failed" if error else "complete",
                 "error_type": type(error).__name__ if error else "", "error_message": str(error) if error else ""}]
@@ -282,8 +289,21 @@ def export_csv_results(
             host_rows.append({**key, "call_e2e_us": elapsed, **host_fields(snapshot["host"])})
             for lane in snapshot["cores"]:
                 core_rows.append({**key, "core": lane["core"], **core_fields(lane)})
-    target = Path(directory).expanduser().resolve()
-    target.mkdir(parents=True, exist_ok=True)
+    output_root = Path(directory).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    # Atomically reserve a directory for this test, including same-second runs.
+    # The readable name carries the test configuration; CSV run_id remains the
+    # unique join key. Never mix or overwrite files from an earlier test.
+    suffix = 1
+    while True:
+        folder = str(metadata["run_directory"])
+        target = output_root / (folder if suffix == 1 else f"{folder}_{suffix}")
+        try:
+            target.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
+    metadata = {**metadata, "run_directory": target.name}
     outputs = (
         ("summary", ["row_kind", "sampling_status", "error_type", "error_message", "profile", "core",
                      "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
@@ -294,8 +314,8 @@ def export_csv_results(
     )
     paths = []
     for name, columns, rows in outputs:
-        path = target / f"gather_{metadata['run_id']}_{name}.csv"
-        # Unique run IDs plus exclusive creation protect earlier measurements.
+        path = target / f"{name}.csv"
+        # A new per-test directory plus exclusive creation protect measurements.
         with path.open("x", encoding="utf-8-sig", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=[*metadata, *dict.fromkeys(columns)])
             writer.writeheader()
