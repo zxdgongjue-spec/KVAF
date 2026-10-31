@@ -1,0 +1,39 @@
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.3 post_us=77.5 cq_wait_us=1640.0 total_us=1725.6 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=92 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=77.3 cq_wait_us=1644.8 total_us=1730.8 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=93 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=76.2 cq_wait_us=1640.3 total_us=1724.5 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=94 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.3 post_us=76.4 cq_wait_us=1642.0 total_us=1726.5 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=95 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.3 post_us=77.0 cq_wait_us=1640.4 total_us=1725.7 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=96 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=77.7 cq_wait_us=1639.9 total_us=1726.0 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=97 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.3 post_us=80.7 cq_wait_us=1638.7 total_us=1728.0 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=98 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.4 post_us=80.1 cq_wait_us=1638.1 total_us=1727.0 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=99 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=3.2 post_us=75.0 cq_wait_us=1640.3 total_us=1724.0 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=100 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=76.9 cq_wait_us=2708.2 total_us=2793.7 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=101 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=77.9 cq_wait_us=1639.4 total_us=1725.5 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=102 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=3.2 post_us=72.7 cq_wait_us=1643.2 total_us=1721.9 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=103 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.1 post_us=78.5 cq_wait_us=1641.2 total_us=1728.4 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=104 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=75.6 cq_wait_us=1641.5 total_us=1725.3 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=105 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.2 post_us=76.8 cq_wait_us=1646.5 total_us=1731.9 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=106 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.4 post_us=77.1 cq_wait_us=1642.1 total_us=1728.3 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=107 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=3.5 post_us=74.0 cq_wait_us=1642.7 total_us=1723.5 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=108 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.1 post_us=79.2 cq_wait_us=1641.1 total_us=1729.0 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=109 state=4 detail=
+[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=0 spans=1024 bytes=85983232 build_us=5.1 post_us=77.9 cq_wait_us=1640.8 total_us=1727.9 read_wrs=2048 post_calls=64 tail_cqes=4 waves=1 active_jettys=4 plan_reused=1 cpu_threads=1 checksum_included=0
+[KVAF_CPU] REMOTE_PULL_DONE region=2 source=16033127080588242434 sequence=110 state=4 detail=
+[KVAF_CPU] REGION_RELEASE session=2 channels=0

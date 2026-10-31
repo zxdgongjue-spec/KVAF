@@ -188,6 +188,57 @@ waves、活跃 Jetty 数和 plan_reused。该 total_us 包含描述符准备、�
 两种计时指标应分别比较；不要将 Python effective_GBps 当作纯 READ 带宽。每轮校验仍会
 占用实际运行时间，只是与传输计时分开。诊断后将 PROFILE 关闭再测整体性能，可排除日志影响。
 
+### 2026-10-31 记录：1024 个 82 KiB 块
+
+用户硬件实测通过。删除串行对照、拆分校验计时后的版本为
+`codex/cpu-pull-hbm-reference` / `7fc988571e5ddf99f7ba4b9fecd38673b6fab900`。
+下列日期为记录日期；测试输出未打印运行端 Git SHA 或构建参数。
+原始依据保存在 [客户端命令与输出](benchmarks/2026-10-31-cpu-pull-82mib/client.log)
+和 [CPU 服务端日志节选](benchmarks/2026-10-31-cpu-pull-82mib/cpu-profile.log)。
+
+```bash
+python tests/python/bench_remote_cpu_offload.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
+  --blocks 1024 --block-bytes 83968 --warmup 10 --iterations 100
+```
+
+- A 为 device 6，B 为 device 7；CPU 自动选择 candidate 0，EID 为
+  `00000000003f020000100000df080b00`。
+- B 的 CLOS EID `00000000003f030000100000df00eb00` 探测失败后，回退至
+  `000000000000020000100000df00e100`，scratch READ 校验通过。该过程不计入批次传输时间。
+- 每轮 1024 个离散源块，每块 83,968 字节（82 KiB），有效载荷合计
+  85,983,232 字节（82 MiB）。包含源块间间隔的 HBM 缓冲为 86,051,840 字节。
+- 预热 10 轮、计时 100 轮；每轮改变输入，完整校验本批有效数据后才释放 DDR 槽位并通知 B 复用。
+  本测试不调用 AIV BatchGet、BatchPut 或 A 直接读 B HBM 的路径。
+
+| 指标 | 结果 | 统计范围 |
+|---|---:|---|
+| `offload_from()` 至提交完成平均耗时 | 2,607.1 µs | 100 轮，不含校验 |
+| P50 / P95 / P99 | 2,580.7 / 2,627.6 / 3,662.3 µs | 100 轮 |
+| Python `effective_GBps` | 32.981 GB/s | 有效载荷除以平均调用耗时 |
+| `verification_mean_us` | 150,477.4 µs | 100 轮，校验 RPC 与结果比较单独计时 |
+| CPU 数据面 `total_us` 平均值 | 1,782.8 µs | 日志节选中的 19 轮，sequence 92–110 |
+| CPU 数据面中位数 / 最小值 / 最大值 | 1,726.5 / 1,721.9 / 2,793.7 µs | 同上，包含抖动样本 |
+| CPU 数据面有效带宽 | 48.23 GB/s | 85,983,232 / 1,782.8158 / 1000 |
+| `build_us` / `post_us` / `cq_wait_us` 平均值 | 4.9 / 77.1 / 1,697.4 µs | 同上 19 轮 |
+
+GB/s 使用十进制单位。CPU 数据面时间包含描述符准备、提交和 CQ 等待；Python 时间另外包含
+控制 RPC、工作线程创建和 Meta 提交。CPU 节选不是全部 100 轮，不能将两组均值之差作为精确的
+控制流程耗时分解。
+
+19 条 CPU PROFILE 的计数均一致：`status=0`、`read_wrs=2048`、`post_calls=64`、
+`tail_cqes=4`、`waves=1`、`active_jettys=4`、`plan_reused=1`、`cpu_threads=1`。
+每块拆成 64 KiB 和 18 KiB 两条 READ，每个 Jetty 512 个 WQE；每次 post 最多链接 32 个，
+每个 Jetty 仅等待本轮尾部的成功 CQE。
+
+`sequence=101` 的 `total_us=2793.7`、`cq_wait_us=2708.2`，该轮增加的耗时主要出现在 CQ 等待。
+其余 18 条 `total_us` 平均 1,726.7 µs；上表均值保留了该抖动样本，日志不足以确定抖动原因。
+
+结论：四 Jetty 批量传输和逐轮完整校验均通过，`cpu_checksum_included=0` 确认校验已分离。
+传输调用与校验均值相加为 153.0845 ms，尚不含生产数据、Ready、Free 等阶段；32.981 GB/s
+不代表包含逐轮校验的持续吞吐。当前完成查询在未完成时休眠 1 ms，可作为后续控制流程优化点，
+但尚未通过独立计时验证其具体占比。
+
 ## 未决操作与失败处理
 
 `pending_offload=True` 时保留 A Runtime 和 B 的 HBM，调用 A `resolve_offload()` 查询已有任务。

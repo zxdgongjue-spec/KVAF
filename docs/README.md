@@ -7,4 +7,4 @@
 - [CPU Pull / Offload 设计](cpu_pull_offload_design.md)：通过 PreparePut、CPU 主动 READ 和 CommitPut 实现独立的 HBM 到 DDR 卸载。
 - [CPU Pull / Offload 构建与运行](cpu_pull_offload_usage.md)：独立 OffloadRuntime、两机验收与未决任务恢复。
 
-- [共享 DDR 与跨卡 CPU Pull](shared_ddr_remote_offload.md)：A 统一管理 Meta 和 DDR，CPU Pull B 注册的 HBM；接口、生命周期与双卡验收。
+- [共享 DDR 与跨卡 CPU Pull](shared_ddr_remote_offload.md)：A 统一管理 Meta 和 DDR，CPU Pull B 注册的 HBM；接口、生命周期、双卡验收及性能实测记录。
