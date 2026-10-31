@@ -112,6 +112,15 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         if (fault == 10) p.notify_done_cycle = 101;
         if (fault == 11) p.read_done_cycle = 103;
         if (fault == 12) p.kernel_finish_cycle = 104;
+        if (fault == 13) {
+          // Device feedback: correct header/counts and late timestamps, but
+          // caller-only mask 0x41 and lost early fields. Never accept it.
+          p.valid_mask = 0x41;
+          p.kernel_start_cycle = p.input_done_cycle = p.descriptor_done_cycle = p.notify_done_cycle = 0;
+          p.ack_done_cycle = 97320160017685ULL;
+          p.read_done_cycle = 97320162709862ULL;
+          p.kernel_finish_cycle = 97320162710121ULL;
+        }
       }
     });
   }
@@ -391,8 +400,8 @@ int main() {
   }
   const char* profile_reasons[] = {"", "magic", "sequence", "valid_mask", "timestamp_notify_ack",
       "result", "requests", "data_wrs", "timestamp_start_input", "timestamp_input_descriptor",
-      "timestamp_descriptor_notify", "timestamp_ack_read", "timestamp_read_finish"};
-  for (profile_fault = 1; profile_fault <= 12; ++profile_fault) {
+      "timestamp_descriptor_notify", "timestamp_ack_read", "timestamp_read_finish", "valid_mask"};
+  for (profile_fault = 1; profile_fault <= 13; ++profile_fault) {
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
     const auto failure = owner->Execute(exec);
@@ -403,6 +412,10 @@ int main() {
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
         "data_wrs=", "status_data_wrs=", "args_bytes=224", "record_bytes=192"})
       assert(failure.message().find(field) != std::string::npos);
+    if (profile_fault == 13) {
+      assert(failure.message().find("valid_mask=0x41") != std::string::npos);
+      assert(failure.message().find("cycles=[start:0,input:0,descriptor:0,notify:0,ack:97320160017685") != std::string::npos);
+    }
     GatherBatchGetProfile snapshot;
     assert(!owner->CopyGatherProfile(&snapshot).ok());
     assert(!owner->Execute(exec).ok());

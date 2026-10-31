@@ -155,5 +155,37 @@ PROFILE_SAMPLES = 1
 
 脚本仍执行 payload/guard 预检，随后跳过端到端性能循环，打印
 `GATHER_PROFILE_PHASE_BEGIN` 并开始阶段采集。失败时保留完整的
-`invalid gather profile ... reason=...` 行。此次诊断增强只修改 Host 和 Python，
-沿用当前 V2 gather kernel；目标机更新后重新构建 Host 即可。
+`invalid gather profile ... reason=...` 行。`6d2ecaf` 的诊断增强只修改 Host 和
+Python；下文针对 `0x41` 的修改位于 kernel，必须重编对应 kernel。
+
+## valid_mask=0x41、早期时间戳为零的修正
+
+硬件反馈：magic、sequence、result、requests、data_wrs 均匹配，但 mask 为
+`0x41`，start/input/descriptor/notify 为零，ack/read/finish 已有非零 cycle。
+`0x41` 仅包含外层入口、出口两位，与函数内部阶段和 mask 的更新未一致保留
+相符。它不表示数据 READ 失败，也不是由 MHz 换算产生。没有匹配的设备
+指令或编译器中间表示，尚不能断定具体的编译器/局部内存机制。
+
+修改将计时状态从跨 Gather/Queue 函数传递的可变局部结构体移到每核独占的
+HBM profile 记录，使用显式 `__gm__ volatile` 指针。入口显式初始化，各阶段
+直接写对应字段并累积 mask，结尾设置 result/magic 并 flush；不再把局部
+结构体整体或逐字段回拷。关闭 profile 时不读时钟、不访问 profile 内存。
+每条记录仍只有一个 AIV 核写入，Host 仍在 stream 完成后读取。
+
+ABI 保持 V2 / args 224 B / profile 192 B，Host 仍要求 `valid_mask=0x7f`，
+继续拒绝硬件日志中的不完整形状。此次需在 NPU 目标机运行：
+
+```bash
+git pull --ff-only
+cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_gather_batch_get_perf.py
+```
+
+沿用已有 Host、环境和 kernel 路径；若尚未部署 `6d2ecaf` 的 Host 诊断，先
+执行一次完整 `cmake --build build-npu -j`。计时入口前的 profile 初始化和
+最后记录导出的开销不属于六段 cycle，外层同步调用仍包含这些成本。
+
+模型新增在 descriptor/ACK/data doorbell 时检查生产 GM 记录的阶段进度，确保
+早期时间戳在内层函数仍执行时已保留；同时覆盖空 lane、重复批次与错误。
+这些模型检查不模拟 CANN 的局部对象编译行为，是否消除本次硬件失败仍需
+上述复测。当前日志的后半段仅作为性能线索，不作为通过验收的六阶段结果。

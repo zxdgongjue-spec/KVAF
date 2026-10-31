@@ -187,6 +187,19 @@ struct Fixture {
         const auto op = (word(m.pi, 1) >> 8) & 255;
         const auto sges = word(m.pi, 2) >> 24;
         assert(sges >= 1 && sges <= 6);
+        if (args.profile) {
+          // Observe the production record while nested Gather/Queue calls are
+          // still active. Early stamps must already live in this core's GM
+          // record, not in a local aggregate copied back only at kernel exit.
+          const auto& p = profiles[worker];
+          const uint64_t reached = !(q % 2) ? 0x1f : op == kRead ? 0xf : 0x7;
+          assert(p.magic == 0 && p.sequence == args.sequence);
+          assert(p.valid_mask == reached);
+          assert(p.kernel_start_cycle && p.input_done_cycle && p.descriptor_done_cycle);
+          assert(p.kernel_start_cycle <= p.input_done_cycle && p.input_done_cycle <= p.descriptor_done_cycle);
+          if (reached >= 0xf) assert(p.notify_done_cycle >= p.descriptor_done_cycle);
+          if (reached == 0x1f) assert(p.ack_done_cycle >= p.notify_done_cycle);
+        }
         uint64_t remote_address = uint64_t(word(m.pi, 10)) | (uint64_t(word(m.pi, 11)) << 32);
         if (q % 2 && op == kRead && remote_address == args.remote_control + worker * 64 + 8) {
           if (!timeout && ++ack_reads[worker] == 3) {
