@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Baseline + optional CPU/AIV timings for the real CPU-push scatter path.
+# One complete BatchGet per sample; default is 1024 blocks x 4 x 656 B.
 set -euo pipefail
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 /absolute/path/to/build-npu [scatter-perf-options...]" >&2
@@ -23,5 +23,21 @@ KVAF_SCATTER_PERF_TIMEOUT="${KVAF_SCATTER_PERF_TIMEOUT:-600}"
   echo "ERROR: KVAF_SCATTER_PERF_TIMEOUT must be positive seconds" >&2
   exit 2
 }
+KVAF_PERF_ARGS=("$@")
+KVAF_PERF_HAS_JSON=0
+KVAF_PERF_HAS_CSV=0
+for KVAF_PERF_ARG in "$@"; do
+  case "$KVAF_PERF_ARG" in
+    --json|--json=*) KVAF_PERF_HAS_JSON=1 ;;
+    --csv|--csv=*) KVAF_PERF_HAS_CSV=1 ;;
+  esac
+done
+KVAF_PERF_PREFIX="${KVAF_SCATTER_PERF_RESULT_PREFIX:-$KVAF_ROOT/results/aiv-scatter-$(date +%Y%m%d-%H%M%S)-$$}"
+if [[ "$KVAF_PERF_HAS_JSON" == 0 ]]; then
+  KVAF_PERF_ARGS+=(--json "${KVAF_PERF_PREFIX}.json")
+fi
+if [[ "$KVAF_PERF_HAS_CSV" == 0 ]]; then
+  KVAF_PERF_ARGS+=(--csv "${KVAF_PERF_PREFIX}.csv")
+fi
 exec timeout "${KVAF_SCATTER_PERF_TIMEOUT}s" \
-  python3 "$KVAF_ROOT/tests/python/test_aiv_scatter_perf.py" "$@"
+  python3 "$KVAF_ROOT/tests/python/test_aiv_scatter_perf.py" "${KVAF_PERF_ARGS[@]}"

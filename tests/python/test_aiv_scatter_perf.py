@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real CPU-push scatter benchmark with separate baseline and profiled passes."""
+"""Per-call CPU-push scatter benchmark; changing inputs match the AICPU test."""
 import argparse
 import csv
 import hashlib
@@ -7,38 +7,71 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import time
 
 from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
 from aiv_kernel_metadata import check_aiv_kernel_metadata
-from scatter_perf_common import profile_metrics, summarize
+from scatter_perf_common import PAYLOAD_TIMINGS, profile_metrics, request_values, sample_metrics, summarize
 
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--requests", type=int, default=8193)
+    parser.add_argument("--workload", choices=("full-blocks", "one-token-per-block", "sampled-tokens"),
+                        default="full-blocks", help="all tokens, AICPU reference, or arbitrary token samples")
+    parser.add_argument("--request-length", "--requests", dest="request_length", type=int,
+                        help="request Tensor capacity; independent of the active miss-count")
+    parser.add_argument("--miss-count", type=int, help="active token requests in ONE BatchGet call")
+    parser.add_argument("--active-percent", type=int, default=100,
+                        help="percentage of workload tokens; use instead of --miss-count")
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--cores", type=int, default=1)
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
-    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--input-mode", choices=("changing", "steady"), default="changing",
+                        help="changing refreshes data, metadata and the table before every call like AICPU")
+    parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--profile-warmup", type=int, default=5)
-    parser.add_argument("--profile-iterations", type=int, default=20,
+    parser.add_argument("--profile-warmup", type=int, default=1)
+    parser.add_argument("--profile-iterations", "--profile-rounds", type=int, default=20,
                         help="0 disables all optional CPU/AIV instrumentation")
     parser.add_argument("--aiv-clock-mhz", type=float, default=1000.0,
                         help="GetSystemCycle counter: 1000 MHz on Ascend 950; override for other products")
-    parser.add_argument("--output-pattern", choices=("dense", "strided"), default="strided")
+    parser.add_argument("--output-pattern", choices=("dense", "strided"),
+                        help="compatibility alias for output-row-step 1 or 2")
+    parser.add_argument("--output-row-step", type=int, choices=(1, 2))
+    parser.add_argument("--output-order", choices=("random", "sequential"), default="random")
     parser.add_argument("--source-pattern", choices=("random", "sequential"), default="random")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--json", type=Path)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
-    for field, lo, hi in (("requests", 1, 65536), ("token_bytes", 1, 65535), ("cores", 1, 8),
+    for field, lo, hi in (("token_bytes", 1, 65535), ("cores", 1, 8),
                           ("blocks", 1, 65536), ("tokens_per_block", 1, 65536), ("plans", 1, 64)):
         if not lo <= getattr(args, field) <= hi:
             parser.error(f"{field} must be in [{lo}, {hi}]")
+    if not 1 <= args.active_percent <= 100:
+        parser.error("active-percent must be in [1, 100] for a nonempty performance call")
+    if args.miss_count is not None and args.active_percent != 100:
+        parser.error("use either miss-count or active-percent")
+    workload_tokens = (args.blocks if args.workload == "one-token-per-block" else
+                       args.blocks * args.tokens_per_block)
+    if args.workload == "sampled-tokens" and args.request_length is not None:
+        workload_tokens = args.request_length
+    if args.miss_count is None:
+        args.miss_count = workload_tokens * args.active_percent // 100
+    if args.request_length is None:
+        args.request_length = workload_tokens
+    if not 1 <= args.miss_count <= args.request_length <= 65536:
+        parser.error("require 1 <= miss-count <= request-length <= 65536")
+    if args.workload != "sampled-tokens" and args.miss_count > workload_tokens:
+        parser.error("miss-count exceeds this workload; use sampled-tokens for repeated requests")
+    pattern_step = {"dense": 1, "strided": 2}.get(args.output_pattern)
+    if pattern_step and args.output_row_step and pattern_step != args.output_row_step:
+        parser.error("output-pattern and output-row-step disagree")
+    args.output_row_step = args.output_row_step or pattern_step or 1
+    args.output_pattern = "dense" if args.output_row_step == 1 else "strided"
     if args.token_bytes * args.tokens_per_block > 0xffffffff:
         parser.error("block byte count exceeds uint32")
     if args.token_bytes * (args.tokens_per_block - 1) > 0x7fffffff:
@@ -52,12 +85,14 @@ def arguments(argv=None):
     return args
 
 
-def measure_pass(call, iterations, payload, snapshot=None, clock=None):
-    """Time only synchronous calls; optional snapshots are outside each timer."""
+def measure_pass(call, iterations, payload, snapshot=None, clock=None, prepare=None, verify=None):
+    """Exactly one synchronous BatchGet per sample; all setup/checks are outside."""
     clock = clock or time.perf_counter_ns
     samples = []
     wall_begin = clock()
     for index in range(iterations):
+        if prepare:
+            prepare(index)
         begin = clock()
         call(index)
         elapsed = clock() - begin
@@ -66,7 +101,9 @@ def measure_pass(call, iterations, payload, snapshot=None, clock=None):
             snapshot_begin = clock()
             sample.update(snapshot())
             sample["snapshot_ns"] = clock() - snapshot_begin
-        samples.append(sample)
+        if verify:
+            verify(index)
+        samples.append(sample_metrics(sample))
     return samples, clock() - wall_begin
 
 
@@ -88,30 +125,27 @@ def source_data(torch, rows, token_bytes):
 def request_plans(torch, args, device):
     plans = []
     for index in range(args.plans):
-        generator = torch.Generator().manual_seed(args.seed + index)
-        source_rows = args.blocks * args.tokens_per_block
-        if args.source_pattern == "random":
-            sources = torch.randint(source_rows, (args.requests,), generator=generator)
-        else:
-            sources = (torch.arange(args.requests, dtype=torch.int64) + index) % source_rows
-        row_generator = torch.Generator().manual_seed(args.seed + index + 1000003)
-        rows = torch.randperm(args.requests, generator=row_generator)
-        if args.output_pattern == "strided":
-            rows = rows * 2 + 1
-        cpu = ((sources // args.tokens_per_block).to(torch.int32),
-               ((sources % args.tokens_per_block) * args.token_bytes).to(torch.int32), rows.to(torch.int32))
+        cpu = tuple(torch.tensor(values, dtype=torch.int32)
+                    for values in request_values(args, args.seed + index))
         plans.append((cpu, tuple(t.to(device) for t in cpu)))
     return plans
 
 
 def write_results(args, report):
+    for samples in report["samples"].values():
+        if any(sample["payload_bytes"] != args.miss_count * args.token_bytes for sample in samples):
+            raise ValueError("sample payload does not match this call's active miss-count")
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
-        rows = [dict(phase=phase, cores=args.cores, requests=args.requests, token_bytes=args.token_bytes,
-                     **{k: v for k, v in sample.items() if k != "workers"})
+        rows = [dict(phase=phase, calls=1, cores=args.cores, workload=args.workload,
+                     input_mode=args.input_mode, source_blocks=args.blocks,
+                     tokens_per_block=args.tokens_per_block, request_length=args.request_length,
+                     miss_count=args.miss_count, requests=args.miss_count, token_bytes=args.token_bytes,
+                     output_order=args.output_order, output_row_step=args.output_row_step,
+                     **{k: v for k, v in sample_metrics(sample).items() if k != "workers"})
                 for phase, samples in report["samples"].items() for sample in samples]
         columns = list(dict.fromkeys(k for row in rows for k in row))
         with args.csv.open("w", newline="", encoding="utf-8") as output:
@@ -139,13 +173,19 @@ def main(argv=None):
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     source_rows = args.blocks * args.tokens_per_block
-    output_rows = (2 * args.requests if args.output_pattern == "strided" else args.requests) + 2
+    output_rows = args.output_row_step * args.request_length + 2
     config = vars(args).copy()
-    config.update(device_id=device_id, mode="cpu_push_scatter", units="decimal GB/s, milliseconds",
+    config.update(device_id=device_id, mode="cpu_push_scatter",
+                  units="decimal GB/s; sample durations ns/us; summary durations ms",
                   cpu_service=os.environ.get("KVAF_CPU_SERVICE_ADDR"),
                   npu_eids=os.environ.get("KVAF_NPU_EIDS"),
                   torch_version=str(torch.__version__),
                   timing="synchronous BatchGet call through status validation; setup/verification excluded",
+                  calls_per_sample=1, active_tokens_per_call=args.miss_count,
+                  payload_bytes_per_call=args.miss_count * args.token_bytes,
+                  request_capacity=args.request_length,
+                  verification="every_round_full_output_and_npu_consumer",
+                  reference="aicpu-urma:access_operator/demo/aicpu_batch_get/python/test_batch_get.py",
                   cpu_comm_window="first WRITE submit to last payload/ready tail CQ; includes posting and inter-wave gaps",
                   source_bytes=source_rows * args.token_bytes,
                   output_bytes=output_rows * args.token_bytes,
@@ -155,10 +195,11 @@ def main(argv=None):
     config = {k: str(v) if isinstance(v, Path) else v for k, v in config.items()}
     print("SCATTER_PERF_CONFIG " + json.dumps(config, sort_keys=True), flush=True)
     block_bytes = args.token_bytes * args.tokens_per_block
-    source_cpu = source_data(torch, source_rows, args.token_bytes)
-    source = source_cpu.to(device)
-    plans = request_plans(torch, args, device)
-    count = torch.tensor([args.requests], dtype=torch.int32, device=device)
+    source_cpu = source_data(torch, source_rows, args.token_bytes) if args.input_mode == "steady" else None
+    source = torch.empty((source_rows, args.token_bytes), dtype=torch.uint8, device=device)
+    plans = request_plans(torch, args, device) if args.input_mode == "steady" else None
+    dynamic_inputs = tuple(torch.empty(args.request_length, dtype=torch.int32, device=device) for _ in range(3))
+    count = torch.tensor([args.miss_count], dtype=torch.int32, device=device)
     output = torch.empty((output_rows, args.token_bytes), dtype=torch.uint8, device=device)
     stream = torch.npu.current_stream(device_id)
     keys = build_dsa_keys(args.blocks, q_capacity=args.blocks)
@@ -172,40 +213,71 @@ def main(argv=None):
         raise RuntimeError("rebuild the Python binding with scatter profiling support")
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     report = dict(config=config, samples={}, summary={}, setup_ms={})
-    payload = args.requests * args.token_bytes
+    payload = args.miss_count * args.token_bytes
     try:
         begin = time.perf_counter_ns()
-        runtime.initialize(args.blocks * block_bytes, block_bytes)
+        runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
         report["setup_ms"]["initialize"] = (time.perf_counter_ns() - begin) / 1e6
-        torch.npu.synchronize()
-        begin = time.perf_counter_ns()
-        runtime.batch_put(keys, source, [i * block_bytes for i in range(args.blocks)], [block_bytes] * args.blocks)
-        torch.npu.synchronize()
-        report["setup_ms"]["batch_put"] = (time.perf_counter_ns() - begin) / 1e6
-        table = runtime.prepare_access_table(keys)
-        view = runtime.access_table_view(table, device="npu", capacity=args.blocks)
+        input_offsets = [i * block_bytes for i in range(args.blocks)]
+        lengths = [block_bytes] * args.blocks
+        current = {}
+        epoch = 0
+
+        def populate():
+            runtime.batch_put(keys, source, input_offsets, lengths, stream)
+            current["table"] = runtime.prepare_access_table(keys)
+            current["view"] = runtime.access_table_view(current["table"], device="npu", capacity=args.blocks)
+
+        if args.input_mode == "steady":
+            source.copy_(source_cpu)
+            stream.synchronize()
+            begin = time.perf_counter_ns()
+            populate()
+            stream.synchronize()
+            report["setup_ms"]["batch_put"] = (time.perf_counter_ns() - begin) / 1e6
+
+        def prepare(index):
+            nonlocal epoch, source_cpu
+            if args.input_mode == "changing":
+                rng = random.Random(args.seed + epoch)
+                data = bytearray(rng.randbytes(source_rows * args.token_bytes))
+                source_cpu = torch.frombuffer(data, dtype=torch.uint8).reshape(source_rows, args.token_bytes)
+                cpu = tuple(torch.tensor(values, dtype=torch.int32)
+                            for values in request_values(args, args.seed + epoch))
+                for target, value in zip(dynamic_inputs, cpu):
+                    target.copy_(value)
+                source.copy_(source_cpu)
+                current["cpu"], current["inputs"] = cpu, dynamic_inputs
+            else:
+                current["cpu"], current["inputs"] = plans[index % len(plans)]
+            output.fill_(0xAD)
+            stream.synchronize()
+            if args.input_mode == "changing":
+                populate()
+                stream.synchronize()
+            epoch += 1
 
         def call(index):
-            _, (indices, offsets, rows) = plans[index % len(plans)]
-            runtime.batch_get(view, indices, offsets, count, rows, output, stream=stream, synchronize=True)
+            indices, offsets, rows = current["inputs"]
+            runtime.batch_get(current["view"], indices, offsets, count, rows, output,
+                              stream=stream, synchronize=True)
 
         def check(index):
-            cpu, _ = plans[index % len(plans)]
-            indices, offsets, rows = cpu
+            indices, offsets, rows = (t[:args.miss_count] for t in current["cpu"])
             expected = torch.full((output_rows, args.token_bytes), 0xAD, dtype=torch.uint8)
             source_indices = indices.long() * args.tokens_per_block + offsets.long() // args.token_bytes
             expected[rows.long()] = source_cpu[source_indices]
+            # Like the AICPU reference, consume on the same NPU stream before D2H.
+            consumed = output.to(dtype=torch.int32) + 1
+            if not torch.equal(consumed.cpu(), expected.to(dtype=torch.int32) + 1):
+                raise AssertionError(f"scatter NPU consumer mismatch in round {epoch - 1}")
             if not torch.equal(output.cpu(), expected):
-                raise AssertionError(f"scatter output/guard mismatch for plan {index}")
+                raise AssertionError(f"scatter output/guard mismatch in round {epoch - 1}")
+            if args.input_mode == "changing":
+                runtime.release_access_table(current.pop("table"))
+                current.pop("view")
+                runtime.batch_free(keys)
 
-        def verify():
-            for index in range(len(plans)):
-                output.fill_(0xAD)
-                torch.npu.synchronize()
-                call(index)
-                check(index)
-
-        verify()
         for phase, warmup, iterations in (("baseline", args.warmup, args.iterations),
                                            ("profiled", args.profile_warmup, args.profile_iterations)):
             if not iterations:
@@ -215,32 +287,39 @@ def main(argv=None):
                 runtime.start_scatter_profile()
             print(f"SCATTER_PERF_PHASE phase={phase} warmup={warmup} iterations={iterations}", flush=True)
             for index in range(warmup):
+                prepare(index)
                 call(index)
+                check(index)
             def snapshot():
                 records = [dict(r) for r in runtime.scatter_profile()]
                 return dict(workers=records, sequence=records[0]["sequence"],
-                            **profile_metrics(records, args.cores, args.requests,
+                            **profile_metrics(records, args.cores, args.miss_count,
                                                               args.token_bytes, args.aiv_clock_mhz))
-            samples, wall_ns = measure_pass(call, iterations, payload, snapshot if profiling else None)
+            samples, wall_ns = measure_pass(call, iterations, payload, snapshot if profiling else None,
+                                           prepare=prepare, verify=check)
             report["samples"][phase] = samples
             metrics = {key: summarize([sample[key] for sample in samples], payload)
-                       for key in ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns", "aiv_body_ns", "aiv_scatter_ns")
+                       for key in PAYLOAD_TIMINGS
                        if key in samples[0]}
             # Non-payload subphases get latency statistics, without misleading bandwidths.
             for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns",
-                        "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns"):
+                        "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns",
+                        "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns"):
                 if key in samples[0]:
                     values = [s[key] for s in samples]
                     metrics[key] = dict(mean_ms=sum(values) / len(values) / 1e6,
                                         min_ms=min(values) / 1e6, max_ms=max(values) / 1e6)
             metrics.update(loop_wall_ms=wall_ns / 1e6, loop_effective_gbps=payload * iterations / wall_ns,
                            instrumentation_overhead_included=profiling,
-                           profile_snapshot_in_sample=False)
+                           profile_snapshot_in_sample=False,
+                           loop_includes_setup_and_verification=True)
             report["summary"][phase] = metrics
-            check(iterations - 1)  # Validate the measured output before any new launch overwrites it.
             if profiling:
                 runtime.stop_scatter_profile()
-            verify()
+        if args.input_mode == "steady":
+            runtime.release_access_table(current.pop("table"))
+            current.pop("view")
+            runtime.batch_free(keys)
     finally:
         shutdown_runtime(runtime)
     write_results(args, report)

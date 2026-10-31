@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scatter_perf_common import CPU_MAGIC, PROFILE_MAGIC, profile_metrics, summarize
+from scatter_perf_common import CPU_MAGIC, PROFILE_MAGIC, profile_metrics, request_values, sample_metrics, summarize
 from test_aiv_scatter_perf import arguments, main, measure_pass, write_results
 
 
@@ -47,6 +47,56 @@ class ScatterPerfTests(unittest.TestCase):
         self.assertEqual(result["aiv_build_notify_ns"], 10)
         self.assertEqual(result["aiv_notify_to_done_ns"], 80)
         self.assertEqual(profile_metrics(profiles(), 3, 19, 656, 50)["aiv_scatter_ns"], 840)
+        self.assertEqual(result["aiv_wall_ns"], 2142)
+        self.assertEqual(result["aiv_launch_skew_ns"], 2000)
+        self.assertEqual(result["aiv_wall_ns"], sum(result[key] for key in (
+            "aiv_input_wall_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "aiv_scatter_tail_ns")))
+
+    def test_full_blocks_and_capacity_are_independent(self):
+        args = arguments(["--request-length", "8192"])
+        self.assertEqual((args.blocks, args.tokens_per_block, args.token_bytes), (1024, 4, 656))
+        self.assertEqual((args.request_length, args.miss_count), (8192, 4096))
+        self.assertEqual(args.miss_count * args.token_bytes, 2686976)
+        indices, offsets, rows = request_values(args, 1234)
+        sources = [block * 4 + offset // 656 for block, offset in zip(indices[:4096], offsets[:4096])]
+        self.assertEqual(sorted(sources), list(range(4096)))
+        self.assertEqual(sorted(rows[:4096]), list(range(4096)))
+        self.assertTrue(all(part[4096:] == [-1] * 4096 for part in (indices, offsets, rows)))
+
+    def test_aicpu_reference_reads_one_token_per_block(self):
+        args = arguments(["--workload", "one-token-per-block", "--output-row-step", "2"])
+        self.assertEqual((args.miss_count, args.request_length), (1024, 1024))
+        indices, offsets, rows = request_values(args, 1234)
+        self.assertEqual(sorted(indices), list(range(1024)))
+        self.assertTrue(all(offset in (0, 656, 1312, 1968) for offset in offsets))
+        self.assertEqual(sorted(rows), list(range(0, 2048, 2)))
+
+    def test_partial_and_explicit_sampled_workloads(self):
+        args = arguments(["--active-percent", "75"])
+        self.assertEqual((args.request_length, args.miss_count), (4096, 3072))
+        self.assertEqual(request_values(args, 3)[0][3072:], [-1] * 1024)
+        args = arguments(["--workload", "sampled-tokens", "--requests", "8194"])
+        self.assertEqual(args.miss_count, 8194)
+        args = arguments(["--source-pattern", "sequential", "--output-order", "sequential"])
+        indices, offsets, rows = request_values(args, 3)
+        self.assertEqual(indices[:8], [0] * 4 + [1] * 4)
+        self.assertEqual(offsets[:8], [0, 656, 1312, 1968] * 2)
+        self.assertEqual(rows, list(range(4096)))
+
+    def test_per_call_bandwidth_and_critical_path_close(self):
+        sample = dict(payload_bytes=1000, end_to_end_ns=3000,
+                      **profile_metrics(profiles(), 3, 19, 656, 1000))
+        result = sample_metrics(sample)
+        self.assertEqual(result["cpu_comm_gbps"], 1 / 3)
+        self.assertEqual(result["end_to_end_gbps"], 1 / 3)
+        self.assertEqual(result["end_to_end_us"], 3)
+        self.assertEqual(result["call_outside_aiv_ns"], 858)
+        self.assertEqual(result["end_to_end_ns"], sum(result[key] for key in (
+            "call_outside_aiv_ns", "aiv_input_wall_ns", "aiv_build_notify_ns",
+            "aiv_notify_to_done_ns", "aiv_scatter_tail_ns")))
+        for change in (dict(end_to_end_ns=1), dict(cpu_comm_ns=0), dict(payload_bytes=0)):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                sample_metrics(dict(sample, **change))
 
     def test_idle_workers_do_not_change_payload_numerator(self):
         result = profile_metrics(profiles(8, 1, 32), 8, 1, 32, 1000)
@@ -92,8 +142,26 @@ class ScatterPerfTests(unittest.TestCase):
         self.assertEqual(wall, 20)
         self.assertTrue(all("cpu_comm_ns" not in s for s in samples))
 
+    def test_each_call_excludes_input_refresh_and_full_verification(self):
+        now, events = [0], []
+        def phase(name, duration):
+            def run(index):
+                events.append((name, index))
+                now[0] += duration
+            return run
+        samples, wall = measure_pass(phase("get", 10), 2, 64, clock=lambda: now[0],
+                                     prepare=phase("refresh", 100), verify=phase("check", 1000))
+        self.assertEqual(events, [(name, i) for i in range(2) for name in ("refresh", "get", "check")])
+        self.assertEqual([s["end_to_end_ns"] for s in samples], [10, 10])
+        self.assertEqual([s["end_to_end_gbps"] for s in samples], [6.4, 6.4])
+        self.assertEqual(wall, 2220)
+
     def test_cli_validation_and_skip_before_hardware_import(self):
         for args in (["--requests", "0"], ["--cores", "9"], ["--iterations", "0"],
+                     ["--request-length", "4095"], ["--miss-count", "4097"],
+                     ["--workload", "one-token-per-block", "--miss-count", "1025"],
+                     ["--miss-count", "1", "--active-percent", "75"],
+                     ["--output-pattern", "dense", "--output-row-step", "2"],
                      ["--aiv-clock-mhz", "nan"], ["--token-bytes", "65536"],
                      ["--json", "same", "--csv", "same"],
                      ["--token-bytes", "65535", "--tokens-per-block", "65536"]):
@@ -105,7 +173,9 @@ class ScatterPerfTests(unittest.TestCase):
     def test_json_and_csv_keep_units_and_raw_samples(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            args = arguments(["--json", str(root / "result.json"), "--csv", str(root / "result.csv")])
+            args = arguments(["--blocks", "1", "--tokens-per-block", "1",
+                              "--request-length", "8192",
+                              "--json", str(root / "result.json"), "--csv", str(root / "result.csv")])
             report = dict(config={"units": "decimal GB/s"}, summary={}, samples={
                 "baseline": [dict(iteration=0, payload_bytes=656, end_to_end_ns=1000)],
                 "profiled": [dict(iteration=0, payload_bytes=656, end_to_end_ns=2000,
@@ -116,7 +186,16 @@ class ScatterPerfTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([r["phase"] for r in rows], ["baseline", "profiled"])
             self.assertEqual(rows[1]["cpu_comm_ns"], "500")
+            self.assertEqual(rows[0]["request_length"], "8192")
+            self.assertEqual(rows[0]["miss_count"], "1")
+            self.assertEqual(rows[0]["calls"], "1")
+            self.assertAlmostEqual(float(rows[0]["end_to_end_gbps"]), .656)
+            self.assertAlmostEqual(float(rows[1]["cpu_comm_gbps"]), 1.312)
+            self.assertEqual(rows[0]["end_to_end_us"], "1.0")
             self.assertNotIn("workers", rows[1])
+            report["samples"]["baseline"][0]["payload_bytes"] = 8192 * 656
+            with self.assertRaises(ValueError):
+                write_results(args, report)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,29 @@
 `tests/run_remote_cpu_scatter_perf.sh`。固定选择 `cpu_push_scatter`，使用真实
 CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 
+**一个样本就是一次同步 BatchGet，不是多次调用的总耗时，也不是单 token 耗时。**
+默认 `1024 blocks × 4 tokens/block × 656 B`，每次取满 4096 个 token，
+有效载荷为 **2,686,976 B**。`--request-length` 只控制输入 Tensor 容量，
+`--miss-count` 控制这次调用实际处理的 token 前缀，两者独立。
+例如容量 8192、miss_count 4096，一次只传输 4096 个 token；无效后缀填 -1 并检查不被访问。
+
+测试设置参考本地 `aicpu-urma` 分支的
+`access_operator/demo/aicpu_batch_get/python/test_batch_get.py`：每轮改变源 payload、
+源索引/偏移和输出映射，计时前 BatchPut/准备表，计时后校验整个 output/guard，
+并先由后继 NPU 算子消费结果。默认输出为随机排列的相邻行。
+参考脚本每个 block 只随机取一个 token，不会自动取满 tokens-per-block；
+严格复现这个请求语义使用 `--workload one-token-per-block`。
+
+| workload | 默认每次有效请求数（1024 blocks、4 tokens/block） | 每次有效字节数 |
+| --- | ---: | ---: |
+| `full-blocks`（默认） | 4096，每个 block 的四个 token 各取一次 | 2,686,976 |
+| `one-token-per-block`（AICPU 参考语义） | 1024，每个 block 随机取一个 token | 671,744 |
+| `sampled-tokens` | 默认等于 request-length，允许重复采样 | miss_count × 656 |
+
+`--active-percent 75` 或显式 `--miss-count` 可以测量部分前缀。
+旧 `--requests` 现为 `--request-length` 的别名，不再隐式决定有效前缀。
+旧脚本的 `--requests 8194` 则确实代表一次调用完成 8194 项，其结果不能直接当成新默认形状的性能。
+
 ## 构建与运行
 
 首次使用计时需要同时更新 CPU 服务、NPU Host/Python binding 和 scatter kernel。
@@ -27,45 +50,68 @@ export DEVICE_ID=7
 export KVAF_NPU_EIDS=000000000000020000100000df00e100
 mkdir -p results
 bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
-  --cores 1 --requests 8193 --token-bytes 656 \
-  --blocks 1024 --tokens-per-block 4 --plans 2 \
-  --warmup 20 --iterations 100 --profile-warmup 5 --profile-iterations 20 \
-  --json results/scatter-c1-n8193-t656.json \
-  --csv results/scatter-c1-n8193-t656.csv \
-  2>&1 | tee results/scatter-c1-n8193-t656.log
+  --cores 4 --workload full-blocks --input-mode changing \
+  --blocks 1024 --tokens-per-block 4 --token-bytes 656 \
+  --request-length 8192 --miss-count 4096 \
+  --output-row-step 1 --output-order random \
+  --warmup 50 --iterations 1000 --profile-warmup 1 --profile-rounds 100 \
+  --json results/scatter-c4-b1024-t4.json \
+  --csv results/scatter-c4-b1024-t4.csv \
+  2>&1 | tee results/scatter-c4-b1024-t4.log
 ```
 
 CPU 位于另一台机器时，地址改为实际 CPU_IP。脚本默认总超时 600 秒，可通过
 `KVAF_SCATTER_PERF_TIMEOUT` 覆盖。硬件测试未 opt in 时，Python 入口返回 77；
 包装脚本会显式设置 opt in。使用 `--help` 查看完整参数。
+未提供输出路径时，包装脚本自动在 `results/aiv-scatter-时间-进程号.{json,csv}` 写入两种结果。
+`KVAF_SCATTER_PERF_RESULT_PREFIX` 可覆盖默认结果前缀。
+
+与 AICPU 的每 block 单 token 测试比较时，保持相同 worker 数、输出布局和轮次，改为：
+
+```bash
+bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
+  --cores 4 --workload one-token-per-block --input-mode changing \
+  --blocks 1024 --tokens-per-block 4 --token-bytes 656 \
+  --request-length 1024 --miss-count 1024 \
+  --output-row-step 1 --output-order random \
+  --warmup 50 --iterations 1000 --profile-rounds 100
+```
 
 ## 测试过程
 
-1. 预先构造确定性的 CPU 源数据，经 BatchPut 写入服务端 DDR，并准备 access table。
-   预分配多个随机源请求计划、output 和 stream，计时区间内不创建请求 Tensor。
-2. 在测量前逐计划执行一次全输出/guard 校验。
+1. 预分配并复用设备 source、请求 Tensor、output 和 stream。默认 changing 模式
+   每轮更新 payload 和请求，将 output 重置为 guard，经 BatchPut 写入 DDR，准备新的 access table。
+   这些操作及同步都在该次计时开始前完成。
+2. 每个样本只调用一次 `batch_get(..., synchronize=True)`，等待有效前缀全部传输、
+   scatter 及业务状态检查完成后停止计时。
 3. `baseline` 轮关闭 CPU/AIV 细分打点：预热后测量同步 `BatchGet`。
 4. `profiled` 轮开启打点，单独预热后采样。每次调用完成后，在计时区间外读取
    对应 sequence 的每核报告，并验证 magic、顺序、字节数和 CPU 报告存在性。
-5. 每轮先校验最后一次被测调用留下的实际 output，再逐计划做回归校验。最终
-   Shutdown 成功后才写 JSON/CSV 并打印 PASS。
+5. 每个预热/采样调用结束后先由 NPU 消费 output，再回读并校验完整 output/guard。
+   changing 模式随后释放该轮 access table 和 keys，下轮重新填充。
+   最终 Shutdown 成功后才写 JSON/CSV 并打印 PASS。
 
 源数据、初始化、BatchPut、请求生成及正确性回读不计入 BatchGet 样本。
-`setup_ms` 单独记录初始化和 BatchPut。默认 strided output 是随机奇数行，
-保留空洞/首尾 guard；`--output-pattern dense` 使用随机连续行集合。
-每轮请求计划循环复用，CPU WR plan 可命中缓存，这是稳态复用场景。
-默认 `--source-pattern random`；可改成 `sequential` 比较 CPU DDR 源访问局部性。
+`setup_ms` 记录初始化；steady 模式额外记录初次 BatchPut。
+默认 `--output-row-step 1 --output-order random`：随机排列相邻输出行；
+`--output-row-step 2` 留输出空洞，`--output-order sequential` 按行顺序输出。
+`--output-pattern dense/strided` 是 row-step 1/2 的兼容别名。
+`--input-mode steady --plans 2` 复用源 payload、access table 和两个请求计划，
+仍逐次重置并校验 output；这是额外的固定输入对照，不能混同 changing 结果。
+默认 `--source-pattern random`：full-blocks 随机排列不重复 token，one-token-per-block
+随机排列不重复 block 并各选一个随机 token；sampled-tokens 才允许重复源 token。
+改为 `sequential` 可以比较源访问顺序。
 
 纯基线测试使用 `--profile-iterations 0`。这时不要求 profile API、不读取时钟
 打点、不回传 CPU 报告。端到端 Python 计时仍然有效。
 
 ## 指标定义
 
-设有效 payload 为 `requests * token_bytes`。带宽统一为十进制 GB/s，
+设有效 payload 为 **`miss_count * token_bytes`**，与请求数组容量无关。带宽统一为十进制 GB/s，
 `GB/s = payload_bytes / elapsed_ns`。不是 GiB/s，也不把 HBM 读写计作双倍有效载荷。
 多样本带宽用 `sum(payload_bytes) / sum(elapsed_ns)`，不平均各次带宽。
 
-| JSON 指标 | 计时区间 | 带宽含义 |
+| JSON/CSV 指标 | 计时区间 | 带宽含义 |
 | --- | --- | --- |
 | `baseline.end_to_end_ns` | Python 调用同步 BatchGet，直到传输、scatter、状态 D2H/同步及业务状态核验完成 | 正常完整通路有效带宽，作为主要性能结果 |
 | `profiled.end_to_end_ns` | 相同区间，启用计时报告 | 包含打点和报告传输开销，用于对照 |
@@ -79,11 +125,42 @@ CPU 位于另一台机器时，地址改为实际 CPU_IP。脚本默认总超时
 | `aiv_notify_to_done_ns` | core 0 notify 发布完成 → 观察到本轮 done | 包含 CPU 接收/读取、WRITE、报告回传及 done 的往返等待 |
 | `aiv_scatter_ns` | 各核看到 done → 本核 GM→UB→output 完成，取每核时长最大值 | 本地 scatter 的有效带宽，包含地址/cache/同步开销 |
 
+CSV 每一行还直接提供对应的 `_us` 和有效载荷带宽字段：
+`end_to_end_gbps`、`cpu_comm_gbps`、`cpu_write_gbps`、`aiv_body_gbps`、
+`aiv_wall_gbps`、`aiv_scatter_gbps`。header、post、CQ 等子阶段只给延迟，不拿全量 payload
+除以这些子阶段耗时生成误导性的带宽。baseline 只包含调用级计时和带宽，CPU/AIV 列留空。
+
+`calls=1`、`source_blocks`、`tokens_per_block`、`request_length`、`miss_count`、
+`payload_bytes`、`workload`、`input_mode` 和输出布局逐行记录，避免把源表、容量、有效请求混为一谈。
+
+多核还提供以下调用级时间线。所有 AIV 核使用同一个系统计数器：
+
+| 字段 | 定义 |
+| --- | --- |
+| `aiv_wall_ns` | 最早核 start → 最晚核 finish，包含核启动差异 |
+| `aiv_input_wall_ns` | 最早核 start → core 0 输入准备完成 |
+| `aiv_build_notify_ns` | core 0 输入准备完成 → notify |
+| `aiv_notify_to_done_ns` | core 0 notify → core 0 观察到 done |
+| `aiv_scatter_tail_ns` | core 0 观察到 done → 最晚核 finish；含其他核观察 done 的差异 |
+| `aiv_launch_skew_ns` | 最晚核 start − 最早核 start，诊断启动偏斜 |
+| `call_outside_aiv_ns` | Python 单次同步调用时长 − aiv_wall；包含 binding、launch、设备末尾收尾及同步/状态检查，不是纯 Host 时间 |
+
+其中四个不重叠的 AIV 时间段严格满足：
+
+```text
+aiv_wall = input_wall + build_notify + notify_to_done + scatter_tail
+end_to_end = call_outside_aiv + aiv_wall
+```
+
+`call_outside_aiv` 是两个已分别计算好的时长之差，不对 Host/device 绝对时间戳做相减；
+若 AIV wall 大于同步调用时长，测试报错，需检查计数器换算。
+旧 `aiv_body`/`aiv_scatter` 保留“最大单核区间”的含义，不能将各阶段单独取最大值后相加。
+
 `cpu_comm_ns` 包含 CPU posting、四路 Jetty 的 ready 控制 WRITE、波次间间隔和
 完成轮询处理；不是纯链路时延或理论线速。CPU 只在全部 payload/ready CQ 完成
 后发布 done。AIV 的 notify→done 不能替代 CPU→HBM 通信窗口。
 
-CPU、Host、AIV 分别在自己的时钟域计算差值，不跨域相减，也不把重叠阶段相加
+CPU、Host、AIV 分别在自己的时钟域计算时长，不跨域相减绝对时间戳，也不把重叠阶段相加
 解释为端到端耗时。AIV 原始周期保存在 JSON `workers` 中。Ascend 950PR/950DT
 的 GetSystemCycle 计数器按 1 GHz 换算，默认 `--aiv-clock-mhz 1000`，依据
 [CANN GetSystemCycle 文档](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/tool_interface/system_resources_and_variables/GetSystemCycle_ISASI.md)。
@@ -96,7 +173,13 @@ mean/min/p50/p95/max 毫秒和 `effective_gbps`。JSON 保存配置、Get/Put SH
 汇总、每次原始样本、CPU ns 和每核 AIV cycle。CSV 保存扁平样本，方便绘图。
 
 `loop_effective_gbps` 使用整轮 wall time，包含 Python 循环开销；profiled 轮还
-包含逐次 snapshot 的 D2H/转换开销。它与逐调用时间之和得到的带宽口径不同。
+包含逐次 snapshot 的 D2H/转换开销。整轮还包含输入准备、BatchPut、表准备、
+NPU 消费和完整校验，因此只是整个测试程序的 wall 吞吐，不是 BatchGet 带宽。
+业务性能比较使用 `end_to_end_ns.effective_gbps`（汇总）和 `end_to_end_gbps`（每次）。
+
+执行算法也要区分：当前 AIV 先观察整批 done，再开始本地 scatter；AICPU 参考路径按
+1024 行 chunk 的共同 ready 前缀流水消费，CPU WRITE 可以与 AICPU scatter 重叠。
+对齐测试输入不会自动消除这项实现差异。同步调用完成始终表示整个有效前缀已完成。
 
 profiled 轮新增 CPU 本地计时、每核 128 B 报告和一个 56 B 控制 WRITE/CQ 等待，
 后者在 done 之前完成以保证报告先于完成标记可见，避免依赖 64 B WRITE 原子性。
@@ -110,17 +193,18 @@ snapshot D2H 不计入单次计时。`instrumentation_overhead_included=true` �
 ```bash
 set -euo pipefail
 for cores in 1 3 8; do
-  for requests in 19 4096 8193 65536; do
-    name="scatter-c${cores}-n${requests}-t656"
+  for blocks in 256 1024 4096; do
+    name="scatter-c${cores}-b${blocks}-t4"
     bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
-      --cores "$cores" --requests "$requests" --token-bytes 656 \
+      --cores "$cores" --blocks "$blocks" --tokens-per-block 4 --token-bytes 656 \
       --json "results/${name}.json" --csv "results/${name}.csv" \
       2>&1 | tee "results/${name}.log"
   done
 done
 ```
 
-大 token 的分块边界测试可使用 `--requests 19 --blocks 16 --token-bytes 16385`
+大 token 的分块边界测试可使用
+`--workload sampled-tokens --request-length 19 --blocks 16 --token-bytes 16385`
 或 65535，避免把边界测试变成大内存分配测试。配置日志提供 source/output/staging
 字节数。记录 CPU 服务构建方式、线程绑核和两端是否存在其他负载后再比较结果。
 
