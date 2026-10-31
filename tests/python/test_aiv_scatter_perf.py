@@ -15,6 +15,19 @@ from aiv_kernel_metadata import check_aiv_kernel_metadata
 from scatter_perf_common import PAYLOAD_TIMINGS, profile_metrics, request_values, sample_metrics, summarize
 
 
+# Stable compact layout, including for baseline-only or profiled-only runs.
+# Raw ns, worker cycles and less common diagnostics remain in the JSON report.
+CSV_COLUMNS = (
+    "phase", "iteration", "sequence", "cores", "fused_build", "double_buffer",
+    "request_length", "miss_count", "token_bytes", "payload_bytes",
+    "end_to_end_us", "end_to_end_gbps", "cpu_comm_us", "cpu_comm_gbps",
+    "aiv_build_notify_us", "aiv_scatter_us", "aiv_scatter_gbps",
+    "cpu_write_us", "cpu_write_gbps", "aiv_body_us", "aiv_body_gbps",
+    "aiv_wall_us", "aiv_wall_gbps", "aiv_input_wall_us", "aiv_notify_to_done_us",
+    "aiv_scatter_tail_us", "call_outside_aiv_us",
+)
+
+
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", choices=("full-blocks", "one-token-per-block", "sampled-tokens"),
@@ -151,19 +164,24 @@ def write_results(args, report):
         args.json.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
-        rows = [dict(phase=phase, calls=1, cores=args.cores, workload=args.workload,
-                     fused_build=args.fused_build, double_buffer=args.double_buffer,
-                     input_mode=args.input_mode, source_blocks=args.blocks,
-                     tokens_per_block=args.tokens_per_block, request_length=args.request_length,
-                     miss_count=args.miss_count, requests=args.miss_count, token_bytes=args.token_bytes,
-                     output_order=args.output_order, output_row_step=args.output_row_step,
-                     **{k: v for k, v in sample_metrics(sample).items() if k != "workers"})
-                for phase, samples in report["samples"].items() for sample in samples]
-        columns = list(dict.fromkeys(k for row in rows for k in row))
         with args.csv.open("w", newline="", encoding="utf-8") as output:
-            writer = csv.DictWriter(output, fieldnames=columns)
+            writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
             writer.writeheader()
-            writer.writerows(rows)
+            for phase, samples in report["samples"].items():
+                for sample in samples:
+                    values = dict(phase=phase, cores=args.cores, fused_build=args.fused_build,
+                                  double_buffer=args.double_buffer, request_length=args.request_length,
+                                  miss_count=args.miss_count, token_bytes=args.token_bytes,
+                                  **sample_metrics(sample))
+                    row = {}
+                    for key in CSV_COLUMNS:
+                        value = values.get(key, "")
+                        if value != "" and key.endswith("_us"):
+                            value = f"{value:.3f}"
+                        elif value != "" and key.endswith("_gbps"):
+                            value = f"{value:.6f}"
+                        row[key] = value
+                    writer.writerow(row)
 
 
 def main(argv=None):

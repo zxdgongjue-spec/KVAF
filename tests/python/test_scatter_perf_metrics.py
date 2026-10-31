@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from scatter_perf_common import CPU_MAGIC, PROFILE_MAGIC, profile_metrics, request_values, sample_metrics, summarize
-from test_aiv_scatter_perf import arguments, main, measure_pass, write_results
+from test_aiv_scatter_perf import CSV_COLUMNS, arguments, main, measure_pass, write_results
 
 
 def profiles(cores=3, requests=19, token=656):
@@ -192,7 +192,7 @@ class ScatterPerfTests(unittest.TestCase):
         with patch.dict("os.environ", {"KVAF_RUN_NPU_TESTS": "0"}), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main([]), 77)
 
-    def test_json_and_csv_keep_units_and_raw_samples(self):
+    def test_compact_csv_keeps_us_and_bandwidth_while_json_keeps_raw_samples(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = arguments(["--blocks", "1", "--tokens-per-block", "1",
@@ -206,21 +206,69 @@ class ScatterPerfTests(unittest.TestCase):
             write_results(args, report)
             self.assertEqual(json.loads(args.json.read_text()), report)
             with args.csv.open(newline="") as stream:
-                rows = list(csv.DictReader(stream))
+                reader = csv.DictReader(stream)
+                rows = list(reader)
+                self.assertEqual(reader.fieldnames, list(CSV_COLUMNS))
+            self.assertEqual(len(CSV_COLUMNS), 27)
+            self.assertFalse(any(k.endswith("_ns") for k in CSV_COLUMNS))
             self.assertEqual([r["phase"] for r in rows], ["baseline", "profiled"])
-            self.assertEqual(rows[1]["cpu_comm_ns"], "500")
+            self.assertEqual(rows[1]["cpu_comm_us"], "0.500")
+            self.assertEqual(rows[0]["cpu_comm_us"], "")
+            self.assertEqual(rows[0]["sequence"], "")
             self.assertEqual(rows[0]["request_length"], "8192")
             self.assertEqual(rows[0]["miss_count"], "1")
-            self.assertEqual(rows[0]["calls"], "1")
+            self.assertNotIn("calls", rows[0])
+            self.assertNotIn("requests", rows[0])
             self.assertEqual(rows[0]["fused_build"], "0")
             self.assertEqual(rows[0]["double_buffer"], "1")
             self.assertAlmostEqual(float(rows[0]["end_to_end_gbps"]), .656)
             self.assertAlmostEqual(float(rows[1]["cpu_comm_gbps"]), 1.312)
-            self.assertEqual(rows[0]["end_to_end_us"], "1.0")
+            self.assertEqual(rows[0]["end_to_end_us"], "1.000")
             self.assertNotIn("workers", rows[1])
             report["samples"]["baseline"][0]["payload_bytes"] = 8192 * 656
             with self.assertRaises(ValueError):
                 write_results(args, report)
+
+    def test_compact_csv_has_stable_columns_and_distinguishes_control_and_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = arguments(["--cores", "4", "--request-length", "8192", "--miss-count", "1024",
+                              "--token-bytes", "4096", "--csv", str(Path(temporary) / "result.csv")])
+            # A measured 4 MiB request: a ~4 us descriptor READ must not be
+            # exported as payload communication, or build time as scatter.
+            sample = dict(iteration=0, sequence=1052, payload_bytes=4194304, end_to_end_ns=442120,
+                          cpu_header_ns=2720, cpu_descriptor_ns=3790, cpu_write_ns=146920,
+                          cpu_comm_ns=133960, cpu_post_ns=6770, cpu_cq_wait_ns=127190,
+                          aiv_body_ns=330797, aiv_input_ns=6492, aiv_build_notify_ns=103302,
+                          aiv_notify_to_done_ns=161028, aiv_scatter_ns=59863, aiv_wall_ns=330816,
+                          aiv_input_wall_ns=6493, aiv_scatter_tail_ns=59993, aiv_launch_skew_ns=46,
+                          snapshot_ns=104250)
+            for phases in ({"baseline": [dict(iteration=0, payload_bytes=4194304, end_to_end_ns=442120)]},
+                           {"profiled": [sample]},
+                           {"baseline": [dict(iteration=0, payload_bytes=4194304, end_to_end_ns=442120)],
+                            "profiled": [sample]}):
+                with self.subTest(phases=list(phases)):
+                    write_results(args, dict(samples=phases))
+                    with args.csv.open(newline="") as stream:
+                        reader = csv.DictReader(stream)
+                        rows = list(reader)
+                        self.assertEqual(reader.fieldnames, list(CSV_COLUMNS))
+                    row = rows[-1]
+                    self.assertEqual(row["end_to_end_us"], "442.120")
+                    self.assertEqual(row["payload_bytes"], "4194304")
+                    for diagnostic in ("cpu_descriptor_us", "cpu_post_us", "cpu_cq_wait_us",
+                                       "aiv_input_us", "aiv_launch_skew_us", "snapshot_us"):
+                        self.assertNotIn(diagnostic, row)
+                    if "profiled" in phases:
+                        self.assertEqual(row["cpu_comm_us"], "133.960")
+                        self.assertEqual(row["aiv_build_notify_us"], "103.302")
+                        self.assertEqual(row["aiv_scatter_us"], "59.863")
+                        for timing in ("end_to_end", "cpu_comm", "cpu_write", "aiv_body",
+                                       "aiv_wall", "aiv_scatter"):
+                            self.assertAlmostEqual(float(row[timing + "_gbps"]),
+                                                   4194304 / sample[timing + "_ns"], places=6)
+                        self.assertAlmostEqual(float(row["end_to_end_us"]), sum(float(row[k]) for k in (
+                            "aiv_input_wall_us", "aiv_build_notify_us", "aiv_notify_to_done_us",
+                            "aiv_scatter_tail_us", "call_outside_aiv_us")), places=3)
 
 
 if __name__ == "__main__":

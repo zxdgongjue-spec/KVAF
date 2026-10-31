@@ -193,10 +193,11 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 ## 指标定义
 
 设有效 payload 为 **`miss_count * token_bytes`**，与请求数组容量无关。带宽统一为十进制 GB/s，
-`GB/s = payload_bytes / elapsed_ns`。不是 GiB/s，也不把 HBM 读写计作双倍有效载荷。
+`GB/s = payload_bytes / elapsed_ns = payload_bytes / (elapsed_us * 1000)`。
+不是 GiB/s，也不把 HBM 读写计作双倍有效载荷。
 多样本带宽用 `sum(payload_bytes) / sum(elapsed_ns)`，不平均各次带宽。
 
-| JSON/CSV 指标 | 计时区间 | 带宽含义 |
+| JSON 原始指标（CSV 核心耗时改用同名 `_us`） | 计时区间 | 带宽含义 |
 | --- | --- | --- |
 | `baseline.end_to_end_ns` | Python 调用同步 BatchGet，直到传输、scatter、状态 D2H/同步及业务状态核验完成 | 正常完整通路有效带宽，作为主要性能结果 |
 | `profiled.end_to_end_ns` | 相同区间，启用计时报告 | 包含打点和报告传输开销，用于对照 |
@@ -210,13 +211,38 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 | `aiv_notify_to_done_ns` | core 0 notify 发布完成 → 观察到本轮 done | 包含 CPU 接收/读取、WRITE、报告回传及 done 的往返等待 |
 | `aiv_scatter_ns` | 各核看到 done → 本核 GM→UB→output 完成，取每核时长最大值 | 本地 scatter 的有效带宽，包含地址/cache/同步开销 |
 
-CSV 每一行还直接提供对应的 `_us` 和有效载荷带宽字段：
-`end_to_end_gbps`、`cpu_comm_gbps`、`cpu_write_gbps`、`aiv_body_gbps`、
-`aiv_wall_gbps`、`aiv_scatter_gbps`。header、post、CQ 等子阶段只给延迟，不拿全量 payload
-除以这些子阶段耗时生成误导性的带宽。baseline 只包含调用级计时和带宽，CPU/AIV 列留空。
+CSV 使用固定的 **27 列**，baseline-only、profiled-only 和混合采样的表头/顺序一致。
+所有耗时只写 `_us`，保留 3 位小数；带宽为 GB/s，保留 6 位小数。
+内部计时、计时边界及带宽分子保持原定义；JSON 保留原始 ns、完整指标、每核报告和完整测试配置。
 
-`calls=1`、`source_blocks`、`tokens_per_block`、`request_length`、`miss_count`、
-`payload_bytes`、`workload`、`input_mode` 和输出布局逐行记录，避免把源表、容量、有效请求混为一谈。
+| CSV 分组 | 保留列 |
+| --- | --- |
+| 标识与规模（10 列） | `phase`、`iteration`、`sequence`、`cores`、`fused_build`、`double_buffer`、`request_length`、`miss_count`、`token_bytes`、`payload_bytes` |
+| 核心耗时（11 列） | `end_to_end_us`、`cpu_comm_us`、`aiv_build_notify_us`、`aiv_scatter_us`、`cpu_write_us`、`aiv_body_us`、`aiv_wall_us`、`aiv_input_wall_us`、`aiv_notify_to_done_us`、`aiv_scatter_tail_us`、`call_outside_aiv_us` |
+| 有效带宽（6 列） | `end_to_end_gbps`、`cpu_comm_gbps`、`aiv_scatter_gbps`、`cpu_write_gbps`、`aiv_body_gbps`、`aiv_wall_gbps` |
+
+端到端、通信和 scatter 的耗时/带宽列相邻放置。`calls=1` 和重复的 `requests` 不再逐行输出。
+workload、input_mode、source_blocks、tokens_per_block 和输出布局统一查看 JSON `config`。
+header/descriptor/post/CQ、最大单核 input、launch skew、snapshot 等诊断耗时只保留在 JSON，
+CSV 不再输出这些字段或任何 `_ns` 列。baseline 的 CPU/AIV 和 sequence 列留空，不写成 0。
+仍然每行只对应一次同步 BatchGet，不把数组容量当作有效请求数。
+
+读取数据应使用 `csv.DictReader` 等方式按表头取值。旧 CSV 的列顺序由实际包含的采样字段决定，
+不要把旧表头或固定列号套到另一个版本上。例如双优化 4 MiB 样本首行的原始值是：
+
+```text
+cpu_descriptor_us    =   3.790   # CPU READ 1024 个源地址，共 8192 B；仅在 JSON 保留
+cpu_comm_us          = 133.960   # CPU WRITE 4 MiB payload 及 ready 的通信窗口
+aiv_build_notify_us = 103.302   # AIV 校验、清单生成和通知
+aiv_scatter_us      =  59.863   # HBM staging -> UB -> output
+cpu_comm_gbps       =  31.310122
+```
+
+约 4 us 和 103 us 在该样本中分别属于地址清单 READ 和构建阶段，不能当作 CPU payload 通信和 scatter。
+如果套用了新增 `fused_build`、`double_buffer` 之前的旧表头，后续指标会错位两列：
+旧 `cpu_comm_us` 恰好读到新 `cpu_descriptor_us`，旧 `aiv_scatter_us` 恰好读到新 `aiv_build_notify_us`。
+如果另一个新样本确实按表头显示 4 MiB 的 `cpu_comm_us=4`，其带宽应为 1048.576 GB/s，
+与上述约 31 GB/s 的通信窗口不一致，需要连同表头、payload 和计时原始记录检查。
 
 多核还提供以下调用级时间线。所有 AIV 核使用同一个系统计数器：
 
@@ -255,7 +281,7 @@ CPU、Host、AIV 分别在自己的时钟域计算时长，不跨域相减绝对
 
 控制台每轮结束后输出 `SCATTER_PERF_RESULT`，带有效载荷的指标包含
 mean/min/p50/p95/max 毫秒和 `effective_gbps`。JSON 保存配置、Get/Put SHA-256、
-汇总、每次原始样本、CPU ns 和每核 AIV cycle。CSV 保存扁平样本，方便绘图。
+汇总、每次原始样本、CPU ns 和每核 AIV cycle。CSV 保存固定 27 列的精简样本，方便绘图。
 
 `loop_effective_gbps` 使用整轮 wall time，包含 Python 循环开销；profiled 轮还
 包含逐次 snapshot 的 D2H/转换开销。整轮还包含输入准备、BatchPut、表准备、
@@ -271,7 +297,7 @@ profiled 轮新增 CPU 本地计时、每核 128 B 报告和一个 56 B 控制 W
 该控制 WRITE 不计入 `cpu_comm_ns`，但会增加 AIV 等待和该轮端到端时间。
 snapshot D2H 不计入单次计时。`instrumentation_overhead_included=true` 标记该轮，
 不要把它作为关闭打点后的基线性能。热路径不打印逐请求计时日志。
-`snapshot_ns` 单独记录回读/转换耗时，CSV 同时记录 sequence 便于对应原始请求。
+`snapshot_ns` 在 JSON 中单独记录回读/转换耗时；CSV 记录 sequence 便于对应 JSON 原始请求。
 
 ## 扩展组合
 
