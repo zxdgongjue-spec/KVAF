@@ -22,9 +22,10 @@ RUN_LABEL = "serial"   # 手工标注串行 / chunk 流水等对照版本
 `KVAF_NPU_CORE_COUNT=1/3/8` 设置。源码区还可配置源表规模、每个 block 的
 token 数、SGL 和随机种子；比较不同实现时保持这些值一致。
 
-`PROFILE_CLOCK_MHZ` 默认不填，只输出 AIV 原始 cycle。确认部署平台的
-`GetSystemCycle()` 计数器频率后才填写 MHz，脚本再额外换算微秒；不能将
-AI Core 主频或某个固定默认值直接作为该频率。
+当前测试设备已确认为 Ascend 950DT，`PROFILE_CLOCK_MHZ` 默认设为 `1000`，
+脚本和 CSV 自动将 AIV cycle 换算成微秒，并保留原始 cycle。更换设备时，
+须按对应平台的 `GetSystemCycle()` 计数器频率调整，不能使用 AI Core 主频。
+若尚未确认新设备的频率，可设为 `None`，此时只输出原始 cycle。
 
 ### 如何确认 clock_mhz
 
@@ -45,8 +46,8 @@ npu-smi info -t board -i 7
 | Ascend 950PR / Ascend 950DT | 1000 | us = cycles / 1000 |
 | Atlas A2 / Atlas A3 训练、推理系列 | 50 | us = cycles / 50 |
 
-本项目当前使用 A5/3510 构建路径；确认实际设备为 950PR/950DT 后，在脚本
-顶部设置 `PROFILE_CLOCK_MHZ = 1000`，重新执行 Python 脚本即可输出 read_us，
+本项目当前使用 A5/3510 构建路径，已确认的 950DT 设备对应脚本顶部默认值
+`PROFILE_CLOCK_MHZ = 1000`，重新执行 Python 脚本即可输出 read_us，
 不需为换算重编 kernel。不要把 npu-smi 的 AI Core 运行频率当成此参数。
 例如已采集的 `read_cycles=3031076.4`，在 950PR/950DT 上为
 `read_us=3031.0764`，约 3.031 ms。计数器频率由平台/API 定义确认，不通过
