@@ -3,6 +3,7 @@
 #include "scatter_batch_get.h"
 #include "gather_batch_get.h"
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,16 +19,20 @@ constexpr char kDirect[] = "KvafExecuteBatchGetAivKernelV2";
 constexpr char kScatter[] = "KvafScatterBatchGetAivKernelV1";
 constexpr char kGather[] = "KvafGatherBatchGetAivKernelV3";
 std::vector<std::string> launched;
+uint32_t failure_stage{};
 }
 aclrtBinary aclrtCreateBinary(const void* data, size_t bytes) {
+  if (failure_stage == 1) return nullptr;
   return new std::string(static_cast<const char*>(data), bytes);
 }
 int aclrtBinaryLoad(aclrtBinary binary, aclrtBinHandle* handle) {
+  if (failure_stage == 2) return 500123; // Deliberate test-only ACL status.
   binaries.push_back(std::make_unique<std::string>(*static_cast<std::string*>(binary)));
   *handle = binaries.back().get(); return 0;
 }
 int aclrtDestroyBinary(aclrtBinary binary) { delete static_cast<std::string*>(binary); return 0; }
 int aclrtBinaryGetFunction(aclrtBinHandle binary, const char* name, aclrtFuncHandle* function) {
+  if (failure_stage == 3) return 500124;
   if (*static_cast<std::string*>(binary) != name) return 1;
   *function = binary; return 0;
 }
@@ -87,6 +92,27 @@ int main(int argc, char** argv) {
       Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
     }
     std::ofstream(gather) << kGather;
+  }
+  if (scenario == "create_failure" || scenario == "load_failure" || scenario == "lookup_failure") {
+    failure_stage = scenario == "create_failure" ? 1 : scenario == "load_failure" ? 2 : 3;
+    const int saved_stderr = dup(STDERR_FILENO);
+    FILE* log = std::tmpfile(); Check(saved_stderr >= 0 && log != nullptr);
+    Check(dup2(fileno(log), STDERR_FILENO) >= 0);
+    for (uint32_t i = 0; i < 2; ++i)
+      Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
+    std::fflush(stderr);
+    Check(std::fseek(log, 0, SEEK_SET) == 0);
+    char buffer[4096]; const auto bytes = std::fread(buffer, 1, sizeof(buffer), log);
+    const std::string diagnostic(buffer, bytes);
+    Check(dup2(saved_stderr, STDERR_FILENO) >= 0); close(saved_stderr); std::fclose(log);
+    const std::string phase = failure_stage == 1 ? "create_binary" : failure_stage == 2 ? "binary_load" : "get_function";
+    const std::string acl = failure_stage == 1 ? "unavailable" : failure_stage == 2 ? "500123" : "500124";
+    Check(diagnostic.find("GATHER_KERNEL_LOAD_ERROR phase=" + phase) != std::string::npos);
+    Check(diagnostic.find("path=" + gather.string()) != std::string::npos);
+    Check(diagnostic.find("symbol=" + std::string(kGather)) != std::string::npos);
+    Check(diagnostic.find("acl=" + acl) != std::string::npos);
+    Check(diagnostic.find("GATHER_KERNEL_LOAD_ERROR", diagnostic.find("GATHER_KERNEL_LOAD_ERROR") + 1) == std::string::npos);
+    failure_stage = 0;
   }
   Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == 0);
   std::ofstream(scatter) << kScatter;

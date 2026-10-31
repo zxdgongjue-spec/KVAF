@@ -20,6 +20,20 @@ bool g_loaded = false;
 aclrtBinHandle g_binary = nullptr;
 aclrtFuncHandle g_function = nullptr;
 std::vector<char> g_binary_bytes;
+std::string g_reported_failure;
+
+int32_t LoadFailure(const std::string& path, const char* phase, const std::string& acl) {
+  const auto key = path + "\n" + phase + "\n" + acl + "\n" + std::to_string(g_binary_bytes.size());
+  // EID selection retries the same local file. Print the concrete loader
+  // failure once rather than hiding it among identical routing attempts.
+  if (key != g_reported_failure) {
+    std::fprintf(stderr, "[KVAF_AIV] GATHER_KERNEL_LOAD_ERROR phase=%s path=%s "
+        "symbol=%s acl=%s binary_bytes=%zu args_bytes=%zu\n", phase, path.c_str(),
+        kKernelName, acl.c_str(), g_binary_bytes.size(), sizeof(KvafGatherBatchGetArgs));
+    g_reported_failure = key;
+  }
+  return KVAF_BATCH_GET_RUNTIME_ERROR;
+}
 
 std::string SequentialBinaryPath(const char* configured) {
   std::string path(configured);
@@ -33,6 +47,7 @@ std::string SequentialBinaryPath(const char* configured) {
 }
 
 bool ReadBinary(const char *path) {
+  g_binary_bytes.clear();
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file.is_open()) return false;
   const std::streamsize size = file.tellg();
@@ -48,20 +63,20 @@ extern "C" int32_t KvafGatherBatchGetLoadKernel(const char *kernel_object_path) 
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_loaded) return KVAF_BATCH_GET_SUCCESS;
   const auto path = SequentialBinaryPath(kernel_object_path);
-  if (!ReadBinary(path.c_str())) {
-    std::fprintf(stderr, "[KVAF_AIV] cannot read gather BatchGet kernel: %s; "
-        "rebuild and deploy kvaf_gather_batch_get_kernels.o alongside the direct-read binary\n",
-        path.c_str());
-    return KVAF_BATCH_GET_RUNTIME_ERROR;
-  }
+  if (!ReadBinary(path.c_str())) return LoadFailure(path, "read_file", "unavailable");
   aclrtBinary binary = aclrtCreateBinary(g_binary_bytes.data(), g_binary_bytes.size());
-  if (binary == nullptr) return KVAF_BATCH_GET_RUNTIME_ERROR;
+  if (binary == nullptr) return LoadFailure(path, "create_binary", "unavailable");
+  g_binary = nullptr;
   const aclError load = aclrtBinaryLoad(binary, &g_binary);
   aclrtDestroyBinary(binary);
-  if (load != ACL_SUCCESS || aclrtBinaryGetFunction(g_binary, kKernelName, &g_function) != ACL_SUCCESS) {
-    return KVAF_BATCH_GET_RUNTIME_ERROR;
-  }
+  if (load != ACL_SUCCESS || g_binary == nullptr)
+    return LoadFailure(path, "binary_load", std::to_string(load));
+  g_function = nullptr;
+  const aclError lookup = aclrtBinaryGetFunction(g_binary, kKernelName, &g_function);
+  if (lookup != ACL_SUCCESS || g_function == nullptr)
+    return LoadFailure(path, "get_function", std::to_string(lookup));
   g_loaded = true;
+  g_reported_failure.clear();
   std::fprintf(stderr, "[KVAF_AIV] GATHER_KERNEL_READY path=%s symbol=%s args_bytes=%zu "
       "dyn_ubuf_bytes=%u\n", path.c_str(), kKernelName, sizeof(KvafGatherBatchGetArgs), kKernelLocalMemoryBytes);
   return KVAF_BATCH_GET_SUCCESS;

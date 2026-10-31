@@ -3,6 +3,9 @@ import contextlib
 import io
 import os
 import subprocess
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +21,27 @@ def failing(message):
 
 
 class GatherProbeResultTests(unittest.TestCase):
+    def test_deployment_report_identifies_old_file_and_loaded_python(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gather.o"
+            path.write_bytes(b"KvafGatherBatchGetAivKernelV2\0")
+            module = SimpleNamespace(__file__="/old/kvaf/__init__.py",
+                                     _native=SimpleNamespace(__file__="/old/kvaf/_kvaf.so"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                common.report_gather_kernel(str(path), module)
+            self.assertIn(f"path={path}", output.getvalue())
+            self.assertIn("name_markers=V2 expected_symbol=KvafGatherBatchGetAivKernelV3", output.getvalue())
+            self.assertIn("native=/old/kvaf/_kvaf.so", output.getvalue())
+
+    def test_name_scan_does_not_pretend_to_validate_acl_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custom.o"
+            path.write_bytes(b"unknown binary format")
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                common.report_gather_kernel(str(path), SimpleNamespace())
+            self.assertIn("name_markers=unknown", output.getvalue())
+
     def test_matching_prefix_and_counters_only(self):
         for stage in ("ack", "wqe", "sq", "first_read"):
             wrs = 128 if stage == "first_read" else 0

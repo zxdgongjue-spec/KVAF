@@ -247,6 +247,40 @@ debug 脚本读取性能脚本顶部的 TOKEN_BYTES、REQUEST_COUNT、GATHER_SGL
 加载日志应包含 `symbol=KvafGatherBatchGetAivKernelV3 args_bytes=232`。
 诊断脚本的源数据使用功能回归的确定性字节模式，不作为吞吐对比工作负载。
 
+### initialize 报 load sequential kernel
+
+如果日志停在 `phase=initialize`，异常为 `load sequential kernel`，说明 gather
+尚未启动。此时 `GATHER_PIPELINE_DEBUG_STOP stage=ack` 只表示第一个子进程
+失败，不能理解为已经执行到 ACK 轮询。多个 peer/EID 重试也不会改变同一个
+本地 kernel 文件的加载结果。
+
+探针入口会打印实际 kernel 绝对路径、文件长度、扫描到的 V1/V2/V3 名字
+标记，以及 Python package / native extension 的实际导入路径。名字标记仅
+辅助识别旧产物，不代替 ACL 的 binary/function 校验。
+loader 失败时打印 `GATHER_KERNEL_LOAD_ERROR`，包含 path、目标 symbol、
+phase 和可取得的 ACL 返回码，重复 EID 尝试只打印一次相同错误：
+
+| phase | 失败位置 |
+| --- | --- |
+| read_file | 文件读取 |
+| create_binary | aclrtCreateBinary 返回空指针，无直接 ACL 状态码 |
+| binary_load | aclrtBinaryLoad |
+| get_function | 查找 KvafGatherBatchGetAivKernelV3 |
+
+先让 Python 和 kernel 明确指向同一个 build-npu：
+
+```bash
+cmake --build build-npu --target kvaf_gather_batch_get_kernel _kvaf -j
+export PYTHONPATH="$PWD/build-npu/python"
+export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_gather_batch_get_kernels.o"
+export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python -u tests/python/test_aiv_gather_pipeline_debug.py
+```
+
+若仍失败，提供 `GATHER_KERNEL_FILE`、`GATHER_PYTHON_IMPORT` 和首条
+`GATHER_KERNEL_LOAD_ERROR`。这样可以区分旧文件/路径与 ACL 的实际加载失败，
+不再根据通用初始化异常猜测 WQE 或网络故障。
+
 如需单独运行某个检查点，可设置 `KVAF_AIV_GATHER_PROBE=ack/wqe/sq/first_read`
 并执行 `test_aiv_gather_batch_get.py`。正常性能脚本会拒绝非空探针设置，
 避免输出部分数据却被误记成性能结果。

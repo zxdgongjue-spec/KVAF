@@ -89,6 +89,21 @@ def expect_gather_probe(call, stage: str, *, requests: int, data_wrs: int) -> No
         raise AssertionError("gather probe returned ordinary success; rebuild Host and kernel together")
 
 
+def report_gather_kernel(path: str, module) -> None:
+    """Report deployment inputs, not whether ACL can load this binary."""
+    data = Path(path).read_bytes()
+    # Name markers are useful for spotting an old .o. They are not an ELF
+    # symbol-table check and do not replace aclrtBinaryGetFunction validation.
+    versions = sorted({int(v) for v in re.findall(rb"KvafGatherBatchGetAivKernelV(\d+)\x00", data)})
+    native = getattr(module, "_native", None)
+    print(f"GATHER_KERNEL_FILE path={path} bytes={len(data)} "
+          f"name_markers={','.join('V' + str(v) for v in versions) or 'unknown'} "
+          "expected_symbol=KvafGatherBatchGetAivKernelV3", flush=True)
+    print(f"GATHER_PYTHON_IMPORT executable={sys.executable} "
+          f"package={getattr(module, '__file__', 'unknown')} "
+          f"native={getattr(native, '__file__', 'unknown')}", flush=True)
+
+
 def run(mode: str) -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
@@ -109,6 +124,8 @@ def run(mode: str) -> int:
     from npu_eids import parse_npu_eids
     import kvaf
 
+    if gather_probe:
+        report_gather_kernel(kernel, kvaf)
     backend = detect_torch_backend()
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware test was requested but NPU Runtime is unavailable")

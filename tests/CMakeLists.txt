@@ -109,7 +109,8 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
     ${PROJECT_SOURCE_DIR}/access_operator/include
     ${PROJECT_SOURCE_DIR}/common/include)
-  foreach(scenario compat legacy explicit custom relative missing wrong_symbol)
+  foreach(scenario compat legacy explicit custom relative missing wrong_symbol
+                   create_failure load_failure lookup_failure)
     add_test(NAME kvaf_sequential_loader_${scenario} COMMAND kvaf_sequential_loader_test ${scenario})
   endforeach()
   add_executable(kvaf_sequential_host_test sequential_batch_get_host_test.cc
