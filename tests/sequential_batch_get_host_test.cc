@@ -20,6 +20,7 @@ bool wrong_phase{}, wrong_sequence{}, wrong_magic{};
 bool stale_profile{}, missing_cpu_profile{}, bad_profile_cycle{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
+std::vector<uint32_t> launch_options;
 }
 int aclrtMalloc(void** p, size_t n, int) {
   const int rc = posix_memalign(p, 64, n); if (!rc) ++allocations; return rc;
@@ -54,7 +55,8 @@ int Launch(const KvafScatterBatchGetArgs* a) {
   assert(completed == launches);
   const auto args = *a;
   ++launches; sequences.push_back(a->sequence);
-  assert(!args.reserved || args.reserved == kvaf::kScatterProfileFlag);
+  assert(kvaf::ScatterOptionsValid(args.reserved));
+  launch_options.push_back(args.reserved);
   work.push_back([=] {
     auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
     const auto active = uint64_t(*reinterpret_cast<const int32_t*>(args.request.miss_count));
@@ -65,7 +67,7 @@ int Launch(const KvafScatterBatchGetArgs* a) {
                    args.sequence + wrong_sequence, kernel_result,
                    kernel_result || wrong_phase ? uint64_t(KVAF_SEQ_WAIT_REMOTE) : uint64_t(KVAF_SEQ_COMPLETE),
                    requests, 0, 0, 0};
-      if (args.reserved) {
+      if (kvaf::ScatterProfileEnabled(args.reserved)) {
         auto* profiles = reinterpret_cast<kvaf::ScatterBatchGetCoreProfile*>(
             args.request.core_status + args.request.block_count * sizeof(KvafSequentialStatus));
         auto& p = profiles[i];
@@ -165,6 +167,8 @@ bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint
 
 int main() {
   using namespace kvaf;
+  unsetenv("KVAF_SCATTER_FUSED_BUILD");
+  unsetenv("KVAF_SCATTER_DOUBLE_BUFFER");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -248,6 +252,7 @@ int main() {
     assert(owner->Execute(exec).ok()); assert(completed == before + 1);
     exec.execution.synchronize = true;
     assert(owner->Execute(exec).ok()); assert(completed == before + 3);
+    assert(launch_options.back() == (kScatterOptionsV1 | kScatterFusedBuild | kScatterDoubleBuffer));
     capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
     count = 0; assert(owner->Execute(exec).ok()); count = 1;
     assert(owner->Shutdown().ok()); assert(owner->Shutdown().ok());
@@ -313,5 +318,49 @@ int main() {
     assert(owner->Execute(exec).ok()); assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
   }
+  // The same Host/ABI serves all four choices. Environment changes after
+  // initialize cannot change an in-flight runtime; profile toggles retain them.
+  for (int fused : {0, 1})
+    for (int double_buffer : {0, 1}) {
+      setenv("KVAF_SCATTER_FUSED_BUILD", fused ? "1" : "0", 1);
+      setenv("KVAF_SCATTER_DOUBLE_BUFFER", double_buffer ? "1" : "0", 1);
+      const auto expected = kScatterOptionsV1 | (fused ? kScatterFusedBuild : 0U) |
+          (double_buffer ? kScatterDoubleBuffer : 0U);
+      auto owner = CreateSequentialBatchGet(config);
+      assert(owner->Initialize(region).ok());
+      setenv("KVAF_SCATTER_FUSED_BUILD", fused ? "0" : "1", 1);
+      setenv("KVAF_SCATTER_DOUBLE_BUFFER", double_buffer ? "0" : "1", 1);
+      std::vector<ScatterBatchGetCoreProfile> profiles;
+      assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
+      assert(launch_options.back() == expected);
+      assert(!owner->CopyScatterProfiles(&profiles).ok());
+      assert(owner->SetScatterProfiling(true).ok());
+      assert(owner->Execute(exec).ok()); assert(owner->CopyScatterProfiles(&profiles).ok());
+      assert(launch_options.back() == (expected | kScatterProfiling));
+      assert(owner->SetScatterProfiling(false).ok());
+      assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
+      assert(launch_options.back() == expected);
+      assert(!owner->CopyScatterProfiles(&profiles).ok());
+      assert(owner->Shutdown().ok());
+      // A fresh initialize reads the changed options.
+      assert(owner->Initialize(region).ok());
+      assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
+      assert(launch_options.back() == (expected ^ (kScatterFusedBuild | kScatterDoubleBuffer)));
+      assert(owner->Shutdown().ok());
+      assert(!refs && !allocations && !hccp_refs);
+    }
+  unsetenv("KVAF_SCATTER_FUSED_BUILD");
+  unsetenv("KVAF_SCATTER_DOUBLE_BUFFER");
+  for (const auto* name : {"KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER"})
+    for (const auto* value : {"", "ON", "2"}) {
+      setenv(name, value, 1);
+      auto owner = CreateSequentialBatchGet(config);
+      const auto result = owner->Initialize(region);
+      assert(result.code() == StatusCode::kInvalidArgument);
+      assert(result.message().find(name) != std::string::npos);
+      assert(!refs && !allocations && !hccp_refs);
+      assert(owner->Shutdown().ok());
+      unsetenv(name);
+    }
   std::cout << "sequential Host lifecycle: PASS\n";
 }

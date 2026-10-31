@@ -76,6 +76,8 @@ target_include_directories(kvaf_sequential_batch_get_kernel_model_test PRIVATE
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
   ${PROJECT_SOURCE_DIR}/runtime/include
   ${PROJECT_SOURCE_DIR}/common/include)
+target_compile_options(kvaf_sequential_batch_get_kernel_model_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
 target_link_libraries(kvaf_sequential_batch_get_kernel_model_test PRIVATE pthread)
 add_test(NAME kvaf_sequential_batch_get_kernel_model_test COMMAND kvaf_sequential_batch_get_kernel_model_test)
 foreach(mode scatter gather)
@@ -120,6 +122,8 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
     ${PROJECT_SOURCE_DIR}/access_operator/include
     ${PROJECT_SOURCE_DIR}/runtime/include
     ${PROJECT_SOURCE_DIR}/common/include)
+  target_compile_options(kvaf_sequential_host_test PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
   add_test(NAME kvaf_sequential_host_test COMMAND kvaf_sequential_host_test)
   add_library(kvaf_sequential_host_compile_check OBJECT
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/host/sequential_batch_get.cpp

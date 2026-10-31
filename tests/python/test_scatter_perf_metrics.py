@@ -31,6 +31,27 @@ def profiles(cores=3, requests=19, token=656):
 
 
 class ScatterPerfTests(unittest.TestCase):
+    def test_runtime_switch_defaults_and_cli_precedence(self):
+        with patch.dict("os.environ", {}, clear=True):
+            args = arguments([])
+            self.assertEqual((args.fused_build, args.double_buffer), (1, 1))
+        with patch.dict("os.environ", {"KVAF_SCATTER_FUSED_BUILD": "1",
+                                      "KVAF_SCATTER_DOUBLE_BUFFER": "1"}):
+            args = arguments([])
+            self.assertEqual((args.fused_build, args.double_buffer), (1, 1))
+            for fused in (0, 1):
+                for double in (0, 1):
+                    args = arguments(["--fused-build", str(fused), "--double-buffer", str(double)])
+                    self.assertEqual((args.fused_build, args.double_buffer), (fused, double))
+        with patch.dict("os.environ", {"KVAF_SCATTER_FUSED_BUILD": "0",
+                                      "KVAF_SCATTER_DOUBLE_BUFFER": "0"}):
+            args = arguments([])
+            self.assertEqual((args.fused_build, args.double_buffer), (0, 0))
+        for name in ("KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER"):
+            with patch.dict("os.environ", {name: "ON"}), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                arguments([])
+
     def test_decimal_bandwidth_uses_sum_of_times(self):
         stats = summarize([100, 200, 300], 1000)
         self.assertEqual(stats["effective_gbps"], 5)
@@ -158,6 +179,7 @@ class ScatterPerfTests(unittest.TestCase):
 
     def test_cli_validation_and_skip_before_hardware_import(self):
         for args in (["--requests", "0"], ["--cores", "9"], ["--iterations", "0"],
+                     ["--fused-build", "2"], ["--double-buffer", "ON"],
                      ["--request-length", "4095"], ["--miss-count", "4097"],
                      ["--workload", "one-token-per-block", "--miss-count", "1025"],
                      ["--miss-count", "1", "--active-percent", "75"],
@@ -174,6 +196,7 @@ class ScatterPerfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = arguments(["--blocks", "1", "--tokens-per-block", "1",
+                              "--fused-build", "0", "--double-buffer", "1",
                               "--request-length", "8192",
                               "--json", str(root / "result.json"), "--csv", str(root / "result.csv")])
             report = dict(config={"units": "decimal GB/s"}, summary={}, samples={
@@ -189,6 +212,8 @@ class ScatterPerfTests(unittest.TestCase):
             self.assertEqual(rows[0]["request_length"], "8192")
             self.assertEqual(rows[0]["miss_count"], "1")
             self.assertEqual(rows[0]["calls"], "1")
+            self.assertEqual(rows[0]["fused_build"], "0")
+            self.assertEqual(rows[0]["double_buffer"], "1")
             self.assertAlmostEqual(float(rows[0]["end_to_end_gbps"]), .656)
             self.assertAlmostEqual(float(rows[1]["cpu_comm_gbps"]), 1.312)
             self.assertEqual(rows[0]["end_to_end_us"], "1.0")

@@ -25,6 +25,11 @@ using namespace kvaf_scatter;
 using kvaf_gather::kRead;
 using kvaf_gather::kWrite;
 using kvaf_gather::kErrorBit;
+constexpr std::array<uint32_t, 4> kScatterOptions{
+    kvaf::kScatterOptionsV1,
+    kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild,
+    kvaf::kScatterOptionsV1 | kvaf::kScatterDoubleBuffer,
+    kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterDoubleBuffer};
 // Test fixture only; production launch ABIs are independent.
 struct ModelArgs {
   KvafExecuteBatchGetKernelArgs request;
@@ -129,6 +134,7 @@ struct Fixture {
     r.block_count = cores; r.core_status = Address(status.data());
     r.queue_state = Address(states.data());
     args.mode = mode; args.sequence = 1; args.sgl_size = sgl; args.max_polls = 64;
+    if (mode == KVAF_SEQ_SCATTER) args.reserved = kScatterOptions.back();
     args.source_base = Address(remote.data()); args.source_bytes = source_bytes;
     args.lane_descriptor_bytes = lane_descriptor; args.lane_staging_bytes = lane_staging;
     args.remote_staging = Address(remote.data()) + staging_offset;
@@ -320,65 +326,112 @@ int main() {
   // Exercise the batched copy through the existing complete scatter launch,
   // including CPU notification, changing payloads, output holes and statuses.
   // Deferred model writes must finish before a tile reuses the same UB bank.
-  for (uint32_t workers : {1U, 3U, 8U})
-    for (uint32_t bytes : {31U, 656U, 4096U, 32768U, 32769U}) {
-      Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
-      for (uint32_t count : {0U, 1U, 7U, 31U, 32U, 33U, 63U, 64U, 65U, 129U}) {
-        f.Next(count);
-        std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
-        const auto reads = aiv_model::mte2_copies;
-        const auto writes = aiv_model::mte3_copies;
-        const auto waits = aiv_model::event_waits[PIPE_MTE3][PIPE_S];
-        const auto input_waits = aiv_model::event_waits[PIPE_MTE2][PIPE_S];
-        f.Run();
-        if (bytes <= kTileBytes) {
-          const auto per_tile = std::min(kMaxTileRows, kTileBytes / ((bytes + 31U) & ~31U));
-          uint64_t tiles = 0;
-          for (uint32_t core = 0; core < workers; ++core) {
-            const auto rows = uint64_t(count) * (core + 1) / workers -
-                uint64_t(count) * core / workers;
-            tiles += (rows + per_tile - 1) / per_tile;
+  for (const auto options : kScatterOptions)
+    for (uint32_t workers : {1U, 3U, 8U})
+      for (uint32_t bytes : {31U, 656U, 4096U, 32768U, 32769U}) {
+        Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
+        f.args.reserved = options;
+        const bool double_buffer = kvaf::ScatterOptionEnabled(options, kvaf::kScatterDoubleBuffer);
+        for (uint32_t count : {0U, 1U, 7U, 31U, 32U, 33U, 63U, 64U, 65U, 129U}) {
+          f.Next(count);
+          std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
+          const auto reads = aiv_model::mte2_copies;
+          const auto writes = aiv_model::mte3_copies;
+          const auto waits = aiv_model::event_waits[PIPE_MTE3][PIPE_S];
+          const auto input_waits = aiv_model::event_waits[PIPE_MTE2][PIPE_S];
+          const auto overlapped = aiv_model::overlapped_mte2_copies;
+          f.Run();
+          if (bytes <= kTileBytes) {
+            const auto per_tile = std::min(kMaxTileRows, kTileBytes / ((bytes + 31U) & ~31U));
+            uint64_t tiles = 0, overlapping_inputs = 0;
+            for (uint32_t core = 0; core < workers; ++core) {
+              const auto rows = uint64_t(count) * (core + 1) / workers -
+                  uint64_t(count) * core / workers;
+              const auto core_tiles = (rows + per_tile - 1) / per_tile;
+              tiles += core_tiles;
+              if (double_buffer && core_tiles) overlapping_inputs += core_tiles - 1;
+            }
+            assert(aiv_model::mte2_copies - reads == tiles);
+            assert(aiv_model::mte3_copies - writes == count);
+            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == tiles);
+            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] == input_waits);
+            assert(aiv_model::overlapped_mte2_copies - overlapped == overlapping_inputs);
           }
-          assert(aiv_model::mte2_copies - reads == tiles);
-          assert(aiv_model::mte3_copies - writes == count);
-          assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == tiles);
-          assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] == input_waits);
+          assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
+          const auto used_ub = double_buffer ? kTileBufferBytes : kTileBytes;
+          assert(std::all_of(aiv_model::ub + used_ub,
+                             aiv_model::ub + sizeof(aiv_model::ub),
+                             [](uint8_t byte) { return byte == 0xe9; }));
         }
-        assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
-        assert(std::all_of(aiv_model::ub + kTileBytes,
-                           aiv_model::ub + sizeof(aiv_model::ub),
-                           [](uint8_t byte) { return byte == 0xe9; }));
       }
-    }
-  {
+  // A late invalid row can leave private partial descriptors in fused mode,
+  // but must never publish a new notify or let CPU dereference that list.
+  for (const auto options : kScatterOptions)
+    for (uint32_t workers : {1U, 3U, 8U})
+      for (uint32_t field = 0; field < 5; ++field) {
+        Fixture f(65, 656, workers, KVAF_SEQ_SCATTER, 6);
+        f.args.reserved = options;
+        f.Run();
+        const auto requests = f.push_requests;
+        const auto* descriptors = reinterpret_cast<const uint64_t*>(f.workspace.data() + f.args.descriptor_offset);
+        const auto previous_first = descriptors[0];
+        f.Next(65);
+        if (field == 0) f.indices.back() = f.count;
+        if (field == 1) f.offsets.back() = f.token + 1;
+        if (field == 2) f.rows.back() = f.args.request.output_rows;
+        if (field == 3) f.valid[f.indices.back()] = 0;
+        if (field == 4) f.addresses[f.indices.back()] = f.args.source_base + f.args.source_bytes;
+        const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+        f.Run(false);
+        assert(f.push_requests == requests);
+        assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
+        assert(*reinterpret_cast<const uint64_t*>(f.workspace.data() + 64) != f.args.sequence);
+        for (const auto& status : f.status) assert(status.result == KVAF_SEQ_INVALID);
+        if (field == 0) {
+          const bool fused = kvaf::ScatterOptionEnabled(options, kvaf::kScatterFusedBuild);
+          const auto current_first = f.addresses[f.indices[0]] + uint64_t(f.offsets[0]);
+          assert(current_first != previous_first);
+          assert(descriptors[0] == (fused ? current_first : previous_first));
+        }
+      }
+  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 8U,
+                             kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
-    invalid.args.reserved = 2; invalid.Run(false);
+    invalid.args.reserved = options; invalid.Run(false);
     assert(!invalid.push_requests && invalid.status[0].result == KVAF_SEQ_INVALID);
   }
-  for (uint32_t workers : {1U, 3U, 8U}) {
-    Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
-    f.status.resize(workers * 3); // 64-byte statuses + 128-byte records.
-    f.args.request.core_status = Address(f.status.data());
-    f.args.reserved = kvaf::kScatterProfileFlag;
-    for (uint32_t count : {1U, 19U, 0U, 7U}) {
-      f.Next(count); f.Run();
-      const auto* profiles = reinterpret_cast<const kvaf::ScatterBatchGetCoreProfile*>(
-          f.args.request.core_status + workers * sizeof(KvafSequentialStatus));
-      for (uint32_t core = 0; core < workers; ++core) {
-        const auto& p = profiles[core];
-        assert(p.magic == kvaf::kScatterProfileMagic && p.sequence == f.args.sequence);
-        assert(p.start_cycle && p.start_cycle <= p.inputs_ready_cycle);
-        assert(p.inputs_ready_cycle <= p.done_cycle && p.done_cycle <= p.finish_cycle);
-        const auto requests = uint64_t(count) * (core + 1) / workers - uint64_t(count) * core / workers;
-        assert(p.requests == requests && p.bytes == requests * 656);
-        if (!core && count) {
-          assert(p.notify_cycle >= p.inputs_ready_cycle && p.done_cycle >= p.notify_cycle);
-          assert(p.cpu_magic == kvaf::cpu_push::ProfileToken(f.args.sequence) && p.cpu_comm_ns == 800);
-          assert(p.cpu_header_ns == 11 && p.cpu_descriptor_ns == 22 && p.cpu_write_ns == 1000);
-        } else assert(!p.cpu_magic && !p.notify_cycle);
+  {
+    Fixture legacy(65, 656, 1, KVAF_SEQ_SCATTER, 6);
+    legacy.args.reserved = 0; legacy.Run();
+  }
+  for (const auto options : {0U, kScatterOptions[0], kScatterOptions[1],
+                             kScatterOptions[2], kScatterOptions[3]})
+    for (uint32_t workers : {1U, 3U, 8U}) {
+      Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
+      f.status.resize(workers * 3); // 64-byte statuses + 128-byte records.
+      f.args.request.core_status = Address(f.status.data());
+      f.args.reserved = kvaf::ScatterWithProfiling(options, true);
+      assert(kvaf::ScatterOptionsValid(f.args.reserved));
+      assert(kvaf::ScatterWithProfiling(f.args.reserved, false) == options);
+      for (uint32_t count : {1U, 19U, 0U, 7U}) {
+        f.Next(count); f.Run();
+        const auto* profiles = reinterpret_cast<const kvaf::ScatterBatchGetCoreProfile*>(
+            f.args.request.core_status + workers * sizeof(KvafSequentialStatus));
+        for (uint32_t core = 0; core < workers; ++core) {
+          const auto& p = profiles[core];
+          assert(p.magic == kvaf::kScatterProfileMagic && p.sequence == f.args.sequence);
+          assert(p.start_cycle && p.start_cycle <= p.inputs_ready_cycle);
+          assert(p.inputs_ready_cycle <= p.done_cycle && p.done_cycle <= p.finish_cycle);
+          const auto requests = uint64_t(count) * (core + 1) / workers - uint64_t(count) * core / workers;
+          assert(p.requests == requests && p.bytes == requests * 656);
+          if (!core && count) {
+            assert(p.notify_cycle >= p.inputs_ready_cycle && p.done_cycle >= p.notify_cycle);
+            assert(p.cpu_magic == kvaf::cpu_push::ProfileToken(f.args.sequence) && p.cpu_comm_ns == 800);
+            assert(p.cpu_header_ns == 11 && p.cpu_descriptor_ns == 22 && p.cpu_write_ns == 1000);
+          } else assert(!p.cpu_magic && !p.notify_cycle);
+        }
       }
     }
-  }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,
     // nonaligned byte counts, UB chunk boundaries, and repeated staging writes.

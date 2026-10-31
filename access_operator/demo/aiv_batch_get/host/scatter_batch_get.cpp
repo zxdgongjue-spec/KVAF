@@ -8,6 +8,8 @@
 #include <acl/acl.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -20,6 +22,13 @@ Status Error(const char* what) { return Status::Internal(std::string("AIV sequen
 // The exported segment is the public 48-byte urma_seg_t wire ABI; no liburma is
 // loaded on the NPU Host or AIV. ubva.va is packed at byte 20, len at byte 32.
 constexpr uint32_t kSegmentBytes = 48;
+Status ReadSwitch(const char* name, bool* enabled) {
+  const char* value = std::getenv(name);
+  *enabled = !value || std::strcmp(value, "1") == 0;
+  if (!*enabled && std::strcmp(value, "0") != 0)
+    return Status::InvalidArgument(std::string(name) + " must be 0 or 1");
+  return Status::OK();
+}
 }
 
 class ScatterBatchGet final : public SequentialBatchGet {
@@ -210,10 +219,18 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.config.aiv_batch_get_mode != "cpu_push_scatter" ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
+  bool fused_build, double_buffer;
+  auto result = ReadSwitch("KVAF_SCATTER_FUSED_BUILD", &fused_build);
+  if (!result.ok()) return result;
+  result = ReadSwitch("KVAF_SCATTER_DOUBLE_BUFFER", &double_buffer);
+  if (!result.ok()) return result;
+  // Read once per initialization, never from the timed Execute path.
+  s.args.reserved = kScatterOptionsV1 | (fused_build ? kScatterFusedBuild : 0U) |
+      (double_buffer ? kScatterDoubleBuffer : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
-  auto result = s.config.peer_link->LookupRegion(region.base, &peer);
+  result = s.config.peer_link->LookupRegion(region.base, &peer);
   if (!result.ok()) return result;
   if (!region.base || !region.length || region.base > UINT64_MAX - peer.length ||
       peer.length < region.length)
@@ -229,6 +246,8 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u\n",
+               unsigned(fused_build), unsigned(double_buffer));
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {
@@ -260,7 +279,7 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
       KvafScatterBatchGetLaunch(&args, s.pending)) {
     s.failed = true; return Error("enqueue failed; resources retained");
   }
-  s.profile_ready = args.reserved != 0;
+  s.profile_ready = ScatterProfileEnabled(args.reserved);
   return exec.execution.synchronize ? s.Drain() : Status::OK();
 }
 Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
@@ -269,7 +288,7 @@ Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
   if (!s.initialized) return Status::NotInitialized("scatter is not initialized");
   auto result = s.Drain();
   if (!result.ok()) return result;
-  s.args.reserved = enabled ? kScatterProfileFlag : 0U;
+  s.args.reserved = ScatterWithProfiling(s.args.reserved, enabled);
   s.profile_ready = false;
   return Status::OK();
 }
@@ -277,7 +296,7 @@ Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfi
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!profiles) return Status::InvalidArgument("scatter profile output is null");
-  if (!s.initialized || !s.args.reserved || !s.profile_ready)
+  if (!s.initialized || !ScatterProfileEnabled(s.args.reserved) || !s.profile_ready)
     return Status::InvalidState("enable scatter profiling and complete a BatchGet first");
   auto result = s.Drain();
   if (!result.ok()) return result;

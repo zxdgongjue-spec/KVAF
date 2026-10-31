@@ -27,47 +27,90 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 旧 `--requests` 现为 `--request-length` 的别名，不再隐式决定有效前缀。
 旧脚本的 `--requests 8194` 则确实代表一次调用完成 8194 项，其结果不能直接当成新默认形状的性能。
 
-## UB 批量 scatter 版本对比
+## 清单构建与 UB 流水版本对比
 
-本轮 kernel 使用 32 KiB 静态 UB、最多 32 行的单 bank tile。
+当前默认启用单遍校验/清单构建，以及两个各 32 KiB 的静态 UB bank，总计 64 KiB。
 656 B 的 UB 行距为 672 B，每批最多 32 行；4096 B 每批 8 行。
-每批一次多块 GM→UB，按映射连续发出精确长度的 UB→output，再统一等待这批写完。
+每批一次多块 GM→UB，按映射连续发出精确长度的 UB→output。
+只在 bank 复用前等待该 bank 写完，使下一批输入与上一批写出重叠；末尾等待两个 bank 全部完成。
 尾批按实际行数搬运，超过 32 KiB 的单行使用原有精确分段路径。
+清单构建复用已校验的 index/offset/base，全部成功并刷新清单后才发布 notify。
 仍在整批 CPU done 后开始 scatter，现有 CPU/AIV 计时边界可以直接对比。
 
-验收直接使用本页的完整端到端测试。重编译前保存已跑通的基线 kernel，
-用两个独立进程、相同参数比较；loader 在进程内缓存首次加载的函数。
+两项改动使用**测试时开关**，默认均为 1，同一 Host 和 kernel 二进制支持四种组合：
+
+| 版本 | `--fused-build` | `--double-buffer` |
+| --- | --- | --- |
+| reference：两遍清单、单 bank | 0 | 0 |
+| fused：单遍清单、单 bank | 1 | 0 |
+| double：两遍清单、双 bank | 0 | 1 |
+| both：单遍清单、双 bank | 1 | 1 |
+
+测试参数覆盖同名环境变量 `KVAF_SCATTER_FUSED_BUILD`、`KVAF_SCATTER_DOUBLE_BUFFER`，
+未传参数时使用环境变量，否则默认 1；只接受 0/1。
+Host 在 `initialize()` 读取一次，之后修改环境变量不影响当前实例；需 shutdown 后重新初始化。
+初始化日志应包含 `SCATTER_OPTIONS version=1 fused_build=... double_buffer=...`，确认实际选项。
+flags 通过现有 176 B 参数的 reserved 字传入，使用新版标签并独立保留 profile bit；
+不改 Python/C++ 公共接口、CPU URMA 协议或计时窗口。
+首次需同时重编译 NPU Host 和 kernel，此后切换组合不需重编译。
+旧 Host 的 zero/profile-only 参数仍选择两遍清单、单 bank；新 Host 配旧 kernel 会验证失败。
+
+所有运行时组合均保留最多 64 KiB 的静态 UB 地址范围，单 bank 只使用前 32 KiB。
+因此 reference 是同一二进制下的算法对照，不等价于重编译一份仅声明 32 KiB UB 的旧二进制。
+如需评估最终代码体积、编译布局或 UB 资源差异，另保留旧版本独立比较。
+
+验收使用同一完整端到端测试。各组合用独立进程、相同参数比较。
 示例沿用下文已配置好的 CANN/PyTorch、服务地址、EID、DEVICE_ID 和 PYTHONPATH：
 
 ```bash
-mkdir -p results
-cp build-npu/bin/kvaf_scatter_batch_get_kernels.o results/scatter-reference.o
-cmake --build build-npu --target kvaf_scatter_batch_get_kernel -j
-export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+set -euo pipefail
+KVAF_AB_DIR="$PWD/results/scatter-ab-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$KVAF_AB_DIR"
+cp build-npu/bin/kvaf_scatter_batch_get_kernels.o "$KVAF_AB_DIR/prior.o"
+cmake --build build-npu -j
 
-for variant in reference ub-batch; do
-  if [[ "$variant" == reference ]]; then
-    kernel="$PWD/results/scatter-reference.o"
-  else
-    kernel="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o"
-  fi
-  KVAF_RUN_NPU_TESTS=1 KVAF_BATCH_GET_KERNEL="$kernel" \
-    python -u tests/python/test_aiv_scatter_perf.py \
+for variant in reference fused double both; do
+  case "$variant" in
+    reference) fused=0; double=0 ;;
+    fused)     fused=1; double=0 ;;
+    double)    fused=0; double=1 ;;
+    both)      fused=1; double=1 ;;
+  esac
+  bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
+      --fused-build "$fused" --double-buffer "$double" \
       --cores 4 --workload full-blocks --input-mode changing \
-      --blocks 1024 --tokens-per-block 4 --token-bytes 656 \
-      --request-length 8192 --miss-count 4096 \
+      --blocks 1024 --tokens-per-block 4 --token-bytes 4096 \
+      --request-length 8192 --miss-count 1024 \
       --source-pattern random --output-row-step 1 --output-order random --seed 1234 \
       --warmup 50 --iterations 1000 --profile-rounds 100 \
-      --json "results/scatter-${variant}-656.json" \
-      --csv "results/scatter-${variant}-656.csv"
+      --json "$KVAF_AB_DIR/${variant}.json" --csv "$KVAF_AB_DIR/${variant}.csv"
 done
 ```
 
-两份文件中 `phase=baseline` 都表示关闭细分打点，不表示旧算法。
-通过文件名和 JSON 的 kernel SHA256 区分算法版本，先比较这部分的端到端 p50/p95、
+该例固定为本轮 4 MiB 形状（1024 个有效 token），源模式采用 random；
+复现已有数据时还应与其 JSON 中的 source-pattern 一致。
+各文件中 `phase=baseline` 都表示关闭细分打点，不表示旧算法。
+通过 CSV/JSON 的 `fused_build`、`double_buffer` 区分算法组合，kernel SHA256 应完全一致。
+先比较这部分的端到端 p50/p95、
 有效带宽，再用 `profiled` 的 `aiv_scatter_ns` 和 `cpu_comm_ns` 归因。
-两个版本均须通过完整 output/guard 校验。再以相同方法测 4096 B、非整除前缀和其他核数，
-不要只依据一个形状决定全局替换。
+四个版本均须通过完整 output/guard 校验，再交替重跑对照检查波动。
+656 B、非整除前缀和其他核数也需回归，不仅依据一个形状判断。
+
+已有 CPU kernel 模型覆盖四种开关组合、尾批和大行 fallback、旧 sequence 复用、
+非法输入与中途构建失败。模型按每个事件之前的 DMA 命令确认完成，
+校验双 bank 的输入/输出交错及 UB 复用安全，不模拟真实硬件性能或外部 DMA 可见性。
+可在有 C++ 编译器的 Linux 环境运行：
+
+```bash
+cmake -S . -B build-model -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_GET=OFF
+cmake --build build-model -j --target \
+  kvaf_sequential_batch_get_kernel_model_test kvaf_sequential_host_test
+ctest --test-dir build-model -R 'kvaf_sequential_(batch_get_kernel_model|host)_test' --output-on-failure
+```
+
+一个 kernel 模型可执行文件在运行时遍历四种组合，并覆盖旧参数兼容与非法 flags。
+Host 测试验证默认值、环境变量快照、重新初始化、profile 开关保留算法选择和非法环境值。
 
 ## 构建与运行
 

@@ -26,6 +26,10 @@ def arguments(argv=None):
                         help="percentage of workload tokens; use instead of --miss-count")
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--cores", type=int, default=1)
+    parser.add_argument("--fused-build", type=int, choices=(0, 1),
+                        help="runtime source-list optimization; default: KVAF_SCATTER_FUSED_BUILD or 1")
+    parser.add_argument("--double-buffer", type=int, choices=(0, 1),
+                        help="runtime UB overlap; default: KVAF_SCATTER_DOUBLE_BUFFER or 1")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
@@ -47,6 +51,13 @@ def arguments(argv=None):
     parser.add_argument("--json", type=Path)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
+    for field in ("fused_build", "double_buffer"):
+        if getattr(args, field) is None:
+            name = "KVAF_SCATTER_" + field.upper()
+            value = os.environ.get(name, "1")
+            if value not in ("0", "1"):
+                parser.error(f"{name} must be 0 or 1")
+            setattr(args, field, int(value))
     for field, lo, hi in (("token_bytes", 1, 65535), ("cores", 1, 8),
                           ("blocks", 1, 65536), ("tokens_per_block", 1, 65536), ("plans", 1, 64)):
         if not lo <= getattr(args, field) <= hi:
@@ -141,6 +152,7 @@ def write_results(args, report):
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         rows = [dict(phase=phase, calls=1, cores=args.cores, workload=args.workload,
+                     fused_build=args.fused_build, double_buffer=args.double_buffer,
                      input_mode=args.input_mode, source_blocks=args.blocks,
                      tokens_per_block=args.tokens_per_block, request_length=args.request_length,
                      miss_count=args.miss_count, requests=args.miss_count, token_bytes=args.token_bytes,
@@ -215,6 +227,10 @@ def main(argv=None):
     report = dict(config=config, samples={}, summary={}, setup_ms={})
     payload = args.miss_count * args.token_bytes
     try:
+        # CLI overrides the environment. Host snapshots these during initialize;
+        # baseline/profiled phases then use the same algorithms and binary.
+        os.environ["KVAF_SCATTER_FUSED_BUILD"] = str(args.fused_build)
+        os.environ["KVAF_SCATTER_DOUBLE_BUFFER"] = str(args.double_buffer)
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
         report["setup_ms"]["initialize"] = (time.perf_counter_ns() - begin) / 1e6

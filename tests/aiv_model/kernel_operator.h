@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
+#include <deque>
 
 #define __aicore__
 #define __global__
@@ -27,6 +27,7 @@ inline struct { uint32_t x; } threadIdx;
 enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2, PIPE_ALL };
 using event_t = uint32_t;
 inline bool model_events[4][4][3]{};
+inline uint64_t model_event_fences[4][4][3]{};
 namespace aiv_model {
 // Defer public DMA copies until their producer event is waited on. This catches
 // consuming an unfilled bank, overwriting a bank still being read, and returning
@@ -43,8 +44,10 @@ struct PendingCopy {
   }
 };
 struct CopyQueue {
-  std::vector<PendingCopy> copies;
+  std::deque<PendingCopy> copies;
+  uint64_t submitted{}, completed{};
   bool empty() const { return copies.empty(); }
+  void Push(PendingCopy copy) { copies.push_back(copy); ++submitted; }
   static bool Overlap(const void* first, uint64_t bytes,
                       const void* other, uint64_t other_bytes) {
     if (!bytes || !other_bytes) return false;
@@ -63,14 +66,20 @@ struct CopyQueue {
       if (Overlap(address, bytes, c.source, c.bytes)) return true;
     return false;
   }
-  void Finish() {
-    for (auto& copy : copies) copy.Finish();
-    copies.clear();
+  void FinishThrough(uint64_t fence) {
+    if (fence > submitted) std::abort();
+    while (completed < fence) {
+      copies.front().Finish();
+      copies.pop_front();
+      ++completed;
+    }
   }
+  void Finish() { FinishThrough(submitted); }
 };
 inline CopyQueue mte2, mte3;
 inline uint64_t mte2_copies{}, mte3_copies{};
 inline uint64_t mte2_aligned_copies{}, mte2_tail_copies{};
+inline uint64_t overlapped_mte2_copies{};
 inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
 // Optional exact source interval for tests: a padded UB tail must never cause
 // a read outside the requested GM token, even if the allocation has slack.
@@ -85,13 +94,18 @@ inline void CheckMte2Source(const void* source, uint64_t bytes) {
 inline void set_flag(int source, int target, event_t event) {
   if (model_events[source][target][event]) std::abort();
   model_events[source][target][event] = true;
+  // A bank event covers only commands issued BEFORE the flag, not later work
+  // on the other bank. Waiting for bank 0 must not prematurely drain bank 1.
+  model_event_fences[source][target][event] = source == PIPE_MTE2 ? aiv_model::mte2.submitted :
+      source == PIPE_MTE3 ? aiv_model::mte3.submitted : 0;
 }
 inline void wait_flag(int source, int target, event_t event) {
   if (!model_events[source][target][event]) std::abort();
   model_events[source][target][event] = false;
   ++aiv_model::event_waits[source][target];
-  if (source == PIPE_MTE2) aiv_model::mte2.Finish();
-  if (source == PIPE_MTE3) aiv_model::mte3.Finish();
+  const auto fence = model_event_fences[source][target][event];
+  if (source == PIPE_MTE2) aiv_model::mte2.FinishThrough(fence);
+  if (source == PIPE_MTE3) aiv_model::mte3.FinishThrough(fence);
 }
 inline void set_loop_size_ubtoout(uint64_t) {}
 inline void set_loop1_stride_ubtoout(uint64_t) {}
@@ -171,7 +185,8 @@ void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t co
       reinterpret_cast<uintptr_t>(src.data) % sizeof(T) || bytes > dst.address_.dataLen ||
       !aiv_model::mte2.empty() || aiv_model::mte3.Reads(
           reinterpret_cast<void*>(dst.address_.bufferAddr), bytes)) std::abort();
-  aiv_model::mte2.copies.push_back({reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
+  if (!aiv_model::mte3.empty()) ++aiv_model::overlapped_mte2_copies;
+  aiv_model::mte2.Push({reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
       reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)});
   ++aiv_model::mte2_copies;
   ++aiv_model::mte2_aligned_copies;
@@ -186,10 +201,11 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
       ub_bytes > dst.address_.dataLen || !aiv_model::mte2.empty() ||
       aiv_model::mte3.Reads(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes))
     std::abort();
+  if (!aiv_model::mte3.empty()) ++aiv_model::overlapped_mte2_copies;
   for (uint32_t block = 0; block < p.blockCount; ++block) {
     const auto* source = reinterpret_cast<const uint8_t*>(src.data) + uint64_t(block) * p.blockLen;
     aiv_model::CheckMte2Source(source, p.blockLen);
-    aiv_model::mte2.copies.push_back({
+    aiv_model::mte2.Push({
         reinterpret_cast<uint8_t*>(dst.address_.bufferAddr) + uint64_t(block) * padded,
         source, p.blockLen, padded});
   }
@@ -204,7 +220,7 @@ void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
       aiv_model::mte2.Writes(reinterpret_cast<void*>(src.address_.bufferAddr), p.blockLen) ||
       aiv_model::mte3.Writes(dst.data, p.blockLen))
     std::abort();
-  aiv_model::mte3.copies.push_back({reinterpret_cast<uint8_t*>(dst.data),
+  aiv_model::mte3.Push({reinterpret_cast<uint8_t*>(dst.data),
       reinterpret_cast<const uint8_t*>(src.address_.bufferAddr), p.blockLen, 0});
   ++aiv_model::mte3_copies;
 }
