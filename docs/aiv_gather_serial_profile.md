@@ -26,6 +26,32 @@ token 数、SGL 和随机种子；比较不同实现时保持这些值一致。
 `GetSystemCycle()` 计数器频率后才填写 MHz，脚本再额外换算微秒；不能将
 AI Core 主频或某个固定默认值直接作为该频率。
 
+### 如何确认 clock_mhz
+
+这里需要的是 GetSystemCycle 系统计数器的频率。先在目标机确认芯片型号：
+
+```bash
+npu-smi info -m
+npu-smi info -t board -i 7
+```
+
+`-i 7` 替换为查询结果中的实际 NPU ID，不能只凭 Python 的可见设备序号
+猜测物理 ID；部分平台的 board 查询还需按工具帮助指定 chip ID。
+然后按 [CANN 9.1 GetSystemCycle 官方说明](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/tool_interface/system_resources_and_variables/GetSystemCycle_ISASI.md)
+确认该型号的换算基准：
+
+| 型号 | PROFILE_CLOCK_MHZ | 换算 |
+| --- | --- | --- |
+| Ascend 950PR / Ascend 950DT | 1000 | us = cycles / 1000 |
+| Atlas A2 / Atlas A3 训练、推理系列 | 50 | us = cycles / 50 |
+
+本项目当前使用 A5/3510 构建路径；确认实际设备为 950PR/950DT 后，在脚本
+顶部设置 `PROFILE_CLOCK_MHZ = 1000`，重新执行 Python 脚本即可输出 read_us，
+不需为换算重编 kernel。不要把 npu-smi 的 AI Core 运行频率当成此参数。
+例如已采集的 `read_cycles=3031076.4`，在 950PR/950DT 上为
+`read_us=3031.0764`，约 3.031 ms。计数器频率由平台/API 定义确认，不通过
+Host 的同步等待时间倒推。
+
 ## CSV 输出与后续对比
 
 每次运行结束自动创建一个测试目录，将四份 CSV 放在一起，并打印
@@ -62,8 +88,9 @@ request_count、token_bytes 等列筛选对照，避免把不同核或不同采�
 
 列顺序按字段名固定：`clock_mhz`、`clock_source`、`cpu_profile`、`kernel_path`、
 `put_kernel_path`、`request_plan`、`timing_contract` 放在 `mode` 前；summary 的
-`error_type`、`error_message` 放在 `total_us` 后。移动后部分 Excel 列字母会
-变化，整理数据时建议按表头名称定位。
+`total_us` 后紧跟 input/descriptor/publish/wait_cpu/read/finalize/total 七列
+cycles，再放 `sampling_status`、`core`，然后 `error_type`、`error_message`。
+移动后部分 Excel 列字母会变化，整理数据时建议按表头名称定位。
 
 summary 的 Host 和 AIV 行共享表头，但各自只填自己的指标：
 

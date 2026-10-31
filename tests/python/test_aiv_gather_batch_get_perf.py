@@ -17,7 +17,7 @@ TABLE_CAPACITY = 256            # Number of remote source blocks.
 TOKENS_PER_BLOCK = 128
 GATHER_SGL_SIZE = 6
 SEED = 20261030
-PROFILE_CLOCK_MHZ = None        # Set only after verifying GetSystemCycle frequency.
+PROFILE_CLOCK_MHZ = None        # Verified 950PR/DT: 1000; A2/A3: 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
 RUN_LABEL = "serial"            # Change to identify later pipeline versions.
@@ -312,10 +312,13 @@ def export_csv_results(
     metadata_columns = [key for key in metadata if key not in before_mode]
     mode_index = metadata_columns.index("mode")
     metadata_columns[mode_index:mode_index] = before_mode
+    stage_cycle_columns = [name + "_cycles" for name in stages]
+    summary_core_columns = [field for field in core_columns if field not in stage_cycle_columns]
     outputs = (
-        ("summary", ["row_kind", "sampling_status", "profile", "core",
+        ("summary", ["row_kind", "profile",
                      "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
-                     *host_columns, "error_type", "error_message", *core_columns], summary),
+                     *host_columns, *stage_cycle_columns, "sampling_status", "core",
+                     "error_type", "error_message", *summary_core_columns], summary),
         ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps"], e2e_rows),
         ("profile_host", ["sample_index", "profile", "sequence", "call_e2e_us", *host_columns], host_rows),
         ("profile_core", ["sample_index", "profile", "sequence", "core", *core_columns], core_rows),
