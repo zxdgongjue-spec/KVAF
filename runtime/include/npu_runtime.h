@@ -76,6 +76,9 @@ class NpuRuntime final : public Runtime {
   Status OffloadFrom(const std::vector<KeyId>& keys, const HbmReadyBatch&);
   Status ResolveOffload();
   bool pending_offload() const;
+  // Diagnostic RPC: hashes current DDR after commit, outside Offload's data path.
+  // Call before freeing/overwriting destination slots, the source's next Ready,
+  // or source detach. Synchronous like Offload; not a historical checksum cache.
   Status LastOffloadChecksum(std::uint64_t*) const;
 
   // B's second HBM: direct READ spans, no AccessTable or DDR metadata.

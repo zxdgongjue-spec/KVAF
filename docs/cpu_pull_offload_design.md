@@ -91,7 +91,7 @@ CPU 候选数量通过现有 KVCP GetCandidateCount 查询，KVOF wire ABI 不�
 - 参考读取固定 HBM workspace 的通知和描述符；这里读取调用者传入的连续 Tensor，
   `offsets` 和 `lengths` 都以字节计，不通过额外 HBM staging buffer 搬运用户数据。
 - 参考首次 READ 的目的地址是 CPU 控制区对应偏移；这里使用 DDR slot 0 起始处。
-- 四路连接与参考一致，payload READ 使用四路批量提交；探测及串行对照使用 queue 0。
+- 四路连接与参考一致，payload READ 使用四路批量提交；仅启动探测使用 queue 0 的单条 READ。
 - CPU DDR 池长期保留；每次任务单独注册源 HBM并重建连接，以支持不同 Tensor。
 - 使用 TCP Submit/Query 传递任务，不引入参考的 CPU WRITE、AICPU scatter、HBM 轮询通知
   或 Decode 数据返回流程。

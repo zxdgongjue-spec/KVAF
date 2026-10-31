@@ -320,9 +320,8 @@ void BorrowedPoolTest() {
   Require(backend->Close().ok()&&pool.use_count()==1&&local_mrs==0,"close releases registration and lease, not pool allocation");
   (*pool)[0]=7;Require((*pool)[0]==7,"A still owns DDR after B detaches");
 }
-void BulkReadTest(std::size_t count, std::uint32_t depth, bool serial=false) {
+void BulkReadTest(std::size_t count, std::uint32_t depth) {
   returned_depth=depth;
-  if(serial)setenv("KVAF_CPU_PULL_SERIAL","1",1);
   urma_context_t context{};context.eid.raw[15]=1;
   auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
   Require(backend->Allocate((count+1)*4096,&cpu).ok(),"bulk pool");
@@ -332,7 +331,7 @@ void BulkReadTest(std::size_t count, std::uint32_t depth, bool serial=false) {
   std::vector<p::Span> spans;
   for(std::size_t i=0;i<count;++i)
     spans.push_back({(count-1-i)*4099+7,i*4096+3,65+i%1900});
-  required_wave_queues=serial?1:4;
+  required_wave_queues=4;
   for(unsigned round=0;round<3;++round){
     for(std::size_t i=0;i<hbm.size();++i)hbm[i]=(i*17+round*31)%251;
     std::memset(reinterpret_cast<void*>(cpu.base),0xa5,cpu.bytes);
@@ -342,7 +341,7 @@ void BulkReadTest(std::size_t count, std::uint32_t depth, bool serial=false) {
     for(auto& item:pending)item.second.delay=item.second.index==0?3:0;
     Require(backend->Read(spans).ok(),"bulk READ completes");
     std::size_t calls=0,tails=0;
-    const std::size_t channels=serial?1:4,limit=serial?1:std::min(1024U,depth);
+    const std::size_t channels=4,limit=std::min(1024U,depth);
     for(std::size_t remaining=count;remaining;){
       const auto n=std::min(remaining,channels*limit);
       for(std::size_t q=0;q<channels;++q){
@@ -367,7 +366,7 @@ void BulkReadTest(std::size_t count, std::uint32_t depth, bool serial=false) {
   }
   required_wave_queues=0;
   Require(backend->Close().ok()&&local_mrs==0&&queues==0&&pending.empty(),"bulk cleanup");
-  returned_depth=8192;unsetenv("KVAF_CPU_PULL_SERIAL");
+  returned_depth=8192;
 }
 void BulkFailureTest(Fault injected) {
   urma_context_t context{};context.eid.raw[15]=1;
@@ -416,7 +415,7 @@ int main(){try{
   BulkReadTest(257,8192); // Single wave reused, then changed offsets/lengths.
   BulkReadTest(4096,8192); // Full protocol limit, 1024 WRs per queue.
   BulkReadTest(512,64); // Returned SQ depth forces waves and storage reuse.
-  BulkReadTest(33,8192,true); // Identical data/correctness under the serial baseline.
+  BulkReadTest(33,8192); // Uneven distribution across four queues.
   ProbeFailureTest(Fault::LocalAccess);
   ProbeFailureTest(Fault::CqStatus);
   for(auto injected:{Fault::Post,Fault::Poll,Fault::UserContext,Fault::Receive,Fault::Multiple,Fault::LocalAccess}){

@@ -5,7 +5,9 @@ namespace kvaf::remote_pull {
 // Shared-pool, third-party source control. Keep legacy KVOF and KVCP framing
 // separate; old services cannot accidentally interpret these requests.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
-constexpr std::uint16_t kVersion = 1;
+// V2 computes payload checksums only on explicit Checksum requests. V1 clients
+// expect a checksum in Query/Done, so require all three peers to upgrade together.
+constexpr std::uint16_t kVersion = 2;
 using Endpoint = offload::Endpoint;
 using Span = offload::Span;
 using Result = offload::Result;

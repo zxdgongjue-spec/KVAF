@@ -66,7 +66,7 @@ Status RemotePullOperator::Validate(const RemoteOffloadRequest& request, bool* d
   const auto old = records_.find(request.source.source_id);
   if (old != records_.end() && request.source.sequence <= old->second.request.source.sequence) {
     if (!Same(request, old->second.request)) return Status::InvalidArgument("stale/conflicting B Ready message");
-    current_ = old->second.request; checksum_ = old->second.checksum;
+    current_ = old->second.request;
     *duplicate = true; return old->second.result;
   }
   rp::Response response{};
@@ -103,7 +103,7 @@ Status RemotePullOperator::ResolveOffload() {
     auto status = rp::Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Query), {}, &response);
     if (!status.ok()) return status;
     if (response.result != rp::Result::Ok) return Status::InDoubt("cannot identify remote source task");
-    if (response.state == rp::State::Done) { checksum_ = response.checksum; return Status::OK(); }
+    if (response.state == rp::State::Done) return Status::OK();
     if (response.state == rp::State::Ready || response.state == rp::State::Failed || response.state == rp::State::Cancelled)
       return Status::Internal("remote READ failed or was not submitted");
     if (response.state != rp::State::Running || std::chrono::steady_clock::now() >= deadline)
@@ -117,13 +117,18 @@ Status RemotePullOperator::CompleteOffload(bool committed) {
   rp::Response response{}; auto status = rp::Exchange(ticket_.address, r, {}, &response);
   if (!status.ok()) return status;
   if (response.result != rp::Result::Ok) return Status::InDoubt("CPU did not acknowledge A's metadata decision");
-  records_[current_.source.source_id] = {current_, committed ? Status::OK() : Status::Internal("B batch was aborted"), checksum_};
+  records_[current_.source.source_id] = {current_, committed ? Status::OK() : Status::Internal("B batch was aborted")};
   active_ = false; return Status::OK();
 }
 Status RemotePullOperator::LastChecksum(std::uint64_t* checksum) const {
   if (!checksum || active_ || !current_.source.sequence) return Status::InvalidState("no completed remote Offload checksum");
   const auto record = records_.find(current_.source.source_id);
   if (record == records_.end() || !record->second.result.ok()) return Status::InvalidState("last Offload was not committed");
-  *checksum = checksum_; return Status::OK();
+  rp::Response response{};
+  auto status = rp::Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Checksum), {}, &response);
+  if (!status.ok()) return status;
+  if (response.result != rp::Result::Ok || response.state != rp::State::Committed)
+    return Status::InvalidState("remote Offload checksum unavailable; verify before next Ready or source detach, with DDR slots retained");
+  *checksum = response.checksum; return Status::OK();
 }
 }

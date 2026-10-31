@@ -25,9 +25,14 @@ sequenceDiagram
     A->>C: Submit(source_id, sequence, src_offset, dst_offset, bytes)
     C->>B: URMA READ HBM
     C->>C: 数据直接落入共享 DDR
-    C-->>A: CQ 完成，返回状态和校验和
+    C-->>A: CQ 完成，返回 Done 状态
     A->>A: CommitPut，公布 metadata
     A->>C: Complete(已提交)
+    opt 应用需要校验（计时区间外）
+        A->>C: last_offload_checksum() / Checksum
+        C->>C: 扫描本批 DDR 数据
+        C-->>A: 返回校验和
+    end
     A-->>B: 应用发送复用通知
     B->>C: release_batch() 确认 Complete
     B->>B: 允许覆写本批 HBM
@@ -72,6 +77,8 @@ ready_batch = source.ready([7, 100003], [656, 100001], stream=producer_stream)
 # 卡 A 收到通知：keys 和 lengths 一一对应，keys 仍遵循现有 DSA slot 规则。
 runtime.offload_from([1, 3], ready_batch)
 # 返回成功表示 CPU READ 完成、Meta 已提交、CPU 已确认该批可复用。
+# 可选诊断：另发 RPC 扫描当前 DDR；性能计时应在此调用之前结束。
+checksum = runtime.last_offload_checksum()
 # 通过应用通道通知 B。重复传入完全相同的 keys / ready_batch 不会再次 READ。
 ```
 
@@ -117,7 +124,9 @@ B 对**已经选定的 CPU 池**自动遍历其当前设备的 NPU EID，并校�
 CPU candidate 或重分配 A 的池。若 B 所有 EID 都失败，需要应用清理后重新选择三方都能访问的
 CPU candidate。这一点与旧独立 OffloadRuntime 遍历 CPU×NPU 候选组合不同。
 
-KVRP v1 承载共享池控制消息，KVCP v6 和旧 KVOF v2 保持原格式。CPU 和 NPU 均需重新编译。
+KVRP v2 承载共享池控制消息：Query/Done 只返回传输状态，Checksum 才扫描 DDR。
+v1 客户端依赖 Query 中的校验和，因此不混用；CPU 服务及 A、B 的 Python 扩展都需重新编译。
+KVCP v6 和旧 KVOF v2 保持原格式。
 A/B/CPU 都是同步单调用方控制接口；同一共享池一次只接受一个尚未完成/确认的 Pull，
 同一批内部使用四个 Jetty 并行 READ。每次最多 4096 spans；单个 READ 按
 provider 消息/READ 上限（最多 64 KiB）切分。每个 WQE 只有一个远端源 SGE 和一个本地目标 SGE。
@@ -137,19 +146,16 @@ READ 完成后才能正常确认该尾部。所有活跃 Jetty 尾部均成功�
 post 调用、4 个成功尾部 CQE。更大 span 会拆成更多 WQE，超过本轮容量后分轮执行。
 这里不使用 WRITE 的本地多 SGE gather：远端离散地址无法由一个源 SGE 描述。
 
-CPU 服务使用 Release 构建，以下两种模式分别启动服务后运行相同测试；切换模式前结束上一轮
-客户端并重启服务。环境变量在 Open 时读取，对共享池及旧 OffloadRuntime 都生效。
+CPU 服务使用 Release 构建，数据传输固定使用四 Jetty 批量模式。PROFILE 环境变量在 Open
+时读取，对共享池及旧 OffloadRuntime 都生效。串行对照模式已移除；启动连通性探测仍保留
+queue 0 上的单条 READ，以确认失败候选能安全释放后再回退。
 
 ```bash
 cmake -S . -B build-cpu-shared-ddr -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cpu-shared-ddr -j
 
-# 原有串行行为：queue 0，每条 READ 单独提交并等待。
-KVAF_CPU_PULL_SERIAL=1 KVAF_CPU_PULL_PROFILE=1 \
-  ./build-cpu-shared-ddr/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
-
-# 批量模式（默认）：四个 Jetty，多 WQE 在途、每个 Jetty 每轮一个尾部 CQE。
-KVAF_CPU_PULL_SERIAL=0 KVAF_CPU_PULL_PROFILE=1 \
+# 四个 Jetty，多 WQE 在途、每个 Jetty 每轮一个尾部 CQE。
+KVAF_CPU_PULL_PROFILE=1 \
   ./build-cpu-shared-ddr/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
 ```
 
@@ -169,10 +175,18 @@ checksum；B 收到提交确认后才写下一轮。
 `CPU_PULL_PROFILE` 显示 build/post/cq_wait/total_us、READ WQE 数、post 次数、尾部 CQE 数、
 waves、活跃 Jetty 数和 plan_reused。该 total_us 包含描述符准备、提交和等待，**不包含**
 服务端 checksum、控制 RPC、线程创建或 Meta 提交。`CPU_PULL_BENCH_PASS` 的 Python 时间
-计量 `offload_from()` 至完成，包含这些控制与校验开销；排除注册、生产者写入/Ready 和 Free。
-共享池服务目前仍对 payload 计算完整 checksum，大批量时可能成为端到端耗时的重要部分。
-两种指标应分别比较；不要将 Python effective_GBps 当作纯 READ 带宽。诊断后将 PROFILE
-关闭再测整体性能，可排除额外日志影响。
+计量 `offload_from()` 至提交完成，包含控制 RPC、线程创建和 Meta 提交；排除数据校验、注册、
+生产者写入/Ready 和 Free，输出 `cpu_checksum_included=0`。每轮计时结束后显式调用
+`last_offload_checksum()`，服务端此时才计算完整 payload 的校验和；与预期值一致后才 Free
+并通知 B 复用。`verification_mean_us` 单独统计校验 RPC 和比较的耗时，不计入带宽分母。
+
+`last_offload_checksum()` 读取当前 DDR，不返回历史缓存。调用方必须保留本批目标槽位且
+禁止覆写，直到校验返回；应在 B 的下一次 Ready 或 source detach 之前调用。校验 RPC 丢失
+可以重试，但不会重发 READ，也不会撤销已经完成的 Meta 提交。运行中/未决/已取消/已关闭
+批次拒绝校验；同一池另有运行中或未决的 CPU Pull 时也拒绝。启动 scratch 探测的校验保留。
+
+两种计时指标应分别比较；不要将 Python effective_GBps 当作纯 READ 带宽。每轮校验仍会
+占用实际运行时间，只是与传输计时分开。诊断后将 PROFILE 关闭再测整体性能，可排除日志影响。
 
 ## 未决操作与失败处理
 

@@ -25,14 +25,13 @@ class RemotePullOperator final : public AccessOperator {
   Status LastChecksum(std::uint64_t*) const;
   bool pending() const { return active_; }
  private:
-  struct Record { RemoteOffloadRequest request; Status result; std::uint64_t checksum; };
+  struct Record { RemoteOffloadRequest request; Status result; };
   AccessOperator* aiv_{};
   std::shared_ptr<peer::PeerLink> link_;
   OffloadRegionTicket ticket_;
   std::uint32_t timeout_ms_;
   RemoteOffloadRequest current_;
   bool active_{};
-  std::uint64_t checksum_{};
   std::unordered_map<std::uint64_t, Record> records_;
 };
 }

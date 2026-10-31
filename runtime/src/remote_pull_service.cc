@@ -12,7 +12,7 @@ struct Session {
   RegionInfo region{};
   Endpoint source{}, local{};
   std::unique_ptr<offload::Backend> backend;
-  std::uint64_t sequence{}, checksum{};
+  std::uint64_t sequence{};
   std::vector<Span> ready, submitted;
   State state{State::Connecting}, terminal{State::Connecting};
   std::mutex mutex;
@@ -91,7 +91,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     return out;
   }
   auto& s = *found->second; std::unique_lock<std::mutex> lock(s.mutex);
-  out.state = s.state; out.endpoint = s.local; out.checksum = s.checksum;
+  out.state = s.state; out.endpoint = s.local;
   if (s.region.id != r.region || s.region.epoch != r.epoch) return out;
   if (cmd == Command::Attach) {
     if (!r.task && !std::memcmp(&s.source, &r.source, sizeof(Endpoint)) && s.state != State::Closed)
@@ -126,7 +126,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     for (const auto& span : spans)
       if (span.destination || !offload::Contains(s.source.bytes, span.source, span.bytes)) return out;
     if (s.worker.joinable()) s.worker.join();
-    s.sequence = r.task; s.ready = spans; s.submitted.clear(); s.checksum = 0;
+    s.sequence = r.task; s.ready = spans; s.submitted.clear();
     s.state = out.state = State::Ready; out.result = Result::Ok; return out;
   }
   // A Ready packet may never have reached the service. Cancel also records
@@ -137,7 +137,22 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     s.state = s.terminal = out.state = State::Cancelled; out.result = Result::Ok; return out;
   }
   if (r.task != s.sequence) return out; // Old notifications cannot consume a newer generation.
-  if (cmd == Command::Query || cmd == Command::Checksum) { out.endpoint = s.source; out.result = Result::Ok; return out; }
+  if (cmd == Command::Query) { out.endpoint = s.source; out.result = Result::Ok; return out; }
+  if (cmd == Command::Checksum) {
+    // Diagnostic reads of CURRENT DDR are explicit and outside transfer/commit.
+    // The caller must retain these slots unchanged until this RPC returns.
+    if (s.state != State::Done && s.state != State::Committed) { out.result = Result::Busy; return out; }
+    for (const auto& item : impl_->sources) {
+      if (item.second.get() == &s || item.second->region.id != r.region) continue;
+      std::lock_guard<std::mutex> guard(item.second->mutex);
+      if (item.second->state == State::Running || item.second->state == State::InDoubt) {
+        out.result = Result::Busy; return out;
+      }
+    }
+    try { out.checksum = s.backend->Checksum(s.submitted); out.result = Result::Ok; }
+    catch (...) { out.result = Result::Failed; }
+    return out;
+  }
   if (cmd == Command::Complete) {
     if (r.flags > 1) return out;
     const auto desired = r.flags ? State::Committed : State::Cancelled;
@@ -178,7 +193,6 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
       catch (...) { result = Status::InDoubt("exception in remote READ worker"); }
       std::lock_guard<std::mutex> guard(s.mutex);
       s.state = result.ok() ? State::Done : result.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
-      if (result.ok()) s.checksum = s.backend->Checksum(s.submitted);
       std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_DONE region=%llu source=%llu sequence=%llu state=%u detail=%s\n",
           (unsigned long long)s.region.id, (unsigned long long)id, (unsigned long long)s.sequence,
           unsigned(s.state), result.message().c_str());

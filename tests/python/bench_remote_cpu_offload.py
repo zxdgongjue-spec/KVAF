@@ -1,8 +1,8 @@
-"""Hardware comparison of serial/batched CPU READ with a persistent B HBM source.
+"""Hardware benchmark of batched CPU READ with a persistent B HBM source.
 
-Select the mode on kvaf_cpu_service (KVAF_CPU_PULL_SERIAL=0 or 1), restart it,
-and run this same command. No AIV kernel is required. CPU_PULL_PROFILE measures
-transport time; the Python metric includes offload RPCs, CPU checksum and commit.
+No AIV kernel is required. CPU_PULL_PROFILE measures transport time; the Python
+metric includes offload RPCs and commit. Full DDR checksum verification runs in
+a separate RPC after the measured call and before freeing/reusing any slot.
 """
 import argparse
 import multiprocessing as mp
@@ -110,14 +110,20 @@ def main():
               f"block_bytes={args.block_bytes}", flush=True)
         keys = list(range(args.blocks))
         elapsed = []
+        verification_elapsed = []
         for iteration in range(args.warmup + args.iterations):
             batch = receive(parent, "ready")
             begin = time.perf_counter_ns()
             runtime.offload_from(keys, batch)
             duration = (time.perf_counter_ns() - begin) / 1000
-            assert runtime.last_offload_checksum() == expected[iteration % 2], "DDR checksum mismatch"
+            # This RPC now performs the actual CPU scan, outside offload timing.
+            verify_begin = time.perf_counter_ns()
+            if runtime.last_offload_checksum() != expected[iteration % 2]:
+                raise RuntimeError("DDR checksum mismatch")
+            verify_duration = (time.perf_counter_ns() - verify_begin) / 1000
             if iteration >= args.warmup:
                 elapsed.append(duration)
+                verification_elapsed.append(verify_duration)
             runtime.batch_free(keys)
             parent.send(("reuse", iteration))
         receive(parent, "closed")
@@ -131,7 +137,8 @@ def main():
               f"iterations={len(elapsed)} mean_us={mean:.1f} p50_us={percentile(.5):.1f} "
               f"p95_us={percentile(.95):.1f} p99_us={percentile(.99):.1f} "
               f"effective_GBps={args.blocks * args.block_bytes / mean / 1000:.3f} "
-              "cpu_checksum_included=1 registration_and_producer_and_free_excluded=1 "
+              "cpu_checksum_included=0 registration_and_producer_and_free_excluded=1 "
+              f"verification_mean_us={statistics.mean(verification_elapsed):.1f} "
               "changing_inputs=1 verification=every_round_checksum", flush=True)
     except BaseException:
         traceback.print_exc()

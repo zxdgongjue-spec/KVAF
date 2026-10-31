@@ -11,8 +11,8 @@
 namespace rp = kvaf::remote_pull;
 using kvaf::Status;
 void Ok(const Status& status) { if (!status.ok()) throw std::runtime_error(status.message()); }
-std::atomic<int> payload_reads{0}, scratch_reads{0}, leases{0};
-std::atomic<bool> hold_read{false}, uncertain_read{false};
+std::atomic<int> payload_reads{0}, scratch_reads{0}, checksum_calls{0}, leases{0};
+std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_checksum{false};
 struct SharedBackend final : p::Backend {
   std::vector<std::uint8_t>& pool;
   p::Endpoint source{};
@@ -38,6 +38,8 @@ struct SharedBackend final : p::Backend {
     return Status::OK();
   }
   std::uint64_t Checksum(const std::vector<p::Span>& spans)const override {
+    ++checksum_calls;
+    if(fail_checksum)throw std::runtime_error("simulated diagnostic failure");
     std::uint64_t h=14695981039346656037ULL;
     for(auto span:spans)h=p::Hash(pool.data()+span.destination,span.bytes,h);return h;
   }
@@ -118,16 +120,28 @@ void Lifecycle(){
   kvaf::HbmReadyBatch batch;Ok(b.Ready({16,512},{64,128},reinterpret_cast<void*>(1),&batch));
   Require(!b.ReleaseBatch().ok()&&b.frozen(),"B retained before A submits");
   Require(!a.Shutdown().ok()&&a.initialized(),"A cannot release shared DDR while B registered");
-  aclrtSetDevice(0);const int before=payload_reads;Ok(a.OffloadFrom({1,3},batch));
+  aclrtSetDevice(0);const int before=payload_reads,hashes_before=checksum_calls;Ok(a.OffloadFrom({1,3},batch));
   Require(payload_reads==before+1&&server.pool_allocations==1,"one direct CPU READ batch, one pool");
+  Require(checksum_calls==hashes_before,"offload returns after commit without scanning payload for checksum");
   Require(!std::memcmp(server.pool.data()+256,hbm.data()+16,64)&&!std::memcmp(server.pool.data()+768,hbm.data()+512,128),"CPU uses B offsets and PreparePut DDR destinations");
   std::uint64_t hash{};Ok(a.LastOffloadChecksum(&hash));Require(hash==p::Hash(hbm.data()+512,128,p::Hash(hbm.data()+16,64)),"shared DDR contents hash");
+  Require(checksum_calls==hashes_before+1,"explicit checksum RPC performs verification");
+  // Diagnostics must scan actual DDR, not a transfer-time cached result.
+  server.pool[256]^=0x80;std::uint64_t corrupted{};Ok(a.LastOffloadChecksum(&corrupted));
+  Require(corrupted!=hash,"checksum detects DDR corruption after completion");server.pool[256]^=0x80;
+  server.drop=std::uint16_t(rp::Command::Checksum);
+  Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"lost checksum response does not reopen completed DMA");
+  Ok(a.LastOffloadChecksum(&corrupted));Require(corrupted==hash&&payload_reads==before+1,"diagnostic retry hashes DDR without replaying READ");
+  fail_checksum=true;Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"checksum failure leaves transfer committed");fail_checksum=false;
+  const int hashes_after=checksum_calls;
   Ok(a.OffloadFrom({1,3},batch));Require(payload_reads==before+1,"duplicate Ready notification does not redo PreparePut/READ");
+  Require(checksum_calls==hashes_after,"duplicate notification does not scan payload");
   auto conflict=batch;conflict.input_offsets[0]++;Require(!a.OffloadFrom({1,3},conflict).ok(),"conflicting duplicate rejected");
   kvaf::AccessTableHandle table;Ok(a.core().PrepareAccessTable({{1,3}},&table));Ok(a.core().ReleaseAccessTable(table));
   Ok(a.core().BatchFree({{1,3}}));
   aclrtSetDevice(7);Ok(b.ReleaseBatch());Require(!b.frozen(),"only committed batch can be reused");
   Ok(b.Ready({32},{32},reinterpret_cast<void*>(1),&batch));
+  Require(!a.LastOffloadChecksum(&hash).ok()&&checksum_calls==hashes_after,"next Ready invalidates prior checksum identity without reading reused DDR");
   auto stale=batch;stale.source.region_epoch++;Require(!a.OffloadFrom({2},stale).ok(),"old service epoch rejected before PreparePut");
   server.drop=std::uint16_t(rp::Command::Submit);
   aclrtSetDevice(0);Require(a.OffloadFrom({2},batch).code()==kvaf::StatusCode::kInDoubt&&a.pending_offload(),"lost Submit ACK retains task");
@@ -146,10 +160,17 @@ void Lifecycle(){
   // Timeout remains recoverable while the same worker owns the READ.
   Ok(b.Ready({0},{16},reinterpret_cast<void*>(1),&batch));hold_read=true;
   aclrtSetDevice(0);Require(a.OffloadFrom({0},batch).code()==kvaf::StatusCode::kInDoubt,"READ deadline retains operation");
+  Require(!a.LastOffloadChecksum(&hash).ok(),"pending READ cannot be verified");
+  auto checksum_request=rp::MakeRequest(rp::Command::Checksum);
+  checksum_request.region=ticket.region.id;checksum_request.epoch=ticket.region.epoch;checksum_request.token=ticket.region.token;
+  checksum_request.source_id=batch.source.source_id;checksum_request.task=batch.source.sequence;
+  rp::Response checksum_response{};const int pending_hashes=checksum_calls;
+  Ok(rp::Exchange(server.address,checksum_request,{},&checksum_response));
+  Require(checksum_response.result==rp::Result::Busy&&checksum_calls==pending_hashes,"CPU refuses checksum until all READs finish");
   Require(!b.CancelBatch().ok()&&!b.Shutdown().ok(),"B cannot unregister or cancel an active READ");
   hold_read=false;Ok(a.ResolveOffload());aclrtSetDevice(7);Ok(b.ReleaseBatch());
   server.drop=std::uint16_t(rp::Command::Detach);Require(!b.Shutdown().ok(),"lost Detach reply retains exporter");
-  Ok(b.Shutdown());NoResources();aclrtSetDevice(0);server.fail_release=true;
+  Ok(b.Shutdown());NoResources();Require(!a.LastOffloadChecksum(&hash).ok(),"detached source cannot be verified");aclrtSetDevice(0);server.fail_release=true;
   Require(!a.Shutdown().ok(),"failed DDR release retains runtime for shutdown retry");
   Require(!a.core().PrepareAccessTable({{0}},&table).ok(),"partially closed runtime cannot resume data operations");
   Ok(a.Shutdown());Require(server.pool.empty(),"shared allocation released after detach");

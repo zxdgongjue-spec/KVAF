@@ -649,7 +649,9 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("offload_region", &NpuPythonRuntime::OffloadRegion)
       .def("offload_from", &NpuPythonRuntime::OffloadFrom, py::arg("keys"), py::arg("ready_batch"))
       .def("resolve_offload", &NpuPythonRuntime::ResolveOffload)
-      .def("last_offload_checksum", &NpuPythonRuntime::LastChecksum)
+      .def("last_offload_checksum", &NpuPythonRuntime::LastChecksum,
+           "Hash current CPU DDR via a separate RPC after offload. Call before freeing or "
+           "overwriting the destination slots, the source's next ready(), or source shutdown.")
       .def_property_readonly("pending_offload", &NpuPythonRuntime::PendingOffload)
 #endif
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),

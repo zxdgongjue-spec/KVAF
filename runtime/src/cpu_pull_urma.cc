@@ -132,7 +132,6 @@ class UrmaBackend final : public Backend {
       std::memcpy(local->key[index]+sizeof(urma_jetty_id_t), &q.jetty->jetty_cfg.jfs_cfg.trans_mode,
                   sizeof(urma_transport_mode_t));
     }
-    serial_ = Enabled("KVAF_CPU_PULL_SERIAL");
     profile_ = Enabled("KVAF_CPU_PULL_PROFILE");
     ready_ = true;
     std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_REFERENCE commit=8bc5a2a protocol=%u sge_bytes=%zu "
@@ -145,12 +144,12 @@ class UrmaBackend final : public Backend {
   Status Read(const std::vector<Span>& spans) override {
     Profile stats;
     const auto begin = profile_ ? Clock::now() : Clock::time_point{};
-    const auto status = Transfer(spans, serial_, false, profile_ ? &stats : nullptr);
+    const auto status = Transfer(spans, false, profile_ ? &stats : nullptr);
     if (profile_) {
-      std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE mode=%s status=%u spans=%zu bytes=%llu "
+      std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=%u spans=%zu bytes=%llu "
           "build_us=%.1f post_us=%.1f cq_wait_us=%.1f total_us=%.1f read_wrs=%zu "
           "post_calls=%zu tail_cqes=%zu waves=%zu active_jettys=%zu plan_reused=%u cpu_threads=1 "
-          "checksum_included=0\n", serial_ ? "serial" : "batch", unsigned(status.code()), spans.size(),
+          "checksum_included=0\n", unsigned(status.code()), spans.size(),
           static_cast<unsigned long long>(stats.bytes), stats.build_us, stats.post_us, stats.cq_us,
           Micros(Clock::now()-begin), stats.wrs, stats.posts, stats.cqes, stats.waves,
           stats.jettys, unsigned(stats.reused));
@@ -164,7 +163,7 @@ class UrmaBackend final : public Backend {
       return Error("probe requires one span of at most 64 bytes");
     completed_error_ = false;
     // Candidate recovery relies on exactly one posted WR and its terminal CQE.
-    auto status = Transfer(spans, true, true, nullptr);
+    auto status = Transfer(spans, true, nullptr);
     if (status.ok() || !completed_error_) return status;
     const auto failure = failure_;
     // The probe received its terminal CQE. Confirm queue/source destruction
@@ -349,14 +348,15 @@ class UrmaBackend final : public Backend {
       }
     }
   }
-  Status Transfer(const std::vector<Span>& spans, bool serial, bool probe, Profile* stats) {
+  Status Transfer(const std::vector<Span>& spans, bool probe, Profile* stats) {
     if (poisoned_) return Status::InDoubt(failure_);
     if (!ready_ || !source_ || !destination_) return Error("READ transport is not ready");
-    const bool reuse = !serial && SamePlan(spans);
+    const bool reuse = !probe && SamePlan(spans);
     // A cached plan already passed range/overlap validation against these MRs.
     // Exact equality avoids sorting thousands of unchanged spans every batch.
     if (!reuse && !ValidateSpans(spans, source_bytes_, bytes_)) return Error("invalid READ spans");
-    std::size_t depth = serial ? 1 : kWaveDepth;
+    // Startup probes retain exactly one READ on queue 0 for safe EID fallback.
+    std::size_t depth = probe ? 1 : kWaveDepth;
     for (const auto& q : queues_) {
       if (q.pending) return Poison("READ while another wave is pending");
       depth = std::min<std::size_t>(depth, q.jetty->jetty_cfg.jfs_cfg.depth);
@@ -370,10 +370,10 @@ class UrmaBackend final : public Backend {
       const auto build_begin = stats ? Clock::now() : Clock::time_point{};
       const bool first_wave = cursor == 0 && offset == 0;
       if (reuse) cursor = spans.size();
-      else BuildWave(spans, cursor, offset, serial ? 1 : queues_.size(), depth);
+      else BuildWave(spans, cursor, offset, probe ? 1 : queues_.size(), depth);
       // Cache only a single bounded wave, keyed by ALL offsets and lengths.
       // Larger requests stream through the same storage without growing it.
-      if (!serial && !reuse && first_wave && cursor == spans.size()) cached_spans_ = spans;
+      if (!probe && !reuse && first_wave && cursor == spans.size()) cached_spans_ = spans;
       for (const auto& q : queues_)
         if (q.sequence > UINT64_MAX-q.wrs.size()) return Error("READ completion sequence exhausted");
       std::size_t active = 0;
@@ -480,7 +480,7 @@ class UrmaBackend final : public Backend {
   std::array<Queue, kChannelCount> queues_;
   std::vector<Span> cached_spans_;
   std::size_t next_poll_{};
-  bool serial_{}, profile_{};
+  bool profile_{};
   bool ready_{}, poisoned_{}, destination_valid_{}, completed_error_{};
   std::string failure_;
   bool owns_memory_{true};
