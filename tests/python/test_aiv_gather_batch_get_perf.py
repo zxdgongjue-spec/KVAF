@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gather serial baseline: edit the configuration block below, then run on NPU.
+"""Gather performance comparison: edit the configuration below, then run on NPU.
 
 Only device/core selection and the existing service/kernel paths use environment
 variables. This script has no command-line options. Request tensors are prepared
@@ -20,7 +20,7 @@ SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
-RUN_LABEL = "serial"            # Change to identify later pipeline versions.
+RUN_LABEL = "aiv_pipeline"      # Distinguish this build from the serial baseline.
 # ---------------------------------------------------------------------------
 
 import csv
@@ -370,7 +370,7 @@ def main() -> int:
     if PROFILE_SAMPLES and not all(hasattr(kvaf.NpuRuntime, method) for method in (
         "start_gather_batch_get_profile", "gather_batch_get_profile", "stop_gather_batch_get_profile",
     )):
-        raise RuntimeError("rebuild KVAF Host/Python and gather kernel for serial profiling")
+        raise RuntimeError("rebuild KVAF Host/Python and gather kernel for gather profiling")
     torch = backend.torch
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     torch.npu.set_device(device_id)

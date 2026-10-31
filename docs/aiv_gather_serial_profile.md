@@ -1,6 +1,7 @@
-# Gather 串行阶段计时
+# Gather 阶段计时与 AIV 内部流水
 
-此入口只测试 `gather_read`，保持第一阶段顺序依赖，不加入 chunk 流水或软件在途预算。
+此入口只测试 `gather_read`。CPU 仍整批 gather 后 ACK；当前版本在 ACK 后加入
+AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 功能回归仍使用 `tests/python/test_aiv_gather_batch_get.py`；性能采集使用
 `tests/python/test_aiv_gather_batch_get_perf.py`。
 
@@ -15,7 +16,7 @@ WARMUP = 20            # 不计入结果的预热次数
 ITERATIONS = 100       # 关闭 profile 的端到端性能采样次数，0 可跳过
 PROFILE_SAMPLES = 10   # 开启 profile 的阶段诊断采样次数
 CSV_OUTPUT_DIR = "gather-perf-results"  # 相对执行命令时的工作目录
-RUN_LABEL = "serial"   # 手工标注串行 / chunk 流水等对照版本
+RUN_LABEL = "aiv_pipeline"  # 串行基线用 serial，当前版本用 aiv_pipeline
 ```
 
 请求数、token 长度、预热和采样次数不需要新增启动参数。核数仍通过
@@ -105,8 +106,13 @@ summary 的 Host 和 AIV 行共享表头，但各自只填自己的指标：
 `profile_host_mean` 行的阶段 cycles 列应为空。`wait_us` 是 Host 的剩余同步
 等待，包括设备执行和状态/profile D2H；AIV 的 `wait_cpu_cycles` 只覆盖通知
 完成到最终 ACK，`read_cycles` 从最终 ACK 到数据 CQ 完成。READ 内又有
-`read_build_cycles`（构造和 SQ 写入）与 `data_cq_wait_cycles`（数据 CQ 等待）
-等子计数。Host 等待、AIV 阶段、READ 子计数存在包含关系，不能重复相加。
+`read_build_cycles`（WQE 发布路径）与 `data_cq_wait_cycles`（数据 CQ 等待）
+等子计数。串行基线中的 build 是逐条编码、写 SQ 和 flush 的累计耗时；
+当前流水版的 build 是各物理 wave 从启动首批 VF 到发布最后一批 doorbell 的
+墙钟时间，包括 VF/MTE3 的必要等待，不包含 wave 尾部的 CQ 等待。
+build 期间 NIC 已在执行前面发布的 READ；CQ wait 只反映发布结束后剩余的
+完成等待，不能当成网络传输总时间。Host 等待、AIV 阶段、READ 子计数存在
+包含关系，不能重复相加，也不能把重叠的 VF/MTE3/NIC 工作分别相加。
 当 `clock_source=unverified` 时，AIV 的 read_us 等时间列留空，read_cycles
 仍在 profile_core_mean 行输出。这表示尚缺换算频率，不表示漏采 READ。
 
@@ -124,9 +130,11 @@ sampling_status 只描述采样阶段，随后 Runtime shutdown 的异常仍单�
 
 ## 构建与运行
 
-沿用第一阶段的 CANN/Python/CPU 地址环境，在两端仓库根目录执行。
-本次 gather 参数增加 profile 指针，Host 和 kernel 必须一起更新：新 loader
-要求 `KvafGatherBatchGetAivKernelV2`，旧 kernel 会加载失败，不会静默漏采。
+沿用第一阶段的 CANN/Python/CPU 地址环境，在仓库根目录执行。
+gather profiling 使用含 profile 指针的 V2 ABI，loader 要求
+`KvafGatherBatchGetAivKernelV2`，旧 V1 kernel 会加载失败。
+若已部署支持上述 CSV/profile 的 V2 Host，本次 AIV 内部流水只需重编并部署
+gather kernel；从更旧版本更新时，Host/Python 和 kernel 需一起更新。
 scatter 和 direct 的 kernel ABI 不变。
 
 ```bash
@@ -156,6 +164,46 @@ CPU 日志开关在 worker 创建时读取。日志在最终 ACK 后打印，包
 
 CPU 日志用于诊断，会干扰性能。正式端到端基线关闭此环境变量；需要解释
 CPU 成本时另跑一轮诊断，不将开启 CPU 日志的结果作为无打点吞吐。
+
+## AIV 内部流水版
+
+这次将三项优化合在同一版本中，CPU 协议、每核一个控制 Jetty 和一个数据
+Jetty、输入校验和六阶段计时边界保持原样。数据仍由 NIC 从 CPU staging
+直接 READ 到离散输出，UB 只存 WQE，不存 payload。
+
+1. 每次最多发布 128 条 READ WQE。发布后继续准备后续 WQE，直到物理 SQ
+   WQEBB 容量或传输 WR 上限，再等待该 wave 的有序尾 CQ；整批末尾也等尾 CQ。
+   128 是发布粒度，不是在途预算，绝不每 128 条强制等一次 CQ。
+2. 128 个 SIMT 线程分别构造一条含 1～6 个 SGE 的 WQE，连续写入 UB。
+   MTE3 批量搬到 SQ，环形队列跨尾时分两次搬运。PI、owner 和复制长度均按
+   实际 64 B WQEBB 计算；尾部不足 SGL 的 WQE 也按实际长度紧密排列。
+3. 两个 UB bank 各 24 KiB：VF 构造下一批时，MTE3 搬上一批；搬运完成后
+   Scalar 发布上一批 doorbell。UB 等 MTE3 完成即可复用，SQ 空间等尾 CQ
+   才能复用。尾 WQE 的 completion/order 位在发布前设定，不修改已发布 WQE。
+
+快速路径条件为 `TOKEN_BYTES * GATHER_SGL_SIZE <= 65536`，覆盖当前
+656 B、SGL=6。超过该范围时保留原有 Scalar 拆 token 路径，支持一条 token
+跨多个 WR；这部分暂未做 SIMT 优化。
+
+例如 1 核、8193×656 B、SGL=6、标准 SQ 深度时，仍是 1366 条 READ WR、
+4097 个 WQEBB，发布 11 次 doorbell，只消费 1 个数据尾 CQ。较大批次按
+物理容量分 wave，不引入额外的软件窗口。
+
+重新编译并部署 `kvaf_gather_batch_get_kernels.o` 后，仍用上面的启动命令和
+CSV 目录格式。Host/kernel 参数 ABI 仍是 V2，224 B args / 192 B profile，
+无需更新 CPU 服务。不要只更新 Python label 而继续加载旧 kernel。
+
+```bash
+cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+```
+
+与串行版对比时，不需要分三步单独跑：保存旧版本的 CSV，固定 token、
+request-count、SGL、seed、CPU 线程数和设备，分别对 1/3/8 核运行新版本。
+先对比 `profile=off` 的 mean/p50/p95/p99、useful_GiBps，再对比各核
+`read_us`、`total_us`、`read_build_us` 和 `data_cq_wait_us`。
+多核以最慢 lane 的 read/total 解释整批延迟，不把各核时间相加。
+`data_wrs`、`data_wqebbs` 应与基线一致，`data_doorbells` 增多是提前发布的
+预期行为。实际收益需在 950DT 上测量，本地 CPU 模型只能验证协议与同步。
 
 ## 计时范围
 
@@ -207,8 +255,8 @@ runtime.stop_gather_batch_get_profile()
 
 ## 后续与二阶段比较
 
-保留串行版本，依次比较“串行 / chunk 流水 / chunk 加内部流水”。固定输入、
-有效字节、核数、CPU 线程预算、SGL 和队列容量，保持软件在途预算关闭。
+保留串行基线，先比较“串行 / AIV 内部流水”，后续再加入 CPU chunk 流水。
+固定输入、有效字节、核数、CPU 线程预算、SGL 和队列容量，保持软件在途预算关闭。
 比较 p50/p95/p99、有效 GiB/s 和串行耗时除以流水耗时的加速比。流水阶段
 另加 chunk ready、提交和完成事件验证重叠，不把重叠阶段耗时相加。
 
@@ -225,10 +273,12 @@ Python/Host、CPU gather、控制握手和状态回收的整批延迟比较。81
 
 资源也要对齐：原 direct 的 2 核 × 每核 2 条 Jetty 是四条数据队列；gather
 每核固定一条数据队列和一条控制队列。`KVAF_NPU_CORE_COUNT=2` 可以对齐
-核数，但 gather 仍只有两条数据队列。当前 gather 还逐项构造清单、标量写
+核数，但 gather 仍只有两条数据队列。串行基线中的 gather 逐项构造清单、标量写
 SQ 及 flush；在全部 READ WQE 能放进物理队列时，数据阶段末尾才敲 doorbell。
-原 direct 则已有 SIMT 校验、分批 WQE 构造、UB/MTE 提交和内部流水。
-这些是已确认的实现差别，实际瓶颈仍以阶段数据为准。
+原 direct 则已有 SIMT 分批 WQE 构造、UB/MTE 提交和内部流水。本次已将
+这些 WQE 优化引入 gather 的快速路径。direct 虽保留 SIMT 校验函数，当前
+调用被注释；gather 继续执行输入校验，对比时需要明确这项差别。
+实际瓶颈仍以阶段数据为准。
 
 `invalid gather profile` 在同步及普通执行状态检查通过后产生。新异常包含
 `reason`、记录 magic/sequence/result/valid_mask、七个原始 cycle、请求数/WR

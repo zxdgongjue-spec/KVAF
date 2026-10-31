@@ -72,10 +72,16 @@ template<class T> struct AlignedAllocator {
   template<class U> bool operator!=(const AlignedAllocator<U>&) const { return false; }
 };
 struct ModelQueue {
+  struct PostedWqe {
+    uint64_t pi;
+    uint32_t blocks;
+    std::array<uint32_t, 48> words{};
+  };
   std::vector<uint32_t> sq = std::vector<uint32_t>(16 * 16);
+  std::vector<PostedWqe> posted;
   alignas(64) uint32_t cq[2][16]{};
   uint32_t db{}, cq_db{};
-  uint64_t pi{}, cq_pi{};
+  uint64_t pi{}, completed{}, cq_pi{}, cq_completed{}, doorbells{}, first_db_vfs{};
 };
 struct Fixture;
 Fixture* fixture;
@@ -95,8 +101,9 @@ struct Fixture {
   std::vector<uint64_t> notified;
   std::vector<uint32_t> ack_reads;
   std::vector<bool> cpu_done;
-  bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
+  bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{}, data_timeout{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
+  uint64_t launch_vf_begin{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
@@ -144,16 +151,26 @@ struct Fixture {
       queues.push_back(std::make_unique<ModelQueue>());
       auto& m = *queues.back();
       auto& e = control_entities[q];
-      e.magic = 0x4b564155; e.version = 1; e.local_token_id = 1;
+      e.magic = 0x4b564155; e.version = 1; e.local_token_id = 1 + q;
       e.sq_va = Address(m.sq.data()); e.sq_db_va = Address(&m.db); e.sq_depth = 16; e.wqe_size = 64;
       e.cq_va = Address(m.cq); e.cq_db_va = Address(&m.cq_db); e.cq_depth = 2; e.cqe_size = 64;
-      e.remote_token_id = 2; e.remote_token_value = 3; e.tp_id = 4;
+      e.remote_token_id = 0xab100002 + q; e.remote_token_value = 0xabcd0003 + q;
+      e.tp_id = 0x12ab0004 + q;
+      for (uint32_t i = 0; i < 16; ++i) e.remote_eid[i] = q * 17 + i + 1;
       data_entities[q] = e;
     }
     args.workspace_entity = Address(control_entities.data());
     r.channel_entity = Address(data_entities.data());
   }
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
+  void DataQueueDepth(uint32_t depth) {
+    for (uint32_t core = 0; core < workers; ++core) {
+      auto& m = *queues[core * 2];
+      m.sq.resize(depth * 16);
+      data_entities[core * 2].sq_va = Address(m.sq.data());
+      data_entities[core * 2].sq_depth = depth;
+    }
+  }
   void Poll(void* p) {
     if (args.mode != KVAF_SEQ_SCATTER || Address(p) < (args.workspace & ~uint64_t(63)) ||
         Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
@@ -175,18 +192,48 @@ struct Fixture {
   void Doorbell(uint32_t value, uint32_t* p) {
     for (uint32_t q = 0; q < workers * 2; ++q) {
       auto& m = *queues[q];
-      if (p == &m.cq_db) { m.cq_db = value; return; }
+      if (p == &m.cq_db) {
+        assert(m.cq_completed < m.cq_pi);
+        ++m.cq_completed;
+        assert(value == (m.cq_completed & 0x003fffffU));
+        m.cq_db = value; m.completed = m.pi; m.posted.clear();
+        return;
+      }
       if (p != &m.db) continue;
       const uint32_t worker = q / 2;
+      const uint32_t depth = m.sq.size() / 16;
+      // Already published headers/data must never be patched or overwritten
+      // before the ordered tail CQ has retired their physical SQ wave.
+      for (const auto& previous : m.posted)
+        for (uint32_t i = 0; i < previous.blocks * 16; ++i)
+          assert(m.sq[(previous.pi * 16 + i) % m.sq.size()] == previous.words[i]);
+      if (!m.doorbells) m.first_db_vfs = aiv_model::vf_calls - launch_vf_begin;
+      ++m.doorbells;
+      const uint64_t end = m.pi + uint32_t(value - uint32_t(m.pi));
       auto word = [&](uint64_t base, uint32_t index) {
         return m.sq[((base * 16) + index) % m.sq.size()];
       };
-      while (m.pi < value) {
+      while (m.pi < end) {
         const auto header = word(m.pi, 0);
-        assert((header >> 31) == (1U - ((m.pi / 16) & 1)));
+        assert((header >> 31) == (1U - ((m.pi / depth) & 1)));
         const auto op = (word(m.pi, 1) >> 8) & 255;
         const auto sges = word(m.pi, 2) >> 24;
         assert(sges >= 1 && sges <= 6);
+        const auto& entity = q % 2 ? control_entities[q] : data_entities[q];
+        assert((word(m.pi, 2) & 0xffffffU) == (entity.tp_id & 0xffffffU));
+        assert(word(m.pi, 3) == (entity.remote_token_id & 0xfffffU));
+        assert(word(m.pi, 8) == entity.remote_token_value && word(m.pi, 9) == 0);
+        for (uint32_t i = 0; i < 4; ++i) {
+          uint32_t eid_word;
+          std::memcpy(&eid_word, entity.remote_eid + i * 4, 4);
+          assert(word(m.pi, 4 + i) == eid_word);
+        }
+        const uint32_t blocks = (48 + 16 * sges + 63) / 64;
+        assert(m.pi + blocks - m.completed <= depth);
+        assert(m.posted.size() < depth / 4);
+        ModelQueue::PostedWqe snapshot{m.pi, blocks};
+        for (uint32_t i = 0; i < blocks * 16; ++i) snapshot.words[i] = word(m.pi, i);
+        m.posted.push_back(snapshot);
         if (args.profile) {
           // Observe the production record while nested Gather/Queue calls are
           // still active. Early stamps must already live in this core's GM
@@ -221,6 +268,7 @@ struct Fixture {
         }
         for (uint32_t i = 0; i < sges; ++i) {
           const auto bytes = word(m.pi, 12 + i * 4);
+          assert(word(m.pi, 13 + i * 4) == entity.local_token_id);
           const auto local = uint64_t(word(m.pi, 14 + i * 4)) | (uint64_t(word(m.pi, 15 + i * 4)) << 32);
           if (op == kWrite) std::memcpy(reinterpret_cast<void*>(remote_address), reinterpret_cast<void*>(local), bytes);
           else std::memcpy(reinterpret_cast<void*>(local), reinterpret_cast<void*>(remote_address), bytes);
@@ -237,13 +285,18 @@ struct Fixture {
         }
         if (header & (1U << 21)) {
           assert(((header >> 16) & 3) == 2);
-          m.cq[m.cq_pi % 2][0] = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
-              ((cq_error || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
-          ++m.cq_pi; ++completions;
+          assert(m.pi + blocks == end);
+          if (!(data_timeout && !(q % 2))) {
+            m.cq[m.cq_pi % 2][0] = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
+                ((cq_error || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
+            ++m.cq_pi; ++completions;
+          }
+        } else {
+          assert(((header >> 16) & 3) == 1);
         }
-        m.pi += (48 + 16 * sges + 63) / 64;
+        m.pi += blocks;
       }
-      assert(m.pi == value); m.db = value;
+      assert(m.pi == end); m.db = value;
       return;
     }
     assert(false && "unknown doorbell");
@@ -257,12 +310,19 @@ struct Fixture {
                   reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), token);
     for (uint32_t core = 0; core < workers; ++core) {
       aiv_model::core = core;
+      launch_vf_begin = aiv_model::vf_calls;
       Launch(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
       assert((status[core].result == KVAF_SEQ_OK) == success);
+      assert(aiv_model::raw_copies.empty());
+      for (const auto& source : model_events)
+        for (const auto& direction : source)
+          for (bool pending : direction) assert(!pending);
     }
     if (args.mode == KVAF_SEQ_GATHER) {
+      // Gather DMAs WQE banks through the raw MTE3 primitive, never payload
+      // through the public GM/UB copy helpers used by scatter.
       assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
       assert(!push_requests);
     }
@@ -310,6 +370,76 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  // Real queue depth: early doorbells do not introduce per-post CQ waits.
+  // VF(next bank) executes while the deferred MTE3(previous bank) is pending.
+  {
+    Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.DataQueueDepth(32768); f.EnableProfile();
+    const auto overlap = aiv_model::vf_with_pending_mte3;
+    f.Run(); f.CheckProfiles();
+    const auto& q = *f.queues[0];
+    assert(q.doorbells == 11 && q.cq_completed == 1 && q.first_db_vfs == 2);
+    assert(f.profiles[0].data_wrs == 1366 && f.profiles[0].data_wqebbs == 4097);
+    assert(f.profiles[0].data_doorbells == 11);
+    assert(aiv_model::vf_with_pending_mte3 > overlap);
+    f.Next(8193); f.Run(); f.CheckProfiles();
+  }
+  // Bank/tail boundaries for every SGL, including a partially populated last
+  // WR and an SQ ring wrap inside one multi-SGE WQE/MTE3 post.
+  for (uint32_t sgl = 1; sgl <= 6; ++sgl) {
+    Fixture f(257 * sgl, 13, 1, KVAF_SEQ_GATHER, sgl);
+    f.DataQueueDepth(4096); f.EnableProfile();
+    auto& q = *f.queues[0];
+    auto& s = f.states[0];
+    s.magic = 0x4b564151; s.initialized = 1;
+    s.sq_producer_index = q.pi = q.completed = (1ULL << 32) - 1;
+    q.db = uint32_t(q.pi);
+    s.cq_consumer_index = q.cq_pi = q.cq_completed = (1ULL << 22) - 1;
+    for (auto& entry : q.cq) entry[0] = 0; // expected owner is 1 at this CI
+    for (uint32_t wrs : {1U, 127U, 128U, 129U, 255U, 256U, 257U}) {
+      f.Next(wrs * sgl - (sgl - 1));
+      const auto cq = q.cq_completed, db = q.doorbells;
+      f.Run(); f.CheckProfiles();
+      assert(q.cq_completed - cq == 1);
+      assert(q.doorbells - db == (wrs + 127) / 128);
+    }
+  }
+  // Physical WR capacity drains and CQ owner wrap, rather than a 128-WR
+  // outstanding budget. Multi-core lanes keep independent banks and queues.
+  for (uint32_t sgl : {1U, 6U}) {
+    Fixture f(65536, 13, 1, KVAF_SEQ_GATHER, sgl);
+    f.DataQueueDepth(32768); f.EnableProfile();
+    f.Run(); f.CheckProfiles();
+    const uint32_t wrs = (65536 + sgl - 1) / sgl;
+    assert(f.queues[0]->cq_completed == (wrs + 8191) / 8192);
+    assert(f.queues[0]->doorbells == (wrs + 127) / 128);
+  }
+  for (uint32_t cores : {3U, 8U}) {
+    Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, 6);
+    f.DataQueueDepth(4096); f.Run(); f.Next(1024); f.Run();
+  }
+  for (uint32_t token : {10922U, 10923U, 65536U, 65537U}) {
+    const uint32_t sgl = token < 65536 ? 6 : 1;
+    Fixture f(19, token, 1, KVAF_SEQ_GATHER, sgl);
+    f.DataQueueDepth(520); f.EnableProfile();
+    const auto vf = aiv_model::vf_calls;
+    f.Run(); f.CheckProfiles();
+    assert((aiv_model::vf_calls > vf) == (uint64_t(token) * sgl <= 65536));
+    f.Next(7); f.Run(); f.CheckProfiles();
+  }
+  {
+    Fixture f(1800, 13, 1, KVAF_SEQ_GATHER, 6);
+    f.DataQueueDepth(520); f.EnableProfile(); f.Run(); f.CheckProfiles();
+    assert(f.queues[0]->cq_completed == 3 && f.queues[0]->doorbells == 5);
+  }
+  {
+    Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.DataQueueDepth(32768); f.EnableProfile(); f.data_timeout = true;
+    f.Run(false, true);
+    assert(f.status[0].result == KVAF_SEQ_TIMEOUT && f.states[0].poisoned);
+    assert(f.profiles[0].data_doorbells == 11 && f.profiles[0].valid_mask == 0x5f);
+    f.Next(8193); f.data_timeout = false; f.Run(false);
+  }
   // Profile every lane, including empty lanes and repeated queue wraps. The
   // disabled executions throughout this fixture assert zero timer reads.
   for (uint32_t workers : {1U, 3U, 8U})
@@ -326,7 +456,7 @@ int main() {
         f.Run(); f.CheckProfiles();
         for (uint32_t core = 0; core < workers; ++core) {
           assert(f.profiles[core].data_wqebbs == f.states[core * 2].sq_producer_index - old_pi[core]);
-          assert(f.profiles[core].data_doorbells == f.states[core * 2].cq_consumer_index - old_ci[core]);
+          assert(f.profiles[core].data_doorbells >= f.states[core * 2].cq_consumer_index - old_ci[core]);
         }
       }
       const auto before = f.profiles;

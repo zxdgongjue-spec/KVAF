@@ -41,7 +41,8 @@ int aclrtLaunchKernelWithHostArgs(aclrtFuncHandle function, uint32_t, aclrtStrea
   Check(cfg->attrs[1].id == ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE);
   // Pure SIMD scatter must not inherit the direct SIMT kernel's dynamic UB.
   if (symbol == kScatter) Check(cfg->attrs[1].value.dynUBufSize == 0U);
-  if (symbol == kDirect) Check(cfg->attrs[1].value.dynUBufSize == 160U * 1024U);
+  if (symbol == kDirect || symbol == kGather)
+    Check(cfg->attrs[1].value.dynUBufSize == 160U * 1024U);
   launched.push_back(symbol); return 0;
 }
 int main(int argc, char** argv) {
