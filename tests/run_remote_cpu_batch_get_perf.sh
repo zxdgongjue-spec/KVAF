@@ -34,5 +34,10 @@ export KVAF_BATCH_PUT_KERNEL="$KVAF_PUT_KERNEL"
 export DEVICE_ID
 export PYTHONPATH="$KVAF_BUILD_DIR/python${PYTHONPATH:+:$PYTHONPATH}"
 
-exec timeout "${KVAF_REMOTE_CPU_PERF_TIMEOUT}s" \
+# Keep concurrent workers in the launcher's process group for interrupt cleanup.
+timeout_options=()
+if [[ -n "${KVAF_BATCH_GET_START_GATE:-}" ]]; then
+  timeout_options+=(--foreground)
+fi
+exec timeout "${timeout_options[@]}" "${KVAF_REMOTE_CPU_PERF_TIMEOUT}s" \
   python3 "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" "$@"

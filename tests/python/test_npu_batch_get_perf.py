@@ -345,6 +345,29 @@ def validate_args(args: argparse.Namespace) -> str | None:
     return None
 
 
+def wait_for_concurrent_start() -> None:
+    """Optional launcher rendezvous, outside measurement and silent in benchmark logs."""
+    endpoint = os.environ.get("KVAF_BATCH_GET_START_GATE")
+    if not endpoint:
+        return
+    import socket
+
+    host, port = endpoint.rsplit(":", 1)
+    timeout = int(os.environ.get("KVAF_REMOTE_CPU_PERF_TIMEOUT", "600"))
+    with socket.create_connection((host, int(port)), timeout=timeout) as connection:
+        connection.sendall((os.environ["KVAF_BATCH_GET_START_TOKEN"] + "\n").encode("ascii"))
+        with connection.makefile("rb") as response:
+            message = response.readline(64)
+        if not message.endswith(b"\n") or not message.strip().isdigit():
+            raise RuntimeError("concurrent launcher disconnected before start")
+        start_ns = int(message)
+    while True:
+        remaining_ns = start_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return
+        time.sleep(remaining_ns / 1_000_000_000)
+
+
 def percentile(values: list[float], fraction: float) -> float:
     ordered = sorted(values)
     position = fraction * (len(ordered) - 1)
@@ -911,10 +934,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
-        for _ in range(args.iterations):
+        for iteration in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
             # Request generation and Tensor work are deliberately excluded.
             torch.npu.synchronize()
+            if iteration == 0:
+                wait_for_concurrent_start()
 
             begin = time.perf_counter()
             runtime.batch_get(

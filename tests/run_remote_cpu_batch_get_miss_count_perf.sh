@@ -12,10 +12,11 @@ KVAF_BUILD_DIR="$1"
 shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
-KVAF_BATCH_GET_TOKEN_BYTES=(656)
-KVAF_BATCH_GET_MISS_COUNTS=(2048 4096 8192)
-KVAF_BATCH_GET_AIV_CORES=(2)
-KVAF_BATCH_GET_JETTYS_PER_CORE=(2)
+# Optional space-separated overrides; ordinary single-group sweeps keep their defaults.
+read -r -a KVAF_BATCH_GET_TOKEN_BYTES <<< "${KVAF_BATCH_GET_SWEEP_TOKEN_BYTES:-656}"
+read -r -a KVAF_BATCH_GET_MISS_COUNTS <<< "${KVAF_BATCH_GET_SWEEP_MISS_COUNTS:-2048 4096 8192}"
+read -r -a KVAF_BATCH_GET_AIV_CORES <<< "${KVAF_BATCH_GET_SWEEP_AIV_CORES:-2}"
+read -r -a KVAF_BATCH_GET_JETTYS_PER_CORE <<< "${KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE:-2}"
 
 [[ -x "$KVAF_BATCH_GET_PERF_RUNNER" ]] || {
   echo "ERROR: BatchGet performance runner is not executable: $KVAF_BATCH_GET_PERF_RUNNER" >&2
