@@ -73,7 +73,7 @@ class PullBenchmarks(unittest.TestCase):
         self.assertEqual(result["total"], sum(v for k, v in result.items() if k != "total"))
 
     def test_raw_benchmark_configuration_limits(self):
-        common = ["--cpu", "127.0.0.1:28999", "--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]
+        common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]
         args = parse_args(common + ["--blocks", "13", "--block-bytes", "100001", "--source-space-bytes", "3000000"])
         self.assertEqual((args.packets, args.packet_bytes, args.source_space_bytes), (13, 100001, 3000000))
         self.assertEqual(round_counts(args), (110, 131))

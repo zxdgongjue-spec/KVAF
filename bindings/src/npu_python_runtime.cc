@@ -269,6 +269,17 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
   }
 
+  void InitializeBase() { ThrowIfError(native_->Initialize()); }
+  void InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+    ThrowIfError(native_->InitializeDdr(ddr_bytes, slot_size));
+  }
+  void ShutdownDdr() {
+    ThrowIfError(native_->ShutdownDdr());
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    local_sources_ = py::list();
+#endif
+  }
+
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   void BatchCpuPull(const py::object& keys, py::object source, const py::object& offsets,
                     const py::object& lengths, const py::object& stream) {
@@ -395,6 +406,7 @@ class NpuPythonRuntime final {
   bool PendingRawAddr() const { return native_->pending_raw_addr(); }
 
   bool Initialized() const { return native_->initialized(); }
+  bool DdrInitialized() const { return native_->ddr_initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
@@ -423,8 +435,8 @@ class NpuPythonRuntime final {
   void BatchPut(const py::object& keys, const py::object& source,
                 const py::object& input_offsets, const py::object& lengths,
                 const py::object& stream) {
-    if (!Initialized()) {
-      throw std::runtime_error("Runtime has not been initialized");
+    if (!DdrInitialized()) {
+      throw std::runtime_error("DDR is not initialized; call initialize_ddr before batch_put");
     }
     CopyPrepareKeysInto(keys, &batch_put_request_.keys);
     CopyCpuUint64SequenceInto(input_offsets, "BatchPut input_offsets",
@@ -740,11 +752,18 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("pending_offload", &NpuPythonRuntime::PendingOffload)
 #endif
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
-           "Connect this NPU Runtime to a CPU Runtime service before initialize.")
+           "Configure the CPU service target before initialize_ddr; independent of HBM attachments.")
+      .def("initialize", &NpuPythonRuntime::InitializeBase,
+           "Initialize this NPU without contacting a CPU service or allocating DDR. Idempotent.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
-           py::arg("slot_size"))
+           py::arg("slot_size"), "Initialize the NPU and DDR together (compatibility entrypoint).")
+      .def("initialize_ddr", &NpuPythonRuntime::InitializeDdr, py::arg("ddr_bytes"), py::arg("slot_size"),
+           "Initialize DDR and its data paths after initialize and link_to; HBM links are preserved.")
+      .def("shutdown_ddr", &NpuPythonRuntime::ShutdownDdr,
+           "Release DDR resources after all CPU Pull sources/tasks are retired; retain HBM links and CPU target.")
       .def("shutdown", &NpuPythonRuntime::Shutdown)
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
+      .def_property_readonly("ddr_initialized", &NpuPythonRuntime::DdrInitialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)

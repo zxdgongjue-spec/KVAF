@@ -199,8 +199,11 @@ NPU 源不提前绑定 B 的目标 HBM，是因为 `batch_get_raw_addr()` 每次
 
 | 调用方 | 接口 | 返回与作用 | 变更 |
 |---|---|---|---|
-| B Connector | `runtime.link_to(cpu_address)` | 连接 CPU service | 保留 |
-| B Connector | `runtime.initialize(ddr_bytes, slot_size)` | 分配共享 DDR，初始化 MetaManager | 保留 |
+| B Connector | `runtime.initialize()` | 选择本卡设备、校验配置；不访问 CPU 或申请 DDR | 基础初始化 |
+| B Connector | `runtime.link_to(cpu_address)` | 配置 CPU service 目标；可在基础初始化前后调用 | DDR 可选依赖 |
+| B Connector | `runtime.initialize_ddr(ddr_bytes, slot_size)` | 在基础初始化后分配共享 DDR、初始化 MetaManager 和启用的 DDR 路径 | 独立 DDR 初始化 |
+| B Connector | `runtime.initialize(ddr_bytes, slot_size)` | 依次执行基础和 DDR 初始化，需要先 link_to | 保留组合入口 |
+| B Connector | `runtime.shutdown_ddr()` | 安全释放 DDR 相关资源，保留 NPU Pull 连接及 CPU 目标 | 独立 DDR 清理 |
 | B Connector | `runtime.offload_region()` | 返回 DDR ticket，由应用发送给 A | 保留 |
 | A Connector | `CpuPullHbmSource(device_id, npu_eid)` | 创建 CPU Pull 源对象 | 原 `HbmSource` 更名 |
 | A Connector | `cpu_source.register(ddr_ticket, hbm_cpu, stream)` | 注册源、建立 CPU→A 链路并探测，返回 CpuPullSourceDesc | 扩展返回描述符 |
@@ -212,9 +215,14 @@ NPU 源不提前绑定 B 的目标 HBM，是因为 `batch_get_raw_addr()` 每次
 
 `attach_cpu_source()` 是 B 侧逻辑绑定，不重复建立 CPU→A 的通信资源。`NpuPullHbmSource.register()` 可以保留现有延迟注册方式，在 B attach、对端参数确定后完成实际 HCCP 注册和绑定。
 
+纯 NPU Pull 使用 `initialize() → attach_hbm()`，只需 raw kernel，不需 CPU service、DDR、普通 BatchGet token 参数或启用 CPU Pull。
+`initialized` 表示基础就绪，`ddr_initialized` 表示 DDR 就绪；组合初始化的 DDR 阶段失败时可以出现前者为真、后者为假。
+普通 BatchGet/BatchPut、MetaManager 操作和 CPU Pull 均要求 DDR 就绪。HBM attach 与 DDR 初始化顺序独立；DDR 候选回退、失败清理和 shutdown_ddr 不销毁 HbmReader 连接或输出 MR 缓存。
+DDR 清理不确定时须重试 shutdown_ddr，不能覆盖未释放的分配；新的 DDR core 拒绝旧 PutHandle。
+
 相同身份的重复 attach 不创建第二份资源；同一身份的元数据或 NPU 路由配置冲突会被拒绝。`export_ticket` 保持原字典格式，Connector 只需原样转发和保留，关闭时传给 `detach_hbm(export_ticket)`，无需读取其中的字段。attach 失败后若清理未完成，也用原 ticket 重试 detach；未决 DMA 仍需保留资源，不能强行关闭。
 
-初始化包含实际 READ 探测，因此应用在注册/attach 完成前应保持探测数据稳定。初始化所用的 `stream` 同步与运行阶段不带范围的 `ready()` 是不同阶段。
+源注册/attach 包含实际 READ 探测，因此应用在注册/attach 完成前应保持探测数据稳定。无参数 initialize 只做基础初始化。注册所用的 `stream` 同步与运行阶段不带范围的 `ready()` 是不同阶段。
 
 CPU Pull 使用其独立的 CPU↔NPU EID 配置。NPU↔NPU 链路在 A 的源对象和 B 的 `attach_hbm(local_eid=...)` 上分别配置 fullmesh EID，不能假定 CPU 路由 EID 可以替代。
 
@@ -471,7 +479,7 @@ NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是
 
 ## 11. 现有代码的调整范围
 
-已完成 CPU Pull 改用 `src_offsets + dst_addrs`，以及 Runtime 内部按源身份管理绑定、读取、恢复和关闭。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。Raw READ 算子、同步/错误处理、ticket 字典格式和 DDR 初始化依赖保持当前实现。上述接口调整未更改 KVRP/KVHR 线协议，应用需要使用更新后的 NPU 运行库及 Python 调用签名。
+已完成 CPU Pull 改用 `src_offsets + dst_addrs`，以及 Runtime 内部按源身份管理绑定、读取、恢复和关闭。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。基础初始化与 DDR 初始化现已分离，纯 NPU Pull 不再依赖 DDR。此次初始化拆分未更改 Raw READ 算子、批次同步/恢复协议、ticket 字典格式或 KVRP/KVHR 线协议；应用需重新编译 NPU 运行库和 Python 绑定。
 
 | 当前实现 | 目标调整 |
 |---|---|

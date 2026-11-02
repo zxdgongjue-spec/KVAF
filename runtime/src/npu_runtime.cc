@@ -138,6 +138,15 @@ struct NpuRuntime::Impl {
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *selected, *allocator);
   }
 
+  void ResetDdrCore() {
+    runtime_core.reset();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+    remote_operator.reset();
+#endif
+    access_operator.reset();
+    meta_manager.reset();
+  }
+
   void ReleaseProbe() {
     bandwidth_probe.reset();
     if (probe_buffer != nullptr) {
@@ -151,6 +160,8 @@ struct NpuRuntime::Impl {
 #endif
   NpuRuntimeOptions options;
   AccessOperatorConfig config;
+  bool base_initialized{false};
+  bool closing{false};
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
@@ -188,36 +199,51 @@ struct NpuRuntime::Impl {
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
 };
 
-NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
+NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {}
+
+Status NpuRuntime::Initialize() {
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
+  if (initialized()) return Status::OK();
+  const bool get = !impl_->config.batch_get_kernel_object_path.empty();
+  const bool put = !impl_->config.batch_put_kernel_object_path.empty();
+  const bool raw = !impl_->options.batch_get_raw_addr_kernel_object_path.empty();
 #if !defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (impl_->options.enable_cpu_offload) throw std::invalid_argument("CPU Offload was not built");
+  if (impl_->options.enable_cpu_offload) return Status::NotImplemented("CPU Offload was not built");
 #endif
 #if !defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!impl_->config.batch_get_kernel_object_path.empty()) throw std::invalid_argument("AIV support was not built");
+  if (get || raw) return Status::NotImplemented("AIV support was not built");
 #endif
-  if (!impl_->options.offload_timeout_ms) throw std::invalid_argument("offload timeout must be positive");
-  if (impl_->config.batch_get_kernel_object_path.empty()) {
-    if (!impl_->options.enable_cpu_offload || !impl_->config.batch_put_kernel_object_path.empty())
-      throw std::invalid_argument("configure AIV kernels or enable CPU Offload");
-  } else if (impl_->options.npu_core_count == 0U ||
+#if !defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (put) return Status::NotImplemented("AIV BatchPut support was not built");
+#endif
+  if (impl_->options.enable_cpu_offload && !impl_->options.offload_timeout_ms)
+    return Status::InvalidArgument("offload timeout must be positive");
+  if ((!get && !raw && !impl_->options.enable_cpu_offload) || (put && !get))
+    return Status::InvalidArgument("configure raw READ, DDR AIV kernels or CPU Pull");
+  if ((get || raw) && (impl_->options.npu_core_count == 0U ||
       impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->options.jettys_per_core == 0U ||
       impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       (impl_->options.batch_get_max_inflight_total != 0U &&
-       impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
-      impl_->options.batch_get_token_bytes == 0U ||
+       impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count)))
+    return Status::InvalidArgument("invalid NPU core/Jetty/inflight configuration");
+  if (raw && !get && std::uint64_t{impl_->options.npu_core_count} * impl_->options.jettys_per_core > 4U)
+    return Status::InvalidArgument("raw READ supports 1..4 total Jettys");
+  if (get && (impl_->options.batch_get_token_bytes == 0U ||
       impl_->options.batch_get_tokens_per_block == 0U ||
       (impl_->options.adaptive_ub_device &&
        !impl_->options.peer_ub_device.empty()) ||
       (impl_->options.adaptive_ub_device &&
        (impl_->options.adaptive_ub_miss_count == 0U ||
         impl_->options.adaptive_ub_miss_count >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
-    throw std::invalid_argument("invalid NPU Runtime configuration");
+            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))))) {
+    return Status::InvalidArgument("invalid DDR BatchGet configuration");
   }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
-    throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
+    return Internal("aclrtSetDevice failed for NpuRuntime");
   }
+  impl_->base_initialized = true;
+  return Status::OK();
 }
 
 NpuRuntime::~NpuRuntime() {
@@ -234,8 +260,11 @@ NpuRuntime::~NpuRuntime() {
 
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
-  if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
+  if (ddr_initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize_ddr");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
+  if (impl_->config.batch_get_kernel_object_path.empty() && !impl_->options.enable_cpu_offload)
+    return Status::InvalidArgument("configure DDR AIV kernels or CPU Pull before link_to");
   if (impl_->config.batch_put_kernel_object_path.empty() && !impl_->options.enable_cpu_offload) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
@@ -244,27 +273,29 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link);
   impl_->peer_allocator = allocator.get();
   impl_->allocator = std::move(allocator);
-  impl_->runtime_core.reset();
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  impl_->remote_operator.reset();
-#endif
-  impl_->access_operator.reset();
-  impl_->CreateCore();
   return Status::OK();
 }
 
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  const auto status = Initialize();
+  return status.ok() ? InitializeDdr(ddr_bytes, slot_size) : status;
+}
+
+Status NpuRuntime::InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
-  if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
+  if (!initialized()) return Status::NotInitialized("call initialize before initialize_ddr");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
+  if (ddr_initialized()) return Status::InvalidState("DDR has already been initialized");
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr) {
-    return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
+    return Status::InvalidState("NpuRuntime requires link_to before initialize_ddr");
   }
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
 
   if (impl_->peer_allocator->has_allocation())
-    return Status::InDoubt("previous DDR cleanup is unresolved; retry Shutdown before Initialize");
+    return Status::InDoubt("previous DDR cleanup is unresolved; retry shutdown_ddr before initialize_ddr");
+  if (aclrtSetDevice(device_id()) != ACL_SUCCESS) return Internal("select NPU for DDR initialization");
   std::uint32_t candidate_count = 0U;
   std::uint32_t device_count = 0U;
   bool device_filter_applied = false;
@@ -582,14 +613,14 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
 }
 
 RuntimeCore& NpuRuntime::core() {
-  if (impl_->runtime_core == nullptr) {
-    throw std::logic_error("NpuRuntime requires LinkTo before core access");
+  if (!ddr_initialized()) {
+    throw std::logic_error("DDR is not initialized; call initialize_ddr before DDR operations");
   }
   return *impl_->runtime_core;
 }
 const RuntimeCore& NpuRuntime::core() const {
-  if (impl_->runtime_core == nullptr) {
-    throw std::logic_error("NpuRuntime requires LinkTo before core access");
+  if (!ddr_initialized()) {
+    throw std::logic_error("DDR is not initialized; call initialize_ddr before DDR operations");
   }
   return *impl_->runtime_core;
 }
@@ -607,9 +638,9 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
 }
 
 Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
-  if (impl_->access_operator == nullptr) {
+  if (!ddr_initialized() || impl_->access_operator == nullptr) {
     return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before configuring BatchGet profiling");
+        "initialize_ddr before configuring BatchGet profiling");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   return static_cast<DefaultAccessOperator*>(impl_->access_operator.get())->SetBatchGetKernelProfiling(enabled);
@@ -620,9 +651,9 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
-  if (impl_->access_operator == nullptr) {
+  if (!ddr_initialized() || impl_->access_operator == nullptr) {
     return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before reading BatchGet profiling");
+        "initialize_ddr before reading BatchGet profiling");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   return static_cast<DefaultAccessOperator*>(impl_->access_operator.get())->CopyBatchGetKernelProfiles(profiles);
@@ -633,7 +664,7 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
 
 Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* ticket) const {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (!ticket || !initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
+  if (!ticket || !ddr_initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Offload is not initialized");
   *ticket = impl_->remote_operator->ticket(); return Status::OK();
 #else
   return Status::NotImplemented("CPU Offload was not built");
@@ -641,7 +672,8 @@ Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* ticket) const {
 }
 Status NpuRuntime::BatchCpuPull(const BatchPutRequest& request, BatchPutExecutionOptions execution) {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (!initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Pull is not initialized");
+  if (!ddr_initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Pull is not initialized");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
   int32_t current = -1;
   if (aclrtGetDevice(&current) != ACL_SUCCESS || current != static_cast<int32_t>(device_id()))
@@ -719,10 +751,12 @@ Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ti
                              const std::string& local_eid) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized()) return Status::NotInitialized("initialize NpuRuntime before attach_hbm");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   if (!impl_->hbm_reader) {
     auto kernel = impl_->options.batch_get_raw_addr_kernel_object_path;
     if (kernel.empty()) {
       const auto& get = impl_->options.batch_get_kernel_object_path;
+      if (get.empty()) return Status::InvalidArgument("configure batch_get_raw_addr_kernel_object_path for NPU Pull");
       const auto slash = get.find_last_of('/');
       kernel = (slash == std::string::npos ? std::string{} : get.substr(0, slash + 1)) +
           "kvaf_execute_batch_get_raw_addr_kernels.o";
@@ -736,33 +770,36 @@ Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ti
 #endif
 }
 Status NpuRuntime::AttachCpuSource(const CpuPullSourceDesc& source) {
-  if (!initialized()) return Status::NotInitialized("initialize Runtime before attaching a CPU source");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before attaching a CPU source");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   return core().AttachCpuSource(source);
 }
 Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* put) {
-  if (!initialized()) return Status::NotInitialized("initialize Runtime before PreparePut");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before PreparePut");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
   return core().PreparePut(keys,lengths,put);
 }
 Status NpuRuntime::SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
                                 Uint64ArrayView src_offsets,Uint64ArrayView dst_addrs,Uint64ArrayView lengths) {
-  if (!initialized()) return Status::NotInitialized("initialize Runtime before CPU Pull");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before CPU Pull");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   return core().SubmitCpuPull(ready,put,src_offsets,dst_addrs,lengths);
 }
 Status NpuRuntime::QueryCpuPull(const PutHandle& put,CpuPullState* state) {
-  if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
+  if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().QueryCpuPull(put,state);
 }
 Status NpuRuntime::WaitCpuPull(const PutHandle& put,std::uint32_t timeout,CpuPullState* state) {
-  if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
+  if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().WaitCpuPull(put,timeout,state);
 }
 Status NpuRuntime::CommitPut(const PutHandle& put) {
-  if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
+  if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().CommitPut(put);
 }
 Status NpuRuntime::AbortPut(const PutHandle& put) {
-  if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
+  if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().AbortPut(put);
 }
 Status NpuRuntime::BatchGetRawAddr(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
@@ -770,6 +807,7 @@ Status NpuRuntime::BatchGetRawAddr(const ReadyToken& ready,NpuInt64ArrayView src
                                   bool validate_ranges) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach source HBM before raw READ");
+  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   return impl_->hbm_reader->Read(ready,src,dst,lengths,output,stream,profile,validate_ranges);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
@@ -801,7 +839,7 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
 
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
-  const Status shutdown = Shutdown();
+  const Status shutdown = ShutdownDdr();
   if (!shutdown.ok()) return shutdown;
   impl_->peer_link.reset();
   impl_->config.peer_link.reset();
@@ -824,8 +862,35 @@ Status NpuRuntime::ServeConnection(int) {
 Status NpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->hbm_reader) { auto status = impl_->hbm_reader->Shutdown(); if (!status.ok()) return status; }
+  if (impl_->hbm_reader) {
+    // HBM cleanup may partially close connections. Block new HBM work until
+    // the whole shutdown finishes. A DDR-only CanShutdown rejection retains
+    // the existing behavior: callers may finish/release the blocking batch.
+    impl_->closing = true;
+    auto status = impl_->hbm_reader->Shutdown();
+    if (!status.ok()) return status;
+    impl_->hbm_reader.reset();
+  }
 #endif
+  auto status = ShutdownDdr();
+  if (!status.ok()) return status;
+  impl_->base_initialized = false;
+  impl_->closing = false;
+  return Status::OK();
+}
+
+Status NpuRuntime::ShutdownDdr() {
+  if (impl_ == nullptr) return Status::OK();
+  // Cleanup may be called while the application is working on another card.
+  // Select the owning device for teardown, then restore the caller's device.
+  struct RestoreDevice {
+    int32_t previous{-1};
+    ~RestoreDevice() { if (previous >= 0) (void)aclrtSetDevice(previous); }
+  } restore;
+  if (impl_->runtime_core || impl_->probe_buffer) {
+    (void)aclrtGetDevice(&restore.previous);
+    if (aclrtSetDevice(device_id()) != ACL_SUCCESS) return Internal("select NPU for DDR cleanup");
+  }
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   auto source_status = impl_->FinishLocal(); if (!source_status.ok()) return source_status;
   if (impl_->local_source) {
@@ -846,12 +911,19 @@ Status NpuRuntime::Shutdown() {
     if (selected) status = selected->Shutdown();
     if (status.ok()) status = impl_->peer_allocator->ReleaseAllocation();
   }
-  if (status.ok()) impl_->ReleaseProbe();
+  if (status.ok()) {
+    impl_->ResetDdrCore();
+    impl_->ReleaseProbe();
+  }
   return status;
 }
 
 bool NpuRuntime::initialized() const {
-  return impl_ != nullptr && impl_->runtime_core != nullptr && impl_->runtime_core->initialized();
+  return impl_ != nullptr && impl_->base_initialized;
+}
+
+bool NpuRuntime::ddr_initialized() const {
+  return initialized() && impl_->runtime_core != nullptr && impl_->runtime_core->initialized();
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {

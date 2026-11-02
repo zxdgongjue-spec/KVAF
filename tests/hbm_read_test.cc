@@ -3,6 +3,10 @@
 #include "hbm_read_client.h"
 #include "hbm_read_protocol.h"
 #include "kvaf_aiv_batch_get_raw_addr.h"
+#include "npu_runtime.h"
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+#include "offload_fake_server.h"
+#endif
 #include <poll.h>
 #include "aiv_model/kernel_operator.h"
 #define __attribute__(...)
@@ -116,7 +120,87 @@ class Proxy {
   ~Proxy(){stop=true;thread.join();close(fd);}
 };
 void Check(const Status& s){if(!s.ok())throw std::runtime_error(s.message());}
+void RuntimeInitialization() {
+  raw_mode=true;fake_device=0;
+  std::vector<uint8_t> source(4096,0x67), output(256,0);
+  kvaf::NpuPullHbmSource b(0,"00000000000000000000000000000001");
+  kvaf::HbmReadTicket ticket;
+  Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&ticket));
+  Check(b.Listen("127.0.0.1:0"));
+  const auto address="127.0.0.1:"+std::to_string(b.port());
+  const auto eid="00000000000000000000000000000002";
+  kvaf::NpuRuntimeOptions options;options.batch_get_raw_addr_kernel_object_path="fake.o";
+  auto read=[&](kvaf::NpuRuntime& a) {
+    kvaf::ReadyToken ready;Check(b.Ready(&ready));
+    int64_t src=11,dst=7,n=64;output.assign(output.size(),0);
+    Check(a.BatchGetRawAddr(ready,{&src,1},{&dst,1},{&n,1},
+          {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+    Require(!std::memcmp(output.data()+dst,source.data()+src,n),"Runtime raw payload survives DDR lifecycle");
+    Check(b.ReleaseBatch(ready));
+  };
+  {
+    kvaf::NpuRuntime a(options);
+    Require(!a.initialized()&&!a.ddr_initialized(),"construction does not initialize DDR or device");
+    Require(!a.InitializeDdr(4096,256).ok(),"DDR requires base initialization");
+    Require(!a.AttachHbm(address,ticket,eid).ok(),"attach requires base initialization");
+    Check(a.Initialize());Check(a.Initialize());
+    Require(a.initialized()&&!a.ddr_initialized(),"raw-only base initialization without CPU service");
+    kvaf::PutHandle put;
+    Require(!a.PreparePut({1},{64},&put).ok(),"base initialization cannot satisfy DDR operations");
+    bool rejected=false;try{(void)a.core();}catch(const std::logic_error&){rejected=true;}
+    Require(rejected,"raw-only Runtime exposes no DDR metadata core");
+    Check(a.AttachHbm(address,ticket,eid));read(a);
+    const auto transports=raw_transports.load(), buffers=local_buffers.load();
+    Require(!a.Initialize(4096,256).ok(),"combined initializer still requires CPU target");
+    Check(a.ShutdownDdr());Check(a.ShutdownDdr());
+    Require(a.initialized()&&!a.ddr_initialized()&&b.connected()&&raw_transports==transports&&local_buffers==buffers,
+            "DDR-only cleanup preserves raw connections and output MR cache");
+    read(a);
+    unregister_failures=1;
+    Require(!a.Shutdown().ok()&&a.initialized(),"failed raw cleanup preserves base state");
+    Require(!a.Initialize().ok()&&!a.AttachHbm(address,ticket,eid).ok(),"unfinished global shutdown blocks initialization");
+    Check(a.Shutdown());Require(!a.initialized()&&!a.ddr_initialized()&&!b.connected(),"global shutdown closes raw-only Runtime");
+    Check(a.Initialize());Check(a.AttachHbm(address,ticket,eid));read(a);Check(a.DetachHbm(ticket));Check(a.Shutdown());
+  }
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  options.enable_cpu_offload=true;
+  for(bool ddr_first:{false,true}) {
+    SharedServer cpu;kvaf::NpuRuntime a(options);
+    if(ddr_first) {Check(a.LinkTo({cpu.address}));Check(a.Initialize(4096,256));}
+    else Check(a.Initialize());
+    Check(a.AttachHbm(address,ticket,eid));read(a);
+    const auto transports=raw_transports.load(), buffers=local_buffers.load();
+    if(!ddr_first) {
+      Check(a.LinkTo({cpu.address}));Require(cpu.pool_allocations==0,"link_to only configures DDR target");
+      cpu.drop=uint16_t(rp::Command::Describe);cpu.fail_release=true;
+      Require(!a.InitializeDdr(4096,256).ok()&&!a.ddr_initialized()&&a.initialized(),"failed DDR init preserves base");
+      Require(!a.InitializeDdr(4096,256).ok()&&cpu.pool_allocations==1,"unresolved DDR cannot be replaced");
+      read(a);Check(a.ShutdownDdr());Check(a.InitializeDdr(4096,256));
+    }
+    Require(a.ddr_initialized(),"both initialization orders support DDR");
+    Require(!a.InitializeDdr(4096,256).ok(),"double DDR init rejected");
+    kvaf::PutHandle old;Check(a.PreparePut({1},{64},&old));Check(a.AbortPut(old));
+    cpu.fail_release=true;
+    Require(!a.ShutdownDdr().ok(),"lost DDR release retains cleanup state");
+    read(a);Check(a.ShutdownDdr());
+    Require(a.initialized()&&!a.ddr_initialized()&&cpu.pool.empty()&&raw_transports==transports&&local_buffers==buffers,
+            "DDR teardown does not unregister raw output or tear down its TP");
+    read(a);Check(a.InitializeDdr(4096,256));
+    kvaf::CpuPullState state;
+    Require(!a.QueryCpuPull(old,&state).ok(),"old PutHandle cannot access a reinitialized DDR core");
+    Check(a.ReleaseLink(1));Require(a.initialized()&&!a.ddr_initialized()&&b.connected(),"ReleaseLink affects DDR only");
+    read(a);Check(a.LinkTo({cpu.address}));Check(a.InitializeDdr(4096,256));
+    Check(a.DetachHbm(ticket));Require(a.ddr_initialized(),"HBM detach preserves DDR");
+    Check(a.AttachHbm(address,ticket,eid));read(a);Check(a.Shutdown());
+    Require(!a.initialized()&&!a.ddr_initialized()&&cpu.pool.empty()&&!b.connected(),"mixed shutdown releases both modules");
+  }
+#endif
+  Check(b.Shutdown());
+  Require(!raw_transports&&!local_buffers&&!registrations&&!sessions,"Runtime lifecycle released raw resources");
+  raw_calls=0;raw_wqes=0;quiesces=0;
+}
 int main(){try{
+  RuntimeInitialization();
   raw_mode=true;fake_device=0;
   constexpr size_t source_bytes=400128;
   std::vector<uint8_t> storage(source_bytes+8192,0xee),output(300000,0xa5);

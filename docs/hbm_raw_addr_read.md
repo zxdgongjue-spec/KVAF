@@ -1,6 +1,6 @@
 # NPU 直接读取对端 HBM：batch_get_raw_addr
 
-同一个 NpuRuntime 可访问 CPU DDR，并通过独立 fullmesh 链路读取另一张卡的 HBM。本路径不使用 AccessTable、keys 或 DDR MetaManager。B 可分别注册一块供 CPU Pull 的 HBM 和一块供 NPU Pull 的 HBM。
+同一个 NpuRuntime 可访问 CPU DDR，并通过独立 fullmesh 链路读取另一张卡的 HBM。纯 NPU Pull 不需要 CPU service 或 DDR 初始化，也不使用 AccessTable、keys 或 DDR MetaManager。B 可分别注册一块供 CPU Pull 的 HBM 和一块供 NPU Pull 的 HBM。
 
 ## 生产端 B
 
@@ -23,6 +23,13 @@ ready 不携带范围、不等待生产 stream；应用负责同步。release_ba
 ## 读取端 A
 
 ```python
+runtime = kvaf.NpuRuntime(
+    device_id=6,
+    batch_get_raw_addr_kernel_object_path=raw_kernel,
+    npu_core_count=2, jettys_per_core=2,
+)
+runtime.initialize()
+assert runtime.initialized and not runtime.ddr_initialized
 runtime.attach_hbm(b_address, ticket, local_eid=a_fullmesh_eid)
 # 收到 ready 后，应用计算三个等长、连续的一维 int64 NPU Tensor。
 with torch.npu.stream(a_stream):
@@ -32,6 +39,18 @@ with torch.npu.stream(a_stream):
 runtime.batch_get_raw_addr(ready, src, dst, sizes, output, stream=a_stream)
 # 成功后由应用通知 B 释放批次；所有批次结束后 runtime.detach_hbm(ticket)。
 ```
+
+`initialize()` 只检查所启用功能的配置、选择本卡设备并标记基础就绪；不访问 CPU、不申请 DDR、不建立远端链路。
+实际 raw kernel 加载、MR/Jetty/TP 建链与探测在 `attach_hbm()` 中完成。
+纯 NPU Pull 只配置 raw kernel，不要求普通 BatchGet 的 token 参数或 `enable_cpu_offload=True`。
+混合使用时仍配置普通 BatchGet/BatchPut kernel；raw 路径为空时可从 BatchGet kernel 同目录推导，二者都为空时 attach 报错。
+
+需要 DDR 时，在基础初始化后调用 `link_to(cpu_address)` 和 `initialize_ddr(ddr_bytes, slot_size)`。
+可在 attach HBM 前后初始化 DDR，两条路径的资源相互独立。
+旧 `link_to(...) → initialize(ddr_bytes, slot_size)` 仍可用，内部依次完成基础和 DDR 初始化。
+`initialized` 只表示基础就绪，`ddr_initialized` 才表示 DDR 就绪；DDR 初始化失败可能保留基础就绪状态。
+`shutdown_ddr()` 保留 HBM 链路、输出注册缓存和 CPU 目标，可用于重试失败的 DDR 清理及随后重新初始化 DDR。
+它仍要求 CPU Pull 的任务及源租约已退役。`shutdown()` 关闭所有模块；未决 DMA 不会被强制释放，恢复接口不重发 READ。
 
 源偏移相对于注册 HBM，目的偏移相对于 output，均以字节计。output 和三数组必须在 Runtime 所在 NPU，连续且存储不重叠。与 BatchGet 默认路径一致，调用方负责保证源/目的范围合法、目的段互不重叠，并保证每条长度为 1..UINT32_MAX 且不超过设备支持的单次 READ 上限。每条请求直接生成一个 WQE，不拆分；默认不预扫描长度或源/目的范围。`validate_ranges=True` 可启用正长度、32 位长度字段和源/目的边界诊断，但不检测目的重叠或查询设备能力。形状、数量及元数据存储/output 别名检查保留。应用保证元数据在传入 stream 上就绪，并保持到完成/恢复结束。
 
@@ -131,18 +150,19 @@ python tests/python/test_hbm_read_raw_addr.py \
 若 attach 已明确失败且没有未解决的传输，A 会通知 B 关闭源，避免 B 等待 attached 超时。
 
 本地无 Ascend 硬件时，`kvaf_batch_get_raw_addr_kernel_model_test` 运行实际 AIV 源码的 CPU 模型；
-`kvaf_hbm_read_test` 使用真实 TCP/source/client 与假 ACL/HCCP 验证状态、每段一个 WQE、丢 ACK 和清理。
+`kvaf_hbm_read_test` 在关闭 CPU Pull 构建能力时，使用真实 NpuRuntime/TCP/source/client 与假 ACL/HCCP 验证纯 NPU Pull、每段一个 WQE、丢 ACK 和清理。
+`kvaf_hbm_read_with_ddr_test` 另外验证两种初始化顺序、DDR 失败/关闭/重新初始化不影响 raw READ，以及旧 PutHandle 被拒绝。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
 
 ## 随机离散包性能测试
 
 新增 `tests/python/bench_hbm_read_raw_addr.py`，脚本中的 A 为读取端，B 为生产端。
-先按上文重新编译 NPU 扩展和 raw kernel，启动 CPU 服务，再执行：
+先按上文重新编译 NPU 扩展和 raw kernel，再执行；此脚本不需要 CPU 服务：
 
 ```bash
 export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/bench_hbm_read_raw_addr.py \
-  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
+  --device-a 6 --device-b 7 \
   --npu-eid-a-raw 000000000047050000100000df00d806 \
   --npu-eid-b-raw 000000000047050000100000df00f807 \
   --packets 4096 --packet-bytes 656 --source-space-bytes 268435456 \
@@ -150,8 +170,11 @@ python tests/python/bench_hbm_read_raw_addr.py \
   --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
-EID 对应此前测试机的 fullmesh 配置，其他机器需替换。CPU 服务仅用于当前 NpuRuntime
-初始化；数据直接从 B HBM 读取到 A HBM，不经过 CPU DDR。
+EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已删除 `--cpu`、`--cpu-candidate` 参数和占位 DDR 分配。
+初始化日志包含 `ddr_initialized=0 cpu_service_required=0`；数据直接从 B HBM 读取到 A HBM。
+纯 NPU 部署可用 `KVAF_ENABLE_AIV_BATCH_GET=ON`、`KVAF_ENABLE_AIV_BATCH_PUT=OFF`、
+`KVAF_ENABLE_CPU_OFFLOAD=OFF`、`KVAF_BUILD_REMOTE_CPU_SERVICE=OFF` 构建。
+上面的混合功能验收脚本仍需 CPU service 和 CPU Pull/BatchPut 构建能力。
 
 - `--packets`：包数量，1..4096；兼容 `--blocks`。
 - `--packet-bytes`：每包字节数，所有包相同；兼容 `--block-bytes`。每包直接生成一个 WQE，长度须为 1..UINT32_MAX 且满足设备单次 READ 上限。

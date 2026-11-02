@@ -109,8 +109,11 @@ def main():
         batch_get_token_bytes=656, batch_get_tokens_per_block=1,
         npu_core_count=2, jettys_per_core=2,
         npu_eids=[args.npu_eid_a] if args.npu_eid_a else [])
+    runtime.initialize()
+    assert runtime.initialized and not runtime.ddr_initialized
     runtime.link_to(args.cpu)
-    runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
+    runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
+    assert runtime.ddr_initialized
     ticket = runtime.offload_region()
     marker = torch.full((656,), 0xA5, dtype=torch.uint8)
     marker_hbm = marker.to(f"npu:{args.device_a}")

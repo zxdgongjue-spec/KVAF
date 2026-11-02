@@ -54,8 +54,8 @@ struct NpuRuntimeOptions {
   std::uint32_t offload_timeout_ms{30000};
 };
 
-// NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
-// DDR allocator, while Python remains responsible only for Tensor adaptation.
+// NPU role Runtime. HBM readers are independent of the optional DDR module
+// (MetaManager, AccessOperator and allocator). Python only adapts Tensors.
 class NpuRuntime final : public Runtime {
  public:
   explicit NpuRuntime(NpuRuntimeOptions options);
@@ -64,7 +64,14 @@ class NpuRuntime final : public Runtime {
   NpuRuntime(const NpuRuntime&) = delete;
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
+  // Base device initialization; no CPU service or DDR allocation is required.
+  Status Initialize();
+  // Compatibility entrypoint: base initialization followed by InitializeDdr.
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  Status InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  // Keep HBM reader connections and the configured CPU target alive.
+  Status ShutdownDdr();
+  bool ddr_initialized() const;
   RuntimeCore& core();
   const RuntimeCore& core() const;
   Status GetOffloadRegion(OffloadRegionTicket*) const;

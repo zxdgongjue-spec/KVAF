@@ -102,7 +102,9 @@ target_include_directories(kvaf_batch_get_raw_addr_kernel_model_test PRIVATE
 add_test(NAME kvaf_batch_get_raw_addr_kernel_model_test COMMAND kvaf_batch_get_raw_addr_kernel_model_test)
 
 add_executable(kvaf_hbm_read_test hbm_read_test.cc
+  raw_runtime_fake_operator.cc ../runtime/src/npu_runtime.cc
   ../runtime/src/hbm_read_source.cc ../runtime/src/hbm_read_client.cc)
+target_compile_definitions(kvaf_hbm_read_test PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
 target_include_directories(kvaf_hbm_read_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
   ${PROJECT_SOURCE_DIR}/runtime/src ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl
@@ -110,3 +112,15 @@ target_include_directories(kvaf_hbm_read_test PRIVATE
 target_link_libraries(kvaf_hbm_read_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
 add_test(NAME kvaf_hbm_read_test COMMAND kvaf_hbm_read_test)
 set_tests_properties(kvaf_hbm_read_test PROPERTIES TIMEOUT 45)
+
+add_executable(kvaf_hbm_read_with_ddr_test hbm_read_test.cc raw_runtime_fake_operator.cc
+  ../runtime/src/npu_runtime.cc ../runtime/src/remote_offload.cc ../runtime/src/remote_pull_operator.cc
+  ../runtime/src/hbm_read_source.cc ../runtime/src/hbm_read_client.cc)
+target_compile_definitions(kvaf_hbm_read_with_ddr_test PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1 KVAF_ENABLE_CPU_OFFLOAD=1)
+target_include_directories(kvaf_hbm_read_with_ddr_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model ${PROJECT_SOURCE_DIR}/runtime/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+target_link_libraries(kvaf_hbm_read_with_ddr_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
+add_test(NAME kvaf_hbm_read_with_ddr_test COMMAND kvaf_hbm_read_with_ddr_test)
+set_tests_properties(kvaf_hbm_read_with_ddr_test PROPERTIES TIMEOUT 45)

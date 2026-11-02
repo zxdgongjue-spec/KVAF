@@ -1,7 +1,7 @@
 """Manual two-NPU benchmark: random, equal-sized packets in a registered HBM space.
 
-A reads B with batch_get_raw_addr. A's existing Runtime still needs a CPU service
-for initialization, but payload travels only from B HBM to A HBM. Setup, producer
+A reads B with batch_get_raw_addr without a CPU service or DDR allocation.
+Payload travels only from B HBM to A HBM. Setup, producer
 writes, metadata preparation, verification and application IPC are outside timing.
 """
 import argparse
@@ -17,10 +17,8 @@ GUARD_BYTES = 64
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cpu", required=True)
     parser.add_argument("--device-a", type=int, default=6, help="reader NPU")
     parser.add_argument("--device-b", type=int, default=7, help="producer NPU")
-    parser.add_argument("--cpu-candidate", type=int, default=-1)
     parser.add_argument("--npu-eid-a-raw", required=True, help="A fullmesh EID")
     parser.add_argument("--npu-eid-b-raw", required=True, help="B fullmesh EID")
     parser.add_argument("--packets", "--blocks", type=int, default=4096)
@@ -139,16 +137,15 @@ def main():
     torch.npu.set_device(args.device_a)
     device = f"npu:{args.device_a}"
     runtime = kvaf.NpuRuntime(
-        device_id=args.device_a, enable_cpu_offload=True, cpu_candidate=args.cpu_candidate,
+        device_id=args.device_a,
         batch_get_raw_addr_kernel_object_path=args.raw_kernel,
         npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
         batch_get_max_inflight_total=args.max_inflight_total)
     worker = None
     waiting_for_attach = False
     try:
-        runtime.link_to(args.cpu)
-        # Runtime initialization only; no payload is copied to/from this DDR.
-        runtime.initialize(ddr_bytes=4096, slot_size=4096)
+        runtime.initialize()
+        assert runtime.initialized and not runtime.ddr_initialized
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
         worker = ctx.Process(target=producer, args=(child, args, offsets))
@@ -181,7 +178,7 @@ def main():
               f"max_inflight_total={args.max_inflight_total} "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
-              "payload_uses_cpu_ddr=0", flush=True)
+              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
         internal_stages = {}
         event_errors = set()

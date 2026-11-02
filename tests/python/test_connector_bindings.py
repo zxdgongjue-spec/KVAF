@@ -48,6 +48,32 @@ class NpuTensorLayout:
 
 
 class ConnectorBindings(unittest.TestCase):
+    @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
+    def test_base_and_ddr_initialization_are_independent(self):
+        runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
+        self.assertFalse(runtime.initialized)
+        self.assertFalse(runtime.ddr_initialized)
+        with self.assertRaisesRegex(RuntimeError, "call initialize before initialize_ddr"):
+            runtime.initialize_ddr(4096, 4096)
+        self.assertIsNone(runtime.initialize())
+        self.assertIsNone(runtime.initialize())
+        self.assertTrue(runtime.initialized)
+        self.assertFalse(runtime.ddr_initialized)
+        with self.assertRaisesRegex(ValueError, "link_to before initialize_ddr"):
+            runtime.initialize(ddr_bytes=4096, slot_size=4096)
+        with self.assertRaisesRegex(RuntimeError, "initialize_ddr before PreparePut"):
+            runtime.prepare_put([0], [8])
+        with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+            _ = runtime.remote_region
+        with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+            runtime.batch_put([0], None, [0], [8])
+        self.assertIsNone(runtime.shutdown_ddr())
+        self.assertTrue(runtime.initialized)
+        self.assertFalse(runtime.ddr_initialized)
+        self.assertIsNone(runtime.shutdown())
+        self.assertFalse(runtime.initialized)
+        self.assertIsNone(runtime.shutdown())
+
     def test_descriptors_and_ready_survive_connector_ipc(self):
         cpu = restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99))
         npu = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
@@ -114,7 +140,7 @@ class ConnectorBindings(unittest.TestCase):
             accepted.append(torch.tensor([8, 8], dtype=torch.int64, device="cpu"))
         for value in accepted:
             with self.subTest(value=repr(value)):
-                with self.assertRaisesRegex(RuntimeError, "initialize Runtime before PreparePut"):
+                with self.assertRaisesRegex(RuntimeError, "initialize_ddr before PreparePut"):
                     runtime.prepare_put([1, 2], value)
 
     def test_raw_arrays_require_npu_layout(self):

@@ -4,12 +4,18 @@
 
 源由 `CpuPullHbmSource` 注册，可位于 Runtime 本卡或另一张卡。源端不分配第二个 DDR 池，只绑定读取端提供的 DDR ticket。完整应用职责及接口见 [Connector 设计](connector_pull_api_design.md)。本文沿用验收脚本的 A=读取端、B=生产端。
 
+`initialized` 仅表示本卡基础初始化，CPU Pull 还要求 `ddr_initialized=True`。
+旧 `link_to(...) → initialize(ddr_bytes, slot_size)` 保留为组合入口。
+`shutdown_ddr()` 在任务和 CPU 源租约退役后释放 DDR 及其通信资源，保留独立 NPU Pull 链路和 CPU 目标；失败可原地重试，不重发 READ。
+随后可重新 initialize_ddr；旧 PutHandle 不适用于新的 DDR core。纯 NPU Pull 只需无参数 initialize 和 attach_hbm。
+
 ## 跨卡调用
 
 ```python
 # A 初始化并将 ticket 通过应用 Connector 发送给 B。
+runtime.initialize()
 runtime.link_to(cpu_address)
-runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
+runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
 ticket = runtime.offload_region()
 
 # B 注册，并将 desc 返回 A。
