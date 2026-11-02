@@ -254,6 +254,7 @@ class NpuPythonRuntime final {
   ~NpuPythonRuntime() {
     if (!native_->Shutdown().ok()) {
       (void)raw_retained_.release();
+      (void)raw_outputs_.release();
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
       (void)local_sources_.release();
 #endif
@@ -338,7 +339,7 @@ class NpuPythonRuntime final {
     ThrowIfError(status);
   }
   py::dict BatchGetRawArrays(LinkId region,const ReadyToken& ready,const py::object& src,const py::object& dst,
-                         const py::object& lengths,py::object output,py::object stream,bool profiling) {
+                         const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges) {
     auto array = [&](const py::object& tensor, const char* name) {
       const auto view = GetNpuTensorView(tensor, name);
       if (view.shape.size() != 1 || view.element_bytes != sizeof(std::int64_t) ||
@@ -361,10 +362,16 @@ class NpuPythonRuntime final {
     if(py::hasattr(stream,"device") && stream.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
       throw py::value_error("raw READ stream belongs to another NPU");
     const auto acl_stream=acl_python::StreamFromPython(stream);
+    // Transport caches (address, size) registrations until detach. Pin their
+    // Python owners for the same lifetime so allocator reuse cannot alias an MR.
+    const py::int_ region_key(region);
+    if(!raw_outputs_.contains(region_key))raw_outputs_[region_key]=py::dict();
+    auto outputs=raw_outputs_[region_key].cast<py::dict>();
+    outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data),view.bytes)]=output;
     raw_retained_=py::make_tuple(src,dst,lengths,output,stream);
     HbmReadProfile profile;
     const auto status=native_->BatchGetRawAddr(region,ready,sources,destinations,sizes,
-        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr);
+        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr,validate_ranges);
     if(!native_->pending_raw_addr())raw_retained_=py::none();
     ThrowIfError(status);
     py::dict result; result["state"]="done"; result["sequence"]=ready.sequence;
@@ -384,7 +391,10 @@ class NpuPythonRuntime final {
     }
     return result;
   }
-  void DetachHbm(LinkId region) { ThrowIfError(native_->DetachHbm(region)); }
+  void DetachHbm(LinkId region) {
+    ThrowIfError(native_->DetachHbm(region));
+    raw_outputs_.attr("pop")(py::int_(region),py::none());
+  }
   bool PendingRawAddr() const { return native_->pending_raw_addr(); }
 
   bool Initialized() const { return native_->initialized(); }
@@ -646,6 +656,8 @@ class NpuPythonRuntime final {
  public:
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
+    raw_outputs_=py::dict();
+    raw_retained_=py::none();
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
     local_sources_ = py::list();
 #endif
@@ -653,6 +665,7 @@ class NpuPythonRuntime final {
 
  private:
   py::object raw_retained_{py::none()};
+  py::dict raw_outputs_;
   std::unique_ptr<::kvaf::NpuRuntime> native_;
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   py::list local_sources_;
@@ -696,9 +709,11 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("attach_hbm", &NpuPythonRuntime::AttachHbm, py::arg("address"), py::arg("export_ticket"), py::arg("local_eid") = "")
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("hbm_link"),py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
-           py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,
+           py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
            "Synchronously read peer HBM. profile=True adds Host stage timings and a device event "
-           "interval around the kernel to the returned profile dictionary; profiling is off by default.")
+           "interval around the kernel to the returned profile dictionary; profiling is off by default. "
+           "Output registrations and their Tensors are retained until detach/shutdown; do not resize their storage. "
+           "Callers guarantee valid, disjoint ranges. validate_ranges=True enables bounds diagnostics only.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("region"))
       .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("region"))
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)

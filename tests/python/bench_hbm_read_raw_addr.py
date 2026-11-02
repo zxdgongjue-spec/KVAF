@@ -32,6 +32,8 @@ def parse_args(argv=None):
     parser.add_argument("--profile-warmup", type=int, default=1)
     parser.add_argument("--profile-iterations", type=int, default=20,
                         help="separate instrumented rounds, excluded from bandwidth; 0 disables")
+    parser.add_argument("--validate-ranges", action="store_true",
+                        help="enable optional source/output bounds diagnostics; no overlap detection")
     parser.add_argument("--aiv-cores", type=int, default=2)
     parser.add_argument("--jettys-per-core", type=int, default=2)
     parser.add_argument("--max-inflight-total", type=int, default=2048)
@@ -179,6 +181,7 @@ def main():
               f"min_source_offset={min(offsets)} max_source_end={max(offsets) + args.packet_bytes} "
               f"aiv_cores={args.aiv_cores} jettys_per_core={args.jettys_per_core} "
               f"max_inflight_total={args.max_inflight_total} "
+              f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
@@ -193,7 +196,7 @@ def main():
             instrumented = iteration >= normal_rounds
             begin = time.perf_counter_ns()
             result = runtime.batch_get_raw_addr(link, ready, src, dst, lengths, output,
-                                               stream=stream, profile=instrumented)
+                                               stream=stream, profile=instrumented, validate_ranges=args.validate_ranges)
             elapsed_us = (time.perf_counter_ns() - begin) / 1000
             verify_begin = time.perf_counter_ns()
             if not torch.equal(output, expected_hbm[iteration % 2]):
@@ -234,6 +237,7 @@ def main():
               f"p95_us={stats['p95_us']:.3f} p99_us={stats['p99_us']:.3f} "
               f"effective_GBps={payload_bytes / stats['mean_us'] / 1000:.3f} "
               f"profile_iterations={args.profile_iterations} instrumented_rounds_excluded_from_bandwidth=1 "
+              f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "percentile=linear verification_included=0 setup_and_producer_and_ipc_excluded=1 "
               "changing_inputs=1 verification=every_round_full_output npu_consumer_checked=1 guard_checked=1",
               flush=True)

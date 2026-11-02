@@ -132,7 +132,8 @@ struct Fixture {
 };
 void TestFusedOffsets(std::vector<int64_t> src, std::vector<int64_t> dst,
                       std::vector<int64_t> lengths, uint64_t error=0,
-                      uint32_t cores=2, uint32_t jettys=2, uint32_t budget=2048, size_t output_bytes=300000) {
+                      uint32_t cores=2, uint32_t jettys=2, uint32_t budget=2048, size_t output_bytes=300000,
+                      bool diagnostics=false) {
   Fixture f(1,cores,jettys,budget);
   f.output.assign(output_bytes,0xa5);
   for(auto& entity:f.entities){entity.local_hbm_address=reinterpret_cast<uint64_t>(f.output.data());entity.local_hbm_size=f.output.size();}
@@ -141,6 +142,7 @@ void TestFusedOffsets(std::vector<int64_t> src, std::vector<int64_t> dst,
   f.args.destination_addresses=reinterpret_cast<uint64_t>(dst.data());
   f.args.lengths=reinterpret_cast<uint64_t>(lengths.data());
   f.args.request_count=src.size();f.args.input_mode=KVAF_RAW_NPU_OFFSETS;
+  f.args.validate_ranges=error!=0 || diagnostics;
   std::vector<uint8_t> expected(f.output.size(),0xa5);
   uint64_t chunks=0;
   if(!error)for(size_t i=0;i<src.size();++i){std::memcpy(expected.data()+dst[i],f.remote.data()+src[i],lengths[i]);
@@ -174,7 +176,15 @@ int main(){
   TestFusedOffsets({0},{0},{-1},kInvalidLookup);
   TestFusedOffsets({131071},{0},{2},kInvalidLookup);
   TestFusedOffsets({0},{299999},{2},kInvalidOutput);
-  TestFusedOffsets({0,0},{0,65535},{65536,1},kInvalidOutput);
+  // Overlap is no longer rejected, including with diagnostics enabled. Use
+  // identical writes so this test does not depend on concurrent write order.
+  TestFusedOffsets({7,7},{3,3},{656,656});
+  TestFusedOffsets({7,7},{3,3},{656,656},0,2,2,2048,300000,true);
+  // The default fast path counts/splits lengths without reading source or
+  // destination metadata; bounds diagnostics are explicitly opt-in.
+  {std::vector<int64_t> sizes{656,100001};uint32_t count=0;uint64_t result=0,failed=UINT64_MAX;
+    ValidateAndCountRaw(nullptr,nullptr,sizes.data(),sizes.size(),0,0,&count,&result,&failed);
+    CHECK(result==kSuccess && count==3 && failed==UINT64_MAX);}
   TestFusedOffsets({0},{0},{65537},0,4,1,8); // one span split across cores, including idle cores
   TestFusedOffsets({INT64_MAX},{0},{1},kInvalidLookup);
   TestFusedOffsets({0},{INT64_MAX},{1},kInvalidOutput);

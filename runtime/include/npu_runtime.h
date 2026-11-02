@@ -92,9 +92,12 @@ class NpuRuntime final : public Runtime {
   // Remote producer HBM: direct READ ranges, no AccessTable or DDR metadata.
   Status AttachHbm(const std::string& address, const HbmReadTicket&, LinkId*,
                    const std::string& local_eid = "");
+  // As with BatchGet, output registrations are cached until detach/shutdown.
+  // Keep output storage alive and at a stable address until then. Callers own
+  // range validity and destination disjointness; validate_ranges checks bounds only.
   Status BatchGetRawAddr(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
-                         HbmReadProfile* profile = nullptr);
+                         HbmReadProfile* profile = nullptr, bool validate_ranges = false);
   Status ResolveRawAddr(LinkId); // Never resubmits DMA; retries control/cleanup only.
   Status DetachHbm(LinkId);
   bool pending_raw_addr() const;

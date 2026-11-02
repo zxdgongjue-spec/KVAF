@@ -635,7 +635,7 @@ extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport) {
   ReleaseTransport(transport);
 }
 
-// The raw-address path retires registrations before returning caller buffers.
+// Retire a registration before freeing its storage (probe cleanup or teardown).
 // Every successful release nulls its handle, so partial failures are retryable.
 extern "C" int32_t KvafBatchGetLocalBufferDiscard(KvafBatchGetLocalBuffer **handle) {
   if (!handle || !*handle) return KVAF_BATCH_GET_SUCCESS;

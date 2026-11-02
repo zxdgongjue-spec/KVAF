@@ -407,7 +407,7 @@ result = runtime.batch_get_raw_addr(
 # 成功返回后，output[0:4096] 和 output[4096:8192] 分别包含上述两段数据。
 ```
 
-output 必须在读取完成前保持有效，不得并发覆写、调整大小或释放。若接口因未决传输而失败，KVAF 继续保留对应引用和注册，应用也不得复用该缓冲，直到恢复流程确认可以安全使用或释放。
+output 在读取完成前不得并发覆写。其注册与 BatchGet 一样按地址/长度缓存到 detach/shutdown，Python 同期保留 Tensor 引用，C++ 调用方负责保活；缓存期间不得调整大小或替换底层 storage。若接口因未决传输而失败，应用不得复用该缓冲，直到恢复流程确认可以安全使用。调用方负责范围合法及目的区间不重叠；默认关闭边界诊断，可用 `validate_ranges=True` 显式开启，目的区间两两重叠检查已删除。
 
 | 参数 | 表示什么 | 数据最终写入哪里 |
 |---|---|---|
@@ -430,7 +430,7 @@ sequenceDiagram
     BC->>BC: 准备 output HBM 和三个连续、等长数组
     BC->>BR: batch_get_raw_addr(link, ready, src_offsets, dst_offsets, lengths, output, stream)
     BR->>AS: AcquireRaw：源身份和 sequence，无三数组
-    BR->>BR: 一次 raw READ：整批校验、核内分段、生成 WQE、等待 CQ
+    BR->>BR: 一次 raw READ：可选边界诊断、核内分段、生成 WQE、等待 CQ
     BR->>BR: Host 检查各核最终状态及 WQE 数量
     BR->>AS: 库内部传输完成确认
     BR-->>BC: 输出就绪，返回结果

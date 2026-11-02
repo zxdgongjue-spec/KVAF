@@ -12,7 +12,7 @@ class HbmReader {
   Status Attach(const std::string&, const HbmReadTicket&, const std::string& local_eid, LinkId*);
   Status Read(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
               NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
-              HbmReadProfile* profile = nullptr);
+              HbmReadProfile* profile = nullptr, bool validate_ranges = false);
   Status Resolve(LinkId);
   Status Detach(LinkId);
   Status Shutdown();

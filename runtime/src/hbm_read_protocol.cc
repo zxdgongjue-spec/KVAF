@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -36,7 +37,10 @@ int Connect(const std::string& address) {
     close(fd); fd=-1;
   }
   freeaddrinfo(list);
-  if(fd>=0) offload::SetSocketTimeout(fd);
+  if(fd>=0) {
+    offload::SetSocketTimeout(fd);
+    int yes=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&yes,sizeof(yes));
+  }
   return fd;
 }
 Status Listen(const std::string& address,int* fd,std::uint16_t* port) {
@@ -54,18 +58,22 @@ Status Listen(const std::string& address,int* fd,std::uint16_t* port) {
   if(getsockname(*fd,reinterpret_cast<sockaddr*>(&a),&n)) {close(*fd);*fd=-1;return Status::Internal("HBM getsockname failed");}
   *port=ntohs(a.sin_port); return Status::OK();
 }
-Status Exchange(const std::string& address,Request r,const std::vector<Span>& spans,Response* out) {
+Status Exchange(const std::string& address,Request r,const std::vector<Span>& spans,Response* out,int* connection) {
   if(!out || spans.size()>offload::kMaxSpans) return Status::InvalidArgument("invalid HBM exchange");
-  int fd=Connect(address); if(fd<0) return Status::InDoubt("HBM control connection unavailable");
+  int fd=connection && *connection>=0?*connection:Connect(address);
+  if(fd<0) return Status::InDoubt("HBM control connection unavailable");
+  if(connection)*connection=-1;
   r.count=spans.size(); r.header.bytes=sizeof(r)+spans.size()*sizeof(Span);
   bool ok=offload::WriteBytes(fd,&r,sizeof(r)) && offload::WriteBytes(fd,spans.data(),spans.size()*sizeof(Span)) &&
       offload::ReadBytes(fd,out,sizeof(*out));
-  close(fd);
-  if(!ok) return Status::InDoubt("HBM control response lost; retain source/output and resolve");
+  if(!ok) {close(fd);return Status::InDoubt("HBM control response lost; retain source/output and resolve");}
   if(out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=sizeof(Response) ||
       out->header.command!=(r.header.command|0x8000U) || out->source_id!=r.source_id || out->epoch!=r.epoch ||
-      out->client!=r.client || out->sequence!=r.sequence || out->code>unsigned(StatusCode::kInDoubt))
-    return Status::InDoubt("HBM response identity/version mismatch");
+      out->client!=r.client || out->sequence!=r.sequence || out->code>unsigned(StatusCode::kInDoubt)) {
+    close(fd);return Status::InDoubt("HBM response identity/version mismatch");
+  }
+  if(connection && out->reserved==1U)*connection=fd;
+  else close(fd);
   return Status::Error(static_cast<StatusCode>(out->code), std::string(out->detail,strnlen(out->detail,sizeof(out->detail))));
 }
 }

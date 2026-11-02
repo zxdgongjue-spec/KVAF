@@ -28,7 +28,9 @@ inline Request Make(Command c, const HbmReadTicket& t, std::uint64_t client) {
   r.token=t.token; r.source_id=t.source_id; r.epoch=t.epoch; r.client=client;
   return r;
 }
-Status Exchange(const std::string&, Request, const std::vector<Span>&, Response*);
+// Optional connection is reused only when the server advertises support.
+// Any uncertain exchange closes it; callers resolve the batch before retrying.
+Status Exchange(const std::string&, Request, const std::vector<Span>&, Response*, int* connection = nullptr);
 int Connect(const std::string&);
 Status Listen(const std::string&, int* fd, std::uint16_t* port);
 }

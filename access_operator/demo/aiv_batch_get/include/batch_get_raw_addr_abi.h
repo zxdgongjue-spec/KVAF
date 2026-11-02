@@ -21,7 +21,7 @@ struct KvafExecuteBatchGetRawAddrKernelArgs {
   uint32_t jettys_per_core;
   uint32_t batch_get_max_inflight_total;
   uint32_t input_mode;
-  uint32_t reserved;
+  uint32_t validate_ranges;        // opt-in diagnostic bounds checks; no pairwise overlap checks
 };
 static_assert(sizeof(KvafExecuteBatchGetRawAddrKernelArgs) == 80);
 

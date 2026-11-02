@@ -4,6 +4,8 @@
 #include <atomic>
 #include <future>
 #include <mutex>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <set>
 #include <sys/socket.h>
@@ -126,25 +128,43 @@ struct NpuPullHbmSource::Impl {
   void Serve(std::promise<Status> startup) {
     if(aclrtSetDevice(device)!=ACL_SUCCESS) { startup.set_value(Status::Internal("select B device in HBM service"));return; }
     startup.set_value(Status::OK());
+    std::vector<int> clients;
+    std::vector<pollfd> polls;
     while(!stop.load()) {
-      pollfd p{listener,POLLIN,0}; if(poll(&p,1,100)<=0) continue;
-      int fd=accept(listener,nullptr,nullptr); if(fd<0) continue;
-      offload::SetSocketTimeout(fd);
-      hr::Request r{}; hr::Response response{};
-      if(offload::ReadBytes(fd,&r,sizeof(r)) && r.header.magic==hr::kMagic && r.header.version==hr::kVersion &&
-          r.count<=offload::kMaxSpans && r.header.bytes==sizeof(r)+r.count*sizeof(hr::Span)) {
-        std::vector<hr::Span> spans(r.count);
-        if(offload::ReadBytes(fd,spans.data(),spans.size()*sizeof(hr::Span))) {
-          response.header={hr::kMagic,hr::kVersion,std::uint16_t(r.header.command|0x8000U),sizeof(response)};
-          response.source_id=r.source_id; response.epoch=r.epoch; response.client=r.client; response.sequence=r.sequence;
-          Status s;
-          { std::lock_guard<std::mutex> lock(mutex); s=Handle(r,spans,&response); response.state=unsigned(state); }
-          response.code=unsigned(s.code()); std::snprintf(response.detail,sizeof(response.detail),"%s",s.message().c_str());
-          offload::WriteBytes(fd,&response,sizeof(response));
+      polls.clear();polls.push_back({listener,POLLIN,0});
+      for(int fd:clients)polls.push_back({fd,POLLIN,0});
+      if(poll(polls.data(),polls.size(),100)<=0)continue;
+      // Process existing clients before accepting another. Idle persistent
+      // connections must not block discovery, channel setup or other readers.
+      for(std::size_t i=clients.size();i>0;--i) {
+        if(!polls[i].revents)continue;
+        int fd=clients[i-1];bool keep=false;
+        hr::Request r{};hr::Response response{};
+        if((polls[i].revents&POLLIN) && offload::ReadBytes(fd,&r,sizeof(r)) &&
+            r.header.magic==hr::kMagic && r.header.version==hr::kVersion &&
+            r.count<=offload::kMaxSpans && r.header.bytes==sizeof(r)+r.count*sizeof(hr::Span)) {
+          std::vector<hr::Span> spans(r.count);
+          if(offload::ReadBytes(fd,spans.data(),spans.size()*sizeof(hr::Span))) {
+            response.header={hr::kMagic,hr::kVersion,std::uint16_t(r.header.command|0x8000U),sizeof(response)};
+            response.source_id=r.source_id;response.epoch=r.epoch;response.client=r.client;response.sequence=r.sequence;
+            response.reserved=1U; // Persistent exchanges supported, same v4 wire layout.
+            Status s;
+            {std::lock_guard<std::mutex> lock(mutex);s=Handle(r,spans,&response);response.state=unsigned(state);}
+            response.code=unsigned(s.code());std::snprintf(response.detail,sizeof(response.detail),"%s",s.message().c_str());
+            keep=offload::WriteBytes(fd,&response,sizeof(response));
+          }
         }
+        if(!keep){close(fd);clients.erase(clients.begin()+i-1);}
       }
-      close(fd);
+      if(polls[0].revents&POLLIN) {
+        int fd=accept(listener,nullptr,nullptr);if(fd<0)continue;
+        if(clients.size()>=64){close(fd);continue;}
+        offload::SetSocketTimeout(fd);
+        int yes=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&yes,sizeof(yes));
+        clients.push_back(fd);
+      }
     }
+    for(int fd:clients)close(fd);
   }
 };
 NpuPullHbmSource::NpuPullHbmSource(std::uint32_t d,std::string e):impl_(new Impl(d,std::move(e))){}

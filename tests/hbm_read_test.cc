@@ -15,13 +15,19 @@ void Doorbell(uint32_t, uint32_t*) { std::abort(); }
 
 using kvaf::Status;
 namespace hr=kvaf::hbm_read;
-std::atomic<int> raw_calls{0}, raw_wqes{0}, local_buffers{0}, raw_transports{0};
+std::atomic<int> raw_calls{0}, raw_wqes{0}, local_buffers{0}, raw_transports{0}, local_acquires{0};
 int unregister_failures=0;
 bool fail_probe_cq=false;
 int quiesces=0, raw_syncs=0;
 extern "C" aclError aclrtSynchronizeStream(aclrtStream){++raw_syncs;return 0;}
-struct KvafBatchGetTransport {kvaf::peer::PeerLink* link;std::uint64_t base,bytes;};
-struct KvafBatchGetLocalBuffer {std::uint64_t base,bytes,source_base,source_bytes;};
+struct KvafBatchGetLocalBuffer {
+  std::uint64_t base,bytes,source_base,source_bytes;
+  KvafBatchGetTransport* transport;unsigned references;
+};
+struct KvafBatchGetTransport {
+  kvaf::peer::PeerLink* link;std::uint64_t base,bytes;
+  std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> buffers;
+};
 extern "C" int32_t KvafExecuteBatchGetRawAddrLoadKernel(const char*){return 0;}
 extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(void* base,std::uint64_t bytes,std::uint32_t cores,
     std::uint32_t jettys,void* peer,const std::uint8_t* eid,KvafBatchGetTransport** out){
@@ -39,18 +45,37 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(void* base,std::uint6
   ++raw_transports;*out=new KvafBatchGetTransport{link,reinterpret_cast<std::uint64_t>(base),bytes};return 0;
 }
 extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport* transport,void* output,std::uint64_t bytes,
-    KvafBatchGetLocalBuffer** out,std::uint64_t* entity){++local_buffers;*out=new KvafBatchGetLocalBuffer{reinterpret_cast<uint64_t>(output),bytes,transport->base,transport->bytes};*entity=reinterpret_cast<uint64_t>(*out);return 0;}
+    KvafBatchGetLocalBuffer** out,std::uint64_t* entity){
+  const auto base=reinterpret_cast<uint64_t>(output);
+  for(auto& b:transport->buffers)if(b->base==base && b->bytes==bytes){
+    ++b->references;*out=b.get();*entity=reinterpret_cast<uint64_t>(*out);return 0;}
+  ++local_buffers;++local_acquires;
+  transport->buffers.emplace_back(new KvafBatchGetLocalBuffer{base,bytes,transport->base,transport->bytes,transport,1});
+  *out=transport->buffers.back().get();*entity=reinterpret_cast<uint64_t>(*out);return 0;
+}
+extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer* p){
+  if(p){Require(p->references>0,"release live output registration");--p->references;}}
 extern "C" int32_t KvafBatchGetLocalBufferDiscard(KvafBatchGetLocalBuffer** p){
-  if(!*p)return 0;if(unregister_failures){--unregister_failures;return -1;}--local_buffers;delete *p;*p=nullptr;return 0;}
+  if(!*p)return 0;if(unregister_failures){--unregister_failures;return -1;}
+  Require((*p)->references<=1,"discard output with no outstanding users");
+  auto& buffers=(*p)->transport->buffers;
+  auto it=std::find_if(buffers.begin(),buffers.end(),[&](const auto& b){return b.get()==*p;});
+  Require(it!=buffers.end(),"discard cached registration");buffers.erase(it);--local_buffers;*p=nullptr;return 0;}
 extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport*){++quiesces;return 0;}
-extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport** p){if(*p){--raw_transports;delete *p;*p=nullptr;}return 0;}
+extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport** p){
+  if(*p){
+    for(const auto& b:(*p)->buffers)Require(!b->references,"close only after READ references released");
+    while(!(*p)->buffers.empty()){auto* b=(*p)->buffers.back().get();if(KvafBatchGetLocalBufferDiscard(&b))return -1;}
+    --raw_transports;delete *p;*p=nullptr;
+  }return 0;
+}
 extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs* a,aclrtStream){
   ++raw_calls;auto* src=reinterpret_cast<uint64_t*>(a->source_addresses);auto* dst=reinterpret_cast<uint64_t*>(a->destination_addresses);
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
   uint32_t count=a->request_count;uint64_t result=0,failed=UINT64_MAX;
   if(a->input_mode==KVAF_RAW_NPU_OFFSETS)
     ValidateAndCountRaw(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
-                        local->source_bytes,local->bytes,&count,&result,&failed);
+                        local->source_bytes,local->bytes,&count,&result,&failed,a->validate_ranges);
   if(!result)for(unsigned i=0;i<a->request_count;++i){
     const uint64_t n=a->input_mode==KVAF_RAW_NPU_OFFSETS?reinterpret_cast<const int64_t*>(sizes)[i]:sizes[i];
     const uint64_t source=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->source_base+src[i]:src[i];
@@ -81,6 +106,8 @@ class Proxy {
           int server=hr::Connect(upstream);Require(server>=0,"connect source");hr::Response response{};
           Require(kvaf::offload::WriteBytes(server,&r,sizeof(r))&&kvaf::offload::WriteBytes(server,spans.data(),spans.size()*sizeof(hr::Span))&&
             kvaf::offload::ReadBytes(server,&response,sizeof(response)),"proxy exchange");close(server);
+          // This proxy deliberately models a legacy one-request connection.
+          response.reserved=0;
           if(drop.load()==r.header.command)drop=0;else kvaf::offload::WriteBytes(client,&response,sizeof(response));
         }}close(client);
     }});
@@ -121,7 +148,7 @@ int main(){try{
                 const std::vector<std::int64_t>& dst,const std::vector<std::int64_t>& sizes) {
     const auto calls=raw_calls.load(),syncs=raw_syncs;
     const auto status=a.Read(id,t,{src.data(),src.size()},{dst.data(),dst.size()},
-                             {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1));
+                             {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1),nullptr,true);
     Require(raw_calls-calls<=1 && raw_syncs-syncs==raw_calls-calls,"single fused launch and final synchronization");
     return status;
   };
@@ -132,8 +159,8 @@ int main(){try{
                    {destinations.data(),destinations.size()},{lengths.data(),lengths.size()},out,
                    reinterpret_cast<void*>(1)).ok() && raw_calls==before && !a.pending(),
           "metadata/output alias is rejected before Acquire");
-  auto overlap=destinations;overlap[1]=8;
-  Require(!read(token,sources,overlap,lengths).ok(),"raw-array overlapping outputs rejected");
+  auto invalid_destination=destinations;invalid_destination[1]=output.size();
+  Require(!read(token,sources,invalid_destination,lengths).ok(),"opt-in destination bounds enforced");
   Require(!a.pending(),"NPU validation failure cancels without unresolved DMA");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(!read(token,sources,{destinations[0]},lengths).ok(),"raw-array count mismatch rejected");
@@ -141,6 +168,7 @@ int main(){try{
   Require(!read(token,overrun,destinations,lengths).ok(),"raw-array source bounds enforced");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(raw_calls==before+2 && raw_wqes==before_wqes,"fused validation rejects all invalid ranges before posting DMA");
+  const int cached_acquires=local_acquires,allocated=acl_allocation_calls;
   kvaf::HbmReadProfile profile;
   Check(a.Read(id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
@@ -157,6 +185,8 @@ int main(){try{
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
   Require(!profile.kernel_event_valid && profile.event_error==123 && !a.pending(),
           "timing query failure does not change successful DMA result");
+  Require(local_acquires==cached_acquires && local_buffers==1,"output registration reused across batches");
+  Require(acl_allocation_calls==allocated,"status and queue allocations reused across batches");
   fail_timing_query=false;
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   const int queries=timing_queries;
@@ -174,11 +204,47 @@ int main(){try{
   Require(!a.Resolve(id).ok()&&!a.pending()&&raw_calls==before,"unknown Acquire is cancelled without READ replay");
   Require(!read(token,sources,destinations,lengths).ok(),"consumed sequence cannot replay");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
-  unregister_failures=1;before=raw_calls;
-  Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"unregister failure retains output");
-  Check(a.Resolve(id));Require(raw_calls==before+1,"cleanup retries never replay READ");Check(b.ReleaseBatch(token));
+  before=raw_calls;
+  Check(read(token,sources,destinations,lengths));Check(b.ReleaseBatch(token));
+  Require(raw_calls==before+1 && local_acquires==cached_acquires && local_buffers==1,
+          "batch cleanup releases a reference without unregistering");
+  // Different output sizes/addresses get separate cache entries and old ones
+  // remain reusable, matching BatchGet's transport cache.
+  --out.bytes;Check(b.Ready(&token));Check(read(token,sources,destinations,lengths));Check(b.ReleaseBatch(token));
+  ++out.bytes;Check(b.Ready(&token));Check(read(token,sources,destinations,lengths));Check(b.ReleaseBatch(token));
+  Require(local_acquires==cached_acquires+1 && local_buffers==2,"cache key includes output length");
+  std::vector<uint8_t> second_output(output.size());auto original_out=out;
+  out.data=second_output.data();Check(b.Ready(&token));Check(read(token,sources,destinations,lengths));Check(b.ReleaseBatch(token));
+  out=original_out;
+  Require(local_acquires==cached_acquires+2 && local_buffers==3,"cache key includes output address");
   Check(b.Ready(&token));Check(b.CancelBatch(token));Require(!read(token,sources,destinations,lengths).ok(),"cancelled batch cannot be read");
-  proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(id).ok(),"lost detach reply");Check(a.Detach(id));Check(b.Shutdown());
+  unregister_failures=1;Require(!a.Detach(id).ok() && local_buffers==3,"failed detach preserves cached registrations");
+  Check(b.Ready(&token));before=raw_calls;
+  Require(!read(token,sources,destinations,lengths).ok() && raw_calls==before,"partially closed transport rejects further READs");
+  Check(b.CancelBatch(token));
+  proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(id).ok(),"lost detach reply");Check(a.Detach(id));
+  // Exercise real persistent connections and legacy one-shot calls together.
+  int control=-1;hr::Response response{};auto discover=hr::Make(hr::Command::Discover,ticket,99);
+  const auto address="127.0.0.1:"+std::to_string(b.port());
+  {kvaf::HbmReader direct(0,2,2,2048,"fake.o");kvaf::LinkId direct_id;
+    Check(direct.Attach(address,ticket,"00000000000000000000000000000002",&direct_id));
+    for(unsigned i=0;i<3;++i) {
+      Check(b.Ready(&token));
+      Check(direct.Read(direct_id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+                        {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1)));
+      Check(b.ReleaseBatch(token));
+    }
+    Check(direct.Detach(direct_id));
+  }
+  Check(hr::Exchange(address,discover,{},&response,&control));Require(control>=0 && response.reserved==1,"persistent capability negotiated");
+  const int connected=control;
+  Check(hr::Exchange(address,discover,{},&response)); // idle cached fd does not monopolize the server
+  Check(hr::Exchange(address,discover,{},&response,&control));Require(control==connected,"persistent control fd reused");
+  shutdown(control,SHUT_RDWR);
+  Require(!hr::Exchange(address,discover,{},&response,&control).ok() && control==-1,"uncertain socket discarded without automatic replay");
+  Check(hr::Exchange(address,discover,{},&response,&control));
+  // Shutdown must finish even while an idle persistent client is connected.
+  Check(b.Shutdown());close(control);
   Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers && !events,"all resources and profiling events retired");
   std::cout<<"HBM raw READ: real TCP/source/client, split spans, leases, lost ACKs and cleanup passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

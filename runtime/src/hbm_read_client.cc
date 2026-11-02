@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <unistd.h>
 
 namespace kvaf {
 namespace hr=hbm_read;
@@ -35,13 +36,15 @@ struct DeviceBuffer {
 class ReadLink final:public peer::PeerLink {
  public:
   ReadLink(std::string address,HbmReadTicket t):PeerLink(std::move(address)),ticket(t),client(detail::Nonce()){}
+  ~ReadLink() override {if(control_fd>=0)close(control_fd);}
+  int control_fd{-1};
   HbmReadTicket ticket;
   std::uint64_t client,checksum{};
   offload::Endpoint endpoint{};
   std::uint32_t channel{};
   bool opened{};
   Status Call(hr::Command command,const std::vector<hr::Span>& spans,hr::Response* response,std::uint64_t sequence=0) {
-    auto r=hr::Make(command,ticket,client);r.sequence=sequence;return hr::Exchange(address(),r,spans,response);
+    auto r=hr::Make(command,ticket,client);r.sequence=sequence;return hr::Exchange(address(),r,spans,response,&control_fd);
   }
   Status LookupRegion(std::uint64_t base,peer::PeerRegion* out)const override {
     if(!out || base!=endpoint.base || endpoint.segment_bytes!=48) return Status::InvalidArgument("invalid imported B HBM");
@@ -71,16 +74,18 @@ struct Engine {
   KvafBatchGetTransport* transport{};
   KvafBatchGetLocalBuffer* local{};
   DeviceBuffer descriptors,statuses,queues,scratch;
+  std::vector<KvafRawReadCoreStatus> host_statuses;
   std::uint32_t cores,jettys,budget;
-  bool uncertain{},kernel_finished{};
+  bool uncertain{},kernel_finished{},cache_output{};
   aclrtStream probe_stream{};
   aclrtEvent profile_start{},profile_end{};
   Engine(std::uint32_t c,std::uint32_t j,std::uint32_t b):cores(c),jettys(j),budget(b){}
   Status Cleanup() {
     if(uncertain)return Status::InDoubt("raw READ transport quarantined; source and output must remain alive");
-    if(KvafBatchGetLocalBufferDiscard(&local))return Status::InDoubt("raw READ output unregister pending");
-    auto s=descriptors.Free();if(!s.ok())return s;
-    return statuses.Free();
+    if(cache_output) {
+      KvafBatchGetLocalBufferRelease(local);local=nullptr;
+    } else if(KvafBatchGetLocalBufferDiscard(&local))return Status::InDoubt("raw READ output unregister pending");
+    return descriptors.Free();
   }
   Status QuiesceProbe() {
     if (!uncertain) return Status::OK();
@@ -96,6 +101,7 @@ struct Engine {
       *event=nullptr;
     }
     if(KvafBatchGetTransportClose(&transport))return Status::InDoubt("raw READ transport teardown pending");
+    s=statuses.Free();if(!s.ok())return s;
     s=queues.Free();if(!s.ok())return s;
     if(probe_stream) {
       if(aclrtDestroyStream(probe_stream)!=ACL_SUCCESS)return Status::InDoubt("destroy raw probe stream");
@@ -104,7 +110,7 @@ struct Engine {
     return scratch.Free();
   }
   Status RunProbe(const std::vector<hr::Span>& spans,MutableBufferView output,void* stream) {
-    if(!transport || !stream || uncertain || local || descriptors.data || statuses.data)
+    if(!transport || !stream || uncertain || local || descriptors.data)
       return Status::InvalidState("raw READ engine is not idle");
     std::vector<std::uint64_t> src,dst;std::vector<std::uint32_t> sizes;
     for(auto span:spans) {
@@ -131,26 +137,33 @@ struct Engine {
     return RunKernel(args,output,stream);
   }
   Status RunDevice(NpuInt64ArrayView src,NpuInt64ArrayView dst,NpuInt64ArrayView lengths,
-                   MutableBufferView output,void* stream,HbmReadProfile* profile) {
-    if(!transport || !stream || uncertain || local || descriptors.data || statuses.data)
+                   MutableBufferView output,void* stream,HbmReadProfile* profile,bool validate_ranges) {
+    if(!transport || !stream || uncertain || local || descriptors.data)
       return Status::InvalidState("raw READ engine is not idle");
     KvafExecuteBatchGetRawAddrKernelArgs args{};
     args.source_addresses=reinterpret_cast<std::uint64_t>(src.data);
     args.destination_addresses=reinterpret_cast<std::uint64_t>(dst.data);
     args.lengths=reinterpret_cast<std::uint64_t>(lengths.data);
     args.request_count=src.size;args.input_mode=KVAF_RAW_NPU_OFFSETS;
+    args.validate_ranges=validate_ranges;
+    cache_output=true;
     return RunKernel(args,output,stream,profile);
   }
   Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream,
                    HbmReadProfile* profile=nullptr) {
     auto s=Timed(profile?&profile->buffers_us:nullptr,[&]() -> Status {
-    auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
+    if(!statuses.data) {
+      auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
+    }
     if(!queues.data) {
-      allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
+      auto allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
     }
+    // Completion/cancellation decisions must not observe a previous batch's
+    // success record if this launch fails to write a status.
     if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
       return Status::Internal("clear raw READ status");
+    host_statuses.resize(cores);
     if(profile)for(auto* event:{&profile_start,&profile_end})
       if(!*event && aclrtCreateEventWithFlag(event,ACL_EVENT_TIME_LINE)!=ACL_SUCCESS)
         return Status::Internal("create raw READ timing event");
@@ -184,7 +197,7 @@ struct Engine {
       if(profile->kernel_event_valid)profile->kernel_event_us=static_cast<double>(ms)*1000;
     }
     ProfileTimer status_timer(profile?&profile->status_us:nullptr);
-    std::vector<KvafRawReadCoreStatus> host(cores);
+    auto& host=host_statuses;
     if(aclrtMemcpy(host.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
       return Status::InDoubt("cannot inspect raw READ completion");
     // Cancellation is safe only when EVERY core reports the same full-batch
@@ -335,7 +348,8 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
   return s;
 }
 Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
-                       NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile) {
+                       NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
+                       bool validate_ranges) {
   if(profile)*profile={};
   ProfileTimer total_timer(profile?&profile->total_us:nullptr);
   const auto validation_begin=profile?ProfileClock::now():ProfileClock::time_point{};
@@ -368,11 +382,11 @@ Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,N
   if(profile)profile->validation_us=std::chrono::duration<double,std::micro>(ProfileClock::now()-validation_begin).count();
   hr::Response response{};
   // The source service leases the identity/batch, not a Host copy of the
-  // device metadata. Each READ core validates the complete metadata before posting DMA.
+  // device metadata. Bounds diagnostics are opt-in, as on the BatchGet fast path.
   s=Timed(profile?&profile->acquire_us:nullptr,[&]{return c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence);});
   if(!s.ok()) {if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;return s;}
   c.pending=Pending::Dma;
-  s=c.engine.RunDevice(src,dst,lengths,output,stream,profile);
+  s=c.engine.RunDevice(src,dst,lengths,output,stream,profile,validate_ranges);
   if(c.engine.uncertain)return s;
   c.result=s;c.pending=Pending::Cleanup;
   return c.Resolve(profile);
@@ -384,8 +398,10 @@ Status HbmReader::Detach(LinkId id){
   auto it=impl_->connections.find(id);if(it==impl_->connections.end())return Status::NotFound("HBM region not found");
   auto& c=*it->second;
   if(c.pending!=Pending::None)return Status::InDoubt("resolve raw READ before detach");
-  s=c.engine.Close();if(!s.ok())return s;
+  // Close may destroy queues before a later MR unregister fails. Retrying
+  // teardown is safe; admitting another READ on that transport is not.
   c.ready=false;
+  s=c.engine.Close();if(!s.ok())return s;
   if(c.link->opened){hr::Response response{};s=c.link->Call(hr::Command::Close,{},&response);
     if(!s.ok() && s.code()!=StatusCode::kNotFound)return s;}
   impl_->connections.erase(it);return Status::OK();

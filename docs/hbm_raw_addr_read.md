@@ -33,9 +33,11 @@ runtime.batch_get_raw_addr(link, ready, src, dst, sizes, output, stream=a_stream
 # 成功后由应用通知 B 释放批次；所有批次结束后 runtime.detach_hbm(link)。
 ```
 
-源偏移相对于注册 HBM，目的偏移相对于 output，均以字节计。output 和三数组必须在 Runtime 所在 NPU，连续且存储不重叠；各目的段不得重叠，范围须落在注册源和 output 内。应用保证元数据在传入 stream 上就绪，并保持到完成/恢复结束。
+源偏移相对于注册 HBM，目的偏移相对于 output，均以字节计。output 和三数组必须在 Runtime 所在 NPU，连续且存储不重叠。与 BatchGet 默认路径一致，调用方负责保证源/目的范围合法及目的段互不重叠；算子不再做目的区间两两重叠检查，默认也不扫描源/目的边界。`validate_ranges=True` 可启用边界诊断，但仍不检测目的重叠。形状、元数据存储/output 别名、正长度及 WQE 拆分上限检查保留。应用保证元数据在传入 stream 上就绪，并保持到完成/恢复结束。
 
-当前只保留该 NPU Tensor 重载。成功返回 `{"state": "done", "sequence": ready.sequence}`，包含 READ 完成、输出注册清理、生产端完成确认。未决时用 `resolve_raw_addr(link)` 重试控制或清理，绝不重发 READ；`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
+当前只保留该 NPU Tensor 重载。成功返回 `{"state": "done", "sequence": ready.sequence}`，包含 READ 完成和生产端完成确认。output 按 `(地址, 字节数)` 复用 BatchGet transport 的注册缓存，每批只 Release 引用，detach/shutdown 时统一注销；状态和队列缓冲也跨批复用。Python 绑定保留各缓存 output 的 Tensor 引用直到对应 link 成功 detach 或 runtime 成功 shutdown；期间可读写内容，但不能 resize 或替换底层 storage。C++ 调用方负责保持这些缓冲区的生命周期。同一连接使用越多不同 output，缓存占用也越大，固定 output 的稳定态只注册一次。
+
+未决时用 `resolve_raw_addr(link)` 重试控制或清理，绝不重发 READ；`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
 
 可选 `profile=True` 在成功结果中增加 `profile` 字典，单位均为微秒：
 
@@ -50,19 +52,19 @@ print(result["profile"])
 | `host_total_us` | 原生 HbmReader::Read 全流程；不含 Python 绑定的参数处理和结果字典构造 |
 | `validation_us` | Host 设备、源身份、数组形状和元数据/输出重叠检查 |
 | `acquire_us` | 向生产端获取当前批次的控制请求 |
-| `buffers_us` | 状态缓冲分配/清零、首次队列分配、首次计时事件创建 |
-| `register_output_us` | 注册本卡 output，取得通信实体 |
+| `buffers_us` | 首次状态/队列分配、每批状态清零、首次计时事件创建；Host 状态数组复用 |
+| `register_output_us` | 获取缓存的 output 注册和通信实体，首次遇到该地址/长度时注册 |
 | `launch_us` | Host 提交 raw READ 算子调用 |
 | `synchronize_us` | Host 等待传入 stream 完成 |
 | `kernel_event_us` | 同一 stream 中紧邻算子前后两个设备事件之间的时间 |
 | `status_us` | 最终状态回读与检查 |
-| `cleanup_us` | 注销本批 output、释放临时状态资源 |
+| `cleanup_us` | 释放 output 注册引用；MR、通信实体和状态缓冲保留到 detach/shutdown |
 | `complete_us` | 向生产端确认本批完成 |
 | `event_record_us` / `event_query_us` | Host 提交计时事件 / 查询计时结果的开销 |
 | `host_other_us` | 原生总时间减去上述 Host 阶段的余量 |
 
 `kernel_event_us` 使用 `ACL_EVENT_TIME_LINE` 和 `aclrtEventElapsedTime`，毫秒转微秒。
-它覆盖 raw READ 算子中的整批校验、分段、WQE 提交和 CQ 等待，属于设备 stream 的事件区间，
+它覆盖 raw READ 算子中的可选边界诊断、长度统计/分段、WQE 提交和 CQ 等待，属于设备 stream 的事件区间，
 并非仅网络传输时间或各核时间的累加；也可能包含事件与设备调度开销。
 该区间与 Host 的 launch/synchronize 重叠，不能再加到 Host 阶段总和中。
 用法依据 [CANN 设备事件计时接口](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0090.html)。
@@ -74,11 +76,13 @@ print(result["profile"])
 
 ## 算子与资源
 
-raw READ V2 在同一次算子中完成整批校验、分段、WQE 提交和 CQ 等待。三数组不回传 Host，没有独立准备算子。短段直接索引，长段通过 UB 前缀表定位；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。Host 只读取最终状态。
+raw READ V2 在同一次算子中完成长度统计、分段、WQE 提交和 CQ 等待。默认不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。短段直接索引，长段通过 UB 前缀表定位；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。Host 只读取最终状态，设备状态每批清零以排除上批结果。
 
 仅建链的 all-lane 探测仍使用内部 Host 绝对地址描述符模式，不再作为公开数据读取接口。探测失败必须确认 kernel 已退出且 initiator 队列成功销毁后才能换候选。
 
 KVHR v4 控制协议只传源/连接身份和批次号，不传三数组或 payload。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和未决任务；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和批次状态。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
+
+同一个 reader 的控制请求复用 TCP 连接，双方启用 TCP_NODELAY；服务端轮询多连接，空闲连接不阻塞其他请求。服务端通过 v4 Response 的保留字段声明连接复用能力，旧服务端自动回退为单请求连接。通信结果不确定时关闭连接，由既有 resolve 流程恢复，不自动重发请求。Acquire/Complete 和同步返回继续保留，用于保证 B 的 ready/release_batch 复用时序。
 
 每批最多 4096 段、拆分后最多 1048576 个 WQE，每段 READ 最多 64 KiB；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
 
@@ -154,6 +158,7 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。CPU 服�
 - `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
 - `--max-inflight-total`：默认 2048，含义与 BatchGet 一致。
 - `--profile-warmup` / `--profile-iterations`：单独的内部计时轮次，默认 1/20；设为 `--profile-iterations 0` 即只运行未插桩的带宽测试。
+- `--validate-ranges`：打开可选源/目的边界诊断，默认关闭；不包含目的重叠检测。日志标记 `validate_ranges` 和 `output_registration_cache=1`，首次 output 注册计入 warmup（warmup 为 0 时计入测量）。
 
 输出 `NPU_HBM_BENCH_PASS` 的吞吐和分位数只使用 `--iterations` 轮的
 Python `batch_get_raw_addr()` 完整调用时间，未打开内部计时。
