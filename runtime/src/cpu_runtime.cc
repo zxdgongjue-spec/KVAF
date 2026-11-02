@@ -721,6 +721,20 @@ class CpuService {
     Log("[KVAF_CPU] CPU_PUSH_STARTED session=%llu\n", static_cast<unsigned long long>(session));
     return Result::kOk;
   }
+  Status BenchmarkCpuWrite(const peer::CpuWriteBenchmarkRequest& request,
+                           cpu_push::WriteBenchmarkResult* result) {
+    for (auto& item : regions_) {
+      auto& region = *item.second;
+      if (region.base != request.region_base) continue;
+      if (!region.push) return Status::InvalidState("WRITE benchmark requires an initialized CPU-push session");
+      Log("[KVAF_CPU] WRITE_BENCH_BEGIN bytes=%llu queues=%u mode=%u iterations=%u\n",
+          static_cast<unsigned long long>(request.options.payload_bytes), request.options.queues,
+          request.options.source_mode, request.options.iterations);
+      return region.push->BenchmarkWrite(static_cast<std::uint8_t*>(region.memory), region.base,
+                                        region.bytes, request.options, result);
+    }
+    return Status::NotFound("WRITE benchmark DDR region not found");
+  }
   Result StopCpuPushGet(uint64_t session) {
     const auto found = regions_.find(session);
     if (found == regions_.end()) return Result::kOk;
@@ -1061,6 +1075,22 @@ void HandleClient(int fd, CpuService* service) {
       response.header.command = ResponseCommand(command);
       response.result = static_cast<int32_t>(service->OpenCpuPushGet(request, &response));
       (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kCpuWriteBenchmark: {
+      peer::CpuWriteBenchmarkRequest request{};
+      request.header = header;
+      auto response = std::make_unique<peer::CpuWriteBenchmarkResponse>();
+      response->header = peer::MakeHeader(command, sizeof(*response));
+      response->header.command = peer::ResponseCommand(command);
+      Status status = Status::InvalidArgument("invalid CPU WRITE benchmark request");
+      if (IsValidHeader(header, command, sizeof(request)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header)))
+        status = service->BenchmarkCpuWrite(request, &response->benchmark);
+      response->result = static_cast<int32_t>(status.ok() ? Result::kOk : Result::kResourceError);
+      if (!status.ok())
+        std::snprintf(response->error, sizeof(response->error), "%s", status.message().c_str());
+      (void)WriteAll(fd, response.get(), sizeof(*response));
       return;
     }
     case Command::kStopGatherLanes:

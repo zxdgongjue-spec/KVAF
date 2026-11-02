@@ -44,7 +44,7 @@ void Poll(void* address);
 void Doorbell(uint32_t value, uint32_t* address);
 }  // namespace aiv_model
 
-inline struct { uint32_t x; } threadIdx;
+inline thread_local struct { uint32_t x; } threadIdx;
 enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2, PIPE_ALL };
 using event_t = uint32_t;
 inline thread_local bool model_events[4][4][3]{};
@@ -102,6 +102,7 @@ inline Counter mte2_copies, mte3_copies;
 inline Counter metadata_reads, descriptor_writes;
 inline Counter payload_cache_lines;
 inline Counter address_table_cache_lines;
+inline Counter simt_metadata_reads, simt_calls;
 inline Counter mte2_aligned_copies, mte2_tail_copies;
 inline Counter overlapped_mte2_copies;
 inline Counter out_to_ub_resets, event_waits[4][4];
@@ -148,6 +149,11 @@ inline void set_loop2_stride_ubtoout(uint64_t) {}
 inline void set_atomic_none() {}
 inline uintptr_t get_imm(uint32_t offset) {
   return reinterpret_cast<uintptr_t>(aiv_model::ub + offset);
+}
+template <class T> inline T asc_ldcg(T* source) {
+  if (!aiv_model::IsMetadata(source, sizeof(T))) std::abort();
+  ++aiv_model::simt_metadata_reads;
+  return *source;
 }
 inline void copy_ubuf_to_gm_align_v2(float* dst, float* src, uint64_t config, uint64_t) {
   std::memcpy(dst, src, config >> 25U);
@@ -298,6 +304,7 @@ namespace Simt {
 struct Dim3 { uint32_t x, y, z; };
 template <auto Function, typename... Args>
 void VF_CALL(Dim3 dim, Args... args) {
+  ++aiv_model::simt_calls;
   for (threadIdx.x = 0; threadIdx.x < dim.x; ++threadIdx.x) Function(args...);
 }
 }  // namespace Simt

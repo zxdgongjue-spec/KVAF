@@ -86,6 +86,7 @@ foreach(mode scatter gather)
   set(profile_dependencies)
   if(mode STREQUAL "scatter")
     list(APPEND profile_dependencies
+      "${KVAF_SIMT_API_DIR}/simt_api/device_functions.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/scatter_batch_get_profile.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/cpu_push_get_abi.h")
   endif()

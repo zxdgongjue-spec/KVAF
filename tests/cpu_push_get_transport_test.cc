@@ -173,6 +173,31 @@ struct TransportTest {
     // Same count with a different mode must rebuild, not reuse a marker plan.
     request(maximum, false, false);
     request(maximum, true, true);
+    if (token == 4096 && maximum == 1024) {
+      t.context_ = reinterpret_cast<urma_context_t*>(1);  // Queue mocks own the data plane.
+      for (auto mode : {0U, 1U}) for (auto queues : {1U, 2U, 4U}) {
+        WriteBenchmarkOptions options;
+        options.payload_bytes = 65536; options.source_bytes = 131072; options.seed = 23 + mode + queues;
+        options.message_bytes = 4096; options.fragment_bytes = 656; options.queues = queues;
+        options.post_batch_wrs = 2; options.warmup = 1; options.iterations = 3; options.source_mode = mode;
+        auto result = std::make_unique<WriteBenchmarkResult>();
+        posted.clear();
+        assert(t.BenchmarkWrite(source.data(), Address(source.data()), source.size(), options, result.get()).ok());
+        assert(result->count == options.iterations && t.tracker_.Empty());
+        for (const auto& wr : posted) assert(wr.destination != done_address);
+        for (std::uint32_t i = 0; i < result->count; ++i)
+          assert(result->samples[i].tail_cqes == queues && result->samples[i].comm_ns >=
+                 result->samples[i].post_ns + result->samples[i].cq_wait_ns);
+        for (std::uint64_t offset = 0; offset < options.payload_bytes; offset += 8) {
+          const auto source_offset = mode ? WriteBenchmarkMix(options.seed + offset / options.fragment_bytes) %
+              (options.source_bytes / options.fragment_bytes) * options.fragment_bytes + offset % options.fragment_bytes : offset;
+          std::uint64_t actual;
+          std::memcpy(&actual, hbm.data() + t.layout_.staging + offset, 8);
+          assert(actual == WriteBenchmarkMix(options.seed + source_offset / 8));
+        }
+      }
+      t.context_ = nullptr;
+    }
     // A bad CQ still fails the payload and must never publish successful done.
     posted.clear(); fail_cq = true;
     assert(!t.WriteBatch().ok());

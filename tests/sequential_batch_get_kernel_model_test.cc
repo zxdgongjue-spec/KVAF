@@ -32,6 +32,9 @@ constexpr std::array<uint32_t, 4> kScatterOptions{
     kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild,
     kvaf::kScatterOptionsV1 | kvaf::kScatterDoubleBuffer,
     kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterDoubleBuffer};
+constexpr std::array<uint32_t, 6> kCheckedScatterOptions{
+    kScatterOptions[0], kScatterOptions[1], kScatterOptions[2], kScatterOptions[3],
+    kScatterOptions[1] | kvaf::kScatterSimtBuild, kScatterOptions[3] | kvaf::kScatterSimtBuild};
 // Test fixture only; production launch ABIs are independent.
 struct ModelArgs {
   KvafExecuteBatchGetKernelArgs request;
@@ -421,7 +424,7 @@ int main() {
       }
   // A late invalid row can leave private partial descriptors in fused mode,
   // but must never publish a new notify or let CPU dereference that list.
-  for (const auto options : kScatterOptions)
+  for (const auto options : kCheckedScatterOptions)
     for (uint32_t workers : {1U, 3U, 8U})
       for (uint32_t field = 0; field < 8; ++field) {
         Fixture f(65, 656, workers, KVAF_SEQ_SCATTER, 6);
@@ -481,7 +484,7 @@ int main() {
     small_workspace.Run(false);
     assert(!small_workspace.push_requests);
   }
-  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 16U,
+  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 32U,
                              kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     invalid.args.reserved = options; invalid.Run(false);
@@ -491,9 +494,10 @@ int main() {
     Fixture legacy(65, 656, 1, KVAF_SEQ_SCATTER, 6);
     legacy.args.reserved = 0; legacy.Run();
   }
-  // Reference-sized sparse tables use indexed DMA with no scalar table DCCI,
-  // including changing table contents at the same address between invocations.
-  for (const bool trusted : {false, true})
+  // Both builders handle reference-sized sparse tables and changing table
+  // contents at the same address, without scalar table DCCI.
+  for (const bool simt : {false, true})
+    for (const bool trusted : {false, true})
     for (uint32_t workers : {1U, 4U, 8U}) {
       Fixture f(1024, 31, workers, KVAF_SEQ_SCATTER, 6);
       constexpr uint32_t table_capacity = 1277952;
@@ -503,6 +507,7 @@ int main() {
       f.args.request.address_table = Address(f.addresses.data());
       f.args.request.valid_table = Address(f.valid.data());
       if (trusted) f.args.reserved |= kvaf::kScatterTrustedInputs;
+      if (simt) f.args.reserved |= kvaf::kScatterSimtBuild;
       for (uint32_t i = 0; i < f.count; ++i)
         f.indices[i] = (i * 1237U + 37U) % table_capacity;
       for (uint32_t count : {0U, 1U, 7U, 255U, 256U, 257U, 1024U, 19U}) {
@@ -512,6 +517,7 @@ int main() {
               uint64_t((i + f.args.sequence) % f.count) * f.token * 2;
         const auto flushed = aiv_model::address_table_cache_lines;
         const auto reads = aiv_model::metadata_reads;
+        const auto simt_reads = aiv_model::simt_metadata_reads;
         f.Run();
         assert(aiv_model::address_table_cache_lines == flushed);
         uint64_t tiles = 0;
@@ -519,9 +525,11 @@ int main() {
         for (uint32_t core = 0; core < workers; ++core) {
           const auto begin = uint64_t(groups) * core / workers * 8;
           const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-          tiles += (end - begin + kBuildTileRows - 1) / kBuildTileRows;
+          const auto tile_rows = simt ? kSimtBuildRows : kBuildTileRows;
+          tiles += (end - begin + tile_rows - 1) / tile_rows;
         }
-        assert(aiv_model::metadata_reads - reads == count * (trusted ? 1 : 2) + tiles * (trusted ? 2 : 3));
+        assert(aiv_model::metadata_reads - reads == (simt ? 0 : count * (trusted ? 1 : 2) + tiles * (trusted ? 2 : 3)));
+        assert(aiv_model::simt_metadata_reads - simt_reads == (simt ? count * (trusted ? 3 : 5) : 0));
       }
       if (!trusted) {
         f.Next(1);
@@ -533,6 +541,31 @@ int main() {
         assert(f.push_requests == notified);
       }
     }
+  // SIMT tile boundaries through the complete CPU-push/scatter flow, including
+  // 8192 requests on four cores (one vector call and one descriptor DMA/core).
+  for (const bool trusted : {false, true})
+    for (const bool double_buffer : {false, true})
+      for (uint32_t workers : {1U, 4U, 8U}) {
+        Fixture f(8193, 31, workers, KVAF_SEQ_SCATTER, 6);
+        f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterSimtBuild |
+            (trusted ? kvaf::kScatterTrustedInputs : 0U) |
+            (double_buffer ? kvaf::kScatterDoubleBuffer : 0U);
+        for (uint32_t count : {0U, 1U, 255U, 256U, 4095U, 4096U, 4097U, 8192U, 8193U, 7U}) {
+          f.Next(count);
+          const auto calls = aiv_model::simt_calls;
+          const auto writes = aiv_model::descriptor_writes;
+          uint64_t tiles = 0;
+          const auto groups = (count + 7U) / 8U;
+          for (uint32_t core = 0; core < workers; ++core) {
+            const auto begin = uint64_t(groups) * core / workers * 8;
+            const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
+            tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
+          }
+          f.Run();
+          assert(aiv_model::simt_calls - calls == tiles);
+          assert(aiv_model::descriptor_writes - writes == tiles);
+        }
+      }
   // Trusted callers skip row/valid checks in the builder. Exercise the real
   // launch with changing addresses/prefixes and both cached/fallback tables;
   // output guards, done, all-core status and DMA completion remain required.
@@ -560,7 +593,8 @@ int main() {
         }
       }
   for (const auto options : {0U, kScatterOptions[0], kScatterOptions[1],
-                             kScatterOptions[2], kScatterOptions[3]})
+                             kScatterOptions[2], kScatterOptions[3],
+                             kScatterOptions[3] | kvaf::kScatterSimtBuild})
     for (uint32_t workers : {1U, 3U, 8U}) {
       Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
       f.status.resize(workers * 3); // 64-byte statuses + 128-byte records.

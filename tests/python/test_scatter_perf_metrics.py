@@ -80,6 +80,10 @@ class ScatterPerfTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             args = arguments([])
             self.assertEqual((args.fused_build, args.double_buffer), (1, 1))
+            self.assertEqual(args.simt_build, 1)
+        with patch.dict("os.environ", {"KVAF_SCATTER_SIMT_BUILD": "0"}):
+            self.assertEqual(arguments([]).simt_build, 0)
+            self.assertEqual(arguments(["--simt-build", "1"]).simt_build, 1)
         with patch.dict("os.environ", {"KVAF_SCATTER_FUSED_BUILD": "1",
                                       "KVAF_SCATTER_DOUBLE_BUFFER": "1"}):
             args = arguments([])
@@ -92,7 +96,7 @@ class ScatterPerfTests(unittest.TestCase):
                                       "KVAF_SCATTER_DOUBLE_BUFFER": "0"}):
             args = arguments([])
             self.assertEqual((args.fused_build, args.double_buffer), (0, 0))
-        for name in ("KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER"):
+        for name in ("KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER", "KVAF_SCATTER_SIMT_BUILD"):
             with patch.dict("os.environ", {name: "ON"}), \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 arguments([])

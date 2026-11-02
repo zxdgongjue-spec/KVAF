@@ -44,7 +44,9 @@ def arguments(argv=None):
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--cores", type=int, default=1)
     parser.add_argument("--fused-build", type=int, choices=(0, 1),
-                        help="parallel UB source-list build (0: serial two-pass); default: KVAF_SCATTER_FUSED_BUILD or 1")
+                        help="parallel source-list build (0: serial two-pass); default: KVAF_SCATTER_FUSED_BUILD or 1")
+    parser.add_argument("--simt-build", type=int, choices=(0, 1),
+                        help="parallel SIMT list builder (0: UB/DMA); default: KVAF_SCATTER_SIMT_BUILD or 1")
     parser.add_argument("--double-buffer", type=int, choices=(0, 1),
                         help="runtime UB overlap; default: KVAF_SCATTER_DOUBLE_BUFFER or 1")
     parser.add_argument("--blocks", type=int, default=1024)
@@ -70,7 +72,7 @@ def arguments(argv=None):
     parser.add_argument("--json", type=Path)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
-    for field in ("fused_build", "double_buffer"):
+    for field in ("fused_build", "double_buffer", "simt_build"):
         if getattr(args, field) is None:
             name = "KVAF_SCATTER_" + field.upper()
             value = os.environ.get(name, "1")
@@ -267,6 +269,7 @@ def main(argv=None):
         # CLI overrides the environment. Host snapshots these during initialize;
         # baseline/profiled phases then use the same algorithms and binary.
         os.environ["KVAF_SCATTER_FUSED_BUILD"] = str(args.fused_build)
+        os.environ["KVAF_SCATTER_SIMT_BUILD"] = str(args.simt_build)
         os.environ["KVAF_SCATTER_DOUBLE_BUFFER"] = str(args.double_buffer)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()

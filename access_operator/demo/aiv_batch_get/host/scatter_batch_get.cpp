@@ -226,14 +226,16 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.config.aiv_batch_get_mode != "cpu_push_scatter" ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
-  bool fused_build, double_buffer;
+  bool fused_build, double_buffer, simt_build;
   auto result = ReadSwitch("KVAF_SCATTER_FUSED_BUILD", &fused_build);
   if (!result.ok()) return result;
   result = ReadSwitch("KVAF_SCATTER_DOUBLE_BUFFER", &double_buffer);
   if (!result.ok()) return result;
+  result = ReadSwitch("KVAF_SCATTER_SIMT_BUILD", &simt_build);
+  if (!result.ok()) return result;
   // Read once per initialization, never from the timed Execute path.
   s.args.reserved = kScatterOptionsV1 | (fused_build ? kScatterFusedBuild : 0U) |
-      (double_buffer ? kScatterDoubleBuffer : 0U);
+      (double_buffer ? kScatterDoubleBuffer : 0U) | (simt_build ? kScatterSimtBuild : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
@@ -258,9 +260,9 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u build=%s\n",
-               unsigned(fused_build), unsigned(double_buffer),
-               fused_build ? "parallel_ub" : "serial_two_pass");
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u simt_build=%u build=%s\n",
+               unsigned(fused_build), unsigned(double_buffer), unsigned(simt_build),
+               fused_build ? (simt_build ? "parallel_simt" : "parallel_ub") : "serial_two_pass");
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {

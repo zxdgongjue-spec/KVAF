@@ -184,6 +184,7 @@ int main() {
   using namespace kvaf;
   unsetenv("KVAF_SCATTER_FUSED_BUILD");
   unsetenv("KVAF_SCATTER_DOUBLE_BUFFER");
+  unsetenv("KVAF_SCATTER_SIMT_BUILD");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -269,7 +270,7 @@ int main() {
     exec.execution.synchronize = true;
     assert(owner->Execute(exec).ok()); assert(completed == before + 3);
     assert(async_memsets == memsets_before); // No extra device task per call.
-    assert(launch_options.back() == (kScatterOptionsV1 | kScatterFusedBuild | kScatterDoubleBuffer));
+    assert(launch_options.back() == (kScatterOptionsV1 | kScatterFusedBuild | kScatterDoubleBuffer | kScatterSimtBuild));
     capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
     count = 0; assert(owner->Execute(exec).ok()); count = 1;
     assert(owner->Shutdown().ok()); assert(owner->Shutdown().ok());
@@ -383,18 +384,21 @@ int main() {
     assert(owner->Execute(exec).ok()); assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
   }
-  // The same Host/ABI serves all four choices. Environment changes after
+  // The same Host/ABI serves all runtime choices. Environment changes after
   // initialize cannot change an in-flight runtime; profile toggles retain them.
   for (int fused : {0, 1})
-    for (int double_buffer : {0, 1}) {
+    for (int double_buffer : {0, 1})
+      for (int simt : {0, 1}) {
       setenv("KVAF_SCATTER_FUSED_BUILD", fused ? "1" : "0", 1);
       setenv("KVAF_SCATTER_DOUBLE_BUFFER", double_buffer ? "1" : "0", 1);
+      setenv("KVAF_SCATTER_SIMT_BUILD", simt ? "1" : "0", 1);
       const auto expected = kScatterOptionsV1 | (fused ? kScatterFusedBuild : 0U) |
-          (double_buffer ? kScatterDoubleBuffer : 0U);
+          (double_buffer ? kScatterDoubleBuffer : 0U) | (simt ? kScatterSimtBuild : 0U);
       auto owner = CreateSequentialBatchGet(config);
       assert(owner->Initialize(region).ok());
       setenv("KVAF_SCATTER_FUSED_BUILD", fused ? "0" : "1", 1);
       setenv("KVAF_SCATTER_DOUBLE_BUFFER", double_buffer ? "0" : "1", 1);
+      setenv("KVAF_SCATTER_SIMT_BUILD", simt ? "0" : "1", 1);
       std::vector<ScatterBatchGetCoreProfile> profiles;
       assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
       assert(launch_options.back() == expected);
@@ -410,13 +414,14 @@ int main() {
       // A fresh initialize reads the changed options.
       assert(owner->Initialize(region).ok());
       assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
-      assert(launch_options.back() == (expected ^ (kScatterFusedBuild | kScatterDoubleBuffer)));
+      assert(launch_options.back() == (expected ^ (kScatterFusedBuild | kScatterDoubleBuffer | kScatterSimtBuild)));
       assert(owner->Shutdown().ok());
       assert(!refs && !allocations && !hccp_refs);
     }
   unsetenv("KVAF_SCATTER_FUSED_BUILD");
   unsetenv("KVAF_SCATTER_DOUBLE_BUFFER");
-  for (const auto* name : {"KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER"})
+  unsetenv("KVAF_SCATTER_SIMT_BUILD");
+  for (const auto* name : {"KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER", "KVAF_SCATTER_SIMT_BUILD"})
     for (const auto* value : {"", "ON", "2"}) {
       setenv(name, value, 1);
       auto owner = CreateSequentialBatchGet(config);

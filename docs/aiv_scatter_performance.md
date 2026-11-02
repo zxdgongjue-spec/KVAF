@@ -29,12 +29,21 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 
 ## 清单构建与 UB 流水版本对比
 
-当前默认启用**多核 UB 单遍清单构建**，以及两个各 32 KiB 的静态 UB bank，总计 64 KiB。
+当前默认启用**多核 SIMT 单遍清单构建**，以及两个各 32 KiB 的 payload UB bank，总计 64 KiB。
 656 B 的 UB 行距为 672 B，每批最多 32 行；4096 B 每批 8 行。
 每批一次多块 GM→UB，按映射连续发出精确长度的 UB→output。
 只在 bank 复用前等待该 bank 写完，使下一批输入与上一批写出重叠；末尾等待两个 bank 全部完成。
 尾批按实际行数搬运，超过 32 KiB 的单行使用原有精确分段路径。
 清单构建按 8 条地址（64 B）分组分给各核，避免两个核写同一缓存行。
+SIMT 路径每核启动 256 个线程并行读 index/offset、查地址表、加偏移，直接生成紧凑的 UB 清单，
+每批最多 4096 条。8192 项、4 核时，每核 2048 项，只需一次 VF 调用和一次 16 KiB descriptor DMA。
+输入通过 `asc_ldcg` 绕过核私有 SIMT DCache，防止同地址请求/表内容更新后读到旧值；
+该接口从共享 L2 或 GM 加载，见 [asc_ldcg](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910beta2/API/ascendcopapi/atlasascendc_api_07_10556.html)。
+检查路径仍先检查 index/offset/output row，再读 valid 和源地址，线程失败标志归并后不发布 notify。
+可信输入路径不读 valid/output row、不归并失败标志；VF→MTE3 与清单写回完成等待始终保留。
+SIMT 构建使用 32 KiB 清单槽和 1 KiB 检查槽，复用已有 UB，不额外扩张静态 UB 预算。
+
+`--simt-build 0` 保留上一版 UB/DMA 构建作为同二进制对照：
 每核按 256 条一批把 index/offset 搬入 UB 并生成源地址；检查路径另加载 output row。
 再一次 DMA 写回这批 descriptor。1024 项、4 核时每核构建 256 项。
 地址表不超过 4096 项时，每个参与核将 address 表批量载入 UB（检查路径另加载 valid）；更大的表
@@ -62,25 +71,46 @@ staging payload 仅通过 DMA 读取并禁用 L2 cache，去掉搬运前逐 64 B
 这些构建完成标记位于 CPU layout 后的私有尾部，不能省略。
 仍在整批 CPU done 后开始 scatter，现有 CPU/AIV 计时边界可以直接对比。
 
-两项改动使用**测试时开关**，默认均为 1，同一 Host 和 kernel 二进制支持四种组合：
+三项选择均使用**测试时开关**，默认均为 1，同一 Host 和 kernel 二进制支持下列组合：
 
-| 版本 | `--fused-build` | `--double-buffer` |
-| --- | --- | --- |
-| reference：两遍清单、单 bank | 0 | 0 |
-| fused：多核 UB 单遍清单、单 bank | 1 | 0 |
-| double：两遍清单、双 bank | 0 | 1 |
-| both：多核 UB 单遍清单、双 bank | 1 | 1 |
+| 版本 | `--fused-build` | `--simt-build` | `--double-buffer` |
+| --- | --- | --- | --- |
+| reference：两遍清单、单 bank | 0 | 忽略 | 0 |
+| double：两遍清单、双 bank | 0 | 忽略 | 1 |
+| UB 单遍清单、单 bank | 1 | 0 | 0 |
+| UB 单遍清单、双 bank | 1 | 0 | 1 |
+| SIMT 单遍清单、单 bank | 1 | 1 | 0 |
+| SIMT 单遍清单、双 bank（默认） | 1 | 1 | 1 |
 
-测试参数覆盖同名环境变量 `KVAF_SCATTER_FUSED_BUILD`、`KVAF_SCATTER_DOUBLE_BUFFER`，
+测试参数覆盖同名环境变量 `KVAF_SCATTER_FUSED_BUILD`、`KVAF_SCATTER_DOUBLE_BUFFER`、`KVAF_SCATTER_SIMT_BUILD`，
 未传参数时使用环境变量，否则默认 1；只接受 0/1。
 Host 在 `initialize()` 读取一次，之后修改环境变量不影响当前实例；需 shutdown 后重新初始化。
-初始化日志包含 `SCATTER_OPTIONS version=1 fused_build=... double_buffer=... build=parallel_ub`
-（关闭时为 `build=serial_two_pass`），确认实际选项。
+初始化日志包含 `SCATTER_OPTIONS ... simt_build=... build=parallel_simt`，
+UB 对照为 `build=parallel_ub`，关闭 fused 时为 `build=serial_two_pass`。
 flags 通过现有 176 B 参数的 reserved 字传入，使用新版标签并独立保留 profile bit；
 不改 Python/C++ 方法签名或计时窗口。
-本次需同时重编译 NPU Host 和 kernel：Host 为每核新增一个私有完成缓存行。
-之后切换组合不需重编译。下述控制路径优化需要同时重编译并重启 CPU 服务。
+本次需同时重编译 NPU Host 和 kernel，以识别 reserved 中的 SIMT 位。
+之后切换组合不需重编译；本次 SIMT 改动不要求更新 CPU 服务。
 旧 zero/profile-only 参数仍选择两遍清单、单 bank；构建/测试时应始终使用配套 Host 和 kernel。
+
+针对 8192 requests、4 核的大表场景，直接在完整 E2E 中比较 SIMT 和现有 UB 构建。
+`simt_build` 写入 JSON config 和 plan 中的命令，样本 CSV 仍保持 32 列；A/B 使用不同输出目录。
+build_notify 的起止点仍是 inputs_ready 到真实 notify 发布，包含 VF、清单写回和各核完成等待。
+以 build_notify 的 p50/p99 是否低于 50 us、以及 E2E 是否降低验收，不能只依据指令数判断收益。
+
+```bash
+# 重编 Host 与 kernel；两轮对照使用同一份二进制、同一 CPU 服务配置。
+cmake --build build-npu -j
+for simt in 0 1; do
+  DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+  bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+    --token-sizes 656,4096 --miss-counts 8192 --core-counts 4 \
+    --fused-build 1 --double-buffer 1 --simt-build "$simt" \
+    --warmup 100 --iterations 100 --case-timeout 1800 \
+    --npu-eids 000000000000020000100000df00e100 --peer-ub-device udmac0d1e2 \
+    --output-dir "results/scatter-build-simt-${simt}"
+done
+```
 
 所有运行时组合均保留最多 64 KiB 的静态 UB 地址范围；payload 单 bank 使用前 32 KiB，
 开启 fused build 时构建阶段会复用前 41 KiB。
@@ -105,7 +135,7 @@ for variant in reference fused double both; do
     both)      fused=1; double=1 ;;
   esac
   bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
-      --fused-build "$fused" --double-buffer "$double" \
+      --fused-build "$fused" --double-buffer "$double" --simt-build 0 \
       --cores 4 --workload full-blocks --input-mode changing \
       --blocks 1024 --tokens-per-block 4 --token-bytes 4096 \
       --request-length 8192 --miss-count 1024 \
