@@ -16,10 +16,18 @@ __aicore__ inline void Flush(uint64_t address, uint64_t bytes) {
 }
 __aicore__ inline uint64_t LoadWord(uint64_t address) {
   Flush(address, 8);
+#ifdef KVAF_AIV_MODEL
+  return aiv_model::AtomicLoadWord(address);
+#else
   return *reinterpret_cast<__gm__ volatile uint64_t*>(address);
+#endif
 }
 __aicore__ inline void PublishWord(uint64_t address, uint64_t value) {
+#ifdef KVAF_AIV_MODEL
+  aiv_model::AtomicStoreWord(address, value);
+#else
   *reinterpret_cast<__gm__ uint64_t*>(address) = value;
+#endif
   Flush(address, 8);
 }
 __aicore__ inline bool Range(uint64_t base, uint64_t bytes, uint64_t address, uint64_t n) {

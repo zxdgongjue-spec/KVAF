@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 #include "kernel_operator.h"
@@ -103,6 +105,7 @@ struct Fixture {
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
+  std::mutex poll_mutex;
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
@@ -133,7 +136,8 @@ struct Fixture {
     r.output_rows = n * 2 + 2; r.token_bytes = bytes; r.tokens_per_block = 2;
     r.block_count = cores; r.core_status = Address(status.data());
     r.queue_state = Address(states.data());
-    args.mode = mode; args.sequence = 1; args.sgl_size = sgl; args.max_polls = 64;
+    args.mode = mode; args.sequence = 1; args.sgl_size = sgl;
+    args.max_polls = mode == KVAF_SEQ_SCATTER && cores > 1 ? 100000 : 64;
     if (mode == KVAF_SEQ_SCATTER) args.reserved = kScatterOptions.back();
     args.source_base = Address(remote.data()); args.source_bytes = source_bytes;
     args.lane_descriptor_bytes = lane_descriptor; args.lane_staging_bytes = lane_staging;
@@ -142,7 +146,8 @@ struct Fixture {
     args.remote_control = Address(remote.data()) + control_offset;
     args.descriptor_offset = mode == KVAF_SEQ_SCATTER ? 192 + cores * 64 : cores * 64;
     args.staging_offset = Align(args.descriptor_offset + n * 8ULL);
-    args.workspace_bytes = mode == KVAF_SEQ_SCATTER ? args.staging_offset + n * uint64_t(bytes) + 64 :
+    args.workspace_bytes = mode == KVAF_SEQ_SCATTER ?
+        Align(args.staging_offset + n * uint64_t(bytes)) + uint64_t(cores + 1) * 64 :
         args.descriptor_offset + cores * lane_descriptor;
     // Match the cache-line alignment of real registered DDR/HBM allocations.
     workspace.resize(args.workspace_bytes);
@@ -162,15 +167,21 @@ struct Fixture {
   }
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
   void Poll(void* p) {
+    std::lock_guard<std::mutex> lock(poll_mutex);
     if (args.mode != KVAF_SEQ_SCATTER || Address(p) < (args.workspace & ~uint64_t(63)) ||
         Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
     auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(workspace.data());
-    uint64_t notify; std::memcpy(&notify, workspace.data() + 64, 8);
+    const auto notify = aiv_model::AtomicLoadWord(args.workspace + 64);
     if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
     CheckGuard();
     if (timeout || ++push_polls < 4) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
     assert(request->count == uint32_t(active));
+    if (kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterFusedBuild)) {
+      const auto base = args.workspace + args.workspace_bytes - uint64_t(workers + 1) * 64;
+      for (uint32_t core = 0; core < workers; ++core)
+        assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
+    }
     const auto* src = reinterpret_cast<const uint64_t*>(workspace.data() + args.descriptor_offset);
     for (uint32_t i = 0; i < uint32_t(active); ++i)
       std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
@@ -181,8 +192,8 @@ struct Fixture {
       const uint64_t report[] = {kvaf::cpu_push::ProfileToken(args.sequence), 11, 22, 1000, 800, 200, 500};
       std::memcpy(workspace.data() + 136, report, sizeof(report));
     }
-    std::memcpy(workspace.data() + 128, &done, 8);
     push_done = true; ++push_requests;
+    aiv_model::AtomicStoreWord(args.workspace + 128, done);
   }
   void Doorbell(uint32_t value, uint32_t* p) {
     for (uint32_t q = 0; q < workers * 2; ++q) {
@@ -249,27 +260,59 @@ struct Fixture {
   }
   void Run(bool success = true, bool allow_partial = false) {
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
-    if (args.mode == KVAF_SEQ_SCATTER) {
-      aiv_model::mte2_source_begin = args.workspace + args.staging_offset;
-      aiv_model::mte2_source_end = aiv_model::mte2_source_begin +
-          uint64_t(std::max(active, 0)) * token;
-    }
+    const auto payload_cache_lines = aiv_model::payload_cache_lines;
     expected = output;
     if (success && active >= 0) for (int32_t i = 0; i < active; ++i)
       std::memcpy(expected.data() + uint64_t(rows[i]) * token,
                   reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), token);
-    for (uint32_t core = 0; core < workers; ++core) {
+    auto run_core = [&](uint32_t core) {
       aiv_model::core = core;
+      if (args.mode == KVAF_SEQ_SCATTER) {
+        std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
+        aiv_model::mte2_source_begin = args.workspace + args.staging_offset;
+        aiv_model::mte2_source_end = aiv_model::mte2_source_begin +
+            uint64_t(std::max(active, 0)) * token;
+        // Exact active prefixes: invalid capacity suffixes cannot be DMA-read.
+        const auto prefix = uint64_t(std::max(active, 0)) * 4;
+        aiv_model::metadata_sources = {
+            {args.request.indices, args.request.indices + prefix},
+            {args.request.offsets, args.request.offsets + prefix},
+            {args.request.output_indices, args.request.output_indices + prefix},
+            {args.request.address_table, args.request.address_table + uint64_t(count) * 8},
+            {args.request.valid_table, args.request.valid_table + count}};
+        aiv_model::descriptor_begin = args.workspace + args.descriptor_offset;
+        aiv_model::descriptor_end = aiv_model::descriptor_begin + prefix * 2;
+      }
       Launch(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
       assert((status[core].result == KVAF_SEQ_OK) == success);
+      assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
+      if (args.mode == KVAF_SEQ_SCATTER) {
+        const auto payload_ub = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterDoubleBuffer) ?
+            kTileBufferBytes : kTileBytes;
+        const auto used_ub = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterFusedBuild) ?
+            std::max(payload_ub, kBuildBufferBytes) : payload_ub;
+        assert(std::all_of(aiv_model::ub + used_ub, aiv_model::ub + sizeof(aiv_model::ub),
+                           [](uint8_t byte) { return byte == 0xe9; }));
+      }
+      aiv_model::metadata_sources.clear();
+      aiv_model::descriptor_begin = aiv_model::descriptor_end = 0;
+      aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
+    };
+    if (args.mode == KVAF_SEQ_SCATTER && workers > 1) {
+      // Actual concurrent builders: core 0 may only notify after every worker
+      // has completed its disjoint descriptor DMA and published this sequence.
+      std::vector<std::thread> threads;
+      for (uint32_t core = 0; core < workers; ++core) threads.emplace_back(run_core, core);
+      for (auto& thread : threads) thread.join();
+    } else {
+      for (uint32_t core = 0; core < workers; ++core) run_core(core);
     }
-    aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
     if (args.mode == KVAF_SEQ_GATHER) {
       assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
       assert(!push_requests);
-    }
+    } else assert(aiv_model::payload_cache_lines == payload_cache_lines);
     if (success) assert(output == expected);
     else if (!allow_partial) CheckGuard();
   }
@@ -339,6 +382,8 @@ int main() {
           const auto writes = aiv_model::mte3_copies;
           const auto waits = aiv_model::event_waits[PIPE_MTE3][PIPE_S];
           const auto input_waits = aiv_model::event_waits[PIPE_MTE2][PIPE_S];
+          const auto metadata_reads = aiv_model::metadata_reads;
+          const auto descriptor_writes = aiv_model::descriptor_writes;
           const auto overlapped = aiv_model::overlapped_mte2_copies;
           f.Run();
           if (bytes <= kTileBytes) {
@@ -351,49 +396,88 @@ int main() {
               tiles += core_tiles;
               if (double_buffer && core_tiles) overlapping_inputs += core_tiles - 1;
             }
-            assert(aiv_model::mte2_copies - reads == tiles);
-            assert(aiv_model::mte3_copies - writes == count);
-            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == tiles);
-            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] == input_waits);
+            uint64_t builders = 0, build_tiles = 0;
+            if (kvaf::ScatterOptionEnabled(options, kvaf::kScatterFusedBuild)) {
+              const auto groups = (count + 7U) / 8U;
+              for (uint32_t core = 0; core < workers; ++core) {
+                const auto begin = uint64_t(groups) * core / workers * 8;
+                const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
+                if (end > begin) { ++builders; build_tiles += (end - begin + kBuildTileRows - 1) / kBuildTileRows; }
+              }
+            }
+            assert(aiv_model::metadata_reads - metadata_reads == builders * 2 + build_tiles * 3);
+            assert(aiv_model::descriptor_writes - descriptor_writes == build_tiles);
+            assert(aiv_model::mte2_copies - reads == tiles + builders * 2 + build_tiles * 3);
+            assert(aiv_model::mte3_copies - writes == count + build_tiles);
+            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == tiles + build_tiles);
+            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - input_waits == builders + build_tiles);
             assert(aiv_model::overlapped_mte2_copies - overlapped == overlapping_inputs);
           }
           assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
-          const auto used_ub = double_buffer ? kTileBufferBytes : kTileBytes;
-          assert(std::all_of(aiv_model::ub + used_ub,
-                             aiv_model::ub + sizeof(aiv_model::ub),
-                             [](uint8_t byte) { return byte == 0xe9; }));
         }
       }
   // A late invalid row can leave private partial descriptors in fused mode,
   // but must never publish a new notify or let CPU dereference that list.
   for (const auto options : kScatterOptions)
     for (uint32_t workers : {1U, 3U, 8U})
-      for (uint32_t field = 0; field < 5; ++field) {
+      for (uint32_t field = 0; field < 8; ++field) {
         Fixture f(65, 656, workers, KVAF_SEQ_SCATTER, 6);
         f.args.reserved = options;
         f.Run();
         const auto requests = f.push_requests;
-        const auto* descriptors = reinterpret_cast<const uint64_t*>(f.workspace.data() + f.args.descriptor_offset);
-        const auto previous_first = descriptors[0];
         f.Next(65);
         if (field == 0) f.indices.back() = f.count;
         if (field == 1) f.offsets.back() = f.token + 1;
         if (field == 2) f.rows.back() = f.args.request.output_rows;
         if (field == 3) f.valid[f.indices.back()] = 0;
         if (field == 4) f.addresses[f.indices.back()] = f.args.source_base + f.args.source_bytes;
+        if (field == 5) f.indices.back() = -1;
+        if (field == 6) f.offsets.back() = -1;
+        if (field == 7) f.rows.back() = -1;
         const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+        const auto metadata_reads = aiv_model::metadata_reads;
+        const auto descriptor_writes = aiv_model::descriptor_writes;
         f.Run(false);
         assert(f.push_requests == requests);
-        assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
+        // Other builders may finish private tiles; no payload may be touched.
+        assert(aiv_model::mte2_copies - reads == aiv_model::metadata_reads - metadata_reads);
+        assert(aiv_model::mte3_copies - writes == aiv_model::descriptor_writes - descriptor_writes);
         assert(*reinterpret_cast<const uint64_t*>(f.workspace.data() + 64) != f.args.sequence);
         for (const auto& status : f.status) assert(status.result == KVAF_SEQ_INVALID);
-        if (field == 0) {
-          const bool fused = kvaf::ScatterOptionEnabled(options, kvaf::kScatterFusedBuild);
-          const auto current_first = f.addresses[f.indices[0]] + uint64_t(f.offsets[0]);
-          assert(current_first != previous_first);
-          assert(descriptors[0] == (fused ? current_first : previous_first));
-        }
       }
+  // UB tile boundaries and the table cache/fallback boundary, through full
+  // BatchGet including CPU service and changing metadata at the same addresses.
+  for (uint32_t capacity : {1024U, 4096U, 4097U})
+    for (uint32_t workers : {1U, 4U, 8U}) {
+      Fixture f(capacity, 31, workers, KVAF_SEQ_SCATTER, 6);
+      for (uint32_t count : {1U, 7U, 255U, 256U, 257U, 1023U, 1024U}) {
+        f.Next(count); f.Run();
+        // Change offsets and output maps as well as payload/indices.
+        for (auto& offset : f.offsets) offset = f.token - offset;
+        std::reverse(f.rows.begin(), f.rows.end());
+      }
+      f.Next(capacity); f.Run();
+    }
+  {
+    // A missing builder must time out without ever notifying CPU. Workers that
+    // arrive afterwards observe the failure; their ready flags cannot revive it.
+    Fixture stalled(65, 656, 4, KVAF_SEQ_SCATTER, 6);
+    stalled.args.max_polls = 2;
+    aiv_model::core = 0; Launch(stalled.args);
+    assert(stalled.status[0].result == KVAF_SEQ_TIMEOUT);
+    for (uint32_t core = 1; core < stalled.workers; ++core) {
+      aiv_model::core = core; Launch(stalled.args);
+      assert(stalled.status[core].result == KVAF_SEQ_INVALID);
+    }
+    assert(!stalled.push_requests);
+    stalled.CheckGuard();
+  }
+  {
+    Fixture small_workspace(65, 31, 4, KVAF_SEQ_SCATTER, 6);
+    small_workspace.args.workspace_bytes = small_workspace.args.staging_offset + 64;
+    small_workspace.Run(false);
+    assert(!small_workspace.push_requests);
+  }
   for (const auto options : {2U, kvaf::kScatterOptionsV1 | 8U,
                              kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);

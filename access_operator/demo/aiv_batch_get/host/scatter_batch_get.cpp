@@ -107,8 +107,9 @@ struct ScatterBatchGet::Impl {
     if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout))
       return Status::InvalidArgument("invalid scatter workspace shape");
     args.descriptor_offset = layout.descriptor; args.staging_offset = layout.staging;
-    // Last private line is an AIV-owned build failure marker, outside CPU layout.
-    args.workspace_bytes = layout.bytes + 64;
+    // Private AIV build-ready lines plus the shared failure line. CPU layout
+    // and the request/notify/done protocol remain unchanged.
+    args.workspace_bytes = layout.bytes + uint64_t(config.npu_core_count + 1) * 64;
     if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
         aclrtMemset(workspace, args.workspace_bytes, 0, args.workspace_bytes) != ACL_SUCCESS)
       return Error("allocate scatter workspace");
@@ -246,8 +247,9 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u\n",
-               unsigned(fused_build), unsigned(double_buffer));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u build=%s\n",
+               unsigned(fused_build), unsigned(double_buffer),
+               fused_build ? "parallel_ub" : "serial_two_pass");
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {

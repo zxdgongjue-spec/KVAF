@@ -7,7 +7,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <atomic>
+#include <vector>
+#include <utility>
+#include <thread>
 
+#define KVAF_AIV_MODEL 1
 #define __aicore__
 #define __global__
 #define __gm__
@@ -16,9 +21,25 @@
 #define LAUNCH_BOUND(n)
 
 namespace aiv_model {
-alignas(64) inline uint8_t ub[160 * 1024];
-inline uint32_t core = 0;
-inline uint64_t cycle = 0;
+alignas(64) inline thread_local uint8_t ub[160 * 1024];
+inline thread_local uint32_t core = 0;
+// Copying a counter takes a value snapshot, preserving existing model tests.
+struct Counter {
+  std::atomic<uint64_t> value{0};
+  Counter() = default;
+  Counter(const Counter& other) : value(other.value.load()) {}
+  operator uint64_t() const { return value.load(); }
+  uint64_t operator++() { return ++value; }
+};
+inline Counter cycle;
+inline uint64_t AtomicLoadWord(uint64_t address) {
+  const auto value = __atomic_load_n(reinterpret_cast<uint64_t*>(address), __ATOMIC_ACQUIRE);
+  std::this_thread::yield(); // Device workers progress concurrently; avoid host spin starvation.
+  return value;
+}
+inline void AtomicStoreWord(uint64_t address, uint64_t value) {
+  __atomic_store_n(reinterpret_cast<uint64_t*>(address), value, __ATOMIC_RELEASE);
+}
 void Poll(void* address);
 void Doorbell(uint32_t value, uint32_t* address);
 }  // namespace aiv_model
@@ -26,8 +47,8 @@ void Doorbell(uint32_t value, uint32_t* address);
 inline struct { uint32_t x; } threadIdx;
 enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2, PIPE_ALL };
 using event_t = uint32_t;
-inline bool model_events[4][4][3]{};
-inline uint64_t model_event_fences[4][4][3]{};
+inline thread_local bool model_events[4][4][3]{};
+inline thread_local uint64_t model_event_fences[4][4][3]{};
 namespace aiv_model {
 // Defer public DMA copies until their producer event is waited on. This catches
 // consuming an unfilled bank, overwriting a bank still being read, and returning
@@ -76,16 +97,28 @@ struct CopyQueue {
   }
   void Finish() { FinishThrough(submitted); }
 };
-inline CopyQueue mte2, mte3;
-inline uint64_t mte2_copies{}, mte3_copies{};
-inline uint64_t mte2_aligned_copies{}, mte2_tail_copies{};
-inline uint64_t overlapped_mte2_copies{};
-inline uint64_t out_to_ub_resets{}, event_waits[4][4]{};
+inline thread_local CopyQueue mte2, mte3;
+inline Counter mte2_copies, mte3_copies;
+inline Counter metadata_reads, descriptor_writes;
+inline Counter payload_cache_lines;
+inline Counter mte2_aligned_copies, mte2_tail_copies;
+inline Counter overlapped_mte2_copies;
+inline Counter out_to_ub_resets, event_waits[4][4];
 // Optional exact source interval for tests: a padded UB tail must never cause
 // a read outside the requested GM token, even if the allocation has slack.
-inline uintptr_t mte2_source_begin{}, mte2_source_end{};
+inline thread_local uintptr_t mte2_source_begin{}, mte2_source_end{};
+inline thread_local uintptr_t descriptor_begin{}, descriptor_end{};
+inline thread_local std::vector<std::pair<uintptr_t, uintptr_t>> metadata_sources;
+inline bool IsMetadata(const void* source, uint64_t bytes) {
+  const auto address = reinterpret_cast<uintptr_t>(source);
+  for (const auto& region : metadata_sources)
+    if (address >= region.first && address <= region.second && bytes <= region.second - address)
+      return true;
+  return false;
+}
 inline void CheckMte2Source(const void* source, uint64_t bytes) {
   if (!mte2_source_end) return;
+  if (IsMetadata(source, bytes)) return;
   const auto address = reinterpret_cast<uintptr_t>(source);
   if (address < mte2_source_begin || address > mte2_source_end ||
       bytes > mte2_source_end - address) std::abort();
@@ -165,6 +198,22 @@ template <typename T> struct LocalTensor {
     result.address_.dataLen -= byte_offset;
     return result;
   }
+  T GetValue(uint32_t offset) const {
+    const auto tensor = (*this)[offset];
+    const auto* address = reinterpret_cast<const T*>(tensor.address_.bufferAddr);
+    if (tensor.address_.dataLen < sizeof(T) || aiv_model::mte2.Writes(address, sizeof(T)))
+      std::abort();
+    T value;
+    std::memcpy(&value, address, sizeof(T));
+    return value;
+  }
+  void SetValue(uint32_t offset, T value) const {
+    const auto tensor = (*this)[offset];
+    auto* address = reinterpret_cast<T*>(tensor.address_.bufferAddr);
+    if (tensor.address_.dataLen < sizeof(T) || aiv_model::mte2.Writes(address, sizeof(T)) ||
+        aiv_model::mte3.Reads(address, sizeof(T))) std::abort();
+    std::memcpy(address, &value, sizeof(T));
+  }
 };
 struct DataCopyExtParams {
   uint16_t blockCount;
@@ -183,12 +232,14 @@ void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t co
   aiv_model::CheckMte2Source(src.data, bytes);
   if (!bytes || bytes % 32 || dst.address_.bufferAddr % 32 ||
       reinterpret_cast<uintptr_t>(src.data) % sizeof(T) || bytes > dst.address_.dataLen ||
-      !aiv_model::mte2.empty() || aiv_model::mte3.Reads(
+      aiv_model::mte2.Writes(reinterpret_cast<void*>(dst.address_.bufferAddr), bytes) ||
+      aiv_model::mte3.Reads(
           reinterpret_cast<void*>(dst.address_.bufferAddr), bytes)) std::abort();
   if (!aiv_model::mte3.empty()) ++aiv_model::overlapped_mte2_copies;
   aiv_model::mte2.Push({reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
       reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)});
   ++aiv_model::mte2_copies;
+  if (aiv_model::IsMetadata(src.data, bytes)) ++aiv_model::metadata_reads;
   ++aiv_model::mte2_aligned_copies;
 }
 template <typename T>
@@ -198,7 +249,8 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
   const uint64_t ub_bytes = uint64_t(p.blockCount) * padded;
   if (!p.blockCount || p.blockCount > 4095 || !p.blockLen || p.srcStride || p.dstStride ||
       p.rsv || pad.isPad || pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
-      ub_bytes > dst.address_.dataLen || !aiv_model::mte2.empty() ||
+      ub_bytes > dst.address_.dataLen ||
+      aiv_model::mte2.Writes(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes) ||
       aiv_model::mte3.Reads(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes))
     std::abort();
   if (!aiv_model::mte3.empty()) ++aiv_model::overlapped_mte2_copies;
@@ -210,6 +262,8 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
         source, p.blockLen, padded});
   }
   ++aiv_model::mte2_copies;
+  if (aiv_model::IsMetadata(src.data, uint64_t(p.blockCount) * p.blockLen))
+    ++aiv_model::metadata_reads;
   ++aiv_model::mte2_tail_copies;
 }
 template <typename T>
@@ -223,9 +277,17 @@ void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
   aiv_model::mte3.Push({reinterpret_cast<uint8_t*>(dst.data),
       reinterpret_cast<const uint8_t*>(src.address_.bufferAddr), p.blockLen, 0});
   ++aiv_model::mte3_copies;
+  const auto address = reinterpret_cast<uintptr_t>(dst.data);
+  if (address >= aiv_model::descriptor_begin && address < aiv_model::descriptor_end) {
+    if (p.blockLen > aiv_model::descriptor_end - address) std::abort();
+    ++aiv_model::descriptor_writes;
+  }
 }
 template <typename T, CacheLine, DcciDst>
 void DataCacheCleanAndInvalid(GlobalTensor<T> tensor) {
+  const auto address = reinterpret_cast<uintptr_t>(tensor.data);
+  if (address >= aiv_model::mte2_source_begin && address < aiv_model::mte2_source_end)
+    ++aiv_model::payload_cache_lines;
   aiv_model::Poll(tensor.data);
 }
 namespace Simt {

@@ -240,6 +240,11 @@ UB tile 32/64 行也不会让 CPU 自动每 32/64 行发布 ready。
 `reference/fused/double/both` 四种对照；测试入口也提供 `--fused-build 0/1`、
 `--double-buffer 0/1`。同一二进制使用固定的最大 64 KiB 静态 UB 地址范围；
 SIMT 列为后续独立候选。
+`fused_build=1` 已进一步实现多核分摊和 UB 元数据批处理：8 项对齐分区、
+256 项构建 tile、4096 项以内 address/valid 表在 UB 缓存，较大表走标量查找 fallback。
+每核私有完成行汇合后 core 0 发布 notify，不改变 CPU 服务协议。
+省略全容量输入缓存维护、二次读取和逐条 GM descriptor 写；保留内容边界校验。
+构建使用前 41 KiB UB，payload 阶段复用这些地址。Host/kernel 需配套重编译。
 核参数维持现有 176 B 合约，reserved 使用新版 options 标签，profile 是独立 bit；
 保留旧 zero/profile-only 标签的两遍清单、单 bank 语义，未知版本/bit 明确拒绝。
 SIMT 变体同步提供 Host 资源配置，不仅替换一个 object 文件。

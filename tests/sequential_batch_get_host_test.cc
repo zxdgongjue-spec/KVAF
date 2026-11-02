@@ -5,6 +5,7 @@
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
+#include "cpu_push_get_layout.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +88,11 @@ int Launch(const KvafScatterBatchGetArgs* a) {
 }
 extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_SCATTER);
+  kvaf::cpu_push::Layout layout;
+  assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout));
+  assert(a->descriptor_offset == layout.descriptor && a->staging_offset == layout.staging);
+  assert(a->workspace_bytes == layout.bytes + uint64_t(a->request.block_count + 1) * 64);
+  assert((a->workspace + a->workspace_bytes) % 64 == 0);
   return Launch(a);
 }
 extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, void*) {

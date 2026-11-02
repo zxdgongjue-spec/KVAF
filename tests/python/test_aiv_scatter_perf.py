@@ -40,7 +40,7 @@ def arguments(argv=None):
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--cores", type=int, default=1)
     parser.add_argument("--fused-build", type=int, choices=(0, 1),
-                        help="runtime source-list optimization; default: KVAF_SCATTER_FUSED_BUILD or 1")
+                        help="parallel UB source-list build (0: serial two-pass); default: KVAF_SCATTER_FUSED_BUILD or 1")
     parser.add_argument("--double-buffer", type=int, choices=(0, 1),
                         help="runtime UB overlap; default: KVAF_SCATTER_DOUBLE_BUFFER or 1")
     parser.add_argument("--blocks", type=int, default=1024)

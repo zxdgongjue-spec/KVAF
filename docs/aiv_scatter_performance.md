@@ -29,12 +29,31 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 
 ## 清单构建与 UB 流水版本对比
 
-当前默认启用单遍校验/清单构建，以及两个各 32 KiB 的静态 UB bank，总计 64 KiB。
+当前默认启用**多核 UB 单遍清单构建**，以及两个各 32 KiB 的静态 UB bank，总计 64 KiB。
 656 B 的 UB 行距为 672 B，每批最多 32 行；4096 B 每批 8 行。
 每批一次多块 GM→UB，按映射连续发出精确长度的 UB→output。
 只在 bank 复用前等待该 bank 写完，使下一批输入与上一批写出重叠；末尾等待两个 bank 全部完成。
 尾批按实际行数搬运，超过 32 KiB 的单行使用原有精确分段路径。
-清单构建复用已校验的 index/offset/base，全部成功并刷新清单后才发布 notify。
+清单构建按 8 条地址（64 B）分组分给各核，避免两个核写同一缓存行。
+每核按 256 条一批把 index/offset/output row 搬入 UB，在 UB 校验并生成源地址，
+再一次 DMA 写回这批 descriptor。1024 项、4 核时每核构建 256 项。
+地址表不超过 4096 项时，每个参与核将 address/valid 表批量载入 UB；更大的表保留
+安全的标量表查找，但请求输入和 descriptor 仍批量搬运。构建最多使用 41 KiB UB，
+之后与 payload bank 复用同一 UB 地址范围。
+
+省略第二遍 Source 读取、逐条 GM descriptor 写、对应的逐缓存行清单刷新，
+以及每核对整个 request capacity 的索引/偏移/输出行号缓存刷新。
+不变量（block 大小、源区域最大合法偏移）移出逐项循环，索引/offset/输出行号的负值与上界判断合并。
+只检查有效前缀；空请求直接完成。索引、offset、valid、源地址和输出行号的合法性判断
+仍保留，因为 Host 只验证 Tensor 形状，不能证明 NPU Tensor 内容合法。
+payload 的输出行号仍通过标量 GM 读取，只刷新本核实际使用的行号片段。
+staging payload 仅通过 DMA 读取并禁用 L2 cache，去掉搬运前逐 64 B 的标量 DCache 刷新；
+这个公共清理同时应用于 fused/reference，CPU done、DMA 完成等待和标量控制字的缓存维护保留。
+依据见 [DataCacheCleanAndInvalid 的 Scalar/DMA 路径说明](https://asc.gitcode.com/api/SIMD-API/basic_api/cache_control/DataCacheCleanAndInvalid.html)。
+
+每核 descriptor DMA 完成后在独立缓存行发布当前 sequence；core 0 等待全部核就绪，
+再写请求头和 notify。任一核校验失败或构建等待超时都不发布本轮 notify。
+这些完成标记位于 CPU layout 后的私有尾部，CPU 服务和 URMA 数据路径不变。
 仍在整批 CPU done 后开始 scatter，现有 CPU/AIV 计时边界可以直接对比。
 
 两项改动使用**测试时开关**，默认均为 1，同一 Host 和 kernel 二进制支持四种组合：
@@ -42,20 +61,23 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 | 版本 | `--fused-build` | `--double-buffer` |
 | --- | --- | --- |
 | reference：两遍清单、单 bank | 0 | 0 |
-| fused：单遍清单、单 bank | 1 | 0 |
+| fused：多核 UB 单遍清单、单 bank | 1 | 0 |
 | double：两遍清单、双 bank | 0 | 1 |
-| both：单遍清单、双 bank | 1 | 1 |
+| both：多核 UB 单遍清单、双 bank | 1 | 1 |
 
 测试参数覆盖同名环境变量 `KVAF_SCATTER_FUSED_BUILD`、`KVAF_SCATTER_DOUBLE_BUFFER`，
 未传参数时使用环境变量，否则默认 1；只接受 0/1。
 Host 在 `initialize()` 读取一次，之后修改环境变量不影响当前实例；需 shutdown 后重新初始化。
-初始化日志应包含 `SCATTER_OPTIONS version=1 fused_build=... double_buffer=...`，确认实际选项。
+初始化日志包含 `SCATTER_OPTIONS version=1 fused_build=... double_buffer=... build=parallel_ub`
+（关闭时为 `build=serial_two_pass`），确认实际选项。
 flags 通过现有 176 B 参数的 reserved 字传入，使用新版标签并独立保留 profile bit；
 不改 Python/C++ 公共接口、CPU URMA 协议或计时窗口。
-首次需同时重编译 NPU Host 和 kernel，此后切换组合不需重编译。
-旧 Host 的 zero/profile-only 参数仍选择两遍清单、单 bank；新 Host 配旧 kernel 会验证失败。
+本次需同时重编译 NPU Host 和 kernel：Host 为每核新增一个私有完成缓存行。
+之后切换组合不需重编译；CPU 服务不需因本次改动重编译。
+旧 zero/profile-only 参数仍选择两遍清单、单 bank；构建/测试时应始终使用配套 Host 和 kernel。
 
-所有运行时组合均保留最多 64 KiB 的静态 UB 地址范围，单 bank 只使用前 32 KiB。
+所有运行时组合均保留最多 64 KiB 的静态 UB 地址范围；payload 单 bank 使用前 32 KiB，
+开启 fused build 时构建阶段会复用前 41 KiB。
 因此 reference 是同一二进制下的算法对照，不等价于重编译一份仅声明 32 KiB UB 的旧二进制。
 如需评估最终代码体积、编译布局或 UB 资源差异，另保留旧版本独立比较。
 
@@ -92,12 +114,15 @@ done
 各文件中 `phase=baseline` 都表示关闭细分打点，不表示旧算法。
 通过 CSV/JSON 的 `fused_build`、`double_buffer` 区分算法组合，kernel SHA256 应完全一致。
 先比较这部分的端到端 p50/p95、
-有效带宽，再用 `profiled` 的 `aiv_scatter_ns` 和 `cpu_comm_ns` 归因。
+有效带宽，再用 `profiled` 的 `aiv_build_notify_us`、`aiv_body_us`、`aiv_wall_us`、
+`aiv_scatter_us` 和 `cpu_comm_us` 归因。JSON 保留对应的原始 ns 字段。
 四个版本均须通过完整 output/guard 校验，再交替重跑对照检查波动。
 656 B、非整除前缀和其他核数也需回归，不仅依据一个形状判断。
 
-已有 CPU kernel 模型覆盖四种开关组合、尾批和大行 fallback、旧 sequence 复用、
-非法输入与中途构建失败。模型按每个事件之前的 DMA 命令确认完成，
+CPU kernel 模型使用线程执行并发 scatter 核，覆盖四种开关组合、256 条构建边界、
+4096/4097 项地址表缓存边界、尾批和大行 fallback、旧 sequence 复用、
+非法输入与中途构建失败。模拟 CPU 会检查全部核已发布本轮构建完成标记，才消费清单。
+模型按每个事件之前的 DMA 命令确认完成，
 校验双 bank 的输入/输出交错及 UB 复用安全，不模拟真实硬件性能或外部 DMA 可见性。
 可在有 C++ 编译器的 Linux 环境运行：
 
