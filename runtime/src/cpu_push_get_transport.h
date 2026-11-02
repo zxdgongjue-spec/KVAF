@@ -68,11 +68,10 @@ class Transport {
   Status PostPrepared(PreparedQueue&, std::uint32_t queue);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&);
-  Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
+  Status ReadControl(std::uint64_t offset, std::uint64_t bytes);
   Status Post(Queue&);
   Status Wait(Queue&);
-  void Add(Queue&, urma_opcode_t, std::uint64_t remote, std::uint32_t bytes,
-           std::uint32_t first_sge, std::uint32_t sges);
+  void AddControlRead(Queue&, std::uint64_t remote, std::uint32_t bytes);
   void ResetRequests(Queue&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;

@@ -162,22 +162,16 @@ void Transport::PrepareCompletions() {
 }
 
 void Transport::ResetRequests(Queue& q) { q.local.clear(); q.remote.clear(); q.wrs.clear(); }
-void Transport::Add(Queue& q, urma_opcode_t opcode, std::uint64_t remote,
-                    std::uint32_t bytes, std::uint32_t first, std::uint32_t sges) {
+void Transport::AddControlRead(Queue& q, std::uint64_t remote, std::uint32_t bytes) {
   q.remote.push_back({remote, bytes, remote_, nullptr});
   urma_jfs_wr_t wr{};
-  wr.opcode = opcode;
+  wr.opcode = URMA_OPC_READ;
   wr.flag.bs.comp_order = 1;
   wr.flag.bs.place_order = URMA_RELAX_ORDER;
   wr.tjetty = q.channel.remote_jetty;
   wr.user_ctx = ++q.sequence;
-  if (opcode == URMA_OPC_WRITE) {
-    wr.rw.src = {reinterpret_cast<urma_sge_t*>(q.local.data() + first), sges};
-    wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
-  } else {
-    wr.rw.src = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
-    wr.rw.dst = {reinterpret_cast<urma_sge_t*>(q.local.data() + first), sges};
-  }
+  wr.rw.src = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
+  wr.rw.dst = {reinterpret_cast<urma_sge_t*>(q.local.data()), 1};
   q.wrs.push_back(wr);
 }
 Status Transport::Post(Queue& q) {
@@ -192,7 +186,7 @@ Status Transport::Post(Queue& q) {
     urma_jfs_wr_t* bad = nullptr;
     if (urma_post_jetty_send_wr(q.channel.local_jetty, &q.wrs[first], &bad)) {
       q.poisoned = true;
-      return Error("post WRITE/READ chain");
+      return Error("post control READ");
     }
   }
   return Status::OK();
@@ -228,7 +222,7 @@ Status Transport::Wait(Queue& q) {
   return Status::OK();
 }
 
-Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes) {
+Status Transport::ReadControl(std::uint64_t offset, std::uint64_t bytes) {
   auto& q = queues_[0];
   if (q.poisoned || q.pending || offset > layout_.staging || bytes > layout_.staging - offset)
     return Error("invalid control transfer");
@@ -236,7 +230,7 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
     ResetRequests(q);
     const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, max_bytes_));
     q.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset), length, control_, nullptr});
-    Add(q, write ? URMA_OPC_WRITE : URMA_OPC_READ, hbm_base_ + offset, length, 0, 1);
+    AddControlRead(q, hbm_base_ + offset, length);
     auto result = Post(q);
     if (result.ok()) result = Wait(q);
     if (!result.ok()) return result;
@@ -246,7 +240,7 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
   return Status::OK();
 }
 Status Transport::ReadRequest(std::uint64_t* sequence) {
-  auto result = Transfer(false, layout_.notify, sizeof(Word));
+  auto result = ReadControl(layout_.notify, sizeof(Word));
   if (result.ok()) {
     const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
     *sequence = notify & ~kProfileNotify;
@@ -266,7 +260,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     // published only after all builders finish. A larger count needs one tail
     // READ; shrink/same-count calls need no second round trip. Never use a
     // cached descriptor: refresh the prefix even when its length is unchanged.
-    result = Transfer(false, layout_.request,
+    result = ReadControl(layout_.request,
         layout_.descriptor + std::uint64_t{descriptor_prefetch_count_} * 8);
   }
   if (!result.ok()) return result;
@@ -278,7 +272,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   descriptor_prefetch_count_ = r.count;
   if (r.count <= prefetched) return Status::OK();
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  return Transfer(false, layout_.descriptor + std::uint64_t{prefetched} * 8,
+  return ReadControl(layout_.descriptor + std::uint64_t{prefetched} * 8,
                   std::uint64_t{r.count - prefetched} * 8);
 }
 
