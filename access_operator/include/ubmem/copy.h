@@ -26,27 +26,14 @@ class MteCopyPipeline {
   }
 
   __aicore__ inline void Copy(uint64_t dst, uint64_t src, uint64_t bytes) {
+    // Tokens that fit one bank do not need the general chunking loop.
+    if (bytes <= chunk_bytes_) {
+      if (bytes != 0) CopyChunk(dst, src, static_cast<uint32_t>(bytes));
+      return;
+    }
     for (uint64_t offset = 0; offset < bytes;) {
-      const uint32_t bank = read_bank_;
-      const auto event = static_cast<event_t>(bank);
-      // Only wait for the bank being reused; other banks may still be busy.
-      if (writing_[bank]) {
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
-        writing_[bank] = false;
-      }
       const uint32_t length = bytes - offset < chunk_bytes_ ? bytes - offset : chunk_bytes_;
-      AscendC::GlobalTensor<uint8_t> source;
-      source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(src + offset));
-      AscendC::DataCopyPad(buffers_[bank], source,
-          AscendC::DataCopyExtParams{1, length, 0, 0, 0},
-          AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
-      destinations_[bank] = dst + offset;
-      lengths_[bank] = length;
-      AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
-      ++issued_;
-      if (++read_bank_ == stages_) read_bank_ = 0;
-      // Prefill stages_ - 1 reads, then issue one read before each write.
-      if (issued_ - written_ == stages_) WriteOldest();
+      CopyChunk(dst + offset, src + offset, length);
       offset += length;
     }
   }
@@ -66,6 +53,28 @@ class MteCopyPipeline {
   }
 
  private:
+  __aicore__ inline void CopyChunk(uint64_t dst, uint64_t src, uint32_t length) {
+    const uint32_t bank = read_bank_;
+    const auto event = static_cast<event_t>(bank);
+    // Only wait for the bank being reused; other banks may still be busy.
+    if (writing_[bank]) {
+      AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+      writing_[bank] = false;
+    }
+    AscendC::GlobalTensor<uint8_t> source;
+    source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(src));
+    AscendC::DataCopyPad(buffers_[bank], source,
+        AscendC::DataCopyExtParams{1, length, 0, 0, 0},
+        AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+    destinations_[bank] = dst;
+    lengths_[bank] = length;
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+    ++issued_;
+    if (++read_bank_ == stages_) read_bank_ = 0;
+    // Prefill stages_ - 1 reads, then issue one read before each write.
+    if (issued_ - written_ == stages_) WriteOldest();
+  }
+
   __aicore__ inline void WriteOldest() {
     const uint32_t bank = write_bank_;
     const auto event = static_cast<event_t>(bank);
