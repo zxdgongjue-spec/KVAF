@@ -98,6 +98,33 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
   }
 }
 
+void* TensorPointer(const py::object& tensor) {
+  return PointerFromValue(tensor.attr("data_ptr")().cast<std::uint64_t>());
+}
+
+BatchGetRequest TrustedScatterRequest(
+    const AccessTableHandle& table, const py::object& addresses,
+    const py::object& valid, const py::object& indices, const py::object& offsets,
+    const py::object& miss_count, const py::object& output_indices,
+    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block) {
+  // Tensor layout/lifetime is the caller's contract. Read only metadata needed
+  // to launch: seven current pointers, two capacities and the output row count.
+  // No dtype/device/contiguity/shape checks or cross-call pointer cache.
+  const auto request_bytes = indices.attr("numel")().cast<std::size_t>() * sizeof(std::int32_t);
+  const auto entries = addresses.attr("numel")().cast<std::size_t>();
+  const auto output_rows = output.attr("size")(0).cast<std::size_t>();
+  return BatchGetRequest{
+      table,
+      {TensorPointer(indices), request_bytes, DeviceKind::kNpu},
+      {TensorPointer(offsets), request_bytes, DeviceKind::kNpu},
+      {TensorPointer(miss_count), sizeof(std::int32_t), DeviceKind::kNpu},
+      {TensorPointer(output_indices), request_bytes, DeviceKind::kNpu},
+      {TensorPointer(output), output_rows * token_bytes, DeviceKind::kNpu},
+      token_bytes, tokens_per_block,
+      {{TensorPointer(addresses), entries * sizeof(Address), DeviceKind::kNpu},
+       {TensorPointer(valid), entries, DeviceKind::kNpu}}};
+}
+
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
   if (result == nullptr) {
     throw std::invalid_argument("key output must not be null");
@@ -239,6 +266,7 @@ class NpuPythonRuntime final {
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
+    trusted_scatter_inputs_ = aiv_batch_get_mode == "cpu_push_scatter";
     options.aiv_batch_get_mode = std::move(aiv_batch_get_mode);
     options.aiv_gather_sgl_size = aiv_gather_sgl_size;
     options.npu_eids = std::move(npu_eids);
@@ -512,52 +540,59 @@ class NpuPythonRuntime final {
     scatter_host::Timer binding_timer(scatter_host::kBinding);
     scatter_host::Timer tensor_timer(scatter_host::kTensorMetadata);
     host_profile_ready_ = false;
-    const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
-    const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
-    const NpuTensorView miss_count_view =
-        GetNpuTensorView(miss_count, "miss_count");
-    const NpuTensorView output_index_view =
-        GetNpuTensorView(output_indices, "output_indices");
-    const NpuTensorView output_view = GetNpuTensorView(output, "output");
-    const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
-    const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
-    if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
-        output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
-        index_view.element_bytes != sizeof(std::int32_t) ||
-        offset_view.element_bytes != sizeof(std::int32_t) ||
-        output_index_view.element_bytes != sizeof(std::int32_t) ||
-        miss_count_view.element_bytes != sizeof(std::int32_t) ||
-        miss_count_view.bytes != sizeof(std::int32_t) ||
-        index_view.bytes != offset_view.bytes ||
-        index_view.bytes != output_index_view.bytes ||
-        address_view.element_bytes != sizeof(Address) ||
-        valid_view.element_bytes != sizeof(std::uint8_t) ||
-        valid_view.bytes != address_view.bytes / sizeof(Address) ||
-        output_view.first_dimension <= 0 ||
-        output_view.bytes % static_cast<std::size_t>(output_view.first_dimension) != 0) {
-      throw py::value_error("BatchGet Tensors do not satisfy the NPU layout contract");
+    BatchGetRequest request;
+    if (trusted_scatter_inputs_) {
+      request = TrustedScatterRequest(access_table, addresses, valid, indices, offsets,
+          miss_count, output_indices, output, native_->batch_get_token_bytes(),
+          native_->batch_get_tokens_per_block());
+    } else {
+      const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
+      const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
+      const NpuTensorView miss_count_view =
+          GetNpuTensorView(miss_count, "miss_count");
+      const NpuTensorView output_index_view =
+          GetNpuTensorView(output_indices, "output_indices");
+      const NpuTensorView output_view = GetNpuTensorView(output, "output");
+      const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
+      const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+      if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
+          output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
+          index_view.element_bytes != sizeof(std::int32_t) ||
+          offset_view.element_bytes != sizeof(std::int32_t) ||
+          output_index_view.element_bytes != sizeof(std::int32_t) ||
+          miss_count_view.element_bytes != sizeof(std::int32_t) ||
+          miss_count_view.bytes != sizeof(std::int32_t) ||
+          index_view.bytes != offset_view.bytes ||
+          index_view.bytes != output_index_view.bytes ||
+          address_view.element_bytes != sizeof(Address) ||
+          valid_view.element_bytes != sizeof(std::uint8_t) ||
+          valid_view.bytes != address_view.bytes / sizeof(Address) ||
+          output_view.first_dimension <= 0 ||
+          output_view.bytes % static_cast<std::size_t>(output_view.first_dimension) != 0) {
+        throw py::value_error("BatchGet Tensors do not satisfy the NPU layout contract");
+      }
+      const std::uint64_t output_rows =
+          static_cast<std::uint64_t>(output_view.first_dimension);
+      const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
+      if (output_block_bytes != native_->batch_get_token_bytes()) {
+        throw py::value_error(
+            "BatchGet output Tensor row size does not match batch_get_token_bytes");
+      }
+      request = BatchGetRequest{
+          access_table,
+          ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
+          ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
+          ConstBufferView{miss_count_view.data, miss_count_view.bytes,
+                          DeviceKind::kNpu},
+          ConstBufferView{output_index_view.data, output_index_view.bytes,
+                          DeviceKind::kNpu},
+          MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
+          output_block_bytes,
+          native_->batch_get_tokens_per_block(),
+          AccessTableDeviceView{
+              ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
+              ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     }
-    const std::uint64_t output_rows =
-        static_cast<std::uint64_t>(output_view.first_dimension);
-    const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes != native_->batch_get_token_bytes()) {
-      throw py::value_error(
-          "BatchGet output Tensor row size does not match batch_get_token_bytes");
-    }
-    const BatchGetRequest request{
-        access_table,
-        ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
-        ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
-        ConstBufferView{miss_count_view.data, miss_count_view.bytes,
-                        DeviceKind::kNpu},
-        ConstBufferView{output_index_view.data, output_index_view.bytes,
-                        DeviceKind::kNpu},
-        MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
-        output_block_bytes,
-        native_->batch_get_tokens_per_block(),
-        AccessTableDeviceView{
-            ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
-            ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     tensor_timer.Stop();
     scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
     const aclrtStream acl_stream = ResolveStream(stream);
@@ -566,7 +601,7 @@ class NpuPythonRuntime final {
     {
       scatter_host::Timer native_timer(scatter_host::kNative);
       status = native_->core().BatchGet(
-          request, BatchGetExecutionOptions{acl_stream, synchronize});
+          request, BatchGetExecutionOptions{acl_stream, synchronize, trusted_scatter_inputs_});
     }
     ThrowIfError(status);
     host_profile_ready_ = host_profile_enabled_;
@@ -580,6 +615,7 @@ class NpuPythonRuntime final {
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  bool trusted_scatter_inputs_{false};
   bool host_profile_enabled_{false}, host_profile_ready_{false};
   scatter_host::Profile host_profile_{};
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
@@ -670,7 +706,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
-           "the default returns after enqueueing work on that stream.")
+           "the default returns after enqueueing work on that stream. CPU-push scatter trusts "
+           "the caller's contiguous NPU layouts and eager-stream/lifetime contract.")
       .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
            py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
@@ -678,7 +715,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("synchronize") = false,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
            "stream=None uses torch.npu.current_stream(); the default returns "
-           "after enqueueing work on that stream.");
+           "after enqueueing work on that stream. CPU-push scatter trusts the "
+           "caller's contiguous NPU layouts and eager-stream/lifetime contract.");
 }
 
 }  // namespace kvaf

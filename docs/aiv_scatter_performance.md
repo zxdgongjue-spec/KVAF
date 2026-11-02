@@ -130,8 +130,9 @@ CPU kernel 模型使用线程执行并发 scatter 核，覆盖四种开关组合
 cmake -S . -B build-model -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF \
   -DKVAF_ENABLE_AIV_BATCH_GET=OFF
 cmake --build build-model -j --target \
-  kvaf_sequential_batch_get_kernel_model_test kvaf_sequential_host_test
-ctest --test-dir build-model -R 'kvaf_sequential_(batch_get_kernel_model|host)_test' --output-on-failure
+  kvaf_sequential_batch_get_kernel_model_test kvaf_sequential_host_test \
+  kvaf_runtime_batch_get_contract_test
+ctest --test-dir build-model -R 'kvaf_(sequential_(batch_get_kernel_model|host)|runtime_batch_get_contract)_test' --output-on-failure
 ```
 
 一个 kernel 模型可执行文件在运行时遍历四种组合，并覆盖旧参数兼容与非法 flags。
@@ -142,7 +143,7 @@ Host 测试验证默认值、环境变量快照、重新初始化、profile 开�
 ### 调用外围与 Host 分段诊断
 
 `call_outside_aiv_us = end_to_end_us - aiv_wall_us`。它覆盖 Python/Pybind 包装与
-Tensor 元数据解析、Runtime 校验、capture 查询、提交/排队、状态回拷和同步返回，
+Tensor 元数据读取、Host 请求准备、提交/排队、状态回拷和同步返回，
 也覆盖 kernel 的计时 start 之前和 finish 之后的工作。它不是某一个 API 的计时，
 也不能直接全部归为 Python 执行时间。
 BatchPut、准备表、输入刷新、output guard 校验和单独读取 profile 快照均不在该单次计时内。
@@ -150,10 +151,26 @@ BatchPut、准备表、输入刷新、output guard 校验和单独读取 profile
 每次同步调用原先提交 `status memset → scatter kernel → 256 B status D2H（4 核）`，
 然后执行一次 stream synchronize 并校验各核 magic/sequence/result/phase。
 现在去掉每轮 status memset：状态区只在初始化时清零一次，每次 kernel 完整写回状态，
-旧状态由递增 sequence 检出。Tensor 解析去掉重复的 hasattr 预检查和 shape vector 分配，
-每次仍读取当前存储指针并校验布局，不跨调用缓存可能变化的 Tensor 元数据。
+旧状态由递增 sequence 检出。
 
-诊断时沿用完整端到端入口，在原命令添加 `--host-profile`，结果写进 JSON，CSV 仍为 27 列：
+Python `cpu_push_scatter` 的 BatchGet 默认使用调用方保证输入格式的通路：
+只读取七个当前 data_ptr、indices/address 两个容量和 output 的首维行数，
+其余大小由配置的 token_bytes 和 int32/64 位地址/uint8 格式推导。
+去掉连续性、device、element_size、维数、长度匹配、溢出等逐 Tensor 校验，
+并跳过 Runtime 的 Host AccessTable 查找/生命周期/布局复验、Host Input 复验和 capture 查询。
+不跨调用缓存指针，原有 changing 测试仍每轮取得当前 Tensor 存储。
+
+调用方须提供连续 NPU Tensor：三个 int32 请求数组等长，miss_count 为 int32[1]，
+地址表为 64 位地址、valid 为等长 uint8；output 每行字节数等于配置 token_bytes。
+容量和生命周期由调用方保证，使用 eager stream；该通路不验证也不支持 graph capture。
+Python 签名不变；其他模式及 C++ 默认调用保留原验证行为。
+C++ 调用者可通过 `BatchGetExecutionOptions::trusted_npu_request=true` 使用同一合同。
+完成等待、异步 workspace 复用前的 drain、设备结果和 API 错误处理仍执行。
+
+profiled 阶段默认采集 Host 分段，结果写进 JSON，并在 CSV 原 27 列后追加五列，合计 32 列：
+`host_tensor_metadata_us`、`host_launch_us`、`host_status_copy_enqueue_us`、
+`host_stream_sync_us`、`host_python_dispatch_us`，统一保留三位小数。
+关闭采样的行留空，不以 0 代替未采集值。完整端到端入口示例：
 
 ```bash
 cmake --build build-npu -j
@@ -166,8 +183,9 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 ```
 
 也可在直接使用绑定时设置 `KVAF_SCATTER_HOST_PROFILE=1`，然后调用现有
-`start_scatter_profile()`。测试脚本以 `--host-profile` 为准覆盖环境变量。
-诊断默认关闭；仅在 profiled 阶段启用，baseline 不读取 Host 时钟。
+`start_scatter_profile()`。测试脚本以 `--host-profile/--no-host-profile` 为准覆盖环境变量。
+脚本在 profiled 阶段默认启用，可用 `--no-host-profile` 关闭；baseline 不读取 Host 时钟。
+`--profile-rounds 0` 默认同时关闭 Host 计时。
 本次需重编译绑定、Runtime 和 NPU Host；CPU 服务与 AIV kernel 协议不变。
 
 `samples.profiled` 中新增原始 `host_*_ns` 及对应 `host_*_us`，`summary.profiled`
@@ -178,15 +196,15 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 end_to_end
 ├─ host_python_dispatch           调用总时长减 binding：包装、重载派发和返回差值
 └─ host_binding                   BatchGetImpl 整体
-   ├─ host_tensor_metadata        7 个 Tensor 的解析、布局校验与请求组装
+   ├─ host_tensor_metadata        必需的指针/容量读取与请求组装
    ├─ host_stream_resolve         stream 对象转 ACL handle
    └─ host_native                 Runtime::BatchGet 整体
-      ├─ host_runtime_validation  AccessTable 生命周期和请求布局校验
+      ├─ host_runtime_validation  初始化状态与通路分发；完整复验已跳过
       └─ host_operator            ScatterBatchGet::Execute 整体
          ├─ host_mutex_wait       获取实例锁
-         ├─ host_capture_query    查询 capture 状态
+         ├─ host_capture_query    该通路省略，JSON 中为 0
          ├─ host_prior_drain      收尾上一笔请求；同步稳态下无上一笔待完成任务
-         ├─ host_input            kernel 参数构造/布局校验
+         ├─ host_input            kernel 参数构造，无布局复验
          ├─ host_launch           kernel 提交 API
          ├─ host_status_copy_enqueue  状态 D2H 的提交 API
          ├─ host_stream_sync      等待设备、D2H 完成及同步返回
@@ -200,7 +218,7 @@ end_to_end
 也不能直接用它减完整 aiv_wall：设备可能在 Host 进入同步 API 之前已经开始执行。
 Host 诊断增加计时开销，只用于定位；最终收益用默认关闭诊断的 baseline 比较。
 
-capture 状态可随每次调用变化，不能仅按 stream 地址缓存；同步接口必须等待真实完成。
+该通路按 eager stream 合同直接提交；同步接口仍等待真实完成。
 状态校验仍用于发现 kernel 正常返回但某核结果为 INVALID/TIMEOUT/REMOTE_ERROR 的情况。
 设置 `synchronize=False` 只改变返回时机，不能据此宣称同步端到端耗时降低。
 
@@ -301,7 +319,7 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 | `aiv_notify_to_done_ns` | core 0 notify 发布完成 → 观察到本轮 done | 包含 CPU 接收/读取、WRITE、报告回传及 done 的往返等待 |
 | `aiv_scatter_ns` | 各核看到 done → 本核 GM→UB→output 完成，取每核时长最大值 | 本地 scatter 的有效带宽，包含地址/cache/同步开销 |
 
-CSV 使用固定的 **27 列**，baseline-only、profiled-only 和混合采样的表头/顺序一致。
+CSV 使用固定的 **32 列**，baseline-only、profiled-only 和混合采样的表头/顺序一致。
 所有耗时只写 `_us`，保留 3 位小数；带宽为 GB/s，保留 6 位小数。
 内部计时、计时边界及带宽分子保持原定义；JSON 保留原始 ns、完整指标、每核报告和完整测试配置。
 
@@ -310,11 +328,12 @@ CSV 使用固定的 **27 列**，baseline-only、profiled-only 和混合采样�
 | 标识与规模（10 列） | `phase`、`iteration`、`sequence`、`cores`、`fused_build`、`double_buffer`、`request_length`、`miss_count`、`token_bytes`、`payload_bytes` |
 | 核心耗时（11 列） | `end_to_end_us`、`cpu_comm_us`、`aiv_build_notify_us`、`aiv_scatter_us`、`cpu_write_us`、`aiv_body_us`、`aiv_wall_us`、`aiv_input_wall_us`、`aiv_notify_to_done_us`、`aiv_scatter_tail_us`、`call_outside_aiv_us` |
 | 有效带宽（6 列） | `end_to_end_gbps`、`cpu_comm_gbps`、`aiv_scatter_gbps`、`cpu_write_gbps`、`aiv_body_gbps`、`aiv_wall_gbps` |
+| Host 耗时（新增 5 列） | `host_tensor_metadata_us`、`host_launch_us`、`host_status_copy_enqueue_us`、`host_stream_sync_us`、`host_python_dispatch_us` |
 
 端到端、通信和 scatter 的耗时/带宽列相邻放置。`calls=1` 和重复的 `requests` 不再逐行输出。
 workload、input_mode、source_blocks、tokens_per_block 和输出布局统一查看 JSON `config`。
 header/descriptor/post/CQ、最大单核 input、launch skew、snapshot 等诊断耗时只保留在 JSON，
-CSV 不再输出这些字段或任何 `_ns` 列。baseline 的 CPU/AIV 和 sequence 列留空，不写成 0。
+CSV 不输出这些字段或任何 `_ns` 列。baseline 的 CPU/AIV/Host 和 sequence 列留空，不写成 0。
 仍然每行只对应一次同步 BatchGet，不把数组容量当作有效请求数。
 
 读取数据应使用 `csv.DictReader` 等方式按表头取值。旧 CSV 的列顺序由实际包含的采样字段决定，
@@ -371,7 +390,7 @@ CPU、Host、AIV 分别在自己的时钟域计算时长，不跨域相减绝对
 
 控制台每轮结束后输出 `SCATTER_PERF_RESULT`，带有效载荷的指标包含
 mean/min/p50/p95/max 毫秒和 `effective_gbps`。JSON 保存配置、Get/Put SHA-256、
-汇总、每次原始样本、CPU ns 和每核 AIV cycle。CSV 保存固定 27 列的精简样本，方便绘图。
+汇总、每次原始样本、CPU ns 和每核 AIV cycle。CSV 保存固定 32 列样本，方便绘图。
 
 `loop_effective_gbps` 使用整轮 wall time，包含 Python 循环开销；profiled 轮还
 包含逐次 snapshot 的 D2H/转换开销。整轮还包含输入准备、BatchPut、表准备、

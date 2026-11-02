@@ -61,8 +61,10 @@ class ScatterPerfTests(unittest.TestCase):
                 summarize(values, 1000)
 
     def test_optional_host_profile_preserves_clock_domains_and_csv(self):
-        self.assertFalse(arguments([]).host_profile)
+        self.assertTrue(arguments([]).host_profile)
         self.assertTrue(arguments(["--host-profile"]).host_profile)
+        self.assertFalse(arguments(["--no-host-profile"]).host_profile)
+        self.assertFalse(arguments(["--profile-rounds", "0"]).host_profile)
         records = profiles()
         host = dict.fromkeys(HOST_TIMINGS, 10)
         host.update(host_binding_ns=2500, host_tensor_metadata_ns=100,
@@ -75,7 +77,9 @@ class ScatterPerfTests(unittest.TestCase):
         self.assertEqual(sample["host_python_dispatch_ns"], 500)
         self.assertEqual(sample["host_tensor_metadata_us"], .1)
         self.assertEqual(sample["call_outside_aiv_ns"], 858)
-        self.assertFalse(any(key.startswith("host_") for key in CSV_COLUMNS))
+        self.assertEqual([key for key in CSV_COLUMNS if key.startswith("host_")], [
+            "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
+            "host_stream_sync_us", "host_python_dispatch_us"])
         for key, value in (("host_operator_ns", 0), ("host_binding_ns", 1),
                            ("host_capture_query_ns", -1), ("host_launch_ns", float("nan"))):
             bad = profiles()
@@ -239,12 +243,16 @@ class ScatterPerfTests(unittest.TestCase):
                 reader = csv.DictReader(stream)
                 rows = list(reader)
                 self.assertEqual(reader.fieldnames, list(CSV_COLUMNS))
-            self.assertEqual(len(CSV_COLUMNS), 27)
+            self.assertEqual(len(CSV_COLUMNS), 32)
             self.assertFalse(any(k.endswith("_ns") for k in CSV_COLUMNS))
             self.assertEqual([r["phase"] for r in rows], ["baseline", "profiled"])
             self.assertEqual(rows[1]["cpu_comm_us"], "0.500")
             self.assertEqual(rows[0]["cpu_comm_us"], "")
             self.assertEqual(rows[0]["sequence"], "")
+            self.assertEqual(rows[0]["host_tensor_metadata_us"], "")
+            self.assertEqual(rows[1]["host_tensor_metadata_us"], "0.100")
+            self.assertEqual(rows[1]["host_python_dispatch_us"], "0.500")
+            self.assertEqual(rows[1]["host_launch_us"], "")
             self.assertEqual(rows[0]["request_length"], "8192")
             self.assertEqual(rows[0]["miss_count"], "1")
             self.assertNotIn("calls", rows[0])
@@ -272,6 +280,9 @@ class ScatterPerfTests(unittest.TestCase):
                           aiv_notify_to_done_ns=161028, aiv_scatter_ns=59863, aiv_wall_ns=330816,
                           aiv_input_wall_ns=6493, aiv_scatter_tail_ns=59993, aiv_launch_skew_ns=46,
                           snapshot_ns=104250)
+            sample.update(host_binding_ns=430000, host_tensor_metadata_ns=7000,
+                          host_launch_ns=12000, host_status_copy_enqueue_ns=1500,
+                          host_stream_sync_ns=340000)
             for phases in ({"baseline": [dict(iteration=0, payload_bytes=4194304, end_to_end_ns=442120)]},
                            {"profiled": [sample]},
                            {"baseline": [dict(iteration=0, payload_bytes=4194304, end_to_end_ns=442120)],
@@ -292,6 +303,11 @@ class ScatterPerfTests(unittest.TestCase):
                         self.assertEqual(row["cpu_comm_us"], "133.960")
                         self.assertEqual(row["aiv_build_notify_us"], "103.302")
                         self.assertEqual(row["aiv_scatter_us"], "59.863")
+                        self.assertEqual(row["host_tensor_metadata_us"], "7.000")
+                        self.assertEqual(row["host_launch_us"], "12.000")
+                        self.assertEqual(row["host_status_copy_enqueue_us"], "1.500")
+                        self.assertEqual(row["host_stream_sync_us"], "340.000")
+                        self.assertEqual(row["host_python_dispatch_us"], "12.120")
                         for timing in ("end_to_end", "cpu_comm", "cpu_write", "aiv_body",
                                        "aiv_wall", "aiv_scatter"):
                             self.assertAlmostEqual(float(row[timing + "_gbps"]),

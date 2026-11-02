@@ -22,6 +22,7 @@ bool wrong_phase{}, wrong_sequence{}, wrong_magic{};
 bool stale_profile{}, missing_cpu_profile{}, bad_profile_cycle{};
 bool skip_last_status{};
 int async_memsets{}, async_copies{}, synchronizations{};
+int capture_queries{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 std::vector<uint32_t> launch_options;
@@ -52,6 +53,7 @@ int aclrtSynchronizeStream(aclrtStream) {
   for (auto& f : work) f(); work.clear(); return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* s, aclmdlRI*) {
+  ++capture_queries;
   *s = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
 uint32_t loaded_mode{};
@@ -297,6 +299,28 @@ int main() {
     assert(profile.ns[scatter_host::kOperator] >= profile.ns[scatter_host::kStreamSync]);
     assert(async_copies == copies_before + 1 && synchronizations == syncs_before + 1);
     assert(owner->Shutdown().ok());
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    auto trusted = exec;
+    trusted.execution.trusted_npu_request = true;
+    trusted.execution.synchronize = true;
+    scatter_host::Profile profile;
+    const auto captures_before = capture_queries;
+    const auto copies_before = async_copies, syncs_before = synchronizations;
+    {
+      scatter_host::Session session(&profile);
+      assert(owner->Execute(trusted).ok());
+    }
+    assert(capture_queries == captures_before);
+    assert(profile.ns[scatter_host::kCaptureQuery] == 0);
+    assert(async_copies == copies_before + 1 && synchronizations == syncs_before + 1);
+    // Trusted input bypasses only preflight, not the remote execution result.
+    kernel_result = KVAF_SEQ_TIMEOUT;
+    assert(!owner->Execute(trusted).ok());
+    kernel_result = KVAF_SEQ_OK;
+    assert(owner->Shutdown().ok());
+    assert(!refs && !allocations && !hccp_refs);
   }
   for (uint32_t mismatch = 0; mismatch < 4; ++mismatch) {
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());

@@ -275,23 +275,26 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   mutex_timer.Stop();
   if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
   if (!exec.execution.stream) return Status::InvalidArgument("BatchGet needs a stream");
-  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-  aclmdlRI graph = nullptr;
-  scatter_host::Timer capture_timer(scatter_host::kCaptureQuery);
-  const auto capture_result = aclmdlRICaptureGetInfo(
-      static_cast<aclrtStream>(exec.execution.stream), &capture, &graph);
-  capture_timer.Stop();
-  if (capture_result != ACL_SUCCESS)
-    return Error("query stream capture state");
-  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
-    return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  if (!exec.execution.trusted_npu_request) {
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    scatter_host::Timer capture_timer(scatter_host::kCaptureQuery);
+    const auto capture_result = aclmdlRICaptureGetInfo(
+        static_cast<aclrtStream>(exec.execution.stream), &capture, &graph);
+    capture_timer.Stop();
+    if (capture_result != ACL_SUCCESS)
+      return Error("query stream capture state");
+    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+      return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  }
   scatter_host::Timer prior_timer(scatter_host::kPriorDrain);
   auto result = s.Drain();
   prior_timer.Stop();
   if (!result.ok()) return result;
   auto args = s.args;
   scatter_host::Timer input_timer(scatter_host::kInput);
-  result = Input(exec, s.config, &args.request);
+  if (exec.execution.trusted_npu_request) FillInput(*exec.request, s.config, &args.request);
+  else result = Input(exec, s.config, &args.request);
   input_timer.Stop();
   if (!result.ok()) return result;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");

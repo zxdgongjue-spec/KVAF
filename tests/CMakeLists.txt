@@ -1,5 +1,11 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_runtime_batch_get_contract_test runtime_batch_get_contract_test.cc)
+target_link_libraries(kvaf_runtime_batch_get_contract_test PRIVATE kvaf_runtime)
+target_compile_options(kvaf_runtime_batch_get_contract_test PRIVATE
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
+add_test(NAME kvaf_runtime_batch_get_contract_test COMMAND kvaf_runtime_batch_get_contract_test)
+
 add_executable(kvaf_startup_selection_test startup_selection_test.cc)
 target_include_directories(kvaf_startup_selection_test PRIVATE
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)

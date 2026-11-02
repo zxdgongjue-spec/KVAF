@@ -25,6 +25,8 @@ CSV_COLUMNS = (
     "cpu_write_us", "cpu_write_gbps", "aiv_body_us", "aiv_body_gbps",
     "aiv_wall_us", "aiv_wall_gbps", "aiv_input_wall_us", "aiv_notify_to_done_us",
     "aiv_scatter_tail_us", "call_outside_aiv_us",
+    "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
+    "host_stream_sync_us", "host_python_dispatch_us",
 )
 
 
@@ -53,8 +55,8 @@ def arguments(argv=None):
     parser.add_argument("--profile-warmup", type=int, default=1)
     parser.add_argument("--profile-iterations", "--profile-rounds", type=int, default=20,
                         help="0 disables all optional CPU/AIV instrumentation")
-    parser.add_argument("--host-profile", action="store_true",
-                        help="diagnose Host phases in profiled JSON samples; compact CSV stays unchanged")
+    parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None,
+                        help="Host phase timing in profiled CSV/JSON samples (default: enabled when profiling)")
     parser.add_argument("--aiv-clock-mhz", type=float, default=1000.0,
                         help="GetSystemCycle counter: 1000 MHz on Ascend 950; override for other products")
     parser.add_argument("--output-pattern", choices=("dense", "strided"),
@@ -104,6 +106,8 @@ def arguments(argv=None):
         parser.error("token offset exceeds nonnegative int32")
     if args.warmup < 0 or args.profile_warmup < 0 or args.iterations < 1 or args.profile_iterations < 0:
         parser.error("iterations must be positive; warmup/profile counts must be nonnegative")
+    if args.host_profile is None:
+        args.host_profile = bool(args.profile_iterations)
     if args.host_profile and not args.profile_iterations:
         parser.error("host-profile requires nonzero profile-iterations")
     if not math.isfinite(args.aiv_clock_mhz) or args.aiv_clock_mhz <= 0:

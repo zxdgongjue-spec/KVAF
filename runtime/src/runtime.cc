@@ -255,6 +255,10 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
+  if (execution.trusted_npu_request) {
+    validation_timer.Stop();
+    return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
+  }
   const AccessTableState* table = nullptr;
   if (request.access_table.opaque != 0) {
     table = FindAccessTable(request.access_table);

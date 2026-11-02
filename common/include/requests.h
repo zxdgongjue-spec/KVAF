@@ -48,7 +48,7 @@ struct AccessTableDeviceView {
 
 struct BatchGetRequest {
   // CPU BatchGet 必须提供有效 handle。NPU BatchGet 使用 DeviceAccessTable
-  // 重载时也会提供 handle，以便 Runtime 验证 Host 表生命周期；
+  // 重载时也会提供 handle，验证通路用其检查 Host 表生命周期；trusted 通路跳过；
   // 直接传入 addresses/valid Tensor 时 handle 可为空。
   AccessTableHandle access_table;
 
@@ -98,6 +98,11 @@ struct BatchFreeRequest {
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
+  // Caller guarantees a live, contiguous NPU request with the configured
+  // int32/address/uint8 layouts, capacities and token row size, on an eager
+  // stream. Skip Host layout/lifetime/capture preflight; completion semantics
+  // are unchanged. The Python CPU-push scatter adapter supplies this contract.
+  bool trusted_npu_request{false};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。
