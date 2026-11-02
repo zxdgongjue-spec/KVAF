@@ -710,7 +710,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Synchronously read peer HBM. profile=True adds Host stage timings and a device event "
            "interval around the kernel to the returned profile dictionary; profiling is off by default. "
            "Output registrations and their Tensors are retained until detach/shutdown; do not resize their storage. "
-           "Callers guarantee valid, disjoint ranges. validate_ranges=True enables bounds diagnostics only.")
+           "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
+           "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
       .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("export_ticket"))
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)

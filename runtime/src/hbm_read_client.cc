@@ -11,7 +11,6 @@
 namespace kvaf {
 namespace hr=hbm_read;
 namespace {
-constexpr std::size_t kMaxWqes=1U<<20;
 using ProfileClock = std::chrono::steady_clock;
 struct ProfileTimer {
   double* target;
@@ -112,16 +111,15 @@ struct Engine {
   Status RunProbe(const std::vector<hr::Span>& spans,MutableBufferView output,void* stream) {
     if(!transport || !stream || uncertain || local || descriptors.data)
       return Status::InvalidState("raw READ engine is not idle");
+    if(spans.empty() || spans.size()>KVAF_RAW_MAX_WQES)
+      return Status::InvalidArgument("invalid raw probe request count");
     std::vector<std::uint64_t> src,dst;std::vector<std::uint32_t> sizes;
-    for(auto span:spans) {
-      while(span.bytes) {
-        if(src.size()==kMaxWqes)return Status::InvalidArgument("raw READ exceeds 1048576 WQEs");
-        auto n=std::min<std::uint64_t>(span.bytes,65536);
-        src.push_back(span.source);dst.push_back(span.destination);sizes.push_back(n);
-        span.source+=n;span.destination+=n;span.bytes-=n;
-      }
+    for(const auto& span:spans) {
+      if(!span.bytes || span.bytes>UINT32_MAX)
+        return Status::InvalidArgument("raw probe length must fit one uint32 WQE");
+      src.push_back(span.source);dst.push_back(span.destination);
+      sizes.push_back(static_cast<std::uint32_t>(span.bytes));
     }
-    if(src.empty())return Status::InvalidArgument("empty raw READ");
     const std::size_t n=src.size();
     auto s=descriptors.Allocate(n*20);if(!s.ok())return s;
     auto* d=static_cast<std::uint8_t*>(descriptors.data);
@@ -215,7 +213,7 @@ struct Engine {
                                      " span="+std::to_string(first.failed_request_index));
     }
     const auto n=host.front().total_wqes;
-    if(!n || n>kMaxWqes || (args.input_mode==KVAF_RAW_NPU_OFFSETS ? n<args.request_count : n!=args.request_count))
+    if(!n || n!=args.request_count)
       return Status::InDoubt("invalid raw READ final WQE count");
     for(std::uint32_t c=0;c<cores;++c) {
       const auto& record=host[c];const auto& status=record.execution;

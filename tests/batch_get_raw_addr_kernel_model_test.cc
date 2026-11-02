@@ -144,20 +144,25 @@ void TestFusedOffsets(std::vector<int64_t> src, std::vector<int64_t> dst,
   f.args.request_count=src.size();f.args.input_mode=KVAF_RAW_NPU_OFFSETS;
   f.args.validate_ranges=error!=0 || diagnostics;
   std::vector<uint8_t> expected(f.output.size(),0xa5);
-  uint64_t chunks=0;
-  if(!error)for(size_t i=0;i<src.size();++i){std::memcpy(expected.data()+dst[i],f.remote.data()+src[i],lengths[i]);
-    chunks+=lengths[i]/65536+(lengths[i]%65536!=0);}
+  const uint64_t wqes=error?0:src.size();
+  if(!error)for(size_t i=0;i<src.size();++i)
+    std::memcpy(expected.data()+dst[i],f.remote.data()+src[i],lengths[i]);
   // Run high cores first as well: a bad span outside a core's assigned WQE
   // slice must still prevent every core from posting any work.
   for(int repeat=0;repeat<2;++repeat){
     const auto before=aiv_model::doorbells;
     std::fill(f.output.begin(),f.output.end(),0xa5);
     for(uint32_t n=0;n<f.cores;++n){const auto c=repeat?f.cores-1-n:n;
+      uint64_t before_wqes=0;
+      for(uint32_t j=0;j<jettys;++j)before_wqes+=aiv_model::hardware[c*jettys+j].producer;
       aiv_model::core=c;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
       CHECK(f.statuses[c].execution.magic==KVAF_AIV_BATCH_GET_STATUS_MAGIC);
       CHECK(f.statuses[c].execution.result==error);
-      CHECK(f.statuses[c].total_wqes==chunks);
-      CHECK(f.statuses[c].posted_wqes==chunks*(c+1)/cores-chunks*c/cores);
+      CHECK(f.statuses[c].total_wqes==wqes);
+      CHECK(f.statuses[c].posted_wqes==wqes*(c+1)/cores-wqes*c/cores);
+      uint64_t after_wqes=0;
+      for(uint32_t j=0;j<jettys;++j)after_wqes+=aiv_model::hardware[c*jettys+j].producer;
+      CHECK(after_wqes-before_wqes==f.statuses[c].posted_wqes);
       if(error)CHECK(f.statuses[c].execution.processed_request_count==0);
     }
     CHECK(f.output==expected);
@@ -180,12 +185,13 @@ int main(){
   // identical writes so this test does not depend on concurrent write order.
   TestFusedOffsets({7,7},{3,3},{656,656});
   TestFusedOffsets({7,7},{3,3},{656,656},0,2,2,2048,300000,true);
-  // The default fast path counts/splits lengths without reading source or
-  // destination metadata; bounds diagnostics are explicitly opt-in.
-  {std::vector<int64_t> sizes{656,100001};uint32_t count=0;uint64_t result=0,failed=UINT64_MAX;
-    ValidateAndCountRaw(nullptr,nullptr,sizes.data(),sizes.size(),0,0,&count,&result,&failed);
-    CHECK(result==kSuccess && count==3 && failed==UINT64_MAX);}
-  TestFusedOffsets({0},{0},{65537},0,4,1,8); // one span split across cores, including idle cores
+  // The default fast path never pre-scans metadata, including lengths.
+  {uint64_t result=0,failed=UINT64_MAX;
+    ValidateRawMetadata(nullptr,nullptr,nullptr,4096,0,0,&result,&failed);
+    CHECK(result==kSuccess && failed==UINT64_MAX);}
+  TestFusedOffsets({0},{0},{65537},0,4,1,8); // one WQE, including idle cores
+  TestFusedOffsets({0},{0},{65535});
+  TestFusedOffsets({0},{0},{83968},0,2,2,2048,300000,true);
   TestFusedOffsets({INT64_MAX},{0},{1},kInvalidLookup);
   TestFusedOffsets({0},{INT64_MAX},{1},kInvalidOutput);
   {std::vector<int64_t> src(4096),dst(4096),sizes(4096);
@@ -219,10 +225,10 @@ int main(){
     for(uint32_t c=0;c<2;++c){aiv_model::core=c;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);CHECK(f.statuses[c].execution.result==kInvalidArgs);}
     CHECK(before==aiv_model::doorbells);
   }
-  // Reject count expansion beyond the ABI limit without accessing the payload.
-  {Fixture f(1,2,2,2048);std::vector<int64_t> src{0},dst{0},sizes{int64_t(KVAF_RAW_MAX_WQES)*65536+1};
+  // Diagnostics reject lengths that would truncate in the WQE uint32 field.
+  {Fixture f(1,2,2,2048);std::vector<int64_t> src{0},dst{0},sizes{int64_t(UINT32_MAX)+1};
     for(auto& e:f.entities){e.remote_host_ddr_address=0x10000;e.remote_host_ddr_size=sizes[0];e.local_hbm_address=0x10000000000ULL;e.local_hbm_size=sizes[0];}
-    f.args.output=0x10000000000ULL;f.args.input_mode=KVAF_RAW_NPU_OFFSETS;f.args.request_count=1;
+    f.args.output=0x10000000000ULL;f.args.input_mode=KVAF_RAW_NPU_OFFSETS;f.args.request_count=1;f.args.validate_ranges=1;
     f.args.source_addresses=reinterpret_cast<uint64_t>(src.data());f.args.destination_addresses=reinterpret_cast<uint64_t>(dst.data());f.args.lengths=reinterpret_cast<uint64_t>(sizes.data());
     auto before=aiv_model::doorbells;
     for(uint32_t c=0;c<2;++c){aiv_model::core=c;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);CHECK(f.statuses[c].execution.result==kInvalidArgs);CHECK(!f.statuses[c].posted_wqes);}
@@ -236,7 +242,7 @@ int main(){
   {Fixture f(2,1,1,2048);f.src[1]=UINT64_MAX;auto before=aiv_model::doorbells;f.Run(2,kInvalidLookup);CHECK(before==aiv_model::doorbells);}
   {Fixture f(2,1,1,2048);f.dst[1]=UINT64_MAX;f.Run(2,kInvalidOutput);}
   {Fixture f(2,1,1,2048);f.lengths[1]=0;f.Run(2,kInvalidLookup);}
-  {Fixture f(2,1,1,2048);f.lengths[1]=65537;f.Run(2,kInvalidLookup);}
+  {Fixture f(2,1,1,2048);f.lengths[1]=f.output.size()+1;f.Run(2,kInvalidOutput);}
   for(bool timeout:{false,true}){Fixture f(8193,1,2,2048);aiv_model::hardware[1].timeout=timeout;aiv_model::hardware[1].error=!timeout;
     f.Run(8193,timeout?kCqTimeout:kCqError);CHECK(f.queues[0].poisoned&&f.queues[1].poisoned);
     auto before=aiv_model::doorbells;f.Run(1,kInvalidQueue);CHECK(before==aiv_model::doorbells);}

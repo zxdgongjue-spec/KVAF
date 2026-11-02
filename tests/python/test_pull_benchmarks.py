@@ -79,12 +79,19 @@ class PullBenchmarks(unittest.TestCase):
         self.assertEqual(round_counts(args), (110, 131))
         args.profile_iterations = 0
         self.assertEqual(round_counts(args), (110, 110))
+        # Large requests stay one WQE each; only the WQE byte-count field limits length.
+        args = parse_args(common + ["--packet-bytes", "16777217", "--source-space-bytes", "100000000000"])
+        self.assertEqual(args.packet_bytes, 16777217)
+        args = parse_args(common + ["--packets", "1", "--packet-bytes", str((1 << 32) - 1),
+                                   "--source-space-bytes", str(1 << 32)])
+        self.assertEqual(args.packet_bytes, (1 << 32) - 1)
         for invalid in (["--packets", "4097"], ["--packet-bytes", "0"],
                         ["--source-space-bytes", "1"], ["--device-a", "7"],
                         ["--aiv-cores", "4", "--jettys-per-core", "2"],
                         ["--max-inflight-total", "3"], ["--iterations", "0"],
                         ["--profile-iterations", "-1"],
-                        ["--packet-bytes", "16777217", "--source-space-bytes", "100000000000"]):
+                        ["--packets", "1", "--packet-bytes", str(1 << 32),
+                         "--source-space-bytes", str(1 << 32)]):
             with self.subTest(invalid=invalid), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     parse_args(common + invalid)

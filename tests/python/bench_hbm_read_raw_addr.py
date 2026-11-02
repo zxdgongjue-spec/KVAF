@@ -33,7 +33,7 @@ def parse_args(argv=None):
     parser.add_argument("--profile-iterations", type=int, default=20,
                         help="separate instrumented rounds, excluded from bandwidth; 0 disables")
     parser.add_argument("--validate-ranges", action="store_true",
-                        help="enable optional source/output bounds diagnostics; no overlap detection")
+                        help="enable optional length/source/output bounds diagnostics; no overlap detection")
     parser.add_argument("--aiv-cores", type=int, default=2)
     parser.add_argument("--jettys-per-core", type=int, default=2)
     parser.add_argument("--max-inflight-total", type=int, default=2048)
@@ -41,12 +41,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.device_a == args.device_b:
         parser.error("use two distinct NPUs")
-    if not 1 <= args.packets <= 4096 or args.packet_bytes < 1:
-        parser.error("packets must be in 1..4096; packet-bytes must be positive")
+    if not 1 <= args.packets <= 4096 or not 1 <= args.packet_bytes <= (1 << 32) - 1:
+        parser.error("packets must be in 1..4096; packet-bytes must be in 1..UINT32_MAX")
     if not args.packets * args.packet_bytes <= args.source_space_bytes <= (1 << 63) - 1:
         parser.error("source-space-bytes must fit all packets and signed int64 offsets")
-    if args.packets * ((args.packet_bytes + 65535) // 65536) > 1048576:
-        parser.error("packet splitting exceeds the raw READ limit of 1048576 WQEs")
     if args.iterations < 1 or min(args.warmup, args.profile_warmup, args.profile_iterations) < 0:
         parser.error("iterations must be positive; warmup/profile counts must be nonnegative")
     if args.aiv_cores < 1 or args.jettys_per_core < 1 or args.aiv_cores * args.jettys_per_core > 4:

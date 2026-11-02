@@ -96,8 +96,9 @@ class NpuRuntime final : public Runtime {
   Status AttachHbm(const std::string& address, const HbmReadTicket&,
                    const std::string& local_eid = "");
   // As with BatchGet, output registrations are cached until detach/shutdown.
-  // Keep output storage alive and at a stable address until then. Callers own
-  // range validity and destination disjointness; validate_ranges checks bounds only.
+  // Keep output storage alive and at a stable address until then. Callers guarantee
+  // valid, disjoint ranges and lengths in 1..UINT32_MAX within device READ limits.
+  // Each request produces one WQE; validate_ranges checks lengths and bounds.
   Status BatchGetRawAddr(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
                          HbmReadProfile* profile = nullptr, bool validate_ranges = false);

@@ -138,9 +138,9 @@ lengths[N]
 
 三个数组的元素数量必须相同，范围为 1～4096，偏移非负，每个 `lengths[i]` 大于零。CPU Pull 在 Host 检查数值并保存连续 `uint64_t` 快照，然后通过控制协议发送到 CPU service；接口返回或抛出异常后，应用可以复用这三组 CPU 元数据。
 
-NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数量，Host 另检查元数据存储不与整个 output 分配范围重叠。随后只启动一次 raw READ V2 算子，检查正长度及 WQE 数量并在填写 WQE 时直接计算基址加偏移。当前默认由应用保证源/目的范围合法、目的段不重叠；`validate_ranges=True` 可开启源/目的边界诊断，不检查目的重叠。所有段都不超过 64 KiB 时按下标直接生成 WQE；存在长段时，每核在 UB 建立分段数量的前缀表，通过 WQE 序号定位原段和段内偏移。最多 4096 个输入段、1048576 个 WQE。
+NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数量，Host 另检查元数据存储不与整个 output 分配范围重叠。随后只启动一次 raw READ V2 算子，每个输入段直接生成一个 WQE，填写时计算基址加偏移并读取对应长度。默认不预扫描长度，由应用保证每条长度为 1..UINT32_MAX 且符合设备单次 READ 上限、源/目的范围合法、目的段不重叠；`validate_ranges=True` 可开启正长度、32 位长度字段及源/目的边界诊断，不检查目的重叠或查询设备能力。最多 4096 个输入段，对应最多 4096 个 WQE，无 64 KiB 拆分或前缀表。
 
-长段的分配仍按展开后的 WQE 总数划分到各核，避免单个大段集中在一核；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 在同一次算子完成后读取最终状态，检查各核一致的总 WQE 数及各自已提交/处理数量。该实现的真实性能仍需硬件验证。
+各核直接按输入请求数量划分任务，单个请求完整交给一个核处理；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 在同一次算子完成后读取最终状态，检查各核总 WQE 数等于输入请求数，以及各自已提交/处理数量。该实现的真实性能仍需硬件验证。
 
 NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。接口执行期间不得修改或释放它们。Python 绑定保留三数组和 stream 到正常完成或恢复确认安全；output 注册缓存及其 Tensor 引用保留到对应源 detach 或 Runtime shutdown 成功。如果 `pending_raw_addr` 为真，应用仍不得修改或复用本批存储。C++ 调用者自行保持存储有效。已启用的设备内容检查失败时不会发 READ，KVAF 取消已获取的批次；生产端释放该批次后才能发布新的 ReadyToken 重试。
 
@@ -385,7 +385,7 @@ result = runtime.batch_get_raw_addr(
 | `resolve_raw_addr(ready)` | 校验源身份及批次号后恢复控制确认或资源清理，不重发 READ |
 | `detach_hbm(export_ticket)` | 用初始化时的原 ticket 解除连接，并确认对端资源释放；无未决读取时可调用 |
 
-KVAF 在 Host 检查数组布局、元数据/output 不重叠和批次身份；NPU raw READ V2 在同一次执行内校验完整批次，并直接从三个 Tensor 生成 WQE。不会先生成展开的设备描述符数组。
+KVAF 在 Host 检查数组布局、元数据/output 不重叠和批次身份；NPU raw READ V2 直接从三个 Tensor 为每条请求生成一个 WQE；完整批次的长度/边界诊断仅在显式启用时执行。不会先生成展开的设备描述符数组。
 
 该路径不需要 PreparePut、CommitPut 或 AccessTable。A 的源描述符无需绑定 B 的目标 HBM；B 每次传入 output，KVAF 管理读取所需的本地注册和缓冲引用。第一版成功返回时，输出已完成且传输控制确认已结束。
 
@@ -412,7 +412,7 @@ result = runtime.batch_get_raw_addr(
 # 成功返回后，output[0:4096] 和 output[4096:8192] 分别包含上述两段数据。
 ```
 
-output 在读取完成前不得并发覆写。其注册与 BatchGet 一样按地址/长度缓存到 detach/shutdown，Python 同期保留 Tensor 引用，C++ 调用方负责保活；缓存期间不得调整大小或替换底层 storage。若接口因未决传输而失败，应用不得复用该缓冲，直到恢复流程确认可以安全使用。调用方负责范围合法及目的区间不重叠；默认关闭边界诊断，可用 `validate_ranges=True` 显式开启，目的区间两两重叠检查已删除。
+output 在读取完成前不得并发覆写。其注册与 BatchGet 一样按地址/长度缓存到 detach/shutdown，Python 同期保留 Tensor 引用，C++ 调用方负责保活；缓存期间不得调整大小或替换底层 storage。若接口因未决传输而失败，应用不得复用该缓冲，直到恢复流程确认可以安全使用。调用方负责范围合法、目的区间不重叠以及长度为 1..UINT32_MAX 且符合设备单次 READ 上限；默认关闭长度/边界诊断，可用 `validate_ranges=True` 显式开启，目的区间两两重叠检查已删除。
 
 | 参数 | 表示什么 | 数据最终写入哪里 |
 |---|---|---|
@@ -435,7 +435,7 @@ sequenceDiagram
     BC->>BC: 准备 output HBM 和三个连续、等长数组
     BC->>BR: batch_get_raw_addr(ready, src_offsets, dst_offsets, lengths, output, stream)
     BR->>AS: AcquireRaw：源身份和 sequence，无三数组
-    BR->>BR: 一次 raw READ：可选边界诊断、核内分段、生成 WQE、等待 CQ
+    BR->>BR: 一次 raw READ：可选长度/边界诊断、每段生成一个 WQE、等待 CQ
     BR->>BR: Host 检查各核最终状态及 WQE 数量
     BR->>AS: 库内部传输完成确认
     BR-->>BC: 输出就绪，返回结果
@@ -478,7 +478,7 @@ NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是
 | `HbmSource` | 更名为 CpuPullHbmSource，返回长期源描述符 |
 | `HbmReadSource` | 更名为 NpuPullHbmSource，保留独立 NPU 控制协议与绑定实现 |
 | `ready(offsets, lengths, stream)` | 新接口 ready() 只登记批次；应用负责生产完成和数据稳定 |
-| Ready 携带最终源范围，Submit/Acquire 必须逐项匹配 | 具体范围来自 B 的三个数组；CPU Pull 保存 Host 请求快照，NPU Pull 在同一次 READ 算子中校验并直接生成 WQE，控制面只获取批次读取权 |
+| Ready 携带最终源范围，Submit/Acquire 必须逐项匹配 | 具体范围来自 B 的三个数组；CPU Pull 保存 Host 请求快照，NPU Pull 在同一次 READ 算子中按需诊断并直接生成 WQE，控制面只获取批次读取权 |
 | PreparePut/CommitPut 隐藏在 RuntimeCore 的完整 Offload 中 | 增加受 Runtime 状态管理的公开事务接口 |
 | CPU Submit 隐藏在 RemotePullOperator | 增加 submit/query/wait 接口，由同一 put 管理预留、传输与提交 |
 | CPU 目的地址必须落在 slot 起点 | 支持本次预留有效范围内的拆分和槽内偏移，保持覆盖、归属及不重叠检查 |

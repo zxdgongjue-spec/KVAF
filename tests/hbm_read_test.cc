@@ -74,15 +74,16 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRaw
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
   uint32_t count=a->request_count;uint64_t result=0,failed=UINT64_MAX;
   if(a->input_mode==KVAF_RAW_NPU_OFFSETS)
-    ValidateAndCountRaw(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
-                        local->source_bytes,local->bytes,&count,&result,&failed,a->validate_ranges);
+    ValidateRawMetadata(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
+                        local->source_bytes,local->bytes,&result,&failed,a->validate_ranges);
+  if(result)count=0;
   if(!result)for(unsigned i=0;i<a->request_count;++i){
     const uint64_t n=a->input_mode==KVAF_RAW_NPU_OFFSETS?reinterpret_cast<const int64_t*>(sizes)[i]:sizes[i];
     const uint64_t source=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->source_base+src[i]:src[i];
     const uint64_t destination=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->base+dst[i]:dst[i];
     Require(n && destination>=local->base && n<=local->bytes && destination-local->base<=local->bytes-n,"destination registration");
     std::memcpy(reinterpret_cast<void*>(destination),reinterpret_cast<void*>(source),n);
-    raw_wqes+=n/65536+(n%65536!=0);
+    ++raw_wqes;
   }
   auto* statuses=reinterpret_cast<KvafRawReadCoreStatus*>(a->core_status);
   for(unsigned c=0;c<a->block_count;++c){auto& status=statuses[c];
@@ -188,6 +189,7 @@ int main(){try{
   kvaf::HbmReadProfile profile;
   Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
+  Require(raw_wqes-before_wqes==sources.size(),"one WQE per request, including lengths above 64 KiB");
   const double host_phases=profile.validation_us+profile.acquire_us+profile.buffers_us+profile.register_output_us+
       profile.event_record_us+profile.launch_us+profile.synchronize_us+profile.event_query_us+
       profile.status_us+profile.cleanup_us+profile.complete_us;
@@ -277,5 +279,5 @@ int main(){try{
   // Shutdown must finish even while an idle persistent client is connected.
   Check(b.Shutdown());close(control);
   Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers && !events,"all resources and profiling events retired");
-  std::cout<<"HBM raw READ: real TCP/source/client, split spans, leases, lost ACKs and cleanup passed\n";
+  std::cout<<"HBM raw READ: real TCP/source/client, one WQE per span, leases, lost ACKs and cleanup passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

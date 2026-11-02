@@ -33,7 +33,7 @@ runtime.batch_get_raw_addr(ready, src, dst, sizes, output, stream=a_stream)
 # 成功后由应用通知 B 释放批次；所有批次结束后 runtime.detach_hbm(ticket)。
 ```
 
-源偏移相对于注册 HBM，目的偏移相对于 output，均以字节计。output 和三数组必须在 Runtime 所在 NPU，连续且存储不重叠。与 BatchGet 默认路径一致，调用方负责保证源/目的范围合法及目的段互不重叠；算子不再做目的区间两两重叠检查，默认也不扫描源/目的边界。`validate_ranges=True` 可启用边界诊断，但仍不检测目的重叠。形状、元数据存储/output 别名、正长度及 WQE 拆分上限检查保留。应用保证元数据在传入 stream 上就绪，并保持到完成/恢复结束。
+源偏移相对于注册 HBM，目的偏移相对于 output，均以字节计。output 和三数组必须在 Runtime 所在 NPU，连续且存储不重叠。与 BatchGet 默认路径一致，调用方负责保证源/目的范围合法、目的段互不重叠，并保证每条长度为 1..UINT32_MAX 且不超过设备支持的单次 READ 上限。每条请求直接生成一个 WQE，不拆分；默认不预扫描长度或源/目的范围。`validate_ranges=True` 可启用正长度、32 位长度字段和源/目的边界诊断，但不检测目的重叠或查询设备能力。形状、数量及元数据存储/output 别名检查保留。应用保证元数据在传入 stream 上就绪，并保持到完成/恢复结束。
 
 当前只保留该 NPU Tensor 重载。成功返回 `{"state": "done", "sequence": ready.sequence}`，包含 READ 完成和生产端完成确认。output 按 `(地址, 字节数)` 复用 BatchGet transport 的注册缓存，每批只 Release 引用，detach/shutdown 时统一注销；状态和队列缓冲也跨批复用。Python 绑定保留各缓存 output 的 Tensor 引用直到对应 link 成功 detach 或 runtime 成功 shutdown；期间可读写内容，但不能 resize 或替换底层 storage。C++ 调用方负责保持这些缓冲区的生命周期。同一连接使用越多不同 output，缓存占用也越大，固定 output 的稳定态只注册一次。
 
@@ -66,7 +66,7 @@ print(result["profile"])
 | `host_other_us` | 原生总时间减去上述 Host 阶段的余量 |
 
 `kernel_event_us` 使用 `ACL_EVENT_TIME_LINE` 和 `aclrtEventElapsedTime`，毫秒转微秒。
-它覆盖 raw READ 算子中的可选边界诊断、长度统计/分段、WQE 提交和 CQ 等待，属于设备 stream 的事件区间，
+它覆盖 raw READ 算子中的可选长度/边界诊断、WQE 生成与提交和 CQ 等待，属于设备 stream 的事件区间，
 并非仅网络传输时间或各核时间的累加；也可能包含事件与设备调度开销。
 该区间与 Host 的 launch/synchronize 重叠，不能再加到 Host 阶段总和中。
 用法依据 [CANN 设备事件计时接口](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0090.html)。
@@ -78,7 +78,7 @@ print(result["profile"])
 
 ## 算子与资源
 
-raw READ V2 在同一次算子中完成长度统计、分段、WQE 提交和 CQ 等待。默认不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。短段直接索引，长段通过 UB 前缀表定位；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。Host 只读取最终状态，设备状态每批清零以排除上批结果。
+raw READ V2 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总数等于输入请求数，各核按请求数量划分任务；默认不预扫描长度，也不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。所有请求均按下标直接索引，无分段前缀表或查找；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。Host 只读取最终状态，设备状态每批清零以排除上批结果。
 
 仅建链的 all-lane 探测仍使用内部 Host 绝对地址描述符模式，不再作为公开数据读取接口。探测失败必须确认 kernel 已退出且 initiator 队列成功销毁后才能换候选。
 
@@ -86,7 +86,7 @@ KVHR v4 控制协议只传源/连接身份和批次号，不传三数组或 payl
 
 同一个 reader 的控制请求复用 TCP 连接，双方启用 TCP_NODELAY；服务端轮询多连接，空闲连接不阻塞其他请求。服务端通过 v4 Response 的保留字段声明连接复用能力，旧服务端自动回退为单请求连接。通信结果不确定时关闭连接，由既有 resolve 流程恢复，不自动重发请求。Acquire/Complete 和同步返回继续保留，用于保证 B 的 ready/release_batch 复用时序。
 
-每批最多 4096 段、拆分后最多 1048576 个 WQE，每段 READ 最多 64 KiB；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
+每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
 
 使用 `KvafExecuteBatchGetRawAddrAivKernelV2`，旧 V1 object 不兼容。NPU 运行库和 raw kernel object 需一起重编译。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
 
@@ -131,7 +131,7 @@ python tests/python/test_hbm_read_raw_addr.py \
 若 attach 已明确失败且没有未解决的传输，A 会通知 B 关闭源，避免 B 等待 attached 超时。
 
 本地无 Ascend 硬件时，`kvaf_batch_get_raw_addr_kernel_model_test` 运行实际 AIV 源码的 CPU 模型；
-`kvaf_hbm_read_test` 使用真实 TCP/source/client 与假 ACL/HCCP 验证状态、分段、丢 ACK 和清理。
+`kvaf_hbm_read_test` 使用真实 TCP/source/client 与假 ACL/HCCP 验证状态、每段一个 WQE、丢 ACK 和清理。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
 
 ## 随机离散包性能测试
@@ -154,13 +154,13 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。CPU 服�
 初始化；数据直接从 B HBM 读取到 A HBM，不经过 CPU DDR。
 
 - `--packets`：包数量，1..4096；兼容 `--blocks`。
-- `--packet-bytes`：每包字节数，所有包相同；兼容 `--block-bytes`。大包自动拆成至多 64 KiB 的 WQE，整批最多 1048576 个 WQE。
+- `--packet-bytes`：每包字节数，所有包相同；兼容 `--block-bytes`。每包直接生成一个 WQE，长度须为 1..UINT32_MAX 且满足设备单次 READ 上限。
 - `--source-space-bytes`：B 注册的 HBM 空间大小，至少容纳所有包。以包大小划分槽位，随机抽取不重复槽位，源地址按随机顺序读取；不足一个槽位的尾部不使用。
 - `--seed`：默认 123，可复现布局。目的 output 连续排列，首尾各留 64 字节 guard。
 - `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
 - `--max-inflight-total`：默认 2048，含义与 BatchGet 一致。
 - `--profile-warmup` / `--profile-iterations`：单独的内部计时轮次，默认 1/20；设为 `--profile-iterations 0` 即只运行未插桩的带宽测试。
-- `--validate-ranges`：打开可选源/目的边界诊断，默认关闭；不包含目的重叠检测。日志标记 `validate_ranges` 和 `output_registration_cache=1`，首次 output 注册计入 warmup（warmup 为 0 时计入测量）。
+- `--validate-ranges`：打开可选正长度、32 位长度字段及源/目的边界诊断，默认关闭；不包含目的重叠检测。日志标记 `validate_ranges` 和 `output_registration_cache=1`，首次 output 注册计入 warmup（warmup 为 0 时计入测量）。
 
 输出 `NPU_HBM_BENCH_PASS` 的吞吐和分位数只使用 `--iterations` 轮的
 Python `batch_get_raw_addr()` 完整调用时间，未打开内部计时。
