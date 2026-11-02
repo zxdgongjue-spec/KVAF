@@ -35,17 +35,19 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 只在 bank 复用前等待该 bank 写完，使下一批输入与上一批写出重叠；末尾等待两个 bank 全部完成。
 尾批按实际行数搬运，超过 32 KiB 的单行使用原有精确分段路径。
 清单构建按 8 条地址（64 B）分组分给各核，避免两个核写同一缓存行。
-每核按 256 条一批把 index/offset/output row 搬入 UB，在 UB 校验并生成源地址，
+每核按 256 条一批把 index/offset 搬入 UB 并生成源地址；检查路径另加载 output row。
 再一次 DMA 写回这批 descriptor。1024 项、4 核时每核构建 256 项。
-地址表不超过 4096 项时，每个参与核将 address/valid 表批量载入 UB；更大的表保留
+地址表不超过 4096 项时，每个参与核将 address 表批量载入 UB（检查路径另加载 valid）；更大的表保留
 安全的标量表查找，但请求输入和 descriptor 仍批量搬运。构建最多使用 41 KiB UB，
 之后与 payload bank 复用同一 UB 地址范围。
 
 省略第二遍 Source 读取、逐条 GM descriptor 写、对应的逐缓存行清单刷新，
 以及每核对整个 request capacity 的索引/偏移/输出行号缓存刷新。
 不变量（block 大小、源区域最大合法偏移）移出逐项循环，索引/offset/输出行号的负值与上界判断合并。
-只检查有效前缀；空请求直接完成。索引、offset、valid、源地址和输出行号的合法性判断
-仍保留，因为 Host 只验证 Tensor 形状，不能证明 NPU Tensor 内容合法。
+只处理有效前缀；空请求直接完成。Python CPU-push scatter 沿用可信输入契约，
+调用方保证有效前缀的索引、offset、源地址、valid 和唯一输出行号合法；该路径省略逐项检查，
+不再加载 valid 和用于检查的 output row。普通 C++ 检查路径保留全部内容检查。
+地址表 DMA 与第一批请求输入共用一次等待，避免先等表、再等首批输入。
 payload 的输出行号仍通过标量 GM 读取，只刷新本核实际使用的行号片段。
 staging payload 仅通过 DMA 读取并禁用 L2 cache，去掉搬运前逐 64 B 的标量 DCache 刷新；
 这个公共清理同时应用于 fused/reference，CPU done、DMA 完成等待和标量控制字的缓存维护保留。
@@ -53,7 +55,7 @@ staging payload 仅通过 DMA 读取并禁用 L2 cache，去掉搬运前逐 64 B
 
 每核 descriptor DMA 完成后在独立缓存行发布当前 sequence；core 0 等待全部核就绪，
 再写请求头和 notify。任一核校验失败或构建等待超时都不发布本轮 notify。
-这些完成标记位于 CPU layout 后的私有尾部，CPU 服务和 URMA 数据路径不变。
+这些构建完成标记位于 CPU layout 后的私有尾部，不能省略。
 仍在整批 CPU done 后开始 scatter，现有 CPU/AIV 计时边界可以直接对比。
 
 两项改动使用**测试时开关**，默认均为 1，同一 Host 和 kernel 二进制支持四种组合：
@@ -71,9 +73,9 @@ Host 在 `initialize()` 读取一次，之后修改环境变量不影响当前�
 初始化日志包含 `SCATTER_OPTIONS version=1 fused_build=... double_buffer=... build=parallel_ub`
 （关闭时为 `build=serial_two_pass`），确认实际选项。
 flags 通过现有 176 B 参数的 reserved 字传入，使用新版标签并独立保留 profile bit；
-不改 Python/C++ 公共接口、CPU URMA 协议或计时窗口。
+不改 Python/C++ 方法签名或计时窗口。
 本次需同时重编译 NPU Host 和 kernel：Host 为每核新增一个私有完成缓存行。
-之后切换组合不需重编译；CPU 服务不需因本次改动重编译。
+之后切换组合不需重编译。下述控制路径优化需要同时重编译并重启 CPU 服务。
 旧 zero/profile-only 参数仍选择两遍清单、单 bank；构建/测试时应始终使用配套 Host 和 kernel。
 
 所有运行时组合均保留最多 64 KiB 的静态 UB 地址范围；payload 单 bank 使用前 32 KiB，
@@ -309,9 +311,9 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 | --- | --- | --- |
 | `baseline.end_to_end_ns` | Python 调用同步 BatchGet，直到传输、scatter、状态 D2H/同步及业务状态核验完成 | 正常完整通路有效带宽，作为主要性能结果 |
 | `profiled.end_to_end_ns` | 相同区间，启用计时报告 | 包含打点和报告传输开销，用于对照 |
-| `cpu_comm_ns` | CPU 首次调用提交 payload WRITE 前 → 最后一波 payload/ready 尾 CQ 处理完成 | CPU DDR→HBM staging 的有效通信带宽 |
-| `cpu_write_ns` | CPU WriteBatch 入口 → 全部 payload/ready CQ 完成 | 包括 WR plan 准备、源地址刷新等 CPU 开销的有效带宽 |
-| `cpu_header_ns` / `cpu_descriptor_ns` | CPU READ 请求头 / 地址清单 | 控制面读耗时，只报告延迟 |
+| `cpu_comm_ns` | CPU 首次调用提交 payload WRITE 前 → 最后一波 payload 尾 CQ 处理完成（旧进度模式另含 ready） | CPU DDR→HBM staging 的有效通信带宽 |
+| `cpu_write_ns` | CPU WriteBatch 入口 → 全部 payload CQ 完成 | 包括 WR plan 准备、源地址刷新等 CPU 开销的有效带宽 |
+| `cpu_header_ns` / `cpu_descriptor_ns` | CPU 合并 READ 请求头/上次 count 前缀 / count 增长时补读清单尾部 | 控制面读耗时，只报告延迟；旧版分别计 header / 全清单 |
 | `cpu_post_ns` / `cpu_cq_wait_ns` | 各波 post / CQ 等待耗时之和 | CPU 阶段延迟，不单独作为 payload 带宽 |
 | `aiv_body_ns` | 各核入口打点 → 本核 scatter 完成打点，取每核时长最大值 | AIV 主体有效带宽；不是整个 stream 的 event 时间 |
 | `aiv_input_ns` | 各核输入/cache 准备时间，取最大值 | 输入准备延迟 |
@@ -376,8 +378,8 @@ end_to_end = call_outside_aiv + aiv_wall
 若 AIV wall 大于同步调用时长，测试报错，需检查计数器换算。
 旧 `aiv_body`/`aiv_scatter` 保留“最大单核区间”的含义，不能将各阶段单独取最大值后相加。
 
-`cpu_comm_ns` 包含 CPU posting、四路 Jetty 的 ready 控制 WRITE、波次间间隔和
-完成轮询处理；不是纯链路时延或理论线速。CPU 只在全部 payload/ready CQ 完成
+`cpu_comm_ns` 包含 CPU posting、波次间间隔和完成轮询处理；旧进度模式另含四路 Jetty 的
+ready 控制 WRITE。它不是纯链路时延或理论线速。CPU 只在全部 payload 尾 CQ 完成
 后发布 done。AIV 的 notify→done 不能替代 CPU→HBM 通信窗口。
 
 CPU、Host、AIV 分别在自己的时钟域计算时长，不跨域相减绝对时间戳，也不把重叠阶段相加
@@ -401,12 +403,68 @@ NPU 消费和完整校验，因此只是整个测试程序的 wall 吞吐，不�
 1024 行 chunk 的共同 ready 前缀流水消费，CPU WRITE 可以与 AICPU scatter 重叠。
 对齐测试输入不会自动消除这项实现差异。同步调用完成始终表示整个有效前缀已完成。
 
-profiled 轮新增 CPU 本地计时、每核 128 B 报告和一个 56 B 控制 WRITE/CQ 等待，
-后者在 done 之前完成以保证报告先于完成标记可见，避免依赖 64 B WRITE 原子性。
-该控制 WRITE 不计入 `cpu_comm_ns`，但会增加 AIV 等待和该轮端到端时间。
+profiled 轮新增 CPU 本地计时、每核 128 B 报告和一个 56 B 控制 WRITE。
+当前将报告 WRITE 与 8 B done WRITE 链接后一次提交，仅等待尾部 CQ；done 使用强放置顺序，
+保证报告先于完成标记可见，避免依赖 64 B WRITE 原子性，也避免单独等待报告的一次往返。
+该控制链不计入 `cpu_comm_ns`，但计入 AIV 等待和该轮端到端时间。
 snapshot D2H 不计入单次计时。`instrumentation_overhead_included=true` 标记该轮，
 不要把它作为关闭打点后的基线性能。热路径不打印逐请求计时日志。
 `snapshot_ns` 在 JSON 中单独记录回读/转换耗时；CSV 记录 sequence 便于对应 JSON 原始请求。
+
+## 小包控制与 Host 路径优化
+
+当前 scatter 在 Request 的已有 reserved 位声明 `kBatchDoneOnly`，CPU 保持原有 workspace
+偏移，但不再写 AIV 不读取的逐 worker/chunk/Jetty Ready 进度。CPU 直接将有效前缀
+分配给四条 Jetty，每条尾 WR 强放置排序并产生 CQE；所有 payload 尾 CQE 到齐后才提交
+最终 done。构建 ready、错误传播、超时、整批 done 和 scatter DMA 完成等待均保留。
+未声明该位的消费者仍使用原有进度协议，写计划缓存同时区分 count 与该模式。
+
+1024 项、4 核、max_sge=16、message_bytes=65536 时，656 B 和 4096 B 均为 64 条
+payload WR：移除 16 条 Ready WR 后，总数从 80 减到 64，post 仍为 4 次，payload 尾 CQE
+仍为 4 个。WR 减少不代表带宽按比例增加，需看完整调用实测。
+
+CPU 在观察到新 notify 后，将 header 和上次 count 对应的 descriptor 前缀合并 READ。
+相同/更小 count 时不再单独读 descriptor；首次或 count 增长时补读缺少的尾部，较大
+请求仍按设备 message_bytes 分段。每次都重新读取地址内容，不缓存地址；支持每轮
+更换源和同指针内容变化。notify 轮询仍保留。稳态小包由 notify/header/descriptor
+三步变为 notify/合并前缀两步，不会把整个 capacity 的 65536 个地址都读回来。
+
+计时字段沿用原有 32 列：合并 READ 计入 JSON 的 `cpu_header_ns`；`cpu_descriptor_ns`
+仅记录 count 增长时的补读，稳定 count 时为 0。CPU 通信仍为 payload 首次 post 至末尾
+CQE 的完整窗口；Ready 在新模式中不再参与。profile 报告和最终 done 在该窗口之外，
+但仍在 `aiv_notify_to_done_us` 和端到端计时之内。
+
+Host 复用 Python 方法名，使用 CPython method vectorcall 读取当前 Tensor 指针/尺寸，
+避免重复构造绑定方法与调用参数元组；显式 stream 只取一次 `npu_stream`。不缓存
+Tensor 指针或尺寸，不依赖固定输入对象，不增加 PyTorch C++ 依赖。方法签名不变。
+kernel 提交、各核 status 回拷、一次 stream 同步和执行结果检查仍是同步调用的必要步骤。
+
+本次需重编译 NPU binding/Host/kernel 和 CPU service，并重启 CPU service。
+旧 Host/新 kernel 的 trusted 位、旧 CPU 服务的 Ready 行为会影响对照，测试使用配套产物。
+Linux/URMA 环境新增 `kvaf_cpu_push_transport_test`，执行真实 Transport 的延迟 URMA
+替身：检查 count 增长/缩小/不变、地址变化、65536 项多波次、旧/新进度模式切换、
+精确有效前缀、报告/done 顺序及 CQ 错误；不用于宣称硬件可见性或性能已通过。
+
+仍用完整端到端测试对比旧版和新版，保留相同 CPU 服务、EID、核数和输入设置：
+
+```bash
+cmake --build build-cpu --target kvaf_cpu_service kvaf_cpu_push_transport_test -j
+ctest --test-dir build-cpu -R kvaf_cpu_push_transport_test --output-on-failure
+cmake --build build-npu -j
+ctest --test-dir build-npu -R 'kvaf_sequential_(host_test|batch_get_kernel_model_test)' --output-on-failure
+# 重启更新后的 CPU service，然后运行已有端到端测试；65535 B/多核边界另跑正确性回归。
+for token in 656 4096; do
+  bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
+    --cores 4 --blocks 1024 --tokens-per-block 4 --token-bytes "$token" \
+    --request-length 8192 --miss-count 1024 --input-mode changing \
+    --fused-build 1 --double-buffer 1 --iterations 100 --profile-rounds 100 \
+    --json "results/compact-${token}.json" --csv "results/compact-${token}.csv"
+done
+```
+
+优先比较 baseline 的端到端结果，再用 profiled 的 `cpu_write_us`、`cpu_comm_us`、
+`aiv_build_notify_us`、`call_outside_aiv_us` 与五个 Host 字段归因。只看快样本时，
+预先固定和旧数据相同的筛选规则；同时保留原始样本，不改变有效字节数或计时边界。
 
 ## 扩展组合
 

@@ -12,6 +12,9 @@ constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
 // Opt-in report in Completion::reserved, published before the completion token.
 constexpr std::uint32_t kInlineProfile = 1;
+// The scatter consumer waits for the whole batch, not per-chunk Ready words.
+// Keep the layout and legacy progress mode for older consumers.
+constexpr std::uint32_t kBatchDoneOnly = 2;
 constexpr std::uint64_t kProfileMagic = 0x4b56414650524631ULL;
 inline constexpr std::uint64_t ProfileToken(std::uint64_t sequence) {
   return kProfileMagic ^ (sequence << 32);

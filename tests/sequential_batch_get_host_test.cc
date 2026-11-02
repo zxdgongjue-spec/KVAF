@@ -312,6 +312,7 @@ int main() {
       scatter_host::Session session(&profile);
       assert(owner->Execute(trusted).ok());
     }
+    assert(ScatterOptionEnabled(launch_options.back(), kScatterTrustedInputs));
     assert(capture_queries == captures_before);
     assert(profile.ns[scatter_host::kCaptureQuery] == 0);
     assert(async_copies == copies_before + 1 && synchronizations == syncs_before + 1);

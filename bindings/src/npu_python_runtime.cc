@@ -98,31 +98,57 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
   }
 }
 
-void* TensorPointer(const py::object& tensor) {
-  return PointerFromValue(tensor.attr("data_ptr")().cast<std::uint64_t>());
-}
+// Reuse method-name objects and use CPython's method vectorcall, avoiding an
+// attribute accessor/bound-method/argument-tuple on every trusted tensor read.
+// Cache names only: tensor pointers and sizes are always read for this call.
+struct TensorMetadataMethods {
+  py::str data_ptr{"data_ptr"}, numel{"numel"}, size{"size"};
+  py::int_ zero{0};
+  py::object Call(const py::object& tensor, const py::str& name) const {
+#if PY_VERSION_HEX >= 0x03090000
+    PyObject* result = PyObject_CallMethodNoArgs(tensor.ptr(), name.ptr());
+    if (!result) throw py::error_already_set();
+    return py::reinterpret_steal<py::object>(result);
+#else
+    return tensor.attr(name)();
+#endif
+  }
+  py::object Rows(const py::object& tensor) const {
+#if PY_VERSION_HEX >= 0x03090000
+    PyObject* result = PyObject_CallMethodOneArg(tensor.ptr(), size.ptr(), zero.ptr());
+    if (!result) throw py::error_already_set();
+    return py::reinterpret_steal<py::object>(result);
+#else
+    return tensor.attr(size)(zero);
+#endif
+  }
+  void* Pointer(const py::object& tensor) const {
+    return PointerFromValue(Call(tensor, data_ptr).cast<std::uint64_t>());
+  }
+};
 
 BatchGetRequest TrustedScatterRequest(
     const AccessTableHandle& table, const py::object& addresses,
     const py::object& valid, const py::object& indices, const py::object& offsets,
     const py::object& miss_count, const py::object& output_indices,
-    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block) {
+    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block,
+    const TensorMetadataMethods& methods) {
   // Tensor layout/lifetime is the caller's contract. Read only metadata needed
   // to launch: seven current pointers, two capacities and the output row count.
   // No dtype/device/contiguity/shape checks or cross-call pointer cache.
-  const auto request_bytes = indices.attr("numel")().cast<std::size_t>() * sizeof(std::int32_t);
-  const auto entries = addresses.attr("numel")().cast<std::size_t>();
-  const auto output_rows = output.attr("size")(0).cast<std::size_t>();
+  const auto request_bytes = methods.Call(indices, methods.numel).cast<std::size_t>() * sizeof(std::int32_t);
+  const auto entries = methods.Call(addresses, methods.numel).cast<std::size_t>();
+  const auto output_rows = methods.Rows(output).cast<std::size_t>();
   return BatchGetRequest{
       table,
-      {TensorPointer(indices), request_bytes, DeviceKind::kNpu},
-      {TensorPointer(offsets), request_bytes, DeviceKind::kNpu},
-      {TensorPointer(miss_count), sizeof(std::int32_t), DeviceKind::kNpu},
-      {TensorPointer(output_indices), request_bytes, DeviceKind::kNpu},
-      {TensorPointer(output), output_rows * token_bytes, DeviceKind::kNpu},
+      {methods.Pointer(indices), request_bytes, DeviceKind::kNpu},
+      {methods.Pointer(offsets), request_bytes, DeviceKind::kNpu},
+      {methods.Pointer(miss_count), sizeof(std::int32_t), DeviceKind::kNpu},
+      {methods.Pointer(output_indices), request_bytes, DeviceKind::kNpu},
+      {methods.Pointer(output), output_rows * token_bytes, DeviceKind::kNpu},
       token_bytes, tokens_per_block,
-      {{TensorPointer(addresses), entries * sizeof(Address), DeviceKind::kNpu},
-       {TensorPointer(valid), entries, DeviceKind::kNpu}}};
+      {{methods.Pointer(addresses), entries * sizeof(Address), DeviceKind::kNpu},
+       {methods.Pointer(valid), entries, DeviceKind::kNpu}}};
 }
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
@@ -514,8 +540,8 @@ class NpuPythonRuntime final {
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
-  // Tensors carry no AccessTableHandle, Runtime validates their NPU layout but
-  // cannot validate a corresponding Host AccessTable lifetime or entry length.
+  // Tensors carry no AccessTableHandle. Checked modes validate their NPU
+  // layout; scatter uses the caller's trusted-input contract in either overload.
   void BatchGetFromTensors(const py::object& addresses,
                            const py::object& valid,
                            const py::object& indices,
@@ -544,7 +570,7 @@ class NpuPythonRuntime final {
     if (trusted_scatter_inputs_) {
       request = TrustedScatterRequest(access_table, addresses, valid, indices, offsets,
           miss_count, output_indices, output, native_->batch_get_token_bytes(),
-          native_->batch_get_tokens_per_block());
+          native_->batch_get_tokens_per_block(), tensor_methods_);
     } else {
       const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
       const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
@@ -595,7 +621,9 @@ class NpuPythonRuntime final {
     }
     tensor_timer.Stop();
     scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
-    const aclrtStream acl_stream = ResolveStream(stream);
+    const aclrtStream acl_stream = trusted_scatter_inputs_ && !stream.is_none() ?
+        reinterpret_cast<aclrtStream>(PointerFromValue(
+            stream.attr("npu_stream").cast<std::uint64_t>())) : ResolveStream(stream);
     stream_timer.Stop();
     Status status;
     {
@@ -615,6 +643,7 @@ class NpuPythonRuntime final {
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  TensorMetadataMethods tensor_methods_;
   bool trusted_scatter_inputs_{false};
   bool host_profile_enabled_{false}, host_profile_ready_{false};
   scatter_host::Profile host_profile_{};

@@ -292,6 +292,7 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   prior_timer.Stop();
   if (!result.ok()) return result;
   auto args = s.args;
+  if (exec.execution.trusted_npu_request) args.reserved |= kScatterTrustedInputs;
   scatter_host::Timer input_timer(scatter_host::kInput);
   if (exec.execution.trusted_npu_request) FillInput(*exec.request, s.config, &args.request);
   else result = Input(exec, s.config, &args.request);

@@ -83,4 +83,18 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   set_property(TARGET kvaf_cpu_service APPEND PROPERTY BUILD_RPATH
     "${KVAF_URMA_LIBRARY_DIR}")
   target_compile_features(kvaf_cpu_service PRIVATE cxx_std_17)
+  if(BUILD_TESTING)
+    add_executable(kvaf_cpu_push_transport_test
+      ${PROJECT_SOURCE_DIR}/tests/cpu_push_get_transport_test.cc)
+    target_include_directories(kvaf_cpu_push_transport_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src "${KVAF_URMA_INCLUDE_DIR}"
+      ${PROJECT_SOURCE_DIR}/access_operator/include)
+    target_link_libraries(kvaf_cpu_push_transport_test PRIVATE
+      kvaf_cpu_runtime "${KVAF_URMA_LIBRARY}")
+    target_link_options(kvaf_cpu_push_transport_test PRIVATE
+      -Wl,--wrap=urma_post_jetty_send_wr -Wl,--wrap=urma_poll_jfc)
+    target_compile_options(kvaf_cpu_push_transport_test PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
+    add_test(NAME kvaf_cpu_push_transport_test COMMAND kvaf_cpu_push_transport_test)
+  endif()
 endif()

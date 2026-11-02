@@ -139,13 +139,26 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     std::memcpy(key.key + sizeof(urma_jetty_id_t), &c.local_jetty->jetty_cfg.jfs_cfg.trans_mode,
                 sizeof(urma_transport_mode_t));
   }
-  auto& done = done_.queues[0];
-  done.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + layout_.done),
-                        sizeof(Completion), control_, nullptr});
-  AppendPrepared(done, 0, hbm_base_ + layout_.done, sizeof(Completion), 1, true);
-  SealPrepared(done_);
+  PrepareCompletions();
   Stage("ready");
   return Status::OK();
+}
+
+void Transport::PrepareCompletions() {
+  auto& done = done_.queues[0];
+  done.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + layout_.done),
+                        sizeof(std::uint64_t), control_, nullptr});
+  // Publish only the aligned token. A profiled completion writes the report
+  // first and strongly orders the token behind it in the same submission.
+  AppendPrepared(done, 0, hbm_base_ + layout_.done, sizeof(std::uint64_t), 1, true);
+  SealPrepared(done_);
+  auto& profiled = profiled_done_.queues[0];
+  profiled.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + layout_.done + 8),
+                           sizeof(Completion::reserved), control_, nullptr});
+  AppendPrepared(profiled, 0, hbm_base_ + layout_.done + 8, sizeof(Completion::reserved), 1);
+  profiled.local.push_back(done.local.front());
+  AppendPrepared(profiled, 0, hbm_base_ + layout_.done, sizeof(std::uint64_t), 1, true);
+  SealPrepared(profiled_done_);
 }
 
 void Transport::ResetRequests(Queue& q) { q.local.clear(); q.remote.clear(); q.wrs.clear(); }
@@ -249,19 +262,27 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   Status result;
   {
     BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
-    result = Transfer(false, layout_.request, sizeof(Request));
+    // Read header and the last observed descriptor prefix together. Notify is
+    // published only after all builders finish. A larger count needs one tail
+    // READ; shrink/same-count calls need no second round trip. Never use a
+    // cached descriptor: refresh the prefix even when its length is unchanged.
+    result = Transfer(false, layout_.request,
+        layout_.descriptor + std::uint64_t{descriptor_prefetch_count_} * 8);
   }
   if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
+  const auto prefetched = descriptor_prefetch_count_;
+  descriptor_prefetch_count_ = r.count;
+  if (r.count <= prefetched) return Status::OK();
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+  return Transfer(false, layout_.descriptor + std::uint64_t{prefetched} * 8,
+                  std::uint64_t{r.count - prefetched} * 8);
 }
 
-// Ported from hbm-sgl-probe PrepareWrite: partition each chunk into contiguous
-// Jetty shards, append ordered ready WRs, and signal only each queue's tail.
+// Each prepared chain signals only its queue's strongly ordered tail.
 void Transport::AppendPrepared(PreparedQueue& q, std::uint32_t queue,
     std::uint64_t remote, std::uint32_t bytes, std::uint32_t sges, bool ordered) {
   q.remote.push_back({remote, bytes, remote_, nullptr});
@@ -293,7 +314,8 @@ void Transport::SealPrepared(PreparedWrite& plan) {
 }
 Status Transport::PrepareWrites(std::uint32_t count) {
   if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
-  if (prepared_count_ == count) {
+  const bool batch_done_only = (request().reserved & kBatchDoneOnly) != 0;
+  if (prepared_count_ == count && prepared_batch_done_only_ == batch_done_only) {
     profile_.plan_reused = true;
     return Status::OK();
   }
@@ -301,8 +323,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
-    ForEachPipelineChunk(count, token_bytes_, workers_,
-      [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
+    const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
         const auto rows = range.end - range.begin;
         const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
         auto row = range.begin + queue * base + std::min(queue, remainder);
@@ -325,6 +346,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           }
           AppendPrepared(q, queue, destination, bytes, sges);
         }
+        if (batch_done_only) return;
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
@@ -333,7 +355,12 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
-      });
+      };
+    // Whole-batch completion has no CPU worker/chunk boundaries. Partition
+    // contiguous staging once across Jettys; their ordered CQ tails still
+    // finish before Complete publishes done on queue 0.
+    if (batch_done_only) append(0, 0, {0, count});
+    else ForEachPipelineChunk(count, token_bytes_, workers_, append);
   }
   std::size_t waves = 0;
   for (const auto& shard : shards) waves = std::max(waves, shard.size());
@@ -346,6 +373,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     if (plan->fence_count) prepared_.push_back(std::move(plan));
   }
   prepared_count_ = count;
+  prepared_batch_done_only_ = batch_done_only;
   return Status::OK();
 }
 void Transport::RefreshPrepared(PreparedQueue& q) {
@@ -460,8 +488,9 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
-  if (profile_.enabled && (request().reserved & kInlineProfile) &&
-      sequence && result == Result::kOk) {
+  const bool report = profile_.enabled && (request().reserved & kInlineProfile) &&
+      sequence && result == Result::kOk;
+  if (report) {
     done->reserved[0] = ProfileToken(sequence);
     done->reserved[1] = profile_.header_read_ns;
     done->reserved[2] = profile_.address_read_ns;
@@ -469,14 +498,13 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
     done->reserved[4] = profile_.first_post_ns ? profile_.last_cqe_ns - profile_.first_post_ns : 0;
     done->reserved[5] = profile_.post_ns;
     done->reserved[6] = profile_.cq_wait_ns;
-    // A 64-byte WRITE need not make its words visible atomically. Complete the
-    // report WRITE first, then publish the sequence/result using the done WR.
-    // This extra control transfer is profiling overhead, outside cpu_comm_ns.
-    const auto report = Transfer(true, layout_.done + 8, sizeof(done->reserved));
-    if (!report.ok()) return report;
   }
-  auto status = BeginPrepared(done_, UINT64_MAX);
-  if (status.ok()) status = PostPrepared(done_.queues[0], 0);
+  // One post and one tail CQE for both paths. The 8-byte strongly ordered
+  // token follows the report's placement; do not combine them into an
+  // unordered 64-byte WRITE (the token could otherwise become visible first).
+  auto& plan = report ? profiled_done_ : done_;
+  auto status = BeginPrepared(plan, UINT64_MAX);
+  if (status.ok()) status = PostPrepared(plan.queues[0], 0);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
   return status;
 }
@@ -533,7 +561,10 @@ Status Transport::Shutdown() {
   tracker_ = Tracker(kJettyCount, kJettyDepth);
   prepared_.clear();
   done_ = {};
+  profiled_done_ = {};
   prepared_count_ = UINT32_MAX;
+  descriptor_prefetch_count_ = 0;
+  prepared_batch_done_only_ = false;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;

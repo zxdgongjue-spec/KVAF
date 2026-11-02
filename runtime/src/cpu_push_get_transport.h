@@ -29,6 +29,7 @@ class Transport {
   const Layout& layout() const { return layout_; }
   std::uint64_t session() const { return session_; }
  private:
+  friend struct TransportTest;
   struct Profile {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
@@ -59,6 +60,7 @@ class Transport {
     Tracker::Handle handle;
   };
   Status PrepareWrites(std::uint32_t count);
+  void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
@@ -75,8 +77,11 @@ class Transport {
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
   PreparedWrite done_;
+  PreparedWrite profiled_done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
+  std::uint32_t descriptor_prefetch_count_{};
+  bool prepared_batch_done_only_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};

@@ -99,8 +99,9 @@ struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
   // Caller guarantees a live, contiguous NPU request with the configured
-  // int32/address/uint8 layouts, capacities and token row size, on an eager
-  // stream. Skip Host layout/lifetime/capture preflight; completion semantics
+  // int32/address/uint8 layouts, capacities and token row size, plus valid
+  // active indices/offsets/source addresses and unique output rows, on an eager
+  // stream. Skip Host preflight and scatter's per-row validation; completion semantics
   // are unchanged. The Python CPU-push scatter adapter supplies this contract.
   bool trusted_npu_request{false};
 };
