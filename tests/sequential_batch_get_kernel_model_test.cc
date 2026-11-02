@@ -491,8 +491,8 @@ int main() {
     Fixture legacy(65, 656, 1, KVAF_SEQ_SCATTER, 6);
     legacy.args.reserved = 0; legacy.Run();
   }
-  // Reference-sized sparse tables: cache maintenance must scale with active
-  // requests, not with the 1.28M-entry table, including in-place table changes.
+  // Reference-sized sparse tables use indexed DMA with no scalar table DCCI,
+  // including changing table contents at the same address between invocations.
   for (const bool trusted : {false, true})
     for (uint32_t workers : {1U, 4U, 8U}) {
       Fixture f(1024, 31, workers, KVAF_SEQ_SCATTER, 6);
@@ -511,8 +511,17 @@ int main() {
           f.addresses[f.indices[i]] = f.args.source_base +
               uint64_t((i + f.args.sequence) % f.count) * f.token * 2;
         const auto flushed = aiv_model::address_table_cache_lines;
+        const auto reads = aiv_model::metadata_reads;
         f.Run();
-        assert(aiv_model::address_table_cache_lines - flushed == count);
+        assert(aiv_model::address_table_cache_lines == flushed);
+        uint64_t tiles = 0;
+        const auto groups = (count + 7U) / 8U;
+        for (uint32_t core = 0; core < workers; ++core) {
+          const auto begin = uint64_t(groups) * core / workers * 8;
+          const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
+          tiles += (end - begin + kBuildTileRows - 1) / kBuildTileRows;
+        }
+        assert(aiv_model::metadata_reads - reads == count * (trusted ? 1 : 2) + tiles * (trusted ? 2 : 3));
       }
       if (!trusted) {
         f.Next(1);
@@ -545,6 +554,7 @@ int main() {
               if (begin < end) expected_reads += (capacity <= kCachedTableEntries ? 1 : 0) +
                   2 * ((end - begin + kBuildTileRows - 1) / kBuildTileRows);
             }
+            if (capacity > kCachedTableEntries) expected_reads += count;
             assert(aiv_model::metadata_reads - reads == expected_reads);
           }
         }

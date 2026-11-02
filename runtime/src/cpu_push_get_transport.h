@@ -52,6 +52,8 @@ class Transport {
     std::vector<urma_jfs_wr_t> wrs;
     std::vector<Source> sources;
     std::vector<Marker> markers;
+    // Whole-batch, unsplit tokens have one SGE per contiguous descriptor row.
+    std::uint32_t first_row{UINT32_MAX};
   };
   struct PreparedWrite {
     std::array<PreparedQueue, kJettyCount> queues;
@@ -65,7 +67,7 @@ class Transport {
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
-  Status PostPrepared(PreparedQueue&, std::uint32_t queue);
+  Status PostPrepared(PreparedWrite&);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&);
   Status ReadControl(std::uint64_t offset, std::uint64_t bytes);
@@ -89,6 +91,7 @@ class Transport {
   std::uint8_t* memory_{};
   std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
+  std::uint32_t post_batch_wrs_{128};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push

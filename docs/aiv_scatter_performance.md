@@ -37,10 +37,12 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 清单构建按 8 条地址（64 B）分组分给各核，避免两个核写同一缓存行。
 每核按 256 条一批把 index/offset 搬入 UB 并生成源地址；检查路径另加载 output row。
 再一次 DMA 写回这批 descriptor。1024 项、4 核时每核构建 256 项。
-地址表不超过 4096 项时，每个参与核将 address 表批量载入 UB（检查路径另加载 valid）；更大的表保留
-按请求条目刷新 DCache 后进行标量表查找，但请求输入和 descriptor 仍批量搬运。大表不再
-由每核刷新整个 address/valid 表；每次调用重新刷新实际使用的条目，以支持同一地址上的表内容更新。
-检查路径先检查 index 上界，再访问/刷新 valid 和 address。构建最多使用 41 KiB UB，
+地址表不超过 4096 项时，每个参与核将 address 表批量载入 UB（检查路径另加载 valid）；更大的表
+按本批 index 发起精确 8 B 的地址条目 DMA，每项使用独立 32 B UB 槽，全部发出后集中等待一次。
+检查路径先检查整批 index/offset/row，再发起 address/valid DMA，避免后续非法索引留下未完成搬运。
+地址与 valid 均从 UB 读取，不再逐项 DCCI 后串行读取 GM；每次调用重新搬入条目，支持表原址更新。
+GM→UB 的非对齐填充规则见 [DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.html)。
+构建最多使用 41 KiB UB，
 之后与 payload bank 复用同一 UB 地址范围。
 
 省略第二遍 Source 读取、逐条 GM descriptor 写、对应的逐缓存行清单刷新，
@@ -436,6 +438,28 @@ snapshot D2H 不计入单次计时。`instrumentation_overhead_included=true` �
 最终 done。构建 ready、错误传播、超时、整批 done 和 scatter DMA 完成等待均保留。
 未声明该位的消费者仍使用原有进度协议，写计划缓存同时区分 count 与该模式。
 
+整批模式下，若 `max_sge×token_bytes <= message_bytes`，每个 token 对应一个 source SGE，
+直接顺序读取当前 descriptor 并刷新 SGE 地址，省去逐项 Source 映射表与二次索引。
+大 token 的分段和旧进度模式继续使用完整映射。每次调用都更新地址，不缓存请求内容。
+payload WR 按提交批次轮转四条 Jetty，使其他队列尽早开始；每次默认提交 128 条 WR，
+仍只在每条队列的最后一条 WR 上请求完成，全部尾 CQE 到齐后才发布 done。
+
+可在启动 CPU 服务时设置 `KVAF_CPU_PUSH_POST_BATCH_WRS`（1..8192，默认 128），
+不改变 kernel ABI 或 NPU Python 接口。修改后需重启服务；该变量应设置在 CPU 服务进程上。
+例如 8192 项、max_sge=13 的 656/1024 B 请求都是 632 条数据 WR：batch=32 时 20 次 post，
+batch=128 时 8 次，batch=256 时 4 次。WR/SGE 的硬件上限与 SQ credit 预算没有放宽。
+减少提交次数不等于同比提高带宽，需对比端到端结果和 JSON 的 cpu_post_ns/cpu_cq_wait_ns。
+`CPU_PUSH_CAP` 记录实际 max_sge、message_bytes、post_batch_wrs 和 optimized；
+性能运行应为 optimized=1，使用常规 Release 构建，显式 Debug 配置不会被程序强制覆盖。
+
+```bash
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu -j --target kvaf_cpu_service kvaf_cpu_push_transport_test
+ctest --test-dir build-cpu -R kvaf_cpu_push_transport_test --output-on-failure
+KVAF_CPU_PUSH_POST_BATCH_WRS=128 \
+  ./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28990 --gather-threads 8
+```
+
 1024 项、4 核、max_sge=16、message_bytes=65536 时，656 B 和 4096 B 均为 64 条
 payload WR：移除 16 条 Ready WR 后，总数从 80 减到 64，post 仍为 4 次，payload 尾 CQE
 仍为 4 个。WR 减少不代表带宽按比例增加，需看完整调用实测。
@@ -637,9 +661,9 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 
 1800 秒是扩大整例准备预算，不改变 URMA/AIV 的内部超时，也不保证通信故障会自行恢复。
 保持完整大表需要足够的 CPU 内存；若需缩表，对照分支也必须使用相同 table-capacity。
-大表 fused build 之前每核刷新约 10 MB 地址表，4 核合计 638,976 条 cache line；
-miss_count=1024 时修复后仅需 1024 次地址条目刷新。reference（fused_build=0）保留原实现用于对照。
-刷新数量的下降不能直接当作实测加速比，收益应比较相同配置的新旧 E2E 和 build_notify 样本。
+大表 fused build 只 DMA 读取本次有效请求用到的地址条目，不扫描完整表，不逐项等待标量 GM 读取。
+reference（fused_build=0）保留原实现用于对照。指令和刷新数量的下降不能直接当作实测加速比，
+收益应比较相同配置的新旧 E2E 和 build_notify 样本。
 
 每配置保存 `.log`、原始 `.json`、原有格式的 32 列 `.csv`；扫描额外保存 `plan.json` 和
 按配置/阶段逐行排列的 `summary.csv`。汇总为 15 列：配置、completion_mode、stage、mean/p50/p90/p99_us、

@@ -20,6 +20,7 @@ std::vector<Posted> posted;
 std::uint64_t done_address{};
 bool fail_cq{};
 std::uint32_t post_calls{};
+std::vector<std::uint32_t> post_queues;
 std::uint64_t Address(const void* p) { return reinterpret_cast<std::uint64_t>(p); }
 }
 
@@ -28,6 +29,7 @@ extern "C" urma_status_t __wrap_urma_post_jetty_send_wr(
   const auto q = static_cast<std::uint32_t>(jetty - jettys.data());
   assert(q < kJettyCount);
   ++post_calls;
+  post_queues.push_back(q);
   pending[q].push_back(wr);
   for (auto* current = wr; current; current = current->next) {
     const auto& dst = current->rw.dst.sge[0];
@@ -72,10 +74,12 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
 
 namespace kvaf::cpu_push {
 struct TransportTest {
-  static void Run(std::uint32_t token, std::uint32_t maximum = 1024) {
+  static void Run(std::uint32_t token, std::uint32_t maximum = 1024,
+                  std::uint32_t max_sge = 16, std::uint32_t post_batch = 128) {
     Transport t;
     assert(MakeLayout(token, 4, &t.layout_));
-    t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = 16; t.max_bytes_ = 65536;
+    t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = max_sge; t.max_bytes_ = 65536;
+    t.post_batch_wrs_ = post_batch;
     // Retain marker space to exercise legacy mode as well as done-only mode.
     void* memory = nullptr;
     assert(!posix_memalign(&memory, 64, t.layout_.staging + 32768));
@@ -113,8 +117,24 @@ struct TransportTest {
       assert(!std::memcmp(t.memory_ + t.layout_.descriptor, addresses, count * 8));
       posted.clear();
       post_calls = 0;
+      post_queues.clear();
       std::memset(hbm.data() + t.layout_.staging, 0xad, std::uint64_t(maximum) * token);
       assert(t.WriteBatch().ok());
+      if (whole && count >= kJettyCount) {
+        for (std::uint32_t q = 0; q < kJettyCount; ++q) assert(post_queues[q] == q);
+        std::uint32_t expected_posts = 0;
+        for (const auto& plan : t.prepared_)
+          for (const auto& q : plan->queues) {
+            expected_posts += (q.wrs.size() + post_batch - 1) / post_batch;
+            if (!q.local.empty() && std::uint64_t{max_sge} * token <= t.max_bytes_) {
+              assert(q.first_row != UINT32_MAX && q.sources.empty());
+              const auto* addresses = reinterpret_cast<const std::uint64_t*>(t.memory_ + t.layout_.descriptor);
+              for (std::size_t i = 0; i < q.local.size(); ++i)
+                assert(q.local[i].addr == addresses[q.first_row + i]);
+            }
+          }
+        assert(post_calls == expected_posts);
+      }
       for (std::uint32_t i = 0; i < count; ++i)
         assert(!std::memcmp(hbm.data() + t.layout_.staging + std::uint64_t(i) * token,
                             reinterpret_cast<void*>(addresses[i]), token));
@@ -126,7 +146,7 @@ struct TransportTest {
       }
       if (whole) assert(markers == 0);
       else if (count) assert(markers > 0);
-      if (count == 1024 && (token == 656 || token == 4096)) {
+      if (count == 1024 && max_sge == 16 && (token == 656 || token == 4096)) {
         assert(data == 64 && tails == 4 && post_calls == 4);
         assert(markers == (whole ? 0 : 16));
       }
@@ -173,5 +193,10 @@ int main() {
   for (auto token : {13U, 656U, 4096U, 65535U}) kvaf::cpu_push::TransportTest::Run(token);
   // Cross SQ-credit/wave and segmented control-READ boundaries.
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests);
+  // Deployed SGE limit, interleaved multi-doorbell queues and reused plans with
+  // changing source addresses. All runtime submission sizes preserve ordering.
+  for (auto batch : {32U, 128U, 256U})
+    for (auto token : {656U, 1024U})
+      kvaf::cpu_push::TransportTest::Run(token, 8192, 13, batch);
   std::cout << "PASS: CPU push coalesced reads, done-only writes and completion ordering\n";
 }

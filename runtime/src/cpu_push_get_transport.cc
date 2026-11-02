@@ -15,7 +15,12 @@
 namespace kvaf::cpu_push {
 namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
-constexpr std::size_t kJettyDepth = 8192, kDoorbellWrs = 32;
+constexpr std::size_t kJettyDepth = 8192;
+#ifdef __OPTIMIZE__
+constexpr unsigned kOptimized = 1;
+#else
+constexpr unsigned kOptimized = 0;
+#endif
 constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
@@ -58,6 +63,14 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
   context_ = context;
+  if (const auto* value = std::getenv("KVAF_CPU_PUSH_POST_BATCH_WRS")) {
+    char* end = nullptr;
+    errno = 0;
+    const auto limit = std::strtoul(value, &end, 10);
+    if (errno || end == value || *end || !limit || limit > kJettyDepth)
+      return Status::InvalidArgument("KVAF_CPU_PUSH_POST_BATCH_WRS must be in 1..8192");
+    post_batch_wrs_ = static_cast<std::uint32_t>(limit);
+  }
   session_ = setup.session_id;
   source_ = source;
   hbm_base_ = setup.hbm_base;
@@ -70,8 +83,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
-  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u\n",
-               max_sge_, max_bytes_, workers_, token_bytes_);
+  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
+               "post_batch_wrs=%u optimized=%u\n",
+               max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
@@ -299,7 +313,7 @@ void Transport::SealPrepared(PreparedWrite& plan) {
       wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(q.local.data() + local);
       wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(q.remote.data() + i);
       local += wr.rw.src.num_sge;
-      wr.next = i + 1 < q.wrs.size() && (i + 1) % kDoorbellWrs ? &q.wrs[i + 1] : nullptr;
+      wr.next = i + 1 < q.wrs.size() && (i + 1) % post_batch_wrs_ ? &q.wrs[i + 1] : nullptr;
     }
     q.wrs.back().flag.bs.complete_enable = 1;
     q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
@@ -329,11 +343,14 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           // BatchGet's existing maximum request/token sizes.
           if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
           auto& q = waves.back();
+          if (batch_done_only && q.local.empty() && std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_)
+            q.first_row = row;
           const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
           std::uint32_t bytes = 0, sges = 0;
           while (row < end && sges < max_sge_ && bytes < max_bytes_) {
             const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-            q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
+            if (q.first_row == UINT32_MAX)
+              q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
             q.local.push_back({0, length, source_, nullptr});
             ++sges; bytes += length; offset += length;
             if (offset == token_bytes_) { ++row; offset = 0; }
@@ -372,7 +389,15 @@ Status Transport::PrepareWrites(std::uint32_t count) {
 }
 void Transport::RefreshPrepared(PreparedQueue& q) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  for (const auto& source : q.sources) q.local[source.local].addr = addresses[source.row] + source.offset;
+  if (q.first_row != UINT32_MAX) {
+    // No per-SGE mapping walk or dependent vector indexing for ordinary small
+    // tokens. Refresh on every call: plans are reusable, source addresses are not.
+    const auto* input = addresses + q.first_row;
+    auto* output = q.local.data();
+    for (std::size_t i = 0; i < q.local.size(); ++i) output[i].addr = input[i];
+  } else {
+    for (const auto& source : q.sources) q.local[source.local].addr = addresses[source.row] + source.offset;
+  }
   for (const auto& marker : q.markers) *marker.value = Progress(request().sequence, marker.progress);
 }
 Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
@@ -388,12 +413,20 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   }
   return Status::OK();
 }
-Status Transport::PostPrepared(PreparedQueue& q, std::uint32_t queue) {
-  for (std::size_t first = 0; first < q.wrs.size(); first += kDoorbellWrs) {
-    urma_jfs_wr_t* bad = nullptr;
-    if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[first], &bad)) {
-      queues_[queue].poisoned = true;
-      return Error("post prepared WRITE chain");
+Status Transport::PostPrepared(PreparedWrite& plan) {
+  std::size_t largest = 0;
+  for (const auto& q : plan.queues) largest = std::max(largest, q.wrs.size());
+  // Start all four Jettys before posting the next slice of any queue. A long
+  // queue must not delay the first doorbell to the remaining three Jettys.
+  for (std::size_t first = 0; first < largest; first += post_batch_wrs_) {
+    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+      if (first >= plan.queues[q].wrs.size()) continue;
+      urma_jfs_wr_t* bad = nullptr;
+      if (urma_post_jetty_send_wr(queues_[q].channel.local_jetty,
+                                &plan.queues[q].wrs[first], &bad)) {
+        queues_[q].poisoned = true;
+        return Error("post prepared WRITE chain");
+      }
     }
   }
   return Status::OK();
@@ -458,15 +491,13 @@ Status Transport::WriteBatch() {
       for (const auto& q : plan.queues) {
         profile_.ready_wrs += q.markers.size();
         profile_.data_wrs += q.wrs.size() - q.markers.size();
-        profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
+        profile_.post_calls += (q.wrs.size() + post_batch_wrs_ - 1) / post_batch_wrs_;
       }
     }
     const auto phase_begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
     if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = phase_begin;
-    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-      status = PostPrepared(plan.queues[q], q);
-      if (!status.ok()) return status;
-    }
+    status = PostPrepared(plan);
+    if (!status.ok()) return status;
     const auto posted = profile_.enabled ? BatchGetProfileNowNs() : 0;
     if (profile_.enabled) profile_.post_ns += posted - phase_begin;
     status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
@@ -498,18 +529,13 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   // unordered 64-byte WRITE (the token could otherwise become visible first).
   auto& plan = report ? profiled_done_ : done_;
   auto status = BeginPrepared(plan, UINT64_MAX);
-  if (status.ok()) status = PostPrepared(plan.queues[0], 0);
+  if (status.ok()) status = PostPrepared(plan);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
   return status;
 }
 
 void Transport::PrintProfile() const {
   if (!profile_.enabled || (request().reserved & kInlineProfile)) return;
-#ifdef __OPTIMIZE__
-  constexpr unsigned optimized = 1;
-#else
-  constexpr unsigned optimized = 0;
-#endif
   const auto& p = profile_;
   const auto& r = request();
   const auto build_ns = p.write_ns - p.post_ns - p.cq_wait_ns;
@@ -523,7 +549,7 @@ void Transport::PrintProfile() const {
       p.header_read_ns / 1000.0, p.address_read_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
       p.cq_wait_ns / 1000.0, p.write_ns / 1000.0, submit_ns / 1000.0, p.done_ns / 1000.0,
       p.data_wrs, p.ready_wrs, p.post_calls, p.waves, p.tail_cqes, p.cpu_threads,
-      unsigned(p.plan_reused), optimized);
+      unsigned(p.plan_reused), kOptimized);
 }
 
 Status Transport::Shutdown() {
@@ -559,6 +585,7 @@ Status Transport::Shutdown() {
   prepared_count_ = UINT32_MAX;
   descriptor_prefetch_count_ = 0;
   prepared_batch_done_only_ = false;
+  post_batch_wrs_ = 128;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;
