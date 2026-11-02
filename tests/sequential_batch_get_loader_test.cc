@@ -39,8 +39,11 @@ int aclrtLaunchKernelWithHostArgs(aclrtFuncHandle function, uint32_t, aclrtStrea
       symbol == kGather ? sizeof(KvafGatherBatchGetArgs) : sizeof(KvafExecuteBatchGetKernelArgs)));
   Check(cfg->numAttrs == 4 && cfg->attrs[3].value.engineType == ACL_RT_ENGINE_TYPE_AIV);
   Check(cfg->attrs[1].id == ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE);
-  // Pure SIMD scatter must not inherit the direct SIMT kernel's dynamic UB.
-  if (symbol == kScatter) Check(cfg->attrs[1].value.dynUBufSize == 0U);
+  // Scatter now includes a SIMT VF. A zero launch budget leaves its manually
+  // addressed UB outside allocated shared memory; runtime algorithm bits do
+  // not change the mixed binary's memory contract.
+  if (symbol == kScatter) Check(cfg->attrs[1].value.dynUBufSize == 64U * 1024U);
+  if (symbol == kGather) Check(cfg->attrs[1].value.dynUBufSize == 0U);
   if (symbol == kDirect) Check(cfg->attrs[1].value.dynUBufSize == 160U * 1024U);
   launched.push_back(symbol); return 0;
 }
@@ -94,6 +97,14 @@ int main(int argc, char** argv) {
   Check(KvafExecuteBatchGetLaunch(&d, reinterpret_cast<void*>(1)) == 0);
   Check(KvafGatherBatchGetLaunch(&g, reinterpret_cast<void*>(1)) == 0);
   Check((launched == std::vector<std::string>{kGather, kScatter, kDirect, kGather}));
+  for (uint32_t options : {kvaf::kScatterOptionsV1,
+                           kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild,
+                           kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterSimtBuild,
+                           kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterSimtBuild |
+                               kvaf::kScatterDoubleBuffer | kvaf::kScatterTrustedInputs}) {
+    s.reserved = options;
+    Check(KvafScatterBatchGetLaunch(&s, reinterpret_cast<void*>(1)) == 0);
+  }
   Check(KvafScatterBatchGetLoadKernel(scatter_path.c_str()) == 0);
   Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == 0 && binaries.size() == loaded);
   fs::current_path(original); fs::remove_all(directory);

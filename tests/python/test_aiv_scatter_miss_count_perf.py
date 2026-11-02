@@ -388,7 +388,11 @@ def run_case(args):
         if args.sort_input_indices:
             preflight = reference.sort_request_plan_prefix(torch, view.addresses, *preflight, args.miss_count)
         output.zero_()
-        runtime.batch_get(view, preflight[0], preflight[1], count, preflight[2], output)
+        # Surface the first kernel error with native mode/sequence/phase,
+        # rather than only a later device-wide synchronization exception.
+        # This validation call remains outside all measured samples.
+        runtime.batch_get(view, preflight[0], preflight[1], count, preflight[2], output,
+                          synchronize=True)
         torch.npu.synchronize()
         complete_outside_measurement(runtime, False)
         # Same contiguous-prefix correctness comparison as the reference.

@@ -29,7 +29,9 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 
 ## 清单构建与 UB 流水版本对比
 
-当前默认启用**多核 SIMT 单遍清单构建**，以及两个各 32 KiB 的 payload UB bank，总计 64 KiB。
+当前默认启用**多核 SIMT 单遍清单构建**，以及两个各 32 KiB 的 payload UB bank。
+混合二进制的 loader 通过 `dynUBufSize=65536` 预留这 64 KiB 共享 UB；
+`LocalTensor`/`get_imm` 只是地址视图，不能替代 SIMT 启动时的共享内存预留。
 656 B 的 UB 行距为 672 B，每批最多 32 行；4096 B 每批 8 行。
 每批一次多块 GM→UB，按映射连续发出精确长度的 UB→output。
 只在 bank 复用前等待该 bank 写完，使下一批输入与上一批写出重叠；末尾等待两个 bank 全部完成。
@@ -41,7 +43,7 @@ SIMT 路径每核启动 256 个线程并行读 index/offset、查地址表、加
 该接口从共享 L2 或 GM 加载，见 [asc_ldcg](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910beta2/API/ascendcopapi/atlasascendc_api_07_10556.html)。
 检查路径仍先检查 index/offset/output row，再读 valid 和源地址，线程失败标志归并后不发布 notify。
 可信输入路径不读 valid/output row、不归并失败标志；VF→MTE3 与清单写回完成等待始终保留。
-SIMT 构建使用 32 KiB 清单槽和 1 KiB 检查槽，复用已有 UB，不额外扩张静态 UB 预算。
+SIMT 构建使用 32 KiB 清单槽和 1 KiB 检查槽，复用预留的 64 KiB 共享 UB。
 
 `--simt-build 0` 保留上一版 UB/DMA 构建作为同二进制对照：
 每核按 256 条一批把 index/offset 搬入 UB 并生成源地址；检查路径另加载 output row。
@@ -112,10 +114,51 @@ for simt in 0 1; do
 done
 ```
 
-所有运行时组合均保留最多 64 KiB 的静态 UB 地址范围；payload 单 bank 使用前 32 KiB，
+所有运行时组合均由 loader 预留相同的 64 KiB 动态共享 UB；payload 单 bank 使用前 32 KiB，
 开启 fused build 时构建阶段会复用前 41 KiB。
 因此 reference 是同一二进制下的算法对照，不等价于重编译一份仅声明 32 KiB UB 的旧二进制。
 如需评估最终代码体积、编译布局或 UB 资源差异，另保留旧版本独立比较。
+
+### SIMT 预检异常与 UB 启动契约
+
+PID 8066 的异常位于 `BuildSourcesSimt<true>_simt_entry+0xf8`，
+多个核均报告 `VEC_ERROR=0x200000`、`MTE_ERROR=0`，返回 507035（Vector Core 执行异常）。
+CPU 当时仍是 last_sequence=0，随后控制 READ 报 status=9（ACK 重试超时）；应先定位设备端 VF，
+不能仅将 CPU 的错误当作 payload 通信故障。
+
+加入 SIMT 时，旧纯 SIMD loader 的 `dynUBufSize=0` 未同步修改，导致手工地址访问的 UB
+没有对应的共享内存预留。现由 Host/kernel 共用 `kScatterLocalMemoryBytes=64*1024`，
+loader 固定申请 65536 B，包括 `--simt-build 0` 在同一混合二进制中的对照路径。
+SIMT 还使用 UB 中的编译器预留区和 DCache，内存划分见
+[毕昇编译器内存约束](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920beta2/programug/Ascendcopdevg/asc-devkit/docs/zh/guide/programming_guide/compilation_and_execution/operator_compilation/bisheng_compiler.md)。
+这个修正处理了明确的启动配置遗漏，具体故障指令和硬件恢复仍需以设备日志和复测确认。
+
+必须重编并部署 NPU Host/binding 与 kernel；只替换 kernel .o 不会修复 loader 配置。
+新 Python 进程应打印 `SCATTER_KERNEL_READY ... dyn_ubuf_bytes=65536`，
+以及 `SCATTER_OPTIONS ... build=parallel_simt`。
+预检改为同步 BatchGet，使首个错误带上 Native mode/sequence/phase；正式样本的计时方式不变。
+先用小源表完成同样的完整 CPU→HBM→scatter 正确性检查，避免每次排障重新准备百 GB 源表：
+
+```bash
+cmake --build build-npu -j
+DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --single --token-bytes 656 --miss-count 8192 --aiv-cores 4 \
+  --table-capacity 8192 --tokens-per-block 4 --simt-build 1 \
+  --warmup 1 --iterations 3 --case-timeout 180 \
+  --npu-eids 000000000000020000100000df00e100 --peer-ub-device udmac0d1e2 \
+  --output-dir results/scatter-simt-ub-check
+```
+
+该配置用于快速确认完整正确性；性能验收继续使用原始大表配置。
+Linux loader 回归会实际调用生产 loader 并检查动态 UB，使用不依赖 CANN 的模型构建：
+
+```bash
+cmake -S . -B build-model -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF \
+  -DKVAF_ENABLE_AIV_BATCH_GET=OFF
+cmake --build build-model -j --target kvaf_sequential_loader_test
+ctest --test-dir build-model -R kvaf_sequential_loader_ --output-on-failure
+```
 
 验收使用同一完整端到端测试。各组合用独立进程、相同参数比较。
 示例沿用下文已配置好的 CANN/PyTorch、服务地址、EID、DEVICE_ID 和 PYTHONPATH：

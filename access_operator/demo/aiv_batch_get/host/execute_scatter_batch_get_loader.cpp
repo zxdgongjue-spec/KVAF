@@ -12,9 +12,10 @@
 namespace {
 constexpr char kKernelName[] = "KvafScatterBatchGetAivKernelV1";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
-// CANN requires dynUBufSize == 0 for pure SIMD kernels. Scatter's static
-// LocalTensor at UB offset 0 does not use the direct SIMT kernel's dynamic UB.
-constexpr uint32_t kKernelDynamicUbufBytes = 0U;
+// This binary now contains a SIMT VF. Its manually addressed UB scratch must
+// be reserved at launch, including when a runtime switch selects the UB path.
+// Zero was correct for the older pure-SIMD binary, not this mixed binary.
+constexpr uint32_t kKernelDynamicUbufBytes = kvaf::kScatterLocalMemoryBytes;
 std::mutex g_mutex;
 bool g_loaded = false;
 aclrtBinHandle g_binary = nullptr;
@@ -62,6 +63,8 @@ extern "C" int32_t KvafScatterBatchGetLoadKernel(const char *kernel_object_path)
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
   g_loaded = true;
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_KERNEL_READY path=%s dyn_ubuf_bytes=%u kernel_bytes=%zu\n",
+               path.c_str(), kKernelDynamicUbufBytes, g_binary_bytes.size());
   return KVAF_BATCH_GET_SUCCESS;
 }
 

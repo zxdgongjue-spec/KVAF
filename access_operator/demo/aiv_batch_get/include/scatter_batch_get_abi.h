@@ -8,6 +8,9 @@
 #endif
 
 namespace kvaf {
+// Shared UB footprint of this mixed SIMD/SIMT binary, reserved by its loader.
+// LocalTensor/get_imm address views do not reserve shared memory for SIMT.
+constexpr uint32_t kScatterLocalMemoryBytes = 64U * 1024U;
 // Versioned runtime options in the existing reserved word. Unknown versions or
 // bits must fail validation rather than silently select a different algorithm.
 constexpr uint32_t kScatterOptionsV1 = 0x53430100U;

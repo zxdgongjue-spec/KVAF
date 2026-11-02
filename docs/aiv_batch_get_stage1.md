@@ -14,11 +14,12 @@ Scatter 只消费本轮整批 done，不消费 chunk ready。Gather 的
 `pipeline_chunk_bytes=0`，不把 `~sequence` started ACK 当成完成。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
-Scatter 使用一个 16 KiB 静态 UB 缓冲，顺序执行 GM→UB→GM。32 B 整数倍主体
-使用 `DataCopy<uint8_t>`，尾部使用精确长度的 `DataCopyPad<uint8_t>`，不从
-packed staging 多读 padding。每次复用 UB 前等待 MTE3 写出完成。
-保留 staging cache 刷新、GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障。
-纯 SIMD loader 的 `dynUBufSize=0`。
+Scatter 当前使用两个 32 KiB UB bank，顺序等待 CPU 整批 done 后执行 GM→UB→GM。
+精确长度的 `DataCopyPad<uint8_t>` 不从 packed staging 多读 padding，复用 bank 前等待写出完成。
+清单可运行时选择多核 SIMT 或 UB 构建，具体见 [性能测试说明](aiv_scatter_performance.md)。
+包含 SIMT VF 的当前二进制由 loader 设置 `dynUBufSize=65536` 预留共享 UB；
+旧纯 SIMD loader 的零动态 UB 配置不适用于这个混合二进制。
+GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 
 排障用的九种提前返回探针、逐字节 UB 比较、诊断版本、地址/指纹日志及采集脚本
 已移除。正常 kernel 始终完成完整 scatter，正确性由端到端测试回读全部输出验收。
