@@ -63,7 +63,10 @@ def sample_metrics(sample):
     if "host_binding_ns" in result:
         # Both are Host durations. The difference includes Python/pybind entry,
         # overload dispatch and the return path outside BatchGetImpl's timer.
-        outside = result["end_to_end_ns"] - result["host_binding_ns"]
+        # Async enqueue + external synchronization measures a shorter binding
+        # call than the whole sample. Do not mislabel the external device wait
+        # as Python dispatch. Existing synchronous callers use the old default.
+        outside = result.get("host_call_ns", result["end_to_end_ns"]) - result["host_binding_ns"]
         if outside < 0:
             raise ValueError("binding time exceeds the measured BatchGet call")
         result["host_python_dispatch_ns"] = outside

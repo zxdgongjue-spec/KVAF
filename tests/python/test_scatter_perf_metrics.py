@@ -91,6 +91,9 @@ class ScatterPerfTests(unittest.TestCase):
             profile_metrics(records, 3, 19, 656, 1000)
         with self.assertRaises(ValueError):
             sample_metrics(dict(payload_bytes=1000, end_to_end_ns=2000, host_binding_ns=2500))
+        asynchronous = sample_metrics(dict(payload_bytes=1000, end_to_end_ns=10000,
+                                           host_call_ns=3000, host_binding_ns=2500))
+        self.assertEqual(asynchronous["host_python_dispatch_ns"], 500)
 
     def test_profile_clock_domains_and_slowest_worker(self):
         result = profile_metrics(profiles(), 3, 19, 656, 1000)

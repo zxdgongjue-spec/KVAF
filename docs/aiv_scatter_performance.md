@@ -486,6 +486,127 @@ done
 或 65535，避免把边界测试变成大内存分配测试。配置日志提供 source/output/staging
 字节数。记录 CPU 服务构建方式、线程绑核和两端是否存在其他负载后再比较结果。
 
+## 与 direct-READ miss-count 扫描对齐的独立测试
+
+新增 `tests/run_remote_cpu_scatter_miss_count_perf.sh` 和
+`tests/python/test_aiv_scatter_miss_count_perf.py`。原有 changing-data 测试
+`tests/run_remote_cpu_scatter_perf.sh` / `test_aiv_scatter_perf.py` 保留。
+新入口走现有 CPU SGL WRITE→HBM staging→AIV scatter，没有新增传输实现。
+
+新入口复用 `test_npu_batch_get_perf.py` 的参数默认值、环境变量、排序函数和请求生成函数。
+direct-READ 原入口只将原有请求生成代码提取为共享函数，随机数调用顺序、分布和测试行为不变。
+对照源为 `tests/run_remote_cpu_batch_get_miss_count_perf.sh`：
+
+| 场景项 | 新测试与参考测试共同设置 |
+| --- | --- |
+| request-length | 32768，独立于有效 miss-count |
+| table-capacity | 16384×78 = 1277952 个有效 block |
+| tokens-per-block | 128 |
+| 源数据 | 一次性分块 BatchPut 填满表；复用同一确定性 token pattern |
+| 请求 | 每次重新生成整个容量的索引/offset；只执行 miss-count 前缀 |
+| 默认源分布 | 从整个 table 随机取 block、随机取 block 内 token |
+| 默认输出 | 连续行；也支持 random 输出和源地址排序 |
+| warmup / iterations / seed | 3 / 100 / 20260903 |
+| token 扫描 | 128, 256, 512, 656, 1024, 2048, 4096 B |
+| miss-count 扫描 | 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 |
+
+远端表不因请求量较小而自动缩减。默认 656 B 配置需要 107307073536 B DDR，
+4096 B 需要 670014898176 B；NPU 端只保留固定大小的填充 chunk 和请求/output。
+`--dry-run` 会打印每个配置的确切 DDR 大小，不导入 torch/kvaf，也不创建结果目录。
+如指定较小 `--table-capacity`，direct-READ 与 scatter 两边应使用同一个值。
+
+拓扑约束单独记录：本实现的 CPU payload 固定 4 条 Jetty，支持 1..8 个 AIV 核，
+新入口默认扫描 1/2/4/8 核，共 7×9×4 = 252 个配置。参考中的 16/32 核不支持；
+其每核 Jetty 1..64 的轴不能等价映射成这条 CPU-push 通路。
+新测试固定 Host 的 `--jettys-per-core=2`，该参数用于初始化/BatchPut，
+每行汇总另写 `cpu_jettys=4`，避免误解为 `aiv_cores×jettys_per_core` 条 payload 队列。
+仅支持单 EID；可以指定 `--peer-ub-device` 固定 CPU 设备，不做 adaptive UB 校准。
+`max-inflight-total` 是 direct READ 参数，新报告明确记录其不约束 CPU WRITE 通路。
+
+默认 `--completion-mode reference` 使用与参考相同的调用与计时顺序：
+`begin → batch_get(六个位置参数，默认 stream/异步返回) → submitted → torch.npu.synchronize() → completed`。
+`end_to_end` 是 begin→completed，包含真实 kernel 和全设备同步；请求生成/预同步、
+status 验证和 snapshot 在窗口外。每轮测量后必须 drain 并检查所有核 status，
+最后一轮 warmup 也在首个测量前 drain，避免上轮状态回拷进入下一轮计时。
+profiled 用现有 `scatter_profile()` 的 drain+验证契约；baseline 用
+`stop_scatter_profile()` 的 drain-before-disable 契约，此时打点始终关闭。
+验证失败直接失败，不产生成功样本，不继续扫描。
+
+`--completion-mode validated` 保留一次 `batch_get(..., synchronize=True)` 的完整同步口径，
+将 status 回拷/检查计入 end_to_end，不再额外做全设备同步。此口径用于与原 changing-data
+测试比较，不能和 reference 口径混算。原 changing-data 入口的计时及默认行为不变。
+JSON、plan 和汇总均记录 completion_mode。输出/count 与设备地址表的 HBM 分配顺序也按
+参考保留：先分配 output/count，再填表，最后创建 NPU 地址表。
+
+报告同时提供 `kernel_total`（最大单核主体时长）和 `kernel_wall`（跨核最早 start→最晚 finish），
+便于对照设备区间；它们各自遵循两个 kernel 原有的打点边界。direct 的 finish 在
+业务 status 写入之后，scatter 的 finish 在报告/status 刷新之前，因此这里只是同样的
+max-per-core/wall 聚合，不能把两个内部阶段当作完全相同的执行窗口。
+CPU post/CQ 的耗时保留在 JSON，不把它们重命名成 direct AIV 的 post/completion 阶段。
+
+每个配置先做确定性 active-prefix/guard 校验，正式采样结束后再校验最后一轮随机 payload；
+逐轮改变源数据和全 output/guard 的强回归仍由原有 changing-data 测试覆盖。
+默认与参考扫描一样开启 kernel profile；scatter 路径另采集 CPU 时间并在 done 前传回报告，
+因此两种实现的打点成本不相等。JSON 记录 instrumentation_overhead_included 和
+cpu_profile_report_before_done；比较无打点的业务性能时两边均运行 baseline。
+Host 额外 RAII 打点默认关闭；需要归因时显式传 `--host-profile`。
+`--no-kernel-profile` 可运行 baseline；参考的 miss-count shell 会
+强制开启 kernel profile，baseline 应改用它的单场景 `run_remote_cpu_batch_get_perf.sh` 对照。
+`reference` 模式的 JSON `host_call_ns` 表示 enqueue 调用，`device_sync_ns` 表示其后
+的全设备同步，两者相加等于 end_to_end_ns；汇总对应 host_call/device_sync 两个阶段。
+`host_python_dispatch` 按 host_call 减 binding 时长，不会把设备等待误算成 Python 派发。
+CSV 的 `host_stream_sync_us` 仍只表示 Native 内部 stream 同步：Host 打点关闭时留空，
+reference 模式开启 Host 打点时该值为 0，不能与外部 device_sync 混淆。
+窗口外的验证代价记录为 snapshot_ns 或 status_validation_ns。
+
+沿用已配置的 CPU 服务、EID 和 CANN/PyTorch 环境：
+
+```bash
+# 先查看计划和内存规模；不访问设备。
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --dry-run --token-sizes 656,4096 --miss-counts 32,1024 --core-counts 4
+
+# 单配置：保持参考的大表和 128 tokens/block 默认值。
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --single --token-bytes 656 --miss-count 1024 --aiv-cores 4 \
+  --json results/aligned-t656-m1024.json --csv results/aligned-t656-m1024.csv
+
+# 全部 252 个支持的配置；目录须为空或尚不存在。
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --output-dir results/scatter-miss-aligned
+
+# 相同场景的 baseline；也可同时使用 --single 或缩小扫描轴。
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --no-kernel-profile --token-sizes 656,4096 --miss-counts 1024 --core-counts 4 \
+  --output-dir results/scatter-miss-aligned-baseline
+
+# 完整同步 API 口径及额外 Host 归因；与默认 reference 结果分开分析。
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --single --token-bytes 656 --miss-count 1024 --aiv-cores 4 \
+  --completion-mode validated --host-profile
+```
+
+端点默认值沿用参考 wrapper：`KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999`、`DEVICE_ID=0`，
+已有环境变量会覆盖。原有 scatter wrapper 的默认端口/设备不同，运行前传入同一个服务和设备。
+系统计数器频率与参考 shell 扫描使用同样优先级：`KVAF_BATCH_GET_KERNEL_CLOCK_MHZ`
+（缺省 1000）覆盖单场景 PERF 时钟环境，避免两边周期换算使用不同频率。
+shell 也像参考扫描一样在命令末尾固定该时钟值；通过此环境变量设置两边的频率，
+传给 shell 的 `--kernel-profile-clock-mhz` 不会覆盖它。单独运行 Python 入口时仍可用该 CLI 参数。
+默认扫描轴与参考一样不被 token/miss-count/core 的单值环境变量缩窄；可显式用列表或
+CLI 单值筛选。profile 默认值也按参考正式扫描强制开启，明确的 `--no-kernel-profile` 才关闭。
+`KVAF_REMOTE_CPU_PERF_TIMEOUT` / `--case-timeout` 控制每个配置的超时，默认 600 秒；
+单配置和扫描均使用独立子进程。失败、超时或不完整报告会停止后续配置，保留已经完成的汇总。
+
+每配置保存 `.log`、原始 `.json`、原有格式的 32 列 `.csv`；扫描额外保存 `plan.json` 和
+按配置/阶段逐行排列的 `summary.csv`。汇总为 15 列：配置、completion_mode、stage、mean/p50/p90/p99_us、
+effective_GBps、p50_GBps 和原始 JSON 路径。带宽分子始终为 `miss_count×token_bytes`；
+effective_GBps 按总字节/总耗时，p50_GBps 按有效字节/p50 耗时。
+CPU/AIV 细分字段仅在 profiled 样本存在；baseline 不生成虚构的阶段耗时。
+按总队列数对照时，direct 侧应选 1核×4 Jetty、2核×2 Jetty 或 4核×1 Jetty，
+分别对照 scatter 相同核数的固定 4 条 CPU Jetty；8 核 direct 至少 8 条队列，无法等量匹配。
+plan/JSON 的 queue_matched_direct_jettys_per_core 给出这个匹配值（不适用时为 null）。
+这仅对齐队列数量，CPU owner 与 AIV 发起线程的执行位置和调度仍由实现决定。
+
 ## 在自己的程序中采集
 
 ```python
