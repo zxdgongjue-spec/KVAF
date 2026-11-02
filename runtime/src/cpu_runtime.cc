@@ -476,6 +476,7 @@ struct Region {
   bool closing = false;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
+  std::shared_ptr<offload::UrmaDestination> pull_destination;
   uint32_t token_value = 0U;
   std::vector<Channel> channels;
 };
@@ -492,8 +493,11 @@ class CpuService {
             const auto it = regions_.find(info.id);
             if (it == regions_.end() || info.epoch != epoch_) return nullptr;
             const auto& region = it->second;
+            if (!region->pull_destination)
+              region->pull_destination = offload::CreateUrmaDestination(region->resources->context(),
+                  region->memory, region->bytes, region->token_value);
             return offload::CreateBorrowedUrmaBackend(region->resources->context(), region->memory,
-                region->bytes, region->token_value, region);
+                region->bytes, region->token_value, region, region->pull_destination);
           }) {
       std::random_device random; epoch_ = (std::uint64_t(random()) << 32) ^ random();
       if (!epoch_) epoch_ = 1;
@@ -836,6 +840,10 @@ class CpuService {
       if (!ReleaseChannel(&*iterator)) return false;
     }
     region->channels.clear();
+    if (region->pull_destination) {
+      if (!offload::CloseUrmaDestination(region->pull_destination).ok()) return false;
+      region->pull_destination.reset();
+    }
     if (region->segment != nullptr) {
       if (urma_unregister_seg(region->segment)) return false;
       region->segment = nullptr;

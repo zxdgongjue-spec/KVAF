@@ -11,6 +11,9 @@ Result Convert(const Status& s) { return s.ok() ? Result::Ok : s.code() == Statu
 struct Session {
   RegionInfo region{};
   Endpoint source{}, local{};
+  std::unordered_map<std::uint64_t, Endpoint> memories;
+  std::uint32_t memory_count{1};
+  std::uint64_t mr_id{1};
   std::unique_ptr<offload::Backend> backend;
   std::uint64_t sequence{};
   std::vector<Span> submitted;
@@ -55,6 +58,7 @@ Status Service::Shutdown() {
 Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   Response out{}; out.header = {kMagic, kVersion, std::uint16_t(r.header.command | 0x8000U), sizeof(out)};
   out.region = r.region; out.epoch = r.epoch; out.source_id = r.source_id; out.task = r.task;
+  out.mr_id = r.mr_id;
   if (r.header.magic != kMagic || r.header.version != kVersion || !r.region ||
       r.count != spans.size() || spans.size() > kMaxSpans ||
       r.header.bytes != sizeof(r) + spans.size()*sizeof(Span)) return out;
@@ -69,9 +73,11 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   if (!r.source_id) return out;
   auto found = impl_->sources.find(r.source_id);
   if (cmd == Command::Attach && found == impl_->sources.end()) {
-    if (region.closing || r.task || !r.source.bytes || r.source.token != region.token) return out;
+    if (region.closing || r.task || !r.source.bytes || r.source.token != region.token || r.mr_id != 1 ||
+        !r.memory_count || r.memory_count > kMaxSourceMrs) return out;
     if (impl_->sources.size() >= 4096) { out.result = Result::Busy; return out; }
     auto s = std::make_unique<Session>(); s->region = region; s->source = r.source;
+    s->memory_count = r.memory_count; s->memories.emplace(1, r.source);
     s->backend = impl_->attach(region);
     if (!s->backend) { out.result = Result::Failed; return out; }
     s->local.base = region.base; s->local.bytes = region.bytes; s->local.token = region.token;
@@ -94,7 +100,8 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   out.state = s.state; out.endpoint = s.local;
   if (s.region.id != r.region || s.region.epoch != r.epoch) return out;
   if (cmd == Command::Attach) {
-    if (!r.task && !std::memcmp(&s.source, &r.source, sizeof(Endpoint)) && s.state != State::Closed)
+    if (!r.task && r.mr_id == 1 && r.memory_count == s.memory_count &&
+        !std::memcmp(&s.memories.at(1), &r.source, sizeof(Endpoint)) && s.state != State::Closed)
       out.result = s.state == State::InDoubt ? Result::InDoubt : s.state == State::Failed ? Result::Failed : Result::Ok;
     return out;
   }
@@ -108,37 +115,69 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     }
     out.state = s.state; out.result = Result::Ok; return out;
   }
+  if (cmd == Command::AddMemory) {
+    if (r.task || !r.mr_id || r.mr_id > s.memory_count || !r.source.bytes ||
+        r.source.token != region.token || s.state == State::Closed) return out;
+    const auto existing = s.memories.find(r.mr_id);
+    if (existing != s.memories.end()) {
+      if (!std::memcmp(&existing->second, &r.source, sizeof(Endpoint))) out.result = Result::Ok;
+      return out;
+    }
+    if (s.state != State::Connecting) return out;
+    // Memory identity is per MR; the connection identity must remain unchanged.
+    const auto& link = s.memories.at(1);
+    if (r.source.tp != link.tp || r.source.psn != link.psn || r.source.key_bytes != link.key_bytes ||
+        std::memcmp(r.source.eid, link.eid, sizeof(link.eid)) ||
+        std::memcmp(r.source.key, link.key, sizeof(link.key))) return out;
+    try { status = s.backend->AddSource(r.mr_id, r.source); }
+    catch (...) { status = Status::InDoubt("exception importing HBM MR"); }
+    if (status.ok()) s.memories.emplace(r.mr_id, r.source);
+    else s.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
+    out.state = s.state; out.result = Convert(status); return out;
+  }
   if (cmd == Command::Bind && !r.task && (s.state == State::Connecting || s.state == State::Idle)) {
+    if (s.memories.size() != s.memory_count) return out;
     s.state = out.state = State::Idle; out.result = Result::Ok; return out;
   }
   if (cmd == Command::Probe && !r.task && !s.sequence && s.state == State::Idle) {
+    const auto memory = s.memories.find(r.mr_id);
+    if (memory == s.memories.end()) return out;
     if (spans.size() != 1 || spans[0].destination || spans[0].bytes > 64 ||
-        !offload::Contains(s.source.bytes, spans[0].source, spans[0].bytes)) return out;
-    try { status = s.backend->ProbeToScratch(spans[0].source, spans[0].bytes, &out.checksum); }
+        !offload::Contains(memory->second.bytes, spans[0].source, spans[0].bytes)) return out;
+    try {
+      status = s.backend->SelectSource(r.mr_id);
+      if (status.ok()) status = s.backend->ProbeToScratch(spans[0].source, spans[0].bytes, &out.checksum);
+    }
     catch (...) { status = Status::InDoubt("exception probing HBM source"); }
     if (!status.ok()) s.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
     out.state = s.state; out.result = Convert(status); return out;
   }
   if (cmd == Command::InspectSource && !r.task && s.state != State::Closed) {
-    out.endpoint = s.source; out.result = Result::Ok; return out;
+    const auto memory = s.memories.find(r.mr_id);
+    if (memory == s.memories.end()) return out;
+    out.endpoint = memory->second; out.reserved = s.memory_count; out.result = Result::Ok; return out;
   }
-  if (!r.task) return out;
+  const auto memory = s.memories.find(r.mr_id);
+  if (!r.task || memory == s.memories.end()) return out;
   if (cmd == Command::Ready) {
     if (r.flags || !spans.empty()) return out;
-    if (r.task == s.sequence && s.state != State::Closed) { out.result = Result::Ok; return out; }
+    if (r.task == s.sequence && s.state != State::Closed) {
+      if (r.mr_id == s.mr_id) out.result = Result::Ok;
+      return out;
+    }
     if (r.task != s.sequence + 1 || (s.state != State::Idle && s.state != State::Committed && s.state != State::Cancelled)) return out;
     if (s.worker.joinable()) s.worker.join();
-    s.sequence = r.task; s.submitted.clear();
+    s.sequence = r.task; s.mr_id = r.mr_id; s.source = memory->second; s.submitted.clear();
     s.state = out.state = State::Ready; out.result = Result::Ok; return out;
   }
   // A Ready packet may never have reached the service. Cancel also records
   // the next unused sequence, preventing a delayed Ready from reviving it.
   if (cmd == Command::Cancel && r.task == s.sequence + 1 &&
       (s.state == State::Idle || s.state == State::Committed || s.state == State::Cancelled)) {
-    s.sequence = r.task; s.submitted.clear();
+    s.sequence = r.task; s.mr_id = r.mr_id; s.source = memory->second; s.submitted.clear();
     s.state = s.terminal = out.state = State::Cancelled; out.result = Result::Ok; return out;
   }
-  if (r.task != s.sequence) return out; // Old notifications cannot consume a newer generation.
+  if (r.task != s.sequence || r.mr_id != s.mr_id) return out; // Bind sequence AND MR identity.
   if (cmd == Command::Query) { out.endpoint = s.source; out.result = Result::Ok; return out; }
   if (cmd == Command::Checksum) {
     // Diagnostic reads of CURRENT DDR are explicit and outside transfer/commit.
@@ -183,6 +222,13 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
       out.result = Result::Busy; return out;
     }
   }
+  // Resolve the MR once per batch, after prior work has completed. All WQEs
+  // then use its imported segment/base with the existing shared queues.
+  status = s.backend->SelectSource(r.mr_id);
+  if (!status.ok()) {
+    s.state = out.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
+    out.result = Convert(status); return out;
+  }
   s.submitted = spans; s.state = State::Running;
   try {
     s.worker = std::thread([&s, id = r.source_id] {
@@ -191,9 +237,9 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
       catch (...) { result = Status::InDoubt("exception in remote READ worker"); }
       std::lock_guard<std::mutex> guard(s.mutex);
       s.state = result.ok() ? State::Done : result.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
-      std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_DONE region=%llu source=%llu sequence=%llu state=%u detail=%s\n",
+      std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_DONE region=%llu source=%llu sequence=%llu mr=%llu state=%u detail=%s\n",
           (unsigned long long)s.region.id, (unsigned long long)id, (unsigned long long)s.sequence,
-          unsigned(s.state), result.message().c_str());
+          (unsigned long long)s.mr_id, unsigned(s.state), result.message().c_str());
     });
   } catch (...) { s.state = State::Failed; out.state = s.state; out.result = Result::Failed; return out; }
   out.state = State::Running; out.result = Result::Ok; return out;

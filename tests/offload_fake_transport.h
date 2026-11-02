@@ -29,6 +29,7 @@ std::atomic<int> cqs{0}, jetties{0}, peer_imports{0};
 std::atomic<std::uint64_t> registered_base{0}, registered_bytes{0};
 int context_error = 0;
 int fail_jetty_at = 0, fail_peer_at = 0;
+int fail_memory_at = 0;
 bool null_context = false;
 bool auto_mode = false;
 bool raw_mode = false;
@@ -61,7 +62,7 @@ aclError aclrtDestroyEvent(aclrtEvent p){--events;delete static_cast<int*>(p);re
 }
 namespace kvaf::direct_hccp {
 // Track ordering per context so the model can hold multiple sources at once.
-struct FakeContext { int queues{}, completions{}, tp_queries{}, imports{}; std::uint32_t token{kRegionToken}; };
+struct FakeContext { int queues{}, completions{}, tp_queries{}, imports{}, memories{}; std::uint32_t token{kRegionToken}; };
 struct FakeQueue { FakeContext* context; };
 struct DirectHccpSession {};
 bool AcquireDirectHccpSession(std::uint32_t,std::uint32_t,DirectHccpSession** s){++sessions;*s=new DirectHccpSession;return true;}
@@ -83,6 +84,7 @@ bool LoadDirectHccp(DirectHccpApi* a){
     // Match a provider requiring page-aligned HBM registration starts.
     if(mr->in.mem.addr & 4095U){*p=nullptr;return 528101;}
     auto& ctx=*static_cast<FakeContext*>(context);
+    if (++ctx.memories == fail_memory_at) { *p=nullptr; return 528101; }
     if(raw_mode) ctx.token=mr->in.ub.token_value;
     Require(mr->in.ub.token_value==ctx.token,"HBM registration uses peer token");
     Require(mr->in.ub.flags==0x29c1,"reference HBM registration flags");

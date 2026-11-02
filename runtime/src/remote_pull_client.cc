@@ -55,6 +55,7 @@ Status Exchange(const std::string& address, Request request,
   if (h.magic != kMagic || h.version != kVersion || h.bytes != sizeof(Response) ||
       h.command != (request.header.command | 0x8000U) ||
       response->region != request.region || response->source_id != request.source_id || response->task != request.task ||
+      response->mr_id != request.mr_id ||
       (request.epoch && response->epoch != request.epoch))
     return Status::InDoubt("CPU response identity/version mismatch");
   return Status::OK();

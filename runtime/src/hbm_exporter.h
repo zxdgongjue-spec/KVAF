@@ -59,16 +59,6 @@ class Exporter {
   Status Open(const ConstBufferView& input, const std::string& eid, const p::Endpoint& cpu,
               bool npu_peer = false) {
     std::uint32_t physical{};
-    const auto input_base = reinterpret_cast<std::uint64_t>(input.data);
-    if (!input.valid() || input.device != DeviceKind::kNpu || input.bytes > UINT64_MAX-input_base)
-      return Status::InvalidArgument("invalid HBM export range");
-    // Match BatchGet's HCCP registration: Tensor suballocations/views need
-    // not start on a page boundary. Register the containing range, but keep
-    // the public endpoint restricted to the Tensor itself.
-    constexpr std::uint64_t kPageBytes = 4096;
-    const auto registration_base = input_base & ~(kPageBytes-1);
-    const auto input_offset = input_base-registration_base;
-    const auto registration_bytes = input_offset+input.bytes;
     if (!cpu.token) return Error("CPU Allocate omitted region token; rebuild both Offload peers");
     if (!ParseEid(eid, descriptor.eid)) return Status::InvalidArgument("npu_eid must contain 32 hex digits");
     if (!h::LoadDirectHccp(&api_)) return Error("load Direct HCCP API");
@@ -87,63 +77,9 @@ class Exporter {
               << " npu_eid=" << EidHex(descriptor.eid);
       return Error(message.str());
     }
-    h::TokenId token{};
-    if (api_.token_alloc(context_, &token, &token_) || !token_) return Error("allocate source token");
     descriptor.token = cpu.token;
-    h::MrRegInfo mr{};
-    mr.in.mem.addr = registration_base; mr.in.mem.size = registration_bytes;
-    // Match cpu_push_host.cc's deployed HBM contract (0x29c1).
-    // Offload still submits only READ operations.
-    mr.in.ub.flags = h::MemRegFlags(true);
-    mr.in.ub.token_value = descriptor.token; mr.in.ub.token_id_handle = token_;
-    const int register_ret = api_.lmem_register(context_, &mr, &mr_);
-    if (register_ret || !mr_) {
-      std::ostringstream message;
-      message << "register source HBM: RaCtxLmemRegister ret=" << register_ret
-              << " handle_nonnull=" << (mr_ != nullptr) << " physical=" << physical
-              << " addr=0x" << std::hex << mr.in.mem.addr << " flags=0x" << mr.in.ub.flags
-              << " input_addr=0x" << input_base
-              << std::dec << " bytes=" << registration_bytes << " input_bytes=" << input.bytes
-              << " input_offset=" << input_offset;
-      return Error(message.str());
-    }
-    if (mr.out.key.size != 48)
-      return Error("unsupported HBM segment ABI: key_bytes=" + std::to_string(mr.out.key.size) +
-                   " expected=48 physical=" + std::to_string(physical));
-    descriptor.segment_bytes = mr.out.key.size;
-    std::memcpy(descriptor.segment, mr.out.key.value, mr.out.key.size);
-    // urma_seg_t: packed UBVA {eid[16], uasid[4], va[8]}, aligned len at 32.
-    std::uint64_t exported_base{}, exported_bytes{};
-    std::memcpy(&exported_base, descriptor.segment + 20, 8);
-    std::memcpy(&exported_bytes, descriptor.segment + 32, 8);
-    const bool zero_base = exported_base == 0;
-    const bool short_segment = exported_bytes < registration_bytes;
-    const bool address_overflow = exported_base > UINT64_MAX-registration_bytes;
-    // Match aicpu-urma's CPU-push export: the configured EID selects a CTP
-    // route, while the segment carries the provider's memory identity. Do not
-    // require equality or replace either EID with the other one.
-    if (zero_base || short_segment || address_overflow) {
-      std::ostringstream message;
-      message << "invalid exported HBM range: zero_base=" << zero_base
-              << " short_segment=" << short_segment << " address_overflow=" << address_overflow
-              << " physical=" << physical
-              << " eid_index=" << attr.ub.eid_index << " key_bytes=" << unsigned(mr.out.key.size)
-              << " requested_base=0x" << std::hex << registration_base
-              << " exported_base=0x" << exported_base << std::dec
-              << " requested_bytes=" << registration_bytes << " exported_bytes=" << exported_bytes
-              << " npu_eid=" << EidHex(descriptor.eid)
-              << " segment_eid=" << EidHex(descriptor.segment);
-      return Error(message.str());
-    }
-    descriptor.base = exported_base+input_offset;
-    descriptor.bytes = input.bytes;
-    std::fprintf(stderr, "[KVAF_NPU] HBM_EXPORT_RANGE input_base=0x%llx input_bytes=%llu "
-        "registered_base=0x%llx registered_bytes=%llu input_offset=%llu exported_base=0x%llx "
-        "exported_bytes=%llu source_base=0x%llx\n",
-        (unsigned long long)input_base, (unsigned long long)input.bytes,
-        (unsigned long long)registration_base, (unsigned long long)registration_bytes,
-        (unsigned long long)input_offset, (unsigned long long)exported_base,
-        (unsigned long long)exported_bytes, (unsigned long long)descriptor.base);
+    auto registered = RegisterMemory(input, physical, descriptor, token_, mr_);
+    if (!registered.ok()) return registered;
     descriptor.psn = 1; // cpu_push_host.cc initializes npu_psn to 1.
     tp_cfg_.flag = h::CtpFlag(); tp_cfg_.transport_mode = h::kReliableMessage;
     std::memcpy(tp_cfg_.local_eid.raw, descriptor.eid, 16);
@@ -175,8 +111,21 @@ class Exporter {
         "physical=%u npu_eid=%s cpu_eid=%s hbm_flags=0x%x psn=%u\n",
         npu_peer ? "HBM_READ_EXPORT" : "CPU_PULL_REFERENCE",
         p::kEndpointVersion, p::kChannelCount, physical, EidHex(descriptor.eid).c_str(), EidHex(cpu.eid).c_str(),
-        mr.in.ub.flags, descriptor.psn);
+        h::MemRegFlags(true), descriptor.psn);
     return Status::OK();
+  }
+  // Additional MRs use the existing context/route and target Jettys.
+  // Preserve each registration's segment/token independently of the link.
+  Status AddMemory(const ConstBufferView& input, p::Endpoint* out) {
+    if (!out || !context_ || !mr_) return Error("open source connection before adding memory");
+    extra_memory_.emplace_back();
+    auto& memory = extra_memory_.back();
+    memory.descriptor = descriptor;
+    std::uint32_t physical{};
+    if (!h::GetCurrentNpuPhysicalDeviceId(&physical)) return Error("resolve NPU physical device");
+    auto status = RegisterMemory(input, physical, memory.descriptor, memory.token, memory.mr);
+    if (status.ok()) *out = memory.descriptor;
+    return status;
   }
   Status Bind(const p::Endpoint& cpu) {
     if (cpu.token != descriptor.token) return Error("CPU Jetty token differs from allocated region token");
@@ -248,6 +197,11 @@ class Exporter {
       if (!status.ok()) return Status::InDoubt(status.message());
       channel.reset();
     }
+    for (auto& memory : extra_memory_) {
+      RELEASE(memory.mr, lmem_unregister)
+      RELEASE(memory.token, token_free)
+    }
+    extra_memory_.clear();
     RELEASE(mr_, lmem_unregister)
     RELEASE(token_, token_free)
 #undef RELEASE
@@ -257,6 +211,81 @@ class Exporter {
     return Status::OK();
   }
  private:
+  Status RegisterMemory(const ConstBufferView& input, std::uint32_t physical,
+                        p::Endpoint& descriptor, void*& token_handle, void*& mr_handle) {
+    const auto input_base = reinterpret_cast<std::uint64_t>(input.data);
+    if (!input.valid() || input.device != DeviceKind::kNpu || input.bytes > UINT64_MAX-input_base)
+      return Status::InvalidArgument("invalid HBM export range");
+    // Match BatchGet's HCCP registration: Tensor suballocations/views need
+    // not start on a page boundary. Register the containing range, but keep
+    // the public endpoint restricted to the Tensor itself.
+    constexpr std::uint64_t kPageBytes = 4096;
+    const auto registration_base = input_base & ~(kPageBytes-1);
+    const auto input_offset = input_base-registration_base;
+    const auto registration_bytes = input_offset+input.bytes;
+    h::TokenId token{};
+    if (api_.token_alloc(context_, &token, &token_handle) || !token_handle) return Error("allocate source token");
+    h::MrRegInfo mr{};
+    mr.in.mem.addr = registration_base; mr.in.mem.size = registration_bytes;
+    // Match cpu_push_host.cc's deployed HBM contract (0x29c1).
+    // Offload still submits only READ operations.
+    mr.in.ub.flags = h::MemRegFlags(true);
+    mr.in.ub.token_value = descriptor.token; mr.in.ub.token_id_handle = token_handle;
+    const int register_ret = api_.lmem_register(context_, &mr, &mr_handle);
+    if (register_ret || !mr_handle) {
+      std::ostringstream message;
+      message << "register source HBM: RaCtxLmemRegister ret=" << register_ret
+              << " handle_nonnull=" << (mr_handle != nullptr) << " physical=" << physical
+              << " addr=0x" << std::hex << mr.in.mem.addr << " flags=0x" << mr.in.ub.flags
+              << " input_addr=0x" << input_base
+              << std::dec << " bytes=" << registration_bytes << " input_bytes=" << input.bytes
+              << " input_offset=" << input_offset;
+      return Error(message.str());
+    }
+    if (mr.out.key.size != 48)
+      return Error("unsupported HBM segment ABI: key_bytes=" + std::to_string(mr.out.key.size) +
+                   " expected=48 physical=" + std::to_string(physical));
+    descriptor.segment_bytes = mr.out.key.size;
+    std::memcpy(descriptor.segment, mr.out.key.value, mr.out.key.size);
+    // urma_seg_t: packed UBVA {eid[16], uasid[4], va[8]}, aligned len at 32.
+    std::uint64_t exported_base{}, exported_bytes{};
+    std::memcpy(&exported_base, descriptor.segment + 20, 8);
+    std::memcpy(&exported_bytes, descriptor.segment + 32, 8);
+    const bool zero_base = exported_base == 0;
+    const bool short_segment = exported_bytes < registration_bytes;
+    const bool address_overflow = exported_base > UINT64_MAX-registration_bytes;
+    // Match aicpu-urma's CPU-push export: the configured EID selects a CTP
+    // route, while the segment carries the provider's memory identity. Do not
+    // require equality or replace either EID with the other one.
+    if (zero_base || short_segment || address_overflow) {
+      std::ostringstream message;
+      message << "invalid exported HBM range: zero_base=" << zero_base
+              << " short_segment=" << short_segment << " address_overflow=" << address_overflow
+              << " physical=" << physical
+              << " key_bytes=" << unsigned(mr.out.key.size)
+              << " requested_base=0x" << std::hex << registration_base
+              << " exported_base=0x" << exported_base << std::dec
+              << " requested_bytes=" << registration_bytes << " exported_bytes=" << exported_bytes
+              << " npu_eid=" << EidHex(descriptor.eid)
+              << " segment_eid=" << EidHex(descriptor.segment);
+      return Error(message.str());
+    }
+    descriptor.base = exported_base+input_offset;
+    descriptor.bytes = input.bytes;
+    std::fprintf(stderr, "[KVAF_NPU] HBM_EXPORT_RANGE input_base=0x%llx input_bytes=%llu "
+        "registered_base=0x%llx registered_bytes=%llu input_offset=%llu exported_base=0x%llx "
+        "exported_bytes=%llu source_base=0x%llx\n",
+        (unsigned long long)input_base, (unsigned long long)input.bytes,
+        (unsigned long long)registration_base, (unsigned long long)registration_bytes,
+        (unsigned long long)input_offset, (unsigned long long)exported_base,
+        (unsigned long long)exported_bytes, (unsigned long long)descriptor.base);
+    return Status::OK();
+  }
+  struct Memory {
+    p::Endpoint descriptor{};
+    void *token{}, *mr{};
+  };
+  std::vector<Memory> extra_memory_;
   Status PollTp() {
     int result{}; const int rc = api_.get_async_req_result(async_, &result);
     if (rc == 128301) return Status::Busy("CTP pending");

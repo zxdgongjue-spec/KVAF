@@ -55,7 +55,7 @@ urma_status_t urma_free_token_id(urma_token_id_t* t){delete t;return URMA_SUCCES
 urma_target_seg_t* urma_register_seg(urma_context_t*,urma_seg_cfg_t* cfg){
   Require(cfg->flag.bs.access==URMA_ACCESS_LOCAL_WRITE&&!cfg->flag.bs.non_pin,"DDR must be pinned LOCAL_WRITE");
   Require(cfg->token_value.token&&cfg->token_id&&cfg->flag.bs.token_id_valid,"explicit DDR token");
-  Require(imported_mrs==1,"reference imports HBM before receiving DDR registration");
+  Require(imported_mrs>=1,"reference imports HBM before receiving DDR registration");
   Require(cfg->token_value.token==expected_token,"DDR uses allocated region token");
   registered_token=cfg->token_value.token;
   auto* mr=new urma_target_seg_t{};mr->seg.ubva.va=cfg->va;mr->seg.len=cfg->len;
@@ -100,7 +100,7 @@ urma_status_t urma_unimport_jetty(urma_target_jetty_t* q){--peers;delete q;retur
 int urma_get_tp_list(void*,void* input,std::uint32_t* count,void* info){
   const auto* cfg=static_cast<TpQuery*>(input);
   Require(cfg->local[15]==1&&cfg->remote[15]==2,"CTP uses selected route EIDs, not segment EID");
-  Require(local_mrs==1&&imported_mrs==1&&queues==0,"CTP follows MR setup and precedes queues");
+  Require(local_mrs==1&&imported_mrs>=1&&queues%12==0,"CTP follows MR setup and precedes this group of queues");
   ctp_queried=true;*count=1;*static_cast<std::uint64_t*>(info)=9;return 0;
 }
 urma_target_jetty_t* urma_import_jetty_ex(void*,void* remote,void* token,void* active){
@@ -354,6 +354,53 @@ void BorrowedPoolTest() {
   Require(backend->Close().ok()&&pool.use_count()==1&&local_mrs==0,"close releases registration and lease, not pool allocation");
   (*pool)[0]=7;Require((*pool)[0]==7,"A still owns DDR after B detaches");
 }
+void MultipleMrTransportTest() {
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto pool=std::make_shared<std::vector<std::uint8_t>>(32768,0xa5);
+  const auto base=reinterpret_cast<std::uint64_t>(pool->data());
+  constexpr std::uint32_t token=1337;
+  auto destination=p::CreateUrmaDestination(&context,pool->data(),pool->size(),token);
+  auto backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),token,pool,destination);
+  std::vector<std::vector<std::uint8_t>> memories(78);
+  for(std::size_t i=0;i<memories.size();++i)memories[i].resize(20000+i*64,std::uint8_t(i+1));
+  auto source=Source(memories[0],token,true);p::Endpoint cpu{};cpu.base=base;cpu.bytes=pool->size();cpu.token=token;
+  Require(backend->Open(source,&cpu).ok(),"open shared MR group");
+  for(std::size_t i=1;i<memories.size();++i) {
+    auto mr=source;mr.base=reinterpret_cast<std::uint64_t>(memories[i].data());mr.bytes=memories[i].size();
+    urma_seg_t segment{};std::memcpy(&segment,mr.segment,sizeof(segment));
+    segment.ubva.va=mr.base;segment.len=mr.bytes;segment.token_id=0x10000+i*256;
+    std::memcpy(mr.segment,&segment,sizeof(segment));expected_segment=segment;
+    Require(backend->AddSource(i+1,mr).ok(),"import additional HBM MR");
+    Require(backend->AddSource(i+1,mr).ok(),"same MR import is idempotent");
+    ++mr.bytes;Require(!backend->AddSource(i+1,mr).ok(),"MR identity cannot be replaced");
+  }
+  Require(imported_mrs==78&&local_mrs==1&&queues==12&&peers==4&&imports==4,
+          "78 imports share four Jettys and one DDR destination MR");
+  Require(!p::CloseUrmaDestination(destination).ok(),"DDR registration cannot close while borrowed");
+  const std::vector<p::Span> spans{{7,64,10001},{15000,16000,123}};
+  for(std::size_t n=0;n<80;++n) {
+    const auto index=n%78;Require(backend->SelectSource(index+1).ok(),"select registered MR");
+    std::uint64_t hash{};
+    Require(backend->ProbeToScratch(64,64,&hash).ok()&&hash==p::Hash(memories[index].data()+64,64),"probe selected MR");
+    Require(local_mrs==1,"scratch is separate and retired");
+    for(int repeat=0;repeat<2;++repeat) {
+      memories[index][7]=std::uint8_t(n+repeat+100);
+      Require(backend->Read(spans).ok(),"read switched MR and reuse plan");
+      Require(!std::memcmp(pool->data()+64,memories[index].data()+7,10001)&&
+              !std::memcmp(pool->data()+16000,memories[index].data()+15000,123),"WQE source base and tseg match selected MR");
+    }
+  }
+  Require(!backend->SelectSource(0).ok()&&!backend->SelectSource(79).ok(),"unknown MR rejected");
+  Require(backend->Close().ok()&&local_mrs==1&&imported_mrs==0&&queues==0&&peers==0,
+          "source teardown preserves pool-owned DDR registration");
+  // A later source/candidate borrows the same pinned registration, even though
+  // it has its own peer link. Never allocate another receiving MR for the pool.
+  backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),token,pool,destination);
+  Require(backend->Open(Source(memories[1],token,true),&cpu).ok()&&local_mrs==1,"another source reuses pool MR");
+  Require(backend->Read(spans).ok()&&backend->Close().ok(),"second source reads and detaches");
+  Require(p::CloseUrmaDestination(destination).ok()&&local_mrs==0,"DDR owner finally unregisters MR");
+  destination.reset();Require(pool.use_count()==1,"all source leases released");
+}
 void BulkReadTest(std::size_t count, std::uint32_t depth) {
   returned_depth=depth;
   urma_context_t context{};context.eid.raw[15]=1;
@@ -443,6 +490,7 @@ void BulkFailureTest(Fault injected) {
 int main(){try{
   ProfileSummaryTest();
   BorrowedPoolTest();
+  MultipleMrTransportTest();
   RegistrationFailureTest();
   PartialChannelFailureTest();
   ReadTest(false);

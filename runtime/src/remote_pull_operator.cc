@@ -6,7 +6,7 @@ namespace rp = remote_pull;
 namespace {
 rp::Request Request(const OffloadRegionTicket& ticket, const CpuPullRequest& current, rp::Command cmd) {
   auto r = rp::MakeRequest(cmd); r.epoch = ticket.region.epoch; r.region = ticket.region.id; r.token = ticket.region.token;
-  r.source_id = current.source.source_id; r.task = current.sequence; return r;
+  r.source_id = current.source.source_id; r.task = current.sequence; r.mr_id = current.mr_id; return r;
 }
 
 }
@@ -73,13 +73,18 @@ Status RemotePullOperator::ValidateCpuSource(const CpuPullSourceDesc& source) {
       source.region_epoch != ticket_.region.epoch)
     return Status::InvalidArgument("CPU source is not bound to this DDR pool");
   CpuPullRequest current; current.source = source;
-  rp::Response response{};
-  auto status = rp::Exchange(ticket_.address, Request(ticket_, current, rp::Command::InspectSource), {}, &response);
-  if (!status.ok()) return status;
-  if (response.result != rp::Result::Ok || response.endpoint.bytes != source.source_bytes ||
-      response.state == rp::State::Connecting || response.state == rp::State::Failed ||
-      response.state == rp::State::InDoubt || response.state == rp::State::Closed)
-    return Status::InvalidState("CPU source is missing, stale or unavailable");
+  if (source.mr_count() > rp::kMaxSourceMrs || source.bytes_for(1) != source.source_bytes)
+    return Status::InvalidArgument("invalid CPU source MR table");
+  for (current.mr_id = 1; current.mr_id <= source.mr_count(); ++current.mr_id) {
+    rp::Response response{};
+    auto status = rp::Exchange(ticket_.address, Request(ticket_, current, rp::Command::InspectSource), {}, &response);
+    if (!status.ok()) return status;
+    if (response.result != rp::Result::Ok || response.endpoint.bytes != source.bytes_for(current.mr_id) ||
+        response.reserved != source.mr_count() ||
+        response.state == rp::State::Connecting || response.state == rp::State::Failed ||
+        response.state == rp::State::InDoubt || response.state == rp::State::Closed)
+      return Status::InvalidState("CPU source is missing, stale or unavailable");
+  }
   return Status::OK();
 }
 Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {
@@ -92,12 +97,12 @@ Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {
   std::vector<rp::Span> spans;
   for (std::size_t i = 0; i < request.copies.lengths.size(); ++i)
     spans.push_back({request.copies.source[i], request.copies.destination[i], request.copies.lengths[i]});
-  if (!offload::ValidateSpans(spans, source.source_bytes, ticket_.region.bytes))
+  if (!offload::ValidateSpans(spans, source.bytes_for(request.mr_id), ticket_.region.bytes))
     return Status::InvalidArgument("invalid CPU Pull source/destination ranges");
   rp::Response response{};
   auto status = rp::Exchange(ticket_.address, Request(ticket_, request, rp::Command::Query), {}, &response);
   if (!status.ok()) return Status::Internal("CPU Pull pre-submit query failed; no READ submitted: "+status.message());
-  if (response.result != rp::Result::Ok || response.state != rp::State::Ready || response.endpoint.bytes != source.source_bytes)
+  if (response.result != rp::Result::Ok || response.state != rp::State::Ready || response.endpoint.bytes != source.bytes_for(request.mr_id))
     return Status::InvalidState("CPU Pull batch is not Ready");
   current_ = request; active_ = true; committed_ = false;
   status = rp::Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Submit), spans, &response);

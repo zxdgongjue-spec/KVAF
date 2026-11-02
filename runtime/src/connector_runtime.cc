@@ -23,7 +23,9 @@ bool PutHandle::submitted() const { return state_ && state_->submitted; }
 
 Status RuntimeCore::AttachCpuSource(const CpuPullSourceDesc& source) {
   if (!initialized_ || closing_) return Status::InvalidState("initialize Runtime before attaching CPU source");
-  if (!source.source_id || !source.source_bytes || !source.region_id || !source.region_epoch)
+  if (!source.source_id || !source.source_bytes || !source.region_id || !source.region_epoch ||
+      source.mr_count() > 4096 || source.bytes_for(1) != source.source_bytes ||
+      std::any_of(source.mr_bytes.begin(), source.mr_bytes.end(), [](auto bytes) { return !bytes; }))
     return Status::InvalidArgument("invalid CPU source descriptor");
   const auto existing = cpu_sources_.find(source.source_id);
   if (existing != cpu_sources_.end() && !SameSource(existing->second, source))
@@ -49,7 +51,7 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
                                   Uint64ArrayView lengths) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
   if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
-      !desc || !ready.sequence)
+      !desc || !ready.sequence || !desc->bytes_for(ready.mr_id))
     return Status::InvalidArgument("CPU source, ReadyToken or put belongs to another Runtime/batch");
   const auto source = cpu_sources_.find(desc->source_id);
   if (source == cpu_sources_.end() || !SameSource(source->second, *desc))
@@ -68,7 +70,7 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
     address -= p.region.base;
   }
   if (p.submitted) {
-    if (!SameSource(p.request.source, *desc) || p.request.sequence != ready.sequence ||
+    if (!SameSource(p.request.source, *desc) || p.request.sequence != ready.sequence || p.request.mr_id != ready.mr_id ||
         copies.source != p.request.copies.source || copies.destination != p.request.copies.destination ||
         copies.lengths != p.request.copies.lengths)
       return Status::InvalidArgument("duplicate CPU Pull changed its request");
@@ -80,7 +82,8 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
   std::vector<std::pair<std::uint64_t, std::uint64_t>> destinations, reservations;
   for (std::size_t i = 0; i < copies.source.size(); ++i) {
     const auto n = copies.lengths[i];
-    if (copies.source[i] > desc->source_bytes || n > desc->source_bytes-copies.source[i] ||
+    const auto source_bytes = desc->bytes_for(ready.mr_id);
+    if (copies.source[i] > source_bytes || n > source_bytes-copies.source[i] ||
         copies.destination[i] > p.region.length || n > p.region.length-copies.destination[i])
       return Status::InvalidArgument("CPU Pull range outside registered source/DDR");
     destinations.emplace_back(copies.destination[i], n);
@@ -106,7 +109,7 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
     if (cursor != end) return Status::InvalidArgument("CPU Pull leaves unwritten Put bytes");
   }
   if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
-  p.request = {*desc, ready.sequence, std::move(copies)};
+  p.request = {*desc, ready.sequence, std::move(copies), ready.mr_id};
   p.submitted = true; p.state = CpuPullState::Submitted;
   // Record the request on the caller's existing put before the first RPC.
   try { status = access_operator_.SubmitCpuPull(p.request); }

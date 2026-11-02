@@ -9,6 +9,13 @@
 namespace kvaf {
 struct CpuPullSourceDesc {
   std::uint64_t source_id{}, source_bytes{}, region_id{}, region_epoch{};
+  // Empty for a single-MR source; otherwise indexed by mr_id - 1.
+  // source_bytes remains the first tensor's size, never an address envelope.
+  std::vector<std::uint64_t> mr_bytes;
+  std::size_t mr_count() const { return mr_bytes.empty() ? 1 : mr_bytes.size(); }
+  std::uint64_t bytes_for(std::uint64_t mr_id) const {
+    return !mr_id || mr_id > mr_count() ? 0 : mr_bytes.empty() ? source_bytes : mr_bytes[mr_id-1];
+  }
 };
 struct NpuPullSourceDesc {
   std::uint64_t source_id{}, source_bytes{}, source_epoch{};
@@ -16,10 +23,11 @@ struct NpuPullSourceDesc {
 struct ReadyToken {
   std::variant<CpuPullSourceDesc, NpuPullSourceDesc> source;
   std::uint64_t sequence{};
+  std::uint64_t mr_id{1}; // CPU Pull only: one registered tensor per batch.
 };
 inline bool SameSource(const CpuPullSourceDesc& a, const CpuPullSourceDesc& b) {
   return a.source_id == b.source_id && a.source_bytes == b.source_bytes &&
-      a.region_id == b.region_id && a.region_epoch == b.region_epoch;
+      a.region_id == b.region_id && a.region_epoch == b.region_epoch && a.mr_bytes == b.mr_bytes;
 }
 inline bool SameSource(const NpuPullSourceDesc& a, const NpuPullSourceDesc& b) {
   return a.source_id == b.source_id && a.source_bytes == b.source_bytes && a.source_epoch == b.source_epoch;
@@ -66,6 +74,7 @@ struct CpuPullRequest {
   CpuPullSourceDesc source;
   std::uint64_t sequence{};
   CopyArrays copies;
+  std::uint64_t mr_id{1};
 };
 enum class CpuPullState { Prepared, Submitted, Running, Done, Failed, InDoubt, Committed, Aborted };
 }

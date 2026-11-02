@@ -1,6 +1,7 @@
 #pragma once
 #include "offload_fake_transport.h"
 #include "remote_pull_service.h"
+#include <map>
 namespace rp = kvaf::remote_pull;
 using kvaf::Status;
 std::atomic<int> payload_reads{0}, scratch_reads{0}, checksum_calls{0}, leases{0};
@@ -8,13 +9,19 @@ std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_checksum{false};
 struct SharedBackend final : p::Backend {
   std::vector<std::uint8_t>& pool;
   p::Endpoint source{};
+  std::map<std::uint64_t,p::Endpoint> memories;
   bool closed{};
   explicit SharedBackend(std::vector<std::uint8_t>& v):pool(v){++leases;}
   Status Allocate(std::uint64_t,p::Endpoint*) override { throw std::runtime_error("B must not allocate DDR"); }
   Status Open(const p::Endpoint& s,p::Endpoint* cpu) override {
-    source=s; cpu->key_bytes=28;cpu->tp=1;cpu->psn=2;
+    source=s; memories[1]=s; cpu->key_bytes=28;cpu->tp=1;cpu->psn=2;
     for(unsigned i=0;i<4;++i){cpu->key[i][15]=4;cpu->key[i][20]=10+i;}
     return Status::OK();
+  }
+  Status AddSource(std::uint64_t id,const p::Endpoint& s) override { memories[id]=s;return Status::OK(); }
+  Status SelectSource(std::uint64_t id) override {
+    auto found=memories.find(id);if(found==memories.end())return Status::InvalidArgument("missing MR");
+    source=found->second;return Status::OK();
   }
   Status ProbeToScratch(std::uint64_t offset,std::uint64_t bytes,std::uint64_t* hash) override {
     ++scratch_reads;

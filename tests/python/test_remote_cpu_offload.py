@@ -2,6 +2,8 @@
 
 Uses spawn (separate ACL processes); Pipe transports only tickets/notifications.
 Optional AIV kernels verify BatchPut and BatchGet on the very same DDR pool.
+--tensors 78 --rounds 156 cycles 78 separately allocated tensors twice, with
+one connection group and multiple spans from only the selected tensor per batch.
 """
 import argparse
 import multiprocessing as mp
@@ -42,18 +44,22 @@ def producer(pipe, args, ticket, lengths):
 
     torch.npu.set_device(args.device_b)
     stream = torch.npu.Stream(device=args.device_b)
-    hbm = torch.zeros(SOURCE_BYTES, dtype=torch.uint8, device=f"npu:{args.device_b}")
+    tensors = [torch.zeros(SOURCE_BYTES + i * 64, dtype=torch.uint8,
+                           device=f"npu:{args.device_b}") for i in range(args.tensors)]
+    hbm = tensors[0]
     source = kvaf.CpuPullHbmSource(device_id=args.device_b, npu_eid=args.npu_eid_b)
     try:
-        desc = source.register(ticket, hbm)
+        desc = source.register(ticket, tensors if args.tensors > 1 else hbm)
+        assert desc.mr_count == args.tensors
         pipe.send(("registered", source.selected_npu_eid))
         pipe.send(("cpu_source", desc))
         for round_id in range(args.rounds):
+            hbm = tensors[round_id % len(tensors)]
             with torch.npu.stream(stream):
-                hbm.copy_(pattern(torch, round_id), non_blocking=True)
+                hbm[:SOURCE_BYTES].copy_(pattern(torch, round_id), non_blocking=True)
             # The application waits for production; Ready only publishes batch identity.
             stream.synchronize()  # Producer synchronization belongs to the application.
-            batch = source.ready()
+            batch = source.ready(hbm) if args.tensors > 1 else source.ready()
             pipe.send(("ready", batch))
             receive(pipe, "reuse")
             source.release_batch(batch)
@@ -64,7 +70,7 @@ def producer(pipe, args, ticket, lengths):
         pipe.send(("error", traceback.format_exc()))
         try:
             if source.frozen:
-                source.cancel_batch(source.ready())  # Refused if any READ may still be active.
+                source.cancel_batch(source.ready(hbm))  # Refused if any READ may still be active.
             source.shutdown()
         except Exception as error:
             retain(str(error))
@@ -97,9 +103,12 @@ def main():
     parser.add_argument("--batch-get-kernel", default="")
     parser.add_argument("--batch-put-kernel", default="")
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--tensors", type=int, default=1)
     args = parser.parse_args()
     if args.device_a == args.device_b or args.rounds < 2:
         parser.error("use two distinct NPUs and at least two rounds")
+    if not 1 <= args.tensors <= 4096 or args.rounds < args.tensors:
+        parser.error("use 1..4096 tensors and enough rounds to read every tensor")
     if bool(args.batch_get_kernel) != bool(args.batch_put_kernel):
         parser.error("supply both AIV kernels, or neither")
     import torch
@@ -171,7 +180,8 @@ def main():
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        print(f"REMOTE_OFFLOAD_PASS shared_pool=1 duplicate_notification=1 producer_reuse_ack=1 connector_api=1", flush=True)
+        print(f"REMOTE_OFFLOAD_PASS shared_pool=1 duplicate_notification=1 producer_reuse_ack=1 "
+              f"connector_api=1 tensors={args.tensors} single_mr_per_batch=1", flush=True)
     except BaseException:
         traceback.print_exc()
         if runtime.pending_offload or worker.is_alive():

@@ -10,6 +10,14 @@ class Backend {
   virtual ~Backend() = default;
   virtual Status Allocate(std::uint64_t bytes, Endpoint* local) = 0;
   virtual Status Open(const Endpoint& source, Endpoint* local) = 0;
+  // One connection owns multiple imported source MRs. Selection never posts DMA
+  // or recreates queues, and is forbidden while a batch is unresolved.
+  virtual Status AddSource(std::uint64_t, const Endpoint&) {
+    return Status::NotImplemented("multiple source MRs are unavailable");
+  }
+  virtual Status SelectSource(std::uint64_t id) {
+    return id == 1 ? Status::OK() : Status::InvalidArgument("unknown source MR");
+  }
   virtual Status Read(const std::vector<Span>& spans) = 0;
   // Startup only. A backend may retire a failed, completed probe before
   // returning a non-InDoubt error; unresolved DMA must remain InDoubt.

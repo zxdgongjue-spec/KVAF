@@ -4,12 +4,13 @@
 namespace kvaf::remote_pull {
 // Shared DDR with identity-only Ready and application-defined Submit ranges.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
-constexpr std::uint16_t kVersion = 4;
+constexpr std::uint16_t kVersion = 5;
+constexpr std::uint32_t kMaxSourceMrs = 4096;
 using Endpoint = offload::Endpoint;
 using Span = offload::Span;
 using Result = offload::Result;
 constexpr auto kMaxSpans = offload::kMaxSpans;
-enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Ready, Submit, Query, Complete, Cancel, Detach, Checksum, InspectSource };
+enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Ready, Submit, Query, Complete, Cancel, Detach, Checksum, InspectSource, AddMemory };
 enum class State : std::uint32_t { Connecting, Idle, Ready, Running, Done, Failed, InDoubt, Committed, Cancelled, Closed };
 struct RegionInfo {
   std::uint64_t epoch{}, id{}, base{}, bytes{}, slot_size{};
@@ -21,6 +22,8 @@ struct Request {
   std::uint32_t count{};
   std::uint64_t region{}, epoch{}, source_id{}, task{}; // task = B's ready sequence
   std::uint32_t token{}, flags{}; // Complete flags: 1=committed, 0=aborted
+  std::uint64_t mr_id{1};
+  std::uint32_t memory_count{1}, reserved{}; // Attach declares the immutable MR table size.
   Endpoint source{};
 };
 struct Response {
@@ -29,6 +32,7 @@ struct Response {
   std::uint64_t region{}, epoch{}, source_id{}, task{}, checksum{};
   State state{State::Connecting};
   std::uint32_t reserved{};
+  std::uint64_t mr_id{1};
   RegionInfo pool{};
   Endpoint endpoint{};
 };

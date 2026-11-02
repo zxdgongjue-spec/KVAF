@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <dlfcn.h>
 #include <sstream>
+#include <unordered_map>
 
 namespace kvaf::offload {
 namespace {
@@ -62,17 +63,88 @@ void Describe(std::ostream& out, const char* name, const urma_seg_t& segment) {
       << ' ' << name << "_token_id=" << segment.token_id;
 }
 
+} // namespace
+
+class UrmaDestination {
+ public:
+  UrmaDestination(urma_context_t* context, void* memory, std::uint64_t bytes, std::uint32_t token)
+      : context_(context), memory_(memory), bytes_(bytes), region_token_(token) {}
+  ~UrmaDestination() { (void)Close(); }
+  urma_target_seg_t* segment() const { return destination_; }
+  bool Matches(urma_context_t* context, void* memory, std::uint64_t bytes, std::uint32_t token) const {
+    return context_ == context && memory_ == memory && bytes_ == bytes && region_token_ == token;
+  }
+  Status Close() {
+    if (destination_) {
+      if (urma_unregister_seg(destination_)) return Status::InDoubt("unregister shared DDR destination");
+      destination_ = nullptr;
+    }
+    if (token_) {
+      if (urma_free_token_id(token_)) return Status::InDoubt("free shared DDR destination token");
+      token_ = nullptr;
+    }
+    destination_valid_ = false;
+    return Status::OK();
+  }
+  Status Ensure() {
+    if (destination_valid_) return Status::OK();
+    if (!token_) token_ = urma_alloc_token_id(context_);
+    if (!token_) return Error("allocate DDR token");
+    urma_seg_cfg_t cfg{};
+    cfg.va = reinterpret_cast<std::uint64_t>(memory_); cfg.len = bytes_;
+    cfg.token_id = token_; cfg.token_value.token = region_token_;
+    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    cfg.flag.bs.access = 1U;
+    cfg.flag.bs.non_pin = 0;
+    cfg.flag.bs.token_id_valid = 1;
+    if (!destination_) destination_ = urma_register_seg(context_, &cfg);
+    if (!destination_) return Error("register pinned DDR");
+    const auto& segment = destination_->seg;
+    const bool range_ok = segment.ubva.va && cfg.va <= UINT64_MAX-bytes_ && cfg.va >= segment.ubva.va &&
+                          Contains(segment.len, cfg.va-segment.ubva.va, bytes_);
+    const bool access_ok = (segment.attr.bs.access & 1U) && !segment.attr.bs.non_pin;
+    std::ostringstream log;
+    log << "CPU_PULL_DDR sge_bytes=" << sizeof(urma::Sge);
+    Describe(log, "registered", segment);
+    log << " range_ok=" << range_ok << " access_ok=" << access_ok;
+    std::fprintf(stderr, "%s\n", log.str().c_str());
+    if (!range_ok || !access_ok) return Error("invalid registered DDR range/access");
+    destination_valid_ = true;
+    return Status::OK();
+  }
+ private:
+  urma_context_t* context_{};
+  void* memory_{};
+  std::uint64_t bytes_{};
+  std::uint32_t region_token_{};
+  urma_token_id_t* token_{};
+  urma_target_seg_t* destination_{};
+  bool destination_valid_{};
+};
+std::shared_ptr<UrmaDestination> CreateUrmaDestination(urma_context_t* context, void* memory,
+                                                    std::uint64_t bytes, std::uint32_t token) {
+  return std::make_shared<UrmaDestination>(context, memory, bytes, token);
+}
+Status CloseUrmaDestination(const std::shared_ptr<UrmaDestination>& destination) {
+  if (!destination) return Status::OK();
+  if (destination.use_count() != 1) return Status::Busy("CPU Pull still retains DDR destination MR");
+  return destination->Close();
+}
+
+namespace {
 class UrmaBackend final : public Backend {
  public:
   explicit UrmaBackend(urma_context_t* context) : context_(context) {}
   UrmaBackend(urma_context_t* context, void* memory, std::uint64_t bytes,
-              std::uint32_t token, std::shared_ptr<void> lease)
+              std::uint32_t token, std::shared_ptr<void> lease, std::shared_ptr<UrmaDestination> destination)
       : context_(context), memory_(memory), bytes_(bytes), region_token_(token),
-        owns_memory_(false), lease_(std::move(lease)) {}
+        owns_memory_(false), lease_(std::move(lease)), borrowed_destination_(bool(destination)),
+        shared_destination_(std::move(destination)) {}
   ~UrmaBackend() override {
     if (!Close().ok()) {
       std::fprintf(stderr, "CPU_PULL: retaining non-quiescent resources\n");
       if (lease_) (void)new std::shared_ptr<void>(std::move(lease_));
+      if (shared_destination_) (void)new std::shared_ptr<UrmaDestination>(std::move(shared_destination_));
       // Keep descriptors/SGEs as well as MRs and the pool alive on unknown DMA.
       for (auto& q : queues_) (void)new Queue(std::move(q));
     }
@@ -117,16 +189,11 @@ class UrmaBackend final : public Backend {
 
     // Reference order: import HBM, register the receiving host buffer, query
     // CTP, then create/import four queues. Preserve exported memory/Jetty EIDs.
-    urma_import_seg_flag_t flags{};
-    flags.bs.cacheable = URMA_NON_CACHEABLE;
-    flags.bs.access = (1U << 1U) | (1U << 2U);
-    flags.bs.mapping = URMA_SEG_NOMAP;
-    urma_token_t token{}; token.token = region_token_;
-    source_ = urma_import_seg(context_, &segment, &token, 0, flags);
-    if (!source_) return Error("import HBM");
-    source_base_ = source.base;
-    source_bytes_ = source.bytes;
-    auto status = RegisterDestination();
+    auto status = AddSource(1, source);
+    if (!status.ok()) return status;
+    status = SelectSource(1);
+    if (!status.ok()) return status;
+    status = RegisterDestination();
     if (!status.ok()) return status;
     std::uint64_t tp{};
     if (!urma::QueryTp(query, context_, source.eid, &tp)) return Error("query CTP");
@@ -162,6 +229,44 @@ class UrmaBackend final : public Backend {
     return Status::OK();
   }
 
+  Status AddSource(std::uint64_t id, const Endpoint& source) override {
+    if (poisoned_) return Status::InDoubt(failure_);
+    if (!id || source.segment_bytes != sizeof(urma_seg_t) || source.token != region_token_)
+      return Error("invalid source MR identity");
+    for (const auto& q : queues_) if (q.pending) return Status::InDoubt("READ is pending");
+    auto found = sources_.find(id);
+    if (found != sources_.end())
+      return std::memcmp(&found->second.endpoint, &source, sizeof(source)) == 0
+          ? Status::OK() : Error("source MR identity changed");
+    urma_seg_t segment{};
+    std::memcpy(&segment, source.segment, sizeof(segment));
+    if (!source.base || source.base > UINT64_MAX-source.bytes || source.base < segment.ubva.va ||
+        !Contains(segment.len, source.base-segment.ubva.va, source.bytes)) return Error("source segment range");
+    // Allocate bookkeeping before importing so an allocation failure cannot
+    // orphan an imported segment.
+    auto& memory = sources_[id]; memory.endpoint = source;
+    urma_import_seg_flag_t flags{};
+    flags.bs.cacheable = URMA_NON_CACHEABLE;
+    flags.bs.access = (1U << 1U) | (1U << 2U);
+    flags.bs.mapping = URMA_SEG_NOMAP;
+    urma_token_t token{}; token.token = source.token;
+    memory.segment = urma_import_seg(context_, &segment, &token, 0, flags);
+    if (!memory.segment) { sources_.erase(id); return Error("import HBM MR"); }
+    return Status::OK();
+  }
+  Status SelectSource(std::uint64_t id) override {
+    if (poisoned_) return Status::InDoubt(failure_);
+    for (const auto& q : queues_) if (q.pending) return Status::InDoubt("cannot change MR during READ");
+    const auto found = sources_.find(id);
+    if (found == sources_.end() || !found->second.segment) return Error("unknown source MR");
+    if (selected_mr_ != id) cached_spans_.clear(); // Same offsets in another MR are a different plan.
+    selected_mr_ = id;
+    source_ = found->second.segment;
+    source_base_ = found->second.endpoint.base;
+    source_bytes_ = found->second.endpoint.bytes;
+    return Status::OK();
+  }
+
   Status Read(const std::vector<Span>& spans) override {
     Profile stats;
     const auto begin = profile_ ? Clock::now() : Clock::time_point{};
@@ -173,10 +278,11 @@ class UrmaBackend final : public Backend {
       if (profile_each_) std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=%u spans=%zu bytes=%llu "
           "build_us=%.1f post_us=%.1f cq_wait_us=%.1f total_us=%.1f read_wrs=%zu "
           "post_calls=%zu tail_cqes=%zu waves=%zu active_jettys=%zu plan_reused=%u cpu_threads=1 "
-          "checksum_included=0 profile_id=%llu batch=%llu\n", unsigned(status.code()), spans.size(),
+          "checksum_included=0 profile_id=%llu batch=%llu mr=%llu\n", unsigned(status.code()), spans.size(),
           static_cast<unsigned long long>(stats.bytes), stats.build_us, stats.post_us, stats.cq_us,
           total_us, stats.wrs, stats.posts, stats.cqes, stats.waves,
-          stats.jettys, unsigned(stats.reused), (unsigned long long)profile_id_, (unsigned long long)profile_batch_);
+          stats.jettys, unsigned(stats.reused), (unsigned long long)profile_id_, (unsigned long long)profile_batch_,
+          (unsigned long long)selected_mr_);
       if (!status.ok()) ReportProfile("read_error");
     }
     return status;
@@ -220,7 +326,8 @@ class UrmaBackend final : public Backend {
       RELEASE(q.cq, urma_delete_jfc)
       q = {};
     }
-    RELEASE(source_, urma_unimport_seg)
+    for (auto& item : sources_) { RELEASE(item.second.segment, urma_unimport_seg) }
+    sources_.clear(); source_ = nullptr; selected_mr_ = 0;
     ReportProfile("source_release");
     profile_summary_.ReleaseSamples();
     source_base_ = source_bytes_ = 0;
@@ -229,11 +336,15 @@ class UrmaBackend final : public Backend {
   Status Close() override {
     auto status = ReleaseSource(); if (!status.ok()) return status;
     status = ReleaseScratch(); if (!status.ok()) return status;
-    RELEASE(destination_, urma_unregister_seg)
-    RELEASE(token_, urma_free_token_id)
+    if (shared_destination_) {
+      if (!borrowed_destination_) {
+        status = shared_destination_->Close(); if (!status.ok()) return status;
+      }
+      destination_ = nullptr; shared_destination_.reset();
+    }
 #undef RELEASE
     if (owns_memory_) std::free(memory_);
-    memory_ = nullptr; bytes_ = 0; destination_valid_ = false; lease_.reset();
+    memory_ = nullptr; bytes_ = 0; lease_.reset();
     return Status::OK();
   }
   Status ProbeToScratch(std::uint64_t offset, std::uint64_t bytes, std::uint64_t* checksum) override {
@@ -442,30 +553,13 @@ class UrmaBackend final : public Backend {
     std::free(scratch_); scratch_ = nullptr; return Status::OK();
   }
   Status RegisterDestination() {
-    if (destination_valid_) return Status::OK();
-    if (!token_) token_ = urma_alloc_token_id(context_);
-    if (!token_) return Error("allocate DDR token");
-    urma_seg_cfg_t cfg{};
-    cfg.va = reinterpret_cast<std::uint64_t>(memory_); cfg.len = bytes_;
-    cfg.token_id = token_; cfg.token_value.token = region_token_;
-    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-    cfg.flag.bs.access = 1U;
-    cfg.flag.bs.non_pin = 0;
-    cfg.flag.bs.token_id_valid = 1;
-    if (!destination_) destination_ = urma_register_seg(context_, &cfg);
-    if (!destination_) return Error("register pinned DDR");
-    const auto& segment = destination_->seg;
-    const bool range_ok = segment.ubva.va && cfg.va <= UINT64_MAX-bytes_ && cfg.va >= segment.ubva.va &&
-                          Contains(segment.len, cfg.va-segment.ubva.va, bytes_);
-    const bool access_ok = (segment.attr.bs.access & 1U) && !segment.attr.bs.non_pin;
-    std::ostringstream log;
-    log << "CPU_PULL_DDR sge_bytes=" << sizeof(urma::Sge);
-    Describe(log, "registered", segment);
-    log << " range_ok=" << range_ok << " access_ok=" << access_ok;
-    std::fprintf(stderr, "%s\n", log.str().c_str());
-    if (!range_ok || !access_ok) return Error("invalid registered DDR range/access");
-    destination_valid_ = true;
-    return Status::OK();
+    if (!shared_destination_)
+      shared_destination_ = CreateUrmaDestination(context_, memory_, bytes_, region_token_);
+    if (!shared_destination_->Matches(context_, memory_, bytes_, region_token_))
+      return Error("shared DDR destination belongs to a different pool/context");
+    auto status = shared_destination_->Ensure();
+    if (status.ok()) destination_ = shared_destination_->segment();
+    return status;
   }
   Status ReadFailure(std::size_t index, const char* stage, int ret, int error_number,
                      const urma_jfs_wr_t* bad = nullptr, const urma_cr_t* cr = nullptr) {
@@ -475,6 +569,7 @@ class UrmaBackend final : public Backend {
       if (bad == &q.wrs[i] || (cr && cr->user_ctx == q.wrs[i].user_ctx)) { failed = i; break; }
     std::ostringstream message;
     message << "stage=" << stage << " ret=" << ret << " errno=" << error_number
+            << " mr=" << selected_mr_
             << " sge_bytes=" << sizeof(urma::Sge) << " queue=" << index
             << " wr_id=" << q.wrs[failed].user_ctx << " pending_tail=" << q.pending
             << " wave_wrs=" << q.wrs.size() << " wr_index=" << failed
@@ -506,8 +601,10 @@ class UrmaBackend final : public Backend {
   void* memory_{};
   std::uint64_t bytes_{}, source_base_{}, source_bytes_{};
   std::uint32_t region_token_{}, max_sge_{}, max_bytes_{};
-  urma_token_id_t* token_{};
   urma_target_seg_t *destination_{}, *source_{};
+  struct SourceMemory { Endpoint endpoint{}; urma_target_seg_t* segment{}; };
+  std::unordered_map<std::uint64_t, SourceMemory> sources_;
+  std::uint64_t selected_mr_{};
   std::array<Queue, kChannelCount> queues_;
   std::vector<Span> cached_spans_;
   std::size_t next_poll_{};
@@ -515,10 +612,12 @@ class UrmaBackend final : public Backend {
   bool profile_each_{true};
   std::uint64_t profile_id_{}, profile_batch_{};
   CpuPullProfileSummary profile_summary_;
-  bool ready_{}, poisoned_{}, destination_valid_{}, completed_error_{};
+  bool ready_{}, poisoned_{}, completed_error_{};
   std::string failure_;
   bool owns_memory_{true};
   std::shared_ptr<void> lease_;
+  bool borrowed_destination_{};
+  std::shared_ptr<UrmaDestination> shared_destination_;
   void* scratch_{};
   urma_token_id_t* scratch_token_{};
   urma_target_seg_t* scratch_mr_{};
@@ -528,8 +627,9 @@ std::unique_ptr<Backend> CreateUrmaBackend(urma_context_t* context) {
   return context ? std::make_unique<UrmaBackend>(context) : nullptr;
 }
 std::unique_ptr<Backend> CreateBorrowedUrmaBackend(urma_context_t* context, void* memory,
-    std::uint64_t bytes, std::uint32_t token, std::shared_ptr<void> lease) {
+    std::uint64_t bytes, std::uint32_t token, std::shared_ptr<void> lease,
+    std::shared_ptr<UrmaDestination> destination) {
   return context && memory && bytes && token && lease
-      ? std::make_unique<UrmaBackend>(context, memory, bytes, token, std::move(lease)) : nullptr;
+      ? std::make_unique<UrmaBackend>(context, memory, bytes, token, std::move(lease), std::move(destination)) : nullptr;
 }
 }

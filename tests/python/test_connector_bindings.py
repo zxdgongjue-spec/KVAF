@@ -90,6 +90,25 @@ class ConnectorBindings(unittest.TestCase):
         self.assertEqual(pickle.loads(pickle.dumps(cpu)).region_epoch, 99)
         self.assertEqual(pickle.loads(pickle.dumps(npu)).source_epoch, 88)
 
+    def test_cpu_multi_mr_identity_survives_connector_ipc(self):
+        sizes = [4096 + i * 64 for i in range(78)]
+        cpu = restored(kvaf.CpuPullSourceDesc, (12, sizes[0], 2, 99, sizes))
+        ready = restored(kvaf.ReadyToken, (cpu, 7, 78))
+        copy = pickle.loads(pickle.dumps(ready))
+        self.assertEqual(copy.mr_id, 78)
+        self.assertEqual(copy.source.mr_count, 78)
+        self.assertEqual(copy.source.mr_bytes, sizes)
+        # Returned lists cannot mutate the identity that is stored in KVAF.
+        copy.source.mr_bytes.clear()
+        self.assertEqual(copy.source.mr_count, 78)
+        with self.assertRaises(AttributeError):
+            copy.mr_id = 1
+        with self.assertRaises(AttributeError):
+            copy.source.mr_bytes = [1]
+        single = restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99))
+        self.assertEqual(single.mr_count, 1)
+        self.assertEqual(restored(kvaf.ReadyToken, (single, 7)).mr_id, 1)
+
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_only_current_pull_interfaces_are_exported(self):
         for name in ("HbmSource", "HbmReadSource", "OffloadRuntime", "CpuPullSourceHandle", "CpuPullTask"):

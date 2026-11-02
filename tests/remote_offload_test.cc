@@ -281,15 +281,21 @@ void ConnectorQuarantine(){
     kvaf::NpuRuntime reader(options);Ok(reader.LinkTo({server.address}));Ok(reader.Initialize(1024,256));
     kvaf::OffloadRegionTicket ticket;Ok(reader.GetOffloadRegion(&ticket));
     std::vector<std::uint8_t> data(4096,7);aclrtSetDevice(7);
+    std::vector<std::uint8_t> second(4096,0x9a);
+    std::vector<kvaf::ConstBufferView> sources{{data.data(),data.size(),kvaf::DeviceKind::kNpu},
+                                             {second.data(),second.size(),kvaf::DeviceKind::kNpu}};
     kvaf::CpuPullHbmSource producer(7,"00000000000000000000000000000001");
-    Ok(producer.Register(ticket,{data.data(),data.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+    Ok(producer.Register(ticket,sources,reinterpret_cast<void*>(1)));
     kvaf::CpuPullSourceDesc desc;Ok(producer.GetDescriptor(&desc));
-    Ok(reader.AttachCpuSource(desc));kvaf::ReadyToken ready;Ok(producer.Ready(&ready));
+    Ok(reader.AttachCpuSource(desc));kvaf::ReadyToken ready;Ok(producer.Ready(sources[1],&ready));
     kvaf::PutHandle put;Ok(reader.PreparePut({0},{32},&put));std::vector<std::uint64_t> offsets{0},destinations{put.entries()[0].address},sizes{32};
     uncertain_read=true;Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
     kvaf::CpuPullState state;
     Require(reader.WaitCpuPull(put,1000,&state).code()==kvaf::StatusCode::kInDoubt,"CQ uncertainty quarantines task");
     const int reads=payload_reads;
+    kvaf::ReadyToken other;
+    Require(!producer.Ready(sources[0],&other).ok()&&registrations==2&&jetties==4,
+            "uncertain batch retains all MRs and prevents switching source");
     Require(!reader.CommitPut(put).ok()&&!reader.AbortPut(put).ok()&&!reader.Shutdown().ok(),"uncertain DMA retains DDR");
     Require(!producer.CancelBatch(ready).ok()&&!producer.ReleaseBatch(ready).ok()&&!producer.Shutdown().ok(),"uncertain DMA retains producer registration");
     Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
@@ -298,4 +304,77 @@ void ConnectorQuarantine(){
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';_exit(1);}}
   int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"Connector quarantine checks");
 }
-int main(){try{Lifecycle();SharedMetadata();LocalAndFallback();InitializationRecovery();ConnectorApi();ConnectorQuarantine();std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+void MultipleMemorySource() {
+  SharedServer server;kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;
+  kvaf::NpuRuntime reader(options);Ok(reader.LinkTo({server.address}));Ok(reader.Initialize(1024,256));
+  kvaf::OffloadRegionTicket ticket;Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::vector<std::uint8_t>> tensors(78);
+  std::vector<kvaf::ConstBufferView> views;
+  for(std::size_t i=0;i<tensors.size();++i) {
+    tensors[i].resize(512+i*64,std::uint8_t(i+1));
+    views.push_back({tensors[i].data(),tensors[i].size(),kvaf::DeviceKind::kNpu});
+  }
+  aclrtSetDevice(7);kvaf::CpuPullHbmSource source(7,"00000000000000000000000000000001");
+  Require(!source.Register(ticket,std::vector<kvaf::ConstBufferView>{},reinterpret_cast<void*>(1)).ok(),"empty MR list rejected");
+  Require(!source.Register(ticket,std::vector<kvaf::ConstBufferView>{views[0],views[0]},reinterpret_cast<void*>(1)).ok(),"duplicate tensor rejected");
+  fail_memory_at=37;
+  Require(!source.Register(ticket,views,reinterpret_cast<void*>(1)).ok(),"partial HBM registration fails atomically");
+  fail_memory_at=0;NoResources();
+  // CPU may import an additional MR even when its reply is lost. The producer
+  // keeps the entire exporter until Detach confirms retirement.
+  server.drop=unsigned(rp::Command::AddMemory);
+  Require(source.Register(ticket,views,reinterpret_cast<void*>(1)).code()==kvaf::StatusCode::kInDoubt,
+          "lost AddMemory response retains partial registration");
+  Require(registrations==78&&leases==1&&!source.registered(),"partial table is not publicly usable");
+  Ok(source.Shutdown());NoResources();
+  const auto probes=scratch_reads.load();
+  Ok(source.Register(ticket,views,reinterpret_cast<void*>(1)));
+  Require(registrations==78&&contexts==1&&sessions==1&&jetties==4&&peer_imports==4&&leases==1,
+          "78 MRs share one exporter, backend and four Jettys");
+  Require(scratch_reads==probes+78,"probe every MR before publishing source");
+  Require(std::all_of(server.pool.begin(),server.pool.end(),[](auto x){return x==0xA5;}),"all probes preserve pool");
+  kvaf::CpuPullSourceDesc desc;Ok(source.GetDescriptor(&desc));
+  Require(desc.mr_count()==78&&desc.bytes_for(78)==tensors.back().size(),"descriptor retains individual sizes");
+  auto wrong=desc;wrong.mr_bytes[50]++;Require(!reader.AttachCpuSource(wrong).ok(),"attach checks every MR");
+  Ok(reader.AttachCpuSource(desc));
+  kvaf::ReadyToken ready;
+  Require(!source.Ready(&ready).ok(),"multi-MR ready must select tensor");
+  auto unregistered=views[1];unregistered.bytes--;
+  Require(!source.Ready(unregistered,&ready).ok(),"ready rejects unregistered views");
+  const auto reads=payload_reads.load();
+  for(std::size_t n=0;n<80;++n) {
+    const auto index=n%78;
+    std::fill(tensors[index].begin(),tensors[index].end(),std::uint8_t(n+11));
+    if(n==0) {
+      server.drop=unsigned(rp::Command::Ready);
+      Require(!source.Ready(views[index],&ready).ok()&&source.frozen(),"lost Ready retains selected MR");
+      kvaf::ReadyToken other;
+      Require(!source.Ready(views[1],&other).ok(),"lost Ready cannot switch MR");
+    }
+    Ok(source.Ready(views[index],&ready));
+    Require(ready.mr_id==index+1,"Ready selects tensor MR");
+    auto stale=ready;stale.mr_id=index==0?2:1;
+    Require(!source.ReleaseBatch(stale).ok()&&!source.CancelBatch(stale).ok(),"producer acknowledgement binds MR");
+    auto forged=rp::MakeRequest(rp::Command::Ready);forged.region=ticket.region.id;forged.epoch=ticket.region.epoch;
+    forged.token=ticket.region.token;forged.source_id=desc.source_id;forged.task=ready.sequence;forged.mr_id=stale.mr_id;
+    rp::Response response;Ok(rp::Exchange(ticket.address,forged,{},&response));
+    Require(response.result!=rp::Result::Ok,"server rejects same sequence with changed MR");
+    kvaf::PutHandle put;Ok(reader.PreparePut({1,2},{64,32},&put));
+    std::vector<std::uint64_t> src{7,300},dst{put.entries()[0].address,put.entries()[1].address},lengths{64,32};
+    auto outside=src;outside[0]=views[index].bytes-32;
+    Require(!reader.SubmitCpuPull(ready,put,outside,dst,lengths).ok(),"bounds use selected tensor");
+    if(n==0)server.drop=unsigned(rp::Command::Submit);
+    auto submitted=reader.SubmitCpuPull(ready,put,src,dst,lengths);
+    Require(submitted.ok()||(n==0&&submitted.code()==kvaf::StatusCode::kInDoubt),"submit or retain lost response");
+    Require(!reader.SubmitCpuPull(stale,put,src,dst,lengths).ok(),"duplicate cannot change MR");
+    Ok(reader.SubmitCpuPull(ready,put,src,dst,lengths));
+    kvaf::CpuPullState state;Ok(reader.WaitCpuPull(put,1000,&state));Ok(reader.CommitPut(put));
+    Require(!std::memcmp(server.pool.data()+256,tensors[index].data()+7,64)&&
+            !std::memcmp(server.pool.data()+512,tensors[index].data()+300,32),"batch reads only selected tensor");
+    Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{1,2}}));
+  }
+  Require(payload_reads==reads+80&&registrations==78&&contexts==1&&jetties==4&&scratch_reads==probes+78,
+          "MR switching never registers, rebuilds links, probes or replays DMA");
+  Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
+}
+int main(){try{Lifecycle();SharedMetadata();LocalAndFallback();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine();std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

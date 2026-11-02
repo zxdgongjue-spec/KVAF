@@ -1,6 +1,6 @@
 # CPU Pull 构建与验证
 
-当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，公开接口使用 KVRP v4；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
+当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，公开接口使用 KVRP v5；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
 
 ## CPU 服务
 
@@ -73,15 +73,39 @@ python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7
 # 应用 Connector 显式接口：两张卡、同一个共享 DDR 池。
 python tests/python/test_remote_cpu_offload.py \
   --cpu 127.0.0.1:28999 --device-a 6 --device-b 7
+
+# 78 个独立分配的 tensor，逐个注册 MR、共用连接；每个 tensor 拉取两轮。
+python tests/python/test_remote_cpu_offload.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
+  --tensors 78 --rounds 156
 ```
 
 本卡测试可用 `--npu-eid` 固定 CPU↔本卡路由、用 `--cpu-candidate` 固定 CPU 设备。共享池首先由 Runtime 分配并固定 CPU candidate，源注册在该池上尝试 NPU EID；不会为每个源重建 DDR 池。
 
-源 EID 自动发现先尝试 CLOS，再尝试 asdrv pair-info。注册含最多 64 字节的 scratch READ 和 checksum 探测，不覆盖已经分配的 DDR 槽位。此前测试机器上 CLOS 路由被拒绝，`000000000000020000100000df00e100` 路由成功；具体选择以当前硬件为准。
+源 EID 自动发现先尝试 CLOS，再尝试 asdrv pair-info。注册对每个 MR 各做最多 64 字节的 scratch READ 和 checksum 探测，不覆盖已经分配的 DDR 槽位。此前测试机器上 CLOS 路由被拒绝，`000000000000020000100000df00e100` 路由成功；具体选择以当前硬件为准。
 
 本卡验收成功标记为 `LOCAL_CPU_PULL_PASS`，跨卡为 `REMOTE_OFFLOAD_PASS`。建链导入成功不能代替数据校验。
 
 需要普通 BatchPut/BatchGet 和 NPU 直读时，见 [共享 DDR](shared_ddr_remote_offload.md)、[NPU raw READ](hbm_raw_addr_read.md) 和 [Connector 接口设计](connector_pull_api_design.md)。
+
+## 多 MR CPU Pull 接口
+
+生产端调用 `source.register(ticket, tensors)` 注册列表，再用 `source.ready(tensors[i])`
+选择本批源。原单 tensor 的 `register(ticket, tensor)` 和 `ready()` 保持可用。
+读取端仍使用 `attach_cpu_source(desc)` 和
+`submit_cpu_pull(ready, put, src_offsets, dst_addrs, lengths)`，不新增句柄参数。
+`src_offsets` 始终相对选定 tensor，`dst_addrs` 来自本次 `prepare_put()` 分配。
+
+78 个 MR 共用一组 4 Jetty。每个共享 DDR Region 只保留一份 pinned 本地接收 MR，
+另外仍保留原先供 NPU BatchGet/BatchPut 访问的 DDR 导出 MR。`ready(tensor)`
+生成的 MR 身份由 Connector 原样转发，CPU 内部选择对应的导入段和 token 信息。
+注册后 tensor 的地址和大小不能变化，所有分配保留到 shutdown 成功；当前批次未释放前
+不能改写选中 tensor。使用同一个 Source 对象的批次依次提交、完成、释放。
+
+成功注册日志包含 `mrs=78 jettys=4 probe=all_mrs_scratch_checksum_pass`。
+`REMOTE_PULL_DONE` 中的 `mr` 随所选 tensor 改变；验收终行应有
+`REMOTE_OFFLOAD_PASS ... tensors=78 single_mr_per_batch=1`。
+每轮 checksum 和重复提交校验继续保留，且不重新注册或重建连接。
 
 ## 性能测试与阶段统计
 
