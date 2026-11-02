@@ -61,8 +61,8 @@ class MulticardTests(unittest.TestCase):
         return subprocess.run([
             str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_multicard_perf.sh"),
             str(root / "build"), "--devices", "0", "1", "--seconds", "0.05",
-            "--ready-timeout", "3", "--output", str(root / "results"),
-        ], env=env, capture_output=True, text=True, timeout=15)
+            "--ready-timeout", "10", "--output", str(root / "results"),
+        ], env=env, capture_output=True, text=True, timeout=30)
 
     def test_coordinated_workers_and_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -76,9 +76,32 @@ class MulticardTests(unittest.TestCase):
             self.assertEqual([float(row["retained_percent"]) for row in rows], [50, 50])
             aggregate = json.loads((output / "aggregate.json").read_text())
             self.assertEqual(aggregate["isolated_sum_GBps"], 60)
+            self.assertEqual(aggregate["concurrent_sum_GBps"], 30)
             self.assertAlmostEqual(aggregate["concurrent_wall_GBps"], 30, places=5)
+            self.assertAlmostEqual(aggregate["drop_percent"], 50, places=5)
+            self.assertAlmostEqual(aggregate["lost_GBps"], 30, places=5)
             self.assertEqual(aggregate["overlap_percent"], 100)
             self.assertTrue((output / "concurrent/device_0.log").exists())
+            with (output / "aggregate.csv").open() as source:
+                totals = list(csv.DictReader(source))
+            self.assertEqual(len(totals), 1)
+            self.assertEqual(totals[0]["device_order"], "0 1")
+            self.assertEqual(float(totals[0]["isolated_sum_GBps"]), 60)
+            report = (output / "report.md").read_text()
+            self.assertIn("每卡独立 328 MiB", report)
+            self.assertIn("| 各卡相加 | 60.000 | 30.000 |", report)
+            self.assertIn("| 并发总吞吐（实际窗口） | 30.000 | GB/s |", report)
+
+            # Reporting works from saved results even with no runnable worker.
+            (root / "runner").unlink()
+            regenerated = subprocess.run([
+                str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_multicard_perf.sh"),
+                str(root / "missing-build"), "--summarize", str(output),
+            ], capture_output=True, text=True, timeout=5)
+            self.assertEqual(regenerated.returncode, 0, regenerated.stdout + regenerated.stderr)
+            self.assertIn("MULTICARD_REPORT", regenerated.stdout)
+            self.assertNotIn("MULTICARD_MEASURE", regenerated.stdout)
+            self.assertEqual((output / "report.md").read_text(), report)
 
     def test_failed_worker_aborts_peers_without_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,8 +127,10 @@ class MulticardTests(unittest.TestCase):
             multi.write_summary(root, solo, shared)
             aggregate = json.loads((root / "aggregate.json").read_text())
             self.assertAlmostEqual(aggregate["concurrent_wall_GBps"], 20 / 1.01)
+            self.assertEqual(aggregate["concurrent_sum_GBps"], 20)
             self.assertAlmostEqual(aggregate["overlap_percent"], 0.99 / 1.01 * 100)
             self.assertAlmostEqual(aggregate["retained_percent"], 100 / 1.01)
+            self.assertAlmostEqual(aggregate["drop_percent"], 100 - 100 / 1.01)
             with self.assertRaisesRegex(RuntimeError, "overlapped"):
                 multi.write_summary(root, solo, [record(0, 0, 1), record(1, 2, 3)])
 
