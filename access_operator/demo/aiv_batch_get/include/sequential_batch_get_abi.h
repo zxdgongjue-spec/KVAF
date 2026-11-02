@@ -8,7 +8,7 @@ enum {
   KVAF_SEQ_GATHER = 2,
   KVAF_SEQ_MAX_REQUESTS = 65536,
   KVAF_SEQ_MAX_WORKERS = 8,
-  KVAF_SEQ_MAX_SGES = 6,
+  KVAF_SEQ_MAX_SGES = 13,
 };
 static const uint64_t KVAF_SEQ_STATUS_MAGIC = 0x4b56414653455131ULL;
 enum KvafSequentialResult : uint64_t {

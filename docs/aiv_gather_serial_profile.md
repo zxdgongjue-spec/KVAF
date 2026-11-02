@@ -7,8 +7,8 @@ AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 
 当前 gather 与 direct 一样，关闭 AIV 的逐请求 `ValidateRows` 校验；输入由
 调用方保证合法。输入缓存维护、基础参数和请求数检查仍保留，六阶段打点
-边界不变，因此 `input_us` 不会归零。此变更只需重新编译 gather kernel，
-不改变 Host/Python ABI 或 CPU 服务。
+边界不变，因此 `input_us` 不会归零。当前 SGL 上限扩展到 13，需要同步重编
+NPU Runtime/Host/Python 与 gather kernel；CPU 服务和 wire 协议保持不变。
 
 ## 地址清单的 SIMT 构造与批量搬运
 
@@ -32,11 +32,27 @@ output_indices、请求数的缓存维护和基础参数检查继续保留。
 口径不变。8193 请求、1 核时，清单分为 6 次 VF 构造和 6 次 MTE3 搬运。
 本地模型验证内容、边界和同步；实际收益和设备缓存可见性需在 950DT 上复测。
 
-本轮只需重新编译 gather kernel：
+只更新清单构造时可以单独重编 gather kernel；本轮 SGL 上限扩展请使用
+“构建与运行”中的完整 NPU 构建命令，同步更新 Runtime/Host/Python。
 
-```bash
-cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
-```
+## 本地 SGE 上限扩展到 13
+
+根据本次 NPU 侧查询的 `max_jfs_sge=13`，软件支持范围扩展为 1～13。
+API 和脚本默认仍为 6；真机测试时修改脚本顶部 `GATHER_SGL_SIZE = 13`，
+也可依次测试 5、9、13。每条完整 WQE 分别占 128、192、256 B。
+
+READ 每个 UB bank 按最大 13 SGE 预留 32 KiB（128 WR × 256 B），两 bank
+共 64 KiB。Scalar 控制/大 token 回退编码区相应扩到 64 个 uint32，所有
+Runtime/Host/kernel/Python 上限同步调整。实际 WQEBB 搬运量仍按所选 SGL
+计算。清单继续使用 24 KiB 分块，两阶段先后复用 UB，避免改变 descriptor
+构造粒度。单 WR 的 64 KiB 限制保持不变；SGL=13 时，token 不超过 5041 B
+使用 SIMT 快速路径，更大 token 走 Scalar 拆分路径。
+
+1 核、8192 或 8193 请求、656 B/token、SGL=13 时，预期 631 条 READ WR、
+2522 个数据 WQEBB、5 次数据 doorbell；标准队列容量下等待一次数据尾 CQ。
+本地模型覆盖全部 1～13 SGE、所有尾项长度、256 B WQE 环回、小 SQ 的容量
+drain、1/3/8 核和 64 KiB 边界两侧的快速/Scalar 路径，实际编码兼容性和性能
+仍需在目标 NPU 上复测。
 
 ## 参数在哪里修改
 
@@ -213,15 +229,15 @@ Jetty 和六阶段计时边界保持原样。数据仍由 NIC 从 CPU staging
 1. 每次最多发布 128 条 READ WQE。发布后继续准备后续 WQE，直到物理 SQ
    WQEBB 容量或传输 WR 上限，再等待该 wave 的有序尾 CQ；整批末尾也等尾 CQ。
    128 是发布粒度，不是在途预算，绝不每 128 条强制等一次 CQ。
-2. 128 个 SIMT 线程分别构造一条含 1～6 个 SGE 的 WQE，连续写入 UB。
+2. 128 个 SIMT 线程分别构造一条含 1～13 个 SGE 的 WQE，连续写入 UB。
    MTE3 批量搬到 SQ，环形队列跨尾时分两次搬运。PI、owner 和复制长度均按
    实际 64 B WQEBB 计算；尾部不足 SGL 的 WQE 也按实际长度紧密排列。
-3. 两个 UB bank 各 24 KiB：VF 构造下一批时，MTE3 搬上一批；搬运完成后
+3. READ 的两个 UB bank 各 32 KiB：VF 构造下一批时，MTE3 搬上一批；搬运完成后
    Scalar 发布上一批 doorbell。UB 等 MTE3 完成即可复用，SQ 空间等尾 CQ
    才能复用。尾 WQE 的 completion/order 位在发布前设定，不修改已发布 WQE。
 
 快速路径条件为 `TOKEN_BYTES * GATHER_SGL_SIZE <= 65536`，覆盖当前
-656 B、SGL=6。超过该范围时保留原有 Scalar 拆 token 路径，支持一条 token
+656 B、SGL=6/13。超过该范围时保留原有 Scalar 拆 token 路径，支持一条 token
 跨多个 WR；这部分暂未做 SIMT 优化。
 
 例如 1 核、8193×656 B、SGL=6、标准 SQ 深度时，仍是 1366 条 READ WR、

@@ -417,7 +417,13 @@ int main() {
   assert(push_stopped == 17);
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   config.aiv_batch_get_mode = "gather_read";
-  config.aiv_gather_sgl_size = 6;
+  for (uint32_t sgl : {0U, 14U}) {
+    config.aiv_gather_sgl_size = sgl;
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
+    assert(!allocations && !refs && !hccp_refs);
+  }
+  config.aiv_gather_sgl_size = 13;
   exec.execution.synchronize = true;
   {
     auto owner = CreateSequentialBatchGet(config);

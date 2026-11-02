@@ -70,7 +70,7 @@ Scatter kernel 已按硬件故障定位需要撤掉入口的 `InitSocState()`，
 [UBToGM DataCopyPad](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_UBToGM.html) 和
 [SIMD/SIMT 内存层次](https://asc.gitcode.com/guide/programming_guide/advanced_programming/advanced_ai_core_programming_model/simd_simt_hybrid_programming/memory_hierarchy.html)。
 
-Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1～6 个本地 SGE，
+Gather 的控制与数据队列分开，每核固定两条 Jetty。可配置 1～13 个本地 SGE，
 每条 READ 的总长度最多 64 KiB，按 64 B WQEBB 处理变长 WQE 和 SQ 回绕。
 Gather 的控制阶段使用标量 GM 访问、缓存操作与 USER_CTL 队列。数据快速
 路径由 SIMT 编码 WQE、MTE3 搬到 SQ；不使用 LocalTensor 或 MTE payload
@@ -141,7 +141,7 @@ runtime = kvaf.NpuRuntime(
     batch_put_kernel_object_path=put_kernel_path,
     npu_core_count=1,                 # 首次上机先用单核，再验证 3/8 核
     aiv_batch_get_mode="gather_read", # 或 "cpu_push_scatter"
-    aiv_gather_sgl_size=6,            # Gather: 1..6
+    aiv_gather_sgl_size=6,            # Gather: 1..13; compare 5/9/13
 )
 runtime.link_to(cpu_service_address)
 runtime.initialize(ddr_bytes, slot_size)

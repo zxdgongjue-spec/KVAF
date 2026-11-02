@@ -42,8 +42,10 @@ class GatherPerfSummaryTest(unittest.TestCase):
     def test_default_config_and_supported_shapes(self):
         for cores in (1, 3, 8):
             for count in (1024, 8192, 8193, 65536):
-                with patch.object(perf, "REQUEST_COUNT", count):
-                    perf.validate_config(cores)
+                for sgl in range(1, 14):
+                    with patch.object(perf, "REQUEST_COUNT", count), \
+                         patch.object(perf, "GATHER_SGL_SIZE", sgl):
+                        perf.validate_config(cores)
 
     def test_invalid_shapes_and_counts_fail_before_hardware(self):
         for field, value in (
@@ -51,7 +53,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
             ("REQUEST_COUNT", 65537), ("REQUEST_COUNT", True),
             ("WARMUP", -1), ("ITERATIONS", -1), ("PROFILE_SAMPLES", -1),
             ("TABLE_CAPACITY", 1 << 31), ("TOKENS_PER_BLOCK", 1 << 31),
-            ("GATHER_SGL_SIZE", 7), ("SEED", -1),
+            ("GATHER_SGL_SIZE", 0), ("GATHER_SGL_SIZE", 14), ("SEED", -1),
         ):
             with self.subTest(field=field, value=value), patch.object(perf, field, value):
                 with self.assertRaises(ValueError):

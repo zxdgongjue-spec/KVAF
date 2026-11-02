@@ -15,7 +15,7 @@ ITERATIONS = 100                # Profile OFF samples; 0 skips E2E for profile d
 PROFILE_SAMPLES = 10            # Profile ON: diagnostic stage samples, separately.
 TABLE_CAPACITY = 256            # Number of remote source blocks.
 TOKENS_PER_BLOCK = 128
-GATHER_SGL_SIZE = 6
+GATHER_SGL_SIZE = 6             # 1..13; compare 5 / 9 / 13 on the confirmed NPU.
 SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
@@ -79,8 +79,8 @@ def validate_config(cores: int) -> None:
         raise ValueError("TABLE_CAPACITY exceeds the DSA int32 directory range")
     if (TOKENS_PER_BLOCK - 1) * TOKEN_BYTES > (1 << 31) - 1:
         raise ValueError("token offsets must fit int32")
-    if not 1 <= cores <= 8 or not 1 <= GATHER_SGL_SIZE <= 6:
-        raise ValueError("KVAF_NPU_CORE_COUNT must be 1..8 and GATHER_SGL_SIZE 1..6")
+    if not 1 <= cores <= 8 or not 1 <= GATHER_SGL_SIZE <= 13:
+        raise ValueError("KVAF_NPU_CORE_COUNT must be 1..8 and GATHER_SGL_SIZE 1..13")
     if not isinstance(SEED, int) or isinstance(SEED, bool) or not 0 <= SEED < 1 << 63:
         raise ValueError("SEED must be an integer in [0, 2**63)")
     if PROFILE_CLOCK_MHZ is not None and (
