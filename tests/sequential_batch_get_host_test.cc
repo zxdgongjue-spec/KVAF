@@ -6,6 +6,7 @@
 #include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
 #include "cpu_push_get_layout.h"
+#include "scatter_host_profile.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,8 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool wrong_phase{}, wrong_sequence{}, wrong_magic{};
 bool stale_profile{}, missing_cpu_profile{}, bad_profile_cycle{};
+bool skip_last_status{};
+int async_memsets{}, async_copies{}, synchronizations{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 std::vector<uint32_t> launch_options;
@@ -31,9 +34,11 @@ int aclrtFree(void* p) { if (p) { --allocations; std::free(p); } return 0; }
 int aclrtFreeHost(void* p) { return aclrtFree(p); }
 int aclrtMemset(void* p, size_t, int32_t v, size_t n) { std::memset(p, v, n); return 0; }
 int aclrtMemsetAsync(void* p, size_t, int32_t v, size_t n, aclrtStream) {
+  ++async_memsets;
   work.push_back([=] { std::memset(p, v, n); }); return 0;
 }
 int aclrtMemcpyAsync(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind, aclrtStream) {
+  ++async_copies;
   if (fail_copy) return 507035;
   work.push_back([=] { std::memcpy(d, s, n); }); return 0;
 }
@@ -42,6 +47,7 @@ int aclrtMemcpy(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind) {
   std::memcpy(d, s, n); return 0;
 }
 int aclrtSynchronizeStream(aclrtStream) {
+  ++synchronizations;
   if (fail_sync) return 507034;
   for (auto& f : work) f(); work.clear(); return 0;
 }
@@ -62,6 +68,7 @@ int Launch(const KvafScatterBatchGetArgs* a) {
     auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
     const auto active = uint64_t(*reinterpret_cast<const int32_t*>(args.request.miss_count));
     for (uint32_t i = 0; i < args.request.block_count; ++i) {
+      if (skip_last_status && i + 1 == args.request.block_count) continue;
       const auto requests = active * (i + 1) / args.request.block_count -
                             active * i / args.request.block_count;
       status[i] = {wrong_magic ? 0 : KVAF_SEQ_STATUS_MAGIC,
@@ -253,16 +260,43 @@ int main() {
   {
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     const auto before = launches;
+    const auto memsets_before = async_memsets;
     exec.execution.synchronize = false;
     assert(owner->Execute(exec).ok()); assert(completed == before);
     assert(owner->Execute(exec).ok()); assert(completed == before + 1);
     exec.execution.synchronize = true;
     assert(owner->Execute(exec).ok()); assert(completed == before + 3);
+    assert(async_memsets == memsets_before); // No extra device task per call.
     assert(launch_options.back() == (kScatterOptionsV1 | kScatterFusedBuild | kScatterDoubleBuffer));
     capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
     count = 0; assert(owner->Execute(exec).ok()); count = 1;
     assert(owner->Shutdown().ok()); assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
+  }
+  for (bool previous_success : {false, true}) {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    if (previous_success) assert(owner->Execute(exec).ok());
+    // A missing core is rejected both on the first request and when its old
+    // successful record is still in HBM. No per-call clear is required.
+    skip_last_status = true;
+    assert(!owner->Execute(exec).ok());
+    skip_last_status = false;
+    assert(owner->Shutdown().ok());
+    assert(!refs && !allocations && !hccp_refs);
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    scatter_host::Profile profile;
+    const auto copies_before = async_copies, syncs_before = synchronizations;
+    {
+      scatter_host::Session session(&profile);
+      assert(owner->Execute(exec).ok());
+    }
+    assert(scatter_host::current == nullptr);
+    assert(profile.ns[scatter_host::kOperator] > 0);
+    assert(profile.ns[scatter_host::kOperator] >= profile.ns[scatter_host::kStreamSync]);
+    assert(async_copies == copies_before + 1 && synchronizations == syncs_before + 1);
+    assert(owner->Shutdown().ok());
   }
   for (uint32_t mismatch = 0; mismatch < 4; ++mismatch) {
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());

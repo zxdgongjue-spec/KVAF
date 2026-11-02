@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "scatter_host_profile.h"
 
 #include <cstdint>
 #include <limits>
@@ -250,6 +251,7 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
+  scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -340,6 +342,7 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
   }
+  validation_timer.Stop();
   return access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
 }

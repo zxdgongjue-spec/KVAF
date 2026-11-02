@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -17,6 +18,7 @@
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
+#include "scatter_host_profile.h"
 
 namespace py = pybind11;
 
@@ -55,40 +57,45 @@ struct NpuTensorView {
   void* data{nullptr};
   std::size_t bytes{0};
   std::size_t element_bytes{0};
-  std::vector<py::ssize_t> shape;
+  std::size_t dimensions{0};
+  py::ssize_t first_dimension{0};
 };
 
 NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
-  if (!py::hasattr(tensor, "data_ptr") || !py::hasattr(tensor, "numel") ||
-      !py::hasattr(tensor, "element_size") ||
-      !py::hasattr(tensor, "is_contiguous") ||
-      !py::hasattr(tensor, "device") || !py::hasattr(tensor, "shape")) {
-    throw py::type_error(std::string(name) + " must be a contiguous NPU Tensor");
+  // Read metadata once. A hasattr preflight repeats six Python attribute
+  // lookups per Tensor; it neither validates their values nor freezes storage.
+  try {
+    if (!tensor.attr("is_contiguous")().cast<bool>()) {
+      throw py::value_error(std::string(name) + " must be contiguous");
+    }
+    const std::string device = py::str(tensor.attr("device")).cast<std::string>();
+    if (device.rfind("npu", 0) != 0) {
+      throw py::value_error(std::string(name) + " must reside on an NPU");
+    }
+    const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
+    const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
+    const std::uint64_t element_bytes =
+        tensor.attr("element_size")().cast<std::uint64_t>();
+    if (pointer == 0 || elements == 0 || element_bytes == 0 ||
+        elements > std::numeric_limits<std::size_t>::max() ||
+        element_bytes > std::numeric_limits<std::size_t>::max() ||
+        static_cast<std::size_t>(elements) >
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(element_bytes)) {
+      throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
+    }
+    const py::sequence shape = tensor.attr("shape");
+    const auto dimensions = shape.size();
+    return NpuTensorView{
+        PointerFromValue(pointer),
+        static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
+        static_cast<std::size_t>(element_bytes),
+        dimensions, dimensions ? shape[0].cast<py::ssize_t>() : 0};
+  } catch (const py::error_already_set& error) {
+    if (error.matches(PyExc_AttributeError))
+      throw py::type_error(std::string(name) + " must be a contiguous NPU Tensor");
+    throw;
   }
-  if (!tensor.attr("is_contiguous")().cast<bool>()) {
-    throw py::value_error(std::string(name) + " must be contiguous");
-  }
-  const std::string device = py::str(tensor.attr("device")).cast<std::string>();
-  if (device.rfind("npu", 0) != 0) {
-    throw py::value_error(std::string(name) + " must reside on an NPU");
-  }
-  const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
-  const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
-  const std::uint64_t element_bytes =
-      tensor.attr("element_size")().cast<std::uint64_t>();
-  if (pointer == 0 || elements == 0 || element_bytes == 0 ||
-      elements > std::numeric_limits<std::size_t>::max() ||
-      element_bytes > std::numeric_limits<std::size_t>::max() ||
-      static_cast<std::size_t>(elements) >
-          std::numeric_limits<std::size_t>::max() /
-              static_cast<std::size_t>(element_bytes)) {
-    throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
-  }
-  return NpuTensorView{
-      PointerFromValue(pointer),
-      static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
-      static_cast<std::size_t>(element_bytes),
-      tensor.attr("shape").cast<std::vector<py::ssize_t>>()};
 }
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
@@ -376,8 +383,18 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
-  void StartScatterProfile() { ThrowIfError(native_->SetScatterProfiling(true)); }
-  void StopScatterProfile() { ThrowIfError(native_->SetScatterProfiling(false)); }
+  void StartScatterProfile() {
+    const char* value = std::getenv("KVAF_SCATTER_HOST_PROFILE");
+    if (value && std::string(value) != "0" && std::string(value) != "1")
+      throw py::value_error("KVAF_SCATTER_HOST_PROFILE must be 0 or 1");
+    ThrowIfError(native_->SetScatterProfiling(true));
+    host_profile_enabled_ = value && std::string(value) == "1";
+    host_profile_ready_ = false;
+  }
+  void StopScatterProfile() {
+    ThrowIfError(native_->SetScatterProfiling(false));
+    host_profile_enabled_ = host_profile_ready_ = false;
+  }
   py::list ScatterProfileSnapshot() const {
     std::vector<kvaf::ScatterBatchGetCoreProfile> profiles;
     ThrowIfError(native_->CopyScatterProfiles(&profiles));
@@ -402,6 +419,12 @@ class NpuPythonRuntime final {
       item["cpu_comm_ns"] = profile.cpu_comm_ns;
       item["cpu_post_ns"] = profile.cpu_post_ns;
       item["cpu_cq_wait_ns"] = profile.cpu_cq_wait_ns;
+      if (!core && host_profile_enabled_ && host_profile_ready_) {
+        py::dict host;
+        for (std::size_t phase = 0; phase < scatter_host::kCount; ++phase)
+          host[scatter_host::kNames[phase]] = host_profile_.ns[phase];
+        item["host_profile"] = std::move(host);
+      }
       result.append(std::move(item));
     }
     return result;
@@ -485,6 +508,10 @@ class NpuPythonRuntime final {
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
                     bool synchronize) {
+    scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
+    scatter_host::Timer binding_timer(scatter_host::kBinding);
+    scatter_host::Timer tensor_timer(scatter_host::kTensorMetadata);
+    host_profile_ready_ = false;
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView miss_count_view =
@@ -494,8 +521,8 @@ class NpuPythonRuntime final {
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
-    if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
-        output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
+    if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
+        output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
@@ -506,12 +533,12 @@ class NpuPythonRuntime final {
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
-        output_view.shape.front() <= 0 ||
-        output_view.bytes % static_cast<std::size_t>(output_view.shape.front()) != 0) {
+        output_view.first_dimension <= 0 ||
+        output_view.bytes % static_cast<std::size_t>(output_view.first_dimension) != 0) {
       throw py::value_error("BatchGet Tensors do not satisfy the NPU layout contract");
     }
     const std::uint64_t output_rows =
-        static_cast<std::uint64_t>(output_view.shape.front());
+        static_cast<std::uint64_t>(output_view.first_dimension);
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
     if (output_block_bytes != native_->batch_get_token_bytes()) {
       throw py::value_error(
@@ -531,19 +558,30 @@ class NpuPythonRuntime final {
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
+    tensor_timer.Stop();
+    scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
     const aclrtStream acl_stream = ResolveStream(stream);
-    ThrowIfError(native_->core().BatchGet(
-        request, BatchGetExecutionOptions{acl_stream,
-                                           synchronize}));
+    stream_timer.Stop();
+    Status status;
+    {
+      scatter_host::Timer native_timer(scatter_host::kNative);
+      status = native_->core().BatchGet(
+          request, BatchGetExecutionOptions{acl_stream, synchronize});
+    }
+    ThrowIfError(status);
+    host_profile_ready_ = host_profile_enabled_;
   }
 
  public:
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
+    host_profile_enabled_ = host_profile_ready_ = false;
   }
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  bool host_profile_enabled_{false}, host_profile_ready_{false};
+  scatter_host::Profile host_profile_{};
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scatter_perf_common import CPU_MAGIC, PROFILE_MAGIC, profile_metrics, request_values, sample_metrics, summarize
+from scatter_perf_common import HOST_TIMINGS, CPU_MAGIC, PROFILE_MAGIC, profile_metrics, request_values, sample_metrics, summarize
 from test_aiv_scatter_perf import CSV_COLUMNS, arguments, main, measure_pass, write_results
 
 
@@ -59,6 +59,34 @@ class ScatterPerfTests(unittest.TestCase):
         for values in ([], [0], [-1], [float("nan")], [float("inf")]):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 summarize(values, 1000)
+
+    def test_optional_host_profile_preserves_clock_domains_and_csv(self):
+        self.assertFalse(arguments([]).host_profile)
+        self.assertTrue(arguments(["--host-profile"]).host_profile)
+        records = profiles()
+        host = dict.fromkeys(HOST_TIMINGS, 10)
+        host.update(host_binding_ns=2500, host_tensor_metadata_ns=100,
+                    host_native_ns=2300, host_operator_ns=2200, host_stream_sync_ns=2100)
+        records[0]["host_profile"] = host
+        metrics = profile_metrics(records, 3, 19, 656, 1000)
+        self.assertEqual(metrics["host_stream_sync_ns"], 2100)
+        self.assertEqual(profile_metrics(records, 3, 19, 656, 50)["host_stream_sync_ns"], 2100)
+        sample = sample_metrics(dict(payload_bytes=1000, end_to_end_ns=3000, **metrics))
+        self.assertEqual(sample["host_python_dispatch_ns"], 500)
+        self.assertEqual(sample["host_tensor_metadata_us"], .1)
+        self.assertEqual(sample["call_outside_aiv_ns"], 858)
+        self.assertFalse(any(key.startswith("host_") for key in CSV_COLUMNS))
+        for key, value in (("host_operator_ns", 0), ("host_binding_ns", 1),
+                           ("host_capture_query_ns", -1), ("host_launch_ns", float("nan"))):
+            bad = profiles()
+            bad[0]["host_profile"] = dict(host, **{key: value})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                profile_metrics(bad, 3, 19, 656, 1000)
+        records[0]["host_profile"] = {key: value for key, value in host.items() if key != "host_launch_ns"}
+        with self.assertRaises(ValueError):
+            profile_metrics(records, 3, 19, 656, 1000)
+        with self.assertRaises(ValueError):
+            sample_metrics(dict(payload_bytes=1000, end_to_end_ns=2000, host_binding_ns=2500))
 
     def test_profile_clock_domains_and_slowest_worker(self):
         result = profile_metrics(profiles(), 3, 19, 656, 1000)
@@ -180,6 +208,7 @@ class ScatterPerfTests(unittest.TestCase):
     def test_cli_validation_and_skip_before_hardware_import(self):
         for args in (["--requests", "0"], ["--cores", "9"], ["--iterations", "0"],
                      ["--fused-build", "2"], ["--double-buffer", "ON"],
+                     ["--host-profile", "--profile-iterations", "0"],
                      ["--request-length", "4095"], ["--miss-count", "4097"],
                      ["--workload", "one-token-per-block", "--miss-count", "1025"],
                      ["--miss-count", "1", "--active-percent", "75"],
@@ -202,7 +231,8 @@ class ScatterPerfTests(unittest.TestCase):
             report = dict(config={"units": "decimal GB/s"}, summary={}, samples={
                 "baseline": [dict(iteration=0, payload_bytes=656, end_to_end_ns=1000)],
                 "profiled": [dict(iteration=0, payload_bytes=656, end_to_end_ns=2000,
-                                  cpu_comm_ns=500, workers=profiles())]})
+                                  cpu_comm_ns=500, host_binding_ns=1500,
+                                  host_tensor_metadata_ns=100, workers=profiles())]})
             write_results(args, report)
             self.assertEqual(json.loads(args.json.read_text()), report)
             with args.csv.open(newline="") as stream:

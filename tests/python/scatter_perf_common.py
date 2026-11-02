@@ -8,6 +8,13 @@ PROFILE_MAGIC = 0x4B56415343505231
 
 PAYLOAD_TIMINGS = ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns",
                    "aiv_body_ns", "aiv_wall_ns", "aiv_scatter_ns")
+HOST_TIMINGS = (
+    "host_binding_ns", "host_tensor_metadata_ns", "host_stream_resolve_ns",
+    "host_native_ns", "host_runtime_validation_ns", "host_operator_ns",
+    "host_mutex_wait_ns", "host_capture_query_ns", "host_prior_drain_ns",
+    "host_input_ns", "host_launch_ns", "host_status_copy_enqueue_ns",
+    "host_stream_sync_ns", "host_status_validate_ns",
+)
 
 
 def request_values(args, seed):
@@ -53,6 +60,13 @@ def sample_metrics(sample):
         if outside < 0:
             raise ValueError("AIV wall time exceeds synchronous call; check the counter frequency")
         result["call_outside_aiv_ns"] = outside
+    if "host_binding_ns" in result:
+        # Both are Host durations. The difference includes Python/pybind entry,
+        # overload dispatch and the return path outside BatchGetImpl's timer.
+        outside = result["end_to_end_ns"] - result["host_binding_ns"]
+        if outside < 0:
+            raise ValueError("binding time exceeds the measured BatchGet call")
+        result["host_python_dispatch_ns"] = outside
     for key, value in list(result.items()):
         if key.endswith("_ns"):
             if not math.isfinite(value) or value < 0:
@@ -127,4 +141,16 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
         aiv_scatter_tail_ns=(last_finish - cpu["done_cycle"]) * ns_per_cycle,
         aiv_launch_skew_ns=(max(r["start_cycle"] for r in records) - first_start) * ns_per_cycle,
     )
+    host = cpu.get("host_profile")
+    if host is not None:
+        if any(key not in host or not math.isfinite(host[key]) or host[key] < 0
+               for key in HOST_TIMINGS):
+            raise ValueError("invalid or incomplete Host profile")
+        # Detect a mismatched/old binding or an unshared profiling context.
+        if any(host[key] <= 0 for key in ("host_binding_ns", "host_tensor_metadata_ns",
+                                         "host_native_ns", "host_operator_ns")):
+            raise ValueError("Host profile missing; rebuild Runtime, binding and Host together")
+        if not host["host_operator_ns"] <= host["host_native_ns"] <= host["host_binding_ns"]:
+            raise ValueError("invalid Host profile containment")
+        result.update({key: host[key] for key in HOST_TIMINGS})
     return result

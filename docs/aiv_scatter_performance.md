@@ -139,6 +139,71 @@ Host 测试验证默认值、环境变量快照、重新初始化、profile 开�
 
 ## 构建与运行
 
+### 调用外围与 Host 分段诊断
+
+`call_outside_aiv_us = end_to_end_us - aiv_wall_us`。它覆盖 Python/Pybind 包装与
+Tensor 元数据解析、Runtime 校验、capture 查询、提交/排队、状态回拷和同步返回，
+也覆盖 kernel 的计时 start 之前和 finish 之后的工作。它不是某一个 API 的计时，
+也不能直接全部归为 Python 执行时间。
+BatchPut、准备表、输入刷新、output guard 校验和单独读取 profile 快照均不在该单次计时内。
+
+每次同步调用原先提交 `status memset → scatter kernel → 256 B status D2H（4 核）`，
+然后执行一次 stream synchronize 并校验各核 magic/sequence/result/phase。
+现在去掉每轮 status memset：状态区只在初始化时清零一次，每次 kernel 完整写回状态，
+旧状态由递增 sequence 检出。Tensor 解析去掉重复的 hasattr 预检查和 shape vector 分配，
+每次仍读取当前存储指针并校验布局，不跨调用缓存可能变化的 Tensor 元数据。
+
+诊断时沿用完整端到端入口，在原命令添加 `--host-profile`，结果写进 JSON，CSV 仍为 27 列：
+
+```bash
+cmake --build build-npu -j
+bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
+    --host-profile --cores 4 --fused-build 1 --double-buffer 1 \
+    --blocks 1024 --tokens-per-block 4 --token-bytes 4096 \
+    --request-length 8192 --miss-count 1024 --input-mode changing \
+    --warmup 50 --iterations 1000 --profile-rounds 100 \
+    --json results/scatter-host-profile.json --csv results/scatter-host-profile.csv
+```
+
+也可在直接使用绑定时设置 `KVAF_SCATTER_HOST_PROFILE=1`，然后调用现有
+`start_scatter_profile()`。测试脚本以 `--host-profile` 为准覆盖环境变量。
+诊断默认关闭；仅在 profiled 阶段启用，baseline 不读取 Host 时钟。
+本次需重编译绑定、Runtime 和 NPU Host；CPU 服务与 AIV kernel 协议不变。
+
+`samples.profiled` 中新增原始 `host_*_ns` 及对应 `host_*_us`，`summary.profiled`
+保留各分段的 `mean_us/p50_us/p95_us/min_us/max_us` 等统计。
+字段的包含关系如下，各层存在嵌套，不能全部相加：
+
+```text
+end_to_end
+├─ host_python_dispatch           调用总时长减 binding：包装、重载派发和返回差值
+└─ host_binding                   BatchGetImpl 整体
+   ├─ host_tensor_metadata        7 个 Tensor 的解析、布局校验与请求组装
+   ├─ host_stream_resolve         stream 对象转 ACL handle
+   └─ host_native                 Runtime::BatchGet 整体
+      ├─ host_runtime_validation  AccessTable 生命周期和请求布局校验
+      └─ host_operator            ScatterBatchGet::Execute 整体
+         ├─ host_mutex_wait       获取实例锁
+         ├─ host_capture_query    查询 capture 状态
+         ├─ host_prior_drain      收尾上一笔请求；同步稳态下无上一笔待完成任务
+         ├─ host_input            kernel 参数构造/布局校验
+         ├─ host_launch           kernel 提交 API
+         ├─ host_status_copy_enqueue  状态 D2H 的提交 API
+         ├─ host_stream_sync      等待设备、D2H 完成及同步返回
+         └─ host_status_validate  各核状态校验
+```
+
+上述名字在 JSON 中以 `_ns`/`_us` 结尾；父层还包含少量分段之间的工作。
+若一次调用需要 drain 上一笔异步请求，`host_prior_drain` 内还包含相应的 copy/sync/validate，
+因此这些字段也不能简单相加当成严格的互斥分区。
+`host_stream_sync` 包含尚未完成的 AIV/CPU 通信时间，不能整段算成额外开销，
+也不能直接用它减完整 aiv_wall：设备可能在 Host 进入同步 API 之前已经开始执行。
+Host 诊断增加计时开销，只用于定位；最终收益用默认关闭诊断的 baseline 比较。
+
+capture 状态可随每次调用变化，不能仅按 stream 地址缓存；同步接口必须等待真实完成。
+状态校验仍用于发现 kernel 正常返回但某核结果为 INVALID/TIMEOUT/REMOTE_ERROR 的情况。
+设置 `synchronize=False` 只改变返回时机，不能据此宣称同步端到端耗时降低。
+
 首次使用计时需要同时更新 CPU 服务、NPU Host/Python binding 和 scatter kernel。
 CPU 服务应在空闲时用当前分支产物重启；旧服务可以执行业务传输，但无法返回
 本次新增的 CPU 计时报告，测试会明确失败，不会把缺失计时当成零耗时。

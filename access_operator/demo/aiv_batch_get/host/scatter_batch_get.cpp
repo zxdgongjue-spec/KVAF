@@ -2,6 +2,7 @@
 #include "sequential_batch_get_common.h"
 #include "kvaf_aiv_batch_get.h"
 #include "cpu_push_get_layout.h"
+#include "scatter_host_profile.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "direct_hccp/target_channel.h"
 #include "peer_link.h"
@@ -77,16 +78,21 @@ struct ScatterBatchGet::Impl {
   Status Drain() {
     if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
     if (!pending) return Status::OK();
+    scatter_host::Timer copy_timer(scatter_host::kStatusCopy);
     const aclError copied = aclrtMemcpyAsync(status_host, StatusBytes(), status_device,
                                             StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, pending);
+    copy_timer.Stop();
     if (copied != ACL_SUCCESS) {
       failed = true; return AclFailure("copy_status", copied);
     }
+    scatter_host::Timer sync_timer(scatter_host::kStreamSync);
     const aclError synchronized = aclrtSynchronizeStream(pending);
+    sync_timer.Stop();
     if (synchronized != ACL_SUCCESS) {
       failed = true; return AclFailure("synchronize", synchronized);
     }
     pending = nullptr;
+    scatter_host::Timer validation_timer(scatter_host::kStatusValidate);
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
@@ -241,6 +247,11 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (aclrtMalloc(&s.status_device, s.StatusBytes() + s.ProfileBytes(), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMallocHost(&s.status_host, s.StatusBytes()) != ACL_SUCCESS)
     return Error("allocate statuses");
+  // Clear recycled HBM once: first-launch stale bytes must not look like
+  // sequence 1. Later requests are distinguished by their increasing sequence.
+  if (aclrtMemset(s.status_device, s.StatusBytes() + s.ProfileBytes(), 0,
+                 s.StatusBytes() + s.ProfileBytes()) != ACL_SUCCESS)
+    return Error("initialize statuses");
   s.args.max_polls = 100000000U;
   s.args.source_base = region.base; s.args.source_bytes = region.length;
   result = s.InitializePush(peer);
@@ -257,28 +268,44 @@ Status ScatterBatchGet::Drain() {
   return impl_->Drain();
 }
 Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
+  scatter_host::Timer operator_timer(scatter_host::kOperator);
   auto& s = *impl_;
+  scatter_host::Timer mutex_timer(scatter_host::kMutexWait);
   std::lock_guard<std::mutex> lock(s.mutex);
+  mutex_timer.Stop();
   if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
   if (!exec.execution.stream) return Status::InvalidArgument("BatchGet needs a stream");
   aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
   aclmdlRI graph = nullptr;
-  if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
+  scatter_host::Timer capture_timer(scatter_host::kCaptureQuery);
+  const auto capture_result = aclmdlRICaptureGetInfo(
+      static_cast<aclrtStream>(exec.execution.stream), &capture, &graph);
+  capture_timer.Stop();
+  if (capture_result != ACL_SUCCESS)
     return Error("query stream capture state");
   if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
     return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  scatter_host::Timer prior_timer(scatter_host::kPriorDrain);
   auto result = s.Drain();
+  prior_timer.Stop();
   if (!result.ok()) return result;
   auto args = s.args;
+  scatter_host::Timer input_timer(scatter_host::kInput);
   result = Input(exec, s.config, &args.request);
+  input_timer.Stop();
   if (!result.ok()) return result;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
   args.request.core_status = Ptr(s.status_device); args.request.queue_state = 0;
   args.sequence = ++s.sequence;
   s.profile_ready = false;
   s.pending = static_cast<aclrtStream>(exec.execution.stream);
-  if (aclrtMemsetAsync(s.status_device, s.StatusBytes(), 0, s.StatusBytes(), s.pending) != ACL_SUCCESS ||
-      KvafScatterBatchGetLaunch(&args, s.pending)) {
+  // Every launched core overwrites its complete status. Drain checks this
+  // request's monotonically increasing sequence, so an old status cannot pass.
+  // Avoid submitting a separate device memset task before every kernel.
+  scatter_host::Timer launch_timer(scatter_host::kLaunch);
+  const auto launch_result = KvafScatterBatchGetLaunch(&args, s.pending);
+  launch_timer.Stop();
+  if (launch_result) {
     s.failed = true; return Error("enqueue failed; resources retained");
   }
   s.profile_ready = ScatterProfileEnabled(args.reserved);

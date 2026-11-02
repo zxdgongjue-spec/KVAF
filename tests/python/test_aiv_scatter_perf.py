@@ -12,7 +12,7 @@ import time
 
 from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
 from aiv_kernel_metadata import check_aiv_kernel_metadata
-from scatter_perf_common import PAYLOAD_TIMINGS, profile_metrics, request_values, sample_metrics, summarize
+from scatter_perf_common import HOST_TIMINGS, PAYLOAD_TIMINGS, percentile, profile_metrics, request_values, sample_metrics, summarize
 
 
 # Stable compact layout, including for baseline-only or profiled-only runs.
@@ -53,6 +53,8 @@ def arguments(argv=None):
     parser.add_argument("--profile-warmup", type=int, default=1)
     parser.add_argument("--profile-iterations", "--profile-rounds", type=int, default=20,
                         help="0 disables all optional CPU/AIV instrumentation")
+    parser.add_argument("--host-profile", action="store_true",
+                        help="diagnose Host phases in profiled JSON samples; compact CSV stays unchanged")
     parser.add_argument("--aiv-clock-mhz", type=float, default=1000.0,
                         help="GetSystemCycle counter: 1000 MHz on Ascend 950; override for other products")
     parser.add_argument("--output-pattern", choices=("dense", "strided"),
@@ -102,6 +104,8 @@ def arguments(argv=None):
         parser.error("token offset exceeds nonnegative int32")
     if args.warmup < 0 or args.profile_warmup < 0 or args.iterations < 1 or args.profile_iterations < 0:
         parser.error("iterations must be positive; warmup/profile counts must be nonnegative")
+    if args.host_profile and not args.profile_iterations:
+        parser.error("host-profile requires nonzero profile-iterations")
     if not math.isfinite(args.aiv_clock_mhz) or args.aiv_clock_mhz <= 0:
         parser.error("aiv-clock-mhz must be positive and finite")
     if args.json and args.csv and args.json.resolve() == args.csv.resolve():
@@ -249,6 +253,7 @@ def main(argv=None):
         # baseline/profiled phases then use the same algorithms and binary.
         os.environ["KVAF_SCATTER_FUSED_BUILD"] = str(args.fused_build)
         os.environ["KVAF_SCATTER_DOUBLE_BUFFER"] = str(args.double_buffer)
+        os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
         report["setup_ms"]["initialize"] = (time.perf_counter_ns() - begin) / 1e6
@@ -326,6 +331,8 @@ def main(argv=None):
                 check(index)
             def snapshot():
                 records = [dict(r) for r in runtime.scatter_profile()]
+                if args.host_profile and "host_profile" not in records[0]:
+                    raise RuntimeError("rebuild Python binding, Runtime and Host for --host-profile")
                 return dict(workers=records, sequence=records[0]["sequence"],
                             **profile_metrics(records, args.cores, args.miss_count,
                                                               args.token_bytes, args.aiv_clock_mhz))
@@ -338,11 +345,17 @@ def main(argv=None):
             # Non-payload subphases get latency statistics, without misleading bandwidths.
             for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns",
                         "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns",
-                        "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns"):
+                        "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns",
+                        *HOST_TIMINGS, "host_python_dispatch_ns"):
                 if key in samples[0]:
                     values = [s[key] for s in samples]
                     metrics[key] = dict(mean_ms=sum(values) / len(values) / 1e6,
                                         min_ms=min(values) / 1e6, max_ms=max(values) / 1e6)
+                    if key.startswith("host_"):
+                        metrics[key].update(mean_us=sum(values) / len(values) / 1000,
+                                            p50_us=percentile(values, .5) / 1000,
+                                            p95_us=percentile(values, .95) / 1000,
+                                            min_us=min(values) / 1000, max_us=max(values) / 1000)
             metrics.update(loop_wall_ms=wall_ns / 1e6, loop_effective_gbps=payload * iterations / wall_ns,
                            instrumentation_overhead_included=profiling,
                            profile_snapshot_in_sample=False,
