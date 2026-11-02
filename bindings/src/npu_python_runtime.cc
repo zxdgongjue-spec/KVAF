@@ -302,23 +302,20 @@ class NpuPythonRuntime final {
     CopyCpuUint64SequenceInto(lengths,"lengths",&sizes);
     PutHandle put; ThrowIfError(native_->PreparePut(CopyPrepareKeys(keys),sizes,&put)); return put;
   }
-  CpuPullTask SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
+  void SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
                            const py::object& src,const py::object& dst_addrs,const py::object& lengths) {
     std::vector<std::uint64_t> sources, destinations, sizes;
     CopyCpuUint64SequenceInto(src, "src_offsets", &sources);
     CopyCpuUint64SequenceInto(dst_addrs, "dst_addrs", &destinations);
     CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
-    CpuPullTask task;
-    const auto status=native_->SubmitCpuPull(ready,put,sources,destinations,sizes,&task);
-    if(!status.ok()) throw std::runtime_error(status.message()+"; recover the original task via put.task");
-    return task;
+    ThrowIfError(native_->SubmitCpuPull(ready,put,sources,destinations,sizes));
   }
-  CpuPullState QueryCpuPull(const CpuPullTask& task) {
-    CpuPullState state; ThrowIfError(native_->QueryCpuPull(task,&state)); return state;
+  CpuPullState QueryCpuPull(const PutHandle& put) {
+    CpuPullState state; ThrowIfError(native_->QueryCpuPull(put,&state)); return state;
   }
-  CpuPullState WaitCpuPull(const CpuPullTask& task,std::uint32_t timeout) {
+  CpuPullState WaitCpuPull(const PutHandle& put,std::uint32_t timeout) {
     CpuPullState state; Status status;
-    {py::gil_scoped_release release;status=native_->WaitCpuPull(task,timeout,&state);}
+    {py::gil_scoped_release release;status=native_->WaitCpuPull(put,timeout,&state);}
     ThrowIfError(status); return state;
   }
   CpuPullState CommitPut(const PutHandle& put) { ThrowIfError(native_->CommitPut(put)); return put.state(); }
@@ -729,9 +726,10 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("ready"),py::arg("put"),
            py::arg("src_offsets"),py::arg("dst_addrs"),py::arg("lengths"),
            "Submit CPU READ using an attached ReadyToken source and absolute DDR destination "
-           "addresses from put.entries. The three Host arrays must be equally sized.")
-      .def("query_cpu_pull",&NpuPythonRuntime::QueryCpuPull,py::arg("task"))
-      .def("wait_cpu_pull",&NpuPythonRuntime::WaitCpuPull,py::arg("task"),py::arg("timeout")=30000,
+           "addresses from put.entries. The three Host arrays must be equally sized. "
+           "Returns None; query/wait using the same put, including after a lost response.")
+      .def("query_cpu_pull",&NpuPythonRuntime::QueryCpuPull,py::arg("put"))
+      .def("wait_cpu_pull",&NpuPythonRuntime::WaitCpuPull,py::arg("put"),py::arg("timeout")=30000,
            "Wait for DMA only; timeout is in milliseconds. Commit explicitly afterward.")
       .def("commit_put",&NpuPythonRuntime::CommitPut,py::arg("put"))
       .def("abort_put",&NpuPythonRuntime::AbortPut,py::arg("put"))

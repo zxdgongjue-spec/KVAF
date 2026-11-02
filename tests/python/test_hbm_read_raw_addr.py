@@ -136,9 +136,9 @@ def main():
             source_offsets = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
             cpu_destinations = torch.tensor([e.address for e in put.entries],
                                             dtype=torch.int64, device="cpu")
-            task = runtime.submit_cpu_pull(cpu_batch, put, source_offsets,
+            runtime.submit_cpu_pull(cpu_batch, put, source_offsets,
                                            cpu_destinations, torch.full((3,), 656, dtype=torch.int64, device="cpu"))
-            runtime.wait_cpu_pull(task, timeout=30000)
+            runtime.wait_cpu_pull(put, timeout=30000)
             runtime.commit_put(put)
             cpu_expected = pattern(torch, round_id)
             rows = [cpu_expected[o:o + 656] for o in OFFSETS]

@@ -66,8 +66,10 @@ class ConnectorBindings(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_only_current_pull_interfaces_are_exported(self):
-        for name in ("HbmSource", "HbmReadSource", "OffloadRuntime", "CpuPullSourceHandle"):
+        for name in ("HbmSource", "HbmReadSource", "OffloadRuntime", "CpuPullSourceHandle", "CpuPullTask"):
             self.assertFalse(hasattr(kvaf, name))
+        self.assertFalse(hasattr(kvaf.PutHandle, "task"))
+        self.assertTrue(hasattr(kvaf.PutHandle, "submitted"))
         for name in ("offload", "offload_from", "resolve_offload", "release_offload_source"):
             self.assertFalse(hasattr(kvaf.NpuRuntime, name))
         self.assertTrue(hasattr(kvaf.NpuRuntime, "batch_cpu_pull"))

@@ -85,9 +85,9 @@ class NpuRuntime final : public Runtime {
   // Resolves the attached source from ReadyToken. dst_addrs are absolute DDR addresses.
   Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
                        Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
-                       Uint64ArrayView lengths, CpuPullTask*);
-  Status QueryCpuPull(const CpuPullTask&, CpuPullState*);
-  Status WaitCpuPull(const CpuPullTask&, std::uint32_t timeout_ms, CpuPullState*);
+                       Uint64ArrayView lengths);
+  Status QueryCpuPull(const PutHandle&, CpuPullState*);
+  Status WaitCpuPull(const PutHandle&, std::uint32_t timeout_ms, CpuPullState*);
   Status CommitPut(const PutHandle&);
   Status AbortPut(const PutHandle&);
 

@@ -30,10 +30,8 @@ void BindConnectorTypes(py::module_& m) {
   py::class_<PutAllocation>(m,"PutEntry")
     .def_readonly("key",&PutAllocation::key).def_readonly("address",&PutAllocation::address)
     .def_readonly("length",&PutAllocation::reserved_length);
-  py::class_<CpuPullTask>(m,"CpuPullTask")
-    .def_property_readonly("id",&CpuPullTask::id).def_property_readonly("valid",&CpuPullTask::valid);
   py::class_<PutHandle>(m,"PutHandle")
     .def_property_readonly("id",&PutHandle::id).def_property_readonly("entries",&PutHandle::entries)
-    .def_property_readonly("state",&PutHandle::state).def_property_readonly("task",&PutHandle::task);
+    .def_property_readonly("state",&PutHandle::state).def_property_readonly("submitted",&PutHandle::submitted);
 }
 }

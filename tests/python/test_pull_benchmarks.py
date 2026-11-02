@@ -41,23 +41,28 @@ class PullBenchmarks(unittest.TestCase):
             events.append(name)
             now += us * 1000
 
+        prepared_put = object()
+        test = self
+
         class Runtime:
             def prepare_put(self, *args):
                 step("prepare_put", 10)
-                return "put"
+                return prepared_put
 
-            def submit_cpu_pull(self, *args):
+            def submit_cpu_pull(self, ready, put, src, dst, sizes):
+                test.assertIs(put, prepared_put)
                 step("submit_cpu_pull", 30)
-                return "task"
 
-            def wait_cpu_pull(self, task):
+            def wait_cpu_pull(self, put):
+                test.assertIs(put, prepared_put)
                 step("wait_cpu_pull", 40)
 
             def commit_put(self, put):
+                test.assertIs(put, prepared_put)
                 step("commit_put", 50)
 
         def organize(put):
-            self.assertEqual(put, "put")
+            self.assertIs(put, prepared_put)
             step("dst_addrs", 20)
             return [0]
 

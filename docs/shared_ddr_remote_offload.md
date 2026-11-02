@@ -28,8 +28,8 @@ lengths = torch.tensor([656, 100001], dtype=torch.int64, device="cpu")
 src = torch.tensor([7, 100003], dtype=torch.int64, device="cpu")
 put = runtime.prepare_put([1, 3], lengths)
 dst_addrs = torch.tensor([e.address for e in put.entries], dtype=torch.int64, device="cpu")
-task = runtime.submit_cpu_pull(ready, put, src, dst_addrs, lengths)
-runtime.wait_cpu_pull(task)
+runtime.submit_cpu_pull(ready, put, src, dst_addrs, lengths)
+runtime.wait_cpu_pull(put)
 runtime.commit_put(put)
 
 # A 应用发送完成消息；B 确认后可覆写下一批。
@@ -44,7 +44,7 @@ CPU 源偏移相对于注册 HBM 的逻辑起点；目的直接使用 PreparePut
 runtime.batch_cpu_pull(keys, local_npu_tensor, input_offsets, lengths, stream=producer_stream)
 ```
 
-同步语义与 BatchPut 一致：成功返回时数据和元数据提交均完成。内部注册本卡源、等待生产、PreparePut、组织目的绝对地址、提交 CPU READ、等待及确认批次复用。应用不管理内部 put/task。源注册缓存至切换 Tensor 或 shutdown；同参数再次调用是新批次。
+同步语义与 BatchPut 一致：成功返回时数据和元数据提交均完成。内部注册本卡源、等待生产、PreparePut、组织目的绝对地址、提交 CPU READ、等待及确认批次复用。应用不管理内部 put。源注册缓存至切换 Tensor 或 shutdown；同参数再次调用是新批次。
 
 独立 OffloadRuntime、旧类别名、带范围 Ready、offload/offload_from、旧恢复入口已经删除。当前只保留上述便利入口及显式 Connector 事务接口。
 
@@ -166,7 +166,7 @@ GB/s 使用十进制单位。CPU 数据面时间包含描述符准备、提交�
 
 ## 未决操作
 
-显式事务由应用持有 put/task：Submit 响应丢失后从 `put.task` 查询原任务，使用 query/wait/commit/abort；不可重复 PreparePut 替代未决任务。生产端通过 `release_batch(ready)` 或尚未获取批次时的 `cancel_batch(ready)` 核验身份及状态。
+显式事务由应用持有一个 put：Submit 成功返回 None，查询、等待、提交和撤销均使用原 put。参数校验失败且 `put.submitted=False` 时可以修正参数后提交；`put.submitted=True` 表示请求已记录，即使 Submit 响应丢失也用原 put 恢复，不可重复 PreparePut 替代未决任务。它不表示 CPU 已接受或 DMA 已完成。生产端通过 `release_batch(ready)` 或尚未获取批次时的 `cancel_batch(ready)` 核验身份及状态。
 
 本卡 `batch_cpu_pull()` 自动处理可确认失败的 Abort。未决 DMA 保留内部事务并阻止新调用；`shutdown()` 只查询、确认并清理，不重发 READ。清理未成功时，源和 DDR 继续保持有效。Commit 已开始后，确认丢失不能逆转已发布的元数据。
 

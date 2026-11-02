@@ -52,7 +52,7 @@ B 的普通 BatchPut、BatchGet、本卡 Offload 和跨卡 CPU Pull 共用一个
 
 ## 4. 描述符、批次和地址结构
 
-以下为应用可见的逻辑结构。Connector 传递 KVAF 返回的描述符，不自行组装 MR、Jetty 或 TP 数据。Python 的两个源描述符及 ReadyToken 为只读对象，支持 pickle 跨进程交换；本地 put/task/source handle 不支持跨进程传递。
+以下为应用可见的逻辑结构。Connector 传递 KVAF 返回的描述符，不自行组装 MR、Jetty 或 TP 数据。Python 的两个源描述符及 ReadyToken 为只读对象，支持 pickle 跨进程交换；本地 PutHandle 不支持跨进程传递。
 
 ### 4.1 长期源身份
 
@@ -263,9 +263,9 @@ source.release_batch(completion.ready)
 | 接口 | 返回与作用 |
 |---|---|
 | `prepare_put(keys, lengths) → put` | 包装现有 MetaManager 的 PreparePut，预留槽位并返回目标地址，此时本批新数据尚未发布为可读 |
-| `submit_cpu_pull(ready, put, src_offsets, dst_addrs, lengths) → task` | 按 ready 查找源，校验并提交 CPU READ，返回任务句柄；不代表数据完成 |
-| `query_cpu_pull(task) → status` | 查询同一任务，不重发 READ |
-| `wait_cpu_pull(task, timeout) → result` | 成功表示所有 READ 已完成、数据已落入 DDR，尚未 CommitPut |
+| `submit_cpu_pull(ready, put, src_offsets, dst_addrs, lengths) → None` | 按 ready 查找源，校验并提交 CPU READ，记录在原 put 中；不代表数据完成 |
+| `query_cpu_pull(put) → status` | 查询原 put 的状态，不重发 READ；未提交时返回 PREPARED |
+| `wait_cpu_pull(put, timeout) → result` | 成功返回 DONE 或 COMMITTED；只等待数据完成，不自动 Commit；尚未提交时立即报错 |
 | `commit_put(put) → result` | 检查关联传输完成，提交 MetaManager，并完成 CPU 侧批次确认 |
 | `abort_put(put)` | 在元数据未提交且确认无在途 DMA 时撤销事务 |
 
@@ -279,16 +279,17 @@ PutHandle
     所属 Runtime
     DDR region 身份
     entries：每个 key 的 address 和有效数据长度 length
-    关联 task 与事务状态
+    state：最近一次已知事务状态
+    submitted：是否已记录本次提交请求
 ```
 
 目标槽位仍采用当前 MetaManager 的 DSA 规则；接口公开不改变 key 到槽位的分配策略。应用不能自行构造一个 put 句柄来绕过预留。
 
-三个数组只说明“从哪里搬到哪里、搬多少字节”，`put` 还提供目的槽位的归属和提交上下文。提交时 KVAF 根据它确认 `dst_addrs` 指向本次预留的有效范围，将 task 绑定到该事务，防止其他任务覆盖槽位或在 DMA 未完成时释放槽位。读取成功后 `commit_put(put)` 发布这批 key 的新数据；安全撤销时 `abort_put(put)` 回收本次预留。
+三个数组只说明“从哪里搬到哪里、搬多少字节”，`put` 还提供目的槽位的归属和提交上下文。提交时 KVAF 根据它确认 `dst_addrs` 指向本次预留的有效范围，将请求快照与传输状态保存在同一事务中，防止其他任务覆盖槽位或在 DMA 未完成时释放槽位。读取成功后 `commit_put(put)` 发布这批 key 的新数据；安全撤销时 `abort_put(put)` 回收本次预留。
 
 `put` 只在创建它的 B Runtime 中使用，不作为对象发给 A 或 CPU service；CPU service 通过控制协议中的 region、源和任务身份执行读取。NPU 直接读取路径的目的地由 `output` 指定，因此不需要 put。
 
-任务在发送控制请求前创建并保存在 Runtime 中，与 put 绑定。提交响应丢失时必须保留并暴露原任务供查询，不能只抛出异常而丢失恢复入口。
+提交请求在首次 RPC 前记录到原 put，并设置 `submitted=True`。它只表示本地已有请求记录，不代表 CPU 已接受或 DMA 已完成。提交响应丢失时直接用原 put 查询、等待及恢复，不另取 task，也不能重新 PreparePut 替代未决操作。
 
 ### 8.2 地址组织和检查
 
@@ -308,10 +309,10 @@ dst_addrs = torch.tensor(
 )
 lengths = torch.tensor(key_lengths, dtype=torch.int64, device="cpu")
 
-task = runtime.submit_cpu_pull(
+runtime.submit_cpu_pull(
     ready, put, src_offsets, dst_addrs, lengths,
 )
-result = runtime.wait_cpu_pull(task, timeout)
+result = runtime.wait_cpu_pull(put, timeout)
 runtime.commit_put(put)
 
 # 传输和提交已完成；此后的业务处理及通知由应用决定。
@@ -352,10 +353,10 @@ sequenceDiagram
     BC->>BC: 计算三个连续、等长数组
     BC->>BR: submit_cpu_pull(ready, put, src_offsets, dst_addrs, lengths)
     BR->>CPU: 提交读取任务
-    BR-->>BC: task
+    BR-->>BC: None（请求保存在原 put）
     CPU->>AS: READ A 的 HBM
     CPU->>CPU: 写入 DDR，等待各队列尾部完成 CQE
-    BC->>BR: wait_cpu_pull(task)
+    BC->>BR: wait_cpu_pull(put)
     BR-->>BC: 数据完成
     BC->>BR: commit_put(put)
     BR->>BR: 提交 MetaManager
@@ -453,14 +454,14 @@ NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是
 |---|---|
 | PreparePut 后尚未提交 READ | 可以 AbortPut |
 | READ 全部完成、尚未 CommitPut | 可以 Commit，或在确认 DMA 结束后撤销写事务 |
-| 提交响应丢失、超时或 DMA 状态不确定 | 保留 task、put、目标槽位和源缓冲，查询原任务；不能释放并复用地址 |
+| 提交响应丢失、超时或 DMA 状态不确定 | 保留原 put、目标槽位和源缓冲，用原 put 查询；不能释放并复用地址 |
 | Meta 已提交，但 CPU 确认响应丢失 | 重试 commit_put 的确认阶段，不重复 Commit，不改为 Abort |
 | NPU READ 完成但控制确认未完成 | 用 resolve_raw_addr 恢复确认，不重读数据 |
 | A 收到延迟或重复的业务完成消息 | 按源和 sequence 匹配；不能释放另一个批次 |
 
 重复提交必须关联原任务且参数一致。已完成请求返回原结果或明确的已完成状态，不能再次产生 READ；冲突参数必须拒绝。未知 DMA 状态不自动重建链路或重放请求。
 
-公开的 put/task 状态与现有 Offload 的 pending 保护共用，避免拆出接口后普通 BatchPut、BatchFree 或 Shutdown 绕过未决资源保护。句柄超时、退出作用域或异常都不代表 DMA 已结束。
+公开的 put 状态与现有 Offload 的 pending 保护共用，避免拆出接口后普通 BatchPut、BatchFree 或 Shutdown 绕过未决资源保护。句柄超时、退出作用域或异常都不代表 DMA 已结束。
 
 生产端注册持有底层缓冲直到 shutdown 成功。批次 release 只允许覆写下一批，不代表已经可以释放整块注册内存。
 
@@ -470,7 +471,7 @@ NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是
 
 ## 11. 现有代码的调整范围
 
-本次接口调整只包含 CPU Pull 改用 `src_offsets + dst_addrs`，以及 Runtime 内部按源身份管理绑定、读取、恢复和关闭。Raw READ 算子、同步/错误处理、ticket 字典格式和 PutHandle/CpuPullTask 的划分保持当前实现；后续调整另行处理。本次未更改 KVRP/KVHR 线协议，应用需要使用更新后的 NPU 运行库及 Python 调用签名。
+已完成 CPU Pull 改用 `src_offsets + dst_addrs`，以及 Runtime 内部按源身份管理绑定、读取、恢复和关闭。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。Raw READ 算子、同步/错误处理、ticket 字典格式和 DDR 初始化依赖保持当前实现。上述接口调整未更改 KVRP/KVHR 线协议，应用需要使用更新后的 NPU 运行库及 Python 调用签名。
 
 | 当前实现 | 目标调整 |
 |---|---|
@@ -479,7 +480,7 @@ NPU 的 AcquireRaw 控制消息只携带源/连接身份和 sequence，作用是
 | `ready(offsets, lengths, stream)` | 新接口 ready() 只登记批次；应用负责生产完成和数据稳定 |
 | Ready 携带最终源范围，Submit/Acquire 必须逐项匹配 | 具体范围来自 B 的三个数组；CPU Pull 保存 Host 请求快照，NPU Pull 在同一次 READ 算子中校验并直接生成 WQE，控制面只获取批次读取权 |
 | PreparePut/CommitPut 隐藏在 RuntimeCore 的完整 Offload 中 | 增加受 Runtime 状态管理的公开事务接口 |
-| CPU Submit 隐藏在 RemotePullOperator | 增加 submit/query/wait 接口，绑定 put 与 task |
+| CPU Submit 隐藏在 RemotePullOperator | 增加 submit/query/wait 接口，由同一 put 管理预留、传输与提交 |
 | CPU 目的地址必须落在 slot 起点 | 支持本次预留有效范围内的拆分和槽内偏移，保持覆盖、归属及不重叠检查 |
 | batch_get_raw_addr 的源地址列表来自 Ready batch | 扩展入口由 B 提供三个连续、等长数组，保留原算子和通信实现 |
 
@@ -504,7 +505,7 @@ PreparePut → 注册/复用本卡 HBM → 等待生产 stream → Ready
 
 同参数再次调用表示新批次，不表示恢复。若 key 尚未释放，会像 BatchPut 一样拒绝重复分配。明确失败时内部 Abort；若 DMA 状态不确定，保留源/槽位、拒绝新操作，`shutdown()` 查询原任务并在确认完成后清理，绝不重发 READ。若元数据已 Commit 但 CPU 确认丢失，保持原 Commit 决定并补确认；不能反向 Abort。shutdown 未成功前继续保留相关存储。
 
-跨卡 Connector 继续使用显式 PreparePut/Submit/Wait/Commit/Abort；它们的 task/put 恢复机制不变。CPU 四 Jetty READ 调度和 raw READ V2 算子保持原有数据面实现，各条路径仍持有各自的 MR、Jetty、TP。
+跨卡 Connector 继续使用显式 PreparePut/Submit/Wait/Commit/Abort；恢复直接使用原 put，重复提交仍核对原请求且不重发 READ。CPU 四 Jetty READ 调度和 raw READ V2 算子保持原有数据面实现，各条路径仍持有各自的 MR、Jetty、TP。
 
 ## 12. 第一版范围
 
@@ -522,16 +523,16 @@ PreparePut → 注册/复用本卡 HBM → 等待生产 stream → Ready
 
 - `cpu_source.register(...)` 返回 `CpuPullSourceDesc`，由源端 Connector 发给读取端。
 - `source.ready()` 返回 `ReadyToken`；应用调用前同步生产 stream。
-- `prepare_put(...)` 返回 `PutHandle`：`entries` 提供只读的 `key/address/length`，`state` 提供事务状态，`task` 提供关联任务。
-- `submit_cpu_pull(...)` 返回 `CpuPullTask`。若响应丢失而抛出异常，通过 `put.task` 取回原任务；`put.task.valid` 表示是否已建立任务上下文。不得重新 PreparePut 来替代未决任务。
-- `query_cpu_pull(task)` 返回 `CpuPullState`；`wait_cpu_pull(task, timeout=30000)` 的 timeout 单位为毫秒，成功返回 `DONE` 或已提交的 `COMMITTED`，不会自动 Commit。
+- `prepare_put(...)` 返回 `PutHandle`：`entries` 提供只读的 `key/address/length`，`state` 为最近一次已知状态，`submitted` 表示是否已记录提交请求。`state` 不会自动轮询远端。
+- `submit_cpu_pull(...)` 成功返回 `None`，失败抛异常。响应丢失时请求仍保存在原 put 上，继续通过它 Query/Wait；不得重新 PreparePut 替代未决任务。`submitted=True` 不表示 CPU 已接受或完成读取。
+- `query_cpu_pull(put)` 返回 `CpuPullState`，需要时查询远端并更新 put.state；尚未提交时返回 `PREPARED`。`wait_cpu_pull(put, timeout=30000)` 的 timeout 单位为毫秒，成功返回 `DONE` 或已提交的 `COMMITTED`，不会自动 Commit；未提交即调用 Wait 会立即报错。
 - `commit_put(put)` 返回 `COMMITTED`，`abort_put(put)` 返回 `ABORTED`。提交响应丢失后重试原 commit，不能反向 Abort。PreparePut 后尚未提交任务时，可以直接 Abort。
 - 新 `batch_get_raw_addr(...)` 成功返回 `{"state": "done", "sequence": ready.sequence}`，实际数据直接写入 output。其未决恢复使用原批次的 `resolve_raw_addr(ready)`，不会重发 READ，也不能用其他批次的 ReadyToken 完成确认。
 - 可选 `profile=True` 会在成功返回值中增加 `profile` 字典，提供 Host 大阶段和设备事件测得的算子区间；默认关闭，详见 [raw READ 计时与基准](hbm_raw_addr_read.md)。
 
 显式事务使用 `query_cpu_pull`、`wait_cpu_pull`、`commit_put`、`abort_put` 恢复。本卡 `batch_cpu_pull()` 内部管理事务，异常清理由 `shutdown()` 处理。当前版本从 PreparePut 起保护这笔事务，完成或撤销前会拒绝同一 Runtime 的其他 DDR 访问操作。
 
-如果提交前的参数校验失败，`put.task.valid` 为 false，可以修正数组后继续提交，或撤销 put。若任务已经建立，使用原句柄查询：`DONE` 可提交或撤销，`FAILED` 可撤销，`RUNNING` / `IN_DOUBT` 保留资源。未成功通知 CPU 的失败可能仍让生产批次处于 Ready，应用协调源端调用 `cancel_batch(ready)`；源端会拒绝取消已被获取的批次。
+如果提交前的参数校验失败，`put.submitted` 为 false，可以修正数组后继续提交，或撤销 put。请求记录后即使 CPU 尚未接受也保持 submitted 为 true，使用原 put 查询：`DONE` 可提交或撤销，`FAILED` 可撤销，`RUNNING` / `IN_DOUBT` 保留资源。已记录请求的参数不能更换；重复提交只确认与原请求一致，不重发 READ。未成功通知 CPU 的失败可能仍让生产批次处于 Ready，应用协调源端调用 `cancel_batch(ready)`；源端会拒绝取消已被获取的批次。
 
 C++ 的共享类型与数组视图在 `common/include/connector_types.h`，事务句柄与 RuntimeCore 接口在 `runtime/include/runtime.h`，NPU 包装接口在 `runtime/include/npu_runtime.h`。CPU 源仍通过 `runtime/include/remote_offload.h` 引入，NPU 源通过 `runtime/include/hbm_read.h` 引入。C++ 调用者在未决期间自行保持源和输出内存有效，Python 绑定保留对应 Tensor 引用。
 

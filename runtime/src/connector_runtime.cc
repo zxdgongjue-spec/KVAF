@@ -19,12 +19,7 @@ const std::vector<PutAllocation>& PutHandle::entries() const {
   return state_ ? state_->allocation.entries : empty;
 }
 CpuPullState PutHandle::state() const { return state_ ? state_->state : CpuPullState::Aborted; }
-CpuPullTask PutHandle::task() const {
-  CpuPullTask result;
-  if (state_ && state_->submitted) result.state_ = state_;
-  return result;
-}
-std::uint64_t CpuPullTask::id() const { return state_ ? state_->context.id : 0; }
+bool PutHandle::submitted() const { return state_ && state_->submitted; }
 
 Status RuntimeCore::AttachCpuSource(const CpuPullSourceDesc& source) {
   if (!initialized_ || closing_) return Status::InvalidState("initialize Runtime before attaching CPU source");
@@ -51,9 +46,9 @@ Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
 }
 Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
                                   const PutHandle& put, Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
-                                  Uint64ArrayView lengths, CpuPullTask* out) {
+                                  Uint64ArrayView lengths) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
-  if (!initialized_ || closing_ || !out || !put.state_ || put.state_->owner != connector_owner_ ||
+  if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
       !desc || !ready.sequence)
     return Status::InvalidArgument("CPU source, ReadyToken or put belongs to another Runtime/batch");
   const auto source = cpu_sources_.find(desc->source_id);
@@ -77,7 +72,7 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
         copies.source != p.request.copies.source || copies.destination != p.request.copies.destination ||
         copies.lengths != p.request.copies.lengths)
       return Status::InvalidArgument("duplicate CPU Pull changed its request");
-    out->state_ = put.state_; // Never resubmit, including after a lost response.
+    // Never resubmit, including after a lost response. The original put owns recovery.
     return Status::OK();
   }
   if (connector_put_ != put.state_ || p.state != CpuPullState::Prepared)
@@ -113,18 +108,18 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
   if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
   p.request = {*desc, ready.sequence, std::move(copies)};
   p.submitted = true; p.state = CpuPullState::Submitted;
-  out->state_ = put.state_; // Recovery handle exists before the first RPC.
+  // Record the request on the caller's existing put before the first RPC.
   try { status = access_operator_.SubmitCpuPull(p.request); }
   catch (const std::exception& e) { status = Status::InDoubt(std::string("CPU Pull submit exception: ")+e.what()); }
   if (!status.ok()) p.state = status.code() == StatusCode::kInDoubt ? CpuPullState::InDoubt : CpuPullState::Failed;
   return status;
 }
-Status RuntimeCore::QueryCpuPull(const CpuPullTask& task, CpuPullState* out) {
-  if (!out || !task.state_ || task.state_->owner != connector_owner_)
-    return Status::InvalidArgument("CPU Pull task belongs to another Runtime");
-  auto& p = *task.state_;
+Status RuntimeCore::QueryCpuPull(const PutHandle& put, CpuPullState* out) {
+  if (!out || !put.state_ || put.state_->owner != connector_owner_)
+    return Status::InvalidArgument("CPU Pull put belongs to another Runtime");
+  auto& p = *put.state_;
   if (p.state == CpuPullState::Submitted || p.state == CpuPullState::Running || p.state == CpuPullState::InDoubt) {
-    if (connector_put_ != task.state_) return Status::InvalidState("CPU Pull task is no longer active");
+    if (connector_put_ != put.state_) return Status::InvalidState("CPU Pull put is no longer active");
     CpuPullState state = CpuPullState::InDoubt;
     Status status;
     try { status = access_operator_.QueryCpuPull(&state); }
@@ -134,16 +129,18 @@ Status RuntimeCore::QueryCpuPull(const CpuPullTask& task, CpuPullState* out) {
   }
   *out = p.state; return Status::OK();
 }
-Status RuntimeCore::WaitCpuPull(const CpuPullTask& task, std::uint32_t timeout_ms, CpuPullState* out) {
+Status RuntimeCore::WaitCpuPull(const PutHandle& put, std::uint32_t timeout_ms, CpuPullState* out) {
   if (!out) return Status::InvalidArgument("missing CPU Pull result");
   const auto deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(timeout_ms);
   for (;;) {
-    auto status = QueryCpuPull(task, out); if (!status.ok()) return status;
+    auto status = QueryCpuPull(put, out); if (!status.ok()) return status;
+    if (*out == CpuPullState::Prepared)
+      return Status::InvalidState("submit CPU Pull before waiting on this put");
     if (*out == CpuPullState::Done || *out == CpuPullState::Committed) return Status::OK();
     if (*out == CpuPullState::Failed || *out == CpuPullState::Aborted)
       return Status::Internal("CPU Pull failed/cancelled without committing");
     if (*out == CpuPullState::InDoubt || std::chrono::steady_clock::now() >= deadline)
-      return Status::InDoubt("CPU Pull unresolved; retain put and source, query the original task");
+      return Status::InDoubt("CPU Pull unresolved; retain put and source, query the original put");
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
@@ -157,7 +154,7 @@ Status RuntimeCore::FinishConnectorPut(const PutHandle& put, bool commit) {
   if (!p.metadata_finished) {
     if (p.submitted) {
       CpuPullState state;
-      auto status = QueryCpuPull(put.task(), &state); if (!status.ok()) return status;
+      auto status = QueryCpuPull(put, &state); if (!status.ok()) return status;
       if (state != CpuPullState::Done && state != CpuPullState::Failed)
         return Status::InDoubt("cannot finish Put while DMA may still be active");
     }

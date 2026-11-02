@@ -135,20 +135,23 @@ def main():
         for round_id in range(args.rounds):
             batch = receive(parent, "ready")
             put = runtime.prepare_put(KEYS, lengths)
+            assert not put.submitted and put.state == kvaf.CpuPullState.PREPARED
             src = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
             dst = torch.tensor([entry.address for entry in put.entries],
                                dtype=torch.int64, device="cpu")
             sizes = torch.tensor(lengths, dtype=torch.int64, device="cpu")
-            task = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
-            assert runtime.wait_cpu_pull(task, timeout=30000) == kvaf.CpuPullState.DONE
+            result = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
+            assert result is None and put.submitted
+            state = runtime.wait_cpu_pull(put, timeout=30000)
+            assert state == kvaf.CpuPullState.DONE
             runtime.commit_put(put)
             expected = pattern(torch, round_id)
             rows = [expected[o:o+n] for o, n in zip(OFFSETS, lengths)]
             checksum = fnv64(b"".join(bytes(row.tolist()) for row in rows))
             assert runtime.last_offload_checksum() == checksum, "CPU DDR checksum mismatch"
             duplicate = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
-            assert duplicate.id == task.id
-            assert runtime.query_cpu_pull(task) == kvaf.CpuPullState.COMMITTED
+            assert duplicate is None and put.submitted
+            assert runtime.query_cpu_pull(put) == kvaf.CpuPullState.COMMITTED
             runtime.commit_put(put)
             assert runtime.last_offload_checksum() == checksum
             table = runtime.prepare_access_table(KEYS)

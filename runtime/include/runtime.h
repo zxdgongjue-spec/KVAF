@@ -15,25 +15,17 @@
 namespace kvaf {
 
 struct ConnectorPutState;
-class CpuPullTask;
 // Process-local write transactions. These do not own a second DDR pool.
 class PutHandle {
  public:
   std::uint64_t id() const;
   const std::vector<PutAllocation>& entries() const;
   CpuPullState state() const;
-  CpuPullTask task() const; // Also available after a lost Submit response.
+  // True once the request is recorded, even if the Submit reply was lost.
+  // This does not imply remote acceptance or DMA completion.
+  bool submitted() const;
  private:
   friend class RuntimeCore;
-  std::shared_ptr<ConnectorPutState> state_;
-};
-class CpuPullTask {
- public:
-  std::uint64_t id() const;
-  bool valid() const { return bool(state_); }
- private:
-  friend class RuntimeCore;
-  friend class PutHandle;
   std::shared_ptr<ConnectorPutState> state_;
 };
 
@@ -127,9 +119,9 @@ class RuntimeCore {
   // DDR addresses within this Put's allocations. The wire protocol uses offsets.
   Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
                        Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
-                       Uint64ArrayView lengths, CpuPullTask*);
-  Status QueryCpuPull(const CpuPullTask&, CpuPullState*);
-  Status WaitCpuPull(const CpuPullTask&, std::uint32_t timeout_ms, CpuPullState*);
+                       Uint64ArrayView lengths);
+  Status QueryCpuPull(const PutHandle&, CpuPullState*);
+  Status WaitCpuPull(const PutHandle&, std::uint32_t timeout_ms, CpuPullState*);
   Status CommitPut(const PutHandle&);
   Status AbortPut(const PutHandle&);
 

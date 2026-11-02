@@ -682,12 +682,11 @@ Status NpuRuntime::BatchCpuPull(const BatchPutRequest& request, BatchPutExecutio
     std::vector<std::uint64_t> destinations;
     for (const auto& entry : impl_->local_put.entries())
       destinations.push_back(entry.address);
-    CpuPullTask task;
     result = impl_->runtime_core->SubmitCpuPull(impl_->local_ready, impl_->local_put,
-        request.input_offsets, destinations, request.lengths, &task);
+        request.input_offsets, destinations, request.lengths);
     if (!result.ok()) return result;
     CpuPullState state;
-    result = impl_->runtime_core->WaitCpuPull(task, impl_->options.offload_timeout_ms, &state);
+    result = impl_->runtime_core->WaitCpuPull(impl_->local_put, impl_->options.offload_timeout_ms, &state);
     if (!result.ok()) return result;
     impl_->local_commit = true; // Preserve this decision across a lost Commit ACK.
     return Status::OK();
@@ -746,17 +745,17 @@ Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<s
   return core().PreparePut(keys,lengths,put);
 }
 Status NpuRuntime::SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
-                                Uint64ArrayView src_offsets,Uint64ArrayView dst_addrs,Uint64ArrayView lengths,CpuPullTask* task) {
+                                Uint64ArrayView src_offsets,Uint64ArrayView dst_addrs,Uint64ArrayView lengths) {
   if (!initialized()) return Status::NotInitialized("initialize Runtime before CPU Pull");
-  return core().SubmitCpuPull(ready,put,src_offsets,dst_addrs,lengths,task);
+  return core().SubmitCpuPull(ready,put,src_offsets,dst_addrs,lengths);
 }
-Status NpuRuntime::QueryCpuPull(const CpuPullTask& task,CpuPullState* state) {
+Status NpuRuntime::QueryCpuPull(const PutHandle& put,CpuPullState* state) {
   if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
-  return core().QueryCpuPull(task,state);
+  return core().QueryCpuPull(put,state);
 }
-Status NpuRuntime::WaitCpuPull(const CpuPullTask& task,std::uint32_t timeout,CpuPullState* state) {
+Status NpuRuntime::WaitCpuPull(const PutHandle& put,std::uint32_t timeout,CpuPullState* state) {
   if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
-  return core().WaitCpuPull(task,timeout,state);
+  return core().WaitCpuPull(put,timeout,state);
 }
 Status NpuRuntime::CommitPut(const PutHandle& put) {
   if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
