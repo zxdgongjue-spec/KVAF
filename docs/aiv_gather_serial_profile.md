@@ -44,7 +44,7 @@ cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
 
 ```python
 TOKEN_BYTES = 656       # 每条 token 的字节数，不是请求数
-REQUEST_COUNT = 8193   # 每批有效请求数：可改为 1024 / 8193 / 65536
+REQUEST_COUNT = 8192   # 每批有效请求数：可改为 1024 / 8192 / 8193 / 65536
 WARMUP = 20            # 不计入结果的预热次数
 ITERATIONS = 100       # 关闭 profile 的端到端性能采样次数，0 可跳过
 PROFILE_SAMPLES = 10   # 开启 profile 的阶段诊断采样次数
@@ -95,7 +95,7 @@ UTC+08:00）命名，包含年月日、时分秒、核数、token bytes、reques
 
 ```text
 gather-perf-results/
-  20261031_093235-cores1-token-bytes656-request-count8193/
+  20261031_093235-cores1-token-bytes656-request-count8192/
     summary.csv
     e2e.csv
     profile_host.csv
@@ -120,6 +120,13 @@ summary 按 `row_kind` 区分：`e2e_summary` 是无打点性能基线，
 `profile_e2e_summary` 是有打点、同口径的外层调用统计，另有
 `profile_host_mean` 和各核的 `profile_core_mean`。通过 run_label、cores、
 request_count、token_bytes 等列筛选对照，避免把不同核或不同采集口径相加。
+
+终端 `GATHER_PERF_RESULT` 和 summary 中 `e2e_summary`、`profile_e2e_summary`
+的 `useful_GiBps` 均按各自样本的 `p50_us` 计算：
+`request_count * token_bytes / (p50_us / 1e6) / 1024**3`。
+终端同时输出 `bandwidth_basis=p50_us`；mean/p95/p99 继续保留。
+`e2e.csv` 的逐样本带宽仍使用该样本自己的 `e2e_us`；Host/core 阶段汇总
+仍为均值。CSV 列名、列顺序和时间单位不变，旧结果的带宽不会自动重算。
 
 列顺序按字段名固定：`clock_mhz`、`clock_source`、`cpu_profile`、`kernel_path`、
 `put_kernel_path`、`request_plan`、`timing_contract` 放在 `mode` 前；summary 的

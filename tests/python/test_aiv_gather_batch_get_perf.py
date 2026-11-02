@@ -9,7 +9,7 @@ from __future__ import annotations
 
 # ---- Edit benchmark settings here. ------------------------------------------
 TOKEN_BYTES = 656
-REQUEST_COUNT = 8193             # Try 1024, 8193, 65536; all requests are active.
+REQUEST_COUNT = 8192             # Try 1024, 8192, 8193, 65536; all requests are active.
 WARMUP = 20                     # Excluded from performance results.
 ITERATIONS = 100                # Profile OFF samples; 0 skips E2E for profile debugging.
 PROFILE_SAMPLES = 10            # Profile ON: diagnostic stage samples, separately.
@@ -185,10 +185,11 @@ def print_profiles(samples: list[dict[str, object]], cores: int) -> None:
 
 def latency_summary(samples_us: Sequence[float], payload_bytes: int) -> dict[str, float]:
     mean_us = statistics.mean(samples_us)
+    p50_us = percentile(samples_us, 0.50)
     return {
-        "mean_us": mean_us, "p50_us": percentile(samples_us, 0.50),
+        "mean_us": mean_us, "p50_us": p50_us,
         "p95_us": percentile(samples_us, 0.95), "p99_us": percentile(samples_us, 0.99),
-        "useful_GiBps": payload_bytes / (mean_us / 1e6) / 1024**3,
+        "useful_GiBps": payload_bytes / (p50_us / 1e6) / 1024**3,
     }
 
 
@@ -444,12 +445,12 @@ def main() -> int:
             batch_get()
             samples_us.append((time.perf_counter_ns() - begin) / 1000)
         if samples_us:
-            mean_us = statistics.mean(samples_us)
+            result = latency_summary(samples_us, payload_bytes)
             print(
                 f"GATHER_PERF_RESULT profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
-                f"mean_us={mean_us:.3f} p50_us={percentile(samples_us, 0.50):.3f} "
-                f"p95_us={percentile(samples_us, 0.95):.3f} p99_us={percentile(samples_us, 0.99):.3f} "
-                f"useful_GiBps={payload_bytes / (mean_us / 1e6) / 1024**3:.3f}",
+                f"mean_us={result['mean_us']:.3f} p50_us={result['p50_us']:.3f} "
+                f"p95_us={result['p95_us']:.3f} p99_us={result['p99_us']:.3f} "
+                f"useful_GiBps={result['useful_GiBps']:.3f} bandwidth_basis=p50_us",
                 flush=True,
             )
         else:

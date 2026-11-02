@@ -41,7 +41,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
 
     def test_default_config_and_supported_shapes(self):
         for cores in (1, 3, 8):
-            for count in (1024, 8193, 65536):
+            for count in (1024, 8192, 8193, 65536):
                 with patch.object(perf, "REQUEST_COUNT", count):
                     perf.validate_config(cores)
 
@@ -167,6 +167,30 @@ class GatherPerfSummaryTest(unittest.TestCase):
             self.assertEqual([float(row["total_cycles"]) for row in core_means], [6, 12, 18])
             self.assertTrue(all(row["prepare_us"] == "" and row["wait_us"] == "" for row in core_means))
             self.assertTrue(all(row["run_id"] == metadata["run_id"] for row in summary + e2e + host + cores))
+
+    def test_csv_summary_bandwidth_uses_p50_despite_slow_outliers(self):
+        metadata = self.csv_metadata()
+        baseline = [1000.0, 1000.0, 100000.0]
+        profiled = [2000.0, 2000.0, 200000.0]
+        samples = [snapshot(sequence) for sequence in (1, 2, 3)]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = perf.export_csv_results(directory, metadata, baseline, samples, profiled)
+            results = {row["row_kind"]: row for row in self.read_csv(paths[0])}
+            for kind, mean_us, p50_us in (
+                ("e2e_summary", 34000.0, 1000.0),
+                ("profile_e2e_summary", 68000.0, 2000.0),
+            ):
+                with self.subTest(row_kind=kind):
+                    self.assertEqual(float(results[kind]["mean_us"]), mean_us)
+                    self.assertEqual(float(results[kind]["p50_us"]), p50_us)
+                    self.assertAlmostEqual(
+                        float(results[kind]["useful_GiBps"]),
+                        metadata["payload_bytes"] / (p50_us / 1e6) / 1024**3,
+                    )
+            # Raw sample bandwidth still describes that sample's own latency.
+            raw = self.read_csv(paths[1])
+            self.assertAlmostEqual(float(raw[-1]["useful_GiBps"]),
+                                   metadata["payload_bytes"] / (baseline[-1] / 1e6) / 1024**3)
 
     def test_csv_clock_conversion_uses_captured_configuration(self):
         metadata = self.csv_metadata(clock=50)
