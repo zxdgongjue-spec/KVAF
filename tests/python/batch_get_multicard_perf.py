@@ -28,6 +28,7 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
     capturing = False
     captured = False
     try:
+        print(f"MULTICARD_GRAPH_CAPTURE_BEGIN calls={len(plans)}", flush=True)
         graph.capture_begin(stream)
         capturing = True
         for plan in plans:
@@ -35,6 +36,7 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
         capturing = False
         graph.capture_end()
         captured = True
+        print("MULTICARD_GRAPH_CAPTURE_DONE", flush=True)
         # A validation replay is separate from the configured warmup replays.
         graph.replay(stream)
         graph.synchronize(stream)
@@ -86,6 +88,13 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
         graph.reset()
 
 
+def worker_error(device, process, log_path, phase):
+    tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-60:])
+    return RuntimeError(
+        f"device {device} {phase}, exit_status={process.returncode}; log={log_path}\n{tail}"
+    )
+
+
 def run_group(args, devices, directory):
     directory.mkdir()
     runner = Path(os.environ.get(
@@ -123,7 +132,7 @@ def run_group(args, devices, directory):
         while not all((directory / f"ready_{device}").exists() for device in devices):
             for device, process, log_path in children:
                 if process.poll() is not None:
-                    raise RuntimeError(f"device {device} exited before ready; see {log_path}")
+                    raise worker_error(device, process, log_path, "exited before ready")
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"timed out waiting for workers; see {directory}")
             time.sleep(0.05)
@@ -136,13 +145,13 @@ def run_group(args, devices, directory):
         while any(process.poll() is None for _, process, _ in children):
             for device, process, log_path in children:
                 if process.poll() not in (None, 0):
-                    raise RuntimeError(f"device {device} failed; see {log_path}")
+                    raise worker_error(device, process, log_path, "failed during measurement")
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"measurement timed out; see {directory}")
             time.sleep(0.05)
         for device, process, log_path in children:
             if process.returncode != 0:
-                raise RuntimeError(f"device {device} failed; see {log_path}")
+                raise worker_error(device, process, log_path, "failed during measurement")
         results = [json.loads((directory / f"device_{device}.json").read_text()) for device in devices]
         for device, result in zip(devices, results):
             if result["device"] != device or not result["verified"] or result["end"] <= result["start"]:
@@ -233,9 +242,12 @@ def main(argv=None):
     config = vars(args).copy()
     config["build_dir"] = str(args.build_dir)
     config["output"] = str(directory)
+    config["ddr_bytes_per_device"] = args.table_capacity * args.tokens_per_block * args.token_bytes
+    config["peak_concurrent_ddr_bytes"] = len(args.devices) * config["ddr_bytes_per_device"]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={args.aiv_cores} "
-          f"ddr_bytes_per_device={args.table_capacity * args.tokens_per_block * args.token_bytes} "
+          f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
+          f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
           "timing=sustained_graph_replay_to_completion units=decimal_GBps", flush=True)
     print(f"MULTICARD_RESULTS path={directory}", flush=True)
     try:

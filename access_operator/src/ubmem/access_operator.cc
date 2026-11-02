@@ -93,6 +93,13 @@ struct AccessOperator::Impl {
   Status Launch(BatchArgs& args, aclrtStream stream, StreamState& state, bool synchronize) {
     args.profile = profiling && args.operation == Operation::kGet ? (profile_detail ? 2 : 1) : 0;
     profile_stream = nullptr;
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    if (!synchronize) {
+      auto status = Acl("aclmdlRICaptureGetInfo",
+          aclmdlRICaptureGetInfo(stream, &capture, &graph));
+      if (!status.ok()) return status;
+    }
     const auto size = options.cores * sizeof(CoreStatus);
     if (synchronize) {
       // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
@@ -117,6 +124,10 @@ struct AccessOperator::Impl {
     state.pending = StreamState::Pending::kStream;
     if (args.profile) profile_stream = stream;
     if (!synchronize) {
+      // Ordinary events cannot be recorded during ACL Graph capture. The
+      // graph owner completes replay on this stream before releasing it;
+      // Shutdown retains the stream drain for captured work.
+      if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE) return Status::OK();
       status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
       if (!status.ok()) {
         ready = false;

@@ -29,6 +29,7 @@ assert option("--table-capacity") == "4096"
 assert "--no-kernel-profile" in sys.argv
 assert os.environ["KVAF_TRANSPORT"] == "ubmem"
 if directory.name == "concurrent" and device == int(os.environ.get("FAIL_DEVICE", "-1")):
+    print("FAKE_UNDERLYING_DEVICE_ERROR", flush=True)
     sys.exit(3)
 time.sleep(device * 0.01)
 (directory / f"ready_{device}").touch()
@@ -85,6 +86,8 @@ class MulticardTests(unittest.TestCase):
             result = self.run_controller(root, fail=1)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("device 1", result.stderr)
+            self.assertIn("exit_status=3", result.stderr)
+            self.assertIn("FAKE_UNDERLYING_DEVICE_ERROR", result.stderr)
             self.assertTrue((root / "results/concurrent/abort").exists())
             self.assertTrue((root / "results/concurrent/cleaned_0").exists())
             self.assertFalse((root / "results/summary.csv").exists())
