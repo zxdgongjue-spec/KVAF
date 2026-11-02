@@ -38,7 +38,9 @@ CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 每核按 256 条一批把 index/offset 搬入 UB 并生成源地址；检查路径另加载 output row。
 再一次 DMA 写回这批 descriptor。1024 项、4 核时每核构建 256 项。
 地址表不超过 4096 项时，每个参与核将 address 表批量载入 UB（检查路径另加载 valid）；更大的表保留
-安全的标量表查找，但请求输入和 descriptor 仍批量搬运。构建最多使用 41 KiB UB，
+按请求条目刷新 DCache 后进行标量表查找，但请求输入和 descriptor 仍批量搬运。大表不再
+由每核刷新整个 address/valid 表；每次调用重新刷新实际使用的条目，以支持同一地址上的表内容更新。
+检查路径先检查 index 上界，再访问/刷新 valid 和 address。构建最多使用 41 KiB UB，
 之后与 payload bank 复用同一 UB 地址范围。
 
 省略第二遍 Source 读取、逐条 GM descriptor 写、对应的逐缓存行清单刷新，
@@ -122,7 +124,7 @@ done
 656 B、非整除前缀和其他核数也需回归，不仅依据一个形状判断。
 
 CPU kernel 模型使用线程执行并发 scatter 核，覆盖四种开关组合、256 条构建边界、
-4096/4097 项地址表缓存边界、尾批和大行 fallback、旧 sequence 复用、
+4096/4097 项地址表缓存边界、1,277,952 项大表的稀疏访问和原址更新、尾批和大行 fallback、旧 sequence 复用、
 非法输入与中途构建失败。模拟 CPU 会检查全部核已发布本轮构建完成标记，才消费清单。
 模型按每个事件之前的 DMA 命令确认完成，
 校验双 bank 的输入/输出交错及 UB 复用安全，不模拟真实硬件性能或外部 DMA 可见性。
@@ -611,6 +613,33 @@ shell 也像参考扫描一样在命令末尾固定该时钟值；通过此环�
 CLI 单值筛选。profile 默认值也按参考正式扫描强制开启，明确的 `--no-kernel-profile` 才关闭。
 `KVAF_REMOTE_CPU_PERF_TIMEOUT` / `--case-timeout` 控制每个配置的超时，默认 600 秒；
 单配置和扫描均使用独立子进程。失败、超时或不完整报告会停止后续配置，保留已经完成的汇总。
+这个预算覆盖 initialize、完整表 population、preflight、warmup、测量和 teardown，不能将
+`SCATTER_ALIGNED_SWEEP_FAILED timeout=600` 直接解释为一次 BatchGet 通信超时。
+子进程启用无缓冲输出，日志记录各阶段 begin/end，填表每 5 秒报告一次进度；
+超时/失败会回显日志末尾 40 行。这些日志均在单次 BatchGet 的计时窗口之外。
+
+默认大表在 4096 B、128 tokens/block 时分配 `670014898176 B`（624 GiB）CPU DDR，
+656 B 时为 `107307073536 B`。THP 模式会先 memset 整个区域，URMA 注册随后执行；
+CPU 日志的 `REGION_ALLOCATE_BEGIN`、`REGION_MEMORY_READY` 和 `REGION_ALLOCATED` 可区分
+内存准备与注册，后者记录 memory_us/register_us/total_us。此为测试准备，未计入 E2E 样本。
+自动 EID 的失败候选可能导致释放后再分配整张表；已验证可用的路由应明确固定。
+例如当前 Device 7 与 udmac0d1e2 的组合可按下列配置复测（重编 scatter kernel；
+CPU 新增准备耗时日志还需重编并重启 CPU 服务）：
+
+```bash
+cmake --build build-npu -j --target kvaf_scatter_batch_get_kernel
+DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --token-sizes 656,4096 --miss-counts 1024 --core-counts 4 \
+  --npu-eids 000000000000020000100000df00e100 --peer-ub-device udmac0d1e2 \
+  --case-timeout 1800 --output-dir results/scatter-sparse-table
+```
+
+1800 秒是扩大整例准备预算，不改变 URMA/AIV 的内部超时，也不保证通信故障会自行恢复。
+保持完整大表需要足够的 CPU 内存；若需缩表，对照分支也必须使用相同 table-capacity。
+大表 fused build 之前每核刷新约 10 MB 地址表，4 核合计 638,976 条 cache line；
+miss_count=1024 时修复后仅需 1024 次地址条目刷新。reference（fused_build=0）保留原实现用于对照。
+刷新数量的下降不能直接当作实测加速比，收益应比较相同配置的新旧 E2E 和 build_notify 样本。
 
 每配置保存 `.log`、原始 `.json`、原有格式的 32 列 `.csv`；扫描额外保存 `plan.json` 和
 按配置/阶段逐行排列的 `summary.csv`。汇总为 15 列：配置、completion_mode、stage、mean/p50/p90/p99_us、

@@ -268,16 +268,51 @@ class AlignedScatterTests(unittest.TestCase):
             self.assertEqual(tuple(map(int, values.split())), expected)
 
     def test_output_count_and_address_table_allocation_order_match(self):
-        expected = [("torch", "empty"), ("torch", "tensor"),
-                    ("runtime", "batch_put"), ("runtime", "access_table_view")]
         for function in (reference.main, perf.run_case):
+            expected = [("torch", "empty"), ("torch", "tensor"),
+                        ("runtime", "batch_put") if function == reference.main else (None, "populate_table"),
+                        ("runtime", "access_table_view")]
             tree = ast.parse(inspect.getsource(function))
             positions = []
             for owner, name in expected:
                 positions.append(min(n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute) and n.func.attr == name
-                    and isinstance(n.func.value, ast.Name) and n.func.value.id == owner))
+                    and (isinstance(n.func, ast.Name) and owner is None and n.func.id == name or
+                         isinstance(n.func, ast.Attribute) and n.func.attr == name and
+                         isinstance(n.func.value, ast.Name) and n.func.value.id == owner)))
             self.assertEqual(positions, sorted(positions), function.__name__)
+
+    def test_full_table_population_keeps_chunks_and_reports_progress(self):
+        args = self.parse("--single", "--table-capacity", "7", "--tokens-per-block", "128")
+        block_bytes = args.tokens_per_block * args.token_bytes
+        calls = []
+        runtime = SimpleNamespace(batch_put=lambda *values: calls.append(values))
+        source = ["block0", "block1", "block2"]
+        offsets = [i * block_bytes for i in range(3)]
+        lengths = [block_bytes] * 3
+        capture = io.StringIO()
+        with patch.object(perf.time, "perf_counter_ns", side_effect=[0, 10**9, 6*10**9, 7*10**9]), \
+                contextlib.redirect_stdout(capture):
+            perf.populate_table(runtime, args, source, offsets, lengths, 3)
+        self.assertEqual([key for call in calls for key in call[0]], list(range(7)))
+        self.assertEqual([len(call[1]) for call in calls], [3, 3, 1])
+        for keys, values, actual_offsets, actual_lengths in calls:
+            self.assertEqual(values, source[:len(keys)])
+            self.assertEqual(actual_offsets, offsets[:len(keys)])
+            self.assertEqual(actual_lengths, lengths[:len(keys)])
+        self.assertNotIn("entries=3 ", capture.getvalue())  # Throttle setup logging.
+        self.assertIn("entries=6 total_entries=7", capture.getvalue())
+        self.assertIn(f"entries=7 total_entries=7 bytes={7 * block_bytes}", capture.getvalue())
+
+    def test_failed_setup_phase_does_not_become_success(self):
+        report = {"setup_us": {}}
+        capture = io.StringIO()
+        with patch.object(perf.time, "perf_counter_ns", side_effect=[0, 5000]), \
+                contextlib.redirect_stdout(capture), self.assertRaisesRegex(RuntimeError, "register failed"):
+            with perf.setup_phase(report, "initialize", ddr_bytes=670014898176):
+                raise RuntimeError("register failed")
+        self.assertEqual(report["setup_us"], {})
+        self.assertIn("phase=initialize event=failed elapsed_us=5.000", capture.getvalue())
+        self.assertNotIn("event=end", capture.getvalue())
 
     def test_statistics_use_payload_not_capacity_and_keep_quantiles(self):
         stats = perf.statistics_ns([100, 200, 300], 656 * 32)
@@ -363,12 +398,19 @@ class AlignedScatterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             def timeout(command, **kwargs):
                 self.assertEqual(kwargs["timeout"], 3)
+                self.assertEqual(kwargs["env"]["PYTHONUNBUFFERED"], "1")
+                kwargs["stdout"].write("old line\n" * 10000 +
+                                       "SCATTER_ALIGNED_PHASE phase=initialize event=begin ddr_bytes=670014898176\n")
                 raise subprocess.TimeoutExpired(command, 3)
+            capture = io.StringIO()
             with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()):
+                    contextlib.redirect_stderr(capture):
                 code = perf.main(["--build", "unused", "--single", "--case-timeout", "3",
                                   "--output-dir", temporary], runner=timeout)
             self.assertEqual(code, 124)
+            self.assertIn("timeout_scope=initialize+populate", capture.getvalue())
+            self.assertIn("phase=initialize event=begin", capture.getvalue())
+            self.assertLess(len(capture.getvalue()), 2000)
         events = []
         class Runtime:
             initialized = True

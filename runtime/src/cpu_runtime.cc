@@ -458,9 +458,17 @@ class CpuService {
     region->candidate_id = candidate_id;
     region->resources = resources;
     region->bytes = bytes;
+    const auto allocate_begin = std::chrono::steady_clock::now();
+    Log("[KVAF_CPU] REGION_ALLOCATE_BEGIN candidate=%u bytes=%" PRIu64 " page_mode=%s\n",
+        candidate_id, bytes, MemoryPageModeName());
     if (!AllocateMemory(region.get())) {
       return Result::kResourceError;
     }
+    const auto memory_ready = std::chrono::steady_clock::now();
+    const auto memory_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        memory_ready - allocate_begin).count();
+    Log("[KVAF_CPU] REGION_MEMORY_READY candidate=%u bytes=%" PRIu64 " memory_us=%" PRId64
+        " next=register\n", candidate_id, bytes, static_cast<int64_t>(memory_us));
     region->bytes = bytes;
     if (bytes >= 64U)
       std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
@@ -488,7 +496,10 @@ class CpuService {
     config.token_id = region->token_id;
     config.token_value.token = region->token_value;
     config.flag = flag;
+    const auto register_begin = std::chrono::steady_clock::now();
     region->segment = urma_register_seg(resources->context(), &config);
+    const auto register_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - register_begin).count();
     if (region->segment == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
           " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
@@ -518,9 +529,14 @@ class CpuService {
     }
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s "
+        "memory_us=%" PRId64 " register_us=%" PRId64 " total_us=%" PRId64 "\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value, MemoryPageModeName());
+        response->peer_base, response->token_id, flag.value, MemoryPageModeName(),
+        static_cast<int64_t>(memory_us),
+        static_cast<int64_t>(register_us),
+        static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - allocate_begin).count()));
     return Result::kOk;
   }
 

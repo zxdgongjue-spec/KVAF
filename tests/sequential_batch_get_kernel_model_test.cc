@@ -278,8 +278,10 @@ struct Fixture {
             {args.request.indices, args.request.indices + prefix},
             {args.request.offsets, args.request.offsets + prefix},
             {args.request.output_indices, args.request.output_indices + prefix},
-            {args.request.address_table, args.request.address_table + uint64_t(count) * 8},
-            {args.request.valid_table, args.request.valid_table + count}};
+            {args.request.address_table, args.request.address_table + uint64_t(args.request.table_capacity) * 8},
+            {args.request.valid_table, args.request.valid_table + args.request.table_capacity}};
+        aiv_model::address_table_begin = args.request.address_table;
+        aiv_model::address_table_end = args.request.address_table + uint64_t(args.request.table_capacity) * 8;
         aiv_model::descriptor_begin = args.workspace + args.descriptor_offset;
         aiv_model::descriptor_end = aiv_model::descriptor_begin + prefix * 2;
       }
@@ -297,6 +299,7 @@ struct Fixture {
                            [](uint8_t byte) { return byte == 0xe9; }));
       }
       aiv_model::metadata_sources.clear();
+      aiv_model::address_table_begin = aiv_model::address_table_end = 0;
       aiv_model::descriptor_begin = aiv_model::descriptor_end = 0;
       aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
     };
@@ -488,6 +491,39 @@ int main() {
     Fixture legacy(65, 656, 1, KVAF_SEQ_SCATTER, 6);
     legacy.args.reserved = 0; legacy.Run();
   }
+  // Reference-sized sparse tables: cache maintenance must scale with active
+  // requests, not with the 1.28M-entry table, including in-place table changes.
+  for (const bool trusted : {false, true})
+    for (uint32_t workers : {1U, 4U, 8U}) {
+      Fixture f(1024, 31, workers, KVAF_SEQ_SCATTER, 6);
+      constexpr uint32_t table_capacity = 1277952;
+      f.addresses.resize(table_capacity);
+      f.valid.resize(table_capacity, 1);
+      f.args.request.table_capacity = table_capacity;
+      f.args.request.address_table = Address(f.addresses.data());
+      f.args.request.valid_table = Address(f.valid.data());
+      if (trusted) f.args.reserved |= kvaf::kScatterTrustedInputs;
+      for (uint32_t i = 0; i < f.count; ++i)
+        f.indices[i] = (i * 1237U + 37U) % table_capacity;
+      for (uint32_t count : {0U, 1U, 7U, 255U, 256U, 257U, 1024U, 19U}) {
+        f.Next(count);
+        for (uint32_t i = 0; i < f.count; ++i)
+          f.addresses[f.indices[i]] = f.args.source_base +
+              uint64_t((i + f.args.sequence) % f.count) * f.token * 2;
+        const auto flushed = aiv_model::address_table_cache_lines;
+        f.Run();
+        assert(aiv_model::address_table_cache_lines - flushed == count);
+      }
+      if (!trusted) {
+        f.Next(1);
+        f.indices[0] = table_capacity;
+        const auto flushed = aiv_model::address_table_cache_lines;
+        const auto notified = f.push_requests;
+        f.Run(false);
+        assert(aiv_model::address_table_cache_lines == flushed);
+        assert(f.push_requests == notified);
+      }
+    }
   // Trusted callers skip row/valid checks in the builder. Exercise the real
   // launch with changing addresses/prefixes and both cached/fallback tables;
   // output guards, done, all-core status and DMA completion remain required.

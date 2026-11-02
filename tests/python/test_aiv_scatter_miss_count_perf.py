@@ -7,6 +7,7 @@ uses the reference CLI defaults and the exact same request-plan generator.
 import argparse
 import copy
 import csv
+from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -20,6 +21,7 @@ import time
 
 import test_npu_batch_get_perf as reference
 from aiv_batch_get_test_common import shutdown_runtime
+from dsa_keys import build_dsa_keys
 from scatter_perf_common import PAYLOAD_TIMINGS, profile_metrics, sample_metrics
 from test_aiv_scatter_perf import write_results
 
@@ -68,7 +70,8 @@ def arguments(argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--json", type=Path, help="single-case raw samples/configuration")
     parser.add_argument("--csv", type=Path, help="single-case compact 32-column samples")
-    parser.add_argument("--case-timeout", type=int, default=600)
+    parser.add_argument("--case-timeout", type=int, default=600,
+                        help="whole-case seconds, including DDR allocation/registration, full-table population and measurement")
     parser.add_argument("--completion-mode", choices=("reference", "validated"), default="reference",
                         help="reference: enqueue then global device sync; validated: synchronous API including status checks")
     parser.add_argument("--fused-build", type=int, choices=(0, 1))
@@ -149,6 +152,55 @@ def cases(args):
                 case.token_bytes, case.miss_count, case.aiv_cores, case.cores = token, count, cores, cores
                 result.append(case)
     return result
+
+
+def log_phase(name, event, **details):
+    print(f"SCATTER_ALIGNED_PHASE phase={name} event={event} " +
+          " ".join(f"{key}={value}" for key, value in details.items()), flush=True)
+
+
+@contextmanager
+def setup_phase(report, name, **details):
+    log_phase(name, "begin", **details)
+    begin = time.perf_counter_ns()
+    try:
+        yield
+    except BaseException:
+        log_phase(name, "failed", elapsed_us=f"{(time.perf_counter_ns() - begin) / 1000:.3f}")
+        raise
+    else:
+        elapsed = (time.perf_counter_ns() - begin) / 1000
+        report["setup_us"][name] = elapsed
+        log_phase(name, "end", elapsed_us=f"{elapsed:.3f}")
+
+
+def populate_table(runtime, args, source, offsets, lengths, chunk):
+    last_progress = begin = time.perf_counter_ns()
+    block_bytes = args.tokens_per_block * args.token_bytes
+    for first in range(0, args.table_capacity, chunk):
+        n = min(chunk, args.table_capacity - first)
+        runtime.batch_put(build_dsa_keys(n, q_capacity=args.table_capacity, start=first),
+                          source[:n], offsets[:n], lengths[:n])
+        now = time.perf_counter_ns()
+        if first + n == args.table_capacity or now - last_progress >= 5_000_000_000:
+            log_phase("populate_table", "progress", entries=first + n, total_entries=args.table_capacity,
+                      bytes=(first + n) * block_bytes, elapsed_us=f"{(now - begin) / 1000:.3f}")
+            last_progress = now
+
+
+def report_case_failure(case, reason):
+    path = case.json.with_suffix(".log")
+    print(f"SCATTER_ALIGNED_SWEEP_FAILED {reason} log={path} "
+          f"ddr_bytes={case.table_capacity * case.tokens_per_block * case.token_bytes} "
+          "timeout_scope=initialize+populate+prepare+preflight+warmup+measure+teardown", file=sys.stderr)
+    # Bound diagnostic reads even if a driver has emitted a very large log.
+    with path.open("rb") as stream:
+        size = stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, size - 65536))
+        lines = stream.read().decode("utf-8", errors="replace").splitlines()
+    if size > 65536:
+        lines = lines[1:]
+    print("SCATTER_ALIGNED_LAST_LOG_LINES\n" + "\n".join(lines[-40:]), file=sys.stderr)
 
 
 def statistics_ns(values, payload=None):
@@ -233,7 +285,6 @@ def run_case(args):
         return 77
     from aiv_kernel_metadata import check_aiv_kernel_metadata
     from backend import detect_torch_backend
-    from dsa_keys import build_dsa_keys
     kernel = args.build / "bin/kvaf_scatter_batch_get_kernels.o"
     put_kernel = args.build / "bin/kvaf_execute_batch_put_kernels.o"
     check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
@@ -288,9 +339,10 @@ def run_case(args):
     report = dict(config=config, setup_us={}, samples={phase: []}, summary={})
     table = None
     try:
-        begin = time.perf_counter_ns()
-        runtime.initialize(args.table_capacity * block_bytes, block_bytes)
-        report["setup_us"]["initialize"] = (time.perf_counter_ns() - begin) / 1000
+        with setup_phase(report, "initialize", ddr_bytes=config["ddr_bytes"],
+                         table_capacity=args.table_capacity):
+            runtime.initialize(args.table_capacity * block_bytes, block_bytes)
+        log_phase("prepare_hbm", "begin")
         # Same bounded repeated token pattern and DSA directory as the reference;
         # do not allocate the whole (possibly hundreds of GB) source table in HBM.
         token_rows = torch.arange(args.tokens_per_block, dtype=torch.int64, device=device).unsqueeze(1)
@@ -304,18 +356,14 @@ def run_case(args):
         # population and the later device address-table allocation.
         output = torch.empty((args.request_length, args.token_bytes), dtype=torch.uint8, device=device)
         count = torch.tensor([args.miss_count], dtype=torch.int32, device=device)
-        begin = time.perf_counter_ns()
-        for first in range(0, args.table_capacity, chunk):
-            n = min(chunk, args.table_capacity - first)
-            runtime.batch_put(build_dsa_keys(n, q_capacity=args.table_capacity, start=first),
-                              source[:n], source_offsets[:n], source_lengths[:n])
-        torch.npu.synchronize()
-        report["setup_us"]["populate_table"] = (time.perf_counter_ns() - begin) / 1000
-        begin = time.perf_counter_ns()
-        table = runtime.prepare_access_table(torch.arange(args.table_capacity, dtype=torch.int64))
-        view = runtime.access_table_view(table, device="npu", capacity=args.table_capacity)
-        torch.npu.synchronize()
-        report["setup_us"]["prepare_access_table"] = (time.perf_counter_ns() - begin) / 1000
+        log_phase("prepare_hbm", "end")
+        with setup_phase(report, "populate_table", total_bytes=config["ddr_bytes"]):
+            populate_table(runtime, args, source, source_offsets, source_lengths, chunk)
+            torch.npu.synchronize()
+        with setup_phase(report, "prepare_access_table"):
+            table = runtime.prepare_access_table(torch.arange(args.table_capacity, dtype=torch.int64))
+            view = runtime.access_table_view(table, device="npu", capacity=args.table_capacity)
+            torch.npu.synchronize()
 
         def verify(inputs, guard=False):
             rows = inputs[2][:args.miss_count].to(torch.int64)
@@ -326,6 +374,7 @@ def run_case(args):
                     torch.count_nonzero(output[args.miss_count:]).item():
                 raise AssertionError("aligned scatter wrote outside active output prefix")
 
+        log_phase("preflight", "begin")
         request_ids = torch.arange(args.request_length, dtype=torch.int64, device=device)
         linear = request_ids % (args.table_capacity * args.tokens_per_block)
         preflight_indices = (linear // args.tokens_per_block).to(torch.int32)
@@ -345,18 +394,23 @@ def run_case(args):
         if args.miss_count < args.request_length and torch.count_nonzero(output[args.miss_count:]).item():
             raise AssertionError("aligned scatter preflight modified the output suffix")
         print("SCATTER_ALIGNED_CORRECTNESS_PASS active_prefix_and_guard=1", flush=True)
+        log_phase("preflight", "end")
         contiguous_source_token_ids = request_ids % (args.table_capacity * args.tokens_per_block)
         if args.kernel_profile:
             runtime.start_scatter_profile()
+        log_phase("warmup", "begin", calls=args.warmup)
         warmup_calls(runtime, view, count, output, torch, args,
                      lambda: reference.generate_request_plan(torch, args, device, request_ids, view.addresses,
                                                              contiguous_source_token_ids))
+        log_phase("warmup", "end")
+        log_phase("measure", "begin", calls=args.iterations)
         for iteration in range(args.iterations):
             inputs = reference.generate_request_plan(torch, args, device, request_ids, view.addresses,
                                                      contiguous_source_token_ids)
             torch.npu.synchronize()  # Same pre-call isolation as the reference.
             report["samples"][phase].append(
                 measure_call(runtime, view, inputs, count, output, torch, args, iteration))
+        log_phase("measure", "end")
         verify(inputs, guard=args.output_access_pattern == "contiguous")
         samples = report["samples"][phase]
         report["summary"][phase] = {
@@ -374,7 +428,9 @@ def run_case(args):
         return 0
     finally:
         # Preserve the execution exception if an aborted device also fails teardown.
+        log_phase("teardown", "begin")
         close_case(runtime, table)
+        log_phase("teardown", "end")
 
 
 def close_case(runtime, table):
@@ -453,12 +509,14 @@ def main(argv=None, runner=None):
         with case.json.with_suffix(".log").open("w", encoding="utf-8") as log:
             try:
                 result = runner(case_command(case), stdout=log, stderr=subprocess.STDOUT,
-                                timeout=args.case_timeout, check=False)
+                                timeout=args.case_timeout, check=False,
+                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
             except subprocess.TimeoutExpired:
-                print(f"SCATTER_ALIGNED_SWEEP_FAILED timeout={args.case_timeout} log={log.name}", file=sys.stderr)
+                log.flush()
+                report_case_failure(case, f"timeout={args.case_timeout}")
                 return 124
         if result.returncode:
-            print(f"SCATTER_ALIGNED_SWEEP_FAILED status={result.returncode} log={log.name}", file=sys.stderr)
+            report_case_failure(case, f"status={result.returncode}")
             return result.returncode
         report = json.loads(case.json.read_text(encoding="utf-8"))
         for key in ("request_length", "table_capacity", "tokens_per_block", "token_bytes",

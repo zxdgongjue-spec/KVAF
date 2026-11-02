@@ -101,6 +101,7 @@ inline thread_local CopyQueue mte2, mte3;
 inline Counter mte2_copies, mte3_copies;
 inline Counter metadata_reads, descriptor_writes;
 inline Counter payload_cache_lines;
+inline Counter address_table_cache_lines;
 inline Counter mte2_aligned_copies, mte2_tail_copies;
 inline Counter overlapped_mte2_copies;
 inline Counter out_to_ub_resets, event_waits[4][4];
@@ -108,6 +109,7 @@ inline Counter out_to_ub_resets, event_waits[4][4];
 // a read outside the requested GM token, even if the allocation has slack.
 inline thread_local uintptr_t mte2_source_begin{}, mte2_source_end{};
 inline thread_local uintptr_t descriptor_begin{}, descriptor_end{};
+inline thread_local uintptr_t address_table_begin{}, address_table_end{};
 inline thread_local std::vector<std::pair<uintptr_t, uintptr_t>> metadata_sources;
 inline bool IsMetadata(const void* source, uint64_t bytes) {
   const auto address = reinterpret_cast<uintptr_t>(source);
@@ -286,6 +288,8 @@ void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
 template <typename T, CacheLine, DcciDst>
 void DataCacheCleanAndInvalid(GlobalTensor<T> tensor) {
   const auto address = reinterpret_cast<uintptr_t>(tensor.data);
+  if (address < aiv_model::address_table_end && address + 64 > aiv_model::address_table_begin)
+    ++aiv_model::address_table_cache_lines;
   if (address >= aiv_model::mte2_source_begin && address < aiv_model::mte2_source_end)
     ++aiv_model::payload_cache_lines;
   aiv_model::Poll(tensor.data);
