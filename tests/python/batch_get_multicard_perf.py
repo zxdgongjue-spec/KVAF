@@ -117,6 +117,7 @@ def run_group(args, devices, directory):
                 "--table-capacity", str(args.table_capacity),
                 "--token-bytes", str(args.token_bytes), "--tokens-per-block", str(args.tokens_per_block),
                 "--aiv-cores", str(args.aiv_cores), "--jettys-per-core", str(args.jettys_per_core),
+                "--max-inflight-total", str(args.max_inflight_total),
                 "--warmup", str(args.warmup), "--seed", str(args.seed),
                 "--source-access-pattern", "random", "--output-access-pattern", "contiguous",
                 "--no-sort-input-indices", "--no-kernel-profile",
@@ -237,6 +238,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     metadata = {key: config[key] for key in (
         "transport", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
         "seconds", "graph_calls", "warmup", "seed", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
+        "jettys_per_core", "max_inflight_total",
     ) if key in config}
     metadata["run"] = directory.name
     metadata["device_order"] = " ".join(str(r["device"]) for r in isolated)
@@ -264,6 +266,11 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("访问模式 / 随机种子", f"随机读取、连续输出；seed={config['seed']}"),
             ("CPU service", config["peer"]),
         ]
+        if config["transport"] == "urma":
+            settings += [(label, config[key]) for label, key in (
+                ("Jetty 数 / AIV 核", "jettys_per_core"),
+                ("未完成 READ 上限 / 卡", "max_inflight_total"),
+            ) if key in config]
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
     device_rows = [
         (r["device"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
@@ -288,11 +295,52 @@ def write_summary(directory, isolated, concurrent, config=None):
         raise RuntimeError("measurement windows overlapped less than 95%; inspect worker logs before judging contention")
 
 
+def write_sweep_summary(directory, cores):
+    for filename in ("summary.csv", "aggregate.csv"):
+        rows = []
+        for core in cores:
+            with (directory / f"cores_{core}" / filename).open() as source:
+                rows.extend(dict(row, aiv_cores=core) for row in csv.DictReader(source))
+        with (directory / filename).open("w", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    headers = ["AIV 核数 / 卡", "独立带宽之和 GB/s", "并发总吞吐 GB/s", "保留 %", "下降 %"]
+    values = [(row["aiv_cores"], *(f"{float(row[key]):.3f}" for key in (
+        "isolated_sum_GBps", "concurrent_wall_GBps", "retained_percent", "drop_percent"))) for row in rows]
+    table = markdown_table(headers, values)
+    report = ["# 多卡 BatchGet 核数扫描", "",
+              f"协议：{rows[0]['transport']}；每批 {rows[0]['requests']} × {rows[0]['token_bytes']} B；带宽单位为十进制 GB/s。",
+              "", table, ""]
+    report += [f"- [{core} 核详细结果](cores_{core}/report.md)" for core in cores]
+    (directory / "report.md").write_text("\n".join(report) + "\n")
+    print(f"MULTICARD_CORE_SWEEP_SUMMARY\n{table}")
+    print(f"MULTICARD_REPORT path={directory / 'report.md'}")
+
+
+def summarize(directory):
+    config = json.loads((directory / "config.json").read_text())
+    if isinstance(config["aiv_cores"], list):
+        for core in config["aiv_cores"]:
+            summarize(directory / f"cores_{core}")
+        write_sweep_summary(directory, config["aiv_cores"])
+        return
+    isolated = [json.loads((directory / f"isolated_{device}/device_{device}.json").read_text())
+                for device in config["devices"]]
+    concurrent = [json.loads((directory / f"concurrent/device_{device}.json").read_text())
+                  for device in config["devices"]]
+    for device, solo, shared in zip(config["devices"], isolated, concurrent):
+        if solo["device"] != device or shared["device"] != device or not solo["verified"] or not shared["verified"]:
+            raise RuntimeError(f"invalid saved result for device {device}")
+    write_summary(directory, isolated, concurrent, config)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
-    parser.add_argument("--aiv-cores", type=int, default=16)
+    parser.add_argument("--aiv-cores", nargs="+", type=int,
+                        help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--graph-calls", type=int, default=256,
                         help="BatchGet calls per captured graph; replayed continuously during measurement")
@@ -301,6 +349,9 @@ def main(argv=None):
     parser.add_argument("--table-capacity", type=int, default=4096)
     parser.add_argument("--tokens-per-block", type=int, default=128)
     parser.add_argument("--jettys-per-core", type=int, default=2)
+    parser.add_argument("--max-inflight-total", type=int,
+                        default=int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048")),
+                        help="URMA unconfirmed READ limit per card; 0 uses the baseline")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20260903)
     parser.add_argument("--transport", choices=("ubmem", "urma"), default=os.environ.get("KVAF_TRANSPORT", "ubmem"))
@@ -313,19 +364,16 @@ def main(argv=None):
     if args.summarize is not None:
         directory = args.summarize.resolve()
         try:
-            config = json.loads((directory / "config.json").read_text())
-            isolated = [json.loads((directory / f"isolated_{device}/device_{device}.json").read_text())
-                        for device in config["devices"]]
-            concurrent = [json.loads((directory / f"concurrent/device_{device}.json").read_text())
-                          for device in config["devices"]]
-            for device, solo, shared in zip(config["devices"], isolated, concurrent):
-                if solo["device"] != device or shared["device"] != device or not solo["verified"] or not shared["verified"]:
-                    raise RuntimeError(f"invalid saved result for device {device}")
-            write_summary(directory, isolated, concurrent, config)
+            summarize(directory)
         except Exception as error:
             print(f"MULTICARD_SUMMARY_FAILED {error}", file=sys.stderr)
             return 1
         return 0
+    cores = args.aiv_cores
+    if cores is None:
+        cores = [int(value) for value in os.environ.get("KVAF_BATCH_GET_AIV_CORES", "16").split()]
+    if not cores or min(cores) < 1 or len(set(cores)) != len(cores):
+        parser.error("--aiv-cores requires distinct positive core counts")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
     for name in ("seconds", "graph_calls", "requests", "token_bytes", "table_capacity", "tokens_per_block", "ready_timeout"):
@@ -333,7 +381,7 @@ def main(argv=None):
         if not math.isfinite(value) or value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     args.build_dir = args.build_dir.resolve()
-    directory = (args.output or Path.cwd() / time.strftime("kvaf_multicard_%Y%m%d_%H%M%S")).resolve()
+    directory = (args.output or Path.cwd() / time.strftime(f"kvaf_multicard_{args.transport}_%Y%m%d_%H%M%S")).resolve()
     directory.mkdir()
     config = vars(args).copy()
     config.pop("summarize")
@@ -341,16 +389,29 @@ def main(argv=None):
     config["output"] = str(directory)
     config["ddr_bytes_per_device"] = args.table_capacity * args.tokens_per_block * args.token_bytes
     config["peak_concurrent_ddr_bytes"] = len(args.devices) * config["ddr_bytes_per_device"]
+    config["aiv_cores"] = cores if len(cores) > 1 else cores[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={args.aiv_cores} "
+    print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
+          f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
+          f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
           f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
           "timing=sustained_graph_replay_to_completion units=decimal_GBps", flush=True)
     print(f"MULTICARD_RESULTS path={directory}", flush=True)
     try:
-        isolated = [run_group(args, [device], directory / f"isolated_{device}")[0] for device in args.devices]
-        concurrent = run_group(args, args.devices, directory / "concurrent")
-        write_summary(directory, isolated, concurrent, config)
+        for core in cores:
+            args.aiv_cores = core
+            case = directory / f"cores_{core}" if len(cores) > 1 else directory
+            if case != directory:
+                case.mkdir()
+                case_config = dict(config, aiv_cores=core, output=str(case))
+                (case / "config.json").write_text(json.dumps(case_config, indent=2) + "\n")
+            print(f"MULTICARD_CORE_SWEEP_BEGIN aiv_cores={core}", flush=True)
+            isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
+            concurrent = run_group(args, args.devices, case / "concurrent")
+            write_summary(case, isolated, concurrent, dict(config, aiv_cores=core))
+        if len(cores) > 1:
+            write_sweep_summary(directory, cores)
     except (Exception, KeyboardInterrupt) as error:
         print(f"MULTICARD_FAILED {error}", file=sys.stderr)
         return 1

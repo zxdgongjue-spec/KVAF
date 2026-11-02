@@ -27,7 +27,11 @@ device = int(os.environ["DEVICE_ID"])
 assert option("--token-bytes") == "656"
 assert option("--table-capacity") == "4096"
 assert "--no-kernel-profile" in sys.argv
-assert os.environ["KVAF_TRANSPORT"] == "ubmem"
+transport = os.environ["KVAF_TRANSPORT"]
+assert transport == os.environ["EXPECTED_TRANSPORT"]
+assert option("--aiv-cores") in os.environ["EXPECTED_CORES"].split()
+assert option("--jettys-per-core") == os.environ["EXPECTED_JETTYS"]
+assert option("--max-inflight-total") == os.environ["EXPECTED_INFLIGHT"]
 if directory.name == "concurrent" and device == int(os.environ.get("FAIL_DEVICE", "-1")):
     print("FAKE_UNDERLYING_DEVICE_ERROR", flush=True)
     sys.exit(3)
@@ -40,7 +44,8 @@ while not (directory / "start.json").exists():
     time.sleep(0.005)
 assert all((directory / f"ready_{d}").exists() for d in ([0, 1] if directory.name == "concurrent" else [device]))
 window = json.loads((directory / "start.json").read_text())
-time.sleep(max(0, window["stop"] - time.monotonic()))
+# Synthetic results use the coordinator's timestamps; no worker clock is needed.
+time.sleep(window["stop"] - window["start"])
 rate = 15 if directory.name == "concurrent" else 30
 elapsed = window["stop"] - window["start"]
 result = dict(device=device, start=window["start"], end=window["stop"],
@@ -51,17 +56,23 @@ pathlib.Path(option("--contention-result")).write_text(json.dumps(result))
 
 
 class MulticardTests(unittest.TestCase):
-    def run_controller(self, root, fail=None):
+    def run_controller(self, root, fail=None, transport="ubmem", options=(), cores=16,
+                       jettys=2, inflight=2048, expected_transport=None, core_env="16"):
         runner = root / "runner"
         runner.write_text(FAKE_RUNNER)
         runner.chmod(0o755)
-        env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner), KVAF_TRANSPORT="ubmem")
+        env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner), KVAF_TRANSPORT=transport,
+                   KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048",
+                   KVAF_BATCH_GET_AIV_CORES=core_env,
+                   EXPECTED_TRANSPORT=expected_transport or transport, EXPECTED_CORES=str(cores),
+                   EXPECTED_JETTYS=str(jettys), EXPECTED_INFLIGHT=str(inflight))
         if fail is not None:
             env["FAIL_DEVICE"] = str(fail)
         return subprocess.run([
             str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_multicard_perf.sh"),
             str(root / "build"), "--devices", "0", "1", "--seconds", "0.05",
             "--ready-timeout", "10", "--output", str(root / "results"),
+            *options,
         ], env=env, capture_output=True, text=True, timeout=30)
 
     def test_coordinated_workers_and_summary(self):
@@ -102,6 +113,55 @@ class MulticardTests(unittest.TestCase):
             self.assertIn("MULTICARD_REPORT", regenerated.stdout)
             self.assertNotIn("MULTICARD_MEASURE", regenerated.stdout)
             self.assertEqual((output / "report.md").read_text(), report)
+
+    def test_urma_core_sweep_and_offline_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, transport="urma", cores="1 2",
+                                         options=("--aiv-cores", "1", "2"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = root / "results"
+            config = json.loads((output / "config.json").read_text())
+            self.assertEqual(config["transport"], "urma")
+            self.assertEqual(config["aiv_cores"], [1, 2])
+            self.assertIn("jettys_per_core=2 max_inflight_total=2048", result.stdout)
+            report = (output / "cores_2/report.md").read_text()
+            self.assertIn("| 协议 | urma |", report)
+            self.assertIn("| Jetty 数 / AIV 核 | 2 |", report)
+            self.assertIn("| 未完成 READ 上限 / 卡 | 2048 |", report)
+            with (output / "aggregate.csv").open() as source:
+                totals = list(csv.DictReader(source))
+            self.assertEqual([row["aiv_cores"] for row in totals], ["1", "2"])
+            self.assertTrue(all(row["transport"] == "urma" for row in totals))
+            self.assertTrue(all(row["max_inflight_total"] == "2048" for row in totals))
+            with (output / "summary.csv").open() as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual([(row["aiv_cores"], row["device"]) for row in rows],
+                             [("1", "0"), ("1", "1"), ("2", "0"), ("2", "1")])
+            sweep_report = (output / "report.md").read_text()
+            (root / "runner").unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(multi.main([str(root / "missing-build"), "--summarize", str(output)]), 0)
+            self.assertEqual((output / "report.md").read_text(), sweep_report)
+
+    def test_core_sweep_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, core_env="8 16", cores="8 16")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            config = json.loads((root / "results/config.json").read_text())
+            self.assertEqual(config["aiv_cores"], [8, 16])
+
+    def test_explicit_urma_configuration_overrides_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # The command-line protocol must override KVAF_TRANSPORT too.
+            runner_result = self.run_controller(
+                root, options=("--transport", "urma", "--aiv-cores", "4",
+                               "--jettys-per-core", "1", "--max-inflight-total", "1024"),
+                cores=4, jettys=1, inflight=1024, expected_transport="urma",
+            )
+            self.assertEqual(runner_result.returncode, 0, runner_result.stdout + runner_result.stderr)
 
     def test_failed_worker_aborts_peers_without_summary(self):
         with tempfile.TemporaryDirectory() as temporary:

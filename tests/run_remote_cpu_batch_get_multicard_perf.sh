@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/build-npu [--devices 6 7] [options...]" >&2
+  echo "Usage: $0 /absolute/path/to/build-npu [--transport ubmem|urma] [--devices 6 7] [--aiv-cores 1 2 4] [options...]" >&2
   exit 2
 fi
 
