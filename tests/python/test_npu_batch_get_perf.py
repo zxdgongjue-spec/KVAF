@@ -282,6 +282,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048),
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
+    parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.miss_count is None:
         args.miss_count = args.request_length
@@ -346,6 +349,11 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.contention_control_dir is not None:
+        if args.contention_result is None or args.contention_graph_calls <= 0 or args.miss_count <= 0:
+            return "contention mode requires a result path, positive graph calls and positive miss-count"
+        if args.kernel_profile:
+            return "contention mode measures graph throughput and requires --no-kernel-profile"
     return None
 
 
@@ -962,6 +970,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     miss_count_value,
                 )
             return indices, offsets, output_indices
+
+        if args.contention_control_dir is not None:
+            from batch_get_multicard_perf import run_worker
+
+            def submit(plan, stream):
+                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
+
+            def check_output(plan):
+                slots = (plan[1][:miss_count_value] // token_bytes).to(torch.int64)
+                destinations = plan[2][:miss_count_value].to(torch.int64)
+                if not torch.equal(output.index_select(0, destinations), entry_pattern.index_select(0, slots)):
+                    raise AssertionError("contention graph replay payload validation failed")
+
+            run_worker(kvaf, torch, args, create_request_plan, submit, check_output)
+            return 0
 
         if args.kernel_profile:
             if args.ubmem_profile_detail:
