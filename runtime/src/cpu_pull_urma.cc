@@ -1,4 +1,5 @@
 #include "cpu_pull_urma.h"
+#include "cpu_pull_profile.h"
 #include "urma_device_abi.h"
 #include "urma_transport.h"
 
@@ -28,6 +29,19 @@ double Micros(Clock::duration duration) {
   return std::chrono::duration<double, std::micro>(duration).count();
 }
 std::atomic<std::uint32_t> next_token{1}, next_psn{1};
+std::atomic<std::uint64_t> next_profile_id{0};
+std::uint64_t ProfileWarmup() {
+  const char* value = std::getenv("KVAF_CPU_PULL_PROFILE_WARMUP");
+  if (!value) return 0;
+  char* end{};
+  errno = 0;
+  const auto warmup = std::strtoull(value, &end, 10);
+  if (!*value || *value < '0' || *value > '9' || *end || errno) {
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE_CONFIG invalid_warmup using=0\n");
+    return 0;
+  }
+  return warmup;
+}
 std::uint32_t Next(std::atomic<std::uint32_t>& sequence) {
   auto value = ++sequence;
   while (!value) value = ++sequence;
@@ -133,6 +147,13 @@ class UrmaBackend final : public Backend {
                   sizeof(urma_transport_mode_t));
     }
     profile_ = Enabled("KVAF_CPU_PULL_PROFILE");
+    if (profile_) {
+      profile_id_ = ++next_profile_id;
+      profile_batch_ = 0;
+      const char* each = std::getenv("KVAF_CPU_PULL_PROFILE_EACH");
+      profile_each_ = !each || std::strcmp(each, "0") != 0;
+      profile_summary_.Reset(ProfileWarmup());
+    }
     ready_ = true;
     std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_REFERENCE commit=8bc5a2a endpoint_layout=%u sge_bytes=%zu "
         "jettys=%u max_sge=%u max_bytes=%u local_eid=%s peer_eid=%s psn=%u peer_psn=%u\n",
@@ -146,13 +167,17 @@ class UrmaBackend final : public Backend {
     const auto begin = profile_ ? Clock::now() : Clock::time_point{};
     const auto status = Transfer(spans, false, profile_ ? &stats : nullptr);
     if (profile_) {
-      std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=%u spans=%zu bytes=%llu "
+      const auto total_us = Micros(Clock::now()-begin);
+      ++profile_batch_;
+      profile_summary_.Record(status.ok(), stats.build_us, stats.post_us, stats.cq_us, total_us);
+      if (profile_each_) std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROFILE mode=batch status=%u spans=%zu bytes=%llu "
           "build_us=%.1f post_us=%.1f cq_wait_us=%.1f total_us=%.1f read_wrs=%zu "
           "post_calls=%zu tail_cqes=%zu waves=%zu active_jettys=%zu plan_reused=%u cpu_threads=1 "
-          "checksum_included=0\n", unsigned(status.code()), spans.size(),
+          "checksum_included=0 profile_id=%llu batch=%llu\n", unsigned(status.code()), spans.size(),
           static_cast<unsigned long long>(stats.bytes), stats.build_us, stats.post_us, stats.cq_us,
-          Micros(Clock::now()-begin), stats.wrs, stats.posts, stats.cqes, stats.waves,
-          stats.jettys, unsigned(stats.reused));
+          total_us, stats.wrs, stats.posts, stats.cqes, stats.waves,
+          stats.jettys, unsigned(stats.reused), (unsigned long long)profile_id_, (unsigned long long)profile_batch_);
+      if (!status.ok()) ReportProfile("read_error");
     }
     return status;
   }
@@ -196,6 +221,8 @@ class UrmaBackend final : public Backend {
       q = {};
     }
     RELEASE(source_, urma_unimport_seg)
+    ReportProfile("source_release");
+    profile_summary_.ReleaseSamples();
     source_base_ = source_bytes_ = 0;
     return Status::OK();
   }
@@ -246,6 +273,10 @@ class UrmaBackend final : public Backend {
     return hash;
   }
  private:
+  void ReportProfile(const char* reason) {
+    if (profile_) profile_summary_.Report(stderr, profile_id_, source_base_,
+        reinterpret_cast<std::uint64_t>(memory_), reason);
+  }
   struct Profile {
     std::uint64_t bytes{};
     std::size_t wrs{}, posts{}, cqes{}, waves{}, jettys{};
@@ -481,6 +512,9 @@ class UrmaBackend final : public Backend {
   std::vector<Span> cached_spans_;
   std::size_t next_poll_{};
   bool profile_{};
+  bool profile_each_{true};
+  std::uint64_t profile_id_{}, profile_batch_{};
+  CpuPullProfileSummary profile_summary_;
   bool ready_{}, poisoned_{}, destination_valid_{}, completed_error_{};
   std::string failure_;
   bool owns_memory_{true};

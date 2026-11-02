@@ -768,10 +768,10 @@ Status NpuRuntime::AbortPut(const PutHandle& put) {
   return core().AbortPut(put);
 }
 Status NpuRuntime::BatchGetRawAddr(LinkId link,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
-                                  NpuInt64ArrayView lengths,MutableBufferView output,void* stream) {
+                                  NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach source HBM before raw READ");
-  return impl_->hbm_reader->Read(link,ready,src,dst,lengths,output,stream);
+  return impl_->hbm_reader->Read(link,ready,src,dst,lengths,output,stream,profile);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif

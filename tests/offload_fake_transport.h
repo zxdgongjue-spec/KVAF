@@ -21,6 +21,8 @@
 namespace p = kvaf::offload;
 constexpr std::uint32_t kRegionToken = 0x13579bdf;
 std::atomic<int> registrations{0}, events{0}, event_waits{0}, reads{0};
+std::atomic<int> timing_queries{0};
+bool fail_timing_query=false;
 std::atomic<int> sessions{0}, contexts{0}, probe_allocations{0};
 std::atomic<int> cqs{0}, jetties{0}, peer_imports{0};
 std::atomic<std::uint64_t> registered_base{0}, registered_bytes{0};
@@ -52,6 +54,8 @@ aclError aclrtMemset(void* p,std::size_t,int value,std::size_t n){std::memset(p,
 aclError aclrtCreateStream(aclrtStream* p){*p=new int;return 0;}
 aclError aclrtDestroyStream(aclrtStream p){delete static_cast<int*>(p);return 0;}
 aclError aclrtCreateEvent(aclrtEvent* p){++events;*p=new int;return 0;}
+aclError aclrtCreateEventWithFlag(aclrtEvent* p,std::uint32_t flag){Require(flag==ACL_EVENT_TIME_LINE,"timing event flag");return aclrtCreateEvent(p);}
+aclError aclrtEventElapsedTime(float* ms,aclrtEvent,aclrtEvent){++timing_queries;*ms=0.125F;return fail_timing_query?123:0;}
 aclError aclrtRecordEvent(aclrtEvent,aclrtStream){return 0;}
 aclError aclrtSynchronizeEvent(aclrtEvent){++event_waits;return 0;}
 aclError aclrtDestroyEvent(aclrtEvent p){--events;delete static_cast<int*>(p);return 0;}

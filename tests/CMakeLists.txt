@@ -1,5 +1,11 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_executable(kvaf_cpu_pull_profile_test cpu_pull_profile_test.cc)
+target_include_directories(kvaf_cpu_pull_profile_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
+add_test(NAME kvaf_cpu_pull_profile_test COMMAND kvaf_cpu_pull_profile_test)
+add_test(NAME kvaf_pull_benchmarks_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_pull_benchmarks.py")
+
 add_executable(kvaf_npu_eid_discovery_test npu_eid_discovery_test.cc)
 target_include_directories(kvaf_npu_eid_discovery_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
 target_link_libraries(kvaf_npu_eid_discovery_test PRIVATE kvaf_peer_link ${CMAKE_DL_LIBS})

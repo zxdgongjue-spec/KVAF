@@ -338,7 +338,7 @@ class NpuPythonRuntime final {
     ThrowIfError(status);
   }
   py::dict BatchGetRawArrays(LinkId region,const ReadyToken& ready,const py::object& src,const py::object& dst,
-                         const py::object& lengths,py::object output,py::object stream) {
+                         const py::object& lengths,py::object output,py::object stream,bool profiling) {
     auto array = [&](const py::object& tensor, const char* name) {
       const auto view = GetNpuTensorView(tensor, name);
       if (view.shape.size() != 1 || view.element_bytes != sizeof(std::int64_t) ||
@@ -362,11 +362,27 @@ class NpuPythonRuntime final {
       throw py::value_error("raw READ stream belongs to another NPU");
     const auto acl_stream=acl_python::StreamFromPython(stream);
     raw_retained_=py::make_tuple(src,dst,lengths,output,stream);
+    HbmReadProfile profile;
     const auto status=native_->BatchGetRawAddr(region,ready,sources,destinations,sizes,
-        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream);
+        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr);
     if(!native_->pending_raw_addr())raw_retained_=py::none();
     ThrowIfError(status);
-    py::dict result; result["state"]="done"; result["sequence"]=ready.sequence; return result;
+    py::dict result; result["state"]="done"; result["sequence"]=ready.sequence;
+    if(profiling) {
+      py::dict timing;
+      timing["host_total_us"]=profile.total_us;
+      double phases=0;
+#define RAW_PHASE(name) timing[#name]=profile.name; phases+=profile.name
+      RAW_PHASE(validation_us); RAW_PHASE(acquire_us); RAW_PHASE(buffers_us); RAW_PHASE(register_output_us);
+      RAW_PHASE(event_record_us); RAW_PHASE(launch_us); RAW_PHASE(synchronize_us); RAW_PHASE(event_query_us);
+      RAW_PHASE(status_us); RAW_PHASE(cleanup_us); RAW_PHASE(complete_us);
+#undef RAW_PHASE
+      timing["host_other_us"]=std::max(0.0,profile.total_us-phases);
+      timing["kernel_event_us"]=profile.kernel_event_valid?py::cast(profile.kernel_event_us):py::none();
+      timing["kernel_event_error"]=profile.event_error;
+      result["profile"]=std::move(timing);
+    }
+    return result;
   }
   void DetachHbm(LinkId region) { ThrowIfError(native_->DetachHbm(region)); }
   bool PendingRawAddr() const { return native_->pending_raw_addr(); }
@@ -680,7 +696,9 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("attach_hbm", &NpuPythonRuntime::AttachHbm, py::arg("address"), py::arg("export_ticket"), py::arg("local_eid") = "")
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("hbm_link"),py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
-           py::arg("output"),py::arg("stream")=py::none())
+           py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,
+           "Synchronously read peer HBM. profile=True adds Host stage timings and a device event "
+           "interval around the kernel to the returned profile dictionary; profiling is off by default.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("region"))
       .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("region"))
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)

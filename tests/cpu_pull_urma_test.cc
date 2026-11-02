@@ -4,6 +4,8 @@
 #include "urma_transport.h"
 #include "urma_device_abi.h"
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -243,6 +245,38 @@ void ReadTest(bool distinct_eids){
   Require(backend->ReleaseSource().ok()&&imported_mrs==0&&queues==0&&peers==0&&local_mrs==1,"release source before pool");
   Require(backend->Close().ok()&&local_mrs==0,"release pool");
 }
+void ProfileSummaryTest(){
+  const char* names[]={"KVAF_CPU_PULL_PROFILE","KVAF_CPU_PULL_PROFILE_WARMUP","KVAF_CPU_PULL_PROFILE_EACH"};
+  std::string saved[3];bool existed[3]{};
+  for(int i=0;i<3;++i)if(const auto* value=std::getenv(names[i])){existed[i]=true;saved[i]=value;}
+  setenv(names[0],"1",1);setenv(names[1],"1",1);setenv(names[2],"0",1);
+  FILE* output=std::tmpfile();Require(output,"capture profile output");
+  std::fflush(stderr);const int old_stderr=dup(STDERR_FILENO);Require(old_stderr>=0,"save stderr");
+  Require(dup2(fileno(output),STDERR_FILENO)>=0,"redirect profile output");
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  Require(backend->Allocate(4096,&cpu).ok(),"profile pool");
+  std::vector<std::uint8_t> hbm(4096,0x75);
+  Require(backend->Open(Source(hbm,cpu.token,true),&cpu).ok(),"profile source");
+  std::uint64_t checksum{};
+  Require(backend->ProbeToScratch(64,64,&checksum).ok(),"profile excludes startup probe");
+  for(int i=0;i<3;++i){
+    Require(backend->Read({{64,128,64}}).ok(),"profile payload READ");
+    Require(backend->Checksum({{64,128,64}})==p::Hash(hbm.data()+64,64),"profile excludes checksum");
+  }
+  Require(backend->Close().ok()&&backend->Close().ok(),"profile closes idempotently");
+  std::fflush(stderr);Require(dup2(old_stderr,STDERR_FILENO)>=0,"restore stderr");close(old_stderr);
+  std::rewind(output);std::string log;char bytes[1024];
+  while(const auto n=std::fread(bytes,1,sizeof(bytes),output))log.append(bytes,n);
+  std::fclose(output);
+  for(int i=0;i<3;++i){if(existed[i])setenv(names[i],saved[i].c_str(),1);else unsetenv(names[i]);}
+  Require(log.find("attempts=3 samples=3 failed=0")!=std::string::npos,"summary includes all payload batches only");
+  Require(log.find("attempts=2 samples=2 failed=0")!=std::string::npos,"summary excludes configured warmup");
+  Require(log.find("CPU_PULL_PROFILE mode=batch")==std::string::npos,"per-batch profile output disabled");
+  std::size_t headers=0,pos=0;
+  while((pos=log.find("CPU_PULL_SUMMARY profile_id=",pos))!=std::string::npos){++headers;++pos;}
+  Require(headers==2&&log.find("reason=source_release")!=std::string::npos,"one all/measured summary on close");
+}
 void RegistrationFailureTest(){
   urma_context_t context{};
   for(auto invalid:{BadLocalSegment::ZeroBase,BadLocalSegment::Short,BadLocalSegment::NoWrite,BadLocalSegment::NonPin}){
@@ -407,6 +441,7 @@ void BulkFailureTest(Fault injected) {
   _exit(0);
 }
 int main(){try{
+  ProfileSummaryTest();
   BorrowedPoolTest();
   RegistrationFailureTest();
   PartialChannelFailureTest();

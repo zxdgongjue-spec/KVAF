@@ -37,6 +37,39 @@ runtime.batch_get_raw_addr(link, ready, src, dst, sizes, output, stream=a_stream
 
 当前只保留该 NPU Tensor 重载。成功返回 `{"state": "done", "sequence": ready.sequence}`，包含 READ 完成、输出注册清理、生产端完成确认。未决时用 `resolve_raw_addr(link)` 重试控制或清理，绝不重发 READ；`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
 
+可选 `profile=True` 在成功结果中增加 `profile` 字典，单位均为微秒：
+
+```python
+result = runtime.batch_get_raw_addr(
+    link, ready, src, dst, sizes, output, stream=a_stream, profile=True)
+print(result["profile"])
+```
+
+| 字段 | 计时范围 |
+| --- | --- |
+| `host_total_us` | 原生 HbmReader::Read 全流程；不含 Python 绑定的参数处理和结果字典构造 |
+| `validation_us` | Host 设备、源身份、数组形状和元数据/输出重叠检查 |
+| `acquire_us` | 向生产端获取当前批次的控制请求 |
+| `buffers_us` | 状态缓冲分配/清零、首次队列分配、首次计时事件创建 |
+| `register_output_us` | 注册本卡 output，取得通信实体 |
+| `launch_us` | Host 提交 raw READ 算子调用 |
+| `synchronize_us` | Host 等待传入 stream 完成 |
+| `kernel_event_us` | 同一 stream 中紧邻算子前后两个设备事件之间的时间 |
+| `status_us` | 最终状态回读与检查 |
+| `cleanup_us` | 注销本批 output、释放临时状态资源 |
+| `complete_us` | 向生产端确认本批完成 |
+| `event_record_us` / `event_query_us` | Host 提交计时事件 / 查询计时结果的开销 |
+| `host_other_us` | 原生总时间减去上述 Host 阶段的余量 |
+
+`kernel_event_us` 使用 `ACL_EVENT_TIME_LINE` 和 `aclrtEventElapsedTime`，毫秒转微秒。
+它覆盖 raw READ 算子中的整批校验、分段、WQE 提交和 CQ 等待，属于设备 stream 的事件区间，
+并非仅网络传输时间或各核时间的累加；也可能包含事件与设备调度开销。
+该区间与 Host 的 launch/synchronize 重叠，不能再加到 Host 阶段总和中。
+用法依据 [CANN 设备事件计时接口](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0090.html)。
+事件记录或结果查询失败不改变已成功的数据传输结果；此时 `kernel_event_us=None`，
+`kernel_event_error` 提供 ACL 返回码。事件创建失败发生在发起 READ 之前，接口返回异常。
+默认 `profile=False`，不创建/记录计时事件；计时事件按 reader 复用，detach 时销毁。
+
 双方必须显式配置 fullmesh EID：B 构造源时的 npu_eid 和 A attach_hbm 的 local_eid。CPU↔NPU 路由独立配置，自动 CLOS/pair-info 发现不能替代 fullmesh。
 
 ## 算子与资源
@@ -94,3 +127,42 @@ python tests/python/test_hbm_read_raw_addr.py \
 本地无 Ascend 硬件时，`kvaf_batch_get_raw_addr_kernel_model_test` 运行实际 AIV 源码的 CPU 模型；
 `kvaf_hbm_read_test` 使用真实 TCP/source/client 与假 ACL/HCCP 验证状态、分段、丢 ACK 和清理。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
+
+## 随机离散包性能测试
+
+新增 `tests/python/bench_hbm_read_raw_addr.py`，脚本中的 A 为读取端，B 为生产端。
+先按上文重新编译 NPU 扩展和 raw kernel，启动 CPU 服务，再执行：
+
+```bash
+export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
+python tests/python/bench_hbm_read_raw_addr.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
+  --npu-eid-a-raw 000000000047050000100000df00d806 \
+  --npu-eid-b-raw 000000000047050000100000df00f807 \
+  --packets 4096 --packet-bytes 656 --source-space-bytes 268435456 \
+  --warmup 10 --iterations 100 --profile-warmup 1 --profile-iterations 20 \
+  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+```
+
+EID 对应此前测试机的 fullmesh 配置，其他机器需替换。CPU 服务仅用于当前 NpuRuntime
+初始化；数据直接从 B HBM 读取到 A HBM，不经过 CPU DDR。
+
+- `--packets`：包数量，1..4096；兼容 `--blocks`。
+- `--packet-bytes`：每包字节数，所有包相同；兼容 `--block-bytes`。大包自动拆成至多 64 KiB 的 WQE，整批最多 1048576 个 WQE。
+- `--source-space-bytes`：B 注册的 HBM 空间大小，至少容纳所有包。以包大小划分槽位，随机抽取不重复槽位，源地址按随机顺序读取；不足一个槽位的尾部不使用。
+- `--seed`：默认 123，可复现布局。目的 output 连续排列，首尾各留 64 字节 guard。
+- `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
+- `--max-inflight-total`：默认 2048，含义与 BatchGet 一致。
+- `--profile-warmup` / `--profile-iterations`：单独的内部计时轮次，默认 1/20；设为 `--profile-iterations 0` 即只运行未插桩的带宽测试。
+
+输出 `NPU_HBM_BENCH_PASS` 的吞吐和分位数只使用 `--iterations` 轮的
+Python `batch_get_raw_addr()` 完整调用时间，未打开内部计时。
+另外运行带 `profile=True` 的轮次，输出 `NPU_HBM_INTERNAL_PROFILE_STAGE`，
+包括 `python_total`、上述全部 Host 阶段和 `kernel_event` 的 mean/P50/P95/P99/min/max。
+内部计时轮次不混入带宽统计；各分位数按 `(N-1)*p` 线性插值，不能将不同阶段的 P99 相加。
+`NPU_HBM_INTERNAL_PROFILE_INFO` 列出有效设备计时样本数和计时错误码，缺失的设备计时不会作为零值统计。
+
+源注册、连接探测、源写入、三组 NPU int64 Tensor 准备、output 清空、应用 IPC、数据校验均在传输计时之外。
+每轮交替输入内容，并检查 NPU 消费者和完整回读数据（含 guard）。
+`NPU_HBM_BENCH_PROFILE_STAGE` 另列读取端接口/校验时间及生产端 ready/release_batch 时间。
+源与目的进程的时钟不相减。两端初始化与清理时间不纳入稳定态逐批统计。

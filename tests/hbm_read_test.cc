@@ -141,10 +141,30 @@ int main(){try{
   Require(!read(token,overrun,destinations,lengths).ok(),"raw-array source bounds enforced");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(raw_calls==before+2 && raw_wqes==before_wqes,"fused validation rejects all invalid ranges before posting DMA");
+  kvaf::HbmReadProfile profile;
+  Check(a.Read(id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+               {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
+  const double host_phases=profile.validation_us+profile.acquire_us+profile.buffers_us+profile.register_output_us+
+      profile.event_record_us+profile.launch_us+profile.synchronize_us+profile.event_query_us+
+      profile.status_us+profile.cleanup_us+profile.complete_us;
+  Require(profile.kernel_event_valid && profile.kernel_event_us==125.0 && !profile.event_error,
+          "device event milliseconds converted to microseconds");
+  Require(host_phases<=profile.total_us && profile.total_us>0 && events==2,
+          "Host stages fit total; timing events retained for reuse");
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  fail_timing_query=true;
+  Check(a.Read(id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+               {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
+  Require(!profile.kernel_event_valid && profile.event_error==123 && !a.pending(),
+          "timing query failure does not change successful DMA result");
+  fail_timing_query=false;
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  const int queries=timing_queries;
   before=raw_calls;
   proxy.drop=unsigned(hr::Command::Complete);
   Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"new raw API retains lost Complete");
   Check(a.Resolve(id));Require(raw_calls==before+1,"new raw API resolve does not replay DMA");
+  Require(timing_queries==queries,"unprofiled READ and recovery do not query timing events");
   Require(!std::memcmp(output.data()+7,source+9,67)&&!std::memcmp(output.data()+5000,source+90001,70001),"raw-array offsets are relative to logical source/output");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(!b.ReleaseBatch(saved).ok()&&!b.CancelBatch(saved).ok(),"explicit source token rejects delayed notifications");
@@ -159,6 +179,6 @@ int main(){try{
   Check(a.Resolve(id));Require(raw_calls==before+1,"cleanup retries never replay READ");Check(b.ReleaseBatch(token));
   Check(b.Ready(&token));Check(b.CancelBatch(token));Require(!read(token,sources,destinations,lengths).ok(),"cancelled batch cannot be read");
   proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(id).ok(),"lost detach reply");Check(a.Detach(id));Check(b.Shutdown());
-  Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers,"all resources retired");
+  Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers && !events,"all resources and profiling events retired");
   std::cout<<"HBM raw READ: real TCP/source/client, split spans, leases, lost ACKs and cleanup passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

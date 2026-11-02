@@ -7,12 +7,31 @@ a separate RPC after the measured call and before freeing/reusing any slot.
 import argparse
 import multiprocessing as mp
 import random
-import statistics
 import time
 import traceback
 
 from test_cpu_offload import fnv64
 from test_remote_cpu_offload import receive, retain
+from pull_bench_utils import print_stages, summarize_us
+
+
+def measure_pull(runtime, source, ready, keys, src, sizes, make_destinations,
+                 clock=time.perf_counter_ns):
+    """Consecutive Host boundaries; stages sum exactly to prepare-to-commit time."""
+    begin = clock()
+    put = runtime.prepare_put(keys, sizes)
+    prepared = clock()
+    dst = make_destinations(put)
+    organized = clock()
+    task = runtime.submit_cpu_pull(source, ready, put, src, dst, sizes)
+    submitted = clock()
+    runtime.wait_cpu_pull(task)
+    waited = clock()
+    runtime.commit_put(put)
+    committed = clock()
+    return dict(total=(committed-begin)/1000, prepare_put=(prepared-begin)/1000,
+                dst_offsets=(organized-prepared)/1000, submit_cpu_pull=(submitted-organized)/1000,
+                wait_cpu_pull=(waited-submitted)/1000, commit_put=(committed-waited)/1000)
 
 
 def layout(args):
@@ -38,6 +57,7 @@ def producer(pipe, args, ticket):
     stream = torch.npu.Stream(device=args.device_b)
     hbm = torch.empty(size, dtype=torch.uint8, device=f"npu:{args.device_b}")
     source = kvaf.CpuPullHbmSource(device_id=args.device_b, npu_eid=args.npu_eid_b)
+    stages = {"ready": [], "release_batch": []}
     try:
         # Initialize before registration's scratch READ/checksum probe.
         hbm.copy_(patterns[0])
@@ -49,11 +69,19 @@ def producer(pipe, args, ticket):
             with torch.npu.stream(stream):
                 hbm.copy_(patterns[iteration % 2], non_blocking=True)
             stream.synchronize()
+            begin = time.perf_counter_ns()
             batch = source.ready()
+            ready_us = (time.perf_counter_ns() - begin) / 1000
             pipe.send(("ready", batch))
             receive(pipe, "reuse")
+            begin = time.perf_counter_ns()
             source.release_batch(batch)
+            release_us = (time.perf_counter_ns() - begin) / 1000
+            if iteration >= args.warmup:
+                stages["ready"].append(ready_us)
+                stages["release_batch"].append(release_us)
         source.shutdown()
+        print_stages("CPU_PULL_BENCH_PROFILE", "producer", stages, args.warmup)
         pipe.send(("closed", None))
     except BaseException:
         pipe.send(("error", traceback.format_exc()))
@@ -114,40 +142,43 @@ def main():
               f"b_eid={receive(parent, 'registered')} blocks={args.blocks} "
               f"block_bytes={args.block_bytes}", flush=True)
         keys = list(range(args.blocks))
-        elapsed = []
-        verification_elapsed = []
+        stages = {name: [] for name in ("total", "prepare_put", "dst_offsets", "submit_cpu_pull",
+                                       "wait_cpu_pull", "commit_put", "last_offload_checksum",
+                                       "verification", "batch_free")}
+        def make_destinations(put):
+            return torch.tensor([e.address - ticket["base"] for e in put.entries], dtype=torch.int64, device="cpu")
         for iteration in range(args.warmup + args.iterations):
             batch = receive(parent, "ready")
-            begin = time.perf_counter_ns()
-            put = runtime.prepare_put(keys, sizes)
-            dst = torch.tensor([e.address - ticket["base"] for e in put.entries], dtype=torch.int64, device="cpu")
-            task = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
-            runtime.wait_cpu_pull(task)
-            runtime.commit_put(put)
-            duration = (time.perf_counter_ns() - begin) / 1000
+            timing = measure_pull(runtime, cpu_source, batch, keys, src, sizes, make_destinations)
             # This RPC now performs the actual CPU scan, outside offload timing.
             verify_begin = time.perf_counter_ns()
-            if runtime.last_offload_checksum() != expected[iteration % 2]:
+            actual = runtime.last_offload_checksum()
+            checksum_end = time.perf_counter_ns()
+            if actual != expected[iteration % 2]:
                 raise RuntimeError("DDR checksum mismatch")
-            verify_duration = (time.perf_counter_ns() - verify_begin) / 1000
-            if iteration >= args.warmup:
-                elapsed.append(duration)
-                verification_elapsed.append(verify_duration)
+            timing["last_offload_checksum"] = (checksum_end - verify_begin) / 1000
+            timing["verification"] = (time.perf_counter_ns() - verify_begin) / 1000
+            free_begin = time.perf_counter_ns()
             runtime.batch_free(keys)
+            timing["batch_free"] = (time.perf_counter_ns() - free_begin) / 1000
+            if iteration >= args.warmup:
+                for name, value in timing.items():
+                    stages[name].append(value)
             parent.send(("reuse", iteration))
         receive(parent, "closed")
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        ordered = sorted(elapsed)
-        percentile = lambda p: ordered[min(len(ordered)-1, int((len(ordered)-1)*p))]
-        mean = statistics.mean(elapsed)
+        stats = summarize_us(stages["total"])
+        mean = stats["mean_us"]
+        print_stages("CPU_PULL_BENCH_PROFILE", "reader", stages, args.warmup)
         print("CPU_PULL_BENCH_PASS metric=python_prepare_put_to_commit "
-              f"iterations={len(elapsed)} mean_us={mean:.1f} p50_us={percentile(.5):.1f} "
-              f"p95_us={percentile(.95):.1f} p99_us={percentile(.99):.1f} "
+              f"iterations={stats['samples']} mean_us={mean:.1f} p50_us={stats['p50_us']:.1f} "
+              f"p95_us={stats['p95_us']:.1f} p99_us={stats['p99_us']:.1f} "
               f"effective_GBps={args.blocks * args.block_bytes / mean / 1000:.3f} "
               "cpu_checksum_included=0 registration_and_producer_and_free_excluded=1 "
-              f"verification_mean_us={statistics.mean(verification_elapsed):.1f} "
+              f"verification_mean_us={summarize_us(stages['verification'])['mean_us']:.1f} "
+              "percentile=linear "
               "changing_inputs=1 verification=every_round_checksum", flush=True)
     except BaseException:
         traceback.print_exc()

@@ -93,7 +93,8 @@ class NpuRuntime final : public Runtime {
   Status AttachHbm(const std::string& address, const HbmReadTicket&, LinkId*,
                    const std::string& local_eid = "");
   Status BatchGetRawAddr(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
-                         NpuInt64ArrayView lengths, MutableBufferView output, void* stream);
+                         NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
+                         HbmReadProfile* profile = nullptr);
   Status ResolveRawAddr(LinkId); // Never resubmits DMA; retries control/cleanup only.
   Status DetachHbm(LinkId);
   bool pending_raw_addr() const;

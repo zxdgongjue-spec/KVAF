@@ -3,12 +3,22 @@
 #include "hbm_exporter.h"
 #include "kvaf_aiv_batch_get_raw_addr.h"
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <map>
 
 namespace kvaf {
 namespace hr=hbm_read;
 namespace {
 constexpr std::size_t kMaxWqes=1U<<20;
+using ProfileClock = std::chrono::steady_clock;
+struct ProfileTimer {
+  double* target;
+  ProfileClock::time_point begin;
+  explicit ProfileTimer(double* out):target(out),begin(out?ProfileClock::now():ProfileClock::time_point{}){}
+  ~ProfileTimer(){if(target)*target+=std::chrono::duration<double,std::micro>(ProfileClock::now()-begin).count();}
+};
+template<class F> auto Timed(double* target,F operation){ProfileTimer timer(target);return operation();}
 struct DeviceBuffer {
   void* data{}; std::size_t bytes{};
   Status Allocate(std::size_t n) {
@@ -64,6 +74,7 @@ struct Engine {
   std::uint32_t cores,jettys,budget;
   bool uncertain{},kernel_finished{};
   aclrtStream probe_stream{};
+  aclrtEvent profile_start{},profile_end{};
   Engine(std::uint32_t c,std::uint32_t j,std::uint32_t b):cores(c),jettys(j),budget(b){}
   Status Cleanup() {
     if(uncertain)return Status::InDoubt("raw READ transport quarantined; source and output must remain alive");
@@ -80,6 +91,10 @@ struct Engine {
   }
   Status Close() {
     auto s=Cleanup();if(!s.ok())return s;
+    for(auto* event:{&profile_start,&profile_end})if(*event) {
+      if(aclrtDestroyEvent(*event)!=ACL_SUCCESS)return Status::InDoubt("destroy raw READ profiling event");
+      *event=nullptr;
+    }
     if(KvafBatchGetTransportClose(&transport))return Status::InDoubt("raw READ transport teardown pending");
     s=queues.Free();if(!s.ok())return s;
     if(probe_stream) {
@@ -116,7 +131,7 @@ struct Engine {
     return RunKernel(args,output,stream);
   }
   Status RunDevice(NpuInt64ArrayView src,NpuInt64ArrayView dst,NpuInt64ArrayView lengths,
-                   MutableBufferView output,void* stream) {
+                   MutableBufferView output,void* stream,HbmReadProfile* profile) {
     if(!transport || !stream || uncertain || local || descriptors.data || statuses.data)
       return Status::InvalidState("raw READ engine is not idle");
     KvafExecuteBatchGetRawAddrKernelArgs args{};
@@ -124,28 +139,51 @@ struct Engine {
     args.destination_addresses=reinterpret_cast<std::uint64_t>(dst.data);
     args.lengths=reinterpret_cast<std::uint64_t>(lengths.data);
     args.request_count=src.size;args.input_mode=KVAF_RAW_NPU_OFFSETS;
-    return RunKernel(args,output,stream);
+    return RunKernel(args,output,stream,profile);
   }
-  Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream) {
-    auto s=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!s.ok())return s;
+  Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream,
+                   HbmReadProfile* profile=nullptr) {
+    auto s=Timed(profile?&profile->buffers_us:nullptr,[&]() -> Status {
+    auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
     if(!queues.data) {
-      s=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!s.ok())return s;
+      allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
     }
     if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
       return Status::Internal("clear raw READ status");
+    if(profile)for(auto* event:{&profile_start,&profile_end})
+      if(!*event && aclrtCreateEventWithFlag(event,ACL_EVENT_TIME_LINE)!=ACL_SUCCESS)
+        return Status::Internal("create raw READ timing event");
+    return Status::OK();
+    });
+    if(!s.ok())return s;
     std::uint64_t entity{};
-    if(KvafBatchGetLocalBufferAcquire(transport,output.data,output.bytes,&local,&entity))
+    if(Timed(profile?&profile->register_output_us:nullptr,[&]{
+        return KvafBatchGetLocalBufferAcquire(transport,output.data,output.bytes,&local,&entity);}))
       return Status::Internal("register A raw READ output");
     args.output=reinterpret_cast<std::uint64_t>(output.data);
     args.core_status=reinterpret_cast<std::uint64_t>(statuses.data);args.queue_state=reinterpret_cast<std::uint64_t>(queues.data);
     args.channel_entity=entity;args.block_count=cores;args.jettys_per_core=jettys;args.batch_get_max_inflight_total=budget;
     kernel_finished=false;
     uncertain=true; // Includes launch errors: never assume the device saw no work.
-    if(KvafExecuteBatchGetRawAddrLaunch(&args,static_cast<aclrtStream>(stream)) ||
-       aclrtSynchronizeStream(static_cast<aclrtStream>(stream))!=ACL_SUCCESS)
+    if(profile)profile->event_error=Timed(&profile->event_record_us,[&]{
+      return aclrtRecordEvent(profile_start,static_cast<aclrtStream>(stream));});
+    if(Timed(profile?&profile->launch_us:nullptr,[&]{
+        return KvafExecuteBatchGetRawAddrLaunch(&args,static_cast<aclrtStream>(stream));}))
+      return Status::InDoubt("raw READ launch/stream completion uncertain");
+    if(profile && !profile->event_error)profile->event_error=Timed(&profile->event_record_us,[&]{
+      return aclrtRecordEvent(profile_end,static_cast<aclrtStream>(stream));});
+    if(Timed(profile?&profile->synchronize_us:nullptr,[&]{
+        return aclrtSynchronizeStream(static_cast<aclrtStream>(stream));})!=ACL_SUCCESS)
       return Status::InDoubt("raw READ launch/stream completion uncertain");
     kernel_finished=true;
+    if(profile && !profile->event_error) {
+      float ms{};
+      profile->event_error=Timed(&profile->event_query_us,[&]{return aclrtEventElapsedTime(&ms,profile_start,profile_end);});
+      profile->kernel_event_valid=!profile->event_error && std::isfinite(ms) && ms>=0;
+      if(profile->kernel_event_valid)profile->kernel_event_us=static_cast<double>(ms)*1000;
+    }
+    ProfileTimer status_timer(profile?&profile->status_us:nullptr);
     std::vector<KvafRawReadCoreStatus> host(cores);
     if(aclrtMemcpy(host.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
       return Status::InDoubt("cannot inspect raw READ completion");
@@ -187,14 +225,15 @@ struct Connection {
   Status result;
   Connection(const std::string& a,const HbmReadTicket& t,std::uint32_t c,std::uint32_t j,std::uint32_t b):
       link(new ReadLink(a,t)),engine(c,j,b){}
-  Status Resolve() {
+  Status Resolve(HbmReadProfile* profile=nullptr) {
     if(pending==Pending::None)return Status::InvalidState("no pending raw READ");
     if(pending==Pending::Dma || engine.uncertain)return Status::InDoubt("raw READ DMA unresolved; retain A output and B source; no READ replay");
     if(pending==Pending::Acquire) {result=Status::Internal("raw READ cancelled before DMA after uncertain Acquire");pending=Pending::Cancel;}
-    auto s=engine.Cleanup();if(!s.ok())return s;
+    auto s=Timed(profile?&profile->cleanup_us:nullptr,[&]{return engine.Cleanup();});if(!s.ok())return s;
     if(pending==Pending::Cleanup)pending=result.ok()?Pending::Complete:Pending::Cancel;
     hr::Response response{};
-    s=link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,{},&response,sequence);
+    s=Timed(profile?&profile->complete_us:nullptr,[&]{
+      return link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,{},&response,sequence);});
     if(!s.ok())return Status::InDoubt("raw READ acknowledgement pending: "+s.message());
     pending=Pending::None;last_sequence=sequence;return result;
   }
@@ -296,7 +335,10 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
   return s;
 }
 Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
-                       NpuInt64ArrayView lengths,MutableBufferView output,void* stream) {
+                       NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile) {
+  if(profile)*profile={};
+  ProfileTimer total_timer(profile?&profile->total_us:nullptr);
+  const auto validation_begin=profile?ProfileClock::now():ProfileClock::time_point{};
   auto s=impl_->Device();if(!s.ok())return s;
   auto it=impl_->connections.find(id);
   if(it==impl_->connections.end())return Status::NotFound("HBM reader link not found");
@@ -323,16 +365,17 @@ Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,N
       return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
   }
   c.sequence=ready.sequence;c.pending=Pending::Acquire;c.result=Status::OK();
+  if(profile)profile->validation_us=std::chrono::duration<double,std::micro>(ProfileClock::now()-validation_begin).count();
   hr::Response response{};
   // The source service leases the identity/batch, not a Host copy of the
   // device metadata. Each READ core validates the complete metadata before posting DMA.
-  s=c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence);
+  s=Timed(profile?&profile->acquire_us:nullptr,[&]{return c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence);});
   if(!s.ok()) {if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;return s;}
   c.pending=Pending::Dma;
-  s=c.engine.RunDevice(src,dst,lengths,output,stream);
+  s=c.engine.RunDevice(src,dst,lengths,output,stream,profile);
   if(c.engine.uncertain)return s;
   c.result=s;c.pending=Pending::Cleanup;
-  return c.Resolve();
+  return c.Resolve(profile);
 }
 Status HbmReader::Resolve(LinkId id){auto s=impl_->Device();if(!s.ok())return s;auto it=impl_->connections.find(id);
   return it==impl_->connections.end()?Status::NotFound("HBM region not found"):it->second->Resolve();}
