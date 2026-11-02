@@ -492,13 +492,8 @@ def main(argv=None, runner=None):
         print(json.dumps(dict(dry_run=True, combinations=len(selected), **plan), indent=2))
         return 0
     if not args.single:
-        if root.exists() and any(root.iterdir()):
-            raise ValueError("use a new or empty output-dir for this sweep")
         root.mkdir(parents=True, exist_ok=True)
         (root / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
-    for case in selected:
-        if any(path.exists() for path in (case.json, case.csv, case.json.with_suffix(".log"))):
-            raise ValueError("use new JSON/CSV/log filenames for this run")
     rows = []
     runner = runner or subprocess.run
     for index, case in enumerate(selected):

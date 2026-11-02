@@ -588,7 +588,7 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
   --single --token-bytes 656 --miss-count 1024 --aiv-cores 4 \
   --json results/aligned-t656-m1024.json --csv results/aligned-t656-m1024.csv
 
-# 全部 252 个支持的配置；目录须为空或尚不存在。
+# 全部 252 个支持的配置；允许复用目录并覆盖同名结果。
 bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
   --output-dir results/scatter-miss-aligned
 
