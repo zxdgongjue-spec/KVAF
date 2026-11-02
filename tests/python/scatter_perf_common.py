@@ -6,6 +6,30 @@ import statistics
 CPU_MAGIC = 0x4B56414650524631
 PROFILE_MAGIC = 0x4B56415343505231
 
+# Python 3.11 Random.randbytes(n) calls getrandbits(n * 8), whose bit count
+# must fit a C int. Keep chunks word-aligned so seeded output is identical to
+# one large randbytes call for sizes that the original call can handle.
+RANDOM_SOURCE_CHUNK_BYTES = 16 * 1024 * 1024
+MAX_RANDOM_SOURCE_CHUNK_BYTES = (((1 << 31) - 1) // 8) & ~3
+
+
+def random_byte_chunks(rng, byte_count, chunk_bytes=RANDOM_SOURCE_CHUNK_BYTES):
+    """Yield exact, bounded random byte ranges, including a partial final word."""
+    if byte_count < 0:
+        raise ValueError("random source byte count must be nonnegative")
+    if not 0 < chunk_bytes <= MAX_RANDOM_SOURCE_CHUNK_BYTES or chunk_bytes % 4:
+        raise ValueError("random source chunk must be word-aligned and fit the C int bit count")
+    for offset in range(0, byte_count, chunk_bytes):
+        yield offset, rng.randbytes(min(chunk_bytes, byte_count - offset))
+
+
+def fill_random_bytes(buffer, rng, chunk_bytes=RANDOM_SOURCE_CHUNK_BYTES):
+    """Refresh caller-owned storage without resizing it or allocating a full copy."""
+    target = memoryview(buffer).cast("B")
+    for offset, data in random_byte_chunks(rng, len(target), chunk_bytes):
+        target[offset:offset + len(data)] = data
+
+
 PAYLOAD_TIMINGS = ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns",
                    "aiv_body_ns", "aiv_wall_ns", "aiv_scatter_ns")
 HOST_TIMINGS = (

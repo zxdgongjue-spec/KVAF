@@ -12,7 +12,9 @@ import time
 
 from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
 from aiv_kernel_metadata import check_aiv_kernel_metadata
-from scatter_perf_common import HOST_TIMINGS, PAYLOAD_TIMINGS, percentile, profile_metrics, request_values, sample_metrics, summarize
+from scatter_perf_common import (HOST_TIMINGS, PAYLOAD_TIMINGS, RANDOM_SOURCE_CHUNK_BYTES,
+                                 fill_random_bytes, percentile, profile_metrics,
+                                 request_values, sample_metrics, summarize)
 
 
 # Stable compact layout, including for baseline-only or profiled-only runs.
@@ -226,6 +228,8 @@ def main(argv=None):
                   reference="aicpu-urma:access_operator/demo/aicpu_batch_get/python/test_batch_get.py",
                   cpu_comm_window="first WRITE submit to last payload/ready tail CQ; includes posting and inter-wave gaps",
                   source_bytes=source_rows * args.token_bytes,
+                  source_generation_chunk_bytes=(RANDOM_SOURCE_CHUNK_BYTES
+                                                 if args.input_mode == "changing" else None),
                   output_bytes=output_rows * args.token_bytes,
                   staging_bytes=65536 * args.token_bytes,
                   get_sha256=hashlib.sha256(Path(kernel).read_bytes()).hexdigest(),
@@ -233,7 +237,14 @@ def main(argv=None):
     config = {k: str(v) if isinstance(v, Path) else v for k, v in config.items()}
     print("SCATTER_PERF_CONFIG " + json.dumps(config, sort_keys=True), flush=True)
     block_bytes = args.token_bytes * args.tokens_per_block
-    source_cpu = source_data(torch, source_rows, args.token_bytes) if args.input_mode == "steady" else None
+    if args.input_mode == "changing":
+        # Keep one full CPU source for correctness checks and reuse its storage.
+        # Generating an entire multi-GiB Python integer/bytes object overflows
+        # Random.getrandbits's C int argument and creates large temporary copies.
+        source_storage = bytearray(source_rows * args.token_bytes)
+        source_cpu = torch.frombuffer(source_storage, dtype=torch.uint8).reshape(source_rows, args.token_bytes)
+    else:
+        source_cpu = source_data(torch, source_rows, args.token_bytes)
     source = torch.empty((source_rows, args.token_bytes), dtype=torch.uint8, device=device)
     plans = request_plans(torch, args, device) if args.input_mode == "steady" else None
     dynamic_inputs = tuple(torch.empty(args.request_length, dtype=torch.int32, device=device) for _ in range(3))
@@ -280,11 +291,10 @@ def main(argv=None):
             report["setup_ms"]["batch_put"] = (time.perf_counter_ns() - begin) / 1e6
 
         def prepare(index):
-            nonlocal epoch, source_cpu
+            nonlocal epoch
             if args.input_mode == "changing":
                 rng = random.Random(args.seed + epoch)
-                data = bytearray(rng.randbytes(source_rows * args.token_bytes))
-                source_cpu = torch.frombuffer(data, dtype=torch.uint8).reshape(source_rows, args.token_bytes)
+                fill_random_bytes(source_storage, rng)
                 cpu = tuple(torch.tensor(values, dtype=torch.int32)
                             for values in request_values(args, args.seed + epoch))
                 for target, value in zip(dynamic_inputs, cpu):

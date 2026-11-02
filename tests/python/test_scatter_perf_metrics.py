@@ -4,11 +4,14 @@ import csv
 import io
 import json
 from pathlib import Path
+import random
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from scatter_perf_common import HOST_TIMINGS, CPU_MAGIC, PROFILE_MAGIC, profile_metrics, request_values, sample_metrics, summarize
+from scatter_perf_common import (HOST_TIMINGS, CPU_MAGIC, PROFILE_MAGIC, RANDOM_SOURCE_CHUNK_BYTES,
+                                 MAX_RANDOM_SOURCE_CHUNK_BYTES, fill_random_bytes,
+                                 random_byte_chunks, profile_metrics, request_values, sample_metrics, summarize)
 from test_aiv_scatter_perf import CSV_COLUMNS, arguments, main, measure_pass, write_results
 
 
@@ -31,6 +34,48 @@ def profiles(cores=3, requests=19, token=656):
 
 
 class ScatterPerfTests(unittest.TestCase):
+    def test_chunked_source_matches_seeded_randbytes_and_keeps_storage(self):
+        for size in (0, 1, 3, 4, 7, 31, 32, 33, 127, 1027):
+            for chunk in (4, 32, 64):
+                storage = bytearray([0xAD]) * (size + 16)
+                exported = memoryview(storage)[8:8 + size]
+                identity = id(storage)
+                for seed in (1234, 1235):
+                    fill_random_bytes(exported, random.Random(seed), chunk)
+                    self.assertEqual(bytes(exported), random.Random(seed).randbytes(size))
+                    self.assertEqual(storage[:8], bytes([0xAD]) * 8)
+                    self.assertEqual(storage[8 + size:], bytes([0xAD]) * 8)
+                    self.assertEqual(id(storage), identity)
+
+    def test_multi_gib_source_avoids_c_int_overflow_without_huge_test_allocation(self):
+        class Chunk:
+            def __init__(self, size): self.size = size
+            def __len__(self): return self.size
+        class CIntLimitedRandom:
+            def randbytes(self, size):
+                if size * 8 > (1 << 31) - 1:
+                    raise OverflowError("Python int too large to convert to C int")
+                return Chunk(size)
+        rng = CIntLimitedRandom()
+        # Exact reported source shape: 4096 blocks * 128 tokens * 4096 bytes.
+        args = arguments(["--blocks", "4096", "--tokens-per-block", "128", "--token-bytes", "4096",
+                          "--request-length", "8192", "--miss-count", "4096"])
+        source_bytes = args.blocks * args.tokens_per_block * args.token_bytes
+        self.assertEqual(source_bytes, 1 << 31)
+        self.assertEqual(args.miss_count * args.token_bytes, 16 * 1024 * 1024)
+        with self.assertRaises(OverflowError):
+            rng.randbytes(source_bytes)
+        for size in ((1 << 28) - 1, 1 << 28, source_bytes, source_bytes + 3):
+            end = 0
+            for offset, data in random_byte_chunks(rng, size):
+                self.assertEqual(offset, end)
+                self.assertLessEqual(len(data), RANDOM_SOURCE_CHUNK_BYTES)
+                end += len(data)
+            self.assertEqual(end, size)
+        for size, chunk in ((-1, 4), (1, 0), (1, 3), (1, MAX_RANDOM_SOURCE_CHUNK_BYTES + 4)):
+            with self.assertRaises(ValueError):
+                list(random_byte_chunks(rng, size, chunk))
+
     def test_runtime_switch_defaults_and_cli_precedence(self):
         with patch.dict("os.environ", {}, clear=True):
             args = arguments([])

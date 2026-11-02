@@ -274,7 +274,11 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 
 ## 测试过程
 
-1. 预分配并复用设备 source、请求 Tensor、output 和 stream。默认 changing 模式
+1. 预分配并复用设备 source、请求 Tensor、output、stream 和 changing 模式的 CPU 源缓冲区。
+   CPU Tensor 直接引用这份缓冲区；每轮按 16 MiB 分块生成随机字节并原地覆盖，
+   避免为整个源数据构造巨大的 Python int/bytes/bytearray 临时副本。
+   分块按 4 B 对齐，保持相同 seed/epoch 下与原单次 randbytes 相同的字节流。
+   默认 changing 模式
    每轮更新 payload 和请求，将 output 重置为 guard，经 BatchPut 写入 DDR，准备新的 access table。
    这些操作及同步都在该次计时开始前完成。
 2. 每个样本只调用一次 `batch_get(..., synchronize=True)`，等待有效前缀全部传输、
@@ -288,6 +292,17 @@ bash tests/run_remote_cpu_scatter_perf.sh "$PWD/build-npu" \
 
 源数据、初始化、BatchPut、请求生成及正确性回读不计入 BatchGet 样本。
 `setup_ms` 记录初始化；steady 模式额外记录初次 BatchPut。
+JSON config 的 `source_generation_chunk_bytes` 记录随机数据生成块大小，
+它与 URMA 单条 WR 大小无关，不改变通信分片或带宽分子。
+
+例如 `--blocks 4096 --tokens-per-block 128 --token-bytes 4096` 的源数据为 2 GiB，
+而 `--miss-count 4096` 的单次有效载荷为 16 MiB。旧版在 prepare 中调用
+`randbytes(2 GiB)`，Python 3.11 内部将 17179869184 位传给 C int 参数的 getrandbits，
+触发 `OverflowError: Python int too large to convert to C int`；这发生在 BatchGet 之前。
+分块修复保留全部源数据刷新、seed、请求规模和逐轮校验，不靠缩小测试规模规避。
+大源数据重复更新仍有实际 setup 成本，运行较多轮时可按需要调大原 wrapper 的
+`KVAF_SCATTER_PERF_TIMEOUT`（整个进程的总超时，默认 600 秒）。
+
 默认 `--output-row-step 1 --output-order random`：随机排列相邻输出行；
 `--output-row-step 2` 留输出空洞，`--output-order sequential` 按行顺序输出。
 `--output-pattern dense/strided` 是 row-step 1/2 的兼容别名。
