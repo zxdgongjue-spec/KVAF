@@ -131,22 +131,22 @@ def main():
     child.close()
     try:
         print(f"B registered: eid={receive(parent, 'registered')}", flush=True)
-        cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
+        runtime.attach_cpu_source(receive(parent, "cpu_source"))
         for round_id in range(args.rounds):
             batch = receive(parent, "ready")
             put = runtime.prepare_put(KEYS, lengths)
             src = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
-            dst = torch.tensor([entry.address - ticket["base"] for entry in put.entries],
+            dst = torch.tensor([entry.address for entry in put.entries],
                                dtype=torch.int64, device="cpu")
             sizes = torch.tensor(lengths, dtype=torch.int64, device="cpu")
-            task = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
+            task = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
             assert runtime.wait_cpu_pull(task, timeout=30000) == kvaf.CpuPullState.DONE
             runtime.commit_put(put)
             expected = pattern(torch, round_id)
             rows = [expected[o:o+n] for o, n in zip(OFFSETS, lengths)]
             checksum = fnv64(b"".join(bytes(row.tolist()) for row in rows))
             assert runtime.last_offload_checksum() == checksum, "CPU DDR checksum mismatch"
-            duplicate = runtime.submit_cpu_pull(cpu_source, batch, put, src, dst, sizes)
+            duplicate = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
             assert duplicate.id == task.id
             assert runtime.query_cpu_pull(task) == kvaf.CpuPullState.COMMITTED
             runtime.commit_put(put)

@@ -80,26 +80,30 @@ class NpuRuntime final : public Runtime {
   // or source detach. Synchronous; not a historical checksum cache.
   Status LastOffloadChecksum(std::uint64_t*) const;
 
-  Status AttachCpuSource(const CpuPullSourceDesc&, CpuPullSourceHandle*);
+  Status AttachCpuSource(const CpuPullSourceDesc&);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
-  Status SubmitCpuPull(const CpuPullSourceHandle&, const ReadyToken&, const PutHandle&,
-                       Uint64ArrayView src, Uint64ArrayView dst, Uint64ArrayView lengths, CpuPullTask*);
+  // Resolves the attached source from ReadyToken. dst_addrs are absolute DDR addresses.
+  Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
+                       Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
+                       Uint64ArrayView lengths, CpuPullTask*);
   Status QueryCpuPull(const CpuPullTask&, CpuPullState*);
   Status WaitCpuPull(const CpuPullTask&, std::uint32_t timeout_ms, CpuPullState*);
   Status CommitPut(const PutHandle&);
   Status AbortPut(const PutHandle&);
 
-  // Remote producer HBM: direct READ ranges, no AccessTable or DDR metadata.
-  Status AttachHbm(const std::string& address, const HbmReadTicket&, LinkId*,
+  // Save the remote source connection, selected by ReadyToken on each READ.
+  // No AccessTable or DDR metadata is used for this path.
+  Status AttachHbm(const std::string& address, const HbmReadTicket&,
                    const std::string& local_eid = "");
   // As with BatchGet, output registrations are cached until detach/shutdown.
   // Keep output storage alive and at a stable address until then. Callers own
   // range validity and destination disjointness; validate_ranges checks bounds only.
-  Status BatchGetRawAddr(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
+  Status BatchGetRawAddr(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
                          HbmReadProfile* profile = nullptr, bool validate_ranges = false);
-  Status ResolveRawAddr(LinkId); // Never resubmits DMA; retries control/cleanup only.
-  Status DetachHbm(LinkId);
+  Status ResolveRawAddr(const ReadyToken&); // Retries this batch's control/cleanup, never DMA.
+  // Also cleans up a failed Attach using the original export ticket.
+  Status DetachHbm(const HbmReadTicket&);
   bool pending_raw_addr() const;
 
   std::uint32_t device_id() const;

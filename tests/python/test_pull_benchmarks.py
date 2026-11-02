@@ -58,12 +58,12 @@ class PullBenchmarks(unittest.TestCase):
 
         def organize(put):
             self.assertEqual(put, "put")
-            step("dst_offsets", 20)
+            step("dst_addrs", 20)
             return [0]
 
-        result = measure_pull(Runtime(), None, None, [1], [0], [8], organize, clock=lambda: now)
-        self.assertEqual(events, ["prepare_put", "dst_offsets", "submit_cpu_pull", "wait_cpu_pull", "commit_put"])
-        self.assertEqual(result, dict(total=150, prepare_put=10, dst_offsets=20,
+        result = measure_pull(Runtime(), None, [1], [0], [8], organize, clock=lambda: now)
+        self.assertEqual(events, ["prepare_put", "dst_addrs", "submit_cpu_pull", "wait_cpu_pull", "commit_put"])
+        self.assertEqual(result, dict(total=150, prepare_put=10, dst_addrs=20,
                                       submit_cpu_pull=30, wait_cpu_pull=40, commit_put=50))
         self.assertEqual(result["total"], sum(v for k, v in result.items() if k != "total"))
 

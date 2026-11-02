@@ -15,7 +15,7 @@ from test_remote_cpu_offload import receive, retain
 from pull_bench_utils import print_stages, summarize_us
 
 
-def measure_pull(runtime, source, ready, keys, src, sizes, make_destinations,
+def measure_pull(runtime, ready, keys, src, sizes, make_destinations,
                  clock=time.perf_counter_ns):
     """Consecutive Host boundaries; stages sum exactly to prepare-to-commit time."""
     begin = clock()
@@ -23,14 +23,14 @@ def measure_pull(runtime, source, ready, keys, src, sizes, make_destinations,
     prepared = clock()
     dst = make_destinations(put)
     organized = clock()
-    task = runtime.submit_cpu_pull(source, ready, put, src, dst, sizes)
+    task = runtime.submit_cpu_pull(ready, put, src, dst, sizes)
     submitted = clock()
     runtime.wait_cpu_pull(task)
     waited = clock()
     runtime.commit_put(put)
     committed = clock()
     return dict(total=(committed-begin)/1000, prepare_put=(prepared-begin)/1000,
-                dst_offsets=(organized-prepared)/1000, submit_cpu_pull=(submitted-organized)/1000,
+                dst_addrs=(organized-prepared)/1000, submit_cpu_pull=(submitted-organized)/1000,
                 wait_cpu_pull=(waited-submitted)/1000, commit_put=(committed-waited)/1000)
 
 
@@ -135,21 +135,21 @@ def main():
         worker = ctx.Process(target=producer, args=(child, args, ticket))
         worker.start()
         child.close()
-        cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
+        runtime.attach_cpu_source(receive(parent, "cpu_source"))
         src = torch.tensor(offsets, dtype=torch.int64, device="cpu")
         sizes = torch.full((args.blocks,), args.block_bytes, dtype=torch.int64, device="cpu")
         print(f"CPU_PULL_BENCH_READY cpu_candidate={ticket['cpu_candidate']} "
               f"b_eid={receive(parent, 'registered')} blocks={args.blocks} "
               f"block_bytes={args.block_bytes}", flush=True)
         keys = list(range(args.blocks))
-        stages = {name: [] for name in ("total", "prepare_put", "dst_offsets", "submit_cpu_pull",
+        stages = {name: [] for name in ("total", "prepare_put", "dst_addrs", "submit_cpu_pull",
                                        "wait_cpu_pull", "commit_put", "last_offload_checksum",
                                        "verification", "batch_free")}
         def make_destinations(put):
-            return torch.tensor([e.address - ticket["base"] for e in put.entries], dtype=torch.int64, device="cpu")
+            return torch.tensor([e.address for e in put.entries], dtype=torch.int64, device="cpu")
         for iteration in range(args.warmup + args.iterations):
             batch = receive(parent, "ready")
-            timing = measure_pull(runtime, cpu_source, batch, keys, src, sizes, make_destinations)
+            timing = measure_pull(runtime, batch, keys, src, sizes, make_destinations)
             # This RPC now performs the actual CPU scan, outside offload timing.
             verify_begin = time.perf_counter_ns()
             actual = runtime.last_offload_checksum()

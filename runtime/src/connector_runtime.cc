@@ -26,12 +26,15 @@ CpuPullTask PutHandle::task() const {
 }
 std::uint64_t CpuPullTask::id() const { return state_ ? state_->context.id : 0; }
 
-Status RuntimeCore::AttachCpuSource(const CpuPullSourceDesc& source, CpuPullSourceHandle* out) {
+Status RuntimeCore::AttachCpuSource(const CpuPullSourceDesc& source) {
   if (!initialized_ || closing_) return Status::InvalidState("initialize Runtime before attaching CPU source");
-  if (!out || !source.source_id || !source.source_bytes || !source.region_id || !source.region_epoch)
+  if (!source.source_id || !source.source_bytes || !source.region_id || !source.region_epoch)
     return Status::InvalidArgument("invalid CPU source descriptor");
+  const auto existing = cpu_sources_.find(source.source_id);
+  if (existing != cpu_sources_.end() && !SameSource(existing->second, source))
+    return Status::InvalidArgument("CPU source identity conflicts with an attached source");
   auto status = access_operator_.ValidateCpuSource(source);
-  if (status.ok()) { out->owner_ = connector_owner_; out->source_ = source; }
+  if (status.ok()) cpu_sources_[source.source_id] = source;
   return status;
 }
 Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
@@ -46,17 +49,29 @@ Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
   connector_put_ = state; out->state_ = state;
   return Status::OK();
 }
-Status RuntimeCore::SubmitCpuPull(const CpuPullSourceHandle& source, const ReadyToken& ready,
-                                  const PutHandle& put, Uint64ArrayView src, Uint64ArrayView dst,
+Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
+                                  const PutHandle& put, Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
                                   Uint64ArrayView lengths, CpuPullTask* out) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
   if (!initialized_ || closing_ || !out || !put.state_ || put.state_->owner != connector_owner_ ||
-      source.owner_ != connector_owner_ || !desc || !SameSource(source.source_, *desc) || !ready.sequence)
+      !desc || !ready.sequence)
     return Status::InvalidArgument("CPU source, ReadyToken or put belongs to another Runtime/batch");
+  const auto source = cpu_sources_.find(desc->source_id);
+  if (source == cpu_sources_.end() || !SameSource(source->second, *desc))
+    return Status::InvalidArgument("CPU Pull source is not attached to this Runtime or its identity changed");
   auto& p = *put.state_;
   CopyArrays copies;
-  auto status = SnapshotCopyArrays(src, dst, lengths, &copies);
+  auto status = SnapshotCopyArrays(src_offsets, dst_addrs, lengths, &copies);
   if (!status.ok()) return status;
+  // Normalize only our owned snapshot, before duplicate comparison. Application
+  // arrays stay absolute; service-side spans retain their existing offset ABI.
+  for (std::size_t i = 0; i < copies.destination.size(); ++i) {
+    auto& address = copies.destination[i];
+    if (address < p.region.base || address-p.region.base > p.region.length ||
+        copies.lengths[i] > p.region.length-(address-p.region.base))
+      return Status::InvalidArgument("CPU Pull destination address outside this Put's DDR region");
+    address -= p.region.base;
+  }
   if (p.submitted) {
     if (!SameSource(p.request.source, *desc) || p.request.sequence != ready.sequence ||
         copies.source != p.request.copies.source || copies.destination != p.request.copies.destination ||

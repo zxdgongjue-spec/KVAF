@@ -17,7 +17,7 @@ source = kvaf.CpuPullHbmSource(device_id=device_b)
 desc = source.register(ticket, hbm_b, stream=producer_stream)
 
 # A 初始化阶段逻辑绑定，不重复建链。
-handle = runtime.attach_cpu_source(desc)
+runtime.attach_cpu_source(desc)
 
 # B 每批生产完成后发布身份，应用将 ready 与业务元数据发送给 A。
 producer_stream.synchronize()
@@ -27,8 +27,8 @@ ready = source.ready()
 lengths = torch.tensor([656, 100001], dtype=torch.int64, device="cpu")
 src = torch.tensor([7, 100003], dtype=torch.int64, device="cpu")
 put = runtime.prepare_put([1, 3], lengths)
-dst = torch.tensor([e.address - ticket["base"] for e in put.entries], dtype=torch.int64, device="cpu")
-task = runtime.submit_cpu_pull(handle, ready, put, src, dst, lengths)
+dst_addrs = torch.tensor([e.address for e in put.entries], dtype=torch.int64, device="cpu")
+task = runtime.submit_cpu_pull(ready, put, src, dst_addrs, lengths)
 runtime.wait_cpu_pull(task)
 runtime.commit_put(put)
 
@@ -36,7 +36,7 @@ runtime.commit_put(put)
 source.release_batch(ready)
 ```
 
-CPU 源偏移相对于注册 HBM 的逻辑起点；目的偏移相对于共享 DDR base。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。
+CPU 源偏移相对于注册 HBM 的逻辑起点；目的直接使用 PreparePut 返回的 DDR 绝对地址，可加槽内偏移。Runtime 内部转换为 CPU 协议使用的相对偏移，应用无需解析 DDR ticket。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。源绑定保存在 Runtime 内，通过 ready.source 自动查找，不需要应用保存本地源句柄。
 
 ## 本卡便利入口
 
@@ -44,7 +44,7 @@ CPU 源偏移相对于注册 HBM 的逻辑起点；目的偏移相对于共享 D
 runtime.batch_cpu_pull(keys, local_npu_tensor, input_offsets, lengths, stream=producer_stream)
 ```
 
-同步语义与 BatchPut 一致：成功返回时数据和元数据提交均完成。内部注册本卡源、等待生产、PreparePut、组织目的偏移、提交 CPU READ、等待及确认批次复用。应用不管理内部 put/task。源注册缓存至切换 Tensor 或 shutdown；同参数再次调用是新批次。
+同步语义与 BatchPut 一致：成功返回时数据和元数据提交均完成。内部注册本卡源、等待生产、PreparePut、组织目的绝对地址、提交 CPU READ、等待及确认批次复用。应用不管理内部 put/task。源注册缓存至切换 Tensor 或 shutdown；同参数再次调用是新批次。
 
 独立 OffloadRuntime、旧类别名、带范围 Ready、offload/offload_from、旧恢复入口已经删除。当前只保留上述便利入口及显式 Connector 事务接口。
 

@@ -121,7 +121,7 @@ ddr_base、调用数、失败数、丢弃样本数；失败仅计数，不混入
 
 Python 输出 `CPU_PULL_BENCH_PROFILE_STAGE`，同样排除预热并给出全部分位数：
 
-- reader：`prepare_put`、`dst_offsets`（应用组织目的地址）、`submit_cpu_pull`、`wait_cpu_pull`、`commit_put`，其总和为 `total`。
+- reader：`prepare_put`、`dst_addrs`（应用组织 DDR 绝对地址）、`submit_cpu_pull`、`wait_cpu_pull`、`commit_put`，其总和为 `total`。
 - reader 另列 `last_offload_checksum`、`verification`、`batch_free`，均不包含在传输 `total` 中；checksum 是 verification 的组成部分，不能重复相加。
 - producer：`ready`、`release_batch`。源写入与同步、业务通知 IPC、注册/建链均不计入传输总时间。
 

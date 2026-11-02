@@ -123,9 +123,9 @@ def main():
     producer_waiting_for_attach = False
     try:
         address, export = receive(parent, "export")
-        cpu_source = runtime.attach_cpu_source(receive(parent, "cpu_source"))
+        runtime.attach_cpu_source(receive(parent, "cpu_source"))
         producer_waiting_for_attach = True
-        region = runtime.attach_hbm(address, export, local_eid=args.npu_eid_a_raw)
+        runtime.attach_hbm(address, export, local_eid=args.npu_eid_a_raw)
         parent.send(("attached", True))
         producer_waiting_for_attach = False
         stream = torch.npu.Stream(device=args.device_a)
@@ -134,9 +134,9 @@ def main():
             cpu_batch, raw_batch = receive(parent, "ready")
             put = runtime.prepare_put(KEYS, [656] * 3)
             source_offsets = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
-            cpu_destinations = torch.tensor([e.address - ticket["base"] for e in put.entries],
+            cpu_destinations = torch.tensor([e.address for e in put.entries],
                                             dtype=torch.int64, device="cpu")
-            task = runtime.submit_cpu_pull(cpu_source, cpu_batch, put, source_offsets,
+            task = runtime.submit_cpu_pull(cpu_batch, put, source_offsets,
                                            cpu_destinations, torch.full((3,), 656, dtype=torch.int64, device="cpu"))
             runtime.wait_cpu_pull(task, timeout=30000)
             runtime.commit_put(put)
@@ -149,7 +149,7 @@ def main():
                 raw_sources = torch.tensor(OFFSETS, dtype=torch.int64, device=output.device)
                 raw_destinations = torch.tensor(RAW_DESTINATIONS, dtype=torch.int64, device=output.device)
                 raw_lengths = torch.tensor(RAW_LENGTHS, dtype=torch.int64, device=output.device)
-            runtime.batch_get_raw_addr(region, raw_batch, raw_sources, raw_destinations,
+            runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
                                       raw_lengths, output, stream=stream)
             raw_expected = pattern(torch, round_id + 101)
             expected = torch.full((110000,), 0xCC, dtype=torch.uint8)
@@ -166,7 +166,7 @@ def main():
             assert receive(parent, "released") == round_id
             print(f"HBM_RAW_ROUND_PASS round={round_id} raw_bytes={sum(RAW_LENGTHS)} "
                   "ddr_batch_get=1 cpu_pull=1 padding_checked=1 npu_consumer_checked=1", flush=True)
-        runtime.detach_hbm(region)
+        runtime.detach_hbm(export)
         parent.send(("detached", None))
         receive(parent, "closed")
         worker.join(10)
@@ -177,6 +177,7 @@ def main():
         traceback.print_exc()
         if producer_waiting_for_attach and not runtime.pending_raw_addr and not runtime.pending_offload:
             try:
+                runtime.detach_hbm(export)
                 parent.send(("attached", False))
                 receive(parent, "closed")
                 worker.join(10)

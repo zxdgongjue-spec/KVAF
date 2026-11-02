@@ -16,15 +16,7 @@ namespace kvaf {
 
 struct ConnectorPutState;
 class CpuPullTask;
-// Process-local, non-forgeable bindings. These do not own a second DDR pool.
-class CpuPullSourceHandle {
- public:
-  const CpuPullSourceDesc& source() const { return source_; }
- private:
-  friend class RuntimeCore;
-  std::shared_ptr<const int> owner_;
-  CpuPullSourceDesc source_;
-};
+// Process-local write transactions. These do not own a second DDR pool.
 class PutHandle {
  public:
   std::uint64_t id() const;
@@ -128,10 +120,14 @@ class RuntimeCore {
 
   bool pending_offload() const { return bool(connector_put_); }
 
-  Status AttachCpuSource(const CpuPullSourceDesc&, CpuPullSourceHandle*);
+  // Validate and save the source binding; subsequent submissions use ReadyToken.
+  Status AttachCpuSource(const CpuPullSourceDesc&);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
-  Status SubmitCpuPull(const CpuPullSourceHandle&, const ReadyToken&, const PutHandle&,
-                       Uint64ArrayView src, Uint64ArrayView dst, Uint64ArrayView lengths, CpuPullTask*);
+  // Source offsets are relative to registered HBM; destinations are absolute
+  // DDR addresses within this Put's allocations. The wire protocol uses offsets.
+  Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
+                       Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
+                       Uint64ArrayView lengths, CpuPullTask*);
   Status QueryCpuPull(const CpuPullTask&, CpuPullState*);
   Status WaitCpuPull(const CpuPullTask&, std::uint32_t timeout_ms, CpuPullState*);
   Status CommitPut(const PutHandle&);
@@ -165,6 +161,7 @@ class RuntimeCore {
   bool closing_{false};
   std::shared_ptr<const int> connector_owner_{std::make_shared<const int>(0)};
   std::shared_ptr<ConnectorPutState> connector_put_;
+  std::unordered_map<std::uint64_t, CpuPullSourceDesc> cpu_sources_;
   Status FinishConnectorPut(const PutHandle&, bool commit);
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};

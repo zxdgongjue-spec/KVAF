@@ -48,7 +48,7 @@ if hasattr(_native, "AclGraph"):
     __all__.append("AclGraph")
 
 for _name in ("CpuPullSourceDesc", "NpuPullSourceDesc", "ReadyToken", "CpuPullState",
-              "CpuPullSourceHandle", "PutEntry", "PutHandle", "CpuPullTask",
+              "PutEntry", "PutHandle", "CpuPullTask",
               "CpuPullHbmSource", "NpuPullHbmSource"):
     if hasattr(_native, _name):
         globals()[_name] = getattr(_native, _name)

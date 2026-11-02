@@ -9,12 +9,12 @@ class HbmReader {
   HbmReader(std::uint32_t device, std::uint32_t cores, std::uint32_t jettys,
             std::uint32_t budget, std::string kernel);
   ~HbmReader();
-  Status Attach(const std::string&, const HbmReadTicket&, const std::string& local_eid, LinkId*);
-  Status Read(LinkId, const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
+  Status Attach(const std::string&, const HbmReadTicket&, const std::string& local_eid);
+  Status Read(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
               NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
               HbmReadProfile* profile = nullptr, bool validate_ranges = false);
-  Status Resolve(LinkId);
-  Status Detach(LinkId);
+  Status Resolve(const ReadyToken&);
+  Status Detach(const HbmReadTicket&);
   Status Shutdown();
   bool pending() const;
  private:

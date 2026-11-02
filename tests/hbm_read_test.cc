@@ -124,19 +124,31 @@ int main(){try{
   kvaf::NpuPullHbmSource b(0,"00000000000000000000000000000001");kvaf::HbmReadTicket ticket;
   Check(b.Register({source,source_bytes,kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&ticket));Check(b.Listen("127.0.0.1:0"));
   Proxy proxy("127.0.0.1:"+std::to_string(b.port()));
-  {kvaf::HbmReader failed(0,2,2,2048,"fake.o");kvaf::LinkId rejected{};
+  {kvaf::HbmReader failed(0,2,2,2048,"fake.o");
     fail_probe_cq=true;
-    Require(!failed.Attach(proxy.address,ticket,"00000000000000000000000000000002",&rejected).ok(),"probe CQ failure rejected");
+    Require(!failed.Attach(proxy.address,ticket,"00000000000000000000000000000002").ok(),"probe CQ failure rejected");
     Require(quiesces==1 && !failed.pending() && !b.connected() && !registrations && !raw_transports && !local_buffers,
             "failed probe quiesces all Jettys before retiring either side");
     Check(failed.Shutdown());raw_calls=0;}
-  kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::LinkId id;
-  Check(a.Attach(proxy.address,ticket,"00000000000000000000000000000002",&id));
+  {kvaf::HbmReader failed(0,2,2,2048,"fake.o");
+    fail_probe_cq=true;proxy.drop=unsigned(hr::Command::Close);
+    Require(!failed.Attach(proxy.address,ticket,"00000000000000000000000000000002").ok(),"failed attach retains lost cleanup reply");
+    Check(failed.Detach(ticket));Check(failed.Detach(ticket));Check(failed.Shutdown());
+    Require(!b.connected() && !raw_transports && !registrations,"original export ticket recovers failed attachment");
+    raw_calls=0;}
+  kvaf::HbmReader a(0,2,2,2048,"fake.o");
+  Check(a.Attach(proxy.address,ticket,"00000000000000000000000000000002"));
   Require(registered_base==reinterpret_cast<uintptr_t>(source)-0xc00 && registered_bytes==source_bytes+0xc00,
           "register aligned range covering the unaligned Tensor");
   Require(b.connected() && raw_calls==1,"all-lane probe completed");
-  { kvaf::HbmReader other(0,2,2,2048,"fake.o");kvaf::LinkId rejected{};
-    Require(!other.Attach(proxy.address,ticket,"00000000000000000000000000000002",&rejected).ok(),"reject second reader");
+  Check(a.Attach(proxy.address,ticket,"00000000000000000000000000000002"));
+  Require(raw_calls==1 && raw_transports==1,"repeated attach reuses the saved connection");
+  auto wrong_ticket=ticket;wrong_ticket.token++;
+  Require(!a.Attach(proxy.address,wrong_ticket,"00000000000000000000000000000002").ok(),"conflicting ticket rejected");
+  Require(!a.Detach(wrong_ticket).ok() && b.connected(),"wrong ticket cannot detach a saved source");
+  Require(!a.Attach(proxy.address,ticket,"00000000000000000000000000000004").ok(),"conflicting route rejected");
+  { kvaf::HbmReader other(0,2,2,2048,"fake.o");
+    Require(!other.Attach(proxy.address,ticket,"00000000000000000000000000000002").ok(),"reject second reader");
     Check(other.Shutdown()); }
   Require(!b.Shutdown().ok(),"cannot unregister connected source");
   auto out=kvaf::MutableBufferView{output.data(),output.size(),kvaf::DeviceKind::kNpu};
@@ -147,7 +159,7 @@ int main(){try{
   auto read=[&](const kvaf::ReadyToken& t,const std::vector<std::int64_t>& src,
                 const std::vector<std::int64_t>& dst,const std::vector<std::int64_t>& sizes) {
     const auto calls=raw_calls.load(),syncs=raw_syncs;
-    const auto status=a.Read(id,t,{src.data(),src.size()},{dst.data(),dst.size()},
+    const auto status=a.Read(t,{src.data(),src.size()},{dst.data(),dst.size()},
                              {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1),nullptr,true);
     Require(raw_calls-calls<=1 && raw_syncs-syncs==raw_calls-calls,"single fused launch and final synchronization");
     return status;
@@ -155,7 +167,11 @@ int main(){try{
   const auto saved=token;auto bad=token;std::get<kvaf::NpuPullSourceDesc>(bad.source).source_epoch++;
   before=raw_calls;const auto before_wqes=raw_wqes.load();
   Require(!read(bad,sources,destinations,lengths).ok(),"raw-array stale identity rejected");
-  Require(!a.Read(id,token,{reinterpret_cast<const int64_t*>(output.data()),sources.size()},
+  bad=token;std::get<kvaf::NpuPullSourceDesc>(bad.source).source_bytes++;
+  Require(!read(bad,sources,destinations,lengths).ok(),"raw-array source size mismatch rejected");
+  bad=token;bad.source=kvaf::CpuPullSourceDesc{};
+  Require(!read(bad,sources,destinations,lengths).ok(),"raw READ rejects CPU Ready tokens");
+  Require(!a.Read(token,{reinterpret_cast<const int64_t*>(output.data()),sources.size()},
                    {destinations.data(),destinations.size()},{lengths.data(),lengths.size()},out,
                    reinterpret_cast<void*>(1)).ok() && raw_calls==before && !a.pending(),
           "metadata/output alias is rejected before Acquire");
@@ -170,7 +186,7 @@ int main(){try{
   Require(raw_calls==before+2 && raw_wqes==before_wqes,"fused validation rejects all invalid ranges before posting DMA");
   const int cached_acquires=local_acquires,allocated=acl_allocation_calls;
   kvaf::HbmReadProfile profile;
-  Check(a.Read(id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+  Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
   const double host_phases=profile.validation_us+profile.acquire_us+profile.buffers_us+profile.register_output_us+
       profile.event_record_us+profile.launch_us+profile.synchronize_us+profile.event_query_us+
@@ -181,7 +197,7 @@ int main(){try{
           "Host stages fit total; timing events retained for reuse");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   fail_timing_query=true;
-  Check(a.Read(id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+  Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
   Require(!profile.kernel_event_valid && profile.event_error==123 && !a.pending(),
           "timing query failure does not change successful DMA result");
@@ -193,7 +209,10 @@ int main(){try{
   before=raw_calls;
   proxy.drop=unsigned(hr::Command::Complete);
   Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"new raw API retains lost Complete");
-  Check(a.Resolve(id));Require(raw_calls==before+1,"new raw API resolve does not replay DMA");
+  auto wrong_batch=token;wrong_batch.sequence++;
+  Require(!a.Resolve(wrong_batch).ok() && a.pending(),"wrong sequence cannot resolve another batch");
+  Require(!a.Resolve(saved).ok() && a.pending(),"stale Ready cannot resolve current batch");
+  Check(a.Resolve(token));Require(raw_calls==before+1,"new raw API resolve does not replay DMA");
   Require(timing_queries==queries,"unprofiled READ and recovery do not query timing events");
   Require(!std::memcmp(output.data()+7,source+9,67)&&!std::memcmp(output.data()+5000,source+90001,70001),"raw-array offsets are relative to logical source/output");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
@@ -201,7 +220,7 @@ int main(){try{
   proxy.drop=unsigned(hr::Command::AcquireRaw);before=raw_calls;
   Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"lost new Acquire response retains batch");
   Require(!b.CancelBatch(token).ok(),"cannot cancel an acquired identity-only batch");
-  Require(!a.Resolve(id).ok()&&!a.pending()&&raw_calls==before,"unknown Acquire is cancelled without READ replay");
+  Require(!a.Resolve(token).ok()&&!a.pending()&&raw_calls==before,"unknown Acquire is cancelled without READ replay");
   Require(!read(token,sources,destinations,lengths).ok(),"consumed sequence cannot replay");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   before=raw_calls;
@@ -218,23 +237,35 @@ int main(){try{
   out=original_out;
   Require(local_acquires==cached_acquires+2 && local_buffers==3,"cache key includes output address");
   Check(b.Ready(&token));Check(b.CancelBatch(token));Require(!read(token,sources,destinations,lengths).ok(),"cancelled batch cannot be read");
-  unregister_failures=1;Require(!a.Detach(id).ok() && local_buffers==3,"failed detach preserves cached registrations");
+  unregister_failures=1;Require(!a.Detach(ticket).ok() && local_buffers==3,"failed detach preserves cached registrations");
   Check(b.Ready(&token));before=raw_calls;
   Require(!read(token,sources,destinations,lengths).ok() && raw_calls==before,"partially closed transport rejects further READs");
   Check(b.CancelBatch(token));
-  proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(id).ok(),"lost detach reply");Check(a.Detach(id));
+  proxy.drop=unsigned(hr::Command::Close);Require(!a.Detach(ticket).ok(),"lost detach reply");Check(a.Detach(ticket));
+  Check(a.Detach(ticket));
   // Exercise real persistent connections and legacy one-shot calls together.
   int control=-1;hr::Response response{};auto discover=hr::Make(hr::Command::Discover,ticket,99);
   const auto address="127.0.0.1:"+std::to_string(b.port());
-  {kvaf::HbmReader direct(0,2,2,2048,"fake.o");kvaf::LinkId direct_id;
-    Check(direct.Attach(address,ticket,"00000000000000000000000000000002",&direct_id));
+  {kvaf::HbmReader direct(0,2,2,2048,"fake.o");
+    Check(direct.Attach(address,ticket,"00000000000000000000000000000002"));
+    std::vector<uint8_t> other_storage(source_bytes,0x77);
+    kvaf::NpuPullHbmSource other(0,"00000000000000000000000000000001");kvaf::HbmReadTicket other_ticket;
+    Check(other.Register({other_storage.data(),other_storage.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&other_ticket));
+    Check(other.Listen("127.0.0.1:0"));
+    Check(direct.Attach("127.0.0.1:"+std::to_string(other.port()),other_ticket,"00000000000000000000000000000002"));
+    kvaf::ReadyToken other_ready;Check(other.Ready(&other_ready));
+    Check(direct.Read(other_ready,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+                      {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1)));
+    Require(!std::memcmp(output.data()+7,other_storage.data()+9,67),"Ready selects second saved NPU source");
+    Check(other.ReleaseBatch(other_ready));Check(direct.Detach(other_ticket));Check(other.Shutdown());
     for(unsigned i=0;i<3;++i) {
       Check(b.Ready(&token));
-      Check(direct.Read(direct_id,token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
+      Check(direct.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                         {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1)));
       Check(b.ReleaseBatch(token));
+      Require(!std::memcmp(output.data()+7,source+9,67),"detaching one source preserves the other connection");
     }
-    Check(direct.Detach(direct_id));
+    Check(direct.Detach(ticket));
   }
   Check(hr::Exchange(address,discover,{},&response,&control));Require(control>=0 && response.reserved==1,"persistent capability negotiated");
   const int connected=control;

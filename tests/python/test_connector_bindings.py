@@ -66,7 +66,7 @@ class ConnectorBindings(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_only_current_pull_interfaces_are_exported(self):
-        for name in ("HbmSource", "HbmReadSource", "OffloadRuntime"):
+        for name in ("HbmSource", "HbmReadSource", "OffloadRuntime", "CpuPullSourceHandle"):
             self.assertFalse(hasattr(kvaf, name))
         for name in ("offload", "offload_from", "resolve_offload", "release_offload_source"):
             self.assertFalse(hasattr(kvaf.NpuRuntime, name))
@@ -86,7 +86,22 @@ class ConnectorBindings(unittest.TestCase):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
         source = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
         ready = restored(kvaf.ReadyToken, (source, 7))
-        runtime.batch_get_raw_addr(1, ready, *arrays, output=None)
+        runtime.batch_get_raw_addr(ready, *arrays, output=None)
+
+    @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
+    def test_recovery_and_detach_accept_connector_identity_objects(self):
+        runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
+        source = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
+        ready = restored(kvaf.ReadyToken, (source, 7))
+        ticket = dict(version=1, source_id=13, epoch=88, bytes=8192, token=3)
+        # Typed arguments reach Runtime without an application-local link ID.
+        with self.assertRaisesRegex(RuntimeError, "no HBM reader"):
+            runtime.resolve_raw_addr(ready=ready)
+        with self.assertRaisesRegex(RuntimeError, "no HBM reader"):
+            runtime.detach_hbm(export_ticket=ticket)
+        for method in (runtime.resolve_raw_addr, runtime.detach_hbm):
+            with self.assertRaises(TypeError):
+                method(1)
 
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_cpu_pull_lengths_remain_batch_put_compatible(self):

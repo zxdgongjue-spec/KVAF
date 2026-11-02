@@ -231,13 +231,14 @@ struct Engine {
 enum class Pending { None, Acquire, Dma, Cleanup, Complete, Cancel };
 struct Connection {
   std::unique_ptr<ReadLink> link;
+  std::string local_eid;
   Engine engine;
   Pending pending{Pending::None};
   std::uint64_t sequence{},last_sequence{};
   bool ready{};
   Status result;
-  Connection(const std::string& a,const HbmReadTicket& t,std::uint32_t c,std::uint32_t j,std::uint32_t b):
-      link(new ReadLink(a,t)),engine(c,j,b){}
+  Connection(const std::string& a,const HbmReadTicket& t,const std::string& eid,std::uint32_t c,std::uint32_t j,std::uint32_t b):
+      link(new ReadLink(a,t)),local_eid(eid),engine(c,j,b){}
   Status Resolve(HbmReadProfile* profile=nullptr) {
     if(pending==Pending::None)return Status::InvalidState("no pending raw READ");
     if(pending==Pending::Dma || engine.uncertain)return Status::InDoubt("raw READ DMA unresolved; retain A output and B source; no READ replay");
@@ -255,8 +256,9 @@ struct Connection {
 struct HbmReader::Impl {
   std::uint32_t device,cores,jettys,budget;
   std::string kernel;
-  LinkId next{1};
-  std::map<LinkId,std::unique_ptr<Connection>> connections;
+  // Registration identity, never an application-maintained local connection ID.
+  using SourceKey = std::pair<std::uint64_t, std::uint64_t>;
+  std::map<SourceKey,std::unique_ptr<Connection>> connections;
   Status Device()const {
     int current=-1;return aclrtGetDevice(&current)==ACL_SUCCESS && current==int(device)?Status::OK():
         Status::InvalidState("select A device before HBM READ operation");
@@ -265,12 +267,21 @@ struct HbmReader::Impl {
 HbmReader::HbmReader(std::uint32_t d,std::uint32_t c,std::uint32_t j,std::uint32_t b,std::string k):
     impl_(new Impl{d,c,j,b,std::move(k)}){}
 HbmReader::~HbmReader(){if(!Shutdown().ok())(void)impl_.release();}
-Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,const std::string& local_eid,LinkId* out) {
+Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,const std::string& local_eid) {
   auto s=impl_->Device();if(!s.ok())return s;
-  if(!out || !ticket.source_id || !ticket.epoch || !ticket.token || !ticket.bytes ||
+  if(address.empty() || !ticket.source_id || !ticket.epoch || !ticket.token || !ticket.bytes ||
       !impl_->cores || !impl_->jettys || impl_->cores*std::uint64_t(impl_->jettys)>offload::kChannelCount ||
       (impl_->budget && impl_->budget<impl_->cores*2) || impl_->kernel.empty())
     return Status::InvalidArgument("configure raw kernel and 1..4 total Jettys for HBM READ");
+  const Impl::SourceKey key{ticket.source_id,ticket.epoch};
+  const auto existing=impl_->connections.find(key);
+  if(existing!=impl_->connections.end()) {
+    const auto& c=*existing->second;
+    if(c.link->ticket.bytes!=ticket.bytes || c.link->ticket.token!=ticket.token ||
+        c.link->address()!=address || c.local_eid!=local_eid)
+      return Status::InvalidArgument("HBM source is already attached with different metadata or route");
+    return c.ready ? Status::OK() : Status::InDoubt("HBM attach/close incomplete; retry detach_hbm with the original export_ticket");
+  }
   if(KvafExecuteBatchGetRawAddrLoadKernel(impl_->kernel.c_str()))return Status::Internal("load batch_get_raw_addr kernel");
   std::vector<npu_eid::NpuLocalEidCandidate> candidates;
   if(local_eid.empty()) {
@@ -282,9 +293,8 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
   s=hr::Exchange(address,discover,{},&info);if(!s.ok())return s;
   if(!info.candidates || info.candidates>256)return Status::Internal("invalid B EID candidate count");
   for(std::uint32_t b=0;b<info.candidates;++b)for(const auto& a:candidates) {
-    *out=impl_->next++;
-    auto owned=std::make_unique<Connection>(address,ticket,impl_->cores,impl_->jettys,impl_->budget);
-    auto& c=*owned;impl_->connections.emplace(*out,std::move(owned));
+    auto owned=std::make_unique<Connection>(address,ticket,local_eid,impl_->cores,impl_->jettys,impl_->budget);
+    auto& c=*owned;impl_->connections.emplace(key,std::move(owned));
     auto request=hr::Make(hr::Command::Open,ticket,c.link->client);request.candidate=b;
     std::memcpy(request.endpoint.eid,a.eid.data(),16);
     hr::Response response{};c.link->opened=true;
@@ -322,7 +332,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
         const auto quiesced=c.engine.QuiesceProbe();
         if(!quiesced.ok()) {
           c.pending=Pending::Dma;
-          return Status::InDoubt("HBM attach probe quarantined; region="+std::to_string(*out)+"; "+s.message()+"; "+quiesced.message());
+          return Status::InDoubt("HBM attach probe quarantined; source="+std::to_string(ticket.source_id)+"; retain original export_ticket; "+s.message()+"; "+quiesced.message());
         }
         s=Status::Internal("startup probe READ failed; transport quiesced: "+s.message());
       }
@@ -336,31 +346,32 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
     }
     if(s.ok()) {
       c.ready=true;
-      std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY region=%llu A_eid=%s B_eid=%s jettys=%u probe=all_lanes_pass\n",
-          (unsigned long long)*out,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->endpoint.eid).c_str(),impl_->cores*impl_->jettys);
+      std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY source=%llu epoch=%llu A_eid=%s B_eid=%s jettys=%u probe=all_lanes_pass\n",
+          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->endpoint.eid).c_str(),impl_->cores*impl_->jettys);
       return s;
     }
-    std::fprintf(stderr,"[KVAF_NPU] HBM_READ_CANDIDATE_REJECTED region=%llu A_eid=%s B_candidate=%u detail=%s\n",
-        (unsigned long long)*out,npu_eid::EidToHex(a.eid).c_str(),b,s.message().c_str());
-    auto cleanup=Detach(*out);
-    if(!cleanup.ok())return Status::InDoubt("HBM attach cleanup pending; region="+std::to_string(*out)+"; "+cleanup.message());
+    std::fprintf(stderr,"[KVAF_NPU] HBM_READ_CANDIDATE_REJECTED source=%llu A_eid=%s B_candidate=%u detail=%s\n",
+        (unsigned long long)ticket.source_id,npu_eid::EidToHex(a.eid).c_str(),b,s.message().c_str());
+    auto cleanup=Detach(ticket);
+    if(!cleanup.ok())return Status::InDoubt("HBM attach cleanup pending; retry detach_hbm with the original export_ticket; "+cleanup.message());
   }
   return s;
 }
-Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
+Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
                        NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
                        bool validate_ranges) {
   if(profile)*profile={};
   ProfileTimer total_timer(profile?&profile->total_us:nullptr);
   const auto validation_begin=profile?ProfileClock::now():ProfileClock::time_point{};
   auto s=impl_->Device();if(!s.ok())return s;
-  auto it=impl_->connections.find(id);
-  if(it==impl_->connections.end())return Status::NotFound("HBM reader link not found");
+  const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
+  if(!source)return Status::InvalidArgument("raw READ requires an NPU Pull ReadyToken");
+  auto it=impl_->connections.find({source->source_id,source->source_epoch});
+  if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not attached");
   auto& c=*it->second;
   if(!c.ready || c.pending!=Pending::None)return Status::Busy("raw READ region not ready or has unresolved work");
-  const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
   const auto& ticket=c.link->ticket;
-  if(!source || !SameSource(*source,{ticket.source_id,ticket.bytes,ticket.epoch}) ||
+  if(!SameSource(*source,{ticket.source_id,ticket.bytes,ticket.epoch}) ||
       !ready.sequence || ready.sequence<=c.last_sequence)
     return Status::InvalidArgument("NPU Pull ReadyToken belongs to another source or consumed batch");
   const auto base=reinterpret_cast<std::uint64_t>(output.data);
@@ -391,12 +402,27 @@ Status HbmReader::Read(LinkId id,const ReadyToken& ready,NpuInt64ArrayView src,N
   c.result=s;c.pending=Pending::Cleanup;
   return c.Resolve(profile);
 }
-Status HbmReader::Resolve(LinkId id){auto s=impl_->Device();if(!s.ok())return s;auto it=impl_->connections.find(id);
-  return it==impl_->connections.end()?Status::NotFound("HBM region not found"):it->second->Resolve();}
-Status HbmReader::Detach(LinkId id){
+Status HbmReader::Resolve(const ReadyToken& ready){
   auto s=impl_->Device();if(!s.ok())return s;
-  auto it=impl_->connections.find(id);if(it==impl_->connections.end())return Status::NotFound("HBM region not found");
+  const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
+  if(!source)return Status::InvalidArgument("raw READ recovery requires an NPU Pull ReadyToken");
+  auto it=impl_->connections.find({source->source_id,source->source_epoch});
+  if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not attached");
+  const auto& ticket=it->second->link->ticket;
+  if(!SameSource(*source,{ticket.source_id,ticket.bytes,ticket.epoch}) ||
+      !ready.sequence || ready.sequence!=it->second->sequence)
+    return Status::InvalidArgument("raw READ recovery token does not match the pending batch");
+  return it->second->Resolve();
+}
+Status HbmReader::Detach(const HbmReadTicket& ticket){
+  auto s=impl_->Device();if(!s.ok())return s;
+  if(!ticket.source_id || !ticket.epoch || !ticket.bytes || !ticket.token)
+    return Status::InvalidArgument("invalid HBM export ticket");
+  auto it=impl_->connections.find({ticket.source_id,ticket.epoch});
+  if(it==impl_->connections.end())return Status::OK(); // Also valid after a fully cleaned failed Attach.
   auto& c=*it->second;
+  if(c.link->ticket.bytes!=ticket.bytes || c.link->ticket.token!=ticket.token)
+    return Status::InvalidArgument("HBM detach ticket does not match the attached source");
   if(c.pending!=Pending::None)return Status::InDoubt("resolve raw READ before detach");
   // Close may destroy queues before a later MR unregister fails. Retrying
   // teardown is safe; admitting another READ on that transport is not.
@@ -406,6 +432,6 @@ Status HbmReader::Detach(LinkId id){
     if(!s.ok() && s.code()!=StatusCode::kNotFound)return s;}
   impl_->connections.erase(it);return Status::OK();
 }
-Status HbmReader::Shutdown(){while(!impl_->connections.empty()){auto s=Detach(impl_->connections.begin()->first);if(!s.ok())return s;}return Status::OK();}
+Status HbmReader::Shutdown(){while(!impl_->connections.empty()){const auto ticket=impl_->connections.begin()->second->link->ticket;auto s=Detach(ticket);if(!s.ok())return s;}return Status::OK();}
 bool HbmReader::pending()const{for(auto& item:impl_->connections)if(item.second->pending!=Pending::None)return true;return false;}
 }

@@ -27,8 +27,6 @@ void BindConnectorTypes(py::module_& m) {
     .value("RUNNING",CpuPullState::Running).value("DONE",CpuPullState::Done)
     .value("FAILED",CpuPullState::Failed).value("IN_DOUBT",CpuPullState::InDoubt)
     .value("COMMITTED",CpuPullState::Committed).value("ABORTED",CpuPullState::Aborted);
-  py::class_<CpuPullSourceHandle>(m,"CpuPullSourceHandle")
-    .def_property_readonly("source",&CpuPullSourceHandle::source);
   py::class_<PutAllocation>(m,"PutEntry")
     .def_readonly("key",&PutAllocation::key).def_readonly("address",&PutAllocation::address)
     .def_readonly("length",&PutAllocation::reserved_length);

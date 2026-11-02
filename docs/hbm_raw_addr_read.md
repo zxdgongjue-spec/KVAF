@@ -23,27 +23,29 @@ ready 不携带范围、不等待生产 stream；应用负责同步。release_ba
 ## 读取端 A
 
 ```python
-link = runtime.attach_hbm(b_address, ticket, local_eid=a_fullmesh_eid)
+runtime.attach_hbm(b_address, ticket, local_eid=a_fullmesh_eid)
 # 收到 ready 后，应用计算三个等长、连续的一维 int64 NPU Tensor。
 with torch.npu.stream(a_stream):
     src = torch.tensor([7, 100003, 250019], dtype=torch.int64, device=output.device)
     dst = torch.tensor([100, 500, 4096], dtype=torch.int64, device=output.device)
     sizes = torch.tensor([1, 656, 100001], dtype=torch.int64, device=output.device)
-runtime.batch_get_raw_addr(link, ready, src, dst, sizes, output, stream=a_stream)
-# 成功后由应用通知 B 释放批次；所有批次结束后 runtime.detach_hbm(link)。
+runtime.batch_get_raw_addr(ready, src, dst, sizes, output, stream=a_stream)
+# 成功后由应用通知 B 释放批次；所有批次结束后 runtime.detach_hbm(ticket)。
 ```
 
 源偏移相对于注册 HBM，目的偏移相对于 output，均以字节计。output 和三数组必须在 Runtime 所在 NPU，连续且存储不重叠。与 BatchGet 默认路径一致，调用方负责保证源/目的范围合法及目的段互不重叠；算子不再做目的区间两两重叠检查，默认也不扫描源/目的边界。`validate_ranges=True` 可启用边界诊断，但仍不检测目的重叠。形状、元数据存储/output 别名、正长度及 WQE 拆分上限检查保留。应用保证元数据在传入 stream 上就绪，并保持到完成/恢复结束。
 
 当前只保留该 NPU Tensor 重载。成功返回 `{"state": "done", "sequence": ready.sequence}`，包含 READ 完成和生产端完成确认。output 按 `(地址, 字节数)` 复用 BatchGet transport 的注册缓存，每批只 Release 引用，detach/shutdown 时统一注销；状态和队列缓冲也跨批复用。Python 绑定保留各缓存 output 的 Tensor 引用直到对应 link 成功 detach 或 runtime 成功 shutdown；期间可读写内容，但不能 resize 或替换底层 storage。C++ 调用方负责保持这些缓冲区的生命周期。同一连接使用越多不同 output，缓存占用也越大，固定 output 的稳定态只注册一次。
 
-未决时用 `resolve_raw_addr(link)` 重试控制或清理，绝不重发 READ；`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
+KVAF 按源身份保存初始化的连接，每批从 `ready.source` 自动查找；应用无需维护本地连接编号。同一 Runtime 可以绑定多个源，分别持有通信资源。关闭时原样传回初始化的 ticket；attach 失败但清理未完成时，同样用 `detach_hbm(ticket)` 重试清理，不解析报错中的内部编号。未决 DMA 仍会阻止关闭。
+
+未决时用原批次的 `resolve_raw_addr(ready)` 重试控制或清理，绝不重发 READ；源身份或批次号不符会被拒绝。`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
 
 可选 `profile=True` 在成功结果中增加 `profile` 字典，单位均为微秒：
 
 ```python
 result = runtime.batch_get_raw_addr(
-    link, ready, src, dst, sizes, output, stream=a_stream, profile=True)
+    ready, src, dst, sizes, output, stream=a_stream, profile=True)
 print(result["profile"])
 ```
 

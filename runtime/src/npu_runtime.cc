@@ -678,13 +678,12 @@ Status NpuRuntime::BatchCpuPull(const BatchPutRequest& request, BatchPutExecutio
     auto result = impl_->local_source->Ready(&impl_->local_ready); if (!result.ok()) return result;
     CpuPullSourceDesc desc;
     result = impl_->local_source->GetDescriptor(&desc); if (!result.ok()) return result;
-    CpuPullSourceHandle source;
-    result = impl_->runtime_core->AttachCpuSource(desc, &source); if (!result.ok()) return result;
+    result = impl_->runtime_core->AttachCpuSource(desc); if (!result.ok()) return result;
     std::vector<std::uint64_t> destinations;
     for (const auto& entry : impl_->local_put.entries())
-      destinations.push_back(entry.address - impl_->runtime_core->remote_region().base);
+      destinations.push_back(entry.address);
     CpuPullTask task;
-    result = impl_->runtime_core->SubmitCpuPull(source, impl_->local_ready, impl_->local_put,
+    result = impl_->runtime_core->SubmitCpuPull(impl_->local_ready, impl_->local_put,
         request.input_offsets, destinations, request.lengths, &task);
     if (!result.ok()) return result;
     CpuPullState state;
@@ -718,7 +717,7 @@ Status NpuRuntime::LastOffloadChecksum(std::uint64_t* checksum) const {
 }
 
 Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ticket,
-                             LinkId* region, const std::string& local_eid) {
+                             const std::string& local_eid) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized()) return Status::NotInitialized("initialize NpuRuntime before attach_hbm");
   if (!impl_->hbm_reader) {
@@ -732,24 +731,24 @@ Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ti
     impl_->hbm_reader = std::make_unique<HbmReader>(device_id(), npu_core_count(), jettys_per_core(),
         impl_->options.batch_get_max_inflight_total, kernel);
   }
-  return impl_->hbm_reader->Attach(address, ticket, local_eid, region);
+  return impl_->hbm_reader->Attach(address, ticket, local_eid);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif
 }
-Status NpuRuntime::AttachCpuSource(const CpuPullSourceDesc& source, CpuPullSourceHandle* handle) {
+Status NpuRuntime::AttachCpuSource(const CpuPullSourceDesc& source) {
   if (!initialized()) return Status::NotInitialized("initialize Runtime before attaching a CPU source");
-  return core().AttachCpuSource(source, handle);
+  return core().AttachCpuSource(source);
 }
 Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* put) {
   if (!initialized()) return Status::NotInitialized("initialize Runtime before PreparePut");
   if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
   return core().PreparePut(keys,lengths,put);
 }
-Status NpuRuntime::SubmitCpuPull(const CpuPullSourceHandle& source,const ReadyToken& ready,const PutHandle& put,
-                                Uint64ArrayView src,Uint64ArrayView dst,Uint64ArrayView lengths,CpuPullTask* task) {
+Status NpuRuntime::SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
+                                Uint64ArrayView src_offsets,Uint64ArrayView dst_addrs,Uint64ArrayView lengths,CpuPullTask* task) {
   if (!initialized()) return Status::NotInitialized("initialize Runtime before CPU Pull");
-  return core().SubmitCpuPull(source,ready,put,src,dst,lengths,task);
+  return core().SubmitCpuPull(ready,put,src_offsets,dst_addrs,lengths,task);
 }
 Status NpuRuntime::QueryCpuPull(const CpuPullTask& task,CpuPullState* state) {
   if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
@@ -767,25 +766,25 @@ Status NpuRuntime::AbortPut(const PutHandle& put) {
   if (!initialized()) return Status::NotInitialized("Runtime is not initialized");
   return core().AbortPut(put);
 }
-Status NpuRuntime::BatchGetRawAddr(LinkId link,const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
+Status NpuRuntime::BatchGetRawAddr(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
                                   NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
                                   bool validate_ranges) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach source HBM before raw READ");
-  return impl_->hbm_reader->Read(link,ready,src,dst,lengths,output,stream,profile,validate_ranges);
+  return impl_->hbm_reader->Read(ready,src,dst,lengths,output,stream,profile,validate_ranges);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif
 }
-Status NpuRuntime::ResolveRawAddr(LinkId region) {
+Status NpuRuntime::ResolveRawAddr(const ReadyToken& ready) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->hbm_reader) return impl_->hbm_reader->Resolve(region);
+  if (impl_->hbm_reader) return impl_->hbm_reader->Resolve(ready);
 #endif
   return Status::NotInitialized("no HBM reader");
 }
-Status NpuRuntime::DetachHbm(LinkId region) {
+Status NpuRuntime::DetachHbm(const HbmReadTicket& ticket) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->hbm_reader) return impl_->hbm_reader->Detach(region);
+  if (impl_->hbm_reader) return impl_->hbm_reader->Detach(ticket);
 #endif
   return Status::NotInitialized("no HBM reader");
 }

@@ -158,7 +158,7 @@ def main():
         child.close()
         address, ticket = receive(parent, "export")
         waiting_for_attach = True
-        link = runtime.attach_hbm(address, ticket, local_eid=args.npu_eid_a_raw)
+        runtime.attach_hbm(address, ticket, local_eid=args.npu_eid_a_raw)
         parent.send(("attached", True))
         waiting_for_attach = False
         stream = torch.npu.Stream(device=args.device_a)
@@ -195,7 +195,7 @@ def main():
             stream.synchronize()
             instrumented = iteration >= normal_rounds
             begin = time.perf_counter_ns()
-            result = runtime.batch_get_raw_addr(link, ready, src, dst, lengths, output,
+            result = runtime.batch_get_raw_addr(ready, src, dst, lengths, output,
                                                stream=stream, profile=instrumented, validate_ranges=args.validate_ranges)
             elapsed_us = (time.perf_counter_ns() - begin) / 1000
             verify_begin = time.perf_counter_ns()
@@ -216,7 +216,7 @@ def main():
                     event_errors.add(result["profile"]["kernel_event_error"])
             parent.send(("reuse", iteration))
             assert receive(parent, "released") == iteration
-        runtime.detach_hbm(link)
+        runtime.detach_hbm(ticket)
         parent.send(("detached", None))
         receive(parent, "closed")
         worker.join(10)
@@ -245,6 +245,7 @@ def main():
         traceback.print_exc()
         if waiting_for_attach and not runtime.pending_raw_addr:
             try:
+                runtime.detach_hbm(ticket)
                 parent.send(("attached", False))
                 receive(parent, "closed")
                 worker.join(10)

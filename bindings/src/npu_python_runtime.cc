@@ -294,22 +294,22 @@ class NpuPythonRuntime final {
   py::dict OffloadRegion() const {
     OffloadRegionTicket ticket; ThrowIfError(native_->GetOffloadRegion(&ticket)); return remote_python::Pack(ticket);
   }
-  CpuPullSourceHandle AttachCpuSource(const CpuPullSourceDesc& source) {
-    CpuPullSourceHandle result; ThrowIfError(native_->AttachCpuSource(source,&result)); return result;
+  void AttachCpuSource(const CpuPullSourceDesc& source) {
+    ThrowIfError(native_->AttachCpuSource(source));
   }
   PutHandle PreparePut(const py::object& keys,const py::object& lengths) {
     std::vector<std::uint64_t> sizes;
     CopyCpuUint64SequenceInto(lengths,"lengths",&sizes);
     PutHandle put; ThrowIfError(native_->PreparePut(CopyPrepareKeys(keys),sizes,&put)); return put;
   }
-  CpuPullTask SubmitCpuPull(const CpuPullSourceHandle& source,const ReadyToken& ready,const PutHandle& put,
-                           const py::object& src,const py::object& dst,const py::object& lengths) {
+  CpuPullTask SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
+                           const py::object& src,const py::object& dst_addrs,const py::object& lengths) {
     std::vector<std::uint64_t> sources, destinations, sizes;
     CopyCpuUint64SequenceInto(src, "src_offsets", &sources);
-    CopyCpuUint64SequenceInto(dst, "dst_offsets", &destinations);
+    CopyCpuUint64SequenceInto(dst_addrs, "dst_addrs", &destinations);
     CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
     CpuPullTask task;
-    const auto status=native_->SubmitCpuPull(source,ready,put,sources,destinations,sizes,&task);
+    const auto status=native_->SubmitCpuPull(ready,put,sources,destinations,sizes,&task);
     if(!status.ok()) throw std::runtime_error(status.message()+"; recover the original task via put.task");
     return task;
   }
@@ -327,19 +327,18 @@ class NpuPythonRuntime final {
   std::uint64_t LastChecksum() const { std::uint64_t hash{}; ThrowIfError(native_->LastOffloadChecksum(&hash)); return hash; }
 #endif
 
-  std::uint64_t AttachHbm(const std::string& address, const py::dict& ticket, const std::string& eid) {
-    LinkId region{};
-    auto status = native_->AttachHbm(address, hbm_read_python::Ticket(ticket), &region, eid);
-    if (!status.ok()) throw std::runtime_error(status.message() + "; region=" + std::to_string(region));
-    return region;
+  void AttachHbm(const std::string& address, const py::dict& ticket, const std::string& eid) {
+    ThrowIfError(native_->AttachHbm(address, hbm_read_python::Ticket(ticket), eid));
   }
-  void ResolveRawAddr(LinkId region) {
-    const auto status = native_->ResolveRawAddr(region);
+  void ResolveRawAddr(const ReadyToken& ready) {
+    const auto status = native_->ResolveRawAddr(ready);
     if (!native_->pending_raw_addr()) raw_retained_ = py::none();
     ThrowIfError(status);
   }
-  py::dict BatchGetRawArrays(LinkId region,const ReadyToken& ready,const py::object& src,const py::object& dst,
+  py::dict BatchGetRawArrays(const ReadyToken& ready,const py::object& src,const py::object& dst,
                          const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges) {
+    const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
+    if(!source)throw py::value_error("raw READ requires an NPU Pull ReadyToken");
     auto array = [&](const py::object& tensor, const char* name) {
       const auto view = GetNpuTensorView(tensor, name);
       if (view.shape.size() != 1 || view.element_bytes != sizeof(std::int64_t) ||
@@ -364,13 +363,13 @@ class NpuPythonRuntime final {
     const auto acl_stream=acl_python::StreamFromPython(stream);
     // Transport caches (address, size) registrations until detach. Pin their
     // Python owners for the same lifetime so allocator reuse cannot alias an MR.
-    const py::int_ region_key(region);
-    if(!raw_outputs_.contains(region_key))raw_outputs_[region_key]=py::dict();
-    auto outputs=raw_outputs_[region_key].cast<py::dict>();
+    const auto source_key=py::make_tuple(source->source_id,source->source_epoch,source->source_bytes);
+    if(!raw_outputs_.contains(source_key))raw_outputs_[source_key]=py::dict();
+    auto outputs=raw_outputs_[source_key].cast<py::dict>();
     outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data),view.bytes)]=output;
     raw_retained_=py::make_tuple(src,dst,lengths,output,stream);
     HbmReadProfile profile;
-    const auto status=native_->BatchGetRawAddr(region,ready,sources,destinations,sizes,
+    const auto status=native_->BatchGetRawAddr(ready,sources,destinations,sizes,
         {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr,validate_ranges);
     if(!native_->pending_raw_addr())raw_retained_=py::none();
     ThrowIfError(status);
@@ -391,9 +390,10 @@ class NpuPythonRuntime final {
     }
     return result;
   }
-  void DetachHbm(LinkId region) {
-    ThrowIfError(native_->DetachHbm(region));
-    raw_outputs_.attr("pop")(py::int_(region),py::none());
+  void DetachHbm(const py::dict& export_ticket) {
+    const auto ticket=hbm_read_python::Ticket(export_ticket);
+    ThrowIfError(native_->DetachHbm(ticket));
+    raw_outputs_.attr("pop")(py::make_tuple(ticket.source_id,ticket.epoch,ticket.bytes),py::none());
   }
   bool PendingRawAddr() const { return native_->pending_raw_addr(); }
 
@@ -708,14 +708,14 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("batch_get_raw_addr_kernel_object_path") = "")
       .def("attach_hbm", &NpuPythonRuntime::AttachHbm, py::arg("address"), py::arg("export_ticket"), py::arg("local_eid") = "")
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
-           py::arg("hbm_link"),py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
+           py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
            "Synchronously read peer HBM. profile=True adds Host stage timings and a device event "
            "interval around the kernel to the returned profile dictionary; profiling is off by default. "
            "Output registrations and their Tensors are retained until detach/shutdown; do not resize their storage. "
            "Callers guarantee valid, disjoint ranges. validate_ranges=True enables bounds diagnostics only.")
-      .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("region"))
-      .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("region"))
+      .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
+      .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("export_ticket"))
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
       .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("source"),
@@ -726,8 +726,10 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("offload_region", &NpuPythonRuntime::OffloadRegion)
       .def("attach_cpu_source",&NpuPythonRuntime::AttachCpuSource,py::arg("source_desc"))
       .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
-      .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("source_handle"),py::arg("ready"),py::arg("put"),
-           py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"))
+      .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("ready"),py::arg("put"),
+           py::arg("src_offsets"),py::arg("dst_addrs"),py::arg("lengths"),
+           "Submit CPU READ using an attached ReadyToken source and absolute DDR destination "
+           "addresses from put.entries. The three Host arrays must be equally sized.")
       .def("query_cpu_pull",&NpuPythonRuntime::QueryCpuPull,py::arg("task"))
       .def("wait_cpu_pull",&NpuPythonRuntime::WaitCpuPull,py::arg("task"),py::arg("timeout")=30000,
            "Wait for DMA only; timeout is in milliseconds. Commit explicitly afterward.")
