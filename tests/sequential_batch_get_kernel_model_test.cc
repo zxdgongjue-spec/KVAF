@@ -105,16 +105,19 @@ struct Fixture {
   std::vector<KvafBatchGetDirectUrmaEntity> control_entities, data_entities;
   std::vector<std::unique_ptr<ModelQueue>> queues;
   std::vector<uint64_t> notified;
+  std::vector<uint64_t> read_vf_begin, read_overlap_begin;
   std::vector<uint32_t> ack_reads;
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{}, data_timeout{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   uint64_t launch_vf_begin{};
+  uint64_t descriptor_cache_lines{}, valid_table_cache_lines{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
         indices(n), offsets(n), rows(n), status(cores), profiles(cores), states(cores * 2),
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
+        read_vf_begin(cores), read_overlap_begin(cores),
         ack_reads(cores), cpu_done(cores) {
     fixture = this;
     const uint64_t source_bytes = uint64_t(n) * bytes * 2;
@@ -178,6 +181,14 @@ struct Fixture {
     }
   }
   void Poll(void* p) {
+    if (args.mode == KVAF_SEQ_GATHER) {
+      const auto address = Address(p);
+      if (address >= args.workspace + args.descriptor_offset &&
+          address < args.workspace + args.workspace_bytes) ++descriptor_cache_lines;
+      // Ignore partial boundary lines which unrelated allocations can share.
+      if (address >= Address(valid.data()) && address + 64 <= Address(valid.data()) + valid.size())
+        ++valid_table_cache_lines;
+    }
     if (args.mode != KVAF_SEQ_SCATTER || Address(p) < (args.workspace & ~uint64_t(63)) ||
         Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
     auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(workspace.data());
@@ -194,6 +205,27 @@ struct Fixture {
     const uint64_t done = ((args.sequence + (future_done ? 1 : 0)) << 32) | (remote_error ? 5 : 1);
     std::memcpy(workspace.data() + 128, &done, 8);
     push_done = true; ++push_requests;
+  }
+  void CheckDescriptor(uint32_t worker) {
+    assert(aiv_model::raw_copies.empty());  // Ready before the NIC reads HBM.
+    const uint32_t first = uint64_t(active) * worker / workers;
+    const uint32_t last = uint64_t(active) * (worker + 1) / workers;
+    const auto* local = workspace.data() + args.descriptor_offset + worker * args.lane_descriptor_bytes;
+    const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(local);
+    assert(h->magic == kvaf::peer::kGatherDescriptorMagic && h->sequence == args.sequence);
+    assert(h->staging_address == args.remote_staging + worker * args.lane_staging_bytes);
+    assert(h->span_count == last - first && h->total_bytes == (last - first) * token);
+    assert(!h->pipeline_chunk_bytes && h->span_bytes == token && !h->ready_bytes);
+    const auto* spans = reinterpret_cast<const kvaf::peer::GatherSpan*>(local + sizeof(*h));
+    for (uint32_t i = first; i < last; ++i) {
+      const auto& span = spans[i - first];
+      assert(span.address == addresses[indices[i]] + offsets[i]);
+      assert(span.length == token && !span.reserved);
+    }
+    const auto bytes = sizeof(*h) + (last - first) * sizeof(*spans);
+    const auto padded = Align(bytes);
+    for (uint64_t i = bytes; i < padded; ++i) assert(local[i] == 0);
+    for (uint64_t i = padded; i < args.lane_descriptor_bytes; ++i) assert(local[i] == 0xa7);
   }
   void Doorbell(uint32_t value, uint32_t* p) {
     for (uint32_t q = 0; q < workers * 2; ++q) {
@@ -213,7 +245,8 @@ struct Fixture {
       for (const auto& previous : m.posted)
         for (uint32_t i = 0; i < previous.blocks * 16; ++i)
           assert(m.sq[(previous.pi * 16 + i) % m.sq.size()] == previous.words[i]);
-      if (!m.doorbells) m.first_db_vfs = aiv_model::vf_calls - launch_vf_begin;
+      if (!m.doorbells)
+        m.first_db_vfs = aiv_model::vf_calls - (q % 2 ? launch_vf_begin : read_vf_begin[worker]);
       ++m.doorbells;
       const uint64_t end = m.pi + uint32_t(value - uint32_t(m.pi));
       auto word = [&](uint64_t base, uint32_t index) {
@@ -254,6 +287,9 @@ struct Fixture {
           if (reached == 0x1f) assert(p.ack_done_cycle >= p.notify_done_cycle);
         }
         uint64_t remote_address = uint64_t(word(m.pi, 10)) | (uint64_t(word(m.pi, 11)) << 32);
+        if (q % 2 && op == kWrite &&
+            remote_address == args.remote_descriptor + worker * args.lane_descriptor_bytes)
+          CheckDescriptor(worker);
         if (q % 2 && op == kRead && remote_address == args.remote_control + worker * 64 + 8) {
           if (!timeout && ++ack_reads[worker] == 3) {
             auto* c = reinterpret_cast<kvaf::peer::GatherControl*>(args.remote_control) + worker;
@@ -265,6 +301,8 @@ struct Fixture {
             cpu.Copy();
             c->ack = args.sequence | (remote_error ? kErrorBit : 0);
             cpu_done[worker] = true;
+            read_vf_begin[worker] = aiv_model::vf_calls;
+            read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
           }
         }
         if (!(q % 2)) {
@@ -310,6 +348,8 @@ struct Fixture {
   void Run(bool success = true, bool allow_partial = false) {
     const auto cycles = aiv_model::cycle;
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+    if (args.mode == KVAF_SEQ_GATHER)
+      std::fill(workspace.begin() + args.descriptor_offset, workspace.end(), 0xa7);
     expected = output;
     if (success && active >= 0) {
       for (uint32_t core = 0; core < workers; ++core) {
@@ -344,6 +384,7 @@ struct Fixture {
       // through the public GM/UB copy helpers used by scatter.
       assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
       assert(!push_requests);
+      assert(!descriptor_cache_lines && !valid_table_cache_lines);
     }
     if (success) assert(output == expected);
     else if (!allow_partial) CheckGuard();
@@ -391,6 +432,31 @@ void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 int main() {
   const auto& metadata = KvafGatherBatchGetAivKernelV3_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
+  // Header/span/tail contents are checked before the descriptor's first NIC
+  // WRITE. Stress 128-thread tails, both 24-KiB banks, lane boundaries, and a
+  // smaller launch after a larger one without relying on zeroed HBM/UB.
+  for (uint32_t cores : {1U, 3U, 8U}) {
+    Fixture f(65536, 13, cores, KVAF_SEQ_GATHER, 6);
+    f.args.gather_probe = KVAF_GATHER_PROBE_ACK; f.EnableProfile();
+    for (uint32_t count : {0U, 1U, 127U, 128U, 129U, 1532U * cores,
+                           1533U * cores, 1533U * cores + 1U, 3069U * cores,
+                           3070U * cores, 65536U, 1U, 65536U}) {
+      f.Next(count);
+      f.args.gather_probe = count ? KVAF_GATHER_PROBE_ACK : KVAF_GATHER_PROBE_NONE;
+      const auto overlap = aiv_model::vf_with_pending_mte3;
+      f.Run();
+      for (uint32_t core = 0; core < cores; ++core) {
+        const auto rows = uint64_t(count) * (core + 1) / cores - uint64_t(count) * core / cores;
+        assert(f.profiles[core].valid_mask == (rows ? 0x5f : 0x7f));
+        if (!rows) {
+          const auto* lane = f.workspace.data() + f.args.descriptor_offset + core * f.args.lane_descriptor_bytes;
+          for (uint64_t i = 0; i < f.args.lane_descriptor_bytes; ++i) assert(lane[i] == 0xa7);
+        }
+      }
+      if (cores == 1 && count > 1533) assert(aiv_model::vf_with_pending_mte3 > overlap);
+      assert(!f.data_reads);
+    }
+  }
   for (uint32_t probe = KVAF_GATHER_PROBE_ACK; probe <= KVAF_GATHER_PROBE_FIRST_READ; ++probe)
     for (uint32_t cores : {1U, 3U, 8U}) {
       Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, 6);
@@ -401,9 +467,12 @@ int main() {
         std::vector<uint64_t> before(cores);
         for (uint32_t c = 0; c < cores; ++c) before[c] = f.queues[c * 2]->doorbells;
         f.Run();
+        // All nonempty lanes now configure descriptor MTE3. ACK/WQE probes
+        // must still avoid configuring the subsequent data-SQ MTE3 path.
+        const auto descriptor_config = 4 * std::min(count, cores);
         if (probe <= KVAF_GATHER_PROBE_WQE)
-          assert(aiv_model::ub_to_out_config_writes == config_writes);
-        else assert(aiv_model::ub_to_out_config_writes > config_writes);
+          assert(aiv_model::ub_to_out_config_writes == config_writes + descriptor_config);
+        else assert(aiv_model::ub_to_out_config_writes > config_writes + descriptor_config);
         for (uint32_t c = 0; c < cores; ++c) {
           const auto rows = uint64_t(count) * (c + 1) / cores - uint64_t(count) * c / cores;
           const auto added = f.queues[c * 2]->doorbells - before[c];
@@ -423,13 +492,12 @@ int main() {
   {
     Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
     f.DataQueueDepth(32768); f.EnableProfile();
-    const auto overlap = aiv_model::vf_with_pending_mte3;
     f.Run(); f.CheckProfiles();
     const auto& q = *f.queues[0];
     assert(q.doorbells == 11 && q.cq_completed == 1 && q.first_db_vfs == 2);
     assert(f.profiles[0].data_wrs == 1366 && f.profiles[0].data_wqebbs == 4097);
     assert(f.profiles[0].data_doorbells == 11);
-    assert(aiv_model::vf_with_pending_mte3 > overlap);
+    assert(aiv_model::vf_with_pending_mte3 > f.read_overlap_begin[0]);
     f.Next(8193); f.Run(); f.CheckProfiles();
   }
   // Bank/tail boundaries for every SGL, including a partially populated last
@@ -470,9 +538,8 @@ int main() {
     const uint32_t sgl = token < 65536 ? 6 : 1;
     Fixture f(19, token, 1, KVAF_SEQ_GATHER, sgl);
     f.DataQueueDepth(520); f.EnableProfile();
-    const auto vf = aiv_model::vf_calls;
     f.Run(); f.CheckProfiles();
-    assert((aiv_model::vf_calls > vf) == (uint64_t(token) * sgl <= 65536));
+    assert((aiv_model::vf_calls > f.read_vf_begin[0]) == (uint64_t(token) * sgl <= 65536));
     f.Next(7); f.Run(); f.CheckProfiles();
   }
   {

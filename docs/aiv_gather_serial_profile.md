@@ -10,6 +10,34 @@ AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 边界不变，因此 `input_us` 不会归零。此变更只需重新编译 gather kernel，
 不改变 Host/Python ABI 或 CPU 服务。
 
+## 地址清单的 SIMT 构造与批量搬运
+
+`input` 已移除不再使用的 `valid_table` 缓存 Flush。地址表、indices、offsets、
+output_indices、请求数的缓存维护和基础参数检查继续保留。
+
+`descriptor` 不再由 Scalar 逐条写 HBM 后遍历整份清单 Flush，改为：
+
+1. 128 个 SIMT 线程分步并行读取 indices/offsets/address_table，在 UB 中生成
+   源地址、length 和 reserved；48 B 头部也在 UB 内生成，协议布局不变。
+2. 两个 24 KiB UB bank 交替使用，SIMT 构造下一块时，MTE3 将上一块批量写入
+   本 lane 的 HBM 清单。首块最多 1533 条 span，后续整块最多 1536 条。
+3. 最后一块向上补齐到 64 B，仅写本 lane 已分配的对齐空间；发送 CPU 的字节数
+   仍是 `48 + 16 * 请求数`，不包含补齐字节。
+4. 等待最后一次 MTE3 完成后才结束 `descriptor` 阶段、进入控制 WRITE 发布。
+   HBM 清单全程由 MTE3 写入，没有 Scalar 缓存脏行，不再执行整份清单 Flush。
+   全部 bank/event 在返回前回收，后续 READ 阶段复用同一组 UB。
+
+队列实体检查、每条 span 的 length/reserved、CPU gather 和 ACK 协议均保持不变。
+`descriptor_us` 仍包含队列准备、清单生成和可供网卡读取前的完成等待，六阶段
+口径不变。8193 请求、1 核时，清单分为 6 次 VF 构造和 6 次 MTE3 搬运。
+本地模型验证内容、边界和同步；实际收益和设备缓存可见性需在 950DT 上复测。
+
+本轮只需重新编译 gather kernel：
+
+```bash
+cmake --build build-npu --target kvaf_gather_batch_get_kernel -j
+```
+
 ## 参数在哪里修改
 
 直接编辑性能脚本顶部的配置区：
@@ -227,7 +255,7 @@ UB WQE 区间，并展开最多 6 个 SGE 的写入，避免额外的私有临�
 | stage | 实际完成的范围 | 数据输出 |
 | --- | --- | --- |
 | ack | 输入缓存处理、清单、控制 WRITE、CPU gather 和最终 ACK | 全部保持 guard |
-| wqe | ack + 首批 SIMT WQE 构造，并等待 VF→Scalar 完成；跳过 MTE3 配置 | 全部保持 guard；未写 SQ |
+| wqe | ack + 首批 SIMT WQE 构造，并等待 VF→Scalar 完成；跳过数据 SQ 的 MTE3 配置 | 全部保持 guard；未写 SQ |
 | sq | ack + 首批 VF 与 UB→SQ MTE3 完成 | 全部保持 guard；未敲数据 doorbell |
 | first_read | ack + 每个非空 lane 首批最多 128 READ WR，等待有序尾 CQ | 核对已读前缀及其余 guard |
 | full | 关闭所有探针，运行原有完整输出回归 | 核对全部数据、guard、批次/stream 复用 |
@@ -235,6 +263,8 @@ UB WQE 区间，并展开最多 6 个 SGE 的写入，避免额外的私有临�
 wqe/sq 检查点验证相应执行单元已完成，不单独声称 WQE 内容已逐字校验；
 first_read/full 进一步验证实际 payload。前缀不留下已发布但未完成的 READ。
 输入为空不会被 Host 当成有效诊断；探针禁止异步调用和性能 profile。
+当前 ack 以前已包含清单的 SIMT/MTE3，因此 wqe 仅跳过后续数据 SQ 的 MTE3；
+若 ack 尚未通过，不能根据 wqe 失败将故障直接定位到 READ WQE 构造。
 
 沿用原来的 kernel/Python/CPU 服务环境，更新并完整重编后执行一个命令：
 
@@ -306,8 +336,9 @@ WQE 构造检查；没有运行到 SQ payload 搬运、数据 doorbell 或数据
 2. 为 gather 导出显式 `FunLevelKType / K_TYPE_AIV` 元数据，与 BatchPut 和
    direct_read 一致。独立二进制和 Host launch 配置见
    [CANN 9.1 官方 AIV 调度示例](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/commlib/commopdev/docs/en/comm_op_dev_guide/aiv_comm_op_dev/op_dispatch.md)。
-3. wqe 检查点跳过 MTE3 的 loop/atomic 配置；sq、first_read 和正常流水继续
-   执行原有配置，使 wqe 的故障范围只包含 VF 准备、构造及完成等待。
+3. wqe 检查点跳过数据 SQ 的 MTE3 loop/atomic 配置；sq、first_read 和正常
+   流水继续执行原有配置。在 ack 已通过的前提下，wqe 新增范围只包含
+   READ WQE 的 VF 准备、构造及完成等待。
 
 ABI 仍为 V3 / args 232 B / profile 192 B，已有 V3 Host 可以只重编 gather
 kernel。它们是针对已定位范围的修正，不等于已证明 507015 的具体根因。
@@ -338,7 +369,7 @@ SU/MTE/VF 错误位，可继续对照本次二进制定位，不能沿用旧二�
 | 阶段 | 边界 |
 | --- | --- |
 | 输入准备 | kernel 入口 → 输入缓存处理、请求数检查和本 lane 分区完成；逐请求校验已关闭 |
-| 清单构造 | 输入准备完成 → 清单构造、flush 完成 |
+| 清单构造 | 输入准备完成 → 队列准备、清单 SIMT 构造和 UB→HBM MTE3 完成 |
 | 请求发布 | 清单完成 → descriptor、command、notify 的 WRITE 完成 |
 | 等待 CPU | notify WRITE 完成 → 观察到最终 ACK |
 | 数据 READ | 最终 ACK → 全部数据 READ 的 CQ 完成，包含 WQE 构造和容量回收 |
