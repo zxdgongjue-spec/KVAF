@@ -5,6 +5,11 @@ AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 功能回归仍使用 `tests/python/test_aiv_gather_batch_get.py`；性能采集使用
 `tests/python/test_aiv_gather_batch_get_perf.py`。
 
+当前 gather 与 direct 一样，关闭 AIV 的逐请求 `ValidateRows` 校验；输入由
+调用方保证合法。输入缓存维护、基础参数和请求数检查仍保留，六阶段打点
+边界不变，因此 `input_us` 不会归零。此变更只需重新编译 gather kernel，
+不改变 Host/Python ABI 或 CPU 服务。
+
 ## 参数在哪里修改
 
 直接编辑性能脚本顶部的配置区：
@@ -167,7 +172,7 @@ CPU 成本时另跑一轮诊断，不将开启 CPU 日志的结果作为无打�
 ## AIV 内部流水版
 
 这次将三项优化合在同一版本中，CPU 协议、每核一个控制 Jetty 和一个数据
-Jetty、输入校验和六阶段计时边界保持原样。数据仍由 NIC 从 CPU staging
+Jetty 和六阶段计时边界保持原样。数据仍由 NIC 从 CPU staging
 直接 READ 到离散输出，UB 只存 WQE，不存 payload。
 
 1. 每次最多发布 128 条 READ WQE。发布后继续准备后续 WQE，直到物理 SQ
@@ -221,7 +226,7 @@ UB WQE 区间，并展开最多 6 个 SGE 的写入，避免额外的私有临�
 
 | stage | 实际完成的范围 | 数据输出 |
 | --- | --- | --- |
-| ack | 输入校验、清单、控制 WRITE、CPU gather 和最终 ACK | 全部保持 guard |
+| ack | 输入缓存处理、清单、控制 WRITE、CPU gather 和最终 ACK | 全部保持 guard |
 | wqe | ack + 首批 SIMT WQE 构造，并等待 VF→Scalar 完成；跳过 MTE3 配置 | 全部保持 guard；未写 SQ |
 | sq | ack + 首批 VF 与 UB→SQ MTE3 完成 | 全部保持 guard；未敲数据 doorbell |
 | first_read | ack + 每个非空 lane 首批最多 128 READ WR，等待有序尾 CQ | 核对已读前缀及其余 guard |
@@ -332,7 +337,7 @@ SU/MTE/VF 错误位，可继续对照本次二进制定位，不能沿用旧二�
 
 | 阶段 | 边界 |
 | --- | --- |
-| 输入准备 | kernel 入口 → 输入缓存处理与本 lane 校验完成 |
+| 输入准备 | kernel 入口 → 输入缓存处理、请求数检查和本 lane 分区完成；逐请求校验已关闭 |
 | 清单构造 | 输入准备完成 → 清单构造、flush 完成 |
 | 请求发布 | 清单完成 → descriptor、command、notify 的 WRITE 完成 |
 | 等待 CPU | notify WRITE 完成 → 观察到最终 ACK |
@@ -393,8 +398,8 @@ Python/Host、CPU gather、控制握手和状态回收的整批延迟比较。81
 核数，但 gather 仍只有两条数据队列。串行基线中的 gather 逐项构造清单、标量写
 SQ 及 flush；在全部 READ WQE 能放进物理队列时，数据阶段末尾才敲 doorbell。
 原 direct 则已有 SIMT 分批 WQE 构造、UB/MTE 提交和内部流水。本次已将
-这些 WQE 优化引入 gather 的快速路径。direct 虽保留 SIMT 校验函数，当前
-调用被注释；gather 继续执行输入校验，对比时需要明确这项差别。
+这些 WQE 优化引入 gather 的快速路径。当前 direct 和 gather 的逐请求校验
+调用均已注释；gather 仍保留输入缓存维护和基础检查，总耗时仍计入全部六阶段。
 实际瓶颈仍以阶段数据为准。
 
 `invalid gather profile` 在同步及普通执行状态检查通过后产生。新异常包含

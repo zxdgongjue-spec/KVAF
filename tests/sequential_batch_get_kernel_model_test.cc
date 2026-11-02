@@ -515,8 +515,12 @@ int main() {
   {
     Fixture large_token(19, 65535, 3, KVAF_SEQ_GATHER, 6);
     large_token.EnableProfile(); large_token.Run(); large_token.CheckProfiles();
+    // Exercise the unchecked gather path with safe addresses and rows.
+    Fixture unchecked(7, 656, 1, KVAF_SEQ_GATHER, 6);
+    std::fill(unchecked.valid.begin(), unchecked.valid.end(), 0);
+    unchecked.EnableProfile(); unchecked.Run(); unchecked.CheckProfiles();
     Fixture invalid(7, 656, 1, KVAF_SEQ_GATHER, 6);
-    invalid.EnableProfile(); invalid.rows[0] = -1; invalid.Run(false);
+    invalid.EnableProfile(); invalid.active = -1; invalid.Run(false);
     assert(invalid.profiles[0].result == KVAF_SEQ_INVALID);
     assert(invalid.profiles[0].valid_mask == 0x41);
     Fixture timeout(7, 656, 1, KVAF_SEQ_GATHER, 6);
@@ -705,8 +709,10 @@ int main() {
     Fixture large(65536, 1, 1, mode, 6); large.Run();
     Fixture negative(7, 656, 1, mode, 6); negative.active = -1; negative.Run(false);
     Fixture excessive(7, 656, 1, mode, 6); excessive.active = 8; excessive.Run(false);
-    Fixture invalid(7, 656, 1, mode, 6); invalid.rows[0] = -1; invalid.Run(false);
-    Fixture bad_source(7, 656, 1, mode, 6); bad_source.addresses[bad_source.indices[0]] = 1; bad_source.Run(false);
+    if (mode == KVAF_SEQ_SCATTER) {
+      Fixture invalid(7, 656, 1, mode, 6); invalid.rows[0] = -1; invalid.Run(false);
+      Fixture bad_source(7, 656, 1, mode, 6); bad_source.addresses[bad_source.indices[0]] = 1; bad_source.Run(false);
+    }
     Fixture timeout(7, 656, 1, mode, 6); timeout.timeout = true; timeout.Run(false);
     Fixture error(7, 656, 1, mode, 6); error.remote_error = true; error.Run(false);
   }
