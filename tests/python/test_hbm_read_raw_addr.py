@@ -1,7 +1,9 @@
-"""A BatchPut/BatchGet DDR + CPU Pull B HBM1 + A raw READ B HBM2.
+"""A BatchPut/BatchGet DDR + CPU and NPU Pull from the same B tensors.
 
 Run with the existing CPU service. The B source control listener is embedded
 in the spawned producer process; payload never travels through its Pipe/TCP.
+Both paths independently register the same 1..4096 tensors. Each round reads
+one selected tensor through both paths before allowing B to reuse its storage.
 """
 import argparse
 import multiprocessing as mp
@@ -21,21 +23,23 @@ def producer(pipe, args, ddr_ticket):
 
     torch.npu.set_device(args.device_b)
     stream = torch.npu.Stream(device=args.device_b)
-    hbm_cpu = torch.zeros(SOURCE_BYTES, dtype=torch.uint8, device=f"npu:{args.device_b}")
-    # Exercise a contiguous Tensor whose address is deliberately not page aligned.
-    hbm_a_tensors = []
+    # Both paths register these exact tensors, including their unaligned starts.
+    tensors = []
     for i in range(args.hbm_mrs):
         storage = torch.zeros(SOURCE_BYTES + 8192 + i * 64, dtype=torch.uint8, device=f"npu:{args.device_b}")
         raw_offset = (-storage.data_ptr()) % 4096 + 0xC00
         tensor = storage[raw_offset:raw_offset + SOURCE_BYTES + i * 64]
         assert tensor.is_contiguous() and tensor.data_ptr() % 4096 == 0xC00
-        hbm_a_tensors.append(tensor)
+        tensors.append(tensor)
     cpu_source = kvaf.CpuPullHbmSource(args.device_b, args.npu_eid_b_cpu)
     a_source = kvaf.NpuPullHbmSource(args.device_b, args.npu_eid_b_raw)
-    raw_batch = None
+    hbm = tensors[0]
+    cpu_batch = raw_batch = None
     try:
-        cpu_desc = cpu_source.register(ddr_ticket, hbm_cpu)
-        ticket = a_source.register(hbm_a_tensors if args.hbm_mrs > 1 else hbm_a_tensors[0])
+        registration = tensors if args.hbm_mrs > 1 else tensors[0]
+        cpu_desc = cpu_source.register(ddr_ticket, registration)
+        ticket = a_source.register(registration)
+        assert cpu_desc.mr_count == args.hbm_mrs
         port = a_source.listen("127.0.0.1:0")
         pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
         pipe.send(("cpu_source", cpu_desc))
@@ -47,21 +51,25 @@ def producer(pipe, args, ddr_ticket):
             return
         assert a_source.connected
         for round_id in range(args.rounds):
-            hbm_a = hbm_a_tensors[round_id % args.hbm_mrs]
+            hbm = tensors[round_id % args.hbm_mrs]
+            cpu_batch = raw_batch = None
             with torch.npu.stream(stream):
-                hbm_cpu.copy_(pattern(torch, round_id), non_blocking=True)
-                hbm_a[:SOURCE_BYTES].copy_(pattern(torch, round_id + 101), non_blocking=True)
+                hbm[:SOURCE_BYTES].copy_(pattern(torch, round_id), non_blocking=True)
             stream.synchronize()
-            cpu_batch = cpu_source.ready()
-            raw_batch = a_source.ready(hbm_a) if args.hbm_mrs > 1 else a_source.ready()
-            try:
-                a_source.release_batch(raw_batch)
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("B reused HBM before A's READ")
+            cpu_batch = cpu_source.ready(hbm) if args.hbm_mrs > 1 else cpu_source.ready()
+            raw_batch = a_source.ready(hbm) if args.hbm_mrs > 1 else a_source.ready()
+            assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
+            assert raw_batch.source.mr_count == args.hbm_mrs
+            for source, batch in ((cpu_source, cpu_batch), (a_source, raw_batch)):
+                try:
+                    source.release_batch(batch)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("B released shared HBM before its consumer completed")
             pipe.send(("ready", (cpu_batch, raw_batch)))
-            receive(pipe, "reuse")
+            # A sends this only after BOTH reads and all verification complete.
+            assert receive(pipe, "reuse") == round_id
             cpu_source.release_batch(cpu_batch)
             a_source.release_batch(raw_batch)
             assert not cpu_source.frozen and not a_source.frozen
@@ -73,13 +81,15 @@ def producer(pipe, args, ddr_ticket):
     except BaseException:
         pipe.send(("error", traceback.format_exc()))
         try:
-            if a_source.frozen and raw_batch is not None:
-                try:
-                    a_source.release_batch(raw_batch)
-                except RuntimeError:
-                    a_source.cancel_batch(raw_batch)
-            if cpu_source.frozen:
-                cpu_source.cancel_batch(cpu_source.ready())
+            for source, batch in ((a_source, raw_batch), (cpu_source, cpu_batch)):
+                if source.frozen:
+                    # Recover the same MR if Ready failed before returning its token.
+                    if batch is None:
+                        batch = source.ready(hbm) if args.hbm_mrs > 1 else source.ready()
+                    try:
+                        source.release_batch(batch)
+                    except RuntimeError:
+                        source.cancel_batch(batch)
             a_source.shutdown()
             cpu_source.shutdown()
         except Exception as error:
@@ -100,7 +110,8 @@ def main():
     parser.add_argument("--batch-get-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_kernels.o")
     parser.add_argument("--batch-put-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o")
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
-    parser.add_argument("--hbm-mrs", type=int, default=1, help="separate NPU Pull tensors sharing one connection")
+    parser.add_argument("--hbm-mrs", type=int, default=1,
+                        help="shared source tensors, independently registered for both CPU and NPU Pull")
     parser.add_argument("--rounds", type=int, default=None)
     args = parser.parse_args()
     if not 1 <= args.hbm_mrs <= 4096:
@@ -148,7 +159,7 @@ def main():
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
         for round_id in range(args.rounds):
             cpu_batch, raw_batch = receive(parent, "ready")
-            assert raw_batch.mr_id == round_id % args.hbm_mrs + 1
+            assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
             put = runtime.prepare_put(KEYS, [656] * 3)
             source_offsets = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
             cpu_destinations = torch.tensor([e.address for e in put.entries],
@@ -168,7 +179,7 @@ def main():
                 raw_lengths = torch.tensor(RAW_LENGTHS, dtype=torch.int64, device=output.device)
             runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
                                       raw_lengths, output, stream=stream)
-            raw_expected = pattern(torch, round_id + 101)
+            raw_expected = cpu_expected  # Both paths read this round's same tensor contents.
             expected = torch.full((110000,), 0xCC, dtype=torch.uint8)
             for src, dst, n in zip(OFFSETS, RAW_DESTINATIONS, RAW_LENGTHS):
                 expected[dst:dst + n] = raw_expected[src:src + n]
@@ -182,14 +193,15 @@ def main():
             parent.send(("reuse", round_id))
             assert receive(parent, "released") == round_id
             print(f"HBM_RAW_ROUND_PASS round={round_id} mr_id={raw_batch.mr_id} raw_bytes={sum(RAW_LENGTHS)} "
-                  "ddr_batch_get=1 cpu_pull=1 padding_checked=1 npu_consumer_checked=1", flush=True)
+                  "ddr_batch_get=1 cpu_pull=1 shared_source_tensors=1 padding_checked=1 npu_consumer_checked=1", flush=True)
         runtime.detach_hbm(export)
         parent.send(("detached", None))
         receive(parent, "closed")
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        print(f"HBM_RAW_PASS npu_mrs={args.hbm_mrs} cpu_mrs=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1", flush=True)
+        print(f"HBM_RAW_PASS npu_mrs={args.hbm_mrs} cpu_mrs={args.hbm_mrs} "
+              "shared_source_tensors=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1", flush=True)
     except BaseException:
         traceback.print_exc()
         if producer_waiting_for_attach and not runtime.pending_raw_addr and not runtime.pending_offload:

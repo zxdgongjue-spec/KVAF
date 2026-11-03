@@ -48,7 +48,7 @@ B 的普通 BatchPut、BatchGet、本卡 Offload 和跨卡 CPU Pull 共用一个
 
 两个对象共用底层 `Exporter` 的 HBM 注册、地址对齐、资源创建和清理代码，但分别持有注册、连接和状态。CPU 与 NPU 对端的描述符格式、TP 绑定和控制协议仍分别处理，不合并资源实例。
 
-按当前场景，A 的两块 HBM 分别由这两个对象管理。对象本身留在 A 进程内，不能通过 Connector 序列化发送。
+两个对象可以分别注册不同的 HBM，也可以独立注册同一份 tensor 列表；注册和连接实例仍各自持有。共享底层 tensor 时，应用等待两条路径均完成并释放批次后才能覆写它。对象本身留在生产端进程内，不能通过 Connector 序列化发送。
 
 ## 4. 描述符、批次和地址结构
 
@@ -607,7 +607,7 @@ python tests/python/test_hbm_read_raw_addr.py \
 
 上述 EID/设备对应此前同机验收配置，构建目录按实际路径替换。两个旧测试脚本的参数名称继续沿用 **device-a 为读取端、device-b 为生产端**，与本文设计中的 A/B 角色命名相反。
 
-CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checksum 和批次复用确认。组合验收同时覆盖共享 DDR 的普通 BatchPut/BatchGet、CPU Pull 和三数组 NPU 直读，包括非页对齐源、输出间隔及 NPU 消费者校验。本卡便利入口另外通过 `python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7` 验证；该脚本无需 AIV 算子。
+CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checksum 和批次复用确认。组合验收同时覆盖共享 DDR 的普通 BatchPut/BatchGet、CPU Pull 和三数组 NPU 直读，包括非页对齐源、输出间隔及 NPU 消费者校验。组合脚本的 `--hbm-mrs` 同时控制 CPU/NPU Pull 独立注册的同一份 tensor 列表，每轮选择同一个 tensor，等待两条路径完成后复用。本卡便利入口另外通过 `python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7` 验证；该脚本无需 AIV 算子。
 
 需要同时重新编译 NPU 运行库和 raw-address kernel object。当前入口为 `KvafExecuteBatchGetRawAddrAivKernelV2`，使用扩展的参数与最终状态 ABI；旧 V1 object 会拒绝加载。已删除独立准备算子及其状态 ABI。
 

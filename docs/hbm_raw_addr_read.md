@@ -163,16 +163,16 @@ python tests/python/test_hbm_read_raw_addr.py \
 脚本自动启动 B 子进程和 B 的临时控制监听端口。在同一个 A runtime 中逐轮验证：
 
 1. A BatchPut 写入 DDR 的 marker 保持正确。
-2. CPU Pull B HBM₁ 到共享 DDR，A BatchGet 读回并逐字节比较。
-3. A 直接 READ B HBM₂ 的 1/656/100001 字节三段，检查目的位置间隔、padding 和 NPU 消费者可见性。
-   HBM₂ 使用页内偏移为 `0xc00` 的连续 Tensor view，覆盖非页对齐的注册场景。
-4. B 两块缓冲区分别收到确认后复用，内容每轮变化。
+2. CPU Pull 本轮选中的 B tensor 到共享 DDR，A BatchGet 读回并逐字节比较。
+3. A 直接 READ 同一个 B tensor 的 1/656/100001 字节三段，检查目的位置间隔、padding 和 NPU 消费者可见性。
+   两条路径独立注册相同的 tensor 列表；tensor 使用页内偏移为 `0xc00` 的连续 view，覆盖非页对齐的注册场景。
+4. 每轮只生产一次数据，两条路径分别对照同一份期望值验证。A 在 CPU Pull 和 NPU Pull 均完成且校验通过后通知 B，B 释放两条路径的批次后才复用源；内容每轮变化。
 5. 先释放批次、A detach、B shutdown，最后关闭 A runtime。
 
 可独立指定 `--npu-eid-a`（DDR）、`--npu-eid-a-raw`（A—B，A 的 fullmesh）、
 `--npu-eid-b-cpu`（CPU—B）、`--npu-eid-b-raw`（A—B，B 的 fullmesh）。
-加 `--hbm-mrs 78` 即让 B 为 NPU Pull 注册 78 个不同大小、非页对齐的 tensor，逐轮选择并复用同一个 output；不指定 rounds 时自动运行至少两轮完整 MR 轮换（156 批）。
-成功输出 `HBM_RAW_PASS npu_mrs=78 cpu_mrs=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1`（单 MR 为 npu_mrs=1）。
+`--hbm-mrs` 同时控制两条路径的源 tensor 数量。设置 78 时，B 只分配 78 个不同大小、非页对齐的 tensor，由 CPU Pull 和 NPU Pull 分别注册，因此各有 78 个 MR、各自共用一组连接；设置 1 时两条路径注册同一个 tensor。每轮两条路径选择相同索引，NPU 读取复用同一个 output。不指定 rounds 时默认 `max(3, 2 * hbm_mrs)`，78 MR 对应 156 批。
+成功输出 `HBM_RAW_PASS npu_mrs=78 cpu_mrs=78 shared_source_tensors=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1`（单 MR 时两项均为 1）。
 出现 unresolved 时测试会保留进程/缓冲区，需先检查两端日志和确认传输停止。
 若 attach 已明确失败且没有未解决的传输，A 会通知 B 关闭源，避免 B 等待 attached 超时。
 
