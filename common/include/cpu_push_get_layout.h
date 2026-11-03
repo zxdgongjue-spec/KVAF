@@ -21,35 +21,6 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
   *out = l;
   return true;
 }
-struct Range { std::uint32_t begin{}, end{}; };
-inline std::uint32_t RowsPerCacheGroup(std::uint32_t bytes) {
-  auto divisor = 64U;
-  while (divisor) {
-    const auto remainder = bytes % divisor;
-    bytes = divisor; divisor = remainder;
-  }
-  return 64 / bytes;
-}
-inline std::uint32_t ActiveWorkers(std::uint32_t count, std::uint32_t bytes,
-                                   std::uint32_t workers) {
-  const auto quantum = RowsPerCacheGroup(bytes);
-  return std::min(workers, (count + quantum - 1) / quantum);
-}
-// Worker boundaries own complete staging cache lines.
-inline Range WorkerRange(std::uint32_t count, std::uint32_t bytes,
-                         std::uint32_t worker, std::uint32_t workers) {
-  const auto active = ActiveWorkers(count, bytes, workers);
-  if (worker >= active) return {count, count};
-  const auto quantum = RowsPerCacheGroup(bytes);
-  const auto groups = (count + quantum - 1) / quantum;
-  return {groups * worker / active * quantum,
-          std::min(groups * (worker + 1) / active * quantum, count)};
-}
-inline std::uint32_t ChunkCount(Range r) { return (r.end - r.begin + kChunkRows - 1) / kChunkRows; }
-inline Range ChunkRange(Range r, std::uint32_t chunk) {
-  const auto begin = r.begin + chunk * kChunkRows;
-  return {begin, std::min(r.end, begin + kChunkRows)};
-}
 template <class Emit>
 void ForEachPipelineChunk(std::uint32_t count, std::uint32_t bytes,
                           std::uint32_t workers, Emit emit) {

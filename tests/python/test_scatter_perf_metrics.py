@@ -81,9 +81,13 @@ class ScatterPerfTests(unittest.TestCase):
             args = arguments([])
             self.assertEqual((args.fused_build, args.double_buffer), (1, 1))
             self.assertEqual(args.simt_build, 1)
+            self.assertEqual(args.pipeline, 1)
         with patch.dict("os.environ", {"KVAF_SCATTER_SIMT_BUILD": "0"}):
             self.assertEqual(arguments([]).simt_build, 0)
             self.assertEqual(arguments(["--simt-build", "1"]).simt_build, 1)
+        with patch.dict("os.environ", {"KVAF_SCATTER_PIPELINE": "0"}):
+            self.assertEqual(arguments([]).pipeline, 0)
+            self.assertEqual(arguments(["--pipeline", "1"]).pipeline, 1)
         with patch.dict("os.environ", {"KVAF_SCATTER_FUSED_BUILD": "1",
                                       "KVAF_SCATTER_DOUBLE_BUFFER": "1"}):
             args = arguments([])
@@ -96,7 +100,7 @@ class ScatterPerfTests(unittest.TestCase):
                                       "KVAF_SCATTER_DOUBLE_BUFFER": "0"}):
             args = arguments([])
             self.assertEqual((args.fused_build, args.double_buffer), (0, 0))
-        for name in ("KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER", "KVAF_SCATTER_SIMT_BUILD"):
+        for name in ("KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER", "KVAF_SCATTER_SIMT_BUILD", "KVAF_SCATTER_PIPELINE"):
             with patch.dict("os.environ", {name: "ON"}), \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 arguments([])
@@ -167,6 +171,28 @@ class ScatterPerfTests(unittest.TestCase):
         self.assertEqual(sorted(sources), list(range(4096)))
         self.assertEqual(sorted(rows[:4096]), list(range(4096)))
         self.assertTrue(all(part[4096:] == [-1] * 4096 for part in (indices, offsets, rows)))
+
+    def test_pipeline_active_copies_overlap_notify_without_double_counting(self):
+        records = profiles(cores=1, requests=8192)
+        r = records[0]
+        base = r["start_cycle"]
+        r.update(pipeline=1, scatter_start_cycle=base + 40, scatter_finish_cycle=base + 130,
+                 scatter_cycles=60, ready_wait_cycles=40, scatter_chunks=8)
+        metrics = profile_metrics(records, 1, 8192, 656, 1000)
+        self.assertEqual(metrics["pipeline"], 1)
+        self.assertEqual(metrics["aiv_scatter_ns"], 60)
+        self.assertEqual(metrics["aiv_scatter_tail_ns"], 40)
+        self.assertEqual(metrics["aiv_ready_wait_ns"], 40)
+        result = sample_metrics(dict(payload_bytes=8192 * 656, end_to_end_ns=200, **metrics))
+        self.assertEqual(result["end_to_end_ns"], sum(result[key] for key in (
+            "call_outside_aiv_ns", "aiv_input_wall_ns", "aiv_build_notify_ns",
+            "aiv_notify_to_done_ns", "aiv_scatter_tail_ns")))
+        self.assertNotEqual(metrics["aiv_scatter_ns"], metrics["aiv_scatter_tail_ns"])
+        for field, value in (("scatter_cycles", 100), ("ready_wait_cycles", 100),
+                             ("scatter_finish_cycle", base + 141), ("scatter_chunks", 0)):
+            broken = [dict(r, **{field: value})]
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                profile_metrics(broken, 1, 8192, 656, 1000)
 
     def test_aicpu_reference_reads_one_token_per_block(self):
         args = arguments(["--workload", "one-token-per-block", "--output-row-step", "2"])
@@ -295,7 +321,7 @@ class ScatterPerfTests(unittest.TestCase):
                 reader = csv.DictReader(stream)
                 rows = list(reader)
                 self.assertEqual(reader.fieldnames, list(CSV_COLUMNS))
-            self.assertEqual(len(CSV_COLUMNS), 32)
+            self.assertEqual(len(CSV_COLUMNS), 34)
             self.assertFalse(any(k.endswith("_ns") for k in CSV_COLUMNS))
             self.assertEqual([r["phase"] for r in rows], ["baseline", "profiled"])
             self.assertEqual(rows[1]["cpu_comm_us"], "0.500")

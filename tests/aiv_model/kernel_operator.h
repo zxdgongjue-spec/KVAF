@@ -112,6 +112,7 @@ inline thread_local uintptr_t mte2_source_begin{}, mte2_source_end{};
 inline thread_local uintptr_t descriptor_begin{}, descriptor_end{};
 inline thread_local uintptr_t address_table_begin{}, address_table_end{};
 inline thread_local std::vector<std::pair<uintptr_t, uintptr_t>> metadata_sources;
+inline void (*payload_observer)(const void*, uint64_t) = nullptr;
 inline bool IsMetadata(const void* source, uint64_t bytes) {
   const auto address = reinterpret_cast<uintptr_t>(source);
   for (const auto& region : metadata_sources)
@@ -125,6 +126,7 @@ inline void CheckMte2Source(const void* source, uint64_t bytes) {
   const auto address = reinterpret_cast<uintptr_t>(source);
   if (address < mte2_source_begin || address > mte2_source_end ||
       bytes > mte2_source_end - address) std::abort();
+  if (payload_observer) payload_observer(source, bytes);
 }
 }
 inline void set_flag(int source, int target, event_t event) {

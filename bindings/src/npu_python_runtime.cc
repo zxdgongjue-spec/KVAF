@@ -488,6 +488,12 @@ class NpuPythonRuntime final {
       item["cpu_comm_ns"] = profile.cpu_comm_ns;
       item["cpu_post_ns"] = profile.cpu_post_ns;
       item["cpu_cq_wait_ns"] = profile.cpu_cq_wait_ns;
+      item["pipeline"] = profile.pipeline;
+      item["scatter_cycles"] = profile.scatter_cycles;
+      item["ready_wait_cycles"] = profile.ready_wait_cycles;
+      item["scatter_start_cycle"] = profile.scatter_start_cycle;
+      item["scatter_finish_cycle"] = profile.scatter_finish_cycle;
+      item["scatter_chunks"] = profile.scatter_chunks;
       if (!core && host_profile_enabled_ && host_profile_ready_) {
         py::dict host;
         for (std::size_t phase = 0; phase < scatter_host::kCount; ++phase)

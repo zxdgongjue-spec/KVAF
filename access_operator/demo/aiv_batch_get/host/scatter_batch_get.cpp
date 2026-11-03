@@ -228,16 +228,19 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.config.aiv_batch_get_mode != "cpu_push_scatter" ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
-  bool fused_build, double_buffer, simt_build;
+  bool fused_build, double_buffer, simt_build, pipeline;
   auto result = ReadSwitch("KVAF_SCATTER_FUSED_BUILD", &fused_build);
   if (!result.ok()) return result;
   result = ReadSwitch("KVAF_SCATTER_DOUBLE_BUFFER", &double_buffer);
   if (!result.ok()) return result;
   result = ReadSwitch("KVAF_SCATTER_SIMT_BUILD", &simt_build);
   if (!result.ok()) return result;
+  result = ReadSwitch("KVAF_SCATTER_PIPELINE", &pipeline);
+  if (!result.ok()) return result;
   // Read once per initialization, never from the timed Execute path.
   s.args.reserved = kScatterOptionsV1 | (fused_build ? kScatterFusedBuild : 0U) |
-      (double_buffer ? kScatterDoubleBuffer : 0U) | (simt_build ? kScatterSimtBuild : 0U);
+      (double_buffer ? kScatterDoubleBuffer : 0U) | (simt_build ? kScatterSimtBuild : 0U) |
+      (pipeline ? kScatterPipeline : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
@@ -262,8 +265,8 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u simt_build=%u build=%s\n",
-               unsigned(fused_build), unsigned(double_buffer), unsigned(simt_build),
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS version=1 fused_build=%u double_buffer=%u simt_build=%u pipeline=%u build=%s\n",
+               unsigned(fused_build), unsigned(double_buffer), unsigned(simt_build), unsigned(pipeline),
                fused_build ? (simt_build ? "parallel_simt" : "parallel_ub") : "serial_two_pass");
   return Status::OK();
 }
@@ -348,6 +351,11 @@ Status ScatterBatchGet::CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfi
     if (p.magic != kScatterProfileMagic || p.sequence != s.sequence ||
         !p.start_cycle || p.inputs_ready_cycle < p.start_cycle ||
         p.done_cycle < p.inputs_ready_cycle || p.finish_cycle < p.done_cycle ||
+        p.pipeline != ScatterOptionEnabled(s.args.reserved, kScatterPipeline) ||
+        (p.requests && (!p.scatter_cycles || !p.scatter_chunks ||
+            p.scatter_start_cycle < p.inputs_ready_cycle ||
+            p.scatter_finish_cycle > p.finish_cycle || p.scatter_finish_cycle <= p.scatter_start_cycle ||
+            p.scatter_cycles > p.scatter_finish_cycle - p.scatter_start_cycle)) ||
         p.bytes != p.requests * s.config.batch_get_token_bytes ||
         (!core && p.notify_cycle && (p.notify_cycle < p.inputs_ready_cycle || p.notify_cycle > p.done_cycle)))
       return Error("invalid scatter profile; rebuild Host and AIV kernel together");

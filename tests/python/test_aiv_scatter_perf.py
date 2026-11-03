@@ -20,13 +20,13 @@ from scatter_perf_common import (HOST_TIMINGS, PAYLOAD_TIMINGS, RANDOM_SOURCE_CH
 # Stable compact layout, including for baseline-only or profiled-only runs.
 # Raw ns, worker cycles and less common diagnostics remain in the JSON report.
 CSV_COLUMNS = (
-    "phase", "iteration", "sequence", "cores", "fused_build", "double_buffer",
+    "phase", "iteration", "sequence", "cores", "fused_build", "double_buffer", "pipeline",
     "request_length", "miss_count", "token_bytes", "payload_bytes",
     "end_to_end_us", "end_to_end_gbps", "cpu_comm_us", "cpu_comm_gbps",
     "aiv_build_notify_us", "aiv_scatter_us", "aiv_scatter_gbps",
     "cpu_write_us", "cpu_write_gbps", "aiv_body_us", "aiv_body_gbps",
     "aiv_wall_us", "aiv_wall_gbps", "aiv_input_wall_us", "aiv_notify_to_done_us",
-    "aiv_scatter_tail_us", "call_outside_aiv_us",
+    "aiv_scatter_tail_us", "aiv_ready_wait_us", "call_outside_aiv_us",
     "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
     "host_stream_sync_us", "host_python_dispatch_us",
 )
@@ -49,6 +49,8 @@ def arguments(argv=None):
                         help="parallel SIMT list builder (0: UB/DMA); default: KVAF_SCATTER_SIMT_BUILD or 1")
     parser.add_argument("--double-buffer", type=int, choices=(0, 1),
                         help="runtime UB overlap; default: KVAF_SCATTER_DOUBLE_BUFFER or 1")
+    parser.add_argument("--pipeline", type=int, choices=(0, 1),
+                        help="overlap CPU WRITE and AIV scatter with chunk Ready (default: 1)")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
@@ -72,7 +74,7 @@ def arguments(argv=None):
     parser.add_argument("--json", type=Path)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
-    for field in ("fused_build", "double_buffer", "simt_build"):
+    for field in ("fused_build", "double_buffer", "simt_build", "pipeline"):
         if getattr(args, field) is None:
             name = "KVAF_SCATTER_" + field.upper()
             value = os.environ.get(name, "1")
@@ -182,9 +184,11 @@ def write_results(args, report):
             for phase, samples in report["samples"].items():
                 for sample in samples:
                     values = dict(phase=phase, cores=args.cores, fused_build=args.fused_build,
-                                  double_buffer=args.double_buffer, request_length=args.request_length,
+                                  double_buffer=args.double_buffer,
+                                  request_length=args.request_length,
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
                                   **sample_metrics(sample))
+                    values.setdefault("pipeline", args.pipeline)
                     row = {}
                     for key in CSV_COLUMNS:
                         value = values.get(key, "")
@@ -218,6 +222,7 @@ def main(argv=None):
     output_rows = args.output_row_step * args.request_length + 2
     config = vars(args).copy()
     config.update(device_id=device_id, mode="cpu_push_scatter",
+                  pipeline_chunk_rows=1024,
                   units="decimal GB/s; sample durations ns/us; summary durations ms",
                   cpu_service=os.environ.get("KVAF_CPU_SERVICE_ADDR"),
                   npu_eids=os.environ.get("KVAF_NPU_EIDS"),
@@ -271,6 +276,7 @@ def main(argv=None):
         os.environ["KVAF_SCATTER_FUSED_BUILD"] = str(args.fused_build)
         os.environ["KVAF_SCATTER_SIMT_BUILD"] = str(args.simt_build)
         os.environ["KVAF_SCATTER_DOUBLE_BUFFER"] = str(args.double_buffer)
+        os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
@@ -362,7 +368,7 @@ def main(argv=None):
             # Non-payload subphases get latency statistics, without misleading bandwidths.
             for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns",
                         "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns",
-                        "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns",
+                        "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_ready_wait_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns",
                         *HOST_TIMINGS, "host_python_dispatch_ns"):
                 if key in samples[0]:
                     values = [s[key] for s in samples]

@@ -4,7 +4,7 @@ import random
 import statistics
 
 CPU_MAGIC = 0x4B56414650524631
-PROFILE_MAGIC = 0x4B56415343505231
+PROFILE_MAGIC = 0x4B56415343505232
 
 # Python 3.11 Random.randbytes(n) calls getrandbits(n * 8), whose bit count
 # must fit a C int. Keep chunks word-aligned so seeded output is identical to
@@ -133,6 +133,7 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
     if len(records) != cores or [r["core"] for r in records] != list(range(cores)):
         raise ValueError("profile core count/order mismatch")
     sequence = records[0]["sequence"]
+    pipeline = records[0].get("pipeline", 0)
     for core, r in enumerate(records):
         expected_requests = requests * (core + 1) // cores - requests * core // cores
         if (r["magic"] != PROFILE_MAGIC or not sequence or r["sequence"] != sequence
@@ -140,6 +141,19 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
             raise ValueError("profile sequence/magic/payload mismatch")
         if not 0 < r["start_cycle"] <= r["inputs_ready_cycle"] <= r["done_cycle"] <= r["finish_cycle"]:
             raise ValueError("invalid AIV timeline")
+        if r.get("pipeline", 0) != pipeline or pipeline not in (0, 1):
+            raise ValueError("inconsistent scatter pipeline mode")
+        if pipeline or "scatter_cycles" in r:
+            start, finish = r.get("scatter_start_cycle", 0), r.get("scatter_finish_cycle", 0)
+            active, waiting = r.get("scatter_cycles", 0), r.get("ready_wait_cycles", 0)
+            if expected_requests:
+                if not (r["inputs_ready_cycle"] <= start < finish <= r["finish_cycle"]
+                        and 0 < active <= finish - start and r.get("scatter_chunks", 0) > 0):
+                    raise ValueError("invalid scatter copy timeline")
+            elif start or finish or active or r.get("scatter_chunks", 0):
+                raise ValueError("idle core reported scatter copies")
+            if waiting < 0 or active + waiting > r["finish_cycle"] - r["inputs_ready_cycle"]:
+                raise ValueError("invalid scatter wait/copy accounting")
     cpu = records[0]
     if not cpu["inputs_ready_cycle"] <= cpu["notify_cycle"] <= cpu["done_cycle"]:
         raise ValueError("invalid notify timeline")
@@ -156,11 +170,13 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
     result = {key: cpu[key] for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_write_ns",
                                        "cpu_comm_ns", "cpu_post_ns", "cpu_cq_wait_ns")}
     result.update(
+        pipeline=pipeline,
         aiv_body_ns=max(r["finish_cycle"] - r["start_cycle"] for r in records) * ns_per_cycle,
         aiv_input_ns=max(r["inputs_ready_cycle"] - r["start_cycle"] for r in records) * ns_per_cycle,
         aiv_build_notify_ns=(cpu["notify_cycle"] - cpu["inputs_ready_cycle"]) * ns_per_cycle,
         aiv_notify_to_done_ns=(cpu["done_cycle"] - cpu["notify_cycle"]) * ns_per_cycle,
-        aiv_scatter_ns=max(r["finish_cycle"] - r["done_cycle"] for r in records) * ns_per_cycle,
+        aiv_scatter_ns=max(r.get("scatter_cycles", r["finish_cycle"] - r["done_cycle"])
+                           for r in records) * ns_per_cycle,
         # All AIV timestamps use the same system counter. These wall intervals
         # form a non-overlapping timeline even when worker launches are skewed.
         aiv_wall_ns=(last_finish - first_start) * ns_per_cycle,
@@ -168,6 +184,8 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
         aiv_scatter_tail_ns=(last_finish - cpu["done_cycle"]) * ns_per_cycle,
         aiv_launch_skew_ns=(max(r["start_cycle"] for r in records) - first_start) * ns_per_cycle,
     )
+    if all("ready_wait_cycles" in r for r in records):
+        result["aiv_ready_wait_ns"] = max(r["ready_wait_cycles"] for r in records) * ns_per_cycle
     host = cpu.get("host_profile")
     if host is not None:
         if any(key not in host or not math.isfinite(host[key]) or host[key] < 0

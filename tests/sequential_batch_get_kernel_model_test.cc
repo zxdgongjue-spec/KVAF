@@ -15,6 +15,7 @@
 #include "kernel_operator.h"
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
+#include "cpu_push_get_layout.h"
 #include "sequential_batch_get_abi.h"
 // The CPU model exercises the kernel body, without Ascend ELF section placement.
 #define __attribute__(...)
@@ -107,6 +108,11 @@ struct Fixture {
   std::vector<uint32_t> ack_reads;
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
+  bool hold_done_until_scatter{}, copied_before_done{}, stall_ready{}, future_ready{}, error_after_scatter{};
+  struct PushPart { uint32_t worker, chunk; kvaf::cpu_push::Range range; };
+  std::vector<PushPart> push_parts;
+  std::vector<bool> payload_read;
+  uint32_t push_step{}, read_rows{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   std::mutex poll_mutex;
 
@@ -116,6 +122,8 @@ struct Fixture {
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
         ack_reads(cores), cpu_done(cores) {
     fixture = this;
+    aiv_model::payload_observer = [](const void* p, uint64_t bytes) { fixture->PayloadRead(p, bytes); };
+    payload_read.resize(n);
     const uint64_t source_bytes = uint64_t(n) * bytes * 2;
     const uint64_t lane_staging = Align(uint64_t((n + cores - 1) / cores) * bytes);
     const uint64_t lane_descriptor = Align(48 + uint64_t((n + cores - 1) / cores) * 16);
@@ -176,7 +184,8 @@ struct Fixture {
     auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(workspace.data());
     const auto notify = aiv_model::AtomicLoadWord(args.workspace + 64);
     if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
-    CheckGuard();
+    const bool pipeline = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline);
+    if (!pipeline) CheckGuard();
     if (timeout || ++push_polls < 4) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
     assert(request->count == uint32_t(active));
@@ -186,17 +195,63 @@ struct Fixture {
         assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
     }
     const auto* src = reinterpret_cast<const uint64_t*>(workspace.data() + args.descriptor_offset);
-    for (uint32_t i = 0; i < uint32_t(active); ++i)
-      std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
-                  reinterpret_cast<void*>(src[i]), token);
-    const uint64_t done = ((args.sequence + (future_done ? 1 : 0)) << 32) | (remote_error ? 5 : 1);
+    if (pipeline && !remote_error && !future_done) {
+      if (push_parts.empty()) kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
+          [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
+            push_parts.push_back({worker, chunk, range});
+          });
+      if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
+        const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
+        const auto q = push_step % kvaf::cpu_push::kJettyCount;
+        const auto rows = part.range.end - part.range.begin;
+        const auto base = rows / kvaf::cpu_push::kJettyCount, rem = rows % kvaf::cpu_push::kJettyCount;
+        const auto begin = part.range.begin + q * base + std::min(q, rem);
+        const auto end = begin + base + (q < rem);
+        for (auto i = begin; i < end; ++i)
+          std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
+                      reinterpret_cast<void*>(src[i]), token);
+        if (!stall_ready || q != 3) aiv_model::AtomicStoreWord(
+            args.workspace + 192 + part.worker * 64 + q * 8,
+            kvaf::cpu_push::Progress(args.sequence + future_ready, part.chunk + 1));
+        ++push_step;
+        return; // Delay other queues/chunks and final done until later polls.
+      }
+      if (stall_ready || (hold_done_until_scatter && read_rows < uint32_t(active))) return;
+    } else {
+      for (uint32_t i = 0; i < uint32_t(active); ++i)
+        std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
+                    reinterpret_cast<void*>(src[i]), token);
+    }
+    const uint64_t done = ((args.sequence + (future_done ? 1 : 0)) << 32) |
+        ((remote_error || error_after_scatter) ? 5 : 1);
     if (notify & kvaf::cpu_push::kProfileNotify) {
-      assert(request->reserved == (kvaf::cpu_push::kInlineProfile | kvaf::cpu_push::kBatchDoneOnly));
+      assert(request->reserved == (kvaf::cpu_push::kInlineProfile |
+          (pipeline ? 0U : kvaf::cpu_push::kBatchDoneOnly)));
       const uint64_t report[] = {kvaf::cpu_push::ProfileToken(args.sequence), 11, 22, 1000, 800, 200, 500};
       std::memcpy(workspace.data() + 136, report, sizeof(report));
     }
     push_done = true; ++push_requests;
     aiv_model::AtomicStoreWord(args.workspace + 128, done);
+  }
+  void PayloadRead(const void* p, uint64_t bytes) {
+    if (!kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline)) return;
+    std::lock_guard<std::mutex> lock(poll_mutex);
+    const auto offset = Address(p) - args.workspace - args.staging_offset;
+    const auto begin = offset / token, end = (offset + bytes + token - 1) / token;
+    assert(end <= uint32_t(active));
+    for (uint32_t i = begin; i < end; ++i) {
+      for (uint32_t worker = 0; worker < workers; ++worker) {
+        const auto range = kvaf::cpu_push::WorkerRange(active, token, worker, workers);
+        if (i < range.begin || i >= range.end) continue;
+        const auto chunk = (i - range.begin) / kvaf::cpu_push::kChunkRows + 1;
+        for (uint32_t q = 0; q < kvaf::cpu_push::kJettyCount; ++q) {
+          const auto progress = aiv_model::AtomicLoadWord(args.workspace + 192 + worker * 64 + q * 8);
+          assert(progress >> 32 == args.sequence && uint32_t(progress) >= chunk);
+        }
+      }
+      if (!payload_read[i]) { payload_read[i] = true; ++read_rows; }
+    }
+    copied_before_done |= !push_done;
   }
   void Doorbell(uint32_t value, uint32_t* p) {
     for (uint32_t q = 0; q < workers * 2; ++q) {
@@ -328,6 +383,8 @@ struct Fixture {
     std::fill(cpu_done.begin(), cpu_done.end(), false);
     std::fill(ack_reads.begin(), ack_reads.end(), 0);
     push_done = false; push_polls = 0;
+    push_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
+    std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
     for (uint64_t i = 0; i < args.source_bytes; ++i) remote[i] ^= 0x35;
     std::reverse(indices.begin(), indices.end());
@@ -484,7 +541,7 @@ int main() {
     small_workspace.Run(false);
     assert(!small_workspace.push_requests);
   }
-  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 32U,
+  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 64U,
                              kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     invalid.args.reserved = options; invalid.Run(false);
@@ -594,10 +651,11 @@ int main() {
       }
   for (const auto options : {0U, kScatterOptions[0], kScatterOptions[1],
                              kScatterOptions[2], kScatterOptions[3],
-                             kScatterOptions[3] | kvaf::kScatterSimtBuild})
+                             kScatterOptions[3] | kvaf::kScatterSimtBuild,
+                             kScatterOptions[3] | kvaf::kScatterSimtBuild | kvaf::kScatterPipeline})
     for (uint32_t workers : {1U, 3U, 8U}) {
       Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
-      f.status.resize(workers * 3); // 64-byte statuses + 128-byte records.
+      f.status.resize(workers * 4); // 64-byte statuses + 192-byte V2 records.
       f.args.request.core_status = Address(f.status.data());
       f.args.reserved = kvaf::ScatterWithProfiling(options, true);
       assert(kvaf::ScatterOptionsValid(f.args.reserved));
@@ -613,6 +671,8 @@ int main() {
           assert(p.inputs_ready_cycle <= p.done_cycle && p.done_cycle <= p.finish_cycle);
           const auto requests = uint64_t(count) * (core + 1) / workers - uint64_t(count) * core / workers;
           assert(p.requests == requests && p.bytes == requests * 656);
+          assert(p.pipeline == kvaf::ScatterOptionEnabled(f.args.reserved, kvaf::kScatterPipeline));
+          assert(bool(p.scatter_cycles) == bool(requests));
           if (!core && count) {
             assert(p.notify_cycle >= p.inputs_ready_cycle && p.done_cycle >= p.notify_cycle);
             assert(p.cpu_magic == kvaf::cpu_push::ProfileToken(f.args.sequence) && p.cpu_comm_ns == 800);
@@ -621,6 +681,48 @@ int main() {
         }
       }
     }
+  // The producer deliberately withholds final done until payload DMA has
+  // started. A whole-batch-only consumer times out; a pipelined consumer must
+  // copy only fully published chunks and still wait for final done afterwards.
+  for (uint32_t bytes : {31U, 656U, 4096U})
+    for (uint32_t workers : {1U, 3U, 8U})
+      for (bool double_buffer : {false, true}) {
+        Fixture f(8193, bytes, workers, KVAF_SEQ_SCATTER, 6);
+        f.args.max_polls = 1000000;
+        f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild |
+            kvaf::kScatterSimtBuild | kvaf::kScatterPipeline | kvaf::kScatterTrustedInputs |
+            (double_buffer ? kvaf::kScatterDoubleBuffer : 0U);
+        f.hold_done_until_scatter = true;
+        for (uint32_t count : {8193U, 1U, 19U, 4097U, 0U, 8192U}) {
+          f.Next(count); f.Run();
+          if (count) assert(f.copied_before_done && f.push_done && f.read_rows == count);
+        }
+      }
+  for (const auto options : kCheckedScatterOptions)
+    for (bool trusted : {false, true}) {
+      Fixture f(257, 656, 3, KVAF_SEQ_SCATTER, 6);
+      f.args.reserved = options | kvaf::kScatterPipeline |
+          (trusted ? kvaf::kScatterTrustedInputs : 0U);
+      f.hold_done_until_scatter = true;
+      f.Run();
+      assert(f.copied_before_done && f.read_rows == 257 && f.push_done);
+    }
+  for (bool future : {false, true}) {
+    Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
+    f.args.reserved |= kvaf::kScatterPipeline;
+    f.stall_ready = !future; f.future_ready = future;
+    f.Run(false);
+    assert(!f.read_rows && !f.push_done);
+    assert(f.status[0].result == (future ? KVAF_SEQ_REMOTE_ERROR : KVAF_SEQ_TIMEOUT));
+  }
+  {
+    Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
+    f.args.reserved |= kvaf::kScatterPipeline;
+    f.hold_done_until_scatter = f.error_after_scatter = true;
+    f.Run(false, true);
+    assert(f.read_rows == 19 && f.push_done && f.copied_before_done);
+    assert(f.status[0].result == KVAF_SEQ_REMOTE_ERROR); // Ready is never success.
+  }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,
     // nonaligned byte counts, UB chunk boundaries, and repeated staging writes.
