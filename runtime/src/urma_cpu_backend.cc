@@ -283,12 +283,28 @@ class UrmaResourcePool {
 
   bool Initialize(const std::string& requested_device, bool eid_index_requested,
                   uint32_t requested_eid_index) {
+    // UMDK otherwise writes provider/init errors only to syslog, hiding the
+    // reason behind the peer protocol's generic resource-error response.
+    (void)urma_register_log_func([](int level, char* message) {
+      Log("[KVAF_CPU] UMDK level=%d %s\n", level, message);
+    });
+    Dl_info library{};
+    if (dladdr(reinterpret_cast<void*>(&urma_init), &library) != 0) {
+      Log("[KVAF_CPU] URMA_INIT library=%s\n", library.dli_fname);
+    }
     urma_init_attr_t init{};
-    if (urma_init(&init) != URMA_SUCCESS) {
-      Log("[KVAF_CPU] urma_init failed\n");
+    errno = 0;
+    const auto init_result = urma_init(&init);
+    if (init_result != URMA_SUCCESS && init_result != URMA_EEXIST) {
+      const int init_errno = errno;
+      Log("[KVAF_CPU] urma_init failed ret=%d errno=%d (%s)\n",
+          static_cast<int>(init_result), init_errno, std::strerror(init_errno));
       return false;
     }
-    initialized_ = true;
+    // HAL's Host P2P DDR path may have initialized the same process-wide
+    // liburma already. Borrow it in that case; only its owner may uninit it.
+    owns_urma_init_ = init_result == URMA_SUCCESS;
+    if (!owns_urma_init_) Log("[KVAF_CPU] URMA_INIT_REUSED owner=external\n");
 
     int device_count = 0;
     urma_device_t** devices = urma_get_device_list(&device_count);
@@ -420,13 +436,13 @@ class UrmaResourcePool {
  private:
   void Shutdown() {
     candidates_.clear();
-    if (initialized_) {
+    if (owns_urma_init_) {
       (void)urma_uninit();
-      initialized_ = false;
+      owns_urma_init_ = false;
     }
   }
 
-  bool initialized_ = false;
+  bool owns_urma_init_ = false;
   std::vector<UrmaCandidate> candidates_;
 };
 

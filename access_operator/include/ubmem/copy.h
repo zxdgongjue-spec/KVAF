@@ -27,7 +27,7 @@ class MteCopyPipeline {
 
   __aicore__ inline void Copy(uint64_t dst, uint64_t src, uint64_t bytes) {
     for (uint64_t offset = 0; offset < bytes;) {
-      const uint32_t bank = issued_ % stages_;
+      const uint32_t bank = read_bank_;
       const auto event = static_cast<event_t>(bank);
       // Only wait for the bank being reused; other banks may still be busy.
       if (writing_[bank]) {
@@ -44,6 +44,7 @@ class MteCopyPipeline {
       lengths_[bank] = length;
       AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
       ++issued_;
+      if (++read_bank_ == stages_) read_bank_ = 0;
       // Prefill stages_ - 1 reads, then issue one read before each write.
       if (issued_ - written_ == stages_) WriteOldest();
       offset += length;
@@ -66,7 +67,7 @@ class MteCopyPipeline {
 
  private:
   __aicore__ inline void WriteOldest() {
-    const uint32_t bank = written_ % stages_;
+    const uint32_t bank = write_bank_;
     const auto event = static_cast<event_t>(bank);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
     AscendC::GlobalTensor<uint8_t> destination;
@@ -76,11 +77,13 @@ class MteCopyPipeline {
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
     writing_[bank] = true;
     ++written_;
+    if (++write_bank_ == stages_) write_bank_ = 0;
   }
 
   AscendC::LocalTensor<uint8_t> buffers_[MaxStages];
   uint64_t destinations_[MaxStages];
   uint32_t lengths_[MaxStages], chunk_bytes_, stages_;
+  uint32_t read_bank_ = 0, write_bank_ = 0;
   bool writing_[MaxStages] = {};
   uint64_t issued_ = 0, written_ = 0;
 };
