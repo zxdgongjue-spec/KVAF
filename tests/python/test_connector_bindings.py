@@ -133,6 +133,12 @@ class ConnectorBindings(unittest.TestCase):
             self.assertFalse(hasattr(kvaf.NpuRuntime, name))
         self.assertTrue(hasattr(kvaf.NpuRuntime, "batch_cpu_pull"))
         self.assertTrue(hasattr(kvaf.NpuRuntime, "resolve_cpu_pull"))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "listen_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuRuntime, "attach_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuRuntime, "detach_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuPullHbmSource, "listen"))
+        with self.assertRaises(TypeError):
+            kvaf.NpuPullHbmSource(0).register(None)  # receiver is mandatory
         for cls in (kvaf.CpuPullHbmSource, kvaf.NpuPullHbmSource):
             source = cls(0)
             with self.assertRaises(TypeError):
@@ -151,17 +157,16 @@ class ConnectorBindings(unittest.TestCase):
         runtime.batch_get_raw_addr(ready, *arrays, output=None)
 
     @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
-    def test_recovery_and_detach_accept_connector_identity_objects(self):
+    def test_recovery_and_cancel_accept_connector_identity_objects(self):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
         source = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
         ready = restored(kvaf.ReadyToken, (source, 7))
-        ticket = dict(version=1, source_id=13, epoch=88, bytes=8192, token=3)
         # Typed arguments reach Runtime without an application-local link ID.
         with self.assertRaisesRegex(RuntimeError, "no HBM reader"):
             runtime.resolve_raw_addr(ready=ready)
-        with self.assertRaisesRegex(RuntimeError, "no HBM reader"):
-            runtime.detach_hbm(export_ticket=ticket)
-        for method in (runtime.resolve_raw_addr, runtime.detach_hbm):
+        with self.assertRaisesRegex(RuntimeError, "not initialized|requires AIV"):
+            runtime.cancel_raw_addr(ready=ready)
+        for method in (runtime.resolve_raw_addr, runtime.cancel_raw_addr):
             with self.assertRaises(TypeError):
                 method(1)
 

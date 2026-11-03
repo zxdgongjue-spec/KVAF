@@ -110,10 +110,12 @@ class NpuRuntime final : public Runtime {
   Status CommitPut(const PutHandle&);
   Status AbortPut(const PutHandle&);
 
-  // Save the remote source connection, selected by ReadyToken on each READ.
-  // No AccessTable or DDR metadata is used for this path.
-  Status AttachHbm(const std::string& address, const HbmReadTicket&,
-                   const std::string& local_eid = "");
+  // One receiver listener automatically attaches incoming producer sources.
+  // Saved connections are selected by ReadyToken; no AccessTable/DDR is used.
+  Status ListenHbm(const std::string& listen_address, const std::string& advertise_address,
+                   const std::string& local_eid, HbmReceiverTicket*);
+  // Fence this published batch against late READs and confirm cancellation to P.
+  Status CancelRawAddr(const ReadyToken&);
   // As with BatchGet, output registrations are cached until detach/shutdown.
   // Keep output storage alive and at a stable address until then. Callers guarantee
   // valid, disjoint ranges and lengths in 1..UINT32_MAX within device READ limits.
@@ -122,8 +124,6 @@ class NpuRuntime final : public Runtime {
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
                          HbmReadProfile* profile = nullptr, bool validate_ranges = false);
   Status ResolveRawAddr(const ReadyToken&); // Retries this batch's control/cleanup, never DMA.
-  // Also cleans up a failed Attach using the original export ticket.
-  Status DetachHbm(const HbmReadTicket&);
   bool pending_raw_addr() const;
 
   std::uint32_t device_id() const;

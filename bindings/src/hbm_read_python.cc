@@ -23,7 +23,7 @@ class PythonReadSource {
     if(!n || !size || n>SIZE_MAX/size)throw py::value_error("invalid HBM source size");
     return {reinterpret_cast<void*>(value.attr("data_ptr")().cast<std::uintptr_t>()),n*size,DeviceKind::kNpu};
   }
-  py::dict Register(py::object value,py::object stream){
+  void Register(py::object value,const py::dict& receiver,py::object stream){
     if(!tensor.is_none())throw py::value_error("shutdown the previous HBM read source first");
     py::list owners;
     if(py::isinstance<py::list>(value) || py::isinstance<py::tuple>(value)) {
@@ -31,15 +31,18 @@ class PythonReadSource {
     } else owners.append(value);
     std::vector<ConstBufferView> views;
     for(auto item:owners) views.push_back(View(item));
-    auto producer=Stream(stream);HbmReadTicket ticket;
-    Check(source.Register(views,producer,&ticket));
+    auto producer=Stream(stream);auto target=hbm_read_python::Receiver(receiver);
+    // A failed handshake can already own MRs or have uncertain peer state.
+    // Pin all storage before entering native initialization, including failures.
     tensor=std::move(owners);
-    return hbm_read_python::Pack(ticket);
+    Status status;
+    {py::gil_scoped_release release;status=source.Register(views,target,producer);}
+    Check(status);
   }
   ReadyToken Ready(py::object value){
     ReadyToken ready;Check(value.is_none()?source.Ready(&ready):source.Ready(View(value),&ready));return ready;
   }
-  void Shutdown(){Check(source.Shutdown());tensor=py::none();}
+  void Shutdown(){Status status;{py::gil_scoped_release release;status=source.Shutdown();}Check(status);tensor=py::none();}
   NpuPullHbmSource source;
   py::object tensor{py::none()};
 };
@@ -47,8 +50,9 @@ class PythonReadSource {
 void BindNpuPullHbmSource(py::module_& m){
   py::class_<PythonReadSource>(m,"NpuPullHbmSource")
     .def(py::init<std::uint32_t,std::string>(),py::arg("device_id"),py::arg("npu_eid")="")
-    .def("register",&PythonReadSource::Register,py::arg("source"),py::arg("stream")=py::none())
-    .def("listen",[](PythonReadSource& p,const std::string& address){Check(p.source.Listen(address));return p.source.port();},py::arg("address"))
+    .def("register",&PythonReadSource::Register,py::arg("source"),py::kw_only(),py::arg("receiver"),py::arg("stream")=py::none(),
+         "Register and connect all MRs to the receiver; returns only after READ probes and confirmation. "
+         "On failure retain storage and retry shutdown. Ready cannot be cancelled unilaterally.")
     .def("ready",&PythonReadSource::Ready,py::arg("tensor")=py::none())
     .def("release_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.ReleaseBatch(t));},py::arg("ready_token"))
     .def("cancel_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.CancelBatch(t));},py::arg("ready_token"))

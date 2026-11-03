@@ -784,10 +784,10 @@ Status NpuRuntime::LastOffloadChecksum(std::uint64_t* checksum) const {
 #endif
 }
 
-Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ticket,
-                             const std::string& local_eid) {
+Status NpuRuntime::ListenHbm(const std::string& address, const std::string& advertised,
+                             const std::string& local_eid, HbmReceiverTicket* receiver) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!initialized()) return Status::NotInitialized("initialize NpuRuntime before attach_hbm");
+  if (!initialized()) return Status::NotInitialized("initialize NpuRuntime before listen_hbm");
   if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   if (!impl_->hbm_reader) {
     auto kernel = impl_->options.batch_get_raw_addr_kernel_object_path;
@@ -801,7 +801,7 @@ Status NpuRuntime::AttachHbm(const std::string& address, const HbmReadTicket& ti
     impl_->hbm_reader = std::make_unique<HbmReader>(device_id(), npu_core_count(), jettys_per_core(),
         impl_->options.batch_get_max_inflight_total, kernel);
   }
-  return impl_->hbm_reader->Attach(address, ticket, local_eid);
+  return impl_->hbm_reader->Listen(address, advertised, local_eid, receiver);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif
@@ -856,11 +856,13 @@ Status NpuRuntime::ResolveRawAddr(const ReadyToken& ready) {
 #endif
   return Status::NotInitialized("no HBM reader");
 }
-Status NpuRuntime::DetachHbm(const HbmReadTicket& ticket) {
+Status NpuRuntime::CancelRawAddr(const ReadyToken& ready) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->hbm_reader) return impl_->hbm_reader->Detach(ticket);
+  if(!impl_->hbm_reader)return Status::NotInitialized("NPU Pull is not initialized");
+  return impl_->hbm_reader->Cancel(ready);
+#else
+  return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif
-  return Status::NotInitialized("no HBM reader");
 }
 bool NpuRuntime::pending_raw_addr() const {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)

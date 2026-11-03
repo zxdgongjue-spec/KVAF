@@ -27,11 +27,18 @@ struct HbmReadTicket {
     return true;
   }
 };
+// Serializable receiver identity. This is exchanged once by application discovery;
+// source/MR tickets are subsequently exchanged only by KVAF.
+struct HbmReceiverTicket {
+  std::string control_address;
+  std::uint64_t receiver_id{}, receiver_epoch{};
+  bool valid() const { return !control_address.empty() && receiver_id && receiver_epoch; }
+};
 // Opt-in diagnostics for one synchronous call. Host stages use steady_clock;
 // kernel_event_us is the device event interval around the kernel on its stream
 // and overlaps launch/synchronize (never add it to the Host phase sum).
 struct HbmReadProfile {
-  double total_us{}, validation_us{}, acquire_us{}, buffers_us{}, register_output_us{};
+  double total_us{}, validation_us{}, buffers_us{}, register_output_us{};
   double event_record_us{}, launch_us{}, synchronize_us{}, event_query_us{}, status_us{};
   double cleanup_us{}, complete_us{}, kernel_event_us{};
   bool kernel_event_valid{};
@@ -45,21 +52,23 @@ class NpuPullHbmSource {
   ~NpuPullHbmSource();
   NpuPullHbmSource(const NpuPullHbmSource&) = delete;
   NpuPullHbmSource& operator=(const NpuPullHbmSource&) = delete;
-  Status Register(ConstBufferView, void* producer_stream, HbmReadTicket*);
-  Status Register(const std::vector<ConstBufferView>&, void* producer_stream, HbmReadTicket*);
-  Status Ready(ReadyToken*); // Single-MR convenience only.
+  // Blocking full initialization: TCP, all MR registrations, channel binding
+  // and READ probes. Failure may retain resources; retry Shutdown for cleanup.
+  Status Register(ConstBufferView, const HbmReceiverTicket&, void* producer_stream);
+  Status Register(const std::vector<ConstBufferView>&, const HbmReceiverTicket&, void* producer_stream);
+  Status Ready(ReadyToken*); // Single-MR convenience; publishes irrevocable read permission.
   Status Ready(ConstBufferView tensor, ReadyToken*);
   Status ReleaseBatch(const ReadyToken&);
+  // Only releases a batch already ended by the reader. Ready is irrevocable
+  // on the producer: the reader must fence late notifications before reuse.
   Status CancelBatch(const ReadyToken&);
-  Status Listen(const std::string& address); // host:port; port 0 chooses a free port
-  std::uint16_t port() const;
-  Status Shutdown(); // Reader must detach first; failure retains registration.
+  Status Shutdown(); // Requests reader detach; failure retains registration.
   bool frozen() const;
   bool connected() const;
   std::uint32_t device_id() const;
   std::string selected_npu_eid() const;
  private:
-  Status FinishBatch(const ReadyToken&, bool cancel);
+  Status FinishBatch(const ReadyToken&);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

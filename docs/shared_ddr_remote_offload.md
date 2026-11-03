@@ -7,7 +7,7 @@
 `initialized` 仅表示本卡基础初始化，CPU Pull 还要求 `ddr_initialized=True`。
 旧 `link_to(...) → initialize(ddr_bytes, slot_size)` 保留为组合入口。
 `shutdown_ddr()` 在任务和 CPU 源租约退役后释放 DDR 及其通信资源，保留独立 NPU Pull 链路和 CPU 目标；失败可原地重试，不重发 READ。
-随后可重新 initialize_ddr；旧 PutHandle 不适用于新的 DDR core。纯 NPU Pull 只需无参数 initialize 和 attach_hbm。
+随后可重新 initialize_ddr；旧 PutHandle 不适用于新的 DDR core。纯 NPU Pull 读取端只需无参数 initialize 和 listen_hbm，生产端 register(receiver=...) 自动建链。
 
 ## 跨卡调用
 
@@ -67,7 +67,7 @@ runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, timeout=30000)
 
 Runtime 先分配共享 DDR，固定 CPU candidate。源注册在同一池上探测 CPU↔源卡 EID，使用 scratch READ，不覆盖缓存槽位。NPU↔NPU raw READ 的 fullmesh 链路独立配置。
 
-CPU Pull 控制协议 KVRP v5，支持一个源连接下多个 HBM MR；NPU Pull 控制协议为 KVHR v5。使用 CPU Pull 的服务和应用需同时重编译重启；旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+CPU Pull 控制协议 KVRP v5，支持一个源连接下多个 HBM MR；NPU Pull 控制协议为 KVHR v6。使用 CPU Pull 的服务和应用需同时重编译重启；旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 同一共享池一次只允许一个未完成或未确认的 Pull；每批最多 4096 spans，CPU 内部四 Jetty 并行。服务保留 source 的关闭记录用于确认重试，源注册次数（包括失败候选）上限为 4096，推荐长驻注册复用。
 

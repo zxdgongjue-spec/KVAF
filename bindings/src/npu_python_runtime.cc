@@ -348,11 +348,17 @@ class NpuPythonRuntime final {
   std::uint64_t LastChecksum() const { std::uint64_t hash{}; ThrowIfError(native_->LastOffloadChecksum(&hash)); return hash; }
 #endif
 
-  void AttachHbm(const std::string& address, const py::dict& ticket, const std::string& eid) {
-    ThrowIfError(native_->AttachHbm(address, hbm_read_python::Ticket(ticket), eid));
+  py::dict ListenHbm(const std::string& address,const std::string& advertised,const std::string& eid) {
+    HbmReceiverTicket ticket;Status status;
+    {py::gil_scoped_release release;status=native_->ListenHbm(address,advertised,eid,&ticket);}
+    ThrowIfError(status);return hbm_read_python::Pack(ticket);
+  }
+  void CancelRawAddr(const ReadyToken& ready) {
+    Status status;{py::gil_scoped_release release;status=native_->CancelRawAddr(ready);}
+    ThrowIfError(status);
   }
   void ResolveRawAddr(const ReadyToken& ready) {
-    const auto status = native_->ResolveRawAddr(ready);
+    Status status;{py::gil_scoped_release release;status=native_->ResolveRawAddr(ready);}
     if (!native_->pending_raw_addr()) raw_retained_ = py::none();
     ThrowIfError(status);
   }
@@ -400,7 +406,7 @@ class NpuPythonRuntime final {
       timing["host_total_us"]=profile.total_us;
       double phases=0;
 #define RAW_PHASE(name) timing[#name]=profile.name; phases+=profile.name
-      RAW_PHASE(validation_us); RAW_PHASE(acquire_us); RAW_PHASE(buffers_us); RAW_PHASE(register_output_us);
+      RAW_PHASE(validation_us); RAW_PHASE(buffers_us); RAW_PHASE(register_output_us);
       RAW_PHASE(event_record_us); RAW_PHASE(launch_us); RAW_PHASE(synchronize_us); RAW_PHASE(event_query_us);
       RAW_PHASE(status_us); RAW_PHASE(cleanup_us); RAW_PHASE(complete_us);
 #undef RAW_PHASE
@@ -410,11 +416,6 @@ class NpuPythonRuntime final {
       result["profile"]=std::move(timing);
     }
     return result;
-  }
-  void DetachHbm(const py::dict& export_ticket) {
-    const auto ticket=hbm_read_python::Ticket(export_ticket);
-    ThrowIfError(native_->DetachHbm(ticket));
-    raw_outputs_.attr("pop")(py::make_tuple(ticket.source_id,ticket.epoch,ticket.bytes),py::none());
   }
   bool PendingRawAddr() const { return native_->pending_raw_addr(); }
 
@@ -722,17 +723,20 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("enable_cpu_offload") = false, py::arg("cpu_candidate") = -1,
            py::arg("offload_timeout_ms") = 30000,
            py::arg("batch_get_raw_addr_kernel_object_path") = "")
-      .def("attach_hbm", &NpuPythonRuntime::AttachHbm, py::arg("address"), py::arg("export_ticket"), py::arg("local_eid") = "")
+      .def("listen_hbm", &NpuPythonRuntime::ListenHbm, py::arg("listen_address"),
+           py::arg("advertise_address")="", py::arg("local_eid")="")
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
            "Synchronously read peer HBM. profile=True adds Host stage timings and a device event "
            "interval around the kernel to the returned profile dictionary; profiling is off by default. "
-           "Output registrations and their Tensors are retained until detach/shutdown; do not resize their storage. "
+           "Output Tensors are retained until Runtime shutdown; do not resize their storage. "
            "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
            "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
-      .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("export_ticket"))
+      .def("cancel_raw_addr", &NpuPythonRuntime::CancelRawAddr, py::arg("ready"),
+           "Fence a published batch without reading it; producer may release after success. "
+           "On lost acknowledgement use resolve_raw_addr with the same token.")
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
       .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("ready"),

@@ -7,6 +7,14 @@
 #include <cmath>
 #include <map>
 #include <unistd.h>
+#include <atomic>
+#include <future>
+#include <thread>
+#include <mutex>
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 namespace kvaf {
 namespace hr=hbm_read;
@@ -34,9 +42,8 @@ struct DeviceBuffer {
 };
 class ReadLink final:public peer::PeerLink {
  public:
-  ReadLink(std::string address,HbmReadTicket t):PeerLink(std::move(address)),ticket(t),client(detail::Nonce()){}
-  ~ReadLink() override {if(control_fd>=0)close(control_fd);}
-  int control_fd{-1};
+  ReadLink(std::shared_ptr<hr::ControlChannel> channel,HbmReadTicket t):PeerLink("reverse-hbm"),control(std::move(channel)),ticket(t),client(detail::Nonce()){}
+  std::shared_ptr<hr::ControlChannel> control;
   HbmReadTicket ticket;
   std::uint64_t client;
   std::vector<offload::Endpoint> memories;
@@ -44,8 +51,8 @@ class ReadLink final:public peer::PeerLink {
   offload::Endpoint endpoint{};
   std::uint32_t channel{};
   bool opened{};
-  Status Call(hr::Command command,const std::vector<hr::Span>& spans,hr::Response* response,std::uint64_t sequence=0,std::uint64_t mr_id=1) {
-    auto r=hr::Make(command,ticket,client);r.sequence=sequence;r.mr_id=mr_id;return hr::Exchange(address(),r,spans,response,&control_fd);
+  Status Call(hr::Command command,hr::Response* response,std::uint64_t sequence=0,std::uint64_t mr_id=1) {
+    auto r=hr::Make(command,ticket,client);r.sequence=sequence;r.mr_id=mr_id;return control->Exchange(r,response);
   }
   Status LookupRegion(std::uint64_t base,peer::PeerRegion* out)const override {
     auto it=std::find_if(memories.begin(),memories.end(),[&](const auto& e){return e.base==base;});
@@ -67,7 +74,7 @@ class ReadLink final:public peer::PeerLink {
     auto r=hr::Make(hr::Command::Channel,ticket,client);r.channel=channel;
     r.endpoint.tp=tp;r.endpoint.psn=psn;r.endpoint.token=token;r.endpoint.key_bytes=key_bytes;
     std::memcpy(r.endpoint.eid,local_eid,16);std::memcpy(r.endpoint.key[0],key,key_bytes);
-    hr::Response response{};auto s=hr::Exchange(address(),r,{},&response);if(!s.ok())return s;
+    hr::Response response{};auto s=control->Exchange(r,&response);if(!s.ok())return s;
     if(response.endpoint.key_bytes!=32 || response.endpoint.token!=token) return Status::Internal("invalid B target descriptor");
     *peer_bytes=response.endpoint.key_bytes;std::memcpy(peer_key->data(),response.endpoint.key[channel],*peer_bytes);
     *peer_tp=response.endpoint.tp;*peer_psn=response.endpoint.psn;++channel;return Status::OK();
@@ -231,7 +238,7 @@ struct Engine {
     uncertain=false;return Status::OK();
   }
 };
-enum class Pending { None, Acquire, Dma, Cleanup, Complete, Cancel };
+enum class Pending { None, Dma, Cleanup, Complete, Cancel };
 struct Connection {
   std::unique_ptr<ReadLink> link;
   std::string local_eid;
@@ -240,17 +247,16 @@ struct Connection {
   std::uint64_t sequence{},last_sequence{},mr_id{1};
   bool ready{};
   Status result;
-  Connection(const std::string& a,const HbmReadTicket& t,const std::string& eid,std::uint32_t c,std::uint32_t j,std::uint32_t b):
+  Connection(std::shared_ptr<hr::ControlChannel> a,const HbmReadTicket& t,const std::string& eid,std::uint32_t c,std::uint32_t j,std::uint32_t b):
       link(new ReadLink(a,t)),local_eid(eid),engine(c,j,b){}
   Status Resolve(HbmReadProfile* profile=nullptr) {
     if(pending==Pending::None)return Status::InvalidState("no pending raw READ");
     if(pending==Pending::Dma || engine.uncertain)return Status::InDoubt("raw READ DMA unresolved; retain A output and B source; no READ replay");
-    if(pending==Pending::Acquire) {result=Status::Internal("raw READ cancelled before DMA after uncertain Acquire");pending=Pending::Cancel;}
     auto s=Timed(profile?&profile->cleanup_us:nullptr,[&]{return engine.Cleanup();});if(!s.ok())return s;
     if(pending==Pending::Cleanup)pending=result.ok()?Pending::Complete:Pending::Cancel;
     hr::Response response{};
     s=Timed(profile?&profile->complete_us:nullptr,[&]{
-      return link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,{},&response,sequence,mr_id);});
+      return link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,&response,sequence,mr_id);});
     if(!s.ok())return Status::InDoubt("raw READ acknowledgement pending: "+s.message());
     pending=Pending::None;last_sequence=sequence;return result;
   }
@@ -259,6 +265,13 @@ struct Connection {
 struct HbmReader::Impl {
   std::uint32_t device,cores,jettys,budget;
   std::string kernel;
+  mutable std::recursive_mutex mutex;
+  HbmReceiverTicket receiver;
+  std::string local_eid;
+  bool accepting{true};
+  int listener{-1};
+  std::atomic<bool> stop{false};
+  std::thread thread;
   // Registration identity, never an application-maintained local connection ID.
   using SourceKey = std::pair<std::uint64_t, std::uint64_t>;
   std::map<SourceKey,std::unique_ptr<Connection>> connections;
@@ -269,10 +282,93 @@ struct HbmReader::Impl {
 };
 HbmReader::HbmReader(std::uint32_t d,std::uint32_t c,std::uint32_t j,std::uint32_t b,std::string k):
     impl_(new Impl{d,c,j,b,std::move(k)}){}
-HbmReader::~HbmReader(){if(!Shutdown().ok())(void)impl_.release();}
-Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,const std::string& local_eid) {
+HbmReader::~HbmReader(){if(!Shutdown().ok()){
+  impl_->stop=true;if(impl_->thread.joinable())impl_->thread.join();
+  (void)impl_.release(); // Retain unresolved hardware, but never a thread capturing a destroyed owner.
+}}
+Status HbmReader::Listen(const std::string& address,const std::string& advertised,const std::string& eid,HbmReceiverTicket* out) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  auto status=impl_->Device();if(!status.ok())return status;
+  if(!out || impl_->listener>=0)return Status::InvalidState("HBM receiver already listening or missing result");
+  if(!impl_->cores || !impl_->jettys || impl_->cores*std::uint64_t(impl_->jettys)>offload::kChannelCount ||
+     (impl_->budget && impl_->budget<impl_->cores*2) || impl_->kernel.empty())
+    return Status::InvalidArgument("configure raw kernel and 1..4 total Jettys before listen_hbm");
+  if(!eid.empty()) {std::uint8_t parsed[16];if(!detail::ParseEid(eid,parsed))return Status::InvalidArgument("invalid receiver fullmesh EID");}
+  if(KvafExecuteBatchGetRawAddrLoadKernel(impl_->kernel.c_str()))return Status::Internal("load batch_get_raw_addr kernel");
+  auto endpoint=advertised.empty()?address:advertised;
+  const auto split=endpoint.rfind(':');
+  if(split==std::string::npos || endpoint.substr(0,split)=="0.0.0.0")
+    return Status::InvalidArgument("listen_hbm requires a routable advertise_address when binding 0.0.0.0");
+  std::uint16_t port{};status=hr::Listen(address,&impl_->listener,&port);if(!status.ok())return status;
+  if(endpoint.substr(split+1)=="0")endpoint=endpoint.substr(0,split+1)+std::to_string(port);
+  impl_->receiver={endpoint,detail::Nonce(),detail::Nonce()};impl_->local_eid=eid;impl_->stop=false;impl_->accepting=true;
+  // Device initialization errors are returned before the listener is published.
+  std::promise<Status> promise;auto future=promise.get_future();
+  impl_->thread=std::thread([this,promise=std::move(promise)]()mutable{
+    auto s=aclrtSetDevice(impl_->device)==ACL_SUCCESS?Status::OK():Status::Internal("select receiver control device");
+    promise.set_value(s);if(s.ok())Serve();
+  });
+  status=future.get();
+  if(!status.ok()){impl_->thread.join();close(impl_->listener);impl_->listener=-1;return status;}
+  *out=impl_->receiver;return Status::OK();
+}
+void HbmReader::Serve() {
+  if(aclrtSetDevice(impl_->device)!=ACL_SUCCESS)return;
+  while(!impl_->stop.load()) {
+    pollfd p{impl_->listener,POLLIN,0};if(poll(&p,1,50)<=0)continue;
+    int fd=accept(impl_->listener,nullptr,nullptr);if(fd<0)continue;
+    offload::SetSocketTimeout(fd);int yes=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&yes,sizeof(yes));
+    hr::Hello h{};HbmReadTicket ticket;auto status=hr::ReadHello(fd,&h,&ticket);
+    {std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+      if(status.ok() && (h.receiver_id!=impl_->receiver.receiver_id || h.receiver_epoch!=impl_->receiver.receiver_epoch))
+        status=Status::InvalidState("stale HBM receiver ticket; reinitialize the source");
+      if(status.ok() && !impl_->accepting && h.header.command==unsigned(hr::Admission::Join))
+        status=Status::Busy("HBM receiver is shutting down; only recovery/detach is allowed");
+      if(status.ok()) {
+        const Impl::SourceKey key{ticket.source_id,ticket.epoch};
+        auto it=impl_->connections.find(key);
+        if(h.header.command==unsigned(hr::Admission::Leave))status=Detach(ticket);
+        else if(it!=impl_->connections.end()) {
+          auto& c=*it->second;
+          if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token)
+            status=Status::InvalidArgument("HBM reconnect changed source manifest/token");
+          else {
+            int copy=dup(fd);
+            status=copy<0?Status::Internal("duplicate HBM socket"):c.link->control->Replace(copy);
+            if(!status.ok() && copy>=0)close(copy);
+          }
+        } else if(h.header.command==unsigned(hr::Admission::Resume))status=Status::NotFound("HBM receiver session retired; do not recreate or replay READ");
+        else {
+          int copy=dup(fd);
+          status=copy<0?Status::Internal("duplicate HBM socket"):Attach(std::make_shared<hr::ControlChannel>(copy),ticket,impl_->local_eid);
+        }
+      }
+      hr::SendResult(fd,status);
+    }
+    close(fd);
+  }
+}
+Status HbmReader::Cancel(const ReadyToken& ready) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  auto status=impl_->Device();if(!status.ok())return status;
+  const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
+  if(!source)return Status::InvalidArgument("cancel_raw_addr requires an NPU Pull token");
+  auto it=impl_->connections.find({source->source_id,source->source_epoch});
+  if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not connected");
+  auto& c=*it->second;
+  if(!c.link->ticket.matches(*source) || !source->bytes_for(ready.mr_id) || !ready.sequence)
+    return Status::InvalidArgument("invalid NPU Pull cancellation identity");
+  if(c.pending!=Pending::None)return Status::Busy("resolve the existing raw READ/cancellation first");
+  if(ready.sequence==c.last_sequence && ready.mr_id==c.mr_id)return Status::OK();
+  if(ready.sequence<=c.last_sequence)return Status::InvalidState("NPU Pull batch already consumed");
+  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.pending=Pending::Cancel;c.result=Status::OK();
+  // Mark pending before contacting P. Even a lost reply must fence a late READ.
+  return c.Resolve();
+}
+Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmReadTicket& ticket,const std::string& local_eid) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   auto s=impl_->Device();if(!s.ok())return s;
-  if(address.empty() || !ticket.valid() ||
+  if(!control || !ticket.valid() ||
       !impl_->cores || !impl_->jettys || impl_->cores*std::uint64_t(impl_->jettys)>offload::kChannelCount ||
       (impl_->budget && impl_->budget<impl_->cores*2) || impl_->kernel.empty())
     return Status::InvalidArgument("configure raw kernel and 1..4 total Jettys for HBM READ");
@@ -281,9 +377,9 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
   if(existing!=impl_->connections.end()) {
     const auto& c=*existing->second;
     if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token ||
-        c.link->address()!=address || c.local_eid!=local_eid)
+        c.local_eid!=local_eid)
       return Status::InvalidArgument("HBM source is already attached with different metadata or route");
-    return c.ready ? Status::OK() : Status::InDoubt("HBM attach/close incomplete; retry detach_hbm with the original export_ticket");
+    return c.ready ? Status::OK() : Status::InDoubt("HBM attach/close incomplete; retry producer shutdown");
   }
   if(KvafExecuteBatchGetRawAddrLoadKernel(impl_->kernel.c_str()))return Status::Internal("load batch_get_raw_addr kernel");
   std::vector<npu_eid::NpuLocalEidCandidate> candidates;
@@ -293,21 +389,21 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
     if(!npu_eid::DiscoverPhysicalNpuEids(physical,&candidates,&error))return Status::Internal(error);
   } else { npu_eid::NpuLocalEidCandidate c{};if(!detail::ParseEid(local_eid,c.eid.data()))return Status::InvalidArgument("invalid A EID");candidates.push_back(c); }
   auto discover=hr::Make(hr::Command::Discover,ticket,0);hr::Response info{};
-  s=hr::Exchange(address,discover,{},&info);if(!s.ok())return s;
+  s=control->Exchange(discover,&info);if(!s.ok())return s;
   if(!info.candidates || info.candidates>256)return Status::Internal("invalid B EID candidate count");
   for(std::uint32_t b=0;b<info.candidates;++b)for(const auto& a:candidates) {
-    auto owned=std::make_unique<Connection>(address,ticket,local_eid,impl_->cores,impl_->jettys,impl_->budget);
+    auto owned=std::make_unique<Connection>(control,ticket,local_eid,impl_->cores,impl_->jettys,impl_->budget);
     auto& c=*owned;impl_->connections.emplace(key,std::move(owned));
     auto request=hr::Make(hr::Command::Open,ticket,c.link->client);request.candidate=b;
     std::memcpy(request.endpoint.eid,a.eid.data(),16);
     hr::Response response{};c.link->opened=true;
-    s=hr::Exchange(address,request,{},&response);
+    s=control->Exchange(request,&response);
     if(s.ok()) {
       const auto count=ticket.mr_count();
       c.link->endpoint=response.endpoint;
       if(response.mr_count!=count) s=Status::Internal("B HBM MR count differs from ticket");
       for(std::uint64_t mr=1;s.ok() && mr<=count;++mr) {
-        if(mr>1) s=c.link->Call(hr::Command::Memory,{},&response,0,mr);
+        if(mr>1) s=c.link->Call(hr::Command::Memory,&response,0,mr);
         if(!s.ok()) break;
         const auto& e=response.endpoint;
         if(response.mr_count!=count || e.token!=ticket.token || e.bytes!=ticket.bytes_for(mr) ||
@@ -355,7 +451,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
         const auto quiesced=c.engine.QuiesceProbe();
         if(!quiesced.ok()) {
           c.pending=Pending::Dma;
-          return Status::InDoubt("HBM attach probe quarantined; source="+std::to_string(ticket.source_id)+"; retain original export_ticket; "+s.message()+"; "+quiesced.message());
+          return Status::InDoubt("HBM attach probe quarantined; source="+std::to_string(ticket.source_id)+"; retain producer source; "+s.message()+"; "+quiesced.message());
         }
         s=Status::Internal("startup probe READ failed; transport quiesced: "+s.message());
       }
@@ -365,7 +461,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
       }
       if(s.ok())s=c.engine.Cleanup();
       if(s.ok())s=c.engine.scratch.Free();
-      if(s.ok())s=c.link->Call(hr::Command::Confirm,{},&response);
+      if(s.ok())s=c.link->Call(hr::Command::Confirm,&response);
     }
     if(s.ok()) {
       c.ready=true;
@@ -376,7 +472,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
     std::fprintf(stderr,"[KVAF_NPU] HBM_READ_CANDIDATE_REJECTED source=%llu A_eid=%s B_candidate=%u detail=%s\n",
         (unsigned long long)ticket.source_id,npu_eid::EidToHex(a.eid).c_str(),b,s.message().c_str());
     auto cleanup=Detach(ticket);
-    if(!cleanup.ok())return Status::InDoubt("HBM attach cleanup pending; retry detach_hbm with the original export_ticket; "+cleanup.message());
+    if(!cleanup.ok())return Status::InDoubt("HBM attach cleanup pending; retry producer shutdown; "+cleanup.message());
   }
   return s;
 }
@@ -386,6 +482,7 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
   if(profile)*profile={};
   ProfileTimer total_timer(profile?&profile->total_us:nullptr);
   const auto validation_begin=profile?ProfileClock::now():ProfileClock::time_point{};
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   auto s=impl_->Device();if(!s.ok())return s;
   const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
   if(!source)return Status::InvalidArgument("raw READ requires an NPU Pull ReadyToken");
@@ -412,13 +509,9 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
     if(address>UINT64_MAX-bytes || (address<=base ? base-address<bytes : address-base<output.bytes))
       return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
   }
-  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.engine.mr_id=ready.mr_id;c.pending=Pending::Acquire;c.result=Status::OK();
+  if(!c.link->control->connected())return Status::InDoubt("HBM control offline; wait for producer reconnect before READ");
+  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.engine.mr_id=ready.mr_id;c.result=Status::OK();
   if(profile)profile->validation_us=std::chrono::duration<double,std::micro>(ProfileClock::now()-validation_begin).count();
-  hr::Response response{};
-  // The source service leases the identity/batch, not a Host copy of the
-  // device metadata. Bounds diagnostics are opt-in, as on the BatchGet fast path.
-  s=Timed(profile?&profile->acquire_us:nullptr,[&]{return c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence,ready.mr_id);});
-  if(!s.ok()) {if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;return s;}
   c.pending=Pending::Dma;
   s=c.engine.RunDevice(src,dst,lengths,output,stream,profile,validate_ranges);
   if(c.engine.uncertain)return s;
@@ -426,6 +519,7 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
   return c.Resolve(profile);
 }
 Status HbmReader::Resolve(const ReadyToken& ready){
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   auto s=impl_->Device();if(!s.ok())return s;
   const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
   if(!source)return Status::InvalidArgument("raw READ recovery requires an NPU Pull ReadyToken");
@@ -438,6 +532,7 @@ Status HbmReader::Resolve(const ReadyToken& ready){
   return it->second->Resolve();
 }
 Status HbmReader::Detach(const HbmReadTicket& ticket){
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   auto s=impl_->Device();if(!s.ok())return s;
   if(!ticket.valid())
     return Status::InvalidArgument("invalid HBM export ticket");
@@ -451,10 +546,21 @@ Status HbmReader::Detach(const HbmReadTicket& ticket){
   // teardown is safe; admitting another READ on that transport is not.
   c.ready=false;
   s=c.engine.Close();if(!s.ok())return s;
-  if(c.link->opened){hr::Response response{};s=c.link->Call(hr::Command::Close,{},&response);
-    if(!s.ok() && s.code()!=StatusCode::kNotFound)return s;}
+  if(c.link->opened){hr::Response response{};s=c.link->Call(hr::Command::Close,&response);
+    if(!s.ok() && s.code()!=StatusCode::kNotFound)return s;
+    // Both hardware sides are retired. This final notification lets P finish
+    // shutdown even if D subsequently closes its listener. Lost notification
+    // is recovered by Leave/Resume -> NotFound, never a new hardware attach.
+    c.link->Call(hr::Command::Retire,&response);}
   impl_->connections.erase(it);return Status::OK();
 }
-Status HbmReader::Shutdown(){while(!impl_->connections.empty()){const auto ticket=impl_->connections.begin()->second->link->ticket;auto s=Detach(ticket);if(!s.ok())return s;}return Status::OK();}
-bool HbmReader::pending()const{for(auto& item:impl_->connections)if(item.second->pending!=Pending::None)return true;return false;}
+Status HbmReader::Shutdown(){
+  {std::lock_guard<std::recursive_mutex> lock(impl_->mutex);impl_->accepting=false;}
+  impl_->stop=true;
+  if(impl_->thread.joinable())impl_->thread.join();
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  while(!impl_->connections.empty()){const auto ticket=impl_->connections.begin()->second->link->ticket;auto s=Detach(ticket);if(!s.ok()){impl_->stop=false;impl_->thread=std::thread([this]{Serve();});return s;}}
+  if(impl_->listener>=0){close(impl_->listener);impl_->listener=-1;}
+  impl_->receiver={};return Status::OK();}
+bool HbmReader::pending()const{std::lock_guard<std::recursive_mutex> lock(impl_->mutex);for(auto& item:impl_->connections)if(item.second->pending!=Pending::None)return true;return false;}
 }

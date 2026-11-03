@@ -77,7 +77,7 @@ def packet_payload(torch, offsets, packet_bytes, phase):
     return ((rows * 131 + columns * 17 + (columns >> 3) + phase * 31) & 255).to(torch.uint8)
 
 
-def producer(pipe, args, offsets):
+def producer(pipe, args, offsets, receiver):
     import torch
     import torch_npu  # noqa: F401
     import kvaf
@@ -94,13 +94,8 @@ def producer(pipe, args, offsets):
         slot_count = args.source_space_bytes // args.packet_bytes
         indices = torch.tensor([offset // args.packet_bytes for offset in offsets], dtype=torch.int64, device=device)
         torch.npu.synchronize()
-        ticket = source.register(tensors if args.source_count > 1 else tensors[0], stream=stream)
-        port = source.listen("127.0.0.1:0")
-        pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
-        if receive(pipe, "attached") is False:
-            source.shutdown()
-            pipe.send(("closed", None))
-            return
+        source.register(tensors if args.source_count > 1 else tensors[0], receiver=receiver, stream=stream)
+        pipe.send(("connected", None))
         normal_rounds, total_rounds = round_counts(args)
         for iteration in range(total_rounds):
             hbm = tensors[iteration % args.source_count]
@@ -122,7 +117,7 @@ def producer(pipe, args, offsets):
                 stages["ready"].append(ready_us)
                 stages["release_batch"].append(release_us)
             pipe.send(("released", iteration))
-        receive(pipe, "detached")
+        receive(pipe, "shutdown")
         source.shutdown()
         print_stages("NPU_HBM_BENCH_PROFILE", "producer", stages, args.warmup)
         pipe.send(("closed", None))
@@ -156,20 +151,16 @@ def main():
         npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
         batch_get_max_inflight_total=args.max_inflight_total)
     worker = None
-    waiting_for_attach = False
     try:
         runtime.initialize()
         assert runtime.initialized and not runtime.ddr_initialized
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
-        worker = ctx.Process(target=producer, args=(child, args, offsets))
+        receiver = runtime.listen_hbm("127.0.0.1:0", local_eid=args.npu_eid_a_raw)
+        worker = ctx.Process(target=producer, args=(child, args, offsets, receiver))
         worker.start()
         child.close()
-        address, ticket = receive(parent, "export")
-        waiting_for_attach = True
-        runtime.attach_hbm(address, ticket, local_eid=args.npu_eid_a_raw)
-        parent.send(("attached", True))
-        waiting_for_attach = False
+        receive(parent, "connected")
         stream = torch.npu.Stream(device=args.device_a)
         with torch.npu.stream(stream):
             output = torch.empty(payload_bytes + 2 * GUARD_BYTES, dtype=torch.uint8, device=device)
@@ -185,7 +176,7 @@ def main():
               f"max_inflight_total={args.max_inflight_total} "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
-              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0", flush=True)
+              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
         internal_stages = {}
         event_errors = set()
@@ -224,8 +215,7 @@ def main():
                     event_errors.add(result["profile"]["kernel_event_error"])
             parent.send(("reuse", iteration))
             assert receive(parent, "released") == iteration
-        runtime.detach_hbm(ticket)
-        parent.send(("detached", None))
+        parent.send(("shutdown", None))
         receive(parent, "closed")
         worker.join(10)
         assert worker.exitcode == 0
@@ -251,14 +241,6 @@ def main():
               flush=True)
     except BaseException:
         traceback.print_exc()
-        if waiting_for_attach and not runtime.pending_raw_addr:
-            try:
-                runtime.detach_hbm(ticket)
-                parent.send(("attached", False))
-                receive(parent, "closed")
-                worker.join(10)
-            except Exception as error:
-                print(f"NPU_HBM_BENCH_STARTUP_CLEANUP_FAILED: {error}", flush=True)
         if runtime.pending_raw_addr or (worker is not None and worker.is_alive()):
             retain("NPU HBM benchmark output or source remains retained")
         runtime.shutdown()

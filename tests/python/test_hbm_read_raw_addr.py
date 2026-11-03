@@ -1,7 +1,7 @@
 """A BatchPut/BatchGet DDR + CPU and NPU Pull from the same B tensors.
 
-Run with the existing CPU service. The B source control listener is embedded
-in the spawned producer process; payload never travels through its Pipe/TCP.
+Run with the existing CPU service. The A Runtime owns the control listener; B registers and connects in one call.
+Payload never travels through its Pipe/TCP.
 Both paths independently register the same 1..4096 tensors. Each round reads
 one selected tensor through both paths before allowing B to reuse its storage.
 """
@@ -16,7 +16,7 @@ RAW_LENGTHS = [1, 656, 100001]
 RAW_DESTINATIONS = [100, 500, 4096]
 
 
-def producer(pipe, args, ddr_ticket):
+def producer(pipe, args, ddr_ticket, receiver):
     import torch
     import torch_npu  # noqa: F401
     import kvaf
@@ -38,17 +38,9 @@ def producer(pipe, args, ddr_ticket):
     try:
         registration = tensors if args.hbm_mrs > 1 else tensors[0]
         cpu_desc = cpu_source.register(ddr_ticket, registration)
-        ticket = a_source.register(registration)
+        a_source.register(registration, receiver=receiver, stream=stream)
         assert cpu_desc.mr_count == args.hbm_mrs
-        port = a_source.listen("127.0.0.1:0")
-        pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
         pipe.send(("cpu_source", cpu_desc))
-        if receive(pipe, "attached") is False:
-            # A failed before publishing any batch and has no unresolved READ.
-            a_source.shutdown()
-            cpu_source.shutdown()
-            pipe.send(("closed", None))
-            return
         assert a_source.connected
         for round_id in range(args.rounds):
             hbm = tensors[round_id % args.hbm_mrs]
@@ -74,7 +66,7 @@ def producer(pipe, args, ddr_ticket):
             a_source.release_batch(raw_batch)
             assert not cpu_source.frozen and not a_source.frozen
             pipe.send(("released", round_id))
-        receive(pipe, "detached")
+        receive(pipe, "shutdown")
         a_source.shutdown()
         cpu_source.shutdown()
         pipe.send(("closed", None))
@@ -145,17 +137,12 @@ def main():
     runtime.batch_put([0], marker_hbm, [0], [656])
     ctx = mp.get_context("spawn")
     parent, child = ctx.Pipe()
-    worker = ctx.Process(target=producer, args=(child, args, ticket))
+    receiver = runtime.listen_hbm("127.0.0.1:0", local_eid=args.npu_eid_a_raw)
+    worker = ctx.Process(target=producer, args=(child, args, ticket, receiver))
     worker.start()
     child.close()
-    producer_waiting_for_attach = False
     try:
-        address, export = receive(parent, "export")
         runtime.attach_cpu_source(receive(parent, "cpu_source"))
-        producer_waiting_for_attach = True
-        runtime.attach_hbm(address, export, local_eid=args.npu_eid_a_raw)
-        parent.send(("attached", True))
-        producer_waiting_for_attach = False
         stream = torch.npu.Stream(device=args.device_a)
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
         for round_id in range(args.rounds):
@@ -195,8 +182,7 @@ def main():
             assert receive(parent, "released") == round_id
             print(f"HBM_RAW_ROUND_PASS round={round_id} mr_id={raw_batch.mr_id} raw_bytes={sum(RAW_LENGTHS)} "
                   "ddr_batch_get=1 cpu_pull=1 shared_source_tensors=1 padding_checked=1 npu_consumer_checked=1", flush=True)
-        runtime.detach_hbm(export)
-        parent.send(("detached", None))
+        parent.send(("shutdown", None))
         receive(parent, "closed")
         worker.join(10)
         assert worker.exitcode == 0
@@ -205,14 +191,6 @@ def main():
               "shared_source_tensors=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1", flush=True)
     except BaseException:
         traceback.print_exc()
-        if producer_waiting_for_attach and not runtime.pending_raw_addr and not runtime.pending_offload:
-            try:
-                runtime.detach_hbm(export)
-                parent.send(("attached", False))
-                receive(parent, "closed")
-                worker.join(10)
-            except Exception as cleanup_error:
-                print(f"HBM_RAW_STARTUP_CLEANUP_FAILED: {cleanup_error}", flush=True)
         if runtime.pending_raw_addr or runtime.pending_offload or worker.is_alive():
             retain("A raw READ/offload or B source still retained")
         runtime.shutdown()

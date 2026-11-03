@@ -21,8 +21,8 @@ def main() -> int:
                 raise RuntimeError(f"KVAF shared DDR binding is incomplete: {owner}")
 
     if options.require_aiv or options.require_offload:
-        for owner, names in (("NpuPullHbmSource", ("register", "listen", "ready", "release_batch", "shutdown")),
-                             ("NpuRuntime", ("attach_hbm", "batch_get_raw_addr", "resolve_raw_addr", "detach_hbm"))):
+        for owner, names in (("NpuPullHbmSource", ("register", "ready", "release_batch", "shutdown")),
+                             ("NpuRuntime", ("listen_hbm", "batch_get_raw_addr", "resolve_raw_addr", "cancel_raw_addr"))):
             if not hasattr(kvaf, owner) or any(not hasattr(getattr(kvaf, owner), name) for name in names):
                 raise RuntimeError(f"KVAF raw HBM READ binding is incomplete: {owner}")
 
