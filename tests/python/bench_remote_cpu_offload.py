@@ -1,7 +1,7 @@
 """Hardware benchmark of batched CPU READ with a persistent B HBM source.
 
 No AIV kernel is required. CPU_PULL_PROFILE measures transport time; the Python
-metric includes offload RPCs and commit. Full DDR checksum verification runs in
+metric measures the complete batch_cpu_pull call, including commit. Full DDR checksum verification runs in
 a separate RPC after the measured call and before freeing/reusing any slot.
 """
 import argparse
@@ -15,23 +15,22 @@ from test_remote_cpu_offload import receive, retain
 from pull_bench_utils import print_stages, summarize_us
 
 
-def measure_pull(runtime, ready, keys, src, sizes, make_destinations,
+INTERNAL_STAGES = ("binding_prepare", "native_total", "validation", "prepare_put", "dst_offsets",
+                   "submit_cpu_pull", "wait_cpu_pull", "commit_put", "native_other")
+
+
+def measure_pull(runtime, ready, keys, src, sizes, *, profile=True,
                  clock=time.perf_counter_ns):
-    """Consecutive Host boundaries; stages sum exactly to prepare-to-commit time."""
+    """One public wrapper call; diagnostics and slot release are timed by the caller."""
     begin = clock()
-    put = runtime.prepare_put(keys, sizes)
-    prepared = clock()
-    dst = make_destinations(put)
-    organized = clock()
-    runtime.submit_cpu_pull(ready, put, src, dst, sizes)
-    submitted = clock()
-    runtime.wait_cpu_pull(put)
-    waited = clock()
-    runtime.commit_put(put)
-    committed = clock()
-    return dict(total=(committed-begin)/1000, prepare_put=(prepared-begin)/1000,
-                dst_addrs=(organized-prepared)/1000, submit_cpu_pull=(submitted-organized)/1000,
-                wait_cpu_pull=(waited-submitted)/1000, commit_put=(committed-waited)/1000)
+    result = runtime.batch_cpu_pull(keys, ready, src, sizes, profile=profile)
+    elapsed = (clock() - begin) / 1000
+    timing = dict(total=elapsed)
+    if profile:
+        timing.update((name, result["profile"][name + "_us"]) for name in INTERNAL_STAGES)
+        # Durations on this Host only. Includes dispatch, GIL handling and result conversion.
+        timing["python_and_binding_other"] = max(0.0, elapsed - timing["binding_prepare"] - timing["native_total"])
+    return timing
 
 
 def layout(args):
@@ -105,6 +104,8 @@ def main():
     parser.add_argument("--block-bytes", type=int, default=656)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--no-profile", dest="profile", action="store_false",
+                        help="disable internal Host stage timers; measure only wrapper total and diagnostics")
     args = parser.parse_args()
     if args.device_a == args.device_b or not 2 <= args.blocks <= 4096:
         parser.error("use distinct devices and 2..4096 blocks")
@@ -142,14 +143,13 @@ def main():
               f"b_eid={receive(parent, 'registered')} blocks={args.blocks} "
               f"block_bytes={args.block_bytes}", flush=True)
         keys = list(range(args.blocks))
-        stages = {name: [] for name in ("total", "prepare_put", "dst_addrs", "submit_cpu_pull",
-                                       "wait_cpu_pull", "commit_put", "last_offload_checksum",
-                                       "verification", "batch_free")}
-        def make_destinations(put):
-            return torch.tensor([e.address for e in put.entries], dtype=torch.int64, device="cpu")
+        names = ("total", "last_offload_checksum", "verification", "batch_free")
+        if args.profile:
+            names += INTERNAL_STAGES + ("python_and_binding_other",)
+        stages = {name: [] for name in names}
         for iteration in range(args.warmup + args.iterations):
             batch = receive(parent, "ready")
-            timing = measure_pull(runtime, batch, keys, src, sizes, make_destinations)
+            timing = measure_pull(runtime, batch, keys, src, sizes, profile=args.profile)
             # This RPC now performs the actual CPU scan, outside offload timing.
             verify_begin = time.perf_counter_ns()
             actual = runtime.last_offload_checksum()
@@ -172,10 +172,11 @@ def main():
         stats = summarize_us(stages["total"])
         mean = stats["mean_us"]
         print_stages("CPU_PULL_BENCH_PROFILE", "reader", stages, args.warmup)
-        print("CPU_PULL_BENCH_PASS metric=python_prepare_put_to_commit "
+        print("CPU_PULL_BENCH_PASS metric=python_batch_cpu_pull_to_commit "
               f"iterations={stats['samples']} mean_us={mean:.1f} p50_us={stats['p50_us']:.1f} "
               f"p95_us={stats['p95_us']:.1f} p99_us={stats['p99_us']:.1f} "
               f"effective_GBps={args.blocks * args.block_bytes / mean / 1000:.3f} "
+              f"profile_enabled={int(args.profile)} profile_overhead_included={int(args.profile)} "
               "cpu_checksum_included=0 registration_and_producer_and_free_excluded=1 "
               f"verification_mean_us={summarize_us(stages['verification'])['mean_us']:.1f} "
               "percentile=linear "

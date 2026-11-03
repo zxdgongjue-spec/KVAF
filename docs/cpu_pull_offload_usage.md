@@ -46,29 +46,62 @@ CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 `-DASCEND_CANN_PACKAGE_PATH=/实际目录` 指定。此构建只需要 CANN host runtime，
 不编译 AIV kernel。最后一条命令应指向新构建目录内的 kvaf。
 
-## 本卡 HBM 的 CPU Pull
+## 统一 CPU Pull 便利入口
+
+本卡和非本卡都使用已注册源的 ReadyToken，一次调用完成 PreparePut、目的地址组织、
+Submit、Wait 和 Commit。原来直接传本卡 tensor/stream 的形式已删除。
+下面将生产和消费代码写在同一进程，跨进程时通过应用 Connector 交换 ticket、desc、ready 和完成通知：
 
 ```python
 runtime = kvaf.NpuRuntime(device_id=7, enable_cpu_offload=True)
 runtime.link_to("127.0.0.1:28999")
 runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
-runtime.batch_cpu_pull([1, 3], source, [7, 100003], [656, 100001], stream=producer_stream)
+
+cpu_source = kvaf.CpuPullHbmSource(device_id=7)
+desc = cpu_source.register(runtime.offload_region(), tensor, stream=producer_stream)
+runtime.attach_cpu_source(desc)
+
+# 每批：应用在选定 tensor 中写入后，先等待生产完成。
+producer_stream.synchronize()
+ready = cpu_source.ready()
+runtime.batch_cpu_pull([1, 3], ready, [7, 100003], [656, 100001])
 checksum = runtime.last_offload_checksum()  # 独立诊断，未计入传输调用
+cpu_source.release_batch(ready)  # 跨进程时由 Connector 通知生产端执行
 runtime.batch_free([1, 3])
+
+cpu_source.shutdown()  # 先注销源，再关闭持有 DDR 的 Runtime。
 runtime.shutdown()
 ```
 
-source 是本卡连续 NPU Tensor；元数据使用 Host 整数序列或连续一维 CPU int64 Tensor。偏移和长度均为字节。每个 key 对应一个由 MetaManager 分配的槽位，长度不超过 slot_size；每批最多 4096 个块。省略 stream 时使用当前 NPU stream。
+keys、src_offsets、lengths 使用三个等长的 Host 整数序列或连续一维 CPU int64 Tensor。
+每个 key 对应一个源段；源偏移相对 Ready 选中的 tensor，长度不超过 slot_size，每批最多 4096 段。
+目的地址来自内部 PreparePut，与普通 BatchPut 共用槽位和 MetaManager。
+多 MR 场景初始化用 `register(ticket, tensors)`，每批用 `ready(tensors[i])`，消费接口不变。
 
-`batch_cpu_pull()` 同步等待源生产、CPU READ 和 Meta Commit；成功返回 None，失败抛异常。注册在源不变时复用，切换源或 shutdown 时注销。相同参数再次调用表示新批次，不是恢复；目标 keys 仍占用时会被拒绝。
+默认成功返回 None，表示 CPU READ 和 Meta Commit 完成；失败抛异常。
+可选 `profile=True` 时成功返回 `{"profile": {...}}`，包含本次调用的 Host 阶段耗时，单位微秒；
+默认不读取阶段时钟，恢复接口也不累计跨调用 profile。生产同步与源注册/释放
+始终由生产端应用管理，便利入口不接收 stream 或 tensor，也不自动释放 Ready。
+自定义槽内布局或一 key 多源段继续使用显式 `prepare_put/submit_cpu_pull/wait_cpu_pull/commit_put`。
 
-明确失败内部 Abort；DMA 未决时保留源和槽位并阻止新操作。应用停止使用该 Runtime，调用 shutdown 核验并清理原操作；shutdown 不发起新 READ，也不能在 DMA 尚未结束时强行释放。Python 会保留源引用；C++ 调用者需保持输入分配有效，直到换源注销成功或 shutdown 成功。已发起 Commit 的批次在确认丢失后仍完成原 Commit 决定。
+`timeout=None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000 毫秒）。其语义与
+`wait_cpu_pull` 相同，只控制完成轮询，不覆盖单次网络 RPC 超时。
+明确失败内部 Abort；DMA 未决时保留内部 Put 和槽位，保持源数据不变，用
+`runtime.resolve_cpu_pull(timeout=30000)` 恢复。恢复只查询/等待原任务并 Commit/Abort，
+不重新发起 READ；成功提交返回 None，失败或仍未决抛异常。
+`pending_offload=True` 表示仍需保留；为 False 的明确失败已安全撤销，生产端可 Cancel/Release。
+同参数再次调用 batch_cpu_pull 是新操作，不能用于恢复；目标 keys 仍占用时也会被拒绝。
+Commit 或 Abort 确认丢失后只能继续原决定。shutdown 可尝试非阻塞恢复，但不会代替生产端注销源。
 
 ## 验收命令
 
 ```bash
-# 本卡便利入口：三轮变化数据，1/656/100001 字节，校验后释放槽位。
+# 统一便利入口、本卡源：三轮变化数据，1/656/100001 字节，校验后释放槽位。
 python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7
+
+# 统一便利入口、跨卡源：
+python tests/python/test_remote_cpu_offload.py \
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --pull-api batch
 
 # 应用 Connector 显式接口：两张卡、同一个共享 DDR 池。
 python tests/python/test_remote_cpu_offload.py \
@@ -77,7 +110,7 @@ python tests/python/test_remote_cpu_offload.py \
 # 78 个独立分配的 tensor，逐个注册 MR、共用连接；每个 tensor 拉取两轮。
 python tests/python/test_remote_cpu_offload.py \
   --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 \
-  --tensors 78 --rounds 156
+  --tensors 78 --rounds 156 --pull-api batch
 ```
 
 本卡测试可用 `--npu-eid` 固定 CPU↔本卡路由、用 `--cpu-candidate` 固定 CPU 设备。共享池首先由 Runtime 分配并固定 CPU candidate，源注册在该池上尝试 NPU EID；不会为每个源重建 DDR 池。
@@ -92,9 +125,12 @@ python tests/python/test_remote_cpu_offload.py \
 
 生产端调用 `source.register(ticket, tensors)` 注册列表，再用 `source.ready(tensors[i])`
 选择本批源。原单 tensor 的 `register(ticket, tensor)` 和 `ready()` 保持可用。
-读取端仍使用 `attach_cpu_source(desc)` 和
-`submit_cpu_pull(ready, put, src_offsets, dst_addrs, lengths)`，不新增句柄参数。
-`src_offsets` 始终相对选定 tensor，`dst_addrs` 来自本次 `prepare_put()` 分配。
+读取端使用 `attach_cpu_source(desc)`，每批调用
+`batch_cpu_pull(keys, ready, src_offsets, lengths)`；需要自定义目的布局时使用
+`submit_cpu_pull(ready, put, src_offsets, dst_offsets, lengths)`，不新增连接句柄参数。
+`src_offsets` 始终相对选定 tensor，`dst_offsets` 在提取本次 `prepare_put()` 结果时计算：
+`entry.address - runtime.remote_region["base"] + 槽内偏移`。Submit 不再执行减基地址，
+便利入口内部完成该计算；PreparePut 和普通 BatchPut 仍使用绝对地址。
 
 78 个 MR 共用一组 4 Jetty。每个共享 DDR Region 只保留一份 pinned 本地接收 MR，
 另外仍保留原先供 NPU BatchGet/BatchPut 访问的 DDR 导出 MR。`ready(tensor)`
@@ -105,9 +141,13 @@ python tests/python/test_remote_cpu_offload.py \
 成功注册日志包含 `mrs=78 jettys=4 probe=all_mrs_scratch_checksum_pass`。
 `REMOTE_PULL_DONE` 中的 `mr` 随所选 tensor 改变；验收终行应有
 `REMOTE_OFFLOAD_PASS ... tensors=78 single_mr_per_batch=1`。
-每轮 checksum 和重复提交校验继续保留，且不重新注册或重建连接。
+每轮 checksum 校验继续保留，显式模式另外验证重复提交，且两种模式都不重新注册或重建连接。
 
 ## 性能测试与阶段统计
+
+bench 现在每批仅调用一次 `runtime.batch_cpu_pull(keys, ready, src_offsets, lengths)`，
+不再在 Python 分别执行 Prepare/Submit/Wait/Commit，也不在 Python 组织目的偏移数组。
+需要重新构建 NPU 运行库和 Python 扩展；CPU 控制协议与 READ 数据面未变化。
 
 CPU 服务开启统计后，每个源连接独立累计 READ 样本，正常注销源时输出汇总；READ
 失败时也会输出当时的汇总。探测与校验 RPC 不计入样本。可沿用已有构建目录，例如：
@@ -143,14 +183,35 @@ ddr_base、调用数、失败数、丢弃样本数；失败仅计数，不混入
 | `other` | READ 总时间减去 build/post/cq_wait 的余量 |
 | `total` | CPU backend 的 READ 调用时间，不含摘要采集/打印、校验、上层控制 RPC |
 
-Python 输出 `CPU_PULL_BENCH_PROFILE_STAGE`，同样排除预热并给出全部分位数：
+Python 输出 `CPU_PULL_BENCH_PROFILE_STAGE`，同样排除预热并给出全部分位数。
+bench 默认传入 `profile=True`，输出以下阶段（均为消费端 Host 耗时）：
 
-- reader：`prepare_put`、`dst_addrs`（应用组织 DDR 绝对地址）、`submit_cpu_pull`、`wait_cpu_pull`、`commit_put`，其总和为 `total`。
-- reader 另列 `last_offload_checksum`、`verification`、`batch_free`，均不包含在传输 `total` 中；checksum 是 verification 的组成部分，不能重复相加。
-- producer：`ready`、`release_batch`。源写入与同步、业务通知 IPC、注册/建链均不计入传输总时间。
+| reader 阶段 | 含义 |
+| --- | --- |
+| `total` | Python 调用 batch_cpu_pull 前，到函数返回后；包含参数转换、事务、等待和提交 |
+| `binding_prepare` | Python 绑定转换 keys、src_offsets、lengths 和超时参数 |
+| `native_total` | C++ BatchCpuPull 的完整耗时，包含下列六个阶段及 native_other |
+| `validation` | 初始化状态、批次数量、Ready 类型/MR 和源范围检查 |
+| `prepare_put` | 内部 PreparePut，分配并预留 DDR 槽位 |
+| `dst_offsets` | C++ 提取槽位地址并减 DDR base |
+| `submit_cpu_pull` | 内部 Submit，包括请求检查、快照和控制 RPC |
+| `wait_cpu_pull` | 内部完成轮询与等待；不是 CPU READ 纯传输耗时 |
+| `commit_put` | 元数据提交及 CPU 完成确认 |
+| `native_other` | native_total 减去六个内部阶段之和 |
+| `python_and_binding_other` | total 减 binding_prepare 与 native_total，包含分派、GIL 和结果字典转换等 |
 
-`CPU_PULL_BENCH_PASS` 的 `metric=python_prepare_put_to_commit` 包含事务/控制开销，
-不能与 CPU backend 的 total 等同；也不跨进程相减时间戳。
+`native_total = validation + prepare_put + dst_offsets + submit_cpu_pull + wait_cpu_pull + commit_put + native_other`；
+`total = binding_prepare + native_total + python_and_binding_other`。父子计时存在包含关系，不能把所有行累加。
+
+reader 另列 `last_offload_checksum`、`verification`、`batch_free`，均不包含在 `total` 中；
+checksum 属于 verification，不能重复相加。producer 继续单列 `ready`、`release_batch`；
+源写入与同步、业务通知 IPC、注册/建链均不计入传输总时间。
+
+`CPU_PULL_BENCH_PASS` 的指标名现在为 `metric=python_batch_cpu_pull_to_commit`。
+默认 `profile_enabled=1 profile_overhead_included=1`，总耗时包含阶段计时与结果字典转换开销。
+需要测默认不采集阶段数据的接口开销时，在相同命令后增加 `--no-profile`：只输出调用总时间和
+计时外诊断/释放时间；`profile_enabled=0`，CPU 服务的 READ 统计不受此开关影响。
+总时间包含事务/控制开销，不能与 CPU backend 的 total 等同，也不跨进程相减时间戳。
 CPU 与 Python 分位数统一按 `(N-1)*p` 线性插值，各阶段分位数不可相加。
 统计只在开启时存储逐批耗时，不保存 payload；汇总与排序在 READ 计时之外完成。
 这些脚本不再包含 serial 模式。

@@ -4,7 +4,7 @@ import io
 import unittest
 
 from bench_hbm_read_raw_addr import parse_args, round_counts, pattern_phase
-from bench_remote_cpu_offload import measure_pull
+from bench_remote_cpu_offload import INTERNAL_STAGES, measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
 
 
@@ -32,45 +32,45 @@ class PullBenchmarks(unittest.TestCase):
         with self.assertRaises(ValueError):
             scattered_offsets(4, 100, 399, 0)
 
-    def test_cpu_interface_timing_is_additive_and_excludes_diagnostics(self):
-        events = []
-        now = 0
+    def test_cpu_bench_uses_one_wrapper_call_and_excludes_diagnostics(self):
+        for profiling in (False, True):
+            with self.subTest(profiling=profiling):
+                events = []
+                now = 0
+                keys, ready, src, sizes = [1], object(), [32], [8]
+                test = self
 
-        def step(name, us):
-            nonlocal now
-            events.append(name)
-            now += us * 1000
+                class Runtime:
+                    # No explicit transaction or diagnostic methods: the benchmark
+                    # must use only the same entrypoint as the application.
+                    def batch_cpu_pull(self, actual_keys, actual_ready, actual_src, actual_sizes, *, profile):
+                        nonlocal now
+                        test.assertIs(actual_keys, keys)
+                        test.assertIs(actual_ready, ready)
+                        test.assertIs(actual_src, src)
+                        test.assertIs(actual_sizes, sizes)
+                        test.assertEqual(profile, profiling)
+                        events.append("batch_cpu_pull")
+                        now += 150 * 1000
+                        if profile:
+                            return {"profile": dict(binding_prepare_us=10, native_total_us=130,
+                                validation_us=5, prepare_put_us=10, dst_offsets_us=15,
+                                submit_cpu_pull_us=20, wait_cpu_pull_us=40, commit_put_us=30,
+                                native_other_us=10)}
 
-        prepared_put = object()
-        test = self
-
-        class Runtime:
-            def prepare_put(self, *args):
-                step("prepare_put", 10)
-                return prepared_put
-
-            def submit_cpu_pull(self, ready, put, src, dst, sizes):
-                test.assertIs(put, prepared_put)
-                step("submit_cpu_pull", 30)
-
-            def wait_cpu_pull(self, put):
-                test.assertIs(put, prepared_put)
-                step("wait_cpu_pull", 40)
-
-            def commit_put(self, put):
-                test.assertIs(put, prepared_put)
-                step("commit_put", 50)
-
-        def organize(put):
-            self.assertIs(put, prepared_put)
-            step("dst_addrs", 20)
-            return [0]
-
-        result = measure_pull(Runtime(), None, [1], [0], [8], organize, clock=lambda: now)
-        self.assertEqual(events, ["prepare_put", "dst_addrs", "submit_cpu_pull", "wait_cpu_pull", "commit_put"])
-        self.assertEqual(result, dict(total=150, prepare_put=10, dst_addrs=20,
-                                      submit_cpu_pull=30, wait_cpu_pull=40, commit_put=50))
-        self.assertEqual(result["total"], sum(v for k, v in result.items() if k != "total"))
+                result = measure_pull(Runtime(), ready, keys, src, sizes,
+                                      profile=profiling, clock=lambda: now)
+                self.assertEqual(events, ["batch_cpu_pull"])
+                self.assertEqual(result["total"], 150)
+                if profiling:
+                    self.assertEqual(set(result), {"total", "python_and_binding_other", *INTERNAL_STAGES})
+                    self.assertEqual(result["python_and_binding_other"], 10)
+                    self.assertEqual(result["native_total"], sum(result[k] for k in INTERNAL_STAGES
+                                                               if k not in ("binding_prepare", "native_total")))
+                    self.assertEqual(result["total"], result["native_total"] + result["binding_prepare"]
+                                     + result["python_and_binding_other"])
+                else:
+                    self.assertEqual(result, dict(total=150))
 
     def test_multi_mr_warmup_and_patterns(self):
         args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--source-count", "78"])

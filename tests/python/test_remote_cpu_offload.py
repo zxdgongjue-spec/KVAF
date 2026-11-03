@@ -104,6 +104,8 @@ def main():
     parser.add_argument("--batch-put-kernel", default="")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--tensors", type=int, default=1)
+    parser.add_argument("--pull-api", choices=("explicit", "batch"), default="explicit",
+                        help="explicit transaction steps or the unified batch_cpu_pull wrapper")
     args = parser.parse_args()
     if args.device_a == args.device_b or args.rounds < 2:
         parser.error("use two distinct NPUs and at least two rounds")
@@ -126,6 +128,7 @@ def main():
     runtime.link_to(args.cpu)
     runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
     ticket = runtime.offload_region()
+    ddr_base = runtime.remote_region["base"]
     print(f"shared DDR region={ticket['region_id']} epoch={ticket['epoch']} "
           f"cpu_candidate={ticket['cpu_candidate']} base={ticket['base']:#x}", flush=True)
     lengths = [656] * 3 if aiv else [1, 656, 100001]
@@ -143,26 +146,32 @@ def main():
         runtime.attach_cpu_source(receive(parent, "cpu_source"))
         for round_id in range(args.rounds):
             batch = receive(parent, "ready")
-            put = runtime.prepare_put(KEYS, lengths)
-            assert not put.submitted and put.state == kvaf.CpuPullState.PREPARED
             src = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
-            dst = torch.tensor([entry.address for entry in put.entries],
-                               dtype=torch.int64, device="cpu")
             sizes = torch.tensor(lengths, dtype=torch.int64, device="cpu")
-            result = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
-            assert result is None and put.submitted
-            state = runtime.wait_cpu_pull(put, timeout=30000)
-            assert state == kvaf.CpuPullState.DONE
-            runtime.commit_put(put)
+            if args.pull_api == "batch":
+                result = runtime.batch_cpu_pull(KEYS, batch, src, sizes)
+                assert result is None
+                assert not runtime.pending_offload
+            else:
+                put = runtime.prepare_put(KEYS, lengths)
+                assert not put.submitted and put.state == kvaf.CpuPullState.PREPARED
+                dst = torch.tensor([entry.address - ddr_base for entry in put.entries],
+                                   dtype=torch.int64, device="cpu")
+                result = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
+                assert result is None and put.submitted
+                state = runtime.wait_cpu_pull(put, timeout=30000)
+                assert state == kvaf.CpuPullState.DONE
+                runtime.commit_put(put)
             expected = pattern(torch, round_id)
             rows = [expected[o:o+n] for o, n in zip(OFFSETS, lengths)]
             checksum = fnv64(b"".join(bytes(row.tolist()) for row in rows))
             assert runtime.last_offload_checksum() == checksum, "CPU DDR checksum mismatch"
-            duplicate = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
-            assert duplicate is None and put.submitted
-            assert runtime.query_cpu_pull(put) == kvaf.CpuPullState.COMMITTED
-            runtime.commit_put(put)
-            assert runtime.last_offload_checksum() == checksum
+            if args.pull_api == "explicit":
+                duplicate = runtime.submit_cpu_pull(batch, put, src, dst, sizes)
+                assert duplicate is None and put.submitted
+                assert runtime.query_cpu_pull(put) == kvaf.CpuPullState.COMMITTED
+                runtime.commit_put(put)
+                assert runtime.last_offload_checksum() == checksum
             table = runtime.prepare_access_table(KEYS)
             try:
                 view = runtime.access_table_view(table)
@@ -180,7 +189,8 @@ def main():
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        print(f"REMOTE_OFFLOAD_PASS shared_pool=1 duplicate_notification=1 producer_reuse_ack=1 "
+        print(f"REMOTE_OFFLOAD_PASS shared_pool=1 duplicate_notification={int(args.pull_api == 'explicit')} "
+              f"producer_reuse_ack=1 pull_api={args.pull_api} "
               f"connector_api=1 tensors={args.tensors} single_mr_per_batch=1", flush=True)
     except BaseException:
         traceback.print_exc()

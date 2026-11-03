@@ -1,6 +1,6 @@
 # 共享 DDR 与 CPU Pull
 
-同一个 `NpuRuntime(enable_cpu_offload=True)` 管理普通 BatchPut/BatchGet、本卡 `batch_cpu_pull()` 和跨卡显式 CPU Pull 事务。它们共享 RuntimeCore、MetaManager、DDR allocator 和 DDR region；数据面连接各自独立。
+同一个 `NpuRuntime(enable_cpu_offload=True)` 管理普通 BatchPut/BatchGet、统一 `batch_cpu_pull()` 和显式 CPU Pull 事务。它们共享 RuntimeCore、MetaManager、DDR allocator 和 DDR region；数据面连接各自独立。
 
 源由 `CpuPullHbmSource` 注册，可位于 Runtime 本卡或另一张卡。源端不分配第二个 DDR 池，只绑定读取端提供的 DDR ticket。完整应用职责及接口见 [Connector 设计](connector_pull_api_design.md)。本文沿用验收脚本的 A=读取端、B=生产端。
 
@@ -33,8 +33,9 @@ ready = source.ready()
 lengths = torch.tensor([656, 100001], dtype=torch.int64, device="cpu")
 src = torch.tensor([7, 100003], dtype=torch.int64, device="cpu")
 put = runtime.prepare_put([1, 3], lengths)
-dst_addrs = torch.tensor([e.address for e in put.entries], dtype=torch.int64, device="cpu")
-runtime.submit_cpu_pull(ready, put, src, dst_addrs, lengths)
+ddr_base = runtime.remote_region["base"]
+dst_offsets = torch.tensor([e.address - ddr_base for e in put.entries], dtype=torch.int64, device="cpu")
+runtime.submit_cpu_pull(ready, put, src, dst_offsets, lengths)
 runtime.wait_cpu_pull(put)
 runtime.commit_put(put)
 
@@ -42,23 +43,31 @@ runtime.commit_put(put)
 source.release_batch(ready)
 ```
 
-CPU 源偏移相对于注册 HBM 的逻辑起点；目的直接使用 PreparePut 返回的 DDR 绝对地址，可加槽内偏移。Runtime 内部转换为 CPU 协议使用的相对偏移，应用无需解析 DDR ticket。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。源绑定保存在 Runtime 内，通过 ready.source 自动查找，不需要应用保存本地源句柄。
+CPU 源偏移相对于注册 HBM 的逻辑起点；目的在提取 PreparePut 地址时计算 `entry.address - runtime.remote_region["base"] + 槽内偏移`。Submit 直接接收相对偏移，CPU 加回同一 DDR 池基地址执行 READ；便利入口内部完成偏移提取。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。源绑定保存在 Runtime 内，通过 ready.source 自动查找，不需要应用保存本地源句柄。
 
-## 本卡便利入口
+## 统一便利入口
+
+初始化注册和 Ready 流程与上面相同。本卡与非本卡都可将 Prepare/Submit/Wait/Commit 简化为：
 
 ```python
-runtime.batch_cpu_pull(keys, local_npu_tensor, input_offsets, lengths, stream=producer_stream)
+runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, timeout=30000)
 ```
 
-同步语义与 BatchPut 一致：成功返回时数据和元数据提交均完成。内部注册本卡源、等待生产、PreparePut、组织目的绝对地址、提交 CPU READ、等待及确认批次复用。应用不管理内部 put。源注册缓存至切换 Tensor 或 shutdown；同参数再次调用是新批次。
+每个 key 对应一个源段，目标在内部提取 PreparePut 返回的槽位起点时减去 DDR base，以相对偏移提交。
+默认成功返回 None 表示数据和元数据提交均完成；内部 Put 不暴露给应用。
+可选 `profile=True` 时成功返回含 Host 阶段时间的 profile 字典。bench 使用此统一入口，
+默认保留阶段统计，`--no-profile` 关闭内部计时；数据校验仍位于调用总计时之外。
+生产同步、Ready、Release/Cancel 和源注销仍由生产端管理；支持 Ready 选择预注册的多个 MR。
+同参数再次调用是新操作，未决恢复使用 `runtime.resolve_cpu_pull(timeout=30000)`。
 
-独立 OffloadRuntime、旧类别名、带范围 Ready、offload/offload_from、旧恢复入口已经删除。当前只保留上述便利入口及显式 Connector 事务接口。
+独立 OffloadRuntime、旧类别名、带范围 Ready、offload/offload_from、旧恢复入口以及
+直接传本卡 tensor/stream 的 batch_cpu_pull 重载已删除。当前保留统一便利入口及显式事务接口。
 
 ## 建链与协议
 
 Runtime 先分配共享 DDR，固定 CPU candidate。源注册在同一池上探测 CPU↔源卡 EID，使用 scratch READ，不覆盖缓存槽位。NPU↔NPU raw READ 的 fullmesh 链路独立配置。
 
-CPU Pull 控制协议 KVRP v5，支持一个源连接下多个 HBM MR；NPU Pull 控制协议仍为 KVHR v4。使用 CPU Pull 的服务和应用需同时重编译重启；旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+CPU Pull 控制协议 KVRP v5，支持一个源连接下多个 HBM MR；NPU Pull 控制协议为 KVHR v5。使用 CPU Pull 的服务和应用需同时重编译重启；旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 同一共享池一次只允许一个未完成或未确认的 Pull；每批最多 4096 spans，CPU 内部四 Jetty 并行。服务保留 source 的关闭记录用于确认重试，源注册次数（包括失败候选）上限为 4096，推荐长驻注册复用。
 
@@ -119,7 +128,7 @@ waves、活跃 Jetty 数和 plan_reused。该 total_us 包含描述符准备、�
 
 ### 2026-10-31 历史记录：1024 个 82 KiB 块
 
-此记录使用当时的旧便利接口；原始日志和指标保留。当前脚本已迁移到显式事务，指标名为 `python_prepare_put_to_commit`，需重新测量，不能将历史数字标为新接口成绩。
+此记录使用当时的旧便利接口；原始日志和指标保留。当前脚本使用统一 batch_cpu_pull 封装，指标名为 `python_batch_cpu_pull_to_commit`，需重新测量，不能将历史数字标为新接口成绩。
 
 用户硬件实测通过。删除串行对照、拆分校验计时后的版本为
 `codex/cpu-pull-hbm-reference` / `7fc988571e5ddf99f7ba4b9fecd38673b6fab900`。
@@ -174,7 +183,7 @@ GB/s 使用十进制单位。CPU 数据面时间包含描述符准备、提交�
 
 显式事务由应用持有一个 put：Submit 成功返回 None，查询、等待、提交和撤销均使用原 put。参数校验失败且 `put.submitted=False` 时可以修正参数后提交；`put.submitted=True` 表示请求已记录，即使 Submit 响应丢失也用原 put 恢复，不可重复 PreparePut 替代未决任务。它不表示 CPU 已接受或 DMA 已完成。生产端通过 `release_batch(ready)` 或尚未获取批次时的 `cancel_batch(ready)` 核验身份及状态。
 
-本卡 `batch_cpu_pull()` 自动处理可确认失败的 Abort。未决 DMA 保留内部事务并阻止新调用；`shutdown()` 只查询、确认并清理，不重发 READ。清理未成功时，源和 DDR 继续保持有效。Commit 已开始后，确认丢失不能逆转已发布的元数据。
+统一 `batch_cpu_pull()` 自动处理可确认失败的 Abort。未决 DMA 保留内部事务并阻止新调用，应用使用 `resolve_cpu_pull()` 查询、等待并完成原 Commit/Abort，不重发 READ。仍未决时保持源和 DDR 有效；Commit 已开始后不能逆转决定。生产端收到应用通知后 Release/Cancel，关闭源后才能释放消费端 DDR。shutdown 只尝试一次完成查询，不等待在途 DMA，也不代替生产端注销源。
 
 ## 构建与双卡验证
 

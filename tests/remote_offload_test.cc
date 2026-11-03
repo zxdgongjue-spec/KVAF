@@ -22,7 +22,7 @@ void Lifecycle(){
   kvaf::ReadyToken ready;Ok(b.Ready(&ready));
   Require(!b.ReleaseBatch(ready).ok()&&!a.Shutdown().ok(),"source lease blocks premature release");
   kvaf::PutHandle put;Ok(a.PreparePut({1,3},{64,128},&put));
-  std::vector<std::uint64_t> src{16,512},dst{put.entries()[0].address,put.entries()[1].address},sizes{64,128};
+  std::vector<std::uint64_t> src{16,512},dst{put.entries()[0].address-ticket.region.base,put.entries()[1].address-ticket.region.base},sizes{64,128};
   const int before=payload_reads, hashes=checksum_calls;
   Ok(a.SubmitCpuPull(ready,put,src,dst,sizes));kvaf::CpuPullState state;
   Ok(a.WaitCpuPull(put,1000,&state));Ok(a.CommitPut(put));
@@ -71,7 +71,7 @@ void SharedMetadata(){
   kvaf::ReadyToken ready;Ok(b.Ready(&ready));
   Ok(core.AttachCpuSource(std::get<kvaf::CpuPullSourceDesc>(ready.source)));
   kvaf::PutHandle put;Ok(core.PreparePut({1},{64},&put));
-  std::vector<std::uint64_t> src{64},dst{put.entries()[0].address},sizes{64};
+  std::vector<std::uint64_t> src{64},dst{put.entries()[0].address-core.remote_region().base},sizes{64};
   Ok(core.SubmitCpuPull(ready,put,src,dst,sizes));kvaf::CpuPullState state;
   Ok(core.WaitCpuPull(put,1000,&state));Ok(core.CommitPut(put));
   Require(aiv.puts==1&&!std::memcmp(server.pool.data()+256,b_data.data()+64,64),"Pull bypasses AIV and shares DDR");
@@ -86,45 +86,117 @@ void SharedMetadata(){
 }
 int producer_syncs=0;
 extern "C" aclError aclrtSynchronizeStream(aclrtStream){++producer_syncs;return 0;}
-void LocalAndFallback(){
+void UnifiedBatchCpuPull() {
   EidFixture fixture;
   const std::string eid1="00000000000000000000000000000001",eid5="00000000000000000000000000000005";
   EidFixture::Write(fixture.paths.rootinfo,EidFixture::Clos(0,eid1)+EidFixture::Clos(0,eid5));
   const char* prior=getenv("KVAF_HCCL_ROOTINFO_PATH");const bool had_prior=prior;const std::string saved=prior?prior:"";
   setenv("KVAF_HCCL_ROOTINFO_PATH",fixture.paths.rootinfo.c_str(),1);auto_mode=true;failed_route=1;
-  SharedServer server;kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;options.offload_timeout_ms=2;
-  kvaf::NpuRuntime a(options);Ok(a.LinkTo({server.address}));Ok(a.Initialize(1024,256));
-  std::vector<std::uint8_t> hbm(4096,0x43);kvaf::BatchPutRequest req{{2},{hbm.data(),hbm.size(),kvaf::DeviceKind::kNpu},{32},{64}};
-  Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));
-  Require(server.pool_allocations==1&&leases==1&&producer_syncs==1,"local Pull shares pool, synchronizes producer and caches source");
-  Require(!std::memcmp(server.pool.data()+512,hbm.data()+32,64),"local Pull payload");
-  kvaf::AccessTableHandle table;Ok(a.core().PrepareAccessTable({{2}},&table));kvaf::AccessTableView view;Ok(a.core().GetAccessTableView(table,&view));
-  Require(view.valid[0],"synchronous success includes metadata commit");Ok(a.core().ReleaseAccessTable(table));
-  const int reads=payload_reads,probes=scratch_reads;
-  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&!a.pending_offload()&&payload_reads==reads,"duplicate occupied key fails before transfer");
-  Ok(a.core().BatchFree({{2}}));hbm[32]=0x88;Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));
-  Require(server.pool[512]==0x88&&payload_reads==reads+1&&scratch_reads==probes,"each call is a new batch and reuses registration");
-  Ok(a.core().BatchFree({{2}}));
-  server.drop=unsigned(rp::Command::Ready);
-  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&!a.pending_offload()&&payload_reads==reads+1,"lost Ready aborts safely before READ");
-  // Metadata commit has happened; retry only its acknowledgement on shutdown.
-  server.drop=unsigned(rp::Command::Complete);
-  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&a.pending_offload(),"lost commit ACK retains the decision");
-  const int committed=payload_reads;Ok(a.Shutdown());Require(payload_reads==committed,"shutdown never replays READ");NoResources();
-  Ok(a.Initialize(1024,256));
-  hold_read=true;server.drop=unsigned(rp::Command::Submit);
-  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok()&&a.pending_offload(),"unresolved READ retains source and slots");
-  Require(!a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}).ok(),"repeated calls do not implicitly resume a pending operation");
-  Require(!a.Shutdown().ok()&&!a.core().BatchFree({{2}}).ok(),"in-flight DMA blocks cleanup and slot reuse");
+  SharedServer server;kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;options.offload_timeout_ms=1000;
+  kvaf::NpuRuntime reader(options);Ok(reader.LinkTo({server.address}));Ok(reader.Initialize(1024,256));
+  kvaf::OffloadRegionTicket ticket;Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::uint8_t> first(512,0x13),second(4096);
+  for(std::size_t i=0;i<second.size();++i)second[i]=(i*17+3)%251;
+  std::vector<kvaf::ConstBufferView> views{{first.data(),first.size(),kvaf::DeviceKind::kNpu},
+                                         {second.data(),second.size(),kvaf::DeviceKind::kNpu}};
+  aclrtSetDevice(0);kvaf::CpuPullHbmSource source(0);
+  Ok(source.Register(ticket,views,reinterpret_cast<void*>(1)));
+  kvaf::CpuPullSourceDesc desc;Ok(source.GetDescriptor(&desc));Ok(reader.AttachCpuSource(desc));
+  kvaf::ReadyToken ready;Ok(source.Ready(views[1],&ready));
+  std::vector<std::uint64_t> offsets{32,600},lengths{64,32};
+  const int reads=payload_reads,probes=scratch_reads,syncs=producer_syncs;
+  auto wrong=ready;wrong.mr_id=3;
+  Require(!reader.BatchCpuPull({3,1},wrong,offsets,lengths).ok(),"reject missing MR");
+  wrong=ready;wrong.source=kvaf::NpuPullSourceDesc{13,4096,7};
+  Require(!reader.BatchCpuPull({3,1},wrong,offsets,lengths).ok(),"reject NPU Pull Ready");
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,{64}).ok(),"reject unequal arrays");
+  Require(!reader.BatchCpuPull({3,1},ready,std::vector<std::uint64_t>{UINT64_MAX,600},lengths).ok(),"reject overflowing source");
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,{0,32}).ok(),"reject empty span");
+  wrong=ready;std::get<kvaf::CpuPullSourceDesc>(wrong.source).source_id++;
+  Require(!reader.BatchCpuPull({3,1},wrong,offsets,lengths).ok()&&!reader.pending_offload(),
+          "unattached source rolls back the internal Put");
+  Require(payload_reads==reads,"invalid convenience calls do not submit READ");
+  kvaf::CpuPullProfile profile;profile.total_us=1e12;
+  Ok(reader.BatchCpuPull({3,1},ready,offsets,lengths,1000,&profile));
+  const auto stage_sum=profile.validation_us+profile.prepare_put_us+profile.dst_offsets_us+
+      profile.submit_cpu_pull_us+profile.wait_cpu_pull_us+profile.commit_put_us;
+  Require(profile.prepare_put_us>0&&profile.submit_cpu_pull_us>0&&profile.wait_cpu_pull_us>0&&
+          profile.commit_put_us>0&&profile.total_us>=stage_sum&&profile.total_us<1e12,
+          "optional wrapper profile resets output and nests Host stage durations in native total");
+  Require(!reader.pending_offload()&&source.frozen(),"success commits but never releases the producer batch");
+  Require(!std::memcmp(server.pool.data()+768,second.data()+32,64)&&
+          !std::memcmp(server.pool.data()+256,second.data()+600,32),"key order selects the correct destinations");
+  kvaf::AccessTableHandle table;Ok(reader.core().PrepareAccessTable({{3,1}},&table));kvaf::AccessTableView view;
+  Ok(reader.core().GetAccessTableView(table,&view));
+  Require(view.valid[0]&&view.valid[1]&&view.lengths[0]==64&&view.lengths[1]==32,"success includes metadata commit");
+  Ok(reader.core().ReleaseAccessTable(table));
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+1,
+          "new call with occupied keys fails without replay");
+  Require(!reader.ResolveCpuPull().ok(),"no hidden batch remains after success");
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
+  // A successful submit followed by timeout retains the original owned arrays.
+  Ok(source.Ready(views[1],&ready));hold_read=true;
+  Require(reader.BatchCpuPull({3,1},ready,offsets,lengths,1).code()==kvaf::StatusCode::kInDoubt&&reader.pending_offload(),
+          "timeout retains internal transaction");
+  offsets[0]=70;lengths[0]=16;
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok(),"cannot start a second hidden transaction");
+  kvaf::PutHandle explicit_put;
+  Require(!reader.PreparePut({0},{8},&explicit_put).ok()&&!reader.core().BatchFree({{3,1}}).ok(),"pending DMA protects DDR");
+  Require(!reader.ResolveCpuPull(0).ok()&&!source.ReleaseBatch(ready).ok(),"no premature completion or producer reuse");
+  hold_read=false;Ok(reader.ResolveCpuPull(1000));
+  Require(payload_reads==reads+2&&!std::memcmp(server.pool.data()+768,second.data()+32,64),"recovery uses snapshot without replay");
+  offsets[0]=32;lengths[0]=64;
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
+  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::Submit);
+  Require(reader.BatchCpuPull({3,1},ready,offsets,lengths).code()==kvaf::StatusCode::kInDoubt,"lost Submit retains hidden Put");
+  Ok(reader.ResolveCpuPull(1000));Require(payload_reads==reads+3,"lost Submit resolves without another READ");
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
+  // Lost pre-submit query is a definite failure; Ready stays producer-owned.
+  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::Query);
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+3,
+          "pre-submit failure aborts slots without DMA");
+  Ok(source.CancelBatch(ready));
+  Ok(source.Ready(views[1],&ready));Ok(source.CancelBatch(ready));
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload(),"cancelled Ready rolls back Put");
+
+  // Terminal DMA failure must not publish keys or report a successful resolve.
+  Ok(source.Ready(views[1],&ready));fail_read=true;
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).ok()&&!reader.pending_offload(),"terminal failure safely aborts");
+  fail_read=false;Ok(source.ReleaseBatch(ready));
+  Require(reader.core().PrepareAccessTable({{3,1}},&table).code()==kvaf::StatusCode::kNotFound,
+          "aborted data is not published");
+
+  // Failed abort acknowledgement retains the abort decision, never commits.
+  Ok(source.Ready(views[1],&ready));fail_read=true;server.drop=unsigned(rp::Command::Complete);
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).ok()&&reader.pending_offload(),"lost abort ACK stays pending");
+  Require(!reader.ResolveCpuPull(1000).ok()&&!reader.pending_offload(),"resolved failure still reports failure");
+  fail_read=false;Ok(source.ReleaseBatch(ready));
+
+  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::Complete);
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).ok()&&reader.pending_offload(),"lost commit ACK retains decision");
+  const int committed=payload_reads;Ok(reader.ResolveCpuPull(1000));
+  Require(payload_reads==committed,"commit recovery never replays READ");
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
+  // The generic recovery entry must not consume an application's explicit Put.
+  Ok(reader.PreparePut({0},{8},&explicit_put));
+  Require(!reader.ResolveCpuPull().ok()&&reader.pending_offload(),"explicit transactions require their original handle");
+  Ok(reader.AbortPut(explicit_put));
+  Ok(source.Ready(views[1],&ready));hold_read=true;server.drop=unsigned(rp::Command::Submit);
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok(),"retain for shutdown");
+  Require(!reader.Shutdown().ok()&&reader.pending_offload(),"shutdown cannot free active DMA");
   hold_read=false;
-  Status close;
-  for(int i=0;i<1000;++i){close=a.Shutdown();if(close.ok())break;std::this_thread::sleep_for(std::chrono::milliseconds(1));}
-  Ok(close);NoResources();
-  // A different input replaces the cached registration after the old one retires.
-  Ok(a.Initialize(1024,256));Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));Ok(a.core().BatchFree({{2}}));
-  std::vector<std::uint8_t> replacement(8192,0x94);req.input={replacement.data(),replacement.size(),kvaf::DeviceKind::kNpu};
-  Ok(a.BatchCpuPull(req,{reinterpret_cast<void*>(1)}));Require(server.pool[512]==0x94&&leases==1,"source replacement retires previous registration");
-  Ok(a.Shutdown());NoResources();auto_mode=false;failed_route=0;
+  for(int i=0;i<1000&&reader.pending_offload();++i) {
+    Require(!reader.Shutdown().ok(),"producer registration still blocks DDR release");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Require(!reader.pending_offload()&&source.frozen(),"shutdown resolves original transaction but never releases source");
+  Ok(source.ReleaseBatch(ready));Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
+  Require(producer_syncs==syncs&&scratch_reads==probes,"batch calls never synchronize producer or rebuild registrations");
+  auto_mode=false;failed_route=0;
   if(had_prior)setenv("KVAF_HCCL_ROOTINFO_PATH",saved.c_str(),1);else unsetenv("KVAF_HCCL_ROOTINFO_PATH");
 }
 void InitializationRecovery() {
@@ -166,13 +238,13 @@ void ConnectorApi(){
   kvaf::PutHandle second;Require(!reader.PreparePut({2},{16},&second).ok(),"one active transaction");
   Require(!reader.CommitPut(put).ok(),"cannot commit untransferred Put");
   // Three segments, two keys: reordered source and destination plus slot-internal split.
-  std::vector<std::uint64_t> src{200,7,100},dst{put.entries()[1].address,put.entries()[0].address+32,put.entries()[0].address},sizes{32,32,32};
+  std::vector<std::uint64_t> src{200,7,100},dst{put.entries()[1].address-ticket.region.base,put.entries()[0].address-ticket.region.base+32,put.entries()[0].address-ticket.region.base},sizes{32,32,32};
   const int reads=payload_reads;
-  for(auto address:{ticket.region.base-1,ticket.region.base+ticket.region.bytes-16,
-                    UINT64_MAX,put.entries()[1].address-ticket.region.base}) {
-    auto outside=dst;outside[0]=address;
+  for(auto offset:{ticket.region.bytes-16,ticket.region.bytes,
+                   UINT64_MAX,put.entries()[1].address}) {
+    auto outside=dst;outside[0]=offset;
     Require(!reader.SubmitCpuPull(ready,put,src,outside,sizes).ok(),
-            "absolute DDR addresses reject underflow, overrun, overflow and old offsets");
+            "DDR offsets reject overrun, overflow and old absolute addresses");
   }
   for(unsigned field=0;field<4;++field) {
     auto stale=ready;auto& identity=std::get<kvaf::CpuPullSourceDesc>(stale.source);
@@ -182,9 +254,9 @@ void ConnectorApi(){
     if(field==3)++identity.region_epoch;
     Require(!reader.SubmitCpuPull(stale,put,src,dst,sizes).ok(),"Ready must match an attached CPU source");
   }
-  auto invalid=dst;invalid[0]=ticket.region.base;
+  auto invalid=dst;invalid[0]=0;
   Require(!reader.SubmitCpuPull(ready,put,src,invalid,sizes).ok(),"cannot target another slot in same pool");
-  invalid=dst;invalid[1]=put.entries()[0].address+24;
+  invalid=dst;invalid[1]=put.entries()[0].address-ticket.region.base+24;
   Require(!reader.SubmitCpuPull(ready,put,src,invalid,sizes).ok(),"overlapping or incomplete reservation rejected");
   auto short_sizes=sizes;short_sizes[1]=16;
   Require(!reader.SubmitCpuPull(ready,put,src,dst,short_sizes).ok(),"cannot commit unwritten holes");
@@ -214,8 +286,8 @@ void ConnectorApi(){
   Require(put.submitted() && put.state()==state,"wait refreshes the shared put state");
   Require(!producer.ReleaseBatch(ready).ok(),"producer waits for metadata acknowledgement");
   Ok(reader.SubmitCpuPull(ready,put,src,dst,sizes));
-  Require(dst[0]==put.entries()[1].address && dst[1]==put.entries()[0].address+32,
-          "normalization does not modify application absolute address arrays");
+  Require(dst[0]==put.entries()[1].address-ticket.region.base && dst[1]==put.entries()[0].address-ticket.region.base+32,
+          "submission preserves application offset arrays");
   auto changed=src;changed[0]++;
   Require(!reader.SubmitCpuPull(ready,put,changed,dst,sizes).ok(),"conflicting retry rejected");
   auto changed_dst=dst;std::swap(changed_dst[1],changed_dst[2]);
@@ -244,12 +316,12 @@ void ConnectorApi(){
   Require(!reader.WaitCpuPull(second,0,&state).ok(),"aborted put is not a successful READ");
   // Completed DMA may be explicitly discarded without publishing its key.
   Ok(producer.Ready(&ready));Ok(reader.PreparePut({0},{32},&second));
-  std::vector<std::uint64_t> one{0},destination{second.entries()[0].address},length{32};
+  std::vector<std::uint64_t> one{0},destination{second.entries()[0].address-ticket.region.base},length{32};
   Ok(reader.SubmitCpuPull(ready,second,one,destination,length));
   Ok(reader.WaitCpuPull(second,1000,&state));Ok(reader.AbortPut(second));Ok(producer.ReleaseBatch(ready));
   // A recorded request may fail before CPU accepts it; submitted is not success.
   Ok(producer.Ready(&ready));Ok(reader.PreparePut({0},{32},&second));
-  destination={second.entries()[0].address};Ok(producer.CancelBatch(ready));
+  destination={second.entries()[0].address-ticket.region.base};Ok(producer.CancelBatch(ready));
   const int before_rejection=payload_reads;
   Require(!reader.SubmitCpuPull(ready,second,one,destination,length).ok() && second.submitted(),
           "pre-submit remote rejection leaves the recorded request on put");
@@ -264,7 +336,7 @@ void ConnectorApi(){
   Ok(other.Register(ticket,{other_hbm.data(),other_hbm.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
   kvaf::CpuPullSourceDesc other_desc;Ok(other.GetDescriptor(&other_desc));Ok(reader.AttachCpuSource(other_desc));
   for(auto* source:{&other,&producer}) {
-    Ok(source->Ready(&ready));Ok(reader.PreparePut({0},{32},&second));destination={second.entries()[0].address};
+    Ok(source->Ready(&ready));Ok(reader.PreparePut({0},{32},&second));destination={second.entries()[0].address-ticket.region.base};
     Ok(reader.SubmitCpuPull(ready,second,one,destination,length));Ok(reader.WaitCpuPull(second,1000,&state));
     Require(!std::memcmp(server.pool.data(),source==&other?other_hbm.data():hbm.data(),32),
             "Ready identity routes CPU Pull to the correct producer");
@@ -273,7 +345,7 @@ void ConnectorApi(){
   Ok(other.Shutdown());
   Ok(producer.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-void ConnectorQuarantine(){
+void ConnectorQuarantine(bool batch){
   // An unresolved CQ must retain all resources. Isolate intentional retention.
   const auto child=fork();Require(child>=0,"fork quarantine test");
   if(child==0){try{
@@ -288,17 +360,26 @@ void ConnectorQuarantine(){
     Ok(producer.Register(ticket,sources,reinterpret_cast<void*>(1)));
     kvaf::CpuPullSourceDesc desc;Ok(producer.GetDescriptor(&desc));
     Ok(reader.AttachCpuSource(desc));kvaf::ReadyToken ready;Ok(producer.Ready(sources[1],&ready));
-    kvaf::PutHandle put;Ok(reader.PreparePut({0},{32},&put));std::vector<std::uint64_t> offsets{0},destinations{put.entries()[0].address},sizes{32};
-    uncertain_read=true;Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
-    kvaf::CpuPullState state;
-    Require(reader.WaitCpuPull(put,1000,&state).code()==kvaf::StatusCode::kInDoubt,"CQ uncertainty quarantines task");
+    kvaf::PutHandle put;std::vector<std::uint64_t> offsets{0},destinations,sizes{32};
+    uncertain_read=true;
+    if(batch) {
+      Require(reader.BatchCpuPull({0},ready,offsets,sizes,1000).code()==kvaf::StatusCode::kInDoubt,"wrapper retains quarantined task");
+    } else {
+      Ok(reader.PreparePut({0},{32},&put));destinations={put.entries()[0].address-ticket.region.base};
+      Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
+      kvaf::CpuPullState state;
+      Require(reader.WaitCpuPull(put,1000,&state).code()==kvaf::StatusCode::kInDoubt,"CQ uncertainty quarantines task");
+    }
     const int reads=payload_reads;
     kvaf::ReadyToken other;
     Require(!producer.Ready(sources[0],&other).ok()&&registrations==2&&jetties==4,
             "uncertain batch retains all MRs and prevents switching source");
-    Require(!reader.CommitPut(put).ok()&&!reader.AbortPut(put).ok()&&!reader.Shutdown().ok(),"uncertain DMA retains DDR");
+    if(batch) Require(!reader.ResolveCpuPull(0).ok(),"resolve cannot turn quarantine into completion");
+    else Require(!reader.CommitPut(put).ok()&&!reader.AbortPut(put).ok(),"uncertain DMA forbids commit and abort");
+    Require(!reader.Shutdown().ok(),"uncertain DMA retains DDR");
     Require(!producer.CancelBatch(ready).ok()&&!producer.ReleaseBatch(ready).ok()&&!producer.Shutdown().ok(),"uncertain DMA retains producer registration");
-    Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
+    if(batch) Require(!reader.BatchCpuPull({0},ready,offsets,sizes).ok(),"pending wrapper cannot resubmit");
+    else Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
     Require(payload_reads==reads&&reader.pending_offload(),"quarantined duplicate never retries READ");
     _exit(0);
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';_exit(1);}}
@@ -359,16 +440,23 @@ void MultipleMemorySource() {
     forged.token=ticket.region.token;forged.source_id=desc.source_id;forged.task=ready.sequence;forged.mr_id=stale.mr_id;
     rp::Response response;Ok(rp::Exchange(ticket.address,forged,{},&response));
     Require(response.result!=rp::Result::Ok,"server rejects same sequence with changed MR");
-    kvaf::PutHandle put;Ok(reader.PreparePut({1,2},{64,32},&put));
-    std::vector<std::uint64_t> src{7,300},dst{put.entries()[0].address,put.entries()[1].address},lengths{64,32};
-    auto outside=src;outside[0]=views[index].bytes-32;
-    Require(!reader.SubmitCpuPull(ready,put,outside,dst,lengths).ok(),"bounds use selected tensor");
-    if(n==0)server.drop=unsigned(rp::Command::Submit);
-    auto submitted=reader.SubmitCpuPull(ready,put,src,dst,lengths);
-    Require(submitted.ok()||(n==0&&submitted.code()==kvaf::StatusCode::kInDoubt),"submit or retain lost response");
-    Require(!reader.SubmitCpuPull(stale,put,src,dst,lengths).ok(),"duplicate cannot change MR");
-    Ok(reader.SubmitCpuPull(ready,put,src,dst,lengths));
-    kvaf::CpuPullState state;Ok(reader.WaitCpuPull(put,1000,&state));Ok(reader.CommitPut(put));
+    if (n % 2) {
+      std::vector<std::uint64_t> src{7,views[index].bytes-32},lengths{64,32};
+      auto outside=src;outside[1]++;
+      Require(!reader.BatchCpuPull({1,2},ready,outside,lengths).ok()&&!reader.pending_offload(),"wrapper bounds use selected tensor");
+      Ok(reader.BatchCpuPull({1,2},ready,src,lengths,1000));
+    } else {
+      kvaf::PutHandle put;Ok(reader.PreparePut({1,2},{64,32},&put));
+      std::vector<std::uint64_t> src{7,300},dst{put.entries()[0].address-ticket.region.base,put.entries()[1].address-ticket.region.base},lengths{64,32};
+      auto outside=src;outside[0]=views[index].bytes-32;
+      Require(!reader.SubmitCpuPull(ready,put,outside,dst,lengths).ok(),"bounds use selected tensor");
+      if(n==0)server.drop=unsigned(rp::Command::Submit);
+      auto submitted=reader.SubmitCpuPull(ready,put,src,dst,lengths);
+      Require(submitted.ok()||(n==0&&submitted.code()==kvaf::StatusCode::kInDoubt),"submit or retain lost response");
+      Require(!reader.SubmitCpuPull(stale,put,src,dst,lengths).ok(),"duplicate cannot change MR");
+      Ok(reader.SubmitCpuPull(ready,put,src,dst,lengths));
+      kvaf::CpuPullState state;Ok(reader.WaitCpuPull(put,1000,&state));Ok(reader.CommitPut(put));
+    }
     Require(!std::memcmp(server.pool.data()+256,tensors[index].data()+7,64)&&
             !std::memcmp(server.pool.data()+512,tensors[index].data()+300,32),"batch reads only selected tensor");
     Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{1,2}}));
@@ -377,4 +465,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();LocalAndFallback();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine();std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{Lifecycle();SharedMetadata();UnifiedBatchCpuPull();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

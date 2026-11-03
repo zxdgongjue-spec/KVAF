@@ -5,7 +5,7 @@
 namespace rp = kvaf::remote_pull;
 using kvaf::Status;
 std::atomic<int> payload_reads{0}, scratch_reads{0}, checksum_calls{0}, leases{0};
-std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_checksum{false};
+std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_read{false}, fail_checksum{false};
 struct SharedBackend final : p::Backend {
   std::vector<std::uint8_t>& pool;
   p::Endpoint source{};
@@ -33,6 +33,7 @@ struct SharedBackend final : p::Backend {
     ++payload_reads;
     while(hold_read)std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if(uncertain_read)return Status::InDoubt("simulated unresolved CQ");
+    if(fail_read)return Status::Internal("simulated terminal READ failure");
     for(auto span:spans)std::memcpy(pool.data()+span.destination,reinterpret_cast<void*>(source.base+span.source),span.bytes);
     return Status::OK();
   }

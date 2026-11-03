@@ -1,6 +1,6 @@
 # CPU Pull / Offload 实现设计
 
-本文为历史设计记录，最初的独立 OffloadRuntime 及 KVOF 实现现已删除，本文旧接口不可用于当前版本。本卡便利接口为 `NpuRuntime.batch_cpu_pull()`，当前实现见 [Connector 接口设计](connector_pull_api_design.md)。后续整合版本见
+本文为历史设计记录，最初的独立 OffloadRuntime 及 KVOF 实现现已删除，本文旧接口不可用于当前版本。统一便利接口为 `NpuRuntime.batch_cpu_pull()`，当前实现见 [Connector 接口设计](connector_pull_api_design.md)。后续整合版本见
 [共享 DDR 与跨卡 CPU Pull](shared_ddr_remote_offload.md)：NpuRuntime 统一 Meta/DDR，支持 A 提交、CPU 读取 B。
 
 ## 基线与范围

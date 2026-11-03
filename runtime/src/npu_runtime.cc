@@ -13,6 +13,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,22 @@ namespace kvaf {
 namespace {
 
 Status Internal(std::string message) { return Status::Internal(std::move(message)); }
+
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+class ScopedCpuPullTimer {
+ public:
+  explicit ScopedCpuPullTimer(double* elapsed) : elapsed_(elapsed) {
+    if (elapsed_) start_ = std::chrono::steady_clock::now();
+  }
+  ~ScopedCpuPullTimer() {
+    if (elapsed_) *elapsed_ += std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - start_).count();
+  }
+ private:
+  double* elapsed_;
+  std::chrono::steady_clock::time_point start_{};
+};
+#endif
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
@@ -169,29 +186,46 @@ struct NpuRuntime::Impl {
   std::unique_ptr<AccessOperator> access_operator;
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   std::unique_ptr<RemotePullOperator> remote_operator;
-  std::unique_ptr<CpuPullHbmSource> local_source;
-  ConstBufferView local_input{};
-  PutHandle local_put;
-  ReadyToken local_ready;
-  bool local_commit{}, local_retire{};
+  PutHandle batch_pull_put;
+  bool batch_pull_abort{};
+  Status batch_pull_failure;
 
-  // No new submission is performed here. Shutdown can finish an acknowledged
-  // decision or abort a failed call only after the original DMA is terminal.
-  Status FinishLocal() {
-    if (!local_put.id()) return Status::OK();
-    auto status = local_commit ? runtime_core->CommitPut(local_put) : runtime_core->AbortPut(local_put);
-    if (!status.ok()) return Status::InDoubt("local CPU Pull is unresolved; retain source and DDR: " + status.message());
-    if (local_source && local_source->frozen()) {
-      status = local_commit ? local_source->ReleaseBatch(local_ready) : local_source->CancelBatch(local_ready);
-      if (!status.ok()) return Status::InDoubt("local CPU Pull source acknowledgement pending: " + status.message());
+  // The original Put owns the request and the irreversible metadata decision.
+  // Recovery and shutdown never resubmit READ or release the producer's source.
+  Status FinishBatchCpuPull(std::uint32_t timeout_ms, CpuPullProfile* profile = nullptr) {
+    if (!batch_pull_put.id()) return Status::InvalidState("no pending batch_cpu_pull to resolve");
+    const auto pending = [](const Status& status) {
+      return Status::InDoubt("CPU Pull unresolved; retain producer data and call resolve_cpu_pull: " + status.message());
+    };
+    try {
+      if (!batch_pull_abort) {
+        CpuPullState state = CpuPullState::InDoubt;
+        Status status;
+        {
+          ScopedCpuPullTimer timer(profile ? &profile->wait_cpu_pull_us : nullptr);
+          status = runtime_core->WaitCpuPull(batch_pull_put, timeout_ms, &state);
+        }
+        if (!status.ok()) {
+          if (state != CpuPullState::Failed) return pending(status);
+          batch_pull_abort = true;
+          batch_pull_failure = status;
+        }
+      }
+      Status status;
+      {
+        ScopedCpuPullTimer timer(profile ? &profile->commit_put_us : nullptr);
+        status = batch_pull_abort ? runtime_core->AbortPut(batch_pull_put)
+                                  : runtime_core->CommitPut(batch_pull_put);
+      }
+      if (!status.ok()) return pending(status);
+      const auto result = batch_pull_abort ? batch_pull_failure : Status::OK();
+      batch_pull_put = {};
+      batch_pull_abort = false;
+      batch_pull_failure = Status::OK();
+      return result;
+    } catch (const std::exception& e) {
+      return pending(Status::Internal(e.what()));
     }
-    if (local_source && (local_retire || !local_source->registered())) {
-      status = local_source->Shutdown();
-      if (!status.ok()) return Status::InDoubt("local CPU Pull source cleanup pending: " + status.message());
-      local_source.reset(); local_input = {};
-    }
-    local_put = {}; local_ready = {}; local_commit = local_retire = false;
-    return Status::OK();
   }
 #endif
   std::unique_ptr<RuntimeCore> runtime_core;
@@ -670,72 +704,75 @@ Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* ticket) const {
   return Status::NotImplemented("CPU Offload was not built");
 #endif
 }
-Status NpuRuntime::BatchCpuPull(const BatchPutRequest& request, BatchPutExecutionOptions execution) {
+Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken& ready,
+                                Uint64ArrayView src_offsets, const std::vector<std::uint64_t>& lengths,
+                                std::uint32_t timeout_ms, CpuPullProfile* profile) {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (!ddr_initialized() || !impl_->remote_operator) return Status::InvalidState("CPU Pull is not initialized");
-  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
-  if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
-  int32_t current = -1;
-  if (aclrtGetDevice(&current) != ACL_SUCCESS || current != static_cast<int32_t>(device_id()))
-    return Status::InvalidState("select the Runtime NPU before BatchCpuPull");
-  if (!request.input.valid() || request.input.device != DeviceKind::kNpu || !execution.stream ||
-      request.keys.empty() || request.keys.size() > remote_pull::kMaxSpans ||
-      request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
-    return Status::InvalidArgument("BatchCpuPull requires local NPU input, a stream and equally sized metadata");
-  for (std::size_t i = 0; i < request.keys.size(); ++i)
-    if (!offload::Contains(request.input.bytes, request.input_offsets[i], request.lengths[i]))
-      return Status::InvalidArgument("BatchCpuPull source range is outside its HBM Tensor");
-  auto status = impl_->runtime_core->PreparePut(request.keys, request.lengths, &impl_->local_put);
+  if (profile) *profile = {};
+  ScopedCpuPullTimer total(profile ? &profile->total_us : nullptr);
+  {
+    ScopedCpuPullTimer timer(profile ? &profile->validation_us : nullptr);
+    if (!ddr_initialized() || !impl_->remote_operator) return Status::NotInitialized("initialize_ddr before batch_cpu_pull");
+    if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
+    if (pending_offload()) return Status::Busy("finish the existing Put or resolve_cpu_pull before starting a new batch");
+    if (keys.empty() || keys.size() > remote_pull::kMaxSpans || !src_offsets.data ||
+        keys.size() != src_offsets.size || keys.size() != lengths.size() ||
+        reinterpret_cast<std::uintptr_t>(src_offsets.data) % alignof(std::uint64_t))
+      return Status::InvalidArgument("batch_cpu_pull requires nonempty, equally sized keys, src_offsets and lengths");
+    const auto* source = std::get_if<CpuPullSourceDesc>(&ready.source);
+    if (!source || !ready.sequence || !source->bytes_for(ready.mr_id))
+      return Status::InvalidArgument("batch_cpu_pull requires a CPU ReadyToken with a valid MR");
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      if (!lengths[i] || !offload::Contains(source->bytes_for(ready.mr_id), src_offsets.data[i], lengths[i]))
+        return Status::InvalidArgument("batch_cpu_pull source range is outside the selected MR");
+    }
+  }
+  Status status;
+  {
+    ScopedCpuPullTimer timer(profile ? &profile->prepare_put_us : nullptr);
+    status = impl_->runtime_core->PreparePut(keys, lengths, &impl_->batch_pull_put);
+  }
   if (!status.ok()) return status;
-  impl_->local_commit = false; impl_->local_ready = {};
-  auto execute = [&]() -> Status {
-    if (impl_->local_source && (request.input.data != impl_->local_input.data || request.input.bytes != impl_->local_input.bytes)) {
-      impl_->local_retire = true;
-      auto result = impl_->local_source->Shutdown(); if (!result.ok()) return result;
-      impl_->local_source.reset(); impl_->local_input = {};
-    }
-    if (!impl_->local_source) {
-      impl_->local_retire = true;
-      impl_->local_source = std::make_unique<CpuPullHbmSource>(device_id(),
-          impl_->options.npu_eids.empty() ? "" : impl_->options.npu_eids.front());
-      impl_->local_input = request.input;
-      auto result = impl_->local_source->Register(impl_->remote_operator->ticket(), request.input, execution.stream);
-      if (!result.ok()) return result;
-    }
-    impl_->local_retire = false;
-    // Like BatchPut, preceding production on the supplied stream must finish
-    // before transport reads the source. Identity-only Ready itself does not wait.
-    if (aclrtSynchronizeStream(static_cast<aclrtStream>(execution.stream)) != ACL_SUCCESS)
-      return Status::Internal("BatchCpuPull producer stream synchronization failed");
-    auto result = impl_->local_source->Ready(&impl_->local_ready); if (!result.ok()) return result;
-    CpuPullSourceDesc desc;
-    result = impl_->local_source->GetDescriptor(&desc); if (!result.ok()) return result;
-    result = impl_->runtime_core->AttachCpuSource(desc); if (!result.ok()) return result;
+  impl_->batch_pull_abort = false;
+  impl_->batch_pull_failure = Status::OK();
+  try {
     std::vector<std::uint64_t> destinations;
-    for (const auto& entry : impl_->local_put.entries())
-      destinations.push_back(entry.address);
-    result = impl_->runtime_core->SubmitCpuPull(impl_->local_ready, impl_->local_put,
-        request.input_offsets, destinations, request.lengths);
-    if (!result.ok()) return result;
-    CpuPullState state;
-    result = impl_->runtime_core->WaitCpuPull(impl_->local_put, impl_->options.offload_timeout_ms, &state);
-    if (!result.ok()) return result;
-    impl_->local_commit = true; // Preserve this decision across a lost Commit ACK.
-    return Status::OK();
-  };
-  try { status = execute(); }
-  catch (const std::exception& e) { status = Status::InDoubt(std::string("BatchCpuPull interrupted: ") + e.what()); }
-  const auto finished = impl_->FinishLocal();
-  // Failed calls never create another READ. If cleanup cannot prove completion,
-  // the retained transaction blocks new work until Shutdown can safely retire it.
-  return finished.ok() ? status : finished;
+    {
+      ScopedCpuPullTimer timer(profile ? &profile->dst_offsets_us : nullptr);
+      destinations.reserve(impl_->batch_pull_put.entries().size());
+      const auto ddr_base = impl_->runtime_core->remote_region().base;
+      for (const auto& entry : impl_->batch_pull_put.entries())
+        destinations.push_back(entry.address - ddr_base);
+    }
+    {
+      ScopedCpuPullTimer timer(profile ? &profile->submit_cpu_pull_us : nullptr);
+      status = impl_->runtime_core->SubmitCpuPull(ready, impl_->batch_pull_put, src_offsets, destinations, lengths);
+    }
+  } catch (const std::exception& e) {
+    status = impl_->batch_pull_put.submitted() ? Status::InDoubt(e.what()) : Status::Internal(e.what());
+  }
+  if (!status.ok()) {
+    if (status.code() == StatusCode::kInDoubt)
+      return Status::InDoubt("CPU Pull submission unresolved; retain producer data and call resolve_cpu_pull: " + status.message());
+    impl_->batch_pull_abort = true;
+    impl_->batch_pull_failure = status;
+  }
+  return impl_->FinishBatchCpuPull(timeout_ms == UINT32_MAX ? impl_->options.offload_timeout_ms : timeout_ms, profile);
 #else
-  return Status::NotImplemented("CPU Pull was not built");
+  return Status::NotImplemented("CPU Offload was not built");
+#endif
+}
+Status NpuRuntime::ResolveCpuPull(std::uint32_t timeout_ms) {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before resolve_cpu_pull");
+  return impl_->FinishBatchCpuPull(timeout_ms == UINT32_MAX ? impl_->options.offload_timeout_ms : timeout_ms);
+#else
+  return Status::NotImplemented("CPU Offload was not built");
 #endif
 }
 bool NpuRuntime::pending_offload() const {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (impl_->local_put.id()) return true;
+  if (impl_->batch_pull_put.id()) return true;
 #endif
   return impl_->runtime_core && impl_->runtime_core->pending_offload();
 }
@@ -777,14 +814,14 @@ Status NpuRuntime::AttachCpuSource(const CpuPullSourceDesc& source) {
 Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* put) {
   if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before PreparePut");
   if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
-  if (pending_offload()) return Status::Busy("finish the existing transaction or shutdown the unresolved BatchCpuPull");
+  if (pending_offload()) return Status::Busy("finish the existing Put or resolve_cpu_pull before starting a new batch");
   return core().PreparePut(keys,lengths,put);
 }
 Status NpuRuntime::SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
-                                Uint64ArrayView src_offsets,Uint64ArrayView dst_addrs,Uint64ArrayView lengths) {
+                                Uint64ArrayView src_offsets,Uint64ArrayView dst_offsets,Uint64ArrayView lengths) {
   if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before CPU Pull");
   if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
-  return core().SubmitCpuPull(ready,put,src_offsets,dst_addrs,lengths);
+  return core().SubmitCpuPull(ready,put,src_offsets,dst_offsets,lengths);
 }
 Status NpuRuntime::QueryCpuPull(const PutHandle& put,CpuPullState* state) {
   if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
@@ -892,10 +929,11 @@ Status NpuRuntime::ShutdownDdr() {
     if (aclrtSetDevice(device_id()) != ACL_SUCCESS) return Internal("select NPU for DDR cleanup");
   }
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  auto source_status = impl_->FinishLocal(); if (!source_status.ok()) return source_status;
-  if (impl_->local_source) {
-    source_status = impl_->local_source->Shutdown(); if (!source_status.ok()) return source_status;
-    impl_->local_source.reset(); impl_->local_input = {};
+  if (impl_->batch_pull_put.id()) {
+    // Do one query, without blocking shutdown on an active DMA. Once resolved,
+    // source detach remains the producer's responsibility, even on the same NPU.
+    const auto status = impl_->FinishBatchCpuPull(0);
+    if (impl_->batch_pull_put.id()) return status;
   }
 #endif
   Status status;

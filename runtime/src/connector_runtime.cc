@@ -47,7 +47,7 @@ Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
   return Status::OK();
 }
 Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
-                                  const PutHandle& put, Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
+                                  const PutHandle& put, Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
                                   Uint64ArrayView lengths) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
   if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
@@ -58,17 +58,8 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
     return Status::InvalidArgument("CPU Pull source is not attached to this Runtime or its identity changed");
   auto& p = *put.state_;
   CopyArrays copies;
-  auto status = SnapshotCopyArrays(src_offsets, dst_addrs, lengths, &copies);
+  auto status = SnapshotCopyArrays(src_offsets, dst_offsets, lengths, &copies);
   if (!status.ok()) return status;
-  // Normalize only our owned snapshot, before duplicate comparison. Application
-  // arrays stay absolute; service-side spans retain their existing offset ABI.
-  for (std::size_t i = 0; i < copies.destination.size(); ++i) {
-    auto& address = copies.destination[i];
-    if (address < p.region.base || address-p.region.base > p.region.length ||
-        copies.lengths[i] > p.region.length-(address-p.region.base))
-      return Status::InvalidArgument("CPU Pull destination address outside this Put's DDR region");
-    address -= p.region.base;
-  }
   if (p.submitted) {
     if (!SameSource(p.request.source, *desc) || p.request.sequence != ready.sequence || p.request.mr_id != ready.mr_id ||
         copies.source != p.request.copies.source || copies.destination != p.request.copies.destination ||

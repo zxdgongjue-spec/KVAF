@@ -4,6 +4,7 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -255,9 +256,6 @@ class NpuPythonRuntime final {
     if (!native_->Shutdown().ok()) {
       (void)raw_retained_.release();
       (void)raw_outputs_.release();
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-      (void)local_sources_.release();
-#endif
     }
   }
 
@@ -275,31 +273,46 @@ class NpuPythonRuntime final {
   }
   void ShutdownDdr() {
     ThrowIfError(native_->ShutdownDdr());
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-    local_sources_ = py::list();
-#endif
   }
 
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  void BatchCpuPull(const py::object& keys, py::object source, const py::object& offsets,
-                    const py::object& lengths, const py::object& stream) {
-    if (native_->pending_offload()) throw py::value_error("finish the existing transaction or shutdown the unresolved batch_cpu_pull");
-    const auto view = GetNpuTensorView(source, "source");
-    if (source.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("batch_cpu_pull requires local HBM; use CpuPullHbmSource and submit_cpu_pull for another NPU");
-    BatchPutRequest request; request.keys = CopyPrepareKeys(keys);
-    CopyCpuUint64SequenceInto(offsets, "input_offsets", &request.input_offsets);
-    CopyCpuUint64SequenceInto(lengths, "lengths", &request.lengths);
-    request.input = {view.data, view.bytes, DeviceKind::kNpu};
-    const auto producer = ResolveStream(stream);
-    if (!stream.is_none() && py::hasattr(stream, "device") &&
-        stream.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("producer stream belongs to another NPU");
-    bool retained = false;
-    for (auto item : local_sources_) if (item.is(source)) retained = true;
-    if (!retained) local_sources_.append(source);
-    const auto status = native_->BatchCpuPull(request, {producer});
-    if (status.ok()) { local_sources_ = py::list(); local_sources_.append(source); }
+  py::object BatchCpuPull(const py::object& keys, const ReadyToken& ready, const py::object& offsets,
+                         const py::object& lengths, const py::object& timeout, bool profiling) {
+    using Clock = std::chrono::steady_clock;
+    const auto begin = profiling ? Clock::now() : Clock::time_point{};
+    const auto key_ids = CopyPrepareKeys(keys);
+    std::vector<std::uint64_t> sources, sizes;
+    CopyCpuUint64SequenceInto(offsets, "src_offsets", &sources);
+    CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
+    const auto timeout_ms = timeout.is_none() ? UINT32_MAX : timeout.cast<std::uint32_t>();
+    const double binding_prepare_us = profiling
+        ? std::chrono::duration<double, std::micro>(Clock::now() - begin).count() : 0;
+    CpuPullProfile profile;
+    Status status;
+    { py::gil_scoped_release release;
+      status = native_->BatchCpuPull(key_ids, ready, sources, sizes, timeout_ms, profiling ? &profile : nullptr); }
+    ThrowIfError(status);
+    if (!profiling) return py::none();
+    py::dict timing;
+    timing["binding_prepare_us"] = binding_prepare_us;
+    timing["native_total_us"] = profile.total_us;
+    timing["validation_us"] = profile.validation_us;
+    timing["prepare_put_us"] = profile.prepare_put_us;
+    timing["dst_offsets_us"] = profile.dst_offsets_us;
+    timing["submit_cpu_pull_us"] = profile.submit_cpu_pull_us;
+    timing["wait_cpu_pull_us"] = profile.wait_cpu_pull_us;
+    timing["commit_put_us"] = profile.commit_put_us;
+    timing["native_other_us"] = std::max(0.0, profile.total_us - profile.validation_us
+        - profile.prepare_put_us - profile.dst_offsets_us - profile.submit_cpu_pull_us
+        - profile.wait_cpu_pull_us - profile.commit_put_us);
+    py::dict result;
+    result["profile"] = std::move(timing);
+    return result;
+  }
+  void ResolveCpuPull(const py::object& timeout) {
+    const auto timeout_ms = timeout.is_none() ? UINT32_MAX : timeout.cast<std::uint32_t>();
+    Status status;
+    { py::gil_scoped_release release; status = native_->ResolveCpuPull(timeout_ms); }
     ThrowIfError(status);
   }
   py::dict OffloadRegion() const {
@@ -314,10 +327,10 @@ class NpuPythonRuntime final {
     PutHandle put; ThrowIfError(native_->PreparePut(CopyPrepareKeys(keys),sizes,&put)); return put;
   }
   void SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
-                           const py::object& src,const py::object& dst_addrs,const py::object& lengths) {
+                           const py::object& src,const py::object& dst_offsets,const py::object& lengths) {
     std::vector<std::uint64_t> sources, destinations, sizes;
     CopyCpuUint64SequenceInto(src, "src_offsets", &sources);
-    CopyCpuUint64SequenceInto(dst_addrs, "dst_addrs", &destinations);
+    CopyCpuUint64SequenceInto(dst_offsets, "dst_offsets", &destinations);
     CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
     ThrowIfError(native_->SubmitCpuPull(ready,put,sources,destinations,sizes));
   }
@@ -667,18 +680,12 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->Shutdown());
     raw_outputs_=py::dict();
     raw_retained_=py::none();
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-    local_sources_ = py::list();
-#endif
   }
 
  private:
   py::object raw_retained_{py::none()};
   py::dict raw_outputs_;
   std::unique_ptr<::kvaf::NpuRuntime> native_;
-#if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  py::list local_sources_;
-#endif
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
@@ -728,18 +735,27 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("detach_hbm", &NpuPythonRuntime::DetachHbm, py::arg("export_ticket"))
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-      .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("source"),
-           py::arg("input_offsets"), py::arg("lengths"), py::arg("stream") = py::none(),
-           "Synchronously pull local NPU HBM into MetaManager-allocated DDR slots and commit. "
-           "Returns None on success. On unresolved failure retain source data and call shutdown(); "
-           "calling batch_cpu_pull again never resumes or resubmits a pending operation.")
+      .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("ready"),
+           py::arg("src_offsets"), py::arg("lengths"), py::kw_only(), py::arg("timeout") = py::none(),
+           py::arg("profile") = false,
+           "Prepare DDR slots, submit CPU READ, wait and commit using an attached CPU ReadyToken. "
+           "One source span per key; Host metadata matches batch_put. Returns None on success. "
+           "timeout is in milliseconds (None uses offload_timeout_ms). On unresolved failure "
+           "retain producer data and call resolve_cpu_pull; never repeat the batch as recovery. "
+           "Producer synchronization and release_batch remain the application's responsibility. "
+           "profile=True returns a profile dictionary with Host stage timings in microseconds instead of None; "
+           "profiling is disabled by default and does not include verification or source release.")
+      .def("resolve_cpu_pull", &NpuPythonRuntime::ResolveCpuPull, py::kw_only(), py::arg("timeout") = py::none(),
+           "Finish the internally retained batch_cpu_pull, without replaying READ. Returns None "
+           "only after successful commit; failure raises. Does not recover explicit PutHandle transactions.")
       .def("offload_region", &NpuPythonRuntime::OffloadRegion)
       .def("attach_cpu_source",&NpuPythonRuntime::AttachCpuSource,py::arg("source_desc"))
       .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
       .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("ready"),py::arg("put"),
-           py::arg("src_offsets"),py::arg("dst_addrs"),py::arg("lengths"),
-           "Submit CPU READ using an attached ReadyToken source and absolute DDR destination "
-           "addresses from put.entries. The three Host arrays must be equally sized. "
+           py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
+           "Submit CPU READ using an attached ReadyToken source and DDR-relative destination "
+           "offsets: put.entries[i].address minus runtime.remote_region['base'], plus any in-slot offset. "
+           "The three Host arrays must be equally sized. "
            "Returns None; query/wait using the same put, including after a lost response.")
       .def("query_cpu_pull",&NpuPythonRuntime::QueryCpuPull,py::arg("put"))
       .def("wait_cpu_pull",&NpuPythonRuntime::WaitCpuPull,py::arg("put"),py::arg("timeout")=30000,

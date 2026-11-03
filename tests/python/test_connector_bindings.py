@@ -132,6 +132,7 @@ class ConnectorBindings(unittest.TestCase):
         for name in ("offload", "offload_from", "resolve_offload", "release_offload_source"):
             self.assertFalse(hasattr(kvaf.NpuRuntime, name))
         self.assertTrue(hasattr(kvaf.NpuRuntime, "batch_cpu_pull"))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "resolve_cpu_pull"))
         for cls in (kvaf.CpuPullHbmSource, kvaf.NpuPullHbmSource):
             source = cls(0)
             with self.assertRaises(TypeError):
@@ -167,6 +168,7 @@ class ConnectorBindings(unittest.TestCase):
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_cpu_pull_lengths_remain_batch_put_compatible(self):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
+        ready = restored(kvaf.ReadyToken, (restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99)), 1))
         accepted = [[8, 8], (8, 8), np.array([8, 8], dtype=np.uint64),
                     np.array([8, 8], dtype=np.int64), np.arange(4, dtype=np.uint64)[::2] + 1]
         if torch is not None:
@@ -175,6 +177,21 @@ class ConnectorBindings(unittest.TestCase):
             with self.subTest(value=repr(value)):
                 with self.assertRaisesRegex(RuntimeError, "initialize_ddr before PreparePut"):
                     runtime.prepare_put([1, 2], value)
+                with self.assertRaisesRegex(RuntimeError, "initialize_ddr before batch_cpu_pull"):
+                    runtime.batch_cpu_pull([1, 2], ready, [0, 64], value, timeout=0)
+
+    @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
+    def test_batch_cpu_pull_requires_ready_instead_of_local_tensor(self):
+        runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
+        ready = restored(kvaf.ReadyToken, (restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99)), 1))
+        with self.assertRaises(TypeError):
+            runtime.batch_cpu_pull([0], NpuTensorLayout(), [0], [8])
+        with self.assertRaises(TypeError):
+            runtime.batch_cpu_pull([0], ready, [0], [8], stream=None)
+        with self.assertRaisesRegex(RuntimeError, "initialize_ddr before batch_cpu_pull"):
+            runtime.batch_cpu_pull([0], ready, [0], [8], profile=True)
+        with self.assertRaisesRegex(RuntimeError, "initialize_ddr before resolve_cpu_pull"):
+            runtime.resolve_cpu_pull(timeout=0)
 
     def test_raw_arrays_require_npu_layout(self):
         valid = NpuTensorLayout()

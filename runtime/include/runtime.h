@@ -115,10 +115,10 @@ class RuntimeCore {
   // Validate and save the source binding; subsequent submissions use ReadyToken.
   Status AttachCpuSource(const CpuPullSourceDesc&);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
-  // Source offsets are relative to registered HBM; destinations are absolute
-  // DDR addresses within this Put's allocations. The wire protocol uses offsets.
+  // Source offsets are relative to the selected HBM MR; destination offsets
+  // are relative to the DDR region base and must cover this Put's allocations.
   Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
-                       Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
+                       Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
                        Uint64ArrayView lengths);
   Status QueryCpuPull(const PutHandle&, CpuPullState*);
   Status WaitCpuPull(const PutHandle&, std::uint32_t timeout_ms, CpuPullState*);

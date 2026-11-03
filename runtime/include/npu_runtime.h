@@ -14,6 +14,13 @@ namespace kvaf {
 
 struct BatchGetKernelProfile;
 
+// Optional Host wall-clock timings for one synchronous BatchCpuPull call.
+// Successful calls only; stages are inside total_us, never CPU-service clocks.
+struct CpuPullProfile {
+  double validation_us{}, prepare_put_us{}, dst_offsets_us{}, submit_cpu_pull_us{};
+  double wait_cpu_pull_us{}, commit_put_us{}, total_us{};
+};
+
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path = "",
                     std::uint32_t token_bytes = 0,
@@ -75,12 +82,16 @@ class NpuRuntime final : public Runtime {
   RuntimeCore& core();
   const RuntimeCore& core() const;
   Status GetOffloadRegion(OffloadRegionTicket*) const;
-  // Synchronous local-HBM -> shared-DDR convenience API. Success includes
-  // metadata commit. Failed unresolved DMA retains input/slots and blocks reuse;
-  // Shutdown queries the original task and retries cleanup without resubmitting.
-  // Input registration is cached until a different source or Shutdown; native
-  // callers must keep the input allocation alive for that registration lifetime.
-  Status BatchCpuPull(const BatchPutRequest&, BatchPutExecutionOptions = {});
+  // One source span per key, from an attached CPU source's selected MR. Prepare,
+  // Submit, Wait and Commit are internal; success includes metadata publication.
+  // The producer owns registration, synchronization, Ready and ReleaseBatch on
+  // both local and remote NPUs. UINT32_MAX uses options.offload_timeout_ms.
+  Status BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken&,
+                      Uint64ArrayView src_offsets, const std::vector<std::uint64_t>& lengths,
+                      std::uint32_t timeout_ms = UINT32_MAX, CpuPullProfile* profile = nullptr);
+  // Finish the internally retained batch, never replay READ. Explicit PutHandle
+  // transactions still use Query/Wait/Commit/Abort with their original handle.
+  Status ResolveCpuPull(std::uint32_t timeout_ms = UINT32_MAX);
   bool pending_offload() const;
   // Diagnostic RPC: hashes current DDR after commit, outside CPU Pull's data path.
   // Call before freeing/overwriting destination slots, the source's next Ready,
@@ -89,9 +100,10 @@ class NpuRuntime final : public Runtime {
 
   Status AttachCpuSource(const CpuPullSourceDesc&);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
-  // Resolves the attached source from ReadyToken. dst_addrs are absolute DDR addresses.
+  // Resolves the attached source from ReadyToken. dst_offsets are byte offsets
+  // from this Runtime's DDR base, within the given Put's reserved ranges.
   Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
-                       Uint64ArrayView src_offsets, Uint64ArrayView dst_addrs,
+                       Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
                        Uint64ArrayView lengths);
   Status QueryCpuPull(const PutHandle&, CpuPullState*);
   Status WaitCpuPull(const PutHandle&, std::uint32_t timeout_ms, CpuPullState*);

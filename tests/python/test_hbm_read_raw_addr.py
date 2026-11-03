@@ -139,6 +139,7 @@ def main():
     runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
     assert runtime.ddr_initialized
     ticket = runtime.offload_region()
+    ddr_base = runtime.remote_region["base"]
     marker = torch.full((656,), 0xA5, dtype=torch.uint8)
     marker_hbm = marker.to(f"npu:{args.device_a}")
     runtime.batch_put([0], marker_hbm, [0], [656])
@@ -162,7 +163,7 @@ def main():
             assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
             put = runtime.prepare_put(KEYS, [656] * 3)
             source_offsets = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
-            cpu_destinations = torch.tensor([e.address for e in put.entries],
+            cpu_destinations = torch.tensor([e.address - ddr_base for e in put.entries],
                                             dtype=torch.int64, device="cpu")
             runtime.submit_cpu_pull(cpu_batch, put, source_offsets,
                                            cpu_destinations, torch.full((3,), 656, dtype=torch.int64, device="cpu"))
