@@ -13,7 +13,10 @@ QoS configuration and optional CPU driver source excerpts in `report.json` and
 raw files. Use `collect_read_qos.py` for each workload to sample one or more devices
 concurrently, pairing `--urma-device` and `--eid` values in order. Raw `perf_*.txt`
 and timing/status go under `<output>/<device>/`; the root `sampling.log` records
-overall status. Devices sharing a controller reuse the same samples. Neither tool
+overall status. Devices with identical `chip_id`, `die_id` and `logic_port_bitmap`
+in `caps_info` reuse the same samples, even across different debugfs paths.
+The grouping fields and selected sampling path are recorded in the logs; sampling
+does not save a separate `caps_info` file. Neither tool
 queries NPU/HCCP/Ascend or live Jetty/TP resources. Sampling does not produce a
 JSON report or bandwidth CSV.
 See [CPU information and port/VL sampling](read_qos.md) for commands and output

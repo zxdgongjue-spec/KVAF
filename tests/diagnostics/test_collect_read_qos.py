@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from collect_read_qos import main, parse_perf_stats
+from collect_read_qos import main, parse_perf_stats, parse_port_group
 from collect_read_qos_info import (
     Collector, collect_sources, configured_response_pairs, main as info_main, normalize_eid, parse_devices,
     resolve_debug_dir, select_device,
@@ -23,6 +23,11 @@ name : udmac0d0e3
 eid0 : 0000:0000:0000:0000:0000:0000:0000:0000
 """
 MULTI_DEVICES = DEVICES.replace("0000:0000:0000:0000:0000:0000:0000:0000", OTHER_EID)
+CAPS = """logic_port_bitmap: 0x30
+chip_id: 1
+die_id: 1
+"""
+OTHER_CAPS = CAPS.replace("chip_id: 1", "chip_id: 0")
 PERF = """perf_stats_period: 100(ms)
 port bandwidth info:
     port_id: 0
@@ -84,6 +89,21 @@ class ReadQosTest(unittest.TestCase):
         self.assertEqual(configured_response_pairs(text), [[8, 9], [4, 5]])
         self.assertIsNone(configured_response_pairs("ctp_resp_vl_offset: 1\n"))
 
+    def test_port_group_requires_complete_unambiguous_numeric_identity(self):
+        self.assertEqual(parse_port_group(CAPS), (1, 1, 48))
+        self.assertEqual(parse_port_group(CAPS.replace("\n", "\r\n")), (1, 1, 48))
+        self.assertEqual(parse_port_group("  chip_id: 0X01\n\tdie_id: 01\nlogic_port_bitmap: 048\n"),
+                         parse_port_group(CAPS))
+        for field in ("chip_id", "die_id", "logic_port_bitmap"):
+            lines = [line for line in CAPS.splitlines() if not line.startswith(field + ":")]
+            missing = "\n".join(lines) + "\n"
+            for invalid in (missing, CAPS + f"{field}: 1\n", missing + f"{field}: unknown\n",
+                            missing + f"{field}: -1\n", missing + f"{field}:\n"):
+                with self.subTest(field=field, caps=invalid), self.assertRaises(ValueError):
+                    parse_port_group(invalid)
+        with self.assertRaises(ValueError):
+            parse_port_group(CAPS.replace("0x30", "0x0"))
+
     def test_information_snapshot_only_queries_cpu_information(self):
         def run(argv, **kwargs):
             self.assertIn(argv[0], ("cat", "modinfo", "urma_admin"))
@@ -131,6 +151,8 @@ class ReadQosTest(unittest.TestCase):
         def run(argv, **kwargs):
             if argv == ["urma_admin", "show", "--all", "--whole"]:
                 output = DEVICES
+            elif argv[0] == "cat" and str(argv[1]).endswith("caps_info"):
+                output = CAPS
             elif argv[0] == "cat" and str(argv[1]).endswith("perf_stats"):
                 output = PERF
             else:
@@ -146,7 +168,7 @@ class ReadQosTest(unittest.TestCase):
                 self.assertEqual(main(["--eid", CPU_EID,
                                        "--samples", "2", "--interval", "0.1", "--label", "p15-only",
                                        "--output", str(output)]), 0)
-            self.assertEqual(command.call_count, 3)
+            self.assertEqual(command.call_count, 4)
             sleep.assert_called_once_with(0.1)
             self.assertEqual({path.name for path in output.iterdir()},
                              {"udmac0d1e2", "sampling.log"})
@@ -164,6 +186,7 @@ class ReadQosTest(unittest.TestCase):
             self.assertNotIn("64000", log)
             root_log = (output / "sampling.log").read_text(encoding="utf-8")
             self.assertEqual(root_log.count("name=urma_devices"), 1)
+            self.assertEqual(root_log.count("name=caps_info_udmac0d1e2"), 1)
             self.assertIn("COLLECTION_DONE status=complete completed_devices=1 requested_devices=1", root_log)
 
     def test_sampling_failures_are_visible_and_return_nonzero(self):
@@ -173,6 +196,8 @@ class ReadQosTest(unittest.TestCase):
                     code, output = 0, "unavailable in fixture"
                     if argv[:2] == ["urma_admin", "show"] and "--all" in argv:
                         output = "" if stage == "device_identity" else DEVICES
+                    elif argv[0] == "cat" and str(argv[1]).endswith("caps_info"):
+                        output = CAPS
                     elif argv[0] == "cat" and str(argv[1]).endswith("perf_stats"):
                         code = 1 if stage == "perf_stats_read" else 0
                         output = "Permission denied" if code else "unknown bandwidth format"
@@ -205,6 +230,8 @@ class ReadQosTest(unittest.TestCase):
             nonlocal reads
             if argv[0] == "urma_admin":
                 return subprocess.CompletedProcess(argv, 0, DEVICES.encode())
+            if Path(argv[1]).name == "caps_info":
+                return subprocess.CompletedProcess(argv, 0, CAPS.encode())
             reads += 1
             if reads == 2:
                 raise subprocess.TimeoutExpired(argv, 15, output=b"partial read")
@@ -225,7 +252,7 @@ class ReadQosTest(unittest.TestCase):
             self.assertEqual((device_output / "perf_0001.txt").read_text(encoding="utf-8"), "partial read\nTIMEOUT\n")
             self.assertFalse((device_output / "perf_0002.txt").exists())
 
-    def test_multiple_controllers_sample_concurrently_into_separate_directories(self):
+    def test_distinct_port_groups_sample_concurrently_into_separate_directories(self):
         barrier = threading.Barrier(2, timeout=5)
         other_perf = PERF.replace("64000", "128000")
 
@@ -235,54 +262,68 @@ class ReadQosTest(unittest.TestCase):
             self.assertEqual(argv[0], "cat")
             device = Path(argv[1]).parent.name
             self.assertIn(device, ("udmac0d1e2", "udmac0d0e3"))
+            if Path(argv[1]).name == "caps_info":
+                output = CAPS if device == "udmac0d1e2" else other_caps
+                return subprocess.CompletedProcess(argv, 0, output.encode())
             # A serial implementation cannot get both readers past this barrier.
             barrier.wait()
             output = PERF if device == "udmac0d1e2" else other_perf
             return subprocess.CompletedProcess(argv, 0, output.encode())
 
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "samples"
-            with patch("collect_read_qos.sys.platform", "linux"), \
-                 patch("collect_read_qos_info.subprocess.run", side_effect=run) as command, \
-                 patch("collect_read_qos.resolve_debug_dir",
-                       side_effect=lambda device, root: Path(directory) / "debug" / device.name), \
-                 patch("collect_read_qos.time.sleep"), redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["--urma-device", "udmac0d1e2", "udmac0d0e3",
-                                       "--eid", CPU_EID, OTHER_EID, "--samples", "2",
-                                       "--output", str(output)]), 0)
-            self.assertEqual(command.call_count, 5)
-            self.assertEqual({path.name for path in output.iterdir()},
-                             {"sampling.log", "udmac0d1e2", "udmac0d0e3"})
-            for device, eid, expected in (("udmac0d1e2", CPU_EID, PERF),
-                                          ("udmac0d0e3", OTHER_EID, other_perf)):
-                device_output = output / device
-                self.assertEqual({path.name for path in device_output.iterdir()},
-                                 {"sampling.log", "perf_0000.txt", "perf_0001.txt"})
-                for sample in range(2):
-                    self.assertEqual((device_output / f"perf_{sample:04d}.txt").read_text(encoding="utf-8"), expected)
-                log = (device_output / "sampling.log").read_text(encoding="utf-8")
-                self.assertIn(f"eid={eid}", log)
-                self.assertIn(f"status=complete device={device} valid_perf_samples=2", log)
-            self.assertIn("completed_devices=2 requested_devices=2",
-                          (output / "sampling.log").read_text(encoding="utf-8"))
+        # A difference in any field must keep the groups separate, even for overlapping bitmaps.
+        for other_caps in (OTHER_CAPS, CAPS.replace("die_id: 1", "die_id: 0"), CAPS.replace("0x30", "0x10")):
+            with self.subTest(caps=other_caps), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "samples"
+                with patch("collect_read_qos.sys.platform", "linux"), \
+                     patch("collect_read_qos_info.subprocess.run", side_effect=run) as command, \
+                     patch("collect_read_qos.resolve_debug_dir",
+                           side_effect=lambda device, root: Path(directory) / "debug" / device.name), \
+                     patch("collect_read_qos.time.sleep"), redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["--urma-device", "udmac0d1e2", "udmac0d0e3",
+                                           "--eid", CPU_EID, OTHER_EID, "--samples", "2",
+                                           "--output", str(output)]), 0)
+                self.assertEqual(command.call_count, 7)
+                self.assertEqual({path.name for path in output.iterdir()},
+                                 {"sampling.log", "udmac0d1e2", "udmac0d0e3"})
+                for device, eid, expected in (("udmac0d1e2", CPU_EID, PERF),
+                                              ("udmac0d0e3", OTHER_EID, other_perf)):
+                    device_output = output / device
+                    self.assertEqual({path.name for path in device_output.iterdir()},
+                                     {"sampling.log", "perf_0000.txt", "perf_0001.txt"})
+                    for sample in range(2):
+                        self.assertEqual((device_output / f"perf_{sample:04d}.txt").read_text(encoding="utf-8"), expected)
+                    log = (device_output / "sampling.log").read_text(encoding="utf-8")
+                    self.assertIn(f"eid={eid}", log)
+                    self.assertNotIn("SHARED_PORT_GROUP", log)
+                    self.assertIn(f"status=complete device={device} valid_perf_samples=2", log)
+                self.assertIn("completed_devices=2 requested_devices=2",
+                              (output / "sampling.log").read_text(encoding="utf-8"))
 
-    def test_shared_controller_is_read_once_with_identical_raw_data_and_timestamps(self):
+    def test_shared_ports_are_read_once_across_debugfs_paths_with_identical_data_and_timestamps(self):
         def run(argv, **kwargs):
-            output = MULTI_DEVICES if argv[0] == "urma_admin" else PERF
+            if argv[0] == "urma_admin":
+                output = MULTI_DEVICES
+            elif Path(argv[1]).name == "caps_info":
+                output = CAPS if Path(argv[1]).parent.name == "00007" else CAPS.replace("0x30", "48")
+            else:
+                self.assertEqual(Path(argv[1]).parent.name, "00007")
+                output = PERF
             return subprocess.CompletedProcess(argv, 0, output.encode())
 
-        for explicit in (True, False):
-            with self.subTest(explicit=explicit), tempfile.TemporaryDirectory() as directory:
+        for explicit, shared_path in ((True, True), (True, False), (False, False)):
+            with self.subTest(explicit=explicit, shared_path=shared_path), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "samples"
+                first_debug = Path(directory) / "00007"
+                second_debug = first_debug if shared_path else Path(directory) / "00008"
                 arguments = ["--eid", CPU_EID, "--eid", OTHER_EID, "--samples", "2", "--output", str(output)]
                 if explicit:
                     arguments += ["--urma-device", "udmac0d1e2", "--urma-device", "udmac0d0e3"]
                 with patch("collect_read_qos.sys.platform", "linux"), \
                      patch("collect_read_qos_info.subprocess.run", side_effect=run) as command, \
-                     patch("collect_read_qos.resolve_debug_dir", return_value=Path(directory) / "shared"), \
+                     patch("collect_read_qos.resolve_debug_dir", side_effect=[first_debug, second_debug]), \
                      patch("collect_read_qos.time.sleep"), redirect_stdout(io.StringIO()):
                     self.assertEqual(main(arguments), 0)
-                self.assertEqual(command.call_count, 3)
+                self.assertEqual(command.call_count, 5)
                 first, second = output / "udmac0d1e2", output / "udmac0d0e3"
                 for sample in range(2):
                     filename = f"perf_{sample:04d}.txt"
@@ -290,7 +331,12 @@ class ReadQosTest(unittest.TestCase):
                 first_log = (first / "sampling.log").read_text(encoding="utf-8")
                 second_log = (second / "sampling.log").read_text(encoding="utf-8")
                 for log in (first_log, second_log):
-                    self.assertIn("SHARED_CONTROLLER devices=udmac0d1e2,udmac0d0e3", log)
+                    self.assertIn("SHARED_PORT_GROUP devices=udmac0d1e2,udmac0d0e3", log)
+                    self.assertIn("chip_id=1 die_id=1 logic_port_bitmap=0x30", log)
+                    self.assertIn(f"source_device=udmac0d1e2 path={first_debug / 'perf_stats'}", log)
+                self.assertIn(f"perf_stats={second_debug / 'perf_stats'}", second_log)
+                root_log = (output / "sampling.log").read_text(encoding="utf-8")
+                self.assertEqual(root_log.count("SAMPLING_READY"), 1)
                 self.assertEqual([line for line in first_log.splitlines() if line.startswith("COMMAND")],
                                  [line for line in second_log.splitlines() if line.startswith("COMMAND")])
 
@@ -304,6 +350,9 @@ class ReadQosTest(unittest.TestCase):
                     code, text = 0, MULTI_DEVICES
                     if argv[0] == "cat":
                         device = Path(argv[1]).parent.name
+                        if Path(argv[1]).name == "caps_info":
+                            text = CAPS if device == "udmac0d1e2" else OTHER_CAPS
+                            return subprocess.CompletedProcess(argv, 0, text.encode())
                         reads.append(device)
                         text = PERF
                         if device == "udmac0d0e3":
@@ -349,6 +398,47 @@ class ReadQosTest(unittest.TestCase):
                     self.assertIn(f"stage={stage}", failed_log)
                     self.assertIn("status=incomplete device=udmac0d0e3 valid_perf_samples=0", failed_log)
                     self.assertEqual(reads.count("udmac0d0e3"), 1)
+
+    def test_unverified_port_group_is_skipped_while_healthy_device_keeps_sampling(self):
+        for failure in ("read", "timeout", "truncated", "missing_field"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "samples"
+                reads = []
+
+                def run(argv, **kwargs):
+                    if argv[0] == "urma_admin":
+                        return subprocess.CompletedProcess(argv, 0, MULTI_DEVICES.encode())
+                    path = Path(argv[1])
+                    code, text = 0, CAPS
+                    if path.name == "caps_info":
+                        if path.parent.name == "udmac0d0e3":
+                            if failure == "read":
+                                code, text = 1, "Permission denied"
+                            elif failure == "timeout":
+                                raise subprocess.TimeoutExpired(argv, 15)
+                            elif failure == "truncated":
+                                text += "x" * (2 * 1024 * 1024)
+                            else:
+                                text = CAPS.replace("chip_id: 1\n", "")
+                    else:
+                        self.assertEqual(path.name, "perf_stats")
+                        reads.append(path.parent.name)
+                        text = PERF
+                    return subprocess.CompletedProcess(argv, code, text.encode())
+
+                with patch("collect_read_qos.sys.platform", "linux"), \
+                     patch("collect_read_qos_info.subprocess.run", side_effect=run), \
+                     patch("collect_read_qos.resolve_debug_dir",
+                           side_effect=lambda device, root: Path(directory) / device.name), \
+                     patch("collect_read_qos.time.sleep"), redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["--urma-device", "udmac0d1e2", "udmac0d0e3",
+                                           "--eid", CPU_EID, OTHER_EID, "--samples", "2",
+                                           "--output", str(output)]), 1)
+                self.assertEqual(reads, ["udmac0d1e2", "udmac0d1e2"])
+                self.assertFalse((output / "udmac0d0e3").exists())
+                root_log = (output / "sampling.log").read_text(encoding="utf-8")
+                self.assertIn("stage=port_group_identity", root_log)
+                self.assertIn("COLLECTION_DONE status=incomplete completed_devices=1 requested_devices=2", root_log)
 
     def test_invalid_multi_device_arguments_fail_before_creating_output(self):
         options = (
