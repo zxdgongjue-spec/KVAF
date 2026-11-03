@@ -71,7 +71,8 @@ class Transport {
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
-  Status PostPrepared(PreparedWrite&);
+  Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
+                      std::uint64_t* first_post_ns = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&);
   Status ReadControl(std::uint64_t offset, std::uint64_t bytes);

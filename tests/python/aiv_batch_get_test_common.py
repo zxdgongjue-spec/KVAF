@@ -145,19 +145,23 @@ def run(mode: str) -> int:
         # Enqueue on two caller streams without an intervening caller sync.
         # The owner must drain the first request before reusing workspace.
         retained = []
-        for output in outputs:
-            stream = torch.npu.Stream(device=device_id)
-            with torch.npu.stream(stream):
-                output.fill_(0xAD)
-                inputs = [t.to(device) for t in (index_cpu, offset_cpu, row_cpu)]
-                count = torch.tensor([1], dtype=torch.int32, device=device)
-                runtime.batch_get(view, inputs[0], inputs[1], count, inputs[2],
-                                  output, stream=stream, synchronize=False)
-            retained.append((stream, inputs, count))
-        torch.npu.synchronize()
-        expected = torch.full_like(outputs[0].cpu(), 0xAD)
-        expected[row_cpu[0].long()] = source_cpu[(index_cpu[0] * 4 + offset_cpu[0] // token).long()]
-        assert all(torch.equal(output.cpu(), expected) for output in outputs)
+        for explicit_stream in (False, True):
+            for output in outputs:
+                stream = torch.npu.Stream(device=device_id)
+                with torch.npu.stream(stream):
+                    output.fill_(0xAD)
+                    inputs = [t.to(device) for t in (index_cpu, offset_cpu, row_cpu)]
+                    count = torch.tensor([1], dtype=torch.int32, device=device)
+                    # The default must resolve the current stream again after
+                    # every context switch, even if its callable is cached.
+                    kwargs = {"stream": stream} if explicit_stream else {}
+                    runtime.batch_get(view, inputs[0], inputs[1], count, inputs[2],
+                                      output, synchronize=False, **kwargs)
+                retained.append((stream, inputs, count))
+            torch.npu.synchronize()
+            expected = torch.full_like(outputs[0].cpu(), 0xAD)
+            expected[row_cpu[0].long()] = source_cpu[(index_cpu[0] * 4 + offset_cpu[0] // token).long()]
+            assert all(torch.equal(output.cpu(), expected) for output in outputs)
         # Shutdown checks the final queued execution status and joins CPU workers.
         runtime.shutdown()
         print(f"PASS: mode={mode} cores={cores} token_bytes={token} counts={counts}")

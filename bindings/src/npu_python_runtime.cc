@@ -100,10 +100,13 @@ NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
 
 // Reuse method-name objects and use CPython's method vectorcall, avoiding an
 // attribute accessor/bound-method/argument-tuple on every trusted tensor read.
-// Cache names only: tensor pointers and sizes are always read for this call.
+// Cache names and the stream-query callable; pointers, sizes and stream handles
+// are always read for this call.
 struct TensorMetadataMethods {
   py::str data_ptr{"data_ptr"}, numel{"numel"}, size{"size"};
+  py::str stream_handle{"npu_stream"};
   py::int_ zero{0};
+  py::object current_stream;
   py::object Call(const py::object& tensor, const py::str& name) const {
 #if PY_VERSION_HEX >= 0x03090000
     PyObject* result = PyObject_CallMethodNoArgs(tensor.ptr(), name.ptr());
@@ -124,6 +127,18 @@ struct TensorMetadataMethods {
   }
   void* Pointer(const py::object& tensor) const {
     return PointerFromValue(Call(tensor, data_ptr).cast<std::uint64_t>());
+  }
+  aclrtStream Stream(const py::object& requested) {
+    py::object selected = requested;
+    if (selected.is_none()) {
+      // Cache the Python callable, never the stream or handle. Resolve the
+      // caller's current device/stream on every call, including stream switches.
+      if (!current_stream)
+        current_stream = py::module_::import("torch").attr("npu").attr("current_stream");
+      selected = current_stream();
+    }
+    return reinterpret_cast<aclrtStream>(PointerFromValue(
+        selected.attr(stream_handle).cast<std::uint64_t>()));
   }
 };
 
@@ -621,9 +636,8 @@ class NpuPythonRuntime final {
     }
     tensor_timer.Stop();
     scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
-    const aclrtStream acl_stream = trusted_scatter_inputs_ && !stream.is_none() ?
-        reinterpret_cast<aclrtStream>(PointerFromValue(
-            stream.attr("npu_stream").cast<std::uint64_t>())) : ResolveStream(stream);
+    const aclrtStream acl_stream = trusted_scatter_inputs_ ?
+        tensor_methods_.Stream(stream) : ResolveStream(stream);
     stream_timer.Stop();
     Status status;
     {

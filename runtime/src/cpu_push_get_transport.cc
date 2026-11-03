@@ -185,7 +185,7 @@ void Transport::AddControlRead(Queue& q, std::uint64_t remote, std::uint32_t byt
   wr.tjetty = q.channel.remote_jetty;
   wr.user_ctx = ++q.sequence;
   wr.rw.src = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
-  wr.rw.dst = {reinterpret_cast<urma_sge_t*>(q.local.data()), 1};
+  wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&q.local.back()), 1};
   q.wrs.push_back(wr);
 }
 Status Transport::Post(Queue& q) {
@@ -242,14 +242,22 @@ Status Transport::ReadControl(std::uint64_t offset, std::uint64_t bytes) {
     return Error("invalid control transfer");
   while (bytes) {
     ResetRequests(q);
-    const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, max_bytes_));
-    q.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset), length, control_, nullptr});
-    AddControlRead(q, hbm_base_ + offset, length);
+    const auto chunks = static_cast<std::size_t>(std::min<std::uint64_t>(
+        (bytes + max_bytes_ - 1) / max_bytes_, kJettyDepth));
+    // Reserve before taking SGE pointers. A coalesced header/descriptor can
+    // exceed one message; submit its READs together and wait only for the
+    // strongly ordered tail, rather than paying one round trip per message.
+    q.local.reserve(chunks); q.remote.reserve(chunks); q.wrs.reserve(chunks);
+    for (std::size_t i = 0; i < chunks; ++i) {
+      const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, max_bytes_));
+      q.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset), length, control_, nullptr});
+      AddControlRead(q, hbm_base_ + offset, length);
+      offset += length;
+      bytes -= length;
+    }
     auto result = Post(q);
     if (result.ok()) result = Wait(q);
     if (!result.ok()) return result;
-    offset += length;
-    bytes -= length;
   }
   return Status::OK();
 }
@@ -413,7 +421,8 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   }
   return Status::OK();
 }
-Status Transport::PostPrepared(PreparedWrite& plan) {
+Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources,
+                               std::uint64_t* first_post_ns) {
   std::size_t largest = 0;
   for (const auto& q : plan.queues) largest = std::max(largest, q.wrs.size());
   // Start all four Jettys before posting the next slice of any queue. A long
@@ -421,7 +430,12 @@ Status Transport::PostPrepared(PreparedWrite& plan) {
   for (std::size_t first = 0; first < largest; first += post_batch_wrs_) {
     for (std::uint32_t q = 0; q < kJettyCount; ++q) {
       if (first >= plan.queues[q].wrs.size()) continue;
+      // Once a queue is refreshed, its SGL remains immutable until its CQE.
+      // Start its DMA while the CPU refreshes the following queues; do not
+      // delay the first WRITE until all four address lists have been walked.
+      if (refresh_sources && !first) RefreshPrepared(plan.queues[q]);
       urma_jfs_wr_t* bad = nullptr;
+      if (first_post_ns && !*first_post_ns) *first_post_ns = BatchGetProfileNowNs();
       if (urma_post_jetty_send_wr(queues_[q].channel.local_jetty,
                                 &plan.queues[q].wrs[first], &bad)) {
         queues_[q].poisoned = true;
@@ -482,7 +496,6 @@ Status Transport::WriteBatch() {
   // and crossing several team barriers for each short request.
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
-    for (auto& queue : plan.queues) RefreshPrepared(queue);
     status = BeginPrepared(plan, w + 1);
     if (!status.ok()) return status;
     if (profile_.enabled) {
@@ -494,12 +507,16 @@ Status Transport::WriteBatch() {
         profile_.post_calls += (q.wrs.size() + post_batch_wrs_ - 1) / post_batch_wrs_;
       }
     }
-    const auto phase_begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
-    if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = phase_begin;
-    status = PostPrepared(plan);
+    std::uint64_t first_post = 0;
+    status = PostPrepared(plan, true, profile_.enabled ? &first_post : nullptr);
     if (!status.ok()) return status;
     const auto posted = profile_.enabled ? BatchGetProfileNowNs() : 0;
-    if (profile_.enabled) profile_.post_ns += posted - phase_begin;
+    if (profile_.enabled) {
+      if (!profile_.first_post_ns) profile_.first_post_ns = first_post;
+      // This submission interval includes refreshing subsequent queues while
+      // earlier queues transfer. Keep that elapsed time in cpu_comm/post.
+      profile_.post_ns += posted - first_post;
+    }
     status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
     if (profile_.enabled) {
       profile_.last_cqe_ns = BatchGetProfileNowNs();

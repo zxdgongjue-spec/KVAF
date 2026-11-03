@@ -21,6 +21,7 @@ std::uint64_t done_address{};
 bool fail_cq{};
 std::uint32_t post_calls{};
 std::vector<std::uint32_t> post_queues;
+const kvaf::urma::Sge* later_queue_source{};
 std::uint64_t Address(const void* p) { return reinterpret_cast<std::uint64_t>(p); }
 }
 
@@ -28,6 +29,13 @@ extern "C" urma_status_t __wrap_urma_post_jetty_send_wr(
     urma_jetty_t* jetty, urma_jfs_wr_t* wr, urma_jfs_wr_t**) {
   const auto q = static_cast<std::uint32_t>(jetty - jettys.data());
   assert(q < kJettyCount);
+  if (later_queue_source) {
+    // Queue 0 starts transferring before queue 1's source addresses are
+    // refreshed. Deferred DMA below still verifies all submitted SGLs.
+    assert(q == 0 && wr->opcode == URMA_OPC_WRITE);
+    assert(wr->rw.src.sge[0].addr && !later_queue_source->addr);
+    later_queue_source = nullptr;
+  }
   ++post_calls;
   post_queues.push_back(q);
   pending[q].push_back(wr);
@@ -75,10 +83,11 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
 namespace kvaf::cpu_push {
 struct TransportTest {
   static void Run(std::uint32_t token, std::uint32_t maximum = 1024,
-                  std::uint32_t max_sge = 16, std::uint32_t post_batch = 128) {
+                  std::uint32_t max_sge = 16, std::uint32_t post_batch = 128,
+                  std::uint32_t message_bytes = 65536) {
     Transport t;
     assert(MakeLayout(token, 4, &t.layout_));
-    t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = max_sge; t.max_bytes_ = 65536;
+    t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = max_sge; t.max_bytes_ = message_bytes;
     t.post_batch_wrs_ = post_batch;
     // Retain marker space to exercise legacy mode as well as done-only mode.
     void* memory = nullptr;
@@ -108,18 +117,41 @@ struct TransportTest {
       std::uint64_t observed{};
       assert(t.ReadRequest(&observed).ok() && observed == sequence);
       posted.clear();
+      post_calls = 0;
       const auto prefetched = t.descriptor_prefetch_count_;
       assert(t.ReadDescriptor(sequence).ok());
-      if (std::max(prefetched, count) <= 1024) {
-        assert(posted.size() == (count > prefetched ? 2 : 1));
-        assert(posted.front().opcode == URMA_OPC_READ);
-      }
+      std::size_t reads = 0, submissions = 0;
+      const auto check_read = [&](std::uint64_t bytes) {
+        while (bytes) {
+          const auto chunks = std::min<std::uint64_t>(
+              (bytes + message_bytes - 1) / message_bytes, 8192);
+          for (std::uint64_t i = 0; i < chunks; ++i) {
+            const auto& wr = posted.at(reads++);
+            assert(wr.opcode == URMA_OPC_READ);
+            assert(wr.signaled == (i + 1 == chunks));
+            assert(wr.order == (i + 1 == chunks ? URMA_STRONG_ORDER : URMA_RELAX_ORDER));
+            bytes -= wr.bytes;
+          }
+          submissions += (chunks + 31) / 32;
+        }
+      };
+      check_read(t.layout_.descriptor + std::uint64_t(prefetched) * 8);
+      if (count > prefetched) check_read(std::uint64_t(count - prefetched) * 8);
+      assert(posted.size() == reads && post_calls == submissions);
       assert(!std::memcmp(t.memory_ + t.layout_.descriptor, addresses, count * 8));
       posted.clear();
       post_calls = 0;
       post_queues.clear();
+      if (whole && count >= 4 && t.prepared_count_ == count && t.prepared_batch_done_only_ &&
+          !t.prepared_.empty() && t.prepared_[0]->queues[0].first_row != UINT32_MAX &&
+          !t.prepared_[0]->queues[1].local.empty()) {
+        t.prepared_[0]->queues[0].local[0].addr = 0;
+        t.prepared_[0]->queues[1].local[0].addr = 0;
+        later_queue_source = &t.prepared_[0]->queues[1].local[0];
+      }
       std::memset(hbm.data() + t.layout_.staging, 0xad, std::uint64_t(maximum) * token);
       assert(t.WriteBatch().ok());
+      assert(!later_queue_source);
       if (whole && count >= kJettyCount) {
         for (std::uint32_t q = 0; q < kJettyCount; ++q) assert(post_queues[q] == q);
         std::uint32_t expected_posts = 0;
@@ -146,7 +178,8 @@ struct TransportTest {
       }
       if (whole) assert(markers == 0);
       else if (count) assert(markers > 0);
-      if (count == 1024 && max_sge == 16 && (token == 656 || token == 4096)) {
+      if (count == 1024 && max_sge == 16 && message_bytes == 65536 &&
+          (token == 656 || token == 4096)) {
         assert(data == 64 && tails == 4 && post_calls == 4);
         assert(markers == (whole ? 0 : 16));
       }
@@ -253,9 +286,15 @@ struct TransportTest {
       }
       t.context_ = nullptr;
     }
-    // A bad CQ still fails the payload and must never publish successful done.
+    // A bad CQ fails the batch and must never publish successful done.
     posted.clear(); fail_cq = true;
-    assert(!t.WriteBatch().ok());
+    if (message_bytes == 64) {
+      assert(!t.ReadControl(0, t.layout_.descriptor + std::uint64_t(maximum) * 8).ok());
+      const auto calls = post_calls;
+      assert(!t.ReadControl(0, sizeof(Request)).ok() && post_calls == calls);
+    } else {
+      assert(!t.WriteBatch().ok());
+    }
     for (const auto& wr : posted) assert(wr.destination != done_address);
     fail_cq = false;
     for (auto& q : pending) q.clear();
@@ -273,6 +312,9 @@ int main() {
   for (auto token : {13U, 656U, 4096U, 65535U}) kvaf::cpu_push::TransportTest::Run(token);
   // Cross SQ-credit/wave and segmented control-READ boundaries.
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests);
+  // More READs than one post chain, and more than one SQ-sized control flight.
+  kvaf::cpu_push::TransportTest::Run(13, 1024, 16, 128, 64);
+  kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests, 16, 128, 64);
   // Deployed SGE limit, interleaved multi-doorbell queues and reused plans with
   // changing source addresses. All runtime submission sizes preserve ordering.
   for (auto batch : {32U, 128U, 256U})

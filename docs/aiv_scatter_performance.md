@@ -519,6 +519,11 @@ snapshot D2H 不计入单次计时。`instrumentation_overhead_included=true` �
 大 token 的分段和旧进度模式继续使用完整映射。每次调用都更新地址，不缓存请求内容。
 payload WR 按提交批次轮转四条 Jetty，使其他队列尽早开始；每次默认提交 128 条 WR，
 仍只在每条队列的最后一条 WR 上请求完成，全部尾 CQE 到齐后才发布 done。
+每条队列在本轮第一次提交前刷新自己的 SGE，随后立即提交，让先提交队列的 DMA
+与后续队列的地址刷新重叠。已提交队列的 SGL 在完成前保持不变，不再先刷新完四条队列才开始传输。
+`cpu_comm_ns` 仍从实际首批提交前计到最后 payload CQE，期间后续队列的刷新计入
+`cpu_post_ns` 和 `cpu_comm_ns`。因此 `cpu_write_ns - cpu_comm_ns` 不再代表全部 SGE 刷新工作，
+对比时以端到端、`cpu_write_ns` 和 notify→done 的总耗时判断收益，不能只看该差值降低。
 
 可在启动 CPU 服务时设置 `KVAF_CPU_PUSH_POST_BATCH_WRS`（1..8192，默认 128），
 不改变 kernel ABI 或 NPU Python 接口。修改后需重启服务；该变量应设置在 CPU 服务进程上。
@@ -545,6 +550,10 @@ CPU 在观察到新 notify 后，将 header 和上次 count 对应的 descriptor
 请求仍按设备 message_bytes 分段。每次都重新读取地址内容，不缓存地址；支持每轮
 更换源和同指针内容变化。notify 轮询仍保留。稳态小包由 notify/header/descriptor
 三步变为 notify/合并前缀两步，不会把整个 capacity 的 65536 个地址都读回来。
+分段 READ 现在链接后批量提交，仅尾 WR 请求 CQE 并使用强放置顺序、完成顺序；
+一批最多使用 SQ depth 数量的 WR，等该批全部完成后才复用 SGE 或处理下一批。
+8192 项、4 核、64 KiB message 时，合并前缀占 65984 B，两个 READ 一起提交，
+由原来两次串行 CQ 等待改为一次。首次/count 增长时仍在检查 header 后补读缺少的地址。
 
 计时字段沿用原有 32 列：合并 READ 计入 JSON 的 `cpu_header_ns`；`cpu_descriptor_ns`
 仅记录 count 增长时的补读，稳定 count 时为 0。CPU 通信仍为 payload 首次 post 至末尾
@@ -554,7 +563,13 @@ CQE 的完整窗口；Ready 在新模式中不再参与。profile 报告和最�
 Host 复用 Python 方法名，使用 CPython method vectorcall 读取当前 Tensor 指针/尺寸，
 避免重复构造绑定方法与调用参数元组；显式 stream 只取一次 `npu_stream`。不缓存
 Tensor 指针或尺寸，不依赖固定输入对象，不增加 PyTorch C++ 依赖。方法签名不变。
+默认 stream 路径缓存 `torch.npu.current_stream` 查询函数，省去逐次 import/属性预检；
+每次仍调用查询函数并读取返回对象的当前 `npu_stream`，支持 current-stream 上下文切换。
 kernel 提交、各核 status 回拷、一次 stream 同步和执行结果检查仍是同步调用的必要步骤。
+
+这轮固定开销优化需重编并重启 CPU service，同时重编 NPU binding；AIV kernel 和协议 ABI 不变。
+原生 Transport 测试覆盖分段 READ 的一次尾完成、超过 SQ depth 的分批、地址刷新与提交交错、
+变化地址的数据结果以及 CQ 失败后禁止复用。端到端正确性测试另覆盖默认/显式 stream 切换。
 
 本次需重编译 NPU binding/Host/kernel 和 CPU service，并重启 CPU service。
 旧 Host/新 kernel 的 trusted 位、旧 CPU 服务的 Ready 行为会影响对照，测试使用配套产物。
