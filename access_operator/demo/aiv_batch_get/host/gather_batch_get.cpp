@@ -182,9 +182,11 @@ struct GatherBatchGet::Impl {
     if (peer.length < region.length || peer.length - region.length <
         GatherRemoteWorkspaceBytes(config.batch_get_token_bytes, workers))
       return Status::InvalidArgument("remote DDR lacks reserved gather workspace");
-    if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+    // Prefer huge pages with the Runtime's normal-page fallback. Small queue
+    // state allocations may still use normal pages under HUGE_FIRST.
+    if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
         aclrtMemset(workspace, args.workspace_bytes, 0, args.workspace_bytes) != ACL_SUCCESS ||
-        aclrtMalloc(&queues, workers * 2 * sizeof(KvafBatchGetQueueState), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+        aclrtMalloc(&queues, workers * 2 * sizeof(KvafBatchGetQueueState), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
         aclrtMemset(queues, workers * 2 * sizeof(KvafBatchGetQueueState), 0,
                     workers * 2 * sizeof(KvafBatchGetQueueState)) != ACL_SUCCESS)
       return Error("allocate gather workspace");

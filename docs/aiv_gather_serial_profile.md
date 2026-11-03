@@ -10,6 +10,46 @@ AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 边界不变，因此 `input_us` 不会归零。当前 SGL 上限扩展到 13，需要同步重编
 NPU Runtime/Host/Python 与 gather kernel；CPU 服务和 wire 协议保持不变。
 
+## Gather HBM 页策略与 payload 路径
+
+Host 初始化时，`workspace` 和 `queues` 使用 `ACL_MEM_MALLOC_HUGE_FIRST`，
+优先申请大页，大页不足时允许 Runtime 回退到普通页；不使用强制大页策略，
+也不为了触发大页而扩大逻辑申请尺寸。这是 CANN 的 Device 内存分配策略，
+不是 Linux CPU DDR 的 THP 合页机制。
+
+按 [CANN 页策略说明](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1349.html)，
+`HUGE_FIRST` 在申请量不超过 1 MiB 时仍分配普通页，超过时优先使用 2 MiB
+大页。因此本次修改表示大页优先，不能据此宣称实际分配一定为大页。
+`workspace` 为最大 65536 请求预留约 1 MiB 的清单和 scratch；`queues`
+每核只有两个 64 B 软件队列状态，1～8 核为 128～1024 B，仍可能使用普通页。
+本次修改需重编 NPU Host/Runtime 并重建 Runtime 实例，CPU 服务和 kernel ABI
+不变；本地生命周期测试不验证真机物理页大小或带宽收益。
+
+当前 `gather_read` 中，各缓冲区职责如下：
+
+| 缓冲区 | 内容与用途 |
+| --- | --- |
+| HBM `workspace` | 每 lane 64 B scratch（sequence/ACK/command）和源地址清单；不存 token payload |
+| HBM `queues` | 每 lane 控制/数据队列的 PI、CI、初始化和错误状态；不是实际 SQ/CQ 缓冲区 |
+| AIV UB | 先生成描述清单，再复用为 READ WQE 双 bank；不缓存 payload |
+| HCCP 分配的 SQ/CQ | 实际 WQE 和完成记录；本次不改变其分配策略 |
+| CPU DDR staging | CPU 按请求顺序将源 token 复制到连续区间 |
+| 调用方 output HBM | 数据 READ 的最终目的地址，由调用方/torch_npu 分配并由 Host 注册 |
+
+执行时，AIV 从地址表、indices 和 offsets 计算每条源地址，在 UB 生成清单，
+经 MTE3 写入 workspace，再用控制 WRITE 发送到 CPU DDR。CPU 根据清单将
+真正的 payload memcpy 到 DDR staging，完成后发布 ACK。AIV 观察到最终 ACK
+后构造 READ WQE：远端源为 `staging + i * token_bytes`，本地目的 SGE 为
+`output + output_indices[i] * token_bytes`。WQE 从 UB 经 MTE3 写入实际 SQ，
+NIC 按 WQE 将 DDR staging 的 payload 直接 READ 到 output HBM。
+
+因此 payload 路径是“CPU 源 DDR → CPU staging DDR → output HBM”，不经过
+HBM workspace、软件 queues 或 UB。以 8192 × 4096 B 为例，payload 为 32 MiB；
+单 lane 的有效描述清单只有 `48 + 8192 * 16 = 131120 B`。SGL=6 时，完整
+READ WR 从 staging 连续读取 24 KiB，直接写入 output 的六个指定 4096 B 行，
+没有额外的 AIV payload scatter 拷贝。workspace 的大页策略只直接影响清单/
+控制区访问，不能替代 output HBM 页策略的验证。
+
 ## 控制通知合批
 
 `publish` 仍先 WRITE 完整源清单并等待尾 CQ；随后将 command 和 notify
