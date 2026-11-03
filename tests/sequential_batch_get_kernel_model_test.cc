@@ -85,9 +85,11 @@ struct ModelQueue {
   };
   std::vector<uint32_t> sq = std::vector<uint32_t>(16 * 16);
   std::vector<PostedWqe> posted;
+  std::vector<std::vector<uint64_t>> write_batches;
   alignas(64) uint32_t cq[2][16]{};
   uint32_t db{}, cq_db{};
   uint64_t pi{}, completed{}, cq_pi{}, cq_completed{}, doorbells{}, first_db_vfs{};
+  uint64_t fail_cq_at{UINT64_MAX};
 };
 struct Fixture;
 Fixture* fixture;
@@ -106,6 +108,7 @@ struct Fixture {
   std::vector<std::unique_ptr<ModelQueue>> queues;
   std::vector<uint64_t> notified;
   std::vector<uint64_t> read_vf_begin, read_overlap_begin;
+  std::vector<uint64_t> scratch_cache_lines;
   std::vector<uint32_t> ack_reads;
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{}, data_timeout{};
@@ -118,7 +121,7 @@ struct Fixture {
         indices(n), offsets(n), rows(n), status(cores), profiles(cores), states(cores * 2),
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
         read_vf_begin(cores), read_overlap_begin(cores),
-        ack_reads(cores), cpu_done(cores) {
+        scratch_cache_lines(cores), ack_reads(cores), cpu_done(cores) {
     fixture = this;
     const uint64_t source_bytes = uint64_t(n) * bytes * 2;
     const uint64_t lane_staging = Align(uint64_t((n + cores - 1) / cores) * bytes);
@@ -183,6 +186,8 @@ struct Fixture {
   void Poll(void* p) {
     if (args.mode == KVAF_SEQ_GATHER) {
       const auto address = Address(p);
+      if (address >= args.workspace && address < args.workspace + workers * 64ULL)
+        ++scratch_cache_lines[(address - args.workspace) / 64];
       if (address >= args.workspace + args.descriptor_offset &&
           address < args.workspace + args.workspace_bytes) ++descriptor_cache_lines;
       // Ignore partial boundary lines which unrelated allocations can share.
@@ -249,6 +254,7 @@ struct Fixture {
         m.first_db_vfs = aiv_model::vf_calls - (q % 2 ? launch_vf_begin : read_vf_begin[worker]);
       ++m.doorbells;
       const uint64_t end = m.pi + uint32_t(value - uint32_t(m.pi));
+      std::vector<uint64_t> writes;
       auto word = [&](uint64_t base, uint32_t index) {
         return m.sq[((base * 16) + index) % m.sq.size()];
       };
@@ -287,6 +293,7 @@ struct Fixture {
           if (reached == 0x1f) assert(p.ack_done_cycle >= p.notify_done_cycle);
         }
         uint64_t remote_address = uint64_t(word(m.pi, 10)) | (uint64_t(word(m.pi, 11)) << 32);
+        if (q % 2 && op == kWrite) writes.push_back(remote_address);
         if (q % 2 && op == kWrite &&
             remote_address == args.remote_descriptor + worker * args.lane_descriptor_bytes)
           CheckDescriptor(worker);
@@ -332,7 +339,7 @@ struct Fixture {
           assert(m.pi + blocks == end);
           if (!(data_timeout && !(q % 2))) {
             m.cq[m.cq_pi % 2][0] = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
-                ((cq_error || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
+                ((cq_error || m.cq_pi == m.fail_cq_at || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
             ++m.cq_pi; ++completions;
           }
         } else {
@@ -341,6 +348,7 @@ struct Fixture {
         m.pi += blocks;
       }
       assert(m.pi == end); m.db = value;
+      if (!writes.empty()) m.write_batches.push_back(std::move(writes));
       return;
     }
     assert(false && "unknown doorbell");
@@ -432,6 +440,65 @@ void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 int main() {
   const auto& metadata = KvafGatherBatchGetAivKernelV3_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
+  // Publish the descriptor separately, then command/notify under one ordered
+  // tail CQ. Repeated calls wrap SQ/CQ and leave stale ACK/mailbox contents.
+  for (uint32_t cores : {1U, 3U, 8U}) {
+    Fixture f(8193, 13, cores, KVAF_SEQ_GATHER, 6);
+    for (uint32_t core = 0; core < cores; ++core) {
+      // The descriptor leaves command at the last SQ slot and notify at slot 0.
+      const auto rows = 8193ULL * (core + 1) / cores - 8193ULL * core / cores;
+      const auto descriptor_wrs = (48 + rows * 16 + 65535) / 65536;
+      auto& q = *f.queues[core * 2 + 1];
+      auto& s = f.states[core * 2 + 1];
+      s.magic = 0x4b564151; s.initialized = 1;
+      s.sq_producer_index = q.pi = q.completed = 16 - descriptor_wrs - 1;
+      q.db = uint32_t(q.pi);
+    }
+    f.EnableProfile();
+    for (uint32_t count : {8193U, 1U, 0U, 8193U}) {
+      f.Next(count);
+      const auto old_flushes = f.scratch_cache_lines;
+      std::vector<uint64_t> old_batches(cores), old_cqs(cores);
+      for (uint32_t core = 0; core < cores; ++core) {
+        old_batches[core] = f.queues[core * 2 + 1]->write_batches.size();
+        old_cqs[core] = f.queues[core * 2 + 1]->cq_completed;
+      }
+      f.Run(); f.CheckProfiles();
+      for (uint32_t core = 0; core < cores; ++core) {
+        const auto rows = uint64_t(count) * (core + 1) / cores - uint64_t(count) * core / cores;
+        const auto& q = *f.queues[core * 2 + 1];
+        if (!rows) {
+          assert(q.write_batches.size() == old_batches[core]);
+          assert(q.cq_completed == old_cqs[core]);
+          assert(f.scratch_cache_lines[core] == old_flushes[core]);
+          continue;
+        }
+        assert(q.write_batches.size() == old_batches[core] + 2);
+        const auto descriptor = f.args.remote_descriptor + core * f.args.lane_descriptor_bytes;
+        std::vector<uint64_t> descriptor_writes;
+        for (uint64_t offset = 0; offset < 48 + rows * 16; offset += 65536)
+          descriptor_writes.push_back(descriptor + offset);
+        assert(q.write_batches[old_batches[core]] == descriptor_writes);
+        const auto control = f.args.remote_control + core * 64;
+        assert((q.write_batches.back() == std::vector<uint64_t>{control + 16, control}));
+        assert(q.cq_completed - old_cqs[core] == 2 + f.ack_reads[core]);
+        // One clean for both source words; ACK READs still invalidate after CQ.
+        assert(f.scratch_cache_lines[core] - old_flushes[core] == 1 + f.ack_reads[core]);
+      }
+    }
+  }
+  {
+    Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.EnableProfile();
+    f.queues[1]->fail_cq_at = 1;  // Descriptor succeeds; notify tail CQ fails.
+    f.Run(false);
+    assert(f.status[0].result == KVAF_SEQ_CQ_ERROR && f.status[0].phase == KVAF_SEQ_NOTIFY);
+    assert(f.states[1].poisoned && !f.ack_reads[0] && !f.data_reads);
+    assert(f.profiles[0].valid_mask == 0x47 && f.queues[1]->write_batches.size() == 2);
+    f.queues[1]->fail_cq_at = UINT64_MAX;
+    f.Next(19); f.Run(false);  // A failed control queue cannot be reused.
+    assert(f.status[0].result == KVAF_SEQ_QUEUE_ERROR);
+  }
   // Header/span/tail contents are checked before the descriptor's first NIC
   // WRITE. Stress 128-thread tails, both 24-KiB banks, lane boundaries, and a
   // smaller launch after a larger one without relying on zeroed HBM/UB.

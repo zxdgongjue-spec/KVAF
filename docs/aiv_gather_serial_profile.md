@@ -10,6 +10,21 @@ AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 边界不变，因此 `input_us` 不会归零。当前 SGL 上限扩展到 13，需要同步重编
 NPU Runtime/Host/Python 与 gather kernel；CPU 服务和 wire 协议保持不变。
 
+## 控制通知合批
+
+`publish` 仍先 WRITE 完整源清单并等待尾 CQ；随后将 command 和 notify
+两条 8 B WRITE 合批，在 SQ 容量允许时只敲一次 doorbell、等待一次有序尾 CQ。
+notify 尾 WQE 使用 strong place order 和 completion，确保 CPU 看到 sequence
+之前 command 已可见。正常队列下，publish 从三次提交/等待减少为两次；
+保留原有小 SQ 容量 drain，不合并清单与通知，不改变 CPU gather 或数据 READ。
+
+每 lane 的 64 B scratch 在通知前一次写好 sequence（+0）和 descriptor 地址
+（+16），对所在缓存行执行一次 clean/invalidate；两个 WRITE 不再复用同一源槽。
+ACK 仍使用 +8，查询 CQ 完成后的缓存失效继续保留，避免读取旧值。
+`notify_done_cycle` 仍记录在通知尾 CQ 完成之后，六阶段打点边界不变。
+本次只需重编部署 gather kernel，Host/CPU 协议与 ABI 不变；收益和 DMA 可见性
+需在目标 NPU 上复测。
+
 ## 地址清单的 SIMT 构造与批量搬运
 
 `input` 已移除不再使用的 `valid_table` 缓存 Flush。地址表、indices、offsets、
@@ -158,6 +173,16 @@ summary 的 Host 和 AIV 行共享表头，但各自只填自己的指标：
 | e2e_summary / profile_e2e_summary | mean_us、p50_us 等整批统计 | 已包含在整批时间中，不额外拆阶段 |
 | profile_host_mean | prepare_us、launch_us、status_enqueue_us、wait_us、finish_us、total_us | Host 只观察同步等待，没有独立 READ 计时 |
 | profile_core_mean | input / descriptor / publish / wait_cpu / read / finalize / total 的 cycles 和 us | read_cycles，频率核实后有 read_us |
+
+例如 core total 约 190 us、Host total 约 234 us、Python E2E 约 287 us 时，
+Host 与 core 间的约 44 us 包含 Host 参数准备及输出 buffer acquire、launch
+和前置 status/profile memset、设备调度、kernel 打点区间外的 profile 初始化/
+导出与退出、状态/profile D2H、同步返回及 Host 收尾。Host 提交与设备执行可
+重叠，不能将各项调用耗时简单相加。多核应按每个样本的最早 kernel_start
+到最晚 kernel_finish 计算设备区间，不能用各核 total 的平均值替代整批时间。
+Host total 与 Python E2E 的约 53 us 则还覆盖绑定层、Tensor 元数据提取、
+stream 解析及进入 Host profile 前的检查等工作。以上是计时范围解释，
+不是对各项耗时的实测分摊；应使用同一 profile 样本比较。
 
 `profile_host_mean` 行的阶段 cycles 列应为空。`wait_us` 是 Host 的剩余同步
 等待，包括设备执行和状态/profile D2H；AIV 的 `wait_cpu_cycles` 只覆盖通知
