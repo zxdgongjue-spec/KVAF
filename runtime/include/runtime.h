@@ -113,7 +113,6 @@ class RuntimeCore {
   bool pending_offload() const { return bool(connector_put_); }
 
   // Validate and save the source binding; subsequent submissions use ReadyToken.
-  Status AttachCpuSource(const CpuPullSourceDesc&);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
   // Source offsets are relative to the selected HBM MR; destination offsets
   // are relative to the DDR region base and must cover this Put's allocations.
@@ -153,7 +152,6 @@ class RuntimeCore {
   bool closing_{false};
   std::shared_ptr<const int> connector_owner_{std::make_shared<const int>(0)};
   std::shared_ptr<ConnectorPutState> connector_put_;
-  std::unordered_map<std::uint64_t, CpuPullSourceDesc> cpu_sources_;
   Status FinishConnectorPut(const PutHandle&, bool commit);
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};

@@ -61,8 +61,7 @@ def producer(pipe, args, ticket):
         # Initialize before registration's scratch READ/checksum probe.
         hbm.copy_(patterns[0])
         torch.npu.synchronize()
-        desc = source.register(ticket, hbm)
-        pipe.send(("cpu_source", desc))
+        source.register(ticket, hbm)
         pipe.send(("registered", source.selected_npu_eid))
         for iteration in range(args.warmup + args.iterations):
             with torch.npu.stream(stream):
@@ -136,7 +135,6 @@ def main():
         worker = ctx.Process(target=producer, args=(child, args, ticket))
         worker.start()
         child.close()
-        runtime.attach_cpu_source(receive(parent, "cpu_source"))
         src = torch.tensor(offsets, dtype=torch.int64, device="cpu")
         sizes = torch.full((args.blocks,), args.block_bytes, dtype=torch.int64, device="cpu")
         print(f"CPU_PULL_BENCH_READY cpu_candidate={ticket['cpu_candidate']} "

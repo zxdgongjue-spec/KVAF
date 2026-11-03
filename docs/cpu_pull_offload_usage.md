@@ -50,7 +50,7 @@ CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 
 本卡和非本卡都使用已注册源的 ReadyToken，一次调用完成 PreparePut、目的地址组织、
 Submit、Wait 和 Commit。原来直接传本卡 tensor/stream 的形式已删除。
-下面将生产和消费代码写在同一进程，跨进程时通过应用 Connector 交换 ticket、desc、ready 和完成通知：
+下面将生产和消费代码写在同一进程，跨进程时通过应用 Connector 交换 DDR ticket、ready 和完成通知：
 
 ```python
 runtime = kvaf.NpuRuntime(device_id=7, enable_cpu_offload=True)
@@ -58,8 +58,7 @@ runtime.link_to("127.0.0.1:28999")
 runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
 
 cpu_source = kvaf.CpuPullHbmSource(device_id=7)
-desc = cpu_source.register(runtime.offload_region(), tensor, stream=producer_stream)
-runtime.attach_cpu_source(desc)
+cpu_source.register(runtime.offload_region(), tensor, stream=producer_stream)  # 成功返回 None
 
 # 每批：应用在选定 tensor 中写入后，先等待生产完成。
 producer_stream.synchronize()
@@ -125,7 +124,7 @@ python tests/python/test_remote_cpu_offload.py \
 
 生产端调用 `source.register(ticket, tensors)` 注册列表，再用 `source.ready(tensors[i])`
 选择本批源。原单 tensor 的 `register(ticket, tensor)` 和 `ready()` 保持可用。
-读取端使用 `attach_cpu_source(desc)`，每批调用
+注册完成后无需再交换独立 source_desc 或调用 attach；每批直接使用 ReadyToken 调用
 `batch_cpu_pull(keys, ready, src_offsets, lengths)`；需要自定义目的布局时使用
 `submit_cpu_pull(ready, put, src_offsets, dst_offsets, lengths)`，不新增连接句柄参数。
 `src_offsets` 始终相对选定 tensor，`dst_offsets` 在提取本次 `prepare_put()` 结果时计算：

@@ -12,7 +12,7 @@ class PythonSource {
   ~PythonSource() {
     if (!source_.Shutdown().ok()) (void)tensor_.release(); // Retain HBM with quarantined DMA/registration.
   }
-  CpuPullSourceDesc Register(const py::dict& ticket, py::object tensor, py::object stream) {
+  void Register(const py::dict& ticket, py::object tensor, py::object stream) {
     if (!tensor_.is_none()) throw py::value_error("shutdown the previous source before registering again");
     std::vector<ConstBufferView> inputs;
     py::list owners;
@@ -28,7 +28,6 @@ class PythonSource {
     const auto producer = Stream(stream);
     tensor_ = owners; // Snapshot owners, independent of later changes to the caller's list.
     Check(source_.Register(t, inputs, producer));
-    CpuPullSourceDesc desc; Check(source_.GetDescriptor(&desc)); return desc;
   }
   ConstBufferView View(const py::object& tensor) const {
     if (!py::hasattr(tensor, "data_ptr") || !py::hasattr(tensor, "device") ||

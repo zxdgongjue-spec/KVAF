@@ -43,8 +43,9 @@ class AccessOperator {
   // frozen batch only after this decision is acknowledged by the CPU.
   virtual Status CompleteOffload(bool) { return Status::OK(); }
 
+  // Local descriptor and DDR ownership checks only; no source attachment or RPC.
   virtual Status ValidateCpuSource(const CpuPullSourceDesc&) {
-    return Status::NotImplemented("CPU Pull source binding is unavailable");
+    return Status::NotImplemented("CPU Pull source validation is unavailable");
   }
   virtual Status SubmitCpuPull(const CpuPullRequest&) {
     return Status::NotImplemented("CPU Pull submission is unavailable");

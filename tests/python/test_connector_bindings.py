@@ -134,6 +134,7 @@ class ConnectorBindings(unittest.TestCase):
         self.assertTrue(hasattr(kvaf.NpuRuntime, "batch_cpu_pull"))
         self.assertTrue(hasattr(kvaf.NpuRuntime, "resolve_cpu_pull"))
         self.assertTrue(hasattr(kvaf.NpuRuntime, "listen_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuRuntime, "attach_cpu_source"))
         self.assertFalse(hasattr(kvaf.NpuRuntime, "attach_hbm"))
         self.assertFalse(hasattr(kvaf.NpuRuntime, "detach_hbm"))
         self.assertFalse(hasattr(kvaf.NpuPullHbmSource, "listen"))

@@ -21,19 +21,6 @@ const std::vector<PutAllocation>& PutHandle::entries() const {
 CpuPullState PutHandle::state() const { return state_ ? state_->state : CpuPullState::Aborted; }
 bool PutHandle::submitted() const { return state_ && state_->submitted; }
 
-Status RuntimeCore::AttachCpuSource(const CpuPullSourceDesc& source) {
-  if (!initialized_ || closing_) return Status::InvalidState("initialize Runtime before attaching CPU source");
-  if (!source.source_id || !source.source_bytes || !source.region_id || !source.region_epoch ||
-      source.mr_count() > 4096 || source.bytes_for(1) != source.source_bytes ||
-      std::any_of(source.mr_bytes.begin(), source.mr_bytes.end(), [](auto bytes) { return !bytes; }))
-    return Status::InvalidArgument("invalid CPU source descriptor");
-  const auto existing = cpu_sources_.find(source.source_id);
-  if (existing != cpu_sources_.end() && !SameSource(existing->second, source))
-    return Status::InvalidArgument("CPU source identity conflicts with an attached source");
-  auto status = access_operator_.ValidateCpuSource(source);
-  if (status.ok()) cpu_sources_[source.source_id] = source;
-  return status;
-}
 Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
                                const std::vector<std::uint64_t>& lengths, PutHandle* out) {
   if (!initialized_ || closing_) return Status::InvalidState("initialize Runtime before PreparePut");
@@ -53,12 +40,13 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
   if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
       !desc || !ready.sequence || !desc->bytes_for(ready.mr_id))
     return Status::InvalidArgument("CPU source, ReadyToken or put belongs to another Runtime/batch");
-  const auto source = cpu_sources_.find(desc->source_id);
-  if (source == cpu_sources_.end() || !SameSource(source->second, *desc))
-    return Status::InvalidArgument("CPU Pull source is not attached to this Runtime or its identity changed");
+  // ReadyToken carries the source identity. This validates only local metadata;
+  // the CPU checks the selected MR and batch before accepting the actual READ.
+  auto status = access_operator_.ValidateCpuSource(*desc);
+  if (!status.ok()) return status;
   auto& p = *put.state_;
   CopyArrays copies;
-  auto status = SnapshotCopyArrays(src_offsets, dst_offsets, lengths, &copies);
+  status = SnapshotCopyArrays(src_offsets, dst_offsets, lengths, &copies);
   if (!status.ok()) return status;
   if (p.submitted) {
     if (!SameSource(p.request.source, *desc) || p.request.sequence != ready.sequence || p.request.mr_id != ready.mr_id ||

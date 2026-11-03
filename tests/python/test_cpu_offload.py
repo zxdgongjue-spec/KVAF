@@ -40,8 +40,8 @@ def main():
         lengths = [1, 656, 100001]  # final block requires multiple <=64 KiB READs
         with torch.npu.stream(stream):
             source = torch.zeros(400128, dtype=torch.uint8, device=f"npu:{args.device}")
-        desc = cpu_source.register(runtime.offload_region(), source, stream=stream)
-        runtime.attach_cpu_source(desc)
+        registered = cpu_source.register(runtime.offload_region(), source, stream=stream)
+        assert registered is None
         for round_id in range(3):
             expected = ((torch.arange(source.numel(), dtype=torch.int64) * 17 + round_id) % 251).to(torch.uint8)
             with torch.npu.stream(stream):

@@ -18,12 +18,9 @@ runtime.link_to(cpu_address)
 runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
 ticket = runtime.offload_region()
 
-# B 注册，并将 desc 返回 A。
+# B 注册并完成与 CPU 的建链；成功返回 None，无需向 A 单独发送 desc。
 source = kvaf.CpuPullHbmSource(device_id=device_b)
-desc = source.register(ticket, hbm_b, stream=producer_stream)
-
-# A 初始化阶段逻辑绑定，不重复建链。
-runtime.attach_cpu_source(desc)
+source.register(ticket, hbm_b, stream=producer_stream)
 
 # B 每批生产完成后发布身份，应用将 ready 与业务元数据发送给 A。
 producer_stream.synchronize()
@@ -43,7 +40,7 @@ runtime.commit_put(put)
 source.release_batch(ready)
 ```
 
-CPU 源偏移相对于注册 HBM 的逻辑起点；目的在提取 PreparePut 地址时计算 `entry.address - runtime.remote_region["base"] + 槽内偏移`。Submit 直接接收相对偏移，CPU 加回同一 DDR 池基地址执行 READ；便利入口内部完成偏移提取。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。源绑定保存在 Runtime 内，通过 ready.source 自动查找，不需要应用保存本地源句柄。
+CPU 源偏移相对于注册 HBM 的逻辑起点；目的在提取 PreparePut 地址时计算 `entry.address - runtime.remote_region["base"] + 槽内偏移`。Submit 直接接收相对偏移，CPU 加回同一 DDR 池基地址执行 READ；便利入口内部完成偏移提取。提交范围必须精确覆盖本次 PreparePut 的有效数据范围，支持拆分/重排，禁止空洞、重叠或跨槽。与普通 BatchPut 使用同一个 MetaManager，无需 reserve_raw_ddr。CPU 服务保存源连接和 MR；Runtime 使用 ready.source 校验 DDR 归属并提交，由 CPU 核对选中 MR 的真实注册信息，不需要应用保存源句柄或预先调用 attach。
 
 ## 统一便利入口
 

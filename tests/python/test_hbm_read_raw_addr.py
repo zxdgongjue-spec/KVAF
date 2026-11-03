@@ -37,10 +37,9 @@ def producer(pipe, args, ddr_ticket, receiver):
     cpu_batch = raw_batch = None
     try:
         registration = tensors if args.hbm_mrs > 1 else tensors[0]
-        cpu_desc = cpu_source.register(ddr_ticket, registration)
+        registered = cpu_source.register(ddr_ticket, registration)
+        assert registered is None
         a_source.register(registration, receiver=receiver, stream=stream)
-        assert cpu_desc.mr_count == args.hbm_mrs
-        pipe.send(("cpu_source", cpu_desc))
         assert a_source.connected
         for round_id in range(args.rounds):
             hbm = tensors[round_id % args.hbm_mrs]
@@ -51,7 +50,7 @@ def producer(pipe, args, ddr_ticket, receiver):
             cpu_batch = cpu_source.ready(hbm) if args.hbm_mrs > 1 else cpu_source.ready()
             raw_batch = a_source.ready(hbm) if args.hbm_mrs > 1 else a_source.ready()
             assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
-            assert raw_batch.source.mr_count == args.hbm_mrs
+            assert cpu_batch.source.mr_count == raw_batch.source.mr_count == args.hbm_mrs
             for source, batch in ((cpu_source, cpu_batch), (a_source, raw_batch)):
                 try:
                     source.release_batch(batch)
@@ -142,7 +141,6 @@ def main():
     worker.start()
     child.close()
     try:
-        runtime.attach_cpu_source(receive(parent, "cpu_source"))
         stream = torch.npu.Stream(device=args.device_a)
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
         for round_id in range(args.rounds):

@@ -72,19 +72,11 @@ Status RemotePullOperator::ValidateCpuSource(const CpuPullSourceDesc& source) {
   if (!source.source_id || !source.source_bytes || source.region_id != ticket_.region.id ||
       source.region_epoch != ticket_.region.epoch)
     return Status::InvalidArgument("CPU source is not bound to this DDR pool");
-  CpuPullRequest current; current.source = source;
-  if (source.mr_count() > rp::kMaxSourceMrs || source.bytes_for(1) != source.source_bytes)
+  if (!source.region_id || !source.region_epoch || source.mr_count() > rp::kMaxSourceMrs ||
+      source.bytes_for(1) != source.source_bytes)
     return Status::InvalidArgument("invalid CPU source MR table");
-  for (current.mr_id = 1; current.mr_id <= source.mr_count(); ++current.mr_id) {
-    rp::Response response{};
-    auto status = rp::Exchange(ticket_.address, Request(ticket_, current, rp::Command::InspectSource), {}, &response);
-    if (!status.ok()) return status;
-    if (response.result != rp::Result::Ok || response.endpoint.bytes != source.bytes_for(current.mr_id) ||
-        response.reserved != source.mr_count() ||
-        response.state == rp::State::Connecting || response.state == rp::State::Failed ||
-        response.state == rp::State::InDoubt || response.state == rp::State::Closed)
-      return Status::InvalidState("CPU source is missing, stale or unavailable");
-  }
+  for (auto bytes : source.mr_bytes)
+    if (!bytes) return Status::InvalidArgument("invalid CPU source MR size");
   return Status::OK();
 }
 Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {

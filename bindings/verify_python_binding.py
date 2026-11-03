@@ -16,7 +16,7 @@ def main() -> int:
 
     if options.require_offload:
         for owner, names in (("CpuPullHbmSource", ("register", "ready", "release_batch", "shutdown")),
-                             ("NpuRuntime", ("batch_cpu_pull", "resolve_cpu_pull", "offload_region", "attach_cpu_source", "prepare_put", "submit_cpu_pull", "wait_cpu_pull", "commit_put", "abort_put"))):
+                             ("NpuRuntime", ("batch_cpu_pull", "resolve_cpu_pull", "offload_region", "prepare_put", "submit_cpu_pull", "wait_cpu_pull", "commit_put", "abort_put"))):
             if not hasattr(kvaf, owner) or any(not hasattr(getattr(kvaf, owner), name) for name in names):
                 raise RuntimeError(f"KVAF shared DDR binding is incomplete: {owner}")
 

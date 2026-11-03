@@ -318,9 +318,6 @@ class NpuPythonRuntime final {
   py::dict OffloadRegion() const {
     OffloadRegionTicket ticket; ThrowIfError(native_->GetOffloadRegion(&ticket)); return remote_python::Pack(ticket);
   }
-  void AttachCpuSource(const CpuPullSourceDesc& source) {
-    ThrowIfError(native_->AttachCpuSource(source));
-  }
   PutHandle PreparePut(const py::object& keys,const py::object& lengths) {
     std::vector<std::uint64_t> sizes;
     CopyCpuUint64SequenceInto(lengths,"lengths",&sizes);
@@ -753,7 +750,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Finish the internally retained batch_cpu_pull, without replaying READ. Returns None "
            "only after successful commit; failure raises. Does not recover explicit PutHandle transactions.")
       .def("offload_region", &NpuPythonRuntime::OffloadRegion)
-      .def("attach_cpu_source",&NpuPythonRuntime::AttachCpuSource,py::arg("source_desc"))
       .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
       .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("ready"),py::arg("put"),
            py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),

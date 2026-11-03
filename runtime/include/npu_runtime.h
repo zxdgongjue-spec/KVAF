@@ -82,7 +82,7 @@ class NpuRuntime final : public Runtime {
   RuntimeCore& core();
   const RuntimeCore& core() const;
   Status GetOffloadRegion(OffloadRegionTicket*) const;
-  // One source span per key, from an attached CPU source's selected MR. Prepare,
+  // One source span per key, from the CPU source MR selected by ReadyToken. Prepare,
   // Submit, Wait and Commit are internal; success includes metadata publication.
   // The producer owns registration, synchronization, Ready and ReleaseBatch on
   // both local and remote NPUs. UINT32_MAX uses options.offload_timeout_ms.
@@ -98,9 +98,8 @@ class NpuRuntime final : public Runtime {
   // or source detach. Synchronous; not a historical checksum cache.
   Status LastOffloadChecksum(std::uint64_t*) const;
 
-  Status AttachCpuSource(const CpuPullSourceDesc&);
   Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
-  // Resolves the attached source from ReadyToken. dst_offsets are byte offsets
+  // Uses the source identity carried by ReadyToken. dst_offsets are byte offsets
   // from this Runtime's DDR base, within the given Put's reserved ranges.
   Status SubmitCpuPull(const ReadyToken&, const PutHandle&,
                        Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,

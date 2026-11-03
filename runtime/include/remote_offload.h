@@ -18,9 +18,10 @@ class CpuPullHbmSource {
  public:
   explicit CpuPullHbmSource(std::uint32_t device_id, std::string npu_eid = "");
   ~CpuPullHbmSource();
+  // Completes registration, CPU linking and probes. No reader attachment is needed;
+  // Ready carries the descriptor used for submission.
   Status Register(const OffloadRegionTicket&, ConstBufferView input, void* producer_stream);
   Status Register(const OffloadRegionTicket&, const std::vector<ConstBufferView>& inputs, void* producer_stream);
-  Status GetDescriptor(CpuPullSourceDesc*) const;
   Status Ready(ReadyToken*); // Application has already synchronized production.
   Status Ready(ConstBufferView input, ReadyToken*); // Select one of the registered tensors.
   Status ReleaseBatch(const ReadyToken&);
@@ -31,6 +32,7 @@ class CpuPullHbmSource {
   std::uint32_t device_id() const;
   std::string selected_npu_eid() const;
  private:
+  Status GetDescriptor(CpuPullSourceDesc*) const;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

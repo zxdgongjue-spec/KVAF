@@ -49,10 +49,9 @@ def producer(pipe, args, ticket, lengths):
     hbm = tensors[0]
     source = kvaf.CpuPullHbmSource(device_id=args.device_b, npu_eid=args.npu_eid_b)
     try:
-        desc = source.register(ticket, tensors if args.tensors > 1 else hbm)
-        assert desc.mr_count == args.tensors
+        registered = source.register(ticket, tensors if args.tensors > 1 else hbm)
+        assert registered is None
         pipe.send(("registered", source.selected_npu_eid))
-        pipe.send(("cpu_source", desc))
         for round_id in range(args.rounds):
             hbm = tensors[round_id % len(tensors)]
             with torch.npu.stream(stream):
@@ -60,6 +59,7 @@ def producer(pipe, args, ticket, lengths):
             # The application waits for production; Ready only publishes batch identity.
             stream.synchronize()  # Producer synchronization belongs to the application.
             batch = source.ready(hbm) if args.tensors > 1 else source.ready()
+            assert batch.source.mr_count == args.tensors
             pipe.send(("ready", batch))
             receive(pipe, "reuse")
             source.release_batch(batch)
@@ -143,7 +143,6 @@ def main():
     child.close()
     try:
         print(f"B registered: eid={receive(parent, 'registered')}", flush=True)
-        runtime.attach_cpu_source(receive(parent, "cpu_source"))
         for round_id in range(args.rounds):
             batch = receive(parent, "ready")
             src = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")

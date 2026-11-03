@@ -722,6 +722,8 @@ Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken
     const auto* source = std::get_if<CpuPullSourceDesc>(&ready.source);
     if (!source || !ready.sequence || !source->bytes_for(ready.mr_id))
       return Status::InvalidArgument("batch_cpu_pull requires a CPU ReadyToken with a valid MR");
+    auto status = impl_->remote_operator->ValidateCpuSource(*source);
+    if (!status.ok()) return status;
     for (std::size_t i = 0; i < keys.size(); ++i) {
       if (!lengths[i] || !offload::Contains(source->bytes_for(ready.mr_id), src_offsets.data[i], lengths[i]))
         return Status::InvalidArgument("batch_cpu_pull source range is outside the selected MR");
@@ -805,11 +807,6 @@ Status NpuRuntime::ListenHbm(const std::string& address, const std::string& adve
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif
-}
-Status NpuRuntime::AttachCpuSource(const CpuPullSourceDesc& source) {
-  if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before attaching a CPU source");
-  if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
-  return core().AttachCpuSource(source);
 }
 Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* put) {
   if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before PreparePut");

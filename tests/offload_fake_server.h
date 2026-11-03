@@ -54,7 +54,7 @@ class SharedServer {
     if(id!=info.id||pool.empty())return Status::NotFound("region");*out=info;return Status::OK();
   },[this](const rp::RegionInfo&){return std::make_unique<SharedBackend>(pool);}};
   std::atomic<std::uint16_t> drop{0};
-  std::atomic<int> pool_allocations{0};
+  std::atomic<int> pool_allocations{0}, inspect_calls{0}, query_calls{0}, submit_calls{0};
   std::atomic<bool> stop{false}, fail_release{false};
   std::string address;
   int listener{-1};std::thread thread;
@@ -98,6 +98,9 @@ class SharedServer {
       else{
         ReadTail(fd,&req);Require(req.count<=rp::kMaxSpans,"bounded spans");std::vector<rp::Span> spans(req.count);
         Require(p::ReadBytes(fd,spans.data(),spans.size()*sizeof(rp::Span)),"read spans");
+        if(req.header.command==unsigned(rp::Command::InspectSource))++inspect_calls;
+        if(req.header.command==unsigned(rp::Command::Query))++query_calls;
+        if(req.header.command==unsigned(rp::Command::Submit))++submit_calls;
         const auto response=service.Dispatch(req,spans);auto expected=req.header.command;
         if(!drop.compare_exchange_strong(expected,0))p::WriteBytes(fd,&response,sizeof(response));
       }

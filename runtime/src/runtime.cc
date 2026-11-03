@@ -137,7 +137,6 @@ Status RuntimeCore::Shutdown() {
 
   initialized_ = false;
   closing_ = false;
-  cpu_sources_.clear();
   remote_region_ = RemoteRegionDesc{};
   return first_error;
 }
