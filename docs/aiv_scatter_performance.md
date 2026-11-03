@@ -415,7 +415,7 @@ JSON config 的 `source_generation_chunk_bytes` 记录随机数据生成块大�
 | `aiv_input_ns` | 各核输入/cache 准备时间，取最大值 | 输入准备延迟 |
 | `aiv_build_notify_ns` | core 0 输入准备完成 → 描述符构建、header 刷新、notify 发布完成 | 请求构建/发布延迟 |
 | `aiv_notify_to_done_ns` | core 0 notify 发布完成 → 观察到本轮 done | 包含 CPU 接收/读取、WRITE、报告回传及 done 的往返等待 |
-| `aiv_scatter_ns` | 各核实际 CopyRows 区间之和的最大值；包含各次真实 MTE 完成等待，排除 CPU Ready/done 等待 | 本地 scatter 的有效带宽；流水模式可与通信重叠，不能直接与通信时长相加 |
+| `aiv_scatter_ns` | 各核搬运提交、bank 复用等待及最终 MTE 收尾时长累计的最大值；排除 Ready/done 轮询 | scatter 服务时间对应的有效带宽；异步 MTE3 也可在轮询时执行，此值不是硬件 DMA 忙碌时长 |
 
 CSV 使用固定的 **34 列**，baseline-only、profiled-only 和混合采样的表头/顺序一致。
 相对旧 32 列新增 `pipeline` 和 `aiv_ready_wait_us`，原始周期信息留在 JSON。
@@ -811,39 +811,57 @@ GM→UB 和 UB→output 的两条搬运流水线。业务 BatchGet 接口和 176
 pipeline=0:
   构建清单/notify → CPU 写完整批 staging、全部尾 CQ、最终 done → 全量 scatter → 返回
 pipeline=1:
-  构建清单/notify → CPU 写 chunk 0、Ready → 写 chunk 1、Ready → … → 全部尾 CQ、done
-                                 AIV scatter 0 → scatter 1 → … → 全部 MTE 完成、检查 done → 返回
+  构建清单/notify → CPU 各 Jetty 写 payload、分别 Ready → 后续 chunk → 全部尾 CQ、done
+                                 AIV 按已 Ready 分片消费，跨片保持 UB bank → 等 done 与 MTE3 → 返回
 ```
 
 复用现有 CPU V3 协议，chunk 为每个 CPU worker 最多 1024 行。每条 Jetty 写完自己负责的
-chunk payload 后，用 STRONG 放置顺序写该 worker 的 Ready 字；AIV 等四路 Ready 的
-sequence 匹配且进度达到当前 chunk，才读对应 staging。Ready 可跳过多个已完成 chunk，
+chunk payload 后，用 STRONG 放置顺序写该 worker 的 Ready 字；AIV 扫描当前 chunk 中尚未消费的
+Jetty，哪路 Ready 的 sequence/进度匹配，就先读哪路的精确 staging 分片。
+不等待其他三路，也不固定先等 queue 0；一次缓存行刷新覆盖四个 Ready 字。
+1024 行完整 chunk 在四路上各 256 行，因此消费粒度缩小，无需增加 Ready WR。
+Ready 可跳过多个已完成 chunk，
 不会退回去等待已经被后续进度覆盖的值；旧 sequence 被忽略，未来 sequence 和错误 done 拒绝。
 CPU 的 worker 分区按 staging 缓存行对齐，AIV 保持原有均衡分区，对两种分区求交后消费，
 因此 1/19/8193 等不整齐请求数与 idle core 也适用。
 
-所有 payload 尾 CQ 和最终 done 仍保留，每次 CopyRows 返回前仍等全部 MTE3 完成。
+所有 payload 尾 CQ 和最终 done 仍保留。每个分片 EnqueueRows 只在 bank 复用前等待该 bank，
+跨分片、跨 chunk 保留 bank 状态；等待下一分片 Ready 或最终 done 时，先前的 MTE3 可以继续执行。
+在成功返回或异常退出前统一等待仍未回收的 MTE3，未完成的 bank 不能被重新用作输入。
 最后一个 Ready 不能替代最终成功结果；错误完成不会被当成 PASS。空请求继续直接完成。
 现有 CPU 服务已经支持该进度协议，CPU 不增加 gather、数据打包或额外 payload 拷贝。
 Ready 是链内 8 B 强序 WRITE，无额外逐块 Host 往返或逐块 CQ 等待；最终 CQ/报告计时不移出样本。
 Ready 增加 WR 和强序边界，因此通信耗时可能变化，收益以相同配置的端到端结果为准。
 
-需一起重新构建 AIV kernel、Host 和 Python binding，profile 从 128 B 升为 192 B V2；
-旧 profile magic 会被拒绝。CPU wire ABI 和 workspace 中 request/Ready/descriptor/staging 偏移未变。
+CPU 端也恢复流水模式的快速 SGE 刷新：每个连续 payload 区间只保存一个
+`{local_sge, first_descriptor_row, count}` 段，提交前顺序刷新整段 SGE 地址；Ready SGE 不参与刷新。
+大 token 需要跨 WR 分段时继续保留精确的 row/offset 映射。只复用写计划，每次调用都重新读取
+descriptor 地址，不能复用上轮地址内容；首条队列提交后继续刷新后续队列，保持 SGL 生命周期。
+
+必须重建 AIV kernel 和 CPU service，并重启 CPU service 才能同时获得两端优化。
+656/4096 B 常见配置的 CPU 初始化日志应出现 `source_refresh=contiguous_runs_v1`；
+大 token 回退时显示 `source_refresh=fragment_map`。仅更新 NPU kernel 不会修复旧 CPU 服务的刷新路径。
+从上一版流水升级时启动 ABI、192 B V2 profile 和 CPU V3 wire ABI 均不变；
+更早的 128 B profile 仍需配套重建 Host/binding，旧 magic 会被拒绝。
+workspace 的 request/Ready/descriptor/staging 偏移未变。
 
 CSV/JSON 的新含义：
 
 - `pipeline`：实际启用模式；CSV 由每核报告核对，baseline 记录测试配置。
-- `aiv_scatter_us`：每核各 chunk 的实际 CopyRows 时长累计后取最大值，含真实 DMA 等待，
-  排除 Ready/done 等待；`aiv_scatter_gbps` 继续用整次有效 payload 除以该时长。
-- `aiv_ready_wait_us`：每核等待四路 Ready 以及最终 done 的累计时长，取最大值。
+- `aiv_scatter_us`：每核各分片提交/搬运依赖等待与最终 MTE3 收尾的时长累计后取最大值，
+  排除 Ready/done 轮询；`aiv_scatter_gbps` 用整次有效 payload 除以该服务时间。
+  异步 MTE3 可以在轮询期间继续执行，这不是完整 DMA 忙碌时长，也不是物理 HBM 总读写带宽。
+- `aiv_ready_wait_us`：每核等待下一个可消费 Jetty 分片以及最终 done 的累计时长，取最大值。
   idle core 也可能参与这个最大值；这是诊断量，不能直接加到墙钟分解上。
 - `aiv_notify_to_done_us`：core 0 notify 到观察到最终 done；期间允许 scatter。
-  `done_cycle` 在等待及 chunk 边界采样，反映观察时刻，无法精确还原搬运期间发生的 done。
+  `done_cycle` 在等待及 Jetty 分片边界采样，反映观察时刻，无法精确还原搬运期间发生的 done。
 - `aiv_scatter_tail_us`：core 0 观察 done 到最后一个核 finish 的剩余尾段。
   其中可以只剩其他核的搬运，也可能主要是控制收尾；不能当成全量 scatter 时长。
 - JSON `workers` 另有 `scatter_start_cycle`、`scatter_finish_cycle`、`scatter_cycles`、
-  `scatter_chunks`、`ready_wait_cycles`。CPU 与 AIV 绝对时间戳不可跨时钟域相减。
+  `scatter_chunks`、`ready_wait_cycles`。`scatter_chunks` 现在计实际消费的 Jetty 分片数，
+  不是 CPU 1024 行 chunk 数；首尾时间跨度包含中间的 Ready/done 等待。
+  JSON config 用 `pipeline_consumer=jetty_ready_persistent_ub` 标识本版流程；CSV 列数保持 34。
+  CPU 与 AIV 绝对时间戳不可跨时钟域相减。
 
 墙钟仍按下式拆解。`cpu_comm` 与完整 `aiv_scatter` 均为重叠子区间，不能再额外相加：
 
@@ -856,7 +874,10 @@ aiv_wall = aiv_input_wall + aiv_build_notify + aiv_notify_to_done + aiv_scatter_
 再在同一份二进制上对照两个模式（其余参数与原测试保持一致）：
 
 ```bash
+cmake --build build-cpu -j --target kvaf_cpu_service kvaf_cpu_push_transport_test
+ctest --test-dir build-cpu -R '^kvaf_cpu_push_transport_test$' --output-on-failure
 cmake --build build-npu -j
+# 重建 CPU 服务后，使用原有启动参数重启该服务，再运行下面的 NPU 测试。
 KVAF_SCATTER_PIPELINE=1 python -u tests/python/test_aiv_scatter_batch_get.py
 
 for p in 0 1; do
@@ -868,6 +889,7 @@ done
 
 用相同 token/miss-count/核数比较各自 E2E 最快 25% 样本的 `end_to_end_us`、`aiv_wall_us`、
 `aiv_scatter_tail_us`，同时检查 `cpu_comm_us` 是否因 Ready 序列明显增加。
+同时比较 `cpu_write_us-cpu_comm_us` 的准备/收尾差值是否下降，避免流水恢复后丢掉 CPU 快速路径。
 656 B 与 4096 B 分别比较；不能把通信带宽提高视为本次优化的前提或验收结论。
 现有 changing-data E2E 和 reference-aligned 测试均保留完整输出校验，未新增独立 scatter 性能测试。
 
@@ -879,6 +901,9 @@ cmake --build build-model -j --target kvaf_sequential_host_test kvaf_sequential_
 ctest --test-dir build-model -R 'kvaf_sequential_(host_test|batch_get_kernel_model_test)' --output-on-failure
 ```
 
-模型逐条 Jetty 发布 Ready，检查 AIV 的每次 payload DMA 只读取四路均就绪的 chunk，
-并故意等到 AIV 开始消费后才发布 done；另覆盖 Ready 缺失/未来序号和消费后的最终错误。
+模型逐条 Jetty 发布 Ready，检查 AIV 的每次 payload DMA 只读取对应 Jetty 已就绪的分片，
+并故意等到 AIV 消费本片才发布下一路 Ready，同时测试 queue 0 最晚到达。
+检查跨 Ready 边界仍有 MTE3 在途，以及缺失 Ready/未来序号/最终错误时仍回收全部 DMA；
+现有完整输出与 guard 校验保留。CPU transport 模型另在 Ready WR 执行前校验该路分片已写完，
+并覆盖连续段刷新、changing descriptor、多波次和分段 token 的数据正确性。
 它验证控制流与范围，硬件 DMA 可见性、CANN 编译和性能仍需上机验证。

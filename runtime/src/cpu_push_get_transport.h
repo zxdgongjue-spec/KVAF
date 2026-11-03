@@ -51,10 +51,14 @@ class Transport {
   using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
   struct PreparedQueue {
     struct Source { std::uint32_t local, row, offset; };
+    struct SourceRun { std::uint32_t local, row, count; };
     struct Marker { std::uint64_t* value; std::uint32_t progress; };
     std::vector<urma::Sge> local, remote;
     std::vector<urma_jfs_wr_t> wrs;
     std::vector<Source> sources;
+    // One sequential refresh per contiguous payload span; Ready SGEs are
+    // deliberately excluded. Fragmented tokens retain the exact Source map.
+    std::vector<SourceRun> source_runs;
     std::vector<Marker> markers;
     // Whole-batch, unsplit tokens have one SGE per contiguous descriptor row.
     std::uint32_t first_row{UINT32_MAX};

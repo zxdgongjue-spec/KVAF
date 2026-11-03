@@ -14,8 +14,9 @@ struct alignas(64) ScatterBatchGetCoreProfile {
   std::uint64_t requests{}, bytes{};
   std::uint64_t cpu_magic{}, cpu_header_ns{}, cpu_descriptor_ns{}, cpu_write_ns{};
   std::uint64_t cpu_comm_ns{}, cpu_post_ns{}, cpu_cq_wait_ns{};
-  // CopyRows intervals include their real MTE completion waits, but exclude
-  // waits for CPU progress. They can overlap notify->done in pipeline mode.
+  // Enqueue/service intervals plus the final MTE drain, excluding Ready/done
+  // polling. Async MTE3 may also run during that polling; this is NOT a hardware
+  // DMA-busy counter. The start/finish span includes inter-shard waits.
   std::uint64_t scatter_cycles{}, ready_wait_cycles{};
   std::uint64_t scatter_start_cycle{}, scatter_finish_cycle{}, scatter_chunks{}, pipeline{};
   std::uint64_t reserved[2]{};

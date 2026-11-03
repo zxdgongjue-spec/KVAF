@@ -223,6 +223,7 @@ def main(argv=None):
     config = vars(args).copy()
     config.update(device_id=device_id, mode="cpu_push_scatter",
                   pipeline_chunk_rows=1024,
+                  pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
                   units="decimal GB/s; sample durations ns/us; summary durations ms",
                   cpu_service=os.environ.get("KVAF_CPU_SERVICE_ADDR"),
                   npu_eids=os.environ.get("KVAF_NPU_EIDS"),

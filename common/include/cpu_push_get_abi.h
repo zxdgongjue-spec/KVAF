@@ -88,6 +88,14 @@ KVAF_CPU_PUSH_INLINE Range ChunkRange(Range r, std::uint32_t chunk) {
   const auto begin = r.begin + chunk * kChunkRows;
   return {begin, r.end < begin + kChunkRows ? r.end : begin + kChunkRows};
 }
+// A Ready word covers only this Jetty's exact shard of a worker/chunk.
+// Consumers may copy that shard without waiting for the other three Jettys.
+KVAF_CPU_PUSH_INLINE Range JettyRange(Range r, std::uint32_t queue) {
+  const auto rows = r.end - r.begin;
+  const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
+  const auto begin = r.begin + queue * base + (queue < remainder ? queue : remainder);
+  return {begin, begin + base + (queue < remainder ? 1U : 0U)};
+}
 }  // namespace kvaf::cpu_push
 
 #ifdef KVAF_CPU_PUSH_DEFAULT_INLINE

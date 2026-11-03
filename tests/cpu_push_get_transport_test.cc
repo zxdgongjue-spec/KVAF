@@ -77,6 +77,26 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
         // Whole-batch done must never be posted before other Jettys drain.
         for (const auto& queue : pending) assert(queue.empty());
       }
+      const auto workspace = done_address - 128;
+      const auto& request = *reinterpret_cast<const Request*>(workspace);
+      if (wr->opcode == URMA_OPC_WRITE && dst.addr >= workspace + 192 &&
+          dst.addr < workspace + 192 + request.workers * sizeof(Ready)) {
+        Layout layout; assert(MakeLayout(request.token_bytes, request.workers, &layout));
+        const auto worker = (dst.addr - workspace - 192) / sizeof(Ready);
+        assert((dst.addr - workspace - 192) % sizeof(Ready) == q * 8);
+        assert(dst.len == 8 && wr->flag.bs.place_order == URMA_STRONG_ORDER);
+        const auto progress = *reinterpret_cast<const std::uint64_t*>(wr->rw.src.sge[0].addr);
+        assert(progress >> 32 == request.sequence && std::uint32_t(progress) > 0);
+        const auto range = WorkerRange(request.count, request.token_bytes, worker, request.workers);
+        const auto shard = JettyRange(ChunkRange(range, std::uint32_t(progress) - 1), q);
+        const auto* addresses = reinterpret_cast<const std::uint64_t*>(workspace + layout.descriptor);
+        // Check the producer's exact guarantee at the Ready publication point,
+        // before any later queue/chunk is required to complete.
+        for (auto row = shard.begin; row < shard.end; ++row)
+          assert(!std::memcmp(reinterpret_cast<const void*>(workspace + layout.staging +
+              std::uint64_t(row) * request.token_bytes), reinterpret_cast<const void*>(addresses[row]),
+              request.token_bytes));
+      }
       auto* out = reinterpret_cast<std::uint8_t*>(dst.addr);
       std::size_t bytes = 0;
       for (std::uint32_t i = 0; i < wr->rw.src.num_sge; ++i) {
@@ -161,8 +181,9 @@ struct TransportTest {
       posted.clear();
       post_calls = 0;
       post_queues.clear();
-      if (whole && count >= 4 && t.prepared_count_ == count && t.prepared_batch_done_only_ &&
-          !t.prepared_.empty() && t.prepared_[0]->queues[0].first_row != UINT32_MAX &&
+      if (count >= 4 && t.prepared_count_ == count && t.prepared_batch_done_only_ == whole &&
+          !t.prepared_.empty() && (t.prepared_[0]->queues[0].first_row != UINT32_MAX ||
+                                 !t.prepared_[0]->queues[0].source_runs.empty()) &&
           !t.prepared_[0]->queues[1].local.empty()) {
         t.prepared_[0]->queues[0].local[0].addr = 0;
         t.prepared_[0]->queues[1].local[0].addr = 0;
@@ -171,6 +192,23 @@ struct TransportTest {
       std::memset(hbm.data() + t.layout_.staging, 0xad, std::uint64_t(maximum) * token);
       assert(t.WriteBatch().ok());
       assert(!later_queue_source);
+      if (!whole && std::uint64_t{max_sge} * token <= t.max_bytes_) {
+        std::size_t payload_sges = 0;
+        const auto* current = reinterpret_cast<const std::uint64_t*>(t.memory_ + t.layout_.descriptor);
+        for (const auto& plan : t.prepared_) for (const auto& q : plan->queues) {
+          assert(q.sources.empty() && q.first_row == UINT32_MAX);
+          std::vector<bool> seen(q.local.size());
+          for (const auto& run : q.source_runs) for (std::uint32_t i = 0; i < run.count; ++i) {
+            assert(run.row + i < count && run.local + i < q.local.size());
+            assert(!seen[run.local + i]); seen[run.local + i] = true;
+            assert(q.local[run.local + i].addr == current[run.row + i]);
+            ++payload_sges;
+          }
+          assert(std::count(seen.begin(), seen.end(), false) == q.markers.size());
+          for (const auto& marker : q.markers) assert(*marker.value == Progress(sequence, marker.progress));
+        }
+        assert(payload_sges == count); // Every data SGE, excluding Ready, refreshed exactly once.
+      }
       if (whole && count >= kJettyCount) {
         for (std::uint32_t q = 0; q < kJettyCount; ++q) assert(post_queues[q] == q);
         std::uint32_t expected_posts = 0;
@@ -226,7 +264,8 @@ struct TransportTest {
     for (auto count : {1U, maximum, maximum, 19U, 257U, 0U, maximum})
       request(count, true, sequence % 2 == 0);
     // Same count with a different mode must rebuild, not reuse a marker plan.
-    request(maximum, false, false);
+    for (auto count : {maximum, maximum, 19U, 257U, 0U, maximum})
+      request(count, false, sequence % 2 == 0);
     request(maximum, true, true);
     if (token == 4096 && maximum == 1024) {
       t.context_ = reinterpret_cast<urma_context_t*>(1);  // Queue mocks own the data plane.

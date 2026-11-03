@@ -321,6 +321,7 @@ def run_case(args):
     config.update(mode="cpu_push_scatter",
         transport=("CPU_SGL_WRITE_overlapped_AIV_scatter" if args.pipeline else "CPU_SGL_WRITE_then_AIV_scatter"),
         pipeline_chunk_rows=1024,
+        pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
         cpu_jettys=CPU_JETTYS, host_jettys_per_core_scope="setup_and_BatchPut",
         queue_matched_direct_jettys_per_core=(CPU_JETTYS // args.aiv_cores
                                              if CPU_JETTYS % args.aiv_cores == 0 else None),

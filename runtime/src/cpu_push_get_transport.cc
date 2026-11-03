@@ -89,9 +89,10 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "post_batch_wrs=%u optimized=%u payload_comp_order=%s\n",
+               "post_batch_wrs=%u optimized=%u payload_comp_order=%s source_refresh=%s\n",
                max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized,
-               tail_payload_comp_order_ ? "tail" : "all");
+               tail_payload_comp_order_ ? "tail" : "all",
+               std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map");
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
@@ -347,14 +348,14 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+  const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
     const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
-        const auto rows = range.end - range.begin;
-        const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
-        auto row = range.begin + queue * base + std::min(queue, remainder);
-        const auto end = row + base + (queue < remainder ? 1U : 0U);
+        const auto shard = JettyRange(range, queue);
+        auto row = shard.begin;
+        const auto end = shard.end;
         std::uint32_t offset = 0;
         while (row < end) {
           // The probe budgets source SGEs as well as WRs against SQ depth.
@@ -362,17 +363,25 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           // BatchGet's existing maximum request/token sizes.
           if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
           auto& q = waves.back();
-          if (batch_done_only && q.local.empty() && std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_)
+          if (batch_done_only && q.local.empty() && unsplit)
             q.first_row = row;
+          const auto first_local = static_cast<std::uint32_t>(q.local.size());
+          const auto first_row = row;
           const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
           std::uint32_t bytes = 0, sges = 0;
           while (row < end && sges < max_sge_ && bytes < max_bytes_) {
             const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-            if (q.first_row == UINT32_MAX)
+            if (!unsplit)
               q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
             q.local.push_back({0, length, source_, nullptr});
             ++sges; bytes += length; offset += length;
             if (offset == token_bytes_) { ++row; offset = 0; }
+          }
+          if (unsplit && !batch_done_only) {
+            if (!q.source_runs.empty() && q.source_runs.back().local + q.source_runs.back().count == first_local &&
+                q.source_runs.back().row + q.source_runs.back().count == first_row) {
+              q.source_runs.back().count += sges;
+            } else q.source_runs.push_back({first_local, first_row, sges});
           }
           AppendPrepared(q, queue, destination, bytes, sges);
         }
@@ -414,6 +423,12 @@ void Transport::RefreshPrepared(PreparedQueue& q) {
     const auto* input = addresses + q.first_row;
     auto* output = q.local.data();
     for (std::size_t i = 0; i < q.local.size(); ++i) output[i].addr = input[i];
+  } else if (!q.source_runs.empty()) {
+    for (const auto& run : q.source_runs) {
+      const auto* input = addresses + run.row;
+      auto* output = q.local.data() + run.local;
+      for (std::uint32_t i = 0; i < run.count; ++i) output[i].addr = input[i];
+    }
   } else {
     for (const auto& source : q.sources) q.local[source.local].addr = addresses[source.row] + source.offset;
   }

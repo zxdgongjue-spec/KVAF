@@ -109,6 +109,7 @@ struct Fixture {
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
   bool hold_done_until_scatter{}, copied_before_done{}, stall_ready{}, future_ready{}, error_after_scatter{};
+  bool hold_next_jetty{}, late_first_jetty{}, copied_before_all_ready{}, waited_with_output_pending{};
   struct PushPart { uint32_t worker, chunk; kvaf::cpu_push::Range range; };
   std::vector<PushPart> push_parts;
   std::vector<bool> payload_read;
@@ -185,6 +186,7 @@ struct Fixture {
     const auto notify = aiv_model::AtomicLoadWord(args.workspace + 64);
     if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
     const bool pipeline = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline);
+    if (pipeline && !aiv_model::mte3.empty()) waited_with_output_pending = true;
     if (!pipeline) CheckGuard();
     if (timeout || ++push_polls < 4) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
@@ -202,12 +204,13 @@ struct Fixture {
           });
       if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
         const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
-        const auto q = push_step % kvaf::cpu_push::kJettyCount;
-        const auto rows = part.range.end - part.range.begin;
-        const auto base = rows / kvaf::cpu_push::kJettyCount, rem = rows % kvaf::cpu_push::kJettyCount;
-        const auto begin = part.range.begin + q * base + std::min(q, rem);
-        const auto end = begin + base + (q < rem);
-        for (auto i = begin; i < end; ++i)
+        const auto q = (push_step + (late_first_jetty ? 1U : 0U)) % kvaf::cpu_push::kJettyCount;
+        if (hold_next_jetty && push_step % kvaf::cpu_push::kJettyCount) {
+          const auto previous = kvaf::cpu_push::JettyRange(part.range, (q + 3) % 4);
+          for (auto i = previous.begin; i < previous.end; ++i) if (!payload_read[i]) return;
+        }
+        const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
+        for (auto i = shard.begin; i < shard.end; ++i)
           std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
                       reinterpret_cast<void*>(src[i]), token);
         if (!stall_ready || q != 3) aiv_model::AtomicStoreWord(
@@ -244,10 +247,16 @@ struct Fixture {
         const auto range = kvaf::cpu_push::WorkerRange(active, token, worker, workers);
         if (i < range.begin || i >= range.end) continue;
         const auto chunk = (i - range.begin) / kvaf::cpu_push::kChunkRows + 1;
+        const auto part = kvaf::cpu_push::ChunkRange(range, chunk - 1);
+        bool all_ready = true;
         for (uint32_t q = 0; q < kvaf::cpu_push::kJettyCount; ++q) {
           const auto progress = aiv_model::AtomicLoadWord(args.workspace + 192 + worker * 64 + q * 8);
-          assert(progress >> 32 == args.sequence && uint32_t(progress) >= chunk);
+          const bool ready = progress >> 32 == args.sequence && uint32_t(progress) >= chunk;
+          all_ready &= ready;
+          const auto shard = kvaf::cpu_push::JettyRange(part, q);
+          if (i >= shard.begin && i < shard.end) assert(ready);
         }
+        copied_before_all_ready |= !all_ready;
       }
       if (!payload_read[i]) { payload_read[i] = true; ++read_rows; }
     }
@@ -384,6 +393,7 @@ struct Fixture {
     std::fill(ack_reads.begin(), ack_reads.end(), 0);
     push_done = false; push_polls = 0;
     push_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
+    copied_before_all_ready = waited_with_output_pending = false;
     std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
     for (uint64_t i = 0; i < args.source_bytes; ++i) remote[i] ^= 0x35;
@@ -711,9 +721,23 @@ int main() {
     Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
     f.args.reserved |= kvaf::kScatterPipeline;
     f.stall_ready = !future; f.future_ready = future;
-    f.Run(false);
-    assert(!f.read_rows && !f.push_done);
+    f.Run(false, !future);
+    assert(f.read_rows == (future ? 0U : 15U) && !f.push_done);
     assert(f.status[0].result == (future ? KVAF_SEQ_REMOTE_ERROR : KVAF_SEQ_TIMEOUT));
+  }
+  // A late queue cannot hold back a ready queue. The fake CPU withholds the
+  // next Jetty until this one's shard has been read; whole-chunk or fixed-q0
+  // consumers time out. MTE3 must stay live across Ready boundaries as well.
+  for (bool late_first : {false, true}) for (bool double_buffer : {false, true}) {
+    Fixture f(1024, 656, 1, KVAF_SEQ_SCATTER, 6);
+    f.args.max_polls = 10000;
+    f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterPipeline |
+        (double_buffer ? kvaf::kScatterDoubleBuffer : 0U);
+    f.hold_next_jetty = f.hold_done_until_scatter = true;
+    f.late_first_jetty = late_first;
+    f.Run();
+    assert(f.read_rows == 1024 && f.copied_before_done && f.copied_before_all_ready);
+    assert(f.waited_with_output_pending);
   }
   {
     Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
