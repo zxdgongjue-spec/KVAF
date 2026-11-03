@@ -16,15 +16,17 @@ void BindConnectorTypes(py::module_& m) {
     .def_readonly("source_id",&NpuPullSourceDesc::source_id)
     .def_readonly("source_bytes",&NpuPullSourceDesc::source_bytes)
     .def_readonly("source_epoch",&NpuPullSourceDesc::source_epoch)
-    .def(py::pickle([](const NpuPullSourceDesc& s){return py::make_tuple(s.source_id,s.source_bytes,s.source_epoch);},
-      [](py::tuple t){if(t.size()!=3)throw py::value_error("invalid NPU source descriptor");
-        return NpuPullSourceDesc{t[0].cast<std::uint64_t>(),t[1].cast<std::uint64_t>(),t[2].cast<std::uint64_t>()};}));
+    .def_property_readonly("mr_count",&NpuPullSourceDesc::mr_count)
+    .def_readonly("mr_bytes",&NpuPullSourceDesc::mr_bytes)
+    .def(py::pickle([](const NpuPullSourceDesc& s){return py::make_tuple(s.source_id,s.source_bytes,s.source_epoch,s.mr_bytes);},
+      [](py::tuple t){if(t.size()!=3 && t.size()!=4)throw py::value_error("invalid NPU source descriptor");
+        return NpuPullSourceDesc{t[0].cast<std::uint64_t>(),t[1].cast<std::uint64_t>(),t[2].cast<std::uint64_t>(),
+          t.size()==4?t[3].cast<std::vector<std::uint64_t>>():std::vector<std::uint64_t>{}};}));
   py::class_<ReadyToken>(m,"ReadyToken")
     .def_readonly("source",&ReadyToken::source).def_readonly("sequence",&ReadyToken::sequence)
     .def_readonly("mr_id",&ReadyToken::mr_id)
     .def(py::pickle([](const ReadyToken& t) -> py::tuple {
-        if (std::holds_alternative<CpuPullSourceDesc>(t.source)) return py::make_tuple(t.source,t.sequence,t.mr_id);
-        return py::make_tuple(t.source,t.sequence);},
+        return py::make_tuple(t.source,t.sequence,t.mr_id);},
       [](py::tuple t){if(t.size()!=2 && t.size()!=3)throw py::value_error("invalid ReadyToken");
         return ReadyToken{t[0].cast<std::variant<CpuPullSourceDesc,NpuPullSourceDesc>>(),t[1].cast<std::uint64_t>(),t.size()==3?t[2].cast<std::uint64_t>():1};}));
   py::enum_<CpuPullState>(m,"CpuPullState")

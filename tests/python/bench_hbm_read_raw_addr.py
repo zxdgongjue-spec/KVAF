@@ -23,7 +23,8 @@ def parse_args(argv=None):
     parser.add_argument("--npu-eid-b-raw", required=True, help="B fullmesh EID")
     parser.add_argument("--packets", "--blocks", type=int, default=4096)
     parser.add_argument("--packet-bytes", "--block-bytes", type=int, default=656)
-    parser.add_argument("--source-space-bytes", type=int, default=256 * 1024 * 1024)
+    parser.add_argument("--source-space-bytes", type=int, default=256 * 1024 * 1024, help="bytes per registered tensor")
+    parser.add_argument("--source-count", type=int, default=1, help="1..4096 independent MRs sharing one connection")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
@@ -37,6 +38,11 @@ def parse_args(argv=None):
     parser.add_argument("--max-inflight-total", type=int, default=2048)
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
     args = parser.parse_args(argv)
+    if not 1 <= args.source_count <= 4096:
+        parser.error("source-count must be in 1..4096")
+    # Visit every MR/output pair before timed samples; retain single-MR defaults.
+    if args.source_count > 1 and args.warmup >= 0:
+        args.warmup = max(args.warmup, args.source_count)
     if args.device_a == args.device_b:
         parser.error("use two distinct NPUs")
     if not 1 <= args.packets <= 4096 or not 1 <= args.packet_bytes <= (1 << 32) - 1:
@@ -56,6 +62,11 @@ def parse_args(argv=None):
 def round_counts(args):
     normal = args.warmup + args.iterations
     return normal, normal + (args.profile_warmup + args.profile_iterations if args.profile_iterations else 0)
+
+
+def pattern_phase(iteration, source_count):
+    # Different tensors have different data; each reuse cycle changes it again.
+    return 2 * (iteration % source_count) + (iteration // source_count) % 2
 
 
 def packet_payload(torch, offsets, packet_bytes, phase):
@@ -78,13 +89,12 @@ def producer(pipe, args, offsets):
     ready = None
     stages = {"ready": [], "release_batch": []}
     try:
-        hbm = torch.zeros(args.source_space_bytes, dtype=torch.uint8, device=device)
+        tensors = [torch.zeros(args.source_space_bytes, dtype=torch.uint8, device=device)
+                   for _ in range(args.source_count)]
         slot_count = args.source_space_bytes // args.packet_bytes
-        rows = hbm[:slot_count * args.packet_bytes].view(slot_count, args.packet_bytes)
         indices = torch.tensor([offset // args.packet_bytes for offset in offsets], dtype=torch.int64, device=device)
-        patterns = [packet_payload(torch, offsets, args.packet_bytes, phase).to(device) for phase in range(2)]
         torch.npu.synchronize()
-        ticket = source.register(hbm, stream=stream)
+        ticket = source.register(tensors if args.source_count > 1 else tensors[0], stream=stream)
         port = source.listen("127.0.0.1:0")
         pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
         if receive(pipe, "attached") is False:
@@ -93,11 +103,15 @@ def producer(pipe, args, offsets):
             return
         normal_rounds, total_rounds = round_counts(args)
         for iteration in range(total_rounds):
+            hbm = tensors[iteration % args.source_count]
+            rows = hbm[:slot_count * args.packet_bytes].view(slot_count, args.packet_bytes)
+            payload = packet_payload(torch, offsets, args.packet_bytes, pattern_phase(iteration, args.source_count)).to(device)
+            torch.npu.synchronize()
             with torch.npu.stream(stream):
-                rows.index_copy_(0, indices, patterns[iteration % 2])
+                rows.index_copy_(0, indices, payload)
             stream.synchronize()
             begin = time.perf_counter_ns()
-            ready = source.ready()
+            ready = source.ready(hbm) if args.source_count > 1 else source.ready()
             ready_us = (time.perf_counter_ns() - begin) / 1000
             pipe.send(("ready", ready))
             receive(pipe, "reuse")
@@ -163,16 +177,9 @@ def main():
             dst = torch.arange(args.packets, dtype=torch.int64, device=device) * args.packet_bytes + GUARD_BYTES
             lengths = torch.full((args.packets,), args.packet_bytes, dtype=torch.int64, device=device)
         stream.synchronize()
-        expected = []
-        for phase in range(2):
-            value = torch.full((output.numel(),), 0xCC, dtype=torch.uint8)
-            value[GUARD_BYTES:GUARD_BYTES + payload_bytes] = packet_payload(torch, offsets, args.packet_bytes, phase).flatten()
-            expected.append(value)
-        expected_hbm = [value.to(device) for value in expected]
-        torch.npu.synchronize()
         print(f"NPU_HBM_BENCH_READY reader={args.device_a} producer={args.device_b} "
               f"packets={args.packets} packet_bytes={args.packet_bytes} payload_bytes={payload_bytes} "
-              f"source_space_bytes={args.source_space_bytes} seed={args.seed} "
+              f"source_count={args.source_count} source_space_bytes_per_mr={args.source_space_bytes} seed={args.seed} "
               f"min_source_offset={min(offsets)} max_source_end={max(offsets) + args.packet_bytes} "
               f"aiv_cores={args.aiv_cores} jettys_per_core={args.jettys_per_core} "
               f"max_inflight_total={args.max_inflight_total} "
@@ -185,6 +192,12 @@ def main():
         normal_rounds, total_rounds = round_counts(args)
         for iteration in range(total_rounds):
             ready = receive(parent, "ready")
+            assert ready.mr_id == iteration % args.source_count + 1
+            expected = torch.full((output.numel(),), 0xCC, dtype=torch.uint8)
+            expected[GUARD_BYTES:GUARD_BYTES + payload_bytes] = packet_payload(
+                torch, offsets, args.packet_bytes, pattern_phase(iteration, args.source_count)).flatten()
+            expected_hbm = expected.to(device)
+            torch.npu.synchronize()
             with torch.npu.stream(stream):
                 output.fill_(0xCC)
             stream.synchronize()
@@ -194,9 +207,9 @@ def main():
                                                stream=stream, profile=instrumented, validate_ranges=args.validate_ranges)
             elapsed_us = (time.perf_counter_ns() - begin) / 1000
             verify_begin = time.perf_counter_ns()
-            if not torch.equal(output, expected_hbm[iteration % 2]):
+            if not torch.equal(output, expected_hbm):
                 raise RuntimeError(f"NPU consumer mismatch at iteration {iteration}")
-            if not torch.equal(output.cpu(), expected[iteration % 2]):
+            if not torch.equal(output.cpu(), expected):
                 raise RuntimeError(f"payload/guard mismatch at iteration {iteration}")
             verify_us = (time.perf_counter_ns() - verify_begin) / 1000
             if args.warmup <= iteration < normal_rounds:
@@ -227,7 +240,7 @@ def main():
                   flush=True)
         stats = summarize_us(stages["batch_get_raw_addr"])
         print("NPU_HBM_BENCH_PASS metric=python_batch_get_raw_addr_call "
-              f"iterations={stats['samples']} warmup_excluded={args.warmup} "
+              f"source_count={args.source_count} iterations={stats['samples']} warmup_excluded={args.warmup} "
               f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
               f"p95_us={stats['p95_us']:.3f} p99_us={stats['p99_us']:.3f} "
               f"effective_GBps={payload_bytes / stats['mean_us'] / 1000:.3f} "

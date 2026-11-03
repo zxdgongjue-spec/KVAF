@@ -37,6 +37,14 @@ int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     uint32_t jettys_per_core, void *peer_link,
     const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
     KvafBatchGetTransport **transport);
+// NPU multi-MR: MR 1 is the original peer region. Additional MRs share
+// contexts/queues, and must be added before READs. Failed imports stay owned
+// by the transport until Close; do not retry a partial registration in place.
+int32_t KvafBatchGetTransportAddRemoteMemory(KvafBatchGetTransport *transport,
+    uint64_t mr_id, uint64_t base, uint64_t bytes);
+int32_t KvafBatchGetLocalBufferAcquireForRemote(KvafBatchGetTransport *transport,
+    uint64_t mr_id, void *output_hbm, uint64_t output_hbm_bytes,
+    KvafBatchGetLocalBuffer **local_buffer, uint64_t *device_channel_entity);
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
 
 // Acquire registers/caches one caller-owned HBM output range. Re-acquiring

@@ -38,15 +38,19 @@ class ReadLink final:public peer::PeerLink {
   ~ReadLink() override {if(control_fd>=0)close(control_fd);}
   int control_fd{-1};
   HbmReadTicket ticket;
-  std::uint64_t client,checksum{};
+  std::uint64_t client;
+  std::vector<offload::Endpoint> memories;
+  std::vector<std::uint64_t> checksums;
   offload::Endpoint endpoint{};
   std::uint32_t channel{};
   bool opened{};
-  Status Call(hr::Command command,const std::vector<hr::Span>& spans,hr::Response* response,std::uint64_t sequence=0) {
-    auto r=hr::Make(command,ticket,client);r.sequence=sequence;return hr::Exchange(address(),r,spans,response,&control_fd);
+  Status Call(hr::Command command,const std::vector<hr::Span>& spans,hr::Response* response,std::uint64_t sequence=0,std::uint64_t mr_id=1) {
+    auto r=hr::Make(command,ticket,client);r.sequence=sequence;r.mr_id=mr_id;return hr::Exchange(address(),r,spans,response,&control_fd);
   }
   Status LookupRegion(std::uint64_t base,peer::PeerRegion* out)const override {
-    if(!out || base!=endpoint.base || endpoint.segment_bytes!=48) return Status::InvalidArgument("invalid imported B HBM");
+    auto it=std::find_if(memories.begin(),memories.end(),[&](const auto& e){return e.base==base;});
+    if(!out || it==memories.end() || it->segment_bytes!=48) return Status::InvalidArgument("invalid imported B HBM");
+    const auto& endpoint=*it;
     *out={};out->base=endpoint.base;out->length=endpoint.bytes;out->token_value=endpoint.token;
     std::memcpy(&out->token_id,endpoint.segment+44,4);
     out->segment_key_bytes=endpoint.segment_bytes;std::memcpy(out->segment_key.data(),endpoint.segment,endpoint.segment_bytes);
@@ -75,6 +79,7 @@ struct Engine {
   DeviceBuffer descriptors,statuses,queues,scratch;
   std::vector<KvafRawReadCoreStatus> host_statuses;
   std::uint32_t cores,jettys,budget;
+  std::uint64_t mr_id{1};
   bool uncertain{},kernel_finished{},cache_output{};
   aclrtStream probe_stream{};
   aclrtEvent profile_start{},profile_end{};
@@ -170,7 +175,7 @@ struct Engine {
     if(!s.ok())return s;
     std::uint64_t entity{};
     if(Timed(profile?&profile->register_output_us:nullptr,[&]{
-        return KvafBatchGetLocalBufferAcquire(transport,output.data,output.bytes,&local,&entity);}))
+        return KvafBatchGetLocalBufferAcquireForRemote(transport,mr_id,output.data,output.bytes,&local,&entity);}))
       return Status::Internal("register A raw READ output");
     args.output=reinterpret_cast<std::uint64_t>(output.data);
     args.core_status=reinterpret_cast<std::uint64_t>(statuses.data);args.queue_state=reinterpret_cast<std::uint64_t>(queues.data);
@@ -232,7 +237,7 @@ struct Connection {
   std::string local_eid;
   Engine engine;
   Pending pending{Pending::None};
-  std::uint64_t sequence{},last_sequence{};
+  std::uint64_t sequence{},last_sequence{},mr_id{1};
   bool ready{};
   Status result;
   Connection(const std::string& a,const HbmReadTicket& t,const std::string& eid,std::uint32_t c,std::uint32_t j,std::uint32_t b):
@@ -245,7 +250,7 @@ struct Connection {
     if(pending==Pending::Cleanup)pending=result.ok()?Pending::Complete:Pending::Cancel;
     hr::Response response{};
     s=Timed(profile?&profile->complete_us:nullptr,[&]{
-      return link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,{},&response,sequence);});
+      return link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,{},&response,sequence,mr_id);});
     if(!s.ok())return Status::InDoubt("raw READ acknowledgement pending: "+s.message());
     pending=Pending::None;last_sequence=sequence;return result;
   }
@@ -267,7 +272,7 @@ HbmReader::HbmReader(std::uint32_t d,std::uint32_t c,std::uint32_t j,std::uint32
 HbmReader::~HbmReader(){if(!Shutdown().ok())(void)impl_.release();}
 Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,const std::string& local_eid) {
   auto s=impl_->Device();if(!s.ok())return s;
-  if(address.empty() || !ticket.source_id || !ticket.epoch || !ticket.token || !ticket.bytes ||
+  if(address.empty() || !ticket.valid() ||
       !impl_->cores || !impl_->jettys || impl_->cores*std::uint64_t(impl_->jettys)>offload::kChannelCount ||
       (impl_->budget && impl_->budget<impl_->cores*2) || impl_->kernel.empty())
     return Status::InvalidArgument("configure raw kernel and 1..4 total Jettys for HBM READ");
@@ -275,7 +280,7 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
   const auto existing=impl_->connections.find(key);
   if(existing!=impl_->connections.end()) {
     const auto& c=*existing->second;
-    if(c.link->ticket.bytes!=ticket.bytes || c.link->ticket.token!=ticket.token ||
+    if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token ||
         c.link->address()!=address || c.local_eid!=local_eid)
       return Status::InvalidArgument("HBM source is already attached with different metadata or route");
     return c.ready ? Status::OK() : Status::InDoubt("HBM attach/close incomplete; retry detach_hbm with the original export_ticket");
@@ -298,33 +303,53 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
     hr::Response response{};c.link->opened=true;
     s=hr::Exchange(address,request,{},&response);
     if(s.ok()) {
-      c.link->endpoint=response.endpoint;c.link->checksum=response.checksum;
+      const auto count=ticket.mr_count();
+      c.link->endpoint=response.endpoint;
+      if(response.mr_count!=count) s=Status::Internal("B HBM MR count differs from ticket");
+      for(std::uint64_t mr=1;s.ok() && mr<=count;++mr) {
+        if(mr>1) s=c.link->Call(hr::Command::Memory,{},&response,0,mr);
+        if(!s.ok()) break;
+        const auto& e=response.endpoint;
+        if(response.mr_count!=count || e.token!=ticket.token || e.bytes!=ticket.bytes_for(mr) ||
+            e.segment_bytes!=48 || e.key_bytes!=32 || !e.base || e.bytes>UINT64_MAX-e.base || !e.tp || !e.psn ||
+            std::memcmp(e.eid,c.link->endpoint.eid,16)) {
+          s=Status::Internal("invalid B HBM export descriptor");break;
+        }
+        for(const auto& prior:c.link->memories) if(e.base==prior.base)
+          s=Status::Internal("ambiguous exported HBM base");
+        c.link->memories.push_back(e);c.link->checksums.push_back(response.checksum);
+      }
       auto& e=c.link->endpoint;
-      if(e.token!=ticket.token || e.bytes!=ticket.bytes || e.segment_bytes!=48 || e.key_bytes!=32 ||
-          !e.base || e.bytes>UINT64_MAX-e.base || !e.tp || !e.psn)
-        s=Status::Internal("invalid B HBM export descriptor");
-      else if(KvafBatchGetTransportCreateWithPeerLink(reinterpret_cast<void*>(e.base),e.bytes,
+      if(s.ok() && KvafBatchGetTransportCreateWithPeerLink(reinterpret_cast<void*>(e.base),e.bytes,
           impl_->cores,impl_->jettys,c.link.get(),a.eid.data(),&c.engine.transport))
         s=Status::Internal("create A-B raw READ transport");
+      for(std::uint64_t mr=2;s.ok() && mr<=count;++mr) {
+        const auto& memory=c.link->memories[mr-1];
+        if(KvafBatchGetTransportAddRemoteMemory(c.engine.transport,mr,memory.base,memory.bytes))
+          s=Status::Internal("import B HBM MR "+std::to_string(mr));
+      }
     }
     if(s.ok()) {
-      const auto bytes=std::min<std::uint64_t>(ticket.bytes,64);
       const auto rows=impl_->cores*(128U*(impl_->jettys-1)+1U);
-      s=c.engine.scratch.Allocate(rows*bytes);
+      s=c.engine.scratch.Allocate(rows*64U);
       auto& stream=c.engine.probe_stream;
       if(s.ok() && aclrtCreateStream(&stream)!=ACL_SUCCESS)s=Status::Internal("create raw READ probe stream");
-      if(s.ok()) {
+      for(std::size_t mr=0;s.ok() && mr<c.link->memories.size();++mr) {
+        c.engine.mr_id=mr+1;
+        const auto& memory=c.link->memories[mr];
+        const auto bytes=std::min<std::uint64_t>(memory.bytes,64);
         auto base=reinterpret_cast<std::uint64_t>(c.engine.scratch.data);
         std::vector<hr::Span> probe;
-        for(std::uint32_t i=0;i<rows;++i)probe.push_back({c.link->endpoint.base,base+i*bytes,bytes});
+        for(std::uint32_t i=0;i<rows;++i)probe.push_back({memory.base,base+i*bytes,bytes});
         s=c.engine.RunProbe(probe,{c.engine.scratch.data,c.engine.scratch.bytes,DeviceKind::kNpu},stream);
         if(s.ok()) {
           std::vector<std::uint8_t> result(rows*bytes);
           if(aclrtMemcpy(result.data(),result.size(),c.engine.scratch.data,result.size(),ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
             s=Status::Internal("copy raw READ probe output");
           for(std::uint32_t i=0;s.ok() && i<rows;++i)
-            if(offload::Hash(result.data()+i*bytes,bytes)!=c.link->checksum)s=Status::Internal("raw READ probe checksum mismatch");
+            if(offload::Hash(result.data()+i*bytes,bytes)!=c.link->checksums[mr])s=Status::Internal("raw READ probe checksum mismatch");
         }
+        if(s.ok()) s=c.engine.Cleanup();
       }
       if(c.engine.uncertain) {
         const auto quiesced=c.engine.QuiesceProbe();
@@ -344,8 +369,8 @@ Status HbmReader::Attach(const std::string& address,const HbmReadTicket& ticket,
     }
     if(s.ok()) {
       c.ready=true;
-      std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY source=%llu epoch=%llu A_eid=%s B_eid=%s jettys=%u probe=all_lanes_pass\n",
-          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->endpoint.eid).c_str(),impl_->cores*impl_->jettys);
+      std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY source=%llu epoch=%llu A_eid=%s B_eid=%s jettys=%u mrs=%zu probe=all_mrs_all_lanes_pass\n",
+          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->endpoint.eid).c_str(),impl_->cores*impl_->jettys,ticket.mr_count());
       return s;
     }
     std::fprintf(stderr,"[KVAF_NPU] HBM_READ_CANDIDATE_REJECTED source=%llu A_eid=%s B_candidate=%u detail=%s\n",
@@ -369,7 +394,7 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
   auto& c=*it->second;
   if(!c.ready || c.pending!=Pending::None)return Status::Busy("raw READ region not ready or has unresolved work");
   const auto& ticket=c.link->ticket;
-  if(!SameSource(*source,{ticket.source_id,ticket.bytes,ticket.epoch}) ||
+  if(!ticket.matches(*source) || !source->bytes_for(ready.mr_id) ||
       !ready.sequence || ready.sequence<=c.last_sequence)
     return Status::InvalidArgument("NPU Pull ReadyToken belongs to another source or consumed batch");
   const auto base=reinterpret_cast<std::uint64_t>(output.data);
@@ -387,12 +412,12 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
     if(address>UINT64_MAX-bytes || (address<=base ? base-address<bytes : address-base<output.bytes))
       return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
   }
-  c.sequence=ready.sequence;c.pending=Pending::Acquire;c.result=Status::OK();
+  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.engine.mr_id=ready.mr_id;c.pending=Pending::Acquire;c.result=Status::OK();
   if(profile)profile->validation_us=std::chrono::duration<double,std::micro>(ProfileClock::now()-validation_begin).count();
   hr::Response response{};
   // The source service leases the identity/batch, not a Host copy of the
   // device metadata. Bounds diagnostics are opt-in, as on the BatchGet fast path.
-  s=Timed(profile?&profile->acquire_us:nullptr,[&]{return c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence);});
+  s=Timed(profile?&profile->acquire_us:nullptr,[&]{return c.link->Call(hr::Command::AcquireRaw,{},&response,ready.sequence,ready.mr_id);});
   if(!s.ok()) {if(s.code()!=StatusCode::kInDoubt)c.pending=Pending::None;return s;}
   c.pending=Pending::Dma;
   s=c.engine.RunDevice(src,dst,lengths,output,stream,profile,validate_ranges);
@@ -407,19 +432,19 @@ Status HbmReader::Resolve(const ReadyToken& ready){
   auto it=impl_->connections.find({source->source_id,source->source_epoch});
   if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not attached");
   const auto& ticket=it->second->link->ticket;
-  if(!SameSource(*source,{ticket.source_id,ticket.bytes,ticket.epoch}) ||
-      !ready.sequence || ready.sequence!=it->second->sequence)
+  if(!ticket.matches(*source) || !source->bytes_for(ready.mr_id) ||
+      !ready.sequence || ready.sequence!=it->second->sequence || ready.mr_id!=it->second->mr_id)
     return Status::InvalidArgument("raw READ recovery token does not match the pending batch");
   return it->second->Resolve();
 }
 Status HbmReader::Detach(const HbmReadTicket& ticket){
   auto s=impl_->Device();if(!s.ok())return s;
-  if(!ticket.source_id || !ticket.epoch || !ticket.bytes || !ticket.token)
+  if(!ticket.valid())
     return Status::InvalidArgument("invalid HBM export ticket");
   auto it=impl_->connections.find({ticket.source_id,ticket.epoch});
   if(it==impl_->connections.end())return Status::OK(); // Also valid after a fully cleaned failed Attach.
   auto& c=*it->second;
-  if(c.link->ticket.bytes!=ticket.bytes || c.link->ticket.token!=ticket.token)
+  if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token)
     return Status::InvalidArgument("HBM detach ticket does not match the attached source");
   if(c.pending!=Pending::None)return Status::InDoubt("resolve raw READ before detach");
   // Close may destroy queues before a later MR unregister fails. Retrying

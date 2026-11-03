@@ -3,7 +3,7 @@ import contextlib
 import io
 import unittest
 
-from bench_hbm_read_raw_addr import parse_args, round_counts
+from bench_hbm_read_raw_addr import parse_args, round_counts, pattern_phase
 from bench_remote_cpu_offload import measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
 
@@ -72,6 +72,14 @@ class PullBenchmarks(unittest.TestCase):
                                       submit_cpu_pull=30, wait_cpu_pull=40, commit_put=50))
         self.assertEqual(result["total"], sum(v for k, v in result.items() if k != "total"))
 
+    def test_multi_mr_warmup_and_patterns(self):
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--source-count", "78"])
+        self.assertEqual(args.warmup, 78)
+        self.assertEqual(len({pattern_phase(i, 78) for i in range(78)}), 78)
+        for i in range(78):
+            self.assertNotEqual(pattern_phase(i, 78), pattern_phase(i + 78, 78))
+        self.assertEqual([pattern_phase(i, 1) for i in range(4)], [0, 1, 0, 1])
+
     def test_raw_benchmark_configuration_limits(self):
         common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]
         args = parse_args(common + ["--blocks", "13", "--block-bytes", "100001", "--source-space-bytes", "3000000"])
@@ -89,7 +97,7 @@ class PullBenchmarks(unittest.TestCase):
                         ["--source-space-bytes", "1"], ["--device-a", "7"],
                         ["--aiv-cores", "4", "--jettys-per-core", "2"],
                         ["--max-inflight-total", "3"], ["--iterations", "0"],
-                        ["--profile-iterations", "-1"],
+                        ["--profile-iterations", "-1"], ["--source-count", "0"], ["--source-count", "4097"],
                         ["--packets", "1", "--packet-bytes", str(1 << 32),
                          "--source-space-bytes", str(1 << 32)]):
             with self.subTest(invalid=invalid), contextlib.redirect_stderr(io.StringIO()):

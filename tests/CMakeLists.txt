@@ -124,3 +124,13 @@ target_include_directories(kvaf_hbm_read_with_ddr_test PRIVATE
 target_link_libraries(kvaf_hbm_read_with_ddr_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
 add_test(NAME kvaf_hbm_read_with_ddr_test COMMAND kvaf_hbm_read_with_ddr_test)
 set_tests_properties(kvaf_hbm_read_with_ddr_test PROPERTIES TIMEOUT 45)
+
+add_executable(kvaf_hbm_read_transport_test hbm_read_transport_test.cc
+  ../access_operator/src/direct_hccp/direct_hccp_remote_transport.cc
+  ../access_operator/src/direct_hccp/direct_hccp_session.cc)
+target_include_directories(kvaf_hbm_read_transport_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl
+  ${PROJECT_SOURCE_DIR}/access_operator/include
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+target_link_libraries(kvaf_hbm_read_transport_test PRIVATE kvaf_peer_link ${CMAKE_DL_LIBS})
+add_test(NAME kvaf_hbm_read_transport_test COMMAND kvaf_hbm_read_transport_test)

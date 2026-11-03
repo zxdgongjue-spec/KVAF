@@ -1,6 +1,7 @@
 #include "hbm_read.h"
 #include "hbm_read_protocol.h"
 #include "hbm_exporter.h"
+#include <algorithm>
 #include <atomic>
 #include <future>
 #include <mutex>
@@ -19,14 +20,16 @@ struct NpuPullHbmSource::Impl {
   std::uint32_t device;
   std::string eid,selected;
   mutable std::mutex mutex;
-  ConstBufferView input{};
+  std::vector<ConstBufferView> inputs;
+  std::vector<offload::Endpoint> memories;
+  std::vector<std::uint64_t> checksums;
   HbmReadTicket ticket{};
   std::vector<npu_eid::NpuLocalEidCandidate> candidates;
   std::unique_ptr<detail::Exporter> exporter;
   std::array<offload::Endpoint,offload::kChannelCount> peers{};
   std::array<bool,offload::kChannelCount> bound{};
   std::set<std::uint64_t> retired;
-  std::uint64_t client{},sequence{},checksum{},completed{};
+  std::uint64_t client{},sequence{},completed{},mr_id{1},completed_mr{};
   std::uint32_t candidate{};
   offload::Endpoint initiator{};
   Status open_result;
@@ -44,7 +47,7 @@ struct NpuPullHbmSource::Impl {
   }
   Status Handle(const hr::Request& r,const std::vector<hr::Span>& spans,hr::Response* response) {
     if(closing) return Status::Busy("HBM source is shutting down");
-    if(r.source_id!=ticket.source_id || r.epoch!=ticket.epoch || r.token!=ticket.token || !input.valid())
+    if(r.source_id!=ticket.source_id || r.epoch!=ticket.epoch || r.token!=ticket.token || inputs.empty())
       return Status::NotFound("HBM ticket is stale or belongs to another source");
     auto command=static_cast<hr::Command>(r.header.command);
     if(command==hr::Command::Discover) {
@@ -61,7 +64,7 @@ struct NpuPullHbmSource::Impl {
       if(client) {
         if(candidate!=r.candidate || std::memcmp(initiator.eid,r.endpoint.eid,16))
           return Status::InvalidArgument("reader retry changed its EID pair");
-        if(open_result.ok()) { response->endpoint=exporter->descriptor; response->checksum=checksum; }
+        if(open_result.ok()) { response->endpoint=memories.front(); response->checksum=checksums.front(); response->mr_count=inputs.size(); }
         return open_result;
       }
       if(frozen || r.candidate>=candidates.size()) return Status::Busy("cannot attach while HBM is frozen");
@@ -69,25 +72,35 @@ struct NpuPullHbmSource::Impl {
       client=r.client; candidate=r.candidate; initiator=r.endpoint; initiator.token=ticket.token;
       exporter=std::make_unique<detail::Exporter>();
       selected=npu_eid::EidToHex(candidates[candidate].eid);
-      open_result=exporter->Open(input,selected,initiator,true);
-      if(open_result.ok()) {
+      memories.resize(inputs.size()); checksums.resize(inputs.size());
+      open_result=exporter->Open(inputs.front(),selected,initiator,true);
+      if(open_result.ok()) memories.front()=exporter->descriptor;
+      for(std::size_t i=1;open_result.ok() && i<inputs.size();++i)
+        open_result=exporter->AddMemory(inputs[i],&memories[i]);
+      for(std::size_t i=0;open_result.ok() && i<inputs.size();++i) {
+        const auto& input=inputs[i];
         std::array<std::uint8_t,64> expected{};
         auto n=std::min<std::size_t>(expected.size(),input.bytes);
         if(aclrtMemcpy(expected.data(),expected.size(),input.data,n,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
           open_result=Status::Internal("copy HBM READ probe expectation");
-        checksum=offload::Hash(expected.data(),n);
+        checksums[i]=offload::Hash(expected.data(),n);
       }
-      if(open_result.ok()) {response->endpoint=exporter->descriptor;response->checksum=checksum;}
+      if(open_result.ok()) {response->endpoint=memories.front();response->checksum=checksums.front();response->mr_count=inputs.size();}
       return open_result;
     }
     if(client!=r.client || !exporter) return Status::NotFound("HBM reader connection not found");
     if(command==hr::Command::Close) {
       if(frozen) return Status::Busy("release/cancel frozen HBM before detach");
       auto status=exporter->Close(); if(!status.ok()) return status;
-      exporter.reset(); retired.insert(client); client=0; bound.fill(false); peers={};
+      exporter.reset(); memories.clear(); checksums.clear(); retired.insert(client); client=0; bound.fill(false); peers={};
       confirmed=false; selected.clear(); state=hr::State::Registered; return Status::OK();
     }
     if(!open_result.ok()) return open_result;
+    if(command==hr::Command::Memory) {
+      if(!r.mr_id || r.mr_id>memories.size()) return Status::InvalidArgument("unknown HBM MR");
+      response->endpoint=memories[r.mr_id-1];response->checksum=checksums[r.mr_id-1];
+      response->mr_count=memories.size();return Status::OK();
+    }
     if(command==hr::Command::Channel) {
       if(confirmed || r.channel>=bound.size() || std::memcmp(r.endpoint.eid,initiator.eid,16))
         return Status::InvalidArgument("invalid HBM target channel");
@@ -109,8 +122,9 @@ struct NpuPullHbmSource::Impl {
       return Status::OK();
     }
     if((command==hr::Command::Complete || command==hr::Command::Cancel) &&
-        r.sequence && r.sequence==completed) return Status::OK();
-    if(!confirmed || !frozen || r.sequence!=sequence) return Status::InvalidState("HBM batch is stale or not ready");
+        r.sequence && r.sequence==completed)
+      return r.mr_id==completed_mr ? Status::OK() : Status::InvalidArgument("completed HBM batch MR mismatch");
+    if(!confirmed || !frozen || r.sequence!=sequence || r.mr_id!=mr_id) return Status::InvalidState("HBM batch is stale or not ready");
     if(command==hr::Command::AcquireRaw) {
       if(!spans.empty()) return Status::InvalidArgument("NPU Pull control carries identity only");
       if(state==hr::State::Reading) return Status::OK();
@@ -121,7 +135,7 @@ struct NpuPullHbmSource::Impl {
       if(state==hr::State::Done) return Status::OK();
       if(state!=hr::State::Reading && !(command==hr::Command::Cancel && state==hr::State::Ready)) return Status::InvalidState("HBM batch was not acquired");
       // Cancel is only sent by a reader that has not launched any READ.
-      state=hr::State::Done; completed=sequence; return Status::OK();
+      state=hr::State::Done; completed=sequence; completed_mr=mr_id; return Status::OK();
     }
     return Status::InvalidArgument("unknown HBM command");
   }
@@ -147,7 +161,8 @@ struct NpuPullHbmSource::Impl {
           if(offload::ReadBytes(fd,spans.data(),spans.size()*sizeof(hr::Span))) {
             response.header={hr::kMagic,hr::kVersion,std::uint16_t(r.header.command|0x8000U),sizeof(response)};
             response.source_id=r.source_id;response.epoch=r.epoch;response.client=r.client;response.sequence=r.sequence;
-            response.reserved=1U; // Persistent exchanges supported, same v4 wire layout.
+            response.mr_id=r.mr_id;
+            response.reserved=1U; // Persistent exchanges supported.
             Status s;
             {std::lock_guard<std::mutex> lock(mutex);s=Handle(r,spans,&response);response.state=unsigned(state);}
             response.code=unsigned(s.code());std::snprintf(response.detail,sizeof(response.detail),"%s",s.message().c_str());
@@ -170,12 +185,23 @@ struct NpuPullHbmSource::Impl {
 NpuPullHbmSource::NpuPullHbmSource(std::uint32_t d,std::string e):impl_(new Impl(d,std::move(e))){}
 NpuPullHbmSource::~NpuPullHbmSource(){if(!Shutdown().ok()) (void)impl_.release();}
 Status NpuPullHbmSource::Register(ConstBufferView input,void* stream,HbmReadTicket* out) {
+  return Register(std::vector<ConstBufferView>{input},stream,out);
+}
+Status NpuPullHbmSource::Register(const std::vector<ConstBufferView>& inputs,void* stream,HbmReadTicket* out) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto s=impl_->Device(); if(!s.ok()) return s;
-  if(impl_->input.valid()) return Status::InvalidState("HBM source already registered");
-  auto base=reinterpret_cast<std::uintptr_t>(input.data);
-  if(!out || !input.valid() || input.device!=DeviceKind::kNpu || input.bytes>UINT64_MAX-base)
-    return Status::InvalidArgument("invalid HBM source buffer");
+  if(!impl_->inputs.empty()) return Status::InvalidState("HBM source already registered");
+  if(!out || inputs.empty() || inputs.size()>4096) return Status::InvalidArgument("HBM requires 1..4096 tensors");
+  std::vector<std::pair<std::uintptr_t,std::uintptr_t>> ranges;
+  for(const auto& input:inputs) {
+    const auto base=reinterpret_cast<std::uintptr_t>(input.data);
+    if(!input.valid() || input.device!=DeviceKind::kNpu || input.bytes>UINT64_MAX-base)
+      return Status::InvalidArgument("invalid HBM source buffer");
+    ranges.emplace_back(base,base+input.bytes);
+  }
+  std::sort(ranges.begin(),ranges.end());
+  for(std::size_t i=1;i<ranges.size();++i) if(ranges[i].first<ranges[i-1].second)
+    return Status::InvalidArgument("HBM tensors must not overlap");
   s=detail::Exporter::Ready(stream); if(!s.ok()) return s;
   impl_->candidates.clear();
   if(impl_->eid.empty()) {
@@ -187,13 +213,14 @@ Status NpuPullHbmSource::Register(ConstBufferView input,void* stream,HbmReadTick
     if(!detail::ParseEid(impl_->eid,c.eid.data())) return Status::InvalidArgument("invalid B EID");
     impl_->candidates.push_back(c);
   }
-  impl_->input=input;impl_->closing=false;impl_->sequence=impl_->completed=0;
-  impl_->ticket={detail::Nonce(),detail::Nonce(),input.bytes,std::uint32_t(detail::Nonce())|1U};
+  impl_->inputs=inputs;impl_->closing=false;impl_->sequence=impl_->completed=impl_->completed_mr=0;impl_->mr_id=1;
+  impl_->ticket={detail::Nonce(),detail::Nonce(),inputs.front().bytes,std::uint32_t(detail::Nonce())|1U};
+  if(inputs.size()>1) for(const auto& input:inputs) impl_->ticket.mr_bytes.push_back(input.bytes);
   *out=impl_->ticket; return Status::OK();
 }
 Status NpuPullHbmSource::Listen(const std::string& address) {
   if(impl_->listener>=0) return Status::InvalidState("HBM source already listening");
-  if(!impl_->input.valid()) return Status::InvalidState("register HBM before listen");
+  if(impl_->inputs.empty()) return Status::InvalidState("register HBM before listen");
   auto s=hr::Listen(address,&impl_->listener,&impl_->port);if(!s.ok())return s;
   impl_->stop=false;std::promise<Status> promise;auto future=promise.get_future();
   impl_->thread=std::thread([p=impl_.get(),promise=std::move(promise)]()mutable{p->Serve(std::move(promise));});
@@ -201,23 +228,34 @@ Status NpuPullHbmSource::Listen(const std::string& address) {
   if(!s.ok()){impl_->thread.join();close(impl_->listener);impl_->listener=-1;}
   return s;
 }
-Status NpuPullHbmSource::Ready(ReadyToken* out) {
+Status NpuPullHbmSource::Ready(ReadyToken* out) { return Ready(ConstBufferView{},out); }
+Status NpuPullHbmSource::Ready(ConstBufferView tensor,ReadyToken* out) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto status=impl_->Device();if(!status.ok())return status;
   if(!out || !impl_->confirmed) return Status::InvalidState("attach reader before Ready");
+  std::uint64_t mr=1;
+  if(!tensor.data && !tensor.bytes) {
+    if(impl_->inputs.size()!=1) return Status::InvalidArgument("select a registered tensor for multi-MR Ready");
+  } else {
+    auto it=std::find_if(impl_->inputs.begin(),impl_->inputs.end(),[&](const auto& input){
+      return input.data==tensor.data && input.bytes==tensor.bytes && input.device==tensor.device;});
+    if(it==impl_->inputs.end()) return Status::InvalidArgument("tensor is not registered in this HBM source");
+    mr=std::distance(impl_->inputs.begin(),it)+1;
+  }
+  if(impl_->frozen && impl_->mr_id!=mr) return Status::Busy("release current batch before selecting another MR");
   if(!impl_->frozen) {
+    impl_->mr_id=mr;
     if(impl_->sequence==UINT64_MAX) return Status::InvalidState("HBM sequence exhausted");
     ++impl_->sequence;impl_->frozen=true;impl_->state=hr::State::Ready;
   }
-  *out={NpuPullSourceDesc{impl_->ticket.source_id,impl_->input.bytes,impl_->ticket.epoch},impl_->sequence};
+  *out={impl_->ticket.source(),impl_->sequence,impl_->mr_id};
   return Status::OK();
 }
 Status NpuPullHbmSource::FinishBatch(const ReadyToken& token,bool cancel){
   std::lock_guard<std::mutex> lock(impl_->mutex);
   {
     const auto* source=std::get_if<NpuPullSourceDesc>(&token.source);
-    const NpuPullSourceDesc own{impl_->ticket.source_id,impl_->input.bytes,impl_->ticket.epoch};
-    if(!source || !SameSource(*source,own) || !token.sequence || token.sequence!=impl_->sequence)
+    if(!source || !impl_->ticket.matches(*source) || !token.sequence || token.sequence!=impl_->sequence || token.mr_id!=impl_->mr_id)
       return Status::InvalidArgument("stale NPU Pull batch identity");
   }
   if(!impl_->frozen)return Status::OK();
@@ -233,7 +271,7 @@ Status NpuPullHbmSource::Shutdown(){
    impl_->closing=true;}
   impl_->stop=true;if(impl_->thread.joinable())impl_->thread.join();
   if(impl_->listener>=0){close(impl_->listener);impl_->listener=-1;}
-  impl_->input={};impl_->retired.clear();impl_->ticket={};return Status::OK();
+  impl_->inputs.clear();impl_->retired.clear();impl_->ticket={};return Status::OK();
 }
 std::uint16_t NpuPullHbmSource::port()const{return impl_->port;}
 bool NpuPullHbmSource::frozen()const{std::lock_guard<std::mutex>l(impl_->mutex);return impl_->frozen || (impl_->client && !impl_->confirmed);}

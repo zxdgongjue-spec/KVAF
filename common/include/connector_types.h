@@ -19,18 +19,24 @@ struct CpuPullSourceDesc {
 };
 struct NpuPullSourceDesc {
   std::uint64_t source_id{}, source_bytes{}, source_epoch{};
+  // Same indexing as CPU Pull; independent registrations and identities.
+  std::vector<std::uint64_t> mr_bytes;
+  std::size_t mr_count() const { return mr_bytes.empty() ? 1 : mr_bytes.size(); }
+  std::uint64_t bytes_for(std::uint64_t mr_id) const {
+    return !mr_id || mr_id > mr_count() ? 0 : mr_bytes.empty() ? source_bytes : mr_bytes[mr_id-1];
+  }
 };
 struct ReadyToken {
   std::variant<CpuPullSourceDesc, NpuPullSourceDesc> source;
   std::uint64_t sequence{};
-  std::uint64_t mr_id{1}; // CPU Pull only: one registered tensor per batch.
+  std::uint64_t mr_id{1}; // One registered tensor per batch, for either Pull path.
 };
 inline bool SameSource(const CpuPullSourceDesc& a, const CpuPullSourceDesc& b) {
   return a.source_id == b.source_id && a.source_bytes == b.source_bytes &&
       a.region_id == b.region_id && a.region_epoch == b.region_epoch && a.mr_bytes == b.mr_bytes;
 }
 inline bool SameSource(const NpuPullSourceDesc& a, const NpuPullSourceDesc& b) {
-  return a.source_id == b.source_id && a.source_bytes == b.source_bytes && a.source_epoch == b.source_epoch;
+  return a.source_id == b.source_id && a.source_bytes == b.source_bytes && a.source_epoch == b.source_epoch && a.mr_bytes == b.mr_bytes;
 }
 
 // Host-only, read-only contiguous arrays. The caller keeps them stable during

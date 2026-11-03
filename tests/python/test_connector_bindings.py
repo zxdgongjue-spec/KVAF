@@ -109,6 +109,20 @@ class ConnectorBindings(unittest.TestCase):
         self.assertEqual(single.mr_count, 1)
         self.assertEqual(restored(kvaf.ReadyToken, (single, 7)).mr_id, 1)
 
+    def test_npu_multi_mr_identity_survives_connector_ipc(self):
+        sizes = [4096 + i * 64 for i in range(78)]
+        source = restored(kvaf.NpuPullSourceDesc, (13, sizes[0], 88, sizes))
+        ready = restored(kvaf.ReadyToken, (source, 9, 78))
+        copy = pickle.loads(pickle.dumps(ready))
+        self.assertEqual(copy.mr_id, 78)
+        self.assertEqual(copy.source.mr_count, 78)
+        self.assertEqual(copy.source.mr_bytes, sizes)
+        copy.source.mr_bytes.clear()
+        self.assertEqual(copy.source.mr_count, 78)
+        with self.assertRaises(AttributeError):
+            copy.mr_id = 1
+        self.assertEqual(restored(kvaf.NpuPullSourceDesc, (13, 8192, 88)).mr_count, 1)
+
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_only_current_pull_interfaces_are_exported(self):
         for name in ("HbmSource", "HbmReadSource", "OffloadRuntime", "CpuPullSourceHandle", "CpuPullTask"):

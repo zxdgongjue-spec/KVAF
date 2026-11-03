@@ -1,6 +1,6 @@
 # NPU 直接读取对端 HBM：batch_get_raw_addr
 
-同一个 NpuRuntime 可访问 CPU DDR，并通过独立 fullmesh 链路读取另一张卡的 HBM。纯 NPU Pull 不需要 CPU service 或 DDR 初始化，也不使用 AccessTable、keys 或 DDR MetaManager。B 可分别注册一块供 CPU Pull 的 HBM 和一块供 NPU Pull 的 HBM。
+同一个 NpuRuntime 可访问 CPU DDR，并通过独立 fullmesh 链路读取另一张卡的 HBM。纯 NPU Pull 不需要 CPU service 或 DDR 初始化，也不使用 AccessTable、keys 或 DDR MetaManager。B 可为 CPU Pull 和 NPU Pull 分别注册 tensor 列表；两套注册与连接独立，不要求是同一批底层数据。
 
 ## 生产端 B
 
@@ -18,7 +18,33 @@ source.release_batch(ready)
 
 register 保留连续 NPU Tensor，初始化实际注册在 attach 时完成。Tensor 起点无需页对齐：底层向下对齐 4 KiB 并覆盖整个 Tensor，逻辑源起点仍为 Tensor 的实际地址。注册至探测完成期间保持数据稳定。
 
-ready 不携带范围、不等待生产 stream；应用负责同步。release_batch(ready) 只在读取完成/已安全取消后成功，cancel_batch(ready) 只允许取消尚未被读取方获取的批次。两者都核验源身份和 sequence。注销前先释放批次、由 A detach，再 source.shutdown()。
+ready 不携带范围、不等待生产 stream；应用负责同步。release_batch(ready) 只在读取完成/已安全取消后成功，cancel_batch(ready) 只允许取消尚未被读取方获取的批次。两者都核验源身份、sequence 和 mr_id。注销前先释放批次、由 A detach，再 source.shutdown()。
+
+## 多 MR 共用 NPU 连接
+
+```python
+# B：固定列表中的每个 tensor 独立注册；列表共用连接。
+source = kvaf.NpuPullHbmSource(device_id=7, npu_eid=b_fullmesh_eid)
+ticket = source.register(tensors, stream=producer_stream)
+port = source.listen("127.0.0.1:0")
+# Connector 转交地址和 ticket，等待 A attach 完成。
+# produce(tensors[i])，并等待实际生产 stream 完成后：
+ready = source.ready(tensors[i])
+# Connector 把 ready 与业务元数据发给 A；不查询 MR 或通信句柄。
+# A 的调用与下文一致，src_offsets 相对于本次选中的 tensors[i]。
+# A 完成后应用通知 B：
+source.release_batch(ready)
+```
+
+- `register()` 接收单 tensor，或 1～4096 个 tensor 的 list/tuple。每个 tensor 连续、非空、在源对象指定的 NPU 上；逻辑范围不能重叠。列表固定到 shutdown，Python 保留所有 tensor 引用；注册期间不能 resize、释放或替换底层 storage。
+- `ready(tensor)` 按设备、起点和长度匹配注册项；不同范围的子视图不被接受。单 MR 仍可调用 `ready()`；多 MR 必须显式选择。一次调用的全部段属于同一 MR，不跨 MR。
+- 一个源同时一个未释放批次；同一 tensor 重复 Ready 返回该批次，选择其他 tensor 被拒绝。sequence 在源内统一递增。未选中的 tensor 可由应用继续生产，选中的 tensor 直到完成确认和 release 之前保持稳定。
+- B 使用一个 context、每个 tensor 一个 MR/token ID，以及共用的一组 4 个目标 Jetty。A 使用一个 context、逐个导入的 MR 和共用的 1～4 个发起 Jetty/CQ；TP 保留现有逐 Jetty 协商方式。
+- attach 的 Open 返回首 MR 和数量，Memory 请求取得其余 MR；注册/导入不在运行阶段重复执行。每个 MR 都做覆盖全部启用 Jetty 的小块 READ 校验，全部通过才返回成功。初始化部分失败按整组清理，清理不确定时保留原 ticket。
+- A 以 `source_id + source_epoch` 找到连接，以 `ready.mr_id` 选择远端 MR。源描述符的 `mr_bytes`/`mr_count` 是只读信息，`source_bytes` 仍指首 tensor 的大小，不是所有 tensor 的地址包络或长度之和。应用原样转交即可。
+- output 的本地 MR 仍按地址/长度缓存。按“MR ID + output 注册”另外缓存轻量通信描述；它们引用同一 SQ/CQ/Jetty/TP，远端基址、长度、token 和内存 EID 各不相同。首次组合生成并上传一次，后续复用；SQ/CQ 计数与队列状态跨 MR 延续。raw READ 算子及其 ABI 不变。
+- 新 ticket 为 version 2，增加 MR 长度列表；可解析旧 version 1 单 MR ticket。ReadyToken 的 pickle 包含 mr_id，旧单 MR 状态按 mr_id=1 解析。线协议 KVHR 则要求两端均为 v5，不与 v4 互通。
+- CPU Pull 与 NPU Pull 不共用 MR 或状态。若应用给两者注册同一底层 tensor，覆写前应等待两条路径的消费者都完成。
 
 ## 读取端 A
 
@@ -58,7 +84,7 @@ runtime.batch_get_raw_addr(ready, src, dst, sizes, output, stream=a_stream)
 
 KVAF 按源身份保存初始化的连接，每批从 `ready.source` 自动查找；应用无需维护本地连接编号。同一 Runtime 可以绑定多个源，分别持有通信资源。关闭时原样传回初始化的 ticket；attach 失败但清理未完成时，同样用 `detach_hbm(ticket)` 重试清理，不解析报错中的内部编号。未决 DMA 仍会阻止关闭。
 
-未决时用原批次的 `resolve_raw_addr(ready)` 重试控制或清理，绝不重发 READ；源身份或批次号不符会被拒绝。`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
+未决时用原批次的 `resolve_raw_addr(ready)` 重试控制或清理，绝不重发 READ；源身份、批次号或 MR ID 不符会被拒绝。`pending_raw_addr` 表示仍需保留资源。若获取批次的响应丢失而尚未发 READ，恢复会取消并返回错误，不能将 output 视为有效。
 
 可选 `profile=True` 在成功结果中增加 `profile` 字典，单位均为微秒：
 
@@ -74,7 +100,7 @@ print(result["profile"])
 | `validation_us` | Host 设备、源身份、数组形状和元数据/输出重叠检查 |
 | `acquire_us` | 向生产端获取当前批次的控制请求 |
 | `buffers_us` | 首次状态/队列分配、每批状态清零、首次计时事件创建；Host 状态数组复用 |
-| `register_output_us` | 获取缓存的 output 注册和通信实体，首次遇到该地址/长度时注册 |
+| `register_output_us` | 获取 output 注册及选定 MR 的通信描述；首次 output 注册、首次 MR/output 组合上传描述，之后均复用 |
 | `launch_us` | Host 提交 raw READ 算子调用 |
 | `synchronize_us` | Host 等待传入 stream 完成 |
 | `kernel_event_us` | 同一 stream 中紧邻算子前后两个设备事件之间的时间 |
@@ -101,9 +127,9 @@ raw READ V2 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总
 
 仅建链的 all-lane 探测仍使用内部 Host 绝对地址描述符模式，不再作为公开数据读取接口。探测失败必须确认 kernel 已退出且 initiator 队列成功销毁后才能换候选。
 
-KVHR v4 控制协议只传源/连接身份和批次号，不传三数组或 payload。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和未决任务；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和批次状态。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
+KVHR v5 运行阶段控制消息只传源/连接身份、MR ID 和批次号，不传三数组或 payload；初始化另行交换各 MR 的导出信息。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和未决任务；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和批次状态。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
 
-同一个 reader 的控制请求复用 TCP 连接，双方启用 TCP_NODELAY；服务端轮询多连接，空闲连接不阻塞其他请求。服务端通过 v4 Response 的保留字段声明连接复用能力，旧服务端自动回退为单请求连接。通信结果不确定时关闭连接，由既有 resolve 流程恢复，不自动重发请求。Acquire/Complete 和同步返回继续保留，用于保证 B 的 ready/release_batch 复用时序。
+同一个 reader 的控制请求复用 TCP 连接，双方启用 TCP_NODELAY；服务端轮询多连接，空闲连接不阻塞其他请求。服务端通过 Response 的保留字段声明连接复用能力，同版本未声明复用的服务端使用单请求连接；不同线协议版本拒绝通信。通信结果不确定时关闭连接，由既有 resolve 流程恢复，不自动重发请求。Acquire/Complete 和同步返回继续保留，用于保证 B 的 ready/release_batch 复用时序。
 
 每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
 
@@ -111,7 +137,7 @@ KVHR v4 控制协议只传源/连接身份和批次号，不传三数组或 payl
 
 ## 编译与硬件验证
 
-CPU service 与 NPU 扩展需同时重编译并重启，以使用 KVRP/KVHR v4。
+此次多 MR NPU Pull 需同时重编译、重启 A/B 的 NPU 运行库与 Python 扩展（KVHR v5）。CPU Pull 的 KVRP v5 未改，已有匹配的 CPU service 无需因此更新。raw READ kernel ABI 保持 V2。
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash
@@ -145,13 +171,16 @@ python tests/python/test_hbm_read_raw_addr.py \
 
 可独立指定 `--npu-eid-a`（DDR）、`--npu-eid-a-raw`（A—B，A 的 fullmesh）、
 `--npu-eid-b-cpu`（CPU—B）、`--npu-eid-b-raw`（A—B，B 的 fullmesh）。
-成功输出 `HBM_RAW_PASS two_b_buffers=1 shared_runtime=1 no_access_table_for_hbm=1`。
+加 `--hbm-mrs 78` 即让 B 为 NPU Pull 注册 78 个不同大小、非页对齐的 tensor，逐轮选择并复用同一个 output；不指定 rounds 时自动运行至少两轮完整 MR 轮换（156 批）。
+成功输出 `HBM_RAW_PASS npu_mrs=78 cpu_mrs=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1`（单 MR 为 npu_mrs=1）。
 出现 unresolved 时测试会保留进程/缓冲区，需先检查两端日志和确认传输停止。
 若 attach 已明确失败且没有未解决的传输，A 会通知 B 关闭源，避免 B 等待 attached 超时。
 
 本地无 Ascend 硬件时，`kvaf_batch_get_raw_addr_kernel_model_test` 运行实际 AIV 源码的 CPU 模型；
 `kvaf_hbm_read_test` 在关闭 CPU Pull 构建能力时，使用真实 NpuRuntime/TCP/source/client 与假 ACL/HCCP 验证纯 NPU Pull、每段一个 WQE、丢 ACK 和清理。
 `kvaf_hbm_read_with_ddr_test` 另外验证两种初始化顺序、DDR 失败/关闭/重新初始化不影响 raw READ，以及旧 PutHandle 被拒绝。
+上述两个集成测试还覆盖 78 MR 注册/探测、选择错误、部分注册失败及多 MR 丢失完成通知恢复。
+`kvaf_hbm_read_transport_test` 运行生产 Host 注册/缓存代码，验证 78 份不同 token/EID 的描述共用 output MR 和队列、缓存命中、上传失败、部分导入和重试清理。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
 
 ## 随机离散包性能测试
@@ -178,7 +207,8 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已
 
 - `--packets`：包数量，1..4096；兼容 `--blocks`。
 - `--packet-bytes`：每包字节数，所有包相同；兼容 `--block-bytes`。每包直接生成一个 WQE，长度须为 1..UINT32_MAX 且满足设备单次 READ 上限。
-- `--source-space-bytes`：B 注册的 HBM 空间大小，至少容纳所有包。以包大小划分槽位，随机抽取不重复槽位，源地址按随机顺序读取；不足一个槽位的尾部不使用。
+- `--source-space-bytes`：B 每个注册 tensor 的 HBM 空间大小，至少容纳本批所有包。以包大小划分槽位，随机抽取不重复槽位，源地址按随机顺序读取；不足一个槽位的尾部不使用。
+- `--source-count`：注册多少个独立 tensor/MR（默认 1，范围 1～4096），共用连接，逐批轮换；HBM 总空间约为 source-count × source-space-bytes。多 MR 时预热至少覆盖全部 MR/output 组合，实际 warmup 会打印。各 MR 的数据不同，同一 MR 再次使用时改变数据；期望值生成和校验不计入传输时间。
 - `--seed`：默认 123，可复现布局。目的 output 连续排列，首尾各留 64 字节 guard。
 - `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
 - `--max-inflight-total`：默认 2048，含义与 BatchGet 一致。
@@ -196,3 +226,23 @@ Python `batch_get_raw_addr()` 完整调用时间，未打开内部计时。
 每轮交替输入内容，并检查 NPU 消费者和完整回读数据（含 guard）。
 `NPU_HBM_BENCH_PROFILE_STAGE` 另列读取端接口/校验时间及生产端 ready/release_batch 时间。
 源与目的进程的时钟不相减。两端初始化与清理时间不纳入稳定态逐批统计。
+
+### 78 MR 的纯 NPU 验收与性能测量
+
+无需启动 CPU service。以下沿用测试机曾通过的 device/fullmesh EID 映射：
+
+```bash
+python tests/python/bench_hbm_read_raw_addr.py \
+  --device-a 7 --device-b 6 \
+  --npu-eid-a-raw 000000000047050000100000df00f807 \
+  --npu-eid-b-raw 000000000047050000100000df00d806 \
+  --source-count 78 --source-space-bytes 1048576 \
+  --packets 1024 --packet-bytes 656 \
+  --warmup 78 --iterations 156 --profile-iterations 78 \
+  --validate-ranges \
+  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+```
+
+注册成功日志包含 `HBM_READ_READY ... jettys=4 mrs=78 probe=all_mrs_all_lanes_pass`。
+通过标志为 `NPU_HBM_BENCH_PASS ... source_count=78`。功能验收可保留 validate-ranges，
+比较默认快速路径性能时去掉此开关，并使用相同包数/包大小/空间大小对照 source-count=1。

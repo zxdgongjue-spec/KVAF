@@ -69,7 +69,7 @@ Status Exchange(const std::string& address,Request r,const std::vector<Span>& sp
   if(!ok) {close(fd);return Status::InDoubt("HBM control response lost; retain source/output and resolve");}
   if(out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=sizeof(Response) ||
       out->header.command!=(r.header.command|0x8000U) || out->source_id!=r.source_id || out->epoch!=r.epoch ||
-      out->client!=r.client || out->sequence!=r.sequence || out->code>unsigned(StatusCode::kInDoubt)) {
+      out->client!=r.client || out->sequence!=r.sequence || out->mr_id!=r.mr_id || out->code>unsigned(StatusCode::kInDoubt)) {
     close(fd);return Status::InDoubt("HBM response identity/version mismatch");
   }
   if(connection && out->reserved==1U)*connection=fd;

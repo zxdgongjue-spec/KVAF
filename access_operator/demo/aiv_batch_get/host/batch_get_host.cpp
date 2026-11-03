@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <new>
 #include <string>
@@ -50,6 +51,10 @@ struct LocalPathRegistration {
 
 // A local buffer has stable heap storage because it is an opaque handle held
 // by the caller. Zero-reference entries stay cached until transport teardown.
+struct RemoteEntityView {
+  void* data{};
+  bool ready{};
+};
 struct KvafBatchGetLocalBuffer {
   KvafBatchGetTransport *transport = nullptr;
   std::vector<LocalPathRegistration> path_registrations{};
@@ -58,6 +63,9 @@ struct KvafBatchGetLocalBuffer {
   uint32_t reference_count = 0U;
   void *device_entities = nullptr;
   uint64_t device_channel_entity = 0U;
+  // Only descriptor storage varies by remote MR. The local registrations
+  // and all SQ/CQ addresses remain shared. MR 1 uses device_entities above.
+  std::map<uint64_t, RemoteEntityView> remote_entities;
 };
 
 // A USER_CTL SQ/CQ is strictly single-producer/single-consumer from the AIV
@@ -65,6 +73,12 @@ struct KvafBatchGetLocalBuffer {
 // Jetty per core rather than sharing producer/consumer indices.
 using DirectAivWorker = hccp::DeviceAivWorkerResources;
 
+struct RemoteMemoryRegistration {
+  DirectMemory memory{};
+  uint64_t base{}, bytes{};
+  std::vector<void*> imports;
+  bool ready{};
+};
 struct KvafBatchGetTransport {
   DirectHccpApi api{};
   hccp::DirectHccpSession *session = nullptr;
@@ -73,6 +87,7 @@ struct KvafBatchGetTransport {
   // and transport token. Workers are striped over these paths.
   std::vector<hccp::DeviceAivPathResources> paths{};
   DirectMemory peer_memory{};
+  std::map<uint64_t, RemoteMemoryRegistration> remote_memories;
   // Local HBM registrations are keyed by the exact caller-visible (addr,
   // bytes) pair. Heap ownership keeps opaque LocalBuffer handles stable.
   std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> local_buffers{};
@@ -197,6 +212,8 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
 
 void ReleaseLocalBufferResources(KvafBatchGetTransport *transport, KvafBatchGetLocalBuffer *local) {
   if (transport == nullptr || local == nullptr) return;
+  for (auto& view : local->remote_entities) if (view.second.data) (void)aclrtFree(view.second.data);
+  local->remote_entities.clear();
   if (local->device_entities != nullptr) {
     (void)aclrtFree(local->device_entities);
     local->device_entities = nullptr;
@@ -351,8 +368,18 @@ bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t d
   return true;
 }
 
+extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport**);
+
 void ReleaseTransport(KvafBatchGetTransport *transport) {
   if (transport == nullptr) {
+    return;
+  }
+  if (transport->remote_memories.size()>1) {
+    // Multi-MR teardown must retire queues before any imported segment. Keep
+    // the legacy void API conservative: a failed checked close retains state.
+    auto* owned=transport;
+    if (KvafBatchGetTransportClose(&owned))
+      std::fprintf(stderr,"[KVAF_AIV] MULTI_MR_TEARDOWN_PENDING transport_retained=1\n");
     return;
   }
   if (!transport->local_buffers.empty()) {
@@ -572,6 +599,8 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
                "local_hbm=deferred_acquire\n",
                static_cast<unsigned long long>(host_ddr_bytes), entity_count,
                peer_local_eid_count);
+  state->remote_memories.emplace(1, RemoteMemoryRegistration{
+      state->peer_memory, reinterpret_cast<uint64_t>(host_ddr), host_ddr_bytes, {}, true});
   *transport = state;
   return KVAF_BATCH_GET_SUCCESS;
 
@@ -654,6 +683,10 @@ extern "C" int32_t KvafBatchGetLocalBufferDiscard(KvafBatchGetLocalBuffer **hand
       r.token_handle = nullptr;
     }
   }
+  for (auto& view : local->remote_entities) if (view.second.data) {
+    if (aclrtFree(view.second.data) != ACL_SUCCESS) return KVAF_BATCH_GET_RUNTIME_ERROR;
+    view.second={};
+  }
   if (local->device_entities) {
     if (aclrtFree(local->device_entities) != ACL_SUCCESS) return KVAF_BATCH_GET_RUNTIME_ERROR;
     local->device_entities = nullptr;
@@ -690,6 +723,15 @@ extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport **handle) {
     auto* local = t->local_buffers.back().get();
     if (KvafBatchGetLocalBufferDiscard(&local)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
   }
+  for (auto& entry : t->remote_memories) {
+    for (size_t i=0;i<entry.second.imports.size();++i) {
+      auto& handle=entry.second.imports[i];
+      if (handle) {
+        if (t->api.rmem_unimport(t->paths[i].device_context,handle)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+        handle=nullptr;
+      }
+    }
+  }
   for (auto& p : t->paths) {
     if (p.device_peer_memory_import) {
       if (t->api.rmem_unimport(p.device_context, p.device_peer_memory_import)) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
@@ -719,5 +761,62 @@ extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport *t) {
       jetty.handle = nullptr;
     }
   }
+  return KVAF_BATCH_GET_SUCCESS;
+}
+
+extern "C" int32_t KvafBatchGetTransportAddRemoteMemory(KvafBatchGetTransport* t,
+    uint64_t mr_id, uint64_t base, uint64_t bytes) {
+  if (!t || mr_id<2 || mr_id>4096 || !base || !bytes || bytes>UINT64_MAX-base ||
+      t->remote_memories.count(mr_id) || !t->local_buffers.empty()) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  DirectMemory memory{};std::array<uint8_t,hccp::kEidBytes> route{}, original_route{};
+  DirectMemory original{};
+  if (!hccp::LoadPeerMemory(t->peer_link,base,&memory,&route) ||
+      !hccp::LoadPeerMemory(t->peer_link,t->remote_memories.at(1).base,&original,&original_route) ||
+      route!=original_route || memory.token_value!=t->peer_memory.token_value ||
+      memory.registered_address!=base || memory.registered_bytes!=bytes)
+    return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  // Own even a partially returned provider handle before any import call.
+  auto& remote=t->remote_memories[mr_id];
+  remote.memory=memory;remote.base=base;remote.bytes=bytes;remote.imports.resize(t->paths.size());
+  for (size_t i=0;i<t->paths.size();++i)
+    if (!ImportRemoteMemory(t->api,t->paths[i].device_context,memory,&remote.imports[i]))
+      return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  remote.ready=true;return KVAF_BATCH_GET_SUCCESS;
+}
+
+extern "C" int32_t KvafBatchGetLocalBufferAcquireForRemote(KvafBatchGetTransport* t,
+    uint64_t mr_id, void* output, uint64_t bytes, KvafBatchGetLocalBuffer** out, uint64_t* entity) {
+  if (!t || !out || !entity) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  auto remote=t->remote_memories.find(mr_id);
+  if (remote==t->remote_memories.end() || !remote->second.ready) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  auto status=KvafBatchGetLocalBufferAcquire(t,output,bytes,out,entity);
+  if (status || mr_id==1) return status;
+  auto* local=*out;
+  auto existing=local->remote_entities.find(mr_id);
+  if (existing!=local->remote_entities.end() && existing->second.ready) {
+    *entity=reinterpret_cast<uint64_t>(existing->second.data);return KVAF_BATCH_GET_SUCCESS;
+  }
+  const auto& mr=remote->second;
+  std::vector<KvafBatchGetDirectUrmaEntity> entities(
+      t->entity_templates.begin(),t->entity_templates.begin()+t->worker_count);
+  const auto eid=ReverseEidForAivWqe(mr.memory.wqe_eid);
+  for (uint32_t i=0;i<t->worker_count;++i) {
+    auto& e=entities[i];const auto& local_mr=local->path_registrations[t->workers[i].path_index].memory;
+    e.remote_host_ddr_address=mr.base;e.remote_host_ddr_size=mr.bytes;
+    e.remote_token_id=mr.memory.token_id;e.remote_token_value=mr.memory.token_value;
+    std::memcpy(e.remote_eid,eid.data(),eid.size());
+    e.local_hbm_address=local->output_hbm_address;e.local_hbm_size=local->output_hbm_bytes;
+    e.local_token_id=local_mr.token_id;e.local_token_value=local_mr.token_value;
+  }
+  // Retain incomplete allocations as well. A failed upload is never exposed
+  // to the kernel; a later call may finish it, or Close frees its storage.
+  auto& view=local->remote_entities[mr_id];
+  const auto n=t->worker_count*sizeof(entities.front());
+  if ((!view.data && aclrtMalloc(&view.data,n,ACL_MEM_MALLOC_NORMAL_ONLY)!=ACL_SUCCESS) || !view.data ||
+      aclrtMemcpy(view.data,n,entities.data(),n,ACL_MEMCPY_HOST_TO_DEVICE)!=ACL_SUCCESS) {
+    KvafBatchGetLocalBufferRelease(local);*out=nullptr;*entity=0;
+    return KVAF_BATCH_GET_RUNTIME_ERROR;
+  }
+  view.ready=true;*entity=reinterpret_cast<uint64_t>(view.data);
   return KVAF_BATCH_GET_SUCCESS;
 }

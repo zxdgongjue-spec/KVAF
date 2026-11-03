@@ -8,6 +8,7 @@
 #include "offload_fake_server.h"
 #endif
 #include <poll.h>
+#include <map>
 #include "aiv_model/kernel_operator.h"
 #define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_raw_addr_aiv.asc"
@@ -31,6 +32,7 @@ struct KvafBatchGetLocalBuffer {
 struct KvafBatchGetTransport {
   kvaf::peer::PeerLink* link;std::uint64_t base,bytes;
   std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> buffers;
+  std::map<uint64_t,std::pair<uint64_t,uint64_t>> memories;
 };
 extern "C" int32_t KvafExecuteBatchGetRawAddrLoadKernel(const char*){return 0;}
 extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(void* base,std::uint64_t bytes,std::uint32_t cores,
@@ -46,7 +48,8 @@ extern "C" int32_t KvafBatchGetTransportCreateWithPeerLink(void* base,std::uint6
     Require(link->CreateChannel(region.base,key,32,eid,region.token_value,2+i,2,&remote,&remote_bytes,&tp,&psn).ok(),"bind NPU-to-NPU channel");
     Require(remote_bytes==32 && remote[15]==3 && psn==1 && tp==i+1,"NPU target raw descriptor");
   }
-  ++raw_transports;*out=new KvafBatchGetTransport{link,reinterpret_cast<std::uint64_t>(base),bytes};return 0;
+  ++raw_transports;*out=new KvafBatchGetTransport{link,reinterpret_cast<std::uint64_t>(base),bytes};
+  (*out)->memories[1]={reinterpret_cast<uint64_t>(base),bytes};return 0;
 }
 extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport* transport,void* output,std::uint64_t bytes,
     KvafBatchGetLocalBuffer** out,std::uint64_t* entity){
@@ -56,6 +59,17 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport* transpo
   ++local_buffers;++local_acquires;
   transport->buffers.emplace_back(new KvafBatchGetLocalBuffer{base,bytes,transport->base,transport->bytes,transport,1});
   *out=transport->buffers.back().get();*entity=reinterpret_cast<uint64_t>(*out);return 0;
+}
+extern "C" int32_t KvafBatchGetTransportAddRemoteMemory(KvafBatchGetTransport* t,uint64_t mr,uint64_t base,uint64_t bytes){
+  kvaf::peer::PeerRegion region;Require(t->link->LookupRegion(base,&region).ok() && region.length==bytes,"lookup additional MR");
+  t->memories[mr]={base,bytes};return 0;
+}
+extern "C" int32_t KvafBatchGetLocalBufferAcquireForRemote(KvafBatchGetTransport* t,uint64_t mr,void* output,uint64_t bytes,
+    KvafBatchGetLocalBuffer** out,uint64_t* entity){
+  if(!t->memories.count(mr))return -1;
+  auto s=KvafBatchGetLocalBufferAcquire(t,output,bytes,out,entity);
+  if(!s){(*out)->source_base=t->memories.at(mr).first;(*out)->source_bytes=t->memories.at(mr).second;}
+  return s;
 }
 extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer* p){
   if(p){Require(p->references>0,"release live output registration");--p->references;}}
@@ -199,7 +213,66 @@ void RuntimeInitialization() {
   Require(!raw_transports&&!local_buffers&&!registrations&&!sessions,"Runtime lifecycle released raw resources");
   raw_calls=0;raw_wqes=0;quiesces=0;
 }
+void MultiMemory() {
+  raw_mode=true;fake_device=0;
+  std::vector<std::vector<uint8_t>> storage;
+  std::vector<kvaf::ConstBufferView> tensors;
+  for(unsigned i=0;i<78;++i)storage.emplace_back(4096+i*16,static_cast<uint8_t>(i+1));
+  for(auto& t:storage)tensors.push_back({t.data()+3,t.size()-3,kvaf::DeviceKind::kNpu});
+  kvaf::NpuPullHbmSource b(0,"00000000000000000000000000000001");kvaf::HbmReadTicket ticket;
+  auto duplicate=tensors;duplicate.push_back(tensors.front());
+  Require(!b.Register(duplicate,reinterpret_cast<void*>(1),&ticket).ok(),"reject overlapping source tensors");
+  Check(b.Register(tensors,reinterpret_cast<void*>(1),&ticket));Check(b.Listen("127.0.0.1:0"));
+  Require(ticket.source().mr_count()==78 && ticket.bytes==tensors.front().bytes,"ticket describes independent tensor sizes");
+  Proxy proxy("127.0.0.1:"+std::to_string(b.port()));
+  {
+    kvaf::HbmReader failed(0,2,2,2048,"fake.o");fail_memory_at=37;
+    Require(!failed.Attach(proxy.address,ticket,"00000000000000000000000000000002").ok(),"partial MR registration fails whole attach");
+    fail_memory_at=0;Check(failed.Shutdown());
+    Require(!registrations && !contexts && !jetties && !raw_transports,"partial registration safely unwound");
+  }
+  kvaf::HbmReader a(0,2,2,2048,"fake.o");const auto probes=raw_calls.load();
+  Check(a.Attach(proxy.address,ticket,"00000000000000000000000000000002"));
+  Require(raw_calls==probes+78 && registrations==78 && contexts==1 && jetties==4 && raw_transports==1,
+          "78 MRs probed over one connection and four target Jettys");
+  auto bad_ticket=ticket;bad_ticket.mr_bytes.back()++;
+  Require(!a.Attach(proxy.address,bad_ticket,"00000000000000000000000000000002").ok() && !a.Detach(bad_ticket).ok(),"full MR manifest bound to ticket");
+  kvaf::ReadyToken token;
+  Require(!b.Ready(&token).ok(),"multi-MR ready requires a tensor");
+  Require(!b.Ready({storage[0].data(),storage[0].size(),kvaf::DeviceKind::kNpu},&token).ok(),"ready matches exact tensor range");
+  std::vector<uint8_t> output(128,0xcc);int64_t src=7,dst=11,n=64;
+  auto read=[&](const kvaf::ReadyToken& r){return a.Read(r,{&src,1},{&dst,1},{&n,1},
+      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,true);};
+  const auto acquired=local_acquires.load();
+  for(unsigned i=0;i<156;++i) {
+    const auto index=(i*17)%78;
+    Check(b.Ready(tensors[index],&token));Require(token.mr_id==index+1,"Ready selects matching MR");
+    kvaf::ReadyToken repeat;Check(b.Ready(tensors[index],&repeat));Require(repeat.sequence==token.sequence,"repeat ready is same frozen batch");
+    Require(!b.Ready(tensors[(index+1)%78],&repeat).ok(),"cannot switch a frozen MR");
+    auto wrong=token;wrong.mr_id=(index+1)%78+1;
+    Require(!read(wrong).ok() && !a.pending(),"source rejects wrong MR before DMA");
+    const auto calls=raw_calls.load();
+    if(i==79) {
+      proxy.drop=unsigned(hr::Command::Complete);
+      Require(!read(token).ok() && a.pending(),"multi-MR lost completion retained");
+      Require(!a.Resolve(wrong).ok() && a.pending(),"wrong MR cannot resolve a pending batch");
+      Check(a.Resolve(token));
+    } else Check(read(token));
+    Require(raw_calls==calls+1,"one READ launch; no replay on recovery");
+    Require(!std::memcmp(output.data()+dst,static_cast<const uint8_t*>(tensors[index].data)+src,n),"MR switch copies selected tensor");
+    Require(output.front()==0xcc && output.back()==0xcc,"padding preserved");
+    Require(!b.ReleaseBatch(wrong).ok(),"wrong MR cannot release producer data");
+    Check(b.ReleaseBatch(token));
+  }
+  Require(local_acquires==acquired+1 && local_buffers==1 && raw_transports==1 && jetties==4,"switching MR reuses output registration and queues");
+  Check(b.Ready(tensors.back(),&token));src=tensors.back().bytes-32;
+  Require(!read(token).ok() && !a.pending(),"bounds follow selected MR");Check(b.ReleaseBatch(token));
+  Check(a.Detach(ticket));Check(b.Shutdown());
+  Require(!registrations && !contexts && !jetties && !raw_transports && !local_buffers,"multi-MR teardown complete");
+  raw_calls=0;raw_wqes=0;quiesces=0;
+}
 int main(){try{
+  MultiMemory();
   RuntimeInitialization();
   raw_mode=true;fake_device=0;
   constexpr size_t source_bytes=400128;

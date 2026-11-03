@@ -23,15 +23,19 @@ def producer(pipe, args, ddr_ticket):
     stream = torch.npu.Stream(device=args.device_b)
     hbm_cpu = torch.zeros(SOURCE_BYTES, dtype=torch.uint8, device=f"npu:{args.device_b}")
     # Exercise a contiguous Tensor whose address is deliberately not page aligned.
-    hbm_a_storage = torch.zeros(SOURCE_BYTES + 8192, dtype=torch.uint8, device=f"npu:{args.device_b}")
-    raw_offset = (-hbm_a_storage.data_ptr()) % 4096 + 0xC00
-    hbm_a = hbm_a_storage[raw_offset:raw_offset + SOURCE_BYTES]
-    assert hbm_a.is_contiguous() and hbm_a.data_ptr() % 4096 == 0xC00
+    hbm_a_tensors = []
+    for i in range(args.hbm_mrs):
+        storage = torch.zeros(SOURCE_BYTES + 8192 + i * 64, dtype=torch.uint8, device=f"npu:{args.device_b}")
+        raw_offset = (-storage.data_ptr()) % 4096 + 0xC00
+        tensor = storage[raw_offset:raw_offset + SOURCE_BYTES + i * 64]
+        assert tensor.is_contiguous() and tensor.data_ptr() % 4096 == 0xC00
+        hbm_a_tensors.append(tensor)
     cpu_source = kvaf.CpuPullHbmSource(args.device_b, args.npu_eid_b_cpu)
     a_source = kvaf.NpuPullHbmSource(args.device_b, args.npu_eid_b_raw)
+    raw_batch = None
     try:
         cpu_desc = cpu_source.register(ddr_ticket, hbm_cpu)
-        ticket = a_source.register(hbm_a)
+        ticket = a_source.register(hbm_a_tensors if args.hbm_mrs > 1 else hbm_a_tensors[0])
         port = a_source.listen("127.0.0.1:0")
         pipe.send(("export", (f"127.0.0.1:{port}", ticket)))
         pipe.send(("cpu_source", cpu_desc))
@@ -43,12 +47,13 @@ def producer(pipe, args, ddr_ticket):
             return
         assert a_source.connected
         for round_id in range(args.rounds):
+            hbm_a = hbm_a_tensors[round_id % args.hbm_mrs]
             with torch.npu.stream(stream):
                 hbm_cpu.copy_(pattern(torch, round_id), non_blocking=True)
-                hbm_a.copy_(pattern(torch, round_id + 101), non_blocking=True)
+                hbm_a[:SOURCE_BYTES].copy_(pattern(torch, round_id + 101), non_blocking=True)
             stream.synchronize()
             cpu_batch = cpu_source.ready()
-            raw_batch = a_source.ready()
+            raw_batch = a_source.ready(hbm_a) if args.hbm_mrs > 1 else a_source.ready()
             try:
                 a_source.release_batch(raw_batch)
             except RuntimeError:
@@ -68,8 +73,11 @@ def producer(pipe, args, ddr_ticket):
     except BaseException:
         pipe.send(("error", traceback.format_exc()))
         try:
-            if a_source.frozen:
-                a_source.cancel_batch(a_source.ready())
+            if a_source.frozen and raw_batch is not None:
+                try:
+                    a_source.release_batch(raw_batch)
+                except RuntimeError:
+                    a_source.cancel_batch(raw_batch)
             if cpu_source.frozen:
                 cpu_source.cancel_batch(cpu_source.ready())
             a_source.shutdown()
@@ -92,10 +100,15 @@ def main():
     parser.add_argument("--batch-get-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_kernels.o")
     parser.add_argument("--batch-put-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o")
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--hbm-mrs", type=int, default=1, help="separate NPU Pull tensors sharing one connection")
+    parser.add_argument("--rounds", type=int, default=None)
     args = parser.parse_args()
-    if args.device_a == args.device_b or args.rounds < 2:
-        parser.error("use two different NPUs and at least two rounds")
+    if not 1 <= args.hbm_mrs <= 4096:
+        parser.error("hbm-mrs must be in 1..4096")
+    if args.rounds is None:
+        args.rounds = max(3, 2 * args.hbm_mrs)
+    if args.device_a == args.device_b or args.rounds < max(2, args.hbm_mrs):
+        parser.error("use two different NPUs and enough rounds to visit all MRs (at least two)")
     import torch
     import torch_npu  # noqa: F401
     import kvaf
@@ -135,6 +148,7 @@ def main():
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
         for round_id in range(args.rounds):
             cpu_batch, raw_batch = receive(parent, "ready")
+            assert raw_batch.mr_id == round_id % args.hbm_mrs + 1
             put = runtime.prepare_put(KEYS, [656] * 3)
             source_offsets = torch.tensor(OFFSETS, dtype=torch.int64, device="cpu")
             cpu_destinations = torch.tensor([e.address for e in put.entries],
@@ -167,7 +181,7 @@ def main():
             runtime.batch_free(KEYS)
             parent.send(("reuse", round_id))
             assert receive(parent, "released") == round_id
-            print(f"HBM_RAW_ROUND_PASS round={round_id} raw_bytes={sum(RAW_LENGTHS)} "
+            print(f"HBM_RAW_ROUND_PASS round={round_id} mr_id={raw_batch.mr_id} raw_bytes={sum(RAW_LENGTHS)} "
                   "ddr_batch_get=1 cpu_pull=1 padding_checked=1 npu_consumer_checked=1", flush=True)
         runtime.detach_hbm(export)
         parent.send(("detached", None))
@@ -175,7 +189,7 @@ def main():
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
-        print(f"HBM_RAW_PASS two_b_buffers=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1", flush=True)
+        print(f"HBM_RAW_PASS npu_mrs={args.hbm_mrs} cpu_mrs=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1", flush=True)
     except BaseException:
         traceback.print_exc()
         if producer_waiting_for_attach and not runtime.pending_raw_addr and not runtime.pending_offload:

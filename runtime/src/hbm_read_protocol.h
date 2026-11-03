@@ -4,24 +4,24 @@
 
 namespace kvaf::hbm_read {
 constexpr std::uint32_t kMagic = 0x4b564852; // KVHR, independent of KVCP/KVRP
-constexpr std::uint16_t kVersion = 4; // Only identity leases; ranges stay on the reader NPU.
-enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Complete=6, Cancel, Close, AcquireRaw };
+constexpr std::uint16_t kVersion = 5; // Multi-MR identity leases; ranges stay on the reader NPU.
+enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Complete=6, Cancel, Close, AcquireRaw, Memory };
 enum class State : std::uint32_t { Registered, Connected, Ready, Reading, Done };
 using Span = offload::Span;
 struct Request {
   peer::MessageHeader header{};
   std::uint32_t token{}, candidate{}, channel{}, count{};
-  std::uint64_t source_id{}, epoch{}, client{}, sequence{};
+  std::uint64_t source_id{}, epoch{}, client{}, sequence{}, mr_id{1};
   offload::Endpoint endpoint{};
 };
 struct Response {
   peer::MessageHeader header{};
   std::uint32_t code{}, candidates{}, state{}, reserved{};
-  std::uint64_t source_id{}, epoch{}, client{}, sequence{}, checksum{};
+  std::uint64_t source_id{}, epoch{}, client{}, sequence{}, checksum{}, mr_id{1}, mr_count{};
   offload::Endpoint endpoint{};
   char detail[256]{};
 };
-static_assert(sizeof(Request) == 440 && sizeof(Response) == 704, "KVHR wire ABI changed");
+static_assert(sizeof(Request) == 448 && sizeof(Response) == 720, "KVHR wire ABI changed");
 inline Request Make(Command c, const HbmReadTicket& t, std::uint64_t client) {
   Request r{};
   r.header = {kMagic, kVersion, static_cast<std::uint16_t>(c), sizeof(Request)};
