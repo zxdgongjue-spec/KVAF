@@ -4,6 +4,9 @@
 `tests/run_remote_cpu_scatter_perf.sh`。固定选择 `cpu_push_scatter`，使用真实
 CPU 服务、URMA WRITE、AIV GM→UB→output，不走 mock。
 
+临时 HBM staging 所属的持久 workspace 使用 `ACL_MEM_MALLOC_HUGE_FIRST` 分配，
+优先使用大页，大页不足时允许回退普通页；分配成功不代表一定获得了大页。
+
 **一个样本就是一次同步 BatchGet，不是多次调用的总耗时，也不是单 token 耗时。**
 默认 `1024 blocks × 4 tokens/block × 656 B`，每次取满 4096 个 token，
 有效载荷为 **2,686,976 B**。`--request-length` 只控制输入 Tensor 容量，

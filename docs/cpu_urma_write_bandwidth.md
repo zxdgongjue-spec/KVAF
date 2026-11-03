@@ -10,6 +10,9 @@ BatchGet、scatter、清单构建、CPU gather 或 payload memcpy。源数据填
 初始化复用已验证的 CPU-push 注册和 Jetty 路径，因而仍需要既有 NPU binding、scatter/BatchPut
 kernel 对象。初始化会执行一次现有的 BatchPut 连通性探测，该探测不属于测量。
 
+目标 HBM 复用 scatter workspace，使用 `ACL_MEM_MALLOC_HUGE_FIRST` 分配：优先大页，
+大页不足时允许回退普通页。该分配位于计时窗口之外。
+
 测试占用专用 Runtime 会话。开始测试时暂停并 join 普通 notify worker，由同一线程独占队列；
 测试后直接 shutdown，不再在该会话中运行 BatchGet。生产 BatchGet 数据路径未增加分支。
 

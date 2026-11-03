@@ -116,7 +116,9 @@ struct ScatterBatchGet::Impl {
     // Private AIV build-ready lines plus the shared failure line. CPU layout
     // and the request/notify/done protocol remain unchanged.
     args.workspace_bytes = layout.bytes + uint64_t(config.npu_core_count + 1) * 64;
-    if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+    // Prefer huge pages for the persistent CPU WRITE target and scatter staging;
+    // ACL may fall back to normal pages when huge pages are unavailable.
+    if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
         aclrtMemset(workspace, args.workspace_bytes, 0, args.workspace_bytes) != ACL_SUCCESS)
       return Error("allocate scatter workspace");
     uint32_t physical = 0;
