@@ -160,6 +160,9 @@ class GatherPerfSummaryTest(unittest.TestCase):
             self.assertEqual(float(results["e2e_summary"]["p95_us"]), 1950.0)
             self.assertEqual(float(results["profile_e2e_summary"]["mean_us"]), 2150.0)
             self.assertEqual(results["profile_host_mean"]["first_sequence"], "123")
+            self.assertEqual(results["e2e_summary"]["timing_contract"], "async_call_to_stream_completion")
+            self.assertTrue(all(row["timing_contract"] == "synchronous_call_with_status_check"
+                                for row in host + cores))
             # Host wait includes current-batch device/D2H completion. It has no
             # separately measured READ stage, so never fill AIV cells in it.
             self.assertEqual(results["profile_host_mean"]["read_cycles"], "")
@@ -169,6 +172,12 @@ class GatherPerfSummaryTest(unittest.TestCase):
             self.assertEqual([float(row["total_cycles"]) for row in core_means], [6, 12, 18])
             self.assertTrue(all(row["prepare_us"] == "" and row["wait_us"] == "" for row in core_means))
             self.assertTrue(all(row["run_id"] == metadata["run_id"] for row in summary + e2e + host + cores))
+
+    def test_async_baseline_rejects_forced_status_readback(self):
+        with patch.dict(os.environ, {"KVAF_RUN_NPU_TESTS": "1", "KVAF_AIV_GATHER_CHECK_STATUS": "1"}, clear=True), \
+             contextlib.redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(perf.main(), 2)
+        self.assertIn("unset KVAF_AIV_GATHER_CHECK_STATUS", output.getvalue())
 
     def test_csv_summary_bandwidth_uses_p50_despite_slow_outliers(self):
         metadata = self.csv_metadata()
@@ -269,7 +278,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         self.assertEqual(metadata["run_directory"], "20261031_093235-cores3-token-bytes656-request-count1")
         self.assertEqual(metadata["started_at_local"], "2026-10-31T09:32:35+08:00")
         self.assertEqual(metadata["timezone"], "Asia/Shanghai")
-        self.assertEqual(metadata["schema_version"], 2)
+        self.assertEqual(metadata["schema_version"], 3)
 
     def test_csv_rejects_partial_or_invalid_profile_batches(self):
         with tempfile.TemporaryDirectory() as directory:

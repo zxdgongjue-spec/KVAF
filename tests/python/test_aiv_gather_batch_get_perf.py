@@ -207,7 +207,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -223,7 +223,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
         "cpu_profile": "external", "kernel_path": kernel, "put_kernel_path": put_kernel,
         "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR", ""),
-        "request_plan": "fixed_random", "timing_contract": "synchronous_call_with_status_check",
+        "request_plan": "fixed_random", "timing_contract": "async_call_to_stream_completion",
     }
 
 
@@ -333,7 +333,10 @@ def export_csv_results(
         with path.open("x", encoding="utf-8-sig", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=[*metadata_columns, *dict.fromkeys(columns)])
             writer.writeheader()
-            writer.writerows({**metadata, **row} for row in rows)
+            writer.writerows({**metadata, **row,
+                              "timing_contract": "synchronous_call_with_status_check"
+                              if row.get("profile") == "on" else metadata["timing_contract"]}
+                             for row in rows)
         paths.append(path)
     return paths
 
@@ -351,6 +354,10 @@ def main() -> int:
         return 77
     if os.environ.get("KVAF_AIV_GATHER_PROBE"):
         print("FAIL: gather prefix probes cannot collect performance; use test_aiv_gather_pipeline_debug.py",
+              file=sys.stderr)
+        return 2
+    if os.environ.get("KVAF_AIV_GATHER_CHECK_STATUS") == "1":
+        print("FAIL: unset KVAF_AIV_GATHER_CHECK_STATUS for the asynchronous performance baseline",
               file=sys.stderr)
         return 2
     try:
@@ -399,7 +406,7 @@ def main() -> int:
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} "
             f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={PROFILE_SAMPLES} "
-            "plan=fixed_random timing=synchronous_call_with_status_check",
+            "plan=fixed_random timing=async_call_to_stream_completion",
             flush=True,
         )
         runtime.initialize(TABLE_CAPACITY * block_bytes, block_bytes)
@@ -424,11 +431,15 @@ def main() -> int:
         output = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8, device=device)
         torch.npu.synchronize()
 
-        def batch_get() -> None:
-            runtime.batch_get(view, indices, offsets, miss_count, rows, output, synchronize=True)
+        def batch_get(*, checked: bool = False) -> None:
+            runtime.batch_get(view, indices, offsets, miss_count, rows, output, synchronize=checked)
+            if not checked:
+                # Same timing contract as the direct benchmark: asynchronous
+                # submission followed by caller-owned completion, without D2H.
+                torch.npu.synchronize()
 
         # Check all payload bytes and the two untouched guard rows outside timing.
-        batch_get()
+        batch_get(checked=True)
         expected = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8)
         source_ids = indices_cpu.to(torch.int64) * TOKENS_PER_BLOCK + slots_cpu
         for start in range(0, REQUEST_COUNT, 128):
@@ -458,10 +469,10 @@ def main() -> int:
         if PROFILE_SAMPLES:
             print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={PROFILE_SAMPLES}", flush=True)
             runtime.start_gather_batch_get_profile()
-            batch_get()  # Warm the profiling path; exclude this sample.
+            batch_get(checked=True)  # Warm the profiling path; exclude this sample.
             for _ in range(PROFILE_SAMPLES):
                 begin = time.perf_counter_ns()
-                batch_get()
+                batch_get(checked=True)
                 elapsed = (time.perf_counter_ns() - begin) / 1000
                 snapshots.append(dict(runtime.gather_batch_get_profile()))
                 profile_calls_us.append(elapsed)

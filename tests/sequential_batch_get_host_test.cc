@@ -19,6 +19,8 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
+bool allow_queued_launches{};
+int async_memsets{}, status_copies{}, stream_syncs{};
 uint64_t kernel_result{};
 uint32_t profile_fault{};
 std::vector<uint64_t> sequences;
@@ -31,13 +33,16 @@ int aclrtFree(void* p) { if (p) { --allocations; std::free(p); } return 0; }
 int aclrtFreeHost(void* p) { return aclrtFree(p); }
 int aclrtMemset(void* p, size_t, int32_t v, size_t n) { std::memset(p, v, n); return 0; }
 int aclrtMemsetAsync(void* p, size_t, int32_t v, size_t n, aclrtStream) {
+  ++async_memsets;
   work.push_back([=] { std::memset(p, v, n); }); return 0;
 }
 int aclrtMemcpyAsync(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind, aclrtStream) {
+  ++status_copies;
   if (fail_copy) return 507035;
   work.push_back([=] { std::memcpy(d, s, n); }); return 0;
 }
 int aclrtSynchronizeStream(aclrtStream) {
+  ++stream_syncs;
   if (fail_sync) return 507034;
   for (auto& f : work) f(); work.clear(); return 0;
 }
@@ -49,7 +54,7 @@ extern "C" int32_t KvafScatterBatchGetLoadKernel(const char*) { loaded_mode = KV
 extern "C" int32_t KvafGatherBatchGetLoadKernel(const char*) { loaded_mode = KVAF_SEQ_GATHER; return 0; }
 int Launch(const KvafScatterBatchGetArgs* a) {
   // The previous request must finish before its workspace is reused.
-  assert(completed == launches);
+  assert(allow_queued_launches || completed == launches);
   const auto args = *a;
   ++launches; sequences.push_back(a->sequence);
   const auto result = args.scatter_probe && !old_probe_kernel && !kernel_result ?
@@ -217,6 +222,8 @@ int main() {
   using namespace kvaf;
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   unsetenv("KVAF_AIV_GATHER_PROBE");
+  // Keep strict status-failure coverage, now an explicit async diagnostic mode.
+  setenv("KVAF_AIV_GATHER_CHECK_STATUS", "1", 1);
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -495,6 +502,55 @@ int main() {
     assert(owner->SetGatherProfiling(false).ok()); // Cleanup preserves original failure.
     assert(!owner->Shutdown().ok() && allocations == 6);
     fail_sync = false;
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  unsetenv("KVAF_AIV_GATHER_CHECK_STATUS");
+  allow_queued_launches = true;
+  exec.execution.synchronize = false;
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    const auto copies = status_copies, syncs = stream_syncs, clears = async_memsets;
+    const auto done = completed;
+    fail_copy = true;  // Ordinary async work must never enqueue a status D2H.
+    assert(owner->Execute(exec).ok() && refs == 1);
+    assert(owner->Execute(exec).ok() && completed == done && refs == 1);
+    assert(status_copies == copies && stream_syncs == syncs && async_memsets == clears);
+    assert(owner->Drain().ok() && completed == done + 2);
+    assert(status_copies == copies && stream_syncs == syncs + 1);
+    fail_copy = false;
+    exec.execution.synchronize = true;
+    assert(owner->Execute(exec).ok());
+    assert(status_copies == copies + 1 && async_memsets == clears);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+    exec.execution.synchronize = false;
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    const auto copies = status_copies, done = completed;
+    assert(owner->Execute(exec).ok());
+    exec.execution.stream = reinterpret_cast<void*>(2);
+    assert(owner->Execute(exec).ok() && completed == done + 1);
+    assert(status_copies == copies);  // Stream switch fences without readback.
+    assert(owner->Shutdown().ok() && completed == done + 2 && !allocations && !refs);
+    exec.execution.stream = reinterpret_cast<void*>(1);
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    kernel_result = KVAF_SEQ_TIMEOUT;
+    assert(owner->Execute(exec).ok());
+    // As in direct async mode, stream completion does not inspect device status.
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+    kernel_result = 0;
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    const auto copies = status_copies, clears = async_memsets;
+    exec.execution.synchronize = true;
+    assert(owner->Execute(exec).ok());
+    GatherBatchGetProfile snapshot;
+    assert(owner->CopyGatherProfile(&snapshot).ok());
+    assert(status_copies == copies + 2 && async_memsets == clears);
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
   std::cout << "sequential Host lifecycle: PASS\n";

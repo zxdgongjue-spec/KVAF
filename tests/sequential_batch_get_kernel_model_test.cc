@@ -98,9 +98,10 @@ struct Fixture {
   int32_t active;
   ModelArgs args{};
   std::vector<uint8_t, AlignedAllocator<uint8_t>> remote, workspace;
-  std::vector<uint8_t> output, expected, valid;
-  std::vector<uint64_t> addresses;
-  std::vector<int32_t> indices, offsets, rows;
+  std::vector<uint8_t> output, expected;
+  std::vector<uint8_t, AlignedAllocator<uint8_t>> valid;
+  std::vector<uint64_t, AlignedAllocator<uint64_t>> addresses;
+  std::vector<int32_t, AlignedAllocator<int32_t>> indices, offsets, rows;
   std::vector<KvafSequentialStatus> status;
   std::vector<KvafGatherBatchGetCoreProfile> profiles;
   std::vector<KvafBatchGetQueueState> states;
@@ -115,6 +116,7 @@ struct Fixture {
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   uint64_t launch_vf_begin{};
   uint64_t descriptor_cache_lines{}, valid_table_cache_lines{};
+  uint64_t simt_input_cache_lines{}, row_cache_lines{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
@@ -193,6 +195,12 @@ struct Fixture {
       // Ignore partial boundary lines which unrelated allocations can share.
       if (address >= Address(valid.data()) && address + 64 <= Address(valid.data()) + valid.size())
         ++valid_table_cache_lines;
+      if ((address >= Address(addresses.data()) && address < Address(addresses.data()) + addresses.size() * 8) ||
+          (address >= Address(indices.data()) && address < Address(indices.data()) + indices.size() * 4) ||
+          (address >= Address(offsets.data()) && address < Address(offsets.data()) + offsets.size() * 4))
+        ++simt_input_cache_lines;
+      if (address >= Address(rows.data()) && address < Address(rows.data()) + rows.size() * 4)
+        ++row_cache_lines;
     }
     if (args.mode != KVAF_SEQ_SCATTER || Address(p) < (args.workspace & ~uint64_t(63)) ||
         Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
@@ -356,6 +364,7 @@ struct Fixture {
   void Run(bool success = true, bool allow_partial = false) {
     const auto cycles = aiv_model::cycle;
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
+    const auto old_row_cache_lines = row_cache_lines;
     if (args.mode == KVAF_SEQ_GATHER)
       std::fill(workspace.begin() + args.descriptor_offset, workspace.end(), 0xa7);
     expected = output;
@@ -393,6 +402,9 @@ struct Fixture {
       assert(aiv_model::mte2_copies == reads && aiv_model::mte3_copies == writes);
       assert(!push_requests);
       assert(!descriptor_cache_lines && !valid_table_cache_lines);
+      assert(!simt_input_cache_lines);
+      if (uint64_t(token) * args.sgl_size <= 65536)
+        assert(row_cache_lines == old_row_cache_lines);
     }
     if (success) assert(output == expected);
     else if (!allow_partial) CheckGuard();
@@ -440,8 +452,8 @@ void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 int main() {
   const auto& metadata = KvafGatherBatchGetAivKernelV3_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
-  // Publish the descriptor separately, then command/notify under one ordered
-  // tail CQ. Repeated calls wrap SQ/CQ and leave stale ACK/mailbox contents.
+  // Descriptor/command/notify share one ordered tail CQ when capacity permits.
+  // Repeated calls wrap SQ/CQ and leave stale ACK/mailbox contents.
   for (uint32_t cores : {1U, 3U, 8U}) {
     Fixture f(8193, 13, cores, KVAF_SEQ_GATHER, 6);
     for (uint32_t core = 0; core < cores; ++core) {
@@ -449,9 +461,12 @@ int main() {
       const auto rows = 8193ULL * (core + 1) / cores - 8193ULL * core / cores;
       const auto descriptor_wrs = (48 + rows * 16 + 65535) / 65536;
       auto& q = *f.queues[core * 2 + 1];
+      q.sq.resize(64 * 16);
+      f.control_entities[core * 2 + 1].sq_va = Address(q.sq.data());
+      f.control_entities[core * 2 + 1].sq_depth = 64;
       auto& s = f.states[core * 2 + 1];
       s.magic = 0x4b564151; s.initialized = 1;
-      s.sq_producer_index = q.pi = q.completed = 16 - descriptor_wrs - 1;
+      s.sq_producer_index = q.pi = q.completed = 64 - descriptor_wrs - 1;
       q.db = uint32_t(q.pi);
     }
     f.EnableProfile();
@@ -473,28 +488,49 @@ int main() {
           assert(f.scratch_cache_lines[core] == old_flushes[core]);
           continue;
         }
-        assert(q.write_batches.size() == old_batches[core] + 2);
+        assert(q.write_batches.size() == old_batches[core] + 1);
         const auto descriptor = f.args.remote_descriptor + core * f.args.lane_descriptor_bytes;
         std::vector<uint64_t> descriptor_writes;
         for (uint64_t offset = 0; offset < 48 + rows * 16; offset += 65536)
           descriptor_writes.push_back(descriptor + offset);
-        assert(q.write_batches[old_batches[core]] == descriptor_writes);
         const auto control = f.args.remote_control + core * 64;
-        assert((q.write_batches.back() == std::vector<uint64_t>{control + 16, control}));
-        assert(q.cq_completed - old_cqs[core] == 2 + f.ack_reads[core]);
+        descriptor_writes.push_back(control + 16);
+        descriptor_writes.push_back(control);
+        assert(q.write_batches.back() == descriptor_writes);
+        assert(q.cq_completed - old_cqs[core] == 1 + f.ack_reads[core]);
         // One clean for both source words; ACK READs still invalidate after CQ.
         assert(f.scratch_cache_lines[core] - old_flushes[core] == 1 + f.ack_reads[core]);
       }
     }
   }
+  // Combined publication still drains at the transport's physical WR limit.
+  // No notify may reach the CPU before all descriptor bytes and command.
+  for (uint32_t depth : {4U, 8U, 16U, 64U}) {
+    Fixture f(8193, 13, 1, KVAF_SEQ_GATHER, 1);
+    auto& q = *f.queues[1];
+    q.sq.resize(depth * 16);
+    f.control_entities[1].sq_va = Address(q.sq.data());
+    f.control_entities[1].sq_depth = depth;
+    f.EnableProfile();
+    for (uint32_t rows : {8193U, 1U, 8193U}) {
+      f.Next(rows);
+      const auto batches = q.write_batches.size();
+      const auto cq = q.cq_completed;
+      f.Run(); f.CheckProfiles();
+      const uint32_t writes = (48 + rows * 16 + 65535) / 65536 + 2;
+      const uint32_t waves = (writes + depth / 4 - 1) / (depth / 4);
+      assert(q.write_batches.size() - batches == waves);
+      assert(q.cq_completed - cq == waves + f.ack_reads[0]);
+    }
+  }
   {
     Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
     f.EnableProfile();
-    f.queues[1]->fail_cq_at = 1;  // Descriptor succeeds; notify tail CQ fails.
+    f.queues[1]->fail_cq_at = 0;  // Combined descriptor/notify tail CQ fails.
     f.Run(false);
     assert(f.status[0].result == KVAF_SEQ_CQ_ERROR && f.status[0].phase == KVAF_SEQ_NOTIFY);
     assert(f.states[1].poisoned && !f.ack_reads[0] && !f.data_reads);
-    assert(f.profiles[0].valid_mask == 0x47 && f.queues[1]->write_batches.size() == 2);
+    assert(f.profiles[0].valid_mask == 0x47 && f.queues[1]->write_batches.size() == 1);
     f.queues[1]->fail_cq_at = UINT64_MAX;
     f.Next(19); f.Run(false);  // A failed control queue cannot be reused.
     assert(f.status[0].result == KVAF_SEQ_QUEUE_ERROR);
@@ -526,7 +562,7 @@ int main() {
   }
   for (uint32_t probe = KVAF_GATHER_PROBE_ACK; probe <= KVAF_GATHER_PROBE_FIRST_READ; ++probe)
     for (uint32_t cores : {1U, 3U, 8U})
-      for (uint32_t sgl : {6U, 13U}) {
+      for (uint32_t sgl : {1U, 6U, 13U}) {
         Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, sgl);
         f.DataQueueDepth(4096); f.args.gather_probe = probe;
         for (uint32_t count : {8193U, 1U, 8193U}) {
@@ -563,7 +599,7 @@ int main() {
     f.Run(); f.CheckProfiles();
     const auto& q = *f.queues[0];
     const uint64_t doorbells = sgl == 6 ? 11 : 5;
-    assert(q.doorbells == doorbells && q.cq_completed == 1 && q.first_db_vfs == 2);
+    assert(q.doorbells == doorbells && q.cq_completed == 1 && q.first_db_vfs == 3);
     assert(f.profiles[0].data_wrs == (sgl == 6 ? 1366 : 631));
     assert(f.profiles[0].data_wqebbs == (sgl == 6 ? 4097 : 2522));
     assert(f.profiles[0].data_doorbells == doorbells);
@@ -620,6 +656,18 @@ int main() {
     f.Run(); f.CheckProfiles();
     assert((aiv_model::vf_calls > f.read_vf_begin[0]) == (uint64_t(token) * sgl <= 65536));
     f.Next(7); f.Run(); f.CheckProfiles();
+  }
+  {
+    Fixture f(257, 12000, 3, KVAF_SEQ_GATHER, 6);
+    f.EnableProfile(); f.Next(7);
+    const auto before = f.row_cache_lines;
+    f.Run(); f.CheckProfiles();
+    uint64_t expected = 0;
+    for (uint32_t core = 0; core < f.workers; ++core) {
+      const auto first = 7 * core / f.workers, last = 7 * (core + 1) / f.workers;
+      expected += (last * 4 - 1) / 64 - first * 4 / 64 + 1;
+    }
+    assert(f.row_cache_lines - before == expected); // Active lane, not capacity.
   }
   {
     Fixture f(1800, 13, 1, KVAF_SEQ_GATHER, 6);

@@ -6,7 +6,8 @@ AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
 `tests/python/test_aiv_gather_batch_get_perf.py`。
 
 当前 gather 与 direct 一样，关闭 AIV 的逐请求 `ValidateRows` 校验；输入由
-调用方保证合法。输入缓存维护、基础参数和请求数检查仍保留，六阶段打点
+调用方保证合法。SIMT 输入不再执行全量 Scalar Flush；只保留 Scalar 请求数、
+队列/ACK 的必要缓存维护，大 token 回退仅 Flush 本 lane 的输出行映射。基础参数和请求数检查仍保留，六阶段打点
 边界不变，因此 `input_us` 不会归零。当前 SGL 上限扩展到 13，需要同步重编
 NPU Runtime/Host/Python 与 gather kernel；CPU 服务和 wire 协议保持不变。
 
@@ -52,11 +53,11 @@ READ WR 从 staging 连续读取 24 KiB，直接写入 output 的六个指定 40
 
 ## 控制通知合批
 
-`publish` 仍先 WRITE 完整源清单并等待尾 CQ；随后将 command 和 notify
-两条 8 B WRITE 合批，在 SQ 容量允许时只敲一次 doorbell、等待一次有序尾 CQ。
-notify 尾 WQE 使用 strong place order 和 completion，确保 CPU 看到 sequence
-之前 command 已可见。正常队列下，publish 从三次提交/等待减少为两次；
-保留原有小 SQ 容量 drain，不合并清单与通知，不改变 CPU gather 或数据 READ。
+`publish` 将源清单的分段 WRITE、command 和 notify 两条 8 B WRITE 合批，
+在 SQ 容量允许时只敲一次 doorbell、等待一次有序尾 CQ。notify 尾 WQE 使用
+strong place order 和 completion，保留清单/command 先于 notify 的可见性约束。
+正常队列下，publish 从两次提交/等待减少为一次；小 SQ 仍按 WQEBB/WR 实际
+容量提前 drain。CPU gather、最终 ACK 和 payload READ 的协议不变。
 
 每 lane 的 64 B scratch 在通知前一次写好 sequence（+0）和 descriptor 地址
 （+16），对所在缓存行执行一次 clean/invalidate；两个 WRITE 不再复用同一源槽。
@@ -67,8 +68,10 @@ ACK 仍使用 +8，查询 CQ 完成后的缓存失效继续保留，避免读取
 
 ## 地址清单的 SIMT 构造与批量搬运
 
-`input` 已移除不再使用的 `valid_table` 缓存 Flush。地址表、indices、offsets、
-output_indices、请求数的缓存维护和基础参数检查继续保留。
+`input` 不再 Flush `valid_table`、地址表、indices、offsets 或全量 output_indices。
+这些数组在快速路径中由 SIMT 读取，Scalar DCCI 不能代替 SIMT 的缓存一致性；
+访问方式与 direct 保持一致。Scalar 读取的请求数仍失效一条缓存行；超过 64 KiB
+WR 的 Scalar 回退仅在进入回退后 Flush 当前 lane 的有效 output_indices 范围。
 
 `descriptor` 不再由 Scalar 逐条写 HBM 后遍历整份清单 Flush，改为：
 
@@ -188,9 +191,12 @@ token 字节数、SGL、表规模、seed、预热/采样次数、计数器频率
 和 CPU 服务地址。远端 CPU 日志开关仍记作 external，不假定它已经关闭。
 
 summary 按 `row_kind` 区分：`e2e_summary` 是无打点性能基线，
-`profile_e2e_summary` 是有打点、同口径的外层调用统计，另有
+`profile_e2e_summary` 是有打点且含状态/profile D2H 的同步调用统计，另有
 `profile_host_mean` 和各核的 `profile_core_mean`。通过 run_label、cores、
-request_count、token_bytes 等列筛选对照，避免把不同核或不同采集口径相加。
+request_count、token_bytes、timing_contract 等列筛选对照，避免把不同核或不同采集口径相加。
+无打点组使用 `async_call_to_stream_completion`；打点组使用
+`synchronous_call_with_status_check`。二者均等待本批完成，但后者额外回收诊断
+数据，差值包含 D2H 和校验成本，不能全部归为设备计时指令的开销。
 
 终端 `GATHER_PERF_RESULT` 和 summary 中 `e2e_summary`、`profile_e2e_summary`
 的 `useful_GiBps` 均按各自样本的 `p50_us` 计算：
@@ -215,8 +221,8 @@ summary 的 Host 和 AIV 行共享表头，但各自只填自己的指标：
 | profile_core_mean | input / descriptor / publish / wait_cpu / read / finalize / total 的 cycles 和 us | read_cycles，频率核实后有 read_us |
 
 例如 core total 约 190 us、Host total 约 234 us、Python E2E 约 287 us 时，
-Host 与 core 间的约 44 us 包含 Host 参数准备及输出 buffer acquire、launch
-和前置 status/profile memset、设备调度、kernel 打点区间外的 profile 初始化/
+Host 与 core 间的约 44 us 包含 Host 参数准备及输出 buffer acquire、launch、
+设备调度、kernel 打点区间外的 profile 初始化/
 导出与退出、状态/profile D2H、同步返回及 Host 收尾。Host 提交与设备执行可
 重叠，不能将各项调用耗时简单相加。多核应按每个样本的最早 kernel_start
 到最晚 kernel_finish 计算设备区间，不能用各核 total 的平均值替代整批时间。
@@ -237,13 +243,14 @@ build 期间 NIC 已在执行前面发布的 READ；CQ wait 只反映发布结�
 当 `clock_source=unverified` 时，AIV 的 read_us 等时间列留空，read_cycles
 仍在 profile_core_mean 行输出。这表示尚缺换算频率，不表示漏采 READ。
 
-CSV schema_version 为 2。所有耗时列以 `_us` 命名，不再导出 `_ns` 列；
+CSV schema_version 为 3，区分异步基线和同步诊断的 timing_contract。
+所有耗时列以 `_us` 命名，不再导出 `_ns` 列；
 Host 的内部 ns 在导出时除以 1000。AIV 保留原始 cycle 供诊断，六阶段、
 构造及 CQ 等待均有对应 `_us` 列；频率未核实时这些列留空，不猜测频率。
 测试开始时间仍以带时区的日期文本保存，便于对应目录。
 CSV I/O 在测量循环之外进行，不计入样本时间。
 开启打点时的外层调用计时包含本次同步和状态/profile D2H，快照的 Python
-复制在调用计时之外，便于与无打点组比较。
+复制在调用计时之外；与无打点组比较时需考虑诊断 D2H 和状态校验的差异。
 
 如果采样中途报错，已完成的样本仍会输出，summary 的 `sampling_status`
 行为 failed 并保留异常；没有采到的阶段文件只有表头，不伪造零耗时样本。
@@ -298,7 +305,8 @@ Jetty 和六阶段计时边界保持原样。数据仍由 NIC 从 CPU staging
    MTE3 批量搬到 SQ，环形队列跨尾时分两次搬运。PI、owner 和复制长度均按
    实际 64 B WQEBB 计算；尾部不足 SGL 的 WQE 也按实际长度紧密排列。
 3. READ 的两个 UB bank 各 32 KiB：VF 构造下一批时，MTE3 搬上一批；搬运完成后
-   Scalar 发布上一批 doorbell。UB 等 MTE3 完成即可复用，SQ 空间等尾 CQ
+   Scalar 按 direct 的三阶段调度发布前两批的 doorbell：MTE(n-1)、VF(n)、
+   commit(n-2)，尾部再排空剩余提交。UB 等 MTE3 完成即可复用，SQ 空间等尾 CQ
    才能复用。尾 WQE 的 completion/order 位在发布前设定，不修改已发布 WQE。
 
 快速路径条件为 `TOKEN_BYTES * GATHER_SGL_SIZE <= 65536`，覆盖当前
@@ -448,7 +456,9 @@ SU/MTE/VF 错误位，可继续对照本次二进制定位，不能沿用旧二�
 
 ## 计时范围
 
-每次调用显式 `synchronize=True`，当前批的状态回收也包含在本批完成之内。
+无打点基线使用 `synchronize=False`，随后由 Python 调用方同步到本批完成；
+正常异步路径不自动 D2H 回收 status，同流连续提交也不再隐式同步上批。
+预检与 profile 使用 `synchronize=True`，当前批的状态回收包含在本批完成之内。
 初始化、BatchPut、请求 Tensor 构造和结果校验不在测量循环内。预热后先采
 关闭 profile 的端到端延迟及有效 GiB/s，再单独开启 profile 采阶段数据。
 
@@ -468,7 +478,8 @@ SU/MTE/VF 错误位，可继续对照本次二进制定位，不能沿用旧二�
 这些子计数用于解释数据阶段，不与其总时间重复相加。
 
 Host 的 `prepare_ns` 覆盖 owner 内的参数检查及 output 注册，`launch_ns`
-覆盖状态清零及 launch 入队，`status_enqueue_ns` 覆盖状态/profile D2H 入队，
+只覆盖 launch 入队；status/profile 在设备入口完整初始化，不再逐批由 Host 清零。
+`status_enqueue_ns` 覆盖状态/profile D2H 入队，
 `wait_ns` 是设备执行及 D2H 的剩余完成等待，不是完整 kernel 耗时；
 `finish_ns` 覆盖结果校验与资源回收。
 `total_ns` 从上批 Drain 后的本批 owner 准备开始到回收结束，不包含 Python、
