@@ -8,24 +8,25 @@ std::atomic<int> payload_reads{0}, scratch_reads{0}, checksum_calls{0}, leases{0
 std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_read{false}, fail_checksum{false};
 struct SharedBackend final : p::Backend {
   std::vector<std::uint8_t>& pool;
-  p::Endpoint source{};
-  std::map<std::uint64_t,p::Endpoint> memories;
+  p::MemoryDesc source{};
+  p::ConnectionDesc connection{};
+  std::map<std::uint64_t,p::MemoryDesc> memories;
   bool closed{};
   explicit SharedBackend(std::vector<std::uint8_t>& v):pool(v){++leases;}
-  Status Allocate(std::uint64_t,p::Endpoint*) override { throw std::runtime_error("B must not allocate DDR"); }
-  Status Open(const p::Endpoint& s,p::Endpoint* cpu) override {
-    source=s; memories[1]=s; cpu->key_bytes=28;cpu->tp=1;cpu->psn=2;
+  Status Allocate(std::uint64_t,p::MemoryDesc*) override { throw std::runtime_error("B must not allocate DDR"); }
+  Status Open(const p::ConnectionDesc& peer,const p::MemoryDesc& s,p::ConnectionDesc* cpu) override {
+    connection=peer; source=s; memories[1]=s; cpu->key_bytes=28;cpu->tp=1;cpu->psn=2;
     for(unsigned i=0;i<4;++i){cpu->key[i][15]=4;cpu->key[i][20]=10+i;}
     return Status::OK();
   }
-  Status AddSource(std::uint64_t id,const p::Endpoint& s) override { memories[id]=s;return Status::OK(); }
+  Status AddSource(std::uint64_t id,const p::MemoryDesc& s) override { memories[id]=s;return Status::OK(); }
   Status SelectSource(std::uint64_t id) override {
     auto found=memories.find(id);if(found==memories.end())return Status::InvalidArgument("missing MR");
     source=found->second;return Status::OK();
   }
   Status ProbeToScratch(std::uint64_t offset,std::uint64_t bytes,std::uint64_t* hash) override {
     ++scratch_reads;
-    if(source.eid[15]==failed_route) return Status::Internal("retired candidate probe");
+    if(connection.eid[15]==failed_route) return Status::Internal("retired candidate probe");
     *hash=p::Hash(reinterpret_cast<const std::uint8_t*>(source.base+offset),bytes);
     return Status::OK();
   }
@@ -96,13 +97,17 @@ class SharedServer {
       if(!p::ReadBytes(fd,&req.header,sizeof(req.header))){close(fd);continue;}
       if(req.header.magic==kvaf::peer::kProtocolMagic)Peer(fd,req.header);
       else{
-        ReadTail(fd,&req);Require(req.count<=rp::kMaxSpans,"bounded spans");std::vector<rp::Span> spans(req.count);
+        Require(p::ReadBytes(fd,reinterpret_cast<char*>(&req)+sizeof(req.header),rp::RequestBytes(req.header.command)-sizeof(req.header)),"read control body");Require(req.count<=rp::kMaxSpans,"bounded spans");std::vector<rp::Span> spans(req.count);
         Require(p::ReadBytes(fd,spans.data(),spans.size()*sizeof(rp::Span)),"read spans");
+        if(req.header.command==unsigned(rp::Command::AddMemory)) {
+          Require(req.header.bytes==offsetof(rp::Request,connection),"CPU extra MR frame excludes connection tail");
+          Require(!req.connection.tp&&!req.connection.key_bytes,"connection was not transmitted with extra MR");
+        }
         if(req.header.command==unsigned(rp::Command::InspectSource))++inspect_calls;
         if(req.header.command==unsigned(rp::Command::Query))++query_calls;
         if(req.header.command==unsigned(rp::Command::Submit))++submit_calls;
         const auto response=service.Dispatch(req,spans);auto expected=req.header.command;
-        if(!drop.compare_exchange_strong(expected,0))p::WriteBytes(fd,&response,sizeof(response));
+        if(!drop.compare_exchange_strong(expected,0))p::WriteBytes(fd,&response,rp::ResponseBytes(req.header.command));
       }
       close(fd);
     }});

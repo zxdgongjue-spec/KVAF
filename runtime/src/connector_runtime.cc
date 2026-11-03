@@ -38,7 +38,7 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
                                   Uint64ArrayView lengths) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
   if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
-      !desc || !ready.sequence || !desc->bytes_for(ready.mr_id))
+      !desc || !ready.sequence || !ready.mr_id || ready.mr_id > 4096 || !desc->mr_length)
     return Status::InvalidArgument("CPU source, ReadyToken or put belongs to another Runtime/batch");
   // ReadyToken carries the source identity. This validates only local metadata;
   // the CPU checks the selected MR and batch before accepting the actual READ.
@@ -61,7 +61,7 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
   std::vector<std::pair<std::uint64_t, std::uint64_t>> destinations, reservations;
   for (std::size_t i = 0; i < copies.source.size(); ++i) {
     const auto n = copies.lengths[i];
-    const auto source_bytes = desc->bytes_for(ready.mr_id);
+    const auto source_bytes = desc->mr_length;
     if (copies.source[i] > source_bytes || n > source_bytes-copies.source[i] ||
         copies.destination[i] > p.region.length || n > p.region.length-copies.destination[i])
       return Status::InvalidArgument("CPU Pull range outside registered source/DDR");

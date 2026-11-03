@@ -387,7 +387,7 @@ class NpuPythonRuntime final {
     const auto acl_stream=acl_python::StreamFromPython(stream);
     // Transport caches (address, size) registrations until detach. Pin their
     // Python owners for the same lifetime so allocator reuse cannot alias an MR.
-    const auto source_key=py::make_tuple(source->source_id,source->source_epoch,source->source_bytes);
+    const auto source_key=py::make_tuple(source->source_id,source->source_epoch);
     if(!raw_outputs_.contains(source_key))raw_outputs_[source_key]=py::dict();
     auto outputs=raw_outputs_[source_key].cast<py::dict>();
     outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data),view.bytes)]=output;

@@ -5,7 +5,7 @@
 
 namespace kvaf::hbm_read {
 constexpr std::uint32_t kMagic = 0x4b564852; // KVHR, independent of KVCP/KVRP
-constexpr std::uint16_t kVersion = 6; // Receiver listens; Ready publishes an irrevocable batch.
+constexpr std::uint16_t kVersion = 7; // Receiver listens; Ready publishes an irrevocable batch.
 enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Complete=6, Cancel, Close, Memory=10, Retire };
 enum class State : std::uint32_t { Registered, Connected, Ready, Done };
 using Span = offload::Span;
@@ -13,19 +13,28 @@ struct Request {
   peer::MessageHeader header{};
   std::uint32_t token{}, candidate{}, channel{}, count{};
   std::uint64_t source_id{}, epoch{}, client{}, sequence{}, mr_id{1};
-  offload::Endpoint endpoint{};
+  offload::ConnectionDesc connection{};
 };
 struct Response {
   peer::MessageHeader header{};
   std::uint32_t code{}, candidates{}, state{}, reserved{};
   std::uint64_t source_id{}, epoch{}, client{}, sequence{}, checksum{}, mr_id{1}, mr_count{};
-  offload::Endpoint endpoint{};
+  offload::MemoryDesc memory{};
   char detail[256]{};
+  offload::ConnectionDesc connection{};
 };
-static_assert(sizeof(Request) == 448 && sizeof(Response) == 720, "KVHR wire ABI changed");
+static_assert(sizeof(Request) == 368 && sizeof(Response) == 728, "KVHR wire ABI changed");
+inline std::uint32_t RequestBytes(std::uint16_t command) {
+  const auto c=static_cast<Command>(command);
+  return c==Command::Open || c==Command::Channel ? sizeof(Request) : offsetof(Request, connection);
+}
+inline std::uint32_t ResponseBytes(std::uint16_t command) {
+  const auto c=static_cast<Command>(command & 0x7fffU);
+  return c==Command::Open || c==Command::Channel ? sizeof(Response) : offsetof(Response, connection);
+}
 inline Request Make(Command c, const HbmReadTicket& t, std::uint64_t client) {
   Request r{};
-  r.header = {kMagic, kVersion, static_cast<std::uint16_t>(c), sizeof(Request)};
+  r.header = {kMagic, kVersion, static_cast<std::uint16_t>(c), RequestBytes(static_cast<std::uint16_t>(c))};
   r.token=t.token; r.source_id=t.source_id; r.epoch=t.epoch; r.client=client;
   return r;
 }

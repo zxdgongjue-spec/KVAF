@@ -8,21 +8,22 @@
 #include "connector_types.h"
 
 namespace kvaf {
+// Internal registration manifest. Single and multiple MRs use the same layout.
 struct HbmReadTicket {
-  std::uint64_t source_id{}, epoch{}, bytes{};
+  std::uint64_t source_id{}, epoch{};
   std::uint32_t token{};
   std::vector<std::uint64_t> mr_bytes;
-  NpuPullSourceDesc source() const { return {source_id, bytes, epoch, mr_bytes}; }
-  std::size_t mr_count() const { return mr_bytes.empty()?1:mr_bytes.size(); }
+  NpuPullSourceDesc source() const { return {source_id, epoch}; }
+  std::size_t mr_count() const { return mr_bytes.size(); }
   std::uint64_t bytes_for(std::uint64_t id) const {
-    return !id || id>mr_count()?0:mr_bytes.empty()?bytes:mr_bytes[id-1];
+    return !id || id > mr_bytes.size() ? 0 : mr_bytes[id-1];
   }
-  bool matches(const NpuPullSourceDesc& s) const {
-    return source_id==s.source_id && epoch==s.source_epoch && bytes==s.source_bytes && mr_bytes==s.mr_bytes;
+  bool matches(const NpuPullSourceDesc& s) const { return SameSource(source(), s); }
+  bool same_registration(const HbmReadTicket& other) const {
+    return matches(other.source()) && token == other.token && mr_bytes == other.mr_bytes;
   }
   bool valid() const {
-    if (!source_id || !epoch || !token || !bytes || mr_bytes.size()>4096) return false;
-    if (!mr_bytes.empty() && (mr_bytes.size()<2 || mr_bytes.front()!=bytes)) return false;
+    if (!source_id || !epoch || !token || mr_bytes.empty() || mr_bytes.size()>4096) return false;
     for (auto n:mr_bytes) if (!n) return false;
     return true;
   }

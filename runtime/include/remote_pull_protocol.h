@@ -4,9 +4,10 @@
 namespace kvaf::remote_pull {
 // Shared DDR with identity-only Ready and application-defined Submit ranges.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
-constexpr std::uint16_t kVersion = 5;
+constexpr std::uint16_t kVersion = 6;
 constexpr std::uint32_t kMaxSourceMrs = 4096;
-using Endpoint = offload::Endpoint;
+using MemoryDesc = offload::MemoryDesc;
+using ConnectionDesc = offload::ConnectionDesc;
 using Span = offload::Span;
 using Result = offload::Result;
 constexpr auto kMaxSpans = offload::kMaxSpans;
@@ -24,7 +25,8 @@ struct Request {
   std::uint32_t token{}, flags{}; // Complete flags: 1=committed, 0=aborted
   std::uint64_t mr_id{1};
   std::uint32_t memory_count{1}, reserved{}; // Attach declares the immutable MR table size.
-  Endpoint source{};
+  MemoryDesc source{};
+  ConnectionDesc connection{}; // Wire tail present only for Attach.
 };
 struct Response {
   peer::MessageHeader header{};
@@ -34,10 +36,17 @@ struct Response {
   std::uint32_t reserved{};
   std::uint64_t mr_id{1};
   RegionInfo pool{};
-  Endpoint endpoint{};
+  MemoryDesc memory{};
+  ConnectionDesc connection{}; // Wire tail present only for Attach.
 };
+inline std::uint32_t RequestBytes(std::uint16_t command) {
+  return command == static_cast<std::uint16_t>(Command::Attach) ? sizeof(Request) : offsetof(Request, connection);
+}
+inline std::uint32_t ResponseBytes(std::uint16_t command) {
+  return (command & 0x7fffU) == static_cast<std::uint16_t>(Command::Attach) ? sizeof(Response) : offsetof(Response, connection);
+}
 inline Request MakeRequest(Command command) {
-  Request r{}; r.header = {kMagic, kVersion, static_cast<std::uint16_t>(command), sizeof(r)}; return r;
+  Request r{}; r.header = {kMagic, kVersion, static_cast<std::uint16_t>(command), RequestBytes(static_cast<std::uint16_t>(command))}; return r;
 }
 inline bool SameSpans(const std::vector<Span>& a, const std::vector<Span>& b) {
   return a.size() == b.size() && (a.empty() || !std::memcmp(a.data(), b.data(), a.size()*sizeof(Span)));

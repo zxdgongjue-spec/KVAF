@@ -54,35 +54,36 @@ inline bool ParseEid(const std::string& text, std::uint8_t* eid) {
 
 class Exporter {
  public:
-  p::Endpoint descriptor{};
+  p::MemoryDesc descriptor{};
+  p::ConnectionDesc connection{};
   ~Exporter() { if (!Close().ok()) std::fprintf(stderr, "OFFLOAD: quarantined HBM export\n"); }
-  Status Open(const ConstBufferView& input, const std::string& eid, const p::Endpoint& cpu,
+  Status Open(const ConstBufferView& input, const std::string& eid, const p::ConnectionDesc& cpu,
               bool npu_peer = false) {
     std::uint32_t physical{};
     if (!cpu.token) return Error("CPU Allocate omitted region token; rebuild both Offload peers");
-    if (!ParseEid(eid, descriptor.eid)) return Status::InvalidArgument("npu_eid must contain 32 hex digits");
+    if (!ParseEid(eid, connection.eid)) return Status::InvalidArgument("npu_eid must contain 32 hex digits");
     if (!h::LoadDirectHccp(&api_)) return Error("load Direct HCCP API");
     if (!h::GetCurrentNpuPhysicalDeviceId(&physical)) return Error("resolve NPU physical device");
     if (!h::AcquireDirectHccpSession(physical, 18, &session_))
       return Error("initialize Direct HCCP session: physical=" + std::to_string(physical));
     h::CtxInitCfg cfg{}; cfg.mode = h::kOfflineHdc;
     h::CtxInitAttr attr{}; attr.phy_id = physical;
-    std::memcpy(attr.ub.eid.raw, descriptor.eid, 16);
+    std::memcpy(attr.ub.eid.raw, connection.eid, 16);
     const int context_ret = api_.ctx_init(&cfg, &attr, &context_);
     if (context_ret || !context_) {
       std::ostringstream message;
       message << "create HBM context: RaCtxInit ret=" << context_ret
               << " context_nonnull=" << (context_ != nullptr) << " mode=" << cfg.mode
               << " physical=" << physical << " eid_index=" << attr.ub.eid_index
-              << " npu_eid=" << EidHex(descriptor.eid);
+              << " npu_eid=" << EidHex(connection.eid);
       return Error(message.str());
     }
-    descriptor.token = cpu.token;
+    descriptor.token = connection.token = cpu.token;
     auto registered = RegisterMemory(input, physical, descriptor, token_, mr_);
     if (!registered.ok()) return registered;
-    descriptor.psn = 1; // cpu_push_host.cc initializes npu_psn to 1.
+    connection.psn = 1; // cpu_push_host.cc initializes npu_psn to 1.
     tp_cfg_.flag = h::CtpFlag(); tp_cfg_.transport_mode = h::kReliableMessage;
-    std::memcpy(tp_cfg_.local_eid.raw, descriptor.eid, 16);
+    std::memcpy(tp_cfg_.local_eid.raw, connection.eid, 16);
     std::memcpy(tp_cfg_.peer_eid.raw, cpu.eid, 16);
     if (api_.get_tp_info_async(context_, &tp_cfg_, &tp_info_, &tp_count_, &async_) || !async_)
       return Error("submit source CTP query");
@@ -104,43 +105,43 @@ class Exporter {
       if (!status.ok()) return status;
       const auto& key = channel->jetty_info().key;
       if (key.size != 32) return Error("unsupported NPU Jetty ABI");
-      descriptor.key_bytes = key.size;
-      std::memcpy(descriptor.key[index], key.value, key.size);
+      connection.key_bytes = key.size;
+      std::memcpy(connection.key[index], key.value, key.size);
     }
     std::fprintf(stderr, "[KVAF_NPU] %s commit=8bc5a2a endpoint_layout=%u jettys=%u "
         "physical=%u npu_eid=%s cpu_eid=%s hbm_flags=0x%x psn=%u\n",
         npu_peer ? "HBM_READ_EXPORT" : "CPU_PULL_REFERENCE",
-        p::kEndpointVersion, p::kChannelCount, physical, EidHex(descriptor.eid).c_str(), EidHex(cpu.eid).c_str(),
-        h::MemRegFlags(true), descriptor.psn);
+        p::kEndpointVersion, p::kChannelCount, physical, EidHex(connection.eid).c_str(), EidHex(cpu.eid).c_str(),
+        h::MemRegFlags(true), connection.psn);
     return Status::OK();
   }
   // Additional MRs use the existing context/route and target Jettys.
   // Preserve each registration's segment/token independently of the link.
-  Status AddMemory(const ConstBufferView& input, p::Endpoint* out) {
+  Status AddMemory(const ConstBufferView& input, p::MemoryDesc* out) {
     if (!out || !context_ || !mr_) return Error("open source connection before adding memory");
     extra_memory_.emplace_back();
     auto& memory = extra_memory_.back();
-    memory.descriptor = descriptor;
+    memory.descriptor.token = connection.token;
     std::uint32_t physical{};
     if (!h::GetCurrentNpuPhysicalDeviceId(&physical)) return Error("resolve NPU physical device");
     auto status = RegisterMemory(input, physical, memory.descriptor, memory.token, memory.mr);
     if (status.ok()) *out = memory.descriptor;
     return status;
   }
-  Status Bind(const p::Endpoint& cpu) {
+  Status Bind(const p::ConnectionDesc& cpu) {
     if (cpu.token != descriptor.token) return Error("CPU Jetty token differs from allocated region token");
     if (cpu.key_bytes != 28 || !cpu.tp || !cpu.psn) return Error("invalid CPU initiator");
     for (std::size_t index = 0; index < channels_.size(); ++index) {
       h::QpImportInfoT info{};
       if (!h::ImportPeerJetty(api_, context_, cpu.key[index], cpu.key_bytes,
-          cpu.token, descriptor.tp, cpu.tp, descriptor.psn, cpu.psn, "cpu_pull",
+          cpu.token, connection.tp, cpu.tp, connection.psn, cpu.psn, "cpu_pull",
           &info, channels_[index]->peer_jetty_output())) return Error("import CPU initiator");
     }
     return Status::OK();
   }
   // NPU initiators export 32-byte keys, unlike the CPU's 28-byte keys.
   // Keep both provider identities opaque and use route EIDs only for CTP.
-  Status BindNpuChannel(std::size_t index, const p::Endpoint& peer) {
+  Status BindNpuChannel(std::size_t index, const p::ConnectionDesc& peer) {
     if (index >= channels_.size() || peer.key_bytes != 32 ||
         peer.token != descriptor.token || !peer.tp || !peer.psn)
       return Error("invalid NPU READ initiator");
@@ -148,7 +149,7 @@ class Exporter {
     // corresponding B CTP per channel rather than reusing the CPU-pull TP.
     if (!npu_tp_handles_[index]) {
       if (index == 0) {
-        npu_tp_handles_[index] = descriptor.tp;
+        npu_tp_handles_[index] = connection.tp;
       } else {
         tp_info_ = {}; tp_count_ = 1;
         if (api_.get_tp_info_async(context_, &tp_cfg_, &tp_info_, &tp_count_, &async_) || !async_)
@@ -164,18 +165,18 @@ class Exporter {
             return Status::InDoubt("NPU channel CTP query pending");
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        npu_tp_handles_[index] = descriptor.tp;
+        npu_tp_handles_[index] = connection.tp;
       }
     }
     h::QpImportInfoT info{};
     if (!h::ImportPeerJetty(api_, context_, peer.key[0], peer.key_bytes,
-        peer.token, npu_tp_handles_[index], peer.tp, descriptor.psn, peer.psn,
+        peer.token, npu_tp_handles_[index], peer.tp, connection.psn, peer.psn,
         "npu_raw_read_target", &info, channels_[index]->peer_jetty_output()))
       return Error("import NPU READ initiator");
     return Status::OK();
   }
-  p::Endpoint NpuChannelDescriptor(std::size_t index) const {
-    auto result = descriptor;
+  p::ConnectionDesc NpuChannelDescriptor(std::size_t index) const {
+    auto result = connection;
     if (index < npu_tp_handles_.size()) result.tp = npu_tp_handles_[index];
     return result;
   }
@@ -212,7 +213,7 @@ class Exporter {
   }
  private:
   Status RegisterMemory(const ConstBufferView& input, std::uint32_t physical,
-                        p::Endpoint& descriptor, void*& token_handle, void*& mr_handle) {
+                        p::MemoryDesc& descriptor, void*& token_handle, void*& mr_handle) {
     const auto input_base = reinterpret_cast<std::uint64_t>(input.data);
     if (!input.valid() || input.device != DeviceKind::kNpu || input.bytes > UINT64_MAX-input_base)
       return Status::InvalidArgument("invalid HBM export range");
@@ -266,7 +267,7 @@ class Exporter {
               << " requested_base=0x" << std::hex << registration_base
               << " exported_base=0x" << exported_base << std::dec
               << " requested_bytes=" << registration_bytes << " exported_bytes=" << exported_bytes
-              << " npu_eid=" << EidHex(descriptor.eid)
+              << " npu_eid=" << EidHex(connection.eid)
               << " segment_eid=" << EidHex(descriptor.segment);
       return Error(message.str());
     }
@@ -282,7 +283,7 @@ class Exporter {
     return Status::OK();
   }
   struct Memory {
-    p::Endpoint descriptor{};
+    p::MemoryDesc descriptor{};
     void *token{}, *mr{};
   };
   std::vector<Memory> extra_memory_;
@@ -291,7 +292,7 @@ class Exporter {
     if (rc == 128301) return Status::Busy("CTP pending");
     async_ = nullptr;
     if (rc || result || !tp_count_ || !tp_info_.tp_handle) return Error("source CTP query failed");
-    descriptor.tp = tp_info_.tp_handle; return Status::OK();
+    connection.tp = tp_info_.tp_handle; return Status::OK();
   }
   h::DirectHccpApi api_{};
   h::DirectHccpSession* session_{};

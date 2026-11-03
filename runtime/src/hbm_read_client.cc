@@ -46,9 +46,9 @@ class ReadLink final:public peer::PeerLink {
   std::shared_ptr<hr::ControlChannel> control;
   HbmReadTicket ticket;
   std::uint64_t client;
-  std::vector<offload::Endpoint> memories;
+  std::vector<offload::MemoryDesc> memories;
   std::vector<std::uint64_t> checksums;
-  offload::Endpoint endpoint{};
+  offload::ConnectionDesc connection{};
   std::uint32_t channel{};
   bool opened{};
   Status Call(hr::Command command,hr::Response* response,std::uint64_t sequence=0,std::uint64_t mr_id=1) {
@@ -61,7 +61,7 @@ class ReadLink final:public peer::PeerLink {
     *out={};out->base=endpoint.base;out->length=endpoint.bytes;out->token_value=endpoint.token;
     std::memcpy(&out->token_id,endpoint.segment+44,4);
     out->segment_key_bytes=endpoint.segment_bytes;std::memcpy(out->segment_key.data(),endpoint.segment,endpoint.segment_bytes);
-    std::memcpy(out->eid.data(),endpoint.eid,16);
+    std::memcpy(out->eid.data(),connection.eid,16);
     out->has_memory_eid=true;std::memcpy(out->memory_eid.data(),endpoint.segment,16);
     return Status::OK();
   }
@@ -69,15 +69,15 @@ class ReadLink final:public peer::PeerLink {
       const std::uint8_t* local_eid,std::uint32_t token,std::uint64_t tp,std::uint32_t psn,
       std::array<std::uint8_t,peer::kQpKeyBytes>* peer_key,std::uint32_t* peer_bytes,
       std::uint64_t* peer_tp,std::uint32_t* peer_psn)override {
-    if(base!=endpoint.base || channel>=offload::kChannelCount || key_bytes!=32 || token!=ticket.token)
+    if(memories.empty() || base!=memories.front().base || channel>=offload::kChannelCount || key_bytes!=32 || token!=ticket.token)
       return Status::InvalidArgument("invalid NPU raw READ channel");
     auto r=hr::Make(hr::Command::Channel,ticket,client);r.channel=channel;
-    r.endpoint.tp=tp;r.endpoint.psn=psn;r.endpoint.token=token;r.endpoint.key_bytes=key_bytes;
-    std::memcpy(r.endpoint.eid,local_eid,16);std::memcpy(r.endpoint.key[0],key,key_bytes);
+    r.connection.tp=tp;r.connection.psn=psn;r.connection.token=token;r.connection.key_bytes=key_bytes;
+    std::memcpy(r.connection.eid,local_eid,16);std::memcpy(r.connection.key[0],key,key_bytes);
     hr::Response response{};auto s=control->Exchange(r,&response);if(!s.ok())return s;
-    if(response.endpoint.key_bytes!=32 || response.endpoint.token!=token) return Status::Internal("invalid B target descriptor");
-    *peer_bytes=response.endpoint.key_bytes;std::memcpy(peer_key->data(),response.endpoint.key[channel],*peer_bytes);
-    *peer_tp=response.endpoint.tp;*peer_psn=response.endpoint.psn;++channel;return Status::OK();
+    if(response.connection.key_bytes!=32 || response.connection.token!=token) return Status::Internal("invalid B target descriptor");
+    *peer_bytes=response.connection.key_bytes;std::memcpy(peer_key->data(),response.connection.key[channel],*peer_bytes);
+    *peer_tp=response.connection.tp;*peer_psn=response.connection.psn;++channel;return Status::OK();
   }
 };
 struct Engine {
@@ -330,7 +330,7 @@ void HbmReader::Serve() {
         if(h.header.command==unsigned(hr::Admission::Leave))status=Detach(ticket);
         else if(it!=impl_->connections.end()) {
           auto& c=*it->second;
-          if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token)
+          if(!c.link->ticket.same_registration(ticket))
             status=Status::InvalidArgument("HBM reconnect changed source manifest/token");
           else {
             int copy=dup(fd);
@@ -356,7 +356,7 @@ Status HbmReader::Cancel(const ReadyToken& ready) {
   auto it=impl_->connections.find({source->source_id,source->source_epoch});
   if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not connected");
   auto& c=*it->second;
-  if(!c.link->ticket.matches(*source) || !source->bytes_for(ready.mr_id) || !ready.sequence)
+  if(!c.link->ticket.matches(*source) || !c.link->ticket.bytes_for(ready.mr_id) || !ready.sequence)
     return Status::InvalidArgument("invalid NPU Pull cancellation identity");
   if(c.pending!=Pending::None)return Status::Busy("resolve the existing raw READ/cancellation first");
   if(ready.sequence==c.last_sequence && ready.mr_id==c.mr_id)return Status::OK();
@@ -376,7 +376,7 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
   const auto existing=impl_->connections.find(key);
   if(existing!=impl_->connections.end()) {
     const auto& c=*existing->second;
-    if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token ||
+    if(!c.link->ticket.same_registration(ticket) ||
         c.local_eid!=local_eid)
       return Status::InvalidArgument("HBM source is already attached with different metadata or route");
     return c.ready ? Status::OK() : Status::InDoubt("HBM attach/close incomplete; retry producer shutdown");
@@ -395,28 +395,28 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
     auto owned=std::make_unique<Connection>(control,ticket,local_eid,impl_->cores,impl_->jettys,impl_->budget);
     auto& c=*owned;impl_->connections.emplace(key,std::move(owned));
     auto request=hr::Make(hr::Command::Open,ticket,c.link->client);request.candidate=b;
-    std::memcpy(request.endpoint.eid,a.eid.data(),16);
+    std::memcpy(request.connection.eid,a.eid.data(),16);
     hr::Response response{};c.link->opened=true;
     s=control->Exchange(request,&response);
     if(s.ok()) {
       const auto count=ticket.mr_count();
-      c.link->endpoint=response.endpoint;
-      if(response.mr_count!=count) s=Status::Internal("B HBM MR count differs from ticket");
+      c.link->connection=response.connection;
+      const auto& connection=c.link->connection;
+      if(response.mr_count!=count || connection.key_bytes!=32 || connection.token!=ticket.token ||
+          !connection.tp || !connection.psn) s=Status::Internal("invalid B HBM connection or MR count");
       for(std::uint64_t mr=1;s.ok() && mr<=count;++mr) {
         if(mr>1) s=c.link->Call(hr::Command::Memory,&response,0,mr);
         if(!s.ok()) break;
-        const auto& e=response.endpoint;
+        const auto& e=response.memory;
         if(response.mr_count!=count || e.token!=ticket.token || e.bytes!=ticket.bytes_for(mr) ||
-            e.segment_bytes!=48 || e.key_bytes!=32 || !e.base || e.bytes>UINT64_MAX-e.base || !e.tp || !e.psn ||
-            std::memcmp(e.eid,c.link->endpoint.eid,16)) {
+            e.segment_bytes!=48 || !e.base || e.bytes>UINT64_MAX-e.base) {
           s=Status::Internal("invalid B HBM export descriptor");break;
         }
         for(const auto& prior:c.link->memories) if(e.base==prior.base)
           s=Status::Internal("ambiguous exported HBM base");
         c.link->memories.push_back(e);c.link->checksums.push_back(response.checksum);
       }
-      auto& e=c.link->endpoint;
-      if(s.ok() && KvafBatchGetTransportCreateWithPeerLink(reinterpret_cast<void*>(e.base),e.bytes,
+      if(s.ok() && KvafBatchGetTransportCreateWithPeerLink(reinterpret_cast<void*>(c.link->memories.front().base),c.link->memories.front().bytes,
           impl_->cores,impl_->jettys,c.link.get(),a.eid.data(),&c.engine.transport))
         s=Status::Internal("create A-B raw READ transport");
       for(std::uint64_t mr=2;s.ok() && mr<=count;++mr) {
@@ -466,7 +466,7 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
     if(s.ok()) {
       c.ready=true;
       std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY source=%llu epoch=%llu A_eid=%s B_eid=%s jettys=%u mrs=%zu probe=all_mrs_all_lanes_pass\n",
-          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->endpoint.eid).c_str(),impl_->cores*impl_->jettys,ticket.mr_count());
+          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->connection.eid).c_str(),impl_->cores*impl_->jettys,ticket.mr_count());
       return s;
     }
     std::fprintf(stderr,"[KVAF_NPU] HBM_READ_CANDIDATE_REJECTED source=%llu A_eid=%s B_candidate=%u detail=%s\n",
@@ -491,7 +491,7 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
   auto& c=*it->second;
   if(!c.ready || c.pending!=Pending::None)return Status::Busy("raw READ region not ready or has unresolved work");
   const auto& ticket=c.link->ticket;
-  if(!ticket.matches(*source) || !source->bytes_for(ready.mr_id) ||
+  if(!ticket.matches(*source) || !ticket.bytes_for(ready.mr_id) ||
       !ready.sequence || ready.sequence<=c.last_sequence)
     return Status::InvalidArgument("NPU Pull ReadyToken belongs to another source or consumed batch");
   const auto base=reinterpret_cast<std::uint64_t>(output.data);
@@ -526,7 +526,7 @@ Status HbmReader::Resolve(const ReadyToken& ready){
   auto it=impl_->connections.find({source->source_id,source->source_epoch});
   if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not attached");
   const auto& ticket=it->second->link->ticket;
-  if(!ticket.matches(*source) || !source->bytes_for(ready.mr_id) ||
+  if(!ticket.matches(*source) || !ticket.bytes_for(ready.mr_id) ||
       !ready.sequence || ready.sequence!=it->second->sequence || ready.mr_id!=it->second->mr_id)
     return Status::InvalidArgument("raw READ recovery token does not match the pending batch");
   return it->second->Resolve();
@@ -539,7 +539,7 @@ Status HbmReader::Detach(const HbmReadTicket& ticket){
   auto it=impl_->connections.find({ticket.source_id,ticket.epoch});
   if(it==impl_->connections.end())return Status::OK(); // Also valid after a fully cleaned failed Attach.
   auto& c=*it->second;
-  if(!SameSource(c.link->ticket.source(),ticket.source()) || c.link->ticket.token!=ticket.token)
+  if(!c.link->ticket.same_registration(ticket))
     return Status::InvalidArgument("HBM detach ticket does not match the attached source");
   if(c.pending!=Pending::None)return Status::InDoubt("resolve raw READ before detach");
   // Close may destroy queues before a later MR unregister fails. Retrying

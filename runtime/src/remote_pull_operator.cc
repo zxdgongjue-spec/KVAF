@@ -5,7 +5,7 @@ namespace kvaf {
 namespace rp = remote_pull;
 namespace {
 rp::Request Request(const OffloadRegionTicket& ticket, const CpuPullRequest& current, rp::Command cmd) {
-  auto r = rp::MakeRequest(cmd); r.epoch = ticket.region.epoch; r.region = ticket.region.id; r.token = ticket.region.token;
+  auto r = rp::MakeRequest(cmd); r.epoch = ticket.epoch; r.region = ticket.region_id; r.token = ticket.token;
   r.source_id = current.source.source_id; r.task = current.sequence; r.mr_id = current.mr_id; return r;
 }
 
@@ -21,17 +21,19 @@ Status RemotePullOperator::Initialize(const RemoteRegionDesc& region) {
   if (response.result != rp::Result::Ok || !response.pool.epoch || response.pool.id != peer.session_id ||
       response.pool.base != region.base || response.pool.bytes != region.length || response.pool.slot_size != region.slot_size)
     return Status::Internal("CPU shared DDR descriptor mismatch; update both peers");
-  ticket_ = {link_->address(), response.pool};
+  region_ = response.pool;
+  ticket_ = {link_->address(), region_.id, region_.epoch, region_.token, {}};
+  std::copy(std::begin(region_.eid), std::end(region_.eid), ticket_.eid.begin());
   return aiv_ ? aiv_->Initialize(region) : Status::OK();
 }
 Status RemotePullOperator::CanShutdown() const {
   if (active_) return Status::InDoubt("resolve remote source Offload before shutdown");
-  if (ticket_.region.id) {
-    auto r = rp::MakeRequest(rp::Command::Describe); r.region = ticket_.region.id;
-    r.token = ticket_.region.token;
+  if (ticket_.region_id) {
+    auto r = rp::MakeRequest(rp::Command::Describe); r.region = ticket_.region_id;
+    r.token = ticket_.token;
     rp::Response response{}; auto status = rp::Exchange(ticket_.address, r, {}, &response);
     if (!status.ok()) return status;
-    if (response.result != rp::Result::Ok || response.pool.epoch != ticket_.region.epoch)
+    if (response.result != rp::Result::Ok || response.pool.epoch != ticket_.epoch)
       return Status::InDoubt("shared DDR identity unavailable during shutdown");
     if (response.reserved) return Status::Busy("detach B HBM sources before A shutdown");
   }
@@ -69,32 +71,27 @@ Status RemotePullOperator::LastChecksum(std::uint64_t* checksum) const {
   *checksum = response.checksum; return Status::OK();
 }
 Status RemotePullOperator::ValidateCpuSource(const CpuPullSourceDesc& source) {
-  if (!source.source_id || !source.source_bytes || source.region_id != ticket_.region.id ||
-      source.region_epoch != ticket_.region.epoch)
+  if (!source.source_id || !source.mr_length || source.region_id != ticket_.region_id ||
+      source.region_epoch != ticket_.epoch)
     return Status::InvalidArgument("CPU source is not bound to this DDR pool");
-  if (!source.region_id || !source.region_epoch || source.mr_count() > rp::kMaxSourceMrs ||
-      source.bytes_for(1) != source.source_bytes)
-    return Status::InvalidArgument("invalid CPU source MR table");
-  for (auto bytes : source.mr_bytes)
-    if (!bytes) return Status::InvalidArgument("invalid CPU source MR size");
   return Status::OK();
 }
 Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {
   if (active_) return Status::Busy("previous CPU Pull is unresolved");
   const auto& source = request.source;
-  if (source.region_id != ticket_.region.id || source.region_epoch != ticket_.region.epoch ||
+  if (source.region_id != ticket_.region_id || source.region_epoch != ticket_.epoch ||
       !request.sequence || !source.source_id || request.copies.source.size() != request.copies.lengths.size() ||
       request.copies.destination.size() != request.copies.lengths.size())
     return Status::InvalidArgument("invalid CPU Pull request");
   std::vector<rp::Span> spans;
   for (std::size_t i = 0; i < request.copies.lengths.size(); ++i)
     spans.push_back({request.copies.source[i], request.copies.destination[i], request.copies.lengths[i]});
-  if (!offload::ValidateSpans(spans, source.bytes_for(request.mr_id), ticket_.region.bytes))
+  if (!offload::ValidateSpans(spans, source.mr_length, region_.bytes))
     return Status::InvalidArgument("invalid CPU Pull source/destination ranges");
   rp::Response response{};
   auto status = rp::Exchange(ticket_.address, Request(ticket_, request, rp::Command::Query), {}, &response);
   if (!status.ok()) return Status::Internal("CPU Pull pre-submit query failed; no READ submitted: "+status.message());
-  if (response.result != rp::Result::Ok || response.state != rp::State::Ready || response.endpoint.bytes != source.bytes_for(request.mr_id))
+  if (response.result != rp::Result::Ok || response.state != rp::State::Ready || response.memory.bytes != source.mr_length)
     return Status::InvalidState("CPU Pull batch is not Ready");
   current_ = request; active_ = true; committed_ = false;
   status = rp::Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Submit), spans, &response);

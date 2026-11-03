@@ -10,8 +10,9 @@ namespace {
 Result Convert(const Status& s) { return s.ok() ? Result::Ok : s.code() == StatusCode::kInDoubt ? Result::InDoubt : Result::Failed; }
 struct Session {
   RegionInfo region{};
-  Endpoint source{}, local{};
-  std::unordered_map<std::uint64_t, Endpoint> memories;
+  MemoryDesc source{};
+  ConnectionDesc peer{}, local{};
+  std::unordered_map<std::uint64_t, MemoryDesc> memories;
   std::uint32_t memory_count{1};
   std::uint64_t mr_id{1};
   std::unique_ptr<offload::Backend> backend;
@@ -56,12 +57,12 @@ Status Service::Shutdown() {
   return Status::OK();
 }
 Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
-  Response out{}; out.header = {kMagic, kVersion, std::uint16_t(r.header.command | 0x8000U), sizeof(out)};
+  Response out{}; out.header = {kMagic, kVersion, std::uint16_t(r.header.command | 0x8000U), ResponseBytes(r.header.command)};
   out.region = r.region; out.epoch = r.epoch; out.source_id = r.source_id; out.task = r.task;
   out.mr_id = r.mr_id;
   if (r.header.magic != kMagic || r.header.version != kVersion || !r.region ||
       r.count != spans.size() || spans.size() > kMaxSpans ||
-      r.header.bytes != sizeof(r) + spans.size()*sizeof(Span)) return out;
+      r.header.bytes != RequestBytes(r.header.command) + spans.size()*sizeof(Span)) return out;
   const auto cmd = static_cast<Command>(r.header.command);
   if (cmd != Command::Ready && cmd != Command::Submit && cmd != Command::Probe && !spans.empty()) return out;
   RegionInfo region{};
@@ -73,19 +74,19 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   if (!r.source_id) return out;
   auto found = impl_->sources.find(r.source_id);
   if (cmd == Command::Attach && found == impl_->sources.end()) {
-    if (region.closing || r.task || !r.source.bytes || r.source.token != region.token || r.mr_id != 1 ||
+    if (region.closing || r.task || !r.source.bytes || r.source.token != region.token || r.connection.token != region.token || r.mr_id != 1 ||
         !r.memory_count || r.memory_count > kMaxSourceMrs) return out;
     if (impl_->sources.size() >= 4096) { out.result = Result::Busy; return out; }
-    auto s = std::make_unique<Session>(); s->region = region; s->source = r.source;
+    auto s = std::make_unique<Session>(); s->region = region; s->source = r.source; s->peer = r.connection;
     s->memory_count = r.memory_count; s->memories.emplace(1, r.source);
     s->backend = impl_->attach(region);
     if (!s->backend) { out.result = Result::Failed; return out; }
-    s->local.base = region.base; s->local.bytes = region.bytes; s->local.token = region.token;
+    s->local.token = region.token;
     std::memcpy(s->local.eid, region.eid, 16);
-    try { status = s->backend->Open(r.source, &s->local); }
+    try { status = s->backend->Open(r.connection, r.source, &s->local); }
     catch (...) { status = Status::InDoubt("exception attaching HBM source"); }
     s->state = status.ok() ? State::Connecting : status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
-    out.result = Convert(status); out.state = s->state; out.endpoint = s->local;
+    out.result = Convert(status); out.state = s->state; out.connection = s->local;
     std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_ATTACH region=%llu source=%llu state=%u detail=%s\n",
         (unsigned long long)r.region, (unsigned long long)r.source_id, unsigned(s->state), status.message().c_str());
     impl_->sources.emplace(r.source_id, std::move(s)); return out;
@@ -97,11 +98,12 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     return out;
   }
   auto& s = *found->second; std::unique_lock<std::mutex> lock(s.mutex);
-  out.state = s.state; out.endpoint = s.local;
+  out.state = s.state; out.connection = s.local;
   if (s.region.id != r.region || s.region.epoch != r.epoch) return out;
   if (cmd == Command::Attach) {
     if (!r.task && r.mr_id == 1 && r.memory_count == s.memory_count &&
-        !std::memcmp(&s.memories.at(1), &r.source, sizeof(Endpoint)) && s.state != State::Closed)
+        !std::memcmp(&s.memories.at(1), &r.source, sizeof(MemoryDesc)) &&
+        !std::memcmp(&s.peer, &r.connection, sizeof(ConnectionDesc)) && s.state != State::Closed)
       out.result = s.state == State::InDoubt ? Result::InDoubt : s.state == State::Failed ? Result::Failed : Result::Ok;
     return out;
   }
@@ -120,15 +122,11 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
         r.source.token != region.token || s.state == State::Closed) return out;
     const auto existing = s.memories.find(r.mr_id);
     if (existing != s.memories.end()) {
-      if (!std::memcmp(&existing->second, &r.source, sizeof(Endpoint))) out.result = Result::Ok;
+      if (!std::memcmp(&existing->second, &r.source, sizeof(MemoryDesc))) out.result = Result::Ok;
       return out;
     }
     if (s.state != State::Connecting) return out;
-    // Memory identity is per MR; the connection identity must remain unchanged.
-    const auto& link = s.memories.at(1);
-    if (r.source.tp != link.tp || r.source.psn != link.psn || r.source.key_bytes != link.key_bytes ||
-        std::memcmp(r.source.eid, link.eid, sizeof(link.eid)) ||
-        std::memcmp(r.source.key, link.key, sizeof(link.key))) return out;
+    // The source session owns the connection; this message contains only an MR.
     try { status = s.backend->AddSource(r.mr_id, r.source); }
     catch (...) { status = Status::InDoubt("exception importing HBM MR"); }
     if (status.ok()) s.memories.emplace(r.mr_id, r.source);
@@ -155,7 +153,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   if (cmd == Command::InspectSource && !r.task && s.state != State::Closed) {
     const auto memory = s.memories.find(r.mr_id);
     if (memory == s.memories.end()) return out;
-    out.endpoint = memory->second; out.reserved = s.memory_count; out.result = Result::Ok; return out;
+    out.memory = memory->second; out.reserved = s.memory_count; out.result = Result::Ok; return out;
   }
   const auto memory = s.memories.find(r.mr_id);
   if (!r.task || memory == s.memories.end()) return out;
@@ -178,7 +176,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     s.state = s.terminal = out.state = State::Cancelled; out.result = Result::Ok; return out;
   }
   if (r.task != s.sequence || r.mr_id != s.mr_id) return out; // Bind sequence AND MR identity.
-  if (cmd == Command::Query) { out.endpoint = s.source; out.result = Result::Ok; return out; }
+  if (cmd == Command::Query) { out.memory = s.source; out.result = Result::Ok; return out; }
   if (cmd == Command::Checksum) {
     // Diagnostic reads of CURRENT DDR are explicit and outside transfer/commit.
     // The caller must retain these slots unchanged until this RPC returns.
@@ -246,12 +244,14 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
 }
 void Service::Serve(int fd, const peer::MessageHeader& header) {
   offload::SetSocketTimeout(fd);
-  if (header.version != kVersion || header.bytes < sizeof(Request) || header.bytes > sizeof(Request)+kMaxSpans*sizeof(Span)) return;
+  const auto request_bytes = RequestBytes(header.command);
+  if (header.magic != kMagic || header.version != kVersion || header.bytes < request_bytes ||
+      header.bytes > request_bytes+kMaxSpans*sizeof(Span)) return;
   Request r{}; r.header = header;
-  if (!offload::ReadBytes(fd, reinterpret_cast<char*>(&r)+sizeof(header), sizeof(r)-sizeof(header)) ||
-      r.count > kMaxSpans || header.bytes != sizeof(r)+r.count*sizeof(Span)) return;
+  if (!offload::ReadBytes(fd, reinterpret_cast<char*>(&r)+sizeof(header), request_bytes-sizeof(header)) ||
+      r.count > kMaxSpans || header.bytes != request_bytes+r.count*sizeof(Span)) return;
   std::vector<Span> spans(r.count);
   if (!offload::ReadBytes(fd, spans.data(), spans.size()*sizeof(Span))) return;
-  const auto response = Dispatch(r, spans); offload::WriteBytes(fd, &response, sizeof(response));
+  const auto response = Dispatch(r, spans); offload::WriteBytes(fd, &response, ResponseBytes(header.command));
 }
 }

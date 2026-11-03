@@ -54,39 +54,35 @@ B 的普通 BatchPut、BatchGet、本卡 Offload 和跨卡 CPU Pull 共用一个
 
 以下为应用可见的逻辑结构。Connector 原样传递 KVAF 返回的 ReadyToken（内含源描述符），不自行组装 MR、Jetty 或 TP 数据。Python 的两个源描述符及 ReadyToken 为只读对象，支持 pickle 跨进程交换；本地 PutHandle 不支持跨进程传递。
 
-### 4.1 长期源身份
+### 4.1 每批源描述
 
 ```cpp
 struct CpuPullSourceDesc {
     uint64_t source_id;
-    uint64_t source_bytes;
     uint64_t region_id;
     uint64_t region_epoch;
-    vector<uint64_t> mr_bytes; // 多 MR 时逐个记录长度；单 MR 可以为空
+    uint64_t mr_length; // 本批 ReadyToken.mr_id 对应的逻辑长度
 };
 
 struct NpuPullSourceDesc {
     uint64_t source_id;
-    uint64_t source_bytes;
     uint64_t source_epoch;
-    vector<uint64_t> mr_bytes; // 独立 NPU MR 列表，与 CPU 源无关
 };
 ```
 
 | 字段 | 含义与用途 |
 |---|---|
 | `source_id` | 一组 HBM 源注册和连接的编号；CPU/NPU Pull 都可包含多个 MR，不是物理卡号 |
-| `source_bytes` | 单 MR 的逻辑长度；多 MR 时保留首个 tensor 的长度，不是跨 tensor 的地址范围 |
-| `mr_bytes` / `mr_count` | 两种源的只读 MR 长度列表和数量；多 MR 按本批 mr_id 取长度做范围检查，应用不需解析 |
+| `mr_length` | CPU Pull 本批选中 tensor 的逻辑长度，用于提交前范围检查；不是首个 MR 长度或跨 tensor 的地址范围 |
 | `region_id` | CPU service 分配的整个 DDR 池编号，不是 key 或 slot 编号 |
 | `region_epoch` | CPU service 实例代次，拒绝重启前遗留的旧请求；当前实现由服务创建时生成，同一实例的 region 共用 |
 | `source_epoch` | NPU 直读源身份的代次，用于拒绝旧的源描述符 |
 
 CPU Pull 的源在初始化时绑定指定 DDR 池，因此包含 region 身份。NPU Pull 源描述的是 A 上被读取的 HBM，不绑定 B 的某块输出 HBM。
 
-上面的结构只列身份信息。NPU 源的访问凭据、HBM 基址、segment 和通道描述由 KVAF 在 register(receiver=...) 的建链连接中自动交换。应用不再转发 export_ticket 或维护 hbm_link。
+上面的结构只携带本批所需身份，以及 CPU Pull 所需的选中 MR 长度。完整 MR 清单保存在 KVAF 内部，不随 ReadyToken 反复传递。NPU 源的访问凭据、HBM 基址、segment 和通道描述由 KVAF 在 register(receiver=...) 的建链连接中自动交换。应用不再转发 export_ticket 或维护 hbm_link。
 
-CPU 源的连接和 MR 保存在 CPU service，B Runtime 无需另存一份初始化源绑定。每批直接读取 ReadyToken.source，先在本地检查描述符格式和 DDR region/epoch，再通过已有的提交前 Query 核对选中 MR 的真实长度与批次状态，CPU 在 Submit 时校验实际注册范围。NPU 源自动接入 B 的监听 Runtime，按 source_id/source_epoch 保存连接并核对 MR 长度清单。
+CPU 源的连接和 MR 保存在 CPU service，B Runtime 无需另存一份初始化源绑定。每批直接读取 ReadyToken.source，先在本地检查描述符格式和 DDR region/epoch，再通过已有的提交前 Query 核对 mr_length 与选中 MR 的真实长度及批次状态，CPU 在 Submit 时校验实际注册范围。NPU 源自动接入 B 的监听 Runtime，按 source_id/source_epoch 保存连接；每批按 mr_id 查询内部 MR 清单。内部长度列表对单 MR 和多 MR 都非空，不再另存首个 MR 长度；初始化及重连仍核对完整清单和访问凭据。
 
 ### 4.2 ReadyToken
 
@@ -98,7 +94,7 @@ ReadyToken {
 }
 ```
 
-`ReadyToken` 不包含 `readable_ranges`、源/目的地址列表、业务 key 或实际数据。这里的 Token 是批次身份描述，不是 URMA 内存访问 token。
+`ReadyToken` 不包含 `readable_ranges`、源/目的地址列表、完整 MR 长度列表、业务 key 或实际数据。这里的 Token 是批次身份描述，不是 URMA 内存访问 token。Python pickle 使用 v2 类型标记并拒绝旧格式，Connector 仍只需原样传递对象。
 
 单 MR 使用 `source.ready()`，两种源的多 MR 都使用 `source.ready(tensor)` 选择已注册的 tensor。接口登记批次并返回身份信息。应用应在确认生产写入完成后调用它；该接口不再接收 offset/length 列表，也不承担业务层的数据可读性判断。
 
@@ -108,7 +104,7 @@ A Connector 向 B 发送的是：
 
 ```text
 应用业务元数据：逻辑块、数据布局、业务请求标识等
-KVAF ReadyToken：源身份和 sequence；CPU Pull 还包含本批 MR 身份
+KVAF ReadyToken：源身份、sequence 和 mr_id；CPU Pull 另带本批 mr_length
 ```
 
 业务元数据由应用解释，KVAF 只校验资源和批次身份。
@@ -227,6 +223,28 @@ A Connector → B Connector：应用数据布局；源注册和建链信息由 K
 
 源对象、MR、Jetty 和 TP 保存在 KVAF 内部；应用交换的只是票据与业务元数据。
 
+`runtime.offload_region()` 返回给生产端的 DDR ticket 使用 version=2，仅包含：
+
+| 字段 | 用途 |
+|---|---|
+| `version` | 票据格式版本，当前为 2 |
+| `address` | CPU service 控制地址 |
+| `region_id`、`epoch` | 绑定指定 DDR 池并拒绝旧实例的请求 |
+| `token`、`eid` | 注册、建链时使用的访问凭据与 CPU 路由身份 |
+
+DDR 的 base、bytes、slot_size、candidate 等完整布局仍由读取端 Runtime 和 CPU service 保存。生产端不需要这些字段；读取端应用通过 `runtime.remote_region` 取得 base、length、slot_size、device，目的地址提取流程不变。旧 version=1 DDR ticket 不再接受。NPU receiver ticket 仍使用 version=1。
+
+### 6.1 内部连接描述与 MR 描述
+
+初始化报文和资源存储将共享连接与单个 MR 分开：
+
+| 内部结构 | 内容 | 保存与交换时机 |
+|---|---|---|
+| `ConnectionDesc` | 路由 EID、TP、PSN、连接 token、四个 Jetty key 及 key 长度 | 每个源连接保存；CPU Attach、NPU Open/Channel 时交换 |
+| `MemoryDesc` | MR 逻辑 base/bytes、内存 token、导出 segment 及长度 | 每个 MR 独立保存；CPU AddMemory、NPU Memory 只交换 MR 描述 |
+
+新增 MR 不再复制或发送整份连接描述。MR 的导入段、token ID、注册句柄仍逐块保存；实际注册范围和逻辑可读范围的区别也保留。NPU 各通道独立协商 TP、CPU 共享 TP，以及两条路径独立注册的方式不变。
+
 CPU Pull 的初始化和对接点如下（D=读取端、P=生产端、K=CPU service）：
 
 ```mermaid
@@ -251,7 +269,7 @@ sequenceDiagram
 ```
 
 
-### 6.1 CPU Pull：多个 tensor 注册，共用连接
+### 6.2 CPU Pull：多个 tensor 注册，共用连接
 
 ```python
 # 生产端：每个 tensor 各自连续，tensor 之间可以不连续。
@@ -284,11 +302,11 @@ source.release_batch(ready)
 - 注册期间所有 tensor 的分配必须存活、地址和长度不能变化。正常运行只要求当前冻结 tensor 不被改写，其余 tensor 可由应用生产。Python 绑定保存独立的 tensor 引用列表，不依赖应用保留原 list 对象。
 - NPU Pull 已独立支持多 MR，使用 `NpuPullHbmSource.register(tensors, receiver=receiver)` 和 `ready(tensor)`；不共享 CPU Pull 的 MR。详见下节。
 
-### 6.2 NPU Pull：多个 tensor 注册，共用连接
+### 6.3 NPU Pull：多个 tensor 注册，共用连接
 
 多 MR NPU Pull：生产端 register(tensors, receiver=receiver) 固定 1～4096 个 Tensor，自动连接读取端并导入全部 MR、完成逐 MR 全通道探测。ready(tensor) 选中本批唯一源，batch_get_raw_addr 的 src_offsets 相对该 Tensor，dst_offsets 相对 output，三组 NPU int64 数组不变。
 
-每个 NPU 源只有一组 Jetty/CQ/TP，各 MR 保留自己的内存身份。AIV Host 缓存“MR ID + output 注册”对应的轻量通信描述，复用 output 的本地 MR 和队列计数；现有 raw READ 算子及 ABI 不变。单 tensor 使用 register(tensor, receiver=receiver)/ready()。内部注册清单包含 mr_bytes，KVHR v6 在控制消息中携带 mr_id；应用不查询或传递 MR 句柄。注册约束、失败保留和硬件测试见 [NPU 多 MR 说明](hbm_raw_addr_read.md)。
+每个 NPU 源只有一组 Jetty/CQ/TP，各 MR 保留自己的内存身份。AIV Host 缓存“MR ID + output 注册”对应的轻量通信描述，复用 output 的本地 MR 和队列计数；现有 raw READ 算子及 ABI 不变。单 tensor 使用 register(tensor, receiver=receiver)/ready()。内部注册清单包含 mr_bytes，KVHR v7 在控制消息中携带 mr_id；应用不查询或传递 MR 句柄。注册约束、失败保留和硬件测试见 [NPU 多 MR 说明](hbm_raw_addr_read.md)。
 
 ## 7. A 端批次接口
 
@@ -536,7 +554,7 @@ Connector 的业务通知由应用实现，KVAF 的 Complete/Cancel 不替代业
 
 ## 11. 现有代码的调整范围
 
-CPU Pull 当前使用 `src_offsets + dst_offsets`，在提取 PreparePut 的 address 时减去 DDR base；Submit 不再转换目的数组。NPU 源绑定由 Runtime 管理；CPU 源连接由 CPU service 管理，Runtime 直接使用 ReadyToken.source 提交，保存本次事务以支持恢复。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。基础初始化与 DDR 初始化现已分离，纯 NPU Pull 不再依赖 DDR。此次初始化拆分未更改 Raw READ 算子、批次同步/恢复协议、ticket 字典格式或 KVRP/KVHR 线协议；应用需重新编译 NPU 运行库和 Python 绑定。
+CPU Pull 当前使用 `src_offsets + dst_offsets`，在提取 PreparePut 的 address 时减去 DDR base；Submit 不再转换目的数组。NPU 源绑定由 Runtime 管理；CPU 源连接由 CPU service 管理，Runtime 直接使用 ReadyToken.source 提交，保存本次事务以支持恢复。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。基础初始化与 DDR 初始化现已分离，纯 NPU Pull 不再依赖 DDR。本次描述符精简不改变 Raw READ 算子、批次同步与恢复语义，但更新了 ReadyToken 序列化格式、DDR ticket 和 KVRP/KVHR 报文；CPU service、两端 NPU 运行库和 Python 绑定需一起重编译、重启。
 
 | 当前实现 | 目标调整 |
 |---|---|
@@ -549,7 +567,7 @@ CPU Pull 当前使用 `src_offsets + dst_offsets`，在提取 PreparePut 的 add
 | CPU 目的地址必须落在 slot 起点 | 支持本次预留有效范围内的拆分和槽内偏移，保持覆盖、归属及不重叠检查 |
 | batch_get_raw_addr 的源地址列表来自 Ready batch | 扩展入口由 B 提供三个连续、等长数组，保留原算子和通信实现 |
 
-CPU Pull 控制协议 KVRP 使用 v5，NPU 直读控制协议 KVHR 使用 v6。NPU 多 MR 改动需更新两个 NPU 应用及运行库；已有 KVRP v5 的 CPU service 无需因此更新。协议版本不符时拒绝通信。两种 Ready 都发布源身份、批次号及本批 MR 身份。
+CPU Pull 控制协议 KVRP 使用 v6，NPU 直读控制协议 KVHR 使用 v7。本次精简需更新 CPU service、两个 NPU 应用及运行库。协议版本不符时拒绝通信。两种 Ready 都发布源身份、批次号及本批 MR 身份。
 
 已删除：旧类名别名、`ready(offsets, lengths, stream)`、无 token 的 release/cancel、`offload_from()`、`offload()`、`resolve_offload()`、`release_offload_source()`、旧 raw READ 重载、独立 OffloadRuntime 及 KVOF 服务、直接传本卡 tensor 的 batch_cpu_pull 重载。
 
@@ -582,7 +600,7 @@ ReadyToken 携带源和 MR 身份，校验 DDR 归属 → PreparePut → 提取 
 
 PreparePut 仍返回绝对地址，普通 BatchPut 不变。显式 `submit_cpu_pull` 的第四个参数现为
 `dst_offsets`，旧的绝对地址调用须改为 `entry.address - runtime.remote_region["base"]`。
-便利入口签名及 CPU 控制协议不变，应用需要重编 NPU 运行库和 Python 绑定。
+便利入口签名不变；当前 CPU 控制协议为 KVRP v6，应用和 CPU service 需要配套重编译。
 
 `keys`、`src_offsets`、`lengths` 是三个等长的 Host 整数序列或连续一维 CPU int64 Tensor，
 每个 key 对应一个源段，顺序一一对应。偏移和长度以字节计，源偏移相对 Ready 选中的 tensor；
@@ -627,7 +645,7 @@ runtime.resolve_cpu_pull(timeout=30000)
 
 ### 13.1 Python 返回值与恢复入口
 
-- `cpu_source.register(...)` 成功返回 `None`，无需向读取端额外发送 source_desc 或调用 attach_cpu_source；CPU Pull 线协议仍为 KVRP v5。
+- `cpu_source.register(...)` 成功返回 `None`，无需向读取端额外发送 source_desc 或调用 attach_cpu_source；CPU Pull 线协议为 KVRP v6。
 - CPU 源描述符保留在 `ReadyToken.source` 中；本地格式、DDR 归属及 Put 覆盖检查失败时不发 RPC，提交前 Query 和 CPU 端 Submit 仍校验选中 MR 与批次。取消了对所有 MR 的初始化 InspectSource 查询。
 - `source.ready()` 返回 `ReadyToken`；应用调用前同步生产 stream。
 - `prepare_put(...)` 返回 `PutHandle`：`entries` 提供只读的 `key/address/length`，`state` 为最近一次已知状态，`submitted` 表示是否已记录提交请求。`state` 不会自动轮询远端。

@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <memory>
 #include <string>
 #include "remote_pull_protocol.h"
@@ -7,9 +8,12 @@
 #include "connector_types.h"
 
 namespace kvaf {
+// Producer-facing registration ticket; DDR allocation/layout stays on the reader.
 struct OffloadRegionTicket {
   std::string address;
-  remote_pull::RegionInfo region{};
+  std::uint64_t region_id{}, epoch{};
+  std::uint32_t token{};
+  std::array<std::uint8_t, 16> eid{};
 };
 // Producer owns a fixed set of HBM MRs and one shared connection group.
 // One frozen batch selects one MR. Keep ALL allocations alive until Shutdown

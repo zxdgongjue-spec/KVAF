@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -8,21 +9,26 @@
 
 namespace kvaf::offload {
 // Provider endpoint layout shared by CPU Pull and NPU Pull.
-constexpr std::uint16_t kEndpointVersion = 2;
+constexpr std::uint16_t kEndpointVersion = 3;
 constexpr std::uint32_t kChannelCount = 4;
 constexpr std::uint32_t kMaxSpans = 4096;
 enum class Result : std::uint32_t { Ok, Invalid, NotFound, Busy, Failed, InDoubt };
 struct Span { std::uint64_t source, destination, bytes; };
-struct Endpoint {
-  std::uint64_t base{}, bytes{}, tp{};
-  // The shared DDR ticket carries the authentication token; provider token
-  // IDs remain local objects.
-  std::uint32_t psn{}, token{}, key_bytes{}, segment_bytes{};
-  // eid selects the CTP route. key and segment are opaque provider exports;
-  // their embedded EIDs can differ from the route EID and must stay unchanged.
-  std::uint8_t eid[16]{}, key[kChannelCount][64]{}, segment[64]{};
+// Shared once per source connection. Route EID is independent of the opaque
+// EIDs embedded in provider Jetty keys and MR segments.
+struct ConnectionDesc {
+  std::uint64_t tp{};
+  std::uint32_t psn{}, token{}, key_bytes{};
+  std::uint8_t eid[16]{}, key[kChannelCount][64]{};
 };
-static_assert(sizeof(Span) == 24 && sizeof(Endpoint) == 376);
+// Per-MR logical range and provider export. Token ID remains in the opaque
+// segment; token value is explicit even when registrations share its value.
+struct MemoryDesc {
+  std::uint64_t base{}, bytes{};
+  std::uint32_t token{}, segment_bytes{};
+  std::uint8_t segment[64]{};
+};
+static_assert(sizeof(Span) == 24 && sizeof(ConnectionDesc) == 296 && sizeof(MemoryDesc) == 88);
 inline bool Contains(std::uint64_t size, std::uint64_t offset, std::uint64_t bytes) {
   return bytes && offset <= size && bytes <= size - offset;
 }

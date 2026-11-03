@@ -8,11 +8,11 @@ namespace kvaf::offload {
 class Backend {
  public:
   virtual ~Backend() = default;
-  virtual Status Allocate(std::uint64_t bytes, Endpoint* local) = 0;
-  virtual Status Open(const Endpoint& source, Endpoint* local) = 0;
+  virtual Status Allocate(std::uint64_t bytes, MemoryDesc* local) = 0;
+  virtual Status Open(const ConnectionDesc& peer, const MemoryDesc& source, ConnectionDesc* local) = 0;
   // One connection owns multiple imported source MRs. Selection never posts DMA
   // or recreates queues, and is forbidden while a batch is unresolved.
-  virtual Status AddSource(std::uint64_t, const Endpoint&) {
+  virtual Status AddSource(std::uint64_t, const MemoryDesc&) {
     return Status::NotImplemented("multiple source MRs are unavailable");
   }
   virtual Status SelectSource(std::uint64_t id) {

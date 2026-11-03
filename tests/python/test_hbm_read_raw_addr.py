@@ -50,7 +50,7 @@ def producer(pipe, args, ddr_ticket, receiver):
             cpu_batch = cpu_source.ready(hbm) if args.hbm_mrs > 1 else cpu_source.ready()
             raw_batch = a_source.ready(hbm) if args.hbm_mrs > 1 else a_source.ready()
             assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
-            assert cpu_batch.source.mr_count == raw_batch.source.mr_count == args.hbm_mrs
+            assert cpu_batch.source.mr_length == hbm.numel() * hbm.element_size()
             for source, batch in ((cpu_source, cpu_batch), (a_source, raw_batch)):
                 try:
                     source.release_batch(batch)
@@ -130,6 +130,8 @@ def main():
     runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
     assert runtime.ddr_initialized
     ticket = runtime.offload_region()
+    assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
+    assert ticket["version"] == 2
     ddr_base = runtime.remote_region["base"]
     marker = torch.full((656,), 0xA5, dtype=torch.uint8)
     marker_hbm = marker.to(f"npu:{args.device_a}")
@@ -174,7 +176,7 @@ def main():
             assert torch.equal(output, expected_hbm), "NPU consumer sees incorrect raw READ output"
             assert torch.equal(output.cpu(), expected), "raw READ payload/padding mismatch"
             verify_aiv(torch, runtime, [marker] + rows, f"npu:{args.device_a}")
-            assert runtime.remote_region["base"] == ticket["base"]
+            assert runtime.remote_region["base"] == ddr_base
             runtime.batch_free(KEYS)
             parent.send(("reuse", round_id))
             assert receive(parent, "released") == round_id

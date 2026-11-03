@@ -720,12 +720,12 @@ Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken
         reinterpret_cast<std::uintptr_t>(src_offsets.data) % alignof(std::uint64_t))
       return Status::InvalidArgument("batch_cpu_pull requires nonempty, equally sized keys, src_offsets and lengths");
     const auto* source = std::get_if<CpuPullSourceDesc>(&ready.source);
-    if (!source || !ready.sequence || !source->bytes_for(ready.mr_id))
+    if (!source || !ready.sequence || !ready.mr_id || ready.mr_id > remote_pull::kMaxSourceMrs || !source->mr_length)
       return Status::InvalidArgument("batch_cpu_pull requires a CPU ReadyToken with a valid MR");
     auto status = impl_->remote_operator->ValidateCpuSource(*source);
     if (!status.ok()) return status;
     for (std::size_t i = 0; i < keys.size(); ++i) {
-      if (!lengths[i] || !offload::Contains(source->bytes_for(ready.mr_id), src_offsets.data[i], lengths[i]))
+      if (!lengths[i] || !offload::Contains(source->mr_length, src_offsets.data[i], lengths[i]))
         return Status::InvalidArgument("batch_cpu_pull source range is outside the selected MR");
     }
   }

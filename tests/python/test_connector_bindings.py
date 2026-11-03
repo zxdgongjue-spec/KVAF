@@ -75,53 +75,51 @@ class ConnectorBindings(unittest.TestCase):
         self.assertIsNone(runtime.shutdown())
 
     def test_descriptors_and_ready_survive_connector_ipc(self):
-        cpu = restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99))
-        npu = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
+        cpu = restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096))
+        npu = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
         for source in (cpu, npu):
-            ready = restored(kvaf.ReadyToken, (source, 7))
+            ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 78))
             copy = pickle.loads(pickle.dumps(ready))
             self.assertEqual(copy.sequence, 7)
+            self.assertEqual(copy.mr_id, 78)
             self.assertEqual(type(copy.source), type(source))
             self.assertEqual(copy.source.source_id, source.source_id)
-            self.assertEqual(copy.source.source_bytes, source.source_bytes)
-            self.assertFalse(hasattr(copy, "readable_ranges"))
+            for name in ("readable_ranges", "mr_bytes", "mr_count", "source_bytes"):
+                self.assertFalse(hasattr(copy.source, name))
             with self.assertRaises(AttributeError):
                 copy.sequence = 8
+            with self.assertRaises(AttributeError):
+                copy.mr_id = 1
         self.assertEqual(pickle.loads(pickle.dumps(cpu)).region_epoch, 99)
+        self.assertEqual(pickle.loads(pickle.dumps(cpu)).mr_length, 4096)
+        with self.assertRaises(AttributeError):
+            cpu.mr_length = 8
         self.assertEqual(pickle.loads(pickle.dumps(npu)).source_epoch, 88)
+        self.assertFalse(hasattr(npu, "mr_length"))
 
-    def test_cpu_multi_mr_identity_survives_connector_ipc(self):
-        sizes = [4096 + i * 64 for i in range(78)]
-        cpu = restored(kvaf.CpuPullSourceDesc, (12, sizes[0], 2, 99, sizes))
-        ready = restored(kvaf.ReadyToken, (cpu, 7, 78))
-        copy = pickle.loads(pickle.dumps(ready))
-        self.assertEqual(copy.mr_id, 78)
-        self.assertEqual(copy.source.mr_count, 78)
-        self.assertEqual(copy.source.mr_bytes, sizes)
-        # Returned lists cannot mutate the identity that is stored in KVAF.
-        copy.source.mr_bytes.clear()
-        self.assertEqual(copy.source.mr_count, 78)
-        with self.assertRaises(AttributeError):
-            copy.mr_id = 1
-        with self.assertRaises(AttributeError):
-            copy.source.mr_bytes = [1]
-        single = restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99))
-        self.assertEqual(single.mr_count, 1)
-        self.assertEqual(restored(kvaf.ReadyToken, (single, 7)).mr_id, 1)
+    def test_ready_size_does_not_grow_with_registered_mrs(self):
+        for source in (restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096)),
+                       restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))):
+            lengths = []
+            for mr in (1, 78, 4096):
+                ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, mr))
+                wire = pickle.dumps(ready)
+                self.assertEqual(pickle.loads(wire).mr_id, mr)
+                lengths.append(len(wire))
+            # Only the integer encoding of mr_id may grow, never an MR list.
+            self.assertLessEqual(max(lengths) - min(lengths), 2)
 
-    def test_npu_multi_mr_identity_survives_connector_ipc(self):
-        sizes = [4096 + i * 64 for i in range(78)]
-        source = restored(kvaf.NpuPullSourceDesc, (13, sizes[0], 88, sizes))
-        ready = restored(kvaf.ReadyToken, (source, 9, 78))
-        copy = pickle.loads(pickle.dumps(ready))
-        self.assertEqual(copy.mr_id, 78)
-        self.assertEqual(copy.source.mr_count, 78)
-        self.assertEqual(copy.source.mr_bytes, sizes)
-        copy.source.mr_bytes.clear()
-        self.assertEqual(copy.source.mr_count, 78)
-        with self.assertRaises(AttributeError):
-            copy.mr_id = 1
-        self.assertEqual(restored(kvaf.NpuPullSourceDesc, (13, 8192, 88)).mr_count, 1)
+    def test_old_identity_formats_are_rejected(self):
+        for cls, states in ((kvaf.CpuPullSourceDesc, ((12, 4096, 2, 99), (2, 4096, 2, 99, [4096]))),
+                            (kvaf.NpuPullSourceDesc, ((13, 8192, 88), (2, 8192, 88), (13, 8192, 88, [8192])))):
+            for state in states:
+                with self.subTest(cls=cls, state=state):
+                    with self.assertRaisesRegex(ValueError, "version"):
+                        restored(cls, state)
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        for state in ((source, 7), (source, 7, 1)):
+            with self.assertRaisesRegex(ValueError, "version"):
+                restored(kvaf.ReadyToken, state)
 
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_only_current_pull_interfaces_are_exported(self):
@@ -153,15 +151,15 @@ class ConnectorBindings(unittest.TestCase):
 
     def call_with_arrays(self, arrays):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
-        source = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
-        ready = restored(kvaf.ReadyToken, (source, 7))
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 1))
         runtime.batch_get_raw_addr(ready, *arrays, output=None)
 
     @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
     def test_recovery_and_cancel_accept_connector_identity_objects(self):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
-        source = restored(kvaf.NpuPullSourceDesc, (13, 8192, 88))
-        ready = restored(kvaf.ReadyToken, (source, 7))
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 1))
         # Typed arguments reach Runtime without an application-local link ID.
         with self.assertRaisesRegex(RuntimeError, "no HBM reader"):
             runtime.resolve_raw_addr(ready=ready)
@@ -174,7 +172,7 @@ class ConnectorBindings(unittest.TestCase):
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_cpu_pull_lengths_remain_batch_put_compatible(self):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
-        ready = restored(kvaf.ReadyToken, (restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99)), 1))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096)), 1, 1))
         accepted = [[8, 8], (8, 8), np.array([8, 8], dtype=np.uint64),
                     np.array([8, 8], dtype=np.int64), np.arange(4, dtype=np.uint64)[::2] + 1]
         if torch is not None:
@@ -189,7 +187,7 @@ class ConnectorBindings(unittest.TestCase):
     @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
     def test_batch_cpu_pull_requires_ready_instead_of_local_tensor(self):
         runtime = kvaf.NpuRuntime(enable_cpu_offload=True)
-        ready = restored(kvaf.ReadyToken, (restored(kvaf.CpuPullSourceDesc, (12, 4096, 2, 99)), 1))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096)), 1, 1))
         with self.assertRaises(TypeError):
             runtime.batch_cpu_pull([0], NpuTensorLayout(), [0], [8])
         with self.assertRaises(TypeError):

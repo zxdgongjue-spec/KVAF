@@ -77,11 +77,15 @@ Status ControlChannel::Replace(int fd) {
 Status ControlChannel::Exchange(Request r,Response* out) {
   std::lock_guard<std::mutex> lock(mutex_);
   if(fd_<0)return Status::InDoubt("HBM control disconnected; wait for producer reconnect, then resolve");
-  r.count=0;r.header.bytes=sizeof(r);
-  if(!offload::WriteBytes(fd_,&r,sizeof(r)) || !offload::ReadBytes(fd_,out,sizeof(*out))) {
+  r.count=0;r.header.bytes=RequestBytes(r.header.command);
+  *out={};
+  const auto response_bytes=ResponseBytes(r.header.command);
+  if(!offload::WriteBytes(fd_,&r,r.header.bytes) || !offload::ReadBytes(fd_,&out->header,sizeof(out->header)) ||
+     out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=response_bytes ||
+     !offload::ReadBytes(fd_,reinterpret_cast<char*>(out)+sizeof(out->header),response_bytes-sizeof(out->header))) {
     Close();return Status::InDoubt("HBM control response lost; retain source/output and resolve");
   }
-  if(out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=sizeof(Response) ||
+  if(out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=response_bytes ||
       out->header.command!=(r.header.command|0x8000U) || out->source_id!=r.source_id || out->epoch!=r.epoch ||
       out->client!=r.client || out->sequence!=r.sequence || out->mr_id!=r.mr_id || out->code>unsigned(StatusCode::kInDoubt)) {
     Close();return Status::InDoubt("HBM response identity/version mismatch");
@@ -92,7 +96,7 @@ Status SendHello(int fd,Admission command,const HbmReceiverTicket& receiver,cons
   Hello h{};h.header={kMagic,kVersion,std::uint16_t(command),std::uint32_t(sizeof(h)+ticket.mr_count()*8)};
   h.receiver_id=receiver.receiver_id;h.receiver_epoch=receiver.receiver_epoch;
   h.source_id=ticket.source_id;h.source_epoch=ticket.epoch;h.token=ticket.token;h.mr_count=ticket.mr_count();
-  std::vector<std::uint64_t> sizes;for(std::uint64_t i=1;i<=ticket.mr_count();++i)sizes.push_back(ticket.bytes_for(i));
+  const auto& sizes=ticket.mr_bytes;
   return offload::WriteBytes(fd,&h,sizeof(h)) && offload::WriteBytes(fd,sizes.data(),sizes.size()*8)?Status::OK():Status::InDoubt("HBM admission send failed");
 }
 Status ReadHello(int fd,Hello* h,HbmReadTicket* ticket) {
@@ -102,7 +106,7 @@ Status ReadHello(int fd,Hello* h,HbmReadTicket* ticket) {
     return Status::InvalidArgument("invalid HBM admission/version");
   std::vector<std::uint64_t> sizes(h->mr_count);
   if(!offload::ReadBytes(fd,sizes.data(),sizes.size()*8))return Status::InDoubt("HBM admission truncated");
-  *ticket={h->source_id,h->source_epoch,sizes[0],h->token};if(sizes.size()>1)ticket->mr_bytes=std::move(sizes);
+  *ticket={h->source_id,h->source_epoch,h->token,std::move(sizes)};
   return ticket->valid()?Status::OK():Status::InvalidArgument("invalid HBM source manifest");
 }
 bool SendResult(int fd,const Status& s) {

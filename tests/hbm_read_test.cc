@@ -117,6 +117,8 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRaw
 class Proxy {
  public:
   kvaf::HbmReceiverTicket receiver;
+  kvaf::HbmReadTicket manifest;
+  kvaf::HbmReadTicket Manifest() { std::lock_guard<std::mutex> l(mutex); return manifest; }
   int fd=-1;std::atomic<bool> stop{false};std::atomic<unsigned> drop{0},requests{0};
   std::thread thread;std::mutex mutex;std::vector<int> sockets;std::vector<std::thread> workers;
   explicit Proxy(kvaf::HbmReceiverTicket target):receiver(target) {
@@ -129,6 +131,7 @@ class Proxy {
       workers.emplace_back([this,client,server,target]{
         kvaf::offload::SetSocketTimeout(client);hr::Hello hello{};kvaf::HbmReadTicket ticket;
         if(hr::ReadHello(client,&hello,&ticket).ok() && hr::SendHello(server,static_cast<hr::Admission>(hello.header.command),target,ticket).ok()) {
+          {std::lock_guard<std::mutex> l(mutex);manifest=ticket;}
           while(!stop) {
             pollfd p{server,POLLIN,0};if(poll(&p,1,20)<=0)continue;
             kvaf::peer::MessageHeader h{};if(!kvaf::offload::ReadBytes(server,&h,sizeof(h)))break;
@@ -140,12 +143,17 @@ class Proxy {
               continue;
             }
             hr::Request request{};request.header=h;
-            Require(h.bytes==sizeof(request) && h.command!=9,"no AcquireRaw or metadata on control path");
-            if(!kvaf::offload::ReadBytes(server,reinterpret_cast<char*>(&request)+sizeof(h),sizeof(request)-sizeof(h)))break;
+            Require(h.bytes==hr::RequestBytes(h.command) && h.command!=9,"no AcquireRaw or metadata on control path");
+            if(!kvaf::offload::ReadBytes(server,reinterpret_cast<char*>(&request)+sizeof(h),h.bytes-sizeof(h)))break;
             ++requests;hr::Response response{};
-            if(!kvaf::offload::WriteBytes(client,&request,sizeof(request)) || !kvaf::offload::ReadBytes(client,&response,sizeof(response)))break;
+            if(!kvaf::offload::WriteBytes(client,&request,h.bytes) || !kvaf::offload::ReadBytes(client,&response,hr::ResponseBytes(h.command)))break;
+            Require(response.header.bytes==hr::ResponseBytes(h.command),"exact NPU response frame size");
+            if(h.command==unsigned(hr::Command::Memory)) {
+              Require(h.bytes==offsetof(hr::Request,connection) &&
+                      response.header.bytes==offsetof(hr::Response,connection),"extra MR frames contain no connection tail");
+            }
             if(drop==h.command){drop=0;break;}
-            if(!kvaf::offload::WriteBytes(server,&response,sizeof(response)))break;
+            if(!kvaf::offload::WriteBytes(server,&response,hr::ResponseBytes(h.command)))break;
           }
         }
         std::lock_guard<std::mutex> l(mutex);
@@ -243,6 +251,16 @@ void MultiMemory() {
   const auto probes=raw_calls.load();
   Check(b.Register(tensors,proxy.receiver,reinterpret_cast<void*>(1)));
   Require(raw_calls==probes+78&&registrations==78&&contexts==1&&jetties==4&&raw_transports==1,"78 MRs share four Jettys and one connection");
+  // Resume must still validate the entire immutable manifest even though Ready
+  // carries only identity. A changed later MR must not rebuild or replace a link.
+  auto original=proxy.Manifest();Require(original.mr_bytes.size()==78,"full manifest is exchanged only at registration");
+  auto changed=original;changed.mr_bytes[50]++;
+  int socket=hr::Connect(receiver.control_address);Require(socket>=0,"connect invalid resume");
+  Check(hr::SendHello(socket,hr::Admission::Resume,receiver,changed));
+  kvaf::peer::MessageHeader header{};Require(kvaf::offload::ReadBytes(socket,&header,sizeof(header)),"resume response header");
+  Require(hr::ReadResult(socket,header).code()==kvaf::StatusCode::kInvalidArgument,"changed MR manifest rejected on resume");
+  close(socket);
+  Require(raw_calls==probes+78&&raw_transports==1,"invalid resume never probes or rebuilds the transport");
   kvaf::ReadyToken ready;
   Require(!b.Ready(&ready).ok(),"multi-MR ready needs tensor");
   Require(!b.Ready({storage[0].data(),storage[0].size(),kvaf::DeviceKind::kNpu},&ready).ok(),"exact tensor selection");
@@ -294,8 +312,8 @@ int main(){try{
   const auto saved=token;auto bad=token;std::get<kvaf::NpuPullSourceDesc>(bad.source).source_epoch++;
   before=raw_calls;const auto before_wqes=raw_wqes.load();
   Require(!read(bad,sources,destinations,lengths).ok(),"raw-array stale identity rejected");
-  bad=token;std::get<kvaf::NpuPullSourceDesc>(bad.source).source_bytes++;
-  Require(!read(bad,sources,destinations,lengths).ok(),"raw-array source size mismatch rejected");
+  bad=token;bad.mr_id=0;
+  Require(!read(bad,sources,destinations,lengths).ok(),"raw-array invalid MR identity rejected");
   bad=token;bad.source=kvaf::CpuPullSourceDesc{};
   Require(!read(bad,sources,destinations,lengths).ok(),"raw READ rejects CPU Ready tokens");
   Require(!a.Read(token,{reinterpret_cast<const int64_t*>(output.data()),sources.size()},

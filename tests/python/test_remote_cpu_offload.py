@@ -59,7 +59,7 @@ def producer(pipe, args, ticket, lengths):
             # The application waits for production; Ready only publishes batch identity.
             stream.synchronize()  # Producer synchronization belongs to the application.
             batch = source.ready(hbm) if args.tensors > 1 else source.ready()
-            assert batch.source.mr_count == args.tensors
+            assert batch.source.mr_length == hbm.numel() * hbm.element_size()
             pipe.send(("ready", batch))
             receive(pipe, "reuse")
             source.release_batch(batch)
@@ -128,9 +128,11 @@ def main():
     runtime.link_to(args.cpu)
     runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
     ticket = runtime.offload_region()
+    assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
+    assert ticket["version"] == 2
     ddr_base = runtime.remote_region["base"]
     print(f"shared DDR region={ticket['region_id']} epoch={ticket['epoch']} "
-          f"cpu_candidate={ticket['cpu_candidate']} base={ticket['base']:#x}", flush=True)
+          f"base={ddr_base:#x}", flush=True)
     lengths = [656] * 3 if aiv else [1, 656, 100001]
     marker = torch.full((656,), 0xA5, dtype=torch.uint8)
     if aiv:
@@ -175,12 +177,12 @@ def main():
             try:
                 view = runtime.access_table_view(table)
                 assert list(view["valid"]) == [1] * 3
-                assert list(view["addresses"]) == [ticket["base"] + k * ticket["slot_size"] for k in KEYS]
+                assert list(view["addresses"]) == [ddr_base + k * runtime.remote_region["slot_size"] for k in KEYS]
             finally:
                 runtime.release_access_table(table)
             if aiv:
                 verify_aiv(torch, runtime, [marker] + rows, f"npu:{args.device_a}")
-            assert runtime.remote_region["base"] == ticket["base"], "DDR pool changed"
+            assert runtime.remote_region["base"] == ddr_base, "DDR pool changed"
             runtime.batch_free(KEYS)
             parent.send(("reuse", round_id))
             print(f"REMOTE_OFFLOAD_ROUND_PASS round={round_id} bytes={sum(lengths)} aiv_checked={int(aiv)}", flush=True)

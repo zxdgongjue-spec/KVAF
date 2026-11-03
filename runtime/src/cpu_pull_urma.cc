@@ -149,7 +149,7 @@ class UrmaBackend final : public Backend {
       for (auto& q : queues_) (void)new Queue(std::move(q));
     }
   }
-  Status Allocate(std::uint64_t bytes, Endpoint* local) override {
+  Status Allocate(std::uint64_t bytes, MemoryDesc* local) override {
     if (!context_ || !local || memory_ || !bytes || bytes > SIZE_MAX) return Error("invalid allocation");
     if (posix_memalign(&memory_, 4096, bytes)) return Error("allocate DDR");
     std::memset(memory_, 0, bytes);
@@ -158,20 +158,19 @@ class UrmaBackend final : public Backend {
     local->base = reinterpret_cast<std::uint64_t>(memory_);
     local->bytes = bytes;
     local->token = region_token_;
-    std::memcpy(local->eid, context_->eid.raw, 16);
     return Status::OK();
   }
 
-  Status Open(const Endpoint& source, Endpoint* local) override {
+  Status Open(const ConnectionDesc& peer, const MemoryDesc& source, ConnectionDesc* local) override {
     if (!local || !memory_ || source_ || poisoned_ || source.segment_bytes != sizeof(urma_seg_t) ||
-        (source.key_bytes != 28 && source.key_bytes != 32) || !source.tp || !source.psn || !source.token)
+        (peer.key_bytes != 28 && peer.key_bytes != 32) || !peer.tp || !peer.psn || !source.token)
       return Error("invalid source endpoint");
-    if (source.token != region_token_) return Error("source token differs from region token");
+    if (source.token != region_token_ || peer.token != region_token_) return Error("source token differs from region token");
     urma_seg_t segment{};
     std::memcpy(&segment, source.segment, sizeof(segment));
     if (!source.base || source.base > UINT64_MAX-source.bytes || source.base < segment.ubva.va ||
         !Contains(segment.len, source.base-segment.ubva.va, source.bytes)) return Error("source segment range");
-    for (const auto& key : source.key) {
+    for (const auto& key : peer.key) {
       urma_transport_mode_t mode{};
       std::memcpy(&mode, key+sizeof(urma_jetty_id_t), sizeof(mode));
       if (mode != URMA_TM_RM) return Error("source Jetty transport mode");
@@ -196,7 +195,8 @@ class UrmaBackend final : public Backend {
     status = RegisterDestination();
     if (!status.ok()) return status;
     std::uint64_t tp{};
-    if (!urma::QueryTp(query, context_, source.eid, &tp)) return Error("query CTP");
+    if (!urma::QueryTp(query, context_, peer.eid, &tp)) return Error("query CTP");
+    std::memcpy(local->eid, context_->eid.raw, 16);
     local->tp = tp;
     local->psn = Next(next_psn);
     local->token = region_token_;
@@ -206,8 +206,8 @@ class UrmaBackend final : public Backend {
       const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, region_token_,
           {16384, kDepth, max_sge_, false, true}, q.cq, q.rq, q.jetty);
       if (error) return Error(error);
-      q.peer = urma::ImportJetty(import, context_, source.key[index], region_token_,
-          tp, source.tp, local->psn, source.psn);
+      q.peer = urma::ImportJetty(import, context_, peer.key[index], region_token_,
+          tp, peer.tp, local->psn, peer.psn);
       if (!q.peer) return Error("import NPU Jetty " + std::to_string(index));
       std::memcpy(local->key[index], &q.jetty->jetty_id, sizeof(urma_jetty_id_t));
       std::memcpy(local->key[index]+sizeof(urma_jetty_id_t), &q.jetty->jetty_cfg.jfs_cfg.trans_mode,
@@ -225,11 +225,11 @@ class UrmaBackend final : public Backend {
     std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_REFERENCE commit=8bc5a2a endpoint_layout=%u sge_bytes=%zu "
         "jettys=%u max_sge=%u max_bytes=%u local_eid=%s peer_eid=%s psn=%u peer_psn=%u\n",
         kEndpointVersion, sizeof(urma::Sge), kChannelCount, max_sge_, max_bytes_,
-        Eid(context_->eid.raw).c_str(), Eid(source.eid).c_str(), local->psn, source.psn);
+        Eid(context_->eid.raw).c_str(), Eid(peer.eid).c_str(), local->psn, peer.psn);
     return Status::OK();
   }
 
-  Status AddSource(std::uint64_t id, const Endpoint& source) override {
+  Status AddSource(std::uint64_t id, const MemoryDesc& source) override {
     if (poisoned_) return Status::InDoubt(failure_);
     if (!id || source.segment_bytes != sizeof(urma_seg_t) || source.token != region_token_)
       return Error("invalid source MR identity");
@@ -602,7 +602,7 @@ class UrmaBackend final : public Backend {
   std::uint64_t bytes_{}, source_base_{}, source_bytes_{};
   std::uint32_t region_token_{}, max_sge_{}, max_bytes_{};
   urma_target_seg_t *destination_{}, *source_{};
-  struct SourceMemory { Endpoint endpoint{}; urma_target_seg_t* segment{}; };
+  struct SourceMemory { MemoryDesc endpoint{}; urma_target_seg_t* segment{}; };
   std::unordered_map<std::uint64_t, SourceMemory> sources_;
   std::uint64_t selected_mr_{};
   std::array<Queue, kChannelCount> queues_;

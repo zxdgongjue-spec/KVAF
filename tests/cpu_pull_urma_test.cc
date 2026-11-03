@@ -173,38 +173,42 @@ int urma_poll_jfc(urma_jfc_t* cq,int capacity,urma_cr_t* cr){
   return fault==Fault::Multiple?2:1;
 }
 }
-p::Endpoint Source(std::vector<std::uint8_t>& memory,std::uint32_t token,bool distinct_eids){
-  p::Endpoint source{};source.base=reinterpret_cast<std::uint64_t>(memory.data());source.bytes=memory.size();
-  source.tp=7;source.psn=1;source.token=token;source.key_bytes=32;source.segment_bytes=48;source.eid[15]=2;
-  urma_seg_t segment{};segment.ubva.va=source.base;segment.len=source.bytes;
+struct TestSource { p::MemoryDesc memory; p::ConnectionDesc connection; };
+kvaf::Status Open(p::Backend& backend, const TestSource& source) {
+  p::ConnectionDesc local{};return backend.Open(source.connection,source.memory,&local);
+}
+TestSource Source(std::vector<std::uint8_t>& memory,std::uint32_t token,bool distinct_eids){
+  TestSource source{};source.memory.base=reinterpret_cast<std::uint64_t>(memory.data());source.memory.bytes=memory.size();
+  source.connection.tp=7;source.connection.psn=1;source.memory.token=source.connection.token=token;source.connection.key_bytes=32;source.memory.segment_bytes=48;source.connection.eid[15]=2;
+  urma_seg_t segment{};segment.ubva.va=source.memory.base;segment.len=source.memory.bytes;
   segment.ubva.eid.raw[15]=distinct_eids?3:2;
-  std::memcpy(source.segment,&segment,sizeof(segment));auto mode=URMA_TM_RM;for(std::size_t i=0;i<p::kChannelCount;++i){
-    source.key[i][15]=segment.ubva.eid.raw[15];source.key[i][20]=i+1;
-    std::memcpy(source.key[i]+24,&mode,4);
+  std::memcpy(source.memory.segment,&segment,sizeof(segment));auto mode=URMA_TM_RM;for(std::size_t i=0;i<p::kChannelCount;++i){
+    source.connection.key[i][15]=segment.ubva.eid.raw[15];source.connection.key[i][20]=i+1;
+    std::memcpy(source.connection.key[i]+24,&mode,4);
   }
   expected_token=token;ctp_queried=false;imports=0;
-  expected_segment=segment;std::memcpy(expected_jetty_key,source.key,sizeof(expected_jetty_key));
+  expected_segment=segment;std::memcpy(expected_jetty_key,source.connection.key,sizeof(expected_jetty_key));
   return source;
 }
 void ReadTest(bool distinct_eids){
   urma_device_t device{};urma_context_t context{};context.dev=&device;context.eid.raw[15]=1;
   auto backend=p::CreateUrmaBackend(&context);
-  p::Endpoint cpu{};Require(backend->Allocate(32768,&cpu).ok(),"allocate");
+  p::MemoryDesc cpu{};Require(backend->Allocate(32768,&cpu).ok(),"allocate");
   Require(cpu.token&&local_mrs==0,"Allocate reserves DDR; registration waits for HBM import");
   std::vector<std::uint8_t> memory(20000);for(std::size_t i=0;i<memory.size();++i)memory[i]=i%251;
   auto source=Source(memory,cpu.token,distinct_eids);
-  auto invalid=source;invalid.base=source.base-1;
-  Require(!backend->Open(invalid,&cpu).ok(),"reject source before exported range");
-  invalid=source;invalid.bytes=source.bytes+1;
-  Require(!backend->Open(invalid,&cpu).ok(),"reject source extending past exported range");
-  invalid=source;invalid.base=UINT64_MAX;invalid.bytes=2;
-  Require(!backend->Open(invalid,&cpu).ok(),"reject source address overflow");
-  invalid=source;invalid.token=source.token==1?2:1;
-  Require(backend->Open(invalid,&cpu).message().find("source token differs")!=std::string::npos,"reject mismatched region token");
-  invalid=source;invalid.token=0;
-  Require(!backend->Open(invalid,&cpu).ok(),"reject missing token");
+  auto invalid=source;invalid.memory.base=source.memory.base-1;
+  Require(!Open(*backend,invalid).ok(),"reject source before exported range");
+  invalid=source;invalid.memory.bytes=source.memory.bytes+1;
+  Require(!Open(*backend,invalid).ok(),"reject source extending past exported range");
+  invalid=source;invalid.memory.base=UINT64_MAX;invalid.memory.bytes=2;
+  Require(!Open(*backend,invalid).ok(),"reject source address overflow");
+  invalid=source;invalid.memory.token=source.memory.token==1?2:1;
+  Require(Open(*backend,invalid).message().find("source token differs")!=std::string::npos,"reject mismatched region token");
+  invalid=source;invalid.memory.token=0;
+  Require(!Open(*backend,invalid).ok(),"reject missing token");
   Require(imported_mrs==0&&queues==0,"range/token errors rejected before resource creation");
-  Require(backend->Open(source,&cpu).ok()&&queues==12&&peers==4,"open four reference channels");
+  Require(Open(*backend,source).ok()&&queues==12&&peers==4,"open four reference channels");
   Require(cpu.token==registered_token,"DDR registration shares region token");
   std::vector<p::Span> spans{{7,64,10001},{15000,16000,123}};
   const int before=posts;
@@ -254,10 +258,10 @@ void ProfileSummaryTest(){
   std::fflush(stderr);const int old_stderr=dup(STDERR_FILENO);Require(old_stderr>=0,"save stderr");
   Require(dup2(fileno(output),STDERR_FILENO)>=0,"redirect profile output");
   urma_context_t context{};context.eid.raw[15]=1;
-  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
   Require(backend->Allocate(4096,&cpu).ok(),"profile pool");
   std::vector<std::uint8_t> hbm(4096,0x75);
-  Require(backend->Open(Source(hbm,cpu.token,true),&cpu).ok(),"profile source");
+  Require(Open(*backend,Source(hbm,cpu.token,true)).ok(),"profile source");
   std::uint64_t checksum{};
   Require(backend->ProbeToScratch(64,64,&checksum).ok(),"profile excludes startup probe");
   for(int i=0;i<3;++i){
@@ -281,15 +285,15 @@ void RegistrationFailureTest(){
   urma_context_t context{};
   for(auto invalid:{BadLocalSegment::ZeroBase,BadLocalSegment::Short,BadLocalSegment::NoWrite,BadLocalSegment::NonPin}){
     bad_local_segment=invalid;
-    auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+    auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
     Require(backend->Allocate(4096,&cpu).ok(),"allocate invalid-registration pool");
     std::vector<std::uint8_t> memory(4096);
     const auto source=Source(memory,cpu.token,true);
-    const auto status=backend->Open(source,&cpu);
+    const auto status=Open(*backend,source);
     Require(status.message().find("invalid registered DDR")!=std::string::npos,"reject malformed DDR registration");
     Require(imported_mrs==1&&queues==0,"invalid DDR never linked or used for READ");
     Require(backend->ReleaseSource().ok(),"release failed source setup");
-    Require(!backend->Open(source,&cpu).ok(),"retry never accepts previously invalid registered DDR");
+    Require(!Open(*backend,source).ok(),"retry never accepts previously invalid registered DDR");
     Require(backend->Close().ok()&&local_mrs==0,"failed registration cleans up");
   }
   bad_local_segment=BadLocalSegment::None;
@@ -297,18 +301,18 @@ void RegistrationFailureTest(){
 void PartialChannelFailureTest(){
   urma_context_t context{};context.eid.raw[15]=1;
   for(bool importing:{false,true})for(int index=0;index<int(p::kChannelCount);++index){
-    auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+    auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
     Require(backend->Allocate(4096,&cpu).ok(),"allocate partial setup pool");
     std::vector<std::uint8_t> memory(4096,0x5a);
     auto source=Source(memory,cpu.token,true);
     (importing?fail_import:fail_create)=index;
     const int before=post_calls;
-    Require(!backend->Open(source,&cpu).ok()&&post_calls==before,"partial channel setup never submits READ");
+    Require(!Open(*backend,source).ok()&&post_calls==before,"partial channel setup never submits READ");
     Require(backend->ReleaseSource().ok()&&queues==0&&peers==0&&imported_mrs==0&&local_mrs==1,
             "partial four-channel setup cleans up and retains DDR pool");
     fail_import=fail_create=-1;
     source=Source(memory,cpu.token,true);
-    Require(backend->Open(source,&cpu).ok(),"retry uses retained DDR registration");
+    Require(Open(*backend,source).ok(),"retry uses retained DDR registration");
     Require(backend->Read({{64,0,64}}).ok(),"retry can read after partial setup cleanup");
     Require(backend->Close().ok()&&queues==0&&peers==0&&local_mrs==0&&imported_mrs==0,"retry closes cleanly");
   }
@@ -316,11 +320,11 @@ void PartialChannelFailureTest(){
 void ProbeFailureTest(Fault injected, bool teardown_failure=false) {
   fault=injected;fail_delete=teardown_failure;
   urma_context_t context{};context.eid.raw[15]=1;
-  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
   Require(backend->Allocate(4096,&cpu).ok(),"probe pool");
   std::vector<std::uint8_t> memory(4096,0xa5);
   const auto source=Source(memory,cpu.token,true);
-  Require(backend->Open(source,&cpu).ok(),"probe link");
+  Require(Open(*backend,source).ok(),"probe link");
   const auto result=backend->Probe({{64,0,64}});
   const bool retired=!teardown_failure&&(injected==Fault::LocalAccess||injected==Fault::CqStatus);
   Require(!result.ok(),"probe error cannot select candidate");
@@ -345,8 +349,8 @@ void BorrowedPoolTest() {
   auto backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),123,pool);
   Require(pool.use_count()==2,"borrowed backend holds shared DDR lease");
   std::vector<std::uint8_t> hbm(4096,0x91);
-  auto source=Source(hbm,123,true);p::Endpoint cpu{};cpu.token=123;
-  Require(backend->Open(source,&cpu).ok()&&local_mrs==1,"borrowed pool registered locally");
+  auto source=Source(hbm,123,true);p::MemoryDesc cpu{};cpu.token=123;
+  Require(Open(*backend,source).ok()&&local_mrs==1,"borrowed pool registered locally");
   std::uint64_t hash{};
   Require(backend->ProbeToScratch(64,64,&hash).ok()&&hash==p::Hash(hbm.data()+64,64),"scratch probe checksum");
   Require(local_mrs==1&&std::all_of(pool->begin(),pool->end(),[](auto c){return c==0x5a;}),"scratch MR released; all DDR slots unchanged");
@@ -363,16 +367,16 @@ void MultipleMrTransportTest() {
   auto backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),token,pool,destination);
   std::vector<std::vector<std::uint8_t>> memories(78);
   for(std::size_t i=0;i<memories.size();++i)memories[i].resize(20000+i*64,std::uint8_t(i+1));
-  auto source=Source(memories[0],token,true);p::Endpoint cpu{};cpu.base=base;cpu.bytes=pool->size();cpu.token=token;
-  Require(backend->Open(source,&cpu).ok(),"open shared MR group");
+  auto source=Source(memories[0],token,true);p::MemoryDesc cpu{};cpu.base=base;cpu.bytes=pool->size();cpu.token=token;
+  Require(Open(*backend,source).ok(),"open shared MR group");
   for(std::size_t i=1;i<memories.size();++i) {
-    auto mr=source;mr.base=reinterpret_cast<std::uint64_t>(memories[i].data());mr.bytes=memories[i].size();
-    urma_seg_t segment{};std::memcpy(&segment,mr.segment,sizeof(segment));
-    segment.ubva.va=mr.base;segment.len=mr.bytes;segment.token_id=0x10000+i*256;
-    std::memcpy(mr.segment,&segment,sizeof(segment));expected_segment=segment;
-    Require(backend->AddSource(i+1,mr).ok(),"import additional HBM MR");
-    Require(backend->AddSource(i+1,mr).ok(),"same MR import is idempotent");
-    ++mr.bytes;Require(!backend->AddSource(i+1,mr).ok(),"MR identity cannot be replaced");
+    auto mr=source;mr.memory.base=reinterpret_cast<std::uint64_t>(memories[i].data());mr.memory.bytes=memories[i].size();
+    urma_seg_t segment{};std::memcpy(&segment,mr.memory.segment,sizeof(segment));
+    segment.ubva.va=mr.memory.base;segment.len=mr.memory.bytes;segment.token_id=0x10000+i*256;
+    std::memcpy(mr.memory.segment,&segment,sizeof(segment));expected_segment=segment;
+    Require(backend->AddSource(i+1,mr.memory).ok(),"import additional HBM MR");
+    Require(backend->AddSource(i+1,mr.memory).ok(),"same MR import is idempotent");
+    ++mr.memory.bytes;Require(!backend->AddSource(i+1,mr.memory).ok(),"MR identity cannot be replaced");
   }
   Require(imported_mrs==78&&local_mrs==1&&queues==12&&peers==4&&imports==4,
           "78 imports share four Jettys and one DDR destination MR");
@@ -396,7 +400,7 @@ void MultipleMrTransportTest() {
   // A later source/candidate borrows the same pinned registration, even though
   // it has its own peer link. Never allocate another receiving MR for the pool.
   backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),token,pool,destination);
-  Require(backend->Open(Source(memories[1],token,true),&cpu).ok()&&local_mrs==1,"another source reuses pool MR");
+  Require(Open(*backend,Source(memories[1],token,true)).ok()&&local_mrs==1,"another source reuses pool MR");
   Require(backend->Read(spans).ok()&&backend->Close().ok(),"second source reads and detaches");
   Require(p::CloseUrmaDestination(destination).ok()&&local_mrs==0,"DDR owner finally unregisters MR");
   destination.reset();Require(pool.use_count()==1,"all source leases released");
@@ -404,11 +408,11 @@ void MultipleMrTransportTest() {
 void BulkReadTest(std::size_t count, std::uint32_t depth) {
   returned_depth=depth;
   urma_context_t context{};context.eid.raw[15]=1;
-  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
   Require(backend->Allocate((count+1)*4096,&cpu).ok(),"bulk pool");
   std::vector<std::uint8_t> hbm((count+1)*4099);
   auto source=Source(hbm,cpu.token,true);
-  Require(backend->Open(source,&cpu).ok(),"bulk link");
+  Require(Open(*backend,source).ok(),"bulk link");
   std::vector<p::Span> spans;
   for(std::size_t i=0;i<count;++i)
     spans.push_back({(count-1-i)*4099+7,i*4096+3,65+i%1900});
@@ -451,11 +455,11 @@ void BulkReadTest(std::size_t count, std::uint32_t depth) {
 }
 void BulkFailureTest(Fault injected) {
   urma_context_t context{};context.eid.raw[15]=1;
-  auto backend=p::CreateUrmaBackend(&context);p::Endpoint cpu{};
+  auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
   Require(backend->Allocate(512*128,&cpu).ok(),"fault pool");
   std::vector<std::uint8_t> hbm(512*256,0x93);
   auto source=Source(hbm,cpu.token,true);
-  Require(backend->Open(source,&cpu).ok(),"fault link");
+  Require(Open(*backend,source).ok(),"fault link");
   std::vector<p::Span> spans;
   for(unsigned i=0;i<512;++i)spans.push_back({i*256U,i*128U,64});
   fault=injected;

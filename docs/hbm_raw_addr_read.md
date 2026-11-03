@@ -72,7 +72,7 @@ ready 即正式发布读取许可，P 必须保持该 Tensor 内容稳定到完�
 - Complete/Cancel 响应丢失时，保留源和 output，用原 ReadyToken 调用 resolve_raw_addr。P 后台仅重新建立 TCP，D 校验同一接收端代次、源身份和 MR 清单后复用原连接状态；恢复绝不重放 READ。
 - DMA 状态不确定仍保留资源并返回 InDoubt，TCP 断开不代表 DMA 已结束。接收端重启或会话退役后，旧连接不能自动创建一套新硬件资源。
 - 正常关闭：应用停止任务 → P release_batch → P source.shutdown() → D runtime.shutdown()。source.shutdown 内部通知 D 关闭发起端资源，再关闭 P 导出资源并确认退役，无需应用持有 export_ticket。失败继续保留对象并重试；D 全局 shutdown 也会关闭所有源连接。
-- 线协议为 KVHR v6，要求两端一起更新。CPU Pull 协议与 API 不变。
+- 线协议为 KVHR v7，要求两端一起更新。CPU Pull 同期更新为 KVRP v6；两条公开读取接口的调用方式不变。
 
 可选 `profile=True` 在成功结果中增加 `profile` 字典，单位均为微秒：
 
@@ -114,7 +114,9 @@ raw READ V2 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总
 
 仅建链的 all-lane 探测仍使用内部 Host 绝对地址描述符模式，不再作为公开数据读取接口。探测失败必须确认 kernel 已退出且 initiator 队列成功销毁后才能换候选。
 
-KVHR v6 运行阶段控制消息只传源/连接身份、MR ID 和批次号，不传三数组或 payload；初始化另行交换各 MR 的导出信息。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和未决任务；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和批次状态。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
+NPU ReadyToken.source 只包含 source_id 和 source_epoch，ReadyToken 另含 sequence 与 mr_id。完整 MR 长度列表保存在 KVAF 内部，单 MR 也使用非空列表；初始化及 TCP 重连仍检查完整清单。连接描述与 MR 描述分别存储，新增 MR 的 Memory 请求/响应不再携带 Jetty/TP 描述。
+
+KVHR v7 运行阶段控制消息只传源/连接身份、MR ID 和批次号，不传三数组或 payload；初始化另行交换各 MR 的导出信息。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和未决任务；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和批次状态。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
 
 同一个 reader 的控制请求复用 TCP 连接，双方启用 TCP_NODELAY；服务端轮询多连接，空闲连接不阻塞其他请求。服务端通过 Response 的保留字段声明连接复用能力，同版本未声明复用的服务端使用单请求连接；不同线协议版本拒绝通信。通信结果不确定时关闭连接，由既有 resolve 流程恢复，不自动重发请求。Acquire/Complete 和同步返回继续保留，用于保证 B 的 ready/release_batch 复用时序。
 
@@ -124,7 +126,7 @@ KVHR v6 运行阶段控制消息只传源/连接身份、MR ID 和批次号，�
 
 ## 编译与硬件验证
 
-此次多 MR NPU Pull 需同时重编译、重启 A/B 的 NPU 运行库与 Python 扩展（KVHR v6）。CPU Pull 的 KVRP v5 未改，已有匹配的 CPU service 无需因此更新。raw READ kernel ABI 保持 V2。
+本次描述符精简需同时重编译、重启 A/B 的 NPU 运行库与 Python 扩展（KVHR v7）；如果启用 CPU Pull，还需更新 CPU service（KVRP v6）。raw READ kernel ABI 保持 V2，NPU receiver ticket 仍为 version=1。
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash

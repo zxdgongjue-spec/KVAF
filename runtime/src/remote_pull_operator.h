@@ -25,6 +25,7 @@ class RemotePullOperator final : public AccessOperator {
   AccessOperator* aiv_{};
   std::shared_ptr<peer::PeerLink> link_;
   OffloadRegionTicket ticket_;
+  remote_pull::RegionInfo region_{}; // Complete reader-local DDR description.
   CpuPullRequest current_;
   bool active_{};
   bool committed_{};

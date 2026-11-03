@@ -7,8 +7,8 @@ namespace rp = remote_pull;
 namespace {
 Status Error(const std::string& s) { return Status::Internal("Remote Offload: " + s); }
 rp::Request Request(const OffloadRegionTicket& ticket, std::uint64_t id, std::uint64_t sequence, rp::Command command) {
-  auto r = rp::MakeRequest(command); r.region = ticket.region.id; r.epoch = ticket.region.epoch;
-  r.token = ticket.region.token; r.source_id = id; r.task = sequence; return r;
+  auto r = rp::MakeRequest(command); r.region = ticket.region_id; r.epoch = ticket.epoch;
+  r.token = ticket.token; r.source_id = id; r.task = sequence; return r;
 }
 Status Result(const rp::Response& response, const char* operation) {
   if (response.result == rp::Result::Ok) return Status::OK();
@@ -23,7 +23,7 @@ struct CpuPullHbmSource::Impl {
   std::string eid, selected;
   OffloadRegionTicket ticket;
   std::vector<ConstBufferView> inputs;
-  std::vector<offload::Endpoint> memories;
+  std::vector<offload::MemoryDesc> memories;
   std::unique_ptr<detail::Exporter> exporter;
   std::uint64_t id{}, sequence{}, mr_id{1};
   bool attached{}, bound{}, frozen{};
@@ -36,7 +36,9 @@ struct CpuPullHbmSource::Impl {
     auto r = Request(ticket, id, use_sequence ? sequence : 0, cmd);
     r.mr_id = mr_id;
     r.memory_count = static_cast<std::uint32_t>(inputs.size());
-    if (mr_id && mr_id <= memories.size()) r.source = memories[mr_id-1];
+    if (cmd == rp::Command::Attach) r.connection = exporter->connection;
+    if ((cmd == rp::Command::Attach || cmd == rp::Command::AddMemory) && mr_id && mr_id <= memories.size())
+      r.source = memories[mr_id-1];
     return rp::Exchange(ticket.address, r, spans, out);
   }
   Status Shutdown() {
@@ -66,7 +68,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
   auto status = impl_->Device(); if (!status.ok()) return status;
   if (impl_->exporter || impl_->attached || impl_->frozen) return Status::InvalidState("source is already registered or unresolved");
   if (inputs.empty() || inputs.size() > rp::kMaxSourceMrs || !stream ||
-      !ticket.region.id || !ticket.region.epoch || !ticket.region.token || ticket.address.empty())
+      !ticket.region_id || !ticket.epoch || !ticket.token || ticket.address.empty())
     return Status::InvalidArgument("Register requires B HBM, producer stream and a shared DDR ticket");
   std::vector<std::pair<std::uintptr_t, std::size_t>> ranges;
   for (const auto& input : inputs) {
@@ -90,8 +92,8 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
     if (!detail::ParseEid(impl_->eid, candidate.eid.data())) return Status::InvalidArgument("invalid B NPU EID");
     candidate.source = "explicit"; candidates.push_back(candidate);
   }
-  offload::Endpoint cpu{}; cpu.base = ticket.region.base; cpu.bytes = ticket.region.bytes;
-  cpu.token = ticket.region.token; std::memcpy(cpu.eid, ticket.region.eid, 16);
+  offload::ConnectionDesc cpu{};
+  cpu.token = ticket.token; std::memcpy(cpu.eid, ticket.eid.data(), 16);
   for (const auto& candidate : candidates) {
     impl_->inputs = inputs; impl_->id = detail::Nonce(); impl_->sequence = 0; impl_->mr_id = 1;
     impl_->exporter = std::make_unique<detail::Exporter>();
@@ -100,7 +102,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
     if (status.ok()) {
       impl_->memories.push_back(impl_->exporter->descriptor);
       for (std::size_t i = 1; status.ok() && i < inputs.size(); ++i) {
-        offload::Endpoint memory{};
+        offload::MemoryDesc memory{};
         status = impl_->exporter->AddMemory(inputs[i], &memory);
         if (status.ok()) impl_->memories.push_back(memory);
       }
@@ -110,7 +112,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
       rp::Response response{};
       status = impl_->Call(rp::Command::Attach, {}, &response, false);
       if (status.ok()) status = Result(response, "Attach");
-      if (status.ok()) status = impl_->exporter->Bind(response.endpoint);
+      if (status.ok()) status = impl_->exporter->Bind(response.connection);
       for (std::size_t i = 1; status.ok() && i < inputs.size(); ++i) {
         impl_->mr_id = i+1;
         status = impl_->Call(rp::Command::AddMemory, {}, &response, false);
@@ -141,7 +143,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
       impl_->bound = true; impl_->selected = eid;
       impl_->mr_id = 1;
       std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_READY region=%llu source=%llu device=%u npu_eid=%s mrs=%zu jettys=4 probe=all_mrs_scratch_checksum_pass\n",
-          (unsigned long long)ticket.region.id, (unsigned long long)impl_->id, impl_->device, eid.c_str(), inputs.size());
+          (unsigned long long)ticket.region_id, (unsigned long long)impl_->id, impl_->device, eid.c_str(), inputs.size());
       return status;
     }
     if (status.code() == StatusCode::kInDoubt) return status;
@@ -153,9 +155,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
 }
 Status CpuPullHbmSource::GetDescriptor(CpuPullSourceDesc* out) const {
   if (!out || !impl_->bound) return Status::InvalidState("register CPU Pull HBM before exporting its descriptor");
-  *out = {impl_->id, impl_->inputs.front().bytes, impl_->ticket.region.id, impl_->ticket.region.epoch};
-  if (impl_->inputs.size() > 1)
-    for (const auto& input : impl_->inputs) out->mr_bytes.push_back(input.bytes);
+  *out = {impl_->id, impl_->ticket.region_id, impl_->ticket.epoch, impl_->inputs[impl_->mr_id-1].bytes};
   return Status::OK();
 }
 Status CpuPullHbmSource::Ready(ReadyToken* out) {
@@ -166,7 +166,7 @@ Status CpuPullHbmSource::Ready(ConstBufferView input, ReadyToken* out) {
   auto status = impl_->Device(); if (!status.ok()) return status;
   CpuPullSourceDesc source;
   if (!out) return Status::InvalidArgument("missing ReadyToken output");
-  status = GetDescriptor(&source); if (!status.ok()) return status;
+  if (!impl_->bound) return Status::InvalidState("register CPU Pull HBM before Ready");
   const auto it = std::find_if(impl_->inputs.begin(), impl_->inputs.end(), [&](ConstBufferView registered) {
     return registered.data == input.data && registered.bytes == input.bytes && registered.device == input.device;
   });
@@ -178,6 +178,7 @@ Status CpuPullHbmSource::Ready(ConstBufferView input, ReadyToken* out) {
     if (impl_->sequence == UINT64_MAX) return Status::InvalidState("source sequence exhausted");
     ++impl_->sequence; impl_->frozen = true; impl_->mr_id = mr_id;
   }
+  status = GetDescriptor(&source); if (!status.ok()) return status;
   *out = {source, impl_->sequence, impl_->mr_id}; // Recoverable after a lost Ready ACK.
   rp::Response response{};
   status = impl_->Call(rp::Command::Ready, {}, &response);

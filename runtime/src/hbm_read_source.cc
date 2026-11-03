@@ -20,17 +20,17 @@ struct NpuPullHbmSource::Impl {
   std::string eid,selected;
   mutable std::mutex mutex;
   std::vector<ConstBufferView> inputs;
-  std::vector<offload::Endpoint> memories;
+  std::vector<offload::MemoryDesc> memories;
   std::vector<std::uint64_t> checksums;
   HbmReadTicket ticket{};
   std::vector<npu_eid::NpuLocalEidCandidate> candidates;
   std::unique_ptr<detail::Exporter> exporter;
-  std::array<offload::Endpoint,offload::kChannelCount> peers{};
+  std::array<offload::ConnectionDesc,offload::kChannelCount> peers{};
   std::array<bool,offload::kChannelCount> bound{};
   std::set<std::uint64_t> retired;
   std::uint64_t client{},sequence{},completed{},mr_id{1},completed_mr{};
   std::uint32_t candidate{};
-  offload::Endpoint initiator{};
+  offload::ConnectionDesc initiator{};
   Status open_result;
   hr::State state{hr::State::Registered};
   bool confirmed{},frozen{},closing{};
@@ -54,7 +54,6 @@ struct NpuPullHbmSource::Impl {
     if(command==hr::Command::Discover) {
       response->candidates=candidates.size();
       if(r.candidate>=candidates.size()) return Status::NotFound("HBM EID candidate not found");
-      std::memcpy(response->endpoint.eid,candidates[r.candidate].eid.data(),16);
       return Status::OK();
     }
     if(!r.client) return Status::InvalidArgument("missing HBM reader identity");
@@ -64,14 +63,14 @@ struct NpuPullHbmSource::Impl {
       if(retired.count(r.client)) return Status::InvalidState("reader connection already retired");
       if(client && client!=r.client) return Status::Busy("HBM already has a reader");
       if(client) {
-        if(candidate!=r.candidate || std::memcmp(initiator.eid,r.endpoint.eid,16))
+        if(candidate!=r.candidate || std::memcmp(initiator.eid,r.connection.eid,16))
           return Status::InvalidArgument("reader retry changed its EID pair");
-        if(open_result.ok()) { response->endpoint=memories.front(); response->checksum=checksums.front(); response->mr_count=inputs.size(); }
+        if(open_result.ok()) { response->memory=memories.front();response->connection=exporter->connection; response->checksum=checksums.front(); response->mr_count=inputs.size(); }
         return open_result;
       }
       if(frozen || r.candidate>=candidates.size()) return Status::Busy("cannot attach while HBM is frozen");
       if(retired.size()>=256) return Status::Busy("HBM connection history full; recreate source");
-      peer_retired=false;client=r.client; candidate=r.candidate; initiator=r.endpoint; initiator.token=ticket.token;
+      peer_retired=false;client=r.client; candidate=r.candidate; initiator=r.connection; initiator.token=ticket.token;
       exporter=std::make_unique<detail::Exporter>();
       selected=npu_eid::EidToHex(candidates[candidate].eid);
       memories.resize(inputs.size()); checksums.resize(inputs.size());
@@ -87,7 +86,7 @@ struct NpuPullHbmSource::Impl {
           open_result=Status::Internal("copy HBM READ probe expectation");
         checksums[i]=offload::Hash(expected.data(),n);
       }
-      if(open_result.ok()) {response->endpoint=memories.front();response->checksum=checksums.front();response->mr_count=inputs.size();}
+      if(open_result.ok()) {response->memory=memories.front();response->connection=exporter->connection;response->checksum=checksums.front();response->mr_count=inputs.size();}
       return open_result;
     }
     if(client!=r.client || !exporter) return Status::NotFound("HBM reader connection not found");
@@ -100,23 +99,23 @@ struct NpuPullHbmSource::Impl {
     if(!open_result.ok()) return open_result;
     if(command==hr::Command::Memory) {
       if(!r.mr_id || r.mr_id>memories.size()) return Status::InvalidArgument("unknown HBM MR");
-      response->endpoint=memories[r.mr_id-1];response->checksum=checksums[r.mr_id-1];
+      response->memory=memories[r.mr_id-1];response->checksum=checksums[r.mr_id-1];
       response->mr_count=memories.size();return Status::OK();
     }
     if(command==hr::Command::Channel) {
-      if(confirmed || r.channel>=bound.size() || std::memcmp(r.endpoint.eid,initiator.eid,16))
+      if(confirmed || r.channel>=bound.size() || std::memcmp(r.connection.eid,initiator.eid,16))
         return Status::InvalidArgument("invalid HBM target channel");
       if(bound[r.channel]) {
-        if(std::memcmp(&peers[r.channel],&r.endpoint,sizeof(r.endpoint)))
+        if(std::memcmp(&peers[r.channel],&r.connection,sizeof(r.connection)))
           return Status::InvalidArgument("channel retry changed descriptor");
       } else {
         // Preserve a partial failed import: do not retry into the same handle.
         if(peers[r.channel].key_bytes) return Status::InDoubt("partial target import; detach before retry");
-        peers[r.channel]=r.endpoint;
-        auto s=exporter->BindNpuChannel(r.channel,r.endpoint); if(!s.ok()) return s;
+        peers[r.channel]=r.connection;
+        auto s=exporter->BindNpuChannel(r.channel,r.connection); if(!s.ok()) return s;
         bound[r.channel]=true;
       }
-      response->endpoint=exporter->NpuChannelDescriptor(r.channel); return Status::OK();
+      response->connection=exporter->NpuChannelDescriptor(r.channel); return Status::OK();
     }
     if(command==hr::Command::Confirm) {
       if(!bound[0]) return Status::InvalidState("HBM has no bound channel");
@@ -174,16 +173,16 @@ struct NpuPullHbmSource::Impl {
             report(status);continue;
           }
           hr::Request r{};r.header=h;
-          if(h.magic!=hr::kMagic || h.version!=hr::kVersion || h.bytes!=sizeof(r) ||
-             !offload::ReadBytes(fd,reinterpret_cast<char*>(&r)+sizeof(h),sizeof(r)-sizeof(h)) || r.count)break;
+          if(h.magic!=hr::kMagic || h.version!=hr::kVersion || h.bytes!=hr::RequestBytes(h.command) ||
+             !offload::ReadBytes(fd,reinterpret_cast<char*>(&r)+sizeof(h),h.bytes-sizeof(h)) || r.count)break;
           hr::Response response{};
-          response.header={hr::kMagic,hr::kVersion,std::uint16_t(h.command|0x8000U),sizeof(response)};
+          response.header={hr::kMagic,hr::kVersion,std::uint16_t(h.command|0x8000U),hr::ResponseBytes(h.command)};
           response.source_id=r.source_id;response.epoch=r.epoch;response.client=r.client;
           response.sequence=r.sequence;response.mr_id=r.mr_id;
           Status result;
           {std::lock_guard<std::mutex> lock(mutex);result=Handle(r,&response);response.state=unsigned(state);}
           response.code=unsigned(result.code());std::snprintf(response.detail,sizeof(response.detail),"%s",result.message().c_str());
-          if(!offload::WriteBytes(fd,&response,sizeof(response)))break;
+          if(!offload::WriteBytes(fd,&response,hr::ResponseBytes(h.command)))break;
         }
         {std::lock_guard<std::mutex> lock(socket_mutex);socket=-1;close(fd);}
       }
@@ -230,8 +229,8 @@ Status NpuPullHbmSource::Register(const std::vector<ConstBufferView>& inputs,con
     impl_->candidates.push_back(c);
   }
   impl_->inputs=inputs;impl_->closing=false;impl_->sequence=impl_->completed=impl_->completed_mr=0;impl_->mr_id=1;
-  impl_->ticket={detail::Nonce(),detail::Nonce(),inputs.front().bytes,std::uint32_t(detail::Nonce())|1U};
-  if(inputs.size()>1) for(const auto& input:inputs) impl_->ticket.mr_bytes.push_back(input.bytes);
+  impl_->ticket={detail::Nonce(),detail::Nonce(),std::uint32_t(detail::Nonce())|1U,{}};
+  for(const auto& input:inputs) impl_->ticket.mr_bytes.push_back(input.bytes);
   impl_->receiver=receiver;impl_->admission_sent=false;impl_->peer_retired=false;impl_->stop=false;
   std::promise<Status> promise;auto future=promise.get_future();
   impl_->thread=std::thread([p=impl_.get(),promise=std::move(promise)]()mutable{p->Serve(std::move(promise));});

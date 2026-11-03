@@ -7,24 +7,14 @@
 #include "status.h"
 
 namespace kvaf {
+// Per-batch CPU source description. mr_length belongs to ReadyToken::mr_id;
+// the complete registration manifest remains on the producer and CPU service.
 struct CpuPullSourceDesc {
-  std::uint64_t source_id{}, source_bytes{}, region_id{}, region_epoch{};
-  // Empty for a single-MR source; otherwise indexed by mr_id - 1.
-  // source_bytes remains the first tensor's size, never an address envelope.
-  std::vector<std::uint64_t> mr_bytes;
-  std::size_t mr_count() const { return mr_bytes.empty() ? 1 : mr_bytes.size(); }
-  std::uint64_t bytes_for(std::uint64_t mr_id) const {
-    return !mr_id || mr_id > mr_count() ? 0 : mr_bytes.empty() ? source_bytes : mr_bytes[mr_id-1];
-  }
+  std::uint64_t source_id{}, region_id{}, region_epoch{}, mr_length{};
 };
+// NPU reader already owns the manifest installed during registration.
 struct NpuPullSourceDesc {
-  std::uint64_t source_id{}, source_bytes{}, source_epoch{};
-  // Same indexing as CPU Pull; independent registrations and identities.
-  std::vector<std::uint64_t> mr_bytes;
-  std::size_t mr_count() const { return mr_bytes.empty() ? 1 : mr_bytes.size(); }
-  std::uint64_t bytes_for(std::uint64_t mr_id) const {
-    return !mr_id || mr_id > mr_count() ? 0 : mr_bytes.empty() ? source_bytes : mr_bytes[mr_id-1];
-  }
+  std::uint64_t source_id{}, source_epoch{};
 };
 struct ReadyToken {
   std::variant<CpuPullSourceDesc, NpuPullSourceDesc> source;
@@ -32,11 +22,11 @@ struct ReadyToken {
   std::uint64_t mr_id{1}; // One registered tensor per batch, for either Pull path.
 };
 inline bool SameSource(const CpuPullSourceDesc& a, const CpuPullSourceDesc& b) {
-  return a.source_id == b.source_id && a.source_bytes == b.source_bytes &&
-      a.region_id == b.region_id && a.region_epoch == b.region_epoch && a.mr_bytes == b.mr_bytes;
+  return a.source_id == b.source_id && a.region_id == b.region_id &&
+      a.region_epoch == b.region_epoch && a.mr_length == b.mr_length;
 }
 inline bool SameSource(const NpuPullSourceDesc& a, const NpuPullSourceDesc& b) {
-  return a.source_id == b.source_id && a.source_bytes == b.source_bytes && a.source_epoch == b.source_epoch && a.mr_bytes == b.mr_bytes;
+  return a.source_id == b.source_id && a.source_epoch == b.source_epoch;
 }
 
 // Host-only, read-only contiguous arrays. The caller keeps them stable during

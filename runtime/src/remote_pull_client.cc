@@ -46,17 +46,19 @@ Status Exchange(const std::string& address, Request request,
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   }
   request.count = static_cast<std::uint32_t>(spans.size());
-  request.header.bytes = sizeof(Request) + request.count * sizeof(Span);
-  const bool ok = WriteBytes(fd, &request, sizeof(request)) &&
-      WriteBytes(fd, spans.data(), spans.size() * sizeof(Span)) && ReadBytes(fd, response, sizeof(*response));
+  const auto request_bytes = RequestBytes(request.header.command);
+  request.header.bytes = request_bytes + request.count * sizeof(Span);
+  *response = {};
+  const bool sent = WriteBytes(fd, &request, request_bytes) && WriteBytes(fd, spans.data(), spans.size()*sizeof(Span));
+  auto& h = response->header;
+  const auto response_bytes = ResponseBytes(request.header.command);
+  const bool header_ok = sent && ReadBytes(fd, &h, sizeof(h)) && h.magic == kMagic && h.version == kVersion &&
+      h.bytes == response_bytes && h.command == (request.header.command | 0x8000U);
+  const bool ok = header_ok && ReadBytes(fd, reinterpret_cast<char*>(response)+sizeof(h), response_bytes-sizeof(h));
   close(fd);
-  if (!ok) return Status::InDoubt("CPU control response unavailable; retain source and task");
-  const auto& h = response->header;
-  if (h.magic != kMagic || h.version != kVersion || h.bytes != sizeof(Response) ||
-      h.command != (request.header.command | 0x8000U) ||
-      response->region != request.region || response->source_id != request.source_id || response->task != request.task ||
-      response->mr_id != request.mr_id ||
-      (request.epoch && response->epoch != request.epoch))
+  if (!ok) return Status::InDoubt("CPU control response unavailable or version mismatch; retain source and task");
+  if (response->region != request.region || response->source_id != request.source_id || response->task != request.task ||
+      response->mr_id != request.mr_id || (request.epoch && response->epoch != request.epoch))
     return Status::InDoubt("CPU response identity/version mismatch");
   return Status::OK();
 }

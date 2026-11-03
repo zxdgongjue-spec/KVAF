@@ -130,6 +130,8 @@ def main():
         slot = ((args.block_bytes + 4095) // 4096) * 4096
         runtime.initialize(ddr_bytes=args.blocks * slot, slot_size=slot)
         ticket = runtime.offload_region()
+        assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
+        assert ticket["version"] == 2
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
         worker = ctx.Process(target=producer, args=(child, args, ticket))
@@ -137,7 +139,7 @@ def main():
         child.close()
         src = torch.tensor(offsets, dtype=torch.int64, device="cpu")
         sizes = torch.full((args.blocks,), args.block_bytes, dtype=torch.int64, device="cpu")
-        print(f"CPU_PULL_BENCH_READY cpu_candidate={ticket['cpu_candidate']} "
+        print(f"CPU_PULL_BENCH_READY region={ticket['region_id']} "
               f"b_eid={receive(parent, 'registered')} blocks={args.blocks} "
               f"block_bytes={args.block_bytes}", flush=True)
         keys = list(range(args.blocks))

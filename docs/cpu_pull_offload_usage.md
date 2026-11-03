@@ -1,6 +1,6 @@
 # CPU Pull 构建与验证
 
-当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，公开接口使用 KVRP v5；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
+当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，控制协议使用 KVRP v6；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
 
 ## CPU 服务
 
@@ -75,7 +75,9 @@ runtime.shutdown()
 keys、src_offsets、lengths 使用三个等长的 Host 整数序列或连续一维 CPU int64 Tensor。
 每个 key 对应一个源段；源偏移相对 Ready 选中的 tensor，长度不超过 slot_size，每批最多 4096 段。
 目的地址来自内部 PreparePut，与普通 BatchPut 共用槽位和 MetaManager。
-多 MR 场景初始化用 `register(ticket, tensors)`，每批用 `ready(tensors[i])`，消费接口不变。
+多 MR 场景初始化用 `register(ticket, tensors)`，每批用 `ready(tensors[i])`，消费接口不变。ReadyToken 仅携带本批 MR 身份与长度 `mr_length`，不再携带完整 MR 清单。
+
+生产端 DDR ticket 为 version=2，只包含 `version/address/region_id/epoch/token/eid`。源端不需要 DDR 基址、大小、slot_size 或 candidate；读取端仍通过 `runtime.remote_region` 获取本地保存的 DDR 布局。应用只需原样转交 ticket 与 ReadyToken。
 
 默认成功返回 None，表示 CPU READ 和 Meta Commit 完成；失败抛异常。
 可选 `profile=True` 时成功返回 `{"profile": {...}}`，包含本次调用的 Host 阶段耗时，单位微秒；
@@ -146,7 +148,7 @@ python tests/python/test_remote_cpu_offload.py \
 
 bench 现在每批仅调用一次 `runtime.batch_cpu_pull(keys, ready, src_offsets, lengths)`，
 不再在 Python 分别执行 Prepare/Submit/Wait/Commit，也不在 Python 组织目的偏移数组。
-需要重新构建 NPU 运行库和 Python 扩展；CPU 控制协议与 READ 数据面未变化。
+当前描述符格式要求 CPU service、NPU 运行库和 Python 扩展配套重编译、重启；四 Jetty READ 数据面与计时边界未变化。
 
 CPU 服务开启统计后，每个源连接独立累计 READ 样本，正常注销源时输出汇总；READ
 失败时也会输出当时的汇总。探测与校验 RPC 不计入样本。可沿用已有构建目录，例如：
