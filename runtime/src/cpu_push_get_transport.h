@@ -26,7 +26,8 @@ class Transport {
   void PrintProfile() const;
   Status BenchmarkWrite(std::uint8_t* source_memory, std::uint64_t source_base,
                         std::uint64_t source_capacity, const WriteBenchmarkOptions&,
-                        WriteBenchmarkResult*);
+                        WriteBenchmarkResult*, const WriteBenchmarkDiagnosticOptions* = nullptr,
+                        WriteBenchmarkDiagnostics* = nullptr);
   Status Shutdown();
   const Request& request() const { return *reinterpret_cast<const Request*>(memory_); }
   const Layout& layout() const { return layout_; }

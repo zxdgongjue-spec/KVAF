@@ -27,8 +27,30 @@ struct WriteBenchmarkResult {
   std::uint32_t message_bytes{}, max_sge{}, queues{}, post_batch_wrs{}, waves{}, optimized{}, count{};
   WriteBenchmarkSample samples[kWriteBenchmarkSamples]{};
 };
+// Separate diagnostic RPC keeps the original benchmark wire ABI unchanged.
+struct WriteBenchmarkDiagnosticOptions {
+  std::uint64_t source_window_bytes{}, target_window_bytes{}, flight_bytes{};
+  std::int32_t cpu{-1};
+  std::uint32_t idle_us{}, reserved{};
+};
+struct WriteBenchmarkDiagnosticSample {
+  std::uint64_t thread_cpu_ns{}, voluntary_switches{}, involuntary_switches{}, minor_faults{}, major_faults{};
+  std::int32_t cpu_start{-1}, cpu_end{-1};
+  std::uint64_t inter_sample_gap_ns{};
+};
+struct WriteBenchmarkDiagnostics {
+  std::uint64_t source_window_bytes{}, target_window_bytes{}, flight_bytes{};
+  std::int32_t cpu_requested{-1};
+  std::uint32_t idle_us{};
+  // JSON snapshot: NUMA/page information and case-wide cgroup v2 counters.
+  char environment[2048]{};
+  WriteBenchmarkDiagnosticSample samples[kWriteBenchmarkSamples]{};
+};
 #pragma pack(pop)
 static_assert(sizeof(WriteBenchmarkOptions) == 52);
 static_assert(sizeof(WriteBenchmarkSample) == 32);
 static_assert(sizeof(WriteBenchmarkResult) == 68 + 32 * kWriteBenchmarkSamples);
+static_assert(sizeof(WriteBenchmarkDiagnosticOptions) == 36);
+static_assert(sizeof(WriteBenchmarkDiagnosticSample) == 56);
+static_assert(sizeof(WriteBenchmarkDiagnostics) == 2080 + 56 * kWriteBenchmarkSamples);
 }  // namespace kvaf::cpu_push

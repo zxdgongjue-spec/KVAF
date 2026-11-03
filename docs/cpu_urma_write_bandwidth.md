@@ -109,3 +109,79 @@ warmup/测量，最后完整回读 HBM 与独立生成的期望值比较。回�
 ```bash
 python3 -m unittest discover -s tests/python -p test_cpu_write_bandwidth_config.py
 ```
+
+## 定位总数据量增大后的带宽下降
+
+`--diagnostic-suite` 固定每个样本实际 WRITE 总量，分别控制 CPU 源工作集、HBM 目标工作集、
+每次提交并等到完成的在途窗口。默认都是 64 MiB 实际流量、64 KiB/WR、4 Jetty，改变以下参数：
+
+| variant | 源工作集 | HBM 目标工作集 | 在途窗口 |
+|---|---|---|---|
+| baseline | 64 MiB | 64 MiB | 原 SQ credit 约束，一波 |
+| source_reuse | 4 MiB | 64 MiB | 与 baseline 相同 |
+| flight_limited | 64 MiB | 64 MiB | 每 4 MiB 等待全部尾 CQE |
+| flight_source_reuse | 4 MiB | 64 MiB | 每 4 MiB 等待全部尾 CQE |
+| flight_target_reuse | 64 MiB | 4 MiB | 每 4 MiB 等待全部尾 CQE |
+| flight_both_reuse | 4 MiB | 4 MiB | 每 4 MiB 等待全部尾 CQE |
+| baseline_repeat | 64 MiB | 64 MiB | 与首组相同，检查时间漂移 |
+
+4 MiB 窗口由 `--suite-window-bytes` 修改；每样本总流量由 `--sizes` 修改。
+源窗口缩小仅复用 CPU 源地址，目标仍写满整个 64 MiB，用于隔离源工作集影响。
+目标窗口缩小需在上一波真实完成后才能重用；所以判断目标工作集时，比较
+`flight_target_reuse` 与同样有完成等待的 `flight_limited`，不能直接比较不同在途窗口。
+原始流量按全部 WRITE 的实际长度求和并检查等于 payload，复用地址没有减少统计中的实际传输。
+
+先重编 CPU 服务并重启，再在 NPU 端运行：
+
+```bash
+cmake --build build-cpu -j --target kvaf_cpu_service kvaf_cpu_push_transport_test
+ctest --test-dir build-cpu -R kvaf_cpu_push_transport_test --output-on-failure
+
+DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+bash tests/run_cpu_urma_write_bandwidth.sh "$PWD/build-npu" \
+  --diagnostic-suite --warmup 30 --iterations 100 \
+  --npu-eids 000000000000020000100000df00e100 --peer-ub-device udmac0d1e2 \
+  --output-dir results/cpu-write-diagnose
+```
+
+诊断使用独立控制命令，旧命令和常规 16 列 CSV 兼容；无需重编 NPU binding 或 kernel。
+启用诊断时 CSV 增加 variant、窗口和线程观察字段，JSON 还保存环境和自动对照结果。
+控制台 `CPU_WRITE_DIAGNOSIS` 与 JSON 的 `diagnosis` 给出各组最快 25% 样本的带宽比值；
+比值用于定位方向，不自动断言缓存、IOMMU 或硬件的具体根因。首尾 baseline 相差超过 10%
+时会提示先复测时间漂移，避免将系统负载变化错误归因于窗口设置。
+
+诊断指标：
+
+- `thread_cpu_us`：该线程实际使用的 CPU 时间，来自 `CLOCK_THREAD_CPUTIME_ID`。
+- `off_cpu_estimate_us`：墙钟窗口减线程 CPU 时间的近似差值。诊断采样边界略宽，微小负值取 0；
+  用于识别抢占/中断等时间损失，不用来修正带宽分母。
+- `voluntary_switches` / `involuntary_switches`：线程上下文切换增量。
+- `minor_faults` / `major_faults`：该 CPU 线程的页故障，零计数不能排除设备侧地址转换开销。
+- `cpu_start` / `cpu_end`：样本前后的逻辑 CPU；相同 CPU 不代表中间没有迁移。
+- `inter_sample_gap_us`：上一样本完成到本样本首个提交的间隔，包含诊断采样和显式 idle；首个样本无前值时为 0。
+- JSON `diagnostics.environment`：源页 NUMA 抽样分布、CPU NUMA 节点、所在 VMA 的
+  KernelPageSize/MMUPageSize/AnonHugePages、cgroup v2 配额和整组限流计数变化。
+  VMA 大页信息不能当作设备 TLB 粒度的证明；限流计数包括 warmup，且不覆盖不可见的祖先限制。
+
+NUMA 查询只查询页面位置，不迁移页面；权限或 seccomp 禁止查询时保留 errno，不中断测试。
+接口含义见 [move_pages](https://man7.org/linux/man-pages/man2/move_pages.2.html)、
+[线程 CPU 时钟](https://man7.org/linux/man-pages/man2/clock_gettime.2.html)、
+[getrusage](https://man7.org/linux/man-pages/man2/getrusage.2.html)。诊断采样仅在显式启用时运行。
+线程计数读取放在传输计时区间之外，会略微改变样本间隔；优先比较同一套诊断里的对照，
+不要将它与普通模式的差异直接当成硬件加速。带宽分母始终保留完整墙钟传输窗口。
+
+结果判断顺序：
+
+1. 慢样本新增约 1 ms 且 off_cpu 同步增长：先固定空闲 CPU，排查调度/限额；保持完整完成窗口计时。
+2. source_reuse 比 baseline 明显快：源工作集相关，继续区分内存放置、CPU 缓存和设备地址转换。
+3. flight_limited 在相同完整源/目标工作集下更快：单次在途量或流控/观测节奏相关，不能解释为源缓存改善。
+4. flight_target_reuse 比 flight_limited 明显快：目标工作集或 HBM 入站路径相关。
+5. 所有变体都无改善且线程无明显 off_cpu：再结合端口实际速率、TP/重传/拥塞计数检查设备路径。
+
+可加 `--cpu N` 绑定 CPU 服务端执行本次 RPC 的逻辑核，结束后恢复原线程亲和性；N 不是 NPU 的
+DEVICE_ID。绑定不会迁移已分配的源内存，内存放置应在启动服务时用 NUMA 策略控制。
+`--idle-us 100` 在样本间插入不计时的间隔，可对照连续压力和突发节奏，不能将它计入有效带宽。
+
+单独对照也可用 `--diagnostics --source-window-bytes 4M`、
+`--diagnostics --flight-bytes 4M` 等参数；随机 SGL 可以采线程指标，但窗口复用对照限定为 contiguous。
+目标窗口复用时完整校验窗口内最后一轮写入的数据；所有样本仍等待全部 payload 尾 CQE。

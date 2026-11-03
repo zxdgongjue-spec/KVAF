@@ -721,17 +721,19 @@ class CpuService {
     Log("[KVAF_CPU] CPU_PUSH_STARTED session=%llu\n", static_cast<unsigned long long>(session));
     return Result::kOk;
   }
-  Status BenchmarkCpuWrite(const peer::CpuWriteBenchmarkRequest& request,
-                           cpu_push::WriteBenchmarkResult* result) {
+  Status BenchmarkCpuWrite(std::uint64_t region_base, const cpu_push::WriteBenchmarkOptions& options,
+                           cpu_push::WriteBenchmarkResult* result,
+                           const cpu_push::WriteBenchmarkDiagnosticOptions* diagnostics = nullptr,
+                           cpu_push::WriteBenchmarkDiagnostics* records = nullptr) {
     for (auto& item : regions_) {
       auto& region = *item.second;
-      if (region.base != request.region_base) continue;
+      if (region.base != region_base) continue;
       if (!region.push) return Status::InvalidState("WRITE benchmark requires an initialized CPU-push session");
       Log("[KVAF_CPU] WRITE_BENCH_BEGIN bytes=%llu queues=%u mode=%u iterations=%u\n",
-          static_cast<unsigned long long>(request.options.payload_bytes), request.options.queues,
-          request.options.source_mode, request.options.iterations);
+          static_cast<unsigned long long>(options.payload_bytes), options.queues,
+          options.source_mode, options.iterations);
       return region.push->BenchmarkWrite(static_cast<std::uint8_t*>(region.memory), region.base,
-                                        region.bytes, request.options, result);
+                                        region.bytes, options, result, diagnostics, records);
     }
     return Status::NotFound("WRITE benchmark DDR region not found");
   }
@@ -1086,7 +1088,24 @@ void HandleClient(int fd, CpuService* service) {
       Status status = Status::InvalidArgument("invalid CPU WRITE benchmark request");
       if (IsValidHeader(header, command, sizeof(request)) &&
           ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header)))
-        status = service->BenchmarkCpuWrite(request, &response->benchmark);
+        status = service->BenchmarkCpuWrite(request.region_base, request.options, &response->benchmark);
+      response->result = static_cast<int32_t>(status.ok() ? Result::kOk : Result::kResourceError);
+      if (!status.ok())
+        std::snprintf(response->error, sizeof(response->error), "%s", status.message().c_str());
+      (void)WriteAll(fd, response.get(), sizeof(*response));
+      return;
+    }
+    case Command::kCpuWriteBenchmarkDiagnostics: {
+      peer::CpuWriteBenchmarkDiagnosticRequest request{};
+      request.header = header;
+      auto response = std::make_unique<peer::CpuWriteBenchmarkDiagnosticResponse>();
+      response->header = peer::MakeHeader(command, sizeof(*response));
+      response->header.command = peer::ResponseCommand(command);
+      Status status = Status::InvalidArgument("invalid CPU WRITE diagnostic request");
+      if (IsValidHeader(header, command, sizeof(request)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header)))
+        status = service->BenchmarkCpuWrite(request.region_base, request.options, &response->benchmark,
+                                           &request.diagnostics, &response->diagnostics);
       response->result = static_cast<int32_t>(status.ok() ? Result::kOk : Result::kResourceError);
       if (!status.ok())
         std::snprintf(response->error, sizeof(response->error), "%s", status.message().c_str());

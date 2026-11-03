@@ -34,6 +34,7 @@ enum class Command : uint16_t {
   kStopCpuPushGet = 13U,
   kStopGatherLanes = 14U,
   kCpuWriteBenchmark = 15U,
+  kCpuWriteBenchmarkDiagnostics = 16U,
 };
 
 enum class Result : int32_t {
@@ -176,6 +177,19 @@ struct CpuWriteBenchmarkResponse {
   char error[192];
   cpu_push::WriteBenchmarkResult benchmark;
 };
+struct CpuWriteBenchmarkDiagnosticRequest {
+  MessageHeader header;
+  uint64_t region_base;
+  cpu_push::WriteBenchmarkOptions options;
+  cpu_push::WriteBenchmarkDiagnosticOptions diagnostics;
+};
+struct CpuWriteBenchmarkDiagnosticResponse {
+  MessageHeader header;
+  int32_t result;
+  char error[192];
+  cpu_push::WriteBenchmarkResult benchmark;
+  cpu_push::WriteBenchmarkDiagnostics diagnostics;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -193,6 +207,8 @@ static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI cha
 static_assert(sizeof(CpuWriteBenchmarkRequest) == 72U, "WRITE benchmark request ABI changed");
 static_assert(sizeof(CpuWriteBenchmarkResponse) == 276U + 32U * cpu_push::kWriteBenchmarkSamples,
               "WRITE benchmark response ABI changed");
+static_assert(sizeof(CpuWriteBenchmarkDiagnosticRequest) == 108U);
+static_assert(sizeof(CpuWriteBenchmarkDiagnosticResponse) == 2356U + 88U * cpu_push::kWriteBenchmarkSamples);
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

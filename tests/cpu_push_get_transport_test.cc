@@ -196,6 +196,61 @@ struct TransportTest {
           assert(actual == WriteBenchmarkMix(options.seed + source_offset / 8));
         }
       }
+      // Fixed traffic with independent source/destination working sets. Target
+      // wraps only across drained flights; count every transmitted byte and
+      // validate the final writer, including guard bytes after the target ring.
+      const std::array<std::array<std::uint64_t, 3>, 6> window_cases{{
+          {0, 0, 0}, {4096, 0, 0}, {0, 0, 4096}, {4096, 0, 4096},
+          {0, 4096, 4096}, {4096, 4096, 4096}}};
+      for (const auto& windows : window_cases) {
+        WriteBenchmarkOptions options;
+        options.payload_bytes = 65536; options.source_bytes = 131072; options.seed = 97;
+        options.message_bytes = 1024; options.fragment_bytes = 656; options.queues = 4;
+        options.post_batch_wrs = 2; options.warmup = 1; options.iterations = 3;
+        WriteBenchmarkDiagnosticOptions diagnostic;
+        diagnostic.source_window_bytes = windows[0]; diagnostic.target_window_bytes = windows[1];
+        diagnostic.flight_bytes = windows[2];
+        auto result = std::make_unique<WriteBenchmarkResult>();
+        auto records = std::make_unique<WriteBenchmarkDiagnostics>();
+        posted.clear();
+        std::memset(hbm.data() + t.layout_.staging, 0xad, hbm.size() - t.layout_.staging);
+        assert(t.BenchmarkWrite(source.data(), Address(source.data()), source.size(), options, result.get(),
+                                &diagnostic, records.get()).ok());
+        std::uint64_t wire_bytes = 0;
+        for (const auto& wr : posted) wire_bytes += wr.bytes;
+        assert(wire_bytes == options.payload_bytes * (options.warmup + options.iterations));
+        assert(result->count == options.iterations && t.tracker_.Empty());
+        assert(std::strstr(records->environment, "source_pages_sampled"));
+        const auto source_slice = records->source_window_bytes / options.queues;
+        const auto target_slice = records->target_window_bytes / options.queues;
+        const auto logical_slice = options.payload_bytes / options.queues;
+        for (std::uint32_t i = 0; i < result->count; ++i) {
+          assert(result->samples[i].tail_cqes == options.queues * result->waves);
+          assert(records->samples[i].thread_cpu_ns > 0);
+        }
+        for (std::uint32_t q = 0; q < options.queues; ++q)
+          for (std::uint64_t offset = 0; offset < target_slice; offset += 8) {
+            const auto last = offset + (logical_slice - 1 - offset) / target_slice * target_slice;
+            const auto src = q * source_slice + last % source_slice;
+            std::uint64_t actual;
+            std::memcpy(&actual, hbm.data() + t.layout_.staging + q * target_slice + offset, 8);
+            assert(actual == WriteBenchmarkMix(options.seed + src / 8));
+          }
+        for (auto i = t.layout_.staging + records->target_window_bytes; i < hbm.size(); ++i)
+          assert(hbm[i] == 0xad);
+      }
+      {
+        WriteBenchmarkOptions options;
+        options.payload_bytes = 65536; options.source_bytes = 131072; options.message_bytes = 4096;
+        WriteBenchmarkDiagnosticOptions invalid;
+        invalid.target_window_bytes = 4096; // No drained flights: cannot safely overwrite.
+        auto result = std::make_unique<WriteBenchmarkResult>();
+        auto records = std::make_unique<WriteBenchmarkDiagnostics>();
+        const auto before = post_calls;
+        assert(!t.BenchmarkWrite(source.data(), Address(source.data()), source.size(), options, result.get(),
+                                 &invalid, records.get()).ok());
+        assert(post_calls == before);
+      }
       t.context_ = nullptr;
     }
     // A bad CQ still fails the payload and must never publish successful done.

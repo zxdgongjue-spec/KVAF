@@ -67,9 +67,10 @@ void Worker::Run() {
   }
 }
 Status Worker::BenchmarkWrite(std::uint8_t* memory, std::uint64_t base, std::uint64_t bytes,
-                             const WriteBenchmarkOptions& options, WriteBenchmarkResult* result) {
+                             const WriteBenchmarkOptions& options, WriteBenchmarkResult* result,
+                             const WriteBenchmarkDiagnosticOptions* diagnostics, WriteBenchmarkDiagnostics* records) {
   stop_.store(true, std::memory_order_release);
   if (thread_.joinable()) thread_.join();
-  return transport_->BenchmarkWrite(memory, base, bytes, options, result);
+  return transport_->BenchmarkWrite(memory, base, bytes, options, result, diagnostics, records);
 }
 }  // namespace kvaf::cpu_push

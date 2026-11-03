@@ -16,7 +16,8 @@ class Worker {
   // Dedicated benchmark sessions stay quiesced until teardown. The benchmark
   // owns all queues and cannot race the ordinary notify-polling worker.
   Status BenchmarkWrite(std::uint8_t* memory, std::uint64_t base, std::uint64_t bytes,
-                        const WriteBenchmarkOptions&, WriteBenchmarkResult*);
+                        const WriteBenchmarkOptions&, WriteBenchmarkResult*,
+                        const WriteBenchmarkDiagnosticOptions* = nullptr, WriteBenchmarkDiagnostics* = nullptr);
  private:
   void Run();
   std::unique_ptr<Transport> transport_;
