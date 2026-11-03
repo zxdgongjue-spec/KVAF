@@ -533,6 +533,23 @@ batch=128 时 8 次，batch=256 时 4 次。WR/SGE 的硬件上限与 SQ credit 
 `CPU_PUSH_CAP` 记录实际 max_sge、message_bytes、post_batch_wrs 和 optimized；
 性能运行应为 optimized=1，使用常规 Release 构建，显式 Debug 配置不会被程序强制覆盖。
 
+直接 SGL 路径另提供实验开关 `KVAF_CPU_PUSH_PAYLOAD_COMP_ORDER=all|tail`，
+由 CPU service 在初始化会话时读取，默认 `all` 保持原行为。`tail` 仅清除普通 payload
+WR 的 `comp_order`；这些 WR 仍为 `RELAX_ORDER`，每队列最后一条 WR 仍为
+`STRONG_ORDER + comp_order=1 + complete_enable=1`，所有尾 CQE 到齐后才发布 done。
+旧进度模式的强序 Ready WR、控制 READ、profile/done WRITE 均保持原完成顺序。
+这不启用 Jetty 的 outorder_comp，也不改为 NO_ORDER；强序尾对前序 RELAX/STRONG 的等待保留。
+语义依据为 [URMA API Guide](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)
+的 `place_order/comp_order` 说明。该位能否改善随机 SGL 的设备调度必须在硬件上 A/B 验证，
+不能依据本地替身测试认定吞吐提高。传输测试额外逆序执行无完成顺序约束的 payload WR，
+验证强序边界、完整数据、suffix guard、ready/report/done 和错误处理。
+
+纯 WRITE 单测和 BatchGet 共用该开关；CPU 日志 `CPU_PUSH_CAP` 记录实际
+`payload_comp_order`。A/B 只切换 CPU service 上的该变量并重启，保持相同输入、CPU/NUMA、
+post_batch_wrs 和 NPU 产物，并保留对应服务日志。只需重编 CPU service，无需修改 kernel、
+协议或 payload 布局，也不引入 CPU gather。默认 `all` 不变，`tail` 通过端到端和完整数据校验
+后再决定是否采用；`cpu_comm`、`cpu_write` 与 AIV 计时边界不变。
+
 ```bash
 cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cpu -j --target kvaf_cpu_service kvaf_cpu_push_transport_test

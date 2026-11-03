@@ -129,7 +129,7 @@ Status Transport::BenchmarkWrite(std::uint8_t* memory, std::uint64_t base,
     auto plan = std::make_unique<PreparedWrite>();
     for (std::uint32_t q = 0; q < o.queues; ++q)
       if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
-    SealPrepared(*plan);
+    SealPrepared(*plan, true);
     if (plan->fence_count) prepared_.push_back(std::move(plan));
   }
   out->waves = prepared_.size();

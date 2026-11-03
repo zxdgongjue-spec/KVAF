@@ -1,6 +1,7 @@
 // Execute the production CPU transport with deferred URMA submissions. This
 // checks protocol/data ordering, not physical DMA visibility or bandwidth.
 #include "cpu_push_get_transport.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -13,7 +14,7 @@ std::array<urma_jetty_t, kJettyCount> jettys{};
 std::array<urma_jfc_t, kJettyCount> cqs{};
 std::array<std::deque<urma_jfs_wr_t*>, kJettyCount> pending;
 struct Posted {
-  std::uint32_t queue, opcode, bytes, order, signaled;
+  std::uint32_t queue, opcode, bytes, order, signaled, comp_order;
   std::uint64_t destination;
 };
 std::vector<Posted> posted;
@@ -42,7 +43,8 @@ extern "C" urma_status_t __wrap_urma_post_jetty_send_wr(
   for (auto* current = wr; current; current = current->next) {
     const auto& dst = current->rw.dst.sge[0];
     posted.push_back({q, static_cast<std::uint32_t>(current->opcode), dst.len,
-        current->flag.bs.place_order, current->flag.bs.complete_enable, dst.addr});
+        current->flag.bs.place_order, current->flag.bs.complete_enable,
+        current->flag.bs.comp_order, dst.addr});
   }
   return static_cast<urma_status_t>(0);
 }
@@ -53,7 +55,22 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
   int completed = 0;
   while (!pending[q].empty()) {
     auto* first = pending[q].front(); pending[q].pop_front();
-    for (auto* wr = first; wr; wr = wr->next) {
+    std::vector<urma_jfs_wr_t*> execution;
+    for (auto* wr = first; wr; wr = wr->next) execution.push_back(wr);
+    // Exercise independent payload placement in a different order, while
+    // retaining the strong ready/tail fences that publish completion.
+    for (std::size_t i = 0; i < execution.size();) {
+      const auto independent = [](const urma_jfs_wr_t* wr) {
+        return wr->opcode == URMA_OPC_WRITE && !wr->flag.bs.comp_order &&
+               wr->flag.bs.place_order == URMA_RELAX_ORDER;
+      };
+      if (!independent(execution[i])) { ++i; continue; }
+      auto end = i + 1;
+      while (end < execution.size() && independent(execution[end])) ++end;
+      std::reverse(execution.begin() + i, execution.begin() + end);
+      i = end;
+    }
+    for (auto* wr : execution) {
       const auto& dst = wr->rw.dst.sge[0];
       if (wr->opcode == URMA_OPC_WRITE && dst.addr == done_address) {
         assert(dst.len == 8 && wr->flag.bs.place_order == URMA_STRONG_ORDER);
@@ -84,11 +101,12 @@ namespace kvaf::cpu_push {
 struct TransportTest {
   static void Run(std::uint32_t token, std::uint32_t maximum = 1024,
                   std::uint32_t max_sge = 16, std::uint32_t post_batch = 128,
-                  std::uint32_t message_bytes = 65536) {
+                  std::uint32_t message_bytes = 65536, bool tail_comp_order = false) {
     Transport t;
     assert(MakeLayout(token, 4, &t.layout_));
     t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = max_sge; t.max_bytes_ = message_bytes;
     t.post_batch_wrs_ = post_batch;
+    t.tail_payload_comp_order_ = tail_comp_order;
     // Retain marker space to exercise legacy mode as well as done-only mode.
     void* memory = nullptr;
     assert(!posix_memalign(&memory, 64, t.layout_.staging + 32768));
@@ -128,6 +146,7 @@ struct TransportTest {
           for (std::uint64_t i = 0; i < chunks; ++i) {
             const auto& wr = posted.at(reads++);
             assert(wr.opcode == URMA_OPC_READ);
+            assert(wr.comp_order == 1);
             assert(wr.signaled == (i + 1 == chunks));
             assert(wr.order == (i + 1 == chunks ? URMA_STRONG_ORDER : URMA_RELAX_ORDER));
             bytes -= wr.bytes;
@@ -175,6 +194,8 @@ struct TransportTest {
         if (wr.destination < t.hbm_base_ + t.layout_.descriptor) ++markers;
         else ++data;
         tails += wr.signaled;
+        assert(wr.comp_order == (!tail_comp_order || wr.order == URMA_STRONG_ORDER));
+        if (wr.signaled) assert(wr.order == URMA_STRONG_ORDER && wr.comp_order);
       }
       if (whole) assert(markers == 0);
       else if (count) assert(markers > 0);
@@ -198,6 +219,7 @@ struct TransportTest {
         assert(done->reserved[0] == ProfileToken(sequence));
       }
       assert(posted.back().destination == done_address && posted.back().signaled);
+      for (const auto& wr : posted) assert(wr.comp_order == 1);
       assert(reinterpret_cast<Completion*>(hbm.data() + t.layout_.done)->token == Progress(sequence, 1));
       assert(t.tracker_.Empty());
     };
@@ -217,7 +239,10 @@ struct TransportTest {
         posted.clear();
         assert(t.BenchmarkWrite(source.data(), Address(source.data()), source.size(), options, result.get()).ok());
         assert(result->count == options.iterations && t.tracker_.Empty());
-        for (const auto& wr : posted) assert(wr.destination != done_address);
+        for (const auto& wr : posted) {
+          assert(wr.destination != done_address);
+          assert(wr.comp_order == (!tail_comp_order || wr.order == URMA_STRONG_ORDER));
+        }
         for (std::uint32_t i = 0; i < result->count; ++i)
           assert(result->samples[i].tail_cqes == queues && result->samples[i].comm_ns >=
                  result->samples[i].post_ns + result->samples[i].cq_wait_ns);
@@ -320,5 +345,10 @@ int main() {
   for (auto batch : {32U, 128U, 256U})
     for (auto token : {656U, 1024U})
       kvaf::cpu_push::TransportTest::Run(token, 8192, 13, batch);
+  // Tail-only completion ordering keeps all strong ready/done fences and CQs.
+  for (auto token : {13U, 656U, 4096U, 65535U})
+    kvaf::cpu_push::TransportTest::Run(token, 1024, 16, 128, 65536, true);
+  kvaf::cpu_push::TransportTest::Run(656, 8192, 13, 128, 65536, true);
+  kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests, 16, 128, 65536, true);
   std::cout << "PASS: CPU push coalesced reads, done-only writes and completion ordering\n";
 }

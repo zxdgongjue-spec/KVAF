@@ -69,7 +69,7 @@ class Transport {
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
-  void SealPrepared(PreparedWrite&);
+  void SealPrepared(PreparedWrite&, bool payload = false);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
                       std::uint64_t* first_post_ns = nullptr);
@@ -97,6 +97,7 @@ class Transport {
   std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t post_batch_wrs_{128};
+  bool tail_payload_comp_order_{};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push

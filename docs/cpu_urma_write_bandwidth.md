@@ -74,6 +74,10 @@ message 上限共同限制。例如 max_sge=13、fragment=656 时每个满 WR �
 
 连续源的稳定大包结果用于判断已选 EID/链路的可达上限，随机 SGL 结果用于判断碎片读取损失。
 两种模式都用同一个 CPU 提交线程，可扫描 1/2/4 Jetty；不聚合多个 UB 设备的带宽。
+可在 CPU service 启动时用 `KVAF_CPU_PUSH_PAYLOAD_COMP_ORDER=all|tail` 对照普通 payload
+WR 的完成顺序约束，默认 `all`；`tail` 仍保留强序尾和所有队列尾 CQE 等待。
+该开关同样作用于 BatchGet，详见 `docs/aiv_scatter_performance.md`；实际值记录在
+CPU 服务 `CPU_PUSH_CAP` 日志中，CSV 和传输计时口径不变。
 `optimized=1` 表示 CPU 数据面启用了编译器优化。性能对照应使用相同的 Release 配置、NUMA
 内存放置和 CPU 亲和性，避免将运行环境差异当成链路能力。
 

@@ -63,6 +63,11 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
   context_ = context;
+  if (const auto* value = std::getenv("KVAF_CPU_PUSH_PAYLOAD_COMP_ORDER")) {
+    if (std::strcmp(value, "all") != 0 && std::strcmp(value, "tail") != 0)
+      return Status::InvalidArgument("KVAF_CPU_PUSH_PAYLOAD_COMP_ORDER must be all or tail");
+    tail_payload_comp_order_ = std::strcmp(value, "tail") == 0;
+  }
   if (const auto* value = std::getenv("KVAF_CPU_PUSH_POST_BATCH_WRS")) {
     char* end = nullptr;
     errno = 0;
@@ -84,8 +89,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "post_batch_wrs=%u optimized=%u\n",
-               max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized);
+               "post_batch_wrs=%u optimized=%u payload_comp_order=%s\n",
+               max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized,
+               tail_payload_comp_order_ ? "tail" : "all");
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
@@ -311,13 +317,18 @@ void Transport::AppendPrepared(PreparedQueue& q, std::uint32_t queue,
   wr.rw.dst.num_sge = 1;
   q.wrs.push_back(wr);
 }
-void Transport::SealPrepared(PreparedWrite& plan) {
+void Transport::SealPrepared(PreparedWrite& plan, bool payload) {
   for (std::uint32_t index = 0; index < kJettyCount; ++index) {
     auto& q = plan.queues[index];
     if (q.wrs.empty()) continue;
     std::size_t local = 0;
     for (std::size_t i = 0; i < q.wrs.size(); ++i) {
       auto& wr = q.wrs[i];
+      // Payload ranges do not overlap. RELAX writes may execute independently;
+      // a STRONG tail waits for preceding RELAX/STRONG writes before executing.
+      // Keep its completion ordering/CQE, and preserve all control/ready ordering.
+      wr.flag.bs.comp_order = !payload || !tail_payload_comp_order_ ||
+          wr.flag.bs.place_order == URMA_STRONG_ORDER || i + 1 == q.wrs.size();
       wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(q.local.data() + local);
       wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(q.remote.data() + i);
       local += wr.rw.src.num_sge;
@@ -388,7 +399,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     auto plan = std::make_unique<PreparedWrite>();
     for (std::uint32_t q = 0; q < kJettyCount; ++q)
       if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
-    SealPrepared(*plan);
+    SealPrepared(*plan, true);
     if (plan->fence_count) prepared_.push_back(std::move(plan));
   }
   prepared_count_ = count;
@@ -603,6 +614,7 @@ Status Transport::Shutdown() {
   descriptor_prefetch_count_ = 0;
   prepared_batch_done_only_ = false;
   post_batch_wrs_ = 128;
+  tail_payload_comp_order_ = false;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;
