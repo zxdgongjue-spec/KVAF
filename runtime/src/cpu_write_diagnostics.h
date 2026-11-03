@@ -63,27 +63,39 @@ inline int CpuNode(int cpu) {
 
 struct Memory {
   std::uint64_t kernel_page{}, mmu_page{}, anon_huge{}, vma_bytes{};
+  std::uint64_t private_hugetlb{}, shared_hugetlb{};
+  bool hugetlb_vma{};
   int node_min{-1}, node_max{-1}, query_errno{}, sampled_pages{};
   std::map<int, int> node_counts;
 };
-inline Memory ReadMemory(void* memory, std::uint64_t bytes) {
+inline Memory ReadPageInfo(std::istream& input, std::uintptr_t address) {
   Memory result;
-  std::ifstream input("/proc/self/smaps");
   std::string line;
   bool found = false;
   while (std::getline(input, line)) {
     unsigned long long first, last, value;
     if (std::sscanf(line.c_str(), "%llx-%llx", &first, &last) == 2) {
       if (found) break;
-      const auto address = reinterpret_cast<std::uintptr_t>(memory);
       found = first <= address && address < last;
       if (found) result.vma_bytes = last - first;
     } else if (found) {
       if (std::sscanf(line.c_str(), "KernelPageSize: %llu kB", &value) == 1) result.kernel_page = value * 1024;
       if (std::sscanf(line.c_str(), "MMUPageSize: %llu kB", &value) == 1) result.mmu_page = value * 1024;
       if (std::sscanf(line.c_str(), "AnonHugePages: %llu kB", &value) == 1) result.anon_huge = value * 1024;
+      if (std::sscanf(line.c_str(), "Private_Hugetlb: %llu kB", &value) == 1) result.private_hugetlb = value * 1024;
+      if (std::sscanf(line.c_str(), "Shared_Hugetlb: %llu kB", &value) == 1) result.shared_hugetlb = value * 1024;
+      if (line.rfind("VmFlags:", 0) == 0) {
+        std::istringstream flags(line.substr(8));
+        std::string flag;
+        while (flags >> flag) if (flag == "ht") result.hugetlb_vma = true;
+      }
     }
   }
+  return result;
+}
+inline Memory ReadMemory(void* memory, std::uint64_t bytes) {
+  std::ifstream input("/proc/self/smaps");
+  auto result = ReadPageInfo(input, reinterpret_cast<std::uintptr_t>(memory));
 #ifdef SYS_move_pages
   std::array<void*, 64> pages{};
   std::array<int, 64> nodes{};
@@ -153,6 +165,9 @@ inline std::string Environment(const Memory& memory, int cpu, const Cgroup& befo
       << ",\"numa_query_errno\":" << memory.query_errno << ",\"source_pages_sampled\":" << memory.sampled_pages
       << ",\"kernel_page_bytes\":" << memory.kernel_page << ",\"mmu_page_bytes\":" << memory.mmu_page
       << ",\"vma_anon_huge_bytes\":" << memory.anon_huge << ",\"source_vma_bytes\":" << memory.vma_bytes
+      << ",\"vma_private_hugetlb_bytes\":" << memory.private_hugetlb
+      << ",\"vma_shared_hugetlb_bytes\":" << memory.shared_hugetlb
+      << ",\"vma_hugetlb\":" << (memory.hugetlb_vma ? 1 : 0)
       << ",\"cgroup_v2_available\":" << (same ? 1 : 0) << ",\"cpu_quota_us\":" << before.quota_us
       << ",\"cpu_period_us\":" << before.period_us << ",\"case_throttled_events\":" << events
       << ",\"case_throttled_us\":" << us << ",\"source_numa_counts\":{";

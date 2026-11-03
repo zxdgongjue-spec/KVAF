@@ -168,6 +168,8 @@ bash tests/run_cpu_urma_write_bandwidth.sh "$PWD/build-npu" \
 - `inter_sample_gap_us`：上一样本完成到本样本首个提交的间隔，包含诊断采样和显式 idle；首个样本无前值时为 0。
 - JSON `diagnostics.environment`：源页 NUMA 抽样分布、CPU NUMA 节点、所在 VMA 的
   KernelPageSize/MMUPageSize/AnonHugePages、cgroup v2 配额和整组限流计数变化。
+  显式大页另有 `vma_private_hugetlb_bytes`、`vma_shared_hugetlb_bytes` 和
+  `vma_hugetlb`（来自 `VmFlags` 的 `ht`）；HugeTLB 的 `AnonHugePages` 为 0 是正常的。
   VMA 大页信息不能当作设备 TLB 粒度的证明；限流计数包括 warmup，且不覆盖不可见的祖先限制。
 
 NUMA 查询只查询页面位置，不迁移页面；权限或 seccomp 禁止查询时保留 errno，不中断测试。
@@ -192,3 +194,101 @@ DEVICE_ID。绑定不会迁移已分配的源内存，内存放置应在启动�
 单独对照也可用 `--diagnostics --source-window-bytes 4M`、
 `--diagnostics --flight-bytes 4M` 等参数；随机 SGL 可以采线程指标，但窗口复用对照限定为 contiguous。
 目标窗口复用时完整校验窗口内最后一轮写入的数据；所有样本仍等待全部 payload 尾 CQE。
+
+## CPU 源内存 THP/HugeTLB 对照
+
+THP（Transparent Huge Pages，透明大页）由 Linux 自动决定合并和拆分；现有默认模式使用
+2 MiB 对齐、`MADV_HUGEPAGE` 和注册前触页，但 advice 成功不保证覆盖全部源区。
+`--memory-page-mode hugetlb` 改为 `mmap(MAP_HUGETLB)` 显式分配，严格使用 HugeTLB，
+资源/权限不足直接报错，不回退普通页。支持 `--hugetlb-page-kb N`，未给时使用系统默认
+HugeTLB 页大小。独立 CPU WRITE 和实际 SGL→HBM→AIV scatter 共用该源区分配器。
+此次只切换源内存分配；WR/SGL、URMA 注册标志、完成等待和 NPU 代码保持相同。
+需要重新构建并重启 CPU 服务，无需重编 NPU kernel/binding。
+
+先在 CPU 机器确认支持的页大小和空闲池（ARM 不一定是 2 MiB）：
+
+```bash
+grep -E '^HugePages_|^Hugepagesize:|^Hugetlb:' /proc/meminfo
+ls /sys/kernel/mm/hugepages
+grep . /sys/devices/system/node/node*/hugepages/hugepages-*kB/free_hugepages
+```
+
+每个同时存在的源 region 需要 `ceil(ddr_bytes / page_bytes)` 个对应大小的大页，此外需计入
+其他使用者；独立 WRITE 另有 4 KiB 控制区，需一并取整。建议先测 128 MiB 源区，
+而不是直接预留完整默认源表：656 B、128 token/block、
+1277952 block 的源表约 99.94 GiB，只有 payload 是约 5.125 MiB。大页池需覆盖整个源区。
+以下示例按系统默认页大小在选定 NUMA node 上准备一个 128 MiB 实验源区的池；
+`KVAF_PAGE_NODE` 要改成已确认的 UB 本地节点。已有预留只增不减；不要在本实验中自动
+缩小其他任务的池。预留可能因内存碎片不足而失败，务必回读实际值。
+
+```bash
+KVAF_PAGE_NODE=0
+KVAF_PAGE_KB=$(awk '/^Hugepagesize:/{print $2}' /proc/meminfo)
+KVAF_POOL_DIR="/sys/devices/system/node/node${KVAF_PAGE_NODE}/hugepages/hugepages-${KVAF_PAGE_KB}kB"
+KVAF_POOL_NEED=$(( (128 * 1024 + KVAF_PAGE_KB - 1) / KVAF_PAGE_KB + 2 ))
+KVAF_POOL_OLD=$(cat "$KVAF_POOL_DIR/nr_hugepages")
+if (( KVAF_POOL_OLD < KVAF_POOL_NEED )); then
+  echo "$KVAF_POOL_NEED" | sudo tee "$KVAF_POOL_DIR/nr_hugepages"
+fi
+cat "$KVAF_POOL_DIR/nr_hugepages" "$KVAF_POOL_DIR/free_hugepages"
+
+# 沿用已有 CPU 构建配置；测试目标要求 BUILD_TESTING=ON。
+cmake -S . -B build-cpu -DBUILD_TESTING=ON
+cmake --build build-cpu -j --target kvaf_cpu_service kvaf_cpu_source_memory_test
+ctest --test-dir build-cpu -R '^kvaf_cpu_source_memory_test$' --output-on-failure
+
+# 每组单独启动；完成后正常停止服务再切换模式。其余启动参数沿用现有配置。
+numactl --cpunodebind="$KVAF_PAGE_NODE" --membind="$KVAF_PAGE_NODE" \
+  ./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28990 \
+  --memory-page-mode thp
+# 下一组把最后一项改为 --memory-page-mode hugetlb。
+```
+
+不使用 `MAP_NORESERVE`，服务也不自动修改预留池或 overcommit。非 root 服务需要相应的
+HugeTLB 使用权限；容器需有足够的 hugetlb cgroup 配额。分配失败看 CPU 服务
+`REGION_ALLOCATE_FAILED` 中的 errno、映射大小和页大小；若 URMA 不接受该映射，
+日志会明确停在 `stage=urma_register_seg`，不能假定当前驱动一定支持。
+
+在另一终端分别对 thp、hugetlb、thp-repeat 运行同一命令，只改输出目录：
+
+```bash
+DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+bash tests/run_cpu_urma_write_bandwidth.sh "$PWD/build-npu" \
+  --sizes 5373952 --source-modes contiguous,random-sgl \
+  --fragment-bytes 656 --source-bytes 128M \
+  --message-sizes 64K --queue-counts 4 --post-batch-wrs 128 \
+  --warmup 30 --iterations 100 --diagnostics \
+  --npu-eids 000000000000020000100000df00e100 --peer-ub-device udmac0d1e2 \
+  --output-dir results/cpu-write-thp
+```
+
+保留 CPU 服务每组日志的 `REGION_ALLOCATED page_mode=... allocation_bytes=...
+hugetlb_page_bytes=...`，并检查 JSON 的 VMA 证据和 NUMA 分布。诊断 JSON 不改变原 CSV
+列数；来源是覆盖源区起点的 VMA，并非整个进程的大页合计。显式 HugeTLB 取整映射范围内
+都使用 HugeTLB；THP 若 VMA 合并，不能把整 VMA 的大页统计当成精确的源区覆盖率。
+
+接着以相同模式运行整体端到端测试，保持 pipeline 参数一致：
+
+```bash
+DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --single --token-bytes 656 --miss-count 8192 --request-length 32768 \
+  --aiv-cores 4 --tokens-per-block 128 --table-capacity 1598 --pipeline 0 \
+  --warmup 30 --iterations 100 \
+  --npu-eids 000000000000020000100000df00e100 --peer-ub-device udmac0d1e2 \
+  --json results/scatter-thp-128m.json --csv results/scatter-thp-128m.csv
+```
+
+1598 block 的源区为 134180864 B，约 128 MiB，仅用于隔离页模式，仍然每次更新随机请求。
+源区大小近似对齐，也不等于两个测试的地址序列、线程和准备工作相同。确认方向后恢复原始
+`--table-capacity`，并按实际源表大小准备池，才可作为业务性能结果。
+
+独立 WRITE 按 comm 最快 25%，端到端按 E2E 最快 25% 比较；同时报告 p50/p95 和首尾 THP
+漂移。重点看 `cpu_post_us`、`cpu_cq_wait_us`（端到端在 JSON）、`cpu_write_us` 及最终 E2E。
+HugeTLB 不改变 SGE/WR 数量，也不保证设备地址转换粒度，不能预先承诺随机 SGL 达到连续源的
+90+ GB/s。若 CQ 等待下降而 post 保持高位，继续优化源地址刷新和四队列提交。若页模式无收益，
+优先做“全部刷新后集中提交”与“逐队列刷新/提交”的 A/B，分开计时 refresh 和 URMA post API，
+以 CPU write/E2E 判断收益，避免仅把准备工作挪出 comm。页模式实验不同时更改队列/消息配置。
+
+参考 Linux 内核的 [THP](https://docs.kernel.org/admin-guide/mm/transhuge.html) 与
+[HugeTLB](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html) 文档。
