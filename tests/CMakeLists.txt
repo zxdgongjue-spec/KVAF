@@ -3,6 +3,9 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME kvaf_concurrent_batch_get_python
   COMMAND "${Python3_EXECUTABLE}" -B
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_concurrent_batch_get.py")
+add_test(NAME kvaf_mixed_peer_batch_get_python
+  COMMAND "${Python3_EXECUTABLE}" -B
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_mixed_peer_batch_get.py")
 add_test(NAME kvaf_diagnostics_python
   COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
           -s "${CMAKE_CURRENT_SOURCE_DIR}/diagnostics" -p "test_*.py")

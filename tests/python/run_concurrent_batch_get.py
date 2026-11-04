@@ -164,7 +164,7 @@ def run_flows(flows, timeout):
                     if process.poll() is not None:
                         raise RuntimeError(f"{name} exited before synchronized start (status={process.returncode})")
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("waiting for both flows to become ready")
+                    raise TimeoutError("waiting for all flows to become ready")
                 try:
                     connection, _ = listener.accept()
                 except socket.timeout:
@@ -182,11 +182,11 @@ def run_flows(flows, timeout):
             for connection in connections:
                 connection.sendall(f"{start_ns}\n".encode("ascii"))
                 connection.close()
-            emit("[launcher] both flows ready; synchronized start scheduled")
+            emit("[launcher] all flows ready; synchronized start scheduled")
             # After release, each original benchmark runs its own iterations.
             while any(p.poll() is None for p in processes) or any(t.is_alive() for t in readers):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("waiting for the two sweeps to finish")
+                    raise TimeoutError("waiting for the sweeps to finish")
                 time.sleep(0.05)
             finished = True
             return next((p.returncode if p.returncode > 0 else 128 - p.returncode
