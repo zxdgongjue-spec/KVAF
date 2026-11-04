@@ -907,3 +907,46 @@ ctest --test-dir build-model -R 'kvaf_sequential_(host_test|batch_get_kernel_mod
 现有完整输出与 guard 校验保留。CPU transport 模型另在 Ready WR 执行前校验该路分片已写完，
 并覆盖连续段刷新、changing descriptor、多波次和分段 token 的数据正确性。
 它验证控制流与范围，硬件 DMA 可见性、CANN 编译和性能仍需上机验证。
+
+## preflight 的 WAIT_REMOTE 超时与控制 READ ACK 超时
+
+`worker=0 sequence=1 observed_sequence=1 phase=4 result=2` 对应
+`KVAF_SEQ_WAIT_REMOTE / KVAF_SEQ_TIMEOUT`，表示 kernel 正常返回了等待远端超时状态。
+CPU 若同时报 `phase=read_notify last_sequence=0`、`bytes=64`、`wr_opcode=16`
+和 `status=9`，失败的是从 NPU HBM notify 读回控制字，尚未进入描述符处理或 SGL payload。
+`9` 是 `URMA_CR_ACK_TIMEOUT_ERR`，不能仅凭该值区分路由、TP/PSN、远端资源或驱动问题。
+`tpn=0` 是失败 CQE 的字段，不能直接解释成应用创建了 TP 0。
+THP 源区已注册成功不能证明控制 READ 稳定，也不能证明实际大页覆盖率。
+
+旧启动探测只有一次空闲 READ 和一次 pending WRITE。启动时 `CPU_PUSH_STARTED` 成功后，
+第二次 notify READ (`actual_ctx=expected_ctx=0x2`) 仍可能失败，随后 AIV 等不到 done。
+现在 CPU 在启动后台线程前执行三轮真实 READ/WRITE，任一轮失败都拒绝当前启动候选，
+沿用既有清理和 EID 回退。这里只写 sequence=0 的 pending，不发布请求成功或跳过完成等待。
+成功日志为 `CPU_PUSH_LINK_PROBE_READY session=... rounds=3`，失败日志包含
+`round=2/3 phase=read_notify ... status=9 status_name=ACK_TIMEOUT ... wait_us=...`。
+这加强启动筛选，不是对底层 ACK 超时的通用修复；若三轮通过后仍失败，需检查持续读和后续
+BatchPut 通道创建期间的状态变化。测试覆盖第 1/2/3 次 READ 失败，以及目标非空闲的拒绝。
+
+CPU `CPU_PUSH_CAP optimized=0` 表示未启用编译优化，带宽复测前应按 Release 构建并重启实际
+监听端口上的服务。它是独立的性能问题，不能据此解释 ACK 重传超时：
+
+```bash
+# 沿用已有 CPU 构建目录和 URMA 路径配置。
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build-cpu -j --target kvaf_cpu_service kvaf_cpu_push_transport_test
+ctest --test-dir build-cpu -R '^kvaf_cpu_push_transport_test$' --output-on-failure
+
+# 正常停止旧服务后启动；地址与端口必须和 NPU config.cpu_service 对应。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28890 --memory-page-mode thp
+```
+
+检查新的 `CPU_PUSH_CAP optimized=1`。本修复只要求更新 CPU 服务，NPU kernel/绑定 ABI 不变。
+普通请求的 READ、SGL WRITE、Ready、done 和 CQ 等待不增加探测；三轮探测仅执行于初始化。
+
+A+K 若配置远端地址（如 `141.62.38.71:28890`），应使用该拓扑实际可达的 EID；不能套用此前
+本机 CPU→NPU 测试的物理 EID。抓取同一次运行双方完整初始化日志，按 session 对齐 CPU
+`CANDIDATE_READY / CPU_PUSH_START_FAILED / CPU_PUSH_LINK_PROBE_READY` 和 NPU
+`STARTUP_CANDIDATE_BEGIN / STARTUP_CANDIDATE_FAILED`。所有候选均 ACK 超时时，保留
+两端该时间段的 UB/UDMA/UVS 驱动日志，核对 EID 路由和 TP 状态；导入句柄成功不足以证明
+数据面可持续通信。

@@ -20,6 +20,8 @@ class Transport {
                     const peer::OpenCpuPushGetRequest&, urma::GetTpList,
                     urma::ImportJettyEx, std::uint32_t psn, peer::OpenCpuPushGetResponse*);
   Status ReadRequest(std::uint64_t* sequence);
+  // Repeat real idle READ/WRITE round trips before accepting a startup candidate.
+  Status ProbeIdleLink();
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch();
   Status Complete(std::uint64_t sequence, Result result);

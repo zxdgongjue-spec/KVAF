@@ -20,6 +20,7 @@ struct Posted {
 std::vector<Posted> posted;
 std::uint64_t done_address{};
 bool fail_cq{};
+std::uint64_t fail_read_context{};
 std::uint32_t post_calls{};
 std::vector<std::uint32_t> post_queues;
 const kvaf::urma::Sge* later_queue_source{};
@@ -109,7 +110,8 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
         assert(!completed);
         cr[0] = {};
         cr[0].user_ctx = wr->user_ctx;
-        cr[0].status = fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
+        cr[0].status = wr->opcode == URMA_OPC_READ && fail_read_context == wr->user_ctx
+            ? URMA_CR_ACK_TIMEOUT_ERR : fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
         completed = 1;
       }
     }
@@ -119,6 +121,47 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
 
 namespace kvaf::cpu_push {
 struct TransportTest {
+  static void IdleProbe(std::uint64_t failed_read, bool idle = true) {
+    Transport t;
+    assert(MakeLayout(656, 4, &t.layout_));
+    t.workers_ = 4; t.token_bytes_ = 656; t.max_sge_ = 13; t.max_bytes_ = 65536;
+    void* control = nullptr;
+    assert(!posix_memalign(&control, 64, t.layout_.staging));
+    t.memory_ = static_cast<std::uint8_t*>(control);
+    std::memset(control, 0, t.layout_.staging);
+    std::vector<std::uint8_t> hbm(t.layout_.staging);
+    t.hbm_base_ = Address(hbm.data()); done_address = t.hbm_base_ + 128;
+    if (!idle) reinterpret_cast<Word*>(hbm.data() + 64)->value = 7;
+    for (std::size_t q = 0; q < kJettyCount; ++q) {
+      assert(pending[q].empty());
+      t.queues_[q].channel.local_jetty = &jettys[q];
+      t.queues_[q].channel.local_jfc = &cqs[q];
+    }
+    t.PrepareCompletions();
+    posted.clear(); fail_read_context = failed_read;
+    const auto status = t.ProbeIdleLink();
+    assert(status.ok() == (!failed_read && idle));
+    if (failed_read) {
+      assert(status.message().find("round=" + std::to_string(failed_read) + "/3") != std::string::npos);
+      assert(status.message().find("phase=read_notify") != std::string::npos);
+      assert(status.message().find("status=9 status_name=ACK_TIMEOUT") != std::string::npos);
+      // Failed reads never lead to another WRITE or a published start success.
+      assert(posted.size() == failed_read * 2 - 1);
+      assert(t.queues_[0].poisoned);
+    } else if (!idle) {
+      assert(posted.size() == 1 && status.message().find("target is not idle") != std::string::npos);
+    } else {
+      assert(posted.size() == 6 && t.queues_[0].sequence == 3);
+      for (std::size_t i = 0; i < posted.size(); ++i)
+        assert(posted[i].opcode == (i % 2 ? URMA_OPC_WRITE : URMA_OPC_READ));
+      assert(*reinterpret_cast<const std::uint64_t*>(hbm.data() + 128) == 0);
+    }
+    fail_read_context = 0;
+    for (auto& q : t.queues_) {
+      q.channel.local_jetty = nullptr; q.channel.local_jfc = nullptr;
+    }
+    assert(t.Shutdown().ok());
+  }
   static void Run(std::uint32_t token, std::uint32_t maximum = 1024,
                   std::uint32_t max_sge = 16, std::uint32_t post_batch = 128,
                   std::uint32_t message_bytes = 65536, bool tail_comp_order = false) {
@@ -373,6 +416,8 @@ struct TransportTest {
 }
 
 int main() {
+  for (auto failed_read : {0U, 1U, 2U, 3U}) kvaf::cpu_push::TransportTest::IdleProbe(failed_read);
+  kvaf::cpu_push::TransportTest::IdleProbe(0, false);
   for (auto token : {13U, 656U, 4096U, 65535U}) kvaf::cpu_push::TransportTest::Run(token);
   // Cross SQ-credit/wave and segmented control-READ boundaries.
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests);

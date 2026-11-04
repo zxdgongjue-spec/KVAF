@@ -22,6 +22,16 @@ constexpr unsigned kOptimized = 1;
 constexpr unsigned kOptimized = 0;
 #endif
 constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
+const char* CqStatusName(urma_cr_status_t status) {
+  switch (status) {
+    case URMA_CR_SUCCESS: return "SUCCESS";
+    case URMA_CR_ACK_TIMEOUT_ERR: return "ACK_TIMEOUT";
+    case URMA_CR_LOC_ACCESS_ERR: return "LOCAL_ACCESS_ERROR";
+    case URMA_CR_REM_ACCESS_ABORT_ERR: return "REMOTE_ACCESS_ABORT";
+    case URMA_CR_RNR_RETRY_CNT_EXC_ERR: return "RNR_RETRY_EXCEEDED";
+    default: return "OTHER";
+  }
+}
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
     std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s\n", stage);
@@ -33,6 +43,7 @@ std::string CqDetails(std::size_t queue, const urma_cr_t& cr,
                       const cpu_runtime_detail::UrmaChannel& channel) {
   std::ostringstream out;
   out << " queue=" << queue << " status=" << static_cast<unsigned>(cr.status)
+      << " status_name=" << CqStatusName(cr.status)
       << " actual_ctx=0x" << std::hex << cr.user_ctx << std::dec
       << " flags=" << static_cast<unsigned>(cr.flag.value)
       << " completion_bytes=" << cr.completion_len << " local_id=" << cr.local_id
@@ -213,7 +224,8 @@ Status Transport::Post(Queue& q) {
   return Status::OK();
 }
 Status Transport::Wait(Queue& q) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+  const auto wait_begin = std::chrono::steady_clock::now();
+  const auto deadline = wait_begin + std::chrono::milliseconds(kTimeoutMs);
   std::uint32_t polls = 0;
   while (q.pending) {
     urma_cr_t crs[8]{};
@@ -231,7 +243,9 @@ Status Transport::Wait(Queue& q) {
             << " remote_addr=0x" << q.remote.front().addr << std::dec
             << " bytes=" << q.remote.front().len
             << " wr_opcode=" << static_cast<unsigned>(q.wrs.back().opcode)
-            << " notify_offset=" << layout_.notify;
+            << " notify_offset=" << layout_.notify
+            << " wait_us=" << std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_begin).count();
         return Status::Internal(out.str());
       }
       q.pending = 0;
@@ -276,6 +290,25 @@ Status Transport::ReadRequest(std::uint64_t* sequence) {
     profile_.enabled = (notify & kProfileNotify) != 0;
   }
   return result;
+}
+Status Transport::ProbeIdleLink() {
+  // One successful request does not prove that this TP can advance its packet
+  // sequence. Reject a candidate whose second/subsequent notify READ fails,
+  // instead of accepting it and making the first AIV request wait until timeout.
+  constexpr unsigned rounds = 3;
+  for (unsigned round = 1; round <= rounds; ++round) {
+    const auto prefix = "startup link probe round=" + std::to_string(round) + "/" +
+                        std::to_string(rounds);
+    std::uint64_t sequence = 0;
+    auto status = ReadRequest(&sequence);
+    if (!status.ok()) return Status::Error(status.code(), prefix + " phase=read_notify: " + status.message());
+    if (sequence != 0)
+      return Status::InvalidState(prefix + " phase=read_notify: target is not idle, sequence=" +
+                                  std::to_string(sequence));
+    status = Complete(0, Result::kPending);
+    if (!status.ok()) return Status::Error(status.code(), prefix + " phase=write_pending: " + status.message());
+  }
+  return Status::OK();
 }
 Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (profile_.enabled) {
