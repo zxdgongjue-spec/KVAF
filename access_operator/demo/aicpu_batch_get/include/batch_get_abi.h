@@ -51,6 +51,8 @@ inline constexpr std::uint64_t GatherWorkspaceBytes(std::uint32_t workers) {
 }
 static_assert(sizeof(GatherReadArgs) <= 256U);
 struct AicpuBatchGetInput {
+  // GatherRead with indices == 0 reads address_table[i] as a complete source
+  // address; offsets is unused. Other callers use address_table[indices[i]] + offsets[i].
   std::uint64_t address_table{}, indices{}, offsets{}, miss_count{}, output_indices{};
   std::uint32_t table_capacity{}, request_capacity{}, token_bytes{};
 };

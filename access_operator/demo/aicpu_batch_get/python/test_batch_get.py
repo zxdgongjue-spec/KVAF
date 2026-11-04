@@ -11,7 +11,7 @@ import statistics
 import time
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device-id", type=int, default=7)
     parser.add_argument("--peer", default="127.0.0.1:28990")
@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--tokens-per-block", type=int, default=2)
     parser.add_argument("--active-percent", type=int, default=100)
+    parser.add_argument("--miss-count", type=int,
+                        help="exact active prefix length; overrides --active-percent")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-rounds", type=int, default=0,
@@ -39,11 +41,13 @@ def parse_args() -> argparse.Namespace:
         default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json")
         if cann else None,
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not all(1 <= workers <= 8 for workers in args.workers):
         parser.error("--workers must contain values from 1 to 8")
     if not 1 <= args.blocks <= 65536:
         parser.error("--blocks must be from 1 to 65536")
+    if args.miss_count is not None and not 0 <= args.miss_count <= args.blocks:
+        parser.error("--miss-count must be between zero and --blocks")
     if args.token_bytes <= 0 or args.token_bytes * 65536 > 0xFFFFFFFF:
         parser.error("--token-bytes must be positive and 65536 tokens must fit uint32")
     if args.tokens_per_block <= 0 or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
@@ -68,7 +72,37 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def print_profile(samples: list[dict], mode: str) -> None:
+def timing_stats(values: list[float], payload_bytes: int = 0) -> dict:
+    p50 = percentile(values, 0.50)
+    mean = statistics.mean(values)
+    return {
+        "mean_us": mean, "p50_us": p50, "p90_us": percentile(values, 0.90),
+        "p95_us": percentile(values, 0.95), "p99_us": percentile(values, 0.99),
+        "GBps": payload_bytes / mean / 1000 if mean else 0.0,
+        "p50_GBps": payload_bytes / p50 / 1000 if p50 else 0.0,
+    }
+
+
+def summarize_profiles(profiles: list[dict], payload_bytes: int) -> dict:
+    if not profiles:
+        return {}
+    stages = {"kernel_total": timing_stats(
+        [sample["device_span_us"] for sample in profiles], payload_bytes)}
+    # Take the slowest worker in EACH round, then calculate percentiles.
+    # Phase maxima can belong to different workers and must not be added.
+    for stage, field in (
+        ("post", "post_us"), ("completion_wait", "cq_wait_us"),
+        ("ready_wait", "ready_wait_us"), ("read", "read_us"),
+        ("wr_build", "wr_build_us"), ("request", "request_us"),
+        ("source_write", "source_write_us"), ("notify", "notify_us"), ("ack", "ack_us"),
+    ):
+        stages[stage] = timing_stats([
+            max(worker[field] for worker in sample["workers"]) for sample in profiles])
+    return stages
+
+
+def print_profile(samples: list[dict], mode: str, *, warmup: int = 1,
+                  separate_samples: bool = True) -> None:
     def mean(key: str, rows: list[dict]) -> float:
         return statistics.mean(row[key] for row in rows)
 
@@ -76,10 +110,10 @@ def print_profile(samples: list[dict], mode: str) -> None:
         return " ".join(f"{key}={mean(key, rows):.1f}" for key in keys)
 
     print(f"AICPU_BATCH_GET_PROFILE mode={mode} workers={len(samples[0]['workers'])} "
-          f"rounds={len(samples)} warmup=1 "
+          f"rounds={len(samples)} warmup={warmup} "
           "aggregation=mean_per_worker units=us "
           "output_payload_flushes=0 "
-          "instrumented_rounds_excluded_from_bandwidth=1")
+          f"instrumented_rounds_excluded_from_bandwidth={int(separate_samples)}")
     print("  Python " + fields(samples, ("python_call_us", "binding_prepare_us", "native_call_us",
                                        "binding_total_us", "python_other_us")))
     hosts = [sample["host"] for sample in samples]
@@ -91,7 +125,7 @@ def print_profile(samples: list[dict], mode: str) -> None:
         print(f"  Worker {index} " + fields(rows, ("entry_us", "exit_us", "wall_us",
                                                   "request_us", "source_write_us", "notify_us",
                                                   "read_us", "ack_us")))
-        print("    Within request " + fields(rows, ("input_cache_us", "descriptor_cache_us")))
+        print("    Within request " + fields(rows, ("descriptor_cache_us",)))
         print("    Within READ " + fields(rows, ("read_setup_us", "wr_build_us", "ready_wait_us",
                                                 "post_us", "cq_wait_us")))
         print("    Counts " + fields(rows, ("bytes", "spans", "read_wqes", "post_calls",
@@ -112,6 +146,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
              mode: str = "gather_read") -> None:
     device = f"npu:{args.device_id}"
     n, token = args.blocks, args.token_bytes
+    measured_count = args.miss_count if args.miss_count is not None else n * args.active_percent // 100
     block_bytes = token * args.tokens_per_block
     rng = random.Random(20261021)  # Identical input sequence for every worker count.
     keys = list(range(n))
@@ -142,7 +177,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     profiles: list[dict] = []
     device_table = None
 
-    def run_round(epoch: int, active_percent: int, raw_tensors: bool = False,
+    def run_round(epoch: int, active_count: int, raw_tensors: bool = False,
                   synchronize: bool = True, profile: bool = False) -> tuple[int, int]:
         nonlocal device_table
         payload = bytearray(rng.randbytes(n * block_bytes))
@@ -154,7 +189,6 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
             row_values.sort()
         row_values = [args.output_row_step * row for row in row_values]
         offset_values = [rng.randrange(args.tokens_per_block) * token for _ in range(n)]
-        active_count = n * active_percent // 100
         expected = bytearray([0xA5]) * (n * 2 * token)
         for i in range(active_count):
             start = index_values[i] * block_bytes + offset_values[i]
@@ -211,20 +245,20 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
               f"iterations={args.iterations}", flush=True)
         # Exercise both Python overloads, partial prefixes and the empty-request path.
         for epoch, (active, raw) in enumerate(((100, False), (75, True), (0, False))):
-            run_round(epoch, active, raw)
-        run_round(3, 75, synchronize=False)
+            run_round(epoch, n * active // 100, raw)
+        run_round(3, n * 75 // 100, synchronize=False)
         for epoch in range(args.warmup):
-            run_round(epoch + 4, args.active_percent)
+            run_round(epoch + 4, measured_count)
         for epoch in range(args.iterations):
-            elapsed, size = run_round(epoch + 4 + args.warmup, args.active_percent)
+            elapsed, size = run_round(epoch + 4 + args.warmup, measured_count)
             samples_ns.append(elapsed)
             payload_bytes.append(size)
         if args.profile_rounds:
             profile_epoch = 4 + args.warmup + args.iterations
-            run_round(profile_epoch, args.active_percent, profile=True)
+            run_round(profile_epoch, measured_count, profile=True)
             profiles.clear()
             for epoch in range(args.profile_rounds):
-                run_round(profile_epoch + 1 + epoch, args.active_percent, profile=True)
+                run_round(profile_epoch + 1 + epoch, measured_count, profile=True)
     finally:
         # Registered source/output allocations remain alive until teardown.
         runtime.shutdown()
@@ -235,6 +269,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         f"AICPU_BATCH_GET_PASS mode={mode} workers={workers} iterations={args.iterations} "
         f"mean_us={statistics.mean(samples_us):.1f} "
         f"p50_us={percentile(samples_us, 0.50):.1f} "
+        f"p90_us={percentile(samples_us, 0.90):.1f} "
         f"p95_us={percentile(samples_us, 0.95):.1f} "
         f"p99_us={percentile(samples_us, 0.99):.1f} GBps={bandwidth:.3f} "
         f"output_order={args.output_order} output_row_step={args.output_row_step} "
@@ -245,6 +280,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     )
     if profiles:
         print_profile(profiles, mode)
+
 
 
 def main() -> None:

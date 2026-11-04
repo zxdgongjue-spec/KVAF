@@ -91,6 +91,43 @@ runtime.batch_get(addresses, valid, indices, offsets, miss_count, output_indices
 调用方管理这些地址对应的远端数据生命周期。使用 `prepare_access_table` 的调用仍保留公共元数据接口，
 Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制 Host 地址表。
 
+## 测试直接输入 CPU 源地址
+
+给性能扫描加 `--source-mode direct`，AICPU 就直接读取本轮的 `addresses[i]`，
+跳过 `address_table[indices[i]] + offsets[i]`。默认 `--source-mode table` 保留查表方式。
+两种方式使用相同的 100 GiB CPU DDR 总预算、随机源数据和输出行，CPU gather、流水 READ 均相同。
+
+```bash
+./build.sh aicpu-urma --install-kernel
+
+KVAF_AICPU_TOKEN_BYTES="656" \
+KVAF_AICPU_MISS_COUNTS="4096" \
+KVAF_AICPU_WORKERS="1" \
+./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
+  --device-id 7 --peer 127.0.0.1:28888 \
+  --urma-device udmac0d1e5 --eid-index 0 \
+  --source-mode direct --warmup 10 --iterations 100
+```
+
+测试在每轮计时前从地址表生成裸地址，并同步完成；传入 kernel 的是本轮裸地址数组。
+所以这组数据衡量的是**源地址已准备好时**的性能，地址生成成本不在计时中。
+终端和 CSV 增加 `source_mode`；裸地址模式将 `lookup_table_us` 换成 `prepare_request_us`，
+包含填写地址/长度清单和发送前的清单缓存维护，其余阶段口径相同。
+
+实际调用使用 `aicpu_batch_get_mode="gather_read_direct"` 创建 Runtime，再调用已有 Tensor 重载：
+
+```python
+# source_addresses: HBM 中连续的 int64 数组，每项已包含完整 CPU 源地址。
+# 每个有效地址至少可读取 token_bytes 字节；output_indices 指定 HBM 输出行。
+runtime.batch_get(source_addresses, valid, indices, offsets, miss_count,
+                  output_indices, output, stream=stream, synchronize=True)
+```
+
+为复用现有 Python 接口，`valid`、`indices`、`offsets` 仍需满足原来的 Tensor 形状与类型要求，
+但裸地址模式的 AICPU kernel 不读取它们。地址数组容量须覆盖请求数组容量；
+只处理 `miss_count` 指定的有效前缀。调用方可直接提供已有的裸地址，不需要创建全量地址表。
+默认查表模式及 CPU-push 模式的输入含义不变。CPU 服务无需修改，Host 库与设备包需一起更新。
+
 ## 用 Python 检查正确性和比较 worker 数
 
 CPU 服务启动后，在仓库根目录运行：
@@ -137,13 +174,111 @@ print(profile["workers"])
 | Host | 准备、launch、状态及 profile D2H 入队、等待 stream、收尾；各项之和为 Host total |
 | Device | 最早 worker 进入至最后 worker 主体退出，使用同一设备时钟；不含最后的 profile 导出 |
 | Worker | 相对进入/退出、总时长、清单构建、源清单 WRITE、通知 CPU、流水 READ、最终 ACK |
-| Within request | 输入缓存维护、清单缓存维护；已包含在清单构建中 |
+| Within request | 清单交给 URMA DMA 前的缓存维护；已包含在请求准备中 |
 | Within READ | 工作区准备、WR/SGL 构建、等待就绪前缀、provider 提交、最后 CQE 等待；已包含在 READ 中 |
 
 各 worker 互相重叠，不能把它们的阶段最大值相加为端到端时间。
 `ready_wait` 包含与 CPU gather 重叠的等待，并非 CPU gather 本身的计时。
 provider 提交包含编码、写 SQ 和 doorbell，不能单独当作写 SQ 耗时。
 Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳不相减。
+
+## 全量性能扫描
+
+在仓库根目录构建后，先启动 CPU 服务：
+
+```bash
+./build.sh cpu
+./build.sh aicpu-urma --install-kernel
+
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28990 \
+  --gather-threads 8 --gather-mode active --gather-affinity off
+```
+
+另一个终端加载 CANN 环境，在仓库根目录运行扫描：
+
+```bash
+./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
+  --device-id 7 --peer 127.0.0.1:28990 \
+  --urma-device udmac0d1e5 --eid-index 0
+```
+
+Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.batch_get` 测量。
+默认扫描 252 组：
+
+| 参数 | 扫描值 |
+| --- | --- |
+| token_bytes | 128、256、512、656、1024、2048、4096 B |
+| miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
+| workers | 1、2、4、5 |
+
+每组预热 10 轮、测量 100 轮，均开启 profile。端到端、算子和各阶段耗时来自同一批测量轮次。
+只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
+算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段每轮取 worker 最大耗时，再对测量轮次求均值。
+
+通信 DDR 总预算固定为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
+按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
+再按完整块向下取整。同一 token 大小下，不同 worker 使用相同的源地址池。
+每块默认 128 个 token，数据和地址表初始化一次。
+每轮有放回随机选择源块和块内 token，输出随机选择互不重复的 HBM 行，没有固定隔行保护区。
+输入数组和输出行数为 `max(32768, miss_count)`，每轮校验整个输出和未写入行。
+准备数据、BatchPut、生成请求和结果校验在计时之外。
+
+缩小扫描范围时，设置三个列表即可；其他参数直接传给单组测试：
+
+```bash
+KVAF_AICPU_TOKEN_BYTES="656" \
+KVAF_AICPU_MISS_COUNTS="32 4096" \
+KVAF_AICPU_WORKERS="1 2 4" \
+./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
+  --device-id 7 --peer 127.0.0.1:28990 \
+  --urma-device udmac0d1e5 --eid-index 0 \
+  --warmup 3 --iterations 20
+```
+
+`--table-capacity` 仅用于选择更小的源池，不能超出上述预算；`--tokens-per-block` 控制每块 token 数。
+`miss_count` 只决定本轮从源池读取多少个 token，不决定源池分配大小。
+每组日志打印源池 GiB、工作区预算 MiB 和总预算，避免字节数用科学计数法显示。
+CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
+
+结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
+可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
+终端按现有 profile 的执行顺序显示每组配置的一份汇总，省略 worker 明细、缓存细项、计数和 Host/Python 杂项：
+
+- 准备 CPU 读取请求（地址查表、填写清单并交给 DMA）、发送地址清单、通知 CPU。
+- 流水 READ 总时间，以及其中的 WR/SGL 构建、等待 CPU 就绪前缀、提交 READ、等待 READ CQE。
+
+上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
+请求准备包含地址查表、填写地址/长度清单及发送前的清单缓存维护；READ 下的子项包含在 READ 总时间内。
+阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
+
+CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列为均值，算子耗时列为 P50：
+
+| 表头 | 含义 |
+| --- | --- |
+| source_mode | `table` 为查表输入，`direct` 为本轮完整源地址输入 |
+| token_bytes / miss_count / workers | 测试配置 |
+| device_p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
+| lookup_table_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
+| prepare_request_us | 裸地址模式下替代 `lookup_table_us`：顺序读取源地址、填写清单并清理清单缓存 |
+| address_send_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
+| notify_cpu_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
+| read_total_us | 从 staging READ 到输出 HBM 的整个流水阶段 |
+| build_wqe_us | 构建 URMA READ 请求及目标分散地址 |
+| cpu_gather_wait_us | 等待 CPU 完成当前需要的 staging 前缀 |
+| post_us | provider 编码、SQ 写入及 doorbell |
+| cq_wait_us | 等待已提交 READ 完成 |
+
+`build_wqe_us`、`cpu_gather_wait_us`、`post_us` 和 `cq_wait_us` 已经包含在 `read_total_us` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
+耗时保留 1 位小数，带宽为十进制 GB/s。上述 8 个阶段字段表示均值（微秒），`device_p50_us` 表示算子耗时中位数（微秒）。`lookup_table_us` 沿用请求准备阶段打点，包含查表、填清单和清单缓存维护；`cpu_gather_wait_us` 是 AICPU 等待就绪前缀的时间，不是 CPU gather 的独立执行耗时。
+
+当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
+把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。
+这一步只准备请求元数据，不搬运实际 payload。地址表、索引、偏移、输出行号和 miss_count
+遵循 CANN 输入 Tensor 的交接方式，AICPU 直接读取，不再额外刷新地址表或逐项刷新输入。
+输入内容可以每轮更新，不依赖上一轮内容不变。
+
+原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
 
 ## 执行和资源约定
 
@@ -173,7 +308,20 @@ READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请�
 WR/SGL 工作区按本轮请求的上界增长，完成后复用容量；每轮仍重新填写全部有效请求。
 会话用独立数组保存数据队列和控制队列，worker 0 与其他 worker 使用相同的存储和访问方式。
 AICPU 只将输出地址交给 URMA，不直接读写输出 payload，因此 READ 前后不再逐段清理输出的 AICPU 缓存。
-输入元数据读取前、源清单发送前、状态回传前仍做缓存维护。
+GatherRead 只在以下 kernel 内部 URMA DMA 交接处保留缓存维护：
+
+| 位置 | 写入方 → 读取方 | 保留理由 |
+| --- | --- | --- |
+| 非空源清单发送前 | AICPU → URMA WRITE DMA | 清单刚由 AICPU 填写，DMA 随即在同一 kernel 内读取其 HBM 内容 |
+| 通知发送前 | AICPU → URMA WRITE DMA | 发布刚写入的请求编号和描述符指针 |
+| 进度 READ 完成后 | URMA READ DMA → AICPU | DMA 覆盖复用的 scratch，AICPU 在同一 kernel 内读取新进度 |
+| ACK READ 完成后 | URMA READ DMA → AICPU | DMA 覆盖 ACK 槽，AICPU 在同一 kernel 内判断完成状态 |
+
+这些交接不经过 kernel 完成边界，CQ 表示传输完成；它本身不构成 CANN 对本地 AICPU 缓存的交接。
+已删除输入 Tensor、miss_count、status 和 profile 回传前的手工刷新。
+输入在 kernel 启动前就绪，status/profile 由同一 stream 上排在 kernel 之后的 D2H 回传，
+与现有 UMDK 控制 kernel 和 CPU-push kernel 的处理一致。空请求不发送清单，也不执行清单刷新。
+`input_cache_ns` 的 ABI 槽位保留为零；不再执行该阶段或在测试输出中展示它。
 每个 worker 的 scratch 独占一条 64 B 缓存行：通知发送前清理一次，此后 AICPU 只读取查询结果，
 不再在每次 ready/ACK READ 前重复清理；收到 CQE 后仍清理再取值，避免读到旧缓存。
 不清零 scratch 中的 ACK 槽，查询完成后直接使用远端覆盖的值。

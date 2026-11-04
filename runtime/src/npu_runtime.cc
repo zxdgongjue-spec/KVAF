@@ -488,8 +488,10 @@ struct NpuRuntime::Impl {
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& mode = impl_->options.aicpu_batch_get_mode;
-  if (mode != "gather_read" && mode != "cpu_push_scatter")
-    throw std::invalid_argument("aicpu_batch_get_mode must be gather_read or cpu_push_scatter");
+  if (mode != "gather_read" && mode != "gather_read_direct" && mode != "cpu_push_scatter")
+    throw std::invalid_argument("aicpu_batch_get_mode must be gather_read, gather_read_direct or cpu_push_scatter");
+  if (mode == "gather_read_direct" && impl_->options.aicpu_urma_kernel_json_path.empty())
+    throw std::invalid_argument("gather_read_direct requires an AICPU kernel JSON");
   const bool push = mode == "cpu_push_scatter";
 #if !defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   if (push) throw std::invalid_argument("cpu_push_scatter was not built; rebuild with --cpu-push");

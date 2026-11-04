@@ -70,6 +70,47 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 预检包括部分/空 `miss_count`、两种 Tensor 重载和异步调用。
 需要阶段耗时时增加 `--profile-rounds 100`；采样轮次不计入正常带宽。
 
+## 全量性能扫描
+
+CPU 服务启动后，在加载 CANN 环境的终端运行：
+
+```bash
+./tests/run_aicpu_cpu_push_scatter_sweep.sh build-aicpu-urma \
+  --device-id 7 --peer 127.0.0.1:28990 \
+  --urma-device udmac0d1e5 --eid-index 0
+```
+
+默认与 GatherRead sweep 一样扫描 252 组：token 为 128、256、512、656、1024、2048、4096 B，
+miss_count 为 32、64、128、256、512、1024、2048、4096、8192，worker 为 1、2、4、5。
+每组预热 10 轮、测量 100 轮，均开启 profile。
+
+源数据池按 100 GiB DDR 预算初始化一次，每块默认 128 个 token；CPU push 的 staging 和地址清单在 HBM，
+不从 DDR 预算扣除 GatherRead 工作区。每轮有放回随机选择源 token，随机选择互不重复的输出行，
+输入和输出行数为 `max(32768, miss_count)`，逐轮校验整个输出及未写入行。
+`--table-capacity` 可缩小源池；与 GatherRead 对比时可指定相同容量。
+
+主指标为 `device_p50_us` 和 `p50_GBps`，带宽按有效字节数除以算子 P50 计算。
+各阶段每轮取 worker 最大值，再对测量轮次求均值：`lookup_table_us`、`notify_cpu_us`、
+`push_total_us`、`ready_wait_us`、`scatter_us`、`done_wait_us`。
+ready 等待和 scatter 包含在 push 总时间内，各阶段最大值不能相加。
+CPU 自身的 READ/WRITE 分段耗时仍在服务端 `CPU_PUSH_PROFILE` 日志中。
+
+缩小扫描范围示例：
+
+```bash
+KVAF_AICPU_TOKEN_BYTES="656" \
+KVAF_AICPU_MISS_COUNTS="32 4096" \
+KVAF_AICPU_WORKERS="1 2 4 5" \
+./tests/run_aicpu_cpu_push_scatter_sweep.sh build-aicpu-urma \
+  --device-id 7 --peer 127.0.0.1:28990 \
+  --urma-device udmac0d1e5 --eid-index 0 \
+  --table-capacity 4096 --warmup 3 --iterations 20
+```
+
+每组 `.log` 和 `summary.csv` 默认写入 `reports/aicpu-cpu-push-scatter/<时间戳>`。
+`KVAF_AICPU_SWEEP_LOG_DIR` 可指定一个新目录；任一组失败后停止并保留已完成结果。
+单组入口为 `python/benchmark_cpu_push_scatter.py`，参数与 GatherRead 相同，另支持 `--npu-eid`。
+
 ## 请求与数据流
 
 一次调用处理 `int32 miss_count` 指定的有效前缀，最多 65536 项。

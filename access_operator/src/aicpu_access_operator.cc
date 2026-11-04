@@ -9,17 +9,19 @@
 namespace kvaf {
 struct UmdkAccessOperator::Impl {
   explicit Impl(UmdkAccessOperatorConfig config)
-      : valid_mode(config.batch_get_mode == "gather_read" || config.batch_get_mode == "cpu_push_scatter"),
+      : valid_mode(config.batch_get_mode == "gather_read" ||
+                   config.batch_get_mode == "gather_read_direct" ||
+                   config.batch_get_mode == "cpu_push_scatter"),
         session({config.kernel_json, config.device, config.eid_index, config.workers,
                  config.peer_link}),
-        get(session, config.token_bytes),
+        get(session, config.token_bytes, config.batch_get_mode == "gather_read_direct"),
         put(session) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
     if (config.batch_get_mode == "cpu_push_scatter")
       push = std::make_unique<cpu_push::CpuPushTransport>(cpu_push::Config{
           config.peer_link, config.kernel_json, config.local_eid, config.token_bytes, config.workers});
 #else
-    valid_mode = config.batch_get_mode == "gather_read";
+    valid_mode = config.batch_get_mode == "gather_read" || config.batch_get_mode == "gather_read_direct";
 #endif
   }
   bool valid_mode;
