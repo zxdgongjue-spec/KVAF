@@ -16,13 +16,18 @@ KVAF_BATCH_GET_TOKEN_BYTES=(128 256 512 656 1024 2048 4096)
 KVAF_BATCH_GET_MISS_COUNTS=(32 64 128 256 512 1024 2048 4096 8192)
 KVAF_BATCH_GET_AIV_CORES=(1 2 4 8 16 32)
 KVAF_BATCH_GET_JETTYS_PER_CORE=(1 2 4 8 16 32 64)
+# Miss counts come from the array above. These defaults apply to every case;
+# explicit CLI values and the short adaptive calibration can override them.
+: "${KVAF_BATCH_GET_PERF_WARMUP:=10}"
+: "${KVAF_BATCH_GET_PERF_ITERATIONS:=100}"
+export KVAF_BATCH_GET_PERF_WARMUP KVAF_BATCH_GET_PERF_ITERATIONS
 
 [[ -x "$KVAF_BATCH_GET_PERF_RUNNER" ]] || {
   echo "ERROR: BatchGet performance runner is not executable: $KVAF_BATCH_GET_PERF_RUNNER" >&2
   exit 1
 }
 
-# Only the eager kernel profile uses the platform-specific AIV clock.
+# Kernel profiling in either execution mode uses the platform-specific AIV clock.
 : "${KVAF_BATCH_GET_KERNEL_CLOCK_MHZ:=1000}"
 : "${KVAF_ADAPTIVE_UB_MISS_COUNT:=2048}"
 if [[ ! "$KVAF_ADAPTIVE_UB_MISS_COUNT" =~ ^[1-9][0-9]*$ ]]; then
@@ -72,6 +77,7 @@ adaptive_requested=false
 base_options=()
 : "${KVAF_BATCH_GET_PERF_EXECUTION_MODE:=eager}"
 execution_mode="$KVAF_BATCH_GET_PERF_EXECUTION_MODE"
+kernel_profile="${KVAF_BATCH_GET_PERF_KERNEL_PROFILE:-auto}"
 while (($# > 0)); do
   case "$1" in
     --adaptive-ub-device) adaptive_requested=true ;;
@@ -81,31 +87,58 @@ while (($# > 0)); do
       shift
       ;;
     --execution-mode=*) execution_mode="${1#*=}" ;;
+    --kernel-profile) kernel_profile=1 ;;
+    --no-kernel-profile) kernel_profile=0 ;;
+    --kernel-profile-clock-mhz)
+      [[ $# -ge 2 ]] || { echo "ERROR: --kernel-profile-clock-mhz requires a value" >&2; exit 2; }
+      KVAF_BATCH_GET_KERNEL_CLOCK_MHZ="$2"
+      shift
+      ;;
+    --kernel-profile-clock-mhz=*) KVAF_BATCH_GET_KERNEL_CLOCK_MHZ="${1#*=}" ;;
     *) base_options+=("$1") ;;
   esac
   shift
 done
 base_options+=(--execution-mode "$execution_mode")
 case "$execution_mode" in
+  eager) default_kernel_profile=1 ;;
+  graph) default_kernel_profile=0 ;;
+  *) echo "ERROR: execution-mode must be eager or graph" >&2; exit 2 ;;
+esac
+case "$kernel_profile" in
+  auto) kernel_profile="$default_kernel_profile" ;;
+  1|true|True|TRUE|yes|YES|on|ON) kernel_profile=1 ;;
+  0|false|False|FALSE|no|NO|off|OFF) kernel_profile=0 ;;
+  *) echo "ERROR: KVAF_BATCH_GET_PERF_KERNEL_PROFILE must be a boolean" >&2; exit 2 ;;
+esac
+export KVAF_BATCH_GET_PERF_KERNEL_PROFILE="$kernel_profile"
+if [[ "$kernel_profile" == 1 ]]; then
+  [[ "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: kernel profile clock MHz must be a positive integer" >&2
+    exit 2
+  }
+  profile_options=(--kernel-profile --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ")
+else
+  profile_options=(--no-kernel-profile)
+fi
+case "$execution_mode" in
   graph)
     total_operation=batch_get_graph_event
     calibration_operation=batch_get_graph_event
     aggregation=npu_stream_event_interval
-    profile_options=(--no-kernel-profile)
     ;;
   eager)
-    [[ "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^[1-9][0-9]*$ ]] || {
-      echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive integer" >&2
-      exit 2
-    }
-    total_operation=batch_get_kernel_total
     calibration_operation=batch_get
-    aggregation=max_elapsed_across_cores
-    profile_options=(--kernel-profile --kernel-profile-clock-mhz "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ")
+    if [[ "$kernel_profile" == 1 ]]; then
+      total_operation=batch_get_kernel_total
+      aggregation=max_elapsed_across_cores
+    else
+      total_operation=batch_get
+      aggregation=host_call_to_stream_completion
+    fi
     ;;
-  *) echo "ERROR: execution-mode must be eager or graph" >&2; exit 2 ;;
 esac
-echo "BATCH_GET_MISS_SWEEP_TIMING execution_mode=$execution_mode metric=$total_operation unit=us"
+echo "BATCH_GET_MISS_SWEEP_TIMING execution_mode=$execution_mode kernel_profile=$kernel_profile metric=$total_operation unit=us"
 
 selected_ub_device=""
 adaptive_selection_skipped=false
@@ -252,7 +285,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         total_profile_result="$(extract_profile_result "$log_file" "$total_operation")"
         post_profile_result=""
         completion_wait_profile_result=""
-        if [[ "$execution_mode" == eager ]]; then
+        if [[ "$kernel_profile" == 1 ]]; then
           post_profile_result="$(extract_profile_result "$log_file" batch_get_kernel_post)"
           completion_wait_profile_result="$(extract_profile_result "$log_file" batch_get_kernel_completion_wait)"
           if [[ -z "$post_profile_result" || -z "$completion_wait_profile_result" ]]; then
@@ -300,7 +333,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         completion_wait_p50_us=""
         completion_wait_p90_us=""
         completion_wait_p99_us=""
-        if [[ "$execution_mode" == eager ]]; then
+        if [[ "$kernel_profile" == 1 ]]; then
           post_mean_us="$(extract_field "$post_profile_result" mean_us)"
           post_p50_us="$(extract_field "$post_profile_result" p50_us)"
           post_p90_us="$(extract_field "$post_profile_result" p90_us)"
@@ -339,6 +372,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           "aiv_cores=$aiv_cores"
           "jettys_per_core=$jettys_per_core"
           "metric=$total_operation"
+          "kernel_profile=$kernel_profile"
           "unit=us"
           "mean_us=$mean_us"
           "p50_us=$p50_us"
@@ -348,7 +382,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           "p50_GBps=$p50_gbps"
           "selected_ub_device=$shape_ub_device"
         )
-        if [[ "$execution_mode" == eager ]]; then
+        if [[ "$kernel_profile" == 1 ]]; then
           result+=(
             "post_mean_us=$post_mean_us"
             "post_p50_us=$post_p50_us"
@@ -370,8 +404,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_DONE token_bytes=$token_bytes"
 done
 
-printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us metric=%s aggregation=%s\n' \
-  "${#mean_us_values[@]}" "$total_operation" "$aggregation"
+printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us metric=%s kernel_profile=%s aggregation=%s\n' \
+  "${#mean_us_values[@]}" "$total_operation" "$kernel_profile" "$aggregation"
 printf 'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=%s\n' "${total_operation#batch_get_}"
 printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s %15s\n' \
   token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us p50_GB/s
@@ -388,7 +422,7 @@ for index in "${!mean_us_values[@]}"; do
     "${p50_gbps_values[$index]}"
 done
 
-if [[ "$execution_mode" == eager ]]; then
+if [[ "$kernel_profile" == 1 ]]; then
   printf '\nBATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_post\n'
   printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s\n' \
     token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us
@@ -426,9 +460,9 @@ fi
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,metric'
+    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,metric,kernel_profile'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -447,7 +481,8 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_p90_us_values[$index]}" \
       "${completion_wait_p99_us_values[$index]}" \
       "${selected_ub_device_values[$index]}" \
-      "$total_operation"
+      "$total_operation" \
+      "$kernel_profile"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"

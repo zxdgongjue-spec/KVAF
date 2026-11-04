@@ -298,8 +298,6 @@ def validate_args(args: argparse.Namespace) -> str | None:
     ddr_bytes = args.table_capacity * block_bytes
     if args.execution_mode not in {"eager", "graph"}:
         return "execution-mode must be eager or graph"
-    if args.execution_mode == "graph" and args.kernel_profile:
-        return "graph Event timing requires --no-kernel-profile; use eager for kernel diagnostics"
     if args.request_length <= 0 or args.request_length > MAX_INT32:
         return "request-length must be in [1, INT32_MAX]"
     if args.table_capacity <= 0 or args.table_capacity > MAX_INT32:
@@ -430,6 +428,7 @@ def measure_graph_event_us(
     validate_replay: Callable[[], None],
     warmup: int,
     iterations: int,
+    collect_profile: Callable[[], None] | None = None,
 ) -> list[float]:
     """Capture only launch; measure one replay per sample on the same stream."""
     try:
@@ -479,6 +478,10 @@ def measure_graph_event_us(
                 if not math.isfinite(elapsed_us) or elapsed_us < 0:
                     raise RuntimeError(f"invalid graph Event duration: {elapsed_us} us")
                 samples_us.append(elapsed_us)
+                if collect_profile is not None:
+                    # Each replay overwrites the status buffer. Read this sample
+                    # after the end Event, before the next replay can overwrite it.
+                    collect_profile()
 
             validate_replay()
             return samples_us
@@ -957,6 +960,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return indices, offsets, output_indices
 
+        kernel_profile_samples: list[list[dict[str, object]]] = []
+        if args.kernel_profile:
+            runtime.start_batch_get_kernel_profile()
+            kernel_profile_started = True
+            print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
+
         if args.execution_mode == "graph":
             torch.npu.synchronize()
             graph_stream = torch.npu.Stream(device=device_id)
@@ -997,11 +1006,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         raise AssertionError("BatchGet graph modified rows outside miss_count")
                 print("BATCH_GET_GRAPH_CORRECTNESS_PASS", flush=True)
 
+            def collect_graph_profile() -> None:
+                kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
+
             print(
                 "GRAPH_PERF_CONTRACT metric=batch_get_graph_event unit=us "
                 "captured_ops=runtime_batch_get fixed_tensor_addresses=1 "
                 "capture_excluded=1 input_updates_excluded=1 validation_excluded=1 "
-                "kernel_profile=0 eager_setup_calls=1 validation_replays=1 "
+                f"kernel_profile={int(args.kernel_profile)} profile_readback_excluded=1 "
+                "eager_setup_calls=1 validation_replays=1 "
                 "event_overhead_included=1 dispatch_gaps_may_be_included=1 "
                 f"warmup={args.warmup} samples={args.iterations}",
                 flush=True,
@@ -1010,18 +1023,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 torch, graph, graph_stream, launch_graph_batch_get,
                 prepare_graph_inputs, validate_graph_output,
                 args.warmup, args.iterations,
+                collect_profile=collect_graph_profile if args.kernel_profile else None,
             )
             print_samples(
                 "batch_get_graph_event", samples_us, args.warmup,
                 request_length, miss_count_value, token_bytes,
             )
+            if args.kernel_profile:
+                print_kernel_profile(
+                    kernel_profile_samples, args.warmup,
+                    args.kernel_profile_clock_mhz, args.aiv_cores,
+                    args.jettys_per_core, request_length, miss_count_value, token_bytes,
+                )
+                runtime.stop_batch_get_kernel_profile()
+                kernel_profile_started = False
+                print("BATCH_GET_KERNEL_PROFILE_DISABLED")
             print("BATCH_GET_PERF_PHASE_DONE phase=batch_get_graph_event")
             return 0
-
-        if args.kernel_profile:
-            runtime.start_batch_get_kernel_profile()
-            kernel_profile_started = True
-            print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
@@ -1043,7 +1061,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         submit_samples: list[float] = []
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
-        kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
             # Request generation and Tensor work are deliberately excluded.

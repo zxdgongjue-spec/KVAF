@@ -17,6 +17,7 @@ STAGES = {
     "batch_get_kernel_completion_wait": "completion_wait_",
 }
 GRAPH_OPERATION = "batch_get_graph_event"
+HOST_OPERATION = "batch_get"
 FIELDNAMES = [
     *SHAPE_FIELDS,
     *(f"{stat}_us" for stat in STATS),
@@ -25,6 +26,7 @@ FIELDNAMES = [
     *(f"completion_wait_{stat}_us" for stat in STATS),
     "selected_ub_device",
     "metric",
+    "kernel_profile",
 ]
 LOG_PATTERN = "token_bytes_*_miss_count_*_aiv_cores_*_jettys_per_core_*.log"
 LOG_NAME = re.compile(
@@ -66,7 +68,7 @@ def parse_log(path, clock_override=None):
             elif parts[0] == "KERNEL_PROFILE_CONTRACT":
                 contract = record
             elif parts[0] == "PERF_RESULT" and record.get("operation") in (
-                *STAGES, GRAPH_OPERATION
+                *STAGES, GRAPH_OPERATION, HOST_OPERATION
             ):
                 profiles[record["operation"]] = record
             elif parts[0] == "[KVAF_AIV]" and len(parts) > 1 and parts[1] in (
@@ -81,7 +83,21 @@ def parse_log(path, clock_override=None):
                 raise ValueError("benchmark error reported in log")
 
     graph_mode = config.get("execution_mode") == "graph" or GRAPH_OPERATION in profiles
-    stages = {GRAPH_OPERATION: ""} if graph_mode else STAGES
+    profile_flag = config.get("kernel_profile")
+    if profile_flag is not None and profile_flag not in {"0", "1"}:
+        raise ValueError(f"invalid kernel_profile: {profile_flag!r}")
+    kernel_profile = profile_flag == "1" if profile_flag is not None else any(
+        operation in profiles for operation in STAGES
+    )
+    primary = GRAPH_OPERATION if graph_mode else (
+        "batch_get_kernel_total" if kernel_profile else HOST_OPERATION
+    )
+    stages = {primary: ""}
+    if kernel_profile:
+        stages.update(STAGES)
+        # The graph Event remains the primary duration even with kernel profiling.
+        if graph_mode:
+            stages["batch_get_kernel_total"] = None
     missing = stages.keys() - profiles.keys()
     if missing:
         raise ValueError(f"incomplete profile: missing {', '.join(sorted(missing))}")
@@ -105,7 +121,9 @@ def parse_log(path, clock_override=None):
         profile = profiles[operation]
         for stat in STATS:
             us_name = f"{stat}_us"
-            if graph_mode or (us_name in profile and clock_override is None):
+            if operation in {GRAPH_OPERATION, HOST_OPERATION} or (
+                us_name in profile and clock_override is None
+            ):
                 duration_us = number(profile.get(us_name), f"{operation}.{us_name}")
             else:
                 clock = number(
@@ -117,14 +135,16 @@ def parse_log(path, clock_override=None):
                 name = f"{stat}_cycles"
                 cycles = number(profile.get(name), f"{operation}.{name}")
                 duration_us = cycles / clock
-            row[f"{prefix}{stat}_us"] = f"{duration_us:.3f}"
-            if not prefix and stat == "p50":
+            if prefix is not None:
+                row[f"{prefix}{stat}_us"] = f"{duration_us:.3f}"
+            if operation == primary and stat == "p50":
                 p50_us = duration_us
     payload_bytes = row["miss_count"] * row["token_bytes"]
     gbps = payload_bytes / p50_us / 1000 if p50_us > 0 else 0
     row["p50_GBps"] = f"{gbps:.3f}"
     row["selected_ub_device"] = device
-    row["metric"] = GRAPH_OPERATION if graph_mode else "batch_get_kernel_total"
+    row["metric"] = primary
+    row["kernel_profile"] = str(int(kernel_profile))
     return row
 
 

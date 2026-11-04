@@ -6,6 +6,7 @@ import csv
 import io
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ class GraphTimingFixture:
         self.validated_inputs = []
         self.executed_inputs = []
         self.launch_calls = 0
+        self.profile_inputs = []
         self.replays = 0
         self.fail_capture = fail_capture
         self.fail_replay = fail_replay
@@ -102,10 +104,16 @@ class GraphTimingFixture:
         self.ready = False
         self.reset_done = True
 
-    def measure(self, warmup=2, iterations=3):
+    def collect_profile(self):
+        assert self.output == self.input
+        self.profile_inputs.append(self.input)
+        self.now_ms += 300.0
+
+    def measure(self, warmup=2, iterations=3, profile=False):
         return perf.measure_graph_event_us(
             self.torch, self, self.stream, self.launch, self.prepare,
             self.validate, warmup, iterations,
+            collect_profile=self.collect_profile if profile else None,
         )
 
 
@@ -135,11 +143,30 @@ class GraphPerfTests(unittest.TestCase):
                 self.assertFalse(fixture.capturing)
                 self.assertTrue(fixture.reset_done)
 
+    def test_profile_is_collected_per_measured_replay_outside_event_interval(self):
+        fixture = GraphTimingFixture()
+        samples = fixture.measure(warmup=2, profile=True)
+        self.assertEqual(fixture.profile_inputs, [4, 5, 6])
+        for sample in samples:
+            self.assertAlmostEqual(sample, 237.5)
+        self.assertTrue(fixture.reset_done)
+
+    def test_graph_is_reset_when_profile_readback_fails(self):
+        fixture = GraphTimingFixture()
+        def fail_readback():
+            raise RuntimeError("profile readback failed")
+        fixture.collect_profile = fail_readback
+        with self.assertRaisesRegex(RuntimeError, "profile readback"):
+            fixture.measure(profile=True)
+        self.assertTrue(fixture.reset_done)
+
     def test_mode_validation_and_environment_override(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(perf.parse_args([]).execution_mode, "eager")
-            args = perf.parse_args(["--execution-mode", "graph", "--kernel-profile"])
-            self.assertIn("--no-kernel-profile", perf.validate_args(args))
+            for mode in ("eager", "graph"):
+                for flag in ("--kernel-profile", "--no-kernel-profile"):
+                    args = perf.parse_args(["--execution-mode", mode, flag])
+                    self.assertIsNone(perf.validate_args(args))
             args = perf.parse_args([
                 "--execution-mode", "graph", "--no-kernel-profile",
                 "--kernel-profile-clock-mhz", "0",
@@ -162,7 +189,7 @@ class GraphPerfTests(unittest.TestCase):
 
 
 class SweepModeTests(unittest.TestCase):
-    def run_sweep(self, mode, adaptive=False):
+    def run_sweep(self, mode=None, adaptive=False, profile=None, extra_options=(), custom_env=None):
         root = Path(__file__).resolve().parents[2]
         source = (root / "tests/run_remote_cpu_batch_get_miss_count_perf.sh").read_text()
         # Run one real sweep case, with a fake runner replacing NPU hardware.
@@ -181,23 +208,35 @@ class SweepModeTests(unittest.TestCase):
             script.write_text(source)
             runner = directory / "runner.py"
             runner.write_text('''#!/usr/bin/env python3
+import os
 import sys
 args = sys.argv[2:]
+assert os.environ['KVAF_BATCH_GET_PERF_WARMUP'] == '10'
+assert os.environ['KVAF_BATCH_GET_PERF_ITERATIONS'] == '100'
 def option(name, default):
     return args[args.index(name) + 1] if name in args else default
 mode = option('--execution-mode', 'eager')
 profile_flags = [arg for arg in args if arg in ('--kernel-profile', '--no-kernel-profile')]
+assert len(profile_flags) == 1
+profile = profile_flags[0] == '--kernel-profile'
 if '--adaptive-calibration-only' in args:
+    assert not profile
     print('BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE')
     sys.exit(0)
 is_calibration = option('--iterations', '') == '5'
-assert profile_flags[-1] == ('--no-kernel-profile' if mode == 'graph' or is_calibration else '--kernel-profile')
-operation = 'batch_get_graph_event' if mode == 'graph' else ('batch_get' if is_calibration else 'batch_get_kernel_total')
+if is_calibration:
+    assert not profile
+if profile:
+    assert option('--kernel-profile-clock-mhz', '') == os.environ.get('FAKE_EXPECT_CLOCK', '1000')
 if '--peer-ub-device' in args:
     print('[KVAF_AIV] UB_DEVICE_REUSED ub_device=' + option('--peer-ub-device', ''))
-print('BATCH_GET_PERF_CONFIG execution_mode=' + mode + ' token_bytes=656 miss_count=32 aiv_cores=2 jettys_per_core=2')
-print('PERF_RESULT operation=' + operation + ' mean_us=250.125 p50_us=200.000 p90_us=300.000 p99_us=400.000 unit=us useful_GiBps=0.100')
-if mode == 'eager' and not is_calibration:
+print('BATCH_GET_PERF_CONFIG execution_mode=' + mode + ' kernel_profile=' + str(int(profile)) + ' token_bytes=656 miss_count=32 aiv_cores=2 jettys_per_core=2')
+if mode == 'graph':
+    print('PERF_RESULT operation=batch_get_graph_event mean_us=250.125 p50_us=200.000 p90_us=300.000 p99_us=400.000 unit=us useful_GiBps=0.100')
+else:
+    print('PERF_RESULT operation=batch_get mean_us=500.250 p50_us=400.000 p90_us=600.000 p99_us=800.000 unit=us useful_GiBps=0.050')
+if profile:
+    print('PERF_RESULT operation=batch_get_kernel_total mean_us=200.000 p50_us=160.000 p90_us=250.000 p99_us=300.000 unit=us')
     for stage in ('post', 'completion_wait'):
         print('PERF_RESULT operation=batch_get_kernel_' + stage + ' mean_us=100.000 p50_us=80.000 p90_us=120.000 p99_us=160.000 unit=us')
 ''')
@@ -206,10 +245,15 @@ if mode == 'eager' and not is_calibration:
             env.update(
                 KVAF_BATCH_GET_PERF_RUNNER=str(runner),
                 KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=str(directory / "logs"),
-                # Event timing must not depend on an AIV clock.
-                KVAF_BATCH_GET_KERNEL_CLOCK_MHZ="invalid" if mode == "graph" else "1000",
+                KVAF_BATCH_GET_KERNEL_CLOCK_MHZ="1000",
             )
-            command = ["bash", str(script), "/unused/build", "--execution-mode", mode]
+            env.update(custom_env or {})
+            command = ["bash", str(script), "/unused/build"]
+            if mode is not None:
+                command.extend(["--execution-mode", mode])
+            if profile is not None:
+                command.append("--kernel-profile" if profile else "--no-kernel-profile")
+            command.extend(extra_options)
             if adaptive:
                 command.append("--adaptive-ub-device")
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
@@ -217,25 +261,72 @@ if mode == 'eager' and not is_calibration:
             with (directory / "logs/batch_get_miss_sweep_summary.csv").open(newline="") as csv_file:
                 rows = list(csv.DictReader(csv_file))
             self.assertEqual(len(rows), 1)
+            # Recovery from the real per-case log must match the live sweep CSV
+            # in every mode, including its primary metric and profiling flag.
+            recovery = runpy.run_path(str(root / "tests/summarize_batch_get_miss_sweep.py"))
+            case_log = next((directory / "logs").glob("token_bytes_*.log"))
+            recovered = recovery["parse_log"](case_log)
+            self.assertEqual(rows[0], {key: str(value) for key, value in recovered.items()})
             return rows[0], result.stdout
 
     def test_sweep_graph_us_and_empty_diagnostic_columns(self):
-        row, output = self.run_sweep("graph", adaptive=True)
+        row, output = self.run_sweep("graph", adaptive=True, custom_env={
+            "KVAF_BATCH_GET_KERNEL_CLOCK_MHZ": "invalid",
+        })
         self.assertEqual(row["mean_us"], "250.125")
         self.assertEqual(row["p50_GBps"], "0.105")
         self.assertEqual(row["metric"], "batch_get_graph_event")
         self.assertEqual(row["post_mean_us"], "")
+        self.assertEqual(row["kernel_profile"], "0")
         self.assertEqual(row["selected_ub_device"], "udmac0d1e2")
         self.assertNotIn("stage=kernel_post", output)
         self.assertNotIn("clock_mhz=", output)
 
     def test_sweep_eager_keeps_kernel_stages_in_us(self):
-        row, output = self.run_sweep("eager")
-        self.assertEqual(row["mean_us"], "250.125")
+        row, output = self.run_sweep()
+        self.assertEqual(row["mean_us"], "200.000")
         self.assertEqual(row["post_mean_us"], "100.000")
         self.assertEqual(row["completion_wait_p99_us"], "160.000")
         self.assertEqual(row["metric"], "batch_get_kernel_total")
+        self.assertEqual(row["kernel_profile"], "1")
         self.assertIn("stage=kernel_post", output)
+
+    def test_sweep_explicit_eager_profile_off_uses_host_metric(self):
+        row, output = self.run_sweep("eager", profile=False, custom_env={
+            "KVAF_BATCH_GET_KERNEL_CLOCK_MHZ": "invalid",
+            "KVAF_BATCH_GET_PERF_KERNEL_PROFILE": "1",
+        })
+        self.assertEqual(row["mean_us"], "500.250")
+        self.assertEqual(row["p50_GBps"], "0.052")
+        self.assertEqual(row["metric"], "batch_get")
+        self.assertEqual(row["kernel_profile"], "0")
+        self.assertEqual(row["post_mean_us"], "")
+        self.assertNotIn("stage=kernel_post", output)
+
+    def test_sweep_explicit_graph_profile_on_keeps_event_primary(self):
+        row, output = self.run_sweep("graph", adaptive=True, profile=True, extra_options=(
+            "--kernel-profile-clock-mhz", "500",
+        ), custom_env={
+            "KVAF_BATCH_GET_PERF_KERNEL_PROFILE": "0", "FAKE_EXPECT_CLOCK": "500",
+        })
+        self.assertEqual(row["mean_us"], "250.125")
+        self.assertEqual(row["metric"], "batch_get_graph_event")
+        self.assertEqual(row["kernel_profile"], "1")
+        self.assertEqual(row["post_mean_us"], "100.000")
+        self.assertIn("stage=kernel_post", output)
+        self.assertIn("clock_mhz=500", output)
+
+    def test_explicit_default_choices_and_environment_overrides(self):
+        for mode, profile in (("eager", True), ("graph", False)):
+            with self.subTest(mode=mode):
+                row, _ = self.run_sweep(mode, profile=profile)
+                self.assertEqual(row["kernel_profile"], str(int(profile)))
+        row, _ = self.run_sweep(custom_env={
+            "KVAF_BATCH_GET_PERF_EXECUTION_MODE": "graph",
+            "KVAF_BATCH_GET_PERF_KERNEL_PROFILE": "true",
+        })
+        self.assertEqual(row["metric"], "batch_get_graph_event")
+        self.assertEqual(row["kernel_profile"], "1")
 
 
 if __name__ == "__main__":

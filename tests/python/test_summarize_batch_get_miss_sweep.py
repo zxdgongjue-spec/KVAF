@@ -62,6 +62,7 @@ class SweepRecoveryTests(unittest.TestCase):
                 "post_mean_us", "post_p50_us", "post_p90_us", "post_p99_us",
                 "completion_wait_mean_us", "completion_wait_p50_us",
                 "completion_wait_p90_us", "completion_wait_p99_us", "selected_ub_device", "metric",
+                "kernel_profile",
             ])
         self.assertEqual([row["aiv_cores"] for row in rows], ["1", "2", "4", "8"])
         self.assertEqual(rows[0]["p50_us"], "8.000")
@@ -70,6 +71,7 @@ class SweepRecoveryTests(unittest.TestCase):
         self.assertEqual(rows[0]["completion_wait_p99_us"], "10.000")
         self.assertEqual(rows[0]["selected_ub_device"], "udmac0d1e2")
         self.assertEqual(rows[0]["metric"], "batch_get_kernel_total")
+        self.assertEqual(rows[0]["kernel_profile"], "1")
         for path, original in snapshots.items():
             self.assertEqual(path.read_bytes(), original)
 
@@ -94,10 +96,48 @@ class SweepRecoveryTests(unittest.TestCase):
             self.assertEqual(row["mean_us"], "250.125")
             self.assertEqual(row["p50_GBps"], "0.105")
             self.assertEqual(row["metric"], "batch_get_graph_event")
+            self.assertEqual(row["kernel_profile"], "0")
             self.assertEqual(row["post_mean_us"], "")
             self.assertEqual(row["completion_wait_p99_us"], "")
         path.write_text(path.read_text().replace("p50_us=200.000", "p50_us=nan"))
         with self.assertRaises(ValueError):
+            summary.parse_log(path)
+
+    def test_graph_profile_on_requires_and_recovers_both_timelines(self):
+        event = (
+            "PERF_RESULT operation=batch_get_graph_event "
+            "mean_us=250.125 p50_us=200.000 p90_us=300.000 p99_us=400.000\n"
+        )
+        path = self.write_log(profile=event + PROFILE)
+        for override, post_us in ((None, "4.000"), (500, "8.000")):
+            row = summary.parse_log(path, clock_override=override)
+            self.assertEqual(row["metric"], "batch_get_graph_event")
+            self.assertEqual(row["kernel_profile"], "1")
+            self.assertEqual(row["mean_us"], "250.125")
+            self.assertEqual(row["post_mean_us"], post_us)
+        path.write_text(path.read_text().replace(
+            "BATCH_GET_PERF_CONFIG ", "BATCH_GET_PERF_CONFIG kernel_profile=1 "
+        ).split("PERF_RESULT operation=batch_get_kernel_completion_wait")[0])
+        with self.assertRaisesRegex(ValueError, "incomplete profile"):
+            summary.parse_log(path)
+
+    def test_eager_profile_off_uses_host_duration_without_clock(self):
+        host = (
+            "PERF_RESULT operation=batch_get "
+            "mean_us=500.250 p50_us=400.000 p90_us=600.000 p99_us=800.000\n"
+        )
+        path = self.write_log(profile=host)
+        path.write_text(path.read_text().replace(
+            "BATCH_GET_PERF_CONFIG ", "BATCH_GET_PERF_CONFIG execution_mode=eager kernel_profile=0 "
+        ).replace("clock_mhz=1000", "clock_mhz=invalid"))
+        row = summary.parse_log(path)
+        self.assertEqual(row["metric"], "batch_get")
+        self.assertEqual(row["kernel_profile"], "0")
+        self.assertEqual(row["mean_us"], "500.250")
+        self.assertEqual(row["post_mean_us"], "")
+        self.assertEqual(row["p50_GBps"], "0.052")
+        path.write_text(path.read_text().replace("kernel_profile=0", "kernel_profile=1"))
+        with self.assertRaisesRegex(ValueError, "incomplete profile"):
             summary.parse_log(path)
 
     def test_microsecond_kernel_results_and_clock_override(self):

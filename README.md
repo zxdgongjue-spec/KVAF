@@ -295,21 +295,52 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 记录 `torch.npu.Event(enable_timing=True)`：
 
 ```bash
-tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
-  --execution-mode graph --no-kernel-profile \
-  --miss-count 2048 --warmup 10 --iterations 100
+# 原批处理入口，默认 eager + kernel-profile：
+tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu
 
-# 扫描 token 大小、miss_count、核数和 Jetty 数：
+# graph 默认关闭 kernel-profile：
 tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
-  --execution-mode graph --warmup 10 --iterations 100
+  --execution-mode graph
+
+# 显式覆盖默认值：
+tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
+  --execution-mode eager --no-kernel-profile
+tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
+  --execution-mode graph --kernel-profile
 ```
+
+批处理脚本每组默认 `warmup=10`、`iterations=100`，可在脚本顶部调整，或通过
+`KVAF_BATCH_GET_PERF_WARMUP`、`KVAF_BATCH_GET_PERF_ITERATIONS`、命令行覆盖。
+miss-count 由扫描数组逐组指定（含 2048）；adaptive 标定单独使用 warmup=1、
+iterations=5，并关闭 kernel-profile。
+
+批处理入口支持四种组合，未显式指定 profiling 时按执行模式选择默认值：
+
+| 执行模式 | kernel-profile 默认值 | CSV 主耗时指标 |
+| --- | --- | --- |
+| eager | 开启 | 开启时为每核 kernel_total 最大值，关闭时为 Host 调用到完成耗时 |
+| graph | 关闭 | NPU Event 的图回放耗时，开启 profiling 后额外汇总核内阶段 |
+
+`--kernel-profile` / `--no-kernel-profile` 可覆盖默认值，也可用
+`KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1/0`；命令行优先，重复开关以最后一个为准。
+开启 profiling 时可通过 `--kernel-profile-clock-mhz` 覆盖核内周期换算频率。
+
+两个 shell 脚本是上下层关系：`run_remote_cpu_batch_get_perf.sh` 运行一个配置，
+调用 `tests/python/test_npu_batch_get_perf.py` 执行完整的初始化、填表、校验和计时；
+`run_remote_cpu_batch_get_miss_count_perf.sh` 调用前者，遍历 7 种 token 大小、
+9 种 miss-count、6 种核数和 7 种 Jetty 数，共 2646 个配置，并生成汇总 CSV。
+
+单配置入口仅输出到终端；批量 sweep 通过 `tee` 保存每组 stdout/stderr，目录由
+`KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR` 控制，见下文。日志保存在执行脚本的机器上。
 
 执行模式默认 `eager`，也可通过 `KVAF_BATCH_GET_PERF_EXECUTION_MODE=graph` 设置。
 该性能脚本所有耗时输出统一为微秒：`mean_us`、`p50_us`、`p90_us`、`p99_us`；
-Event 返回的毫秒先乘 1000，图模式不依赖 `kernel-profile-clock-mhz`。
+Event 返回的毫秒先乘 1000，Event 计时不依赖 `kernel-profile-clock-mhz`。
 图模式输出 `PERF_RESULT operation=batch_get_graph_event`，eager 保留 Host
 调用耗时和可选的核内 cycles 诊断，耗时字段同样使用 `us`。
-图模式需关闭核内 profiling，避免其开销混入主指标。
+graph + kernel-profile 同时输出 Event 与核内 timeline；每次测量完成后读取
+该次 profile，读回操作位于 Event 计时区间外。开启 profiling 会使 Event 耗时包含
+核内采样与 profile 写回开销。Event 自身不依赖核内频率，核内诊断仍需正确配置 MHz。
 
 图模式排除 capture、预热、请求构造/排序、固定 buffer 内容更新和正确性校验；
 每个样本前更新输入并完成相关 stream 工作。图回放在计时前和最后一个样本后检查
@@ -340,9 +371,10 @@ sweep 前设置 `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR`。默认在输入目录生�
 `token_bytes_*_miss_count_*_aiv_cores_*_jettys_per_core_*.log`，忽略设备校准日志。
 每个输入日志应只包含一个 case，不能传整次 sweep 的控制台合并日志。
 
-CSV 使用 `*_us` 耗时列，并用 `metric` 列标记测量范围。eager 从 total、post、
-completion_wait 三组 `PERF_RESULT` 提取结果；图模式读取
-`batch_get_graph_event`，post/completion_wait 列留空，不要求核内 profiling。
+CSV 使用 `*_us` 耗时列，并用 `metric` 和 `kernel_profile` 列标记测量范围与
+profiling 开关。eager 开启 profiling 时主指标为 `batch_get_kernel_total`，
+关闭时为 `batch_get`；graph 主指标始终为 `batch_get_graph_event`。
+两种模式都只在开启 profiling 时汇总 post/completion_wait，关闭时这些列留空。
 新日志直接读取微秒，旧核内日志仍支持 `cycles / clock_mhz` 换算。
 `p50_GBps = miss_count * token_bytes / p50_us / 1000`。
 核内频率优先读取 `KERNEL_PROFILE_CONTRACT` 或 `BATCH_GET_PERF_CONFIG`，缺失时
