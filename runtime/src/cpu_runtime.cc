@@ -335,6 +335,11 @@ class CpuGatherWorker {
         session_id_(session_id), lane_(lane) {
     const char* profile = std::getenv("KVAF_GATHER_PROFILE");
     profile_enabled_ = profile && std::strcmp(profile, "1") == 0;
+    if (profile_enabled_) {
+      executor_.EnableProfiling();
+      profile_samples_.resize(512U);
+      for (auto& sample : profile_samples_) sample.threads.resize(executor_.MaxThreads());
+    }
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -342,14 +347,74 @@ class CpuGatherWorker {
   ~CpuGatherWorker() {
     stop_.store(true, std::memory_order_release);
     worker_.join();
+    DumpProfiles();
   }
  private:
+  struct ProfileSample {
+    uint64_t sequence{}, observed_ns{}, done_ns{}, notify_poll_window_ns{};
+    uint64_t start_ack_ns{}, prepare_ns{}, copy_ns{}, ack_ns{};
+    std::size_t active_threads{};
+    peer::GatherDescriptorHeader header{};
+    peer::CpuGatherCopyProfile copy{};
+    std::vector<peer::CpuGatherThreadProfile> threads;
+    bool valid{}, notify_poll_window_valid{};
+  };
+
+  void DumpProfiles() const {
+    if (!profile_enabled_) return;
+    Log("CPU_GATHER_PROFILE_BUFFER session=%" PRIu64 " lane=%u samples=%zu capacity=%zu"
+        " dropped=%zu\n", session_id_, lane_, profile_count_, profile_samples_.size(),
+        profile_dropped_);
+    for (std::size_t index = 0U; index < profile_count_; ++index) {
+      const auto& sample = profile_samples_[index];
+      const auto& copy = sample.copy;
+      Log("CPU_GATHER_PROFILE session=%" PRIu64 " lane=%u sequence=%" PRIu64
+          " rows=%u bytes=%u active_threads=%zu prepare_ns=%" PRIu64
+          " copy_ns=%" PRIu64 " ack_ns=%" PRIu64 " total_ns=%" PRIu64
+          " observed_ns=%" PRIu64 " done_ns=%" PRIu64
+          " start_ack_ns=%" PRIu64 " notify_poll_window_ns=%" PRIu64
+          " notify_poll_window_valid=%u dispatch_to_copy_ns=%" PRIu64
+          " join_wait_ns=%" PRIu64 " result=%s\n",
+          session_id_, lane_, sample.sequence, sample.header.span_count, sample.header.total_bytes,
+          sample.active_threads, sample.prepare_ns, sample.copy_ns, sample.ack_ns,
+          sample.done_ns - sample.observed_ns, sample.observed_ns, sample.done_ns,
+          sample.start_ack_ns, sample.notify_poll_window_ns,
+          sample.notify_poll_window_valid ? 1U : 0U,
+          sample.valid ? copy.begin_ns - copy.publish_ns : 0U,
+          sample.valid ? copy.done_ns - copy.coordinator_done_ns : 0U,
+          sample.valid ? "ok" : "error");
+      for (std::size_t worker = 0U; worker < sample.active_threads; ++worker) {
+        const auto& thread = sample.threads[worker];
+        Log("CPU_GATHER_THREAD_PROFILE session=%" PRIu64 " lane=%u sequence=%" PRIu64
+            " worker=%zu tid=%" PRIu64 " cpu=%d wait_path=%u bytes=%" PRIu64
+            " ready_ns=%" PRIu64 " start_ns=%" PRIu64 " done_ns=%" PRIu64
+            " ready_delay_ns=%" PRIu64 " start_delay_ns=%" PRIu64
+            " copy_ns=%" PRIu64 " barrier_ns=%" PRIu64 " work_ns=%" PRIu64
+            " thread_cpu_ns=%" PRIu64 " cpu_time_valid=%u\n",
+            session_id_, lane_, sample.sequence, worker, thread.tid, thread.cpu,
+            thread.wait_path ? 1U : 0U, thread.bytes, thread.ready_ns, thread.start_ns, thread.done_ns,
+            thread.ready_ns - copy.publish_ns, thread.start_ns - copy.begin_ns,
+            thread.copy_done_ns - thread.start_ns, thread.done_ns - thread.copy_done_ns,
+            thread.done_ns - thread.start_ns, thread.thread_cpu_ns,
+            thread.cpu_time_valid ? 1U : 0U);
+      }
+    }
+  }
+
   void Run() {
     executor_.BindWorker(0U);
     std::uint64_t last = 0U;
+    uint64_t last_idle_poll_ns = 0U;
+    uint32_t poll_count = 0U;
     while (!stop_.load(std::memory_order_acquire)) {
+      // One timestamped idle poll in 256, rather than a clock read on every
+      // spin. The resulting window bounds local visibility-to-observation;
+      // it cannot measure the remote publish-to-visibility delay.
+      const auto poll_start = profile_enabled_ && (poll_count++ & 255U) == 0U
+          ? BatchGetProfileNowNs() : 0U;
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
       if (!sequence || sequence == last || (sequence & peer::kGatherErrorBit)) {
+        if (poll_start != 0U) last_idle_poll_ns = poll_start;
         if (mode_ == CpuGatherMode::kPassive)
           std::this_thread::sleep_for(std::chrono::microseconds(20));
         else
@@ -358,8 +423,14 @@ class CpuGatherWorker {
       }
       last = sequence;
       const auto service_start = profile_enabled_ ? BatchGetProfileNowNs() : 0U;
+      const auto notify_poll_window = last_idle_poll_ns != 0U
+          ? service_start - last_idle_poll_ns : 0U;
+      const bool notify_poll_window_valid = last_idle_poll_ns != 0U;
+      last_idle_poll_ns = 0U;
+      poll_count = 0U;
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
       peer::GatherBarrier();
+      const auto start_ack_end = profile_enabled_ ? BatchGetProfileNowNs() : 0U;
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
       bool valid = false;
       std::size_t active_threads = 0U;
@@ -397,15 +468,29 @@ class CpuGatherWorker {
       peer::GatherBarrier();
       if (profile_enabled_) {
         const auto service_end = BatchGetProfileNowNs();
-        // Print after publishing completion. total_ns starts when this worker
-        // observes notify, not when the remote AIV publishes it; these CPU clock
-        // durations must not be added to the AIV's inclusive ACK wait interval.
-        Log("CPU_GATHER_PROFILE session=%" PRIu64 " lane=%u sequence=%" PRIu64
-            " rows=%u bytes=%u active_threads=%zu prepare_ns=%" PRIu64
-            " copy_ns=%" PRIu64 " ack_ns=%" PRIu64 " total_ns=%" PRIu64 " result=%s\n",
-            session_id_, lane_, sequence, profile_header.span_count, profile_header.total_bytes,
-            active_threads, prepare_ns, copy_ns, service_end - ack_start,
-            service_end - service_start, valid ? "ok" : "error");
+        // Preallocated, bounded storage: logging here could delay observation
+        // of the next notify. Flush only when this lane is stopped/released.
+        if (profile_count_ < profile_samples_.size()) {
+          auto& sample = profile_samples_[profile_count_++];
+          sample.sequence = sequence;
+          sample.observed_ns = service_start;
+          sample.done_ns = service_end;
+          sample.notify_poll_window_ns = notify_poll_window;
+          sample.notify_poll_window_valid = notify_poll_window_valid;
+          sample.start_ack_ns = start_ack_end - service_start;
+          sample.prepare_ns = prepare_ns;
+          sample.copy_ns = copy_ns;
+          sample.ack_ns = service_end - ack_start;
+          sample.header = profile_header;
+          sample.valid = valid;
+          sample.active_threads = valid ? active_threads : 0U;
+          if (valid) {
+            sample.copy = executor_.CopyProfile();
+            std::copy_n(executor_.ThreadProfiles().begin(), active_threads, sample.threads.begin());
+          }
+        } else {
+          ++profile_dropped_;
+        }
       }
     }
   }
@@ -417,6 +502,8 @@ class CpuGatherWorker {
   uint64_t session_id_;
   uint32_t lane_;
   bool profile_enabled_{false};
+  std::vector<ProfileSample> profile_samples_;
+  std::size_t profile_count_{}, profile_dropped_{};
   std::atomic<bool> stop_{false};
   std::thread worker_;
 };

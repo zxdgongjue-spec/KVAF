@@ -45,6 +45,18 @@ inline void GatherSpinPause() {
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
+// CPU steady-clock timestamps only; they do not share the AIV clock.
+struct alignas(64) CpuGatherThreadProfile {
+  std::uint64_t ready_ns{}, start_ns{}, copy_done_ns{}, done_ns{};
+  std::uint64_t thread_cpu_ns{}, bytes{}, tid{};
+  int cpu{-1};
+  bool wait_path{}, cpu_time_valid{};
+};
+
+struct CpuGatherCopyProfile {
+  std::uint64_t publish_ns{}, begin_ns{}, coordinator_done_ns{}, done_ns{};
+};
+
 class CpuGatherExecutor {
  public:
   CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
@@ -95,6 +107,13 @@ class CpuGatherExecutor {
 
   void Copy();
 
+  // Enable before the first PrepareDirect. Disabled execution reads no clocks.
+  void EnableProfiling() { thread_profiles_.resize(max_threads_); }
+  std::size_t MaxThreads() const { return max_threads_; }
+  const CpuGatherCopyProfile& CopyProfile() const { return copy_profile_; }
+  // Read active entries only, after Copy has joined all helpers.
+  const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
+
  private:
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
                       std::uint32_t span_count, std::uint32_t total_bytes) {
@@ -111,6 +130,11 @@ class CpuGatherExecutor {
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     phase_.store(0U, std::memory_order_release);
+    if (!thread_profiles_.empty()) {
+      std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
+      copy_profile_ = {};
+      copy_profile_.publish_ns = NowNs();
+    }
     generation_.fetch_add(1U, std::memory_order_release);
     lock.unlock();
     ready_.notify_all();
@@ -144,6 +168,11 @@ class CpuGatherExecutor {
 
   std::uint64_t ProcessSource(std::size_t worker);
 
+  static std::uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  void CopyWorker(std::size_t worker);
   void RunHelper(std::size_t worker);
 
   std::uint8_t* memory_;
@@ -167,6 +196,8 @@ class CpuGatherExecutor {
   std::uint32_t pipeline_chunk_bytes_{0U};
   std::vector<std::uint32_t> chunk_done_;
   std::atomic<std::size_t> next_chunk_{0U};
+  std::vector<CpuGatherThreadProfile> thread_profiles_;
+  CpuGatherCopyProfile copy_profile_{};
   alignas(64) std::atomic<std::uint32_t> phase_{0U};
   alignas(64) std::atomic<std::size_t> completed_{0U};
   std::atomic<bool> stopping_{false};

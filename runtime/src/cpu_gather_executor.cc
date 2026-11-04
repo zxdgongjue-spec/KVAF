@@ -1,7 +1,18 @@
 #include "cpu_gather_executor.h"
 
+#include <ctime>
+
 namespace kvaf::peer {
 namespace {
+
+std::uint64_t ThreadCpuNs() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+  timespec value{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0)
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000U + value.tv_nsec;
+#endif
+  return 0U;
+}
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
@@ -67,11 +78,39 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 
 void CpuGatherExecutor::Copy() {
   completed_.store(0U, std::memory_order_relaxed);
+  if (!thread_profiles_.empty()) {
+    copy_profile_.begin_ns = NowNs();
+    thread_profiles_[0].ready_ns = copy_profile_.begin_ns;
+  }
   phase_.store(1U, std::memory_order_release);
-  (void)ProcessSource(0U);
-  GatherBarrier();
+  CopyWorker(0U);
+  if (!thread_profiles_.empty())
+    copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) GatherSpinPause();
   if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
+  if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
+}
+
+void CpuGatherExecutor::CopyWorker(std::size_t worker) {
+  if (thread_profiles_.empty()) {
+    (void)ProcessSource(worker);
+    GatherBarrier();
+    return;
+  }
+  auto& profile = thread_profiles_[worker];
+#if defined(__linux__)
+  profile.tid = static_cast<std::uint64_t>(syscall(SYS_gettid));
+  profile.cpu = sched_getcpu();
+#endif
+  const auto cpu_begin = ThreadCpuNs();
+  profile.start_ns = NowNs();
+  profile.bytes = ProcessSource(worker);
+  profile.copy_done_ns = NowNs();
+  GatherBarrier();
+  profile.done_ns = NowNs();
+  const auto cpu_end = ThreadCpuNs();
+  profile.cpu_time_valid = cpu_begin != 0U && cpu_end >= cpu_begin;
+  profile.thread_cpu_ns = profile.cpu_time_valid ? cpu_end - cpu_begin : 0U;
 }
 
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
@@ -138,6 +177,7 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
   bool was_active = false;
   for (;;) {
     bool active = false;
+    bool wait_path = false;
     if (wait_mode_ != GatherWaitMode::kPassive && was_active) {
       const auto spin_start = std::chrono::steady_clock::now();
       std::uint32_t spin_count = 0U;
@@ -151,16 +191,19 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
         generation = generation_.load(std::memory_order_acquire);
       }
       std::unique_lock<std::mutex> lock(mutex_);
-      if (generation_.load(std::memory_order_acquire) == observed_generation)
+      if (generation_.load(std::memory_order_acquire) == observed_generation) {
+        wait_path = true;
         ready_.wait(lock, [this, &observed_generation] {
           return stopping_.load(std::memory_order_acquire) ||
                  generation_.load(std::memory_order_acquire) != observed_generation;
         });
+      }
       if (stopping_.load(std::memory_order_acquire)) return;
       observed_generation = generation_.load(std::memory_order_acquire);
       active = worker < active_threads_;
     } else {
       std::unique_lock<std::mutex> lock(mutex_);
+      wait_path = true;
       ready_.wait(lock, [this, &observed_generation] {
         return stopping_.load(std::memory_order_acquire) ||
                generation_.load(std::memory_order_acquire) != observed_generation;
@@ -171,12 +214,15 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
     }
     was_active = active;
     if (!active) continue;
+    if (!thread_profiles_.empty()) {
+      thread_profiles_[worker].ready_ns = NowNs();
+      thread_profiles_[worker].wait_path = wait_path;
+    }
     while (phase_.load(std::memory_order_acquire) == 0U) {
       if (stopping_.load(std::memory_order_acquire)) return;
       GatherSpinPause();
     }
-    (void)ProcessSource(worker);
-    GatherBarrier();
+    CopyWorker(worker);
     completed_.fetch_add(1U, std::memory_order_release);
   }
 }

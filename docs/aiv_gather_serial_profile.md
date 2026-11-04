@@ -284,10 +284,14 @@ KVAF_GATHER_PROFILE=1 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --gather-threads 8
 ```
 
-CPU 日志开关在 worker 创建时读取。日志在最终 ACK 后打印，包含
+CPU 日志开关在 worker 创建时读取。记录在最终 ACK 后写入预分配缓冲，
+正常停止/释放 lane 时统一打印，每 lane 最多保存 512 条请求并报告 dropped。包含
 `session/lane/sequence`、rows、bytes、实际线程数、`prepare_ns`、`copy_ns`、
 `ack_ns`、`total_ns` 和结果。`copy_ns` 包括本 lane 所有 helper 完成等待；
 `total_ns` 包含准备、拷贝及控制开销，不与子项重复相加。
+新增每线程启动延迟、拷贝/barrier、线程 CPU 时间和 coordinator join 等待，
+采集命令、通知窗口的限制及字段说明见
+[Gather CPU 性能采集](aiv_gather_cpu_profile.md)。
 
 CPU 日志用于诊断，会干扰性能。正式端到端基线关闭此环境变量；需要解释
 CPU 成本时另跑一轮诊断，不将开启 CPU 日志的结果作为无打点吞吐。

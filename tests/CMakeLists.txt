@@ -9,6 +9,13 @@ add_test(NAME kvaf_aiv_test_cleanup_python
 add_test(NAME kvaf_gather_perf_summary_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_perf_summary.py")
 
+add_executable(kvaf_cpu_gather_executor_profile_test cpu_gather_executor_profile_test.cc
+  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)
+target_include_directories(kvaf_cpu_gather_executor_profile_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
+target_link_libraries(kvaf_cpu_gather_executor_profile_test PRIVATE pthread)
+add_test(NAME kvaf_cpu_gather_executor_profile_test COMMAND kvaf_cpu_gather_executor_profile_test)
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")
