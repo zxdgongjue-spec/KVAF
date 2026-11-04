@@ -85,6 +85,18 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     "${KVAF_URMA_LIBRARY_DIR}")
   target_compile_features(kvaf_cpu_service PRIVATE cxx_std_17)
   if(BUILD_TESTING)
+    add_executable(kvaf_cpu_peer_session_test
+      ${PROJECT_SOURCE_DIR}/tests/cpu_peer_session_test.cc)
+    target_include_directories(kvaf_cpu_peer_session_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src "${KVAF_URMA_INCLUDE_DIR}"
+      ${PROJECT_SOURCE_DIR}/access_operator/include)
+    target_link_libraries(kvaf_cpu_peer_session_test PRIVATE
+      kvaf_cpu_runtime "${KVAF_URMA_LIBRARY}")
+    target_compile_options(kvaf_cpu_peer_session_test PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
+    add_test(NAME kvaf_cpu_peer_session_test COMMAND kvaf_cpu_peer_session_test)
+    set_tests_properties(kvaf_cpu_peer_session_test PROPERTIES TIMEOUT 10)
+
     add_executable(kvaf_cpu_push_transport_test
       ${PROJECT_SOURCE_DIR}/tests/cpu_push_get_transport_test.cc)
     target_include_directories(kvaf_cpu_push_transport_test PRIVATE

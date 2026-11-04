@@ -1093,6 +1093,8 @@ void HandleClient(int fd, CpuService* service) {
       (void)WriteAll(fd, response.get(), sizeof(*response));
       return;
     }
+    case Command::kStopGatherLanes:
+    case Command::kStartCpuPushGet:
     case Command::kStopCpuPushGet: {
       peer::CpuPushGetSessionRequest request{};
       request.header = header;
