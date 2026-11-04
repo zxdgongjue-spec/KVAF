@@ -1,6 +1,8 @@
 #include "cpu_push_get_worker.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace kvaf::cpu_push {
@@ -12,12 +14,21 @@ Worker::~Worker() {
 }
 Status Worker::Start() {
   if (thread_.joinable() || stop_.load()) return Status::InvalidState("CPU push worker cannot restart");
-  // Check sustained control traffic before publishing START success. The worker
-  // is not running yet, so it cannot race these queue submissions.
-  const auto linked = transport_->ProbeIdleLink();
-  if (!linked.ok()) return linked;
-  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_LINK_PROBE_READY session=%llu rounds=3\n",
-               static_cast<unsigned long long>(transport_->session()));
+  const auto* mode = std::getenv("KVAF_CPU_PUSH_STARTUP_PROBE");
+  if (!mode) mode = "basic";
+  if (std::strcmp(mode, "basic") && std::strcmp(mode, "diagnostic") && std::strcmp(mode, "off"))
+    return Status::InvalidArgument("KVAF_CPU_PUSH_STARTUP_PROBE must be basic, diagnostic or off");
+  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_STARTUP_PROBE session=%llu mode=%s\n",
+               static_cast<unsigned long long>(transport_->session()), mode);
+  // The default only checks one READ so unreachable EID pairs can fall back.
+  // Diagnostic mode repeats READ/WRITE; off allows a zero-probe comparison.
+  // The background worker still performs and validates every business I/O.
+  if (std::strcmp(mode, "off")) {
+    const auto linked = transport_->ProbeIdleLink(std::strcmp(mode, "diagnostic") == 0);
+    if (!linked.ok()) return linked;
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_LINK_PROBE_READY session=%llu mode=%s\n",
+                 static_cast<unsigned long long>(transport_->session()), mode);
+  }
   try { thread_ = std::thread(&Worker::Run, this); }
   catch (const std::exception& e) { return Status::Internal(e.what()); }
   return Status::OK();

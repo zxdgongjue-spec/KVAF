@@ -21,6 +21,7 @@ std::vector<Posted> posted;
 std::uint64_t done_address{};
 bool fail_cq{};
 std::uint64_t fail_read_context{};
+std::uint32_t fail_pending_write{}, pending_write_count{};
 std::uint32_t post_calls{};
 std::vector<std::uint32_t> post_queues;
 const kvaf::urma::Sge* later_queue_source{};
@@ -73,10 +74,13 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
     }
     for (auto* wr : execution) {
       const auto& dst = wr->rw.dst.sge[0];
+      bool fail_this_pending_write = false;
       if (wr->opcode == URMA_OPC_WRITE && dst.addr == done_address) {
         assert(dst.len == 8 && wr->flag.bs.place_order == URMA_STRONG_ORDER);
         // Whole-batch done must never be posted before other Jettys drain.
         for (const auto& queue : pending) assert(queue.empty());
+        if (*reinterpret_cast<const std::uint64_t*>(wr->rw.src.sge[0].addr) == 0)
+          fail_this_pending_write = ++pending_write_count == fail_pending_write;
       }
       const auto workspace = done_address - 128;
       const auto& request = *reinterpret_cast<const Request*>(workspace);
@@ -110,7 +114,8 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
         assert(!completed);
         cr[0] = {};
         cr[0].user_ctx = wr->user_ctx;
-        cr[0].status = wr->opcode == URMA_OPC_READ && fail_read_context == wr->user_ctx
+        cr[0].status = (wr->opcode == URMA_OPC_READ && fail_read_context == wr->user_ctx) ||
+            fail_this_pending_write
             ? URMA_CR_ACK_TIMEOUT_ERR : fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
         completed = 1;
       }
@@ -121,7 +126,8 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
 
 namespace kvaf::cpu_push {
 struct TransportTest {
-  static void IdleProbe(std::uint64_t failed_read, bool idle = true) {
+  static void IdleProbe(std::uint64_t failed_read, bool idle = true,
+                        std::uint32_t failed_write = 0, bool diagnostic = true) {
     Transport t;
     assert(MakeLayout(656, 4, &t.layout_));
     t.workers_ = 4; t.token_bytes_ = 656; t.max_sge_ = 13; t.max_bytes_ = 65536;
@@ -131,6 +137,8 @@ struct TransportTest {
     std::memset(control, 0, t.layout_.staging);
     std::vector<std::uint8_t> hbm(t.layout_.staging);
     t.hbm_base_ = Address(hbm.data()); done_address = t.hbm_base_ + 128;
+    constexpr std::uint64_t untouched_done = 0x12345678;
+    *reinterpret_cast<std::uint64_t*>(hbm.data() + 128) = untouched_done;
     if (!idle) reinterpret_cast<Word*>(hbm.data() + 64)->value = 7;
     for (std::size_t q = 0; q < kJettyCount; ++q) {
       assert(pending[q].empty());
@@ -139,24 +147,44 @@ struct TransportTest {
     }
     t.PrepareCompletions();
     posted.clear(); fail_read_context = failed_read;
-    const auto status = t.ProbeIdleLink();
-    assert(status.ok() == (!failed_read && idle));
-    if (failed_read) {
-      assert(status.message().find("round=" + std::to_string(failed_read) + "/3") != std::string::npos);
+    fail_pending_write = failed_write; pending_write_count = 0;
+    const auto status = t.ProbeIdleLink(diagnostic);
+    assert(status.ok() == (!failed_read && !failed_write && idle));
+    if (!diagnostic) {
+      assert(posted.size() == 1 && t.queues_[0].sequence == 1);
+      assert(*reinterpret_cast<const std::uint64_t*>(hbm.data() + 128) == untouched_done);
+      if (failed_read || !idle) {
+        assert(status.message().find("stage=basic round=1/1 phase=read_notify") != std::string::npos);
+        assert(t.queues_[0].poisoned == bool(failed_read));
+      }
+    } else if (failed_read) {
+      const auto round = failed_read <= 3 ? failed_read : failed_read - 3;
+      assert(status.message().find(failed_read <= 3 ? "stage=read_only" : "stage=mixed") != std::string::npos);
+      assert(status.message().find("round=" + std::to_string(round) + "/3") != std::string::npos);
       assert(status.message().find("phase=read_notify") != std::string::npos);
       assert(status.message().find("status=9 status_name=ACK_TIMEOUT") != std::string::npos);
       // Failed reads never lead to another WRITE or a published start success.
-      assert(posted.size() == failed_read * 2 - 1);
+      assert(posted.size() == (failed_read <= 3 ? failed_read : failed_read * 2 - 4));
       assert(t.queues_[0].poisoned);
+    } else if (failed_write) {
+      assert(status.message().find("stage=mixed round=" + std::to_string(failed_write) + "/3") != std::string::npos);
+      assert(status.message().find("phase=write_pending") != std::string::npos);
+      assert(status.message().find("status=9 status_name=ACK_TIMEOUT") != std::string::npos);
+      // A failed pending WRITE must not be followed by another READ.
+      assert(posted.size() == 3 + failed_write * 2 && t.queues_[0].poisoned);
     } else if (!idle) {
       assert(posted.size() == 1 && status.message().find("target is not idle") != std::string::npos);
     } else {
-      assert(posted.size() == 6 && t.queues_[0].sequence == 3);
-      for (std::size_t i = 0; i < posted.size(); ++i)
-        assert(posted[i].opcode == (i % 2 ? URMA_OPC_WRITE : URMA_OPC_READ));
+      assert(posted.size() == 9 && t.queues_[0].sequence == 6);
       assert(*reinterpret_cast<const std::uint64_t*>(hbm.data() + 128) == 0);
     }
+    for (std::size_t i = 0; i < posted.size(); ++i)
+      assert(posted[i].opcode == (i < 3 || (i - 3) % 2 == 0 ? URMA_OPC_READ : URMA_OPC_WRITE));
+    // No WRITE can contaminate the sustained READ stage, and both stages
+    // retain the production completion/placement ordering.
+    for (const auto& wr : posted) assert(wr.comp_order && wr.signaled && wr.order == URMA_STRONG_ORDER);
     fail_read_context = 0;
+    fail_pending_write = 0; pending_write_count = 0;
     for (auto& q : t.queues_) {
       q.channel.local_jetty = nullptr; q.channel.local_jfc = nullptr;
     }
@@ -416,7 +444,15 @@ struct TransportTest {
 }
 
 int main() {
-  for (auto failed_read : {0U, 1U, 2U, 3U}) kvaf::cpu_push::TransportTest::IdleProbe(failed_read);
+  // Default startup must not issue the old synthetic pending WRITE or repeat
+  // READs. Failure still rejects the candidate, rather than returning success.
+  kvaf::cpu_push::TransportTest::IdleProbe(0, true, 0, false);
+  kvaf::cpu_push::TransportTest::IdleProbe(1, true, 0, false);
+  kvaf::cpu_push::TransportTest::IdleProbe(0, false, 0, false);
+  for (auto failed_read : {0U, 1U, 2U, 3U, 4U, 5U, 6U})
+    kvaf::cpu_push::TransportTest::IdleProbe(failed_read);
+  for (auto failed_write : {1U, 2U, 3U})
+    kvaf::cpu_push::TransportTest::IdleProbe(0, true, failed_write);
   kvaf::cpu_push::TransportTest::IdleProbe(0, false);
   for (auto token : {13U, 656U, 4096U, 65535U}) kvaf::cpu_push::TransportTest::Run(token);
   // Cross SQ-credit/wave and segmented control-READ boundaries.

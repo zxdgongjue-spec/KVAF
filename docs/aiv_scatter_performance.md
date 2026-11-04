@@ -920,12 +920,67 @@ THP 源区已注册成功不能证明控制 READ 稳定，也不能证明实际�
 
 旧启动探测只有一次空闲 READ 和一次 pending WRITE。启动时 `CPU_PUSH_STARTED` 成功后，
 第二次 notify READ (`actual_ctx=expected_ctx=0x2`) 仍可能失败，随后 AIV 等不到 done。
-现在 CPU 在启动后台线程前执行三轮真实 READ/WRITE，任一轮失败都拒绝当前启动候选，
-沿用既有清理和 EID 回退。这里只写 sequence=0 的 pending，不发布请求成功或跳过完成等待。
-成功日志为 `CPU_PUSH_LINK_PROBE_READY session=... rounds=3`，失败日志包含
-`round=2/3 phase=read_notify ... status=9 status_name=ACK_TIMEOUT ... wait_us=...`。
-这加强启动筛选，不是对底层 ACK 超时的通用修复；若三轮通过后仍失败，需检查持续读和后续
-BatchPut 通道创建期间的状态变化。测试覆盖第 1/2/3 次 READ 失败，以及目标非空闲的拒绝。
+三轮 READ/WRITE 探测进一步确认：部分候选是第一轮 READ 和 pending WRITE 成功，第二轮
+READ 在约 8.084 秒后收到硬件 ACK_TIMEOUT CQE；另一些候选在首个 READ 就失败。
+在此时点还没有启动后台线程、创建后续 BatchPut 通道或执行 AIV kernel，不能再把该次失败
+归因于这些后续步骤，也不能仅凭第二轮失败断定是 WRITE 或某个 PSN 值错误。
+
+多轮 READ/WRITE 属于诊断流量，不能作为默认业务启动步骤。因此启动已收敛为 CPU 服务端
+环境变量 `KVAF_CPU_PUSH_STARTUP_PROBE`，不改 NPU 接口或协议：
+
+| 模式 | 启动行为 |
+| --- | --- |
+| `basic`（默认） | 一次真实 64 B notify READ，检查目标空闲，失败仍回退 EID；不执行 pending WRITE |
+| `diagnostic` | 连续 READ 三次 (`stage=read_only`)，再三轮 READ/pending WRITE (`stage=mixed`) |
+| `off` | 跳过启动探测，直接启动正常 worker，用于确认启动流量本身是否影响通信 |
+
+`off` 仍执行正常 worker 的 notify/descriptor READ、SGL WRITE、done 和 CQ 校验。
+它取消了启动阶段对不可达 EID 配对的筛选；对照时应固定待验证的 CPU UB device/EID 与 NPU
+EID，避免自动选择不同候选掩盖差异。实际请求和输出校验仍必须通过才算成功。
+这三个模式不改变每次 BatchGet 的业务时序；启动日志打印 `CPU_PUSH_STARTUP_PROBE ... mode=...`。
+在 CPU 服务启动终端设置变量并重启服务，NPU 测试终端设置该变量不会改变已运行的 CPU 服务。
+
+```bash
+# 默认 basic：不再叠加诊断 READ/WRITE，也不写没有业务请求的 pending。
+KVAF_CPU_PUSH_STARTUP_PROBE=basic ./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28890 --memory-page-mode thp
+```
+
+仅在 `diagnostic` 模式下，成功阶段打印
+`CPU_PUSH_LINK_PROBE_STAGE_READY ... stage=read_only reads=3 writes=0`
+及 `stage=mixed reads=3 writes=3`；最终日志为 `CPU_PUSH_LINK_PROBE_READY ... mode=diagnostic`。
+
+| 失败位置 | 已缩小的范围 |
+| --- | --- |
+| `stage=read_only round=1/3 phase=read_notify` | 基础 READ 路由、访问或 TP 状态尚未建立可靠通信 |
+| `stage=read_only round=2/3` 或 `3/3` | 没有 WRITE 参与，优先检查连续 READ 的应答/TP 状态推进与驱动 |
+| `stage=mixed ... phase=write_pending` | 连续 READ 已通过，pending WRITE 自身失败 |
+| `stage=mixed round=2/3 phase=read_notify` | 连续 READ 已通过，故障与插入 WRITE 后的状态转换相关；仍需底层证据区分具体原因 |
+| 两阶段通过，后台线程稍后失败 | 继续检查长时间控制流与后续初始化期间的资源状态变化 |
+
+`CPU_PUSH_LINK_CONFIG` 记录双方协商的初始 TP/PSN 和 notify/done 地址，CQ 错误增加
+`local_tp / peer_tp / initial_tx_psn / initial_rx_psn / wr_flags`，用于两端逐项对齐。
+初始 PSN 不是实时硬件计数器，`actual_ctx=0x2` 只是应用 READ 的标签，也不是报文 PSN。
+应用 CQ 等待上限为 30 秒；约 8.084 秒返回 status=9 表明先收到了底层 ACK 超时 CQE，
+不是 Python 的 600 秒 case timeout，也不是源区分配缓慢。
+模型测试覆盖六个 READ 位置、三个 pending WRITE 位置的独立故障，以及非空闲目标拒绝。
+默认 basic 另外检查仅提交一次 READ，并保留原 done 内容，防止再次引入无请求的 WRITE。
+这些探测用于区分故障，不宣称修复底层 ACK 超时。
+
+### 与 run_remote_cpu_batch_get_miss_count_perf.sh 的区别
+
+参考脚本调用 `test_npu_batch_get_perf.py`，使用 `direct_read` 默认模式与
+`kvaf_execute_batch_get_kernels.o`。数据流是 NPU 主动 READ CPU DDR，CPU 服务提供已注册源区和
+通道；CPU 不启动 push worker。scatter 入口显式指定 `cpu_push_scatter`，CPU 先 READ NPU HBM
+中的 notify/descriptor，再 SGL WRITE 到 NPU staging，最后由 AIV scatter 到 output。
+两者可以对齐请求形状与计时范围，但不会覆盖同一组单边操作。
+
+因此 direct-read 成功不能证明 CPU→NPU 的控制 READ 稳定。附件中 `startup notify READ`
+是旧的单次启动探测错误格式；同份日志的 session=6 已到 `CPU_PUSH_STARTED`，随后正常 worker
+仍在 `actual_ctx=0x2 / last_sequence=0` 失败。它不能证明多轮诊断造成了全部超时，也不能证明
+关闭探测即可修复。下一步应对照 CPU 主动访问 NPU HBM 的通道配置和 TP 状态，而非删除真实
+请求的完成检查。当前 direct-read 每个 Jetty 单独查询 TP，而 scatter 四个 Jetty 共用一对 TP，
+且 scatter 使用固定 NPU 初始 PSN=1；这些是源码差异，尚不是已证实的故障根因。
 
 CPU `CPU_PUSH_CAP optimized=0` 表示未启用编译优化，带宽复测前应按 Release 构建并重启实际
 监听端口上的服务。它是独立的性能问题，不能据此解释 ACK 重传超时：
@@ -941,8 +996,8 @@ ctest --test-dir build-cpu -R '^kvaf_cpu_push_transport_test$' --output-on-failu
   --listen 0.0.0.0 --port 28890 --memory-page-mode thp
 ```
 
-检查新的 `CPU_PUSH_CAP optimized=1`。本修复只要求更新 CPU 服务，NPU kernel/绑定 ABI 不变。
-普通请求的 READ、SGL WRITE、Ready、done 和 CQ 等待不增加探测；三轮探测仅执行于初始化。
+检查新的 `CPU_PUSH_CAP optimized=1`。本次探测改动只要求更新 CPU 服务，NPU kernel/绑定 ABI 不变。
+普通请求的 READ、SGL WRITE、Ready、done 和 CQ 等待不增加探测；两阶段探测仅执行于初始化。
 
 A+K 若配置远端地址（如 `141.62.38.71:28890`），应使用该拓扑实际可达的 EID；不能套用此前
 本机 CPU→NPU 测试的物理 EID。抓取同一次运行双方完整初始化日志，按 session 对齐 CPU

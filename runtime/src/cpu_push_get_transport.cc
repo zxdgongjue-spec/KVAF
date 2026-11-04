@@ -48,7 +48,11 @@ std::string CqDetails(std::size_t queue, const urma_cr_t& cr,
       << " flags=" << static_cast<unsigned>(cr.flag.value)
       << " completion_bytes=" << cr.completion_len << " local_id=" << cr.local_id
       << " jetty_id=" << channel.local_jetty->jetty_id.id
-      << " cq_id=" << channel.local_jfc->jfc_id.id << " tpn=" << cr.tpn;
+      << " cq_id=" << channel.local_jfc->jfc_id.id << " tpn=" << cr.tpn
+      << " local_tp=0x" << std::hex << channel.tp.local
+      << " peer_tp=0x" << channel.tp.peer
+      << " initial_tx_psn=0x" << channel.tp.local_psn
+      << " initial_rx_psn=0x" << channel.tp.peer_psn << std::dec;
   return out.str();
 }
 }  // namespace
@@ -165,6 +169,11 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
+    // Keep the negotiated initial values for CQ failure diagnostics. These
+    // are not the live hardware packet sequence counters.
+    std::copy_n(setup.eid, c.tp.peer_eid.size(), c.tp.peer_eid.begin());
+    c.tp.local = cpu_tp; c.tp.peer = setup.npu_tp;
+    c.tp.local_psn = psn; c.tp.peer_psn = setup.npu_psn;
     auto& key = response->channels[q];
     key.bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
     std::memcpy(key.key, &c.local_jetty->jetty_id, sizeof(urma_jetty_id_t));
@@ -172,6 +181,12 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                 sizeof(urma_transport_mode_t));
   }
   PrepareCompletions();
+  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_LINK_CONFIG session=%llu cpu_tp=0x%llx npu_tp=0x%llx "
+               "cpu_initial_psn=0x%x npu_initial_psn=0x%x notify=0x%llx done=0x%llx\n",
+               static_cast<unsigned long long>(session_), static_cast<unsigned long long>(cpu_tp),
+               static_cast<unsigned long long>(setup.npu_tp), psn, setup.npu_psn,
+               static_cast<unsigned long long>(hbm_base_ + layout_.notify),
+               static_cast<unsigned long long>(hbm_base_ + layout_.done));
   Stage("ready");
   return Status::OK();
 }
@@ -243,6 +258,7 @@ Status Transport::Wait(Queue& q) {
             << " remote_addr=0x" << q.remote.front().addr << std::dec
             << " bytes=" << q.remote.front().len
             << " wr_opcode=" << static_cast<unsigned>(q.wrs.back().opcode)
+            << " wr_flags=0x" << std::hex << q.wrs.back().flag.value << std::dec
             << " notify_offset=" << layout_.notify
             << " wait_us=" << std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - wait_begin).count();
@@ -291,22 +307,30 @@ Status Transport::ReadRequest(std::uint64_t* sequence) {
   }
   return result;
 }
-Status Transport::ProbeIdleLink() {
-  // One successful request does not prove that this TP can advance its packet
-  // sequence. Reject a candidate whose second/subsequent notify READ fails,
-  // instead of accepting it and making the first AIV request wait until timeout.
-  constexpr unsigned rounds = 3;
-  for (unsigned round = 1; round <= rounds; ++round) {
-    const auto prefix = "startup link probe round=" + std::to_string(round) + "/" +
-                        std::to_string(rounds);
-    std::uint64_t sequence = 0;
-    auto status = ReadRequest(&sequence);
-    if (!status.ok()) return Status::Error(status.code(), prefix + " phase=read_notify: " + status.message());
-    if (sequence != 0)
-      return Status::InvalidState(prefix + " phase=read_notify: target is not idle, sequence=" +
-                                  std::to_string(sequence));
-    status = Complete(0, Result::kPending);
-    if (!status.ok()) return Status::Error(status.code(), prefix + " phase=write_pending: " + status.message());
+Status Transport::ProbeIdleLink(bool diagnostic) {
+  // Candidate selection only needs one real READ. Extra READs and pending
+  // WRITEs change the idle control flow, so keep them in explicit diagnostics.
+  const unsigned rounds = diagnostic ? 3U : 1U;
+  for (const bool mixed : {false, true}) {
+    if (mixed && !diagnostic) break;
+    const std::string stage = !diagnostic ? "basic" : mixed ? "mixed" : "read_only";
+    for (unsigned round = 1; round <= rounds; ++round) {
+      const auto prefix = "startup link probe stage=" + stage + " round=" +
+                          std::to_string(round) + "/" + std::to_string(rounds);
+      std::uint64_t sequence = 0;
+      auto status = ReadRequest(&sequence);
+      if (!status.ok()) return Status::Error(status.code(), prefix + " phase=read_notify: " + status.message());
+      if (sequence != 0)
+        return Status::InvalidState(prefix + " phase=read_notify: target is not idle, sequence=" +
+                                    std::to_string(sequence));
+      if (mixed) {
+        status = Complete(0, Result::kPending);
+        if (!status.ok()) return Status::Error(status.code(), prefix + " phase=write_pending: " + status.message());
+      }
+    }
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_LINK_PROBE_STAGE_READY session=%llu stage=%s "
+                 "reads=%u writes=%u\n", static_cast<unsigned long long>(session_),
+                 stage.c_str(), rounds, mixed ? rounds : 0U);
   }
   return Status::OK();
 }
