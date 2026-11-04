@@ -294,6 +294,33 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
 
+### 从已有 BatchGet sweep 日志补生成 CSV
+
+`tests/run_remote_cpu_batch_get_miss_count_perf.sh` 每个配置通过 `tee` 保存独立
+日志，但只在所有配置成功后写 CSV；任一配置失败会提前退出。中断后可使用离线
+汇总脚本，无需 NPU、构建目录或网络：
+
+```bash
+python3 tests/summarize_batch_get_miss_sweep.py /path/to/kvaf_batch_get_miss_sweep.XXXXXX
+# 或指定多个目录/单个 case 日志和输出路径：
+python3 tests/summarize_batch_get_miss_sweep.py /path/to/log_dir \
+  -o /path/to/recovered.csv
+```
+
+日志目录见原运行输出中的 `BATCH_GET_MISS_SWEEP_LOG_DIR path=...`，也可在运行
+sweep 前设置 `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR`。默认在输入目录生成
+`batch_get_miss_sweep_summary.csv`；目录内递归查找
+`token_bytes_*_miss_count_*_aiv_cores_*_jettys_per_core_*.log`，忽略设备校准日志。
+每个输入日志应只包含一个 case，不能传整次 sweep 的控制台合并日志。
+
+CSV 列与原脚本相同，从 total、post、completion_wait 三组 `PERF_RESULT`
+提取 mean/P50/P90/P99 cycles。微秒为 `cycles / clock_mhz`，
+`p50_GBps = miss_count * token_bytes * clock_mhz / p50_cycles / 1000`。
+频率优先读取日志中的 `KERNEL_PROFILE_CONTRACT` 或 `BATCH_GET_PERF_CONFIG`，
+缺失时使用 1000 MHz；可用 `--clock-mhz 1000` 显式覆盖。缺少任一组结果、数值
+无效或报告 benchmark 异常的日志会输出 `SKIP` 并跳过，其余完整结果照常写入。
+全部日志无效时返回失败并保留已有 CSV。重复运行会覆盖指定的 CSV，不改原始日志。
+
 ### BatchGet 总在途请求预算
 
 `NpuRuntime(..., batch_get_max_inflight_total=2048)` 默认限制单次 BatchGet 所有
