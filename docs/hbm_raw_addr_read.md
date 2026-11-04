@@ -86,12 +86,12 @@ print(result["profile"])
 | --- | --- |
 | `host_total_us` | 原生 HbmReader::Read 全流程；不含 Python 绑定的参数处理和结果字典构造 |
 | `validation_us` | Host 设备、源身份、数组形状和元数据/输出重叠检查 |
-| `buffers_us` | 首次状态/队列分配、每批状态清零、首次计时事件创建；Host 状态数组复用 |
+| `buffers_us` | 首次状态/队列分配与清零、首次计时事件创建；稳定态复用，不再每批清零 |
 | `register_output_us` | 获取 output 注册及选定 MR 的通信描述；首次 output 注册、首次 MR/output 组合上传描述，之后均复用 |
 | `launch_us` | Host 提交 raw READ 算子调用 |
 | `synchronize_us` | Host 等待传入 stream 完成 |
 | `kernel_event_us` | 同一 stream 中紧邻算子前后两个设备事件之间的时间 |
-| `status_us` | 最终状态回读与检查 |
+| `status_us` | 最终状态回读，检查每核启动编号、执行结果和请求数量 |
 | `cleanup_us` | 释放 output 注册引用；MR、通信实体和状态缓冲保留到 detach/shutdown |
 | `complete_us` | 向生产端确认本批完成 |
 | `event_record_us` / `event_query_us` | Host 提交计时事件 / 查询计时结果的开销 |
@@ -110,7 +110,9 @@ print(result["profile"])
 
 ## 算子与资源
 
-raw READ V2 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总数等于输入请求数，各核按请求数量划分任务；默认不预扫描长度，也不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。所有请求均按下标直接索引，无分段前缀表或查找；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。Host 只读取最终状态，设备状态每批清零以排除上批结果。
+raw READ V3 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总数等于输入请求数，各核按请求数量划分任务；默认不预扫描长度，也不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。所有请求均按下标直接索引，无分段前缀表或查找；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。
+
+每个 reader engine 为每次 kernel 启动（包括建链探测）分配一个非零、递增的 64 位编号。每个核写完最终结果后，把该编号写进结果结构原有的预留位置；Host 在解释成功或诊断失败前，先检查所有核的编号属于本轮。缺少任何核的新结果都会保留未决状态，不发送 Complete/Cancel，也不允许复用源和 output。状态缓冲只在首次分配后清零一次，稳态不再调用同步 `aclrtMemset`；每核结果仍为 1280 B，HBM 分配量和状态回读量不增加。
 
 仅建链的 all-lane 探测仍使用内部 Host 绝对地址描述符模式，不再作为公开数据读取接口。探测失败必须确认 kernel 已退出且 initiator 队列成功销毁后才能换候选。
 
@@ -122,11 +124,11 @@ KVHR v7 运行阶段控制消息只传源/连接身份、MR ID 和批次号，�
 
 每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
 
-使用 `KvafExecuteBatchGetRawAddrAivKernelV2`，旧 V1 object 不兼容。NPU 运行库和 raw kernel object 需一起重编译。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
+使用 `KvafExecuteBatchGetRawAddrAivKernelV3`，参数从 80 B 增至 88 B，旧 V1/V2 object 会拒绝加载。NPU 运行库和 raw kernel object 需一起重编译；Python 调用、object 文件名和控制协议不变。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
 
 ## 编译与硬件验证
 
-本次描述符精简需同时重编译、重启 A/B 的 NPU 运行库与 Python 扩展（KVHR v7）；如果启用 CPU Pull，还需更新 CPU service（KVRP v6）。raw READ kernel ABI 保持 V2，NPU receiver ticket 仍为 version=1。
+本优化分支需同时重编译 NPU 运行库、Python 扩展和 raw READ V3 kernel，更新后重启 A/B 进程。控制协议仍为 KVHR v7，NPU receiver ticket 仍为 version=1；已有匹配 KVRP v6 的 CPU service 无需为本次优化更新。
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash

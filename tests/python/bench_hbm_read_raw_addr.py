@@ -176,7 +176,8 @@ def main():
               f"max_inflight_total={args.max_inflight_total} "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
-              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0", flush=True)
+              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
+              "status_reset=init_only status_generation=1", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
         internal_stages = {}
         event_errors = set()

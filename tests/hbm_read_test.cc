@@ -23,6 +23,8 @@ namespace hr=kvaf::hbm_read;
 std::atomic<int> raw_calls{0}, raw_wqes{0}, local_buffers{0}, raw_transports{0}, local_acquires{0};
 int unregister_failures=0;
 bool fail_probe_cq=false;
+int skip_status_core=-1;
+bool skip_all_statuses=false;
 int quiesces=0, raw_syncs=0;
 extern "C" aclError aclrtSynchronizeStream(aclrtStream){++raw_syncs;return 0;}
 struct KvafBatchGetLocalBuffer {
@@ -31,6 +33,7 @@ struct KvafBatchGetLocalBuffer {
 };
 struct KvafBatchGetTransport {
   kvaf::peer::PeerLink* link;std::uint64_t base,bytes;
+  std::uint64_t last_generation{};
   std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> buffers;
   std::map<uint64_t,std::pair<uint64_t,uint64_t>> memories;
 };
@@ -90,6 +93,8 @@ extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport** p){
 extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs* a,aclrtStream){
   ++raw_calls;auto* src=reinterpret_cast<uint64_t*>(a->source_addresses);auto* dst=reinterpret_cast<uint64_t*>(a->destination_addresses);
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
+  Require(a->generation>local->transport->last_generation,"every launch, including probes, gets a fresh nonzero generation");
+  local->transport->last_generation=a->generation;
   uint32_t count=a->request_count;uint64_t result=0,failed=UINT64_MAX;
   if(a->input_mode==KVAF_RAW_NPU_OFFSETS)
     ValidateRawMetadata(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
@@ -105,10 +110,12 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRaw
   }
   auto* statuses=reinterpret_cast<KvafRawReadCoreStatus*>(a->core_status);
   for(unsigned c=0;c<a->block_count;++c){auto& status=statuses[c];
+    if(skip_all_statuses || int(c)==skip_status_core)continue;
     status.execution.magic=KVAF_AIV_BATCH_GET_STATUS_MAGIC;
     status.execution.result=fail_probe_cq?7:result;status.execution.failed_request_index=failed;
     status.execution.processed_request_count=uint64_t(count)*(c+1)/a->block_count-uint64_t(count)*c/a->block_count;
     status.total_wqes=count;status.posted_wqes=status.execution.processed_request_count;
+    status.completed_generation=a->generation;
   }
   fail_probe_cq=false;return 0;
 }
@@ -277,7 +284,44 @@ void MultiMemory() {
   }
   Check(b.Shutdown());Check(a.Shutdown());Require(!registrations&&!raw_transports&&!local_buffers,"multi-MR cleanup");
 }
-int main(){try{
+// Run these fault cases in separate processes: missing device results must
+// quarantine live resources, so normal teardown is intentionally forbidden.
+void StaleCompletion(const std::string& mode) {
+  raw_mode=true;fake_device=0;
+  std::vector<uint8_t> source(4096,0x67),output(128);
+  kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::HbmReceiverTicket receiver;
+  Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));Proxy proxy(receiver);
+  kvaf::NpuPullHbmSource b(0,producer_eid);
+  Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},proxy.receiver,reinterpret_cast<void*>(1)));
+  kvaf::ReadyToken token;int64_t src=7,dst=11,n=mode=="stale-rejection"?0:64;
+  auto read=[&]{return a.Read(token,{&src,1},{&dst,1},{&n,1},
+      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,true);};
+  Check(b.Ready(&token));const auto memsets=acl_memset_calls.load();
+  const auto first=read();
+  if(mode=="stale-rejection")
+    Require(first.code()==kvaf::StatusCode::kInvalidArgument&&!a.pending(),"fresh rejection safely cancels");
+  else Check(first);
+  Check(b.ReleaseBatch(token));Check(b.Ready(&token));
+  skip_all_statuses=mode!="stale-core";skip_status_core=mode=="stale-core"?1:-1;
+  const auto before=raw_calls.load();const auto requests=proxy.requests.load();
+  const auto status=read();
+  Require(status.code()==kvaf::StatusCode::kInDoubt && a.pending() &&
+          status.message().find("generation mismatch")!=std::string::npos,
+          "stale success, stale rejection or one unwritten core must retain the batch");
+  Require(acl_memset_calls==memsets,"steady-state reads never clear the result buffer");
+  Require(proxy.requests==requests,"stale result must send neither Complete nor Cancel");
+  Require(!a.Resolve(token).ok()&&raw_calls==before+1,"unresolved DMA cannot be replayed by recovery");
+  Require(!b.ReleaseBatch(token).ok()&&b.frozen(),"producer cannot reuse an unconfirmed source");
+  Require(!a.Shutdown().ok(),"unresolved output and transport remain retained");
+  std::_Exit(0);
+}
+
+int main(int argc,char** argv){try{
+  if(argc==2) {
+    const std::string mode=argv[1];
+    Require(mode=="stale-success"||mode=="stale-core"||mode=="stale-rejection","known fault mode");
+    StaleCompletion(mode);
+  }
   ReceiverTopology();
   MultiMemory();
   RuntimeInitialization();
@@ -329,7 +373,7 @@ int main(){try{
   Require(!read(token,overrun,destinations,lengths).ok(),"raw-array source bounds enforced");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(raw_calls==before+2 && raw_wqes==before_wqes,"fused validation rejects all invalid ranges before posting DMA");
-  const int cached_acquires=local_acquires,allocated=acl_allocation_calls;
+  const int cached_acquires=local_acquires,allocated=acl_allocation_calls,memsets=acl_memset_calls;
   kvaf::HbmReadProfile profile;
   Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
@@ -349,6 +393,7 @@ int main(){try{
           "timing query failure does not change successful DMA result");
   Require(local_acquires==cached_acquires && local_buffers==1,"output registration reused across batches");
   Require(acl_allocation_calls==allocated,"status and queue allocations reused across batches");
+  Require(acl_memset_calls==memsets,"profiled repeated reads do not clear device state");
   fail_timing_query=false;
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   const int queries=timing_queries;

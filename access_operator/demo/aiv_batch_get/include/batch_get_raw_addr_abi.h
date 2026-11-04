@@ -22,8 +22,9 @@ struct KvafExecuteBatchGetRawAddrKernelArgs {
   uint32_t batch_get_max_inflight_total;
   uint32_t input_mode;
   uint32_t validate_ranges;        // opt-in length/bounds checks; no pairwise overlap checks
+  uint64_t generation;            // nonzero, unique per engine launch, including startup probes
 };
-static_assert(sizeof(KvafExecuteBatchGetRawAddrKernelArgs) == 80);
+static_assert(sizeof(KvafExecuteBatchGetRawAddrKernelArgs) == 88);
 
 // Returned only after the single READ launch finishes. Counts distinguish
 // validation rejection (no WQEs posted) from an unresolved transport failure.
@@ -31,6 +32,7 @@ struct KvafRawReadCoreStatus {
   KvafBatchGetCoreStatus execution;
   uint64_t total_wqes;
   uint64_t posted_wqes;
-  uint64_t reserved[6];
+  uint64_t completed_generation;  // written after this core's final result; replaces reserved[0]
+  uint64_t reserved[5];
 };
 static_assert(sizeof(KvafRawReadCoreStatus) == 1280);

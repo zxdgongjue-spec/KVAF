@@ -87,6 +87,8 @@ struct Engine {
   std::vector<KvafRawReadCoreStatus> host_statuses;
   std::uint32_t cores,jettys,budget;
   std::uint64_t mr_id{1};
+  std::uint64_t launch_generation{};
+  bool statuses_initialized{};
   bool uncertain{},kernel_finished{},cache_output{};
   aclrtStream probe_stream{};
   aclrtEvent profile_start{},profile_end{};
@@ -113,6 +115,7 @@ struct Engine {
     }
     if(KvafBatchGetTransportClose(&transport))return Status::InDoubt("raw READ transport teardown pending");
     s=statuses.Free();if(!s.ok())return s;
+    statuses_initialized=false;
     s=queues.Free();if(!s.ok())return s;
     if(probe_stream) {
       if(aclrtDestroyStream(probe_stream)!=ACL_SUCCESS)return Status::InDoubt("destroy raw probe stream");
@@ -161,18 +164,24 @@ struct Engine {
   }
   Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream,
                    HbmReadProfile* profile=nullptr) {
+    if(launch_generation==UINT64_MAX)return Status::InvalidState("raw READ launch generation exhausted; recreate connection");
+    args.generation=++launch_generation;
     auto s=Timed(profile?&profile->buffers_us:nullptr,[&]() -> Status {
     if(!statuses.data) {
       auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
+    }
+    // Initialize once. Every subsequent result must carry this launch's
+    // generation, so an unwritten core cannot reuse an earlier success/error.
+    // Keep the flag false on failure so retry never uses uninitialized status.
+    if(!statuses_initialized) {
+      if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
+        return Status::Internal("initialize raw READ status");
+      statuses_initialized=true;
     }
     if(!queues.data) {
       auto allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
     }
-    // Completion/cancellation decisions must not observe a previous batch's
-    // success record if this launch fails to write a status.
-    if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
-      return Status::Internal("clear raw READ status");
     host_statuses.resize(cores);
     if(profile)for(auto* event:{&profile_start,&profile_end})
       if(!*event && aclrtCreateEventWithFlag(event,ACL_EVENT_TIME_LINE)!=ACL_SUCCESS)
@@ -210,6 +219,11 @@ struct Engine {
     auto& host=host_statuses;
     if(aclrtMemcpy(host.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
       return Status::InDoubt("cannot inspect raw READ completion");
+    // Check ALL cores before interpreting either success or pre-DMA rejection.
+    // A stale validation error must not authorize Cancel/reuse either.
+    for(std::uint32_t c=0;c<cores;++c)
+      if(host[c].completed_generation!=args.generation)
+        return Status::InDoubt("raw READ completion generation mismatch: core="+std::to_string(c));
     // Cancellation is safe only when EVERY core reports the same full-batch
     // validation failure and explicitly reports zero posted/processed WQEs.
     const auto& first=host.front().execution;

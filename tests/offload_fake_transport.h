@@ -25,6 +25,7 @@ std::atomic<int> timing_queries{0};
 bool fail_timing_query=false;
 std::atomic<int> sessions{0}, contexts{0}, probe_allocations{0};
 std::atomic<int> acl_allocation_calls{0};
+std::atomic<int> acl_memset_calls{0};
 std::atomic<int> cqs{0}, jetties{0}, peer_imports{0};
 std::atomic<std::uint64_t> registered_base{0}, registered_bytes{0};
 int context_error = 0;
@@ -50,7 +51,7 @@ aclError aclrtMemcpy(void* dst,std::size_t capacity,const void* src,std::size_t 
 }
 aclError aclrtMalloc(void** p,std::size_t n,int){++acl_allocation_calls;*p=std::malloc(n);if(*p)++probe_allocations;return *p?0:1;}
 aclError aclrtFree(void* p){if(p)--probe_allocations;std::free(p);return 0;}
-aclError aclrtMemset(void* p,std::size_t,int value,std::size_t n){std::memset(p,value,n);return 0;}
+aclError aclrtMemset(void* p,std::size_t,int value,std::size_t n){++acl_memset_calls;std::memset(p,value,n);return 0;}
 aclError aclrtCreateStream(aclrtStream* p){*p=new int;return 0;}
 aclError aclrtDestroyStream(aclrtStream p){delete static_cast<int*>(p);return 0;}
 aclError aclrtCreateEvent(aclrtEvent* p){++events;*p=new int;return 0;}

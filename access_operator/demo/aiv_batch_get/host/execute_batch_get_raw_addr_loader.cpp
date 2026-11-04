@@ -9,7 +9,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchGetRawAddrAivKernelV2";
+constexpr char kKernelName[] = "KvafExecuteBatchGetRawAddrAivKernelV3";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -40,7 +40,7 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLoadKernel(const char *kernel_objec
   const aclError load = aclrtBinaryLoad(binary, &g_binary);
   aclrtDestroyBinary(binary);
   if (load != ACL_SUCCESS || aclrtBinaryGetFunction(g_binary, kKernelName, &g_function) != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_NPU] rebuild raw-address kernel object: fused READ V2 entry is required\n");
+    std::fprintf(stderr, "[KVAF_NPU] rebuild raw-address kernel object: generation-stamped READ V3 entry is required\n");
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
   g_loaded = true;
@@ -78,7 +78,7 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRaw
       arguments->request_count == 0U || arguments->source_addresses == 0U ||
       arguments->destination_addresses == 0U || arguments->lengths == 0U ||
       arguments->output == 0U || arguments->channel_entity == 0U ||
-      arguments->queue_state == 0U || arguments->core_status == 0U ||
+      arguments->queue_state == 0U || arguments->core_status == 0U || arguments->generation == 0U ||
       arguments->jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
       arguments->input_mode > KVAF_RAW_NPU_OFFSETS ||
       arguments->request_count > KVAF_RAW_MAX_WQES ||
