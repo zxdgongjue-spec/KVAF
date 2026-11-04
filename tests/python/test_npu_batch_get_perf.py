@@ -14,6 +14,7 @@ environment variables:
     --tokens-per-block     KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
+    --execution-mode       KVAF_BATCH_GET_PERF_EXECUTION_MODE (eager or graph)
     --max-inflight-total   KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL
     --source-access-pattern
                            KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN
@@ -30,12 +31,13 @@ environment variables:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import statistics
 import sys
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -136,6 +138,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             else None
         ),
         help="exact valid request-prefix length; defaults to request-length",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("eager", "graph"),
+        default=os.environ.get("KVAF_BATCH_GET_PERF_EXECUTION_MODE", "eager"),
+        help="eager host timing or standalone BatchGet graph replay with NPU Events; all times in us",
     )
     parser.add_argument(
         "--source-access-pattern",
@@ -262,7 +270,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 DEFAULT_KERNEL_PROFILE_CLOCK_MHZ,
             ),
         ),
-        help="AIV clock used to convert profile cycles to milliseconds",
+        help="AIV clock used to convert profile cycles to microseconds",
     )
     parser.set_defaults(
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
@@ -288,6 +296,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> str | None:
     block_bytes = args.token_bytes * args.tokens_per_block
     ddr_bytes = args.table_capacity * block_bytes
+    if args.execution_mode not in {"eager", "graph"}:
+        return "execution-mode must be eager or graph"
+    if args.execution_mode == "graph" and args.kernel_profile:
+        return "graph Event timing requires --no-kernel-profile; use eager for kernel diagnostics"
     if args.request_length <= 0 or args.request_length > MAX_INT32:
         return "request-length must be in [1, INT32_MAX]"
     if args.table_capacity <= 0 or args.table_capacity > MAX_INT32:
@@ -332,7 +344,7 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "iterations must be positive"
     if args.populate_chunk_entries <= 0:
         return "populate-chunk-entries must be positive"
-    if args.kernel_profile_clock_mhz <= 0:
+    if args.kernel_profile and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     return None
 
@@ -385,21 +397,21 @@ def print_samples(
     miss_count: int,
     token_bytes: int,
 ) -> None:
-    mean_ms = statistics.mean(samples)
+    mean_us = statistics.mean(samples)
     result = (
         "PERF_RESULT "
         f"operation={operation} samples={len(samples)} warmup_excluded={warmup} "
         f"request_length={request_length} miss_count={miss_count} "
-        f"mean_ms={mean_ms:.3f} "
-        f"p50_ms={percentile(samples, 0.50):.3f} "
-        f"p90_ms={percentile(samples, 0.90):.3f} "
-        f"p99_ms={percentile(samples, 0.99):.3f}"
+        f"mean_us={mean_us:.3f} "
+        f"p50_us={percentile(samples, 0.50):.3f} "
+        f"p90_us={percentile(samples, 0.90):.3f} "
+        f"p99_us={percentile(samples, 0.99):.3f} unit=us"
     )
-    if operation == "batch_get":
+    if operation in {"batch_get", "batch_get_graph_event"}:
         payload_bytes = miss_count * token_bytes
         useful_gibps = (
-            payload_bytes / (mean_ms / 1000.0) / (1024.0**3)
-            if payload_bytes > 0
+            payload_bytes / (mean_us / 1_000_000.0) / (1024.0**3)
+            if payload_bytes > 0 and mean_us > 0
             else 0.0
         )
         result += (
@@ -407,6 +419,73 @@ def print_samples(
             f"useful_GiBps={useful_gibps:.3f}"
         )
     print(result)
+
+
+def measure_graph_event_us(
+    torch: object,
+    graph: object,
+    stream: object,
+    launch: Callable[[], None],
+    prepare_inputs: Callable[[], None],
+    validate_replay: Callable[[], None],
+    warmup: int,
+    iterations: int,
+) -> list[float]:
+    """Capture only launch; measure one replay per sample on the same stream."""
+    try:
+        with torch.npu.stream(stream):
+            prepare_inputs()
+            stream.synchronize()
+            # Register the fixed output buffer and finish lazy setup outside capture.
+            launch()
+            stream.synchronize()
+            graph.capture_begin(stream)
+            try:
+                launch()
+            finally:
+                graph.capture_end()
+
+            # Verify the captured path before timing, with no prior output to reuse.
+            prepare_inputs()
+            stream.synchronize()
+            graph.replay(stream)
+            stream.synchronize()
+            validate_replay()
+            stream.synchronize()
+
+            start = torch.npu.Event(enable_timing=True)
+            end = torch.npu.Event(enable_timing=True)
+            # Event creation is lazy; initialize both before collecting samples.
+            start.record(stream)
+            end.record(stream)
+            end.synchronize()
+
+            for _ in range(warmup):
+                prepare_inputs()
+                stream.synchronize()
+                graph.replay(stream)
+                stream.synchronize()
+
+            samples_us: list[float] = []
+            for _ in range(iterations):
+                prepare_inputs()
+                stream.synchronize()
+                start.record(stream)
+                graph.replay(stream)
+                end.record(stream)
+                end.synchronize()
+                # Event.elapsed_time returns ms, independently of the AIV clock.
+                elapsed_us = float(start.elapsed_time(end)) * 1000.0
+                if not math.isfinite(elapsed_us) or elapsed_us < 0:
+                    raise RuntimeError(f"invalid graph Event duration: {elapsed_us} us")
+                samples_us.append(elapsed_us)
+
+            validate_replay()
+            return samples_us
+    finally:
+        # The caller keeps all fixed buffers alive until the graph is destroyed.
+        stream.synchronize()
+        graph.reset()
 
 
 def print_kernel_profile(
@@ -422,8 +501,8 @@ def print_kernel_profile(
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
 
-    def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
-        return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
+    def elapsed_us(profile: dict[str, object], begin: str, end: str) -> float:
+        return (int(profile[end]) - int(profile[begin])) / clock_mhz
 
     stage_samples: dict[str, list[float]] = {
         "kernel_wall": [],
@@ -437,12 +516,12 @@ def print_kernel_profile(
     }
     per_core: list[dict[str, float]] = [
         {
-            "total_ms": 0.0,
-            "setup_ms": 0.0,
-            "compact_ms": 0.0,
-            "post_ms": 0.0,
-            "completion_wait_ms": 0.0,
-            "finalize_ms": 0.0,
+            "total_us": 0.0,
+            "setup_us": 0.0,
+            "compact_us": 0.0,
+            "post_us": 0.0,
+            "completion_wait_us": 0.0,
+            "finalize_us": 0.0,
             "active_requests": 0.0,
             "total_posts": 0.0,
             "submitted_group_count": 0.0,
@@ -452,7 +531,7 @@ def print_kernel_profile(
             **{
                 name: 0.0
                 for jetty in range(MAX_JETTYS_PER_CORE)
-                for name in (f"jetty{jetty}_wait_ms", f"jetty{jetty}_polls")
+                for name in (f"jetty{jetty}_wait_us", f"jetty{jetty}_polls")
             },
         }
         for _ in range(npu_core_count)
@@ -464,7 +543,6 @@ def print_kernel_profile(
                 - min(int(profile["kernel_start_cycle"]) for profile in sample)
             )
             / clock_mhz
-            / 1000.0
         )
         critical: dict[str, float] = {
             "kernel_total": 0.0,
@@ -477,12 +555,12 @@ def print_kernel_profile(
         }
         for profile in sample:
             core = int(profile["core"])
-            total = elapsed_ms(profile, "kernel_start_cycle", "kernel_finish_cycle")
-            setup = elapsed_ms(profile, "kernel_start_cycle", "setup_done_cycle")
-            compact = elapsed_ms(profile, "setup_done_cycle", "compact_done_cycle")
-            post = int(profile["post_active_cycles"]) / clock_mhz / 1000.0
-            completion = int(profile["drain_wait_cycles"]) / clock_mhz / 1000.0
-            finalize = elapsed_ms(
+            total = elapsed_us(profile, "kernel_start_cycle", "kernel_finish_cycle")
+            setup = elapsed_us(profile, "kernel_start_cycle", "setup_done_cycle")
+            compact = elapsed_us(profile, "setup_done_cycle", "compact_done_cycle")
+            post = int(profile["post_active_cycles"]) / clock_mhz
+            completion = int(profile["drain_wait_cycles"]) / clock_mhz
+            finalize = elapsed_us(
                 profile, "completion_done_cycle", "kernel_finish_cycle"
             )
             first_doorbell = int(profile["first_doorbell_cycle"])
@@ -493,7 +571,6 @@ def print_kernel_profile(
                     int(profile["completion_done_cycle"]) - first_doorbell
                 )
                 / clock_mhz
-                / 1000.0
             )
             critical["kernel_total"] = max(critical["kernel_total"], total)
             critical["kernel_setup"] = max(critical["kernel_setup"], setup)
@@ -509,12 +586,12 @@ def print_kernel_profile(
                 critical["kernel_finalize"], finalize
             )
             accumulator = per_core[core]
-            accumulator["total_ms"] += total
-            accumulator["setup_ms"] += setup
-            accumulator["compact_ms"] += compact
-            accumulator["post_ms"] += post
-            accumulator["completion_wait_ms"] += completion
-            accumulator["finalize_ms"] += finalize
+            accumulator["total_us"] += total
+            accumulator["setup_us"] += setup
+            accumulator["compact_us"] += compact
+            accumulator["post_us"] += post
+            accumulator["completion_wait_us"] += completion
+            accumulator["finalize_us"] += finalize
             accumulator["active_requests"] += int(profile["active_requests"])
             accumulator["total_posts"] += int(profile["total_posts"])
             accumulator["submitted_group_count"] += int(profile["submitted_group_count"])
@@ -524,8 +601,8 @@ def print_kernel_profile(
             waits = list(profile["jetty_completion_wait_cycles"])
             polls = list(profile["jetty_completion_polls"])
             for jetty in range(MAX_JETTYS_PER_CORE):
-                accumulator[f"jetty{jetty}_wait_ms"] += (
-                    int(waits[jetty]) / clock_mhz / 1000.0
+                accumulator[f"jetty{jetty}_wait_us"] += (
+                    int(waits[jetty]) / clock_mhz
                 )
                 accumulator[f"jetty{jetty}_polls"] += int(polls[jetty])
         for stage, value in critical.items():
@@ -533,7 +610,7 @@ def print_kernel_profile(
 
     print(
         "KERNEL_PROFILE_CONTRACT "
-        f"clock_mhz={clock_mhz} unit=ms samples={len(samples)} "
+        f"clock_mhz={clock_mhz} unit=us samples={len(samples)} "
         f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
         f"request_length={request_length} miss_count={miss_count} "
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
@@ -545,21 +622,21 @@ def print_kernel_profile(
     )
     total_useful_bytes = len(samples) * miss_count * token_bytes
     for stage, values in stage_samples.items():
-        cycle_values = [value * clock_mhz * 1000.0 for value in values]
+        cycle_values = [value * clock_mhz for value in values]
         useful_gibps = ""
         if stage == "kernel_total":
             useful_gibps = (
                 " useful_GiBps="
-                f"{total_useful_bytes / (1024.0**3) / (sum(values) / 1000.0):.3f}"
+                f"{total_useful_bytes / (1024.0**3) / (sum(values) / 1_000_000.0):.3f}"
             )
         print(
             "PERF_RESULT "
             f"operation=batch_get_{stage} samples={len(values)} "
             f"warmup_excluded={warmup} "
-            f"mean_ms={statistics.mean(values):.3f} "
-            f"p50_ms={percentile(values, 0.50):.3f} "
-            f"p90_ms={percentile(values, 0.90):.3f} "
-            f"p99_ms={percentile(values, 0.99):.3f} "
+            f"mean_us={statistics.mean(values):.3f} "
+            f"p50_us={percentile(values, 0.50):.3f} "
+            f"p90_us={percentile(values, 0.90):.3f} "
+            f"p99_us={percentile(values, 0.99):.3f} "
             f"mean_cycles={statistics.mean(cycle_values):.3f} "
             f"p50_cycles={percentile(cycle_values, 0.50):.3f} "
             f"p90_cycles={percentile(cycle_values, 0.90):.3f} "
@@ -603,6 +680,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "and KVAF_BUILD_PYTHON=ON."
         )
         return 0
+    if args.execution_mode == "graph" and not hasattr(kvaf, "AclGraph"):
+        print("FAIL: rebuild KVAF with AclGraph support for graph timing", file=sys.stderr)
+        return 2
     if args.kernel_profile and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in (
@@ -690,6 +770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         print(
             "BATCH_GET_PERF_CONFIG "
+            f"execution_mode={args.execution_mode} unit=us "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
@@ -706,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
-            "timing=call_to_stream_completion"
+            f"timing={'graph_replay_npu_event' if args.execution_mode == 'graph' else 'call_to_stream_completion'}"
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -876,6 +957,67 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return indices, offsets, output_indices
 
+        if args.execution_mode == "graph":
+            torch.npu.synchronize()
+            graph_stream = torch.npu.Stream(device=device_id)
+            graph = kvaf.AclGraph()
+            # Capture fixed addresses, while each replay consumes a fresh plan.
+            indices = torch.empty_like(preflight_indices)
+            offsets = torch.empty_like(preflight_offsets)
+            output_indices = torch.empty_like(preflight_output_indices)
+
+            def prepare_graph_inputs() -> None:
+                new_indices, new_offsets, new_rows = create_request_plan()
+                indices.copy_(new_indices)
+                offsets.copy_(new_offsets)
+                output_indices.copy_(new_rows)
+                output.zero_()
+
+            def launch_graph_batch_get() -> None:
+                runtime.batch_get(
+                    device_table, indices, offsets, miss_count,
+                    output_indices, output, stream=graph_stream,
+                    synchronize=False,
+                )
+
+            def validate_graph_output() -> None:
+                # Check the current plan, including shuffled/random output rows.
+                active_rows = output_indices[:miss_count_value].to(torch.int64)
+                token_slots = (
+                    offsets[:miss_count_value].to(torch.int64) // token_bytes
+                )
+                if not torch.equal(
+                    output.index_select(0, active_rows),
+                    entry_pattern.index_select(0, token_slots),
+                ):
+                    raise AssertionError("BatchGet graph replay payload validation failed")
+                if miss_count_value < request_length:
+                    inactive_rows = output_indices[miss_count_value:].to(torch.int64)
+                    if bool(torch.count_nonzero(output.index_select(0, inactive_rows)).item()):
+                        raise AssertionError("BatchGet graph modified rows outside miss_count")
+                print("BATCH_GET_GRAPH_CORRECTNESS_PASS", flush=True)
+
+            print(
+                "GRAPH_PERF_CONTRACT metric=batch_get_graph_event unit=us "
+                "captured_ops=runtime_batch_get fixed_tensor_addresses=1 "
+                "capture_excluded=1 input_updates_excluded=1 validation_excluded=1 "
+                "kernel_profile=0 eager_setup_calls=1 validation_replays=1 "
+                "event_overhead_included=1 dispatch_gaps_may_be_included=1 "
+                f"warmup={args.warmup} samples={args.iterations}",
+                flush=True,
+            )
+            samples_us = measure_graph_event_us(
+                torch, graph, graph_stream, launch_graph_batch_get,
+                prepare_graph_inputs, validate_graph_output,
+                args.warmup, args.iterations,
+            )
+            print_samples(
+                "batch_get_graph_event", samples_us, args.warmup,
+                request_length, miss_count_value, token_bytes,
+            )
+            print("BATCH_GET_PERF_PHASE_DONE phase=batch_get_graph_event")
+            return 0
+
         if args.kernel_profile:
             runtime.start_batch_get_kernel_profile()
             kernel_profile_started = True
@@ -919,9 +1061,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             submitted = time.perf_counter()
             torch.npu.synchronize()
             completed = time.perf_counter()
-            submit_samples.append((submitted - begin) * 1000.0)
-            synchronize_samples.append((completed - submitted) * 1000.0)
-            batch_get_samples.append((completed - begin) * 1000.0)
+            submit_samples.append((submitted - begin) * 1_000_000.0)
+            synchronize_samples.append((completed - submitted) * 1_000_000.0)
+            batch_get_samples.append((completed - begin) * 1_000_000.0)
             if args.kernel_profile:
                 kernel_profile_samples.append(
                     list(runtime.batch_get_kernel_profile())

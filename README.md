@@ -290,6 +290,33 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
 `output_indices`；请求构造和排序不计入 BatchGet 计时。
 
+独立 BatchGet 图模式性能测试使用固定地址的输入/输出 Tensor，只 capture
+`runtime.batch_get(..., synchronize=False)`，再在同一 NPU stream 的 replay 前后
+记录 `torch.npu.Event(enable_timing=True)`：
+
+```bash
+tests/run_remote_cpu_batch_get_perf.sh /absolute/path/to/build-npu \
+  --execution-mode graph --no-kernel-profile \
+  --miss-count 2048 --warmup 10 --iterations 100
+
+# 扫描 token 大小、miss_count、核数和 Jetty 数：
+tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
+  --execution-mode graph --warmup 10 --iterations 100
+```
+
+执行模式默认 `eager`，也可通过 `KVAF_BATCH_GET_PERF_EXECUTION_MODE=graph` 设置。
+该性能脚本所有耗时输出统一为微秒：`mean_us`、`p50_us`、`p90_us`、`p99_us`；
+Event 返回的毫秒先乘 1000，图模式不依赖 `kernel-profile-clock-mhz`。
+图模式输出 `PERF_RESULT operation=batch_get_graph_event`，eager 保留 Host
+调用耗时和可选的核内 cycles 诊断，耗时字段同样使用 `us`。
+图模式需关闭核内 profiling，避免其开销混入主指标。
+
+图模式排除 capture、预热、请求构造/排序、固定 buffer 内容更新和正确性校验；
+每个样本前更新输入并完成相关 stream 工作。图回放在计时前和最后一个样本后检查
+有效请求的 payload 及未写入行。Event 测量的是 stream 上两点间的间隔，包含事件
+开销，也可能包含 Host 下发造成的设备空隙；它与每核 `kernel_total` 的范围不同。
+图对象在 Runtime 和固定 Tensor 释放前完成同步并销毁。
+
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
@@ -313,12 +340,15 @@ sweep 前设置 `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR`。默认在输入目录生�
 `token_bytes_*_miss_count_*_aiv_cores_*_jettys_per_core_*.log`，忽略设备校准日志。
 每个输入日志应只包含一个 case，不能传整次 sweep 的控制台合并日志。
 
-CSV 列与原脚本相同，从 total、post、completion_wait 三组 `PERF_RESULT`
-提取 mean/P50/P90/P99 cycles。微秒为 `cycles / clock_mhz`，
-`p50_GBps = miss_count * token_bytes * clock_mhz / p50_cycles / 1000`。
-频率优先读取日志中的 `KERNEL_PROFILE_CONTRACT` 或 `BATCH_GET_PERF_CONFIG`，
-缺失时使用 1000 MHz；可用 `--clock-mhz 1000` 显式覆盖。缺少任一组结果、数值
-无效或报告 benchmark 异常的日志会输出 `SKIP` 并跳过，其余完整结果照常写入。
+CSV 使用 `*_us` 耗时列，并用 `metric` 列标记测量范围。eager 从 total、post、
+completion_wait 三组 `PERF_RESULT` 提取结果；图模式读取
+`batch_get_graph_event`，post/completion_wait 列留空，不要求核内 profiling。
+新日志直接读取微秒，旧核内日志仍支持 `cycles / clock_mhz` 换算。
+`p50_GBps = miss_count * token_bytes / p50_us / 1000`。
+核内频率优先读取 `KERNEL_PROFILE_CONTRACT` 或 `BATCH_GET_PERF_CONFIG`，缺失时
+使用 1000 MHz；`--clock-mhz 1000` 可覆盖核内 cycles 换算，对 Event 微秒无影响。
+缺少所选模式的结果、数值无效或报告 benchmark 异常的日志会输出 `SKIP` 并跳过，
+其余完整结果照常写入。
 全部日志无效时返回失败并保留已有 CSV。重复运行会覆盖指定的 CSV，不改原始日志。
 
 ### BatchGet 总在途请求预算

@@ -66,7 +66,7 @@ def main():
                         ('KVAF_BATCH_PUT_KERNEL', str(build/'bin/kvaf_execute_batch_put_kernels.o'))]:
         os.environ[name] = value
     sys.path[:0] = [str(build/'python'), str(source_path.parent)]
-    sys.argv = [str(source_path), *extra, '--kernel-profile', '--kernel-profile-clock-mhz', str(args.clock_mhz)]
+    sys.argv = [str(source_path), *extra, '--execution-mode', 'eager', '--kernel-profile', '--kernel-profile-clock-mhz', str(args.clock_mhz)]
 
     def save(config, host, submit, events, profiles):
         if not (len(host) == len(submit) == len(events) == len(profiles)):
@@ -78,7 +78,7 @@ def main():
                              'Host timing includes event instrumentation overhead.',
                              'Cross-core wall timestamps assume a common device clock.',
                              'Transfer window overlaps WQE posting; do not add the two.'],
-                      samples=[summarize_sample(p,args.clock_mhz,payload,h*1000,s*1000,e)
+                      samples=[summarize_sample(p,args.clock_mhz,payload,h,s,e)
                                for h,s,e,p in zip(host,submit,events,profiles)])
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2, default=str))

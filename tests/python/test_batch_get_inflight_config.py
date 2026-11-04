@@ -51,7 +51,10 @@ class InflightConfigTests(unittest.TestCase):
                 fields = dict(field.split("=", 1) for field in line.split()[1:])
                 records[fields["operation"]] = fields
         self.assertEqual(records["batch_get_kernel_post"]["mean_cycles"], "80.000")
+        self.assertEqual(records["batch_get_kernel_post"]["mean_us"], "0.080")
         self.assertEqual(records["batch_get_kernel_completion_wait"]["mean_cycles"], "100.000")
+        self.assertEqual(records["batch_get_kernel_completion_wait"]["mean_us"], "0.100")
+        self.assertNotIn("_ms", output.getvalue())
         self.assertIn("peak_submitted_not_drained_mean=2048", output.getvalue())
 
 

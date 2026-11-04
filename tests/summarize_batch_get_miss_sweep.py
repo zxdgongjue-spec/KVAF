@@ -16,6 +16,7 @@ STAGES = {
     "batch_get_kernel_post": "post_",
     "batch_get_kernel_completion_wait": "completion_wait_",
 }
+GRAPH_OPERATION = "batch_get_graph_event"
 FIELDNAMES = [
     *SHAPE_FIELDS,
     *(f"{stat}_us" for stat in STATS),
@@ -23,6 +24,7 @@ FIELDNAMES = [
     *(f"post_{stat}_us" for stat in STATS),
     *(f"completion_wait_{stat}_us" for stat in STATS),
     "selected_ub_device",
+    "metric",
 ]
 LOG_PATTERN = "token_bytes_*_miss_count_*_aiv_cores_*_jettys_per_core_*.log"
 LOG_NAME = re.compile(
@@ -63,7 +65,9 @@ def parse_log(path, clock_override=None):
                 config = record
             elif parts[0] == "KERNEL_PROFILE_CONTRACT":
                 contract = record
-            elif parts[0] == "PERF_RESULT" and record.get("operation") in STAGES:
+            elif parts[0] == "PERF_RESULT" and record.get("operation") in (
+                *STAGES, GRAPH_OPERATION
+            ):
                 profiles[record["operation"]] = record
             elif parts[0] == "[KVAF_AIV]" and len(parts) > 1 and parts[1] in (
                 "UB_DEVICE_SELECTED", "UB_DEVICE_REUSED"
@@ -76,7 +80,9 @@ def parse_log(path, clock_override=None):
             ) or line.startswith("Traceback (most recent call last):"):
                 raise ValueError("benchmark error reported in log")
 
-    missing = STAGES.keys() - profiles.keys()
+    graph_mode = config.get("execution_mode") == "graph" or GRAPH_OPERATION in profiles
+    stages = {GRAPH_OPERATION: ""} if graph_mode else STAGES
+    missing = stages.keys() - profiles.keys()
     if missing:
         raise ValueError(f"incomplete profile: missing {', '.join(sorted(missing))}")
 
@@ -91,25 +97,34 @@ def parse_log(path, clock_override=None):
         if name in filename_shape and row[name] != int(filename_shape[name]):
             raise ValueError(f"{name} differs between filename and log")
 
-    clock = number(
-        clock_override if clock_override is not None else contract.get(
-            "clock_mhz", config.get("kernel_profile_clock_mhz", 1000)
-        ),
-        "clock_mhz", positive=True,
-    )
-    p50_cycles = None
-    for operation, prefix in STAGES.items():
+    for prefix in STAGES.values():
+        for stat in STATS:
+            row[f"{prefix}{stat}_us"] = ""
+    p50_us = 0.0
+    for operation, prefix in stages.items():
         profile = profiles[operation]
         for stat in STATS:
-            name = f"{stat}_cycles"
-            cycles = number(profile.get(name), f"{operation}.{name}")
-            row[f"{prefix}{stat}_us"] = f"{cycles / clock:.3f}"
-            if operation == "batch_get_kernel_total" and stat == "p50":
-                p50_cycles = cycles
+            us_name = f"{stat}_us"
+            if graph_mode or (us_name in profile and clock_override is None):
+                duration_us = number(profile.get(us_name), f"{operation}.{us_name}")
+            else:
+                clock = number(
+                    clock_override if clock_override is not None else contract.get(
+                        "clock_mhz", config.get("kernel_profile_clock_mhz", 1000)
+                    ),
+                    "clock_mhz", positive=True,
+                )
+                name = f"{stat}_cycles"
+                cycles = number(profile.get(name), f"{operation}.{name}")
+                duration_us = cycles / clock
+            row[f"{prefix}{stat}_us"] = f"{duration_us:.3f}"
+            if not prefix and stat == "p50":
+                p50_us = duration_us
     payload_bytes = row["miss_count"] * row["token_bytes"]
-    gbps = payload_bytes * clock / p50_cycles / 1000 if p50_cycles > 0 else 0
+    gbps = payload_bytes / p50_us / 1000 if p50_us > 0 else 0
     row["p50_GBps"] = f"{gbps:.3f}"
     row["selected_ub_device"] = device
+    row["metric"] = GRAPH_OPERATION if graph_mode else "batch_get_kernel_total"
     return row
 
 

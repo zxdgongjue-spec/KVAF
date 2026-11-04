@@ -61,7 +61,7 @@ class SweepRecoveryTests(unittest.TestCase):
                 "mean_us", "p50_us", "p90_us", "p99_us", "p50_GBps",
                 "post_mean_us", "post_p50_us", "post_p90_us", "post_p99_us",
                 "completion_wait_mean_us", "completion_wait_p50_us",
-                "completion_wait_p90_us", "completion_wait_p99_us", "selected_ub_device",
+                "completion_wait_p90_us", "completion_wait_p99_us", "selected_ub_device", "metric",
             ])
         self.assertEqual([row["aiv_cores"] for row in rows], ["1", "2", "4", "8"])
         self.assertEqual(rows[0]["p50_us"], "8.000")
@@ -69,6 +69,7 @@ class SweepRecoveryTests(unittest.TestCase):
         self.assertEqual(rows[0]["post_mean_us"], "4.000")
         self.assertEqual(rows[0]["completion_wait_p99_us"], "10.000")
         self.assertEqual(rows[0]["selected_ub_device"], "udmac0d1e2")
+        self.assertEqual(rows[0]["metric"], "batch_get_kernel_total")
         for path, original in snapshots.items():
             self.assertEqual(path.read_bytes(), original)
 
@@ -80,6 +81,32 @@ class SweepRecoveryTests(unittest.TestCase):
         row = summary.parse_log(path, clock_override=2000)
         self.assertEqual(row["p50_us"], "4.000")
         self.assertEqual(row["p50_GBps"], "5.248")
+
+    def test_graph_microseconds_need_no_kernel_profile_or_clock(self):
+        profile = (
+            "PERF_RESULT operation=batch_get_graph_event samples=5 "
+            "mean_us=250.125 p50_us=200.000 p90_us=300.000 p99_us=400.000 unit=us\n"
+        )
+        path = self.write_log(profile=profile)
+        path.write_text(path.read_text().replace("clock_mhz=1000", "clock_mhz=invalid"))
+        for override in (None, 500):
+            row = summary.parse_log(path, clock_override=override)
+            self.assertEqual(row["mean_us"], "250.125")
+            self.assertEqual(row["p50_GBps"], "0.105")
+            self.assertEqual(row["metric"], "batch_get_graph_event")
+            self.assertEqual(row["post_mean_us"], "")
+            self.assertEqual(row["completion_wait_p99_us"], "")
+        path.write_text(path.read_text().replace("p50_us=200.000", "p50_us=nan"))
+        with self.assertRaises(ValueError):
+            summary.parse_log(path)
+
+    def test_microsecond_kernel_results_and_clock_override(self):
+        profile = PROFILE.replace("unit=ms", "unit=us").replace(
+            "p50_cycles=8000.000", "p50_cycles=8000.000 p50_us=8.000"
+        )
+        path = self.write_log(profile=profile)
+        self.assertEqual(summary.parse_log(path)["p50_us"], "8.000")
+        self.assertEqual(summary.parse_log(path, clock_override=500)["p50_us"], "16.000")
 
     def test_config_clock_and_legacy_filename_fallback(self):
         profile = PROFILE.split("\n", 1)[1]
