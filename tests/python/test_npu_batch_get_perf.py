@@ -21,6 +21,7 @@ environment variables:
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
+    --ubmem-profile-detail  per-row diagnostic timing (requires --kernel-profile)
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
@@ -253,6 +254,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="disable AIV kernel cycle profiling",
     )
     parser.add_argument(
+        "--ubmem-profile-detail", action="store_true",
+        help="measure UBmem address preparation, MTE submission and final drain; adds timing overhead",
+    )
+    parser.add_argument(
         "--kernel-profile-clock-mhz",
         type=int,
         default=environment_int(
@@ -264,6 +269,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
         help="AIV clock used to convert profile cycles to milliseconds",
     )
+    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
     parser.set_defaults(
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
@@ -276,6 +282,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048),
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
+    parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.miss_count is None:
         args.miss_count = args.request_length
@@ -286,6 +295,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
+    if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
+        return "adaptive-ub-device and peer-ub-device apply only to URMA"
+    if args.ubmem_profile_detail and (args.transport != "ubmem" or not args.kernel_profile):
+        return "ubmem-profile-detail requires --transport ubmem and --kernel-profile"
     block_bytes = args.token_bytes * args.tokens_per_block
     ddr_bytes = args.table_capacity * block_bytes
     if args.request_length <= 0 or args.request_length > MAX_INT32:
@@ -334,6 +347,11 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.contention_control_dir is not None:
+        if args.contention_result is None or args.contention_graph_calls <= 0 or args.miss_count <= 0:
+            return "contention mode requires a result path, positive graph calls and positive miss-count"
+        if args.kernel_profile:
+            return "contention mode measures graph throughput and requires --no-kernel-profile"
     return None
 
 
@@ -409,6 +427,76 @@ def print_samples(
     print(result)
 
 
+def print_ubmem_kernel_profile(
+    samples: list[list[dict[str, object]]], warmup: int, clock_mhz: int,
+    miss_count: int, token_bytes: int,
+) -> None:
+    # Take every stage from the same slowest core in each sample. Independent
+    # stage maxima can come from different cores and would not sum to total.
+    critical = [
+        max(sample, key=lambda core: int(core["kernel_finish_cycle"]) - int(core["kernel_start_cycle"]))
+        for sample in samples
+    ]
+    stages = {"kernel_total": [
+        int(core["kernel_finish_cycle"]) - int(core["kernel_start_cycle"])
+        for core in critical
+    ]}
+    detailed = bool(critical[0].get("ubmem_profile_detail", False))
+    if detailed:
+        for stage, field in (
+            ("kernel_setup", "ubmem_setup_cycles"),
+            ("kernel_address_prepare", "ubmem_address_cycles"),
+            ("kernel_mte_submit", "ubmem_submit_cycles"),
+            ("kernel_final_drain", "ubmem_drain_cycles"),
+        ):
+            stages[stage] = [int(core[field]) for core in critical]
+        measured = list(stages.values())[1:]
+        stages["kernel_other"] = [
+            total - sum(values[i] for values in measured)
+            for i, total in enumerate(stages["kernel_total"])
+        ]
+        if any(value < 0 for value in stages["kernel_other"]):
+            raise AssertionError("UBmem profile stage cycles exceed kernel total")
+    print(
+        "KERNEL_PROFILE_CONTRACT transport=ubmem "
+        f"clock_mhz={clock_mhz} samples={len(samples)} "
+        f"detail={int(detailed)} aggregation=max_elapsed_across_cores "
+        "kernel_total=miss_count_address_resolution_mte_copy_and_final_drain "
+        "address_preparation=simt_ub_pipeline address_batch_rows=32 address_banks=2 "
+        "profile_overhead_included=1 d2h_outside_host_metric=1"
+    )
+    if detailed:
+        print(
+            "KERNEL_PROFILE_DETAIL_CONTRACT "
+            "stage_aggregation=on_slowest_total_core_per_sample "
+            "address_prepare=simt_submit_ready_wait_and_scalar_address_loads simt_execution_may_overlap_mte=1 "
+            "mte_submit=copy_call_including_synchronization_not_dma_duration "
+            "final_drain=pending_simt_and_final_mte3_completion "
+            "other=loop_and_timing_bookkeeping "
+            "dma_may_overlap_address_prepare=1 per_row_timing_perturbs_pipeline=1"
+        )
+    for stage, cycles in stages.items():
+        milliseconds = [value / clock_mhz / 1000.0 for value in cycles]
+        result = (
+            f"PERF_RESULT operation=batch_get_{stage} "
+            f"samples={len(samples)} warmup_excluded={warmup} "
+            f"mean_ms={statistics.mean(milliseconds):.6f} "
+            f"p50_ms={percentile(milliseconds, 0.50):.6f} "
+            f"p90_ms={percentile(milliseconds, 0.90):.6f} "
+            f"p99_ms={percentile(milliseconds, 0.99):.6f} "
+            f"mean_cycles={statistics.mean(cycles):.3f} "
+            f"p50_cycles={percentile(cycles, 0.50):.3f} "
+            f"p90_cycles={percentile(cycles, 0.90):.3f} "
+            f"p99_cycles={percentile(cycles, 0.99):.3f} "
+            f"detail={int(detailed)} transport=ubmem"
+        )
+        if stage == "kernel_total":
+            useful_bytes = len(samples) * miss_count * token_bytes
+            gibps = useful_bytes / (1024.0**3) / (sum(milliseconds) / 1000.0)
+            result += f" useful_GiBps={gibps:.3f}"
+        print(result)
+
+
 def print_kernel_profile(
     samples: list[list[dict[str, object]]],
     warmup: int,
@@ -418,9 +506,14 @@ def print_kernel_profile(
     request_length: int,
     miss_count: int,
     token_bytes: int,
+    transport: str = "urma",
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
+
+    if transport == "ubmem":
+        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes)
+        return
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
         return (int(profile[end]) - int(profile[begin])) / clock_mhz / 1000.0
@@ -682,6 +775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         adaptive_ub_miss_count=args.adaptive_ub_miss_count,
         peer_ub_device=args.peer_ub_device,
         adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
+        transport=args.transport,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -695,7 +789,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
             f"source_access_pattern={args.source_access_pattern} "
             f"output_access_pattern={args.output_access_pattern} "
-            f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
+            f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
@@ -876,8 +970,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return indices, offsets, output_indices
 
+        if args.contention_control_dir is not None:
+            from batch_get_multicard_perf import run_worker
+
+            def submit(plan, stream):
+                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
+
+            def check_output(plan):
+                slots = (plan[1][:miss_count_value] // token_bytes).to(torch.int64)
+                destinations = plan[2][:miss_count_value].to(torch.int64)
+                if not torch.equal(output.index_select(0, destinations), entry_pattern.index_select(0, slots)):
+                    raise AssertionError("contention graph replay payload validation failed")
+
+            run_worker(kvaf, torch, args, create_request_plan, submit, check_output)
+            return 0
+
         if args.kernel_profile:
-            runtime.start_batch_get_kernel_profile()
+            if args.ubmem_profile_detail:
+                runtime.start_batch_get_kernel_profile(detailed=True)
+            else:
+                runtime.start_batch_get_kernel_profile()
             kernel_profile_started = True
             print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
 
@@ -961,6 +1073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 request_length,
                 miss_count_value,
                 token_bytes,
+                args.transport,
             )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

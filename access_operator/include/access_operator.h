@@ -83,6 +83,11 @@ struct BatchGetKernelProfile {
   std::uint64_t post_active_cycles{0};
   std::uint64_t drain_wait_cycles{0};
   std::uint64_t peak_submitted_not_drained{0};
+  bool ubmem_profile_detail{false};
+  std::uint64_t ubmem_setup_cycles{0};
+  std::uint64_t ubmem_address_cycles{0};
+  std::uint64_t ubmem_submit_cycles{0};
+  std::uint64_t ubmem_drain_cycles{0};
 };
 
 // Default synchronous NPU data-plane implementation.

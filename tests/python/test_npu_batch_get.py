@@ -12,6 +12,7 @@ runner process is launched.
 from __future__ import annotations
 
 from array import array
+import argparse
 import os
 from pathlib import Path
 import statistics
@@ -80,7 +81,7 @@ def validate_output(
             raise AssertionError(f"output mismatch for request={request}, row={row}")
 
 
-def main() -> int:
+def main(transport: str = "urma") -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
@@ -220,6 +221,7 @@ def main() -> int:
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(
         str(kernel),
+        transport=transport,
         batch_get_token_bytes=token_bytes,
         batch_get_tokens_per_block=tokens_per_block,
         device_id=device_id,
@@ -702,6 +704,14 @@ def main() -> int:
             )
             graph.reset()
             graph = None
+        if transport == "ubmem":
+            runtime.release_access_table(table)
+            table = None
+            runtime.shutdown()
+            for _ in range(2):
+                runtime.initialize(ddr_bytes, source_stride)
+                runtime.shutdown()
+            print("RUNTIME_NPU_UBMEM_REINITIALIZE_PASS")
         return 0
     except Exception as error:
         print(
@@ -729,4 +739,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    raise SystemExit(main(parser.parse_args().transport))

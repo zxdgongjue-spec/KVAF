@@ -38,10 +38,14 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
-adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048)`
+adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048, transport="urma")`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
+
+`transport` 默认使用 URMA；传入 `transport="ubmem"` 使用 UBmem。UBmem 的 CPU
+内存分配依赖 Ascend HAL 与驱动；CPU 服务根据分配请求选择后端，无需指定协议。
+
 `jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，可选 1 到 64 个独立
 Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，BatchGet 配置为 3 到
 64 时 BatchPut 仍使用 2 个。
