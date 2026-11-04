@@ -8,6 +8,8 @@ add_test(NAME kvaf_aiv_test_cleanup_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_test_cleanup.py")
 add_test(NAME kvaf_gather_perf_summary_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_perf_summary.py")
+add_test(NAME kvaf_gather_cpu_profile_analysis_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_cpu_profile_analysis.py")
 
 add_executable(kvaf_cpu_gather_executor_profile_test cpu_gather_executor_profile_test.cc
   ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)

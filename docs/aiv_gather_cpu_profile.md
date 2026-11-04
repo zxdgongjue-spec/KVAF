@@ -114,6 +114,33 @@ ACK 读取与 CQ 等待，而且 CPU 可能在 AIV 的 publish 阶段尚未结�
 计时和线程 CPU 时钟本身有开销。这轮用于归因，正式吞吐关闭
 `KVAF_GATHER_PROFILE`，不要将诊断轮当作无打点基线。
 
+## 批量汇总到一个 CSV
+
+将日志放入同一目录，文件名包含 SGL，例如 `gather-cpu-656-sgl6.log`、
+`gather-cpu-4096-sgl1.log`。脚本通过请求中的 `bytes/rows` 识别 token 大小，
+SGL 从文件名读取；文件名没有 SGL 时可用 `--sgl 6` 为本次输入指定同一个值。
+
+```bash
+python3 tests/python/analyze_gather_cpu_profile.py cpu-logs/ -o cpu_summary.csv
+```
+
+也可传入多个文件或通配符。默认只解析 `CPU_GATHER_PROFILE` 请求汇总行，
+统计其中所有 `_ns` 耗时字段；绝对时刻 `observed_ns/done_ns` 不作为耗时统计。
+失败请求和 valid=0 的字段不参与统计。每个文件、token 大小、SGL、lane、rows、
+active_threads 分别统计，每个耗时字段在 CSV 中占一行。
+
+仅处理指定字段、指定 sequence 范围（例如此前 profile 的 123～132）：
+
+```bash
+python3 tests/python/analyze_gather_cpu_profile.py 'cpu-logs/*.log' -o cpu_summary.csv \
+  --fields total copy prepare join_wait --first-sequence 123 --last-sequence 132
+```
+
+输出包含 samples、mean、p50/p95/p99、min/max、stddev、variance、CV。
+耗时和标准差均为 us，方差为 us²，CV 为百分比；方差使用 n−1 的样本估计，
+只有一个样本时标准差/方差/CV 留空。分位数使用线性插值。
+脚本保留慢样本，默认包含全部 sequence；需要排除预热时指定 sequence 范围。
+
 ## 相关实现
 
 - `runtime/src/cpu_runtime.cc`：notify 轮询、请求阶段、缓冲和日志输出。
