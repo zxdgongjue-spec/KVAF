@@ -712,7 +712,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
           probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
           for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            probe_keys.push_back(std::numeric_limits<KeyId>::max() - row);
+            // MetaManager maps each bounded DSA key directly to its slot.
+            probe_keys.push_back(row);
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
           }
@@ -853,9 +854,13 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
     std::fprintf(stderr,
                  "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
-                 "pairs=%zu\n",
+                 "pairs=%zu token_bytes=%u tokens_per_block=%u miss_count=%u "
+                 "aiv_cores=%u jettys_per_core=%u warmup=%u samples=%u\n",
                  impl_->options.device_id, device_names[device].c_str(),
-                 device_candidates[device].size());
+                 device_candidates[device].size(), probe_config.token_bytes,
+                 probe_config.tokens_per_block, probe_config.miss_count,
+                 impl_->options.npu_core_count, impl_->options.jettys_per_core,
+                 detail::kStartupWarmup, detail::kStartupSamples);
   }
   return detail::SelectStartupDeviceCandidate(
       device_candidates, initialize_candidate, cleanup);

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -17,6 +18,7 @@
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
+#include "direct_hccp/direct_hccp_session.h"
 #include "kvaf_aiv_batch_put.h"
 #endif
 
@@ -51,8 +53,10 @@ struct BatchPutExecutionState {
   void* metadata{nullptr};
   void* core_status{nullptr};
   std::size_t metadata_capacity{0};
-  std::vector<std::uint64_t> host_metadata;
-  std::vector<KvafBatchPutCoreStatus> host_core_status;
+  void* host_metadata{nullptr};
+  std::size_t host_metadata_capacity{0};
+  KvafBatchPutCoreStatus* host_core_status{nullptr};
+  std::size_t host_core_status_count{0};
 };
 
 void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
@@ -65,6 +69,12 @@ void ReleaseBatchPutExecutionState(BatchPutExecutionState* execution) {
   if (execution->metadata != nullptr) {
     (void)aclrtFree(execution->metadata);
   }
+  if (execution->host_core_status != nullptr) {
+    (void)aclrtFreeHost(execution->host_core_status);
+  }
+  if (execution->host_metadata != nullptr) {
+    (void)aclrtFreeHost(execution->host_metadata);
+  }
   *execution = BatchPutExecutionState{};
 }
 
@@ -74,9 +84,17 @@ Status InitializeBatchPutExecutionState(std::uint32_t npu_core_count,
     return InvalidArgument("invalid BatchPut execution state");
   }
   BatchPutExecutionState state;
-  state.host_core_status.resize(npu_core_count);
   const std::size_t status_bytes =
       static_cast<std::size_t>(npu_core_count) * sizeof(KvafBatchPutCoreStatus);
+  void* host_core_status = nullptr;
+  if (aclrtMallocHost(&host_core_status, status_bytes) != ACL_SUCCESS ||
+      host_core_status == nullptr) {
+    return Internal("failed to allocate pinned BatchPut core status buffer");
+  }
+  state.host_core_status =
+      static_cast<KvafBatchPutCoreStatus*>(host_core_status);
+  state.host_core_status_count = npu_core_count;
+  std::memset(state.host_core_status, 0, status_bytes);
   if (aclrtMalloc(&state.core_status, status_bytes,
                   ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMemset(state.core_status, status_bytes, 0, status_bytes) != ACL_SUCCESS) {
@@ -94,12 +112,23 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
                  (3U * sizeof(std::uint64_t))) {
     return InvalidArgument("BatchPut metadata dimensions are invalid");
   }
-  execution->host_metadata.resize(rows * 3U);
+  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
+  if (rows > execution->host_metadata_capacity) {
+    void* host_metadata = nullptr;
+    if (aclrtMallocHost(&host_metadata, bytes) != ACL_SUCCESS ||
+        host_metadata == nullptr) {
+      return Internal("failed to grow pinned BatchPut host metadata buffer");
+    }
+    if (execution->host_metadata != nullptr) {
+      (void)aclrtFreeHost(execution->host_metadata);
+    }
+    execution->host_metadata = host_metadata;
+    execution->host_metadata_capacity = rows;
+  }
   if (rows <= execution->metadata_capacity) {
     return Status::OK();
   }
 
-  const std::size_t bytes = rows * 3U * sizeof(std::uint64_t);
   void* metadata = nullptr;
   if (aclrtMalloc(&metadata, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
     return Internal("failed to grow BatchPut device metadata buffers");
@@ -617,6 +646,12 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
           source.jetty_completion_wait_cycles[jetty];
       destination.jetty_completion_polls[jetty] =
           source.jetty_completion_polls[jetty];
+      const auto& measured = source.jettys[jetty];
+      destination.jettys[jetty] = {
+          measured.requests, measured.posts, measured.first_doorbell_cycle,
+          measured.last_doorbell_cycle, measured.first_completion_cycle,
+          measured.last_completion_cycle, measured.completion_count,
+          measured.priority, measured.jetty_id, measured.eid_path};
     }
     profiles->push_back(destination);
   }
@@ -663,7 +698,8 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     if (!status.ok()) {
       return status;
     }
-    std::uint64_t* const host_offsets = execution.host_metadata.data();
+    std::uint64_t* const host_offsets =
+        static_cast<std::uint64_t*>(execution.host_metadata);
     std::uint64_t* const host_lengths = host_offsets + rows;
     std::uint64_t* const host_destinations = host_lengths + rows;
     std::copy(exec.request->input_offsets.begin(),
@@ -675,11 +711,6 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     }
 
     const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
-    if (aclrtMemcpy(execution.metadata, metadata_bytes,
-                    execution.host_metadata.data(), metadata_bytes,
-                    ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-      return Internal("failed to upload BatchPut metadata to NPU");
-    }
 
     KvafBatchPutLocalBuffer* local_buffer = nullptr;
     if (KvafBatchPutLocalBufferAcquire(
@@ -689,6 +720,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       return Internal("failed to acquire caller input for BatchPut");
     }
 
+    const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
     KvafExecuteBatchPutKernelArgs arguments{};
     arguments.input = PointerValue(exec.request->input.data);
     arguments.input_offsets = PointerValue(execution.metadata);
@@ -703,14 +735,25 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     arguments.row_count = static_cast<std::uint32_t>(rows);
     arguments.aiv_core_count = impl_->config.npu_core_count;
 
-    for (KvafBatchPutCoreStatus& core_status : execution.host_core_status) {
-      core_status = KvafBatchPutCoreStatus{};
+    std::memset(execution.host_core_status, 0,
+                execution.host_core_status_count *
+                    sizeof(KvafBatchPutCoreStatus));
+    if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
+                         execution.host_metadata, metadata_bytes,
+                         ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
+      KvafBatchPutLocalBufferRelease(local_buffer);
+      return Internal("failed to enqueue BatchPut metadata upload to NPU");
     }
+
     const int32_t result = KvafExecuteBatchPutSync(
-        local_buffer, &arguments,
-        static_cast<aclrtStream>(exec.execution.stream),
-        execution.host_core_status.data(),
-        static_cast<std::uint32_t>(execution.host_core_status.size()));
+        local_buffer, &arguments, stream, execution.host_core_status,
+        static_cast<std::uint32_t>(execution.host_core_status_count));
+    if (result != KVAF_BATCH_PUT_SUCCESS) {
+      // The metadata upload may have been accepted even when launch or status
+      // setup subsequently failed. Do not reuse its pinned source buffer until
+      // the stream has stopped reading it.
+      (void)aclrtSynchronizeStream(stream);
+    }
     KvafBatchPutLocalBufferRelease(local_buffer);
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);

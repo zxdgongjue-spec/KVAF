@@ -113,7 +113,7 @@ KVAF_PEER_DEVICE=npu KVAF_PEER_SERVICE_ADDR=NPU1_HOST_IP:28999 DEVICE_ID=0 \
 不要为 NPU peer 传 `--adaptive-ub-device` 或 `--peer-ub-device`，它们只用于 CPU 服务。
 `table-capacity` 是有效 block 数，池容量为
 `table_capacity × tokens_per_block × token_bytes`；上述命令在最大 token 配置下
-分配 4 GiB。原来的默认 table-capacity 在该配置下需要 624 GiB，应根据 NPU1
+分配 4 GiB。旧版默认 table-capacity 在该配置下需要 624 GiB，应根据 NPU1
 可用 HBM 显式设置。CPU/NPU 对比测试应使用相同容量和访问模式。
 各 shape 的 `BATCH_GET_PERF_CONFIG` 日志记录实际 `peer_device`。
 
@@ -145,8 +145,8 @@ try:
     source = (torch.arange(2 * block_bytes, dtype=torch.int64) % 251).to(
         dtype=torch.uint8, device="npu:0"
     ).reshape(2, tokens_per_block, token_bytes)
-    runtime.batch_put([101, 102], source, [0, block_bytes], [block_bytes, block_bytes])
-    table = runtime.prepare_access_table([101, 102])
+    runtime.batch_put([0, 1], source, [0, block_bytes], [block_bytes, block_bytes])
+    table = runtime.prepare_access_table([0, 1])
     view = runtime.access_table_view(table, device="npu")
     indices = torch.tensor([0, 1], dtype=torch.int32, device="npu:0")
     offsets = torch.tensor([3 * token_bytes, 7 * token_bytes],

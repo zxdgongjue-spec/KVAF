@@ -54,7 +54,8 @@ class MetaManager {
  public:
   virtual ~MetaManager() = default;
 
-  // 注册一块可管理的远端内存区域。
+  // 注册远端区域；DSA Key 必须位于 [0, length / slot_size)。
+  // 固定映射 slot_id = key，地址为 base + key * slot_size。
   virtual Status RegisterRemoteRegion(const RemoteRegionDesc& region) = 0;
 
   // 为一批 key 预留远端 slot。
@@ -67,7 +68,7 @@ class MetaManager {
   // 将 PreparePut 预留的地址正式提交为可见映射。
   virtual Status CommitPut(const PutContext& put_context) = 0;
 
-  // 放弃一次尚未提交的 put，并把预留 slot 归还到空闲队列。
+  // 放弃一次尚未提交的 put，使该 Key 对应的 slot 恢复空闲。
   virtual Status AbortPut(const PutContext& put_context) = 0;
 
   // 为一批 key 建立稳定读快照。
@@ -85,7 +86,7 @@ class MetaManager {
   // 释放稳定读快照，解除对应记录的 pin。
   virtual Status UnlockKeys(const LockContext& lock_context) = 0;
 
-  // 释放一批 key 当前占用的 slot，并放回空闲队列。
+  // 释放一批 key 当前占用的 slot，使相同 Key 可以复用该 slot。
   virtual Status BatchFree(const std::vector<KeyId>& flat_keys) = 0;
 };
 

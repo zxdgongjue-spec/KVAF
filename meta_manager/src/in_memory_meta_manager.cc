@@ -2,8 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
-#include <queue>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +15,9 @@ namespace kvaf {
 
 namespace {
 
+// DSA keys are bounded slot IDs. Visibility belongs to each fixed slot.
+enum class SlotState : std::uint8_t { kEmpty, kPending, kActive };
+
 // 单条 key 当前绑定的地址记录。
 struct AddressRecord {
   std::uint64_t record_id{0};
@@ -21,11 +25,7 @@ struct AddressRecord {
   std::uint64_t valid_length{0};
   std::size_t slot_id{0};
   std::uint32_t pin_count{0};
-};
-
-// key 到当前可见记录的索引项。
-struct KeyEntry {
-  AddressRecord active_record;
+  SlotState state{SlotState::kEmpty};
 };
 
 // PreparePut 阶段的临时预留项。
@@ -77,6 +77,22 @@ Status InvalidState(std::string message) {
 
 // 批量接口要求 key 唯一，避免重复申请或重复释放。
 bool HasDistinctKeys(const std::vector<KeyId>& keys) {
+  // BatchPut callers commonly provide monotonically increasing key ranges.
+  // This avoids allocating a temporary hash node for every key on that path.
+  if (keys.size() < 2) {
+    return true;
+  }
+  bool strictly_increasing = true;
+  for (std::size_t index = 1; index < keys.size(); ++index) {
+    if (keys[index] <= keys[index - 1]) {
+      strictly_increasing = false;
+      break;
+    }
+  }
+  if (strictly_increasing) {
+    return true;
+  }
+
   std::unordered_set<KeyId> seen;
   seen.reserve(keys.size());
   for (KeyId key : keys) {
@@ -89,7 +105,7 @@ bool HasDistinctKeys(const std::vector<KeyId>& keys) {
 
 class InMemoryMetaManager final : public MetaManager {
  public:
-  // 注册单个远端 region，并按固定 slot 粒度初始化空闲队列。
+  // Register the complete DSA key space: key_id == slot_id.
   Status RegisterRemoteRegion(const RemoteRegionDesc& region) override {
     if (region.length == 0) {
       return InvalidArgument("remote region length must be greater than zero");
@@ -107,14 +123,22 @@ class InMemoryMetaManager final : public MetaManager {
       return AlreadyExists("remote region has already been registered");
     }
 
-    region_ = region;
-    region_registered_ = true;
-
     const std::uint64_t slot_count = region.length / region.slot_size;
-    for (std::uint64_t i = 0; i < slot_count; ++i) {
-      free_slots_.push(static_cast<std::size_t>(i));
+    if (slot_count > std::numeric_limits<std::size_t>::max()) {
+      return InvalidArgument("remote region slot count exceeds host size_t");
+    }
+    const std::size_t slot_count_size = static_cast<std::size_t>(slot_count);
+    try {
+      records_.assign(slot_count_size, AddressRecord{});
+      // BatchPut normally has one in-flight context. Reserve its bucket so
+      // steady-state emplace does not trigger a bucket-table rehash.
+      pending_puts_.reserve(1U);
+    } catch (const std::bad_alloc&) {
+      return Status::OutOfMemory("failed to allocate DSA slot metadata");
     }
 
+    region_ = region;
+    region_registered_ = true;
     return Status::OK();
   }
 
@@ -135,25 +159,23 @@ class InMemoryMetaManager final : public MetaManager {
     if (!HasDistinctKeys(flat_keys)) {
       return InvalidArgument("PreparePut does not accept duplicate keys");
     }
-
     std::lock_guard<std::mutex> lock(meta_mutex_);
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
-    if (free_slots_.size() < flat_keys.size()) {
-      return Status::Error(StatusCode::kOutOfMemory,
-                           "not enough free slots for PreparePut");
-    }
-
+    // Validate the whole batch before reserving any fixed slot.
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
+      if (flat_keys[i] >= records_.size()) {
+        return InvalidArgument(
+            "PreparePut key must be a DSA slot ID inside the region");
+      }
       if (lengths[i] == 0) {
         return InvalidArgument("PreparePut length must be greater than zero");
       }
       if (lengths[i] > region_.slot_size) {
         return InvalidArgument("PreparePut length exceeds slot_size");
       }
-      if (key_index_.find(flat_keys[i]) != key_index_.end() ||
-          pending_keys_.find(flat_keys[i]) != pending_keys_.end()) {
+      if (records_[flat_keys[i]].state != SlotState::kEmpty) {
         return AlreadyExists("PreparePut key already exists or is pending");
       }
     }
@@ -163,21 +185,18 @@ class InMemoryMetaManager final : public MetaManager {
     pending_context.items.reserve(flat_keys.size());
     put_desc->entries.clear();
     put_desc->entries.reserve(flat_keys.size());
-
-    // slot 在这里离开 free queue，但在 CommitPut 前仍然不可见。
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
-      const std::size_t slot_id = free_slots_.front();
-      free_slots_.pop();
-
-      const Address address = SlotAddress(slot_id);
-      pending_context.items.push_back(
-          PendingPutItem{flat_keys[i], slot_id, lengths[i]});
+      const std::size_t slot_id = static_cast<std::size_t>(flat_keys[i]);
+      pending_context.items.push_back(PendingPutItem{flat_keys[i], slot_id, lengths[i]});
       put_desc->entries.push_back(
-          PutAllocation{flat_keys[i], address, lengths[i]});
-      pending_keys_.insert(flat_keys[i]);
+          PutAllocation{flat_keys[i], SlotAddress(slot_id), lengths[i]});
     }
-
-    pending_puts_.emplace(ctx_id, std::move(pending_context));
+    // Finish all allocations before changing slot visibility.
+    auto pending_it =
+        pending_puts_.emplace(ctx_id, std::move(pending_context)).first;
+    for (const PendingPutItem& item : pending_it->second.items) {
+      records_[item.slot_id].state = SlotState::kPending;
+    }
     put_context->id = ctx_id;
     return Status::OK();
   }
@@ -199,29 +218,25 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (const PendingPutItem& item : pending_it->second.items) {
-      if (key_index_.find(item.key) != key_index_.end()) {
-        return InvalidState("CommitPut found an already committed key");
+      if (records_[item.slot_id].state != SlotState::kPending) {
+        return InvalidState("CommitPut lost a pending DSA slot");
       }
     }
-
-    // Commit 是写路径对读路径的可见性边界。
+    // The mutex makes publication of the whole batch atomic to readers.
     for (const PendingPutItem& item : pending_it->second.items) {
-      AddressRecord record;
+      AddressRecord& record = records_[item.slot_id];
       record.record_id = next_record_id_++;
       record.uba = SlotAddress(item.slot_id);
       record.valid_length = item.valid_length;
       record.slot_id = item.slot_id;
       record.pin_count = 0;
-
-      key_index_.emplace(item.key, KeyEntry{record});
-      pending_keys_.erase(item.key);
+      record.state = SlotState::kActive;
     }
-
     pending_puts_.erase(pending_it);
     return Status::OK();
   }
 
-  // 放弃一次未提交的 put，并把预留 slot 归还空闲队列。
+  // 放弃一次未提交的 put，使该 Key 的固定 slot 恢复 EMPTY。
   Status AbortPut(const PutContext& put_context) override {
     if (put_context.id == 0) {
       return InvalidArgument("PutContext id must be non-zero");
@@ -238,8 +253,7 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (const PendingPutItem& item : pending_it->second.items) {
-      free_slots_.push(item.slot_id);
-      pending_keys_.erase(item.key);
+      records_[item.slot_id] = AddressRecord{};
     }
 
     pending_puts_.erase(pending_it);
@@ -268,8 +282,7 @@ class InMemoryMetaManager final : public MetaManager {
     std::vector<LockedItem> items;
     items.reserve(flat_keys.size());
     for (KeyId key : flat_keys) {
-      auto key_it = key_index_.find(key);
-      if (key_it == key_index_.end()) {
+      if (key >= records_.size() || records_[key].state != SlotState::kActive) {
         // Pins are taken while building the snapshot so this path needs to
         // roll them back if a later key is missing.
         for (const LockedItem& item : items) {
@@ -278,11 +291,9 @@ class InMemoryMetaManager final : public MetaManager {
         return NotFound("LockKeys key was not found");
       }
 
-      // unordered_map node addresses remain stable across rehash. The pin
-      // prevents BatchFree from erasing this record until UnlockKeys, so this
-      // pointer is a valid stable-read snapshot and avoids two more hash
-      // lookups per key in BatchLookup/UnlockKeys.
-      AddressRecord* record = &key_it->second.active_record;
+      // records_ is allocated once during region registration and never
+      // resized, so this pointer remains stable until the manager is destroyed.
+      AddressRecord* record = &records_[key];
       ++record->pin_count;
       items.push_back(LockedItem{key, record});
     }
@@ -385,28 +396,18 @@ class InMemoryMetaManager final : public MetaManager {
       return NotInitialized("remote region has not been registered");
     }
 
-    std::vector<std::size_t> slots_to_recycle;
-    slots_to_recycle.reserve(flat_keys.size());
     for (KeyId key : flat_keys) {
-      auto key_it = key_index_.find(key);
-      if (key_it == key_index_.end()) {
+      if (key >= records_.size() || records_[key].state != SlotState::kActive) {
         return NotFound("BatchFree key was not found");
       }
-
-      const AddressRecord& record = key_it->second.active_record;
+      const AddressRecord& record = records_[key];
       if (record.pin_count > 0) {
         return Busy("BatchFree key is still pinned by a LockContext");
       }
-
-      slots_to_recycle.push_back(record.slot_id);
     }
 
     for (KeyId key : flat_keys) {
-      key_index_.erase(key);
-    }
-
-    for (std::size_t slot_id : slots_to_recycle) {
-      free_slots_.push(slot_id);
+      records_[key] = AddressRecord{};
     }
 
     return Status::OK();
@@ -417,14 +418,12 @@ class InMemoryMetaManager final : public MetaManager {
     return region_.base + static_cast<Address>(slot_id) * region_.slot_size;
   }
 
-  // 当前 POC 使用一把总锁保护元数据和空闲 slot 队列。
+  // One mutex protects fixed-slot states, transactions and read snapshots.
   std::mutex meta_mutex_;
   bool region_registered_{false};
   RemoteRegionDesc region_;
-  std::queue<std::size_t> free_slots_;
-  std::unordered_map<KeyId, KeyEntry> key_index_;
+  std::vector<AddressRecord> records_;
   std::unordered_map<std::uint64_t, PendingPutContext> pending_puts_;
-  std::unordered_set<KeyId> pending_keys_;
   std::unordered_map<std::uint64_t, ActiveLockContext> lock_contexts_;
   std::uint64_t next_record_id_{1};
   std::uint64_t next_put_context_id_{1};

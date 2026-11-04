@@ -39,12 +39,24 @@ class MissSweepTests(unittest.TestCase):
         runner.write_text(f"#!{sys.executable}\n" + textwrap.dedent(f"""\
             import os
             import sys
+            if sys.argv[1].endswith("batch_get_jetty_profile.py"):
+                os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
             sys.path.insert(0, {str(ROOT / 'tests' / 'python')!r})
             import test_npu_batch_get_perf as perf
 
             assert sys.argv[1].endswith("test_npu_batch_get_perf.py")
             args = perf.parse_args(sys.argv[2:])
             assert perf.validate_args(args) is None
+            if args.adaptive_calibration_only:
+                if os.environ.get("FIXED_CPU_DEVICE"):
+                    print("[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED reason=k_side_device_filter")
+                print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
+                raise SystemExit(0)
+            if not args.kernel_profile:
+                assert args.peer_ub_device in ("udmaA", "udmaB")
+                speed = 2 if args.peer_ub_device == "udmaB" else 1
+                print(f"PERF_RESULT operation=batch_get useful_GiBps={{speed}}")
+                raise SystemExit(0)
             assert args.kernel_profile
             mode = "raw" if args.raw_addresses else "lookup"
             assert mode == os.environ["EXPECTED_ADDRESS_MODE"]
@@ -91,6 +103,30 @@ class MissSweepTests(unittest.TestCase):
                 args.kernel_profile_clock_mhz, args.aiv_cores, args.jettys_per_core,
                 args.request_length, args.miss_count, args.token_bytes,
                 address_mode=mode, batch_get_mode=args.batch_get_mode)
+            for profile in sample:
+                active = profile["active_requests"]
+                profile["completion_count"] = int(active > 0)
+                profile["jettys"] = []
+                for slot in range(args.jettys_per_core):
+                    requests = active if slot == 0 else 0
+                    profile["jettys"].append({{
+                        "requests": requests, "posts": int(requests > 0),
+                        "completion_count": int(requests > 0),
+                        "priority": 3 + slot, "jetty_id": 100 + slot,
+                        "eid_path": slot % 2,
+                        "first_doorbell_cycle": profile["first_doorbell_cycle"] if requests else 0,
+                        "last_doorbell_cycle": profile["post_done_cycle"] if requests else 0,
+                        "first_completion_cycle": profile["completion_done_cycle"] if requests else 0,
+                        "last_completion_cycle": profile["completion_done_cycle"] if requests else 0,
+                    }})
+            rows = perf.jetty_profile.summarize([sample],
+                clock_mhz=args.kernel_profile_clock_mhz, npu_core_count=args.aiv_cores,
+                jettys_per_core=args.jettys_per_core, token_bytes=args.token_bytes,
+                miss_count=args.miss_count, request_length=args.request_length,
+                max_inflight_total=args.max_inflight_total, warmup=args.warmup,
+                peer_device=args.peer_device, batch_get_mode=args.batch_get_mode)
+            perf.jetty_profile.write_csv(args.jetty_csv, rows)
+            print(f"BATCH_GET_JETTY_CSV_WRITTEN path={{args.jetty_csv}} rows={{len(rows)}}")
             """))
         runner.chmod(0o755)
         self.environment = {
@@ -149,6 +185,11 @@ class MissSweepTests(unittest.TestCase):
                 with summary.open() as handle:
                     rows = list(csv.DictReader(handle))
                 self.assertEqual(len(rows), 2)
+                with (self.directory / "logs/batch_get_jetty_summary.csv").open() as handle:
+                    jetty_rows = list(csv.DictReader(handle))
+                self.assertEqual(len(jetty_rows), 8)
+                self.assertEqual({row["batch_get_mode"] for row in jetty_rows}, {batch_get_mode})
+                self.assertEqual(sum(int(row["requests_total"]) for row in jetty_rows), 64)
                 for row, count in zip(rows, (0, 64)):
                     self.assertEqual(row["address_mode"], mode)
                     self.assertEqual(row["batch_get_mode"], batch_get_mode)
@@ -185,6 +226,24 @@ class MissSweepTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No-pipeline stage profiling is unavailable", result.stdout)
         self.assertFalse((self.directory / "logs/batch_get_miss_sweep_summary.csv").exists())
+
+    def test_full_path_calibration_selects_and_reuses_best_cpu_device(self):
+        self.environment["KVAF_ADAPTIVE_UB_DEVICES"] = "udmaA,udmaB"
+        result = self.run_sweep("--adaptive-ub-device")
+        self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr)
+        self.assertIn("selected_ub_device=udmaB", result.stdout)
+        selection = (self.directory / "logs/ub_device_selection.log").read_text()
+        self.assertIn("mode=full_perf_path", selection)
+        self.assertEqual(selection.count("BATCH_GET_UB_DEVICE_CANDIDATE_BEGIN"), 2)
+        with (self.directory / "logs/batch_get_miss_sweep_summary.csv").open() as stream:
+            self.assertEqual({r["selected_ub_device"] for r in csv.DictReader(stream)}, {"udmaB"})
+
+    def test_fixed_cpu_device_skips_full_path_calibration(self):
+        self.environment["FIXED_CPU_DEVICE"] = "1"
+        result = self.run_sweep("--adaptive-ub-device")
+        self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr)
+        self.assertIn("BATCH_GET_UB_DEVICE_CALIBRATION_SKIPPED", result.stdout)
+        self.assertNotIn("BATCH_GET_UB_DEVICE_CANDIDATE_BEGIN", result.stdout)
 
     def test_invalid_modes_fail_before_launch(self):
         for options in (

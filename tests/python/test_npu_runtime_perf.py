@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kvaf
 
 from backend import detect_torch_backend
+from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
 
 
@@ -176,8 +177,9 @@ def main(batch: int = 16) -> int:
 
     # All BatchPut and BatchFree inputs are created before their measured loops.
     # Key batches are distinct, so Runtime never sees a duplicate Put or Free.
-    all_keys = list(range(1, table_capacity + 1))
-    prepare_keys = torch.arange(1, table_capacity + 1, dtype=torch.int64)
+    # DSA with one pool row/layer: key = block_q in [0, table_capacity).
+    all_keys = build_dsa_keys(table_capacity, q_capacity=table_capacity)
+    prepare_keys = torch.arange(table_capacity, dtype=torch.int64)
     key_batches = [
         all_keys[batch_index * PUT_BATCH_SIZE : (batch_index + 1) * PUT_BATCH_SIZE]
         for batch_index in range(total_put_batches)
@@ -248,7 +250,7 @@ def main(batch: int = 16) -> int:
 
         # Verify the complete CPU-DDR data path before accepting steady-state samples.
         print("RUNTIME_PERF_PHASE_BEGIN phase=correctness_preflight")
-        preflight_keys = list(range(table_capacity + 1, table_capacity + PUT_BATCH_SIZE + 1))
+        preflight_keys = all_keys[:PUT_BATCH_SIZE]
         runtime.batch_put(preflight_keys, kv_data, put_offsets, lengths)
         torch.npu.synchronize()
         preflight_table = runtime.prepare_access_table(preflight_keys)

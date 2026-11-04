@@ -1,3 +1,6 @@
+> 历史设计：当前实现已采用 DSA 固定映射 `slot_id = key`。
+> 空闲队列和任意 Key 分配的描述不再适用；当前约定见 [MetaManager](../meta_manager/README.md)。
+
 # MetaManager 地址管理设计
 
 ## 1. 目标

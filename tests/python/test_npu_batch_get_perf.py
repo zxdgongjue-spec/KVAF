@@ -25,6 +25,7 @@ environment variables:
     --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
+    --jetty-csv            KVAF_BATCH_GET_JETTY_CSV
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
     adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
     --peer-device          KVAF_PEER_DEVICE (cpu or npu; default cpu)
@@ -44,15 +45,17 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
+from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
+import batch_get_jetty_profile as jetty_profile
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
-DEFAULT_TABLE_CAPACITY = 16_384 * 78
+DEFAULT_TABLE_CAPACITY = 16_384
 DEFAULT_TOKENS_PER_BLOCK = 128
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_AIV_CORES = 2
-DEFAULT_JETTYS_PER_CORE = 1
+DEFAULT_JETTYS_PER_CORE = 2
 MAX_JETTYS_PER_CORE = 64
 DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
@@ -219,6 +222,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="strict K-side UB device selected by an earlier process",
     )
     parser.add_argument(
+        "--adaptive-calibration-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--warmup",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
@@ -283,6 +291,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
         help="AIV clock used to convert profile cycles to milliseconds",
     )
+    parser.add_argument(
+        "--jetty-csv", default=os.environ.get("KVAF_BATCH_GET_JETTY_CSV", ""),
+        help="write per-Jetty summary CSV (requires --kernel-profile)",
+    )
     parser.set_defaults(
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
         sort_input_indices=environment_bool(
@@ -345,6 +357,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "KVAF_ADAPTIVE_UB_MISS_COUNT must be in [1, INT32_MAX]"
     if args.adaptive_ub_device and args.peer_ub_device:
         return "adaptive-ub-device and peer-ub-device are mutually exclusive"
+    if args.adaptive_calibration_only and not args.adaptive_ub_device:
+        return "adaptive-calibration-only requires adaptive-ub-device"
     if args.adaptive_ub_device and (
         any(not device for device in args.adaptive_peer_ub_devices)
         or len(set(args.adaptive_peer_ub_devices))
@@ -367,7 +381,32 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.jetty_csv and not args.kernel_profile:
+        return "jetty-csv requires kernel-profile"
     return None
+
+
+def wait_for_concurrent_start() -> None:
+    """Optional launcher rendezvous, outside measurement and silent in benchmark logs."""
+    endpoint = os.environ.get("KVAF_BATCH_GET_START_GATE")
+    if not endpoint:
+        return
+    import socket
+
+    host, port = endpoint.rsplit(":", 1)
+    timeout = int(os.environ.get("KVAF_REMOTE_CPU_PERF_TIMEOUT", "600"))
+    with socket.create_connection((host, int(port)), timeout=timeout) as connection:
+        connection.sendall((os.environ["KVAF_BATCH_GET_START_TOKEN"] + "\n").encode("ascii"))
+        with connection.makefile("rb") as response:
+            message = response.readline(64)
+        if not message.endswith(b"\n") or not message.strip().isdigit():
+            raise RuntimeError("concurrent launcher disconnected before start")
+        start_ns = int(message)
+    while True:
+        remaining_ns = start_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return
+        time.sleep(remaining_ns / 1_000_000_000)
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -464,7 +503,7 @@ def print_kernel_profile(
     ):
         raise AssertionError(
             "No-pipeline stage profiling is unavailable; rebuild the host, Python binding "
-            "and V4 kernels together, and select --batch-get-mode no-pipeline"
+            "and V5 kernels together, and select --batch-get-mode no-pipeline"
         )
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
@@ -592,7 +631,8 @@ def print_kernel_profile(
         "setup=entity_queue_and_miss_count compact=removed_direct_prefix "
         "post=sum_group_capacity_check_wqe_fill_sq_copy_and_doorbell "
         "transfer_window=first_doorbell_to_all_cq_complete "
-        "completion_wait=sum_all_group_drains "
+        "completion_wait=round_robin_cq_probes_and_drains "
+        "jetty_wait=probe_active_time "
         "peak_submitted_not_drained=per_core_conservative_software_count "
         "profile_overhead_included=1 d2h_outside_host_metric=1"
     )
@@ -790,6 +830,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if runtime.remote_region["device"] != args.peer_device:
             raise AssertionError("Runtime selected the wrong remote memory device")
         print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
+        if args.adaptive_calibration_only:
+            print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
+            return 0
 
         # Every table entry contains the same deterministic token pattern. Reusing
         # a bounded source Tensor keeps setup memory independent of table capacity;
@@ -821,7 +864,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         populated = 0
         while populated < table_capacity:
             count = min(populate_entries, table_capacity - populated)
-            keys = list(range(populated + 1, populated + count + 1))
+            keys = build_dsa_keys(count, start=populated, q_capacity=table_capacity)
             runtime.batch_put(
                 keys,
                 populate_source[:count],
@@ -836,7 +879,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=prepare_access_table")
-        prepare_keys = torch.arange(1, table_capacity + 1, dtype=torch.int64)
+        # The same single-pool-row/single-layer DSA order as population:
+        # key = block_q in [0, table_capacity).
+        prepare_keys = torch.arange(table_capacity, dtype=torch.int64)
         table = runtime.prepare_access_table(prepare_keys)
         device_table = runtime.access_table_view(
             table, device="npu", capacity=table_capacity
@@ -900,8 +945,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("BATCH_GET_PERF_PHASE_DONE phase=correctness_preflight")
 
-        # The table is populated in key order and MetaManager allocates fixed
-        # slots FIFO, so linear token IDs map to adjacent remote addresses.
+        # DSA keys map directly to fixed slots, so linear token IDs map to
+        # adjacent remote CPU addresses.
         # shuffled-contiguous changes only their submission order and keeps the
         # exact same remote working set as contiguous.
         contiguous_source_token_ids = request_ids % total_tokens
@@ -927,9 +972,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 source_token_ids = contiguous_source_token_ids
                 if args.source_access_pattern == "shuffled-contiguous":
-                    source_token_ids = source_token_ids[
-                        torch.randperm(request_length, device=device)
-                    ]
+                    source_token_ids = contiguous_source_token_ids.clone()
+                    active_permutation = torch.randperm(
+                        miss_count_value, device=device
+                    )
+                    source_token_ids[:miss_count_value].copy_(
+                        contiguous_source_token_ids[:miss_count_value].index_select(
+                            0, active_permutation
+                        )
+                    )
                 indices = (source_token_ids // tokens_per_block).to(torch.int32)
                 token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
             offsets = token_slots * token_bytes
@@ -969,11 +1020,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
-        for _ in range(args.iterations):
+        for iteration in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
             submission = prepare_submission(indices, offsets, output_indices)
             # Request generation and Tensor work are deliberately excluded.
             torch.npu.synchronize()
+
+            if iteration == 0:
+                wait_for_concurrent_start()
 
             begin = time.perf_counter()
             submit_batch_get(*submission)
@@ -1025,6 +1079,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 address_mode="raw" if args.raw_addresses else "lookup",
                 batch_get_mode=args.batch_get_mode,
             )
+            jetty_rows = jetty_profile.summarize(
+                kernel_profile_samples, clock_mhz=args.kernel_profile_clock_mhz,
+                npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
+                token_bytes=token_bytes, miss_count=miss_count_value,
+                request_length=request_length, max_inflight_total=args.max_inflight_total,
+                warmup=args.warmup,
+                peer_device=args.peer_device, batch_get_mode=args.batch_get_mode,
+            )
+            jetty_profile.print_table(jetty_rows)
+            if args.jetty_csv:
+                jetty_profile.write_csv(args.jetty_csv, jetty_rows)
+                print(f"BATCH_GET_JETTY_CSV_WRITTEN path={args.jetty_csv} rows={len(jetty_rows)}")
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False
             print("BATCH_GET_KERNEL_PROFILE_DISABLED")

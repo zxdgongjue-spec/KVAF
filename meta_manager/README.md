@@ -105,12 +105,13 @@ sequenceDiagram
 
 核心数据结构：
 
-- `free_slots_`：FIFO 空闲队列
-- `key_index_`：committed key 索引
-- `pending_puts_`：未提交写事务
-- `pending_keys_`：防止 pending 阶段重复申请
-- `lock_contexts_`：活动读快照
-- `region_`：单 region 配置，slot 地址通过 `base + slot_id * slot_size` 计算
+- `records_`：按 DSA Key 索引的固定 slot 数组，记录 EMPTY/PENDING/ACTIVE 状态。
+- `pending_puts_`：未提交写事务。
+- `lock_contexts_`：活动读快照，通过 pin 防止释放仍在使用的 slot。
+- `region_`：单 region 配置，Key 必须在 `[0, length / slot_size)` 内。
+
+地址固定为 `base + key * slot_size`。释放或回滚后，仅相同 Key 复用该 slot；
+不再按申请顺序从空闲队列分配。CPU DDR 与 NPU HBM 使用相同约定。
 
 记录生命周期：
 

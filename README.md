@@ -1,5 +1,8 @@
 # KVAF
 
+Priority/SL、逐 Jetty 报表、双进程并发及 CPU/NPU peer 的组合用法见
+[分支集成说明](docs/priority_sl_integration.md)。
+
 KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备（DDR 或 HBM）中的地址、
 生命周期和访问一致性，并提供高性能的 BatchPut/BatchGet
 数据搬运能力。
@@ -255,7 +258,7 @@ runtime = kvaf.NpuRuntime(
     device_id=0,
     npu_core_count=2,
     batch_put_kernel_object_path="build-npu/bin/kvaf_execute_batch_put_kernels.o",
-    jettys_per_core=1,
+    jettys_per_core=2,
     # 可选：每项是32位连续十六进制；空列表保持单 EID 自动发现。
     npu_eids=[
         "00112233445566778899aabbccddeeff",
@@ -309,7 +312,7 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 `no-pipeline` 开启 `--kernel-profile` 后还会输出 WQE 填充、MTE3 拷贝和
 doorbell 三阶段耗时。miss-count sweep 默认开启 profiling，汇总表和 CSV 会
 自动包含三阶段的 mean/p50/p90/p99（微秒）。耗时按每核单次调用内所有 post
-累计，再取核间最大值，包含同步和计时开销；CQ 等待单独统计。此扩展使用 V4
+累计，再取核间最大值，包含同步和计时开销；CQ 等待单独统计。此扩展使用 V5
 状态布局，需通过 `./build.sh npu` 一起重编 host、Python binding 和 kernel。
 
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持

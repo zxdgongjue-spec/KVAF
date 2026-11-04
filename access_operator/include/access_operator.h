@@ -36,6 +36,7 @@ class AccessOperator {
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+
 };
 
 // Configuration for the current NPU-backed default implementation. Transport
@@ -48,7 +49,7 @@ struct AccessOperatorConfig {
   std::string batch_put_kernel_object_path;
   std::uint32_t npu_core_count{0};
   // Direct-HCCP Jettys assigned to each BatchGet AIV core.
-  std::uint32_t jettys_per_core{1};
+  std::uint32_t jettys_per_core{2};
   // Per-launch total READ budget; 0 selects the original whole-batch path.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // BatchPut retains its independent one-or-two-Jetty implementation. Zero
@@ -62,6 +63,19 @@ struct AccessOperatorConfig {
   // continues to use peer_local_eid above.
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
+};
+
+struct BatchGetJettyProfile {
+  std::uint64_t requests{0};
+  std::uint64_t posts{0};
+  std::uint64_t first_doorbell_cycle{0};
+  std::uint64_t last_doorbell_cycle{0};
+  std::uint64_t first_completion_cycle{0};
+  std::uint64_t last_completion_cycle{0};
+  std::uint64_t completion_count{0};
+  std::uint32_t priority{0};
+  std::uint32_t jetty_id{0};
+  std::uint32_t eid_path{0};
 };
 
 struct BatchGetKernelProfile {
@@ -86,6 +100,7 @@ struct BatchGetKernelProfile {
   std::uint64_t wqe_fill_cycles{0};
   std::uint64_t mte_copy_cycles{0};
   std::uint64_t doorbell_cycles{0};
+  std::array<BatchGetJettyProfile, 64> jettys{};
 };
 
 // Default synchronous NPU data-plane implementation.

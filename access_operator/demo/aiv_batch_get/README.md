@@ -73,7 +73,7 @@ For graph use, warm up the output registration before capture. Keep the address
 arrays, output allocation and their addresses fixed, and update array contents
 and `miss_count` on the capture stream before replay. Raw mode needs no device
 AccessTable. Host, binding and kernel must be rebuilt together: the argument
-record is now 128 bytes and the launcher requires `KvafExecuteBatchGetAivKernelV4`.
+record is now 128 bytes and the launcher requires `KvafExecuteBatchGetAivKernelV5`.
 
 The local-memory lifetime is intentionally separate from the shared
 transport:
@@ -153,13 +153,13 @@ temporarily disabled in this branch.
 
 The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
-launcher now requires the `KvafExecuteBatchGetAivKernelV4` symbol.
+launcher now requires the `KvafExecuteBatchGetAivKernelV5` symbol.
 
 ### No-pipeline lookup variant
 
 The build also produces `bin/kvaf_execute_batch_get_no_pipeline_kernels.o`.
 It compiles the same source with `KVAF_BATCH_GET_PIPELINED=0`, using the same
-128-byte launch arguments and V4 status ABI. Each post uses one UB bank: fill up to 128 WQEs, wait for vector
+128-byte launch arguments and V5 status ABI. Each post uses one UB bank: fill up to 128 WQEs, wait for vector
 completion, copy the bank into SQ with MTE3, wait for copy completion, then
 update PI and ring the doorbell. The next post's vector fill waits for that
 scalar commit. SQ wrap still uses two copies before the doorbell.
@@ -171,7 +171,7 @@ remote READ completion after every post or disable the two-group inflight
 scheduler. The launcher loads one object per process, so compare variants in
 separate benchmark runs.
 
-### No-pipeline stage timing (V4)
+### No-pipeline stage timing (V5)
 
 With `--batch-get-mode no-pipeline --kernel-profile`, the benchmark reports
 three additional `PERF_RESULT` operations:
@@ -198,15 +198,15 @@ are also available from `runtime.batch_get_kernel_profile()` as
 `wqe_fill_cycles`, `mte_copy_cycles` and `doorbell_cycles`, with
 `post_stage_profile_enabled=1` in the serial kernel's profile.
 
-Stage profiling adds scalar completion barriers and four clock reads per post.
+Stage profiling adds scalar completion barriers and five clock reads per post, including the Jetty doorbell timestamp.
 Reported timings include this synchronization and clock overhead. The ordinary
 non-profiled serial path does not add those barriers or clock reads. Stage sums
 need not equal `kernel_post`: that metric also covers scheduling and accounting,
 and independent stage maxima can come from different cores.
 
 Run `./build.sh npu` to rebuild the **host, Python binding and both kernels**.
-V4 extends the status stride from 1216 to 1280 bytes while retaining 128-byte
-launch arguments. The new `KvafExecuteBatchGetAivKernelV4` symbol prevents
+V5 combines stage and per-Jetty measurements with a 5888-byte status stride and 128-byte
+launch arguments. The new `KvafExecuteBatchGetAivKernelV5` symbol prevents
 mixing incompatible host/kernel status layouts. The benchmark rejects missing
 stage counters instead of reporting unavailable measurements as zero.
 
@@ -278,7 +278,7 @@ bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
 ```
 
 The four `KVAF_BATCH_GET_SWEEP_*` variables accept space-separated values.
-Omit them to retain the original 2646-shape sweep. Set
+Defaults select 656-byte tokens, miss counts 2048/4096/8192, two cores and two Jettys per core. Set
 `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR` to choose a persistent output directory;
 otherwise its temporary path is printed at startup. Results also go to
 `batch_get_miss_sweep_summary.csv` in that directory. Configuration, kernel
@@ -310,6 +310,149 @@ The `kvaf_batch_get_no_pipeline_model_test` CTest target executes the production
 kernel's serial specialization in the CPU shim, checking post ordering,
 payloads, tails, replay, SQ/CQ wrap and faults. These checks do not measure
 hardware performance or validate AIV DMA/cache visibility.
+## Per-Jetty priority experiments
+
+Set `KVAF_BATCH_GET_JETTY_PRIORITIES` in the NPU test process to configure
+BatchGet's local Jettys. No Python, Runtime, C API, wire protocol or kernel ABI
+change is required. Host Jettys and BatchPut Jettys retain their existing
+configuration; the original Direct-HCCP creation entry point still uses 15.
+
+The value is a comma-separated list of decimal integers in `[0, 15]`.
+Whitespace around each integer is accepted. An unset variable or an empty
+string selects `15` for all Jettys. Invalid values (including empty entries,
+trailing commas, signs and out-of-range integers) fail BatchGet transport
+creation before it allocates device resources; they do not fall back to 15.
+
+Assignment follows the existing core-major worker index:
+
+```text
+entity_index = core * jettys_per_core + jetty_slot
+priority = priorities[entity_index % priority_count]
+```
+
+There is no required relationship between list length and core/Jetty count.
+A single value applies to every Jetty; a shorter list repeats; a longer list
+leaves its unused suffix unapplied. Repeated entries are allowed. Existing
+core and Jetty limits still apply, and EID path assignment is unchanged.
+For example, `3,10,13,15` with three cores and two Jettys per core gives:
+
+| Core | Jetty 0 | Jetty 1 |
+| --- | --- | --- |
+| 0 | 3 | 10 |
+| 1 | 13 | 15 |
+| 2 | 3 | 10 |
+
+The list is read once at transport creation, and each transport starts at its
+first entry. Changing the environment does not change existing Jettys or a
+captured graph; start a new test process to recreate the transport.
+
+After `./build.sh npu`, with the existing CPU service listening on port 29000:
+
+```bash
+mkdir -p logs
+set -o pipefail
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 \
+DEVICE_ID=7 \
+KVAF_BATCH_GET_JETTY_PRIORITIES=3,10,13,15 \
+tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+    --aiv-cores 3 --jettys-per-core 2 \
+    --token-bytes 656 --request-length 4096 --miss-count 4096 \
+    --max-inflight-total 2048 --warmup 20 --iterations 100 \
+    --kernel-profile 2>&1 | tee logs/batch_get_priority_3_10_13_15.log
+```
+
+Use the CPU endpoint and NPU device appropriate to the server. The same
+environment variable also passes through
+`tests/run_remote_cpu_batch_get_miss_count_perf.sh` without script changes;
+its existing sweep determines core/Jetty counts. For controlled comparisons,
+use the single-configuration runner above and keep device/EID selection,
+workload and inflight budget fixed. Compare `15`, `13`, `15,13`, and `13,15`
+in interleaved repeated runs before adding more priority values.
+
+`BATCH_GET_JETTY_PRIORITY_CONFIG` logs the normalized list, assignment order,
+worker count and number of unused entries. `BATCH_GET_JETTY_PRIORITY` logs
+`core`, `jetty_slot`, `entity_index`, `eid_path`, `jetty_id`, and the priority
+passed for each successfully created BatchGet Jetty. `DIRECT_JETTY_READY`
+also includes priority, including 15 for callers of the original entry point.
+Inspect the mapping with:
+
+```bash
+grep -E 'BATCH_GET_JETTY_PRIORITY|DIRECT_JETTY_READY' \
+    logs/batch_get_priority_3_10_13_15.log
+```
+
+These logs confirm the requested priority, not the hardware's effective SL.
+NPU priority-to-SL mapping must be verified for the actual NPU device.
+
+## Per-Jetty measurements and CSV
+
+`--kernel-profile` now collects each Jetty's actual READ count, post count,
+group-checkpoint completion count, first/last doorbell timestamp and
+first/last observed successful CQE timestamp. Priority, Jetty ID and EID path
+come from the created transport, not from re-reading the environment during
+reporting. There is one table row per configured `(core, jetty_slot)`, including
+unused Jettys.
+
+Profiling probes active Jettys once per round, rotating the starting slot.
+It probes between group submissions and while draining, including both
+pending groups in each Jetty's CQ order. A fast Jetty's younger checkpoint can
+be observed before another Jetty finishes the oldest group. Group credits are
+still released only after every participating Jetty completes. With profiling
+disabled, the existing blocking completion path remains in use.
+
+The original `jetty*_wait_ms_mean` counters now measure active CQ-probe time
+in profiling mode; they are not transmission latency. `kernel_completion_wait`
+includes the between-group probes and group drains. Compare priority settings
+using the same profiling mode: its polling and timestamp overhead affects the
+workload and differs from older profiling results.
+
+Your existing sweep command automatically prints `JETTY_PROFILE_TABLE` for
+each shape and writes CSVs into `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR`:
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 \
+DEVICE_ID=7 \
+KVAF_BATCH_GET_JETTY_PRIORITIES=3,10,13,15 \
+tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu"
+```
+
+- `batch_get_miss_sweep_summary.csv`: overall summary, including address/mode and no-pipeline stage columns.
+- `batch_get_jetty_summary.csv`: combined per-Jetty summary for all shapes.
+- `token_bytes_..._jettys_per_core_....jetty.csv`: per-shape Jetty summary,
+  beside the corresponding `.log`.
+
+Override the combined path with `KVAF_BATCH_GET_JETTY_SWEEP_CSV`. For the
+single-configuration runner, add `--kernel-profile --jetty-csv logs/jettys.csv`
+(or set `KVAF_BATCH_GET_JETTY_CSV` and enable profiling).
+
+Important per-Jetty CSV columns:
+
+| Column | Meaning |
+| --- | --- |
+| `peer_device`, `batch_get_mode`, `address_mode` | Remote memory and operator variant. |
+| `core`, `jetty_slot`, `entity_index`, `jetty_id`, `eid_path`, `priority` | Actual local resource/configuration identity. |
+| `samples`, `active_samples`, `warmup_excluded` | Measured launch count, launches using this Jetty, and excluded warmup count. |
+| `requests_total`, `bytes_total`, `requests_mean`, `bytes_mean` | Actual volume, total over measured launches or mean per launch. |
+| `posts_mean`, `completions_mean` | Doorbells and signaled group checkpoints per launch; CQEs are not individual READs. |
+| `first_post_us_mean`, `last_post_us_mean` | Submission timestamps relative to this core's kernel start. |
+| `first_completion_seen_us_mean`, `last_completion_seen_us_mean` | Observed completion timestamps relative to this core's kernel start. |
+| `observed_window_us_mean/p50/p90/p99` | First doorbell to last observed completion, per active launch. |
+| `effective_GBps` | Total actual bytes divided by the sum of observed windows, using decimal GB/s. |
+| `probe_active_us_mean`, `polls_mean` | CQ probing cost per measured launch, for diagnostics. |
+
+Unused Jettys have zero volume and blank timing/throughput cells, rather than
+appearing infinitely fast. Timing statistics use active launches only; volume
+means use all measured launches. Zero-miss launches are supported. Full shape,
+token size, inflight budget and clock MHz accompany every row.
+
+These are software observation windows, not hardware transfer latencies or
+per-READ latency. Polling occurs between group submissions, not during WQE
+materialization, so a CQE ready during posting is observed later. The window
+also includes submission gaps and group-credit waits. Raw timestamp offsets
+use each core's own start; compare durations, not presumed synchronized core
+start times. Do not add per-Jetty effective rates to obtain overall bandwidth.
+Exchange priority assignments between slots and repeat with fixed device/EID,
+shape and budget to distinguish priority effects from workload/slot effects.
 
 ## Graph boundary
 

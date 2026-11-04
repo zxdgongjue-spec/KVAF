@@ -366,9 +366,20 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
                           std::uint32_t token_value, std::uint32_t sq_depth,
                           const char* role, QpCreateInfo* jetty_info,
                           void** jetty_handle) {
+  return CreateDeviceAivJetty(api, context, cq_handle, token_handle,
+                              token_value, sq_depth, role, jetty_info,
+                              jetty_handle, 15U);
+}
+
+bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
+                          void* cq_handle, void* token_handle,
+                          std::uint32_t token_value, std::uint32_t sq_depth,
+                          const char* role, QpCreateInfo* jetty_info,
+                          void** jetty_handle, std::uint8_t priority) {
   if (api.qp_create == nullptr || context == nullptr || cq_handle == nullptr ||
       token_handle == nullptr || token_value == 0U || sq_depth == 0U ||
-      role == nullptr || jetty_info == nullptr || jetty_handle == nullptr) {
+      role == nullptr || jetty_info == nullptr || jetty_handle == nullptr ||
+      priority > 15U) {
     return false;
   }
   const std::uint64_t sq_bytes = static_cast<std::uint64_t>(sq_depth) *
@@ -393,7 +404,7 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
   attr.ub.jfs_flag = JfsFlagErrorSuspend();
   attr.ub.token_id_handle = token_handle;
   attr.ub.token_value = token_value;
-  attr.ub.priority = 15U;
+  attr.ub.priority = priority;
   attr.ub.rnr_retry = 7U;
   attr.ub.err_timeout = 16U;
   attr.ub.ext_mode.sqebb_num = sq_depth;
@@ -408,10 +419,10 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
       jetty_info->key.size > kQpKeyBytes) {
     std::fprintf(stderr,
                  "[KVAF_AIV] DIRECT_JETTY_CREATE_FAILED role=%s mode=%u sq_depth=%u sqebb_num=%u "
-                 "cstm_flag=%u requested_sq_bytes=%u ret=%d handle=%p key_bytes=%u\n",
+                 "cstm_flag=%u requested_sq_bytes=%u priority=%u ret=%d handle=%p key_bytes=%u\n",
                  role, attr.ub.mode, sq_depth, attr.ub.ext_mode.sqebb_num,
                  attr.ub.ext_mode.cstm_flag, attr.ub.ext_mode.sq.buffer_size,
-                 ret, *jetty_handle, jetty_info->key.size);
+                 static_cast<unsigned int>(priority), ret, *jetty_handle, jetty_info->key.size);
     return false;
   }
   if (jetty_info->ub.sq_buffer_va == 0U || jetty_info->ub.db_addr == 0U ||
@@ -427,11 +438,12 @@ bool CreateDeviceAivJetty(const DirectHccpApi& api, void* context,
   }
   std::fprintf(stderr,
                "[KVAF_AIV] DIRECT_JETTY_READY role=%s mode=%u cstm_flag=%u jetty_id=%u sq_va=0x%llx "
-               "db_va=0x%llx returned_wqebb_bytes=%llu\n",
+               "db_va=0x%llx returned_wqebb_bytes=%llu priority=%u\n",
                role, attr.ub.mode, attr.ub.ext_mode.cstm_flag, jetty_info->ub.id,
                static_cast<unsigned long long>(jetty_info->ub.sq_buffer_va),
                static_cast<unsigned long long>(jetty_info->ub.db_addr),
-               static_cast<unsigned long long>(jetty_info->ub.wqebb_size));
+               static_cast<unsigned long long>(jetty_info->ub.wqebb_size),
+               static_cast<unsigned int>(priority));
   std::fprintf(stderr,
                "[KVAF_AIV] DIRECT_USER_CTL_QUEUE_CONTRACT role=%s profile=aiv_dev_used "
                "sq_depth_entries=%u sqebb_num=%u requested_sq_buffer_bytes=%u "

@@ -1,5 +1,12 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+add_test(NAME kvaf_concurrent_batch_get_python
+  COMMAND "${Python3_EXECUTABLE}" -B
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_concurrent_batch_get.py")
+add_test(NAME kvaf_diagnostics_python
+  COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+          -s "${CMAKE_CURRENT_SOURCE_DIR}/diagnostics" -p "test_*.py")
+
 add_executable(kvaf_batch_get_raw_request_test batch_get_raw_request_test.cc)
 target_link_libraries(kvaf_batch_get_raw_request_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_batch_get_raw_request COMMAND kvaf_batch_get_raw_request_test)
@@ -23,6 +30,9 @@ add_executable(kvaf_npu_target_channel_test npu_target_channel_test.cc)
 target_include_directories(kvaf_npu_target_channel_test PRIVATE ../runtime/src)
 target_link_libraries(kvaf_npu_target_channel_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_npu_target_channel COMMAND kvaf_npu_target_channel_test)
+add_test(NAME kvaf_dsa_keys_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")
 
 add_executable(kvaf_batch_get_schedule_test batch_get_schedule_test.cc)
 target_include_directories(kvaf_batch_get_schedule_test PRIVATE
@@ -46,6 +56,9 @@ add_test(NAME kvaf_batch_get_inflight_config_python
 add_test(NAME kvaf_batch_get_miss_sweep_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_miss_sweep.py")
+add_test(NAME kvaf_batch_get_jetty_profile_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_jetty_profile.py")
 
 add_test(
   NAME kvaf_npu_eid_parser_python
