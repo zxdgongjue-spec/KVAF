@@ -92,13 +92,13 @@ class AlignedScatterTests(unittest.TestCase):
         self.assertEqual(args.table_capacity * 128 * 4096, 670014898176)
 
     def test_scalar_axes_and_environment_round_trip(self):
-        args = self.parse("--token-bytes", "656", "--miss-count", "1024", "--aiv-cores", "4", "--simt-build", "0", "--pipeline", "0")
+        args = self.parse("--token-bytes", "656", "--miss-count", "1024", "--aiv-cores", "4", "--pipeline", "0")
         self.assertEqual(len(perf.cases(args)), 1)
         case = perf.cases(args)[0]
         case.json, case.csv = Path("case.json"), Path("case.csv")
         child = self.parse(*perf.case_command(case)[4:])
         for key in ("token_bytes", "miss_count", "aiv_cores", "table_capacity",
-                    "warmup", "kernel_profile", "host_profile", "fused_build", "double_buffer", "completion_mode", "simt_build", "pipeline"):
+                    "warmup", "kernel_profile", "host_profile", "completion_mode", "pipeline"):
             self.assertEqual(getattr(child, key), getattr(case, key))
         with patch.dict(os.environ, {"KVAF_BATCH_GET_PERF_TOKEN_BYTES": "256",
                                     "KVAF_BATCH_GET_PERF_MISS_COUNT": "64",

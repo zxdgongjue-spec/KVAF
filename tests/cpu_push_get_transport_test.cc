@@ -20,8 +20,6 @@ struct Posted {
 std::vector<Posted> posted;
 std::uint64_t done_address{};
 bool fail_cq{};
-std::uint64_t fail_read_context{};
-std::uint32_t fail_pending_write{}, pending_write_count{};
 std::uint32_t post_calls{};
 std::vector<std::uint32_t> post_queues;
 const kvaf::urma::Sge* later_queue_source{};
@@ -59,28 +57,12 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
     auto* first = pending[q].front(); pending[q].pop_front();
     std::vector<urma_jfs_wr_t*> execution;
     for (auto* wr = first; wr; wr = wr->next) execution.push_back(wr);
-    // Exercise independent payload placement in a different order, while
-    // retaining the strong ready/tail fences that publish completion.
-    for (std::size_t i = 0; i < execution.size();) {
-      const auto independent = [](const urma_jfs_wr_t* wr) {
-        return wr->opcode == URMA_OPC_WRITE && !wr->flag.bs.comp_order &&
-               wr->flag.bs.place_order == URMA_RELAX_ORDER;
-      };
-      if (!independent(execution[i])) { ++i; continue; }
-      auto end = i + 1;
-      while (end < execution.size() && independent(execution[end])) ++end;
-      std::reverse(execution.begin() + i, execution.begin() + end);
-      i = end;
-    }
     for (auto* wr : execution) {
       const auto& dst = wr->rw.dst.sge[0];
-      bool fail_this_pending_write = false;
       if (wr->opcode == URMA_OPC_WRITE && dst.addr == done_address) {
         assert(dst.len == 8 && wr->flag.bs.place_order == URMA_STRONG_ORDER);
         // Whole-batch done must never be posted before other Jettys drain.
         for (const auto& queue : pending) assert(queue.empty());
-        if (*reinterpret_cast<const std::uint64_t*>(wr->rw.src.sge[0].addr) == 0)
-          fail_this_pending_write = ++pending_write_count == fail_pending_write;
       }
       const auto workspace = done_address - 128;
       const auto& request = *reinterpret_cast<const Request*>(workspace);
@@ -114,9 +96,7 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
         assert(!completed);
         cr[0] = {};
         cr[0].user_ctx = wr->user_ctx;
-        cr[0].status = (wr->opcode == URMA_OPC_READ && fail_read_context == wr->user_ctx) ||
-            fail_this_pending_write
-            ? URMA_CR_ACK_TIMEOUT_ERR : fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
+        cr[0].status = fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
         completed = 1;
       }
     }
@@ -126,78 +106,13 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
 
 namespace kvaf::cpu_push {
 struct TransportTest {
-  static void IdleProbe(std::uint64_t failed_read, bool idle = true,
-                        std::uint32_t failed_write = 0, bool diagnostic = true) {
-    Transport t;
-    assert(MakeLayout(656, 4, &t.layout_));
-    t.workers_ = 4; t.token_bytes_ = 656; t.max_sge_ = 13; t.max_bytes_ = 65536;
-    void* control = nullptr;
-    assert(!posix_memalign(&control, 64, t.layout_.staging));
-    t.memory_ = static_cast<std::uint8_t*>(control);
-    std::memset(control, 0, t.layout_.staging);
-    std::vector<std::uint8_t> hbm(t.layout_.staging);
-    t.hbm_base_ = Address(hbm.data()); done_address = t.hbm_base_ + 128;
-    constexpr std::uint64_t untouched_done = 0x12345678;
-    *reinterpret_cast<std::uint64_t*>(hbm.data() + 128) = untouched_done;
-    if (!idle) reinterpret_cast<Word*>(hbm.data() + 64)->value = 7;
-    for (std::size_t q = 0; q < kJettyCount; ++q) {
-      assert(pending[q].empty());
-      t.queues_[q].channel.local_jetty = &jettys[q];
-      t.queues_[q].channel.local_jfc = &cqs[q];
-    }
-    t.PrepareCompletions();
-    posted.clear(); fail_read_context = failed_read;
-    fail_pending_write = failed_write; pending_write_count = 0;
-    const auto status = t.ProbeIdleLink(diagnostic);
-    assert(status.ok() == (!failed_read && !failed_write && idle));
-    if (!diagnostic) {
-      assert(posted.size() == 1 && t.queues_[0].sequence == 1);
-      assert(*reinterpret_cast<const std::uint64_t*>(hbm.data() + 128) == untouched_done);
-      if (failed_read || !idle) {
-        assert(status.message().find("stage=basic round=1/1 phase=read_notify") != std::string::npos);
-        assert(t.queues_[0].poisoned == bool(failed_read));
-      }
-    } else if (failed_read) {
-      const auto round = failed_read <= 3 ? failed_read : failed_read - 3;
-      assert(status.message().find(failed_read <= 3 ? "stage=read_only" : "stage=mixed") != std::string::npos);
-      assert(status.message().find("round=" + std::to_string(round) + "/3") != std::string::npos);
-      assert(status.message().find("phase=read_notify") != std::string::npos);
-      assert(status.message().find("status=9 status_name=ACK_TIMEOUT") != std::string::npos);
-      // Failed reads never lead to another WRITE or a published start success.
-      assert(posted.size() == (failed_read <= 3 ? failed_read : failed_read * 2 - 4));
-      assert(t.queues_[0].poisoned);
-    } else if (failed_write) {
-      assert(status.message().find("stage=mixed round=" + std::to_string(failed_write) + "/3") != std::string::npos);
-      assert(status.message().find("phase=write_pending") != std::string::npos);
-      assert(status.message().find("status=9 status_name=ACK_TIMEOUT") != std::string::npos);
-      // A failed pending WRITE must not be followed by another READ.
-      assert(posted.size() == 3 + failed_write * 2 && t.queues_[0].poisoned);
-    } else if (!idle) {
-      assert(posted.size() == 1 && status.message().find("target is not idle") != std::string::npos);
-    } else {
-      assert(posted.size() == 9 && t.queues_[0].sequence == 6);
-      assert(*reinterpret_cast<const std::uint64_t*>(hbm.data() + 128) == 0);
-    }
-    for (std::size_t i = 0; i < posted.size(); ++i)
-      assert(posted[i].opcode == (i < 3 || (i - 3) % 2 == 0 ? URMA_OPC_READ : URMA_OPC_WRITE));
-    // No WRITE can contaminate the sustained READ stage, and both stages
-    // retain the production completion/placement ordering.
-    for (const auto& wr : posted) assert(wr.comp_order && wr.signaled && wr.order == URMA_STRONG_ORDER);
-    fail_read_context = 0;
-    fail_pending_write = 0; pending_write_count = 0;
-    for (auto& q : t.queues_) {
-      q.channel.local_jetty = nullptr; q.channel.local_jfc = nullptr;
-    }
-    assert(t.Shutdown().ok());
-  }
   static void Run(std::uint32_t token, std::uint32_t maximum = 1024,
                   std::uint32_t max_sge = 16, std::uint32_t post_batch = 128,
-                  std::uint32_t message_bytes = 65536, bool tail_comp_order = false) {
+                  std::uint32_t message_bytes = 65536) {
     Transport t;
     assert(MakeLayout(token, 4, &t.layout_));
     t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = max_sge; t.max_bytes_ = message_bytes;
     t.post_batch_wrs_ = post_batch;
-    t.tail_payload_comp_order_ = tail_comp_order;
     // Retain marker space to exercise legacy mode as well as done-only mode.
     void* memory = nullptr;
     assert(!posix_memalign(&memory, 64, t.layout_.staging + 32768));
@@ -303,7 +218,7 @@ struct TransportTest {
         if (wr.destination < t.hbm_base_ + t.layout_.descriptor) ++markers;
         else ++data;
         tails += wr.signaled;
-        assert(wr.comp_order == (!tail_comp_order || wr.order == URMA_STRONG_ORDER));
+        assert(wr.comp_order == 1);
         if (wr.signaled) assert(wr.order == URMA_STRONG_ORDER && wr.comp_order);
       }
       if (whole) assert(markers == 0);
@@ -351,7 +266,7 @@ struct TransportTest {
         assert(result->count == options.iterations && t.tracker_.Empty());
         for (const auto& wr : posted) {
           assert(wr.destination != done_address);
-          assert(wr.comp_order == (!tail_comp_order || wr.order == URMA_STRONG_ORDER));
+          assert(wr.comp_order == 1);
         }
         for (std::uint32_t i = 0; i < result->count; ++i)
           assert(result->samples[i].tail_cqes == queues && result->samples[i].comm_ns >=
@@ -363,61 +278,6 @@ struct TransportTest {
           std::memcpy(&actual, hbm.data() + t.layout_.staging + offset, 8);
           assert(actual == WriteBenchmarkMix(options.seed + source_offset / 8));
         }
-      }
-      // Fixed traffic with independent source/destination working sets. Target
-      // wraps only across drained flights; count every transmitted byte and
-      // validate the final writer, including guard bytes after the target ring.
-      const std::array<std::array<std::uint64_t, 3>, 6> window_cases{{
-          {0, 0, 0}, {4096, 0, 0}, {0, 0, 4096}, {4096, 0, 4096},
-          {0, 4096, 4096}, {4096, 4096, 4096}}};
-      for (const auto& windows : window_cases) {
-        WriteBenchmarkOptions options;
-        options.payload_bytes = 65536; options.source_bytes = 131072; options.seed = 97;
-        options.message_bytes = 1024; options.fragment_bytes = 656; options.queues = 4;
-        options.post_batch_wrs = 2; options.warmup = 1; options.iterations = 3;
-        WriteBenchmarkDiagnosticOptions diagnostic;
-        diagnostic.source_window_bytes = windows[0]; diagnostic.target_window_bytes = windows[1];
-        diagnostic.flight_bytes = windows[2];
-        auto result = std::make_unique<WriteBenchmarkResult>();
-        auto records = std::make_unique<WriteBenchmarkDiagnostics>();
-        posted.clear();
-        std::memset(hbm.data() + t.layout_.staging, 0xad, hbm.size() - t.layout_.staging);
-        assert(t.BenchmarkWrite(source.data(), Address(source.data()), source.size(), options, result.get(),
-                                &diagnostic, records.get()).ok());
-        std::uint64_t wire_bytes = 0;
-        for (const auto& wr : posted) wire_bytes += wr.bytes;
-        assert(wire_bytes == options.payload_bytes * (options.warmup + options.iterations));
-        assert(result->count == options.iterations && t.tracker_.Empty());
-        assert(std::strstr(records->environment, "source_pages_sampled"));
-        const auto source_slice = records->source_window_bytes / options.queues;
-        const auto target_slice = records->target_window_bytes / options.queues;
-        const auto logical_slice = options.payload_bytes / options.queues;
-        for (std::uint32_t i = 0; i < result->count; ++i) {
-          assert(result->samples[i].tail_cqes == options.queues * result->waves);
-          assert(records->samples[i].thread_cpu_ns > 0);
-        }
-        for (std::uint32_t q = 0; q < options.queues; ++q)
-          for (std::uint64_t offset = 0; offset < target_slice; offset += 8) {
-            const auto last = offset + (logical_slice - 1 - offset) / target_slice * target_slice;
-            const auto src = q * source_slice + last % source_slice;
-            std::uint64_t actual;
-            std::memcpy(&actual, hbm.data() + t.layout_.staging + q * target_slice + offset, 8);
-            assert(actual == WriteBenchmarkMix(options.seed + src / 8));
-          }
-        for (auto i = t.layout_.staging + records->target_window_bytes; i < hbm.size(); ++i)
-          assert(hbm[i] == 0xad);
-      }
-      {
-        WriteBenchmarkOptions options;
-        options.payload_bytes = 65536; options.source_bytes = 131072; options.message_bytes = 4096;
-        WriteBenchmarkDiagnosticOptions invalid;
-        invalid.target_window_bytes = 4096; // No drained flights: cannot safely overwrite.
-        auto result = std::make_unique<WriteBenchmarkResult>();
-        auto records = std::make_unique<WriteBenchmarkDiagnostics>();
-        const auto before = post_calls;
-        assert(!t.BenchmarkWrite(source.data(), Address(source.data()), source.size(), options, result.get(),
-                                 &invalid, records.get()).ok());
-        assert(post_calls == before);
       }
       t.context_ = nullptr;
     }
@@ -444,16 +304,6 @@ struct TransportTest {
 }
 
 int main() {
-  // Default startup must not issue the old synthetic pending WRITE or repeat
-  // READs. Failure still rejects the candidate, rather than returning success.
-  kvaf::cpu_push::TransportTest::IdleProbe(0, true, 0, false);
-  kvaf::cpu_push::TransportTest::IdleProbe(1, true, 0, false);
-  kvaf::cpu_push::TransportTest::IdleProbe(0, false, 0, false);
-  for (auto failed_read : {0U, 1U, 2U, 3U, 4U, 5U, 6U})
-    kvaf::cpu_push::TransportTest::IdleProbe(failed_read);
-  for (auto failed_write : {1U, 2U, 3U})
-    kvaf::cpu_push::TransportTest::IdleProbe(0, true, failed_write);
-  kvaf::cpu_push::TransportTest::IdleProbe(0, false);
   for (auto token : {13U, 656U, 4096U, 65535U}) kvaf::cpu_push::TransportTest::Run(token);
   // Cross SQ-credit/wave and segmented control-READ boundaries.
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests);
@@ -465,10 +315,5 @@ int main() {
   for (auto batch : {32U, 128U, 256U})
     for (auto token : {656U, 1024U})
       kvaf::cpu_push::TransportTest::Run(token, 8192, 13, batch);
-  // Tail-only completion ordering keeps all strong ready/done fences and CQs.
-  for (auto token : {13U, 656U, 4096U, 65535U})
-    kvaf::cpu_push::TransportTest::Run(token, 1024, 16, 128, 65536, true);
-  kvaf::cpu_push::TransportTest::Run(656, 8192, 13, 128, 65536, true);
-  kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests, 16, 128, 65536, true);
   std::cout << "PASS: CPU push coalesced reads, done-only writes and completion ordering\n";
 }

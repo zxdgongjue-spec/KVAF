@@ -98,10 +98,8 @@ int main(int argc, char** argv) {
   Check(KvafGatherBatchGetLaunch(&g, reinterpret_cast<void*>(1)) == 0);
   Check((launched == std::vector<std::string>{kGather, kScatter, kDirect, kGather}));
   for (uint32_t options : {kvaf::kScatterOptionsV1,
-                           kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild,
-                           kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterSimtBuild,
-                           kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterSimtBuild |
-                               kvaf::kScatterDoubleBuffer | kvaf::kScatterTrustedInputs}) {
+                           kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline,
+                           kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline | kvaf::kScatterTrustedInputs}) {
     s.reserved = options;
     Check(KvafScatterBatchGetLaunch(&s, reinterpret_cast<void*>(1)) == 0);
   }

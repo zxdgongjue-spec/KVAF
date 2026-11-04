@@ -20,17 +20,13 @@ class Transport {
                     const peer::OpenCpuPushGetRequest&, urma::GetTpList,
                     urma::ImportJettyEx, std::uint32_t psn, peer::OpenCpuPushGetResponse*);
   Status ReadRequest(std::uint64_t* sequence);
-  // Basic startup uses one READ for candidate selection, without a WRITE.
-  // The multi-round READ/WRITE diagnostic is explicit and off by default.
-  Status ProbeIdleLink(bool diagnostic = false);
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch();
   Status Complete(std::uint64_t sequence, Result result);
   void PrintProfile() const;
   Status BenchmarkWrite(std::uint8_t* source_memory, std::uint64_t source_base,
                         std::uint64_t source_capacity, const WriteBenchmarkOptions&,
-                        WriteBenchmarkResult*, const WriteBenchmarkDiagnosticOptions* = nullptr,
-                        WriteBenchmarkDiagnostics* = nullptr);
+                        WriteBenchmarkResult*);
   Status Shutdown();
   const Request& request() const { return *reinterpret_cast<const Request*>(memory_); }
   const Layout& layout() const { return layout_; }
@@ -76,7 +72,7 @@ class Transport {
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
-  void SealPrepared(PreparedWrite&, bool payload = false);
+  void SealPrepared(PreparedWrite&);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
                       std::uint64_t* first_post_ns = nullptr);
@@ -104,7 +100,6 @@ class Transport {
   std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t post_batch_wrs_{128};
-  bool tail_payload_comp_order_{};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push

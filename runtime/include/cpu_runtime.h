@@ -12,7 +12,6 @@ enum class CpuGatherMode { kAdaptive, kActive, kPassive };
 enum class CpuMemoryPageMode {
   kDefault,
   kTransparentHugePage,
-  kHugeTlb,
 };
 
 struct CpuRuntimeOptions {
@@ -23,8 +22,6 @@ struct CpuRuntimeOptions {
   bool gather_affinity{true};
   CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
-  // Zero selects Linux's default HugeTLB page size. Used only with kHugeTlb.
-  std::uint32_t hugetlb_page_kb{0U};
 };
 
 // CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;

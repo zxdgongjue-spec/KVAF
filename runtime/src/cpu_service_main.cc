@@ -11,12 +11,11 @@ namespace {
 
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
-               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off] [--memory-page-mode default|thp|hugetlb] [--hugetlb-page-kb N]\n"
+               "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off] [--memory-page-mode default|thp]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to auto (up to 32), "
                "mode to adaptive (one polling coordinator, parked helpers), affinity to on. "
-               "Default memory page mode is thp. HugeTLB uses the system default page size unless --hugetlb-page-kb is given, with no fallback. "
-               "The service requires only liburma and /dev/uburma.\n",
+               "Default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
                program);
 }
 
@@ -40,10 +39,6 @@ bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode)
     *mode = kvaf::CpuMemoryPageMode::kTransparentHugePage;
     return true;
   }
-  if (text == "hugetlb") {
-    *mode = kvaf::CpuMemoryPageMode::kHugeTlb;
-    return true;
-  }
   return false;
 }
 
@@ -60,8 +55,7 @@ int main(int argc, char** argv) {
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
          argument == "--eid-index" || argument == "--gather-threads" ||
-         argument == "--gather-mode" || argument == "--gather-affinity" || argument == "--memory-page-mode" ||
-         argument == "--hugetlb-page-kb") &&
+         argument == "--gather-mode" || argument == "--gather-affinity" || argument == "--memory-page-mode") &&
         index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
@@ -110,14 +104,7 @@ int main(int argc, char** argv) {
 
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
-        std::fprintf(stderr, "invalid --memory-page-mode; expected default, thp or hugetlb\n");
-        return 2;
-      }
-    } else if (argument == "--hugetlb-page-kb") {
-      if (!ParseUnsigned(argv[++index], std::numeric_limits<std::uint32_t>::max(),
-                         &cpu_options.hugetlb_page_kb) || !cpu_options.hugetlb_page_kb ||
-          (cpu_options.hugetlb_page_kb & (cpu_options.hugetlb_page_kb - 1))) {
-        std::fprintf(stderr, "invalid --hugetlb-page-kb; expected a positive power-of-two KiB size\n");
+        std::fprintf(stderr, "invalid --memory-page-mode; expected default or thp\n");
         return 2;
       }
     } else {

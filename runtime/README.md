@@ -44,7 +44,7 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持三种页分配模式；未指定时默认使用 `thp`：
+CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -55,26 +55,12 @@ CPU DDR region 支持三种页分配模式；未指定时默认使用 `thp`：
 # 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
-
-# 显式 HugeTLB：从预留池分配，失败直接报错，不回退普通页。
-# 未指定页大小时读取 /proc/meminfo 的 Hugepagesize，不假定为 2 MiB。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb
-
-# 只有系统支持并预留了该页大小时才使用，例如 2048 KiB。
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb --hugetlb-page-kb 2048
 ```
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
-`page_mode`、`allocation_bytes`、`hugetlb_page_bytes`。HugeTLB 的映射/释放长度向大页取整，
-但对外 region 长度和 URMA 注册长度保持请求值；注册前主动触页，拆除 URMA 后按映射长度
-`munmap`。默认 THP 模式还应通过源区 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
-合并量；HugeTLB 看 `Private_Hugetlb`/`Shared_Hugetlb` 和 `VmFlags: ... ht ...`，
-不能用 `AnonHugePages=0` 判定 HugeTLB 未生效。Linux 使用大页并不保证 UDMA/IOMMU
-一定保留相同的页表粒度。服务不会自动修改系统预留池；对照步骤见
-[CPU WRITE 测试](../docs/cpu_urma_write_bandwidth.md#cpu-源内存-thphugetlb-对照)。
+`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常

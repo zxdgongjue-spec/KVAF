@@ -28,14 +28,8 @@ using namespace kvaf_scatter;
 using kvaf_gather::kRead;
 using kvaf_gather::kWrite;
 using kvaf_gather::kErrorBit;
-constexpr std::array<uint32_t, 4> kScatterOptions{
-    kvaf::kScatterOptionsV1,
-    kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild,
-    kvaf::kScatterOptionsV1 | kvaf::kScatterDoubleBuffer,
-    kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterDoubleBuffer};
-constexpr std::array<uint32_t, 6> kCheckedScatterOptions{
-    kScatterOptions[0], kScatterOptions[1], kScatterOptions[2], kScatterOptions[3],
-    kScatterOptions[1] | kvaf::kScatterSimtBuild, kScatterOptions[3] | kvaf::kScatterSimtBuild};
+constexpr std::array<uint32_t, 1> kScatterOptions{kvaf::kScatterOptionsV1};
+constexpr auto kCheckedScatterOptions = kScatterOptions;
 // Test fixture only; production launch ABIs are independent.
 struct ModelArgs {
   KvafExecuteBatchGetKernelArgs request;
@@ -191,7 +185,7 @@ struct Fixture {
     if (timeout || ++push_polls < 4) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
     assert(request->count == uint32_t(active));
-    if (kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterFusedBuild)) {
+    {
       const auto base = args.workspace + args.workspace_bytes - uint64_t(workers + 1) * 64;
       for (uint32_t core = 0; core < workers; ++core)
         assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
@@ -358,10 +352,7 @@ struct Fixture {
       assert((status[core].result == KVAF_SEQ_OK) == success);
       assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
       if (args.mode == KVAF_SEQ_SCATTER) {
-        const auto payload_ub = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterDoubleBuffer) ?
-            kTileBufferBytes : kTileBytes;
-        const auto used_ub = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterFusedBuild) ?
-            std::max(payload_ub, kBuildBufferBytes) : payload_ub;
+        const auto used_ub = kTileBufferBytes;
         assert(std::all_of(aiv_model::ub + used_ub, aiv_model::ub + sizeof(aiv_model::ub),
                            [](uint8_t byte) { return byte == 0xe9; }));
       }
@@ -447,7 +438,6 @@ int main() {
       for (uint32_t bytes : {31U, 656U, 4096U, 32768U, 32769U}) {
         Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
         f.args.reserved = options;
-        const bool double_buffer = kvaf::ScatterOptionEnabled(options, kvaf::kScatterDoubleBuffer);
         for (uint32_t count : {0U, 1U, 7U, 31U, 32U, 33U, 63U, 64U, 65U, 129U}) {
           f.Next(count);
           std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
@@ -467,23 +457,23 @@ int main() {
                   uint64_t(count) * core / workers;
               const auto core_tiles = (rows + per_tile - 1) / per_tile;
               tiles += core_tiles;
-              if (double_buffer && core_tiles) overlapping_inputs += core_tiles - 1;
+              if (core_tiles) overlapping_inputs += core_tiles - 1;
             }
-            uint64_t builders = 0, build_tiles = 0;
-            if (kvaf::ScatterOptionEnabled(options, kvaf::kScatterFusedBuild)) {
+            uint64_t build_tiles = 0;
+            {
               const auto groups = (count + 7U) / 8U;
               for (uint32_t core = 0; core < workers; ++core) {
                 const auto begin = uint64_t(groups) * core / workers * 8;
                 const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-                if (end > begin) { ++builders; build_tiles += (end - begin + kBuildTileRows - 1) / kBuildTileRows; }
+                if (end > begin) build_tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
               }
             }
-            assert(aiv_model::metadata_reads - metadata_reads == builders * 2 + build_tiles * 3);
+            assert(aiv_model::metadata_reads == metadata_reads);
             assert(aiv_model::descriptor_writes - descriptor_writes == build_tiles);
-            assert(aiv_model::mte2_copies - reads == tiles + builders * 2 + build_tiles * 3);
+            assert(aiv_model::mte2_copies - reads == tiles);
             assert(aiv_model::mte3_copies - writes == count + build_tiles);
             assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == tiles + build_tiles);
-            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - input_waits == build_tiles);
+            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] == input_waits);
             assert(aiv_model::overlapped_mte2_copies - overlapped == overlapping_inputs);
           }
           assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
@@ -518,7 +508,7 @@ int main() {
         assert(*reinterpret_cast<const uint64_t*>(f.workspace.data() + 64) != f.args.sequence);
         for (const auto& status : f.status) assert(status.result == KVAF_SEQ_INVALID);
       }
-  // UB tile boundaries and the table cache/fallback boundary, through full
+  // UB tile boundaries and different table sizes, through full
   // BatchGet including CPU service and changing metadata at the same addresses.
   for (uint32_t capacity : {1024U, 4096U, 4097U})
     for (uint32_t workers : {1U, 4U, 8U}) {
@@ -561,10 +551,9 @@ int main() {
     Fixture legacy(65, 656, 1, KVAF_SEQ_SCATTER, 6);
     legacy.args.reserved = 0; legacy.Run();
   }
-  // Both builders handle reference-sized sparse tables and changing table
+  // The SIMT builder handles reference-sized sparse tables and changing table
   // contents at the same address, without scalar table DCCI.
-  for (const bool simt : {false, true})
-    for (const bool trusted : {false, true})
+  for (const bool trusted : {false, true})
     for (uint32_t workers : {1U, 4U, 8U}) {
       Fixture f(1024, 31, workers, KVAF_SEQ_SCATTER, 6);
       constexpr uint32_t table_capacity = 1277952;
@@ -574,7 +563,6 @@ int main() {
       f.args.request.address_table = Address(f.addresses.data());
       f.args.request.valid_table = Address(f.valid.data());
       if (trusted) f.args.reserved |= kvaf::kScatterTrustedInputs;
-      if (simt) f.args.reserved |= kvaf::kScatterSimtBuild;
       for (uint32_t i = 0; i < f.count; ++i)
         f.indices[i] = (i * 1237U + 37U) % table_capacity;
       for (uint32_t count : {0U, 1U, 7U, 255U, 256U, 257U, 1024U, 19U}) {
@@ -592,11 +580,11 @@ int main() {
         for (uint32_t core = 0; core < workers; ++core) {
           const auto begin = uint64_t(groups) * core / workers * 8;
           const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-          const auto tile_rows = simt ? kSimtBuildRows : kBuildTileRows;
+          const auto tile_rows = kSimtBuildRows;
           tiles += (end - begin + tile_rows - 1) / tile_rows;
         }
-        assert(aiv_model::metadata_reads - reads == (simt ? 0 : count * (trusted ? 1 : 2) + tiles * (trusted ? 2 : 3)));
-        assert(aiv_model::simt_metadata_reads - simt_reads == (simt ? count * (trusted ? 3 : 5) : 0));
+        assert(aiv_model::metadata_reads == reads);
+        assert(aiv_model::simt_metadata_reads - simt_reads == count * (trusted ? 3 : 5));
       }
       if (!trusted) {
         f.Next(1);
@@ -611,12 +599,10 @@ int main() {
   // SIMT tile boundaries through the complete CPU-push/scatter flow, including
   // 8192 requests on four cores (one vector call and one descriptor DMA/core).
   for (const bool trusted : {false, true})
-    for (const bool double_buffer : {false, true})
       for (uint32_t workers : {1U, 4U, 8U}) {
         Fixture f(8193, 31, workers, KVAF_SEQ_SCATTER, 6);
-        f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterSimtBuild |
-            (trusted ? kvaf::kScatterTrustedInputs : 0U) |
-            (double_buffer ? kvaf::kScatterDoubleBuffer : 0U);
+        f.args.reserved = kvaf::kScatterOptionsV1 |
+            (trusted ? kvaf::kScatterTrustedInputs : 0U);
         for (uint32_t count : {0U, 1U, 255U, 256U, 4095U, 4096U, 4097U, 8192U, 8193U, 7U}) {
           f.Next(count);
           const auto calls = aiv_model::simt_calls;
@@ -634,7 +620,7 @@ int main() {
         }
       }
   // Trusted callers skip row/valid checks in the builder. Exercise the real
-  // launch with changing addresses/prefixes and both cached/fallback tables;
+  // launch with changing addresses/prefixes and different table sizes;
   // output guards, done, all-core status and DMA completion remain required.
   for (const auto options : kScatterOptions)
     for (uint32_t workers : {1U, 4U, 8U})
@@ -645,24 +631,11 @@ int main() {
           f.Next(count);
           const auto reads = aiv_model::metadata_reads;
           f.Run();
-          if (kvaf::ScatterOptionEnabled(options, kvaf::kScatterFusedBuild)) {
-            const auto groups = (count + 7U) / 8U;
-            uint64_t expected_reads = 0;
-            for (uint32_t core = 0; core < workers; ++core) {
-              const auto begin = uint64_t(groups) * core / workers * 8;
-              const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-              if (begin < end) expected_reads += (capacity <= kCachedTableEntries ? 1 : 0) +
-                  2 * ((end - begin + kBuildTileRows - 1) / kBuildTileRows);
-            }
-            if (capacity > kCachedTableEntries) expected_reads += count;
-            assert(aiv_model::metadata_reads - reads == expected_reads);
-          }
+          assert(aiv_model::metadata_reads == reads);
         }
       }
-  for (const auto options : {0U, kScatterOptions[0], kScatterOptions[1],
-                             kScatterOptions[2], kScatterOptions[3],
-                             kScatterOptions[3] | kvaf::kScatterSimtBuild,
-                             kScatterOptions[3] | kvaf::kScatterSimtBuild | kvaf::kScatterPipeline})
+  for (const auto options : {0U, kvaf::kScatterOptionsV1,
+                             kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline})
     for (uint32_t workers : {1U, 3U, 8U}) {
       Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
       f.status.resize(workers * 4); // 64-byte statuses + 192-byte V2 records.
@@ -696,12 +669,11 @@ int main() {
   // copy only fully published chunks and still wait for final done afterwards.
   for (uint32_t bytes : {31U, 656U, 4096U})
     for (uint32_t workers : {1U, 3U, 8U})
-      for (bool double_buffer : {false, true}) {
+      {
         Fixture f(8193, bytes, workers, KVAF_SEQ_SCATTER, 6);
         f.args.max_polls = 1000000;
-        f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild |
-            kvaf::kScatterSimtBuild | kvaf::kScatterPipeline | kvaf::kScatterTrustedInputs |
-            (double_buffer ? kvaf::kScatterDoubleBuffer : 0U);
+        f.args.reserved = kvaf::kScatterOptionsV1 |
+            kvaf::kScatterPipeline | kvaf::kScatterTrustedInputs;
         f.hold_done_until_scatter = true;
         for (uint32_t count : {8193U, 1U, 19U, 4097U, 0U, 8192U}) {
           f.Next(count); f.Run();
@@ -728,11 +700,10 @@ int main() {
   // A late queue cannot hold back a ready queue. The fake CPU withholds the
   // next Jetty until this one's shard has been read; whole-chunk or fixed-q0
   // consumers time out. MTE3 must stay live across Ready boundaries as well.
-  for (bool late_first : {false, true}) for (bool double_buffer : {false, true}) {
+  for (bool late_first : {false, true}) {
     Fixture f(1024, 656, 1, KVAF_SEQ_SCATTER, 6);
     f.args.max_polls = 10000;
-    f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterFusedBuild | kvaf::kScatterPipeline |
-        (double_buffer ? kvaf::kScatterDoubleBuffer : 0U);
+    f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline;
     f.hold_next_jetty = f.hold_done_until_scatter = true;
     f.late_first_jetty = late_first;
     f.Run();

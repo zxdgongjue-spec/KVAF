@@ -10,7 +10,6 @@
 #include <cstring>
 #include <exception>
 #include <sstream>
-#include <thread>
 
 namespace kvaf::cpu_push {
 namespace {
@@ -31,13 +30,6 @@ const char* CqStatusName(urma_cr_status_t status) {
     case URMA_CR_RNR_RETRY_CNT_EXC_ERR: return "RNR_RETRY_EXCEEDED";
     default: return "OTHER";
   }
-}
-void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
-  if (queue == UINT32_MAX)
-    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s\n", stage);
-  else
-    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s queue=%u\n", stage, queue);
-  errno = 0;
 }
 std::string CqDetails(std::size_t queue, const urma_cr_t& cr,
                       const cpu_runtime_detail::UrmaChannel& channel) {
@@ -78,11 +70,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
   context_ = context;
-  if (const auto* value = std::getenv("KVAF_CPU_PUSH_PAYLOAD_COMP_ORDER")) {
-    if (std::strcmp(value, "all") != 0 && std::strcmp(value, "tail") != 0)
-      return Status::InvalidArgument("KVAF_CPU_PUSH_PAYLOAD_COMP_ORDER must be all or tail");
-    tail_payload_comp_order_ = std::strcmp(value, "tail") == 0;
-  }
   if (const auto* value = std::getenv("KVAF_CPU_PUSH_POST_BATCH_WRS")) {
     char* end = nullptr;
     errno = 0;
@@ -96,7 +83,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
-  Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
     return Error("query device");
@@ -104,9 +90,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "post_batch_wrs=%u optimized=%u payload_comp_order=%s source_refresh=%s\n",
+               "post_batch_wrs=%u optimized=%u source_refresh=%s\n",
                max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized,
-               tail_payload_comp_order_ ? "tail" : "all",
                std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map");
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
@@ -119,18 +104,15 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   flag.bs.mapping = URMA_SEG_NOMAP;
   urma_token_t token{};
   token.token = setup.token_value;
-  Stage("import_hbm");
   remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
   if (!remote_) return Error("import HBM segment");
   void* buffer = nullptr;
   // Each in-flight ready WRITE has its own immutable registered source word.
   const auto marker_bytes = workers_ * kMaxChunks * kJettyCount * sizeof(std::uint64_t);
   const auto bytes = (layout_.staging + marker_bytes + 4095) & ~std::uint64_t{4095};
-  Stage("allocate_control");
   if (posix_memalign(&buffer, 4096, bytes)) return Error("allocate control buffer");
   memory_ = static_cast<std::uint8_t*>(buffer);
   std::memset(memory_, 0, bytes);
-  Stage("allocate_control_token");
   control_token_ = urma_alloc_token_id(context_);
   if (!control_token_) return Error("allocate control token");
   urma_seg_cfg_t cfg{};
@@ -144,11 +126,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   cfg.flag.bs.access = 1U;  // LOCAL_WRITE in the deployed public UMDK ABI.
   cfg.flag.bs.non_pin = 0;
   cfg.flag.bs.token_id_valid = 1;
-  Stage("register_control");
   control_ = urma_register_seg(context_, &cfg);
   if (!control_) return Error("register control buffer");
   std::uint64_t cpu_tp = 0;
-  Stage("query_ctp");
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
   response->cpu_tp = cpu_tp;
   response->cpu_psn = psn;
@@ -157,7 +137,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       return Error("invalid NPU Jetty key");
     auto& queue = queues_[q];
     auto& c = queue.channel;
-    Stage("create_queues", q);
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
         {16384, kJettyDepth, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
     if (error) return Error(error);
@@ -165,7 +144,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     queue.local.reserve(1);
     queue.remote.reserve(1);
     queue.wrs.reserve(1);
-    Stage("import_jetty", q);
     c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
@@ -181,13 +159,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                 sizeof(urma_transport_mode_t));
   }
   PrepareCompletions();
-  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_LINK_CONFIG session=%llu cpu_tp=0x%llx npu_tp=0x%llx "
-               "cpu_initial_psn=0x%x npu_initial_psn=0x%x notify=0x%llx done=0x%llx\n",
-               static_cast<unsigned long long>(session_), static_cast<unsigned long long>(cpu_tp),
-               static_cast<unsigned long long>(setup.npu_tp), psn, setup.npu_psn,
-               static_cast<unsigned long long>(hbm_base_ + layout_.notify),
-               static_cast<unsigned long long>(hbm_base_ + layout_.done));
-  Stage("ready");
   return Status::OK();
 }
 
@@ -307,33 +278,6 @@ Status Transport::ReadRequest(std::uint64_t* sequence) {
   }
   return result;
 }
-Status Transport::ProbeIdleLink(bool diagnostic) {
-  // Candidate selection only needs one real READ. Extra READs and pending
-  // WRITEs change the idle control flow, so keep them in explicit diagnostics.
-  const unsigned rounds = diagnostic ? 3U : 1U;
-  for (const bool mixed : {false, true}) {
-    if (mixed && !diagnostic) break;
-    const std::string stage = !diagnostic ? "basic" : mixed ? "mixed" : "read_only";
-    for (unsigned round = 1; round <= rounds; ++round) {
-      const auto prefix = "startup link probe stage=" + stage + " round=" +
-                          std::to_string(round) + "/" + std::to_string(rounds);
-      std::uint64_t sequence = 0;
-      auto status = ReadRequest(&sequence);
-      if (!status.ok()) return Status::Error(status.code(), prefix + " phase=read_notify: " + status.message());
-      if (sequence != 0)
-        return Status::InvalidState(prefix + " phase=read_notify: target is not idle, sequence=" +
-                                    std::to_string(sequence));
-      if (mixed) {
-        status = Complete(0, Result::kPending);
-        if (!status.ok()) return Status::Error(status.code(), prefix + " phase=write_pending: " + status.message());
-      }
-    }
-    std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_LINK_PROBE_STAGE_READY session=%llu stage=%s "
-                 "reads=%u writes=%u\n", static_cast<unsigned long long>(session_),
-                 stage.c_str(), rounds, mixed ? rounds : 0U);
-  }
-  return Status::OK();
-}
 Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (profile_.enabled) {
     profile_ = {};
@@ -375,18 +319,13 @@ void Transport::AppendPrepared(PreparedQueue& q, std::uint32_t queue,
   wr.rw.dst.num_sge = 1;
   q.wrs.push_back(wr);
 }
-void Transport::SealPrepared(PreparedWrite& plan, bool payload) {
+void Transport::SealPrepared(PreparedWrite& plan) {
   for (std::uint32_t index = 0; index < kJettyCount; ++index) {
     auto& q = plan.queues[index];
     if (q.wrs.empty()) continue;
     std::size_t local = 0;
     for (std::size_t i = 0; i < q.wrs.size(); ++i) {
       auto& wr = q.wrs[i];
-      // Payload ranges do not overlap. RELAX writes may execute independently;
-      // a STRONG tail waits for preceding RELAX/STRONG writes before executing.
-      // Keep its completion ordering/CQE, and preserve all control/ready ordering.
-      wr.flag.bs.comp_order = !payload || !tail_payload_comp_order_ ||
-          wr.flag.bs.place_order == URMA_STRONG_ORDER || i + 1 == q.wrs.size();
       wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(q.local.data() + local);
       wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(q.remote.data() + i);
       local += wr.rw.src.num_sge;
@@ -465,7 +404,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     auto plan = std::make_unique<PreparedWrite>();
     for (std::uint32_t q = 0; q < kJettyCount; ++q)
       if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
-    SealPrepared(*plan, true);
+    SealPrepared(*plan);
     if (plan->fence_count) prepared_.push_back(std::move(plan));
   }
   prepared_count_ = count;
@@ -686,7 +625,6 @@ Status Transport::Shutdown() {
   descriptor_prefetch_count_ = 0;
   prepared_batch_done_only_ = false;
   post_batch_wrs_ = 128;
-  tail_payload_comp_order_ = false;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
   std::free(memory_); memory_ = nullptr;

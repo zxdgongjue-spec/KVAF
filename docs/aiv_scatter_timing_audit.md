@@ -1,5 +1,8 @@
 # AIV scatter BatchGet 计时审计与逐层耗时拆解
 
+> 历史实验记录：当前已固定SIMT融合清单构建和UB双缓冲，仅保留流水算法开关。
+> 下文旧对照开关不再支持；运行方式和计时口径见 [当前性能测试说明](aiv_scatter_performance.md)。
+
 审计日期：2026-10-31。代码基线：`aiv-scatter@7a499b4`。
 数据：三组各 100 条 `profiled` 样本，均为 4 个 AIV 核、1024 blocks、请求容量 8192。
 前两组为 4 tokens/block、有效 token 数 4096，token 分别为 656 B 和 4096 B；

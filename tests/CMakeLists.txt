@@ -1,16 +1,5 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(kvaf_cpu_source_memory_test cpu_source_memory_test.cc)
-  target_include_directories(kvaf_cpu_source_memory_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
-  target_link_libraries(kvaf_cpu_source_memory_test PRIVATE kvaf_runtime)
-  target_link_options(kvaf_cpu_source_memory_test PRIVATE
-    -Wl,--wrap=mmap -Wl,--wrap=munmap -Wl,--wrap=posix_memalign -Wl,--wrap=madvise)
-  target_compile_options(kvaf_cpu_source_memory_test PRIVATE
-    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
-  add_test(NAME kvaf_cpu_source_memory_test COMMAND kvaf_cpu_source_memory_test)
-endif()
-
 add_executable(kvaf_runtime_batch_get_contract_test runtime_batch_get_contract_test.cc)
 target_link_libraries(kvaf_runtime_batch_get_contract_test PRIVATE kvaf_runtime)
 target_compile_options(kvaf_runtime_batch_get_contract_test PRIVATE

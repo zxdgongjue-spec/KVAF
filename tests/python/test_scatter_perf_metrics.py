@@ -76,34 +76,21 @@ class ScatterPerfTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 list(random_byte_chunks(rng, size, chunk))
 
-    def test_runtime_switch_defaults_and_cli_precedence(self):
+    def test_pipeline_is_the_only_algorithm_switch(self):
         with patch.dict("os.environ", {}, clear=True):
             args = arguments([])
-            self.assertEqual((args.fused_build, args.double_buffer), (1, 1))
-            self.assertEqual(args.simt_build, 1)
             self.assertEqual(args.pipeline, 1)
-        with patch.dict("os.environ", {"KVAF_SCATTER_SIMT_BUILD": "0"}):
-            self.assertEqual(arguments([]).simt_build, 0)
-            self.assertEqual(arguments(["--simt-build", "1"]).simt_build, 1)
+            for name in ("fused_build", "double_buffer", "simt_build"):
+                self.assertFalse(hasattr(args, name))
         with patch.dict("os.environ", {"KVAF_SCATTER_PIPELINE": "0"}):
             self.assertEqual(arguments([]).pipeline, 0)
             self.assertEqual(arguments(["--pipeline", "1"]).pipeline, 1)
-        with patch.dict("os.environ", {"KVAF_SCATTER_FUSED_BUILD": "1",
-                                      "KVAF_SCATTER_DOUBLE_BUFFER": "1"}):
-            args = arguments([])
-            self.assertEqual((args.fused_build, args.double_buffer), (1, 1))
-            for fused in (0, 1):
-                for double in (0, 1):
-                    args = arguments(["--fused-build", str(fused), "--double-buffer", str(double)])
-                    self.assertEqual((args.fused_build, args.double_buffer), (fused, double))
-        with patch.dict("os.environ", {"KVAF_SCATTER_FUSED_BUILD": "0",
-                                      "KVAF_SCATTER_DOUBLE_BUFFER": "0"}):
-            args = arguments([])
-            self.assertEqual((args.fused_build, args.double_buffer), (0, 0))
-        for name in ("KVAF_SCATTER_FUSED_BUILD", "KVAF_SCATTER_DOUBLE_BUFFER", "KVAF_SCATTER_SIMT_BUILD", "KVAF_SCATTER_PIPELINE"):
-            with patch.dict("os.environ", {name: "ON"}), \
-                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                arguments([])
+        with patch.dict("os.environ", {"KVAF_SCATTER_PIPELINE": "ON"}), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            arguments([])
+        for option in ("--fused-build", "--double-buffer", "--simt-build"):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                arguments([option, "0"])
 
     def test_decimal_bandwidth_uses_sum_of_times(self):
         stats = summarize([100, 200, 300], 1000)
@@ -289,7 +276,7 @@ class ScatterPerfTests(unittest.TestCase):
 
     def test_cli_validation_and_skip_before_hardware_import(self):
         for args in (["--requests", "0"], ["--cores", "9"], ["--iterations", "0"],
-                     ["--fused-build", "2"], ["--double-buffer", "ON"],
+                     ["--pipeline", "2"],
                      ["--host-profile", "--profile-iterations", "0"],
                      ["--request-length", "4095"], ["--miss-count", "4097"],
                      ["--workload", "one-token-per-block", "--miss-count", "1025"],
@@ -307,7 +294,7 @@ class ScatterPerfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = arguments(["--blocks", "1", "--tokens-per-block", "1",
-                              "--fused-build", "0", "--double-buffer", "1",
+                              "--pipeline", "0",
                               "--request-length", "8192",
                               "--json", str(root / "result.json"), "--csv", str(root / "result.csv")])
             report = dict(config={"units": "decimal GB/s"}, summary={}, samples={
@@ -321,7 +308,7 @@ class ScatterPerfTests(unittest.TestCase):
                 reader = csv.DictReader(stream)
                 rows = list(reader)
                 self.assertEqual(reader.fieldnames, list(CSV_COLUMNS))
-            self.assertEqual(len(CSV_COLUMNS), 34)
+            self.assertEqual(len(CSV_COLUMNS), 32)
             self.assertFalse(any(k.endswith("_ns") for k in CSV_COLUMNS))
             self.assertEqual([r["phase"] for r in rows], ["baseline", "profiled"])
             self.assertEqual(rows[1]["cpu_comm_us"], "0.500")
@@ -335,8 +322,9 @@ class ScatterPerfTests(unittest.TestCase):
             self.assertEqual(rows[0]["miss_count"], "1")
             self.assertNotIn("calls", rows[0])
             self.assertNotIn("requests", rows[0])
-            self.assertEqual(rows[0]["fused_build"], "0")
-            self.assertEqual(rows[0]["double_buffer"], "1")
+            self.assertEqual(rows[0]["pipeline"], "0")
+            self.assertNotIn("fused_build", rows[0])
+            self.assertNotIn("double_buffer", rows[0])
             self.assertAlmostEqual(float(rows[0]["end_to_end_gbps"]), .656)
             self.assertAlmostEqual(float(rows[1]["cpu_comm_gbps"]), 1.312)
             self.assertEqual(rows[0]["end_to_end_us"], "1.000")

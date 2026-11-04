@@ -20,7 +20,7 @@ from scatter_perf_common import (HOST_TIMINGS, PAYLOAD_TIMINGS, RANDOM_SOURCE_CH
 # Stable compact layout, including for baseline-only or profiled-only runs.
 # Raw ns, worker cycles and less common diagnostics remain in the JSON report.
 CSV_COLUMNS = (
-    "phase", "iteration", "sequence", "cores", "fused_build", "double_buffer", "pipeline",
+    "phase", "iteration", "sequence", "cores", "pipeline",
     "request_length", "miss_count", "token_bytes", "payload_bytes",
     "end_to_end_us", "end_to_end_gbps", "cpu_comm_us", "cpu_comm_gbps",
     "aiv_build_notify_us", "aiv_scatter_us", "aiv_scatter_gbps",
@@ -43,12 +43,6 @@ def arguments(argv=None):
                         help="percentage of workload tokens; use instead of --miss-count")
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--cores", type=int, default=1)
-    parser.add_argument("--fused-build", type=int, choices=(0, 1),
-                        help="parallel source-list build (0: serial two-pass); default: KVAF_SCATTER_FUSED_BUILD or 1")
-    parser.add_argument("--simt-build", type=int, choices=(0, 1),
-                        help="parallel SIMT list builder (0: UB/DMA); default: KVAF_SCATTER_SIMT_BUILD or 1")
-    parser.add_argument("--double-buffer", type=int, choices=(0, 1),
-                        help="runtime UB overlap; default: KVAF_SCATTER_DOUBLE_BUFFER or 1")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter with chunk Ready (default: 1)")
     parser.add_argument("--blocks", type=int, default=1024)
@@ -74,7 +68,7 @@ def arguments(argv=None):
     parser.add_argument("--json", type=Path)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
-    for field in ("fused_build", "double_buffer", "simt_build", "pipeline"):
+    for field in ("pipeline",):
         if getattr(args, field) is None:
             name = "KVAF_SCATTER_" + field.upper()
             value = os.environ.get(name, "1")
@@ -183,8 +177,7 @@ def write_results(args, report):
             writer.writeheader()
             for phase, samples in report["samples"].items():
                 for sample in samples:
-                    values = dict(phase=phase, cores=args.cores, fused_build=args.fused_build,
-                                  double_buffer=args.double_buffer,
+                    values = dict(phase=phase, cores=args.cores,
                                   request_length=args.request_length,
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
                                   **sample_metrics(sample))
@@ -220,7 +213,7 @@ def main(argv=None):
     device = f"npu:{device_id}"
     source_rows = args.blocks * args.tokens_per_block
     output_rows = args.output_row_step * args.request_length + 2
-    config = vars(args).copy()
+    config = dict(vars(args), source_list_builder="parallel_simt", scatter_copy="ub_double_buffer")
     config.update(device_id=device_id, mode="cpu_push_scatter",
                   pipeline_chunk_rows=1024,
                   pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
@@ -274,9 +267,6 @@ def main(argv=None):
     try:
         # CLI overrides the environment. Host snapshots these during initialize;
         # baseline/profiled phases then use the same algorithms and binary.
-        os.environ["KVAF_SCATTER_FUSED_BUILD"] = str(args.fused_build)
-        os.environ["KVAF_SCATTER_SIMT_BUILD"] = str(args.simt_build)
-        os.environ["KVAF_SCATTER_DOUBLE_BUFFER"] = str(args.double_buffer)
         os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()

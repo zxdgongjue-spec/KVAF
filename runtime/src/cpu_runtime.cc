@@ -8,9 +8,9 @@
 #include "cpu_gather_executor.h"
 #include "gather_workspace.h"
 #include "cpu_push_get_worker.h"
-#include "cpu_source_memory.h"
 
 #include <dlfcn.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -83,6 +83,8 @@ constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transp
 // and transport mode; the trailing four bytes are retained on the wire.
 constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
+constexpr std::size_t kBasePageBytes = 4096U;
+constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -386,7 +388,7 @@ struct Region {
   uint64_t id = 0U;
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
-  cpu_memory::SourceMemory memory;
+  void* memory = nullptr;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
   urma_token_id_t* token_id = nullptr;
@@ -404,13 +406,11 @@ class CpuService {
              std::size_t min_bytes_per_thread, bool gather_affinity,
              CpuGatherMode gather_mode,
              CpuMemoryPageMode memory_page_mode = CpuMemoryPageMode::kTransparentHugePage,
-             std::uint32_t hugetlb_page_kb = 0U,
              bool device_filter_applied = false)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
         gather_affinity_(gather_affinity), gather_mode_(gather_mode),
-        memory_page_mode_(memory_page_mode), hugetlb_page_kb_(hugetlb_page_kb),
-        device_filter_applied_(device_filter_applied) {}
+        memory_page_mode_(memory_page_mode), device_filter_applied_(device_filter_applied) {}
   ~CpuService() { ReleaseAll(); }
 
   uint32_t CandidateCount() const {
@@ -461,10 +461,7 @@ class CpuService {
     const auto allocate_begin = std::chrono::steady_clock::now();
     Log("[KVAF_CPU] REGION_ALLOCATE_BEGIN candidate=%u bytes=%" PRIu64 " page_mode=%s\n",
         candidate_id, bytes, MemoryPageModeName());
-    const auto allocated = region->memory.Allocate(bytes, memory_page_mode_, hugetlb_page_kb_);
-    if (!allocated.ok()) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED page_mode=%s reason=%s\n",
-          MemoryPageModeName(), allocated.message().c_str());
+    if (!AllocateMemory(region.get())) {
       return Result::kResourceError;
     }
     const auto memory_ready = std::chrono::steady_clock::now();
@@ -474,7 +471,7 @@ class CpuService {
         " next=register\n", candidate_id, bytes, static_cast<int64_t>(memory_us));
     region->bytes = bytes;
     if (bytes >= 64U)
-      std::memset(static_cast<uint8_t*>(region->memory.data) + peer::GatherControlOffset(bytes), 0, 64U);
+      std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
     region->token_value = NextToken();
     region->token_id = urma_alloc_token_id(resources->context());
     if (region->token_id == nullptr) {
@@ -494,7 +491,7 @@ class CpuService {
     flag.bs.non_pin = 1U;
     flag.bs.token_id_valid = 1U;
     urma_seg_cfg_t config{};
-    config.va = reinterpret_cast<uint64_t>(region->memory.data);
+    config.va = reinterpret_cast<uint64_t>(region->memory);
     config.len = bytes;
     config.token_id = region->token_id;
     config.token_value.token = region->token_value;
@@ -506,7 +503,7 @@ class CpuService {
     if (region->segment == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
           " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
-          region->memory.data, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
+          region->memory, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
@@ -530,18 +527,16 @@ class CpuService {
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
+    regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
         "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s "
-        "allocation_bytes=%zu hugetlb_page_bytes=%zu "
         "memory_us=%" PRId64 " register_us=%" PRId64 " total_us=%" PRId64 "\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
         response->peer_base, response->token_id, flag.value, MemoryPageModeName(),
-        region->memory.allocation_bytes, region->memory.hugetlb_page_bytes,
         static_cast<int64_t>(memory_us),
         static_cast<int64_t>(register_us),
         static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - allocate_begin).count()));
-    regions_.emplace(id, std::move(region));
     return Result::kOk;
   }
 
@@ -641,7 +636,7 @@ class CpuService {
     if (region.push || region.gather != nullptr || !region.gather_lanes.empty()) return Result::kResourceError;
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
-          region.memory.data, region.base, region.bytes, gather_threads_,
+          region.memory, region.base, region.bytes, gather_threads_,
           min_bytes_per_thread_, gather_affinity_, gather_mode_);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
@@ -665,7 +660,7 @@ class CpuService {
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const auto budget = gather_threads_ / lanes + (lane < gather_threads_ % lanes ? 1U : 0U);
         created.push_back(std::make_unique<CpuGatherWorker>(
-            region.memory.data, region.base, region.bytes, budget, min_bytes_per_thread_,
+            region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
             gather_affinity_, gather_mode_, control_address + lane * sizeof(peer::GatherControl),
             cpu_offset));
         cpu_offset += budget;
@@ -727,9 +722,7 @@ class CpuService {
     return Result::kOk;
   }
   Status BenchmarkCpuWrite(std::uint64_t region_base, const cpu_push::WriteBenchmarkOptions& options,
-                           cpu_push::WriteBenchmarkResult* result,
-                           const cpu_push::WriteBenchmarkDiagnosticOptions* diagnostics = nullptr,
-                           cpu_push::WriteBenchmarkDiagnostics* records = nullptr) {
+                           cpu_push::WriteBenchmarkResult* result) {
     for (auto& item : regions_) {
       auto& region = *item.second;
       if (region.base != region_base) continue;
@@ -737,8 +730,8 @@ class CpuService {
       Log("[KVAF_CPU] WRITE_BENCH_BEGIN bytes=%llu queues=%u mode=%u iterations=%u\n",
           static_cast<unsigned long long>(options.payload_bytes), options.queues,
           options.source_mode, options.iterations);
-      return region.push->BenchmarkWrite(static_cast<std::uint8_t*>(region.memory.data), region.base,
-                                        region.bytes, options, result, diagnostics, records);
+      return region.push->BenchmarkWrite(static_cast<std::uint8_t*>(region.memory), region.base,
+                                        region.bytes, options, result);
     }
     return Status::NotFound("WRITE benchmark DDR region not found");
   }
@@ -765,7 +758,47 @@ class CpuService {
 
  private:
   const char* MemoryPageModeName() const {
-    return cpu_memory::PageModeName(memory_page_mode_);
+    switch (memory_page_mode_) {
+      case CpuMemoryPageMode::kDefault:
+        return "default";
+      case CpuMemoryPageMode::kTransparentHugePage:
+        return "thp";
+    }
+    return "unknown";
+  }
+
+  bool AllocateMemory(Region* region) {
+    if (region == nullptr || region->bytes == 0U ||
+        region->bytes > std::numeric_limits<std::size_t>::max()) {
+      return false;
+    }
+    const std::size_t bytes = static_cast<std::size_t>(region->bytes);
+    const std::size_t alignment =
+        memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
+            ? kHugePage2MBytes
+            : kBasePageBytes;
+    const int allocation_status = posix_memalign(&region->memory, alignment, bytes);
+    if (allocation_status != 0 || region->memory == nullptr) {
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
+          " alignment=%zu status=%d memory=%p page_mode=%s\n",
+          region->bytes, alignment, allocation_status, region->memory,
+          MemoryPageModeName());
+      return false;
+    }
+    if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
+      if (madvise(region->memory, bytes, MADV_HUGEPAGE) != 0) {
+        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
+            " errno=%d\n",
+            region->bytes, errno);
+        free(region->memory);
+        region->memory = nullptr;
+        return false;
+      }
+      // Fault the range while huge-page advice is active. Launching the service
+      // under a NUMA memory policy makes placement deterministic as well.
+      std::memset(region->memory, 0, bytes);
+    }
+    return true;
   }
 
   uint32_t NextToken() {
@@ -879,9 +912,10 @@ class CpuService {
       (void)urma_free_token_id(region->token_id);
       region->token_id = nullptr;
     }
-    const auto released = region->memory.Release();
-    if (!released.ok()) Log("[KVAF_CPU] REGION_MEMORY_RELEASE_FAILED reason=%s\n",
-                            released.message().c_str());
+    if (region->memory != nullptr) {
+      free(region->memory);
+      region->memory = nullptr;
+    }
   }
 
   void ReleaseAll() {
@@ -897,7 +931,6 @@ class CpuService {
   bool gather_affinity_{true};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
-  std::uint32_t hugetlb_page_kb_{0U};
   bool device_filter_applied_{false};
   uint64_t next_region_id_ = 1U;
   uint32_t next_token_ = 1U;
@@ -1060,25 +1093,6 @@ void HandleClient(int fd, CpuService* service) {
       (void)WriteAll(fd, response.get(), sizeof(*response));
       return;
     }
-    case Command::kCpuWriteBenchmarkDiagnostics: {
-      peer::CpuWriteBenchmarkDiagnosticRequest request{};
-      request.header = header;
-      auto response = std::make_unique<peer::CpuWriteBenchmarkDiagnosticResponse>();
-      response->header = peer::MakeHeader(command, sizeof(*response));
-      response->header.command = peer::ResponseCommand(command);
-      Status status = Status::InvalidArgument("invalid CPU WRITE diagnostic request");
-      if (IsValidHeader(header, command, sizeof(request)) &&
-          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header)))
-        status = service->BenchmarkCpuWrite(request.region_base, request.options, &response->benchmark,
-                                           &request.diagnostics, &response->diagnostics);
-      response->result = static_cast<int32_t>(status.ok() ? Result::kOk : Result::kResourceError);
-      if (!status.ok())
-        std::snprintf(response->error, sizeof(response->error), "%s", status.message().c_str());
-      (void)WriteAll(fd, response.get(), sizeof(*response));
-      return;
-    }
-    case Command::kStopGatherLanes:
-    case Command::kStartCpuPushGet:
     case Command::kStopCpuPushGet: {
       peer::CpuPushGetSessionRequest request{};
       request.header = header;
@@ -1115,8 +1129,6 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   }
   if (options.gather_threads > 64U)
     return Status::InvalidArgument("CpuRuntime gather_threads must be in [1,64] or auto");
-  const auto page_options = cpu_memory::ValidateOptions(options.memory_page_mode, options.hugetlb_page_kb);
-  if (!page_options.ok()) return page_options;
   const auto detected = std::thread::hardware_concurrency();
   const std::size_t gather_threads = options.gather_threads == 0U
       ? std::min<std::size_t>(detected == 0U ? 1U : detected, 32U)
@@ -1131,7 +1143,7 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   impl->service = std::make_unique<CpuService>(
       &impl->resources, gather_threads, min_bytes_per_thread,
       options.gather_affinity, options.gather_mode,
-      options.memory_page_mode, options.hugetlb_page_kb, !options.ub_device.empty());
+      options.memory_page_mode, !options.ub_device.empty());
   impl_ = std::move(impl);
   return Status::OK();
 }
