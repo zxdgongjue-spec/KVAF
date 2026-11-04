@@ -1,16 +1,24 @@
-# 同一张 NPU 并发读取本机 NPU HBM 与远端 CPU DDR
+# 两路独立配置的 BatchGet 并发与基线对比
 
 入口为 `tests/python/run_mixed_peer_batch_get.py`，复用现有两路并发启动器和
-BatchGet sweep。默认两个独立客户端进程都使用逻辑卡 NPU6：
+BatchGet sweep，使用相同的 `--flow1/2-device`、`--flow1/2-priorities` 和
+`--flow1/2-args` 接口。两个独立客户端进程在同一主机启动，可使用相同或不同
+NPU；每路分别选择 CPU DDR 或 NPU HBM peer，不要求一条必须是 NPU、另一条必须是 CPU。
+下面以 **NPU6 → NPU5，加上 NPU4 → 远端 CPU** 为例：
 
-| 流量 | 数据提供端 | 控制连接 | 数据路径 |
-| --- | --- | --- | --- |
-| `npu_peer` | 本机 NPU5 上的 HBM 服务 | 默认 `127.0.0.1:28999` | NPU6 经 UB 读取 NPU5 HBM |
-| `cpu_peer` | 远端 CPU 服务器上的 DDR 服务 | 必须指定 CPU 主机 IP 与端口 | NPU6 经 UB 读取 CPU DDR，默认固定 `udmac0d1e3` |
+| 流量 | 发起端 | peer 类型 | 服务地址 | CPU UB 设备 |
+| --- | --- | --- | --- | --- |
+| `flow1` | NPU6 | `npu` | `127.0.0.1:28999`（服务使用 NPU5） | 不适用 |
+| `flow2` | NPU4 | `cpu` | `CPU_HOST:29000` | `udmac0d1e3` |
 
-`--device` 是两路共用的本地逻辑卡号；目标卡 NPU5 由服务启动参数选择。
+`--flow1-device` / `--flow2-device` 分别指定发起端逻辑卡号，必须显式传入；
+目标卡 NPU5 由服务启动参数选择。
 `udmac0d1e3` 是远端 CPU 的 UB 设备名，不是 IP 地址。TCP 用于建链，
 BatchGet 数据经 UB 传输。两路分别填充和校验自己的远端内存池。
+
+此前专用入口的 `--device`、`--npu-*`、`--cpu-*` 参数已替换为上述 flow 接口；
+日志目录也改为按 flow 编号区分。已有 `run_concurrent_batch_get.py` 的参数和
+输出结构不变，它本身也支持这些 peer 组合；本入口额外提供共享参数和基线对比。
 
 ## 1. 启动两端服务
 
@@ -35,29 +43,34 @@ BatchGet 数据经 UB 传输。两路分别填充和校验自己的远端内存�
 `--eid-index` 按该服务器实际配置调整。容器内使用各进程可见的逻辑 NPU 编号；
 本机服务的 `127.0.0.1` 需要客户端与服务共享网络命名空间，否则换成可达地址。
 
-## 2. 在 NPU6 上运行混合并发测试
+## 2. 分别配置两个 flow
 
 在 NPU 主机另开终端，设置 CPU 服务器的实际 IP：
 
 ```bash
 CPU_HOST=192.0.2.10  # 替换成实际 CPU 服务器 IP
 python3 tests/python/run_mixed_peer_batch_get.py "$PWD/build-npu" \
-  --device 6 \
-  --npu-service-addr 127.0.0.1:28999 \
-  --cpu-service-addr "$CPU_HOST:29000" \
-  --cpu-ub-device udmac0d1e3 \
-  --npu-priorities 15 --cpu-priorities 15 \
+  --flow1-device 6 --flow2-device 4 \
+  --flow1-priorities 15 --flow2-priorities 15 \
+  --flow1-args="--peer-device npu --peer-service-addr 127.0.0.1:28999" \
+  --flow2-args="--peer-device cpu --peer-service-addr $CPU_HOST:29000 --peer-ub-device udmac0d1e3" \
   --common-args="--batch-get-mode lookup --request-length 8192 --miss-count 8192 --table-capacity 16384 --tokens-per-block 128 --token-bytes 656 --aiv-cores 2 --jettys-per-core 2 --warmup 10 --iterations 1000" \
-  --output-dir results/mixed-npu6
+  --output-dir results/mixed-npu6-npu4
 ```
 
+若两路都从 NPU6 发起，只需改为 `--flow2-device 6`。每个 flow 的
+`--peer-device`、`--peer-service-addr` 和 `--peer-ub-device` 都在自己的
+`--flow*-args` 中设置；两个 flow 也可交换 peer 类型，或都配置为 `npu` / `cpu`。
+NPU peer 不接受 `--peer-ub-device`。CPU 实验应固定 UB 设备或在服务端固定过滤器，
+本入口与原启动器均不允许自适应 UB 校准。
+
 两路各完成建链、BatchPut 填充、读回校验和预热后，在第一次计时前等待共同
-起跑时刻。终端输出分别带 `[npu_peer]`、`[cpu_peer]` 前缀；参数中的
+起跑时刻。终端输出分别带 `[flow1]`、`[flow2]` 前缀；参数中的
 `aiv-cores` 和 `jettys-per-core` 是每一路的配置。示例每个远端池约需
 1.28 GiB，客户端还需要填充和输出等临时内存。
 
-两路默认都启用 kernel/逐 Jetty profiling。`--npu-priorities` 和
-`--cpu-priorities` 分别控制两路本地 BatchGet Jetty 的 priority，可传
+两路默认都启用 kernel/逐 Jetty profiling。`--flow1-priorities` 和
+`--flow2-priorities` 分别控制两路本地 BatchGet Jetty 的 priority，可传
 `3,13` 等列表，范围 0–15；未传时沿用 `KVAF_BATCH_GET_JETTY_PRIORITIES`，
 该环境变量也未设置时为 15。SL 由设备的 priority→SL 映射决定。
 
@@ -65,18 +78,18 @@ python3 tests/python/run_mixed_peer_batch_get.py "$PWD/build-npu" \
 
 在上述命令中增加 `--with-baselines` 并使用一个新输出目录，即依次执行：
 
-1. 仅 NPU6 → NPU5。
-2. 仅 NPU6 → CPU `udmac0d1e3`。
-3. 两路同时运行。
+1. 仅 `flow1`（示例：NPU6 → NPU5）。
+2. 仅 `flow2`（示例：NPU4 → CPU `udmac0d1e3`）。
+3. 两个 flow 同时运行。
 
 同一路在单路/并发阶段使用相同参数与 profiling 设置。输出结构为：
 
 ```text
-results/mixed-npu6/
-  baseline_npu/npu_peer/    # 仅 --with-baselines 时生成
-  baseline_cpu/cpu_peer/    # 仅 --with-baselines 时生成
-  concurrent/npu_peer/
-  concurrent/cpu_peer/
+results/mixed-npu6-npu4/
+  baseline_flow1/flow1/     # 仅 --with-baselines 时生成
+  baseline_flow2/flow2/     # 仅 --with-baselines 时生成
+  concurrent/flow1/
+  concurrent/flow2/
   comparison.csv           # 仅 --with-baselines 且三阶段全部成功时生成
 ```
 
@@ -89,22 +102,22 @@ results/mixed-npu6/
 
 ## 分别配置两路流量
 
-`--common-args` 使用现有 benchmark 参数。`--npu-args` / `--cpu-args`
+`--common-args` 使用现有 benchmark 参数。`--flow1-args` / `--flow2-args`
 追加各自的参数，同名的普通单值参数以后者为准，例如：
 
 ```bash
-  --npu-args="--batch-get-mode raw --miss-count 4096 --iterations 2000" \
-  --cpu-args="--batch-get-mode no-pipeline --miss-count 8192 --iterations 1000"
+  --flow1-args="--peer-device npu --peer-service-addr 127.0.0.1:28999 --batch-get-mode raw --miss-count 4096 --iterations 2000" \
+  --flow2-args="--peer-device cpu --peer-service-addr $CPU_HOST:29000 --peer-ub-device udmac0d1e3 --batch-get-mode no-pipeline --miss-count 8192 --iterations 1000"
 ```
 
-固定客户端 EID 时分别加 `--npu-args="--npu-eids <NPU6_EID列表>"` 和
-`--cpu-args="--npu-eids <NPU6_EID列表>"`；两个列表均属于发起端 NPU6，
-可以相同或不同。NPU5 服务的 EID 用服务端 `--npu-eid` 配置。
-服务地址和 CPU UB 设备通过顶层参数指定；额外参数中禁止覆盖 peer 路由，
-也不执行自适应 UB 校准，避免不同阶段选择不同链路。
+固定客户端 EID 时，在 `--flow1-args` 字符串末尾追加
+`--npu-eids <NPU6_EID列表>`，在 `--flow2-args` 中追加
+`--npu-eids <NPU4_EID列表>`。每个列表属于该 flow 的发起端，不能混用两张卡的
+EID。NPU5 服务的 EID 用服务端 `--npu-eid` 配置。每个 `--flow*-args` 传一个
+完整字符串；重复传同一个 `--flow*-args` 时，后面的字符串会整体替换前面的。
 
 同步只发生在首轮测量前，两路随后独立执行各自的迭代次数。它保证进程准备
-完成后共同起跑；实际 kernel 是否重叠取决于同卡调度。两路结束时间可能不同，
+完成后共同起跑；实际 kernel 是否重叠取决于设备调度。两路结束时间可能不同，
 较慢一路末尾可能包含另一流已经结束的样本。应根据单路耗时调整各自迭代次数，
 使测量持续时间接近，并结合现有 [端口采样工具](../tests/diagnostics/README.md)
 确认流量重叠。若需比较稳定性，可更换输出目录重复实验。
@@ -122,5 +135,6 @@ python3 -B tests/python/test_concurrent_batch_get.py -v
 ```
 
 Linux 测试以替身替代 NPU benchmark，实际运行 Bash sweep、同步门和 CSV
-汇总，检查相同源卡的路由隔离、基线顺序、参数继承和比较值。
+汇总，检查同卡/异卡、NPU+CPU、CPU+NPU、NPU+NPU、CPU+CPU 的路由隔离、
+基线顺序、参数继承和比较值。
 真实 NPU/CPU 连通性与并发性能需要在目标设备执行上述实验。

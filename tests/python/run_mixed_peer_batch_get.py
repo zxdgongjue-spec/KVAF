@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Run NPU->NPU HBM and NPU->CPU DDR BatchGet concurrently on one client NPU.
+"""Run two independently configured BatchGet flows, optionally with baselines.
 
-Reuses the existing sweep, profiling, ready gate and process cleanup. Services
-must already be running. --with-baselines runs each flow alone first, using the
-same options, then writes comparison.csv after the concurrent run succeeds.
+Uses the same --flow1/2-device, --flow1/2-priorities and --flow1/2-args options
+as run_concurrent_batch_get.py. Each flow selects its own CPU/NPU peer through
+its benchmark options. Client NPUs may be the same or different, on this host.
+Services must already be running. --with-baselines runs each flow alone first,
+then writes comparison.csv after the concurrent run succeeds.
 """
 
 from __future__ import annotations
@@ -23,60 +25,40 @@ def parse_args(argv=None):
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="new directory for concurrent/ and optional baseline results")
-    parser.add_argument("--device", type=int, default=6,
-                        help="local logical client NPU ID shared by both processes (default: 6)")
-    parser.add_argument("--npu-service-addr", default="127.0.0.1:28999",
-                        help="HBM service host:port; select provider NPU5 when starting that service")
-    parser.add_argument("--cpu-service-addr", required=True, help="remote CPU service host:port")
-    parser.add_argument("--cpu-ub-device", default="udmac0d1e3",
-                        help="fixed remote CPU UB device (default: udmac0d1e3)")
     parser.add_argument("--common-args", default="",
                         help="quoted benchmark options shared by both flows")
-    for peer in ("npu", "cpu"):
-        parser.add_argument(f"--{peer}-args", default="",
-                            help="quoted per-flow benchmark options, appended after --common-args")
-        parser.add_argument(f"--{peer}-priorities",
+    for name in ("flow1", "flow2"):
+        parser.add_argument(f"--{name}-device", type=int, required=True,
+                            help="local logical client NPU ID for this flow")
+        parser.add_argument(f"--{name}-args", default="",
+                            help="quoted benchmark options including --peer-device, "
+                                 "--peer-service-addr and, for CPU peers, --peer-ub-device; "
+                                 "appended after --common-args")
+        parser.add_argument(f"--{name}-priorities",
                             default=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES") or "15",
                             help="comma-separated local BatchGet Jetty priorities, each in [0, 15]")
     parser.add_argument("--with-baselines", action="store_true",
-                        help="run NPU-only, CPU-only, then both; compare kernel latency/bandwidth")
+                        help="run flow1 alone, flow2 alone, then both; compare kernel latency/bandwidth")
     args = parser.parse_args(argv)
-    if args.device < 0:
-        parser.error("device must be non-negative")
-    for field in ("npu_service_addr", "cpu_service_addr", "cpu_ub_device"):
-        if not getattr(args, field).strip():
-            parser.error(f"{field.replace('_', '-')} must not be empty")
+    for name in ("flow1", "flow2"):
+        if getattr(args, f"{name}_device") < 0:
+            parser.error(f"{name}-device must be non-negative")
     return args
 
 
 def build_runs(args):
-    """Fix the two routes explicitly, independent of inherited peer settings."""
-    options = {}
-    reserved = {"--peer-device", "--peer-service-addr", "--peer-ub-device",
-                "--adaptive-ub-device", "--adaptive-calibration-only"}
-    for peer in ("npu", "cpu"):
-        extra = shlex.split(args.common_args) + shlex.split(getattr(args, f"{peer}_args"))
-        for option in extra:
-            if option.split("=", 1)[0] in reserved:
-                raise ValueError(f"{peer}: {option} is not allowed in benchmark options; "
-                                 "use --npu-service-addr, --cpu-service-addr and --cpu-ub-device")
-        extra += ["--peer-device", peer, "--peer-service-addr", getattr(args, f"{peer}_service_addr")]
-        if peer == "cpu":
-            extra += ["--peer-ub-device", args.cpu_ub_device]
-        options[peer] = shlex.join(extra)
-
-    phases = [("concurrent", ("npu", "cpu"))]
+    """Reuse the original flow builder for every baseline and concurrent worker."""
+    phases = [("concurrent", ("flow1", "flow2"))]
     if args.with_baselines:
-        phases = [("baseline_npu", ("npu",)), ("baseline_cpu", ("cpu",)), *phases]
+        phases = [("baseline_flow1", ("flow1",)), ("baseline_flow2", ("flow2",)), *phases]
     runs = []
-    for phase, peers in phases:
-        config = argparse.Namespace(build_dir=args.build_dir, output_dir=args.output_dir / phase)
+    for phase, names in phases:
+        config = argparse.Namespace(**vars(args))
+        config.output_dir = args.output_dir / phase
         flows = []
-        for peer in peers:
-            name = f"{peer}_peer"
-            setattr(config, f"{name}_device", args.device)
-            setattr(config, f"{name}_priorities", getattr(args, f"{peer}_priorities"))
-            setattr(config, f"{name}_args", options[peer])
+        for name in names:
+            options = shlex.split(args.common_args) + shlex.split(getattr(args, f"{name}_args"))
+            setattr(config, f"{name}_args", shlex.join(options))
             flows.append(concurrent.build_flow(config, name))
         runs.append((phase, flows))
     return runs
@@ -85,17 +67,17 @@ def build_runs(args):
 def write_comparison(output):
     metrics = ("mean_us", "p50_us", "p99_us", "p50_GBps")
     rows = []
-    for peer in ("npu", "cpu"):
+    for name in ("flow1", "flow2"):
         samples = []
-        for phase in (f"baseline_{peer}", "concurrent"):
-            path = output / phase / f"{peer}_peer" / "batch_get_miss_sweep_summary.csv"
+        for phase in (f"baseline_{name}", "concurrent"):
+            path = output / phase / name / "batch_get_miss_sweep_summary.csv"
             with path.open(newline="", encoding="utf-8") as stream:
                 records = list(csv.DictReader(stream))
             if len(records) != 1 or not set(metrics).issubset(records[0]):
                 raise ValueError(f"expected one complete sweep summary: {path}")
             samples.append(records[0])
         baseline, measured = samples
-        row = {"flow": f"{peer}_peer"}
+        row = {"flow": name}
         for metric in metrics:
             row[f"baseline_{metric}"] = baseline[metric]
             row[f"concurrent_{metric}"] = measured[metric]
@@ -125,10 +107,6 @@ def main(argv=None):
         runs = build_runs(args)
         # Reserve the whole experiment directory before starting any child.
         args.output_dir.mkdir(parents=True, exist_ok=False)
-        print(f"[mixed] NPU{args.device} -> NPU HBM at {args.npu_service_addr}; "
-              f"priorities={args.npu_priorities}", flush=True)
-        print(f"[mixed] NPU{args.device} -> CPU DDR at {args.cpu_service_addr} "
-              f"via {args.cpu_ub_device}; priorities={args.cpu_priorities}", flush=True)
         for phase, flows in runs:
             print(f"[mixed] phase={phase}", flush=True)
             for _, _, env in flows:

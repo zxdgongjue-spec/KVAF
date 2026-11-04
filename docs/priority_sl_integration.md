@@ -37,9 +37,9 @@ Jetty。有效 SL 由设备映射决定，不直接由这个变量设置。
 
 ## 两路同步并发
 
-同一张 NPU 同时读取本机 NPU HBM 和远端 CPU DDR，可直接使用
-[`run_mixed_peer_batch_get.py` 专用入口](mixed_peer_batch_get.md)，支持固定
-CPU UB 设备，以及可选的单路基线与并发结果对比。
+两路分别配置源 NPU 与 CPU/NPU peer，可使用
+[`run_mixed_peer_batch_get.py` 扩展入口](mixed_peer_batch_get.md)，沿用
+`flow1/flow2` 参数，支持同卡或异卡，以及可选的单路基线与并发结果对比。
 
 在同一台客户端主机启动两个独立进程。每路可以使用相同或不同 NPU，也可以
 分别指定 CPU/NPU peer、服务地址、EID、算子模式、shape 和优先级。

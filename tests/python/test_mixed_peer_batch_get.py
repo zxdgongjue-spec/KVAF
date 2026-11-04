@@ -64,9 +64,11 @@ class MixedPeerTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.argv = ["build-npu", "--output-dir", str(self.output),
-                     "--cpu-service-addr", "cpu-host:29000"]
+                     "--flow1-device", "6", "--flow2-device", "4",
+                     "--flow1-args=--peer-device npu --peer-service-addr 127.0.0.1:28999",
+                     "--flow2-args=--peer-device cpu --peer-service-addr cpu-host:29000 --peer-ub-device udmac0d1e3"]
 
-    def test_fixed_mixed_routes_override_inherited_peer_on_same_device(self):
+    def test_independent_sources_and_peers_override_inherited_settings(self):
         with patch.dict(os.environ, KVAF_PEER_DEVICE="cpu", KVAF_PEER_SERVICE_ADDR="wrong:1"):
             runs = mixed.build_runs(mixed.parse_args(self.argv))
             self.assertEqual([phase for phase, _ in runs], ["concurrent"])
@@ -76,30 +78,38 @@ class MixedPeerTests(unittest.TestCase):
                 self.assertEqual(parsed.peer_service_addr,
                                  "127.0.0.1:28999" if peer == "npu" else "cpu-host:29000")
                 self.assertEqual(parsed.peer_ub_device, "" if peer == "npu" else "udmac0d1e3")
-                self.assertEqual(env["DEVICE_ID"], "6")
+                self.assertEqual(env["DEVICE_ID"], "6" if peer == "npu" else "4")
                 self.assertEqual(Path(env["KVAF_BATCH_GET_MISS_SWEEP_CSV"]).parent.name, name)
                 if peer == "npu":
                     self.assertEqual(parsed.adaptive_peer_ub_devices, [])
 
     def test_per_flow_modes_eids_priorities_and_shape_override(self):
         args = mixed.parse_args(self.argv + [
-            "--device", "7", "--npu-priorities", "3,5", "--cpu-priorities", "13",
+            "--flow1-device", "7", "--flow1-priorities", "3,5", "--flow2-priorities", "13",
             "--common-args=--miss-count 4096 --aiv-cores 1 --jettys-per-core 2 --iterations 30",
-            "--npu-args=--batch-get-mode raw --npu-eids " + "1" * 32,
-            "--cpu-args=--batch-get-mode no-pipeline --miss-count 8192 --npu-eids " + "2" * 32])
+            self.argv[-2] + " --batch-get-mode raw --npu-eids " + "1" * 32,
+            self.argv[-1] + " --batch-get-mode no-pipeline --miss-count 8192 --npu-eids " + "2" * 32])
         for peer, (_, command, env) in zip(("npu", "cpu"), mixed.build_runs(args)[0][1]):
             parsed = perf.parse_args(command[3:])
             self.assertEqual(parsed.batch_get_mode, "raw" if peer == "npu" else "no-pipeline")
             self.assertEqual(parsed.npu_eids, [("1" if peer == "npu" else "2") * 32])
             self.assertEqual(parsed.iterations, 30)
-            self.assertEqual(env["DEVICE_ID"], "7")
+            self.assertEqual(env["DEVICE_ID"], "7" if peer == "npu" else "4")
             self.assertEqual(env["KVAF_BATCH_GET_JETTY_PRIORITIES"], "3,5" if peer == "npu" else "13")
             self.assertEqual(env["KVAF_BATCH_GET_SWEEP_MISS_COUNTS"], "4096" if peer == "npu" else "8192")
 
+    def test_original_flow_configuration_builds_identical_worker_commands(self):
+        # The extended entry point accepts the original launcher's flow options.
+        args = mixed.parse_args(self.argv)
+        original = mixed.concurrent.parse_args(self.argv)
+        original.output_dir = args.output_dir / "concurrent"
+        expected = [mixed.concurrent.build_flow(original, name) for name in ("flow1", "flow2")]
+        self.assertEqual(mixed.build_runs(args)[0][1], expected)
+
     def test_invalid_configuration_launches_nothing(self):
-        for option in ("--npu-args=--peer-device cpu", "--cpu-args=--peer-ub-device=wrong",
-                       "--common-args=--adaptive-ub-device", "--npu-priorities=16",
-                       "--cpu-args=--iterations 0"):
+        for option in (self.argv[-2] + " --peer-ub-device=udmac0d1e3",
+                       "--common-args=--adaptive-ub-device", "--flow1-priorities=16",
+                       self.argv[-1] + " --iterations 0"):
             with self.subTest(option=option), contextlib.redirect_stdout(io.StringIO()), \
                     patch.object(mixed.concurrent, "run_flows") as run:
                 self.assertEqual(mixed.main(self.argv + [option]), 1)
@@ -124,9 +134,9 @@ class MixedPeerTests(unittest.TestCase):
         self.assertFalse((self.output / "comparison.csv").exists())
 
     def test_zero_baseline_has_no_ratio(self):
-        for peer in ("npu", "cpu"):
-            for phase in (f"baseline_{peer}", "concurrent"):
-                directory = self.output / phase / f"{peer}_peer"
+        for name in ("flow1", "flow2"):
+            for phase in (f"baseline_{name}", "concurrent"):
+                directory = self.output / phase / name
                 directory.mkdir(parents=True)
                 (directory / "batch_get_miss_sweep_summary.csv").write_text(
                     "mean_us,p50_us,p99_us,p50_GBps\n0,0,0,0\n")
@@ -147,38 +157,71 @@ class MixedPeerTests(unittest.TestCase):
         (self.root / "python3").symlink_to(sys.executable)
         env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner),
                    PATH=str(self.root) + os.pathsep + os.environ.get("PATH", ""))
-        result = subprocess.run([sys.executable, "-B", mixed.__file__, *self.argv,
-                                 "--with-baselines", "--npu-priorities=3", "--cpu-priorities=13",
-                                 "--common-args=--miss-count 8192 --aiv-cores 1 --jettys-per-core 1 --iterations 7",
-                                 "--npu-args=--batch-get-mode raw", "--cpu-args=--batch-get-mode no-pipeline"],
+        cases = (("same_source", (6, 6), ("npu", "cpu"), True),
+                 ("different_sources", (6, 4), ("npu", "cpu"), True),
+                 ("reversed_peers", (4, 6), ("cpu", "npu"), False),
+                 ("both_npu", (6, 4), ("npu", "npu"), True),
+                 ("both_cpu", (6, 4), ("cpu", "cpu"), True))
+        for label, devices, peers, baselines in cases:
+            with self.subTest(label=label):
+                self.check_real_sweeps(env, self.root / label, devices, peers, baselines)
+
+    def check_real_sweeps(self, env, output, devices, peers, baselines):
+        argv = ["build-npu", "--output-dir", str(output),
+                "--common-args=--miss-count 8192 --aiv-cores 1 --jettys-per-core 1 --iterations 7"]
+        routes = {}
+        for index, (device, peer) in enumerate(zip(devices, peers), start=1):
+            name = f"flow{index}"
+            mode = "raw" if index == 1 else "no-pipeline"
+            endpoint = f"{peer}-host{index}:29000"
+            ub_device = f"udmac0d1e{index + 1}" if peer == "cpu" else ""
+            options = f"--peer-device {peer} --peer-service-addr {endpoint} --batch-get-mode {mode}"
+            if ub_device:
+                options += f" --peer-ub-device {ub_device}"
+            argv += [f"--{name}-device={device}", f"--{name}-priorities={index * 3}",
+                     f"--{name}-args={options}"]
+            routes[name] = (device, peer, endpoint, ub_device, mode, str(index * 3))
+        if baselines:
+            argv.append("--with-baselines")
+        result = subprocess.run([sys.executable, "-B", mixed.__file__, *argv],
                                 env=env, text=True, capture_output=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        phases = [("concurrent", ("flow1", "flow2"))]
+        if baselines:
+            phases = [("baseline_flow1", ("flow1",)), ("baseline_flow2", ("flow2",)), *phases]
         records = {}
-        for phase, peers in (("baseline_npu", ("npu",)), ("baseline_cpu", ("cpu",)),
-                             ("concurrent", ("npu", "cpu"))):
-            for peer in peers:
-                directory = self.output / phase / f"{peer}_peer"
+        for phase, names in phases:
+            for name in names:
+                device, peer, endpoint, ub_device, mode, priority = routes[name]
+                directory = output / phase / name
                 record = json.loads((directory / "invocation.json").read_text())
-                records[phase, peer] = record
-                self.assertEqual(record["device"], "6")
+                records[phase, name] = record
+                self.assertEqual(record["device"], str(device))
                 self.assertEqual(record["peer_device"], peer)
-                self.assertEqual(record["peer_ub_device"], "" if peer == "npu" else "udmac0d1e3")
-                self.assertEqual(record["priorities"], "3" if peer == "npu" else "13")
+                self.assertEqual(record["peer_service_addr"], endpoint)
+                self.assertEqual(record["peer_ub_device"], ub_device)
+                self.assertEqual(record["priorities"], priority)
                 self.assertEqual(record["iterations"], 7)
                 self.assertTrue((directory / "batch_get_jetty_summary.csv").is_file())
                 with (directory / "batch_get_miss_sweep_summary.csv").open() as stream:
                     summary = list(csv.DictReader(stream))
                 self.assertEqual(len(summary), 1)
-                self.assertEqual(summary[0]["batch_get_mode"], "raw" if peer == "npu" else "no-pipeline")
-                self.assertEqual(summary[0]["selected_ub_device"], "" if peer == "npu" else "udmac0d1e3")
-        self.assertLess(records["baseline_npu", "npu"]["finish_ns"], records["baseline_cpu", "cpu"]["ready_ns"])
-        ready = max(records["concurrent", peer]["ready_ns"] for peer in ("npu", "cpu"))
-        for peer in ("npu", "cpu"):
-            self.assertLess(records["baseline_cpu", "cpu"]["finish_ns"], records["concurrent", peer]["ready_ns"])
-            self.assertGreaterEqual(records["concurrent", peer]["start_ns"], ready)
-        with (self.output / "comparison.csv").open() as stream:
+                self.assertEqual(summary[0]["batch_get_mode"], mode)
+                self.assertEqual(summary[0]["selected_ub_device"], ub_device)
+        ready = max(records["concurrent", name]["ready_ns"] for name in routes)
+        for name in routes:
+            self.assertGreaterEqual(records["concurrent", name]["start_ns"], ready)
+        if not baselines:
+            self.assertFalse((output / "comparison.csv").exists())
+            self.assertEqual({p.name for p in output.iterdir()}, {"concurrent"})
+            return
+        self.assertLess(records["baseline_flow1", "flow1"]["finish_ns"],
+                        records["baseline_flow2", "flow2"]["ready_ns"])
+        for name in routes:
+            self.assertLess(records["baseline_flow2", "flow2"]["finish_ns"], records["concurrent", name]["ready_ns"])
+        with (output / "comparison.csv").open() as stream:
             rows = list(csv.DictReader(stream))
-        self.assertEqual([row["flow"] for row in rows], ["npu_peer", "cpu_peer"])
+        self.assertEqual([row["flow"] for row in rows], ["flow1", "flow2"])
         for row in rows:
             self.assertEqual(float(row["mean_us_ratio"]), 2.0)
             self.assertAlmostEqual(float(row["p50_GBps_ratio"]), 0.5, places=5)
