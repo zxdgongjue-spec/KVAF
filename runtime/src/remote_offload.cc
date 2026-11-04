@@ -142,7 +142,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
     if (status.ok()) {
       impl_->bound = true; impl_->selected = eid;
       impl_->mr_id = 1;
-      std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_READY region=%llu source=%llu device=%u npu_eid=%s mrs=%zu jettys=4 probe=all_mrs_scratch_checksum_pass\n",
+      std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_READY region=%llu source=%llu device=%u npu_eid=%s mrs=%zu jettys=4 probe=all_mrs_all_jettys_scratch_checksum_pass\n",
           (unsigned long long)ticket.region_id, (unsigned long long)impl_->id, impl_->device, eid.c_str(), inputs.size());
       return status;
     }

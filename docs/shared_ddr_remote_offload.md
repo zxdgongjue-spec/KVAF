@@ -85,7 +85,8 @@ post 调用、4 个成功尾部 CQE。更大 span 会拆成更多 WQE，超过�
 
 CPU 服务使用 Release 构建，数据传输固定使用四 Jetty 批量模式。PROFILE 环境变量在 Open
 时读取，用于共享池 CPU Pull。串行对照模式已移除；启动连通性探测仍保留
-queue 0 上的单条 READ，以确认失败候选能安全释放后再回退。
+四个 Jetty 各自的单条 READ，逐个提交并等待，始终最多一个探测 WR 在途；每个 Jetty 都需通过
+scratch checksum 校验。只有收到对应终止 CQE 且清理成功，失败候选才允许回退。
 
 ```bash
 cmake -S . -B build-cpu-shared-ddr -DCMAKE_BUILD_TYPE=Release
