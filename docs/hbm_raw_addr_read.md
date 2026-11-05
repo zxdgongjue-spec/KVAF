@@ -149,6 +149,11 @@ KVHR v7 运行阶段控制消息只传源/连接身份、MR ID 和批次号，�
 
 同一个 reader 的控制请求复用 TCP 连接，双方启用 TCP_NODELAY；服务端轮询多连接，空闲连接不阻塞其他请求。服务端通过 Response 的保留字段声明连接复用能力，同版本未声明复用的服务端使用单请求连接；不同线协议版本拒绝通信。通信结果不确定时关闭连接，由既有 resolve 流程恢复，不自动重发请求。Acquire/Complete 和同步返回继续保留，用于保证 B 的 ready/release_batch 复用时序。
 
+Complete 控制通路合并了头和正文的接收：A 按当前命令的固定回复长度读取；B 先读取所有请求共有的 72 B 前缀，只有 Open/Channel 或 admission result 才继续读取各自的尾部。
+正常 Complete 仍发送 72 B 请求并等待 432 B 回复，完整帧到达时两端各减少一次 `recv`。
+分片时继续读足当前帧，帧头不合法时拒绝；不会多读下一帧，也不会把短回复当成成功。
+请求/回复格式、KVHR v7、B 端批次状态转换和丢回复后的 resolve 行为保持一致，Python 绑定和 kernel 不受此改动影响。
+
 每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
 
 使用 `KvafExecuteBatchGetRawAddrAivKernelV3`，参数从 80 B 增至 88 B，旧 V1/V2 object 会拒绝加载。NPU 运行库和 raw kernel object 需一起重编译；Python 调用、object 文件名和控制协议不变。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
@@ -201,6 +206,16 @@ python tests/python/test_hbm_read_raw_addr.py \
 假 ACL 将 kernel 和状态拷贝延迟到 stream 同步时按顺序执行，验证 Host 不会提前读取结果；
 还覆盖固定页内存申请/释放失败、跨批次复用，以及异步回读提交或同步失败时保留源、output 和状态缓冲。
 `kvaf_hbm_read_transport_test` 运行生产 Host 注册/缓存代码，验证 78 份不同 token/EID 的描述共用 output MR 和队列、缓存命中、上传失败、部分导入和重试清理。
+`kvaf_hbm_read_control_test` 验证混合控制帧粘连、头/正文分片、截断、错误版本/长度/批次身份及远端错误返回。
+可在启用 `BUILD_TESTING` 的构建中运行纯 C++ loopback TCP 对照：
+
+```bash
+./build/tests/kvaf_hbm_read_control_test --benchmark
+```
+
+将 `build` 替换为实际测试构建目录。基准交替比较旧的头/正文分开接收与当前合并接收，
+每组预热 100 次、测量 2000 次，双方都使用 TCP_NODELAY。
+它只测控制消息往返，没有 NPU 工作和真实源状态处理；最终收益看原硬件 bench 的 `complete` 和完整调用时间。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
 
 ## 随机离散包性能测试

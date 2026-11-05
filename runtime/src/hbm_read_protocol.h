@@ -71,6 +71,11 @@ Status SendHello(int fd, Admission, const HbmReceiverTicket&, const HbmReadTicke
 Status ReadHello(int fd, Hello*, HbmReadTicket*);
 bool SendResult(int fd, const Status&);
 Status ReadResult(int fd, const peer::MessageHeader&);
+Status ReadResult(const HelloResult&);
+// Read the common request prefix once, then only the remaining tail. The
+// socket carries both requests and admission results; never read into the
+// next frame when they arrive together. request->header identifies the kind.
+bool ReadSourceMessage(int fd, Request*, HelloResult*);
 Status Leave(const HbmReceiverTicket&, const HbmReadTicket&);
 int Connect(const std::string&);
 Status Listen(const std::string&, int* fd, std::uint16_t* port);

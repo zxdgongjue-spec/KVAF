@@ -12,6 +12,21 @@
 
 namespace kvaf::hbm_read {
 namespace {
+// Usually receives the entire prefix in one syscall, while still checking a
+// fragmented header before waiting for its body. bytes never crosses a frame.
+template<class Validate>
+bool ReadPrefix(int fd,void* frame,peer::MessageHeader& header,std::size_t bytes,Validate validate) {
+  ssize_t received;
+  do { received=recv(fd,frame,bytes,0); } while(received<0 && errno==EINTR);
+  if(received<=0)return false;
+  auto n=static_cast<std::size_t>(received);
+  if(n<sizeof(header)) {
+    if(!offload::ReadBytes(fd,static_cast<char*>(frame)+n,sizeof(header)-n))return false;
+    n=sizeof(header);
+  }
+  if(!validate(header))return false;
+  return n==bytes || offload::ReadBytes(fd,static_cast<char*>(frame)+n,bytes-n);
+}
 addrinfo* Addresses(const std::string& address, bool listen) {
   auto split=address.rfind(':');
   if (split==std::string::npos || split==0 || split+1==address.size()) return nullptr;
@@ -80,9 +95,10 @@ Status ControlChannel::Exchange(Request r,Response* out) {
   r.count=0;r.header.bytes=RequestBytes(r.header.command);
   *out={};
   const auto response_bytes=ResponseBytes(r.header.command);
-  if(!offload::WriteBytes(fd_,&r,r.header.bytes) || !offload::ReadBytes(fd_,&out->header,sizeof(out->header)) ||
-     out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=response_bytes ||
-     !offload::ReadBytes(fd_,reinterpret_cast<char*>(out)+sizeof(out->header),response_bytes-sizeof(out->header))) {
+  if(!offload::WriteBytes(fd_,&r,r.header.bytes) ||
+     !ReadPrefix(fd_,out,out->header,response_bytes,[&](const peer::MessageHeader& h){
+       return h.magic==kMagic && h.version==kVersion && h.bytes==response_bytes;
+     })) {
     Close();return Status::InDoubt("HBM control response lost; retain source/output and resolve");
   }
   if(out->header.magic!=kMagic || out->header.version!=kVersion || out->header.bytes!=response_bytes ||
@@ -116,9 +132,30 @@ bool SendResult(int fd,const Status& s) {
 Status ReadResult(int fd,const peer::MessageHeader& header) {
   HelloResult r{};r.header=header;
   if(header.magic!=kMagic || header.version!=kVersion || header.command!=unsigned(Admission::Result) || header.bytes!=sizeof(r) ||
-     !offload::ReadBytes(fd,reinterpret_cast<char*>(&r)+sizeof(header),sizeof(r)-sizeof(header)) || r.code>unsigned(StatusCode::kInDoubt))
+     !offload::ReadBytes(fd,reinterpret_cast<char*>(&r)+sizeof(header),sizeof(r)-sizeof(header)))
+    return Status::InDoubt("HBM admission response lost or invalid");
+  return ReadResult(r);
+}
+Status ReadResult(const HelloResult& r) {
+  if(r.header.magic!=kMagic || r.header.version!=kVersion || r.header.command!=unsigned(Admission::Result) ||
+     r.header.bytes!=sizeof(r) || r.code>unsigned(StatusCode::kInDoubt))
     return Status::InDoubt("HBM admission response lost or invalid");
   return Status::Error(static_cast<StatusCode>(r.code),std::string(r.detail,strnlen(r.detail,sizeof(r.detail))));
+}
+bool ReadSourceMessage(int fd,Request* request,HelloResult* result) {
+  constexpr auto prefix=offsetof(Request,connection);
+  static_assert(prefix>=sizeof(peer::MessageHeader) && prefix<=sizeof(HelloResult),"invalid KVHR common prefix");
+  if(!ReadPrefix(fd,request,request->header,prefix,[](const peer::MessageHeader& h){
+      return h.magic==kMagic && h.version==kVersion &&
+          h.bytes==(h.command==unsigned(Admission::Result)?sizeof(HelloResult):RequestBytes(h.command));
+    }))return false;
+  const auto& h=request->header;
+  if(h.command==unsigned(Admission::Result)) {
+    std::memcpy(result,request,prefix);
+    return offload::ReadBytes(fd,reinterpret_cast<char*>(result)+prefix,sizeof(*result)-prefix);
+  }
+  return !request->count && (h.bytes==prefix ||
+      offload::ReadBytes(fd,reinterpret_cast<char*>(request)+prefix,h.bytes-prefix));
 }
 Status Leave(const HbmReceiverTicket& receiver,const HbmReadTicket& ticket) {
   int fd=Connect(receiver.control_address);if(fd<0)return Status::InDoubt("HBM receiver unavailable; retain registration");

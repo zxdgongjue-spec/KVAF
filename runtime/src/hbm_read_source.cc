@@ -156,10 +156,11 @@ struct NpuPullHbmSource::Impl {
               report(Status::InDoubt("HBM registration timed out; retain source and retry shutdown"));
             continue;
           }
-          peer::MessageHeader h{};
-          if(n<0 || !(p.revents&POLLIN) || !offload::ReadBytes(fd,&h,sizeof(h)))break;
+          hr::Request r{};hr::HelloResult admission{};
+          if(n<0 || !(p.revents&POLLIN) || !hr::ReadSourceMessage(fd,&r,&admission))break;
+          const auto& h=r.header;
           if(h.command==unsigned(hr::Admission::Result)) {
-            status=hr::ReadResult(fd,h);
+            status=hr::ReadResult(admission);
             if(!status.ok()) {
               std::lock_guard<std::mutex> lock(mutex);
               if(status.code()==StatusCode::kNotFound && !client && !retired.empty()){peer_retired=true;stop=true;}
@@ -172,9 +173,6 @@ struct NpuPullHbmSource::Impl {
             }
             report(status);continue;
           }
-          hr::Request r{};r.header=h;
-          if(h.magic!=hr::kMagic || h.version!=hr::kVersion || h.bytes!=hr::RequestBytes(h.command) ||
-             !offload::ReadBytes(fd,reinterpret_cast<char*>(&r)+sizeof(h),h.bytes-sizeof(h)) || r.count)break;
           hr::Response response{};
           response.header={hr::kMagic,hr::kVersion,std::uint16_t(h.command|0x8000U),hr::ResponseBytes(h.command)};
           response.source_id=r.source_id;response.epoch=r.epoch;response.client=r.client;

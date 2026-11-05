@@ -117,6 +117,12 @@ foreach(fault stale-success stale-core stale-rejection copy-submit-failure sync-
   set_tests_properties(kvaf_hbm_read_${fault}_test PROPERTIES TIMEOUT 15)
 endforeach()
 
+add_executable(kvaf_hbm_read_control_test hbm_read_control_test.cc)
+target_include_directories(kvaf_hbm_read_control_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
+target_link_libraries(kvaf_hbm_read_control_test PRIVATE kvaf_offload_control kvaf_peer_link)
+add_test(NAME kvaf_hbm_read_control_test COMMAND kvaf_hbm_read_control_test)
+set_tests_properties(kvaf_hbm_read_control_test PROPERTIES TIMEOUT 15)
+
 add_executable(kvaf_hbm_read_with_ddr_test hbm_read_test.cc raw_runtime_fake_operator.cc
   ../runtime/src/npu_runtime.cc ../runtime/src/remote_offload.cc ../runtime/src/remote_pull_operator.cc
   ../runtime/src/hbm_read_source.cc ../runtime/src/hbm_read_client.cc)
