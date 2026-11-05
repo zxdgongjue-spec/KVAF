@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "peer_protocol.h"
+#include "cpu_gather.h"
 #include "status.h"
 
 namespace kvaf::peer {
@@ -50,6 +51,12 @@ class PeerLink {
   void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  Status EnableDirectGather(uint64_t region_base) const;
+  Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
+                        OpenCpuPushGetResponse* response) const;
+  Status StartCpuPushGet(uint64_t region_base) const;
+  Status StopCpuPushGet(uint64_t region_base) const;
   Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
@@ -57,6 +64,16 @@ class PeerLink {
       std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
       uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
       uint32_t* peer_psn);
+
+  // Shared TP is negotiated explicitly; keep the original overload for callers
+  // using the existing per-channel transport setup.
+  Status CreateChannel(
+      uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
+      uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
+      uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
+      std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
+      uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
+      uint32_t* peer_psn, bool share_tp);
 
  private:
   std::string address_;

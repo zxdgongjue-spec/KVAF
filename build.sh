@@ -6,6 +6,7 @@ set -euo pipefail
 readonly KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly UMDK_REPOSITORY="https://gitcode.com/openeuler/umdk.git"
 readonly UMDK_BRANCH="br_UMDK_24.12.0_LTS"
+source "$KVAF_ROOT/scripts/cann_root.sh"
 
 die() {
   echo "ERROR: $*" >&2
@@ -14,22 +15,33 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N] [--without-urma] [--without-python]
+Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N] [mode-specific options]
 
-cpu  Builds the unified CPU Runtime service. If liburma is not installed,
+cpu  Builds the CPU Runtime service with liburma and OpenMP. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
      --without-urma includes only the UBmem backend in the same service.
-npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
-     installs pybind11 for the selected Python interpreter when necessary.
+aicpu-urma Builds and installs AICPU gather_read, BatchPut and Python bindings.
+     --cpu-push adds Host direct HCCP and the CPU push/scatter kernel (needs device securec).
+npu  Builds all backends (AIV URMA, UBmem, AICPU Gather/Scatter and BatchPut),
+     outputs one Python package and installs the AICPU device package into CANN.
+     --without-aicpu builds only AIV/UBmem, without AICPU dependencies or installation.
      --without-python builds NPU C++ libraries and tests without the binding.
+Both NPU modes install pybind11 for the selected Python interpreter when necessary.
+     --check-kernel / --uninstall-kernel manage the AICPU package without building.
+     --install-kernel remains accepted for compatibility; installation is automatic.
+     Installing requires write access to the selected CANN package/config directories.
 
 Environment overrides:
-  KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
+  KVAF_UMDK_ROOT       UMDK source/header root for CPU and AICPU builds
   KVAF_URMA_LIBRARY    Existing liburma.so path for the CPU build
   KVAF_UMDK_BUILD_DIR  Build directory used when building bundled UMDK
-  ASCEND_CANN_PACKAGE_PATH
-                        CANN toolkit root for the NPU build
+  ASCEND_HOME_PATH / ASCEND_CANN_PACKAGE_PATH
+                        CANN root; both must resolve to the same directory if set
   PYTHON               Python interpreter for the NPU binding (default: python3)
+  KVAF_AICPU_CXX       AICPU cross compiler override
+  KVAF_AICPU_SECUREC_INCLUDE_DIR
+  KVAF_AICPU_SECUREC_LIBRARY
+                        Device securec header and AArch64 library for memcpy_sp
   KVAF_BUILD_JOBS      Parallel build jobs
 EOF
 }
@@ -129,6 +141,7 @@ build_cpu() {
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_CPU_ENABLE_URMA=ON -DBUILD_TESTING=ON \
+    -DKVAF_ENABLE_AICPU_URMA=OFF \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
@@ -136,17 +149,7 @@ build_cpu() {
 }
 
 find_cann_root() {
-  local candidate
-  for candidate in \
-    "${ASCEND_CANN_PACKAGE_PATH:-}" \
-    "${ASCEND_HOME_PATH:-}" \
-    /usr/local/Ascend/ascend-toolkit/latest \
-    /usr/local/Ascend/cann/aarch64-linux/asc; do
-    if [[ -n "$candidate" && -f "$candidate/include/acl/acl.h" ]]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
+  kvaf_find_cann_root
 }
 
 build_npu() {
@@ -154,50 +157,106 @@ build_npu() {
   local jobs="$2"
   local python_bin="${PYTHON:-python3}"
   local cann_root
-  local pybind11_dir=""
   local build_python=OFF
-
-  require_command cmake
+  local build_aiv=ON build_aicpu=ON build_testing=ON
+  local umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
+  local -a cmake_options=()
+  local -a package_options=()
+  if [[ "$mode" == aicpu-urma ]]; then build_aiv=OFF; build_testing=OFF; fi
+  if [[ "$without_aicpu" == ON ]]; then build_aicpu=OFF; fi
+  if [[ "$cpu_push" == ON ]]; then package_options+=(--require-scatter); fi
   cann_root="$(find_cann_root)"
-  [[ -n "$cann_root" ]] || die "CANN toolkit was not found; source CANN set_env.sh or set ASCEND_CANN_PACKAGE_PATH"
+  [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
+  if [[ "$kernel_action" == check || "$kernel_action" == uninstall ]]; then
+    local -a artifact_options=()
+    local artifact_dir="$build_dir/access_operator/src/aicpu_urma"
+    if [[ "$kernel_action" == check && -s "$artifact_dir/kernel.json" && -s "$artifact_dir/kvaf-aicpu-urma.tar.gz" ]]; then
+      artifact_options+=("$artifact_dir")
+    fi
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" \
+      ${package_options[@]+"${package_options[@]}"} "--$kernel_action" "$cann_root" \
+      ${artifact_options[@]+"${artifact_options[@]}"}
+    return
+  fi
+  [[ -f "$cann_root/include/acl/acl.h" ]] || die "ACL headers missing under $cann_root"
+  require_command cmake
   if [[ "$without_python" != ON ]]; then
     build_python=ON
     require_command "$python_bin"
+    python_bin="$(command -v "$python_bin")"
     if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
       echo "[KVAF_BUILD] installing pybind11 for $python_bin"
       "$python_bin" -m pip install --user pybind11
     fi
-    pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
+    cmake_options+=("-DPython_EXECUTABLE=$python_bin" "-DPython3_EXECUTABLE=$python_bin"
+      "-Dpybind11_DIR=$("$python_bin" -m pybind11 --cmakedir)")
   fi
-
+  if [[ "$build_aicpu" == ON ]]; then
+    ensure_umdk_source "$umdk_root"
+    cmake_options+=("-DKVAF_URMA_ROOT=$umdk_root")
+    if [[ -n "${KVAF_AICPU_CXX:-}" ]]; then
+      cmake_options+=("-DKVAF_AICPU_CXX=$KVAF_AICPU_CXX")
+    fi
+    if [[ -n "${KVAF_AICPU_SECUREC_INCLUDE_DIR:-}" ]]; then
+      cmake_options+=("-DKVAF_AICPU_SECUREC_INCLUDE_DIR=$KVAF_AICPU_SECUREC_INCLUDE_DIR")
+    fi
+    if [[ -n "${KVAF_AICPU_SECUREC_LIBRARY:-}" ]]; then
+      cmake_options+=("-DKVAF_AICPU_SECUREC_LIBRARY=$KVAF_AICPU_SECUREC_LIBRARY")
+    fi
+  fi
+  # Set every backend switch explicitly so reusing a build directory cannot
+  # retain AICPU/Scatter (or a CPU service) after selecting a trimmed build.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DBUILD_TESTING=ON \
-    -DKVAF_BUILD_PYTHON="$build_python" \
-    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-    -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    -DBUILD_TESTING="$build_testing" -DKVAF_BUILD_PYTHON="$build_python" \
+    -DKVAF_ENABLE_AIV_BATCH_GET="$build_aiv" -DKVAF_ENABLE_AIV_BATCH_PUT="$build_aiv" \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA="$build_aicpu" \
+    -DKVAF_ENABLE_AICPU_CPU_PUSH="$cpu_push" \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
-    -Dpybind11_DIR="$pybind11_dir"
+    ${cmake_options[@]+"${cmake_options[@]}"}
   cmake --build "$build_dir" --parallel "$jobs"
+  if [[ "$build_aicpu" == ON ]]; then
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" \
+      ${package_options[@]+"${package_options[@]}"} --install \
+      "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
+  fi
   if [[ "$build_python" == ON ]]; then echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"; fi
-  echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
-  echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  if [[ "$build_aiv" == ON ]]; then
+    echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
+    echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  fi
 }
 
 mode="${1:-}"
 case "$mode" in
-  cpu|npu) shift ;;
+  cpu|npu|aicpu-urma) shift ;;
   -h|--help|help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
 esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
+kernel_action=build
+cpu_push=OFF
+if [[ "$mode" == npu ]]; then cpu_push=ON; fi
 without_urma=OFF
+without_aicpu=OFF
 without_python=OFF
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --without-urma) without_urma=ON; shift ;;
-    --without-python) without_python=ON; shift ;;
+    --without-urma)
+      [[ "$mode" == cpu ]] || die "--without-urma is only valid for cpu"
+      without_urma=ON; shift ;;
+    --without-python)
+      [[ "$mode" == npu ]] || die "--without-python is only valid for npu"
+      without_python=ON; shift ;;
+    --without-aicpu)
+      [[ "$mode" == npu ]] || die "--without-aicpu is only valid for npu"
+      without_aicpu=ON; cpu_push=OFF; shift ;;
+    --cpu-push)
+      [[ "$mode" == aicpu-urma ]] || die "--cpu-push is only valid for aicpu-urma"
+      cpu_push=ON
+      shift
+      ;;
     --build-dir)
       [[ $# -ge 2 ]] || die "--build-dir requires a value"
       build_dir="$2"
@@ -208,11 +267,23 @@ while [[ $# -gt 0 ]]; do
       jobs="$2"
       shift 2
       ;;
+    --install-kernel|--check-kernel|--uninstall-kernel)
+      [[ "$mode" != cpu ]] || die "$1 is only valid for npu or aicpu-urma"
+      case "$1" in
+        --install-kernel) kernel_action=install ;;
+        --check-kernel) kernel_action=check ;;
+        --uninstall-kernel) kernel_action=uninstall ;;
+      esac
+      shift
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
+if [[ "$without_aicpu" == ON && "$kernel_action" != build ]]; then
+  die "AICPU package actions cannot be combined with --without-aicpu"
+fi
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"
 else

@@ -8,6 +8,8 @@
 
 namespace kvaf {
 
+struct BatchGetProfile;
+
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
 struct RuntimeInitRequest {
@@ -98,6 +100,8 @@ struct BatchFreeRequest {
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
+  // Optional AICPU stage timings; requires synchronize=true.
+  BatchGetProfile* profile{nullptr};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

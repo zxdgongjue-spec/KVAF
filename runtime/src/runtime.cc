@@ -121,6 +121,11 @@ Status RuntimeCore::Shutdown() {
   // Stop accepting work, but keep ownership until cleanup has succeeded.
   initialized_ = false;
 
+  // Pending transfers may still reference the region and access tables.
+  // Keep ownership intact if the operator cannot drain or close its session.
+  const Status operator_status = access_operator_.Shutdown();
+  if (!operator_status.ok()) return operator_status;
+
   Status first_error = Status::OK();
   for (const auto& entry : access_tables_) {
     const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
@@ -130,10 +135,6 @@ Status RuntimeCore::Shutdown() {
   }
   access_tables_.clear();
 
-  const Status operator_status = access_operator_.Shutdown();
-  if (!operator_status.ok()) {
-    return first_error.ok() ? operator_status : first_error;
-  }
   const Status release_status = ddr_allocator_.Release(remote_region_);
   if (!release_status.ok()) {
     return first_error.ok() ? release_status : first_error;
