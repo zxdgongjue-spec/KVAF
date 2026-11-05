@@ -45,11 +45,13 @@ struct CpuRuntime::Impl {
 #endif
 };
 CpuRuntime::CpuRuntime() = default;
-CpuRuntime::~CpuRuntime() { (void)Shutdown(); }
+CpuRuntime::~CpuRuntime() { if (!Shutdown().ok()) (void)impl_.release(); }
 Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   if (impl_) return Status::InvalidState("CpuRuntime already initialized");
   if (options.has_eid_index && options.ub_device.empty())
     return Status::InvalidArgument("invalid CPU runtime options");
+  if (options.gather_threads > 64U)
+    return Status::InvalidArgument("CpuRuntime gather_threads must be in [1,64] or auto");
   impl_ = std::make_unique<Impl>(options);
   return Status::OK();
 }
@@ -70,6 +72,7 @@ Status CpuRuntime::ReleaseLink(LinkId id) {
 }
 Status CpuRuntime::ServeConnection(int fd) {
   if (!impl_) return Status::NotInitialized("CpuRuntime not initialized");
+  if (fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
   peer::MessageHeader header{};
   if (!Read(fd, &header, sizeof(header)) || header.magic != peer::kProtocolMagic ||
       header.version != peer::kProtocolVersion)
@@ -102,6 +105,13 @@ Status CpuRuntime::ServeConnection(int fd) {
       return Reply<peer::CandidateInfoResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kCreateChannel:
       return Reply<peer::CreateChannelResponse>(fd, command, peer::Result::kResourceError);
+    case peer::Command::kOpenCpuPushGet:
+      return Reply<peer::OpenCpuPushGetResponse>(fd, command, peer::Result::kResourceError);
+    case peer::Command::kEnableDirectGather:
+    case peer::Command::kEnableGatherLanes:
+    case peer::Command::kStartCpuPushGet:
+    case peer::Command::kStopCpuPushGet:
+      return Reply<peer::StatusResponse>(fd, command, peer::Result::kResourceError);
     default: return Reply<peer::StatusResponse>(fd, command, peer::Result::kInvalidRequest);
   }
 }
@@ -109,6 +119,10 @@ Status CpuRuntime::Shutdown() {
   if (!impl_) return Status::OK();
   auto status = impl_->ubmem.Shutdown();
   if (!status.ok()) return status;
+#ifdef KVAF_CPU_HAS_URMA
+  status = impl_->urma.Shutdown();
+  if (!status.ok()) return status;
+#endif
   impl_.reset();
   return Status::OK();
 }

@@ -117,6 +117,13 @@ bool GetPeerCtp(const DirectHccpApi& api, void* context,
 
 }  // namespace
 
+bool GetPeerTp(const DirectHccpApi& api, void* context,
+               const std::array<std::uint8_t, kEidBytes>& local_eid,
+               const std::array<std::uint8_t, kEidBytes>& peer_eid,
+               const char* role, std::uint64_t* tp) {
+  return GetPeerCtp(api, context, local_eid, peer_eid, role, tp);
+}
+
 bool LoadDirectHccp(DirectHccpApi* api) {
   if (api == nullptr) return false;
   for (const char* candidate : {"libra.so", "libra.so.0", "libhccp.so", "libhccp.so.0"}) {
