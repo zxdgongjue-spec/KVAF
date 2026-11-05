@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -59,18 +60,105 @@ class InstallTests(unittest.TestCase):
         self.artifacts = Path(self.temp.name) / "artifacts"
         self.artifacts.mkdir()
         self.entries = {name: {} for name in ("KvafAicpuBatchPut", "KvafAicpuGatherRead", "KvafAicpuUmdkControl")}
+        self.revision = 0
         self.write_json()
+        self.write_archive(b"old kernel")
+
+    def write_archive(self, data):
         with tarfile.open(self.artifacts / "kvaf-aicpu-urma.tar.gz", "w:gz") as archive:
             info = tarfile.TarInfo("aicpu_kernels_device/libkvaf_aicpu_urma.so")
-            info.size = 4
-            archive.addfile(info, io.BytesIO(b"test"))
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
 
     def write_json(self):
         (self.artifacts / "kernel.json").write_text(json.dumps(self.entries))
 
-    def installer(self, *args):
+    def installer(self, *args, env=None):
         return subprocess.run(["bash", str(ROOT / "access_operator/src/aicpu_urma/package/install_kernel.sh"), *map(str, args)],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env=env)
+
+    def installed_paths(self):
+        base = self.root / "opp/vendors/cust/op_impl/aicpu"
+        return [base / "kernel/kvaf-aicpu-urma.tar.gz", base / "config/kvaf_aicpu_urma.json",
+                self.root / "conf/ascend_package_load.ini"]
+
+    def snapshot(self):
+        return [path.read_bytes() if path.exists() else None for path in self.installed_paths()]
+
+    def update_artifacts(self):
+        self.revision += 1
+        self.entries[SCATTER] = {"revision": self.revision}
+        self.write_json()
+        self.write_archive(f"new kernel {self.revision}".encode())
+
+    def assert_no_transaction_files(self):
+        self.assertFalse((self.root / "conf/.kvaf-aicpu-urma.lock").exists())
+        self.assertFalse(list(self.root.rglob("*.kvaf.*")))
+
+    def fault_environment(self, command, target=None):
+        # Fail the real installer's command, allowing all rollback commands to run.
+        directory = Path(self.temp.name) / "bin"
+        directory.mkdir(exist_ok=True)
+        wrapper = directory / command
+        wrapper.write_text(f"#!{sys.executable}\n" +
+            "import os, sys\nfrom pathlib import Path\n" +
+            ("if sys.argv[-2].endswith('/new') and Path(sys.argv[-1]).resolve() == Path(" + repr(str(target)) + ").resolve()" +
+             ":\n    sys.exit(42)\n" if command == "mv" else "sys.exit(42)\n") +
+            f"os.execv({shutil.which(command)!r}, [{command!r}] + sys.argv[1:])\n")
+        wrapper.chmod(0o755)
+        return dict(os.environ, PATH=str(directory) + os.pathsep + os.environ.get("PATH", ""))
+
+    def test_malformed_config_does_not_replace_existing_package(self):
+        self.assertEqual(self.installer("--install", self.artifacts, self.root).returncode, 0)
+        config = self.installed_paths()[2]
+        config.write_text(config.read_text().replace("optional:true", "optional:false"))
+        before = self.snapshot()
+        self.update_artifacts()
+        result = self.installer("--install", self.artifacts, self.root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("malformed", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_no_transaction_files()
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root bypasses directory permissions")
+    def test_unwritable_conf_preserves_existing_package(self):
+        self.assertEqual(self.installer("--install", self.artifacts, self.root).returncode, 0)
+        before = self.snapshot()
+        self.update_artifacts()
+        conf = self.root / "conf"
+        conf.chmod(0o555)
+        try:
+            result = self.installer("--install", self.artifacts, self.root)
+        finally:
+            conf.chmod(0o755)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_no_transaction_files()
+
+    def test_publication_failures_roll_back_fresh_install_and_upgrade(self):
+        for upgrade in (False, True):
+            if upgrade:
+                self.assertEqual(self.installer("--install", self.artifacts, self.root).returncode, 0)
+            before = self.snapshot()
+            self.update_artifacts()
+            for target in self.installed_paths():
+                with self.subTest(upgrade=upgrade, target=target):
+                    result = self.installer("--install", self.artifacts, self.root,
+                                            env=self.fault_environment("mv", target))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.snapshot(), before)
+                    self.assert_no_transaction_files()
+
+    def test_post_install_check_failure_rolls_back_all_files(self):
+        self.assertEqual(self.installer("--install", self.artifacts, self.root).returncode, 0)
+        before = self.snapshot()
+        self.update_artifacts()
+        result = self.installer("--install", self.artifacts, self.root,
+                                env=self.fault_environment("cmp"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("differs from build artifact", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_no_transaction_files()
 
     def resolve_root(self, **environment):
         env = dict(os.environ)

@@ -359,7 +359,8 @@ ctest --test-dir build-host-tests --output-on-failure
 
 通过 `transport` 和 `aicpu_batch_get_mode` 选择前述四种组合。前三个基础参数
 `batch_get_kernel_object_path`、`batch_get_token_bytes`、`batch_get_tokens_per_block`
-必须传入，其他配置使用关键字。
+必须传入。原有参数直到 `transport` 仍支持位置传参；新增的
+`aicpu_batch_get_mode` 仅接受关键字传参，其他配置也建议使用关键字。
 
 | 内核路径参数 | AIV URMA | UBmem | AICPU Gather/Scatter |
 | --- | --- | --- | --- |

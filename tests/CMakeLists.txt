@@ -32,6 +32,14 @@ target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
 target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
 add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
 
+add_executable(kvaf_cpu_push_shutdown_test cpu_push_shutdown_test.cc
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/host/cpu_push_host.cc)
+target_include_directories(kvaf_cpu_push_shutdown_test PRIVATE cpu_push_host_stub
+  ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/access_operator/demo
+  ${PROJECT_SOURCE_DIR}/access_operator/src ${PROJECT_SOURCE_DIR}/runtime/include)
+target_link_libraries(kvaf_cpu_push_shutdown_test PRIVATE kvaf_common)
+add_test(NAME kvaf_cpu_push_shutdown_test COMMAND kvaf_cpu_push_shutdown_test)
+
 add_test(NAME kvaf_dsa_keys_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_dsa_keys.py")
@@ -59,6 +67,15 @@ add_test(
 )
 
 if(KVAF_BUILD_PYTHON)
+  pybind11_add_module(_kvaf_constructor_test npu_constructor_binding.cc)
+  target_include_directories(_kvaf_constructor_test PRIVATE ${PROJECT_SOURCE_DIR}/bindings/include)
+  set_target_properties(_kvaf_constructor_test PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/python")
+  add_test(NAME kvaf_npu_constructor_python
+    COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_constructor.py")
+  set_tests_properties(kvaf_npu_constructor_python PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python")
+
   add_test(
     NAME kvaf_runtime_mock_python
     COMMAND "${Python3_EXECUTABLE}"

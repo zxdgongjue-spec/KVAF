@@ -211,6 +211,9 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
 
 Status CpuPushTransport::Shutdown() {
   auto& s = *impl_;
+  // A healthy enqueued request still needs the CPU producer. Drain it before
+  // STOP; after an execution failure, STOP must run even if draining failed.
+  const auto drained = s.failed ? Status::OK() : s.Drain();
   // Stop the remote initiator before releasing any HBM, even after kernel failure.
   if (s.peer_open) {
     auto stopped = s.config.peer_link->StopCpuPushGet(s.source.base);
@@ -243,6 +246,6 @@ Status CpuPushTransport::Shutdown() {
   }
   s.sequence = 0;
   s.initialized = s.failed = false;
-  return Status::OK();
+  return drained;
 }
 }  // namespace kvaf::cpu_push

@@ -39,11 +39,11 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 `[0, miss_count)` 前缀参与搬运。
 
 `NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
-batch_get_tokens_per_block, *, device_id=0, npu_core_count=2,
+batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
 adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048,
-aicpu_batch_get_mode="", transport="urma")`
+transport="urma", *, aicpu_batch_get_mode="")`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
@@ -54,7 +54,8 @@ aicpu_batch_get_mode="", transport="urma")`
 AICPU 包由 Runtime 从 CANN 安装目录自动定位，删除了公开 JSON 路径参数。
 Gather 和 Scatter 都支持 `npu_eids` 候选列表，按顺序尝试并选用一个 EID，
 不指定时自动发现；AIV 的多 EID 条带语义不变。
-构造函数前三项以外使用关键字，避免删除旧参数后位置错位。
+保留原有参数直到 `transport` 的位置参数调用方式；新增的 `aicpu_batch_get_mode`
+仅接受关键字传参。新代码建议使用关键字明确各项配置。
 
 `transport` 默认使用 URMA；传入 `transport="ubmem"` 使用 UBmem。UBmem 的 CPU
 内存分配依赖 Ascend HAL 与驱动；CPU 服务根据分配请求选择后端，无需指定协议。

@@ -58,10 +58,9 @@ check_installed() {
   echo "[KVAF_AICPU_URMA] CHECK_OK root=$cann_root package=$kernel_dir/$package json=$config_dir/$json"
 }
 
-rewrite_load_config() {
+prepare_load_config() {
   local add_block="$1"
-  local temporary
-  temporary="$(mktemp "${load_config}.kvaf.XXXXXX")"
+  local temporary="$2"
   cp -p "$load_config" "$temporary"
   if ! awk -v target="$header" '
     BEGIN {
@@ -85,8 +84,69 @@ rewrite_load_config() {
   if [[ "$add_block" == true ]]; then
     printf '%s\n' "$expected_block" >> "$temporary"
   fi
+}
+
+rewrite_load_config() {
+  local temporary
+  temporary="$(mktemp "${load_config}.kvaf.XXXXXX")"
+  prepare_load_config "$1" "$temporary"
   mv -f "$temporary" "$load_config"
 }
+
+# Stage and validate all files before replacing any installed file. Each staging
+# directory is on its target's filesystem, so publication and rollback use rename.
+install_package() (
+  local -a targets=("$kernel_dir/$package" "$config_dir/$json" "$load_config")
+  local -a staging=()
+  local attempted=0 committed=false
+  cleanup_install() {
+    local result=$? failed=false i directory
+    trap - EXIT HUP INT TERM
+    if [[ "$committed" != true ]]; then
+      for ((i=attempted-1; i>=0; --i)); do
+        directory="${staging[$i]}"
+        if [[ -e "$directory/previous" || -L "$directory/previous" ]]; then
+          mv -f "$directory/previous" "${targets[$i]}" || failed=true
+        else
+          rm -f "${targets[$i]}" || failed=true
+        fi
+      done
+    fi
+    if [[ "$failed" == true ]]; then
+      echo "[KVAF_AICPU_URMA] rollback incomplete; recovery files retained: ${staging[*]}" >&2
+      exit 1
+    fi
+    for directory in ${staging[@]+"${staging[@]}"}; do rm -rf "$directory"; done
+    exit "$result"
+  }
+  trap cleanup_install EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  check_artifacts "$artifact_dir"
+  mkdir -p "$kernel_dir" "$config_dir"
+  for ((i=0; i<${#targets[@]}; ++i)); do
+    [[ ! -d "${targets[$i]}" ]] || die "installation target is a directory: ${targets[$i]}"
+    staging+=("$(mktemp -d "${targets[$i]}.kvaf.XXXXXX")")
+    if [[ -e "${targets[$i]}" || -L "${targets[$i]}" ]]; then
+      cp -pP "${targets[$i]}" "${staging[$i]}/previous"
+    fi
+  done
+  install -m 644 "$artifact_dir/$package" "${staging[0]}/new"
+  install -m 644 "$artifact_dir/kernel.json" "${staging[1]}/new"
+  prepare_load_config true "${staging[2]}/new"
+  # Preserve the original loader configuration for existing installations too.
+  if [[ ! -e "$load_config.kvaf-aicpu-urma.bak" ]]; then
+    cp -p "$load_config" "$load_config.kvaf-aicpu-urma.bak"
+  fi
+  for ((i=0; i<${#targets[@]}; ++i)); do
+    attempted=$((i + 1))
+    mv -f "${staging[$i]}/new" "${targets[$i]}"
+  done
+  check_installed "$artifact_dir"
+  committed=true
+)
 
 require_scatter=false
 if [[ "${1:-}" == --require-scatter ]]; then require_scatter=true; shift; fi
@@ -126,17 +186,19 @@ config_dir="$cann_root/opp/vendors/cust/op_impl/aicpu/config"
 load_config="$cann_root/conf/ascend_package_load.ini"
 [[ -f "$load_config" ]] || die "CANN package loader config missing: $load_config"
 
+# Serialize installs/uninstalls so rollback cannot overwrite another invocation.
+if [[ "$action" != --check ]]; then
+  lock_dir="$cann_root/conf/.kvaf-aicpu-urma.lock"
+  mkdir "$lock_dir" || die "cannot lock package installation: $lock_dir"
+  trap 'rmdir "$lock_dir"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
+
 case "$action" in
   --install)
-    check_artifacts "$artifact_dir"
-    mkdir -p "$kernel_dir" "$config_dir"
-    if [[ ! -f "$load_config.kvaf-aicpu-urma.bak" ]]; then
-      cp -p "$load_config" "$load_config.kvaf-aicpu-urma.bak"
-    fi
-    install -m 644 "$artifact_dir/$package" "$kernel_dir/$package"
-    install -m 644 "$artifact_dir/kernel.json" "$config_dir/$json"
-    rewrite_load_config true
-    check_installed "$artifact_dir"
+    install_package
     echo "[KVAF_AICPU_URMA] installed; restart the NPU client process"
     ;;
   --check)
