@@ -205,7 +205,7 @@ bool DescribeWorker(const UmdkControlArgs& args, std::uint32_t index, UmdkContro
   return true;
 }
 
-bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status) {
+static bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (std::all_of(args.local_eid, args.local_eid + 16, [](auto b) { return b == 0; }))
     return Fail(status, "Host-selected EID is zero");
   bool matched = false;
