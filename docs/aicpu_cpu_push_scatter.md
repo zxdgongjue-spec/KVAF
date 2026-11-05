@@ -108,7 +108,7 @@ KVAF_AICPU_WORKERS="1 2 4 5" \
 
 每组 `.log` 和 `summary.csv` 默认写入 `reports/aicpu-cpu-push-scatter/<时间戳>`。
 `KVAF_AICPU_SWEEP_LOG_DIR` 可指定一个新目录；任一组失败后停止并保留已完成结果。
-单组入口为 `python/benchmark_cpu_push_scatter.py`，参数与 GatherRead 相同，都支持 `--npu-eid`。
+单组入口为 `python/benchmark_cpu_push_scatter.py`，参数与 GatherRead 相同，复用原有 `--npu-eids` / `KVAF_NPU_EIDS` 及共享解析器。
 
 ## 请求与数据流
 

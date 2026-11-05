@@ -8,17 +8,24 @@ import os
 from pathlib import Path
 import random
 import statistics
+import sys
 import time
+
+# Share the original hardware tests' EID parser.
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tests" / "python"))
+from npu_eids import parse_npu_eids
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--device-id", type=int, default=7)
     parser.add_argument("--peer", default="127.0.0.1:28990")
     parser.add_argument("--workers", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--modes", nargs="+", choices=["gather_read", "cpu_push_scatter"],
                         default=["gather_read"])
-    parser.add_argument("--npu-eid", help="optional Host-selected NPU EID for all AICPU modes")
+    parser.add_argument("--npu-eids", type=parse_npu_eids,
+                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
+                        help="comma-separated Host EID candidates (environment: KVAF_NPU_EIDS)")
     parser.add_argument("--output-row-step", type=int, choices=[1, 2], default=2,
                         help="1 checks adjacent output rows; 2 leaves one guard row between outputs")
     parser.add_argument("--output-order", choices=["random", "sequential"], default="random",
@@ -164,7 +171,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         urma_device=args.urma_device,
         urma_eid_index=args.eid_index,
         aicpu_batch_get_mode=mode,
-        npu_eids=[args.npu_eid] if args.npu_eid else [],
+        npu_eids=args.npu_eids,
     )
     # Reuse registered allocations while changing their contents each round.
     source = torch.empty((n, block_bytes), dtype=torch.uint8, device=device)

@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 
 from test_batch_get import timing_stats
+from npu_eids import parse_npu_eids
 
 DDR_BUDGET_BYTES = 100 * 1024**3
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -18,7 +19,7 @@ PREFIXES = {"gather_read": "AICPU_GATHER_READ", "cpu_push_scatter": "AICPU_CPU_P
 
 
 def parse_args(argv=None, *, mode="gather_read"):
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
     p.add_argument("--urma-device", default="")
@@ -29,7 +30,9 @@ def parse_args(argv=None, *, mode="gather_read"):
                        help="direct: prepare CPU source addresses before timing; skip AICPU lookup")
     else:
         p.set_defaults(source_mode="table")
-    p.add_argument("--npu-eid", help="optional Host-selected NPU EID")
+    p.add_argument("--npu-eids", type=parse_npu_eids,
+                   default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
+                   help="comma-separated Host EID candidates (environment: KVAF_NPU_EIDS)")
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
     p.add_argument("--kernel-json", default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") if cann else None)
     p.add_argument("--workers", type=int, default=1)
@@ -166,13 +169,12 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
     direct = a.source_mode == "direct"
-    mode_options = {"npu_eids": [a.npu_eid]} if a.npu_eid else {}
     runtime = kvaf.NpuRuntime(
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
         npu_core_count=a.workers, aicpu_urma_kernel_json_path=a.kernel_json,
         urma_device=a.urma_device, urma_eid_index=a.eid_index,
-        aicpu_batch_get_mode="gather_read_direct" if direct else mode, **mode_options,
+        aicpu_batch_get_mode="gather_read_direct" if direct else mode, npu_eids=a.npu_eids,
     )
     profiles = []
     # Source and output allocations stay alive until the session is closed.
