@@ -90,7 +90,7 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 
 ### CPU Runtime
 
-`CpuRuntime` 由独立的 `kvaf_cpu_service` 进程创建。依赖于 UB 驱动、UMDK
+`CpuRuntime` 由独立的 `kvaf_cpu_service` 进程创建。默认 URMA 后端依赖于 UB 驱动、UMDK
 公开头文件和 `liburma.so`（无须 CANN、HCCP、ACL 或 NPU 驱动）。
 
 - 自动枚举可用 UMDK device/EID；
@@ -124,7 +124,8 @@ session 恢复、多个 peer 的选择和 CPU 侧数据面不属于当前范围�
 
 | 角色 | 必需条件 |
 | --- | --- |
-| CPU 服务机 | 已加载的 UB 驱动、`/dev/uburma`、可用的 `liburma.so`。 |
+| CPU 服务机（URMA） | 已加载的 UB 驱动、`/dev/uburma`、可用的 `liburma.so`。 |
+| CPU 服务机（UBmem） | 支持 Host P2P DDR、Fabric/VMM 接口的 Ascend 驱动和 HAL 库。 |
 | NPU 服务机 | Ascend 驱动、CANN、`torch_npu`、Python 3 和 C++17 编译器。 |
 | NPU kernel 构建 | CANN 路径中需要 `include/acl/acl.h`、`tools/ccec_compiler/bin` 和 SIMT 开发头 `simt_api/device_atomic_functions.h`。 |
 | 两端网络 | NPU 能通过 TCP 访问 CPU 服务地址；UB 网络和平台拓扑已配置。 |
@@ -180,7 +181,8 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
   --listen 0.0.0.0 --port 28999
 ```
 
-服务会自动发现 UB device/EID，并打印 `CANDIDATE_DISCOVERED` 与 `LISTEN`。也可按需要传入 `--ub-device NAME --eid-index N` 来选定对应的端口。
+服务启动后打印 `LISTEN`；首次 URMA 请求触发 device/EID 枚举并打印 `CANDIDATE_DISCOVERED`。
+也可按需要传入 `--ub-device NAME --eid-index N` 来选定 URMA 端口。
 N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
 `KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
 详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
@@ -234,8 +236,9 @@ KVAF_RUNTIME_PERF_ITERATIONS
 
 ## Python 调用流程
 
-默认情况下，`NpuRuntime` 只需要应用指定 CPU 服务地址，EID 与 UB device 由 Runtime
-自动选择。需要多 EID 并行时，可以显式提供严格的 NPU EID 列表。
+`NpuRuntime` 通过构造参数 `transport="urma"`（默认）或 `transport="ubmem"` 选择协议。
+以下 EID 与 Jetty 配置适用于 URMA；默认自动选择 EID 与 UB device，需要多 EID 并行时
+可以显式提供严格的 NPU EID 列表。
 
 ```python
 import kvaf
@@ -247,6 +250,7 @@ runtime = kvaf.NpuRuntime(
     device_id=0,
     npu_core_count=2,
     batch_put_kernel_object_path="build-npu/bin/kvaf_execute_batch_put_kernels.o",
+    transport="urma",  # 使用 UBmem 时改为 "ubmem"，其余 Runtime 接口保持相同。
     jettys_per_core=2,
     # 可选：每项是32位连续十六进制；空列表保持单 EID 自动发现。
     npu_eids=[
@@ -255,7 +259,7 @@ runtime = kvaf.NpuRuntime(
     ],
 )
 runtime.link_to("<cpu-ip>:28999")
-runtime.initialize(ddr_bytes=16 * 1024**3, slot_size=576)
+runtime.initialize(ddr_bytes=4096 * 656 * 128, slot_size=656 * 128)
 
 # 使用 NPU Tensor 调用 batch_put / batch_get；具体 Tensor 形状见 tests/python/。
 # table = runtime.prepare_access_table(keys)
@@ -294,7 +298,24 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
 
-### BatchGet 总在途请求预算
+### UBmem 传输
+
+UBmem 复用同一个 CPU service。CPU 端通过 Ascend HAL 分配 Host P2P DDR 并导出
+Fabric handle，NPU 通过 ACL 导入、映射后使用 MTE2/UB/MTE3 搬运数据。CPU 服务根据
+分配请求选择后端，无需指定协议；只使用 UBmem 时可用 `./build.sh cpu --without-urma`
+构建。Get/Put 的每核 UB 预算为 32 KiB，Get 最多使用 8 级流水，Put 使用双缓冲。
+
+CPU 服务启动后，可用下面的命令测试 `4096 × 656 B` 的 BatchGet。示例使用本机服务，
+CPU DDR 地址空间为 328 MiB；远程部署时替换服务地址。
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999 \
+tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+  --transport ubmem --request-length 4096 --table-capacity 4096 \
+  --aiv-cores 16 --output-access-pattern contiguous
+```
+
+### URMA BatchGet 总在途请求预算
 
 `NpuRuntime(..., batch_get_max_inflight_total=2048)` 默认限制单次 BatchGet 所有
 AIV 核合计的未确认 READ 数。小请求保留整批路径；大请求每核使用两个交叠组，

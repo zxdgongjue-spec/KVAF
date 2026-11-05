@@ -1,6 +1,16 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_package(Threads REQUIRED)
+add_executable(kvaf_runtime_cleanup_test runtime_cleanup_test.cc)
+target_link_libraries(kvaf_runtime_cleanup_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_runtime_cleanup_test COMMAND kvaf_runtime_cleanup_test)
+
+if(KVAF_BUILD_REMOTE_CPU_SERVICE AND NOT KVAF_CPU_ENABLE_URMA)
+  add_executable(kvaf_cpu_backend_dispatch_test cpu_backend_dispatch_test.cc)
+  target_link_libraries(kvaf_cpu_backend_dispatch_test PRIVATE kvaf_cpu_runtime)
+  add_test(NAME kvaf_cpu_backend_dispatch_test COMMAND kvaf_cpu_backend_dispatch_test)
+endif()
+
 add_executable(kvaf_cpu_push_scatter_test cpu_push_scatter_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc)
 target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
@@ -24,6 +34,9 @@ add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_mod
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
+add_test(NAME kvaf_batch_get_multicard_perf_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_multicard_perf.py")
 
 add_test(
   NAME kvaf_npu_eid_parser_python

@@ -69,7 +69,7 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
       ddr_allocator_(ddr_allocator) {}
 
 RuntimeCore::~RuntimeCore() {
-  if (initialized_) {
+  if (needs_cleanup_) {
     (void)Shutdown();
   }
 }
@@ -77,6 +77,9 @@ RuntimeCore::~RuntimeCore() {
 Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   if (initialized_) {
     return Status::InvalidState("Runtime has already been initialized");
+  }
+  if (needs_cleanup_) {
+    return Status::InvalidState("Runtime still has resources to clean up");
   }
   if (!access_tables_.empty()) {
     return Status::InvalidState("Runtime has unreleased AccessTables");
@@ -87,34 +90,36 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   if (!status.ok()) {
     return status;
   }
+  remote_region_ = remote_region;
+  needs_cleanup_ = true;
   if (remote_region.length == 0 || remote_region.slot_size == 0 ||
       remote_region.length % remote_region.slot_size != 0) {
-    (void)ddr_allocator_.Release(remote_region);
+    (void)Shutdown();
     return Status::InvalidArgument("DDR allocator returned an invalid remote region");
   }
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
-    (void)ddr_allocator_.Release(remote_region);
+    (void)Shutdown();
     return status;
   }
 
   status = meta_manager_.RegisterRemoteRegion(remote_region);
   if (!status.ok()) {
-    (void)access_operator_.Shutdown();
-    (void)ddr_allocator_.Release(remote_region);
+    (void)Shutdown();
     return status;
   }
 
-  remote_region_ = remote_region;
   initialized_ = true;
   return Status::OK();
 }
 
 Status RuntimeCore::Shutdown() {
-  if (!initialized_) {
+  if (!needs_cleanup_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
+  // Stop accepting work, but keep ownership until cleanup has succeeded.
+  initialized_ = false;
 
   // Pending transfers may still reference the region and access tables.
   // Keep ownership intact if the operator cannot drain or close its session.
@@ -131,11 +136,11 @@ Status RuntimeCore::Shutdown() {
   access_tables_.clear();
 
   const Status release_status = ddr_allocator_.Release(remote_region_);
-  if (!release_status.ok() && first_error.ok()) {
-    first_error = release_status;
+  if (!release_status.ok()) {
+    return first_error.ok() ? release_status : first_error;
   }
 
-  initialized_ = false;
+  needs_cleanup_ = false;
   remote_region_ = RemoteRegionDesc{};
   return first_error;
 }

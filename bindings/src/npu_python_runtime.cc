@@ -279,10 +279,13 @@ class NpuPythonRuntime final {
                    std::uint32_t batch_get_max_inflight_total,
                    std::string aicpu_urma_kernel_json_path,
                    std::string urma_device, std::uint32_t urma_eid_index,
-                   std::string aicpu_batch_get_mode) {
+                   std::string aicpu_batch_get_mode, const std::string& transport) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
+    if (transport == "urma") options.transport = Transport::kUrma;
+    else if (transport == "ubmem") options.transport = Transport::kUbmem;
+    else throw py::value_error("transport must be urma or ubmem");
     options.batch_put_kernel_object_path =
         std::move(batch_put_kernel_object_path);
     options.device_id = device_id;
@@ -436,8 +439,8 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
   }
 
-  void StartBatchGetKernelProfile() {
-    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
+  void StartBatchGetKernelProfile(bool detailed) {
+    ThrowIfError(native_->SetBatchGetKernelProfiling(true, detailed));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
@@ -463,6 +466,11 @@ class NpuPythonRuntime final {
       item["post_active_cycles"] = profile.post_active_cycles;
       item["drain_wait_cycles"] = profile.drain_wait_cycles;
       item["peak_submitted_not_drained"] = profile.peak_submitted_not_drained;
+      item["ubmem_profile_detail"] = profile.ubmem_profile_detail;
+      item["ubmem_setup_cycles"] = profile.ubmem_setup_cycles;
+      item["ubmem_address_cycles"] = profile.ubmem_address_cycles;
+      item["ubmem_submit_cycles"] = profile.ubmem_submit_cycles;
+      item["ubmem_drain_cycles"] = profile.ubmem_drain_cycles;
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
@@ -605,7 +613,8 @@ void BindNpuPythonRuntime(py::module_& module) {
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
                     std::string, std::vector<std::string>, std::uint32_t,
-                    std::string, std::string, std::uint32_t, std::string>(),
+                    std::string, std::string, std::uint32_t, std::string,
+                    const std::string&>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -622,7 +631,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("aicpu_urma_kernel_json_path") = "",
            py::arg("urma_device") = "",
            py::arg("urma_eid_index") = UINT32_MAX,
-           py::arg("aicpu_batch_get_mode") = "gather_read")
+           py::arg("aicpu_batch_get_mode") = "gather_read",
+           py::arg("transport") = "urma")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
@@ -658,6 +668,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            "CPU torch.int64 Tensor.")
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
+           py::arg("detailed") = false,
            "Enable the per-core BatchGet kernel cycle timeline.")
       .def("batch_get_kernel_profile",
            &NpuPythonRuntime::BatchGetKernelProfileSnapshot,

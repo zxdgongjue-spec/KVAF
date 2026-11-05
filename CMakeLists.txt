@@ -11,9 +11,8 @@ option(KVAF_ENABLE_AIV_BATCH_PUT
 option(KVAF_ENABLE_AICPU_URMA "Build the optional AICPU UMDK GatherRead data plane" OFF)
 option(KVAF_ENABLE_AICPU_CPU_PUSH "Build the Host direct-HCCP AICPU CPU push/scatter path" OFF)
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
-       "Build the liburma-only persistent CPU DDR/Jetty service"
+       "Build the persistent CPU DDR service (URMA and UBmem)"
        OFF)
-
 if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
     "KVAF_ENABLE_AIV_BATCH_PUT requires KVAF_ENABLE_AIV_BATCH_GET because "
