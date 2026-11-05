@@ -25,10 +25,11 @@ def main() -> int:
             or not hasattr(kvaf.NpuRuntime, "start_scatter_profile")
             or not hasattr(kvaf.NpuRuntime, "scatter_profile")
             or not hasattr(kvaf.NpuRuntime, "stop_scatter_profile")
+            or not hasattr(kvaf.NpuRuntime, "prepare_scatter_batch_get")
         ):
             raise RuntimeError(
                 "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
-                "AclGraph, BatchFree, and BatchGet/scatter profiling"
+                "AclGraph, BatchFree, prepared scatter, and BatchGet/scatter profiling"
             )
     return 0
 

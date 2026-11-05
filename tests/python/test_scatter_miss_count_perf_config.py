@@ -88,17 +88,19 @@ class AlignedScatterTests(unittest.TestCase):
         self.assertTrue(args.kernel_profile)
         self.assertFalse(args.host_profile)
         self.assertEqual(args.completion_mode, "reference")
+        self.assertEqual(args.host_submit, "reference")
         self.assertEqual(args.table_capacity, 1277952)
         self.assertEqual(args.table_capacity * 128 * 4096, 670014898176)
 
     def test_scalar_axes_and_environment_round_trip(self):
-        args = self.parse("--token-bytes", "656", "--miss-count", "1024", "--aiv-cores", "4", "--pipeline", "0")
+        args = self.parse("--token-bytes", "656", "--miss-count", "1024", "--aiv-cores", "4",
+                          "--pipeline", "0", "--host-submit", "prepared")
         self.assertEqual(len(perf.cases(args)), 1)
         case = perf.cases(args)[0]
         case.json, case.csv = Path("case.json"), Path("case.csv")
         child = self.parse(*perf.case_command(case)[4:])
         for key in ("token_bytes", "miss_count", "aiv_cores", "table_capacity",
-                    "warmup", "kernel_profile", "host_profile", "completion_mode", "pipeline"):
+                    "warmup", "kernel_profile", "host_profile", "completion_mode", "pipeline", "host_submit"):
             self.assertEqual(getattr(child, key), getattr(case, key))
         with patch.dict(os.environ, {"KVAF_BATCH_GET_PERF_TOKEN_BYTES": "256",
                                     "KVAF_BATCH_GET_PERF_MISS_COUNT": "64",
@@ -225,6 +227,50 @@ class AlignedScatterTests(unittest.TestCase):
         sample = perf.measure_call(Runtime(), "table", (1, 2, 3), "count", "output", torch,
                                    args, 0, clock=lambda: now[0])
         self.assertEqual(sample["end_to_end_us"], 100)
+
+    def test_prepared_buffers_refresh_every_plan_without_rebinding(self):
+        fixed = tuple(Vector([0, 0, -1]) for _ in range(3))
+        original_ids = [id(t) for t in fixed]
+        for values in ((7, 11, 2), (3, 19, 0)):
+            plan = tuple(Vector([v, v + 1, -1]) for v in values)
+            current = perf.refresh_request_buffers(plan, fixed)
+            self.assertIs(current, fixed)
+            self.assertEqual([id(t) for t in current], original_ids)
+            self.assertEqual([t.values() for t in current], [t.values() for t in plan])
+            self.assertIs(perf.refresh_request_buffers(plan, None), plan)
+
+    def test_prepared_measurement_keeps_external_sync_and_profile_outside(self):
+        for completion in ("reference", "validated"):
+            args = self.parse("--single", "--host-submit", "prepared", "--host-profile",
+                              "--miss-count", "1024", "--aiv-cores", "4",
+                              "--completion-mode", completion)
+            now, events = [0], []
+            class Runtime:
+                def batch_get(self, *args, **kwargs):
+                    raise AssertionError("prepared sample used dynamic submission")
+                def scatter_profile(self):
+                    events.append("snapshot")
+                    now[0] += 1000000
+                    records = profiles(4, 1024, 656)
+                    host = dict.fromkeys(HOST_TIMINGS, 0)
+                    host.update(host_binding_ns=5000, host_native_ns=4000, host_operator_ns=3000)
+                    records[0]["host_profile"] = host
+                    return records
+            def submit():
+                events.append("submit")
+                now[0] += 10000 if completion == "reference" else 100000
+            def sync():
+                events.append("sync")
+                now[0] += 90000
+            sample = perf.measure_call(Runtime(), "table", (1, 2, 3), "count", "output",
+                SimpleNamespace(npu=SimpleNamespace(synchronize=sync)), args, 0,
+                clock=lambda: now[0], submit=submit)
+            self.assertEqual(sample["end_to_end_us"], 100)
+            self.assertEqual(sample["snapshot_us"], 1000)
+            self.assertEqual(sample["host_tensor_metadata_us"], 0)
+            self.assertEqual(sample["host_stream_resolve_us"], 0)
+            self.assertEqual(events, ["submit", "sync", "snapshot"] if completion == "reference"
+                             else ["submit", "snapshot"])
 
     def test_warmup_drains_last_status_and_does_not_hide_errors(self):
         args = self.parse("--single", "--warmup", "3")

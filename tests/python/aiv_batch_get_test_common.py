@@ -162,8 +162,43 @@ def run(mode: str) -> int:
             expected = torch.full_like(outputs[0].cpu(), 0xAD)
             expected[row_cpu[0].long()] = source_cpu[(index_cpu[0] * 4 + offset_cpu[0] // token).long()]
             assert all(torch.equal(output.cpu(), expected) for output in outputs)
+        if mode == "cpu_push_scatter":
+            # Prepared submission fixes storage/stream, not request contents.
+            # Submit outside the producer stream context to exercise the fixed
+            # stream contract, including zero/full counts and random sparse rows.
+            for synchronous in (False, True):
+                fixed_stream = torch.npu.Stream(device=device_id)
+                with torch.npu.stream(fixed_stream):
+                    fixed = [t.to(device) for t in (index_cpu, offset_cpu, row_cpu)]
+                    fixed_count = torch.tensor([0], dtype=torch.int32, device=device)
+                    submit = runtime.prepare_scatter_batch_get(
+                        view, fixed[0], fixed[1], fixed_count, fixed[2], outputs[0],
+                        synchronize=synchronous)
+                for epoch, active in enumerate((0, 1, min(19, capacity), capacity, 0)):
+                    index_cpu = (torch.arange(capacity, dtype=torch.int32) * 7 + epoch) % blocks
+                    offset_cpu = ((torch.arange(capacity, dtype=torch.int32) + epoch) % 4) * token
+                    row_cpu = ((torch.arange(capacity, dtype=torch.int32) + epoch) % capacity) * 2 + 1
+                    with torch.npu.stream(fixed_stream):
+                        for target, values in zip(fixed, (index_cpu, offset_cpu, row_cpu)):
+                            target.copy_(values)
+                        fixed_count.fill_(active)
+                        outputs[0].fill_(0xAD)
+                    submit()
+                    torch.npu.synchronize()
+                    expected = torch.full_like(outputs[0].cpu(), 0xAD)
+                    src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
+                    expected[row_cpu[:active].long()] = source_cpu[src_rows]
+                    assert torch.equal(outputs[0].cpu(), expected), ("prepared", synchronous, active)
+            print("[KVAF_TEST] PREPARED_SCATTER_OK inplace_requests=1 fixed_stream=1", flush=True)
         # Shutdown checks the final queued execution status and joins CPU workers.
         runtime.shutdown()
+        if mode == "cpu_push_scatter":
+            try:
+                submit()
+            except ValueError as error:
+                assert "expired" in str(error)
+            else:
+                raise AssertionError("prepared request survived Runtime shutdown")
         print(f"PASS: mode={mode} cores={cores} token_bytes={token} counts={counts}")
     finally:
         shutdown_runtime(runtime)

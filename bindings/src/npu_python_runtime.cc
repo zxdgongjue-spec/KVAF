@@ -128,7 +128,7 @@ struct TensorMetadataMethods {
   void* Pointer(const py::object& tensor) const {
     return PointerFromValue(Call(tensor, data_ptr).cast<std::uint64_t>());
   }
-  aclrtStream Stream(const py::object& requested) {
+  py::object SelectStream(const py::object& requested) {
     py::object selected = requested;
     if (selected.is_none()) {
       // Cache the Python callable, never the stream or handle. Resolve the
@@ -137,6 +137,10 @@ struct TensorMetadataMethods {
         current_stream = py::module_::import("torch").attr("npu").attr("current_stream");
       selected = current_stream();
     }
+    return selected;
+  }
+  aclrtStream Stream(const py::object& requested) {
+    const auto selected = SelectStream(requested);
     return reinterpret_cast<aclrtStream>(PointerFromValue(
         selected.attr(stream_handle).cast<std::uint64_t>()));
   }
@@ -324,6 +328,7 @@ class NpuPythonRuntime final {
 
   void Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
+    ++generation_;
   }
 
   bool Initialized() const { return native_->initialized(); }
@@ -575,6 +580,38 @@ class NpuPythonRuntime final {
                  miss_count, output_indices, output, stream, synchronize);
   }
 
+  // Prepare only immutable launch metadata. The kernel reads the current
+  // contents of these same Tensor allocations on every invocation.
+  py::object PrepareScatterBatchGet(const DeviceAccessTable& table,
+                                   const py::object& indices, const py::object& offsets,
+                                   const py::object& miss_count, const py::object& output_indices,
+                                   const py::object& output, const py::object& stream,
+                                   bool synchronize) {
+    if (!trusted_scatter_inputs_ || !Initialized())
+      throw py::value_error("prepare_scatter_batch_get requires initialized cpu_push_scatter");
+    const auto selected = tensor_methods_.SelectStream(stream);
+    const auto acl_stream = tensor_methods_.Stream(selected);
+    const auto request = TrustedScatterRequest(table.source(), table.addresses(), table.valid(),
+        indices, offsets, miss_count, output_indices, output, native_->batch_get_token_bytes(),
+        native_->batch_get_tokens_per_block(), tensor_methods_);
+    const auto generation = generation_;
+    // The returned no-argument callable owns all Python storage and the Runtime.
+    // No implicit pointer cache is added to the ordinary, stream-dynamic API.
+    auto retained = py::make_tuple(py::cast(this, py::return_value_policy::reference),
+        selected, table.addresses(), table.valid(), indices, offsets, miss_count,
+        output_indices, output);
+    return py::cpp_function(
+        [this, request, acl_stream, synchronize, generation, retained = std::move(retained)]() {
+          (void)retained;
+          scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
+          scatter_host::Timer binding_timer(scatter_host::kBinding);
+          host_profile_ready_ = false;
+          if (generation != generation_)
+            throw py::value_error("prepared scatter request expired after Runtime shutdown/reinitialize");
+          SubmitBatchGet(request, acl_stream, synchronize, true);
+        }, py::name("submit_scatter_batch_get"));
+  }
+
  private:
   void BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
@@ -645,11 +682,16 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = trusted_scatter_inputs_ ?
         tensor_methods_.Stream(stream) : ResolveStream(stream);
     stream_timer.Stop();
+    SubmitBatchGet(request, acl_stream, synchronize, trusted_scatter_inputs_);
+  }
+
+  void SubmitBatchGet(const BatchGetRequest& request, aclrtStream stream,
+                      bool synchronize, bool trusted) {
     Status status;
     {
       scatter_host::Timer native_timer(scatter_host::kNative);
       status = native_->core().BatchGet(
-          request, BatchGetExecutionOptions{acl_stream, synchronize, trusted_scatter_inputs_});
+          request, BatchGetExecutionOptions{stream, synchronize, trusted});
     }
     ThrowIfError(status);
     host_profile_ready_ = host_profile_enabled_;
@@ -657,12 +699,14 @@ class NpuPythonRuntime final {
 
  public:
   void Shutdown() {
+    ++generation_;
     ThrowIfError(native_->Shutdown());
     host_profile_enabled_ = host_profile_ready_ = false;
   }
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  std::uint64_t generation_{};
   TensorMetadataMethods tensor_methods_;
   bool trusted_scatter_inputs_{false};
   bool host_profile_enabled_{false}, host_profile_ready_{false};
@@ -749,6 +793,15 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("stop_batch_get_kernel_profile",
            &NpuPythonRuntime::StopBatchGetKernelProfile,
            "Copy the latest timeline and disable BatchGet kernel profiling.")
+      .def("prepare_scatter_batch_get", &NpuPythonRuntime::PrepareScatterBatchGet,
+           py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
+           py::arg("miss_count"), py::arg("output_indices"), py::arg("output"),
+           py::arg("stream") = py::none(), py::arg("synchronize") = false,
+           "Return a no-argument submit callable for fixed Tensor storage and stream. "
+           "In-place contents may change; do not resize/rebind storage or release the table. "
+           "Retains Runtime, Tensors and stream; keep callable alive until completion. "
+           "Expires on shutdown/reinitialize. "
+           "Submission, status validation and final DMA completion use the ordinary scatter path.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"),

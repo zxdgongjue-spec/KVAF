@@ -109,6 +109,7 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 | `--pipeline` | 默认1；设0比较全批 done 后 scatter |
 | `--kernel-profile/--no-kernel-profile` | 对齐入口默认开启 AIV/CPU 打点 |
 | `--host-profile/--no-host-profile` | 默认关闭 Host 细分打点 |
+| `--host-submit` | reference（默认原调用）或 prepared（固定 Tensor 存储和 stream） |
 | `--completion-mode` | reference 或 validated |
 | `--case-timeout` | 整个 case，包含初始化、填表、采样和拆除 |
 
@@ -117,6 +118,41 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 只支持单 NPU EID 和固定 peer-ub-device；不做 adaptive UB 设备校准。
 固定4条 CPU Jetty不能等价解释为 aiv-cores×jettys-per-core 条 payload 队列。
 
+## 固定 Host 提交
+
+固定存储的业务调用可以在初始化后准备一次无参数提交函数：
+
+```python
+submit = runtime.prepare_scatter_batch_get(
+    view, indices, offsets, miss_count, output_indices, output,
+    stream=stream, synchronize=False,
+)
+# 每次先在同一个 stream 上更新输入内容，再提交。
+submit()
+torch.npu.synchronize()
+```
+
+准备阶段解析七个 Tensor 指针、容量和 stream，返回函数持有 Runtime、Tensor 和
+stream 的引用。逐次提交不再调用 Tensor 方法、查询当前 stream 或派发多参数重载，
+仍走原有 Runtime/算子/kernel 提交路径。`miss_count`、请求数组和表内容可原地更新；
+Tensor 存储和尺寸须保持固定，提交函数及表保持有效直到完成。更换存储、表或 stream 时重新准备；
+shutdown/reinitialize 后旧提交函数失效。原有 `batch_get` 继续逐次解析当前输入和 stream。
+
+对齐性能入口增加 `--host-submit prepared`，原 reference 模式和默认参数保留。
+prepared 模式仍使用相同随机请求生成器，每轮将新计划原地写入固定输入 buffer，
+更新与预同步在计时外；计时内仍只有一次提交及原来的全设备同步，snapshot/校验位置不变。
+准备耗时记录为 JSON `setup_us.prepare_submit`，不将准备或多次调用冒充一次提交。
+JSON 用 `host_submit`、`input_storage`、`stream_selection` 和
+`host_timing_matches_reference` 明确区分调用方式，CSV 保持32列。
+开启 Host profile 后 prepared 的 `host_tensor_metadata_us` 和
+`host_stream_resolve_us` 为0，表示本次提交没有这些操作。
+
+使用同一组参数分别运行 `--host-submit reference --pipeline 0`、
+`--host-submit prepared --pipeline 0`、`--host-submit prepared --pipeline 1`，
+保持 `--completion-mode reference --host-profile`，每组写入各自 JSON/CSV。
+先比较 `host_call_us`、`host_python_dispatch_us`、`host_launch_us` 和
+`call_outside_aiv_us`，再比较端到端及 scatter 尾部；比较同组最快25%的样本。
+
 ## 流水和完成语义
 
 pipeline=0：所有 payload 尾 CQE完成，CPU 发布 done，随后 AIV scatter。
@@ -124,6 +160,13 @@ pipeline=1：CPU 按每核1024行 chunk 组织四条 Jetty，分别发布各 Jet
 AIV 优先消费已就绪 shard，UB 双缓冲跨 Ready 边界保持 MTE3 搬运在途。
 两种模式都必须等待最终匹配序号的 done，并完成全部输出 DMA 后才成功返回。
 Ready 表示某个 shard 已可读，不代表整次请求成功。
+
+上述流水覆盖本次 CPU WRITE 与 scatter；本次提交前的 Host 工作仍在启动关键路径上。
+请求N运行时可提前准备请求N+1的 Host 参数；进一步让N+1的CPU传输与N的scatter
+并行，则需要独立 workspace、状态/完成序号和输入输出生命周期。当前逐次 Drain
+会串行化提交，因此不能直接取消逐次同步或把多次提交的平均耗时称为单次 BatchGet
+延迟。固定 Host 提交不改变这项约束。即使请求内重叠充分，最后一个 Ready shard
+的scatter及最终完成收尾仍可能形成尾部。
 
 CPU payload 恢复全 WR `comp_order=1`；每条链保留强序尾 WR 和真实尾 CQE，
 ready/done 的必要强序保证继续保留。不得删除最终完成等待或提前发布成功。
