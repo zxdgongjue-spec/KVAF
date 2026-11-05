@@ -40,12 +40,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-rounds", type=int, default=0,
                         help="extra instrumented rounds, excluded from bandwidth statistics")
-    cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
-    parser.add_argument(
-        "--kernel-json",
-        default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json")
-        if cann else None,
-    )
     args = parser.parse_args(argv)
     if not all(1 <= workers <= 8 for workers in args.workers):
         parser.error("--workers must contain values from 1 to 8")
@@ -62,8 +56,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (not 0 <= args.active_percent <= 100 or args.warmup < 0 or args.iterations <= 0
             or args.profile_rounds < 0):
         parser.error("invalid active percentage, warmup or iteration count")
-    if not args.kernel_json or not Path(args.kernel_json).is_file():
-        parser.error("source the CANN environment or pass an installed --kernel-json")
     return args
 
 
@@ -162,7 +154,6 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         batch_get_tokens_per_block=args.tokens_per_block,
         device_id=args.device_id,
         npu_core_count=workers,
-        aicpu_urma_kernel_json_path=args.kernel_json,
         aicpu_batch_get_mode=mode,
         npu_eids=args.npu_eids,
     )

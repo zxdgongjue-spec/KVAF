@@ -6,7 +6,6 @@ import argparse
 import os
 import statistics
 import sys
-from pathlib import Path
 import time
 
 from test_batch_get import timing_stats
@@ -22,16 +21,9 @@ def parse_args(argv=None, *, mode="gather_read"):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
-    if mode == "gather_read":
-        p.add_argument("--source-mode", choices=("table", "direct"), default="table",
-                       help="direct: prepare CPU source addresses before timing; skip AICPU lookup")
-    else:
-        p.set_defaults(source_mode="table")
     p.add_argument("--npu-eids", type=parse_npu_eids,
                    default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                    help="comma-separated Host EID candidates (environment: KVAF_NPU_EIDS)")
-    cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
-    p.add_argument("--kernel-json", default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") if cann else None)
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--token-bytes", type=int, default=656)
     p.add_argument("--miss-count", type=int, default=4096)
@@ -57,8 +49,6 @@ def parse_args(argv=None, *, mode="gather_read"):
         p.error("invalid warmup or iterations")
     if a.device_id < 0:
         p.error("invalid device ID")
-    if not a.kernel_json or not Path(a.kernel_json).is_file():
-        p.error("source the CANN environment or pass an installed --kernel-json")
     return a
 
 
@@ -98,11 +88,11 @@ def token_pattern(torch, token_ids, byte_ids):
     return encoded ^ pattern.expand_as(encoded).contiguous()
 
 
-def summarize_measurements(profiles, payload_bytes, *, mode="gather_read", source_mode="table"):
+def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
     device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
     summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
     phases = (
-        ("prepare_request_us" if source_mode == "direct" else "lookup_table_us", "request_us"),
+        ("lookup_table_us", "request_us"),
         ("address_send_us", "source_write_us"),
         ("notify_cpu_us", "notify_us"),
         ("read_total_us", "read_us"),
@@ -126,11 +116,11 @@ def summarize_measurements(profiles, payload_bytes, *, mode="gather_read", sourc
 
 def print_measurements(a, summary, *, mode="gather_read"):
     prefix = PREFIXES[mode]
-    source_label = f" source_mode={a.source_mode}" if mode == "gather_read" else ""
+    source_label = " source_mode=table" if mode == "gather_read" else ""
     print(f"{prefix}_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
           f"p50_GBps={summary['p50_GBps']:.3f}{source_label} phase_aggregation=mean_of_per_round_worker_max")
     if mode == "gather_read":
-        request_field = "prepare_request_us" if a.source_mode == "direct" else "lookup_table_us"
+        request_field = "lookup_table_us"
         print(f"  {request_field}={summary[request_field]:.1f} | "
               f"address_send_us={summary['address_send_us']:.1f} | "
               f"notify_cpu_us={summary['notify_cpu_us']:.1f}")
@@ -147,7 +137,7 @@ def print_measurements(a, summary, *, mode="gather_read"):
         print(f"  done_wait_us={summary['done_wait_us']:.1f}")
     result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers, **summary)
     if mode == "gather_read":
-        result = dict(source_mode=a.source_mode, **result)
+        result = dict(source_mode="table", **result)
     fields = []
     for key, value in result.items():
         formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
@@ -165,12 +155,10 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     _, reserved = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
-    direct = a.source_mode == "direct"
     runtime = kvaf.NpuRuntime(
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
-        npu_core_count=a.workers, aicpu_urma_kernel_json_path=a.kernel_json,
-        aicpu_batch_get_mode="gather_read_direct" if direct else mode, npu_eids=a.npu_eids,
+        npu_core_count=a.workers, aicpu_batch_get_mode=mode, npu_eids=a.npu_eids,
     )
     profiles = []
     # Source and output allocations stay alive until the session is closed.
@@ -179,14 +167,13 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     output = torch.empty((length, a.token_bytes), dtype=torch.uint8, device=device)
     byte_ids = torch.arange(a.token_bytes, dtype=torch.int64, device=device).unsqueeze(0)
     table = device_table = None
-    direct_valid = torch.ones(length, dtype=torch.uint8, device=device) if direct else None
     print(f"{prefix}_CONFIG table_capacity={a.table_capacity} "
           f"tokens_per_block={a.tokens_per_block} request_length={length} "
           f"token_bytes={a.token_bytes} miss_count={a.miss_count} workers={a.workers} "
           f"source_pool_GiB={ddr_bytes / 1024**3:.3f} "
           f"workspace_budget_MiB={reserved / 1024**2:.3f} "
           f"total_budget_GiB={DDR_BUDGET_BYTES / 1024**3:.1f} "
-          f"source_mode={a.source_mode} source=random_with_replacement output=random_unique_rows "
+          "source_mode=table source=random_with_replacement output=random_unique_rows "
           "guard_rows=0 source_initialized_once=1", flush=True)
 
     def run_round(count, profile=False):
@@ -197,13 +184,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
             token_ids = indices[:count].to(torch.int64) * a.tokens_per_block + offsets[:count].to(torch.int64) // a.token_bytes
             expected.index_copy_(0, rows[:count].to(torch.int64), token_pattern(torch, token_ids, byte_ids))
         output.fill_(0xA5)
-        if direct:
-            # Request generation is outside timing. Only these complete source
-            # addresses reach the AICPU kernel; indices/offsets are not read there.
-            addresses = device_table.addresses.index_select(0, indices.to(torch.int64)) + offsets.to(torch.int64)
-            inputs = (addresses, direct_valid, indices, offsets, miss_count, rows, output)
-        else:
-            inputs = (device_table, indices, offsets, miss_count, rows, output)
+        inputs = (device_table, indices, offsets, miss_count, rows, output)
         stream.synchronize()
         begin = time.perf_counter_ns()
         measured = runtime.batch_get(*inputs, stream=stream, synchronize=True, profile=profile)
@@ -250,7 +231,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
 
     print(f"{prefix}_PASS workers={a.workers} iterations={a.iterations} "
           "verification=every_round_full_output_npu_compare", flush=True)
-    summary = summarize_measurements(profiles, payload_bytes, mode=mode, source_mode=a.source_mode)
+    summary = summarize_measurements(profiles, payload_bytes, mode=mode)
     print_measurements(a, summary, mode=mode)
 
 

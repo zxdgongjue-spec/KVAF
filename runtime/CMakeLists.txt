@@ -10,6 +10,7 @@ target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 add_library(kvaf_runtime
   src/runtime.cc
   src/runtime_service.cc
+  src/npu_runtime_config.cc
 )
 
 target_include_directories(kvaf_runtime
@@ -44,7 +45,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
   endif()
   if(KVAF_ENABLE_AICPU_URMA)
-    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_aicpu_access_operator)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_aicpu_access_operator kvaf_umdk_host)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AICPU_URMA=1)
   endif()
   if(KVAF_ENABLE_AICPU_CPU_PUSH)

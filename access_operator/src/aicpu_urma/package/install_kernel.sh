@@ -9,7 +9,7 @@ expected_block="$(printf '%s\n' "$header" 'install_path:2' 'optional:true' \
   'package_path:opp/vendors/cust/op_impl/aicpu/kernel' 'load_as_per_soc:false')"
 
 usage() {
-  echo "Usage: bash $0 --install ARTIFACT_DIR CANN_ROOT | --check CANN_ROOT [ARTIFACT_DIR] | --uninstall CANN_ROOT" >&2
+  echo "Usage: bash $0 [--require-scatter] --install ARTIFACT_DIR CANN_ROOT | --check CANN_ROOT [ARTIFACT_DIR] | --uninstall CANN_ROOT" >&2
 }
 
 die() {
@@ -30,6 +30,9 @@ check_artifacts() {
   grep -Fq '"KvafAicpuBatchPut"' "$dir/kernel.json" || die "BatchPut missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuGatherRead"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUmdkControl"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
+  if [[ "$require_scatter" == true ]]; then
+    grep -Fq '"KvafAicpuCpuPushScatterA12V24"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
+  fi
 }
 
 check_installed() {
@@ -40,6 +43,9 @@ check_installed() {
   grep -Fq '"KvafAicpuBatchPut"' "$config_dir/$json" || die "installed JSON lacks BatchPut"
   grep -Fq '"KvafAicpuGatherRead"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
   grep -Fq '"KvafAicpuUmdkControl"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
+  if [[ "$require_scatter" == true ]]; then
+    grep -Fq '"KvafAicpuCpuPushScatterA12V24"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
+  fi
   count="$(grep -Fxc "$header" "$load_config" || true)"
   [[ "$count" == 1 ]] || die "expected one $header entry in $load_config, found $count"
   block="$(grep -A4 -Fx "$header" "$load_config")"
@@ -82,6 +88,8 @@ rewrite_load_config() {
   mv -f "$temporary" "$load_config"
 }
 
+require_scatter=false
+if [[ "${1:-}" == --require-scatter ]]; then require_scatter=true; shift; fi
 action="${1:-}"
 case "$action" in
   --install)

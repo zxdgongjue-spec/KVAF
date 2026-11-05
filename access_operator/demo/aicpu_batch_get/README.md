@@ -1,7 +1,10 @@
 # AICPU BatchGet
 
-默认使用 `gather_read`：一次启动 N 个 AICPU 实例，每个 worker 独立生成清单、
+显式设置 `aicpu_batch_get_mode="gather_read"`：一次启动 N 个 AICPU 实例，每个 worker 独立生成清单、
 请求 CPU gather、查询就绪进度、READ 到输出 HBM，并确认自己的最终 ACK。
+
+Runtime 的 mode 默认为空，表示使用 AIV；AICPU 包从 CANN 安装目录自动定位，无需传 JSON 路径。
+Gather 和 Scatter 都支持通过 `npu_eids` 指定多个候选，逐个尝试并选用一个可用 EID。
 
 设置 `aicpu_batch_get_mode="cpu_push_scatter"` 可使用 Host direct HCCP 建链、
 CPU SGL WRITE 到 HBM staging、AICPU 本地 scatter 的路径。

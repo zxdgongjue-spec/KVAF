@@ -63,6 +63,23 @@ bool LoadUmdkKernel(const char* json_path) {
   binary = loaded;
   return true;
 }
+Status PrepareUmdkKernel(const std::string& json, bool scatter) {
+  const std::string context = "AICPU mode=" + std::string(scatter ? "cpu_push_scatter" : "gather_read") +
+                              " json=" + json;
+  if (!LoadUmdkKernel(json.c_str()))
+    return Status::Internal(context + ": failed to load installed device package");
+  std::lock_guard<std::mutex> lock(kernel_mutex);
+  for (const char* name : {"KvafAicpuUmdkControl", "KvafAicpuBatchPut",
+                          scatter ? "KvafAicpuCpuPushScatterA12V24" : "KvafAicpuGatherRead"}) {
+    if (functions.find(name) != functions.end()) continue;
+    aclrtFuncHandle function = nullptr;
+    if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS || !function)
+      return Status::NotFound(context + ": missing kernel entry " + name +
+          "; rebuild and reinstall the matching AICPU package, then restart the client");
+    functions.emplace(name, function);
+  }
+  return Status::OK();
+}
 int32_t LaunchUmdkKernel(const char* name, const void* args, std::size_t bytes, aclrtStream stream,
                          std::uint32_t blocks) {
   if (!name || !args) return -1;

@@ -6,6 +6,7 @@ set -euo pipefail
 readonly KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly UMDK_REPOSITORY="https://gitcode.com/openeuler/umdk.git"
 readonly UMDK_BRANCH="br_UMDK_24.12.0_LTS"
+source "$KVAF_ROOT/scripts/cann_root.sh"
 
 die() {
   echo "ERROR: $*" >&2
@@ -30,8 +31,8 @@ Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
   KVAF_URMA_LIBRARY    Existing liburma.so path for the CPU build
   KVAF_UMDK_BUILD_DIR  Build directory used when building bundled UMDK
-  ASCEND_CANN_PACKAGE_PATH
-                        CANN toolkit root for the NPU build
+  ASCEND_HOME_PATH / ASCEND_CANN_PACKAGE_PATH
+                        CANN root; both must resolve to the same directory if set
   PYTHON               Python interpreter for the NPU binding (default: python3)
   KVAF_AICPU_CXX       AICPU cross compiler override
   KVAF_AICPU_SECUREC_INCLUDE_DIR
@@ -144,17 +145,7 @@ build_cpu() {
 }
 
 find_cann_root() {
-  local candidate
-  for candidate in \
-    "${ASCEND_CANN_PACKAGE_PATH:-}" \
-    "${ASCEND_HOME_PATH:-}" \
-    /usr/local/Ascend/ascend-toolkit/latest \
-    /usr/local/Ascend/cann/aarch64-linux/asc; do
-    if [[ -n "$candidate" && -f "$candidate/include/acl/acl.h" ]]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
+  kvaf_find_cann_root
 }
 
 build_npu() {
@@ -168,6 +159,7 @@ build_npu() {
   require_command cmake
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit was not found; source CANN set_env.sh or set ASCEND_CANN_PACKAGE_PATH"
+  [[ -f "$cann_root/include/acl/acl.h" ]] || die "ACL headers missing under $cann_root"
   if [[ "$without_python" != ON ]]; then
     build_python=ON
     require_command "$python_bin"
@@ -191,28 +183,25 @@ build_npu() {
   echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
 }
 
-check_aicpu_cann_root() {
-  local selected_root="$1"
-  local runtime_root
-  [[ -n "${ASCEND_HOME_PATH:-}" ]] || return 0
-  [[ -d "$ASCEND_HOME_PATH" ]] || die "ASCEND_HOME_PATH does not exist: $ASCEND_HOME_PATH"
-  runtime_root="$(cd "$ASCEND_HOME_PATH" && pwd -P)"
-  selected_root="$(cd "$selected_root" && pwd -P)"
-  [[ "$runtime_root" == "$selected_root" ]] ||
-    die "AICPU build CANN root ($selected_root) differs from runtime ASCEND_HOME_PATH ($runtime_root)"
-}
-
 build_aicpu_urma() {
   local build_dir="$1" jobs="$2" kernel_action="$3" cpu_push="$4"
   local cann_root umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
   local -a compiler_option=()
+  local -a package_options=()
+  if [[ "$cpu_push" == ON ]]; then package_options+=(--require-scatter); fi
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
-  check_aicpu_cann_root "$cann_root"
   if [[ "$kernel_action" == check || "$kernel_action" == uninstall ]]; then
-    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" "--$kernel_action" "$cann_root"
+    local -a artifact_options=()
+    local artifact_dir="$build_dir/access_operator/src/aicpu_urma"
+    if [[ "$kernel_action" == check && -s "$artifact_dir/kernel.json" && -s "$artifact_dir/kvaf-aicpu-urma.tar.gz" ]]; then
+      artifact_options+=("$artifact_dir")
+    fi
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" \
+      "${package_options[@]}" "--$kernel_action" "$cann_root" "${artifact_options[@]}"
     return
   fi
+  [[ -f "$cann_root/include/acl/acl.h" ]] || die "ACL headers missing under $cann_root"
   require_command cmake
   local python_bin="${PYTHON:-python3}"
   require_command "$python_bin"
@@ -238,7 +227,7 @@ build_aicpu_urma() {
     "${compiler_option[@]}"
   cmake --build "$build_dir" --target _kvaf kvaf_aicpu_urma_kernel --parallel "$jobs"
   if [[ "$kernel_action" == install ]]; then
-    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" --install \
+    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" "${package_options[@]}" --install \
       "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
   fi
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"

@@ -277,7 +277,6 @@ class NpuPythonRuntime final {
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
-                   std::string aicpu_urma_kernel_json_path,
                    std::string aicpu_batch_get_mode, const std::string& transport) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
@@ -290,8 +289,6 @@ class NpuPythonRuntime final {
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
-    options.aicpu_urma_kernel_json_path = std::move(aicpu_urma_kernel_json_path);
-    aicpu_backend_ = !options.aicpu_urma_kernel_json_path.empty();
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
@@ -300,6 +297,7 @@ class NpuPythonRuntime final {
     options.peer_ub_device = std::move(peer_ub_device);
     options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+    aicpu_backend_ = native_->uses_aicpu();
   }
 
   void LinkTo(std::string address) {
@@ -610,10 +608,10 @@ void BindNpuPythonRuntime(py::module_& module) {
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
                     std::string, std::vector<std::string>, std::uint32_t,
-                    std::string, std::string, const std::string&>(),
+                    std::string, const std::string&>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
-           py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
+           py::arg("batch_get_tokens_per_block"), py::kw_only(), py::arg("device_id") = 0,
            py::arg("npu_core_count") = 2,
            py::arg("batch_put_kernel_object_path") = "",
            py::arg("jettys_per_core") = 2,
@@ -624,8 +622,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("adaptive_peer_ub_devices") =
                std::vector<std::string>{},
            py::arg("batch_get_max_inflight_total") = 2048,
-           py::arg("aicpu_urma_kernel_json_path") = "",
-           py::arg("aicpu_batch_get_mode") = "gather_read",
+           py::arg("aicpu_batch_get_mode") = "",
            py::arg("transport") = "urma")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
