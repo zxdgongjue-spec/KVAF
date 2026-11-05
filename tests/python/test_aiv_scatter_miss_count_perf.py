@@ -72,8 +72,9 @@ def arguments(argv=None):
     parser.add_argument("--csv", type=Path, help="single-case compact timing/bandwidth samples")
     parser.add_argument("--case-timeout", type=int, default=600,
                         help="whole-case seconds, including DDR allocation/registration, full-table population and measurement")
-    parser.add_argument("--completion-mode", choices=("reference", "validated"), default="reference",
-                        help="reference: enqueue then global device sync; validated: synchronous API including status checks")
+    parser.add_argument("--completion-mode", choices=("reference", "validated", "native-stream"), default="reference",
+                        help="reference: enqueue then global device sync; validated: API including status checks; "
+                             "native-stream: prepared submit + native stream wait, status checks outside sample")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
     parser.add_argument("--head-start", type=int, choices=(0, 1),
@@ -122,6 +123,8 @@ def arguments(argv=None):
 
 
 def validate_scatter(args):
+    if args.completion_mode == "native-stream" and args.host_submit != "prepared":
+        return "native-stream completion requires --host-submit prepared"
     if not 1 <= args.aiv_cores <= 8:
         return "CPU-push scatter supports 1..8 AIV cores; 16/32-core reference points are unsupported"
     if args.jettys_per_core != 2:
@@ -247,7 +250,7 @@ def warmup_calls(runtime, view, count, output, torch, args, plan_factory, submit
                 runtime.batch_get(view, indices, offsets, count, output_indices, output, synchronize=True)
             else:
                 submit()
-    if args.warmup and args.completion_mode == "reference":
+    if args.warmup and args.completion_mode in ("reference", "native-stream"):
         # No last-warmup status drain may spill into the first timed Execute.
         complete_outside_measurement(runtime, args.kernel_profile)
 
@@ -285,7 +288,7 @@ def measure_call(runtime, view, inputs, count, output, torch, args, iteration,
                                       args.token_bytes, args.kernel_profile_clock_mhz))
         sample["workers"] = records
         sample["snapshot_ns"] = clock() - begin
-    elif args.completion_mode == "reference":
+    elif args.completion_mode in ("reference", "native-stream"):
         begin = clock()
         complete_outside_measurement(runtime, False)
         sample["status_validation_ns"] = clock() - begin
@@ -345,12 +348,15 @@ def run_case(args):
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
         input_mode="steady_table_new_request_plan_per_call", calls_per_sample=1,
         timing=("enqueue_then_global_device_sync" if args.completion_mode == "reference"
+                else "prepared_enqueue_then_native_stream_sync" if args.completion_mode == "native-stream"
                 else "synchronous_BatchGet_through_status_validation"),
         stream_selection=("fixed_stream_per_call_task_queue_fence" if args.host_submit == "prepared" else
                           "current_stream_resolved_inside_binding_like_reference"),
         input_storage=("fixed_buffers_refreshed_per_call" if args.host_submit == "prepared" else
                        "new_request_tensors_per_call"),
-        host_timing_matches_reference=args.host_submit == "reference",
+        host_timing_matches_reference=(args.host_submit == "reference" and args.completion_mode == "reference"),
+        completion_scope=("fixed_stream" if args.completion_mode == "native-stream" else
+                          "device" if args.completion_mode == "reference" else "validated_stream"),
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",
         verification="deterministic_preflight_prefix_and_guard_then_last_random_payload",
         profile_snapshot_in_sample=False, setup_in_sample=False,
@@ -421,7 +427,8 @@ def run_case(args):
             with setup_phase(report, "prepare_submit"):
                 submit = runtime.prepare_scatter_batch_get(
                     view, preflight[0], preflight[1], count, preflight[2], output,
-                    synchronize=args.completion_mode == "validated")
+                    synchronize=args.completion_mode == "validated",
+                    wait_stream=args.completion_mode == "native-stream")
         output.zero_()
         # Exercise the selected submission path, then synchronize and validate
         # business status outside all measured samples.

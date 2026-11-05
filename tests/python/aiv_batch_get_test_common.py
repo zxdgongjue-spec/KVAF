@@ -175,7 +175,7 @@ def run(mode: str) -> int:
             # Prepared submission fixes storage/stream, not request contents.
             # Submit outside the producer stream context to exercise the fixed
             # stream contract, including zero/full counts and random sparse rows.
-            for synchronous in (False, True):
+            for synchronous, native_wait in ((False, False), (True, False), (False, True)):
                 fixed_stream = torch.npu.Stream(device=device_id)
                 stream_probe = FixedStreamProbe(fixed_stream)
                 with torch.npu.stream(fixed_stream):
@@ -183,7 +183,7 @@ def run(mode: str) -> int:
                     fixed_count = torch.tensor([0], dtype=torch.int32, device=device)
                     submit = runtime.prepare_scatter_batch_get(
                         view, fixed[0], fixed[1], fixed_count, fixed[2], outputs[0],
-                        stream=stream_probe, synchronize=synchronous)
+                        stream=stream_probe, synchronize=synchronous, wait_stream=native_wait)
                 for epoch, active in enumerate((0, 1, min(19, capacity), capacity, 0)):
                     index_cpu = (torch.arange(capacity, dtype=torch.int32) * 7 + epoch) % blocks
                     offset_cpu = ((torch.arange(capacity, dtype=torch.int32) + epoch) % 4) * token
@@ -199,12 +199,13 @@ def run(mode: str) -> int:
                     reads_before = stream_probe.reads
                     submit()
                     assert stream_probe.reads == reads_before + 1, "prepared submit skipped task-queue fence"
-                    torch.npu.synchronize()
+                    if not native_wait:
+                        torch.npu.synchronize()
                     expected = torch.full_like(outputs[0].cpu(), 0xAD)
                     src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
                     expected[row_cpu[:active].long()] = source_cpu[src_rows]
-                    assert torch.equal(outputs[0].cpu(), expected), ("prepared", synchronous, active)
-            print("[KVAF_TEST] PREPARED_SCATTER_OK inplace_requests=1 fixed_stream=1", flush=True)
+                    assert torch.equal(outputs[0].cpu(), expected), ("prepared", synchronous, native_wait, active)
+            print("[KVAF_TEST] PREPARED_SCATTER_OK inplace_requests=1 fixed_stream=1 native_wait=1", flush=True)
         # Shutdown checks the final queued execution status and joins CPU workers.
         runtime.shutdown()
         if mode == "cpu_push_scatter":

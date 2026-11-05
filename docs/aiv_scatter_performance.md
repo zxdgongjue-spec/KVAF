@@ -113,7 +113,7 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 | `--kernel-profile/--no-kernel-profile` | 对齐入口默认开启 AIV/CPU 打点 |
 | `--host-profile/--no-host-profile` | 默认关闭 Host 细分打点 |
 | `--host-submit` | reference（默认原调用）或 prepared（固定 Tensor 存储和 stream） |
-| `--completion-mode` | reference 或 validated |
+| `--completion-mode` | reference、validated；prepared还支持native-stream |
 | `--case-timeout` | 整个 case，包含初始化、填表、采样和拆除 |
 
 不带 `--single` 时扫描 token-sizes、miss-counts、core-counts，在 output-dir 下输出分组 CSV/JSON
@@ -156,6 +156,43 @@ JSON 用 `host_submit`、`input_storage`、`stream_selection` 和
 JSON 的 `stream_selection=fixed_stream_per_call_task_queue_fence` 标识这一实现。
 对应机制见 torch_npu 的 [npu_stream 属性](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/npu/Stream.cpp#L78)
 及 [NPUStream::stream 队列处理](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUStream.cpp#L442)。
+
+若业务只需要等待本次固定 stream 完成，可以把提交和等待合并在一次原生调用中：
+
+```python
+submit_and_wait = runtime.prepare_scatter_batch_get(
+    view, indices, offsets, miss_count, output_indices, output,
+    stream=stream, wait_stream=True,
+)
+submit_and_wait()  # 返回时该 stream 上的 kernel/最终输出 DMA 已完成。
+# 与原来的异步提交+全设备同步一致，在通常的 drain/profile 处验证业务状态。
+profiles = runtime.scatter_profile()  # 仅在开启 kernel profile 时使用。
+```
+
+`wait_stream=True` 在同一次 C++ 回调内提交并调用 `aclrtSynchronizeStream`，减少
+Python 返回、torch.npu 全设备同步的包装/派发和第二次调用开销。每次仍读取固定
+stream 的 `npu_stream` 属性，保证输入生产任务先于 ACL kernel。它等待该 stream
+的真实完成；状态回拷/验证仍沿用原来的后续 drain。连续提交而未提前 drain 时，
+下一次调用仍会先验证上一轮状态。`synchronize=True` 则在本次调用内包含状态
+验证，不能与 `wait_stream=True` 同时设置。
+
+对齐入口用 `--host-submit prepared --completion-mode native-stream` 选择此路径。
+计时内是一轮完整提交和原生 stream 等待，不再额外调用 `torch.npu.synchronize()`；
+请求刷新和预同步、profile snapshot及业务状态验证的位置与reference模式一致。
+这是固定 stream 的完成语义，JSON记录 `completion_scope=fixed_stream`、
+`timing=prepared_enqueue_then_native_stream_sync`和`host_timing_matches_reference=false`。
+它不等价于等待整个设备的其他stream，CSV仍保持32列，须保留对应JSON区分配置。
+
+此模式的 `host_call_us`/`host_binding_us`包含设备等待，`host_stream_sync_us`也包含
+尚未完成的设备执行，不能全部计为Host开销。`device_sync_ns`仅用于reference的外部
+全设备同步，native-stream不伪造该字段。比较外围继续使用`call_outside_aiv_us`，
+同时检查端到端和设备阶段，避免把计时归属变化误判为加速。
+
+固定 `--pipeline 1 --head-start 1` 及相同CPU/UB端口、请求配置和资源占用，分别运行
+`--host-submit prepared --completion-mode reference`与
+`--host-submit prepared --completion-mode native-stream`。这一改动只需重编NPU绑定
+（`cmake --build build-npu -j --target _kvaf`）。真实收益需要上机对比，约8 µs的
+ACL kernel提交以及设备排队、完成返回的开销仍在端到端窗口内。
 
 使用同一组参数分别运行 `--host-submit reference --pipeline 0`、
 `--host-submit prepared --pipeline 0`、`--host-submit prepared --pipeline 1`，
@@ -299,6 +336,7 @@ pipeline=1时CPU通信、Ready等待、scatter活跃区间重叠，不能将这�
 
 对齐入口 reference：异步 BatchGet后全设备同步，完成后在采样外drain/验证status。
 validated：同步API，状态回拷/检查计入端到端，不额外全设备同步。
+native-stream：prepared原生提交并等待固定stream，完成后在采样外drain/验证status。
 profile snapshot及最终payload验证均在采样外；打点本身的报告写回开销仍在设备流程中。
 Host profile用于解释外围；其stream-sync耗时不能再与AIV时长叠加。
 最终收益应同时比较无打点端到端与相同打点配置下的阶段变化。

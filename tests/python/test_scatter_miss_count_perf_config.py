@@ -140,6 +140,14 @@ class AlignedScatterTests(unittest.TestCase):
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.parse(*args)
 
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.parse("--completion-mode", "native-stream")
+        native = self.parse("--completion-mode", "native-stream", "--host-submit", "prepared")
+        case = perf.cases(native)[0]
+        case.json, case.csv = Path("native.json"), Path("native.csv")
+        child = self.parse(*perf.case_command(case)[4:])
+        self.assertEqual((child.host_submit, child.completion_mode), ("prepared", "native-stream"))
+
     def test_shared_generator_matches_reference_random_domain(self):
         args = self.parse("--single", "--request-length", "32", "--miss-count", "7")
         torch = Torch()
@@ -253,7 +261,7 @@ class AlignedScatterTests(unittest.TestCase):
             self.assertIs(perf.refresh_request_buffers(plan, None), plan)
 
     def test_prepared_measurement_keeps_external_sync_and_profile_outside(self):
-        for completion in ("reference", "validated"):
+        for completion in ("reference", "validated", "native-stream"):
             args = self.parse("--single", "--host-submit", "prepared", "--host-profile",
                               "--miss-count", "1024", "--aiv-cores", "4",
                               "--completion-mode", completion)
@@ -268,6 +276,8 @@ class AlignedScatterTests(unittest.TestCase):
                     host = dict.fromkeys(HOST_TIMINGS, 0)
                     host.update(host_binding_ns=5000, host_stream_resolve_ns=300,
                                 host_native_ns=4000, host_operator_ns=3000)
+                    if completion == "native-stream":
+                        host.update(host_binding_ns=95000, host_stream_sync_ns=90000)
                     records[0]["host_profile"] = host
                     return records
             def submit():
@@ -285,6 +295,40 @@ class AlignedScatterTests(unittest.TestCase):
             self.assertEqual(sample["host_stream_resolve_us"], .3)
             self.assertEqual(events, ["submit", "sync", "snapshot"] if completion == "reference"
                              else ["submit", "snapshot"])
+            if completion == "native-stream":
+                self.assertEqual(sample["host_stream_sync_us"], 90)
+                self.assertEqual(sample["host_python_dispatch_us"], 5)
+                self.assertNotIn("device_sync_ns", sample)
+
+    def test_native_stream_baseline_validation_stays_outside_sample(self):
+        args = self.parse("--single", "--host-submit", "prepared",
+                          "--completion-mode", "native-stream", "--no-kernel-profile")
+        now, events = [0], []
+        class Runtime:
+            def stop_scatter_profile(self):
+                events.append("validate")
+                now[0] += 1000000
+        def submit():
+            events.append("submit_and_wait")
+            now[0] += 100000
+        def unexpected():
+            self.fail("native-stream added global synchronization")
+        torch = SimpleNamespace(npu=SimpleNamespace(synchronize=unexpected))
+        sample = perf.measure_call(Runtime(), "table", (1, 2, 3), "count", "output", torch,
+                                   args, 0, clock=lambda: now[0], submit=submit)
+        self.assertEqual(sample["end_to_end_us"], 100)
+        self.assertEqual(sample["status_validation_ns"], 1000000)
+        self.assertEqual(events, ["submit_and_wait", "validate"])
+
+    def test_native_stream_warmup_drains_before_measurement(self):
+        args = self.parse("--single", "--host-submit", "prepared",
+                          "--completion-mode", "native-stream", "--warmup", "2")
+        events = []
+        runtime = SimpleNamespace(scatter_profile=lambda: events.append("validate") or [])
+        torch = SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: events.append("presync")))
+        perf.warmup_calls(runtime, "table", "count", "output", torch, args, lambda: (1, 2, 3),
+                          submit=lambda: events.append("submit_and_wait"))
+        self.assertEqual(events, ["presync", "submit_and_wait"] * 2 + ["validate"])
 
     def test_warmup_drains_last_status_and_does_not_hide_errors(self):
         args = self.parse("--single", "--warmup", "3")
