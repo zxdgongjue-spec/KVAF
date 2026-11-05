@@ -1,10 +1,11 @@
-# Python BatchGet 使用 AICPU UMDK 流水
+# AICPU GatherRead：构建、调用与验证
 
 已有的 `NpuRuntime.batch_get` 可以选择 UMDK 后端。一次 launch 启动 N 个 AICPU 实例，
 各自从本轮 NPU Tensor 的输入区间生成源清单，请求 CPU gather 到自己的 DDR staging 区间，
 查询自己的就绪前缀、提交 READ，并等待自己的完成通知和 CPU ACK。
 indices、offsets、miss_count、output_indices 和数据可以每轮变化，不缓存上一轮内容。
-本页描述默认 `aicpu_batch_get_mode="gather_read"`。
+本页描述 `transport="urma"`、`aicpu_batch_get_mode="gather_read"` 的用法；
+mode 默认空，表示使用 AIV。`transport="ubmem"` 不能与非空 mode 组合。
 Host direct HCCP 建链的 `cpu_push_scatter` 路径见 [CPU 回推说明](aicpu_cpu_push_scatter.md)。
 与顶层 BatchGet 一致，`int32[1] miss_count` 指定输入数组的有效前缀长度；
 只处理前 `miss_count` 项，取值范围为 0 到输入数组容量。
@@ -14,16 +15,31 @@ AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使�
 
 ## 构建和启动
 
-合入 main 后控制协议使用版本 6，CPU 服务和 NPU 客户端需同时重新构建并重启。
+当前控制协议使用版本 6，CPU 服务和 NPU 客户端使用配套版本构建并重启。
 AICPU 使用独立的输入 ABI；重新安装设备包后再启动客户端。
 
-在仓库根目录执行：
+以下命令均在仓库根目录执行。CPU 端构建服务：
 
 ```bash
 ./build.sh cpu
-./build.sh aicpu-urma --install-kernel
-export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
 ```
+
+NPU 端先加载实际安装的 CANN `set_env.sh`，再统一构建：
+
+```bash
+./build.sh npu
+./build.sh npu --check-kernel
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+默认包含 AIV URMA、UBmem、AICPU Put/Gather/Scatter，生成一份 Python 包，
+构建成功后自动安装 AICPU 设备包，无需 `--install-kernel`。
+安装需要对所选 CANN 的包目录和加载配置有写权限。
+
+仅需 AICPU Gather/Put 时，可改用 `./build.sh aicpu-urma`，同样自动安装；
+此时将本文的 `build-npu` 换为 `build-aicpu-urma`，安装检查使用
+`./build.sh aicpu-urma --check-kernel`。该裁剪构建不包含 Scatter，也不要求其 securec 依赖。
+`./build.sh npu --without-aicpu` 仅构建 AIV/UBmem，不能用于本页的 AICPU 测试。
 
 CPU 服务使用新二进制重启：
 
@@ -33,10 +49,14 @@ CPU 服务使用新二进制重启：
   --gather-threads 8 --gather-mode active --gather-affinity off
 ```
 
+同一服务也可供 AIV、UBmem 和 Scatter 使用。`--gather-threads` 是每个 Gather
+session 的 CPU 线程总预算，须不小于客户端 AICPU worker 数；`active` 使用主动等待，
+`--gather-affinity off` 不主动绑核。这些参数不改变其他后端的执行。
+示例使用设备 7 和本机服务 `127.0.0.1:28990`，跨主机部署时替换为实际设备号和 CPU 地址。
+
 NPU 进程先加载 CANN 环境，再使用现有 Tensor 接口：
 
 ```python
-import os
 import torch
 import torch_npu
 import kvaf
@@ -48,10 +68,8 @@ runtime = kvaf.NpuRuntime(
     batch_get_tokens_per_block=1,
     device_id=7,
     npu_core_count=1,
-    aicpu_urma_kernel_json_path=os.path.join(
-        os.environ["ASCEND_HOME_PATH"],
-        "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json",
-    ),
+    transport="urma",
+    aicpu_batch_get_mode="gather_read",
 )
 runtime.link_to("127.0.0.1:28990")
 runtime.initialize(ddr_bytes=656 * 8192, slot_size=656)
@@ -73,11 +91,22 @@ runtime.release_access_table(table)
 runtime.shutdown()
 ```
 
-设备号和服务地址按部署环境调整；UMDK device/index 默认由 Host EID 匹配，通常无需指定。原来的 addresses/valid Tensor 重载也可直接使用。
-`NpuRuntime::Impl::CreateCore()` 在创建 RuntimeCore 时选择 AccessOperator：
-`aicpu_urma_kernel_json_path` 非空时创建 `UmdkAccessOperator`，为空时创建 AIV 的
-`DefaultAccessOperator`。同一个 Runtime 的 Get/Put 使用选中的实现。
-相应实现必须在构建时启用；`build.sh aicpu-urma` 只编译 AICPU 后端，因此必须提供该 JSON 路径。
+UMDK device/index 由 Host EID 匹配，不再作为 `NpuRuntime` 参数提供。
+`batch_get_kernel_object_path` 仍是必传参数，但 AICPU 填 `""` 即可；
+`batch_put_kernel_object_path` 可省略。两者均不用于加载 AICPU 内核。
+原来的 `addresses/valid` Tensor 重载也可直接使用。
+`NpuRuntime` 通过 `transport` 和 `aicpu_batch_get_mode` 选择后端：
+`transport="urma"` 且 mode 为空时使用 AIV；mode 为 `gather_read` 或
+`cpu_push_scatter` 时，Get 和 Put 都使用 AICPU。`transport="ubmem"` 要求 mode 为空。
+AICPU kernel JSON 由 Runtime 从选定 CANN 根目录的
+`opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json` 加载，无需传路径。
+环境变量 `ASCEND_HOME_PATH` 和 `ASCEND_CANN_PACKAGE_PATH` 若同时设置，必须指向同一真实目录。
+只有一个非空时使用它；都未设置时，依次检查 `/usr/local/Ascend/ascend-toolkit/latest`
+和 `/usr/local/Ascend/cann/aarch64-linux/asc`。显式无效目录直接报错；根目录一旦确定，
+缺包也不会转到另一套 CANN 安装中搜索。
+Runtime 还检查设备 tar 包及 `conf/ascend_package_load.ini` 注册配置，并在远端 DDR 分配前
+加载内核、检查所需入口。缺包、缺入口或未构建后端时直接报错，不回退到 AIV。
+AICPU-only 构建也必须显式填写 mode；公开 JSON 路径参数已删除。
 
 如果调用方已经持有 NPU 地址表，直接调用现有 Tensor 重载，不必再创建 Host AccessTable 或重新上传地址表：
 
@@ -91,7 +120,7 @@ Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制
 
 ## 与 AIV 共用 Host EID 发现
 
-GatherRead、裸地址 GatherRead 和 CPU Push Scatter 都由 `NpuRuntime` 的现有
+GatherRead 和 CPU Push Scatter 都由 `NpuRuntime` 的现有
 EID 发现流程选路：逻辑设备号映射到物理设备号，读取 CLOS 与 pair_info 候选，
 再沿用原有候选验证流程选择可用连接。AICPU 不再自行选择第一个可见 UMDK EID。
 
@@ -100,7 +129,9 @@ Host 将选定 EID 传入 UMDK Prepare，设备端只匹配该 EID 对应的 UB 
 UMDK device/index 完全由选定 EID 自动匹配，不再提供单独的设备/索引过滤参数。
 测试脚本复用原有 `parse_npu_eids()`，通过 `--npu-eids` 或 `KVAF_NPU_EIDS` 指定 EID；
 不指定时自动发现。Python 的 `npu_eids` 在 GatherRead 下按顺序作为候选尝试，
-CPU Push Scatter 接受一个显式 EID。AIV 原有的多 EID 条带语义不变。
+CPU Push Scatter 同样将列表作为按顺序尝试的候选；每次只使用一个 EID。AIV 原有的多 EID 条带语义不变。
+候选失败后完成资源清理再尝试下一项，清理失败则停止并保留资源供重试。
+`KVAF_NPU_EIDS` 由测试脚本解析后传给 Runtime，Runtime 本身不读取该环境变量。
 
 同一个 Runtime 的 GatherRead/BatchPut 共用选定 EID；CPU Push Scatter 的 HCCP 回推通道
 与其 UMDK BatchPut 也绑定同一个 Host EID，各自管理自己的通信资源。
@@ -108,69 +139,49 @@ Host/设备控制参数已增加 EID 字段，仍使用单一 `KvafAicpuUmdkCont
 升级时必须一起重建 Host 库并重新安装设备算子包，然后重启 NPU 进程：
 
 ```bash
-./build.sh aicpu-urma --cpu-push --install-kernel
-export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
+./build.sh npu
+./build.sh npu --check-kernel
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 AICPU 初始化输出 `UMDK_EID_SELECTED source=host device=... eid_index=... eid=...`，
 应与 Runtime 选定的 Host 候选一致。该改动不包含 TP 实验、请求邮箱协议变更或诊断清零开关。
 
-## 测试直接输入 CPU 源地址
+## 公开输入模式
 
-给性能扫描加 `--source-mode direct`，AICPU 就直接读取本轮的 `addresses[i]`，
-跳过 `address_table[indices[i]] + offsets[i]`。默认 `--source-mode table` 保留查表方式。
-两种方式使用相同的 100 GiB CPU DDR 总预算、随机源数据和输出行，CPU gather、流水 READ 均相同。
-
-```bash
-./build.sh aicpu-urma --install-kernel
-
-KVAF_AICPU_TOKEN_BYTES="656" \
-KVAF_AICPU_MISS_COUNTS="4096" \
-KVAF_AICPU_WORKERS="1" \
-./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
-  --device-id 7 --peer 127.0.0.1:28888 \
-  --source-mode direct --warmup 10 --iterations 100
-```
-
-测试在每轮计时前从地址表生成裸地址，并同步完成；传入 kernel 的是本轮裸地址数组。
-所以这组数据衡量的是**源地址已准备好时**的性能，地址生成成本不在计时中。
-终端和 CSV 增加 `source_mode`；裸地址模式将 `lookup_table_us` 换成 `prepare_request_us`，
-包含填写地址/长度清单和发送前的清单缓存维护，其余阶段口径相同。
-
-实际调用使用 `aicpu_batch_get_mode="gather_read_direct"` 创建 Runtime，再调用已有 Tensor 重载：
-
-```python
-# source_addresses: HBM 中连续的 int64 数组，每项已包含完整 CPU 源地址。
-# 每个有效地址至少可读取 token_bytes 字节；output_indices 指定 HBM 输出行。
-runtime.batch_get(source_addresses, valid, indices, offsets, miss_count,
-                  output_indices, output, stream=stream, synchronize=True)
-```
-
-为复用现有 Python 接口，`valid`、`indices`、`offsets` 仍需满足原来的 Tensor 形状与类型要求，
-但裸地址模式的 AICPU kernel 不读取它们。地址数组容量须覆盖请求数组容量；
-只处理 `miss_count` 指定的有效前缀。调用方可直接提供已有的裸地址，不需要创建全量地址表。
-默认查表模式及 CPU-push 模式的输入含义不变。CPU 服务无需修改，Host 库与设备包需一起更新。
+公开 Runtime 只提供查表输入，`gather_read_direct` 不再是合法 mode，
+测试及 sweep 不再提供 `--source-mode direct`。裸 `addresses/valid` Tensor 重载
+仍表示地址表，源地址为 `addresses[indices[i]] + offsets[i]`，不能传入逐请求最终地址替代。
 
 ## 用 Python 检查正确性和比较 worker 数
 
 CPU 服务启动后，在仓库根目录运行：
 
 ```bash
-export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
-  --workers 1 2 4 --blocks 4096 --token-bytes 656 \
-  --tokens-per-block 2 --warmup 10 --iterations 1000
+  --modes gather_read --workers 1 2 4 5 \
+  --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
+  --output-row-step 2 --warmup 3 --iterations 20
 ```
 
-脚本从 CANN 环境变量寻找已安装的 kernel JSON，也可用 `--kernel-json` 显式指定。
+为与 Scatter 对照配置保持一致，本例使用 1、2、4、5 个 worker。
+实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，暂不推荐 Scatter 使用该配置。
+
+Runtime 统一定位已安装的 AICPU 包；脚本不再接受 `--kernel-json`。
 每轮重新生成源数据、输入索引、偏移和输出行号；先完成 BatchPut，再执行 BatchGet，
 逐字节检查整个输出，包括未写入的行和间隔；还在 NPU 上执行转换和加法，检查后续算子读取结果。
 预检覆盖两种 Python 重载、完整/部分/空前缀，以及异步 BatchGet 后同 stream 的 NPU 消费者。
 源和输出 Tensor 的注册地址持续有效到 Runtime 关闭；每轮释放 AccessTable 和 key 后重新写入，
 不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试前 75% 的请求。
 
-每个 worker 配置输出一行 `AICPU_BATCH_GET_PASS`，包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
+上例应输出 4 条 `AICPU_BATCH_GET_PASS mode=gather_read`。
+改用 `--output-row-step 1` 检查相邻输出行；增加测量轮次可做性能复测。
+多候选验证可追加 `--npu-eids "实际EID1,实际EID2"`。若要检查失败回退，第一项应是
+格式合法但对当前连接不可用的候选，后面放已确认可用的候选，并检查最终选中 EID 的日志。
+
+每个 worker 配置的通过日志包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
 计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
 输入准备、BatchPut、AccessTable 创建与上传、输出下载和正确性检查均在计时之外。
 正常带宽统计不启用 profile。需要定位阶段耗时时，在同一命令末尾加 `--profile-rounds 100`：
@@ -206,25 +217,16 @@ Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳�
 
 ## 全量性能扫描
 
-在仓库根目录构建后，先启动 CPU 服务：
+按前文完成构建和安装并保持 CPU 服务运行，在 NPU 终端加载 CANN 环境后执行：
 
 ```bash
-./build.sh cpu
-./build.sh aicpu-urma --install-kernel
-
-./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28990 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
-```
-
-另一个终端加载 CANN 环境，在仓库根目录运行扫描：
-
-```bash
-./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
+./tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
   --device-id 7 --peer 127.0.0.1:28990
 ```
 
-Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.batch_get` 测量。
+Shell 脚本循环调用
+[benchmark_gather_read.py](../access_operator/demo/aicpu_batch_get/python/benchmark_gather_read.py)，
+通过 `NpuRuntime.batch_get` 测量。
 默认扫描 252 组：
 
 | 参数 | 扫描值 |
@@ -233,7 +235,8 @@ Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.
 | miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
 | workers | 1、2、4、5 |
 
-每组预热 10 轮、测量 100 轮，均开启 profile。端到端、算子和各阶段耗时来自同一批测量轮次。
+每组预热 10 轮、测量 100 轮，均开启 profile。汇总输出算子时间和各阶段耗时，
+不把该采样带宽等同于正确性脚本中关闭 profile 的 Python 端到端带宽。
 只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
 算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段每轮取 worker 最大耗时，再对测量轮次求均值。
 
@@ -245,15 +248,15 @@ Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.
 输入数组和输出行数为 `max(32768, miss_count)`，每轮校验整个输出和未写入行。
 准备数据、BatchPut、生成请求和结果校验在计时之外。
 
-缩小扫描范围时，设置三个列表即可；其他参数直接传给单组测试：
+缩小扫描范围和源池时，设置三个列表并传入 `--table-capacity`：
 
 ```bash
 KVAF_AICPU_TOKEN_BYTES="656" \
 KVAF_AICPU_MISS_COUNTS="32 4096" \
 KVAF_AICPU_WORKERS="1 2 4" \
-./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
+./tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
   --device-id 7 --peer 127.0.0.1:28990 \
-  --warmup 3 --iterations 20
+  --table-capacity 4096 --warmup 3 --iterations 20
 ```
 
 `--table-capacity` 仅用于选择更小的源池，不能超出上述预算；`--tokens-per-block` 控制每块 token 数。
@@ -374,6 +377,7 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 | `access_operator/src/aicpu_urma/kernel/control_kernel.cc` | Host 控制命令的设备入口和分发 |
 | `access_operator/src/aicpu_urma/package/` | 算子 JSON、UMDK 库打包和安装脚本 |
 
-BatchGet 还提供 `cpu_push_scatter` 入口，通过 `aicpu_batch_get_mode` 在初始化时选择；
+BatchGet 还提供 `cpu_push_scatter` 入口，通过 `aicpu_batch_get_mode` 在 Runtime 构造时选择；
 两条路径使用相同的输入前缀和输出地址语义。
-两个 demo 均按 `include/host/kernel` 分层，共用一个设备包和会话；Python 参数及构建命令保持不变。
+两个 demo 均按 `include/host/kernel` 分层，共用一个设备包。Gather 与 Put 共用 UMDK
+会话；Scatter Get 使用独立的 Host HCCP 通道，配套 Put 仍使用 UMDK，会话生命周期分别管理。
