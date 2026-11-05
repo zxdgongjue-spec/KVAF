@@ -32,9 +32,6 @@ struct NpuRuntimeOptions {
   std::uint32_t jettys_per_core{2U};
   // Nonempty selects the optional AICPU UMDK data plane; AIV defaults stay unchanged.
   std::string aicpu_urma_kernel_json_path;
-  // Optional UMDK endpoint filters; AICPU always uses the Host-selected EID.
-  std::string urma_device;
-  std::uint32_t urma_eid_index{UINT32_MAX};
   // AICPU BatchGet algorithm; BatchPut continues to use its UMDK session.
   std::string aicpu_batch_get_mode{"gather_read"};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.

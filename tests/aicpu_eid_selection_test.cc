@@ -72,7 +72,6 @@ int main() {
   endpoints[2][1].eid_index = 5;
   const auto* requested = endpoints[1][1].eid.raw;
   UmdkControlArgs args{};
-  args.eid_index = UINT32_MAX;
   std::memcpy(args.local_eid, requested, 16);
   UmdkControlStatus status{};
 
@@ -86,20 +85,7 @@ int main() {
   CHECK((attempts == std::vector<std::pair<int, unsigned>>{{1, 3}, {2, 5}}));
   CHECK(status.result == 0 && status.error_number == 0 && freed_eids == 2);
 
-  Reset(); args.eid_index = 5;
-  CHECK(CreateContext(args, status));
-  CHECK((attempts == std::vector<std::pair<int, unsigned>>{{2, 5}}));
-
-  Reset(); args.eid_index = 0; status = {};
-  CHECK(!CreateContext(args, status));
-  CHECK(attempts.empty() && status.error_number == ENODEV);
-
-  Reset(); args.eid_index = UINT32_MAX;
-  std::strcpy(args.device, "ub2");
-  CHECK(CreateContext(args, status));
-  CHECK((attempts == std::vector<std::pair<int, unsigned>>{{2, 5}}));
-
-  Reset(); args.device[0] = '\0'; status = {};
+  Reset(); status = {};
   std::array<std::uint8_t, 16> missing{}; missing[15] = 9;
   std::memcpy(args.local_eid, missing.data(), 16);
   CHECK(!CreateContext(args, status));
@@ -119,5 +105,5 @@ int main() {
   CHECK(!CreateContext(args, status));
   CHECK(std::strcmp(status.stage, "urma_get_device_list") == 0);
 
-  std::puts("PASS mandatory Host EID matching, filters, retries and failures; no autonomous selection");
+  std::puts("PASS Host EID resolves device/index automatically; retries, missing/zero EIDs and failures");
 }

@@ -23,7 +23,7 @@ CPU push 自动发现单个 NPU EID，也可通过 `npu_eids=[eid]` 指定一个
 自动发现的候选按现有 Runtime 初始化流程尝试；多 EID 条带和 AIV 自适应调优不用于此路径。
 Get 使用 Host direct HCCP/RA；Put 使用 AICPU UMDK session。两者使用同一个 Host 选定 EID，
 复用仓库原有的 CLOS/pair_info 发现与候选验证流程，UMDK 不再独立选择端点。
-`--urma-device`、`--eid-index` 只作可选过滤，默认不限制；没有匹配该 EID 的 UMDK 端点就尝试下一候选。
+UMDK 根据选定 EID 自动匹配 device/index；没有匹配端点就尝试下一候选，不再提供独立过滤参数。
 控制参数有更新，Host 库和设备包必须一起重建；仍保留单一 UMDK 控制入口。
 CPU push 的 V3 数据/请求协议及 TP 管理保持本分支原有实现。
 CPU 使用四路 Jetty，由所属服务线程更新并依次提交预构建链；

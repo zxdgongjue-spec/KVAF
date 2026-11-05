@@ -39,7 +39,7 @@ batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
 adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048,
-aicpu_urma_kernel_json_path="", urma_device="", urma_eid_index=UINT32_MAX,
+aicpu_urma_kernel_json_path="",
 aicpu_batch_get_mode="gather_read", transport="urma")`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；

@@ -464,8 +464,8 @@ struct NpuRuntime::Impl {
     } else if (!options.aicpu_urma_kernel_json_path.empty()) {
 #if defined(KVAF_ENABLE_AICPU_URMA)
       access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
-          options.aicpu_urma_kernel_json_path, options.urma_device, options.urma_eid_index,
-          options.npu_core_count, peer_link, options.batch_get_token_bytes,
+          options.aicpu_urma_kernel_json_path, options.npu_core_count,
+          peer_link, options.batch_get_token_bytes,
           options.aicpu_batch_get_mode, config.peer_local_eid});
 #else
       throw std::invalid_argument("AICPU UMDK support was not built");

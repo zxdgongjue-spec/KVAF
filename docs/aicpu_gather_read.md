@@ -97,7 +97,7 @@ EID 发现流程选路：逻辑设备号映射到物理设备号，读取 CLOS �
 
 Host 将选定 EID 传入 UMDK Prepare，设备端只匹配该 EID 对应的 UB device/index 并创建 context；
 没有匹配项时报告失败，交回 Runtime 尝试下一个候选，不改用其他 EID。
-`--urma-device` 和 `--eid-index` 是可选过滤条件，默认不限制设备或索引。
+UMDK device/index 完全由选定 EID 自动匹配，不再提供单独的设备/索引过滤参数。
 测试脚本复用原有 `parse_npu_eids()`，通过 `--npu-eids` 或 `KVAF_NPU_EIDS` 指定 EID；
 不指定时自动发现。Python 的 `npu_eids` 在 GatherRead 下按顺序作为候选尝试，
 CPU Push Scatter 接受一个显式 EID。AIV 原有的多 EID 条带语义不变。

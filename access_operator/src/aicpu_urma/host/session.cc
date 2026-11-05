@@ -57,9 +57,9 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
   if (status.result != 0) {
     failed_ = true;
     std::fprintf(stderr,
-                 "UMDK_SETUP_ERROR op=%u workers=%u host_device='%s' "
+                 "UMDK_SETUP_ERROR op=%u workers=%u "
                  "result=%d errno=%d stage=%s detail=%s\n",
-                 static_cast<unsigned>(op), args_.worker_count, args_.device, status.result,
+                 static_cast<unsigned>(op), args_.worker_count, status.result,
                  status.error_number, status.stage, status.detail);
     return Status::Internal("UMDK setup/cleanup failed");
   }
@@ -97,10 +97,8 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   if (failed_ || pending_)
     return Status::InvalidState("UMDK session failed; shut down before reuse");
   auto& link = *config_.peer_link;
-  const auto& device = config_.device;
-  const auto eid_index = config_.eid_index, workers = config_.workers;
-  if (connected_ && args_.remote_address == region_base && args_.worker_count == workers &&
-      device == args_.device && eid_index == args_.eid_index) {
+  const auto workers = config_.workers;
+  if (connected_ && args_.remote_address == region_base && args_.worker_count == workers) {
     const auto address = reinterpret_cast<std::uint64_t>(output);
     for (const auto& buffer : registered_buffers_)
       if (address >= buffer.first && address - buffer.first <= buffer.second &&
@@ -115,8 +113,6 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   }
   auto result = Shutdown();
   if (!result.ok()) return result;
-  if (device.size() >= sizeof(args_.device))
-    return Status::InvalidArgument("UMDK device name is too long");
   peer::PeerRegion region;
   result = link.LookupRegion(region_base, &region);
   if (!result.ok()) return result;
@@ -132,8 +128,6 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   args_.local_buffer = reinterpret_cast<std::uint64_t>(output);
   args_.buffer_bytes = output_bytes;
   args_.worker_count = workers;
-  args_.eid_index = eid_index;
-  std::snprintf(args_.device, sizeof(args_.device), "%s", device.c_str());
   args_.token = region.token_value;
   args_.remote_address = region.base;
   std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);

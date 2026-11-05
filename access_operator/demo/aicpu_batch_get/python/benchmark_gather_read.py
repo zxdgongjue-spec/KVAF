@@ -22,9 +22,6 @@ def parse_args(argv=None, *, mode="gather_read"):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
-    p.add_argument("--urma-device", default="")
-    p.add_argument("--eid-index", type=int, default=0xFFFFFFFF,
-                       help="optional UMDK endpoint index filter; default matches the Host EID at any index")
     if mode == "gather_read":
         p.add_argument("--source-mode", choices=("table", "direct"), default="table",
                        help="direct: prepare CPU source addresses before timing; skip AICPU lookup")
@@ -58,8 +55,8 @@ def parse_args(argv=None, *, mode="gather_read"):
         p.error("source pool plus workspace must fit the 100 GiB DDR budget")
     if a.warmup < 0 or a.iterations <= 0:
         p.error("invalid warmup or iterations")
-    if a.device_id < 0 or not 0 <= a.eid_index <= 0xFFFFFFFF:
-        p.error("invalid device or EID index")
+    if a.device_id < 0:
+        p.error("invalid device ID")
     if not a.kernel_json or not Path(a.kernel_json).is_file():
         p.error("source the CANN environment or pass an installed --kernel-json")
     return a
@@ -173,7 +170,6 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
         npu_core_count=a.workers, aicpu_urma_kernel_json_path=a.kernel_json,
-        urma_device=a.urma_device, urma_eid_index=a.eid_index,
         aicpu_batch_get_mode="gather_read_direct" if direct else mode, npu_eids=a.npu_eids,
     )
     profiles = []

@@ -278,7 +278,6 @@ class NpuPythonRuntime final {
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
                    std::string aicpu_urma_kernel_json_path,
-                   std::string urma_device, std::uint32_t urma_eid_index,
                    std::string aicpu_batch_get_mode, const std::string& transport) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
@@ -293,8 +292,6 @@ class NpuPythonRuntime final {
     options.jettys_per_core = jettys_per_core;
     options.aicpu_urma_kernel_json_path = std::move(aicpu_urma_kernel_json_path);
     aicpu_backend_ = !options.aicpu_urma_kernel_json_path.empty();
-    options.urma_device = std::move(urma_device);
-    options.urma_eid_index = urma_eid_index;
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
@@ -613,8 +610,7 @@ void BindNpuPythonRuntime(py::module_& module) {
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
                     std::string, std::vector<std::string>, std::uint32_t,
-                    std::string, std::string, std::uint32_t, std::string,
-                    const std::string&>(),
+                    std::string, std::string, const std::string&>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -629,8 +625,6 @@ void BindNpuPythonRuntime(py::module_& module) {
                std::vector<std::string>{},
            py::arg("batch_get_max_inflight_total") = 2048,
            py::arg("aicpu_urma_kernel_json_path") = "",
-           py::arg("urma_device") = "",
-           py::arg("urma_eid_index") = UINT32_MAX,
            py::arg("aicpu_batch_get_mode") = "gather_read",
            py::arg("transport") = "urma")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),

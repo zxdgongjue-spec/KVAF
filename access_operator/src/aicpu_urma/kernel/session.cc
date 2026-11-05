@@ -210,7 +210,7 @@ bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status) {
     return Fail(status, "Host-selected EID is zero");
   bool matched = false;
   const bool enumerated = kvaf::urma::EnumerateEndpoints(
-      state.api, args.device, args.eid_index, [&](auto* device, const auto& eid) {
+      state.api, "", UINT32_MAX, [&](auto* device, const auto& eid) {
         if (std::memcmp(args.local_eid, eid.eid.raw, 16) != 0) return false;
         matched = true;
         state.context = state.api.urma_create_context(device, eid.eid_index);
@@ -234,7 +234,7 @@ bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status) {
   char expected[33]{};
   for (unsigned i = 0; i < 16; ++i) std::snprintf(expected + i * 2, 3, "%02x", args.local_eid[i]);
   errno = ENODEV;
-  return Fail(status, "Host EID not exposed by UMDK (device/index filters applied)", -1, expected);
+  return Fail(status, "Host EID not exposed by UMDK", -1, expected);
 }
 
 bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {

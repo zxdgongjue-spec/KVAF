@@ -40,9 +40,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-rounds", type=int, default=0,
                         help="extra instrumented rounds, excluded from bandwidth statistics")
-    parser.add_argument("--urma-device", default="")
-    parser.add_argument("--eid-index", type=int, default=0xFFFFFFFF,
-                       help="optional UMDK endpoint index filter; default matches the Host EID at any index")
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
     parser.add_argument(
         "--kernel-json",
@@ -65,8 +62,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (not 0 <= args.active_percent <= 100 or args.warmup < 0 or args.iterations <= 0
             or args.profile_rounds < 0):
         parser.error("invalid active percentage, warmup or iteration count")
-    if not 0 <= args.eid_index <= 0xFFFFFFFF:
-        parser.error("--eid-index must be a nonnegative uint32 index")
     if not args.kernel_json or not Path(args.kernel_json).is_file():
         parser.error("source the CANN environment or pass an installed --kernel-json")
     return args
@@ -168,8 +163,6 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         device_id=args.device_id,
         npu_core_count=workers,
         aicpu_urma_kernel_json_path=args.kernel_json,
-        urma_device=args.urma_device,
-        urma_eid_index=args.eid_index,
         aicpu_batch_get_mode=mode,
         npu_eids=args.npu_eids,
     )

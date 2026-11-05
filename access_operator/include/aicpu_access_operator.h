@@ -4,8 +4,6 @@
 namespace kvaf {
 struct UmdkAccessOperatorConfig {
   std::string kernel_json;
-  std::string device;
-  std::uint32_t eid_index{UINT32_MAX};
   std::uint32_t workers{1U};
   std::shared_ptr<PeerLink> peer_link;
   std::uint32_t token_bytes{0U};
