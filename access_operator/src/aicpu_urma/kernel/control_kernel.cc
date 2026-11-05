@@ -21,7 +21,7 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
   if (args->op == UmdkControlOp::kPrepare) {
     if (!args->worker_count || args->worker_count > 8 || !args->local_buffer ||
         !args->buffer_bytes || args->local_buffer > UINT64_MAX - args->buffer_bytes ||
-        args->device[63] || args->library[255])
+        args->library[255])
       Fail(status, "invalid UMDK session arguments");
     else if (state.session != 0) {
       status.session = 0;

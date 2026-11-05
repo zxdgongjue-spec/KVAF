@@ -205,6 +205,38 @@ bool DescribeWorker(const UmdkControlArgs& args, std::uint32_t index, UmdkContro
   return true;
 }
 
+static bool CreateContext(const UmdkControlArgs& args, UmdkControlStatus& status) {
+  if (std::all_of(args.local_eid, args.local_eid + 16, [](auto b) { return b == 0; }))
+    return Fail(status, "Host-selected EID is zero");
+  bool matched = false;
+  const bool enumerated = kvaf::urma::EnumerateEndpoints(
+      state.api, "", UINT32_MAX, [&](auto* device, const auto& eid) {
+        if (std::memcmp(args.local_eid, eid.eid.raw, 16) != 0) return false;
+        matched = true;
+        state.context = state.api.urma_create_context(device, eid.eid_index);
+        if (!state.context) {
+          Fail(status, "urma_create_context");
+          // The same EID can be exposed at another device/index.
+          return false;
+        }
+        status.result = status.error_number = 0;
+        status.detail[0] = '\0';
+        std::memcpy(status.eid, state.context->eid.raw, 16);
+        std::fprintf(stderr, "[KVAF_AICPU] UMDK_EID_SELECTED source=host device=%s eid_index=%u eid=",
+                     device->name, eid.eid_index);
+        for (auto byte : status.eid) std::fprintf(stderr, "%02x", byte);
+        std::fprintf(stderr, "\n");
+        return true;
+      });
+  if (!enumerated) return Fail(status, "urma_get_device_list");
+  if (state.context) return true;
+  if (matched) return false;
+  char expected[33]{};
+  for (unsigned i = 0; i < 16; ++i) std::snprintf(expected + i * 2, 3, "%02x", args.local_eid[i]);
+  errno = ENODEV;
+  return Fail(status, "Host EID not exposed by UMDK", -1, expected);
+}
+
 bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (state.session != 0) return Fail(status, "UMDK session already active");
   state.session = ++generation;
@@ -219,18 +251,7 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (init_result != 0 && init_result != EEXIST && init_result != -EEXIST)
     return Fail(status, "urma_init", init_result);
   state.owns_init = init_result == 0;
-  const bool enumerated = kvaf::urma::EnumerateEndpoints(
-      state.api, args.device, args.eid_index, [&](auto* device, const auto& eid) {
-        state.context = state.api.urma_create_context(device, eid.eid_index);
-        if (!state.context) {
-          Fail(status, "urma_create_context");
-          return true;
-        }
-        std::memcpy(status.eid, state.context->eid.raw, 16);
-        return true;
-      });
-  if (!enumerated) return Fail(status, "urma_get_device_list");
-  if (!state.context) return status.result ? false : Fail(status, "no usable UB EID inside AICPU");
+  if (!CreateContext(args, status)) return false;
   std::copy_n(args.route_eid, 16, state.peer_eid.begin());
   state.worker_count = args.worker_count;
   // Preserve queue creation order while storing every worker uniformly.

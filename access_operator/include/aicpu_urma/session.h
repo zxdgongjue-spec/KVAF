@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -12,10 +13,9 @@ namespace kvaf::aicpu_urma {
 
 struct UmdkSessionConfig {
   std::string kernel_json;
-  std::string device;
-  std::uint32_t eid_index{UINT32_MAX};
   std::uint32_t workers{1U};
   std::shared_ptr<peer::PeerLink> peer_link;
+  std::array<std::uint8_t, 16> local_eid{};
 };
 
 class UmdkSession {
