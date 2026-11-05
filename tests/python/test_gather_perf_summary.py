@@ -62,6 +62,56 @@ class GatherPerfSummaryTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 perf.validate_config(cores)
 
+    def test_output_layout_validation_and_random_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.csv_metadata()["output_layout"], "random")
+        for layout in ("random", "segmented", "contiguous"):
+            with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": layout}):
+                perf.validate_config(2)
+                self.assertEqual(self.csv_metadata()["output_layout"], layout)
+        with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": "unknown"}):
+            with self.assertRaisesRegex(ValueError, "KVAF_GATHER_OUTPUT_LAYOUT"):
+                perf.validate_config(2)
+        with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": "segmented"}), \
+             patch.object(perf, "TOKEN_BYTES", 16384):
+            with self.assertRaisesRegex(ValueError, "65536"):
+                perf.validate_config(2)
+
+    def test_output_rows_preserve_random_mapping_and_contiguous_guards(self):
+        calls = []
+        def permutation(count):
+            calls.append(count)
+            return [2, 0, 3, 1]
+        self.assertEqual(perf.make_output_rows(4, 2, 6, "random", permutation), [3, 1, 4, 2])
+        self.assertEqual(calls, [4])
+        self.assertEqual(perf.make_output_rows(4, 2, 6, "contiguous", permutation), [1, 2, 3, 4])
+        self.assertEqual(calls, [4])  # Contiguous output consumes no random numbers.
+
+    def test_segmented_rows_follow_per_core_wqe_boundaries_and_keep_a_permutation(self):
+        for requests in (1, 7, 19, 8192, 8193):
+            for cores in (1, 2, 3, 8):
+                for sgl in (1, 6, 13):
+                    rows = perf.make_output_rows(requests, cores, sgl, "segmented", lambda n: reversed(range(n)))
+                    self.assertEqual(sorted(rows), list(range(1, requests + 1)))
+                    for core in range(cores):
+                        first, last = requests * core // cores, requests * (core + 1) // cores
+                        for begin in range(first, last, sgl):
+                            segment = rows[begin:min(begin + sgl, last)]
+                            self.assertEqual(segment, list(range(segment[0], segment[0] + len(segment))))
+                        tail = first + (last - first) // sgl * sgl
+                        self.assertEqual(rows[tail:last], list(range(tail + 1, last + 1)))
+        rows = perf.make_output_rows(8192, 2, 6, "segmented", lambda n: reversed(range(n)))
+        self.assertGreater(rows[0], 4096)  # Full segments also shuffle across lanes.
+        self.assertNotEqual(rows[6], rows[5] + 1)
+
+    def test_output_layout_is_recorded_in_all_csv_files(self):
+        with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": "segmented"}):
+            metadata = self.csv_metadata()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = perf.export_csv_results(directory, metadata, [1000.0], [snapshot()], [1100.0])
+            for path in paths:
+                self.assertTrue(all(row["output_layout"] == "segmented" for row in self.read_csv(path)))
+
     def test_profile_only_debugging_and_empty_sampling_rejection(self):
         with patch.object(perf, "WARMUP", 0), patch.object(perf, "ITERATIONS", 0):
             perf.validate_config(1)

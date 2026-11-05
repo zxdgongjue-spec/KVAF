@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Gather performance comparison: edit the configuration below, then run on NPU.
 
-Only device/core selection and the existing service/kernel paths use environment
-variables. This script has no command-line options. Request tensors are prepared
-once and reused, so the measurements describe a warmed, fixed random workload.
+Device/core selection, service/kernel paths and KVAF_GATHER_OUTPUT_LAYOUT use
+environment variables. Request tensors are prepared once and reused; CPU source
+requests remain fixed and random across all output layouts.
 """
 from __future__ import annotations
 
@@ -81,6 +81,11 @@ def validate_config(cores: int) -> None:
         raise ValueError("token offsets must fit int32")
     if not 1 <= cores <= 8 or not 1 <= GATHER_SGL_SIZE <= 13:
         raise ValueError("KVAF_NPU_CORE_COUNT must be 1..8 and GATHER_SGL_SIZE 1..13")
+    layout = os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random")
+    if layout not in ("random", "segmented", "contiguous"):
+        raise ValueError("KVAF_GATHER_OUTPUT_LAYOUT must be random, segmented or contiguous")
+    if layout == "segmented" and TOKEN_BYTES * GATHER_SGL_SIZE > 65536:
+        raise ValueError("segmented output requires TOKEN_BYTES * GATHER_SGL_SIZE <= 65536")
     if not isinstance(SEED, int) or isinstance(SEED, bool) or not 0 <= SEED < 1 << 63:
         raise ValueError("SEED must be an integer in [0, 2**63)")
     if PROFILE_CLOCK_MHZ is not None and (
@@ -94,6 +99,23 @@ def validate_config(cores: int) -> None:
         raise ValueError("CSV_OUTPUT_DIR must be a non-empty directory path")
     if not isinstance(RUN_LABEL, str):
         raise ValueError("RUN_LABEL must be a string")
+
+
+def make_output_rows(requests: int, cores: int, sgl: int, layout: str, randperm) -> list[int]:
+    """Keep guard rows untouched; shuffle whole WQE destinations, retaining tails."""
+    if layout == "random":
+        return [row + 1 for row in randperm(requests)]
+    rows = list(range(1, requests + 1))
+    if layout == "segmented":
+        starts = []
+        for core in range(cores):
+            first, last = requests * core // cores, requests * (core + 1) // cores
+            starts.extend(range(first, last - sgl + 1, sgl))
+        # Full segments can move across lanes; partial tails keep their rows.
+        for target, index in zip(starts, randperm(len(starts))):
+            source = starts[index]
+            rows[target:target + sgl] = range(source + 1, source + sgl + 1)
+    return rows
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -218,6 +240,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "token_bytes": TOKEN_BYTES, "request_count": REQUEST_COUNT,
         "payload_bytes": REQUEST_COUNT * TOKEN_BYTES, "table_capacity": TABLE_CAPACITY,
         "tokens_per_block": TOKENS_PER_BLOCK, "sgl": GATHER_SGL_SIZE, "seed": SEED,
+        "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
@@ -398,13 +421,14 @@ def main() -> int:
         batch_get_max_inflight_total=0,
     )
     metadata = csv_metadata(cores, device_id, kernel, put_kernel)
+    layout = metadata["output_layout"]
     samples_us, snapshots, profile_calls_us = [], [], []
     try:
         runtime.link_to(endpoint)
         print(
             f"GATHER_PERF_CONFIG mode=gather_read cores={cores} token_bytes={TOKEN_BYTES} "
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
-            f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} "
+            f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={PROFILE_SAMPLES} "
             "plan=fixed_random timing=async_call_to_stream_completion",
             flush=True,
@@ -423,7 +447,9 @@ def main() -> int:
         generator = torch.Generator().manual_seed(SEED)
         indices_cpu = torch.randint(TABLE_CAPACITY, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
         slots_cpu = torch.randint(TOKENS_PER_BLOCK, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
-        rows_cpu = torch.randperm(REQUEST_COUNT, generator=generator).to(torch.int32) + 1
+        rows_cpu = torch.tensor(make_output_rows(
+            REQUEST_COUNT, cores, GATHER_SGL_SIZE, layout,
+            lambda count: torch.randperm(count, generator=generator).tolist()), dtype=torch.int32)
         indices = indices_cpu.to(device)
         offsets = (slots_cpu * TOKEN_BYTES).to(device)
         rows = rows_cpu.to(device)

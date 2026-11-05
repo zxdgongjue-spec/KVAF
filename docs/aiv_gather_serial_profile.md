@@ -130,6 +130,27 @@ RUN_LABEL = "aiv_pipeline"  # 串行基线用 serial，当前版本用 aiv_pipel
 `KVAF_NPU_CORE_COUNT=1/3/8` 设置。源码区还可配置源表规模、每个 block 的
 token 数、SGL 和随机种子；比较不同实现时保持这些值一致。
 
+NPU 输出布局可通过环境变量 `KVAF_GATHER_OUTPUT_LAYOUT` 切换，默认仍为 `random`：
+
+| 值 | NPU 输出布局 |
+| --- | --- |
+| `random` | 原有随机排列，每个 token 的落点离散 |
+| `segmented` | 每条 WQE 内的本地地址依次加 token_bytes，完整段之间随机排列；每核不足 SGL 的尾段保留原位 |
+| `contiguous` | 全批输出索引递增，跨 WQE 也连续 |
+
+```bash
+DEVICE_ID=4 KVAF_NPU_CORE_COUNT=2 KVAF_GATHER_OUTPUT_LAYOUT=segmented \
+  python tests/python/test_aiv_gather_batch_get_perf.py
+DEVICE_ID=4 KVAF_NPU_CORE_COUNT=2 KVAF_GATHER_OUTPUT_LAYOUT=contiguous \
+  python tests/python/test_aiv_gather_batch_get_perf.py
+```
+
+三种布局保留相同的随机 CPU 源请求、数据量、保护行和通用 SGL 编码。
+完整段可跨 lane 打乱，但不会重叠或越界；分段布局要求 token_bytes × SGL ≤ 65536，
+与当前 SIMT READ 分组一致。启动日志和所有 CSV 均记录 `output_layout`。
+8192 请求、2 核、SGL=6 时，按每核 4096 个请求分组，各自最后一条有 4 个 SGE。
+只需更新 Python 脚本，不需要重编 Host/kernel 或更改 CPU 服务。
+
 当前测试设备已确认为 Ascend 950DT，`PROFILE_CLOCK_MHZ` 默认设为 `1000`，
 脚本和 CSV 自动将 AIV cycle 换算成微秒，并保留原始 cycle。更换设备时，
 须按对应平台的 `GetSystemCycle()` 计数器频率调整，不能使用 AI Core 主频。
