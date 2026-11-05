@@ -51,7 +51,7 @@ void Worker::Run() {
       if (!completion.ok()) report("write_error_completion", completion);
       return;
     }
-    status = transport_->WriteBatch();
+    status = transport_->WriteBatch(&stop_);
     if (!status.ok()) { report("write_payload", status); return; }
     status = transport_->Complete(sequence, Result::kOk);
     if (!status.ok()) { report("write_completion", status); return; }

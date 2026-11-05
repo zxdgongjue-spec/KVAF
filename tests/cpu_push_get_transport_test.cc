@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iostream>
 
 namespace {
@@ -23,6 +24,10 @@ bool fail_cq{};
 std::uint32_t post_calls{};
 std::vector<std::uint32_t> post_queues;
 const kvaf::urma::Sge* later_queue_source{};
+std::function<void()> publish_suffix;
+std::uint32_t first_suffix_post{};
+std::uint64_t suffix_destination{};
+bool expect_prefix_overlap{}, prefix_pending_at_suffix{};
 std::uint64_t Address(const void* p) { return reinterpret_cast<std::uint64_t>(p); }
 struct HbmBuffer {
   void* memory{};
@@ -54,18 +59,30 @@ extern "C" urma_status_t __wrap_urma_post_jetty_send_wr(
   pending[q].push_back(wr);
   for (auto* current = wr; current; current = current->next) {
     const auto& dst = current->rw.dst.sge[0];
+    if (suffix_destination && dst.addr >= suffix_destination && !first_suffix_post) {
+      // The suffix is queued while this Jetty's prefix CQE is still pending.
+      prefix_pending_at_suffix = pending[q].size() > 1;
+      if (expect_prefix_overlap) assert(prefix_pending_at_suffix);
+      first_suffix_post = post_calls;
+    }
     posted.push_back({q, static_cast<std::uint32_t>(current->opcode), dst.len,
         current->flag.bs.place_order, current->flag.bs.complete_enable,
         current->flag.bs.comp_order, dst.addr});
   }
+  // Emulate a device that finishes the suffix only after the CPU has already
+  // issued the prefix. Waiting for the full list before this post deadlocks.
+  if (publish_suffix) {
+    auto publish = std::move(publish_suffix); publish_suffix = {};
+    publish();
+  }
   return static_cast<urma_status_t>(0);
 }
 
-extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
+extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int limit, urma_cr_t* cr) {
   const auto q = static_cast<std::uint32_t>(cq - cqs.data());
   assert(q < kJettyCount);
   int completed = 0;
-  while (!pending[q].empty()) {
+  while (!pending[q].empty() && completed < limit) {
     auto* first = pending[q].front(); pending[q].pop_front();
     std::vector<urma_jfs_wr_t*> execution;
     for (auto* wr = first; wr; wr = wr->next) execution.push_back(wr);
@@ -105,11 +122,11 @@ extern "C" int __wrap_urma_poll_jfc(urma_jfc_t* cq, int, urma_cr_t* cr) {
       }
       assert(bytes == dst.len);
       if (wr->flag.bs.complete_enable) {
-        assert(!completed);
-        cr[0] = {};
-        cr[0].user_ctx = wr->user_ctx;
-        cr[0].status = fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
-        completed = 1;
+        assert(completed < limit);
+        cr[completed] = {};
+        cr[completed].user_ctx = wr->user_ctx;
+        cr[completed].status = fail_cq ? static_cast<urma_cr_status_t>(1) : URMA_CR_SUCCESS;
+        ++completed;
       }
     }
   }
@@ -120,11 +137,13 @@ namespace kvaf::cpu_push {
 struct TransportTest {
   static void Run(std::uint32_t token, std::uint32_t maximum = 1024,
                   std::uint32_t max_sge = 16, std::uint32_t post_batch = 128,
-                  std::uint32_t message_bytes = 65536) {
+                  std::uint32_t message_bytes = 65536, bool head_start = false,
+                  std::uint32_t credit_depth = 8192) {
     Transport t;
     assert(MakeLayout(token, 4, &t.layout_));
     t.workers_ = 4; t.token_bytes_ = token; t.max_sge_ = max_sge; t.max_bytes_ = message_bytes;
     t.post_batch_wrs_ = post_batch;
+    t.tracker_ = Transport::Tracker(kJettyCount, credit_depth);
     // Retain marker space to exercise legacy mode as well as done-only mode.
     void* memory = nullptr;
     assert(!posix_memalign(&memory, 64, t.layout_.staging + 32768));
@@ -148,6 +167,12 @@ struct TransportTest {
       *r = {};
       r->magic = kMagic; r->sequence = sequence; r->count = count; r->token_bytes = token; r->workers = 4;
       r->reserved = (whole ? kBatchDoneOnly : 0) | (profile ? kInlineProfile : 0);
+      const auto head = head_start && count > kChunkRows ? kChunkRows : 0U;
+      suffix_destination = head ? t.hbm_base_ + t.layout_.staging + uint64_t(head) * token : 0;
+      first_suffix_post = 0;
+      expect_prefix_overlap = head && credit_depth == 8192;
+      prefix_pending_at_suffix = false;
+      if (head) { r->reserved |= kHeadStart; r->reserved_words[0] = head; }
       reinterpret_cast<Word*>(hbm.data() + 64)->value = sequence | (profile ? kProfileNotify : 0);
       auto* addresses = reinterpret_cast<std::uint64_t*>(hbm.data() + t.layout_.descriptor);
       for (std::uint32_t i = 0; i < count; ++i)
@@ -156,18 +181,28 @@ struct TransportTest {
       // Ready/done/marker source words. Every call refreshes the entire prefix.
       posted.clear(); post_calls = 0;
       std::memcpy(t.memory_, r, sizeof(*r));
-      std::memcpy(t.memory_ + t.layout_.descriptor, addresses, count * 8);
+      std::memcpy(t.memory_ + t.layout_.descriptor, addresses, (head ? head : count) * 8);
+      if (head) {
+        std::memset(t.memory_ + t.layout_.descriptor + head * 8, 0xff, (count - head) * 8);
+        __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + kSuffixNotifyOffset), 0, __ATOMIC_RELEASE);
+        publish_suffix = [&] {
+          assert(!pending[0].empty());
+          std::memcpy(t.memory_ + t.layout_.descriptor + head * 8, addresses + head, (count - head) * 8);
+          __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + kSuffixNotifyOffset), sequence, __ATOMIC_RELEASE);
+        };
+      }
       __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + 64),
                       sequence | (profile ? kProfileNotify : 0), __ATOMIC_RELEASE);
       std::uint64_t observed{};
       assert(t.ReadRequest(&observed).ok() && observed == sequence);
       assert(t.ReadDescriptor(sequence).ok());
       assert(posted.empty() && !post_calls); // Local mailbox: no control READs.
-      assert(!std::memcmp(t.memory_ + t.layout_.descriptor, addresses, count * 8));
+      assert(!std::memcmp(t.memory_ + t.layout_.descriptor, addresses, (head ? head : count) * 8));
       posted.clear();
       post_calls = 0;
       post_queues.clear();
       if (count >= 4 && t.prepared_count_ == count && t.prepared_batch_done_only_ == whole &&
+          t.prepared_head_rows_ == head &&
           !t.prepared_.empty() && (t.prepared_[0]->queues[0].first_row != UINT32_MAX ||
                                  !t.prepared_[0]->queues[0].source_runs.empty()) &&
           !t.prepared_[0]->queues[1].local.empty()) {
@@ -177,6 +212,10 @@ struct TransportTest {
       }
       std::memset(hbm.data() + t.layout_.staging, 0xad, std::uint64_t(maximum) * token);
       assert(t.WriteBatch().ok());
+      assert(!publish_suffix);
+      if (head) assert(first_suffix_post);
+      if (head && !whole && count == 8192 && credit_depth == 128)
+        assert(!prefix_pending_at_suffix); // Real credit shortage requires a drain.
       assert(!later_queue_source);
       if (!whole && std::uint64_t{max_sge} * token <= t.max_bytes_) {
         std::size_t payload_sges = 0;
@@ -228,7 +267,7 @@ struct TransportTest {
         assert(data == 64 && tails == 4 && post_calls == 4);
         assert(markers == (whole ? 0 : 16));
       }
-      if (!whole && count == 8192 && max_sge == 16 && token == 656 && post_batch == 128) {
+      if (!whole && count == 8192 && max_sge == 16 && token == 656 && post_batch == 128 && !head) {
         assert(data == 512 && markers == 32 && tails == 4 && post_calls == 4);
         assert((post_queues == std::vector<std::uint32_t>{0, 1, 2, 3}));
       }
@@ -265,7 +304,18 @@ struct TransportTest {
     // Same count with a different mode must rebuild, not reuse a marker plan.
     for (auto count : {maximum, maximum, 19U, 257U, 0U, maximum})
       request(count, false, sequence % 2 == 0);
+    if (head_start) for (auto count : {1024U, 1025U, 1031U}) request(count, false, true);
     request(maximum, true, true);
+    if (head_start) {
+      const auto sequence = t.request().sequence;
+      __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + kSuffixNotifyOffset),
+                       sequence + 1, __ATOMIC_RELEASE);
+      assert(!t.WaitSuffix(nullptr).ok());
+      __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + kSuffixNotifyOffset), 0, __ATOMIC_RELEASE);
+      std::atomic<bool> stop{true};
+      assert(!t.WaitSuffix(&stop).ok());
+      __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + kSuffixNotifyOffset), sequence, __ATOMIC_RELEASE);
+    }
     if (token == 4096 && maximum == 1024) {
       t.context_ = reinterpret_cast<urma_context_t*>(1);  // Queue mocks own the data plane.
       for (auto mode : {0U, 1U}) for (auto queues : {1U, 2U, 4U}) {
@@ -319,6 +369,9 @@ int main() {
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests, 16, 128, 64);
   // 128 payload WR + 8 Ready per queue must stay one post at budget 128.
   kvaf::cpu_push::TransportTest::Run(656, 8192, 16, 128);
+  for (auto token : {13U, 656U, 4096U})
+    kvaf::cpu_push::TransportTest::Run(token, 8192, 16, 128, 65536, true);
+  kvaf::cpu_push::TransportTest::Run(656, 8192, 16, 128, 65536, true, 128);
   // Deployed SGE limit, interleaved multi-doorbell queues and reused plans with
   // changing source addresses. All runtime submission sizes preserve ordering.
   for (auto batch : {32U, 128U, 256U})

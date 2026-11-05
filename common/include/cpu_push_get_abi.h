@@ -20,6 +20,10 @@ constexpr std::uint32_t kInlineProfile = 1;
 // Optional whole-batch consumer mode suppresses per-chunk Ready writes.
 // Pipelined consumers leave this bit clear and use the unchanged V3 layout.
 constexpr std::uint32_t kBatchDoneOnly = 2;
+// Request::reserved_words[0] is the complete descriptor prefix length.
+// notify.value commits that prefix; notify.reserved[0] commits the suffix.
+constexpr std::uint32_t kHeadStart = 4;
+constexpr std::uint32_t kSuffixNotifyOffset = 72;
 constexpr std::uint64_t kProfileMagic = 0x4b56414650524631ULL;
 inline constexpr std::uint64_t ProfileToken(std::uint64_t sequence) {
   return kProfileMagic ^ (sequence << 32);

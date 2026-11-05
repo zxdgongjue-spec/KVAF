@@ -25,6 +25,7 @@
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_scatter_batch_get_aiv.asc"
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_gather_batch_get_aiv.asc"
 #undef __attribute__
+#include "scatter_mailbox_templates.h"
 
 namespace {
 using namespace kvaf_scatter;
@@ -124,6 +125,9 @@ struct Fixture {
   bool hold_next_jetty{}, late_first_jetty{}, copied_before_all_ready{}, waited_with_output_pending{};
   struct PushPart { uint32_t worker, chunk; kvaf::cpu_push::Range range; };
   std::vector<PushPart> push_parts;
+  struct HeadPart { uint32_t worker, chunk, queue; kvaf::cpu_push::Range range; bool suffix, ready; };
+  std::vector<HeadPart> head_parts;
+  bool head_started_early{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
@@ -194,6 +198,7 @@ struct Fixture {
       mailbox.entity.remote_host_ddr_address = Address(mailbox_memory.data());
       mailbox.entity.remote_host_ddr_size = mailbox_memory.size();
       mailbox.max_write_bytes = 65536;
+      kvaf::PrepareScatterMailboxTemplates(&mailbox);
       r.channel_entity = Address(&mailbox);
       r.queue_state = Address(&mailbox.queue);
     }
@@ -201,24 +206,61 @@ struct Fixture {
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
   void Poll(void* p) {
     std::lock_guard<std::mutex> lock(poll_mutex);
-    if (args.mode != KVAF_SEQ_SCATTER || Address(p) < (args.workspace & ~uint64_t(63)) ||
-        Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
+    const auto address = Address(p);
+    const bool control_cq = address >= Address(queues[0]->cq) &&
+                            address < Address(queues[0]->cq) + sizeof(queues[0]->cq);
+    if (args.mode != KVAF_SEQ_SCATTER || push_done ||
+        (!control_cq && (address < (args.workspace & ~uint64_t(63)) ||
+                        address >= args.workspace + args.workspace_bytes))) return;
     auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(mailbox_memory.data());
     const auto notify = aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) + 64);
     if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
     const bool pipeline = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline);
+    const bool head = (request->reserved & kvaf::cpu_push::kHeadStart) != 0;
     if (pipeline && !aiv_model::mte3.empty()) waited_with_output_pending = true;
     if (!pipeline) CheckGuard();
-    if (timeout || ++push_polls < 4) return;
+    if (timeout || (++push_polls < 4 && !head)) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
     assert(request->count == uint32_t(active));
-    {
+    if (!head) {
       const auto base = args.workspace + args.workspace_bytes - uint64_t(workers + 1) * 64;
       for (uint32_t core = 0; core < workers; ++core)
         assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
     }
     const auto* src = reinterpret_cast<const uint64_t*>(mailbox_memory.data() + args.descriptor_offset);
-    if (pipeline && !remote_error && !future_done) {
+    if (head) {
+      const auto cut = uint32_t(request->reserved_words[0]);
+      if (head_parts.empty()) {
+        for (uint32_t phase = 0; phase < 2; ++phase)
+          kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
+            [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
+              for (uint32_t q = 0; q < 4; ++q) {
+                const auto shard = kvaf::cpu_push::JettyRange(range, q);
+                const auto first = std::max(shard.begin, phase ? cut : 0U);
+                const auto last = std::min(shard.end, phase ? uint32_t(active) : cut);
+                if (first < last) head_parts.push_back({worker, chunk, q, {first, last},
+                                                       phase != 0, last == shard.end});
+              }
+            });
+      }
+      const bool suffix = aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) +
+                            kvaf::cpu_push::kSuffixNotifyOffset) == args.sequence;
+      if (push_step < head_parts.size()) {
+        const auto& part = head_parts[push_step];
+        if (part.suffix && !suffix) return;
+        if (!part.suffix) head_started_early |= aiv_model::AtomicLoadWord(
+            args.workspace + args.workspace_bytes - uint64_t(workers + 1) * 64) != args.sequence;
+        for (auto row = part.range.begin; row < part.range.end; ++row)
+          std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
+                      reinterpret_cast<void*>(src[row]), token);
+        if (pipeline && part.ready) aiv_model::AtomicStoreWord(
+            args.workspace + 192 + part.worker * 64 + part.queue * 8,
+            kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
+        ++push_step;
+        return;
+      }
+      assert(suffix); // A complete prefix alone must never publish done.
+    } else if (pipeline && !remote_error && !future_done) {
       if (push_parts.empty()) kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
           [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
             push_parts.push_back({worker, chunk, range});
@@ -250,7 +292,8 @@ struct Fixture {
         ((remote_error || error_after_scatter) ? 5 : 1);
     if (notify & kvaf::cpu_push::kProfileNotify) {
       assert(request->reserved == (kvaf::cpu_push::kInlineProfile |
-          (pipeline ? 0U : kvaf::cpu_push::kBatchDoneOnly)));
+          (pipeline ? 0U : kvaf::cpu_push::kBatchDoneOnly) |
+          (head ? kvaf::cpu_push::kHeadStart : 0U)));
       const uint64_t report[] = {kvaf::cpu_push::ProfileToken(args.sequence), 11, 22, 1000, 800, 200, 500};
       std::memcpy(workspace.data() + 136, report, sizeof(report));
     }
@@ -336,18 +379,25 @@ struct Fixture {
             assert(local == args.workspace + offset);
             assert((offset < 64 && offset + bytes <= 64) ||
                    (offset >= args.descriptor_offset && offset + bytes <= args.descriptor_offset + active * 8) ||
-                   (offset == 64 && bytes == 8));
-            if (offset == 64) {
+                   ((offset == 64 || offset == kvaf::cpu_push::kSuffixNotifyOffset) && bytes == 8));
+            if (offset == 64 || offset == kvaf::cpu_push::kSuffixNotifyOffset) {
               // Commit cannot precede any header/list placement. Verify exact
               // fresh contents, including on same-sized consecutive calls.
               assert(((header >> 16) & 3) == 2);
               assert(!std::memcmp(mailbox_memory.data(), workspace.data(), 64));
+              const auto* request = reinterpret_cast<const kvaf::cpu_push::Request*>(mailbox_memory.data());
+              const auto rows = offset == 64 && (request->reserved & kvaf::cpu_push::kHeadStart) ?
+                                  request->reserved_words[0] : uint64_t(active);
               assert(!std::memcmp(mailbox_memory.data() + args.descriptor_offset,
-                                  workspace.data() + args.descriptor_offset, active * 8));
+                                  workspace.data() + args.descriptor_offset, rows * 8));
               aiv_model::AtomicStoreWord(remote_address, aiv_model::AtomicLoadWord(local));
             } else {
-              assert((aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) + 64) &
-                      ~kvaf::cpu_push::kProfileNotify) != args.sequence);
+              const auto* request = reinterpret_cast<const kvaf::cpu_push::Request*>(mailbox_memory.data());
+              const bool suffix = (request->reserved & kvaf::cpu_push::kHeadStart) &&
+                  offset >= args.descriptor_offset + request->reserved_words[0] * 8;
+              if (suffix) assert(aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) + 72) != args.sequence);
+              else assert((aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) + 64) &
+                            ~kvaf::cpu_push::kProfileNotify) != args.sequence);
               std::memcpy(reinterpret_cast<void*>(remote_address), reinterpret_cast<void*>(local), bytes);
             }
           }
@@ -389,6 +439,8 @@ struct Fixture {
         {args.request.output_indices, args.request.output_indices + prefix},
         {args.request.address_table, args.request.address_table + uint64_t(args.request.table_capacity) * 8},
         {args.request.valid_table, args.request.valid_table + args.request.table_capacity}};
+    aiv_model::metadata_sources.push_back({Address(mailbox.write_templates),
+        Address(mailbox.write_templates) + sizeof(mailbox.write_templates)});
     aiv_model::address_table_begin = args.request.address_table;
     aiv_model::address_table_end = args.request.address_table + uint64_t(args.request.table_capacity) * 8;
     aiv_model::descriptor_begin = args.workspace + args.descriptor_offset;
@@ -416,6 +468,10 @@ struct Fixture {
       Launch(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
       assert(status[core].sequence == args.sequence);
+      if ((status[core].result == KVAF_SEQ_OK) != success)
+        std::cerr << "kernel failure: mode=" << args.mode << " count=" << active << " token=" << token
+                  << " workers=" << workers << " core=" << core << " options=" << args.reserved
+                  << " phase=" << status[core].phase << " result=" << status[core].result << '\n';
       assert((status[core].result == KVAF_SEQ_OK) == success);
       assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
       if (args.mode == KVAF_SEQ_SCATTER) {
@@ -447,7 +503,8 @@ struct Fixture {
     std::fill(cpu_done.begin(), cpu_done.end(), false);
     std::fill(ack_reads.begin(), ack_reads.end(), 0);
     push_done = false; push_polls = 0;
-    push_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
+    push_parts.clear(); head_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
+    head_started_early = false;
     copied_before_all_ready = waited_with_output_pending = false;
     std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
@@ -579,9 +636,9 @@ int main() {
               }
             }
             const auto metadata_tiles = layout.cached_rows ? tiles : 0;
-            assert(aiv_model::metadata_reads - metadata_reads == metadata_tiles);
+            assert(aiv_model::metadata_reads - metadata_reads == metadata_tiles + f.mailbox_posts - control_posts);
             assert(aiv_model::descriptor_writes - descriptor_writes == build_tiles);
-            assert(aiv_model::mte2_copies - reads == tiles + metadata_tiles);
+            assert(aiv_model::mte2_copies - reads == tiles + metadata_tiles + f.mailbox_posts - control_posts);
             assert(aiv_model::mte3_copies - writes == count + build_tiles +
                    f.mailbox_sq_copies - control_copies);
             // Scatter no longer waits for MTE3 on Scalar at every tile.
@@ -589,7 +646,7 @@ int main() {
                    f.mailbox_posts - control_posts);
             assert(aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2] - recycle_waits == tiles);
             assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - input_waits ==
-                metadata_tiles + active_workers);
+                metadata_tiles + active_workers + f.mailbox_posts - control_posts);
           }
           assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
         }
@@ -658,7 +715,7 @@ int main() {
     small_workspace.Run(false);
     assert(!small_workspace.push_requests);
   }
-  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 64U,
+  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 128U,
                              kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     invalid.args.reserved = options; invalid.Run(false);
@@ -889,6 +946,23 @@ int main() {
     Fixture error(7, 656, 1, mode, 6); error.remote_error = true; error.Run(false);
   }
   Fixture future(7, 656, 1, KVAF_SEQ_SCATTER, 6); future.future_done = true; future.Run(false);
+  for (auto pipeline : {0U, kvaf::kScatterPipeline})
+    for (auto trusted : {0U, kvaf::kScatterTrustedInputs})
+      for (auto workers : {1U, 3U, 4U}) {
+        Fixture head(8193, 13, workers, KVAF_SEQ_SCATTER, 6);
+        head.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterHeadStart | pipeline | trusted;
+        head.args.max_polls = 100000;
+        for (auto count : {8193U, 8193U, 1024U, 1025U, 1031U, 0U, 8193U}) {
+          head.Next(count); head.Run();
+          if (count > 1024 && trusted) assert(head.head_started_early);
+          else assert(!head.head_started_early);
+        }
+        if (!trusted) {
+          const auto requests = head.push_requests;
+          head.Next(8193); head.indices.back() = -1; head.Run(false);
+          assert(head.push_requests == requests); // Checked failures never publish a prefix.
+        }
+      }
   {
     // Small negotiated messages cross control post/SQ/CQ boundaries. A fresh
     // list must reach CPU before every commit, including same-count reuse.

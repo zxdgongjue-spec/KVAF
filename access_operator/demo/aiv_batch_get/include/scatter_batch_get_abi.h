@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include "sequential_batch_get_abi.h"
 #include "scatter_batch_get_profile.h"
 
@@ -18,7 +19,9 @@ constexpr uint32_t kScatterProfiling = 4U;
 // Host's existing trusted-input contract also applies to device list contents.
 constexpr uint32_t kScatterTrustedInputs = 8U;
 constexpr uint32_t kScatterPipeline = 32U;
-constexpr uint32_t kScatterOptionsMask = kScatterProfiling | kScatterTrustedInputs | kScatterPipeline;
+constexpr uint32_t kScatterHeadStart = 64U;
+constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
+constexpr uint32_t kScatterOptionsMask = kScatterProfiling | kScatterTrustedInputs | kScatterPipeline | kScatterHeadStart;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
       (value & ~kScatterOptionsMask) == kScatterOptionsV1;
@@ -43,8 +46,15 @@ struct alignas(64) KvafScatterMailboxContext {
   KvafBatchGetQueueState queue;
   uint32_t max_write_bytes;
   uint32_t reserved[15];
+  // Host-prepared immutable WRITE headers. Device DMA loads a batch and
+  // patches only owner/order, addresses and lengths in UB.
+  uint32_t write_templates[kvaf::kScatterMailboxWqesPerBatch][16];
 };
-static_assert(sizeof(KvafScatterMailboxContext) == 320);
+static_assert(sizeof(KvafScatterMailboxContext) == 1344);
+namespace kvaf {
+constexpr uint32_t kScatterMailboxTemplateOffset = offsetof(KvafScatterMailboxContext, write_templates);
+static_assert(kScatterMailboxTemplateOffset == 320);
+}  // namespace kvaf
 
 struct KvafScatterBatchGetArgs {
   KvafExecuteBatchGetKernelArgs request;

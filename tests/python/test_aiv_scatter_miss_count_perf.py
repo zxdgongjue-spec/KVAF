@@ -76,6 +76,8 @@ def arguments(argv=None):
                         help="reference: enqueue then global device sync; validated: synchronous API including status checks")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
+    parser.add_argument("--head-start", type=int, choices=(0, 1),
+                        help="publish first 1024 source rows early, then submit the suffix in bulk (default: 0)")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--host-submit", choices=("reference", "prepared"), default="reference",
                         help="reference: original dynamic Tensor/stream API; prepared: fixed storage/stream with per-call task-queue fence")
@@ -88,9 +90,9 @@ def arguments(argv=None):
     args.cores = args.aiv_cores  # Reuse the existing compact sample writer.
     if not any(x.split("=", 1)[0] == "--jettys-per-core" for x in remaining):
         args.jettys_per_core = 2  # This benchmark fixes setup topology, irrespective of scalar sweep env.
-    for name in ("pipeline",):
+    for name, default in (("pipeline", "1"), ("head_start", "0")):
         if getattr(args, name) is None:
-            value = os.environ.get("KVAF_SCATTER_" + name.upper(), "1")
+            value = os.environ.get("KVAF_SCATTER_" + name.upper(), default)
             if value not in ("0", "1"):
                 parser.error("KVAF_SCATTER_" + name.upper() + " must be 0 or 1")
             setattr(args, name, int(value))
@@ -318,6 +320,7 @@ def run_case(args):
     block_bytes = args.tokens_per_block * args.token_bytes
     payload = args.miss_count * args.token_bytes
     os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
+    os.environ["KVAF_SCATTER_HEAD_START"] = str(args.head_start)
     os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
     runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
         device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
@@ -327,7 +330,8 @@ def run_case(args):
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "worker"}
     config.update(mode="cpu_push_scatter", source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
-        request_control="AIV_WRITE_mailbox_then_ordered_notify", cpu_post_budget="payload_wrs_ready_attached",
+        request_control=("AIV_WRITE_prefix_then_suffix" if args.head_start else "AIV_WRITE_mailbox_then_ordered_notify"),
+        control_wqe="host_template_ub_patch", cpu_post_budget="payload_wrs_ready_attached",
         scatter_max_stages=3, scatter_max_tile_rows=32, scatter_ub_bytes=65536,
         scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar",
         transport=("CPU_SGL_WRITE_overlapped_AIV_scatter" if args.pipeline else "CPU_SGL_WRITE_then_AIV_scatter"),
@@ -497,7 +501,7 @@ def case_command(args):
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
                  "aiv_cores", "jettys_per_core", "warmup", "iterations", "populate_chunk_entries",
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
-                 "max_inflight_total", "pipeline", "case_timeout"):
+                 "max_inflight_total", "pipeline", "head_start", "case_timeout"):
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
     command.extend(("--completion-mode", args.completion_mode))
     command.extend(("--host-submit", args.host_submit))
@@ -570,7 +574,7 @@ def main(argv=None, runner=None):
         report = json.loads(case.json.read_text(encoding="utf-8"))
         for key in ("request_length", "table_capacity", "tokens_per_block", "token_bytes",
                     "miss_count", "aiv_cores", "jettys_per_core", "source_access_pattern",
-                    "output_access_pattern", "sort_input_indices", "completion_mode", "pipeline", "host_submit"):
+                    "output_access_pattern", "sort_input_indices", "completion_mode", "pipeline", "head_start", "host_submit"):
             if report["config"].get(key) != getattr(case, key):
                 raise ValueError(f"case report configuration mismatch: {key}")
         phase = "profiled" if case.kernel_profile else "baseline"

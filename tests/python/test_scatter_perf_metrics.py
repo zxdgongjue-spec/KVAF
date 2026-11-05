@@ -76,16 +76,24 @@ class ScatterPerfTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 list(random_byte_chunks(rng, size, chunk))
 
-    def test_pipeline_is_the_only_algorithm_switch(self):
+    def test_pipeline_and_head_start_are_independent_switches(self):
         with patch.dict("os.environ", {}, clear=True):
             args = arguments([])
             self.assertEqual(args.pipeline, 1)
+            self.assertEqual(args.head_start, 0)
             for name in ("fused_build", "double_buffer", "simt_build"):
                 self.assertFalse(hasattr(args, name))
         with patch.dict("os.environ", {"KVAF_SCATTER_PIPELINE": "0"}):
             self.assertEqual(arguments([]).pipeline, 0)
             self.assertEqual(arguments(["--pipeline", "1"]).pipeline, 1)
+        with patch.dict("os.environ", {"KVAF_SCATTER_HEAD_START": "1"}):
+            self.assertEqual(arguments([]).head_start, 1)
+            self.assertEqual(arguments(["--head-start", "0"]).head_start, 0)
+            self.assertEqual(arguments(["--pipeline", "0"]).head_start, 1)
         with patch.dict("os.environ", {"KVAF_SCATTER_PIPELINE": "ON"}), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            arguments([])
+        with patch.dict("os.environ", {"KVAF_SCATTER_HEAD_START": "ON"}), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             arguments([])
         for option in ("--fused-build", "--double-buffer", "--simt-build"):
@@ -276,7 +284,7 @@ class ScatterPerfTests(unittest.TestCase):
 
     def test_cli_validation_and_skip_before_hardware_import(self):
         for args in (["--requests", "0"], ["--cores", "9"], ["--iterations", "0"],
-                     ["--pipeline", "2"],
+                     ["--pipeline", "2"], ["--head-start", "2"],
                      ["--host-profile", "--profile-iterations", "0"],
                      ["--request-length", "4095"], ["--miss-count", "4097"],
                      ["--workload", "one-token-per-block", "--miss-count", "1025"],

@@ -11,9 +11,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 7 exports the CPU push mailbox for AIV-initiated request publication.
+// Version 8 adds prefix/suffix publication to the CPU push mailbox protocol.
 // CPU service and NPU runtime must be rebuilt together.
-constexpr uint16_t kProtocolVersion = 7U;
+constexpr uint16_t kProtocolVersion = 8U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;

@@ -1,18 +1,21 @@
 #pragma once
 
-// Core 0 publishes a complete request to registered CPU memory using the same
+// Core 0 publishes request phases to registered CPU memory using the same
 // device USER_CTL WRITE format as BatchPut. UB is reused only after list-build
 // DMA has drained, and returned to payload scatter after the control CQ drains.
 namespace kvaf_scatter {
 using namespace AscendC;
 using namespace kvaf_aiv;
+enum class MailboxPhase { Full, Head, Suffix };
 
 __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_t count,
-    __gm__ kvaf::ScatterBatchGetCoreProfile* profile) {
+    __gm__ kvaf::ScatterBatchGetCoreProfile* profile,
+    MailboxPhase phase = MailboxPhase::Full) {
   auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
   if (!context || !state) return KVAF_SEQ_QUEUE_ERROR;
-  Flush(reinterpret_cast<uint64_t>(context), sizeof(*context));
+  // Templates are read by DMA, not Scalar cache.
+  Flush(reinterpret_cast<uint64_t>(context), kvaf::kScatterMailboxTemplateOffset);
   const auto& e = context->entity;
   if (e.magic != 0x4b564155U || e.version != 1 || !e.sq_va || !e.sq_db_va ||
       !e.cq_va || !e.cq_db_va || e.sq_depth < 4 || e.sq_depth % 4 ||
@@ -27,19 +30,32 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
   }
   // Never copy the intervening done/Ready lines: CPU owns them as WRITE
   // sources and could still be retiring the previous request's final CQE.
-  const uint64_t offsets[3] = {0, a.descriptor_offset, 64};
-  const uint64_t lengths[3] = {64, uint64_t(count) * 8, 8};
+  const uint32_t head = phase == MailboxPhase::Full ? count : kvaf::cpu_push::kChunkRows;
+  const bool suffix = phase == MailboxPhase::Suffix;
+  const uint64_t offsets[3] = {suffix ? a.descriptor_offset + uint64_t(head) * 8 : 0,
+      suffix ? kvaf::cpu_push::kSuffixNotifyOffset : a.descriptor_offset, 64};
+  const uint64_t lengths[3] = {suffix ? uint64_t(count - head) * 8 : 64,
+      suffix ? 8 : uint64_t(head) * 8, 8};
+  const uint32_t regions = suffix ? 2 : 3;
   uint32_t region = 0;
   uint64_t offset = 0;
-  const auto limit = e.sq_depth / 4 < 16 ? e.sq_depth / 4 : 16U;
+  const auto limit = e.sq_depth / 4 < kvaf::kScatterMailboxWqesPerBatch ?
+      e.sq_depth / 4 : kvaf::kScatterMailboxWqesPerBatch;
   LocalTensor<uint32_t> buffer(TPosition::VECIN, 0, 16 * 16);
   LocalTensor<uint8_t> encoded(TPosition::VECIN, 0, 16 * 64);
   GlobalTensor<uint8_t> sq;
   sq.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(e.sq_va));
-  while (region < 3) {
+  GlobalTensor<uint32_t> templates;
+  templates.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
+      reinterpret_cast<uint64_t>(context) + kvaf::kScatterMailboxTemplateOffset));
+  while (region < regions) {
+    // One DMA replaces per-WQE Scalar reconstruction of all invariant words.
+    DataCopy(buffer, templates, kvaf::kScatterMailboxWqesPerBatch * 16);
+    set_flag(PIPE_MTE2, PIPE_S, static_cast<event_t>(0));
+    wait_flag(PIPE_MTE2, PIPE_S, static_cast<event_t>(0));
     const auto pi = state->sq_producer_index;
     uint32_t wrs = 0;
-    while (wrs < limit && region < 3) {
+    while (wrs < limit && region < regions) {
       const auto remaining = lengths[region] - offset;
       const auto bytes = remaining < context->max_write_bytes ?
           static_cast<uint32_t>(remaining) : context->max_write_bytes;
@@ -47,21 +63,17 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
       const auto remote = e.remote_host_ddr_address + offsets[region] + offset;
       offset += bytes;
       if (offset == lengths[region]) { ++region; offset = 0; }
-      const bool tail = wrs + 1 == limit || region == 3;
+      const bool tail = wrs + 1 == limit || region == regions;
       const auto owner = 1U - static_cast<uint32_t>(((pi + wrs) / e.sq_depth) & 1U);
-      uint32_t words[16] = {};
-      words[0] = ((tail ? 2U : 1U) << 16) | (1U << 18) | (1U << 20) |
-                 (uint32_t(tail) << 21) | (1U << 28) | (1U << 29) | (owner << 31);
-      words[1] = 3U << 8;
-      words[2] = (e.tp_id & 0xffffffU) | (1U << 24);
-      words[3] = e.remote_token_id & 0xfffffU;
-      const auto* eid = reinterpret_cast<__gm__ const uint32_t*>(e.remote_eid);
-      for (uint32_t i = 0; i < 4; ++i) words[4 + i] = eid[i];
-      words[8] = e.remote_token_value;
-      words[10] = static_cast<uint32_t>(remote); words[11] = static_cast<uint32_t>(remote >> 32);
-      words[12] = bytes; words[13] = e.local_token_id;
-      words[14] = static_cast<uint32_t>(local); words[15] = static_cast<uint32_t>(local >> 32);
-      for (uint32_t i = 0; i < 16; ++i) buffer.SetValue(wrs * 16 + i, words[i]);
+      const auto base = wrs * 16;
+      const uint32_t control = ((tail ? 2U : 1U) << 16) | (1U << 18) | (1U << 20) |
+          (uint32_t(tail) << 21) | (1U << 28) | (1U << 29) | (owner << 31);
+      buffer.SetValue(base, control);
+      buffer.SetValue(base + 10, static_cast<uint32_t>(remote));
+      buffer.SetValue(base + 11, static_cast<uint32_t>(remote >> 32));
+      buffer.SetValue(base + 12, bytes);
+      buffer.SetValue(base + 14, static_cast<uint32_t>(local));
+      buffer.SetValue(base + 15, static_cast<uint32_t>(local >> 32));
       ++wrs;
     }
     set_flag(PIPE_S, PIPE_MTE3, static_cast<event_t>(0));
@@ -78,7 +90,7 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
     state->sq_producer_index = pi + wrs;
     // Timestamp publication, before waiting for its CQE. CPU can already
     // start payload DMA while core 0 retires this control completion.
-    if (region == 3 && profile) profile->notify_cycle = GetSystemCycle();
+    if (region == regions && profile && !suffix) profile->notify_cycle = GetSystemCycle();
     st_dev(static_cast<uint32_t>(pi + wrs), reinterpret_cast<__gm__ uint32_t*>(e.sq_db_va), 0);
     const auto ci = state->cq_consumer_index;
     const auto cqe = e.cq_va + (ci % e.cq_depth) * e.cqe_size;

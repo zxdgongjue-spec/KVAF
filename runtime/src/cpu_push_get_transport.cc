@@ -201,6 +201,9 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
+  if ((r.reserved & kHeadStart) &&
+      (r.reserved_words[0] != kChunkRows || r.count <= kChunkRows))
+    return Status::InvalidArgument("CPU push descriptor prefix mismatch");
   return Status::OK();
 }
 
@@ -247,19 +250,25 @@ void Transport::SealPrepared(PreparedWrite& plan) {
 Status Transport::PrepareWrites(std::uint32_t count) {
   if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
   const bool batch_done_only = (request().reserved & kBatchDoneOnly) != 0;
-  if (prepared_count_ == count && prepared_batch_done_only_ == batch_done_only) {
+  const auto head_rows = (request().reserved & kHeadStart) ? kChunkRows : 0U;
+  if (prepared_count_ == count && prepared_batch_done_only_ == batch_done_only &&
+      prepared_head_rows_ == head_rows) {
     profile_.plan_reused = true;
     return Status::OK();
   }
-  std::array<std::vector<PreparedQueue>, kJettyCount> shards;
-  const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
-  for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
-    auto& waves = shards[queue];
-    waves.emplace_back();
-    const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
+  prepared_.clear();
+  const auto build_stage = [&](Range stage, bool suffix) {
+    std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+    const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
+    for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
+      auto& waves = shards[queue];
+      waves.emplace_back();
+      const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
         const auto shard = JettyRange(range, queue);
-        auto row = shard.begin;
-        const auto end = shard.end;
+        const auto begin = batch_done_only ? shard.begin : std::max(shard.begin, stage.begin);
+        const auto end = batch_done_only ? shard.end : std::min(shard.end, stage.end);
+        if (head_rows && begin >= end) return;
+        auto row = begin;
         std::uint32_t offset = 0;
         while (row < end) {
           // The probe budgets source SGEs as well as WRs against SQ depth.
@@ -289,7 +298,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           }
           AppendPrepared(q, queue, destination, bytes, sges);
         }
-        if (batch_done_only) return;
+        if (batch_done_only || (head_rows && end < shard.end)) return;
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
@@ -299,24 +308,28 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
       };
-    // Whole-batch completion has no CPU worker/chunk boundaries. Partition
-    // contiguous staging once across Jettys; their ordered CQ tails still
-    // finish before Complete publishes done on queue 0.
-    if (batch_done_only) append(0, 0, {0, count});
-    else ForEachPipelineChunk(count, token_bytes_, workers_, append);
-  }
-  std::size_t waves = 0;
-  for (const auto& shard : shards) waves = std::max(waves, shard.size());
-  prepared_.clear();
-  for (std::size_t w = 0; w < waves; ++w) {
-    auto plan = std::make_unique<PreparedWrite>();
-    for (std::uint32_t q = 0; q < kJettyCount; ++q)
-      if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
-    SealPrepared(*plan);
-    if (plan->fence_count) prepared_.push_back(std::move(plan));
-  }
+      // Whole-batch completion has no CPU worker/chunk boundaries. Partition
+      // this stage across Jettys; all ordered CQ tails still finish before
+      // Complete publishes done on queue 0.
+      if (batch_done_only) append(0, 0, stage);
+      else ForEachPipelineChunk(count, token_bytes_, workers_, append);
+    }
+    std::size_t waves = 0;
+    for (const auto& shard : shards) waves = std::max(waves, shard.size());
+    for (std::size_t w = 0; w < waves; ++w) {
+      auto plan = std::make_unique<PreparedWrite>();
+      plan->suffix = suffix;
+      for (std::uint32_t q = 0; q < kJettyCount; ++q)
+        if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
+      SealPrepared(*plan);
+      if (plan->fence_count) prepared_.push_back(std::move(plan));
+    }
+  };
+  if (head_rows) build_stage({0, head_rows}, false);
+  build_stage({head_rows, count}, head_rows != 0);
   prepared_count_ = count;
   prepared_batch_done_only_ = batch_done_only;
+  prepared_head_rows_ = head_rows;
   return Status::OK();
 }
 void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& post) {
@@ -346,12 +359,19 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
   for (; marker != q.markers.end() && marker->local < post.end_sge; ++marker)
     *marker->value = Progress(request().sequence, marker->progress);
 }
-Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
+Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, Profile* drain_profile,
+                                  bool drain_for_credits) {
   for (const auto& q : queues_)
     if (q.poisoned) return Error("queue unavailable");
   bool submitted = false;
   auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
   if (!status.ok()) return status;
+  if (!submitted && drain_for_credits) {
+    status = DrainPrepared(drain_profile);
+    if (!status.ok()) return status;
+    status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
+    if (!status.ok()) return status;
+  }
   if (!submitted) return Error("drained queue has insufficient credits");
   for (std::size_t i = 0; i < plan.fence_count; ++i) {
     const auto& fence = plan.fences[i];
@@ -413,7 +433,7 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
             return Status::Error(status.code(), status.message() +
                                  CqDetails(q, cr, queues_[q].channel));
           }
-          if (completed && completed != id) return Error("unexpected prepared completion");
+          if (completed && id && completed != id) return Error("unexpected prepared completion");
           *finished = completed != 0;
           return Status::OK();
         });
@@ -426,44 +446,68 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
     }
   }
 }
-Status Transport::WriteBatch() {
+Status Transport::WaitSuffix(const std::atomic<bool>* stop) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+  std::uint32_t polls = 0;
+  for (;;) {
+    const auto sequence = __atomic_load_n(
+        reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset), __ATOMIC_ACQUIRE);
+    if (sequence == request().sequence) return Status::OK();
+    if (sequence > request().sequence) return Error("future descriptor suffix sequence");
+    // Stop must also cancel a partial request after a device-side failure.
+    if (stop && stop->load(std::memory_order_acquire)) return Error("descriptor suffix wait cancelled");
+    if ((++polls & 31) == 0 && std::chrono::steady_clock::now() >= deadline)
+      return Error("descriptor suffix timeout; resources retained");
+  }
+}
+Status Transport::DrainPrepared(Profile* profile) {
+  BatchGetProfileScope timer(profile ? &profile->cq_wait_ns : nullptr);
+  while (!tracker_.Empty()) {
+    auto status = PollPrepared(0, profile); // A prefix and suffix can both be in flight.
+    if (!status.ok()) return status;
+  }
+  if (profile) profile->last_cqe_ns = BatchGetProfileNowNs();
+  return Status::OK();
+}
+Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto status = PrepareWrites(request().count);
   if (!status.ok()) return status;
-  // Match the ordered-WRITE probe: short submissions to all four queues from
-  // their owner, then poll their tails together. Avoid waking an OpenMP team
-  // and crossing several team barriers for each short request.
+  auto* profile = profile_.enabled ? &profile_ : nullptr;
+  bool suffix_ready = false;
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
-    status = BeginPrepared(plan, w + 1);
+    if (plan.suffix && !suffix_ready) {
+      status = WaitSuffix(stop);
+      if (!status.ok()) return status;
+      suffix_ready = true;
+    }
+    // Only a physical SQ-credit shortage drains the prefix before the suffix.
+    status = BeginPrepared(plan, w + 1, profile, true);
     if (!status.ok()) return status;
-    if (profile_.enabled) {
-      profile_.cpu_threads = 1;
-      ++profile_.waves;
+    if (profile) {
+      profile->cpu_threads = 1;
+      ++profile->waves;
       for (const auto& q : plan.queues) {
-        profile_.ready_wrs += q.markers.size();
-        profile_.data_wrs += q.wrs.size() - q.markers.size();
-        profile_.post_calls += q.posts.size();
+        profile->ready_wrs += q.markers.size();
+        profile->data_wrs += q.wrs.size() - q.markers.size();
+        profile->post_calls += q.posts.size();
       }
     }
     std::uint64_t first_post = 0;
-    status = PostPrepared(plan, true, profile_.enabled ? &first_post : nullptr);
+    status = PostPrepared(plan, true, profile ? &first_post : nullptr);
     if (!status.ok()) return status;
-    const auto posted = profile_.enabled ? BatchGetProfileNowNs() : 0;
-    if (profile_.enabled) {
-      if (!profile_.first_post_ns) profile_.first_post_ns = first_post;
-      // This submission interval includes refreshing subsequent queues while
-      // earlier queues transfer. Keep that elapsed time in cpu_comm/post.
-      profile_.post_ns += posted - first_post;
+    if (profile) {
+      if (!profile->first_post_ns) profile->first_post_ns = first_post;
+      profile->post_ns += BatchGetProfileNowNs() - first_post;
     }
-    status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
-    if (profile_.enabled) {
-      profile_.last_cqe_ns = BatchGetProfileNowNs();
-      profile_.cq_wait_ns += profile_.last_cqe_ns - posted;
+    const bool keep_prefix = !plan.suffix && w + 1 < prepared_.size() && prepared_[w + 1]->suffix;
+    if (!keep_prefix) {
+      status = DrainPrepared(profile);
+      if (!status.ok()) return status;
     }
-    if (!status.ok()) return status;
   }
-  return status;
+  return tracker_.Empty() ? Status::OK() : DrainPrepared(profile);
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
@@ -539,6 +583,7 @@ Status Transport::Shutdown() {
   profiled_done_ = {};
   prepared_count_ = UINT32_MAX;
   prepared_batch_done_only_ = false;
+  prepared_head_rows_ = 0;
   post_batch_wrs_ = 128;
   next_poll_queue_ = 0;
   for (auto& q : queues_) q.poisoned = false;

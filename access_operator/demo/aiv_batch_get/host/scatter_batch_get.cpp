@@ -3,6 +3,7 @@
 #include "kvaf_aiv_batch_get.h"
 #include "cpu_push_get_layout.h"
 #include "scatter_host_profile.h"
+#include "scatter_mailbox_templates.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "direct_hccp/target_channel.h"
 #include "peer_link.h"
@@ -23,11 +24,11 @@ Status Error(const char* what) { return Status::Internal(std::string("AIV sequen
 // The exported segment is the public 48-byte urma_seg_t wire ABI; no liburma is
 // loaded on the NPU Host or AIV. ubva.va is packed at byte 20, len at byte 32.
 constexpr uint32_t kSegmentBytes = 48;
-Status ReadSwitch(const char* name, bool* enabled) {
+Status ReadSwitch(const char* name, bool* enabled, bool default_value = true) {
   const char* value = std::getenv(name);
-  *enabled = !value || std::strcmp(value, "1") == 0;
-  if (!*enabled && std::strcmp(value, "0") != 0)
+  if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0)
     return Status::InvalidArgument(std::string(name) + " must be 0 or 1");
+  *enabled = value ? std::strcmp(value, "1") == 0 : default_value;
   return Status::OK();
 }
 }
@@ -209,6 +210,7 @@ struct ScatterBatchGet::Impl {
     if (!e.sq_va || !e.sq_db_va || !e.cq_va || !e.cq_db_va || !e.tp_id ||
         !e.local_token_id || e.cqe_size < 32) return Error("invalid mailbox queue ABI");
     mailbox_context = Ptr(workspace) + layout.bytes;
+    PrepareScatterMailboxTemplates(&mailbox);
     if (aclrtMemcpy(reinterpret_cast<void*>(mailbox_context), sizeof(mailbox), &mailbox,
                     sizeof(mailbox), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
       return Error("initialize AIV mailbox context");
@@ -284,7 +286,11 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   bool pipeline;
   auto result = ReadSwitch("KVAF_SCATTER_PIPELINE", &pipeline);
   if (!result.ok()) return result;
-  s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U);
+  bool head_start;
+  result = ReadSwitch("KVAF_SCATTER_HEAD_START", &head_start, false);
+  if (!result.ok()) return result;
+  s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
+                    (head_start ? kScatterHeadStart : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
@@ -309,7 +315,8 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u\n", unsigned(pipeline));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u head_start=%u\n",
+               unsigned(pipeline), unsigned(head_start));
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {

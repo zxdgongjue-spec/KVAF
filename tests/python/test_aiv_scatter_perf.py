@@ -45,6 +45,8 @@ def arguments(argv=None):
     parser.add_argument("--cores", type=int, default=1)
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter with chunk Ready (default: 1)")
+    parser.add_argument("--head-start", type=int, choices=(0, 1),
+                        help="publish first 1024 source rows early, then submit the suffix in bulk (default: 0)")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
@@ -68,10 +70,10 @@ def arguments(argv=None):
     parser.add_argument("--json", type=Path)
     parser.add_argument("--csv", type=Path)
     args = parser.parse_args(argv)
-    for field in ("pipeline",):
+    for field, default in (("pipeline", "1"), ("head_start", "0")):
         if getattr(args, field) is None:
             name = "KVAF_SCATTER_" + field.upper()
-            value = os.environ.get(name, "1")
+            value = os.environ.get(name, default)
             if value not in ("0", "1"):
                 parser.error(f"{name} must be 0 or 1")
             setattr(args, field, int(value))
@@ -214,7 +216,8 @@ def main(argv=None):
     source_rows = args.blocks * args.tokens_per_block
     output_rows = args.output_row_step * args.request_length + 2
     config = dict(vars(args), source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
-                  request_control="AIV_WRITE_mailbox_then_ordered_notify", cpu_post_budget="payload_wrs_ready_attached",
+                  request_control=("AIV_WRITE_prefix_then_suffix" if args.head_start else "AIV_WRITE_mailbox_then_ordered_notify"),
+                  control_wqe="host_template_ub_patch", cpu_post_budget="payload_wrs_ready_attached",
                   scatter_max_stages=3, scatter_max_tile_rows=32, scatter_ub_bytes=65536,
                   scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar")
     config.update(device_id=device_id, mode="cpu_push_scatter",
@@ -271,6 +274,7 @@ def main(argv=None):
         # CLI overrides the environment. Host snapshots these during initialize;
         # baseline/profiled phases then use the same algorithms and binary.
         os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
+        os.environ["KVAF_SCATTER_HEAD_START"] = str(args.head_start)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)

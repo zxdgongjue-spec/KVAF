@@ -89,18 +89,19 @@ class AlignedScatterTests(unittest.TestCase):
         self.assertFalse(args.host_profile)
         self.assertEqual(args.completion_mode, "reference")
         self.assertEqual(args.host_submit, "reference")
+        self.assertEqual(args.head_start, 0)
         self.assertEqual(args.table_capacity, 1277952)
         self.assertEqual(args.table_capacity * 128 * 4096, 670014898176)
 
     def test_scalar_axes_and_environment_round_trip(self):
         args = self.parse("--token-bytes", "656", "--miss-count", "1024", "--aiv-cores", "4",
-                          "--pipeline", "0", "--host-submit", "prepared")
+                          "--pipeline", "0", "--head-start", "1", "--host-submit", "prepared")
         self.assertEqual(len(perf.cases(args)), 1)
         case = perf.cases(args)[0]
         case.json, case.csv = Path("case.json"), Path("case.csv")
         child = self.parse(*perf.case_command(case)[4:])
         for key in ("token_bytes", "miss_count", "aiv_cores", "table_capacity",
-                    "warmup", "kernel_profile", "host_profile", "completion_mode", "pipeline", "host_submit"):
+                    "warmup", "kernel_profile", "host_profile", "completion_mode", "pipeline", "head_start", "host_submit"):
             self.assertEqual(getattr(child, key), getattr(case, key))
         with patch.dict(os.environ, {"KVAF_BATCH_GET_PERF_TOKEN_BYTES": "256",
                                     "KVAF_BATCH_GET_PERF_MISS_COUNT": "64",
@@ -115,9 +116,21 @@ class AlignedScatterTests(unittest.TestCase):
             self.assertEqual({c.aiv_cores for c in perf.cases(env)}, {1, 2, 4, 8})
             self.assertEqual(env.jettys_per_core, 2)
 
+    def test_head_start_environment_can_be_overridden_independently(self):
+        with patch.dict(os.environ, {"KVAF_SCATTER_HEAD_START": "1",
+                                    "KVAF_SCATTER_PIPELINE": "0"}, clear=True):
+            env = perf.arguments(["--build", "unused"])
+            self.assertEqual((env.pipeline, env.head_start), (0, 1))
+            override = perf.arguments(["--build", "unused", "--head-start", "0"])
+            self.assertEqual((override.pipeline, override.head_start), (0, 0))
+        for value in ("ON", "2"):
+            with patch.dict(os.environ, {"KVAF_SCATTER_HEAD_START": value}, clear=True), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                perf.arguments(["--build", "unused"])
+
     def test_unsupported_and_inconsistent_cases_fail_before_hardware(self):
         for args in (("--aiv-cores", "16"), ("--core-counts", "1,32"),
-                     ("--jettys-per-core", "4"), ("--adaptive-ub-device",),
+                     ("--jettys-per-core", "4"), ("--adaptive-ub-device",), ("--head-start", "2"),
                      ("--miss-count", "0"), ("--request-length", "65537"),
                      ("--token-sizes", "656,656"), ("--miss-counts", "65537"),
                      ("--no-kernel-profile", "--host-profile"),

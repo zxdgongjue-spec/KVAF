@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -21,7 +22,7 @@ class Transport {
                     urma::ImportJettyEx, std::uint32_t psn, peer::OpenCpuPushGetResponse*);
   Status ReadRequest(std::uint64_t* sequence);
   Status ReadDescriptor(std::uint64_t sequence);
-  Status WriteBatch();
+  Status WriteBatch(const std::atomic<bool>* stop = nullptr);
   Status Complete(std::uint64_t sequence, Result result);
   void PrintProfile() const;
   Status BenchmarkWrite(std::uint8_t* source_memory, std::uint64_t source_base,
@@ -66,16 +67,20 @@ class Transport {
     std::array<Tracker::Fence, kJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
+    bool suffix{};
   };
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
-  Status BeginPrepared(PreparedWrite&, std::uint64_t id);
+  Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
+                       bool drain_for_credits = false);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
                       std::uint64_t* first_post_ns = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
+  Status DrainPrepared(Profile* profile = nullptr);
+  Status WaitSuffix(const std::atomic<bool>* stop);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
@@ -84,6 +89,7 @@ class Transport {
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
+  std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};
