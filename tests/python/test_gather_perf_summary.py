@@ -65,6 +65,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
     def test_output_layout_validation_and_random_default(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(self.csv_metadata()["output_layout"], "random")
+            self.assertEqual(self.csv_metadata()["coalesce_sges"], 0)
         for layout in ("random", "segmented", "contiguous"):
             with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": layout}):
                 perf.validate_config(2)
@@ -76,6 +77,38 @@ class GatherPerfSummaryTest(unittest.TestCase):
              patch.object(perf, "TOKEN_BYTES", 16384):
             with self.assertRaisesRegex(ValueError, "65536"):
                 perf.validate_config(2)
+
+    def test_coalescing_requires_consecutive_rows_and_preserves_logical_sgl(self):
+        for layout in ("segmented", "contiguous"):
+            with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": layout,
+                                         "KVAF_AIV_GATHER_COALESCE_SGES": "1"}):
+                perf.validate_config(2)
+                metadata = self.csv_metadata()
+                self.assertEqual(metadata["coalesce_sges"], 1)
+                self.assertEqual(metadata["sgl"], perf.GATHER_SGL_SIZE)
+        for value in ("2", "true"):
+            with patch.dict(os.environ, {"KVAF_AIV_GATHER_COALESCE_SGES": value}):
+                with self.assertRaisesRegex(ValueError, "COALESCE_SGES"):
+                    perf.validate_config(2)
+        with patch.dict(os.environ, {"KVAF_AIV_GATHER_COALESCE_SGES": "1",
+                                     "KVAF_GATHER_OUTPUT_LAYOUT": "random"}):
+            with self.assertRaisesRegex(ValueError, "segmented/contiguous"):
+                perf.validate_config(2)
+        with patch.dict(os.environ, {"KVAF_AIV_GATHER_COALESCE_SGES": "1",
+                                     "KVAF_GATHER_OUTPUT_LAYOUT": "contiguous"}), \
+             patch.object(perf, "TOKEN_BYTES", 16384):
+            with self.assertRaisesRegex(ValueError, "65536"):
+                perf.validate_config(2)
+
+    def test_coalesced_preflight_detects_ignored_flag_and_changed_read_granularity(self):
+        for wrs, blocks in ((683, 683), (683, 2048), (4096, 4096)):
+            profile = {"cores": [{"requests": 4096, "data_wrs": wrs, "data_wqebbs": blocks},
+                                 {"requests": 0, "data_wrs": 0, "data_wqebbs": 0}]}
+            if blocks == 683:
+                perf.check_coalesced_profile(profile)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "rebuild and deploy"):
+                    perf.check_coalesced_profile(profile)
 
     def test_output_rows_preserve_random_mapping_and_contiguous_guards(self):
         calls = []
@@ -105,12 +138,14 @@ class GatherPerfSummaryTest(unittest.TestCase):
         self.assertNotEqual(rows[6], rows[5] + 1)
 
     def test_output_layout_is_recorded_in_all_csv_files(self):
-        with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": "segmented"}):
+        with patch.dict(os.environ, {"KVAF_GATHER_OUTPUT_LAYOUT": "segmented",
+                                     "KVAF_AIV_GATHER_COALESCE_SGES": "1"}):
             metadata = self.csv_metadata()
         with tempfile.TemporaryDirectory() as directory:
             paths = perf.export_csv_results(directory, metadata, [1000.0], [snapshot()], [1100.0])
             for path in paths:
                 self.assertTrue(all(row["output_layout"] == "segmented" for row in self.read_csv(path)))
+                self.assertTrue(all(row["coalesce_sges"] == "1" for row in self.read_csv(path)))
 
     def test_profile_only_debugging_and_empty_sampling_rejection(self):
         with patch.object(perf, "WARMUP", 0), patch.object(perf, "ITERATIONS", 0):

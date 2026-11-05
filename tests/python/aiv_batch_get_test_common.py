@@ -108,6 +108,10 @@ def run(mode: str) -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
+    if mode == "gather_read" and os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1":
+        print("FAIL: SGE coalescing requires consecutive rows; use test_aiv_gather_batch_get_perf.py",
+              file=sys.stderr)
+        return 2
     try:
         kernel, put_kernel = kernel_paths(mode)
     except ValueError as error:

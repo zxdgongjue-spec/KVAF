@@ -151,6 +151,42 @@ DEVICE_ID=4 KVAF_NPU_CORE_COUNT=2 KVAF_GATHER_OUTPUT_LAYOUT=contiguous \
 8192 请求、2 核、SGL=6 时，按每核 4096 个请求分组，各自最后一条有 4 个 SGE。
 只需更新 Python 脚本，不需要重编 Host/kernel 或更改 CPU 服务。
 
+### 合并连续目的 SGE 的对照实验
+
+`KVAF_AIV_GATHER_COALESCE_SGES=1` 开启实验，默认关闭。
+仍保留 `GATHER_SGL_SIZE=6` 作为每条逻辑 READ 的 token 数，
+将连续的 6 个 4096 B 目的 SGE 编码为一个 24576 B SGE。
+READ 数、数据量、每批发布的 WR 数和尾 CQ 等待方式不变，WQE 从 192 B 减至 64 B。
+尾条长度按实际 token 数计算；2 核、8192 请求时，尾条是一个 16384 B SGE。
+
+本次需要同步重编并部署 N 侧 Host/Python 和 gather kernel，CPU 服务无需修改：
+
+```bash
+cmake --build build-npu -j
+```
+
+保持脚本 `TOKEN_BYTES=4096`、`REQUEST_COUNT=8192`、`GATHER_SGL_SIZE=6`，
+在同一个新构建上比较关闭与开启；也可将布局换成 `segmented`：
+
+```bash
+DEVICE_ID=4 KVAF_NPU_CORE_COUNT=2 KVAF_GATHER_OUTPUT_LAYOUT=contiguous \
+  KVAF_AIV_GATHER_COALESCE_SGES=0 python tests/python/test_aiv_gather_batch_get_perf.py
+DEVICE_ID=4 KVAF_NPU_CORE_COUNT=2 KVAF_GATHER_OUTPUT_LAYOUT=contiguous \
+  KVAF_AIV_GATHER_COALESCE_SGES=1 python tests/python/test_aiv_gather_batch_get_perf.py
+```
+
+每核 `data_wrs` 应均为 683，`data_doorbells` 均为 6，
+`data_wqebbs` 从 2048 变为 683。启动日志和所有 CSV 记录 `coalesce_sges`。
+开启后，脚本在计时外采集一次 profile 核对 READ/WQEBB 数并校验全部 payload；
+旧 Host 忽略开关会被计数检查识别，不会作为成功的合并实验继续采样。
+
+合并只支持 token_bytes × SGL ≤ 65536，调用方须保证每条逻辑 READ 内的
+`output_indices` 严格依次加 1；内核不额外扫描校验这一前置条件。
+性能脚本仅允许在 `segmented/contiguous` 布局下开启。
+使用离散保护行的功能/前缀探针脚本会拒绝该开关，正确性由性能脚本的预检验证。
+参数结构仍为 V3 / 232 B，复用原来的末尾 reserved 字段为 `coalesce_sges`；
+旧 V3 kernel 会拒绝非零的该字段。普通关闭路径保持原有编码。
+
 当前测试设备已确认为 Ascend 950DT，`PROFILE_CLOCK_MHZ` 默认设为 `1000`，
 脚本和 CSV 自动将 AIV cycle 换算成微秒，并保留原始 cycle。更换设备时，
 须按对应平台的 `GetSystemCycle()` 计数器频率调整，不能使用 AI Core 主频。

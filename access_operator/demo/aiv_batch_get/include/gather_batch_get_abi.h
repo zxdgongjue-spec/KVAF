@@ -36,7 +36,11 @@ struct KvafGatherBatchGetArgs {
   uint64_t profile;
   // Optional prefix diagnostics. V3 prevents older kernels from silently
   // ignoring a requested checkpoint. Zero preserves normal execution.
-  uint32_t probe, reserved;
+  uint32_t probe;
+  // Experimental: one SGE per logical READ. The caller must supply consecutive
+  // output rows within each sgl_size group; token_bytes * sgl_size <= 65536.
+  // Reuses V3's zero-only reserved word: old kernels reject an enabled flag.
+  uint32_t coalesce_sges;
 };
 static_assert(sizeof(KvafGatherBatchGetArgs) == 232);
 

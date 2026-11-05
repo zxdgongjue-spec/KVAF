@@ -19,6 +19,7 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
+uint32_t last_coalesce_sges{};
 bool allow_queued_launches{};
 int async_memsets{}, status_copies{}, stream_syncs{};
 uint64_t kernel_result{};
@@ -88,6 +89,7 @@ extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, v
 }
 extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_GATHER);
+  last_coalesce_sges = a->coalesce_sges;
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
   const auto rc = Launch(&model);
@@ -222,6 +224,7 @@ int main() {
   using namespace kvaf;
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   unsetenv("KVAF_AIV_GATHER_PROBE");
+  unsetenv("KVAF_AIV_GATHER_COALESCE_SGES");
   // Keep strict status-failure coverage, now an explicit async diagnostic mode.
   setenv("KVAF_AIV_GATHER_CHECK_STATUS", "1", 1);
   AccessOperatorConfig config;
@@ -241,6 +244,7 @@ int main() {
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok());
     assert(owner->Execute(exec).ok()); assert(completed == 0 && refs == 2);
+    assert(last_coalesce_sges == 0);
     assert(owner->Execute(exec).ok()); assert(completed == 1 && refs == 2);
     assert(owner->Drain().ok()); assert(completed == 2 && refs == 1);
     capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
@@ -551,6 +555,30 @@ int main() {
     GatherBatchGetProfile snapshot;
     assert(owner->CopyGatherProfile(&snapshot).ok());
     assert(status_copies == copies + 2 && async_memsets == clears);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  for (const char* value : {"2", "true"}) {
+    setenv("KVAF_AIV_GATHER_COALESCE_SGES", value, 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
+    assert(!allocations && !refs);
+  }
+  setenv("KVAF_AIV_GATHER_COALESCE_SGES", "1", 1);
+  {
+    const auto token = config.batch_get_token_bytes;
+    config.batch_get_token_bytes = 65535;
+    auto owner = CreateSequentialBatchGet(config);
+    const auto result = owner->Initialize(region);
+    assert(result.code() == StatusCode::kInvalidArgument);
+    assert(result.message().find("coalesced gather") != std::string::npos);
+    assert(!allocations && !refs);
+    config.batch_get_token_bytes = token;
+  }
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_AIV_GATHER_COALESCE_SGES"); // Read once at initialization.
+    assert(owner->Execute(exec).ok() && last_coalesce_sges == 1);
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
   std::cout << "sequential Host lifecycle: PASS\n";

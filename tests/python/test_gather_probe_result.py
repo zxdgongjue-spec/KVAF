@@ -21,6 +21,12 @@ def failing(message):
 
 
 class GatherProbeResultTests(unittest.TestCase):
+    def test_sparse_functional_rows_reject_coalescing_before_loading_hardware(self):
+        with patch.dict(os.environ, {"KVAF_RUN_NPU_TESTS": "1", "KVAF_AIV_GATHER_COALESCE_SGES": "1"}), \
+             patch.object(common, "kernel_paths") as paths, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(common.run("gather_read"), 2)
+            paths.assert_not_called()
+
     def test_deployment_report_identifies_old_file_and_loaded_python(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "gather.o"

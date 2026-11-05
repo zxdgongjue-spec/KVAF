@@ -338,6 +338,13 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
+  const char* coalesce = std::getenv("KVAF_AIV_GATHER_COALESCE_SGES");
+  if (coalesce && *coalesce && std::strcmp(coalesce, "0") && std::strcmp(coalesce, "1"))
+    return Status::InvalidArgument("KVAF_AIV_GATHER_COALESCE_SGES must be 0 or 1");
+  s.args.coalesce_sges = coalesce && std::strcmp(coalesce, "1") == 0;
+  if (s.args.coalesce_sges &&
+      uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
+    return Status::InvalidArgument("coalesced gather requires token_bytes * SGL <= 65536");
   if (s.args.probe > KVAF_GATHER_PROBE_ACK &&
       uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
     return Status::InvalidArgument("gather WQE/SQ probes require token_bytes * SGL <= 65536");

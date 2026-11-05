@@ -48,6 +48,7 @@ struct ModelArgs {
   uint32_t scatter_probe;  // Former reserved word; zero preserves normal execution.
   uint64_t profile{};
   uint32_t gather_probe{};
+  uint32_t coalesce_sges{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -59,7 +60,7 @@ void Launch(const ModelArgs& a) {
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
-      a.gather_probe, 0});
+      a.gather_probe, a.coalesce_sges});
   }
 }
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
@@ -177,6 +178,20 @@ struct Fixture {
     r.channel_entity = Address(data_entities.data());
   }
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
+  void ConsecutiveReadRows(bool segmented) {
+    for (uint32_t i = 0; i < count; ++i) rows[i] = i + 1;
+    if (!segmented) return;
+    std::vector<uint32_t> starts;
+    for (uint32_t core = 0; core < workers; ++core) {
+      const uint32_t first = uint64_t(active) * core / workers;
+      const uint32_t last = uint64_t(active) * (core + 1) / workers;
+      for (uint32_t begin = first; begin + args.sgl_size <= last; begin += args.sgl_size)
+        starts.push_back(begin);
+    }
+    for (std::size_t i = 0; i < starts.size(); ++i)
+      for (uint32_t j = 0; j < args.sgl_size; ++j)
+        rows[starts[i] + j] = starts[starts.size() - i - 1] + j + 1;
+  }
   void DataQueueDepth(uint32_t depth) {
     for (uint32_t core = 0; core < workers; ++core) {
       auto& m = *queues[core * 2];
@@ -323,6 +338,7 @@ struct Fixture {
         if (!(q % 2)) {
           assert(op == kRead && cpu_done[worker]);
           assert(ack_reads[worker] >= 3); // Must not treat started ACK as completed.
+          if (args.coalesce_sges) assert(sges == 1);
           ++data_reads; max_sges = std::max(max_sges, sges);
         }
         for (uint32_t i = 0; i < sges; ++i) {
@@ -608,29 +624,63 @@ int main() {
   }
   // Bank/tail boundaries for every SGL, including a partially populated last
   // WR and an SQ ring wrap inside one multi-SGE WQE/MTE3 post.
-  for (uint32_t sgl = 1; sgl <= 13; ++sgl) {
-    Fixture f(257 * sgl, 13, 1, KVAF_SEQ_GATHER, sgl);
-    f.DataQueueDepth(4096); f.EnableProfile();
-    auto& q = *f.queues[0];
-    auto& s = f.states[0];
-    s.magic = 0x4b564151; s.initialized = 1;
-    s.sq_producer_index = q.pi = q.completed = (1ULL << 32) - 1;
-    q.db = uint32_t(q.pi);
-    s.cq_consumer_index = q.cq_pi = q.cq_completed = (1ULL << 22) - 1;
-    for (auto& entry : q.cq) entry[0] = 0; // expected owner is 1 at this CI
-    for (uint32_t wrs : {1U, 127U, 128U, 129U, 255U, 256U, 257U}) {
-      f.Next(wrs * sgl - (sgl - 1));
-      const auto cq = q.cq_completed, db = q.doorbells;
-      f.Run(); f.CheckProfiles();
-      assert(q.cq_completed - cq == 1);
-      assert(q.doorbells - db == (wrs + 127) / 128);
+  for (uint32_t sgl = 1; sgl <= 13; ++sgl)
+    for (uint32_t coalesce : {0U, 1U}) {
+      Fixture f(257 * sgl, 13, 1, KVAF_SEQ_GATHER, sgl);
+      f.args.coalesce_sges = coalesce;
+      f.DataQueueDepth(4096); f.EnableProfile();
+      auto& q = *f.queues[0];
+      auto& s = f.states[0];
+      s.magic = 0x4b564151; s.initialized = 1;
+      s.sq_producer_index = q.pi = q.completed = (1ULL << 32) - 1;
+      q.db = uint32_t(q.pi);
+      s.cq_consumer_index = q.cq_pi = q.cq_completed = (1ULL << 22) - 1;
+      for (auto& entry : q.cq) entry[0] = 0; // expected owner is 1 at this CI
+      for (uint32_t wrs : {1U, 127U, 128U, 129U, 255U, 256U, 257U}) {
+        f.Next(wrs * sgl - (sgl - 1));
+        if (coalesce) f.ConsecutiveReadRows(false);
+        const auto cq = q.cq_completed, db = q.doorbells;
+        f.Run(); f.CheckProfiles();
+        assert(q.cq_completed - cq == 1);
+        assert(q.doorbells - db == (wrs + 127) / 128);
+        if (coalesce) assert(f.profiles[0].data_wqebbs == wrs);
+      }
+      for (uint32_t tail = 1; tail <= sgl; ++tail) {
+        f.Next(128 * sgl + tail);
+        if (coalesce) f.ConsecutiveReadRows(false);
+        const auto cq = q.cq_completed, db = q.doorbells;
+        f.Run(); f.CheckProfiles();
+        assert(q.cq_completed - cq == 1 && q.doorbells - db == 2);
+        if (coalesce) assert(f.profiles[0].data_wqebbs == 129);
+      }
     }
-    for (uint32_t tail = 1; tail <= sgl; ++tail) {
-      f.Next(128 * sgl + tail);
-      const auto cq = q.cq_completed, db = q.doorbells;
-      f.Run(); f.CheckProfiles();
-      assert(q.cq_completed - cq == 1 && q.doorbells - db == 2);
+  // Same logical 24-KiB READs in both layouts and encodings, including 16-KiB
+  // tails. Coalescing changes SQ occupancy, not WR/doorbell/completion counts.
+  for (bool segmented : {false, true})
+    for (uint32_t coalesce : {0U, 1U}) {
+      Fixture f(8192, 4096, 2, KVAF_SEQ_GATHER, 6);
+      f.args.coalesce_sges = coalesce;
+      f.ConsecutiveReadRows(segmented);
+      f.DataQueueDepth(32768); f.EnableProfile(); f.Run(); f.CheckProfiles();
+      assert(f.max_sges == (coalesce ? 1U : 6U));
+      for (uint32_t core = 0; core < 2; ++core) {
+        const auto& p = f.profiles[core];
+        assert(p.data_wrs == 683 && p.data_doorbells == 6);
+        assert(p.data_wqebbs == (coalesce ? 683 : 2048));
+        assert(f.queues[core * 2]->cq_completed == 1);
+      }
     }
+  {
+    Fixture f(19, 10922, 3, KVAF_SEQ_GATHER, 6);
+    f.args.coalesce_sges = 1; f.ConsecutiveReadRows(true); f.Run();
+    Fixture exact(19, 16384, 2, KVAF_SEQ_GATHER, 4);
+    exact.args.coalesce_sges = 1; exact.ConsecutiveReadRows(false); exact.Run();
+    Fixture too_large(19, 10923, 3, KVAF_SEQ_GATHER, 6);
+    too_large.args.coalesce_sges = 1; too_large.Run(false);
+    assert(!too_large.data_reads && !too_large.ack_reads[0]);
+    Fixture invalid(1, 656, 1, KVAF_SEQ_GATHER, 6);
+    invalid.args.coalesce_sges = 2; invalid.Run(false);
+    assert(!invalid.data_reads);
   }
   // Physical WR capacity drains and CQ owner wrap, rather than a 128-WR
   // outstanding budget. Multi-core lanes keep independent banks and queues.
