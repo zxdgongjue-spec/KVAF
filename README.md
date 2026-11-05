@@ -128,6 +128,7 @@ session 恢复、多个 peer 的选择和 CPU 侧数据面不属于当前范围�
 | CPU 服务机（UBmem） | 支持 Host P2P DDR、Fabric/VMM 接口的 Ascend 驱动和 HAL 库。 |
 | NPU 服务机 | Ascend 驱动、CANN、`torch_npu`、Python 3 和 C++17 编译器。 |
 | NPU kernel 构建 | CANN 路径中需要 `include/acl/acl.h`、`tools/ccec_compiler/bin` 和 SIMT 开发头 `simt_api/device_atomic_functions.h`。 |
+| AICPU kernel 构建 | 默认全量构建还需要 AICPU AArch64 交叉编译器、UMDK 头文件及设备侧 securec；安装需要对所选 CANN 包目录和加载配置有写权限。 |
 | 两端网络 | NPU 能通过 TCP 访问 CPU 服务地址；UB 网络和平台拓扑已配置。 |
 
 
@@ -161,12 +162,35 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ./build.sh npu
 ```
 
+默认同时构建 AIV URMA、UBmem、AICPU Put/Gather/Scatter，输出一份 Python 包。
+构建成功后自动将 AICPU 设备包安装到所选 CANN 根目录；无需 `--install-kernel`。
+`ASCEND_HOME_PATH` 和 `ASCEND_CANN_PACKAGE_PATH` 同时设置时必须指向同一真实目录。
+安装完成后重启 NPU 客户端进程。
+
+按需裁剪或检查安装：
+
+```bash
+./build.sh npu --without-aicpu       # 原来的 AIV/UBmem 构建，不安装 AICPU 包
+./build.sh npu --without-python     # 全部后端及设备包，不构建 Python binding
+./build.sh npu --check-kernel        # 检查已安装的 Gather/Scatter 包，不重新构建
+./build.sh aicpu-urma               # 仅 AICPU Put/Gather，构建后自动安装
+./build.sh aicpu-urma --cpu-push     # 仅 AICPU Put/Gather/Scatter，构建后自动安装
+```
+
+这些是按需选择的不同命令，不需要依次执行。`aicpu-urma` 默认输出到
+`build-aicpu-urma`；统一构建使用 `build-npu`，运行时通过 `transport` 和
+`aicpu_batch_get_mode` 选择后端，无需切换 Python 包。
+`--without-aicpu` 不检查 AICPU 依赖，也不修改已经安装的 AICPU 包；需要卸载时单独执行
+`./build.sh npu --uninstall-kernel`。原 `--install-kernel` 参数保留兼容。
+
 构建结果包括：
 
 ```text
 build-npu/python/kvaf/
 build-npu/bin/kvaf_execute_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
+build-npu/access_operator/src/aicpu_urma/kernel.json
+build-npu/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz
 ```
 
 

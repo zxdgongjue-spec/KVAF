@@ -2,6 +2,10 @@
 
 本目录是 KVAF C++ 核心与 Python 之间的可选绑定层，使用 Pybind11 构建 `_kvaf` 原生扩展。
 
+`./build.sh npu` 默认将 AIV URMA、UBmem 和 AICPU Gather/Scatter 构建进同一个
+`build-npu/python/kvaf` 包，并自动安装 AICPU 设备包。运行时按 `transport` 和
+`aicpu_batch_get_mode` 选择后端；仅需 AIV/UBmem 时使用 `--without-aicpu`。
+
 `include/` 存放 Binding 内部共享头，`src/` 存放扩展实现；Python 包与构建后导入校验脚本保留在本目录。
 
 当前 Binding 用于验证以下链路：

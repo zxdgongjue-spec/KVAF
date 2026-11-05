@@ -101,4 +101,6 @@ add_custom_command(OUTPUT "${kernel_so}"
 add_custom_command(OUTPUT "${package_dir}/kvaf-aicpu-urma.tar.gz"
   COMMAND "${CMAKE_COMMAND}" -E tar czf "${package_dir}/kvaf-aicpu-urma.tar.gz" aicpu_kernels_device
   WORKING_DIRECTORY "${package_dir}" DEPENDS "${kernel_so}" VERBATIM)
-add_custom_target(kvaf_aicpu_urma_kernel DEPENDS "${package_dir}/kvaf-aicpu-urma.tar.gz")
+# A build with AICPU enabled must produce the device package alongside the Host
+# library. build.sh installs it only after the complete build succeeds.
+add_custom_target(kvaf_aicpu_urma_kernel ALL DEPENDS "${package_dir}/kvaf-aicpu-urma.tar.gz")

@@ -6,6 +6,8 @@ target_link_libraries(kvaf_npu_runtime_config_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_npu_runtime_config_test COMMAND kvaf_npu_runtime_config_test)
 add_test(NAME kvaf_aicpu_configuration_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aicpu_configuration.py")
+add_test(NAME kvaf_build_script_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_build_script.py")
 add_executable(kvaf_aicpu_kernel_loader_test aicpu_kernel_loader_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/host/kernel_loader.cc)
 target_include_directories(kvaf_aicpu_kernel_loader_test PRIVATE

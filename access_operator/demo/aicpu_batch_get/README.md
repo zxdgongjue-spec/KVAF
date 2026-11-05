@@ -8,7 +8,8 @@ Gather 和 Scatter 都支持通过 `npu_eids` 指定多个候选，逐个尝试�
 
 设置 `aicpu_batch_get_mode="cpu_push_scatter"` 可使用 Host direct HCCP 建链、
 CPU SGL WRITE 到 HBM staging、AICPU 本地 scatter 的路径。
-构建时添加 `./build.sh aicpu-urma --cpu-push`。
+`./build.sh npu` 默认包含该路径和其他全部后端，并自动安装 AICPU 包；
+只构建 AICPU 时使用 `./build.sh aicpu-urma --cpu-push`，也会自动安装。
 其动态请求协议、构建和验证见 [CPU 回推说明](../../../docs/aicpu_cpu_push_scatter.md)。
 
 - `host/batch_get_host.cc`：内部 workspace、当前请求参数、stream 和完成状态。
