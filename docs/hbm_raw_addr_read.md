@@ -86,12 +86,12 @@ print(result["profile"])
 | --- | --- |
 | `host_total_us` | 原生 HbmReader::Read 全流程；不含 Python 绑定的参数处理和结果字典构造 |
 | `validation_us` | Host 设备、源身份、数组形状和元数据/输出重叠检查 |
-| `buffers_us` | 首次状态/队列分配与清零、首次计时事件创建；稳定态复用，不再每批清零 |
+| `buffers_us` | 首次设备状态/队列分配与清零、Host 固定页状态缓冲分配、首次计时事件创建；稳定态复用，不再每批清零 |
 | `register_output_us` | 获取 output 注册及选定 MR 的通信描述；首次 output 注册、首次 MR/output 组合上传描述，之后均复用 |
 | `launch_us` | Host 提交 raw READ 算子调用 |
-| `synchronize_us` | Host 等待传入 stream 完成 |
+| `synchronize_us` | Host 等待传入 stream 中的 kernel 和状态异步回读都完成 |
 | `kernel_event_us` | 同一 stream 中紧邻算子前后两个设备事件之间的时间 |
-| `status_us` | 最终状态回读，检查每核启动编号、执行结果和请求数量 |
+| `status_us` | 提交状态异步回读的 Host 开销，加上同步后检查每核启动编号、执行结果和请求数量的开销；不含设备拷贝等待 |
 | `cleanup_us` | 释放 output 注册引用；MR、通信实体和状态缓冲保留到 detach/shutdown |
 | `complete_us` | 向生产端确认本批完成 |
 | `event_record_us` / `event_query_us` | Host 提交计时事件 / 查询计时结果的开销 |
@@ -105,6 +105,12 @@ print(result["profile"])
 事件记录或结果查询失败不改变已成功的数据传输结果；此时 `kernel_event_us=None`，
 `kernel_event_error` 提供 ACL 返回码。事件创建失败发生在发起 READ 之前，接口返回异常。
 默认 `profile=False`，不创建/记录计时事件；计时事件按 reader 复用，detach 时销毁。
+
+状态通过 `aclrtMemcpyAsync` 回读到初始化时由 `aclrtMallocHost` 分配的固定页内存，
+与 kernel 使用同一条 stream。顺序为 kernel → 结束计时事件（仅 profile）→ 状态回读 → 一次 stream 同步 → Host 校验。
+`kernel_event_us` 不包含状态拷贝；`synchronize_us` 现在包含状态拷贝等待，因此比较优化前后时要看完整调用时间，不能只比较 `status_us`。
+拷贝提交失败仍尝试同步已启动的 kernel；提交或同步失败均保留未决状态，不发送 Complete/Cancel。
+固定页缓冲跨批次复用，只在连接安全关闭时释放；同步失败时继续保留，防止未完成拷贝写入已释放的 Host 内存。
 
 双方必须显式配置 fullmesh EID：B 构造源时的 npu_eid 和 A listen_hbm 的 local_eid。CPU↔NPU 路由独立配置，自动 CLOS/pair-info 发现不能替代 fullmesh。
 
@@ -171,6 +177,8 @@ python tests/python/test_hbm_read_raw_addr.py \
 `kvaf_hbm_read_test` 在关闭 CPU Pull 构建能力时，使用真实 NpuRuntime/TCP/source/client 与假 ACL/HCCP 验证纯 NPU Pull、每段一个 WQE、丢 ACK 和清理。
 `kvaf_hbm_read_with_ddr_test` 另外验证两种初始化顺序、DDR 失败/关闭/重新初始化不影响 raw READ，以及旧 PutHandle 被拒绝。
 上述两个集成测试还覆盖 78 MR 注册/探测、选择错误、部分注册失败及多 MR 丢失完成通知恢复。
+假 ACL 将 kernel 和状态拷贝延迟到 stream 同步时按顺序执行，验证 Host 不会提前读取结果；
+还覆盖固定页内存申请/释放失败、跨批次复用，以及异步回读提交或同步失败时保留源、output 和状态缓冲。
 `kvaf_hbm_read_transport_test` 运行生产 Host 注册/缓存代码，验证 78 份不同 token/EID 的描述共用 output MR 和队列、缓存命中、上传失败、部分导入和重试清理。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
 

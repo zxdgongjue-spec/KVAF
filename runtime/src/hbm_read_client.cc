@@ -40,6 +40,20 @@ struct DeviceBuffer {
     data=nullptr;bytes=0;return Status::OK();
   }
 };
+struct HostStatusBuffer {
+  KvafRawReadCoreStatus* data{};
+  Status Allocate(std::size_t bytes) {
+    if(data)return Status::InvalidState("raw READ host status already allocated");
+    void* memory{};
+    if(aclrtMallocHost(&memory,bytes)!=ACL_SUCCESS || !memory)
+      return Status::OutOfMemory("allocate raw READ pinned host status");
+    data=static_cast<KvafRawReadCoreStatus*>(memory);return Status::OK();
+  }
+  Status Free() {
+    if(data && aclrtFreeHost(data)!=ACL_SUCCESS)return Status::InDoubt("free raw READ pinned host status");
+    data=nullptr;return Status::OK();
+  }
+};
 class ReadLink final:public peer::PeerLink {
  public:
   ReadLink(std::shared_ptr<hr::ControlChannel> channel,HbmReadTicket t):PeerLink("reverse-hbm"),control(std::move(channel)),ticket(t),client(detail::Nonce()){}
@@ -84,7 +98,7 @@ struct Engine {
   KvafBatchGetTransport* transport{};
   KvafBatchGetLocalBuffer* local{};
   DeviceBuffer descriptors,statuses,queues,scratch;
-  std::vector<KvafRawReadCoreStatus> host_statuses;
+  HostStatusBuffer host_statuses;
   std::uint32_t cores,jettys,budget;
   std::uint64_t mr_id{1};
   std::uint64_t launch_generation{};
@@ -114,6 +128,7 @@ struct Engine {
       *event=nullptr;
     }
     if(KvafBatchGetTransportClose(&transport))return Status::InDoubt("raw READ transport teardown pending");
+    s=host_statuses.Free();if(!s.ok())return s;
     s=statuses.Free();if(!s.ok())return s;
     statuses_initialized=false;
     s=queues.Free();if(!s.ok())return s;
@@ -182,7 +197,9 @@ struct Engine {
       auto allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
     }
-    host_statuses.resize(cores);
+    if(!host_statuses.data) {
+      auto allocated=host_statuses.Allocate(statuses.bytes);if(!allocated.ok())return allocated;
+    }
     if(profile)for(auto* event:{&profile_start,&profile_end})
       if(!*event && aclrtCreateEventWithFlag(event,ACL_EVENT_TIME_LINE)!=ACL_SUCCESS)
         return Status::Internal("create raw READ timing event");
@@ -205,10 +222,18 @@ struct Engine {
       return Status::InDoubt("raw READ launch/stream completion uncertain");
     if(profile && !profile->event_error)profile->event_error=Timed(&profile->event_record_us,[&]{
       return aclrtRecordEvent(profile_end,static_cast<aclrtStream>(stream));});
+    // Same-stream ordering puts the status copy after the kernel (and its end
+    // event). Reuse pinned memory and wait once for both tasks before reading it.
+    const auto copy_error=Timed(profile?&profile->status_us:nullptr,[&]{
+      return aclrtMemcpyAsync(host_statuses.data,statuses.bytes,statuses.data,statuses.bytes,
+                              ACL_MEMCPY_DEVICE_TO_HOST,static_cast<aclrtStream>(stream));});
+    // Even a copy submission failure must not skip waiting for a launched
+    // kernel. A failed wait keeps both device and pinned host buffers retained.
     if(Timed(profile?&profile->synchronize_us:nullptr,[&]{
         return aclrtSynchronizeStream(static_cast<aclrtStream>(stream));})!=ACL_SUCCESS)
       return Status::InDoubt("raw READ launch/stream completion uncertain");
     kernel_finished=true;
+    if(copy_error!=ACL_SUCCESS)return Status::InDoubt("cannot enqueue raw READ completion copy");
     if(profile && !profile->event_error) {
       float ms{};
       profile->event_error=Timed(&profile->event_query_us,[&]{return aclrtEventElapsedTime(&ms,profile_start,profile_end);});
@@ -216,9 +241,7 @@ struct Engine {
       if(profile->kernel_event_valid)profile->kernel_event_us=static_cast<double>(ms)*1000;
     }
     ProfileTimer status_timer(profile?&profile->status_us:nullptr);
-    auto& host=host_statuses;
-    if(aclrtMemcpy(host.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
-      return Status::InDoubt("cannot inspect raw READ completion");
+    const auto* host=host_statuses.data;
     // Check ALL cores before interpreting either success or pre-DMA rejection.
     // A stale validation error must not authorize Cancel/reuse either.
     for(std::uint32_t c=0;c<cores;++c)
@@ -226,19 +249,21 @@ struct Engine {
         return Status::InDoubt("raw READ completion generation mismatch: core="+std::to_string(c));
     // Cancellation is safe only when EVERY core reports the same full-batch
     // validation failure and explicitly reports zero posted/processed WQEs.
-    const auto& first=host.front().execution;
+    const auto& first=host[0].execution;
     bool rejected=args.input_mode==KVAF_RAW_NPU_OFFSETS &&
         (first.result==1 || first.result==4 || first.result==8);
-    for(const auto& record:host)
+    for(std::uint32_t c=0;c<cores;++c) {
+      const auto& record=host[c];
       rejected=rejected && record.execution.magic==KVAF_AIV_BATCH_GET_STATUS_MAGIC &&
           record.execution.result==first.result && record.execution.failed_request_index==first.failed_request_index &&
           !record.total_wqes && !record.posted_wqes && !record.execution.processed_request_count;
+    }
     if(rejected) {
       uncertain=false;
       return Status::InvalidArgument("NPU raw READ metadata rejected before DMA: result="+std::to_string(first.result)+
                                      " span="+std::to_string(first.failed_request_index));
     }
-    const auto n=host.front().total_wqes;
+    const auto n=host[0].total_wqes;
     if(!n || n!=args.request_count)
       return Status::InDoubt("invalid raw READ final WQE count");
     for(std::uint32_t c=0;c<cores;++c) {

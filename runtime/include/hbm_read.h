@@ -40,6 +40,8 @@ struct HbmReceiverTicket {
 // and overlaps launch/synchronize (never add it to the Host phase sum).
 struct HbmReadProfile {
   double total_us{}, validation_us{}, buffers_us{}, register_output_us{};
+  // status_us includes async D2H submission and CPU validation; its device
+  // execution is included in synchronize_us, after the kernel end event.
   double event_record_us{}, launch_us{}, synchronize_us{}, event_query_us{}, status_us{};
   double cleanup_us{}, complete_us{}, kernel_event_us{};
   bool kernel_event_valid{};

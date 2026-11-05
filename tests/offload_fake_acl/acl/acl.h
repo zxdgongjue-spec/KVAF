@@ -13,9 +13,12 @@ constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
 extern "C" {
 aclError aclrtSetDevice(int32_t);
 aclError aclrtMemcpy(void*, std::size_t, const void*, std::size_t, int);
+aclError aclrtMemcpyAsync(void*, std::size_t, const void*, std::size_t, int, aclrtStream);
 aclError aclrtGetDevice(int32_t*);
 aclError aclrtMalloc(void**, std::size_t, int);
 aclError aclrtFree(void*);
+aclError aclrtMallocHost(void**, std::size_t);
+aclError aclrtFreeHost(void*);
 aclError aclrtMemset(void*, std::size_t, int, std::size_t);
 aclError aclrtCreateStream(aclrtStream*);
 aclError aclrtDestroyStream(aclrtStream);

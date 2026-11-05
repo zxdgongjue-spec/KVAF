@@ -112,7 +112,7 @@ target_include_directories(kvaf_hbm_read_test PRIVATE
 target_link_libraries(kvaf_hbm_read_test PRIVATE kvaf_runtime kvaf_offload_control kvaf_peer_link ${CMAKE_DL_LIBS})
 add_test(NAME kvaf_hbm_read_test COMMAND kvaf_hbm_read_test)
 set_tests_properties(kvaf_hbm_read_test PROPERTIES TIMEOUT 45)
-foreach(fault stale-success stale-core stale-rejection)
+foreach(fault stale-success stale-core stale-rejection copy-submit-failure sync-failure)
   add_test(NAME kvaf_hbm_read_${fault}_test COMMAND kvaf_hbm_read_test ${fault})
   set_tests_properties(kvaf_hbm_read_${fault}_test PROPERTIES TIMEOUT 15)
 endforeach()

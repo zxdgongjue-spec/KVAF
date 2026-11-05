@@ -9,6 +9,7 @@
 #endif
 #include <poll.h>
 #include <map>
+#include <functional>
 #include "aiv_model/kernel_operator.h"
 #define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_raw_addr_aiv.asc"
@@ -26,7 +27,50 @@ bool fail_probe_cq=false;
 int skip_status_core=-1;
 bool skip_all_statuses=false;
 int quiesces=0, raw_syncs=0;
-extern "C" aclError aclrtSynchronizeStream(aclrtStream){++raw_syncs;return 0;}
+bool fail_status_copy=false,fail_raw_sync=false;
+int host_allocation_failures=0,host_free_failures=0;
+std::atomic<int> pinned_buffers{0},pinned_allocation_calls{0},status_copies{0};
+std::mutex fake_stream_mutex;
+std::map<aclrtStream,std::vector<std::function<void()>>> fake_stream_tasks;
+std::map<void*,std::size_t> pinned_memory;
+void EnqueueRawTask(aclrtStream stream,std::function<void()> task) {
+  std::lock_guard<std::mutex> lock(fake_stream_mutex);
+  fake_stream_tasks[stream].push_back(std::move(task));
+}
+extern "C" aclError aclrtMallocHost(void** memory,std::size_t bytes) {
+  ++pinned_allocation_calls;
+  if(host_allocation_failures){--host_allocation_failures;*memory=nullptr;return 1;}
+  *memory=std::malloc(bytes);if(!*memory)return 1;
+  std::memset(*memory,0xa5,bytes);
+  std::lock_guard<std::mutex> lock(fake_stream_mutex);
+  pinned_memory[*memory]=bytes;++pinned_buffers;return 0;
+}
+extern "C" aclError aclrtFreeHost(void* memory) {
+  if(host_free_failures){--host_free_failures;return 1;}
+  std::lock_guard<std::mutex> lock(fake_stream_mutex);
+  Require(pinned_memory.erase(memory)==1,"release a live pinned status allocation");
+  --pinned_buffers;std::free(memory);return 0;
+}
+extern "C" aclError aclrtMemcpyAsync(void* dst,std::size_t capacity,const void* src,
+                                     std::size_t bytes,int kind,aclrtStream stream) {
+  std::lock_guard<std::mutex> lock(fake_stream_mutex);
+  Require(kind==ACL_MEMCPY_DEVICE_TO_HOST && bytes<=capacity && pinned_memory.count(dst) &&
+          bytes<=pinned_memory.at(dst),"async status copy uses pinned host storage");
+  Require(!fake_stream_tasks[stream].empty(),"status copy follows a kernel on the same stream");
+  ++status_copies;
+  if(fail_status_copy)return 1;
+  // Neither kernel nor copy executes until synchronization. Reading the host
+  // buffer early observes old/poisoned status and fails the generation check.
+  fake_stream_tasks[stream].push_back([=]{std::memcpy(dst,src,bytes);});return 0;
+}
+extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
+  ++raw_syncs;
+  if(fail_raw_sync)return 1; // Leave queued work live, as on an uncertain wait.
+  std::vector<std::function<void()>> tasks;
+  {std::lock_guard<std::mutex> lock(fake_stream_mutex);
+    tasks.swap(fake_stream_tasks[stream]);fake_stream_tasks.erase(stream);}
+  for(auto& task:tasks)task();return 0;
+}
 struct KvafBatchGetLocalBuffer {
   std::uint64_t base,bytes,source_base,source_bytes;
   KvafBatchGetTransport* transport;unsigned references;
@@ -90,8 +134,8 @@ extern "C" int32_t KvafBatchGetTransportClose(KvafBatchGetTransport** p){
     --raw_transports;delete *p;*p=nullptr;
   }return 0;
 }
-extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs* a,aclrtStream){
-  ++raw_calls;auto* src=reinterpret_cast<uint64_t*>(a->source_addresses);auto* dst=reinterpret_cast<uint64_t*>(a->destination_addresses);
+void ExecuteRawKernel(const KvafExecuteBatchGetRawAddrKernelArgs* a) {
+  auto* src=reinterpret_cast<uint64_t*>(a->source_addresses);auto* dst=reinterpret_cast<uint64_t*>(a->destination_addresses);
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
   Require(a->generation>local->transport->last_generation,"every launch, including probes, gets a fresh nonzero generation");
   local->transport->last_generation=a->generation;
@@ -117,7 +161,11 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRaw
     status.total_wqes=count;status.posted_wqes=status.execution.processed_request_count;
     status.completed_generation=a->generation;
   }
-  fail_probe_cq=false;return 0;
+  fail_probe_cq=false;
+}
+extern "C" int32_t KvafExecuteBatchGetRawAddrLaunch(const KvafExecuteBatchGetRawAddrKernelArgs* a,aclrtStream stream){
+  ++raw_calls;const auto args=*a;
+  EnqueueRawTask(stream,[args]{ExecuteRawKernel(&args);});return 0;
 }
 // P connects to this proxy as if it were D. Inspect real framed traffic and
 // drop selected acknowledgements after their side effects have happened.
@@ -209,6 +257,8 @@ void RuntimeInitialization() {
     unregister_failures=1;
     Require(!a.Shutdown().ok()&&a.initialized(),"failed teardown retains runtime");
     Require(!a.Initialize().ok(),"closing runtime cannot reinitialize");
+    host_free_failures=1;
+    Require(!a.Shutdown().ok() && pinned_buffers==1,"failed pinned status free retains storage for retry");
     Check(a.Shutdown());Check(b.Shutdown());
     Require(!a.initialized()&&!a.ddr_initialized(),"global teardown complete");
     Check(a.Initialize());Check(a.ListenHbm("127.0.0.1:0","",reader_eid,&receiver));Check(a.Shutdown());
@@ -316,9 +366,35 @@ void StaleCompletion(const std::string& mode) {
   std::_Exit(0);
 }
 
+void ReadbackFailure(const std::string& mode) {
+  raw_mode=true;fake_device=0;
+  std::vector<uint8_t> source(4096,0x67),output(128);
+  kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::HbmReceiverTicket receiver;
+  Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));Proxy proxy(receiver);
+  kvaf::NpuPullHbmSource b(0,producer_eid);
+  Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},proxy.receiver,reinterpret_cast<void*>(1)));
+  kvaf::ReadyToken token;int64_t src=7,dst=11,n=64;Check(b.Ready(&token));
+  const auto calls=raw_calls.load(),syncs=raw_syncs;
+  const auto requests=proxy.requests.load();
+  const auto copies=status_copies.load(),allocations=pinned_allocation_calls.load();
+  fail_status_copy=mode=="copy-submit-failure";fail_raw_sync=mode=="sync-failure";
+  const auto status=a.Read(token,{&src,1},{&dst,1},{&n,1},
+      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1));
+  Require(status.code()==kvaf::StatusCode::kInDoubt && a.pending(),"failed readback retains batch");
+  Require(raw_calls==calls+1 && raw_syncs==syncs+1 && status_copies==copies+1,
+          "even a failed copy submission still waits for the launched kernel");
+  Require(proxy.requests==requests,"failed readback sends neither Complete nor Cancel");
+  Require(!a.Resolve(token).ok() && raw_calls==calls+1,"recovery must not replay unresolved READ");
+  Require(!b.ReleaseBatch(token).ok() && b.frozen(),"failed readback keeps producer frozen");
+  Require(!a.Shutdown().ok() && pinned_buffers==1 && pinned_allocation_calls==allocations &&
+          local_buffers==1 && raw_transports==1,"uncertain read retains pinned status, output and transport");
+  std::_Exit(0);
+}
+
 int main(int argc,char** argv){try{
   if(argc==2) {
     const std::string mode=argv[1];
+    if(mode=="copy-submit-failure"||mode=="sync-failure")ReadbackFailure(mode);
     Require(mode=="stale-success"||mode=="stale-core"||mode=="stale-rejection","known fault mode");
     StaleCompletion(mode);
   }
@@ -333,6 +409,10 @@ int main(int argc,char** argv){try{
   kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::HbmReceiverTicket receiver;
   Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));Proxy proxy(receiver);
   kvaf::NpuPullHbmSource b(0,producer_eid);
+  host_allocation_failures=1;
+  Require(!b.Register({source,source_bytes,kvaf::DeviceKind::kNpu},proxy.receiver,reinterpret_cast<void*>(1)).ok(),"failed pinned status allocation");
+  Check(Retry([&]{return b.Shutdown();}));
+  Require(!pinned_buffers&&!registrations&&!raw_transports&&!local_buffers,"failed pinned allocation cleaned up before READ");
   fail_probe_cq=true;
   Require(!b.Register({source,source_bytes,kvaf::DeviceKind::kNpu},proxy.receiver,reinterpret_cast<void*>(1)).ok(),"failed startup probe");
   Check(Retry([&]{return b.Shutdown();}));Require(!registrations&&!raw_transports&&!local_buffers,"failed probe cleanup");
@@ -374,6 +454,7 @@ int main(int argc,char** argv){try{
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(raw_calls==before+2 && raw_wqes==before_wqes,"fused validation rejects all invalid ranges before posting DMA");
   const int cached_acquires=local_acquires,allocated=acl_allocation_calls,memsets=acl_memset_calls;
+  const auto pinned_allocated=pinned_allocation_calls.load();
   kvaf::HbmReadProfile profile;
   Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
                {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
@@ -393,6 +474,7 @@ int main(int argc,char** argv){try{
           "timing query failure does not change successful DMA result");
   Require(local_acquires==cached_acquires && local_buffers==1,"output registration reused across batches");
   Require(acl_allocation_calls==allocated,"status and queue allocations reused across batches");
+  Require(pinned_allocation_calls==pinned_allocated && pinned_buffers==1,"pinned host status reused across batches");
   Require(acl_memset_calls==memsets,"profiled repeated reads do not clear device state");
   fail_timing_query=false;
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
@@ -446,6 +528,6 @@ int main(int argc,char** argv){try{
   Require(!b.Ready(&token).ok(),"closing source cannot publish");
   proxy.drop=unsigned(hr::Command::Close);Require(!b.Shutdown().ok(),"lost Close response retains teardown");
   Check(Retry([&]{return b.Shutdown();}));Check(a.Shutdown());
-  Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers && !events,"all resources and profiling events retired");
+  Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers && !events && !pinned_buffers && fake_stream_tasks.empty(),"all resources and profiling events retired");
   std::cout<<"HBM raw READ: real TCP/source/client, one WQE per span, leases, lost ACKs and cleanup passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}
