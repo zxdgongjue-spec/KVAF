@@ -2,8 +2,10 @@
 
 Gather 串行计时新增独立性能入口，参数在脚本顶部修改，见
 [Gather 阶段计时与内部流水](aiv_gather_serial_profile.md)。当前 gather launch ABI 为
-232 B，symbol 为 `KvafGatherBatchGetAivKernelV3`，需要同步更新 Host 和 kernel。
-V3 增加可选执行检查点，用于定位当前 1 核流水版的 507015；尚未完成硬件验收。
+240 B，symbol 为 `KvafGatherBatchGetAivKernelV4`，需要同步更新 Host/Python 和 kernel。
+V4 接通 [CPU gather 与 payload READ 分块流水](aiv_gather_chunk_pipeline.md)，默认
+128 KiB；下文无 CPU chunk 的第一阶段行为可通过
+`KVAF_AIV_GATHER_CHUNK_BYTES=0` 对照。
 
 ## 当前临时运行方式：只检查 CPU push / done
 
@@ -89,9 +91,9 @@ Python 继续使用统一的 `kvaf.NpuRuntime(..., aiv_batch_get_mode=...)` 和
 | --- | --- | --- |
 | Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
-| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，232 B |
+| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，240 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV3` |
+| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV4` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 | 独立测试 | `tests/python/test_aiv_scatter_batch_get.py` | `tests/python/test_aiv_gather_batch_get.py` |
 

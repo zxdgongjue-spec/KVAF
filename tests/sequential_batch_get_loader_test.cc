@@ -17,7 +17,7 @@ std::vector<std::unique_ptr<std::string>> binaries;
 void Check(bool ok) { if (!ok) std::abort(); }
 constexpr char kDirect[] = "KvafExecuteBatchGetAivKernelV2";
 constexpr char kScatter[] = "KvafScatterBatchGetAivKernelV1";
-constexpr char kGather[] = "KvafGatherBatchGetAivKernelV3";
+constexpr char kGather[] = "KvafGatherBatchGetAivKernelV4";
 std::vector<std::string> launched;
 uint32_t failure_stage{};
 }
@@ -85,9 +85,9 @@ int main(int argc, char** argv) {
   }
   if (scenario == "wrong_symbol") {
     Check(KvafScatterBatchGetLoadKernel(gather.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
-    // V3 adds prefix diagnostics. Neither V1 nor V2 may ignore a requested
-    // checkpoint while the Host mistakes it for the new implementation.
-    for (const char* old : {"KvafGatherBatchGetAivKernelV1", "KvafGatherBatchGetAivKernelV2"}) {
+    // V4 adds CPU chunk consumption. Older kernels must fail at symbol lookup.
+    for (const char* old : {"KvafGatherBatchGetAivKernelV1", "KvafGatherBatchGetAivKernelV2",
+                            "KvafGatherBatchGetAivKernelV3"}) {
       std::ofstream(gather) << old;
       Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == KVAF_BATCH_GET_RUNTIME_ERROR);
     }

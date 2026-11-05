@@ -20,6 +20,7 @@ bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
 uint32_t last_coalesce_sges{};
+uint32_t last_pipeline_chunk_bytes{};
 bool allow_queued_launches{};
 int async_memsets{}, status_copies{}, stream_syncs{};
 uint64_t kernel_result{};
@@ -90,6 +91,8 @@ extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, v
 extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_GATHER);
   last_coalesce_sges = a->coalesce_sges;
+  last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
+  if (a->probe) assert(!last_pipeline_chunk_bytes);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
   const auto rc = Launch(&model);
@@ -131,6 +134,19 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         p.kernel_finish_cycle = 106;
         p.requests = statuses[i].requests + (fault == 6);
         p.data_wrs = statuses[i].data_wrs + (fault == 7);
+        if (args.pipeline_chunk_bytes && p.requests) {
+          p.pipeline_chunk_bytes = args.pipeline_chunk_bytes;
+          p.ack_done_cycle = 106;
+          p.first_ready_cycle = 104;
+          p.first_read_submit_cycle = 104;
+          p.first_read_ready_bytes = p.requests * args.request.token_bytes;
+          p.ready_queries = 2;
+          p.ready_wait_cycles = 1;
+          if (fault == 14) p.pipeline_chunk_bytes = 0;
+          if (fault == 15) p.first_ready_cycle = 102;
+          if (fault == 16) ++p.first_read_ready_bytes;
+          if (fault == 17) p.first_read_submit_cycle = 106;
+        }
         if (fault == 8) p.input_done_cycle = 99;
         if (fault == 9) p.descriptor_done_cycle = 100;
         if (fault == 10) p.notify_done_cycle = 101;
@@ -475,6 +491,7 @@ int main() {
   const char* profile_reasons[] = {"", "magic", "sequence", "valid_mask", "timestamp_notify_ack",
       "result", "requests", "data_wrs", "timestamp_start_input", "timestamp_input_descriptor",
       "timestamp_descriptor_notify", "timestamp_ack_read", "timestamp_read_finish", "valid_mask"};
+  setenv("KVAF_AIV_GATHER_CHUNK_BYTES", "0", 1);
   for (profile_fault = 1; profile_fault <= 13; ++profile_fault) {
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
@@ -484,7 +501,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=232", "record_bytes=192"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=240", "record_bytes=192"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);
@@ -495,6 +512,7 @@ int main() {
     assert(!owner->Execute(exec).ok());
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
+  unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
   profile_fault = 0;
   {
     auto owner = CreateSequentialBatchGet(config);
@@ -581,5 +599,28 @@ int main() {
     assert(owner->Execute(exec).ok() && last_coalesce_sges == 1);
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
+  for (const char* chunk : {"0", "64", "131072", "4294967232"}) {
+    setenv("KVAF_AIV_GATHER_CHUNK_BYTES", chunk, 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES"); // Captured at Runtime initialization.
+    assert(owner->Execute(exec).ok());
+    assert(last_pipeline_chunk_bytes == std::strtoull(chunk, nullptr, 10));
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  for (const char* chunk : {"-64", "+64", "63", "65", "64K", "4294967296", " 64"}) {
+    setenv("KVAF_AIV_GATHER_CHUNK_BYTES", chunk, 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
+    assert(!allocations && !refs);
+  }
+  unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
+  for (profile_fault = 14; profile_fault <= 17; ++profile_fault) {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    assert(owner->Execute(exec).code() == StatusCode::kInternal);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  profile_fault = 0;
   std::cout << "sequential Host lifecycle: PASS\n";
 }

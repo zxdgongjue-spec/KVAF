@@ -20,7 +20,7 @@ SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
-RUN_LABEL = "aiv_pipeline"      # Distinguish this build from the serial baseline.
+RUN_LABEL = "cpu_chunk_pipeline"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
 
 import csv
@@ -52,12 +52,49 @@ HOST_FIELDS = (
 )
 COUNTERS = (
     "data_wrs", "ack_queries", "data_wqebbs", "data_doorbells",
-    "data_cq_wait_cycles", "read_build_cycles",
+    "data_cq_wait_cycles", "read_build_cycles", "ready_queries", "ready_wait_cycles",
+    "pipeline_chunk_bytes", "first_read_ready_bytes",
 )
+PIPELINE_EVENTS = ("first_ready_cycle", "first_read_submit_cycle")
+
+
+def configured_chunk_bytes() -> int:
+    value = os.environ.get("KVAF_AIV_GATHER_CHUNK_BYTES", "") or "131072"
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64")
+    chunk = int(value)
+    if chunk > (1 << 32) - 1 or (chunk and chunk % 64):
+        raise ValueError("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64")
+    return chunk
+
+
+def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
+    """Serial stages partition time; chunk-mode wait_cpu and read overlap."""
+    pipeline = int(lane.get("pipeline_chunk_bytes", 0)) != 0
+    durations = {}
+    for name, begin, end in STAGE_BOUNDARIES:
+        first, last = int(lane[begin]), int(lane[end])
+        if pipeline and name == "read":
+            first = int(lane["first_read_submit_cycle"])
+        elif pipeline and name == "finalize":
+            first = max(first, int(lane["ack_done_cycle"]))
+        if first < 0 or last < first:
+            raise ValueError(f"invalid {name} profile timestamp order")
+        durations[name] = last - first
+    if pipeline:
+        notify, ready, submit, read, ack, finish = (
+            int(lane[key]) for key in ("notify_done_cycle", "first_ready_cycle",
+                "first_read_submit_cycle", "read_done_cycle", "ack_done_cycle", "kernel_finish_cycle"))
+        if not notify <= ready <= submit <= read <= finish or not notify <= ack <= finish:
+            raise ValueError("invalid overlapping gather profile timestamp order")
+        if not 0 < int(lane.get("first_read_ready_bytes", 0)) <= int(lane["requests"]) * TOKEN_BYTES:
+            raise ValueError("invalid first READ ready prefix")
+    return durations
 
 
 def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
+    configured_chunk_bytes()
     positive = {
         "TOKEN_BYTES": TOKEN_BYTES, "REQUEST_COUNT": REQUEST_COUNT,
         "TABLE_CAPACITY": TABLE_CAPACITY,
@@ -180,11 +217,8 @@ def summarize_profiles(
                 raise ValueError("profile request count does not match the lane partition")
             values = core_values[core]
             values["requests"].append(expected_requests)
-            for name, begin, end in STAGE_BOUNDARIES:
-                first, last = int(lane[begin]), int(lane[end])
-                if first < 0 or last < first:
-                    raise ValueError(f"invalid {name} profile timestamp order")
-                values[name].append(last - first)
+            for name, duration in profile_stage_cycles(lane).items():
+                values[name].append(duration)
             for field in COUNTERS:
                 value = int(lane.get(field, 0))
                 if value < 0:
@@ -242,7 +276,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -255,6 +289,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "tokens_per_block": TOKENS_PER_BLOCK, "sgl": GATHER_SGL_SIZE, "seed": SEED,
         "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "coalesce_sges": int(os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES", "0") or "0"),
+        "configured_chunk_bytes": configured_chunk_bytes(),
         "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
@@ -283,7 +318,7 @@ def export_csv_results(
     boundaries = [STAGE_BOUNDARIES[0][1]] + [end for _, _, end in STAGE_BOUNDARIES[:-1]]
     host_columns = [field.removesuffix("_ns") + "_us" for field in HOST_FIELDS]
     timed_counters = [field for field in COUNTERS if field.endswith("_cycles")]
-    core_columns = ["requests", *boundaries, *(name + "_cycles" for name in stages),
+    core_columns = ["requests", *boundaries, *PIPELINE_EVENTS, *(name + "_cycles" for name in stages),
                     *(name + "_us" for name in stages), *COUNTERS,
                     *(field.removesuffix("_cycles") + "_us" for field in timed_counters)]
 
@@ -291,8 +326,10 @@ def export_csv_results(
         row = {"requests": lane["requests"], **{key: lane.get(key, 0) for key in COUNTERS}}
         if not mean:
             row.update({key: lane[key] for key in boundaries})
+            row.update({key: lane.get(key, 0) for key in PIPELINE_EVENTS})
+        durations = None if mean else profile_stage_cycles(lane)
         for name, begin, end in STAGE_BOUNDARIES:
-            cycles = lane[name] if mean else int(lane[end]) - int(lane[begin])
+            cycles = lane[name] if mean else durations[name]
             row[name + "_cycles"] = cycles
             row[name + "_us"] = cycles / float(clock) if clock != "" else ""
         for field in timed_counters:
@@ -445,6 +482,7 @@ def main() -> int:
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"coalesce_sges={metadata['coalesce_sges']} "
+            f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
             f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={PROFILE_SAMPLES} "
             "plan=fixed_random timing=async_call_to_stream_completion",
             flush=True,

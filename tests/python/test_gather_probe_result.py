@@ -37,7 +37,7 @@ class GatherProbeResultTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 common.report_gather_kernel(str(path), module)
             self.assertIn(f"path={path}", output.getvalue())
-            self.assertIn("name_markers=V2 expected_symbol=KvafGatherBatchGetAivKernelV3", output.getvalue())
+            self.assertIn("name_markers=V2 expected_symbol=KvafGatherBatchGetAivKernelV4", output.getvalue())
             self.assertIn("native=/old/kvaf/_kvaf.so", output.getvalue())
 
     def test_name_scan_does_not_pretend_to_validate_acl_binary(self):

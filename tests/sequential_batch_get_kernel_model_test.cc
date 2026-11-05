@@ -49,6 +49,7 @@ struct ModelArgs {
   uint64_t profile{};
   uint32_t gather_probe{};
   uint32_t coalesce_sges{};
+  uint32_t pipeline_chunk_bytes{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -56,11 +57,11 @@ void Launch(const ModelArgs& a) {
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
       a.sequence, a.max_polls, a.scatter_probe});
   } else {
-    KvafGatherBatchGetAivKernelV3({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV4({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
-      a.gather_probe, a.coalesce_sges});
+      a.gather_probe, a.coalesce_sges, a.pipeline_chunk_bytes, 0});
   }
 }
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
@@ -112,19 +113,26 @@ struct Fixture {
   std::vector<uint64_t> read_vf_begin, read_overlap_begin;
   std::vector<uint64_t> scratch_cache_lines;
   std::vector<uint32_t> ack_reads;
+  std::vector<uint32_t> ready_reads;
+  std::vector<uint64_t> first_read_ready;
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{}, data_timeout{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   uint64_t launch_vf_begin{};
   uint64_t descriptor_cache_lines{}, valid_table_cache_lines{};
   uint64_t simt_input_cache_lines{}, row_cache_lines{};
+  // Deterministic CPU producer: progress queries advance one copy chunk, while
+  // the CPU's final ACK is deliberately withheld until after payload READs.
+  uint32_t ready_fault{}, ready_step{1}, ready_idle{2};
+  bool ack_timeout{}, ack_error{}, queried_with_data_inflight{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
         indices(n), offsets(n), rows(n), status(cores), profiles(cores), states(cores * 2),
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
         read_vf_begin(cores), read_overlap_begin(cores),
-        scratch_cache_lines(cores), ack_reads(cores), cpu_done(cores) {
+        scratch_cache_lines(cores), ack_reads(cores), ready_reads(cores),
+        first_read_ready(cores), cpu_done(cores) {
     fixture = this;
     const uint64_t source_bytes = uint64_t(n) * bytes * 2;
     const uint64_t lane_staging = Align(uint64_t((n + cores - 1) / cores) * bytes);
@@ -243,7 +251,7 @@ struct Fixture {
     assert(h->magic == kvaf::peer::kGatherDescriptorMagic && h->sequence == args.sequence);
     assert(h->staging_address == args.remote_staging + worker * args.lane_staging_bytes);
     assert(h->span_count == last - first && h->total_bytes == (last - first) * token);
-    assert(!h->pipeline_chunk_bytes && h->span_bytes == token && !h->ready_bytes);
+    assert(h->pipeline_chunk_bytes == args.pipeline_chunk_bytes && h->span_bytes == token && !h->ready_bytes);
     const auto* spans = reinterpret_cast<const kvaf::peer::GatherSpan*>(local + sizeof(*h));
     for (uint32_t i = first; i < last; ++i) {
       const auto& span = spans[i - first];
@@ -254,6 +262,36 @@ struct Fixture {
     const auto padded = Align(bytes);
     for (uint64_t i = bytes; i < padded; ++i) assert(local[i] == 0);
     for (uint64_t i = padded; i < args.lane_descriptor_bytes; ++i) assert(local[i] == 0xa7);
+  }
+  void AdvanceGather(uint32_t worker) {
+    ++ready_reads[worker];
+    auto* h = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(
+        args.remote_descriptor + worker * args.lane_descriptor_bytes);
+    assert(h->sequence == args.sequence && h->pipeline_chunk_bytes == args.pipeline_chunk_bytes);
+    if (!queues[worker * 2]->posted.empty()) queried_with_data_inflight = true;
+    if (timeout || ready_reads[worker] <= ready_idle) return;
+    const auto begin = h->ready_bytes;
+    const auto end = std::min<uint64_t>(h->total_bytes,
+        begin + uint64_t(args.pipeline_chunk_bytes) * ready_step);
+    const auto* spans = reinterpret_cast<const kvaf::peer::GatherSpan*>(h + 1);
+    for (auto offset = begin; offset < end;) {
+      const auto index = offset / token, in_span = offset % token;
+      const auto bytes = std::min<uint64_t>(token - in_span, end - offset);
+      std::memcpy(reinterpret_cast<void*>(h->staging_address + offset),
+                  reinterpret_cast<const void*>(spans[index].address + in_span), bytes);
+      offset += bytes;
+    }
+    h->ready_bytes = end;
+    // Faults 3/5 follow a real partial submission, exercising an unsignaled
+    // data wave. Other malformed responses fail before any payload submission.
+    if (ready_fault && ((ready_fault != 3 && ready_fault != 5) || first_read_ready[worker])) {
+      if (ready_fault == 1) --h->sequence;
+      if (ready_fault == 2) ++h->sequence;
+      if (ready_fault == 3) h->ready_bytes = 0;
+      if (ready_fault == 4) h->ready_bytes = uint64_t(h->total_bytes) + 64;
+      if (ready_fault == 5) h->ready_bytes = kErrorBit;
+      if (ready_fault == 6) h->ready_bytes = 1;
+    }
   }
   void Doorbell(uint32_t value, uint32_t* p) {
     for (uint32_t q = 0; q < workers * 2; ++q) {
@@ -307,7 +345,8 @@ struct Fixture {
           // still active. Early stamps must already live in this core's GM
           // record, not in a local aggregate copied back only at kernel exit.
           const auto& p = profiles[worker];
-          const uint64_t reached = !(q % 2) ? 0x1f : op == kRead ? 0xf : 0x7;
+          const uint64_t reached = op == kWrite ? 0x7 : args.pipeline_chunk_bytes ?
+              (p.read_done_cycle ? 0x2f : 0xf) : !(q % 2) ? 0x1f : 0xf;
           assert(p.magic == 0 && p.sequence == args.sequence);
           assert(p.valid_mask == reached);
           assert(p.kernel_start_cycle && p.input_done_cycle && p.descriptor_done_cycle);
@@ -320,24 +359,46 @@ struct Fixture {
         if (q % 2 && op == kWrite &&
             remote_address == args.remote_descriptor + worker * args.lane_descriptor_bytes)
           CheckDescriptor(worker);
+        if (q % 2 && op == kRead && args.pipeline_chunk_bytes &&
+            remote_address == args.remote_descriptor + worker * args.lane_descriptor_bytes + 8) {
+          assert(sges == 1 && word(m.pi, 12) == 40);
+          AdvanceGather(worker);
+        }
         if (q % 2 && op == kRead && remote_address == args.remote_control + worker * 64 + 8) {
-          if (!timeout && ++ack_reads[worker] == 3) {
+          ++ack_reads[worker];
+          if (!timeout && !ack_timeout && ack_reads[worker] == 3) {
             auto* c = reinterpret_cast<kvaf::peer::GatherControl*>(args.remote_control) + worker;
             assert(c->notify == args.sequence);
             const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(c->command);
-            assert(h->pipeline_chunk_bytes == 0 && h->sequence == args.sequence);
-            kvaf::peer::CpuGatherExecutor cpu(remote.data(), Address(remote.data()), 2);
-            assert(cpu.PrepareDirect(remote.size(), c->command, args.sequence, count));
-            cpu.Copy();
-            c->ack = args.sequence | (remote_error ? kErrorBit : 0);
+            assert(h->pipeline_chunk_bytes == args.pipeline_chunk_bytes && h->sequence == args.sequence);
+            if (!args.pipeline_chunk_bytes) {
+              kvaf::peer::CpuGatherExecutor cpu(remote.data(), Address(remote.data()), 2);
+              assert(cpu.PrepareDirect(remote.size(), c->command, args.sequence, count));
+              cpu.Copy();
+              read_vf_begin[worker] = aiv_model::vf_calls;
+              read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
+            } else {
+              assert(h->ready_bytes == h->total_bytes);
+              assert(queues[worker * 2]->cq_completed == queues[worker * 2]->cq_pi);
+            }
+            c->ack = args.sequence | ((remote_error || ack_error) ? kErrorBit : 0);
             cpu_done[worker] = true;
-            read_vf_begin[worker] = aiv_model::vf_calls;
-            read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
           }
         }
         if (!(q % 2)) {
-          assert(op == kRead && cpu_done[worker]);
-          assert(ack_reads[worker] >= 3); // Must not treat started ACK as completed.
+          assert(op == kRead);
+          if (args.pipeline_chunk_bytes) {
+            const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(
+                args.remote_descriptor + worker * args.lane_descriptor_bytes);
+            uint64_t bytes = 0;
+            for (uint32_t i = 0; i < sges; ++i) bytes += word(m.pi, 12 + i * 4);
+            assert(remote_address >= h->staging_address);
+            assert(remote_address + bytes <= h->staging_address + h->ready_bytes);
+            if (!first_read_ready[worker]) first_read_ready[worker] = h->ready_bytes;
+            assert(!cpu_done[worker] && !ack_reads[worker]);
+          } else {
+            assert(cpu_done[worker] && ack_reads[worker] >= 3);
+          }
           if (args.coalesce_sges) assert(sges == 1);
           ++data_reads; max_sges = std::max(max_sges, sges);
         }
@@ -356,6 +417,8 @@ struct Fixture {
             c->ack = ~args.sequence;
             // Even a tempting ready prefix must not bypass the final ACK.
             reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(c->command)->ready_bytes = 0;
+            read_vf_begin[worker] = aiv_model::vf_calls;
+            read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
           }
         }
         if (header & (1U << 21)) {
@@ -433,7 +496,7 @@ struct Fixture {
       assert(p.magic == KVAF_GATHER_PROFILE_MAGIC && p.sequence == args.sequence);
       assert(p.result == KVAF_SEQ_OK && p.valid_mask == KVAF_GATHER_PROFILE_ALL_EVENTS);
       const uint64_t boundaries[] = {p.kernel_start_cycle, p.input_done_cycle,
-          p.descriptor_done_cycle, p.notify_done_cycle, p.ack_done_cycle,
+          p.descriptor_done_cycle, p.notify_done_cycle, p.pipeline_chunk_bytes ? p.notify_done_cycle : p.ack_done_cycle,
           p.read_done_cycle, p.kernel_finish_cycle};
       assert(boundaries[0] && std::is_sorted(std::begin(boundaries), std::end(boundaries)));
       const auto rows = uint64_t(active) * (core + 1) / workers - uint64_t(active) * core / workers;
@@ -445,7 +508,16 @@ struct Fixture {
       } else {
         assert(p.ack_queries == 3 && p.data_wqebbs >= p.data_wrs);
         assert(p.data_doorbells && p.data_cq_wait_cycles && p.read_build_cycles);
-        assert(p.data_cq_wait_cycles + p.read_build_cycles <= p.read_done_cycle - p.ack_done_cycle);
+        if (args.pipeline_chunk_bytes) {
+          assert(p.pipeline_chunk_bytes == args.pipeline_chunk_bytes);
+          assert(p.ready_queries == ready_reads[core] && p.ready_wait_cycles);
+          assert(p.notify_done_cycle < p.first_ready_cycle && p.first_ready_cycle < p.first_read_submit_cycle);
+          assert(p.first_read_ready_bytes == first_read_ready[core]);
+          assert(p.first_read_submit_cycle < p.read_done_cycle && p.read_done_cycle < p.ack_done_cycle);
+          assert(p.ack_done_cycle < p.kernel_finish_cycle);
+        } else {
+          assert(p.data_cq_wait_cycles + p.read_build_cycles <= p.read_done_cycle - p.ack_done_cycle);
+        }
       }
     }
   }
@@ -454,6 +526,8 @@ struct Fixture {
     std::fill(output.begin(), output.end(), 0xad);
     std::fill(cpu_done.begin(), cpu_done.end(), false);
     std::fill(ack_reads.begin(), ack_reads.end(), 0);
+    std::fill(ready_reads.begin(), ready_reads.end(), 0);
+    std::fill(first_read_ready.begin(), first_read_ready.end(), 0);
     push_done = false; push_polls = 0;
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
     for (uint64_t i = 0; i < args.source_bytes; ++i) remote[i] ^= 0x35;
@@ -466,8 +540,89 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
-  const auto& metadata = KvafGatherBatchGetAivKernelV3_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV4_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
+  // CPU chunks and NIC READs overlap without per-chunk data CQ waits. The
+  // producer only copies the next chunk when queried: an early data doorbell
+  // therefore proves that later staging bytes have not been gathered yet.
+  for (uint32_t cores : {1U, 3U, 8U})
+    for (uint32_t sgl : {1U, 6U, 13U})
+      for (uint32_t chunk : {64U, 4096U, 131072U}) {
+        Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, sgl);
+        f.args.pipeline_chunk_bytes = chunk;
+        f.args.max_polls = 256; // 64-byte chunks can bisect a 13-SGE READ.
+        f.DataQueueDepth(32768); f.EnableProfile();
+        for (uint32_t count : {8193U, 1U, 0U, 8193U}) {
+          f.Next(count); f.Run(); f.CheckProfiles();
+          if (count == 8193) {
+            assert(f.queried_with_data_inflight);
+            for (uint32_t core = 0; core < cores; ++core) {
+              const auto bytes = (uint64_t(count) * (core + 1) / cores - uint64_t(count) * core / cores) * f.token;
+              assert(f.first_read_ready[core] && f.first_read_ready[core] < bytes);
+            }
+          }
+        }
+        for (uint32_t core = 0; core < cores; ++core) {
+          const auto rows = 8193ULL * (core + 1) / cores - 8193ULL * core / cores;
+          const auto wrs = (rows + sgl - 1) / sgl;
+          assert(f.queues[core * 2]->cq_completed == 2 * ((wrs + 8191) / 8192) + (core + 1 == cores));
+        }
+      }
+  // 128 KiB makes 32 x 4 KiB READs ready: publish that short post immediately.
+  // Both encodings retain lane-wide SGL grouping and partial final WRs.
+  for (uint32_t coalesce : {0U, 1U}) {
+    Fixture f(8192, 4096, 2, KVAF_SEQ_GATHER, coalesce ? 6 : 1);
+    f.args.pipeline_chunk_bytes = 131072; f.args.coalesce_sges = coalesce;
+    if (coalesce) f.ConsecutiveReadRows(true);
+    f.DataQueueDepth(32768); f.EnableProfile(); f.Run(); f.CheckProfiles();
+    for (uint32_t core = 0; core < 2; ++core) {
+      assert(f.profiles[core].first_read_ready_bytes == 131072);
+      assert(f.queues[core * 2]->cq_completed == 1);
+      assert(f.profiles[core].data_doorbells > 1);
+    }
+  }
+  {
+    Fixture f(1024, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 4096; f.DataQueueDepth(32768);
+    f.Run(); // Profiling disabled: the production path must read no clocks.
+    f.Next(1); f.Run();
+  }
+  // Small SQ/CQ rings and readiness jumps still respect physical wave limits.
+  for (uint32_t depth : {4U, 16U, 520U}) {
+    Fixture f(8193, 13, 3, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 4096; f.ready_step = 3;
+    f.DataQueueDepth(depth); f.EnableProfile();
+    f.Run(); f.CheckProfiles(); f.Next(8193); f.Run(); f.CheckProfiles();
+  }
+  for (uint32_t fault : {1U, 2U, 3U, 4U, 5U, 6U}) {
+    Fixture f(1024, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 4096; f.ready_fault = fault;
+    f.DataQueueDepth(32768); f.EnableProfile(); f.Run(false, true);
+    assert(f.status[0].result == KVAF_SEQ_REMOTE_ERROR && f.states[0].poisoned && f.states[1].poisoned);
+    if (fault == 3 || fault == 5) {
+      assert(f.data_reads && !f.queues[0]->cq_completed);
+      assert(!f.queues[0]->posted.empty()); // Unsignaled partial wave is retained.
+    } else assert(!f.data_reads);
+    f.ready_fault = 0; f.Next(1024); f.Run(false, true);
+    assert(f.status[0].result == KVAF_SEQ_QUEUE_ERROR);
+  }
+  for (uint32_t failure : {0U, 1U, 2U, 3U, 4U, 5U}) {
+    Fixture f(1024, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 4096; f.DataQueueDepth(32768); f.EnableProfile();
+    f.timeout = failure == 0; f.ack_timeout = failure == 1;
+    f.ack_error = failure == 2; f.data_timeout = failure == 3; f.data_cq_error = failure == 4;
+    if (failure == 5) f.queues[1]->fail_cq_at = 4; // Progress CQ error after a partial READ post.
+    f.Run(false, true);
+    const auto expected = failure == 2 ? KVAF_SEQ_REMOTE_ERROR : failure >= 4 ? KVAF_SEQ_CQ_ERROR : KVAF_SEQ_TIMEOUT;
+    assert(f.status[0].result == expected && f.states[0].poisoned && f.states[1].poisoned);
+    if (failure == 0) assert(!f.data_reads);
+    else assert(f.data_reads);
+  }
+  for (uint32_t chunk : {1U, 63U, 65U}) {
+    Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = chunk; f.Run(false);
+    assert(f.status[0].result == KVAF_SEQ_INVALID && !f.data_reads);
+  }
   // Descriptor/command/notify share one ordered tail CQ when capacity permits.
   // Repeated calls wrap SQ/CQ and leave stale ACK/mailbox contents.
   for (uint32_t cores : {1U, 3U, 8U}) {

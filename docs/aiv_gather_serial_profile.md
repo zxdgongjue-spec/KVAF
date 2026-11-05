@@ -1,7 +1,10 @@
 # Gather 阶段计时与 AIV 内部流水
 
-此入口只测试 `gather_read`。CPU 仍整批 gather 后 ACK；当前版本在 ACK 后加入
-AIV 内部的 WQE/SQ 流水，不加入 CPU chunk 流水或软件在途预算。
+当前版本已接通 [CPU chunk 与 payload READ 流水](aiv_gather_chunk_pipeline.md)，
+默认 128 KiB，Host/kernel 使用 V4 / args 240 B / profile 192 B。
+下文整批 ACK 后 READ 的计时说明和历史 V3 诊断记录，适用于
+`KVAF_AIV_GATHER_CHUNK_BYTES=0` 的 AIV 内部流水基线；chunk 模式的重叠
+阶段口径、构建和对比方法以上述新文档为准。此入口只测试 `gather_read`。
 功能回归仍使用 `tests/python/test_aiv_gather_batch_get.py`；性能采集使用
 `tests/python/test_aiv_gather_batch_get_perf.py`。
 
@@ -300,7 +303,8 @@ build 期间 NIC 已在执行前面发布的 READ；CQ wait 只反映发布结�
 当 `clock_source=unverified` 时，AIV 的 read_us 等时间列留空，read_cycles
 仍在 profile_core_mean 行输出。这表示尚缺换算频率，不表示漏采 READ。
 
-CSV schema_version 为 3，区分异步基线和同步诊断的 timing_contract。
+CSV schema_version 为 4，区分异步基线和同步诊断的 timing_contract；
+新增 chunk 配置、ready 查询和首次 READ 提交字段。
 所有耗时列以 `_us` 命名，不再导出 `_ns` 列；
 Host 的内部 ns 在导出时除以 1000。AIV 保留原始 cycle 供诊断，六阶段、
 构造及 CQ 等待均有对应 `_us` 列；频率未核实时这些列留空，不猜测频率。
@@ -316,8 +320,8 @@ sampling_status 只描述采样阶段，随后 Runtime shutdown 的异常仍单�
 ## 构建与运行
 
 沿用第一阶段的 CANN/Python/CPU 地址环境，在仓库根目录执行。
-当前 gather 使用含可选诊断字段的 V3 ABI，loader 要求
-`KvafGatherBatchGetAivKernelV3`，旧 V1/V2 kernel 会加载失败。
+当前 gather 使用 V4 / args 240 B，loader 要求
+`KvafGatherBatchGetAivKernelV4`，旧 V1/V2/V3 kernel 会加载失败。
 本次必须同步更新 Host/Python 和 gather kernel，不能只重编 kernel。
 scatter 和 direct 的 kernel ABI 不变。
 

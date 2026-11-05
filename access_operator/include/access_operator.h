@@ -89,14 +89,16 @@ struct BatchGetKernelProfile {
   std::uint64_t peak_submitted_not_drained{0};
 };
 
-// Serial gather timeline. Device cycles and Host nanoseconds are different
-// clock domains; only differences within one domain may be compared.
+// Gather timeline; CPU wait and payload READ overlap when chunk mode is active.
+// Device cycles and Host nanoseconds belong to different clock domains.
 struct GatherBatchGetCoreProfile {
   std::uint64_t sequence{}, kernel_start_cycle{}, input_done_cycle{};
   std::uint64_t descriptor_done_cycle{}, notify_done_cycle{}, ack_done_cycle{};
   std::uint64_t read_done_cycle{}, kernel_finish_cycle{}, requests{}, data_wrs{};
   std::uint64_t ack_queries{}, data_wqebbs{}, data_doorbells{};
   std::uint64_t data_cq_wait_cycles{}, read_build_cycles{};
+  std::uint64_t first_ready_cycle{}, first_read_submit_cycle{}, first_read_ready_bytes{};
+  std::uint64_t ready_queries{}, ready_wait_cycles{}, pipeline_chunk_bytes{};
 };
 
 struct GatherBatchGetProfile {

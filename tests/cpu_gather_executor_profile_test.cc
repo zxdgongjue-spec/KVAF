@@ -44,7 +44,23 @@ void Run(kvaf::peer::GatherWaitMode mode, bool profile, bool variable, bool pipe
       std::memset(staging, 0xAD, expected.size());
       const auto threads = executor.PrepareDirect(region_bytes, base, sequence, 512U);
       Check(threads == (count == 1U ? 1U : 4U), "unexpected active thread count");
+      std::thread consumer;
+      if (pipeline) {
+        consumer = std::thread([&] {
+          std::uint64_t previous = 0;
+          do {
+            const auto ready = __atomic_load_n(&header->ready_bytes, __ATOMIC_ACQUIRE);
+            Check(ready >= previous && ready <= expected.size(), "invalid ready prefix");
+            Check(ready == expected.size() || ready % header->pipeline_chunk_bytes == 0,
+                  "ready prefix is not a complete chunk");
+            Check(std::memcmp(staging + previous, expected.data() + previous, ready - previous) == 0,
+                  "ready was published before its payload");
+            previous = ready;
+          } while (previous < expected.size());
+        });
+      }
       executor.Copy();
+      if (consumer.joinable()) consumer.join();
       Check(std::memcmp(staging, expected.data(), expected.size()) == 0,
             "profiling changed gathered payload");
       Check(!pipeline || header->ready_bytes == expected.size(), "pipeline not complete");

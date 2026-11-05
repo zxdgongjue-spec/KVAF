@@ -179,6 +179,42 @@ class GatherPerfSummaryTest(unittest.TestCase):
         for lane in lanes:
             self.assertEqual(sum(lane[name] for name, _, _ in perf.STAGE_BOUNDARIES[:-1]), lane["total"])
 
+    def test_chunk_configuration_matches_host_uint32_contract(self):
+        for value, expected in (("", 131072), ("0", 0), ("64", 64), ("131072", 131072)):
+            with patch.dict(os.environ, {"KVAF_AIV_GATHER_CHUNK_BYTES": value}):
+                perf.validate_config(1)
+                self.assertEqual(perf.configured_chunk_bytes(), expected)
+        for value in ("-64", "+64", "63", "65", "64K", "4294967296", " 64", "６４"):
+            with self.subTest(value=value), patch.dict(os.environ, {"KVAF_AIV_GATHER_CHUNK_BYTES": value}):
+                with self.assertRaisesRegex(ValueError, "CHUNK_BYTES"):
+                    perf.validate_config(1)
+
+    def test_chunk_profile_accepts_ack_after_read_and_exports_overlap(self):
+        sample = snapshot(1, cores=1, requests=1)
+        lane = sample["cores"][0]
+        lane.update(pipeline_chunk_bytes=64, first_ready_cycle=4, first_read_submit_cycle=5,
+                    read_done_cycle=9, ack_done_cycle=10, kernel_finish_cycle=11,
+                    ready_queries=3, ready_wait_cycles=2, first_read_ready_bytes=656)
+        _, lanes = perf.summarize_profiles([sample], 1, 1)
+        self.assertEqual(lanes[0]["wait_cpu"], 7)
+        self.assertEqual(lanes[0]["read"], 4)
+        self.assertEqual(lanes[0]["finalize"], 1)
+        self.assertEqual(lanes[0]["total"], 11)
+        metadata = {**self.csv_metadata(clock=50), "cores": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            paths = perf.export_csv_results(directory, metadata, [], [sample], [100.0])
+            row = self.read_csv(paths[3])[0]
+            self.assertEqual(int(row["first_read_submit_cycle"]), 5)
+            self.assertEqual(int(row["first_read_ready_bytes"]), 656)
+            self.assertEqual(float(row["read_cycles"]), 4)
+            self.assertEqual(float(row["ready_wait_us"]), 2 / 50)
+        for key, value in (("first_ready_cycle", 2), ("first_read_submit_cycle", 10),
+                           ("ack_done_cycle", 12), ("first_read_ready_bytes", 657)):
+            bad = copy.deepcopy(sample)
+            bad["cores"][0][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                perf.summarize_profiles([bad], 1, 1)
+
     def test_profiles_reject_missing_stale_failed_or_wrong_lane_data(self):
         original = snapshot()
         for case in ("missing_core", "duplicate", "wrong_partition", "stale_lane", "error", "time_reversal", "negative_counter", "negative_host"):
@@ -363,7 +399,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         self.assertEqual(metadata["run_directory"], "20261031_093235-cores3-token-bytes656-request-count1")
         self.assertEqual(metadata["started_at_local"], "2026-10-31T09:32:35+08:00")
         self.assertEqual(metadata["timezone"], "Asia/Shanghai")
-        self.assertEqual(metadata["schema_version"], 3)
+        self.assertEqual(metadata["schema_version"], 4)
 
     def test_csv_rejects_partial_or_invalid_profile_batches(self):
         with tempfile.TemporaryDirectory() as directory:

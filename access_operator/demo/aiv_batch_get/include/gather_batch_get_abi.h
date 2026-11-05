@@ -11,6 +11,10 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
   uint64_t notify_done_cycle, ack_done_cycle, read_done_cycle, kernel_finish_cycle;
   uint64_t requests, data_wrs, ack_queries, data_wqebbs, data_doorbells;
   uint64_t data_cq_wait_cycles, read_build_cycles;
+  // CPU progress and data submissions overlap in chunk mode. Event cycles use
+  // the AIV clock; first_read_ready_bytes is the progress snapshot at submission.
+  uint64_t first_ready_cycle, first_read_submit_cycle, first_read_ready_bytes;
+  uint64_t ready_queries, ready_wait_cycles, pipeline_chunk_bytes;
 };
 static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 192);
 
@@ -41,8 +45,12 @@ struct KvafGatherBatchGetArgs {
   // output rows within each sgl_size group; token_bytes * sgl_size <= 65536.
   // Reuses V3's zero-only reserved word: old kernels reject an enabled flag.
   uint32_t coalesce_sges;
+  // Zero: whole-batch ACK before READ. Otherwise consume the CPU ready prefix.
+  // V4 prevents a V3 kernel from silently ignoring the requested pipeline.
+  uint32_t pipeline_chunk_bytes;
+  uint32_t reserved;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 232);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 240);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

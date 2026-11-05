@@ -451,6 +451,12 @@ class NpuPythonRuntime final {
       item["data_doorbells"] = p.data_doorbells;
       item["data_cq_wait_cycles"] = p.data_cq_wait_cycles;
       item["read_build_cycles"] = p.read_build_cycles;
+      item["first_ready_cycle"] = p.first_ready_cycle;
+      item["first_read_submit_cycle"] = p.first_read_submit_cycle;
+      item["first_read_ready_bytes"] = p.first_read_ready_bytes;
+      item["ready_queries"] = p.ready_queries;
+      item["ready_wait_cycles"] = p.ready_wait_cycles;
+      item["pipeline_chunk_bytes"] = p.pipeline_chunk_bytes;
       cores.append(std::move(item));
     }
     py::dict result;

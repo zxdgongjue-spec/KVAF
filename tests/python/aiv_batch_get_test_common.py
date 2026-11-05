@@ -98,7 +98,7 @@ def report_gather_kernel(path: str, module) -> None:
     native = getattr(module, "_native", None)
     print(f"GATHER_KERNEL_FILE path={path} bytes={len(data)} "
           f"name_markers={','.join('V' + str(v) for v in versions) or 'unknown'} "
-          "expected_symbol=KvafGatherBatchGetAivKernelV3", flush=True)
+          "expected_symbol=KvafGatherBatchGetAivKernelV4", flush=True)
     print(f"GATHER_PYTHON_IMPORT executable={sys.executable} "
           f"package={getattr(module, '__file__', 'unknown')} "
           f"native={getattr(native, '__file__', 'unknown')}", flush=True)

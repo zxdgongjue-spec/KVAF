@@ -8,6 +8,7 @@
 #include <acl/acl.h>
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -267,10 +268,18 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.input_done_cycle > p.descriptor_done_cycle) reason = "timestamp_input_descriptor";
     else if (p.descriptor_done_cycle > p.notify_done_cycle) reason = "timestamp_descriptor_notify";
     else if (p.notify_done_cycle > p.ack_done_cycle) reason = "timestamp_notify_ack";
-    else if (p.ack_done_cycle > p.read_done_cycle) reason = "timestamp_ack_read";
+    else if (!p.pipeline_chunk_bytes && p.ack_done_cycle > p.read_done_cycle) reason = "timestamp_ack_read";
+    else if (p.ack_done_cycle > p.kernel_finish_cycle) reason = "timestamp_ack_finish";
+    else if (p.notify_done_cycle > p.read_done_cycle) reason = "timestamp_notify_read";
     else if (p.read_done_cycle > p.kernel_finish_cycle) reason = "timestamp_read_finish";
     else if (p.requests != statuses[i].requests) reason = "requests";
     else if (p.data_wrs != statuses[i].data_wrs) reason = "data_wrs";
+    else if (p.pipeline_chunk_bytes != (p.requests ? args.pipeline_chunk_bytes : 0)) reason = "pipeline_chunk_bytes";
+    else if (p.pipeline_chunk_bytes &&
+        (p.first_ready_cycle < p.notify_done_cycle || p.first_ready_cycle > p.first_read_submit_cycle ||
+         p.first_read_submit_cycle > p.read_done_cycle || !p.first_read_ready_bytes ||
+         p.first_read_ready_bytes > p.requests * config.batch_get_token_bytes))
+      reason = "timestamp_ready_submit_read";
     if (reason) {
       // The stream and normal status already passed. Preserve the actual
       // record in the exception before Shutdown frees it: a generic error here
@@ -295,6 +304,11 @@ Status GatherBatchGet::Impl::CaptureProfile() {
              << " data_doorbells=" << p.data_doorbells
              << " data_cq_wait_cycles=" << p.data_cq_wait_cycles
              << " read_build_cycles=" << p.read_build_cycles
+             << " pipeline_chunk_bytes=" << p.pipeline_chunk_bytes
+             << " first_ready_cycle=" << p.first_ready_cycle
+             << " first_read_submit_cycle=" << p.first_read_submit_cycle
+             << " first_read_ready_bytes=" << p.first_read_ready_bytes
+             << " ready_queries=" << p.ready_queries << " ready_wait_cycles=" << p.ready_wait_cycles
              << " args_bytes=" << sizeof(KvafGatherBatchGetArgs)
              << " record_bytes=" << sizeof(p);
       return Status::Internal(detail.str());
@@ -315,6 +329,12 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     out.data_doorbells = p.data_doorbells;
     out.data_cq_wait_cycles = p.data_cq_wait_cycles;
     out.read_build_cycles = p.read_build_cycles;
+    out.first_ready_cycle = p.first_ready_cycle;
+    out.first_read_submit_cycle = p.first_read_submit_cycle;
+    out.first_read_ready_bytes = p.first_read_ready_bytes;
+    out.ready_queries = p.ready_queries;
+    out.ready_wait_cycles = p.ready_wait_cycles;
+    out.pipeline_chunk_bytes = p.pipeline_chunk_bytes;
     latest_profile.cores.push_back(out);
   }
   return Status::OK();
@@ -338,6 +358,19 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
+  s.args.pipeline_chunk_bytes = kGatherChunkBytes;
+  const char* chunk = std::getenv("KVAF_AIV_GATHER_CHUNK_BYTES");
+  if (chunk && *chunk) {
+    const auto parsed = std::from_chars(chunk, chunk + std::strlen(chunk), s.args.pipeline_chunk_bytes);
+    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
+        (s.args.pipeline_chunk_bytes &&
+         (s.args.pipeline_chunk_bytes < 64 || s.args.pipeline_chunk_bytes % 64)))
+      return Status::InvalidArgument("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64");
+  }
+  // Prefix diagnostics retain their original whole-batch contract. The general
+  // split-token encoder is unchanged in this first chunk-consumer version.
+  if (s.args.probe || uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
+    s.args.pipeline_chunk_bytes = 0;
   const char* coalesce = std::getenv("KVAF_AIV_GATHER_COALESCE_SGES");
   if (coalesce && *coalesce && std::strcmp(coalesce, "0") && std::strcmp(coalesce, "1"))
     return Status::InvalidArgument("KVAF_AIV_GATHER_COALESCE_SGES must be 0 or 1");
