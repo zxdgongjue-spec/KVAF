@@ -24,6 +24,18 @@ std::uint32_t post_calls{};
 std::vector<std::uint32_t> post_queues;
 const kvaf::urma::Sge* later_queue_source{};
 std::uint64_t Address(const void* p) { return reinterpret_cast<std::uint64_t>(p); }
+struct HbmBuffer {
+  void* memory{};
+  std::size_t bytes;
+  explicit HbmBuffer(std::size_t n) : bytes(n) {
+    assert(!posix_memalign(&memory, 64, n));
+    std::memset(memory, 0xad, n);
+  }
+  ~HbmBuffer() { std::free(memory); }
+  std::uint8_t* data() { return static_cast<std::uint8_t*>(memory); }
+  std::size_t size() const { return bytes; }
+  std::uint8_t& operator[](std::size_t i) { return data()[i]; }
+};
 }
 
 extern "C" urma_status_t __wrap_urma_post_jetty_send_wr(
@@ -118,7 +130,9 @@ struct TransportTest {
     assert(!posix_memalign(&memory, 64, t.layout_.staging + 32768));
     t.memory_ = static_cast<std::uint8_t*>(memory);
     std::memset(memory, 0, t.layout_.staging + 32768);
-    std::vector<std::uint8_t> hbm(t.layout_.staging + std::uint64_t(maximum) * token, 0xad);
+    // Request/Ready have alignas(64); a byte vector does not guarantee their
+    // alignment, even though real registered HBM is cache-line aligned.
+    HbmBuffer hbm(t.layout_.staging + std::uint64_t(maximum) * token);
     std::vector<std::uint8_t> source(std::uint64_t(maximum) * token);
     for (std::size_t i = 0; i < source.size(); ++i) source[i] = (i * 13 + i / token) % 251;
     t.hbm_base_ = Address(hbm.data()); done_address = t.hbm_base_ + t.layout_.done;
@@ -132,37 +146,23 @@ struct TransportTest {
       ++sequence;
       auto* r = reinterpret_cast<Request*>(hbm.data());
       *r = {};
-      r->sequence = sequence; r->count = count; r->token_bytes = token; r->workers = 4;
+      r->magic = kMagic; r->sequence = sequence; r->count = count; r->token_bytes = token; r->workers = 4;
       r->reserved = (whole ? kBatchDoneOnly : 0) | (profile ? kInlineProfile : 0);
       reinterpret_cast<Word*>(hbm.data() + 64)->value = sequence | (profile ? kProfileNotify : 0);
       auto* addresses = reinterpret_cast<std::uint64_t*>(hbm.data() + t.layout_.descriptor);
       for (std::uint32_t i = 0; i < count; ++i)
         addresses[i] = Address(source.data() + std::uint64_t((count - i + sequence) % count) * token);
+      // Model AIV's ordered mailbox publication, disjoint from CPU-owned
+      // Ready/done/marker source words. Every call refreshes the entire prefix.
+      posted.clear(); post_calls = 0;
+      std::memcpy(t.memory_, r, sizeof(*r));
+      std::memcpy(t.memory_ + t.layout_.descriptor, addresses, count * 8);
+      __atomic_store_n(reinterpret_cast<std::uint64_t*>(t.memory_ + 64),
+                      sequence | (profile ? kProfileNotify : 0), __ATOMIC_RELEASE);
       std::uint64_t observed{};
       assert(t.ReadRequest(&observed).ok() && observed == sequence);
-      posted.clear();
-      post_calls = 0;
-      const auto prefetched = t.descriptor_prefetch_count_;
       assert(t.ReadDescriptor(sequence).ok());
-      std::size_t reads = 0, submissions = 0;
-      const auto check_read = [&](std::uint64_t bytes) {
-        while (bytes) {
-          const auto chunks = std::min<std::uint64_t>(
-              (bytes + message_bytes - 1) / message_bytes, 8192);
-          for (std::uint64_t i = 0; i < chunks; ++i) {
-            const auto& wr = posted.at(reads++);
-            assert(wr.opcode == URMA_OPC_READ);
-            assert(wr.comp_order == 1);
-            assert(wr.signaled == (i + 1 == chunks));
-            assert(wr.order == (i + 1 == chunks ? URMA_STRONG_ORDER : URMA_RELAX_ORDER));
-            bytes -= wr.bytes;
-          }
-          submissions += (chunks + 31) / 32;
-        }
-      };
-      check_read(t.layout_.descriptor + std::uint64_t(prefetched) * 8);
-      if (count > prefetched) check_read(std::uint64_t(count - prefetched) * 8);
-      assert(posted.size() == reads && post_calls == submissions);
+      assert(posted.empty() && !post_calls); // Local mailbox: no control READs.
       assert(!std::memcmp(t.memory_ + t.layout_.descriptor, addresses, count * 8));
       posted.clear();
       post_calls = 0;
@@ -200,7 +200,7 @@ struct TransportTest {
         std::uint32_t expected_posts = 0;
         for (const auto& plan : t.prepared_)
           for (const auto& q : plan->queues) {
-            expected_posts += (q.wrs.size() + post_batch - 1) / post_batch;
+            expected_posts += q.posts.size();
             if (!q.local.empty() && std::uint64_t{max_sge} * token <= t.max_bytes_) {
               assert(q.first_row != UINT32_MAX && q.sources.empty());
               const auto* addresses = reinterpret_cast<const std::uint64_t*>(t.memory_ + t.layout_.descriptor);
@@ -228,6 +228,19 @@ struct TransportTest {
         assert(data == 64 && tails == 4 && post_calls == 4);
         assert(markers == (whole ? 0 : 16));
       }
+      if (!whole && count == 8192 && max_sge == 16 && token == 656 && post_batch == 128) {
+        assert(data == 512 && markers == 32 && tails == 4 && post_calls == 4);
+        assert((post_queues == std::vector<std::uint32_t>{0, 1, 2, 3}));
+      }
+      for (const auto& plan : t.prepared_) for (const auto& q : plan->queues)
+        for (const auto& post : q.posts) {
+          std::uint32_t payloads = 0, sges = post.first_sge;
+          for (auto* wr = &q.wrs[post.wr]; wr; wr = wr->next) {
+            payloads += wr->rw.dst.sge[0].addr >= t.hbm_base_ + t.layout_.staging;
+            sges += wr->rw.src.num_sge;
+          }
+          assert(payloads <= post_batch && sges == post.end_sge);
+        }
       // The suffix outside the active prefix is never written.
       for (auto i = t.layout_.staging + std::uint64_t(count) * token; i < hbm.size(); ++i)
         assert(hbm[i] == 0xad);
@@ -283,13 +296,7 @@ struct TransportTest {
     }
     // A bad CQ fails the batch and must never publish successful done.
     posted.clear(); fail_cq = true;
-    if (message_bytes == 64) {
-      assert(!t.ReadControl(0, t.layout_.descriptor + std::uint64_t(maximum) * 8).ok());
-      const auto calls = post_calls;
-      assert(!t.ReadControl(0, sizeof(Request)).ok() && post_calls == calls);
-    } else {
-      assert(!t.WriteBatch().ok());
-    }
+    assert(!t.WriteBatch().ok());
     for (const auto& wr : posted) assert(wr.destination != done_address);
     fail_cq = false;
     for (auto& q : pending) q.clear();
@@ -305,15 +312,17 @@ struct TransportTest {
 
 int main() {
   for (auto token : {13U, 656U, 4096U, 65535U}) kvaf::cpu_push::TransportTest::Run(token);
-  // Cross SQ-credit/wave and segmented control-READ boundaries.
+  // Cross SQ-credit/wave boundaries and small negotiated message limits.
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests);
-  // More READs than one post chain, and more than one SQ-sized control flight.
+  // Payload fragmentation, multi-post chains and multiple SQ-sized waves.
   kvaf::cpu_push::TransportTest::Run(13, 1024, 16, 128, 64);
   kvaf::cpu_push::TransportTest::Run(13, kvaf::cpu_push::kMaxRequests, 16, 128, 64);
+  // 128 payload WR + 8 Ready per queue must stay one post at budget 128.
+  kvaf::cpu_push::TransportTest::Run(656, 8192, 16, 128);
   // Deployed SGE limit, interleaved multi-doorbell queues and reused plans with
   // changing source addresses. All runtime submission sizes preserve ordering.
   for (auto batch : {32U, 128U, 256U})
     for (auto token : {656U, 1024U})
       kvaf::cpu_push::TransportTest::Run(token, 8192, 13, batch);
-  std::cout << "PASS: CPU push coalesced reads, done-only writes and completion ordering\n";
+  std::cout << "PASS: CPU push mailbox, payload-budget posts and completion ordering\n";
 }

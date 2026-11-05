@@ -36,6 +36,16 @@ KVAF_SCATTER_OPTIONS_INLINE constexpr uint32_t ScatterWithProfiling(uint32_t val
 }
 }  // namespace kvaf
 
+// Persistent private workspace state, referenced through the existing request
+// entity/queue pointers. The public 176-byte launch ABI is unchanged.
+struct alignas(64) KvafScatterMailboxContext {
+  KvafBatchGetDirectUrmaEntity entity;
+  KvafBatchGetQueueState queue;
+  uint32_t max_write_bytes;
+  uint32_t reserved[15];
+};
+static_assert(sizeof(KvafScatterMailboxContext) == 320);
+
 struct KvafScatterBatchGetArgs {
   KvafExecuteBatchGetKernelArgs request;
   uint64_t workspace, workspace_bytes, descriptor_offset, staging_offset;

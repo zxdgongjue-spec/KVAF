@@ -20,7 +20,7 @@ Status Transport::BenchmarkWrite(std::uint8_t* memory, std::uint64_t base,
   if (!tracker_.Empty()) return Status::Busy("WRITE benchmark has outstanding DMA");
   for (std::uint32_t index = 0; index < kJettyCount; ++index) {
     const auto& q = queues_[index];
-    if (q.poisoned || q.pending || (index < o.queues &&
+    if (q.poisoned || (index < o.queues &&
         (!q.channel.local_jetty || !q.channel.local_jfc)))
       return Status::InvalidState("WRITE benchmark queue is not initialized and idle");
   }

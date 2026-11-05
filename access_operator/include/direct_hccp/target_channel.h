@@ -19,7 +19,7 @@ class TargetChannel {
 
   Status Initialize(void* token_id_handle, std::uint32_t token_value,
                     std::uint32_t sq_depth, std::uint32_t rq_depth,
-                    std::uint32_t cq_depth) {
+                    std::uint32_t cq_depth, bool device_initiator = false) {
     if (cq_handle_ != nullptr || jetty_handle_ != nullptr) {
       return Status::InvalidState("NPU target channel already initialized");
     }
@@ -32,11 +32,17 @@ class TargetChannel {
     cq_info_ = {};
     jetty_info_ = {};
     cq_info_.in.depth = cq_depth;
-    cq_info_.in.ub.mode = direct_hccp::kJfcNormal;
+    cq_info_.in.ub.mode = device_initiator ? direct_hccp::kJfcUserCtlNormal : direct_hccp::kJfcNormal;
     const int cq_rc = api_.cq_create(context_, &cq_info_, &cq_handle_);
     if (cq_rc != 0 || cq_handle_ == nullptr) {
       return Status::Internal("NPU target CQ creation failed (rc=" +
                               std::to_string(cq_rc) + ")");
+    }
+    if (device_initiator) {
+      if (!direct_hccp::CreateDeviceAivJetty(api_, context_, cq_handle_, token_id_handle,
+          token_value, sq_depth, "scatter_mailbox", &jetty_info_, &jetty_handle_))
+        return Status::Internal("NPU scatter mailbox Jetty creation failed");
+      return Status::OK();
     }
     direct_hccp::QpCreateAttr attr{};
     attr.scq_handle = cq_handle_;
@@ -69,13 +75,14 @@ class TargetChannel {
   void** peer_jetty_output() { return &peer_jetty_; }
 
   Status Shutdown() {
-    if (peer_jetty_ != nullptr && api_.qp_unimport != nullptr) {
-      if (api_.qp_unimport(context_, peer_jetty_)) return Status::Internal("unimport CPU target Jetty failed");
-      peer_jetty_ = nullptr;
-    }
+    // Stop local DMA before releasing any imported target it may reference.
     if (jetty_handle_ != nullptr && api_.qp_destroy != nullptr) {
       if (api_.qp_destroy(jetty_handle_)) return Status::Internal("destroy NPU target Jetty failed");
       jetty_handle_ = nullptr;
+    }
+    if (peer_jetty_ != nullptr && api_.qp_unimport != nullptr) {
+      if (api_.qp_unimport(context_, peer_jetty_)) return Status::Internal("unimport CPU target Jetty failed");
+      peer_jetty_ = nullptr;
     }
     if (cq_handle_ != nullptr && api_.cq_destroy != nullptr) {
       if (api_.cq_destroy(context_, cq_handle_)) return Status::Internal("destroy NPU target CQ failed");

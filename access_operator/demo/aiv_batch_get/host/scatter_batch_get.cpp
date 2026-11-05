@@ -61,6 +61,8 @@ struct ScatterBatchGet::Impl {
   void* context{};
   void* token{};
   void* memory_handle{};
+  void* mailbox_import{};
+  uint64_t mailbox_context{};
   std::array<std::unique_ptr<d::TargetChannel>, 4> channels;
   aclrtStream pending{};
   uint64_t sequence{};
@@ -113,9 +115,10 @@ struct ScatterBatchGet::Impl {
     if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout))
       return Status::InvalidArgument("invalid scatter workspace shape");
     args.descriptor_offset = layout.descriptor; args.staging_offset = layout.staging;
-    // Private AIV build-ready lines plus the shared failure line. CPU layout
-    // and the request/notify/done protocol remain unchanged.
-    args.workspace_bytes = layout.bytes + uint64_t(config.npu_core_count + 1) * 64;
+    // Queue context precedes the private build-ready/failure lines. Shared
+    // request/descriptor/staging offsets and the launch ABI remain unchanged.
+    args.workspace_bytes = layout.bytes + sizeof(KvafScatterMailboxContext) +
+                           uint64_t(config.npu_core_count + 1) * 64;
     // Prefer huge pages for the persistent CPU WRITE target and scatter staging;
     // ACL may fall back to normal pages when huge pages are unavailable.
     if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
@@ -155,7 +158,8 @@ struct ScatterBatchGet::Impl {
     open.npu_tp = npu_tp;
     for (uint32_t q = 0; q < 4; ++q) {
       channels[q] = std::make_unique<d::TargetChannel>(api, context);
-      auto result = channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384);
+      // Queue 0 is bidirectional: CPU payload target and AIV mailbox initiator.
+      auto result = channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384, q == 0);
       if (!result.ok()) return result;
       const auto& key = channels[q]->jetty_info().key;
       open.channels[q].bytes = key.size;
@@ -165,12 +169,49 @@ struct ScatterBatchGet::Impl {
     push_open = true;  // A lost response can still leave a live remote session.
     auto result = config.peer_link->OpenCpuPushGet(region.base, open, &response);
     if (!result.ok()) return result;
+    if (response.mailbox_segment_bytes != kSegmentBytes || !response.mailbox_base ||
+        response.mailbox_bytes < layout.staging || !(response.mailbox_token_id >> 8) ||
+        response.max_write_bytes < 64 || response.max_write_bytes > 65536)
+      return Error("invalid CPU mailbox setup (rebuild CPU service and NPU runtime together)");
+    d::MrImportInfo imported{};
+    imported.in.key.size = kSegmentBytes;
+    std::memcpy(imported.in.key.value, response.mailbox_segment, kSegmentBytes);
+    imported.in.ub.flags = ((1U << 1U) | (1U << 2U)) << 1U; // READ/WRITE, no mapping/cache.
+    imported.in.ub.token_value = peer.token_value;
+    if (api.rmem_import(context, &imported, &mailbox_import) || !mailbox_import)
+      return Error("import CPU request mailbox");
+    KvafScatterMailboxContext mailbox{};
+    mailbox.max_write_bytes = response.max_write_bytes;
+    auto& e = mailbox.entity;
+    e.magic = 0x4b564155U; e.version = 1;
+    e.remote_host_ddr_address = response.mailbox_base;
+    e.remote_host_ddr_size = response.mailbox_bytes;
+    e.remote_token_id = response.mailbox_token_id >> 8;
+    e.remote_token_value = peer.token_value;
+    e.local_hbm_address = Ptr(workspace); e.local_hbm_size = args.workspace_bytes;
+    e.local_token_id = id.token_id; e.local_token_value = peer.token_value;
     for (uint32_t q = 0; q < 4; ++q) {
       d::QpImportInfoT info{};
       if (!d::ImportPeerJetty(api, context, response.channels[q].key, response.channels[q].bytes,
           peer.token_value, open.npu_tp, response.cpu_tp, open.npu_psn, response.cpu_psn,
           "aiv_scatter", &info, channels[q]->peer_jetty_output())) return Error("import CPU Jetty");
+      if (!q) e.tp_id = info.out.ub.tpn;
     }
+    const auto& sq = channels[0]->jetty_info().ub;
+    const auto& cq = channels[0]->cq_info().out;
+    e.sq_va = sq.sq_buffer_va; e.sq_db_va = sq.db_addr; e.jetty_id = sq.id;
+    e.sq_depth = 1024 * 4; e.wqe_size = 64;
+    e.cq_va = cq.buffer_addr; e.cq_db_va = cq.swdb_addr; e.jfc_id = cq.id;
+    e.cq_depth = 16384; e.cqe_size = cq.cqe_size;
+    // Same EID encoding as the validated device-initiated BatchPut path.
+    for (uint32_t i = 0; i < sizeof(e.remote_eid); ++i)
+      e.remote_eid[i] = peer.eid[sizeof(e.remote_eid) - 1 - i];
+    if (!e.sq_va || !e.sq_db_va || !e.cq_va || !e.cq_db_va || !e.tp_id ||
+        !e.local_token_id || e.cqe_size < 32) return Error("invalid mailbox queue ABI");
+    mailbox_context = Ptr(workspace) + layout.bytes;
+    if (aclrtMemcpy(reinterpret_cast<void*>(mailbox_context), sizeof(mailbox), &mailbox,
+                    sizeof(mailbox), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+      return Error("initialize AIV mailbox context");
     return config.peer_link->StartCpuPushGet(region.base);
   }
 
@@ -178,12 +219,20 @@ struct ScatterBatchGet::Impl {
     // A normal close must let the CPU finish serving the pending request first.
     // On execution errors, keep closing the transports before releasing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
+    const bool execution_failed = failed || !execution_status.ok();
     failed = true;  // A partially closed transport cannot accept another Execute.
     if (pending) {
       const aclError synchronized = aclrtSynchronizeStream(pending);
       if (synchronized != ACL_SUCCESS) return AclFailure("shutdown_synchronize", synchronized);
     }
     pending = nullptr;
+    // A timed-out control WRITE can still reference the CPU mailbox. Retire
+    // its local SQ before StopCpuPushGet unregisters/frees that remote memory.
+    if (execution_failed && channels[0]) {
+      auto result = channels[0]->Shutdown();
+      if (!result.ok()) return result;
+      channels[0].reset();
+    }
     if (push_open) {
       auto result = config.peer_link->StopCpuPushGet(region.base);
       if (!result.ok()) return result;
@@ -193,6 +242,10 @@ struct ScatterBatchGet::Impl {
       auto result = channel->Shutdown();
       if (!result.ok()) return result;
       channel.reset();
+    }
+    if (mailbox_import) {
+      if (api.rmem_unimport(context, mailbox_import)) return Error("unimport CPU mailbox");
+      mailbox_import = nullptr;
     }
     if (memory_handle) {
       if (api.lmem_unregister(context, memory_handle)) return Error("unregister scatter HBM");
@@ -208,7 +261,7 @@ struct ScatterBatchGet::Impl {
     }
     if (status_host && aclrtFreeHost(status_host) != ACL_SUCCESS) return Error("free status memory");
     status_host = nullptr;
-    initialized = failed = profile_ready = false; sequence = 0; args = {};
+    initialized = failed = profile_ready = false; sequence = mailbox_context = 0; args = {};
     return execution_status;
   }
 };
@@ -295,7 +348,9 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   input_timer.Stop();
   if (!result.ok()) return result;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
-  args.request.core_status = Ptr(s.status_device); args.request.queue_state = 0;
+  args.request.core_status = Ptr(s.status_device);
+  args.request.channel_entity = s.mailbox_context;
+  args.request.queue_state = s.mailbox_context + offsetof(KvafScatterMailboxContext, queue);
   args.sequence = ++s.sequence;
   s.profile_ready = false;
   s.pending = static_cast<aclrtStream>(exec.execution.stream);

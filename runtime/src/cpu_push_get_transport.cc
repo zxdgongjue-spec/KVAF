@@ -120,14 +120,22 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   cfg.len = bytes;
   cfg.token_id = control_token_;
   cfg.token_value.token = setup.token_value;
-  // This pinned buffer receives local READ results and supplies local WRITE
-  // payloads. Use the probe's direct-host registration, not remote DDR flags.
+  // AIV pushes header/list here before publishing notify. The same pinned
+  // registration supplies immutable local Ready/done WRITE source words.
   cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-  cfg.flag.bs.access = 1U;  // LOCAL_WRITE in the deployed public UMDK ABI.
+  // Public UMDK bit 0 is LOCAL_ONLY (exclusive), not a combinable local
+  // write flag. Remote WRITE registration also requires remote READ.
+  cfg.flag.bs.access = (1U << 1U) | (1U << 2U);
   cfg.flag.bs.non_pin = 0;
   cfg.flag.bs.token_id_valid = 1;
   control_ = urma_register_seg(context_, &cfg);
   if (!control_) return Error("register control buffer");
+  response->mailbox_base = control_->seg.ubva.va;
+  response->mailbox_bytes = control_->seg.len;
+  response->mailbox_token_id = control_token_->token_id;
+  response->mailbox_segment_bytes = sizeof(urma_seg_t);
+  response->max_write_bytes = max_bytes_;
+  std::memcpy(response->mailbox_segment, &control_->seg, sizeof(urma_seg_t));
   std::uint64_t cpu_tp = 0;
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
   response->cpu_tp = cpu_tp;
@@ -140,10 +148,6 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
         {16384, kJettyDepth, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
     if (error) return Error(error);
-    // Control READs use one SGE. Data and done use reusable prepared chains.
-    queue.local.reserve(1);
-    queue.remote.reserve(1);
-    queue.wrs.reserve(1);
     c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
@@ -179,131 +183,25 @@ void Transport::PrepareCompletions() {
   SealPrepared(profiled_done_);
 }
 
-void Transport::ResetRequests(Queue& q) { q.local.clear(); q.remote.clear(); q.wrs.clear(); }
-void Transport::AddControlRead(Queue& q, std::uint64_t remote, std::uint32_t bytes) {
-  q.remote.push_back({remote, bytes, remote_, nullptr});
-  urma_jfs_wr_t wr{};
-  wr.opcode = URMA_OPC_READ;
-  wr.flag.bs.comp_order = 1;
-  wr.flag.bs.place_order = URMA_RELAX_ORDER;
-  wr.tjetty = q.channel.remote_jetty;
-  wr.user_ctx = ++q.sequence;
-  wr.rw.src = {reinterpret_cast<urma_sge_t*>(&q.remote.back()), 1};
-  wr.rw.dst = {reinterpret_cast<urma_sge_t*>(&q.local.back()), 1};
-  q.wrs.push_back(wr);
-}
-Status Transport::Post(Queue& q) {
-  if (q.poisoned || q.pending || q.wrs.empty()) return Error("queue unavailable");
-  auto& tail = q.wrs.back();
-  tail.flag.bs.complete_enable = 1;
-  tail.flag.bs.place_order = URMA_STRONG_ORDER;
-  q.pending = tail.user_ctx;
-  for (std::size_t first = 0; first < q.wrs.size(); first += 32) {
-    const auto end = std::min(first + 32, q.wrs.size());
-    for (auto i = first; i < end; ++i) q.wrs[i].next = i + 1 < end ? &q.wrs[i + 1] : nullptr;
-    urma_jfs_wr_t* bad = nullptr;
-    if (urma_post_jetty_send_wr(q.channel.local_jetty, &q.wrs[first], &bad)) {
-      q.poisoned = true;
-      return Error("post control READ");
-    }
-  }
-  return Status::OK();
-}
-Status Transport::Wait(Queue& q) {
-  const auto wait_begin = std::chrono::steady_clock::now();
-  const auto deadline = wait_begin + std::chrono::milliseconds(kTimeoutMs);
-  std::uint32_t polls = 0;
-  while (q.pending) {
-    urma_cr_t crs[8]{};
-    const auto count = urma_poll_jfc(q.channel.local_jfc, 8, crs);
-    if (count < 0) { q.poisoned = true; return Error("poll CQ"); }
-    for (int i = 0; i < count; ++i) {
-      if (crs[i].status != URMA_CR_SUCCESS || crs[i].user_ctx != q.pending) {
-        q.poisoned = true;
-        std::ostringstream out;
-        out << "CPU push: control CQ "
-            << (crs[i].status != URMA_CR_SUCCESS ? "failed" : "context mismatch")
-            << CqDetails(&q - queues_.data(), crs[i], q.channel)
-            << " expected_ctx=0x" << std::hex << q.pending
-            << " local_addr=0x" << q.local.front().addr
-            << " remote_addr=0x" << q.remote.front().addr << std::dec
-            << " bytes=" << q.remote.front().len
-            << " wr_opcode=" << static_cast<unsigned>(q.wrs.back().opcode)
-            << " wr_flags=0x" << std::hex << q.wrs.back().flag.value << std::dec
-            << " notify_offset=" << layout_.notify
-            << " wait_us=" << std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - wait_begin).count();
-        return Status::Internal(out.str());
-      }
-      q.pending = 0;
-    }
-    if ((++polls & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
-      q.poisoned = true; return Error("CQ timeout; resources retained");
-    }
-  }
-  return Status::OK();
-}
-
-Status Transport::ReadControl(std::uint64_t offset, std::uint64_t bytes) {
-  auto& q = queues_[0];
-  if (q.poisoned || q.pending || offset > layout_.staging || bytes > layout_.staging - offset)
-    return Error("invalid control transfer");
-  while (bytes) {
-    ResetRequests(q);
-    const auto chunks = static_cast<std::size_t>(std::min<std::uint64_t>(
-        (bytes + max_bytes_ - 1) / max_bytes_, kJettyDepth));
-    // Reserve before taking SGE pointers. A coalesced header/descriptor can
-    // exceed one message; submit its READs together and wait only for the
-    // strongly ordered tail, rather than paying one round trip per message.
-    q.local.reserve(chunks); q.remote.reserve(chunks); q.wrs.reserve(chunks);
-    for (std::size_t i = 0; i < chunks; ++i) {
-      const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, max_bytes_));
-      q.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset), length, control_, nullptr});
-      AddControlRead(q, hbm_base_ + offset, length);
-      offset += length;
-      bytes -= length;
-    }
-    auto result = Post(q);
-    if (result.ok()) result = Wait(q);
-    if (!result.ok()) return result;
-  }
-  return Status::OK();
-}
 Status Transport::ReadRequest(std::uint64_t* sequence) {
-  auto result = ReadControl(layout_.notify, sizeof(Word));
-  if (result.ok()) {
-    const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
-    *sequence = notify & ~kProfileNotify;
-    profile_.enabled = (notify & kProfileNotify) != 0;
-  }
-  return result;
+  // Strongly ordered remote WRITE publishes notify only after the request and
+  // descriptor list. Acquire also prevents compiler/CPU reordering of local
+  // mailbox loads; no URMA READ or CQ round trip is needed while idle.
+  const auto notify = __atomic_load_n(
+      reinterpret_cast<const std::uint64_t*>(memory_ + layout_.notify), __ATOMIC_ACQUIRE);
+  *sequence = notify & ~kProfileNotify;
+  profile_.enabled = (notify & kProfileNotify) != 0;
+  return Status::OK();
 }
 Status Transport::ReadDescriptor(std::uint64_t sequence) {
-  if (profile_.enabled) {
-    profile_ = {};
-    profile_.enabled = true;
-  }
-  Status result;
-  {
-    BatchGetProfileScope timer(profile_.enabled ? &profile_.header_read_ns : nullptr);
-    // Read header and the last observed descriptor prefix together. Notify is
-    // published only after all builders finish. A larger count needs one tail
-    // READ; shrink/same-count calls need no second round trip. Never use a
-    // cached descriptor: refresh the prefix even when its length is unchanged.
-    result = ReadControl(layout_.request,
-        layout_.descriptor + std::uint64_t{descriptor_prefetch_count_} * 8);
-  }
-  if (!result.ok()) return result;
+  const bool enabled = profile_.enabled;
+  profile_ = {};
+  profile_.enabled = enabled;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
-  const auto prefetched = descriptor_prefetch_count_;
-  descriptor_prefetch_count_ = r.count;
-  if (r.count <= prefetched) return Status::OK();
-  BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  return ReadControl(layout_.descriptor + std::uint64_t{prefetched} * 8,
-                  std::uint64_t{r.count - prefetched} * 8);
+  return Status::OK();
 }
 
 // Each prepared chain signals only its queue's strongly ordered tail.
@@ -323,14 +221,24 @@ void Transport::SealPrepared(PreparedWrite& plan) {
   for (std::uint32_t index = 0; index < kJettyCount; ++index) {
     auto& q = plan.queues[index];
     if (q.wrs.empty()) continue;
-    std::size_t local = 0;
+    std::uint32_t local = 0, payloads = 0;
     for (std::size_t i = 0; i < q.wrs.size(); ++i) {
       auto& wr = q.wrs[i];
+      const bool payload = q.remote[i].addr >= hbm_base_ + layout_.staging;
+      // Budget payload WRs. Their strongly ordered Ready WR belongs to the
+      // same submission; it must not force an extra doorbell at the boundary.
+      if (!i || (payload && payloads == post_batch_wrs_)) {
+        if (i) { q.wrs[i - 1].next = nullptr; q.posts.back().end_sge = local; }
+        q.posts.push_back({static_cast<std::uint32_t>(i), local, 0});
+        payloads = 0;
+      }
+      payloads += payload;
       wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(q.local.data() + local);
       wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(q.remote.data() + i);
       local += wr.rw.src.num_sge;
-      wr.next = i + 1 < q.wrs.size() && (i + 1) % post_batch_wrs_ ? &q.wrs[i + 1] : nullptr;
+      wr.next = i + 1 < q.wrs.size() ? &q.wrs[i + 1] : nullptr;
     }
+    q.posts.back().end_sge = local;
     q.wrs.back().flag.bs.complete_enable = 1;
     q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
     plan.fences[plan.fence_count++] = {index, q.wrs.size(), 0};
@@ -386,7 +294,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
             (worker * kMaxChunks + chunk) * kJettyCount + queue;
-        q.markers.push_back({marker, chunk + 1});
+        q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
@@ -411,28 +319,36 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   prepared_batch_done_only_ = batch_done_only;
   return Status::OK();
 }
-void Transport::RefreshPrepared(PreparedQueue& q) {
+void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& post) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   if (q.first_row != UINT32_MAX) {
     // No per-SGE mapping walk or dependent vector indexing for ordinary small
     // tokens. Refresh on every call: plans are reusable, source addresses are not.
     const auto* input = addresses + q.first_row;
     auto* output = q.local.data();
-    for (std::size_t i = 0; i < q.local.size(); ++i) output[i].addr = input[i];
+    for (auto i = post.first_sge; i < post.end_sge; ++i) output[i].addr = input[i];
   } else if (!q.source_runs.empty()) {
-    for (const auto& run : q.source_runs) {
-      const auto* input = addresses + run.row;
-      auto* output = q.local.data() + run.local;
-      for (std::uint32_t i = 0; i < run.count; ++i) output[i].addr = input[i];
+    auto it = std::lower_bound(q.source_runs.begin(), q.source_runs.end(), post.first_sge,
+        [](const PreparedQueue::SourceRun& r, std::uint32_t i) { return r.local + r.count <= i; });
+    for (; it != q.source_runs.end() && it->local < post.end_sge; ++it) {
+      const auto first = std::max(it->local, post.first_sge);
+      const auto end = std::min(it->local + it->count, post.end_sge);
+      for (auto i = first; i < end; ++i) q.local[i].addr = addresses[it->row + i - it->local];
     }
   } else {
-    for (const auto& source : q.sources) q.local[source.local].addr = addresses[source.row] + source.offset;
+    auto it = std::lower_bound(q.sources.begin(), q.sources.end(), post.first_sge,
+        [](const PreparedQueue::Source& s, std::uint32_t i) { return s.local < i; });
+    for (; it != q.sources.end() && it->local < post.end_sge; ++it)
+      q.local[it->local].addr = addresses[it->row] + it->offset;
   }
-  for (const auto& marker : q.markers) *marker.value = Progress(request().sequence, marker.progress);
+  auto marker = std::lower_bound(q.markers.begin(), q.markers.end(), post.first_sge,
+      [](const PreparedQueue::Marker& m, std::uint32_t i) { return m.local < i; });
+  for (; marker != q.markers.end() && marker->local < post.end_sge; ++marker)
+    *marker->value = Progress(request().sequence, marker->progress);
 }
 Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   for (const auto& q : queues_)
-    if (q.poisoned || q.pending) return Error("queue unavailable");
+    if (q.poisoned) return Error("queue unavailable");
   bool submitted = false;
   auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
   if (!status.ok()) return status;
@@ -446,20 +362,21 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
 Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources,
                                std::uint64_t* first_post_ns) {
   std::size_t largest = 0;
-  for (const auto& q : plan.queues) largest = std::max(largest, q.wrs.size());
+  for (const auto& q : plan.queues) largest = std::max(largest, q.posts.size());
   // Start all four Jettys before posting the next slice of any queue. A long
   // queue must not delay the first doorbell to the remaining three Jettys.
-  for (std::size_t first = 0; first < largest; first += post_batch_wrs_) {
+  for (std::size_t batch = 0; batch < largest; ++batch) {
     for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-      if (first >= plan.queues[q].wrs.size()) continue;
-      // Once a queue is refreshed, its SGL remains immutable until its CQE.
-      // Start its DMA while the CPU refreshes the following queues; do not
-      // delay the first WRITE until all four address lists have been walked.
-      if (refresh_sources && !first) RefreshPrepared(plan.queues[q]);
+      auto& queue = plan.queues[q];
+      if (batch >= queue.posts.size()) continue;
+      const auto& post = queue.posts[batch];
+      // Refresh only this submission. Posted SGEs/marker words stay immutable
+      // until CQ completion, while other queues/batches can be prepared.
+      if (refresh_sources) RefreshPrepared(queue, post);
       urma_jfs_wr_t* bad = nullptr;
       if (first_post_ns && !*first_post_ns) *first_post_ns = BatchGetProfileNowNs();
       if (urma_post_jetty_send_wr(queues_[q].channel.local_jetty,
-                                &plan.queues[q].wrs[first], &bad)) {
+                                &queue.wrs[post.wr], &bad)) {
         queues_[q].poisoned = true;
         return Error("post prepared WRITE chain");
       }
@@ -526,7 +443,7 @@ Status Transport::WriteBatch() {
       for (const auto& q : plan.queues) {
         profile_.ready_wrs += q.markers.size();
         profile_.data_wrs += q.wrs.size() - q.markers.size();
-        profile_.post_calls += (q.wrs.size() + post_batch_wrs_ - 1) / post_batch_wrs_;
+        profile_.post_calls += q.posts.size();
       }
     }
     std::uint64_t first_post = 0;
@@ -600,7 +517,6 @@ Status Transport::Shutdown() {
       if (urma_delete_jetty(c.local_jetty)) return Error("delete Jetty; DMA resources retained");
       c.local_jetty = nullptr;
     }
-    q.pending = 0;
     if (c.remote_jetty) {
       if (urma_unimport_jetty(c.remote_jetty)) return Error("unimport Jetty");
       c.remote_jetty = nullptr;
@@ -622,11 +538,10 @@ Status Transport::Shutdown() {
   done_ = {};
   profiled_done_ = {};
   prepared_count_ = UINT32_MAX;
-  descriptor_prefetch_count_ = 0;
   prepared_batch_done_only_ = false;
   post_batch_wrs_ = 128;
   next_poll_queue_ = 0;
-  for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
+  for (auto& q : queues_) q.poisoned = false;
   std::free(memory_); memory_ = nullptr;
   context_ = nullptr;
   return Status::OK();

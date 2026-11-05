@@ -39,7 +39,8 @@ JSON 记录 stage 上限、UB 大小和复用事件方向，CSV 及计时口径�
 
 ## 构建与运行
 
-Host 和 AIV kernel 必须一起重编；混合 SIMD/SIMT kernel 的 loader 始终申请 65536 B 动态 UB，
+CPU 服务、NPU Host 和 AIV kernel 必须一起重编并重启服务（PeerLink 协议升级为 V7，
+OpenCpuPushGet 响应增加 CPU mailbox segment/token）；混合 SIMD/SIMT kernel 的 loader 始终申请 65536 B 动态 UB，
 kernel 类型必须为 AIV。接口参数仍为 176 B，生产输入沿用 trusted-input 契约。
 CPU 源内存默认保留 THP 分配；NPU workspace 保留 `ACL_MEM_MALLOC_HUGE_FIRST`，
 大页不足时可回退普通页。显式 HugeTLB 模式、CPU tail-only completion-order 试验、
@@ -177,8 +178,29 @@ Ready 表示某个 shard 已可读，不代表整次请求成功。
 
 CPU payload 恢复全 WR `comp_order=1`；每条链保留强序尾 WR 和真实尾 CQE，
 ready/done 的必要强序保证继续保留。不得删除最终完成等待或提前发布成功。
-CPU 控制 READ 合并 header/descriptor，WR/SGL 计划复用，每次刷新真实源地址，
-四队列分批交错提交与逐队列刷新/提交重叠继续保留。
+CPU 的 WR/SGL 计划复用，每次刷新真实源地址。四队列按提交批次交错启动，
+仅刷新当前批次的 SGE/Ready 源字，已经提交的部分保持不变直到 CQ 完成。
+`KVAF_CPU_PUSH_POST_BATCH_WRS`（CPU 服务环境变量，默认128）现在按 payload WR 计数，
+对应 Ready WR 附在该批次尾部，不单独占用预算。
+例如 max_sge=16、8192×656 B 时，每队列128个 payload WR +8个 Ready 只提交一次，
+四队列从8次 post 降为4次；实际 WR 数仍受硬件 max_sge、消息上限和 SQ wave 约束。
+
+## 请求控制通路
+
+AIV 多核完成清单构建后，由核0利用双向 Jetty 0 的 USER_CTL SQ 发送：
+
+```text
+WRITE 64 B 请求头 + WRITE 有效源地址清单（按协商消息上限分片）
+→ 同一 SQ 的强序 WRITE 发布 8 B notify
+→ CPU acquire 轮询本地 notify，直接读取本地头和清单
+→ CPU SGL WRITE payload / Ready → 最终报告 / done → AIV 排空 scatter
+```
+
+头、清单、notify 分成互不重叠的传输，不覆盖 CPU 拥有的 done/Ready/marker 区。
+小请求通常一批提交三个控制 WR，只确认该批强序尾 CQE；较大清单按有界批次发送。
+清单和控制 SQ 编码共用已保留的 UB，发送完成后再交给 payload stage ring。
+CPU 空闲轮询和每次请求解析不再发出远端 READ，减少原来的请求发现及清单拉取往返。
+仍保留队列完成、错误、超时和最终 done；无流水和流水共用此通路，不新增算法开关。
 
 ## 计时和带宽口径
 
@@ -193,8 +215,8 @@ JSON保留原始纳秒、worker cycle、CPU post/CQ等待和配置。
 | end_to_end_us / end_to_end_gbps | 一次 BatchGet 的完整调用/同步窗口 |
 | cpu_comm_us / cpu_comm_gbps | 首个 payload WRITE 提交到最后尾 CQE 被观测 |
 | cpu_write_us / cpu_write_gbps | CPU WriteBatch 整体，包含计划复用处理和地址刷新 |
-| aiv_build_notify_us | 输入就绪到核0发布通知，包含多核清单构建和汇合 |
-| aiv_notify_to_done_us | 通知到核0观测最终 done，包含CPU控制、数据传输与完成发布 |
+| aiv_build_notify_us | 输入就绪到核0提交最后 notify 所在批次，包含多核构建、汇合及控制 WR 编码/提交；大清单还含先前控制批次等待 |
+| aiv_notify_to_done_us | 最后控制批次提交到核0观测最终 done，包含 mailbox 传输/尾CQ、CPU准备、payload传输和完成发布 |
 | aiv_scatter_us / aiv_scatter_gbps | 最大单核scatter活跃耗时，流水模式下排除等待Ready的区间 |
 | aiv_body_us / aiv_body_gbps | 最大单核主体耗时 |
 | aiv_wall_us / aiv_wall_gbps | 跨核最早start到最晚finish的设备跨度 |
@@ -209,7 +231,10 @@ JSON保留原始纳秒、worker cycle、CPU post/CQ等待和配置。
 | host_python_dispatch_us | 绑定计时外的包装、派发与返回差值 |
 
 `cpu_comm` 还包含首个提交后后续队列的地址刷新/提交及完成观测延迟，不能直接等同物理线速。
-`cpu_header_ns`、`cpu_descriptor_ns` 是控制读取，不可作为payload通信分母。
+`cpu_header_ns`、`cpu_descriptor_ns` 为兼容历史 JSON 保留，mailbox 路径没有控制 READ，值为0。
+控制开销转入上述 AIV 窗口，不能将这两个零值理解为控制通信不耗时。
+`aiv_notify_to_done_us - cpu_comm_us` 仍是控制、CPU准备和完成发布的残差，
+不能把以前约38 µs全部当成可删除时间，也不能只看该残差变小就认定端到端受益。
 Host和设备时钟不能跨域相减；各核计时不能求和。
 pipeline=1时CPU通信、Ready等待、scatter活跃区间重叠，不能将这些列直接相加。
 做关闭流水的近似层级拆解可用：

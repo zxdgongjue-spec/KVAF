@@ -105,6 +105,10 @@ struct Fixture {
   int32_t active;
   ModelArgs args{};
   std::vector<uint8_t, AlignedAllocator<uint8_t>> remote, workspace;
+  std::vector<uint8_t, AlignedAllocator<uint8_t>> mailbox_memory;
+  KvafScatterMailboxContext mailbox{};
+  uint32_t mailbox_sq_copies{}, mailbox_posts{};
+  bool mailbox_cq_timeout{};
   std::vector<uint8_t> output, expected, valid;
   std::vector<uint64_t> addresses;
   std::vector<int32_t> indices, offsets, rows;
@@ -167,7 +171,7 @@ struct Fixture {
     args.descriptor_offset = mode == KVAF_SEQ_SCATTER ? 192 + cores * 64 : cores * 64;
     args.staging_offset = Align(args.descriptor_offset + n * 8ULL);
     args.workspace_bytes = mode == KVAF_SEQ_SCATTER ?
-        Align(args.staging_offset + n * uint64_t(bytes)) + uint64_t(cores + 1) * 64 :
+        Align(args.staging_offset + n * uint64_t(bytes)) + sizeof(mailbox) + uint64_t(cores + 1) * 64 :
         args.descriptor_offset + cores * lane_descriptor;
     // Match the cache-line alignment of real registered DDR/HBM allocations.
     workspace.resize(args.workspace_bytes);
@@ -184,14 +188,23 @@ struct Fixture {
     }
     args.workspace_entity = Address(control_entities.data());
     r.channel_entity = Address(data_entities.data());
+    if (mode == KVAF_SEQ_SCATTER) {
+      mailbox_memory.resize(args.staging_offset);
+      mailbox.entity = control_entities[0];
+      mailbox.entity.remote_host_ddr_address = Address(mailbox_memory.data());
+      mailbox.entity.remote_host_ddr_size = mailbox_memory.size();
+      mailbox.max_write_bytes = 65536;
+      r.channel_entity = Address(&mailbox);
+      r.queue_state = Address(&mailbox.queue);
+    }
   }
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
   void Poll(void* p) {
     std::lock_guard<std::mutex> lock(poll_mutex);
     if (args.mode != KVAF_SEQ_SCATTER || Address(p) < (args.workspace & ~uint64_t(63)) ||
         Address(p) >= args.workspace + args.workspace_bytes || push_done) return;
-    auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(workspace.data());
-    const auto notify = aiv_model::AtomicLoadWord(args.workspace + 64);
+    auto* request = reinterpret_cast<kvaf::cpu_push::Request*>(mailbox_memory.data());
+    const auto notify = aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) + 64);
     if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
     const bool pipeline = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline);
     if (pipeline && !aiv_model::mte3.empty()) waited_with_output_pending = true;
@@ -204,7 +217,7 @@ struct Fixture {
       for (uint32_t core = 0; core < workers; ++core)
         assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
     }
-    const auto* src = reinterpret_cast<const uint64_t*>(workspace.data() + args.descriptor_offset);
+    const auto* src = reinterpret_cast<const uint64_t*>(mailbox_memory.data() + args.descriptor_offset);
     if (pipeline && !remote_error && !future_done) {
       if (push_parts.empty()) kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
           [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
@@ -271,10 +284,17 @@ struct Fixture {
     copied_before_done |= !push_done;
   }
   void Doorbell(uint32_t value, uint32_t* p) {
+    std::lock_guard<std::mutex> lock(poll_mutex);
     for (uint32_t q = 0; q < workers * 2; ++q) {
       auto& m = *queues[q];
       if (p == &m.cq_db) { m.cq_db = value; return; }
       if (p != &m.db) continue;
+      const bool scatter = args.mode == KVAF_SEQ_SCATTER;
+      if (scatter) {
+        assert(q == 0 && aiv_model::mte3.empty());
+        ++mailbox_posts;
+        mailbox_sq_copies += 1 + ((m.pi % 16) + value - m.pi > 16);
+      }
       const uint32_t worker = q / 2;
       auto word = [&](uint64_t base, uint32_t index) {
         return m.sq[((base * 16) + index) % m.sq.size()];
@@ -299,7 +319,7 @@ struct Fixture {
             cpu_done[worker] = true;
           }
         }
-        if (!(q % 2)) {
+        if (!scatter && !(q % 2)) {
           assert(op == kRead && cpu_done[worker]);
           assert(ack_reads[worker] >= 3); // Must not treat started ACK as completed.
           ++data_reads; max_sges = std::max(max_sges, sges);
@@ -307,11 +327,35 @@ struct Fixture {
         for (uint32_t i = 0; i < sges; ++i) {
           const auto bytes = word(m.pi, 12 + i * 4);
           const auto local = uint64_t(word(m.pi, 14 + i * 4)) | (uint64_t(word(m.pi, 15 + i * 4)) << 32);
-          if (op == kWrite) std::memcpy(reinterpret_cast<void*>(remote_address), reinterpret_cast<void*>(local), bytes);
+          if (scatter) {
+            assert(op == kWrite && sges == 1 && bytes <= mailbox.max_write_bytes);
+            assert(word(m.pi, 3) == mailbox.entity.remote_token_id);
+            assert(word(m.pi, 13) == mailbox.entity.local_token_id);
+            const auto offset = remote_address - Address(mailbox_memory.data());
+            assert(offset + bytes <= mailbox_memory.size());
+            assert(local == args.workspace + offset);
+            assert((offset < 64 && offset + bytes <= 64) ||
+                   (offset >= args.descriptor_offset && offset + bytes <= args.descriptor_offset + active * 8) ||
+                   (offset == 64 && bytes == 8));
+            if (offset == 64) {
+              // Commit cannot precede any header/list placement. Verify exact
+              // fresh contents, including on same-sized consecutive calls.
+              assert(((header >> 16) & 3) == 2);
+              assert(!std::memcmp(mailbox_memory.data(), workspace.data(), 64));
+              assert(!std::memcmp(mailbox_memory.data() + args.descriptor_offset,
+                                  workspace.data() + args.descriptor_offset, active * 8));
+              aiv_model::AtomicStoreWord(remote_address, aiv_model::AtomicLoadWord(local));
+            } else {
+              assert((aiv_model::AtomicLoadWord(Address(mailbox_memory.data()) + 64) &
+                      ~kvaf::cpu_push::kProfileNotify) != args.sequence);
+              std::memcpy(reinterpret_cast<void*>(remote_address), reinterpret_cast<void*>(local), bytes);
+            }
+          }
+          else if (op == kWrite) std::memcpy(reinterpret_cast<void*>(remote_address), reinterpret_cast<void*>(local), bytes);
           else std::memcpy(reinterpret_cast<void*>(local), reinterpret_cast<void*>(remote_address), bytes);
           remote_address += bytes;
         }
-        if (q % 2 && op == kWrite) {
+        if (!scatter && q % 2 && op == kWrite) {
           auto* c = reinterpret_cast<kvaf::peer::GatherControl*>(args.remote_control) + worker;
           if (c->notify == args.sequence && notified[worker] != args.sequence) {
             notified[worker] = args.sequence;
@@ -320,7 +364,7 @@ struct Fixture {
             reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(c->command)->ready_bytes = 0;
           }
         }
-        if (header & (1U << 21)) {
+        if ((header & (1U << 21)) && !(scatter && mailbox_cq_timeout)) {
           assert(((header >> 16) & 3) == 2);
           m.cq[m.cq_pi % 2][0] = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
               ((cq_error || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
@@ -508,6 +552,7 @@ int main() {
           const auto recycle_waits = aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2];
           const auto metadata_reads = aiv_model::metadata_reads;
           const auto descriptor_writes = aiv_model::descriptor_writes;
+          const auto control_copies = f.mailbox_sq_copies, control_posts = f.mailbox_posts;
           f.Run();
           if (bytes <= kTileBytes) {
             const auto layout = MakeRowCopyLayout(bytes);
@@ -537,9 +582,11 @@ int main() {
             assert(aiv_model::metadata_reads - metadata_reads == metadata_tiles);
             assert(aiv_model::descriptor_writes - descriptor_writes == build_tiles);
             assert(aiv_model::mte2_copies - reads == tiles + metadata_tiles);
-            assert(aiv_model::mte3_copies - writes == count + build_tiles);
+            assert(aiv_model::mte3_copies - writes == count + build_tiles +
+                   f.mailbox_sq_copies - control_copies);
             // Scatter no longer waits for MTE3 on Scalar at every tile.
-            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == build_tiles);
+            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == build_tiles +
+                   f.mailbox_posts - control_posts);
             assert(aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2] - recycle_waits == tiles);
             assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - input_waits ==
                 metadata_tiles + active_workers);
@@ -842,6 +889,23 @@ int main() {
     Fixture error(7, 656, 1, mode, 6); error.remote_error = true; error.Run(false);
   }
   Fixture future(7, 656, 1, KVAF_SEQ_SCATTER, 6); future.future_done = true; future.Run(false);
+  {
+    // Small negotiated messages cross control post/SQ/CQ boundaries. A fresh
+    // list must reach CPU before every commit, including same-count reuse.
+    Fixture mailbox(257, 13, 1, KVAF_SEQ_SCATTER, 6);
+    mailbox.mailbox.max_write_bytes = 64;
+    for (auto count : {257U, 257U, 19U, 1U, 0U, 257U}) {
+      mailbox.Next(count); mailbox.Run();
+    }
+    assert(mailbox.mailbox_posts > 16 && mailbox.mailbox.queue.completed_batch_count == 5);
+    Fixture control_error(19, 656, 1, KVAF_SEQ_SCATTER, 6);
+    control_error.cq_error = true; control_error.Run(false);
+    assert(control_error.mailbox.queue.poisoned && control_error.status[0].result == KVAF_SEQ_CQ_ERROR);
+    control_error.Next(19); control_error.cq_error = false; control_error.Run(false);
+    Fixture control_timeout(19, 656, 1, KVAF_SEQ_SCATTER, 6);
+    control_timeout.mailbox_cq_timeout = true; control_timeout.Run(false);
+    assert(control_timeout.mailbox.queue.poisoned && control_timeout.status[0].result == KVAF_SEQ_TIMEOUT);
+  }
   Fixture cq(7, 656, 1, KVAF_SEQ_GATHER, 6); cq.cq_error = true; cq.Run(false);
   assert(cq.states[1].poisoned);
   for (uint32_t sgl = 1; sgl <= 6; ++sgl) {

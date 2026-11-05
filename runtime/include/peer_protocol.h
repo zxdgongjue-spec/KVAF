@@ -11,9 +11,9 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 6 exposes candidate metadata before allocation so adaptive startup
-// can group EIDs by K-side UB device and benchmark each device only once.
-constexpr uint16_t kProtocolVersion = 6U;
+// Version 7 exports the CPU push mailbox for AIV-initiated request publication.
+// CPU service and NPU runtime must be rebuilt together.
+constexpr uint16_t kProtocolVersion = 7U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -160,6 +160,9 @@ struct OpenCpuPushGetResponse {
   uint64_t cpu_tp;
   uint32_t cpu_psn;
   CpuPushChannelKey channels[4];
+  uint64_t mailbox_base, mailbox_bytes;
+  uint32_t mailbox_token_id, mailbox_segment_bytes, max_write_bytes;
+  uint8_t mailbox_segment[kSegKeyBytes];
 };
 struct CpuPushGetSessionRequest {
   MessageHeader header;
@@ -188,7 +191,7 @@ static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
 static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
-static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(OpenCpuPushGetResponse) == 392U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 static_assert(sizeof(CpuWriteBenchmarkRequest) == 72U, "WRITE benchmark request ABI changed");
 static_assert(sizeof(CpuWriteBenchmarkResponse) == 276U + 32U * cpu_push::kWriteBenchmarkSamples,

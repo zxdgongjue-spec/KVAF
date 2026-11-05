@@ -1,5 +1,8 @@
 # AIV BatchGet Scatter / Gather 三阶段设计
 
+> 2026-11-05：第3.1节已更新为当前 mailbox 控制通路；其余阶段保留最初设计过程。
+> 当前固定优化、流水参数及计时口径见 [性能测试说明](aiv_scatter_performance.md)。
+
 ## 1. 文档状态与基线
 
 - 日期：2026-10-28。
@@ -65,32 +68,28 @@ scatter 的四路 CPU Jetty 与 AIV 核数独立；gather 初始采用每核一�
 notify 是内存中的请求序号，不是一次 UMDK 函数调用，也不是 SQ doorbell。
 SQ doorbell 通知通信硬件处理队列；notify 通知 CPU 软件处理新的 BatchGet。
 
-### 3.1 Scatter：CPU 主动 READ HBM
+### 3.1 Scatter：AIV 推送 CPU mailbox
 
-初始化时由 NPU Host 注册 HBM workspace，通过 PeerLink 将 segment、token、
-workspace 地址和布局交给 CPU，并完成四路 TargetChannel 建链。
-
-每轮由 AIV 写本地 HBM，CPU 使用自己的 UMDK 接口拉取：
+当前实现由 NPU Host 注册 HBM workspace、CPU 服务注册可远端写入的 mailbox，
+通过 V7 OpenCpuPushGet 交换两端 segment/token 和四路 Jetty。Jetty 0 同时提供
+AIV 可发起控制 WRITE 的 USER_CTL SQ；CPU 四条 payload 队列保持不变。
 
 ```text
 AIV                                      CPU worker
-生成 sources[]，写入 HBM
-写 request header
-确保清单和 header 对远端 DMA 可见
-最后发布 HBM.notify = sequence
-                                         UMDK READ HBM.notify
-                                         发现新 sequence
-                                         UMDK READ HBM.request
-                                         UMDK READ HBM.sources[0:count]
+多核生成 sources[]，写入 HBM
+核0等待构建完成，写 request header
+WRITE header + 有效 sources[] 到 CPU mailbox
+同一 SQ 强序 WRITE mailbox.notify
+                                         acquire 轮询本地 notify
+                                         校验本地 request，直接使用本地 sources[]
                                          更新 SGL 并开始回推 payload
 ```
 
-CPU 在初始化时已知道 `HBM.sources` 的位置；清单中的 `sources[i]` 则是实际
-CPU DDR 源地址。发布这个请求不要求 AIV 发出通信 WQE。
-
-参考分支的 `Transport::ReadRequest()`、`ReadDescriptor()` 已采用此机制。
-AIV 发布顺序需要完成 GM 写出及目标平台要求的缓存维护，不能仅靠普通赋值或
-`volatile`；具体可见性操作须在目标设备验证。
+头、清单和 notify 分开发送，绝不覆盖 CPU 拥有的 done/Ready/marker 源区。
+每个有界控制批次只等待强序尾 CQE；最终 notify 排在全部清单之后。
+`ReadRequest()`/`ReadDescriptor()` 名称沿用原接口，热路径不再发出 URMA READ。
+具体 DMA 可见性与性能仍须在目标设备验证，当前说明见
+[性能测试说明](aiv_scatter_performance.md)。
 
 ### 3.2 Gather：AIV 手写控制 WRITE WQE
 

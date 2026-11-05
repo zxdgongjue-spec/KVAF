@@ -42,16 +42,14 @@ class Transport {
   } profile_;
   struct Queue {
     cpu_runtime_detail::UrmaChannel channel;
-    std::vector<urma::Sge> local, remote;
-    std::vector<urma_jfs_wr_t> wrs;
-    std::uint64_t sequence{}, pending{};
     bool poisoned{};
   };
   using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
   struct PreparedQueue {
     struct Source { std::uint32_t local, row, offset; };
     struct SourceRun { std::uint32_t local, row, count; };
-    struct Marker { std::uint64_t* value; std::uint32_t progress; };
+    struct Marker { std::uint64_t* value; std::uint32_t progress, local; };
+    struct Post { std::uint32_t wr, first_sge, end_sge; };
     std::vector<urma::Sge> local, remote;
     std::vector<urma_jfs_wr_t> wrs;
     std::vector<Source> sources;
@@ -59,6 +57,7 @@ class Transport {
     // deliberately excluded. Fragmented tokens retain the exact Source map.
     std::vector<SourceRun> source_runs;
     std::vector<Marker> markers;
+    std::vector<Post> posts;
     // Whole-batch, unsplit tokens have one SGE per contiguous descriptor row.
     std::uint32_t first_row{UINT32_MAX};
   };
@@ -77,19 +76,13 @@ class Transport {
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
                       std::uint64_t* first_post_ns = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
-  void RefreshPrepared(PreparedQueue&);
-  Status ReadControl(std::uint64_t offset, std::uint64_t bytes);
-  Status Post(Queue&);
-  Status Wait(Queue&);
-  void AddControlRead(Queue&, std::uint64_t remote, std::uint32_t bytes);
-  void ResetRequests(Queue&);
+  void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
   PreparedWrite done_;
   PreparedWrite profiled_done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
-  std::uint32_t descriptor_prefetch_count_{};
   bool prepared_batch_done_only_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};

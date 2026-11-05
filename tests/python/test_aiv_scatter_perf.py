@@ -214,6 +214,7 @@ def main(argv=None):
     source_rows = args.blocks * args.tokens_per_block
     output_rows = args.output_row_step * args.request_length + 2
     config = dict(vars(args), source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
+                  request_control="AIV_WRITE_mailbox_then_ordered_notify", cpu_post_budget="payload_wrs_ready_attached",
                   scatter_max_stages=3, scatter_max_tile_rows=32, scatter_ub_bytes=65536,
                   scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar")
     config.update(device_id=device_id, mode="cpu_push_scatter",

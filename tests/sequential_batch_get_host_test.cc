@@ -13,6 +13,9 @@
 #include <functional>
 #include <iostream>
 #include <vector>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 namespace {
 std::vector<std::function<void()>> work;
@@ -21,6 +24,8 @@ bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool wrong_phase{}, wrong_sequence{}, wrong_magic{};
 bool stale_profile{}, missing_cpu_profile{}, bad_profile_cycle{};
 bool skip_last_status{};
+void* mailbox_jetty{};
+bool fail_mailbox_destroy{}, fail_mailbox_import{};
 int async_memsets{}, async_copies{}, synchronizations{};
 int capture_queries{};
 uint64_t kernel_result{};
@@ -28,10 +33,25 @@ std::vector<uint64_t> sequences;
 std::vector<uint32_t> launch_options;
 }
 int aclrtMalloc(void** p, size_t n, int) {
-  const int rc = posix_memalign(p, 64, n); if (!rc) ++allocations; return rc;
+#ifdef _WIN32
+  *p = _aligned_malloc(n, 64); const int rc = *p ? 0 : 1;
+#else
+  const int rc = posix_memalign(p, 64, n);
+#endif
+  if (!rc) ++allocations; return rc;
 }
 int aclrtMallocHost(void** p, size_t n) { return aclrtMalloc(p, n, 0); }
-int aclrtFree(void* p) { if (p) { --allocations; std::free(p); } return 0; }
+int aclrtFree(void* p) {
+  if (p) {
+    --allocations;
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+  }
+  return 0;
+}
 int aclrtFreeHost(void* p) { return aclrtFree(p); }
 int aclrtMemset(void* p, size_t, int32_t v, size_t n) { std::memset(p, v, n); return 0; }
 int aclrtMemsetAsync(void* p, size_t, int32_t v, size_t n, aclrtStream) {
@@ -105,7 +125,13 @@ extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, v
   kvaf::cpu_push::Layout layout;
   assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout));
   assert(a->descriptor_offset == layout.descriptor && a->staging_offset == layout.staging);
-  assert(a->workspace_bytes == layout.bytes + uint64_t(a->request.block_count + 1) * 64);
+  assert(a->workspace_bytes == layout.bytes + sizeof(KvafScatterMailboxContext) +
+         uint64_t(a->request.block_count + 1) * 64);
+  assert(a->request.channel_entity == a->workspace + layout.bytes);
+  assert(a->request.queue_state == a->request.channel_entity + offsetof(KvafScatterMailboxContext, queue));
+  const auto& mailbox = *reinterpret_cast<const KvafScatterMailboxContext*>(a->request.channel_entity);
+  assert(mailbox.entity.local_hbm_address == a->workspace && mailbox.entity.local_token_id == 7);
+  assert(mailbox.entity.remote_token_id == 8 && mailbox.max_write_bytes == 65536);
   assert((a->workspace + a->workspace_bytes) % 64 == 0);
   return Launch(a);
 }
@@ -140,9 +166,17 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
-Status PeerLink::OpenCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenCpuPushGetResponse*) const { return Status::OK(); }
+Status PeerLink::OpenCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenCpuPushGetResponse* r) const {
+  r->mailbox_base = 0x1000000; r->mailbox_bytes = 0x100000;
+  r->mailbox_segment_bytes = 48; r->mailbox_token_id = 0x800; r->max_write_bytes = 65536;
+  return Status::OK();
+}
 Status PeerLink::StartCpuPushGet(uint64_t) const { return Status::OK(); }
-Status PeerLink::StopCpuPushGet(uint64_t) const { assert(work.empty()); ++push_stopped; return Status::OK(); }
+Status PeerLink::StopCpuPushGet(uint64_t) const {
+  assert(work.empty());
+  if (kernel_result) assert(!mailbox_jetty); // Failed initiator retired before remote MR release.
+  ++push_stopped; return Status::OK();
+}
 }
 namespace kvaf::direct_hccp {
 void* Hold() { ++hccp_refs; return new int; }
@@ -150,7 +184,7 @@ int Release(void* p) { assert(p && hccp_refs); --hccp_refs; delete static_cast<i
 bool LoadDirectHccp(DirectHccpApi* api) {
   api->ctx_init = [](CtxInitCfg*, CtxInitAttr*, void** out) { *out = Hold(); return 0; };
   api->ctx_deinit = Release;
-  api->token_alloc = [](void*, TokenId*, void** out) { *out = Hold(); return 0; };
+  api->token_alloc = [](void*, TokenId* id, void** out) { id->token_id = 7; *out = Hold(); return 0; };
   api->token_free = [](void*, void* handle) { return Release(handle); };
   api->lmem_register = [](void*, MrRegInfo* mr, void** out) {
     *out = Hold(); mr->out.key.size = 48;
@@ -159,12 +193,26 @@ bool LoadDirectHccp(DirectHccpApi* api) {
     return 0;
   };
   api->lmem_unregister = [](void*, void* handle) { return Release(handle); };
-  api->cq_create = [](void*, CqInfo*, void** out) { *out = Hold(); return 0; };
+  api->rmem_import = [](void*, MrImportInfo* info, void** out) {
+    assert(info->in.ub.flags == 12); // Remote READ/WRITE, matching exported rights.
+    *out = Hold(); return fail_mailbox_import ? 1 : 0;
+  };
+  api->rmem_unimport = [](void*, void* handle) { return Release(handle); };
+  api->cq_create = [](void*, CqInfo* info, void** out) {
+    *out = Hold(); info->out.buffer_addr = 0x200000; info->out.swdb_addr = 0x200100;
+    info->out.cqe_size = 64; return 0;
+  };
   api->cq_destroy = [](void*, void* handle) { return Release(handle); };
   api->qp_create = [](void*, QpCreateAttr*, QpCreateInfo* info, void** out) {
     *out = Hold(); info->key.size = 32; return 0;
   };
-  api->qp_destroy = Release;
+  api->qp_destroy = [](void* handle) {
+    if (handle == mailbox_jetty) {
+      if (fail_mailbox_destroy) return 1;
+      mailbox_jetty = nullptr;
+    }
+    return Release(handle);
+  };
   api->qp_unimport = [](void*, void* handle) { return Release(handle); };
   return true;
 }
@@ -179,9 +227,15 @@ bool GetPeerTp(const DirectHccpApi&, void*, const std::array<uint8_t, kEidBytes>
   assert(reinterpret_cast<uintptr_t>(tp) % alignof(uint64_t) == 0);
   *tp = 1; return true;
 }
+bool CreateDeviceAivJetty(const DirectHccpApi&, void*, void*, void*, uint32_t,
+                          uint32_t depth, const char*, QpCreateInfo* info, void** out) {
+  assert(depth == 1024);
+  *out = mailbox_jetty = Hold(); info->key.size = 32; info->ub.sq_buffer_va = 0x300000;
+  info->ub.db_addr = 0x300100; info->ub.wqebb_size = 64; return true;
+}
 bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint32_t,
-                     uint64_t, uint64_t, uint32_t, uint32_t, const char*, QpImportInfoT*, void** out) {
-  *out = Hold(); return true;
+                     uint64_t, uint64_t, uint32_t, uint32_t, const char*, QpImportInfoT* info, void** out) {
+  *out = Hold(); info->out.ub.tpn = 3; return true;
 }
 }
 
@@ -263,6 +317,26 @@ int main() {
   assert(stopped == 6 && quiesced == 6);
   config.aiv_batch_get_mode = "cpu_push_scatter";
   config.aiv_gather_sgl_size = 0; // A gather-only option must not affect scatter.
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    fail_mailbox_import = true;
+    assert(!owner->Initialize(region).ok());
+    fail_mailbox_import = false;
+    assert(owner->Shutdown().ok());
+    assert(!allocations && !hccp_refs && !mailbox_jetty);
+    assert(owner->Initialize(region).ok());
+    kernel_result = KVAF_SEQ_CQ_ERROR;
+    exec.execution.synchronize = true;
+    assert(!owner->Execute(exec).ok());
+    const auto stops_before = push_stopped;
+    fail_mailbox_destroy = true;
+    assert(!owner->Shutdown().ok());
+    assert(push_stopped == stops_before && mailbox_jetty && hccp_refs);
+    fail_mailbox_destroy = false;
+    assert(owner->Shutdown().ok());
+    assert(!allocations && !hccp_refs && !mailbox_jetty);
+    kernel_result = 0;
+  }
   {
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     const auto before = launches;
