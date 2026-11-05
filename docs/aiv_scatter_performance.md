@@ -1,14 +1,41 @@
 # AIV CPU-push scatter 性能测试
 
 CPU 通过四条 Jetty 发起 URMA SGL WRITE，将数据写入 NPU HBM staging；AIV 将 staging
-中的 token scatter 到输出行。默认固定采用 SIMT 多核融合清单构建和 UB 双缓冲。
+中的 token scatter 到输出行。固定采用 SIMT 多核融合清单构建和 UB/MTE stage ring。
 唯一算法开关是流水掩盖：`--pipeline 0|1`，对应环境变量 `KVAF_SCATTER_PIPELINE`，
 未设置时默认开启。初始化后不再读取开关，不允许改变在途请求的算法。
 
 `--fused-build`、`--double-buffer`、`--simt-build` 及其同名环境变量已移除。
 串行两遍构建、UB/DMA 构建对照和单缓冲算法已删除；JSON 用
-`source_list_builder=parallel_simt`、`scatter_copy=ub_double_buffer` 描述固定实现。
+`source_list_builder=parallel_simt`、`scatter_copy=ub_mte_stage_ring` 描述固定实现。
 计时开关与请求规模、队列、源分布等测试参数继续保留。
+
+## A5 stage 调度
+
+参考 [DeepEP-Ascend A5 dispatch copy epilogue](https://github.com/deepseek-ai/DeepEP-Ascend/blob/main/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.hpp)
+的预填充、环形 refill 和 MTE3→MTE2 复用依赖。payload 继续使用 MTE2/MTE3；
+随机输出仍逐行发出精确长度的 MTE3 命令，不依赖输出行连续，也不使用 SIMT 搬 payload。
+
+- 每批最多 32 行，先预取可用 stage，再消费并 refill。stage 复用由 MTE3→MTE2
+  事件排在 DMA 流水线上，Scalar 不再逐批等待 MTE3→S。
+- 保持 64 KiB UB 和原有每批行数；能容纳三个 payload bank 及各自 128 B 行号缓存时
+  使用三 stage，否则使用双 stage。656 B token 的 UB pitch 为 672 B：
+  `3 × 32 × 672 + 3 × 128 = 64896 B`。
+- UB 有余量时，output_indices 每批 DMA 到独立行号缓存，在 UB 上读取；
+  仅等待该批行号到达 Scalar，payload 到达由 MTE2→MTE3 事件约束。
+  行号走 DMA 的路径不再 Flush 整个输出索引前缀。4096 B 等占满双 bank 的行宽保留
+  Scalar GM 行号读取；超过 32 KiB 的行仍走精确分块 fallback。
+- `pipeline=1` 只在已发布 Ready 的 Jetty shard 内预取，状态跨 shard 保留。
+  返回前仍等待最终 done，并通过 MTE3→MTE2→S 排空所有 bank；异常退出也排空。
+
+JSON 记录 stage 上限、UB 大小和复用事件方向，CSV 及计时口径不变。
+这些改动减少 Scalar 等待和 GM 行号读取，不能据模型推断具体硬件加速比。
+验收继续使用两套完整 BatchGet；先对比 pipeline=0，再对比 pipeline=1，
+固定 CPU/UB 端口、table-capacity、请求计划及核数，656/4096 B 都需要测试。
+业务随机输出须显式指定 `--output-access-pattern random`（changing 入口为
+`--output-order random`），避免默认连续输出掩盖真实开销。
+在同轮最快 25% 的端到端样本上比较 `end_to_end_us`、`aiv_scatter_us`、
+`aiv_scatter_tail_us` 和 `cpu_comm_us`，不要分别挑各阶段最快值。
 
 ## 构建与运行
 

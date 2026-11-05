@@ -12,6 +12,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include "kernel_operator.h"
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
@@ -70,11 +73,22 @@ template<class T> struct AlignedAllocator {
   AlignedAllocator() = default;
   template<class U> AlignedAllocator(const AlignedAllocator<U>&) {}
   T* allocate(std::size_t n) {
+#ifdef _WIN32
+    void* p = _aligned_malloc(n * sizeof(T), 64);
+    if (!p) throw std::bad_alloc();
+#else
     void* p = nullptr;
     if (posix_memalign(&p, 64, n * sizeof(T))) throw std::bad_alloc();
+#endif
     return static_cast<T*>(p);
   }
-  void deallocate(T* p, std::size_t) { std::free(p); }
+  void deallocate(T* p, std::size_t) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+  }
   template<class U> bool operator==(const AlignedAllocator<U>&) const { return true; }
   template<class U> bool operator!=(const AlignedAllocator<U>&) const { return false; }
 };
@@ -319,6 +333,29 @@ struct Fixture {
     }
     assert(false && "unknown doorbell");
   }
+  void SetModelInputs() {
+    aiv_model::mte2_source_begin = args.workspace + args.staging_offset;
+    aiv_model::mte2_source_end = aiv_model::mte2_source_begin +
+        uint64_t(std::max(active, 0)) * token;
+    // Exact active prefixes: invalid capacity suffixes cannot be DMA-read.
+    const auto prefix = uint64_t(std::max(active, 0)) * 4;
+    aiv_model::metadata_sources = {
+        {args.request.indices, args.request.indices + prefix},
+        {args.request.offsets, args.request.offsets + prefix},
+        {args.request.output_indices, args.request.output_indices + prefix},
+        {args.request.address_table, args.request.address_table + uint64_t(args.request.table_capacity) * 8},
+        {args.request.valid_table, args.request.valid_table + args.request.table_capacity}};
+    aiv_model::address_table_begin = args.request.address_table;
+    aiv_model::address_table_end = args.request.address_table + uint64_t(args.request.table_capacity) * 8;
+    aiv_model::descriptor_begin = args.workspace + args.descriptor_offset;
+    aiv_model::descriptor_end = aiv_model::descriptor_begin + prefix * 2;
+  }
+  void ClearModelInputs() {
+    aiv_model::metadata_sources.clear();
+    aiv_model::address_table_begin = aiv_model::address_table_end = 0;
+    aiv_model::descriptor_begin = aiv_model::descriptor_end = 0;
+    aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
+  }
   void Run(bool success = true, bool allow_partial = false) {
     const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
     const auto payload_cache_lines = aiv_model::payload_cache_lines;
@@ -330,21 +367,7 @@ struct Fixture {
       aiv_model::core = core;
       if (args.mode == KVAF_SEQ_SCATTER) {
         std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
-        aiv_model::mte2_source_begin = args.workspace + args.staging_offset;
-        aiv_model::mte2_source_end = aiv_model::mte2_source_begin +
-            uint64_t(std::max(active, 0)) * token;
-        // Exact active prefixes: invalid capacity suffixes cannot be DMA-read.
-        const auto prefix = uint64_t(std::max(active, 0)) * 4;
-        aiv_model::metadata_sources = {
-            {args.request.indices, args.request.indices + prefix},
-            {args.request.offsets, args.request.offsets + prefix},
-            {args.request.output_indices, args.request.output_indices + prefix},
-            {args.request.address_table, args.request.address_table + uint64_t(args.request.table_capacity) * 8},
-            {args.request.valid_table, args.request.valid_table + args.request.table_capacity}};
-        aiv_model::address_table_begin = args.request.address_table;
-        aiv_model::address_table_end = args.request.address_table + uint64_t(args.request.table_capacity) * 8;
-        aiv_model::descriptor_begin = args.workspace + args.descriptor_offset;
-        aiv_model::descriptor_end = aiv_model::descriptor_begin + prefix * 2;
+        SetModelInputs();
       }
       Launch(args);
       assert(status[core].magic == KVAF_SEQ_STATUS_MAGIC);
@@ -356,10 +379,7 @@ struct Fixture {
         assert(std::all_of(aiv_model::ub + used_ub, aiv_model::ub + sizeof(aiv_model::ub),
                            [](uint8_t byte) { return byte == 0xe9; }));
       }
-      aiv_model::metadata_sources.clear();
-      aiv_model::address_table_begin = aiv_model::address_table_end = 0;
-      aiv_model::descriptor_begin = aiv_model::descriptor_end = 0;
-      aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
+      ClearModelInputs();
     };
     if (args.mode == KVAF_SEQ_SCATTER && workers > 1) {
       // Actual concurrent builders: core 0 may only notify after every worker
@@ -393,10 +413,47 @@ struct Fixture {
 };
 }
 namespace aiv_model {
-void Poll(void* p) { fixture->Poll(p); }
+void Poll(void* p) {
+  // Check completion at status publication, before the entry's final PIPE_ALL
+  // barrier could hide an early-success bug in the scatter drain.
+  if (fixture->args.mode == KVAF_SEQ_SCATTER) {
+    const auto& status = fixture->status[core];
+    const auto line = Address(&status) & ~uint64_t(63);
+    if (Address(p) == line && status.phase == KVAF_SEQ_COMPLETE)
+      assert(mte2.empty() && mte3.empty());
+  }
+  fixture->Poll(p);
+}
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  {
+    // Cross-DMA waits must queue dependencies, not block Scalar. Refill the
+    // same bank before either engine is drained; it must still output the old
+    // contents first. This exercises the model used by the real stage ring.
+    using namespace AscendC;
+    alignas(32) uint8_t first[64], second[64], output[64]{};
+    std::memset(first, 0x21, sizeof(first));
+    std::memset(second, 0x43, sizeof(second));
+    LocalTensor<uint8_t> bank(TPosition::VECIN, 0, 64);
+    GlobalTensor<uint8_t> source, destination;
+    source.SetGlobalBuffer(first); destination.SetGlobalBuffer(output);
+    DataCopy(bank, source, 64);
+    set_flag(PIPE_MTE2, PIPE_MTE3, 0);
+    wait_flag(PIPE_MTE2, PIPE_MTE3, 0);
+    assert(!aiv_model::mte2.empty());
+    DataCopyPad(destination, bank, DataCopyExtParams{1, 64, 0, 0, 0});
+    set_flag(PIPE_MTE3, PIPE_MTE2, 0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, 0);
+    assert(!aiv_model::mte3.empty() && output[0] == 0);
+    source.SetGlobalBuffer(second);
+    DataCopy(bank, source, 64);
+    set_flag(PIPE_MTE2, PIPE_S, 0);
+    wait_flag(PIPE_MTE2, PIPE_S, 0);
+    assert(std::memcmp(output, first, 64) == 0);
+    assert(bank.GetValue(0) == second[0]);
+    assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
+  }
   // Match the hardware smoke test: the first launch is empty, followed by
   // nonempty launches on the same queues. Empty work must finish all worker
   // statuses without notifying the CPU or advancing any SQ/CQ state.
@@ -435,29 +492,37 @@ int main() {
   // Deferred model writes must finish before a tile reuses the same UB bank.
   for (const auto options : kScatterOptions)
     for (uint32_t workers : {1U, 3U, 8U})
-      for (uint32_t bytes : {31U, 656U, 4096U, 32768U, 32769U}) {
+      for (uint32_t bytes : {31U, 656U, 672U, 673U, 1000U, 4096U, 32768U, 32769U}) {
         Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
+        // Permute unique sparse destinations: output has no fixed stride.
+        for (uint32_t i = 0; i < f.count; ++i) f.rows[i] = 2 * ((i * 37U + 11U) % f.count) + 1;
         f.args.reserved = options;
-        for (uint32_t count : {0U, 1U, 7U, 31U, 32U, 33U, 63U, 64U, 65U, 129U}) {
+        for (uint32_t count : {0U, 1U, 7U, 31U, 32U, 33U, 63U, 64U, 65U,
+                               95U, 96U, 97U, 129U}) {
           f.Next(count);
           std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
           const auto reads = aiv_model::mte2_copies;
           const auto writes = aiv_model::mte3_copies;
           const auto waits = aiv_model::event_waits[PIPE_MTE3][PIPE_S];
           const auto input_waits = aiv_model::event_waits[PIPE_MTE2][PIPE_S];
+          const auto recycle_waits = aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2];
           const auto metadata_reads = aiv_model::metadata_reads;
           const auto descriptor_writes = aiv_model::descriptor_writes;
-          const auto overlapped = aiv_model::overlapped_mte2_copies;
           f.Run();
           if (bytes <= kTileBytes) {
-            const auto per_tile = std::min(kMaxTileRows, kTileBytes / ((bytes + 31U) & ~31U));
-            uint64_t tiles = 0, overlapping_inputs = 0;
+            const auto layout = MakeRowCopyLayout(bytes);
+            const auto per_tile = layout.rows;
+            assert(layout.banks >= 2 && layout.banks <= kMaxBanks);
+            assert(layout.banks * layout.bank_bytes +
+                (layout.cached_rows ? layout.banks * kRowIndexBytes : 0U) <= kTileBufferBytes);
+            if (bytes == 656) assert(layout.banks == 3 && layout.cached_rows && per_tile == 32);
+            uint64_t tiles = 0, active_workers = 0;
             for (uint32_t core = 0; core < workers; ++core) {
               const auto rows = uint64_t(count) * (core + 1) / workers -
                   uint64_t(count) * core / workers;
               const auto core_tiles = (rows + per_tile - 1) / per_tile;
               tiles += core_tiles;
-              if (core_tiles) overlapping_inputs += core_tiles - 1;
+              if (core_tiles) ++active_workers;
             }
             uint64_t build_tiles = 0;
             {
@@ -468,13 +533,16 @@ int main() {
                 if (end > begin) build_tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
               }
             }
-            assert(aiv_model::metadata_reads == metadata_reads);
+            const auto metadata_tiles = layout.cached_rows ? tiles : 0;
+            assert(aiv_model::metadata_reads - metadata_reads == metadata_tiles);
             assert(aiv_model::descriptor_writes - descriptor_writes == build_tiles);
-            assert(aiv_model::mte2_copies - reads == tiles);
+            assert(aiv_model::mte2_copies - reads == tiles + metadata_tiles);
             assert(aiv_model::mte3_copies - writes == count + build_tiles);
-            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == tiles + build_tiles);
-            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] == input_waits);
-            assert(aiv_model::overlapped_mte2_copies - overlapped == overlapping_inputs);
+            // Scatter no longer waits for MTE3 on Scalar at every tile.
+            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == build_tiles);
+            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2] - recycle_waits == tiles);
+            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - input_waits ==
+                metadata_tiles + active_workers);
           }
           assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
         }
@@ -526,6 +594,7 @@ int main() {
     // arrive afterwards observe the failure; their ready flags cannot revive it.
     Fixture stalled(65, 656, 4, KVAF_SEQ_SCATTER, 6);
     stalled.args.max_polls = 2;
+    stalled.SetModelInputs();
     aiv_model::core = 0; Launch(stalled.args);
     assert(stalled.status[0].result == KVAF_SEQ_TIMEOUT);
     for (uint32_t core = 1; core < stalled.workers; ++core) {
@@ -534,6 +603,7 @@ int main() {
     }
     assert(!stalled.push_requests);
     stalled.CheckGuard();
+    stalled.ClearModelInputs();
   }
   {
     Fixture small_workspace(65, 31, 4, KVAF_SEQ_SCATTER, 6);
@@ -571,19 +641,9 @@ int main() {
           f.addresses[f.indices[i]] = f.args.source_base +
               uint64_t((i + f.args.sequence) % f.count) * f.token * 2;
         const auto flushed = aiv_model::address_table_cache_lines;
-        const auto reads = aiv_model::metadata_reads;
         const auto simt_reads = aiv_model::simt_metadata_reads;
         f.Run();
         assert(aiv_model::address_table_cache_lines == flushed);
-        uint64_t tiles = 0;
-        const auto groups = (count + 7U) / 8U;
-        for (uint32_t core = 0; core < workers; ++core) {
-          const auto begin = uint64_t(groups) * core / workers * 8;
-          const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-          const auto tile_rows = kSimtBuildRows;
-          tiles += (end - begin + tile_rows - 1) / tile_rows;
-        }
-        assert(aiv_model::metadata_reads == reads);
         assert(aiv_model::simt_metadata_reads - simt_reads == count * (trusted ? 3 : 5));
       }
       if (!trusted) {
@@ -629,9 +689,7 @@ int main() {
         f.args.reserved = options | kvaf::kScatterTrustedInputs;
         for (uint32_t count : {0U, 1U, 7U, 256U, 257U, 1024U, 19U}) {
           f.Next(count);
-          const auto reads = aiv_model::metadata_reads;
           f.Run();
-          assert(aiv_model::metadata_reads == reads);
         }
       }
   for (const auto options : {0U, kvaf::kScatterOptionsV1,
@@ -688,6 +746,21 @@ int main() {
       f.hold_done_until_scatter = true;
       f.Run();
       assert(f.copied_before_done && f.read_rows == 257 && f.push_done);
+    }
+  // Re-prime partially used rings across uneven Ready shards, including
+  // three->two stage layout boundaries, uncached row indices and large rows.
+  for (uint32_t bytes : {673U, 1000U, 32768U, 32769U})
+    for (uint32_t workers : {1U, 3U}) {
+      Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
+      f.args.reserved |= kvaf::kScatterPipeline;
+      f.args.max_polls = 100000;
+      f.hold_done_until_scatter = f.hold_next_jetty = f.late_first_jetty = true;
+      for (uint32_t i = 0; i < f.count; ++i) f.rows[i] = 2 * ((i * 37U + 11U) % f.count) + 1;
+      for (uint32_t count : {1U, 33U, 95U, 97U, 129U, 7U}) {
+        std::rotate(f.rows.begin(), f.rows.begin() + 1, f.rows.end());
+        f.Next(count); f.Run();
+        assert(f.read_rows == count && f.push_done && f.copied_before_done);
+      }
     }
   for (bool future : {false, true}) {
     Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);

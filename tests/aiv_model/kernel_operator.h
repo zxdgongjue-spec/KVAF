@@ -50,8 +50,9 @@ using event_t = uint32_t;
 inline thread_local bool model_events[4][4][3]{};
 inline thread_local uint64_t model_event_fences[4][4][3]{};
 namespace aiv_model {
-// Defer public DMA copies until their producer event is waited on. This catches
-// consuming an unfilled bank, overwriting a bank still being read, and returning
+// Defer public DMA copies until their producer event is waited on. DMA-to-DMA
+// waits are queued on the consumer, so Scalar can issue a stage ring ahead.
+// This catches consuming an unfilled bank, overwriting a bank still being read, and returning
 // before the final MTE3 write. It does not emulate CANN instruction generation.
 struct PendingCopy {
   uint8_t* destination{};
@@ -65,10 +66,21 @@ struct PendingCopy {
   }
 };
 struct CopyQueue {
-  std::deque<PendingCopy> copies;
+  struct Command {
+    PendingCopy copy;
+    CopyQueue* dependency{};
+    uint64_t fence{};
+  };
+  std::deque<Command> copies;
   uint64_t submitted{}, completed{};
+  uint64_t peer_fence{};
+  bool executing{};
   bool empty() const { return copies.empty(); }
-  void Push(PendingCopy copy) { copies.push_back(copy); ++submitted; }
+  void Push(PendingCopy copy) { copies.push_back({copy}); ++submitted; }
+  void Wait(CopyQueue& producer, uint64_t fence) {
+    copies.push_back({{}, &producer, fence}); ++submitted;
+    if (fence > peer_fence) peer_fence = fence;
+  }
   static bool Overlap(const void* first, uint64_t bytes,
                       const void* other, uint64_t other_bytes) {
     if (!bytes || !other_bytes) return false;
@@ -76,28 +88,40 @@ struct CopyQueue {
     const auto b = reinterpret_cast<uintptr_t>(other);
     return a <= b ? b - a < bytes : a - b < other_bytes;
   }
-  bool Writes(const void* address, uint64_t bytes) const {
-    for (const auto& c : copies)
-      if (Overlap(address, bytes, c.destination, c.padded_bytes ? c.padded_bytes : c.bytes))
+  bool Writes(const void* address, uint64_t bytes, uint64_t after = 0) const {
+    auto serial = completed;
+    for (const auto& command : copies) {
+      const auto& c = command.copy;
+      if (++serial > after &&
+          Overlap(address, bytes, c.destination, c.padded_bytes ? c.padded_bytes : c.bytes))
         return true;
+    }
     return false;
   }
-  bool Reads(const void* address, uint64_t bytes) const {
-    for (const auto& c : copies)
-      if (Overlap(address, bytes, c.source, c.bytes)) return true;
+  bool Reads(const void* address, uint64_t bytes, uint64_t after = 0) const {
+    auto serial = completed;
+    for (const auto& command : copies) {
+      const auto& c = command.copy;
+      if (++serial > after && Overlap(address, bytes, c.source, c.bytes)) return true;
+    }
     return false;
   }
   void FinishThrough(uint64_t fence) {
     if (fence > submitted) std::abort();
     while (completed < fence) {
-      copies.front().Finish();
+      if (executing) std::abort(); // A cyclic DMA dependency cannot progress.
+      executing = true;
+      auto command = copies.front();
+      if (command.dependency) command.dependency->FinishThrough(command.fence);
+      command.copy.Finish();
       copies.pop_front();
       ++completed;
+      executing = false;
     }
   }
   void Finish() { FinishThrough(submitted); }
 };
-inline thread_local CopyQueue mte2, mte3;
+static thread_local CopyQueue mte2, mte3;
 inline Counter mte2_copies, mte3_copies;
 inline Counter metadata_reads, descriptor_writes;
 inline Counter payload_cache_lines;
@@ -111,7 +135,7 @@ inline Counter out_to_ub_resets, event_waits[4][4];
 inline thread_local uintptr_t mte2_source_begin{}, mte2_source_end{};
 inline thread_local uintptr_t descriptor_begin{}, descriptor_end{};
 inline thread_local uintptr_t address_table_begin{}, address_table_end{};
-inline thread_local std::vector<std::pair<uintptr_t, uintptr_t>> metadata_sources;
+static thread_local std::vector<std::pair<uintptr_t, uintptr_t>> metadata_sources;
 inline void (*payload_observer)(const void*, uint64_t) = nullptr;
 inline bool IsMetadata(const void* source, uint64_t bytes) {
   const auto address = reinterpret_cast<uintptr_t>(source);
@@ -142,6 +166,12 @@ inline void wait_flag(int source, int target, event_t event) {
   model_events[source][target][event] = false;
   ++aiv_model::event_waits[source][target];
   const auto fence = model_event_fences[source][target][event];
+  if (source == PIPE_MTE2 && target == PIPE_MTE3) {
+    aiv_model::mte3.Wait(aiv_model::mte2, fence); return;
+  }
+  if (source == PIPE_MTE3 && target == PIPE_MTE2) {
+    aiv_model::mte2.Wait(aiv_model::mte3, fence); return;
+  }
   if (source == PIPE_MTE2) aiv_model::mte2.FinishThrough(fence);
   if (source == PIPE_MTE3) aiv_model::mte3.FinishThrough(fence);
 }
@@ -242,9 +272,9 @@ void DataCopy(const LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t co
   aiv_model::CheckMte2Source(src.data, bytes);
   if (!bytes || bytes % 32 || dst.address_.bufferAddr % 32 ||
       reinterpret_cast<uintptr_t>(src.data) % sizeof(T) || bytes > dst.address_.dataLen ||
-      aiv_model::mte2.Writes(reinterpret_cast<void*>(dst.address_.bufferAddr), bytes) ||
       aiv_model::mte3.Reads(
-          reinterpret_cast<void*>(dst.address_.bufferAddr), bytes)) std::abort();
+          reinterpret_cast<void*>(dst.address_.bufferAddr), bytes, aiv_model::mte2.peer_fence))
+    std::abort();
   if (!aiv_model::mte3.empty()) ++aiv_model::overlapped_mte2_copies;
   aiv_model::mte2.Push({reinterpret_cast<uint8_t*>(dst.address_.bufferAddr),
       reinterpret_cast<const uint8_t*>(src.data), uint32_t(bytes), uint32_t(bytes)});
@@ -260,8 +290,8 @@ void DataCopyPad(const LocalTensor<T>& dst, const GlobalTensor<T>& src,
   if (!p.blockCount || p.blockCount > 4095 || !p.blockLen || p.srcStride || p.dstStride ||
       p.rsv || pad.isPad || pad.leftPadding || pad.rightPadding || dst.address_.bufferAddr % 32 ||
       ub_bytes > dst.address_.dataLen ||
-      aiv_model::mte2.Writes(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes) ||
-      aiv_model::mte3.Reads(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes))
+      aiv_model::mte3.Reads(reinterpret_cast<void*>(dst.address_.bufferAddr), ub_bytes,
+          aiv_model::mte2.peer_fence))
     std::abort();
   if (!aiv_model::mte3.empty()) ++aiv_model::overlapped_mte2_copies;
   for (uint32_t block = 0; block < p.blockCount; ++block) {
@@ -281,7 +311,8 @@ void DataCopyPad(const GlobalTensor<T>& dst, const LocalTensor<T>& src,
                  const DataCopyExtParams& p) {
   if (p.blockCount != 1 || !p.blockLen || p.srcStride || p.dstStride || p.rsv ||
       src.address_.bufferAddr % 32 || p.blockLen > src.address_.dataLen ||
-      aiv_model::mte2.Writes(reinterpret_cast<void*>(src.address_.bufferAddr), p.blockLen) ||
+      aiv_model::mte2.Writes(reinterpret_cast<void*>(src.address_.bufferAddr), p.blockLen,
+          aiv_model::mte3.peer_fence) ||
       aiv_model::mte3.Writes(dst.data, p.blockLen))
     std::abort();
   aiv_model::mte3.Push({reinterpret_cast<uint8_t*>(dst.data),

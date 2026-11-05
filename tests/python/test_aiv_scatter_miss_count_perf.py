@@ -311,7 +311,9 @@ def run_case(args):
         aiv_batch_get_mode="cpu_push_scatter")
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "worker"}
-    config.update(mode="cpu_push_scatter", source_list_builder="parallel_simt", scatter_copy="ub_double_buffer",
+    config.update(mode="cpu_push_scatter", source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
+        scatter_max_stages=3, scatter_max_tile_rows=32, scatter_ub_bytes=65536,
+        scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar",
         transport=("CPU_SGL_WRITE_overlapped_AIV_scatter" if args.pipeline else "CPU_SGL_WRITE_then_AIV_scatter"),
         pipeline_chunk_rows=1024,
         pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
