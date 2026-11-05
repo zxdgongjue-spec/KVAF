@@ -590,7 +590,6 @@ class NpuPythonRuntime final {
     if (!trusted_scatter_inputs_ || !Initialized())
       throw py::value_error("prepare_scatter_batch_get requires initialized cpu_push_scatter");
     const auto selected = tensor_methods_.SelectStream(stream);
-    const auto acl_stream = tensor_methods_.Stream(selected);
     const auto request = TrustedScatterRequest(table.source(), table.addresses(), table.valid(),
         indices, offsets, miss_count, output_indices, output, native_->batch_get_token_bytes(),
         native_->batch_get_tokens_per_block(), tensor_methods_);
@@ -601,13 +600,21 @@ class NpuPythonRuntime final {
         selected, table.addresses(), table.valid(), indices, offsets, miss_count,
         output_indices, output);
     return py::cpp_function(
-        [this, request, acl_stream, synchronize, generation, retained = std::move(retained)]() {
+        [this, request, selected, synchronize, generation, retained = std::move(retained)]() {
           (void)retained;
           scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
           scatter_host::Timer binding_timer(scatter_host::kBinding);
           host_profile_ready_ = false;
           if (generation != generation_)
             throw py::value_error("prepared scatter request expired after Runtime shutdown/reinitialize");
+          // torch_npu's npu_stream getter drains its Host task queue before
+          // returning the ACL handle. Keep this producer->raw-launch ordering
+          // on EVERY call: work such as output.zero_()/input.copy_() may have
+          // been queued since preparation. Retain the Stream object, never
+          // cache away this dispatch fence; no device-wide sync is added.
+          scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
+          const auto acl_stream = tensor_methods_.Stream(selected);
+          stream_timer.Stop();
           SubmitBatchGet(request, acl_stream, synchronize, true);
         }, py::name("submit_scatter_batch_get"));
   }

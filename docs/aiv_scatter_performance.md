@@ -132,9 +132,13 @@ submit()
 torch.npu.synchronize()
 ```
 
-准备阶段解析七个 Tensor 指针、容量和 stream，返回函数持有 Runtime、Tensor 和
-stream 的引用。逐次提交不再调用 Tensor 方法、查询当前 stream 或派发多参数重载，
-仍走原有 Runtime/算子/kernel 提交路径。`miss_count`、请求数组和表内容可原地更新；
+准备阶段解析七个 Tensor 指针、容量并选定 stream 对象，返回函数持有 Runtime、Tensor 和
+stream 的引用。逐次提交不再调用 Tensor 方法、构造当前 stream 对象或派发多参数重载，
+仍走原有 Runtime/算子/kernel 提交路径。每次提交仍读取固定对象的 `npu_stream` 属性：
+torch_npu 的该 getter 会排空框架 Host 任务队列，保证此前的 `zero_`、`copy_` 等
+操作先于裸 ACL kernel 提交。不能把这一步当成普通字段访问而缓存成原始句柄。
+该顺序保证沿用框架的 dispatch fence，不增加逐次全设备同步。
+`miss_count`、请求数组和表内容可原地更新；
 Tensor 存储和尺寸须保持固定，提交函数及表保持有效直到完成。更换存储、表或 stream 时重新准备；
 shutdown/reinitialize 后旧提交函数失效。原有 `batch_get` 继续逐次解析当前输入和 stream。
 
@@ -144,8 +148,11 @@ prepared 模式仍使用相同随机请求生成器，每轮将新计划原地�
 准备耗时记录为 JSON `setup_us.prepare_submit`，不将准备或多次调用冒充一次提交。
 JSON 用 `host_submit`、`input_storage`、`stream_selection` 和
 `host_timing_matches_reference` 明确区分调用方式，CSV 保持32列。
-开启 Host profile 后 prepared 的 `host_tensor_metadata_us` 和
-`host_stream_resolve_us` 为0，表示本次提交没有这些操作。
+开启 Host profile 后 prepared 的 `host_tensor_metadata_us` 为0；
+`host_stream_resolve_us` 仍记录必要的 Host 任务队列 fence 和句柄取得，不能要求其为0。
+JSON 的 `stream_selection=fixed_stream_per_call_task_queue_fence` 标识这一实现。
+对应机制见 torch_npu 的 [npu_stream 属性](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/npu/Stream.cpp#L78)
+及 [NPUStream::stream 队列处理](https://github.com/Ascend/pytorch/blob/master/torch_npu/csrc/core/npu/NPUStream.cpp#L442)。
 
 使用同一组参数分别运行 `--host-submit reference --pipeline 0`、
 `--host-submit prepared --pipeline 0`、`--host-submit prepared --pipeline 1`，

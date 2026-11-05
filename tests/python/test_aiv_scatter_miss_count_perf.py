@@ -78,7 +78,7 @@ def arguments(argv=None):
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--host-submit", choices=("reference", "prepared"), default="reference",
-                        help="reference: original dynamic Tensor/stream API; prepared: reuse fixed storage and stream")
+                        help="reference: original dynamic Tensor/stream API; prepared: fixed storage/stream with per-call task-queue fence")
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
         remaining.append("--kernel-profile")  # Reference sweep profiles every formal case.
@@ -341,7 +341,7 @@ def run_case(args):
         input_mode="steady_table_new_request_plan_per_call", calls_per_sample=1,
         timing=("enqueue_then_global_device_sync" if args.completion_mode == "reference"
                 else "synchronous_BatchGet_through_status_validation"),
-        stream_selection=("fixed_at_prepare" if args.host_submit == "prepared" else
+        stream_selection=("fixed_stream_per_call_task_queue_fence" if args.host_submit == "prepared" else
                           "current_stream_resolved_inside_binding_like_reference"),
         input_storage=("fixed_buffers_refreshed_per_call" if args.host_submit == "prepared" else
                        "new_request_tensors_per_call"),

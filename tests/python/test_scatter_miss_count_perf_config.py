@@ -253,7 +253,8 @@ class AlignedScatterTests(unittest.TestCase):
                     now[0] += 1000000
                     records = profiles(4, 1024, 656)
                     host = dict.fromkeys(HOST_TIMINGS, 0)
-                    host.update(host_binding_ns=5000, host_native_ns=4000, host_operator_ns=3000)
+                    host.update(host_binding_ns=5000, host_stream_resolve_ns=300,
+                                host_native_ns=4000, host_operator_ns=3000)
                     records[0]["host_profile"] = host
                     return records
             def submit():
@@ -268,7 +269,7 @@ class AlignedScatterTests(unittest.TestCase):
             self.assertEqual(sample["end_to_end_us"], 100)
             self.assertEqual(sample["snapshot_us"], 1000)
             self.assertEqual(sample["host_tensor_metadata_us"], 0)
-            self.assertEqual(sample["host_stream_resolve_us"], 0)
+            self.assertEqual(sample["host_stream_resolve_us"], .3)
             self.assertEqual(events, ["submit", "sync", "snapshot"] if completion == "reference"
                              else ["submit", "snapshot"])
 

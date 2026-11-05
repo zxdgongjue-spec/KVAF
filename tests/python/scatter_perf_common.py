@@ -192,8 +192,8 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
                for key in HOST_TIMINGS):
             raise ValueError("invalid or incomplete Host profile")
         # Detect a mismatched/old binding or an unshared profiling context.
-        # Prepared submissions read Tensor metadata/stream once during setup,
-        # so those two per-call fields are legitimately zero.
+        # Prepared submissions read Tensor metadata once during setup. The
+        # stream timer still includes torch_npu's required Host-queue fence.
         if any(host[key] <= 0 for key in ("host_binding_ns", "host_native_ns", "host_operator_ns")):
             raise ValueError("Host profile missing; rebuild Runtime, binding and Host together")
         if not host["host_operator_ns"] <= host["host_native_ns"] <= host["host_binding_ns"]:
