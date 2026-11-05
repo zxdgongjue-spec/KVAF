@@ -4,8 +4,9 @@
 4096 B × 8192、2 个 AIV 核、SGL=1 的约 1.4～1.5 ms 等待。
 CPU 阶段和线程埋点均由 `KVAF_GATHER_PROFILE=1` 开启；关闭时不读取这些计时器。
 CPU 埋点本身不改变通信 ABI，所有 SGL 共用同一路径。当前
-[chunk 调度与 NPU 查询优化](aiv_gather_chunk_pipeline.md)需要同步更新 K 侧
-CPU 服务和 N 侧 gather kernel；部署方式以上述文档为准。
+[chunk 调度与 NPU 查询优化](aiv_gather_chunk_pipeline.md)的基础实现需要更新 K 侧
+CPU 服务和 N 侧 gather kernel；其后的任务内部分进度发布只需更新 CPU 服务。
+部署方式以上述文档为准。
 
 ## 采集
 
@@ -92,7 +93,7 @@ ACK 读取与 CQ 等待，而且 CPU 可能在 AIV 的 publish 阶段尚未结�
 | --- | --- |
 | `ready_delay_ns` | 发布 helper generation 到该线程取得任务；coordinator 使用 Copy 开始时刻 |
 | `start_delay_ns` | coordinator 开始 Copy 到该线程开始 ProcessSource 的延迟，含 phase 等待和调度 |
-| `copy_ns` | 该线程的 ProcessSource 墙钟耗时；chunk 模式含任务内 barrier，coordinator 还包含前缀发布 |
+| `copy_ns` | 该线程的 ProcessSource 墙钟耗时；chunk 模式含每个全局 chunk 边界及任务末尾的 barrier，coordinator 还包含前缀发布 |
 | `barrier_ns` | ProcessSource 返回到末尾同步完成；整批模式含 dsb sy，chunk 模式已在任务内同步，不重复执行末尾 barrier |
 | `work_ns` | 该线程 ProcessSource 加 barrier 的墙钟耗时 |
 | `thread_cpu_ns` | 同一工作区间附近的线程 CPU 时间；`cpu_time_valid=0` 时不可使用 |

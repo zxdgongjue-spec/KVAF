@@ -137,7 +137,7 @@ class CpuGatherExecutor {
       const auto rounds = (total_bytes_ + round_bytes - 1U) / round_bytes;
       const auto slots = threads * rounds;
       task_bytes_ = ((total_bytes_ + slots - 1U) / slots + 63U) & ~std::uint64_t{63U};
-      task_done_.assign((total_bytes_ + task_bytes_ - 1U) / task_bytes_, TaskDone{});
+      task_progress_.assign((total_bytes_ + task_bytes_ - 1U) / task_bytes_, TaskProgress{});
       ready_tasks_ = 0U;
       published_bytes_ = 0U;
     }
@@ -207,10 +207,10 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
-  // Separate copy scheduling from wire progress granularity. Each completion
-  // has one writer; only the coordinator advances the externally read prefix.
-  struct alignas(64) TaskDone { std::uint32_t value{}; };
-  std::vector<TaskDone> task_done_;
+  // Separate balanced task ownership from partial DMA-visible progress. Each
+  // slot has one writer; only the coordinator publishes the contiguous prefix.
+  struct alignas(64) TaskProgress { std::uint64_t bytes{}; };
+  std::vector<TaskProgress> task_progress_;
   std::uint64_t task_bytes_{0U};
   std::size_t ready_tasks_{0U};
   std::uint64_t published_bytes_{0U};

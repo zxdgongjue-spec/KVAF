@@ -3,6 +3,10 @@
 #include <ctime>
 
 namespace kvaf::peer {
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+// Test-only seam for holding a task tail after an earlier prefix is visible.
+void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end);
+#endif
 namespace {
 
 std::uint64_t ThreadCpuNs() {
@@ -105,7 +109,7 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   profile.start_ns = NowNs();
   profile.bytes = ProcessSource(worker);
   profile.copy_done_ns = NowNs();
-  // Chunk writers already completed their stores before publishing TaskDone.
+  // Chunk writers already completed their stores before publishing progress.
   if (pipeline_ready_ == nullptr) GatherBarrier();
   profile.done_ns = NowNs();
   const auto cpu_end = ThreadCpuNs();
@@ -116,6 +120,9 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
   if (offset >= end) return 0U;
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+  CpuGatherBeforeCopyRange(offset, end);
+#endif
   const auto begin = offset;
   const auto index_for_offset = span_bytes_ != 0U
       ? offset / span_bytes_
@@ -147,24 +154,37 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
     return CopyRange(Boundary(worker), Boundary(worker + 1U));
   }
   std::uint64_t copied = 0U;
-  for (auto task = worker; task < task_done_.size(); task += active_threads_) {
+  for (auto task = worker; task < task_progress_.size(); task += active_threads_) {
     const auto begin = static_cast<std::uint64_t>(task) * task_bytes_;
-    copied += CopyRange(begin, std::min(begin + task_bytes_, total_bytes_));
-    // Keep the DMA visibility barrier on every payload-writing thread. A
-    // coordinator barrier alone cannot replace completion of another core's stores.
-    GatherBarrier();
-    __atomic_store_n(&task_done_[task].value, 1U, __ATOMIC_RELEASE);
-    if (worker == 0U) PublishReady();
+    const auto end = std::min(begin + task_bytes_, total_bytes_);
+    for (auto offset = begin; offset < end;) {
+      // Checkpoint at global staging chunk boundaries, not at task-local
+      // multiples: a chunk may span two balanced tasks and two CPU threads.
+      const auto boundary = (offset / pipeline_chunk_bytes_ + 1U) * pipeline_chunk_bytes_;
+      const auto next = std::min(end, boundary);
+      copied += CopyRange(offset, next);
+      // This writer must finish its payload stores before advertising partial
+      // progress. The task's remaining bytes can then be copied independently.
+      GatherBarrier();
+      __atomic_store_n(&task_progress_[task].bytes, next - begin, __ATOMIC_RELEASE);
+      if (worker == 0U) PublishReady();
+      offset = next;
+    }
   }
   return copied;
 }
 
 void CpuGatherExecutor::PublishReady() {
   if (pipeline_ready_ == nullptr) return;
-  while (ready_tasks_ < task_done_.size() &&
-         __atomic_load_n(&task_done_[ready_tasks_].value, __ATOMIC_ACQUIRE) != 0U)
+  auto copied = std::min(total_bytes_, static_cast<std::uint64_t>(ready_tasks_) * task_bytes_);
+  while (ready_tasks_ < task_progress_.size()) {
+    const auto begin = static_cast<std::uint64_t>(ready_tasks_) * task_bytes_;
+    const auto end = std::min(begin + task_bytes_, total_bytes_);
+    const auto progress = __atomic_load_n(&task_progress_[ready_tasks_].bytes, __ATOMIC_ACQUIRE);
+    copied = begin + progress;
+    if (copied < end) break;
     ++ready_tasks_;
-  const auto copied = std::min(total_bytes_, static_cast<std::uint64_t>(ready_tasks_) * task_bytes_);
+  }
   const auto ready = copied == total_bytes_ ? copied : copied / pipeline_chunk_bytes_ * pipeline_chunk_bytes_;
   if (ready > published_bytes_) {
     __atomic_store_n(pipeline_ready_, ready, __ATOMIC_RELEASE);

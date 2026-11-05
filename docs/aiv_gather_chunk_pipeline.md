@@ -15,10 +15,16 @@ payload READ 重叠。保留原有 AIV WQE/SQ 双 bank 流水、整批 staging�
    CPU 拷贝任务与 ready 发布粒度分开：任务按线程数均衡分轮，单任务不超过
    256 KiB，线程按编号分担各轮任务，不再竞争全局领取计数器。当前
    4096 x 656 B / 16 线程得到 16 个 164 KiB 任务，与 ready chunk 大小无关。
-   每个写线程在任务结束后保留系统 barrier，再写各自 64 B 隔离的完成标记。
-   coordinator 是唯一 ready 发布者，汇总连续已完成任务后按 chunk 向下取整；
+   每个写线程在跨过全局 ready chunk 边界或到达任务末尾时，执行系统 barrier，
+   再更新各自 64 B 隔离的已完成字节数。任务分工不变，但不必等完整任务结束
+   才报告进度。例如首线程先复制 `[0,128 KiB)`、barrier、发布 ready=128 KiB，
+   再复制该任务剩余的 36 KiB。边界可以落在 token 内，CopyRange 按字节处理。
+   coordinator 是唯一 ready 发布者，汇总连续已完成任务及首个未完成任务的
+   部分进度后按 chunk 向下取整；不能越过前面的数据空洞。
    全部字节完成时发布实际尾部长度。移除 helper 的公共 ready CAS 和 chunk
    模式重复的线程末尾 barrier。coordinator 等待 helper 时继续推进前缀。
+   128 KiB 只是默认值；设置 `KVAF_AIV_GATHER_CHUNK_BYTES=65536` 可使用
+   64 KiB 发布粒度。任务大小不变，首前缀更早发布，但 barrier/进度更新更频繁。
 3. `ReadyPrefix::BeginQuery/FinishQuery/TryFinishQuery` 经控制队列 READ 描述符的 `[8,48)`，取回本轮
    sequence 和 ready_bytes。目的地址使用现有每 lane 64 B scratch 的
    `[16,56)`，初次通知 WRITE 完成后才复用。校验序号、错误位、范围、
@@ -62,13 +68,15 @@ cmake --build build-npu -j
 export PYTHONPATH="$PWD/build-npu/python"
 ```
 
-本轮 CPU 调度/发布优化修改了 CPU executor，必须同步重编并重启 CPU 服务：
+CPU 调度/发布优化修改了 CPU executor，必须重编并重启 CPU 服务：
 
 ```bash
 cmake --build build-cpu -j
 ```
 
-wire ABI、V4 args 和 profile 布局不变；已有 V4 Host/Python 接口兼容。
+本次任务内部的部分进度发布只修改 CPU executor；如果 N 侧已部署上述 V4
+流水实现，无需再次重编 NPU。wire ABI、V4 args 和 profile 布局不变；
+已有 V4 Host/Python 接口兼容。
 实际加载日志应显示 `symbol=KvafGatherBatchGetAivKernelV4 args_bytes=240`。
 修改环境变量后需要新建 Runtime 实例。
 
@@ -141,5 +149,8 @@ CPU/NPU 时钟不可直接相减，硬件性能和 DMA 可见性仍需目标双�
   profile 校验和旧 ABI 拒绝。无 profile 的模型执行检查不读取计时器。
 - 16 线程、656 B/4096 B token 的均衡任务检查覆盖多个 ready 粒度，包括
   ready chunk 大于整批数据的情况，验证调大发布粒度不会丢失拷贝并行度。
+- 在 4096 x 656 B / 16 线程场景，测试暂停首任务在首个 64 KiB/128 KiB
+  前缀之后的复制，验证 ready 已发布、前缀内容正确且任务尾部尚未修改；
+  覆盖开启/关闭 profile。
 
 本地模型不模拟 CANN 编译、设备缓存一致性或 CPU/NIC DDR 带宽争用。

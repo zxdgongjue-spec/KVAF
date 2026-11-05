@@ -3,6 +3,26 @@
 #include <cstdlib>
 #include <iostream>
 
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+namespace cpu_gather_test {
+constexpr std::uint64_t kFirstTask = 164U * 1024U;
+std::atomic<bool> hold_tail{false}, tail_entered{false}, release_tail{false};
+std::atomic<std::uint64_t> held_begin{0U}, held_end{0U};
+}  // namespace cpu_gather_test
+
+namespace kvaf::peer {
+void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end) {
+  using namespace cpu_gather_test;
+  if (!hold_tail.load(std::memory_order_acquire) ||
+      begin != held_begin.load(std::memory_order_relaxed) ||
+      end != held_end.load(std::memory_order_relaxed))
+    return;
+  tail_entered.store(true, std::memory_order_release);
+  while (!release_tail.load(std::memory_order_acquire)) GatherSpinPause();
+}
+}  // namespace kvaf::peer
+#endif
+
 namespace {
 void Check(bool condition, const char* message) {
   if (!condition) {
@@ -115,7 +135,7 @@ void BalancedCopies(unsigned count, unsigned token) {
       std::memset(expected.data() + std::uint64_t(i) * token, i % 251, token);
     }
     std::uint64_t sequence = 0;
-    for (const auto chunk : {64U, 0U, 131072U, 524288U, 0U, 4194304U}) {
+    for (const auto chunk : {64U, 0U, 65536U, 131072U, 524288U, 0U, 4194304U}) {
       *header = {kvaf::peer::kGatherDescriptorMagic, ++sequence, base + staging_offset,
                  count, static_cast<std::uint32_t>(bytes), chunk, token, 0};
       auto* staging = memory + staging_offset;
@@ -143,6 +163,73 @@ void BalancedCopies(unsigned count, unsigned token) {
   }
   std::free(allocation);
 }
+
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
+  using namespace cpu_gather_test;
+  constexpr unsigned count = 4096U, token = 656U;
+  constexpr std::uint64_t bytes = std::uint64_t(count) * token;
+  constexpr auto staging_offset = 131072U + bytes;
+  constexpr auto region_bytes = staging_offset + bytes + 64U;
+  void* allocation = nullptr;
+  Check(posix_memalign(&allocation, 64U, region_bytes) == 0, "allocation failed");
+  auto* memory = static_cast<std::uint8_t*>(allocation);
+  const auto base = reinterpret_cast<std::uint64_t>(memory);
+  {
+    kvaf::peer::CpuGatherExecutor executor(memory, base, 16U, 65536U,
+                                         kvaf::peer::GatherWaitMode::kActive);
+    if (profile) executor.EnableProfiling();
+    auto* header = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
+    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(header + 1);
+    std::vector<std::uint8_t> expected(bytes);
+    for (unsigned index = 0U; index < count; ++index) {
+      const auto offset = 131072U + std::uint64_t(count - index - 1U) * token;
+      spans[index] = {base + offset, token, 0U};
+      std::memset(memory + offset, index % 251U, token);
+      std::memset(expected.data() + std::uint64_t(index) * token, index % 251U, token);
+    }
+    *header = {kvaf::peer::kGatherDescriptorMagic, 1U, base + staging_offset,
+               count, static_cast<std::uint32_t>(bytes), chunk, token, 0U};
+    auto* staging = memory + staging_offset;
+    std::memset(staging, 0xad, bytes);
+    Check(executor.PrepareDirect(region_bytes, base, 1U, count) == 16U,
+          "early publication changed copy parallelism");
+    tail_entered.store(false, std::memory_order_relaxed);
+    release_tail.store(false, std::memory_order_relaxed);
+    held_begin.store(chunk, std::memory_order_relaxed);
+    held_end.store(std::min(kFirstTask, std::uint64_t(chunk) * 2U), std::memory_order_relaxed);
+    hold_tail.store(true, std::memory_order_release);
+    std::atomic<bool> copy_done{false};
+    std::thread consumer([&] {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!tail_entered.load(std::memory_order_acquire) &&
+             !copy_done.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      Check(tail_entered.load(std::memory_order_acquire),
+            "first task was not split at the ready boundary");
+      Check(__atomic_load_n(&header->ready_bytes, __ATOMIC_ACQUIRE) == chunk,
+            "first chunk was not published before copying the task tail");
+      Check(std::memcmp(staging, expected.data(), chunk) == 0,
+            "first ready prefix contains unfinished payload");
+      Check(std::all_of(staging + chunk, staging + kFirstTask,
+                        [](std::uint8_t byte) { return byte == 0xad; }),
+            "task tail was copied before first prefix publication");
+      release_tail.store(true, std::memory_order_release);
+    });
+    executor.Copy();
+    copy_done.store(true, std::memory_order_release);
+    consumer.join();
+    hold_tail.store(false, std::memory_order_release);
+    Check(header->ready_bytes == bytes, "early publication omitted the final prefix");
+    Check(std::memcmp(staging, expected.data(), bytes) == 0, "early publication payload mismatch");
+    if (profile)
+      for (const auto& thread : executor.ThreadProfiles())
+        Check(thread.bytes == kFirstTask, "partial publication changed balanced task ownership");
+  }
+  std::free(allocation);
+}
+#endif
 }  // namespace
 
 int main() {
@@ -154,5 +241,11 @@ int main() {
         for (bool pipeline : {false, true}) Run(mode, profile, variable, pipeline);
   BalancedCopies(4096, 656);   // Previously 21 tasks for 16 threads at 128 KiB.
   BalancedCopies(4096, 4096);  // Multiple balanced rounds, bounded copy task size.
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+  for (const auto chunk : {65536U, 131072U}) {
+    PublishBeforeTaskTail(false, chunk);
+    PublishBeforeTaskTail(true, chunk);
+  }
+#endif
   std::cout << "CPU gather profile tests passed\n";
 }

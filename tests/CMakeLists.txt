@@ -16,6 +16,7 @@ add_executable(kvaf_cpu_gather_executor_profile_test cpu_gather_executor_profile
 target_include_directories(kvaf_cpu_gather_executor_profile_test PRIVATE
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
 target_link_libraries(kvaf_cpu_gather_executor_profile_test PRIVATE pthread)
+target_compile_definitions(kvaf_cpu_gather_executor_profile_test PRIVATE KVAF_CPU_GATHER_COPY_TEST_HOOK=1)
 add_test(NAME kvaf_cpu_gather_executor_profile_test COMMAND kvaf_cpu_gather_executor_profile_test)
 
 add_test(NAME kvaf_dsa_keys_python
