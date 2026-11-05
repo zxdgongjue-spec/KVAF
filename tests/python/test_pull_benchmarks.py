@@ -3,7 +3,7 @@ import contextlib
 import io
 import unittest
 
-from bench_hbm_read_raw_addr import parse_args, round_counts, pattern_phase
+from bench_hbm_read_raw_addr import parse_args, round_counts, pattern_phase, raw_profile_sample
 from bench_remote_cpu_offload import INTERNAL_STAGES, measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
 
@@ -79,6 +79,31 @@ class PullBenchmarks(unittest.TestCase):
         for i in range(78):
             self.assertNotEqual(pattern_phase(i, 78), pattern_phase(i + 78, 78))
         self.assertEqual([pattern_phase(i, 1) for i in range(4)], [0, 1, 0, 1])
+
+    def test_raw_binding_accounting_uses_same_call_and_excludes_device_overlap(self):
+        stages = dict(checks=2, src=3, dst=4, lengths=5, output=6, stream=7,
+                      retain=8, native=100, release=9, result=10, profile=11, report=12)
+        profile = {f"binding_{name}_us": value for name, value in stages.items()}
+        profile.update(binding_total_us=sum(stages.values()), host_total_us=97,
+                       kernel_event_us=70, kernel_event_error=0)
+        elapsed = profile["binding_total_us"] + 13
+        sample = raw_profile_sample({"profile": profile}, elapsed)
+        self.assertEqual(sample["binding_native_other"], 3)
+        self.assertEqual(sample["python_and_binding_other"], 13)
+        # Native stages and kernel events are nested/overlapping measurements;
+        # neither is added on top of the outer native-call timer.
+        self.assertEqual(sample["python_total"], sum(stages.values()) + 13)
+        self.assertEqual(sample["python_total"], sum(value for name, value in stages.items() if name != "native")
+                         + sample["host_total"] + sample["binding_native_other"] + sample["python_and_binding_other"])
+        profile["kernel_event_us"] = None
+        self.assertNotIn("kernel_event", raw_profile_sample({"profile": profile}, elapsed))
+        # Do not silently clamp an inconsistent sample to zero.
+        profile["host_total_us"] = stages["native"] + 1
+        signed = raw_profile_sample({"profile": profile}, profile["binding_total_us"] - 2)
+        self.assertEqual(signed["binding_native_other"], -1)
+        self.assertEqual(signed["python_and_binding_other"], -2)
+        with self.assertRaisesRegex(RuntimeError, "rebuild"):
+            raw_profile_sample({"profile": {"host_total_us": 100}}, 200)
 
     def test_raw_benchmark_configuration_limits(self):
         common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]

@@ -361,8 +361,22 @@ class NpuPythonRuntime final {
   }
   py::dict BatchGetRawArrays(const ReadyToken& ready,const py::object& src,const py::object& dst,
                          const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges) {
+    using Clock = std::chrono::steady_clock;
+    const auto begin=profiling?Clock::now():Clock::time_point{};
+    auto previous=begin;
+    struct {
+      double checks{},src{},dst{},lengths{},output{},stream{},retain{},native{},release{},result{},profile{},report{};
+    } binding;
+    // Adjacent boundaries keep stages disjoint. No clock reads with profile off.
+    auto mark=[&](double& stage) {
+      if(profiling) {
+        const auto now=Clock::now();
+        stage+=std::chrono::duration<double,std::micro>(now-previous).count();previous=now;
+      }
+    };
     const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
     if(!source)throw py::value_error("raw READ requires an NPU Pull ReadyToken");
+    mark(binding.checks);
     auto array = [&](const py::object& tensor, const char* name) {
       const auto view = GetNpuTensorView(tensor, name);
       if (view.shape.size() != 1 || view.element_bytes != sizeof(std::int64_t) ||
@@ -373,18 +387,24 @@ class NpuPythonRuntime final {
       return NpuInt64ArrayView{static_cast<const std::int64_t*>(view.data), view.bytes / sizeof(std::int64_t)};
     };
     const auto sources = array(src, "src_offsets");
+    mark(binding.src);
     const auto destinations = array(dst, "dst_offsets");
+    mark(binding.dst);
     const auto sizes = array(lengths, "lengths");
+    mark(binding.lengths);
     if (sources.size != destinations.size || sources.size != sizes.size || sources.size > 4096)
       throw py::value_error("raw READ metadata must have equal lengths in 1..4096");
     if(native_->pending_raw_addr())throw py::value_error("resolve the pending raw READ first");
+    mark(binding.checks);
     const auto view=GetNpuTensorView(output,"output");
     if(output.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
       throw py::value_error("raw READ output belongs to another NPU");
+    mark(binding.output);
     if(stream.is_none())stream=py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
     if(py::hasattr(stream,"device") && stream.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
       throw py::value_error("raw READ stream belongs to another NPU");
     const auto acl_stream=acl_python::StreamFromPython(stream);
+    mark(binding.stream);
     // Transport caches (address, size) registrations until detach. Pin their
     // Python owners for the same lifetime so allocator reuse cannot alias an MR.
     const auto source_key=py::make_tuple(source->source_id,source->source_epoch);
@@ -393,11 +413,15 @@ class NpuPythonRuntime final {
     outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data),view.bytes)]=output;
     raw_retained_=py::make_tuple(src,dst,lengths,output,stream);
     HbmReadProfile profile;
+    mark(binding.retain);
     const auto status=native_->BatchGetRawAddr(ready,sources,destinations,sizes,
         {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr,validate_ranges);
+    mark(binding.native);
     if(!native_->pending_raw_addr())raw_retained_=py::none();
     ThrowIfError(status);
+    mark(binding.release);
     py::dict result; result["state"]="done"; result["sequence"]=ready.sequence;
+    mark(binding.result);
     if(profiling) {
       py::dict timing;
       timing["host_total_us"]=profile.total_us;
@@ -410,7 +434,19 @@ class NpuPythonRuntime final {
       timing["host_other_us"]=std::max(0.0,profile.total_us-phases);
       timing["kernel_event_us"]=profile.kernel_event_valid?py::cast(profile.kernel_event_us):py::none();
       timing["kernel_event_error"]=profile.event_error;
-      result["profile"]=std::move(timing);
+      result["profile"]=timing;
+      mark(binding.profile);
+      // Account for most of the instrumentation's own dictionary work. Only
+      // the final report/total fields and function return remain outside total.
+#define RAW_BINDING_PHASE(name) timing["binding_" #name "_us"]=binding.name
+      RAW_BINDING_PHASE(checks); RAW_BINDING_PHASE(src); RAW_BINDING_PHASE(dst);
+      RAW_BINDING_PHASE(lengths); RAW_BINDING_PHASE(output); RAW_BINDING_PHASE(stream);
+      RAW_BINDING_PHASE(retain); RAW_BINDING_PHASE(native); RAW_BINDING_PHASE(release);
+      RAW_BINDING_PHASE(result); RAW_BINDING_PHASE(profile);
+#undef RAW_BINDING_PHASE
+      mark(binding.report);
+      timing["binding_report_us"]=binding.report;
+      timing["binding_total_us"]=std::chrono::duration<double,std::micro>(previous-begin).count();
     }
     return result;
   }

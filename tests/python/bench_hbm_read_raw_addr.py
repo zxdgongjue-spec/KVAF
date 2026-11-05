@@ -69,6 +69,21 @@ def pattern_phase(iteration, source_count):
     return 2 * (iteration % source_count) + (iteration // source_count) % 2
 
 
+def raw_profile_sample(result, elapsed_us):
+    """Split one profiled call; keep nested totals and disjoint stages distinct."""
+    profile = result["profile"]
+    if "binding_total_us" not in profile:
+        raise RuntimeError("raw READ binding timings missing; rebuild the NPU Python extension")
+    sample = {name[:-3]: value for name, value in profile.items()
+              if name.endswith("_us") and value is not None}
+    sample["python_total"] = elapsed_us
+    # Use the same call's measurements, not the separate unprofiled bandwidth run.
+    # Preserve signed residuals so accounting/clock problems cannot be hidden.
+    sample["binding_native_other"] = profile["binding_native_us"] - profile["host_total_us"]
+    sample["python_and_binding_other"] = elapsed_us - profile["binding_total_us"]
+    return sample
+
+
 def packet_payload(torch, offsets, packet_bytes, phase):
     # Same row/byte pattern family as BatchGet, with distinct source-slot IDs
     # and alternating contents so stale output cannot pass the next round.
@@ -177,7 +192,7 @@ def main():
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
-              "status_reset=init_only status_generation=1 status_readback=async_pinned", flush=True)
+              "status_reset=init_only status_generation=1 status_readback=async_pinned binding_profile=1", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
         internal_stages = {}
         event_errors = set()
@@ -208,10 +223,8 @@ def main():
                 stages["batch_get_raw_addr"].append(elapsed_us)
                 stages["verification"].append(verify_us)
             elif iteration >= normal_rounds + args.profile_warmup:
-                internal_stages.setdefault("python_total", []).append(elapsed_us)
-                for name, value in result["profile"].items():
-                    if name.endswith("_us") and value is not None:
-                        internal_stages.setdefault(name[:-3], []).append(value)
+                for name, value in raw_profile_sample(result, elapsed_us).items():
+                    internal_stages.setdefault(name, []).append(value)
                 if result["profile"]["kernel_event_us"] is None:
                     event_errors.add(result["profile"]["kernel_event_error"])
             parent.send(("reuse", iteration))

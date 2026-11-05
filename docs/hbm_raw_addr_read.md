@@ -97,6 +97,27 @@ print(result["profile"])
 | `event_record_us` / `event_query_us` | Host 提交计时事件 / 查询计时结果的开销 |
 | `host_other_us` | 原生总时间减去上述 Host 阶段的余量 |
 
+绑定层另提供以下字段，同样只在 `profile=True` 时读取时钟：
+
+| 字段 | 计时范围 |
+| --- | --- |
+| `binding_checks_us` | 入口准备、源类型、三数组数量及调用前 pending 检查 |
+| `binding_src_us` / `binding_dst_us` / `binding_lengths_us` | 分别提取三个描述 Tensor 的地址、数量、元素大小和 shape，检查连续性、dtype 和设备；不回读数组内容 |
+| `binding_output_us` | 提取 output Tensor 信息并检查设备 |
+| `binding_stream_us` | 获取/检查 stream 并提取 ACL stream 指针；显式传入 stream 时不获取默认 stream |
+| `binding_retain_us` | 查询/更新 output 引用缓存、保留本轮 Tensor/stream 引用和准备 profile 结构 |
+| `binding_native_us` | 整个 NpuRuntime::BatchGetRawAddr 调用，包含 `host_total_us` |
+| `binding_release_us` | 原生返回后检查 pending、释放本轮保留引用、检查返回状态 |
+| `binding_result_us` | 构造正常返回的 state/sequence 字典 |
+| `binding_profile_us` | 构造原有原生计时字典并挂到返回结果；仅 profile 调用产生 |
+| `binding_report_us` | 将新增绑定阶段计时写入字典的开销；仅 profile 调用产生 |
+| `binding_total_us` | 绑定函数入口至写完上述阶段字段；包含原生调用及计时探针开销，不含最后写入 report/total 两个字段、函数退栈和 pybind 返回过程 |
+
+这些阶段以相邻时间戳划分，互不重叠，`binding_checks_us` 合并了入口和数组数量/pending 两段检查。
+`binding_total_us` 等于各 `binding_*` 阶段之和（不再把 total 自身相加）；
+`binding_native_us` 已包含原生总时间与各原生子阶段，`kernel_event_us` 也不能额外加到 Host 总和。
+计时和返回计时字典会增加 profile 调用的开销，带宽仍使用未插桩轮次。
+
 `kernel_event_us` 使用 `ACL_EVENT_TIME_LINE` 和 `aclrtEventElapsedTime`，毫秒转微秒。
 它覆盖 raw READ 算子中的可选长度/边界诊断、WQE 生成与提交和 CQ 等待，属于设备 stream 的事件区间，
 并非仅网络传输时间或各核时间的累加；也可能包含事件与设备调度开销。
@@ -218,6 +239,15 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已
 Python `batch_get_raw_addr()` 完整调用时间，未打开内部计时。
 另外运行带 `profile=True` 的轮次，输出 `NPU_HBM_INTERNAL_PROFILE_STAGE`，
 包括 `python_total`、上述全部 Host 阶段和 `kernel_event` 的 mean/P50/P95/P99/min/max。
+绑定阶段也输出在同一组日志中。bench 对每个 profile 调用另外计算：
+
+- `binding_native_other = binding_native_us - host_total_us`：原生包装层及内外计时边界之间的余量。
+- `python_and_binding_other = python_total - binding_total_us`：Python 调用、pybind 参数转换、最后两个计时字段写入、绑定局部对象析构、返回值交接及替换上一轮 result 的释放开销。
+
+差额保留正负号，便于发现计时问题；按同一次调用计算后再统计，不能用未插桩轮次减去 profile 轮次。
+逐轮可按 `python_total = binding_total_us + python_and_binding_other` 对账，
+`binding_native_us = host_total_us + binding_native_other`；各分位数仍不能相加。
+读取端函数在原生调用期间继续持有 GIL，不存在该边界的 GIL 释放/重新获取耗时。
 内部计时轮次不混入带宽统计；各分位数按 `(N-1)*p` 线性插值，不能将不同阶段的 P99 相加。
 `NPU_HBM_INTERNAL_PROFILE_INFO` 列出有效设备计时样本数和计时错误码，缺失的设备计时不会作为零值统计。
 
