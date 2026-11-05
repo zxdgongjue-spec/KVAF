@@ -20,7 +20,7 @@ SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
-RUN_LABEL = "cpu_chunk_pipeline"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
+RUN_LABEL = "cpu_chunk_optimized"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
 
 import csv

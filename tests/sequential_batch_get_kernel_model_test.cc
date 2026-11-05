@@ -85,13 +85,18 @@ struct ModelQueue {
     uint32_t blocks;
     std::array<uint32_t, 64> words{};
   };
-  std::vector<uint32_t> sq = std::vector<uint32_t>(16 * 16);
+  std::vector<uint32_t, AlignedAllocator<uint32_t>> sq =
+      std::vector<uint32_t, AlignedAllocator<uint32_t>>(16 * 16);
   std::vector<PostedWqe> posted;
   std::vector<std::vector<uint64_t>> write_batches;
   alignas(64) uint32_t cq[2][16]{};
   uint32_t db{}, cq_db{};
   uint64_t pi{}, completed{}, cq_pi{}, cq_completed{}, doorbells{}, first_db_vfs{};
   uint64_t fail_cq_at{UINT64_MAX};
+  uint64_t drop_cq_at{UINT64_MAX};
+  uint64_t release_vf{}, sq_cache_lines{};
+  uint32_t deferred_word{};
+  bool deferred_cq{};
 };
 struct Fixture;
 Fixture* fixture;
@@ -122,9 +127,10 @@ struct Fixture {
   uint64_t descriptor_cache_lines{}, valid_table_cache_lines{};
   uint64_t simt_input_cache_lines{}, row_cache_lines{};
   // Deterministic CPU producer: progress queries advance one copy chunk, while
-  // the CPU's final ACK is deliberately withheld until after payload READs.
+  // the CPU's final ACK is deliberately withheld until three ACK queries.
   uint32_t ready_fault{}, ready_step{1}, ready_idle{2};
   bool ack_timeout{}, ack_error{}, queried_with_data_inflight{};
+  bool hold_data_cq_for_ack{}, delay_progress_cq{}, ack_with_data_inflight{}, prefetched_during_vf{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
@@ -209,6 +215,18 @@ struct Fixture {
     }
   }
   void Poll(void* p) {
+    for (uint32_t q = 0; q < workers * 2; ++q) {
+      auto& m = *queues[q];
+      if (Address(p) >= Address(m.sq.data()) && Address(p) < Address(m.sq.data()) + m.sq.size() * 4)
+        ++m.sq_cache_lines;
+      if (m.deferred_cq && m.release_vf != UINT64_MAX &&
+          aiv_model::vf_calls >= m.release_vf && Address(p) == Address(m.cq[m.cq_pi % 2])) {
+        m.cq[m.cq_pi % 2][0] = m.deferred_word;
+        ++m.cq_pi; ++completions;
+        m.deferred_cq = false;
+        prefetched_during_vf = true;
+      }
+    }
     if (args.mode == KVAF_SEQ_GATHER) {
       const auto address = Address(p);
       if (address >= args.workspace && address < args.workspace + workers * 64ULL)
@@ -366,6 +384,7 @@ struct Fixture {
         }
         if (q % 2 && op == kRead && remote_address == args.remote_control + worker * 64 + 8) {
           ++ack_reads[worker];
+          if (!queues[worker * 2]->posted.empty()) ack_with_data_inflight = true;
           if (!timeout && !ack_timeout && ack_reads[worker] == 3) {
             auto* c = reinterpret_cast<kvaf::peer::GatherControl*>(args.remote_control) + worker;
             assert(c->notify == args.sequence);
@@ -379,7 +398,13 @@ struct Fixture {
               read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
             } else {
               assert(h->ready_bytes == h->total_bytes);
-              assert(queues[worker * 2]->cq_completed == queues[worker * 2]->cq_pi);
+              assert(!queues[worker * 2]->posted.empty());
+              auto& data = *queues[worker * 2];
+              if (data.deferred_cq && data.release_vf == UINT64_MAX) {
+                data.cq[data.cq_pi % 2][0] = data.deferred_word;
+                ++data.cq_pi; ++completions;
+                data.deferred_cq = false;
+              }
             }
             c->ack = args.sequence | ((remote_error || ack_error) ? kErrorBit : 0);
             cpu_done[worker] = true;
@@ -424,10 +449,20 @@ struct Fixture {
         if (header & (1U << 21)) {
           assert(((header >> 16) & 3) == 2);
           assert(m.pi + blocks == end);
-          if (!(data_timeout && !(q % 2))) {
-            m.cq[m.cq_pi % 2][0] = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
+          if (!(data_timeout && !(q % 2)) && m.cq_pi != m.drop_cq_at) {
+            const auto completion_word = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
                 ((cq_error || m.cq_pi == m.fail_cq_at || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
-            ++m.cq_pi; ++completions;
+            const bool defer_progress = delay_progress_cq && q % 2 && op == kRead && first_read_ready[worker] &&
+                remote_address == args.remote_descriptor + worker * args.lane_descriptor_bytes + 8 + 40;
+            if ((hold_data_cq_for_ack && !(q % 2)) || defer_progress) {
+              assert(!m.deferred_cq);
+              m.deferred_cq = true;
+              m.deferred_word = completion_word;
+              m.release_vf = defer_progress ? aiv_model::vf_calls + 1 : UINT64_MAX;
+            } else {
+              m.cq[m.cq_pi % 2][0] = completion_word;
+              ++m.cq_pi; ++completions;
+            }
           }
         } else {
           assert(((header >> 16) & 3) == 1);
@@ -513,7 +548,7 @@ struct Fixture {
           assert(p.ready_queries == ready_reads[core] && p.ready_wait_cycles);
           assert(p.notify_done_cycle < p.first_ready_cycle && p.first_ready_cycle < p.first_read_submit_cycle);
           assert(p.first_read_ready_bytes == first_read_ready[core]);
-          assert(p.first_read_submit_cycle < p.read_done_cycle && p.read_done_cycle < p.ack_done_cycle);
+          assert(p.first_read_submit_cycle < p.ack_done_cycle && p.ack_done_cycle < p.read_done_cycle);
           assert(p.ack_done_cycle < p.kernel_finish_cycle);
         } else {
           assert(p.data_cq_wait_cycles + p.read_build_cycles <= p.read_done_cycle - p.ack_done_cycle);
@@ -542,6 +577,47 @@ void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 int main() {
   const auto& metadata = KvafGatherBatchGetAivKernelV4_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
+  for (uint32_t chunk : {0U, 4096U}) {
+    Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = chunk;
+    f.Run();
+    // Three publication WRs plus one SQ clean per control query. Ready fields
+    // share one scratch-line invalidate, rather than one per field.
+    assert(f.queues[1]->sq_cache_lines == 3 + f.ready_reads[0] + f.ack_reads[0]);
+    assert(f.scratch_cache_lines[0] == 1 + f.ready_reads[0] + f.ack_reads[0]);
+  }
+  {
+    Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 131072; f.ready_idle = 0; f.ready_step = 4;
+    f.delay_progress_cq = true; f.hold_data_cq_for_ack = true;
+    f.DataQueueDepth(32768); f.EnableProfile(); f.Run(); f.CheckProfiles();
+    assert(f.queues[0]->first_db_vfs == 1); // No three-VF startup bubble.
+    assert(f.prefetched_during_vf && f.ack_with_data_inflight);
+    assert(!f.queues[0]->deferred_cq && !f.queues[1]->deferred_cq);
+    assert(f.queues[0]->cq_completed == 1); // No per-frontier data CQ drain.
+    assert(aiv_model::vf_with_pending_mte3 > f.read_overlap_begin[0]);
+  }
+  for (uint32_t fault : {3U, 5U}) {
+    Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 131072; f.ready_idle = 0; f.ready_step = 4;
+    f.ready_fault = fault; f.DataQueueDepth(32768); f.EnableProfile();
+    f.Run(false, true);
+    assert(f.status[0].result == KVAF_SEQ_REMOTE_ERROR);
+    assert(f.states[0].poisoned && f.states[1].poisoned);
+    assert(f.status[0].data_wrs == 128); // Built next VF is discarded, never doorbelled.
+  }
+  for (bool timeout : {false, true}) {
+    Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 131072; f.ready_idle = 0; f.ready_step = 16;
+    f.DataQueueDepth(32768); f.EnableProfile();
+    if (timeout) f.queues[1]->drop_cq_at = 3; // Two publication CQs + initial ready; lookahead is lost.
+    else f.ready_fault = 5; // Error while a VF and an MTE3 post are still live.
+    f.Run(false, true);
+    assert(f.status[0].result == (timeout ? KVAF_SEQ_TIMEOUT : KVAF_SEQ_REMOTE_ERROR));
+    assert(f.states[0].poisoned && f.states[1].poisoned && f.data_reads);
+    assert(!f.queues[0]->posted.empty() && !f.queues[0]->cq_completed);
+    assert(f.status[0].data_wrs < (8193 + 5) / 6);
+  }
   // CPU chunks and NIC READs overlap without per-chunk data CQ waits. The
   // producer only copies the next chunk when queried: an early data doorbell
   // therefore proves that later staging bytes have not been gathered yet.

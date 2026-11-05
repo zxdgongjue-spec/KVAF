@@ -92,6 +92,57 @@ void Run(kvaf::peer::GatherWaitMode mode, bool profile, bool variable, bool pipe
   }
   std::free(allocation);
 }
+
+void BalancedCopies(unsigned count, unsigned token) {
+  const std::uint64_t bytes = std::uint64_t(count) * token;
+  const auto staging_offset = (131072U + bytes + 63U) & ~std::uint64_t{63U};
+  const auto region_bytes = staging_offset + bytes + 64U;
+  void* allocation = nullptr;
+  Check(posix_memalign(&allocation, 64U, region_bytes) == 0, "allocation failed");
+  auto* memory = static_cast<std::uint8_t*>(allocation);
+  const auto base = reinterpret_cast<std::uint64_t>(memory);
+  {
+    kvaf::peer::CpuGatherExecutor executor(memory, base, 16U, 65536U,
+                                         kvaf::peer::GatherWaitMode::kActive);
+    executor.EnableProfiling();
+    auto* header = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
+    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(header + 1);
+    std::vector<std::uint8_t> expected(bytes);
+    for (unsigned i = 0; i < count; ++i) {
+      const auto offset = 131072U + std::uint64_t(count - i - 1) * token;
+      spans[i] = {base + offset, token, 0};
+      std::memset(memory + offset, i % 251, token);
+      std::memset(expected.data() + std::uint64_t(i) * token, i % 251, token);
+    }
+    std::uint64_t sequence = 0;
+    for (const auto chunk : {64U, 0U, 131072U, 524288U, 0U, 4194304U}) {
+      *header = {kvaf::peer::kGatherDescriptorMagic, ++sequence, base + staging_offset,
+                 count, static_cast<std::uint32_t>(bytes), chunk, token, 0};
+      auto* staging = memory + staging_offset;
+      std::memset(staging, 0xad, bytes);
+      Check(executor.PrepareDirect(region_bytes, base, sequence, count) == 16,
+            "chunk size reduced useful copy parallelism");
+      std::thread consumer;
+      if (chunk) consumer = std::thread([&] {
+        std::uint64_t previous = 0;
+        while (previous < bytes) {
+          const auto ready = __atomic_load_n(&header->ready_bytes, __ATOMIC_ACQUIRE);
+          Check(ready >= previous && ready <= bytes, "ready prefix regressed");
+          Check(ready == bytes || ready % chunk == 0, "misaligned ready publication");
+          Check(std::memcmp(staging + previous, expected.data() + previous, ready - previous) == 0,
+                "published task prefix contains unfinished payload");
+          previous = ready;
+        }
+      });
+      executor.Copy();
+      if (consumer.joinable()) consumer.join();
+      Check(std::memcmp(staging, expected.data(), bytes) == 0, "balanced copy payload mismatch");
+      for (const auto& profile : executor.ThreadProfiles())
+        Check(profile.bytes == bytes / 16, "copy work still depends on ready chunk size");
+    }
+  }
+  std::free(allocation);
+}
 }  // namespace
 
 int main() {
@@ -101,5 +152,7 @@ int main() {
     for (bool profile : {false, true})
       for (bool variable : {false, true})
         for (bool pipeline : {false, true}) Run(mode, profile, variable, pipeline);
+  BalancedCopies(4096, 656);   // Previously 21 tasks for 16 threads at 128 KiB.
+  BalancedCopies(4096, 4096);  // Multiple balanced rounds, bounded copy task size.
   std::cout << "CPU gather profile tests passed\n";
 }

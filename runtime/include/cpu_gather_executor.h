@@ -129,6 +129,18 @@ class CpuGatherExecutor {
     staging_ = memory_ + (staging - base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
+    if (pipeline_ready_ != nullptr) {
+      // Balanced static rounds, capped at 256 KiB per copy task. A 2.5625-MiB
+      // lane with 16 threads gets 16 x 164-KiB tasks, independent of ready chunk.
+      constexpr std::uint64_t kMaxTaskBytes = 256U * 1024U;
+      const auto round_bytes = threads * kMaxTaskBytes;
+      const auto rounds = (total_bytes_ + round_bytes - 1U) / round_bytes;
+      const auto slots = threads * rounds;
+      task_bytes_ = ((total_bytes_ + slots - 1U) / slots + 63U) & ~std::uint64_t{63U};
+      task_done_.assign((total_bytes_ + task_bytes_ - 1U) / task_bytes_, TaskDone{});
+      ready_tasks_ = 0U;
+      published_bytes_ = 0U;
+    }
     phase_.store(0U, std::memory_order_release);
     if (!thread_profiles_.empty()) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
@@ -167,6 +179,7 @@ class CpuGatherExecutor {
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
 
   std::uint64_t ProcessSource(std::size_t worker);
+  void PublishReady();
 
   static std::uint64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -194,8 +207,13 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
-  std::vector<std::uint32_t> chunk_done_;
-  std::atomic<std::size_t> next_chunk_{0U};
+  // Separate copy scheduling from wire progress granularity. Each completion
+  // has one writer; only the coordinator advances the externally read prefix.
+  struct alignas(64) TaskDone { std::uint32_t value{}; };
+  std::vector<TaskDone> task_done_;
+  std::uint64_t task_bytes_{0U};
+  std::size_t ready_tasks_{0U};
+  std::uint64_t published_bytes_{0U};
   std::vector<CpuGatherThreadProfile> thread_profiles_;
   CpuGatherCopyProfile copy_profile_{};
   alignas(64) std::atomic<std::uint32_t> phase_{0U};

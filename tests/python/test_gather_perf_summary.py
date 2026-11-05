@@ -215,6 +215,22 @@ class GatherPerfSummaryTest(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 perf.summarize_profiles([bad], 1, 1)
 
+    def test_chunk_profile_accepts_ack_while_payload_is_in_flight(self):
+        sample = snapshot(1, cores=1, requests=1)
+        lane = sample["cores"][0]
+        lane.update(pipeline_chunk_bytes=64, first_ready_cycle=4, first_read_submit_cycle=5,
+                    ack_done_cycle=7, read_done_cycle=10, kernel_finish_cycle=11,
+                    ready_queries=2, ready_wait_cycles=1, first_read_ready_bytes=656)
+        _, lanes = perf.summarize_profiles([sample], 1, 1)
+        self.assertEqual(lanes[0]["wait_cpu"], 4)
+        self.assertEqual(lanes[0]["read"], 5)
+        self.assertEqual(lanes[0]["finalize"], 1)
+        metadata = {**self.csv_metadata(clock=50), "cores": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            row = self.read_csv(perf.export_csv_results(directory, metadata, [], [sample], [100.0])[3])[0]
+            self.assertEqual(float(row["wait_cpu_cycles"]), 4)
+            self.assertEqual(float(row["read_cycles"]), 5)
+
     def test_profiles_reject_missing_stale_failed_or_wrong_lane_data(self):
         original = snapshot()
         for case in ("missing_core", "duplicate", "wrong_partition", "stale_lane", "error", "time_reversal", "negative_counter", "negative_host"):

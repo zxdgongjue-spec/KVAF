@@ -66,10 +66,6 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   pipeline_ready_ = nullptr;
   if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
-    const auto chunks = header.total_bytes / pipeline_chunk_bytes_ +
-                        (header.total_bytes % pipeline_chunk_bytes_ != 0U);
-    chunk_done_.assign(chunks, 0U);
-    next_chunk_.store(0U, std::memory_order_relaxed);
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
   }
@@ -86,15 +82,18 @@ void CpuGatherExecutor::Copy() {
   CopyWorker(0U);
   if (!thread_profiles_.empty())
     copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
-  while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) GatherSpinPause();
-  if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
+  while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
+    PublishReady();
+    GatherSpinPause();
+  }
+  PublishReady();
   if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
 }
 
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   if (thread_profiles_.empty()) {
     (void)ProcessSource(worker);
-    GatherBarrier();
+    if (pipeline_ready_ == nullptr) GatherBarrier();
     return;
   }
   auto& profile = thread_profiles_[worker];
@@ -106,7 +105,8 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   profile.start_ns = NowNs();
   profile.bytes = ProcessSource(worker);
   profile.copy_done_ns = NowNs();
-  GatherBarrier();
+  // Chunk writers already completed their stores before publishing TaskDone.
+  if (pipeline_ready_ == nullptr) GatherBarrier();
   profile.done_ns = NowNs();
   const auto cpu_end = ThreadCpuNs();
   profile.cpu_time_valid = cpu_begin != 0U && cpu_end >= cpu_begin;
@@ -147,27 +147,29 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
     return CopyRange(Boundary(worker), Boundary(worker + 1U));
   }
   std::uint64_t copied = 0U;
-  for (;;) {
-    const auto chunk = next_chunk_.fetch_add(1U, std::memory_order_relaxed);
-    if (chunk >= chunk_done_.size()) return copied;
-    const auto begin = static_cast<std::uint64_t>(chunk) * pipeline_chunk_bytes_;
-    copied += CopyRange(begin, std::min(begin + pipeline_chunk_bytes_, total_bytes_));
+  for (auto task = worker; task < task_done_.size(); task += active_threads_) {
+    const auto begin = static_cast<std::uint64_t>(task) * task_bytes_;
+    copied += CopyRange(begin, std::min(begin + task_bytes_, total_bytes_));
+    // Keep the DMA visibility barrier on every payload-writing thread. A
+    // coordinator barrier alone cannot replace completion of another core's stores.
     GatherBarrier();
-    __atomic_store_n(&chunk_done_[chunk], 1U, __ATOMIC_RELEASE);
-    auto observed = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
-    auto prefix = static_cast<std::size_t>(observed / pipeline_chunk_bytes_);
-    while (prefix < chunk_done_.size() &&
-           __atomic_load_n(&chunk_done_[prefix], __ATOMIC_ACQUIRE) != 0U)
-      ++prefix;
-    const auto ready_bytes =
-        std::min(total_bytes_, static_cast<std::uint64_t>(prefix) * pipeline_chunk_bytes_);
-    while (observed < ready_bytes) {
-      if (!__atomic_compare_exchange_n(pipeline_ready_, &observed, ready_bytes, false,
-                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-        continue;
-      GatherBarrier();
-      break;
-    }
+    __atomic_store_n(&task_done_[task].value, 1U, __ATOMIC_RELEASE);
+    if (worker == 0U) PublishReady();
+  }
+  return copied;
+}
+
+void CpuGatherExecutor::PublishReady() {
+  if (pipeline_ready_ == nullptr) return;
+  while (ready_tasks_ < task_done_.size() &&
+         __atomic_load_n(&task_done_[ready_tasks_].value, __ATOMIC_ACQUIRE) != 0U)
+    ++ready_tasks_;
+  const auto copied = std::min(total_bytes_, static_cast<std::uint64_t>(ready_tasks_) * task_bytes_);
+  const auto ready = copied == total_bytes_ ? copied : copied / pipeline_chunk_bytes_ * pipeline_chunk_bytes_;
+  if (ready > published_bytes_) {
+    __atomic_store_n(pipeline_ready_, ready, __ATOMIC_RELEASE);
+    GatherBarrier();
+    published_bytes_ = ready;
   }
 }
 

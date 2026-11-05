@@ -3,7 +3,9 @@
 目标是解释 AIV `wait_cpu_us` 中 CPU 执行的部分，尤其是
 4096 B × 8192、2 个 AIV 核、SGL=1 的约 1.4～1.5 ms 等待。
 CPU 阶段和线程埋点均由 `KVAF_GATHER_PROFILE=1` 开启；关闭时不读取这些计时器。
-只需重编 K 侧 CPU 服务，N 侧 Host/kernel 和通信 ABI 不变，所有 SGL 共用同一路径。
+CPU 埋点本身不改变通信 ABI，所有 SGL 共用同一路径。当前
+[chunk 调度与 NPU 查询优化](aiv_gather_chunk_pipeline.md)需要同步更新 K 侧
+CPU 服务和 N 侧 gather kernel；部署方式以上述文档为准。
 
 ## 采集
 
@@ -65,7 +67,7 @@ pgrep -af '[k]vaf_cpu_service'
 | `prepare_ns` | 校验描述、发布任务和唤醒 helper 的耗时；首次调用含创建线程 |
 | `copy_ns` | coordinator 开始执行 Copy 到所有 helper 完成，包含唤醒、调度、拷贝和等待 |
 | `dispatch_to_copy_ns` | 发布 helper generation 到 coordinator 开始 Copy 的间隔，与 prepare 部分重叠 |
-| `join_wait_ns` | coordinator 完成本地拷贝/barrier 后，等待其他 helper 完成的时间，是 copy 的子项 |
+| `join_wait_ns` | coordinator 完成本地任务后等待 helper 的时间，是 copy 的子项；chunk 优化版在此期间也推进 ready 前缀 |
 | `ack_ns` | 写最终 ACK 并完成 barrier 的耗时 |
 | `total_ns` | 从观察 notify 到最终 ACK barrier 完成，包含上述执行阶段及边界开销 |
 | `notify_poll_window_ns` | 最近一次带时间戳的空轮询到观察新 notify 的间隔，仅在 valid=1 时有效 |
@@ -90,8 +92,8 @@ ACK 读取与 CQ 等待，而且 CPU 可能在 AIV 的 publish 阶段尚未结�
 | --- | --- |
 | `ready_delay_ns` | 发布 helper generation 到该线程取得任务；coordinator 使用 Copy 开始时刻 |
 | `start_delay_ns` | coordinator 开始 Copy 到该线程开始 ProcessSource 的延迟，含 phase 等待和调度 |
-| `copy_ns` | 该线程的 ProcessSource 墙钟耗时；当前无分块流水的请求中主要是 CopyRange/memcpy |
-| `barrier_ns` | ProcessSource 返回到 GatherBarrier 完成，AArch64 上包含 dsb sy |
+| `copy_ns` | 该线程的 ProcessSource 墙钟耗时；chunk 模式含任务内 barrier，coordinator 还包含前缀发布 |
+| `barrier_ns` | ProcessSource 返回到末尾同步完成；整批模式含 dsb sy，chunk 模式已在任务内同步，不重复执行末尾 barrier |
 | `work_ns` | 该线程 ProcessSource 加 barrier 的墙钟耗时 |
 | `thread_cpu_ns` | 同一工作区间附近的线程 CPU 时间；`cpu_time_valid=0` 时不可使用 |
 | `bytes` | 该线程实际拷贝的字节数；各活跃线程相加应等于请求 bytes |
@@ -107,6 +109,7 @@ ACK 读取与 CQ 等待，而且 CPU 可能在 AIV 的 publish 阶段尚未结�
 - `work_ns` 明显大于 `thread_cpu_ns`：工作期间可能有较长的未运行区间或中断；
   这是调度线索，两个时钟的读取边界不同，不能用微小差值认定被抢占。
 - `barrier_ns` 高：检查数据写入完成/系统 barrier，而不是只看 memcpy。
+  chunk 模式的任务内 barrier 计入 copy_ns，不能由较低的 barrier_ns 推断其没有成本。
 - `join_wait_ns` 高：coordinator 在等待其他线程，结合最晚线程的启动和工作时间定位。
 - CPU `total_ns` 只有几十/几百 us，而同请求 AIV 等待仍有 1.5 ms：CPU 执行不足以
   解释等待，继续检查通知观察之前及 ACK 发布之后的通信与调度，不先归因于 memcpy。
