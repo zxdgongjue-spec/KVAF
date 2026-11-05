@@ -32,6 +32,7 @@ struct NpuRuntimeOptions {
   std::uint32_t jettys_per_core{2U};
   // Nonempty selects the optional AICPU UMDK data plane; AIV defaults stay unchanged.
   std::string aicpu_urma_kernel_json_path;
+  // Optional UMDK endpoint filters; AICPU always uses the Host-selected EID.
   std::string urma_device;
   std::uint32_t urma_eid_index{UINT32_MAX};
   // AICPU BatchGet algorithm; BatchPut continues to use its UMDK session.
@@ -41,7 +42,8 @@ struct NpuRuntimeOptions {
   // Optional strict local-EID list. Empty preserves automatic discovery and
   // selects one working EID. Multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut
-  // remains on the first EID.
+  // remains on the first EID. AICPU tries explicit EIDs as connectivity
+  // fallbacks; CPU push/scatter accepts one explicit EID.
   std::vector<std::string> npu_eids{};
   // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
   // explicit device uses the native first-working path without tuning.

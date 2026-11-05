@@ -52,8 +52,6 @@ runtime = kvaf.NpuRuntime(
         os.environ["ASCEND_HOME_PATH"],
         "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json",
     ),
-    urma_device="udmac0d1e5",
-    urma_eid_index=0,
 )
 runtime.link_to("127.0.0.1:28990")
 runtime.initialize(ddr_bytes=656 * 8192, slot_size=656)
@@ -75,7 +73,7 @@ runtime.release_access_table(table)
 runtime.shutdown()
 ```
 
-设备、URMA device、EID 和服务地址按部署环境调整。原来的 addresses/valid Tensor 重载也可直接使用。
+设备号和服务地址按部署环境调整；UMDK device/index 默认由 Host EID 匹配，通常无需指定。原来的 addresses/valid Tensor 重载也可直接使用。
 `NpuRuntime::Impl::CreateCore()` 在创建 RuntimeCore 时选择 AccessOperator：
 `aicpu_urma_kernel_json_path` 非空时创建 `UmdkAccessOperator`，为空时创建 AIV 的
 `DefaultAccessOperator`。同一个 Runtime 的 Get/Put 使用选中的实现。
@@ -91,6 +89,31 @@ runtime.batch_get(addresses, valid, indices, offsets, miss_count, output_indices
 调用方管理这些地址对应的远端数据生命周期。使用 `prepare_access_table` 的调用仍保留公共元数据接口，
 Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制 Host 地址表。
 
+## 与 AIV 共用 Host EID 发现
+
+GatherRead、裸地址 GatherRead 和 CPU Push Scatter 都由 `NpuRuntime` 的现有
+EID 发现流程选路：逻辑设备号映射到物理设备号，读取 CLOS 与 pair_info 候选，
+再沿用原有候选验证流程选择可用连接。AICPU 不再自行选择第一个可见 UMDK EID。
+
+Host 将选定 EID 传入 UMDK Prepare，设备端只匹配该 EID 对应的 UB device/index 并创建 context；
+没有匹配项时报告失败，交回 Runtime 尝试下一个候选，不改用其他 EID。
+`--urma-device` 和 `--eid-index` 是可选过滤条件，默认不限制设备或索引。
+`--npu-eid` 可指定一个 Host EID；Python 的 `npu_eids` 在 GatherRead 下按顺序作为候选尝试，
+CPU Push Scatter 接受一个显式 EID。AIV 原有的多 EID 条带语义不变。
+
+同一个 Runtime 的 GatherRead/BatchPut 共用选定 EID；CPU Push Scatter 的 HCCP 回推通道
+与其 UMDK BatchPut 也绑定同一个 Host EID，各自管理自己的通信资源。
+Host/设备控制参数已增加 EID 字段，仍使用单一 `KvafAicpuUmdkControl` 入口。
+升级时必须一起重建 Host 库并重新安装设备算子包，然后重启 NPU 进程：
+
+```bash
+./build.sh aicpu-urma --cpu-push --install-kernel
+export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
+```
+
+AICPU 初始化输出 `UMDK_EID_SELECTED source=host device=... eid_index=... eid=...`，
+应与 Runtime 选定的 Host 候选一致。该改动不包含 TP 实验、请求邮箱协议变更或诊断清零开关。
+
 ## 测试直接输入 CPU 源地址
 
 给性能扫描加 `--source-mode direct`，AICPU 就直接读取本轮的 `addresses[i]`，
@@ -105,7 +128,6 @@ KVAF_AICPU_MISS_COUNTS="4096" \
 KVAF_AICPU_WORKERS="1" \
 ./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
   --device-id 7 --peer 127.0.0.1:28888 \
-  --urma-device udmac0d1e5 --eid-index 0 \
   --source-mode direct --warmup 10 --iterations 100
 ```
 
@@ -136,7 +158,6 @@ CPU 服务启动后，在仓库根目录运行：
 export PYTHONPATH="$PWD/build-aicpu-urma/python:$PYTHONPATH"
 python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0 \
   --workers 1 2 4 --blocks 4096 --token-bytes 656 \
   --tokens-per-block 2 --warmup 10 --iterations 1000
 ```
@@ -199,8 +220,7 @@ Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳�
 
 ```bash
 ./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0
+  --device-id 7 --peer 127.0.0.1:28990
 ```
 
 Shell 脚本循环调用 `python/benchmark_gather_read.py`，通过 `NpuRuntime.batch_get` 测量。
@@ -232,7 +252,6 @@ KVAF_AICPU_MISS_COUNTS="32 4096" \
 KVAF_AICPU_WORKERS="1 2 4" \
 ./tests/run_aicpu_gather_read_sweep.sh build-aicpu-urma \
   --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0 \
   --warmup 3 --iterations 20
 ```
 

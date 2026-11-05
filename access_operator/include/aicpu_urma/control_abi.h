@@ -39,6 +39,8 @@ struct UmdkControlArgs {
   std::uint32_t worker_index;
   std::uint64_t transfer_spans;
   std::uint32_t transfer_count;
+  // Selected by NpuRuntime; device/index only filter matching endpoints.
+  std::uint8_t local_eid[16];
 };
 
 struct alignas(64) UmdkControlStatus {

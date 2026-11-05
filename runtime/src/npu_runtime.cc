@@ -542,8 +542,8 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
         config.adaptive_ub_miss_count > static_cast<std::uint32_t>(INT32_MAX))))) {
     throw std::invalid_argument("invalid URMA Runtime configuration");
   }
-  if (aicpu && (config.adaptive_ub_device || (!push && !config.npu_eids.empty())))
-    throw std::invalid_argument("AICPU uses urma_device/urma_eid_index; AIV EID striping and startup tuning are unavailable");
+  if (aicpu && config.adaptive_ub_device)
+    throw std::invalid_argument("AICPU startup bandwidth tuning is unavailable");
   if (aicpu && (config.npu_core_count > 8U || GatherStagingBytes(config.batch_get_token_bytes) > UINT32_MAX))
     throw std::invalid_argument("UMDK supports 1..8 workers and a gather payload fitting uint32");
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
@@ -626,10 +626,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   std::vector<NpuLocalEidCandidate> npu_candidates;
   std::string discovery_error;
   const bool explicit_eids = !impl_->options.npu_eids.empty();
-  if (!impl_->options.aicpu_urma_kernel_json_path.empty() &&
-      impl_->options.aicpu_batch_get_mode != "cpu_push_scatter") {
-    npu_candidates.push_back({{}, "umdk_device_discovery"});
-  } else if (explicit_eids) {
+  const bool aicpu = !impl_->options.aicpu_urma_kernel_json_path.empty();
+  // AIV stripes an explicit list; AICPU tries those EIDs one at a time.
+  const bool multi_eid_group = explicit_eids && !aicpu;
+  if (explicit_eids) {
     if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
                                      impl_->options.npu_eids,
                                      &npu_candidates, &discovery_error)) {
@@ -643,7 +643,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   const std::size_t worker_count =
       static_cast<std::size_t>(impl_->options.npu_core_count) *
       impl_->options.jettys_per_core;
-  if (explicit_eids && npu_candidates.size() > worker_count) {
+  if (multi_eid_group && npu_candidates.size() > worker_count) {
     return Status::InvalidArgument(
         "npu_eids count exceeds npu_core_count * jettys_per_core workers");
   }
@@ -669,9 +669,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     last = detail::BuildStartupProbeLayout(probe_config, &probe_layout);
     if (!last.ok()) return last;
   }
-  // An explicit N-side list remains one strict multi-EID group. Automatically
-  // discovered EIDs are connectivity fallbacks.
-  const std::size_t npu_group_count = explicit_eids ? 1U : npu_candidates.size();
+  // AICPU reuses the existing Host discovery and candidate validation loop.
+  const std::size_t npu_group_count = multi_eid_group ? 1U : npu_candidates.size();
   std::vector<std::string> peer_candidate_device_names;
   std::vector<bool> peer_candidate_allowed;
   if (fixed_peer_device) {
@@ -708,8 +707,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     impl_->peer_allocator->SetCandidate(peer_candidate);
     Status last;
     for (const std::size_t npu_group : std::array<std::size_t, 1U>{candidate.local_group}) {
-      const std::size_t group_begin = explicit_eids ? 0U : npu_group;
-      const std::size_t group_size = explicit_eids ? npu_candidates.size() : 1U;
+      const std::size_t group_begin = multi_eid_group ? 0U : npu_group;
+      const std::size_t group_size = multi_eid_group ? npu_candidates.size() : 1U;
       impl_->runtime_core.reset();
       impl_->access_operator.reset();
       impl_->ReleaseProbe();

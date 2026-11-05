@@ -12,8 +12,6 @@ runtime = kvaf.NpuRuntime(
     npu_core_count=4,
     aicpu_urma_kernel_json_path=kernel_json,
     aicpu_batch_get_mode="cpu_push_scatter",
-    urma_device="udmac0d1e5",  # BatchPut 的 UMDK 端点，按部署环境调整。
-    urma_eid_index=0,
 )
 runtime.link_to("127.0.0.1:28990")
 runtime.initialize(ddr_bytes=656 * 2 * 8192, slot_size=656 * 2)
@@ -23,7 +21,11 @@ runtime.initialize(ddr_bytes=656 * 2 * 8192, slot_size=656 * 2)
 `aicpu_batch_get_mode` 默认为 `gather_read`，两个值均可使用原有两种 Tensor 重载。
 CPU push 自动发现单个 NPU EID，也可通过 `npu_eids=[eid]` 指定一个 EID。
 自动发现的候选按现有 Runtime 初始化流程尝试；多 EID 条带和 AIV 自适应调优不用于此路径。
-Get 使用 Host direct HCCP/RA；Put 继续使用既有 AICPU UMDK session。
+Get 使用 Host direct HCCP/RA；Put 使用 AICPU UMDK session。两者使用同一个 Host 选定 EID，
+复用仓库原有的 CLOS/pair_info 发现与候选验证流程，UMDK 不再独立选择端点。
+`--urma-device`、`--eid-index` 只作可选过滤，默认不限制；没有匹配该 EID 的 UMDK 端点就尝试下一候选。
+控制参数有更新，Host 库和设备包必须一起重建；仍保留单一 UMDK 控制入口。
+CPU push 的 V3 数据/请求协议及 TP 管理保持本分支原有实现。
 CPU 使用四路 Jetty，由所属服务线程更新并依次提交预构建链；
 `npu_core_count` / `--workers` 控制 AICPU worker 数。
 
@@ -57,7 +59,6 @@ CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 co
 ```bash
 python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0 \
   --modes gather_read cpu_push_scatter --workers 1 2 4 8 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
   --output-row-step 1 --warmup 10 --iterations 100
@@ -76,8 +77,7 @@ CPU 服务启动后，在加载 CANN 环境的终端运行：
 
 ```bash
 ./tests/run_aicpu_cpu_push_scatter_sweep.sh build-aicpu-urma \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0
+  --device-id 7 --peer 127.0.0.1:28990
 ```
 
 默认与 GatherRead sweep 一样扫描 252 组：token 为 128、256、512、656、1024、2048、4096 B，
@@ -103,13 +103,12 @@ KVAF_AICPU_MISS_COUNTS="32 4096" \
 KVAF_AICPU_WORKERS="1 2 4 5" \
 ./tests/run_aicpu_cpu_push_scatter_sweep.sh build-aicpu-urma \
   --device-id 7 --peer 127.0.0.1:28990 \
-  --urma-device udmac0d1e5 --eid-index 0 \
   --table-capacity 4096 --warmup 3 --iterations 20
 ```
 
 每组 `.log` 和 `summary.csv` 默认写入 `reports/aicpu-cpu-push-scatter/<时间戳>`。
 `KVAF_AICPU_SWEEP_LOG_DIR` 可指定一个新目录；任一组失败后停止并保留已完成结果。
-单组入口为 `python/benchmark_cpu_push_scatter.py`，参数与 GatherRead 相同，另支持 `--npu-eid`。
+单组入口为 `python/benchmark_cpu_push_scatter.py`，参数与 GatherRead 相同，都支持 `--npu-eid`。
 
 ## 请求与数据流
 

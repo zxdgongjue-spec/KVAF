@@ -18,7 +18,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--modes", nargs="+", choices=["gather_read", "cpu_push_scatter"],
                         default=["gather_read"])
-    parser.add_argument("--npu-eid", help="optional single NPU EID for cpu_push_scatter")
+    parser.add_argument("--npu-eid", help="optional Host-selected NPU EID for all AICPU modes")
     parser.add_argument("--output-row-step", type=int, choices=[1, 2], default=2,
                         help="1 checks adjacent output rows; 2 leaves one guard row between outputs")
     parser.add_argument("--output-order", choices=["random", "sequential"], default="random",
@@ -34,7 +34,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-rounds", type=int, default=0,
                         help="extra instrumented rounds, excluded from bandwidth statistics")
     parser.add_argument("--urma-device", default="")
-    parser.add_argument("--eid-index", type=int, default=0)
+    parser.add_argument("--eid-index", type=int, default=0xFFFFFFFF,
+                       help="optional UMDK endpoint index filter; default matches the Host EID at any index")
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
     parser.add_argument(
         "--kernel-json",
@@ -57,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (not 0 <= args.active_percent <= 100 or args.warmup < 0 or args.iterations <= 0
             or args.profile_rounds < 0):
         parser.error("invalid active percentage, warmup or iteration count")
-    if not 0 <= args.eid_index < 0xFFFFFFFF:
+    if not 0 <= args.eid_index <= 0xFFFFFFFF:
         parser.error("--eid-index must be a nonnegative uint32 index")
     if not args.kernel_json or not Path(args.kernel_json).is_file():
         parser.error("source the CANN environment or pass an installed --kernel-json")
@@ -163,7 +164,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         urma_device=args.urma_device,
         urma_eid_index=args.eid_index,
         aicpu_batch_get_mode=mode,
-        npu_eids=[args.npu_eid] if mode == "cpu_push_scatter" and args.npu_eid else [],
+        npu_eids=[args.npu_eid] if args.npu_eid else [],
     )
     # Reuse registered allocations while changing their contents each round.
     source = torch.empty((n, block_bytes), dtype=torch.uint8, device=device)

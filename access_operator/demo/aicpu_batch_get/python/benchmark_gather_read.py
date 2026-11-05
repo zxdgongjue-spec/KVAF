@@ -22,14 +22,14 @@ def parse_args(argv=None, *, mode="gather_read"):
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
     p.add_argument("--urma-device", default="")
-    p.add_argument("--eid-index", type=int, default=0)
+    p.add_argument("--eid-index", type=int, default=0xFFFFFFFF,
+                       help="optional UMDK endpoint index filter; default matches the Host EID at any index")
     if mode == "gather_read":
         p.add_argument("--source-mode", choices=("table", "direct"), default="table",
                        help="direct: prepare CPU source addresses before timing; skip AICPU lookup")
     else:
         p.set_defaults(source_mode="table")
-    if mode == "cpu_push_scatter":
-        p.add_argument("--npu-eid", help="optional single NPU EID for direct HCCP")
+    p.add_argument("--npu-eid", help="optional Host-selected NPU EID")
     cann = os.environ.get("ASCEND_HOME_PATH") or os.environ.get("ASCEND_CANN_PACKAGE_PATH")
     p.add_argument("--kernel-json", default=str(Path(cann) / "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json") if cann else None)
     p.add_argument("--workers", type=int, default=1)
@@ -55,7 +55,7 @@ def parse_args(argv=None, *, mode="gather_read"):
         p.error("source pool plus workspace must fit the 100 GiB DDR budget")
     if a.warmup < 0 or a.iterations <= 0:
         p.error("invalid warmup or iterations")
-    if a.device_id < 0 or not 0 <= a.eid_index < 0xFFFFFFFF:
+    if a.device_id < 0 or not 0 <= a.eid_index <= 0xFFFFFFFF:
         p.error("invalid device or EID index")
     if not a.kernel_json or not Path(a.kernel_json).is_file():
         p.error("source the CANN environment or pass an installed --kernel-json")
@@ -166,7 +166,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
     direct = a.source_mode == "direct"
-    mode_options = {"npu_eids": [a.npu_eid]} if mode == "cpu_push_scatter" and a.npu_eid else {}
+    mode_options = {"npu_eids": [a.npu_eid]} if a.npu_eid else {}
     runtime = kvaf.NpuRuntime(
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,

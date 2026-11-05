@@ -94,6 +94,7 @@ extern std::array<std::mutex, 8> worker_mutexes;
 std::uint64_t NowNs();
 Queue& DataQueue(std::uint32_t index);
 Queue* FindQueue(std::uint32_t index);
+bool CreateContext(const UmdkControlArgs&, UmdkControlStatus&);
 bool Prepare(const UmdkControlArgs&, UmdkControlStatus&);
 bool Connect(const UmdkControlArgs&, UmdkControlStatus&);
 bool DescribeWorker(const UmdkControlArgs&, std::uint32_t index, UmdkControlStatus&);

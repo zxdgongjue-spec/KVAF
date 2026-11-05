@@ -86,8 +86,10 @@ Status UmdkSession::Shutdown() {
 
 Status UmdkSession::Load() {
   if (!config_.peer_link || config_.kernel_json.empty() || !config_.workers ||
-      config_.workers > 8U || !LoadUmdkKernel(config_.kernel_json.c_str()))
-    return Status::InvalidArgument("UMDK requires PeerLink, kernel JSON and 1..8 workers");
+      config_.workers > 8U ||
+      std::all_of(config_.local_eid.begin(), config_.local_eid.end(), [](auto b) { return b == 0; }) ||
+      !LoadUmdkKernel(config_.kernel_json.c_str()))
+    return Status::InvalidArgument("UMDK requires PeerLink, kernel JSON, Host-selected EID and 1..8 workers");
   return Status::OK();
 }
 
@@ -135,9 +137,12 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   args_.token = region.token_value;
   args_.remote_address = region.base;
   std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);
+  std::copy(config_.local_eid.begin(), config_.local_eid.end(), args_.local_eid);
   UmdkControlStatus prepared{};
   result = Run(UmdkControlOp::kPrepare, prepared);
   if (!result.ok()) return result;
+  if (!std::equal(config_.local_eid.begin(), config_.local_eid.end(), prepared.eid))
+    return Status::Internal("AICPU context EID differs from the Host-selected EID");
   if (prepared.key_bytes != 28 || region.segment_key_bytes > sizeof(args_.segment))
     return Status::Internal("invalid UMDK peer descriptor");
   args_.segment_bytes = region.segment_key_bytes;

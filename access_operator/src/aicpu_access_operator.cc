@@ -13,7 +13,7 @@ struct UmdkAccessOperator::Impl {
                    config.batch_get_mode == "gather_read_direct" ||
                    config.batch_get_mode == "cpu_push_scatter"),
         session({config.kernel_json, config.device, config.eid_index, config.workers,
-                 config.peer_link}),
+                 config.peer_link, config.local_eid}),
         get(session, config.token_bytes, config.batch_get_mode == "gather_read_direct"),
         put(session) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
