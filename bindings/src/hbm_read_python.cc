@@ -52,10 +52,12 @@ void BindNpuPullHbmSource(py::module_& m){
     .def(py::init<std::uint32_t,std::string>(),py::arg("device_id"),py::arg("npu_eid")="")
     .def("register",&PythonReadSource::Register,py::arg("source"),py::kw_only(),py::arg("receiver"),py::arg("stream")=py::none(),
          "Register and connect all MRs to the receiver; returns only after READ probes and confirmation. "
-         "On failure retain storage and retry shutdown. Ready cannot be cancelled unilaterally.")
+         "On failure retain storage and retry shutdown. Application owns consumer-done notifications and batch reuse.")
     .def("ready",&PythonReadSource::Ready,py::arg("tensor")=py::none())
-    .def("release_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.ReleaseBatch(t));},py::arg("ready_token"))
-    .def("cancel_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.CancelBatch(t));},py::arg("ready_token"))
+    .def("release_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.ReleaseBatch(t));},py::arg("ready_token"),
+         "Release local batch state after the application's consumer-done notification; does not verify remote completion.")
+    .def("cancel_batch",[](PythonReadSource& p,const ReadyToken& t){Check(p.source.CancelBatch(t));},py::arg("ready_token"),
+         "Release local batch state after the application has fenced the consumer from reading it.")
     .def("shutdown",&PythonReadSource::Shutdown)
     .def_property_readonly("connected",[](PythonReadSource& p){return p.source.connected();})
     .def_property_readonly("frozen",[](PythonReadSource& p){return p.source.frozen();})

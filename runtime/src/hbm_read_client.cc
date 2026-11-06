@@ -243,11 +243,11 @@ struct Engine {
     ProfileTimer status_timer(profile?&profile->status_us:nullptr);
     const auto* host=host_statuses.data;
     // Check ALL cores before interpreting either success or pre-DMA rejection.
-    // A stale validation error must not authorize Cancel/reuse either.
+    // A stale validation error must not release read references either.
     for(std::uint32_t c=0;c<cores;++c)
       if(host[c].completed_generation!=args.generation)
         return Status::InDoubt("raw READ completion generation mismatch: core="+std::to_string(c));
-    // Cancellation is safe only when EVERY core reports the same full-batch
+    // Ending a rejected read is safe only when EVERY core reports the same full-batch
     // validation failure and explicitly reports zero posted/processed WQEs.
     const auto& first=host[0].execution;
     bool rejected=args.input_mode==KVAF_RAW_NPU_OFFSETS &&
@@ -277,7 +277,7 @@ struct Engine {
     uncertain=false;return Status::OK();
   }
 };
-enum class Pending { None, Dma, Cleanup, Complete, Cancel };
+enum class Pending { None, Dma, Cleanup };
 struct Connection {
   std::unique_ptr<ReadLink> link;
   std::string local_eid;
@@ -292,11 +292,8 @@ struct Connection {
     if(pending==Pending::None)return Status::InvalidState("no pending raw READ");
     if(pending==Pending::Dma || engine.uncertain)return Status::InDoubt("raw READ DMA unresolved; retain A output and B source; no READ replay");
     auto s=Timed(profile?&profile->cleanup_us:nullptr,[&]{return engine.Cleanup();});if(!s.ok())return s;
-    if(pending==Pending::Cleanup)pending=result.ok()?Pending::Complete:Pending::Cancel;
-    hr::Response response{};
-    s=Timed(profile?&profile->complete_us:nullptr,[&]{
-      return link->Call(pending==Pending::Complete?hr::Command::Complete:hr::Command::Cancel,&response,sequence,mr_id);});
-    if(!s.ok())return Status::InDoubt("raw READ acknowledgement pending: "+s.message());
+    // Data readiness is the end of this operation. The application delivers
+    // completion/reuse notifications through its own channel, outside Runtime.
     pending=Pending::None;last_sequence=sequence;return result;
   }
 };
@@ -400,9 +397,10 @@ Status HbmReader::Cancel(const ReadyToken& ready) {
   if(c.pending!=Pending::None)return Status::Busy("resolve the existing raw READ/cancellation first");
   if(ready.sequence==c.last_sequence && ready.mr_id==c.mr_id)return Status::OK();
   if(ready.sequence<=c.last_sequence)return Status::InvalidState("NPU Pull batch already consumed");
-  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.pending=Pending::Cancel;c.result=Status::OK();
-  // Mark pending before contacting P. Even a lost reply must fence a late READ.
-  return c.Resolve();
+  // Fence a skipped batch locally. The application coordinates source reuse;
+  // this operation neither notifies the producer nor changes its state.
+  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.last_sequence=ready.sequence;
+  return Status::OK();
 }
 Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmReadTicket& ticket,const std::string& local_eid) {
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
@@ -548,7 +546,6 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
     if(address>UINT64_MAX-bytes || (address<=base ? base-address<bytes : address-base<output.bytes))
       return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
   }
-  if(!c.link->control->connected())return Status::InDoubt("HBM control offline; wait for producer reconnect before READ");
   c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.engine.mr_id=ready.mr_id;c.result=Status::OK();
   if(profile)profile->validation_us=std::chrono::duration<double,std::micro>(ProfileClock::now()-validation_begin).count();
   c.pending=Pending::Dma;

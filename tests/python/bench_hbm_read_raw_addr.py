@@ -124,7 +124,9 @@ def producer(pipe, args, offsets, receiver):
             ready = source.ready(hbm) if args.source_count > 1 else source.ready()
             ready_us = (time.perf_counter_ns() - begin) / 1000
             pipe.send(("ready", ready))
-            receive(pipe, "reuse")
+            # The application owns completion notification; Runtime only reads.
+            if receive(pipe, "reuse") != iteration:
+                raise RuntimeError("reuse notification belongs to another round")
             begin = time.perf_counter_ns()
             source.release_batch(ready)
             release_us = (time.perf_counter_ns() - begin) / 1000
@@ -137,13 +139,13 @@ def producer(pipe, args, offsets, receiver):
         print_stages("NPU_HBM_BENCH_PROFILE", "producer", stages, args.warmup)
         pipe.send(("closed", None))
     except BaseException:
-        pipe.send(("error", traceback.format_exc()))
         try:
-            if source.frozen and ready is not None:
-                try:
-                    source.release_batch(ready)
-                except RuntimeError:
-                    source.cancel_batch(ready)
+            pipe.send(("error", traceback.format_exc()))
+        except OSError:
+            pass  # A disconnected application channel cannot authorize reuse.
+        try:
+            # No validated reuse message means the consumer may still be reading.
+            # Shutdown rejects a frozen batch and the exception path retains it.
             source.shutdown()
         except Exception as error:
             retain(str(error))
@@ -192,7 +194,8 @@ def main():
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
-              "status_reset=init_only status_generation=1 status_readback=async_pinned binding_profile=1", flush=True)
+              "status_reset=init_only status_generation=1 status_readback=async_pinned binding_profile=1 "
+              "completion_notification=application batch_control_rpcs=0", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
         internal_stages = {}
         event_errors = set()
@@ -248,6 +251,7 @@ def main():
               f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
               f"p95_us={stats['p95_us']:.3f} p99_us={stats['p99_us']:.3f} "
               f"effective_GBps={payload_bytes / stats['mean_us'] / 1000:.3f} "
+              "return_condition=data_ready completion_notification=application "
               f"profile_iterations={args.profile_iterations} instrumented_rounds_excluded_from_bandwidth=1 "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "percentile=linear verification_included=0 setup_and_producer_and_ipc_excluded=1 "

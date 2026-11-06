@@ -66,7 +66,7 @@ runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, timeout=30000)
 
 Runtime 先分配共享 DDR，固定 CPU candidate。源注册在同一池上探测 CPU↔源卡 EID，使用 scratch READ，不覆盖缓存槽位。NPU↔NPU raw READ 的 fullmesh 链路独立配置。
 
-CPU Pull 控制协议 KVRP v6，支持一个源连接下多个 HBM MR；NPU Pull 控制协议为 KVHR v7。使用 CPU Pull 的服务和应用需同时重编译重启；旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+CPU Pull 控制协议 KVRP v6，支持一个源连接下多个 HBM MR；NPU Pull 控制协议为 KVHR v8，每批完成/取消通知由应用提供。NPU 两端需一起更新；CPU Pull 完成协议不变，已有匹配 KVRP v6 的 CPU service 无需为本次 NPU 变更更新。旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 同一共享池一次只允许一个未完成或未确认的 Pull；每批最多 4096 spans，CPU 内部四 Jetty 并行。服务保留 source 的关闭记录用于确认重试，源注册次数（包括失败候选）上限为 4096，推荐长驻注册复用。
 

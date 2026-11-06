@@ -113,16 +113,18 @@ class NpuRuntime final : public Runtime {
   // Saved connections are selected by ReadyToken; no AccessTable/DDR is used.
   Status ListenHbm(const std::string& listen_address, const std::string& advertise_address,
                    const std::string& local_eid, HbmReceiverTicket*);
-  // Fence this published batch against late READs and confirm cancellation to P.
+  // Fence this batch locally against late READs; application coordinates producer reuse.
   Status CancelRawAddr(const ReadyToken&);
   // As with BatchGet, output registrations are cached until detach/shutdown.
   // Keep output storage alive and at a stable address until then. Callers guarantee
   // valid, disjoint ranges and lengths in 1..UINT32_MAX within device READ limits.
   // Each request produces one WQE; validate_ranges checks lengths and bounds.
+  // Success means data is ready. Completion/reuse notifications belong to the
+  // application; Runtime performs no per-batch control RPC.
   Status BatchGetRawAddr(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
                          HbmReadProfile* profile = nullptr, bool validate_ranges = false);
-  Status ResolveRawAddr(const ReadyToken&); // Retries this batch's control/cleanup, never DMA.
+  Status ResolveRawAddr(const ReadyToken&); // Retries local cleanup only, never DMA or notifications.
   bool pending_raw_addr() const;
 
   std::uint32_t device_id() const;

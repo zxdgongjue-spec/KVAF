@@ -174,6 +174,7 @@ class Proxy {
   kvaf::HbmReceiverTicket receiver;
   kvaf::HbmReadTicket manifest;
   kvaf::HbmReadTicket Manifest() { std::lock_guard<std::mutex> l(mutex); return manifest; }
+  void Disconnect() { std::lock_guard<std::mutex> l(mutex);for(int s:sockets)shutdown(s,SHUT_RDWR); }
   int fd=-1;std::atomic<bool> stop{false};std::atomic<unsigned> drop{0},requests{0};
   std::thread thread;std::mutex mutex;std::vector<int> sockets;std::vector<std::thread> workers;
   explicit Proxy(kvaf::HbmReceiverTicket target):receiver(target) {
@@ -349,7 +350,7 @@ void StaleCompletion(const std::string& mode) {
   Check(b.Ready(&token));const auto memsets=acl_memset_calls.load();
   const auto first=read();
   if(mode=="stale-rejection")
-    Require(first.code()==kvaf::StatusCode::kInvalidArgument&&!a.pending(),"fresh rejection safely cancels");
+    Require(first.code()==kvaf::StatusCode::kInvalidArgument&&!a.pending(),"fresh rejection ends locally before DMA");
   else Check(first);
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   skip_all_statuses=mode!="stale-core";skip_status_core=mode=="stale-core"?1:-1;
@@ -359,9 +360,12 @@ void StaleCompletion(const std::string& mode) {
           status.message().find("generation mismatch")!=std::string::npos,
           "stale success, stale rejection or one unwritten core must retain the batch");
   Require(acl_memset_calls==memsets,"steady-state reads never clear the result buffer");
-  Require(proxy.requests==requests,"stale result must send neither Complete nor Cancel");
+  Require(proxy.requests==requests,"stale result sends no batch control messages");
+  auto wrong=token;++wrong.sequence;
+  Require(!a.Resolve(wrong).ok() && a.pending(),"wrong token cannot resolve another batch");
   Require(!a.Resolve(token).ok()&&raw_calls==before+1,"unresolved DMA cannot be replayed by recovery");
-  Require(!b.ReleaseBatch(token).ok()&&b.frozen(),"producer cannot reuse an unconfirmed source");
+  Require(!a.Cancel(token).ok()&&a.pending(),"local cancellation cannot discard unresolved DMA");
+  Require(b.frozen(),"application withholds reuse notification after uncertain DMA");
   Require(!a.Shutdown().ok(),"unresolved output and transport remain retained");
   std::_Exit(0);
 }
@@ -383,9 +387,9 @@ void ReadbackFailure(const std::string& mode) {
   Require(status.code()==kvaf::StatusCode::kInDoubt && a.pending(),"failed readback retains batch");
   Require(raw_calls==calls+1 && raw_syncs==syncs+1 && status_copies==copies+1,
           "even a failed copy submission still waits for the launched kernel");
-  Require(proxy.requests==requests,"failed readback sends neither Complete nor Cancel");
+  Require(proxy.requests==requests,"failed readback sends no batch control messages");
   Require(!a.Resolve(token).ok() && raw_calls==calls+1,"recovery must not replay unresolved READ");
-  Require(!b.ReleaseBatch(token).ok() && b.frozen(),"failed readback keeps producer frozen");
+  Require(!a.Cancel(token).ok() && b.frozen(),"failed readback stays pending and application leaves source frozen");
   Require(!a.Shutdown().ok() && pinned_buffers==1 && pinned_allocation_calls==allocations &&
           local_buffers==1 && raw_transports==1,"uncertain read retains pinned status, output and transport");
   std::_Exit(0);
@@ -428,9 +432,11 @@ int main(int argc,char** argv){try{
   auto read=[&](const kvaf::ReadyToken& t,const std::vector<std::int64_t>& src,
                 const std::vector<std::int64_t>& dst,const std::vector<std::int64_t>& sizes) {
     const auto calls=raw_calls.load(),syncs=raw_syncs;
+    const auto requests=proxy.requests.load();
     const auto status=a.Read(t,{src.data(),src.size()},{dst.data(),dst.size()},
                              {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1),nullptr,true);
     Require(raw_calls-calls<=1 && raw_syncs-syncs==raw_calls-calls,"single fused launch and final synchronization");
+    Require(proxy.requests==requests,"READ success/rejection performs no batch control RPC");
     return status;
   };
   const auto saved=token;auto bad=token;std::get<kvaf::NpuPullSourceDesc>(bad.source).source_epoch++;
@@ -443,10 +449,10 @@ int main(int argc,char** argv){try{
   Require(!a.Read(token,{reinterpret_cast<const int64_t*>(output.data()),sources.size()},
                    {destinations.data(),destinations.size()},{lengths.data(),lengths.size()},out,
                    reinterpret_cast<void*>(1)).ok() && raw_calls==before && !a.pending(),
-          "metadata/output alias is rejected before Acquire");
+          "metadata/output alias is rejected before READ");
   auto invalid_destination=destinations;invalid_destination[1]=output.size();
   Require(!read(token,sources,invalid_destination,lengths).ok(),"opt-in destination bounds enforced");
-  Require(!a.pending(),"NPU validation failure cancels without unresolved DMA");
+  Require(!a.pending(),"NPU validation failure finishes locally without unresolved DMA");
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(!read(token,sources,{destinations[0]},lengths).ok(),"raw-array count mismatch rejected");
   auto overrun=sources;overrun[1]=source_bytes;
@@ -461,7 +467,7 @@ int main(int argc,char** argv){try{
   Require(raw_wqes-before_wqes==sources.size(),"one WQE per request, including lengths above 64 KiB");
   const double host_phases=profile.validation_us+profile.buffers_us+profile.register_output_us+
       profile.event_record_us+profile.launch_us+profile.synchronize_us+profile.event_query_us+
-      profile.status_us+profile.cleanup_us+profile.complete_us;
+      profile.status_us+profile.cleanup_us;
   Require(profile.kernel_event_valid && profile.kernel_event_us==125.0 && !profile.event_error,
           "device event milliseconds converted to microseconds");
   Require(host_phases<=profile.total_us && profile.total_us>0 && events==2,
@@ -480,24 +486,25 @@ int main(int argc,char** argv){try{
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   const int queries=timing_queries;
   before=raw_calls;
-  proxy.drop=unsigned(hr::Command::Complete);
-  Require(!read(token,sources,destinations,lengths).ok()&&a.pending(),"new raw API retains lost Complete");
-  auto wrong_batch=token;wrong_batch.sequence++;
-  Require(!a.Resolve(wrong_batch).ok() && a.pending(),"wrong sequence cannot resolve another batch");
-  Require(!a.Resolve(saved).ok() && a.pending(),"stale Ready cannot resolve current batch");
-  Check(Retry([&]{return a.Resolve(token);}));Require(raw_calls==before+1,"new raw API resolve does not replay DMA");
-  Require(timing_queries==queries,"unprofiled READ and recovery do not query timing events");
+  proxy.Disconnect();
+  Check(read(token,sources,destinations,lengths));
+  Require(!a.pending() && raw_calls==before+1,"data-ready return does not depend on the control socket");
+  Require(!a.Resolve(token).ok() && raw_calls==before+1,"finished READ needs no remote confirmation or replay");
+  Require(timing_queries==queries,"unprofiled READ does not query timing events");
   Require(!std::memcmp(output.data()+7,source+9,67)&&!std::memcmp(output.data()+5000,source+90001,70001),"raw-array offsets are relative to logical source/output");
+  Require(b.frozen(),"successful READ does not release producer state through Runtime");
+  Require(!read(token,sources,destinations,lengths).ok() && raw_calls==before+1,"completed sequence cannot replay even before app releases source");
+  // This release represents the application's own consumer-done notification.
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(!b.ReleaseBatch(saved).ok()&&!b.CancelBatch(saved).ok(),"explicit source token rejects delayed notifications");
   before=raw_calls;
-  Require(!b.CancelBatch(token).ok(),"published source cannot cancel unilaterally");
-  proxy.drop=unsigned(hr::Command::Cancel);
-  Require(!a.Cancel(token).ok()&&a.pending(),"lost cancel response retains fence");
-  Require(!read(token,sources,destinations,lengths).ok()&&raw_calls==before,"pending cancellation blocks delayed READ");
-  Check(Retry([&]{return a.Resolve(token);}));
+  const auto cancel_requests=proxy.requests.load();
+  Require(!b.Shutdown().ok() && b.frozen(),"source stays registered until application releases its batch");
   Check(a.Cancel(token));
-  Check(b.ReleaseBatch(token));
+  Check(a.Cancel(token));
+  Require(proxy.requests==cancel_requests && !a.pending(),"local cancellation is idempotent and sends no notification");
+  Check(b.CancelBatch(token));
+  Check(b.CancelBatch(token));
   Require(!read(token,sources,destinations,lengths).ok()&&raw_calls==before,"cancelled sequence cannot replay");
   Check(b.Ready(&token));
   before=raw_calls;
@@ -523,7 +530,7 @@ int main(int argc,char** argv){try{
   Require(!std::memcmp(output.data()+7,other_storage.data()+9,67),"Ready selects other source");
   Check(other.ReleaseBatch(other_ready));Check(other.Shutdown());
   Check(b.Ready(&token));const auto requests=proxy.requests.load();Check(read(token,sources,destinations,lengths));
-  Require(proxy.requests==requests+1,"only Complete RPC per successful READ, no AcquireRaw");Check(b.ReleaseBatch(token));
+  Require(proxy.requests==requests,"zero batch control RPCs per successful READ");Check(b.ReleaseBatch(token));
   unregister_failures=1;Require(!b.Shutdown().ok(),"failed detach preserves source");
   Require(!b.Ready(&token).ok(),"closing source cannot publish");
   proxy.drop=unsigned(hr::Command::Close);Require(!b.Shutdown().ok(),"lost Close response retains teardown");

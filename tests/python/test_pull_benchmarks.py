@@ -1,8 +1,12 @@
 """Timing boundaries, percentile conventions and scattered layouts without NPU hardware."""
 import contextlib
 import io
+import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import bench_hbm_read_raw_addr as raw_bench
 from bench_hbm_read_raw_addr import parse_args, round_counts, pattern_phase, raw_profile_sample
 from bench_remote_cpu_offload import INTERNAL_STAGES, measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
@@ -104,6 +108,65 @@ class PullBenchmarks(unittest.TestCase):
         self.assertEqual(signed["python_and_binding_other"], -2)
         with self.assertRaisesRegex(RuntimeError, "rebuild"):
             raw_profile_sample({"profile": {"host_total_us": 100}}, 200)
+
+    def test_raw_producer_reuses_source_only_after_matching_application_message(self):
+        class Retained(Exception):
+            pass
+
+        for mode in ("success", "wrong_round", "disconnected"):
+            with self.subTest(mode=mode):
+                source = MagicMock()
+                source.frozen = False
+                token = object()
+
+                def ready():
+                    source.frozen = True
+                    return token
+
+                def release(actual):
+                    self.assertIs(actual, token)
+                    source.frozen = False
+
+                def shutdown():
+                    if source.frozen:
+                        raise RuntimeError("source still frozen")
+
+                source.ready.side_effect = ready
+                source.release_batch.side_effect = release
+                source.shutdown.side_effect = shutdown
+                pipe, torch = MagicMock(), MagicMock()
+                torch.npu.stream.side_effect = lambda stream: contextlib.nullcontext()
+
+                def receive(actual_pipe, kind):
+                    self.assertIs(actual_pipe, pipe)
+                    if kind == "reuse":
+                        if mode == "disconnected":
+                            raise EOFError("application channel disconnected")
+                        return 0 if mode == "success" else 1
+                    self.assertEqual(kind, "shutdown")
+
+                if mode == "disconnected":
+                    def send(message):
+                        if message[0] == "error":
+                            raise BrokenPipeError()
+                    pipe.send.side_effect = send
+                args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b",
+                                   "--warmup", "0", "--iterations", "1", "--profile-iterations", "0"])
+                modules = dict(torch=torch, torch_npu=SimpleNamespace(),
+                               kvaf=SimpleNamespace(NpuPullHbmSource=lambda *args: source))
+                with patch.dict(sys.modules, modules), patch.object(raw_bench, "packet_payload", return_value=MagicMock()), \
+                        patch.object(raw_bench, "receive", side_effect=receive), \
+                        patch.object(raw_bench, "retain", side_effect=Retained), patch.object(raw_bench, "print_stages"):
+                    if mode == "success":
+                        raw_bench.producer(pipe, args, [0], {})
+                        source.release_batch.assert_called_once_with(token)
+                        self.assertFalse(source.frozen)
+                    else:
+                        with self.assertRaises(Retained):
+                            raw_bench.producer(pipe, args, [0], {})
+                        source.release_batch.assert_not_called()
+                        self.assertTrue(source.frozen)
+                    source.cancel_batch.assert_not_called()
 
     def test_raw_benchmark_configuration_limits(self):
         common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]

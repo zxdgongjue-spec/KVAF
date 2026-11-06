@@ -429,7 +429,7 @@ class NpuPythonRuntime final {
 #define RAW_PHASE(name) timing[#name]=profile.name; phases+=profile.name
       RAW_PHASE(validation_us); RAW_PHASE(buffers_us); RAW_PHASE(register_output_us);
       RAW_PHASE(event_record_us); RAW_PHASE(launch_us); RAW_PHASE(synchronize_us); RAW_PHASE(event_query_us);
-      RAW_PHASE(status_us); RAW_PHASE(cleanup_us); RAW_PHASE(complete_us);
+      RAW_PHASE(status_us); RAW_PHASE(cleanup_us);
 #undef RAW_PHASE
       timing["host_other_us"]=std::max(0.0,profile.total_us-phases);
       timing["kernel_event_us"]=profile.kernel_event_valid?py::cast(profile.kernel_event_us):py::none();
@@ -761,15 +761,16 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
-           "Synchronously read peer HBM. profile=True adds Host stage timings and a device event "
+           "Return after peer HBM data is ready and status checked; application owns completion/reuse notifications. "
+           "profile=True adds Host stage timings and a device event "
            "interval around the kernel to the returned profile dictionary; profiling is off by default. "
            "Output Tensors are retained until Runtime shutdown; do not resize their storage. "
            "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
            "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
       .def("cancel_raw_addr", &NpuPythonRuntime::CancelRawAddr, py::arg("ready"),
-           "Fence a published batch without reading it; producer may release after success. "
-           "On lost acknowledgement use resolve_raw_addr with the same token.")
+           "Locally fence a published batch without reading it; application coordinates producer reuse. "
+           "Does not send a notification. Pending DMA must be resolved first.")
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
       .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("ready"),

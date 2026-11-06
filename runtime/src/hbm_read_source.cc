@@ -28,7 +28,7 @@ struct NpuPullHbmSource::Impl {
   std::array<offload::ConnectionDesc,offload::kChannelCount> peers{};
   std::array<bool,offload::kChannelCount> bound{};
   std::set<std::uint64_t> retired;
-  std::uint64_t client{},sequence{},completed{},mr_id{1},completed_mr{};
+  std::uint64_t client{},sequence{},mr_id{1};
   std::uint32_t candidate{};
   offload::ConnectionDesc initiator{};
   Status open_result;
@@ -121,17 +121,6 @@ struct NpuPullHbmSource::Impl {
       if(!bound[0]) return Status::InvalidState("HBM has no bound channel");
       confirmed=true; if(state==hr::State::Registered) state=hr::State::Connected;
       return Status::OK();
-    }
-    if((command==hr::Command::Complete || command==hr::Command::Cancel) &&
-        r.sequence && r.sequence==completed)
-      return r.mr_id==completed_mr ? Status::OK() : Status::InvalidArgument("completed HBM batch MR mismatch");
-    if(!confirmed || !frozen || r.sequence!=sequence || r.mr_id!=mr_id) return Status::InvalidState("HBM batch is stale or not ready");
-    if(command==hr::Command::Complete || command==hr::Command::Cancel) {
-      if(state==hr::State::Done) return Status::OK();
-      if(state!=hr::State::Ready) return Status::InvalidState("HBM batch is not published");
-      // Reader serializes READ/cancel and records this sequence before replying.
-      // Producer cannot revoke a published token without reader confirmation.
-      state=hr::State::Done; completed=sequence; completed_mr=mr_id; return Status::OK();
     }
     return Status::InvalidArgument("unknown HBM command");
   }
@@ -226,7 +215,7 @@ Status NpuPullHbmSource::Register(const std::vector<ConstBufferView>& inputs,con
     if(!detail::ParseEid(impl_->eid,c.eid.data())) return Status::InvalidArgument("invalid B EID");
     impl_->candidates.push_back(c);
   }
-  impl_->inputs=inputs;impl_->closing=false;impl_->sequence=impl_->completed=impl_->completed_mr=0;impl_->mr_id=1;
+  impl_->inputs=inputs;impl_->closing=false;impl_->sequence=0;impl_->mr_id=1;
   impl_->ticket={detail::Nonce(),detail::Nonce(),std::uint32_t(detail::Nonce())|1U,{}};
   for(const auto& input:inputs) impl_->ticket.mr_bytes.push_back(input.bytes);
   impl_->receiver=receiver;impl_->admission_sent=false;impl_->peer_retired=false;impl_->stop=false;
@@ -266,8 +255,8 @@ Status NpuPullHbmSource::FinishBatch(const ReadyToken& token){
       return Status::InvalidArgument("stale NPU Pull batch identity");
   }
   if(!impl_->frozen)return Status::OK();
-  if(impl_->state!=hr::State::Done)
-    return Status::Busy("published HBM cannot be revoked locally; reader must complete or cancel_raw_addr first");
+  // The application calls this only after its own consumer-done/cancel
+  // handshake. Runtime cannot infer remote DMA completion from local state.
   impl_->frozen=false;impl_->state=hr::State::Connected;return Status::OK();
 }
 Status NpuPullHbmSource::ReleaseBatch(const ReadyToken& t){return FinishBatch(t);}
@@ -275,7 +264,7 @@ Status NpuPullHbmSource::CancelBatch(const ReadyToken& t){return FinishBatch(t);
 Status NpuPullHbmSource::Shutdown(){
   bool detach=false;
   {std::lock_guard<std::mutex> lock(impl_->mutex);
-   if(impl_->frozen)return Status::Busy("release the completed/cancelled HBM batch before shutdown");
+   if(impl_->frozen)return Status::Busy("release the application-confirmed HBM batch before shutdown");
    impl_->closing=true;
    detach=impl_->admission_sent && !impl_->peer_retired;}
   if(detach) {

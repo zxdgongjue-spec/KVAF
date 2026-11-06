@@ -5,9 +5,9 @@
 
 namespace kvaf::hbm_read {
 constexpr std::uint32_t kMagic = 0x4b564852; // KVHR, independent of KVCP/KVRP
-constexpr std::uint16_t kVersion = 7; // Receiver listens; Ready publishes an irrevocable batch.
-enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Complete=6, Cancel, Close, Memory=10, Retire };
-enum class State : std::uint32_t { Registered, Connected, Ready, Done };
+constexpr std::uint16_t kVersion = 8; // Application owns batch completion/reuse notifications.
+enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Close=8, Memory=10, Retire };
+enum class State : std::uint32_t { Registered, Connected, Ready };
 using Span = offload::Span;
 struct Request {
   peer::MessageHeader header{};

@@ -51,13 +51,14 @@ def producer(pipe, args, ddr_ticket, receiver):
             raw_batch = a_source.ready(hbm) if args.hbm_mrs > 1 else a_source.ready()
             assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
             assert cpu_batch.source.mr_length == hbm.numel() * hbm.element_size()
-            for source, batch in ((cpu_source, cpu_batch), (a_source, raw_batch)):
-                try:
-                    source.release_batch(batch)
-                except RuntimeError:
-                    pass
-                else:
-                    raise AssertionError("B released shared HBM before its consumer completed")
+            # CPU Pull still verifies its own CPU-service completion. NPU Pull
+            # source reuse is authorized by the application's Pipe message below.
+            try:
+                cpu_source.release_batch(cpu_batch)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("B released shared HBM before its CPU consumer completed")
             pipe.send(("ready", (cpu_batch, raw_batch)))
             # A sends this only after BOTH reads and all verification complete.
             assert receive(pipe, "reuse") == round_id
@@ -70,17 +71,21 @@ def producer(pipe, args, ddr_ticket, receiver):
         cpu_source.shutdown()
         pipe.send(("closed", None))
     except BaseException:
-        pipe.send(("error", traceback.format_exc()))
         try:
-            for source, batch in ((a_source, raw_batch), (cpu_source, cpu_batch)):
-                if source.frozen:
-                    # Recover the same MR if Ready failed before returning its token.
-                    if batch is None:
-                        batch = source.ready(hbm) if args.hbm_mrs > 1 else source.ready()
-                    try:
-                        source.release_batch(batch)
-                    except RuntimeError:
-                        source.cancel_batch(batch)
+            pipe.send(("error", traceback.format_exc()))
+        except OSError:
+            pass
+        try:
+            if a_source.frozen:
+                retain("NPU source has no application reuse confirmation")
+            if cpu_source.frozen:
+                # CPU Pull retains its service-side completion checks.
+                if cpu_batch is None:
+                    cpu_batch = cpu_source.ready(hbm) if args.hbm_mrs > 1 else cpu_source.ready()
+                try:
+                    cpu_source.release_batch(cpu_batch)
+                except RuntimeError:
+                    cpu_source.cancel_batch(cpu_batch)
             a_source.shutdown()
             cpu_source.shutdown()
         except Exception as error:

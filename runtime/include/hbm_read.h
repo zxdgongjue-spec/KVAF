@@ -43,7 +43,7 @@ struct HbmReadProfile {
   // status_us includes async D2H submission and CPU validation; its device
   // execution is included in synchronize_us, after the kernel end event.
   double event_record_us{}, launch_us{}, synchronize_us{}, event_query_us{}, status_us{};
-  double cleanup_us{}, complete_us{}, kernel_event_us{};
+  double cleanup_us{}, kernel_event_us{};
   bool kernel_event_valid{};
   std::int32_t event_error{};
 };
@@ -59,11 +59,12 @@ class NpuPullHbmSource {
   // and READ probes. Failure may retain resources; retry Shutdown for cleanup.
   Status Register(ConstBufferView, const HbmReceiverTicket&, void* producer_stream);
   Status Register(const std::vector<ConstBufferView>&, const HbmReceiverTicket&, void* producer_stream);
-  Status Ready(ReadyToken*); // Single-MR convenience; publishes irrevocable read permission.
+  Status Ready(ReadyToken*); // Single-MR convenience; application keeps source stable until consumer done.
   Status Ready(ConstBufferView tensor, ReadyToken*);
+  // Application has confirmed that the consumer finished, or fenced a skipped
+  // read. These methods only validate identity and release local batch state;
+  // they do not exchange notifications or inspect remote DMA completion.
   Status ReleaseBatch(const ReadyToken&);
-  // Only releases a batch already ended by the reader. Ready is irrevocable
-  // on the producer: the reader must fence late notifications before reuse.
   Status CancelBatch(const ReadyToken&);
   Status Shutdown(); // Requests reader detach; failure retains registration.
   bool frozen() const;
