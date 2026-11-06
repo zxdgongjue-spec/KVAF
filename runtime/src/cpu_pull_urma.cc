@@ -49,6 +49,28 @@ std::uint32_t Next(std::atomic<std::uint32_t>& sequence) {
   return value;
 }
 Status Error(const std::string& detail) { return Status::Internal("CPU Pull: " + detail); }
+const char* CompletionStatusName(urma_cr_status_t status) {
+#define CR_NAME(value) case value: return #value
+  switch (status) {
+    CR_NAME(URMA_CR_SUCCESS);
+    CR_NAME(URMA_CR_UNSUPPORTED_OPCODE_ERR);
+    CR_NAME(URMA_CR_LOC_LEN_ERR);
+    CR_NAME(URMA_CR_LOC_OPERATION_ERR);
+    CR_NAME(URMA_CR_LOC_ACCESS_ERR);
+    CR_NAME(URMA_CR_REM_RESP_LEN_ERR);
+    CR_NAME(URMA_CR_REM_UNSUPPORTED_REQ_ERR);
+    CR_NAME(URMA_CR_REM_OPERATION_ERR);
+    CR_NAME(URMA_CR_REM_ACCESS_ABORT_ERR);
+    CR_NAME(URMA_CR_ACK_TIMEOUT_ERR);
+    CR_NAME(URMA_CR_RNR_RETRY_CNT_EXC_ERR);
+    CR_NAME(URMA_CR_WR_FLUSH_ERR);
+    CR_NAME(URMA_CR_WR_SUSPEND_DONE);
+    CR_NAME(URMA_CR_WR_FLUSH_ERR_DONE);
+    CR_NAME(URMA_CR_WR_UNHANDLED);
+    default: return "URMA_CR_UNKNOWN";
+  }
+#undef CR_NAME
+}
 std::string Eid(const std::uint8_t* bytes) {
   constexpr char hex[] = "0123456789abcdef";
   std::string value;
@@ -289,25 +311,7 @@ class UrmaBackend final : public Backend {
   }
 
   Status Probe(const std::vector<Span>& spans) override {
-    if (poisoned_) return Status::InDoubt(failure_);
-    if (spans.size() != 1 || !spans[0].bytes || spans[0].bytes > 64)
-      return Error("probe requires one span of at most 64 bytes");
-    completed_error_ = false;
-    // Candidate recovery relies on exactly one posted WR and its terminal CQE.
-    auto status = Transfer(spans, true, nullptr);
-    if (status.ok() || !completed_error_) return status;
-    const auto failure = failure_;
-    // The probe received its terminal CQE. Confirm queue/source destruction
-    // before reporting a recoverable candidate failure to the NPU host.
-    queues_[0].pending = 0;
-    poisoned_ = false;
-    status = ReleaseSource();
-    if (!status.ok()) {
-      failure_ = failure + "; probe teardown failed: " + status.message();
-      return Status::InDoubt(failure_);
-    }
-    failure_.clear(); completed_error_ = false;
-    return Status::Internal(failure + "; probe queues and source retired");
+    return ProbeQueues(spans, nullptr);
   }
 
   Status ReleaseSource() override {
@@ -368,10 +372,9 @@ class UrmaBackend final : public Backend {
     auto* saved_memory = memory_; const auto saved_bytes = bytes_; auto* saved_mr = destination_;
     memory_ = scratch_; bytes_ = 4096; destination_ = scratch_mr_;
     Status status;
-    try { status = Probe({{offset, 0, bytes}}); }
+    try { status = ProbeQueues({{offset, 0, bytes}}, checksum); }
     catch (...) { status = Poison("exception during scratch READ"); }
     memory_ = saved_memory; bytes_ = saved_bytes; destination_ = saved_mr;
-    if (status.ok()) *checksum = Hash(static_cast<const std::uint8_t*>(scratch_), bytes);
     // Unknown DMA retains scratch and pool MR as well as the source lease.
     if (status.code() == StatusCode::kInDoubt) return status;
     const auto released = ReleaseScratch();
@@ -384,6 +387,39 @@ class UrmaBackend final : public Backend {
     return hash;
   }
  private:
+  Status ProbeQueues(const std::vector<Span>& spans, std::uint64_t* checksum) {
+    if (poisoned_) return Status::InDoubt(failure_);
+    if (spans.size() != 1 || !spans[0].bytes || spans[0].bytes > 64)
+      return Error("probe requires one span of at most 64 bytes");
+    std::uint64_t first_hash{};
+    for (std::size_t index = 0; index < queues_.size(); ++index) {
+      completed_error_ = false;
+      // Probe every Jetty, but allow only one outstanding WR. A terminal
+      // error can retire this entire candidate without other DMA in flight.
+      auto status = Transfer(spans, true, nullptr, index);
+      if (!status.ok()) {
+        if (!completed_error_) return status;
+        const auto failure = failure_;
+        queues_[index].pending = 0;
+        poisoned_ = false;
+        status = ReleaseSource();
+        if (!status.ok()) {
+          failure_ = failure + "; probe teardown failed: " + status.message();
+          return Status::InDoubt(failure_);
+        }
+        failure_.clear(); completed_error_ = false;
+        return Status::Internal(failure + "; probe queues and source retired");
+      }
+      if (checksum) {
+        const auto hash = Hash(static_cast<const std::uint8_t*>(memory_)+spans[0].destination, spans[0].bytes);
+        if (index && hash != first_hash)
+          return Error("scratch checksum differs across Jettys: queue=" + std::to_string(index));
+        first_hash = hash;
+      }
+    }
+    if (checksum) *checksum = first_hash; // Producer verifies the same bytes too.
+    return Status::OK();
+  }
   void ReportProfile(const char* reason) {
     if (profile_) profile_summary_.Report(stderr, profile_id_, source_base_,
         reinterpret_cast<std::uint64_t>(memory_), reason);
@@ -401,14 +437,15 @@ class UrmaBackend final : public Backend {
         });
   }
   void BuildWave(const std::vector<Span>& spans, std::size_t& cursor,
-                 std::uint64_t& offset, std::size_t channels, std::size_t depth) {
+                 std::uint64_t& offset, std::size_t channels, std::size_t depth,
+                 std::size_t first_queue = 0) {
     for (auto& q : queues_) {
       q.local.clear(); q.remote.clear(); q.wrs.clear();
     }
     for (std::size_t n = 0; n < channels*depth && cursor < spans.size(); ++n) {
       const auto& span = spans[cursor];
       const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_bytes_, span.bytes-offset));
-      auto& q = queues_[n % channels];
+      auto& q = queues_[(first_queue + n % channels) % queues_.size()];
       q.local.push_back({reinterpret_cast<std::uint64_t>(memory_)+span.destination+offset,
                          length, destination_, nullptr});
       q.remote.push_back({source_base_+span.source+offset, length, source_, nullptr});
@@ -490,14 +527,14 @@ class UrmaBackend final : public Backend {
       }
     }
   }
-  Status Transfer(const std::vector<Span>& spans, bool probe, Profile* stats) {
+  Status Transfer(const std::vector<Span>& spans, bool probe, Profile* stats, std::size_t probe_queue = 0) {
     if (poisoned_) return Status::InDoubt(failure_);
     if (!ready_ || !source_ || !destination_) return Error("READ transport is not ready");
     const bool reuse = !probe && SamePlan(spans);
     // A cached plan already passed range/overlap validation against these MRs.
     // Exact equality avoids sorting thousands of unchanged spans every batch.
     if (!reuse && !ValidateSpans(spans, source_bytes_, bytes_)) return Error("invalid READ spans");
-    // Startup probes retain exactly one READ on queue 0 for safe EID fallback.
+    // Each startup probe has exactly one READ on its selected queue.
     std::size_t depth = probe ? 1 : kWaveDepth;
     for (const auto& q : queues_) {
       if (q.pending) return Poison("READ while another wave is pending");
@@ -512,7 +549,7 @@ class UrmaBackend final : public Backend {
       const auto build_begin = stats ? Clock::now() : Clock::time_point{};
       const bool first_wave = cursor == 0 && offset == 0;
       if (reuse) cursor = spans.size();
-      else BuildWave(spans, cursor, offset, probe ? 1 : queues_.size(), depth);
+      else BuildWave(spans, cursor, offset, probe ? 1 : queues_.size(), depth, probe ? probe_queue : 0);
       // Cache only a single bounded wave, keyed by ALL offsets and lengths.
       // Larger requests stream through the same storage without growing it.
       if (!probe && !reuse && first_wave && cursor == spans.size()) cached_spans_ = spans;
@@ -579,7 +616,7 @@ class UrmaBackend final : public Backend {
     if (cr) message << " cq_status=" << static_cast<unsigned>(cr->status)
                     << " cq_user_ctx=" << cr->user_ctx << " cq_flags=" << unsigned(cr->flag.value)
                     << " local_id=" << cr->local_id << " tpn=" << cr->tpn;
-    if (cr && cr->status == URMA_CR_LOC_ACCESS_ERR) message << " cq_status_name=URMA_CR_LOC_ACCESS_ERR";
+    if (cr) message << " cq_status_name=" << CompletionStatusName(cr->status);
     if (destination_) Describe(message, "dst_mr", destination_->seg);
     if (source_) Describe(message, "src_mr", source_->seg);
     return Poison(message.str());

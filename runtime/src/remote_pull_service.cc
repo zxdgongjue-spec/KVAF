@@ -148,6 +148,9 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     }
     catch (...) { status = Status::InDoubt("exception probing HBM source"); }
     if (!status.ok()) s.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
+    std::fprintf(stderr, "[KVAF_CPU] CPU_PULL_PROBE_END region=%llu source=%llu mr=%llu state=%u status=%u detail=%s\n",
+        (unsigned long long)r.region, (unsigned long long)r.source_id, (unsigned long long)r.mr_id,
+        unsigned(s.state), unsigned(status.code()), status.message().c_str());
     out.state = s.state; out.result = Convert(status); return out;
   }
   if (cmd == Command::InspectSource && !r.task && s.state != State::Closed) {

@@ -3,6 +3,7 @@
 #include "cpu_pull_urma.h"
 #include "urma_transport.h"
 #include "urma_device_abi.h"
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -21,8 +22,10 @@ int fail_create = -1, fail_import = -1;
 bool fail_delete = false;
 bool ctp_queried{};
 std::uint32_t expected_token{};
-enum class Fault { None, Post, PartialPost, Poll, CqStatus, LocalAccess, UserContext, Receive, Multiple, InteriorError };
+enum class Fault { None, Post, PartialPost, Poll, CqStatus, LocalAccess, UserContext, Receive, Multiple, InteriorError, AckTimeout };
 Fault fault = Fault::None;
+int ack_timeout_queue=-1, corrupt_queue=-1;
+std::array<int,p::kChannelCount> posts_by_queue{};
 enum class BadLocalSegment { None, ZeroBase, Short, NoWrite, NonPin };
 BadLocalSegment bad_local_segment = BadLocalSegment::None;
 std::uint32_t registered_token{};
@@ -139,7 +142,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* jetty,urma_jfs_wr_t* wr,urma
     }else{
       Require(current->flag.bs.place_order==URMA_RELAX_ORDER&&!current->flag.bs.fence,"interior READs can overlap");
     }
-    q.wrs.push_back(current);++posts;
+    q.wrs.push_back(current);++posts;++posts_by_queue[q.index];
     Require(q.wrs.size()<=std::min(1024U,returned_depth),"bounded in-flight wave and returned SQ depth");
   }
   return URMA_SUCCESS;
@@ -156,6 +159,7 @@ int urma_poll_jfc(urma_jfc_t* cq,int capacity,urma_cr_t* cr){
   if(q.delay){--q.delay;return 0;} // Other CQs must progress while this one is delayed.
   if(fault==Fault::Poll){errno=EIO;return -1;}
   cr->status=fault==Fault::CqStatus?URMA_CR_REM_ACCESS_ABORT_ERR:URMA_CR_SUCCESS;
+  if(fault==Fault::AckTimeout&&int(q.index)==ack_timeout_queue)cr->status=URMA_CR_ACK_TIMEOUT_ERR;
   if(fault==Fault::LocalAccess||fault==Fault::Receive||fault==Fault::Multiple||fault==Fault::InteriorError)cr->status=URMA_CR_LOC_ACCESS_ERR;
   cr->flag.bs.s_r=fault==Fault::Receive;
   cr->user_ctx=fault==Fault::UserContext?q.tail+1:fault==Fault::InteriorError?q.wrs.front()->user_ctx:q.tail;
@@ -166,6 +170,7 @@ int urma_poll_jfc(urma_jfc_t* cq,int capacity,urma_cr_t* cr){
     const auto& source=*reinterpret_cast<const Sge*>(wr->rw.src.sge);
     const auto& destination=*reinterpret_cast<const Sge*>(wr->rw.dst.sge);
     std::memcpy(reinterpret_cast<void*>(destination.addr),reinterpret_cast<void*>(source.addr),source.len);
+    if(int(q.index)==corrupt_queue)*reinterpret_cast<std::uint8_t*>(destination.addr)^=1;
   }
   q.tail=0;q.wrs.clear();++cqes;
   check_wave=std::all_of(pending.begin(),pending.end(),[](const auto& item){return item.second.wrs.empty();});
@@ -317,17 +322,25 @@ void PartialChannelFailureTest(){
     Require(backend->Close().ok()&&queues==0&&peers==0&&local_mrs==0&&imported_mrs==0,"retry closes cleanly");
   }
 }
-void ProbeFailureTest(Fault injected, bool teardown_failure=false) {
+void ProbeFailureTest(Fault injected, bool teardown_failure=false, int queue=0) {
   fault=injected;fail_delete=teardown_failure;
+  ack_timeout_queue=queue;
   urma_context_t context{};context.eid.raw[15]=1;
   auto backend=p::CreateUrmaBackend(&context);p::MemoryDesc cpu{};
   Require(backend->Allocate(4096,&cpu).ok(),"probe pool");
   std::vector<std::uint8_t> memory(4096,0xa5);
   const auto source=Source(memory,cpu.token,true);
   Require(Open(*backend,source).ok(),"probe link");
+  const auto before=posts;
   const auto result=backend->Probe({{64,0,64}});
-  const bool retired=!teardown_failure&&(injected==Fault::LocalAccess||injected==Fault::CqStatus);
+  const bool retired=!teardown_failure&&(injected==Fault::LocalAccess||injected==Fault::CqStatus||injected==Fault::AckTimeout);
   Require(!result.ok(),"probe error cannot select candidate");
+  if(injected==Fault::AckTimeout) {
+    Require(posts==before+queue+1,"probe stops at the failing Jetty");
+    Require(result.message().find("queue="+std::to_string(queue))!=std::string::npos&&
+            result.message().find("cq_status_name=URMA_CR_ACK_TIMEOUT_ERR")!=std::string::npos,
+            "ACK timeout identifies the failing Jetty and decoded status");
+  }
   if(retired) {
     Require(result.code()==kvaf::StatusCode::kInternal&&result.message().find("probe queues and source retired")!=std::string::npos,
             "matching terminal CQ plus successful destruction permits fallback");
@@ -342,6 +355,29 @@ void ProbeFailureTest(Fault injected, bool teardown_failure=false) {
     Require(queues==12&&peers==4&&imported_mrs==1&&local_mrs==1,"unknown probe retains all leases");
     _exit(0);
   }
+}
+void AllJettyScratchTest() {
+  urma_context_t context{};context.eid.raw[15]=1;
+  auto pool=std::make_shared<std::vector<std::uint8_t>>(4096,0x3c);
+  auto backend=p::CreateBorrowedUrmaBackend(&context,pool->data(),pool->size(),123,pool);
+  std::vector<std::uint8_t> hbm(4096,0x5a);
+  Require(Open(*backend,Source(hbm,123,true)).ok(),"open all-Jetty probe");
+  const auto before=posts_by_queue;
+  required_wave_queues=1;check_wave=true;
+  std::uint64_t checksum{};
+  Require(backend->ProbeToScratch(64,64,&checksum).ok()&&checksum==p::Hash(hbm.data()+64,64),"all-Jetty scratch checksum");
+  for(std::size_t i=0;i<p::kChannelCount;++i)
+    Require(posts_by_queue[i]==before[i]+1,"each Jetty must perform a startup READ");
+  Require(std::all_of(pool->begin(),pool->end(),[](auto b){return b==0x3c;}),"all Jetty probes preserve business DDR");
+  Require(local_mrs==1,"scratch registration is released after all Jettys complete");
+  corrupt_queue=1;
+  const auto calls=post_calls;
+  const auto result=backend->ProbeToScratch(64,64,&checksum);
+  Require(!result.ok()&&result.message().find("checksum differs across Jettys: queue=1")!=std::string::npos,
+          "earlier Jetty checksum failure cannot be masked by the final Jetty");
+  Require(post_calls==calls+2&&local_mrs==1,"checksum failure stops probing and releases scratch");
+  corrupt_queue=-1;required_wave_queues=0;
+  Require(backend->Close().ok()&&queues==0&&peers==0&&imported_mrs==0&&local_mrs==0,"all-Jetty probe cleanup");
 }
 void BorrowedPoolTest() {
   urma_context_t context{};context.eid.raw[15]=1;
@@ -492,6 +528,7 @@ void BulkFailureTest(Fault injected) {
   _exit(0);
 }
 int main(){try{
+  AllJettyScratchTest();
   ProfileSummaryTest();
   BorrowedPoolTest();
   MultipleMrTransportTest();
@@ -505,6 +542,12 @@ int main(){try{
   BulkReadTest(33,8192); // Uneven distribution across four queues.
   ProbeFailureTest(Fault::LocalAccess);
   ProbeFailureTest(Fault::CqStatus);
+  for(int queue=0;queue<int(p::kChannelCount);++queue)ProbeFailureTest(Fault::AckTimeout,false,queue);
+  {
+    const auto child=fork();Require(child>=0,"fork later Jetty teardown failure");
+    if(child==0){try{ProbeFailureTest(Fault::AckTimeout,true,1);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}
+    int status{};Require(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"later Jetty failure retains resources when teardown fails");
+  }
   for(auto injected:{Fault::Post,Fault::Poll,Fault::UserContext,Fault::Receive,Fault::Multiple,Fault::LocalAccess}){
     const auto child=fork();Require(child>=0,"fork probe scenario");
     if(child==0){try{ProbeFailureTest(injected,injected==Fault::LocalAccess);}catch(const std::exception& e){std::cerr<<e.what()<<'\n';}_exit(1);}

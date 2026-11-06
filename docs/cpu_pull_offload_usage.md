@@ -116,7 +116,7 @@ python tests/python/test_remote_cpu_offload.py \
 
 本卡测试可用 `--npu-eid` 固定 CPU↔本卡路由、用 `--cpu-candidate` 固定 CPU 设备。共享池首先由 Runtime 分配并固定 CPU candidate，源注册在该池上尝试 NPU EID；不会为每个源重建 DDR 池。
 
-源 EID 自动发现先尝试 CLOS，再尝试 asdrv pair-info。注册对每个 MR 各做最多 64 字节的 scratch READ 和 checksum 探测，不覆盖已经分配的 DDR 槽位。此前测试机器上 CLOS 路由被拒绝，`000000000000020000100000df00e100` 路由成功；具体选择以当前硬件为准。
+源 EID 自动发现先尝试 CLOS，再尝试 asdrv pair-info。注册对每个 MR 在四个 Jetty 上各做最多 64 字节的 scratch READ 和 checksum 探测，逐个等待完成，不覆盖已经分配的 DDR 槽位。此前测试机器上 CLOS 路由被拒绝，`000000000000020000100000df00e100` 路由成功；具体选择以当前硬件为准。
 
 本卡验收成功标记为 `LOCAL_CPU_PULL_PASS`，跨卡为 `REMOTE_OFFLOAD_PASS`。建链导入成功不能代替数据校验。
 
@@ -139,7 +139,12 @@ python tests/python/test_remote_cpu_offload.py \
 注册后 tensor 的地址和大小不能变化，所有分配保留到 shutdown 成功；当前批次未释放前
 不能改写选中 tensor。使用同一个 Source 对象的批次依次提交、完成、释放。
 
-成功注册日志包含 `mrs=78 jettys=4 probe=all_mrs_scratch_checksum_pass`。
+成功注册日志包含 `mrs=78 jettys=4 probe=all_mrs_all_jettys_scratch_checksum_pass`。
+CPU 的 `CPU_PULL_PROBE_END` 记录每个 MR 的探测结果，失败时包含具体阶段、Jetty 和 CQ 错误名。
+例如 `cq_status=9 cq_status_name=URMA_CR_ACK_TIMEOUT_ERR` 表示传输重试后仍未获得预期确认，
+与 `cq_status=4` 的本地访问错误不同。四个单条探测全部通过仍不等于正式多 Jetty 并行读取已验证。
+跨机时应对齐已验证的 CPU/NPU EID 配对；仅启用 CPU Pull、未加载 BatchGet kernel 的初始化
+会选择第一个能分配 DDR 的 CPU candidate，不会遍历全部 CPU candidate 执行跨机 READ 探测。
 `REMOTE_PULL_DONE` 中的 `mr` 随所选 tensor 改变；验收终行应有
 `REMOTE_OFFLOAD_PASS ... tensors=78 single_mr_per_batch=1`。
 每轮 checksum 校验继续保留，显式模式另外验证重复提交，且两种模式都不重新注册或重建连接。
