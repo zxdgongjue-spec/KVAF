@@ -1,7 +1,7 @@
-# NPU 单 CPU EID 基线与双 CPU EID 并发端口争用测试
+# NPU 单 CPU EID 基线与多 CPU EID 并发端口争用测试
 
-`run_peer_eid_sweep.py` 接受一个或两个远端 CPU EID。一个 EID 时退化为单路
-基线，所有 Jetty 都访问该 EID；两个 EID 时，两路 BatchGet 由同一
+`run_peer_eid_sweep.py` 接受一个或多个远端 CPU EID。一个 EID 时退化为单路
+基线，所有 Jetty 都访问该 EID；多个 EID 时，各路 BatchGet 由同一
 Runtime、同一 stream 上的同一次 AIV kernel 发出，各自使用独立 Jetty/SQ/CQ。
 脚本名称保留 sweep，但不逐个 EID 串行跑性能测试。
 
@@ -38,7 +38,19 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 若 CPU 服务在另一台机器上，`KVAF_CPU_SERVICE_ADDR` 使用该机器可达的 IP。
 输出目录可不存在或为空；已有同名结果文件时拒绝覆盖。
 指定 EID 未被 CPU 服务公布、EID 重复、建链失败时直接失败，不回退到其他 EID。
-服务端若通过 `--ub-device` 限制为单个设备，可能无法公布这两个 EID。
+服务端若通过 `--ub-device` 限制为单个设备，可能无法公布全部指定 EID。
+
+三路及以上仍使用逗号分隔的 `--peer-eids`，并保证 `--jettys` 不少于 EID 数量。
+例如，将 `CPU_EID_0`、`CPU_EID_1`、`CPU_EID_2` 和 `NPU_EID` 设为实际 EID 后，
+三路、每路两个 Jetty 的配置为：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 DEVICE_ID=7 \
+python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
+    --peer-eids "$CPU_EID_0,$CPU_EID_1,$CPU_EID_2" \
+    --npu-eid "$NPU_EID" --cores 1 --jettys 6 \
+    --output-dir results/peer-contention-three-001
+```
 
 单路基线使用同一脚本，只需给 `--peer-eids` 传一个值，例如：
 
@@ -55,48 +67,50 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 
 单 EID 模式下可使用 `--jettys 1`，也允许小请求量或 `--miss-count 0`，不要求
 每个 Jetty/core 都有流量。精确 EID 选择及数据正确性校验仍然保留。
-与双路比较时，保持 `cores`、`jettys`、`miss-count`、token 大小和 inflight
+与多路比较时，保持 `cores`、`jettys`、`miss-count`、token 大小和 inflight
 等参数一致，并使用不同输出目录。EID 数量不会自动改变总请求量：单路全部搬运，
-双路分担同一总量；例如 `--jettys 4 --miss-count 2048` 在单路是四个 Jetty
+多路分担同一总量；例如 `--jettys 4 --miss-count 2048` 在单路是四个 Jetty
 都指向同一个 EID，在双路是每个 EID 两个 Jetty。
 
 ## 参数和测量口径
 
 | 参数 | 含义 |
 | --- | --- |
-| `--peer-eids` | 一个 CPU EID 为单路基线；两个不同 CPU EID 为并发测试，顺序对应 path 0、1 |
+| `--peer-eids` | 一个 CPU EID 为单路基线；多个不同 CPU EID 为并发测试，顺序对应 path 0 到 N−1；数量不超过 `--jettys` |
 | `--npu-eid` | 一个本地 NPU EID；设备由 `DEVICE_ID` 选择 |
 | `--cores` | 一次 kernel 使用的 AIV core 总数，1–48 |
-| `--jettys` | **每 core 的 Jetty 总数**，单路 1–64，双路 2–64；单路全部使用 path 0，双路按 0、1、0、1 分配 |
+| `--jettys` | **每 core 的 Jetty 总数**，1–64，且不少于 EID 数量 N；按 `jetty_slot % N` 分配路径 |
 | `--table-capacity` | 共享 DDR 表的条目数 |
 | `--request-length` | 请求数组容量，默认 32768 |
-| `--miss-count` | 每次 BatchGet 的有效请求总数；单路全部搬运、双路分担；默认等于 request-length |
+| `--miss-count` | 每次 BatchGet 的有效请求总数；单路全部搬运、多路分担；默认等于 request-length |
 | `--token-bytes` / `--tokens-per-block` | 默认 656 / 128 |
 | `--warmup` / `--iterations` | 默认 3 / 100，warmup 不计入结果 |
-| `--max-inflight-total` | 总 inflight 上限；单路默认 2048，与原性能测试一致；双路默认 `max(2048, cores * jettys * 256)` |
+| `--max-inflight-total` | 总 inflight 上限；单路默认 2048，与原性能测试一致；多路默认 `max(2048, cores * jettys * 256)` |
 | `--timeout` | 完整测试超时秒数，默认 600 |
 | `--kernel-profile-clock-mhz` | AIV 周期换算频率，默认读取 `KVAF_BATCH_GET_KERNEL_CLOCK_MHZ`，未设置时为 1000 MHz，与原 miss-count 脚本一致 |
 
 双路时，`--cores 1 --jettys 4` 是 1 core、共 4 Jetty，每个 CPU EID 分到 2 个。
 这不等同于两个各用 1 core、4 Jetty 的独立测试；比较基线时应匹配资源和流量。
-奇数 Jetty 会使两路分配不对称，公平比较宜使用偶数。请求以每 post 最多 128 个
-READ 的粒度轮转，尾部也可能使两路字节数不同，实际分配以 CSV 为准。
+Jetty 数不是 EID 数量的整数倍时，各路分配不对称，公平比较宜使用整数倍。
+请求以每 post 最多 128 个 READ 的粒度轮转，尾部也可能使各路字节数不同，实际分配以 CSV 为准。
+多路测试要求 `miss-count >= cores * jettys * 128`，以保证所有 Jetty 都有流量；
+默认请求量不足时需同步增大 `--request-length` 和 `--miss-count`。
 
-两个 CPU EID 对**同一块 DDR backing**分别注册，拥有各自的 token/segment/channel。
-这样 BatchPut 只需通过第一条路径填充数据，两个 EID 读取的是同一张已验证的表。
+所有 CPU EID 对**同一块 DDR backing**分别注册，拥有各自的 token/segment/channel。
+这样 BatchPut 只需通过第一条路径填充数据，所有 EID 读取的是同一张已验证的表。
 `table-capacity=16384` 的默认 DDR 大小为 `16384 * 128 * 656 = 1375731712` 字节，
-不是每个 EID 各分配这么多内存。这避免双份 DDR 分配，但内存工作集与旧的双服务
+不是每个 EID 各分配这么多内存。这避免多份 DDR 分配，但内存工作集与旧的双服务
 测试不同；测量仍同时包含 DDR、UB、NPU 等因素。
 
 ## 为什么不会按 EID 串行执行
 
-1. CPU 的 TCP 请求只用于发现、注册和建链。建链完成后保留两条注册，READ
+1. CPU 的 TCP 请求只用于发现、注册和建链。建链完成后保留各路注册，READ
    数据直接经 UB 传输，CPU 的 TCP accept 循环不参与 BatchGet 数据搬运。
 2. NPU 将每个 Jetty 的远端 EID、token、TP 和队列信息写入 entity table。
-   每个 core 内 Jetty 按 peer 顺序轮转，单 core 也能向两个 EID 发流。
+   每个 core 内 Jetty 按 peer 顺序轮转，单 core 也能向多个 EID 发流。
 3. 每个提交组先向参与的 Jetty 发出 doorbell，再检查完成；不会先等待一个 EID
    的全部 BatchGet 完成再启动另一个。脚本检查请求数和 inflight 上限，确保首个组
-   足够覆盖所有配置的 Jetty。两条 doorbell 指令之间仍有指令执行时间，并非同一周期。
+   足够覆盖所有配置的 Jetty。各条 doorbell 指令之间仍有指令执行时间，并非同一周期。
 4. kernel 原本对跨 Jetty 的远端 token 做相等校验，现允许每个注册使用独立凭证，
    同时继续校验所有路径的 DDR/HBM 地址范围一致。
 
@@ -115,9 +129,9 @@ READ 的粒度轮转，尾部也可能使两路字节数不同，实际分配以
 微秒数使用 `cycles / clock_mhz`，不从四舍五入后的毫秒数换算；
 `p50_GB/s` 使用本次合计的 `miss_count * token_bytes` 除以 kernel_total 的 p50
 时间，以十进制 GB/s 表示，与原脚本口径一致，不再额外乘以 EID 数量。
-每次调用依然只有一个配置（`combinations=1`），传两个 EID 时在该配置内并发。
+每次调用依然只有一个配置（`combinations=1`），传多个 EID 时在该配置内并发。
 没有自动改成原 shell 脚本的 2048/4096/8192 三组请求量。需要对比某一组时，
-在原命令末尾追加例如 `--miss-count 2048`；两路共同分担这 2048 个请求。
+在原命令末尾追加例如 `--miss-count 2048`；各路共同分担这 2048 个请求，仍需满足上述最小请求量约束。
 
 - `config.json`：启动参数、命令、设备和 CPU 地址。
 - `batch_get.log`：完整终端日志，包含原生建链/路由、预热、校验、总吞吐、
@@ -130,23 +144,24 @@ READ 的粒度轮转，尾部也可能使两路字节数不同，实际分配以
 - `peer_samples.csv`：每次迭代、每个 core、每个 CPU EID 的请求数、字节数、
   首末 doorbell/CQE 观测周期及 `first_wave_observed_overlap_cycles`。
 
-双路成功的运行应包含 `BATCH_GET_PERF_CORRECTNESS_PASS`、两条 `PEER_EID_TRAFFIC`，
+多路成功的运行应包含 `BATCH_GET_PERF_CORRECTNESS_PASS`、每个 EID 一条 `PEER_EID_TRAFFIC`，
 以及 `PEER_EID_CONCURRENCY ... execution=single_kernel`。
-每个样本/core 都必须两路有流量，且两路首个 doorbell 均早于任一路首次观测到 CQE。
-不满足时测试失败，不把仅启动了两条路径当作并发测试成功。
+每个样本/core 都必须所有路径有流量，且所有路径的首个 doorbell 均早于任一路首次观测到 CQE。
+不满足时测试失败，不把仅启动了多条路径当作并发测试成功。
 
 单路则输出一条 `PEER_EID_TRAFFIC` 和
-`PEER_EID_BASELINE ... concurrency_check=not_applicable`，不输出双路并发结论。
+`PEER_EID_BASELINE ... concurrency_check=not_applicable`，不输出多路并发结论。
 同样生成三个性能汇总表及全部 CSV；`peer_samples.csv` 的
 `first_wave_observed_overlap_cycles` 留空，空闲 core 的请求数和时间戳记为 0。
-启动日志和 `config.json` 的 `mode` 区分 `single_eid_baseline` 与 `dual_eid_concurrent`。
+启动日志和 `config.json` 的 `mode`：单路为 `single_eid_baseline`，双路保留
+`dual_eid_concurrent`，三路及以上为 `multi_eid_concurrent`。
 
 这里的重叠量是 **doorbell 到观测到 CQE 的未确认请求窗口**；CQE 轮询有延迟，
-它不能证明物理线上每一瞬间都存在两路流量。不同 core 的周期不直接比较。
+它不能证明物理线上每一瞬间都存在所有路径的流量。不同 core 的周期不直接比较。
 判断是否争用你给定的共享物理端口，还需对照单 EID 基线以及端口计数器；
 代码本身不推断 EID 到物理端口的拓扑。建议使用已有端口统计脚本辅助观察。
 
-输出格式调整及单 EID 支持只改 Python 脚本，无需再次编译 CPU/NPU 二进制；首次启用双 EID
+输出格式调整及单/多 EID 支持只改 Python 脚本，无需再次编译 CPU/NPU 二进制；首次启用多 EID
 功能所需的 v7 构建要求仍适用。原有命令可继续使用，请换一个尚无同名结果的输出目录。
 
 ## 已完成的验证与目标机验收

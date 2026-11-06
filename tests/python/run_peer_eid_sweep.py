@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a single CPU EID baseline or two concurrent EIDs in one BatchGet kernel."""
+"""Run a single CPU EID baseline or multiple concurrent EIDs in one BatchGet kernel."""
 
 import argparse
 import csv
@@ -19,7 +19,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--peer-eids", required=True, type=parse_npu_eids,
-                        help="one CPU EID for a baseline, or two distinct comma-separated EIDs")
+                        help="one CPU EID for a baseline, or multiple distinct comma-separated EIDs; "
+                             "count must not exceed --jettys")
     parser.add_argument("--npu-eid", required=True, type=parse_npu_eids)
     parser.add_argument("--cores", type=int, default=1, help="total AIV cores in the single kernel")
     parser.add_argument("--jettys", type=int, default=4, choices=range(1, 65),
@@ -34,14 +35,14 @@ def parse_args(argv=None):
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--max-inflight-total", type=int, default=None,
-                        help="default 2048 for one EID; max(2048, cores * Jettys * 256) for two")
+                        help="default 2048 for one EID; max(2048, cores * Jettys * 256) for multiple EIDs")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=int(os.environ.get("KVAF_BATCH_GET_KERNEL_CLOCK_MHZ", "1000")),
                         help="AIV clock for cycles-to-us conversion, as in the miss-count runner")
     args = parser.parse_args(argv)
-    if len(args.peer_eids) not in (1, 2) or len(args.npu_eid) != 1:
-        parser.error("one or two distinct CPU peer EIDs and exactly one NPU EID are required")
+    if not args.peer_eids or len(args.npu_eid) != 1:
+        parser.error("at least one distinct CPU peer EID and exactly one NPU EID are required")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
     if args.max_inflight_total is None:
@@ -161,7 +162,12 @@ def write_summary(args, log_text, output, emit):
 def main(argv=None):
     args = parse_args(argv)
     single_peer = len(args.peer_eids) == 1
-    mode = "single_eid_baseline" if single_peer else "dual_eid_concurrent"
+    if single_peer:
+        mode = "single_eid_baseline"
+    elif len(args.peer_eids) == 2:
+        mode = "dual_eid_concurrent"
+    else:
+        mode = "multi_eid_concurrent"
     build = args.build_dir.resolve()
     kernel = build / "bin/kvaf_execute_batch_get_kernels.o"
     put_kernel = build / "bin/kvaf_execute_batch_put_kernels.o"
