@@ -8,6 +8,7 @@ struct OperatorOptions {
   std::uint32_t device_id{0};
   std::uint32_t cores{2};
   std::shared_ptr<peer::PeerLink> peer_link;
+  bool managed_completion{false};
 };
 
 // Mapped-memory backend of the existing KVAF contract.
@@ -19,6 +20,7 @@ class AccessOperator final : public kvaf::AccessOperator {
   ~AccessOperator() override;
   Status Initialize(const RemoteRegionDesc& region) override;
   Status Shutdown() override;
+  Status DrainGet() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);

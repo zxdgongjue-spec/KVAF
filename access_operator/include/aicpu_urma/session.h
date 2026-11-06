@@ -26,6 +26,7 @@ class UmdkSession {
   Status Shutdown();
   // A failed launch/completion blocks reuse until Shutdown succeeds.
   Status Drain();
+  Status ReleaseBuffers();
   using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
   Status WriteDescriptors(std::uint64_t descriptors, std::uint32_t count, aclrtStream stream,
                           Launch);

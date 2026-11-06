@@ -1,3 +1,4 @@
+#include "execution_config_python.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -341,6 +342,7 @@ class PythonRuntime final {
 }  // namespace kvaf
 
 PYBIND11_MODULE(_kvaf, m) {
+  kvaf::python_binding::BindExecutionConfigs(m);
   m.doc() = "Synchronous KVAF Runtime Python bindings";
 
   py::class_<kvaf::AccessTableHandle>(m, "AccessTable")

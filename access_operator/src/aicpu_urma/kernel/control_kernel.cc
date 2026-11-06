@@ -10,28 +10,32 @@ using namespace kvaf::aicpu_urma::detail;
 extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControl(
     UmdkControlArgs* args) {
   if (!args || !args->status) return 1;
-  std::unique_lock<std::shared_mutex> lock(state_mutex);
+
   auto& status = *reinterpret_cast<UmdkControlStatus*>(args->status);
   status = {};
   status.magic = kUmdkControlMagic;
   status.owner_pid = getpid();
-  status.session = state.session;
+  auto session = args->op == UmdkControlOp::kPrepare ? CreateSession() : FindSession(args->session);
+  if (!session) { Fail(status, "UMDK session was not found"); return 0; }
+  const auto session_id = args->op == UmdkControlOp::kPrepare ? session->state.session : args->session;
+  std::unique_lock<std::shared_mutex> lock(session->mutex);
+  SessionScope scope(*session);
+  status.session = CurrentState().session;
 
   errno = 0;
   if (args->op == UmdkControlOp::kPrepare) {
     if (!args->worker_count || args->worker_count > 8 || !args->local_buffer ||
         !args->buffer_bytes || args->local_buffer > UINT64_MAX - args->buffer_bytes ||
-        args->library[255])
+        args->library[255]) {
       Fail(status, "invalid UMDK session arguments");
-    else if (state.session != 0) {
+      CurrentState().session = 0;
       status.session = 0;
-      Fail(status, "UMDK session already active");
     } else if (!Prepare(*args, status)) {
       UmdkControlStatus cleanup{};
       if (Cleanup(cleanup)) status.session = 0;
     }
   } else if (args->owner_pid != status.owner_pid || !args->session ||
-             args->session != state.session)
+             args->session != CurrentState().session)
     Fail(status, "AICPU process/session changed");
   else
     switch (args->op) {
@@ -48,6 +52,9 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
         TransferControl(true, reinterpret_cast<const UmdkTransfer*>(args->transfer_spans),
                         args->transfer_count, status);
         break;
+      case UmdkControlOp::kUnregisterBuffers:
+        UnregisterBuffers(status);
+        break;
       case UmdkControlOp::kDestroy:
         Cleanup(status);
         break;
@@ -56,6 +63,14 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
         break;
     }
 
+  if (CurrentState().session == 0) RemoveSession(session_id);
   if (!status.result) std::snprintf(status.stage, sizeof(status.stage), "OK");
   return 0;
+}
+
+// Explicit entry capability: old packages lack independent sessions and
+// completion-scoped buffer unregistration. Host preflight requires this name.
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV2(
+    UmdkControlArgs* args) {
+  return KvafAicpuUmdkControl(args);
 }

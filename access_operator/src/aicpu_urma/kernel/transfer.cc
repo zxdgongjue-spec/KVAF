@@ -9,9 +9,6 @@
 
 namespace kvaf::aicpu_urma::detail {
 
-namespace {
-std::array<std::mutex, 8> control_mutexes;
-}  // namespace
 
 std::uint64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -25,7 +22,7 @@ bool PostBatch(Queue& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail,
   tail->next = nullptr;
   urma_jfs_wr_t* bad = nullptr;
   errno = 0;
-  const int result = state.api.urma_post_jetty_send_wr(worker.jetty, first, &bad);
+  const int result = CurrentState().api.urma_post_jetty_send_wr(worker.jetty, first, &bad);
   tail->next = saved_next;
   if (result == 0) return true;
   worker.poisoned = true;
@@ -40,7 +37,7 @@ bool WaitCompletion(Queue& worker, std::uint64_t context, std::uint64_t start,
   auto now = start;
   while (now < deadline) {
     urma_cr_t completion{};
-    const int count = state.api.urma_poll_jfc(worker.jfc, 1, &completion);
+    const int count = CurrentState().api.urma_poll_jfc(worker.jfc, 1, &completion);
     if (count < 0) {
       Fail(status, "urma_poll_jfc", count);
       break;
@@ -82,7 +79,7 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
   while (transfer_index < count && requests.wrs.size() < 4096) {
     const auto& transfer = transfers[transfer_index];
     if (transfer.bytes == 0 || offset >= transfer.bytes ||
-        !UmdkRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
+        !UmdkRange(CurrentState().remote->seg.ubva.va, CurrentState().remote->seg.len, transfer.remote,
                    transfer.bytes))
       return Fail(status, "UMDK transfer outside remote region");
     auto* segment = LocalSegment(transfer.local, transfer.bytes);
@@ -90,7 +87,7 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
     const auto bytes =
         static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, transfer.bytes - offset));
     requests.local_sges.push_back({transfer.local + offset, bytes, segment, nullptr});
-    requests.remote_sges.push_back({transfer.remote + offset, bytes, state.remote, nullptr});
+    requests.remote_sges.push_back({transfer.remote + offset, bytes, CurrentState().remote, nullptr});
     urma_jfs_wr_t wr{};
     wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
     wr.flag.bs.comp_order = 1;
@@ -121,14 +118,14 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
 // The caller holds the control lock and waits for the CQE before reusing these slots.
 bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
                  UmdkControlStatus& status) {
-  if (!UmdkRange(state.remote->seg.ubva.va, state.remote->seg.len, transfer.remote,
+  if (!UmdkRange(CurrentState().remote->seg.ubva.va, CurrentState().remote->seg.len, transfer.remote,
                  transfer.bytes))
     return Fail(status, "UMDK transfer outside remote region");
   auto* segment = LocalSegment(transfer.local, transfer.bytes);
   if (!segment) return Fail(status, "UMDK transfer outside registered HBM");
   const auto bytes = static_cast<std::uint32_t>(transfer.bytes);
   worker.single_local = {transfer.local, bytes, segment, nullptr};
-  worker.single_remote = {transfer.remote, bytes, state.remote, nullptr};
+  worker.single_remote = {transfer.remote, bytes, CurrentState().remote, nullptr};
   urma_sg_t local{reinterpret_cast<urma_sge_t*>(&worker.single_local), 1};
   urma_sg_t remote{reinterpret_cast<urma_sge_t*>(&worker.single_remote), 1};
   auto& wr = worker.single_wr;
@@ -148,7 +145,7 @@ bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
 
 bool TransferQueue(Queue& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                    UmdkControlStatus& status) {
-  if (worker.poisoned || worker.target == nullptr || state.remote == nullptr ||
+  if (worker.poisoned || worker.target == nullptr || CurrentState().remote == nullptr ||
       transfers == nullptr || count == 0 || count > kUmdkMaxTransfers)
     return Fail(status, "invalid UMDK transfer queue");
   if (count == 1 && transfers[0].bytes > 0 && transfers[0].bytes <= 65536)
@@ -174,7 +171,7 @@ bool TransferControl(bool write, const UmdkTransfer* transfers, std::uint32_t co
                      UmdkControlStatus& status, std::uint32_t worker_index) {
   auto* control = FindQueue(kUmdkControlQueueIndex + worker_index);
   if (!control) return Fail(status, "control queue is unavailable");
-  std::lock_guard<std::mutex> control_lock(control_mutexes[worker_index]);
+  std::lock_guard<std::mutex> control_lock(active_session->control_mutexes[worker_index]);
   return TransferQueue(*control, write, transfers, count, status);
 }
 
@@ -184,9 +181,13 @@ namespace kvaf::aicpu_urma {
 using namespace detail;
 std::uint32_t UmdkTransferSync(const UmdkContext* args, bool write, const UmdkTransfer* transfers,
                                std::uint32_t count, std::uint32_t worker_index) {
-  std::shared_lock<std::shared_mutex> lock(state_mutex);
-  if (args == nullptr || args->session != state.session ||
-      args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= state.worker_count)
+  if (!args) return 16;
+  auto session = FindSession(args->session);
+  if (!session) return 16;
+  std::shared_lock<std::shared_mutex> lock(session->mutex);
+  SessionScope scope(*session);
+  if (args == nullptr || args->session != CurrentState().session ||
+      args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= CurrentState().worker_count)
     return 16;
   UmdkControlStatus status{};
   const bool success = TransferControl(write, transfers, count, status, worker_index);

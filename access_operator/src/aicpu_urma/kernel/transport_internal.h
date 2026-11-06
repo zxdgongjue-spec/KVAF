@@ -1,6 +1,8 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <mutex>
+#include <memory>
 #include <shared_mutex>
 #include <vector>
 
@@ -88,9 +90,22 @@ struct SessionState {
   std::vector<RegisteredBuffer> buffers;
 };
 
-extern SessionState state;
-extern std::shared_mutex state_mutex;
-extern std::array<std::mutex, 8> worker_mutexes;
+struct ExecutionSession {
+  SessionState state;
+  std::shared_mutex mutex;
+  std::array<std::mutex, 8> worker_mutexes, control_mutexes;
+  std::atomic<unsigned> next_worker{0};
+};
+std::shared_ptr<ExecutionSession> CreateSession();
+std::shared_ptr<ExecutionSession> FindSession(std::uint64_t id);
+void RemoveSession(std::uint64_t id);
+extern thread_local ExecutionSession* active_session;
+inline SessionState& CurrentState() { return active_session->state; }
+struct SessionScope {
+  ExecutionSession* previous;
+  explicit SessionScope(ExecutionSession& session) : previous(active_session) { active_session = &session; }
+  ~SessionScope() { active_session = previous; }
+};
 std::uint64_t NowNs();
 Queue& DataQueue(std::uint32_t index);
 Queue* FindQueue(std::uint32_t index);
@@ -99,6 +114,7 @@ bool Connect(const UmdkControlArgs&, UmdkControlStatus&);
 bool DescribeWorker(const UmdkControlArgs&, std::uint32_t index, UmdkControlStatus&);
 bool RegisterBuffer(const UmdkControlArgs&, UmdkControlStatus&);
 bool Cleanup(UmdkControlStatus&);
+bool UnregisterBuffers(UmdkControlStatus&);
 void Stage(UmdkControlStatus&, const char*);
 bool Fail(UmdkControlStatus&, const char*, int result = -1, const char* detail = "");
 bool PostBatch(Queue&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);

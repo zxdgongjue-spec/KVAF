@@ -290,9 +290,13 @@ struct DefaultAccessOperator::Impl {
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+  aclrtStream pending_get{nullptr};
+  KvafBatchGetLocalBuffer* pending_buffer{nullptr};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
+  aclrtStream pending_put{nullptr};
+  KvafBatchPutLocalBuffer* pending_put_buffer{nullptr};
 #endif
   bool initialized{false};
 };
@@ -300,14 +304,14 @@ struct DefaultAccessOperator::Impl {
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 
-DefaultAccessOperator::~DefaultAccessOperator() { (void)Shutdown(); }
+DefaultAccessOperator::~DefaultAccessOperator() { if (!Shutdown().ok()) (void)impl_.release(); }
 
 Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) {
   if (impl_->initialized) {
     return InvalidState("AccessOperator has already been initialized");
   }
   if (remote_region.base == 0 || remote_region.length == 0 ||
-      impl_->config.batch_get_kernel_object_path.empty() ||
+      (impl_->config.enable_get && impl_->config.batch_get_kernel_object_path.empty()) ||
       impl_->config.npu_core_count == 0 ||
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
@@ -353,51 +357,54 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
     return InvalidArgument("invalid BatchPut transport configuration");
   }
 #endif
-  if (KvafExecuteBatchGetLoadKernel(
-          impl_->config.batch_get_kernel_object_path.c_str()) !=
-      KVAF_BATCH_GET_SUCCESS) {
-    return Internal("failed to load BatchGet kernel");
-  }
+  if (impl_->config.enable_get) {
+    if (KvafExecuteBatchGetLoadKernel(
+            impl_->config.batch_get_kernel_object_path.c_str()) !=
+        KVAF_BATCH_GET_SUCCESS) {
+      return Internal("failed to load BatchGet kernel");
+    }
 
-  KvafBatchGetTransport* transport = nullptr;
-  static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
-                "NPU EID storage must remain packed");
-  const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
-      impl_->config.peer_local_eids.data());
-  const auto peer_local_eid_count =
-      static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
-  const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
-      reinterpret_cast<void*>(remote_region.base), remote_region.length,
-      impl_->config.npu_core_count, impl_->config.jettys_per_core,
-      impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
-      &transport);
-  if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
-    return Internal("failed to create reusable BatchGet transport");
-  }
+    KvafBatchGetTransport* transport = nullptr;
+    static_assert(sizeof(impl_->config.peer_local_eids.front()) == 16U,
+                  "NPU EID storage must remain packed");
+    const auto* peer_local_eids = reinterpret_cast<const std::uint8_t*>(
+        impl_->config.peer_local_eids.data());
+    const auto peer_local_eid_count =
+        static_cast<std::uint32_t>(impl_->config.peer_local_eids.size());
+    const int32_t result = KvafBatchGetTransportCreateWithPeerLinkMultiEid(
+        reinterpret_cast<void*>(remote_region.base), remote_region.length,
+        impl_->config.npu_core_count, impl_->config.jettys_per_core,
+        impl_->config.peer_link.get(), peer_local_eids, peer_local_eid_count,
+        &transport);
+    if (result != KVAF_BATCH_GET_SUCCESS || transport == nullptr) {
+      return Internal("failed to create reusable BatchGet transport");
+    }
 
-  BatchGetExecutionState execution;
-  execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
-                           sizeof(KvafBatchGetCoreStatus);
-  execution.queue_state_bytes =
-      static_cast<std::size_t>(impl_->config.npu_core_count) *
-      impl_->config.jettys_per_core *
-      sizeof(KvafBatchGetQueueState);
-  if (aclrtMalloc(&execution.status, execution.status_bytes,
-                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      aclrtMalloc(&execution.queue_state, execution.queue_state_bytes,
-                  ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      aclrtMemset(execution.status, execution.status_bytes, 0,
-                  execution.status_bytes) != ACL_SUCCESS ||
-      aclrtMemset(execution.queue_state, execution.queue_state_bytes, 0,
-                  execution.queue_state_bytes) != ACL_SUCCESS) {
-    if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
-    if (execution.status != nullptr) (void)aclrtFree(execution.status);
-    KvafBatchGetTransportDestroy(transport);
-    return Internal("failed to allocate internal BatchGet execution state");
+    BatchGetExecutionState execution;
+    execution.status_bytes = static_cast<std::size_t>(impl_->config.npu_core_count) *
+                             sizeof(KvafBatchGetCoreStatus);
+    execution.queue_state_bytes =
+        static_cast<std::size_t>(impl_->config.npu_core_count) *
+        impl_->config.jettys_per_core *
+        sizeof(KvafBatchGetQueueState);
+    if (aclrtMalloc(&execution.status, execution.status_bytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMalloc(&execution.queue_state, execution.queue_state_bytes,
+                    ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+        aclrtMemset(execution.status, execution.status_bytes, 0,
+                    execution.status_bytes) != ACL_SUCCESS ||
+        aclrtMemset(execution.queue_state, execution.queue_state_bytes, 0,
+                    execution.queue_state_bytes) != ACL_SUCCESS) {
+      if (execution.queue_state != nullptr) (void)aclrtFree(execution.queue_state);
+      if (execution.status != nullptr) (void)aclrtFree(execution.status);
+      KvafBatchGetTransportDestroy(transport);
+      return Internal("failed to allocate internal BatchGet execution state");
   }
   impl_->remote_region = remote_region;
   impl_->transport = transport;
   impl_->execution = execution;
+  }
+  impl_->remote_region = remote_region;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (!impl_->config.batch_put_kernel_object_path.empty()) {
     if (impl_->config.npu_core_count > KVAF_AIV_BATCH_PUT_MAX_AIV_CORES ||
@@ -458,9 +465,20 @@ Status DefaultAccessOperator::Shutdown() {
     return Status::OK();
   }
 
+  auto drained = DrainGet();
+  if (!drained.ok()) return drained;
+
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (impl_->pending_put) {
+    if (aclrtSynchronizeStream(impl_->pending_put) != ACL_SUCCESS)
+      return Status::CompletionUnknown("Put stream still pending; resources retained");
+    if (KvafBatchPutLocalBufferRetire(impl_->pending_put_buffer) != KVAF_BATCH_PUT_SUCCESS)
+      return Internal("failed to retire Put registration; resources retained");
+    impl_->pending_put_buffer = nullptr;
+    impl_->pending_put = nullptr;
+  }
   ReleaseBatchPutExecutionState(&impl_->batch_put_execution);
   if (impl_->batch_put_transport != nullptr) {
     KvafBatchPutTransportDestroy(impl_->batch_put_transport);
@@ -491,6 +509,16 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
+  if (impl_->config.managed_completion) {
+    auto drained = DrainGet();
+    if (!drained.ok()) return drained;
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
+      return Internal("cannot query graph capture state");
+    if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+      return Status::NotImplemented("per-call dispatcher graph leases are not implemented; use legacy Direct graph path");
+  }
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
       exec, impl_->config.npu_core_count, impl_->config.jettys_per_core,
@@ -511,11 +539,20 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
+  if (impl_->config.managed_completion) {
+    impl_->pending_get = stream;
+    impl_->pending_buffer = local_buffer;
+    if (aclrtMemsetAsync(impl_->execution.status, impl_->execution.status_bytes, 0xFF,
+                         impl_->execution.status_bytes, stream) != ACL_SUCCESS)
+      return Status::CompletionUnknown("failed to initialize Get completion status");
+  }
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
-    KvafBatchGetLocalBufferRelease(local_buffer);
+    if (!impl_->config.managed_completion) KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
   }
+  if (impl_->config.managed_completion)
+    return exec.execution.synchronize ? DrainGet() : Status::OK();
   if (exec.execution.synchronize) {
     const aclError sync_result = aclrtSynchronizeStream(stream);
     KvafBatchGetLocalBufferRelease(local_buffer);
@@ -529,6 +566,24 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     // the caller owns stream completion and tensor lifetime.
     KvafBatchGetLocalBufferRelease(local_buffer);
   }
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::DrainGet() {
+  if (!impl_->pending_get) return Status::OK();
+  if (aclrtSynchronizeStream(impl_->pending_get) != ACL_SUCCESS)
+    return Status::CompletionUnknown("BatchGet stream completion failed; resources retained");
+  std::vector<KvafBatchGetCoreStatus> reports(impl_->config.npu_core_count);
+  if (aclrtMemcpy(reports.data(), impl_->execution.status_bytes, impl_->execution.status,
+                  impl_->execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    return Internal("failed to collect BatchGet completion status");
+  for (const auto& r : reports)
+    if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result != 0)
+      return Internal("BatchGet kernel reported an execution error; session retained");
+  if (KvafBatchGetLocalBufferRetire(impl_->pending_buffer) != KVAF_BATCH_GET_SUCCESS)
+    return Internal("failed to retire Get registration; resources retained");
+  impl_->pending_buffer = nullptr;
+  impl_->pending_get = nullptr;
   return Status::OK();
 }
 
@@ -707,6 +762,10 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       return Internal("failed to enqueue BatchPut metadata upload to NPU");
     }
 
+    if (impl_->config.managed_completion) {
+      impl_->pending_put = stream;
+      impl_->pending_put_buffer = local_buffer;
+    }
     const int32_t result = KvafExecuteBatchPutSync(
         local_buffer, &arguments, stream, execution.host_core_status,
         static_cast<std::uint32_t>(execution.host_core_status_count));
@@ -716,7 +775,14 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       // the stream has stopped reading it.
       (void)aclrtSynchronizeStream(stream);
     }
-    KvafBatchPutLocalBufferRelease(local_buffer);
+    if (impl_->config.managed_completion && result != KVAF_BATCH_PUT_SUCCESS)
+      return Status::CompletionUnknown("AIV BatchPut execution failed; session retained for shutdown");
+    if (impl_->config.managed_completion) {
+      if (KvafBatchPutLocalBufferRetire(local_buffer) != KVAF_BATCH_PUT_SUCCESS)
+        return Status::CompletionUnknown("failed to retire Put registration; resources retained");
+    } else KvafBatchPutLocalBufferRelease(local_buffer);
+    impl_->pending_put = nullptr;
+    impl_->pending_put_buffer = nullptr;
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
       return Internal("AIV Direct-HCCP BatchPut execution failed");

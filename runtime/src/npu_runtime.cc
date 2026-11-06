@@ -1,4 +1,5 @@
 #include "npu_runtime.h"
+#include "execution_dispatcher.h"
 
 #include <acl/acl.h>
 
@@ -440,6 +441,20 @@ std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
 
 struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
+    options.per_call_execution = options.per_call_execution || options.default_put || options.default_get ||
+        options.enabled_put_configs || options.enabled_get_configs || options.transport_mode != TransportMode::Urma;
+    if (options.per_call_execution) {
+      auto normalized = NormalizeExecutionPolicy(&options);
+      if (!normalized.ok()) throw std::invalid_argument(normalized.message());
+      if (options.transport_mode == TransportMode::UrmaAndUbmem)
+        throw std::invalid_argument("urma+ubmem requires the shared Region binding protocol; not implemented in this version");
+      options.transport = options.transport_mode == TransportMode::Ubmem ? Transport::Ubmem : Transport::Urma;
+      if (options.default_get && options.default_get->executor == Executor::Aicpu)
+        options.aicpu_batch_get_mode = options.default_get->algorithm == GetAlgorithm::Gather ? "gather_read" : "cpu_push_scatter";
+      else options.aicpu_batch_get_mode.clear();
+      if (options.adaptive_ub_device)
+        throw std::invalid_argument("per-call execution uses lazy preparation; adaptive startup probing is not supported");
+    }
     const auto selected = detail::ResolveRuntimeBackend(
         options.transport, options.aicpu_batch_get_mode, &backend);
     if (!selected.ok()) throw std::invalid_argument(selected.message());
@@ -458,7 +473,20 @@ struct NpuRuntime::Impl {
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
     urma_operator = nullptr;
-    if (backend == detail::RuntimeBackend::kUbmem) {
+    dispatcher = nullptr;
+    if (options.per_call_execution) {
+      auto dispatch = std::make_unique<ExecutionDispatcher>(options);
+      for (auto c : *options.enabled_put_configs) {
+        auto status = dispatch->RegisterPut(c, [this, c]() { return MakeProvider(c.transport, c.executor, GetAlgorithm::Direct, false); });
+        if (!status.ok()) throw std::invalid_argument(status.message());
+      }
+      for (auto c : *options.enabled_get_configs) {
+        auto status = dispatch->RegisterGet(c, [this, c]() { return MakeProvider(c.transport, c.executor, c.algorithm, true); });
+        if (!status.ok()) throw std::invalid_argument(status.message());
+      }
+      dispatcher = dispatch.get();
+      access_operator = std::move(dispatch);
+    } else if (backend == detail::RuntimeBackend::kUbmem) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
       access_operator = std::make_unique<ubmem::AccessOperator>(ubmem::OperatorOptions{
           options.batch_get_kernel_object_path, options.batch_put_kernel_object_path,
@@ -487,6 +515,33 @@ struct NpuRuntime::Impl {
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
   }
 
+  std::unique_ptr<AccessOperator> MakeProvider(Transport transport, Executor executor,
+                                               GetAlgorithm algorithm, bool get) {
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+    if (transport == Transport::Ubmem) {
+      return std::make_unique<ubmem::AccessOperator>(ubmem::OperatorOptions{
+          get ? options.batch_get_kernel_object_path : "",
+          get ? "" : options.batch_put_kernel_object_path,
+          options.device_id, options.npu_core_count, peer_link, true});
+    }
+    if (executor == Executor::Aiv) {
+      auto c = config;
+      c.enable_get = get;
+      c.managed_completion = true;
+      if (get) c.batch_put_kernel_object_path.clear();
+      return std::make_unique<DefaultAccessOperator>(std::move(c));
+    }
+#endif
+#if defined(KVAF_ENABLE_AICPU_URMA)
+    return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
+        kernel_package.json_path, options.npu_core_count, peer_link, options.batch_get_token_bytes,
+        algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
+        config.peer_local_eid, get, true});
+#else
+    throw std::invalid_argument("requested execution provider was not built");
+#endif
+  }
+
   void ReleaseProbe() {
     bandwidth_probe.reset();
     if (probe_buffer != nullptr) {
@@ -505,6 +560,7 @@ struct NpuRuntime::Impl {
   std::shared_ptr<peer::PeerLink> peer_link;
   std::unique_ptr<AccessOperator> access_operator;
   DefaultAccessOperator* urma_operator{nullptr};
+  ExecutionDispatcher* dispatcher{nullptr};
   std::unique_ptr<RuntimeCore> runtime_core;
   void* probe_buffer{nullptr};
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
@@ -513,8 +569,43 @@ struct NpuRuntime::Impl {
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& config = impl_->options;
   const bool aicpu = detail::UsesAicpu(impl_->backend);
+  bool any_aicpu = aicpu;
+  if (config.per_call_execution) {
+    bool gather = false, scatter = false;
+    auto check = [&](Transport t, Executor e, bool put) {
+      if (e == Executor::Aicpu) {
+        any_aicpu = true;
+#if !defined(KVAF_ENABLE_AICPU_URMA)
+        throw std::invalid_argument("enabled AICPU provider was not built");
+#endif
+      } else {
 #if !defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!aicpu)
+        throw std::invalid_argument("enabled AIV/UBMEM provider was not built");
+#endif
+        if ((put ? config.batch_put_kernel_object_path : config.batch_get_kernel_object_path).empty())
+          throw std::invalid_argument("enabled AIV provider requires its kernel path");
+#if !defined(KVAF_ENABLE_AIV_BATCH_PUT)
+        if (put && t == Transport::Urma) throw std::invalid_argument("enabled AIV Put provider was not built");
+#endif
+      }
+    };
+    for (auto c : *config.enabled_put_configs) check(c.transport, c.executor, true);
+    for (auto c : *config.enabled_get_configs) {
+      check(c.transport, c.executor, false);
+      if (c.executor == Executor::Aiv && c.algorithm != GetAlgorithm::Direct)
+        throw std::invalid_argument("AIV Gather/Scatter interfaces are reserved; kernels are not integrated");
+      gather |= c.algorithm == GetAlgorithm::Gather;
+      scatter |= c.algorithm == GetAlgorithm::Scatter;
+#if !defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+      if (c.algorithm == GetAlgorithm::Scatter) throw std::invalid_argument("CPU push provider was not built");
+#endif
+    }
+    if (gather && scatter) throw std::invalid_argument(
+        "simultaneous Gather/Scatter enablement requires per-execution CPU sessions; select one in this version");
+  }
+
+#if !defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (!aicpu && !config.per_call_execution)
     throw std::invalid_argument("AIV/UBmem support was not built; select gather_read or cpu_push_scatter");
 #endif
 #if !defined(KVAF_ENABLE_AICPU_URMA)
@@ -524,7 +615,7 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   if (impl_->backend == detail::RuntimeBackend::kUrmaAicpuScatter)
     throw std::invalid_argument("cpu_push_scatter was not built; rebuild with --cpu-push");
 #endif
-  if ((config.batch_get_kernel_object_path.empty() && !aicpu) ||
+  if ((!config.per_call_execution && config.batch_get_kernel_object_path.empty() && !aicpu) ||
       config.npu_core_count == 0 || config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
@@ -540,9 +631,9 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   }
   if (aicpu && config.adaptive_ub_device)
     throw std::invalid_argument("AICPU startup bandwidth tuning is unavailable");
-  if (aicpu && (config.npu_core_count > 8U || GatherStagingBytes(config.batch_get_token_bytes) > UINT32_MAX))
+  if (any_aicpu && (config.npu_core_count > 8U || GatherStagingBytes(config.batch_get_token_bytes) > UINT32_MAX))
     throw std::invalid_argument("UMDK supports 1..8 workers and a gather payload fitting uint32");
-  if (aicpu) {
+  if (any_aicpu) {
     detail::AicpuPackageSearch search;
     if (const char* path = std::getenv("ASCEND_HOME_PATH")) search.ascend_home_path = path;
     if (const char* path = std::getenv("ASCEND_CANN_PACKAGE_PATH")) search.ascend_cann_package_path = path;
@@ -563,6 +654,7 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
     const auto status = Shutdown();
+    if (!status.ok()) { (void)impl_.release(); return; }
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     if (status.ok()) impl_->ReleaseProbe();
@@ -573,7 +665,7 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
+  if (!impl_->options.per_call_execution && impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
       impl_->config.batch_put_kernel_object_path.empty()) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
   }
@@ -584,8 +676,11 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
     impl_->allocator = std::make_unique<ubmem::DdrAllocator>(impl_->peer_link);
 #endif
   } else {
+    bool needs_gather = impl_->backend == detail::RuntimeBackend::kUrmaAicpuGather;
+    if (impl_->options.per_call_execution)
+      for (auto c : *impl_->options.enabled_get_configs) needs_gather |= c.algorithm == GetAlgorithm::Gather;
     auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
-        impl_->backend != detail::RuntimeBackend::kUrmaAicpuGather ? 0U :
+        !needs_gather ? 0U :
             GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes,
                                        impl_->options.npu_core_count));
     impl_->peer_allocator = allocator.get();
@@ -733,6 +828,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
       impl_->CreateCore();
       last = impl_->runtime_core->Initialize(candidate_request);
+      if (impl_->options.per_call_execution) return last;
       if (last.ok()) {
         const std::uint64_t probe_bytes =
             std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
@@ -944,13 +1040,28 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
+bool NpuRuntime::per_call_execution() const { return impl_->options.per_call_execution; }
+Status NpuRuntime::DrainGet() {
+  if (!impl_->options.per_call_execution)
+    return Status::NotImplemented("drain_get requires per-call execution; legacy callers synchronize their stream");
+  return core().DrainGet();
+}
+Status NpuRuntime::Warmup(PutExecutionConfig c) {
+  if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");
+  return impl_->dispatcher ? impl_->dispatcher->Warmup(c) : Status::NotImplemented("warmup requires per-call execution");
+}
+Status NpuRuntime::Warmup(GetExecutionConfig c) {
+  if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");
+  return impl_->dispatcher ? impl_->dispatcher->Warmup(c) : Status::NotImplemented("warmup requires per-call execution");
+}
+
 Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->options.transport == Transport::kUbmem)
+  if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled, detailed);
   if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBmem");
   if (impl_->urma_operator != nullptr)
@@ -966,7 +1077,7 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (impl_->options.transport == Transport::kUbmem)
+  if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
   if (impl_->urma_operator != nullptr)
     return impl_->urma_operator->CopyBatchGetKernelProfiles(profiles);
@@ -1011,6 +1122,9 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
+  if (impl_->options.per_call_execution)
+    return RuntimeCapabilities{!impl_->options.enabled_get_configs->empty(),
+        !impl_->options.enabled_put_configs->empty(), false, true};
   return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
       uses_aicpu(), false, true};
 }

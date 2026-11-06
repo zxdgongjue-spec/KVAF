@@ -9,8 +9,10 @@ struct UmdkAccessOperatorConfig {
   std::uint32_t token_bytes{0U};
   std::string batch_get_mode{"gather_read"};
   std::array<std::uint8_t, 16> local_eid{};
+  bool enable_get{true};
+  bool managed_completion{false};
 };
-// Runtime adapter for the AICPU demos. gather_read and BatchPut share UMDK;
+// Runtime adapter with independent UMDK Put/Get sessions;
 // cpu_push_scatter owns an independent Host-side direct HCCP target.
 class UmdkAccessOperator final : public AccessOperator {
  public:
@@ -18,6 +20,7 @@ class UmdkAccessOperator final : public AccessOperator {
   ~UmdkAccessOperator() override;
   Status Initialize(const RemoteRegionDesc&) override;
   Status Shutdown() override;
+  Status DrainGet() override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
 

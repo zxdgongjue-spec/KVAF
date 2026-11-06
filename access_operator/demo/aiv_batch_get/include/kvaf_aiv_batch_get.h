@@ -52,6 +52,8 @@ int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transport,
 // later acquire can reuse them without re-registering HBM. Call only after
 // all launches using this local buffer have completed.
 void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_buffer);
+// Requires exclusive reference and completed DMA; unregisters without caching.
+int32_t KvafBatchGetLocalBufferRetire(KvafBatchGetLocalBuffer *local_buffer);
 
 int32_t KvafExecuteBatchGetLoadKernel(const char *kernel_object_path);
 int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs *arguments,

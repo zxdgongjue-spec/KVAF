@@ -307,7 +307,10 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
 }
 
 Status PeerLink::ReleaseRegion(uint64_t base) {
-  if (ubmem_mappings_.count(base)) return Status::Busy("UBmem Device VA must be unmapped before releasing CPU DDR");
+  {
+    std::lock_guard<std::mutex> lock(mapping_mutex_);
+    if (ubmem_mappings_.count(base)) return Status::Busy("UBmem Device VA must be unmapped before releasing CPU DDR");
+  }
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
@@ -319,6 +322,7 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
 }
 
 Status PeerLink::RetainUbmemMapping(uint64_t base) {
+  std::lock_guard<std::mutex> lock(mapping_mutex_);
   const auto found = regions_.find(base);
   if (found == regions_.end() || found->second.fabric_mapping_bytes == 0) {
     return Status::NotFound("UBmem mapping has no allocated Fabric region");
@@ -328,6 +332,7 @@ Status PeerLink::RetainUbmemMapping(uint64_t base) {
 }
 
 void PeerLink::ReleaseUbmemMapping(uint64_t base) {
+  std::lock_guard<std::mutex> lock(mapping_mutex_);
   auto found = ubmem_mappings_.find(base);
   if (found != ubmem_mappings_.end() && --found->second == 0) ubmem_mappings_.erase(found);
 }

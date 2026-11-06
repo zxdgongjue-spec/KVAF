@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "types.h"
+#include "execution_config.h"
 
 namespace kvaf {
 
@@ -87,6 +88,7 @@ struct BatchPutRequest {
 // before the remote WRITE. stream is ignored by CPU/mock implementations.
 struct BatchPutExecutionOptions {
   void* stream{nullptr};
+  std::optional<PutExecutionConfig> config;
 };
 
 struct BatchFreeRequest {
@@ -102,6 +104,7 @@ struct BatchGetExecutionOptions {
   bool synchronize{false};
   // Optional AICPU stage timings; requires synchronize=true.
   BatchGetProfile* profile{nullptr};
+  std::optional<GetExecutionConfig> config;
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

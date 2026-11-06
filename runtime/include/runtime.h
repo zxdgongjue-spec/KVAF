@@ -2,6 +2,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -94,6 +98,7 @@ class RuntimeCore {
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
+  Status DrainGet();
 
  protected:
   MetaManager& meta_manager_;
@@ -119,11 +124,17 @@ class RuntimeCore {
   const AccessTableState* FindAccessTable(
       const AccessTableHandle& handle) const;
 
-  bool initialized_{false};
-  bool needs_cleanup_{false};
+  Status DrainGetLocked();
+  mutable std::shared_mutex lifecycle_mutex_;
+  mutable std::mutex table_mutex_;
+  std::mutex put_mutex_, get_mutex_;
+  std::shared_ptr<AccessTableState> pending_get_table_;
+  std::optional<PutContext> pending_put_;
+  std::atomic<bool> initialized_{false};
+  std::atomic<bool> needs_cleanup_{false};
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
-  std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
+  std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>>
       access_tables_;
 };
 

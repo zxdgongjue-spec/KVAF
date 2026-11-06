@@ -34,6 +34,10 @@ class AccessOperator {
   virtual Status Initialize(const RemoteRegionDesc& remote_region) = 0;
   virtual Status Shutdown() = 0;
 
+  // Legacy synchronous implementations require no completion action.
+  virtual Status PreparePut(const BatchPutExecutionOptions&) { return Status::OK(); }
+  virtual Status DrainGet() { return Status::OK(); }
+  virtual bool TracksGetCompletion() const { return false; }
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
@@ -63,6 +67,8 @@ struct AccessOperatorConfig {
   // continues to use peer_local_eid above.
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
+  bool enable_get{true};
+  bool managed_completion{false};
 };
 
 struct BatchGetKernelProfile {
@@ -114,6 +120,8 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+
+  Status DrainGet() override;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

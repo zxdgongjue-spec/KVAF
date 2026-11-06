@@ -12,11 +12,10 @@ namespace kvaf::aicpu_urma {
 namespace {
 using namespace detail;
 
-unsigned ClaimWorker(unsigned count) {
+unsigned ClaimWorker(unsigned count, std::atomic<unsigned>& next) {
   if (count == 1U) return 0U;
   // Runtime drains the previous launch before reuse. Exactly N claims assign
   // every slot once, even if a new session changes N or starts at another slot.
-  static std::atomic<unsigned> next{0U};
   auto observed = next.load(std::memory_order_relaxed);
   for (;;) {
     const auto worker = observed % count;
@@ -58,7 +57,7 @@ struct GatherBuildLayout {
         token_bytes(request.token_bytes),
         rows(reinterpret_cast<const std::int32_t*>(request.output_indices)),
         local_segment(LocalSegment(args.output, args.output_extent)),
-        remote_segment(state.remote) {
+        remote_segment(CurrentState().remote) {
     prototype.opcode = URMA_OPC_READ;
     prototype.flag.bs.comp_order = 1;
     prototype.flag.bs.place_order = URMA_RELAX_ORDER;
@@ -246,13 +245,16 @@ std::uint32_t ReadStaging(const AicpuBatchGetInput& request,
                          const GatherReadArgs& args, GatherReadStatus& status,
                          std::uint32_t first, std::uint32_t last,
                          BatchGetWorkerProfile* profile) {
-  std::shared_lock<std::shared_mutex> lock(state_mutex);
+  auto session = FindSession(args.context.session);
+  if (!session) return kGatherTransportFailed;
+  std::shared_lock<std::shared_mutex> lock(session->mutex);
+  SessionScope scope(*session);
   const auto worker_index = args.worker_index;
-  if (worker_index >= state.worker_count || args.worker_count != state.worker_count ||
+  if (worker_index >= CurrentState().worker_count || args.worker_count != CurrentState().worker_count ||
       args.context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
-      args.context.session != state.session || args.sgl_size == 0 || args.sq_batch_wqes == 0)
+      args.context.session != CurrentState().session || args.sgl_size == 0 || args.sq_batch_wqes == 0)
     return kGatherTransportFailed;
-  std::lock_guard<std::mutex> worker_lock(worker_mutexes[worker_index]);
+  std::lock_guard<std::mutex> worker_lock(session->worker_mutexes[worker_index]);
   auto& worker = DataQueue(worker_index);
   if (worker.poisoned || worker.target == nullptr) return kGatherTransportFailed;
   UmdkControlStatus error{};
@@ -363,7 +365,9 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   BatchGetWorkerProfile measured{};
   auto* profile = args.profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
-  const auto worker = ClaimWorker(args.worker_count);
+  auto session = detail::FindSession(args.context.session);
+  if (!session) return 1U;
+  const auto worker = ClaimWorker(args.worker_count, session->next_worker);
   args.worker_index = worker;
   args.core_status += worker * sizeof(GatherReadStatus);
   args.scratch += worker * 64U;

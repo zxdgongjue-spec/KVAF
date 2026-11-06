@@ -112,3 +112,29 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
+
+add_executable(kvaf_execution_dispatcher_test execution_dispatcher_test.cc)
+target_link_libraries(kvaf_execution_dispatcher_test PRIVATE kvaf_runtime Threads::Threads)
+add_test(NAME kvaf_execution_dispatcher_test COMMAND kvaf_execution_dispatcher_test)
+set_tests_properties(kvaf_execution_dispatcher_test PROPERTIES TIMEOUT 20)
+if(KVAF_BUILD_PYTHON)
+  add_test(NAME kvaf_execution_config_python
+    COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_execution_config.py")
+  set_tests_properties(kvaf_execution_config_python PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+endif()
+
+# Optional host-only validation against real/stub URMA headers; no liburma or NPU.
+set(KVAF_TEST_URMA_INCLUDE_DIR "" CACHE PATH "URMA headers for host session registry tests")
+if(KVAF_TEST_URMA_INCLUDE_DIR)
+  add_executable(kvaf_aicpu_session_registry_test aicpu_session_registry_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/session.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/transfer.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/control_kernel.cc)
+  target_include_directories(kvaf_aicpu_session_registry_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel
+    ${PROJECT_SOURCE_DIR}/access_operator/include ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_aicpu_session_registry_test PRIVATE kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME kvaf_aicpu_session_registry_test COMMAND kvaf_aicpu_session_registry_test)
+  set_tests_properties(kvaf_aicpu_session_registry_test PROPERTIES TIMEOUT 10)
+endif()

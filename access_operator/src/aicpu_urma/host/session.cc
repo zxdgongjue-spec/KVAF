@@ -43,7 +43,7 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
     return Status::Internal("failed to clear UMDK setup status");
   const auto launch = launch_kernel
                           ? launch_kernel(&args_, stream)
-                          : LaunchUmdkKernel("KvafAicpuUmdkControl", &args_, sizeof(args_), stream);
+                          : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV2", &args_, sizeof(args_), stream);
   if (launch != 0) {
     failed_ = true;
     return Status::Internal("UMDK kernel launch failed");
@@ -84,11 +84,21 @@ Status UmdkSession::Shutdown() {
   return Status::OK();
 }
 
+Status UmdkSession::ReleaseBuffers() {
+  auto drained = Drain();
+  if (!drained.ok()) return drained;
+  if (!connected_ || registered_buffers_.empty()) return Status::OK();
+  UmdkControlStatus status{};
+  auto released = Run(UmdkControlOp::kUnregisterBuffers, status);
+  if (released.ok()) registered_buffers_.clear();
+  return released;
+}
+
 Status UmdkSession::Load() {
   if (!config_.peer_link || config_.kernel_json.empty() || !config_.workers ||
       config_.workers > 8U ||
       std::all_of(config_.local_eid.begin(), config_.local_eid.end(), [](auto b) { return b == 0; }) ||
-      !LoadUmdkKernel(config_.kernel_json.c_str()))
+      !PrepareUmdkKernel(config_.kernel_json, false).ok())
     return Status::InvalidArgument("UMDK requires PeerLink, kernel JSON, Host-selected EID and 1..8 workers");
   return Status::OK();
 }

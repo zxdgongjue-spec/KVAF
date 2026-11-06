@@ -7,6 +7,7 @@
 #include <acl/acl.h>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <unordered_map>
 
 namespace kvaf::ubmem {
@@ -25,6 +26,7 @@ struct AccessOperator::Impl {
     std::size_t capacity{};
     Pending pending{Pending::kNone};
   };
+  mutable std::mutex mutex;
   OperatorOptions options;
   std::unique_ptr<DeviceMapping> mapping;
   RemoteRegionDesc remote{};
@@ -95,13 +97,15 @@ struct AccessOperator::Impl {
     profile_stream = nullptr;
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
-    if (!synchronize) {
+    if (!synchronize || options.managed_completion) {
       auto status = Acl("aclmdlRICaptureGetInfo",
           aclmdlRICaptureGetInfo(stream, &capture, &graph));
       if (!status.ok()) return status;
     }
+    if (options.managed_completion && capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+      return Status::NotImplemented("per-call UBMEM graph leases are not implemented");
     const auto size = options.cores * sizeof(CoreStatus);
-    if (synchronize) {
+    if (synchronize || options.managed_completion) {
       // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
       // not look like a successful zero-row kernel.
       auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
@@ -201,7 +205,7 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
     impl_->mapping = std::make_unique<DeviceMapping>();
     status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
   }
-  if (status.ok()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
+  if (status.ok() && !impl_->options.batch_get_kernel_object_path.empty()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
       "KvafExecuteBatchGetUbmemKernelV2");
   if (status.ok() && !impl_->options.batch_put_kernel_object_path.empty())
     status = impl_->LoadKernel(1, impl_->options.batch_put_kernel_object_path,
@@ -219,6 +223,7 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
 }
 
 Status AccessOperator::Shutdown() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->ready = false;
   impl_->profiling = false;
   impl_->profile_stream = nullptr;
@@ -260,7 +265,29 @@ Status AccessOperator::Shutdown() {
   return Status::OK();
 }
 
+Status AccessOperator::DrainGet() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  for (auto& entry : impl_->streams) {
+    auto& state = entry.second;
+    if (state.pending == Impl::StreamState::Pending::kNone) continue;
+    auto status = state.pending == Impl::StreamState::Pending::kEvent
+        ? Acl("aclrtSynchronizeEvent", aclrtSynchronizeEvent(state.event))
+        : Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(entry.first));
+    if (!status.ok()) return status;
+    const auto size = impl_->options.cores * sizeof(CoreStatus);
+    status = Acl("aclrtMemcpy(completion)", aclrtMemcpy(state.host_statuses, size,
+        state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST));
+    if (!status.ok()) return status;
+    const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
+    for (std::size_t i = 0; i < impl_->options.cores; ++i)
+      if (reports[i].result != 0) return Status::Internal("UBMEM Get kernel reported an error");
+    state.pending = Impl::StreamState::Pending::kNone;
+  }
+  return Status::OK();
+}
+
 Status AccessOperator::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->ready) return Status::NotInitialized("UBmem operator is not initialized");
   impl_->profiling = enabled;
   impl_->profile_detail = enabled && detailed;
@@ -269,6 +296,7 @@ Status AccessOperator::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
 }
 
 Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!profiles) return Status::InvalidArgument("profile output is null");
   if (!impl_->ready || !impl_->profiling || !impl_->profile_stream)
     return Status::InvalidState("no profiled UBmem BatchGet launch");
@@ -301,6 +329,7 @@ Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProf
 }
 
 Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   // RuntimeCore owns buffer/layout validation. This adapter only restricts
   // the device and checks narrowing to its kernel ABI.
   const auto& r = *exec.request;
@@ -328,6 +357,7 @@ Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
 }
 
 Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->functions[1]) return Status::NotImplemented("UBmem BatchPut kernel is not configured");
   const auto& r = *exec.request;
   const auto rows = r.keys.size();

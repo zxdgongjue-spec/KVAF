@@ -1,3 +1,4 @@
+find_package(Threads REQUIRED)
 add_library(kvaf_peer_link STATIC src/peer_link.cc)
 
 target_include_directories(kvaf_peer_link
@@ -8,6 +9,8 @@ target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
 add_library(kvaf_runtime
+  src/execution_config.cc
+  src/execution_dispatcher.cc
   src/runtime.cc
   src/runtime_service.cc
   src/npu_runtime_config.cc
@@ -21,6 +24,7 @@ target_include_directories(kvaf_runtime
 target_link_libraries(kvaf_runtime
   PUBLIC
     kvaf_common
+    Threads::Threads
     kvaf_meta_manager
     kvaf_access_operator
 )

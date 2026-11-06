@@ -40,6 +40,14 @@ struct BatchGetTransport::Impl {
                       " source_mode=" + (direct_addresses ? "direct" : "table") +
                       "; buffers retained; detail=" + (detail ? detail : "unavailable"));
     }
+    if (aclrtMemcpy(status_host, execution.status_bytes, execution.status,
+                    execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+      return Internal("GatherRead completion status unavailable; buffers retained");
+    const auto* reports = static_cast<const GatherReadStatus*>(status_host);
+    for (unsigned worker = 0; worker < session.config().workers; ++worker)
+      if (reports[worker].magic != kGatherStatusMagic || reports[worker].sequence != sequence ||
+          reports[worker].result != 0)
+        return Internal("GatherRead worker failed; session retained for recovery");
     pending = nullptr;
     return Status::OK();
   }

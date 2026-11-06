@@ -16,6 +16,7 @@ enum class StatusCode {
   kInvalidState,
   kOutOfMemory,
   kInternal,
+  kCompletionUnknown,
 };
 
 class Status {
@@ -62,6 +63,10 @@ class Status {
 
   static Status Internal(std::string message) {
     return Error(StatusCode::kInternal, std::move(message));
+  }
+
+  static Status CompletionUnknown(std::string message) {
+    return Error(StatusCode::kCompletionUnknown, std::move(message));
   }
 
   bool ok() const { return code_ == StatusCode::kOk; }

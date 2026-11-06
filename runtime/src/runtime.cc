@@ -69,12 +69,17 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
       ddr_allocator_(ddr_allocator) {}
 
 RuntimeCore::~RuntimeCore() {
-  if (needs_cleanup_) {
-    (void)Shutdown();
+  if (needs_cleanup_ && !Shutdown().ok()) {
+    // The allocation owner must also retain its resources. Do not unpin keys
+    // as an incidental consequence of destroying the public handle registry.
+    auto* retained = new decltype(access_tables_)(std::move(access_tables_));
+    (void)retained;
+    if (pending_get_table_) (void)new std::shared_ptr<AccessTableState>(std::move(pending_get_table_));
   }
 }
 
 Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
+  std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (initialized_) {
     return Status::InvalidState("Runtime has already been initialized");
   }
@@ -94,18 +99,21 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   needs_cleanup_ = true;
   if (remote_region.length == 0 || remote_region.slot_size == 0 ||
       remote_region.length % remote_region.slot_size != 0) {
+    lifecycle.unlock();
     (void)Shutdown();
     return Status::InvalidArgument("DDR allocator returned an invalid remote region");
   }
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
+    lifecycle.unlock();
     (void)Shutdown();
     return status;
   }
 
   status = meta_manager_.RegisterRemoteRegion(remote_region);
   if (!status.ok()) {
+    lifecycle.unlock();
     (void)Shutdown();
     return status;
   }
@@ -115,6 +123,7 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
 }
 
 Status RuntimeCore::Shutdown() {
+  std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (!needs_cleanup_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -126,14 +135,14 @@ Status RuntimeCore::Shutdown() {
   const Status operator_status = access_operator_.Shutdown();
   if (!operator_status.ok()) return operator_status;
 
-  Status first_error = Status::OK();
-  for (const auto& entry : access_tables_) {
-    const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
-    if (!status.ok() && first_error.ok()) {
-      first_error = status;
-    }
-  }
+  pending_get_table_.reset();
   access_tables_.clear();
+  if (pending_put_) {
+    const auto aborted = meta_manager_.AbortPut(*pending_put_);
+    if (!aborted.ok()) return aborted;
+    pending_put_.reset();
+  }
+  Status first_error = Status::OK();
 
   const Status release_status = ddr_allocator_.Release(remote_region_);
   if (!release_status.ok()) {
@@ -147,6 +156,8 @@ Status RuntimeCore::Shutdown() {
 
 Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
                                        AccessTableHandle* handle) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(table_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -199,7 +210,12 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
     (void)meta_manager_.UnlockKeys(lock_context);
     return Status::InvalidState("AccessTable handle space is exhausted");
   }
-  auto table = std::make_unique<AccessTableState>();
+  // Public handles and in-flight requests independently own this pin.
+  auto table = std::shared_ptr<AccessTableState>(new AccessTableState,
+      [this](AccessTableState* state) {
+        (void)meta_manager_.UnlockKeys(state->lock_context);
+        delete state;
+      });
   table->lock_context = lock_context;
   table->addresses = std::move(lookup.addresses);
   table->lengths = std::move(lookup.lengths);
@@ -214,6 +230,8 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
 
 Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
                                        AccessTableView* view) const {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(table_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -230,6 +248,8 @@ Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
 }
 
 Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(table_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -237,25 +257,32 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (table == nullptr) {
     return Status::NotFound("AccessTable handle was not found");
   }
-  const Status status = meta_manager_.UnlockKeys(table->lock_context);
-  if (!status.ok()) {
-    return status;
-  }
   access_tables_.erase(handle.opaque);
   return Status::OK();
 }
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  const AccessTableState* table = nullptr;
-  if (request.access_table.opaque != 0) {
-    table = FindAccessTable(request.access_table);
-    if (table == nullptr) {
-      return Status::NotFound("AccessTable handle was not found");
-    }
+  if (execution.config && !access_operator_.TracksGetCompletion())
+    return Status::NotImplemented("per-call execution requires an execution policy at construction");
+  std::shared_ptr<AccessTableState> table_ref;
+  {
+    std::lock_guard<std::mutex> lock(table_mutex_);
+    const auto it = access_tables_.find(request.access_table.opaque);
+    if (it != access_tables_.end()) table_ref = it->second;
+  }
+  const AccessTableState* table = table_ref.get();
+  if (request.access_table.opaque != 0 && !table)
+    return Status::NotFound("AccessTable handle was not found");
+  // Pin before any resource wait. This lock serializes only Get submissions.
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  if (access_operator_.TracksGetCompletion()) {
+    const auto drained = DrainGetLocked();
+    if (!drained.ok()) return drained;
   }
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
@@ -337,12 +364,22 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
   }
-  return access_operator_.ExecuteBatchGet(
+  if (access_operator_.TracksGetCompletion()) pending_get_table_ = table_ref;
+  const auto status = access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
+  if (status.ok() && execution.synchronize) pending_get_table_.reset();
+  if (!status.ok() && access_operator_.TracksGetCompletion()) {
+    // Preparation failures have no outstanding DMA. Failed submissions retain
+    // their pin unless the provider can positively establish completion.
+    (void)DrainGetLocked();
+  }
+  return status;
 }
 
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
                              BatchPutExecutionOptions execution) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -363,6 +400,11 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
           "BatchPut input_offsets and lengths must describe bytes inside input");
     }
   }
+  if (execution.config && !access_operator_.TracksGetCompletion())
+    return Status::NotImplemented("per-call execution requires an execution policy at construction");
+  if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
+  auto prepared = access_operator_.PreparePut(execution);
+  if (!prepared.ok()) return prepared;
   PutContext put_context;
   PutAccessDesc put_desc;
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
@@ -374,17 +416,20 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   status = access_operator_.ExecuteBatchPut(
       BatchPutExecRequest{&request, &put_desc, execution});
   if (!status.ok()) {
-    (void)meta_manager_.AbortPut(put_context);
+    if (status.code() == StatusCode::kCompletionUnknown) pending_put_ = put_context;
+    else (void)meta_manager_.AbortPut(put_context);
     return status;
   }
   status = meta_manager_.CommitPut(put_context);
   if (!status.ok()) {
+    pending_put_ = put_context;
     return status;
   }
   return Status::OK();
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -392,6 +437,18 @@ Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
     return Status::InvalidArgument("BatchFree requires at least one key");
   }
   return meta_manager_.BatchFree(request.keys);
+}
+
+Status RuntimeCore::DrainGetLocked() {
+  auto status = access_operator_.DrainGet();
+  if (status.ok()) pending_get_table_.reset();
+  return status;
+}
+Status RuntimeCore::DrainGet() {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  return DrainGetLocked();
 }
 
 RuntimeCore::AccessTableState* RuntimeCore::FindAccessTable(

@@ -4,10 +4,11 @@
 #include <vector>
 
 #include "status.h"
+#include "execution_config.h"
 
 namespace kvaf {
 
-enum class Transport { kUrma, kUbmem };
+
 
 namespace detail {
 enum class RuntimeBackend { kUrmaAiv, kUrmaAicpuGather, kUrmaAicpuScatter, kUbmem };

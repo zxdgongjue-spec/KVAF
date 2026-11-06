@@ -32,6 +32,8 @@ int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transport,
                                        void *input_device, uint64_t input_device_bytes,
                                        KvafBatchPutLocalBuffer **local_buffer);
 void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer);
+// Requires exclusive reference and completed DMA; unregisters without caching.
+int32_t KvafBatchPutLocalBufferRetire(KvafBatchPutLocalBuffer *local_buffer);
 
 int32_t KvafExecuteBatchPutLoadKernel(const char *kernel_object_path);
 

@@ -533,6 +533,28 @@ extern "C" int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transpo
   return KVAF_BATCH_PUT_SUCCESS;
 }
 
+extern "C" int32_t KvafBatchPutLocalBufferRetire(KvafBatchPutLocalBuffer* local) {
+  if (!local || !local->transport || local->reference_count != 1U) return KVAF_BATCH_PUT_INVALID_ARGUMENT;
+  auto* transport = local->transport;
+  std::lock_guard<std::mutex> lock(transport->mutex);
+  if (local->memory.handle) {
+    if (transport->api.lmem_unregister(transport->device_context, local->memory.handle) != 0) return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
+    local->memory.handle = nullptr;
+  }
+  if (local->token_handle) {
+    if (transport->api.token_free(transport->device_context, local->token_handle) != 0) return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
+    local->token_handle = nullptr;
+  }
+  if (local->device_entities) {
+    if (aclrtFree(local->device_entities) != ACL_SUCCESS) return KVAF_BATCH_PUT_RUNTIME_ERROR;
+    local->device_entities = nullptr;
+  }
+  for (auto it = transport->local_buffers.begin(); it != transport->local_buffers.end(); ++it) {
+    if (it->get() == local) { transport->local_buffers.erase(it); return KVAF_BATCH_PUT_SUCCESS; }
+  }
+  return KVAF_BATCH_PUT_INVALID_ARGUMENT;
+}
+
 extern "C" void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer) {
   if (local_buffer == nullptr) {
     return;

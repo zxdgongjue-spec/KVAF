@@ -18,7 +18,7 @@ void BindNpuRuntimeConstructor(pybind11::class_<Runtime>& runtime) {
                        std::uint32_t, std::string, std::uint32_t,
                        std::vector<std::string>, bool, std::uint32_t,
                        std::string, std::vector<std::string>, std::uint32_t,
-                       const std::string&, std::string>(),
+                       const std::string&, std::string, py::object, py::object, py::object, py::object, bool>(),
               py::arg("batch_get_kernel_object_path"),
               py::arg("batch_get_token_bytes"),
               py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -32,7 +32,10 @@ void BindNpuRuntimeConstructor(pybind11::class_<Runtime>& runtime) {
               py::arg("adaptive_peer_ub_devices") = std::vector<std::string>{},
               py::arg("batch_get_max_inflight_total") = 2048,
               py::arg("transport") = "urma", py::kw_only(),
-              py::arg("aicpu_batch_get_mode") = "");
+              py::arg("aicpu_batch_get_mode") = "",
+              py::arg("default_put") = py::none(), py::arg("default_get") = py::none(),
+              py::arg("enabled_put_configs") = py::none(), py::arg("enabled_get_configs") = py::none(),
+              py::arg("per_call_execution") = false);
 }
 
 }  // namespace kvaf::python_binding

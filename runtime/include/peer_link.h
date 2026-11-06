@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <mutex>
 #include <unordered_map>
 
 #include "peer_protocol.h"
@@ -78,6 +79,7 @@ class PeerLink {
  private:
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
+  mutable std::mutex mapping_mutex_;
   std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;
 };
 

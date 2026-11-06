@@ -613,6 +613,31 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transpo
   return KVAF_BATCH_GET_SUCCESS;
 }
 
+extern "C" int32_t KvafBatchGetLocalBufferRetire(KvafBatchGetLocalBuffer* local) {
+  if (!local || !local->transport || local->reference_count != 1U) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  auto* transport = local->transport;
+  for (std::size_t i = 0; i < local->path_registrations.size(); ++i) {
+    auto& registration = local->path_registrations[i];
+    auto* context = transport->paths[i].device_context;
+    if (registration.memory.handle) {
+      if (transport->api.lmem_unregister(context, registration.memory.handle) != 0) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      registration.memory.handle = nullptr;
+    }
+    if (registration.token_handle) {
+      if (transport->api.token_free(context, registration.token_handle) != 0) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+      registration.token_handle = nullptr;
+    }
+  }
+  if (local->device_entities) {
+    if (aclrtFree(local->device_entities) != ACL_SUCCESS) return KVAF_BATCH_GET_RUNTIME_ERROR;
+    local->device_entities = nullptr;
+  }
+  for (auto it = transport->local_buffers.begin(); it != transport->local_buffers.end(); ++it) {
+    if (it->get() == local) { transport->local_buffers.erase(it); return KVAF_BATCH_GET_SUCCESS; }
+  }
+  return KVAF_BATCH_GET_INVALID_ARGUMENT;
+}
+
 extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_buffer) {
   if (local_buffer == nullptr || local_buffer->transport == nullptr) return;
   if (local_buffer->reference_count == 0U) {

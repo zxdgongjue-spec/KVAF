@@ -15,6 +15,8 @@ except ImportError as error:
         f"this dynamic-loader error: {error}"
     ) from error
 
+PutExecutionConfig = _native.PutExecutionConfig
+GetExecutionConfig = _native.GetExecutionConfig
 AccessTable = _native.AccessTable
 Runtime = _native.Runtime
 MockRuntime = _native.MockRuntime
@@ -29,6 +31,8 @@ if hasattr(_native, "NpuRuntime"):
     DeviceAccessTable = _native.DeviceAccessTable
 
 __all__ = [
+    "PutExecutionConfig",
+    "GetExecutionConfig",
     "AccessTable",
     "Runtime",
     "MockRuntime",

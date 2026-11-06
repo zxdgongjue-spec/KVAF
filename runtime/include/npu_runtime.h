@@ -13,7 +13,9 @@ namespace kvaf {
 
 struct BatchGetKernelProfile;
 
-struct NpuRuntimeOptions {
+struct NpuRuntimeOptions : ExecutionPolicy {
+  // Legacy constructors keep their selected backend and graph behavior.
+  bool per_call_execution{false};
   NpuRuntimeOptions(std::string kernel_object_path,
                     std::uint32_t token_bytes,
                     std::uint32_t tokens_per_block)
@@ -76,6 +78,11 @@ class NpuRuntime final : public Runtime {
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
+
+  Status Warmup(PutExecutionConfig);
+  Status Warmup(GetExecutionConfig);
+  Status DrainGet();
+  bool per_call_execution() const;
 
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(
