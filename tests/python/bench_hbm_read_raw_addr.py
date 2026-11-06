@@ -1,10 +1,12 @@
-"""Manual two-NPU benchmark: random, equal-sized packets in a registered HBM space.
+"""Manual two-NPU benchmark: random packets in a registered HBM space.
 
 A reads B with batch_get_raw_addr without a CPU service or DDR allocation.
 Payload travels only from B HBM to A HBM. Setup, producer
 writes, metadata preparation, verification and application IPC are outside timing.
 """
 import argparse
+from dataclasses import dataclass
+from math import gcd
 import multiprocessing as mp
 import time
 import traceback
@@ -15,14 +17,26 @@ from test_remote_cpu_offload import receive, retain
 GUARD_BYTES = 64
 
 
+def packet_group(value):
+    try:
+        count, size = (int(part) for part in value.split(":"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("packet-group must be COUNT:BYTES") from None
+    if count < 1 or not 1 <= size <= (1 << 32) - 1:
+        raise argparse.ArgumentTypeError("group count must be positive; bytes must be in 1..UINT32_MAX")
+    return count, size
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device-a", type=int, default=6, help="reader NPU")
     parser.add_argument("--device-b", type=int, default=7, help="producer NPU")
     parser.add_argument("--npu-eid-a-raw", required=True, help="A fullmesh EID")
     parser.add_argument("--npu-eid-b-raw", required=True, help="B fullmesh EID")
-    parser.add_argument("--packets", "--blocks", type=int, default=4096)
-    parser.add_argument("--packet-bytes", "--block-bytes", type=int, default=656)
+    parser.add_argument("--packets", "--blocks", type=int, help="uniform packet count (default: 4096)")
+    parser.add_argument("--packet-bytes", "--block-bytes", type=int, help="uniform packet bytes (default: 656)")
+    parser.add_argument("--packet-group", "--block-group", dest="packet_groups", action="append", type=packet_group,
+                        help="repeat COUNT:BYTES for mixed sizes in one READ; excludes uniform size/count flags")
     parser.add_argument("--source-space-bytes", type=int, default=256 * 1024 * 1024, help="bytes per registered tensor")
     parser.add_argument("--source-count", type=int, default=1, help="1..4096 independent MRs sharing one connection")
     parser.add_argument("--seed", type=int, default=123)
@@ -45,9 +59,20 @@ def parse_args(argv=None):
         args.warmup = max(args.warmup, args.source_count)
     if args.device_a == args.device_b:
         parser.error("use two distinct NPUs")
-    if not 1 <= args.packets <= 4096 or not 1 <= args.packet_bytes <= (1 << 32) - 1:
-        parser.error("packets must be in 1..4096; packet-bytes must be in 1..UINT32_MAX")
-    if not args.packets * args.packet_bytes <= args.source_space_bytes <= (1 << 63) - 1:
+    if args.packet_groups:
+        if args.packets is not None or args.packet_bytes is not None:
+            parser.error("packet-group cannot be combined with packets/packet-bytes")
+        args.packets = sum(count for count, _ in args.packet_groups)
+    else:
+        args.packets = 4096 if args.packets is None else args.packets
+        args.packet_bytes = 656 if args.packet_bytes is None else args.packet_bytes
+        if not 1 <= args.packet_bytes <= (1 << 32) - 1:
+            parser.error("packet-bytes must be in 1..UINT32_MAX")
+        args.packet_groups = [(args.packets, args.packet_bytes)]
+    if not 1 <= args.packets <= 4096:
+        parser.error("total packets must be in 1..4096")
+    args.payload_bytes = sum(count * size for count, size in args.packet_groups)
+    if not args.payload_bytes <= args.source_space_bytes <= (1 << 63) - 1:
         parser.error("source-space-bytes must fit all packets and signed int64 offsets")
     if args.iterations < 1 or min(args.warmup, args.profile_warmup, args.profile_iterations) < 0:
         parser.error("iterations must be positive; warmup/profile counts must be nonnegative")
@@ -57,6 +82,50 @@ def parse_args(argv=None):
             args.max_inflight_total and args.max_inflight_total < 2 * args.aiv_cores):
         parser.error("max-inflight-total must be 0 or at least twice aiv-cores, within uint32")
     return args
+
+
+@dataclass(frozen=True)
+class PacketGroup:
+    packet_bytes: int
+    source_base: int
+    source_bytes: int
+    output_base: int
+    offsets: tuple
+
+
+@dataclass(frozen=True)
+class PacketLayout:
+    groups: tuple
+    sources: tuple
+    destinations: tuple
+    lengths: tuple
+
+
+def packet_layout(args):
+    """Disjoint source regions; group-contiguous output; interleaved READ segments."""
+    groups = []
+    payload_prefix = source_base = 0
+    alignment = 0
+    for _, size in args.packet_groups:
+        alignment = gcd(alignment, size)
+    for index, (count, size) in enumerate(args.packet_groups):
+        payload_end = payload_prefix + count * size
+        source_end = args.source_space_bytes * payload_end // args.payload_bytes
+        if index + 1 < len(args.packet_groups):
+            source_end -= source_end % alignment
+        region_bytes = source_end - source_base
+        offsets = tuple(scattered_offsets(count, size, region_bytes, args.seed + index))
+        groups.append(PacketGroup(size, source_base, region_bytes, GUARD_BYTES + payload_prefix, offsets))
+        payload_prefix, source_base = payload_end, source_end
+    sources, destinations, lengths = [], [], []
+    # Interleave sizes so contiguous core partitions each receive both groups.
+    for row in range(max(len(group.offsets) for group in groups)):
+        for group in groups:
+            if row < len(group.offsets):
+                sources.append(group.source_base + group.offsets[row])
+                destinations.append(group.output_base + row * group.packet_bytes)
+                lengths.append(group.packet_bytes)
+    return PacketLayout(tuple(groups), tuple(sources), tuple(destinations), tuple(lengths))
 
 
 def round_counts(args):
@@ -92,7 +161,7 @@ def packet_payload(torch, offsets, packet_bytes, phase):
     return ((rows * 131 + columns * 17 + (columns >> 3) + phase * 31) & 255).to(torch.uint8)
 
 
-def producer(pipe, args, offsets, receiver):
+def producer(pipe, args, layout, receiver):
     import torch
     import torch_npu  # noqa: F401
     import kvaf
@@ -106,19 +175,23 @@ def producer(pipe, args, offsets, receiver):
     try:
         tensors = [torch.zeros(args.source_space_bytes, dtype=torch.uint8, device=device)
                    for _ in range(args.source_count)]
-        slot_count = args.source_space_bytes // args.packet_bytes
-        indices = torch.tensor([offset // args.packet_bytes for offset in offsets], dtype=torch.int64, device=device)
+        indices = [torch.tensor([offset // group.packet_bytes for offset in group.offsets],
+                                dtype=torch.int64, device=device) for group in layout.groups]
         torch.npu.synchronize()
         source.register(tensors if args.source_count > 1 else tensors[0], receiver=receiver, stream=stream)
         pipe.send(("connected", None))
         normal_rounds, total_rounds = round_counts(args)
         for iteration in range(total_rounds):
             hbm = tensors[iteration % args.source_count]
-            rows = hbm[:slot_count * args.packet_bytes].view(slot_count, args.packet_bytes)
-            payload = packet_payload(torch, offsets, args.packet_bytes, pattern_phase(iteration, args.source_count)).to(device)
+            phase = pattern_phase(iteration, args.source_count)
+            payloads = [packet_payload(torch, group.offsets, group.packet_bytes, phase + index * 17).to(device)
+                        for index, group in enumerate(layout.groups)]
             torch.npu.synchronize()
             with torch.npu.stream(stream):
-                rows.index_copy_(0, indices, payload)
+                for group, index, payload in zip(layout.groups, indices, payloads):
+                    slots = group.source_bytes // group.packet_bytes
+                    rows = hbm[group.source_base:group.source_base + slots * group.packet_bytes].view(slots, group.packet_bytes)
+                    rows.index_copy_(0, index, payload)
             stream.synchronize()
             begin = time.perf_counter_ns()
             ready = source.ready(hbm) if args.source_count > 1 else source.ready()
@@ -158,8 +231,9 @@ def main():
     import torch_npu  # noqa: F401
     import kvaf
 
-    offsets = scattered_offsets(args.packets, args.packet_bytes, args.source_space_bytes, args.seed)
-    payload_bytes = args.packets * args.packet_bytes
+    layout = packet_layout(args)
+    payload_bytes = args.payload_bytes
+    group_description = ",".join(f"{count}x{size}" for count, size in args.packet_groups)
     torch.npu.set_device(args.device_a)
     device = f"npu:{args.device_a}"
     runtime = kvaf.NpuRuntime(
@@ -174,21 +248,23 @@ def main():
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
         receiver = runtime.listen_hbm("127.0.0.1:0", local_eid=args.npu_eid_a_raw)
-        worker = ctx.Process(target=producer, args=(child, args, offsets, receiver))
+        worker = ctx.Process(target=producer, args=(child, args, layout, receiver))
         worker.start()
         child.close()
         receive(parent, "connected")
         stream = torch.npu.Stream(device=args.device_a)
         with torch.npu.stream(stream):
             output = torch.empty(payload_bytes + 2 * GUARD_BYTES, dtype=torch.uint8, device=device)
-            src = torch.tensor(offsets, dtype=torch.int64, device=device)
-            dst = torch.arange(args.packets, dtype=torch.int64, device=device) * args.packet_bytes + GUARD_BYTES
-            lengths = torch.full((args.packets,), args.packet_bytes, dtype=torch.int64, device=device)
+            src = torch.tensor(layout.sources, dtype=torch.int64, device=device)
+            dst = torch.tensor(layout.destinations, dtype=torch.int64, device=device)
+            lengths = torch.tensor(layout.lengths, dtype=torch.int64, device=device)
         stream.synchronize()
         print(f"NPU_HBM_BENCH_READY reader={args.device_a} producer={args.device_b} "
-              f"packets={args.packets} packet_bytes={args.packet_bytes} payload_bytes={payload_bytes} "
+              f"packets={args.packets} packet_bytes={args.packet_bytes if args.packet_bytes is not None else 'mixed'} "
+              f"packet_groups={group_description} packet_order=round_robin_groups payload_bytes={payload_bytes} "
               f"source_count={args.source_count} source_space_bytes_per_mr={args.source_space_bytes} seed={args.seed} "
-              f"min_source_offset={min(offsets)} max_source_end={max(offsets) + args.packet_bytes} "
+              f"min_source_offset={min(layout.sources)} "
+              f"max_source_end={max(offset + size for offset, size in zip(layout.sources, layout.lengths))} "
               f"aiv_cores={args.aiv_cores} jettys_per_core={args.jettys_per_core} "
               f"max_inflight_total={args.max_inflight_total} "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
@@ -204,8 +280,11 @@ def main():
             ready = receive(parent, "ready")
             assert ready.mr_id == iteration % args.source_count + 1
             expected = torch.full((output.numel(),), 0xCC, dtype=torch.uint8)
-            expected[GUARD_BYTES:GUARD_BYTES + payload_bytes] = packet_payload(
-                torch, offsets, args.packet_bytes, pattern_phase(iteration, args.source_count)).flatten()
+            phase = pattern_phase(iteration, args.source_count)
+            for index, group in enumerate(layout.groups):
+                group_bytes = len(group.offsets) * group.packet_bytes
+                expected[group.output_base:group.output_base + group_bytes] = packet_payload(
+                    torch, group.offsets, group.packet_bytes, phase + index * 17).flatten()
             expected_hbm = expected.to(device)
             torch.npu.synchronize()
             with torch.npu.stream(stream):
@@ -247,6 +326,7 @@ def main():
                   flush=True)
         stats = summarize_us(stages["batch_get_raw_addr"])
         print("NPU_HBM_BENCH_PASS metric=python_batch_get_raw_addr_call "
+              f"packets={args.packets} packet_groups={group_description} payload_bytes={payload_bytes} "
               f"source_count={args.source_count} iterations={stats['samples']} warmup_excluded={args.warmup} "
               f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
               f"p95_us={stats['p95_us']:.3f} p99_us={stats['p99_us']:.3f} "

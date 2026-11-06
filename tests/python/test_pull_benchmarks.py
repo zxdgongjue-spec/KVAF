@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import bench_hbm_read_raw_addr as raw_bench
-from bench_hbm_read_raw_addr import parse_args, round_counts, pattern_phase, raw_profile_sample
+from bench_hbm_read_raw_addr import GUARD_BYTES, packet_layout, parse_args, round_counts, pattern_phase, raw_profile_sample
 from bench_remote_cpu_offload import INTERNAL_STAGES, measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
 
@@ -35,6 +35,97 @@ class PullBenchmarks(unittest.TestCase):
                             scattered_offsets(37, 656, 1000003, 124))
         with self.assertRaises(ValueError):
             scattered_offsets(4, 100, 399, 0)
+
+    def test_mixed_blocks_share_one_layout_and_balance_contiguous_core_partitions(self):
+        common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]
+        for space in (17301504, 268435456):
+            args = parse_args(common + ["--block-group", "1024:16384", "--block-group", "1024:512",
+                                        "--source-space-bytes", str(space)])
+            layout = packet_layout(args)
+            self.assertEqual(args.packets, 2048)
+            self.assertEqual(args.payload_bytes, 17301504)
+            self.assertEqual(layout, packet_layout(args))
+            self.assertEqual(layout.lengths, (16384, 512) * 1024)
+            for partition in (layout.lengths[:1024], layout.lengths[1024:]):
+                self.assertEqual(sum(partition), args.payload_bytes // 2)
+            source_ranges = sorted(zip(layout.sources, layout.lengths))
+            self.assertTrue(all(0 <= offset < offset + size <= space for offset, size in source_ranges))
+            self.assertTrue(all(left + size <= right for (left, size), (right, _) in
+                                zip(source_ranges, source_ranges[1:])))
+            output_ranges = sorted(zip(layout.destinations, layout.lengths))
+            self.assertEqual(output_ranges[0][0], GUARD_BYTES)
+            self.assertTrue(all(left + size == right for (left, size), (right, _) in
+                                zip(output_ranges, output_ranges[1:])))
+            self.assertEqual(sum(layout.lengths), args.payload_bytes)
+            self.assertEqual(output_ranges[-1][0] + output_ranges[-1][1], GUARD_BYTES + args.payload_bytes)
+            self.assertTrue(all(group.source_base % group.packet_bytes == 0 for group in layout.groups))
+
+    def test_uniform_layout_preserves_the_previous_seeded_addresses(self):
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"])
+        layout = packet_layout(args)
+        self.assertEqual(layout.sources, tuple(scattered_offsets(4096, 656, 268435456, 123)))
+        self.assertEqual(layout.destinations, tuple(GUARD_BYTES + i * 656 for i in range(4096)))
+        self.assertEqual(layout.lengths, (656,) * 4096)
+
+    def test_mixed_layout_routes_both_changing_payloads_and_preserves_guards(self):
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b",
+                           "--packet-group", "3:16", "--packet-group", "2:4", "--source-space-bytes", "173"])
+        layout = packet_layout(args)
+        previous = None
+        for phase in (0, 1):
+            source = bytearray(args.source_space_bytes)
+            expected = bytearray([0xCC] * (args.payload_bytes + 2 * GUARD_BYTES))
+            for index, group in enumerate(layout.groups):
+                for row, offset in enumerate(group.offsets):
+                    payload = bytes(((offset // group.packet_bytes) % 256 * 131 + col * 17 +
+                                     (col >> 3) + (phase + index * 17) * 31) & 255
+                                    for col in range(group.packet_bytes))
+                    start = group.source_base + offset
+                    source[start:start + len(payload)] = payload
+                    start = group.output_base + row * group.packet_bytes
+                    expected[start:start + len(payload)] = payload
+            output = bytearray([0xCC] * len(expected))
+            for src, dst, size in zip(layout.sources, layout.destinations, layout.lengths):
+                output[dst:dst + size] = source[src:src + size]
+            self.assertEqual(output, expected)
+            self.assertEqual(output[:GUARD_BYTES], bytes([0xCC]) * GUARD_BYTES)
+            self.assertEqual(output[-GUARD_BYTES:], bytes([0xCC]) * GUARD_BYTES)
+            if previous is not None:
+                self.assertNotEqual(output, previous)
+            previous = output
+
+    def test_mixed_bench_submits_both_groups_in_one_runtime_call(self):
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b",
+                           "--packet-group", "2:16", "--packet-group", "2:4",
+                           "--source-space-bytes", "128", "--warmup", "0", "--iterations", "1",
+                           "--profile-iterations", "0"])
+        layout = packet_layout(args)
+        torch, runtime, ctx = MagicMock(), MagicMock(), MagicMock()
+        runtime.initialized, runtime.ddr_initialized = True, False
+        torch.npu.stream.side_effect = lambda stream: contextlib.nullcontext()
+        torch.tensor.side_effect = lambda values, **kwargs: tuple(values)
+        torch.empty.return_value.numel.return_value = args.payload_bytes + 2 * GUARD_BYTES
+        torch.equal.return_value = True
+        parent, child = MagicMock(), MagicMock()
+        ctx.Pipe.return_value = parent, child
+        ctx.Process.return_value.exitcode = 0
+
+        def receive(pipe, kind):
+            return SimpleNamespace(mr_id=1) if kind == "ready" else (0 if kind == "released" else None)
+
+        modules = dict(torch=torch, torch_npu=SimpleNamespace(), kvaf=SimpleNamespace(NpuRuntime=lambda **kwargs: runtime))
+        with patch.dict(sys.modules, modules), patch.object(raw_bench, "parse_args", return_value=args), \
+                patch.object(raw_bench.mp, "get_context", return_value=ctx), \
+                patch.object(raw_bench, "receive", side_effect=receive), \
+                patch.object(raw_bench, "packet_payload", return_value=MagicMock()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            raw_bench.main()
+        runtime.batch_get_raw_addr.assert_called_once()
+        call = runtime.batch_get_raw_addr.call_args
+        self.assertEqual(call.args[1:4], (layout.sources, layout.destinations, layout.lengths))
+        self.assertEqual(call.args[3], (16, 4, 16, 4))
+        self.assertIs(call.args[4], torch.empty.return_value)
+        self.assertFalse(call.kwargs["profile"])
 
     def test_cpu_bench_uses_one_wrapper_call_and_excludes_diagnostics(self):
         for profiling in (False, True):
@@ -151,6 +242,7 @@ class PullBenchmarks(unittest.TestCase):
                             raise BrokenPipeError()
                     pipe.send.side_effect = send
                 args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b",
+                                   "--packets", "1", "--packet-bytes", "8", "--source-space-bytes", "32",
                                    "--warmup", "0", "--iterations", "1", "--profile-iterations", "0"])
                 modules = dict(torch=torch, torch_npu=SimpleNamespace(),
                                kvaf=SimpleNamespace(NpuPullHbmSource=lambda *args: source))
@@ -158,12 +250,12 @@ class PullBenchmarks(unittest.TestCase):
                         patch.object(raw_bench, "receive", side_effect=receive), \
                         patch.object(raw_bench, "retain", side_effect=Retained), patch.object(raw_bench, "print_stages"):
                     if mode == "success":
-                        raw_bench.producer(pipe, args, [0], {})
+                        raw_bench.producer(pipe, args, packet_layout(args), {})
                         source.release_batch.assert_called_once_with(token)
                         self.assertFalse(source.frozen)
                     else:
                         with self.assertRaises(Retained):
-                            raw_bench.producer(pipe, args, [0], {})
+                            raw_bench.producer(pipe, args, packet_layout(args), {})
                         source.release_batch.assert_not_called()
                         self.assertTrue(source.frozen)
                     source.cancel_batch.assert_not_called()
@@ -186,6 +278,12 @@ class PullBenchmarks(unittest.TestCase):
                         ["--aiv-cores", "4", "--jettys-per-core", "2"],
                         ["--max-inflight-total", "3"], ["--iterations", "0"],
                         ["--profile-iterations", "-1"], ["--source-count", "0"], ["--source-count", "4097"],
+                        ["--packet-group", "1024:0"], ["--packet-group", "0:512"],
+                        ["--packet-group", "1024x512"], ["--packet-group", "1:2:3"],
+                        ["--packet-group", "2049:512", "--packet-group", "2048:512"],
+                        ["--packet-group", "1024:16384", "--packet-group", "1024:512", "--source-space-bytes", "17301503"],
+                        ["--packet-group", "1:512", "--blocks", "1"],
+                        ["--packet-group", "1:512", "--packet-bytes", "512"],
                         ["--packets", "1", "--packet-bytes", str(1 << 32),
                          "--source-space-bytes", str(1 << 32)]):
             with self.subTest(invalid=invalid), contextlib.redirect_stderr(io.StringIO()):

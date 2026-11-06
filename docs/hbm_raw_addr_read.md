@@ -211,7 +211,7 @@ Python bench 的无硬件测试还验证匹配的 reuse 消息才释放源；错
 
 ## 随机离散包性能测试
 
-新增 `tests/python/bench_hbm_read_raw_addr.py`，脚本中的 A 为读取端，B 为生产端。
+`tests/python/bench_hbm_read_raw_addr.py` 中的 A 为读取端，B 为生产端。
 先按上文重新编译 NPU 扩展和 raw kernel，再执行；此脚本不需要 CPU 服务：
 
 ```bash
@@ -231,9 +231,10 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已
 `KVAF_ENABLE_CPU_OFFLOAD=OFF`、`KVAF_BUILD_REMOTE_CPU_SERVICE=OFF` 构建。
 上面的混合功能验收脚本仍需 CPU service 和 CPU Pull/BatchPut 构建能力。
 
-- `--packets`：包数量，1..4096；兼容 `--blocks`。
-- `--packet-bytes`：每包字节数，所有包相同；兼容 `--block-bytes`。每包直接生成一个 WQE，长度须为 1..UINT32_MAX 且满足设备单次 READ 上限。
-- `--source-space-bytes`：B 每个注册 tensor 的 HBM 空间大小，至少容纳本批所有包。以包大小划分槽位，随机抽取不重复槽位，源地址按随机顺序读取；不足一个槽位的尾部不使用。
+- `--packets`：等长模式的包数量，默认 4096，1..4096；兼容 `--blocks`。
+- `--packet-bytes`：等长模式的每包字节数，默认 656；兼容 `--block-bytes`。每包直接生成一个 WQE，长度须为 1..UINT32_MAX 且满足设备单次 READ 上限。
+- `--packet-group COUNT:BYTES`：混合大小模式，可重复；兼容 `--block-group`。全部组在同一次调用中读取，总包数须在 1..4096，不能同时指定等长模式的数量/大小参数。
+- `--source-space-bytes`：B 每个注册 tensor 的 HBM 空间大小，至少容纳本批所有包。等长模式按包大小划分槽位，随机抽取不重复槽位；混合模式按各组数据量比例划分同一 MR 的不重叠源区域，再在各区域抽取槽位。不足一个槽位的尾部不使用。
 - `--source-count`：注册多少个独立 tensor/MR（默认 1，范围 1～4096），共用连接，逐批轮换；HBM 总空间约为 source-count × source-space-bytes。多 MR 时预热至少覆盖全部 MR/output 组合，实际 warmup 会打印。各 MR 的数据不同，同一 MR 再次使用时改变数据；期望值生成和校验不计入传输时间。
 - `--seed`：默认 123，可复现布局。目的 output 连续排列，首尾各留 64 字节 guard。
 - `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
@@ -279,6 +280,31 @@ python tests/python/bench_npu_binding_metadata.py --device 6 --iterations 100
 每轮交替输入内容，并检查 NPU 消费者和完整回读数据（含 guard）。
 `NPU_HBM_BENCH_PROFILE_STAGE` 另列读取端接口/校验时间及生产端 ready/release_batch 时间。
 源与目的进程的时钟不相减。两端初始化与清理时间不纳入稳定态逐批统计。
+
+### 一次读取两组不同大小的 block
+
+下面一次 `batch_get_raw_addr()` 读取 1024 个 `128 × 128 B` block 和 1024 个 `128 × 4 B` block：
+
+```bash
+export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
+python tests/python/bench_hbm_read_raw_addr.py \
+  --device-a 6 --device-b 7 \
+  --npu-eid-a-raw 000000000047050000100000df00d806 \
+  --npu-eid-b-raw 000000000047050000100000df00f807 \
+  --block-group 1024:16384 --block-group 1024:512 \
+  --source-space-bytes 268435456 \
+  --warmup 10 --iterations 100 --profile-warmup 1 --profile-iterations 20 \
+  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+```
+
+每批共 2048 段、17,301,504 B（16.5 MiB），只调用一次 Runtime。默认 source-count=1，两组都来自同一个源 Tensor/MR，
+输出也在同一个 Tensor。读取描述按大块、小块交错排列，lengths 为 `[16384, 512, 16384, 512, ...]`，
+让默认两个核都处理 512 个大块和 512 个小块。output 的前 16 MiB 存放大块，随后 0.5 MiB 存放小块，首尾各有 64 B guard。
+两组使用不同的数据模式，同一组逐轮改变内容；每轮仍校验完整 output 和 guard。
+
+日志应包含 `packets=2048 packet_groups=1024x16384,1024x512 payload_bytes=17301504`。
+带宽分子使用两组数据量之和，计时范围仍是同一次调用至数据就绪；源写入、期望值生成和校验都在计时之外。
+此场景只修改 Python bench，已安装当前绑定和 raw kernel 时，拉取脚本更新即可运行。
 
 ### 78 MR 的纯 NPU 验收与性能测量
 
