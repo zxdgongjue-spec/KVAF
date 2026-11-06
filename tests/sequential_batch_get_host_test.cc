@@ -246,7 +246,6 @@ bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint
 int main() {
   using namespace kvaf;
   unsetenv("KVAF_SCATTER_PIPELINE");
-  unsetenv("KVAF_SCATTER_HEAD_START");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -466,12 +465,10 @@ int main() {
     assert(owner->Execute(exec).ok()); assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
   }
-  // Both algorithm options are independent and fixed at initialization.
-  for (int head : {0, 1}) for (int pipeline : {0, 1}) {
+  // The pipeline mode is fixed at initialization.
+  for (int pipeline : {0, 1}) {
     setenv("KVAF_SCATTER_PIPELINE", pipeline ? "1" : "0", 1);
-    setenv("KVAF_SCATTER_HEAD_START", head ? "1" : "0", 1);
-    const auto expected = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
-                          (head ? kScatterHeadStart : 0U);
+    const auto expected = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U);
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok());
     setenv("KVAF_SCATTER_PIPELINE", pipeline ? "0" : "1", 1);
@@ -492,17 +489,15 @@ int main() {
     assert(!refs && !allocations && !hccp_refs);
   }
   unsetenv("KVAF_SCATTER_PIPELINE");
-  unsetenv("KVAF_SCATTER_HEAD_START");
-  for (const auto* name : {"KVAF_SCATTER_PIPELINE", "KVAF_SCATTER_HEAD_START"})
   for (const auto* value : {"", "ON", "2"}) {
-    setenv(name, value, 1);
+    setenv("KVAF_SCATTER_PIPELINE", value, 1);
     auto owner = CreateSequentialBatchGet(config);
     const auto result = owner->Initialize(region);
     assert(result.code() == StatusCode::kInvalidArgument);
-    assert(result.message().find(name) != std::string::npos);
+    assert(result.message().find("KVAF_SCATTER_PIPELINE") != std::string::npos);
     assert(!refs && !allocations && !hccp_refs);
     assert(owner->Shutdown().ok());
-    unsetenv(name);
+    unsetenv("KVAF_SCATTER_PIPELINE");
   }
   std::cout << "sequential Host lifecycle: PASS\n";
 }

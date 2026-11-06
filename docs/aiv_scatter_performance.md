@@ -3,8 +3,7 @@
 CPU 通过四条 Jetty 发起 URMA SGL WRITE，将数据写入 NPU HBM staging；AIV 将 staging
 中的 token scatter 到输出行。固定采用 SIMT 多核融合清单构建和 UB/MTE stage ring。
 通信/scatter 重叠由 `--pipeline 0|1` 控制，对应环境变量 `KVAF_SCATTER_PIPELINE`，
-默认开启。清单首段快启由独立的 `--head-start 0|1` 控制，对应
-`KVAF_SCATTER_HEAD_START`，默认关闭。两个开关均在初始化时读取，修改后须重建 Runtime。
+默认开启，在初始化时读取。首段快启由内核按输入契约和本次有效行数自动选择。
 
 `--fused-build`、`--double-buffer`、`--simt-build` 及其同名环境变量已移除。
 串行两遍构建、UB/DMA 构建对照和单缓冲算法已删除；JSON 用
@@ -109,7 +108,6 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 | `--aiv-cores` | 1..8；CPU payload 始终4条 Jetty |
 | `--jettys-per-core` | 固定2，仅用于 Host setup/BatchPut |
 | `--pipeline` | 默认1；设0比较全批 done 后 scatter |
-| `--head-start` | 默认0；设1先发布1024行源清单，再合批发布其余清单；独立于pipeline |
 | `--kernel-profile/--no-kernel-profile` | 对齐入口默认开启 AIV/CPU 打点 |
 | `--host-profile/--no-host-profile` | 默认关闭 Host 细分打点 |
 | `--host-submit` | reference（默认原调用）或 prepared（固定 Tensor 存储和 stream） |
@@ -188,7 +186,7 @@ stream 的 `npu_stream` 属性，保证输入生产任务先于 ACL kernel。它
 全设备同步，native-stream不伪造该字段。比较外围继续使用`call_outside_aiv_us`，
 同时检查端到端和设备阶段，避免把计时归属变化误判为加速。
 
-固定 `--pipeline 1 --head-start 1` 及相同CPU/UB端口、请求配置和资源占用，分别运行
+固定 `--pipeline 1` 及相同CPU/UB端口、请求配置和资源占用，分别运行
 `--host-submit prepared --completion-mode reference`与
 `--host-submit prepared --completion-mode native-stream`。这一改动只需重编NPU绑定
 （`cmake --build build-npu -j --target _kvaf`）。真实收益需要上机对比，约8 µs的
@@ -204,7 +202,9 @@ ACL kernel提交以及设备排队、完成返回的开销仍在端到端窗口�
 
 pipeline=0：所有 payload 尾 CQE完成，CPU 发布 done，随后 AIV scatter。
 pipeline=1：CPU 按每核1024行 chunk 组织四条 Jetty，分别发布各 Jetty shard 的 Ready；
-AIV 优先消费已就绪 shard，UB 双缓冲跨 Ready 边界保持 MTE3 搬运在途。
+AIV 每次刷新读取同一缓存行的四条 Ready，立即消费可读 shard，并将其中相邻的 shard 合成连续
+staging 搬运区间。UB stage ring 跨区间保持 MTE3 搬运在途。JSON 的 `scatter_chunks` 记录每核
+实际提交的搬运区间数，多个相邻 shard 合并后只计一次。
 两种模式都必须等待最终匹配序号的 done，并完成全部输出 DMA 后才成功返回。
 Ready 表示某个 shard 已可读，不代表整次请求成功。
 
@@ -249,7 +249,7 @@ CPU 空闲轮询和每次请求解析不再发出远端 READ，减少原来的�
 
 ## 首段快启、剩余合批
 
-`KVAF_SCATTER_HEAD_START=1` 且有效行数大于1024时，trusted-input 路径由核0先构建
+trusted-input 请求的有效行数大于1024时，核0先构建
 首1024行并发送请求头、首段清单和 notify。CPU看到 notify 即刷新首段 SGE 并启动四条
 Jetty，不等待完整清单。其余核并行构建各自剩余部分；核0完成自己的剩余部分并汇合后，
 将剩余清单按协商消息上限合批发送，以 notify 行内第二个8 B序号（offset 72）发布完成。
@@ -258,31 +258,13 @@ CPU acquire 观察到匹配序号后才读取剩余地址并提交，避免读�
 首段与剩余段可以同时在队列中传输，不额外等待首段 CQ；只有实际 SQ credits 不足才
 提前排空。Ready 仅在对应完整 shard 提交后发布，最终 done 仍等待所有 payload 尾 CQE，
 AIV 成功返回前仍完成全部 MTE3。CPU Stop 能取消等待剩余清单，失败请求不会提前成功。
-1024行及以下自动沿用整批路径；checked-input 调用保留完整校验后再发布的语义，
-前段构建重叠收益主要面向现有 trusted-input 主路径。
+1024行及以下的请求采用整批发布。checked-input 请求完整校验后整批发布。
+两种 `pipeline` 模式都按上述条件选择请求清单发布方式。
 
 快启会增加提交数：max_sge=16、8192×656 B 的常见配置从4次 CPU post变成
-4次首段 post +4次剩余段 post，控制通路也多一次发布。因此开关默认关闭，须用硬件
-端到端数据确认提前起传的收益能覆盖新增提交成本，不能仅凭 build_notify 变短判定有效。
-
-先固定其他配置，用下面方式对比。两组均使用本次控制 WQE 模板，测试文件分别命名：
-
-```bash
-for head in 0 1; do
-  KVAF_SCATTER_HEAD_START=$head DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
-  bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
-    --single --token-bytes 656 --miss-count 8192 --request-length 32768 \
-    --tokens-per-block 128 --table-capacity 16384 --aiv-cores 4 \
-    --peer-ub-device udmac1d1e2 --host-submit prepared --host-profile \
-    --pipeline 1 --warmup 30 --iterations 100 \
-    --json results/head-$head.json --csv results/head-$head.csv
-done
-```
-
-也可直接传 `--head-start 1`，CLI 优先于环境变量。JSON记录 `head_start`、
-`request_control` 和 `control_wqe=host_template_ub_patch`；CSV仍为32列，
-不能混合两个配置的CSV后丢弃对应JSON。对比同组端到端最快25%的样本，同时检查
-`end_to_end_us`、`cpu_post_ns`、`cpu_comm_us`、`aiv_notify_to_done_us`和scatter尾部。
+4次首段 post +4次剩余段 post，控制通路也多一次发布。对比不同版本时，用相同请求配置检查
+`end_to_end_us`、`cpu_post_ns`、`cpu_comm_us`、`aiv_notify_to_done_us` 和 scatter 尾部。
+benchmark JSON 的 `request_control` 记录该用例实际采用的清单发布方式。
 
 ## 计时和带宽口径
 
@@ -297,7 +279,7 @@ JSON保留原始纳秒、worker cycle、CPU post/CQ等待和配置。
 | end_to_end_us / end_to_end_gbps | 一次 BatchGet 的完整调用/同步窗口 |
 | cpu_comm_us / cpu_comm_gbps | 首个 payload WRITE 提交到最后尾 CQE 被观测 |
 | cpu_write_us / cpu_write_gbps | CPU WriteBatch 整体，包含计划复用处理和地址刷新 |
-| aiv_build_notify_us | 输入就绪到核0提交初始 notify 所在批次；head-start=0包含完整构建/汇合，head-start=1的trusted路径仅包含首段构建及控制提交 |
+| aiv_build_notify_us | 输入就绪到核0提交初始 notify 所在批次。整批路径包含完整构建和汇合，快启路径包含首段构建和控制提交 |
 | aiv_notify_to_done_us | 初始 notify 所在批次提交到核0观测最终 done，包含 mailbox 传输/尾CQ、CPU准备、payload传输和完成发布；快启时还覆盖剩余清单的构建/汇合/发布 |
 | aiv_scatter_us / aiv_scatter_gbps | 最大单核scatter活跃耗时，流水模式下排除等待Ready的区间 |
 | aiv_body_us / aiv_body_gbps | 最大单核主体耗时 |

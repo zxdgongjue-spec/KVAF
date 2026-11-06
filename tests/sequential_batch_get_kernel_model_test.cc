@@ -130,6 +130,7 @@ struct Fixture {
   bool head_started_early{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
+  uint32_t ready_per_poll{1};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   std::mutex poll_mutex;
 
@@ -260,26 +261,32 @@ struct Fixture {
         return;
       }
       assert(suffix); // A complete prefix alone must never publish done.
+      if (hold_done_until_scatter && read_rows < uint32_t(active)) return;
     } else if (pipeline && !remote_error && !future_done) {
       if (push_parts.empty()) kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
           [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
             push_parts.push_back({worker, chunk, range});
           });
       if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
-        const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
-        const auto q = (push_step + (late_first_jetty ? 1U : 0U)) % kvaf::cpu_push::kJettyCount;
-        if (hold_next_jetty && push_step % kvaf::cpu_push::kJettyCount) {
-          const auto previous = kvaf::cpu_push::JettyRange(part.range, (q + 3) % 4);
-          for (auto i = previous.begin; i < previous.end; ++i) if (!payload_read[i]) return;
+        // Deliver test bursts only on Ready refreshes so unrelated polls do
+        // not change which progress words the consumer sees together.
+        if (ready_per_poll > 1 && address != args.workspace + 192) return;
+        for (uint32_t i = 0; i < ready_per_poll &&
+             push_step < push_parts.size() * kvaf::cpu_push::kJettyCount; ++i, ++push_step) {
+          const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
+          const auto q = (push_step + (late_first_jetty ? 1U : 0U)) % kvaf::cpu_push::kJettyCount;
+          if (hold_next_jetty && push_step % kvaf::cpu_push::kJettyCount) {
+            const auto previous = kvaf::cpu_push::JettyRange(part.range, (q + 3) % 4);
+            for (auto row = previous.begin; row < previous.end; ++row) if (!payload_read[row]) return;
+          }
+          const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
+          for (auto row = shard.begin; row < shard.end; ++row)
+            std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
+                        reinterpret_cast<void*>(src[row]), token);
+          if (!stall_ready || q != 3) aiv_model::AtomicStoreWord(
+              args.workspace + 192 + part.worker * 64 + q * 8,
+              kvaf::cpu_push::Progress(args.sequence + future_ready, part.chunk + 1));
         }
-        const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
-        for (auto i = shard.begin; i < shard.end; ++i)
-          std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
-                      reinterpret_cast<void*>(src[i]), token);
-        if (!stall_ready || q != 3) aiv_model::AtomicStoreWord(
-            args.workspace + 192 + part.worker * 64 + q * 8,
-            kvaf::cpu_push::Progress(args.sequence + future_ready, part.chunk + 1));
-        ++push_step;
         return; // Delay other queues/chunks and final done until later polls.
       }
       if (stall_ready || (hold_done_until_scatter && read_rows < uint32_t(active))) return;
@@ -715,7 +722,7 @@ int main() {
     small_workspace.Run(false);
     assert(!small_workspace.push_requests);
   }
-  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 128U,
+  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 64U, kvaf::kScatterOptionsV1 | 128U,
                              kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
     Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
     invalid.args.reserved = options; invalid.Run(false);
@@ -760,8 +767,8 @@ int main() {
         assert(f.push_requests == notified);
       }
     }
-  // SIMT tile boundaries through the complete CPU-push/scatter flow, including
-  // 8192 requests on four cores (one vector call and one descriptor DMA/core).
+  // SIMT tile boundaries through the complete CPU-push/scatter flow,
+  // including the extra prefix tile for eligible requests.
   for (const bool trusted : {false, true})
       for (uint32_t workers : {1U, 4U, 8U}) {
         Fixture f(8193, 31, workers, KVAF_SEQ_SCATTER, 6);
@@ -771,12 +778,13 @@ int main() {
           f.Next(count);
           const auto calls = aiv_model::simt_calls;
           const auto writes = aiv_model::descriptor_writes;
-          uint64_t tiles = 0;
+          const auto prefix = trusted && count > kvaf::cpu_push::kChunkRows ? kvaf::cpu_push::kChunkRows : 0U;
+          uint64_t tiles = (prefix + kSimtBuildRows - 1) / kSimtBuildRows;
           const auto groups = (count + 7U) / 8U;
           for (uint32_t core = 0; core < workers; ++core) {
-            const auto begin = uint64_t(groups) * core / workers * 8;
+            const auto begin = std::max(uint64_t(prefix), uint64_t(groups) * core / workers * 8);
             const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-            tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
+            if (begin < end) tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
           }
           f.Run();
           assert(aiv_model::simt_calls - calls == tiles);
@@ -887,6 +895,20 @@ int main() {
     assert(f.read_rows == 1024 && f.copied_before_done && f.copied_before_all_ready);
     assert(f.waited_with_output_pending);
   }
+  for (uint32_t ready_per_poll : {2U, 4U}) {
+    Fixture f(1024, 656, 1, KVAF_SEQ_SCATTER, 6);
+    f.status.resize(4);
+    f.args.request.core_status = Address(f.status.data());
+    f.args.reserved = kvaf::ScatterWithProfiling(kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline, true);
+    f.ready_per_poll = ready_per_poll;
+    f.late_first_jetty = f.hold_done_until_scatter = true;
+    f.Run();
+    const auto* profile = reinterpret_cast<const kvaf::ScatterBatchGetCoreProfile*>(f.status.data() + 1);
+    // q1 and q2 share a range. q0 and q3 remain separate unless all four
+    // queues are visible in the same refresh.
+    assert(profile->scatter_chunks == (ready_per_poll == 2 ? 3U : 1U));
+    assert(f.read_rows == 1024 && f.copied_before_done && f.push_done);
+  }
   {
     Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
     f.args.reserved |= kvaf::kScatterPipeline;
@@ -950,12 +972,13 @@ int main() {
     for (auto trusted : {0U, kvaf::kScatterTrustedInputs})
       for (auto workers : {1U, 3U, 4U}) {
         Fixture head(8193, 13, workers, KVAF_SEQ_SCATTER, 6);
-        head.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterHeadStart | pipeline | trusted;
+        head.args.reserved = kvaf::kScatterOptionsV1 | pipeline | trusted;
         head.args.max_polls = 100000;
         for (auto count : {8193U, 8193U, 1024U, 1025U, 1031U, 0U, 8193U}) {
           head.Next(count); head.Run();
-          if (count > 1024 && trusted) assert(head.head_started_early);
-          else assert(!head.head_started_early);
+          const bool expect_head = count > kvaf::cpu_push::kChunkRows && trusted;
+          assert(head.head_started_early == expect_head);
+          assert(head.head_parts.empty() == !expect_head);
         }
         if (!trusted) {
           const auto requests = head.push_requests;

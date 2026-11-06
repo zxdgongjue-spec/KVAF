@@ -30,6 +30,7 @@ def fill_random_bytes(buffer, rng, chunk_bytes=RANDOM_SOURCE_CHUNK_BYTES):
         target[offset:offset + len(data)] = data
 
 
+SCATTER_CHUNK_ROWS = 1024
 PAYLOAD_TIMINGS = ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns",
                    "aiv_body_ns", "aiv_wall_ns", "aiv_scatter_ns")
 HOST_TIMINGS = (

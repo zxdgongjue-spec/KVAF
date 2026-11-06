@@ -24,13 +24,6 @@ Status Error(const char* what) { return Status::Internal(std::string("AIV sequen
 // The exported segment is the public 48-byte urma_seg_t wire ABI; no liburma is
 // loaded on the NPU Host or AIV. ubva.va is packed at byte 20, len at byte 32.
 constexpr uint32_t kSegmentBytes = 48;
-Status ReadSwitch(const char* name, bool* enabled, bool default_value = true) {
-  const char* value = std::getenv(name);
-  if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0)
-    return Status::InvalidArgument(std::string(name) + " must be 0 or 1");
-  *enabled = value ? std::strcmp(value, "1") == 0 : default_value;
-  return Status::OK();
-}
 }
 
 class ScatterBatchGet final : public SequentialBatchGet {
@@ -283,18 +276,15 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.config.aiv_batch_get_mode != "cpu_push_scatter" ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
-  bool pipeline;
-  auto result = ReadSwitch("KVAF_SCATTER_PIPELINE", &pipeline);
-  if (!result.ok()) return result;
-  bool head_start;
-  result = ReadSwitch("KVAF_SCATTER_HEAD_START", &head_start, false);
-  if (!result.ok()) return result;
-  s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
-                    (head_start ? kScatterHeadStart : 0U);
+  const char* pipeline_option = std::getenv("KVAF_SCATTER_PIPELINE");
+  if (pipeline_option && std::strcmp(pipeline_option, "0") && std::strcmp(pipeline_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_PIPELINE must be 0 or 1");
+  const bool pipeline = !pipeline_option || pipeline_option[0] == '1';
+  s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
-  result = s.config.peer_link->LookupRegion(region.base, &peer);
+  auto result = s.config.peer_link->LookupRegion(region.base, &peer);
   if (!result.ok()) return result;
   if (!region.base || !region.length || region.base > UINT64_MAX - peer.length ||
       peer.length < region.length)
@@ -315,8 +305,7 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u head_start=%u\n",
-               unsigned(pipeline), unsigned(head_start));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u\n", unsigned(pipeline));
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {
