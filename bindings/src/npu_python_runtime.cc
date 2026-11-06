@@ -19,6 +19,7 @@
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
+#include "npu_tensor_python.h"
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
 #include "remote_offload_python.h"
 #include "connector_python.h"
@@ -57,45 +58,8 @@ void* PointerFromValue(std::uint64_t pointer) {
   return reinterpret_cast<void*>(static_cast<std::uintptr_t>(pointer));
 }
 
-struct NpuTensorView {
-  void* data{nullptr};
-  std::size_t bytes{0};
-  std::size_t element_bytes{0};
-  std::vector<py::ssize_t> shape;
-};
-
-NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
-  if (!py::hasattr(tensor, "data_ptr") || !py::hasattr(tensor, "numel") ||
-      !py::hasattr(tensor, "element_size") ||
-      !py::hasattr(tensor, "is_contiguous") ||
-      !py::hasattr(tensor, "device") || !py::hasattr(tensor, "shape")) {
-    throw py::type_error(std::string(name) + " must be a contiguous NPU Tensor");
-  }
-  if (!tensor.attr("is_contiguous")().cast<bool>()) {
-    throw py::value_error(std::string(name) + " must be contiguous");
-  }
-  const std::string device = py::str(tensor.attr("device")).cast<std::string>();
-  if (device.rfind("npu", 0) != 0) {
-    throw py::value_error(std::string(name) + " must reside on an NPU");
-  }
-  const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
-  const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
-  const std::uint64_t element_bytes =
-      tensor.attr("element_size")().cast<std::uint64_t>();
-  if (pointer == 0 || elements == 0 || element_bytes == 0 ||
-      elements > std::numeric_limits<std::size_t>::max() ||
-      element_bytes > std::numeric_limits<std::size_t>::max() ||
-      static_cast<std::size_t>(elements) >
-          std::numeric_limits<std::size_t>::max() /
-              static_cast<std::size_t>(element_bytes)) {
-    throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
-  }
-  return NpuTensorView{
-      PointerFromValue(pointer),
-      static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
-      static_cast<std::size_t>(element_bytes),
-      tensor.attr("shape").cast<std::vector<py::ssize_t>>()};
-}
+using python_binding::GetNpuTensorView;
+using python_binding::NpuTensorView;
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
   if (result == nullptr) {
@@ -378,12 +342,7 @@ class NpuPythonRuntime final {
     if(!source)throw py::value_error("raw READ requires an NPU Pull ReadyToken");
     mark(binding.checks);
     auto array = [&](const py::object& tensor, const char* name) {
-      const auto view = GetNpuTensorView(tensor, name);
-      if (view.shape.size() != 1 || view.element_bytes != sizeof(std::int64_t) ||
-          !py::hasattr(tensor, "dtype") || py::str(tensor.attr("dtype")).cast<std::string>() != "torch.int64" ||
-          reinterpret_cast<std::uintptr_t>(view.data) % alignof(std::int64_t) ||
-          tensor.attr("device").attr("index").cast<std::uint32_t>() != native_->device_id())
-        throw py::value_error(std::string(name) + " must be a one-dimensional torch.int64 Tensor on the Runtime NPU");
+      const auto view = python_binding::GetNpuInt64TensorView(tensor, name, native_->device_id());
       return NpuInt64ArrayView{static_cast<const std::int64_t*>(view.data), view.bytes / sizeof(std::int64_t)};
     };
     const auto sources = array(src, "src_offsets");
@@ -396,12 +355,13 @@ class NpuPythonRuntime final {
       throw py::value_error("raw READ metadata must have equal lengths in 1..4096");
     if(native_->pending_raw_addr())throw py::value_error("resolve the pending raw READ first");
     mark(binding.checks);
-    const auto view=GetNpuTensorView(output,"output");
-    if(output.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
+    const auto view=GetNpuTensorView(output,"output",false);
+    if(view.device.attr("index").cast<std::uint32_t>()!=native_->device_id())
       throw py::value_error("raw READ output belongs to another NPU");
     mark(binding.output);
     if(stream.is_none())stream=py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
-    if(py::hasattr(stream,"device") && stream.attr("device").attr("index").cast<std::uint32_t>()!=native_->device_id())
+    const auto stream_device=py::getattr(stream,"device",py::object{});
+    if(stream_device && stream_device.attr("index").cast<std::uint32_t>()!=native_->device_id())
       throw py::value_error("raw READ stream belongs to another NPU");
     const auto acl_stream=acl_python::StreamFromPython(stream);
     mark(binding.stream);

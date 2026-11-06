@@ -258,6 +258,23 @@ Python `batch_get_raw_addr()` 数据就绪返回时间，未打开内部计时�
 内部计时轮次不混入带宽统计；各分位数按 `(N-1)*p` 线性插值，不能将不同阶段的 P99 相加。
 `NPU_HBM_INTERNAL_PROFILE_INFO` 列出有效设备计时样本数和计时错误码，缺失的设备计时不会作为零值统计。
 
+绑定层每次调用只获取一次各 Tensor 属性，复用同一个 device 对象完成设备检查。
+raw READ 对 torch.Size 只提取维数并校验维度值，避免构造 shape vector；普通 BatchGet 仍获取完整 shape。
+这些信息每次重新读取，不按 Python 对象身份缓存地址或布局；output 注册缓存和未决任务的引用保留规则不变。
+
+如果 `binding_src` 明显高于另外两个描述 Tensor，可单独对照三种解析顺序：
+
+```bash
+# 构建测试辅助扩展；配置时需 KVAF_BUILD_PYTHON=ON、BUILD_TESTING=ON。
+cmake --build build-shared-ddr --target _kvaf_binding_metadata_test -j
+PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}" \
+python tests/python/bench_npu_binding_metadata.py --device 6 --iterations 100
+```
+
+该诊断调用与生产绑定相同的元数据提取函数，分别先解析 src、dst、lengths，输出 `NPU_HBM_METADATA_PROFILE`。
+它只测属性提取，不进行 READ，也不计入主 bench 的吞吐结果。若较高耗时跟着第一个解析的位置走，说明需要继续追踪首次访问成本；
+若没有复现，则需结合主 bench 的实际调用环境排查。优化效果仍以原 bench 未插桩的整次调用时间为准。
+
 源注册、连接探测、源写入、三组 NPU int64 Tensor 准备、output 清空、应用 IPC、数据校验均在传输计时之外。
 每轮交替输入内容，并检查 NPU 消费者和完整回读数据（含 guard）。
 `NPU_HBM_BENCH_PROFILE_STAGE` 另列读取端接口/校验时间及生产端 ready/release_batch 时间。

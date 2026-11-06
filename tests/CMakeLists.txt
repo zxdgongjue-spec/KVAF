@@ -45,6 +45,17 @@ add_test(
 )
 
 if(KVAF_BUILD_PYTHON)
+  pybind11_add_module(_kvaf_binding_metadata_test npu_binding_metadata_module.cc
+    ../bindings/src/acl_python_utils.cc)
+  target_include_directories(_kvaf_binding_metadata_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/bindings/include ${CMAKE_CURRENT_SOURCE_DIR}/offload_fake_acl)
+  set_target_properties(_kvaf_binding_metadata_test PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
+  add_test(NAME kvaf_npu_binding_metadata_python
+    COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_binding_metadata.py")
+  set_tests_properties(kvaf_npu_binding_metadata_python PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
   add_test(NAME kvaf_connector_bindings_python
     COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_connector_bindings.py")
   set_tests_properties(kvaf_connector_bindings_python PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
