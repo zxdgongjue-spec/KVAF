@@ -87,20 +87,18 @@ class AlignedScatterTests(unittest.TestCase):
         self.assertEqual(set(c.aiv_cores for c in perf.cases(args)), {1, 2, 4, 8})
         self.assertTrue(args.kernel_profile)
         self.assertFalse(args.host_profile)
-        self.assertEqual(args.completion_mode, "reference")
-        self.assertEqual(args.host_submit, "reference")
         self.assertEqual(args.table_capacity, 1277952)
         self.assertEqual(args.table_capacity * 128 * 4096, 670014898176)
 
     def test_scalar_axes_and_environment_round_trip(self):
         args = self.parse("--token-bytes", "656", "--miss-count", "1024", "--aiv-cores", "4",
-                          "--pipeline", "0", "--host-submit", "prepared")
+                          "--pipeline", "0")
         self.assertEqual(len(perf.cases(args)), 1)
         case = perf.cases(args)[0]
         case.json, case.csv = Path("case.json"), Path("case.csv")
         child = self.parse(*perf.case_command(case)[4:])
         for key in ("token_bytes", "miss_count", "aiv_cores", "table_capacity",
-                    "warmup", "kernel_profile", "host_profile", "completion_mode", "pipeline", "host_submit"):
+                    "warmup", "kernel_profile", "host_profile", "pipeline"):
             self.assertEqual(getattr(child, key), getattr(case, key))
         with patch.dict(os.environ, {"KVAF_BATCH_GET_PERF_TOKEN_BYTES": "256",
                                     "KVAF_BATCH_GET_PERF_MISS_COUNT": "64",
@@ -118,6 +116,7 @@ class AlignedScatterTests(unittest.TestCase):
     def test_unsupported_and_inconsistent_cases_fail_before_hardware(self):
         for args in (("--aiv-cores", "16"), ("--core-counts", "1,32"),
                      ("--jettys-per-core", "4"), ("--adaptive-ub-device",), ("--head-start", "1"),
+                     ("--host-submit", "prepared"), ("--completion-mode", "reference"),
                      ("--miss-count", "0"), ("--request-length", "65537"),
                      ("--token-sizes", "656,656"), ("--miss-counts", "65537"),
                      ("--no-kernel-profile", "--host-profile"),
@@ -126,14 +125,6 @@ class AlignedScatterTests(unittest.TestCase):
                      ("--case-timeout", "0"), ("--json", "result.json")):
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.parse(*args)
-
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            self.parse("--completion-mode", "native-stream")
-        native = self.parse("--completion-mode", "native-stream", "--host-submit", "prepared")
-        case = perf.cases(native)[0]
-        case.json, case.csv = Path("native.json"), Path("native.csv")
-        child = self.parse(*perf.case_command(case)[4:])
-        self.assertEqual((child.host_submit, child.completion_mode), ("prepared", "native-stream"))
 
     def test_shared_generator_matches_reference_random_domain(self):
         args = self.parse("--single", "--request-length", "32", "--miss-count", "7")
@@ -166,14 +157,13 @@ class AlignedScatterTests(unittest.TestCase):
         self.assertEqual(actual[:7], sorted(original[:7], key=lambda row: addresses[row[0]] + row[1]))
         self.assertEqual(actual[7:], original[7:])
 
-    def test_reference_call_sync_and_validation_boundaries(self):
+    def test_prepared_call_sync_and_validation_boundaries(self):
         args = self.parse("--single", "--aiv-cores", "4", "--miss-count", "1024", "--host-profile")
         now = [0]
         events = []
         class Runtime:
             pending = False
-            def batch_get(self, *values, **kwargs):
-                assert kwargs == {}  # Exactly the reference positional/default-stream call.
+            def submit(self):
                 assert not self.pending, "previous validation spilled into this sample"
                 self.pending = True
                 events.append("enqueue")
@@ -184,7 +174,7 @@ class AlignedScatterTests(unittest.TestCase):
                 now[0] += 1000000
                 records = profiles(4, 1024, 656)
                 host = dict.fromkeys(HOST_TIMINGS, 0)
-                host.update(host_binding_ns=5000, host_tensor_metadata_ns=1000,
+                host.update(host_binding_ns=5000, host_stream_resolve_ns=300,
                             host_native_ns=3000, host_operator_ns=2000)
                 records[0]["host_profile"] = host
                 return records
@@ -197,23 +187,19 @@ class AlignedScatterTests(unittest.TestCase):
             now[0] += 90000
         torch = SimpleNamespace(npu=SimpleNamespace(synchronize=sync))
         runtime = Runtime()
-        class Inputs:
-            def __iter__(self):
-                now[0] += 1234  # Request unpacking must stay outside the timing window.
-                return iter((1, 2, 3))
-        sample = perf.measure_call(runtime, "table", Inputs(), "count", "output", torch,
-                                   args, 0, clock=lambda: now[0])
+        sample = perf.measure_call(runtime, torch, args, 0, runtime.submit, clock=lambda: now[0])
         self.assertEqual(sample["end_to_end_us"], 100)
         self.assertEqual(sample["host_call_ns"], 10000)
         self.assertEqual(sample["device_sync_us"], 90)
         self.assertEqual(sample["host_stream_sync_us"], 0)  # Native stream timer is not external global sync.
+        self.assertEqual(sample["host_tensor_metadata_us"], 0)
+        self.assertEqual(sample["host_stream_resolve_us"], .3)
         self.assertEqual(sample["host_python_dispatch_us"], 5)
         self.assertEqual(sample["snapshot_ns"], 1000000)
         self.assertEqual(sample["payload_bytes"], 1024 * 656)
         args.kernel_profile = False
         args.host_profile = False
-        sample = perf.measure_call(runtime, "table", (1, 2, 3), "count", "output", torch,
-                                   args, 1, clock=lambda: now[0])
+        sample = perf.measure_call(runtime, torch, args, 1, runtime.submit, clock=lambda: now[0])
         self.assertNotIn("workers", sample)
         self.assertEqual(sample["status_validation_ns"], 1000000)
         self.assertEqual(sample["end_to_end_us"], 100)
@@ -222,108 +208,21 @@ class AlignedScatterTests(unittest.TestCase):
         self.assertEqual(events, ["enqueue", "global_sync", "snapshot_and_validate",
                                   "enqueue", "global_sync", "baseline_validate"])
 
-    def test_validated_mode_has_no_extra_global_sync(self):
-        args = self.parse("--single", "--completion-mode", "validated", "--no-kernel-profile")
-        now = [0]
-        class Runtime:
-            def batch_get(self, *values, **kwargs):
-                assert kwargs == {"synchronize": True}
-                now[0] += 100000
-        def unexpected():
-            self.fail("validated mode added a redundant global synchronization")
-        torch = SimpleNamespace(npu=SimpleNamespace(synchronize=unexpected))
-        sample = perf.measure_call(Runtime(), "table", (1, 2, 3), "count", "output", torch,
-                                   args, 0, clock=lambda: now[0])
-        self.assertEqual(sample["end_to_end_us"], 100)
-
     def test_prepared_buffers_refresh_every_plan_without_rebinding(self):
         fixed = tuple(Vector([0, 0, -1]) for _ in range(3))
         original_ids = [id(t) for t in fixed]
         for values in ((7, 11, 2), (3, 19, 0)):
             plan = tuple(Vector([v, v + 1, -1]) for v in values)
-            current = perf.refresh_request_buffers(plan, fixed)
-            self.assertIs(current, fixed)
-            self.assertEqual([id(t) for t in current], original_ids)
-            self.assertEqual([t.values() for t in current], [t.values() for t in plan])
-            self.assertIs(perf.refresh_request_buffers(plan, None), plan)
-
-    def test_prepared_measurement_keeps_external_sync_and_profile_outside(self):
-        for completion in ("reference", "validated", "native-stream"):
-            args = self.parse("--single", "--host-submit", "prepared", "--host-profile",
-                              "--miss-count", "1024", "--aiv-cores", "4",
-                              "--completion-mode", completion)
-            now, events = [0], []
-            class Runtime:
-                def batch_get(self, *args, **kwargs):
-                    raise AssertionError("prepared sample used dynamic submission")
-                def scatter_profile(self):
-                    events.append("snapshot")
-                    now[0] += 1000000
-                    records = profiles(4, 1024, 656)
-                    host = dict.fromkeys(HOST_TIMINGS, 0)
-                    host.update(host_binding_ns=5000, host_stream_resolve_ns=300,
-                                host_native_ns=4000, host_operator_ns=3000)
-                    if completion == "native-stream":
-                        host.update(host_binding_ns=95000, host_stream_sync_ns=90000)
-                    records[0]["host_profile"] = host
-                    return records
-            def submit():
-                events.append("submit")
-                now[0] += 10000 if completion == "reference" else 100000
-            def sync():
-                events.append("sync")
-                now[0] += 90000
-            sample = perf.measure_call(Runtime(), "table", (1, 2, 3), "count", "output",
-                SimpleNamespace(npu=SimpleNamespace(synchronize=sync)), args, 0,
-                clock=lambda: now[0], submit=submit)
-            self.assertEqual(sample["end_to_end_us"], 100)
-            self.assertEqual(sample["snapshot_us"], 1000)
-            self.assertEqual(sample["host_tensor_metadata_us"], 0)
-            self.assertEqual(sample["host_stream_resolve_us"], .3)
-            self.assertEqual(events, ["submit", "sync", "snapshot"] if completion == "reference"
-                             else ["submit", "snapshot"])
-            if completion == "native-stream":
-                self.assertEqual(sample["host_stream_sync_us"], 90)
-                self.assertEqual(sample["host_python_dispatch_us"], 5)
-                self.assertNotIn("device_sync_ns", sample)
-
-    def test_native_stream_baseline_validation_stays_outside_sample(self):
-        args = self.parse("--single", "--host-submit", "prepared",
-                          "--completion-mode", "native-stream", "--no-kernel-profile")
-        now, events = [0], []
-        class Runtime:
-            def stop_scatter_profile(self):
-                events.append("validate")
-                now[0] += 1000000
-        def submit():
-            events.append("submit_and_wait")
-            now[0] += 100000
-        def unexpected():
-            self.fail("native-stream added global synchronization")
-        torch = SimpleNamespace(npu=SimpleNamespace(synchronize=unexpected))
-        sample = perf.measure_call(Runtime(), "table", (1, 2, 3), "count", "output", torch,
-                                   args, 0, clock=lambda: now[0], submit=submit)
-        self.assertEqual(sample["end_to_end_us"], 100)
-        self.assertEqual(sample["status_validation_ns"], 1000000)
-        self.assertEqual(events, ["submit_and_wait", "validate"])
-
-    def test_native_stream_warmup_drains_before_measurement(self):
-        args = self.parse("--single", "--host-submit", "prepared",
-                          "--completion-mode", "native-stream", "--warmup", "2")
-        events = []
-        runtime = SimpleNamespace(scatter_profile=lambda: events.append("validate") or [])
-        torch = SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: events.append("presync")))
-        perf.warmup_calls(runtime, "table", "count", "output", torch, args, lambda: (1, 2, 3),
-                          submit=lambda: events.append("submit_and_wait"))
-        self.assertEqual(events, ["presync", "submit_and_wait"] * 2 + ["validate"])
+            perf.refresh_request_buffers(plan, fixed)
+            self.assertEqual([id(t) for t in fixed], original_ids)
+            self.assertEqual([t.values() for t in fixed], [t.values() for t in plan])
 
     def test_warmup_drains_last_status_and_does_not_hide_errors(self):
         args = self.parse("--single", "--warmup", "3")
         events = []
         class Runtime:
             pending = False
-            def batch_get(self, *values, **kwargs):
-                assert kwargs == {}
+            def submit(self):
                 self.pending = True
                 events.append("enqueue")
             def scatter_profile(self):
@@ -334,24 +233,15 @@ class AlignedScatterTests(unittest.TestCase):
                 raise RuntimeError("business status failed")
         runtime = Runtime()
         torch = SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: events.append("sync")))
-        perf.warmup_calls(runtime, "table", "count", "output", torch, args, lambda: (1, 2, 3))
+        def refresh():
+            events.append("refresh")
+        perf.warmup_calls(runtime, torch, args, refresh, runtime.submit)
         self.assertFalse(runtime.pending)
-        self.assertEqual(events, ["sync", "enqueue", "sync"] * 3 + ["validate"])
+        self.assertEqual(events, ["refresh", "sync", "enqueue", "sync"] * 3 + ["validate"])
         with self.assertRaisesRegex(RuntimeError, "business status failed"):
             perf.complete_outside_measurement(runtime, False)
 
-    def test_reference_enqueue_signature_and_matrix_axes_are_shared(self):
-        # Check against the actual reference, not a separately invented shape.
-        old_tree = ast.parse(inspect.getsource(reference.main))
-        old_calls = [n for n in ast.walk(old_tree) if isinstance(n, ast.Call) and
-                     isinstance(n.func, ast.Attribute) and n.func.attr == "batch_get"]
-        self.assertEqual(len(old_calls), 3)
-        new_tree = ast.parse(inspect.getsource(perf.measure_call))
-        branch = next(n.body for n in new_tree.body[0].body if isinstance(n, ast.If))
-        new_call = next(n for statement in branch for n in ast.walk(statement)
-                        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "batch_get")
-        self.assertEqual(len(new_call.args), len(old_calls[-1].args))
-        self.assertEqual(new_call.keywords, old_calls[-1].keywords)
+    def test_reference_matrix_axes_are_shared(self):
         script = Path(reference.__file__).parents[1] / "run_remote_cpu_batch_get_miss_count_perf.sh"
         source = script.read_text(encoding="utf-8")
         for name, expected in (("TOKEN_BYTES", perf.TOKEN_SIZES), ("MISS_COUNTS", perf.MISS_COUNTS)):
@@ -363,6 +253,8 @@ class AlignedScatterTests(unittest.TestCase):
             expected = [("torch", "empty"), ("torch", "tensor"),
                         ("runtime", "batch_put") if function == reference.main else (None, "populate_table"),
                         ("runtime", "access_table_view")]
+            if function == perf.run_case:
+                expected.append(("runtime", "prepare_scatter_batch_get"))
             tree = ast.parse(inspect.getsource(function))
             positions = []
             for owner, name in expected:
@@ -429,6 +321,7 @@ class AlignedScatterTests(unittest.TestCase):
             self.assertEqual(plan["cases"][0]["payload_bytes"], 656 * 32)
             self.assertEqual(plan["cpu_jettys"], 4)
             self.assertEqual(plan["completion_mode"], "reference")
+            self.assertEqual(plan["host_submit"], "prepared")
             self.assertEqual(plan["cases"][0]["queue_matched_direct_jettys_per_core"], 1)
             self.assertFalse(output.exists())
 
@@ -452,7 +345,8 @@ class AlignedScatterTests(unittest.TestCase):
             child = self.parse(*command[2:])
             sample = dict(iteration=0, payload_bytes=child.miss_count * child.token_bytes,
                           end_to_end_ns=1000, aiv_body_ns=700)
-            report = dict(config=vars(child).copy(), samples={"profiled": [sample]}, summary={"profiled": {
+            report = dict(config=dict(vars(child), host_submit="prepared", completion_mode="reference"),
+                          samples={"profiled": [sample]}, summary={"profiled": {
                 key: perf.statistics_ns([sample[key]], sample["payload_bytes"])
                 for key in ("end_to_end_ns", "aiv_body_ns")}})
             report["config"] = {k: str(v) if isinstance(v, Path) else v for k,v in report["config"].items()}

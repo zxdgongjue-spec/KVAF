@@ -29,6 +29,7 @@ TOKEN_SIZES = (128, 256, 512, 656, 1024, 2048, 4096)
 MISS_COUNTS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 CORE_COUNTS = (1, 2, 4, 8)
 CPU_JETTYS = 4
+SUBMISSION_CONFIG = {"host_submit": "prepared", "completion_mode": "reference"}
 STAGES = {
     "end_to_end_ns": "end_to_end", "aiv_body_ns": "kernel_total",
     "host_call_ns": "host_call", "device_sync_ns": "device_sync",
@@ -72,14 +73,9 @@ def arguments(argv=None):
     parser.add_argument("--csv", type=Path, help="single-case compact timing/bandwidth samples")
     parser.add_argument("--case-timeout", type=int, default=600,
                         help="whole-case seconds, including DDR allocation/registration, full-table population and measurement")
-    parser.add_argument("--completion-mode", choices=("reference", "validated", "native-stream"), default="reference",
-                        help="reference: enqueue then global device sync; validated: API including status checks; "
-                             "native-stream: prepared submit + native stream wait, status checks outside sample")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--host-submit", choices=("reference", "prepared"), default="reference",
-                        help="reference: original dynamic Tensor/stream API; prepared: fixed storage/stream with per-call task-queue fence")
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
         remaining.append("--kernel-profile")  # Reference sweep profiles every formal case.
@@ -120,8 +116,6 @@ def arguments(argv=None):
 
 
 def validate_scatter(args):
-    if args.completion_mode == "native-stream" and args.host_submit != "prepared":
-        return "native-stream completion requires --host-submit prepared"
     if not 1 <= args.aiv_cores <= 8:
         return "CPU-push scatter supports 1..8 AIV cores; 16/32-core reference points are unsupported"
     if args.jettys_per_core != 2:
@@ -232,52 +226,26 @@ def complete_outside_measurement(runtime, profiling):
     return None
 
 
-def warmup_calls(runtime, view, count, output, torch, args, plan_factory, submit=None):
+def warmup_calls(runtime, torch, args, refresh_inputs, submit):
     for _ in range(args.warmup):
-        indices, offsets, output_indices = plan_factory()
+        refresh_inputs()
         torch.npu.synchronize()
-        if args.completion_mode == "reference":
-            if submit is None:
-                runtime.batch_get(view, indices, offsets, count, output_indices, output)
-            else:
-                submit()
-            torch.npu.synchronize()
-        else:
-            if submit is None:
-                runtime.batch_get(view, indices, offsets, count, output_indices, output, synchronize=True)
-            else:
-                submit()
-    if args.warmup and args.completion_mode in ("reference", "native-stream"):
+        submit()
+        torch.npu.synchronize()
+    if args.warmup:
         # No last-warmup status drain may spill into the first timed Execute.
         complete_outside_measurement(runtime, args.kernel_profile)
 
 
-def measure_call(runtime, view, inputs, count, output, torch, args, iteration,
-                 clock=time.perf_counter_ns, submit=None):
-    indices, offsets, output_indices = inputs  # Reference unpacks the plan before timing.
-    if args.completion_mode == "reference":
-        # Same positional API/default stream and three timestamp boundaries as
-        # test_npu_batch_get_perf: enqueue -> submitted -> global sync -> end.
-        begin = clock()
-        if submit is None:
-            runtime.batch_get(view, indices, offsets, count, output_indices, output)
-        else:
-            submit()
-        submitted = clock()
-        torch.npu.synchronize()
-        completed = clock()
-        host_call_ns = submitted - begin
-        global_sync_ns = completed - submitted
-    else:
-        begin = clock()
-        if submit is None:
-            runtime.batch_get(view, indices, offsets, count, output_indices, output, synchronize=True)
-        else:
-            submit()
-        completed = clock()
-        host_call_ns = completed - begin
+def measure_call(runtime, torch, args, iteration, submit, clock=time.perf_counter_ns):
+    begin = clock()
+    submit()
+    submitted = clock()
+    torch.npu.synchronize()
+    completed = clock()
     sample = dict(iteration=iteration, payload_bytes=args.miss_count * args.token_bytes,
-                  end_to_end_ns=completed - begin, host_call_ns=host_call_ns)
+                  end_to_end_ns=completed - begin, host_call_ns=submitted - begin,
+                  device_sync_ns=completed - submitted)
     if args.kernel_profile:
         begin = clock()
         records = complete_outside_measurement(runtime, True)
@@ -285,14 +253,10 @@ def measure_call(runtime, view, inputs, count, output, torch, args, iteration,
                                       args.token_bytes, args.kernel_profile_clock_mhz))
         sample["workers"] = records
         sample["snapshot_ns"] = clock() - begin
-    elif args.completion_mode in ("reference", "native-stream"):
+    else:
         begin = clock()
         complete_outside_measurement(runtime, False)
         sample["status_validation_ns"] = clock() - begin
-    if args.completion_mode == "reference":
-        # Keep external device-wide sync separate from the Native RAII stream
-        # timer; it is outside the binding interval, not a child of that timer.
-        sample["device_sync_ns"] = global_sync_ns
     return sample_metrics(sample)
 
 
@@ -344,27 +308,20 @@ def run_case(args):
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
         input_mode="steady_table_new_request_plan_per_call", calls_per_sample=1,
-        timing=("enqueue_then_global_device_sync" if args.completion_mode == "reference"
-                else "prepared_enqueue_then_native_stream_sync" if args.completion_mode == "native-stream"
-                else "synchronous_BatchGet_through_status_validation"),
-        stream_selection=("fixed_stream_per_call_task_queue_fence" if args.host_submit == "prepared" else
-                          "current_stream_resolved_inside_binding_like_reference"),
-        input_storage=("fixed_buffers_refreshed_per_call" if args.host_submit == "prepared" else
-                       "new_request_tensors_per_call"),
-        host_timing_matches_reference=(args.host_submit == "reference" and args.completion_mode == "reference"),
-        completion_scope=("fixed_stream" if args.completion_mode == "native-stream" else
-                          "device" if args.completion_mode == "reference" else "validated_stream"),
+        timing="enqueue_then_global_device_sync", stream_selection="fixed_stream_per_call_task_queue_fence",
+        input_storage="fixed_buffers_refreshed_per_call", host_timing_matches_reference=False,
+        completion_scope="device",
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",
         verification="deterministic_preflight_prefix_and_guard_then_last_random_payload",
         profile_snapshot_in_sample=False, setup_in_sample=False,
         instrumentation_overhead_included=args.kernel_profile,
         cpu_profile_report_before_done=args.kernel_profile,
-        status_validation_in_sample=args.completion_mode == "validated",
+        status_validation_in_sample=False,
         kernel_counter_scope="scatter_body_finish_before_report_and_status_flush",
         units="us; decimal GB/s", payload_bytes_per_call=payload,
         ddr_bytes=args.table_capacity * block_bytes,
         get_sha256=hashlib.sha256(kernel.read_bytes()).hexdigest(),
-        put_sha256=hashlib.sha256(put_kernel.read_bytes()).hexdigest())
+        put_sha256=hashlib.sha256(put_kernel.read_bytes()).hexdigest(), **SUBMISSION_CONFIG)
     print("SCATTER_ALIGNED_CONFIG " + json.dumps(config, sort_keys=True), flush=True)
     phase = "profiled" if args.kernel_profile else "baseline"
     report = dict(config=config, setup_us={}, samples={phase: []}, summary={})
@@ -415,25 +372,14 @@ def run_case(args):
                      request_ids.to(torch.int32))
         if args.sort_input_indices:
             preflight = reference.sort_request_plan_prefix(torch, view.addresses, *preflight, args.miss_count)
-        submit = None
-        fixed_inputs = None
-        if args.host_submit == "prepared":
-            # Keep this storage for the entire case, while refreshing the
-            # independently generated request contents before every call.
-            fixed_inputs = preflight
-            with setup_phase(report, "prepare_submit"):
-                submit = runtime.prepare_scatter_batch_get(
-                    view, preflight[0], preflight[1], count, preflight[2], output,
-                    synchronize=args.completion_mode == "validated",
-                    wait_stream=args.completion_mode == "native-stream")
+        # Keep this storage for the entire case and refresh its contents in place.
+        fixed_inputs = preflight
+        with setup_phase(report, "prepare_submit"):
+            submit = runtime.prepare_scatter_batch_get(
+                view, fixed_inputs[0], fixed_inputs[1], count, fixed_inputs[2], output,
+                synchronize=False)
         output.zero_()
-        # Exercise the selected submission path, then synchronize and validate
-        # business status outside all measured samples.
-        if submit is None:
-            runtime.batch_get(view, preflight[0], preflight[1], count, preflight[2], output,
-                              synchronize=True)
-        else:
-            submit()
+        submit()
         torch.npu.synchronize()
         complete_outside_measurement(runtime, False)
         # Same contiguous-prefix correctness comparison as the reference.
@@ -445,24 +391,24 @@ def run_case(args):
         log_phase("preflight", "end")
         contiguous_source_token_ids = request_ids % (args.table_capacity * args.tokens_per_block)
 
-        def next_plan():
+        def refresh_inputs():
             plan = reference.generate_request_plan(torch, args, device, request_ids, view.addresses,
                                                    contiguous_source_token_ids)
-            return refresh_request_buffers(plan, fixed_inputs)
+            refresh_request_buffers(plan, fixed_inputs)
 
         if args.kernel_profile:
             runtime.start_scatter_profile()
         log_phase("warmup", "begin", calls=args.warmup)
-        warmup_calls(runtime, view, count, output, torch, args, next_plan, submit=submit)
+        warmup_calls(runtime, torch, args, refresh_inputs, submit)
         log_phase("warmup", "end")
         log_phase("measure", "begin", calls=args.iterations)
         for iteration in range(args.iterations):
-            inputs = next_plan()
+            refresh_inputs()
             torch.npu.synchronize()  # Same pre-call isolation as the reference.
             report["samples"][phase].append(
-                measure_call(runtime, view, inputs, count, output, torch, args, iteration, submit=submit))
+                measure_call(runtime, torch, args, iteration, submit))
         log_phase("measure", "end")
-        verify(inputs, guard=args.output_access_pattern == "contiguous")
+        verify(fixed_inputs, guard=args.output_access_pattern == "contiguous")
         samples = report["samples"][phase]
         report["summary"][phase] = {
             key: statistics_ns([r[key] for r in samples], payload if key in PAYLOAD_TIMINGS else None)
@@ -493,11 +439,8 @@ def close_case(runtime, table):
 
 
 def refresh_request_buffers(plan, fixed_inputs):
-    if fixed_inputs is None:
-        return plan
     for destination, source in zip(fixed_inputs, plan):
         destination.copy_(source)
-    return fixed_inputs
 
 
 def case_command(args):
@@ -507,8 +450,6 @@ def case_command(args):
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
                  "max_inflight_total", "pipeline", "case_timeout"):
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
-    command.extend(("--completion-mode", args.completion_mode))
-    command.extend(("--host-submit", args.host_submit))
     command.append("--kernel-profile" if args.kernel_profile else "--no-kernel-profile")
     command.append("--host-profile" if args.host_profile else "--no-host-profile")
     command.append("--sort-input-indices" if args.sort_input_indices else "--no-sort-input-indices")
@@ -538,12 +479,10 @@ def main(argv=None, runner=None):
     selected = cases(args)
     root = args.output_dir or Path("results") / f"scatter-miss-{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
     for case in selected:
-        name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_{case.completion_mode}"
-        if case.host_submit == "prepared":
-            name += "_prepared"
+        name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_reference_prepared"
         case.json = case.json or root / (name + ".json")
         case.csv = case.csv or root / (name + ".csv")
-    plan = dict(mode="cpu_push_scatter", cpu_jettys=CPU_JETTYS, completion_mode=args.completion_mode,
+    plan = dict(mode="cpu_push_scatter", cpu_jettys=CPU_JETTYS, **SUBMISSION_CONFIG,
                 unsupported_reference_cores=[16, 32], jetty_axis="fixed_CPU_4_not_per_AIV_core",
                 cases=[dict(command=case_command(case), payload_bytes=case.miss_count * case.token_bytes,
                             ddr_bytes=case.table_capacity * case.tokens_per_block * case.token_bytes,
@@ -561,7 +500,7 @@ def main(argv=None, runner=None):
     for index, case in enumerate(selected):
         print(f"SCATTER_ALIGNED_SWEEP_BEGIN case={index+1}/{len(selected)} token_bytes={case.token_bytes} "
               f"miss_count={case.miss_count} aiv_cores={case.aiv_cores} cpu_jettys={CPU_JETTYS} "
-              f"completion_mode={case.completion_mode}", flush=True)
+              "host_submit=prepared completion_mode=reference", flush=True)
         case.json.parent.mkdir(parents=True, exist_ok=True)
         with case.json.with_suffix(".log").open("w", encoding="utf-8") as log:
             try:
@@ -576,10 +515,13 @@ def main(argv=None, runner=None):
             report_case_failure(case, f"status={result.returncode}")
             return result.returncode
         report = json.loads(case.json.read_text(encoding="utf-8"))
-        for key in ("request_length", "table_capacity", "tokens_per_block", "token_bytes",
-                    "miss_count", "aiv_cores", "jettys_per_core", "source_access_pattern",
-                    "output_access_pattern", "sort_input_indices", "completion_mode", "pipeline", "host_submit"):
-            if report["config"].get(key) != getattr(case, key):
+        expected = {key: getattr(case, key) for key in (
+            "request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
+            "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
+            "sort_input_indices", "pipeline")}
+        expected.update(SUBMISSION_CONFIG)
+        for key, value in expected.items():
+            if report["config"].get(key) != value:
                 raise ValueError(f"case report configuration mismatch: {key}")
         phase = "profiled" if case.kernel_profile else "baseline"
         samples = report["samples"].get(phase, [])
