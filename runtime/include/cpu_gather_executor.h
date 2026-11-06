@@ -207,6 +207,9 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
+  std::uint64_t* shard_progress_{nullptr};
+  std::uint64_t shard_sequence_{};
+  std::uint32_t shard_sgl_{}, shard_wrs_{}, shard_count_{};
   // Separate balanced task ownership from partial DMA-visible progress. Each
   // slot has one writer; only the coordinator publishes the contiguous prefix.
   struct alignas(64) TaskProgress { std::uint64_t bytes{}; };

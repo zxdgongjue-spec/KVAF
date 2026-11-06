@@ -20,18 +20,26 @@ std::uint64_t ThreadCpuNs() {
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
-  if (bytes < 64U || base > UINT64_MAX - bytes || header.magic != kGatherDescriptorMagic ||
+  const bool sharded = header.magic == kGatherShardMagic;
+  if (bytes < 64U || base > UINT64_MAX - bytes ||
+      (!sharded && header.magic != kGatherDescriptorMagic) ||
       header.span_count == 0U ||
-      header.ready_bytes != 0U ||
+      (!sharded && header.ready_bytes != 0U) ||
+      (sharded && (!header.pipeline_chunk_bytes || !header.span_bytes ||
+                   !header.sequence || header.sequence > UINT32_MAX ||
+                   !header.ready_bytes || header.ready_bytes > 13U ||
+                   header.ready_bytes * header.span_bytes > 65536U)) ||
       (header.pipeline_chunk_bytes != 0U &&
        (header.pipeline_chunk_bytes < 64U || header.pipeline_chunk_bytes % 64U != 0U)))
     return false;
   const auto data_bytes = GatherControlOffset(bytes);
-  if (!GatherRange(base, data_bytes, descriptor_address, GatherDescriptorBytes(header.span_count)) ||
+  const auto descriptor_bytes = sharded ?
+      GatherProgressOffset(header.span_count) + kGatherProgressBytes : GatherDescriptorBytes(header.span_count);
+  if (!GatherRange(base, data_bytes, descriptor_address, descriptor_bytes) ||
       !GatherRange(base, data_bytes, header.staging_address, header.total_bytes))
     return false;
   return descriptor_address >= header.staging_address + header.total_bytes ||
-         header.staging_address >= descriptor_address + GatherDescriptorBytes(header.span_count);
+         header.staging_address >= descriptor_address + descriptor_bytes;
 }
 
 }  // namespace
@@ -68,7 +76,16 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     if (variable_offsets_.back() != header.total_bytes) return 0U;
   }
   pipeline_ready_ = nullptr;
-  if (header.pipeline_chunk_bytes != 0U) {
+  shard_progress_ = nullptr;
+  if (header.magic == kGatherShardMagic) {
+    pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
+    shard_sgl_ = static_cast<std::uint32_t>(header.ready_bytes);
+    shard_sequence_ = header.sequence;
+    shard_wrs_ = (header.span_count + shard_sgl_ - 1U) / shard_sgl_;
+    shard_count_ = GatherShardCount(shard_wrs_);
+    shard_progress_ = reinterpret_cast<std::uint64_t*>(
+        memory_ + descriptor_address - base_ + GatherProgressOffset(header.span_count));
+  } else if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
@@ -97,7 +114,7 @@ void CpuGatherExecutor::Copy() {
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   if (thread_profiles_.empty()) {
     (void)ProcessSource(worker);
-    if (pipeline_ready_ == nullptr) GatherBarrier();
+    if (pipeline_ready_ == nullptr && shard_progress_ == nullptr) GatherBarrier();
     return;
   }
   auto& profile = thread_profiles_[worker];
@@ -110,7 +127,7 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   profile.bytes = ProcessSource(worker);
   profile.copy_done_ns = NowNs();
   // Chunk writers already completed their stores before publishing progress.
-  if (pipeline_ready_ == nullptr) GatherBarrier();
+  if (pipeline_ready_ == nullptr && shard_progress_ == nullptr) GatherBarrier();
   profile.done_ns = NowNs();
   const auto cpu_end = ThreadCpuNs();
   profile.cpu_time_valid = cpu_begin != 0U && cpu_end >= cpu_begin;
@@ -150,6 +167,26 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
 }
 
 std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
+  if (shard_progress_ != nullptr) {
+    std::uint64_t copied = 0U;
+    const auto wr_bytes = std::uint64_t(shard_sgl_) * span_bytes_;
+    const auto step = std::max<std::uint64_t>(1U, pipeline_chunk_bytes_ / wr_bytes);
+    for (auto shard = worker; shard < shard_count_; shard += active_threads_) {
+      const auto first = GatherShardBoundary(shard_wrs_, shard_count_, shard);
+      const auto last = GatherShardBoundary(shard_wrs_, shard_count_, shard + 1U);
+      for (auto wr = std::uint64_t(first); wr < last;) {
+        const auto next = std::min<std::uint64_t>(last, wr + step);
+        copied += CopyRange(std::min(total_bytes_, wr * wr_bytes),
+                            std::min(total_bytes_, next * wr_bytes));
+        GatherBarrier();
+        __atomic_store_n(shard_progress_ + shard,
+                         GatherShardProgress(shard_sequence_, next - first), __ATOMIC_RELEASE);
+        GatherBarrier();
+        wr = next;
+      }
+    }
+    return copied;
+  }
   if (pipeline_ready_ == nullptr) {
     return CopyRange(Boundary(worker), Boundary(worker + 1U));
   }

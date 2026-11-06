@@ -230,6 +230,99 @@ void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
   std::free(allocation);
 }
 #endif
+void ShardedCopies(bool profile, unsigned token, unsigned sgl, unsigned chunk) {
+  constexpr unsigned count = 4097;
+  const auto bytes = std::uint64_t(count) * token;
+  const auto staging_offset = (131072U + bytes + 63U) & ~std::uint64_t{63};
+  const auto region_bytes = staging_offset + ((bytes + 63U) & ~std::uint64_t{63}) + 64;
+  void* allocation = nullptr;
+  Check(posix_memalign(&allocation, 64, region_bytes) == 0, "allocation failed");
+  auto* memory = static_cast<std::uint8_t*>(allocation);
+  const auto base = reinterpret_cast<std::uint64_t>(memory);
+  {
+    kvaf::peer::CpuGatherExecutor executor(memory, base, 8, 4096,
+                                         kvaf::peer::GatherWaitMode::kActive);
+    if (profile) executor.EnableProfiling();
+    auto* h = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
+    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(h + 1);
+    auto* progress = reinterpret_cast<std::uint64_t*>(memory + kvaf::GatherProgressOffset(count));
+    const auto wrs = (count + sgl - 1) / sgl;
+    const auto shards = kvaf::GatherShardCount(wrs);
+    std::memset(progress, 0, kvaf::kGatherProgressBytes);
+    std::vector<std::uint8_t> expected(bytes);
+    for (unsigned sequence = 1; sequence <= 3; ++sequence) {
+      for (unsigned i = 0; i < count; ++i) {
+        const auto offset = 131072U + std::uint64_t(count - i - 1) * token;
+        spans[i] = {base + offset, token, 0};
+        std::memset(memory + offset, (i + sequence) % 251, token);
+        std::memset(expected.data() + std::uint64_t(i) * token, (i + sequence) % 251, token);
+      }
+      *h = {kvaf::kGatherShardMagic, sequence, base + staging_offset, count,
+            static_cast<std::uint32_t>(bytes), chunk, token, sgl};
+      auto* staging = memory + staging_offset;
+      std::memset(staging, 0xad, bytes);
+      Check(executor.PrepareDirect(region_bytes, base, sequence, count) == 8,
+            "shard preparation failed");
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+      using namespace cpu_gather_test;
+      const auto first_end = std::min<std::uint64_t>(
+          kvaf::GatherShardBoundary(wrs, shards, 1), std::max<std::uint64_t>(1, chunk / (sgl * token))) * sgl * token;
+      held_begin.store(0); held_end.store(first_end);
+      tail_entered.store(false); release_tail.store(false); hold_tail.store(true);
+#endif
+      std::thread consumer([&] {
+        std::vector<unsigned> observed(shards);
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((__atomic_load_n(progress + shards - 1, __ATOMIC_ACQUIRE) >> 32) != sequence &&
+               std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        Check((__atomic_load_n(progress + shards - 1, __ATOMIC_ACQUIRE) >> 32) == sequence,
+              "late shard cannot progress while first shard is blocked");
+        Check((__atomic_load_n(progress, __ATOMIC_ACQUIRE) >> 32) != sequence,
+              "blocked first shard advertised new progress");
+        release_tail.store(true, std::memory_order_release);
+#endif
+        unsigned finished = 0;
+        while (finished < shards) {
+          finished = 0;
+          for (unsigned shard = 0; shard < shards; ++shard) {
+            const auto value = __atomic_load_n(progress + shard, __ATOMIC_ACQUIRE);
+            if ((value >> 32) != sequence) continue;
+            const auto first = kvaf::GatherShardBoundary(wrs, shards, shard);
+            const auto size = kvaf::GatherShardBoundary(wrs, shards, shard + 1) - first;
+            const auto ready = static_cast<unsigned>(value);
+            Check(ready >= observed[shard] && ready <= size, "invalid per-shard progress");
+            const auto begin = std::min(bytes, std::uint64_t(first + observed[shard]) * sgl * token);
+            const auto end = std::min(bytes, std::uint64_t(first + ready) * sgl * token);
+            Check(std::memcmp(staging + begin, expected.data() + begin, end - begin) == 0,
+                  "shard publication preceded its payload");
+            observed[shard] = ready;
+            finished += ready == size;
+          }
+        }
+      });
+      executor.Copy(); consumer.join();
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+      cpu_gather_test::hold_tail.store(false);
+#endif
+      Check(std::memcmp(staging, expected.data(), bytes) == 0, "shard output mismatch");
+      if (profile) {
+        std::uint64_t copied = 0;
+        for (const auto& thread : executor.ThreadProfiles()) copied += thread.bytes;
+        Check(copied == bytes, "shard profiles double-count or omit bytes");
+      }
+    }
+    const auto header = *h;
+    for (unsigned invalid : {0U, 14U}) {
+      h->ready_bytes = invalid;
+      Check(!executor.PrepareDirect(region_bytes, base, 3, count), "invalid READ group accepted");
+    }
+    *h = header;
+    Check(!executor.PrepareDirect(kvaf::GatherProgressOffset(count) + 64, base, 3, count),
+          "missing shard trailer accepted");
+  }
+  std::free(allocation);
+}
 }  // namespace
 
 int main() {
@@ -239,6 +332,10 @@ int main() {
     for (bool profile : {false, true})
       for (bool variable : {false, true})
         for (bool pipeline : {false, true}) Run(mode, profile, variable, pipeline);
+  for (bool profile : {false, true})
+    for (unsigned token : {656U, 4096U})
+      for (unsigned sgl : {1U, 6U, 13U})
+        for (unsigned chunk : {64U, 4096U, 131072U}) ShardedCopies(profile, token, sgl, chunk);
   BalancedCopies(4096, 656);   // Previously 21 tasks for 16 threads at 128 KiB.
   BalancedCopies(4096, 4096);  // Multiple balanced rounds, bounded copy task size.
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)

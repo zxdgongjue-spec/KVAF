@@ -1,5 +1,6 @@
 #pragma once
 #include "sequential_batch_get_abi.h"
+#include "gather_shard_layout.h"
 
 constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524631ULL;
 // A completed successful profile has all seven boundary timestamps. On error,
@@ -12,7 +13,8 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
   uint64_t requests, data_wrs, ack_queries, data_wqebbs, data_doorbells;
   uint64_t data_cq_wait_cycles, read_build_cycles;
   // CPU progress and data submissions overlap in chunk mode. Event cycles use
-  // the AIV clock; first_read_ready_bytes is the progress snapshot at submission.
+  // the AIV clock; first_read_ready_bytes is the progress snapshot at submission
+  // (sum of independently ready shard bytes in GDR3, a prefix in GDR2).
   uint64_t first_ready_cycle, first_read_submit_cycle, first_read_ready_bytes;
   uint64_t ready_queries, ready_wait_cycles, pipeline_chunk_bytes;
 };
@@ -45,10 +47,11 @@ struct KvafGatherBatchGetArgs {
   // output rows within each sgl_size group; token_bytes * sgl_size <= 65536.
   // Reuses V3's zero-only reserved word: old kernels reject an enabled flag.
   uint32_t coalesce_sges;
-  // Zero: whole-batch ACK before READ. Otherwise consume the CPU ready prefix.
-  // V4 prevents a V3 kernel from silently ignoring the requested pipeline.
+  // Zero: whole-batch ACK before READ. Nonzero: progress publication granularity;
+  // pipeline_shards selects GDR3 independent shards or the GDR2 ready prefix.
   uint32_t pipeline_chunk_bytes;
-  uint32_t reserved;
+  // V5: GDR3 per-shard progress. Zero retains GDR2 prefix/whole-batch modes.
+  uint32_t pipeline_shards;
 };
 static_assert(sizeof(KvafGatherBatchGetArgs) == 240);
 

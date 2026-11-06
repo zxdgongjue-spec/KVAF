@@ -8,6 +8,8 @@ add_test(NAME kvaf_aiv_test_cleanup_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_test_cleanup.py")
 add_test(NAME kvaf_gather_perf_summary_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_perf_summary.py")
+add_test(NAME kvaf_gather_binding_fastpath_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_binding_fastpath.py")
 add_test(NAME kvaf_gather_cpu_profile_analysis_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_cpu_profile_analysis.py")
 
@@ -155,3 +157,7 @@ if(NOT KVAF_ENABLE_AIV_BATCH_GET)
     ${PROJECT_SOURCE_DIR}/common/include)
   target_compile_definitions(kvaf_sequential_host_compile_check PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
 endif()
+
+add_executable(kvaf_runtime_batch_get_contract_test runtime_batch_get_contract_test.cc)
+target_link_libraries(kvaf_runtime_batch_get_contract_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_runtime_batch_get_contract_test COMMAND kvaf_runtime_batch_get_contract_test)

@@ -20,7 +20,7 @@ SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
-RUN_LABEL = "cpu_chunk_optimized"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
+RUN_LABEL = "shard_ready_pipeline"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
 
 import csv
@@ -47,13 +47,18 @@ STAGE_BOUNDARIES = (
     ("finalize", "read_done_cycle", "kernel_finish_cycle"),
     ("total", "kernel_start_cycle", "kernel_finish_cycle"),
 )
+CALL_HOST_FIELDS = tuple("call_" + phase + "_ns" for phase in (
+    "binding", "tensor_metadata", "stream_resolve", "native", "runtime_validation",
+    "operator", "mutex_wait", "capture_query", "prior_drain", "input", "launch",
+    "status_copy_enqueue", "stream_sync", "status_validate", "output_acquire",
+))
 HOST_FIELDS = (
-    "prepare_ns", "launch_ns", "status_enqueue_ns", "wait_ns", "finish_ns", "total_ns",
+    "prepare_ns", "launch_ns", "status_enqueue_ns", "wait_ns", "finish_ns", "total_ns", *CALL_HOST_FIELDS,
 )
 COUNTERS = (
     "data_wrs", "ack_queries", "data_wqebbs", "data_doorbells",
     "data_cq_wait_cycles", "read_build_cycles", "ready_queries", "ready_wait_cycles",
-    "pipeline_chunk_bytes", "first_read_ready_bytes",
+    "pipeline_chunk_bytes", "pipeline_shards", "first_read_ready_bytes",
 )
 PIPELINE_EVENTS = ("first_ready_cycle", "first_read_submit_cycle")
 
@@ -95,6 +100,9 @@ def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
 def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
     configured_chunk_bytes()
+    for name in ("KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_GATHER_TRUSTED_INPUTS"):
+        if (os.environ.get(name, "1") or "1") not in ("0", "1"):
+            raise ValueError(f"{name} must be 0 or 1")
     positive = {
         "TOKEN_BYTES": TOKEN_BYTES, "REQUEST_COUNT": REQUEST_COUNT,
         "TABLE_CAPACITY": TABLE_CAPACITY,
@@ -276,7 +284,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -290,6 +298,8 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "coalesce_sges": int(os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES", "0") or "0"),
         "configured_chunk_bytes": configured_chunk_bytes(),
+        "configured_shard_pipeline": int(os.environ.get("KVAF_AIV_GATHER_SHARD_PIPELINE", "1") or "1"),
+        "trusted_gather_inputs": int(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1"),
         "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
@@ -391,11 +401,13 @@ def export_csv_results(
     stage_time_columns = [name + "_us" for name in stages if name != "total"]
     summary_core_columns = [field for field in core_columns
                             if field not in (*stage_cycle_columns, *stage_time_columns, "total_us")]
+    base_host_columns = [field for field in host_columns if not field.startswith("call_")]
+    call_host_columns = [field for field in host_columns if field.startswith("call_")]
     outputs = (
         ("summary", ["row_kind", "profile",
                      "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
-                     *host_columns, *stage_time_columns, *stage_cycle_columns, "sampling_status", "core",
-                     "error_type", "error_message", *summary_core_columns], summary),
+                     *base_host_columns, *stage_time_columns, *stage_cycle_columns, "sampling_status", "core",
+                     "error_type", "error_message", *call_host_columns, *summary_core_columns], summary),
         ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps"], e2e_rows),
         ("profile_host", ["sample_index", "profile", "sequence", "call_e2e_us", *host_columns], host_rows),
         ("profile_core", ["sample_index", "profile", "sequence", "core", *core_columns], core_rows),
@@ -471,6 +483,7 @@ def main() -> int:
         npu_eids=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
         aiv_batch_get_mode="gather_read", aiv_gather_sgl_size=GATHER_SGL_SIZE,
         batch_get_max_inflight_total=0,
+        trusted_gather_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1",
     )
     metadata = csv_metadata(cores, device_id, kernel, put_kernel)
     layout = metadata["output_layout"]

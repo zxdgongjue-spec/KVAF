@@ -98,7 +98,7 @@ struct GatherBatchGetCoreProfile {
   std::uint64_t ack_queries{}, data_wqebbs{}, data_doorbells{};
   std::uint64_t data_cq_wait_cycles{}, read_build_cycles{};
   std::uint64_t first_ready_cycle{}, first_read_submit_cycle{}, first_read_ready_bytes{};
-  std::uint64_t ready_queries{}, ready_wait_cycles{}, pipeline_chunk_bytes{};
+  std::uint64_t ready_queries{}, ready_wait_cycles{}, pipeline_chunk_bytes{}, pipeline_shards{};
 };
 
 struct GatherBatchGetProfile {

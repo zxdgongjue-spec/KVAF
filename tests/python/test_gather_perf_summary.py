@@ -415,7 +415,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         self.assertEqual(metadata["run_directory"], "20261031_093235-cores3-token-bytes656-request-count1")
         self.assertEqual(metadata["started_at_local"], "2026-10-31T09:32:35+08:00")
         self.assertEqual(metadata["timezone"], "Asia/Shanghai")
-        self.assertEqual(metadata["schema_version"], 4)
+        self.assertEqual(metadata["schema_version"], 5)
 
     def test_csv_rejects_partial_or_invalid_profile_batches(self):
         with tempfile.TemporaryDirectory() as directory:

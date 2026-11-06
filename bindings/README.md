@@ -1,5 +1,10 @@
 # Python Bindings
 
+`gather_read` 的 Python 构造参数 `trusted_gather_inputs=True` 默认启用最小元数据
+读取和 Runtime/Host 快路径；调用方保证输入 Tensor 格式、容量和生命周期，且仅使用
+eager。设置为 `False` 保留完整布局检查；其他模式保持原行为。指针、容量和 stream
+handle 每轮重新读取。部署与性能对照见 [gather 分片流水](../docs/aiv_gather_shard_pipeline.md)。
+
 本目录是 KVAF C++ 核心与 Python 之间的可选绑定层，使用 Pybind11 构建 `_kvaf` 原生扩展。
 
 `include/` 存放 Binding 内部共享头，`src/` 存放扩展实现；Python 包与构建后导入校验脚本保留在本目录。

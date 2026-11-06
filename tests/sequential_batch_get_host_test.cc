@@ -20,7 +20,8 @@ bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
 uint32_t last_coalesce_sges{};
-uint32_t last_pipeline_chunk_bytes{};
+uint32_t last_pipeline_chunk_bytes{}, last_pipeline_shards{};
+uint32_t capture_queries{};
 bool allow_queued_launches{};
 int async_memsets{}, status_copies{}, stream_syncs{};
 uint64_t kernel_result{};
@@ -49,6 +50,7 @@ int aclrtSynchronizeStream(aclrtStream) {
   for (auto& f : work) f(); work.clear(); return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* s, aclmdlRI*) {
+  ++capture_queries;
   *s = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
 uint32_t loaded_mode{};
@@ -92,6 +94,7 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   assert(loaded_mode == KVAF_SEQ_GATHER);
   last_coalesce_sges = a->coalesce_sges;
   last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
+  last_pipeline_shards = a->pipeline_shards;
   if (a->probe) assert(!last_pipeline_chunk_bytes);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
@@ -622,5 +625,27 @@ int main() {
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
   profile_fault = 0;
+  // Trusted gather bypasses capture/Input revalidation, while retaining status
+  // handling, stream-switch fences and the existing resource lifecycle.
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    const auto before = capture_queries;
+    exec.execution.trusted_npu_request = true;
+    exec.execution.synchronize = true;
+    assert(owner->Execute(exec).ok() && capture_queries == before);
+    exec.execution.trusted_npu_request = false;
+    assert(owner->Execute(exec).ok() && capture_queries == before + 1);
+    assert(owner->Shutdown().ok() && !refs && !allocations);
+  }
+  for (const char* setting : {"0", "1"}) {
+    setenv("KVAF_AIV_GATHER_SHARD_PIPELINE", setting, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
+    assert(owner->Execute(exec).ok() && last_pipeline_shards == unsigned(*setting - '0'));
+    assert(owner->Shutdown().ok() && !refs && !allocations);
+  }
+  setenv("KVAF_AIV_GATHER_SHARD_PIPELINE", "invalid", 1);
+  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
+  unsetenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
   std::cout << "sequential Host lifecycle: PASS\n";
 }

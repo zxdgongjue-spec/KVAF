@@ -1,5 +1,9 @@
 # CPU gather 与 payload READ 分块流水
 
+当前默认已升级为 [GDR3 独立分片进度与 V5 调用快路径](aiv_gather_shard_pipeline.md)。
+以下描述保留为 `KVAF_AIV_GATHER_SHARD_PIPELINE=0` 的连续前缀对照实现；
+部署请按新文档同时更新 CPU 服务与 NPU Host/Runtime/Python/kernel。
+
 当前 gather_read 默认使用每 lane 128 KiB ready 发布粒度，将 CPU gather 与 NIC
 payload READ 重叠。保留原有 AIV WQE/SQ 双 bank 流水、整批 staging、每 lane
 一个控制 Jetty 和一个数据 Jetty；清单仍完整生成和发布。不加入跨 batch

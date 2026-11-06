@@ -98,6 +98,9 @@ struct BatchFreeRequest {
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
+  // Caller guarantees contiguous, correctly typed NPU tensors and their lifetime.
+  // The gather fast path is eager only; storage and stream are read each call.
+  bool trusted_npu_request{false};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

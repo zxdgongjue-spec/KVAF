@@ -4,6 +4,21 @@
 
 namespace kvaf::sequential_detail {
 inline uint64_t Ptr(const void* p) { return reinterpret_cast<uint64_t>(p); }
+inline void FillInput(const BatchGetRequest& r, const AccessOperatorConfig& config,
+                      KvafExecuteBatchGetKernelArgs* a) {
+  const auto& table = r.device_access_table;
+  const auto count = r.indices.bytes / 4;
+  const auto entries = table.addresses.bytes / 8;
+  *a = {};
+  a->address_table = Ptr(table.addresses.data); a->valid_table = Ptr(table.valid.data);
+  a->indices = Ptr(r.indices.data); a->offsets = Ptr(r.offsets.data);
+  a->miss_count = Ptr(r.miss_count.data); a->output_indices = Ptr(r.output_indices.data);
+  a->output = Ptr(r.output.data); a->table_capacity = entries; a->request_capacity = count;
+  a->output_rows = r.output.bytes / r.output_block_bytes;
+  a->token_bytes = r.output_block_bytes; a->tokens_per_block = r.tokens_per_block;
+  a->block_count = config.npu_core_count; a->jettys_per_core = 2;
+  // Intentionally never copy the direct-read inflight budget into this ABI.
+}
 inline Status Input(const BatchGetExecRequest& exec, const AccessOperatorConfig& config,
              KvafExecuteBatchGetKernelArgs* a) {
   if (!exec.request || !exec.execution.stream) return Status::InvalidArgument("BatchGet needs request and stream");
@@ -25,15 +40,7 @@ inline Status Input(const BatchGetExecRequest& exec, const AccessOperatorConfig&
       r.output.bytes % r.output_block_bytes || r.output.bytes / r.output_block_bytes > UINT32_MAX ||
       Ptr(r.output.data) > UINT64_MAX - r.output.bytes)
     return Status::InvalidArgument("invalid sequential BatchGet Tensor layout/capacity");
-  *a = {};
-  a->address_table = Ptr(table.addresses.data); a->valid_table = Ptr(table.valid.data);
-  a->indices = Ptr(r.indices.data); a->offsets = Ptr(r.offsets.data);
-  a->miss_count = Ptr(r.miss_count.data); a->output_indices = Ptr(r.output_indices.data);
-  a->output = Ptr(r.output.data); a->table_capacity = entries; a->request_capacity = count;
-  a->output_rows = r.output.bytes / r.output_block_bytes;
-  a->token_bytes = r.output_block_bytes; a->tokens_per_block = r.tokens_per_block;
-  a->block_count = config.npu_core_count; a->jettys_per_core = 2;
-  // Intentionally never copy the direct-read inflight budget into this ABI.
+  FillInput(r, config, a);
   return Status::OK();
 }
 }

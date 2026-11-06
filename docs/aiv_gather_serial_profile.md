@@ -1,5 +1,9 @@
 # Gather 阶段计时与 AIV 内部流水
 
+当前默认使用 [GDR3 分片流水与 V5 调用快路径](aiv_gather_shard_pipeline.md)，
+args 仍为 240 B、profile 192 B；旧 V4 连续前缀模式保留为显式对照。
+Python/Host 分段计时和 CSV schema 5 的说明以新文档为准。
+
 当前版本已接通 [CPU chunk 与 payload READ 流水](aiv_gather_chunk_pipeline.md)，
 默认 128 KiB，Host/kernel 使用 V4 / args 240 B / profile 192 B。
 下文整批 ACK 后 READ 的计时说明和历史 V3 诊断记录，适用于
