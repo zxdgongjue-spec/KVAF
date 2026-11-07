@@ -14,12 +14,14 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu> [--transport urma|ubmem] [--build-dir DIR] [--jobs N]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
 npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
      installs pybind11 for the selected Python interpreter when necessary.
+     --transport ubmem builds local Host DDR Put/Get without UMDK/liburma.
+     UBmem owns its arena in the NPU worker; it does not use a CPU service.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -27,6 +29,7 @@ Environment overrides:
   KVAF_UMDK_BUILD_DIR  Build directory used when building bundled UMDK
   ASCEND_CANN_PACKAGE_PATH
                         CANN toolkit root for the NPU build
+  SOC_VERSION          Exact active SoC for UBmem kernels (for example Ascend950DT_9582)
   PYTHON               Python interpreter for the NPU binding (default: python3)
   KVAF_BUILD_JOBS      Parallel build jobs
 EOF
@@ -119,6 +122,10 @@ build_cpu() {
   [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DKVAF_TRANSPORT=urma \
+    -DKVAF_ENABLE_NPU=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
@@ -143,9 +150,17 @@ find_cann_root() {
 build_npu() {
   local build_dir="$1"
   local jobs="$2"
+  local transport="$3"
   local python_bin="${PYTHON:-python3}"
   local cann_root
   local pybind11_dir
+  local urma_enabled=OFF
+  local -a transport_args=("-DKVAF_TRANSPORT=$transport")
+  if [[ "$transport" == urma ]]; then urma_enabled=ON; fi
+  if [[ "$transport" == ubmem ]]; then
+    [[ -n "${SOC_VERSION:-}" ]] || die "SOC_VERSION must name the actual device SoC for UBmem kernels"
+    transport_args+=("-DSOC_VERSION=$SOC_VERSION")
+  fi
 
   require_command cmake
   require_command "$python_bin"
@@ -160,14 +175,23 @@ build_npu() {
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING=ON \
     -DKVAF_BUILD_PYTHON=ON \
-    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-    -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    "${transport_args[@]}" \
+    -DKVAF_ENABLE_NPU=ON \
+    -DKVAF_ENABLE_AIV_BATCH_GET="$urma_enabled" \
+    -DKVAF_ENABLE_AIV_BATCH_PUT="$urma_enabled" \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
+    -DPython_EXECUTABLE="$python_bin" \
     -Dpybind11_DIR="$pybind11_dir"
   cmake --build "$build_dir" --parallel "$jobs"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
-  echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
-  echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  if [[ "$transport" == urma ]]; then
+    echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
+    echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  else
+    echo "[KVAF_BUILD] UBmem BatchGet kernel: $build_dir/bin/kvaf_ubmem_batch_get.o"
+    echo "[KVAF_BUILD] UBmem BatchPut kernel: $build_dir/bin/kvaf_ubmem_batch_put.o"
+  fi
 }
 
 mode="${1:-}"
@@ -177,10 +201,16 @@ case "$mode" in
   *) usage >&2; exit 2 ;;
 esac
 
-build_dir="$KVAF_ROOT/build-$mode"
+build_dir=""
+transport=urma
 jobs="$(default_jobs)"
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --transport)
+      [[ $# -ge 2 && ( "$2" == urma || "$2" == ubmem ) ]] || die "--transport requires urma or ubmem"
+      transport="$2"
+      shift 2
+      ;;
     --build-dir)
       [[ $# -ge 2 ]] || die "--build-dir requires a value"
       build_dir="$2"
@@ -196,8 +226,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
+if [[ -z "$build_dir" ]]; then
+  if [[ "$transport" == urma ]]; then
+    build_dir="$KVAF_ROOT/build-$mode"
+  else
+    build_dir="$KVAF_ROOT/build-ubmem-$mode"
+  fi
+fi
 if [[ "$mode" == cpu ]]; then
+  [[ "$transport" == urma ]] || die "UBmem uses a worker-local Host DDR arena; build with 'npu --transport ubmem', not a CPU service"
   build_cpu "$build_dir" "$jobs"
 else
-  build_npu "$build_dir" "$jobs"
+  build_npu "$build_dir" "$jobs" "$transport"
 fi

@@ -21,15 +21,30 @@
 #include <utility>
 #include <vector>
 
-#include "batch_get_abi.h"
+#ifndef KVAF_ENABLE_URMA
+#define KVAF_ENABLE_URMA 1
+#endif
+#ifndef KVAF_ENABLE_UBMEM
+#define KVAF_ENABLE_UBMEM 0
+#endif
+
 #include "access_operator.h"
-#include "peer_link.h"
 #include "meta_manager.h"
+#if KVAF_ENABLE_URMA
+#include "batch_get_abi.h"
+#include "direct_hccp/direct_hccp_session.h"
+#include "peer_link.h"
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
+#endif
+#if KVAF_ENABLE_UBMEM
+#include "ubmem/host_arena.h"
+#include "ubmem/access_operator.h"
+#endif
 
 namespace kvaf {
 namespace {
+#if KVAF_ENABLE_URMA
 
 Status Internal(std::string message) { return Status::Internal(std::move(message)); }
 
@@ -79,6 +94,8 @@ struct NpuLocalEidCandidate {
 constexpr char kUbDevIdPath[] = "/proc/asdrv_ub/dev_id";
 constexpr char kUbPairInfoPath[] = "/proc/asdrv_ub/pair_info";
 constexpr char kUbSelectorLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
+// Same PID-scoped HDC service used by the BatchGet and BatchPut transports.
+constexpr std::uint32_t kPidHdcType = 18U;
 
 std::string EidToHex(const std::array<std::uint8_t, peer::kEidBytes>& eid) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -423,6 +440,7 @@ std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
   return std::min(ddr_bytes / slot_size, desired_rows);
 }
 
+#endif
 }  // namespace
 
 struct NpuRuntime::Impl {
@@ -440,55 +458,163 @@ struct NpuRuntime::Impl {
 
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
-    access_operator = std::make_unique<DefaultAccessOperator>(config);
+    if (options.transport == Transport::kUbmem) {
+#if KVAF_ENABLE_UBMEM
+      access_operator = CreateUbmemAccessOperator(config);
+#else
+      throw std::invalid_argument("KVAF was built without UBmem support");
+#endif
+    } else {
+#if KVAF_ENABLE_URMA
+      auto op = std::make_unique<DefaultAccessOperator>(config);
+      urma_operator = op.get();
+      access_operator = std::move(op);
+#else
+      throw std::invalid_argument("KVAF was built without URMA support");
+#endif
+    }
     runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
   }
 
   void ReleaseProbe() {
+#if KVAF_ENABLE_URMA
     bandwidth_probe.reset();
     if (probe_buffer != nullptr) {
       (void)aclrtFree(probe_buffer);
       probe_buffer = nullptr;
     }
+#endif
   }
 
   NpuRuntimeOptions options;
   AccessOperatorConfig config;
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
+  std::unique_ptr<AccessOperator> access_operator;
+  std::unique_ptr<RuntimeCore> runtime_core;
+#if KVAF_ENABLE_UBMEM
+  UbmemFusedContext ubmem_fused;
+  void* ubmem_fused_stream{nullptr};
+  std::uint64_t next_ubmem_lease{1};
+  std::vector<AccessTableHandle> ubmem_fused_tables;
+
+  Status CheckUbmemDevice() const {
+    std::int32_t current = -1;
+    const aclError error = aclrtGetDevice(&current);
+    if (error != ACL_SUCCESS || current < 0 ||
+        static_cast<std::uint32_t>(current) != options.device_id) {
+      return Status::InvalidState("UBmem fused context must run on its Runtime device");
+    }
+    return Status::OK();
+  }
+
+  Status CheckUbmemOwner(const UbmemFusedContext& owner) const {
+    const Status ready = runtime_core->CheckFusedReadLease();
+    if (!ready.ok()) return ready;
+    const auto& live = ubmem_fused;
+    if (live.lease_id == 0) return Status::NotFound("Runtime has no UBmem fused lease");
+    if (owner.abi_version != live.abi_version || owner.lease_id != live.lease_id ||
+        owner.device_id != live.device_id || owner.region_base != live.region_base ||
+        owner.region_bytes != live.region_bytes || owner.slot_bytes != live.slot_bytes ||
+        owner.output_address != live.output_address || owner.output_bytes != live.output_bytes ||
+        owner.token_bytes != live.token_bytes || owner.tokens_per_block != live.tokens_per_block) {
+      return Status::InvalidArgument("pass the original unmodified UBmem fused owner context");
+    }
+    return CheckUbmemDevice();
+  }
+
+  Status CheckUbmemOutput(void* output, std::uint64_t bytes) const {
+    const auto base = reinterpret_cast<std::uintptr_t>(output);
+    const auto token_bytes = options.batch_get_token_bytes;
+    if (base == 0 || base % 32 != 0 || bytes == 0 ||
+        bytes > std::numeric_limits<std::uintptr_t>::max() - base ||
+        (token_bytes != 656 && token_bytes != 2624) || bytes % token_bytes != 0) {
+      return Status::InvalidArgument("UBmem fused output requires aligned complete 656/2624-byte rows");
+    }
+    return Status::OK();
+  }
+
+  Status FenceUbmemReads() {
+    Status status = CheckUbmemDevice();
+    if (!status.ok()) return status;
+    const aclError error = aclrtSynchronizeDevice();
+    if (error != ACL_SUCCESS) {
+      return Status::CompletionUnknown("UBmem fused device fence failed; retain arena, output, tables and graphs; ACL=" +
+                                        std::to_string(error));
+    }
+    return Status::OK();
+  }
+#endif
+#if KVAF_ENABLE_URMA
   PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
-  std::unique_ptr<DefaultAccessOperator> access_operator;
-  std::unique_ptr<RuntimeCore> runtime_core;
+  DefaultAccessOperator* urma_operator{nullptr};
   void* probe_buffer{nullptr};
   std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
+#endif
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-  if (impl_->config.batch_get_kernel_object_path.empty() || impl_->options.npu_core_count == 0U ||
-      impl_->options.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
-      impl_->options.jettys_per_core == 0U ||
-      impl_->options.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-      (impl_->options.batch_get_max_inflight_total != 0U &&
-       impl_->options.batch_get_max_inflight_total < 2U * impl_->options.npu_core_count) ||
-      impl_->options.batch_get_token_bytes == 0U ||
-      impl_->options.batch_get_tokens_per_block == 0U ||
-      (impl_->options.adaptive_ub_device &&
-       !impl_->options.peer_ub_device.empty()) ||
-      (impl_->options.adaptive_ub_device &&
-       (impl_->options.adaptive_ub_miss_count == 0U ||
-        impl_->options.adaptive_ub_miss_count >
-            static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
+  const auto& o = impl_->options;
+  if (o.batch_get_kernel_object_path.empty() || o.npu_core_count == 0U ||
+      o.batch_get_token_bytes == 0U || o.batch_get_tokens_per_block == 0U ||
+      (o.transport != Transport::kUrma && o.transport != Transport::kUbmem)) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
-  if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
+  if (o.ubmem_page_mode != UbmemPageMode::kHuge &&
+      o.ubmem_page_mode != UbmemPageMode::kBase && o.ubmem_page_mode != UbmemPageMode::kThp) {
+    throw std::invalid_argument("UBmem page mode must be huge, base, or thp");
+  }
+  if (o.ubmem_numa_node < -1 || o.ubmem_numa_node > 4095 ||
+      (o.ubmem_numa_node >= 0 &&
+       (o.transport != Transport::kUbmem || o.ubmem_page_mode != UbmemPageMode::kThp))) {
+    throw std::invalid_argument("ubmem_numa_node requires UBmem THP and must be -1 or 0..4095");
+  }
+  if (o.transport == Transport::kUrma) {
+    if (o.ubmem_page_mode != UbmemPageMode::kHuge) {
+      throw std::invalid_argument("non-default ubmem_page_mode requires transport=ubmem");
+    }
+#if KVAF_ENABLE_URMA
+    if (o.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES || o.jettys_per_core == 0U ||
+        o.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
+        (o.batch_get_max_inflight_total != 0U && o.batch_get_max_inflight_total < 2U * o.npu_core_count) ||
+        (o.adaptive_ub_device && !o.peer_ub_device.empty()) ||
+        (o.adaptive_ub_device && (o.adaptive_ub_miss_count == 0U ||
+         o.adaptive_ub_miss_count > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())))) {
+      throw std::invalid_argument("invalid URMA Runtime configuration");
+    }
+#else
+    throw std::invalid_argument("KVAF was built without URMA support; select transport=ubmem");
+#endif
+  } else {
+#if KVAF_ENABLE_UBMEM
+    if (o.batch_put_kernel_object_path.empty() || o.reuse_device_ra || o.adaptive_ub_device ||
+        !o.npu_eids.empty() || !o.peer_ub_device.empty() || !o.adaptive_peer_ub_devices.empty()) {
+      throw std::invalid_argument("UBmem requires its Put kernel and does not accept URMA routing options");
+    }
+#else
+    throw std::invalid_argument("KVAF was built without UBmem support");
+#endif
+  }
+  if (aclrtSetDevice(o.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
+#if KVAF_ENABLE_UBMEM
+  if (o.transport == Transport::kUbmem) {
+    impl_->allocator = CreateUbmemDdrMemoryAllocator(o.device_id, o.ubmem_page_mode, o.ubmem_numa_node);
+    impl_->CreateCore();
+  }
+#endif
 }
 
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
-    (void)Shutdown();
+    if (!Shutdown().ok()) {
+      std::fprintf(stderr, "[KVAF_AIV] FUSED_RUNTIME_RETAINED_ON_DESTRUCTION "
+                           "reason=teardown_not_safe\n");
+      (void)impl_.release();
+      return;
+    }
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     impl_->ReleaseProbe();
@@ -496,6 +622,10 @@ NpuRuntime::~NpuRuntime() {
 }
 
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("UBmem uses worker-owned local DDR and has no peer link");
+  }
+#if KVAF_ENABLE_URMA
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
@@ -511,9 +641,16 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   impl_->access_operator.reset();
   impl_->CreateCore();
   return Status::OK();
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
 }
 
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return impl_->runtime_core->Initialize(RuntimeInitRequest{ddr_bytes, slot_size, DeviceKind::kCpu});
+  }
+#if KVAF_ENABLE_URMA
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
   if (impl_->peer_link == nullptr || impl_->peer_allocator == nullptr) {
@@ -521,6 +658,20 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
+  }
+  if (impl_->options.reuse_device_ra) {
+    std::uint32_t physical_device_id = 0U;
+    if (!ResolvePhysicalDeviceId(impl_->options.device_id, &physical_device_id)) {
+      return Internal("cannot resolve physical NPU for caller-initialized device RA");
+    }
+    direct_hccp::DirectHccpSession* session = nullptr;
+    if (!direct_hccp::AcquireDirectHccpSession(
+            physical_device_id, kPidHdcType, &session, true)) {
+      return Internal("failed to borrow caller-initialized device RA");
+    }
+    // The shared session remains cached at refs=0 for the process lifetime.
+    // Every candidate's BatchGet/BatchPut transport acquires this same session.
+    direct_hccp::ReleaseDirectHccpSession(session);
   }
 
   std::uint32_t candidate_count = 0U;
@@ -677,7 +828,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       if (last.ok() && measure) {
         impl_->bandwidth_probe =
             std::make_unique<detail::StartupBandwidthProbe>(probe_config);
-        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->access_operator, cycles);
+        last = impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->urma_operator, cycles);
         if (last.ok()) {
           std::fprintf(stderr,
                        "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
@@ -806,20 +957,24 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   return detail::SelectStartupDeviceCandidate(
       device_candidates, initialize_candidate, cleanup);
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
 }
 
 RuntimeCore& NpuRuntime::core() {
   if (impl_->runtime_core == nullptr) {
-    throw std::logic_error("NpuRuntime requires LinkTo before core access");
+    throw std::logic_error("Runtime core is unavailable; URMA requires LinkTo first");
   }
   return *impl_->runtime_core;
 }
 const RuntimeCore& NpuRuntime::core() const {
   if (impl_->runtime_core == nullptr) {
-    throw std::logic_error("NpuRuntime requires LinkTo before core access");
+    throw std::logic_error("Runtime core is unavailable; URMA requires LinkTo first");
   }
   return *impl_->runtime_core;
 }
+Transport NpuRuntime::transport() const { return impl_->options.transport; }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
@@ -834,27 +989,213 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
 }
 
 Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("this interface requires URMA; UBmem uses a separate completion/lease ABI");
+  }
+#if KVAF_ENABLE_URMA
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled);
+  return impl_->urma_operator->SetBatchGetKernelProfiling(enabled);
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("this interface requires URMA; UBmem uses a separate completion/lease ABI");
+  }
+#if KVAF_ENABLE_URMA
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
-  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
+  return impl_->urma_operator->CopyBatchGetKernelProfiles(profiles);
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }
 
+Status NpuRuntime::AcquireFusedBatchGetContext(
+    void* output, std::uint64_t output_bytes, FusedBatchGetContext* context) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("this interface requires URMA; UBmem uses a separate completion/lease ABI");
+  }
+#if KVAF_ENABLE_URMA
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("initialize the linked Runtime before acquiring a fused context");
+  }
+  return impl_->urma_operator->AcquireFusedBatchGetContext(
+      output, output_bytes, impl_->options.batch_get_token_bytes,
+      impl_->options.batch_get_tokens_per_block, context);
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
+}
+
+Status NpuRuntime::RegisterFusedBatchGetOutput(
+    const FusedBatchGetContext& owner, void* output,
+    std::uint64_t output_bytes, FusedBatchGetContext* view) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("this interface requires URMA; UBmem uses a separate completion/lease ABI");
+  }
+#if KVAF_ENABLE_URMA
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("Runtime has no fused BatchGet context");
+  }
+  return impl_->urma_operator->RegisterFusedBatchGetOutput(
+      owner, output, output_bytes, view);
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
+}
+
+Status NpuRuntime::ReleaseFusedBatchGetContext(
+    const FusedBatchGetContext& context, void* stream) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("this interface requires URMA; UBmem uses a separate completion/lease ABI");
+  }
+#if KVAF_ENABLE_URMA
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("Runtime has no fused BatchGet context");
+  }
+  return impl_->urma_operator->ReleaseFusedBatchGetContext(context, stream);
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
+}
+
+Status NpuRuntime::AcquireUbmemFusedContext(
+    void* output, std::uint64_t output_bytes, void* stream,
+    UbmemFusedContext* context) {
+  if (impl_->options.transport != Transport::kUbmem) {
+    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
+  }
+#if KVAF_ENABLE_UBMEM
+  if (context == nullptr || stream == nullptr) {
+    return Status::InvalidArgument("UBmem fused acquire requires output context and caller stream");
+  }
+  *context = {};
+  if (!initialized()) return Status::NotInitialized("initialize Runtime before acquiring a UBmem fused lease");
+  if (impl_->ubmem_fused.lease_id != 0) return Status::Busy("Runtime already has a UBmem fused lease");
+  Status status = impl_->CheckUbmemDevice();
+  if (!status.ok()) return status;
+  status = impl_->CheckUbmemOutput(output, output_bytes);
+  if (!status.ok()) return status;
+  if (impl_->next_ubmem_lease == 0) return Status::InvalidState("UBmem fused lease ID space exhausted");
+  const auto& region = core().remote_region();
+  const std::uint64_t block_bytes =
+      static_cast<std::uint64_t>(impl_->options.batch_get_token_bytes) *
+      impl_->options.batch_get_tokens_per_block;
+  if (region.slot_size < block_bytes) {
+    return Status::InvalidArgument("UBmem fused block layout exceeds the DDR slot size");
+  }
+  status = core().AcquireFusedReadLease([state = impl_.get()] {
+    return state->FenceUbmemReads();
+  });
+  if (!status.ok()) return status;
+  impl_->ubmem_fused = UbmemFusedContext{
+      1, impl_->options.device_id, impl_->next_ubmem_lease++,
+      region.base, region.length, region.slot_size,
+      reinterpret_cast<std::uintptr_t>(output), output_bytes,
+      impl_->options.batch_get_token_bytes, impl_->options.batch_get_tokens_per_block};
+  impl_->ubmem_fused_stream = stream;
+  // Drain previous ordinary operations once. A failed fence deliberately keeps
+  // the lease and native owner intact even though acquire cannot return it.
+  status = core().FenceFusedReads();
+  if (!status.ok()) return status;
+  *context = impl_->ubmem_fused;
+  return Status::OK();
+#else
+  return Status::NotImplemented("KVAF was built without UBmem support");
+#endif
+}
+
+Status NpuRuntime::RegisterUbmemFusedOutput(
+    const UbmemFusedContext& owner, void* output, std::uint64_t output_bytes,
+    UbmemFusedContext* view) {
+  if (impl_->options.transport != Transport::kUbmem) {
+    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
+  }
+#if KVAF_ENABLE_UBMEM
+  if (view == nullptr) return Status::InvalidArgument("UBmem fused output view must not be null");
+  *view = {};
+  Status status = impl_->CheckUbmemOwner(owner);
+  if (!status.ok()) return status;
+  status = impl_->CheckUbmemOutput(output, output_bytes);
+  if (!status.ok()) return status;
+  *view = owner;
+  view->output_address = reinterpret_cast<std::uintptr_t>(output);
+  view->output_bytes = output_bytes;
+  return Status::OK();
+#else
+  return Status::NotImplemented("KVAF was built without UBmem support");
+#endif
+}
+
+Status NpuRuntime::RegisterUbmemFusedAccessTable(
+    const UbmemFusedContext& owner, const AccessTableHandle& table) {
+  if (impl_->options.transport != Transport::kUbmem) {
+    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
+  }
+#if KVAF_ENABLE_UBMEM
+  Status status = impl_->CheckUbmemOwner(owner);
+  if (!status.ok()) return status;
+  for (const auto& registered : impl_->ubmem_fused_tables) {
+    if (registered.opaque == table.opaque) return Status::OK();
+  }
+  // Reserve bookkeeping before taking the extra reader, so host allocation
+  // failure cannot strand a pin absent from the release list.
+  impl_->ubmem_fused_tables.push_back(table);
+  status = core().RetainFusedAccessTable(
+      table, static_cast<std::uint64_t>(owner.token_bytes) * owner.tokens_per_block);
+  if (!status.ok()) impl_->ubmem_fused_tables.pop_back();
+  return status;
+#else
+  return Status::NotImplemented("KVAF was built without UBmem support");
+#endif
+}
+
+Status NpuRuntime::ReleaseUbmemFusedContext(
+    const UbmemFusedContext& owner, void* stream) {
+  if (impl_->options.transport != Transport::kUbmem) {
+    return Status::NotImplemented("UBmem fused context requires transport=ubmem");
+  }
+#if KVAF_ENABLE_UBMEM
+  Status status = impl_->CheckUbmemOwner(owner);
+  if (!status.ok()) return status;
+  if (stream == nullptr || stream != impl_->ubmem_fused_stream) {
+    return Status::InvalidArgument("release UBmem fused context with its acquire stream");
+  }
+  status = core().FenceFusedReads();
+  if (!status.ok()) return status;
+  while (!impl_->ubmem_fused_tables.empty()) {
+    status = core().ReleaseFusedAccessTable(impl_->ubmem_fused_tables.back());
+    if (!status.ok()) return status;
+    impl_->ubmem_fused_tables.pop_back();
+  }
+  status = core().ReleaseFusedReadLease();
+  if (!status.ok()) return status;
+  impl_->ubmem_fused = {};
+  impl_->ubmem_fused_stream = nullptr;
+  return Status::OK();
+#else
+  return Status::NotImplemented("KVAF was built without UBmem support");
+#endif
+}
+
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
+  if (impl_->options.transport == Transport::kUbmem) {
+    return Status::NotImplemented("UBmem uses worker-owned local DDR and has no peer link");
+  }
+#if KVAF_ENABLE_URMA
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
   if (!shutdown.ok()) return shutdown;
@@ -867,6 +1208,9 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   impl_->runtime_core.reset();
   impl_->access_operator.reset();
   return Status::OK();
+#else
+  return Status::NotImplemented("URMA support is not built");
+#endif
 }
 
 Status NpuRuntime::ServeConnection(int) {
@@ -878,6 +1222,7 @@ Status NpuRuntime::Shutdown() {
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->initialized()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
+  if (!status.ok()) return status;
   impl_->ReleaseProbe();
   return status;
 }
@@ -887,7 +1232,8 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false, true};
+  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty(), false,
+                             impl_->options.transport == Transport::kUrma};
 }
 
 }  // namespace kvaf

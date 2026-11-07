@@ -13,6 +13,7 @@
 #define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
 #undef __attribute__
+using namespace kvaf_device;
 
 #define CHECK(condition) do { if (!(condition)) { \
   std::cerr << "line " << __LINE__ << ": " #condition "\n"; std::exit(1); \
@@ -204,6 +205,24 @@ struct Fixture {
 };
 
 int main() {
+  // A fused caller owns a descriptor subrange, not the whole prefix. The
+  // standalone entry point below still exercises the original partitioning.
+  {
+    Fixture f(4096, 1, 2, 2048);
+    kvaf_device::KvafBatchGetDevice(f.args, 0, 500, 205);
+    CHECK(f.statuses[0].result == 0);
+    for (uint32_t i = 0; i < f.capacity; ++i) {
+      for (uint32_t byte = 0; byte < 16; ++byte) {
+        CHECK(f.output[f.rows[i] * 16 + byte] ==
+              (i >= 500 && i < 705 ? f.remote[f.indices[i] * 16 + byte] : 0));
+      }
+    }
+    const auto posts = aiv_model::doorbells;
+    kvaf_device::KvafBatchGetDevice(f.args, 0, 4090, 205);
+    CHECK(f.statuses[0].result == kInvalidArgs);
+    CHECK(aiv_model::doorbells == posts);
+  }
+
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
                            {1, 16, 0}}) {

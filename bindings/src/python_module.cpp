@@ -16,7 +16,7 @@
 #include "meta_manager.h"
 #include "runtime.h"
 
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#if KVAF_ENABLE_NPU
 #include "acl_graph_python.h"
 #include "npu_python_runtime.h"
 #endif
@@ -389,7 +389,7 @@ PYBIND11_MODULE(_kvaf, m) {
   m.def_submodule("meta_manager");
   m.def_submodule("access_operator");
 
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#if KVAF_ENABLE_NPU
   kvaf::BindNpuPythonRuntime(m);
   kvaf::BindAclGraph(m);
 #endif

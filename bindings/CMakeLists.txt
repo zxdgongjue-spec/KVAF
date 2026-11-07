@@ -13,7 +13,7 @@ target_include_directories(_kvaf
 
 set(KVAF_PYTHON_BINDING_PREFLIGHT_ARGS)
 
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_NPU)
   target_sources(_kvaf PRIVATE
     src/acl_python_utils.cc
     src/acl_graph_python.cc
@@ -21,35 +21,31 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
   )
   target_link_libraries(_kvaf
     PRIVATE
-      kvaf_default_access_operator
       kvaf_npu_runtime
-      kvaf_execute_batch_get_host
       ascendcl
   )
-  if(KVAF_ENABLE_AIV_BATCH_PUT)
-    target_link_libraries(_kvaf PRIVATE kvaf_execute_batch_put_host)
-  endif()
   target_include_directories(_kvaf
     PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_get/include
       ${ASCEND_CANN_PACKAGE_PATH}/include
   )
   target_link_directories(_kvaf PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
   target_compile_definitions(_kvaf
     PRIVATE
-      KVAF_ENABLE_AIV_BATCH_GET=1
+      KVAF_ENABLE_NPU=1
       _GLIBCXX_USE_CXX11_ABI=0
   )
   # _kvaf directly links the AIV host shared object. Keep its build-tree
   # location in the extension RPATH so PYTHONPATH=build/python is sufficient
   # for the direct Python integration test.
-  set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
-    "$<TARGET_FILE_DIR:kvaf_execute_batch_get_host>"
-  )
-  if(KVAF_ENABLE_AIV_BATCH_PUT)
+  if(KVAF_ENABLE_URMA)
+    target_link_libraries(_kvaf PRIVATE kvaf_execute_batch_get_host)
     set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
-      "$<TARGET_FILE_DIR:kvaf_execute_batch_put_host>"
-    )
+      "$<TARGET_FILE_DIR:kvaf_execute_batch_get_host>")
+    if(KVAF_ENABLE_AIV_BATCH_PUT)
+      target_link_libraries(_kvaf PRIVATE kvaf_execute_batch_put_host)
+      set_property(TARGET _kvaf APPEND PROPERTY BUILD_RPATH
+        "$<TARGET_FILE_DIR:kvaf_execute_batch_put_host>")
+    endif()
   endif()
   list(APPEND KVAF_PYTHON_BINDING_PREFLIGHT_ARGS --require-aiv)
 endif()

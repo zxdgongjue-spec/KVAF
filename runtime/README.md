@@ -341,3 +341,74 @@ Jetty 数量可通过
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
 这项控制面性能数据。
+# Local Host DDR through UBmem
+
+Build with `bash build.sh npu --transport ubmem`. This creates
+`build-ubmem-npu` and requires the matching A5 CANN 9.2 or later SDK; it does
+not download UMDK or build a CPU service. The default build remains URMA.
+
+Construct Python `NpuRuntime` with `transport="ubmem"` and the
+`kvaf_ubmem_batch_get.o` / `kvaf_ubmem_batch_put.o` paths. Call `initialize`
+directly: each NPU worker owns its local Host DDR mapping and existing
+MetaManager. UBmem does not use `link_to`. Its allocator, data plane, and
+Python bindings must all come from the same build directory.
+
+`ubmem_page_mode="huge"` preserves the default `ACL_DDR_MEM_P2P_HUGE` policy and
+VA page flag 1. Set `ubmem_page_mode="base"` explicitly for
+`ACL_DDR_MEM_P2P_NORMAL` physical pages with VA page flag 0. Both modes query
+their own minimum allocation granularity and round only the backing allocation;
+the requested byte capacity and slot layout remain unchanged. Neither mode
+silently falls back to the other. `UBMEM_ARENA_ALLOC` logs the selected mode,
+requested/mapped sizes, granularity, and NUMA policy before allocation. The
+NUMA ID remains -1 (driver selection); page mode does not select a NUMA node.
+Allocation granularity is not evidence of the physical or NPU translation page
+size. The C++ equivalent is `NpuRuntimeOptions.ubmem_page_mode`, with
+`UbmemPageMode::kHuge` or `UbmemPageMode::kBase`. Base mode requires the UBmem
+transport and a driver that supports Host NUMA normal-page P2P mappings.
+
+`ubmem_page_mode="thp"` (`UbmemPageMode::kThp`) instead uses Linux Host memory:
+2 MiB aligned `posix_memalign`, `MADV_HUGEPAGE`, and prefaulting the complete
+2 MiB rounded backing allocation. This matches the URMA CPU allocator's THP
+policy; logical capacity and slots stay unchanged. NUMA placement follows the
+worker process policy, which may differ from a separately bound URMA service.
+Before allocating, KVAF requires `aclrtHostMemMapCapabilities` to report AIV
+support. It then registers the Host allocation with `ACL_HOST_REG_MAPPED` only,
+as required by the A5 integration (adding `ACL_HOST_REG_PINNED` can return
+107000), and obtains the independent device address with
+`aclrtHostGetDevicePointer`. Neither page-mode fallback nor a CPU service is
+used. The target CANN/driver must support this mapping; a successful stub test
+does not establish device support.
+
+`UBMEM_THP_COVERAGE` records `/proc/self/smaps` before and after registration.
+`status=exact` means the entire allocation was measured; `partial` counts only
+complete VMAs inside it and cannot establish full-arena coverage. `unavailable`
+means no measurement could be obtained. `anon_huge_bytes=0` is reported as zero,
+including when registration removes earlier THP coverage. THP is a request to
+Linux, not a guarantee of huge pages or of an NPU page-table size. Release waits
+for device completion, unregisters the original Host pointer, then frees it;
+a failed wait or unregister retains the allocation instead of freeing live
+memory.
+
+Put accepts packed NPU bytes with offsets/lengths. It uses an AIV kernel to
+write mapped DDR and commits keys only after stream completion and device
+status validation. The first Put kernel uses one writer for correctness;
+its throughput is not a performance baseline. A transfer whose completion
+is unknown quarantines the Runtime and retains tensor, metadata, and arena
+ownership until process exit rather than recycling potentially live slots.
+
+Get supports 656- and 2624-byte rows, fixed-address graph capture/replay, and
+caller-owned NPU request/output buffers. As with the existing enqueue API,
+asynchronous success means submission, not a completed byte check. Callers
+retain their tensors and graphs until execution completes; use
+`synchronize=True` for immediate device-status validation outside capture.
+Invalid device requests are bounds checked, stop copying, and report through
+the synchronous status path. Destroy captured graphs before Runtime shutdown.
+
+The small device acceptance check is
+`tests/python/test_ubmem_runtime.py --build-dir build-ubmem-npu --device 0`.
+Add `--page-mode base` to exercise normal-page Put/Get, reuse, and graph replay.
+For a minimal THP device check, add `--page-mode thp --token-bytes 656`.
+The default token-width list remains `656 2624`.
+It requires `PYTHONPATH=build-ubmem-npu/python` and a real NPU. It does not use
+model weights. UBmem fused leases and KVIP LIFetch are a subsequent patch;
+the URMA fused-context interface deliberately rejects this backend.

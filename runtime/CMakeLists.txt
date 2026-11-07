@@ -26,20 +26,32 @@ target_link_libraries(kvaf_runtime
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_NPU)
   add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
   target_include_directories(kvaf_npu_runtime
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_get/include
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE kvaf_peer_link kvaf_default_access_operator
-            kvaf_execute_batch_get_host ascendcl ${CMAKE_DL_LIBS})
-  if(KVAF_ENABLE_AIV_BATCH_PUT)
-    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
+    PRIVATE ascendcl ${CMAKE_DL_LIBS})
+  target_compile_definitions(kvaf_npu_runtime PUBLIC
+    KVAF_ENABLE_URMA=${KVAF_ENABLE_URMA}
+    KVAF_ENABLE_UBMEM=${KVAF_ENABLE_UBMEM})
+  if(KVAF_ENABLE_URMA)
+    target_include_directories(kvaf_npu_runtime PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/demo/aiv_batch_get/include)
+    target_link_libraries(kvaf_npu_runtime PRIVATE
+      kvaf_peer_link kvaf_default_access_operator kvaf_direct_hccp_session
+      kvaf_execute_batch_get_host)
+    if(KVAF_ENABLE_AIV_BATCH_PUT)
+      target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
+    endif()
+  elseif(KVAF_ENABLE_UBMEM)
+    target_sources(kvaf_npu_runtime PRIVATE
+      src/ubmem/host_arena.cc src/ubmem/host_memory.cc)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_ubmem_access_operator)
   endif()
   target_link_directories(kvaf_npu_runtime PRIVATE ${ASCEND_CANN_PACKAGE_PATH}/lib64)
   target_compile_features(kvaf_npu_runtime PUBLIC cxx_std_17)

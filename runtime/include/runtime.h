@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -87,6 +88,18 @@ class RuntimeCore {
                             AccessTableView* view) const;
   Status ReleaseAccessTable(const AccessTableHandle& handle);
 
+  // External fused readers share the arena without owning an AccessOperator
+  // queue. Fence only at request retirement/release, never on every launch.
+  // The owner must stop submitting a retired request and invalidate its address
+  // table before BatchFree; a fence cannot prevent future graph replays.
+  Status AcquireFusedReadLease(std::function<Status()> fence);
+  Status CheckFusedReadLease() const;
+  Status FenceFusedReads();
+  Status ReleaseFusedReadLease();
+  Status RetainFusedAccessTable(const AccessTableHandle& handle,
+                                std::uint64_t required_block_bytes = 0);
+  Status ReleaseFusedAccessTable(const AccessTableHandle& handle);
+
   Status BatchGet(
       const BatchGetRequest& request,
       const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
@@ -105,6 +118,7 @@ class RuntimeCore {
     std::vector<Address> addresses;
     std::vector<std::uint64_t> lengths;
     std::vector<std::uint8_t> valid;
+    std::uint64_t fused_readers{0};
 
     // NPU BatchGet requires every valid lookup entry to match its configured
     // tokens_per_block * output_block_bytes layout. Compute the invariant once
@@ -119,6 +133,9 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   bool initialized_{false};
+  bool completion_unknown_{false};
+  bool teardown_started_{false};
+  std::function<Status()> fused_read_fence_;
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>

@@ -16,6 +16,9 @@ enum class StatusCode {
   kInvalidState,
   kOutOfMemory,
   kInternal,
+  // A device transfer was submitted but its completion cannot be established.
+  // Its memory and metadata must remain reserved until process teardown.
+  kCompletionUnknown,
 };
 
 class Status {
@@ -62,6 +65,10 @@ class Status {
 
   static Status Internal(std::string message) {
     return Error(StatusCode::kInternal, std::move(message));
+  }
+
+  static Status CompletionUnknown(std::string message) {
+    return Error(StatusCode::kCompletionUnknown, std::move(message));
   }
 
   bool ok() const { return code_ == StatusCode::kOk; }

@@ -3,8 +3,10 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -181,31 +183,70 @@ void CopyCpuUint64SequenceInto(const py::object& values, const char* name,
   }
 }
 
+// Shared identity has no Runtime back-reference. A surviving table keeps the
+// cookie alive, so allocator address reuse cannot impersonate another Runtime.
+struct AccessTableOwner {};
+
 class DeviceAccessTable final {
  public:
   DeviceAccessTable(AccessTableHandle source, py::object addresses,
-                    py::object valid)
-      : source_(source), addresses_(std::move(addresses)), valid_(std::move(valid)) {}
+                    py::object valid, std::shared_ptr<const AccessTableOwner> owner)
+      : source_(source), addresses_(std::move(addresses)), valid_(std::move(valid)),
+        owner_(std::move(owner)) {}
 
   const AccessTableHandle& source() const { return source_; }
   py::object addresses() const { return addresses_; }
   py::object valid() const { return valid_; }
+  bool OwnedBy(const std::shared_ptr<const AccessTableOwner>& owner) const {
+    return owner_ == owner;
+  }
 
  private:
   AccessTableHandle source_;
   py::object addresses_;
   py::object valid_;
+  std::shared_ptr<const AccessTableOwner> owner_;
 };
 
-aclrtStream ResolveStream(const py::object& stream) {
+py::object ResolveStreamOwner(const py::object& stream) {
   if (!stream.is_none()) {
-    return acl_python::StreamFromPython(stream);
+    return stream;
   }
   py::module_ torch = py::module_::import("torch");
   if (!py::hasattr(torch, "npu")) {
     throw std::runtime_error("torch.npu is unavailable for the default KVAF stream");
   }
-  return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
+  return torch.attr("npu").attr("current_stream")();
+}
+
+py::dict FusedContextDict(const FusedBatchGetContext& context) {
+  py::dict result;
+  result["lease_id"] = context.lease_id;
+  result["device_channel_entity"] = context.device_channel_entity;
+  result["device_queue_state"] = context.device_queue_state;
+  result["device_core_status"] = context.device_core_status;
+  result["output_address"] = context.output_address;
+  result["output_bytes"] = context.output_bytes;
+  result["worker_count"] = context.worker_count;
+  result["jettys_per_core"] = context.jettys_per_core;
+  result["token_bytes"] = context.token_bytes;
+  result["tokens_per_block"] = context.tokens_per_block;
+  return result;
+}
+
+py::dict UbmemFusedContextDict(const UbmemFusedContext& context) {
+  py::dict result;
+  result["abi_version"] = context.abi_version;
+  result["lease_id"] = context.lease_id;
+  result["device_id"] = context.device_id;
+  result["region_base"] = context.region_base;
+  result["region_bytes"] = context.region_bytes;
+  result["slot_bytes"] = context.slot_bytes;
+  result["output_address"] = context.output_address;
+  result["output_bytes"] = context.output_bytes;
+  result["token_bytes"] = context.token_bytes;
+  result["tokens_per_block"] = context.tokens_per_block;
+  return result;
 }
 
 class NpuPythonRuntime final {
@@ -221,22 +262,71 @@ class NpuPythonRuntime final {
                    std::uint32_t adaptive_ub_miss_count,
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
-                   std::uint32_t batch_get_max_inflight_total) {
+                   std::uint32_t batch_get_max_inflight_total,
+                   bool reuse_device_ra, const std::string& transport,
+                   const std::string& ubmem_page_mode, int ubmem_numa_node) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
+    if (transport == "urma") {
+      options.transport = Transport::kUrma;
+    } else if (transport == "ubmem") {
+      options.transport = Transport::kUbmem;
+    } else {
+      throw py::value_error("transport must be urma or ubmem");
+    }
+    if (ubmem_page_mode == "huge") {
+      options.ubmem_page_mode = UbmemPageMode::kHuge;
+    } else if (ubmem_page_mode == "base") {
+      options.ubmem_page_mode = UbmemPageMode::kBase;
+    } else if (ubmem_page_mode == "thp") {
+      options.ubmem_page_mode = UbmemPageMode::kThp;
+    } else {
+      throw py::value_error("ubmem_page_mode must be huge, base, or thp");
+    }
+    options.ubmem_numa_node = ubmem_numa_node;
     options.batch_put_kernel_object_path =
         std::move(batch_put_kernel_object_path);
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
+    options.reuse_device_ra = reuse_device_ra;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
     options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+  }
+
+  ~NpuPythonRuntime() {
+    if (completion_unknown_ || ubmem_fused_context_.lease_id != 0) {
+      // A graph can still reference these storages after Python GC. Only
+      // explicit successful release establishes that this lease is finished.
+      for (auto& owner : ubmem_fused_owners_) (void)owner.release();
+      (void)ubmem_fused_stream_.release();
+      (void)native_.release();
+    }
+    if (completion_unknown_) {
+      // Caller-owned Tensor/stream references were quarantined before the
+      // error escaped. Keep their native arena and queued work alive as well.
+      (void)native_.release();
+    }
+    if (fused_context_.lease_id != 0U) {
+      // GC is not proof that caller-launched DMA finished. Keep both the
+      // registered storage and its native owner until process exit. Native
+      // teardown refusing a lease must not be followed by DECREF of output.
+      std::fprintf(stderr,
+          "[KVAF_AIV] FUSED_PYTHON_LEASE_RETAINED_ON_DESTRUCTION "
+          "lease_id=%llu reason=explicit_release_required "
+          "output_and_stream_retained=1 teardown_not_safe=1\n",
+          static_cast<unsigned long long>(fused_context_.lease_id));
+      (void)fused_output_.release();
+      for (auto& output : fused_output_views_) (void)output.release();
+      (void)fused_stream_.release();
+      (void)native_.release();
+    }
   }
 
   void LinkTo(std::string address) {
@@ -248,6 +338,9 @@ class NpuPythonRuntime final {
   }
 
   bool Initialized() const { return native_->initialized(); }
+  const char* TransportName() const {
+    return native_->transport() == Transport::kUbmem ? "ubmem" : "urma";
+  }
   std::uint32_t DeviceId() const { return native_->device_id(); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
@@ -257,6 +350,223 @@ class NpuPythonRuntime final {
   }
   std::uint32_t BatchGetTokensPerBlock() const {
     return native_->batch_get_tokens_per_block();
+  }
+
+  py::dict AcquireFusedBatchGetContext(const py::object& output,
+                                      const py::object& stream) {
+    if (fused_context_.lease_id != 0U) {
+      throw py::value_error("Runtime already owns a fused BatchGet lease");
+    }
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    const NpuTensorView view = GetNpuTensorView(output, "fused output");
+    const std::string device = "npu:" + std::to_string(DeviceId());
+    if (py::str(output.attr("device")).cast<std::string>() != device ||
+        view.shape.size() < 2 || view.shape.front() <= 0 ||
+        view.bytes % static_cast<std::size_t>(view.shape.front()) != 0 ||
+        view.bytes / static_cast<std::size_t>(view.shape.front()) !=
+            BatchGetTokenBytes()) {
+      throw py::value_error(
+          "fused output must be on the Runtime device with one token_bytes-sized row per slot");
+    }
+    py::object launch_stream = stream;
+    if (launch_stream.is_none()) {
+      py::module_ torch = py::module_::import("torch");
+      if (!py::hasattr(torch, "npu")) {
+        throw std::runtime_error("torch.npu is unavailable for the default KVAF stream");
+      }
+      launch_stream = torch.attr("npu").attr("current_stream")(DeviceId());
+    }
+    if (!py::hasattr(launch_stream, "device") ||
+        py::str(launch_stream.attr("device")).cast<std::string>() != device) {
+      throw py::value_error("fused stream must belong to the Runtime device");
+    }
+    const aclrtStream acl_stream = acl_python::StreamFromPython(launch_stream);
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before fused acquire");
+    FusedBatchGetContext context;
+    ThrowIfError(native_->AcquireFusedBatchGetContext(view.data, view.bytes,
+                                                      &context));
+    // Track ownership before allocating the dict: even an allocation failure
+    // must leave a retained native lease rather than unowned registered HBM.
+    fused_output_ = output;
+    fused_stream_ = std::move(launch_stream);
+    fused_acl_stream_ = acl_stream;
+    fused_context_ = context;
+    return FusedContextDict(fused_context_);
+  }
+
+  py::dict RegisterFusedBatchGetOutput(const py::dict& context,
+                                      const py::object& output) {
+    if (fused_context_.lease_id == 0U) {
+      throw py::value_error("output registration requires a live fused lease");
+    }
+    const py::dict expected = FusedContextDict(fused_context_);
+    for (const auto& item : expected) {
+      if (!context.contains(item.first) ||
+          context[item.first].cast<std::uint64_t>() !=
+              item.second.cast<std::uint64_t>()) {
+        throw py::value_error("pass the unmodified original fused lease");
+      }
+    }
+    const auto tensor = GetNpuTensorView(output, "fused output view");
+    const std::string device = "npu:" + std::to_string(DeviceId());
+    if (py::str(output.attr("device")).cast<std::string>() != device ||
+        tensor.shape.size() < 2 || tensor.shape.front() <= 0 ||
+        tensor.bytes % static_cast<std::size_t>(tensor.shape.front()) != 0 ||
+        tensor.bytes / static_cast<std::size_t>(tensor.shape.front()) != BatchGetTokenBytes()) {
+      throw py::value_error("fused output view must have one token_bytes-sized row per slot on the Runtime device");
+    }
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before fused output registration");
+    // Retain before native registration; failures cannot free registered HBM.
+    fused_output_views_.push_back(output);
+    FusedBatchGetContext view;
+    ThrowIfError(native_->RegisterFusedBatchGetOutput(
+        fused_context_, tensor.data, tensor.bytes, &view));
+    return FusedContextDict(view);
+  }
+
+  void ReleaseFusedBatchGetContext(const py::dict& context,
+                                   const py::object& stream) {
+    if (fused_context_.lease_id == 0U) {
+      throw py::value_error("Runtime has no active fused BatchGet lease");
+    }
+    // Never forward user-modified pointers or an old lease to native code.
+    const py::dict expected = FusedContextDict(fused_context_);
+    for (const auto& item : expected) {
+      if (!context.contains(item.first) ||
+          context[item.first].cast<std::uint64_t>() !=
+              item.second.cast<std::uint64_t>()) {
+        throw py::value_error("fused context does not match this Runtime's active lease");
+      }
+    }
+    if (!stream.is_none() &&
+        acl_python::StreamFromPython(stream) != fused_acl_stream_) {
+      throw py::value_error("fused release must use the stream selected at acquire");
+    }
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before fused release");
+    // Native release fences this exact stream, then checks queue statuses.
+    // Failed completion quarantines the native lease. Keep Python references
+    // and surface the error, without retrying teardown or freeing the buffer.
+    ThrowIfError(native_->ReleaseFusedBatchGetContext(fused_context_,
+                                                      fused_acl_stream_));
+    fused_context_ = FusedBatchGetContext{};
+    fused_acl_stream_ = nullptr;
+    fused_output_ = py::object{};
+    fused_output_views_.clear();
+    fused_stream_ = py::object{};
+  }
+
+  py::dict AcquireUbmemFusedContext(const py::object& output,
+                                    const py::object& stream) {
+    if (native_->transport() != Transport::kUbmem) {
+      throw py::value_error("UBmem fused context requires transport=ubmem");
+    }
+    if (completion_unknown_) throw std::runtime_error("Runtime completion is unknown");
+    if (ubmem_fused_context_.lease_id != 0) {
+      throw py::value_error("Runtime already owns a UBmem fused lease");
+    }
+    const auto tensor = CheckUbmemFusedOutput(output);
+    py::object owner = stream;
+    if (owner.is_none()) {
+      owner = py::module_::import("torch").attr("npu").attr("current_stream")(DeviceId());
+    }
+    if (!py::hasattr(owner, "device")) {
+      throw py::value_error("UBmem fused acquire requires a stream object with a device");
+    }
+    CheckUbmemDevice(owner, "UBmem fused stream");
+    const aclrtStream acl_stream = acl_python::StreamFromPython(owner);
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before UBmem fused acquire");
+    // Retain before the native fence: unknown completion must not DECREF them.
+    ubmem_fused_owners_.push_back(output);
+    ubmem_fused_stream_ = std::move(owner);
+    ubmem_fused_acl_stream_ = acl_stream;
+    UbmemFusedContext context;
+    const Status status = native_->AcquireUbmemFusedContext(
+        tensor.data, tensor.bytes, acl_stream, &context);
+    if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
+    if (!status.ok()) {
+      if (!completion_unknown_) {
+        ubmem_fused_owners_.clear();
+        ubmem_fused_stream_ = py::object{};
+        ubmem_fused_acl_stream_ = nullptr;
+      }
+      ThrowIfError(status);
+    }
+    ubmem_fused_context_ = context;
+    return UbmemFusedContextDict(context);
+  }
+
+  py::dict RegisterUbmemFusedOutput(const py::dict& context,
+                                    const py::object& output) {
+    CheckUbmemFusedOwner(context);
+    const auto tensor = CheckUbmemFusedOutput(output);
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before UBmem fused output registration");
+    ubmem_fused_owners_.push_back(output);
+    UbmemFusedContext view;
+    const Status status = native_->RegisterUbmemFusedOutput(
+        ubmem_fused_context_, tensor.data, tensor.bytes, &view);
+    if (!status.ok()) {
+      ubmem_fused_owners_.pop_back();
+      ThrowIfError(status);
+    }
+    return UbmemFusedContextDict(view);
+  }
+
+  void RegisterUbmemFusedAccessTable(const py::dict& context,
+                                     const py::object& table_owner) {
+    CheckUbmemFusedOwner(context);
+    const auto& table = table_owner.cast<const DeviceAccessTable&>();
+    CheckAccessTableOwner(table);
+    CheckUbmemDevice(table.addresses(), "UBmem fused table addresses");
+    CheckUbmemDevice(table.valid(), "UBmem fused table valid");
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before UBmem fused table registration");
+    ubmem_fused_owners_.push_back(table_owner);
+    const Status status = native_->RegisterUbmemFusedAccessTable(
+        ubmem_fused_context_, table.source());
+    if (!status.ok()) {
+      ubmem_fused_owners_.pop_back();
+      ThrowIfError(status);
+    }
+  }
+
+  void RetainUbmemFusedGraph(const py::dict& context, const py::object& graph) {
+    CheckUbmemFusedOwner(context);
+    CheckUbmemDevice(graph, "UBmem fused graph");
+    if (!py::hasattr(graph, "replay") || !PyCallable_Check(graph.attr("replay").ptr())) {
+      throw py::type_error("UBmem fused graph must expose replay()");
+    }
+    ubmem_fused_owners_.push_back(graph);
+  }
+
+  void ReleaseUbmemFusedContext(const py::dict& context,
+                                 const py::object& stream) {
+    CheckUbmemFusedOwner(context);
+    if (!stream.is_none()) {
+      if (!py::hasattr(stream, "device")) {
+        throw py::value_error("UBmem fused release requires the acquire stream object");
+      }
+      CheckUbmemDevice(stream, "UBmem fused release stream");
+      if (acl_python::StreamFromPython(stream) != ubmem_fused_acl_stream_) {
+        throw py::value_error("UBmem fused release must use its acquire stream");
+      }
+    }
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before UBmem fused release");
+    const Status status = native_->ReleaseUbmemFusedContext(
+        ubmem_fused_context_, ubmem_fused_acl_stream_);
+    if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
+    ThrowIfError(status);
+    ubmem_fused_context_ = {};
+    ubmem_fused_acl_stream_ = nullptr;
+    ubmem_fused_owners_.clear();
+    ubmem_fused_stream_ = py::object{};
   }
 
   py::dict RemoteRegion() const {
@@ -279,6 +589,7 @@ class NpuPythonRuntime final {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
+    CheckUbmemDevice(source, "BatchPut source");
     CopyPrepareKeysInto(keys, &batch_put_request_.keys);
     CopyCpuUint64SequenceInto(input_offsets, "BatchPut input_offsets",
                               &batch_put_request_.input_offsets);
@@ -292,11 +603,16 @@ class NpuPythonRuntime final {
           "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
     }
     const NpuTensorView source_view = GetNpuTensorView(source, "BatchPut source");
-    const aclrtStream acl_stream = ResolveStream(stream);
+    py::object stream_owner = ResolveStreamOwner(stream);
+    CheckUbmemDevice(stream_owner, "BatchPut stream");
+    const aclrtStream acl_stream = acl_python::StreamFromPython(stream_owner);
+    std::array<py::object, 8> owners{source, stream_owner};
     batch_put_request_.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
-    ThrowIfError(native_->core().BatchPut(
-        batch_put_request_, BatchPutExecutionOptions{acl_stream}));
+    const Status status = native_->core().BatchPut(
+        batch_put_request_, BatchPutExecutionOptions{acl_stream});
+    QuarantineUnknownCompletion(status, &owners);
+    ThrowIfError(status);
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
@@ -357,7 +673,7 @@ class NpuPythonRuntime final {
                     ACL_MEMCPY_HOST_TO_DEVICE),
         "aclrtMemcpy NPU AccessTable valid");
     return py::cast(DeviceAccessTable{handle, std::move(addresses),
-                                      std::move(valid)});
+                                      std::move(valid), access_table_owner_});
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
@@ -370,7 +686,9 @@ class NpuPythonRuntime final {
   // a second representation solely for the NPU Runtime binding.
   void BatchFree(const py::object& keys) {
     std::vector<KeyId> copied_keys = CopyPrepareKeys(keys);
-    ThrowIfError(native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)}));
+    const Status status = native_->core().BatchFree(BatchFreeRequest{std::move(copied_keys)});
+    if (status.code() == StatusCode::kCompletionUnknown) completion_unknown_ = true;
+    ThrowIfError(status);
   }
 
   void StartBatchGetKernelProfile() {
@@ -423,6 +741,7 @@ class NpuPythonRuntime final {
                 const py::object& miss_count,
                 const py::object& output_indices, const py::object& output,
                 const py::object& stream, bool synchronize) {
+    CheckAccessTableOwner(access_table);
     BatchGetImpl(access_table.source(), access_table.addresses(),
                  access_table.valid(), indices, offsets, miss_count,
                  output_indices, output, stream, synchronize);
@@ -444,6 +763,57 @@ class NpuPythonRuntime final {
   }
 
  private:
+  void CheckAccessTableOwner(const DeviceAccessTable& table) const {
+    if (!table.OwnedBy(access_table_owner_)) {
+      throw py::value_error("DeviceAccessTable belongs to another Runtime");
+    }
+  }
+
+  NpuTensorView CheckUbmemFusedOutput(const py::object& output) const {
+    CheckUbmemDevice(output, "UBmem fused output");
+    const auto view = GetNpuTensorView(output, "UBmem fused output");
+    if (view.shape.size() < 2 || view.shape.front() <= 0 ||
+        view.bytes % static_cast<std::size_t>(view.shape.front()) != 0 ||
+        view.bytes / static_cast<std::size_t>(view.shape.front()) != BatchGetTokenBytes()) {
+      throw py::value_error("UBmem fused output requires one token_bytes-sized row per slot");
+    }
+    return view;
+  }
+
+  void CheckUbmemFusedOwner(const py::dict& context) const {
+    if (completion_unknown_) throw std::runtime_error("Runtime completion is unknown; fused owners are retained");
+    if (ubmem_fused_context_.lease_id == 0) throw py::value_error("Runtime has no active UBmem fused lease");
+    ThrowIfError(native_->core().CheckFusedReadLease());
+    const auto expected = UbmemFusedContextDict(ubmem_fused_context_);
+    for (const auto& item : expected) {
+      if (!context.contains(item.first) ||
+          context[item.first].cast<std::uint64_t>() != item.second.cast<std::uint64_t>()) {
+        throw py::value_error("pass the original unmodified UBmem fused owner context");
+      }
+    }
+  }
+
+  void CheckUbmemDevice(const py::object& object, const char* name) const {
+    if (native_->transport() != Transport::kUbmem ||
+        !py::hasattr(object, "device")) return;
+    const std::string expected = "npu:" + std::to_string(DeviceId());
+    if (py::str(object.attr("device")).cast<std::string>() != expected) {
+      throw py::value_error(std::string(name) + " must belong to Runtime device " + expected);
+    }
+    // Raw ACL stream pointers expose no device. Their owner must enforce the
+    // same-device contract; do not infer an ACL device from the pointer value.
+  }
+
+  void QuarantineUnknownCompletion(const Status& status,
+                                   std::array<py::object, 8>* owners) noexcept {
+    if (status.code() != StatusCode::kCompletionUnknown) return;
+    // Allocate/copy these owners before submitting work. release() is then
+    // allocation-free even when an uncertain launch coincides with host OOM.
+    // No normal Python GC or Runtime destruction can prove DMA completion.
+    for (auto& owner : *owners) (void)owner.release();
+    completion_unknown_ = true;
+  }
+
   void BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
                     const py::object& indices, const py::object& offsets,
@@ -451,6 +821,13 @@ class NpuPythonRuntime final {
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
                     bool synchronize) {
+    CheckUbmemDevice(addresses, "BatchGet addresses");
+    CheckUbmemDevice(valid, "BatchGet valid");
+    CheckUbmemDevice(indices, "BatchGet indices");
+    CheckUbmemDevice(offsets, "BatchGet offsets");
+    CheckUbmemDevice(miss_count, "BatchGet miss_count");
+    CheckUbmemDevice(output_indices, "BatchGet output_indices");
+    CheckUbmemDevice(output, "BatchGet output");
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView miss_count_view =
@@ -497,22 +874,52 @@ class NpuPythonRuntime final {
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
-    const aclrtStream acl_stream = ResolveStream(stream);
-    ThrowIfError(native_->core().BatchGet(
-        request, BatchGetExecutionOptions{acl_stream,
-                                           synchronize}));
+    py::object stream_owner = ResolveStreamOwner(stream);
+    CheckUbmemDevice(stream_owner, "BatchGet stream");
+    const aclrtStream acl_stream = acl_python::StreamFromPython(stream_owner);
+    std::array<py::object, 8> owners{
+        addresses, valid, indices, offsets, miss_count, output_indices, output,
+        stream_owner};
+    const Status status = native_->core().BatchGet(
+        request, BatchGetExecutionOptions{acl_stream, synchronize});
+    QuarantineUnknownCompletion(status, &owners);
+    ThrowIfError(status);
   }
 
  public:
   void Shutdown() {
+    if (completion_unknown_) {
+      throw std::runtime_error(
+          "work completion is unknown; retain this Runtime and its Tensor storage until process teardown");
+    }
+    if (fused_context_.lease_id != 0U) {
+      throw py::value_error(
+          "release the fused BatchGet context successfully before shutdown; "
+          "uncertain DMA completion requires retaining output and Runtime until process teardown");
+    }
+    if (ubmem_fused_context_.lease_id != 0) {
+      throw py::value_error("release the UBmem fused lease before shutdown");
+    }
     ThrowIfError(native_->Shutdown());
   }
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  std::shared_ptr<const AccessTableOwner> access_table_owner_{
+      std::make_shared<const AccessTableOwner>()};
+  bool completion_unknown_{false};
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
+  FusedBatchGetContext fused_context_;
+  py::object fused_output_;
+  std::vector<py::object> fused_output_views_;
+  py::object fused_stream_;
+  aclrtStream fused_acl_stream_{nullptr};
+  UbmemFusedContext ubmem_fused_context_;
+  std::vector<py::object> ubmem_fused_owners_;
+  py::object ubmem_fused_stream_;
+  aclrtStream ubmem_fused_acl_stream_{nullptr};
 };
 
 }  // namespace
@@ -529,7 +936,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
                     std::uint32_t, std::string, std::uint32_t,
                     std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>, std::uint32_t>(),
+                    std::string, std::vector<std::string>, std::uint32_t, bool,
+                    std::string, std::string, int>(),
            py::arg("batch_get_kernel_object_path"),
            py::arg("batch_get_token_bytes"),
            py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
@@ -542,13 +950,67 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("peer_ub_device") = "",
            py::arg("adaptive_peer_ub_devices") =
                std::vector<std::string>{},
-           py::arg("batch_get_max_inflight_total") = 2048)
+           py::arg("batch_get_max_inflight_total") = 2048,
+           py::arg("reuse_device_ra") = false,
+           py::arg("transport") = "urma",
+           py::arg("ubmem_page_mode") = "huge",
+           py::arg("ubmem_numa_node") = -1)
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
-           "Connect this NPU Runtime to a CPU Runtime service before initialize.")
+           "Connect an URMA Runtime to its CPU service. UBmem initializes a worker-local arena without link_to.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
       .def("shutdown", &NpuPythonRuntime::Shutdown)
+      .def("acquire_ubmem_fused_context",
+           &NpuPythonRuntime::AcquireUbmemFusedContext,
+           py::arg("output"), py::arg("stream") = py::none(),
+           "Lease the worker-local HostDDR arena and an output tensor for UBmem fusion. "
+           "Returns an independent mapping/geometry ABI with no URMA queues. "
+           "Keep all launches ordered on the acquire stream. Do not resize retained storage. "
+           "BatchFree fences the device at request retirement: first stop submitting that "
+           "request and invalidate its addresses; later graph replays must not use freed keys.")
+      .def("register_ubmem_fused_output", &NpuPythonRuntime::RegisterUbmemFusedOutput,
+           py::arg("context"), py::arg("output"),
+           "Retain another output under the original UBmem owner lease before capture. "
+           "Returns a view sharing lease and arena, with this output's address and size.")
+      .def("register_ubmem_fused_access_table", &NpuPythonRuntime::RegisterUbmemFusedAccessTable,
+           py::arg("context"), py::arg("device_access_table"),
+           "Optionally retain a KVAF DeviceAccessTable and its metadata pin until lease "
+           "release. Its keys cannot be freed and its handle cannot be released meanwhile. "
+           "Dynamic request address tables may instead use the request-retirement contract.")
+      .def("retain_ubmem_fused_graph", &NpuPythonRuntime::RetainUbmemFusedGraph,
+           py::arg("context"), py::arg("graph"),
+           "Retain a captured graph until explicit UBmem lease release. The graph and its "
+           "remaining inputs must belong to the same Runtime device. Never replay it after release.")
+      .def("release_ubmem_fused_context", &NpuPythonRuntime::ReleaseUbmemFusedContext,
+           py::arg("context"), py::arg("stream") = py::none(),
+           "Pass the original owner dict. Drain device work, remove optional table reader "
+           "pins, and release retained output/table/graph/stream owners. The caller must "
+           "stop all future replays before release. Unknown completion retains all resources.")
+      .def("acquire_fused_batch_get_context",
+           &NpuPythonRuntime::AcquireFusedBatchGetContext,
+           py::arg("output"), py::arg("stream") = py::none(),
+           "Exclusively lease native BatchGet queues and register output HBM. "
+           "Returns integer fields matching FusedBatchGetContext, including lease_id. "
+           "output and stream are retained until successful release. All fused launches "
+           "must run sequentially on this stream; do not resize/rebind output storage, "
+           "reset queue cursors, or free source DDR while the lease is in use. "
+           "stream=None captures the Runtime device's current torch.npu stream.")
+      .def("register_fused_batch_get_output",
+           &NpuPythonRuntime::RegisterFusedBatchGetOutput,
+           py::arg("context"), py::arg("output"),
+           "Setup-only output registration under the original fused lease. "
+           "Returns a view with shared persistent queues; all launches must use "
+           "the acquire stream sequentially. Register before capture. Release "
+           "the original lease to release all views; do not resize their tensors.")
+      .def("release_fused_batch_get_context",
+           &NpuPythonRuntime::ReleaseFusedBatchGetContext,
+           py::arg("context"), py::arg("stream") = py::none(),
+           "Fence the acquire stream and check native queue completion before release. "
+           "Pass the unmodified acquire dict. stream=None uses the retained acquire "
+           "stream, not the current stream. Failure retains all resources and blocks "
+           "shutdown; unknown DMA completion requires process/device teardown.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
+      .def_property_readonly("transport", &NpuPythonRuntime::TransportName)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
