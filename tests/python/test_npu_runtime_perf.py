@@ -9,6 +9,7 @@ NPU stream synchronize.
 
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import statistics
@@ -72,7 +73,7 @@ def print_samples(
     print(result)
 
 
-def main(batch: int = 16) -> int:
+def main(batch: int = 16, transport: str = "urma") -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(f"SKIP: NPU benchmark requires torch_npu; detected {backend.name}.")
@@ -207,6 +208,7 @@ def main(batch: int = 16) -> int:
     output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
     runtime = kvaf.NpuRuntime(
         str(kernel),
+        transport=transport,
         batch_get_token_bytes=token_bytes,
         batch_get_tokens_per_block=tokens_per_block,
         device_id=device_id,
@@ -476,4 +478,6 @@ def main(batch: int = 16) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    raise SystemExit(main(transport=parser.parse_args().transport))

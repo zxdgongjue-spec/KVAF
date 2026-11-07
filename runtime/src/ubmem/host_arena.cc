@@ -15,10 +15,9 @@
 namespace kvaf {
 namespace {
 
-// VA flags select page type (0 normal, 1 huge), not access permission. Keep
+// VA flags select normal pages (0), not access permission. Keep
 // them consistent with the physical allocation; MemSetAccess grants NPU access.
 constexpr std::uint64_t kReserveBasePage = 0;
-constexpr std::uint64_t kReserveHugePage = 1;
 constexpr std::int32_t kRuntime92 = 90200000;
 
 Status AclStatus(aclError code, const char* operation) {
@@ -231,9 +230,8 @@ Status UbmemDdrMemoryAllocator::Allocate(const RuntimeInitRequest& request,
     return Status::InvalidArgument("remote_region must not be null");
   }
   *remote_region = {};
-  if (impl_->page_mode != UbmemPageMode::kHuge &&
-      impl_->page_mode != UbmemPageMode::kBase && impl_->page_mode != UbmemPageMode::kThp) {
-    return Status::InvalidArgument("UBmem page mode must be huge, base, or thp");
+  if (impl_->page_mode != UbmemPageMode::kBase && impl_->page_mode != UbmemPageMode::kThp) {
+    return Status::InvalidArgument("UBmem page mode must be thp or base");
   }
   if (impl_->numa_node < -1 || impl_->numa_node > 4095 ||
       (impl_->numa_node >= 0 && impl_->page_mode != UbmemPageMode::kThp)) {
@@ -263,8 +261,7 @@ Status UbmemDdrMemoryAllocator::Allocate(const RuntimeInitRequest& request,
   aclrtPhysicalMemProp prop{};
   prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
   prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-  const bool base_pages = impl_->page_mode == UbmemPageMode::kBase;
-  prop.memAttr = base_pages ? ACL_DDR_MEM_P2P_NORMAL : ACL_DDR_MEM_P2P_HUGE;
+  prop.memAttr = ACL_DDR_MEM_P2P_NORMAL;
   prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
   // -1 asks the CANN driver to choose the Host NUMA node.
   prop.location.id = static_cast<std::uint32_t>(-1);
@@ -286,21 +283,19 @@ Status UbmemDdrMemoryAllocator::Allocate(const RuntimeInitRequest& request,
   std::fprintf(stderr,
       "[KVAF_UBMEM] UBMEM_ARENA_ALLOC device=%u page_mode=%s valid_bytes=%llu "
       "mapped_bytes=%zu granularity=%zu numa_id=-1\n",
-      impl_->device_id, base_pages ? "base" : "huge",
+      impl_->device_id, "base",
       static_cast<unsigned long long>(request.ddr_bytes), rounded, granularity);
 
   status = AclStatus(aclrtMallocPhysical(&arena.physical, rounded, &prop, 0),
-                     base_pages ? "aclrtMallocPhysical(HOST_NUMA,DDR_P2P_NORMAL)"
-                                : "aclrtMallocPhysical(HOST_NUMA,DDR_P2P_HUGE)");
+                     "aclrtMallocPhysical(HOST_NUMA,DDR_P2P_NORMAL)");
   if (!status.ok()) return impl_->AllocationFailed(std::move(status));
   if (arena.physical == nullptr) {
     return impl_->AllocationFailed(Status::Internal("UBmem physical allocator returned null"));
   }
   arena.physical_allocated = true;
   status = AclStatus(aclrtReserveMemAddress(&arena.address, rounded, 0, nullptr,
-                        base_pages ? kReserveBasePage : kReserveHugePage),
-                     base_pages ? "aclrtReserveMemAddress(base)"
-                                : "aclrtReserveMemAddress(huge)");
+                        kReserveBasePage),
+                     "aclrtReserveMemAddress(base)");
   if (!status.ok()) return impl_->AllocationFailed(std::move(status));
   if (arena.address == nullptr) {
     return impl_->AllocationFailed(Status::Internal("UBmem VA reservation returned null"));

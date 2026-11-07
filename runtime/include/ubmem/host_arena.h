@@ -7,7 +7,7 @@
 
 namespace kvaf {
 
-enum class UbmemPageMode { kHuge, kBase, kThp };
+enum class UbmemPageMode { kBase = 1, kThp = 2 };
 
 // Borrowed views of one worker-owned allocation. The CPU and NPU addresses are
 // separate fields deliberately: callers must not infer one from the other.
@@ -23,8 +23,7 @@ struct UbmemMappedRegion {
   std::uint32_t device_id{0};
 };
 
-// CANN >= 9.2 local Host DDR allocator. Physical and VA page modes match for VMM;
-// huge preserves the original behavior, while base explicitly uses normal pages.
+// CANN >= 9.2 local Host DDR allocator. Base uses normal VMM pages.
 // Linux thp uses ordinary aligned Host memory with MADV_HUGEPAGE, then registers
 // that memory for AIV access; actual THP coverage is reported, not guaranteed.
 // The calling thread must have
@@ -35,7 +34,7 @@ struct UbmemMappedRegion {
 class UbmemDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
   explicit UbmemDdrMemoryAllocator(
-      std::uint32_t device_id, UbmemPageMode page_mode = UbmemPageMode::kHuge, int numa_node = -1);
+      std::uint32_t device_id, UbmemPageMode page_mode = UbmemPageMode::kThp, int numa_node = -1);
   ~UbmemDdrMemoryAllocator() override;
 
   UbmemDdrMemoryAllocator(const UbmemDdrMemoryAllocator&) = delete;
@@ -53,6 +52,6 @@ class UbmemDdrMemoryAllocator final : public DdrMemoryAllocator {
 };
 
 std::unique_ptr<UbmemDdrMemoryAllocator> CreateUbmemDdrMemoryAllocator(
-    std::uint32_t device_id, UbmemPageMode page_mode = UbmemPageMode::kHuge, int numa_node = -1);
+    std::uint32_t device_id, UbmemPageMode page_mode = UbmemPageMode::kThp, int numa_node = -1);
 
 }  // namespace kvaf

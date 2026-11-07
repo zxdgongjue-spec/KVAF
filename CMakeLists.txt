@@ -20,16 +20,21 @@ option(KVAF_ENABLE_AIV_BATCH_GET
 option(KVAF_ENABLE_AIV_BATCH_PUT
        "Build the CANN-backed Direct-HCCP BatchPut data plane"
        ${KVAF_ENABLE_AIV_BATCH_GET})
+option(KVAF_ENABLE_AICPU_URMA "Build the optional AICPU UMDK GatherRead data plane" OFF)
+option(KVAF_ENABLE_AICPU_CPU_PUSH "Build the Host direct-HCCP AICPU CPU push/scatter path" OFF)
 option(KVAF_BUILD_REMOTE_CPU_SERVICE
-       "Build the liburma-only persistent CPU DDR/Jetty service"
+       "Build the persistent CPU DDR service (URMA and UBmem)"
        OFF)
+if(KVAF_ENABLE_AICPU_URMA)
+  set(KVAF_ENABLE_NPU ON)
+endif()
 option(KVAF_ENABLE_NPU "Build CANN-backed NPU Runtime and Python APIs"
        ${KVAF_ENABLE_AIV_BATCH_GET})
 
 if(KVAF_ENABLE_AIV_BATCH_GET AND NOT KVAF_ENABLE_NPU)
   message(FATAL_ERROR "KVAF_ENABLE_AIV_BATCH_GET requires KVAF_ENABLE_NPU")
 endif()
-if(KVAF_ENABLE_NPU AND KVAF_ENABLE_URMA AND NOT KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_NPU AND KVAF_ENABLE_URMA AND NOT KVAF_ENABLE_AIV_BATCH_GET AND NOT KVAF_ENABLE_AICPU_URMA)
   message(FATAL_ERROR "The URMA NPU Runtime requires KVAF_ENABLE_AIV_BATCH_GET")
 endif()
 if(KVAF_ENABLE_UBMEM AND
@@ -41,6 +46,9 @@ if(KVAF_ENABLE_AIV_BATCH_PUT AND NOT KVAF_ENABLE_AIV_BATCH_GET)
   message(FATAL_ERROR
     "KVAF_ENABLE_AIV_BATCH_PUT requires KVAF_ENABLE_AIV_BATCH_GET because "
     "DefaultAccessOperator is built by the CANN BatchGet integration")
+endif()
+if(KVAF_ENABLE_AICPU_CPU_PUSH AND NOT KVAF_ENABLE_AICPU_URMA)
+  message(FATAL_ERROR "KVAF_ENABLE_AICPU_CPU_PUSH requires KVAF_ENABLE_AICPU_URMA")
 endif()
 
 # CANN/PyTorch NPU libraries use the legacy libstdc++ ABI. Keep this setting

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -80,6 +82,7 @@ class RuntimeCore {
   Status Shutdown();
 
   bool initialized() const { return initialized_; }
+  bool needs_cleanup() const { return needs_cleanup_; }
   const RemoteRegionDesc& remote_region() const { return remote_region_; }
 
   Status PrepareAccessTable(const AccessTablePrepareRequest& request,
@@ -133,9 +136,9 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   bool initialized_{false};
-  bool completion_unknown_{false};
-  bool teardown_started_{false};
+  std::atomic<bool> completion_unknown_{false};
   std::function<Status()> fused_read_fence_;
+  bool needs_cleanup_{false};
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>

@@ -219,7 +219,7 @@ bool CreateChannelAt(const std::string& endpoint, const PeerRegion& region,
                      uint32_t local_psn,
                      std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
                      uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
-                     uint32_t* peer_psn, std::string* error) {
+                     uint32_t* peer_psn, bool share_tp, std::string* error) {
   if (local_qp_key == nullptr || local_eid == nullptr || peer_qp_key == nullptr ||
       peer_qp_key_bytes == nullptr || peer_tp_handle == nullptr || peer_psn == nullptr ||
       local_qp_key_bytes == 0U || local_qp_key_bytes > kQpKeyBytes ||
@@ -236,6 +236,7 @@ bool CreateChannelAt(const std::string& endpoint, const PeerRegion& region,
   request.local_qp_key_bytes = local_qp_key_bytes;
   request.peer_token_value = peer_token_value;
   request.local_psn = local_psn;
+  request.reserved = share_tp ? kChannelSharedTp : 0U;
   std::memcpy(request.local_eid, local_eid, sizeof(request.local_eid));
   std::memcpy(request.local_qp_key, local_qp_key, local_qp_key_bytes);
   CreateChannelResponse response{};
@@ -245,6 +246,10 @@ bool CreateChannelAt(const std::string& endpoint, const PeerRegion& region,
       response.peer_qp_key_bytes == 0U || response.peer_qp_key_bytes > kQpKeyBytes ||
       response.peer_tp_handle == 0U || response.peer_psn == 0U) {
     if (error != nullptr && error->empty()) *error = "peer service returned an invalid channel descriptor";
+    return false;
+  }
+  if (share_tp && (response.reserved & kChannelSharedTp) == 0U) {
+    SetError(error, "CPU service did not acknowledge shared TP; rebuild and restart the CPU service");
     return false;
   }
   std::memcpy(peer_qp_key->data(), response.peer_qp_key, peer_qp_key->size());
@@ -302,6 +307,7 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
 }
 
 Status PeerLink::ReleaseRegion(uint64_t base) {
+  if (ubmem_mappings_.count(base)) return Status::Busy("UBmem Device VA must be unmapped before releasing CPU DDR");
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
@@ -309,6 +315,56 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
     return ToStatus("peer DDR release failed", std::move(error));
   }
   regions_.erase(found);
+  return Status::OK();
+}
+
+Status PeerLink::RetainUbmemMapping(uint64_t base) {
+  const auto found = regions_.find(base);
+  if (found == regions_.end() || found->second.fabric_mapping_bytes == 0) {
+    return Status::NotFound("UBmem mapping has no allocated Fabric region");
+  }
+  ++ubmem_mappings_[base];
+  return Status::OK();
+}
+
+void PeerLink::ReleaseUbmemMapping(uint64_t base) {
+  auto found = ubmem_mappings_.find(base);
+  if (found != ubmem_mappings_.end() && --found->second == 0) ubmem_mappings_.erase(found);
+}
+
+Status PeerLink::AllocateUbmemRegion(uint64_t bytes, uint64_t slot_size, PeerRegion* region) {
+  if (region == nullptr || bytes == 0 || slot_size == 0 || bytes % slot_size != 0) {
+    return Status::InvalidArgument("invalid UBmem region request");
+  }
+  AllocateUbmemRegionRequest request{};
+  request.header = MakeHeader(Command::kAllocateUbmemRegion, sizeof(request));
+  request.ddr_bytes = bytes;
+  request.slot_size = slot_size;
+  AllocateUbmemRegionResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error)) {
+    return ToStatus("UBmem allocation exchange failed", std::move(error));
+  }
+  if (!IsValidResponseHeader(response.header, Command::kAllocateUbmemRegion, sizeof(response))) {
+    return Status::Internal("peer returned an invalid UBmem response");
+  }
+  if (response.result != static_cast<int32_t>(Result::kOk)) {
+    response.error_message[sizeof(response.error_message) - 1] = '\0';
+    return Status::Internal(std::string("CPU UBmem allocation failed: ") + response.error_message);
+  }
+  if (response.session_id == 0 || response.peer_base == 0 || response.peer_length != bytes ||
+      response.peer_base > UINT64_MAX - bytes || response.mapping_bytes < bytes ||
+      response.mapping_bytes % (2ULL * 1024 * 1024) != 0) {
+    return Status::Internal("peer returned an invalid UBmem region");
+  }
+  PeerRegion allocated{};
+  allocated.session_id = response.session_id;
+  allocated.base = response.peer_base;
+  allocated.length = response.peer_length;
+  allocated.fabric_mapping_bytes = response.mapping_bytes;
+  std::memcpy(allocated.fabric_handle.data(), response.fabric_handle, sizeof(response.fabric_handle));
+  regions_[allocated.base] = allocated;
+  *region = allocated;
   return Status::OK();
 }
 
@@ -326,14 +382,100 @@ Status PeerLink::CreateChannel(
     uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
     std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
     uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn) {
+  return CreateChannel(region_base, local_qp_key, local_qp_key_bytes, local_eid,
+      peer_token_value, local_tp_handle, local_psn, peer_qp_key, peer_qp_key_bytes,
+      peer_tp_handle, peer_psn, false);
+}
+
+Status PeerLink::CreateChannel(
+    uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
+    uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
+    uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
+    std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
+    uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle, uint32_t* peer_psn, bool share_tp) {
   const auto found = regions_.find(region_base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
   return CreateChannelAt(address_, found->second, local_qp_key, local_qp_key_bytes,
                          local_eid, peer_token_value, local_tp_handle, local_psn,
-                         peer_qp_key, peer_qp_key_bytes, peer_tp_handle, peer_psn, &error)
+                         peer_qp_key, peer_qp_key_bytes, peer_tp_handle, peer_psn, share_tp, &error)
              ? Status::OK()
              : ToStatus("peer channel creation failed", std::move(error));
 }
 
+Status PeerLink::EnableDirectGather(uint64_t region_base) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end())
+    return Status::NotFound("peer DDR region was not found");
+  EnableDirectGatherRequest request{};
+  request.header = MakeHeader(Command::kEnableDirectGather, sizeof(request));
+  request.session_id = found->second.session_id;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableDirectGather,
+                             sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("peer direct gather enable failed", std::move(error));
+  return Status::OK();
+}
+
+Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_address,
+                                  uint32_t lanes) const {
+  const auto found = regions_.find(region_base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  EnableGatherLanesRequest request{};
+  request.header = MakeHeader(Command::kEnableGatherLanes, sizeof(request));
+  request.session_id = found->second.session_id;
+  request.control_address = control_address;
+  request.lanes = lanes;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableGatherLanes, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("peer independent gather enable failed", std::move(error));
+  return Status::OK();
+}
+
+Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
+                                OpenCpuPushGetResponse* response) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  request.header = MakeHeader(Command::kOpenCpuPushGet, sizeof(request));
+  request.session_id = found->second.session_id;
+  std::string error;
+  if (!Exchange(address_, request, response, &error) ||
+      !IsValidResponseHeader(response->header, Command::kOpenCpuPushGet, sizeof(*response)) ||
+      !ResultOk(static_cast<Result>(response->result), &error))
+    return ToStatus("CPU push setup failed", std::move(error));
+  return Status::OK();
+}
+
+namespace {
+Status PushSessionCommand(const std::string& address, uint64_t session, Command command) {
+  CpuPushGetSessionRequest request{};
+  request.header = MakeHeader(command, sizeof(request));
+  request.session_id = session;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, command, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("CPU push session command failed", std::move(error));
+  return Status::OK();
+}
+}  // namespace
+
+Status PeerLink::StartCpuPushGet(uint64_t base) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  return PushSessionCommand(address_, found->second.session_id, Command::kStartCpuPushGet);
+}
+Status PeerLink::StopCpuPushGet(uint64_t base) const {
+  const auto found = regions_.find(base);
+  // ReleaseRegion succeeds only after the remote producer has stopped.
+  if (found == regions_.end()) return Status::OK();
+  return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet);
+}
 }  // namespace kvaf::peer

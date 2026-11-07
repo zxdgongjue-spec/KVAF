@@ -57,7 +57,8 @@ class Allocator final : public kvaf::DdrMemoryAllocator {
 
 void TestLeaseAndRuntimeTeardown() {
   driver = {};
-  kvaf::DefaultAccessOperator op(Config());
+  kvaf::DefaultAccessOperator concrete(Config());
+  kvaf::AccessOperator& op = concrete;
   auto metadata = kvaf::CreateInMemoryMetaManager();
   Allocator allocator;
   kvaf::RuntimeCore runtime(*metadata, op, allocator);
@@ -90,11 +91,12 @@ void TestLeaseAndRuntimeTeardown() {
           "reject concurrent lease");
   Require(op.ExecuteBatchGet({}).code() == kvaf::StatusCode::kBusy,
           "ordinary BatchGet cannot use leased queues");
-  Require(op.SetBatchGetKernelProfiling(true).code() == kvaf::StatusCode::kBusy,
+  Require(concrete.SetBatchGetKernelProfiling(true).code() == kvaf::StatusCode::kBusy,
           "profiling cannot reset leased status");
   Require(runtime.Shutdown().code() == kvaf::StatusCode::kBusy,
           "runtime must propagate active lease");
-  Require(runtime.initialized() && allocator.releases == 0 && driver.destroys == 0,
+  Require(!runtime.initialized() && runtime.needs_cleanup() &&
+              allocator.releases == 0 && driver.destroys == 0,
           "busy shutdown preserves remote DDR and transport");
   auto wrong = context;
   ++wrong.lease_id;

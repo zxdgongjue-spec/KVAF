@@ -69,7 +69,7 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
       ddr_allocator_(ddr_allocator) {}
 
 RuntimeCore::~RuntimeCore() {
-  if (initialized_) {
+  if (needs_cleanup_) {
     (void)Shutdown();
   }
 }
@@ -77,6 +77,9 @@ RuntimeCore::~RuntimeCore() {
 Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   if (initialized_) {
     return Status::InvalidState("Runtime has already been initialized");
+  }
+  if (needs_cleanup_) {
+    return Status::InvalidState("Runtime still has resources to clean up");
   }
   if (!access_tables_.empty()) {
     return Status::InvalidState("Runtime has unreleased AccessTables");
@@ -87,56 +90,61 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   if (!status.ok()) {
     return status;
   }
+  remote_region_ = remote_region;
+  needs_cleanup_ = true;
   if (remote_region.length == 0 || remote_region.slot_size == 0 ||
       remote_region.length % remote_region.slot_size != 0) {
-    (void)ddr_allocator_.Release(remote_region);
+    (void)Shutdown();
     return Status::InvalidArgument("DDR allocator returned an invalid remote region");
   }
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
-    (void)ddr_allocator_.Release(remote_region);
+    (void)Shutdown();
     return status;
   }
 
   status = meta_manager_.RegisterRemoteRegion(remote_region);
   if (!status.ok()) {
-    (void)access_operator_.Shutdown();
-    (void)ddr_allocator_.Release(remote_region);
+    (void)Shutdown();
     return status;
   }
 
-  remote_region_ = remote_region;
   initialized_ = true;
   return Status::OK();
 }
 
 Status RuntimeCore::Shutdown() {
-  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-  if (completion_unknown_) {
-    return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
+  if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown; retain resources");
+  if (fused_read_fence_) return Status::Busy("release the external fused read lease before Runtime shutdown");
+  if (!needs_cleanup_) {
+    return Status::NotInitialized("Runtime has not been initialized");
   }
-  if (fused_read_fence_) {
-    return Status::Busy("release the external fused read lease before Runtime shutdown");
-  }
-  if (!teardown_started_) {
-    // Refuse teardown while queues/leases remain active. After successful
-    // shutdown, no new operation may observe a partially unmapped arena.
-    const Status status = access_operator_.Shutdown();
-    if (!status.ok()) return status;
-    teardown_started_ = true;
-  }
-  for (auto entry = access_tables_.begin(); entry != access_tables_.end();) {
-    const Status status = meta_manager_.UnlockKeys(entry->second->lock_context);
-    if (!status.ok()) return status;
-    entry = access_tables_.erase(entry);
-  }
-  const Status release = ddr_allocator_.Release(remote_region_);
-  if (!release.ok()) return release;
+  // Stop accepting work, but keep ownership until cleanup has succeeded.
   initialized_ = false;
-  teardown_started_ = false;
-  remote_region_ = {};
-  return Status::OK();
+
+  // Pending transfers may still reference the region and access tables.
+  // Keep ownership intact if the operator cannot drain or close its session.
+  const Status operator_status = access_operator_.Shutdown();
+  if (!operator_status.ok()) return operator_status;
+
+  Status first_error = Status::OK();
+  for (const auto& entry : access_tables_) {
+    const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
+    if (!status.ok() && first_error.ok()) {
+      first_error = status;
+    }
+  }
+  access_tables_.clear();
+
+  const Status release_status = ddr_allocator_.Release(remote_region_);
+  if (!release_status.ok()) {
+    return first_error.ok() ? release_status : first_error;
+  }
+
+  needs_cleanup_ = false;
+  remote_region_ = RemoteRegionDesc{};
+  return first_error;
 }
 
 Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
@@ -146,9 +154,6 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
   }
   if (completion_unknown_) {
     return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
-  }
-  if (teardown_started_) {
-    return Status::InvalidState("Runtime shutdown is incomplete; only cleanup may be retried");
   }
   if (handle == nullptr) {
     return Status::InvalidArgument("handle must not be null");
@@ -220,9 +225,6 @@ Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
   if (completion_unknown_) {
     return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
   }
-  if (teardown_started_) {
-    return Status::InvalidState("Runtime shutdown is incomplete; only cleanup may be retried");
-  }
   if (view == nullptr) {
     return Status::InvalidArgument("view must not be null");
   }
@@ -242,9 +244,6 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (completion_unknown_) {
     return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
   }
-  if (teardown_started_) {
-    return Status::InvalidState("Runtime shutdown is incomplete; only cleanup may be retried");
-  }
   AccessTableState* table = FindAccessTable(handle);
   if (table == nullptr) {
     return Status::NotFound("AccessTable handle was not found");
@@ -263,7 +262,6 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 Status RuntimeCore::AcquireFusedReadLease(std::function<Status()> fence) {
   if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
   if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
-  if (teardown_started_) return Status::InvalidState("Runtime shutdown is incomplete");
   if (!fence) return Status::InvalidArgument("fused read lease requires a completion fence");
   if (fused_read_fence_) return Status::Busy("Runtime already has an external fused read lease");
   fused_read_fence_ = std::move(fence);
@@ -273,7 +271,6 @@ Status RuntimeCore::AcquireFusedReadLease(std::function<Status()> fence) {
 Status RuntimeCore::CheckFusedReadLease() const {
   if (completion_unknown_) return Status::CompletionUnknown("Runtime completion is unknown");
   if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-  if (teardown_started_) return Status::InvalidState("Runtime shutdown is incomplete");
   if (!fused_read_fence_) return Status::NotFound("Runtime has no external fused read lease");
   return Status::OK();
 }
@@ -332,9 +329,6 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   }
   if (completion_unknown_) {
     return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
-  }
-  if (teardown_started_) {
-    return Status::InvalidState("Runtime shutdown is incomplete; only cleanup may be retried");
   }
   const AccessTableState* table = nullptr;
   if (request.access_table.opaque != 0) {
@@ -437,9 +431,6 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   if (completion_unknown_) {
     return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
   }
-  if (teardown_started_) {
-    return Status::InvalidState("Runtime shutdown is incomplete; only cleanup may be retried");
-  }
   if (request.keys.empty() || request.input.data == nullptr ||
       request.input.bytes == 0 ||
       request.keys.size() != request.input_offsets.size() ||
@@ -489,9 +480,6 @@ Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
   }
   if (completion_unknown_) {
     return Status::CompletionUnknown("Runtime is quarantined after an unconfirmed device transfer");
-  }
-  if (teardown_started_) {
-    return Status::InvalidState("Runtime shutdown is incomplete; only cleanup may be retried");
   }
   if (request.keys.empty()) {
     return Status::InvalidArgument("BatchFree requires at least one key");

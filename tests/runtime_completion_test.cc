@@ -86,11 +86,11 @@ void TestPartialTeardown() {
   kvaf::RuntimeCore core(*metadata, op, allocator);
   Require(core.Initialize({4096, 256, kvaf::DeviceKind::kCpu}).ok(), "initialize cleanup test");
   allocator.fail_release = true;
-  Require(!core.Shutdown().ok() && core.initialized(), "retain incomplete cleanup state");
-  Require(core.BatchFree({{0}}).code() == kvaf::StatusCode::kInvalidState, "reject work during cleanup");
+  Require(!core.Shutdown().ok() && !core.initialized() && core.needs_cleanup(), "retain incomplete cleanup state");
+  Require(core.BatchFree({{0}}).code() == kvaf::StatusCode::kNotInitialized, "reject work during cleanup");
   allocator.fail_release = false;
   Require(core.Shutdown().ok(), "retry arena release");
-  Require(op.shutdowns == 1 && allocator.releases == 2, "retry only unfinished cleanup");
+  Require(op.shutdowns == 2 && allocator.releases == 2, "retry idempotent operator cleanup and retained allocation");
 }
 
 void TestFusedReadLease() {

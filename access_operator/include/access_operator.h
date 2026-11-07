@@ -17,6 +17,7 @@ class PeerLink;
 namespace kvaf {
 
 struct PutAccessDesc;
+struct FusedBatchGetContext;
 using PeerLink = peer::PeerLink;
 
 struct BatchPutExecRequest {
@@ -36,6 +37,21 @@ class AccessOperator {
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
+
+  // Optional capability: only the AIV backend exports fused queue leases.
+  virtual Status AcquireFusedBatchGetContext(
+      void*, std::uint64_t, std::uint32_t, std::uint32_t,
+      FusedBatchGetContext*) {
+    return Status::NotImplemented("This backend does not support fused BatchGet");
+  }
+  virtual Status RegisterFusedBatchGetOutput(
+      const FusedBatchGetContext&, void*, std::uint64_t, FusedBatchGetContext*) {
+    return Status::NotImplemented("This backend does not support fused BatchGet");
+  }
+  virtual Status ReleaseFusedBatchGetContext(const FusedBatchGetContext&, void*) {
+    return Status::NotImplemented("This backend does not support fused BatchGet");
+  }
+
 
 };
 
@@ -83,6 +99,11 @@ struct BatchGetKernelProfile {
   std::uint64_t post_active_cycles{0};
   std::uint64_t drain_wait_cycles{0};
   std::uint64_t peak_submitted_not_drained{0};
+  bool ubmem_profile_detail{false};
+  std::uint64_t ubmem_setup_cycles{0};
+  std::uint64_t ubmem_address_cycles{0};
+  std::uint64_t ubmem_submit_cycles{0};
+  std::uint64_t ubmem_drain_cycles{0};
 };
 
 // Borrowed device resources for a caller-launched fused kernel. KVAF retains

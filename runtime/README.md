@@ -32,7 +32,7 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 segment/token/Jetty 与会话。TCP 监听是无状态的 `RuntimeService`：它只接收连接并
 分发给 Runtime，不拥有硬件资源。
 
-CPU 服务只需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件和 `liburma.so`；不链接
+CPU 服务需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件、`liburma.so` 和 OpenMP；不链接
 或加载 CANN、HCCP、ACL。仓库根目录的统一构建入口会自动拉取固定 UMDK 源码，并在系统
 缺少 `liburma.so` 时只构建所需的 UMDK `urma` target：
 
@@ -353,31 +353,24 @@ directly: each NPU worker owns its local Host DDR mapping and existing
 MetaManager. UBmem does not use `link_to`. Its allocator, data plane, and
 Python bindings must all come from the same build directory.
 
-`ubmem_page_mode="huge"` preserves the default `ACL_DDR_MEM_P2P_HUGE` policy and
-VA page flag 1. Set `ubmem_page_mode="base"` explicitly for
-`ACL_DDR_MEM_P2P_NORMAL` physical pages with VA page flag 0. Both modes query
-their own minimum allocation granularity and round only the backing allocation;
-the requested byte capacity and slot layout remain unchanged. Neither mode
-silently falls back to the other. `UBMEM_ARENA_ALLOC` logs the selected mode,
-requested/mapped sizes, granularity, and NUMA policy before allocation. The
-NUMA ID remains -1 (driver selection); page mode does not select a NUMA node.
-Allocation granularity is not evidence of the physical or NPU translation page
-size. The C++ equivalent is `NpuRuntimeOptions.ubmem_page_mode`, with
-`UbmemPageMode::kHuge` or `UbmemPageMode::kBase`. Base mode requires the UBmem
-transport and a driver that supports Host NUMA normal-page P2P mappings.
+Local registration supports only `thp` (default) and `base`. The former
+`huge` setting is rejected; it is not silently converted to another policy.
+`base` uses `ACL_DDR_MEM_P2P_NORMAL` and VA flag 0, with the driver's minimum
+allocation granularity. Only the backing size is rounded; slot capacity stays
+exactly as requested.
 
-`ubmem_page_mode="thp"` (`UbmemPageMode::kThp`) instead uses Linux Host memory:
-2 MiB aligned `posix_memalign`, `MADV_HUGEPAGE`, and prefaulting the complete
-2 MiB rounded backing allocation. This matches the URMA CPU allocator's THP
-policy; logical capacity and slots stay unchanged. NUMA placement follows the
-worker process policy, which may differ from a separately bound URMA service.
-Before allocating, KVAF requires `aclrtHostMemMapCapabilities` to report AIV
-support. It then registers the Host allocation with `ACL_HOST_REG_MAPPED` only,
-as required by the A5 integration (adding `ACL_HOST_REG_PINNED` can return
-107000), and obtains the independent device address with
-`aclrtHostGetDevicePointer`. Neither page-mode fallback nor a CPU service is
-used. The target CANN/driver must support this mapping; a successful stub test
-does not establish device support.
+`thp` uses 2 MiB aligned Host memory, `MADV_HUGEPAGE`, and prefaults the full
+rounded backing before `ACL_HOST_REG_MAPPED` registration. This matches the
+URMA CPU service's THP advice/prefault policy. `ubmem_numa_node` selects an
+allowed Host NUMA node before first touch; -1 inherits the process policy.
+CANN must report AIV Host mapping support. The independent device address
+comes from `aclrtHostGetDevicePointer`. Neither mode falls back silently.
+
+The normal URMA/AIV build also preserves upstream's CPU-service/Fabric-handle
+UBmem implementation. The isolated `--transport ubmem` build selects the local
+allocator instead: it neither starts a CPU service nor allocates a second arena.
+The upstream service's internal HAL allocation flags are not local registration
+configuration options.
 
 `UBMEM_THP_COVERAGE` records `/proc/self/smaps` before and after registration.
 `status=exact` means the entire allocation was measured; `partial` counts only
@@ -391,8 +384,10 @@ memory.
 
 Put accepts packed NPU bytes with offsets/lengths. It uses an AIV kernel to
 write mapped DDR and commits keys only after stream completion and device
-status validation. The first Put kernel uses one writer for correctness;
-its throughput is not a performance baseline. A transfer whose completion
+status validation. The validated Get uses an eight-stage copy pipeline; Put
+partitions 8 KiB chunks across AIV workers. Pinned status readback uses one
+stream fence. Async Get submission does not wait on background Put; synchronous
+Get diagnostics serialize access to their shared status workspace. A transfer whose completion
 is unknown quarantines the Runtime and retains tensor, metadata, and arena
 ownership until process exit rather than recycling potentially live slots.
 

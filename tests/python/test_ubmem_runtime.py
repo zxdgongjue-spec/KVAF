@@ -144,7 +144,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--page-mode", choices=("huge", "base", "thp"), default="huge")
+    parser.add_argument("--page-mode", choices=("base", "thp"), default="thp")
     parser.add_argument(
         "--token-bytes", type=int, choices=(656, 2624), nargs="+", default=(656, 2624)
     )

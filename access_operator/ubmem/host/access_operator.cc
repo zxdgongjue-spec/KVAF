@@ -1,10 +1,12 @@
-#include "ubmem/access_operator.h"
+#include "ubmem/local_access_operator.h"
 
 #include <acl/acl.h>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -34,7 +36,7 @@ class UbmemAccessOperator final : public AccessOperator {
   }
 
   Status Initialize(const RemoteRegionDesc& region) override {
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    std::unique_lock<std::shared_mutex> lifetime(state_->lifecycle);
     auto& s = *state_;
     if (s.initialized) return Status::InvalidState("UBmem operator already initialized");
     if (s.poisoned) return Status::CompletionUnknown("UBmem operator is poisoned");
@@ -63,7 +65,7 @@ class UbmemAccessOperator final : public AccessOperator {
   }
 
   Status Shutdown() override {
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    std::unique_lock<std::shared_mutex> lifetime(state_->lifecycle);
     auto& s = *state_;
     if (s.poisoned) return Status::CompletionUnknown("UBmem operator retains resources after unknown completion");
     if (!s.initialized) {
@@ -108,7 +110,11 @@ class UbmemAccessOperator final : public AccessOperator {
   }
 
   Status ExecuteBatchGet(const BatchGetExecRequest& exec) override {
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    std::shared_lock<std::shared_mutex> lifetime(state_->lifecycle);
+    // Only synchronous diagnostics share Put's status workspace. Graph/async
+    // Get submission must not wait for a background Put to drain its stream.
+    std::unique_lock<std::mutex> lock(state_->mutex, std::defer_lock);
+    if (exec.execution.synchronize) lock.lock();
     auto ready = CheckReady();
     if (!ready.ok()) return ready;
     if (exec.request == nullptr || exec.execution.stream == nullptr) return Status::InvalidArgument("UBmem Get requires request and caller stream");
@@ -169,6 +175,7 @@ class UbmemAccessOperator final : public AccessOperator {
   }
 
   Status ExecuteBatchPut(const BatchPutExecRequest& exec) override {
+    std::shared_lock<std::shared_mutex> lifetime(state_->lifecycle);
     std::lock_guard<std::mutex> lock(state_->mutex);
     auto ready = CheckReady();
     if (!ready.ok()) return ready;
@@ -220,6 +227,7 @@ class UbmemAccessOperator final : public AccessOperator {
     AccessOperatorConfig config;
     RemoteRegionDesc region;
     ubmem::Kernel get, put;
+    std::shared_mutex lifecycle;
     std::mutex mutex;
     void* status{nullptr};
     void* status_host{nullptr};
@@ -227,7 +235,8 @@ class UbmemAccessOperator final : public AccessOperator {
     void* metadata_device{nullptr};
     size_t metadata_capacity{0};
     int32_t device{-1};
-    bool initialized{false}, poisoned{false};
+    bool initialized{false};
+    std::atomic<bool> poisoned{false};
   };
 
   Status CheckDevice() const {

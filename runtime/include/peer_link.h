@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "peer_protocol.h"
+#include "cpu_gather.h"
 #include "status.h"
 
 namespace kvaf::peer {
@@ -20,6 +21,8 @@ struct PeerRegion {
   uint32_t segment_key_bytes = 0U;
   std::array<uint8_t, kEidBytes> eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
+  std::array<uint8_t, 128> fabric_handle{};
+  uint64_t fabric_mapping_bytes{};
 };
 
 struct PeerCandidateInfo {
@@ -43,8 +46,17 @@ class PeerLink {
   Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
+  Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);
+  Status RetainUbmemMapping(uint64_t base);
+  void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  Status EnableDirectGather(uint64_t region_base) const;
+  Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
+                        OpenCpuPushGetResponse* response) const;
+  Status StartCpuPushGet(uint64_t region_base) const;
+  Status StopCpuPushGet(uint64_t region_base) const;
   Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
@@ -53,9 +65,20 @@ class PeerLink {
       uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
       uint32_t* peer_psn);
 
+  // Shared TP is negotiated explicitly; keep the original overload for callers
+  // using the existing per-channel transport setup.
+  Status CreateChannel(
+      uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
+      uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
+      uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
+      std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
+      uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
+      uint32_t* peer_psn, bool share_tp);
+
  private:
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
+  std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;
 };
 
 }  // namespace kvaf::peer

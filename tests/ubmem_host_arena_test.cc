@@ -19,7 +19,7 @@ struct Driver {
   std::int32_t device{1};
   std::int32_t version{90200000};
   std::size_t granularity{2 * 1024 * 1024};
-  kvaf::UbmemPageMode page_mode{kvaf::UbmemPageMode::kHuge};
+  kvaf::UbmemPageMode page_mode{kvaf::UbmemPageMode::kBase};
   std::size_t allocated{0};
   std::string failures;
   std::string calls;
@@ -68,9 +68,7 @@ kvaf::RuntimeInitRequest Request() { return {8448, 256, kvaf::DeviceKind::kCpu};
 
 void TestExactCapacityAndRelease(kvaf::UbmemPageMode mode) {
   ResetDriver(mode);
-  auto allocator = mode == kvaf::UbmemPageMode::kHuge
-                       ? kvaf::CreateUbmemDdrMemoryAllocator(1)
-                       : kvaf::CreateUbmemDdrMemoryAllocator(1, mode);
+  auto allocator = kvaf::CreateUbmemDdrMemoryAllocator(1, mode);
   kvaf::RemoteRegionDesc region;
   Require(allocator->Allocate(Request(), &region).ok(), "allocate");
   Require(region.base == reinterpret_cast<std::uintptr_t>(Address()) &&
@@ -433,11 +431,7 @@ void TestNativeFusedUnknownCompletion(kvaf::UbmemPageMode mode) {
 
 void TestNativePageModeValidation() {
   for (auto options : {FusedOptions(static_cast<kvaf::UbmemPageMode>(42)),
-                       FusedOptions(kvaf::UbmemPageMode::kBase),
-                       FusedOptions(kvaf::UbmemPageMode::kThp)}) {
-    if (options.ubmem_page_mode != static_cast<kvaf::UbmemPageMode>(42)) {
-      options.transport = kvaf::Transport::kUrma;
-    }
+                       FusedOptions(static_cast<kvaf::UbmemPageMode>(0))}) {
     bool rejected = false;
     try {
       kvaf::NpuRuntime runtime(options);
@@ -447,7 +441,7 @@ void TestNativePageModeValidation() {
     Require(rejected, "native Runtime rejects invalid or non-UBmem page configuration");
   }
   Require(kvaf::NpuRuntimeOptions("get", 656, 128).ubmem_page_mode ==
-              kvaf::UbmemPageMode::kHuge, "default Runtime page mode remains huge");
+              kvaf::UbmemPageMode::kThp, "default Runtime page mode is THP");
 }
 #endif
 
@@ -626,7 +620,7 @@ std::unique_ptr<AccessOperator> CreateUbmemAccessOperator(const AccessOperatorCo
 
 int main() {
   try {
-    for (const auto mode : {kvaf::UbmemPageMode::kHuge, kvaf::UbmemPageMode::kBase}) {
+    for (const auto mode : {kvaf::UbmemPageMode::kBase}) {
       TestExactCapacityAndRelease(mode);
       TestInvalidRequests(mode);
       TestConstructionFailures(mode);

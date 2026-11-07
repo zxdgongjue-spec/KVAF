@@ -2,12 +2,13 @@
 # Run the Runtime API benchmark through the separately running CPU DDR service.
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu" >&2
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--transport urma|ubmem]" >&2
   exit 2
 fi
 
 KVAF_BUILD_DIR="$1"
+shift
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KVAF_GET_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_get_kernels.o"
 KVAF_PUT_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_put_kernels.o"
@@ -34,4 +35,4 @@ export DEVICE_ID
 export PYTHONPATH="$KVAF_BUILD_DIR/python${PYTHONPATH:+:$PYTHONPATH}"
 
 exec timeout "${KVAF_REMOTE_CPU_PERF_TIMEOUT}s" \
-  python3 "$KVAF_ROOT/tests/python/test_npu_runtime_perf.py"
+  python3 "$KVAF_ROOT/tests/python/test_npu_runtime_perf.py" "$@"

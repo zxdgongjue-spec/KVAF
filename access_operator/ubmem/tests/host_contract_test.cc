@@ -6,11 +6,14 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <functional>
+#include <future>
+#include <chrono>
 #include <vector>
 
 #include "../host/kernel_loader.h"
 #include "meta_manager.h"
-#include "ubmem/access_operator.h"
+#include "ubmem/local_access_operator.h"
 #include "ubmem/transfer_abi.h"
 
 namespace model {
@@ -18,6 +21,7 @@ std::map<void*, bool> allocations;
 int32_t device = 0;
 bool fail_sync = false, fail_free = false, fail_d2h = false, fail_host_alloc = false;
 bool bad_status = false;
+std::function<void()> sync_hook;
 uint32_t sync_calls = 0, async_d2h = 0, blocking_d2h = 0;
 struct PendingCopy { void* destination; const void* source; size_t bytes; aclrtStream stream; };
 std::vector<PendingCopy> pending;
@@ -65,6 +69,7 @@ aclError aclrtMemsetAsync(void* destination, size_t capacity, int value, size_t 
 }
 aclError aclrtSynchronizeStream(aclrtStream stream) {
   ++model::sync_calls;
+  if (model::sync_hook) model::sync_hook();
   if (model::fail_sync) return 17;
   for (const auto& copy : model::pending) {
     assert(copy.stream == stream);
@@ -161,6 +166,16 @@ int main() {
     auto before_copies = model::copies, before_memsets = model::memsets;
     assert(op->ExecuteBatchGet({{}, &get, {model::stream, false}}).ok());
     assert(model::copies == before_copies && model::memsets == before_memsets);
+    // A Put waiting on its stream must not block normal async Get submission.
+    model::sync_hook = [&] {
+      auto submitted = std::async(std::launch::async, [&] {
+        return op->ExecuteBatchGet({{}, &get, {model::stream, false}});
+      });
+      assert(submitted.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+      assert(submitted.get().ok());
+    };
+    assert(op->ExecuteBatchPut(put).ok());
+    model::sync_hook = {};
     model::device = 1;
     assert(op->ExecuteBatchPut(put).code() == StatusCode::kInvalidState);
     model::device = 0;

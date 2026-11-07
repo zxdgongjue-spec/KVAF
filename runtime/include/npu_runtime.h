@@ -10,12 +10,11 @@
 #include "runtime.h"
 #include "ubmem/fused_context.h"
 #include "ubmem/host_arena.h"
+#include "npu_runtime_config.h"
 
 namespace kvaf {
 
 struct BatchGetKernelProfile;
-
-enum class Transport { kUrma, kUbmem };
 
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
@@ -33,12 +32,16 @@ struct NpuRuntimeOptions {
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{2U};
   std::uint32_t jettys_per_core{2U};
+  // Empty selects AIV. gather_read / cpu_push_scatter select AICPU Get and Put.
+  // The AICPU kernel package is resolved from the CANN installation internally.
+  std::string aicpu_batch_get_mode{};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and
-  // selects one working EID. Multiple entries create simultaneous BatchGet
+  // selects one working EID. For AIV, multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut
-  // remains on the first EID.
+  // remains on the first EID. Both AICPU modes try explicit EIDs one at a time
+  // as connectivity fallbacks; Get and Put share the selected EID.
   std::vector<std::string> npu_eids{};
   // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
   // explicit device uses the native first-working path without tuning.
@@ -55,7 +58,7 @@ struct NpuRuntimeOptions {
   // Caller already initialized device RA (for example through HCCL). Borrow
   // it without calling RaInit again; the caller retains its lifetime.
   bool reuse_device_ra{false};
-  UbmemPageMode ubmem_page_mode{UbmemPageMode::kHuge};
+  UbmemPageMode ubmem_page_mode{UbmemPageMode::kThp};
   int ubmem_numa_node{-1};  // THP arena only; -1 inherits the caller policy.
 };
 
@@ -75,13 +78,14 @@ class NpuRuntime final : public Runtime {
 
   std::uint32_t device_id() const;
   Transport transport() const;
+  bool uses_aicpu() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
-  Status SetBatchGetKernelProfiling(bool enabled);
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

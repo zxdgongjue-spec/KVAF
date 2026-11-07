@@ -8,6 +8,7 @@
 
 namespace kvaf {
 
+enum class CpuGatherMode { kAdaptive, kActive, kPassive };
 enum class CpuMemoryPageMode {
   kDefault,
   kTransparentHugePage,
@@ -17,10 +18,14 @@ struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
+  std::uint32_t gather_threads{0U};
+  bool gather_affinity{true};
+  CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
+  std::string hal_library{"libascend_hal.so"};
 };
 
-// CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
+// CPU endpoint Runtime. Allocation requests select URMA or UBmem per session;
 // RuntimeService owns the listening socket and calls ServeConnection.
 class CpuRuntime final : public Runtime {
  public:

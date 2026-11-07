@@ -16,6 +16,8 @@ constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
+constexpr uint32_t kMaxGatherSpans = 65536U;
+constexpr uint32_t kChannelSharedTp = 1U;
 constexpr uint32_t kDeviceNameBytes = 64U;
 
 enum class Command : uint16_t {
@@ -23,7 +25,14 @@ enum class Command : uint16_t {
   kCreateChannel = 2U,
   kReleaseRegion = 3U,
   kGetCandidateCount = 4U,
+  kEnableDirectGather = 9U,
+  kEnableGatherLanes = 10U,
   kGetCandidateInfo = 5U,
+  kOpenCpuPushGet = 11U,
+  kStartCpuPushGet = 12U,
+  kStopCpuPushGet = 13U,
+  kAllocateUbmemRegion = 6U,
+  // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
 
 enum class Result : int32_t {
@@ -116,12 +125,68 @@ struct ReleaseRegionRequest {
   uint64_t session_id;
 };
 
+// UBmem allocation shares the service and session namespace with URMA.
+// Existing URMA v6 records and entry points stay usable.
+struct AllocateUbmemRegionRequest {
+  MessageHeader header;
+  uint64_t ddr_bytes;
+  uint64_t slot_size;
+};
+
+struct AllocateUbmemRegionResponse {
+  MessageHeader header;
+  int32_t result;
+  uint64_t session_id;
+  uint64_t peer_base;
+  uint64_t peer_length;
+  uint64_t mapping_bytes;
+  uint8_t fabric_handle[128];
+  char error_message[256];
+};
+
 struct StatusResponse {
   MessageHeader header;
   int32_t result;
   uint32_t reserved;
 };
+struct EnableDirectGatherRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
+struct EnableGatherLanesRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t control_address;
+  uint32_t lanes;
+};
+// CPU-initiated transfers target Host-registered HBM. Setup completes before
+// the separate start command permits the CPU worker to issue any DMA.
+struct CpuPushChannelKey {
+  uint32_t bytes;
+  uint8_t key[kQpKeyBytes];
+};
+struct OpenCpuPushGetRequest {
+  MessageHeader header;
+  uint64_t session_id, source_bytes, hbm_base, hbm_bytes, npu_tp;
+  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers;
+  uint8_t eid[kEidBytes], segment[kSegKeyBytes];
+  CpuPushChannelKey channels[4];
+};
+struct OpenCpuPushGetResponse {
+  MessageHeader header;
+  int32_t result;
+  uint64_t cpu_tp;
+  uint32_t cpu_psn;
+  CpuPushChannelKey channels[4];
+};
+struct CpuPushGetSessionRequest {
+  MessageHeader header;
+  uint64_t session_id;
+};
 #pragma pack(pop)
+
+static_assert(sizeof(AllocateUbmemRegionRequest) == 28U, "UBmem allocation ABI changed");
+static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI changed");
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
@@ -131,6 +196,10 @@ static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI c
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
+static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
+static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
+static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;
