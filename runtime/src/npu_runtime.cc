@@ -25,6 +25,7 @@
 #include "access_operator.h"
 #include "ubmem/access_operator.h"
 #include "ubmem_allocator.h"
+#include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 #include "gather_workspace.h"
@@ -92,6 +93,8 @@ struct NpuLocalEidCandidate {
 constexpr char kUbDevIdPath[] = "/proc/asdrv_ub/dev_id";
 constexpr char kUbPairInfoPath[] = "/proc/asdrv_ub/pair_info";
 constexpr char kUbSelectorLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
+// Same PID-scoped HDC service used by the BatchGet and BatchPut transports.
+constexpr std::uint32_t kPidHdcType = 18U;
 
 std::string EidToHex(const std::array<std::uint8_t, peer::kEidBytes>& eid) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -563,6 +566,12 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
 NpuRuntime::~NpuRuntime() {
   if (impl_ != nullptr) {
     const auto status = Shutdown();
+    if (!status.ok()) {
+      std::fprintf(stderr, "[KVAF_AIV] FUSED_RUNTIME_RETAINED_ON_DESTRUCTION "
+                           "reason=teardown_not_safe\n");
+      (void)impl_.release();
+      return;
+    }
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     if (status.ok()) impl_->ReleaseProbe();
@@ -605,6 +614,20 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
+  }
+  if (impl_->options.reuse_device_ra) {
+    std::uint32_t physical_device_id = 0U;
+    if (!ResolvePhysicalDeviceId(impl_->options.device_id, &physical_device_id)) {
+      return Internal("cannot resolve physical NPU for caller-initialized device RA");
+    }
+    direct_hccp::DirectHccpSession* session = nullptr;
+    if (!direct_hccp::AcquireDirectHccpSession(
+            physical_device_id, kPidHdcType, &session, true)) {
+      return Internal("failed to borrow caller-initialized device RA");
+    }
+    // The shared session remains cached at refs=0 for the process lifetime.
+    // Every candidate's BatchGet/BatchPut transport acquires this same session.
+    direct_hccp::ReleaseDirectHccpSession(session);
   }
 
   if (impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()) {
@@ -978,6 +1001,34 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
   return Status::NotImplemented("NpuRuntime does not accept links in the CPU--NPU deployment");
 }
 
+Status NpuRuntime::AcquireFusedBatchGetContext(
+    void* output, std::uint64_t output_bytes, FusedBatchGetContext* context) {
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("initialize the linked Runtime before acquiring a fused context");
+  }
+  return impl_->access_operator->AcquireFusedBatchGetContext(
+      output, output_bytes, impl_->options.batch_get_token_bytes,
+      impl_->options.batch_get_tokens_per_block, context);
+}
+
+Status NpuRuntime::RegisterFusedBatchGetOutput(
+    const FusedBatchGetContext& owner, void* output,
+    std::uint64_t output_bytes, FusedBatchGetContext* view) {
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("Runtime has no fused BatchGet context");
+  }
+  return impl_->access_operator->RegisterFusedBatchGetOutput(
+      owner, output, output_bytes, view);
+}
+
+Status NpuRuntime::ReleaseFusedBatchGetContext(
+    const FusedBatchGetContext& context, void* stream) {
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("Runtime has no fused BatchGet context");
+  }
+  return impl_->access_operator->ReleaseFusedBatchGetContext(context, stream);
+}
+
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
@@ -1002,7 +1053,8 @@ Status NpuRuntime::Shutdown() {
   const Status status = impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()
                             ? impl_->runtime_core->Shutdown()
                             : Status::OK();
-  if (status.ok()) impl_->ReleaseProbe();
+  if (!status.ok()) return status;
+  impl_->ReleaseProbe();
   return status;
 }
 

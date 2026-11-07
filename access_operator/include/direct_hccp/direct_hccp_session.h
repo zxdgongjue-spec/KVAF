@@ -22,9 +22,12 @@ void VerboseLog(const char* format, ...);
 // owned by KVAF after a successful RaInit or borrowed when HCCL already owns a
 // compatible device RA. Later callers only take a reference. The caller must
 // pair every success with ReleaseDirectHccpSession after all of its RaCtx
-// resources are gone.
+// resources are gone. On the first acquisition, reuse_device_ra asserts that
+// the caller already initialized device RA: skip RaInit without probing or
+// falling back to another initialization of the shared HDC state.
 bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
-                              DirectHccpSession **session);
+                              DirectHccpSession **session,
+                              bool reuse_device_ra = false);
 
 // Releases a logical transport reference. The RA/HDC bootstrap remains
 // process-owned after its first successful initialization: CANN has no close

@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "access_operator.h"
 #include "runtime.h"
 #include "npu_runtime_config.h"
 
@@ -53,6 +54,9 @@ struct NpuRuntimeOptions {
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};
+  // Caller already initialized device RA (for example through HCCL). Borrow
+  // it without calling RaInit again; the caller retains its lifetime.
+  bool reuse_device_ra{false};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -80,6 +84,18 @@ class NpuRuntime final : public Runtime {
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+
+  // Acquire once before fused launches. KVAF registers this caller-owned HBM
+  // output and exclusively leases its BatchGet queues; ordinary BatchGet and
+  // another acquisition are rejected until release. All uses of the returned
+  // context must run sequentially on one caller stream.
+  Status AcquireFusedBatchGetContext(void* output, std::uint64_t output_bytes,
+                                    FusedBatchGetContext* context);
+  Status RegisterFusedBatchGetOutput(
+      const FusedBatchGetContext& owner, void* output,
+      std::uint64_t output_bytes, FusedBatchGetContext* view);
+  Status ReleaseFusedBatchGetContext(const FusedBatchGetContext& context,
+                                    void* stream);
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

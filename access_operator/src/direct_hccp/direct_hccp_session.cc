@@ -190,9 +190,20 @@ bool CallRaInit(DirectHccpSession *session, uint32_t mode, const char *role) {
 // and KVAF resolve RA through different library images. KVAF therefore owns
 // and deinitializes device RA only after a successful RaInit; on 328002 it
 // borrows the existing RA while retaining independent data-plane resources.
-bool EnsureDeviceRa(DirectHccpSession *session) {
+bool EnsureDeviceRa(DirectHccpSession *session, bool reuse_device_ra) {
   if (session == nullptr) {
     return false;
+  }
+  if (reuse_device_ra) {
+    // Repeated RaInit can reinitialize HCCL's live HDC mutex before returning
+    // EEXIST. The caller explicitly owns this already-initialized device RA.
+    session->device_ra_owned = false;
+    std::fprintf(stderr,
+                 "[KVAF_AIV] DIRECT_HCCP_SESSION_RA_REUSED "
+                 "role=device_aiv physical=%u hdc_type=%u "
+                 "source=caller_initialized\n",
+                 session->key.physical_device_id, session->key.hdc_type);
+    return true;
   }
   const int ret = CallRaInitWithRetry(session, kOfflineHdc, "device_aiv");
   if (ret == 0) {
@@ -247,7 +258,7 @@ void CallRaDeinitBestEffort(DirectHccpSession *session, uint32_t mode, const cha
                role, session->key.physical_device_id, mode, ret);
 }
 
-bool Bootstrap(DirectHccpSession *session) {
+bool Bootstrap(DirectHccpSession *session, bool reuse_device_ra) {
   if (!CallRaInit(session, kPeerOnline, "peer_online")) {
     return false;
   }
@@ -272,7 +283,7 @@ bool Bootstrap(DirectHccpSession *session) {
   VerboseLog("[KVAF_AIV] DIRECT_HCCP_SESSION_SERVICE_READY physical=%u hdc_type=%u\n",
              session->key.physical_device_id, session->key.hdc_type);
 
-  if (!EnsureDeviceRa(session)) {
+  if (!EnsureDeviceRa(session, reuse_device_ra)) {
     CallRaDeinitBestEffort(session, kPeerOnline, "peer_online");
     session->peer_ra_owned = false;
     return false;
@@ -296,7 +307,8 @@ void DestroySession(DirectHccpSession *session) {
 }  // namespace
 
 bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
-                              DirectHccpSession **session) {
+                              DirectHccpSession **session,
+                              bool reuse_device_ra) {
   if (session == nullptr || hdc_type == 0U) {
     return false;
   }
@@ -314,7 +326,7 @@ bool AcquireDirectHccpSession(uint32_t physical_device_id, uint32_t hdc_type,
 
   auto created = std::make_unique<DirectHccpSession>();
   created->key = key;
-  if (!LoadSessionApi(created.get()) || !Bootstrap(created.get())) {
+  if (!LoadSessionApi(created.get()) || !Bootstrap(created.get(), reuse_device_ra)) {
     DestroySession(created.get());
     return false;
   }
