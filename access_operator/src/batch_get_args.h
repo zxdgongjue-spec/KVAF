@@ -42,6 +42,11 @@ inline Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
            PointerValue(request.output_indices.data),
            static_cast<std::uint32_t>(entries), static_cast<std::uint32_t>(count),
            static_cast<std::uint32_t>(request.output_block_bytes)};
+  args->valid_table = PointerValue(request.device_access_table.valid.data);
+  if (!request.tokens_per_block ||
+      request.tokens_per_block > UINT64_MAX / request.output_block_bytes)
+    return Status::InvalidArgument("invalid AICPU block layout");
+  args->block_bytes = request.tokens_per_block * request.output_block_bytes;
   return Status::OK();
 }
 }  // namespace kvaf::detail

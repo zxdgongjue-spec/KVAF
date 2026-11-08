@@ -158,11 +158,12 @@ class UrmaResources {
     return true;
   }
 
-  void Shutdown() {
-    if (context_ != nullptr) {
-      (void)urma_delete_context(context_);
+  bool Shutdown() {
+    if (context_) {
+      if (urma_delete_context(context_) != URMA_SUCCESS) return false;
       context_ = nullptr;
     }
+    return true;
   }
 
   urma_context_t* context() const { return context_; }
@@ -276,7 +277,7 @@ class UrmaResourcePool {
     }
     UrmaCandidate& candidate = candidates_[candidate_id];
     if (candidate.resources != nullptr) {
-      return candidate.resources.get();
+      return candidate.unavailable ? nullptr : candidate.resources.get();
     }
     if (candidate.unavailable) {
       Log("[KVAF_CPU] CANDIDATE_REJECTED id=%u reason=initialization_failed\n", candidate_id);
@@ -285,12 +286,14 @@ class UrmaResourcePool {
     auto resources = std::make_unique<UrmaResources>();
     if (!resources->Initialize(candidate.device_name, candidate.eid_index)) {
       candidate.unavailable = true;
+      candidate.resources = std::move(resources);
       Log("[KVAF_CPU] CANDIDATE_UNAVAILABLE id=%u ub_device=%s eid_index=%u\n", candidate.id,
           candidate.device_name.c_str(), candidate.eid_index);
       return nullptr;
     }
     if (std::memcmp(resources->context()->eid.raw, candidate.eid.data(), candidate.eid.size()) != 0) {
       candidate.unavailable = true;
+      candidate.resources = std::move(resources);
       Log("[KVAF_CPU] CANDIDATE_UNAVAILABLE id=%u reason=eid_changed ub_device=%s eid_index=%u\n",
           candidate.id, candidate.device_name.c_str(), candidate.eid_index);
       return nullptr;
@@ -299,12 +302,16 @@ class UrmaResourcePool {
     return candidate.resources.get();
   }
 
- private:
-  void Shutdown() {
+ public:
+  bool Shutdown() {
+    for (auto& candidate : candidates_)
+      if (candidate.resources && !candidate.resources->Shutdown()) return false;
     candidates_.clear();
     discovery_.Shutdown();
+    return true;
   }
 
+ private:
   CpuUrmaDiscovery discovery_;
   std::vector<UrmaCandidate> candidates_;
 };
@@ -389,6 +396,7 @@ struct Region {
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
+  bool borrowed = false;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
   urma_token_id_t* token_id = nullptr;
@@ -445,7 +453,7 @@ class CpuService {
   }
 
   Result Allocate(uint64_t bytes, uint64_t slot_size, uint32_t candidate_id,
-                  AllocateRegionResponse* response) {
+                  AllocateRegionResponse* response, void* borrowed = nullptr) {
     if (response == nullptr || bytes == 0U || slot_size == 0U || bytes % slot_size != 0U ||
         bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
@@ -455,21 +463,28 @@ class CpuService {
       return Result::kResourceError;
     }
     auto region = std::make_unique<Region>();
+    const uint64_t id = next_region_id_++;
+    region->id = id;
+    auto fail = [&] {
+      if (!ReleaseRegion(region.get())) regions_.emplace(id, std::move(region));
+      return Result::kResourceError;
+    };
     region->candidate_id = candidate_id;
     region->resources = resources;
     region->bytes = bytes;
-    if (!AllocateMemory(region.get())) {
+    region->borrowed = borrowed != nullptr;
+    region->memory = borrowed;
+    if (!borrowed && !AllocateMemory(region.get())) {
       return Result::kResourceError;
     }
     region->bytes = bytes;
-    if (bytes >= 64U)
+    if (!borrowed && bytes >= 64U)
       std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
     region->token_value = NextToken();
     region->token_id = urma_alloc_token_id(resources->context());
     if (region->token_id == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
-      ReleaseRegion(region.get());
-      return Result::kResourceError;
+      return fail();
     }
     urma_reg_seg_flag_t flag{};
     flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
@@ -493,12 +508,11 @@ class CpuService {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
           " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
           region->memory, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
-      ReleaseRegion(region.get());
-      return Result::kResourceError;
+      return fail();
     }
-    const uint64_t id = next_region_id_++;
-    region->id = id;
-    region->base = region->segment->seg.ubva.va;
+
+    region->base =
+        borrowed ? reinterpret_cast<std::uint64_t>(borrowed) : region->segment->seg.ubva.va;
     response->session_id = id;
     response->peer_base = region->segment->seg.ubva.va;
     response->peer_length = bytes;
@@ -513,8 +527,7 @@ class CpuService {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
           " token_id=0x%x\n",
         response->peer_base, response->token_id);
-      ReleaseRegion(region.get());
-      return Result::kResourceError;
+      return fail();
     }
     regions_.emplace(id, std::move(region));
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
@@ -551,17 +564,20 @@ class CpuService {
     }
     std::fprintf(stderr, "\n");
     Channel channel{};
+    auto failed = [&] {
+      if (!channel.Close()) region.channels.push_back(std::move(channel));
+      return Result::kResourceError;
+    };
     const bool share_tp = (request.reserved & peer::kChannelSharedTp) != 0U;
     const bool created = share_tp
         ? channel.CreateLocal(region.resources->context(), region.token_value)
         : CreateLocalJetty(region.resources, region.token_value, &channel.local_jfc,
                             &channel.local_jfr, &channel.local_jetty);
-    if (!created)
-      return Result::kResourceError;
+    if (!created) return failed();
     const auto* shared = share_tp ? cpu_runtime_detail::FindSharedChannelTp(
         region.channels, request.local_eid, request.local_tp_handle) : nullptr;
     if (shared != nullptr) {
-      if (shared->peer_psn != request.local_psn) return Result::kInvalidRequest;
+      if (shared->peer_psn != request.local_psn) return failed();
       channel.tp = *shared;
     } else {
       channel.tp.shared = share_tp;
@@ -569,13 +585,12 @@ class CpuService {
       channel.tp.peer = request.local_tp_handle;
       channel.tp.peer_psn = request.local_psn;
       channel.tp.local_psn = NextPsn();
-      if (!region.resources->GetCtpForPeer(request.local_eid, &channel.tp.local))
-        return Result::kResourceError;
+      if (!region.resources->GetCtpForPeer(request.local_eid, &channel.tp.local)) return failed();
     }
     if (!ImportRemoteJetty(region.resources, request.local_qp_key, request.peer_token_value,
                            channel.tp.local, channel.tp.peer, channel.tp.local_psn,
                            channel.tp.peer_psn, &channel.remote_jetty))
-      return Result::kResourceError;
+      return failed();
     std::memcpy(response->peer_qp_key, &channel.local_jetty->jetty_id,
                 sizeof(channel.local_jetty->jetty_id));
     const urma_transport_mode_t mode = channel.local_jetty->jetty_cfg.jfs_cfg.trans_mode;
@@ -604,7 +619,7 @@ class CpuService {
     if (StopCpuPushGet(id) != Result::kOk) return Result::kResourceError;
     Log("[KVAF_CPU] REGION_RELEASE session=%" PRIu64 " channels=%zu\n", id,
         found->second->channels.size());
-    ReleaseRegion(found->second.get());
+    if (!ReleaseRegion(found->second.get())) return Result::kResourceError;
     regions_.erase(found);
     return Result::kOk;
   }
@@ -669,9 +684,9 @@ class CpuService {
         static_cast<unsigned long long>(request.session_id), request.workers, request.token_bytes,
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<cpu_push::Transport>();
-    const auto status = transport->Initialize(region.resources->context(), region.segment,
-        request, region.resources->tp_query(), region.resources->jetty_import(),
-        NextPsn(), response);
+    const auto status = transport->Initialize(
+        region.resources->context(), region.segment, request, region.resources->tp_query(),
+        region.resources->jetty_import(), NextPsn(), response, region.base);
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
       const auto stopped = transport->Shutdown();
@@ -842,42 +857,47 @@ class CpuService {
     return true;
   }
 
-  void ReleaseRegion(Region* region) {
-    if (region == nullptr) {
-      return;
-    }
+  bool ReleaseRegion(Region* region) {
+    if (region == nullptr) return true;
     if (region->push) {
       if (!region->push->Stop().ok()) {
         // The process must keep source DDR registered until all DMA stops.
         Log("[KVAF_CPU] CPU_PUSH_RELEASE_FAILED source region retained\n");
-        return;
+        return false;
       }
       region->push.reset();
     }
     region->gather.reset();
     region->gather_lanes.clear();
-    while (!region->channels.empty()) region->channels.pop_back();
+    while (!region->channels.empty()) {
+      if (!region->channels.back().Close()) return false;
+      region->channels.pop_back();
+    }
     if (region->segment != nullptr) {
-      (void)urma_unregister_seg(region->segment);
+      if (urma_unregister_seg(region->segment) != URMA_SUCCESS) return false;
       region->segment = nullptr;
     }
     if (region->token_id != nullptr) {
-      (void)urma_free_token_id(region->token_id);
+      if (urma_free_token_id(region->token_id) != URMA_SUCCESS) return false;
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
-      free(region->memory);
+      if (!region->borrowed) free(region->memory);
       region->memory = nullptr;
     }
+    return true;
   }
 
-  void ReleaseAll() {
-    for (auto& entry : regions_) {
-      ReleaseRegion(entry.second.get());
+ public:
+  bool ReleaseAll() {
+    for (auto it = regions_.begin(); it != regions_.end();) {
+      if (!ReleaseRegion(it->second.get())) return false;
+      it = regions_.erase(it);
     }
-    regions_.clear();
+    return true;
   }
 
+ private:
   UrmaResourcePool* resource_pool_ = nullptr;
   std::size_t gather_threads_{1U};
   std::size_t min_bytes_per_thread_{256U * 1024U};
@@ -891,7 +911,26 @@ class CpuService {
   std::unordered_map<uint64_t, std::unique_ptr<Region>> regions_;
 };
 
-void SendStatus(int fd, Command command, Result result) {
+// Reuse the existing typed command handlers without opening an internal socket.
+struct MemoryIo {
+  const std::vector<std::uint8_t>& input;
+  std::vector<std::uint8_t>& output;
+  std::size_t offset = sizeof(MessageHeader);
+};
+bool ReadAll(MemoryIo* io, void* data, std::size_t bytes) {
+  if (bytes > io->input.size() - io->offset) return false;
+  std::memcpy(data, io->input.data() + io->offset, bytes);
+  io->offset += bytes;
+  return true;
+}
+bool WriteAll(MemoryIo* io, const void* data, std::size_t bytes) {
+  const auto* begin = static_cast<const std::uint8_t*>(data);
+  io->output.insert(io->output.end(), begin, begin + bytes);
+  return true;
+}
+
+template <class IO>
+void SendStatus(IO fd, Command command, Result result) {
   StatusResponse response{};
   response.header = MakeHeader(command, sizeof(response));
   response.header.command = ResponseCommand(command);
@@ -899,7 +938,8 @@ void SendStatus(int fd, Command command, Result result) {
   (void)WriteAll(fd, &response, sizeof(response));
 }
 
-void HandleClient(int fd, CpuService* service, const MessageHeader& header) {
+template <class IO>
+void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
   const Command command = static_cast<Command>(header.command);
   switch (command) {
     case Command::kAllocateRegion: {
@@ -1081,6 +1121,48 @@ Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& ne
   return Status::OK();
 }
 
+Status UrmaCpuBackend::AttachRegion(void* memory, std::uint64_t bytes, std::uint64_t slot_size,
+                                    std::uint32_t candidate, peer::PeerRegion* binding) {
+  if (!impl_ || !memory || !binding) return Status::InvalidArgument("invalid borrowed region");
+  peer::AllocateRegionResponse response{};
+  if (impl_->service->Allocate(bytes, slot_size, candidate, &response, memory) != Result::kOk)
+    return Status::Internal("cannot register execution DDR binding");
+  binding->session_id = response.session_id;
+  binding->base = response.peer_base;
+  binding->length = response.peer_length;
+  binding->token_id = response.token_id;
+  binding->token_value = response.token_value;
+  binding->segment_key_bytes = response.segment_key_bytes;
+  std::copy_n(response.peer_eid, binding->eid.size(), binding->eid.begin());
+  std::copy_n(response.segment_key, binding->segment_key.size(), binding->segment_key.begin());
+  return Status::OK();
+}
+Status UrmaCpuBackend::Call(const std::vector<std::uint8_t>& input,
+                            std::vector<std::uint8_t>* output) {
+  if (!impl_ || !output || input.size() < sizeof(MessageHeader))
+    return Status::InvalidArgument("invalid session call");
+  MessageHeader header{};
+  std::memcpy(&header, input.data(), sizeof(header));
+  const auto command = static_cast<Command>(header.command);
+  switch (command) {
+    case Command::kCreateChannel:
+    case Command::kEnableDirectGather:
+    case Command::kEnableGatherLanes:
+    case Command::kOpenCpuPushGet:
+    case Command::kStartCpuPushGet:
+    case Command::kStopCpuPushGet:
+      break;
+    default:
+      return Status::InvalidArgument("command is not an execution session operation");
+  }
+  if (!IsValidHeader(header, command, input.size()))
+    return Status::InvalidArgument("invalid inner header");
+  output->clear();
+  MemoryIo io{input, *output};
+  HandleClient(&io, impl_->service.get(), header);
+  return Status::OK();
+}
+
 Status UrmaCpuBackend::ServeConnection(int connection_fd, const peer::MessageHeader& header) {
   if (!initialized()) return Status::NotInitialized("CpuRuntime has not been initialized");
   if (connection_fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
@@ -1100,6 +1182,10 @@ Status UrmaCpuBackend::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
   auto stopped = impl_->service->StopAllPush();
   if (!stopped.ok()) return stopped;
+  if (!impl_->service->ReleaseAll())
+    return Status::Internal("URMA resources still in use; retry close");
+  if (!impl_->resources.Shutdown())
+    return Status::Internal("URMA contexts still in use; retry close");
   impl_.reset();
   return Status::OK();
 }

@@ -292,6 +292,10 @@ struct DefaultAccessOperator::Impl {
   BatchGetExecutionState execution;
   aclrtStream pending_get{nullptr};
   KvafBatchGetLocalBuffer* pending_buffer{nullptr};
+  KvafBatchGetLocalBuffer* graph_buffer{nullptr};
+  std::uint64_t graph_entity{0};
+  GetGraphOptions graph_options;
+  bool graph_recorded{false};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -316,7 +320,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
       impl_->config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
       impl_->config.jettys_per_core == 0 ||
       impl_->config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-      (impl_->config.batch_get_max_inflight_total != 0U &&
+      (impl_->config.enable_get && impl_->config.batch_get_max_inflight_total != 0U &&
        impl_->config.batch_get_max_inflight_total < 2U * impl_->config.npu_core_count)) {
     return InvalidArgument("invalid AccessOperator initialization config");
   }
@@ -461,6 +465,7 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
 }
 
 Status DefaultAccessOperator::Shutdown() {
+  if (impl_->graph_buffer) return Status::Busy("release graph lease before provider shutdown");
   if (!impl_->initialized) {
     return Status::OK();
   }
@@ -501,6 +506,69 @@ Status DefaultAccessOperator::Shutdown() {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::Warmup(const ExecutionWarmup& request) {
+  if (!impl_->initialized) return Status::NotInitialized("AIV provider not initialized");
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (impl_->batch_put_transport && request.request_capacity)
+    return EnsureBatchPutMetadataCapacity(request.request_capacity, &impl_->batch_put_execution);
+#endif
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
+  if (!impl_->initialized || !impl_->transport || impl_->graph_buffer)
+    return Status::InvalidState("AIV graph provider is unavailable or leased");
+  if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
+      !options.request_capacity)
+    return Status::InvalidArgument("graph preparation requires output, capacity and stream");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(options.stream), &capture, &graph) !=
+      ACL_SUCCESS)
+    return Internal("cannot query graph capture state");
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("prepare graph resources before capture");
+  auto s = DrainGet();
+  if (!s.ok()) return s;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, options.output.data, options.output.bytes,
+                                     &impl_->graph_buffer,
+                                     &impl_->graph_entity) != KVAF_BATCH_GET_SUCCESS)
+    return Internal("cannot register graph output");
+  impl_->graph_options = options;
+  impl_->graph_recorded = false;
+  return Status::OK();
+}
+Status DefaultAccessOperator::FinishGetGraph(void* stream, bool discard) {
+  if (!impl_->graph_buffer) return Status::NotFound("AIV graph lease not found");
+  if (!stream) return InvalidArgument("graph release requires its last replay stream");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(stream), &capture, &graph) != ACL_SUCCESS)
+    return Internal("cannot query graph capture state");
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("finish capture before releasing graph");
+  if (aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) != ACL_SUCCESS)
+    return Status::CompletionUnknown("graph replay completion unresolved");
+  if (impl_->graph_recorded && !discard) {
+    std::vector<KvafBatchGetCoreStatus> reports(impl_->config.npu_core_count);
+    if (aclrtMemcpy(reports.data(), impl_->execution.status_bytes, impl_->execution.status,
+                    impl_->execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+      return Internal("cannot collect graph completion");
+    for (const auto& r : reports)
+      if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result)
+        return Internal(
+            "graph result failed or graph was never replayed; inspect then release with "
+            "discard_result=True");
+  }
+  if (KvafBatchGetLocalBufferRetire(impl_->graph_buffer) != KVAF_BATCH_GET_SUCCESS)
+    return Internal("cannot retire graph registration");
+  impl_->graph_buffer = nullptr;
+  impl_->graph_entity = 0;
+  impl_->graph_options = {};
+  impl_->graph_recorded = false;
+  return Status::OK();
+}
+
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
@@ -509,7 +577,24 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
-  if (impl_->config.managed_completion) {
+  const bool graph_lease = impl_->graph_buffer != nullptr;
+  if (graph_lease) {
+    if (!exec.request || exec.request->output.data != impl_->graph_options.output.data ||
+        exec.request->output.bytes != impl_->graph_options.output.bytes ||
+        exec.execution.stream != impl_->graph_options.stream ||
+        exec.request->indices.bytes / sizeof(std::int32_t) >
+            impl_->graph_options.request_capacity ||
+        exec.execution.synchronize)
+      return InvalidArgument("captured request differs from prepared graph lease");
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) !=
+        ACL_SUCCESS)
+      return Internal("cannot query graph capture state");
+    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+      return Status::InvalidState("graph lease submissions require active capture");
+  }
+  if (impl_->config.managed_completion && !graph_lease) {
     auto drained = DrainGet();
     if (!drained.ok()) return drained;
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
@@ -517,7 +602,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
       return Internal("cannot query graph capture state");
     if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::NotImplemented("per-call dispatcher graph leases are not implemented; use legacy Direct graph path");
+      return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
   }
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
@@ -527,30 +612,35 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
     return status;
   }
 
-  KvafBatchGetLocalBuffer* local_buffer = nullptr;
-  std::uint64_t channel_entity = 0;
-  if (KvafBatchGetLocalBufferAcquire(impl_->transport,
-                                     reinterpret_cast<void*>(arguments.output),
-                                     exec.request->output.bytes, &local_buffer,
-                                     &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
-      local_buffer == nullptr || channel_entity == 0) {
+  KvafBatchGetLocalBuffer* local_buffer = graph_lease ? impl_->graph_buffer : nullptr;
+  std::uint64_t channel_entity = graph_lease ? impl_->graph_entity : 0;
+  if (!graph_lease &&
+      (KvafBatchGetLocalBufferAcquire(impl_->transport, reinterpret_cast<void*>(arguments.output),
+                                      exec.request->output.bytes, &local_buffer,
+                                      &channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+       local_buffer == nullptr || channel_entity == 0)) {
     return Internal("failed to acquire caller output for BatchGet");
   }
   arguments.channel_entity = channel_entity;
 
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
   if (impl_->config.managed_completion) {
-    impl_->pending_get = stream;
-    impl_->pending_buffer = local_buffer;
+    if (!graph_lease) {
+      impl_->pending_get = stream;
+      impl_->pending_buffer = local_buffer;
+    }
     if (aclrtMemsetAsync(impl_->execution.status, impl_->execution.status_bytes, 0xFF,
                          impl_->execution.status_bytes, stream) != ACL_SUCCESS)
       return Status::CompletionUnknown("failed to initialize Get completion status");
   }
+  if (graph_lease) impl_->graph_recorded = true;
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
-    if (!impl_->config.managed_completion) KvafBatchGetLocalBufferRelease(local_buffer);
+    if (!impl_->config.managed_completion && !graph_lease)
+      KvafBatchGetLocalBufferRelease(local_buffer);
     return Internal("failed to launch BatchGet");
   }
+  if (graph_lease) return Status::OK();
   if (impl_->config.managed_completion)
     return exec.execution.synchronize ? DrainGet() : Status::OK();
   if (exec.execution.synchronize) {

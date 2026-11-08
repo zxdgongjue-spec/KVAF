@@ -183,6 +183,7 @@ Status Enqueue(cpu_push::CpuPushTransport& transport) {
   request.output_indices = {&row, sizeof(row), DeviceKind::kNpu};
   request.output = {output, sizeof(output), DeviceKind::kNpu};
   request.output_block_bytes = sizeof(output);
+  request.tokens_per_block = 1;
   request.device_access_table.addresses = {&address, sizeof(address), DeviceKind::kNpu};
   return transport.Execute({{}, &request, {&handle, false}});
 }

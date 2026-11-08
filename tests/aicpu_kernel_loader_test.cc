@@ -10,7 +10,8 @@
   std::cerr << "line " << __LINE__ << ": " #condition "\n"; std::exit(1); \
 } } while (false)
 
-std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV2", "KvafAicpuBatchPut", "KvafAicpuGatherRead"};
+std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV3", "KvafAicpuBatchPut",
+                              "KvafAicpuGatherRead"};
 unsigned loads = 0, lookups = 0, launches = 0;
 int handle;
 aclError aclrtBinaryLoadFromFile(const char*, const aclrtBinaryLoadOptions*, aclrtBinHandle* out) {

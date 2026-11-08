@@ -69,8 +69,8 @@ Status PrepareUmdkKernel(const std::string& json, bool scatter) {
   if (!LoadUmdkKernel(json.c_str()))
     return Status::Internal(context + ": failed to load installed device package");
   std::lock_guard<std::mutex> lock(kernel_mutex);
-  for (const char* name : {"KvafAicpuUmdkControlSessionsV2", "KvafAicpuBatchPut",
-                          scatter ? "KvafAicpuCpuPushScatterA12V24" : "KvafAicpuGatherRead"}) {
+  for (const char* name : {"KvafAicpuUmdkControlSessionsV3", "KvafAicpuBatchPut",
+                           scatter ? "KvafAicpuCpuPushScatterA12V24" : "KvafAicpuGatherRead"}) {
     if (functions.find(name) != functions.end()) continue;
     aclrtFuncHandle function = nullptr;
     if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS || !function)

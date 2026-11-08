@@ -10,7 +10,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchPutAivKernel";
+constexpr char kKernelName[] = "KvafExecuteBatchPutAivKernelV2";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes = 128U * 1024U;
 std::mutex g_mutex;

@@ -1,4 +1,7 @@
 #include "peer_link.h"
+#include "execution_protocol.h"
+#include <atomic>
+#include <random>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -111,6 +114,12 @@ bool Exchange(const std::string& endpoint, const Request& request, Response* res
   return transferred;
 }
 
+template <class Request, class Response>
+bool Exchange(const PeerLink& link, const Request& request, Response* response,
+              std::string* error) {
+  return link.Control(&request, sizeof(request), response, sizeof(*response), error);
+}
+
 bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
                          uint32_t* device_count,
                          bool* device_filter_applied,
@@ -212,14 +221,13 @@ bool AllocateRegionAt(const std::string& endpoint, uint64_t ddr_bytes, uint64_t 
   return true;
 }
 
-bool CreateChannelAt(const std::string& endpoint, const PeerRegion& region,
-                     const uint8_t local_qp_key[kQpKeyBytes],
-                     uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
-                     uint32_t peer_token_value, uint64_t local_tp_handle,
-                     uint32_t local_psn,
-                     std::array<uint8_t, kQpKeyBytes>* peer_qp_key,
-                     uint32_t* peer_qp_key_bytes, uint64_t* peer_tp_handle,
-                     uint32_t* peer_psn, bool share_tp, std::string* error) {
+bool CreateChannelAt(const PeerLink& endpoint, const PeerRegion& region,
+                     const uint8_t local_qp_key[kQpKeyBytes], uint32_t local_qp_key_bytes,
+                     const uint8_t local_eid[kEidBytes], uint32_t peer_token_value,
+                     uint64_t local_tp_handle, uint32_t local_psn,
+                     std::array<uint8_t, kQpKeyBytes>* peer_qp_key, uint32_t* peer_qp_key_bytes,
+                     uint64_t* peer_tp_handle, uint32_t* peer_psn, bool share_tp,
+                     std::string* error) {
   if (local_qp_key == nullptr || local_eid == nullptr || peer_qp_key == nullptr ||
       peer_qp_key_bytes == nullptr || peer_tp_handle == nullptr || peer_psn == nullptr ||
       local_qp_key_bytes == 0U || local_qp_key_bytes > kQpKeyBytes ||
@@ -275,6 +283,213 @@ bool ReleaseRegionAt(const std::string& endpoint, const PeerRegion& region, std:
 
 }  // namespace
 
+struct PeerLink::ExecutionState {
+  mutable std::mutex mutex;
+  execution::Request create;
+  execution::Response reply;
+  std::vector<std::uint8_t> pending;
+  std::uint64_t pending_id = 0;
+  bool confirmed = false, closed = false;
+};
+namespace {
+std::uint64_t ClientId() {
+  const auto id = [] {
+    std::random_device r;
+    auto n = (std::uint64_t(r()) << 32) ^ r();
+    return n ? n : 1;
+  }();
+  return id;
+}
+std::uint64_t NextRequest() {
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1);
+}
+Status SendExecution(const std::string& address, const execution::Request& q,
+                     execution::Response* r) {
+  std::string error;
+  if (!execution::Exchange(address, q, r, &error)) return Status::CompletionUnknown(error);
+  return Status::OK();
+}
+}  // namespace
+Status PeerLink::AllocateCacheRegion(std::uint64_t bytes, std::uint64_t slot, std::uint64_t aux,
+                                     TransportMode mode, PeerRegion* out) {
+  if (!out) return Status::InvalidArgument("null region output");
+  if (execution_ && execution_->closed) execution_.reset();
+  if (!execution_) {
+    execution::Request q;
+    execution::Response caps;
+    auto status = SendExecution(address_, q, &caps);
+    if (!status.ok()) return status;
+    if (!caps.status.ok()) return caps.status;
+    const auto required = execution::kRequired |
+                          (mode != TransportMode::Ubmem ? execution::kUrma : 0) |
+                          (mode != TransportMode::Urma ? execution::kFabric : 0);
+    if ((caps.capabilities & required) != required)
+      return Status::NotImplemented("CPU service lacks Region/session capabilities");
+    execution_ = std::make_shared<ExecutionState>();
+    q.op = execution::Op::CreateRegion;
+    q.client = ClientId();
+    q.request = NextRequest();
+    q.epoch = caps.epoch;
+    q.logical_bytes = bytes;
+    q.slot_size = slot;
+    q.auxiliary_bytes = aux;
+    q.mode = mode;
+    execution_->create = q;
+  }
+  auto& q = execution_->create;
+  if (q.logical_bytes != bytes || q.slot_size != slot || q.auxiliary_bytes != aux || q.mode != mode)
+    return Status::InvalidState("unresolved allocation has different parameters; close first");
+  auto s = PrepareExecution();
+  if (s.ok()) *out = execution_->reply.binding;
+  return s;
+}
+std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& config) {
+  auto child = std::make_shared<PeerLink>(address_);
+  child->parent_ = shared_from_this();
+  child->execution_ = std::make_shared<ExecutionState>();
+  auto& q = child->execution_->create;
+  q = config;
+  q.op = execution::Op::OpenSession;
+  q.client = ClientId();
+  q.request = NextRequest();
+  if (execution_) {
+    q.client = execution_->create.client;
+    q.region = execution_->reply.region;
+    q.epoch = execution_->reply.epoch;
+  }
+  return child;
+}
+Status PeerLink::PrepareExecution() {
+  if (!execution_) return Status::InvalidState("no execution identity");
+  auto& state = *execution_;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed) return Status::InvalidState("execution closed");
+  if (!state.confirmed) {
+    auto s = SendExecution(address_, state.create, &state.reply);
+    if (!s.ok()) return s;
+    state.confirmed = true;
+  }
+  if (!state.reply.status.ok()) return state.reply.status;
+  if (state.reply.state != execution::State::Ready)
+    return Status::InvalidState("execution is not ready");
+  const auto& b = state.reply.binding;
+  if (state.reply.epoch != state.create.epoch || !state.reply.region || !b.base || !b.length ||
+      b.length > UINT64_MAX - b.base ||
+      (!parent_ && (state.reply.logical_bytes != state.create.logical_bytes ||
+                    state.reply.slot_size != state.create.slot_size ||
+                    state.create.auxiliary_bytes > UINT64_MAX - state.create.logical_bytes ||
+                    b.length != state.create.logical_bytes + state.create.auxiliary_bytes)) ||
+      (parent_ && (state.reply.region != state.create.region || !state.reply.session ||
+                   state.reply.logical_bytes != parent_->execution_->reply.logical_bytes ||
+                   state.reply.slot_size != parent_->execution_->reply.slot_size ||
+                   b.length != parent_->execution_->reply.binding.length)))
+    return Status::Internal("execution identity or binding differs from negotiated region");
+  const auto canonical =
+      parent_ ? parent_->execution_->reply.binding.base : state.reply.binding.base;
+  regions_[canonical] = state.reply.binding;
+  return Status::OK();
+}
+Status PeerLink::QueryExecution(execution::Response* out) const {
+  if (!execution_ || !out) return Status::InvalidArgument("no execution identity or output");
+  std::lock_guard<std::mutex> lock(execution_->mutex);
+  auto q = execution_->create;
+  q.op = execution::Op::Query;
+  return SendExecution(address_, q, out);
+}
+Status PeerLink::ResolveExecutionControl() {
+  if (!execution_ || !parent_) return Status::OK();
+  auto& state = *execution_;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (!state.pending_id) return Status::OK();
+  auto q = state.create;
+  q.op = execution::Op::SessionCall;
+  q.region = state.reply.region;
+  q.epoch = state.reply.epoch;
+  q.session = state.reply.session;
+  q.request = state.pending_id;
+  q.payload = state.pending;
+  execution::Response response;
+  auto s = SendExecution(address_, q, &response);
+  if (!s.ok()) return s;
+  // A confirmed rejection also resolves uncertainty; teardown can now proceed.
+  state.pending_id = 0;
+  state.pending.clear();
+  return Status::OK();
+}
+Status PeerLink::CloseExecution() {
+  if (!execution_) return Status::OK();
+  auto& state = *execution_;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (state.closed) return Status::OK();
+  {
+    std::lock_guard<std::mutex> mappings(mapping_mutex_);
+    if (!ubmem_mappings_.empty()) return Status::Busy("Fabric mappings still retained");
+  }
+  // Re-send the immutable create on lost replies; the CPU returns its old record.
+  if (!state.confirmed) {
+    auto s = SendExecution(address_, state.create, &state.reply);
+    if (!s.ok()) return s;
+    state.confirmed = true;
+  }
+  auto q = state.create;
+  q.region = state.reply.region;
+  q.epoch = state.reply.epoch;
+  q.session = state.reply.session;
+  q.op = parent_ ? execution::Op::CloseSession : execution::Op::ReleaseRegion;
+  execution::Response response;
+  auto s = SendExecution(address_, q, &response);
+  if (!s.ok()) return s;
+  if (!response.status.ok()) return response.status;
+  if (response.state != execution::State::Closed)
+    return Status::InvalidState("close did not confirm resource retirement");
+  state.closed = true;
+  regions_.clear();
+  return Status::OK();
+}
+bool PeerLink::Control(const void* input, std::size_t bytes, void* output, std::size_t capacity,
+                       std::string* error) const {
+  if (!execution_ || !parent_) {
+    const int fd = Connect(address_, error);
+    if (fd < 0) return false;
+    const bool ok = WriteAll(fd, input, bytes, error) && ReadAll(fd, output, capacity, error);
+    close(fd);
+    return ok;
+  }
+  auto& state = *execution_;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  auto fail = [&](const std::string& message) {
+    SetError(error, message);
+    return false;
+  };
+  if (!state.confirmed || state.closed || !state.reply.status.ok())
+    return fail("execution session is not ready");
+  const auto* data = static_cast<const std::uint8_t*>(input);
+  std::vector<std::uint8_t> payload(data, data + bytes);
+  if (state.pending_id && state.pending != payload)
+    return fail("unresolved session command; close or retry the original operation");
+  if (!state.pending_id) {
+    state.pending_id = NextRequest();
+    state.pending = payload;
+  }
+  auto q = state.create;
+  q.op = execution::Op::SessionCall;
+  q.region = state.reply.region;
+  q.epoch = state.reply.epoch;
+  q.session = state.reply.session;
+  q.request = state.pending_id;
+  q.payload = payload;
+  execution::Response response;
+  auto s = SendExecution(address_, q, &response);
+  if (!s.ok()) return fail(s.message());
+  state.pending_id = 0;
+  state.pending.clear();
+  if (!response.status.ok()) return fail(response.status.message());
+  if (response.payload.size() != capacity) return fail("invalid session response size");
+  std::memcpy(output, response.payload.data(), capacity);
+  return true;
+}
+
 PeerLink::PeerLink(std::string address) : address_(std::move(address)) {}
 
 Status PeerLink::GetCandidateCount(uint32_t* candidate_count, uint32_t* device_count,
@@ -313,6 +528,7 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
   }
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
+  if (execution_) return CloseExecution();
   std::string error;
   if (!ReleaseRegionAt(address_, found->second, &error)) {
     return ToStatus("peer DDR release failed", std::move(error));
@@ -347,7 +563,7 @@ Status PeerLink::AllocateUbmemRegion(uint64_t bytes, uint64_t slot_size, PeerReg
   request.slot_size = slot_size;
   AllocateUbmemRegionResponse response{};
   std::string error;
-  if (!Exchange(address_, request, &response, &error)) {
+  if (!Exchange(*this, request, &response, &error)) {
     return ToStatus("UBmem allocation exchange failed", std::move(error));
   }
   if (!IsValidResponseHeader(response.header, Command::kAllocateUbmemRegion, sizeof(response))) {
@@ -401,9 +617,9 @@ Status PeerLink::CreateChannel(
   const auto found = regions_.find(region_base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
-  return CreateChannelAt(address_, found->second, local_qp_key, local_qp_key_bytes,
-                         local_eid, peer_token_value, local_tp_handle, local_psn,
-                         peer_qp_key, peer_qp_key_bytes, peer_tp_handle, peer_psn, share_tp, &error)
+  return CreateChannelAt(*this, found->second, local_qp_key, local_qp_key_bytes, local_eid,
+                         peer_token_value, local_tp_handle, local_psn, peer_qp_key,
+                         peer_qp_key_bytes, peer_tp_handle, peer_psn, share_tp, &error)
              ? Status::OK()
              : ToStatus("peer channel creation failed", std::move(error));
 }
@@ -417,9 +633,8 @@ Status PeerLink::EnableDirectGather(uint64_t region_base) const {
   request.session_id = found->second.session_id;
   StatusResponse response{};
   std::string error;
-  if (!Exchange(address_, request, &response, &error) ||
-      !IsValidResponseHeader(response.header, Command::kEnableDirectGather,
-                             sizeof(response)) ||
+  if (!Exchange(*this, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableDirectGather, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), &error))
     return ToStatus("peer direct gather enable failed", std::move(error));
   return Status::OK();
@@ -436,7 +651,7 @@ Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_addres
   request.lanes = lanes;
   StatusResponse response{};
   std::string error;
-  if (!Exchange(address_, request, &response, &error) ||
+  if (!Exchange(*this, request, &response, &error) ||
       !IsValidResponseHeader(response.header, Command::kEnableGatherLanes, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), &error))
     return ToStatus("peer independent gather enable failed", std::move(error));
@@ -450,7 +665,7 @@ Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
   request.header = MakeHeader(Command::kOpenCpuPushGet, sizeof(request));
   request.session_id = found->second.session_id;
   std::string error;
-  if (!Exchange(address_, request, response, &error) ||
+  if (!Exchange(*this, request, response, &error) ||
       !IsValidResponseHeader(response->header, Command::kOpenCpuPushGet, sizeof(*response)) ||
       !ResultOk(static_cast<Result>(response->result), &error))
     return ToStatus("CPU push setup failed", std::move(error));
@@ -458,7 +673,7 @@ Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
 }
 
 namespace {
-Status PushSessionCommand(const std::string& address, uint64_t session, Command command) {
+Status PushSessionCommand(const PeerLink& address, uint64_t session, Command command) {
   CpuPushGetSessionRequest request{};
   request.header = MakeHeader(command, sizeof(request));
   request.session_id = session;
@@ -475,12 +690,12 @@ Status PushSessionCommand(const std::string& address, uint64_t session, Command 
 Status PeerLink::StartCpuPushGet(uint64_t base) const {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
-  return PushSessionCommand(address_, found->second.session_id, Command::kStartCpuPushGet);
+  return PushSessionCommand(*this, found->second.session_id, Command::kStartCpuPushGet);
 }
 Status PeerLink::StopCpuPushGet(uint64_t base) const {
   const auto found = regions_.find(base);
   // ReleaseRegion succeeds only after the remote producer has stopped.
   if (found == regions_.end()) return Status::OK();
-  return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet);
+  return PushSessionCommand(*this, found->second.session_id, Command::kStopCpuPushGet);
 }
 }  // namespace kvaf::peer

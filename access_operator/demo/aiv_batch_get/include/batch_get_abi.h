@@ -102,7 +102,9 @@ typedef struct KvafBatchGetDirectUrmaEntity {
   uint32_t cq_depth;
   uint32_t cqe_size;
   uint32_t reserved0;
-  uint64_t reserved[7];
+  uint64_t registered_base;  // URMA binding base; tables retain remote_host_ddr_address as
+                             // canonical base
+  uint64_t reserved[6];
 } KvafBatchGetDirectUrmaEntity;
 
 // Fixed-shape graph ABI. `output` and `channel_entity` must identify the same

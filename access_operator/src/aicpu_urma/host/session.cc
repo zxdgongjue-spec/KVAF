@@ -41,9 +41,9 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
   auto* device_status = reinterpret_cast<void*>(args_.status);
   if (aclrtMemset(device_status, sizeof(status), 0, sizeof(status)) != ACL_SUCCESS)
     return Status::Internal("failed to clear UMDK setup status");
-  const auto launch = launch_kernel
-                          ? launch_kernel(&args_, stream)
-                          : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV2", &args_, sizeof(args_), stream);
+  const auto launch = launch_kernel ? launch_kernel(&args_, stream)
+                                    : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV3", &args_,
+                                                       sizeof(args_), stream);
   if (launch != 0) {
     failed_ = true;
     return Status::Internal("UMDK kernel launch failed");
@@ -139,7 +139,7 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   args_.buffer_bytes = output_bytes;
   args_.worker_count = workers;
   args_.token = region.token_value;
-  args_.remote_address = region.base;
+  args_.remote_address = region_base;
   std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);
   std::copy(config_.local_eid.begin(), config_.local_eid.end(), args_.local_eid);
   UmdkControlStatus prepared{};
@@ -162,7 +162,7 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     }
     std::array<std::uint8_t, peer::kQpKeyBytes> local_key{}, peer_key{};
     std::copy_n(descriptor.key, descriptor.key_bytes, local_key.begin());
-    result = link.CreateChannel(region.base, local_key.data(), descriptor.key_bytes, descriptor.eid,
+    result = link.CreateChannel(region_base, local_key.data(), descriptor.key_bytes, descriptor.eid,
                                 region.token_value, descriptor.tp, 1, &peer_key, &args_.key_bytes,
                                 &args_.peer_tp, &args_.peer_psn, true);
     if (!result.ok()) return result;

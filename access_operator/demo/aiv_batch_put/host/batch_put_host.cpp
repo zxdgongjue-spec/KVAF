@@ -25,7 +25,7 @@ namespace hccp = kvaf::direct_hccp;
 
 constexpr uint64_t kPageBytes = 4096U;
 constexpr uint32_t kDirectEntityMagic = 0x4b564155U;  // "KVAU"
-constexpr uint32_t kDirectEntityVersion = 1U;
+constexpr uint32_t kDirectEntityVersion = 2U;
 constexpr uint32_t kDeviceUserCtlSqDepth = 8192U;
 constexpr uint32_t kWqeBytes = 64U;
 constexpr uint32_t kWqebbPerWqe = 4U;
@@ -402,6 +402,7 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
     entity.version = kDirectEntityVersion;
     entity.remote_host_ddr_address = state->peer_memory_address;
     entity.remote_host_ddr_size = state->peer_memory_bytes;
+    entity.registered_base = state->peer_memory.registered_address;
     entity.remote_token_id = state->peer_memory.token_id;
     entity.remote_token_value = state->peer_memory.token_value;
     entity.sq_va = worker.device_user_ctl_jetty.info.ub.sq_buffer_va;

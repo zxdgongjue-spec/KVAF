@@ -165,6 +165,8 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
   if (!s.initialized || !exec.execution.stream) return Status::InvalidState("CPU push needs initialization and stream");
   KernelArgs args{};
   result = detail::BuildBatchGetKernelArgs(exec, &args.request);
+  args.request.canonical_base = s.source.base;
+  args.request.logical_bytes = s.source.length;
   if (!result.ok()) return result;
   if (args.request.request_capacity > kMaxRequests || args.request.token_bytes != s.config.token_bytes)
     return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");

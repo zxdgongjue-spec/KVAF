@@ -35,9 +35,9 @@ Transport::~Transport() {
 }
 
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
-    const peer::OpenCpuPushGetRequest& setup,
-    urma::GetTpList query, urma::ImportJettyEx import, std::uint32_t psn,
-    peer::OpenCpuPushGetResponse* response) {
+                             const peer::OpenCpuPushGetRequest& setup, urma::GetTpList query,
+                             urma::ImportJettyEx import, std::uint32_t psn,
+                             peer::OpenCpuPushGetResponse* response, std::uint64_t canonical_base) {
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
@@ -47,6 +47,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     return Status::InvalidArgument("invalid CPU push setup");
   context_ = context;
   source_ = source;
+  source_base_ = canonical_base ? canonical_base : source->seg.ubva.va;
+  source_bytes_ = setup.source_bytes;
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
@@ -233,7 +235,13 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
       r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  return Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+  auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+  if (!read.ok()) return read;
+  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
+  for (std::uint32_t i = 0; i < r.count; ++i)
+    if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
+      return Status::InvalidArgument("CPU push source outside cache region");
+  return Status::OK();
 }
 
 // Ported from hbm-sgl-probe PrepareWrite: partition each chunk into contiguous
@@ -326,7 +334,9 @@ Status Transport::PrepareWrites(std::uint32_t count) {
 }
 void Transport::RefreshPrepared(PreparedQueue& q) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  for (const auto& source : q.sources) q.local[source.local].addr = addresses[source.row] + source.offset;
+  for (const auto& source : q.sources)
+    q.local[source.local].addr =
+        source_->seg.ubva.va + (addresses[source.row] - source_base_) + source.offset;
   for (const auto& marker : q.markers) *marker.value = Progress(request().sequence, marker.progress);
 }
 Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {

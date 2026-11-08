@@ -1,4 +1,6 @@
 #include "cpu_backends.h"
+#include "execution_cpu_backend.h"
+#include <mutex>
 
 #include <sys/socket.h>
 #include <cerrno>
@@ -36,10 +38,14 @@ Status Reply(int fd, peer::Command command, peer::Result result) {
 
 struct CpuRuntime::Impl {
   explicit Impl(CpuRuntimeOptions value)
-      : options(std::move(value)), ubmem(options, next_session) {}
+      : options(std::move(value)),
+        ubmem(options, next_session),
+        execution(CreateExecutionService(options)) {}
   CpuRuntimeOptions options;
   std::uint64_t next_session{1};
   UbmemCpuBackend ubmem;
+  std::unique_ptr<execution::CacheRegionService> execution;
+  std::recursive_mutex legacy_mutex;
 #ifdef KVAF_CPU_HAS_URMA
   UrmaCpuBackend urma;
 #endif
@@ -47,6 +53,7 @@ struct CpuRuntime::Impl {
 CpuRuntime::CpuRuntime() = default;
 CpuRuntime::~CpuRuntime() { if (!Shutdown().ok()) (void)impl_.release(); }
 Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
+  std::unique_lock<std::shared_mutex> life(lifecycle_);
   if (impl_) return Status::InvalidState("CpuRuntime already initialized");
   if (options.has_eid_index && options.ub_device.empty())
     return Status::InvalidArgument("invalid CPU runtime options");
@@ -62,7 +69,12 @@ Status CpuRuntime::AcceptLink(const LinkTarget&) {
   return initialized() ? Status::OK() : Status::NotInitialized("CpuRuntime not initialized");
 }
 Status CpuRuntime::ReleaseLink(LinkId id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  return ReleaseLinkUnlocked(id);
+}
+Status CpuRuntime::ReleaseLinkUnlocked(LinkId id) {
   if (!impl_) return Status::NotInitialized("CpuRuntime not initialized");
+  std::lock_guard<std::recursive_mutex> lock(impl_->legacy_mutex);
   auto status = impl_->ubmem.ReleaseLink(id);
 #ifdef KVAF_CPU_HAS_URMA
   if (status.code() == StatusCode::kNotFound && impl_->urma.initialized())
@@ -71,12 +83,39 @@ Status CpuRuntime::ReleaseLink(LinkId id) {
   return status;
 }
 Status CpuRuntime::ServeConnection(int fd) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
   if (!impl_) return Status::NotInitialized("CpuRuntime not initialized");
   if (fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
   peer::MessageHeader header{};
   if (!Read(fd, &header, sizeof(header)) || header.magic != peer::kProtocolMagic ||
       header.version != peer::kProtocolVersion)
     return Status::InvalidArgument("invalid CPU control header");
+  if (header.command == execution::kCommand) {
+    if (header.bytes < sizeof(header) || header.bytes > 16384)
+      return Status::InvalidArgument("invalid execution packet size");
+    std::vector<std::uint8_t> bytes(header.bytes - sizeof(header));
+    if (!Read(fd, bytes.data(), bytes.size()))
+      return Status::Internal("incomplete execution packet");
+    execution::Request request;
+    execution::Response response;
+    response.status = execution::Decode(bytes, &request);
+    if (response.status.ok()) response = impl_->execution->Handle(request);
+    bytes = execution::Encode(response);
+    auto reply = peer::MakeHeader(static_cast<peer::Command>(execution::kCommand),
+                                  sizeof(header) + bytes.size());
+    reply.command = execution::kCommand | 0x8000;
+    bytes.insert(bytes.begin(), reinterpret_cast<const std::uint8_t*>(&reply),
+                 reinterpret_cast<const std::uint8_t*>(&reply) + sizeof(reply));
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+      auto n = send(fd, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) return Status::Internal("execution reply lost; record retained for query");
+      offset += n;
+    }
+    return Status::OK();
+  }
+  std::lock_guard<std::recursive_mutex> lock(impl_->legacy_mutex);
   const auto command = static_cast<peer::Command>(header.command);
   if (command == peer::Command::kAllocateUbmemRegion)
     return impl_->ubmem.ServeConnection(fd, header);
@@ -85,7 +124,7 @@ Status CpuRuntime::ServeConnection(int fd) {
     if (!peer::IsValidHeader(header, command, sizeof(request)) ||
         !Read(fd, &request.session_id, sizeof(request.session_id)))
       return Reply<peer::StatusResponse>(fd, command, peer::Result::kInvalidRequest);
-    const auto status = ReleaseLink(request.session_id);
+    const auto status = ReleaseLinkUnlocked(request.session_id);
     return Reply<peer::StatusResponse>(fd, command, status.ok() ? peer::Result::kOk :
         status.code() == StatusCode::kNotFound ? peer::Result::kNotFound : peer::Result::kResourceError);
   }
@@ -116,8 +155,11 @@ Status CpuRuntime::ServeConnection(int fd) {
   }
 }
 Status CpuRuntime::Shutdown() {
+  std::unique_lock<std::shared_mutex> life(lifecycle_);
   if (!impl_) return Status::OK();
-  auto status = impl_->ubmem.Shutdown();
+  auto status = impl_->execution->Shutdown();
+  if (!status.ok()) return status;
+  status = impl_->ubmem.Shutdown();
   if (!status.ok()) return status;
 #ifdef KVAF_CPU_HAS_URMA
   status = impl_->urma.Shutdown();
@@ -126,6 +168,9 @@ Status CpuRuntime::Shutdown() {
   impl_.reset();
   return Status::OK();
 }
-bool CpuRuntime::initialized() const { return impl_ != nullptr; }
+bool CpuRuntime::initialized() const {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  return impl_ != nullptr;
+}
 RuntimeCapabilities CpuRuntime::capabilities() const { return {false, false, true, false}; }
 }  // namespace kvaf

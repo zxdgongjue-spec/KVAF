@@ -220,7 +220,56 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
   CHECK(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xA5; }));
 }
 
-int main() {
+void CheckInputBounds() {
+  Layout layout;
+  CHECK(MakeLayout(16, 1, &layout));
+  std::vector<CacheLine> workspace((layout.bytes + 63) / 64);
+  auto* memory = reinterpret_cast<std::uint8_t*>(workspace.data());
+  for (int scenario = 0; scenario < 8; ++scenario) {
+    std::uint64_t address = 4096;
+    std::int32_t index = 0, offset = 0, row = 0, count = 1;
+    std::uint8_t valid = 1;
+    std::uint8_t output[16];
+    std::fill_n(output, 16, 0xA5);
+    if (scenario == 0) index = -1;
+    if (scenario == 1) index = 1;
+    if (scenario == 2) offset = -1;
+    if (scenario == 3) offset = 1;
+    if (scenario == 4) valid = 0;
+    if (scenario == 5) address = 4095;
+    if (scenario == 6) row = 1;
+    if (scenario == 7) address = 4096 + 24;
+    Coordination coordination{};
+    WorkerStatus status{};
+    KernelArgs args{};
+    args.request = {Pointer(&address),
+                    Pointer(&index),
+                    Pointer(&offset),
+                    Pointer(&count),
+                    Pointer(&row),
+                    1,
+                    1,
+                    16};
+    args.request.valid_table = Pointer(&valid);
+    args.request.canonical_base = 4096;
+    args.request.logical_bytes = 32;
+    args.request.block_bytes = 16;
+    args.workspace = Pointer(memory);
+    args.output = Pointer(output);
+    args.output_bytes = 16;
+    args.coordination = Pointer(&coordination);
+    args.status = Pointer(&status);
+    args.sequence = args.workers = 1;
+    CHECK(ExecuteCpuPushScatter(&args) != 0);
+    CHECK(status.result == static_cast<std::uint64_t>(Result::kInvalidRequest));
+    CHECK(std::all_of(output, output + 16, [](auto value) { return value == 0xA5; }));
+  }
+}
+
+int main(int argc, char**) {
+  CheckInputBounds();
+  if (argc > 1) return 0;
+
   CheckPipeline();
   CheckRemoteFailure(Progress(1, static_cast<std::uint32_t>(Result::kTransportError)), Result::kTransportError);
   CheckRemoteFailure(Progress(2, 1), Result::kSequenceError);

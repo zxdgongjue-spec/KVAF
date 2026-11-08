@@ -102,12 +102,14 @@ groups. Zero disables the limit. See [design, configuration and validation](../.
 
 Capacity checks use the currently pending groups. Failed submissions poison
 the affected queues until transport rebuild, preventing stale completions from
-being consumed by a later replay. The baseline's descriptor validation remains
-temporarily disabled in this branch.
+being consumed by a later replay. Descriptor validation checks table validity,
+request offsets, and source/output bounds before posting reads.
 
 The ACL launcher reserves 160 KiB of AIV local memory for the two WQE banks and
 SIMT validation scratch. Rebuild Host, Python binding and Kernel together: the
-launcher now requires the `KvafExecuteBatchGetAivKernelV2` symbol.
+launcher now requires the `KvafExecuteBatchGetAivKernelV3` symbol.
+Version 3 translates stable cache addresses to each session's URMA registration
+base; the entity layout uses a formerly reserved word for `registered_base`.
 
 ## Build and validate on A5
 

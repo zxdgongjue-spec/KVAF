@@ -28,7 +28,7 @@ struct AccessOperator::Impl {
   };
   mutable std::mutex mutex;
   OperatorOptions options;
-  std::unique_ptr<DeviceMapping> mapping;
+  std::shared_ptr<DeviceMapping> mapping;
   RemoteRegionDesc remote{};
   aclrtBinHandle binaries[2]{};
   aclrtFuncHandle functions[2]{};
@@ -36,6 +36,8 @@ struct AccessOperator::Impl {
   std::unordered_map<aclrtStream, StreamState> streams;
   bool ready{};
   bool retained{};
+  bool graph_active{}, graph_recorded{};
+  GetGraphOptions graph_options;
   bool profiling{};
   bool profile_detail{};
   aclrtStream profile_stream{};
@@ -102,15 +104,16 @@ struct AccessOperator::Impl {
           aclmdlRICaptureGetInfo(stream, &capture, &graph));
       if (!status.ok()) return status;
     }
-    if (options.managed_completion && capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::NotImplemented("per-call UBMEM graph leases are not implemented");
+    if (options.managed_completion && !graph_active &&
+        capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+      return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
     const auto size = options.cores * sizeof(CoreStatus);
     if (synchronize || options.managed_completion) {
       // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
       // not look like a successful zero-row kernel.
       auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
       if (!status.ok()) return status;
-      state.pending = StreamState::Pending::kStream;
+      if (!graph_active) state.pending = StreamState::Pending::kStream;
     }
     aclrtLaunchKernelAttr attrs[4]{};
     attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
@@ -125,6 +128,10 @@ struct AccessOperator::Impl {
     auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
         functions[static_cast<unsigned>(args.operation)], options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
     if (!status.ok()) return status;
+    if (graph_active) {
+      graph_recorded = true;
+      return status;
+    }
     state.pending = StreamState::Pending::kStream;
     if (args.profile) profile_stream = stream;
     if (!synchronize) {
@@ -202,8 +209,13 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
   if (status.ok()) {
     impl_->remote = region;
     impl_->retained = true;
-    impl_->mapping = std::make_unique<DeviceMapping>();
-    status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
+    if (impl_->options.mappings)
+      status = impl_->options.mappings->Acquire(impl_->options.device_id, peer.fabric_handle,
+                                                peer.fabric_mapping_bytes, &impl_->mapping);
+    else {
+      impl_->mapping = std::make_shared<DeviceMapping>();
+      status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
+    }
   }
   if (status.ok() && !impl_->options.batch_get_kernel_object_path.empty()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
       "KvafExecuteBatchGetUbmemKernelV2");
@@ -223,6 +235,7 @@ Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
 }
 
 Status AccessOperator::Shutdown() {
+  if (impl_->graph_active) return Status::Busy("release UBMEM graph lease before shutdown");
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->ready = false;
   impl_->profiling = false;
@@ -254,7 +267,8 @@ Status AccessOperator::Shutdown() {
     }
   }
   if (impl_->mapping) {
-    auto status = impl_->mapping->Close();
+    auto status = impl_->options.mappings ? impl_->options.mappings->Release(&impl_->mapping)
+                                          : impl_->mapping->Close();
     if (!status.ok()) return status;
     impl_->mapping.reset();
   }
@@ -262,6 +276,81 @@ Status AccessOperator::Shutdown() {
     impl_->options.peer_link->ReleaseUbmemMapping(impl_->remote.base);
     impl_->retained = false;
   }
+  return Status::OK();
+}
+
+Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->graph_active) return Status::Busy("UBMEM graph lease already held");
+  if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
+      !options.request_capacity)
+    return Status::InvalidArgument("graph preparation requires output, capacity and stream");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  auto s = Acl("aclmdlRICaptureGetInfo",
+               aclmdlRICaptureGetInfo(static_cast<aclrtStream>(options.stream), &capture, &graph));
+  if (!s.ok()) return s;
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("prepare graph before capture");
+  Impl::StreamState* state = nullptr;
+  s = impl_->State(static_cast<aclrtStream>(options.stream), &state);
+  if (!s.ok()) return s;
+  if (state->pending != Impl::StreamState::Pending::kNone)
+    return Status::Busy("UBMEM work is still pending");
+  impl_->graph_options = options;
+  impl_->graph_active = true;
+  impl_->graph_recorded = false;
+  return Status::OK();
+}
+Status AccessOperator::FinishGetGraph(void* stream, bool discard) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->graph_active) return Status::NotFound("UBMEM graph lease not found");
+  if (!stream) return Status::InvalidArgument("graph release requires its last replay stream");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  auto s = Acl("aclmdlRICaptureGetInfo",
+               aclmdlRICaptureGetInfo(static_cast<aclrtStream>(stream), &capture, &graph));
+  if (!s.ok()) return s;
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("finish capture before releasing graph");
+  s = Acl("aclrtSynchronizeStream(graph)",
+          aclrtSynchronizeStream(static_cast<aclrtStream>(stream)));
+  if (!s.ok()) return s;
+  if (impl_->graph_recorded && !discard) {
+    auto& state = impl_->streams.at(static_cast<aclrtStream>(impl_->graph_options.stream));
+    const auto bytes = impl_->options.cores * sizeof(CoreStatus);
+    s = Acl("aclrtMemcpy(graph status)", aclrtMemcpy(state.host_statuses, bytes, state.statuses,
+                                                     bytes, ACL_MEMCPY_DEVICE_TO_HOST));
+    if (!s.ok()) return s;
+    const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
+    for (std::uint32_t i = 0; i < impl_->options.cores; ++i)
+      if (reports[i].result)
+        return Status::Internal(
+            "graph result failed or was never replayed; inspect then release with "
+            "discard_result=True");
+  }
+  impl_->graph_active = false;
+  impl_->graph_recorded = false;
+  impl_->graph_options = {};
+  return Status::OK();
+}
+
+Status AccessOperator::Warmup(const ExecutionWarmup& request) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->ready) return Status::NotInitialized("UBMEM provider not initialized");
+  if (!request.stream) return Status::OK();
+  Impl::StreamState* state = nullptr;
+  auto s = impl_->State(static_cast<aclrtStream>(request.stream), &state);
+  if (!s.ok() || !impl_->functions[1] || !request.request_capacity) return s;
+  const auto bytes = std::size_t(request.request_capacity) * 3 * sizeof(std::uint64_t);
+  if (state->capacity >= bytes) return Status::OK();
+  void* allocation = nullptr;
+  s = Acl("aclrtMalloc(metadata warmup)",
+          aclrtMalloc(&allocation, bytes, ACL_MEM_MALLOC_NORMAL_ONLY));
+  if (!s.ok()) return s;
+  if (state->metadata) aclrtFree(state->metadata);
+  state->metadata = allocation;
+  state->capacity = bytes;
   return Status::OK();
 }
 
@@ -333,6 +422,21 @@ Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   // RuntimeCore owns buffer/layout validation. This adapter only restricts
   // the device and checks narrowing to its kernel ABI.
   const auto& r = *exec.request;
+  if (impl_->graph_active) {
+    if (r.output.data != impl_->graph_options.output.data ||
+        r.output.bytes != impl_->graph_options.output.bytes ||
+        exec.execution.stream != impl_->graph_options.stream ||
+        r.indices.bytes / 4 > impl_->graph_options.request_capacity || exec.execution.synchronize)
+      return Status::InvalidArgument("captured request differs from prepared graph lease");
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    auto s = Acl(
+        "aclmdlRICaptureGetInfo",
+        aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph));
+    if (!s.ok()) return s;
+    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+      return Status::InvalidState("graph submission requires active capture");
+  }
   if (r.output.device != DeviceKind::kNpu ||
       r.output_block_bytes > UINT32_MAX || r.tokens_per_block > UINT32_MAX ||
       r.indices.bytes / 4 > INT32_MAX || r.device_access_table.valid.bytes > UINT32_MAX) {

@@ -55,7 +55,45 @@ struct AicpuBatchGetInput {
   // address; offsets is unused. Other callers use address_table[indices[i]] + offsets[i].
   std::uint64_t address_table{}, indices{}, offsets{}, miss_count{}, output_indices{};
   std::uint32_t table_capacity{}, request_capacity{}, token_bytes{};
+  std::uint64_t valid_table{}, canonical_base{}, logical_bytes{}, block_bytes{};
 };
+inline bool ResolveBatchGetSource(const AicpuBatchGetInput& r, std::uint32_t row,
+                                  std::uint64_t output_bytes, std::uint64_t* source) {
+  if (!source || row >= r.request_capacity || !r.address_table || !r.output_indices ||
+      !r.token_bytes)
+    return false;
+  const auto output = reinterpret_cast<const std::int32_t*>(r.output_indices)[row];
+  if (output < 0 || output_bytes < r.token_bytes ||
+      std::uint64_t(output) > (output_bytes - r.token_bytes) / r.token_bytes)
+    return false;
+  std::uint32_t index = row;
+  std::uint64_t offset = 0;
+  if (r.indices) {
+    const auto selected = reinterpret_cast<const std::int32_t*>(r.indices)[row];
+    if (selected < 0 || std::uint32_t(selected) >= r.table_capacity || !r.offsets) return false;
+    index = selected;
+    const auto displacement = reinterpret_cast<const std::int32_t*>(r.offsets)[row];
+    if (displacement < 0) return false;
+    offset = displacement;
+    if (r.block_bytes && (r.block_bytes < r.token_bytes || offset > r.block_bytes - r.token_bytes))
+      return false;
+    if (r.valid_table && !reinterpret_cast<const std::uint8_t*>(r.valid_table)[index]) return false;
+    if (r.canonical_base && !r.valid_table) return false;
+  } else if (index >= r.table_capacity)
+    return false;
+  const auto base = reinterpret_cast<const std::uint64_t*>(r.address_table)[index];
+  if (r.canonical_base && r.indices && r.block_bytes &&
+      (base < r.canonical_base || base - r.canonical_base > r.logical_bytes ||
+       r.block_bytes > r.logical_bytes - (base - r.canonical_base)))
+    return false;
+  if (offset > UINT64_MAX - base) return false;
+  *source = base + offset;
+  if (r.canonical_base &&
+      (*source < r.canonical_base || *source - r.canonical_base > r.logical_bytes ||
+       r.token_bytes > r.logical_bytes - (*source - r.canonical_base)))
+    return false;
+  return true;
+}
 struct UmdkBatchGetArgs {
   AicpuBatchGetInput request;
   GatherReadArgs gather;

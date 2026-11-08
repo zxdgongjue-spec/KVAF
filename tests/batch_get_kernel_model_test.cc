@@ -107,7 +107,7 @@ struct Fixture {
     aiv_model::hardware.resize(c * j);
     for (uint32_t i = 0; i < remote.size(); ++i) remote[i] = (i * 7 + 1) % 251;
     for (uint32_t i = 0; i < 16; ++i) {
-      addresses[i] = reinterpret_cast<uint64_t>(remote.data() + 16 * i);
+      addresses[i] = 0x1000 + 16 * i;
       valid[i] = 1;
     }
     for (uint32_t i = 0; i < count; ++i) {
@@ -118,9 +118,10 @@ struct Fixture {
       auto& entity = entities[i];
       auto& hardware = aiv_model::hardware[i];
       entity.magic = 0x4b564155U;
-      entity.version = 1;
-      entity.remote_host_ddr_address = reinterpret_cast<uint64_t>(remote.data());
+      entity.version = 2;
+      entity.remote_host_ddr_address = 0x1000;
       entity.remote_host_ddr_size = remote.size();
+      entity.registered_base = reinterpret_cast<uint64_t>(remote.data());
       entity.local_hbm_address = reinterpret_cast<uint64_t>(output.data());
       entity.local_hbm_size = output.size();
       entity.local_token_id = 1;
@@ -162,7 +163,7 @@ struct Fixture {
     for (const auto& queue : queues) cq_before += queue.cq_consumer_index;
     for (uint32_t c = 0; c < cores; ++c) {
       aiv_model::core = c;
-      KvafExecuteBatchGetAivKernelV2(args);
+      KvafExecuteBatchGetAivKernelV3(args);
       CHECK(statuses[c].result == expected);
       if (expected || !profiling) continue;
       const auto& profile = statuses[c].profile;

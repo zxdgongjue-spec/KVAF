@@ -2,6 +2,8 @@
 
 #include <optional>
 #include <vector>
+#include <string>
+#include <cstdint>
 #include "status.h"
 
 namespace kvaf {
@@ -25,6 +27,17 @@ inline bool operator==(PutExecutionConfig a, PutExecutionConfig b) {
 inline bool operator==(GetExecutionConfig a, GetExecutionConfig b) {
   return a.transport == b.transport && a.executor == b.executor && a.algorithm == b.algorithm;
 }
+// Zero cores/Jettys inherit legacy constructor defaults; an explicit in-flight
+// value of zero disables the limiter. Kernel paths can differ by provider.
+struct ExecutionWarmup {
+  std::uint32_t request_capacity{0};
+  void* stream{nullptr};
+};
+struct ExecutionResources {
+  std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};
+  std::optional<std::uint32_t> max_inflight_total;
+  std::string kernel_path;
+};
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};
   std::optional<PutExecutionConfig> default_put;

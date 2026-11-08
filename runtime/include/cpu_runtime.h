@@ -46,6 +46,8 @@ class CpuRuntime final : public Runtime {
   RuntimeCapabilities capabilities() const override;
 
  private:
+  Status ReleaseLinkUnlocked(LinkId);
+  mutable std::shared_mutex lifecycle_;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

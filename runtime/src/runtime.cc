@@ -75,6 +75,7 @@ RuntimeCore::~RuntimeCore() {
     auto* retained = new decltype(access_tables_)(std::move(access_tables_));
     (void)retained;
     if (pending_get_table_) (void)new std::shared_ptr<AccessTableState>(std::move(pending_get_table_));
+    if (!graph_tables_.empty()) (void)new decltype(graph_tables_)(std::move(graph_tables_));
   }
 }
 
@@ -127,6 +128,7 @@ Status RuntimeCore::Shutdown() {
   if (!needs_cleanup_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
+  if (!graph_tables_.empty()) return Status::Busy("release graph leases before shutdown");
   // Stop accepting work, but keep ownership until cleanup has succeeded.
   initialized_ = false;
 
@@ -280,7 +282,9 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     return Status::NotFound("AccessTable handle was not found");
   // Pin before any resource wait. This lock serializes only Get submissions.
   std::lock_guard<std::mutex> direction(get_mutex_);
-  if (access_operator_.TracksGetCompletion()) {
+  if (execution.graph_lease && !graph_tables_.count(execution.graph_lease))
+    return Status::NotFound("Get graph lease not found");
+  if (access_operator_.TracksGetCompletion() && !execution.graph_lease) {
     const auto drained = DrainGetLocked();
     if (!drained.ok()) return drained;
   }
@@ -364,16 +368,42 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
   }
-  if (access_operator_.TracksGetCompletion()) pending_get_table_ = table_ref;
+  if (execution.graph_lease) {
+    auto& pinned = graph_tables_.at(execution.graph_lease);
+    if (pinned && pinned != table_ref)
+      return Status::InvalidState("graph lease already pins another table");
+    pinned = table_ref;
+  } else if (access_operator_.TracksGetCompletion())
+    pending_get_table_ = table_ref;
   const auto status = access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
-  if (status.ok() && execution.synchronize) pending_get_table_.reset();
-  if (!status.ok() && access_operator_.TracksGetCompletion()) {
+  if (status.ok() && execution.synchronize && !execution.graph_lease) pending_get_table_.reset();
+  if (!status.ok() && access_operator_.TracksGetCompletion() && !execution.graph_lease) {
     // Preparation failures have no outstanding DMA. Failed submissions retain
     // their pin unless the provider can positively establish completion.
     (void)DrainGetLocked();
   }
   return status;
+}
+
+Status RuntimeCore::BeginGetGraph(GetExecutionConfig config, const GetGraphOptions& request,
+                                  std::uint64_t* id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  auto s = DrainGetLocked();
+  if (!s.ok()) return s;
+  s = access_operator_.BeginGetGraph(config, request, id);
+  if (s.ok()) graph_tables_.emplace(*id, nullptr);
+  return s;
+}
+Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!graph_tables_.count(id)) return Status::NotFound("Get graph lease not found");
+  auto s = access_operator_.EndGetGraph(id, stream, discard);
+  if (s.ok()) graph_tables_.erase(id);
+  return s;
 }
 
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
@@ -403,7 +433,7 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   if (execution.config && !access_operator_.TracksGetCompletion())
     return Status::NotImplemented("per-call execution requires an execution policy at construction");
   if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
-  auto prepared = access_operator_.PreparePut(execution);
+  auto prepared = access_operator_.PreparePut(request, execution);
   if (!prepared.ok()) return prepared;
   PutContext put_context;
   PutAccessDesc put_desc;

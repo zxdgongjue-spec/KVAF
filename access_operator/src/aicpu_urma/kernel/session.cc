@@ -347,7 +347,8 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
                 "all Jettys must use the same peer TP and PSN");
   urma_seg_t segment{};
   std::memcpy(&segment, args.segment, sizeof(segment));
-  if (args.remote_address < segment.ubva.va || args.remote_address - segment.ubva.va >= segment.len)
+  if (!args.remote_address || segment.len > UINT64_MAX - args.remote_address ||
+      segment.len > UINT64_MAX - segment.ubva.va)
     return Fail(status, "remote range outside segment");
   urma_token_t token{};
   token.token = args.token;

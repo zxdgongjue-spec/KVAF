@@ -7,6 +7,10 @@
 using namespace kvaf::aicpu_urma;
 using namespace kvaf::aicpu_urma::detail;
 #define CHECK(c) do { if (!(c)) throw std::runtime_error(#c); } while (false)
+namespace kvaf::aicpu_urma::detail {
+bool BuildTransfers(Queue&, bool, const UmdkTransfer*, std::uint32_t, std::uint32_t&,
+                    std::uint64_t&, UmdkControlStatus&);
+}
 int main() {
   auto put = CreateSession(), get = CreateSession();
   const auto put_id = put->state.session, get_id = get->state.session;
@@ -36,6 +40,30 @@ int main() {
   args.status = reinterpret_cast<std::uint64_t>(&status);
   CHECK(KvafAicpuUmdkControl(&args) == 0 && status.result && !status.session);
   CHECK(FindSession(put_id) == put && FindSession(get_id) == get);
+  {
+    SessionScope scope(*put);
+    urma_target_seg_t remote{}, local{};
+    remote.seg.ubva.va = 0x9000;
+    remote.seg.len = 0x1000;
+    CurrentState().remote = &remote;
+    CurrentState().remote_address = 0x1000;
+    CurrentState().local = &local;
+    CurrentState().buffer = 0x3000;
+    CurrentState().buffer_bytes = 0x1000;
+    UmdkTransfer transfer{0x1040, 0x3080, 64};
+    std::uint32_t index = 0;
+    std::uint64_t offset = 0;
+    auto& queue = CurrentState().data_queues[0];
+    CHECK(BuildTransfers(queue, false, &transfer, 1, index, offset, status));
+    CHECK(queue.requests.remote_sges[0].addr == 0x9040);
+    index = 0;
+    offset = 0;
+    transfer.remote = 0xFFF;
+    CHECK(!BuildTransfers(queue, false, &transfer, 1, index, offset, status));
+    CurrentState().remote = nullptr;
+    CurrentState().local = nullptr;
+    CurrentState().buffer = 789;
+  }
   RemoveSession(put_id);
   CHECK(!FindSession(put_id) && FindSession(get_id) == get);
   CHECK(put->state.buffer == 789); // in-flight ownership outlives index removal

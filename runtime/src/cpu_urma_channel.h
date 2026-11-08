@@ -52,24 +52,27 @@ struct UrmaChannel {
     return error ? Fail(error, 8192U, token) : true;
   }
 
-  void Reset() {
+  void Reset() { (void)Close(); }
+
+  bool Close() {
     if (remote_jetty != nullptr) {
-      (void)urma_unimport_jetty(remote_jetty);
+      if (urma_unimport_jetty(remote_jetty) != URMA_SUCCESS) return false;
       remote_jetty = nullptr;
     }
     if (local_jetty != nullptr) {
-      (void)urma_delete_jetty(local_jetty);
+      if (urma_delete_jetty(local_jetty) != URMA_SUCCESS) return false;
       local_jetty = nullptr;
     }
     if (local_jfr != nullptr) {
-      (void)urma_delete_jfr(local_jfr);
+      if (urma_delete_jfr(local_jfr) != URMA_SUCCESS) return false;
       local_jfr = nullptr;
     }
     if (local_jfc != nullptr) {
-      (void)urma_delete_jfc(local_jfc);
+      if (urma_delete_jfc(local_jfc) != URMA_SUCCESS) return false;
       local_jfc = nullptr;
     }
     tp = {};
+    return true;
   }
 
  private:

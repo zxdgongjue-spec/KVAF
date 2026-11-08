@@ -112,7 +112,7 @@ struct Execution {
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
     for (std::uint32_t i = 0; i < *count; ++i)
-      sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
+      if (!aicpu_urma::ResolveBatchGetSource(r, i, args.output_bytes, &sources[i])) return false;
     auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
     *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, 0, {}};
     return true;

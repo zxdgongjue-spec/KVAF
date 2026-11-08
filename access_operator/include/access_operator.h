@@ -36,7 +36,23 @@ class AccessOperator {
 
   // Legacy synchronous implementations require no completion action.
   virtual Status PreparePut(const BatchPutExecutionOptions&) { return Status::OK(); }
+  virtual Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions& options) {
+    return PreparePut(options);
+  }
+  virtual Status Warmup(const ExecutionWarmup&) { return Status::OK(); }
   virtual Status DrainGet() { return Status::OK(); }
+  virtual Status PrepareGetGraph(const GetGraphOptions&) {
+    return Status::NotImplemented("provider does not support graph leases");
+  }
+  virtual Status FinishGetGraph(void*, bool) {
+    return Status::NotImplemented("provider does not support graph leases");
+  }
+  virtual Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*) {
+    return Status::NotImplemented("graph leases require execution dispatcher");
+  }
+  virtual Status EndGetGraph(std::uint64_t, void*, bool) {
+    return Status::NotImplemented("graph leases require execution dispatcher");
+  }
   virtual bool TracksGetCompletion() const { return false; }
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
@@ -122,6 +138,9 @@ class DefaultAccessOperator final : public AccessOperator {
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
 
   Status DrainGet() override;
+  Status Warmup(const ExecutionWarmup&) override;
+  Status PrepareGetGraph(const GetGraphOptions&) override;
+  Status FinishGetGraph(void*, bool) override;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

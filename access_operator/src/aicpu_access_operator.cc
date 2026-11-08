@@ -39,6 +39,7 @@ struct UmdkAccessOperator::Impl {
   bool managed_completion;
   RemoteRegionDesc region;
   bool initialized{false};
+  void* warmup_buffer{nullptr};
   std::mutex get_mutex, put_mutex;
 };
 UmdkAccessOperator::UmdkAccessOperator(UmdkAccessOperatorConfig config)
@@ -66,6 +67,23 @@ Status UmdkAccessOperator::Initialize(const RemoteRegionDesc& region) {
   impl_->initialized = true;
   return Status::OK();
 }
+Status UmdkAccessOperator::Warmup(const ExecutionWarmup& request) {
+  if (!impl_->initialized) return Status::NotInitialized("AICPU provider not initialized");
+  if (impl_->enable_get) {
+    std::lock_guard<std::mutex> lock(impl_->get_mutex);
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+    if (impl_->push) return Status::OK();
+#endif
+    return impl_->get.Warmup();
+  }
+  std::lock_guard<std::mutex> lock(impl_->put_mutex);
+  if (!impl_->warmup_buffer &&
+      aclrtMalloc(&impl_->warmup_buffer, 64, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
+    return Status::OutOfMemory("cannot allocate session setup buffer");
+  auto s = impl_->put_session.Ensure(impl_->region.base, impl_->warmup_buffer, 64);
+  return s.ok() ? impl_->put.Reserve(request.request_capacity ? request.request_capacity : 65536)
+                : s;
+}
 Status UmdkAccessOperator::Shutdown() {
   std::scoped_lock lock(impl_->get_mutex, impl_->put_mutex);
   // Push shutdown must stop the remote DMA producer even after a kernel failure.
@@ -85,6 +103,11 @@ Status UmdkAccessOperator::Shutdown() {
   if (!released.ok()) return released;
   auto put_released = impl_->put.Shutdown();
   if (!put_released.ok()) return put_released;
+  if (impl_->warmup_buffer) {
+    if (aclrtFree(impl_->warmup_buffer) != ACL_SUCCESS)
+      return Status::Internal("cannot free session setup buffer");
+    impl_->warmup_buffer = nullptr;
+  }
   impl_->initialized = false;
   return Status::OK();
 }

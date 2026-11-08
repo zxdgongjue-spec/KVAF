@@ -16,6 +16,8 @@ struct BatchGetKernelProfile;
 struct NpuRuntimeOptions : ExecutionPolicy {
   // Legacy constructors keep their selected backend and graph behavior.
   bool per_call_execution{false};
+  std::vector<std::pair<PutExecutionConfig, ExecutionResources>> put_resources;
+  std::vector<std::pair<GetExecutionConfig, ExecutionResources>> get_resources;
   NpuRuntimeOptions(std::string kernel_object_path,
                     std::uint32_t token_bytes,
                     std::uint32_t tokens_per_block)
@@ -79,9 +81,11 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
-  Status Warmup(PutExecutionConfig);
-  Status Warmup(GetExecutionConfig);
+  Status Warmup(PutExecutionConfig, const ExecutionWarmup& = {});
+  Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
   Status DrainGet();
+  Status Recover(PutExecutionConfig);
+  Status Recover(GetExecutionConfig);
   bool per_call_execution() const;
 
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);

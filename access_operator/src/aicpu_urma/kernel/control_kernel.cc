@@ -70,7 +70,7 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
 
 // Explicit entry capability: old packages lack independent sessions and
 // completion-scoped buffer unregistration. Host preflight requires this name.
-extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV2(
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV3(
     UmdkControlArgs* args) {
   return KvafAicpuUmdkControl(args);
 }

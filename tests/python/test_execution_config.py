@@ -12,6 +12,16 @@ class ExecutionConfigTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             get.algorithm = "scatter"
 
+    def test_execution_resources(self):
+        resources = kvaf.ExecutionResources(cores=4, jettys=2, request_capacity=1024,
+                                            max_inflight_total=0, kernel_path="ubmem.o")
+        self.assertEqual((resources.cores, resources.jettys, resources.request_capacity), (4, 2, 1024))
+        self.assertEqual(resources.max_inflight_total, 0)
+        self.assertEqual(resources.kernel_path, "ubmem.o")
+        self.assertIsNone(kvaf.ExecutionResources().max_inflight_total)
+        with self.assertRaises(AttributeError):
+            resources.cores = 8
+
     def test_invalid_strings(self):
         for value in ("auto", "", "URMA", "urma+ubmem"):
             with self.subTest(value=value), self.assertRaises(ValueError):

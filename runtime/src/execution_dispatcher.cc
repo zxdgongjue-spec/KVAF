@@ -82,6 +82,51 @@ Status ExecutionDispatcher::PreparePut(const BatchPutExecutionOptions& options) 
   if (s.ok() && put_failed_) return Status::InvalidState("Put completion is unresolved; shutdown required");
   return s.ok() ? Acquire(puts_, c, &op) : s;
 }
+Status ExecutionDispatcher::PreparePut(const BatchPutRequest& request,
+                                       const BatchPutExecutionOptions& options) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  PutExecutionConfig c;
+  auto s = ResolveExecution(policy_, options.config, &c);
+  AccessOperator* op = nullptr;
+  if (s.ok() && put_failed_)
+    return Status::InvalidState("Put completion is unresolved; shutdown required");
+  if (s.ok()) s = Acquire(puts_, c, &op);
+  return s.ok() ? op->PreparePut(request, options) : s;
+}
+template <class Config>
+Status ExecutionDispatcher::RecoverResource(std::vector<Resource<Config>>& resources, Config c) {
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  Config resolved;
+  auto s = ResolveExecution(policy_, c, &resolved);
+  if (!s.ok()) return s;
+  for (auto& r : resources)
+    if (r.config == resolved) {
+      if (r.owner) {
+        s = r.owner->Shutdown();
+        if (!s.ok()) return s;
+        r.owner.reset();
+      }
+      r.ready = false;
+      r.failure = Status::OK();
+      AccessOperator* owner = nullptr;
+      return Acquire(resources, resolved, &owner);
+    }
+  return Status::NotImplemented("execution provider is unavailable");
+}
+Status ExecutionDispatcher::Recover(PutExecutionConfig c) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  if (put_failed_) return Status::InvalidState("pending Put transaction requires Runtime shutdown");
+  return RecoverResource(puts_, c);
+}
+Status ExecutionDispatcher::Recover(GetExecutionConfig c) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  auto s = DrainGetLocked();
+  if (!s.ok()) return s;
+  return RecoverResource(gets_, c);
+}
 Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(put_mutex_);
@@ -102,6 +147,7 @@ Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) 
   return s;
 }
 Status ExecutionDispatcher::DrainGetLocked() {
+  if (graph_id_) return Status::Busy("Get graph lease owns this direction");
   if (!pending_get_) return Status::OK();
   auto s = pending_get_->DrainGet();
   if (s.ok()) pending_get_ = nullptr;
@@ -113,6 +159,16 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   GetExecutionConfig c;
   auto s = ResolveExecution(policy_, request.execution.config, &c);
   if (!s.ok()) return s;
+  if (graph_id_ || request.execution.graph_lease) {
+    if (!graph_id_ || request.execution.graph_lease != graph_id_ || !(c == graph_config_))
+      return Status::Busy("Get graph lease/configuration mismatch");
+    if (graph_captured_ || request.execution.synchronize || request.execution.profile)
+      return Status::InvalidState("one asynchronous Get capture is allowed per lease");
+    auto invocation = request;
+    invocation.execution.config = c;
+    graph_captured_ = true;
+    return graph_owner_->ExecuteBatchGet(invocation);
+  }
   s = DrainGetLocked();
   if (!s.ok()) return s;
   AccessOperator* op = nullptr;
@@ -130,18 +186,65 @@ Status ExecutionDispatcher::DrainGet() {
   std::lock_guard<std::mutex> lock(get_mutex_);
   return DrainGetLocked();
 }
-Status ExecutionDispatcher::Warmup(PutExecutionConfig c) { return PreparePut({nullptr, c}); }
-Status ExecutionDispatcher::Warmup(GetExecutionConfig c) {
+Status ExecutionDispatcher::Warmup(PutExecutionConfig c, const ExecutionWarmup& request) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  PutExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, c, &resolved);
+  AccessOperator* op = nullptr;
+  if (s.ok() && put_failed_) return Status::InvalidState("Put completion unresolved");
+  if (s.ok()) s = Acquire(puts_, resolved, &op);
+  return s.ok() ? op->Warmup(request) : s;
+}
+Status ExecutionDispatcher::Warmup(GetExecutionConfig c, const ExecutionWarmup& request) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (s.ok()) s = DrainGetLocked();
   AccessOperator* op = nullptr;
-  return s.ok() ? Acquire(gets_, resolved, &op) : s;
+  if (s.ok()) s = Acquire(gets_, resolved, &op);
+  return s.ok() ? op->Warmup(request) : s;
+}
+Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOptions& request,
+                                          std::uint64_t* id) {
+  if (!id) return Status::InvalidArgument("null graph lease output");
+  *id = 0;
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (c.executor != Executor::Aiv || c.algorithm != GetAlgorithm::Direct)
+    return Status::NotImplemented("only AIV Direct Get supports graph leases");
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, c, &resolved);
+  if (s.ok()) s = DrainGetLocked();
+  AccessOperator* op = nullptr;
+  if (s.ok()) s = Acquire(gets_, resolved, &op);
+  if (!s.ok()) return s;
+  if (!next_graph_id_) return Status::InvalidState("graph lease ID exhausted");
+  s = op->PrepareGetGraph(request);
+  if (!s.ok()) return s;
+  graph_id_ = next_graph_id_++;
+  graph_owner_ = op;
+  graph_config_ = resolved;
+  graph_captured_ = false;
+  *id = graph_id_;
+  return Status::OK();
+}
+Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!id || id != graph_id_) return Status::NotFound("Get graph lease not found");
+  auto s = graph_owner_->FinishGetGraph(stream, discard);
+  if (s.ok()) {
+    graph_id_ = 0;
+    graph_owner_ = nullptr;
+    graph_captured_ = false;
+  }
+  return s;
 }
 Status ExecutionDispatcher::Shutdown() {
   std::unique_lock<std::shared_mutex> life(lifecycle_);
+  if (graph_id_) return Status::Busy("release Get graph lease before shutdown");
   ready_ = false;
   Status first;
   auto close = [&first](auto& resources) {

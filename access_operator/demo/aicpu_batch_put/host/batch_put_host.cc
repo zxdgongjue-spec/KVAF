@@ -13,6 +13,19 @@ Status BatchPutTransport::Shutdown() {
   host_transfers_ = std::vector<UmdkTransfer>{};
   return Status::OK();
 }
+Status BatchPutTransport::Reserve(std::uint32_t count) {
+  if (!count || count > kUmdkMaxTransfers) return Status::InvalidArgument("invalid Put capacity");
+  const auto bytes = std::size_t(count) * sizeof(UmdkTransfer);
+  if (bytes <= capacity_) return Status::OK();
+  void* allocation = nullptr;
+  if (aclrtMalloc(&allocation, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+    return Status::OutOfMemory("cannot reserve WRITE descriptors");
+  if (transfers_) (void)aclrtFree(transfers_);
+  transfers_ = allocation;
+  capacity_ = bytes;
+  host_transfers_.reserve(count);
+  return Status::OK();
+}
 Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPutExecRequest& exec) {
   if (!exec.request || !exec.put_desc || !exec.execution.stream)
     return Status::InvalidArgument(
@@ -46,14 +59,8 @@ Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPut
   if (transfers.empty() || transfers.size() > kUmdkMaxTransfers)
     return Status::InvalidArgument("UMDK BatchPut exceeds the transfer list capacity");
   const auto bytes = transfers.size() * sizeof(UmdkTransfer);
-  if (bytes > capacity_) {
-    void* allocation = nullptr;
-    if (aclrtMalloc(&allocation, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
-      return Status::Internal("failed to allocate UMDK WRITE descriptors");
-    if (transfers_ != nullptr) (void)aclrtFree(transfers_);
-    transfers_ = allocation;
-    capacity_ = bytes;
-  }
+  auto reserved = Reserve(transfers.size());
+  if (!reserved.ok()) return reserved;
   if (aclrtMemcpy(transfers_, capacity_, transfers.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE) !=
       ACL_SUCCESS)
     return Status::Internal("failed to upload UMDK WRITE descriptors");

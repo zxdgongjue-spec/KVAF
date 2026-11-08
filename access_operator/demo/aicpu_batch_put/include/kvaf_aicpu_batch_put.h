@@ -12,6 +12,7 @@ class BatchPutTransport {
   explicit BatchPutTransport(UmdkSession& session) : session_(session) {}
   Status Execute(const RemoteRegionDesc&, const BatchPutExecRequest&);
   Status Shutdown();
+  Status Reserve(std::uint32_t capacity);
 
  private:
   UmdkSession& session_;

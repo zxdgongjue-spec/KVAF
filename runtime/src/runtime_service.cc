@@ -9,6 +9,11 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <vector>
 
 namespace kvaf {
 namespace {
@@ -48,15 +53,62 @@ Status RuntimeService::Serve(Runtime& runtime) const {
                             std::to_string(options_.port) + ": " + std::strerror(errno));
   }
   std::fprintf(stderr, "[KVAF_CPU] LISTEN address=%s port=%u\n", options_.address.c_str(), options_.port);
-  while (true) {
+  // A bounded pool allows independent session setup/control to progress while
+  // another session drains. Runtime owns per-record synchronization.
+  std::mutex mutex;
+  std::condition_variable ready, space;
+  std::deque<int> queue;
+  bool stopping = false;
+  std::vector<std::thread> workers;
+  auto worker = [&] {
+    for (;;) {
+      int connection;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        ready.wait(lock, [&] { return stopping || !queue.empty(); });
+        if (queue.empty()) return;
+        connection = queue.front();
+        queue.pop_front();
+        space.notify_one();
+      }
+      try {
+        (void)runtime.ServeConnection(connection);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "[KVAF_CPU] control request failed: %s\n", e.what());
+      }
+      close(connection);
+    }
+  };
+  auto finish = [&] {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stopping = true;
+    }
+    ready.notify_all();
+    for (auto& thread : workers) thread.join();
+    close(listener);
+  };
+  try {
+    for (int i = 0; i < 8; ++i) workers.emplace_back(worker);
+  } catch (const std::exception& e) {
+    finish();
+    return Status::Internal(e.what());
+  }
+  for (;;) {
     const int connection = accept(listener, nullptr, nullptr);
     if (connection < 0) {
       if (errno == EINTR) continue;
-      close(listener);
-      return Status::Internal("accept failed: " + std::string(std::strerror(errno)));
+      const std::string error = std::strerror(errno);
+      finish();
+      return Status::Internal("accept failed: " + error);
     }
-    (void)runtime.ServeConnection(connection);
-    close(connection);
+    timeval timeout{30, 0};
+    setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    std::unique_lock<std::mutex> lock(mutex);
+    space.wait(lock, [&] { return queue.size() < 64; });
+    queue.push_back(connection);
+    ready.notify_one();
   }
 }
 

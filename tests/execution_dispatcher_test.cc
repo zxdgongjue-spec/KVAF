@@ -63,6 +63,8 @@ class Provider final : public AccessOperator {
     pending_ = true;
     return e.execution.synchronize ? DrainGet() : Status::OK();
   }
+  Status PrepareGetGraph(const GetGraphOptions&) override { return Status::OK(); }
+  Status FinishGetGraph(void*, bool) override { return DrainGet(); }
   Status DrainGet() override {
     if (!pending_) return Status::OK();
     ++s_.drains;
@@ -141,6 +143,7 @@ void LazyAndIndependent() {
   a.fail_create = true;
   CHECK(!d.Warmup(gather).ok()); a.fail_create = false;
   CHECK(!d.Warmup(gather).ok() && a.creates == 1);  // no blind retry
+  CHECK(d.Recover(gather).ok() && a.creates == 2);
   a.fail_close = true; CHECK(!d.Shutdown().ok()); a.fail_close = false;
   CHECK(d.Shutdown().ok());
 }
@@ -199,8 +202,62 @@ void RuntimePinsAndTransactions() {
   p.fail_close = true; CHECK(!runtime.Shutdown().ok()); CHECK(runtime.needs_cleanup());
   p.fail_close = false; CHECK(runtime.Shutdown().ok()); CHECK(!runtime.needs_cleanup());
 }
+void GraphLeasePinsAndIsolation() {
+  State p, g, a;
+  ExecutionDispatcher dispatch(Policy());
+  Register(dispatch, p, g, a);
+  auto meta = CreateInMemoryMetaManager();
+  auto allocator = CreateHostDdrMemoryAllocator();
+  RuntimeCore runtime(*meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({128, 16, DeviceKind::kCpu}).ok());
+  char input[16] = "graph payload", output[16]{};
+  CHECK(runtime.BatchPut({{1}, {input, 16, DeviceKind::kCpu}, {0}, {16}}).ok());
+  AccessTableHandle table;
+  CHECK(runtime.PrepareAccessTable({{1}}, &table).ok());
+  std::uint64_t lease = 0;
+  CHECK(runtime
+            .BeginGetGraph(get, {{output, 16, DeviceKind::kCpu}, reinterpret_cast<void*>(1), 1},
+                           &lease)
+            .ok());
+  int index = 0, offset = 0, count = 1, row = 0;
+  BatchGetRequest request{table,
+                          {&index, 4, DeviceKind::kCpu},
+                          {&offset, 4, DeviceKind::kCpu},
+                          {&count, 4, DeviceKind::kCpu},
+                          {&row, 4, DeviceKind::kCpu},
+                          {output, 16, DeviceKind::kCpu},
+                          16,
+                          1,
+                          {}};
+  CHECK(runtime.BatchGet(request).code() == StatusCode::kBusy);
+  CHECK(dispatch.Recover(get).code() == StatusCode::kBusy);
+  BatchGetExecutionOptions options;
+  options.config = get;
+  options.graph_lease = lease;
+  CHECK(runtime.BatchGet(request, options).ok());
+  const auto drains = g.drains.load();
+  CHECK(runtime.BatchGet(request, options).code() == StatusCode::kInvalidState);
+  CHECK(g.drains == drains);
+  CHECK(runtime.ReleaseAccessTable(table).ok());
+  CHECK(runtime.BatchFree({{1}}).code() == StatusCode::kBusy);
+  CHECK(runtime.BatchPut({{2}, {input, 16, DeviceKind::kCpu}, {0}, {16}}).ok());
+  CHECK(g.drains == drains);
+  CHECK(runtime.Shutdown().code() == StatusCode::kBusy);
+  CHECK(runtime.initialized());
+  g.fail_drain = true;
+  CHECK(!runtime.EndGetGraph(lease, reinterpret_cast<void*>(1)).ok());
+  CHECK(runtime.BatchFree({{1}}).code() == StatusCode::kBusy);
+  g.fail_drain = false;
+  CHECK(runtime.EndGetGraph(lease, reinterpret_cast<void*>(1)).ok());
+  CHECK(std::memcmp(input, output, 16) == 0);
+  CHECK(runtime.BatchFree({{1}}).ok());
+  CHECK(runtime.Shutdown().ok());
+}
 }  // namespace
 int main() {
-  Configurations(); LazyAndIndependent(); RuntimePinsAndTransactions();
+  Configurations();
+  LazyAndIndependent();
+  RuntimePinsAndTransactions();
+  GraphLeasePinsAndIsolation();
   std::cout << "Execution registry, lazy domains, pins, overlap and recovery passed\n";
 }

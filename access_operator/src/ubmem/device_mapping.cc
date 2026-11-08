@@ -1,4 +1,5 @@
 #include "ubmem/device_mapping.h"
+#include <acl/acl.h>
 
 #include <cstdio>
 #include <limits>
@@ -53,4 +54,39 @@ Status DeviceMapping::Close() {
   return Status::OK();
 }
 
+Status DeviceMappingCache::Acquire(std::uint32_t device, const FabricHandle& handle,
+                                   std::uint64_t bytes, std::shared_ptr<DeviceMapping>* out) {
+  if (!out || *out) return Status::InvalidArgument("mapping output is occupied");
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto [it, created] = entries_.try_emplace({device, bytes, handle});
+  auto& e = it->second;
+  if (created) {
+    e.mapping = std::make_shared<DeviceMapping>();
+    e.failure = e.mapping->Import(handle, bytes);
+  }
+  // Even failed imports retain their partial handles until the last owner closes.
+  ++e.users;
+  *out = e.mapping;
+  return e.failure;
+}
+Status DeviceMappingCache::Release(std::shared_ptr<DeviceMapping>* owner) {
+  if (!owner || !*owner) return Status::OK();
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+    auto& e = it->second;
+    if (e.mapping != *owner) continue;
+    if (e.users == 1) {
+      auto s = e.mapping->Close();
+      if (!s.ok()) {
+        e.failure = s;
+        return s;
+      }
+      entries_.erase(it);
+    } else
+      --e.users;
+    owner->reset();
+    return Status::OK();
+  }
+  return Status::InvalidState("mapping lease is not owned by this Runtime");
+}
 }  // namespace kvaf::ubmem

@@ -17,6 +17,7 @@ except ImportError as error:
 
 PutExecutionConfig = _native.PutExecutionConfig
 GetExecutionConfig = _native.GetExecutionConfig
+ExecutionResources = _native.ExecutionResources
 AccessTable = _native.AccessTable
 Runtime = _native.Runtime
 MockRuntime = _native.MockRuntime
@@ -33,6 +34,7 @@ if hasattr(_native, "NpuRuntime"):
 __all__ = [
     "PutExecutionConfig",
     "GetExecutionConfig",
+    "ExecutionResources",
     "AccessTable",
     "Runtime",
     "MockRuntime",

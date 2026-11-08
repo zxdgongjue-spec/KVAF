@@ -1,5 +1,5 @@
 find_package(Threads REQUIRED)
-add_library(kvaf_peer_link STATIC src/peer_link.cc)
+add_library(kvaf_peer_link STATIC src/peer_link.cc src/execution_protocol.cc)
 
 target_include_directories(kvaf_peer_link
   PUBLIC
@@ -9,6 +9,7 @@ target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
 add_library(kvaf_runtime
+  src/cache_region_service.cc
   src/execution_config.cc
   src/execution_dispatcher.cc
   src/runtime.cc
@@ -24,6 +25,7 @@ target_include_directories(kvaf_runtime
 target_link_libraries(kvaf_runtime
   PUBLIC
     kvaf_common
+    kvaf_peer_link
     Threads::Threads
     kvaf_meta_manager
     kvaf_access_operator
@@ -64,7 +66,7 @@ endif()
 
 option(KVAF_CPU_ENABLE_URMA "Include the URMA CPU backend" ON)
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/ubmem_cpu_backend.cc)
+  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/ubmem_cpu_backend.cc src/execution_cpu_backend.cc)
   target_include_directories(kvaf_cpu_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(kvaf_cpu_runtime PUBLIC kvaf_runtime PRIVATE kvaf_ubmem_hal kvaf_peer_link)
   if(KVAF_CPU_ENABLE_URMA)

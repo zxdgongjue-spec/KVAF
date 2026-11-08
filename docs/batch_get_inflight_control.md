@@ -42,7 +42,8 @@ runtime = kvaf.NpuRuntime(
 C++ 使用 `NpuRuntimeOptions` / `AccessOperatorConfig` 的同名字段。底层直接
 构造 `KvafExecuteBatchGetKernelArgs` 的调用方须显式填写该字段，零初始化表示基线。
 Kernel 参数仍为 112 字节，新增字段占用原尾部 padding；profile/queue 大小也保持
-不变，但字段语义已更新。Kernel 符号改为 `KvafExecuteBatchGetAivKernelV2`，旧
+不变，但字段语义已更新。当前 Kernel 符号为 `KvafExecuteBatchGetAivKernelV3`，在
+V2 的窗口控制基础上增加规范地址到会话注册基址的转换。旧
 Host/Kernel 混用会在加载符号时失败。必须整体重编 Host、Python binding 和 Kernel。
 预算按值 capture，改变预算需重建 Runtime/graph；`miss_count` 内容仍可动态更新。
 

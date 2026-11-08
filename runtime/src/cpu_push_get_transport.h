@@ -16,9 +16,9 @@ namespace kvaf::cpu_push {
 class Transport {
  public:
   ~Transport();
-  Status Initialize(urma_context_t*, urma_target_seg_t* source,
-                    const peer::OpenCpuPushGetRequest&, urma::GetTpList,
-                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenCpuPushGetResponse*);
+  Status Initialize(urma_context_t*, urma_target_seg_t* source, const peer::OpenCpuPushGetRequest&,
+                    urma::GetTpList, urma::ImportJettyEx, std::uint32_t psn,
+                    peer::OpenCpuPushGetResponse*, std::uint64_t canonical_base = 0);
   Status ReadRequest(std::uint64_t* sequence);
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch();
@@ -82,7 +82,7 @@ class Transport {
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
-  std::uint64_t hbm_base_{};
+  std::uint64_t hbm_base_{}, source_base_{}, source_bytes_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
   Layout layout_;
 };

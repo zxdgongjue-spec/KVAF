@@ -100,6 +100,21 @@ Status BatchGetTransport::Shutdown() {
   impl_->initialized = impl_->cpu_enabled = false;
   return Status::OK();
 }
+Status BatchGetTransport::Warmup() {
+  if (!impl_->initialized) return Status::NotInitialized("Gather not initialized");
+  const auto workers = impl_->session.config().workers;
+  auto s =
+      impl_->session.Ensure(impl_->region.base, impl_->workspace, GatherWorkspaceBytes(workers));
+  if (!s.ok()) return s;
+  if (!impl_->cpu_enabled) {
+    const auto staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
+    const auto controls = staging + GatherStagingBytes(impl_->token_bytes, workers) +
+                          workers * GatherLaneDescriptorBytes(workers);
+    s = impl_->session.config().peer_link->EnableGatherLanes(impl_->region.base, controls, workers);
+    if (s.ok()) impl_->cpu_enabled = true;
+  }
+  return s;
+}
 Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   auto* profile = exec.execution.profile;
   if (profile && !exec.execution.synchronize)
@@ -113,6 +128,8 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   UmdkBatchGetArgs launch{};
   auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
   if (!valid.ok()) return valid;
+  launch.request.canonical_base = impl_->region.base;
+  launch.request.logical_bytes = impl_->region.length;
   if (launch.request.request_capacity > kGatherMaxRequests ||
       launch.request.token_bytes != impl_->token_bytes)
     return InvalidArgument("UMDK BatchGet exceeds 65536 requests or configured token size");

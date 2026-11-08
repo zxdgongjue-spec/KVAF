@@ -6,11 +6,17 @@
 #include <string>
 #include <mutex>
 #include <unordered_map>
+#include <memory>
+#include "execution_config.h"
 
 #include "peer_protocol.h"
 #include "cpu_gather.h"
 #include "status.h"
 
+namespace kvaf::execution {
+struct Request;
+struct Response;
+}  // namespace kvaf::execution
 namespace kvaf::peer {
 
 struct PeerRegion {
@@ -35,9 +41,19 @@ struct PeerCandidateInfo {
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
 // receives it through LinkTo and never reads process environment.
-class PeerLink {
+class PeerLink : public std::enable_shared_from_this<PeerLink> {
  public:
   explicit PeerLink(std::string address);
+  ~PeerLink() = default;
+  Status AllocateCacheRegion(std::uint64_t logical_bytes, std::uint64_t slot_size,
+                             std::uint64_t auxiliary_bytes, TransportMode, PeerRegion*);
+  std::shared_ptr<PeerLink> ExecutionSession(const execution::Request& config);
+  Status PrepareExecution();
+  Status CloseExecution();
+  Status ResolveExecutionControl();
+  Status QueryExecution(execution::Response*) const;
+  // Typed legacy commands are encapsulated in an idempotent session request.
+  bool Control(const void*, std::size_t, void*, std::size_t, std::string*) const;
 
   const std::string& address() const { return address_; }
   bool has_region() const { return !regions_.empty(); }
@@ -77,6 +93,9 @@ class PeerLink {
       uint32_t* peer_psn, bool share_tp);
 
  private:
+  struct ExecutionState;
+  std::shared_ptr<ExecutionState> execution_;
+  std::shared_ptr<PeerLink> parent_;
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
   mutable std::mutex mapping_mutex_;

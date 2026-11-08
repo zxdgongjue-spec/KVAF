@@ -99,6 +99,8 @@ class RuntimeCore {
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
   Status DrainGet();
+  Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*);
+  Status EndGetGraph(std::uint64_t, void* stream, bool discard_result = false);
 
  protected:
   MetaManager& meta_manager_;
@@ -129,6 +131,7 @@ class RuntimeCore {
   mutable std::mutex table_mutex_;
   std::mutex put_mutex_, get_mutex_;
   std::shared_ptr<AccessTableState> pending_get_table_;
+  std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>> graph_tables_;
   std::optional<PutContext> pending_put_;
   std::atomic<bool> initialized_{false};
   std::atomic<bool> needs_cleanup_{false};

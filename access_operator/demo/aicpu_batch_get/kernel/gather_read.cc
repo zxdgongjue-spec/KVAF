@@ -99,7 +99,9 @@ void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_
         offset = 0U;
       }
     }
-    remote[wr_index] = {source, bytes, layout.remote_segment, nullptr};
+    remote[wr_index] = {
+        layout.remote_segment->seg.ubva.va + (source - CurrentState().remote_address), bytes,
+        layout.remote_segment, nullptr};
     auto wr = layout.prototype;
     wr.user_ctx = ++sequence;
     wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&remote[wr_index]);
@@ -134,7 +136,12 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
                      UmdkControlStatus& submitted) {
   const auto& args = prefix.args;
   const auto& source = *reinterpret_cast<const Sge*>(tail.rw.src.sge);
-  const auto required = source.addr + source.len - args.remote_staging;
+  const auto registered_staging =
+      CurrentState().remote->seg.ubva.va + (args.remote_staging - CurrentState().remote_address);
+  if (source.addr < registered_staging)
+    return Fail(submitted, "Gather source precedes registered staging");
+  const auto required = source.addr - registered_staging + source.len;
+  if (required > args.bytes) return Fail(submitted, "Gather source exceeds request staging");
   if (required <= prefix.ready_bytes) return true;
   auto& gather = prefix.gather;
   gather.phase = kWaitReadyPrefix;
@@ -305,12 +312,10 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
   // and CPU-push kernels. AICPU only reads them; no per-request cache sweep.
   auto* descriptor = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(args.source_descriptor);
   auto* sources = reinterpret_cast<kvaf::peer::GatherSpan*>(descriptor + 1);
-  if (!request.indices) {
-    for (auto i = first; i < last; ++i)
-      sources[args.source_span_count++] = {addresses[i], request.token_bytes, 0U};
-  } else {
-    for (auto i = first; i < last; ++i)
-      sources[args.source_span_count++] = {addresses[indices[i]] + offsets[i], request.token_bytes, 0U};
+  for (auto i = first; i < last; ++i) {
+    std::uint64_t source = 0;
+    if (!ResolveBatchGetSource(request, i, args.output_extent, &source)) return false;
+    sources[args.source_span_count++] = {source, request.token_bytes, 0U};
   }
   const auto bytes = static_cast<std::uint64_t>(args.source_span_count) * request.token_bytes;
   if (bytes > UINT32_MAX) return false;

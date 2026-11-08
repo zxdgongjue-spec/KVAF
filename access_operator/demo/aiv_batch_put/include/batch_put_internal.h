@@ -43,7 +43,8 @@ typedef struct KvafBatchPutDirectUrmaEntity {
   uint32_t cq_depth;
   uint32_t cqe_size;
   uint32_t reserved0;
-  uint64_t reserved[7];
+  uint64_t registered_base;
+  uint64_t reserved[6];
 } KvafBatchPutDirectUrmaEntity;
 
 // Private launch envelope. Runtime callers never construct or own these
