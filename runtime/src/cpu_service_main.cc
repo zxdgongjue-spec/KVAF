@@ -12,11 +12,11 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off] "
+               "[--gather-threads N] [--gather-mode adaptive|active|passive] "
                "[--memory-page-mode default|thp] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to auto (up to 32), "
-               "mode to adaptive, affinity to on; memory page mode defaults to thp. "
+               "mode to adaptive; memory page mode defaults to thp. "
                "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
                program);
 }
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     }
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
          argument == "--eid-index" || argument == "--gather-threads" ||
-         argument == "--gather-mode" || argument == "--gather-affinity" ||
+         argument == "--gather-mode" ||
          argument == "--memory-page-mode" || argument == "--hal-library") &&
         index + 1 >= argc) {
       PrintUsage(argv[0]);
@@ -88,13 +88,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "invalid --gather-threads (expected 1..64)\n");
         return 2;
       }
-    } else if (argument == "--gather-affinity") {
-      const std::string value(argv[++index]);
-      if (value != "on" && value != "off") {
-        std::fprintf(stderr, "invalid --gather-affinity (expected on|off)\n");
-        return 2;
-      }
-      cpu_options.gather_affinity = value == "on";
     } else if (argument == "--gather-mode") {
       const std::string value(argv[++index]);
       if (value != "adaptive" && value != "active" && value != "passive") {

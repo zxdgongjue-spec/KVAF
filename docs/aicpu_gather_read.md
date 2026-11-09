@@ -46,12 +46,13 @@ CPU 服务使用新二进制重启：
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28990 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --gather-threads 8 --gather-mode active
 ```
 
 同一服务也可供 AIV、UBmem 和 Scatter 使用。`--gather-threads` 是每个 Gather
-session 的 CPU 线程总预算，须不小于客户端 AICPU worker 数；`active` 使用主动等待，
-`--gather-affinity off` 不主动绑核。这些参数不改变其他后端的执行。
+session 的 CPU 线程总预算，须不小于客户端 AICPU worker 数；`active` 使用主动等待。
+这两个参数不改变其他后端的执行。Gather 线程继承外部 CPU 亲和性；需要限定 NUMA 节点时，
+使用 `numactl --cpunodebind=N --membind=N` 启动服务，或使用 `taskset -c CPU_LIST` 指定 CPU。
 示例使用设备 7 和本机服务 `127.0.0.1:28990`，跨主机部署时替换为实际设备号和 CPU 地址。
 
 NPU 进程先加载 CANN 环境，再使用现有 Tensor 接口：
@@ -262,7 +263,7 @@ KVAF_AICPU_WORKERS="1 2 4" \
 `--table-capacity` 仅用于选择更小的源池，不能超出上述预算；`--tokens-per-block` 控制每块 token 数。
 `miss_count` 只决定本轮从源池读取多少个 token，不决定源池分配大小。
 每组日志打印源池 GiB、工作区预算 MiB 和总预算，避免字节数用科学计数法显示。
-CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
+CPU 线程预算和外部 CPU/NUMA 限制在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
 
 结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
 可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。

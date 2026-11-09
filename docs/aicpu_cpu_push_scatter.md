@@ -87,10 +87,10 @@ CPU 端启动同一个服务：
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28990 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --gather-threads 8 --gather-mode active
 ```
 
-三个 `--gather-*` 参数只影响 Gather，供下面的双模式对照使用；单独运行 Scatter 时
+两个 `--gather-*` 参数只影响 Gather，供下面的双模式对照使用；单独运行 Scatter 时
 可省略，它们不控制 CPU Push 的线程数。CPU Push 由所属服务线程提交，AICPU worker
 数由客户端 `npu_core_count` / `--workers` 控制。
 示例设备号 7 和本机服务地址按部署调整；跨主机时替换为 CPU 服务的可达地址。

@@ -58,7 +58,8 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 ```
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
-`numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录
+`numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的
+CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。`REGION_ALLOCATED` 日志会记录
 `page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
