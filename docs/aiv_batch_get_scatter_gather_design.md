@@ -1,6 +1,7 @@
 # AIV BatchGet Scatter / Gather 三阶段设计
 
-> 第 3.1 节描述当前 scatter mailbox 控制通路，其余章节保留原阶段设计。
+> 第 3.1 节描述当前 Scatter mailbox 控制通路。第 4～6 节记录原阶段设计，
+> 当前配置、数据通路和回归命令以 [实现与验证说明](aiv_batch_get_stage1.md) 为准。
 
 ## 1. 文档状态与基线
 
@@ -73,6 +74,8 @@ SQ doorbell 通知通信硬件处理队列；notify 通知 CPU 软件处理新�
 通过 V8 OpenCpuPushGet 交换两端 segment/token 和四路 Jetty。Jetty 0 同时提供
 AIV 可发起控制 WRITE 的 USER_CTL SQ；CPU 四条 payload 队列保持不变。
 
+整批发布时序如下。
+
 ```text
 AIV                                      CPU worker
 多核生成 sources[]，写入 HBM
@@ -84,10 +87,10 @@ WRITE header + 有效 sources[] 到 CPU mailbox
                                          更新 SGL 并开始回推 payload
 ```
 
-头、清单和 notify 分开发送，绝不覆盖 CPU 拥有的 done/Ready/marker 源区。
-每个有界控制批次只等待强序尾 CQE；最终 notify 排在全部清单之后。
-可信输入超过 1024 个有效行时，核0先发布首段，随后合批发布余下清单和后缀序号。
-CPU 观察到后缀序号后读取其余地址。
+头、清单和 notify 分开发送，避开 CPU 拥有的 done/Ready/marker 源区。
+每个有界控制批次只等待强序尾 CQE。整批模式下，notify 排在完整清单之后。
+可信请求超过 1024 个有效行时，0 号核先发布首段 1024 行和首段 notify，CPU 即可开始
+回推。其余清单构建完成后，0 号核再合批发布余下地址和后缀序号，CPU 据此读取其余地址。
 `ReadRequest()`/`ReadDescriptor()` 名称沿用原接口，热路径不再发出 URMA READ。
 完成语义和流水参数见 [实现与验证说明](aiv_batch_get_stage1.md)。
 

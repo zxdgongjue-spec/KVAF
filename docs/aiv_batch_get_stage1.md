@@ -10,8 +10,9 @@
 | `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 四路 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
 | `gather_read` | AIV WRITE 清单、command、notify → CPU gather → 最终 ACK → AIV 多 SGE READ 到 output → CQ 完成 |
 
-Scatter 默认按 Jetty shard 的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 可在整批 done
-后消费。可信输入超过 1024 个有效行时，内核先发布首段清单，再合批发布剩余清单。
+Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 后，CPU 省略
+分片 Ready，AIV 等到整批 done 成功再开始搬运。两种模式下，可信请求超过 1024 个有效行时，
+内核都会先发布首段清单，再合批发布剩余清单。
 Gather 使用 `pipeline_chunk_bytes=0`，以最终 ACK 为完成条件。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
@@ -57,20 +58,29 @@ python tests/python/aiv_kernel_metadata.py build-npu/bin/kvaf_scatter_batch_get_
 
 ## 使用约束
 
+下面的初始化示例使用性能测试的 block 布局，每个源 block 存 128 个 token，每个 token
+为 656 B，slot 大小为 83,968 B。`batch_get_tokens_per_block` 是源数据布局参数，
+Scatter 流水仍按每个 worker 的 1024 行 chunk 切分。
+
 ```python
+token_bytes = 656
+tokens_per_block = 128
+slot_size = token_bytes * tokens_per_block
+
 runtime = kvaf.NpuRuntime(
     get_kernel_path,
-    batch_get_token_bytes=656,
-    batch_get_tokens_per_block=4,
+    batch_get_token_bytes=token_bytes,
+    batch_get_tokens_per_block=tokens_per_block,
     batch_put_kernel_object_path=put_kernel_path,
-    npu_core_count=1,
+    npu_core_count=4,
     aiv_batch_get_mode="cpu_push_scatter",
 )
 runtime.link_to(cpu_service_address)
-runtime.initialize(ddr_bytes, slot_size)
+runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 ```
 
-- 支持 1～8 核、单 EID、eager；拒绝 graph capture。
+- 支持 1～8 核、单 EID 和 eager 执行。可信 Scatter 入口由调用方保证 stream 未处于
+  graph capture 中，带校验的入口会检查 capture 状态并拒绝 capture。
 - 请求容量 1～65536，固定 token 长度 1～65535 B；`miss_count=0` 是合法空批次。
 - 仅搬运有效前缀，允许重复源和不连续输出行；输出行必须唯一，offset 不能越过源 block。
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
@@ -79,8 +89,8 @@ runtime.initialize(ddr_bytes, slot_size)
 - Host 在 Drain/Shutdown 检查设备状态。执行失败后拒绝继续提交；无法确认 DMA
   停止时保留注册资源，允许重试关闭。错误输出不能作为有效结果消费。
 - done 轮询有次数上限，loader 的 kernel 超时为 180 秒；轮询次数不是毫秒。
-- Scatter staging 按最大 65536 请求配置，约占 `65536 * token_bytes + 512 KiB` HBM，
-  输出 Tensor 另行分配。大 token 的边界测试使用小请求容量以控制内存。
+- Scatter HBM workspace 按最大 65536 请求配置，包括 `65536 * token_bytes` staging、
+  512 KiB 地址清单和控制区。大 token 回归使用较小请求容量以缩小测试输出，workspace 仍按上限分配。
 
 ## 构建与完整回归
 
@@ -94,7 +104,9 @@ cmake --build build-cpu -j
 
 NPU 端沿用支持 A5 `dav-c310-vec` 的 CANN 环境，首次配置启用
 `KVAF_ENABLE_AIV_BATCH_GET`、`KVAF_ENABLE_AIV_BATCH_PUT`、`KVAF_BUILD_PYTHON`。
-在仓库根目录执行完整 scatter 回归：
+在仓库根目录执行 Scatter 正确性回归。当前脚本固定使用 16 个源 block，每个 block
+包含 4 个 token，并覆盖重复源、输出 guard 和 workspace 复用。上面的 128 token/block
+对应性能测试使用的布局。
 
 ```bash
 set -euo pipefail
