@@ -82,6 +82,54 @@ void SharedMetadata(){
   Require(!core.Shutdown().ok(),"busy B blocks shutdown before unlocking tables");Ok(core.GetAccessTableView(table,&view));
   Ok(core.ReleaseAccessTable(table));Ok(b.ReleaseBatch(ready));Ok(b.Shutdown());Ok(core.Shutdown());NoResources();
 }
+void PreparedSyncRequests(){
+  SharedServer server;auto link=std::make_shared<kvaf::peer::PeerLink>(server.address);
+  PoolAllocator allocator(link);kvaf::RemotePullOperator op(nullptr,link);
+  auto meta=kvaf::CreateInMemoryMetaManager();kvaf::RuntimeCore core(*meta,op,allocator);
+  Ok(core.Initialize({1024,128,kvaf::DeviceKind::kCpu}));
+  std::vector<std::uint8_t> data(4096);for(std::size_t i=0;i<data.size();++i)data[i]=(i*19+7)%251;
+  aclrtSetDevice(7);kvaf::CpuPullHbmSource source(7,"00000000000000000000000000000001");
+  Ok(source.Register(op.ticket(),{data.data(),data.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+  kvaf::ReadyToken ready;Ok(source.Ready(&ready));
+  const auto desc=std::get<kvaf::CpuPullSourceDesc>(ready.source);
+  const int reads=payload_reads,submits=server.sync_submit_calls;
+  kvaf::CpuPullRequest invalid{desc,ready.sequence,{{0,32},{640,656},{32,32}},ready.mr_id};
+  kvaf::CpuPullState state;
+  Require(!op.SubmitCpuPullAndWait(invalid,1000,&state).ok()&&payload_reads==reads&&server.sync_submit_calls==submits,
+          "direct operator calls still reject destination overlap before RPC");
+
+  // Whole-entry coverage must work for arbitrary key order and mixed lengths.
+  kvaf::PutHandle put;Ok(core.PreparePut({5,1,4},{31,64,17},&put));
+  std::vector<std::uint64_t> src{3,607,200},dst;
+  for(const auto& entry:put.entries())dst.push_back(entry.address-server.info.base);
+  Ok(core.SubmitCpuPullAndWait(ready,put,src,dst,std::vector<std::uint64_t>{31,64,17},1000));
+  Ok(core.CommitPut(put));
+  Require(!std::memcmp(server.pool.data()+640,data.data()+3,31)&&
+          !std::memcmp(server.pool.data()+128,data.data()+607,64)&&
+          !std::memcmp(server.pool.data()+512,data.data()+200,17),"unordered whole entries retain key/source correspondence");
+  Ok(source.ReleaseBatch(ready));Ok(core.BatchFree({{5,1,4}}));
+
+  // The generic synchronous interface still supports slot-internal splits and
+  // reordering, and rejects holes/overlap/foreign slots before recording DMA.
+  Ok(source.Ready(&ready));Ok(core.PreparePut({5,1},{64,64},&put));
+  src={300,7,100};dst={128,672,640};std::vector<std::uint64_t> sizes{64,32,32};
+  const int before=server.sync_submit_calls;
+  auto bad=dst;bad[0]=384;
+  Require(!core.SubmitCpuPullAndWait(ready,put,src,bad,sizes,1000).ok(),"reject another slot within the same DDR pool");
+  bad=dst;bad[1]=671;
+  Require(!core.SubmitCpuPullAndWait(ready,put,src,bad,sizes,1000).ok(),"reject overlap and unwritten tail");
+  auto short_sizes=sizes;short_sizes[1]=31;
+  Require(!core.SubmitCpuPullAndWait(ready,put,src,dst,short_sizes,1000).ok(),"reject a one-byte hole");
+  bad=dst;bad[1]=688;
+  Require(!core.SubmitCpuPullAndWait(ready,put,src,bad,sizes,1000).ok(),"reject crossing the reserved entry end");
+  Require(!put.submitted()&&server.sync_submit_calls==before,"invalid generic coverage never reaches the prepared operator hook");
+  Ok(core.SubmitCpuPullAndWait(ready,put,src,dst,sizes,1000));Ok(core.CommitPut(put));
+  Require(!std::memcmp(server.pool.data()+128,data.data()+300,64)&&
+          !std::memcmp(server.pool.data()+672,data.data()+7,32)&&
+          !std::memcmp(server.pool.data()+640,data.data()+100,32),"split/reordered synchronous requests preserve byte layout");
+  Require(payload_reads==reads+2,"each valid prepared submission issues exactly one READ");
+  Ok(source.ReleaseBatch(ready));Ok(source.Shutdown());Ok(core.Shutdown());NoResources();
+}
 int producer_syncs=0;
 extern "C" aclError aclrtSynchronizeStream(aclrtStream){++producer_syncs;return 0;}
 void UnifiedBatchCpuPull() {
@@ -554,4 +602,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

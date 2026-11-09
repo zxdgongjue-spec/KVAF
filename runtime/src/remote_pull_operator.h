@@ -25,7 +25,9 @@ class RemotePullOperator final : public AccessOperator {
   Status QueryCpuPull(CpuPullState*) override;
   bool pending() const { return active_; }
  private:
-  Status BuildSpans(const CpuPullRequest&, std::vector<remote_pull::Span>*) const;
+  Status BuildSpans(const CpuPullRequest&, std::vector<remote_pull::Span>*, bool prepared = false) const;
+  Status SubmitPreparedCpuPullAndWait(const CpuPullRequest&, std::uint32_t, CpuPullState*, CpuPullSubmitTiming*) override;
+  Status SubmitCpuPullAndWaitImpl(const CpuPullRequest&, std::uint32_t, CpuPullState*, CpuPullSubmitTiming*, bool prepared);
   AccessOperator* aiv_{};
   std::shared_ptr<peer::PeerLink> link_;
   OffloadRegionTicket ticket_;

@@ -61,6 +61,14 @@ class AccessOperator {
   virtual Status QueryCpuPull(CpuPullState*) {
     return Status::NotImplemented("CPU Pull query is unavailable");
   }
+ private:
+  friend class RuntimeCore;
+  // Only Core may use this after checking owned arrays against its Put. Direct
+  // operator callers keep the fully validating public entrypoint above.
+  virtual Status SubmitPreparedCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
+                                               CpuPullState* state, CpuPullSubmitTiming* profile) {
+    return SubmitCpuPullAndWait(request, timeout_ms, state, profile);
+  }
 };
 
 // Configuration for the current NPU-backed default implementation. Transport

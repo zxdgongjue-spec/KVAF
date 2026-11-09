@@ -604,6 +604,10 @@ ReadyToken 携带源和 MR 身份，校验 DDR 归属 → PreparePut → 提取 
 → SubmitCpuPullAndWait（TCP 长连接，一次请求等待 READ 完成回复）→ CommitPut → 返回 None
 ```
 
+Core 对一段完整覆盖一个 Put entry 的布局按原 entry 顺序线性核对，支持乱序 key 和变长块；
+通用拆分/重排布局仍使用排序覆盖检查。验证后的自有快照经私有 Operator 入口构造 Span，
+复用 Core 的检查结果；公共 Operator 入口和 CPU service 的独立校验保留。
+
 PreparePut 仍返回绝对地址，普通 BatchPut 不变。显式 `submit_cpu_pull` 的第四个参数现为
 `dst_offsets`，旧的绝对地址调用须改为 `entry.address - runtime.remote_region["base"]`。
 便利入口签名不变；当前 CPU 控制协议为 KVRP v7，应用和 CPU service 需要配套重编译。

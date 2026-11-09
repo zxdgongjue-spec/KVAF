@@ -74,36 +74,49 @@ Status RuntimeCore::SubmitCpuPullImpl(const ReadyToken& ready, const PutHandle& 
     return Status::InvalidState("put is no longer prepared");
   {
     CpuPullStageTimer timer(profile ? &profile->cover_check_us : nullptr);
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> destinations, reservations;
-    for (std::size_t i = 0; i < copies.source.size(); ++i) {
-      const auto n = copies.lengths[i];
-      const auto source_bytes = desc->mr_length;
-      if (copies.source[i] > source_bytes || n > source_bytes-copies.source[i] ||
-          copies.destination[i] > p.region.length || n > p.region.length-copies.destination[i])
-        return Status::InvalidArgument("CPU Pull range outside registered source/DDR");
-      destinations.emplace_back(copies.destination[i], n);
-    }
-    for (const auto& entry : p.allocation.entries) {
+    const auto& entries = p.allocation.entries;
+    // PreparePut owns distinct DSA slots. Matching each whole entry proves
+    // exact, non-overlapping coverage in O(n), regardless of key/address order.
+    bool whole_entries = copies.source.size() == entries.size();
+    for (const auto& entry : entries) {
       if (entry.address < p.region.base || entry.address-p.region.base > p.region.length ||
           entry.reserved_length > p.region.length-(entry.address-p.region.base))
         return Status::InvalidState("invalid PreparePut allocation");
-      reservations.emplace_back(entry.address-p.region.base, entry.reserved_length);
     }
-    std::sort(destinations.begin(), destinations.end());
-    std::sort(reservations.begin(), reservations.end());
-    std::size_t next = 0;
-    for (auto reservation : reservations) {
-      auto cursor = reservation.first;
-      const auto end = cursor + reservation.second;
-      while (next < destinations.size() && cursor < end) {
-        const auto segment = destinations[next++];
-        if (segment.first != cursor || segment.second > end-cursor)
-          return Status::InvalidArgument("CPU Pull must exactly cover this put without gaps, overlaps or crossing slots");
-        cursor += segment.second;
+    for (std::size_t i = 0; i < copies.source.size(); ++i) {
+      const auto n = copies.lengths[i];
+      if (copies.source[i] > desc->mr_length || n > desc->mr_length-copies.source[i] ||
+          copies.destination[i] > p.region.length || n > p.region.length-copies.destination[i])
+        return Status::InvalidArgument("CPU Pull range outside registered source/DDR");
+      if (whole_entries && (copies.destination[i] != entries[i].address-p.region.base ||
+                            n != entries[i].reserved_length)) whole_entries = false;
+    }
+    if (!whole_entries) {
+      // Explicit requests may split or reorder entries. Keep the general
+      // coverage check, including gaps, overlaps and crossing-slot rejection.
+      std::vector<std::pair<std::uint64_t, std::uint64_t>> destinations, reservations;
+      destinations.reserve(copies.destination.size());
+      reservations.reserve(entries.size());
+      for (std::size_t i = 0; i < copies.destination.size(); ++i)
+        destinations.emplace_back(copies.destination[i], copies.lengths[i]);
+      for (const auto& entry : entries)
+        reservations.emplace_back(entry.address-p.region.base, entry.reserved_length);
+      std::sort(destinations.begin(), destinations.end());
+      std::sort(reservations.begin(), reservations.end());
+      std::size_t next = 0;
+      for (auto reservation : reservations) {
+        auto cursor = reservation.first;
+        const auto end = cursor + reservation.second;
+        while (next < destinations.size() && cursor < end) {
+          const auto segment = destinations[next++];
+          if (segment.first != cursor || segment.second > end-cursor)
+            return Status::InvalidArgument("CPU Pull must exactly cover this put without gaps, overlaps or crossing slots");
+          cursor += segment.second;
+        }
+        if (cursor != end) return Status::InvalidArgument("CPU Pull leaves unwritten Put bytes");
       }
-      if (cursor != end) return Status::InvalidArgument("CPU Pull leaves unwritten Put bytes");
+      if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
     }
-    if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
   }
   {
     CpuPullStageTimer timer(profile ? &profile->request_save_us : nullptr);
@@ -112,7 +125,7 @@ Status RuntimeCore::SubmitCpuPullImpl(const ReadyToken& ready, const PutHandle& 
   p.submitted = true; p.state = CpuPullState::Submitted;
   // Record the request on the caller's existing put before the first RPC.
   try {
-    status = timeout_ms ? access_operator_.SubmitCpuPullAndWait(p.request, *timeout_ms, &p.state, profile)
+    status = timeout_ms ? access_operator_.SubmitPreparedCpuPullAndWait(p.request, *timeout_ms, &p.state, profile)
                         : access_operator_.SubmitCpuPull(p.request);
   }
   catch (const std::exception& e) { status = Status::InDoubt(std::string("CPU Pull submit exception: ")+e.what()); }

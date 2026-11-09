@@ -78,7 +78,7 @@ Status RemotePullOperator::ValidateCpuSource(const CpuPullSourceDesc& source) {
     return Status::InvalidArgument("CPU source is not bound to this DDR pool");
   return Status::OK();
 }
-Status RemotePullOperator::BuildSpans(const CpuPullRequest& request, std::vector<rp::Span>* output) const {
+Status RemotePullOperator::BuildSpans(const CpuPullRequest& request, std::vector<rp::Span>* output, bool prepared) const {
   if (active_) return Status::Busy("previous CPU Pull is unresolved");
   const auto& source = request.source;
   if (source.region_id != ticket_.region_id || source.region_epoch != ticket_.epoch ||
@@ -89,7 +89,7 @@ Status RemotePullOperator::BuildSpans(const CpuPullRequest& request, std::vector
   spans.reserve(request.copies.lengths.size());
   for (std::size_t i = 0; i < request.copies.lengths.size(); ++i)
     spans.push_back({request.copies.source[i], request.copies.destination[i], request.copies.lengths[i]});
-  if (!offload::ValidateSpans(spans, source.mr_length, region_.bytes))
+  if (!prepared && !offload::ValidateSpans(spans, source.mr_length, region_.bytes))
     return Status::InvalidArgument("invalid CPU Pull source/destination ranges");
   return Status::OK();
 }
@@ -116,11 +116,19 @@ Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request,
 }
 Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
                                                 CpuPullState* state, CpuPullSubmitTiming* profile) {
+  return SubmitCpuPullAndWaitImpl(request, timeout_ms, state, profile, false);
+}
+Status RemotePullOperator::SubmitPreparedCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
+                                                       CpuPullState* state, CpuPullSubmitTiming* profile) {
+  return SubmitCpuPullAndWaitImpl(request, timeout_ms, state, profile, true);
+}
+Status RemotePullOperator::SubmitCpuPullAndWaitImpl(const CpuPullRequest& request, std::uint32_t timeout_ms,
+                                                   CpuPullState* state, CpuPullSubmitTiming* profile, bool prepared) {
   if (!state) return Status::InvalidArgument("missing CPU Pull result");
   std::vector<rp::Span> spans;
   Status status;
   { CpuPullStageTimer timer(profile ? &profile->span_prepare_us : nullptr);
-    status = BuildSpans(request, &spans); }
+    status = BuildSpans(request, &spans, prepared); }
   if (!status.ok()) return status;
   auto r = Request(ticket_, request, rp::Command::SubmitAndWait);
   r.timeout_ms = timeout_ms;

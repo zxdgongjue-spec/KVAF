@@ -86,6 +86,13 @@ keys、src_offsets、lengths 使用三个等长的 Host 整数序列或连续一
 始终由生产端应用管理，便利入口不接收 stream 或 tensor，也不自动释放 Ready。
 自定义槽内布局或一 key 多源段继续使用显式 `prepare_put/submit_cpu_pull/wait_cpu_pull/commit_put`。
 
+一段完整写入一个 Put entry 时，Core 逐项核对目的偏移和长度，线性验证覆盖关系；
+此路径适用于任意 key 顺序、块数量和变长块，不要求目的地址递增。
+拆分或重排 entry 的请求继续使用排序覆盖检查。Core 同步提交在验证并保存自有快照后，
+通过私有 Operator 入口复用检查结果，避免再次排序同一请求；直接调用 Operator 仍执行完整校验，
+CPU service 也继续检查真实 MR、DDR 范围及目的重叠。计时范围和恢复快照不变。
+此优化仅需更新并重编译 NPU 扩展，已有匹配 KVRP v7 的 CPU service 可继续运行。
+
 `timeout=None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000 毫秒），控制 CPU 接受同步任务后
 等待 READ 完成的时间；0 表示提交后立即检查，不等待。客户端接收超时为该预算加 5 秒控制通信余量，
 连接和发送超时仍为 5 秒。超时不会取消 READ。显式 `wait_cpu_pull` 和异常恢复仍使用 Query 查询原任务。
@@ -225,8 +232,8 @@ SubmitAndWait 使用 profile 标志和原响应中未使用的 memory 区域返�
 | 阶段 | 含义 |
 | --- | --- |
 | `snapshot` | 检查并快照 source/destination/length 三个数组 |
-| `cover_check` | 检查源/目的范围，排序并核对本次 Put 的精确覆盖关系 |
-| `span_prepare` | 构造 Span 数组并校验范围/目的重叠 |
+| `cover_check` | 检查源/目的范围及 Put 覆盖；整 entry 一段逐项匹配，拆分/重排请求排序校验 |
+| `span_prepare` | 构造 Span 数组及检查描述符，Core 同步请求复用已完成的范围/覆盖校验 |
 | `request_save` | 保存 Put 请求及 Operator 恢复快照 |
 | `channel_setup` | 检查长连接、必要时重连，设置 socket 参数 |
 | `send` | 将固定请求和 Span 数组写入 TCP；返回不代表 CPU 已接收 |
