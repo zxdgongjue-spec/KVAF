@@ -42,7 +42,6 @@ struct Execution {
   std::uint64_t start, timeout;
   BatchGetWorkerProfile* profile;
   std::uint32_t idle_polls{};
-  std::uint32_t chunks{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   void Relax(bool check_remote = true) {
     // Sample remote errors every 32 stalled polls.
@@ -84,11 +83,13 @@ struct Execution {
     }
     return true;
   }
-  std::uint64_t ReadRangeDone(std::uint32_t w) {
+  ReadySnapshot ReadReady(std::uint32_t w) {
     Barrier();
     auto* ready = reinterpret_cast<volatile Ready*>(Memory() + layout.ready) + w;
     if (profile) ++profile->ready_queries;
-    return ChainReadyProgress(chunks, args.sequence, [&](std::uint32_t q) { return ready->jetty[q]; });
+    ReadySnapshot snapshot;
+    for (std::uint32_t q = 0; q < kJettyCount; ++q) snapshot[q] = ready->jetty[q];
+    return snapshot;
   }
   void FinishRange() { Barrier(); }
   bool Copy(Range range) {
@@ -163,9 +164,8 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
       io.Wait(c.built, builders + 1, false);
     }
   }
-  io.chunks = ChunkCount(range);
   std::uint32_t consumed = 0;
-  if (io.Status() == Result::kPending && io.chunks) {
+  if (io.Status() == Result::kPending && range.begin < range.end) {
     BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
     const auto result = Consume(count, args->request.token_bytes, args->workers, worker,
                                 args->sequence, io.start, io.timeout, io, &consumed);
