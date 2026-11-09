@@ -174,6 +174,10 @@ KVAF_EXECUTION_SUMMARY PASS report=/absolute/path/to/validation-full.json
 优先按以下顺序排查：
 
 - 环境阶段失败：指定 build 目录、解释器、torch_npu、设备号和新包是否一致。
+- 构造时报 `enabled AIV Put provider was not built`：检查
+  `build-npu/CMakeCache.txt` 中 `KVAF_ENABLE_AIV_BATCH_PUT:BOOL=ON`。早期版本即使
+  此选项为 ON，也因 `kvaf_npu_runtime` 缺少同名编译宏而误报；更新本分支并重新
+  执行 `./build.sh npu`。这是 NPU 本地能力检查，与 CPU 地址、端口无关。
 - 初始化/首调失败：CPU 地址与版本、UB/EID 路由、Fabric 能力及 kernel 安装。
 - payload mismatch：报告给出第一个错误字节，结合 case 的 Put/Get 组合定位数据路径。
 - Busy / shutdown 失败：先保留日志和状态；正常失败会尝试安全关闭，关闭未确认时不能声称资源已释放。
@@ -200,13 +204,14 @@ ctest --test-dir build-verify --output-on-failure -j 4
 ```
 
 ACL 目录下应存在 `acl/acl.h`。这两项只启用额外 mock 测试，不代表正式 SDK 或设备验收。
-默认上述配置有 23 项 CTest，启用两项头文件测试后为 25 项；数量包含本次新增的脚本自测。
+默认上述配置有 24 项 CTest，启用两项头文件测试后为 26 项；数量包含验收脚本自测和
+真实 Runtime CMake 编译参数检查。后者无需 CANN，覆盖完整构建及裁剪构建的能力宏。
 
 重点测试可单独运行：
 
 ```bash
 ctest --test-dir build-verify --output-on-failure \
-  -R 'kvaf_(cache_execution_harness_python|execution_dispatcher_test|cache_region_service_test|execution_peer_recovery_test|runtime_cleanup_test|ubmem_mapping_cache_test|aicpu_session_registry_test)'
+  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_dispatcher_test|cache_region_service_test|execution_peer_recovery_test|runtime_cleanup_test|ubmem_mapping_cache_test|aicpu_session_registry_test)'
 ```
 
 TCP 恢复测试绑定本机回环地址，验证创建、控制、关闭回复丢失后的幂等重试。

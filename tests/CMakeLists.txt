@@ -11,6 +11,10 @@ add_test(NAME kvaf_build_script_python
 add_test(NAME kvaf_cache_execution_harness_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cache_execution_harness.py")
 set_tests_properties(kvaf_cache_execution_harness_python PROPERTIES TIMEOUT 30)
+add_test(NAME kvaf_runtime_build_flags_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_runtime_build_flags.py")
+set_tests_properties(kvaf_runtime_build_flags_python PROPERTIES
+  ENVIRONMENT "KVAF_TEST_CMAKE_COMMAND=${CMAKE_COMMAND}" TIMEOUT 120)
 add_executable(kvaf_aicpu_kernel_loader_test aicpu_kernel_loader_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/host/kernel_loader.cc)
 target_include_directories(kvaf_aicpu_kernel_loader_test PRIVATE
