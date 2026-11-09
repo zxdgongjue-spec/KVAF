@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from pathlib import Path
 import statistics
 import sys
 import time
@@ -31,6 +33,9 @@ def parse_args(argv=None, *, mode="gather_read"):
     p.add_argument("--tokens-per-block", type=int, default=DEFAULT_TOKENS_PER_BLOCK)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iterations", type=int, default=100)
+    p.add_argument("--profile-output", type=Path, help="save measured per-round/per-worker profiles as JSON")
+    p.add_argument("--cpu-service-pid", type=int,
+                   help="with --profile-output, snapshot this local CPU service's /proc placement before measurement")
     a = p.parse_args(argv)
     if not 1 <= a.workers <= 8 or not 0 <= a.miss_count <= 65536:
         p.error("workers must be in 1..8 and miss_count in 0..65536")
@@ -49,6 +54,8 @@ def parse_args(argv=None, *, mode="gather_read"):
         p.error("invalid warmup or iterations")
     if a.device_id < 0:
         p.error("invalid device ID")
+    if a.cpu_service_pid is not None and (a.cpu_service_pid <= 0 or a.profile_output is None):
+        p.error("--cpu-service-pid requires a positive PID and --profile-output")
     return a
 
 
@@ -100,6 +107,8 @@ def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
         ("cpu_gather_wait_us", "ready_wait_us"),
         ("post_us", "post_us"),
         ("cq_wait_us", "cq_wait_us"),
+        ("ack_us", "ack_us"),
+        ("ready_queries", "ready_queries"),
     ) if mode == "gather_read" else (
         ("lookup_table_us", "request_us"),
         ("notify_cpu_us", "notify_us"),
@@ -128,6 +137,7 @@ def print_measurements(a, summary, *, mode="gather_read"):
         print(f"    build_wqe_us={summary['build_wqe_us']:.1f} | "
               f"cpu_gather_wait_us={summary['cpu_gather_wait_us']:.1f} | "
               f"post_us={summary['post_us']:.1f} | cq_wait_us={summary['cq_wait_us']:.1f}")
+        print(f"  ack_us={summary['ack_us']:.1f} | ready_queries={summary['ready_queries']:.1f}")
     else:
         print(f"  lookup_table_us={summary['lookup_table_us']:.1f} | "
               f"notify_cpu_us={summary['notify_cpu_us']:.1f}")
@@ -143,6 +153,20 @@ def print_measurements(a, summary, *, mode="gather_read"):
         formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
         fields.append(f"{key}={formatted}")
     print(f"{prefix}_RESULT " + " ".join(fields), flush=True)
+
+
+def capture_cpu_placement(pid):
+    root = Path(f"/proc/{pid}")
+    # The NUMA runner owns this live service. Missing/inaccessible data should
+    # fail the diagnostic rather than silently produce an incomplete report.
+    return {
+        "pid": pid,
+        "status": (root / "status").read_text(),
+        "numa_maps": (root / "numa_maps").read_text(),
+        "smaps_rollup": (root / "smaps_rollup").read_text(),
+        "tasks": {task.name: (task / "status").read_text()
+                  for task in sorted((root / "task").iterdir())},
+    }
 
 
 def run_case(a, torch, kvaf, *, mode="gather_read"):
@@ -161,6 +185,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         npu_core_count=a.workers, aicpu_batch_get_mode=mode, npu_eids=a.npu_eids,
     )
     profiles = []
+    placement = None
     # Source and output allocations stay alive until the session is closed.
     chunk_entries = min(128, a.table_capacity)
     source = torch.empty((chunk_entries, block_bytes), dtype=torch.uint8, device=device)
@@ -217,6 +242,8 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         run_round(a.miss_count)
         for _ in range(a.warmup):
             run_round(a.miss_count, profile=True)
+        if a.cpu_service_pid is not None:
+            placement = capture_cpu_placement(a.cpu_service_pid)
         profiles.clear()
         for _ in range(a.iterations):
             run_round(a.miss_count, profile=True)
@@ -233,6 +260,14 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
           "verification=every_round_full_output_npu_compare", flush=True)
     summary = summarize_measurements(profiles, payload_bytes, mode=mode)
     print_measurements(a, summary, mode=mode)
+    if a.profile_output is not None:
+        report = {
+            "mode": mode, "summary": summary, "profiles": profiles,
+            "cpu_placement": placement,
+            "config": {key: str(value) if isinstance(value, Path) else value
+                       for key, value in vars(a).items()},
+        }
+        a.profile_output.write_text(json.dumps(report, indent=2) + "\n")
 
 
 def main(*, mode="gather_read"):

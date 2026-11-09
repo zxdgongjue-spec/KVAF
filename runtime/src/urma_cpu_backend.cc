@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #if defined(__linux__)
+#include <sched.h>
 #include <time.h>
 #endif
 
@@ -324,11 +325,14 @@ class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t threads, std::size_t min_bytes,
-                  CpuGatherMode mode, uint64_t control_address = 0U)
+                  CpuGatherMode mode, uint64_t control_address = 0U,
+                  bool profile = false, std::uint32_t lane = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
             (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
-        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode)), mode_(mode) {
+        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), profile), mode_(mode),
+        profile_enabled_(profile), lane_(lane) {
+    if (profile_enabled_) profiles_.reserve(128U);
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -336,8 +340,34 @@ class CpuGatherWorker {
   ~CpuGatherWorker() {
     stop_.store(true, std::memory_order_release);
     worker_.join();
+    for (const auto& p : profiles_)
+      Log("CPU_GATHER_PROFILE lane=%u sequence=%llu region=0x%llx descriptor=0x%llx "
+          "bytes=%llu threads=%zu prepare_us=%.3f copy_us=%.3f first_ready_us=%.3f "
+          "total_us=%.3f cpu_begin=%d cpu_end=%d valid=%u\n",
+          lane_, static_cast<unsigned long long>(p.sequence), static_cast<unsigned long long>(base_),
+          static_cast<unsigned long long>(p.descriptor), static_cast<unsigned long long>(p.copy.bytes),
+          p.copy.threads, p.prepare_ns / 1000.0, p.copy.copy_ns / 1000.0,
+          p.copy.first_ready_ns / 1000.0, p.total_ns / 1000.0, p.cpu_begin, p.cpu_end,
+          p.valid ? 1U : 0U);
   }
  private:
+  static std::uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  static int CurrentCpu() {
+#if defined(__linux__)
+    return sched_getcpu();
+#else
+    return -1;
+#endif
+  }
+  struct Profile {
+    std::uint64_t sequence, descriptor, prepare_ns, total_ns;
+    peer::GatherCopyProfile copy;
+    int cpu_begin, cpu_end;
+    bool valid;
+  };
   void Run() {
     std::uint64_t last = 0U;
     while (!stop_.load(std::memory_order_acquire)) {
@@ -350,12 +380,17 @@ class CpuGatherWorker {
         continue;
       }
       last = sequence;
+      const auto begin = profile_enabled_ ? NowNs() : 0U;
+      const auto cpu_begin = profile_enabled_ ? CurrentCpu() : -1;
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
       peer::GatherBarrier();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
       bool valid = false;
+      std::uint64_t prepare_ns = 0U;
       try {
+        const auto prepare_begin = profile_enabled_ ? NowNs() : 0U;
         valid = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
+        if (profile_enabled_) prepare_ns = NowNs() - prepare_begin;
         if (valid) executor_.Copy();
       } catch (const std::exception& error) {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
@@ -371,6 +406,10 @@ class CpuGatherWorker {
       __atomic_store_n(&control_->ack,
                       sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
       peer::GatherBarrier();
+      if (profile_enabled_)
+        profiles_.push_back({sequence, address, prepare_ns, NowNs() - begin,
+                             valid ? executor_.profile() : peer::GatherCopyProfile{},
+                             cpu_begin, CurrentCpu(), valid});
     }
   }
   std::uint8_t* memory_;
@@ -378,6 +417,9 @@ class CpuGatherWorker {
   peer::GatherControl* control_;
   peer::CpuGatherExecutor executor_;
   CpuGatherMode mode_;
+  bool profile_enabled_;
+  std::uint32_t lane_;
+  std::vector<Profile> profiles_;
   std::atomic<bool> stop_{false};
   std::thread worker_;
 };
@@ -402,12 +444,13 @@ class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
              std::size_t min_bytes_per_thread,
-             CpuGatherMode gather_mode,
+             CpuGatherMode gather_mode, bool gather_profile,
              CpuMemoryPageMode memory_page_mode,
              bool device_filter_applied, uint64_t& next_session)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
         gather_mode_(gather_mode),
+        gather_profile_(gather_profile),
         memory_page_mode_(memory_page_mode), device_filter_applied_(device_filter_applied), next_region_id_(next_session) {}
   ~CpuService() { ReleaseAll(); }
 
@@ -619,7 +662,7 @@ class CpuService {
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_mode_);
+          min_bytes_per_thread_, gather_mode_, 0U, gather_profile_);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -642,7 +685,7 @@ class CpuService {
         const auto budget = gather_threads_ / lanes + (lane < gather_threads_ % lanes ? 1U : 0U);
         created.push_back(std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
-            gather_mode_, control_address + lane * sizeof(peer::GatherControl)));
+            gather_mode_, control_address + lane * sizeof(peer::GatherControl), gather_profile_, lane));
       }
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_LANE_SETUP_FAILED reason=%s\n", error.what());
@@ -877,6 +920,7 @@ class CpuService {
   std::size_t gather_threads_{1U};
   std::size_t min_bytes_per_thread_{256U * 1024U};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
+  bool gather_profile_{false};
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
   bool device_filter_applied_{false};
   uint64_t& next_region_id_;
@@ -1069,7 +1113,7 @@ Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& ne
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
       &impl->resources, gather_threads, min_bytes_per_thread,
-      options.gather_mode,
+      options.gather_mode, options.gather_profile,
       options.memory_page_mode, !options.ub_device.empty(), next_session);
   impl_ = std::move(impl);
   return Status::OK();

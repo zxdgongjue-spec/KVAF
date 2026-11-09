@@ -3,6 +3,11 @@
 namespace kvaf::peer {
 namespace {
 
+std::uint64_t ProfileNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
   if (bytes < 64U || base > UINT64_MAX - bytes || header.magic != kGatherDescriptorMagic ||
@@ -66,12 +71,19 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 }
 
 void CpuGatherExecutor::Copy() {
+  if (profile_enabled_) {
+    first_ready_ns_.store(0U, std::memory_order_relaxed);
+    copy_begin_ns_ = ProfileNowNs();
+  }
   completed_.store(0U, std::memory_order_relaxed);
   phase_.store(1U, std::memory_order_release);
   (void)ProcessSource(0U);
   GatherBarrier();
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) GatherSpinPause();
   if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
+  if (profile_enabled_)
+    profile_ = {total_bytes_, first_ready_ns_.load(std::memory_order_relaxed),
+                ProfileNowNs() - copy_begin_ns_, active_threads_};
 }
 
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
@@ -123,9 +135,12 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
     const auto ready_bytes =
         std::min(total_bytes_, static_cast<std::uint64_t>(prefix) * pipeline_chunk_bytes_);
     while (observed < ready_bytes) {
+      const bool first_prefix = observed == 0U;
       if (!__atomic_compare_exchange_n(pipeline_ready_, &observed, ready_bytes, false,
                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         continue;
+      if (profile_enabled_ && first_prefix)
+        first_ready_ns_.store(ProfileNowNs() - copy_begin_ns_, std::memory_order_relaxed);
       GatherBarrier();
       break;
     }

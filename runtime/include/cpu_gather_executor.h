@@ -35,16 +35,21 @@ inline void GatherSpinPause() {
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
+struct GatherCopyProfile {
+  std::uint64_t bytes{}, first_ready_ns{}, copy_ns{};
+  std::size_t threads{};
+};
+
 class CpuGatherExecutor {
  public:
   CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
                 std::size_t min_bytes_per_thread = 256U * 1024U,
-                GatherWaitMode wait_mode = GatherWaitMode::kPassive)
+                GatherWaitMode wait_mode = GatherWaitMode::kPassive, bool profile = false)
       : memory_(static_cast<std::uint8_t*>(memory)),
         base_(base),
         max_threads_(std::max<std::size_t>(1U, max_threads)),
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
-        wait_mode_(wait_mode) {}
+        wait_mode_(wait_mode), profile_enabled_(profile) {}
 
   ~CpuGatherExecutor() {
     {
@@ -62,6 +67,8 @@ class CpuGatherExecutor {
                             std::uint64_t sequence, std::size_t max_spans);
 
   void Copy();
+
+  const GatherCopyProfile& profile() const { return profile_; }
 
  private:
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
@@ -104,6 +111,10 @@ class CpuGatherExecutor {
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;
   GatherWaitMode wait_mode_;
+  bool profile_enabled_;
+  GatherCopyProfile profile_;
+  std::uint64_t copy_begin_ns_{0U};
+  std::atomic<std::uint64_t> first_ready_ns_{0U};
   std::vector<std::thread> helpers_;
   std::mutex mutex_;
   std::condition_variable ready_;

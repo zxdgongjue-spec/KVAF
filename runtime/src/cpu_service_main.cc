@@ -12,12 +12,13 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--gather-threads N] [--gather-mode adaptive|active|passive] "
+               "[--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-profile] "
                "[--memory-page-mode default|thp] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to auto (up to 32), "
                "mode to adaptive; memory page mode defaults to thp. "
-               "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
+               "Allocation requests select URMA or UBmem; backend resources are initialized on demand. "
+               "--gather-profile buffers CPU timings and prints them when the Gather session closes.\n",
                program);
 }
 
@@ -88,6 +89,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "invalid --gather-threads (expected 1..64)\n");
         return 2;
       }
+    } else if (argument == "--gather-profile") {
+      cpu_options.gather_profile = true;
     } else if (argument == "--gather-mode") {
       const std::string value(argv[++index]);
       if (value != "adaptive" && value != "active" && value != "passive") {
