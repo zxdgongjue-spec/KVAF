@@ -195,6 +195,21 @@ KVAF_EXECUTION_SUMMARY PASS report=/absolute/path/to/validation-full.json
     "$HOME/ascend/log" 2>/dev/null | tail -100
   ```
 
+  若 `errno=17 (File exists)`，保留现有 CPU 服务进程，在另一终端附加 syscall
+  跟踪；将 `CPU_PID` 替换为错误中的 `cpu_service_pid`：
+
+  ```bash
+  strace -f -tt -s 256 -e trace=%file,mmap,munmap \
+    -p CPU_PID -o "$PWD/kvaf-cpu-syscalls.log"
+  ```
+
+  在 NPU 端复现失败后，用 Ctrl+C 停止附加的 strace，再提取
+  `rg -n -C 5 'EEXIST' kvaf-cpu-syscalls.log`。需要核对具体 syscall、路径、flags
+  和后续调用：例如 `mkdir` 返回已存在后被 HAL 正常处理，也可能留下 `errno`，
+  所以单凭它还不能认定是文件冲突。先保留失败现场，不删除未知 HAL/共享内存文件。
+  跟踪需要目标机安装 strace 且允许附加；若权限不允许，可在独立测试服务停止后用
+  同一 strace 前缀启动服务（把 `-p CPU_PID` 换成完整的 `kvaf_cpu_service` 启动命令）。
+
   若单独 `--modes urma` 和 `--modes ubmem` 通过，但默认顺序失败，分别记录
   同一 CPU 服务进程下 `--modes urma ubmem --cases matrix` 与
   `--modes ubmem urma --cases matrix` 的结果，并另测 `--modes urma+ubmem`。
