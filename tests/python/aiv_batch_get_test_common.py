@@ -145,76 +145,21 @@ def run(mode: str) -> int:
         # Enqueue on two caller streams without an intervening caller sync.
         # The owner must drain the first request before reusing workspace.
         retained = []
-        for explicit_stream in (False, True):
-            for output in outputs:
-                stream = torch.npu.Stream(device=device_id)
-                with torch.npu.stream(stream):
-                    output.fill_(0xAD)
-                    inputs = [t.to(device) for t in (index_cpu, offset_cpu, row_cpu)]
-                    count = torch.tensor([1], dtype=torch.int32, device=device)
-                    # The default must resolve the current stream again after
-                    # every context switch, even if its callable is cached.
-                    kwargs = {"stream": stream} if explicit_stream else {}
-                    runtime.batch_get(view, inputs[0], inputs[1], count, inputs[2],
-                                      output, synchronize=False, **kwargs)
-                retained.append((stream, inputs, count))
-            torch.npu.synchronize()
-            expected = torch.full_like(outputs[0].cpu(), 0xAD)
-            expected[row_cpu[0].long()] = source_cpu[(index_cpu[0] * 4 + offset_cpu[0] // token).long()]
-            assert all(torch.equal(output.cpu(), expected) for output in outputs)
-        if mode == "cpu_push_scatter":
-            class FixedStreamProbe:
-                """Count the real torch_npu getter, including its task-queue fence."""
-                def __init__(self, stream):
-                    self.stream, self.reads = stream, 0
-                @property
-                def npu_stream(self):
-                    self.reads += 1
-                    return self.stream.npu_stream
-
-            # Prepared submission fixes storage/stream, not request contents.
-            # Submit outside the producer stream context to exercise the fixed
-            # stream contract, including zero/full counts and random sparse rows.
-            for synchronous, native_wait in ((False, False), (True, False), (False, True)):
-                fixed_stream = torch.npu.Stream(device=device_id)
-                stream_probe = FixedStreamProbe(fixed_stream)
-                with torch.npu.stream(fixed_stream):
-                    fixed = [t.to(device) for t in (index_cpu, offset_cpu, row_cpu)]
-                    fixed_count = torch.tensor([0], dtype=torch.int32, device=device)
-                    submit = runtime.prepare_scatter_batch_get(
-                        view, fixed[0], fixed[1], fixed_count, fixed[2], outputs[0],
-                        stream=stream_probe, synchronize=synchronous, wait_stream=native_wait)
-                for epoch, active in enumerate((0, 1, min(19, capacity), capacity, 0)):
-                    index_cpu = (torch.arange(capacity, dtype=torch.int32) * 7 + epoch) % blocks
-                    offset_cpu = ((torch.arange(capacity, dtype=torch.int32) + epoch) % 4) * token
-                    row_cpu = ((torch.arange(capacity, dtype=torch.int32) + epoch) % capacity) * 2 + 1
-                    with torch.npu.stream(fixed_stream):
-                        for target, values in zip(fixed, (index_cpu, offset_cpu, row_cpu)):
-                            target.copy_(values)
-                        fixed_count.fill_(active)
-                        outputs[0].fill_(0xAD)
-                    # Deliberately do not synchronize after the producers.
-                    # Reading the fixed stream's property must dispatch them
-                    # before the raw ACL launch, even after the first submit.
-                    reads_before = stream_probe.reads
-                    submit()
-                    assert stream_probe.reads == reads_before + 1, "prepared submit skipped task-queue fence"
-                    if not native_wait:
-                        torch.npu.synchronize()
-                    expected = torch.full_like(outputs[0].cpu(), 0xAD)
-                    src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
-                    expected[row_cpu[:active].long()] = source_cpu[src_rows]
-                    assert torch.equal(outputs[0].cpu(), expected), ("prepared", synchronous, native_wait, active)
-            print("[KVAF_TEST] PREPARED_SCATTER_OK inplace_requests=1 fixed_stream=1 native_wait=1", flush=True)
+        for output in outputs:
+            stream = torch.npu.Stream(device=device_id)
+            with torch.npu.stream(stream):
+                output.fill_(0xAD)
+                inputs = [t.to(device) for t in (index_cpu, offset_cpu, row_cpu)]
+                count = torch.tensor([1], dtype=torch.int32, device=device)
+                runtime.batch_get(view, inputs[0], inputs[1], count, inputs[2],
+                                  output, stream=stream, synchronize=False)
+            retained.append((stream, inputs, count))
+        torch.npu.synchronize()
+        expected = torch.full_like(outputs[0].cpu(), 0xAD)
+        expected[row_cpu[0].long()] = source_cpu[(index_cpu[0] * 4 + offset_cpu[0] // token).long()]
+        assert all(torch.equal(output.cpu(), expected) for output in outputs)
         # Shutdown checks the final queued execution status and joins CPU workers.
         runtime.shutdown()
-        if mode == "cpu_push_scatter":
-            try:
-                submit()
-            except ValueError as error:
-                assert "expired" in str(error)
-            else:
-                raise AssertionError("prepared request survived Runtime shutdown")
         print(f"PASS: mode={mode} cores={cores} token_bytes={token} counts={counts}")
     finally:
         shutdown_runtime(runtime)

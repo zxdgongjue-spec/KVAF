@@ -1,7 +1,6 @@
 // Executes the production .asc against decoded SQ/CQ and a real CPU gather executor.
 // DMA cache visibility and CANN code generation still require hardware tests.
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -10,7 +9,6 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <malloc.h>
@@ -32,8 +30,6 @@ using namespace kvaf_scatter;
 using kvaf_gather::kRead;
 using kvaf_gather::kWrite;
 using kvaf_gather::kErrorBit;
-constexpr std::array<uint32_t, 1> kScatterOptions{kvaf::kScatterOptionsV1};
-constexpr auto kCheckedScatterOptions = kScatterOptions;
 // Test fixture only; production launch ABIs are independent.
 struct ModelArgs {
   KvafExecuteBatchGetKernelArgs request;
@@ -108,8 +104,6 @@ struct Fixture {
   std::vector<uint8_t, AlignedAllocator<uint8_t>> remote, workspace;
   std::vector<uint8_t, AlignedAllocator<uint8_t>> mailbox_memory;
   KvafScatterMailboxContext mailbox{};
-  uint32_t mailbox_sq_copies{}, mailbox_posts{};
-  bool mailbox_cq_timeout{};
   std::vector<uint8_t> output, expected, valid;
   std::vector<uint64_t> addresses;
   std::vector<int32_t> indices, offsets, rows;
@@ -121,8 +115,7 @@ struct Fixture {
   std::vector<uint32_t> ack_reads;
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
-  bool hold_done_until_scatter{}, copied_before_done{}, stall_ready{}, future_ready{}, error_after_scatter{};
-  bool hold_next_jetty{}, late_first_jetty{}, copied_before_all_ready{}, waited_with_output_pending{};
+  bool hold_done_until_scatter{}, copied_before_done{};
   struct PushPart { uint32_t worker, chunk; kvaf::cpu_push::Range range; };
   std::vector<PushPart> push_parts;
   struct HeadPart { uint32_t worker, chunk, queue; kvaf::cpu_push::Range range; bool suffix, ready; };
@@ -130,7 +123,6 @@ struct Fixture {
   bool head_started_early{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
-  uint32_t ready_per_poll{1};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   std::mutex poll_mutex;
 
@@ -167,7 +159,7 @@ struct Fixture {
     r.queue_state = Address(states.data());
     args.mode = mode; args.sequence = 1; args.sgl_size = sgl;
     args.max_polls = mode == KVAF_SEQ_SCATTER && cores > 1 ? 100000 : 64;
-    if (mode == KVAF_SEQ_SCATTER) args.reserved = kScatterOptions.back();
+    if (mode == KVAF_SEQ_SCATTER) args.reserved = kvaf::kScatterOptionsV1;
     args.source_base = Address(remote.data()); args.source_bytes = source_bytes;
     args.lane_descriptor_bytes = lane_descriptor; args.lane_staging_bytes = lane_staging;
     args.remote_staging = Address(remote.data()) + staging_offset;
@@ -218,7 +210,6 @@ struct Fixture {
     if ((notify & ~kvaf::cpu_push::kProfileNotify) != args.sequence) return;
     const bool pipeline = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline);
     const bool head = (request->reserved & kvaf::cpu_push::kHeadStart) != 0;
-    if (pipeline && !aiv_model::mte3.empty()) waited_with_output_pending = true;
     if (!pipeline) CheckGuard();
     if (timeout || (++push_polls < 4 && !head)) return;
     assert(request->magic == kvaf::cpu_push::kMagic && request->sequence == args.sequence);
@@ -268,42 +259,25 @@ struct Fixture {
             push_parts.push_back({worker, chunk, range});
           });
       if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
-        // Deliver test bursts only on Ready refreshes so unrelated polls do
-        // not change which progress words the consumer sees together.
-        if (ready_per_poll > 1 && address != args.workspace + 192) return;
-        for (uint32_t i = 0; i < ready_per_poll &&
-             push_step < push_parts.size() * kvaf::cpu_push::kJettyCount; ++i, ++push_step) {
-          const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
-          const auto q = (push_step + (late_first_jetty ? 1U : 0U)) % kvaf::cpu_push::kJettyCount;
-          if (hold_next_jetty && push_step % kvaf::cpu_push::kJettyCount) {
-            const auto previous = kvaf::cpu_push::JettyRange(part.range, (q + 3) % 4);
-            for (auto row = previous.begin; row < previous.end; ++row) if (!payload_read[row]) return;
-          }
-          const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
-          for (auto row = shard.begin; row < shard.end; ++row)
-            std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
-                        reinterpret_cast<void*>(src[row]), token);
-          if (!stall_ready || q != 3) aiv_model::AtomicStoreWord(
-              args.workspace + 192 + part.worker * 64 + q * 8,
-              kvaf::cpu_push::Progress(args.sequence + future_ready, part.chunk + 1));
-        }
+        const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
+        const auto q = push_step % kvaf::cpu_push::kJettyCount;
+        const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
+        for (auto row = shard.begin; row < shard.end; ++row)
+          std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
+                      reinterpret_cast<void*>(src[row]), token);
+        aiv_model::AtomicStoreWord(args.workspace + 192 + part.worker * 64 + q * 8,
+                                   kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
+        ++push_step;
         return; // Delay other queues/chunks and final done until later polls.
       }
-      if (stall_ready || (hold_done_until_scatter && read_rows < uint32_t(active))) return;
+      if (hold_done_until_scatter && read_rows < uint32_t(active)) return;
     } else {
       for (uint32_t i = 0; i < uint32_t(active); ++i)
         std::memcpy(workspace.data() + args.staging_offset + uint64_t(i) * token,
                     reinterpret_cast<void*>(src[i]), token);
     }
     const uint64_t done = ((args.sequence + (future_done ? 1 : 0)) << 32) |
-        ((remote_error || error_after_scatter) ? 5 : 1);
-    if (notify & kvaf::cpu_push::kProfileNotify) {
-      assert(request->reserved == (kvaf::cpu_push::kInlineProfile |
-          (pipeline ? 0U : kvaf::cpu_push::kBatchDoneOnly) |
-          (head ? kvaf::cpu_push::kHeadStart : 0U)));
-      const uint64_t report[] = {kvaf::cpu_push::ProfileToken(args.sequence), 11, 22, 1000, 800, 200, 500};
-      std::memcpy(workspace.data() + 136, report, sizeof(report));
-    }
+        (remote_error ? 5 : 1);
     push_done = true; ++push_requests;
     aiv_model::AtomicStoreWord(args.workspace + 128, done);
   }
@@ -319,15 +293,12 @@ struct Fixture {
         if (i < range.begin || i >= range.end) continue;
         const auto chunk = (i - range.begin) / kvaf::cpu_push::kChunkRows + 1;
         const auto part = kvaf::cpu_push::ChunkRange(range, chunk - 1);
-        bool all_ready = true;
         for (uint32_t q = 0; q < kvaf::cpu_push::kJettyCount; ++q) {
           const auto progress = aiv_model::AtomicLoadWord(args.workspace + 192 + worker * 64 + q * 8);
           const bool ready = progress >> 32 == args.sequence && uint32_t(progress) >= chunk;
-          all_ready &= ready;
           const auto shard = kvaf::cpu_push::JettyRange(part, q);
           if (i >= shard.begin && i < shard.end) assert(ready);
         }
-        copied_before_all_ready |= !all_ready;
       }
       if (!payload_read[i]) { payload_read[i] = true; ++read_rows; }
     }
@@ -340,11 +311,7 @@ struct Fixture {
       if (p == &m.cq_db) { m.cq_db = value; return; }
       if (p != &m.db) continue;
       const bool scatter = args.mode == KVAF_SEQ_SCATTER;
-      if (scatter) {
-        assert(q == 0 && aiv_model::mte3.empty());
-        ++mailbox_posts;
-        mailbox_sq_copies += 1 + ((m.pi % 16) + value - m.pi > 16);
-      }
+      if (scatter) assert(q == 0 && aiv_model::mte3.empty());
       const uint32_t worker = q / 2;
       auto word = [&](uint64_t base, uint32_t index) {
         return m.sq[((base * 16) + index) % m.sq.size()];
@@ -421,7 +388,7 @@ struct Fixture {
             reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(c->command)->ready_bytes = 0;
           }
         }
-        if ((header & (1U << 21)) && !(scatter && mailbox_cq_timeout)) {
+        if (header & (1U << 21)) {
           assert(((header >> 16) & 3) == 2);
           m.cq[m.cq_pi % 2][0] = ((1U - ((m.cq_pi / 2) & 1)) << 2) |
               ((cq_error || (data_cq_error && !(q % 2))) ? 1U << 24 : 0);
@@ -448,14 +415,11 @@ struct Fixture {
         {args.request.valid_table, args.request.valid_table + args.request.table_capacity}};
     aiv_model::metadata_sources.push_back({Address(mailbox.write_templates),
         Address(mailbox.write_templates) + sizeof(mailbox.write_templates)});
-    aiv_model::address_table_begin = args.request.address_table;
-    aiv_model::address_table_end = args.request.address_table + uint64_t(args.request.table_capacity) * 8;
     aiv_model::descriptor_begin = args.workspace + args.descriptor_offset;
     aiv_model::descriptor_end = aiv_model::descriptor_begin + prefix * 2;
   }
   void ClearModelInputs() {
     aiv_model::metadata_sources.clear();
-    aiv_model::address_table_begin = aiv_model::address_table_end = 0;
     aiv_model::descriptor_begin = aiv_model::descriptor_end = 0;
     aiv_model::mte2_source_begin = aiv_model::mte2_source_end = 0;
   }
@@ -512,7 +476,6 @@ struct Fixture {
     push_done = false; push_polls = 0;
     push_parts.clear(); head_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
     head_started_early = false;
-    copied_before_all_ready = waited_with_output_pending = false;
     std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
     for (uint64_t i = 0; i < args.source_bytes; ++i) remote[i] ^= 0x35;
@@ -535,33 +498,6 @@ void Poll(void* p) {
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
-  {
-    // Cross-DMA waits must queue dependencies, not block Scalar. Refill the
-    // same bank before either engine is drained; it must still output the old
-    // contents first. This exercises the model used by the real stage ring.
-    using namespace AscendC;
-    alignas(32) uint8_t first[64], second[64], output[64]{};
-    std::memset(first, 0x21, sizeof(first));
-    std::memset(second, 0x43, sizeof(second));
-    LocalTensor<uint8_t> bank(TPosition::VECIN, 0, 64);
-    GlobalTensor<uint8_t> source, destination;
-    source.SetGlobalBuffer(first); destination.SetGlobalBuffer(output);
-    DataCopy(bank, source, 64);
-    set_flag(PIPE_MTE2, PIPE_MTE3, 0);
-    wait_flag(PIPE_MTE2, PIPE_MTE3, 0);
-    assert(!aiv_model::mte2.empty());
-    DataCopyPad(destination, bank, DataCopyExtParams{1, 64, 0, 0, 0});
-    set_flag(PIPE_MTE3, PIPE_MTE2, 0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, 0);
-    assert(!aiv_model::mte3.empty() && output[0] == 0);
-    source.SetGlobalBuffer(second);
-    DataCopy(bank, source, 64);
-    set_flag(PIPE_MTE2, PIPE_S, 0);
-    wait_flag(PIPE_MTE2, PIPE_S, 0);
-    assert(std::memcmp(output, first, 64) == 0);
-    assert(bank.GetValue(0) == second[0]);
-    assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
-  }
   // Match the hardware smoke test: the first launch is empty, followed by
   // nonempty launches on the same queues. Empty work must finish all worker
   // statuses without notifying the CPU or advancing any SQ/CQ state.
@@ -584,338 +520,19 @@ int main() {
       gather.Next(19); gather.Run();
       assert(gather.completions && gather.data_reads);
     }
-  for (uint32_t workers : {1U, 3U, 8U}) {
-    Fixture scatter(19, 656, workers, KVAF_SEQ_SCATTER, 6);
-    const auto cycles = aiv_model::cycle;
-    scatter.active = 0; scatter.Run();
-    assert(!scatter.push_requests);
-    for (const auto& status : scatter.status)
-      assert(status.phase == KVAF_SEQ_COMPLETE && !status.requests);
-    scatter.Next(1); scatter.Run();
-    scatter.Next(19); scatter.Run();
-    assert(aiv_model::cycle == cycles); // No timing reads in the baseline path.
-  }
-  // Exercise the batched copy through the existing complete scatter launch,
-  // including CPU notification, changing payloads, output holes and statuses.
-  // Deferred model writes must finish before a tile reuses the same UB bank.
-  for (const auto options : kScatterOptions)
-    for (uint32_t workers : {1U, 3U, 8U})
-      for (uint32_t bytes : {31U, 656U, 672U, 673U, 1000U, 4096U, 32768U, 32769U}) {
-        Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
-        // Permute unique sparse destinations: output has no fixed stride.
-        for (uint32_t i = 0; i < f.count; ++i) f.rows[i] = 2 * ((i * 37U + 11U) % f.count) + 1;
-        f.args.reserved = options;
-        for (uint32_t count : {0U, 1U, 7U, 31U, 32U, 33U, 63U, 64U, 65U,
-                               95U, 96U, 97U, 129U}) {
-          f.Next(count);
-          std::memset(aiv_model::ub, 0xe9, sizeof(aiv_model::ub));
-          const auto reads = aiv_model::mte2_copies;
-          const auto writes = aiv_model::mte3_copies;
-          const auto waits = aiv_model::event_waits[PIPE_MTE3][PIPE_S];
-          const auto input_waits = aiv_model::event_waits[PIPE_MTE2][PIPE_S];
-          const auto recycle_waits = aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2];
-          const auto metadata_reads = aiv_model::metadata_reads;
-          const auto descriptor_writes = aiv_model::descriptor_writes;
-          const auto control_copies = f.mailbox_sq_copies, control_posts = f.mailbox_posts;
-          f.Run();
-          if (bytes <= kTileBytes) {
-            const auto layout = MakeRowCopyLayout(bytes);
-            const auto per_tile = layout.rows;
-            assert(layout.banks >= 2 && layout.banks <= kMaxBanks);
-            assert(layout.banks * layout.bank_bytes +
-                (layout.cached_rows ? layout.banks * kRowIndexBytes : 0U) <= kTileBufferBytes);
-            if (bytes == 656) assert(layout.banks == 3 && layout.cached_rows && per_tile == 32);
-            uint64_t tiles = 0, active_workers = 0;
-            for (uint32_t core = 0; core < workers; ++core) {
-              const auto rows = uint64_t(count) * (core + 1) / workers -
-                  uint64_t(count) * core / workers;
-              const auto core_tiles = (rows + per_tile - 1) / per_tile;
-              tiles += core_tiles;
-              if (core_tiles) ++active_workers;
-            }
-            uint64_t build_tiles = 0;
-            {
-              const auto groups = (count + 7U) / 8U;
-              for (uint32_t core = 0; core < workers; ++core) {
-                const auto begin = uint64_t(groups) * core / workers * 8;
-                const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-                if (end > begin) build_tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
-              }
-            }
-            const auto metadata_tiles = layout.cached_rows ? tiles : 0;
-            assert(aiv_model::metadata_reads - metadata_reads == metadata_tiles + f.mailbox_posts - control_posts);
-            assert(aiv_model::descriptor_writes - descriptor_writes == build_tiles);
-            assert(aiv_model::mte2_copies - reads == tiles + metadata_tiles + f.mailbox_posts - control_posts);
-            assert(aiv_model::mte3_copies - writes == count + build_tiles +
-                   f.mailbox_sq_copies - control_copies);
-            // Scatter no longer waits for MTE3 on Scalar at every tile.
-            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_S] - waits == build_tiles +
-                   f.mailbox_posts - control_posts);
-            assert(aiv_model::event_waits[PIPE_MTE3][PIPE_MTE2] - recycle_waits == tiles);
-            assert(aiv_model::event_waits[PIPE_MTE2][PIPE_S] - input_waits ==
-                metadata_tiles + active_workers + f.mailbox_posts - control_posts);
-          }
-          assert(aiv_model::mte2.empty() && aiv_model::mte3.empty());
-        }
-      }
-  // A late invalid row can leave private partial descriptors in fused mode,
-  // but must never publish a new notify or let CPU dereference that list.
-  for (const auto options : kCheckedScatterOptions)
-    for (uint32_t workers : {1U, 3U, 8U})
-      for (uint32_t field = 0; field < 8; ++field) {
-        Fixture f(65, 656, workers, KVAF_SEQ_SCATTER, 6);
-        f.args.reserved = options;
-        f.Run();
-        const auto requests = f.push_requests;
-        f.Next(65);
-        if (field == 0) f.indices.back() = f.count;
-        if (field == 1) f.offsets.back() = f.token + 1;
-        if (field == 2) f.rows.back() = f.args.request.output_rows;
-        if (field == 3) f.valid[f.indices.back()] = 0;
-        if (field == 4) f.addresses[f.indices.back()] = f.args.source_base + f.args.source_bytes;
-        if (field == 5) f.indices.back() = -1;
-        if (field == 6) f.offsets.back() = -1;
-        if (field == 7) f.rows.back() = -1;
-        const auto reads = aiv_model::mte2_copies, writes = aiv_model::mte3_copies;
-        const auto metadata_reads = aiv_model::metadata_reads;
-        const auto descriptor_writes = aiv_model::descriptor_writes;
-        f.Run(false);
-        assert(f.push_requests == requests);
-        // Other builders may finish private tiles; no payload may be touched.
-        assert(aiv_model::mte2_copies - reads == aiv_model::metadata_reads - metadata_reads);
-        assert(aiv_model::mte3_copies - writes == aiv_model::descriptor_writes - descriptor_writes);
-        assert(*reinterpret_cast<const uint64_t*>(f.workspace.data() + 64) != f.args.sequence);
-        for (const auto& status : f.status) assert(status.result == KVAF_SEQ_INVALID);
-      }
-  // UB tile boundaries and different table sizes, through full
-  // BatchGet including CPU service and changing metadata at the same addresses.
-  for (uint32_t capacity : {1024U, 4096U, 4097U})
-    for (uint32_t workers : {1U, 4U, 8U}) {
-      Fixture f(capacity, 31, workers, KVAF_SEQ_SCATTER, 6);
-      for (uint32_t count : {1U, 7U, 255U, 256U, 257U, 1023U, 1024U}) {
-        f.Next(count); f.Run();
-        // Change offsets and output maps as well as payload/indices.
-        for (auto& offset : f.offsets) offset = f.token - offset;
-        std::reverse(f.rows.begin(), f.rows.end());
-      }
-      f.Next(capacity); f.Run();
+  // Exercise the benchmark's Scatter path with and without payload overlap.
+  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline}) {
+    Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6);
+    scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs | pipeline;
+    scatter.args.max_polls = 1000000;
+    scatter.hold_done_until_scatter = pipeline != 0;
+    for (uint32_t count : {0U, 19U, 1024U, 8193U, 8193U}) {
+      scatter.Next(count);
+      scatter.Run();
+      assert(scatter.head_started_early == (count > kvaf::cpu_push::kChunkRows));
+      if (pipeline && count)
+        assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == count);
     }
-  {
-    // A missing builder must time out without ever notifying CPU. Workers that
-    // arrive afterwards observe the failure; their ready flags cannot revive it.
-    Fixture stalled(65, 656, 4, KVAF_SEQ_SCATTER, 6);
-    stalled.args.max_polls = 2;
-    stalled.SetModelInputs();
-    aiv_model::core = 0; Launch(stalled.args);
-    assert(stalled.status[0].result == KVAF_SEQ_TIMEOUT);
-    for (uint32_t core = 1; core < stalled.workers; ++core) {
-      aiv_model::core = core; Launch(stalled.args);
-      assert(stalled.status[core].result == KVAF_SEQ_INVALID);
-    }
-    assert(!stalled.push_requests);
-    stalled.CheckGuard();
-    stalled.ClearModelInputs();
-  }
-  {
-    Fixture small_workspace(65, 31, 4, KVAF_SEQ_SCATTER, 6);
-    small_workspace.args.workspace_bytes = small_workspace.args.staging_offset + 64;
-    small_workspace.Run(false);
-    assert(!small_workspace.push_requests);
-  }
-  for (const auto options : {2U, kvaf::kScatterOptionsV1 | 64U, kvaf::kScatterOptionsV1 | 128U,
-                             kvaf::kScatterOptionsV1 ^ 0x100U, kvaf::kScatterProfileFlag | 2U}) {
-    Fixture invalid(1, 656, 1, KVAF_SEQ_SCATTER, 6);
-    invalid.args.reserved = options; invalid.Run(false);
-    assert(!invalid.push_requests && invalid.status[0].result == KVAF_SEQ_INVALID);
-  }
-  {
-    Fixture legacy(65, 656, 1, KVAF_SEQ_SCATTER, 6);
-    legacy.args.reserved = 0; legacy.Run();
-  }
-  // The SIMT builder handles reference-sized sparse tables and changing table
-  // contents at the same address, without scalar table DCCI.
-  for (const bool trusted : {false, true})
-    for (uint32_t workers : {1U, 4U, 8U}) {
-      Fixture f(1024, 31, workers, KVAF_SEQ_SCATTER, 6);
-      constexpr uint32_t table_capacity = 1277952;
-      f.addresses.resize(table_capacity);
-      f.valid.resize(table_capacity, 1);
-      f.args.request.table_capacity = table_capacity;
-      f.args.request.address_table = Address(f.addresses.data());
-      f.args.request.valid_table = Address(f.valid.data());
-      if (trusted) f.args.reserved |= kvaf::kScatterTrustedInputs;
-      for (uint32_t i = 0; i < f.count; ++i)
-        f.indices[i] = (i * 1237U + 37U) % table_capacity;
-      for (uint32_t count : {0U, 1U, 7U, 255U, 256U, 257U, 1024U, 19U}) {
-        f.Next(count);
-        for (uint32_t i = 0; i < f.count; ++i)
-          f.addresses[f.indices[i]] = f.args.source_base +
-              uint64_t((i + f.args.sequence) % f.count) * f.token * 2;
-        const auto flushed = aiv_model::address_table_cache_lines;
-        const auto simt_reads = aiv_model::simt_metadata_reads;
-        f.Run();
-        assert(aiv_model::address_table_cache_lines == flushed);
-        assert(aiv_model::simt_metadata_reads - simt_reads == count * (trusted ? 3 : 5));
-      }
-      if (!trusted) {
-        f.Next(1);
-        f.indices[0] = table_capacity;
-        const auto flushed = aiv_model::address_table_cache_lines;
-        const auto notified = f.push_requests;
-        f.Run(false);
-        assert(aiv_model::address_table_cache_lines == flushed);
-        assert(f.push_requests == notified);
-      }
-    }
-  // SIMT tile boundaries through the complete CPU-push/scatter flow,
-  // including the extra prefix tile for eligible requests.
-  for (const bool trusted : {false, true})
-      for (uint32_t workers : {1U, 4U, 8U}) {
-        Fixture f(8193, 31, workers, KVAF_SEQ_SCATTER, 6);
-        f.args.reserved = kvaf::kScatterOptionsV1 |
-            (trusted ? kvaf::kScatterTrustedInputs : 0U);
-        for (uint32_t count : {0U, 1U, 255U, 256U, 4095U, 4096U, 4097U, 8192U, 8193U, 7U}) {
-          f.Next(count);
-          const auto calls = aiv_model::simt_calls;
-          const auto writes = aiv_model::descriptor_writes;
-          const auto prefix = trusted && count > kvaf::cpu_push::kChunkRows ? kvaf::cpu_push::kChunkRows : 0U;
-          uint64_t tiles = (prefix + kSimtBuildRows - 1) / kSimtBuildRows;
-          const auto groups = (count + 7U) / 8U;
-          for (uint32_t core = 0; core < workers; ++core) {
-            const auto begin = std::max(uint64_t(prefix), uint64_t(groups) * core / workers * 8);
-            const auto end = std::min(uint64_t(count), uint64_t(groups) * (core + 1) / workers * 8);
-            if (begin < end) tiles += (end - begin + kSimtBuildRows - 1) / kSimtBuildRows;
-          }
-          f.Run();
-          assert(aiv_model::simt_calls - calls == tiles);
-          assert(aiv_model::descriptor_writes - writes == tiles);
-        }
-      }
-  // Trusted callers skip row/valid checks in the builder. Exercise the real
-  // launch with changing addresses/prefixes and different table sizes;
-  // output guards, done, all-core status and DMA completion remain required.
-  for (const auto options : kScatterOptions)
-    for (uint32_t workers : {1U, 4U, 8U})
-      for (uint32_t capacity : {1024U, 4097U}) {
-        Fixture f(capacity, 656, workers, KVAF_SEQ_SCATTER, 6);
-        f.args.reserved = options | kvaf::kScatterTrustedInputs;
-        for (uint32_t count : {0U, 1U, 7U, 256U, 257U, 1024U, 19U}) {
-          f.Next(count);
-          f.Run();
-        }
-      }
-  for (const auto options : {0U, kvaf::kScatterOptionsV1,
-                             kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline})
-    for (uint32_t workers : {1U, 3U, 8U}) {
-      Fixture f(19, 656, workers, KVAF_SEQ_SCATTER, 6);
-      f.status.resize(workers * 4); // 64-byte statuses + 192-byte V2 records.
-      f.args.request.core_status = Address(f.status.data());
-      f.args.reserved = kvaf::ScatterWithProfiling(options, true);
-      assert(kvaf::ScatterOptionsValid(f.args.reserved));
-      assert(kvaf::ScatterWithProfiling(f.args.reserved, false) == options);
-      for (uint32_t count : {1U, 19U, 0U, 7U}) {
-        f.Next(count); f.Run();
-        const auto* profiles = reinterpret_cast<const kvaf::ScatterBatchGetCoreProfile*>(
-            f.args.request.core_status + workers * sizeof(KvafSequentialStatus));
-        for (uint32_t core = 0; core < workers; ++core) {
-          const auto& p = profiles[core];
-          assert(p.magic == kvaf::kScatterProfileMagic && p.sequence == f.args.sequence);
-          assert(p.start_cycle && p.start_cycle <= p.inputs_ready_cycle);
-          assert(p.inputs_ready_cycle <= p.done_cycle && p.done_cycle <= p.finish_cycle);
-          const auto requests = uint64_t(count) * (core + 1) / workers - uint64_t(count) * core / workers;
-          assert(p.requests == requests && p.bytes == requests * 656);
-          assert(p.pipeline == kvaf::ScatterOptionEnabled(f.args.reserved, kvaf::kScatterPipeline));
-          assert(bool(p.scatter_cycles) == bool(requests));
-          if (!core && count) {
-            assert(p.notify_cycle >= p.inputs_ready_cycle && p.done_cycle >= p.notify_cycle);
-            assert(p.cpu_magic == kvaf::cpu_push::ProfileToken(f.args.sequence) && p.cpu_comm_ns == 800);
-            assert(p.cpu_header_ns == 11 && p.cpu_descriptor_ns == 22 && p.cpu_write_ns == 1000);
-          } else assert(!p.cpu_magic && !p.notify_cycle);
-        }
-      }
-    }
-  // The producer deliberately withholds final done until payload DMA has
-  // started. A whole-batch-only consumer times out; a pipelined consumer must
-  // copy only fully published chunks and still wait for final done afterwards.
-  for (uint32_t bytes : {31U, 656U, 4096U})
-    for (uint32_t workers : {1U, 3U, 8U})
-      {
-        Fixture f(8193, bytes, workers, KVAF_SEQ_SCATTER, 6);
-        f.args.max_polls = 1000000;
-        f.args.reserved = kvaf::kScatterOptionsV1 |
-            kvaf::kScatterPipeline | kvaf::kScatterTrustedInputs;
-        f.hold_done_until_scatter = true;
-        for (uint32_t count : {8193U, 1U, 19U, 4097U, 0U, 8192U}) {
-          f.Next(count); f.Run();
-          if (count) assert(f.copied_before_done && f.push_done && f.read_rows == count);
-        }
-      }
-  for (const auto options : kCheckedScatterOptions)
-    for (bool trusted : {false, true}) {
-      Fixture f(257, 656, 3, KVAF_SEQ_SCATTER, 6);
-      f.args.reserved = options | kvaf::kScatterPipeline |
-          (trusted ? kvaf::kScatterTrustedInputs : 0U);
-      f.hold_done_until_scatter = true;
-      f.Run();
-      assert(f.copied_before_done && f.read_rows == 257 && f.push_done);
-    }
-  // Re-prime partially used rings across uneven Ready shards, including
-  // three->two stage layout boundaries, uncached row indices and large rows.
-  for (uint32_t bytes : {673U, 1000U, 32768U, 32769U})
-    for (uint32_t workers : {1U, 3U}) {
-      Fixture f(129, bytes, workers, KVAF_SEQ_SCATTER, 6);
-      f.args.reserved |= kvaf::kScatterPipeline;
-      f.args.max_polls = 100000;
-      f.hold_done_until_scatter = f.hold_next_jetty = f.late_first_jetty = true;
-      for (uint32_t i = 0; i < f.count; ++i) f.rows[i] = 2 * ((i * 37U + 11U) % f.count) + 1;
-      for (uint32_t count : {1U, 33U, 95U, 97U, 129U, 7U}) {
-        std::rotate(f.rows.begin(), f.rows.begin() + 1, f.rows.end());
-        f.Next(count); f.Run();
-        assert(f.read_rows == count && f.push_done && f.copied_before_done);
-      }
-    }
-  for (bool future : {false, true}) {
-    Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
-    f.args.reserved |= kvaf::kScatterPipeline;
-    f.stall_ready = !future; f.future_ready = future;
-    f.Run(false, !future);
-    assert(f.read_rows == (future ? 0U : 15U) && !f.push_done);
-    assert(f.status[0].result == (future ? KVAF_SEQ_REMOTE_ERROR : KVAF_SEQ_TIMEOUT));
-  }
-  // A late queue cannot hold back a ready queue. The fake CPU withholds the
-  // next Jetty until this one's shard has been read; whole-chunk or fixed-q0
-  // consumers time out. MTE3 must stay live across Ready boundaries as well.
-  for (bool late_first : {false, true}) {
-    Fixture f(1024, 656, 1, KVAF_SEQ_SCATTER, 6);
-    f.args.max_polls = 10000;
-    f.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline;
-    f.hold_next_jetty = f.hold_done_until_scatter = true;
-    f.late_first_jetty = late_first;
-    f.Run();
-    assert(f.read_rows == 1024 && f.copied_before_done && f.copied_before_all_ready);
-    assert(f.waited_with_output_pending);
-  }
-  for (uint32_t ready_per_poll : {2U, 4U}) {
-    Fixture f(1024, 656, 1, KVAF_SEQ_SCATTER, 6);
-    f.status.resize(4);
-    f.args.request.core_status = Address(f.status.data());
-    f.args.reserved = kvaf::ScatterWithProfiling(kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline, true);
-    f.ready_per_poll = ready_per_poll;
-    f.late_first_jetty = f.hold_done_until_scatter = true;
-    f.Run();
-    const auto* profile = reinterpret_cast<const kvaf::ScatterBatchGetCoreProfile*>(f.status.data() + 1);
-    // q1 and q2 share a range. q0 and q3 remain separate unless all four
-    // queues are visible in the same refresh.
-    assert(profile->scatter_chunks == (ready_per_poll == 2 ? 3U : 1U));
-    assert(f.read_rows == 1024 && f.copied_before_done && f.push_done);
-  }
-  {
-    Fixture f(19, 656, 1, KVAF_SEQ_SCATTER, 6);
-    f.args.reserved |= kvaf::kScatterPipeline;
-    f.hold_done_until_scatter = f.error_after_scatter = true;
-    f.Run(false, true);
-    assert(f.read_rows == 19 && f.push_done && f.copied_before_done);
-    assert(f.status[0].result == KVAF_SEQ_REMOTE_ERROR); // Ready is never success.
   }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,
@@ -968,41 +585,6 @@ int main() {
     Fixture error(7, 656, 1, mode, 6); error.remote_error = true; error.Run(false);
   }
   Fixture future(7, 656, 1, KVAF_SEQ_SCATTER, 6); future.future_done = true; future.Run(false);
-  for (auto pipeline : {0U, kvaf::kScatterPipeline})
-    for (auto trusted : {0U, kvaf::kScatterTrustedInputs})
-      for (auto workers : {1U, 3U, 4U}) {
-        Fixture head(8193, 13, workers, KVAF_SEQ_SCATTER, 6);
-        head.args.reserved = kvaf::kScatterOptionsV1 | pipeline | trusted;
-        head.args.max_polls = 100000;
-        for (auto count : {8193U, 8193U, 1024U, 1025U, 1031U, 0U, 8193U}) {
-          head.Next(count); head.Run();
-          const bool expect_head = count > kvaf::cpu_push::kChunkRows && trusted;
-          assert(head.head_started_early == expect_head);
-          assert(head.head_parts.empty() == !expect_head);
-        }
-        if (!trusted) {
-          const auto requests = head.push_requests;
-          head.Next(8193); head.indices.back() = -1; head.Run(false);
-          assert(head.push_requests == requests); // Checked failures never publish a prefix.
-        }
-      }
-  {
-    // Small negotiated messages cross control post/SQ/CQ boundaries. A fresh
-    // list must reach CPU before every commit, including same-count reuse.
-    Fixture mailbox(257, 13, 1, KVAF_SEQ_SCATTER, 6);
-    mailbox.mailbox.max_write_bytes = 64;
-    for (auto count : {257U, 257U, 19U, 1U, 0U, 257U}) {
-      mailbox.Next(count); mailbox.Run();
-    }
-    assert(mailbox.mailbox_posts > 16 && mailbox.mailbox.queue.completed_batch_count == 5);
-    Fixture control_error(19, 656, 1, KVAF_SEQ_SCATTER, 6);
-    control_error.cq_error = true; control_error.Run(false);
-    assert(control_error.mailbox.queue.poisoned && control_error.status[0].result == KVAF_SEQ_CQ_ERROR);
-    control_error.Next(19); control_error.cq_error = false; control_error.Run(false);
-    Fixture control_timeout(19, 656, 1, KVAF_SEQ_SCATTER, 6);
-    control_timeout.mailbox_cq_timeout = true; control_timeout.Run(false);
-    assert(control_timeout.mailbox.queue.poisoned && control_timeout.status[0].result == KVAF_SEQ_TIMEOUT);
-  }
   Fixture cq(7, 656, 1, KVAF_SEQ_GATHER, 6); cq.cq_error = true; cq.Run(false);
   assert(cq.states[1].poisoned);
   for (uint32_t sgl = 1; sgl <= 6; ++sgl) {

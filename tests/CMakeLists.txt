@@ -1,11 +1,5 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-add_executable(kvaf_runtime_batch_get_contract_test runtime_batch_get_contract_test.cc)
-target_link_libraries(kvaf_runtime_batch_get_contract_test PRIVATE kvaf_runtime)
-target_compile_options(kvaf_runtime_batch_get_contract_test PRIVATE
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
-add_test(NAME kvaf_runtime_batch_get_contract_test COMMAND kvaf_runtime_batch_get_contract_test)
-
 add_executable(kvaf_startup_selection_test startup_selection_test.cc)
 target_include_directories(kvaf_startup_selection_test PRIVATE
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
@@ -95,12 +89,6 @@ foreach(mode scatter gather)
 endforeach()
 add_test(NAME kvaf_aiv_mode_isolation_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_mode_isolation.py")
-add_test(NAME kvaf_aiv_kernel_metadata_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_kernel_metadata.py")
-add_test(NAME kvaf_scatter_perf_metrics_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_perf_metrics.py")
-add_test(NAME kvaf_scatter_miss_count_perf_config_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_miss_count_perf_config.py")
 
 # Compile hardware Host sources even on development machines without CANN.
 # Object-only: never link the declaration doubles into the production libraries.

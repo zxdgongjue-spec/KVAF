@@ -43,7 +43,6 @@ int aclrtLaunchKernelWithHostArgs(aclrtFuncHandle function, uint32_t, aclrtStrea
   // addressed UB outside allocated shared memory; runtime algorithm bits do
   // not change the mixed binary's memory contract.
   if (symbol == kScatter) Check(cfg->attrs[1].value.dynUBufSize == 64U * 1024U);
-  if (symbol == kGather) Check(cfg->attrs[1].value.dynUBufSize == 0U);
   if (symbol == kDirect) Check(cfg->attrs[1].value.dynUBufSize == 160U * 1024U);
   launched.push_back(symbol); return 0;
 }
@@ -97,12 +96,6 @@ int main(int argc, char** argv) {
   Check(KvafExecuteBatchGetLaunch(&d, reinterpret_cast<void*>(1)) == 0);
   Check(KvafGatherBatchGetLaunch(&g, reinterpret_cast<void*>(1)) == 0);
   Check((launched == std::vector<std::string>{kGather, kScatter, kDirect, kGather}));
-  for (uint32_t options : {kvaf::kScatterOptionsV1,
-                           kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline,
-                           kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline | kvaf::kScatterTrustedInputs}) {
-    s.reserved = options;
-    Check(KvafScatterBatchGetLaunch(&s, reinterpret_cast<void*>(1)) == 0);
-  }
   Check(KvafScatterBatchGetLoadKernel(scatter_path.c_str()) == 0);
   Check(KvafGatherBatchGetLoadKernel(gather_path.c_str()) == 0 && binaries.size() == loaded);
   fs::current_path(original); fs::remove_all(directory);

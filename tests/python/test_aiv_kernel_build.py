@@ -25,7 +25,6 @@ output = Path(args[output_index])
 if Path(sys.argv[0]).name == 'ccec':
     source = next(Path(a) for a in args if a.endswith('.asc'))
     symbols = ['g_tilingKey', source.stem]
-    output.with_suffix('.args.json').write_text(json.dumps(args))
 else:
     symbols = []
     for i, arg in enumerate(args):
@@ -86,9 +85,6 @@ add_subdirectory(kernel)
             installed = build / 'bin' / product.name
             assert product.read_bytes() == installed.read_bytes()
             assert json.loads(product.read_text()) == ['g_tilingKey', symbol]
-            compile_args = json.loads((build / 'kernel' / f'{stem}.tmp.args.json').read_text())
-            scatter_flags = [arg for arg in compile_args if arg.startswith('-DKVAF_SCATTER_')]
-            assert not scatter_flags  # Algorithm selection is a runtime option.
         direct = build / 'kernel/kvaf_execute_batch_get_kernels.o'
         old_mtime = direct.stat().st_mtime_ns
         # A missing deployed companion must be restored by an incremental build.

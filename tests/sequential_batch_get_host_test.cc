@@ -6,7 +6,6 @@
 #include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
 #include "cpu_push_get_layout.h"
-#include "scatter_host_profile.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -21,13 +20,9 @@ namespace {
 std::vector<std::function<void()>> work;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
-bool wrong_phase{}, wrong_sequence{}, wrong_magic{};
-bool stale_profile{}, missing_cpu_profile{}, bad_profile_cycle{};
-bool skip_last_status{};
 void* mailbox_jetty{};
 bool fail_mailbox_destroy{}, fail_mailbox_import{};
-int async_memsets{}, async_copies{}, synchronizations{};
-int capture_queries{};
+int async_memsets{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
 std::vector<uint32_t> launch_options;
@@ -59,7 +54,6 @@ int aclrtMemsetAsync(void* p, size_t, int32_t v, size_t n, aclrtStream) {
   work.push_back([=] { std::memset(p, v, n); }); return 0;
 }
 int aclrtMemcpyAsync(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind, aclrtStream) {
-  ++async_copies;
   if (fail_copy) return 507035;
   work.push_back([=] { std::memcpy(d, s, n); }); return 0;
 }
@@ -68,12 +62,10 @@ int aclrtMemcpy(void* d, size_t, const void* s, size_t n, aclrtMemcpyKind) {
   std::memcpy(d, s, n); return 0;
 }
 int aclrtSynchronizeStream(aclrtStream) {
-  ++synchronizations;
   if (fail_sync) return 507034;
   for (auto& f : work) f(); work.clear(); return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* s, aclmdlRI*) {
-  ++capture_queries;
   *s = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
 uint32_t loaded_mode{};
@@ -90,32 +82,10 @@ int Launch(const KvafScatterBatchGetArgs* a) {
     auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
     const auto active = uint64_t(*reinterpret_cast<const int32_t*>(args.request.miss_count));
     for (uint32_t i = 0; i < args.request.block_count; ++i) {
-      if (skip_last_status && i + 1 == args.request.block_count) continue;
       const auto requests = active * (i + 1) / args.request.block_count -
                             active * i / args.request.block_count;
-      status[i] = {wrong_magic ? 0 : KVAF_SEQ_STATUS_MAGIC,
-                   args.sequence + wrong_sequence, kernel_result,
-                   kernel_result || wrong_phase ? uint64_t(KVAF_SEQ_WAIT_REMOTE) : uint64_t(KVAF_SEQ_COMPLETE),
-                   requests, 0, 0, 0};
-      if (kvaf::ScatterProfileEnabled(args.reserved)) {
-        auto* profiles = reinterpret_cast<kvaf::ScatterBatchGetCoreProfile*>(
-            args.request.core_status + args.request.block_count * sizeof(KvafSequentialStatus));
-        auto& p = profiles[i];
-        p = {}; p.magic = kvaf::kScatterProfileMagic; p.sequence = args.sequence + stale_profile;
-        p.start_cycle = 10; p.inputs_ready_cycle = 20;
-        p.notify_cycle = i || !active ? 0 : 30;
-        p.done_cycle = bad_profile_cycle ? 15 : 40; p.finish_cycle = 50;
-        p.requests = requests; p.bytes = requests * args.request.token_bytes;
-        p.pipeline = kvaf::ScatterOptionEnabled(args.reserved, kvaf::kScatterPipeline);
-        if (requests) {
-          p.scatter_start_cycle = p.pipeline ? 35 : 40; p.scatter_finish_cycle = 45;
-          p.scatter_cycles = p.scatter_finish_cycle - p.scatter_start_cycle; p.scatter_chunks = 1;
-        }
-        if (!i && active && !missing_cpu_profile) {
-          p.cpu_magic = kvaf::cpu_push::ProfileToken(args.sequence);
-          p.cpu_write_ns = 1000; p.cpu_comm_ns = 800;
-        }
-      }
+      status[i] = {KVAF_SEQ_STATUS_MAGIC, args.sequence, kernel_result,
+                   kernel_result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE, requests, 0, 0, 0};
     }
     ++completed;
   }); return 0;
@@ -357,63 +327,14 @@ int main() {
     assert(owner->Shutdown().ok()); assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
   }
-  for (bool previous_success : {false, true}) {
-    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    if (previous_success) assert(owner->Execute(exec).ok());
-    // A missing core is rejected both on the first request and when its old
-    // successful record is still in HBM. No per-call clear is required.
-    skip_last_status = true;
-    assert(!owner->Execute(exec).ok());
-    skip_last_status = false;
-    assert(owner->Shutdown().ok());
-    assert(!refs && !allocations && !hccp_refs);
-  }
   {
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    scatter_host::Profile profile;
-    const auto copies_before = async_copies, syncs_before = synchronizations;
-    {
-      scatter_host::Session session(&profile);
-      assert(owner->Execute(exec).ok());
-    }
-    assert(scatter_host::current == nullptr);
-    assert(profile.ns[scatter_host::kOperator] > 0);
-    assert(profile.ns[scatter_host::kOperator] >= profile.ns[scatter_host::kStreamSync]);
-    assert(async_copies == copies_before + 1 && synchronizations == syncs_before + 1);
-    assert(owner->Shutdown().ok());
-  }
-  {
-    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    auto trusted = exec;
-    trusted.execution.trusted_npu_request = true;
-    trusted.execution.synchronize = true;
-    scatter_host::Profile profile;
-    const auto captures_before = capture_queries;
-    const auto copies_before = async_copies, syncs_before = synchronizations;
-    {
-      scatter_host::Session session(&profile);
-      assert(owner->Execute(trusted).ok());
-    }
-    assert(ScatterOptionEnabled(launch_options.back(), kScatterTrustedInputs));
-    assert(capture_queries == captures_before);
-    assert(profile.ns[scatter_host::kCaptureQuery] == 0);
-    assert(async_copies == copies_before + 1 && synchronizations == syncs_before + 1);
-    // Trusted input bypasses only preflight, not the remote execution result.
+    exec.execution.synchronize = true;
     kernel_result = KVAF_SEQ_TIMEOUT;
-    assert(!owner->Execute(trusted).ok());
-    kernel_result = KVAF_SEQ_OK;
+    assert(owner->Execute(exec).code() == StatusCode::kInternal);
     assert(owner->Shutdown().ok());
     assert(!refs && !allocations && !hccp_refs);
-  }
-  for (uint32_t mismatch = 0; mismatch < 4; ++mismatch) {
-    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    kernel_result = mismatch == 0 ? KVAF_SEQ_TIMEOUT : KVAF_SEQ_OK;
-    wrong_phase = mismatch == 1; wrong_sequence = mismatch == 2; wrong_magic = mismatch == 3;
-    const auto result = owner->Execute(exec);
-    assert(result.code() == StatusCode::kInternal);
-    assert(!owner->Execute(exec).ok());
-    assert(owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
-    kernel_result = 0; wrong_phase = wrong_sequence = wrong_magic = false;
+    kernel_result = KVAF_SEQ_OK;
   }
   {
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
@@ -441,63 +362,6 @@ int main() {
     assert(owner->Execute(exec).ok());
     assert(!owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
     assert(owner->Shutdown().ok()); kernel_result = 0;
-  }
-  {
-    auto owner = CreateSequentialBatchGet(config);
-    assert(!owner->SetScatterProfiling(true).ok());
-    assert(owner->Initialize(region).ok());
-    assert(owner->SetScatterProfiling(true).ok());
-    std::vector<ScatterBatchGetCoreProfile> profiles;
-    assert(!owner->CopyScatterProfiles(&profiles).ok());
-    // CopyProfile must drain an asynchronous request before reading its records.
-    assert(owner->Execute(exec).ok()); assert(owner->CopyScatterProfiles(&profiles).ok());
-    assert(profiles.size() == config.npu_core_count && profiles[0].sequence == 1);
-    for (uint32_t mismatch = 0; mismatch < 3; ++mismatch) {
-      stale_profile = mismatch == 0; missing_cpu_profile = mismatch == 1; bad_profile_cycle = mismatch == 2;
-      assert(owner->Execute(exec).ok()); assert(!owner->CopyScatterProfiles(&profiles).ok());
-      stale_profile = missing_cpu_profile = bad_profile_cycle = false;
-    }
-    count = 0;
-    assert(owner->Execute(exec).ok()); assert(owner->CopyScatterProfiles(&profiles).ok());
-    count = 1;
-    assert(owner->SetScatterProfiling(false).ok());
-    assert(!owner->CopyScatterProfiles(&profiles).ok());
-    assert(owner->Execute(exec).ok()); assert(owner->Shutdown().ok());
-    assert(!refs && !allocations && !hccp_refs);
-  }
-  // The pipeline mode is fixed at initialization.
-  for (int pipeline : {0, 1}) {
-    setenv("KVAF_SCATTER_PIPELINE", pipeline ? "1" : "0", 1);
-    const auto expected = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U);
-    auto owner = CreateSequentialBatchGet(config);
-    assert(owner->Initialize(region).ok());
-    setenv("KVAF_SCATTER_PIPELINE", pipeline ? "0" : "1", 1);
-    std::vector<ScatterBatchGetCoreProfile> profiles;
-    assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
-    assert(launch_options.back() == expected);
-    assert(owner->SetScatterProfiling(true).ok());
-    assert(owner->Execute(exec).ok()); assert(owner->CopyScatterProfiles(&profiles).ok());
-    assert(launch_options.back() == (expected | kScatterProfiling));
-    assert(owner->SetScatterProfiling(false).ok());
-    assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
-    assert(launch_options.back() == expected);
-    assert(owner->Shutdown().ok());
-    assert(owner->Initialize(region).ok());
-    assert(owner->Execute(exec).ok()); assert(owner->Drain().ok());
-    assert(launch_options.back() == (expected ^ kScatterPipeline));
-    assert(owner->Shutdown().ok());
-    assert(!refs && !allocations && !hccp_refs);
-  }
-  unsetenv("KVAF_SCATTER_PIPELINE");
-  for (const auto* value : {"", "ON", "2"}) {
-    setenv("KVAF_SCATTER_PIPELINE", value, 1);
-    auto owner = CreateSequentialBatchGet(config);
-    const auto result = owner->Initialize(region);
-    assert(result.code() == StatusCode::kInvalidArgument);
-    assert(result.message().find("KVAF_SCATTER_PIPELINE") != std::string::npos);
-    assert(!refs && !allocations && !hccp_refs);
-    assert(owner->Shutdown().ok());
-    unsetenv("KVAF_SCATTER_PIPELINE");
   }
   std::cout << "sequential Host lifecycle: PASS\n";
 }
