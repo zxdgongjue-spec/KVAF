@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import random
-
 
 def select_peer_eids(peer_eids: list[str], cores: int, jettys_per_core: int) -> list[str]:
-    """Use one random peer only when the whole kernel has a single Jetty."""
-    if cores * jettys_per_core == 1 and len(peer_eids) > 1:
-        return [random.choice(peer_eids)]
+    """Use the first EIDs that fit the kernel's total Jetty count, in input order."""
+    total_jettys = cores * jettys_per_core
+    if total_jettys > 0:
+        return list(peer_eids[:total_jettys])
+    # Leave invalid core/Jetty counts for the caller's argument validation.
     return list(peer_eids)
 
 

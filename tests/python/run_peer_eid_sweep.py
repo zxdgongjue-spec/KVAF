@@ -42,8 +42,8 @@ def parse_args(argv=None):
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--peer-eids", required=True, type=parse_npu_eids,
                         help="one CPU EID for a baseline, or multiple distinct comma-separated EIDs; "
-                             "--cores 1 --jettys 1 randomly selects one EID per configuration; "
-                             "otherwise count must not exceed cores * Jettys per core")
+                             "if candidates exceed cores * Jettys per core, use the first "
+                             "that many EIDs in input order")
     parser.add_argument("--npu-eid", required=True, type=parse_npu_eids)
     parser.add_argument("--cores", type=sweep_values, metavar="N[,N...]",
                         default=os.environ.get("KVAF_BATCH_GET_SWEEP_AIV_CORES") or "1",

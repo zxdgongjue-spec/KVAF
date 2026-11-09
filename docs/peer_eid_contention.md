@@ -3,7 +3,7 @@
 `run_peer_eid_sweep.py` 接受一个或多个远端 CPU EID。一个 EID 时退化为单路
 基线，所有 Jetty 都访问该 EID；多个 EID 且 Jetty 总数足够时，各路 BatchGet 由同一
 Runtime、同一 stream 上的同一次 AIV kernel 发出，各自使用独立 Jetty/SQ/CQ。
-多个 EID 且总共只有一个 Jetty（`cores * jettys == 1`）时，每组参数随机选择一个 EID，按单路基线执行。
+候选 EID 数超过 Jetty 总数时，按传入顺序取前 `cores * jettys` 个；总共一个 Jetty 时固定取第一个 EID，按单路基线执行。
 脚本可以依次测试多组参数，每组都使用同一份 CPU EID 候选列表。
 
 ## 构建和运行
@@ -41,7 +41,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 实际选中的 EID 未被 CPU 服务公布、EID 重复、建链失败时直接失败，不回退到其他 EID。
 服务端若通过 `--ub-device` 限制为单个设备，可能无法公布全部指定 EID。
 
-三路及以上仍使用逗号分隔的 `--peer-eids`，并保证 `cores * jettys` 不少于 EID 数量。
+三路及以上仍使用逗号分隔的 `--peer-eids`；要访问全部候选 EID，需保证 `cores * jettys` 不少于 EID 数量。
 例如，将 `CPU_EID_0`、`CPU_EID_1`、`CPU_EID_2` 和 `NPU_EID` 设为实际 EID 后，
 三路、每路两个 Jetty 的配置为：
 
@@ -79,11 +79,10 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 DEVICE_ID=7 \
 python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
     --peer-eids "$CPU_EID_0,$CPU_EID_1" --npu-eid "$NPU_EID" \
-    --cores 1 --jettys 1 --output-dir results/peer-random-baseline-001
+    --cores 1 --jettys 1 --output-dir results/peer-first-baseline-001
 ```
 
-仅总共一个 Jetty 时，每组参数从候选列表中等概率选择一个 EID，只选择一次，预热和测量迭代
-都使用该 EID。不会在每个请求或迭代之间重新选择；再次运行可能选中相同的 EID。
+总共一个 Jetty 时固定选择候选列表的第一个 EID，预热和测量迭代都使用该 EID。
 此时使用单路的请求量限制和默认 inflight 上限 2048，不做多 EID 并发校验。
 日志 `BATCH_GET_PEER_EID_SELECTION` 记录候选列表和选中项；`config.json` 的
 `requested_peer_eids` 保留候选列表，`peer_eids` 和 `peer_samples.csv` 使用实际选中的 EID，
@@ -99,7 +98,20 @@ core 1 / Jetty 0 -> peer EID 1
 
 每核 Jetty 数不少于 EID 数 N 时，保持 `jetty_slot % N` 的原有映射。
 每核不足、但总数足够时，使用 `(jetty_slot * cores + core) % N` 跨 core 分配，
-先分配各 core 的第一个 Jetty，再分配第二个。总数大于 1、但仍少于 EID 数时直接报错。
+先分配各 core 的第一个 Jetty，再分配第二个。这里 N 是截取后实际生效的 EID 数量。
+
+候选 EID 超过 Jetty 总数时，两个 Python 入口都会在启动 Runtime 前截取列表，保持输入顺序。
+例如传入 `E0,E1,E2`，设置 `--cores 1,2,3,4,5,6 --jettys 1`：
+
+| core 数 | 实际使用的 EID |
+| --- | --- |
+| 1 | E0 |
+| 2 | E0、E1 |
+| 3–6 | E0、E1、E2 |
+
+每组日志 `BATCH_GET_PEER_EID_SELECTION` 的 `selected_peer_eids` 记录完整生效列表，
+`reason=jetty_capacity` 表示因 Jetty 总数不足而截取。配置、建链和 CSV 都使用同一生效列表，
+`requested_peer_eids` 保留原候选列表。此规则无需随机选择，调整候选列表顺序即可控制使用哪些 EID。
 
 ## 参数和测量口径
 
@@ -125,16 +137,16 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 默认只测一组，使用 656 字节、`miss-count=request-length`、1 core、每核 4 个 Jetty。
 脚本启动 benchmark 前会校验全部组合。运行中某组失败或超时会立即停止，已运行各组的明细保留。
 例如两个候选 EID 配合 `--cores 1,2 --jettys 1,2,4` 时，只有 `1 core × 1 Jetty`
-的组合随机选择一个 EID，其余组合都访问两个 EID；每组结果按实际生效的 EID 数量标记模式。
+的组合使用第一个 EID，其余组合都访问两个 EID；每组结果按实际生效的 EID 数量标记模式。
 
 ### 参数说明
 
 | 参数 | 含义 |
 | --- | --- |
-| `--peer-eids` | 一个 CPU EID 为单路基线；多个候选 EID 在 Jetty 总数为 1 时随机选一个，否则须有足够的总 Jetty 访问全部 EID，顺序对应 path 0 到 N−1 |
+| `--peer-eids` | CPU EID 候选列表；按输入顺序取前 `min(候选数, cores * jettys)` 个，实际选中一个时为单路基线，生效列表对应 path 0 到 N−1 |
 | `--npu-eid` | 一个本地 NPU EID；设备由 `DEVICE_ID` 选择 |
 | `--cores` | 一次 kernel 使用的 AIV core 总数，1–48 |
-| `--jettys` | **每 core 的 Jetty 总数**，1–64；总数为 `cores * jettys`，除总数为 1 的随机单路模式外，总数须不少于 EID 数量 N |
+| `--jettys` | **每 core 的 Jetty 总数**，1–64；总数为 `cores * jettys`，决定最多使用多少个候选 EID |
 | `--table-capacity` | 共享 DDR 表的条目数 |
 | `--request-length` | 请求数组容量，默认 32768 |
 | `--miss-count` | 每次 BatchGet 的有效请求总数；单路全部搬运、多路分担；默认等于 request-length |
@@ -221,6 +233,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 跨 core 分配修改了 NPU runtime 校验和 BatchGet host 建链逻辑，需重新运行
 `./build.sh npu --build-dir build-npu`，并更新本次 Python 脚本。首次启用多 EID 功能所需的
 两侧 v7 构建要求仍适用。原有命令可继续使用，请换一个尚无同名结果的输出目录。
+若已构建支持跨 core 分配的版本，本次候选列表截取只需更新 Python 脚本，无需再次编译。
 
 ## 已完成的验证与目标机验收
 
@@ -232,6 +245,10 @@ Python 测试覆盖并发/串行观测、空闲路径、路由错误和参数限
 本次总 Jetty 数与跨 core 分配修改在 Windows 上通过 43 项 Python 测试和 kernel CPU 模型验证，
 覆盖 `2 core × 1 Jetty`、`4 core × 1 Jetty`、跨核三 EID 路由、原有每核轮转及对应 WQE/payload。
 CPU 模型按顺序模拟各 core，不用于证明跨核时间重叠。
+
+候选列表截取修复通过 45 项 Python 测试，其中完整模拟启动了三候选 EID、
+`cores=1,2,3,4,5,6`、`jettys=1`、4 种 token 大小和 3 种 miss-count 的 72 组组合，
+验证参数校验、生效 EID、日志及 CSV 一致；此测试不执行真实 NPU 传输。
 
 当前开发环境无 CANN/UMDK/NPU，尚未完成两侧硬件构建及 NPU7 实测。
 目标机运行上述命令后，先核对 `PEER_EID_SELECTED` 和 `BATCH_GET_PEER_ROUTE`

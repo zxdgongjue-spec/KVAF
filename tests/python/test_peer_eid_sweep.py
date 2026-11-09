@@ -116,29 +116,27 @@ class PeerEidTests(unittest.TestCase):
                                           '--npu-eid', '3' * 32, '--output-dir', 'logs'])
             self.assertEqual(parsed.kernel_profile_clock_mhz, 900)
 
-    def test_single_jetty_selects_one_peer_before_validation_and_budget(self):
-        for selected in EIDS:
-            with self.subTest(selected=selected), \
-                 patch('npu_eids.random.choice', return_value=selected) as choose:
-                args = self.args('--cores', '1', '--jettys', '1', '--miss-count', '0')
+    def test_single_jetty_selects_first_peer_before_validation_and_budget(self):
+        for peers in (EIDS, EIDS[::-1]):
+            with self.subTest(peers=peers):
+                args = self.args('--peer-eids', ','.join(peers), '--cores', '1',
+                                 '--jettys', '1', '--miss-count', '0')
                 parsed = perf.parse_args(sweep.benchmark_args(args))
-                choose.assert_called_once_with(EIDS)
-                self.assertEqual(args.requested_peer_eids, EIDS)
-                self.assertEqual(args.peer_eids, [selected])
-                self.assertEqual(parsed.peer_eids, [selected])
+                self.assertEqual(args.requested_peer_eids, peers)
+                self.assertEqual(args.peer_eids, peers[:1])
+                self.assertEqual(parsed.peer_eids, peers[:1])
                 self.assertEqual(args.mode, 'single_eid_baseline')
                 self.assertEqual(args.max_inflight_total, 2048)
                 self.assertIsNone(perf.validate_args(parsed))
 
     def test_multiple_cores_one_jetty_keep_all_peers(self):
         for cores in (2, 4, 16):
-            with self.subTest(cores=cores), patch('npu_eids.random.choice') as choose:
+            with self.subTest(cores=cores):
                 args = self.args('--cores', str(cores), '--jettys', '1')
                 parsed = perf.parse_args(['--peer-eids', ','.join(EIDS),
                                           '--npu-eids', '3' * 32, '--aiv-cores', str(cores),
                                           '--jettys-per-core', '1',
                                           '--max-inflight-total', str(args.max_inflight_total)])
-                choose.assert_not_called()
                 self.assertEqual(args.peer_eids, EIDS)
                 self.assertEqual(parsed.peer_eids, EIDS)
                 self.assertEqual(args.mode, 'dual_eid_concurrent')
@@ -149,34 +147,47 @@ class PeerEidTests(unittest.TestCase):
         from types import SimpleNamespace
         argv = ['--peer-eids', ','.join(EIDS), '--npu-eids', '3' * 32,
                 '--aiv-cores', '1', '--jettys-per-core', '1', '--miss-count', '0']
-        with patch.dict(os.environ, {}, clear=True), \
-             patch('npu_eids.random.choice', return_value=EIDS[1]) as choose:
+        with patch.dict(os.environ, {}, clear=True):
             args = perf.parse_args(argv)
-            choose.assert_called_once_with(EIDS)
             self.assertEqual(args.requested_peer_eids, EIDS)
-            self.assertEqual(args.peer_eids, EIDS[1:])
+            self.assertEqual(args.peer_eids, EIDS[:1])
             self.assertIsNone(perf.validate_args(args))
             console = io.StringIO()
-            choose.reset_mock()
             with patch.object(perf, 'detect_torch_backend', return_value=SimpleNamespace(
                     name='cpu', reason='unit test')), contextlib.redirect_stdout(console):
                 self.assertEqual(perf.main(argv), 2)
-            choose.assert_called_once_with(EIDS)
-            self.assertIn(f'selected_peer_eid={EIDS[1]}', console.getvalue())
+            self.assertIn(f'selected_peer_eids={EIDS[0]}', console.getvalue())
             self.assertIn('mode=single_eid_baseline', console.getvalue())
             self.assertNotIn('invalid BatchGet', console.getvalue())
+
+    def test_direct_benchmark_truncates_candidates_in_input_order(self):
+        peers = ['3' * 32, *EIDS, '4' * 32, '5' * 32]
+        for cores, jettys in ((1, 2), (2, 1), (2, 2)):
+            with self.subTest(cores=cores, jettys=jettys), patch.dict(os.environ, {}, clear=True):
+                argv = ['--peer-eids', ','.join(peers), '--npu-eids', '6' * 32,
+                        '--aiv-cores', str(cores), '--jettys-per-core', str(jettys)]
+                args = perf.parse_args(argv)
+                selected = peers[:cores * jettys]
+                self.assertEqual(args.requested_peer_eids, peers)
+                self.assertEqual(args.peer_eids, selected)
+                self.assertIsNone(perf.validate_args(args))
+                self.assertEqual(perf.parse_args(argv).peer_eids, selected)
+                messages = []
+                perf.report_peer_eid_selection(args, emit=messages.append)
+                self.assertIn(f'selected_peer_eids={",".join(selected)}', messages[0])
+                self.assertIn('reason=jetty_capacity', messages[0])
+                mode = 'dual_eid_concurrent' if len(selected) == 2 else 'multi_eid_concurrent'
+                self.assertIn(f'mode={mode}', messages[0])
 
     def test_rejects_serializing_or_idle_shapes(self):
         for extra in [('--request-length', '128'), ('--max-inflight-total', '2'),
                       ('--cores', '0'), ('--iterations', '0'), ('--jettys', '0'),
                       ('--jettys', '4,0'), ('--cores', '1,1'), ('--miss-count', '2048,'),
                       ('--peer-eids', ''),
-                      ('--peer-eids', ','.join(EIDS + ['4' * 32]), '--jettys', '2'),
-                      ('--peer-eids', ','.join(EIDS + ['4' * 32]), '--cores', '2', '--jettys', '1'),
                       ('--cores', '2', '--jettys', '1', '--miss-count', '0'),
-                      ('--peer-eids', ','.join(f'{i + 1:032x}' for i in range(5))),
                       ('--npu-eid', ''), ('--npu-eid', ','.join(EIDS)),
-                      ('--peer-eids', ','.join([EIDS[0]] * 2))]:
+                      ('--peer-eids', ','.join([EIDS[0]] * 2)),
+                      ('--peer-eids', ','.join(EIDS + EIDS[:1]), '--cores', '1', '--jettys', '1')]:
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     self.args(*extra)
@@ -386,7 +397,7 @@ class PeerEidTests(unittest.TestCase):
             self.assertIn('BATCH_GET_MISS_SWEEP_SUMMARY combinations=16', log)
             self.assertEqual(log.count('BATCH_GET_MISS_SWEEP_STAGE_SUMMARY'), 3)
 
-    def test_random_baseline_and_mixed_sweep_keep_effective_eids_in_outputs(self):
+    def test_baseline_and_mixed_sweep_keep_effective_eids_in_outputs(self):
         for cores, jettys in (('1', '1'), ('1', '1,2,4'), ('1,2', '1,2')):
             with self.subTest(cores=cores, jettys=jettys), tempfile.TemporaryDirectory() as folder:
                 root = fake_build(folder)
@@ -395,16 +406,14 @@ class PeerEidTests(unittest.TestCase):
                         '--output-dir', str(output), '--cores', cores, '--jettys', jettys]
                 console = io.StringIO()
                 with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': 'localhost:29000'}, clear=True), \
-                     patch('npu_eids.random.choice', return_value=EIDS[1]) as choose, \
                      patch.object(sweep, 'run_logged', side_effect=fake_sweep_benchmark) as run, \
                      contextlib.redirect_stdout(console):
                     self.assertEqual(sweep.main(argv), 0)
-                    choose.assert_called_once_with(EIDS)
                 self.assertEqual(run.call_count, len(cores.split(',')) * len(jettys.split(',')))
                 for call in run.call_args_list:
                     parsed = perf.parse_args(call.args[0][3:])
                     single = parsed.aiv_cores * parsed.jettys_per_core == 1
-                    peers = EIDS[1:] if single else EIDS
+                    peers = EIDS[:1] if single else EIDS
                     mode = 'single_eid_baseline' if single else 'dual_eid_concurrent'
                     case = Path(parsed.peer_csv).parent
                     config = json.loads((case / 'config.json').read_text())
@@ -421,13 +430,51 @@ class PeerEidTests(unittest.TestCase):
                               'PEER_EID_CONCURRENCY')
                     self.assertIn(marker, log)
                     if single:
-                        self.assertIn(f'selected_peer_eid={EIDS[1]}', log)
+                        self.assertIn(f'selected_peer_eids={EIDS[0]}', log)
                         self.assertNotIn('PEER_EID_CONCURRENCY', log)
                 mode = 'single_eid_baseline' if run.call_count == 1 else 'mixed'
                 self.assertIn(f'mode={mode}', (output / 'batch_get.log').read_text())
-                self.assertIn(f'selected_peer_eid={EIDS[1]}', console.getvalue())
+                self.assertIn(f'selected_peer_eids={EIDS[0]}', console.getvalue())
                 with (output / 'batch_get_miss_sweep_summary.csv').open() as stream:
                     self.assertEqual(len(list(csv.DictReader(stream))), run.call_count)
+
+    def test_three_candidate_six_core_sweep_runs_all_72_configurations(self):
+        peers = ['00000000000402000010000050100504',
+                 '00000000000403000010000050100504',
+                 '00000000000404000010000050100504']
+        with tempfile.TemporaryDirectory() as folder:
+            root = fake_build(folder)
+            output = root / 'logs'
+            argv = [str(root), '--peer-eids', ','.join(peers),
+                    '--npu-eid', '00000000003f030000100000df00cb00',
+                    '--token-bytes', '656,1024,2048,4096', '--miss-count', '2048,4096,8192',
+                    '--cores', '1,2,3,4,5,6', '--jettys', '1', '--output-dir', str(output)]
+            with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': '141.62.38.71:29000',
+                                         'DEVICE_ID': '6'}, clear=True), \
+                 patch.object(sweep, 'run_logged', side_effect=fake_sweep_benchmark) as child, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.main(argv), 0)
+            self.assertEqual(child.call_count, 72)
+            for call in child.call_args_list:
+                parsed = perf.parse_args(call.args[0][3:])
+                selected = peers[:parsed.aiv_cores]
+                self.assertEqual(parsed.peer_eids, selected)
+                self.assertIsNone(perf.validate_args(parsed))
+                case = Path(parsed.peer_csv).parent
+                config = json.loads((case / 'config.json').read_text())
+                self.assertEqual(config['requested_peer_eids'], peers)
+                self.assertEqual(config['peer_eids'], selected)
+                self.assertEqual(config['benchmark']['peer_eids'], selected)
+                self.assertEqual(config['max_inflight_total'], 2048)
+                self.assertEqual(config['mode'], {1: 'single_eid_baseline', 2: 'dual_eid_concurrent',
+                                                 3: 'multi_eid_concurrent'}[len(selected)])
+                with (case / 'peer_samples.csv').open() as stream:
+                    self.assertEqual([row['peer_eid'] for row in csv.DictReader(stream)], selected)
+                if parsed.aiv_cores < 3:
+                    self.assertIn(f'selected_peer_eids={",".join(selected)}',
+                                  (case / 'batch_get.log').read_text())
+            with (output / 'batch_get_miss_sweep_summary.csv').open() as stream:
+                self.assertEqual(len(list(csv.DictReader(stream))), 72)
 
     def test_sweep_stops_at_failed_case_and_keeps_prior_logs(self):
         with tempfile.TemporaryDirectory() as folder:

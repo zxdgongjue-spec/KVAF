@@ -198,8 +198,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="strict K-side UB device selected by an earlier process",
     )
     parser.add_argument("--peer-eids", type=parse_npu_eids, default=[],
-                        help="strict CPU EIDs sharing DDR; one Jetty in total randomly selects "
-                             "one EID for the entire run, otherwise stripes paths across core/Jetty workers")
+                        help="CPU EID candidates sharing DDR; use the first aiv-cores * "
+                             "jettys-per-core EIDs if fewer Jettys than candidates are available")
     parser.add_argument("--peer-csv", default="",
                         help="per-sample/core/peer traffic and observed overlap CSV")
     parser.add_argument(
@@ -371,9 +371,11 @@ def validate_args(args: argparse.Namespace) -> str | None:
 
 def report_peer_eid_selection(args, emit=print):
     if args.requested_peer_eids != args.peer_eids:
+        mode = {1: "single_eid_baseline", 2: "dual_eid_concurrent"}.get(
+            len(args.peer_eids), "multi_eid_concurrent")
         emit(f"BATCH_GET_PEER_EID_SELECTION requested_peer_eids={','.join(args.requested_peer_eids)} "
-             f"selected_peer_eid={args.peer_eids[0]} reason=single_jetty_random "
-             "mode=single_eid_baseline")
+             f"selected_peer_eids={','.join(args.peer_eids)} reason=jetty_capacity "
+             f"mode={mode}")
 
 
 def wait_for_concurrent_start() -> None:
