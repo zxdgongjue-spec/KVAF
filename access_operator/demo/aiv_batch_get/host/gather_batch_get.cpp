@@ -281,6 +281,7 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.requests != statuses[i].requests) reason = "requests";
     else if (p.data_wrs != statuses[i].data_wrs) reason = "data_wrs";
     else if (p.pipeline_chunk_bytes != (p.requests ? args.pipeline_chunk_bytes : 0)) reason = "pipeline_chunk_bytes";
+    else if (p.packed_posts != uint64_t(p.requests && args.pipeline_shards == 2)) reason = "packed_posts";
     else if (p.pipeline_chunk_bytes &&
         (p.first_ready_cycle < p.notify_done_cycle || p.first_ready_cycle > p.first_read_submit_cycle ||
          p.first_read_submit_cycle > p.read_done_cycle || !p.first_read_ready_bytes ||
@@ -341,7 +342,15 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     out.ready_queries = p.ready_queries;
     out.ready_wait_cycles = p.ready_wait_cycles;
     out.pipeline_chunk_bytes = p.pipeline_chunk_bytes;
-    out.pipeline_shards = p.requests ? args.pipeline_shards : 0;
+    out.pipeline_shards = p.requests && args.pipeline_shards;
+    out.read_vf_calls = p.read_vf_calls;
+    out.ready_no_change_queries = p.ready_no_change_queries;
+    out.ready_query_skips = p.ready_query_skips;
+    out.max_ready_backlog_wrs = p.max_ready_backlog_wrs;
+    out.ready_idle_waits = p.ready_idle_waits;
+    out.multi_run_posts = p.multi_run_posts;
+    out.packed_posts = p.packed_posts;
+    out.read_plan_segments = p.read_plan_segments;
     latest_profile.cores.push_back(out);
   }
   return Status::OK();
@@ -383,6 +392,11 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Status::InvalidArgument("KVAF_AIV_GATHER_SHARD_PIPELINE must be 0 or 1");
   s.args.pipeline_shards = s.args.pipeline_chunk_bytes &&
       (!shards || !*shards || std::strcmp(shards, "0"));
+  const char* packed = std::getenv("KVAF_AIV_GATHER_PACKED_POSTS");
+  if (packed && *packed && std::strcmp(packed, "0") && std::strcmp(packed, "1"))
+    return Status::InvalidArgument("KVAF_AIV_GATHER_PACKED_POSTS must be 0 or 1");
+  if (s.args.pipeline_shards && (!packed || !*packed || std::strcmp(packed, "0")))
+    s.args.pipeline_shards = 2;
   const char* coalesce = std::getenv("KVAF_AIV_GATHER_COALESCE_SGES");
   if (coalesce && *coalesce && std::strcmp(coalesce, "0") && std::strcmp(coalesce, "1"))
     return Status::InvalidArgument("KVAF_AIV_GATHER_COALESCE_SGES must be 0 or 1");
@@ -415,9 +429,9 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s chunk_bytes=%u max_shards=%u\n",
+  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u max_shards=%u\n",
       s.args.pipeline_shards ? "shard" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
-      s.args.pipeline_chunk_bytes, kGatherMaxShards);
+      s.args.pipeline_shards == 2 ? "packed" : "legacy", s.args.pipeline_chunk_bytes, kGatherMaxShards);
   return Status::OK();
 }
 Status GatherBatchGet::Drain() {

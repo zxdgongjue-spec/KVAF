@@ -58,7 +58,7 @@ void Launch(const ModelArgs& a) {
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
       a.sequence, a.max_polls, a.scatter_probe});
   } else {
-    KvafGatherBatchGetAivKernelV5({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV6({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
@@ -132,6 +132,8 @@ struct Fixture {
   // the CPU's final ACK is deliberately withheld until three ACK queries.
   uint32_t ready_fault{}, ready_step{1}, ready_idle{2};
   bool ack_timeout{}, ack_error{}, queried_with_data_inflight{}, all_shards_ready{};
+  bool odd_ready_wave{}, tail_in_middle{};
+  std::vector<bool> packed_query_had_backlog = std::vector<bool>(8);
   bool hold_data_cq_for_ack{}, delay_progress_cq{}, ack_with_data_inflight{}, prefetched_during_vf{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
@@ -300,6 +302,13 @@ struct Fixture {
     return bytes;
   }
   void AdvanceShards(uint32_t worker) {
+    if (args.pipeline_shards == 2) {
+      uint64_t read_bytes = 0;
+      for (uint32_t i = uint64_t(active) * worker / workers;
+           i < uint64_t(active) * (worker + 1) / workers; ++i)
+        read_bytes += uint64_t(shard_read_rows[i]) * token;
+      packed_query_had_backlog[worker] = ShardReadyBytes(worker) > read_bytes;
+    }
     ++ready_reads[worker];
     auto* h = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(
         args.remote_descriptor + worker * args.lane_descriptor_bytes);
@@ -312,6 +321,9 @@ struct Fixture {
     // consumed before it, rather than merely reporting a fabricated frontier.
     for (uint32_t reverse = shards; reverse > 0; --reverse) {
       const auto shard = reverse - 1;
+      if (!shard && shards > 1 && !first_read_ready[worker] && !all_shards_ready && !odd_ready_wave)
+        continue; // Keep shard zero unavailable until a later shard is consumed.
+      if (odd_ready_wave && ready_reads[worker] == ready_idle + 1 && !(shard & 1)) continue;
       const auto first = kvaf::GatherShardBoundary(total, shards, shard);
       const auto last = kvaf::GatherShardBoundary(total, shards, shard + 1);
       const auto old = uint32_t(progress[shard]);
@@ -330,7 +342,7 @@ struct Fixture {
       if (ready_fault == 4) progress[shard] = kvaf::GatherShardProgress(args.sequence, last - first + 1);
       if (ready_fault == 3 && first_read_ready[worker])
         progress[shards - 1] = kvaf::GatherShardProgress(args.sequence, 0);
-      if (!all_shards_ready) break;
+      if (!all_shards_ready && !odd_ready_wave) break;
     }
     if (ready_fault == 5) {
       auto* c = reinterpret_cast<kvaf::peer::GatherControl*>(args.remote_control) + worker;
@@ -487,6 +499,7 @@ struct Fixture {
               const auto total = (h->span_count + args.sgl_size - 1) / args.sgl_size;
               const auto shards = kvaf::GatherShardCount(total);
               const auto wr = (remote_address - h->staging_address) / (args.sgl_size * token);
+              if (wr + 1 == total && m.pi + blocks < end) tail_in_middle = true;
               const auto* progress = reinterpret_cast<const uint64_t*>(Address(h) + kvaf::GatherProgressOffset(h->span_count));
               uint32_t shard = 0;
               while (kvaf::GatherShardBoundary(total, shards, shard + 1) <= wr) ++shard;
@@ -545,7 +558,8 @@ struct Fixture {
             const auto progress_end = args.pipeline_shards ? Address(descriptor) +
                 kvaf::GatherProgressOffset(descriptor->span_count) + kvaf::kGatherProgressBytes : Address(descriptor) + 48;
             const bool defer_progress = delay_progress_cq && q % 2 && op == kRead &&
-                (args.pipeline_shards || first_read_ready[worker]) && remote_address == progress_end;
+                (args.pipeline_shards == 2 ? packed_query_had_backlog[worker] :
+                  args.pipeline_shards || first_read_ready[worker]) && remote_address == progress_end;
             if ((hold_data_cq_for_ack && !(q % 2) && !cpu_done[worker]) || defer_progress) {
               assert(!m.deferred_cq);
               m.deferred_cq = true;
@@ -639,6 +653,8 @@ struct Fixture {
       assert(boundaries[0] && std::is_sorted(std::begin(boundaries), std::end(boundaries)));
       const auto rows = uint64_t(active) * (core + 1) / workers - uint64_t(active) * core / workers;
       assert(p.requests == rows && p.data_wrs == status[core].data_wrs);
+      assert(p.packed_posts == uint64_t(rows && args.pipeline_shards == 2));
+      if (rows && args.pipeline_shards == 2) assert(p.read_vf_calls == p.data_doorbells);
       if (!rows) {
         assert(p.input_done_cycle == p.read_done_cycle);
         assert(!p.data_wrs && !p.ack_queries && !p.data_wqebbs && !p.data_doorbells);
@@ -678,7 +694,7 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
-  const auto& metadata = KvafGatherBatchGetAivKernelV5_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV6_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
   // GDR3 consumers must read later ready shards before delayed shard zero,
   // retain in-flight READs across shards, and finish ACK before data-CQ drain.
@@ -686,7 +702,7 @@ int main() {
     for (uint32_t sgl : {1U, 6U, 13U})
       for (uint32_t chunk : {64U, 4096U, 131072U}) {
         Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, sgl);
-        f.args.pipeline_chunk_bytes = chunk; f.args.pipeline_shards = 1;
+        f.args.pipeline_chunk_bytes = chunk; f.args.pipeline_shards = 2;
         f.args.max_polls = 512;
         f.DataQueueDepth(32768); f.EnableProfile();
         f.Run(); f.CheckProfiles();
@@ -699,7 +715,7 @@ int main() {
       }
   {
     Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
-    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 1;
+    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 2;
     f.args.max_polls = 512; f.DataQueueDepth(32768);
     f.ready_idle = 0;
     f.delay_progress_cq = true; f.hold_data_cq_for_ack = true;
@@ -709,7 +725,7 @@ int main() {
   }
   {
     Fixture f(8192, 656, 1, KVAF_SEQ_GATHER, 6);
-    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 1;
+    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 2;
     f.all_shards_ready = true; f.ready_idle = 0;
     f.DataQueueDepth(32768); f.EnableProfile(); f.Run(); f.CheckProfiles();
     assert(f.profiles[0].data_doorbells == (((8192 + 5) / 6) + 127) / 128);
@@ -717,19 +733,19 @@ int main() {
   }
   for (uint32_t depth : {4U, 16U, 520U}) {
     Fixture f(1024, 13, 3, KVAF_SEQ_GATHER, 6);
-    f.args.pipeline_chunk_bytes = 4096; f.args.pipeline_shards = 1;
+    f.args.pipeline_chunk_bytes = 4096; f.args.pipeline_shards = 2;
     f.args.max_polls = 512; f.DataQueueDepth(depth); f.Run(); f.Next(19); f.Run();
   }
   for (uint32_t coalesce : {0U, 1U}) {
     Fixture f(8193, 4096, 2, KVAF_SEQ_GATHER, 6);
-    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 1;
+    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 2;
     f.args.coalesce_sges = coalesce; f.args.max_polls = 512;
     if (coalesce) f.ConsecutiveReadRows(true);
     f.DataQueueDepth(32768); f.EnableProfile(); f.Run(); f.CheckProfiles();
   }
   for (uint32_t fault : {1U, 2U, 3U, 4U, 5U}) {
     Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, 6);
-    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 1;
+    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 2;
     f.ready_fault = fault; f.args.max_polls = 128; f.DataQueueDepth(32768);
     f.Run(false, true);
     assert(f.status[0].result == (fault == 1 ? KVAF_SEQ_TIMEOUT : KVAF_SEQ_REMOTE_ERROR));
@@ -739,7 +755,7 @@ int main() {
   }
   for (uint32_t failure = 0; failure < 6; ++failure) {
     Fixture f(1024, 656, 1, KVAF_SEQ_GATHER, 6);
-    f.args.pipeline_chunk_bytes = 4096; f.args.pipeline_shards = 1;
+    f.args.pipeline_chunk_bytes = 4096; f.args.pipeline_shards = 2;
     f.args.max_polls = 128; f.DataQueueDepth(32768);
     f.timeout = failure == 0; f.ack_timeout = failure == 1;
     f.ack_error = failure == 2; f.data_timeout = failure == 3; f.data_cq_error = failure == 4;
@@ -748,6 +764,26 @@ int main() {
     assert(f.status[0].result == (failure == 2 ? KVAF_SEQ_REMOTE_ERROR :
         failure >= 4 ? KVAF_SEQ_CQ_ERROR : KVAF_SEQ_TIMEOUT));
     assert(f.states[0].poisoned && f.states[1].poisoned);
+  }
+  for (uint32_t scheduler : {1U, 2U}) {
+    Fixture f(4096, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = scheduler;
+    f.args.max_polls = 512; f.ready_idle = 0; f.DataQueueDepth(32768); f.EnableProfile();
+    f.Run(); f.CheckProfiles();
+    if (scheduler == 2) {
+      assert(f.profiles[0].read_vf_calls < 64);
+      assert(f.profiles[0].data_doorbells < 64);
+      assert(f.queues[0]->first_db_vfs == 1);
+    } else assert(f.profiles[0].read_vf_calls == 127 && f.profiles[0].data_doorbells == 64);
+  }
+  {
+    Fixture f(4096, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.pipeline_chunk_bytes = 131072; f.args.pipeline_shards = 2;
+    f.odd_ready_wave = true; f.ready_idle = 0; f.DataQueueDepth(32768); f.EnableProfile();
+    f.Run(); f.CheckProfiles();
+    assert(f.profiles[0].multi_run_posts && f.profiles[0].ready_query_skips);
+    assert(f.profiles[0].data_doorbells == 6 && f.profiles[0].read_vf_calls == 6);
+    assert(f.profiles[0].ready_queries == 2 && f.tail_in_middle);
   }
   for (uint32_t chunk : {0U, 4096U}) {
     Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);

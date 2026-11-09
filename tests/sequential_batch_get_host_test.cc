@@ -139,6 +139,7 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         p.data_wrs = statuses[i].data_wrs + (fault == 7);
         if (args.pipeline_chunk_bytes && p.requests) {
           p.pipeline_chunk_bytes = args.pipeline_chunk_bytes;
+          p.packed_posts = args.pipeline_shards == 2;
           p.ack_done_cycle = 106;
           p.first_ready_cycle = 104;
           p.first_read_submit_cycle = 104;
@@ -504,7 +505,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=240", "record_bytes=192"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=240", "record_bytes=256"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);
@@ -641,11 +642,21 @@ int main() {
     setenv("KVAF_AIV_GATHER_SHARD_PIPELINE", setting, 1);
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     unsetenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
-    assert(owner->Execute(exec).ok() && last_pipeline_shards == unsigned(*setting - '0'));
+    assert(owner->Execute(exec).ok() && bool(last_pipeline_shards) == bool(*setting - '0'));
     assert(owner->Shutdown().ok() && !refs && !allocations);
   }
   setenv("KVAF_AIV_GATHER_SHARD_PIPELINE", "invalid", 1);
   { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
   unsetenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
+  for (const char* setting : {"0", "1"}) {
+    setenv("KVAF_AIV_GATHER_PACKED_POSTS", setting, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_AIV_GATHER_PACKED_POSTS");
+    assert(owner->Execute(exec).ok() && last_pipeline_shards == (*setting == '1' ? 2U : 1U));
+    assert(owner->Shutdown().ok() && !refs && !allocations);
+  }
+  setenv("KVAF_AIV_GATHER_PACKED_POSTS", "invalid", 1);
+  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
+  unsetenv("KVAF_AIV_GATHER_PACKED_POSTS");
   std::cout << "sequential Host lifecycle: PASS\n";
 }

@@ -4,6 +4,7 @@
 
 - [CPU gather 与 payload READ 分块流水：实现、配置和验证](aiv_gather_chunk_pipeline.md)
 - [Gather 分片进度流水与 Python/Host 调用快路径](aiv_gather_shard_pipeline.md)
+- [Gather V6 ready 库存与离散 WR 合批调度](aiv_gather_packed_scheduler.md)
 - [Gather 串行阶段计时、脚本配置和性能对比](aiv_gather_serial_profile.md)
 - [Gather 必需开销与 direct 对齐](aiv_gather_direct_alignment.md)
 - [Gather CPU 性能采集与等待归因](aiv_gather_cpu_profile.md)

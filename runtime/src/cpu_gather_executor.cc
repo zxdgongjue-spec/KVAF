@@ -171,19 +171,36 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
     std::uint64_t copied = 0U;
     const auto wr_bytes = std::uint64_t(shard_sgl_) * span_bytes_;
     const auto step = std::max<std::uint64_t>(1U, pipeline_chunk_bytes_ / wr_bytes);
-    for (auto shard = worker; shard < shard_count_; shard += active_threads_) {
-      const auto first = GatherShardBoundary(shard_wrs_, shard_count_, shard);
-      const auto last = GatherShardBoundary(shard_wrs_, shard_count_, shard + 1U);
-      for (auto wr = std::uint64_t(first); wr < last;) {
-        const auto next = std::min<std::uint64_t>(last, wr + step);
-        copied += CopyRange(std::min(total_bytes_, wr * wr_bytes),
-                            std::min(total_bytes_, next * wr_bytes));
-        GatherBarrier();
+    // A worker owns adjacent progress words and staging ranges. Publish a
+    // short first prefix, then checkpoint up to chunk bytes across shard ends.
+    // Both barriers remain; several completed shard words share one epoch.
+    const auto first_shard = (shard_count_ * worker + active_threads_ - 1U) / active_threads_;
+    const auto last_shard = (shard_count_ * (worker + 1U) + active_threads_ - 1U) / active_threads_;
+    if (first_shard == last_shard) return 0U;
+    auto shard = first_shard;
+    auto wr = std::uint64_t(GatherShardBoundary(shard_wrs_, shard_count_, first_shard));
+    const auto end = std::uint64_t(GatherShardBoundary(shard_wrs_, shard_count_, last_shard));
+    const auto first_end = std::uint64_t(GatherShardBoundary(shard_wrs_, shard_count_, first_shard + 1U));
+    bool first = true;
+    while (wr < end) {
+      const auto next = std::min(first ? first_end : end, wr + step);
+      copied += CopyRange(std::min(total_bytes_, wr * wr_bytes),
+                          std::min(total_bytes_, next * wr_bytes));
+      GatherBarrier();
+      while (shard < last_shard) {
+        const auto begin = GatherShardBoundary(shard_wrs_, shard_count_, shard);
+        const auto last = GatherShardBoundary(shard_wrs_, shard_count_, shard + 1U);
         __atomic_store_n(shard_progress_ + shard,
-                         GatherShardProgress(shard_sequence_, next - first), __ATOMIC_RELEASE);
-        GatherBarrier();
-        wr = next;
+            GatherShardProgress(shard_sequence_, std::min<std::uint64_t>(next, last) - begin),
+            __ATOMIC_RELEASE);
+        if (next < last) break;
+        ++shard;
+        if (next == last) break;
       }
+      GatherBarrier();
+      if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
+      wr = next;
+      first = false;
     }
     return copied;
   }

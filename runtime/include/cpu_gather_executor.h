@@ -48,7 +48,7 @@ enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 // CPU steady-clock timestamps only; they do not share the AIV clock.
 struct alignas(64) CpuGatherThreadProfile {
   std::uint64_t ready_ns{}, start_ns{}, copy_done_ns{}, done_ns{};
-  std::uint64_t thread_cpu_ns{}, bytes{}, tid{};
+  std::uint64_t thread_cpu_ns{}, bytes{}, tid{}, progress_publications{};
   int cpu{-1};
   bool wait_path{}, cpu_time_valid{};
 };

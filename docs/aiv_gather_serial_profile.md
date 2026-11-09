@@ -1,5 +1,8 @@
 # Gather 阶段计时与 AIV 内部流水
 
+当前调度与 profile 版本见 [V6 ready 库存与离散 WR 合批](aiv_gather_packed_scheduler.md)：
+args 240 B、profile 256 B，CSV schema 6。下文 V5/V4 部分保留为历史说明。
+
 当前默认使用 [GDR3 分片流水与 V5 调用快路径](aiv_gather_shard_pipeline.md)，
 args 仍为 240 B、profile 192 B；旧 V4 连续前缀模式保留为显式对照。
 Python/Host 分段计时和 CSV schema 5 的说明以新文档为准。

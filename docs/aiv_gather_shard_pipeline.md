@@ -1,5 +1,9 @@
 # Gather 分片进度流水与调用快路径
 
+当前默认调度器已升级为 [V6 ready 库存与离散 WR 合批](aiv_gather_packed_scheduler.md)。
+下文保留 V5 的 GDR3 wire 与连续 run 调度说明；V6 的 profile 为 256 B，
+CPU 新发布策略和配套重编方式以新文档为准。
+
 当前 gather 默认启用独立 shard 进度消费。改动仅使用 gather 的 CPU memcpy、
 READ SQ/CQ、sequence 和最终 ACK 生命周期；未引入 scatter 的 CPU-push 协议、
 payload WRITE 链、done 状态或 workspace 布局。

@@ -537,6 +537,14 @@ class NpuPythonRuntime final {
       item["ready_wait_cycles"] = p.ready_wait_cycles;
       item["pipeline_chunk_bytes"] = p.pipeline_chunk_bytes;
       item["pipeline_shards"] = p.pipeline_shards;
+      item["read_vf_calls"] = p.read_vf_calls;
+      item["ready_no_change_queries"] = p.ready_no_change_queries;
+      item["ready_query_skips"] = p.ready_query_skips;
+      item["max_ready_backlog_wrs"] = p.max_ready_backlog_wrs;
+      item["ready_idle_waits"] = p.ready_idle_waits;
+      item["multi_run_posts"] = p.multi_run_posts;
+      item["packed_posts"] = p.packed_posts;
+      item["read_plan_segments"] = p.read_plan_segments;
       cores.append(std::move(item));
     }
     py::dict result;

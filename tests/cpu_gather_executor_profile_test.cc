@@ -230,7 +230,7 @@ void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
   std::free(allocation);
 }
 #endif
-void ShardedCopies(bool profile, unsigned token, unsigned sgl, unsigned chunk) {
+void ShardedCopies(bool profile, unsigned token, unsigned sgl, unsigned chunk, unsigned threads = 8) {
   constexpr unsigned count = 4097;
   const auto bytes = std::uint64_t(count) * token;
   const auto staging_offset = (131072U + bytes + 63U) & ~std::uint64_t{63};
@@ -240,7 +240,7 @@ void ShardedCopies(bool profile, unsigned token, unsigned sgl, unsigned chunk) {
   auto* memory = static_cast<std::uint8_t*>(allocation);
   const auto base = reinterpret_cast<std::uint64_t>(memory);
   {
-    kvaf::peer::CpuGatherExecutor executor(memory, base, 8, 4096,
+    kvaf::peer::CpuGatherExecutor executor(memory, base, threads, 4096,
                                          kvaf::peer::GatherWaitMode::kActive);
     if (profile) executor.EnableProfiling();
     auto* h = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
@@ -261,7 +261,7 @@ void ShardedCopies(bool profile, unsigned token, unsigned sgl, unsigned chunk) {
             static_cast<std::uint32_t>(bytes), chunk, token, sgl};
       auto* staging = memory + staging_offset;
       std::memset(staging, 0xad, bytes);
-      Check(executor.PrepareDirect(region_bytes, base, sequence, count) == 8,
+      Check(executor.PrepareDirect(region_bytes, base, sequence, count) == threads,
             "shard preparation failed");
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
       using namespace cpu_gather_test;
@@ -310,6 +310,11 @@ void ShardedCopies(bool profile, unsigned token, unsigned sgl, unsigned chunk) {
         std::uint64_t copied = 0;
         for (const auto& thread : executor.ThreadProfiles()) copied += thread.bytes;
         Check(copied == bytes, "shard profiles double-count or omit bytes");
+        if (token == 656 && sgl == 6 && chunk == 131072) {
+          std::uint64_t publications = 0;
+          for (const auto& thread : executor.ThreadProfiles()) publications += thread.progress_publications;
+          Check(publications == 32, "steady copy still publishes/barriers once per shard");
+        }
       }
     }
     const auto header = *h;
@@ -336,6 +341,7 @@ int main() {
     for (unsigned token : {656U, 4096U})
       for (unsigned sgl : {1U, 6U, 13U})
         for (unsigned chunk : {64U, 4096U, 131072U}) ShardedCopies(profile, token, sgl, chunk);
+  ShardedCopies(true, 656, 6, 131072, 16);
   BalancedCopies(4096, 656);   // Previously 21 tasks for 16 threads at 128 KiB.
   BalancedCopies(4096, 4096);  // Multiple balanced rounds, bounded copy task size.
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)

@@ -390,13 +390,13 @@ class CpuGatherWorker {
             " ready_ns=%" PRIu64 " start_ns=%" PRIu64 " done_ns=%" PRIu64
             " ready_delay_ns=%" PRIu64 " start_delay_ns=%" PRIu64
             " copy_ns=%" PRIu64 " barrier_ns=%" PRIu64 " work_ns=%" PRIu64
-            " thread_cpu_ns=%" PRIu64 " cpu_time_valid=%u\n",
+            " thread_cpu_ns=%" PRIu64 " cpu_time_valid=%u progress_publications=%" PRIu64 "\n",
             session_id_, lane_, sample.sequence, worker, thread.tid, thread.cpu,
             thread.wait_path ? 1U : 0U, thread.bytes, thread.ready_ns, thread.start_ns, thread.done_ns,
             thread.ready_ns - copy.publish_ns, thread.start_ns - copy.begin_ns,
             thread.copy_done_ns - thread.start_ns, thread.done_ns - thread.copy_done_ns,
             thread.done_ns - thread.start_ns, thread.thread_cpu_ns,
-            thread.cpu_time_valid ? 1U : 0U);
+            thread.cpu_time_valid ? 1U : 0U, thread.progress_publications);
       }
     }
   }
