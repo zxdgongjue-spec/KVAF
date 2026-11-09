@@ -1,5 +1,7 @@
 # Gather 阶段计时与 AIV 内部流水
 
+新增可独立对照的 [V8 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)，部署需使用 V8 kernel / args 256 B / profile 384 B。下文的旧版本尺寸为历史记录。
+
 当前版本为 [V7 进度控制优化](aiv_gather_progress_control.md)：默认 progress-only pull，
 可选 CPU 进度 push；args 248 B、profile 320 B、CSV schema 7。下文历史版本说明保留。
 

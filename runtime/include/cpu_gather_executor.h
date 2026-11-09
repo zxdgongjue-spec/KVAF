@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -137,7 +138,13 @@ class CpuGatherExecutor {
     staging_ = memory_ + (staging - base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
-    if (pipeline_ready_ != nullptr) {
+    if (cooperative_) {
+      cooperative_count_ = (total_bytes_ + pipeline_chunk_bytes_ - 1U) / pipeline_chunk_bytes_;
+      for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
+        cooperative_progress_[chunk].remaining.store(threads, std::memory_order_relaxed);
+        cooperative_progress_[chunk].complete.store(false, std::memory_order_relaxed);
+      }
+    } else if (pipeline_ready_ != nullptr) {
       // Balanced static rounds, capped at 256 KiB per copy task. A 2.5625-MiB
       // lane with 16 threads gets 16 x 164-KiB tasks, independent of ready chunk.
       constexpr std::uint64_t kMaxTaskBytes = 256U * 1024U;
@@ -188,6 +195,7 @@ class CpuGatherExecutor {
 
   std::uint64_t ProcessSource(std::size_t worker);
   void PublishReady();
+  void PublishCooperativeReady();
 
   static std::uint64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -215,6 +223,15 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
+  bool cooperative_{};
+  std::uint32_t cooperative_count_{};
+  // One completion RMW per worker/block; only the last worker scans/publishes.
+  // Blocks have separate lines and no worker waits for another block's users.
+  struct alignas(64) CooperativeProgress {
+    std::atomic<std::size_t> remaining{0};
+    std::atomic<bool> complete{false};
+  };
+  std::array<CooperativeProgress, kGatherMaxCooperativeChunks> cooperative_progress_;
   std::uint64_t* shard_progress_{nullptr};
   std::uint64_t shard_sequence_{};
   std::uint32_t shard_sgl_{}, shard_wrs_{}, shard_count_{};

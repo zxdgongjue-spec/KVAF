@@ -52,6 +52,7 @@ struct ModelArgs {
   uint32_t pipeline_chunk_bytes{};
   uint32_t pipeline_shards{};
   uint32_t progress_mode{};
+  uint32_t prepare_ahead{}, cooperative_chunks{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -59,11 +60,11 @@ void Launch(const ModelArgs& a) {
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
       a.sequence, a.max_polls, a.scatter_probe});
   } else {
-    KvafGatherBatchGetAivKernelV7({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV8({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
-      a.gather_probe, a.coalesce_sges, a.pipeline_chunk_bytes, a.pipeline_shards, a.progress_mode, 0});
+      a.gather_probe, a.coalesce_sges, a.pipeline_chunk_bytes, a.pipeline_shards, a.progress_mode, a.prepare_ahead, a.cooperative_chunks, 0});
   }
 }
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
@@ -136,6 +137,7 @@ struct Fixture {
   bool odd_ready_wave{}, tail_in_middle{}, prepare_error{};
   std::vector<bool> packed_query_had_backlog = std::vector<bool>(8);
   bool hold_data_cq_for_ack{}, delay_progress_cq{}, ack_with_data_inflight{}, prefetched_during_vf{};
+  bool delay_first_control_cq{};
 
   Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
@@ -279,16 +281,20 @@ struct Fixture {
     std::memcpy(workspace.data() + 128, &done, 8);
     push_done = true; ++push_requests;
   }
+  uint32_t ChunkBytes(uint32_t worker) const {
+    const auto rows = uint64_t(active) * (worker + 1) / workers - uint64_t(active) * worker / workers;
+    return args.cooperative_chunks ? kvaf::GatherCooperativeChunkBytes(rows * token, args.cooperative_chunks) : args.pipeline_chunk_bytes;
+  }
   void CheckDescriptor(uint32_t worker) {
     assert(aiv_model::raw_copies.empty());  // Ready before the NIC reads HBM.
     const uint32_t first = uint64_t(active) * worker / workers;
     const uint32_t last = uint64_t(active) * (worker + 1) / workers;
     const auto* local = workspace.data() + args.descriptor_offset + worker * args.lane_descriptor_bytes;
     const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(local);
-    assert(h->magic == (args.pipeline_shards ? kvaf::kGatherShardMagic : kvaf::peer::kGatherDescriptorMagic) && h->sequence == args.sequence);
+    assert(h->magic == (args.pipeline_shards ? kvaf::kGatherShardMagic : args.cooperative_chunks ? kvaf::kGatherCooperativeMagic : kvaf::peer::kGatherDescriptorMagic) && h->sequence == args.sequence);
     assert(h->staging_address == args.remote_staging + worker * args.lane_staging_bytes);
     assert(h->span_count == last - first && h->total_bytes == (last - first) * token);
-    assert(h->pipeline_chunk_bytes == args.pipeline_chunk_bytes && h->span_bytes == token && h->ready_bytes == (args.pipeline_shards ? args.sgl_size : 0));
+    assert(h->pipeline_chunk_bytes == ChunkBytes(worker) && h->span_bytes == token && h->ready_bytes == (args.pipeline_shards ? args.sgl_size : 0));
     const auto* spans = reinterpret_cast<const kvaf::peer::GatherSpan*>(local + sizeof(*h));
     for (uint32_t i = first; i < last; ++i) {
       const auto& span = spans[i - first];
@@ -367,12 +373,12 @@ struct Fixture {
     ++ready_reads[worker];
     auto* h = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(
         args.remote_descriptor + worker * args.lane_descriptor_bytes);
-    assert(h->sequence == args.sequence && h->pipeline_chunk_bytes == args.pipeline_chunk_bytes);
+    assert(h->sequence == args.sequence && h->pipeline_chunk_bytes == ChunkBytes(worker));
     if (!queues[worker * 2]->posted.empty()) queried_with_data_inflight = true;
     if (timeout || prepare_error || ready_reads[worker] <= ready_idle) return;
     const auto begin = h->ready_bytes;
     const auto end = std::min<uint64_t>(h->total_bytes,
-        begin + uint64_t(args.pipeline_chunk_bytes) * ready_step);
+        begin + uint64_t(h->pipeline_chunk_bytes) * ready_step);
     const auto* spans = reinterpret_cast<const kvaf::peer::GatherSpan*>(h + 1);
     for (auto offset = begin; offset < end;) {
       const auto index = offset / token, in_span = offset % token;
@@ -480,13 +486,15 @@ struct Fixture {
             auto* c = reinterpret_cast<kvaf::peer::GatherControl*>(args.remote_control) + worker;
             assert(c->notify == args.sequence);
             const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(c->command);
-            assert(h->pipeline_chunk_bytes == args.pipeline_chunk_bytes && h->sequence == args.sequence);
+            assert(h->pipeline_chunk_bytes == ChunkBytes(worker) && h->sequence == args.sequence);
             if (!args.pipeline_chunk_bytes) {
               kvaf::peer::CpuGatherExecutor cpu(remote.data(), Address(remote.data()), 2);
               assert(cpu.PrepareDirect(remote.size(), c->command, args.sequence, count));
               cpu.Copy();
-              read_vf_begin[worker] = aiv_model::vf_calls;
-              read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
+              if (!args.prepare_ahead) {
+                read_vf_begin[worker] = aiv_model::vf_calls;
+                read_overlap_begin[worker] = aiv_model::vf_with_pending_mte3;
+              }
             } else {
               assert(args.pipeline_shards || h->ready_bytes == h->total_bytes);
               assert(!queues[worker * 2]->posted.empty());
@@ -574,11 +582,14 @@ struct Fixture {
             const bool defer_progress = delay_progress_cq && q % 2 && op == kRead &&
                 (args.pipeline_shards == 2 ? packed_query_had_backlog[worker] :
                   args.pipeline_shards || first_read_ready[worker]) && remote_address == progress_end;
-            if ((hold_data_cq_for_ack && !(q % 2) && !cpu_done[worker]) || defer_progress) {
+            const bool defer_initial = delay_first_control_cq && q % 2 && op == kRead &&
+                (args.pipeline_chunk_bytes ? ready_reads[worker] : ack_reads[worker]) == 1 &&
+                (remote_address == progress_end || remote_address == args.remote_control + worker * 64 + 16);
+            if ((hold_data_cq_for_ack && !(q % 2) && !cpu_done[worker]) || defer_progress || defer_initial) {
               assert(!m.deferred_cq);
               m.deferred_cq = true;
               m.deferred_word = completion_word;
-              m.release_vf = defer_progress ? aiv_model::vf_calls + 1 : UINT64_MAX;
+              m.release_vf = defer_progress || defer_initial ? aiv_model::vf_calls + 1 : UINT64_MAX;
             } else {
               m.cq[m.cq_pi % 2][0] = completion_word;
               ++m.cq_pi; ++completions;
@@ -669,6 +680,8 @@ struct Fixture {
       assert(p.requests == rows && p.data_wrs == status[core].data_wrs);
       assert(p.packed_posts == uint64_t(rows && args.pipeline_shards == 2));
       assert(p.progress_mode == (rows ? args.progress_mode : 0));
+      assert(p.prepare_ahead == (rows ? args.prepare_ahead : 0));
+      assert(p.cooperative_chunks == (rows ? args.cooperative_chunks : 0));
       if (rows && args.pipeline_shards == 2) assert(p.read_vf_calls == p.data_doorbells);
       if (!rows) {
         assert(p.input_done_cycle == p.read_done_cycle);
@@ -678,13 +691,13 @@ struct Fixture {
         assert((args.pipeline_shards ? p.ack_queries >= 3 : p.ack_queries == 3) && p.data_wqebbs >= p.data_wrs);
         assert(p.data_doorbells && p.data_cq_wait_cycles && p.read_build_cycles);
         if (args.pipeline_chunk_bytes) {
-          assert(p.pipeline_chunk_bytes == args.pipeline_chunk_bytes);
+          assert(p.pipeline_chunk_bytes == ChunkBytes(core));
           assert(p.ready_queries == (args.progress_mode == kvaf::kGatherProgressPush ? 0 : ready_reads[core]) && p.ready_wait_cycles);
           assert(p.notify_done_cycle < p.first_ready_cycle && p.first_ready_cycle < p.first_read_submit_cycle);
           assert(p.first_read_ready_bytes == first_read_ready[core]);
           assert(p.first_read_submit_cycle < p.ack_done_cycle && p.ack_done_cycle < p.read_done_cycle);
           assert(p.ack_done_cycle < p.kernel_finish_cycle);
-        } else {
+        } else if (!args.prepare_ahead) {
           assert(p.data_cq_wait_cycles + p.read_build_cycles <= p.read_done_cycle - p.ack_done_cycle);
         }
       }
@@ -709,8 +722,82 @@ void Poll(void* p) { fixture->Poll(p); }
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
-  const auto& metadata = KvafGatherBatchGetAivKernelV7_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV8_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
+  // Stage 1: WQEs precede the final ACK, but no payload READ does. Stage 2's
+  // prefix gate must also submit a short ready slice of a 128-WR UB bank.
+  for (uint32_t chunk : {0U, 64U, 4096U, 131072U})
+    for (uint32_t depth : {16U, 32768U}) {
+      Fixture f(1541, 656, 3, KVAF_SEQ_GATHER, 6);
+      f.args.prepare_ahead = 1; f.args.pipeline_chunk_bytes = chunk;
+      f.delay_first_control_cq = true;
+      f.args.max_polls = 8192; f.DataQueueDepth(depth); f.EnableProfile();
+      f.Run(); f.CheckProfiles(); assert(f.prefetched_during_vf);
+      for (uint32_t core = 0; core < f.workers; ++core) {
+        const auto& p = f.profiles[core];
+        assert(p.prepare_ahead && p.prepare_ahead_wrs && p.prepare_ahead_cycles);
+        assert(p.read_vf_calls == (depth == 16 ? (p.data_wrs + 3) / 4 : (p.data_wrs + 127) / 128));
+        if (chunk && chunk < 131072) assert(p.first_read_ready_bytes < 128U * 6U * 656U);
+      }
+      f.Next(137); f.Run(); f.CheckProfiles();
+      f.Next(0); f.Run(); f.CheckProfiles();
+    }
+  for (uint32_t failure = 0; failure < 5; ++failure) {
+    Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.DataQueueDepth(32768);
+    f.timeout = failure == 0; f.ack_error = failure == 1;
+    f.data_timeout = failure == 2; f.data_cq_error = failure == 3;
+    if (failure == 4) f.queues[1]->fail_cq_at = 1;
+    f.Run(false, failure == 2 || failure == 3);
+    assert(f.states[0].poisoned && f.states[1].poisoned);
+  }
+  for (uint32_t chunks : {2U, 4U, 8U})
+    for (uint32_t token : {656U, 4096U})
+      for (uint32_t depth : {16U, 32768U}) {
+        Fixture f(1541, token, 3, KVAF_SEQ_GATHER, 6);
+        f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;
+        f.args.pipeline_chunk_bytes = 131072; f.DataQueueDepth(depth); f.EnableProfile();
+        f.hold_data_cq_for_ack = depth == 32768;
+        f.Run(); f.CheckProfiles();
+        for (uint32_t core = 0; core < f.workers; ++core) {
+          const auto& p = f.profiles[core];
+          assert(p.cooperative_chunks == chunks && !p.progress_mode && !p.packed_posts);
+          assert(p.first_read_ready_bytes < p.requests * token);
+          assert(p.read_vf_calls == (depth == 16 ? (p.data_wrs + 3) / 4 : (p.data_wrs + 127) / 128));
+        }
+        f.Next(1); f.Run(); f.CheckProfiles();  // Empty lanes and a sub-WR final prefix.
+      }
+  for (bool coalesce : {false, true})
+    for (uint32_t sgl : {1U, 13U}) {
+      Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, sgl);
+      f.args.prepare_ahead = 1; f.args.cooperative_chunks = 4;
+      f.args.pipeline_chunk_bytes = 131072; f.args.coalesce_sges = coalesce;
+      if (coalesce) f.ConsecutiveReadRows(true);
+      f.DataQueueDepth(32768); f.EnableProfile(); f.Run(); f.CheckProfiles();
+    }
+  for (uint32_t fault : {1U, 2U, 3U, 4U, 5U, 6U}) {
+    Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = 4;
+    f.args.pipeline_chunk_bytes = 131072; f.ready_fault = fault; f.DataQueueDepth(32768);
+    f.Run(false, fault == 3 || fault == 5);
+    assert(f.states[0].poisoned && f.states[1].poisoned);
+  }
+  for (uint32_t chunks : {0U, 4U}) {
+    Fixture f(1541, 656, 3, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;
+    f.args.pipeline_chunk_bytes = chunks ? 131072 : 0;
+    f.DataQueueDepth(16); f.Run();  // Production profile=off reads no clock.
+  }
+  for (uint32_t failure = 0; failure < 5; ++failure) {
+    Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = 4;
+    f.args.pipeline_chunk_bytes = 131072; f.DataQueueDepth(32768);
+    f.timeout = failure == 0; f.ack_timeout = failure == 1;
+    f.ack_error = failure == 2; f.data_timeout = failure == 3;
+    if (failure == 4) f.queues[1]->fail_cq_at = 1;
+    f.Run(false, failure > 0 && failure < 4);
+    assert(f.states[0].poisoned && f.states[1].poisoned);
+  }
   // GDR3 consumers must read later ready shards before delayed shard zero,
   // retain in-flight READs across shards, and finish ACK before data-CQ drain.
   for (uint32_t cores : {1U, 3U, 8U})

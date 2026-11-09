@@ -21,10 +21,14 @@ std::uint64_t ThreadCpuNs() {
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
   const bool sharded = header.magic == kGatherShardMagic;
+  const bool cooperative = header.magic == kGatherCooperativeMagic;
   if (bytes < 64U || base > UINT64_MAX - bytes ||
-      (!sharded && header.magic != kGatherDescriptorMagic) ||
+      (!sharded && !cooperative && header.magic != kGatherDescriptorMagic) ||
       header.span_count == 0U ||
       (!sharded && header.ready_bytes != 0U) ||
+      (cooperative && (!header.pipeline_chunk_bytes ||
+       (std::uint64_t(header.total_bytes) + header.pipeline_chunk_bytes - 1U) /
+           header.pipeline_chunk_bytes > kGatherMaxCooperativeChunks)) ||
       (sharded && (!header.pipeline_chunk_bytes || !header.span_bytes ||
                    !header.sequence || header.sequence > UINT32_MAX ||
                    !header.ready_bytes || header.ready_bytes > 13U ||
@@ -77,6 +81,7 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   }
   pipeline_ready_ = nullptr;
   shard_progress_ = nullptr;
+  cooperative_ = header.magic == kGatherCooperativeMagic;
   if (header.magic == kGatherShardMagic) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
     shard_sgl_ = static_cast<std::uint32_t>(header.ready_bytes);
@@ -169,6 +174,28 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
 }
 
 std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
+  if (cooperative_) {
+    std::uint64_t copied = 0;
+    for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
+      const auto begin = std::uint64_t(chunk) * pipeline_chunk_bytes_;
+      const auto end = std::min(begin + pipeline_chunk_bytes_, total_bytes_);
+      // Partition aligned cache lines inside EACH prefix block, including a
+      // short tail. Empty shares still participate in block completion.
+      const auto lines = (end - begin + 63U) / 64U;
+      const auto local_begin = std::min(end, begin + lines * worker / active_threads_ * 64U);
+      const auto local_end = std::min(end, begin + lines * (worker + 1U) / active_threads_ * 64U);
+      copied += CopyRange(local_begin, local_end);
+      if (local_begin != local_end) GatherBarrier();
+      auto& progress = cooperative_progress_[chunk];
+      // The acquire chain collects every writer's completed payload stores.
+      if (progress.remaining.fetch_sub(1U, std::memory_order_acq_rel) == 1U) {
+        progress.complete.store(true, std::memory_order_release);
+        PublishCooperativeReady();
+      }
+      if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
+    }
+    return copied;
+  }
   if (shard_progress_ != nullptr) {
     std::uint64_t copied = 0U;
     const auto wr_bytes = std::uint64_t(shard_sgl_) * span_bytes_;
@@ -232,7 +259,7 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
 }
 
 void CpuGatherExecutor::PublishReady() {
-  if (pipeline_ready_ == nullptr) return;
+  if (pipeline_ready_ == nullptr || cooperative_) return;
   auto copied = std::min(total_bytes_, static_cast<std::uint64_t>(ready_tasks_) * task_bytes_);
   while (ready_tasks_ < task_progress_.size()) {
     const auto begin = static_cast<std::uint64_t>(ready_tasks_) * task_bytes_;
@@ -247,6 +274,24 @@ void CpuGatherExecutor::PublishReady() {
     __atomic_store_n(pipeline_ready_, ready, __ATOMIC_RELEASE);
     GatherBarrier();
     published_bytes_ = ready;
+  }
+}
+
+void CpuGatherExecutor::PublishCooperativeReady() {
+  std::uint32_t completed = 0;
+  while (completed < cooperative_count_ &&
+         cooperative_progress_[completed].complete.load(std::memory_order_acquire))
+    ++completed;
+  const auto ready = std::min(total_bytes_, std::uint64_t(completed) * pipeline_chunk_bytes_);
+  auto previous = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
+  // At most eight block finishers publish per batch. Concurrent finishers may
+  // coalesce prefixes, but a delayed earlier finisher must never regress ready.
+  while (previous < ready) {
+    if (__atomic_compare_exchange_n(pipeline_ready_, &previous, ready, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      GatherBarrier();
+      break;
+    }
   }
 }
 

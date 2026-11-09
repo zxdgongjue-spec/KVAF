@@ -550,6 +550,10 @@ class NpuPythonRuntime final {
       item["ready_local_updates"] = p.ready_local_updates;
       item["ready_ack_checks"] = p.ready_ack_checks;
       item["ready_control_wrs"] = p.ready_control_wrs;
+      item["prepare_ahead"] = p.prepare_ahead;
+      item["cooperative_chunks"] = p.cooperative_chunks;
+      item["prepare_ahead_wrs"] = p.prepare_ahead_wrs;
+      item["prepare_ahead_cycles"] = p.prepare_ahead_cycles;
       cores.append(std::move(item));
     }
     py::dict result;

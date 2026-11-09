@@ -62,6 +62,7 @@ COUNTERS = (
     "read_vf_calls", "ready_no_change_queries", "ready_query_skips", "max_ready_backlog_wrs",
     "ready_idle_waits", "multi_run_posts", "packed_posts", "read_plan_segments",
     "progress_mode", "ready_local_polls", "ready_local_updates", "ready_ack_checks", "ready_control_wrs",
+    "prepare_ahead", "cooperative_chunks", "prepare_ahead_wrs", "prepare_ahead_cycles",
 )
 PIPELINE_EVENTS = ("first_ready_cycle", "first_read_submit_cycle")
 
@@ -74,6 +75,20 @@ def configured_chunk_bytes() -> int:
     if chunk > (1 << 32) - 1 or (chunk and chunk % 64):
         raise ValueError("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64")
     return chunk
+
+
+def configured_cooperative_chunks() -> int:
+    value = os.environ.get("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "0") or "0"
+    if value not in ("0", "2", "4", "8"):
+        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8")
+    return int(value)
+
+
+def configured_prepare_ahead() -> int:
+    value = os.environ.get("KVAF_AIV_GATHER_PREPARE_AHEAD", "")
+    if value not in ("", "0", "1"):
+        raise ValueError("KVAF_AIV_GATHER_PREPARE_AHEAD must be 0 or 1")
+    return int(value) if value else int(bool(configured_cooperative_chunks()))
 
 
 def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
@@ -102,6 +117,13 @@ def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
 
 def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
+    cooperative = configured_cooperative_chunks()
+    prepare = configured_prepare_ahead()
+    if cooperative and (not prepare or not configured_chunk_bytes()):
+        raise ValueError("COOPERATIVE_CHUNKS requires PREPARE_AHEAD=1 and nonzero CHUNK_BYTES")
+    if prepare and not cooperative and configured_chunk_bytes() and \
+            (os.environ.get("KVAF_AIV_GATHER_SHARD_PIPELINE", "1") or "1") != "0":
+        raise ValueError("PREPARE_AHEAD requires whole-batch or SHARD_PIPELINE=0")
     configured_chunk_bytes()
     if (os.environ.get("KVAF_AIV_GATHER_PROGRESS_MODE", "pull") or "pull") not in ("legacy", "pull", "push"):
         raise ValueError("KVAF_AIV_GATHER_PROGRESS_MODE must be legacy/pull/push")
@@ -131,6 +153,8 @@ def validate_config(cores: int) -> None:
         raise ValueError("token offsets must fit int32")
     if not 1 <= cores <= 8 or not 1 <= GATHER_SGL_SIZE <= 13:
         raise ValueError("KVAF_NPU_CORE_COUNT must be 1..8 and GATHER_SGL_SIZE 1..13")
+    if prepare and TOKEN_BYTES * GATHER_SGL_SIZE > 65536:
+        raise ValueError("PREPARE_AHEAD requires TOKEN_BYTES * GATHER_SGL_SIZE <= 65536")
     layout = os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random")
     if layout not in ("random", "segmented", "contiguous"):
         raise ValueError("KVAF_GATHER_OUTPUT_LAYOUT must be random, segmented or contiguous")
@@ -289,7 +313,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -303,6 +327,8 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "coalesce_sges": int(os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES", "0") or "0"),
         "configured_chunk_bytes": configured_chunk_bytes(),
+        "configured_prepare_ahead": configured_prepare_ahead(),
+        "configured_cooperative_chunks": configured_cooperative_chunks(),
         "configured_progress_mode": os.environ.get("KVAF_AIV_GATHER_PROGRESS_MODE", "pull") or "pull",
         "configured_packed_posts": int(os.environ.get("KVAF_AIV_GATHER_PACKED_POSTS", "1") or "1"),
         "configured_shard_pipeline": int(os.environ.get("KVAF_AIV_GATHER_SHARD_PIPELINE", "1") or "1"),

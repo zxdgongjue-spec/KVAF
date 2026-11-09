@@ -21,7 +21,7 @@ bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_r
 bool wrong_gather_probe_wrs{};
 uint32_t last_coalesce_sges{}, last_progress_mode{}, progress_setups{};
 bool fail_progress_setup{}, progress_live{};
-uint32_t last_pipeline_chunk_bytes{}, last_pipeline_shards{};
+uint32_t last_pipeline_chunk_bytes{}, last_pipeline_shards{}, last_prepare_ahead{}, last_cooperative_chunks{};
 uint32_t capture_queries{};
 bool allow_queued_launches{};
 int async_memsets{}, status_copies{}, stream_syncs{};
@@ -97,6 +97,8 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
   last_pipeline_shards = a->pipeline_shards;
   last_progress_mode = a->progress_mode;
+  last_prepare_ahead = a->prepare_ahead;
+  last_cooperative_chunks = a->cooperative_chunks;
   if (a->probe) assert(!last_pipeline_chunk_bytes);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
@@ -139,8 +141,11 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         p.kernel_finish_cycle = 106;
         p.requests = statuses[i].requests + (fault == 6);
         p.data_wrs = statuses[i].data_wrs + (fault == 7);
+        p.prepare_ahead = p.requests ? args.prepare_ahead : 0;
+        p.cooperative_chunks = p.requests ? args.cooperative_chunks : 0;
         if (args.pipeline_chunk_bytes && p.requests) {
-          p.pipeline_chunk_bytes = args.pipeline_chunk_bytes;
+          p.pipeline_chunk_bytes = args.cooperative_chunks ?
+              kvaf::GatherCooperativeChunkBytes(p.requests * args.request.token_bytes, args.cooperative_chunks) : args.pipeline_chunk_bytes;
           p.packed_posts = args.pipeline_shards == 2;
           p.progress_mode = args.progress_mode;
           p.ack_done_cycle = 106;
@@ -512,7 +517,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=248", "record_bytes=320"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=256", "record_bytes=384"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);
@@ -686,5 +691,48 @@ int main() {
   setenv("KVAF_AIV_GATHER_PROGRESS_MODE", "invalid", 1);
   { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
   unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
+  setenv("KVAF_AIV_GATHER_CHUNK_BYTES", "0", 1);
+  for (const char* setting : {"0", "1"}) {
+    setenv("KVAF_AIV_GATHER_PREPARE_AHEAD", setting, 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    unsetenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
+    assert(owner->Execute(exec).ok() && last_prepare_ahead == uint32_t(*setting - '0'));
+    GatherBatchGetProfile profile;
+    assert(owner->CopyGatherProfile(&profile).ok());
+    for (const auto& lane : profile.cores)
+      assert(lane.prepare_ahead == (lane.requests ? last_prepare_ahead : 0));
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  setenv("KVAF_AIV_GATHER_PREPARE_AHEAD", "invalid", 1);
+  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
+  unsetenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
+  unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
+  for (const char* count : {"2", "4", "8"}) {
+    setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    unsetenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
+    assert(owner->Execute(exec).ok());
+    assert(last_cooperative_chunks == std::strtoul(count, nullptr, 10));
+    assert(last_prepare_ahead == 1 && !last_pipeline_shards && !last_progress_mode);
+    GatherBatchGetProfile profile;
+    assert(owner->CopyGatherProfile(&profile).ok());
+    for (const auto& lane : profile.cores)
+      assert(lane.cooperative_chunks == (lane.requests ? last_cooperative_chunks : 0));
+    assert(owner->Shutdown().ok() && !allocations && !refs && !progress_live);
+  }
+  for (const char* count : {"1", "3", "16", "-2", "4x"}) {
+    setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
+  }
+  setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "4", 1);
+  setenv("KVAF_AIV_GATHER_PREPARE_AHEAD", "0", 1);
+  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
+  unsetenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
+  setenv("KVAF_AIV_GATHER_CHUNK_BYTES", "0", 1);
+  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
+  unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
+  unsetenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
   std::cout << "sequential Host lifecycle: PASS\n";
 }

@@ -104,6 +104,7 @@ struct GatherBatchGetCoreProfile {
   std::uint64_t packed_posts{}, read_plan_segments{};
   std::uint64_t progress_mode{}, ready_local_polls{}, ready_local_updates{};
   std::uint64_t ready_ack_checks{}, ready_control_wrs{};
+  std::uint64_t prepare_ahead{}, cooperative_chunks{}, prepare_ahead_wrs{}, prepare_ahead_cycles{};
 };
 
 struct GatherBatchGetProfile {

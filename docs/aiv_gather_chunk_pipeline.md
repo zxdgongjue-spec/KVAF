@@ -1,5 +1,7 @@
 # CPU gather 与 payload READ 分块流水
 
+新增可独立对照的 [V8 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)，部署需使用 V8 kernel / args 256 B / profile 384 B。下文的旧版本尺寸为历史记录。
+
 当前默认已升级为 [GDR3 独立分片进度与 V5 调用快路径](aiv_gather_shard_pipeline.md)。
 以下描述保留为 `KVAF_AIV_GATHER_SHARD_PIPELINE=0` 的连续前缀对照实现；
 部署请按新文档同时更新 CPU 服务与 NPU Host/Runtime/Python/kernel。

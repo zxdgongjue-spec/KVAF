@@ -65,6 +65,29 @@ class GatherPerfSummaryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "PROGRESS_MODE"):
                 perf.validate_config(2)
 
+    def test_preparation_and_cooperative_selection(self):
+        with patch.dict(os.environ, {"KVAF_AIV_GATHER_CHUNK_BYTES": "0",
+                                    "KVAF_AIV_GATHER_PREPARE_AHEAD": "1"}):
+            perf.validate_config(2)
+            self.assertEqual(self.csv_metadata()["configured_prepare_ahead"], 1)
+            self.assertEqual(self.csv_metadata()["configured_cooperative_chunks"], 0)
+        for chunks in ("2", "4", "8"):
+            with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": chunks,
+                                        "KVAF_AIV_GATHER_PREPARE_AHEAD": ""}):
+                perf.validate_config(2)
+                self.assertEqual(self.csv_metadata()["configured_prepare_ahead"], 1)
+                self.assertEqual(self.csv_metadata()["configured_cooperative_chunks"], int(chunks))
+        for name, value in (("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "3"),
+                            ("KVAF_AIV_GATHER_PREPARE_AHEAD", "true")):
+            with patch.dict(os.environ, {name: value}):
+                with self.assertRaisesRegex(ValueError, name):
+                    perf.validate_config(2)
+        for extra in ({"KVAF_AIV_GATHER_PREPARE_AHEAD": "0"},
+                      {"KVAF_AIV_GATHER_CHUNK_BYTES": "0"}):
+            with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": "4", **extra}):
+                with self.assertRaisesRegex(ValueError, "COOPERATIVE_CHUNKS"):
+                    perf.validate_config(2)
+
     def test_invalid_shapes_and_counts_fail_before_hardware(self):
         for field, value in (
             ("TOKEN_BYTES", 0), ("TOKEN_BYTES", 65536),
@@ -433,7 +456,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         self.assertEqual(metadata["run_directory"], "20261031_093235-cores3-token-bytes656-request-count1")
         self.assertEqual(metadata["started_at_local"], "2026-10-31T09:32:35+08:00")
         self.assertEqual(metadata["timezone"], "Asia/Shanghai")
-        self.assertEqual(metadata["schema_version"], 7)
+        self.assertEqual(metadata["schema_version"], 8)
 
     def test_csv_rejects_partial_or_invalid_profile_batches(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,7 @@
 # Gather V7：progress-only READ 与 CPU 进度 WRITE
 
+新增可独立对照的 [V8 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)，部署需使用 V8 kernel / args 256 B / profile 384 B。下文的旧版本尺寸为历史记录。
+
 本轮保留 V6 packed READ 的分片选择、WQE plan、双 bank、在途数据请求和尾 CQ。
 优化范围是进度发现通路。没有引入 scatter 的 payload WRITE、done 状态或 staging
 生命周期。GDR3 descriptor、generation-tagged completed-WR word 和 DDR 最终 ACK
