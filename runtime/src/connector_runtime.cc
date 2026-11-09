@@ -36,6 +36,16 @@ Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
 Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
                                   const PutHandle& put, Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
                                   Uint64ArrayView lengths) {
+  return SubmitCpuPullImpl(ready, put, src_offsets, dst_offsets, lengths, nullptr);
+}
+Status RuntimeCore::SubmitCpuPullAndWait(const ReadyToken& ready, const PutHandle& put,
+                                        Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
+                                        Uint64ArrayView lengths, std::uint32_t timeout_ms) {
+  return SubmitCpuPullImpl(ready, put, src_offsets, dst_offsets, lengths, &timeout_ms);
+}
+Status RuntimeCore::SubmitCpuPullImpl(const ReadyToken& ready, const PutHandle& put,
+                                     Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
+                                     Uint64ArrayView lengths, const std::uint32_t* timeout_ms) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
   if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
       !desc || !ready.sequence || !ready.mr_id || ready.mr_id > 4096 || !desc->mr_length)
@@ -91,7 +101,10 @@ Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
   p.request = {*desc, ready.sequence, std::move(copies), ready.mr_id};
   p.submitted = true; p.state = CpuPullState::Submitted;
   // Record the request on the caller's existing put before the first RPC.
-  try { status = access_operator_.SubmitCpuPull(p.request); }
+  try {
+    status = timeout_ms ? access_operator_.SubmitCpuPullAndWait(p.request, *timeout_ms, &p.state)
+                        : access_operator_.SubmitCpuPull(p.request);
+  }
   catch (const std::exception& e) { status = Status::InDoubt(std::string("CPU Pull submit exception: ")+e.what()); }
   if (!status.ok()) p.state = status.code() == StatusCode::kInDoubt ? CpuPullState::InDoubt : CpuPullState::Failed;
   return status;

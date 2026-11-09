@@ -114,10 +114,14 @@ void UnifiedBatchCpuPull() {
           "CPU rejects unknown source and the wrapper rolls back its internal Put");
   Require(payload_reads==reads,"invalid convenience calls do not submit READ");
   kvaf::CpuPullProfile profile;profile.total_us=1e12;
+  const int queries_before=server.query_calls, sync_before=server.sync_submit_calls, connections_before=server.connection_count;
   Ok(reader.BatchCpuPull({3,1},ready,offsets,lengths,1000,&profile));
+  Require(server.query_calls==queries_before&&server.sync_submit_calls==sync_before+1,
+          "synchronous batch uses one submit-and-wait without readiness/completion queries");
+  Require(server.connection_count==connections_before,"reader reuses initialized TCP connection for submit and complete");
   const auto stage_sum=profile.validation_us+profile.prepare_put_us+profile.dst_offsets_us+
-      profile.submit_cpu_pull_us+profile.wait_cpu_pull_us+profile.commit_put_us;
-  Require(profile.prepare_put_us>0&&profile.submit_cpu_pull_us>0&&profile.wait_cpu_pull_us>0&&
+      profile.submit_wait_cpu_pull_us+profile.wait_cpu_pull_us+profile.commit_put_us;
+  Require(profile.prepare_put_us>0&&profile.submit_wait_cpu_pull_us>0&&profile.wait_cpu_pull_us>0&&
           profile.commit_put_us>0&&profile.total_us>=stage_sum&&profile.total_us<1e12,
           "optional wrapper profile resets output and nests Host stage durations in native total");
   Require(!reader.pending_offload()&&source.frozen(),"success commits but never releases the producer batch");
@@ -131,6 +135,8 @@ void UnifiedBatchCpuPull() {
           "new call with occupied keys fails without replay");
   Require(!reader.ResolveCpuPull().ok(),"no hidden batch remains after success");
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+1,
+          "a completed Ready cannot be submitted as a new transaction after freeing its keys");
 
   // A successful submit followed by timeout retains the original owned arrays.
   Ok(source.Ready(views[1],&ready));hold_read=true;
@@ -146,15 +152,16 @@ void UnifiedBatchCpuPull() {
   offsets[0]=32;lengths[0]=64;
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
 
-  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::Submit);
+  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::SubmitAndWait);
   Require(reader.BatchCpuPull({3,1},ready,offsets,lengths).code()==kvaf::StatusCode::kInDoubt,"lost Submit retains hidden Put");
   Ok(reader.ResolveCpuPull(1000));Require(payload_reads==reads+3,"lost Submit resolves without another READ");
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
 
-  // Lost pre-submit query is a definite failure; Ready stays producer-owned.
-  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::Query);
-  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+3,
-          "pre-submit failure aborts slots without DMA");
+  // A rejected request was never accepted for DMA and can roll back locally.
+  Ok(source.Ready(views[1],&ready));
+  wrong=ready;++std::get<kvaf::CpuPullSourceDesc>(wrong.source).mr_length;
+  Require(!reader.BatchCpuPull({3,1},wrong,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+3,
+          "selected MR size mismatch is rejected before READ without a pre-submit query");
   Ok(source.CancelBatch(ready));
   Ok(source.Ready(views[1],&ready));Ok(source.CancelBatch(ready));
   Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload(),"cancelled Ready rolls back Put");
@@ -178,11 +185,44 @@ void UnifiedBatchCpuPull() {
   Require(payload_reads==committed,"commit recovery never replays READ");
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
 
+  // A disconnected blocking RPC must not cancel or automatically replay READ.
+  Ok(source.Ready(views[1],&ready));hold_read=true;server.disconnect_submit=true;
+  const int before_disconnect=payload_reads;
+  Require(reader.BatchCpuPull({3,1},ready,offsets,lengths,10).code()==kvaf::StatusCode::kInDoubt&&
+          reader.pending_offload(),"disconnect retains synchronous request and DDR reservations");
+  hold_read=false;Ok(reader.ResolveCpuPull(1000));
+  Require(payload_reads==before_disconnect+1,"reconnect queries the original READ without replay");
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
+  Ok(source.Ready(views[1],&ready));fail_select=true;
+  const int before_select=payload_reads;
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).ok()&&!reader.pending_offload()&&
+          payload_reads==before_select,"terminal MR selection failure aborts without starting READ");
+  fail_select=false;Ok(source.ReleaseBatch(ready));
+
+  // Another connection must be able to query while the blocking RPC waits.
+  Ok(source.Ready(views[1],&ready));hold_read=true;
+  const int before_wait=payload_reads;
+  Status blocking_status;std::atomic<bool> returned{false};
+  std::thread blocking_reader([&]{
+    blocking_status=reader.BatchCpuPull({3,1},ready,offsets,lengths,1000);
+    returned=true;
+  });
+  for(int i=0;i<1000&&payload_reads==before_wait&&!returned;++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool premature_reuse=source.ReleaseBatch(ready).ok();
+  const bool waiter_active=!returned;
+  hold_read=false;blocking_reader.join();
+  Ok(blocking_status);
+  Require(!premature_reuse&&waiter_active,"producer Query is served while synchronous READ remains in flight");
+  Require(payload_reads==before_wait+1,"blocking response waits for exactly one READ");
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
   // The generic recovery entry must not consume an application's explicit Put.
   Ok(reader.PreparePut({0},{8},&explicit_put));
   Require(!reader.ResolveCpuPull().ok()&&reader.pending_offload(),"explicit transactions require their original handle");
   Ok(reader.AbortPut(explicit_put));
-  Ok(source.Ready(views[1],&ready));hold_read=true;server.drop=unsigned(rp::Command::Submit);
+  Ok(source.Ready(views[1],&ready));hold_read=true;server.drop=unsigned(rp::Command::SubmitAndWait);
   Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok(),"retain for shutdown");
   Require(!reader.Shutdown().ok()&&reader.pending_offload(),"shutdown cannot free active DMA");
   hold_read=false;
@@ -433,11 +473,12 @@ void MultipleMemorySource() {
     Require(desc.mr_length==tensors[index].size(),"Ready carries only the selected MR length");
     if(n==50) {
       auto wrong=ready;std::get<kvaf::CpuPullSourceDesc>(wrong.source).mr_length++;
-      const int queries=server.query_calls,submits=server.submit_calls;
+      const int queries=server.query_calls,submits=server.submit_calls,sync_submits=server.sync_submit_calls;
       Require(!reader.BatchCpuPull({1,2},wrong,std::vector<std::uint64_t>{7,300},{64,32}).ok()&&
               !reader.pending_offload(),"CPU checks the selected MR size without an initialization manifest exchange");
-      Require(server.query_calls==queries+1&&server.submit_calls==submits&&payload_reads==reads+50,
-              "invalid selected MR stops at pre-submit Query without READ");
+      Require(server.query_calls==queries&&server.submit_calls==submits&&
+              server.sync_submit_calls==sync_submits+1&&payload_reads==reads+50,
+              "synchronous Submit validates selected MR before READ without a pre-submit Query");
     }
     auto stale=ready;stale.mr_id=index==0?2:1;
     Require(!source.ReleaseBatch(stale).ok()&&!source.CancelBatch(stale).ok(),"producer acknowledgement binds MR");

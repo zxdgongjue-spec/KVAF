@@ -2,6 +2,7 @@
 #include "access_operator.h"
 #include "peer_link.h"
 #include "remote_offload.h"
+#include "remote_pull_service.h"
 
 namespace kvaf {
 // A's dispatcher shares one Core/MetaManager/allocator. AIV and CPU Pull have
@@ -19,9 +20,11 @@ class RemotePullOperator final : public AccessOperator {
   Status LastChecksum(std::uint64_t*) const;
   Status ValidateCpuSource(const CpuPullSourceDesc&) override;
   Status SubmitCpuPull(const CpuPullRequest&) override;
+  Status SubmitCpuPullAndWait(const CpuPullRequest&, std::uint32_t, CpuPullState*) override;
   Status QueryCpuPull(CpuPullState*) override;
   bool pending() const { return active_; }
  private:
+  Status BuildSpans(const CpuPullRequest&, std::vector<remote_pull::Span>*) const;
   AccessOperator* aiv_{};
   std::shared_ptr<peer::PeerLink> link_;
   OffloadRegionTicket ticket_;
@@ -29,5 +32,6 @@ class RemotePullOperator final : public AccessOperator {
   CpuPullRequest current_;
   bool active_{};
   bool committed_{};
+  mutable remote_pull::ControlChannel channel_;
 };
 }

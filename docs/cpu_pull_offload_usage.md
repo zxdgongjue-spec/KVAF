@@ -1,6 +1,6 @@
 # CPU Pull 构建与验证
 
-当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，控制协议使用 KVRP v6；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
+当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，控制协议使用 KVRP v7；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
 
 ## CPU 服务
 
@@ -48,8 +48,9 @@ CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 
 ## 统一 CPU Pull 便利入口
 
-本卡和非本卡都使用已注册源的 ReadyToken，一次调用完成 PreparePut、目的地址组织、
-Submit、Wait 和 Commit。原来直接传本卡 tensor/stream 的形式已删除。
+本卡和非本卡都使用已注册源的 ReadyToken。一次调用在内部准备 DDR 槽位、组织目的偏移、
+提交并等待 READ 完成，最后提交元数据。读取端复用 TCP 长连接；正常路径没有提交前 Query，
+也没有完成轮询。原来直接传本卡 tensor/stream 的形式已删除。
 下面将生产和消费代码写在同一进程，跨进程时通过应用 Connector 交换 DDR ticket、ready 和完成通知：
 
 ```python
@@ -85,8 +86,9 @@ keys、src_offsets、lengths 使用三个等长的 Host 整数序列或连续一
 始终由生产端应用管理，便利入口不接收 stream 或 tensor，也不自动释放 Ready。
 自定义槽内布局或一 key 多源段继续使用显式 `prepare_put/submit_cpu_pull/wait_cpu_pull/commit_put`。
 
-`timeout=None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000 毫秒）。其语义与
-`wait_cpu_pull` 相同，只控制完成轮询，不覆盖单次网络 RPC 超时。
+`timeout=None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000 毫秒），控制 CPU 接受同步任务后
+等待 READ 完成的时间；0 表示提交后立即检查，不等待。客户端接收超时为该预算加 5 秒控制通信余量，
+连接和发送超时仍为 5 秒。超时不会取消 READ。显式 `wait_cpu_pull` 和异常恢复仍使用 Query 查询原任务。
 明确失败内部 Abort；DMA 未决时保留内部 Put 和槽位，保持源数据不变，用
 `runtime.resolve_cpu_pull(timeout=30000)` 恢复。恢复只查询/等待原任务并 Commit/Abort，
 不重新发起 READ；成功提交返回 None，失败或仍未决抛异常。
@@ -153,7 +155,10 @@ CPU 的 `CPU_PULL_PROBE_END` 记录每个 MR 的探测结果，失败时包含�
 
 bench 现在每批仅调用一次 `runtime.batch_cpu_pull(keys, ready, src_offsets, lengths)`，
 不再在 Python 分别执行 Prepare/Submit/Wait/Commit，也不在 Python 组织目的偏移数组。
-当前描述符格式要求 CPU service、NPU 运行库和 Python 扩展配套重编译、重启；四 Jetty READ 数据面与计时边界未变化。
+KVRP v7 增加 SubmitAndWait，服务端在 READ 完成或等待超时后回复，读取端复用长连接。
+CPU service、NPU 运行库和 Python 扩展需要配套重编译、重启；四 Jetty READ 数据面与调用总计时边界不变。
+服务端每个连接独立处理请求，共享 DDR/会话状态由同一控制锁保护。
+等待 READ 时释放控制锁，生产端 Query、Ready/Release 和其他连接的控制请求可继续处理。
 
 CPU 服务开启统计后，每个源连接独立累计 READ 样本，正常注销源时输出汇总；READ
 失败时也会输出当时的汇总。探测与校验 RPC 不计入样本。可沿用已有构建目录，例如：
@@ -200,13 +205,13 @@ bench 默认传入 `profile=True`，输出以下阶段（均为消费端 Host �
 | `validation` | 初始化状态、批次数量、Ready 类型/MR 和源范围检查 |
 | `prepare_put` | 内部 PreparePut，分配并预留 DDR 槽位 |
 | `dst_offsets` | C++ 提取槽位地址并减 DDR base |
-| `submit_cpu_pull` | 内部 Submit，包括请求检查、快照和控制 RPC |
-| `wait_cpu_pull` | 内部完成轮询与等待；不是 CPU READ 纯传输耗时 |
+| `submit_wait_cpu_pull` | 内部同步提交，包括请求检查、快照、控制 RPC、CPU READ 和完成响应等待 |
+| `wait_cpu_pull` | 返回后检查已缓存的完成状态；正常成功路径不发送 Query、不休眠 |
 | `commit_put` | 元数据提交及 CPU 完成确认 |
 | `native_other` | native_total 减去六个内部阶段之和 |
 | `python_and_binding_other` | total 减 binding_prepare 与 native_total，包含分派、GIL 和结果字典转换等 |
 
-`native_total = validation + prepare_put + dst_offsets + submit_cpu_pull + wait_cpu_pull + commit_put + native_other`；
+`native_total = validation + prepare_put + dst_offsets + submit_wait_cpu_pull + wait_cpu_pull + commit_put + native_other`；
 `total = binding_prepare + native_total + python_and_binding_other`。父子计时存在包含关系，不能把所有行累加。
 
 reader 另列 `last_offload_checksum`、`verification`、`batch_free`，均不包含在 `total` 中；

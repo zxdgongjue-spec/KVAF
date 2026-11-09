@@ -50,6 +50,9 @@ class AccessOperator {
   virtual Status SubmitCpuPull(const CpuPullRequest&) {
     return Status::NotImplemented("CPU Pull submission is unavailable");
   }
+  virtual Status SubmitCpuPullAndWait(const CpuPullRequest&, std::uint32_t, CpuPullState*) {
+    return Status::NotImplemented("synchronous CPU Pull submission is unavailable");
+  }
   virtual Status QueryCpuPull(CpuPullState*) {
     return Status::NotImplemented("CPU Pull query is unavailable");
   }

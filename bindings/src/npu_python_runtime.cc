@@ -263,11 +263,11 @@ class NpuPythonRuntime final {
     timing["validation_us"] = profile.validation_us;
     timing["prepare_put_us"] = profile.prepare_put_us;
     timing["dst_offsets_us"] = profile.dst_offsets_us;
-    timing["submit_cpu_pull_us"] = profile.submit_cpu_pull_us;
+    timing["submit_wait_cpu_pull_us"] = profile.submit_wait_cpu_pull_us;
     timing["wait_cpu_pull_us"] = profile.wait_cpu_pull_us;
     timing["commit_put_us"] = profile.commit_put_us;
     timing["native_other_us"] = std::max(0.0, profile.total_us - profile.validation_us
-        - profile.prepare_put_us - profile.dst_offsets_us - profile.submit_cpu_pull_us
+        - profile.prepare_put_us - profile.dst_offsets_us - profile.submit_wait_cpu_pull_us
         - profile.wait_cpu_pull_us - profile.commit_put_us);
     py::dict result;
     result["profile"] = std::move(timing);

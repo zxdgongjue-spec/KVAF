@@ -2,10 +2,12 @@
 #include "offload_fake_transport.h"
 #include "remote_pull_service.h"
 #include <map>
+#include <set>
+#include "runtime_service_loop.h"
 namespace rp = kvaf::remote_pull;
 using kvaf::Status;
 std::atomic<int> payload_reads{0}, scratch_reads{0}, checksum_calls{0}, leases{0};
-std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_read{false}, fail_checksum{false};
+std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_read{false}, fail_checksum{false}, fail_select{false};
 struct SharedBackend final : p::Backend {
   std::vector<std::uint8_t>& pool;
   p::MemoryDesc source{};
@@ -21,6 +23,7 @@ struct SharedBackend final : p::Backend {
   }
   Status AddSource(std::uint64_t id,const p::MemoryDesc& s) override { memories[id]=s;return Status::OK(); }
   Status SelectSource(std::uint64_t id) override {
+    if(fail_select)return Status::Internal("simulated MR selection failure");
     auto found=memories.find(id);if(found==memories.end())return Status::InvalidArgument("missing MR");
     source=found->second;return Status::OK();
   }
@@ -51,14 +54,16 @@ class SharedServer {
  public:
   std::vector<std::uint8_t> pool;
   rp::RegionInfo info{};
+  std::mutex control_mutex;
   rp::Service service{[this](std::uint64_t id,rp::RegionInfo* out){
     if(id!=info.id||pool.empty())return Status::NotFound("region");*out=info;return Status::OK();
-  },[this](const rp::RegionInfo&){return std::make_unique<SharedBackend>(pool);}};
+  },[this](const rp::RegionInfo&){return std::make_unique<SharedBackend>(pool);},&control_mutex};
   std::atomic<std::uint16_t> drop{0};
-  std::atomic<int> pool_allocations{0}, inspect_calls{0}, query_calls{0}, submit_calls{0};
-  std::atomic<bool> stop{false}, fail_release{false};
+  std::atomic<int> pool_allocations{0}, inspect_calls{0}, query_calls{0}, submit_calls{0}, sync_submit_calls{0}, connection_count{0};
+  std::atomic<bool> stop{false}, fail_release{false}, disconnect_submit{false};
   std::string address;
   int listener{-1};std::thread thread;
+  std::set<std::uint16_t> ports;
   template<class T> void Reply(int fd,kvaf::peer::Command cmd,T response){
     response.header=kvaf::peer::MakeHeader(cmd,sizeof(response));response.header.command|=0x8000;
     p::WriteBytes(fd,&response,sizeof(response));
@@ -91,11 +96,14 @@ class SharedServer {
     Require(!bind(listener,reinterpret_cast<sockaddr*>(&addr),sizeof(addr)),"bind loopback");
     socklen_t size=sizeof(addr);Require(!getsockname(listener,reinterpret_cast<sockaddr*>(&addr),&size),"getsockname");
     address="127.0.0.1:"+std::to_string(ntohs(addr.sin_port));Require(!listen(listener,16),"listen");
-    thread=std::thread([this]{while(!stop){
-      const int fd=accept(listener,nullptr,nullptr);if(fd<0)break;p::SetSocketTimeout(fd);
+    thread=std::thread([this]{kvaf::detail::ServeControlConnections(listener,[this](int fd){
+      sockaddr_in peer{};socklen_t bytes=sizeof(peer);
+      Require(!getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&bytes),"peer address");
+      {std::lock_guard<std::mutex> guard(control_mutex);
+       if(ports.insert(peer.sin_port).second)++connection_count;}
       rp::Request req{};
-      if(!p::ReadBytes(fd,&req.header,sizeof(req.header))){close(fd);continue;}
-      if(req.header.magic==kvaf::peer::kProtocolMagic)Peer(fd,req.header);
+      if(!p::ReadBytes(fd,&req.header,sizeof(req.header)))return Status::Internal("closed");
+      if(req.header.magic==kvaf::peer::kProtocolMagic){std::lock_guard<std::mutex> guard(control_mutex);Peer(fd,req.header);}
       else{
         Require(p::ReadBytes(fd,reinterpret_cast<char*>(&req)+sizeof(req.header),rp::RequestBytes(req.header.command)-sizeof(req.header)),"read control body");Require(req.count<=rp::kMaxSpans,"bounded spans");std::vector<rp::Span> spans(req.count);
         Require(p::ReadBytes(fd,spans.data(),spans.size()*sizeof(rp::Span)),"read spans");
@@ -106,11 +114,15 @@ class SharedServer {
         if(req.header.command==unsigned(rp::Command::InspectSource))++inspect_calls;
         if(req.header.command==unsigned(rp::Command::Query))++query_calls;
         if(req.header.command==unsigned(rp::Command::Submit))++submit_calls;
+        if(req.header.command==unsigned(rp::Command::SubmitAndWait))++sync_submit_calls;
+        if(req.header.command==unsigned(rp::Command::SubmitAndWait)&&disconnect_submit.exchange(false))
+          shutdown(fd,SHUT_RDWR);
         const auto response=service.Dispatch(req,spans);auto expected=req.header.command;
-        if(!drop.compare_exchange_strong(expected,0))p::WriteBytes(fd,&response,rp::ResponseBytes(req.header.command));
+        if(drop.compare_exchange_strong(expected,0))return Status::Internal("dropped reply");
+        if(!p::WriteBytes(fd,&response,rp::ResponseBytes(req.header.command)))return Status::Internal("write reply");
       }
-      close(fd);
-    }});
+      return Status::OK();
+    },[this]{return !stop.load();});});
   }
-  ~SharedServer(){stop=true;shutdown(listener,SHUT_RDWR);close(listener);if(thread.joinable())thread.join();}
+  ~SharedServer(){stop=true;shutdown(listener,SHUT_RDWR);if(thread.joinable())thread.join();close(listener);}
 };

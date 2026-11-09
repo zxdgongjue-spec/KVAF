@@ -583,30 +583,31 @@ runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, timeout=None, profile=
 
 便利入口与 `batch_put()` 一样同步返回；默认成功返回 `None` 表示数据搬运及元数据提交完成。
 可选 `profile=True` 成功返回 `{"profile": {...}}`，包括绑定参数转换、C++ 总时间、校验、
-PreparePut、目的偏移组织、Submit、Wait、Commit 和 native_other 的 Host 耗时（微秒）。
+PreparePut、目的偏移组织、SubmitAndWait、完成状态检查、Commit 和 native_other 的 Host 耗时（微秒）。
 失败仍抛异常，不返回可用的性能样本；默认关闭计时，恢复不合并跨调用的样本。
 
 ```python
 result = runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, profile=True)
-print(result["profile"]["wait_cpu_pull_us"])
+print(result["profile"]["submit_wait_cpu_pull_us"])
 ```
 
 内部执行流程：
 
 ```text
 ReadyToken 携带源和 MR 身份，校验 DDR 归属 → PreparePut → 提取 entry.address 并减 DDR base，生成 dst_offsets
-→ SubmitCpuPull → WaitCpuPull → CommitPut → 返回 None
+→ SubmitCpuPullAndWait（TCP 长连接，一次请求等待 READ 完成回复）→ CommitPut → 返回 None
 ```
 
 PreparePut 仍返回绝对地址，普通 BatchPut 不变。显式 `submit_cpu_pull` 的第四个参数现为
 `dst_offsets`，旧的绝对地址调用须改为 `entry.address - runtime.remote_region["base"]`。
-便利入口签名不变；当前 CPU 控制协议为 KVRP v6，应用和 CPU service 需要配套重编译。
+便利入口签名不变；当前 CPU 控制协议为 KVRP v7，应用和 CPU service 需要配套重编译。
 
 `keys`、`src_offsets`、`lengths` 是三个等长的 Host 整数序列或连续一维 CPU int64 Tensor，
 每个 key 对应一个源段，顺序一一对应。偏移和长度以字节计，源偏移相对 Ready 选中的 tensor；
 每个长度必须大于零且不超过目标槽位容量。最多 4096 段，一批只读取一个 MR。
-`timeout` 单位为毫秒，作用于完成轮询等待，与 `wait_cpu_pull` 相同；不改变各控制 RPC 的网络超时。
-`None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000），0 表示查询一次、不等待轮询。
+`timeout` 单位为毫秒，作用于 CPU 接受任务后的 READ 完成等待。客户端接收超时为该预算加 5 秒控制通信余量；
+连接和发送超时仍为 5 秒。`None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000），0 表示提交后立即检查、不等待。
+超时不会取消 READ；恢复与原有显式 `wait_cpu_pull` 继续查询原任务。
 
 应用无需持有内部 Put 或组装 `dst_offsets`。一 key 多段、槽内偏移和自定义目标布局继续使用
 显式 PreparePut/Submit/Wait/Commit 接口，两者共享同一个 MetaManager 和 CPU 数据面。
@@ -645,7 +646,7 @@ runtime.resolve_cpu_pull(timeout=30000)
 
 ### 13.1 Python 返回值与恢复入口
 
-- `cpu_source.register(...)` 成功返回 `None`，无需向读取端额外发送 source_desc 或调用 attach_cpu_source；CPU Pull 线协议为 KVRP v6。
+- `cpu_source.register(...)` 成功返回 `None`，无需向读取端额外发送 source_desc 或调用 attach_cpu_source；CPU Pull 线协议为 KVRP v7。
 - CPU 源描述符保留在 `ReadyToken.source` 中；本地格式、DDR 归属及 Put 覆盖检查失败时不发 RPC，提交前 Query 和 CPU 端 Submit 仍校验选中 MR 与批次。取消了对所有 MR 的初始化 InspectSource 查询。
 - `source.ready()` 返回 `ReadyToken`；应用调用前同步生产 stream。
 - `prepare_put(...)` 返回 `PutHandle`：`entries` 提供只读的 `key/address/length`，`state` 为最近一次已知状态，`submitted` 表示是否已记录提交请求。`state` 不会自动轮询远端。

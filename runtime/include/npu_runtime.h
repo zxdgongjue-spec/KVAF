@@ -17,7 +17,7 @@ struct BatchGetKernelProfile;
 // Optional Host wall-clock timings for one synchronous BatchCpuPull call.
 // Successful calls only; stages are inside total_us, never CPU-service clocks.
 struct CpuPullProfile {
-  double validation_us{}, prepare_put_us{}, dst_offsets_us{}, submit_cpu_pull_us{};
+  double validation_us{}, prepare_put_us{}, dst_offsets_us{}, submit_wait_cpu_pull_us{};
   double wait_cpu_pull_us{}, commit_put_us{}, total_us{};
 };
 
@@ -83,7 +83,7 @@ class NpuRuntime final : public Runtime {
   const RuntimeCore& core() const;
   Status GetOffloadRegion(OffloadRegionTicket*) const;
   // One source span per key, from the CPU source MR selected by ReadyToken. Prepare,
-  // Submit, Wait and Commit are internal; success includes metadata publication.
+  // Submit-and-wait uses one persistent control RPC; success includes metadata publication.
   // The producer owns registration, synchronization, Ready and ReleaseBatch on
   // both local and remote NPUs. UINT32_MAX uses options.offload_timeout_ms.
   Status BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken&,

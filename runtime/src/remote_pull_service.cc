@@ -1,9 +1,12 @@
 #include "remote_pull_service.h"
 #include "offload_client.h"
 #include <cstdio>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <sys/socket.h>
 
 namespace kvaf::remote_pull {
 namespace {
@@ -20,19 +23,25 @@ struct Session {
   std::vector<Span> submitted;
   State state{State::Connecting}, terminal{State::Connecting};
   std::mutex mutex;
+  std::condition_variable completed;
   std::thread worker;
   ~Session() { if (worker.joinable()) worker.join(); }
 };
 bool Pending(State s) { return s == State::Ready || s == State::Running || s == State::InDoubt; }
 }
 struct Service::Impl {
+  Impl(Describe d, Attach a, std::mutex* shared)
+      : describe(std::move(d)), attach(std::move(a)), control_mutex(shared ? *shared : owned_mutex) {}
   Describe describe;
   Attach attach;
+  std::mutex owned_mutex;
+  std::mutex& control_mutex;
   // Closed records are retained for idempotent Detach/Complete. Registration
   // is long-lived; bound the number rather than evicting unacknowledged IDs.
   std::unordered_map<std::uint64_t, std::unique_ptr<Session>> sources;
 };
-Service::Service(Describe describe, Attach attach) : impl_(new Impl{std::move(describe), std::move(attach), {}}) {}
+Service::Service(Describe describe, Attach attach, std::mutex* control_mutex)
+    : impl_(new Impl(std::move(describe), std::move(attach), control_mutex)) {}
 Service::~Service() {
   for (auto& item : impl_->sources) {
     auto& s = *item.second;
@@ -49,6 +58,7 @@ bool Service::RegionBusy(std::uint64_t id) const {
   return false;
 }
 Status Service::Shutdown() {
+  std::lock_guard<std::mutex> control(impl_->control_mutex);
   for (const auto& item : impl_->sources) {
     std::lock_guard<std::mutex> lock(item.second->mutex);
     if (item.second->state != State::Closed)
@@ -57,6 +67,7 @@ Status Service::Shutdown() {
   return Status::OK();
 }
 Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
+  std::unique_lock<std::mutex> control(impl_->control_mutex);
   Response out{}; out.header = {kMagic, kVersion, std::uint16_t(r.header.command | 0x8000U), ResponseBytes(r.header.command)};
   out.region = r.region; out.epoch = r.epoch; out.source_id = r.source_id; out.task = r.task;
   out.mr_id = r.mr_id;
@@ -64,7 +75,8 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
       r.count != spans.size() || spans.size() > kMaxSpans ||
       r.header.bytes != RequestBytes(r.header.command) + spans.size()*sizeof(Span)) return out;
   const auto cmd = static_cast<Command>(r.header.command);
-  if (cmd != Command::Ready && cmd != Command::Submit && cmd != Command::Probe && !spans.empty()) return out;
+  if (cmd != Command::Ready && cmd != Command::Submit && cmd != Command::SubmitAndWait &&
+      cmd != Command::Probe && !spans.empty()) return out;
   RegionInfo region{};
   auto status = impl_->describe(r.region, &region);
   if (!status.ok()) { out.result = Result::NotFound; return out; }
@@ -208,11 +220,35 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
     }
     return out;
   }
-  if (cmd != Command::Submit) return out;
+  if (cmd != Command::Submit && cmd != Command::SubmitAndWait) return out;
+  // A new convenience call is not recovery of an already committed/cancelled
+  // batch. Reject it before claiming acceptance or touching the caller's slots.
+  if (cmd == Command::SubmitAndWait &&
+      (s.state == State::Committed || s.state == State::Cancelled || s.state == State::Closed)) return out;
+  const auto wait_for_completion = [&] {
+    if (cmd == Command::SubmitAndWait) {
+      // The READ worker publishes state under this same mutex. Waiting releases
+      // it, so the response is driven by completion rather than 1 ms polling.
+      control.unlock();
+      s.completed.wait_for(lock, std::chrono::milliseconds(r.timeout_ms),
+                           [&] { return s.state != State::Running; });
+      // A reconnecting client may already have finished this task. Never
+      // report the state of a newer batch as completion of this request.
+      out.state = s.sequence == r.task && s.mr_id == r.mr_id ? s.state : State::InDoubt;
+    }
+  };
   if (!s.submitted.empty()) {
-    if (SameSpans(spans, s.submitted)) out.result = Result::Ok;
+    if (cmd == Command::SubmitAndWait) out.reserved = 1;
+    if (SameSpans(spans, s.submitted) &&
+        (cmd != Command::SubmitAndWait || r.source.bytes == s.source.bytes)) {
+      out.result = Result::Ok;
+      wait_for_completion();
+    }
     return out;
   }
+  // The synchronous request carries the expected selected-MR length, removing
+  // the separate pre-submit Query without weakening its source validation.
+  if (cmd == Command::SubmitAndWait && r.source.bytes != s.source.bytes) return out;
   if (s.state != State::Ready || !offload::ValidateSpans(spans, s.source.bytes, region.bytes)) return out;
   // One unresolved write per pool, including CQ failures with unknown DMA state.
   for (const auto& item : impl_->sources) {
@@ -227,10 +263,12 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   // then use its imported segment/base with the existing shared queues.
   status = s.backend->SelectSource(r.mr_id);
   if (!status.ok()) {
+    if (cmd == Command::SubmitAndWait) out.reserved = 1;
     s.state = out.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
     out.result = Convert(status); return out;
   }
   s.submitted = spans; s.state = State::Running;
+  if (cmd == Command::SubmitAndWait) out.reserved = 1;
   try {
     s.worker = std::thread([&s, id = r.source_id] {
       Status result;
@@ -238,23 +276,27 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
       catch (...) { result = Status::InDoubt("exception in remote READ worker"); }
       std::lock_guard<std::mutex> guard(s.mutex);
       s.state = result.ok() ? State::Done : result.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
+      s.completed.notify_all();
       std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_DONE region=%llu source=%llu sequence=%llu mr=%llu state=%u detail=%s\n",
           (unsigned long long)s.region.id, (unsigned long long)id, (unsigned long long)s.sequence,
           (unsigned long long)s.mr_id, unsigned(s.state), result.message().c_str());
     });
   } catch (...) { s.state = State::Failed; out.state = s.state; out.result = Result::Failed; return out; }
-  out.state = State::Running; out.result = Result::Ok; return out;
+  out.state = State::Running; out.result = Result::Ok;
+  wait_for_completion();
+  return out;
 }
 void Service::Serve(int fd, const peer::MessageHeader& header) {
   offload::SetSocketTimeout(fd);
   const auto request_bytes = RequestBytes(header.command);
   if (header.magic != kMagic || header.version != kVersion || header.bytes < request_bytes ||
-      header.bytes > request_bytes+kMaxSpans*sizeof(Span)) return;
+      header.bytes > request_bytes+kMaxSpans*sizeof(Span)) { shutdown(fd, SHUT_RDWR); return; }
   Request r{}; r.header = header;
   if (!offload::ReadBytes(fd, reinterpret_cast<char*>(&r)+sizeof(header), request_bytes-sizeof(header)) ||
-      r.count > kMaxSpans || header.bytes != request_bytes+r.count*sizeof(Span)) return;
+      r.count > kMaxSpans || header.bytes != request_bytes+r.count*sizeof(Span)) { shutdown(fd, SHUT_RDWR); return; }
   std::vector<Span> spans(r.count);
-  if (!offload::ReadBytes(fd, spans.data(), spans.size()*sizeof(Span))) return;
-  const auto response = Dispatch(r, spans); offload::WriteBytes(fd, &response, ResponseBytes(header.command));
+  if (!offload::ReadBytes(fd, spans.data(), spans.size()*sizeof(Span))) { shutdown(fd, SHUT_RDWR); return; }
+  const auto response = Dispatch(r, spans);
+  if (!offload::WriteBytes(fd, &response, ResponseBytes(header.command))) shutdown(fd, SHUT_RDWR);
 }
 }

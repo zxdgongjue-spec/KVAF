@@ -498,11 +498,12 @@ class CpuService {
                   region->memory, region->bytes, region->token_value);
             return offload::CreateBorrowedUrmaBackend(region->resources->context(), region->memory,
                 region->bytes, region->token_value, region, region->pull_destination);
-          }) {
+          }, &control_mutex_) {
       std::random_device random; epoch_ = (std::uint64_t(random()) << 32) ^ random();
       if (!epoch_) epoch_ = 1;
     }
   ~CpuService() { ReleaseAll(); }
+  std::mutex& ControlMutex() { return control_mutex_; }
   void ServeRemotePull(int fd, const MessageHeader& header) { remote_pull_service_.Serve(fd, header); }
   Status ShutdownPull() {
     auto status = remote_pull_service_.Shutdown();
@@ -880,6 +881,7 @@ class CpuService {
   std::uint64_t epoch_{};
   std::unordered_map<uint64_t, std::shared_ptr<Region>> regions_;
   std::vector<std::shared_ptr<Region>> quarantined_regions_;
+  std::mutex control_mutex_;
   remote_pull::Service remote_pull_service_;
 };
 
@@ -895,6 +897,7 @@ void HandleClient(int fd, CpuService* service) {
   MessageHeader header{};
   if (!ReadAll(fd, &header, sizeof(header))) return;
   if (header.magic == remote_pull::kMagic) { service->ServeRemotePull(fd, header); return; }
+  std::lock_guard<std::mutex> control(service->ControlMutex());
   if (header.magic != kvaf::peer::kProtocolMagic ||
       header.version != kvaf::peer::kProtocolVersion) {
     return;

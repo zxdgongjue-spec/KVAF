@@ -747,8 +747,9 @@ Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken
         destinations.push_back(entry.address - ddr_base);
     }
     {
-      ScopedCpuPullTimer timer(profile ? &profile->submit_cpu_pull_us : nullptr);
-      status = impl_->runtime_core->SubmitCpuPull(ready, impl_->batch_pull_put, src_offsets, destinations, lengths);
+      ScopedCpuPullTimer timer(profile ? &profile->submit_wait_cpu_pull_us : nullptr);
+      status = impl_->runtime_core->SubmitCpuPullAndWait(ready, impl_->batch_pull_put, src_offsets, destinations, lengths,
+          timeout_ms == UINT32_MAX ? impl_->options.offload_timeout_ms : timeout_ms);
     }
   } catch (const std::exception& e) {
     status = impl_->batch_pull_put.submitted() ? Status::InDoubt(e.what()) : Status::Internal(e.what());

@@ -16,7 +16,7 @@ from pull_bench_utils import print_stages, summarize_us
 
 
 INTERNAL_STAGES = ("binding_prepare", "native_total", "validation", "prepare_put", "dst_offsets",
-                   "submit_cpu_pull", "wait_cpu_pull", "commit_put", "native_other")
+                   "submit_wait_cpu_pull", "wait_cpu_pull", "commit_put", "native_other")
 
 
 def measure_pull(runtime, ready, keys, src, sizes, *, profile=True,

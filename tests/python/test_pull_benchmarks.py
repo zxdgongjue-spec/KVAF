@@ -150,7 +150,7 @@ class PullBenchmarks(unittest.TestCase):
                         if profile:
                             return {"profile": dict(binding_prepare_us=10, native_total_us=130,
                                 validation_us=5, prepare_put_us=10, dst_offsets_us=15,
-                                submit_cpu_pull_us=20, wait_cpu_pull_us=40, commit_put_us=30,
+                                submit_wait_cpu_pull_us=20, wait_cpu_pull_us=40, commit_put_us=30,
                                 native_other_us=10)}
 
                 result = measure_pull(Runtime(), ready, keys, src, sizes,
