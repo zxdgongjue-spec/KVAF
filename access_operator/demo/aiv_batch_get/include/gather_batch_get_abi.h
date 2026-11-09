@@ -1,9 +1,8 @@
 #pragma once
 #include "sequential_batch_get_abi.h"
-#include "gather_shard_layout.h"
 #include "gather_prefix_layout.h"
 
-constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524634ULL;
+constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524635ULL;
 // A completed successful profile has all seven boundary timestamps. On error,
 // only the boundaries reached by this launch are marked valid.
 constexpr uint64_t KVAF_GATHER_PROFILE_ALL_EVENTS = 0x7f;
@@ -15,19 +14,14 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
   uint64_t data_cq_wait_cycles, read_build_cycles;
   // CPU progress and data submissions overlap in chunk mode. Event cycles use
   // the AIV clock; first_read_ready_bytes is the progress snapshot at submission
-  // (sum of independently ready shard bytes in GDR3, a prefix in GDR2/GDR4).
+  // as a contiguous prefix in GDR2/GDR4.
   uint64_t first_ready_cycle, first_read_submit_cycle, first_read_ready_bytes;
   uint64_t ready_queries, ready_wait_cycles, pipeline_chunk_bytes;
-  // V6 scheduler diagnostics; all remain zero when profiling is disabled.
-  uint64_t read_vf_calls, ready_no_change_queries, ready_query_skips;
-  uint64_t max_ready_backlog_wrs, ready_idle_waits, multi_run_posts;
-  uint64_t packed_posts, read_plan_segments;
-  uint64_t progress_mode, ready_local_polls, ready_local_updates;
-  uint64_t ready_ack_checks, ready_control_wrs;
-  // V8: preparation is allowed before remote readiness, execution is not.
+  uint64_t read_vf_calls;
+  // Preparation is allowed before remote readiness, execution is not.
   uint64_t prepare_ahead, cooperative_chunks, prepare_ahead_wrs, prepare_ahead_cycles;
 };
-static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 384);
+static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 256);
 
 enum KvafGatherProbe : uint32_t {
   KVAF_GATHER_PROBE_NONE = 0, KVAF_GATHER_PROBE_ACK = 1,
@@ -56,18 +50,13 @@ struct KvafGatherBatchGetArgs {
   // output rows within each sgl_size group; token_bytes * sgl_size <= 65536.
   // Reuses V3's zero-only reserved word: old kernels reject an enabled flag.
   uint32_t coalesce_sges;
-  // Zero: whole-batch ACK before READ. Nonzero: progress publication granularity;
-  // pipeline_shards selects GDR3 independent shards or the GDR2/GDR4 ready prefix.
+  // Zero: whole-batch ACK before READ. Nonzero: contiguous prefix granularity.
   uint32_t pipeline_chunk_bytes;
-  // V6: 0 = GDR2 prefix/whole batch, 1 = legacy GDR3 scheduler,
-  // 2 = packed-ready GDR3 scheduler. The CPU wire format stays GDR3.
-  uint32_t pipeline_shards;
-  // 0 = V6 dual READ query; 1 = progress-only pull; 2 = CPU progress WRITE.
-  uint32_t progress_mode, prepare_ahead;
+  uint32_t prepare_ahead;
   // Zero retains the existing CPU schedule. 2/4/8 select cooperative prefixes.
   uint32_t cooperative_chunks, reserved;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 256);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 248);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

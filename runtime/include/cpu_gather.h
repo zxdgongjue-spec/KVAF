@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "gather_span.h"
-#include "gather_shard_layout.h"
 #include "gather_prefix_layout.h"
 
 namespace kvaf::peer {
@@ -33,8 +32,7 @@ struct GatherDescriptorHeader {
   std::uint32_t pipeline_chunk_bytes{0U};
   // Fixed bytes per source span; zero retains the variable-length wire format.
   std::uint32_t span_bytes{0U};
-  // GDR2/GDR4: mutable contiguous ready bytes. GDR3: immutable READ group size;
-  // generation-tagged shard progress lives in the aligned descriptor trailer.
+  // GDR2/GDR4: mutable contiguous ready bytes.
   std::uint64_t ready_bytes{0U};
 };
 

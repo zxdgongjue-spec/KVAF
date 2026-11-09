@@ -107,9 +107,6 @@ class CpuGatherExecutor {
   }
 
   void Copy();
-  using ProgressHook = void (*)(void*, std::uint64_t, const std::uint64_t*, std::uint32_t);
-  void SetProgressHook(void* context, ProgressHook hook) { progress_context_ = context; progress_hook_ = hook; }
-
   // Enable before the first PrepareDirect. Disabled execution reads no clocks.
   void EnableProfiling() { thread_profiles_.resize(max_threads_); }
   std::size_t MaxThreads() const { return max_threads_; }
@@ -118,12 +115,6 @@ class CpuGatherExecutor {
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
-  void PumpProgress() {
-    if (progress_hook_ && shard_progress_)
-      progress_hook_(progress_context_, shard_sequence_, shard_progress_, shard_count_);
-  }
-  void* progress_context_{};
-  ProgressHook progress_hook_{};
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
                       std::uint32_t span_count, std::uint32_t total_bytes) {
     const std::size_t threads =
@@ -232,9 +223,6 @@ class CpuGatherExecutor {
     std::atomic<bool> complete{false};
   };
   std::array<CooperativeProgress, kGatherMaxCooperativeChunks> cooperative_progress_;
-  std::uint64_t* shard_progress_{nullptr};
-  std::uint64_t shard_sequence_{};
-  std::uint32_t shard_sgl_{}, shard_wrs_{}, shard_count_{};
   // Separate balanced task ownership from partial DMA-visible progress. Each
   // slot has one writer; only the coordinator publishes the contiguous prefix.
   struct alignas(64) TaskProgress { std::uint64_t bytes{}; };

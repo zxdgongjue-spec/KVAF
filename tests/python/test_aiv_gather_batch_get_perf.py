@@ -20,7 +20,7 @@ SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
 POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
-RUN_LABEL = "gather_progress_control"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
+RUN_LABEL = "gather_prepared_prefix"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
 
 import csv
@@ -58,10 +58,7 @@ HOST_FIELDS = (
 COUNTERS = (
     "data_wrs", "ack_queries", "data_wqebbs", "data_doorbells",
     "data_cq_wait_cycles", "read_build_cycles", "ready_queries", "ready_wait_cycles",
-    "pipeline_chunk_bytes", "pipeline_shards", "first_read_ready_bytes",
-    "read_vf_calls", "ready_no_change_queries", "ready_query_skips", "max_ready_backlog_wrs",
-    "ready_idle_waits", "multi_run_posts", "packed_posts", "read_plan_segments",
-    "progress_mode", "ready_local_polls", "ready_local_updates", "ready_ack_checks", "ready_control_wrs",
+    "pipeline_chunk_bytes", "first_read_ready_bytes", "read_vf_calls",
     "prepare_ahead", "cooperative_chunks", "prepare_ahead_wrs", "prepare_ahead_cycles",
 )
 PIPELINE_EVENTS = ("first_ready_cycle", "first_read_submit_cycle")
@@ -121,15 +118,13 @@ def validate_config(cores: int) -> None:
     prepare = configured_prepare_ahead()
     if cooperative and (not prepare or not configured_chunk_bytes()):
         raise ValueError("COOPERATIVE_CHUNKS requires PREPARE_AHEAD=1 and nonzero CHUNK_BYTES")
-    if prepare and not cooperative and configured_chunk_bytes() and \
-            (os.environ.get("KVAF_AIV_GATHER_SHARD_PIPELINE", "1") or "1") != "0":
-        raise ValueError("PREPARE_AHEAD requires whole-batch or SHARD_PIPELINE=0")
     configured_chunk_bytes()
-    if (os.environ.get("KVAF_AIV_GATHER_PROGRESS_MODE", "pull") or "pull") not in ("legacy", "pull", "push"):
-        raise ValueError("KVAF_AIV_GATHER_PROGRESS_MODE must be legacy/pull/push")
-    for name in ("KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_GATHER_TRUSTED_INPUTS", "KVAF_AIV_GATHER_PACKED_POSTS"):
-        if (os.environ.get(name, "1") or "1") not in ("0", "1"):
-            raise ValueError(f"{name} must be 0 or 1")
+    for name in ("KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_AIV_GATHER_PACKED_POSTS",
+                 "KVAF_AIV_GATHER_PROGRESS_MODE"):
+        if os.environ.get(name):
+            raise ValueError(f"{name} has been removed; unset it and use PREPARE_AHEAD / COOPERATIVE_CHUNKS")
+    if (os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") not in ("0", "1"):
+        raise ValueError("KVAF_GATHER_TRUSTED_INPUTS must be 0 or 1")
     positive = {
         "TOKEN_BYTES": TOKEN_BYTES, "REQUEST_COUNT": REQUEST_COUNT,
         "TABLE_CAPACITY": TABLE_CAPACITY,
@@ -313,7 +308,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -329,9 +324,6 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "configured_chunk_bytes": configured_chunk_bytes(),
         "configured_prepare_ahead": configured_prepare_ahead(),
         "configured_cooperative_chunks": configured_cooperative_chunks(),
-        "configured_progress_mode": os.environ.get("KVAF_AIV_GATHER_PROGRESS_MODE", "pull") or "pull",
-        "configured_packed_posts": int(os.environ.get("KVAF_AIV_GATHER_PACKED_POSTS", "1") or "1"),
-        "configured_shard_pipeline": int(os.environ.get("KVAF_AIV_GATHER_SHARD_PIPELINE", "1") or "1"),
         "trusted_gather_inputs": int(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1"),
         "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",

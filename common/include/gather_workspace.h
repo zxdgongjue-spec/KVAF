@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "gather_shard_layout.h"
+#include "gather_prefix_layout.h"
 
 namespace kvaf {
 inline constexpr std::uint32_t kGatherMaxRequests = 65536U;
@@ -15,8 +15,7 @@ inline constexpr std::uint64_t GatherLaneStagingBytes(std::uint32_t token_bytes,
          ~std::uint64_t{63U};
 }
 inline constexpr std::uint64_t GatherLaneDescriptorBytes(std::uint32_t workers) {
-  return ((64U + GatherLaneCapacity(workers) * 16ULL + 63U) & ~std::uint64_t{63U}) +
-         kGatherProgressBytes;
+  return (64U + GatherLaneCapacity(workers) * 16ULL + 63U) & ~std::uint64_t{63U};
 }
 inline constexpr std::uint64_t GatherStagingBytes(std::uint32_t token_bytes,
                                                 std::uint32_t workers = 1U) {

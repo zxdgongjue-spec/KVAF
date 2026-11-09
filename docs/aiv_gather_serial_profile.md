@@ -1,19 +1,10 @@
 # Gather 阶段计时与 AIV 内部流水
 
-新增可独立对照的 [V8 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)，部署需使用 V8 kernel / args 256 B / profile 384 B。下文的旧版本尺寸为历史记录。
-
-当前版本为 [V7 进度控制优化](aiv_gather_progress_control.md)：默认 progress-only pull，
-可选 CPU 进度 push；args 248 B、profile 320 B、CSV schema 7。下文历史版本说明保留。
-
-当前调度与 profile 版本见 [V6 ready 库存与离散 WR 合批](aiv_gather_packed_scheduler.md)：
-args 240 B、profile 256 B，CSV schema 6。下文 V5/V4 部分保留为历史说明。
-
-当前默认使用 [GDR3 分片流水与 V5 调用快路径](aiv_gather_shard_pipeline.md)，
-args 仍为 240 B、profile 192 B；旧 V4 连续前缀模式保留为显式对照。
-Python/Host 分段计时和 CSV schema 5 的说明以新文档为准。
+当前部署使用 [V9 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)：
+args 248 B、profile 256 B、CSV schema 9。下文 V3/V4 的诊断记录为历史说明。
 
 当前版本已接通 [CPU chunk 与 payload READ 流水](aiv_gather_chunk_pipeline.md)，
-默认 128 KiB，Host/kernel 使用 V4 / args 240 B / profile 192 B。
+默认连续前缀为 128 KiB；协作 chunk 与提前准备通过新文档中的开关启用。
 下文整批 ACK 后 READ 的计时说明和历史 V3 诊断记录，适用于
 `KVAF_AIV_GATHER_CHUNK_BYTES=0` 的 AIV 内部流水基线；chunk 模式的重叠
 阶段口径、构建和对比方法以上述新文档为准。此入口只测试 `gather_read`。

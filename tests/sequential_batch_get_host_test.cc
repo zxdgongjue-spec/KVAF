@@ -19,9 +19,8 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
-uint32_t last_coalesce_sges{}, last_progress_mode{}, progress_setups{};
-bool fail_progress_setup{}, progress_live{};
-uint32_t last_pipeline_chunk_bytes{}, last_pipeline_shards{}, last_prepare_ahead{}, last_cooperative_chunks{};
+uint32_t last_coalesce_sges{};
+uint32_t last_pipeline_chunk_bytes{}, last_prepare_ahead{}, last_cooperative_chunks{};
 uint32_t capture_queries{};
 bool allow_queued_launches{};
 int async_memsets{}, status_copies{}, stream_syncs{};
@@ -95,8 +94,6 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   assert(loaded_mode == KVAF_SEQ_GATHER);
   last_coalesce_sges = a->coalesce_sges;
   last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
-  last_pipeline_shards = a->pipeline_shards;
-  last_progress_mode = a->progress_mode;
   last_prepare_ahead = a->prepare_ahead;
   last_cooperative_chunks = a->cooperative_chunks;
   if (a->probe) assert(!last_pipeline_chunk_bytes);
@@ -146,8 +143,6 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         if (args.pipeline_chunk_bytes && p.requests) {
           p.pipeline_chunk_bytes = args.cooperative_chunks ?
               kvaf::GatherCooperativeChunkBytes(p.requests * args.request.token_bytes, args.cooperative_chunks) : args.pipeline_chunk_bytes;
-          p.packed_posts = args.pipeline_shards == 2;
-          p.progress_mode = args.progress_mode;
           p.ack_done_cycle = 106;
           p.first_ready_cycle = 104;
           p.first_read_submit_cycle = 104;
@@ -188,13 +183,9 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport*, void*,
     KvafBatchGetLocalBuffer** b, uint64_t* e) {
   ++refs; *b = new KvafBatchGetLocalBuffer; *e = 1; return 0;
 }
-extern "C" int32_t KvafBatchGetEnableGatherProgress(KvafBatchGetTransport*, KvafBatchGetLocalBuffer*, uint32_t) {
-  ++progress_setups; progress_live = true;
-  return fail_progress_setup ? 1 : 0;
-}
 extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer* b) { --refs; delete b; }
 extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport*) {
-  assert(work.empty() && !progress_live); if (fail_quiesce) return 1; ++quiesced; return 0;
+  assert(work.empty()); if (fail_quiesce) return 1; ++quiesced; return 0;
 }
 extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport* t) { delete t; }
 
@@ -206,7 +197,7 @@ Status PeerLink::LookupRegion(uint64_t base, PeerRegion* r) const {
 Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
-Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); progress_live = false; ++stopped; return Status::OK(); }
+Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
 Status PeerLink::OpenCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenCpuPushGetResponse*) const { return Status::OK(); }
 Status PeerLink::StartCpuPushGet(uint64_t) const { return Status::OK(); }
 Status PeerLink::StopCpuPushGet(uint64_t) const { assert(work.empty()); ++push_stopped; return Status::OK(); }
@@ -517,7 +508,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=256", "record_bytes=384"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=248", "record_bytes=256"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);
@@ -650,47 +641,16 @@ int main() {
     assert(owner->Execute(exec).ok() && capture_queries == before + 1);
     assert(owner->Shutdown().ok() && !refs && !allocations);
   }
-  for (const char* setting : {"0", "1"}) {
-    setenv("KVAF_AIV_GATHER_SHARD_PIPELINE", setting, 1);
-    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    unsetenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
-    assert(owner->Execute(exec).ok() && bool(last_pipeline_shards) == bool(*setting - '0'));
-    assert(owner->Shutdown().ok() && !refs && !allocations);
+  for (const char* name : {"KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_AIV_GATHER_PACKED_POSTS",
+                           "KVAF_AIV_GATHER_PROGRESS_MODE"}) {
+    setenv(name, "0", 1);
+    auto owner = CreateSequentialBatchGet(config);
+    const auto result = owner->Initialize(region);
+    assert(result.code() == StatusCode::kInvalidArgument);
+    assert(result.message().find("has been removed") != std::string::npos);
+    assert(!allocations && !refs);
+    unsetenv(name);
   }
-  setenv("KVAF_AIV_GATHER_SHARD_PIPELINE", "invalid", 1);
-  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
-  unsetenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
-  for (const char* setting : {"0", "1"}) {
-    setenv("KVAF_AIV_GATHER_PACKED_POSTS", setting, 1);
-    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    unsetenv("KVAF_AIV_GATHER_PACKED_POSTS");
-    assert(owner->Execute(exec).ok() && last_pipeline_shards == (*setting == '1' ? 2U : 1U));
-    assert(owner->Shutdown().ok() && !refs && !allocations);
-  }
-  setenv("KVAF_AIV_GATHER_PACKED_POSTS", "invalid", 1);
-  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
-  unsetenv("KVAF_AIV_GATHER_PACKED_POSTS");
-  for (const char* setting : {"legacy", "pull", "push"}) {
-    setenv("KVAF_AIV_GATHER_PROGRESS_MODE", setting, 1);
-    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
-    unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
-    const auto expected_mode = std::strcmp(setting, "legacy") == 0 ? 0U :
-        std::strcmp(setting, "pull") == 0 ? 1U : 2U;
-    assert(owner->Execute(exec).ok() && last_progress_mode == expected_mode);
-    assert(owner->Shutdown().ok() && !progress_live && !refs && !allocations);
-  }
-  assert(progress_setups == 1);
-  setenv("KVAF_AIV_GATHER_PROGRESS_MODE", "push", 1);
-  fail_progress_setup = true;
-  {
-    auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
-    assert(owner->Shutdown().ok() && !progress_live && !refs && !allocations);
-  }
-  fail_progress_setup = false;
-  unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
-  setenv("KVAF_AIV_GATHER_PROGRESS_MODE", "invalid", 1);
-  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
-  unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
   setenv("KVAF_AIV_GATHER_CHUNK_BYTES", "0", 1);
   for (const char* setting : {"0", "1"}) {
     setenv("KVAF_AIV_GATHER_PREPARE_AHEAD", setting, 1);
@@ -715,12 +675,12 @@ int main() {
     unsetenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
     assert(owner->Execute(exec).ok());
     assert(last_cooperative_chunks == std::strtoul(count, nullptr, 10));
-    assert(last_prepare_ahead == 1 && !last_pipeline_shards && !last_progress_mode);
+    assert(last_prepare_ahead == 1);
     GatherBatchGetProfile profile;
     assert(owner->CopyGatherProfile(&profile).ok());
     for (const auto& lane : profile.cores)
       assert(lane.cooperative_chunks == (lane.requests ? last_cooperative_chunks : 0));
-    assert(owner->Shutdown().ok() && !allocations && !refs && !progress_live);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
   }
   for (const char* count : {"1", "3", "16", "-2", "4x"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);

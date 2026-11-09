@@ -1,10 +1,8 @@
 # CPU gather 与 payload READ 分块流水
 
-新增可独立对照的 [V8 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)，部署需使用 V8 kernel / args 256 B / profile 384 B。下文的旧版本尺寸为历史记录。
-
-当前默认已升级为 [GDR3 独立分片进度与 V5 调用快路径](aiv_gather_shard_pipeline.md)。
-以下描述保留为 `KVAF_AIV_GATHER_SHARD_PIPELINE=0` 的连续前缀对照实现；
-部署请按新文档同时更新 CPU 服务与 NPU Host/Runtime/Python/kernel。
+当前部署和新路线见 [V9 提前准备与协作 chunk](aiv_gather_prepared_prefix.md)。
+本文描述保留的 GDR2 连续前缀对照：COOPERATIVE_CHUNKS=0、PREPARE_AHEAD=0；
+不再需要设置已删除的 SHARD_PIPELINE 开关。
 
 当前 gather_read 默认使用每 lane 128 KiB ready 发布粒度，将 CPU gather 与 NIC
 payload READ 重叠。保留原有 AIV WQE/SQ 双 bank 流水、整批 staging、每 lane
@@ -65,9 +63,8 @@ completion。沿用 Shutdown 的 transport quiesce 和 StopGatherLanes 回收，
 
 ## ABI 与部署
 
-Gather kernel 符号升级为 `KvafGatherBatchGetAivKernelV4`，args 从 232 B
-增至 240 B；loader 拒绝 V1/V2/V3。profile 利用原 padding 增加六个字段，
-仍为 192 B。同步重编 NPU Host、Runtime、Python binding 和 gather kernel：
+Gather kernel 为 `KvafGatherBatchGetAivKernelV9`，args 248 B、profile 256 B。
+同步重编 NPU Host、Runtime、Python binding 和 gather kernel：
 
 ```bash
 cmake --build build-npu -j
@@ -80,10 +77,7 @@ CPU 调度/发布优化修改了 CPU executor，必须重编并重启 CPU 服务
 cmake --build build-cpu -j
 ```
 
-本次任务内部的部分进度发布只修改 CPU executor；如果 N 侧已部署上述 V4
-流水实现，无需再次重编 NPU。wire ABI、V4 args 和 profile 布局不变；
-已有 V4 Host/Python 接口兼容。
-实际加载日志应显示 `symbol=KvafGatherBatchGetAivKernelV4 args_bytes=240`。
+实际加载日志应显示 `symbol=KvafGatherBatchGetAivKernelV9 args_bytes=248`。
 修改环境变量后需要新建 Runtime 实例。
 
 ## 验证和 A/B 对比
@@ -105,13 +99,13 @@ KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_CHUNK_BYTES=131072 \
   python -u tests/python/test_aiv_gather_batch_get_perf.py
 ```
 
-两轮都使用 V4；0 保留原有 AIV 内部流水，仅关闭 CPU chunk 消费。CSV 保存
+两轮都使用 V9；0 保留原有 AIV 内部流水，仅关闭 CPU chunk 消费。CSV 保存
 configured_chunk_bytes，逐 lane 保存实际 pipeline_chunk_bytes。Scalar 回退
 和空 lane 的实际值为 0。先比较 profile=off 的端到端 p50/p95/p99 和有效带宽。
 
 ## Profile 口径
 
-CSV schema_version 仍为 4，保留七个 boundary timestamp。当前优化版先在
+CSV schema_version 为 9，保留七个 boundary timestamp。当前优化版先在
 READ 在途期间确认 ACK，再确认最后的数据 CQ，因此成功的非空 chunk lane
 通常表现为 ack_done_cycle 早于 read_done_cycle；旧版相反。Host/脚本允许
 两种顺序，退出前必须同时满足两个完成条件。两者都是 AIV 观察时间，不是

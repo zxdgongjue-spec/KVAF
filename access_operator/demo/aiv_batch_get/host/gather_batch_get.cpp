@@ -216,9 +216,6 @@ struct GatherBatchGet::Impl {
     if (KvafBatchGetLocalBufferAcquire(gather_transport, workspace, args.workspace_bytes,
         &workspace_buffer, &args.workspace_entity)) return Error("register gather workspace");
     gather_enabled = true;  // STOP also handles an uncertain enable response.
-    if (args.progress_mode == kGatherProgressPush &&
-        KvafBatchGetEnableGatherProgress(gather_transport, workspace_buffer, workers))
-      return Error("enable gather progress WRITEs (rebuild/restart the CPU service)");
     return config.peer_link->EnableGatherLanes(region.base, args.remote_control, workers);
   }
 
@@ -232,7 +229,7 @@ struct GatherBatchGet::Impl {
       if (synchronized != ACL_SUCCESS) return AclFailure("shutdown_synchronize", synchronized);
     }
     pending = nullptr;
-    // Keep the receiver and mailbox registered until all CPU progress DMA stops.
+    // Stop CPU copy workers before releasing descriptor/staging resources.
     if (gather_enabled) {
       auto result = config.peer_link->StopGatherLanes(region.base);
       if (!result.ok()) return result;
@@ -287,8 +284,6 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.pipeline_chunk_bytes != (p.requests ? args.cooperative_chunks ?
         GatherCooperativeChunkBytes(p.requests * config.batch_get_token_bytes, args.cooperative_chunks) :
         args.pipeline_chunk_bytes : 0)) reason = "pipeline_chunk_bytes";
-    else if (p.packed_posts != uint64_t(p.requests && args.pipeline_shards == 2)) reason = "packed_posts";
-    else if (p.progress_mode != (p.requests ? args.progress_mode : 0)) reason = "progress_mode";
     else if (p.prepare_ahead != (p.requests ? args.prepare_ahead : 0)) reason = "prepare_ahead";
     else if (p.cooperative_chunks != (p.requests ? args.cooperative_chunks : 0)) reason = "cooperative_chunks";
     else if (p.pipeline_chunk_bytes &&
@@ -354,20 +349,7 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     out.ready_queries = p.ready_queries;
     out.ready_wait_cycles = p.ready_wait_cycles;
     out.pipeline_chunk_bytes = p.pipeline_chunk_bytes;
-    out.pipeline_shards = p.requests && args.pipeline_shards;
     out.read_vf_calls = p.read_vf_calls;
-    out.ready_no_change_queries = p.ready_no_change_queries;
-    out.ready_query_skips = p.ready_query_skips;
-    out.max_ready_backlog_wrs = p.max_ready_backlog_wrs;
-    out.ready_idle_waits = p.ready_idle_waits;
-    out.multi_run_posts = p.multi_run_posts;
-    out.packed_posts = p.packed_posts;
-    out.read_plan_segments = p.read_plan_segments;
-    out.progress_mode = p.progress_mode;
-    out.ready_local_polls = p.ready_local_polls;
-    out.ready_local_updates = p.ready_local_updates;
-    out.ready_ack_checks = p.ready_ack_checks;
-    out.ready_control_wrs = p.ready_control_wrs;
     out.prepare_ahead = p.prepare_ahead;
     out.cooperative_chunks = p.cooperative_chunks;
     out.prepare_ahead_wrs = p.prepare_ahead_wrs;
@@ -393,6 +375,13 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
       s.config.aiv_batch_get_mode != "gather_read" ||
       s.config.peer_local_eids.size() > 1)
     return Status::InvalidArgument("invalid sequential BatchGet configuration");
+  for (const char* name : {"KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_AIV_GATHER_PACKED_POSTS",
+                           "KVAF_AIV_GATHER_PROGRESS_MODE"}) {
+    const char* value = std::getenv(name);
+    if (value && *value)
+      return Status::InvalidArgument(std::string(name) +
+          " has been removed; unset it and use PREPARE_AHEAD / COOPERATIVE_CHUNKS");
+  }
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
   s.args.pipeline_chunk_bytes = kGatherChunkBytes;
@@ -408,25 +397,6 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   // split-token encoder is unchanged in this first chunk-consumer version.
   if (s.args.probe || uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
     s.args.pipeline_chunk_bytes = 0;
-  const char* shards = std::getenv("KVAF_AIV_GATHER_SHARD_PIPELINE");
-  if (shards && *shards && std::strcmp(shards, "0") && std::strcmp(shards, "1"))
-    return Status::InvalidArgument("KVAF_AIV_GATHER_SHARD_PIPELINE must be 0 or 1");
-  s.args.pipeline_shards = s.args.pipeline_chunk_bytes &&
-      (!shards || !*shards || std::strcmp(shards, "0"));
-  const char* packed = std::getenv("KVAF_AIV_GATHER_PACKED_POSTS");
-  if (packed && *packed && std::strcmp(packed, "0") && std::strcmp(packed, "1"))
-    return Status::InvalidArgument("KVAF_AIV_GATHER_PACKED_POSTS must be 0 or 1");
-  if (s.args.pipeline_shards && (!packed || !*packed || std::strcmp(packed, "0")))
-    s.args.pipeline_shards = 2;
-  const char* progress = std::getenv("KVAF_AIV_GATHER_PROGRESS_MODE");
-  uint32_t mode = kGatherProgressPull;
-  if (progress && *progress) {
-    if (!std::strcmp(progress, "legacy")) mode = kGatherProgressLegacy;
-    else if (!std::strcmp(progress, "pull")) mode = kGatherProgressPull;
-    else if (!std::strcmp(progress, "push")) mode = kGatherProgressPush;
-    else return Status::InvalidArgument("KVAF_AIV_GATHER_PROGRESS_MODE must be legacy/pull/push");
-  }
-  s.args.progress_mode = s.args.pipeline_shards == 2 ? mode : kGatherProgressLegacy;
   const char* cooperative = std::getenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
   if (cooperative && *cooperative) {
     const auto parsed = std::from_chars(cooperative, cooperative + std::strlen(cooperative), s.args.cooperative_chunks);
@@ -438,9 +408,6 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
     if (!s.args.pipeline_chunk_bytes || s.args.probe ||
         uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
       return Status::InvalidArgument("cooperative gather requires nonzero chunk mode, no probe, token_bytes * SGL <= 65536");
-    // An explicit cooperative schedule takes precedence over legacy selectors.
-    s.args.pipeline_shards = 0;
-    s.args.progress_mode = kGatherProgressLegacy;
   }
   const char* prepare = std::getenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
   if (prepare && *prepare && std::strcmp(prepare, "0") && std::strcmp(prepare, "1"))
@@ -448,7 +415,7 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   s.args.prepare_ahead = prepare && *prepare ? std::strcmp(prepare, "1") == 0 : bool(s.args.cooperative_chunks);
   if (s.args.cooperative_chunks && !s.args.prepare_ahead)
     return Status::InvalidArgument("cooperative gather requires KVAF_AIV_GATHER_PREPARE_AHEAD=1");
-  if (s.args.prepare_ahead && (s.args.pipeline_shards || s.args.probe ||
+  if (s.args.prepare_ahead && (s.args.probe ||
       uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536))
     return Status::InvalidArgument("gather prepare-ahead requires whole-batch/prefix, no probe, token_bytes * SGL <= 65536");
   const char* coalesce = std::getenv("KVAF_AIV_GATHER_COALESCE_SGES");
@@ -483,13 +450,10 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s progress=%s chunk_bytes=%u max_shards=%u prepare_ahead=%u cooperative_chunks=%u\n",
-      s.args.cooperative_chunks ? "cooperative_prefix" :
-      s.args.pipeline_shards ? "shard" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
-      s.args.prepare_ahead ? "prepared" : s.args.pipeline_shards == 2 ? "packed" : "legacy",
-      s.args.progress_mode == kGatherProgressPush ? "push" :
-      s.args.progress_mode == kGatherProgressPull ? "pull" : "legacy",
-      s.args.pipeline_chunk_bytes, kGatherMaxShards, s.args.prepare_ahead, s.args.cooperative_chunks);
+  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u\n",
+      s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
+      s.args.prepare_ahead ? "prepared" : "baseline",
+      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks);
   return Status::OK();
 }
 Status GatherBatchGet::Drain() {

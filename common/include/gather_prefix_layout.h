@@ -3,9 +3,10 @@
 
 namespace kvaf {
 // GDR4 changes CPU copy ownership only. The 48-byte GDR2 envelope, mutable
-// byte prefix and final ACK keep their meanings; no shard vector is present.
+// byte prefix and final ACK keep their meanings.
 inline constexpr std::uint64_t kGatherCooperativeMagic = 0x4b56414647445234ULL;
 inline constexpr std::uint32_t kGatherMaxCooperativeChunks = 8;
+inline constexpr std::uint32_t kGatherScratchBytes = 64;
 #if defined(__CCE_AICORE__)
 #define KVAF_PREFIX_INLINE __aicore__ inline
 #else

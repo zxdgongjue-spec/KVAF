@@ -1,7 +1,8 @@
 # Gather：整批 ACK 下提前准备 WQE，再加入协作 chunk
 
-这两步基于整批 ACK / 连续前缀路径，不使用 GDR3 shard 选片。两步都有独立对照
-开关；未设置新开关时沿用原路径，便于同一构建比较。没有目标双机性能结果。
+当前保留整批 ACK 基线、连续前缀 chunk 对照，以及 WQE 提前准备与协作 chunk。
+两步优化有独立开关；默认使用 128 KiB 连续前缀，PREPARE_AHEAD=0、
+COOPERATIVE_CHUNKS=0，便于同一构建比较。没有目标双机性能结果。
 
 ## 第一步：整批 ACK + WQE 提前准备
 
@@ -49,8 +50,8 @@ AIV：       query + 提前准备 WQE → 提交 ready 的连续 WR
 NIC：                       READ0 ─── READ1 ─── READ2
 ```
 
-AIV 仍使用原 40 B descriptor READ 查询 sequence / ready_bytes，不读取 512 B
-shard 向量、不选片、不生成离散打包计划。准备游标可以领先 ready 游标，只有两者
+AIV 使用 40 B descriptor READ 查询 sequence / ready_bytes，按连续前缀消费。
+准备游标可以领先 ready 游标，只有两者
 共同覆盖的完整 WR 才提交。一个预构造 bank 中只有少量 WR ready 时，也提交这部分
 并保留其余内容，不能等待凑满 128 WR。每条 WQE 只构造一次；bank 和在途 READ 跨
 前缀保留。已准备且 ready 的首批优先提交，后续快照不插在其提交前处理。
@@ -61,20 +62,32 @@ shard 向量、不选片、不生成离散打包计划。准备游标可以领�
 
 ## 协议、ABI 与配置优先级
 
-- kernel：`KvafGatherBatchGetAivKernelV8`，args 256 B；loader 拒绝 V1–V7。
-- profile：PRF4，384 B；Python CSV schema 8。
+- kernel：`KvafGatherBatchGetAivKernelV9`，args 248 B；loader 拒绝 V1–V8。
+- profile：PRF5，256 B；Python CSV schema 9。
 - 第一步仍使用 GDR2 descriptor；第二步使用 gather 专用 GDR4 magic。
   GDR4 的 48 B header、16 B span、ready 前缀及最终 ACK 布局/含义与 GDR2 相同，
-  magic 仅区分 CPU 任务调度。没有新增 scatter 状态、payload buffer 或进度 WRITE。
-- CPU 与 NPU 的 Host/Runtime/Python/kernel 均须同步重编部署。旧 CPU 不接受 GDR4，
-  会返回错误 ACK，不能混合部署。NPU 运行日志应显示 V8 / args_bytes=256。
-- 非零 cooperative count 优先于旧 SHARD_PIPELINE / PACKED_POSTS / PROGRESS_MODE
-  选择器，实际走 prefix、progress_mode=0，不启用 CPU progress WRITE。
+  magic 仅区分 CPU 任务调度。每 lane scratch 为 64 B，descriptor 后不附加进度向量。
+- CPU 与 NPU 的 Host/Runtime/Python/kernel 均须同步重编部署。不支持 GDR4 的旧 CPU 会拒绝该请求，
+  会返回错误 ACK，不能混合部署。NPU 运行日志应显示 V9 / args_bytes=248。
+- 已删除 SHARD_PIPELINE、PACKED_POSTS、PROGRESS_MODE 及其专用代码、RPC、mailbox
+  和 profile 字段。旧环境变量非空时明确报错，请先 unset；不再静默选择其他路径。
 - 此时 CHUNK_BYTES 仅用于确认启用 chunk 模式，实际字节数按有效 payload 计算；
   显式 CHUNK_BYTES=0 与 cooperative 冲突并报错。
-- prepare-ahead 单独开启时只支持 whole-batch 或 SHARD_PIPELINE=0 的 prefix。
+- prepare-ahead 可用于 whole-batch、普通 prefix 和 cooperative prefix。
   probe 及 token_bytes*SGL>65536 的拆 token 路径不支持新开关，显式请求会报错。
 - 环境变量在 Runtime 初始化时捕获，切换组别须新建 Runtime。
+
+## Python/Host 调用快路径
+
+`trusted_gather_inputs=True` 仍默认启用：每轮读取当前七个 data_ptr、必要容量和当前
+stream handle，复用 method/vectorcall 与 current_stream callable；不缓存跨调用的
+指针、容量或 stream。调用方保证连续 NPU Tensor、int32 请求数组、int32[1] miss_count、
+uint64 地址表和等长 uint8 valid、output 行字节数及生命周期合法。仅支持 eager。
+`trusted_gather_inputs=False` 保留完整检查，C++ 可显式指定
+`BatchGetExecutionOptions::trusted_npu_request=true` 使用相同合同。
+
+同流异步提交、切流 fence、状态检查、MR/entity 缓存、错误后资源保留继续使用原有
+生命周期；本轮没有改变 Python/Host 快路径。
 
 ## 三组硬件对照
 
@@ -82,6 +95,9 @@ shard 向量、不选片、不生成离散打包计划。准备游标可以领�
 同一目录，分别运行以下三组；环境变量不在不同进程之间遗留：
 
 ```bash
+# 清除已删除的调度开关，避免继承上轮实验配置。
+unset KVAF_AIV_GATHER_SHARD_PIPELINE KVAF_AIV_GATHER_PACKED_POSTS KVAF_AIV_GATHER_PROGRESS_MODE
+
 # A：整批 ACK 基线
 env KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=0 \
   KVAF_AIV_GATHER_PREPARE_AHEAD=0 KVAF_AIV_GATHER_CHUNK_BYTES=0 \

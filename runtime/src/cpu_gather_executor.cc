@@ -20,25 +20,19 @@ std::uint64_t ThreadCpuNs() {
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
-  const bool sharded = header.magic == kGatherShardMagic;
   const bool cooperative = header.magic == kGatherCooperativeMagic;
   if (bytes < 64U || base > UINT64_MAX - bytes ||
-      (!sharded && !cooperative && header.magic != kGatherDescriptorMagic) ||
+      (!cooperative && header.magic != kGatherDescriptorMagic) ||
       header.span_count == 0U ||
-      (!sharded && header.ready_bytes != 0U) ||
+      header.ready_bytes != 0U ||
       (cooperative && (!header.pipeline_chunk_bytes ||
        (std::uint64_t(header.total_bytes) + header.pipeline_chunk_bytes - 1U) /
            header.pipeline_chunk_bytes > kGatherMaxCooperativeChunks)) ||
-      (sharded && (!header.pipeline_chunk_bytes || !header.span_bytes ||
-                   !header.sequence || header.sequence > UINT32_MAX ||
-                   !header.ready_bytes || header.ready_bytes > 13U ||
-                   header.ready_bytes * header.span_bytes > 65536U)) ||
       (header.pipeline_chunk_bytes != 0U &&
        (header.pipeline_chunk_bytes < 64U || header.pipeline_chunk_bytes % 64U != 0U)))
     return false;
   const auto data_bytes = GatherControlOffset(bytes);
-  const auto descriptor_bytes = sharded ?
-      GatherProgressOffset(header.span_count) + kGatherProgressBytes : GatherDescriptorBytes(header.span_count);
+  const auto descriptor_bytes = GatherDescriptorBytes(header.span_count);
   if (!GatherRange(base, data_bytes, descriptor_address, descriptor_bytes) ||
       !GatherRange(base, data_bytes, header.staging_address, header.total_bytes))
     return false;
@@ -80,17 +74,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     if (variable_offsets_.back() != header.total_bytes) return 0U;
   }
   pipeline_ready_ = nullptr;
-  shard_progress_ = nullptr;
   cooperative_ = header.magic == kGatherCooperativeMagic;
-  if (header.magic == kGatherShardMagic) {
-    pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
-    shard_sgl_ = static_cast<std::uint32_t>(header.ready_bytes);
-    shard_sequence_ = header.sequence;
-    shard_wrs_ = (header.span_count + shard_sgl_ - 1U) / shard_sgl_;
-    shard_count_ = GatherShardCount(shard_wrs_);
-    shard_progress_ = reinterpret_cast<std::uint64_t*>(
-        memory_ + descriptor_address - base_ + GatherProgressOffset(header.span_count));
-  } else if (header.pipeline_chunk_bytes != 0U) {
+  if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
@@ -110,18 +95,16 @@ void CpuGatherExecutor::Copy() {
     copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
     PublishReady();
-    PumpProgress();
     GatherSpinPause();
   }
   PublishReady();
-  PumpProgress();
   if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
 }
 
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   if (thread_profiles_.empty()) {
     (void)ProcessSource(worker);
-    if (pipeline_ready_ == nullptr && shard_progress_ == nullptr) GatherBarrier();
+    if (pipeline_ready_ == nullptr) GatherBarrier();
     return;
   }
   auto& profile = thread_profiles_[worker];
@@ -134,7 +117,7 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   profile.bytes = ProcessSource(worker);
   profile.copy_done_ns = NowNs();
   // Chunk writers already completed their stores before publishing progress.
-  if (pipeline_ready_ == nullptr && shard_progress_ == nullptr) GatherBarrier();
+  if (pipeline_ready_ == nullptr) GatherBarrier();
   profile.done_ns = NowNs();
   const auto cpu_end = ThreadCpuNs();
   profile.cpu_time_valid = cpu_begin != 0U && cpu_end >= cpu_begin;
@@ -193,44 +176,6 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
         PublishCooperativeReady();
       }
       if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
-    }
-    return copied;
-  }
-  if (shard_progress_ != nullptr) {
-    std::uint64_t copied = 0U;
-    const auto wr_bytes = std::uint64_t(shard_sgl_) * span_bytes_;
-    const auto step = std::max<std::uint64_t>(1U, pipeline_chunk_bytes_ / wr_bytes);
-    // A worker owns adjacent progress words and staging ranges. Publish a
-    // short first prefix, then checkpoint up to chunk bytes across shard ends.
-    // Both barriers remain; several completed shard words share one epoch.
-    const auto first_shard = (shard_count_ * worker + active_threads_ - 1U) / active_threads_;
-    const auto last_shard = (shard_count_ * (worker + 1U) + active_threads_ - 1U) / active_threads_;
-    if (first_shard == last_shard) return 0U;
-    auto shard = first_shard;
-    auto wr = std::uint64_t(GatherShardBoundary(shard_wrs_, shard_count_, first_shard));
-    const auto end = std::uint64_t(GatherShardBoundary(shard_wrs_, shard_count_, last_shard));
-    const auto first_end = std::uint64_t(GatherShardBoundary(shard_wrs_, shard_count_, first_shard + 1U));
-    bool first = true;
-    while (wr < end) {
-      const auto next = std::min(first ? first_end : end, wr + step);
-      copied += CopyRange(std::min(total_bytes_, wr * wr_bytes),
-                          std::min(total_bytes_, next * wr_bytes));
-      GatherBarrier();
-      while (shard < last_shard) {
-        const auto begin = GatherShardBoundary(shard_wrs_, shard_count_, shard);
-        const auto last = GatherShardBoundary(shard_wrs_, shard_count_, shard + 1U);
-        __atomic_store_n(shard_progress_ + shard,
-            GatherShardProgress(shard_sequence_, std::min<std::uint64_t>(next, last) - begin),
-            __ATOMIC_RELEASE);
-        if (next < last) break;
-        ++shard;
-        if (next == last) break;
-      }
-      GatherBarrier();
-      if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
-      if (worker == 0U) PumpProgress();
-      wr = next;
-      first = false;
     }
     return copied;
   }

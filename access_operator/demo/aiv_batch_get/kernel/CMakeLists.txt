@@ -84,7 +84,7 @@ foreach(mode scatter gather)
   set(mode_dependencies)
   if(mode STREQUAL "gather")
     list(APPEND mode_dependencies
-      "${KVAF_AIV_DEMO_INCLUDE_DIR}/../../../../common/include/gather_shard_layout.h")
+      "${KVAF_AIV_DEMO_INCLUDE_DIR}/../../../../common/include/gather_prefix_layout.h")
   endif()
   kvaf_compile_batch_get_kernel(kvaf_${mode}_batch_get execute_${mode}_batch_get_aiv.asc
     "${KVAF_AIV_DEMO_INCLUDE_DIR}/${mode}_batch_get_abi.h"

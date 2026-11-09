@@ -6,7 +6,6 @@
 #include "peer_link.h"
 #include "cpu_gather.h"
 #include "cpu_gather_executor.h"
-#include "gather_progress_transport.h"
 #include "gather_workspace.h"
 #include "cpu_push_get_worker.h"
 #include "batch_get_profile.h"
@@ -328,17 +327,12 @@ class CpuGatherWorker {
                   std::size_t threads, std::size_t min_bytes, bool affinity,
                   CpuGatherMode mode, uint64_t control_address = 0U,
                   std::size_t cpu_offset = 0U, uint64_t session_id = 0U,
-                  uint32_t lane = 0U, peer::GatherProgressTransport* progress = nullptr)
+                  uint32_t lane = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
             (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
         executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), affinity, cpu_offset), mode_(mode),
-        session_id_(session_id), lane_(lane), progress_(progress) {
-    if (progress_)
-      executor_.SetProgressHook(progress_, [](void* context, uint64_t sequence,
-          const uint64_t* words, uint32_t shards) {
-        static_cast<peer::GatherProgressTransport*>(context)->Advance(sequence, words, shards);
-      });
+        session_id_(session_id), lane_(lane) {
     const char* profile = std::getenv("KVAF_GATHER_PROFILE");
     profile_enabled_ = profile && std::strcmp(profile, "1") == 0;
     if (profile_enabled_) {
@@ -462,11 +456,6 @@ class CpuGatherWorker {
         valid = false;
       }
       const auto ack_start = profile_enabled_ ? BatchGetProfileNowNs() : 0U;
-      // Seal the last progress WRITE while payload READs may already be in
-      // flight. A final success ACK is immutable and never precedes a failed
-      // progress submission or reuse of an in-flight snapshot.
-      const bool progress_ok = !progress_ || progress_->Finish();
-      valid = valid && progress_ok;
       if (!valid && address % 64U == 0U &&
           peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
                             sizeof(peer::GatherDescriptorHeader))) {
@@ -477,11 +466,6 @@ class CpuGatherWorker {
       __atomic_store_n(&control_->ack,
                       sequence | (valid ? 0U : peer::kGatherErrorBit), __ATOMIC_RELEASE);
       peer::GatherBarrier();
-      if (!progress_ok) {
-        Log("[KVAF_CPU] GATHER_PROGRESS_FAILED session=%llu lane=%u; sources retained\n",
-            static_cast<unsigned long long>(session_id_), lane_);
-        break;
-      }
       if (profile_enabled_) {
         const auto service_end = BatchGetProfileNowNs();
         // Preallocated, bounded storage: logging here could delay observation
@@ -517,7 +501,6 @@ class CpuGatherWorker {
   CpuGatherMode mode_;
   uint64_t session_id_;
   uint32_t lane_;
-  peer::GatherProgressTransport* progress_{};
   bool profile_enabled_{false};
   std::vector<ProfileSample> profile_samples_;
   std::size_t profile_count_{}, profile_dropped_{};
@@ -538,7 +521,6 @@ struct Region {
   std::vector<Channel> channels;
   std::unique_ptr<CpuGatherWorker> gather;
   std::vector<std::unique_ptr<CpuGatherWorker>> gather_lanes;
-  std::vector<std::unique_ptr<peer::GatherProgressTransport>> gather_progress;
   std::unique_ptr<cpu_push::Worker> push;
 };
 
@@ -760,8 +742,7 @@ class CpuService {
     const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kNotFound;
     Region& region = *found->second;
-    if (region.push || region.gather != nullptr || !region.gather_lanes.empty() ||
-        !region.gather_progress.empty()) return Result::kResourceError;
+    if (region.push || region.gather != nullptr || !region.gather_lanes.empty()) return Result::kResourceError;
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
@@ -782,8 +763,6 @@ class CpuService {
                            lanes * sizeof(peer::GatherControl)))
       return Result::kInvalidRequest;
     if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
-    if (!region.gather_progress.empty() && region.gather_progress.size() != lanes)
-      return Result::kInvalidRequest;
     std::vector<std::unique_ptr<CpuGatherWorker>> created;
     std::size_t cpu_offset = 0U;
     try {
@@ -792,8 +771,7 @@ class CpuService {
         created.push_back(std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
             gather_affinity_, gather_mode_, control_address + lane * sizeof(peer::GatherControl),
-            cpu_offset, session_id, lane,
-            region.gather_progress.empty() ? nullptr : region.gather_progress[lane].get()));
+            cpu_offset, session_id, lane));
         cpu_offset += budget;
       }
     } catch (const std::exception& error) {
@@ -804,63 +782,11 @@ class CpuService {
     return Result::kOk;
   }
 
-  Result EnableGatherProgress(const peer::EnableGatherProgressRequest& request) {
-    const auto found = regions_.find(request.session_id);
-    if (found == regions_.end()) return Result::kNotFound;
-    auto& region = *found->second;
-    if (!request.lanes || request.lanes > kGatherMaxWorkers || request.lanes > gather_threads_ ||
-        request.segment_bytes != sizeof(urma_seg_t) || request.token_value != region.token_value ||
-        request.mailbox_base % 64 || request.mailbox_base > UINT64_MAX -
-            uint64_t(request.lanes) * kGatherScratchBytes)
-      return Result::kInvalidRequest;
-    if (region.push || region.gather || !region.gather_lanes.empty() || !region.gather_progress.empty())
-      return Result::kResourceError;
-    urma_seg_t segment{};
-    std::memcpy(&segment, request.segment, sizeof(segment));
-    if (!peer::GatherRange(segment.ubva.va, segment.len, request.mailbox_base,
-        uint64_t(request.lanes - 1) * kGatherScratchBytes + kGatherProgressBytes))
-      return Result::kInvalidRequest;
-    for (uint32_t lane = 0; lane < request.lanes; ++lane) {
-      for (uint32_t previous = 0; previous < lane; ++previous)
-        if (request.jetty_ids[lane] == request.jetty_ids[previous]) return Result::kInvalidRequest;
-      const auto channel = std::find_if(region.channels.begin(), region.channels.end(), [&](const auto& c) {
-        return c.local_jetty && c.remote_jetty && c.remote_jetty->id.id == request.jetty_ids[lane] &&
-            std::memcmp(c.remote_jetty->id.eid.raw, segment.ubva.eid.raw, kEidBytes) == 0;
-      });
-      if (channel == region.channels.end()) return Result::kInvalidRequest;
-      region.gather_progress.push_back(std::make_unique<peer::GatherProgressTransport>());
-      const auto result = region.gather_progress.back()->Initialize(region.resources->context(),
-          request, lane, channel->local_jetty, channel->remote_jetty, channel->local_jfc);
-      if (!result.ok()) {
-        Log("[KVAF_CPU] GATHER_PROGRESS_SETUP_FAILED lane=%u reason=%s\n", lane, result.message().c_str());
-        return Result::kResourceError; // STOP owns partial setup too.
-      }
-    }
-    Log("[KVAF_CPU] GATHER_PROGRESS_ENABLED session=%llu lanes=%u\n",
-        static_cast<unsigned long long>(region.id), request.lanes);
-    return Result::kOk;
-  }
-
   Result StopGatherLanes(uint64_t session_id) {
     const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kOk;
     auto& region = *found->second;
-    region.gather_lanes.clear(); // joins every possible progress producer first
-    for (auto& progress : region.gather_progress) {
-      if (auto* jetty = progress->jetty()) {
-        const auto channel = std::find_if(region.channels.begin(), region.channels.end(),
-            [&](const auto& c) { return c.local_jetty == jetty; });
-        if (channel == region.channels.end() || urma_delete_jetty(jetty)) {
-          Log("[KVAF_CPU] GATHER_PROGRESS_STOP_FAILED; DMA resources retained\n");
-          return Result::kResourceError;
-        }
-        channel->local_jetty = nullptr;
-        progress->Quiesced();
-      }
-      const auto result = progress->Shutdown();
-      if (!result.ok()) return Result::kResourceError;
-    }
-    region.gather_progress.clear();
+    region.gather_lanes.clear(); // Join all CPU copy workers before releasing their workspace.
     return Result::kOk;
   }
 
@@ -869,7 +795,7 @@ class CpuService {
     const auto found = regions_.find(request.session_id);
     if (found == regions_.end()) return Result::kNotFound;
     auto& region = *found->second;
-    if (region.push || region.gather || !region.gather_lanes.empty() || !region.gather_progress.empty())
+    if (region.push || region.gather || !region.gather_lanes.empty())
       return Result::kResourceError;
     if (!request.source_bytes || request.source_bytes > region.bytes)
       return Result::kInvalidRequest;
@@ -1236,17 +1162,6 @@ void HandleClient(int fd, CpuService* service) {
       return;
     }
 
-    case Command::kEnableGatherProgress: {
-      peer::EnableGatherProgressRequest request{};
-      request.header = header;
-      if (!IsValidHeader(header, command, sizeof(request)) ||
-          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
-        SendStatus(fd, command, Result::kInvalidRequest);
-        return;
-      }
-      SendStatus(fd, command, service->EnableGatherProgress(request));
-      return;
-    }
     case Command::kOpenCpuPushGet: {
       peer::OpenCpuPushGetRequest request{};
       request.header = header;
