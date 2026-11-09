@@ -545,6 +545,11 @@ class NpuPythonRuntime final {
       item["multi_run_posts"] = p.multi_run_posts;
       item["packed_posts"] = p.packed_posts;
       item["read_plan_segments"] = p.read_plan_segments;
+      item["progress_mode"] = p.progress_mode;
+      item["ready_local_polls"] = p.ready_local_polls;
+      item["ready_local_updates"] = p.ready_local_updates;
+      item["ready_ack_checks"] = p.ready_ack_checks;
+      item["ready_control_wrs"] = p.ready_control_wrs;
       cores.append(std::move(item));
     }
     py::dict result;

@@ -105,9 +105,11 @@ void CpuGatherExecutor::Copy() {
     copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
     PublishReady();
+    PumpProgress();
     GatherSpinPause();
   }
   PublishReady();
+  PumpProgress();
   if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
 }
 
@@ -199,6 +201,7 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
       }
       GatherBarrier();
       if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
+      if (worker == 0U) PumpProgress();
       wr = next;
       first = false;
     }

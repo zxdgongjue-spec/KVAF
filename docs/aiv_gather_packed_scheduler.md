@@ -1,5 +1,8 @@
 # Gather ready 库存与离散 WR 合批调度
 
+当前版本为 [V7 进度控制优化](aiv_gather_progress_control.md)：默认 progress-only pull，
+可选 CPU 进度 push；args 248 B、profile 320 B、CSV schema 7。下文历史版本说明保留。
+
 2026-11-09：默认使用 packed 调度器。Python 调用快路径保持不变；CPU wire 继续
 使用 GDR3，sequence、最终 ACK、staging 复用和队列 poison 规则保持不变。
 

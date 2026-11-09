@@ -387,6 +387,20 @@ Status PeerLink::EnableGatherLanes(uint64_t region_base, uint64_t control_addres
   return Status::OK();
 }
 
+Status PeerLink::EnableGatherProgress(uint64_t base, EnableGatherProgressRequest request) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  request.header = MakeHeader(Command::kEnableGatherProgress, sizeof(request));
+  request.session_id = found->second.session_id;
+  StatusResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kEnableGatherProgress, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("gather progress WRITE setup failed", std::move(error));
+  return Status::OK();
+}
+
 Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
                                 OpenCpuPushGetResponse* response) const {
   const auto found = regions_.find(base);

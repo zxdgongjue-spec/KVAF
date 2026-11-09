@@ -1,5 +1,8 @@
 # Gather 分片进度流水与调用快路径
 
+当前版本为 [V7 进度控制优化](aiv_gather_progress_control.md)：默认 progress-only pull，
+可选 CPU 进度 push；args 248 B、profile 320 B、CSV schema 7。下文历史版本说明保留。
+
 当前默认调度器已升级为 [V6 ready 库存与离散 WR 合批](aiv_gather_packed_scheduler.md)。
 下文保留 V5 的 GDR3 wire 与连续 run 调度说明；V6 的 profile 为 256 B，
 CPU 新发布策略和配套重编方式以新文档为准。

@@ -2,7 +2,7 @@
 #include "sequential_batch_get_abi.h"
 #include "gather_shard_layout.h"
 
-constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524632ULL;
+constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524633ULL;
 // A completed successful profile has all seven boundary timestamps. On error,
 // only the boundaries reached by this launch are marked valid.
 constexpr uint64_t KVAF_GATHER_PROFILE_ALL_EVENTS = 0x7f;
@@ -21,8 +21,10 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
   uint64_t read_vf_calls, ready_no_change_queries, ready_query_skips;
   uint64_t max_ready_backlog_wrs, ready_idle_waits, multi_run_posts;
   uint64_t packed_posts, read_plan_segments;
+  uint64_t progress_mode, ready_local_polls, ready_local_updates;
+  uint64_t ready_ack_checks, ready_control_wrs;
 };
-static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 256);
+static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 320);
 
 enum KvafGatherProbe : uint32_t {
   KVAF_GATHER_PROBE_NONE = 0, KVAF_GATHER_PROBE_ACK = 1,
@@ -57,8 +59,10 @@ struct KvafGatherBatchGetArgs {
   // V6: 0 = GDR2 prefix/whole batch, 1 = legacy GDR3 scheduler,
   // 2 = packed-ready GDR3 scheduler. The CPU wire format stays GDR3.
   uint32_t pipeline_shards;
+  // 0 = V6 dual READ query; 1 = progress-only pull; 2 = CPU progress WRITE.
+  uint32_t progress_mode, reserved;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 240);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 248);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

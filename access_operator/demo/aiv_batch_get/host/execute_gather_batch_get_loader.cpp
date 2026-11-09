@@ -11,7 +11,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafGatherBatchGetAivKernelV6";
+constexpr char kKernelName[] = "KvafGatherBatchGetAivKernelV7";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;

@@ -9,6 +9,10 @@ inline constexpr std::uint64_t kGatherShardMagic = 0x4b56414647445233ULL;
 inline constexpr std::uint32_t kGatherMaxShards = 64;
 inline constexpr std::uint32_t kGatherProgressBytes = kGatherMaxShards * 8;
 inline constexpr std::uint32_t kGatherScratchBytes = 64 + kGatherProgressBytes;
+// Packed gather control paths. These do not change the GDR3 payload protocol.
+inline constexpr std::uint32_t kGatherProgressLegacy = 0;
+inline constexpr std::uint32_t kGatherProgressPull = 1;
+inline constexpr std::uint32_t kGatherProgressPush = 2;
 #if defined(__CCE_AICORE__)
 #define KVAF_GATHER_INLINE __aicore__ inline
 #else

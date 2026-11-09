@@ -1,5 +1,8 @@
 # Gather 阶段计时与 AIV 内部流水
 
+当前版本为 [V7 进度控制优化](aiv_gather_progress_control.md)：默认 progress-only pull，
+可选 CPU 进度 push；args 248 B、profile 320 B、CSV schema 7。下文历史版本说明保留。
+
 当前调度与 profile 版本见 [V6 ready 库存与离散 WR 合批](aiv_gather_packed_scheduler.md)：
 args 240 B、profile 256 B，CSV schema 6。下文 V5/V4 部分保留为历史说明。
 

@@ -50,6 +50,12 @@ int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transport,
                                        KvafBatchGetLocalBuffer **local_buffer,
                                        uint64_t *device_channel_entity);
 
+// Enable gather-only progress WRITEs into the scratch mailboxes of this local
+// buffer. Reuses the reverse direction of each lane's control channel.
+int32_t KvafBatchGetEnableGatherProgress(KvafBatchGetTransport *transport,
+                                        KvafBatchGetLocalBuffer *workspace,
+                                        uint32_t lanes);
+
 // The demo retains zero-reference registrations until TransportDestroy, so a
 // later acquire can reuse them without re-registering HBM. Call only after
 // all launches using this local buffer have completed.

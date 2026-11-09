@@ -161,3 +161,23 @@ endif()
 add_executable(kvaf_runtime_batch_get_contract_test runtime_batch_get_contract_test.cc)
 target_link_libraries(kvaf_runtime_batch_get_contract_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_runtime_batch_get_contract_test COMMAND kvaf_runtime_batch_get_contract_test)
+
+add_executable(kvaf_gather_progress_pump_test gather_progress_pump_test.cc
+  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)
+target_include_directories(kvaf_gather_progress_pump_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
+target_link_libraries(kvaf_gather_progress_pump_test PRIVATE pthread)
+add_test(NAME kvaf_gather_progress_pump_test COMMAND kvaf_gather_progress_pump_test)
+
+# Optional native-ABI check: uses public headers and deferred URMA doubles.
+set(KVAF_TEST_URMA_INCLUDE_DIR "" CACHE PATH "Public URMA headers for gather transport tests")
+if(KVAF_TEST_URMA_INCLUDE_DIR)
+  add_executable(kvaf_gather_progress_transport_test gather_progress_transport_test.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/gather_progress_transport.cc)
+  target_include_directories(kvaf_gather_progress_transport_test PRIVATE
+    ${KVAF_TEST_URMA_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/runtime/src
+    ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include
+    ${PROJECT_SOURCE_DIR}/access_operator/include)
+  target_link_libraries(kvaf_gather_progress_transport_test PRIVATE pthread)
+  add_test(NAME kvaf_gather_progress_transport_test COMMAND kvaf_gather_progress_transport_test)
+endif()

@@ -106,6 +106,8 @@ class CpuGatherExecutor {
   }
 
   void Copy();
+  using ProgressHook = void (*)(void*, std::uint64_t, const std::uint64_t*, std::uint32_t);
+  void SetProgressHook(void* context, ProgressHook hook) { progress_context_ = context; progress_hook_ = hook; }
 
   // Enable before the first PrepareDirect. Disabled execution reads no clocks.
   void EnableProfiling() { thread_profiles_.resize(max_threads_); }
@@ -115,6 +117,12 @@ class CpuGatherExecutor {
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
+  void PumpProgress() {
+    if (progress_hook_ && shard_progress_)
+      progress_hook_(progress_context_, shard_sequence_, shard_progress_, shard_count_);
+  }
+  void* progress_context_{};
+  ProgressHook progress_hook_{};
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
                       std::uint32_t span_count, std::uint32_t total_bytes) {
     const std::size_t threads =

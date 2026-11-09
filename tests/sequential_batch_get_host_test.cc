@@ -19,7 +19,8 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
-uint32_t last_coalesce_sges{};
+uint32_t last_coalesce_sges{}, last_progress_mode{}, progress_setups{};
+bool fail_progress_setup{}, progress_live{};
 uint32_t last_pipeline_chunk_bytes{}, last_pipeline_shards{};
 uint32_t capture_queries{};
 bool allow_queued_launches{};
@@ -95,6 +96,7 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   last_coalesce_sges = a->coalesce_sges;
   last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
   last_pipeline_shards = a->pipeline_shards;
+  last_progress_mode = a->progress_mode;
   if (a->probe) assert(!last_pipeline_chunk_bytes);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
@@ -140,6 +142,7 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         if (args.pipeline_chunk_bytes && p.requests) {
           p.pipeline_chunk_bytes = args.pipeline_chunk_bytes;
           p.packed_posts = args.pipeline_shards == 2;
+          p.progress_mode = args.progress_mode;
           p.ack_done_cycle = 106;
           p.first_ready_cycle = 104;
           p.first_read_submit_cycle = 104;
@@ -180,9 +183,13 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport*, void*,
     KvafBatchGetLocalBuffer** b, uint64_t* e) {
   ++refs; *b = new KvafBatchGetLocalBuffer; *e = 1; return 0;
 }
+extern "C" int32_t KvafBatchGetEnableGatherProgress(KvafBatchGetTransport*, KvafBatchGetLocalBuffer*, uint32_t) {
+  ++progress_setups; progress_live = true;
+  return fail_progress_setup ? 1 : 0;
+}
 extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer* b) { --refs; delete b; }
 extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport*) {
-  assert(work.empty()); if (fail_quiesce) return 1; ++quiesced; return 0;
+  assert(work.empty() && !progress_live); if (fail_quiesce) return 1; ++quiesced; return 0;
 }
 extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport* t) { delete t; }
 
@@ -194,7 +201,7 @@ Status PeerLink::LookupRegion(uint64_t base, PeerRegion* r) const {
 Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
-Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
+Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); progress_live = false; ++stopped; return Status::OK(); }
 Status PeerLink::OpenCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenCpuPushGetResponse*) const { return Status::OK(); }
 Status PeerLink::StartCpuPushGet(uint64_t) const { return Status::OK(); }
 Status PeerLink::StopCpuPushGet(uint64_t) const { assert(work.empty()); ++push_stopped; return Status::OK(); }
@@ -505,7 +512,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=240", "record_bytes=256"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=248", "record_bytes=320"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);
@@ -658,5 +665,26 @@ int main() {
   setenv("KVAF_AIV_GATHER_PACKED_POSTS", "invalid", 1);
   { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
   unsetenv("KVAF_AIV_GATHER_PACKED_POSTS");
+  for (const char* setting : {"legacy", "pull", "push"}) {
+    setenv("KVAF_AIV_GATHER_PROGRESS_MODE", setting, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
+    const auto expected_mode = std::strcmp(setting, "legacy") == 0 ? 0U :
+        std::strcmp(setting, "pull") == 0 ? 1U : 2U;
+    assert(owner->Execute(exec).ok() && last_progress_mode == expected_mode);
+    assert(owner->Shutdown().ok() && !progress_live && !refs && !allocations);
+  }
+  assert(progress_setups == 1);
+  setenv("KVAF_AIV_GATHER_PROGRESS_MODE", "push", 1);
+  fail_progress_setup = true;
+  {
+    auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
+    assert(owner->Shutdown().ok() && !progress_live && !refs && !allocations);
+  }
+  fail_progress_setup = false;
+  unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
+  setenv("KVAF_AIV_GATHER_PROGRESS_MODE", "invalid", 1);
+  { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
+  unsetenv("KVAF_AIV_GATHER_PROGRESS_MODE");
   std::cout << "sequential Host lifecycle: PASS\n";
 }

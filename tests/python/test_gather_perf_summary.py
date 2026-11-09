@@ -56,6 +56,15 @@ class GatherPerfSummaryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "PACKED_POSTS"):
                 perf.validate_config(2)
 
+    def test_progress_control_selection_is_validated_and_recorded(self):
+        for setting in ("legacy", "pull", "push", ""):
+            with patch.dict(os.environ, {"KVAF_AIV_GATHER_PROGRESS_MODE": setting}):
+                perf.validate_config(2)
+                self.assertEqual(self.csv_metadata()["configured_progress_mode"], setting or "pull")
+        with patch.dict(os.environ, {"KVAF_AIV_GATHER_PROGRESS_MODE": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "PROGRESS_MODE"):
+                perf.validate_config(2)
+
     def test_invalid_shapes_and_counts_fail_before_hardware(self):
         for field, value in (
             ("TOKEN_BYTES", 0), ("TOKEN_BYTES", 65536),
@@ -424,7 +433,7 @@ class GatherPerfSummaryTest(unittest.TestCase):
         self.assertEqual(metadata["run_directory"], "20261031_093235-cores3-token-bytes656-request-count1")
         self.assertEqual(metadata["started_at_local"], "2026-10-31T09:32:35+08:00")
         self.assertEqual(metadata["timezone"], "Asia/Shanghai")
-        self.assertEqual(metadata["schema_version"], 6)
+        self.assertEqual(metadata["schema_version"], 7)
 
     def test_csv_rejects_partial_or_invalid_profile_batches(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -17,6 +17,8 @@
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
+#include "gather_shard_layout.h"
+#include "peer_link.h"
 
 namespace hccp = kvaf::direct_hccp;
 
@@ -608,6 +610,42 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transpo
                                                     KvafBatchGetLocalBuffer **local_buffer,
                                                     uint64_t *device_channel_entity) {
   if (!AcquireLocalBuffer(transport, output_hbm, output_hbm_bytes, local_buffer, device_channel_entity)) {
+    return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  }
+  return KVAF_BATCH_GET_SUCCESS;
+}
+
+extern "C" int32_t KvafBatchGetEnableGatherProgress(KvafBatchGetTransport *t,
+    KvafBatchGetLocalBuffer *local, uint32_t lanes) {
+  if (!t || !local || local->transport != t || !local->reference_count || !t->peer_link ||
+      t->paths.size() != 1 || local->path_registrations.size() != 1 ||
+      !lanes || lanes > 8 || t->worker_count != lanes * 2 ||
+      local->output_hbm_bytes < uint64_t(lanes) * kvaf::kGatherScratchBytes)
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  const auto& memory = local->path_registrations[0].memory;
+  // Public 48-byte urma_seg_t: packed UBVA at 20, length at 32.
+  if (memory.key_bytes < 48) return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  uint64_t exported = 0, bytes = 0;
+  std::memcpy(&exported, memory.key + 20, 8);
+  std::memcpy(&bytes, memory.key + 32, 8);
+  if (!exported || local->output_hbm_address < memory.registered_address)
+    return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  const auto delta = local->output_hbm_address - memory.registered_address;
+  if (delta > bytes || local->output_hbm_bytes > bytes - delta ||
+      exported > UINT64_MAX - delta - 64)
+    return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
+  kvaf::peer::EnableGatherProgressRequest request{};
+  request.mailbox_base = exported + delta + 64;
+  request.lanes = lanes;
+  request.segment_bytes = 48;
+  request.token_value = memory.token_value;
+  std::memcpy(request.segment, memory.key, 48);
+  for (uint32_t lane = 0; lane < lanes; ++lane)
+    request.jetty_ids[lane] = t->workers[lane * 2 + 1].device_user_ctl_jetty.info.ub.id;
+  const auto result = t->peer_link->EnableGatherProgress(
+      t->peer_memory.registered_address, request);
+  if (!result.ok()) {
+    std::fprintf(stderr, "[KVAF_AIV] GATHER_PROGRESS_SETUP_FAILED reason=%s\n", result.message().c_str());
     return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
   }
   return KVAF_BATCH_GET_SUCCESS;

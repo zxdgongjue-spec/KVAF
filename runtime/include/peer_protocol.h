@@ -32,6 +32,7 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kStopGatherLanes = 14U,
+  kEnableGatherProgress = 15U,
 };
 
 enum class Result : int32_t {
@@ -139,6 +140,15 @@ struct EnableGatherLanesRequest {
   uint64_t control_address;
   uint32_t lanes;
 };
+// Gather-only progress WRITE setup, using the reverse direction of already
+// established gather control channels. No payload or scatter completion state.
+struct EnableGatherProgressRequest {
+  MessageHeader header;
+  uint64_t session_id, mailbox_base;
+  uint32_t lanes, segment_bytes, token_value;
+  uint32_t jetty_ids[8];
+  uint8_t segment[kSegKeyBytes];
+};
 // CPU-initiated transfers target Host-registered HBM. Setup completes before
 // the separate start command permits the CPU worker to issue any DMA.
 struct CpuPushChannelKey {
@@ -174,6 +184,7 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
+static_assert(sizeof(EnableGatherProgressRequest) == 136U, "gather progress setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");

@@ -49,6 +49,7 @@ class PeerLink {
   Status StopGatherLanes(uint64_t region_base) const;
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status EnableGatherProgress(uint64_t region_base, EnableGatherProgressRequest request) const;
   Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
                         OpenCpuPushGetResponse* response) const;
   Status StartCpuPushGet(uint64_t region_base) const;
