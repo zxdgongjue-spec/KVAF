@@ -488,7 +488,8 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       (!impl_->options.peer_eids.empty() &&
        (impl_->options.npu_eids.size() != 1U || impl_->options.adaptive_ub_device ||
         !impl_->options.peer_ub_device.empty() ||
-        impl_->options.peer_eids.size() > impl_->options.jettys_per_core)) ||
+        impl_->options.peer_eids.size() >
+            static_cast<std::size_t>(impl_->options.npu_core_count) * impl_->options.jettys_per_core)) ||
       (impl_->options.adaptive_ub_device &&
        !impl_->options.peer_ub_device.empty()) ||
       (impl_->options.adaptive_ub_device &&

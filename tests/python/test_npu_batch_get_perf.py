@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
-from npu_eids import parse_npu_eids
+from npu_eids import parse_npu_eids, select_peer_eids
 import batch_get_jetty_profile as jetty_profile
 import peer_eid_profile
 
@@ -198,7 +198,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="strict K-side UB device selected by an earlier process",
     )
     parser.add_argument("--peer-eids", type=parse_npu_eids, default=[],
-                        help="strict CPU EIDs sharing DDR; concurrent Jetty paths in one kernel")
+                        help="strict CPU EIDs sharing DDR; one Jetty in total randomly selects "
+                             "one EID for the entire run, otherwise stripes paths across core/Jetty workers")
     parser.add_argument("--peer-csv", default="",
                         help="per-sample/core/peer traffic and observed overlap CSV")
     parser.add_argument(
@@ -288,6 +289,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
     args = parser.parse_args(argv)
+    args.requested_peer_eids = args.peer_eids
+    args.peer_eids = select_peer_eids(args.requested_peer_eids, args.aiv_cores, args.jettys_per_core)
     if args.miss_count is None:
         args.miss_count = args.request_length
     args.adaptive_ub_miss_count = environment_int(
@@ -352,8 +355,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
     if args.peer_eids:
         if len(args.npu_eids) != 1 or args.adaptive_ub_device or args.peer_ub_device:
             return "peer-eids requires one npu-eid and excludes adaptive/fixed UB device selection"
-        if args.jettys_per_core < len(args.peer_eids):
-            return "peer-eids requires at least one Jetty per peer on each core"
+        if args.aiv_cores * args.jettys_per_core < len(args.peer_eids):
+            return "peer-eids count must not exceed aiv-cores * jettys-per-core"
     if len(args.peer_eids) > 1:
         # A post carries 128 READs; ensure the first group reaches every Jetty
         # before completion polling, including with the two-group inflight cap.
@@ -364,6 +367,13 @@ def validate_args(args: argparse.Namespace) -> str | None:
             if args.max_inflight_total < 2 * minimum:
                 return f"peer-eids requires max-inflight-total=0 or >= {2 * minimum}"
     return None
+
+
+def report_peer_eid_selection(args, emit=print):
+    if args.requested_peer_eids != args.peer_eids:
+        emit(f"BATCH_GET_PEER_EID_SELECTION requested_peer_eids={','.join(args.requested_peer_eids)} "
+             f"selected_peer_eid={args.peer_eids[0]} reason=single_jetty_random "
+             "mode=single_eid_baseline")
 
 
 def wait_for_concurrent_start() -> None:
@@ -641,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    report_peer_eid_selection(args)
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(

@@ -14,7 +14,7 @@ import sys
 import threading
 
 import test_npu_batch_get_perf as perf
-from npu_eids import parse_npu_eids
+from npu_eids import parse_npu_eids, select_peer_eids
 
 SHAPE_COLUMNS = ("token_bytes", "miss_count", "aiv_cores", "jettys_per_core")
 STAGES = (("kernel_total", ""), ("kernel_post", "post_"),
@@ -42,7 +42,8 @@ def parse_args(argv=None):
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--peer-eids", required=True, type=parse_npu_eids,
                         help="one CPU EID for a baseline, or multiple distinct comma-separated EIDs; "
-                             "count must not exceed --jettys")
+                             "--cores 1 --jettys 1 randomly selects one EID per configuration; "
+                             "otherwise count must not exceed cores * Jettys per core")
     parser.add_argument("--npu-eid", required=True, type=parse_npu_eids)
     parser.add_argument("--cores", type=sweep_values, metavar="N[,N...]",
                         default=os.environ.get("KVAF_BATCH_GET_SWEEP_AIV_CORES") or "1",
@@ -81,6 +82,10 @@ def parse_args(argv=None):
     for token_bytes, miss_count, cores, jettys in product(*axes):
         run = argparse.Namespace(**vars(args))
         run.token_bytes, run.miss_count, run.cores, run.jettys = token_bytes, miss_count, cores, jettys
+        run.requested_peer_eids = args.peer_eids
+        run.peer_eids = select_peer_eids(run.requested_peer_eids, cores, jettys)
+        run.mode = {1: "single_eid_baseline", 2: "dual_eid_concurrent"}.get(
+            len(run.peer_eids), "multi_eid_concurrent")
         if multiple:
             name = "_".join(f"{key}_{value}" for key, value in shape_fields(run).items())
             run.output_dir = args.output_dir / name
@@ -196,20 +201,32 @@ def write_summary(rows, clock_mhz, output, emit):
     emit(f"BATCH_GET_MISS_SWEEP_CSV_WRITTEN path={path} rows={len(rows)}")
 
 
-def run_case(args, env, mode, stream):
+def run_case(args, env, stream):
     options = benchmark_args(args)
     command = [sys.executable, "-u", str(Path(perf.__file__).resolve()), *options]
     config = dict(vars(args), command=command, cpu_service=env["KVAF_CPU_SERVICE_ADDR"],
-                  device_id=env.get("DEVICE_ID", "0"), execution="single_kernel", mode=mode,
+                  device_id=env.get("DEVICE_ID", "0"), execution="single_kernel",
                   benchmark=vars(perf.parse_args(options)),
                   jetty_priorities=env.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "default"))
     (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2) + "\n", encoding="utf-8")
+
+    def emit(message):
+        print(message, flush=True)
+        stream.write(message + "\n")
+        stream.flush()
+
+    perf.report_peer_eid_selection(args, emit=emit)
     code = run_logged(command, env, stream, args.timeout)
     if code:
         return code, None
     stream.flush()
     log_text = (args.output_dir / "batch_get.log").read_text(encoding="utf-8")
-    peer_result = "PEER_EID_BASELINE " if len(args.peer_eids) == 1 else "PEER_EID_CONCURRENCY "
+    if len(args.peer_eids) == 1:
+        peer_result = "PEER_EID_BASELINE "
+    elif args.jettys < len(args.peer_eids):
+        peer_result = "PEER_EID_MULTI_CORE_TRAFFIC "
+    else:
+        peer_result = "PEER_EID_CONCURRENCY "
     if (not (args.output_dir / "jettys.csv").is_file() or
             not (args.output_dir / "peer_samples.csv").is_file() or
             "BATCH_GET_JETTY_CSV_WRITTEN " not in log_text or peer_result not in log_text):
@@ -219,12 +236,8 @@ def run_case(args, env, mode, stream):
 
 def main(argv=None):
     args, runs = parse_args(argv)
-    if len(args.peer_eids) == 1:
-        mode = "single_eid_baseline"
-    elif len(args.peer_eids) == 2:
-        mode = "dual_eid_concurrent"
-    else:
-        mode = "multi_eid_concurrent"
+    modes = {run.mode for run in runs}
+    mode = runs[0].mode if len(modes) == 1 else "mixed"
     build = args.build_dir.resolve()
     kernel = build / "bin/kvaf_execute_batch_get_kernels.o"
     put_kernel = build / "bin/kvaf_execute_batch_put_kernels.o"
@@ -262,14 +275,15 @@ def main(argv=None):
         emit(f"BATCH_GET_MISS_SWEEP_LOG_DIR path={output}")
         emit(f"BATCH_GET_MISS_SWEEP_PLAN token_sizes={len(args.token_bytes)} miss_counts={len(args.miss_count)} "
              f"aiv_core_counts={len(args.cores)} jetty_counts={len(args.jettys)} combinations={len(runs)}")
-        emit(f"BATCH_GET_PEER_EID_CONFIG peer_eids={','.join(args.peer_eids)} "
-             f"peer_count={len(args.peer_eids)} mode={mode} "
+        emit(f"BATCH_GET_PEER_EID_CONFIG requested_peer_eids={','.join(args.peer_eids)} "
+             f"requested_peer_count={len(args.peer_eids)} mode={mode} "
              "execution=single_kernel traffic_scope=all_peers_total")
         rows = []
         for run in runs:
             shape = " ".join(f"{key}={value}" for key, value in shape_fields(run).items())
             log = run.output_dir / "batch_get.log"
-            emit(f"BATCH_GET_CONFIG_SWEEP_BEGIN {shape}")
+            emit(f"BATCH_GET_CONFIG_SWEEP_BEGIN {shape} mode={run.mode} "
+                 f"peer_eids={','.join(run.peer_eids)} peer_count={len(run.peer_eids)}")
             try:
                 if len(runs) > 1:
                     run.output_dir.mkdir()
@@ -277,7 +291,7 @@ def main(argv=None):
                 else:
                     case_log = nullcontext(stream)
                 with case_log as case_stream:
-                    code, row = run_case(run, env, mode, case_stream)
+                    code, row = run_case(run, env, case_stream)
             except (OSError, ValueError) as error:
                 emit(f"BATCH_GET_MISS_SWEEP_FAILED {shape} status=1 reason={error} log={log}")
                 return 1

@@ -32,6 +32,8 @@ int32_t KvafBatchGetTransportCreateWithPeerLink(
 // peer_local_eid_count 16-byte EIDs. Workers are assigned to EID paths in
 // jetty-major round-robin order, spreading each core's primary Jetty before
 // its secondary Jetty. The legacy entry point above remains a one-EID wrapper.
+// With multiple remote peers, use per-core round robin when each core has
+// enough Jettys; otherwise distribute remote peers in jetty-major order.
 int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link,

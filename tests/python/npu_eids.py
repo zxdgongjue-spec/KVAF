@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+import random
+
+
+def select_peer_eids(peer_eids: list[str], cores: int, jettys_per_core: int) -> list[str]:
+    """Use one random peer only when the whole kernel has a single Jetty."""
+    if cores * jettys_per_core == 1 and len(peer_eids) > 1:
+        return [random.choice(peer_eids)]
+    return list(peer_eids)
+
+
+def peer_eid_path(core: int, slot: int, cores: int, jettys: int, peers: int) -> int:
+    """Match native PeerEidPathIndexForWorker, including cross-core routing."""
+    return (slot if jettys >= peers else slot * cores + core) % peers
+
 
 def parse_npu_eids(value: str | None) -> list[str]:
     """Parse a comma-separated list of unique 16-byte hexadecimal EIDs."""

@@ -476,10 +476,10 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
   const uint32_t remote_path_count = state->peer_link->RegionPathCount(
       reinterpret_cast<uint64_t>(host_ddr));
   const uint32_t path_count = std::max(remote_path_count, peer_local_eid_count);
-  // Multi-peer mode uses one NPU EID and reaches every peer on every core.
+  // Multi-peer mode uses one NPU EID and covers every peer across all workers.
   if (remote_path_count == 0U ||
       (remote_path_count > 1U &&
-       (peer_local_eid_count != 1U || remote_path_count > jettys_per_core))) {
+        (peer_local_eid_count != 1U || remote_path_count > entity_count))) {
     delete state;
     return KVAF_BATCH_GET_INVALID_ARGUMENT;
   }
@@ -530,7 +530,8 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
     const uint32_t jetty_slot = entity_index % jettys_per_core;
     const uint8_t priority = priorities[entity_index % priorities.size()];
     const uint32_t path_index = remote_path_count > 1U
-        ? jetty_slot % remote_path_count
+        ? hccp::PeerEidPathIndexForWorker(core, jetty_slot, aiv_core_count,
+                                        jettys_per_core, remote_path_count)
         : hccp::EidPathIndexForWorker(core, jetty_slot, aiv_core_count, path_count);
     hccp::DeviceAivPathResources &path = state->paths[path_index];
     DirectAivWorker &worker = state->workers[entity_index];
@@ -653,7 +654,8 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
                "local_hbm=deferred_acquire\n",
                static_cast<unsigned long long>(host_ddr_bytes), entity_count,
                path_count, remote_path_count,
-               remote_path_count > 1U ? "per_core_peer_round_robin" : "jetty_major_worker_round_robin");
+               remote_path_count > 1U && jettys_per_core >= remote_path_count
+                   ? "per_core_peer_round_robin" : "jetty_major_worker_round_robin");
   *transport = state;
   return KVAF_BATCH_GET_SUCCESS;
 

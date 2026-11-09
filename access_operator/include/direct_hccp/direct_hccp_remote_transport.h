@@ -114,6 +114,17 @@ static_assert(EidPathIndexForWorker(0U, 15U, 1U, 16U) == 15U);
 static_assert(EidPathIndexForWorker(0U, 32U, 1U, 64U) == 32U);
 static_assert(EidPathIndexForWorker(0U, 63U, 1U, 64U) == 63U);
 
+// Keep every peer on every core when possible. Otherwise spread workers
+// across cores so the total Jetty count can cover all remote peers.
+inline constexpr std::uint32_t PeerEidPathIndexForWorker(
+    std::uint32_t core, std::uint32_t jetty_slot,
+    std::uint32_t core_count, std::uint32_t jettys_per_core,
+    std::uint32_t path_count) {
+  return path_count != 0U && jettys_per_core >= path_count
+             ? jetty_slot % path_count
+             : EidPathIndexForWorker(core, jetty_slot, core_count, path_count);
+}
+
 // One peer channel is bound to one local AIV Jetty. Runtime has already
 // selected the local EID assigned to this worker; this adapter only creates
 // the transport resources required by that selected path.

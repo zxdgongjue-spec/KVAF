@@ -1,7 +1,9 @@
-"""Per-peer traffic and optional concurrency evidence within each AIV core."""
+"""Per-peer traffic across cores, with overlap evidence only within a core."""
 
 import csv
 from pathlib import Path
+
+from npu_eids import peer_eid_path
 
 
 def summarize(samples, peer_eids, cores, jettys, token_bytes):
@@ -10,6 +12,7 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
     for sample_index, profiles in enumerate(samples):
         if len(profiles) != cores:
             raise ValueError("peer profile core count mismatch")
+        sample_paths = set()
         for core, profile in enumerate(profiles):
             lanes = profile["jettys"][:jettys]
             if len(lanes) != jettys:
@@ -17,7 +20,7 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
             groups = [[] for _ in peer_eids]
             for slot, lane in enumerate(lanes):
                 path = int(lane["eid_path"])
-                if path != slot % len(peer_eids):
+                if path != peer_eid_path(core, slot, cores, jettys, len(peer_eids)):
                     raise ValueError("peer profile route does not match requested EID order")
                 if single_peer and int(lane["requests"]) == 0:
                     if any(int(lane[key]) != 0 for key in (
@@ -33,10 +36,11 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
                 if not (0 < first <= last <= done_last and first <= done_first <= done_last):
                     raise ValueError("invalid peer Jetty timeline")
                 groups[path].append(lane)
+                sample_paths.add(path)
             per_core = []
             for path, group in enumerate(groups):
                 if not group and not single_peer:
-                    raise ValueError("a requested peer EID has no Jetty")
+                    continue  # This peer is assigned to another core.
                 requests = sum(int(lane["requests"]) for lane in group)
                 row = dict(sample=sample_index, core=core, peer_path=path,
                            peer_eid=peer_eids[path], requests=requests,
@@ -48,13 +52,16 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
                     row[key] = reduce(int(lane[key]) for lane in group) if group else 0
                 per_core.append(row)
             # First-wave overlap is stricter than overlapping whole-run envelopes:
-            # every peer was submitted before ANY peer's first observed completion.
-            overlap = None if single_peer else (
+            # All peers on this core must be posted before ANY peer's completion.
+            # Never compare timestamps belonging to different cores.
+            overlap = None if len(per_core) < 2 else (
                 min(r["first_completion_cycle"] for r in per_core) -
                 max(r["first_doorbell_cycle"] for r in per_core))
             for row in per_core:
-                row["first_wave_observed_overlap_cycles"] = "" if single_peer else max(0, overlap)
+                row["first_wave_observed_overlap_cycles"] = "" if overlap is None else max(0, overlap)
             rows.extend(per_core)
+        if not single_peer and sample_paths != set(range(len(peer_eids))):
+            raise ValueError("a requested peer EID has no traffic in this sample")
     if not rows:
         raise ValueError("no peer profile samples")
     return rows
@@ -76,9 +83,16 @@ def report(samples, peer_eids, cores, jettys, token_bytes, csv_path):
         print(f"PEER_EID_BASELINE samples={len(samples)} cores={cores} "
               "execution=single_kernel concurrency_check=not_applicable")
         return
-    minimum = min(row["first_wave_observed_overlap_cycles"] for row in rows)
-    print(f"PEER_EID_CONCURRENCY samples={len(samples)} cores={cores} "
-          f"min_first_wave_observed_overlap_cycles={minimum} "
-          "execution=single_kernel evidence=doorbell_to_observed_cqe")
-    if minimum <= 0:
+    overlaps = [row["first_wave_observed_overlap_cycles"] for row in rows
+                if row["first_wave_observed_overlap_cycles"] != ""]
+    minimum = min(overlaps) if overlaps else None
+    if jettys < len(peer_eids):
+        print(f"PEER_EID_MULTI_CORE_TRAFFIC samples={len(samples)} cores={cores} "
+              f"min_within_core_observed_overlap_cycles={minimum if minimum is not None else 'not_applicable'} "
+              "execution=single_kernel cross_core_overlap=not_measured")
+    else:
+        print(f"PEER_EID_CONCURRENCY samples={len(samples)} cores={cores} "
+              f"min_first_wave_observed_overlap_cycles={minimum} "
+              "execution=single_kernel evidence=doorbell_to_observed_cqe")
+    if minimum is not None and minimum <= 0:
         raise ValueError("concurrent first-wave submission was not observed in every sample/core")

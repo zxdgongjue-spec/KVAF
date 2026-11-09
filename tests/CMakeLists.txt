@@ -11,6 +11,7 @@ add_test(NAME kvaf_batch_get_schedule_test COMMAND kvaf_batch_get_schedule_test)
 add_executable(kvaf_batch_get_kernel_model_test batch_get_kernel_model_test.cc)
 target_include_directories(kvaf_batch_get_kernel_model_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
+  ${PROJECT_SOURCE_DIR}/access_operator/include
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
 add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_model_test)
 add_test(NAME kvaf_batch_get_inflight_config_python

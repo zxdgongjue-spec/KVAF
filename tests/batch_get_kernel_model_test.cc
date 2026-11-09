@@ -1,5 +1,6 @@
 #include "kernel_operator.h"
 #include "batch_get_abi.h"
+#include "direct_hccp/direct_hccp_remote_transport.h"
 
 #include <algorithm>
 #include <array>
@@ -258,6 +259,35 @@ struct Fixture {
 };
 
 int main() {
+  struct RoutingCase {
+    uint32_t cores, jettys, peers;
+    std::vector<uint32_t> paths;
+  };
+  for (const auto& routing : {
+           RoutingCase{2, 1, 2, {0, 1}},
+           RoutingCase{4, 1, 2, {0, 1, 0, 1}},
+           RoutingCase{2, 2, 3, {0, 2, 1, 0}},
+           RoutingCase{2, 3, 2, {0, 1, 0, 0, 1, 0}}}) {
+    const uint32_t count = routing.cores * routing.jettys * 128;
+    Fixture f(count, routing.cores, routing.jettys, 0);
+    for (uint32_t lane = 0; lane < f.entities.size(); ++lane) {
+      const uint32_t path = kvaf::direct_hccp::PeerEidPathIndexForWorker(
+          lane / routing.jettys, lane % routing.jettys,
+          routing.cores, routing.jettys, routing.peers);
+      CHECK(path == routing.paths[lane]);
+      auto& entity = f.entities[lane];
+      auto& queue = aiv_model::hardware[lane];
+      entity.eid_path = path;
+      entity.remote_token_id = queue.remote_token_id = 0x101U + path;
+      entity.remote_token_value = queue.remote_token_value = 0x321U + path;
+      queue.remote_eid = {path + 1U, 2U, 3U, 4U};
+      std::memcpy(entity.remote_eid, queue.remote_eid.data(), 16);
+    }
+    // The CPU model executes cores sequentially: verify routes, WQEs and
+    // payloads, without claiming cross-core timing overlap.
+    f.Run(count);
+    for (const auto& queue : aiv_model::hardware) CHECK(queue.producer == 128);
+  }
   for (bool profiling : {false, true}) {
     Fixture f(8192, 1, 4, 2048);
     for (uint32_t lane = 0; lane < 4; ++lane) {
