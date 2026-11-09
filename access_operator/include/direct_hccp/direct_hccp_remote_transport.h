@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "direct_hccp/direct_hccp_abi.h"
+#include "direct_hccp/remote_memory_binding.h"
 
 namespace kvaf::peer {
 class PeerLink;
@@ -73,21 +74,8 @@ struct DeviceAivPathResources {
   std::array<std::uint8_t, kEidBytes> local_eid{};
   void* device_context{nullptr};
   void* device_transport_token_handle{nullptr};
-  void* device_peer_memory_import{nullptr};
-};
-
-struct DeviceAivTransportResources {
-  DirectHccpApi* api{nullptr};
-  DirectHccpSession* session{nullptr};
-  // Legacy single-context fields are retained so BatchPut remains unchanged.
-  void* device_context{nullptr};
-  void* device_transport_token_handle{nullptr};
-  void* device_peer_memory_import{nullptr};
-  DeviceAivWorkerResources* workers{nullptr};
-  std::uint32_t worker_count{0U};
-  // BatchGet uses these fields when more than one local EID is configured.
-  DeviceAivPathResources* paths{nullptr};
-  std::uint32_t path_count{0U};
+  std::uint64_t context_generation{NewBindingGeneration()};
+  std::shared_ptr<HccpRemoteMemoryBinding> peer_binding;
 };
 
 // Queue arrays remain core-major for the AIV ABI, but path assignment is
@@ -123,7 +111,7 @@ struct PeerChannelRequest {
   void* device_context{nullptr};
   std::uint32_t physical_device_id{0};
   std::uint64_t peer_base{0};
-  const DirectMemory* peer_memory{nullptr};
+  const UrmaRemoteMemoryDesc* peer_memory{nullptr};
   const std::array<std::uint8_t, kEidBytes>* local_eid{nullptr};
   const std::array<std::uint8_t, kEidBytes>* peer_eid{nullptr};
   const QpCreateInfo* local_jetty_info{nullptr};
@@ -143,11 +131,11 @@ bool GetPeerTp(const DirectHccpApi&, void* context,
                const std::array<std::uint8_t, kEidBytes>& local_eid,
                const std::array<std::uint8_t, kEidBytes>& peer_eid,
                const char* role, std::uint64_t* tp);
-void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
 
-// Converts the Link descriptor's raw UMDK token to the AIV WQE token format.
+// Loads the raw peer registration descriptor; WQE token encoding is applied
+// only when populating the device entity.
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
-                    DirectMemory* memory,
+                    UrmaRemoteMemoryDesc* memory,
                     std::array<std::uint8_t, kEidBytes>* peer_eid);
 
 bool ImportPeerJetty(const DirectHccpApi& api, void* context,

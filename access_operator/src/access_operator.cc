@@ -201,12 +201,12 @@ Status DefaultAccessOperator::FinishGetGraph(void* stream, bool discard) {
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
   auto& call = resources_->invocation();
   auto view = resources_->GetView();
-  if (view.config.managed_completion && !call.graph_buffer) {
+  if (view.options.managed_completion && !call.graph_buffer) {
     auto status = UrmaAivGetOperator::Drain(view, call);
     if (!status.ok()) return status;
   }
   auto status = UrmaAivGetOperator::Validate(request, view, call);
-  if (status.ok()) status = resources_->PrepareGet(request, call, &view);
+  if (status.ok()) status = resources_->PrepareGetResources(request, call, &view);
   return status.ok() ? UrmaAivGetOperator::Launch(request, view, call) : status;
 }
 Status DefaultAccessOperator::DrainGet() {
@@ -229,7 +229,7 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request
       call.put_completion = {PutOutcome::Failed, status};
     return status;
   }
-  status = resources_->PreparePut(request, call, &view);
+  status = resources_->PreparePutResources(request, call, &view);
   return status.ok() ? UrmaAivPutOperator::Launch(request, view, call) : status;
 }
 Status DefaultAccessOperator::ResolvePut(PutCompletion* out) {
@@ -240,9 +240,9 @@ Status DefaultAccessOperator::AcknowledgePut() {
 }
 
 Status UrmaAivGetOperator::PrepareGraph(const GetGraphOptions& options, UrmaAivGetView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
-  if (!view.initialized || !view.session.transport || invocation.graph_buffer)
+  if (!view.common.ready() || invocation.graph_buffer)
     return Status::InvalidState("AIV graph provider is unavailable or leased");
   if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
       !options.request_capacity)
@@ -259,7 +259,7 @@ Status UrmaAivGetOperator::PrepareGraph(const GetGraphOptions& options, UrmaAivG
   return Status::OK();
 }
 Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (!invocation.graph_buffer) return Status::NotFound("AIV graph lease not found");
   if (!stream) return InvalidArgument("graph release requires its last replay stream");
@@ -272,9 +272,9 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetVie
   if (aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) != ACL_SUCCESS)
     return Status::CompletionUnknown("graph replay completion unresolved");
   if (invocation.graph_recorded && !discard) {
-    std::vector<KvafBatchGetCoreStatus> reports(view.config.npu_core_count);
-    if (aclrtMemcpy(reports.data(), view.session.workspace.status_bytes, view.session.workspace.status,
-                    view.session.workspace.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    std::vector<KvafBatchGetCoreStatus> reports(view.options.npu_core_count);
+    if (aclrtMemcpy(reports.data(), view.workspace.status_bytes, view.workspace.status,
+                    view.workspace.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
       return Internal("cannot collect graph completion");
     for (const auto& r : reports)
       if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result)
@@ -282,7 +282,7 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetVie
             "graph result failed or graph was never replayed; inspect then release with "
             "discard_result=True");
   }
-  if (view.session.RetireOutput(invocation.graph_buffer) != KVAF_BATCH_GET_SUCCESS)
+  if (KvafBatchGetLocalBufferRetire(invocation.graph_buffer) != KVAF_BATCH_GET_SUCCESS)
     return Internal("cannot retire graph registration");
   invocation.graph_buffer = nullptr;
   invocation.graph_entity = 0;
@@ -292,9 +292,9 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetVie
 }
 
 Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
-  if (!view.initialized || view.session.transport == nullptr) {
+  if (!view.common.ready()) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
@@ -318,7 +318,7 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
     if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
       return Status::InvalidState("graph lease submissions require active capture");
   }
-  if (view.config.managed_completion && !graph_lease) {
+  if (view.options.managed_completion && !graph_lease) {
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
     if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
@@ -328,8 +328,8 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
   }
   KvafExecuteBatchGetKernelArgs arguments{};
   Status status = BuildBatchGetKernelArgs(
-      exec, view.config.npu_core_count, view.config.jettys_per_core,
-      view.config.batch_get_max_inflight_total, view.session.workspace, &arguments);
+      exec, view.options.npu_core_count, view.options.jettys_per_core,
+      view.options.batch_get_max_inflight_total, view.workspace, &arguments);
   if (!status.ok()) {
     return status;
   }
@@ -344,9 +344,9 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
   if (!graph_lease && invocation.get_issued)
     return Status::Busy("Get invocation is still in flight");
   KvafExecuteBatchGetKernelArgs arguments{};
-  status = BuildBatchGetKernelArgs(exec, view.config.npu_core_count,
-      view.config.jettys_per_core, view.config.batch_get_max_inflight_total,
-      view.session.workspace, &arguments);
+  status = BuildBatchGetKernelArgs(exec, view.options.npu_core_count,
+      view.options.jettys_per_core, view.options.batch_get_max_inflight_total,
+      view.workspace, &arguments);
   if (!status.ok()) return status;
   KvafBatchGetLocalBuffer* local_buffer = view.buffer;
   const std::uint64_t channel_entity = view.channel_entity;
@@ -360,63 +360,63 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
     return InvalidState("AIV Get registration must be prepared before Launch");
   arguments.channel_entity = channel_entity;
 
-  if (view.config.managed_completion) {
+  if (view.options.managed_completion) {
     if (!graph_lease) {
       invocation.pending_get = stream;
       invocation.pending_buffer = local_buffer;
       invocation.get_issued = false;
     }
-    if (aclrtMemsetAsync(view.session.workspace.status, view.session.workspace.status_bytes, 0xFF,
-                         view.session.workspace.status_bytes, stream) != ACL_SUCCESS)
+    if (aclrtMemsetAsync(view.workspace.status, view.workspace.status_bytes, 0xFF,
+                         view.workspace.status_bytes, stream) != ACL_SUCCESS)
       return Status::CompletionUnknown("failed to initialize Get completion status");
   }
   if (graph_lease) invocation.graph_recorded = true;
   else invocation.get_issued = true;
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
-    if (!view.config.managed_completion && !graph_lease)
-      { view.session.ReleaseOutput(local_buffer); invocation.pending_buffer = nullptr;
+    if (!view.options.managed_completion && !graph_lease)
+      { KvafBatchGetLocalBufferRelease(local_buffer); invocation.pending_buffer = nullptr;
         invocation.pending_get = nullptr; invocation.get_entity = 0; }
     return Internal("failed to launch BatchGet");
   }
   if (graph_lease) return Status::OK();
-  if (view.config.managed_completion)
+  if (view.options.managed_completion)
     return exec.execution.synchronize ? Drain(view, invocation) : Status::OK();
   if (exec.execution.synchronize) {
     const aclError sync_result = aclrtSynchronizeStream(stream);
-    view.session.ReleaseOutput(local_buffer);
+    KvafBatchGetLocalBufferRelease(local_buffer);
     invocation.pending_buffer = nullptr; invocation.pending_get = nullptr; invocation.get_entity = 0;
     if (sync_result != ACL_SUCCESS) {
       return Internal("BatchGet stream synchronization failed");
     }
-    LogBatchGetDeviceStatus(view.session.workspace, view.config.npu_core_count);
+    LogBatchGetDeviceStatus(view.workspace, view.options.npu_core_count);
   } else {
     // The demo transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
-    view.session.ReleaseOutput(local_buffer);
+    KvafBatchGetLocalBufferRelease(local_buffer);
     invocation.pending_buffer = nullptr; invocation.pending_get = nullptr; invocation.get_entity = 0;
   }
   return Status::OK();
 }
 
 Status UrmaAivGetOperator::Drain(UrmaAivGetView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
-  if (view.closing) return Status::CompletionUnknown("AIV transport is closing; retry Shutdown");
+  if (!view.common.ready()) return Status::CompletionUnknown("AIV transport is closing; retry Shutdown");
   if (!invocation.pending_get) return Status::OK();
   if (aclrtSynchronizeStream(invocation.pending_get) != ACL_SUCCESS)
     return Status::CompletionUnknown("BatchGet stream completion failed; resources retained");
   if (invocation.get_issued) {
-    std::vector<KvafBatchGetCoreStatus> reports(view.config.npu_core_count);
-    if (aclrtMemcpy(reports.data(), view.session.workspace.status_bytes, view.session.workspace.status,
-                    view.session.workspace.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    std::vector<KvafBatchGetCoreStatus> reports(view.options.npu_core_count);
+    if (aclrtMemcpy(reports.data(), view.workspace.status_bytes, view.workspace.status,
+                    view.workspace.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
       return Internal("failed to collect BatchGet completion status");
     for (const auto& r : reports)
       if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result != 0)
         return Internal("BatchGet kernel reported an execution error; session retained");
   }
-  if (view.session.RetireOutput(invocation.pending_buffer) != KVAF_BATCH_GET_SUCCESS)
+  if (KvafBatchGetLocalBufferRetire(invocation.pending_buffer) != KVAF_BATCH_GET_SUCCESS)
     return Internal("failed to retire Get registration; resources retained");
   invocation.pending_buffer = nullptr;
   invocation.pending_get = nullptr;
@@ -426,18 +426,18 @@ Status UrmaAivGetOperator::Drain(UrmaAivGetView view, AivInvocation& invocation)
 }
 
 Status UrmaAivGetOperator::SetProfiling(bool enabled, UrmaAivGetView view) {
-  if (!view.initialized || view.session.workspace.status == nullptr) {
+  if (!view.common.ready() || view.workspace.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
   std::vector<KvafBatchGetCoreStatus> statuses(
-      view.config.npu_core_count);
+      view.options.npu_core_count);
   if (enabled) {
     for (KvafBatchGetCoreStatus& status : statuses) {
       status.profile.magic = KVAF_AIV_BATCH_GET_PROFILE_MAGIC;
     }
   }
-  if (aclrtMemcpy(view.session.workspace.status, view.session.workspace.status_bytes,
+  if (aclrtMemcpy(view.workspace.status, view.workspace.status_bytes,
                   statuses.data(), statuses.size() * sizeof(statuses.front()),
                   ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
     return Internal("failed to configure BatchGet kernel profiling");
@@ -450,14 +450,14 @@ Status UrmaAivGetOperator::CopyProfiles(
   if (profiles == nullptr) {
     return InvalidArgument("BatchGet kernel profile output must not be null");
   }
-  if (!view.initialized || view.session.workspace.status == nullptr) {
+  if (!view.common.ready() || view.workspace.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
   }
   std::vector<KvafBatchGetCoreStatus> statuses(
-      view.config.npu_core_count);
+      view.options.npu_core_count);
   if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses.front()),
-                  view.session.workspace.status, view.session.workspace.status_bytes,
+                  view.workspace.status, view.workspace.status_bytes,
                   ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
     return Internal("failed to copy BatchGet kernel profiles");
   }
@@ -514,7 +514,7 @@ Status UrmaAivGetOperator::CopyProfiles(
 }
 
 Status UrmaAivPutOperator::Launch(const BatchPutExecRequest& exec, UrmaAivPutView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Put).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   auto valid = Validate(exec, view, invocation);
   if (!valid.ok()) return valid;
@@ -539,17 +539,17 @@ Status UrmaAivPutOperator::Launch(const BatchPutExecRequest& exec, UrmaAivPutVie
   return result;
 }
 Status UrmaAivPutOperator::Resolve(PutCompletion* out, UrmaAivPutView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Put).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (!out) return InvalidArgument("null Put completion output");
-  if (view.closing) return Status::CompletionUnknown("AIV transport is closing; retry Shutdown");
+  if (!view.common.ready()) return Status::CompletionUnknown("AIV transport is closing; retry Shutdown");
   auto& call = invocation;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (call.pending_put) {
     if (aclrtSynchronizeStream(call.pending_put) != ACL_SUCCESS)
       return Status::CompletionUnknown("Put stream still pending");
     if (call.put_issued) {
-      auto& workspace = view.session.workspace;
+      auto& workspace = view.workspace;
       const auto bytes = workspace.host_core_status_count * sizeof(KvafBatchPutCoreStatus);
       if (aclrtMemcpy(workspace.host_core_status, bytes, workspace.core_status, bytes,
                       ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
@@ -563,7 +563,7 @@ Status UrmaAivPutOperator::Resolve(PutCompletion* out, UrmaAivPutView view, AivI
           return Status::CompletionUnknown("Put reports do not prove all remote WRs completed");
       }
     }
-    if (view.session.RetireInput(call.pending_put_buffer) != KVAF_BATCH_PUT_SUCCESS)
+    if (KvafBatchPutLocalBufferRetire(call.pending_put_buffer) != KVAF_BATCH_PUT_SUCCESS)
       return Status::CompletionUnknown("Put registration retirement still pending");
     call.pending_put_buffer = nullptr;
     call.pending_put = nullptr;
@@ -575,7 +575,7 @@ Status UrmaAivPutOperator::Resolve(PutCompletion* out, UrmaAivPutView view, AivI
   return Status::OK();
 }
 Status UrmaAivPutOperator::Acknowledge(UrmaAivPutView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Put).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (invocation.put_completion.outcome == PutOutcome::Unknown)
     return Status::CompletionUnknown("cannot acknowledge unresolved Put");
@@ -584,9 +584,9 @@ Status UrmaAivPutOperator::Acknowledge(UrmaAivPutView view, AivInvocation& invoc
 }
 
 Status UrmaAivPutOperator::Validate(const BatchPutExecRequest& exec, UrmaAivPutView view, AivInvocation& invocation) {
-  if (invocation.owner != view.identity || view.active != &invocation || view.bound != &invocation)
+  if (!view.common.Validate(&invocation, ExecutionDirection::Put).ok())
     return InvalidArgument("AIV invocation does not match resource view");
-  if (!view.initialized) {
+  if (!view.common.ready()) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }
   if (exec.request == nullptr || exec.put_desc == nullptr ||
@@ -618,11 +618,11 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
   if (!valid.ok()) return valid;
   const auto* input = static_cast<const std::uint8_t*>(exec.request->input.data);
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-  if (view.session.transport != nullptr) {
+  if (view.device_execution) {
     if (exec.execution.stream == nullptr) {
       return InvalidArgument("AIV BatchPut requires a caller-owned ACL stream");
     }
-    AivPutWorkspace& execution = view.session.workspace;
+    AivPutWorkspace& execution = view.workspace;
     const std::size_t rows = exec.request->keys.size();
     invocation.put_rows = rows;
     if (!FitsU32(rows)) {
@@ -652,14 +652,14 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
         exec.execution.stream != invocation.pending_put)
       return InvalidState("AIV Put registration must be prepared before Launch");
 
-    if (view.config.managed_completion) {
+    if (view.options.managed_completion) {
       invocation.pending_put = stream;
       invocation.pending_put_buffer = local_buffer;
     }
     const auto status_bytes = execution.host_core_status_count * sizeof(KvafBatchPutCoreStatus);
     if (aclrtMemset(execution.core_status, status_bytes, 0, status_bytes) != ACL_SUCCESS) {
-      if (!view.config.managed_completion) {
-        view.session.ReleaseInput(local_buffer);
+      if (!view.options.managed_completion) {
+        KvafBatchPutLocalBufferRelease(local_buffer);
         invocation.pending_put = nullptr; invocation.pending_put_buffer = nullptr;
       }
       return Internal("failed to reset Put completion status");
@@ -676,7 +676,7 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
     arguments.core_status = PointerValue(execution.core_status);
     arguments.input_bytes = exec.request->input.bytes;
     arguments.row_count = static_cast<std::uint32_t>(rows);
-    arguments.aiv_core_count = view.config.npu_core_count;
+    arguments.aiv_core_count = view.options.npu_core_count;
 
     std::memset(execution.host_core_status, 0,
                 execution.host_core_status_count *
@@ -684,14 +684,14 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
     if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
                          execution.host_metadata, metadata_bytes,
                          ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
-      if (!view.config.managed_completion) {
-        view.session.ReleaseInput(local_buffer);
+      if (!view.options.managed_completion) {
+        KvafBatchPutLocalBufferRelease(local_buffer);
         invocation.pending_put = nullptr; invocation.pending_put_buffer = nullptr;
       }
       return Status::CompletionUnknown("failed to enqueue BatchPut metadata upload to NPU");
     }
 
-    if (view.config.managed_completion) {
+    if (view.options.managed_completion) {
       invocation.pending_put = stream;
       invocation.pending_put_buffer = local_buffer;
     }
@@ -705,16 +705,16 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
       // the stream has stopped reading it.
       (void)aclrtSynchronizeStream(stream);
     }
-    if (view.config.managed_completion && result != KVAF_BATCH_PUT_SUCCESS)
+    if (view.options.managed_completion && result != KVAF_BATCH_PUT_SUCCESS)
       return Status::CompletionUnknown("AIV BatchPut execution failed; session retained for shutdown");
-    if (view.config.managed_completion) {
-      if (view.session.RetireInput(local_buffer) != KVAF_BATCH_PUT_SUCCESS)
+    if (view.options.managed_completion) {
+      if (KvafBatchPutLocalBufferRetire(local_buffer) != KVAF_BATCH_PUT_SUCCESS)
         return Status::CompletionUnknown("failed to retire Put registration; resources retained");
-    } else view.session.ReleaseInput(local_buffer);
+    } else KvafBatchPutLocalBufferRelease(local_buffer);
     invocation.pending_put = nullptr;
     invocation.pending_put_buffer = nullptr;
     if (result != KVAF_BATCH_PUT_SUCCESS) {
-      LogBatchPutDeviceStatus(execution, view.config.npu_core_count, result);
+      LogBatchPutDeviceStatus(execution, view.options.npu_core_count, result);
       return Internal("AIV Direct-HCCP BatchPut execution failed");
     }
     return Status::OK();

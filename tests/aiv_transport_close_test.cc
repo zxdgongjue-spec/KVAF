@@ -65,6 +65,10 @@ int FreeToken(void* ctx, void* h) {
   return Release(h, found->second.kind == Kind::LocalToken ? Kind::LocalToken : Kind::TransportToken, ctx);
 }
 int UnimportMemory(void* ctx, void* h) { return Release(h, Kind::RemoteMr, ctx); }
+int ImportMemory(void* ctx, hccp::MrImportInfo*, void** out) {
+  *out = Add(Kind::RemoteMr, ctx);
+  return 0;
+}
 int Deinit(void* ctx) { return Release(ctx, Kind::Context); }
 int InitializeContext(hccp::CtxInitCfg*, hccp::CtxInitAttr*, void** out) {
   *out = Add(Kind::Context);
@@ -103,6 +107,7 @@ Transport* Make() {
   t->api.lmem_unregister = Unregister;
   t->api.token_free = FreeToken;
   t->api.rmem_unimport = UnimportMemory;
+  t->api.rmem_import = ImportMemory;
   t->api.ctx_deinit = Deinit;
   auto local = std::make_unique<Buffer>();
   local->transport = t;
@@ -111,7 +116,13 @@ Transport* Make() {
 #ifdef KVAF_TEST_CLOSE_PUT
   t->device_context = Add(Kind::Context);
   auto* ctx = t->device_context;
-  t->device_peer_memory_import = Add(Kind::RemoteMr, ctx);
+  kvaf::UrmaRemoteMemoryDesc remote;
+  remote.registered_address = 4096; remote.registered_bytes = 4096;
+  remote.token_value = 1; remote.key_bytes = 1;
+  CHECK(t->bindings.Acquire(kvaf::UrmaBindingKey::Make(kvaf::MemoryDirection::Put,
+      ctx, t->context_generation, remote, hccp::MemImportFlags()),
+      [&](auto& binding) { return binding.Import(ctx, ImportMemory, UnimportMemory, remote); },
+      &t->peer_binding).ok());
   t->device_transport_token_handle = Add(Kind::TransportToken, ctx);
   local->memory.handle = Add(Kind::LocalMr, ctx);
   local->token_handle = Add(Kind::LocalToken, ctx);
@@ -122,7 +133,13 @@ Transport* Make() {
   for (unsigned i = 0; i < 2; ++i) {
     auto& p = t->paths[i];
     p.device_context = Add(Kind::Context);
-    p.device_peer_memory_import = Add(Kind::RemoteMr, p.device_context);
+    kvaf::UrmaRemoteMemoryDesc remote;
+    remote.registered_address = 4096; remote.registered_bytes = 4096;
+    remote.token_value = 1; remote.key_bytes = 1;
+    CHECK(t->bindings.Acquire(kvaf::UrmaBindingKey::Make(kvaf::MemoryDirection::Get,
+        p.device_context, p.context_generation, remote, hccp::MemImportFlags()),
+        [&](auto& binding) { return binding.Import(p.device_context, ImportMemory, UnimportMemory, remote); },
+        &p.peer_binding).ok());
     p.device_transport_token_handle = Add(Kind::TransportToken, p.device_context);
     local->path_registrations[i].memory.handle = Add(Kind::LocalMr, p.device_context);
     local->path_registrations[i].token_handle = Add(Kind::LocalToken, p.device_context);
@@ -247,7 +264,7 @@ void PartialCreationFailure() {
 // Setup functions are linked but deliberately unused by teardown-only tests.
 namespace kvaf::direct_hccp {
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* device) { *device = 0; return create_failure; }
-bool LoadPeerMemory(PeerLink*, std::uint64_t, DirectMemory*, std::array<std::uint8_t, kEidBytes>*) { return create_failure; }
+bool LoadPeerMemory(PeerLink*, std::uint64_t, UrmaRemoteMemoryDesc*, std::array<std::uint8_t, kEidBytes>*) { return create_failure; }
 bool LoadDirectHccp(DirectHccpApi* api) {
   api->ctx_init = InitializeContext;
   api->ctx_deinit = Deinit;

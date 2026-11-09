@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "access_operator.h"
+#include "aicpu_urma/launch_view.h"
 
 namespace kvaf::cpu_push {
 struct Config {
@@ -20,6 +21,8 @@ class CpuPushTransport {
   Status Execute(const BatchGetExecRequest&);
   Status Prepare(const BatchGetExecRequest&);
   Status ExecutePrepared(const BatchGetExecRequest&);
+  aicpu_urma::ScatterLaunchView View() const;
+  static Status LaunchPrepared(const BatchGetExecRequest&, const aicpu_urma::ScatterLaunchView&, ExecutionState*);
   Status Drain();
   std::unique_ptr<ExecutionState> CreateExecutionState();
   Status BindExecutionState(ExecutionState*);

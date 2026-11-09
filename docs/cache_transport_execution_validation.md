@@ -329,6 +329,28 @@ ctest --test-dir build-verify --output-on-failure \
   Jetty、CQ、MR、token、设备内存、context 释放失败，检查重试不重复释放已完成部分，
   且队列未关闭时不释放其依赖。
 
+本次公共 View / URMA 绑定拆分新增或扩展：
+
+- `kvaf_execution_view_binding_test`：旧 View 在准备/解绑/关闭/同址重建后失效；
+  独立方向准备互不误伤；绑定重复导入复用、context 代次和远端注册身份隔离、
+  部分导入失败及最后引用关闭失败保留、异常后的清理重试。
+- `kvaf_cpu_ddr_registration_test`（需要 URMA 头文件）：CPU 注册标志、原始 token 与
+  注册基址导出，注册部分失败、MR/token 释放失败和幂等重试。
+- `kvaf_aicpu_session_registry_test`：同一 session 多次导入只发生一次，注册身份
+  改变被拒绝，unimport 失败保留句柄；继续检查 canonical → 注册地址转换。
+- AICPU Put/Gather 与 UBMEM provider 用例补充旧 View 的重准备、解绑失效检查。
+
+可单独运行本轮相关用例：
+
+```bash
+ctest --test-dir build-verify --output-on-failure \
+  -R 'kvaf_(execution_view_binding|cpu_ddr_registration|aicpu_session_registry|aicpu_put_resolution|aicpu_gather_resources|cpu_push_shutdown|aiv_.*_transport_close|.*_provider_resources)_test'
+```
+
+此次涉及 CPU 服务、NPU Host 和 AICPU kernel 内部结构，需重新构建两端并部署新的
+AICPU 包；wire 协议未变。沿用第 3 节原全量命令即可，不设置 `--cases`，并在同一个
+CPU 服务进程下重复两轮。原性能脚本的公开参数不变；性能结果应在功能全量通过后采集。
+
 故障通过便携替身注入，不在真机上故意破坏正在执行的 DMA。真机应重新运行第 3 节
 全量测试，覆盖 matrix、overlap、lifetime、resources、graph 和 lifecycle；保持同一
 CPU 服务进程再跑一轮，确认资源跨调用复用及池重建正常。此前 HAL 修复的真机通过

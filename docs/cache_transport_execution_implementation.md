@@ -12,6 +12,8 @@
 | 普通 Put | URMA AIV、URMA AICPU、UBMEM AIV |
 | 普通 Get | URMA AIV Direct、URMA AICPU Gather / Scatter、UBMEM AIV Direct |
 | 混合池 | `urma+ubmem` 从初始化起分配同一份 Fabric DDR，URMA 会话借用并注册该 allocation |
+| URMA 内存绑定 | CPU `CpuDdrRegistration`、NPU `HccpRemoteMemoryBinding` / AICPU `UmdkRemoteMemoryBinding`；描述与句柄分开 |
+| 算子公共视图 | `ExecutionViewCommon` 统一 region、方向、资源代次、调用绑定和准备代次校验 |
 | CPU 资源隔离 | 每个执行配置独立 context、token、MR、队列及 Gather / Push worker；Gather 与 Scatter 可同时启用 |
 | 规范地址 | MetaManager / AccessTable 使用固定 allocation 基址；AIV WQE、AICPU transfer、CPU Push 提交时转换为注册基址 |
 | UBMEM 映射 | Runtime 内按设备、Fabric handle 和映射长度共享；最后一个引用关闭，失败保留并阻止复用 |
@@ -124,6 +126,77 @@ graph 则持续占有租约。
 普通 Get 完成后归还租约；Put 还需等待 Commit/Abort 和完成确认。关闭在状态仍绑定时
 先调用 owner 清理，再解绑并销毁执行状态，最后归还租约和销毁资源。关闭失败保留
 完整依赖，允许重试；AIV transport 的关闭错误也会向上传递，不再被 void 析构接口吞掉。
+
+## URMA 内存绑定与公共 View
+
+本次拆分把“CPU DDR 注册在哪里”和“算子需要哪些执行资源”分开表达：
+
+```text
+CacheRegionService / allocation
+  └─ CPU 执行 session
+       └─ CpuDdrRegistration              token + MR；借用 DDR/context
+            └─ UrmaRemoteMemoryDesc       注册地址、长度、原始 token、EID、注册 key
+
+ExecutionResourceManager
+  ├─ Put 资源域
+  │    └─ provider owner → 自己的 context / 队列 / 工作区 / 内存绑定
+  └─ Get 资源域
+       └─ provider owner → 自己的 context / 队列 / 工作区 / 内存绑定
+
+准备 → ExecutionViewCommon + 后端执行片段 → Launch(request, view, invocation)
+```
+
+`UrmaRemoteMemoryDesc` 不含驱动句柄。`registered_address/registered_bytes` 描述
+通信注册范围，可能包含对齐和辅助区；`CacheRegionDesc` 中的 canonical 地址和
+logical 长度描述用户缓存范围，两者不混用。raw token 保留 UMDK 的原始表示，
+仅在填 AIV WQE entity 时调用 `wqe_token_id()` 转换。
+
+`CpuDdrRegistration` 负责 token 分配、DDR 注册、描述导出和注销。CPU session
+仍负责先停 worker、关闭队列，再关闭注册，最后归还 DDR/context。注销失败保留
+MR，token 释放失败保留 token；重试不重复注销已经释放的 MR。
+
+AIV 的 Get/Put transport 使用同一个 `UrmaBindingCache<Binding>` 实现和
+`HccpRemoteMemoryBinding` 类型，各自持有缓存实例。键包含方向、context 及其创建
+代次、服务端 epoch/region/session、注册范围、token、EID、权限和完整注册 key。
+相同键在该缓存内复用导入；context 地址重用、新 session、token 或 key 变化均不命中。
+最后一个引用关闭失败时保留绑定及依赖，后续 Acquire 返回失败，直到 Close 重试成功。
+库/context 和远端 session 的生命周期仍由上层 owner 租约覆盖，裸 View 不延长生命周期。
+
+AICPU 的 `UmdkRemoteMemoryBinding` 位于设备侧 session registry 内，拥有
+`urma_target_seg_t*`。同一 session 多 worker Connect 复用一个远端导入，重复 Connect
+必须匹配 context、canonical 地址、session、token 和 segment 描述；Host View 只拿
+`UmdkContext {session, owner_pid}` 或受限的 WRITE 提交能力，不传设备侧 C++ 指针。
+
+此版保持 CPU session / wire 协议隔离：不同执行配置当前拥有不同 context，因而不共享
+同一个 URMA import/MR 实例。共享的是 DDR allocation、描述格式、绑定实现和兼容键
+内的引用；跨 CPU session 共用 MR 需要另行扩展注册引用协议。UBMEM 的
+`DeviceMappingCache` 继续在 Runtime 内共享映射，独立 Pull 模块仍按约定暂不接入。
+
+| 算子 | 公共部分之外的执行片段 |
+|---|---|
+| URMA AIV Put | `AivLaunchOptions`、已注册输入 buffer、`AivPutWorkspace` |
+| URMA AIV Get | `AivLaunchOptions`、已注册输出 buffer / channel entity、`AivGetWorkspace` |
+| URMA AICPU Put | `PutLaunchView`：受限 `UmdkWriteView`、descriptor 工作区及容量 |
+| URMA AICPU Gather | `GatherLaunchView`：`UmdkContext`、`AicpuKernelOptions`、scratch、completion/profile buffer、序号 |
+| URMA AICPU Scatter | `ScatterLaunchView`：相同 options/buffer 结构、push 工作区、coordination、序号、资源失败状态 |
+| UBMEM Put/Get | `MappedExecutionView`：`MappedRegionView`、`AivKernelView`、stream 槽位和资源失败状态 |
+
+`ExecutionViewCommon` 用于所有方向，包含 `CacheRegionDesc` 与资源/绑定/准备代次，
+没有注册、分配或关闭接口。缺少服务端 region 身份的旧接口以零表示未知，不能用
+本地 generation 冒充服务端 epoch。`ExecutionViewState` 在 owner 内维护校验状态：
+资源关闭或重建、调用重新绑定、相关工作区重新准备后，旧 View 的 Launch 会被拒绝。
+独立 Put/Get 工作区分别更新准备代次；UBMEM 兼容入口共用 stream 槽位时同时失效。
+这些校验以调用者持有资源租约为前提，不能在 owner 已销毁后继续访问 View。
+
+Gather/Scatter 共用 `AicpuGetInvocation` 的请求、stream、sequence、profiling 状态布局，
+但保持独立状态实例。`ExecutionHealth` 由资源 owner 持有，失败状态不会因更换调用而
+清空。AICPU Put 的 `UmdkWriteView` 只允许提交已准备的 descriptors，没有 Load、Ensure、
+注册、建链或 Shutdown 入口。Gather/Scatter 的 Launch 接收具体值和 buffer 视图，
+不再接收 `BatchGetTransport*` / `CpuPushTransport*`。
+
+各 provider 的资源准备入口统一为 `PreparePutResources` / `PrepareGetResources`。
+它们建立绑定、注册和工作区；`MetaManager::PreparePut` 仍表示原有元数据事务准备。
+兼容 transport 的 `Prepare` / `ExecutePrepared` 和公开 C++ / Python 调用方式保留。
 
 ## Put 恢复语义
 

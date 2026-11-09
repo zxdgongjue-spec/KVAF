@@ -249,9 +249,9 @@ int main() {
   CHECK(!UrmaAivPutOperator::Launch(call, direct.PutView(), *direct_call).ok());
   CHECK(launches == before_launch && registrations.empty());
   CHECK(direct.Warmup({8, call.execution.stream}).ok());
-  const auto workspace = direct.PutView().session.workspace.metadata;
+  const auto workspace = direct.PutView().workspace.metadata;
   auto prepared = direct.PutView();
-  CHECK(direct.PreparePut(call, *direct_call, &prepared).ok());
+  CHECK(direct.PreparePutResources(call, *direct_call, &prepared).ok());
   const auto registered_before_launch = acquisitions;
   CHECK(direct.Bind(unbound.get()).code() == StatusCode::kBusy);
   auto changed_stream = call;
@@ -267,11 +267,11 @@ int main() {
   CHECK(completion.outcome == PutOutcome::Succeeded);
   CHECK(UrmaAivPutOperator::Acknowledge(direct.PutView(), *direct_call).ok());
   CHECK(direct.Warmup({4, call.execution.stream}).ok());
-  CHECK(workspace == direct.PutView().session.workspace.metadata);
+  CHECK(workspace == direct.PutView().workspace.metadata);
   const auto closed_transports = destroys;
   fail_free = true;
   CHECK(!direct.Close().ok() && destroys == closed_transports + 1);
-  CHECK(direct.PutView().session.workspace.metadata == workspace);
+  CHECK(direct.PutView().workspace.metadata == workspace);
   CHECK(!UrmaAivPutOperator::Launch(call, prepared, *direct_call).ok());
   CHECK(launches == before_launch + 1);
   fail_free = false;

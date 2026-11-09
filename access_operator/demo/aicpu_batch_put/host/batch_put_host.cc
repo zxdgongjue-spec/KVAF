@@ -12,9 +12,11 @@ Status BatchPutTransport::BindExecutionState(ExecutionState* state) {
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("Put preparation belongs to another resource");
   preparation_ = typed;
+  views_.Bind(typed);
   return Status::OK();
 }
 Status BatchPutTransport::Shutdown() {
+  views_.Close();
   auto drained = session_.Drain();
   if (!drained.ok()) return drained;
   if (transfers_) (void)aclrtFree(transfers_);
@@ -28,6 +30,7 @@ Status BatchPutTransport::Reserve(std::uint32_t count) {
   if (!count || count > kUmdkMaxTransfers) return Status::InvalidArgument("invalid Put capacity");
   const auto bytes = std::size_t(count) * sizeof(UmdkTransfer);
   if (bytes <= capacity_) return Status::OK();
+  views_.Prepare(ExecutionDirection::Put);
   void* allocation = nullptr;
   if (aclrtMalloc(&allocation, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
     return Status::OutOfMemory("cannot reserve WRITE descriptors");
@@ -38,6 +41,7 @@ Status BatchPutTransport::Reserve(std::uint32_t count) {
   return Status::OK();
 }
 Status BatchPutTransport::Prepare(const RemoteRegionDesc& region, const BatchPutRequest& request) {
+  views_.Prepare();
   preparation_->request = nullptr;
   if (!request.input.valid() || request.input.device != DeviceKind::kNpu || request.keys.empty() ||
       request.keys.size() > kUmdkMaxTransfers || request.keys.size() != request.input_offsets.size() ||
@@ -47,6 +51,8 @@ Status BatchPutTransport::Prepare(const RemoteRegionDesc& region, const BatchPut
   if (!ready.ok()) return ready;
   ready = Reserve(static_cast<std::uint32_t>(request.keys.size()));
   if (!ready.ok()) return ready;
+  views_.Initialize(region);
+  views_.Bind(preparation_);
   preparation_->request = &request;
   preparation_->region = region.base;
   preparation_->input = request.input.data;
@@ -59,7 +65,21 @@ Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPut
   auto prepared = Prepare(region, *exec.request);
   return prepared.ok() ? ExecutePrepared(region, exec) : prepared;
 }
+PutLaunchView BatchPutTransport::View() {
+  return {views_.View(ExecutionDirection::Put), session_.WriteView(), transfers_, capacity_,
+          &host_transfers_};
+}
 Status BatchPutTransport::ExecutePrepared(const RemoteRegionDesc& region, const BatchPutExecRequest& exec) {
+  auto view = View();
+  if (region.base != view.common.region().canonical_base)
+    return Status::InvalidState("AICPU Put region differs from prepared resources");
+  return LaunchPrepared(exec, view, preparation_);
+}
+Status BatchPutTransport::LaunchPrepared(const BatchPutExecRequest& exec, const PutLaunchView& view,
+                                         ExecutionState* state) {
+  auto* preparation = dynamic_cast<PutPreparation*>(state);
+  auto valid = view.common.Validate(preparation, ExecutionDirection::Put);
+  if (!valid.ok()) return valid;
   if (!exec.request || !exec.put_desc || !exec.execution.stream)
     return Status::InvalidArgument(
         "UMDK BatchPut requires initialized operator, input, destination and stream");
@@ -69,13 +89,13 @@ Status BatchPutTransport::ExecutePrepared(const RemoteRegionDesc& region, const 
       request.keys.size() != request.lengths.size() ||
       request.keys.size() != exec.put_desc->entries.size())
     return Status::InvalidArgument("invalid BatchPut layout");
-  if (preparation_->request != &request || preparation_->region != region.base ||
-      preparation_->input != request.input.data || preparation_->bytes != request.input.bytes ||
-      preparation_->rows != request.keys.size() ||
-      request.keys.size() * sizeof(UmdkTransfer) > capacity_)
+  if (preparation->request != &request || preparation->region != view.common.region().canonical_base ||
+      preparation->input != request.input.data || preparation->bytes != request.input.bytes ||
+      preparation->rows != request.keys.size() ||
+      request.keys.size() * sizeof(UmdkTransfer) > view.capacity)
     return Status::InvalidState("AICPU Put resources were not prepared for this request");
-  preparation_->request = nullptr;
-  auto& transfers = host_transfers_;
+  preparation->request = nullptr;
+  auto& transfers = (*view.host_descriptors);
   transfers.clear();
   for (std::size_t index = 0; index < request.keys.size(); ++index) {
     const auto offset = request.input_offsets[index], length = request.lengths[index];
@@ -94,10 +114,10 @@ Status BatchPutTransport::ExecutePrepared(const RemoteRegionDesc& region, const 
   if (transfers.empty() || transfers.size() > kUmdkMaxTransfers)
     return Status::InvalidArgument("UMDK BatchPut exceeds the transfer list capacity");
   const auto bytes = transfers.size() * sizeof(UmdkTransfer);
-  if (aclrtMemcpy(transfers_, capacity_, transfers.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE) !=
+  if (aclrtMemcpy(view.descriptors, view.capacity, transfers.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE) !=
       ACL_SUCCESS)
     return Status::Internal("failed to upload UMDK WRITE descriptors");
-  return session_.WriteDescriptors(reinterpret_cast<std::uint64_t>(transfers_), transfers.size(),
+  return view.transport.Submit(reinterpret_cast<std::uint64_t>(view.descriptors), transfers.size(),
                                    static_cast<aclrtStream>(exec.execution.stream), LaunchBatchPut);
 }
 

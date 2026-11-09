@@ -126,7 +126,8 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
 }  // namespace
 struct AivExecutionResources::State {
   State(AccessOperatorConfig value, const AivExecutionResources* owner)
-      : config(std::move(value)), legacy(owner), active(&legacy) {}
+      : config(std::move(value)), legacy(owner), active(&legacy) { views.Bind(active); }
+  ExecutionViewState views;
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   AivGetSession get;
@@ -143,14 +144,19 @@ AivExecutionResources::~AivExecutionResources() {
 }
 UrmaAivGetView AivExecutionResources::GetView() {
   const auto& call = *state_->active;
-  return {this, state_->config, state_->initialized, state_->closing, state_->get, state_->active, state_->active,
+  const auto& c = state_->config;
+  return {state_->views.View(ExecutionDirection::Get),
+          {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total, c.managed_completion},
+          state_->get.workspace,
           call.graph_buffer ? call.graph_buffer : call.pending_buffer,
           call.graph_buffer ? call.graph_entity : call.get_entity};
 }
 UrmaAivPutView AivExecutionResources::PutView() {
-  return {this, state_->config, state_->initialized, state_->closing, state_->put, state_->active, state_->active
+  const auto& c = state_->config;
+  return {state_->views.View(ExecutionDirection::Put),
+          {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total, c.managed_completion}
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-          , state_->active->pending_put_buffer
+          , state_->put.transport != nullptr, state_->put.workspace, state_->active->pending_put_buffer
 #endif
   };
 }
@@ -167,6 +173,7 @@ Status AivExecutionResources::Bind(ExecutionState* state) {
       || active.pending_put || active.pending_put_buffer
 #endif
       )) return Status::Busy("cannot replace an AIV invocation with pending resources");
+  state_->views.Bind(typed);
   state_->active = typed;
   return Status::OK();
 }
@@ -195,20 +202,23 @@ void AivPutSession::ReleaseInput(KvafBatchPutLocalBuffer* buffer) {
   KvafBatchPutLocalBufferRelease(buffer);
 }
 #endif
-Status AivExecutionResources::PrepareGet(const BatchGetExecRequest& exec,
+Status AivExecutionResources::PrepareGetResources(const BatchGetExecRequest& exec,
     AivInvocation& call, UrmaAivGetView* out) {
-  if (!out || out->identity != this || out->bound != &call || call.owner != this || state_->active != &call)
+  if (!out || !out->common.Validate(&call, ExecutionDirection::Get).ok() || call.owner != this || state_->active != &call)
     return InvalidArgument("Get preparation requires the bound AIV invocation");
   if (!state_->initialized || !state_->get.transport)
     return Status::NotInitialized("AIV Get resource not initialized");
   if (!exec.request || !exec.request->output.valid() || !exec.execution.stream)
     return InvalidArgument("Get preparation requires output and stream");
   if (call.graph_buffer) {
+    state_->views.Prepare(ExecutionDirection::Get);
+    out->common = state_->views.View(ExecutionDirection::Get);
     out->buffer = call.graph_buffer; out->channel_entity = call.graph_entity;
     return Status::OK();
   }
   if (call.pending_buffer || call.pending_get)
     return Status::Busy("drain the preceding Get before preparing resources");
+  state_->views.Prepare(ExecutionDirection::Get);
   KvafBatchGetLocalBuffer* buffer = nullptr;
   std::uint64_t entity = 0;
   const auto result = state_->get.AcquireOutput(exec.request->output.data,
@@ -223,6 +233,7 @@ Status AivExecutionResources::PrepareGet(const BatchGetExecRequest& exec,
   }
   if (result != KVAF_BATCH_GET_SUCCESS || !buffer || !entity)
     return Internal("failed to acquire caller output for BatchGet");
+  out->common = state_->views.View(ExecutionDirection::Get);
   out->buffer = call.pending_buffer;
   out->channel_entity = call.get_entity;
   return Status::OK();
@@ -237,7 +248,7 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   exec.request = &request;
   exec.execution.stream = options.stream;
   auto view = GetView();
-  auto status = PrepareGet(exec, call, &view);
+  auto status = PrepareGetResources(exec, call, &view);
   if (!status.ok()) return status;
   call.graph_buffer = call.pending_buffer;
   call.graph_entity = call.get_entity;
@@ -248,9 +259,9 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   call.get_entity = 0;
   return Status::OK();
 }
-Status AivExecutionResources::PreparePut(const BatchPutExecRequest& exec,
+Status AivExecutionResources::PreparePutResources(const BatchPutExecRequest& exec,
     AivInvocation& call, UrmaAivPutView* out) {
-  if (!out || out->identity != this || out->bound != &call || call.owner != this || state_->active != &call)
+  if (!out || !out->common.Validate(&call, ExecutionDirection::Put).ok() || call.owner != this || state_->active != &call)
     return InvalidArgument("Put preparation requires the bound AIV invocation");
   if (!state_->initialized) return Status::NotInitialized("AIV Put resource not initialized");
   if (!exec.request || !exec.request->input.valid() || exec.request->keys.empty() ||
@@ -260,6 +271,7 @@ Status AivExecutionResources::PreparePut(const BatchPutExecRequest& exec,
   if (call.pending_put || call.pending_put_buffer)
     return Status::Busy("resolve the preceding Put before preparing resources");
 #endif
+  state_->views.Prepare(ExecutionDirection::Put);
   call.put_completion = {};
   auto status = Warmup({static_cast<std::uint32_t>(exec.request->keys.size()), exec.execution.stream});
   if (!status.ok()) { call.put_completion = {PutOutcome::Failed, status}; return status; }
@@ -283,6 +295,7 @@ Status AivExecutionResources::PreparePut(const BatchPutExecRequest& exec,
     }
   }
 #endif
+  out->common = state_->views.View(ExecutionDirection::Put);
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   out->buffer = call.pending_put_buffer;
 #endif
@@ -432,12 +445,14 @@ Status AivExecutionResources::Initialize(const RemoteRegionDesc& remote_region) 
   }
 #endif
   state_->initialized = true;
+  state_->views.Initialize(remote_region);
   return Status::OK();
 }
 
 Status AivExecutionResources::Close() {
   if (state_->active->graph_buffer) return Status::Busy("release graph lease before provider shutdown");
   state_->initialized = false;
+  state_->views.Close();
   if (state_->active->pending_get &&
       aclrtSynchronizeStream(state_->active->pending_get) != ACL_SUCCESS)
     return Status::CompletionUnknown("Get stream still pending; resources retained");
@@ -497,6 +512,7 @@ Status AivExecutionResources::Warmup(const ExecutionWarmup& request) {
     if (state_->active->pending_put &&
         request.request_capacity > state_->put.workspace.metadata_capacity)
       return Status::Busy("cannot resize workspace used by a pending Put");
+    state_->views.Prepare(ExecutionDirection::Put);
     return state_->put.Reserve(request.request_capacity);
   }
 #endif

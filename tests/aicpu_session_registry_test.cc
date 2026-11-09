@@ -7,6 +7,13 @@
 using namespace kvaf::aicpu_urma;
 using namespace kvaf::aicpu_urma::detail;
 #define CHECK(c) do { if (!(c)) throw std::runtime_error(#c); } while (false)
+static urma_target_seg_t imported;
+static bool fail_unimport;
+static int imports, unimports;
+static urma_target_seg_t* Import(urma_context_t*, urma_seg_t* segment, urma_token_t*, uint64_t, urma_import_seg_flag_t) {
+  ++imports; imported.seg = *segment; return &imported;
+}
+static urma_status_t Unimport(urma_target_seg_t*) { ++unimports; return fail_unimport ? URMA_FAIL : URMA_SUCCESS; }
 namespace kvaf::aicpu_urma::detail {
 bool BuildTransfers(Queue&, bool, const UmdkTransfer*, std::uint32_t, std::uint32_t&,
                     std::uint64_t&, UmdkControlStatus&);
@@ -45,8 +52,11 @@ int main() {
     urma_target_seg_t remote{}, local{};
     remote.seg.ubva.va = 0x9000;
     remote.seg.len = 0x1000;
-    CurrentState().remote = &remote;
-    CurrentState().remote_address = 0x1000;
+    auto* context = reinterpret_cast<urma_context_t*>(1);
+    CHECK(CurrentState().remote.Import(context, Import, Unimport, remote.seg, 1, 0x1000, put_id) == 0);
+    CHECK(CurrentState().remote.Import(context, Import, Unimport, remote.seg, 1, 0x1000, put_id) == 0);
+    CHECK(imports == 1);
+    CHECK(CurrentState().remote.Import(context, Import, Unimport, remote.seg, 2, 0x1000, put_id) != 0);
     CurrentState().local = &local;
     CurrentState().buffer = 0x3000;
     CurrentState().buffer_bytes = 0x1000;
@@ -60,7 +70,11 @@ int main() {
     offset = 0;
     transfer.remote = 0xFFF;
     CHECK(!BuildTransfers(queue, false, &transfer, 1, index, offset, status));
-    CurrentState().remote = nullptr;
+    fail_unimport = true;
+    CHECK(CurrentState().remote.Close() != 0 && CurrentState().remote.handle());
+    fail_unimport = false;
+    CHECK(CurrentState().remote.Close() == 0 && !CurrentState().remote.handle());
+    CHECK(unimports == 2);
     CurrentState().local = nullptr;
     CurrentState().buffer = 789;
   }

@@ -26,43 +26,36 @@ struct BatchGetTransport::Impl {
   void* status_host{nullptr};
   void* profile_device{nullptr};
   void* profile_host{nullptr};
-  struct Invocation final : ExecutionState {
-    explicit Invocation(const Impl* value) : owner(value) {}
-    const Impl* owner;
-    aclrtStream pending{};
-    std::uint64_t sequence{};
-    const BatchGetRequest* prepared{};
-    void* prepared_stream{};
-    BatchGetProfile* prepared_profile{};
-    std::uint64_t prepare_started{};
-  };
+  using Invocation = AicpuGetInvocation;
+  ExecutionViewState views;
   Invocation legacy{this};
   Invocation* invocation{&legacy};
   std::uint64_t sequence{0U};
   bool initialized{false}, cpu_enabled{false};
-  Status Drain(const char* stage = "drain") {
-    if (!invocation->pending) return Status::OK();
-    const auto result = aclrtSynchronizeStream(invocation->pending);
-    if (result != ACL_SUCCESS) {
-      const char* detail = aclGetRecentErrMsg();
-      return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
-                      " stage=" + stage + " sequence=" + std::to_string(sequence) +
-                      " workers=" + std::to_string(session.config().workers) +
-                      " source_mode=" + (direct_addresses ? "direct" : "table") +
-                      "; buffers retained; detail=" + (detail ? detail : "unavailable"));
-    }
-    if (aclrtMemcpy(status_host, execution.status_bytes, execution.status,
-                    execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
-      return Internal("GatherRead completion status unavailable; buffers retained");
-    const auto* reports = static_cast<const GatherReadStatus*>(status_host);
-    for (unsigned worker = 0; worker < session.config().workers; ++worker)
-      if (reports[worker].magic != kGatherStatusMagic || reports[worker].sequence != invocation->sequence ||
-          reports[worker].result != 0)
-        return Internal("GatherRead worker failed; session retained for recovery");
-    invocation->pending = nullptr;
-    return Status::OK();
-  }
+  Status Drain(const char* stage = "drain");
 };
+static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call, const char* stage) {
+  if (!call.pending) return Status::OK();
+  const auto result = aclrtSynchronizeStream(call.pending);
+  if (result != ACL_SUCCESS) {
+    const char* detail = aclGetRecentErrMsg();
+    return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
+                    " stage=" + stage + " sequence=" + std::to_string(call.sequence) +
+                    " workers=" + std::to_string(view.options.workers) +
+                    " source_mode=" + (view.direct_addresses ? "direct" : "table") +
+                    "; buffers retained; detail=" + (detail ? detail : "unavailable"));
+  }
+  if (aclrtMemcpy(view.completion.host, view.completion.bytes, view.completion.device,
+                  view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    return Internal("GatherRead completion status unavailable; buffers retained");
+  const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
+  for (unsigned worker = 0; worker < view.options.workers; ++worker)
+    if (reports[worker].magic != kGatherStatusMagic || reports[worker].sequence != call.sequence ||
+        reports[worker].result != 0)
+      return Internal("GatherRead worker failed; session retained for recovery");
+  call.pending = nullptr;
+  return Status::OK();
+}
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
                                      bool direct_addresses)
     : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses)) {}
@@ -74,7 +67,22 @@ Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
   auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
   if (!typed || typed->owner != impl_.get()) return Status::InvalidArgument("Get invocation belongs to another resource");
   impl_->invocation = typed;
+  impl_->views.Bind(typed);
   return Status::OK();
+}
+GatherLaunchView BatchGetTransport::View() const {
+  return {impl_->views.View(ExecutionDirection::Get),
+      {impl_->session.session(), impl_->session.owner_pid()},
+      {impl_->session.config().workers, impl_->token_bytes}, impl_->direct_addresses,
+      impl_->workspace, {impl_->execution.status, impl_->status_host, impl_->execution.status_bytes},
+      {impl_->profile_device, impl_->profile_host, impl_->session.config().workers * sizeof(BatchGetWorkerProfile)},
+      &impl_->sequence};
+}
+Status BatchGetTransport::Impl::Drain(const char* stage) {
+  GatherLaunchView view;
+  view.options.workers = session.config().workers; view.direct_addresses = direct_addresses;
+  view.completion = {execution.status, status_host, execution.status_bytes};
+  return DrainGather(view, *invocation, stage);
 }
 Status BatchGetTransport::Drain() { return impl_->Drain(); }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
@@ -103,9 +111,12 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   }
   impl_->region = region;
   impl_->initialized = true;
+  impl_->views.Bind(impl_->invocation);
+  impl_->views.Initialize(region);
   return Status::OK();
 }
 Status BatchGetTransport::Shutdown() {
+  impl_->views.Close();
   auto drained = impl_->Drain("shutdown");
   if (!drained.ok()) return drained;
   if (impl_->workspace) (void)aclrtFree(impl_->workspace);
@@ -136,6 +147,7 @@ Status BatchGetTransport::Warmup() {
   return s;
 }
 Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec) {
+  impl_->views.Prepare();
   auto& call = *impl_->invocation;
   call.prepared = nullptr;
   if (exec.execution.profile && !exec.execution.synchronize)
@@ -173,10 +185,17 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   return ready.ok() ? ExecutePrepared(exec) : ready;
 }
 Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
+  return LaunchPrepared(exec, View(), impl_->invocation);
+}
+Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
+                                         const GatherLaunchView& view, ExecutionState* state) {
+  auto* invocation = dynamic_cast<AicpuGetInvocation*>(state);
+  auto valid_view = view.common.Validate(invocation, ExecutionDirection::Get);
+  if (!valid_view.ok()) return valid_view;
   auto* profile = exec.execution.profile;
   if (profile && !exec.execution.synchronize)
     return InvalidArgument("BatchGet profiling requires synchronize=true");
-  auto& call = *impl_->invocation;
+  auto& call = *invocation;
   if (call.prepared != exec.request || call.prepared_stream != exec.execution.stream ||
       call.prepared_profile != profile || !call.prepared)
     return Status::InvalidState("Gather resources were not prepared for this request");
@@ -185,30 +204,30 @@ Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
   UmdkBatchGetArgs launch{};
   auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
   if (!valid.ok()) return valid;
-  launch.request.canonical_base = impl_->region.base;
-  launch.request.logical_bytes = impl_->region.length;
+  launch.request.canonical_base = view.common.region().canonical_base;
+  launch.request.logical_bytes = view.common.region().logical_bytes;
   if (launch.request.request_capacity > kGatherMaxRequests ||
-      launch.request.token_bytes != impl_->token_bytes)
+      launch.request.token_bytes != view.options.token_bytes)
     return InvalidArgument("UMDK BatchGet exceeds 65536 requests or configured token size");
-  if (impl_->direct_addresses) {
+  if (view.direct_addresses) {
     if (exec.request->access_table.opaque != 0U)
       return InvalidArgument("gather_read_direct requires the addresses Tensor overload");
     if (launch.request.table_capacity < launch.request.request_capacity)
       return InvalidArgument("direct addresses must cover the request capacity");
     launch.request.indices = launch.request.offsets = 0U;
   }
-  const auto workers = impl_->session.config().workers;
+  const auto workers = view.options.workers;
   const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
-  const auto staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
-  const auto descriptors = staging + GatherStagingBytes(impl_->token_bytes, workers);
+  const auto staging = (view.common.region().canonical_base + view.common.region().logical_bytes + 63U) & ~std::uint64_t{63U};
+  const auto descriptors = staging + GatherStagingBytes(view.options.token_bytes, workers);
   const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers);
-  if (impl_->sequence == peer::kGatherErrorBit - 1U)
+  if (*view.sequence == peer::kGatherErrorBit - 1U)
     return Status::InvalidState("BatchGet sequence exhausted");
   auto& args = launch.gather;
-  args.sequence = ++impl_->sequence;
-  args.context = {impl_->session.session(), impl_->session.owner_pid()};
-  args.core_status = PointerValue(impl_->execution.status);
-  args.scratch = PointerValue(impl_->workspace);
+  args.sequence = ++*view.sequence;
+  args.context = {view.context.session, view.context.owner_pid};
+  args.core_status = PointerValue(view.completion.device);
+  args.scratch = PointerValue(view.workspace);
   args.source_descriptor = args.scratch + kGatherDescriptorOffset;
   args.output = PointerValue(exec.request->output.data);
   args.output_extent = exec.request->output.bytes;
@@ -217,11 +236,11 @@ Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
   args.remote_notify = controls;
   args.remote_ack = args.remote_notify + 8U;
   args.remote_command = args.remote_notify + 16U;
-  args.worker_count = impl_->session.config().workers;
-  args.profile = profile ? PointerValue(impl_->profile_device) : 0U;
+  args.worker_count = view.options.workers;
+  args.profile = profile ? PointerValue(view.profile.device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  impl_->invocation->pending = stream;
-  impl_->invocation->sequence = impl_->sequence;
+  call.pending = stream;
+  call.sequence = *view.sequence;
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchBatchGet(&launch, stream)) return Internal("UMDK BatchGet launch failed");
@@ -231,26 +250,26 @@ Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
     stamp = now;
   }
   if (!exec.execution.synchronize) return Status::OK();
-  if (aclrtMemcpyAsync(impl_->status_host, impl_->execution.status_bytes, impl_->execution.status,
-                       impl_->execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST,
+  if (aclrtMemcpyAsync(view.completion.host, view.completion.bytes, view.completion.device,
+                       view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST,
                        stream) != ACL_SUCCESS)
     return Internal("BatchGet status enqueue failed");
   if (profile) {
-    if (aclrtMemcpyAsync(impl_->profile_host, profile_bytes, impl_->profile_device,
+    if (aclrtMemcpyAsync(view.profile.host, profile_bytes, view.profile.device,
                          profile_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS)
       return Internal("BatchGet profile enqueue failed");
     const auto now = BatchGetProfileNowNs();
     profile->status_enqueue_ns = now - stamp;
     stamp = now;
   }
-  auto completed = impl_->Drain("completion");
+  auto completed = DrainGather(view, call, "completion");
   if (profile) {
     const auto now = BatchGetProfileNowNs();
     profile->wait_ns = now - stamp;
     stamp = now;
   }
   if (!completed.ok()) return completed;
-  const auto* statuses = static_cast<const GatherReadStatus*>(impl_->status_host);
+  const auto* statuses = static_cast<const GatherReadStatus*>(view.completion.host);
   for (unsigned worker = 0; worker < args.worker_count; ++worker)
     if (statuses[worker].magic != kGatherStatusMagic ||
         statuses[worker].sequence != args.sequence || statuses[worker].result)
@@ -259,7 +278,7 @@ Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
                       " result=" + std::to_string(statuses[worker].result));
   if (profile) {
     profile->worker_count = workers;
-    std::copy_n(static_cast<const BatchGetWorkerProfile*>(impl_->profile_host), workers,
+    std::copy_n(static_cast<const BatchGetWorkerProfile*>(view.profile.host), workers,
                 profile->workers.begin());
     const auto end = BatchGetProfileNowNs();
     profile->finish_ns = end - stamp;

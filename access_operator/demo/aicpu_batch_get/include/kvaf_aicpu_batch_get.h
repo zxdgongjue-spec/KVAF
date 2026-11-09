@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "access_operator.h"
+#include "aicpu_urma/launch_view.h"
 #include "aicpu_batch_get/include/batch_get_abi.h"
 namespace kvaf::aicpu_urma {
 class UmdkSession;
@@ -16,6 +17,8 @@ class BatchGetTransport {
   Status Execute(const BatchGetExecRequest&);
   Status Prepare(const BatchGetExecRequest&);
   Status ExecutePrepared(const BatchGetExecRequest&);
+  GatherLaunchView View() const;
+  static Status LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*);
   Status Drain();
   std::unique_ptr<ExecutionState> CreateExecutionState();
   Status BindExecutionState(ExecutionState*);

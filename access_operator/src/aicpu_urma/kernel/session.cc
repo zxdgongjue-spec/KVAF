@@ -115,7 +115,8 @@ bool Cleanup(UmdkControlStatus& status) {
     if (result != 0) return Fail(status, #function, result); \
     CurrentState().member = nullptr;                                  \
   }
-  KVAF_RELEASE(remote, urma_unimport_seg)
+  const auto unimported = CurrentState().remote.Close();
+  if (unimported != 0) return Fail(status, "urma_unimport_seg", unimported);
   while (!CurrentState().buffers.empty()) {
     auto& buffer = CurrentState().buffers.back();
     if (buffer.segment != nullptr) {
@@ -350,23 +351,16 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
   if (!args.remote_address || segment.len > UINT64_MAX - args.remote_address ||
       segment.len > UINT64_MAX - segment.ubva.va)
     return Fail(status, "remote range outside segment");
-  urma_token_t token{};
-  token.token = args.token;
-  urma_import_seg_flag_t flag{};
-  flag.bs.cacheable = URMA_NON_CACHEABLE;
-  flag.bs.access = (1U << 1U) | (1U << 2U);
-  flag.bs.mapping = URMA_SEG_NOMAP;
   Stage(status, "urma_import_seg");
-  if (CurrentState().remote == nullptr)
-    CurrentState().remote = CurrentState().api.urma_import_seg(CurrentState().context, &segment, &token, 0, flag);
-  if (CurrentState().remote == nullptr) return Fail(status, "urma_import_seg");
+  if (CurrentState().remote.Import(CurrentState().context, CurrentState().api.urma_import_seg,
+          CurrentState().api.urma_unimport_seg, segment, args.token, args.remote_address,
+          CurrentState().session) != 0) return Fail(status, "urma_import_seg");
   Stage(status, "urma_import_jetty_ex");
   worker.target = kvaf::urma::ImportJetty(CurrentState().api.import_jetty_ex, CurrentState().context, args.peer_key,
                                           args.token, worker.tp, args.peer_tp, 1U, args.peer_psn);
   if (worker.target == nullptr) return Fail(status, "urma_import_jetty_ex");
   CurrentState().shared_peer_tp = args.peer_tp;
   CurrentState().shared_peer_psn = args.peer_psn;
-  CurrentState().remote_address = args.remote_address;
   return DescribeWorker(args, args.worker_index, status);
 }
 

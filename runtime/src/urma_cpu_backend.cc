@@ -1,4 +1,5 @@
 #include "cpu_backends.h"
+#include "cpu_ddr_registration.h"
 #include "cpu_urma_channel.h"
 #include "urma_transport.h"
 #include "peer_protocol.h"
@@ -399,9 +400,7 @@ struct Region {
   bool borrowed = false;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
-  urma_token_id_t* token_id = nullptr;
-  urma_target_seg_t* segment = nullptr;
-  uint32_t token_value = 0U;
+  CpuDdrRegistration registration;
   std::vector<Channel> channels;
   std::unique_ptr<CpuGatherWorker> gather;
   std::vector<std::unique_ptr<CpuGatherWorker>> gather_lanes;
@@ -480,49 +479,26 @@ class CpuService {
     region->bytes = bytes;
     if (!borrowed && bytes >= 64U)
       std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
-    region->token_value = NextToken();
-    region->token_id = urma_alloc_token_id(resources->context());
-    if (region->token_id == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_alloc_token_id errno=%d\n", errno);
-      return fail();
-    }
-    urma_reg_seg_flag_t flag{};
-    flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-    flag.bs.cacheable = URMA_NON_CACHEABLE;
-    // Keep the CPU DDR registration equivalent to the existing HCCP host-memory
-    // path. LOCAL_WRITE is deliberately absent: it was rejected by the deployed
-    // UDMA driver, whereas remote atomic and non-pinned registration are part of
-    // the established host-DDR contract.
-    flag.bs.access = URMA_ACCESS_REMOTE_READ | URMA_ACCESS_REMOTE_WRITE |
-                     URMA_ACCESS_REMOTE_ATOMIC;
-    flag.bs.non_pin = 1U;
-    flag.bs.token_id_valid = 1U;
-    urma_seg_cfg_t config{};
-    config.va = reinterpret_cast<uint64_t>(region->memory);
-    config.len = bytes;
-    config.token_id = region->token_id;
-    config.token_value.token = region->token_value;
-    config.flag = flag;
-    region->segment = urma_register_seg(resources->context(), &config);
-    if (region->segment == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_register_seg base=%p bytes=%" PRIu64
-          " token_id=0x%x token_value=0x%x reg_flags=0x%x errno=%d\n",
-          region->memory, bytes, region->token_id->token_id, region->token_value, flag.value, errno);
+    auto registered = region->registration.Register(resources->context(), region->memory, bytes, NextToken());
+    if (!registered.ok()) {
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED base=%p bytes=%" PRIu64 " error=%s\n",
+          region->memory, bytes, registered.message().c_str());
       return fail();
     }
 
     region->base =
-        borrowed ? reinterpret_cast<std::uint64_t>(borrowed) : region->segment->seg.ubva.va;
-    response->session_id = id;
-    response->peer_base = region->segment->seg.ubva.va;
+        borrowed ? reinterpret_cast<std::uint64_t>(borrowed) : region->registration.segment()->seg.ubva.va;
+    const auto descriptor = region->registration.Describe(id);
+    response->session_id = descriptor.session_id;
+    response->peer_base = descriptor.registered_address;
+    // Preserve the legacy advertised allocation extent. Driver padding, if
+    // any, remains represented in the serialized segment, not usable DDR.
     response->peer_length = bytes;
-    // HCCP's UB resource-service forwards the public UMDK token object value
-    // (rather than transforming it through its private TokenId wrapper).
-    response->token_id = region->token_id->token_id;
-    response->token_value = region->token_value;
-    response->segment_key_bytes = kSegBytes;
-    std::memcpy(response->peer_eid, region->segment->seg.ubva.eid.raw, kEidBytes);
-    std::memcpy(response->segment_key, &region->segment->seg, kSegBytes);
+    response->token_id = descriptor.token_id;
+    response->token_value = descriptor.token_value;
+    response->segment_key_bytes = descriptor.key_bytes;
+    std::memcpy(response->peer_eid, descriptor.eid.data(), kEidBytes);
+    std::memcpy(response->segment_key, descriptor.key.data(), descriptor.key_bytes);
     if (response->peer_base == 0U || response->token_id == 0U) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=region_descriptor base=0x%" PRIx64
           " token_id=0x%x\n",
@@ -533,7 +509,7 @@ class CpuService {
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
         "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value, MemoryPageModeName());
+        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, MemoryPageModeName());
     return Result::kOk;
   }
 
@@ -570,8 +546,8 @@ class CpuService {
     };
     const bool share_tp = (request.reserved & peer::kChannelSharedTp) != 0U;
     const bool created = share_tp
-        ? channel.CreateLocal(region.resources->context(), region.token_value)
-        : CreateLocalJetty(region.resources, region.token_value, &channel.local_jfc,
+        ? channel.CreateLocal(region.resources->context(), region.registration.token_value())
+        : CreateLocalJetty(region.resources, region.registration.token_value(), &channel.local_jfc,
                             &channel.local_jfr, &channel.local_jetty);
     if (!created) return failed();
     const auto* shared = share_tp ? cpu_runtime_detail::FindSharedChannelTp(
@@ -685,7 +661,7 @@ class CpuService {
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<cpu_push::Transport>();
     const auto status = transport->Initialize(
-        region.resources->context(), region.segment, request, region.resources->tp_query(),
+        region.resources->context(), region.registration.segment(), request, region.resources->tp_query(),
         region.resources->jetty_import(), NextPsn(), response, region.base);
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
@@ -873,14 +849,7 @@ class CpuService {
       if (!region->channels.back().Close()) return false;
       region->channels.pop_back();
     }
-    if (region->segment != nullptr) {
-      if (urma_unregister_seg(region->segment) != URMA_SUCCESS) return false;
-      region->segment = nullptr;
-    }
-    if (region->token_id != nullptr) {
-      if (urma_free_token_id(region->token_id) != URMA_SUCCESS) return false;
-      region->token_id = nullptr;
-    }
+    if (!region->registration.Close().ok()) return false;
     if (region->memory != nullptr) {
       if (!region->borrowed) free(region->memory);
       region->memory = nullptr;

@@ -8,6 +8,7 @@
 
 #include "aicpu_urma/transport.h"
 #include "urma_transport.h"
+#include "remote_memory_binding.h"
 namespace kvaf::aicpu_urma::detail {
 using namespace kvaf::urma;
 #define KVAF_UMDK_APIS(APPLY)    \
@@ -78,12 +79,12 @@ struct SessionState {
   urma_context_t* context = nullptr;
   urma_token_id_t* token = nullptr;
   urma_target_seg_t* local = nullptr;
-  urma_target_seg_t* remote = nullptr;
+  UmdkRemoteMemoryBinding remote;
   std::uint64_t session = 0;
   std::uint64_t shared_tp = 0, shared_peer_tp = 0;
   std::uint32_t shared_peer_psn = 0;
   std::array<std::uint8_t, 16> peer_eid{};
-  std::uint64_t buffer = 0, buffer_bytes = 0, remote_address = 0;
+  std::uint64_t buffer = 0, buffer_bytes = 0;
   std::uint32_t worker_count = 1;
   std::array<Queue, kUmdkControlQueueIndex> data_queues;
   std::array<Queue, kUmdkControlQueueIndex> control_queues;

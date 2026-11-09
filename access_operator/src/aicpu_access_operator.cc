@@ -7,10 +7,9 @@
 namespace kvaf {
 Status UrmaAicpuPutOperator::Launch(const BatchPutExecRequest& request,
                                    const UrmaAicpuPutView& view, AicpuInvocation& call) {
-  if (!view.owner_ || view.owner_ != call.owner || !view.owner_->IsBound(call) || !view.transfers_ || !view.region_ || !view.session_)
-    return Status::InvalidArgument("AICPU Put resource view does not match invocation");
-  view.session_->BindWriteState(&call.write);
-  auto result = view.transfers_->ExecutePrepared(*view.region_, request);
+  auto valid = view.common.Validate(&call, ExecutionDirection::Put);
+  if (!valid.ok()) return valid;
+  auto result = aicpu_urma::BatchPutTransport::LaunchPrepared(request, view.launch, call.put.get());
   if (result.ok()) call.put_completion = {PutOutcome::Succeeded, result};
   else if (!call.write.attempted) call.put_completion = {PutOutcome::Failed, result};
   else call.put_completion.result = result;
@@ -18,18 +17,16 @@ Status UrmaAicpuPutOperator::Launch(const BatchPutExecRequest& request,
 }
 Status UrmaAicpuGatherOperator::Launch(const BatchGetExecRequest& request,
                                       const UrmaAicpuGatherView& view, AicpuInvocation& call) {
-  if (!view.owner_ || view.owner_ != call.owner || !view.owner_->IsBound(call) || !view.gather_)
-    return Status::InvalidArgument("AICPU Gather resource view does not match invocation");
-  auto bound = view.gather_->BindExecutionState(call.get.get());
-  return bound.ok() ? view.gather_->ExecutePrepared(request) : bound;
+  auto valid = view.common.Validate(&call, ExecutionDirection::Get);
+  if (!valid.ok()) return valid;
+  return aicpu_urma::BatchGetTransport::LaunchPrepared(request, view.launch, call.get.get());
 }
 Status UrmaAicpuScatterOperator::Launch(const BatchGetExecRequest& request,
                                        const UrmaAicpuScatterView& view, AicpuInvocation& call) {
-  if (!view.owner_ || view.owner_ != call.owner || !view.owner_->IsBound(call) || !view.push_)
-    return Status::InvalidArgument("AICPU Scatter resource view does not match invocation");
+  auto valid = view.common.Validate(&call, ExecutionDirection::Get);
+  if (!valid.ok()) return valid;
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  auto bound = view.push_->BindExecutionState(call.push.get());
-  return bound.ok() ? view.push_->ExecutePrepared(request) : bound;
+  return cpu_push::CpuPushTransport::LaunchPrepared(request, view.launch, call.push.get());
 #else
   return Status::NotImplemented("AICPU Scatter was not built");
 #endif
@@ -59,7 +56,7 @@ Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
   auto& call = resources_->invocation();
   call.put_completion = {};
   call.write = {};
-  auto result = resources_->PreparePut(request);
+  auto result = resources_->PreparePutResources(request);
   if (!result.ok()) { call.put_completion = {PutOutcome::Failed, result}; return result; }
   result = UrmaAicpuPutOperator::Launch(request, resources_->PutView(), call);
   if (result.ok() && resources_->managed_completion()) result = resources_->ReleasePutBuffers();
@@ -67,7 +64,7 @@ Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
 }
 Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
   std::lock_guard<std::mutex> lock(resources_->get_mutex());
-  auto ready = resources_->PrepareGet(request);
+  auto ready = resources_->PrepareGetResources(request);
   if (!ready.ok()) return ready;
   auto result = resources_->scatter()
       ? UrmaAicpuScatterOperator::Launch(request, resources_->ScatterView(), resources_->invocation())

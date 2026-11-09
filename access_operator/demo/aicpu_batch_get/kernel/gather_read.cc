@@ -57,7 +57,7 @@ struct GatherBuildLayout {
         token_bytes(request.token_bytes),
         rows(reinterpret_cast<const std::int32_t*>(request.output_indices)),
         local_segment(LocalSegment(args.output, args.output_extent)),
-        remote_segment(CurrentState().remote) {
+        remote_segment(CurrentState().remote.handle()) {
     prototype.opcode = URMA_OPC_READ;
     prototype.flag.bs.comp_order = 1;
     prototype.flag.bs.place_order = URMA_RELAX_ORDER;
@@ -100,7 +100,7 @@ void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_
       }
     }
     remote[wr_index] = {
-        layout.remote_segment->seg.ubva.va + (source - CurrentState().remote_address), bytes,
+        layout.remote_segment->seg.ubva.va + (source - CurrentState().remote.canonical()), bytes,
         layout.remote_segment, nullptr};
     auto wr = layout.prototype;
     wr.user_ctx = ++sequence;
@@ -137,7 +137,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
   const auto& args = prefix.args;
   const auto& source = *reinterpret_cast<const Sge*>(tail.rw.src.sge);
   const auto registered_staging =
-      CurrentState().remote->seg.ubva.va + (args.remote_staging - CurrentState().remote_address);
+      CurrentState().remote.handle()->seg.ubva.va + (args.remote_staging - CurrentState().remote.canonical());
   if (source.addr < registered_staging)
     return Fail(submitted, "Gather source precedes registered staging");
   const auto required = source.addr - registered_staging + source.len;

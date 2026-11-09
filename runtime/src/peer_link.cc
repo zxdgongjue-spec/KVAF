@@ -388,6 +388,8 @@ Status PeerLink::PrepareExecution() {
   const auto canonical =
       parent_ ? parent_->execution_->reply.binding.base : state.reply.binding.base;
   regions_[canonical] = state.reply.binding;
+  regions_[canonical].epoch = state.reply.epoch;
+  regions_[canonical].region_id = state.reply.region;
   return Status::OK();
 }
 Status PeerLink::QueryExecution(execution::Response* out) const {

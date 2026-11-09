@@ -8,13 +8,13 @@ std::uint64_t AddressOf(const void* ptr) { return reinterpret_cast<std::uintptr_
 BatchArgs Args(Operation operation, void* local, std::size_t bytes, const MappedExecutionView& view) {
   BatchArgs a{};
   a.operation = operation;
-  a.remote_base = view.remote.base;
-  a.remote_bytes = view.remote.length;
-  a.mapped_base = view.mapped_base;
+  a.remote_base = view.common.region().canonical_base;
+  a.remote_bytes = view.common.region().logical_bytes;
+  a.mapped_base = view.memory.base;
   a.local_base = AddressOf(local);
   a.local_bytes = bytes;
   a.statuses = AddressOf(view.slot->statuses);
-  a.blocks = view.cores;
+  a.blocks = view.kernel.cores;
   return a;
 }
 Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionView& view,
@@ -33,7 +33,7 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   if (view.managed_completion && !call.graph_active &&
       capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
     return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
-  const auto size = view.cores * sizeof(CoreStatus);
+  const auto size = view.kernel.cores * sizeof(CoreStatus);
   if (synchronize || view.managed_completion) {
     // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
     // not look like a successful zero-row kernel.
@@ -53,7 +53,7 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 4; cfg.attrs = attrs;
   if (args.operation == Operation::kPut) call.put_issued = true;
   auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
-      view.function, view.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
+      view.kernel.function, view.kernel.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
   if (!status.ok()) return status;
   if (call.graph_active) {
     call.graph_recorded = true;
@@ -68,7 +68,7 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
     if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE) return Status::OK();
     status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
     if (!status.ok()) {
-      *view.ready = false;
+      view.health->failed = true;
       // No event: drain now or leave Shutdown responsible for retrying.
       if (aclrtSynchronizeStream(stream) == ACL_SUCCESS) call.pending[stream] = ExecutionSlot::Pending::kNone;
       return status;
@@ -90,12 +90,12 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
         static_cast<unsigned long long>(args.mapped_base),
         static_cast<unsigned long long>(args.remote_bytes),
         static_cast<unsigned long long>(args.put_offsets));
-    *view.ready = false;
+    view.health->failed = true;
     return status;
   }
   call.pending[stream] = ExecutionSlot::Pending::kNone;
   const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
-  for (std::size_t i = 0; i < view.cores; ++i) {
+  for (std::size_t i = 0; i < view.kernel.cores; ++i) {
     if (reports[i].result == UINT64_MAX) {
       return Status::Internal("UBmem kernel status was not written (still 0xFF)");
     }
@@ -202,7 +202,7 @@ Status AccessOperator::DrainGet() {
 }
 Status AccessOperator::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
   std::lock_guard<std::mutex> lock(resources_->mutex);
-  if (!resources_->ready) return Status::NotInitialized("UBmem operator is not initialized");
+  if (!resources_->ready || resources_->health.failed) return Status::NotInitialized("UBmem operator is not initialized");
   resources_->profiling = enabled;
   resources_->profile_detail = enabled && detailed;
   resources_->invocation->profile_stream = nullptr;
@@ -211,7 +211,7 @@ Status AccessOperator::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
 Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
   std::lock_guard<std::mutex> lock(resources_->mutex);
   if (!profiles) return Status::InvalidArgument("profile output is null");
-  if (!resources_->ready || !resources_->profiling || !resources_->invocation->profile_stream)
+  if (!resources_->ready || resources_->health.failed || !resources_->profiling || !resources_->invocation->profile_stream)
     return Status::InvalidState("no profiled UBmem BatchGet launch");
   const auto& state = resources_->streams.at(resources_->invocation->profile_stream);
   std::vector<CoreStatus> reports(resources_->options.cores);
@@ -269,6 +269,8 @@ Status AccessOperator::ResolvePut(PutCompletion* out) {
     call.put_completion = {success ? PutOutcome::Succeeded : PutOutcome::Failed,
         success ? Status::OK() : failure};
     resources_->ready = true;
+    resources_->health.failed = false;
+    resources_->views.Initialize(resources_->remote);
   }
   *out = call.put_completion;
   return Status::OK();
@@ -281,10 +283,9 @@ Status AccessOperator::AcknowledgePut() {
 }
 Status UbmemGetOperator::Launch(const BatchGetExecRequest& exec, const UbmemGetView& view,
                                  UbmemInvocation& call) {
-  if (!view.execution_.owner || call.owner != view.execution_.owner || !view.execution_.slot ||
-      !view.execution_.active || *view.execution_.active != &call ||
-      !view.execution_.ready || !*view.execution_.ready || !view.execution_.function || !exec.request ||
-      view.execution_.stream != static_cast<aclrtStream>(exec.execution.stream))
+  if (!view.execution_.common.Validate(&call, ExecutionDirection::Get).ok() ||
+      !view.execution_.health || view.execution_.health->failed || !view.execution_.slot || !view.execution_.kernel.function || !exec.request ||
+      call.prepared_stream != static_cast<aclrtStream>(exec.execution.stream))
     return Status::InvalidArgument("invalid UBMEM Get resource view or invocation");
 
   // RuntimeCore owns buffer/layout validation. This adapter only restricts
@@ -327,15 +328,15 @@ Status UbmemGetOperator::Launch(const BatchGetExecRequest& exec, const UbmemGetV
 Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   std::lock_guard<std::mutex> lock(resources_->mutex);
   UbmemGetView view;
-  auto s = resources_->PrepareGet(static_cast<aclrtStream>(exec.execution.stream), &view);
+  auto s = resources_->PrepareGetResources(static_cast<aclrtStream>(exec.execution.stream), &view);
   return s.ok() ? UbmemGetOperator::Launch(exec, view, *resources_->invocation) : s;
 }
 Status UbmemPutOperator::Launch(const BatchPutExecRequest& exec, const UbmemPutView& view,
                                  UbmemInvocation& call) {
-  if (!view.execution_.owner || call.owner != view.execution_.owner || !view.execution_.slot ||
-      !view.execution_.active || *view.execution_.active != &call ||
-      !view.execution_.ready || !*view.execution_.ready || !view.execution_.function || !exec.request || !exec.put_desc ||
-      view.execution_.stream != static_cast<aclrtStream>(exec.execution.stream))
+  if (!view.execution_.common.Validate(&call, ExecutionDirection::Put).ok() ||
+      !view.execution_.health || view.execution_.health->failed || !view.execution_.slot || !view.execution_.kernel.function || !exec.request ||
+      !exec.put_desc ||
+      call.prepared_stream != static_cast<aclrtStream>(exec.execution.stream))
     return Status::InvalidArgument("invalid UBMEM Put resource view or invocation");
 
   const auto& r = *exec.request;
@@ -377,7 +378,7 @@ Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   UbmemPutView view;
   auto result = !exec.request || exec.request->keys.size() > UINT32_MAX
       ? Status::InvalidArgument("invalid UBMEM Put request capacity")
-      : resources_->PreparePut(static_cast<aclrtStream>(exec.execution.stream),
+      : resources_->PreparePutResources(static_cast<aclrtStream>(exec.execution.stream),
                                static_cast<std::uint32_t>(exec.request->keys.size()), &view);
   if (result.ok()) result = UbmemPutOperator::Launch(exec, view, call);
   if (result.ok()) call.put_completion = {PutOutcome::Succeeded, result};

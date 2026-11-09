@@ -58,6 +58,8 @@ Status BatchGetTransport::Shutdown() { return Status::OK(); }
 Status BatchGetTransport::Drain() { return Status::OK(); }
 Status BatchGetTransport::Prepare(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
 Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
+GatherLaunchView BatchGetTransport::View() const { return {}; }
+Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*) { return Status::NotImplemented("unused"); }
 std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() { return {}; }
 Status BatchGetTransport::BindExecutionState(ExecutionState*) { return Status::OK(); }
 Status PrepareUmdkKernel(const std::string&, bool) { return Status::OK(); }
@@ -164,7 +166,10 @@ int main() {
   AicpuExecutionResources foreign_resources(provider);
   auto foreign_state = foreign_resources.CreateInvocation();
   CHECK(!resources->Bind(foreign_state.get()).ok());
-  CHECK(resources->PreparePut(call).ok());
+  CHECK(resources->PreparePutResources(call).ok());
+  const auto old_put_view = resources->PutView();
+  CHECK(resources->PreparePutResources(call).ok());
+  CHECK(!UrmaAicpuPutOperator::Launch(call, old_put_view, *invocation_state).ok());
   const auto before_allocations = allocations, before_registrations = registrations;
   const auto before_writes = writes;
   auto same_owner_unbound = resources->CreateInvocation();

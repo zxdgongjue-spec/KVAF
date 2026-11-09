@@ -77,6 +77,9 @@ int main() {
   call.execution.synchronize = true; call.execution.profile = &profile;
   CHECK(!gather.ExecutePrepared(call).ok() && launches == 0);
   CHECK(gather.Prepare(call).ok() && registrations == 2 && enables == 1);
+  const auto old_view = gather.View();
+  CHECK(gather.Prepare(call).ok());
+  CHECK(!BatchGetTransport::LaunchPrepared(call, old_view, state.get()).ok() && launches == 0);
   const auto allocations_before_launch = allocations, registrations_before_launch = registrations;
   auto other = request;
   auto mismatched = call; mismatched.request = &other;
@@ -88,7 +91,10 @@ int main() {
   // Warm workspaces and CPU Gather session are reused across invocations.
   CHECK(gather.Prepare(call).ok() && enables == 1 && allocations == allocations_before_launch);
   CHECK(gather.ExecutePrepared(call).ok() && launches == 2);
+  CHECK(gather.Prepare(call).ok());
+  const auto bound_view = gather.View();
   CHECK(gather.BindExecutionState(nullptr).ok());
+  CHECK(!BatchGetTransport::LaunchPrepared(call, bound_view, state.get()).ok() && launches == 2);
   state.reset();
   CHECK(gather.Shutdown().ok() && buffers.empty());
   std::cout << "Gather preparation, typed invocation and allocation-free launch passed\n";

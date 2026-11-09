@@ -73,7 +73,8 @@ struct KvafBatchGetTransport {
   // Each selected local EID owns an independent RaCtx, remote-memory import
   // and transport token. Workers are striped over these paths.
   std::vector<hccp::DeviceAivPathResources> paths{};
-  DirectMemory peer_memory{};
+  kvaf::UrmaRemoteMemoryDesc peer_memory{};
+  kvaf::UrmaBindingCache<hccp::HccpRemoteMemoryBinding> bindings{kvaf::MemoryDirection::Get};
   // Local HBM registrations are keyed by the exact caller-visible (addr,
   // bytes) pair. Heap ownership keeps opaque LocalBuffer handles stable.
   std::vector<std::unique_ptr<KvafBatchGetLocalBuffer>> local_buffers{};
@@ -328,23 +329,6 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
   return true;
 }
 
-bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
-  hccp::MrImportInfo info{};
-  std::memcpy(info.in.key.value, remote.key, remote.key_bytes);
-  info.in.key.size = static_cast<uint8_t>(remote.key_bytes);
-  info.in.ub.flags = hccp::MemImportFlags();
-  info.in.ub.mapping_addr = 0U;
-  info.in.ub.token_value = remote.token_value;
-  const int ret = api.rmem_import(context, &info, import_handle);
-  if (ret != 0 || *import_handle == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_REMOTE_DDR_IMPORT_FAILED ret=%d handle=%p\n", ret, *import_handle);
-    return false;
-  }
-  std::fprintf(stderr, "[KVAF_AIV] DIRECT_REMOTE_DDR_IMPORTED target_seg=0x%llx\n",
-               static_cast<unsigned long long>(info.out.ub.target_seg_handle));
-  return true;
-}
-
 bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
               hccp::CqInfo *info, void **handle) {
   *info = {};
@@ -409,12 +393,8 @@ int32_t ReleaseTransport(KvafBatchGetTransport *transport) {
   // retain their opaque pointer when a later path cleanup fails.
   for (auto it = transport->paths.rbegin(); it != transport->paths.rend(); ++it) {
     auto& path = *it;
-    if (path.device_peer_memory_import) {
-      if (!api.rmem_unimport || !path.device_context ||
-          api.rmem_unimport(path.device_context, path.device_peer_memory_import))
-        return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
-      path.device_peer_memory_import = nullptr;
-    }
+    if (!transport->bindings.Release(&path.peer_binding).ok())
+      return KVAF_BATCH_GET_DIRECT_HCCP_ERROR;
     if (path.device_transport_token_handle) {
       if (!api.token_free || !path.device_context ||
           api.token_free(path.device_context, path.device_transport_token_handle))
@@ -515,8 +495,13 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
         !AllocateToken(state->api, path.device_context, role.c_str(),
                        &path.device_transport_token_handle,
                        &device_transport_token_id) ||
-        !ImportRemoteMemory(state->api, path.device_context, state->peer_memory,
-                            &path.device_peer_memory_import)) {
+        !state->bindings.Acquire(
+            kvaf::UrmaBindingKey::Make(kvaf::MemoryDirection::Get, path.device_context,
+                path.context_generation, state->peer_memory, hccp::MemImportFlags()),
+            [&](hccp::HccpRemoteMemoryBinding& binding) {
+              return binding.Import(path.device_context, state->api.rmem_import,
+                                    state->api.rmem_unimport, state->peer_memory);
+            }, &path.peer_binding).ok()) {
       goto failed;
     }
   }
@@ -570,7 +555,7 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
       entity.remote_host_ddr_address = reinterpret_cast<uint64_t>(host_ddr);
       entity.remote_host_ddr_size = host_ddr_bytes;
       entity.registered_base = state->peer_memory.registered_address;
-      entity.remote_token_id = state->peer_memory.token_id;
+      entity.remote_token_id = state->peer_memory.wqe_token_id();
       entity.remote_token_value = state->peer_memory.token_value;
       entity.sq_va = worker.device_user_ctl_jetty.info.ub.sq_buffer_va;
       entity.sq_db_va = worker.device_user_ctl_jetty.info.ub.db_addr;

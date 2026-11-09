@@ -1,6 +1,9 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_package(Threads REQUIRED)
+add_executable(kvaf_execution_view_binding_test execution_view_binding_test.cc)
+target_link_libraries(kvaf_execution_view_binding_test PRIVATE kvaf_access_operator Threads::Threads)
+add_test(NAME kvaf_execution_view_binding_test COMMAND kvaf_execution_view_binding_test)
 add_executable(kvaf_npu_runtime_config_test npu_runtime_config_test.cc)
 target_link_libraries(kvaf_npu_runtime_config_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_npu_runtime_config_test COMMAND kvaf_npu_runtime_config_test)
@@ -171,6 +174,12 @@ endif()
 # Optional host-only validation against real/stub URMA headers; no liburma or NPU.
 set(KVAF_TEST_URMA_INCLUDE_DIR "" CACHE PATH "URMA headers for host session registry tests")
 if(KVAF_TEST_URMA_INCLUDE_DIR)
+  add_executable(kvaf_cpu_ddr_registration_test cpu_ddr_registration_test.cc)
+  target_include_directories(kvaf_cpu_ddr_registration_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/runtime/src ${PROJECT_SOURCE_DIR}/access_operator/include
+    ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_cpu_ddr_registration_test PRIVATE kvaf_common)
+  add_test(NAME kvaf_cpu_ddr_registration_test COMMAND kvaf_cpu_ddr_registration_test)
   add_executable(kvaf_aicpu_session_registry_test aicpu_session_registry_test.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/session.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/transfer.cc

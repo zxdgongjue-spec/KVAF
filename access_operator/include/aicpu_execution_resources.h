@@ -3,6 +3,7 @@
 #include <mutex>
 #include "aicpu_access_operator.h"
 #include "aicpu_urma/session.h"
+#include "aicpu_urma/launch_view.h"
 
 namespace kvaf {
 namespace aicpu_urma { class BatchPutTransport; class BatchGetTransport; }
@@ -18,28 +19,10 @@ struct AicpuInvocation final : ExecutionState {
   std::unique_ptr<ExecutionState> put, get, push;
 };
 
-// These are concrete, non-owning views. They cannot be constructed with a
-// mismatched session/transport pair or converted across execution directions.
-class UrmaAicpuPutView {
-  friend class AicpuExecutionResources;
-  friend class UrmaAicpuPutOperator;
-  const AicpuExecutionResources* owner_{};
-  aicpu_urma::BatchPutTransport* transfers_{};
-  aicpu_urma::UmdkSession* session_{};
-  const RemoteRegionDesc* region_{};
-};
-class UrmaAicpuGatherView {
-  friend class AicpuExecutionResources;
-  friend class UrmaAicpuGatherOperator;
-  const AicpuExecutionResources* owner_{};
-  aicpu_urma::BatchGetTransport* gather_{};
-};
-class UrmaAicpuScatterView {
-  friend class AicpuExecutionResources;
-  friend class UrmaAicpuScatterOperator;
-  const AicpuExecutionResources* owner_{};
-  cpu_push::CpuPushTransport* push_{};
-};
+// Same common contract across all directions; provider pieces remain typed.
+struct UrmaAicpuPutView { ExecutionViewCommon common; aicpu_urma::PutLaunchView launch; };
+struct UrmaAicpuGatherView { ExecutionViewCommon common; aicpu_urma::GatherLaunchView launch; };
+struct UrmaAicpuScatterView { ExecutionViewCommon common; aicpu_urma::ScatterLaunchView launch; };
 
 // Communication sessions, registrations and execution-slot storage live here,
 // independently of the operator adapter. Close never calls back into an operator.
@@ -53,14 +36,13 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   std::unique_ptr<ExecutionState> CreateInvocation();
   Status Bind(ExecutionState*);
   AicpuInvocation& invocation();
-  bool IsBound(const AicpuInvocation&) const;
   bool managed_completion() const;
   bool scatter() const;
   std::mutex& put_mutex();
   std::mutex& get_mutex();
   // Preparation and Launch run under the same exclusive direction lease.
-  Status PreparePut(const BatchPutExecRequest&);
-  Status PrepareGet(const BatchGetExecRequest&);
+  Status PreparePutResources(const BatchPutExecRequest&);
+  Status PrepareGetResources(const BatchGetExecRequest&);
   Status ReleasePutBuffers();
   Status ReleaseGetBuffers();
   Status ResolvePut(PutCompletion*);

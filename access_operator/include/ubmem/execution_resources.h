@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../access_operator.h"
+#include "execution_view.h"
 #include "ubmem/batch_abi.h"
 #include "ubmem/device_mapping.h"
 #include <acl/acl.h>
@@ -39,21 +40,25 @@ struct UbmemInvocation final : ExecutionState {
   std::uint64_t put_rows{};
   bool put_issued{};
   PutCompletion put_completion;
+  aclrtStream prepared_stream{};
 };
 
 // Borrowed concrete launch views. No allocator, registration, session teardown,
 // or operator pointer is reachable through these views.
-struct MappedExecutionView {
-  const UbmemResources* owner{};
-  RemoteRegionDesc remote{};
-  std::uint64_t mapped_base{};
+struct MappedRegionView {
+  std::uint64_t base{}, bytes{};
+};
+struct AivKernelView {
   aclrtFuncHandle function{};
   std::uint32_t cores{};
+};
+struct MappedExecutionView {
+  ExecutionViewCommon common;
+  MappedRegionView memory;
+  AivKernelView kernel;
   bool managed_completion{}, profiling{}, profile_detail{};
-  bool* ready{};
   ExecutionSlot* slot{};
-  aclrtStream stream{};
-  UbmemInvocation* const* active{};
+  ExecutionHealth* health{};
 };
 class UbmemPutView {
  public:
@@ -87,14 +92,14 @@ class UbmemGetOperator {
 // AccessOperator. The manager can initialize, warm and close it directly.
 class UbmemResources final : public ExecutionResourceOwner {
  public:
-  explicit UbmemResources(OperatorOptions value) : options(std::move(value)) {}
+  explicit UbmemResources(OperatorOptions value) : options(std::move(value)) { views.Bind(invocation); }
   ~UbmemResources() override;
   Status Initialize(const RemoteRegionDesc&) override;
   Status Warmup(const ExecutionWarmup&) override;
   Status Close() override;
   // Preparation requires the caller to hold the exclusive resource lease.
-  Status PreparePut(aclrtStream, std::uint32_t capacity, UbmemPutView*);
-  Status PrepareGet(aclrtStream, UbmemGetView*);
+  Status PreparePutResources(aclrtStream, std::uint32_t capacity, UbmemPutView*);
+  Status PrepareGetResources(aclrtStream, UbmemGetView*);
   Status Bind(ExecutionState*);
   std::unique_ptr<ExecutionState> CreateState() const;
  private:
@@ -103,6 +108,8 @@ class UbmemResources final : public ExecutionResourceOwner {
   Status Slot(aclrtStream, ExecutionSlot**);
   Status ReserveMetadata(ExecutionSlot&, std::uint32_t capacity);
   MappedExecutionView View(unsigned, aclrtStream, ExecutionSlot&);
+  ExecutionViewState views;
+  ExecutionHealth health;
   mutable std::mutex mutex;
   OperatorOptions options;
   std::shared_ptr<DeviceMapping> mapping;

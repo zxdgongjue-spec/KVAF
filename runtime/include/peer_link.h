@@ -30,6 +30,8 @@ struct PeerRegion {
   std::array<uint8_t, kSegKeyBytes> segment_key{};
   std::array<uint8_t, 128> fabric_handle{};
   uint64_t fabric_mapping_bytes{};
+  // Local descriptor identity; wire encoding remains unchanged.
+  uint64_t epoch = 0U, region_id = 0U;
 };
 
 struct PeerCandidateInfo {

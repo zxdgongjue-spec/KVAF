@@ -79,7 +79,7 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
   while (transfer_index < count && requests.wrs.size() < 4096) {
     const auto& transfer = transfers[transfer_index];
     if (transfer.bytes == 0 || offset >= transfer.bytes ||
-        !UmdkRange(CurrentState().remote_address, CurrentState().remote->seg.len, transfer.remote,
+        !UmdkRange(CurrentState().remote.canonical(), CurrentState().remote.handle()->seg.len, transfer.remote,
                    transfer.bytes))
       return Fail(status, "UMDK transfer outside remote region");
     auto* segment = LocalSegment(transfer.local, transfer.bytes);
@@ -87,9 +87,9 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
     const auto bytes =
         static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, transfer.bytes - offset));
     requests.local_sges.push_back({transfer.local + offset, bytes, segment, nullptr});
-    requests.remote_sges.push_back({CurrentState().remote->seg.ubva.va +
-                                        (transfer.remote - CurrentState().remote_address) + offset,
-                                    bytes, CurrentState().remote, nullptr});
+    requests.remote_sges.push_back({CurrentState().remote.handle()->seg.ubva.va +
+                                        (transfer.remote - CurrentState().remote.canonical()) + offset,
+                                    bytes, CurrentState().remote.handle(), nullptr});
     urma_jfs_wr_t wr{};
     wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
     wr.flag.bs.comp_order = 1;
@@ -120,7 +120,7 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
 // The caller holds the control lock and waits for the CQE before reusing these slots.
 bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
                  UmdkControlStatus& status) {
-  if (!UmdkRange(CurrentState().remote_address, CurrentState().remote->seg.len, transfer.remote,
+  if (!UmdkRange(CurrentState().remote.canonical(), CurrentState().remote.handle()->seg.len, transfer.remote,
                  transfer.bytes))
     return Fail(status, "UMDK transfer outside remote region");
   auto* segment = LocalSegment(transfer.local, transfer.bytes);
@@ -128,8 +128,8 @@ bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
   const auto bytes = static_cast<std::uint32_t>(transfer.bytes);
   worker.single_local = {transfer.local, bytes, segment, nullptr};
   worker.single_remote = {
-      CurrentState().remote->seg.ubva.va + (transfer.remote - CurrentState().remote_address), bytes,
-      CurrentState().remote, nullptr};
+      CurrentState().remote.handle()->seg.ubva.va + (transfer.remote - CurrentState().remote.canonical()), bytes,
+      CurrentState().remote.handle(), nullptr};
   urma_sg_t local{reinterpret_cast<urma_sge_t*>(&worker.single_local), 1};
   urma_sg_t remote{reinterpret_cast<urma_sge_t*>(&worker.single_remote), 1};
   auto& wr = worker.single_wr;
@@ -149,7 +149,7 @@ bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
 
 bool TransferQueue(Queue& worker, bool write, const UmdkTransfer* transfers, std::uint32_t count,
                    UmdkControlStatus& status) {
-  if (worker.poisoned || worker.target == nullptr || CurrentState().remote == nullptr ||
+  if (worker.poisoned || worker.target == nullptr || CurrentState().remote.handle() == nullptr ||
       transfers == nullptr || count == 0 || count > kUmdkMaxTransfers)
     return Fail(status, "invalid UMDK transfer queue");
   if (count == 1 && transfers[0].bytes > 0 && transfers[0].bytes <= 65536)

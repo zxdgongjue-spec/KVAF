@@ -21,7 +21,7 @@ Status UbmemResources::LoadKernel(unsigned index, const std::string& path, const
   return status;
 }
 Status UbmemResources::Slot(aclrtStream stream, ExecutionSlot** result) {
-  if (!ready) return Status::InvalidState("UBMEM resources are uninitialized or failed");
+  if (!ready || health.failed) return Status::InvalidState("UBMEM resources are uninitialized or failed");
   if (!stream) return Status::InvalidArgument("UBmem requires a caller-owned ACL stream");
   auto& state = streams[stream];
   // Keep partial allocations in the owner so failed cleanup is retryable.
@@ -63,6 +63,8 @@ Status UbmemResources::Initialize(const RemoteRegionDesc& region) {
         "KvafExecuteBatchPutUbmemKernelV2");
   if (!status.ok()) { (void)Close(); return status; }
   ready = true;
+  health.failed = false;
+  views.Initialize(region, peer.region_id, peer.epoch);
   std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY transport=ubmem mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
       "host_base=0x%llx mapped_base=0x%llx\n",
       kMteBufferBytes,
@@ -75,6 +77,7 @@ Status UbmemResources::Initialize(const RemoteRegionDesc& region) {
 Status UbmemResources::Close() {
   std::lock_guard<std::mutex> lock(mutex);
   if (invocation->graph_active) return Status::Busy("release UBMEM graph lease before shutdown");
+  views.Close();
   ready = false;
   profiling = false;
   invocation->profile_stream = nullptr;
@@ -160,11 +163,14 @@ Status UbmemResources::ReserveMetadata(ExecutionSlot& slot, std::uint32_t capaci
   return Status::OK();
 }
 MappedExecutionView UbmemResources::View(unsigned index, aclrtStream stream, ExecutionSlot& slot) {
-  return {this, remote, mapping->address(), functions[index], options.cores,
-          options.managed_completion, profiling, profile_detail, &ready, &slot, stream, &invocation};
+  invocation->prepared_stream = stream;
+  return {views.View(index ? ExecutionDirection::Put : ExecutionDirection::Get),
+          {mapping->address(), remote.length}, {functions[index], options.cores},
+          options.managed_completion, profiling, profile_detail, &slot, &health};
 }
-Status UbmemResources::PreparePut(aclrtStream stream, std::uint32_t capacity, UbmemPutView* out) {
+Status UbmemResources::PreparePutResources(aclrtStream stream, std::uint32_t capacity, UbmemPutView* out) {
   if (!out) return Status::InvalidArgument("null UBMEM Put view");
+  views.Prepare();
   if (!functions[1]) return Status::NotImplemented("UBmem BatchPut kernel is not configured");
   ExecutionSlot* slot = nullptr;
   auto s = Slot(stream, &slot);
@@ -172,8 +178,9 @@ Status UbmemResources::PreparePut(aclrtStream stream, std::uint32_t capacity, Ub
   if (s.ok()) *out = UbmemPutView(View(1, stream, *slot));
   return s;
 }
-Status UbmemResources::PrepareGet(aclrtStream stream, UbmemGetView* out) {
+Status UbmemResources::PrepareGetResources(aclrtStream stream, UbmemGetView* out) {
   if (!out) return Status::InvalidArgument("null UBMEM Get view");
+  views.Prepare();
   if (!functions[0]) return Status::NotImplemented("UBmem BatchGet kernel is not configured");
   ExecutionSlot* slot = nullptr;
   auto s = Slot(stream, &slot);
@@ -182,8 +189,9 @@ Status UbmemResources::PrepareGet(aclrtStream stream, UbmemGetView* out) {
 }
 Status UbmemResources::Warmup(const ExecutionWarmup& request) {
   std::lock_guard<std::mutex> lock(mutex);
-  if (!ready) return Status::NotInitialized("UBMEM resources not initialized");
+  if (!ready || health.failed) return Status::NotInitialized("UBMEM resources not initialized");
   if (!request.stream) return Status::OK();
+  views.Prepare();
   ExecutionSlot* slot = nullptr;
   auto s = Slot(static_cast<aclrtStream>(request.stream), &slot);
   if (!s.ok() || !functions[1] || !request.request_capacity) return s;
@@ -197,6 +205,7 @@ Status UbmemResources::Bind(ExecutionState* state) {
   auto* typed = state ? dynamic_cast<UbmemInvocation*>(state) : &legacy;
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("UBMEM execution state belongs to another resource");
+  views.Bind(typed);
   invocation = typed;
   return Status::OK();
 }

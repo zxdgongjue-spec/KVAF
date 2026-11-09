@@ -150,7 +150,7 @@ int main() {
   auto* typed = dynamic_cast<ubmem::UbmemInvocation*>(invocation.get());
   CHECK(typed);
   ubmem::UbmemPutView put_view;
-  CHECK(mapped->PreparePut(reinterpret_cast<aclrtStream>(1), 2, &put_view).ok());
+  CHECK(mapped->PreparePutResources(reinterpret_cast<aclrtStream>(1), 2, &put_view).ok());
   static_assert(!std::is_convertible_v<ubmem::UbmemPutView, ubmem::UbmemGetView>);
   const auto allocation_count = allocations;
   const auto launch_count = launches;
@@ -182,7 +182,7 @@ int main() {
   get_call.execution.stream = reinterpret_cast<void*>(1);
   get_call.execution.synchronize = true;
   ubmem::UbmemGetView get_view;
-  CHECK(mapped->PrepareGet(reinterpret_cast<aclrtStream>(1), &get_view).ok());
+  CHECK(mapped->PrepareGetResources(reinterpret_cast<aclrtStream>(1), &get_view).ok());
   CHECK(!ubmem::UbmemGetOperator::Launch(get_call, get_view, *wrong).ok());
   CHECK(ubmem::UbmemGetOperator::Launch(get_call, get_view, *typed).ok());
   CHECK(launches == launch_count + 2 && allocations == allocation_count);
@@ -193,6 +193,9 @@ int main() {
   CHECK(independent->Close().code() == StatusCode::kBusy);
   CHECK(mappings_closed == 1);
   typed->graph_active = false;
+  // Preparing Get invalidated the earlier Put workspace view.
+  CHECK(!ubmem::UbmemPutOperator::Launch(call, put_view, *typed).ok());
+  CHECK(mapped->PreparePutResources(reinterpret_cast<aclrtStream>(1), 2, &put_view).ok());
   fail_wait = true;
   CHECK(!ubmem::UbmemPutOperator::Launch(call, put_view, *typed).ok());
   CHECK(!independent->Close().ok() && mappings_closed == 1);

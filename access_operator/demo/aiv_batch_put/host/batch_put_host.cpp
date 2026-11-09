@@ -69,8 +69,10 @@ struct KvafBatchPutTransport {
   std::array<uint8_t, hccp::kEidBytes> wqe_remote_eid{};
   uint64_t peer_memory_address = 0U;
   uint64_t peer_memory_bytes = 0U;
-  DirectMemory peer_memory{};
-  void *device_peer_memory_import = nullptr;
+  kvaf::UrmaRemoteMemoryDesc peer_memory{};
+  kvaf::UrmaBindingCache<hccp::HccpRemoteMemoryBinding> bindings{kvaf::MemoryDirection::Put};
+  std::uint64_t context_generation{kvaf::NewBindingGeneration()};
+  std::shared_ptr<hccp::HccpRemoteMemoryBinding> peer_binding;
   std::array<DirectAivWorker, kMaxDirectAivWorkers> workers{};
   std::array<KvafBatchPutDirectUrmaEntity, kMaxDirectAivWorkers> entity_templates{};
   void *device_queue_state = nullptr;
@@ -190,23 +192,6 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   return true;
 }
 
-bool ImportRemoteMemory(const DirectHccpApi &api, void *context, const DirectMemory &remote, void **import_handle) {
-  hccp::MrImportInfo info{};
-  std::memcpy(info.in.key.value, remote.key, remote.key_bytes);
-  info.in.key.size = static_cast<uint8_t>(remote.key_bytes);
-  info.in.ub.flags = hccp::MemImportFlags();
-  info.in.ub.mapping_addr = 0U;
-  info.in.ub.token_value = remote.token_value;
-  const int ret = api.rmem_import(context, &info, import_handle);
-  if (ret != 0 || *import_handle == nullptr) {
-    std::fprintf(stderr, "[KVAF_AIV] DIRECT_REMOTE_DDR_IMPORT_FAILED ret=%d handle=%p\n", ret, *import_handle);
-    return false;
-  }
-  hccp::VerboseLog("[KVAF_AIV] DIRECT_REMOTE_DDR_IMPORTED target_seg=0x%llx\n",
-                   static_cast<unsigned long long>(info.out.ub.target_seg_handle));
-  return true;
-}
-
 bool CreateCq(const DirectHccpApi &api, void *context, uint32_t mode, uint32_t depth, const char *role,
               hccp::CqInfo *info, void **handle) {
   *info = {};
@@ -293,11 +278,8 @@ int32_t ReleaseTransport(KvafBatchPutTransport *transport) {
     if (aclrtFree(transport->device_queue_state) != ACL_SUCCESS) return KVAF_BATCH_PUT_RUNTIME_ERROR;
     transport->device_queue_state = nullptr;
   }
-  if (transport->device_peer_memory_import) {
-    if (!api.rmem_unimport || !context || api.rmem_unimport(context, transport->device_peer_memory_import))
-      return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
-    transport->device_peer_memory_import = nullptr;
-  }
+  if (!transport->bindings.Release(&transport->peer_binding).ok())
+    return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
   if (transport->device_transport_token_handle) {
     if (!api.token_free || !context || api.token_free(context, transport->device_transport_token_handle))
       return KVAF_BATCH_PUT_DIRECT_HCCP_ERROR;
@@ -373,8 +355,13 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
     goto failed;
   }
   state->device_transport_token_value = state->peer_memory.token_value;
-  if (!ImportRemoteMemory(state->api, state->device_context, state->peer_memory,
-                          &state->device_peer_memory_import)) {
+  if (!state->bindings.Acquire(
+          kvaf::UrmaBindingKey::Make(kvaf::MemoryDirection::Put, state->device_context,
+              state->context_generation, state->peer_memory, hccp::MemImportFlags()),
+          [&](hccp::HccpRemoteMemoryBinding& binding) {
+            return binding.Import(state->device_context, state->api.rmem_import,
+                                  state->api.rmem_unimport, state->peer_memory);
+          }, &state->peer_binding).ok()) {
     goto failed;
   }
   for (uint32_t entity_index = 0U; entity_index < state->worker_count; ++entity_index) {
@@ -415,7 +402,7 @@ int32_t CreateBatchPutTransport(void *host_ddr, uint64_t host_ddr_bytes,
     entity.remote_host_ddr_address = state->peer_memory_address;
     entity.remote_host_ddr_size = state->peer_memory_bytes;
     entity.registered_base = state->peer_memory.registered_address;
-    entity.remote_token_id = state->peer_memory.token_id;
+    entity.remote_token_id = state->peer_memory.wqe_token_id();
     entity.remote_token_value = state->peer_memory.token_value;
     entity.sq_va = worker.device_user_ctl_jetty.info.ub.sq_buffer_va;
     entity.sq_db_va = worker.device_user_ctl_jetty.info.ub.db_addr;

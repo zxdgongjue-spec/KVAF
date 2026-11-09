@@ -19,9 +19,23 @@ struct UmdkSessionConfig {
   std::array<std::uint8_t, 16> local_eid{};
 };
 
+class UmdkSession;
+// Narrow execution capability: no session setup, registration or shutdown API.
+class UmdkWriteView {
+ public:
+  UmdkWriteView() = default;
+  using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
+  Status Submit(std::uint64_t, std::uint32_t, aclrtStream, Launch) const;
+ private:
+  friend class UmdkSession;
+  explicit UmdkWriteView(UmdkSession* session) : session_(session) {}
+  UmdkSession* session_{};
+};
+
 class UmdkSession {
  public:
   explicit UmdkSession(UmdkSessionConfig config) : config_(std::move(config)) {}
+  UmdkWriteView WriteView() { return UmdkWriteView(this); }
   Status Load();
   Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes);
   Status Shutdown();
@@ -55,5 +69,11 @@ class UmdkSession {
   WriteState legacy_write_;
   WriteState* write_{&legacy_write_};
 };
+
+inline Status UmdkWriteView::Submit(std::uint64_t descriptors, std::uint32_t count,
+                                  aclrtStream stream, Launch launch) const {
+  return session_ ? session_->WriteDescriptors(descriptors, count, stream, launch)
+      : Status::InvalidState("empty UMDK write capability");
+}
 
 }  // namespace kvaf::aicpu_urma

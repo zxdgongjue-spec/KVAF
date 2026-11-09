@@ -51,6 +51,8 @@ set(device_sources "${CMAKE_CURRENT_SOURCE_DIR}/session.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/control_kernel.cc"
   ${KVAF_AICPU_BATCH_GET_DEVICE_SOURCES} ${KVAF_AICPU_BATCH_PUT_DEVICE_SOURCES})
 set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/remote_memory_binding.h"
+  "${CMAKE_SOURCE_DIR}/access_operator/include/urma_memory_binding.h"
   ${KVAF_AICPU_BATCH_GET_DEVICE_HEADERS} ${KVAF_AICPU_BATCH_PUT_DEVICE_HEADERS}
   "${CMAKE_SOURCE_DIR}/access_operator/include/aicpu_urma/control_abi.h"
   "${CMAKE_SOURCE_DIR}/access_operator/include/aicpu_urma/transport.h"

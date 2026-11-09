@@ -1,6 +1,7 @@
 #pragma once
 
 #include "access_operator.h"
+#include "execution_view.h"
 #include "acl/acl.h"
 #include "kvaf_aiv_batch_get.h"
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -74,26 +75,24 @@ struct AivPutSession {
   int AcquireInput(void*, std::size_t, KvafBatchPutLocalBuffer**);
 #endif
 };
+// Immutable launch options, not the resource-creation configuration.
+struct AivLaunchOptions {
+  std::uint32_t npu_core_count{}, jettys_per_core{}, batch_get_max_inflight_total{};
+  bool managed_completion{};
+};
 struct UrmaAivGetView {
-  const AivExecutionResources* identity;
-  const AccessOperatorConfig& config;
-  const bool& initialized;
-  const bool& closing;
-  AivGetSession& session;
-  AivInvocation* const& active;
-  const AivInvocation* bound;
+  ExecutionViewCommon common;
+  AivLaunchOptions options;
+  AivGetWorkspace& workspace;
   KvafBatchGetLocalBuffer* buffer{};
   std::uint64_t channel_entity{};
 };
 struct UrmaAivPutView {
-  const AivExecutionResources* identity;
-  const AccessOperatorConfig& config;
-  const bool& initialized;
-  const bool& closing;
-  AivPutSession& session;
-  AivInvocation* const& active;
-  const AivInvocation* bound;
+  ExecutionViewCommon common;
+  AivLaunchOptions options;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  bool device_execution{};
+  AivPutWorkspace& workspace;
   KvafBatchPutLocalBuffer* buffer{};
 #endif
 };
@@ -106,8 +105,8 @@ class AivExecutionResources final : public ExecutionResourceOwner {
   Status Close() override;
   UrmaAivGetView GetView();
   UrmaAivPutView PutView();
-  Status PrepareGet(const BatchGetExecRequest&, AivInvocation&, UrmaAivGetView*);
-  Status PreparePut(const BatchPutExecRequest&, AivInvocation&, UrmaAivPutView*);
+  Status PrepareGetResources(const BatchGetExecRequest&, AivInvocation&, UrmaAivGetView*);
+  Status PreparePutResources(const BatchPutExecRequest&, AivInvocation&, UrmaAivPutView*);
   Status PrepareGraph(const GetGraphOptions&, AivInvocation&);
   std::unique_ptr<ExecutionState> CreateState() const;
   Status Bind(ExecutionState*);

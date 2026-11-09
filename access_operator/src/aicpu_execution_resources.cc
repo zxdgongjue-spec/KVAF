@@ -24,7 +24,15 @@ struct AicpuExecutionResources::State {
 #else
     valid_mode = config.batch_get_mode == "gather_read";
 #endif
+    legacy.put = put.CreateExecutionState();
+    legacy.get = get.CreateExecutionState();
+    (void)put.BindExecutionState(legacy.put.get());
+    (void)get.BindExecutionState(legacy.get.get());
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+    if (push) { legacy.push = push->CreateExecutionState(); (void)push->BindExecutionState(legacy.push.get()); }
+#endif
   }
+  ExecutionViewState views;
   AicpuInvocation legacy;
   AicpuInvocation* invocation{&legacy};
   bool valid_mode;
@@ -46,7 +54,7 @@ struct AicpuExecutionResources::State {
 };
 
 AicpuExecutionResources::AicpuExecutionResources(UmdkAccessOperatorConfig config)
-    : state_(std::make_unique<State>(this, std::move(config))) {}
+    : state_(std::make_unique<State>(this, std::move(config))) { state_->views.Bind(&state_->legacy); }
 AicpuExecutionResources::~AicpuExecutionResources() {
   // An unresolved DMA/failed release keeps every handle and backing buffer.
   if (!Close().ok()) (void)state_.release();
@@ -82,11 +90,9 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
   }
 #endif
   state_->invocation = call;
+  state_->views.Bind(call);
   state_->put_session.BindWriteState(&call->write);
   return Status::OK();
-}
-bool AicpuExecutionResources::IsBound(const AicpuInvocation& call) const {
-  return state_->initialized && state_->invocation == &call;
 }
 AicpuInvocation& AicpuExecutionResources::invocation() { return *state_->invocation; }
 std::mutex& AicpuExecutionResources::put_mutex() { return state_->put_mutex; }
@@ -99,7 +105,8 @@ bool AicpuExecutionResources::scatter() const {
   return false;
 #endif
 }
-Status AicpuExecutionResources::PreparePut(const BatchPutExecRequest& request) {
+Status AicpuExecutionResources::PreparePutResources(const BatchPutExecRequest& request) {
+  state_->views.Prepare(ExecutionDirection::Put);
   if (!state_->initialized) return Status::NotInitialized("AICPU resources not initialized");
   if (!request.request || !request.put_desc || !request.execution.stream)
     return Status::InvalidArgument("AICPU Put needs input, destination and stream");
@@ -108,7 +115,8 @@ Status AicpuExecutionResources::PreparePut(const BatchPutExecRequest& request) {
   state_->put_session.BindWriteState(&state_->invocation->write);
   return state_->put.Prepare(state_->region, *request.request);
 }
-Status AicpuExecutionResources::PrepareGet(const BatchGetExecRequest& request) {
+Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& request) {
+  state_->views.Prepare(ExecutionDirection::Get);
   if (!state_->initialized || !state_->enable_get)
     return Status::NotInitialized("AICPU Get resources not initialized");
   if (state_->managed_completion && request.execution.stream) {
@@ -127,21 +135,16 @@ Status AicpuExecutionResources::PrepareGet(const BatchGetExecRequest& request) {
 Status AicpuExecutionResources::ReleasePutBuffers() { return state_->put_session.ReleaseBuffers(); }
 Status AicpuExecutionResources::ReleaseGetBuffers() { return state_->get_session.ReleaseBuffers(); }
 UrmaAicpuPutView AicpuExecutionResources::PutView() {
-  UrmaAicpuPutView view;
-  if (state_->initialized) { view.owner_ = this; view.transfers_ = &state_->put; view.session_ = &state_->put_session; view.region_ = &state_->region; }
-  return view;
+  return {state_->views.View(ExecutionDirection::Put), state_->put.View()};
 }
 UrmaAicpuGatherView AicpuExecutionResources::GatherView() {
-  UrmaAicpuGatherView view;
-  if (state_->initialized && state_->enable_get && !scatter()) { view.owner_ = this; view.gather_ = &state_->get; }
-  return view;
+  return {state_->views.View(ExecutionDirection::Get), state_->get.View()};
 }
 UrmaAicpuScatterView AicpuExecutionResources::ScatterView() {
-  UrmaAicpuScatterView view;
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  if (state_->initialized && state_->enable_get && state_->push) { view.owner_ = this; view.push_ = state_->push.get(); }
+  if (state_->push) return {state_->views.View(ExecutionDirection::Get), state_->push->View()};
 #endif
-  return view;
+  return {};
 }
 
 Status AicpuExecutionResources::Initialize(const RemoteRegionDesc& region) {
@@ -155,7 +158,7 @@ Status AicpuExecutionResources::Initialize(const RemoteRegionDesc& region) {
 #endif
   auto loaded = state_->enable_get ? state_->get_session.Load() : state_->put_session.Load();
   if (!loaded.ok()) return loaded;
-  if (!state_->enable_get) { state_->region = region; state_->initialized = true; return Status::OK(); }
+  if (!state_->enable_get) { state_->region = region; state_->initialized = true; state_->views.Initialize(region); return Status::OK(); }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   auto ready = state_->push ? state_->push->Initialize(region) : state_->get.Initialize(region);
 #else
@@ -164,6 +167,7 @@ Status AicpuExecutionResources::Initialize(const RemoteRegionDesc& region) {
   if (!ready.ok()) return ready;
   state_->region = region;
   state_->initialized = true;
+  state_->views.Initialize(region);
   return Status::OK();
 }
 Status AicpuExecutionResources::Warmup(const ExecutionWarmup& request) {
@@ -185,6 +189,7 @@ Status AicpuExecutionResources::Warmup(const ExecutionWarmup& request) {
 }
 Status AicpuExecutionResources::Close() {
   std::scoped_lock lock(state_->get_mutex, state_->put_mutex);
+  state_->views.Close();
   // Push shutdown must stop the remote DMA producer even after a kernel failure.
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   if (state_->push) {
