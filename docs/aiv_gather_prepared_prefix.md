@@ -60,6 +60,27 @@ AIV 使用 40 B descriptor READ 查询 sequence / ready_bytes，按连续前缀�
 不替代最终 ACK，也不允许提前复用 descriptor/staging。错误继续 poison 两条队列，
 消费本地已发出的 VF/MTE3 事件，并沿用原有会话停机和资源保留规则。
 
+## CPU helper 的等待策略
+
+helper 完成本轮所有复制份额后，先判断整批复制是否完成。coordinator 或其他
+helper 仍在复制时，已完成的 helper 直接进入条件变量等待，避免持续自旋与慢线程
+竞争 CPU。块内的份额划分、完成计数和 ready 发布方式沿用上述实现。
+
+整批复制完成后，最多允许 helper 1 短时自旋等待下一轮：`active` 上限 100 us，
+`adaptive` 上限 25 us，`passive` 不自旋；其余 helper 继续休眠。该保温仅在 helper 1
+决定等待时已观察到整批完成的情况下启用，不为保温唤醒已休眠的线程。
+下一轮任务仍由 generation 发布和条件变量广播唤醒，spin 转 sleep 时在同一互斥锁下
+检查 generation，避免丢失通知。线程数缩小后的非活跃 helper 也保持休眠。
+
+coordinator 的 notify 轮询策略不变。这次等待策略调整只需重编、重启 K 侧 CPU
+服务，可配合现有 V9 NPU 构建使用；没有新增开关、通信字段或 ABI 变更。
+线程预算、绑核和内存 NUMA 放置本轮不作调整。
+
+比较时固定线程数、chunk、SGL 和 NPU 配置，分别重测 `active` / `adaptive` 的
+656 B、4096 B 请求。正式比较关闭 profile；单独采样 CPU `copy_ns`、`join_wait_ns`、
+helper `start_delay_ns`，观察减少空转后慢线程是否更快，以及唤醒开销是否上升。
+等待策略不能保证消除所有 AIV `wait_cpu`，实际收益需双机测试确认。
+
 ## 协议、ABI 与配置优先级
 
 - kernel：`KvafGatherBatchGetAivKernelV9`，args 248 B；loader 拒绝 V1–V8。

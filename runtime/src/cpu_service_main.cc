@@ -14,7 +14,9 @@ void PrintUsage(const char* program) {
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] [--gather-threads N] [--gather-mode adaptive|active|passive] [--gather-affinity on|off] [--memory-page-mode default|thp]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to auto (up to 32), "
-               "mode to adaptive (one polling coordinator, parked helpers), affinity to on. "
+               "mode to adaptive, affinity to on. Finished helpers park during an unfinished copy; "
+               "after completion at most one helper spins briefly (active: 100 us, adaptive: 25 us, "
+               "passive: none). Coordinator notify polling is unchanged. "
                "Default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
                program);
 }

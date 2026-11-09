@@ -4,8 +4,10 @@
 
 namespace kvaf::peer {
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
-// Test-only seam for holding a task tail after an earlier prefix is visible.
+// Test-only seams for controlling copy tails and observing helper idle policy.
 void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end);
+void CpuGatherHelperCompleted(std::size_t worker, std::uint64_t generation);
+void CpuGatherHelperWait(std::size_t worker, std::uint64_t generation, bool spinning);
 #endif
 namespace {
 
@@ -89,7 +91,7 @@ void CpuGatherExecutor::Copy() {
     copy_profile_.begin_ns = NowNs();
     thread_profiles_[0].ready_ns = copy_profile_.begin_ns;
   }
-  phase_.store(1U, std::memory_order_release);
+  phase_.store(CopyPhase::kCopying, std::memory_order_release);
   CopyWorker(0U);
   if (!thread_profiles_.empty())
     copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
@@ -99,6 +101,9 @@ void CpuGatherExecutor::Copy() {
   }
   PublishReady();
   if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
+  // A helper may keep warm only after the coordinator AND all helpers finish.
+  // No wakeup is needed here: parked helpers have no more work this generation.
+  phase_.store(CopyPhase::kComplete, std::memory_order_release);
 }
 
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
@@ -247,36 +252,44 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
   for (;;) {
     bool active = false;
     bool wait_path = false;
-    if (wait_mode_ != GatherWaitMode::kPassive && was_active) {
+    auto generation = generation_.load(std::memory_order_acquire);
+    // Finished helpers must not compete with a lagging copy worker. At most
+    // helper 1 can keep warm, opportunistically after the whole copy completes.
+    // Both active and adaptive have a finite helper budget; mode-specific
+    // coordinator notify polling is owned by CpuGatherWorker, not this loop.
+    if (generation == observed_generation && was_active && worker == 1U &&
+        wait_mode_ != GatherWaitMode::kPassive &&
+        phase_.load(std::memory_order_acquire) == CopyPhase::kComplete) {
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+      CpuGatherHelperWait(worker, observed_generation, true);
+#endif
       const auto spin_start = std::chrono::steady_clock::now();
+      const auto budget = std::chrono::microseconds(
+          wait_mode_ == GatherWaitMode::kActive ? 100 : 25);
       std::uint32_t spin_count = 0U;
-      std::uint64_t generation = generation_.load(std::memory_order_acquire);
       while (generation == observed_generation) {
         if (stopping_.load(std::memory_order_acquire)) return;
-        if (wait_mode_ == GatherWaitMode::kAdaptive && (++spin_count & 255U) == 0U &&
-            std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds(100))
+        if ((++spin_count & 63U) == 0U &&
+            std::chrono::steady_clock::now() - spin_start >= budget)
           break;
         GatherSpinPause();
         generation = generation_.load(std::memory_order_acquire);
       }
+    }
+    {
       std::unique_lock<std::mutex> lock(mutex_);
       if (generation_.load(std::memory_order_acquire) == observed_generation) {
         wait_path = true;
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+        CpuGatherHelperWait(worker, observed_generation, false);
+#endif
+        // Publish/Shutdown change the predicate under this same mutex. A
+        // generation arriving between spin and sleep cannot be lost.
         ready_.wait(lock, [this, &observed_generation] {
           return stopping_.load(std::memory_order_acquire) ||
                  generation_.load(std::memory_order_acquire) != observed_generation;
         });
       }
-      if (stopping_.load(std::memory_order_acquire)) return;
-      observed_generation = generation_.load(std::memory_order_acquire);
-      active = worker < active_threads_;
-    } else {
-      std::unique_lock<std::mutex> lock(mutex_);
-      wait_path = true;
-      ready_.wait(lock, [this, &observed_generation] {
-        return stopping_.load(std::memory_order_acquire) ||
-               generation_.load(std::memory_order_acquire) != observed_generation;
-      });
       if (stopping_.load(std::memory_order_acquire)) return;
       observed_generation = generation_.load(std::memory_order_acquire);
       active = worker < active_threads_;
@@ -287,12 +300,15 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
       thread_profiles_[worker].ready_ns = NowNs();
       thread_profiles_[worker].wait_path = wait_path;
     }
-    while (phase_.load(std::memory_order_acquire) == 0U) {
+    while (phase_.load(std::memory_order_acquire) == CopyPhase::kPreparing) {
       if (stopping_.load(std::memory_order_acquire)) return;
       GatherSpinPause();
     }
     CopyWorker(worker);
     completed_.fetch_add(1U, std::memory_order_release);
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+    CpuGatherHelperCompleted(worker, observed_generation);
+#endif
   }
 }
 

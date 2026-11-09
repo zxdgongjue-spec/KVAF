@@ -107,7 +107,7 @@ class CpuGatherExecutor {
   }
 
   void Copy();
-  // Enable before the first PrepareDirect. Disabled execution reads no clocks.
+  // Enable before the first PrepareDirect. Disabled copies read no profile clocks.
   void EnableProfiling() { thread_profiles_.resize(max_threads_); }
   std::size_t MaxThreads() const { return max_threads_; }
   const CpuGatherCopyProfile& CopyProfile() const { return copy_profile_; }
@@ -115,6 +115,8 @@ class CpuGatherExecutor {
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
+  enum class CopyPhase : std::uint32_t { kPreparing, kCopying, kComplete };
+
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
                       std::uint32_t span_count, std::uint32_t total_bytes) {
     const std::size_t threads =
@@ -147,7 +149,7 @@ class CpuGatherExecutor {
       ready_tasks_ = 0U;
       published_bytes_ = 0U;
     }
-    phase_.store(0U, std::memory_order_release);
+    phase_.store(CopyPhase::kPreparing, std::memory_order_release);
     if (!thread_profiles_.empty()) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
       copy_profile_ = {};
@@ -232,7 +234,7 @@ class CpuGatherExecutor {
   std::uint64_t published_bytes_{0U};
   std::vector<CpuGatherThreadProfile> thread_profiles_;
   CpuGatherCopyProfile copy_profile_{};
-  alignas(64) std::atomic<std::uint32_t> phase_{0U};
+  alignas(64) std::atomic<CopyPhase> phase_{CopyPhase::kPreparing};
   alignas(64) std::atomic<std::size_t> completed_{0U};
   std::atomic<bool> stopping_{false};
 };

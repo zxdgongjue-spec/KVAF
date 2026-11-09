@@ -6,7 +6,11 @@ CPU 阶段和线程埋点均由 `KVAF_GATHER_PROFILE=1` 开启；关闭时不读
 CPU 埋点本身不改变通信 ABI，所有 SGL 共用同一路径。当前
 [chunk 调度与 NPU 查询优化](aiv_gather_chunk_pipeline.md)的基础实现需要更新 K 侧
 CPU 服务和 N 侧 gather kernel；其后的任务内部分进度发布只需更新 CPU 服务。
-部署方式以上述文档为准。
+部署方式以上述文档为准。当前 helper 等待方式见
+[CPU helper 的等待策略](aiv_gather_prepared_prefix.md#cpu-helper-的等待策略)：
+本轮复制未完成时，先结束的 helper 立即等待条件变量；整批完成后最多一个 helper
+有界自旋（active 100 us、adaptive 25 us、passive 不自旋），其余 helper 休眠。
+这次调整只需更新 CPU 服务，coordinator notify 轮询策略不变。
 
 ## 采集
 
@@ -100,6 +104,10 @@ ACK 读取与 CQ 等待，而且 CPU 可能在 AIV 的 publish 阶段尚未结�
 | `bytes` | 该线程实际拷贝的字节数；各活跃线程相加应等于请求 bytes |
 | `wait_path` | 该任务是否经过条件变量等待分支；谓词可能立即满足，不等于确实睡眠 |
 | `tid/cpu` | Linux 线程 ID 和开始拷贝时的 CPU 编号 |
+
+上述 `thread_cpu_ns` 只覆盖工作区间，不包含任务结束后的自旋或条件变量等待；
+不能直接用该字段判断进程空闲时的 CPU 占用。新策略下更多任务可能显示
+`wait_path=1`，应结合 `start_delay_ns` 判断唤醒是否影响本轮关键路径。
 
 按每个 sequence 找到 `done_ns` 最晚的线程，判断该 lane 的关键路径。
 线程并行执行，不能把线程 copy/work 墙钟时间相加解释整批延迟。

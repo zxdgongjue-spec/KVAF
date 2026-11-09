@@ -8,6 +8,8 @@ namespace cpu_gather_test {
 constexpr std::uint64_t kFirstTask = 164U * 1024U;
 std::atomic<bool> hold_tail{false}, tail_entered{false}, release_tail{false};
 std::atomic<std::uint64_t> held_begin{0U}, held_end{0U};
+std::atomic<std::uint64_t> wait_generation{0U}, parked_helpers{0U}, spinning_helpers{0U};
+std::atomic<bool> hold_finished_helper{false}, helper_finished{false}, release_helper{false};
 }  // namespace cpu_gather_test
 
 namespace kvaf::peer {
@@ -19,6 +21,24 @@ void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end) {
     return;
   tail_entered.store(true, std::memory_order_release);
   while (!release_tail.load(std::memory_order_acquire)) GatherSpinPause();
+}
+
+void CpuGatherHelperCompleted(std::size_t worker, std::uint64_t generation) {
+  using namespace cpu_gather_test;
+  if (worker != 1U || generation != wait_generation.load(std::memory_order_acquire) ||
+      !hold_finished_helper.load(std::memory_order_acquire))
+    return;
+  // Completion is already visible to Copy(). Hold this helper so the test can
+  // deterministically exercise its idle decision AFTER the whole copy ends.
+  helper_finished.store(true, std::memory_order_release);
+  while (!release_helper.load(std::memory_order_acquire)) GatherSpinPause();
+}
+
+void CpuGatherHelperWait(std::size_t worker, std::uint64_t generation, bool spinning) {
+  using namespace cpu_gather_test;
+  if (generation == 0U || generation != wait_generation.load(std::memory_order_acquire)) return;
+  (spinning ? spinning_helpers : parked_helpers).fetch_or(
+      std::uint64_t{1U} << worker, std::memory_order_release);
 }
 }  // namespace kvaf::peer
 #endif
@@ -165,6 +185,102 @@ void BalancedCopies(unsigned count, unsigned token) {
 }
 
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+template <class Predicate>
+void Await(Predicate predicate, const char* message) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!predicate() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  Check(predicate(), message);
+}
+
+void HelperWaitPolicy(kvaf::peer::GatherWaitMode mode, bool hold_coordinator,
+                      bool cooperative) {
+  using namespace cpu_gather_test;
+  constexpr unsigned count = 512U, token = 656U, threads = 4U;
+  constexpr std::uint64_t bytes = std::uint64_t(count) * token;
+  constexpr auto staging_offset = 65536U + bytes;
+  constexpr auto region_bytes = staging_offset + bytes + 64U;
+  void* allocation = nullptr;
+  Check(posix_memalign(&allocation, 64U, region_bytes) == 0, "wait test allocation failed");
+  auto* memory = static_cast<std::uint8_t*>(allocation);
+  const auto base = reinterpret_cast<std::uint64_t>(memory);
+  {
+    kvaf::peer::CpuGatherExecutor executor(memory, base, threads, 4096U, mode);
+    auto* header = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
+    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(header + 1);
+    std::vector<std::uint8_t> expected(bytes);
+    for (unsigned index = 0U; index < count; ++index) {
+      const auto offset = 65536U + std::uint64_t(count - index - 1U) * token;
+      spans[index] = {base + offset, token, 0U};
+      std::memset(memory + offset, index % 251U, token);
+      std::memset(expected.data() + std::uint64_t(index) * token, index % 251U, token);
+    }
+    const auto chunk = cooperative ? kvaf::GatherCooperativeChunkBytes(bytes, 4U) : 0U;
+    *header = {cooperative ? kvaf::kGatherCooperativeMagic : kvaf::peer::kGatherDescriptorMagic,
+               1U, base + staging_offset, count, static_cast<std::uint32_t>(bytes), chunk, token, 0U};
+    std::memset(memory + staging_offset, 0xad, bytes);
+    parked_helpers.store(0U); spinning_helpers.store(0U);
+    helper_finished.store(false); release_helper.store(false);
+    hold_finished_helper.store(!hold_coordinator);
+    tail_entered.store(false); release_tail.store(false);
+    held_begin.store(0U);
+    held_end.store((cooperative ? chunk : bytes) / threads);
+    hold_tail.store(hold_coordinator, std::memory_order_release);
+    wait_generation.store(1U, std::memory_order_release);
+    Check(executor.PrepareDirect(region_bytes, base, 1U, count) == threads,
+          "wait test lost copy parallelism");
+    constexpr std::uint64_t all_helpers = 14U;
+    if (hold_coordinator) {
+      std::thread driver([&] { executor.Copy(); });
+      Await([&] { return tail_entered.load(std::memory_order_acquire) &&
+                         parked_helpers.load(std::memory_order_acquire) == all_helpers; },
+            "finished helpers did not park while coordinator was copying");
+      Check(spinning_helpers.load() == 0U, "finished helper spun during unfinished copy");
+      release_tail.store(true, std::memory_order_release);
+      driver.join();
+    } else {
+      executor.Copy();
+      Await([&] { return helper_finished.load(std::memory_order_acquire) &&
+                         (parked_helpers.load(std::memory_order_acquire) & 12U) == 12U; },
+            "non-warm helpers did not park after copy");
+      release_helper.store(true, std::memory_order_release);
+      Await([&] { return parked_helpers.load(std::memory_order_acquire) == all_helpers; },
+            "warm helper did not exhaust its bounded spin budget");
+      Check(spinning_helpers.load() ==
+                (mode == kvaf::peer::GatherWaitMode::kPassive ? 0U : 2U),
+            "idle spin was not limited to helper 1");
+    }
+    hold_tail.store(false); hold_finished_helper.store(false);
+    wait_generation.store(0U, std::memory_order_release);
+    Check(std::memcmp(memory + staging_offset, expected.data(), bytes) == 0,
+          "helper wait policy changed gathered payload");
+    // Repeated immediate handoffs exercise the spin-to-sleep race and helpers
+    // becoming inactive for one generation, then participating again.
+    for (std::uint64_t sequence = 2U; sequence <= 65U; ++sequence) {
+      const auto spans_count = sequence % 2U == 0U ? 1U : count;
+      const auto copy_bytes = spans_count * token;
+      header->sequence = sequence;
+      header->span_count = spans_count;
+      header->total_bytes = copy_bytes;
+      header->pipeline_chunk_bytes = cooperative
+          ? kvaf::GatherCooperativeChunkBytes(copy_bytes, 4U) : 0U;
+      header->ready_bytes = 0U;
+      std::memset(memory + staging_offset, 0xad, copy_bytes);
+      Check(executor.PrepareDirect(region_bytes, base, sequence, count) ==
+                (spans_count == 1U ? 1U : threads), "wait test thread count did not recover");
+      executor.Copy();
+      Check(std::memcmp(memory + staging_offset, expected.data(), copy_bytes) == 0,
+            "helper missed a generation after parking");
+    }
+    // Shutdown must also release helpers already dispatched to a generation
+    // whose Copy() has not started yet.
+    header->sequence = 66U; header->ready_bytes = 0U;
+    Check(executor.PrepareDirect(region_bytes, base, 66U, count) == threads,
+          "could not prepare shutdown generation");
+  }
+  std::free(allocation);
+}
+
 void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
   using namespace cpu_gather_test;
   constexpr unsigned count = 4096U, token = 656U;
@@ -361,6 +477,13 @@ int main() {
     for (unsigned token : {656U, 4096U})
       for (unsigned chunks : {2U, 4U, 8U}) CooperativeCopies(profile, token, chunks);
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+  for (const auto mode : {kvaf::peer::GatherWaitMode::kActive,
+                          kvaf::peer::GatherWaitMode::kAdaptive,
+                          kvaf::peer::GatherWaitMode::kPassive}) {
+    HelperWaitPolicy(mode, true, false);
+    HelperWaitPolicy(mode, true, true);
+    HelperWaitPolicy(mode, false, false);
+  }
   CooperativeCopies(false, 656, 4, true);
   CooperativeCopies(true, 656, 4, true);
   CooperativeCopies(false, 656, 4, false, true);
