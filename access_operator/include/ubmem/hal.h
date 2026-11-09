@@ -46,6 +46,12 @@ class Hal {
   std::string path_;
 };
 
+// Lazily load once per library path and retain a strong process-lifetime owner.
+// Host SVM state may outlive dlclose; releasing the last pool must not reset HAL
+// userspace initialization while the driver's process context still exists.
+// Failed loads are not cached. Mapping retains responsibility for pool memory.
+Status AcquireProcessHal(const std::string& library, std::shared_ptr<Hal>* out);
+
 Status HalError(const char* operation, int result);
 
 class Mapping {

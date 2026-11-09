@@ -96,8 +96,8 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
     if (q.mode != TransportMode::Urma) {
       if (bytes > UINT64_MAX - (ubmem::kPageBytes - 1))
         return Status::InvalidArgument("mapping size overflow");
-      auto hal = std::make_shared<ubmem::Hal>();
-      auto s = hal->Load(options.hal_library);
+      std::shared_ptr<ubmem::Hal> hal;
+      auto s = ubmem::AcquireProcessHal(options.hal_library, &hal);
       if (!s.ok()) return s;
       p->mapping = std::make_unique<ubmem::Mapping>(hal);
       s = p->mapping->AllocateHost(

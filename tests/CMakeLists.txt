@@ -32,6 +32,22 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE AND NOT KVAF_CPU_ENABLE_URMA)
   add_test(NAME kvaf_cpu_backend_dispatch_test COMMAND kvaf_cpu_backend_dispatch_test)
 endif()
 
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  add_library(kvaf_ubmem_hal_stub SHARED ubmem_hal_stub.cc)
+  target_include_directories(kvaf_ubmem_hal_stub PRIVATE ${PROJECT_SOURCE_DIR}/access_operator/include)
+  target_link_libraries(kvaf_ubmem_hal_stub PRIVATE kvaf_common Threads::Threads)
+  add_executable(kvaf_ubmem_hal_lifecycle_test ubmem_hal_lifecycle_test.cc)
+  target_include_directories(kvaf_ubmem_hal_lifecycle_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
+  target_link_libraries(kvaf_ubmem_hal_lifecycle_test PRIVATE kvaf_cpu_runtime Threads::Threads ${CMAKE_DL_LIBS})
+  # Do not link the stub: a link-time reference would hide premature dlclose.
+  add_dependencies(kvaf_ubmem_hal_lifecycle_test kvaf_ubmem_hal_stub)
+  foreach(scenario execution legacy concurrent)
+    add_test(NAME kvaf_ubmem_hal_${scenario}_test COMMAND kvaf_ubmem_hal_lifecycle_test
+      $<TARGET_FILE:kvaf_ubmem_hal_stub> ${scenario})
+    set_tests_properties(kvaf_ubmem_hal_${scenario}_test PROPERTIES TIMEOUT 20)
+  endforeach()
+endif()
+
 add_executable(kvaf_cpu_push_scatter_test cpu_push_scatter_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc)
 target_include_directories(kvaf_cpu_push_scatter_test PRIVATE

@@ -15,6 +15,7 @@
 | CPU 资源隔离 | 每个执行配置独立 context、token、MR、队列及 Gather / Push worker；Gather 与 Scatter 可同时启用 |
 | 规范地址 | MetaManager / AccessTable 使用固定 allocation 基址；AIV WQE、AICPU transfer、CPU Push 提交时转换为注册基址 |
 | UBMEM 映射 | Runtime 内按设备、Fabric handle 和映射长度共享；最后一个引用关闭，失败保留并阻止复用 |
+| CPU HAL/SVM | 首次使用时加载，按库路径在进程内共享，跨池及 CPU Runtime 重建保留；池内存与映射仍各自释放 |
 | 生命周期 | Put / Get 分别串行、跨方向独立；AccessTable 失效后仍由在途请求或 graph 保留槽位引用 |
 | 恢复协议 | 能力协商、服务端 epoch、幂等创建和控制 ID、查询、可重试关闭、显式 `recover` |
 | 资源预算 | 各配置独立 cores / Jetty / in-flight / 请求容量 / CPU Gather 线程数 / kernel 路径 |
@@ -46,6 +47,17 @@ URMA context 或队列；URMA 路由发现只枚举候选。Gather 工作区在�
 STOP、队列删除、MR 注销、context 删除或 Fabric unmap 失败都会保留所有权。
 Region 有 session 时拒绝释放。控制记录保留关闭墓碑；单 session 的控制历史上限
 为 4096 条，到达上限后需要关闭并重建，不淘汰尚可重放的 ID。
+
+CPU 的请求级与旧 UBMEM 分配入口统一通过 `AcquireProcessHal` 获取 HAL。
+首次加载由互斥锁保护，成功后由进程级注册表持有强引用；加载失败不缓存，纯 URMA
+分配不触发加载。注册表保留到进程退出，不参与 C++ 静态析构，避免其他资源尚在清理
+时卸载 HAL。每个配置库路径只保留一个 HAL 对象，注册表不持有池或缓存数据。
+`Mapping::Close` 仍逐池执行 unmap、释放虚拟地址和物理 allocation。
+
+此生命周期用于避免已观察到的重建失败：卸载 HAL 后，用户态初始化标志被重置，
+驱动侧 Host SVM 进程上下文仍存在；再次初始化的 OPEN ioctl 返回 `EEXIST`，
+最终表现为 `halMemCreate ret=38`。已经进入此状态的旧服务需要退出并以修复版本
+重新启动；仅更新二进制或重启 NPU 客户端无法恢复原 CPU 进程。
 
 Put 不排空 Get。异步 Get 的 `drain_get()` 等待完整数据面并收集设备结果。未确认完成
 的 Put 保留事务和输入引用，需要成功 `shutdown()` 后才能清理；不能用 `recover`

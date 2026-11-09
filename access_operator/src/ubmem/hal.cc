@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 namespace kvaf::ubmem {
 namespace {
@@ -52,6 +54,28 @@ Status Hal::Load(const std::string& path) {
     return Status::NotFound("HAL lacks required Fabric/VMM interfaces");
   }
   path_ = path;
+  return Status::OK();
+}
+
+Status AcquireProcessHal(const std::string& library, std::shared_ptr<Hal>* out) {
+  if (out == nullptr) return Status::InvalidArgument("HAL output is null");
+  struct Registry {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<Hal>> libraries;
+  };
+  // Deliberately retain the registry through process exit: static destruction
+  // must not dlclose HAL before another runtime/static owner finishes cleanup.
+  // This owns the HAL environment only, never any pool handles or mappings.
+  static auto* registry = new Registry;
+  std::lock_guard<std::mutex> lock(registry->mutex);
+  auto found = registry->libraries.find(library);
+  if (found == registry->libraries.end()) {
+    auto hal = std::make_shared<Hal>();
+    auto status = hal->Load(library);
+    if (!status.ok()) return status;
+    found = registry->libraries.emplace(library, std::move(hal)).first;
+  }
+  *out = found->second;
   return Status::OK();
 }
 

@@ -25,7 +25,6 @@ bool Transfer(int fd, T* object, std::size_t offset, bool write) {
 }  // namespace
 
 struct UbmemCpuBackend::Impl {
-  std::shared_ptr<Hal> hal = std::make_shared<Hal>();
   std::unordered_map<std::uint64_t, std::unique_ptr<Mapping>> regions;
   std::uint64_t& next_session;
   std::string library;
@@ -42,15 +41,19 @@ struct UbmemCpuBackend::Impl {
     peer::AllocateUbmemRegionResponse response{};
     response.header = peer::MakeHeader(peer::Command::kAllocateUbmemRegion, sizeof(response));
     response.header.command = peer::ResponseCommand(peer::Command::kAllocateUbmemRegion);
-    auto region = std::make_unique<Mapping>(hal);
+    std::shared_ptr<Hal> hal;
+    std::unique_ptr<Mapping> region;
     FabricHandle handle{};
     const bool invalid = request.slot_size == 0 || request.ddr_bytes == 0 ||
         request.ddr_bytes > UINT64_MAX - (kPageBytes - 1) ||
         request.ddr_bytes % request.slot_size != 0;
     const auto mapping_bytes = invalid ? 0 : (request.ddr_bytes + kPageBytes - 1) / kPageBytes * kPageBytes;
     Status status = invalid ? Status::InvalidArgument("DDR bytes must be a multiple of slot_size")
-                            : hal->Load(library);
-    if (status.ok()) status = region->AllocateHost(mapping_bytes, &handle);
+                            : AcquireProcessHal(library, &hal);
+    if (status.ok()) {
+      region = std::make_unique<Mapping>(std::move(hal));
+      status = region->AllocateHost(mapping_bytes, &handle);
+    }
     response.result = static_cast<int>(status.ok() ? peer::Result::kOk : peer::Result::kResourceError);
     if (status.ok()) {
       response.session_id = next_session++;

@@ -124,6 +124,44 @@ timeout --signal=TERM --kill-after=10s 1800s \
 和 Python 字节数据占用；Gather/Scatter 还保留其内部固定容量工作区，不能只按 rows
 估算总内存。本脚本不是带宽 benchmark。
 
+### 3.1 HAL/SVM 跨池生命周期回归
+
+现场驱动 `25.6.rc3.1` 曾出现：同一个 CPU 服务第一次 UBMEM matrix 成功，第二次失败；
+UBMEM 全用例也会在 `lifecycle/0` 的重新初始化失败。驱动日志确认
+`svm_char_dev_open` 的 Host SVM OPEN ioctl 返回 `EEXIST`，继而
+`Svm master init failed`、`halMemCreate ret=38`。修复让 HAL 在进程内跨池复用，
+避免池关闭时卸载 HAL；实际池内存、映射仍在关闭时释放。
+
+更新代码后在 CPU 端运行 `./build.sh cpu`，停止旧测试服务并启动新二进制一次。
+这一步清除旧进程遗留的 SVM 状态；后续验证全程使用这个服务，不在轮次间重启。
+NPU 端沿用已构建的同分支接口即可，此修复没有改变协议或设备 kernel。
+
+在 NPU 仓库目录执行（地址和设备号按实际环境修改）：
+
+```bash
+(
+  set -e
+  export KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999
+  export DEVICE_ID=6
+  for run in 1 2 3; do
+    timeout --signal=TERM --kill-after=10s 180s \
+      bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
+      --modes ubmem --cases matrix --report "$PWD/ubmem-reopen-$run.json"
+  done
+  timeout --signal=TERM --kill-after=10s 600s \
+    bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
+    --modes ubmem --cycles 5 --report "$PWD/ubmem-lifecycle-full.json"
+  timeout --signal=TERM --kill-after=10s 1800s \
+    bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
+    --report "$PWD/validation-full.json"
+)
+```
+
+前三次覆盖不同客户端进程先后使用同一个 CPU 服务；第二条测试命令省略 `--cases`，
+运行 UBMEM 全部六类案例并重建池 5 次；最后覆盖全部模式和案例。
+任一步失败会停止。所有命令退出码为 0、五份报告均为 PASS，且期间 CPU 服务 PID
+不变，才算该回归通过。重启服务后仅一次 matrix 成功不足以确认修复。
+
 ## 4. 各案例检查什么
 
 | 案例 | 操作与通过标准 |
@@ -183,30 +221,41 @@ KVAF_EXECUTION_SUMMARY PASS report=/absolute/path/to/validation-full.json
   此选项为 ON，也因 `kvaf_npu_runtime` 缺少同名编译宏而误报；更新本分支并重新
   执行 `./build.sh npu`。这是 NPU 本地能力检查，与 CPU 地址、端口无关。
 - 初始化/首调失败：CPU 地址与版本、UB/EID 路由、Fabric 能力及 kernel 安装。
-- `ubmem/initialize` 报 `halMemCreate(Host P2P DDR) failed, ret=38`：错误发生在
-  CPU 服务的物理内存分配阶段，尚未导出 Fabric handle 或在 NPU 建立映射。
+- `ubmem/initialize` 或 `ubmem/lifecycle` 报 `halMemCreate(Host P2P DDR) failed, ret=38`：
+  错误发生在 CPU 服务调用 HAL 时，尚未导出 Fabric handle 或在 NPU 建立映射；
+  也可能在 HAL 内部初始化失败，尚未真正分配物理内存。
   HAL 返回码不等同于 Linux `errno`，不能据此认定设备不支持 UBMEM 或内存泄漏。
   新版错误同时包含申请的 `bytes`、`cpu_service_pid` 和调用后立即保存的 `errno`；
   `errno=0` 只表示 HAL 未提供该信息。查看 CPU 服务用户的驱动 plog，结合 PID 和
   失败时间匹配记录，日志路径被重定向时使用实际目录：
 
   ```bash
-  rg -n -i -C 3 'halMemCreate|Mem create failed|DRV_ERROR_FILE_OPS' \
+  grep -rniE -C 3 'halMemCreate|Mem create failed|DRV_ERROR_FILE_OPS|Svm master init failed' \
     "$HOME/ascend/log" 2>/dev/null | tail -100
   ```
 
   若 `errno=17 (File exists)`，保留现有 CPU 服务进程，在另一终端附加 syscall
-  跟踪；将 `CPU_PID` 替换为错误中的 `cpu_service_pid`：
+  跟踪。普通部署使用错误中的 `cpu_service_pid`；若服务在 Docker 中、strace 在宿主机，
+  必须使用宿主机看到的该服务 PID，而非容器内 PID：
 
   ```bash
-  strace -f -tt -s 256 -e trace=%file,mmap,munmap \
-    -p CPU_PID -o "$PWD/kvaf-cpu-syscalls.log"
+  strace -f -tt -yy -s 4096 \
+    -e trace=openat,close,ioctl,write,writev,sendto,sendmsg \
+    -p CPU_PID -o "$PWD/kvaf-cpu-hal-detail.log"
   ```
 
-  在 NPU 端复现失败后，用 Ctrl+C 停止附加的 strace，再提取
-  `rg -n -C 5 'EEXIST' kvaf-cpu-syscalls.log`。需要核对具体 syscall、路径、flags
-  和后续调用：例如 `mkdir` 返回已存在后被 HAL 正常处理，也可能留下 `errno`，
-  所以单凭它还不能认定是文件冲突。先保留失败现场，不删除未知 HAL/共享内存文件。
+  在 NPU 端复现失败后，用 Ctrl+C 停止附加的 strace，再提取：
+
+  ```bash
+  grep -nE -C 5 'EEXIST|halMemCreate|Svm master init failed|Ioctl failed|Open failed' \
+    kvaf-cpu-hal-detail.log | tail -180
+  ```
+
+  若 `/dev/davinci_manager` 的 ioctl 返回 EEXIST，并伴随 `svm_char_dev_open`、
+  `svm_ioctl_dev_init`、`Svm master init failed`，与上述 Host SVM 重建失败一致，
+  按 3.1 节更新、重启一次并复验。strace 可能把该 ioctl 编号显示成
+  `ZFS_IOC_POOL_CREATE`，这是编号名称重叠，不能据此判定 ZFS 或普通文件冲突。
+  单独的 `errno=17` 不足以确认根因，不删除未知 HAL/共享内存文件。
   跟踪需要目标机安装 strace 且允许附加；若权限不允许，可在独立测试服务停止后用
   同一 strace 前缀启动服务（把 `-p CPU_PID` 换成完整的 `kvaf_cpu_service` 启动命令）。
 
@@ -245,15 +294,22 @@ ctest --test-dir build-verify --output-on-failure -j 4
 ```
 
 ACL 目录下应存在 `acl/acl.h`。这两项只启用额外 mock 测试，不代表正式 SDK 或设备验收。
-默认上述配置有 24 项 CTest，启用两项头文件测试后为 26 项；数量包含验收脚本自测和
+默认上述配置有 27 项 CTest，启用两项头文件测试后为 29 项；数量包含验收脚本自测和
 真实 Runtime CMake 编译参数检查。后者无需 CANN，覆盖完整构建及裁剪构建的能力宏。
 
 重点测试可单独运行：
 
 ```bash
 ctest --test-dir build-verify --output-on-failure \
-  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_dispatcher_test|cache_region_service_test|execution_peer_recovery_test|runtime_cleanup_test|ubmem_mapping_cache_test|aicpu_session_registry_test)'
+  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_dispatcher_test|cache_region_service_test|execution_peer_recovery_test|runtime_cleanup_test|ubmem_hal_.*_test|ubmem_mapping_cache_test|aicpu_session_registry_test)'
 ```
+
+`kvaf_ubmem_hal_execution_test`、`kvaf_ubmem_hal_legacy_test` 和
+`kvaf_ubmem_hal_concurrent_test` 使用动态加载的替身 HAL，模拟用户态随卸载重置、
+驱动进程状态继续存在的情况。覆盖连续释放/重建池、CPU 后端重建、新旧入口共享及
+并发首次加载，并检查各池的 create/release、reserve/free、map/unmap 数量配对。
+测试不通过链接替身库来保持它存活；旧实现会在第二次分配触发模拟的 `ret=38/EEXIST`。
+这些是生命周期回归，真实驱动验证仍需执行 3.1 节。
 
 TCP 恢复测试绑定本机回环地址，验证创建、控制、关闭回复丢失后的幂等重试。
 `kvaf_cpu_push_scatter_test` 包含超时路径，约需 90 秒，不应把它的正常等待当成挂死。
