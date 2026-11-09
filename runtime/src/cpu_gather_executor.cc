@@ -6,6 +6,8 @@ namespace kvaf::peer {
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
 // Test-only seams for controlling copy tails and observing helper idle policy.
 void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end);
+void CpuGatherBeforeWorkerCopy(std::size_t worker);
+void CpuGatherChunkCompleted(std::uint32_t chunk);
 void CpuGatherHelperCompleted(std::size_t worker, std::uint64_t generation);
 void CpuGatherHelperWait(std::size_t worker, std::uint64_t generation, bool spinning);
 #endif
@@ -107,6 +109,9 @@ void CpuGatherExecutor::Copy() {
 }
 
 void CpuGatherExecutor::CopyWorker(std::size_t worker) {
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+  CpuGatherBeforeWorkerCopy(worker);
+#endif
   if (thread_profiles_.empty()) {
     (void)ProcessSource(worker);
     if (pipeline_ready_ == nullptr) GatherBarrier();
@@ -164,23 +169,37 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
 std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   if (cooperative_) {
     std::uint64_t copied = 0;
-    for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
-      const auto begin = std::uint64_t(chunk) * pipeline_chunk_bytes_;
-      const auto end = std::min(begin + pipeline_chunk_bytes_, total_bytes_);
-      // Partition aligned cache lines inside EACH prefix block, including a
-      // short tail. Empty shares still participate in block completion.
-      const auto lines = (end - begin + 63U) / 64U;
-      const auto local_begin = std::min(end, begin + lines * worker / active_threads_ * 64U);
-      const auto local_end = std::min(end, begin + lines * (worker + 1U) / active_threads_ * 64U);
-      copied += CopyRange(local_begin, local_end);
-      if (local_begin != local_end) GatherBarrier();
-      auto& progress = cooperative_progress_[chunk];
-      // The acquire chain collects every writer's completed payload stores.
-      if (progress.remaining.fetch_sub(1U, std::memory_order_acq_rel) == 1U) {
-        progress.complete.store(true, std::memory_order_release);
-        PublishCooperativeReady();
+    std::uint32_t chunk = cooperative_count_, finished = 0U;
+    for (;;) {
+      // The generation/phase acquires publish immutable task metadata. This
+      // relaxed RMW only assigns unique tiles, earliest unclaimed prefix first.
+      const auto tile = cooperative_next_tile_.fetch_add(1U, std::memory_order_relaxed);
+      const auto next_chunk = tile < cooperative_tiles_
+          ? tile / cooperative_tiles_per_chunk_ : cooperative_count_;
+      if (finished && next_chunk != chunk) {
+        // Flush all this worker's tiles in the block together, not per tile.
+        // No worker has a reserved share; late helpers may legitimately do no
+        // copy work. The last contributor still collects every writer's stores.
+        GatherBarrier();
+        auto& progress = cooperative_progress_[chunk];
+        if (progress.remaining.fetch_sub(finished, std::memory_order_acq_rel) == finished) {
+          progress.complete.store(true, std::memory_order_release);
+          PublishCooperativeReady();
+#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+          CpuGatherChunkCompleted(chunk);
+#endif
+        }
+        if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
+        finished = 0U;
       }
-      if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
+      if (tile >= cooperative_tiles_) break;
+      chunk = next_chunk;
+      const auto begin = std::uint64_t(chunk) * pipeline_chunk_bytes_ +
+          std::uint64_t(tile % cooperative_tiles_per_chunk_) * cooperative_tile_bytes_;
+      const auto end = std::min(begin + cooperative_tile_bytes_,
+          std::min(std::uint64_t(chunk + 1U) * pipeline_chunk_bytes_, total_bytes_));
+      copied += CopyRange(begin, end);
+      ++finished;
     }
     return copied;
   }

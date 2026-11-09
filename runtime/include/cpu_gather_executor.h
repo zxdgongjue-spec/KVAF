@@ -133,10 +133,27 @@ class CpuGatherExecutor {
     active_threads_ = threads;
     if (cooperative_) {
       cooperative_count_ = (total_bytes_ + pipeline_chunk_bytes_ - 1U) / pipeline_chunk_bytes_;
+      // Keep the published chunks, but claim smaller prefix-ordered copy tiles.
+      // Two scheduling opportunities per worker avoid reducing parallelism for
+      // small chunks; the 128-KiB cap bounds an already claimed straggler task.
+      const auto chunk_bytes = std::min<std::uint64_t>(total_bytes_, pipeline_chunk_bytes_);
+      const auto slots = threads * 2U;
+      cooperative_tile_bytes_ = threads == 1U ? pipeline_chunk_bytes_ :
+          static_cast<std::uint32_t>(std::min<std::uint64_t>(128U * 1024U,
+              ((chunk_bytes + slots - 1U) / slots + 63U) & ~std::uint64_t{63U}));
+      cooperative_tiles_per_chunk_ = static_cast<std::uint32_t>(
+          (std::uint64_t(pipeline_chunk_bytes_) + cooperative_tile_bytes_ - 1U) /
+          cooperative_tile_bytes_);
+      cooperative_tiles_ = 0U;
       for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
-        cooperative_progress_[chunk].remaining.store(threads, std::memory_order_relaxed);
+        const auto bytes = std::min<std::uint64_t>(pipeline_chunk_bytes_,
+            total_bytes_ - std::uint64_t(chunk) * pipeline_chunk_bytes_);
+        const auto tiles = (bytes + cooperative_tile_bytes_ - 1U) / cooperative_tile_bytes_;
+        cooperative_tiles_ += static_cast<std::uint32_t>(tiles);
+        cooperative_progress_[chunk].remaining.store(tiles, std::memory_order_relaxed);
         cooperative_progress_[chunk].complete.store(false, std::memory_order_relaxed);
       }
+      cooperative_next_tile_.store(0U, std::memory_order_relaxed);
     } else if (pipeline_ready_ != nullptr) {
       // Balanced static rounds, capped at 256 KiB per copy task. A 2.5625-MiB
       // lane with 16 threads gets 16 x 164-KiB tasks, independent of ready chunk.
@@ -218,8 +235,11 @@ class CpuGatherExecutor {
   std::uint32_t pipeline_chunk_bytes_{0U};
   bool cooperative_{};
   std::uint32_t cooperative_count_{};
-  // One completion RMW per worker/block; only the last worker scans/publishes.
-  // Blocks have separate lines and no worker waits for another block's users.
+  std::uint32_t cooperative_tile_bytes_{}, cooperative_tiles_per_chunk_{}, cooperative_tiles_{};
+  alignas(64) std::atomic<std::uint32_t> cooperative_next_tile_{0U};
+  // One aggregated completion RMW per participating worker/block. Remaining
+  // counts copy tiles, not workers: an unstarted helper cannot hold ready back.
+  // Blocks have separate lines; workers never wait at a published boundary.
   struct alignas(64) CooperativeProgress {
     std::atomic<std::size_t> remaining{0};
     std::atomic<bool> complete{false};

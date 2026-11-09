@@ -11,6 +11,8 @@ CPU 服务和 N 侧 gather kernel；其后的任务内部分进度发布只需�
 本轮复制未完成时，先结束的 helper 立即等待条件变量；整批完成后最多一个 helper
 有界自旋（active 100 us、adaptive 25 us、passive 不自旋），其余 helper 休眠。
 这次调整只需更新 CPU 服务，coordinator notify 轮询策略不变。
+协作 chunk 现由 CPU 动态领取块内 tile，保持原等长 ready 边界和 NPU READ 路径；
+已有 V9/GDR4 构建只需更新 CPU 服务。
 
 ## 采集
 
@@ -102,12 +104,15 @@ ACK 读取与 CQ 等待，而且 CPU 可能在 AIV 的 publish 阶段尚未结�
 | `work_ns` | 该线程 ProcessSource 加 barrier 的墙钟耗时 |
 | `thread_cpu_ns` | 同一工作区间附近的线程 CPU 时间；`cpu_time_valid=0` 时不可使用 |
 | `bytes` | 该线程实际拷贝的字节数；各活跃线程相加应等于请求 bytes |
+| `progress_publications` | 协作模式下，该线程向 chunk 完成计数提交汇总贡献的次数；每个参与块最多一次，不等于 ready_bytes 实际更新次数 |
 | `wait_path` | 该任务是否经过条件变量等待分支；谓词可能立即满足，不等于确实睡眠 |
 | `tid/cpu` | Linux 线程 ID 和开始拷贝时的 CPU 编号 |
 
 上述 `thread_cpu_ns` 只覆盖工作区间，不包含任务结束后的自旋或条件变量等待；
 不能直接用该字段判断进程空闲时的 CPU 占用。新策略下更多任务可能显示
 `wait_path=1`，应结合 `start_delay_ns` 判断唤醒是否影响本轮关键路径。
+动态领取下各线程的 `bytes` 不必相等；晚启动且未领到任务的线程可以为 0，
+此时 `progress_publications` 也为 0。它仍须完成本轮线程汇合后才允许发布最终 ACK。
 
 按每个 sequence 找到 `done_ns` 最晚的线程，判断该 lane 的关键路径。
 线程并行执行，不能把线程 copy/work 墙钟时间相加解释整批延迟。

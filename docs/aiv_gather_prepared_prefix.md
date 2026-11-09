@@ -33,21 +33,29 @@ chunk_bytes = align_up(ceil(lane_payload_bytes / configured_chunks), 64)
 因此部分前缀、不同大小的 lane 都按实际 payload 分块，短请求可能只有一块。
 块边界允许位于 token/WR 内，AIV 始终按完整 WR 的源结束位置判定可提交范围。
 
-CPU 不再让不同线程分别复制整批的不同大段；每个线程依次复制自己在块 0、块 1、
-块 2……中的份额。块内按 64 B cache line 均衡划分，末尾精确处理有效字节。
-线程数量仍按整批 payload 和已有线程预算选择，不因 chunk 变小而降低并行度。
+CPU 保留上述等长 chunk 的发布边界，块内复制改为动态领取小任务（tile），不再给
+每个 helper 预留固定份额。全局原子游标按 staging 顺序分配任务，线程完成后继续
+领取最早尚未分配的任务。线程数量仍按整批 payload 和已有线程预算选择。
 
-每个线程复制一个非空份额后执行原有系统可见性 barrier，再对该块的独立完成
-计数做一次原子递减，随后直接复制下一块，不等待其他线程。最后完成某块的线程
-汇总已完整完成的连续块，并用单调 CAS 推进 `ready_bytes`；发布后保留系统 barrier。
+多线程时 tile 按 64 B 对齐，大小为 `min(128 KiB, align64(ceil(chunk_payload /
+(2 * threads))))`；较小的 chunk 保留约两轮调度机会，较大的 chunk 将单个已领取
+任务限制在 128 KiB。单线程直接复制整个 chunk，末尾都精确处理有效字节。
+tile 只决定 CPU 任务分配，不增加 NPU 进度粒度、WQE 或 READ 提交次数。
+
+同一线程在一个 chunk 内完成的 tile 先本地累计，领取到后续 chunk 或任务耗尽时，
+统一执行原有系统可见性 barrier，再对该块的剩余 tile 数做一次汇总原子递减。
+每个参与线程/块最多一次 barrier 和完成 RMW；没有领到任务的晚启动 helper
+不参与该块完成计数。最后完成某块的线程汇总已完整完成的连续块，并用单调 CAS
+推进 `ready_bytes`；发布后保留系统 barrier。已领取但未完成的 tile 仍会阻止前缀
+跨过该块，不能用后面已完成的块跳过空洞。
 最多八个块的完成者参与发布，不引入专用通知线程。coordinator 正在复制下一块时，
 helper 仍可发布前一块，不能让前缀推进依赖 coordinator 的拷贝检查点。
 
 ```text
-CPU 每个线程：块0的份额 → 块1的份额 → 块2的份额……
-CPU 完成者：       ready0       ready1       ready2
-AIV：       query + 提前准备 WQE → 提交 ready 的连续 WR
-NIC：                       READ0 ─── READ1 ─── READ2
+CPU 任务领取：块0 tile0、tile1…… → 块1 tile0、tile1…… → …
+CPU 完成者：         ready0               ready1
+AIV：        query + 提前准备 WQE → 提交 ready 的连续 WR
+NIC：                         READ0 ─── READ1 ─── …
 ```
 
 AIV 使用 40 B descriptor READ 查询 sequence / ready_bytes，按连续前缀消费。
@@ -57,8 +65,14 @@ AIV 使用 40 B descriptor READ 查询 sequence / ready_bytes，按连续前缀�
 前缀保留。已准备且 ready 的首批优先提交，后续快照不插在其提交前处理。
 
 最后数据 post 发布后，在 READ 仍在途时查询最终 ACK，再确认数据 CQ。ready=total
-不替代最终 ACK，也不允许提前复用 descriptor/staging。错误继续 poison 两条队列，
+不替代最终 ACK；即使所有 tile 已完成，CPU 仍须汇合本轮已调度的所有 helper 后才
+返回最终 ACK，不允许提前复用 descriptor/staging。错误继续 poison 两条队列，
 消费本地已发出的 VF/MTE3 事件，并沿用原有会话停机和资源保留规则。
+
+这版只实施 CPU 动态领取任务，保留等长 2/4/8 个发布块，NPU 的 WQE 编码、双 bank、
+数据队列与进度查询调度均不变。已有 V9/GDR4 部署只需重编、重启 K 侧 CPU 服务，
+环境变量和参数保持原配置。首尾小、中间按 READ bank 发布的非等长布局，以及
+NPU 进度快照消费时机的调整留作后续独立对照，避免同时改变多个因素。
 
 ## CPU helper 的等待策略
 
@@ -154,6 +168,8 @@ READ 重叠，整批提前准备下与 WQE 工作重叠。不能将这些字段�
 模型覆盖：ACK/首次 progress CQ 延迟到 VF 后才返回；ACK 前仅构造 WQE；完整 WR
 就绪判断；128-WR bank 的部分提交；小队列容量、SQ 环回、尾 WQE、coalescing；
 2/4/8 块、不同 token、多核及空 lane；重复调用；进度回退/越界/错误和 CQ/超时退出。
-CPU 并发消费者逐字节检查 ready 前缀，并暂停 coordinator 的后续份额验证 helper
-发布，暂停首块份额验证前缀不跨空洞。模型和 sanitizer 不证明设备 DMA 可见性、
+CPU 并发消费者逐字节检查 ready 前缀；暂停首块/后续块的已领取 tile，验证其他
+线程可完成后续块且 ready 不跨空洞；暂停所有 helper 的首次领取，验证 coordinator
+独自完成并发布全部前缀时仍须等待 helper 汇合。另覆盖变长 span、短尾、2/4/8 块、
+多轮缩小/恢复线程数及停机。模型和 sanitizer 不证明设备 DMA 可见性、
 CANN 编译结果或实际性能收益，仍需目标双机验收。
