@@ -22,12 +22,22 @@ enum KvafBatchPutResult {
 typedef struct KvafBatchPutTransport KvafBatchPutTransport;
 typedef struct KvafBatchPutLocalBuffer KvafBatchPutLocalBuffer;
 
+// On creation failure, a non-null *transport owns partially initialized
+// resources whose cleanup failed. Retain it and retry TransportClose.
 int32_t KvafBatchPutTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link,
     const uint8_t *peer_local_eid, KvafBatchPutTransport **transport);
+// Caller must stop submitting work and synchronize kernel streams first.
+// SUCCESS destroys transport. Failure keeps its handles for Close retry; no
+// further acquisitions/launches are allowed after a close attempt.
+int32_t KvafBatchPutTransportClose(KvafBatchPutTransport *transport);
+// Compatibility wrapper: retain on failure, with no status/retry guarantee.
 void KvafBatchPutTransportDestroy(KvafBatchPutTransport *transport);
 
+// On error, a non-null *local_buffer retains a partially created registration.
+// Keep the caller's HBM alive until LocalBufferRetire or TransportClose succeeds;
+// the partial handle must not be submitted or released into the reusable cache.
 int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transport,
                                        void *input_device, uint64_t input_device_bytes,
                                        KvafBatchPutLocalBuffer **local_buffer);

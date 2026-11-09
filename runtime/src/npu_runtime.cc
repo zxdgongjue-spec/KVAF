@@ -1191,7 +1191,7 @@ Status NpuRuntime::DrainGet() {
 Status NpuRuntime::Recover(PutExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
     return Status::Internal("aclrtSetDevice failed");
-  return impl_->dispatcher ? impl_->dispatcher->Recover(c)
+  return impl_->dispatcher ? core().RecoverPut(c)
                            : Status::NotImplemented("recovery requires per-call execution");
 }
 Status NpuRuntime::Recover(GetExecutionConfig c) {

@@ -15,6 +15,8 @@ Status UmdkSession::CompletePending(UmdkControlStatus& status) {
   if (aclrtMemcpy(&status, sizeof(status), reinterpret_cast<void*>(args_.status), sizeof(status),
                   ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS || status.magic != kUmdkControlMagic)
     return Status::Internal("UMDK completion status unavailable; resources retained");
+  if (args_.op == UmdkControlOp::kWrite && status.result == 0)
+    write_->completion = {PutOutcome::Succeeded, Status::OK()};
   // A recovered prepare/destroy must update ownership before teardown continues.
   if (args_.op == UmdkControlOp::kPrepare) {
     args_.session = status.session;
@@ -41,6 +43,12 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
   auto* device_status = reinterpret_cast<void*>(args_.status);
   if (aclrtMemset(device_status, sizeof(status), 0, sizeof(status)) != ACL_SUCCESS)
     return Status::Internal("failed to clear UMDK setup status");
+  if (op == UmdkControlOp::kWrite) {
+    write_->attempted = true;
+    // An error at the launch boundary cannot prove whether the command was
+    // accepted. Retain its stream and original report before submitting it.
+    pending_ = stream;
+  }
   const auto launch = launch_kernel ? launch_kernel(&args_, stream)
                                     : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV3", &args_,
                                                        sizeof(args_), stream);
@@ -85,6 +93,14 @@ Status UmdkSession::Shutdown() {
 }
 
 Status UmdkSession::ReleaseBuffers() {
+  if (failed_ && args_.op == UmdkControlOp::kUnregisterBuffers && pending_) {
+    UmdkControlStatus status{};
+    auto completed = CompletePending(status);
+    if (!completed.ok()) return completed;
+    if (status.result != 0) return Status::CompletionUnknown("UMDK buffer unregister is unresolved");
+    registered_buffers_.clear();
+    failed_ = false;
+  }
   auto drained = Drain();
   if (!drained.ok()) return drained;
   if (!connected_ || registered_buffers_.empty()) return Status::OK();
@@ -179,6 +195,30 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   return Status::OK();
 }
 
+Status UmdkSession::ResolveWrite(PutCompletion* out) {
+  if (!out) return Status::InvalidArgument("null WRITE completion output");
+  if (write_->completion.outcome == PutOutcome::Succeeded) {
+    // A WRITE may be complete while a later buffer-unregister command failed.
+    // Keep the proven data result; AcknowledgePut retries registration cleanup.
+    *out = write_->completion;
+    return Status::OK();
+  }
+  if (!write_->attempted) {
+    *out = {PutOutcome::Failed, Status::Internal("UMDK WRITE was not submitted")};
+    return Status::OK();
+  }
+  if (args_.op != UmdkControlOp::kWrite || !pending_)
+    return Status::CompletionUnknown("UMDK WRITE completion cannot be established");
+  UmdkControlStatus status{};
+  auto result = CompletePending(status);
+  if (!result.ok()) return result;
+  if (status.result != 0)
+    return Status::CompletionUnknown("UMDK WRITE failed with potentially outstanding remote WRs");
+  failed_ = false;
+  *out = write_->completion;
+  return Status::OK();
+}
+
 Status UmdkSession::WriteDescriptors(std::uint64_t descriptors, std::uint32_t count,
                                      aclrtStream stream, Launch launch) {
   if (failed_ || pending_)
@@ -188,6 +228,11 @@ Status UmdkSession::WriteDescriptors(std::uint64_t descriptors, std::uint32_t co
   args_.transfer_spans = descriptors;
   args_.transfer_count = count;
   UmdkControlStatus status{};
-  return Run(UmdkControlOp::kWrite, status, stream, launch);
+  write_->attempted = false;
+  write_->completion = {};
+  auto result = Run(UmdkControlOp::kWrite, status, stream, launch);
+  if (!result.ok() && write_->completion.outcome != PutOutcome::Succeeded)
+    write_->completion.result = result;
+  return result;
 }
 }  // namespace kvaf::aicpu_urma

@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <new>
@@ -140,8 +141,10 @@ Status RuntimeCore::Shutdown() {
   pending_get_table_.reset();
   access_tables_.clear();
   if (pending_put_) {
-    const auto aborted = meta_manager_.AbortPut(*pending_put_);
-    if (!aborted.ok()) return aborted;
+    if (!pending_put_->metadata_finalized) {
+      const auto aborted = meta_manager_.AbortPut(pending_put_->transaction);
+      if (!aborted.ok()) return aborted;
+    }
     pending_put_.reset();
   }
   Status first_error = Status::OK();
@@ -435,6 +438,10 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
   auto prepared = access_operator_.PreparePut(request, execution);
   if (!prepared.ok()) return prepared;
+  // Construct the retained completion record before reserving metadata; its
+  // status message may allocate. Moving it into the optional after PreparePut
+  // succeeds does not require another allocation.
+  PendingPut pending;
   PutContext put_context;
   PutAccessDesc put_desc;
   Status status = meta_manager_.PreparePut(request.keys, request.lengths,
@@ -443,19 +450,70 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
     return status;
   }
 
-  status = access_operator_.ExecuteBatchPut(
-      BatchPutExecRequest{&request, &put_desc, execution});
-  if (!status.ok()) {
-    if (status.code() == StatusCode::kCompletionUnknown) pending_put_ = put_context;
-    else (void)meta_manager_.AbortPut(put_context);
-    return status;
+  pending.transaction = put_context;
+  pending_put_.emplace(std::move(pending));
+  try {
+    status = access_operator_.ExecuteBatchPut(
+        BatchPutExecRequest{&request, &put_desc, execution});
+  } catch (const std::exception& error) {
+    return Status::CompletionUnknown(std::string("Put execution threw after preparation: ") + error.what());
+  } catch (...) {
+    return Status::CompletionUnknown("Put execution threw after preparation");
   }
-  status = meta_manager_.CommitPut(put_context);
   if (!status.ok()) {
-    pending_put_ = put_context;
-    return status;
+    if (status.code() == StatusCode::kCompletionUnknown) return status;
+    pending_put_->completion = {PutOutcome::Failed, status};
+  } else {
+    pending_put_->completion = {PutOutcome::Succeeded, Status::OK()};
   }
-  return Status::OK();
+  return FinalizePutLocked();
+}
+
+Status RuntimeCore::FinalizePutLocked() {
+  auto& pending = *pending_put_;
+  if (pending.completion.outcome == PutOutcome::Unknown)
+    return Status::CompletionUnknown("Put data-plane completion remains unresolved");
+  if (!pending.metadata_finalized) {
+    const auto status = pending.completion.outcome == PutOutcome::Succeeded
+                            ? meta_manager_.CommitPut(pending.transaction)
+                            : meta_manager_.AbortPut(pending.transaction);
+    if (!status.ok()) return status;
+    pending.metadata_finalized = true;
+  }
+  // Metadata failure must not release the provider's completion record. Likewise
+  // an acknowledgement retry must not repeat a successful CommitPut/AbortPut.
+  const auto acknowledged = access_operator_.AcknowledgePut();
+  if (!acknowledged.ok()) return acknowledged;
+  const auto result = pending.completion.result;
+  pending_put_.reset();
+  return result;
+}
+
+Status RuntimeCore::RecoverPut(PutExecutionConfig config) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  if (!pending_put_) return access_operator_.Recover(config);
+  PutCompletion completion;
+  // The dispatcher checks against the saved effective configuration, including
+  // a default selected by the original call. Never recover a different route.
+  const auto resolved = access_operator_.ResolvePut(config, &completion);
+  if (!resolved.ok()) return resolved;
+  if (completion.outcome == PutOutcome::Unknown)
+    return Status::CompletionUnknown("Put data-plane completion remains unresolved");
+  if ((completion.outcome == PutOutcome::Succeeded) != completion.result.ok())
+    return Status::Internal("inconsistent Put completion result");
+  if (pending_put_->completion.outcome == PutOutcome::Unknown)
+    pending_put_->completion = completion;
+  else if (pending_put_->completion.outcome != completion.outcome)
+    return Status::Internal("Put completion changed after it was resolved");
+  return FinalizePutLocked();
+}
+
+bool RuntimeCore::HasPendingPut() const {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
+  return pending_put_.has_value();
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {

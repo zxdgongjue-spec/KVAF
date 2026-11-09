@@ -34,27 +34,34 @@ struct CpuPushTransport::Impl {
   void* profile_host{};
   std::array<std::unique_ptr<d::TargetChannel>, kJettyCount> channels;
   Layout layout;
-  aclrtStream pending{};
+  struct Invocation final : ExecutionState {
+    explicit Invocation(const Impl* value) : owner(value) {}
+    const Impl* owner;
+    aclrtStream pending{};
+    std::uint64_t sequence{};
+  };
+  Invocation legacy{this};
+  Invocation* invocation{&legacy};
   std::uint64_t sequence{};
   bool peer_open{}, initialized{}, failed{};
 
   Status Drain() {
     if (failed) return Status::InvalidState("CPU push failed; shutdown required");
-    if (!pending) return Status::OK();
+    if (!invocation->pending) return Status::OK();
     const auto bytes = config.workers * sizeof(WorkerStatus);
     if (aclrtMemcpyAsync(status_host, bytes, status_device, bytes,
-                         ACL_MEMCPY_DEVICE_TO_HOST, pending) != ACL_SUCCESS) {
+                         ACL_MEMCPY_DEVICE_TO_HOST, invocation->pending) != ACL_SUCCESS) {
       failed = true;
       return Error("cannot enqueue execution status; resources retained");
     }
-    if (aclrtSynchronizeStream(pending) != ACL_SUCCESS) {
+    if (aclrtSynchronizeStream(invocation->pending) != ACL_SUCCESS) {
       failed = true;
       return Error("stream failed; resources retained");
     }
-    pending = nullptr;
+    invocation->pending = nullptr;
     const auto* statuses = static_cast<const WorkerStatus*>(status_host);
     for (std::uint32_t w = 0; w < config.workers; ++w)
-      if (statuses[w].magic != kMagic || statuses[w].sequence != sequence ||
+      if (statuses[w].magic != kMagic || statuses[w].sequence != invocation->sequence ||
           statuses[w].result != static_cast<std::uint64_t>(Result::kOk)) {
         failed = true;
         return Status::Internal("CPU push worker " + std::to_string(w) + " result=" +
@@ -66,6 +73,15 @@ struct CpuPushTransport::Impl {
 CpuPushTransport::CpuPushTransport(Config config) : impl_(std::make_unique<Impl>(std::move(config))) {}
 CpuPushTransport::~CpuPushTransport() {
   if (!Shutdown().ok()) (void)impl_.release();
+}
+std::unique_ptr<ExecutionState> CpuPushTransport::CreateExecutionState() {
+  return std::make_unique<Impl::Invocation>(impl_.get());
+}
+Status CpuPushTransport::BindExecutionState(ExecutionState* state) {
+  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
+  if (!typed || typed->owner != impl_.get()) return Status::InvalidArgument("Get invocation belongs to another resource");
+  impl_->invocation = typed;
+  return Status::OK();
 }
 Status CpuPushTransport::Drain() { return impl_->Drain(); }
 
@@ -185,7 +201,8 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
   args.sequence = ++s.sequence;
   args.workers = s.config.workers;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  s.pending = stream;
+  s.invocation->pending = stream;
+  s.invocation->sequence = s.sequence;
   // Coordination belongs to this launch; reset on the caller stream before execution.
   if (aclrtMemsetAsync(s.coordination, sizeof(Coordination), 0, sizeof(Coordination), stream) != ACL_SUCCESS) {
     s.failed = true; return Error("reset launch coordination");
@@ -222,9 +239,9 @@ Status CpuPushTransport::Shutdown() {
     if (!stopped.ok()) return stopped;
     s.peer_open = false;
   }
-  if (s.pending && aclrtSynchronizeStream(s.pending) != ACL_SUCCESS)
+  if (s.invocation->pending && aclrtSynchronizeStream(s.invocation->pending) != ACL_SUCCESS)
     return Error("stream still failed/pending; HBM retained");
-  s.pending = nullptr;
+  s.invocation->pending = nullptr;
   for (auto& channel : s.channels) if (channel) {
     auto closed = channel->Shutdown();
     if (!closed.ok()) return closed;

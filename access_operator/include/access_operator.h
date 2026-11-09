@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "requests.h"
+#include "execution_resources.h"
 #include "status.h"
 #include "types.h"
 
@@ -26,13 +27,38 @@ struct BatchPutExecRequest {
 };
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
-// 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
+// 生命周期和 Meta 可见性；Operator 负责执行和完成解析，请求级入口的资源
+// 所有权与单次状态分别由 ResourceManager 和 ExecutionContext 持有。
 class AccessOperator {
  public:
   virtual ~AccessOperator() = default;
 
   virtual Status Initialize(const RemoteRegionDesc& remote_region) = 0;
   virtual Status Shutdown() = 0;
+
+  // Hardware providers transfer ownership once to ResourceManager and retain
+  // only their concrete borrowed view. Legacy/mock providers may return null.
+  virtual std::unique_ptr<ExecutionResourceOwner> TakeResources() { return {}; }
+  // Check the immutable resource profile before granting a request lease.
+  virtual Status ValidateRequestCapacity(std::uint32_t) const { return Status::OK(); }
+  virtual std::unique_ptr<ExecutionState> CreateExecutionState() { return {}; }
+  // A failed bind must leave the previously bound state intact. Passing null
+  // restores the legacy state before the invocation's state object is destroyed.
+  virtual Status BindExecutionState(ExecutionState* state) {
+    return state ? Status::InvalidArgument("provider does not accept execution state") : Status::OK();
+  }
+  // Resolve the original submitted WRITE; never launch or replay it here.
+  // A confirmed result is retained until Runtime finalizes metadata and ACKs.
+  virtual Status ResolvePut(PutCompletion*) {
+    return Status::NotImplemented("provider cannot resolve pending Put completion");
+  }
+  virtual Status ResolvePut(PutExecutionConfig, PutCompletion* completion) {
+    return ResolvePut(completion);
+  }
+  virtual Status AcknowledgePut() { return Status::OK(); }
+  virtual Status Recover(PutExecutionConfig) {
+    return Status::NotImplemented("resource recovery requires execution dispatcher");
+  }
 
   // Legacy synchronous implementations require no completion action.
   virtual Status PreparePut(const BatchPutExecutionOptions&) { return Status::OK(); }
@@ -128,6 +154,11 @@ class DefaultAccessOperator final : public AccessOperator {
  public:
   explicit DefaultAccessOperator(AccessOperatorConfig config);
   ~DefaultAccessOperator() override;
+  std::unique_ptr<ExecutionResourceOwner> TakeResources() override;
+  std::unique_ptr<ExecutionState> CreateExecutionState() override;
+  Status BindExecutionState(ExecutionState*) override;
+  Status ResolvePut(PutCompletion*) override;
+  Status AcknowledgePut() override;
 
   DefaultAccessOperator(const DefaultAccessOperator&) = delete;
   DefaultAccessOperator& operator=(const DefaultAccessOperator&) = delete;
@@ -150,7 +181,11 @@ class DefaultAccessOperator final : public AccessOperator {
 
  private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  struct Resources;
+  Status ExecutePut(const BatchPutExecRequest&);
+  explicit DefaultAccessOperator(Impl* resources);
+  std::unique_ptr<Resources> owned_resources_;
+  Impl* impl_;
 };
 
 }  // namespace kvaf

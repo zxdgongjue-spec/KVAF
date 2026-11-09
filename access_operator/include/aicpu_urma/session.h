@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "acl/acl.h"
+#include "execution_resources.h"
 #include "peer_link.h"
 #include "aicpu_urma/control_abi.h"
 
@@ -27,6 +28,13 @@ class UmdkSession {
   // A failed launch/completion blocks reuse until Shutdown succeeds.
   Status Drain();
   Status ReleaseBuffers();
+  struct WriteState {
+    bool attempted{false};
+    PutCompletion completion;
+  };
+  void BindWriteState(WriteState* state) { write_ = state ? state : &legacy_write_; }
+  Status ResolveWrite(PutCompletion*);
+
   using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
   Status WriteDescriptors(std::uint64_t descriptors, std::uint32_t count, aclrtStream stream,
                           Launch);
@@ -44,6 +52,8 @@ class UmdkSession {
   aclrtStream pending_{nullptr};
   bool connected_{false}, failed_{false};
   std::vector<std::pair<std::uint64_t, std::size_t>> registered_buffers_;
+  WriteState legacy_write_;
+  WriteState* write_{&legacy_write_};
 };
 
 }  // namespace kvaf::aicpu_urma

@@ -294,15 +294,36 @@ ctest --test-dir build-verify --output-on-failure -j 4
 ```
 
 ACL 目录下应存在 `acl/acl.h`。这两项只启用额外 mock 测试，不代表正式 SDK 或设备验收。
-默认上述配置有 27 项 CTest，启用两项头文件测试后为 29 项；数量包含验收脚本自测和
-真实 Runtime CMake 编译参数检查。后者无需 CANN，覆盖完整构建及裁剪构建的能力宏。
+用 `ctest --test-dir build-verify -N` 查看当前构建实际启用的用例。它们包含验收脚本
+自测和真实 Runtime CMake 编译参数检查；后者无需 CANN，覆盖完整构建及裁剪构建的能力宏。
 
 重点测试可单独运行：
 
 ```bash
 ctest --test-dir build-verify --output-on-failure \
-  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_dispatcher_test|cache_region_service_test|execution_peer_recovery_test|runtime_cleanup_test|ubmem_hal_.*_test|ubmem_mapping_cache_test|aicpu_session_registry_test)'
+  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_.*_test|runtime_put_recovery_test|cache_region_service_test|runtime_cleanup_test|ubmem_hal_.*_test|ubmem_mapping_cache_test|aicpu_session_registry_test|aicpu_put_resolution_test|.*_provider_resources_test|aiv_.*_transport_close_test)'
 ```
+
+资源管理与在线 Put 恢复的回归：
+
+- `kvaf_execution_resource_manager_test`：所有权在初始化前移交、租约独占、Put/Get
+  首次初始化互不阻塞、容量拒绝、失败后保留 owner、状态解绑与销毁顺序、请求元数据副本。
+- `kvaf_runtime_put_recovery_test`：未知完成后成功提交或安全回滚、配置不匹配、元数据及
+  完成确认失败重试、提交异常、绑定失败；断言恢复不重复提交 WRITE，也不重复 Commit/Abort。
+- `kvaf_aiv_provider_resources_test`：使用实际 AIV Host provider 和替身设备接口检查
+  执行状态绑定、原次 status 校验、迟到完成、临时注册回收及资源关闭失败重试。
+- `kvaf_ubmem_provider_resources_test`：检查 stream/status 收集失败后保留执行状态、
+  恢复不重发、完整完成数量校验，以及旧报告不能让新调用误判成功。
+- `kvaf_aicpu_put_resolution_test`：多个 descriptor 由一次 WRITE 提交；检查原次序号
+  和设备结果、状态收集失败、WRITE 成功后注销失败的清理重试及结果保留。
+- `kvaf_aiv_get_transport_close_test` / `kvaf_aiv_put_transport_close_test`：逐阶段注入
+  Jetty、CQ、MR、token、设备内存、context 释放失败，检查重试不重复释放已完成部分，
+  且队列未关闭时不释放其依赖。
+
+故障通过便携替身注入，不在真机上故意破坏正在执行的 DMA。真机应重新运行第 3 节
+全量测试，覆盖 matrix、overlap、lifetime、resources、graph 和 lifecycle；保持同一
+CPU 服务进程再跑一轮，确认资源跨调用复用及池重建正常。此前 HAL 修复的真机通过
+结果不能代替本次资源管理重构后的验收。
 
 `kvaf_ubmem_hal_execution_test`、`kvaf_ubmem_hal_legacy_test` 和
 `kvaf_ubmem_hal_concurrent_test` 使用动态加载的替身 HAL，模拟用户态随卸载重置、

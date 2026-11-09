@@ -25,6 +25,15 @@ struct UmdkAccessOperator::Impl {
     valid_mode = config.batch_get_mode == "gather_read";
 #endif
   }
+  struct Invocation final : ExecutionState {
+    explicit Invocation(const Impl* value) : owner(value) {}
+    const Impl* owner;
+    PutCompletion put_completion;
+    aicpu_urma::UmdkSession::WriteState write;
+    std::unique_ptr<ExecutionState> get, push;
+  };
+  Invocation legacy{this};
+  Invocation* invocation{&legacy};
   bool valid_mode;
   aicpu_urma::UmdkSession get_session, put_session;
   aicpu_urma::BatchGetTransport get;
@@ -42,9 +51,46 @@ struct UmdkAccessOperator::Impl {
   void* warmup_buffer{nullptr};
   std::mutex get_mutex, put_mutex;
 };
+struct UmdkAccessOperator::Resources final : ExecutionResourceOwner {
+  explicit Resources(UmdkAccessOperatorConfig config) : state(std::make_unique<Impl>(std::move(config))) {}
+  ~Resources() override { if (!Close().ok()) (void)state.release(); }
+  Status Close() override { return UmdkAccessOperator(state.get()).Shutdown(); }
+  std::unique_ptr<Impl> state;
+};
+UmdkAccessOperator::UmdkAccessOperator(Impl* resources) : impl_(resources) {}
 UmdkAccessOperator::UmdkAccessOperator(UmdkAccessOperatorConfig config)
-    : impl_(std::make_unique<Impl>(std::move(config))) {}
-UmdkAccessOperator::~UmdkAccessOperator() { if (!Shutdown().ok()) (void)impl_.release(); }
+    : owned_resources_(std::make_unique<Resources>(std::move(config))),
+      impl_(owned_resources_->state.get()) {}
+UmdkAccessOperator::~UmdkAccessOperator() = default;
+std::unique_ptr<ExecutionResourceOwner> UmdkAccessOperator::TakeResources() {
+  return std::move(owned_resources_);
+}
+std::unique_ptr<ExecutionState> UmdkAccessOperator::CreateExecutionState() {
+  auto state = std::make_unique<Impl::Invocation>(impl_);
+  state->get = impl_->get.CreateExecutionState();
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) state->push = impl_->push->CreateExecutionState();
+#endif
+  return state;
+}
+Status UmdkAccessOperator::BindExecutionState(ExecutionState* state) {
+  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
+  if (!typed || typed->owner != impl_) return Status::InvalidArgument("AICPU execution state belongs to another resource");
+  auto bound = impl_->get.BindExecutionState(typed->get.get());
+  if (!bound.ok()) return bound;
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) {
+    bound = impl_->push->BindExecutionState(typed->push.get());
+    if (!bound.ok()) {
+      (void)impl_->get.BindExecutionState(impl_->invocation->get.get());
+      return bound;
+    }
+  }
+#endif
+  impl_->invocation = typed;
+  impl_->put_session.BindWriteState(&typed->write);
+  return Status::OK();
+}
 Status UmdkAccessOperator::Initialize(const RemoteRegionDesc& region) {
   if (!impl_->valid_mode) return Status::InvalidArgument("unknown AICPU BatchGet mode");
   if (impl_->initialized) return Status::InvalidState("AICPU operator already initialized");
@@ -131,6 +177,39 @@ Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return status;
 }
 Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  auto& call = *impl_->invocation;
+  call.put_completion = {};
+  call.write = {};
+  impl_->put_session.BindWriteState(&call.write);
+  auto result = ExecutePut(exec);
+  if (result.ok()) call.put_completion = {PutOutcome::Succeeded, result};
+  else if (!call.write.attempted) call.put_completion = {PutOutcome::Failed, result};
+  else call.put_completion.result = result;
+  return result;
+}
+Status UmdkAccessOperator::ResolvePut(PutCompletion* out) {
+  if (!out) return Status::InvalidArgument("null Put completion output");
+  std::lock_guard<std::mutex> lock(impl_->put_mutex);
+  auto& call = *impl_->invocation;
+  if (call.put_completion.outcome == PutOutcome::Unknown) {
+    auto status = impl_->put_session.ResolveWrite(&call.put_completion);
+    if (!status.ok()) return status;
+  }
+  *out = call.put_completion;
+  return Status::OK();
+}
+Status UmdkAccessOperator::AcknowledgePut() {
+  std::lock_guard<std::mutex> lock(impl_->put_mutex);
+  auto& call = *impl_->invocation;
+  if (call.put_completion.outcome == PutOutcome::Unknown)
+    return Status::CompletionUnknown("cannot acknowledge unresolved AICPU Put");
+  auto released = impl_->put_session.ReleaseBuffers();
+  if (!released.ok()) return released;
+  call.put_completion = {};
+  call.write = {};
+  return Status::OK();
+}
+Status UmdkAccessOperator::ExecutePut(const BatchPutExecRequest& exec) {
   std::lock_guard<std::mutex> lock(impl_->put_mutex);
   if (!impl_->initialized) return Status::NotInitialized("AICPU operator is not initialized");
   auto loaded = impl_->put_session.Load();

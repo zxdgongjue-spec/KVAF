@@ -99,6 +99,9 @@ class RuntimeCore {
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
   Status DrainGet();
+  // Resolve the already submitted Put, without replay or closing the Runtime.
+  Status RecoverPut(PutExecutionConfig);
+  bool HasPendingPut() const;
   Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*);
   Status EndGetGraph(std::uint64_t, void* stream, bool discard_result = false);
 
@@ -127,12 +130,19 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   Status DrainGetLocked();
+  Status FinalizePutLocked();
+  struct PendingPut {
+    PutContext transaction;
+    PutCompletion completion;
+    bool metadata_finalized{false};
+  };
   mutable std::shared_mutex lifecycle_mutex_;
   mutable std::mutex table_mutex_;
-  std::mutex put_mutex_, get_mutex_;
+  mutable std::mutex put_mutex_;
+  std::mutex get_mutex_;
   std::shared_ptr<AccessTableState> pending_get_table_;
   std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>> graph_tables_;
-  std::optional<PutContext> pending_put_;
+  std::optional<PendingPut> pending_put_;
   std::atomic<bool> initialized_{false};
   std::atomic<bool> needs_cleanup_{false};
   RemoteRegionDesc remote_region_;

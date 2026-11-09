@@ -147,6 +147,14 @@ add_executable(kvaf_execution_dispatcher_test execution_dispatcher_test.cc)
 target_link_libraries(kvaf_execution_dispatcher_test PRIVATE kvaf_runtime Threads::Threads)
 add_test(NAME kvaf_execution_dispatcher_test COMMAND kvaf_execution_dispatcher_test)
 set_tests_properties(kvaf_execution_dispatcher_test PROPERTIES TIMEOUT 20)
+add_executable(kvaf_execution_resource_manager_test execution_resource_manager_test.cc)
+target_link_libraries(kvaf_execution_resource_manager_test PRIVATE kvaf_runtime Threads::Threads)
+add_test(NAME kvaf_execution_resource_manager_test COMMAND kvaf_execution_resource_manager_test)
+set_tests_properties(kvaf_execution_resource_manager_test PROPERTIES TIMEOUT 20)
+add_executable(kvaf_runtime_put_recovery_test runtime_put_recovery_test.cc)
+target_link_libraries(kvaf_runtime_put_recovery_test PRIVATE kvaf_runtime Threads::Threads)
+add_test(NAME kvaf_runtime_put_recovery_test COMMAND kvaf_runtime_put_recovery_test)
+set_tests_properties(kvaf_runtime_put_recovery_test PROPERTIES TIMEOUT 20)
 if(KVAF_BUILD_PYTHON)
   add_test(NAME kvaf_execution_config_python
     COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_execution_config.py")
@@ -179,6 +187,59 @@ add_test(NAME kvaf_execution_peer_recovery_test COMMAND kvaf_execution_peer_reco
 set_tests_properties(kvaf_execution_peer_recovery_test PROPERTIES TIMEOUT 20)
 set(KVAF_TEST_ACL_INCLUDE_DIR "" CACHE PATH "ACL headers for host mapping lease tests")
 if(KVAF_TEST_ACL_INCLUDE_DIR)
+  foreach(direction get put)
+    add_executable(kvaf_aiv_${direction}_transport_close_test aiv_transport_close_test.cc)
+    target_include_directories(kvaf_aiv_${direction}_transport_close_test PRIVATE
+      ${KVAF_TEST_ACL_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/access_operator/include
+      ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_${direction}/include)
+    target_link_libraries(kvaf_aiv_${direction}_transport_close_test PRIVATE kvaf_common Threads::Threads)
+    add_test(NAME kvaf_aiv_${direction}_transport_close_test COMMAND kvaf_aiv_${direction}_transport_close_test)
+    set_tests_properties(kvaf_aiv_${direction}_transport_close_test PROPERTIES TIMEOUT 20)
+  endforeach()
+  target_compile_definitions(kvaf_aiv_put_transport_close_test PRIVATE KVAF_TEST_CLOSE_PUT=1)
+  add_executable(kvaf_aicpu_put_resolution_test aicpu_put_resolution_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/host/session.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_put/host/batch_put_host.cc)
+  target_include_directories(kvaf_aicpu_put_resolution_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/access_operator/demo)
+  add_test(NAME kvaf_aicpu_put_resolution_test COMMAND kvaf_aicpu_put_resolution_test)
+  set_tests_properties(kvaf_aicpu_put_resolution_test PROPERTIES TIMEOUT 20)
+  add_executable(kvaf_ubmem_provider_resources_test ubmem_provider_resources_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/ubmem/access_operator.cc)
+  target_include_directories(kvaf_ubmem_provider_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR})
+  # Older host-test headers lack this production ACL launch attribute. Only the
+  # fake launch entry is used here; never substitute fields in a hardware build.
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_INCLUDES "${KVAF_TEST_ACL_INCLUDE_DIR}")
+  check_cxx_source_compiles("#include <acl/acl.h>
+    int main() { aclrtLaunchKernelAttr a{};
+      a.id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE; a.value.dynUBufSize = 0; }"
+    KVAF_TEST_ACL_HAS_DYN_UBUF_SIZE)
+  cmake_pop_check_state()
+  if(NOT KVAF_TEST_ACL_HAS_DYN_UBUF_SIZE)
+    target_compile_definitions(kvaf_ubmem_provider_resources_test PRIVATE
+      ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE=ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE
+      dynUBufSize=localMemorySize)
+  endif()
+  add_test(NAME kvaf_ubmem_provider_resources_test COMMAND kvaf_ubmem_provider_resources_test)
+  set_tests_properties(kvaf_ubmem_provider_resources_test PROPERTIES TIMEOUT 20)
+  add_executable(kvaf_aiv_provider_resources_test aiv_provider_resources_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc)
+  target_compile_definitions(kvaf_aiv_provider_resources_test PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
+  target_include_directories(kvaf_aiv_provider_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include)
+  foreach(provider_test kvaf_aicpu_put_resolution_test kvaf_ubmem_provider_resources_test
+                        kvaf_aiv_provider_resources_test)
+    target_include_directories(${provider_test} PRIVATE
+      ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/meta_manager/include
+      ${PROJECT_SOURCE_DIR}/runtime/include)
+    target_link_libraries(${provider_test} PRIVATE kvaf_common Threads::Threads)
+  endforeach()
+  add_test(NAME kvaf_aiv_provider_resources_test COMMAND kvaf_aiv_provider_resources_test)
+  set_tests_properties(kvaf_aiv_provider_resources_test PROPERTIES TIMEOUT 20)
   add_executable(kvaf_ubmem_mapping_cache_test ubmem_mapping_cache_test.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/ubmem/device_mapping.cc)
   target_include_directories(kvaf_ubmem_mapping_cache_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}

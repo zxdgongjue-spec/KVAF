@@ -5,12 +5,11 @@
 #include <shared_mutex>
 #include <vector>
 #include "access_operator.h"
+#include "execution_context.h"
 
 namespace kvaf {
-// Transitional provider adapter: each factory creates one direction's owner.
-// Providers must keep all mutable queues/workspaces inside that instance. Never
-// return two wrappers around one mutable session. A future typed resource view
-// can replace this adapter without changing per-call execution configuration.
+// Policy and direction scheduling. ResourceManager owns sessions/workspaces;
+// execution contexts retain typed exclusive leases until actual completion.
 class ExecutionDispatcher final : public AccessOperator {
  public:
   using Factory = std::function<std::unique_ptr<AccessOperator>()>;
@@ -30,22 +29,12 @@ class ExecutionDispatcher final : public AccessOperator {
   Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
   Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*) override;
   Status EndGetGraph(std::uint64_t, void*, bool) override;
-  Status Recover(PutExecutionConfig);
+  Status Recover(PutExecutionConfig) override;
   Status Recover(GetExecutionConfig);
+  Status ResolvePut(PutExecutionConfig, PutCompletion*) override;
+  Status AcknowledgePut() override;
   const ExecutionPolicy& policy() const { return policy_; }
  private:
-  template<class Config> struct Resource {
-    Config config;
-    Factory factory;
-    std::unique_ptr<AccessOperator> owner;
-    // A failed creation is not retried implicitly. Recover/Shutdown must confirm
-    // cleanup (including remote producers) before replacing its owner.
-    Status failure;
-    bool ready{false};
-  };
-  template<class Config> Status Acquire(std::vector<Resource<Config>>&, Config, AccessOperator**);
-  template <class Config>
-  Status RecoverResource(std::vector<Resource<Config>>&, Config);
   Status DrainGetLocked();
   ExecutionPolicy policy_;
   Status policy_status_;
@@ -53,13 +42,11 @@ class ExecutionDispatcher final : public AccessOperator {
   bool ready_{false};
   mutable std::shared_mutex lifecycle_;
   std::mutex put_mutex_, get_mutex_;
-  std::vector<Resource<PutExecutionConfig>> puts_;
-  std::vector<Resource<GetExecutionConfig>> gets_;
-  AccessOperator* pending_get_{nullptr};
-  bool put_failed_{false};
+  ExecutionResourceManager resources_;
+  std::unique_ptr<PutExecutionContext> pending_put_;
+  std::unique_ptr<GetExecutionContext> pending_get_;
   std::uint64_t graph_id_{0}, next_graph_id_{1};
-  AccessOperator* graph_owner_{nullptr};
-  GetExecutionConfig graph_config_{};
+  std::unique_ptr<GetExecutionContext> graph_context_;
   bool graph_captured_{false};
 };
 }  // namespace kvaf

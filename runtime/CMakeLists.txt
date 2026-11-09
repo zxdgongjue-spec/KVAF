@@ -12,6 +12,7 @@ add_library(kvaf_runtime
   src/cache_region_service.cc
   src/execution_config.cc
   src/execution_dispatcher.cc
+  src/execution_resource_manager.cc
   src/runtime.cc
   src/runtime_service.cc
   src/npu_runtime_config.cc

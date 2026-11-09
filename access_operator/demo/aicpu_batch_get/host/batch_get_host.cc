@@ -26,12 +26,19 @@ struct BatchGetTransport::Impl {
   void* status_host{nullptr};
   void* profile_device{nullptr};
   void* profile_host{nullptr};
-  aclrtStream pending{nullptr};
+  struct Invocation final : ExecutionState {
+    explicit Invocation(const Impl* value) : owner(value) {}
+    const Impl* owner;
+    aclrtStream pending{};
+    std::uint64_t sequence{};
+  };
+  Invocation legacy{this};
+  Invocation* invocation{&legacy};
   std::uint64_t sequence{0U};
   bool initialized{false}, cpu_enabled{false};
   Status Drain(const char* stage = "drain") {
-    if (!pending) return Status::OK();
-    const auto result = aclrtSynchronizeStream(pending);
+    if (!invocation->pending) return Status::OK();
+    const auto result = aclrtSynchronizeStream(invocation->pending);
     if (result != ACL_SUCCESS) {
       const char* detail = aclGetRecentErrMsg();
       return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
@@ -45,10 +52,10 @@ struct BatchGetTransport::Impl {
       return Internal("GatherRead completion status unavailable; buffers retained");
     const auto* reports = static_cast<const GatherReadStatus*>(status_host);
     for (unsigned worker = 0; worker < session.config().workers; ++worker)
-      if (reports[worker].magic != kGatherStatusMagic || reports[worker].sequence != sequence ||
+      if (reports[worker].magic != kGatherStatusMagic || reports[worker].sequence != invocation->sequence ||
           reports[worker].result != 0)
         return Internal("GatherRead worker failed; session retained for recovery");
-    pending = nullptr;
+    invocation->pending = nullptr;
     return Status::OK();
   }
 };
@@ -56,6 +63,15 @@ BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_b
                                      bool direct_addresses)
     : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses)) {}
 BatchGetTransport::~BatchGetTransport() = default;
+std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
+  return std::make_unique<Impl::Invocation>(impl_.get());
+}
+Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
+  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
+  if (!typed || typed->owner != impl_.get()) return Status::InvalidArgument("Get invocation belongs to another resource");
+  impl_->invocation = typed;
+  return Status::OK();
+}
 Status BatchGetTransport::Drain() { return impl_->Drain(); }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
@@ -182,7 +198,8 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   args.worker_count = impl_->session.config().workers;
   args.profile = profile ? PointerValue(impl_->profile_device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  impl_->pending = stream;
+  impl_->invocation->pending = stream;
+  impl_->invocation->sequence = impl_->sequence;
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchBatchGet(&launch, stream)) return Internal("UMDK BatchGet launch failed");

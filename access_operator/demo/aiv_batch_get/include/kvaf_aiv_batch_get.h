@@ -23,6 +23,8 @@ typedef struct KvafBatchGetLocalBuffer KvafBatchGetLocalBuffer;
 
 // Transport owns only the reusable peer-EID paths and remote DDR registrations.
 // It deliberately accepts no caller-owned HBM buffer.
+// On creation failure, a non-null *transport owns partially initialized
+// resources whose cleanup failed. Retain it and retry TransportClose.
 int32_t KvafBatchGetTransportCreateWithPeerLink(
     void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
     uint32_t jettys_per_core, void *peer_link,
@@ -37,12 +39,20 @@ int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     uint32_t jettys_per_core, void *peer_link,
     const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
     KvafBatchGetTransport **transport);
+// Caller must stop submitting work and synchronize kernel streams first.
+// SUCCESS destroys transport. Failure keeps its handles for Close retry; no
+// further acquisitions/launches are allowed after a close attempt.
+int32_t KvafBatchGetTransportClose(KvafBatchGetTransport *transport);
+// Compatibility wrapper: retain on failure, with no status/retry guarantee.
 void KvafBatchGetTransportDestroy(KvafBatchGetTransport *transport);
 
 // Acquire registers/caches one caller-owned HBM output range. Re-acquiring
 // the exact (address, bytes) pair returns the same local-buffer handle and
 // entity table while adding one reference. The returned entity is passed in
 // every kernel launch that uses this output.
+// On error, a non-null *local_buffer retains a partially created registration.
+// Keep the caller's HBM alive until LocalBufferRetire or TransportClose succeeds;
+// the partial handle must not be submitted or released into the reusable cache.
 int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transport,
                                        void *output_hbm, uint64_t output_hbm_bytes,
                                        KvafBatchGetLocalBuffer **local_buffer,

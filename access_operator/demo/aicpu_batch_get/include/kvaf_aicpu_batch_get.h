@@ -15,6 +15,8 @@ class BatchGetTransport {
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
   Status Drain();
+  std::unique_ptr<ExecutionState> CreateExecutionState();
+  Status BindExecutionState(ExecutionState*);
   Status Warmup();
   // Release after the shared session has unregistered its HBM buffers.
   Status Shutdown();

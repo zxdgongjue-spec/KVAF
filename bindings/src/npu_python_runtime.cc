@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -373,15 +374,30 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
+    // Allocate Python ownership before submission. Moving this reference after
+    // an uncertain DMA result must not need another allocation.
+    py::object refs = py::make_tuple(source, stream);
     Status status;
+    std::exception_ptr failure;
+    bool pending_before = false, pending_after = false;
     std::unique_lock<std::mutex> direction(put_mutex_, std::defer_lock);
     {
       py::gil_scoped_release release;
       direction.lock();
+      pending_before = native_->core().HasPendingPut();
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
-      else status = native_->core().BatchPut(batch_put_request, BatchPutExecutionOptions{acl_stream, execution});
+      else {
+        try {
+          status = native_->core().BatchPut(batch_put_request, BatchPutExecutionOptions{acl_stream, execution});
+        } catch (...) {
+          failure = std::current_exception();
+        }
+      }
+      pending_after = native_->core().HasPendingPut();
     }
-    if (!status.ok() && native_->per_call_execution()) pending_put_refs_.push_back(source);
+    if (!pending_before && pending_after)
+      pending_put_ref_ = std::move(refs);
+    if (failure) std::rethrow_exception(failure);
     ThrowIfError(status);
   }
 
@@ -645,6 +661,19 @@ class NpuPythonRuntime final {
     {
       py::gil_scoped_release release;
       lock.lock();
+    }
+    // Keep the output alive before registration, including a failed graph
+    // preparation whose cleanup must be retried by DrainGet/Shutdown. Reserve
+    // the graph map node now as well: publishing a native lease must not be
+    // followed by an allocation that could lose its Python ownership entry.
+    graph_refs_.reserve(graph_refs_.size() + 1);
+    std::vector<py::object> graph_refs;
+    graph_refs.push_back(refs);
+    auto reserved = graph_refs_.emplace(0, std::move(graph_refs));
+    auto graph_node = graph_refs_.extract(reserved.first);
+    pending_get_refs_.push_back(std::move(refs));
+    {
+      py::gil_scoped_release release;
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
         status = Status::Internal("aclrtSetDevice failed");
       else
@@ -652,8 +681,9 @@ class NpuPythonRuntime final {
             config, {{view.data, view.bytes, DeviceKind::kNpu}, native_stream, capacity}, &id);
     }
     if (status.ok()) {
+      graph_node.key() = id;
+      graph_refs_.insert(std::move(graph_node));
       pending_get_refs_.clear();
-      graph_refs_[id].push_back(std::move(refs));
     }
     ThrowIfError(status);
     return id;
@@ -674,9 +704,19 @@ class NpuPythonRuntime final {
     ThrowIfError(status);
   }
   void RecoverPut(PutExecutionConfig c) {
-    py::gil_scoped_release release;
-    std::lock_guard<std::mutex> lock(put_mutex_);
-    ThrowIfError(native_->Recover(c));
+    Status status;
+    bool pending = true;
+    std::unique_lock<std::mutex> lock(put_mutex_, std::defer_lock);
+    {
+      py::gil_scoped_release release;
+      lock.lock();
+      status = native_->Recover(c);
+      pending = native_->core().HasPendingPut();
+    }
+    // A safely aborted Put returns its original error, but no DMA owns the
+    // Tensor or stream anymore. Unknown completion must retain both objects.
+    if (!pending) pending_put_ref_ = py::object{};
+    ThrowIfError(status);
   }
   void RecoverGet(GetExecutionConfig c) {
     py::gil_scoped_release release;
@@ -704,7 +744,7 @@ class NpuPythonRuntime final {
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else status = native_->Shutdown();
     }
-    if (status.ok()) { pending_get_refs_.clear(); pending_put_refs_.clear(); }
+    if (status.ok()) { pending_get_refs_.clear(); pending_put_ref_ = py::object{}; }
     ThrowIfError(status);
   }
   ~NpuPythonRuntime() {
@@ -713,7 +753,7 @@ class NpuPythonRuntime final {
     if (!native_->Shutdown().ok()) {
       // Preserve Python storage as well as native DMA owners on failed cleanup.
       for (auto& ref : pending_get_refs_) (void)ref.release();
-      for (auto& ref : pending_put_refs_) (void)ref.release();
+      (void)pending_put_ref_.release();
       for (auto& entry : graph_refs_)
         for (auto& ref : entry.second) (void)ref.release();
       (void)native_.release();
@@ -724,7 +764,8 @@ class NpuPythonRuntime final {
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   bool aicpu_backend_{false};
   std::mutex get_mutex_, put_mutex_;
-  std::vector<py::object> pending_get_refs_, pending_put_refs_;
+  std::vector<py::object> pending_get_refs_;
+  py::object pending_put_ref_;
   std::unordered_map<std::uint64_t, std::vector<py::object>> graph_refs_;
 };
 

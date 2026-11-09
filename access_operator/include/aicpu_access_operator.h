@@ -18,6 +18,11 @@ class UmdkAccessOperator final : public AccessOperator {
  public:
   explicit UmdkAccessOperator(UmdkAccessOperatorConfig config);
   ~UmdkAccessOperator() override;
+  std::unique_ptr<ExecutionResourceOwner> TakeResources() override;
+  std::unique_ptr<ExecutionState> CreateExecutionState() override;
+  Status BindExecutionState(ExecutionState*) override;
+  Status ResolvePut(PutCompletion*) override;
+  Status AcknowledgePut() override;
   Status Initialize(const RemoteRegionDesc&) override;
   Status Shutdown() override;
   Status DrainGet() override;
@@ -27,6 +32,10 @@ class UmdkAccessOperator final : public AccessOperator {
 
  private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  struct Resources;
+  Status ExecutePut(const BatchPutExecRequest&);
+  explicit UmdkAccessOperator(Impl* resources);
+  std::unique_ptr<Resources> owned_resources_;
+  Impl* impl_;
 };
 }  // namespace kvaf

@@ -20,6 +20,11 @@ class AccessOperator final : public kvaf::AccessOperator {
  public:
   explicit AccessOperator(OperatorOptions options);
   ~AccessOperator() override;
+  std::unique_ptr<ExecutionResourceOwner> TakeResources() override;
+  std::unique_ptr<ExecutionState> CreateExecutionState() override;
+  Status BindExecutionState(ExecutionState*) override;
+  Status ResolvePut(PutCompletion*) override;
+  Status AcknowledgePut() override;
   Status Initialize(const RemoteRegionDesc& region) override;
   Status Shutdown() override;
   Status DrainGet() override;
@@ -32,6 +37,10 @@ class AccessOperator final : public kvaf::AccessOperator {
   Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const;
  private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  struct Resources;
+  Status ExecutePut(const BatchPutExecRequest&);
+  explicit AccessOperator(Impl* resources);
+  std::unique_ptr<Resources> owned_resources_;
+  Impl* impl_;
 };
 }  // namespace kvaf::ubmem

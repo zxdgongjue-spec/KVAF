@@ -17,7 +17,10 @@
 | UBMEM 映射 | Runtime 内按设备、Fabric handle 和映射长度共享；最后一个引用关闭，失败保留并阻止复用 |
 | CPU HAL/SVM | 首次使用时加载，按库路径在进程内共享，跨池及 CPU Runtime 重建保留；池内存与映射仍各自释放 |
 | 生命周期 | Put / Get 分别串行、跨方向独立；AccessTable 失效后仍由在途请求或 graph 保留槽位引用 |
+| 资源管理 | 独立 `ExecutionResourceManager`，Put/Get 类型化租约与视图；provider 转交物理资源所有权，算子只借用 |
+| 单次执行 | 独立 Put/Get `ExecutionContext`，持有请求副本、租约及 provider 执行状态，完成后归还 |
 | 恢复协议 | 能力协商、服务端 epoch、幂等创建和控制 ID、查询、可重试关闭、显式 `recover` |
+| Put 在线恢复 | 查询原次 WRITE 的完成结果；成功提交、确定失败回滚、未知继续保留，不重放数据搬运 |
 | 资源预算 | 各配置独立 cores / Jetty / in-flight / 请求容量 / CPU Gather 线程数 / kernel 路径 |
 | 预热 | 按容量建链、准备内部 buffer、Gather worker、Put metadata；可指定实际调用 stream |
 | Graph | URMA / UBMEM AIV Direct Get 的显式租约，固定输出、提前准备、独占 Get 域、保留 Tensor 和表引用 |
@@ -27,7 +30,7 @@
 硬件上的交叉组合、并发性能和跨 transport 可见性已验收**。AIV Gather / Scatter
 合入后才能补齐设计中的 18 对组合。
 
-CPU Pull / HBM Pull 属于设计的可选扩展，本次 main 没有相应集成，未额外引入参考分支。
+CPU Pull / HBM Pull 的独立模块尚未合入本分支，按当前约定暂不接入，未额外引入参考分支。
 启动带宽自动调优保留在旧入口；请求级入口按已选路由延迟建链，不执行初始化写入探测，
 不自动切换后端或路由。
 
@@ -60,10 +63,61 @@ CPU 的请求级与旧 UBMEM 分配入口统一通过 `AcquireProcessHal` 获取
 重新启动；仅更新二进制或重启 NPU 客户端无法恢复原 CPU 进程。
 
 Put 不排空 Get。异步 Get 的 `drain_get()` 等待完整数据面并收集设备结果。未确认完成
-的 Put 保留事务和输入引用，需要成功 `shutdown()` 后才能清理；不能用 `recover`
-绕过未决写入事务。资源准备失败可以显式 `recover(execution)`，它不改变配置。
+的 Put 保留事务和输入引用，可通过 `recover(原 Put 配置)` 查询原次执行并完成事务；
+若仍无法证明 DMA 完成，恢复继续失败并保留所有权。资源准备失败也可显式
+`recover(execution)`，它不改变配置。
 跨 transport 的可见性依赖已完成的 WRITE / MTE 和目标平台一致性契约，控制面 CPU
 fence 不冒充数据面完成。
+
+## 资源租约与执行上下文
+
+`ExecutionResourceManager` 独立于 Dispatcher 保存两个方向的资源记录。每条记录拥有
+`ExecutionResourceOwner`；`SessionAccessOperator` 及 AIV、AICPU、UBMEM 算子只借用
+对应的具体资源对象。兼容的旧调用者仍可在算子内持有 owner，但请求级入口在初始化
+前通过 `TakeResources()` 将所有权转移给管理器。
+
+管理器按本 Runtime 的固定 Region、执行配置和不可变创建参数复用资源；设备、EID、
+对端、ABI、资源预算及容量固定在创建器中，不跨 Runtime / Region 代次复用。
+Acquire 校验请求容量。Put/Get 分别使用 `PutResourceLease` / `GetResourceLease` 和
+对应视图；视图不暴露另一方向的操作。具体 provider 对执行状态类型及 owner 身份
+再次校验。当前继续保留 `AccessOperator` 适配门面，未把所有后端重写成设计示意中的
+独立 `Launch(invocation, concrete_view, context)` 类接口。
+
+首次 Acquire 只初始化该记录，其他方向可独立初始化。初始化失败会缓存失败状态，
+必须显式恢复；清理失败不会替换旧 owner。已有租约时直接 Acquire 返回 Busy，正常
+请求由 Dispatcher 的方向锁和 Drain 协调。预热归还租约后保留资源，未完成操作和
+graph 则持续占有租约。
+
+| 状态 | 持有位置 |
+|---|---|
+| 通信会话、队列、注册、工作区、物理 status/event 槽位、持久序号 | 资源 owner，跨调用复用 |
+| 本次请求和 Put 地址描述副本、配置、stream、完成结果、pending / graph 状态 | ExecutionContext 及其 provider ExecutionState |
+| Put 元数据事务、AccessTable 及槽位 pin | RuntimeCore，随执行完成或事务恢复释放 |
+| Python Tensor / stream 强引用 | Python Runtime，安全完成或恢复前保留 |
+
+普通 Get 完成后归还租约；Put 还需等待 Commit/Abort 和完成确认。关闭在状态仍绑定时
+先调用 owner 清理，再解绑并销毁执行状态，最后归还租约和销毁资源。关闭失败保留
+完整依赖，允许重试；AIV transport 的关闭错误也会向上传递，不再被 void 析构接口吞掉。
+
+## Put 恢复语义
+
+`runtime.recover(put_config)` 不重新提交 BatchPut。它只解析原次 AIV status、AICPU
+WRITE 序号对应的结果或 UBMEM stream / status：
+
+| 确认结果 | 元数据处理 | 调用结果 |
+|---|---|---|
+| Succeeded | CommitPut，确认完成后释放执行状态和输入引用 | 成功 |
+| Failed，且确认不会再访问原 buffer | AbortPut，确认完成后释放执行状态和输入引用 | 返回原次失败 |
+| Unknown | 保留原事务、buffer、注册、会话和租约 | CompletionUnknown 或底层完成检查错误，之后仍可恢复 |
+
+必须使用原次 Put 的实际配置。元数据提交/回滚失败可以重试；元数据已经完成而确认
+失败时，重试只做确认，不重复 Commit/Abort，也不再次提交 WRITE。Python 即使在
+安全回滚后收到原次异常，也会释放已不再使用的输入引用。
+
+AIV/AICPU 的远端 WR 错误或 CQ 超时不直接等同于安全失败，无法证明远端访问结束时
+仍保留 Unknown；不能通过忽略错误、重建队列或重放 Put 来消除未决事务。没有未决
+事务时，`recover` 才执行该配置资源的关闭和重建。`shutdown()` 仍可在确认数据面已
+停止后回滚尚未提交的事务并清理整个 Runtime。
 
 ## Python 配置和预热
 
@@ -154,8 +208,9 @@ Region/session 状态机、epoch/重复 ID、截断协议、真实 TCP 回复丢
 模型在不同规范/注册基址下的 payload、AICPU transfer 地址转换、输入边界及共享映射关闭失败。
 可通过 `KVAF_TEST_URMA_INCLUDE_DIR` 和 `KVAF_TEST_ACL_INCLUDE_DIR` 启用无需设备库的
 设备注册表及 ACL 映射 mock 测试。CPU 服务以 `KVAF_CPU_ENABLE_URMA=OFF` 完成便携构建。
-本轮启用上述两个 mock 测试选项及 Python 绑定，24 项 CTest 分组运行通过；TCP 测试
-需要允许本机回环监听。`git diff --check` 通过。
+新增便携回归覆盖独立 owner、类型化租约、同资源并发首次获取、执行状态保留、
+原次 Put 的完成恢复、元数据及确认失败重试和不重复提交。TCP 测试需要允许本机
+回环监听；测试名称及命令见验证文档。
 
 本机没有 Ascend 设备或正式 CANN 编译环境；NPU Host、AICPU 与 CPU URMA 源码使用
 本地 SDK stub 进行语法检查。目标环境仍须完成正式 SDK 编译、新 kernel 部署、真实

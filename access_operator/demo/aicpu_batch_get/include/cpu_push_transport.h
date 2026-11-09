@@ -19,6 +19,8 @@ class CpuPushTransport {
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
   Status Drain();
+  std::unique_ptr<ExecutionState> CreateExecutionState();
+  Status BindExecutionState(ExecutionState*);
   Status Shutdown();
  private:
   struct Impl;
