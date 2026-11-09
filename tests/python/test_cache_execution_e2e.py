@@ -72,6 +72,21 @@ def expect_error(operation, exception, pattern):
         raise AssertionError(f"operation unexpectedly succeeded; expected {pattern!r}")
 
 
+def check_missing_keys(runtime, keys):
+    # LockKeys rejects missing keys instead of returning valid=0 entries.
+    # Check each key: a batch lookup stops at the first miss and could conceal
+    # a partial commit later in the rejected Put.
+    for key in keys:
+        try:
+            table = runtime.prepare_access_table([key])
+        except KeyError as error:
+            check("LockKeys key was not found" in str(error),
+                  f"unexpected lookup failure for key {key}: {error}")
+        else:
+            runtime.release_access_table(table)
+            raise AssertionError(f"rejected Put committed key {key}")
+
+
 def layout(rows, tokens_per_block, token_bytes, active, epoch=0, capacity=None):
     """Inactive suffix is deliberately invalid; it must never be consumed."""
     count = rows if capacity is None else capacity
@@ -358,12 +373,7 @@ class Suite:
                         _, source = self.source(self.a.rows + 1, 41)
                         keys = list(range(2 * self.a.rows, 3 * self.a.rows + 1))
                         expect_error(lambda: self.put(r, keys, source), ValueError, "capacity")
-                        absent = self.runtime.prepare_access_table(keys)
-                        try:
-                            check(not any(self.runtime.access_table_view(absent)["valid"]),
-                                  "rejected Put committed keys")
-                        finally:
-                            self.runtime.release_access_table(absent)
+                        check_missing_keys(self.runtime, keys)
                         expect_error(lambda: self.put(r, data.keys, data.source), ValueError,
                                      "already exists|pending")
                     # Explicitly rebuild a healthy provider and verify existing pool contents.

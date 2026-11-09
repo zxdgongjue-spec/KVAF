@@ -16,6 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import kvaf
 
 from backend import TorchBackend, detect_torch_backend, test_payload
+from test_cache_execution_e2e import check_missing_keys
 
 
 def dsa_key(pool_row: int, layer: int, block_q: int) -> int:
@@ -105,6 +106,9 @@ class RuntimeMockTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.batch_put([dsa_key(0, 0, 0)], [self.payload([170])])
 
+        # The hardware acceptance runner must use the native NotFound contract.
+        check_missing_keys(self.kvaf, [dsa_key(0, 0, 0), dsa_key(0, 0, 1)])
+
         # Runtime must invoke AbortPut, otherwise this would be kAlreadyExists.
         self.batch_put([dsa_key(0, 0, 0)], [self.payload([187])])
         table = self.kvaf.prepare_access_table([dsa_key(0, 0, 0)])
@@ -112,6 +116,16 @@ class RuntimeMockTests(unittest.TestCase):
         self.kvaf.batch_get(table, [0], [0], 1, [0], output, output_block_bytes=4)
         self.assertEqual(output, bytes.fromhex("bb000000"))
         self.kvaf.release_access_table(table)
+
+    def test_acceptance_missing_key_check_rejects_partial_commit(self) -> None:
+        self.kvaf.initialize(ddr_bytes=192, slot_size=64)
+        self.batch_put([1], [self.payload([187])])
+        # A single lookup of [0, 1, 2] would stop at missing key 0 and miss key 1.
+        with self.assertRaisesRegex(AssertionError, "rejected Put committed key 1"):
+            check_missing_keys(self.kvaf, [0, 1, 2])
+        # The unexpected table must not leave a stable-read pin behind.
+        self.kvaf.batch_free([1])
+        check_missing_keys(self.kvaf, [0, 1, 2])
 
     def test_get_failure_preserves_lifecycle_and_invalid_index_is_rejected(self) -> None:
         self.kvaf.initialize(ddr_bytes=128, slot_size=64)

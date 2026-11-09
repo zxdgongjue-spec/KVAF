@@ -8,7 +8,7 @@
 - 真机验收：[run_cache_execution_e2e.sh](../tests/run_cache_execution_e2e.sh)，调用
   [test_cache_execution_e2e.py](../tests/python/test_cache_execution_e2e.py)。
 - 便携回归：CTest；其中 `kvaf_cache_execution_harness_python` 检查验收脚本的
-  字节比较、测试计划、失败报告、参数透传及清理顺序，不访问设备。
+  字节比较、测试计划、失败报告、参数透传、逐 key 缺失断言及清理顺序，不访问设备。
 - 旧 `run_remote_cpu_e2e.sh` 主要验证旧 AIV 入口，不覆盖本次新增框架。
 
 真机脚本显式启用 `per_call_execution` 并设置默认配置、enabled 集合和各 provider
@@ -147,6 +147,10 @@ addresses、lengths、valid 不变。这样能发现切换注册或后端时更�
 profiler 检查读写 stream 时间线，且不能把 Host 调用耗时重叠当作 DMA 重叠。
 
 `resources` 在真机上测试的是正常会话的显式关闭/重建，不人为破坏网络或设备。
+超容量 Put 被拒绝后，对每个候选 key 单独调用 `prepare_access_table([key])`，
+要求得到 `KeyError: 'LockKeys key was not found'`。不存在的 key 不会生成 `valid=0`
+表项；也不能只检查整批查询失败，因为查询在首个缺失 key 处停止，可能掩盖后续 key
+被部分提交的问题。
 创建回复丢失、部分初始化、MR/unmap 清理失败、未决 Put 等故障由下节可控注入测试覆盖；
 本脚本 PASS 不代表这些故障已在真实设备上注入。关闭成功也不能单独证明无驱动级资源泄漏，
 长期循环还需观察服务进程、设备和驱动资源计数。
@@ -179,6 +183,11 @@ KVAF_EXECUTION_SUMMARY PASS report=/absolute/path/to/validation-full.json
   此选项为 ON，也因 `kvaf_npu_runtime` 缺少同名编译宏而误报；更新本分支并重新
   执行 `./build.sh npu`。这是 NPU 本地能力检查，与 CPU 地址、端口无关。
 - 初始化/首调失败：CPU 地址与版本、UB/EID 路由、Fabric 能力及 kernel 安装。
+- 旧脚本在 `resources` 案例的 `absent = ...prepare_access_table(keys)` 处报
+  `KeyError: 'LockKeys key was not found'`：这是脚本把正常的缺失 key 当成失败。
+  更新本分支的测试脚本即可，无需重新构建 CPU/NPU；先用
+  `--modes urma --cases resources` 复验，再跑完整用例。修正版会逐 key 验证该异常，
+  若某个 key 意外可读，则报 `rejected Put committed key ...`，此时应排查 Put 提交路径。
 - payload mismatch：报告给出第一个错误字节，结合 case 的 Put/Get 组合定位数据路径。
 - Busy / shutdown 失败：先保留日志和状态；正常失败会尝试安全关闭，关闭未确认时不能声称资源已释放。
 - 客户端被强制终止：确认没有其他客户端使用该测试 CPU 服务后，由操作者检查并重启测试服务，

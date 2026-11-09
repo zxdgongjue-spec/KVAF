@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import test_cache_execution_e2e as e2e
 
@@ -67,6 +67,34 @@ class HarnessTests(unittest.TestCase):
             e2e.expect_error(failure, ValueError, "graph")
         with self.assertRaises(AssertionError):
             e2e.expect_error(lambda: None, ValueError, "capacity")
+
+    def test_rejected_put_checks_every_key_for_not_found(self):
+        runtime = Mock()
+        runtime.prepare_access_table.side_effect = KeyError("LockKeys key was not found")
+        e2e.check_missing_keys(runtime, [64, 65, 66])
+        self.assertEqual(runtime.prepare_access_table.call_args_list,
+                         [call([64]), call([65]), call([66])])
+        runtime.release_access_table.assert_not_called()
+
+    def test_rejected_put_detects_partial_commit_and_releases_probe_table(self):
+        runtime = Mock()
+        runtime.prepare_access_table.side_effect = [
+            KeyError("LockKeys key was not found"), "committed-key-table"]
+        with self.assertRaisesRegex(AssertionError, "rejected Put committed key 65"):
+            e2e.check_missing_keys(runtime, [64, 65, 66])
+        runtime.release_access_table.assert_called_once_with("committed-key-table")
+
+    def test_missing_key_check_does_not_accept_unrelated_failures(self):
+        for error, expected in (
+            (KeyError("AccessTable was not found"), AssertionError),
+            (RuntimeError("Runtime has not been initialized"), RuntimeError),
+        ):
+            with self.subTest(error=error):
+                runtime = Mock()
+                runtime.prepare_access_table.side_effect = error
+                with self.assertRaises(expected):
+                    e2e.check_missing_keys(runtime, [64])
+                runtime.release_access_table.assert_not_called()
 
     def test_report_records_failures_without_swallowing_them(self):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(StringIO()):
