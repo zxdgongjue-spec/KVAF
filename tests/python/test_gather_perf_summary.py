@@ -66,13 +66,15 @@ class GatherPerfSummaryTest(unittest.TestCase):
             perf.validate_config(2)
             self.assertEqual(self.csv_metadata()["configured_prepare_ahead"], 1)
             self.assertEqual(self.csv_metadata()["configured_cooperative_chunks"], 0)
-        for chunks in ("2", "4", "8"):
+        for chunks in ("2", "4", "8", "16", "32"):
             with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": chunks,
                                         "KVAF_AIV_GATHER_PREPARE_AHEAD": ""}):
                 perf.validate_config(2)
                 self.assertEqual(self.csv_metadata()["configured_prepare_ahead"], 1)
                 self.assertEqual(self.csv_metadata()["configured_cooperative_chunks"], int(chunks))
         for name, value in (("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "3"),
+                            ("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "33"),
+                            ("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "64"),
                             ("KVAF_AIV_GATHER_PREPARE_AHEAD", "true")):
             with patch.dict(os.environ, {name: value}):
                 with self.assertRaisesRegex(ValueError, name):

@@ -20,7 +20,7 @@ UB 复用依赖本地 MTE3 完成，SQ 复用依赖物理 wave 的尾 CQ。
 
 ## 第二步：少量多线程协作的连续 chunk
 
-`KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=2/4/8` 启用。默认自动启用 prepare-ahead；
+`KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=2/4/8/16/32` 启用。默认自动启用 prepare-ahead；
 显式 `PREPARE_AHEAD=0` 拒绝初始化。`COOPERATIVE_CHUNKS=0` 关闭此功能。
 
 每个非空 lane 根据本次实际有效行数计算：
@@ -40,7 +40,7 @@ CPU 不再让不同线程分别复制整批的不同大段；每个线程依次�
 每个线程复制一个非空份额后执行原有系统可见性 barrier，再对该块的独立完成
 计数做一次原子递减，随后直接复制下一块，不等待其他线程。最后完成某块的线程
 汇总已完整完成的连续块，并用单调 CAS 推进 `ready_bytes`；发布后保留系统 barrier。
-最多八个块的完成者参与发布，不引入专用通知线程。coordinator 正在复制下一块时，
+最多 32 个块的完成者参与发布，不引入专用通知线程。coordinator 正在复制下一块时，
 helper 仍可发布前一块，不能让前缀推进依赖 coordinator 的拷贝检查点。
 
 ```text
@@ -69,6 +69,9 @@ AIV 使用 40 B descriptor READ 查询 sequence / ready_bytes，按连续前缀�
   magic 仅区分 CPU 任务调度。每 lane scratch 为 64 B，descriptor 后不附加进度向量。
 - CPU 与 NPU 的 Host/Runtime/Python/kernel 均须同步重编部署。不支持 GDR4 的旧 CPU 会拒绝该请求，
   会返回错误 ACK，不能混合部署。NPU 运行日志应显示 V9 / args_bytes=248。
+- 新增 16/32 档位保持 V9/GDR4 和所有字段布局不变，但 K 侧 CPU 服务与 N 侧
+  Host/kernel 均须更新、重编并部署；旧 Host/kernel 不接受新配置，旧 CPU 的
+  完成状态容量最多 8 块，收到超过 8 块的描述符会返回错误 ACK。
 - 已删除 SHARD_PIPELINE、PACKED_POSTS、PROGRESS_MODE 及其专用代码、RPC、mailbox
   和 profile 字段。旧环境变量非空时明确报错，请先 unset；不再静默选择其他路径。
 - 此时 CHUNK_BYTES 仅用于确认启用 chunk 模式，实际字节数按有效 payload 计算；
@@ -108,11 +111,37 @@ env KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=0 \
   KVAF_AIV_GATHER_PREPARE_AHEAD=1 KVAF_AIV_GATHER_CHUNK_BYTES=0 \
   python -u tests/python/test_aiv_gather_batch_get_perf.py
 
-# C：提前准备 + 四个协作 chunk；随后单独比较 2 / 8
+# C：提前准备 + 四个协作 chunk；随后单独比较 2 / 8 / 16 / 32
 env KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=4 \
   KVAF_AIV_GATHER_PREPARE_AHEAD=1 KVAF_AIV_GATHER_CHUNK_BYTES=131072 \
   python -u tests/python/test_aiv_gather_batch_get_perf.py
 ```
+
+保持 K 侧线程数、adaptive 等配置不变，固定脚本中的 `TOKEN_BYTES`，按下列方式
+比较各档位；随后将脚本的 `TOKEN_BYTES` 从 656 改为 4096，再运行同一组命令。
+每档启动独立进程，Runtime 会捕获本次配置：
+
+```bash
+for chunks in 4 8 16 32; do
+  env KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_COOPERATIVE_CHUNKS="$chunks" \
+    KVAF_AIV_GATHER_PREPARE_AHEAD=1 KVAF_AIV_GATHER_CHUNK_BYTES=131072 \
+    python -u tests/python/test_aiv_gather_batch_get_perf.py
+done
+```
+
+8192 行、2 个 AIV 核时，每 lane 的实际大小如下；协作模式下配置的
+`CHUNK_BYTES=131072` 仍只用于启用 chunk，具体数值由实际 payload 与块数覆盖：
+
+| 协作块数 | 656 B token 的实际 chunk | 4096 B token 的实际 chunk |
+| --- | --- | --- |
+| 4 | 656 KiB | 4 MiB |
+| 8 | 328 KiB | 2 MiB |
+| 16 | 164 KiB | 1 MiB |
+| 32 | 82 KiB | 512 KiB |
+
+CPU 活跃线程数继续按整批 payload 和现有 lane 预算选择，不随块数增加；每个线程
+依次参与全部实际块。新增档位只扩大可选分块范围，未改变静态份额、线程等待策略、
+WQE 编码、双 bank、控制查询或数据 CQ 规则。
 
 正式延迟比较使用 profile=off 的 E2E p50/p95 和 kernel 总时延。单独 profile 解释机制：
 
@@ -132,7 +161,7 @@ READ 重叠，整批提前准备下与 WQE 工作重叠。不能将这些字段�
 
 模型覆盖：ACK/首次 progress CQ 延迟到 VF 后才返回；ACK 前仅构造 WQE；完整 WR
 就绪判断；128-WR bank 的部分提交；小队列容量、SQ 环回、尾 WQE、coalescing；
-2/4/8 块、不同 token、多核及空 lane；重复调用；进度回退/越界/错误和 CQ/超时退出。
+2/4/8/16/32 块、不同 token、多核及空 lane；重复调用；进度回退/越界/错误和 CQ/超时退出。
 CPU 并发消费者逐字节检查 ready 前缀，并暂停 coordinator 的后续份额验证 helper
 发布，暂停首块份额验证前缀不跨空洞。模型和 sanitizer 不证明设备 DMA 可见性、
 CANN 编译结果或实际性能收益，仍需目标双机验收。

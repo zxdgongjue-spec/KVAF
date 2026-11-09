@@ -338,6 +338,12 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
     h->pipeline_chunk_bytes = 64;
     Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
           "unbounded cooperative chunk count was accepted");
+    const auto saved = *h;
+    h->span_count = 1;
+    h->total_bytes = h->span_bytes = 33U * 64U;
+    Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
+          "cooperative descriptor with 33 blocks was accepted");
+    *h = saved;
     h->magic = 0x4b56414647445233ULL;  // Retired descriptor format.
     h->pipeline_chunk_bytes = 65536;
     h->ready_bytes = 6;
@@ -359,11 +365,13 @@ int main() {
   BalancedCopies(4096, 4096);  // Multiple balanced rounds, bounded copy task size.
   for (bool profile : {false, true})
     for (unsigned token : {656U, 4096U})
-      for (unsigned chunks : {2U, 4U, 8U}) CooperativeCopies(profile, token, chunks);
+      for (unsigned chunks : {2U, 4U, 8U, 16U, 32U}) CooperativeCopies(profile, token, chunks);
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
-  CooperativeCopies(false, 656, 4, true);
-  CooperativeCopies(true, 656, 4, true);
-  CooperativeCopies(false, 656, 4, false, true);
+  for (unsigned chunks : {4U, 32U}) {
+    CooperativeCopies(false, 656, chunks, true);
+    CooperativeCopies(true, 656, chunks, true);
+    CooperativeCopies(false, 656, chunks, false, true);
+  }
   for (const auto chunk : {65536U, 131072U}) {
     PublishBeforeTaskTail(false, chunk);
     PublishBeforeTaskTail(true, chunk);

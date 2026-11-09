@@ -53,7 +53,7 @@ struct KvafGatherBatchGetArgs {
   // Zero: whole-batch ACK before READ. Nonzero: contiguous prefix granularity.
   uint32_t pipeline_chunk_bytes;
   uint32_t prepare_ahead;
-  // Zero retains the existing CPU schedule. 2/4/8 select cooperative prefixes.
+  // Zero retains the existing CPU schedule. 2/4/8/16/32 select cooperative prefixes.
   uint32_t cooperative_chunks, reserved;
 };
 static_assert(sizeof(KvafGatherBatchGetArgs) == 248);

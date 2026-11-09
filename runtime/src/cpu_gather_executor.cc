@@ -229,7 +229,7 @@ void CpuGatherExecutor::PublishCooperativeReady() {
     ++completed;
   const auto ready = std::min(total_bytes_, std::uint64_t(completed) * pipeline_chunk_bytes_);
   auto previous = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
-  // At most eight block finishers publish per batch. Concurrent finishers may
+  // Only completed-block finishers publish per batch. Concurrent finishers may
   // coalesce prefixes, but a delayed earlier finisher must never regress ready.
   while (previous < ready) {
     if (__atomic_compare_exchange_n(pipeline_ready_, &previous, ready, false,

@@ -668,7 +668,7 @@ int main() {
   { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
   unsetenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
   unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
-  for (const char* count : {"2", "4", "8"}) {
+  for (const char* count : {"2", "4", "8", "16", "32"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
@@ -682,7 +682,7 @@ int main() {
       assert(lane.cooperative_chunks == (lane.requests ? last_cooperative_chunks : 0));
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
-  for (const char* count : {"1", "3", "16", "-2", "4x"}) {
+  for (const char* count : {"1", "3", "24", "33", "64", "-2", "4x"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
     auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
   }

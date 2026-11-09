@@ -402,7 +402,7 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
     const auto parsed = std::from_chars(cooperative, cooperative + std::strlen(cooperative), s.args.cooperative_chunks);
     if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
         !GatherCooperativeCountValid(s.args.cooperative_chunks))
-      return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8");
+      return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32");
   }
   if (s.args.cooperative_chunks) {
     if (!s.args.pipeline_chunk_bytes || s.args.probe ||

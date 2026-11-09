@@ -76,8 +76,8 @@ def configured_chunk_bytes() -> int:
 
 def configured_cooperative_chunks() -> int:
     value = os.environ.get("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "0") or "0"
-    if value not in ("0", "2", "4", "8"):
-        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8")
+    if value not in ("0", "2", "4", "8", "16", "32"):
+        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32")
     return int(value)
 
 

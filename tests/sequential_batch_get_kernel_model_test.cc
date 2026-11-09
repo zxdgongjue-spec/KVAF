@@ -630,7 +630,7 @@ int main() {
     f.Run(false, failure == 2 || failure == 3);
     assert(f.states[0].poisoned && f.states[1].poisoned);
   }
-  for (uint32_t chunks : {2U, 4U, 8U})
+  for (uint32_t chunks : {2U, 4U, 8U, 16U, 32U})
     for (uint32_t token : {656U, 4096U})
       for (uint32_t depth : {16U, 32768U}) {
         Fixture f(1541, token, 3, KVAF_SEQ_GATHER, 6);
@@ -646,6 +646,30 @@ int main() {
         }
         f.Next(1); f.Run(); f.CheckProfiles();  // Empty lanes and a sub-WR final prefix.
       }
+  // Fine cooperative prefixes retain six prepared banks for the benchmark's
+  // 683 logical WRs per lane; prefix boundaries do not add data CQ drains.
+  for (uint32_t chunks : {16U, 32U})
+    for (uint32_t token : {656U, 4096U}) {
+      Fixture f(8192, token, 2, KVAF_SEQ_GATHER, 6);
+      f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;
+      f.args.pipeline_chunk_bytes = 131072; f.DataQueueDepth(32768); f.EnableProfile();
+      f.hold_data_cq_for_ack = true;
+      f.Run(); f.CheckProfiles();
+      for (uint32_t core = 0; core < f.workers; ++core) {
+        const auto& p = f.profiles[core];
+        assert(p.cooperative_chunks == chunks && p.data_wrs == 683 && p.read_vf_calls == 6);
+        assert(p.pipeline_chunk_bytes == kvaf::GatherCooperativeChunkBytes(4096U * token, chunks));
+        assert(p.first_read_ready_bytes < 4096U * token);
+        assert(f.queues[core * 2]->cq_completed == 1);
+      }
+    }
+  for (uint32_t chunks : {1U, 3U, 33U, 64U}) {
+    Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;
+    f.args.pipeline_chunk_bytes = 131072; f.EnableProfile(); f.Run(false);
+    assert(f.status[0].result == KVAF_SEQ_INVALID && f.profiles[0].valid_mask == 0x41);
+    assert(!f.data_reads && !f.states[0].initialized && !f.notified[0]);
+  }
   for (bool coalesce : {false, true})
     for (uint32_t sgl : {1U, 13U}) {
       Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, sgl);
@@ -661,7 +685,7 @@ int main() {
     f.Run(false, fault == 3 || fault == 5);
     assert(f.states[0].poisoned && f.states[1].poisoned);
   }
-  for (uint32_t chunks : {0U, 4U}) {
+  for (uint32_t chunks : {0U, 4U, 16U, 32U}) {
     Fixture f(1541, 656, 3, KVAF_SEQ_GATHER, 6);
     f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;
     f.args.pipeline_chunk_bytes = chunks ? 131072 : 0;
