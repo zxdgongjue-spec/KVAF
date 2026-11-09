@@ -6,3 +6,4 @@
 
 - [缓存访问执行框架设计](cache_transport_execution_design.md)
 - [缓存访问执行框架：实现与使用](cache_transport_execution_implementation.md)
+- [缓存访问执行框架：验证步骤](cache_transport_execution_validation.md)

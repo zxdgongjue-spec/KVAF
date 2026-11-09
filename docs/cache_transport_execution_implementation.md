@@ -2,6 +2,7 @@
 
 基线：`origin/main` 的 `1c13103`；分支：`codex/cache-transport-execution`。
 设计依据：[缓存访问执行框架设计](cache_transport_execution_design.md)。
+验收入口与命令：[验证步骤](cache_transport_execution_validation.md)。
 
 ## 实现范围
 
@@ -100,7 +101,8 @@ runtime.drain_get()
 Gather / Scatter kernel 的内部工作区仍按其固定最大 ABI 容量预留。
 `cpu_threads=0` 使用 CPU 服务默认值。Jetty 数可调项用于 URMA AIV，in-flight 限流用于
 URMA AIV Get，CPU 线程预算用于 AICPU Gather；其他后端不接受无效的调优字段。
-UBMEM 与 URMA 必须使用各自的 kernel 文件。
+标准构建的 Get/Put `.o` 各自包含 URMA 与 UBMEM 入口，同一方向可共用该文件。
+上例中的独立文件名仅演示自定义构建时的 provider 路径覆盖。
 预热不提交 key、不搬运应用数据，也不注册尚未提供的应用 buffer；普通 eager 调用
 仍在完成后注销临时注册。C++ 非拥有 buffer 由调用方保持至完成。
 
