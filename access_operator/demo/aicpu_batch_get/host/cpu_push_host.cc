@@ -39,6 +39,10 @@ struct CpuPushTransport::Impl {
     const Impl* owner;
     aclrtStream pending{};
     std::uint64_t sequence{};
+    const BatchGetRequest* prepared{};
+    void* prepared_stream{};
+    BatchGetProfile* prepared_profile{};
+    std::uint64_t prepare_started{};
   };
   Invocation legacy{this};
   Invocation* invocation{&legacy};
@@ -170,15 +174,48 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   return Status::OK();
 }
 
+Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec) {
+  auto& s = *impl_;
+  auto& call = *s.invocation;
+  call.prepared = nullptr;
+  if (exec.execution.profile && !exec.execution.synchronize)
+    return Status::InvalidArgument("profiling requires synchronize=true");
+  call.prepare_started = exec.execution.profile ? BatchGetProfileNowNs() : 0;
+  if (exec.execution.profile) *exec.execution.profile = {};
+  auto ready = s.Drain();
+  if (!ready.ok()) return ready;
+  if (!s.initialized || !exec.execution.stream)
+    return Status::InvalidState("CPU push needs initialization and stream");
+  KernelArgs checked{};
+  ready = detail::BuildBatchGetKernelArgs(exec, &checked.request);
+  if (!ready.ok()) return ready;
+  if (checked.request.request_capacity > kMaxRequests || checked.request.token_bytes != s.config.token_bytes)
+    return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
+  const auto bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
+  if (exec.execution.profile &&
+      ((!s.profile_device && aclrtMalloc(&s.profile_device, bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS) ||
+       (!s.profile_host && aclrtMallocHost(&s.profile_host, bytes) != ACL_SUCCESS)))
+    return Error("allocate profiling buffers");
+  call.prepared = exec.request;
+  call.prepared_stream = exec.execution.stream;
+  call.prepared_profile = exec.execution.profile;
+  return Status::OK();
+}
 Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
+  auto ready = Prepare(exec);
+  return ready.ok() ? ExecutePrepared(exec) : ready;
+}
+Status CpuPushTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
   auto& s = *impl_;
   auto* profile = exec.execution.profile;
   if (profile && !exec.execution.synchronize) return Status::InvalidArgument("profiling requires synchronize=true");
-  if (profile) *profile = {};
-  const auto begin = profile ? BatchGetProfileNowNs() : 0;
-  auto result = s.Drain();
-  if (!result.ok()) return result;
-  if (!s.initialized || !exec.execution.stream) return Status::InvalidState("CPU push needs initialization and stream");
+  auto& call = *s.invocation;
+  if (!call.prepared || call.prepared != exec.request || call.prepared_stream != exec.execution.stream ||
+      call.prepared_profile != profile)
+    return Status::InvalidState("Scatter resources were not prepared for this request");
+  call.prepared = nullptr;
+  const auto begin = call.prepare_started;
+  Status result;
   KernelArgs args{};
   result = detail::BuildBatchGetKernelArgs(exec, &args.request);
   args.request.canonical_base = s.source.base;
@@ -188,10 +225,6 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
     return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
   if (s.sequence == UINT32_MAX) return Status::InvalidState("CPU push sequence exhausted");
   const auto profile_bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
-  if (profile && ((!s.profile_device && aclrtMalloc(&s.profile_device, profile_bytes,
-          ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS) ||
-      (!s.profile_host && aclrtMallocHost(&s.profile_host, profile_bytes) != ACL_SUCCESS)))
-    return Error("allocate profiling buffers");
   args.workspace = detail::PointerValue(s.memory);
   args.output = detail::PointerValue(exec.request->output.data);
   args.output_bytes = exec.request->output.bytes;

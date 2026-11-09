@@ -33,6 +33,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
 
   add_library(kvaf_default_access_operator
     src/access_operator.cc
+    src/aiv_execution_resources.cc
   )
 
   target_include_directories(kvaf_default_access_operator
@@ -82,7 +83,7 @@ if(KVAF_ENABLE_AICPU_URMA)
   add_subdirectory(demo/aicpu_batch_get)
   add_subdirectory(demo/aicpu_batch_put)
   add_subdirectory(src/aicpu_urma/kernel)
-  add_library(kvaf_aicpu_access_operator STATIC src/aicpu_access_operator.cc)
+  add_library(kvaf_aicpu_access_operator STATIC src/aicpu_access_operator.cc src/aicpu_execution_resources.cc)
   if(KVAF_ENABLE_AICPU_CPU_PUSH)
     target_compile_definitions(kvaf_aicpu_access_operator PRIVATE KVAF_ENABLE_AICPU_CPU_PUSH=1)
   endif()

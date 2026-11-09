@@ -7,17 +7,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <type_traits>
 
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
-int launches = 0, mappings_closed = 0, releases = 0;
+int launches = 0, mappings_closed = 0, releases = 0, allocations = 0;
+bool fail_free = false;
 bool fail_wait = false, fail_copy = false, incomplete = false, fail_launch = false;
 }
 extern "C" {
 aclError aclrtSetDevice(int32_t) { return 0; }
-aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { *p = std::malloc(n); return *p ? 0 : 1; }
-aclError aclrtMallocHost(void** p, size_t n) { *p = std::malloc(n); return *p ? 0 : 1; }
-aclError aclrtFree(void* p) { std::free(p); return 0; }
+aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { ++allocations; *p = std::malloc(n); return *p ? 0 : 1; }
+aclError aclrtMallocHost(void** p, size_t n) { ++allocations; *p = std::malloc(n); return *p ? 0 : 1; }
+aclError aclrtFree(void* p) { if (fail_free) return 1; std::free(p); return 0; }
 aclError aclrtFreeHost(void* p) { std::free(p); return 0; }
 aclError aclrtCreateEvent(aclrtEvent* p) { *p = reinterpret_cast<aclrtEvent>(1); return 0; }
 aclError aclrtDestroyEvent(aclrtEvent) { return 0; }
@@ -88,7 +90,7 @@ int main() {
   auto resources = op->TakeResources();
   CHECK(resources && !op->TakeResources());
   RemoteRegionDesc region; region.base = 0x100000; region.length = 4096; region.device = DeviceKind::kCpu;
-  CHECK(op->Initialize(region).ok());
+  CHECK(resources->Initialize(region).ok());
   auto state = op->CreateExecutionState();
   CHECK(op->BindExecutionState(state.get()).ok());
   ubmem::AccessOperator other(options);
@@ -133,5 +135,78 @@ int main() {
   CHECK(resources->Close().ok() && mappings_closed == 1 && releases == 1);
   resources.reset();
   CHECK(mappings_closed == 1);
-  std::cout << "UBMEM retained resources and non-replaying Put resolution passed\n";
+  // A manager-owned resource can initialize and warm up after its facade has
+  // been destroyed. Stateless algorithms only see already prepared resources.
+  options.batch_get_kernel_object_path = __FILE__;
+  auto facade = std::make_unique<ubmem::AccessOperator>(options);
+  auto independent = facade->TakeResources();
+  facade.reset();
+  CHECK(independent->Initialize(region).ok());
+  CHECK(independent->Warmup({2, reinterpret_cast<void*>(1)}).ok());
+  auto* mapped = dynamic_cast<ubmem::UbmemResources*>(independent.get());
+  CHECK(mapped);
+  auto invocation = mapped->CreateState();
+  CHECK(mapped->Bind(invocation.get()).ok());
+  auto* typed = dynamic_cast<ubmem::UbmemInvocation*>(invocation.get());
+  CHECK(typed);
+  ubmem::UbmemPutView put_view;
+  CHECK(mapped->PreparePut(reinterpret_cast<aclrtStream>(1), 2, &put_view).ok());
+  static_assert(!std::is_convertible_v<ubmem::UbmemPutView, ubmem::UbmemGetView>);
+  const auto allocation_count = allocations;
+  const auto launch_count = launches;
+  auto* wrong = dynamic_cast<ubmem::UbmemInvocation*>(foreign.get());
+  CHECK(wrong && !ubmem::UbmemPutOperator::Launch(call, put_view, *wrong).ok());
+  CHECK(launches == launch_count && allocations == allocation_count);
+  auto unbound = mapped->CreateState();
+  auto* unbound_call = dynamic_cast<ubmem::UbmemInvocation*>(unbound.get());
+  CHECK(unbound_call && !ubmem::UbmemPutOperator::Launch(call, put_view, *unbound_call).ok());
+  auto wrong_stream = call;
+  wrong_stream.execution.stream = reinterpret_cast<void*>(2);
+  CHECK(!ubmem::UbmemPutOperator::Launch(wrong_stream, put_view, *typed).ok());
+  CHECK(launches == launch_count && allocations == allocation_count);
+  fail_launch = false;
+  CHECK(ubmem::UbmemPutOperator::Launch(call, put_view, *typed).ok());
+  CHECK(launches == launch_count + 1 && allocations == allocation_count);
+  std::int32_t index = 0, count = 1;
+  std::uint64_t address = region.base;
+  std::uint8_t valid = 1;
+  BatchGetRequest get;
+  get.indices = get.offsets = get.output_indices = {&index, sizeof(index), DeviceKind::kNpu};
+  get.miss_count = {&count, sizeof(count), DeviceKind::kNpu};
+  get.output = {input, sizeof(input), DeviceKind::kNpu};
+  get.output_block_bytes = 64; get.tokens_per_block = 1;
+  get.device_access_table.addresses = {&address, sizeof(address), DeviceKind::kNpu};
+  get.device_access_table.valid = {&valid, sizeof(valid), DeviceKind::kNpu};
+  BatchGetExecRequest get_call;
+  get_call.request = &get;
+  get_call.execution.stream = reinterpret_cast<void*>(1);
+  get_call.execution.synchronize = true;
+  ubmem::UbmemGetView get_view;
+  CHECK(mapped->PrepareGet(reinterpret_cast<aclrtStream>(1), &get_view).ok());
+  CHECK(!ubmem::UbmemGetOperator::Launch(get_call, get_view, *wrong).ok());
+  CHECK(ubmem::UbmemGetOperator::Launch(get_call, get_view, *typed).ok());
+  CHECK(launches == launch_count + 2 && allocations == allocation_count);
+
+  // A borrowed view becomes unusable after Close; incomplete work and graph
+  // leases must prevent physical cleanup in the meantime.
+  typed->graph_active = true;
+  CHECK(independent->Close().code() == StatusCode::kBusy);
+  CHECK(mappings_closed == 1);
+  typed->graph_active = false;
+  fail_wait = true;
+  CHECK(!ubmem::UbmemPutOperator::Launch(call, put_view, *typed).ok());
+  CHECK(!independent->Close().ok() && mappings_closed == 1);
+  fail_wait = false;
+  fail_free = true;
+  CHECK(!independent->Close().ok() && mappings_closed == 1);
+  fail_free = false;
+  CHECK(independent->Close().ok() && mappings_closed == 2 && releases == 2);
+  const auto after_close_launches = launches;
+  CHECK(!ubmem::UbmemPutOperator::Launch(call, put_view, *typed).ok());
+  CHECK(launches == after_close_launches);
+  CHECK(mapped->Bind(nullptr).ok());
+  invocation.reset();
+  independent.reset();
+  CHECK(mappings_closed == 2 && releases == 2);
+  std::cout << "UBMEM independent resources, typed launch views and completion recovery passed\n";
 }

@@ -18,6 +18,8 @@ class CpuPushTransport {
   ~CpuPushTransport();
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
+  Status Prepare(const BatchGetExecRequest&);
+  Status ExecutePrepared(const BatchGetExecRequest&);
   Status Drain();
   std::unique_ptr<ExecutionState> CreateExecutionState();
   Status BindExecutionState(ExecutionState*);

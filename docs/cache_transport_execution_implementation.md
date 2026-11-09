@@ -72,16 +72,42 @@ fence 不冒充数据面完成。
 ## 资源租约与执行上下文
 
 `ExecutionResourceManager` 独立于 Dispatcher 保存两个方向的资源记录。每条记录拥有
-`ExecutionResourceOwner`；`SessionAccessOperator` 及 AIV、AICPU、UBMEM 算子只借用
-对应的具体资源对象。兼容的旧调用者仍可在算子内持有 owner，但请求级入口在初始化
-前通过 `TakeResources()` 将所有权转移给管理器。
+`ExecutionResourceOwner`。管理器直接调用 owner 的 `Initialize`、`Warmup` 和 `Close`，
+不再通过算子初始化或构造临时算子来关闭资源。兼容的旧调用者仍可通过
+`AccessOperator` 持有独立 owner；请求级入口在初始化前通过 `TakeResources()`
+将所有权转移给管理器。
+
+已接入后端的资源对象与执行算法分为以下结构：
+
+| 资源所有者 | 准备好的借用视图 | 无状态执行算法 |
+|---|---|---|
+| `AivExecutionResources`：Get/Put session、注册、队列和执行工作区 | `UrmaAivPutView` / `UrmaAivGetView` | `UrmaAivPutOperator` / `UrmaAivGetOperator` |
+| `AicpuExecutionResources`：UMDK session、Gather/Push 服务及工作区 | `UrmaAicpuPutView` / `UrmaAicpuGatherView` / `UrmaAicpuScatterView` | 对应的 `UrmaAicpu*Operator` |
+| `ubmem::UbmemResources`：共享映射引用、kernel 模块、每个 stream 的执行槽位 | `UbmemPutView` / `UbmemGetView` | `UbmemPutOperator` / `UbmemGetOperator` |
+| `PeerExecutionResources`：CPU 执行 session、本地资源 owner 及适配门面 | 外层 `SessionAccessOperator` 转发到具体后端 | 不承担 kernel 执行 |
+
+`DefaultAccessOperator`、`UmdkAccessOperator` 和 `ubmem::AccessOperator` 保留为公开
+兼容适配层，内部不再有持有通信资源的 `Impl`。具体算法通过
+`Launch(request, concrete_view, invocation)` 接口执行；映射、设备内存分配和本地
+buffer 注册由资源对象的 Prepare 阶段完成。Launch 组织参数、提交 kernel 和解析结果，
+不创建通信会话或注册应用 buffer。AICPU 的 transport helper 也区分 `Prepare` 与
+`ExecutePrepared`；原 `Execute` 仅保留为兼容组合入口。
+
+`AivInvocation`、`AicpuInvocation`、`UbmemInvocation` 保存本次请求状态，由
+`ExecutionContext` 持有。资源 owner 借用当前绑定的 invocation，用于在异常关闭时
+先等待在途工作；它不接管该 invocation 的所有权。旧入口另有显式 legacy 状态。
 
 管理器按本 Runtime 的固定 Region、执行配置和不可变创建参数复用资源；设备、EID、
 对端、ABI、资源预算及容量固定在创建器中，不跨 Runtime / Region 代次复用。
-Acquire 校验请求容量。Put/Get 分别使用 `PutResourceLease` / `GetResourceLease` 和
-对应视图；视图不暴露另一方向的操作。具体 provider 对执行状态类型及 owner 身份
-再次校验。当前继续保留 `AccessOperator` 适配门面，未把所有后端重写成设计示意中的
-独立 `Launch(invocation, concrete_view, context)` 类接口。
+Dispatcher 先通过注册的适配层调用 `DescribeRequirements`，再把容量需求交给
+Acquire；请求大小转换前检查溢出，容量超预算、溢出或未对齐的请求不会初始化通信资源。当前不可变
+provider/ABI/设备配置在注册工厂中固定，Describe 声明本次调用需要的容量。
+Put/Get 分别使用 `PutResourceLease` / `GetResourceLease`；外层方向视图负责兼容接口
+转发，内部算法接收后端具体视图。具体 provider 校验资源 owner、已绑定调用状态及
+准备阶段的输入，拒绝把其他调用的状态或未准备资源用于 Launch。
+
+仅描述请求不会打开 CPU session。`PeerExecutionResources` 在 Initialize 时才创建并
+发送执行 session 请求；未初始化 owner 的 Close 不会补发远端 CREATE。
 
 首次 Acquire 只初始化该记录，其他方向可独立初始化。初始化失败会缓存失败状态，
 必须显式恢复；清理失败不会替换旧 owner。已有租约时直接 Acquire 返回 Busy，正常

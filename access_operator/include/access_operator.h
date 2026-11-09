@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,23 @@ class AccessOperator {
   // Hardware providers transfer ownership once to ResourceManager and retain
   // only their concrete borrowed view. Legacy/mock providers may return null.
   virtual std::unique_ptr<ExecutionResourceOwner> TakeResources() { return {}; }
+  // Pure request description: no registration, allocation or device work. The
+  // registry fixes the provider/ABI/profile; the invocation supplies capacity.
+  virtual Status DescribeRequirements(const BatchPutRequest& request,
+                                      std::uint32_t* capacity) const {
+    if (!capacity || request.keys.size() > std::numeric_limits<std::uint32_t>::max())
+      return Status::InvalidArgument("invalid Put request capacity");
+    *capacity = static_cast<std::uint32_t>(request.keys.size());
+    return ValidateRequestCapacity(*capacity);
+  }
+  virtual Status DescribeRequirements(const BatchGetRequest& request,
+                                      std::uint32_t* capacity) const {
+    if (!capacity || request.indices.bytes % sizeof(std::int32_t) ||
+        request.indices.bytes / sizeof(std::int32_t) > std::numeric_limits<std::uint32_t>::max())
+      return Status::InvalidArgument("invalid Get request capacity");
+    *capacity = static_cast<std::uint32_t>(request.indices.bytes / sizeof(std::int32_t));
+    return ValidateRequestCapacity(*capacity);
+  }
   // Check the immutable resource profile before granting a request lease.
   virtual Status ValidateRequestCapacity(std::uint32_t) const { return Status::OK(); }
   virtual std::unique_ptr<ExecutionState> CreateExecutionState() { return {}; }
@@ -138,10 +156,10 @@ struct BatchGetKernelProfile {
   std::uint64_t ubmem_drain_cycles{0};
 };
 
-// Default synchronous NPU data-plane implementation.
+// Compatibility adapter for the URMA AIV algorithms and resource provider.
 //
-// Initialize creates reusable BatchGet and (when configured) BatchPut
-// transports for Runtime-owned Host DDR.
+// Standalone callers own an AivExecutionResources provider through this adapter.
+// Managed callers transfer it to ResourceManager before initialization.
 // ExecuteBatchGet obtains a LocalBuffer from the caller-owned output in the
 // request. Direct-HCCP queue/status buffers remain internal to the operator;
 // launch ordering is defined by the caller stream passed with each request.
@@ -150,6 +168,7 @@ struct BatchGetKernelProfile {
 // local/BatchGet-only builds. Both paths consume the packed variable-size
 // BatchPutRequest contract and leave transaction visibility to Runtime.
 // This class is built only with KVAF_ENABLE_AIV_BATCH_GET=ON.
+class AivExecutionResources;
 class DefaultAccessOperator final : public AccessOperator {
  public:
   explicit DefaultAccessOperator(AccessOperatorConfig config);
@@ -180,12 +199,9 @@ class DefaultAccessOperator final : public AccessOperator {
       std::vector<BatchGetKernelProfile>* profiles) const;
 
  private:
-  struct Impl;
-  struct Resources;
-  Status ExecutePut(const BatchPutExecRequest&);
-  explicit DefaultAccessOperator(Impl* resources);
-  std::unique_ptr<Resources> owned_resources_;
-  Impl* impl_;
+  // Compatibility ownership for standalone users; managed entry transfers it.
+  std::unique_ptr<AivExecutionResources> owned_resources_;
+  AivExecutionResources* resources_;
 };
 
 }  // namespace kvaf

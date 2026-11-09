@@ -1,4 +1,5 @@
 #include "access_operator.h"
+#include "aiv_execution_resources.h"
 #include "meta_manager.h"
 #include "kvaf_aiv_batch_get.h"
 #include "kvaf_aiv_batch_put.h"
@@ -14,9 +15,9 @@ struct KvafBatchPutLocalBuffer {};
 struct KvafBatchGetTransport {};
 struct KvafBatchGetLocalBuffer {};
 namespace {
-int launches = 0, destroys = 0, retirements = 0;
+int launches = 0, destroys = 0, retirements = 0, acquisitions = 0;
 bool fail_wait = false, fail_copy = false, fail_retire = false, complete_payload = true;
-bool fail_close = false, fail_create = false;
+bool fail_close = false, fail_create = false, fail_free = false;
 bool fail_acquire = false, fail_get_acquire = false, fail_memset = false;
 int get_launches = 0, get_retirements = 0;
 std::vector<KvafBatchPutLocalBuffer*> registrations;
@@ -25,7 +26,7 @@ std::vector<KvafBatchGetLocalBuffer*> get_registrations;
 extern "C" {
 aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { *p = std::malloc(n); return *p ? 0 : 1; }
 aclError aclrtMallocHost(void** p, size_t n) { *p = std::malloc(n); return *p ? 0 : 1; }
-aclError aclrtFree(void* p) { std::free(p); return 0; }
+aclError aclrtFree(void* p) { if (fail_free) return 1; std::free(p); return 0; }
 aclError aclrtFreeHost(void* p) { std::free(p); return 0; }
 aclError aclrtMemset(void* p, size_t, int value, size_t n) {
   if (fail_memset) return 1;
@@ -58,6 +59,7 @@ int32_t KvafBatchPutTransportClose(KvafBatchPutTransport* p) {
 }
 void KvafBatchPutTransportDestroy(KvafBatchPutTransport* p) { (void)KvafBatchPutTransportClose(p); }
 int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport*, void*, uint64_t, KvafBatchPutLocalBuffer** out) {
+  ++acquisitions;
   *out = new KvafBatchPutLocalBuffer; registrations.push_back(*out); return fail_acquire ? -1 : 0;
 }
 void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer* p) { delete p; }
@@ -118,7 +120,7 @@ int main() {
   auto resources = op->TakeResources();
   CHECK(resources && !op->TakeResources());
   RemoteRegionDesc region; region.base = 0x100000; region.length = 4096; region.device = DeviceKind::kCpu;
-  CHECK(op->Initialize(region).ok());
+  CHECK(resources->Initialize(region).ok());
   auto state = op->CreateExecutionState();
   CHECK(op->BindExecutionState(state.get()).ok());
   DefaultAccessOperator other(config);
@@ -166,7 +168,7 @@ int main() {
   fail_create = true; fail_close = true;
   DefaultAccessOperator partial(config);
   auto partial_resources = partial.TakeResources();
-  CHECK(!partial.Initialize(region).ok());
+  CHECK(!partial_resources->Initialize(region).ok());
   CHECK(!partial_resources->Close().ok() && destroys == 1);
   fail_close = false;
   CHECK(partial_resources->Close().ok() && destroys == 2);
@@ -217,5 +219,64 @@ int main() {
   CHECK(partial_get.Shutdown().code() == StatusCode::kCompletionUnknown); // Not a graph-lease Busy.
   fail_close = false;
   CHECK(partial_get.Shutdown().ok() && get_registrations.empty());
-  std::cout << "AIV resource ownership, typed state and non-replaying Put resolution passed\n";
+  // Resource setup/teardown must work after the compatibility operator is gone.
+  config.enable_get = false;
+  config.batch_put_kernel_object_path = "test-put.o";
+  auto detached_adapter = std::make_unique<DefaultAccessOperator>(config);
+  auto detached_owner = detached_adapter->TakeResources();
+  detached_adapter.reset();
+  const auto before_detached = destroys;
+  CHECK(detached_owner->Initialize(region).ok());
+  CHECK(detached_owner->Warmup({8, call.execution.stream}).ok());
+  CHECK(detached_owner->Close().ok() && destroys == before_detached + 1);
+
+  // Algorithm views carry a resource identity; a foreign invocation is rejected
+  // before any registration/submission. Reusing a session preserves workspace.
+  AivExecutionResources direct(config), unrelated(config);
+  CHECK(direct.Initialize(region).ok());
+  auto direct_state = direct.CreateState();
+  auto* direct_call = dynamic_cast<AivInvocation*>(direct_state.get());
+  auto unrelated_state = unrelated.CreateState();
+  auto* unrelated_call = dynamic_cast<AivInvocation*>(unrelated_state.get());
+  CHECK(direct_call && unrelated_call && direct.Bind(direct_call).ok());
+  const auto before_launch = launches;
+  auto unbound = direct.CreateState();
+  CHECK(!UrmaAivPutOperator::Launch(call, direct.PutView(),
+      *dynamic_cast<AivInvocation*>(unbound.get())).ok());
+  CHECK(!UrmaAivPutOperator::Launch(call, direct.PutView(), *unrelated_call).ok());
+  CHECK(launches == before_launch && registrations.empty());
+  // Prepared workspace is required by the algorithm; only the owner may grow it.
+  CHECK(!UrmaAivPutOperator::Launch(call, direct.PutView(), *direct_call).ok());
+  CHECK(launches == before_launch && registrations.empty());
+  CHECK(direct.Warmup({8, call.execution.stream}).ok());
+  const auto workspace = direct.PutView().session.workspace.metadata;
+  auto prepared = direct.PutView();
+  CHECK(direct.PreparePut(call, *direct_call, &prepared).ok());
+  const auto registered_before_launch = acquisitions;
+  CHECK(direct.Bind(unbound.get()).code() == StatusCode::kBusy);
+  auto changed_stream = call;
+  changed_stream.execution.stream = reinterpret_cast<void*>(2);
+  CHECK(!UrmaAivPutOperator::Launch(changed_stream, prepared, *direct_call).ok());
+  CHECK(launches == before_launch && acquisitions == registered_before_launch);
+  CHECK(!UrmaAivPutOperator::Launch(call, prepared, *direct_call).ok());
+  CHECK(launches == before_launch + 1 && acquisitions == registered_before_launch);
+  CHECK(direct.Warmup({16, call.execution.stream}).code() == StatusCode::kBusy);
+  CHECK(UrmaAivPutOperator::Launch(call, prepared, *direct_call).code() == StatusCode::kBusy);
+  CHECK(launches == before_launch + 1 && acquisitions == registered_before_launch);
+  CHECK(UrmaAivPutOperator::Resolve(&completion, direct.PutView(), *direct_call).ok());
+  CHECK(completion.outcome == PutOutcome::Succeeded);
+  CHECK(UrmaAivPutOperator::Acknowledge(direct.PutView(), *direct_call).ok());
+  CHECK(direct.Warmup({4, call.execution.stream}).ok());
+  CHECK(workspace == direct.PutView().session.workspace.metadata);
+  const auto closed_transports = destroys;
+  fail_free = true;
+  CHECK(!direct.Close().ok() && destroys == closed_transports + 1);
+  CHECK(direct.PutView().session.workspace.metadata == workspace);
+  CHECK(!UrmaAivPutOperator::Launch(call, prepared, *direct_call).ok());
+  CHECK(launches == before_launch + 1);
+  fail_free = false;
+  CHECK(direct.Close().ok() && destroys == closed_transports + 1);
+  CHECK(!UrmaAivPutOperator::Launch(call, prepared, *direct_call).ok());
+  CHECK(direct.Bind(nullptr).ok());
+  std::cout << "AIV independent resources, typed views and non-replaying Put resolution passed\n";
 }

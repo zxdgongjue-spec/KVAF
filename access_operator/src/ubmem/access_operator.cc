@@ -1,314 +1,133 @@
 #include "ubmem/access_operator.h"
-#include "ubmem/batch_abi.h"
-#include "ubmem/device_mapping.h"
-#include "peer_link.h"
 #include "meta_manager.h"
-
-#include <acl/acl.h>
 #include <cstdio>
-#include <fstream>
-#include <mutex>
-#include <unordered_map>
 
 namespace kvaf::ubmem {
 namespace {
 std::uint64_t AddressOf(const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); }
-}  // namespace
+BatchArgs Args(Operation operation, void* local, std::size_t bytes, const MappedExecutionView& view) {
+  BatchArgs a{};
+  a.operation = operation;
+  a.remote_base = view.remote.base;
+  a.remote_bytes = view.remote.length;
+  a.mapped_base = view.mapped_base;
+  a.local_base = AddressOf(local);
+  a.local_bytes = bytes;
+  a.statuses = AddressOf(view.slot->statuses);
+  a.blocks = view.cores;
+  return a;
+}
+Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionView& view,
+                  UbmemInvocation& call, bool synchronize) {
+  auto& state = *view.slot;
 
-struct AccessOperator::Impl {
-  explicit Impl(OperatorOptions value) : options(std::move(value)) {}
-  struct StreamState {
-    enum class Pending { kNone, kEvent, kStream };
-    aclrtEvent event{};
-    void* statuses{};
-    void* host_statuses{};
-    void* metadata{};
-    std::size_t capacity{};
-  };
-  struct Invocation final : ExecutionState {
-    explicit Invocation(const Impl* value) : owner(value) {}
-    const Impl* owner;
-    std::unordered_map<aclrtStream, StreamState::Pending> pending;
-    bool graph_active{}, graph_recorded{};
-    GetGraphOptions graph_options;
-    aclrtStream profile_stream{};
-    aclrtStream put_stream{};
-    std::uint64_t put_rows{};
-    bool put_issued{};
-    PutCompletion put_completion;
-  };
-  Invocation legacy{this};
-  Invocation* invocation{&legacy};
-  mutable std::mutex mutex;
-  OperatorOptions options;
-  std::shared_ptr<DeviceMapping> mapping;
-  RemoteRegionDesc remote{};
-  aclrtBinHandle binaries[2]{};
-  aclrtFuncHandle functions[2]{};
-  std::vector<char> binary_bytes[2];
-  std::unordered_map<aclrtStream, StreamState> streams;
-  bool ready{};
-  bool retained{};
-  bool profiling{};
-  bool profile_detail{};
-
-  Status LoadKernel(unsigned index, const std::string& path, const char* name) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file || file.tellg() <= 0) return Status::NotFound("cannot read UBmem kernel: " + path);
-    auto& bytes = binary_bytes[index];
-    bytes.resize(static_cast<std::size_t>(file.tellg()));
-    file.seekg(0);
-    if (!file.read(bytes.data(), bytes.size())) return Status::Internal("incomplete kernel object");
-    aclrtBinary input = aclrtCreateBinary(bytes.data(), bytes.size());
-    if (!input) return Status::Internal("aclrtCreateBinary failed");
-    auto status = Acl("aclrtBinaryLoad", aclrtBinaryLoad(input, &binaries[index]));
-    aclrtDestroyBinary(input);
-    if (status.ok()) status = Acl("aclrtBinaryGetFunction",
-        aclrtBinaryGetFunction(binaries[index], name, &functions[index]));
+  args.profile = view.profiling && args.operation == Operation::kGet ? (view.profile_detail ? 2 : 1) : 0;
+  call.profile_stream = nullptr;
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (!synchronize || view.managed_completion) {
+    auto status = Acl("aclmdlRICaptureGetInfo",
+        aclmdlRICaptureGetInfo(stream, &capture, &graph));
+    if (!status.ok()) return status;
+  }
+  if (view.managed_completion && !call.graph_active &&
+      capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+    return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
+  const auto size = view.cores * sizeof(CoreStatus);
+  if (synchronize || view.managed_completion) {
+    // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
+    // not look like a successful zero-row kernel.
+    auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
+    if (!status.ok()) return status;
+    if (!call.graph_active) call.pending[stream] = ExecutionSlot::Pending::kStream;
+  }
+  aclrtLaunchKernelAttr attrs[4]{};
+  attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
+  attrs[0].value.schemMode = 1;
+  attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
+  attrs[1].value.timeoutUs.timeoutLow = 180000000U;
+  attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
+  attrs[2].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
+  attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+  attrs[3].value.dynUBufSize = kMteBufferBytes;
+  aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 4; cfg.attrs = attrs;
+  if (args.operation == Operation::kPut) call.put_issued = true;
+  auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
+      view.function, view.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
+  if (!status.ok()) return status;
+  if (call.graph_active) {
+    call.graph_recorded = true;
     return status;
   }
-
-  Status State(aclrtStream stream, StreamState** result) {
-    if (!ready) return Status::InvalidState("UBmem operator is uninitialized or failed; rebuild it");
-    if (stream == nullptr) return Status::InvalidArgument("UBmem requires a caller-owned ACL stream");
-    auto [it, inserted] = streams.try_emplace(stream);
-    auto& state = it->second;
-    if (inserted) {
-      auto status = Acl("aclrtCreateEvent", aclrtCreateEvent(&state.event));
-      if (status.ok()) status = Acl("aclrtMalloc(status)", aclrtMalloc(
-          &state.statuses, options.cores * sizeof(CoreStatus), ACL_MEM_MALLOC_NORMAL_ONLY));
-      if (status.ok()) status = Acl("aclrtMallocHost(status)", aclrtMallocHost(
-          &state.host_statuses, options.cores * sizeof(CoreStatus)));
-      if (!status.ok()) {
-        if (state.host_statuses) aclrtFreeHost(state.host_statuses);
-        if (state.statuses) aclrtFree(state.statuses);
-        if (state.event) aclrtDestroyEvent(state.event);
-        streams.erase(it);
-        return status;
-      }
-    }
-    *result = &state;
-    return Status::OK();
-  }
-
-  BatchArgs Args(Operation operation, void* local, std::size_t bytes, StreamState& state) const {
-    BatchArgs a{};
-    a.operation = operation;
-    a.remote_base = remote.base;
-    a.remote_bytes = remote.length;
-    a.mapped_base = mapping->address();
-    a.local_base = AddressOf(local);
-    a.local_bytes = bytes;
-    a.statuses = AddressOf(state.statuses);
-    a.blocks = options.cores;
-    return a;
-  }
-
-  Status Launch(BatchArgs& args, aclrtStream stream, StreamState& state, bool synchronize) {
-    args.profile = profiling && args.operation == Operation::kGet ? (profile_detail ? 2 : 1) : 0;
-    invocation->profile_stream = nullptr;
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    if (!synchronize || options.managed_completion) {
-      auto status = Acl("aclmdlRICaptureGetInfo",
-          aclmdlRICaptureGetInfo(stream, &capture, &graph));
-      if (!status.ok()) return status;
-    }
-    if (options.managed_completion && !invocation->graph_active &&
-        capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
-    const auto size = options.cores * sizeof(CoreStatus);
-    if (synchronize || options.managed_completion) {
-      // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
-      // not look like a successful zero-row kernel.
-      auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
-      if (!status.ok()) return status;
-      if (!invocation->graph_active) invocation->pending[stream] = StreamState::Pending::kStream;
-    }
-    aclrtLaunchKernelAttr attrs[4]{};
-    attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
-    attrs[0].value.schemMode = 1;
-    attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
-    attrs[1].value.timeoutUs.timeoutLow = 180000000U;
-    attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
-    attrs[2].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
-    attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
-    attrs[3].value.dynUBufSize = kMteBufferBytes;
-    aclrtLaunchKernelCfg cfg{}; cfg.numAttrs = 4; cfg.attrs = attrs;
-    if (args.operation == Operation::kPut) invocation->put_issued = true;
-    auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
-        functions[static_cast<unsigned>(args.operation)], options.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
-    if (!status.ok()) return status;
-    if (invocation->graph_active) {
-      invocation->graph_recorded = true;
-      return status;
-    }
-    invocation->pending[stream] = StreamState::Pending::kStream;
-    if (args.profile) invocation->profile_stream = stream;
-    if (!synchronize) {
-      // Ordinary events cannot be recorded during ACL Graph capture. The
-      // graph owner completes replay on this stream before releasing it;
-      // Shutdown retains the stream drain for captured work.
-      if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE) return Status::OK();
-      status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
-      if (!status.ok()) {
-        ready = false;
-        // No event: drain now or leave Shutdown responsible for retrying.
-        if (aclrtSynchronizeStream(stream) == ACL_SUCCESS) invocation->pending[stream] = StreamState::Pending::kNone;
-        return status;
-      }
-      invocation->pending[stream] = StreamState::Pending::kEvent;
-      return Status::OK();
-    }
-    // Keep the kernel, status D2H and completion wait on the caller's stream,
-    // exactly as the existing synchronous BatchPut path does.
-    status = Acl("aclrtMemcpyAsync(status)", aclrtMemcpyAsync(state.host_statuses, size,
-        state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
-    if (status.ok()) status = Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(stream));
+  call.pending[stream] = ExecutionSlot::Pending::kStream;
+  if (args.profile) call.profile_stream = stream;
+  if (!synchronize) {
+    // Ordinary events cannot be recorded during ACL Graph capture. The
+    // graph owner completes replay on this stream before releasing it;
+    // Shutdown retains the stream drain for captured work.
+    if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE) return Status::OK();
+    status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
     if (!status.ok()) {
-      std::fprintf(stderr, "[KVAF_UBMEM] FAILED_LAUNCH op=%u rows=%u local_base=0x%llx local_bytes=%llu "
-          "mapped_base=0x%llx remote_bytes=%llu metadata=0x%llx\n",
-          static_cast<unsigned>(args.operation), args.capacity,
-          static_cast<unsigned long long>(args.local_base),
-          static_cast<unsigned long long>(args.local_bytes),
-          static_cast<unsigned long long>(args.mapped_base),
-          static_cast<unsigned long long>(args.remote_bytes),
-          static_cast<unsigned long long>(args.put_offsets));
-      ready = false;
+      *view.ready = false;
+      // No event: drain now or leave Shutdown responsible for retrying.
+      if (aclrtSynchronizeStream(stream) == ACL_SUCCESS) call.pending[stream] = ExecutionSlot::Pending::kNone;
       return status;
     }
-    invocation->pending[stream] = StreamState::Pending::kNone;
-    const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
-    for (std::size_t i = 0; i < options.cores; ++i) {
-      if (reports[i].result == UINT64_MAX) {
-        return Status::Internal("UBmem kernel status was not written (still 0xFF)");
-      }
-      if (reports[i].result != 0) {
-        std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
-            static_cast<unsigned long long>(reports[i].result),
-            static_cast<unsigned long long>(reports[i].failed_request));
-        return Status::InvalidArgument("UBmem kernel rejected a request; see KERNEL_ERROR");
-      }
-      if (args.operation == Operation::kPut &&
-          reports[i].completed != static_cast<std::uint64_t>(args.capacity) * (i + 1) / args.blocks -
-              static_cast<std::uint64_t>(args.capacity) * i / args.blocks) {
-        return Status::Internal("UBmem Put completion report does not cover the submitted rows");
-      }
-    }
+    call.pending[stream] = ExecutionSlot::Pending::kEvent;
     return Status::OK();
   }
-};
+  // Keep the kernel, status D2H and completion wait on the caller's stream,
+  // exactly as the existing synchronous BatchPut path does.
+  status = Acl("aclrtMemcpyAsync(status)", aclrtMemcpyAsync(state.host_statuses, size,
+      state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
+  if (status.ok()) status = Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(stream));
+  if (!status.ok()) {
+    std::fprintf(stderr, "[KVAF_UBMEM] FAILED_LAUNCH op=%u rows=%u local_base=0x%llx local_bytes=%llu "
+        "mapped_base=0x%llx remote_bytes=%llu metadata=0x%llx\n",
+        static_cast<unsigned>(args.operation), args.capacity,
+        static_cast<unsigned long long>(args.local_base),
+        static_cast<unsigned long long>(args.local_bytes),
+        static_cast<unsigned long long>(args.mapped_base),
+        static_cast<unsigned long long>(args.remote_bytes),
+        static_cast<unsigned long long>(args.put_offsets));
+    *view.ready = false;
+    return status;
+  }
+  call.pending[stream] = ExecutionSlot::Pending::kNone;
+  const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
+  for (std::size_t i = 0; i < view.cores; ++i) {
+    if (reports[i].result == UINT64_MAX) {
+      return Status::Internal("UBmem kernel status was not written (still 0xFF)");
+    }
+    if (reports[i].result != 0) {
+      std::fprintf(stderr, "[KVAF_UBMEM] KERNEL_ERROR core=%zu code=%llu request=%llu\n", i,
+          static_cast<unsigned long long>(reports[i].result),
+          static_cast<unsigned long long>(reports[i].failed_request));
+      return Status::InvalidArgument("UBmem kernel rejected a request; see KERNEL_ERROR");
+    }
+    if (args.operation == Operation::kPut &&
+        reports[i].completed != static_cast<std::uint64_t>(args.capacity) * (i + 1) / args.blocks -
+            static_cast<std::uint64_t>(args.capacity) * i / args.blocks) {
+      return Status::Internal("UBmem Put completion report does not cover the submitted rows");
+    }
+  }
+  return Status::OK();
+}
+}  // namespace
 
-struct AccessOperator::Resources final : ExecutionResourceOwner {
-  explicit Resources(OperatorOptions options) : state(std::make_unique<Impl>(std::move(options))) {}
-  ~Resources() override { if (!Close().ok()) (void)state.release(); }
-  Status Close() override { return AccessOperator(state.get()).Shutdown(); }
-  std::unique_ptr<Impl> state;
-};
-AccessOperator::AccessOperator(Impl* resources) : impl_(resources) {}
 AccessOperator::AccessOperator(OperatorOptions options)
-    : owned_resources_(std::make_unique<Resources>(std::move(options))),
-      impl_(owned_resources_->state.get()) {}
+    : owned_resources_(std::make_unique<UbmemResources>(std::move(options))),
+      resources_(owned_resources_.get()) {}
 AccessOperator::~AccessOperator() = default;
-std::unique_ptr<ExecutionResourceOwner> AccessOperator::TakeResources() {
-  return std::move(owned_resources_);
-}
-std::unique_ptr<ExecutionState> AccessOperator::CreateExecutionState() {
-  return std::make_unique<Impl::Invocation>(impl_);
-}
-Status AccessOperator::BindExecutionState(ExecutionState* state) {
-  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
-  if (!typed || typed->owner != impl_) return Status::InvalidArgument("UBMEM execution state belongs to another resource");
-  impl_->invocation = typed;
-  return Status::OK();
-}
-
-Status AccessOperator::Initialize(const RemoteRegionDesc& region) {
-  if (impl_->mapping || impl_->options.cores == 0 || impl_->options.cores > 48 ||
-      !impl_->options.peer_link || region.device != DeviceKind::kCpu || region.base == 0 ||
-      region.length > UINT64_MAX - region.base) {
-    return Status::InvalidArgument("invalid UBmem configuration/remote region");
-  }
-  auto status = Acl("aclrtSetDevice", aclrtSetDevice(impl_->options.device_id));
-  peer::PeerRegion peer;
-  if (status.ok()) status = impl_->options.peer_link->LookupRegion(region.base, &peer);
-  if (status.ok()) status = impl_->options.peer_link->RetainUbmemMapping(region.base);
-  if (status.ok()) {
-    impl_->remote = region;
-    impl_->retained = true;
-    if (impl_->options.mappings)
-      status = impl_->options.mappings->Acquire(impl_->options.device_id, peer.fabric_handle,
-                                                peer.fabric_mapping_bytes, &impl_->mapping);
-    else {
-      impl_->mapping = std::make_shared<DeviceMapping>();
-      status = impl_->mapping->Import(peer.fabric_handle, peer.fabric_mapping_bytes);
-    }
-  }
-  if (status.ok() && !impl_->options.batch_get_kernel_object_path.empty()) status = impl_->LoadKernel(0, impl_->options.batch_get_kernel_object_path,
-      "KvafExecuteBatchGetUbmemKernelV2");
-  if (status.ok() && !impl_->options.batch_put_kernel_object_path.empty())
-    status = impl_->LoadKernel(1, impl_->options.batch_put_kernel_object_path,
-        "KvafExecuteBatchPutUbmemKernelV2");
-  if (!status.ok()) { (void)Shutdown(); return status; }
-  impl_->ready = true;
-  std::fprintf(stderr, "[KVAF_UBMEM] DEVICE_MAPPING_READY transport=ubmem mapping=acl ub_bytes=%u bytes=%llu cores=%u acl_device=%u "
-      "host_base=0x%llx mapped_base=0x%llx\n",
-      kMteBufferBytes,
-      static_cast<unsigned long long>(region.length), impl_->options.cores,
-      impl_->options.device_id,
-      static_cast<unsigned long long>(region.base),
-      static_cast<unsigned long long>(impl_->mapping->address()));
-  return Status::OK();
-}
-
-Status AccessOperator::Shutdown() {
-  if (impl_->invocation->graph_active) return Status::Busy("release UBMEM graph lease before shutdown");
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  impl_->ready = false;
-  impl_->profiling = false;
-  impl_->invocation->profile_stream = nullptr;
-  for (auto& entry : impl_->streams) {
-    if (impl_->invocation->pending[entry.first] == Impl::StreamState::Pending::kStream) {
-      auto status = Acl("aclrtSynchronizeStream(recovery)", aclrtSynchronizeStream(entry.first));
-      if (!status.ok()) return status;
-    } else if (impl_->invocation->pending[entry.first] == Impl::StreamState::Pending::kEvent) {
-      auto status = Acl("aclrtSynchronizeEvent(shutdown)", aclrtSynchronizeEvent(entry.second.event));
-      if (!status.ok()) return status;
-    }
-    impl_->invocation->pending[entry.first] = Impl::StreamState::Pending::kNone;
-  }
-  for (auto& entry : impl_->streams) {
-    auto& s = entry.second;
-    if (s.metadata) aclrtFree(s.metadata);
-    if (s.statuses) aclrtFree(s.statuses);
-    if (s.host_statuses) aclrtFreeHost(s.host_statuses);
-    if (s.event) aclrtDestroyEvent(s.event);
-  }
-  impl_->streams.clear();
-  for (unsigned i = 0; i < 2; ++i) {
-    if (impl_->binaries[i]) {
-      auto status = Acl("aclrtBinaryUnLoad", aclrtBinaryUnLoad(impl_->binaries[i]));
-      if (!status.ok()) return status;
-      impl_->binaries[i] = nullptr;
-      impl_->functions[i] = nullptr;
-    }
-  }
-  if (impl_->mapping) {
-    auto status = impl_->options.mappings ? impl_->options.mappings->Release(&impl_->mapping)
-                                          : impl_->mapping->Close();
-    if (!status.ok()) return status;
-    impl_->mapping.reset();
-  }
-  if (impl_->retained) {
-    impl_->options.peer_link->ReleaseUbmemMapping(impl_->remote.base);
-    impl_->retained = false;
-  }
-  return Status::OK();
-}
-
+std::unique_ptr<ExecutionResourceOwner> AccessOperator::TakeResources() { return std::move(owned_resources_); }
+std::unique_ptr<ExecutionState> AccessOperator::CreateExecutionState() { return resources_->CreateState(); }
+Status AccessOperator::BindExecutionState(ExecutionState* state) { return resources_->Bind(state); }
+Status AccessOperator::Initialize(const RemoteRegionDesc& region) { return resources_->Initialize(region); }
+Status AccessOperator::Shutdown() { return resources_->Close(); }
+Status AccessOperator::Warmup(const ExecutionWarmup& request) { return resources_->Warmup(request); }
 Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->invocation->graph_active) return Status::Busy("UBMEM graph lease already held");
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  if (resources_->invocation->graph_active) return Status::Busy("UBMEM graph lease already held");
   if (!options.stream || !options.output.valid() || options.output.device != DeviceKind::kNpu ||
       !options.request_capacity)
     return Status::InvalidArgument("graph preparation requires output, capacity and stream");
@@ -319,19 +138,19 @@ Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
   if (!s.ok()) return s;
   if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
     return Status::InvalidState("prepare graph before capture");
-  Impl::StreamState* state = nullptr;
-  s = impl_->State(static_cast<aclrtStream>(options.stream), &state);
+  ExecutionSlot* state = nullptr;
+  s = resources_->Slot(static_cast<aclrtStream>(options.stream), &state);
   if (!s.ok()) return s;
-  if (impl_->invocation->pending[static_cast<aclrtStream>(options.stream)] != Impl::StreamState::Pending::kNone)
+  if (resources_->invocation->pending[static_cast<aclrtStream>(options.stream)] != ExecutionSlot::Pending::kNone)
     return Status::Busy("UBMEM work is still pending");
-  impl_->invocation->graph_options = options;
-  impl_->invocation->graph_active = true;
-  impl_->invocation->graph_recorded = false;
+  resources_->invocation->graph_options = options;
+  resources_->invocation->graph_active = true;
+  resources_->invocation->graph_recorded = false;
   return Status::OK();
 }
 Status AccessOperator::FinishGetGraph(void* stream, bool discard) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->invocation->graph_active) return Status::NotFound("UBMEM graph lease not found");
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  if (!resources_->invocation->graph_active) return Status::NotFound("UBMEM graph lease not found");
   if (!stream) return Status::InvalidArgument("graph release requires its last replay stream");
   aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
   aclmdlRI graph = nullptr;
@@ -343,81 +162,59 @@ Status AccessOperator::FinishGetGraph(void* stream, bool discard) {
   s = Acl("aclrtSynchronizeStream(graph)",
           aclrtSynchronizeStream(static_cast<aclrtStream>(stream)));
   if (!s.ok()) return s;
-  if (impl_->invocation->graph_recorded && !discard) {
-    auto& state = impl_->streams.at(static_cast<aclrtStream>(impl_->invocation->graph_options.stream));
-    const auto bytes = impl_->options.cores * sizeof(CoreStatus);
+  if (resources_->invocation->graph_recorded && !discard) {
+    auto& state = resources_->streams.at(static_cast<aclrtStream>(resources_->invocation->graph_options.stream));
+    const auto bytes = resources_->options.cores * sizeof(CoreStatus);
     s = Acl("aclrtMemcpy(graph status)", aclrtMemcpy(state.host_statuses, bytes, state.statuses,
                                                      bytes, ACL_MEMCPY_DEVICE_TO_HOST));
     if (!s.ok()) return s;
     const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
-    for (std::uint32_t i = 0; i < impl_->options.cores; ++i)
+    for (std::uint32_t i = 0; i < resources_->options.cores; ++i)
       if (reports[i].result)
         return Status::Internal(
             "graph result failed or was never replayed; inspect then release with "
             "discard_result=True");
   }
-  impl_->invocation->graph_active = false;
-  impl_->invocation->graph_recorded = false;
-  impl_->invocation->graph_options = {};
+  resources_->invocation->graph_active = false;
+  resources_->invocation->graph_recorded = false;
+  resources_->invocation->graph_options = {};
   return Status::OK();
 }
-
-Status AccessOperator::Warmup(const ExecutionWarmup& request) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->ready) return Status::NotInitialized("UBMEM provider not initialized");
-  if (!request.stream) return Status::OK();
-  Impl::StreamState* state = nullptr;
-  auto s = impl_->State(static_cast<aclrtStream>(request.stream), &state);
-  if (!s.ok() || !impl_->functions[1] || !request.request_capacity) return s;
-  const auto bytes = std::size_t(request.request_capacity) * 3 * sizeof(std::uint64_t);
-  if (state->capacity >= bytes) return Status::OK();
-  void* allocation = nullptr;
-  s = Acl("aclrtMalloc(metadata warmup)",
-          aclrtMalloc(&allocation, bytes, ACL_MEM_MALLOC_NORMAL_ONLY));
-  if (!s.ok()) return s;
-  if (state->metadata) aclrtFree(state->metadata);
-  state->metadata = allocation;
-  state->capacity = bytes;
-  return Status::OK();
-}
-
 Status AccessOperator::DrainGet() {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  for (auto& entry : impl_->streams) {
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  for (auto& entry : resources_->streams) {
     auto& state = entry.second;
-    if (impl_->invocation->pending[entry.first] == Impl::StreamState::Pending::kNone) continue;
-    auto status = impl_->invocation->pending[entry.first] == Impl::StreamState::Pending::kEvent
+    if (resources_->invocation->pending[entry.first] == ExecutionSlot::Pending::kNone) continue;
+    auto status = resources_->invocation->pending[entry.first] == ExecutionSlot::Pending::kEvent
         ? Acl("aclrtSynchronizeEvent", aclrtSynchronizeEvent(state.event))
         : Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(entry.first));
     if (!status.ok()) return status;
-    const auto size = impl_->options.cores * sizeof(CoreStatus);
+    const auto size = resources_->options.cores * sizeof(CoreStatus);
     status = Acl("aclrtMemcpy(completion)", aclrtMemcpy(state.host_statuses, size,
         state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST));
     if (!status.ok()) return status;
     const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
-    for (std::size_t i = 0; i < impl_->options.cores; ++i)
+    for (std::size_t i = 0; i < resources_->options.cores; ++i)
       if (reports[i].result != 0) return Status::Internal("UBMEM Get kernel reported an error");
-    impl_->invocation->pending[entry.first] = Impl::StreamState::Pending::kNone;
+    resources_->invocation->pending[entry.first] = ExecutionSlot::Pending::kNone;
   }
   return Status::OK();
 }
-
 Status AccessOperator::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->ready) return Status::NotInitialized("UBmem operator is not initialized");
-  impl_->profiling = enabled;
-  impl_->profile_detail = enabled && detailed;
-  impl_->invocation->profile_stream = nullptr;
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  if (!resources_->ready) return Status::NotInitialized("UBmem operator is not initialized");
+  resources_->profiling = enabled;
+  resources_->profile_detail = enabled && detailed;
+  resources_->invocation->profile_stream = nullptr;
   return Status::OK();
 }
-
 Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(resources_->mutex);
   if (!profiles) return Status::InvalidArgument("profile output is null");
-  if (!impl_->ready || !impl_->profiling || !impl_->invocation->profile_stream)
+  if (!resources_->ready || !resources_->profiling || !resources_->invocation->profile_stream)
     return Status::InvalidState("no profiled UBmem BatchGet launch");
-  const auto& state = impl_->streams.at(impl_->invocation->profile_stream);
-  std::vector<CoreStatus> reports(impl_->options.cores);
+  const auto& state = resources_->streams.at(resources_->invocation->profile_stream);
+  std::vector<CoreStatus> reports(resources_->options.cores);
   // As for URMA profiling, the caller completes the stream before this snapshot.
   auto status = Acl("aclrtMemcpy(profile)", aclrtMemcpy(reports.data(), reports.size() * sizeof(CoreStatus),
       state.statuses, reports.size() * sizeof(CoreStatus), ACL_MEMCPY_DEVICE_TO_HOST));
@@ -443,17 +240,61 @@ Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProf
   }
   return Status::OK();
 }
+Status AccessOperator::ResolvePut(PutCompletion* out) {
+  if (!out) return Status::InvalidArgument("null Put completion output");
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  auto& call = *resources_->invocation;
+  if (call.put_completion.outcome == PutOutcome::Unknown && call.put_stream) {
+    if (aclrtSynchronizeStream(call.put_stream) != ACL_SUCCESS)
+      return Status::CompletionUnknown("UBMEM Put stream still pending");
+    bool success = false;
+    if (call.put_issued) {
+      auto& workspace = resources_->streams.at(call.put_stream);
+      const auto bytes = resources_->options.cores * sizeof(CoreStatus);
+      if (aclrtMemcpy(workspace.host_statuses, bytes, workspace.statuses, bytes,
+                      ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+        return Status::CompletionUnknown("UBMEM Put completion report unavailable");
+      const auto* reports = static_cast<const CoreStatus*>(workspace.host_statuses);
+      success = true;
+      for (std::uint32_t i = 0; i < resources_->options.cores; ++i) {
+        const auto expected = call.put_rows * (i + 1) / resources_->options.cores -
+                              call.put_rows * i / resources_->options.cores;
+        success &= reports[i].result == 0 && reports[i].completed == expected;
+      }
+    }
+    // UBMEM has no posted remote WRs: the completed stream fences local MTE.
+    call.pending[call.put_stream] = ExecutionSlot::Pending::kNone;
+    auto failure = call.put_completion.result;
+    if (failure.ok()) failure = Status::Internal("UBMEM Put did not complete all rows");
+    call.put_completion = {success ? PutOutcome::Succeeded : PutOutcome::Failed,
+        success ? Status::OK() : failure};
+    resources_->ready = true;
+  }
+  *out = call.put_completion;
+  return Status::OK();
+}
+Status AccessOperator::AcknowledgePut() {
+  if (resources_->invocation->put_completion.outcome == PutOutcome::Unknown)
+    return Status::CompletionUnknown("cannot acknowledge unresolved UBMEM Put");
+  resources_->invocation->put_completion = {};
+  return Status::OK();
+}
+Status UbmemGetOperator::Launch(const BatchGetExecRequest& exec, const UbmemGetView& view,
+                                 UbmemInvocation& call) {
+  if (!view.execution_.owner || call.owner != view.execution_.owner || !view.execution_.slot ||
+      !view.execution_.active || *view.execution_.active != &call ||
+      !view.execution_.ready || !*view.execution_.ready || !view.execution_.function || !exec.request ||
+      view.execution_.stream != static_cast<aclrtStream>(exec.execution.stream))
+    return Status::InvalidArgument("invalid UBMEM Get resource view or invocation");
 
-Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
   // RuntimeCore owns buffer/layout validation. This adapter only restricts
   // the device and checks narrowing to its kernel ABI.
   const auto& r = *exec.request;
-  if (impl_->invocation->graph_active) {
-    if (r.output.data != impl_->invocation->graph_options.output.data ||
-        r.output.bytes != impl_->invocation->graph_options.output.bytes ||
-        exec.execution.stream != impl_->invocation->graph_options.stream ||
-        r.indices.bytes / 4 > impl_->invocation->graph_options.request_capacity || exec.execution.synchronize)
+  if (call.graph_active) {
+    if (r.output.data != call.graph_options.output.data ||
+        r.output.bytes != call.graph_options.output.bytes ||
+        exec.execution.stream != call.graph_options.stream ||
+        r.indices.bytes / 4 > call.graph_options.request_capacity || exec.execution.synchronize)
       return Status::InvalidArgument("captured request differs from prepared graph lease");
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
@@ -469,11 +310,8 @@ Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
       r.indices.bytes / 4 > INT32_MAX || r.device_access_table.valid.bytes > UINT32_MAX) {
     return Status::InvalidArgument("invalid UBmem BatchGet device buffers/layout");
   }
-  Impl::StreamState* state;
   auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  auto status = impl_->State(stream, &state);
-  if (!status.ok()) return status;
-  auto a = impl_->Args(Operation::kGet, r.output.data, r.output.bytes, *state);
+  auto a = Args(Operation::kGet, r.output.data, r.output.bytes, view.execution_);
   a.addresses = AddressOf(r.device_access_table.addresses.data);
   a.valid = AddressOf(r.device_access_table.valid.data);
   a.indices = AddressOf(r.indices.data);
@@ -484,66 +322,27 @@ Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   a.table_entries = r.device_access_table.valid.bytes;
   a.token_bytes = r.output_block_bytes;
   a.tokens_per_block = r.tokens_per_block;
-  return impl_->Launch(a, stream, *state, exec.execution.synchronize);
+  return LaunchKernel(a, stream, view.execution_, call, exec.execution.synchronize);
 }
+Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  UbmemGetView view;
+  auto s = resources_->PrepareGet(static_cast<aclrtStream>(exec.execution.stream), &view);
+  return s.ok() ? UbmemGetOperator::Launch(exec, view, *resources_->invocation) : s;
+}
+Status UbmemPutOperator::Launch(const BatchPutExecRequest& exec, const UbmemPutView& view,
+                                 UbmemInvocation& call) {
+  if (!view.execution_.owner || call.owner != view.execution_.owner || !view.execution_.slot ||
+      !view.execution_.active || *view.execution_.active != &call ||
+      !view.execution_.ready || !*view.execution_.ready || !view.execution_.function || !exec.request || !exec.put_desc ||
+      view.execution_.stream != static_cast<aclrtStream>(exec.execution.stream))
+    return Status::InvalidArgument("invalid UBMEM Put resource view or invocation");
 
-Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
-  auto& call = *impl_->invocation;
-  call.put_completion = {};
-  call.put_stream = nullptr;
-  call.put_issued = false;
-  auto result = ExecutePut(exec);
-  if (result.ok()) call.put_completion = {PutOutcome::Succeeded, result};
-  else if (!call.put_stream) call.put_completion = {PutOutcome::Failed, result};
-  else call.put_completion.result = result;
-  return result;
-}
-Status AccessOperator::ResolvePut(PutCompletion* out) {
-  if (!out) return Status::InvalidArgument("null Put completion output");
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  auto& call = *impl_->invocation;
-  if (call.put_completion.outcome == PutOutcome::Unknown && call.put_stream) {
-    if (aclrtSynchronizeStream(call.put_stream) != ACL_SUCCESS)
-      return Status::CompletionUnknown("UBMEM Put stream still pending");
-    bool success = false;
-    if (call.put_issued) {
-      auto& workspace = impl_->streams.at(call.put_stream);
-      const auto bytes = impl_->options.cores * sizeof(CoreStatus);
-      if (aclrtMemcpy(workspace.host_statuses, bytes, workspace.statuses, bytes,
-                      ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
-        return Status::CompletionUnknown("UBMEM Put completion report unavailable");
-      const auto* reports = static_cast<const CoreStatus*>(workspace.host_statuses);
-      success = true;
-      for (std::uint32_t i = 0; i < impl_->options.cores; ++i) {
-        const auto expected = call.put_rows * (i + 1) / impl_->options.cores -
-                              call.put_rows * i / impl_->options.cores;
-        success &= reports[i].result == 0 && reports[i].completed == expected;
-      }
-    }
-    // UBMEM has no posted remote WRs: the completed stream fences local MTE.
-    call.pending[call.put_stream] = Impl::StreamState::Pending::kNone;
-    auto failure = call.put_completion.result;
-    if (failure.ok()) failure = Status::Internal("UBMEM Put did not complete all rows");
-    call.put_completion = {success ? PutOutcome::Succeeded : PutOutcome::Failed,
-        success ? Status::OK() : failure};
-    impl_->ready = true;
-  }
-  *out = call.put_completion;
-  return Status::OK();
-}
-Status AccessOperator::AcknowledgePut() {
-  if (impl_->invocation->put_completion.outcome == PutOutcome::Unknown)
-    return Status::CompletionUnknown("cannot acknowledge unresolved UBMEM Put");
-  impl_->invocation->put_completion = {};
-  return Status::OK();
-}
-
-Status AccessOperator::ExecutePut(const BatchPutExecRequest& exec) {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (!impl_->functions[1]) return Status::NotImplemented("UBmem BatchPut kernel is not configured");
   const auto& r = *exec.request;
   const auto rows = r.keys.size();
-  if (r.input.device != DeviceKind::kNpu || rows > UINT32_MAX) {
+  if (r.input.device != DeviceKind::kNpu || rows > UINT32_MAX ||
+      r.input_offsets.size() != rows || r.lengths.size() != rows ||
+      exec.put_desc->entries.size() != rows) {
     return Status::InvalidArgument("invalid UBmem BatchPut metadata");
   }
   // RuntimeCore checked source ranges; MetaManager allocated these destination
@@ -553,29 +352,37 @@ Status AccessOperator::ExecutePut(const BatchPutExecRequest& exec) {
     metadata[i] = r.input_offsets[i]; metadata[rows + i] = r.lengths[i];
     metadata[2 * rows + i] = exec.put_desc->entries[i].address;
   }
-  Impl::StreamState* state;
+  auto* state = view.execution_.slot;
   auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  auto status = impl_->State(stream, &state);
-  if (!status.ok()) return status;
   const auto bytes = metadata.size() * sizeof(std::uint64_t);
-  if (state->capacity < bytes) {
-    void* buffer = nullptr;
-    status = Acl("aclrtMalloc(metadata)", aclrtMalloc(&buffer, bytes, ACL_MEM_MALLOC_NORMAL_ONLY));
-    if (!status.ok()) return status;
-    if (state->metadata) aclrtFree(state->metadata);
-    state->metadata = buffer; state->capacity = bytes;
-  }
-  status = Acl("aclrtMemcpy(metadata)", aclrtMemcpy(state->metadata, bytes, metadata.data(), bytes,
+  if (state->capacity < bytes) return Status::InvalidArgument("UBMEM Put resource capacity exceeded");
+  auto status = Acl("aclrtMemcpy(metadata)", aclrtMemcpy(state->metadata, bytes, metadata.data(), bytes,
                                                   ACL_MEMCPY_HOST_TO_DEVICE));
   if (!status.ok()) return status;
-  auto a = impl_->Args(Operation::kPut, const_cast<void*>(r.input.data), r.input.bytes, *state);
+  auto a = Args(Operation::kPut, const_cast<void*>(r.input.data), r.input.bytes, view.execution_);
   a.capacity = rows;
-  impl_->invocation->put_rows = rows;
-  impl_->invocation->put_stream = stream;
+  call.put_rows = rows;
+  call.put_stream = stream;
   a.put_offsets = AddressOf(state->metadata);
   a.put_lengths = a.put_offsets + rows * 8;
   a.put_destinations = a.put_lengths + rows * 8;
-  return impl_->Launch(a, stream, *state, true);
+  return LaunchKernel(a, stream, view.execution_, call, true);
 }
-
+Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  std::lock_guard<std::mutex> lock(resources_->mutex);
+  auto& call = *resources_->invocation;
+  call.put_completion = {};
+  call.put_stream = nullptr;
+  call.put_issued = false;
+  UbmemPutView view;
+  auto result = !exec.request || exec.request->keys.size() > UINT32_MAX
+      ? Status::InvalidArgument("invalid UBMEM Put request capacity")
+      : resources_->PreparePut(static_cast<aclrtStream>(exec.execution.stream),
+                               static_cast<std::uint32_t>(exec.request->keys.size()), &view);
+  if (result.ok()) result = UbmemPutOperator::Launch(exec, view, call);
+  if (result.ok()) call.put_completion = {PutOutcome::Succeeded, result};
+  else if (!call.put_stream) call.put_completion = {PutOutcome::Failed, result};
+  else call.put_completion.result = result;
+  return result;
+}
 }  // namespace kvaf::ubmem

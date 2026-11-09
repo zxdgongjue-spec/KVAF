@@ -151,6 +151,12 @@ add_executable(kvaf_execution_resource_manager_test execution_resource_manager_t
 target_link_libraries(kvaf_execution_resource_manager_test PRIVATE kvaf_runtime Threads::Threads)
 add_test(NAME kvaf_execution_resource_manager_test COMMAND kvaf_execution_resource_manager_test)
 set_tests_properties(kvaf_execution_resource_manager_test PROPERTIES TIMEOUT 20)
+add_executable(kvaf_peer_execution_resources_test peer_execution_resources_test.cc)
+target_include_directories(kvaf_peer_execution_resources_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/include)
+target_link_libraries(kvaf_peer_execution_resources_test PRIVATE kvaf_access_operator)
+add_test(NAME kvaf_peer_execution_resources_test COMMAND kvaf_peer_execution_resources_test)
+set_tests_properties(kvaf_peer_execution_resources_test PROPERTIES TIMEOUT 20)
 add_executable(kvaf_runtime_put_recovery_test runtime_put_recovery_test.cc)
 target_link_libraries(kvaf_runtime_put_recovery_test PRIVATE kvaf_runtime Threads::Threads)
 add_test(NAME kvaf_runtime_put_recovery_test COMMAND kvaf_runtime_put_recovery_test)
@@ -198,14 +204,23 @@ if(KVAF_TEST_ACL_INCLUDE_DIR)
   endforeach()
   target_compile_definitions(kvaf_aiv_put_transport_close_test PRIVATE KVAF_TEST_CLOSE_PUT=1)
   add_executable(kvaf_aicpu_put_resolution_test aicpu_put_resolution_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_access_operator.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_execution_resources.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/host/session.cc
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_put/host/batch_put_host.cc)
   target_include_directories(kvaf_aicpu_put_resolution_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
     ${PROJECT_SOURCE_DIR}/access_operator/demo)
   add_test(NAME kvaf_aicpu_put_resolution_test COMMAND kvaf_aicpu_put_resolution_test)
   set_tests_properties(kvaf_aicpu_put_resolution_test PROPERTIES TIMEOUT 20)
+  add_executable(kvaf_aicpu_gather_resources_test aicpu_gather_resources_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/host/batch_get_host.cc)
+  target_include_directories(kvaf_aicpu_gather_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
+    ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/access_operator/src)
+  add_test(NAME kvaf_aicpu_gather_resources_test COMMAND kvaf_aicpu_gather_resources_test)
+  set_tests_properties(kvaf_aicpu_gather_resources_test PROPERTIES TIMEOUT 20)
   add_executable(kvaf_ubmem_provider_resources_test ubmem_provider_resources_test.cc
-    ${PROJECT_SOURCE_DIR}/access_operator/src/ubmem/access_operator.cc)
+    ${PROJECT_SOURCE_DIR}/access_operator/src/ubmem/access_operator.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/ubmem/execution_resources.cc)
   target_include_directories(kvaf_ubmem_provider_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR})
   # Older host-test headers lack this production ACL launch attribute. Only the
   # fake launch entry is used here; never substitute fields in a hardware build.
@@ -226,12 +241,13 @@ if(KVAF_TEST_ACL_INCLUDE_DIR)
   add_test(NAME kvaf_ubmem_provider_resources_test COMMAND kvaf_ubmem_provider_resources_test)
   set_tests_properties(kvaf_ubmem_provider_resources_test PROPERTIES TIMEOUT 20)
   add_executable(kvaf_aiv_provider_resources_test aiv_provider_resources_test.cc
-    ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc)
+    ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aiv_execution_resources.cc)
   target_compile_definitions(kvaf_aiv_provider_resources_test PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
   target_include_directories(kvaf_aiv_provider_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
     ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include)
-  foreach(provider_test kvaf_aicpu_put_resolution_test kvaf_ubmem_provider_resources_test
+  foreach(provider_test kvaf_aicpu_put_resolution_test kvaf_aicpu_gather_resources_test kvaf_ubmem_provider_resources_test
                         kvaf_aiv_provider_resources_test)
     target_include_directories(${provider_test} PRIVATE
       ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/meta_manager/include

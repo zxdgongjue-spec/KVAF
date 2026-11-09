@@ -1,7 +1,9 @@
 #pragma once
 
 #include <memory>
+#include "execution_config.h"
 #include "status.h"
+#include "types.h"
 
 namespace kvaf {
 
@@ -10,6 +12,8 @@ namespace kvaf {
 class ExecutionResourceOwner {
  public:
   virtual ~ExecutionResourceOwner() = default;
+  virtual Status Initialize(const RemoteRegionDesc&) = 0;
+  virtual Status Warmup(const ExecutionWarmup&) { return Status::OK(); }
   virtual Status Close() = 0;
 };
 

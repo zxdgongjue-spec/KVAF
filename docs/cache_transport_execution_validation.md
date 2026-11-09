@@ -301,21 +301,30 @@ ACL 目录下应存在 `acl/acl.h`。这两项只启用额外 mock 测试，不�
 
 ```bash
 ctest --test-dir build-verify --output-on-failure \
-  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_.*_test|runtime_put_recovery_test|cache_region_service_test|runtime_cleanup_test|ubmem_hal_.*_test|ubmem_mapping_cache_test|aicpu_session_registry_test|aicpu_put_resolution_test|.*_provider_resources_test|aiv_.*_transport_close_test)'
+  -R 'kvaf_(runtime_build_flags_python|cache_execution_harness_python|execution_.*_test|peer_execution_resources_test|runtime_put_recovery_test|cache_region_service_test|runtime_cleanup_test|ubmem_hal_.*_test|ubmem_mapping_cache_test|aicpu_session_registry_test|aicpu_put_resolution_test|.*_provider_resources_test|aiv_.*_transport_close_test)'
 ```
 
 资源管理与在线 Put 恢复的回归：
 
 - `kvaf_execution_resource_manager_test`：所有权在初始化前移交、租约独占、Put/Get
-  首次初始化互不阻塞、容量拒绝、失败后保留 owner、状态解绑与销毁顺序、请求元数据副本。
+  首次初始化互不阻塞、容量拒绝、失败后保留 owner、状态解绑与销毁顺序、请求元数据副本；
+  DescribeRequirements 在资源初始化之前执行，初始化和预热直接进入 owner，检查容量溢出。
+- `kvaf_peer_execution_resources_test`：外层算子销毁后独立初始化、预热和关闭资源；
+  本地关闭失败不关闭远端、远端关闭重试、未初始化/超容量请求的清理不创建 CPU session。
 - `kvaf_runtime_put_recovery_test`：未知完成后成功提交或安全回滚、配置不匹配、元数据及
   完成确认失败重试、提交异常、绑定失败；断言恢复不重复提交 WRITE，也不重复 Commit/Abort。
 - `kvaf_aiv_provider_resources_test`：使用实际 AIV Host provider 和替身设备接口检查
-  执行状态绑定、原次 status 校验、迟到完成、临时注册回收及资源关闭失败重试。
+  执行状态绑定、原次 status 校验、迟到完成、临时注册回收及资源关闭失败重试；
+  独立 owner 生命周期、准备后的具体视图、错配状态拒绝和 Launch 不创建注册/工作区。
 - `kvaf_ubmem_provider_resources_test`：检查 stream/status 收集失败后保留执行状态、
-  恢复不重发、完整完成数量校验，以及旧报告不能让新调用误判成功。
+  恢复不重发、完整完成数量校验，以及旧报告不能让新调用误判成功；独立资源初始化、
+  Put/Get 具体视图、Launch 无新增设备分配、未绑定/stream 错配拒绝和释放失败重试。
 - `kvaf_aicpu_put_resolution_test`：多个 descriptor 由一次 WRITE 提交；检查原次序号
-  和设备结果、状态收集失败、WRITE 成功后注销失败的清理重试及结果保留。
+  和设备结果、状态收集失败、WRITE 成功后注销失败的清理重试及结果保留；
+  独立资源生命周期和准备阶段注册、具体 Put Launch 无注册/分配、准备输入和调用状态校验。
+- `kvaf_aicpu_gather_resources_test`：真实 Gather Host 逻辑的 Prepare/ExecutePrepared
+  分离，检查注册和 profiling 工作区只在准备阶段建立，未准备/错配/重复 Launch 被拒绝，
+  连续请求复用 Gather 工作区及 CPU worker。
 - `kvaf_aiv_get_transport_close_test` / `kvaf_aiv_put_transport_close_test`：逐阶段注入
   Jetty、CQ、MR、token、设备内存、context 释放失败，检查重试不重复释放已完成部分，
   且队列未关闭时不释放其依赖。
@@ -323,7 +332,8 @@ ctest --test-dir build-verify --output-on-failure \
 故障通过便携替身注入，不在真机上故意破坏正在执行的 DMA。真机应重新运行第 3 节
 全量测试，覆盖 matrix、overlap、lifetime、resources、graph 和 lifecycle；保持同一
 CPU 服务进程再跑一轮，确认资源跨调用复用及池重建正常。此前 HAL 修复的真机通过
-结果不能代替本次资源管理重构后的验收。
+结果以及此前版本的全量 PASS，不能代替本次资源/算子职责拆分后的验收。测试命令、
+参数和 JSON 报告格式保持不变；重新编译后使用原全量命令即可。
 
 `kvaf_ubmem_hal_execution_test`、`kvaf_ubmem_hal_legacy_test` 和
 `kvaf_ubmem_hal_concurrent_test` 使用动态加载的替身 HAL，模拟用户态随卸载重置、

@@ -68,7 +68,9 @@ Status ExecutionDispatcher::PreparePut(const BatchPutRequest& request,
   PutExecutionConfig c;
   auto s = ResolveExecution(policy_, options.config, &c);
   PutResourceLease lease;
-  if (s.ok()) s = resources_.AcquirePut({c, static_cast<std::uint32_t>(request.keys.size())}, &lease);
+  PutResourceRequirements requirements;
+  if (s.ok()) s = resources_.Describe(c, request, &requirements);
+  if (s.ok()) s = resources_.AcquirePut(requirements, &lease);
   return s.ok() ? lease.view().Prepare(request, options) : s;
 }
 Status ExecutionDispatcher::Recover(PutExecutionConfig c) {
@@ -103,7 +105,9 @@ Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) 
     context->destination = *request.put_desc;
     context->options = request.execution;
     context->options.config = context->config;
-    s = resources_.AcquirePut({context->config, static_cast<std::uint32_t>(context->request.keys.size())}, &context->lease);
+    PutResourceRequirements requirements;
+    s = resources_.Describe(context->config, context->request, &requirements);
+    if (s.ok()) s = resources_.AcquirePut(requirements, &context->lease);
     if (s.ok()) s = context->Bind();
   } catch (const std::exception& e) {
     s = Status::Internal(std::string("Put preparation failed before submission: ") + e.what());
@@ -192,7 +196,9 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   context->table = request.host_access_table;
   context->options = request.execution;
   context->options.config = c;
-  s = resources_.AcquireGet({c, static_cast<std::uint32_t>(request.request->indices.bytes / 4)}, &context->lease);
+  GetResourceRequirements requirements;
+  s = resources_.Describe(c, context->request, &requirements);
+  if (s.ok()) s = resources_.AcquireGet(requirements, &context->lease);
   if (s.ok()) s = context->Bind();
   if (!s.ok()) return s;
   pending_get_ = std::move(context);
@@ -228,6 +234,7 @@ Status ExecutionDispatcher::Warmup(GetExecutionConfig c, const ExecutionWarmup& 
 Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOptions& r, std::uint64_t* id) {
   if (!id) return Status::InvalidArgument("null graph lease output");
   *id = 0;
+  if (!r.request_capacity) return Status::InvalidArgument("graph capacity must be positive");
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (c.executor != Executor::Aiv || c.algorithm != GetAlgorithm::Direct)

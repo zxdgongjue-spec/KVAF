@@ -4,21 +4,31 @@
 
 namespace kvaf {
 namespace detail {
-Status ExecutionResourceRecord::Initialize(const RemoteRegionDesc& region) {
+Status ExecutionResourceRecord::Create() {
   if (!failure.ok()) return failure;
-  if (state == ResourceState::Ready) return Status::OK();
-  state = ResourceState::Creating;
+  if (operation) return Status::OK();
   try {
     operation = factory();
     if (!operation) failure = Status::Internal("provider factory returned null");
-    else {
-      resources = operation->TakeResources();
-      failure = operation->Initialize(region);
-    }
+    else resources = operation->TakeResources();
   } catch (const std::exception& e) {
-    failure = Status::Internal(std::string("provider initialization failed: ") + e.what());
+    failure = Status::Internal(std::string("provider creation failed: ") + e.what());
   } catch (...) {
-    failure = Status::Internal("provider initialization failed");
+    failure = Status::Internal("provider creation failed");
+  }
+  if (!failure.ok()) state = ResourceState::Recovering;
+  return failure;
+}
+Status ExecutionResourceRecord::Initialize(const RemoteRegionDesc& region) {
+  auto s = Create();
+  if (!s.ok() || state == ResourceState::Ready) return s;
+  state = ResourceState::Creating;
+  try {
+    failure = resources ? resources->Initialize(region) : operation->Initialize(region);
+  } catch (const std::exception& e) {
+    failure = Status::Internal(std::string("resource initialization failed: ") + e.what());
+  } catch (...) {
+    failure = Status::Internal("resource initialization failed");
   }
   state = failure.ok() ? ResourceState::Ready : ResourceState::Recovering;
   return failure;
@@ -108,13 +118,39 @@ Status ExecutionResourceManager::Acquire(const std::vector<Entry<C>>& entries, C
   if (!record) return Status::NotImplemented("execution provider is unavailable");
   std::unique_lock<std::mutex> lock(record->mutex);
   if (record->leased) return Status::Busy("execution still owns the resource lease");
-  auto s = record->Initialize(region_);
+  auto s = record->Create();
   if (!s.ok()) return s;
   s = record->operation->ValidateRequestCapacity(capacity);
+  if (!s.ok()) return s;
+  s = record->Initialize(region_);
   if (!s.ok()) return s;
   record->leased = true;
   out->record_ = std::move(record);
   return Status::OK();
+}
+template<class C, class R, class Q>
+Status ExecutionResourceManager::Describe(const std::vector<Entry<C>>& entries, C c,
+                                          const R& request, Q* out) {
+  if (!out) return Status::InvalidArgument("null resource requirements output");
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  if (!ready_) return Status::NotInitialized("resource manager is not accepting work");
+  auto record = Find(entries, c);
+  if (!record) return Status::NotImplemented("execution provider is unavailable");
+  std::lock_guard<std::mutex> lock(record->mutex);
+  if (record->leased) return Status::Busy("execution still owns the resource lease");
+  auto s = record->Create();
+  std::uint32_t capacity{};
+  if (s.ok()) s = record->operation->DescribeRequirements(request, &capacity);
+  if (s.ok()) *out = {c, capacity};
+  return s;
+}
+Status ExecutionResourceManager::Describe(PutExecutionConfig c, const BatchPutRequest& r,
+                                          PutResourceRequirements* out) {
+  return Describe(puts_, c, r, out);
+}
+Status ExecutionResourceManager::Describe(GetExecutionConfig c, const BatchGetRequest& r,
+                                          GetResourceRequirements* out) {
+  return Describe(gets_, c, r, out);
 }
 Status ExecutionResourceManager::AcquirePut(const PutResourceRequirements& r, PutResourceLease* out) {
   return Acquire(puts_, r.config, r.capacity, out);

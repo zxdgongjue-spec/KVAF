@@ -1,19 +1,9 @@
 #pragma once
-#include "../access_operator.h"
+#include "execution_resources.h"
 
 namespace kvaf::ubmem {
-class DeviceMappingCache;
-struct OperatorOptions {
-  std::string batch_get_kernel_object_path;
-  std::string batch_put_kernel_object_path;
-  std::uint32_t device_id{0};
-  std::uint32_t cores{2};
-  std::shared_ptr<peer::PeerLink> peer_link;
-  bool managed_completion{false};
-  std::shared_ptr<DeviceMappingCache> mappings;
-};
-
-// Mapped-memory backend of the existing KVAF contract.
+// Compatibility adapter. UbmemResources owns the physical resources;
+// UbmemPutOperator/UbmemGetOperator execute through prepared borrowed views.
 // Execute methods consume RuntimeCore-validated requests and MetaManager's
 // PutAccessDesc; call RuntimeCore::BatchGet/BatchPut as the public entry points.
 class AccessOperator final : public kvaf::AccessOperator {
@@ -36,11 +26,7 @@ class AccessOperator final : public kvaf::AccessOperator {
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const;
  private:
-  struct Impl;
-  struct Resources;
-  Status ExecutePut(const BatchPutExecRequest&);
-  explicit AccessOperator(Impl* resources);
-  std::unique_ptr<Resources> owned_resources_;
-  Impl* impl_;
+  std::unique_ptr<UbmemResources> owned_resources_;
+  UbmemResources* resources_;
 };
 }  // namespace kvaf::ubmem

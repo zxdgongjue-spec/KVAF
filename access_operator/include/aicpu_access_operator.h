@@ -14,6 +14,9 @@ struct UmdkAccessOperatorConfig {
 };
 // Runtime adapter with independent UMDK Put/Get sessions;
 // cpu_push_scatter owns an independent Host-side direct HCCP target.
+class AicpuExecutionResources;
+struct AicpuInvocation;
+
 class UmdkAccessOperator final : public AccessOperator {
  public:
   explicit UmdkAccessOperator(UmdkAccessOperatorConfig config);
@@ -31,11 +34,7 @@ class UmdkAccessOperator final : public AccessOperator {
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
 
  private:
-  struct Impl;
-  struct Resources;
-  Status ExecutePut(const BatchPutExecRequest&);
-  explicit UmdkAccessOperator(Impl* resources);
-  std::unique_ptr<Resources> owned_resources_;
-  Impl* impl_;
+  std::unique_ptr<AicpuExecutionResources> owned_resources_;
+  AicpuExecutionResources* resources_;
 };
 }  // namespace kvaf

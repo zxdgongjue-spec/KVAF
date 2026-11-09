@@ -31,6 +31,10 @@ struct BatchGetTransport::Impl {
     const Impl* owner;
     aclrtStream pending{};
     std::uint64_t sequence{};
+    const BatchGetRequest* prepared{};
+    void* prepared_stream{};
+    BatchGetProfile* prepared_profile{};
+    std::uint64_t prepare_started{};
   };
   Invocation legacy{this};
   Invocation* invocation{&legacy};
@@ -131,16 +135,53 @@ Status BatchGetTransport::Warmup() {
   }
   return s;
 }
-Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
-  auto* profile = exec.execution.profile;
-  if (profile && !exec.execution.synchronize)
+Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec) {
+  auto& call = *impl_->invocation;
+  call.prepared = nullptr;
+  if (exec.execution.profile && !exec.execution.synchronize)
     return InvalidArgument("BatchGet profiling requires synchronize=true");
-  if (profile) *profile = {};
-  const auto begin = profile ? BatchGetProfileNowNs() : 0U;
+  call.prepare_started = exec.execution.profile ? BatchGetProfileNowNs() : 0;
+  if (exec.execution.profile) *exec.execution.profile = {};
   auto drained = impl_->Drain("previous_request");
   if (!drained.ok()) return drained;
   if (!impl_->initialized || !exec.execution.stream)
     return InvalidArgument("UMDK BatchGet needs initialization and stream");
+  UmdkBatchGetArgs checked{};
+  auto valid = BuildBatchGetKernelArgs(exec, &checked.request);
+  if (!valid.ok()) return valid;
+  if (checked.request.request_capacity > kGatherMaxRequests || checked.request.token_bytes != impl_->token_bytes)
+    return InvalidArgument("UMDK BatchGet exceeds requests or configured token size");
+  if (impl_->direct_addresses && (exec.request->access_table.opaque != 0U ||
+      checked.request.table_capacity < checked.request.request_capacity))
+    return InvalidArgument("invalid direct address request");
+  const auto profile_bytes = impl_->session.config().workers * sizeof(BatchGetWorkerProfile);
+  if (exec.execution.profile &&
+      ((!impl_->profile_device && aclrtMalloc(&impl_->profile_device, profile_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) ||
+       (!impl_->profile_host && aclrtMallocHost(&impl_->profile_host, profile_bytes) != ACL_SUCCESS)))
+    return Internal("failed to allocate BatchGet profiling buffers");
+  auto ready = Warmup();
+  if (!ready.ok()) return ready;
+  ready = impl_->session.Ensure(impl_->region.base, exec.request->output.data, exec.request->output.bytes);
+  if (!ready.ok()) return ready;
+  call.prepared = exec.request;
+  call.prepared_stream = exec.execution.stream;
+  call.prepared_profile = exec.execution.profile;
+  return Status::OK();
+}
+Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
+  auto ready = Prepare(exec);
+  return ready.ok() ? ExecutePrepared(exec) : ready;
+}
+Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
+  auto* profile = exec.execution.profile;
+  if (profile && !exec.execution.synchronize)
+    return InvalidArgument("BatchGet profiling requires synchronize=true");
+  auto& call = *impl_->invocation;
+  if (call.prepared != exec.request || call.prepared_stream != exec.execution.stream ||
+      call.prepared_profile != profile || !call.prepared)
+    return Status::InvalidState("Gather resources were not prepared for this request");
+  call.prepared = nullptr;
+  const auto begin = call.prepare_started;
   UmdkBatchGetArgs launch{};
   auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
   if (!valid.ok()) return valid;
@@ -156,30 +197,11 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
       return InvalidArgument("direct addresses must cover the request capacity");
     launch.request.indices = launch.request.offsets = 0U;
   }
-  auto ensure = [&](void* buffer, std::size_t bytes) {
-    return impl_->session.Ensure(impl_->region.base, buffer, bytes);
-  };
   const auto workers = impl_->session.config().workers;
   const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
-  if (profile) {
-    if ((!impl_->profile_device &&
-         aclrtMalloc(&impl_->profile_device, profile_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) ||
-        (!impl_->profile_host &&
-         aclrtMallocHost(&impl_->profile_host, profile_bytes) != ACL_SUCCESS))
-      return Internal("failed to allocate BatchGet profiling buffers");
-  }
-  auto ready = ensure(impl_->workspace, GatherWorkspaceBytes(workers));
-  if (!ready.ok()) return ready;
-  ready = ensure(exec.request->output.data, exec.request->output.bytes);
-  if (!ready.ok()) return ready;
   const auto staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
   const auto descriptors = staging + GatherStagingBytes(impl_->token_bytes, workers);
   const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers);
-  if (!impl_->cpu_enabled) {
-    ready = impl_->session.config().peer_link->EnableGatherLanes(impl_->region.base, controls, workers);
-    if (!ready.ok()) return ready;
-    impl_->cpu_enabled = true;
-  }
   if (impl_->sequence == peer::kGatherErrorBit - 1U)
     return Status::InvalidState("BatchGet sequence exhausted");
   auto& args = launch.gather;

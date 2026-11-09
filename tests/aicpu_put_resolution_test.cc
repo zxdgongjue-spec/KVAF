@@ -2,6 +2,8 @@
 #include "aicpu_urma/kernel_loader.h"
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
 #include "meta_manager.h"
+#include "aicpu_execution_resources.h"
+#include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -10,16 +12,16 @@
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
 using namespace kvaf::aicpu_urma;
-int writes = 0, unregisters = 0;
+int writes = 0, unregisters = 0, allocations = 0, registrations = 0, destroys = 0, frees = 0;
 bool fail_wait = false, fail_copy = false, write_error = false;
-bool fail_launch = false, fail_memset = false;
+bool fail_launch = false, fail_memset = false, fail_wait_on_write = false;
 std::vector<UmdkTransfer> submitted;
 }
 extern "C" {
 aclError aclrtCreateStream(aclrtStream* p) { *p = reinterpret_cast<aclrtStream>(1); return 0; }
 aclError aclrtDestroyStream(aclrtStream) { return 0; }
-aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { *p = std::malloc(n); return *p ? 0 : 1; }
-aclError aclrtFree(void* p) { std::free(p); return 0; }
+aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { ++allocations; *p = std::malloc(n); return *p ? 0 : 1; }
+aclError aclrtFree(void* p) { ++frees; std::free(p); return 0; }
 aclError aclrtMemset(void* p, size_t, int value, size_t n) {
   if (fail_memset) return 1;
   std::memset(p, value, n); return 0;
@@ -29,6 +31,9 @@ aclError aclrtMemcpy(void* p, size_t, const void* s, size_t n, aclrtMemcpyKind k
   std::memcpy(p, s, n); return 0;
 }
 aclError aclrtSynchronizeStream(aclrtStream) { return fail_wait ? 1 : 0; }
+aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI*) {
+  *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
+}
 }
 namespace kvaf::peer {
 PeerLink::PeerLink(std::string address) : address_(std::move(address)) {}
@@ -42,6 +47,19 @@ Status PeerLink::CreateChannel(uint64_t, const uint8_t*, uint32_t, const uint8_t
 }
 }
 namespace kvaf::aicpu_urma {
+// This test exercises real Put transport/session code. The unused Gather
+// resource is a fake so the test needs neither the Get kernel nor NPU hardware.
+struct BatchGetTransport::Impl {};
+BatchGetTransport::BatchGetTransport(UmdkSession&, std::uint32_t, bool) : impl_(std::make_unique<Impl>()) {}
+BatchGetTransport::~BatchGetTransport() = default;
+Status BatchGetTransport::Initialize(const RemoteRegionDesc&) { return Status::OK(); }
+Status BatchGetTransport::Warmup() { return Status::OK(); }
+Status BatchGetTransport::Shutdown() { return Status::OK(); }
+Status BatchGetTransport::Drain() { return Status::OK(); }
+Status BatchGetTransport::Prepare(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
+Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
+std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() { return {}; }
+Status BatchGetTransport::BindExecutionState(ExecutionState*) { return Status::OK(); }
 Status PrepareUmdkKernel(const std::string&, bool) { return Status::OK(); }
 int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, uint32_t) {
   const auto& args = *static_cast<const UmdkControlArgs*>(input);
@@ -50,10 +68,13 @@ int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, ui
   status.key_bytes = 28;
   std::memcpy(status.eid, args.local_eid, sizeof(status.eid));
   if (args.op == UmdkControlOp::kUnregisterBuffers) ++unregisters;
+  if (args.op == UmdkControlOp::kPrepare || args.op == UmdkControlOp::kRegisterBuffer) ++registrations;
+  if (args.op == UmdkControlOp::kDestroy) ++destroys;
   return 0;
 }
 int32_t LaunchBatchPut(const BatchPutKernelArgs* args, aclrtStream stream) {
   ++writes;
+  if (fail_wait_on_write) fail_wait = true;
   CHECK(args->op == UmdkControlOp::kWrite);
   const auto* transfers = reinterpret_cast<const UmdkTransfer*>(args->transfer_spans);
   submitted.assign(transfers, transfers + args->transfer_count);
@@ -124,5 +145,61 @@ int main() {
   CHECK(transport.Shutdown().ok());
   CHECK(session.Shutdown().ok());
   session.BindWriteState(nullptr);
-  std::cout << "AICPU whole-batch WRITE resolution and cleanup retry passed\n";
+  fail_launch = false;
+  UmdkAccessOperatorConfig provider;
+  provider.kernel_json = config.kernel_json; provider.workers = config.workers;
+  provider.local_eid = config.local_eid; provider.peer_link = config.peer_link;
+  provider.enable_get = false; provider.managed_completion = true;
+  auto adapter = std::make_unique<UmdkAccessOperator>(provider);
+  auto owner = adapter->TakeResources();
+  CHECK(owner && !adapter->TakeResources());
+  // Initialize and reserve without entering any operator lifecycle method.
+  CHECK(owner->Initialize(region).ok());
+  CHECK(owner->Warmup({3, call.execution.stream}).ok());
+  auto state = adapter->CreateExecutionState();
+  CHECK(adapter->BindExecutionState(state.get()).ok());
+  auto* resources = dynamic_cast<AicpuExecutionResources*>(owner.get());
+  auto* invocation_state = dynamic_cast<AicpuInvocation*>(state.get());
+  CHECK(resources && invocation_state);
+  AicpuExecutionResources foreign_resources(provider);
+  auto foreign_state = foreign_resources.CreateInvocation();
+  CHECK(!resources->Bind(foreign_state.get()).ok());
+  CHECK(resources->PreparePut(call).ok());
+  const auto before_allocations = allocations, before_registrations = registrations;
+  const auto before_writes = writes;
+  auto same_owner_unbound = resources->CreateInvocation();
+  CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(),
+        *static_cast<AicpuInvocation*>(same_owner_unbound.get())).ok());
+  auto swapped = request;
+  auto swapped_call = call; swapped_call.request = &swapped;
+  CHECK(!UrmaAicpuPutOperator::Launch(swapped_call, resources->PutView(), *invocation_state).ok());
+  // Concrete views reject foreign invocation identities before any submission.
+  CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(),
+        *static_cast<AicpuInvocation*>(foreign_state.get())).ok());
+  CHECK(writes == before_writes);
+  CHECK(UrmaAicpuPutOperator::Launch(call, resources->PutView(), *invocation_state).ok());
+  CHECK(writes == before_writes + 1 && allocations == before_allocations && registrations == before_registrations);
+  CHECK(adapter->AcknowledgePut().ok());
+  CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(), *invocation_state).ok());
+  CHECK(writes == before_writes + 1); // A prepared transfer slot is consumed once.
+  fail_wait_on_write = true;
+  CHECK(!adapter->ExecuteBatchPut(call).ok());
+  fail_wait_on_write = false;
+  const auto pending_writes = writes, pending_frees = frees;
+  CHECK(!owner->Close().ok() && frees == pending_frees);
+  fail_wait = false;
+  CHECK(adapter->ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Succeeded);
+  CHECK(writes == pending_writes); // Owner failure must not replay the original DMA.
+  CHECK(adapter->AcknowledgePut().ok());
+  CHECK(adapter->BindExecutionState(nullptr).ok());
+  state.reset();
+  const auto before_destroys = destroys;
+  adapter.reset();
+  CHECK(destroys == before_destroys); // Destroying the borrowed algorithm does not close communication.
+  CHECK(owner->Close().ok() && destroys == before_destroys + 1);
+  CHECK(owner->Close().ok() && destroys == before_destroys + 1);
+  // A stale view from a closed owner cannot launch a prepared transfer.
+  AicpuInvocation closed_call(resources);
+  CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(), closed_call).ok());
+  std::cout << "AICPU typed resources, prepare/launch separation and WRITE recovery passed\n";
 }

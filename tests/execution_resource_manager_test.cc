@@ -25,6 +25,8 @@ struct Counters {
   std::atomic<int> factories{0}, initializes{0}, closes{0}, owners{0}, operators{0};
   std::atomic<int> live_states{0}, state_destroys{0}, legacy_shutdowns{0}, close_with_state{0};
   std::atomic<int> put_launches{0}, get_launches{0}, resolves{0};
+  std::atomic<int> legacy_initializes{0}, legacy_warmups{0}, warmups{0}, descriptions{0};
+  std::uint32_t requirement_padding{0}, warmed_capacity{0};
   std::atomic<bool> fail_initialize{false}, fail_close{false}, fail_drain{false};
   std::atomic<bool> fail_put{false}, fail_resolve{false}, fail_ack{false}, fail_get{false};
   bool throw_get{false};
@@ -64,6 +66,20 @@ class Owner final : public ExecutionResourceOwner {
     if (physical.counters.operators != 0) physical.counters.bad_order = true;
     --physical.counters.owners;
     physical.counters.Event("owner destroyed");
+  }
+  Status Initialize(const RemoteRegionDesc&) override {
+    auto& c = physical.counters;
+    ++c.initializes;
+    std::unique_lock<std::mutex> lock(c.mutex);
+    c.initialize_entered = true;
+    c.changed.notify_all();
+    c.changed.wait(lock, [&] { return !c.block_initialize; });
+    return c.fail_initialize ? Status::Internal("initialization failed") : Status::OK();
+  }
+  Status Warmup(const ExecutionWarmup& r) override {
+    ++physical.counters.warmups;
+    physical.counters.warmed_capacity = r.request_capacity;
+    return Status::OK();
   }
   Status Close() override {
     auto& c = physical.counters;
@@ -109,14 +125,20 @@ class BorrowedOperation final : public AccessOperator {
     return Status::OK();
   }
   Status Initialize(const RemoteRegionDesc&) override {
-    auto& c = physical_->counters;
-    if (owner_) c.bad_order = true; // ownership must move before initialization
-    ++c.initializes;
-    std::unique_lock<std::mutex> lock(c.mutex);
-    c.initialize_entered = true;
-    c.changed.notify_all();
-    c.changed.wait(lock, [&] { return !c.block_initialize; });
-    return c.fail_initialize ? Status::Internal("initialization failed") : Status::OK();
+    ++physical_->counters.legacy_initializes;
+    return Status::Internal("borrowed operator must not initialize resources");
+  }
+  Status Warmup(const ExecutionWarmup&) override {
+    ++physical_->counters.legacy_warmups;
+    return Status::Internal("borrowed operator must not allocate workspace");
+  }
+  Status DescribeRequirements(const BatchGetRequest& r, std::uint32_t* capacity) const override {
+    ++physical_->counters.descriptions;
+    if (owner_) physical_->counters.bad_order = true;
+    auto s = AccessOperator::DescribeRequirements(r, capacity);
+    if (!s.ok()) return s;
+    *capacity += physical_->counters.requirement_padding;
+    return ValidateRequestCapacity(*capacity);
   }
   Status Shutdown() override {
     ++physical_->counters.legacy_shutdowns;
@@ -183,7 +205,7 @@ auto Factory(Counters& c) {
 }
 void CheckDestroyed(const Counters& c) {
   CHECK(c.owners == 0 && c.operators == 0 && c.live_states == 0);
-  CHECK(!c.bad_order && c.legacy_shutdowns == 0);
+  CHECK(!c.bad_order && c.legacy_shutdowns == 0 && c.legacy_initializes == 0 && c.legacy_warmups == 0);
 }
 ExecutionPolicy Policy() {
   ExecutionPolicy p;
@@ -195,6 +217,34 @@ void Register(ExecutionDispatcher& d, Counters& p, Counters& g) {
   CHECK(d.RegisterPut(put, Factory(p)).ok());
   CHECK(d.RegisterGet(get, Factory(g)).ok());
   CHECK(d.Initialize(region).ok());
+}
+
+void DescriptionBeforeAllocation() {
+  Counters c;
+  c.capacity = 8;
+  c.requirement_padding = 2; // The provider, not the dispatcher, specifies capacity.
+  ExecutionResourceManager manager;
+  CHECK(manager.Register(get, Factory(c)).ok());
+  CHECK(manager.Initialize(region).ok());
+  BatchGetRequest request;
+  request.indices.bytes = 7 * sizeof(std::int32_t);
+  GetResourceRequirements requirements;
+  CHECK(manager.Describe(get, request, &requirements).code() == StatusCode::kInvalidArgument);
+  CHECK(c.factories == 1 && c.initializes == 0);
+  request.indices.bytes = 6 * sizeof(std::int32_t);
+  CHECK(manager.Describe(get, request, &requirements).ok());
+  CHECK(requirements.config == get && requirements.capacity == 8 && c.initializes == 0);
+  GetResourceLease lease;
+  CHECK(manager.AcquireGet(requirements, &lease).ok() && c.initializes == 1);
+  CHECK(lease.view().Warmup({requirements.capacity, nullptr}).ok());
+  CHECK(c.warmups == 1 && c.warmed_capacity == 8);
+  lease = {};
+  request.indices.bytes = 3;
+  CHECK(manager.Describe(get, request, &requirements).code() == StatusCode::kInvalidArgument);
+  request.indices.bytes = (std::uint64_t(UINT32_MAX) + 1) * sizeof(std::int32_t);
+  CHECK(manager.Describe(get, request, &requirements).code() == StatusCode::kInvalidArgument);
+  CHECK(manager.Shutdown().ok());
+  CheckDestroyed(c);
 }
 
 void ExclusiveLeaseAndIndependentOwner() {
@@ -396,9 +446,12 @@ void FailedGraphPreparationMustRetryClose() {
   Counters p, g;
   ExecutionDispatcher dispatch(Policy());
   Register(dispatch, p, g);
+  std::uint64_t invalid_id = 123;
+  CHECK(dispatch.BeginGetGraph(get, {}, &invalid_id).code() == StatusCode::kInvalidArgument);
+  CHECK(invalid_id == 0 && g.factories == 0 && g.initializes == 0 && g.warmups == 0);
   g.fail_close = true;
   std::uint64_t id = 123;
-  CHECK(!dispatch.BeginGetGraph(get, {}, &id).ok() && id == 0);
+  CHECK(!dispatch.BeginGetGraph(get, {{}, nullptr, 1}, &id).ok() && id == 0);
   CHECK(g.live_states == 1 && g.closes == 1);
   // No Get was submitted: the provider's ordinary Drain would succeed. Only
   // retrying the failed owner close can safely release the graph registration.
@@ -417,7 +470,8 @@ void FailedGraphPreparationMustRetryClose() {
 }  // namespace
 int main() {
   try {
-    ExclusiveLeaseAndIndependentOwner();
+    DescriptionBeforeAllocation();
+  ExclusiveLeaseAndIndependentOwner();
     ConcurrentFirstUseAndDirectionIsolation();
     CapacityFailureDoesNotPoisonResources();
     FailedInitializationRequiresExplicitRecovery();
