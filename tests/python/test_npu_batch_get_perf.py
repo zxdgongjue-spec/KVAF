@@ -377,6 +377,34 @@ def sort_request_plan_prefix(
     return indices, offsets, output_indices
 
 
+def generate_request_plan(torch, args, device, request_ids, address_table,
+                          contiguous_source_token_ids=None):
+    """Shared steady-state source/output distribution for transport comparisons."""
+    if args.source_access_pattern == "random":
+        indices = torch.randint(0, args.table_capacity, (args.request_length,),
+                                dtype=torch.int32, device=device)
+        token_slots = torch.randint(0, args.tokens_per_block, (args.request_length,),
+                                    dtype=torch.int32, device=device)
+    else:
+        source_token_ids = (request_ids % (args.table_capacity * args.tokens_per_block)
+                            if contiguous_source_token_ids is None else contiguous_source_token_ids)
+        if args.source_access_pattern == "shuffled-contiguous":
+            original = source_token_ids
+            source_token_ids = source_token_ids.clone()
+            permutation = torch.randperm(args.miss_count, device=device)
+            source_token_ids[:args.miss_count].copy_(
+                original[:args.miss_count].index_select(0, permutation))
+        indices = (source_token_ids // args.tokens_per_block).to(torch.int32)
+        token_slots = (source_token_ids % args.tokens_per_block).to(torch.int32)
+    offsets = token_slots * args.token_bytes
+    output_indices = (request_ids.to(torch.int32) if args.output_access_pattern == "contiguous"
+                      else torch.randperm(args.request_length, device=device).to(torch.int32))
+    if args.sort_input_indices:
+        indices, offsets, output_indices = sort_request_plan_prefix(
+            torch, address_table, indices, offsets, output_indices, args.miss_count)
+    return indices, offsets, output_indices
+
+
 def print_samples(
     operation: str,
     samples: list[float],
@@ -828,53 +856,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         contiguous_source_token_ids = request_ids % total_tokens
 
         def create_request_plan() -> tuple[object, object, object]:
-            if args.source_access_pattern == "random":
-                # Preserve the established benchmark's full-table random source
-                # distribution as the default behavior.
-                indices = torch.randint(
-                    0,
-                    table_capacity,
-                    (request_length,),
-                    dtype=torch.int32,
-                    device=device,
-                )
-                token_slots = torch.randint(
-                    0,
-                    tokens_per_block,
-                    (request_length,),
-                    dtype=torch.int32,
-                    device=device,
-                )
-            else:
-                source_token_ids = contiguous_source_token_ids
-                if args.source_access_pattern == "shuffled-contiguous":
-                    source_token_ids = contiguous_source_token_ids.clone()
-                    active_permutation = torch.randperm(
-                        miss_count_value, device=device
-                    )
-                    source_token_ids[:miss_count_value].copy_(
-                        contiguous_source_token_ids[:miss_count_value].index_select(
-                            0, active_permutation
-                        )
-                    )
-                indices = (source_token_ids // tokens_per_block).to(torch.int32)
-                token_slots = (source_token_ids % tokens_per_block).to(torch.int32)
-            offsets = token_slots * token_bytes
-            output_indices = (
-                request_ids.to(torch.int32)
-                if args.output_access_pattern == "contiguous"
-                else torch.randperm(request_length, device=device).to(torch.int32)
-            )
-            if args.sort_input_indices:
-                indices, offsets, output_indices = sort_request_plan_prefix(
-                    torch,
-                    device_table.addresses,
-                    indices,
-                    offsets,
-                    output_indices,
-                    miss_count_value,
-                )
-            return indices, offsets, output_indices
+            return generate_request_plan(torch, args, device, request_ids, device_table.addresses,
+                                         contiguous_source_token_ids)
 
         if args.kernel_profile:
             runtime.start_batch_get_kernel_profile()

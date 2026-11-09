@@ -1,0 +1,203 @@
+"""Scatter benchmark accounting; no torch, CANN, or hardware imports."""
+import math
+import random
+import statistics
+
+CPU_MAGIC = 0x4B56414650524631
+PROFILE_MAGIC = 0x4B56415343505232
+
+# Python 3.11 Random.randbytes(n) calls getrandbits(n * 8), whose bit count
+# must fit a C int. Keep chunks word-aligned so seeded output is identical to
+# one large randbytes call for sizes that the original call can handle.
+RANDOM_SOURCE_CHUNK_BYTES = 16 * 1024 * 1024
+MAX_RANDOM_SOURCE_CHUNK_BYTES = (((1 << 31) - 1) // 8) & ~3
+
+
+def random_byte_chunks(rng, byte_count, chunk_bytes=RANDOM_SOURCE_CHUNK_BYTES):
+    """Yield exact, bounded random byte ranges, including a partial final word."""
+    if byte_count < 0:
+        raise ValueError("random source byte count must be nonnegative")
+    if not 0 < chunk_bytes <= MAX_RANDOM_SOURCE_CHUNK_BYTES or chunk_bytes % 4:
+        raise ValueError("random source chunk must be word-aligned and fit the C int bit count")
+    for offset in range(0, byte_count, chunk_bytes):
+        yield offset, rng.randbytes(min(chunk_bytes, byte_count - offset))
+
+
+def fill_random_bytes(buffer, rng, chunk_bytes=RANDOM_SOURCE_CHUNK_BYTES):
+    """Refresh caller-owned storage without resizing it or allocating a full copy."""
+    target = memoryview(buffer).cast("B")
+    for offset, data in random_byte_chunks(rng, len(target), chunk_bytes):
+        target[offset:offset + len(data)] = data
+
+
+SCATTER_CHUNK_ROWS = 1024
+PAYLOAD_TIMINGS = ("end_to_end_ns", "cpu_comm_ns", "cpu_write_ns",
+                   "aiv_body_ns", "aiv_wall_ns", "aiv_scatter_ns")
+HOST_TIMINGS = (
+    "host_binding_ns", "host_tensor_metadata_ns", "host_stream_resolve_ns",
+    "host_native_ns", "host_runtime_validation_ns", "host_operator_ns",
+    "host_mutex_wait_ns", "host_capture_query_ns", "host_prior_drain_ns",
+    "host_input_ns", "host_launch_ns", "host_status_copy_enqueue_ns",
+    "host_stream_sync_ns", "host_status_validate_ns",
+)
+
+
+def request_values(args, seed):
+    """One call's active token prefix, followed by deliberately invalid capacity.
+
+    full-blocks fetches every token once at 100% activity. The AICPU reference
+    instead samples one token from each block; sampled-tokens permits repeats.
+    This helper deliberately has no torch/hardware dependency.
+    """
+    rng = random.Random(seed)
+    count = args.miss_count
+    source_rows = args.blocks * args.tokens_per_block
+    if args.workload == "one-token-per-block":
+        blocks = (rng.sample(range(args.blocks), count) if args.source_pattern == "random"
+                  else list(range(count)))
+        sources = [block * args.tokens_per_block + rng.randrange(args.tokens_per_block)
+                   for block in blocks]
+    elif args.workload == "full-blocks":
+        sources = (rng.sample(range(source_rows), count) if args.source_pattern == "random"
+                   else list(range(count)))
+    elif args.source_pattern == "random":
+        sources = [rng.randrange(source_rows) for _ in range(count)]
+    else:
+        sources = [i % source_rows for i in range(count)]
+    rows = list(range(count))
+    if args.output_order == "random":
+        rng.shuffle(rows)
+    padding = [-1] * (args.request_length - count)
+    return ([row // args.tokens_per_block for row in sources] + padding,
+            [(row % args.tokens_per_block) * args.token_bytes for row in sources] + padding,
+            [row * args.output_row_step for row in rows] + padding)
+
+
+def sample_metrics(sample):
+    """Add per-call us and payload GB/s to JSON and CSV, without double counting."""
+    result = dict(sample)
+    payload = result["payload_bytes"]
+    if payload <= 0:
+        raise ValueError("performance calls require a positive active payload")
+    if "aiv_wall_ns" in result:
+        # Subtract elapsed durations, never absolute Host/device timestamps.
+        outside = result["end_to_end_ns"] - result["aiv_wall_ns"]
+        if outside < 0:
+            raise ValueError("AIV wall time exceeds synchronous call; check the counter frequency")
+        result["call_outside_aiv_ns"] = outside
+    if "host_binding_ns" in result:
+        # Both are Host durations. The difference includes Python/pybind entry,
+        # overload dispatch and the return path outside BatchGetImpl's timer.
+        # Async enqueue + external synchronization measures a shorter binding
+        # call than the whole sample. Do not mislabel the external device wait
+        # as Python dispatch. Existing synchronous callers use the old default.
+        outside = result.get("host_call_ns", result["end_to_end_ns"]) - result["host_binding_ns"]
+        if outside < 0:
+            raise ValueError("binding time exceeds the measured BatchGet call")
+        result["host_python_dispatch_ns"] = outside
+    for key, value in list(result.items()):
+        if key.endswith("_ns"):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid duration: {key}")
+            result[key[:-3] + "_us"] = value / 1000.0
+    for key in PAYLOAD_TIMINGS:
+        if key in result:
+            if result[key] <= 0:
+                raise ValueError(f"payload duration must be positive: {key}")
+            result[key[:-3] + "_gbps"] = payload / result[key]
+    return result
+
+
+def percentile(values, q):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    lo, hi = math.floor(position), math.ceil(position)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (position - lo)
+
+
+def summarize(samples, payload_bytes):
+    """Decimal GB/s: bytes/ns; aggregate rate is bytes summed / time summed."""
+    if not samples or any(not math.isfinite(x) or x <= 0 for x in samples):
+        raise ValueError("timing samples must be finite and positive")
+    if payload_bytes <= 0:
+        raise ValueError("payload bytes must be positive")
+    return dict(samples=len(samples), mean_ms=statistics.mean(samples) / 1e6,
+                min_ms=min(samples) / 1e6, p50_ms=percentile(samples, .5) / 1e6,
+                p95_ms=percentile(samples, .95) / 1e6, max_ms=max(samples) / 1e6,
+                effective_gbps=payload_bytes * len(samples) / sum(samples))
+
+
+def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
+    """Durations only within a clock domain; never subtract CPU and AIV clocks."""
+    if not math.isfinite(clock_mhz) or clock_mhz <= 0:
+        raise ValueError("AIV counter frequency must be positive and finite")
+    if len(records) != cores or [r["core"] for r in records] != list(range(cores)):
+        raise ValueError("profile core count/order mismatch")
+    sequence = records[0]["sequence"]
+    pipeline = records[0].get("pipeline", 0)
+    for core, r in enumerate(records):
+        expected_requests = requests * (core + 1) // cores - requests * core // cores
+        if (r["magic"] != PROFILE_MAGIC or not sequence or r["sequence"] != sequence
+                or r["requests"] != expected_requests or r["bytes"] != expected_requests * token_bytes):
+            raise ValueError("profile sequence/magic/payload mismatch")
+        if not 0 < r["start_cycle"] <= r["inputs_ready_cycle"] <= r["done_cycle"] <= r["finish_cycle"]:
+            raise ValueError("invalid AIV timeline")
+        if r.get("pipeline", 0) != pipeline or pipeline not in (0, 1):
+            raise ValueError("inconsistent scatter pipeline mode")
+        if pipeline or "scatter_cycles" in r:
+            start, finish = r.get("scatter_start_cycle", 0), r.get("scatter_finish_cycle", 0)
+            active, waiting = r.get("scatter_cycles", 0), r.get("ready_wait_cycles", 0)
+            if expected_requests:
+                if not (r["inputs_ready_cycle"] <= start < finish <= r["finish_cycle"]
+                        and 0 < active <= finish - start and r.get("scatter_chunks", 0) > 0):
+                    raise ValueError("invalid scatter copy timeline")
+            elif start or finish or active or r.get("scatter_chunks", 0):
+                raise ValueError("idle core reported scatter copies")
+            if waiting < 0 or active + waiting > r["finish_cycle"] - r["inputs_ready_cycle"]:
+                raise ValueError("invalid scatter wait/copy accounting")
+    cpu = records[0]
+    if not cpu["inputs_ready_cycle"] <= cpu["notify_cycle"] <= cpu["done_cycle"]:
+        raise ValueError("invalid notify timeline")
+    if cpu["cpu_magic"] != (CPU_MAGIC ^ (sequence << 32)):
+        raise ValueError("CPU report missing; rebuild and restart CPU service")
+    if not 0 < cpu["cpu_comm_ns"] <= cpu["cpu_write_ns"]:
+        raise ValueError("invalid CPU communication window")
+    for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns"):
+        if cpu[key] < 0:
+            raise ValueError("negative CPU duration")
+    ns_per_cycle = 1000.0 / clock_mhz
+    first_start = min(r["start_cycle"] for r in records)
+    last_finish = max(r["finish_cycle"] for r in records)
+    result = {key: cpu[key] for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_write_ns",
+                                       "cpu_comm_ns", "cpu_post_ns", "cpu_cq_wait_ns")}
+    result.update(
+        pipeline=pipeline,
+        aiv_body_ns=max(r["finish_cycle"] - r["start_cycle"] for r in records) * ns_per_cycle,
+        aiv_input_ns=max(r["inputs_ready_cycle"] - r["start_cycle"] for r in records) * ns_per_cycle,
+        aiv_build_notify_ns=(cpu["notify_cycle"] - cpu["inputs_ready_cycle"]) * ns_per_cycle,
+        aiv_notify_to_done_ns=(cpu["done_cycle"] - cpu["notify_cycle"]) * ns_per_cycle,
+        aiv_scatter_ns=max(r.get("scatter_cycles", r["finish_cycle"] - r["done_cycle"])
+                           for r in records) * ns_per_cycle,
+        # All AIV timestamps use the same system counter. These wall intervals
+        # form a non-overlapping timeline even when worker launches are skewed.
+        aiv_wall_ns=(last_finish - first_start) * ns_per_cycle,
+        aiv_input_wall_ns=(cpu["inputs_ready_cycle"] - first_start) * ns_per_cycle,
+        aiv_scatter_tail_ns=(last_finish - cpu["done_cycle"]) * ns_per_cycle,
+        aiv_launch_skew_ns=(max(r["start_cycle"] for r in records) - first_start) * ns_per_cycle,
+    )
+    if all("ready_wait_cycles" in r for r in records):
+        result["aiv_ready_wait_ns"] = max(r["ready_wait_cycles"] for r in records) * ns_per_cycle
+    host = cpu.get("host_profile")
+    if host is not None:
+        if any(key not in host or not math.isfinite(host[key]) or host[key] < 0
+               for key in HOST_TIMINGS):
+            raise ValueError("invalid or incomplete Host profile")
+        # Detect a mismatched/old binding or an unshared profiling context.
+        # Prepared submissions read Tensor metadata once during setup. The
+        # stream timer still includes torch_npu's required Host-queue fence.
+        if any(host[key] <= 0 for key in ("host_binding_ns", "host_native_ns", "host_operator_ns")):
+            raise ValueError("Host profile missing; rebuild Runtime, binding and Host together")
+        if not host["host_operator_ns"] <= host["host_native_ns"] <= host["host_binding_ns"]:
+            raise ValueError("invalid Host profile containment")
+        result.update({key: host[key] for key in HOST_TIMINGS})
+    return result

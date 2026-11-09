@@ -145,3 +145,20 @@ PASS: mode=cpu_push_scatter cores=1 token_bytes=656 counts=[0, 1, 7, 19, 8193, 8
 Gather 使用 `test_aiv_gather_batch_get.py` 和对应 gather `.o`。兼容入口
 `test_aiv_sequential_batch_get.py` 根据 `KVAF_AIV_BATCH_GET_MODES` 为各模式启动
 独立进程。未启用 `KVAF_RUN_NPU_TESTS=1` 返回 77，属于跳过。
+
+## Scatter 性能回归
+
+miss-count 脚本固定使用 prepared 提交，提交后调用 `torch.npu.synchronize()`，
+并将 profile 快照放在计时区间之外。以下示例使用每 block 128 个 token。
+
+```bash
+DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
+  bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+    --single --token-bytes 656 --tokens-per-block 128 --table-capacity 16384 \
+    --request-length 32768 --miss-count 8192 --aiv-cores 4 --pipeline 1 \
+    --warmup 3 --iterations 100 \
+    --json results/scatter-aligned.json --csv results/scatter-aligned.csv
+```
+
+加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于
+请求和数据随样本变化的端到端性能回归。
