@@ -10,9 +10,11 @@
 namespace kvaf::peer {
 
 constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
-// Version 8 adds prefix/suffix publication to the CPU push mailbox protocol.
-// CPU service and NPU runtime must be rebuilt together.
-constexpr uint16_t kProtocolVersion = 8U;
+// Version 6 exposes candidate metadata before allocation so adaptive startup
+// can group EIDs by K-side UB device and benchmark each device only once.
+constexpr uint16_t kProtocolVersion = 6U;
+// Scatter's mailbox handshake and session commands require matching peers.
+constexpr uint16_t kCpuPushProtocolVersion = 8U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -33,6 +35,11 @@ enum class Command : uint16_t {
   kStopCpuPushGet = 13U,
   kStopGatherLanes = 14U,
 };
+
+inline constexpr uint16_t ProtocolVersion(Command command) {
+  return command == Command::kOpenCpuPushGet || command == Command::kStartCpuPushGet ||
+         command == Command::kStopCpuPushGet ? kCpuPushProtocolVersion : kProtocolVersion;
+}
 
 enum class Result : int32_t {
   kOk = 0,
@@ -186,14 +193,14 @@ inline constexpr uint16_t ResponseCommand(Command command) {
 }
 
 inline constexpr MessageHeader MakeHeader(Command command, uint32_t bytes) {
-  return MessageHeader{kProtocolMagic, kProtocolVersion,
+  return MessageHeader{kProtocolMagic, ProtocolVersion(command),
                        static_cast<uint16_t>(command), bytes};
 }
 
 inline bool IsValidHeader(const MessageHeader& header, Command command,
                           std::size_t expected_bytes) {
   return header.magic == kProtocolMagic &&
-         header.version == kProtocolVersion &&
+         header.version == ProtocolVersion(command) &&
          header.command == static_cast<uint16_t>(command) &&
          header.bytes == expected_bytes;
 }
@@ -201,7 +208,7 @@ inline bool IsValidHeader(const MessageHeader& header, Command command,
 inline bool IsValidResponseHeader(const MessageHeader& header, Command command,
                                   std::size_t expected_bytes) {
   return header.magic == kProtocolMagic &&
-         header.version == kProtocolVersion &&
+         header.version == ProtocolVersion(command) &&
          header.command == ResponseCommand(command) &&
          header.bytes == expected_bytes;
 }

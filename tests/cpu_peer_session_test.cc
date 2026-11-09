@@ -9,6 +9,13 @@
 namespace {
 using namespace kvaf::peer;
 
+static_assert(ProtocolVersion(Command::kAllocateRegion) == 6U);
+static_assert(ProtocolVersion(Command::kEnableGatherLanes) == 6U);
+static_assert(ProtocolVersion(Command::kStopGatherLanes) == 6U);
+static_assert(ProtocolVersion(Command::kOpenCpuPushGet) == 8U);
+static_assert(ProtocolVersion(Command::kStartCpuPushGet) == 8U);
+static_assert(ProtocolVersion(Command::kStopCpuPushGet) == 8U);
+
 Result Exchange(kvaf::CpuService& service, Command command,
                 bool wrong_size = false, bool truncated = false) {
   int sockets[2];

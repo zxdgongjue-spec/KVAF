@@ -251,13 +251,16 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
-  scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
-  if (!initialized_) {
-    return Status::NotInitialized("Runtime has not been initialized");
-  }
   if (execution.trusted_npu_request) {
+    scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
+    if (!initialized_) {
+      return Status::NotInitialized("Runtime has not been initialized");
+    }
     validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
+  }
+  if (!initialized_) {
+    return Status::NotInitialized("Runtime has not been initialized");
   }
   const AccessTableState* table = nullptr;
   if (request.access_table.opaque != 0) {
@@ -346,7 +349,6 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
   }
-  validation_timer.Stop();
   return access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
 }

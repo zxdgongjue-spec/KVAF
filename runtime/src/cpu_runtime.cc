@@ -918,11 +918,11 @@ void SendStatus(int fd, Command command, Result result) {
 
 void HandleClient(int fd, CpuService* service) {
   MessageHeader header{};
-  if (!ReadAll(fd, &header, sizeof(header)) || header.magic != kvaf::peer::kProtocolMagic ||
-      header.version != kvaf::peer::kProtocolVersion) {
+  if (!ReadAll(fd, &header, sizeof(header)) || header.magic != kvaf::peer::kProtocolMagic) {
     return;
   }
   const Command command = static_cast<Command>(header.command);
+  if (header.version != kvaf::peer::ProtocolVersion(command)) return;
   switch (command) {
     case Command::kAllocateRegion: {
       AllocateRegionRequest request{};

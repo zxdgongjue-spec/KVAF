@@ -21,6 +21,21 @@ namespace d = direct_hccp;
 using namespace sequential_detail;
 namespace {
 Status Error(const char* what) { return Status::Internal(std::string("AIV sequential BatchGet: ") + what); }
+
+void FillTrustedScatterInput(const BatchGetRequest& r, const AccessOperatorConfig& config,
+                             KvafExecuteBatchGetKernelArgs* a) {
+  const auto& table = r.device_access_table;
+  *a = {};
+  a->address_table = Ptr(table.addresses.data); a->valid_table = Ptr(table.valid.data);
+  a->indices = Ptr(r.indices.data); a->offsets = Ptr(r.offsets.data);
+  a->miss_count = Ptr(r.miss_count.data); a->output_indices = Ptr(r.output_indices.data);
+  a->output = Ptr(r.output.data); a->table_capacity = table.addresses.bytes / 8;
+  a->request_capacity = r.indices.bytes / 4;
+  a->output_rows = r.output.bytes / config.batch_get_token_bytes;
+  a->token_bytes = config.batch_get_token_bytes; a->tokens_per_block = r.tokens_per_block;
+  a->block_count = config.npu_core_count; a->jettys_per_core = 2;
+}
+
 // The exported segment is the public 48-byte urma_seg_t wire ABI; no liburma is
 // loaded on the NPU Host or AIV. ubva.va is packed at byte 20, len at byte 32.
 constexpr uint32_t kSegmentBytes = 48;
@@ -339,7 +354,7 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   auto args = s.args;
   if (exec.execution.trusted_npu_request) args.reserved |= kScatterTrustedInputs;
   scatter_host::Timer input_timer(scatter_host::kInput);
-  if (exec.execution.trusted_npu_request) FillInput(*exec.request, s.config, &args.request);
+  if (exec.execution.trusted_npu_request) FillTrustedScatterInput(*exec.request, s.config, &args.request);
   else result = Input(exec, s.config, &args.request);
   input_timer.Stop();
   if (!result.ok()) return result;

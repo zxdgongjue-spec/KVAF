@@ -36,7 +36,8 @@ GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
-每核 192 B 区域。CPU mailbox 使用 V8 控制协议，部署时同步重编 CPU 服务、NPU Host 和 kernel。
+每核 192 B 区域。Scatter mailbox 的打开、启动和停止命令使用 V8，Gather 和公共控制命令
+使用 V6。部署 Scatter 时同步重编 CPU 服务、NPU Host 和 Scatter kernel。
 
 原 `direct_read` 继续使用 `kvaf_execute_batch_get_kernels.o`。三个模块独立编译，
 避免重复链接 SDK 全局符号。顺序模式接收标准 direct/旧 sequential 路径时，
