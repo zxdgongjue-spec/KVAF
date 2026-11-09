@@ -2,28 +2,24 @@
 
 ## 数据通路
 
-当前实现无流水的整批顺序路径，默认模式仍为 `direct_read`。总体设计见
+默认 BatchGet 模式为 `direct_read`。总体设计见
 [三阶段设计](aiv_batch_get_scatter_gather_design.md)。
 
 | 模式 | 执行顺序 |
 | --- | --- |
-| `cpu_push_scatter` | AIV 生成源地址清单并发布 notify → CPU READ 清单 → 四路 Jetty WRITE payload → done → AIV scatter 写目标 HBM |
+| `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 四路 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
 | `gather_read` | AIV WRITE 清单、command、notify → CPU gather → 最终 ACK → AIV 多 SGE READ 到 output → CQ 完成 |
 
-Scatter 只消费本轮整批 done，不消费 chunk ready。Gather 的
-`pipeline_chunk_bytes=0`，不把 `~sequence` started ACK 当成完成。
+Scatter 默认按 Jetty shard 的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 可在整批 done
+后消费。可信输入超过 1024 个有效行时，内核先发布首段清单，再合批发布剩余清单。
+Gather 使用 `pipeline_chunk_bytes=0`，以最终 ACK 为完成条件。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
-Scatter 当前使用两个 32 KiB UB bank，顺序等待 CPU 整批 done 后执行 GM→UB→GM。
-精确长度的 `DataCopyPad<uint8_t>` 不从 packed staging 多读 padding，复用 bank 前等待写出完成。
-清单可运行时选择多核 SIMT 或 UB 构建，具体见 [性能测试说明](aiv_scatter_performance.md)。
+Scatter 使用 64 KiB UB stage ring 执行 GM→UB→GM，通过 MTE3→MTE2 事件安全复用 bank。
+精确长度的 `DataCopyPad<uint8_t>` 用于读取 packed staging 和逐行写入目标。
 包含 SIMT VF 的当前二进制由 loader 设置 `dynUBufSize=65536` 预留共享 UB；
 旧纯 SIMD loader 的零动态 UB 配置不适用于这个混合二进制。
 GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
-
-排障用的九种提前返回探针、逐字节 UB 比较、诊断版本、地址/指纹日志及采集脚本
-已移除。正常 kernel 始终完成完整 scatter，正确性由端到端测试回读全部输出验收。
-Host 保留每核 magic、sequence、result、phase 检查，以及 ACL 错误的阶段和序号。
 
 ## 独立二进制与类型声明
 
@@ -38,10 +34,8 @@ Host 保留每核 magic、sequence、result、phase 检查，以及 ACL 错误�
 | Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV1` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
-Scatter 参数末尾的保留字段默认是 0，可通过版本化 tag 开启性能计时；旧探针 ID
-仍会被 kernel 拒绝。176 B 参数和 64 B 业务状态布局不变，计时使用独立的每核
-128 B 区域。部署时同步更新 Host/kernel，采集 CPU 通信计时还需更新 CPU 服务。
-控制协议结构大小不变，计时报告按请求 opt in。
+Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
+每核 192 B 区域。CPU mailbox 使用 V8 控制协议，部署时同步重编 CPU 服务、NPU Host 和 kernel。
 
 原 `direct_read` 继续使用 `kvaf_execute_batch_get_kernels.o`。三个模块独立编译，
 避免重复链接 SDK 全局符号。顺序模式接收标准 direct/旧 sequential 路径时，
@@ -90,7 +84,7 @@ runtime.initialize(ddr_bytes, slot_size)
 
 ## 构建与完整回归
 
-CPU 端首次配置匹配部署环境的 UMDK；已有正常运行的服务可以沿用：
+CPU 端使用与部署环境匹配的 UMDK 重编并启动服务：
 
 ```bash
 cmake -S . -B build-cpu -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_URMA_ROOT=/path/to/umdk
@@ -138,22 +132,3 @@ PASS: mode=cpu_push_scatter cores=1 token_bytes=656 counts=[0, 1, 7, 19, 8193, 8
 Gather 使用 `test_aiv_gather_batch_get.py` 和对应 gather `.o`。兼容入口
 `test_aiv_sequential_batch_get.py` 根据 `KVAF_AIV_BATCH_GET_MODES` 为各模式启动
 独立进程。未启用 `KVAF_RUN_NPU_TESTS=1` 返回 77，属于跳过。
-
-## 验证记录与后续计时
-
-此前 scatter 实际二进制缺少 `K_TYPE_AIV`，在 MTE2 路径出现 errcode 78。
-补充类型声明后，用户已确认探针通过，并提供了 1 核、656 B、8193 请求容量的
-完整回归 PASS。清理排障分支后仍需重编并按上述命令做目标机回归；多核和边界
-组合以各自实际结果为准。
-
-本地保留生产 kernel 的 CPU 搬运/协议模型、Host 异步生命周期、独立模块构建、
-元数据和 Python 模式隔离回归。模型不代替 CANN 编译或设备测试。
-
-已新增独立性能入口、包装脚本和可关闭的 CPU/AIV 分段计时，见
-[scatter 性能测试与指标口径](aiv_scatter_performance.md)。测试分为关闭打点的
-baseline 和带打点的 profiled 两轮，分别输出端到端、CPU→HBM 通信及本地 scatter
-耗时/有效带宽，并保存 JSON/CSV 原始样本。
-
-现有 `test_npu_batch_get_perf.py`/kernel profile 继续用于 `direct_read`。
-scatter 使用 `tests/run_remote_cpu_scatter_perf.sh` 及 `start_scatter_profile` /
-`scatter_profile` / `stop_scatter_profile` 接口，计时不复用业务完成状态字段。

@@ -66,8 +66,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   endif()
 
   add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/cpu_urma_discovery.cc
-    src/cpu_gather_executor.cc src/cpu_push_get_transport.cc src/cpu_push_get_worker.cc
-    src/cpu_write_benchmark.cc)
+    src/cpu_gather_executor.cc src/cpu_push_get_transport.cc src/cpu_push_get_worker.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE

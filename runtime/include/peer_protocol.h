@@ -3,7 +3,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include "cpu_write_benchmark.h"
 
 // This protocol carries control-plane records between two Runtime peers. The
 // first deployment is CPU DDR served to an Ascend NPU, but the records carry
@@ -33,7 +32,6 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kStopGatherLanes = 14U,
-  kCpuWriteBenchmark = 15U,
 };
 
 enum class Result : int32_t {
@@ -168,17 +166,6 @@ struct CpuPushGetSessionRequest {
   MessageHeader header;
   uint64_t session_id;
 };
-struct CpuWriteBenchmarkRequest {
-  MessageHeader header;
-  uint64_t region_base;
-  cpu_push::WriteBenchmarkOptions options;
-};
-struct CpuWriteBenchmarkResponse {
-  MessageHeader header;
-  int32_t result;
-  char error[192];
-  cpu_push::WriteBenchmarkResult benchmark;
-};
 #pragma pack(pop)
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
@@ -193,9 +180,6 @@ static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI
 static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 392U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
-static_assert(sizeof(CpuWriteBenchmarkRequest) == 72U, "WRITE benchmark request ABI changed");
-static_assert(sizeof(CpuWriteBenchmarkResponse) == 276U + 32U * cpu_push::kWriteBenchmarkSamples,
-              "WRITE benchmark response ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;

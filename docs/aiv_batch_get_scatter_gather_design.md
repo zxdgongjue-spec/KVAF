@@ -1,7 +1,6 @@
 # AIV BatchGet Scatter / Gather 三阶段设计
 
-> 2026-11-05：第3.1节已更新为当前 mailbox 控制通路；其余阶段保留最初设计过程。
-> 当前固定优化、流水参数及计时口径见 [性能测试说明](aiv_scatter_performance.md)。
+> 第 3.1 节描述当前 scatter mailbox 控制通路，其余章节保留原阶段设计。
 
 ## 1. 文档状态与基线
 
@@ -9,7 +8,7 @@
 - 工作分支：`codex/aiv-urma-scatter-gather`。
 - 基线：`origin/main`，提交 `c4375e13d7a9519d907ab6a5d11227795f207286`。
 - 参考：`origin/aicpu-urma`，提交 `8bc5a2a3a1840b40f0e5fc80ee4f361cb62ffcba`。
-- 状态：第一阶段代码已落地，本地模型与 Host 生命周期测试通过；CANN 编译和双机硬件验收待完成。第二、三阶段仍为设计。
+- 状态：Scatter 已支持 mailbox、首段快启和按 Ready 消费。实际构建及设备验收以对应版本的回归结果为准。
 - 第一阶段的代码入口、构建与测试说明见 [第一阶段实现说明](aiv_batch_get_stage1.md)。
 
 目标是在 main 的 AIV 后端上支持 `cpu_push_scatter` 和 `gather_read` 两种
@@ -71,7 +70,7 @@ SQ doorbell 通知通信硬件处理队列；notify 通知 CPU 软件处理新�
 ### 3.1 Scatter：AIV 推送 CPU mailbox
 
 当前实现由 NPU Host 注册 HBM workspace、CPU 服务注册可远端写入的 mailbox，
-通过 V7 OpenCpuPushGet 交换两端 segment/token 和四路 Jetty。Jetty 0 同时提供
+通过 V8 OpenCpuPushGet 交换两端 segment/token 和四路 Jetty。Jetty 0 同时提供
 AIV 可发起控制 WRITE 的 USER_CTL SQ；CPU 四条 payload 队列保持不变。
 
 ```text
@@ -87,9 +86,10 @@ WRITE header + 有效 sources[] 到 CPU mailbox
 
 头、清单和 notify 分开发送，绝不覆盖 CPU 拥有的 done/Ready/marker 源区。
 每个有界控制批次只等待强序尾 CQE；最终 notify 排在全部清单之后。
+可信输入超过 1024 个有效行时，核0先发布首段，随后合批发布余下清单和后缀序号。
+CPU 观察到后缀序号后读取其余地址。
 `ReadRequest()`/`ReadDescriptor()` 名称沿用原接口，热路径不再发出 URMA READ。
-具体 DMA 可见性与性能仍须在目标设备验证，当前说明见
-[性能测试说明](aiv_scatter_performance.md)。
+完成语义和流水参数见 [实现与验证说明](aiv_batch_get_stage1.md)。
 
 ### 3.2 Gather：AIV 手写控制 WRITE WQE
 
