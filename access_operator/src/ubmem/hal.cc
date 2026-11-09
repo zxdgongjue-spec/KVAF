@@ -1,7 +1,10 @@
 #include "ubmem/hal.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace kvaf::ubmem {
@@ -70,8 +73,20 @@ Status Mapping::AllocateHost(std::uint64_t bytes, FabricHandle* descriptor) {
   }
   // MEM_HOST_SIDE, MEM_HUGE_PAGE_TYPE, MEM_P2P_DDR_TYPE.
   MemoryProperty prop{0, 0, 0, 1, 3, 0};
+  // HAL status codes are not errno values. Capture errno immediately, before
+  // logging or cleanup can replace it; some HAL failures leave it at zero.
+  errno = 0;
   int ret = hal_->create(&handle_, bytes, &prop, 0);
-  if (ret != 0) return HalError("halMemCreate(Host P2P DDR)", ret);
+  const int create_errno = errno;
+  if (ret != 0) {
+    const std::string message = "halMemCreate(Host P2P DDR) failed, ret=" +
+        std::to_string(ret) + "; bytes=" + std::to_string(bytes) +
+        "; cpu_service_pid=" + std::to_string(getpid()) +
+        "; errno=" + std::to_string(create_errno) + " (" +
+        (create_errno ? std::strerror(create_errno) : "not supplied by HAL") + ")";
+    std::fprintf(stderr, "[KVAF_UBMEM] %s\n", message.c_str());
+    return Status::Internal(message);
+  }
   bytes_ = bytes;
   Status status = ReserveAndMap();
   if (!status.ok()) return status;

@@ -183,6 +183,23 @@ KVAF_EXECUTION_SUMMARY PASS report=/absolute/path/to/validation-full.json
   此选项为 ON，也因 `kvaf_npu_runtime` 缺少同名编译宏而误报；更新本分支并重新
   执行 `./build.sh npu`。这是 NPU 本地能力检查，与 CPU 地址、端口无关。
 - 初始化/首调失败：CPU 地址与版本、UB/EID 路由、Fabric 能力及 kernel 安装。
+- `ubmem/initialize` 报 `halMemCreate(Host P2P DDR) failed, ret=38`：错误发生在
+  CPU 服务的物理内存分配阶段，尚未导出 Fabric handle 或在 NPU 建立映射。
+  HAL 返回码不等同于 Linux `errno`，不能据此认定设备不支持 UBMEM 或内存泄漏。
+  新版错误同时包含申请的 `bytes`、`cpu_service_pid` 和调用后立即保存的 `errno`；
+  `errno=0` 只表示 HAL 未提供该信息。查看 CPU 服务用户的驱动 plog，结合 PID 和
+  失败时间匹配记录，日志路径被重定向时使用实际目录：
+
+  ```bash
+  rg -n -i -C 3 'halMemCreate|Mem create failed|DRV_ERROR_FILE_OPS' \
+    "$HOME/ascend/log" 2>/dev/null | tail -100
+  ```
+
+  若单独 `--modes urma` 和 `--modes ubmem` 通过，但默认顺序失败，分别记录
+  同一 CPU 服务进程下 `--modes urma ubmem --cases matrix` 与
+  `--modes ubmem urma --cases matrix` 的结果，并另测 `--modes urma+ubmem`。
+  前两项检查跨 Runtime 的模式切换，最后一项检查同一 DDR 池上的混合访问；
+  单模式通过不能代替这两类验证。更换顺序后通过也不能证明原失败已修复。
 - 旧脚本在 `resources` 案例的 `absent = ...prepare_access_table(keys)` 处报
   `KeyError: 'LockKeys key was not found'`：这是脚本把正常的缺失 key 当成失败。
   更新本分支的测试脚本即可，无需重新构建 CPU/NPU；先用
