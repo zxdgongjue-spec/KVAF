@@ -26,6 +26,27 @@ def profile_log():
         for stage, base in [('total', 400), ('post', 100), ('completion_wait', 200)])
 
 
+def fake_build(folder):
+    root = Path(folder)
+    (root / 'bin').mkdir()
+    (root / 'python/kvaf').mkdir(parents=True)
+    for name in ('get', 'put'):
+        (root / f'bin/kvaf_execute_batch_{name}_kernels.o').touch()
+    return root
+
+
+def fake_sweep_benchmark(command, env, stream, timeout):
+    args = perf.parse_args(command[3:])
+    row = dict.fromkeys(perf.jetty_profile.FIELDS, '0')
+    row.update(token_bytes=args.token_bytes, miss_count=args.miss_count,
+               aiv_cores=args.aiv_cores, jettys_per_core=args.jettys_per_core)
+    perf.jetty_profile.write_csv(args.jetty_csv, [row])
+    Path(args.peer_csv).write_text('peer_eid\n' + '\n'.join(args.peer_eids) + '\n')
+    stream.write(profile_log().replace('p50_cycles=400', f'p50_cycles={args.miss_count}') +
+                 '\nBATCH_GET_JETTY_CSV_WRITTEN csv\nPEER_EID_CONCURRENCY execution=single_kernel\n')
+    return 0
+
+
 def sample(serial=False, peer_count=2, jettys=4):
     lanes = []
     for i in range(jettys):
@@ -39,8 +60,9 @@ def sample(serial=False, peer_count=2, jettys=4):
 class PeerEidTests(unittest.TestCase):
     def args(self, *extra):
         with patch.dict(os.environ, {}, clear=True):
-            return sweep.parse_args(['build-npu', '--peer-eids', ','.join(EIDS),
-                                     '--npu-eid', '3' * 32, '--output-dir', 'logs', *extra])
+            _, (run,) = sweep.parse_args(['build-npu', '--peer-eids', ','.join(EIDS),
+                                          '--npu-eid', '3' * 32, '--output-dir', 'logs', *extra])
+            return run
 
     def test_command_runs_all_eids_in_one_benchmark(self):
         for count in (2, 3, 4, 8, 64):
@@ -83,13 +105,14 @@ class PeerEidTests(unittest.TestCase):
         self.assertEqual(parsed.miss_count, 2048)
         self.assertEqual(parsed.kernel_profile_clock_mhz, 800)
         with patch.dict(os.environ, {'KVAF_BATCH_GET_KERNEL_CLOCK_MHZ': '900'}):
-            parsed = sweep.parse_args(['build-npu', '--peer-eids', ','.join(EIDS),
-                                      '--npu-eid', '3' * 32, '--output-dir', 'logs'])
+            parsed, _ = sweep.parse_args(['build-npu', '--peer-eids', ','.join(EIDS),
+                                          '--npu-eid', '3' * 32, '--output-dir', 'logs'])
             self.assertEqual(parsed.kernel_profile_clock_mhz, 900)
 
     def test_rejects_serializing_or_idle_shapes(self):
         for extra in [('--request-length', '128'), ('--max-inflight-total', '2'),
                       ('--cores', '0'), ('--iterations', '0'), ('--jettys', '1'),
+                      ('--jettys', '4,1'), ('--cores', '1,1'), ('--miss-count', '2048,'),
                       ('--peer-eids', ''),
                       ('--peer-eids', ','.join(f'{i + 1:032x}' for i in range(5))),
                       ('--npu-eid', ''), ('--npu-eid', ','.join(EIDS)),
@@ -179,11 +202,7 @@ class PeerEidTests(unittest.TestCase):
 
     def test_launcher_one_child_environment_logs_and_failure_status(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            (root / 'bin').mkdir()
-            (root / 'python/kvaf').mkdir(parents=True)
-            for name in ('get', 'put'):
-                (root / f'bin/kvaf_execute_batch_{name}_kernels.o').touch()
+            root = fake_build(folder)
             output = root / 'logs'
             args = [str(root), '--peer-eids', ','.join(EIDS), '--npu-eid', '3' * 32,
                     '--output-dir', str(output)]
@@ -216,7 +235,8 @@ class PeerEidTests(unittest.TestCase):
         args = self.args('--miss-count', '2048', '--kernel-profile-clock-mhz', '800')
         lines = []
         with tempfile.TemporaryDirectory() as folder:
-            sweep.write_summary(args, profile_log(), Path(folder), lines.append)
+            row = sweep.summary_row(args, profile_log())
+            sweep.write_summary([row], args.kernel_profile_clock_mhz, Path(folder), lines.append)
             with (Path(folder) / 'batch_get_miss_sweep_summary.csv').open() as stream:
                 reader = csv.DictReader(stream)
                 row = next(reader)
@@ -232,17 +252,82 @@ class PeerEidTests(unittest.TestCase):
                 self.assertIn(f'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage={stage}', lines)
             self.assertIn('p50_GB/s', '\n'.join(lines))
 
+    def test_sweep_four_axes_in_order_with_separate_outputs_and_combined_csvs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = fake_build(folder)
+            output = root / 'logs'
+            args = [str(root), '--peer-eids', ','.join(EIDS), '--npu-eid', '3' * 32,
+                    '--output-dir', str(output), '--token-bytes', '656,1024', '--miss-count', '2048,4096',
+                    '--cores', '1,4', '--jettys', '2,4']
+            expected = [(t, m, c, j) for t in (656, 1024) for m in (2048, 4096)
+                        for c in (1, 4) for j in (2, 4)]
+            with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': 'localhost:29000'}, clear=True), \
+                 patch.object(sweep, 'run_logged', side_effect=fake_sweep_benchmark) as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.main(args), 0)
+            self.assertEqual(run.call_count, len(expected))
+            for (t, m, c, j), call in zip(expected, run.call_args_list):
+                parsed = perf.parse_args(call.args[0][3:])
+                self.assertEqual((parsed.token_bytes, parsed.miss_count, parsed.aiv_cores,
+                                  parsed.jettys_per_core), (t, m, c, j))
+                case = output / f'token_bytes_{t}_miss_count_{m}_aiv_cores_{c}_jettys_per_core_{j}'
+                config = json.loads((case / 'config.json').read_text())
+                self.assertEqual(config['max_inflight_total'], max(2048, c * j * 256))
+                self.assertEqual(config['peer_eids'], EIDS)
+                self.assertTrue((case / 'peer_samples.csv').is_file())
+                self.assertIn(f'p50_cycles={m}', (case / 'batch_get.log').read_text())
+            for filename in ('batch_get_miss_sweep_summary.csv', 'batch_get_jetty_summary.csv'):
+                with (output / filename).open() as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual([tuple(int(row[k]) for k in sweep.SHAPE_COLUMNS) for row in rows], expected)
+                if filename == 'batch_get_miss_sweep_summary.csv':
+                    self.assertEqual([r['p50_us'] for r in rows], [f'{m / 1000:.3f}' for _, m, _, _ in expected])
+            log = (output / 'batch_get.log').read_text()
+            self.assertIn('jetty_counts=2 combinations=16', log)
+            self.assertIn('BATCH_GET_MISS_SWEEP_SUMMARY combinations=16', log)
+            self.assertEqual(log.count('BATCH_GET_MISS_SWEEP_STAGE_SUMMARY'), 3)
+
+    def test_sweep_stops_at_failed_case_and_keeps_prior_logs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = fake_build(folder)
+            output = root / 'logs'
+            args = [str(root), '--peer-eids', ','.join(EIDS), '--npu-eid', '3' * 32,
+                    '--output-dir', str(output), '--miss-count', '2048,4096,8192']
+
+            def timeout_second(command, env, stream, timeout):
+                if perf.parse_args(command[3:]).miss_count == 4096:
+                    stream.write('timed out here\n')
+                    return 124
+                return fake_sweep_benchmark(command, env, stream, timeout)
+
+            with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': 'localhost:29000'}, clear=True), \
+                 patch.object(sweep, 'run_logged', side_effect=timeout_second) as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(sweep.main(args), 124)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(len(list(output.glob('*/batch_get.log'))), 2)
+            self.assertEqual(len(list(output.glob('*/jettys.csv'))), 1)
+            log = (output / 'batch_get.log').read_text()
+            self.assertIn('BATCH_GET_MISS_SWEEP_FAILED token_bytes=656 miss_count=4096', log)
+            self.assertNotIn('BATCH_GET_MISS_SWEEP_SUMMARY', log)
+            self.assertFalse(any(output.glob('*summary.csv')))
+
+    def test_shell_sweep_lists_and_explicit_option_precedence(self):
+        env = dict(KVAF_BATCH_GET_SWEEP_TOKEN_BYTES='656 512', KVAF_BATCH_GET_SWEEP_MISS_COUNTS='2048 4096',
+                   KVAF_BATCH_GET_SWEEP_AIV_CORES='1 2', KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE='2 4')
+        with patch.dict(os.environ, env, clear=True):
+            _, runs = sweep.parse_args(['build-npu', '--peer-eids', ','.join(EIDS), '--npu-eid', '3' * 32,
+                                        '--output-dir', 'logs', '--cores', '4'])
+        self.assertEqual([tuple(sweep.shape_fields(run).values()) for run in runs],
+                         [(t, m, 4, j) for t in (656, 512) for m in (2048, 4096) for j in (2, 4)])
+
     def test_successful_launcher_shows_and_saves_complete_summary(self):
         for peers in (EIDS[:1], EIDS, EIDS + ['4' * 32], EIDS + ['4' * 32, '5' * 32]):
             marker = 'PEER_EID_BASELINE' if len(peers) == 1 else 'PEER_EID_CONCURRENCY'
             mode = {1: 'single_eid_baseline', 2: 'dual_eid_concurrent'}.get(
                 len(peers), 'multi_eid_concurrent')
             with self.subTest(peer_count=len(peers)), tempfile.TemporaryDirectory() as folder:
-                root = Path(folder)
-                (root / 'bin').mkdir()
-                (root / 'python/kvaf').mkdir(parents=True)
-                for name in ('get', 'put'):
-                    (root / f'bin/kvaf_execute_batch_{name}_kernels.o').touch()
+                root = fake_build(folder)
                 output = root / 'logs'
                 args = [str(root), '--peer-eids', ','.join(peers), '--npu-eid', '3' * 32,
                         '--output-dir', str(output), '--miss-count', '2048']
@@ -288,13 +373,11 @@ class PeerEidTests(unittest.TestCase):
                 self.assertEqual((output / 'batch_get_jetty_summary.csv').read_text(),
                                  (output / 'jettys.csv').read_text())
 
-    def test_missing_or_invalid_summary_does_not_create_csv(self):
+    def test_missing_or_invalid_profile_rejects_summary_row(self):
         for text in ('', profile_log().replace('p50_cycles=400', 'p50_cycles=nan'),
                      profile_log().replace('p50_cycles=400', 'p50_cycles=0')):
-            with tempfile.TemporaryDirectory() as folder:
-                with self.assertRaises(ValueError):
-                    sweep.write_summary(self.args(), text, Path(folder), lambda line: None)
-                self.assertFalse((Path(folder) / 'batch_get_miss_sweep_summary.csv').exists())
+            with self.assertRaises(ValueError):
+                sweep.summary_row(self.args(), text)
 
     def test_tee_outputs_before_child_exits_and_keeps_stderr(self):
         with tempfile.TemporaryDirectory() as folder:

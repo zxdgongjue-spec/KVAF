@@ -3,7 +3,7 @@
 `run_peer_eid_sweep.py` 接受一个或多个远端 CPU EID。一个 EID 时退化为单路
 基线，所有 Jetty 都访问该 EID；多个 EID 时，各路 BatchGet 由同一
 Runtime、同一 stream 上的同一次 AIV kernel 发出，各自使用独立 Jetty/SQ/CQ。
-脚本名称保留 sweep，但不逐个 EID 串行跑性能测试。
+脚本可以依次测试多组参数，每组都使用同一份 CPU EID 列表。
 
 ## 构建和运行
 
@@ -74,6 +74,30 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 
 ## 参数和测量口径
 
+### 一次测试多个组合
+
+`--token-bytes`、`--miss-count`、`--cores`、`--jettys` 各接受一个整数或一组逗号分隔的整数。
+脚本按这四个参数的顺序遍历全部组合，最内层先切换 `--jettys`。下面的命令依次测试
+2 × 3 × 2 × 2 = 24 组，每组都由同一个 kernel 并发访问两个 CPU EID。
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:29000 DEVICE_ID=7 \
+python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
+    --peer-eids 00000000003f020000100000df080b00,000000000000060000100000df080100 \
+    --npu-eid 00000000003f030000100000df00eb00 \
+    --token-bytes 656,1024 --miss-count 2048,4096,8192 \
+    --cores 1,2 --jettys 2,4 \
+    --output-dir results/peer-sweep-001
+```
+
+也可沿用旧脚本的空格分隔环境变量 `KVAF_BATCH_GET_SWEEP_TOKEN_BYTES`、
+`KVAF_BATCH_GET_SWEEP_MISS_COUNTS`、`KVAF_BATCH_GET_SWEEP_AIV_CORES`、
+`KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE`。命令行优先于对应环境变量。两者都省略时，
+默认只测一组，使用 656 字节、`miss-count=request-length`、1 core、每核 4 个 Jetty。
+脚本启动 benchmark 前会校验全部组合。运行中某组失败或超时会立即停止，已运行各组的明细保留。
+
+### 参数说明
+
 | 参数 | 含义 |
 | --- | --- |
 | `--peer-eids` | 一个 CPU EID 为单路基线；多个不同 CPU EID 为并发测试，顺序对应 path 0 到 N−1；数量不超过 `--jettys` |
@@ -86,7 +110,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 | `--token-bytes` / `--tokens-per-block` | 默认 656 / 128 |
 | `--warmup` / `--iterations` | 默认 3 / 100，warmup 不计入结果 |
 | `--max-inflight-total` | 总 inflight 上限；单路默认 2048，与原性能测试一致；多路默认 `max(2048, cores * jettys * 256)` |
-| `--timeout` | 完整测试超时秒数，默认 600 |
+| `--timeout` | 每个组合的 benchmark 超时秒数，默认 600 |
 | `--kernel-profile-clock-mhz` | AIV 周期换算频率，默认读取 `KVAF_BATCH_GET_KERNEL_CLOCK_MHZ`，未设置时为 1000 MHz，与原 miss-count 脚本一致 |
 
 双路时，`--cores 1 --jettys 4` 是 1 core、共 4 Jetty，每个 CPU EID 分到 2 个。
@@ -117,8 +141,8 @@ Jetty 数不是 EID 数量的整数倍时，各路分配不对称，公平比较
 ## 查看结果
 
 终端输出与 `tests/run_remote_cpu_batch_get_miss_count_perf.sh` 保持相同的主要结构：
-运行时实时显示原生建链日志、测试阶段、`PERF_RESULT` 和每 Jetty 表，同时写入
-`batch_get.log`；结束后打印三张 `BATCH_GET_MISS_SWEEP_STAGE_SUMMARY` 表：
+运行时实时显示原生建链日志、测试阶段、`PERF_RESULT` 和每 Jetty 表，并写入该组的
+`batch_get.log`；全部组合成功后打印三张 `BATCH_GET_MISS_SWEEP_STAGE_SUMMARY` 表：
 
 | stage | 主要列 |
 | --- | --- |
@@ -129,20 +153,18 @@ Jetty 数不是 EID 数量的整数倍时，各路分配不对称，公平比较
 微秒数使用 `cycles / clock_mhz`，不从四舍五入后的毫秒数换算；
 `p50_GB/s` 使用本次合计的 `miss_count * token_bytes` 除以 kernel_total 的 p50
 时间，以十进制 GB/s 表示，与原脚本口径一致，不再额外乘以 EID 数量。
-每次调用依然只有一个配置（`combinations=1`），传多个 EID 时在该配置内并发。
-没有自动改成原 shell 脚本的 2048/4096/8192 三组请求量。需要对比某一组时，
-在原命令末尾追加例如 `--miss-count 2048`；各路共同分担这 2048 个请求，仍需满足上述最小请求量约束。
 
-- `config.json`：启动参数、命令、设备和 CPU 地址。
-- `batch_get.log`：完整终端日志，包含原生建链/路由、预热、校验、总吞吐、
-  每 Jetty 性能、最后三张汇总表以及失败信息。超时或子进程失败时返回非零，
-  保留已有日志，不生成成功汇总。
-- `batch_get_miss_sweep_summary.csv`：与原脚本同名、同列顺序的一行性能汇总。
-  `selected_ub_device` 留空，因为脚本按精确 EID 选择；具体 EID 见 config/peer CSV。
-- `batch_get_jetty_summary.csv`：与原脚本同名、同 schema 的 Jetty 汇总。
-- `jettys.csv`：测量迭代的每 Jetty 汇总，`eid_path` 为 CPU EID 列表下标。
-- `peer_samples.csv`：每次迭代、每个 core、每个 CPU EID 的请求数、字节数、
-  首末 doorbell/CQE 观测周期及 `first_wave_observed_overlap_cycles`。
+单组合沿用原目录结构，全部文件直接写入 `--output-dir`。多组合时，根目录的
+`batch_get.log` 记录计划、各组进度和最终汇总。查看单组原生建链、预热、校验及每 Jetty 性能时，
+打开对应子目录，例如 `token_bytes_656_miss_count_2048_aiv_cores_1_jettys_per_core_2/batch_get.log`。
+
+| 输出文件 | 内容 |
+| --- | --- |
+| 根目录 `batch_get_miss_sweep_summary.csv` | 每个组合一行，顺序与执行顺序一致。列顺序与旧脚本相同，`selected_ub_device` 留空，精确 EID 见各组明细 |
+| 根目录 `batch_get_jetty_summary.csv` | 合并全部组合的每 Jetty 测量结果，可按 `token_bytes`、`miss_count`、`aiv_cores`、`jettys_per_core` 筛选 |
+| 每组 `config.json` | 实际启动参数、命令、设备、CPU 地址及该组 inflight 上限 |
+| 每组 `jettys.csv` | 测量迭代的每 Jetty 汇总，`eid_path` 为 CPU EID 列表下标 |
+| 每组 `peer_samples.csv` | 每次迭代、每个 core、每个 CPU EID 的请求数、字节数、首末 doorbell/CQE 观测周期及 `first_wave_observed_overlap_cycles` |
 
 多路成功的运行应包含 `BATCH_GET_PERF_CORRECTNESS_PASS`、每个 EID 一条 `PEER_EID_TRAFFIC`，
 以及 `PEER_EID_CONCURRENCY ... execution=single_kernel`。

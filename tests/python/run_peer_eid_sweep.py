@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Run a single CPU EID baseline or multiple concurrent EIDs in one BatchGet kernel."""
+"""Sweep BatchGet configurations with one CPU EID or multiple concurrent EIDs per kernel."""
 
 import argparse
+from contextlib import nullcontext
 import csv
+from itertools import product
 import json
 import math
 import os
@@ -14,6 +16,26 @@ import threading
 import test_npu_batch_get_perf as perf
 from npu_eids import parse_npu_eids
 
+SHAPE_COLUMNS = ("token_bytes", "miss_count", "aiv_cores", "jettys_per_core")
+STAGES = (("kernel_total", ""), ("kernel_post", "post_"),
+          ("kernel_completion_wait", "completion_wait_"))
+
+
+def sweep_values(value):
+    """Accept a comma-separated CLI list or a space-separated shell sweep setting."""
+    parts = value.split(",") if "," in value else value.split()
+    try:
+        values = [int(part) for part in parts]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a list of integers") from error
+    if not values or len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("expected one or more distinct integers")
+    return values
+
+
+def shape_fields(args):
+    return dict(zip(SHAPE_COLUMNS, (args.token_bytes, args.miss_count, args.cores, args.jettys)))
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -22,15 +44,21 @@ def parse_args(argv=None):
                         help="one CPU EID for a baseline, or multiple distinct comma-separated EIDs; "
                              "count must not exceed --jettys")
     parser.add_argument("--npu-eid", required=True, type=parse_npu_eids)
-    parser.add_argument("--cores", type=int, default=1, help="total AIV cores in the single kernel")
-    parser.add_argument("--jettys", type=int, default=4, choices=range(1, 65),
-                        help="total Jettys per core, striped over the selected CPU EIDs")
+    parser.add_argument("--cores", type=sweep_values, metavar="N[,N...]",
+                        default=os.environ.get("KVAF_BATCH_GET_SWEEP_AIV_CORES") or "1",
+                        help="AIV core counts per kernel (1-48)")
+    parser.add_argument("--jettys", type=sweep_values, metavar="N[,N...]",
+                        default=os.environ.get("KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE") or "4",
+                        help="Jetty counts per core (1-64), striped over the selected CPU EIDs")
     parser.add_argument("--table-capacity", type=int, default=16384)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--request-length", type=int, default=32768)
-    parser.add_argument("--miss-count", type=int, default=None,
-                        help="total active requests across selected EIDs; defaults to request-length")
-    parser.add_argument("--token-bytes", type=int, default=656)
+    parser.add_argument("--miss-count", type=sweep_values, metavar="N[,N...]",
+                        default=os.environ.get("KVAF_BATCH_GET_SWEEP_MISS_COUNTS") or None,
+                        help="active request counts across selected EIDs; defaults to request-length")
+    parser.add_argument("--token-bytes", type=sweep_values, metavar="N[,N...]",
+                        default=os.environ.get("KVAF_BATCH_GET_SWEEP_TOKEN_BYTES") or "656",
+                        help="token sizes in bytes")
     parser.add_argument("--tokens-per-block", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=100)
@@ -45,15 +73,25 @@ def parse_args(argv=None):
         parser.error("at least one distinct CPU peer EID and exactly one NPU EID are required")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
-    if args.max_inflight_total is None:
-        args.max_inflight_total = (2048 if len(args.peer_eids) == 1 else
-                                   max(2048, args.cores * args.jettys * 256))
     if args.miss_count is None:
-        args.miss_count = args.request_length
-    error = perf.validate_args(perf.parse_args(benchmark_args(args)))
-    if error:
-        parser.error(error)
-    return args
+        args.miss_count = [args.request_length]
+    axes = (args.token_bytes, args.miss_count, args.cores, args.jettys)
+    multiple = any(len(axis) > 1 for axis in axes)
+    runs = []
+    for token_bytes, miss_count, cores, jettys in product(*axes):
+        run = argparse.Namespace(**vars(args))
+        run.token_bytes, run.miss_count, run.cores, run.jettys = token_bytes, miss_count, cores, jettys
+        if multiple:
+            name = "_".join(f"{key}_{value}" for key, value in shape_fields(run).items())
+            run.output_dir = args.output_dir / name
+        if run.max_inflight_total is None:
+            run.max_inflight_total = (2048 if len(run.peer_eids) == 1 else
+                                      max(2048, cores * jettys * 256))
+        error = perf.validate_args(perf.parse_args(benchmark_args(run)))
+        if error:
+            parser.error(f"{shape_fields(run)}: {error}")
+        runs.append(run)
+    return args, runs
 
 
 def benchmark_args(args):
@@ -100,19 +138,15 @@ def run_logged(command, env, log, timeout):
     return 124 if timed_out.is_set() else code
 
 
-def write_summary(args, log_text, output, emit):
+def summary_row(args, log_text):
     """Use the original sweep's PERF_RESULT records, units and CSV columns."""
     records = {}
     for line in log_text.splitlines():
         if line.startswith("PERF_RESULT "):
             fields = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
             records[fields.get("operation")] = fields
-    shape = dict(token_bytes=args.token_bytes, miss_count=args.miss_count,
-                 aiv_cores=args.cores, jettys_per_core=args.jettys)
-    row = dict(shape)
-    stages = (("kernel_total", ""), ("kernel_post", "post_"),
-              ("kernel_completion_wait", "completion_wait_"))
-    for stage, prefix in stages:
+    row = shape_fields(args)
+    for stage, prefix in STAGES:
         record = records.get(f"batch_get_{stage}")
         if record is None:
             raise ValueError(f"missing PERF_RESULT operation=batch_get_{stage}")
@@ -133,36 +167,59 @@ def write_summary(args, log_text, output, emit):
     # Selection uses exact EIDs, not a device name. Identities are in
     # config.json/peer_samples.csv; keep the original sweep's CSV schema exact.
     row["selected_ub_device"] = ""
-    emit("BATCH_GET_MISS_SWEEP_RESULT " + " ".join(f"{key}={value}" for key, value in row.items()) +
-         f" clock_mhz={args.kernel_profile_clock_mhz} payload_bytes={args.miss_count * args.token_bytes} "
-         f"peer_eids={','.join(args.peer_eids)} execution=single_kernel")
-    emit(f"\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=1 units=us "
-         f"clock_mhz={args.kernel_profile_clock_mhz} aggregation=max_elapsed_across_cores")
-    for stage, prefix in stages:
+    return row
+
+
+def write_summary(rows, clock_mhz, output, emit):
+    emit(f"\nBATCH_GET_MISS_SWEEP_SUMMARY combinations={len(rows)} units=us "
+         f"clock_mhz={clock_mhz} aggregation=max_elapsed_across_cores")
+    for stage, prefix in STAGES:
         emit(f"BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage={stage}")
-        columns = [*shape, "mean_us", "p50_us", "p90_us", "p99_us"]
-        values = [str(value) for value in shape.values()] + [
-            row[f"{prefix}{stat}_us"] for stat in ("mean", "p50", "p90", "p99")]
+        stats = ("mean_us", "p50_us", "p90_us", "p99_us")
+        columns = [*SHAPE_COLUMNS, *stats]
+        keys = list(SHAPE_COLUMNS) + [prefix + stat for stat in stats]
         if stage == "kernel_total":
             columns.append("p50_GB/s")
-            values.append(row["p50_GBps"])
-        for cells in (columns, values):
-            emit(" ".join(f"{cell:>{max(15, len(column))}}" for cell, column in zip(cells, columns)))
+            keys.append("p50_GBps")
+        widths = [max(15, len(column)) for column in columns]
+        emit(" ".join(column.rjust(width) for column, width in zip(columns, widths)))
+        for row in rows:
+            emit(" ".join(str(row[key]).rjust(width) for key, width in zip(keys, widths)))
         emit("")
-    emit(f"BATCH_GET_MISS_SWEEP_CLOCK clock_mhz={args.kernel_profile_clock_mhz} "
+    emit(f"BATCH_GET_MISS_SWEEP_CLOCK clock_mhz={clock_mhz} "
          "conversion=cycles_per_mhz_to_us")
     path = output / "batch_get_miss_sweep_summary.csv"
     with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(row))
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
-        writer.writerow(row)
-    emit(f"BATCH_GET_MISS_SWEEP_CSV_WRITTEN path={path} rows=1")
+        writer.writerows(rows)
+    emit(f"BATCH_GET_MISS_SWEEP_CSV_WRITTEN path={path} rows={len(rows)}")
+
+
+def run_case(args, env, mode, stream):
+    options = benchmark_args(args)
+    command = [sys.executable, "-u", str(Path(perf.__file__).resolve()), *options]
+    config = dict(vars(args), command=command, cpu_service=env["KVAF_CPU_SERVICE_ADDR"],
+                  device_id=env.get("DEVICE_ID", "0"), execution="single_kernel", mode=mode,
+                  benchmark=vars(perf.parse_args(options)),
+                  jetty_priorities=env.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "default"))
+    (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2) + "\n", encoding="utf-8")
+    code = run_logged(command, env, stream, args.timeout)
+    if code:
+        return code, None
+    stream.flush()
+    log_text = (args.output_dir / "batch_get.log").read_text(encoding="utf-8")
+    peer_result = "PEER_EID_BASELINE " if len(args.peer_eids) == 1 else "PEER_EID_CONCURRENCY "
+    if (not (args.output_dir / "jettys.csv").is_file() or
+            not (args.output_dir / "peer_samples.csv").is_file() or
+            "BATCH_GET_JETTY_CSV_WRITTEN " not in log_text or peer_result not in log_text):
+        raise ValueError("missing per-Jetty CSV or peer result")
+    return 0, summary_row(args, log_text)
 
 
 def main(argv=None):
-    args = parse_args(argv)
-    single_peer = len(args.peer_eids) == 1
-    if single_peer:
+    args, runs = parse_args(argv)
+    if len(args.peer_eids) == 1:
         mode = "single_eid_baseline"
     elif len(args.peer_eids) == 2:
         mode = "dual_eid_concurrent"
@@ -178,60 +235,67 @@ def main(argv=None):
         print("FAIL: set KVAF_CPU_SERVICE_ADDR to the single CPU service", file=sys.stderr)
         return 2
     output = args.output_dir.resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    log = output / "batch_get.log"
     # Exclusive outputs prevent accidentally confusing old CSVs with a failed run.
-    for name in ("config.json", "batch_get.log", "jettys.csv", "peer_samples.csv",
-                 "batch_get_miss_sweep_summary.csv", "batch_get_jetty_summary.csv"):
-        if (output / name).exists():
-            print(f"FAIL: output already exists: {output / name}", file=sys.stderr)
+    reserved = [output / name for name in ("config.json", "batch_get.log", "jettys.csv", "peer_samples.csv",
+                                           "batch_get_miss_sweep_summary.csv", "batch_get_jetty_summary.csv")]
+    if len(runs) > 1:
+        reserved.extend(run.output_dir for run in runs)
+    for path in reserved:
+        if path.exists():
+            print(f"FAIL: output already exists: {path}", file=sys.stderr)
             return 2
-    command = [sys.executable, "-u", str(Path(perf.__file__).resolve()), *benchmark_args(args)]
     env = dict(os.environ, KVAF_RUN_NPU_TESTS="1", KVAF_BATCH_GET_KERNEL=str(kernel),
                KVAF_BATCH_PUT_KERNEL=str(put_kernel))
     env["PYTHONPATH"] = str(build / "python") + os.pathsep + env.get("PYTHONPATH", "")
-    config = dict(vars(args), command=command, cpu_service=env["KVAF_CPU_SERVICE_ADDR"],
-                  device_id=env.get("DEVICE_ID", "0"), execution="single_kernel", mode=mode,
-                  benchmark=vars(perf.parse_args(benchmark_args(args))),
-                  jetty_priorities=env.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "default"))
-    (output / "config.json").write_text(json.dumps(config, default=str, indent=2) + "\n", encoding="utf-8")
-    with log.open("w", encoding="utf-8") as stream:
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        log_stream = (output / "batch_get.log").open("x", encoding="utf-8")
+    except OSError as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 2
+    with log_stream as stream:
         def emit(message):
             print(message, flush=True)
             stream.write(message + "\n")
             stream.flush()
 
         emit(f"BATCH_GET_MISS_SWEEP_LOG_DIR path={output}")
-        emit("BATCH_GET_MISS_SWEEP_PLAN token_sizes=1 miss_counts=1 aiv_core_counts=1 "
-             "jetty_counts=1 combinations=1")
+        emit(f"BATCH_GET_MISS_SWEEP_PLAN token_sizes={len(args.token_bytes)} miss_counts={len(args.miss_count)} "
+             f"aiv_core_counts={len(args.cores)} jetty_counts={len(args.jettys)} combinations={len(runs)}")
         emit(f"BATCH_GET_PEER_EID_CONFIG peer_eids={','.join(args.peer_eids)} "
              f"peer_count={len(args.peer_eids)} mode={mode} "
              "execution=single_kernel traffic_scope=all_peers_total")
-        shape = (f"token_bytes={args.token_bytes} miss_count={args.miss_count} "
-                 f"aiv_cores={args.cores} jettys_per_core={args.jettys}")
-        emit(f"BATCH_GET_CONFIG_SWEEP_BEGIN {shape}")
-        try:
-            code = run_logged(command, env, stream, args.timeout)
+        rows = []
+        for run in runs:
+            shape = " ".join(f"{key}={value}" for key, value in shape_fields(run).items())
+            log = run.output_dir / "batch_get.log"
+            emit(f"BATCH_GET_CONFIG_SWEEP_BEGIN {shape}")
+            try:
+                if len(runs) > 1:
+                    run.output_dir.mkdir()
+                    case_log = log.open("x", encoding="utf-8")
+                else:
+                    case_log = nullcontext(stream)
+                with case_log as case_stream:
+                    code, row = run_case(run, env, mode, case_stream)
+            except (OSError, ValueError) as error:
+                emit(f"BATCH_GET_MISS_SWEEP_FAILED {shape} status=1 reason={error} log={log}")
+                return 1
             if code:
                 reason = "timeout" if code == 124 else "benchmark_exit"
                 emit(f"BATCH_GET_MISS_SWEEP_FAILED {shape} status={code} reason={reason} log={log}")
                 return code
-            text = log.read_text(encoding="utf-8")
-            peer_result = "PEER_EID_BASELINE " if single_peer else "PEER_EID_CONCURRENCY "
-            if (not (output / "jettys.csv").is_file() or
-                    "BATCH_GET_JETTY_CSV_WRITTEN " not in text or
-                    peer_result not in text):
-                raise ValueError("missing per-Jetty CSV or peer result")
-            summary_lines = []
-            write_summary(args, text, output, summary_lines.append)
+            rows.append(row)
             emit(f"BATCH_GET_CONFIG_SWEEP_DONE {shape}")
-            for line in summary_lines:
-                emit(line)
-            # Same merged filename/schema as the single-EID sweep.
+            emit("BATCH_GET_MISS_SWEEP_RESULT " + " ".join(f"{key}={value}" for key, value in row.items()) +
+                 f" clock_mhz={run.kernel_profile_clock_mhz} payload_bytes={run.miss_count * run.token_bytes} "
+                 f"peer_eids={','.join(run.peer_eids)} execution=single_kernel")
+        try:
             perf.jetty_profile.merge_csv(output / "batch_get_jetty_summary.csv",
-                                         [output / "jettys.csv"], emit=emit)
+                                         [run.output_dir / "jettys.csv" for run in runs], emit=emit)
+            write_summary(rows, args.kernel_profile_clock_mhz, output, emit)
         except (OSError, ValueError) as error:
-            emit(f"BATCH_GET_MISS_SWEEP_FAILED {shape} status=1 reason={error} log={log}")
+            emit(f"BATCH_GET_MISS_SWEEP_FAILED status=1 reason={error}")
             return 1
     return 0
 
