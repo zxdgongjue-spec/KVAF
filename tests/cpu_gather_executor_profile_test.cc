@@ -8,11 +8,6 @@ namespace cpu_gather_test {
 constexpr std::uint64_t kFirstTask = 164U * 1024U;
 std::atomic<bool> hold_tail{false}, tail_entered{false}, release_tail{false};
 std::atomic<std::uint64_t> held_begin{0U}, held_end{0U};
-std::atomic<std::uint64_t> entered_end{0U}, held_workers{0U}, entered_workers{0U};
-std::atomic<bool> release_workers{false}, record_chunks{false};
-std::atomic<std::uint32_t> completed_chunks{0U};
-std::atomic<std::uint64_t> wait_generation{0U}, parked_helpers{0U}, spinning_helpers{0U};
-std::atomic<bool> hold_finished_helper{false}, helper_finished{false}, release_helper{false};
 }  // namespace cpu_gather_test
 
 namespace kvaf::peer {
@@ -20,44 +15,10 @@ void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end) {
   using namespace cpu_gather_test;
   if (!hold_tail.load(std::memory_order_acquire) ||
       begin != held_begin.load(std::memory_order_relaxed) ||
-      (held_end.load(std::memory_order_relaxed) != 0U &&
-       end != held_end.load(std::memory_order_relaxed)))
+      end != held_end.load(std::memory_order_relaxed))
     return;
-  entered_end.store(end, std::memory_order_relaxed);
   tail_entered.store(true, std::memory_order_release);
   while (!release_tail.load(std::memory_order_acquire)) GatherSpinPause();
-}
-
-void CpuGatherBeforeWorkerCopy(std::size_t worker) {
-  using namespace cpu_gather_test;
-  const auto bit = std::uint64_t{1U} << worker;
-  if (!(held_workers.load(std::memory_order_acquire) & bit)) return;
-  entered_workers.fetch_or(bit, std::memory_order_release);
-  while (!release_workers.load(std::memory_order_acquire)) GatherSpinPause();
-}
-
-void CpuGatherChunkCompleted(std::uint32_t chunk) {
-  using namespace cpu_gather_test;
-  if (record_chunks.load(std::memory_order_acquire))
-    completed_chunks.fetch_or(std::uint32_t{1U} << chunk, std::memory_order_release);
-}
-
-void CpuGatherHelperCompleted(std::size_t worker, std::uint64_t generation) {
-  using namespace cpu_gather_test;
-  if (worker != 1U || generation != wait_generation.load(std::memory_order_acquire) ||
-      !hold_finished_helper.load(std::memory_order_acquire))
-    return;
-  // Completion is already visible to Copy(). Hold this helper so the test can
-  // deterministically exercise its idle decision AFTER the whole copy ends.
-  helper_finished.store(true, std::memory_order_release);
-  while (!release_helper.load(std::memory_order_acquire)) GatherSpinPause();
-}
-
-void CpuGatherHelperWait(std::size_t worker, std::uint64_t generation, bool spinning) {
-  using namespace cpu_gather_test;
-  if (generation == 0U || generation != wait_generation.load(std::memory_order_acquire)) return;
-  (spinning ? spinning_helpers : parked_helpers).fetch_or(
-      std::uint64_t{1U} << worker, std::memory_order_release);
 }
 }  // namespace kvaf::peer
 #endif
@@ -204,161 +165,6 @@ void BalancedCopies(unsigned count, unsigned token) {
 }
 
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
-template <class Predicate>
-void Await(Predicate predicate, const char* message) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!predicate() && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  Check(predicate(), message);
-}
-
-void HelperWaitPolicy(kvaf::peer::GatherWaitMode mode, bool hold_coordinator,
-                      bool cooperative) {
-  using namespace cpu_gather_test;
-  constexpr unsigned count = 512U, token = 656U, threads = 4U;
-  constexpr std::uint64_t bytes = std::uint64_t(count) * token;
-  constexpr auto staging_offset = 65536U + bytes;
-  constexpr auto region_bytes = staging_offset + bytes + 64U;
-  void* allocation = nullptr;
-  Check(posix_memalign(&allocation, 64U, region_bytes) == 0, "wait test allocation failed");
-  auto* memory = static_cast<std::uint8_t*>(allocation);
-  const auto base = reinterpret_cast<std::uint64_t>(memory);
-  {
-    kvaf::peer::CpuGatherExecutor executor(memory, base, threads, 4096U, mode);
-    auto* header = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
-    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(header + 1);
-    std::vector<std::uint8_t> expected(bytes);
-    for (unsigned index = 0U; index < count; ++index) {
-      const auto offset = 65536U + std::uint64_t(count - index - 1U) * token;
-      spans[index] = {base + offset, token, 0U};
-      std::memset(memory + offset, index % 251U, token);
-      std::memset(expected.data() + std::uint64_t(index) * token, index % 251U, token);
-    }
-    const auto chunk = cooperative ? kvaf::GatherCooperativeChunkBytes(bytes, 4U) : 0U;
-    *header = {cooperative ? kvaf::kGatherCooperativeMagic : kvaf::peer::kGatherDescriptorMagic,
-               1U, base + staging_offset, count, static_cast<std::uint32_t>(bytes), chunk, token, 0U};
-    std::memset(memory + staging_offset, 0xad, bytes);
-    parked_helpers.store(0U); spinning_helpers.store(0U);
-    helper_finished.store(false); release_helper.store(false);
-    hold_finished_helper.store(!hold_coordinator);
-    tail_entered.store(false); release_tail.store(false);
-    held_begin.store(0U);
-    held_end.store(bytes / threads);
-    hold_tail.store(hold_coordinator && !cooperative, std::memory_order_release);
-    entered_workers.store(0U); release_workers.store(false);
-    held_workers.store(hold_coordinator && cooperative ? 1U : 0U, std::memory_order_release);
-    wait_generation.store(1U, std::memory_order_release);
-    Check(executor.PrepareDirect(region_bytes, base, 1U, count) == threads,
-          "wait test lost copy parallelism");
-    constexpr std::uint64_t all_helpers = 14U;
-    if (hold_coordinator) {
-      std::thread driver([&] { executor.Copy(); });
-      Await([&] { return (tail_entered.load(std::memory_order_acquire) ||
-                         (entered_workers.load(std::memory_order_acquire) & 1U)) &&
-                         parked_helpers.load(std::memory_order_acquire) == all_helpers; },
-            "finished helpers did not park while coordinator was copying");
-      Check(spinning_helpers.load() == 0U, "finished helper spun during unfinished copy");
-      release_tail.store(true, std::memory_order_release);
-      release_workers.store(true, std::memory_order_release);
-      driver.join();
-    } else {
-      executor.Copy();
-      Await([&] { return helper_finished.load(std::memory_order_acquire) &&
-                         (parked_helpers.load(std::memory_order_acquire) & 12U) == 12U; },
-            "non-warm helpers did not park after copy");
-      release_helper.store(true, std::memory_order_release);
-      Await([&] { return parked_helpers.load(std::memory_order_acquire) == all_helpers; },
-            "warm helper did not exhaust its bounded spin budget");
-      Check(spinning_helpers.load() ==
-                (mode == kvaf::peer::GatherWaitMode::kPassive ? 0U : 2U),
-            "idle spin was not limited to helper 1");
-    }
-    hold_tail.store(false); hold_finished_helper.store(false); held_workers.store(0U);
-    wait_generation.store(0U, std::memory_order_release);
-    Check(std::memcmp(memory + staging_offset, expected.data(), bytes) == 0,
-          "helper wait policy changed gathered payload");
-    // Repeated immediate handoffs exercise the spin-to-sleep race and helpers
-    // becoming inactive for one generation, then participating again.
-    for (std::uint64_t sequence = 2U; sequence <= 65U; ++sequence) {
-      const auto spans_count = sequence % 2U == 0U ? 1U : count;
-      const auto copy_bytes = spans_count * token;
-      header->sequence = sequence;
-      header->span_count = spans_count;
-      header->total_bytes = copy_bytes;
-      header->pipeline_chunk_bytes = cooperative
-          ? kvaf::GatherCooperativeChunkBytes(copy_bytes, 4U) : 0U;
-      header->ready_bytes = 0U;
-      std::memset(memory + staging_offset, 0xad, copy_bytes);
-      Check(executor.PrepareDirect(region_bytes, base, sequence, count) ==
-                (spans_count == 1U ? 1U : threads), "wait test thread count did not recover");
-      executor.Copy();
-      Check(std::memcmp(memory + staging_offset, expected.data(), copy_bytes) == 0,
-            "helper missed a generation after parking");
-    }
-    // Shutdown must also release helpers already dispatched to a generation
-    // whose Copy() has not started yet.
-    header->sequence = 66U; header->ready_bytes = 0U;
-    Check(executor.PrepareDirect(region_bytes, base, 66U, count) == threads,
-          "could not prepare shutdown generation");
-  }
-  std::free(allocation);
-}
-
-void CooperativeLateHelpers(kvaf::peer::GatherWaitMode mode, bool profile, unsigned token) {
-  using namespace cpu_gather_test;
-  constexpr unsigned count = 1024U, threads = 4U;
-  const auto bytes = std::uint64_t(count) * token;
-  const auto staging_offset = (65536U + bytes + 63U) & ~std::uint64_t{63U};
-  const auto region_bytes = staging_offset + bytes + 64U;
-  void* allocation = nullptr;
-  Check(posix_memalign(&allocation, 64U, region_bytes) == 0, "late helper allocation failed");
-  auto* memory = static_cast<std::uint8_t*>(allocation);
-  const auto base = reinterpret_cast<std::uint64_t>(memory);
-  {
-    kvaf::peer::CpuGatherExecutor executor(memory, base, threads, 4096U, mode);
-    if (profile) executor.EnableProfiling();
-    auto* header = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
-    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(header + 1);
-    std::vector<std::uint8_t> expected(bytes);
-    for (unsigned index = 0; index < count; ++index) {
-      const auto offset = 65536U + std::uint64_t(count - index - 1U) * token;
-      spans[index] = {base + offset, token, 0U};
-      std::memset(memory + offset, index % 251U, token);
-      std::memset(expected.data() + std::uint64_t(index) * token, index % 251U, token);
-    }
-    const auto chunk = kvaf::GatherCooperativeChunkBytes(bytes, 4U);
-    *header = {kvaf::kGatherCooperativeMagic, 1U, base + staging_offset, count,
-               static_cast<std::uint32_t>(bytes), chunk, token, 0U};
-    std::memset(memory + staging_offset, 0xad, bytes);
-    entered_workers.store(0U); release_workers.store(false);
-    held_workers.store(14U, std::memory_order_release);
-    Check(executor.PrepareDirect(region_bytes, base, 1U, count) == threads,
-          "late helper test changed the worker budget");
-    std::atomic<bool> copy_returned{false};
-    std::thread driver([&] { executor.Copy(); copy_returned.store(true, std::memory_order_release); });
-    Await([&] { return entered_workers.load(std::memory_order_acquire) == 14U &&
-                       __atomic_load_n(&header->ready_bytes, __ATOMIC_ACQUIRE) == bytes; },
-          "unstarted helpers held the ready prefix back");
-    Check(!copy_returned.load(std::memory_order_acquire),
-          "Copy returned before dispatched helpers left the generation");
-    Check(std::memcmp(memory + staging_offset, expected.data(), bytes) == 0,
-          "late helper prefix was published before payload");
-    release_workers.store(true, std::memory_order_release);
-    driver.join();
-    held_workers.store(0U, std::memory_order_release);
-    if (profile) {
-      Check(executor.ThreadProfiles()[0].bytes == bytes &&
-            executor.ThreadProfiles()[0].progress_publications == 4U,
-            "single contributor did not aggregate completion once per block");
-      for (unsigned worker = 1U; worker < threads; ++worker)
-        Check(executor.ThreadProfiles()[worker].bytes == 0U &&
-              executor.ThreadProfiles()[worker].progress_publications == 0U,
-              "late helper repeated already completed copy work");
-    }
-  }
-  std::free(allocation);
-}
-
 void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
   using namespace cpu_gather_test;
   constexpr unsigned count = 4096U, token = 656U;
@@ -425,7 +231,7 @@ void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
 }
 #endif
 void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause_tail = false,
-                       bool pause_first = false, bool variable = false) {
+                       bool pause_first = false) {
   constexpr unsigned max_count = 4097, max_threads = 16;
   const auto max_bytes = std::uint64_t(max_count) * token;
   const auto staging_offset = (131072U + max_bytes + 63U) & ~std::uint64_t{63};
@@ -442,22 +248,17 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
     auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(h + 1);
     std::uint64_t sequence = 0;
     for (unsigned count : {4096U, 1U, 19U, 4097U}) {
-      std::uint64_t bytes = 0;
-      for (unsigned i = 0; i < count; ++i)
-        bytes += variable ? 128U + (i % 7U) * 37U : token;
+      const auto bytes = std::uint64_t(count) * token;
       const auto chunk_bytes = kvaf::GatherCooperativeChunkBytes(bytes, chunks);
       std::vector<std::uint8_t> expected(bytes);
-      std::uint64_t offset_in_output = 0;
       for (unsigned i = 0; i < count; ++i) {
         const auto offset = 131072U + std::uint64_t(count - i - 1) * token;
-        const auto length = variable ? 128U + (i % 7U) * 37U : token;
-        spans[i] = {base + offset, length, 0};
-        std::memset(memory + offset, (i + sequence) % 251, length);
-        std::memset(expected.data() + offset_in_output, (i + sequence) % 251, length);
-        offset_in_output += length;
+        spans[i] = {base + offset, token, 0};
+        std::memset(memory + offset, (i + sequence) % 251, token);
+        std::memset(expected.data() + std::uint64_t(i) * token, (i + sequence) % 251, token);
       }
       *h = {kvaf::kGatherCooperativeMagic, ++sequence, base + staging_offset,
-            count, static_cast<std::uint32_t>(bytes), chunk_bytes, variable ? 0U : token, 0};
+            count, static_cast<std::uint32_t>(bytes), chunk_bytes, token, 0};
       auto* staging = memory + staging_offset;
       std::memset(staging, 0xad, max_bytes + 64);
       const auto threads = executor.PrepareDirect(region_bytes, base, sequence, max_count);
@@ -467,11 +268,10 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
       const bool hold = count == 4096 && (pause_tail || pause_first);
       if (hold) {
         using namespace cpu_gather_test;
+        const auto share = chunk_bytes / threads;
         tail_entered.store(false); release_tail.store(false);
-        held_begin.store(pause_first ? 0U : chunk_bytes);
-        held_end.store(0U);  // Hold whichever worker claims this block's first tile.
-        completed_chunks.store(0U);
-        record_chunks.store(true, std::memory_order_release);
+        held_begin.store(pause_first ? share : chunk_bytes);
+        held_end.store(held_begin.load() + share);
         hold_tail.store(true, std::memory_order_release);
       }
 #endif
@@ -482,11 +282,7 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
           const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
           while (!tail_entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
             std::this_thread::yield();
-          Check(tail_entered.load(), "cooperative tile was not claimed in block order");
-          // Other workers must keep copying later blocks despite the held
-          // tile; completed later blocks must never publish across this hole.
-          Await([&] { return completed_chunks.load(std::memory_order_acquire) & 8U; },
-                "a slow tile prevented workers from completing later blocks");
+          Check(tail_entered.load(), "cooperative share was not copied in block order");
           if (pause_first) {
             Check(__atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE) == 0,
                   "cooperative prefix crossed an unfinished worker share");
@@ -498,8 +294,8 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
             Check(std::memcmp(staging, expected.data(), chunk_bytes) == 0,
                   "cooperative first block was published before payload");
           }
-          Check(std::all_of(staging + held_begin.load(), staging + entered_end.load(),
-                            [](std::uint8_t b) { return b == 0xad; }), "held tile was overwritten");
+          Check(std::all_of(staging + held_begin.load(), staging + held_end.load(),
+                            [](std::uint8_t b) { return b == 0xad; }), "held share was overwritten");
           release_tail.store(true, std::memory_order_release);
         }
 #endif
@@ -516,25 +312,19 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
       executor.Copy(); consumer.join();
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
       cpu_gather_test::hold_tail.store(false, std::memory_order_release);
-      cpu_gather_test::record_chunks.store(false, std::memory_order_release);
 #endif
       Check(std::memcmp(staging, expected.data(), bytes) == 0, "cooperative payload mismatch");
       Check(std::all_of(staging + bytes, staging + max_bytes + 64,
                         [](std::uint8_t b) { return b == 0xad; }), "cooperative tail guard overwritten");
       if (profile) {
-        std::uint64_t copied = 0, publications = 0;
-        const auto blocks = (bytes + chunk_bytes - 1U) / chunk_bytes;
+        std::uint64_t copied = 0;
         for (std::size_t worker = 0; worker < threads; ++worker) {
           const auto& thread = executor.ThreadProfiles()[worker];
           copied += thread.bytes;
-          Check(thread.progress_publications <= blocks &&
-                ((thread.bytes == 0U) == (thread.progress_publications == 0U)),
-                "cooperative worker reported empty or duplicate block contributions");
-          publications += thread.progress_publications;
+          Check(thread.progress_publications == (bytes + chunk_bytes - 1) / chunk_bytes,
+                "cooperative worker did not visit each block exactly once");
         }
         Check(copied == bytes, "cooperative profiles omitted or duplicated bytes");
-        Check(publications >= blocks && publications <= threads * blocks,
-              "cooperative completion was not aggregated by worker/block");
       }
     }
     h->magic = kvaf::peer::kGatherDescriptorMagic;
@@ -570,18 +360,7 @@ int main() {
   for (bool profile : {false, true})
     for (unsigned token : {656U, 4096U})
       for (unsigned chunks : {2U, 4U, 8U}) CooperativeCopies(profile, token, chunks);
-  for (unsigned chunks : {2U, 4U, 8U})
-    CooperativeCopies(true, 656, chunks, false, false, true);
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
-  for (const auto mode : {kvaf::peer::GatherWaitMode::kActive,
-                          kvaf::peer::GatherWaitMode::kAdaptive,
-                          kvaf::peer::GatherWaitMode::kPassive}) {
-    HelperWaitPolicy(mode, true, false);
-    HelperWaitPolicy(mode, true, true);
-    HelperWaitPolicy(mode, false, false);
-    for (bool profile : {false, true})
-      for (unsigned token : {656U, 4096U}) CooperativeLateHelpers(mode, profile, token);
-  }
   CooperativeCopies(false, 656, 4, true);
   CooperativeCopies(true, 656, 4, true);
   CooperativeCopies(false, 656, 4, false, true);
