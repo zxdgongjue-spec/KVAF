@@ -19,24 +19,27 @@ std::uint64_t ThreadCpuNs() {
 }
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
-                      const GatherDescriptorHeader& header) {
+                      const GatherDescriptorHeader& header, const GatherChunkConfig& config) {
+  const bool configured = header.magic == kGatherConfiguredMagic;
   const bool bootstrap = header.magic == kGatherBootstrapMagic;
-  const bool cooperative = bootstrap || header.magic == kGatherCooperativeMagic;
+  const bool cooperative = configured || bootstrap || header.magic == kGatherCooperativeMagic;
+  const auto first = configured ? config.first_chunk_divisor : bootstrap ? kGatherBootstrapDivisor : 0;
+  const auto tails = configured ? config.tail_chunks : bootstrap ? kGatherBootstrapTailChunks : 0;
   if (bytes < 64U || base > UINT64_MAX - bytes ||
       (!cooperative && header.magic != kGatherDescriptorMagic) ||
       header.span_count == 0U ||
       header.ready_bytes != 0U ||
-      (bootstrap && header.pipeline_chunk_bytes != GatherCooperativeChunkBytes(
-          header.total_bytes, kGatherBootstrapTailChunks, kGatherBootstrapDivisor)) ||
+      (configured && (config.reserved || !first || !GatherCooperativeLayoutValid(tails, first))) ||
+      ((configured || bootstrap) && header.pipeline_chunk_bytes != GatherCooperativeChunkBytes(
+          header.total_bytes, tails, first)) ||
       (cooperative && (!header.pipeline_chunk_bytes ||
        GatherProgressChunkCount(header.total_bytes, header.pipeline_chunk_bytes,
-           bootstrap ? kGatherBootstrapDivisor : 0) >
-           (bootstrap ? kGatherBootstrapTailChunks + 1 : kGatherMaxCooperativeChunks))) ||
+           first) > (first ? tails + 1 : kGatherMaxCooperativeChunks))) ||
       (header.pipeline_chunk_bytes != 0U &&
        (header.pipeline_chunk_bytes < 64U || header.pipeline_chunk_bytes % 64U != 0U)))
     return false;
   const auto data_bytes = GatherControlOffset(bytes);
-  const auto descriptor_bytes = GatherDescriptorBytes(header.span_count);
+  const auto descriptor_bytes = GatherDescriptorBytes(header.span_count, configured);
   if (!GatherRange(base, data_bytes, descriptor_address, descriptor_bytes) ||
       !GatherRange(base, data_bytes, header.staging_address, header.total_bytes))
     return false;
@@ -56,10 +59,18 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   const auto* descriptor = memory_ + (descriptor_address - base_);
   GatherDescriptorHeader header;
   std::memcpy(&header, descriptor, sizeof(header));
+  const bool configured = header.magic == kGatherConfiguredMagic;
+  GatherChunkConfig config{};
+  if (configured) {
+    if (!GatherRange(base_, GatherControlOffset(region_bytes), descriptor_address,
+                     GatherPrefixHeaderBytes(true))) return 0;
+    std::memcpy(&config, descriptor + sizeof(header), sizeof(config));
+  }
   if (header.sequence != sequence || header.span_count > max_spans ||
-      !ValidateEnvelope(base_, region_bytes, descriptor_address, header))
+      !ValidateEnvelope(base_, region_bytes, descriptor_address, header, config))
     return 0U;
-  const auto* source_spans = reinterpret_cast<const GatherSpan*>(descriptor + sizeof(header));
+  const auto* source_spans = reinterpret_cast<const GatherSpan*>(
+      descriptor + GatherPrefixHeaderBytes(configured));
   span_bytes_ = header.span_bytes;
   if (span_bytes_ != 0U) {
     // BatchGet has fixed-size tokens: locate any staging byte by division/remainder.
@@ -78,7 +89,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     if (variable_offsets_.back() != header.total_bytes) return 0U;
   }
   pipeline_ready_ = nullptr;
-  first_chunk_divisor_ = header.magic == kGatherBootstrapMagic ? kGatherBootstrapDivisor : 0;
+  first_chunk_divisor_ = configured ? config.first_chunk_divisor :
+      header.magic == kGatherBootstrapMagic ? kGatherBootstrapDivisor : 0;
   cooperative_ = first_chunk_divisor_ || header.magic == kGatherCooperativeMagic;
   if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;

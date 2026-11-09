@@ -684,25 +684,27 @@ int main() {
       assert(lane.cooperative_chunks == (lane.requests ? last_cooperative_chunks : 0));
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
-  setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "4", 1);
-  setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "32", 1);
-  {
+  for (const char* first : {"16", "32"})
+  for (const char* tails : {"1", "4", "6", "8", "32"}) {
+    setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", tails, 1);
+    setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", first, 1);
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
     unsetenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
-    assert(owner->Execute(exec).ok() && last_first_divisor == 32 && last_cooperative_chunks == 4);
+    assert(owner->Execute(exec).ok() && last_first_divisor == std::strtoul(first, nullptr, 10) &&
+           last_cooperative_chunks == std::strtoul(tails, nullptr, 10));
     GatherBatchGetProfile profile; assert(owner->CopyGatherProfile(&profile).ok());
     for (const auto& lane : profile.cores)
       assert(lane.pipeline_chunk_bytes == (lane.requests ? kvaf::GatherCooperativeChunkBytes(
-          lane.requests * config.batch_get_token_bytes, 4, 32) : 0));
+          lane.requests * config.batch_get_token_bytes, last_cooperative_chunks, last_first_divisor) : 0));
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
-  for (const char* value : {"1", "16", "-32", "32x"}) {
+  for (const char* value : {"1", "4294967296", "-32", "32x"}) {
     setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", value, 1);
     auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
   }
   setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "32", 1);
-  for (const char* value : {"0", "8", "32"}) {
+  for (const char* value : {"0", "33", "64"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", value, 1);
     auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
   }

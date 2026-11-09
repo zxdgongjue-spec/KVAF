@@ -401,10 +401,18 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   const char* cooperative = std::getenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
   if (cooperative && *cooperative) {
     const auto parsed = std::from_chars(cooperative, cooperative + std::strlen(cooperative), s.args.cooperative_chunks);
-    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
-        !GatherCooperativeCountValid(s.args.cooperative_chunks))
-      return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32");
+    if (parsed.ec != std::errc{} || *parsed.ptr != '\0')
+      return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer");
   }
+  const char* first = std::getenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
+  if (first && *first) {
+    const auto parsed = std::from_chars(first, first + std::strlen(first), s.args.first_chunk_divisor);
+    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' || s.args.first_chunk_divisor == 1)
+      return Status::InvalidArgument("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or a uint32 >=2");
+  }
+  if (!GatherCooperativeLayoutValid(s.args.cooperative_chunks, s.args.first_chunk_divisor))
+    return Status::InvalidArgument("COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode, "
+                                  "or 1..32 with FIRST_CHUNK_DIVISOR>=2");
   if (s.args.cooperative_chunks) {
     if (!s.args.pipeline_chunk_bytes || s.args.probe ||
         uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
@@ -416,15 +424,6 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   s.args.prepare_ahead = prepare && *prepare ? std::strcmp(prepare, "1") == 0 : bool(s.args.cooperative_chunks);
   if (s.args.cooperative_chunks && !s.args.prepare_ahead)
     return Status::InvalidArgument("cooperative gather requires KVAF_AIV_GATHER_PREPARE_AHEAD=1");
-  const char* first = std::getenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
-  if (first && *first) {
-    const auto parsed = std::from_chars(first, first + std::strlen(first), s.args.first_chunk_divisor);
-    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
-        (s.args.first_chunk_divisor && s.args.first_chunk_divisor != kGatherBootstrapDivisor))
-      return Status::InvalidArgument("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or 32");
-  }
-  if (s.args.first_chunk_divisor && s.args.cooperative_chunks != kGatherBootstrapTailChunks)
-    return Status::InvalidArgument("FIRST_CHUNK_DIVISOR=32 requires COOPERATIVE_CHUNKS=4");
   if (s.args.prepare_ahead && (s.args.probe ||
       uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536))
     return Status::InvalidArgument("gather prepare-ahead requires whole-batch/prefix, no probe, token_bytes * SGL <= 65536");

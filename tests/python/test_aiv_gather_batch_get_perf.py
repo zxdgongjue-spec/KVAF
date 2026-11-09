@@ -76,9 +76,15 @@ def configured_chunk_bytes() -> int:
 
 def configured_cooperative_chunks() -> int:
     value = os.environ.get("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "0") or "0"
-    if value not in ("0", "2", "4", "8", "16", "32"):
-        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32")
-    return int(value)
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer")
+    count = int(value)
+    if configured_first_chunk_divisor():
+        if not 1 <= count <= 32:
+            raise ValueError("COOPERATIVE_CHUNKS must be 1..32 with FIRST_CHUNK_DIVISOR>=2")
+    elif count not in (0, 2, 4, 8, 16, 32):
+        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode")
+    return count
 
 
 def configured_prepare_ahead() -> int:
@@ -90,8 +96,8 @@ def configured_prepare_ahead() -> int:
 
 def configured_first_chunk_divisor() -> int:
     value = os.environ.get("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "0") or "0"
-    if value not in ("0", "32"):
-        raise ValueError("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or 32")
+    if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= (1 << 32) - 1 or int(value) == 1:
+        raise ValueError("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or a uint32 >=2")
     return int(value)
 
 
@@ -123,8 +129,6 @@ def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
     cooperative = configured_cooperative_chunks()
     prepare = configured_prepare_ahead()
-    if configured_first_chunk_divisor() and cooperative != 4:
-        raise ValueError("FIRST_CHUNK_DIVISOR=32 requires COOPERATIVE_CHUNKS=4")
     if cooperative and (not prepare or not configured_chunk_bytes()):
         raise ValueError("COOPERATIVE_CHUNKS requires PREPARE_AHEAD=1 and nonzero CHUNK_BYTES")
     configured_chunk_bytes()
@@ -218,9 +222,10 @@ def check_first_chunk_profile(profile) -> None:
         if not total:
             continue
         first = min(total, ((total + divisor - 1) // divisor + 63) // 64 * 64)
-        tail = max(64, ((total - first + 3) // 4 + 63) // 64 * 64)
+        tails = configured_cooperative_chunks()
+        tail = max(64, ((total - first + tails - 1) // tails + 63) // 64 * 64)
         if (int(lane["pipeline_chunk_bytes"]) != tail or
-                int(lane["cooperative_chunks"]) != 4 or int(lane["prepare_ahead"]) != 1):
+                int(lane["cooperative_chunks"]) != tails or int(lane["prepare_ahead"]) != 1):
             raise RuntimeError("mixed first-chunk layout was not applied; rebuild and deploy "
                                "gather CPU service, Host and kernel")
 

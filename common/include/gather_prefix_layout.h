@@ -10,7 +10,16 @@ inline constexpr std::uint64_t kGatherCooperativeMagic = 0x4b56414647445234ULL;
 inline constexpr std::uint64_t kGatherBootstrapMagic = 0x4b56414647445235ULL;
 inline constexpr std::uint32_t kGatherBootstrapDivisor = 32;
 inline constexpr std::uint32_t kGatherBootstrapTailChunks = 4;
+// GDR6 appends an explicit 16-byte layout config after the unchanged 48-byte
+// prefix header. Sequence/ready offsets and source span records stay unchanged.
+inline constexpr std::uint64_t kGatherConfiguredMagic = 0x4b56414647445236ULL;
+struct GatherChunkConfig {
+  std::uint32_t first_chunk_divisor, tail_chunks;
+  std::uint64_t reserved;
+};
+static_assert(sizeof(GatherChunkConfig) == 16);
 inline constexpr std::uint32_t kGatherMaxCooperativeChunks = 32;
+inline constexpr std::uint32_t kGatherMaxProgressChunks = kGatherMaxCooperativeChunks + 1;
 inline constexpr std::uint32_t kGatherScratchBytes = 64;
 #if defined(__CCE_AICORE__)
 #define KVAF_PREFIX_INLINE __aicore__ inline
@@ -20,6 +29,13 @@ inline constexpr std::uint32_t kGatherScratchBytes = 64;
 KVAF_PREFIX_INLINE bool GatherCooperativeCountValid(std::uint32_t chunks) {
   return chunks == 0 || chunks == 2 || chunks == 4 || chunks == 8 ||
          chunks == 16 || chunks == 32;
+}
+KVAF_PREFIX_INLINE bool GatherCooperativeLayoutValid(std::uint32_t chunks, std::uint32_t first_divisor) {
+  return first_divisor ? first_divisor >= 2 && chunks >= 1 && chunks <= kGatherMaxCooperativeChunks :
+      GatherCooperativeCountValid(chunks);
+}
+KVAF_PREFIX_INLINE std::uint32_t GatherPrefixHeaderBytes(bool configurable) {
+  return configurable ? 64 : 48;
 }
 KVAF_PREFIX_INLINE std::uint64_t GatherFirstChunkBytes(
     std::uint64_t total_bytes, std::uint32_t first_divisor) {

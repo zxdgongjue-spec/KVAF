@@ -14,7 +14,7 @@ struct alignas(64) KvafGatherBatchGetCoreProfile {
   uint64_t data_cq_wait_cycles, read_build_cycles;
   // CPU progress and data submissions overlap in chunk mode. Event cycles use
   // the AIV clock; first_read_ready_bytes is the progress snapshot at submission
-  // as a contiguous prefix in GDR2/GDR4/GDR5.
+  // as a contiguous prefix in GDR2/GDR4/GDR5/GDR6.
   uint64_t first_ready_cycle, first_read_submit_cycle, first_read_ready_bytes;
   uint64_t ready_queries, ready_wait_cycles, pipeline_chunk_bytes;
   uint64_t read_vf_calls;
@@ -55,8 +55,8 @@ struct KvafGatherBatchGetArgs {
   uint32_t prepare_ahead;
   // Zero retains the existing CPU schedule. 2/4/8/16/32 select cooperative prefixes.
   uint32_t cooperative_chunks;
-  // Former zero-only reserved word. 32 enables GDR5 with cooperative_chunks=4;
-  // zero preserves equal chunks. Older kernels reject this nonzero option.
+  // Zero preserves equal chunks. >=2 selects GDR6: first payload/divisor, then
+  // cooperative_chunks equal tails (1..32). Formerly a zero-only reserved word.
   uint32_t first_chunk_divisor;
 };
 static_assert(sizeof(KvafGatherBatchGetArgs) == 248);

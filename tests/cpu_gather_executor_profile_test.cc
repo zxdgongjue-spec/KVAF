@@ -231,7 +231,8 @@ void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
 }
 #endif
 void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause_tail = false,
-                       bool pause_first = false, bool bootstrap = false) {
+                       bool pause_first = false, bool bootstrap = false,
+                       unsigned first_divisor = 32U, bool legacy = false) {
   constexpr unsigned max_count = 4097, max_threads = 16;
   const auto max_bytes = std::uint64_t(max_count) * token;
   const auto staging_offset = (131072U + max_bytes + 63U) & ~std::uint64_t{63};
@@ -245,11 +246,13 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
                                          kvaf::peer::GatherWaitMode::kActive);
     if (profile) executor.EnableProfiling();
     auto* h = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(memory);
-    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(h + 1);
+    const bool configured = bootstrap && !legacy;
+    auto* spans = reinterpret_cast<kvaf::peer::GatherSpan*>(
+        memory + kvaf::GatherPrefixHeaderBytes(configured));
     std::uint64_t sequence = 0;
     for (unsigned count : {4096U, 1U, 19U, 4097U}) {
       const auto bytes = std::uint64_t(count) * token;
-      const auto divisor = bootstrap ? 32U : 0U;
+      const auto divisor = bootstrap ? first_divisor : 0U;
       const auto chunk_bytes = kvaf::GatherCooperativeChunkBytes(bytes, chunks, divisor);
       const auto first_bytes = bootstrap ? kvaf::GatherFirstChunkBytes(bytes, divisor) : chunk_bytes;
       std::vector<std::uint8_t> expected(bytes);
@@ -259,9 +262,14 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
         std::memset(memory + offset, (i + sequence) % 251, token);
         std::memset(expected.data() + std::uint64_t(i) * token, (i + sequence) % 251, token);
       }
-      *h = {bootstrap ? kvaf::kGatherBootstrapMagic : kvaf::kGatherCooperativeMagic,
+      *h = {configured ? kvaf::kGatherConfiguredMagic :
+            bootstrap ? kvaf::kGatherBootstrapMagic : kvaf::kGatherCooperativeMagic,
             ++sequence, base + staging_offset,
             count, static_cast<std::uint32_t>(bytes), chunk_bytes, token, 0};
+      if (configured) {
+        const kvaf::GatherChunkConfig config{divisor, chunks, 0};
+        std::memcpy(memory + sizeof(*h), &config, sizeof(config));
+      }
       auto* staging = memory + staging_offset;
       std::memset(staging, 0xad, max_bytes + 64);
       const auto threads = executor.PrepareDirect(region_bytes, base, sequence, max_count);
@@ -334,6 +342,22 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
         Check(copied == bytes, "cooperative profiles omitted or duplicated bytes");
       }
     }
+    if (configured) {
+      auto* config = reinterpret_cast<kvaf::GatherChunkConfig*>(memory + sizeof(*h));
+      const auto saved_config = *config;
+      h->ready_bytes = 0;
+      config->reserved = 1;
+      Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
+            "GDR6 reserved config bits were accepted");
+      config->reserved = 0; config->tail_chunks = 33;
+      Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
+            "GDR6 excessive tail count was accepted");
+      *config = saved_config; config->first_chunk_divisor = 1;
+      Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
+            "GDR6 divisor 1 was accepted");
+      *config = saved_config;
+      std::memmove(memory + sizeof(*h), spans, h->span_count * sizeof(*spans));
+    }
     h->magic = kvaf::peer::kGatherDescriptorMagic;
     h->pipeline_chunk_bytes = 0; h->ready_bytes = 0;
     Check(executor.PrepareDirect(region_bytes, base, sequence, max_count) != 0,
@@ -392,6 +416,20 @@ int main() {
       for (unsigned chunks : {2U, 4U, 8U, 16U, 32U}) CooperativeCopies(profile, token, chunks);
   for (bool profile : {false, true})
     for (unsigned token : {13U, 656U, 4096U}) CooperativeCopies(profile, token, 4, false, false, true);
+  for (const auto [tails, bytes] : {std::pair{4U, 3932160U}, std::pair{6U, 2621440U},
+       std::pair{8U, 1966080U}}) {
+    Check(kvaf::GatherFirstChunkBytes(16777216, 16) == 1048576 &&
+          kvaf::GatherCooperativeChunkBytes(16777216, tails, 16) == bytes &&
+          kvaf::GatherProgressChunkCount(16777216, bytes, 16) == tails + 1,
+          "configured first 1/16 and equal tails have incorrect boundaries");
+  }
+  for (unsigned first : {16U, 32U})
+    for (unsigned tails : {4U, 6U, 8U})
+      for (unsigned token : {656U, 4096U}) CooperativeCopies(true, token, tails, false, false, true, first);
+  CooperativeCopies(true, 4096, 32, false, false, true, 16);  // All 33 completion slots.
+  CooperativeCopies(true, 656, 1, false, false, true, 2);
+  CooperativeCopies(true, 656, 6, false, false, true, UINT32_MAX);  // Empty first-block shares.
+  CooperativeCopies(false, 656, 4, false, false, true, 32, true);  // Legacy GDR5.
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
   CooperativeCopies(false, 656, 4, true, false, true);
   CooperativeCopies(true, 656, 4, false, true, true);

@@ -223,7 +223,7 @@ class CpuGatherExecutor {
     std::atomic<std::size_t> remaining{0};
     std::atomic<bool> complete{false};
   };
-  std::array<CooperativeProgress, kGatherMaxCooperativeChunks> cooperative_progress_;
+  std::array<CooperativeProgress, kGatherMaxProgressChunks> cooperative_progress_;
   // Separate balanced task ownership from partial DMA-visible progress. Each
   // slot has one writer; only the coordinator publishes the contiguous prefix.
   struct alignas(64) TaskProgress { std::uint64_t bytes{}; };

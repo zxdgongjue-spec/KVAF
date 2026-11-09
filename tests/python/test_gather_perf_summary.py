@@ -97,11 +97,25 @@ class GatherPerfSummaryTest(unittest.TestCase):
                                  ("cooperative_chunks", 32), ("prepare_ahead", 0)):
                 with self.assertRaisesRegex(RuntimeError, "rebuild and deploy"):
                     perf.check_first_chunk_profile({"cores": [{**lane, field: value}]})
-        for first, chunks in (("1", "4"), ("16", "4"), ("32", "0"), ("32", "8"), ("32", "32")):
+        for first, chunks in (("1", "4"), ("4294967296", "4"), ("32", "0"), ("16", "33"), ("32", "64")):
             with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": chunks,
                                         "KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR": first}):
                 with self.assertRaisesRegex(ValueError, "FIRST_CHUNK_DIVISOR"):
                     perf.validate_config(2)
+        for first in ("16", "32"):
+            for tails in ("1", "4", "6", "8", "32"):
+                with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": tails,
+                                            "KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR": first}), \
+                     patch.object(perf, "TOKEN_BYTES", 4096):
+                    perf.validate_config(2)
+                    metadata = self.csv_metadata()
+                    self.assertEqual(metadata["configured_cooperative_chunks"], int(tails))
+                    self.assertEqual(metadata["configured_first_chunk_divisor"], int(first))
+                    total = 4096 * 4096
+                    initial = total // int(first)
+                    tail_bytes = ((total - initial + int(tails) - 1) // int(tails) + 63) // 64 * 64
+                    perf.check_first_chunk_profile({"cores": [dict(requests=4096,
+                        pipeline_chunk_bytes=tail_bytes, cooperative_chunks=int(tails), prepare_ahead=1)]})
 
     def test_invalid_shapes_and_counts_fail_before_hardware(self):
         for field, value in (

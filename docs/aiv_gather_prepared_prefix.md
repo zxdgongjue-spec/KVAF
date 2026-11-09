@@ -60,48 +60,57 @@ AIV 使用 40 B descriptor READ 查询 sequence / ready_bytes，按连续前缀�
 不替代最终 ACK，也不允许提前复用 descriptor/staging。错误继续 poison 两条队列，
 消费本地已发出的 VF/MTE3 事件，并沿用原有会话停机和资源保留规则。
 
-## 小首块加四个尾块（可选对照）
+## 小首块和后续均分块（两个参数独立配置）
 
-设置 `KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=32` 并保持
-`KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=4`，启用“首块取每 lane 实际 payload 的
-1/32，剩余数据再分四块”的布局。该选项默认 0，保留原有均分调度；仅支持 0/32，
-非零时要求 cooperative=4、prepare-ahead=1 和非零 chunk 模式。
+- `KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=D`：0 关闭小首块，保留原均分模式；
+  整数 2..4294967295 表示首块取每 lane 实际 payload 的 1/D。
+- `KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=N`：启用小首块时表示剩余数据均分成 N 块，
+  支持任意整数 1..32，包括 4/6/8；总块数最多 N+1。关闭小首块时，继续只接受
+  原有的 0/2/4/8/16/32 档位。
+
+小首块要求 prepare-ahead=1 和非零 chunk 模式；参数在 Runtime 初始化时捕获。
 
 ```text
-first_bytes = min(payload, align64(ceil(payload / 32)))
-tail_bytes  = align64(ceil((payload - first_bytes) / 4))
+first_bytes = min(payload, align64(ceil(payload / D)))
+tail_bytes  = align64(ceil((payload - first_bytes) / N))
 边界：first_bytes，first_bytes + tail_bytes，…，payload
 ```
 
-尾块按 64 B 对齐，末块精确截断；很短的请求可能少于五块，首块覆盖全部数据时
+尾块按 64 B 对齐，末块精确截断；很短的请求可能少于 N+1 块，首块覆盖全部数据时
 不产生尾块。每个块仍由现有线程静态分担，份额完成后的 barrier、完成计数、
 连续前缀 CAS 和最终 helper 汇合不变。NPU 保留完整 bank 预构造、部分 bank 提交、
 跨块在途 READ 和物理 wave CQ 规则。
 
-8192 行、2 核时：
+8192 行、2 核，首块分母 D=16 时：
 
-| token | 首块 | 后续每块 | 总块数 |
+| 后续块数 N | 656 B：首块 / 后续每块 | 4096 B：首块 / 后续每块 | 总块数 |
 | --- | --- | --- | --- |
-| 656 B | 82 KiB | 635.5 KiB | 5 |
-| 4096 B | 512 KiB | 3.875 MiB | 5 |
+| 4 | 164 KiB / 615 KiB | 1 MiB / 3.75 MiB | 5 |
+| 6 | 164 KiB / 410 KiB | 1 MiB / 2.5 MiB | 7 |
+| 8 | 164 KiB / 307.5 KiB | 1 MiB / 1.875 MiB | 9 |
+
+D=32、N=4 仍得到此前的 656 B：82 KiB + 4×635.5 KiB，以及
+4096 B：512 KiB + 4×3.875 MiB。
 
 ```bash
-env KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=32 \
-  KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=4 KVAF_AIV_GATHER_PREPARE_AHEAD=1 \
+env KVAF_RUN_NPU_TESTS=1 KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=16 \
+  KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=6 KVAF_AIV_GATHER_PREPARE_AHEAD=1 \
   KVAF_AIV_GATHER_CHUNK_BYTES=131072 \
   python -u tests/python/test_aiv_gather_batch_get_perf.py
 ```
 
 对照均分 4/32 档位时，显式设置 `FIRST_CHUNK_DIVISOR=0`（或 unset）后新建 Runtime。
 CSV 记录 `configured_first_chunk_divisor`；混合模式的 `pipeline_chunk_bytes` 表示
-尾块大小，首次实际快照见 `first_read_ready_bytes`，`cooperative_chunks=4` 表示四个
+尾块大小，首次实际快照见 `first_read_ready_bytes`，`cooperative_chunks=N` 表示 N 个
 尾块。性能脚本在计时前通过 profile 确认混合布局生效，避免旧 Host 忽略新环境变量。
 
-本模式使用新 GDR5 magic，48 B header 和 16 B span 布局不变。CPU 从 GDR5 和
-实际 payload 恢复相同边界，并验证尾块大小；NPU 按同一公共函数校验首块及尾块
-边界。旧 CPU 不识别 GDR5，会返回错误 ACK。启动 args 仍为 V9 / 248 B，最后的
-零保留字改为 `first_chunk_divisor`；旧 V9 kernel 会拒绝该非零字段。K 侧 CPU 服务
-与 N 侧 Host、kernel 必须同步重编部署，profile 仍为 PRF5 / 256 B。
+可配置模式使用 GDR6：原 48 B 前缀 header 后附加 16 B 配置（D、N、零保留位），
+再接 16 B span 数组；sequence / ready 偏移不变，进度查询仍是原来的 40 B READ。
+CPU 验证参数范围、保留位、尾块大小、完整描述符范围和最多 33 块的容量，CPU/NPU
+使用同一公共函数恢复及校验边界。已有 workspace 为 64 B header 预留容量。
+新 CPU 继续接受 GDR2/GDR4，以及此前固定 32+4 的 GDR5；旧 CPU 会拒绝 GDR6。
+启动 args 仍为 V9 / 248 B，profile 仍为 PRF5 / 256 B。启用新组合前必须同步重编
+部署 K 侧 CPU 服务与 N 侧 Host/kernel；仅切换 D/N 无需重新编译，但须新建 Runtime。
 
 首发提前后 `read_us` 的起点也提前，比较时同时看 kernel 总时间和无 profile E2E，
 不能仅凭 READ 区间变长判断数据传输退化；本地模型不证明实际时延收益。
@@ -194,7 +203,7 @@ WQE 编码、双 bank、控制查询或数据 CQ 规则。
 | 新字段 | 含义 |
 | --- | --- |
 | prepare_ahead | 本 lane 是否采用提前准备路径，空 lane 为 0 |
-| cooperative_chunks | 配置的协作块数，空 lane 为 0；实际粒度见 pipeline_chunk_bytes |
+| cooperative_chunks | 均分模式的配置块数；混合模式的尾块数 N；空 lane 为 0 |
 | prepare_ahead_wrs | 构造时尚未被 AIV 确认 ready 的 WR 数，不是实际隐藏时长 |
 | prepare_ahead_cycles | 上述构造区间的 Scalar 服务周期，含 VF 发起和必要的本地依赖等待；不等于 VF 硬件执行时间 |
 
