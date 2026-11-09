@@ -50,7 +50,7 @@ struct ModelArgs {
   uint32_t gather_probe{};
   uint32_t coalesce_sges{};
   uint32_t pipeline_chunk_bytes{};
-  uint32_t prepare_ahead{}, cooperative_chunks{};
+  uint32_t prepare_ahead{}, cooperative_chunks{}, first_chunk_divisor{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -62,7 +62,8 @@ void Launch(const ModelArgs& a) {
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
       a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
-      a.gather_probe, a.coalesce_sges, a.pipeline_chunk_bytes, a.prepare_ahead, a.cooperative_chunks, 0});
+      a.gather_probe, a.coalesce_sges, a.pipeline_chunk_bytes, a.prepare_ahead,
+      a.cooperative_chunks, a.first_chunk_divisor});
   }
 }
 uint64_t Address(const void* p) { return reinterpret_cast<uint64_t>(p); }
@@ -265,7 +266,8 @@ struct Fixture {
   }
   uint32_t ChunkBytes(uint32_t worker) const {
     const auto rows = uint64_t(active) * (worker + 1) / workers - uint64_t(active) * worker / workers;
-    return args.cooperative_chunks ? kvaf::GatherCooperativeChunkBytes(rows * token, args.cooperative_chunks) : args.pipeline_chunk_bytes;
+    return args.cooperative_chunks ? kvaf::GatherCooperativeChunkBytes(
+        rows * token, args.cooperative_chunks, args.first_chunk_divisor) : args.pipeline_chunk_bytes;
   }
   void CheckDescriptor(uint32_t worker) {
     assert(aiv_model::raw_copies.empty());  // Ready before the NIC reads HBM.
@@ -273,7 +275,8 @@ struct Fixture {
     const uint32_t last = uint64_t(active) * (worker + 1) / workers;
     const auto* local = workspace.data() + args.descriptor_offset + worker * args.lane_descriptor_bytes;
     const auto* h = reinterpret_cast<const kvaf::peer::GatherDescriptorHeader*>(local);
-    assert(h->magic == (args.cooperative_chunks ? kvaf::kGatherCooperativeMagic : kvaf::peer::kGatherDescriptorMagic) && h->sequence == args.sequence);
+    assert(h->magic == (args.first_chunk_divisor ? kvaf::kGatherBootstrapMagic :
+        args.cooperative_chunks ? kvaf::kGatherCooperativeMagic : kvaf::peer::kGatherDescriptorMagic) && h->sequence == args.sequence);
     assert(h->staging_address == args.remote_staging + worker * args.lane_staging_bytes);
     assert(h->span_count == last - first && h->total_bytes == (last - first) * token);
     assert(h->pipeline_chunk_bytes == ChunkBytes(worker) && h->span_bytes == token && h->ready_bytes == 0);
@@ -296,7 +299,15 @@ struct Fixture {
     if (!queues[worker * 2]->posted.empty()) queried_with_data_inflight = true;
     if (timeout || ready_reads[worker] <= ready_idle) return;
     const auto begin = h->ready_bytes;
-    const auto end = std::min<uint64_t>(h->total_bytes,
+    uint64_t end = begin;
+    if (args.first_chunk_divisor) {
+      for (uint32_t i = 0; i < kvaf::GatherProgressChunkCount(
+           h->total_bytes, h->pipeline_chunk_bytes, args.first_chunk_divisor) && end == begin; ++i) {
+        const auto boundary = kvaf::GatherProgressChunkEnd(
+            h->total_bytes, h->pipeline_chunk_bytes, args.first_chunk_divisor, i);
+        if (boundary > begin) end = boundary;
+      }
+    } else end = std::min<uint64_t>(h->total_bytes,
         begin + uint64_t(h->pipeline_chunk_bytes) * ready_step);
     const auto* spans = reinterpret_cast<const kvaf::peer::GatherSpan*>(h + 1);
     for (auto offset = begin; offset < end;) {
@@ -663,6 +674,33 @@ int main() {
         assert(f.queues[core * 2]->cq_completed == 1);
       }
     }
+  for (uint32_t token : {13U, 656U, 4096U}) {
+    Fixture f(8192, token, 2, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = 4;
+    f.args.first_chunk_divisor = 32; f.args.pipeline_chunk_bytes = 131072;
+    f.DataQueueDepth(32768); f.EnableProfile(); f.hold_data_cq_for_ack = true;
+    f.Run(); f.CheckProfiles();
+    for (uint32_t core = 0; core < f.workers; ++core) {
+      assert(f.profiles[core].read_vf_calls == 6 && f.queues[core * 2]->cq_completed == 1);
+      assert(f.profiles[core].first_read_ready_bytes == kvaf::GatherFirstChunkBytes(4096U * token, 32));
+    }
+    for (uint32_t count : {1U, 19U, 8191U, 0U}) { f.Next(count); f.Run(); f.CheckProfiles(); }
+  }
+  for (uint32_t fault : {1U, 2U, 3U, 4U, 5U, 6U}) {
+    Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = 4;
+    f.args.first_chunk_divisor = 32; f.args.pipeline_chunk_bytes = 131072;
+    f.ready_fault = fault; f.DataQueueDepth(32768); f.Run(false, fault == 3 || fault == 5);
+    assert(f.states[0].poisoned && f.states[1].poisoned);
+  }
+  for (const auto [first, chunks] : {std::pair{1U, 4U}, std::pair{16U, 4U},
+       std::pair{32U, 0U}, std::pair{32U, 8U}, std::pair{32U, 32U}}) {
+    Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;
+    f.args.first_chunk_divisor = first; f.args.pipeline_chunk_bytes = 131072;
+    f.EnableProfile(); f.Run(false);
+    assert(f.status[0].result == KVAF_SEQ_INVALID && !f.states[0].initialized);
+  }
   for (uint32_t chunks : {1U, 3U, 33U, 64U}) {
     Fixture f(19, 656, 1, KVAF_SEQ_GATHER, 6);
     f.args.prepare_ahead = 1; f.args.cooperative_chunks = chunks;

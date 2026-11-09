@@ -20,14 +20,18 @@ std::uint64_t ThreadCpuNs() {
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
-  const bool cooperative = header.magic == kGatherCooperativeMagic;
+  const bool bootstrap = header.magic == kGatherBootstrapMagic;
+  const bool cooperative = bootstrap || header.magic == kGatherCooperativeMagic;
   if (bytes < 64U || base > UINT64_MAX - bytes ||
       (!cooperative && header.magic != kGatherDescriptorMagic) ||
       header.span_count == 0U ||
       header.ready_bytes != 0U ||
+      (bootstrap && header.pipeline_chunk_bytes != GatherCooperativeChunkBytes(
+          header.total_bytes, kGatherBootstrapTailChunks, kGatherBootstrapDivisor)) ||
       (cooperative && (!header.pipeline_chunk_bytes ||
-       (std::uint64_t(header.total_bytes) + header.pipeline_chunk_bytes - 1U) /
-           header.pipeline_chunk_bytes > kGatherMaxCooperativeChunks)) ||
+       GatherProgressChunkCount(header.total_bytes, header.pipeline_chunk_bytes,
+           bootstrap ? kGatherBootstrapDivisor : 0) >
+           (bootstrap ? kGatherBootstrapTailChunks + 1 : kGatherMaxCooperativeChunks))) ||
       (header.pipeline_chunk_bytes != 0U &&
        (header.pipeline_chunk_bytes < 64U || header.pipeline_chunk_bytes % 64U != 0U)))
     return false;
@@ -74,7 +78,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     if (variable_offsets_.back() != header.total_bytes) return 0U;
   }
   pipeline_ready_ = nullptr;
-  cooperative_ = header.magic == kGatherCooperativeMagic;
+  first_chunk_divisor_ = header.magic == kGatherBootstrapMagic ? kGatherBootstrapDivisor : 0;
+  cooperative_ = first_chunk_divisor_ || header.magic == kGatherCooperativeMagic;
   if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
@@ -160,8 +165,9 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   if (cooperative_) {
     std::uint64_t copied = 0;
     for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
-      const auto begin = std::uint64_t(chunk) * pipeline_chunk_bytes_;
-      const auto end = std::min(begin + pipeline_chunk_bytes_, total_bytes_);
+      const auto begin = chunk ? GatherProgressChunkEnd(
+          total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_, chunk - 1) : 0;
+      const auto end = GatherProgressChunkEnd(total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_, chunk);
       // Partition aligned cache lines inside EACH prefix block, including a
       // short tail. Empty shares still participate in block completion.
       const auto lines = (end - begin + 63U) / 64U;
@@ -227,7 +233,8 @@ void CpuGatherExecutor::PublishCooperativeReady() {
   while (completed < cooperative_count_ &&
          cooperative_progress_[completed].complete.load(std::memory_order_acquire))
     ++completed;
-  const auto ready = std::min(total_bytes_, std::uint64_t(completed) * pipeline_chunk_bytes_);
+  const auto ready = completed ? GatherProgressChunkEnd(
+      total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_, completed - 1) : 0;
   auto previous = __atomic_load_n(pipeline_ready_, __ATOMIC_ACQUIRE);
   // Only completed-block finishers publish per batch. Concurrent finishers may
   // coalesce prefixes, but a delayed earlier finisher must never regress ready.

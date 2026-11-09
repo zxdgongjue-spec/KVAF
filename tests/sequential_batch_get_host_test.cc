@@ -20,7 +20,7 @@ bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
 uint32_t last_coalesce_sges{};
-uint32_t last_pipeline_chunk_bytes{}, last_prepare_ahead{}, last_cooperative_chunks{};
+uint32_t last_pipeline_chunk_bytes{}, last_prepare_ahead{}, last_cooperative_chunks{}, last_first_divisor{};
 uint32_t capture_queries{};
 bool allow_queued_launches{};
 int async_memsets{}, status_copies{}, stream_syncs{};
@@ -96,6 +96,7 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
   last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
   last_prepare_ahead = a->prepare_ahead;
   last_cooperative_chunks = a->cooperative_chunks;
+  last_first_divisor = a->first_chunk_divisor;
   if (a->probe) assert(!last_pipeline_chunk_bytes);
   KvafScatterBatchGetArgs model{};
   model.request = a->request; model.sequence = a->sequence;
@@ -142,7 +143,8 @@ extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, voi
         p.cooperative_chunks = p.requests ? args.cooperative_chunks : 0;
         if (args.pipeline_chunk_bytes && p.requests) {
           p.pipeline_chunk_bytes = args.cooperative_chunks ?
-              kvaf::GatherCooperativeChunkBytes(p.requests * args.request.token_bytes, args.cooperative_chunks) : args.pipeline_chunk_bytes;
+              kvaf::GatherCooperativeChunkBytes(p.requests * args.request.token_bytes,
+                  args.cooperative_chunks, args.first_chunk_divisor) : args.pipeline_chunk_bytes;
           p.ack_done_cycle = 106;
           p.first_ready_cycle = 104;
           p.first_read_submit_cycle = 104;
@@ -682,6 +684,29 @@ int main() {
       assert(lane.cooperative_chunks == (lane.requests ? last_cooperative_chunks : 0));
     assert(owner->Shutdown().ok() && !allocations && !refs);
   }
+  setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "4", 1);
+  setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "32", 1);
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->SetGatherProfiling(true).ok());
+    unsetenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
+    assert(owner->Execute(exec).ok() && last_first_divisor == 32 && last_cooperative_chunks == 4);
+    GatherBatchGetProfile profile; assert(owner->CopyGatherProfile(&profile).ok());
+    for (const auto& lane : profile.cores)
+      assert(lane.pipeline_chunk_bytes == (lane.requests ? kvaf::GatherCooperativeChunkBytes(
+          lane.requests * config.batch_get_token_bytes, 4, 32) : 0));
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  for (const char* value : {"1", "16", "-32", "32x"}) {
+    setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", value, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
+  }
+  setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "32", 1);
+  for (const char* value : {"0", "8", "32"}) {
+    setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", value, 1);
+    auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
+  }
+  unsetenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
   for (const char* count : {"1", "3", "24", "33", "64", "-2", "4x"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
     auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());

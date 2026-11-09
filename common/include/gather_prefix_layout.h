@@ -5,6 +5,11 @@ namespace kvaf {
 // GDR4 changes CPU copy ownership only. The 48-byte GDR2 envelope, mutable
 // byte prefix and final ACK keep their meanings.
 inline constexpr std::uint64_t kGatherCooperativeMagic = 0x4b56414647445234ULL;
+// GDR5: first payload/32, followed by four equal-sized (64-B aligned) tails.
+// Keep a distinct magic so older CPU services reject the nonuniform layout.
+inline constexpr std::uint64_t kGatherBootstrapMagic = 0x4b56414647445235ULL;
+inline constexpr std::uint32_t kGatherBootstrapDivisor = 32;
+inline constexpr std::uint32_t kGatherBootstrapTailChunks = 4;
 inline constexpr std::uint32_t kGatherMaxCooperativeChunks = 32;
 inline constexpr std::uint32_t kGatherScratchBytes = 64;
 #if defined(__CCE_AICORE__)
@@ -16,9 +21,42 @@ KVAF_PREFIX_INLINE bool GatherCooperativeCountValid(std::uint32_t chunks) {
   return chunks == 0 || chunks == 2 || chunks == 4 || chunks == 8 ||
          chunks == 16 || chunks == 32;
 }
+KVAF_PREFIX_INLINE std::uint64_t GatherFirstChunkBytes(
+    std::uint64_t total_bytes, std::uint32_t first_divisor) {
+  if (!first_divisor) return 0;
+  const auto first = ((total_bytes + first_divisor - 1) / first_divisor + 63) & ~std::uint64_t{63};
+  return first < total_bytes ? first : total_bytes;
+}
 KVAF_PREFIX_INLINE std::uint32_t GatherCooperativeChunkBytes(
-    std::uint64_t total_bytes, std::uint32_t chunks) {
-  return chunks ? static_cast<std::uint32_t>(((total_bytes + chunks - 1) / chunks + 63) & ~std::uint64_t{63}) : 0;
+    std::uint64_t total_bytes, std::uint32_t chunks, std::uint32_t first_divisor = 0) {
+  const auto remaining = total_bytes - GatherFirstChunkBytes(total_bytes, first_divisor);
+  const auto bytes = chunks ? ((remaining + chunks - 1) / chunks + 63) & ~std::uint64_t{63} : 0;
+  // A nonempty request fully covered by its short first chunk still uses the
+  // nonzero chunk-mode envelope; no tail will actually be copied or published.
+  return static_cast<std::uint32_t>(bytes ? bytes : first_divisor && total_bytes ? 64 : 0);
+}
+KVAF_PREFIX_INLINE std::uint32_t GatherProgressChunkCount(
+    std::uint64_t total_bytes, std::uint32_t chunk_bytes, std::uint32_t first_divisor = 0) {
+  if (!total_bytes || !chunk_bytes) return 0;
+  const auto first = GatherFirstChunkBytes(total_bytes, first_divisor);
+  return static_cast<std::uint32_t>((first ? 1 : 0) +
+      (total_bytes - first + chunk_bytes - 1) / chunk_bytes);
+}
+KVAF_PREFIX_INLINE std::uint64_t GatherProgressChunkEnd(
+    std::uint64_t total_bytes, std::uint32_t chunk_bytes, std::uint32_t first_divisor,
+    std::uint32_t index) {
+  const auto first = GatherFirstChunkBytes(total_bytes, first_divisor);
+  const auto end = first ? first + std::uint64_t(index) * chunk_bytes :
+      std::uint64_t(index + 1) * chunk_bytes;
+  return end < total_bytes ? end : total_bytes;
+}
+KVAF_PREFIX_INLINE bool GatherProgressBytesValid(
+    std::uint64_t total_bytes, std::uint32_t chunk_bytes, std::uint32_t first_divisor,
+    std::uint64_t ready) {
+  if (ready > total_bytes || !chunk_bytes) return false;
+  if (!ready || ready == total_bytes) return true;
+  const auto first = GatherFirstChunkBytes(total_bytes, first_divisor);
+  return ready >= first && (ready - first) % chunk_bytes == 0;
 }
 #undef KVAF_PREFIX_INLINE
 }  // namespace kvaf

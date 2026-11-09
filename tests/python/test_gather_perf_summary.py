@@ -85,6 +85,24 @@ class GatherPerfSummaryTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "COOPERATIVE_CHUNKS"):
                     perf.validate_config(2)
 
+    def test_mixed_first_chunk_selection_and_deployment(self):
+        with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": "4",
+                                    "KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR": "32"}), \
+             patch.object(perf, "TOKEN_BYTES", 4096):
+            perf.validate_config(2)
+            self.assertEqual(self.csv_metadata()["configured_first_chunk_divisor"], 32)
+            lane = dict(requests=4096, pipeline_chunk_bytes=4063232, cooperative_chunks=4, prepare_ahead=1)
+            perf.check_first_chunk_profile({"cores": [lane, {"requests": 0}]})
+            for field, value in (("pipeline_chunk_bytes", 4194304),
+                                 ("cooperative_chunks", 32), ("prepare_ahead", 0)):
+                with self.assertRaisesRegex(RuntimeError, "rebuild and deploy"):
+                    perf.check_first_chunk_profile({"cores": [{**lane, field: value}]})
+        for first, chunks in (("1", "4"), ("16", "4"), ("32", "0"), ("32", "8"), ("32", "32")):
+            with patch.dict(os.environ, {"KVAF_AIV_GATHER_COOPERATIVE_CHUNKS": chunks,
+                                        "KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR": first}):
+                with self.assertRaisesRegex(ValueError, "FIRST_CHUNK_DIVISOR"):
+                    perf.validate_config(2)
+
     def test_invalid_shapes_and_counts_fail_before_hardware(self):
         for field, value in (
             ("TOKEN_BYTES", 0), ("TOKEN_BYTES", 65536),

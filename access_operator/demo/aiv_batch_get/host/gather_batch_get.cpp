@@ -282,7 +282,8 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.requests != statuses[i].requests) reason = "requests";
     else if (p.data_wrs != statuses[i].data_wrs) reason = "data_wrs";
     else if (p.pipeline_chunk_bytes != (p.requests ? args.cooperative_chunks ?
-        GatherCooperativeChunkBytes(p.requests * config.batch_get_token_bytes, args.cooperative_chunks) :
+        GatherCooperativeChunkBytes(p.requests * config.batch_get_token_bytes,
+            args.cooperative_chunks, args.first_chunk_divisor) :
         args.pipeline_chunk_bytes : 0)) reason = "pipeline_chunk_bytes";
     else if (p.prepare_ahead != (p.requests ? args.prepare_ahead : 0)) reason = "prepare_ahead";
     else if (p.cooperative_chunks != (p.requests ? args.cooperative_chunks : 0)) reason = "cooperative_chunks";
@@ -415,6 +416,15 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   s.args.prepare_ahead = prepare && *prepare ? std::strcmp(prepare, "1") == 0 : bool(s.args.cooperative_chunks);
   if (s.args.cooperative_chunks && !s.args.prepare_ahead)
     return Status::InvalidArgument("cooperative gather requires KVAF_AIV_GATHER_PREPARE_AHEAD=1");
+  const char* first = std::getenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
+  if (first && *first) {
+    const auto parsed = std::from_chars(first, first + std::strlen(first), s.args.first_chunk_divisor);
+    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' ||
+        (s.args.first_chunk_divisor && s.args.first_chunk_divisor != kGatherBootstrapDivisor))
+      return Status::InvalidArgument("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or 32");
+  }
+  if (s.args.first_chunk_divisor && s.args.cooperative_chunks != kGatherBootstrapTailChunks)
+    return Status::InvalidArgument("FIRST_CHUNK_DIVISOR=32 requires COOPERATIVE_CHUNKS=4");
   if (s.args.prepare_ahead && (s.args.probe ||
       uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536))
     return Status::InvalidArgument("gather prepare-ahead requires whole-batch/prefix, no probe, token_bytes * SGL <= 65536");
@@ -450,10 +460,10 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u\n",
-      s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
+  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u first_chunk_divisor=%u\n",
+      s.args.first_chunk_divisor ? "bootstrap_prefix" : s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
       s.args.prepare_ahead ? "prepared" : "baseline",
-      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks);
+      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks, s.args.first_chunk_divisor);
   return Status::OK();
 }
 Status GatherBatchGet::Drain() {

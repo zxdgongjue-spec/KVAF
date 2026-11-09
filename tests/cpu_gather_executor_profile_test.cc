@@ -231,7 +231,7 @@ void PublishBeforeTaskTail(bool profile, std::uint32_t chunk) {
 }
 #endif
 void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause_tail = false,
-                       bool pause_first = false) {
+                       bool pause_first = false, bool bootstrap = false) {
   constexpr unsigned max_count = 4097, max_threads = 16;
   const auto max_bytes = std::uint64_t(max_count) * token;
   const auto staging_offset = (131072U + max_bytes + 63U) & ~std::uint64_t{63};
@@ -249,7 +249,9 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
     std::uint64_t sequence = 0;
     for (unsigned count : {4096U, 1U, 19U, 4097U}) {
       const auto bytes = std::uint64_t(count) * token;
-      const auto chunk_bytes = kvaf::GatherCooperativeChunkBytes(bytes, chunks);
+      const auto divisor = bootstrap ? 32U : 0U;
+      const auto chunk_bytes = kvaf::GatherCooperativeChunkBytes(bytes, chunks, divisor);
+      const auto first_bytes = bootstrap ? kvaf::GatherFirstChunkBytes(bytes, divisor) : chunk_bytes;
       std::vector<std::uint8_t> expected(bytes);
       for (unsigned i = 0; i < count; ++i) {
         const auto offset = 131072U + std::uint64_t(count - i - 1) * token;
@@ -257,7 +259,8 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
         std::memset(memory + offset, (i + sequence) % 251, token);
         std::memset(expected.data() + std::uint64_t(i) * token, (i + sequence) % 251, token);
       }
-      *h = {kvaf::kGatherCooperativeMagic, ++sequence, base + staging_offset,
+      *h = {bootstrap ? kvaf::kGatherBootstrapMagic : kvaf::kGatherCooperativeMagic,
+            ++sequence, base + staging_offset,
             count, static_cast<std::uint32_t>(bytes), chunk_bytes, token, 0};
       auto* staging = memory + staging_offset;
       std::memset(staging, 0xad, max_bytes + 64);
@@ -268,10 +271,14 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
       const bool hold = count == 4096 && (pause_tail || pause_first);
       if (hold) {
         using namespace cpu_gather_test;
-        const auto share = chunk_bytes / threads;
         tail_entered.store(false); release_tail.store(false);
-        held_begin.store(pause_first ? share : chunk_bytes);
-        held_end.store(held_begin.load() + share);
+        const auto block_begin = pause_first ? 0U : first_bytes;
+        const auto block_end = pause_first ? first_bytes : kvaf::GatherProgressChunkEnd(
+            bytes, chunk_bytes, divisor, 1);
+        const auto lines = (block_end - block_begin + 63U) / 64U;
+        const auto worker = pause_first ? 1U : 0U;
+        held_begin.store(block_begin + lines * worker / threads * 64U);
+        held_end.store(block_begin + lines * (worker + 1U) / threads * 64U);
         hold_tail.store(true, std::memory_order_release);
       }
 #endif
@@ -287,11 +294,11 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
             Check(__atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE) == 0,
                   "cooperative prefix crossed an unfinished worker share");
           } else {
-            while (__atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE) < chunk_bytes &&
+            while (__atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE) < first_bytes &&
                    std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-            Check(__atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE) == chunk_bytes,
+            Check(__atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE) == first_bytes,
                   "a copying coordinator blocked another worker's ready publication");
-            Check(std::memcmp(staging, expected.data(), chunk_bytes) == 0,
+            Check(std::memcmp(staging, expected.data(), first_bytes) == 0,
                   "cooperative first block was published before payload");
           }
           Check(std::all_of(staging + held_begin.load(), staging + held_end.load(),
@@ -302,7 +309,7 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
         std::uint64_t previous = 0;
         while (previous < bytes) {
           const auto ready = __atomic_load_n(&h->ready_bytes, __ATOMIC_ACQUIRE);
-          Check(ready >= previous && ready <= bytes && (ready == bytes || ready % chunk_bytes == 0),
+          Check(ready >= previous && kvaf::GatherProgressBytesValid(bytes, chunk_bytes, divisor, ready),
                 "invalid cooperative ready prefix");
           Check(std::memcmp(staging + previous, expected.data() + previous, ready - previous) == 0,
                 "cooperative publication preceded its payload");
@@ -321,7 +328,7 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
         for (std::size_t worker = 0; worker < threads; ++worker) {
           const auto& thread = executor.ThreadProfiles()[worker];
           copied += thread.bytes;
-          Check(thread.progress_publications == (bytes + chunk_bytes - 1) / chunk_bytes,
+          Check(thread.progress_publications == kvaf::GatherProgressChunkCount(bytes, chunk_bytes, divisor),
                 "cooperative worker did not visit each block exactly once");
         }
         Check(copied == bytes, "cooperative profiles omitted or duplicated bytes");
@@ -344,6 +351,9 @@ void CooperativeCopies(bool profile, unsigned token, unsigned chunks, bool pause
     Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
           "cooperative descriptor with 33 blocks was accepted");
     *h = saved;
+    h->magic = kvaf::kGatherBootstrapMagic;
+    Check(!executor.PrepareDirect(region_bytes, base, sequence, max_count),
+          "bootstrap descriptor with inconsistent tail size was accepted");
     h->magic = 0x4b56414647445233ULL;  // Retired descriptor format.
     h->pipeline_chunk_bytes = 65536;
     h->ready_bytes = 6;
@@ -363,10 +373,28 @@ int main() {
         for (bool pipeline : {false, true}) Run(mode, profile, variable, pipeline);
   BalancedCopies(4096, 656);   // Previously 21 tasks for 16 threads at 128 KiB.
   BalancedCopies(4096, 4096);  // Multiple balanced rounds, bounded copy task size.
+  // Known byte boundaries independently pin down the requested 32-first/4-tail
+  // plan. Normal multiples of the tail size are NOT legal mixed boundaries.
+  for (const auto total : {16777216ULL, 2686976ULL}) {
+    const auto first = total == 16777216ULL ? 524288ULL : 83968ULL;
+    const auto tail = total == 16777216ULL ? 4063232U : 650752U;
+    Check(kvaf::GatherFirstChunkBytes(total, 32) == first &&
+          kvaf::GatherCooperativeChunkBytes(total, 4, 32) == tail &&
+          kvaf::GatherProgressChunkCount(total, tail, 32) == 5,
+          "bootstrap plan does not match first 1/32 plus four tails");
+    Check(!kvaf::GatherProgressBytesValid(total, tail, 32, tail), "uniform boundary accepted in mixed plan");
+    for (unsigned i = 0; i < 5; ++i)
+      Check(kvaf::GatherProgressChunkEnd(total, tail, 32, i) == first + i * tail,
+            "wrong bootstrap cumulative boundary");
+  }
   for (bool profile : {false, true})
     for (unsigned token : {656U, 4096U})
       for (unsigned chunks : {2U, 4U, 8U, 16U, 32U}) CooperativeCopies(profile, token, chunks);
+  for (bool profile : {false, true})
+    for (unsigned token : {13U, 656U, 4096U}) CooperativeCopies(profile, token, 4, false, false, true);
 #if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
+  CooperativeCopies(false, 656, 4, true, false, true);
+  CooperativeCopies(true, 656, 4, false, true, true);
   for (unsigned chunks : {4U, 32U}) {
     CooperativeCopies(false, 656, chunks, true);
     CooperativeCopies(true, 656, chunks, true);

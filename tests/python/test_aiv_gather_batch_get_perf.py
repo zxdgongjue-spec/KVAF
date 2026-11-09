@@ -88,6 +88,13 @@ def configured_prepare_ahead() -> int:
     return int(value) if value else int(bool(configured_cooperative_chunks()))
 
 
+def configured_first_chunk_divisor() -> int:
+    value = os.environ.get("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "0") or "0"
+    if value not in ("0", "32"):
+        raise ValueError("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or 32")
+    return int(value)
+
+
 def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
     """Serial stages partition time; chunk-mode wait_cpu and read overlap."""
     pipeline = int(lane.get("pipeline_chunk_bytes", 0)) != 0
@@ -116,6 +123,8 @@ def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
     cooperative = configured_cooperative_chunks()
     prepare = configured_prepare_ahead()
+    if configured_first_chunk_divisor() and cooperative != 4:
+        raise ValueError("FIRST_CHUNK_DIVISOR=32 requires COOPERATIVE_CHUNKS=4")
     if cooperative and (not prepare or not configured_chunk_bytes()):
         raise ValueError("COOPERATIVE_CHUNKS requires PREPARE_AHEAD=1 and nonzero CHUNK_BYTES")
     configured_chunk_bytes()
@@ -198,6 +207,22 @@ def check_coalesced_profile(profile) -> None:
         if int(lane["data_wrs"]) != wrs or int(lane["data_wqebbs"]) != wrs:
             raise RuntimeError("SGE coalescing did not preserve READ count / emit one WQEBB per READ; "
                                "rebuild and deploy both gather Host and kernel")
+
+
+def check_first_chunk_profile(profile) -> None:
+    divisor = configured_first_chunk_divisor()
+    if not divisor:
+        return
+    for lane in profile["cores"]:
+        total = int(lane["requests"]) * TOKEN_BYTES
+        if not total:
+            continue
+        first = min(total, ((total + divisor - 1) // divisor + 63) // 64 * 64)
+        tail = max(64, ((total - first + 3) // 4 + 63) // 64 * 64)
+        if (int(lane["pipeline_chunk_bytes"]) != tail or
+                int(lane["cooperative_chunks"]) != 4 or int(lane["prepare_ahead"]) != 1):
+            raise RuntimeError("mixed first-chunk layout was not applied; rebuild and deploy "
+                               "gather CPU service, Host and kernel")
 
 
 def percentile(values: Sequence[float], fraction: float) -> float:
@@ -324,6 +349,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
         "configured_chunk_bytes": configured_chunk_bytes(),
         "configured_prepare_ahead": configured_prepare_ahead(),
         "configured_cooperative_chunks": configured_cooperative_chunks(),
+        "configured_first_chunk_divisor": configured_first_chunk_divisor(),
         "trusted_gather_inputs": int(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1"),
         "warmup": WARMUP, "iterations": ITERATIONS, "profile_samples": PROFILE_SAMPLES,
         "clock_mhz": PROFILE_CLOCK_MHZ if PROFILE_CLOCK_MHZ is not None else "",
@@ -521,6 +547,7 @@ def main() -> int:
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"coalesce_sges={metadata['coalesce_sges']} "
             f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
+            f"configured_first_chunk_divisor={metadata['configured_first_chunk_divisor']} "
             f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={PROFILE_SAMPLES} "
             "plan=fixed_random timing=async_call_to_stream_completion",
             flush=True,
@@ -557,13 +584,15 @@ def main() -> int:
                 torch.npu.synchronize()
 
         # Check all payload bytes and the two untouched guard rows outside timing.
-        if coalesce:
+        if coalesce or configured_first_chunk_divisor():
             runtime.start_gather_batch_get_profile()
         batch_get(checked=True)
-        if coalesce:
+        if coalesce or configured_first_chunk_divisor():
             preflight_profile = runtime.gather_batch_get_profile()
             runtime.stop_gather_batch_get_profile()
-            check_coalesced_profile(preflight_profile)
+            if coalesce:
+                check_coalesced_profile(preflight_profile)
+            check_first_chunk_profile(preflight_profile)
         expected = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8)
         source_ids = indices_cpu.to(torch.int64) * TOKENS_PER_BLOCK + slots_cpu
         for start in range(0, REQUEST_COUNT, 128):

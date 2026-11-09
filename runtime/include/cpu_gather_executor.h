@@ -130,7 +130,7 @@ class CpuGatherExecutor {
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     if (cooperative_) {
-      cooperative_count_ = (total_bytes_ + pipeline_chunk_bytes_ - 1U) / pipeline_chunk_bytes_;
+      cooperative_count_ = GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_);
       for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
         cooperative_progress_[chunk].remaining.store(threads, std::memory_order_relaxed);
         cooperative_progress_[chunk].complete.store(false, std::memory_order_relaxed);
@@ -214,6 +214,7 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
+  std::uint32_t first_chunk_divisor_{0U};
   bool cooperative_{};
   std::uint32_t cooperative_count_{};
   // One completion RMW per worker/block; only the last worker scans/publishes.
