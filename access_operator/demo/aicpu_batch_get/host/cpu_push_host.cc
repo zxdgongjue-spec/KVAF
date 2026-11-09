@@ -92,7 +92,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   d::TokenId token{};
   if (s.api.token_alloc(s.context, &token, &s.token) || !s.token) return Error("allocate RA token");
   const auto status_bytes = s.config.workers * sizeof(WorkerStatus);
-  if (aclrtMalloc(&s.memory, s.layout.bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+  if (aclrtMalloc(&s.memory, s.layout.bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMemset(s.memory, s.layout.bytes, 0, s.layout.staging) != ACL_SUCCESS ||
       aclrtMalloc(&s.coordination, sizeof(Coordination), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMalloc(&s.status_device, status_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
@@ -150,7 +150,8 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   if (!result.ok()) return result;
   s.initialized = true;
   std::fprintf(stderr, "[KVAF_AICPU] CPU_PUSH_REFERENCE commit=%s protocol=3 "
-      "copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3\n", kReferenceCommit);
+      "copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 "
+      "workspace_policy=huge_first\n", kReferenceCommit);
   return Status::OK();
 }
 

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -59,17 +60,41 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   args.sequence = 1;
   args.workers = workers;
   args.timeout_ms = 5000;
+  const auto& notify_word = *reinterpret_cast<const Word*>(memory + layout.notify);
+  auto wait_for = [](const Word& word) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!__atomic_load_n(&word.value, __ATOMIC_ACQUIRE)) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::yield();
+    }
+  };
   std::vector<std::thread> threads;
-  for (std::uint32_t w = 0; w < workers; ++w)
+  auto launch = [&] {
     threads.emplace_back([&] { CHECK(ExecuteCpuPushScatter(&args) == 0); });
+  };
+  launch();
+  if (ActiveWorkers(active, bytes, workers) > 1) {
+    // Hold back all other builders until worker 0 has written its slice.
+    wait_for(coordination.built);
+    CHECK(__atomic_load_n(&notify_word.value, __ATOMIC_ACQUIRE) == 0);
+  }
+  for (std::uint32_t w = 1; w < workers; ++w) launch();
+  if (active) {
+    // Verify exactly what CPU may read as soon as the notification is visible.
+    wait_for(notify_word);
+    const auto& header = *reinterpret_cast<const Request*>(memory + layout.request);
+    CHECK(header.magic == kMagic && header.sequence == 1 && header.count == active);
+    CHECK(header.token_bytes == bytes && header.workers == workers);
+    const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
+    for (std::uint32_t i = 0; i < active; ++i)
+      CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
+    CHECK(active == kMaxRequests || sources[active] == 0);
+  }
   for (auto& thread : threads) thread.join();
   CHECK(output == expected);
-  const auto notify = reinterpret_cast<Word*>(memory + layout.notify)->value;
+  const auto notify = notify_word.value;
   CHECK((notify & ~kProfileNotify) == (active ? 1U : 0U));
   CHECK(((notify & kProfileNotify) != 0) == (active != 0));
-  const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
-  for (std::uint32_t i = 0; i < active; ++i)
-    CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
   std::uint64_t copies = 0;
   for (std::uint32_t w = 0; w < workers; ++w) {
     const auto range = WorkerRange(active, bytes, w, workers);

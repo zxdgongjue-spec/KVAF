@@ -44,9 +44,9 @@ struct Execution {
   std::uint32_t idle_polls{};
   std::uint32_t chunks{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
-  void Relax() {
+  void Relax(bool check_remote = true) {
     // Sample remote errors every 32 stalled polls.
-    if ((++idle_polls & 31) == 0) {
+    if (check_remote && (++idle_polls & 31) == 0) {
       const auto result = CompletionStatus();
       if (result != Result::kPending) Fail(coordination, result);
     }
@@ -67,18 +67,20 @@ struct Execution {
       return static_cast<Result>(std::uint32_t(token));
     return Result::kPending;
   }
-  Result Check() {
+  Result Check(bool check_remote = true) {
     auto result = Status();
     if (result != Result::kPending) return result;
-    result = CompletionStatus();
-    if (result != Result::kPending) return result;
+    if (check_remote) {
+      result = CompletionStatus();
+      if (result != Result::kPending) return result;
+    }
     return CounterNow() - start >= timeout ? Result::kTimeout : Result::kPending;
   }
-  bool Wait(const Word& word, std::uint64_t value) {
+  bool Wait(const Word& word, std::uint64_t value, bool check_remote = true) {
     while (Load(word) < value) {
-      const auto result = Check();
+      const auto result = Check(check_remote);
       if (result != Result::kPending) { Fail(coordination, result); return false; }
-      Relax();
+      Relax(check_remote);
     }
     return true;
   }
@@ -99,7 +101,7 @@ struct Execution {
     if (profile) profile->scatter_copies += range.end - range.begin;
     return copied;
   }
-  bool Build(std::uint32_t* count) {
+  bool Build(std::uint32_t worker, std::uint32_t* count, Range* range) {
     const auto& r = args.request;
     BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
     if (!r.miss_count || !r.address_table || !r.indices || !r.offsets || !r.output_indices ||
@@ -107,15 +109,26 @@ struct Execution {
     const auto active = *reinterpret_cast<const volatile std::int32_t*>(r.miss_count);
     if (active < 0 || static_cast<std::uint32_t>(active) > r.request_capacity) return false;
     *count = active;
+    *range = WorkerRange(*count, r.token_bytes, worker, args.workers);
+    if (range->begin == range->end) return true;
     const auto* addresses = reinterpret_cast<const std::uint64_t*>(r.address_table);
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
-    for (std::uint32_t i = 0; i < *count; ++i)
+    for (auto i = range->begin; i < range->end; ++i)
       sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
-    auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
-    *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, 0, {}};
+    if (!worker) {
+      auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
+      *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, 0, {}};
+    }
+    Barrier();
     return true;
+  }
+  void Notify() {
+    BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
+    auto* notify = reinterpret_cast<Word*>(Memory() + layout.notify);
+    Store(*notify, args.sequence | (profile ? kProfileNotify : 0));
+    Barrier();
   }
 };
 }  // namespace
@@ -134,23 +147,25 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   Execution io{*args, layout, c, CounterNow(),
       CounterFrequency() * args->timeout_ms / 1000, profile};
   std::uint32_t count = 0;
-  if (!worker) {
-    if (!io.Build(&count)) Fail(c, Result::kInvalidRequest);
-    if (Load(c.result) == 0 && count) {
-      BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
-      auto* notify = reinterpret_cast<Word*>(io.Memory() + layout.notify);
-      Store(*notify, args->sequence | (profile ? kProfileNotify : 0));
-      Barrier();
+  Range range{};
+  if (io.Status() == Result::kPending && !io.Build(worker, &count, &range))
+    Fail(c, Result::kInvalidRequest);
+  if (count && io.Status() == Result::kPending) {
+    const auto builders = ActiveWorkers(count, args->request.token_bytes, args->workers);
+    // Each slice is visible before arrival; the extra tick releases scatter after notify.
+    if (range.begin < range.end) __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
+    if (!worker) {
+      if (io.Wait(c.built, builders, false) && io.Status() == Result::kPending) {
+        io.Notify();
+        Store(c.built, builders + 1);
+      }
+    } else {
+      io.Wait(c.built, builders + 1, false);
     }
-    Store(c.built, 1);
-  } else if (io.Wait(c.built, 1)) {
-    // AICPU workers share coherent normal memory; Build publishes this header.
-    count = reinterpret_cast<const Request*>(io.Memory())->count;
   }
-  const auto range = WorkerRange(count, args->request.token_bytes, worker, args->workers);
   io.chunks = ChunkCount(range);
   std::uint32_t consumed = 0;
-  if (Load(c.result) == 0 && count) {
+  if (io.Status() == Result::kPending && io.chunks) {
     BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
     const auto result = Consume(count, args->request.token_bytes, args->workers, worker,
                                 args->sequence, io.start, io.timeout, io, &consumed);

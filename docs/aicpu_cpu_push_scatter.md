@@ -97,7 +97,7 @@ CPU 端启动同一个服务：
 初始化日志必须包含：
 
 ```text
-CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3
+CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first
 ```
 
 ```bash
@@ -175,8 +175,9 @@ KVAF_AICPU_WORKERS="1 2 4 5" \
 目标为 `output + output_indices[i] * token_bytes`。
 调用方继续负责有效 key、token 布局、输出映射及这些资源在操作完成前的生命周期。
 
-初始化时，Host 通过 RA 注册固定 HBM workspace，创建四个 TargetChannel，
+初始化时，Host 用 `ACL_MEM_MALLOC_HUGE_FIRST` 申请 HBM workspace，再通过 RA 注册并创建四个 TargetChannel，
 将 segment、Jetty key 和 TP 信息发给源 DDR 所属 CPU Runtime。
+`workspace_policy=huge_first` 记录申请策略；大页不足时可回退普通页。
 CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激活驻留 CPU worker。
 激活时先同步 READ 请求控制字并 WRITE 初始完成字，确认实际双向 RMA 路径可用。
 这套控制协商通过现有 PeerLink 完成，无需新增 NPU listener。
@@ -184,9 +185,9 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
 每轮过程如下：
 
 1. Host 在调用方 stream 清零本次 AICPU coordination，再启动配置数量的实例。
-2. worker 0 按原始请求顺序生成源地址清单，在 HBM 发布请求头和 request sequence。
-   不生成设备排序数组，不改写调用方 Tensor。
-3. notify 发布 sequence 和可选 profile 位；CPU READ 请求头，验证后 READ 有效源地址前缀，
+2. 各 worker 并行查表，将本核分片的源地址写入原请求位置；worker 0 填写请求头。
+3. 所有非空分片可见后，worker 0 发布一次 notify，携带 sequence 和可选 profile 位。
+   CPU READ 请求头，验证后 READ 有效源地址前缀，
    由所属线程更新预构建 SGL 的源地址。
 4. CPU 直接从已注册 DDR 源 WRITE 到 packed HBM staging，不打包 payload 到 CPU 临时区。
 5. 按 worker 的 staging 区间划分 1024 行 chunk，各 Jetty 在其数据之后强序 WRITE ready。
@@ -248,7 +249,8 @@ Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、
 
 ## Profile
 
-`request_us` 包含动态源地址清单构建，`scatter_us` 记录本地复制。
+`request_us` 记录每个 worker 的源地址分片构建，含发布屏障；worker 0 还计入请求头填写。
+分片汇合等待不计入 `request_us`，`scatter_us` 记录本地复制。
 `scatter_copies` 为实际逐行 memcpy 次数。4096 × 656 B、完整前缀、4 worker 时，
 每个 worker 为 1024 次，总计 4096 次。
 push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 是最终 done 等待；
