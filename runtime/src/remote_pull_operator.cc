@@ -112,17 +112,30 @@ Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {
 }
 Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request,
                                                 std::uint32_t timeout_ms, CpuPullState* state) {
+  return SubmitCpuPullAndWait(request, timeout_ms, state, nullptr);
+}
+Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
+                                                CpuPullState* state, CpuPullSubmitTiming* profile) {
   if (!state) return Status::InvalidArgument("missing CPU Pull result");
   std::vector<rp::Span> spans;
-  auto status = BuildSpans(request, &spans);
+  Status status;
+  { CpuPullStageTimer timer(profile ? &profile->span_prepare_us : nullptr);
+    status = BuildSpans(request, &spans); }
   if (!status.ok()) return status;
   auto r = Request(ticket_, request, rp::Command::SubmitAndWait);
   r.timeout_ms = timeout_ms;
+  if (profile) r.flags |= rp::kSubmitProfile;
   r.source.bytes = request.source.mr_length;
-  current_ = request; active_ = true; committed_ = false;
+  { CpuPullStageTimer timer(profile ? &profile->request_save_us : nullptr);
+    current_ = request; active_ = true; committed_ = false; }
   rp::Response response{};
-  status = channel_.Exchange(ticket_.address, r, spans, &response);
+  status = channel_.Exchange(ticket_.address, r, spans, &response, profile);
   if (!status.ok()) return status; // Never replay a possibly accepted READ.
+  CpuPullStageTimer response_timer(profile ? &profile->response_check_us : nullptr);
+  if (profile) {
+    profile->server = rp::ServerTiming(response);
+    profile->server_available = profile->server.magic == rp::kTimingMagic;
+  }
   if (response.reserved > 1) return Status::InDoubt("invalid CPU Pull acceptance response");
   if (!response.reserved) {
     if (response.result == rp::Result::Ok) return Status::InDoubt("CPU omitted Pull acceptance state");

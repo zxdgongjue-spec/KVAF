@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import bench_hbm_read_raw_addr as raw_bench
 from bench_hbm_read_raw_addr import GUARD_BYTES, packet_layout, parse_args, round_counts, pattern_phase, raw_profile_sample
-from bench_remote_cpu_offload import INTERNAL_STAGES, measure_pull
+from bench_remote_cpu_offload import INTERNAL_STAGES, SUBMIT_STAGES, SERVER_STAGES, measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
 
 
@@ -128,8 +128,8 @@ class PullBenchmarks(unittest.TestCase):
         self.assertFalse(call.kwargs["profile"])
 
     def test_cpu_bench_uses_one_wrapper_call_and_excludes_diagnostics(self):
-        for profiling in (False, True):
-            with self.subTest(profiling=profiling):
+        for profiling, server_available in ((False, False), (True, False), (True, True)):
+            with self.subTest(profiling=profiling, server_available=server_available):
                 events = []
                 now = 0
                 keys, ready, src, sizes = [1], object(), [32], [8]
@@ -151,14 +151,33 @@ class PullBenchmarks(unittest.TestCase):
                             return {"profile": dict(binding_prepare_us=10, native_total_us=130,
                                 validation_us=5, prepare_put_us=10, dst_offsets_us=15,
                                 submit_wait_cpu_pull_us=20, wait_cpu_pull_us=40, commit_put_us=30,
-                                native_other_us=10)}
+                                native_other_us=10,
+                                submit_detail=dict(snapshot_us=1, cover_check_us=2, span_prepare_us=3,
+                                    request_save_us=1, channel_setup_us=1, send_us=2, receive_us=8,
+                                    response_check_us=1, other_us=1),
+                                server_detail=dict(span_receive_us=.5, control_lock_us=.25, validation_us=.5,
+                                    worker_start_us=.75, backend_read_us=4, completion_us=.5,
+                                    reply_prepare_us=.5, total_us=7) if server_available else None,
+                                rpc_gap_us=3 if server_available else None)}
 
                 result = measure_pull(Runtime(), ready, keys, src, sizes,
                                       profile=profiling, clock=lambda: now)
                 self.assertEqual(events, ["batch_cpu_pull"])
                 self.assertEqual(result["total"], 150)
                 if profiling:
-                    self.assertEqual(set(result), {"total", "python_and_binding_other", *INTERNAL_STAGES})
+                    expected = {"total", "python_and_binding_other", *INTERNAL_STAGES,
+                                *("submit_" + name for name in SUBMIT_STAGES)}
+                    if server_available:
+                        expected.update("server_" + name for name in SERVER_STAGES)
+                        expected.add("rpc_gap")
+                    self.assertEqual(set(result), expected)
+                    self.assertEqual(sum(result["submit_" + name] for name in SUBMIT_STAGES),
+                                     result["submit_wait_cpu_pull"])
+                    if server_available:
+                        self.assertEqual(sum(result["server_" + name] for name in SERVER_STAGES if name != "total"),
+                                         result["server_total"])
+                        self.assertEqual(result["submit_send"] + result["submit_receive"],
+                                         result["server_total"] + result["rpc_gap"])
                     self.assertEqual(result["python_and_binding_other"], 10)
                     self.assertEqual(result["native_total"], sum(result[k] for k in INTERNAL_STAGES
                                                                if k not in ("binding_prepare", "native_total")))

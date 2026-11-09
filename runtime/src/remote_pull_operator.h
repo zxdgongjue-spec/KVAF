@@ -21,6 +21,7 @@ class RemotePullOperator final : public AccessOperator {
   Status ValidateCpuSource(const CpuPullSourceDesc&) override;
   Status SubmitCpuPull(const CpuPullRequest&) override;
   Status SubmitCpuPullAndWait(const CpuPullRequest&, std::uint32_t, CpuPullState*) override;
+  Status SubmitCpuPullAndWait(const CpuPullRequest&, std::uint32_t, CpuPullState*, CpuPullSubmitTiming*) override;
   Status QueryCpuPull(CpuPullState*) override;
   bool pending() const { return active_; }
  private:

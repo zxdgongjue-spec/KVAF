@@ -121,7 +121,8 @@ class RuntimeCore {
                        Uint64ArrayView lengths);
   Status SubmitCpuPullAndWait(const ReadyToken&, const PutHandle&,
                               Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
-                              Uint64ArrayView lengths, std::uint32_t timeout_ms);
+                              Uint64ArrayView lengths, std::uint32_t timeout_ms,
+                              CpuPullSubmitTiming* profile = nullptr);
   Status QueryCpuPull(const PutHandle&, CpuPullState*);
   Status WaitCpuPull(const PutHandle&, std::uint32_t timeout_ms, CpuPullState*);
   Status CommitPut(const PutHandle&);
@@ -157,7 +158,8 @@ class RuntimeCore {
   std::shared_ptr<ConnectorPutState> connector_put_;
   Status FinishConnectorPut(const PutHandle&, bool commit);
   Status SubmitCpuPullImpl(const ReadyToken&, const PutHandle&, Uint64ArrayView,
-                           Uint64ArrayView, Uint64ArrayView, const std::uint32_t* timeout_ms);
+                           Uint64ArrayView, Uint64ArrayView, const std::uint32_t* timeout_ms,
+                           CpuPullSubmitTiming* profile);
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>

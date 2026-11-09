@@ -10,6 +10,7 @@
 #include "status.h"
 #include "types.h"
 #include "connector_types.h"
+#include "cpu_pull_timing.h"
 
 namespace kvaf::peer {
 class PeerLink;
@@ -52,6 +53,10 @@ class AccessOperator {
   }
   virtual Status SubmitCpuPullAndWait(const CpuPullRequest&, std::uint32_t, CpuPullState*) {
     return Status::NotImplemented("synchronous CPU Pull submission is unavailable");
+  }
+  virtual Status SubmitCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
+                                      CpuPullState* state, CpuPullSubmitTiming*) {
+    return SubmitCpuPullAndWait(request, timeout_ms, state);
   }
   virtual Status QueryCpuPull(CpuPullState*) {
     return Status::NotImplemented("CPU Pull query is unavailable");

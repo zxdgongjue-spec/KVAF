@@ -218,6 +218,13 @@ void UnifiedBatchCpuPull() {
   Require(payload_reads==before_wait+1,"blocking response waits for exactly one READ");
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
 
+  // A v7 peer without timing support still returns a valid READ result.
+  Ok(source.Ready(views[1],&ready));server.omit_timing=true;
+  Ok(reader.BatchCpuPull({3,1},ready,offsets,lengths,1000,&profile));
+  Require(!profile.submit.server_available&&!reader.pending_offload(),
+          "missing CPU timing is unavailable, not zero or a failed READ");
+  server.omit_timing=false;Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+
   // The generic recovery entry must not consume an application's explicit Put.
   Ok(reader.PreparePut({0},{8},&explicit_put));
   Require(!reader.ResolveCpuPull().ok()&&reader.pending_offload(),"explicit transactions require their original handle");
@@ -235,6 +242,41 @@ void UnifiedBatchCpuPull() {
   Require(producer_syncs==syncs&&scratch_reads==probes,"batch calls never synchronize producer or rebuild registrations");
   auto_mode=false;failed_route=0;
   if(had_prior)setenv("KVAF_HCCL_ROOTINFO_PATH",saved.c_str(),1);else unsetenv("KVAF_HCCL_ROOTINFO_PATH");
+}
+void DetailedTiming(){
+  // Use the real wire parser/response writer, with a delayed fake READ to
+  // verify that receive waiting includes READ and CPU timing survives framing.
+  SharedServer server(true);kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;
+  kvaf::NpuRuntime reader(options);Ok(reader.LinkTo({server.address}));Ok(reader.Initialize(1024,256));
+  kvaf::OffloadRegionTicket ticket;Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::uint8_t> data(4096,0x79);aclrtSetDevice(7);
+  kvaf::CpuPullHbmSource source(7,"00000000000000000000000000000001");
+  Ok(source.Register(ticket,{data.data(),data.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+  kvaf::ReadyToken ready;Ok(source.Ready(&ready));
+  const int reads=payload_reads;
+  read_delay_ms=5;kvaf::CpuPullProfile profile;
+  const auto status=reader.BatchCpuPull({1},ready,std::vector<std::uint64_t>{17},{64},1000,&profile);
+  read_delay_ms=0;Ok(status);
+  const auto& d=profile.submit;const auto& cpu=d.server;
+  Require(d.server_available&&cpu.magic==rp::kTimingMagic,"CPU details arrive in the existing framed response");
+  Require(cpu.backend_read_ns>=4000000,"CPU backend interval contains the delayed READ");
+  Require(d.send_us+d.receive_us>=cpu.total_ns/1000.0,"RPC interval contains CPU handling, not just network time");
+  Require(cpu.control_lock_ns+cpu.validation_ns+cpu.worker_start_ns+cpu.backend_read_ns+cpu.completion_ns==cpu.dispatch_ns&&
+          cpu.receive_ns+cpu.dispatch_ns+cpu.reply_prepare_ns==cpu.total_ns,"CPU-local stages partition handling time");
+  Require(d.snapshot_us+d.cover_check_us+d.span_prepare_us+d.request_save_us+d.channel_setup_us+
+          d.send_us+d.receive_us+d.response_check_us<=profile.submit_wait_cpu_pull_us,
+          "reader details nest within submit-and-wait without overlap");
+  Require(payload_reads==reads+1&&!std::memcmp(server.pool.data()+256,data.data()+17,64),
+          "profiling adds no READ or control recovery and data is ready on return");
+  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{1}}));
+  Ok(source.Ready(&ready));hold_read=true;
+  const auto timeout=reader.BatchCpuPull({1},ready,std::vector<std::uint64_t>{17},{64},0,&profile);
+  hold_read=false;
+  Require(timeout.code()==kvaf::StatusCode::kInDoubt&&reader.pending_offload(),
+          "profiled timeout retains READ without retaining the caller's timing storage");
+  Ok(reader.ResolveCpuPull(1000));
+  Require(payload_reads==reads+2,"profiled timeout recovery does not replay READ");
+  Ok(source.ReleaseBatch(ready));Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
 void InitializationRecovery() {
   SharedServer server;kvaf::NpuRuntimeOptions options;options.enable_cpu_offload=true;
@@ -512,4 +554,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();UnifiedBatchCpuPull();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{Lifecycle();SharedMetadata();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

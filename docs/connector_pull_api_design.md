@@ -591,6 +591,12 @@ result = runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, profile=True)
 print(result["profile"]["submit_wait_cpu_pull_us"])
 ```
 
+profile 中还提供 `submit_detail`（消费端请求准备、TCP 发送/接收和响应检查）、
+`server_detail`（CPU 服务端 Span 接收、校验、线程启动、READ、完成唤醒等）及 `rpc_gap_us`。
+各字段单位均为微秒；server_detail 是服务端持续时间，已包含在消费端的 TCP 交换中。
+CPU service 尚未支持细分统计时，`server_detail` 和 `rpc_gap_us` 为 None，读取结果不受影响。
+完整阶段定义和相加关系见 [CPU Pull 使用说明](cpu_pull_offload_usage.md#性能测试与阶段统计)。
+
 内部执行流程：
 
 ```text

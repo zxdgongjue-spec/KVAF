@@ -36,16 +36,17 @@ Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
 Status RuntimeCore::SubmitCpuPull(const ReadyToken& ready,
                                   const PutHandle& put, Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
                                   Uint64ArrayView lengths) {
-  return SubmitCpuPullImpl(ready, put, src_offsets, dst_offsets, lengths, nullptr);
+  return SubmitCpuPullImpl(ready, put, src_offsets, dst_offsets, lengths, nullptr, nullptr);
 }
 Status RuntimeCore::SubmitCpuPullAndWait(const ReadyToken& ready, const PutHandle& put,
                                         Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
-                                        Uint64ArrayView lengths, std::uint32_t timeout_ms) {
-  return SubmitCpuPullImpl(ready, put, src_offsets, dst_offsets, lengths, &timeout_ms);
+                                        Uint64ArrayView lengths, std::uint32_t timeout_ms, CpuPullSubmitTiming* profile) {
+  if (profile) *profile = {};
+  return SubmitCpuPullImpl(ready, put, src_offsets, dst_offsets, lengths, &timeout_ms, profile);
 }
 Status RuntimeCore::SubmitCpuPullImpl(const ReadyToken& ready, const PutHandle& put,
                                      Uint64ArrayView src_offsets, Uint64ArrayView dst_offsets,
-                                     Uint64ArrayView lengths, const std::uint32_t* timeout_ms) {
+                                     Uint64ArrayView lengths, const std::uint32_t* timeout_ms, CpuPullSubmitTiming* profile) {
   const auto* desc = std::get_if<CpuPullSourceDesc>(&ready.source);
   if (!initialized_ || closing_ || !put.state_ || put.state_->owner != connector_owner_ ||
       !desc || !ready.sequence || !ready.mr_id || ready.mr_id > 4096 || !desc->mr_length)
@@ -56,7 +57,10 @@ Status RuntimeCore::SubmitCpuPullImpl(const ReadyToken& ready, const PutHandle& 
   if (!status.ok()) return status;
   auto& p = *put.state_;
   CopyArrays copies;
-  status = SnapshotCopyArrays(src_offsets, dst_offsets, lengths, &copies);
+  {
+    CpuPullStageTimer timer(profile ? &profile->snapshot_us : nullptr);
+    status = SnapshotCopyArrays(src_offsets, dst_offsets, lengths, &copies);
+  }
   if (!status.ok()) return status;
   if (p.submitted) {
     if (!SameSource(p.request.source, *desc) || p.request.sequence != ready.sequence || p.request.mr_id != ready.mr_id ||
@@ -68,41 +72,47 @@ Status RuntimeCore::SubmitCpuPullImpl(const ReadyToken& ready, const PutHandle& 
   }
   if (connector_put_ != put.state_ || p.state != CpuPullState::Prepared)
     return Status::InvalidState("put is no longer prepared");
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> destinations, reservations;
-  for (std::size_t i = 0; i < copies.source.size(); ++i) {
-    const auto n = copies.lengths[i];
-    const auto source_bytes = desc->mr_length;
-    if (copies.source[i] > source_bytes || n > source_bytes-copies.source[i] ||
-        copies.destination[i] > p.region.length || n > p.region.length-copies.destination[i])
-      return Status::InvalidArgument("CPU Pull range outside registered source/DDR");
-    destinations.emplace_back(copies.destination[i], n);
-  }
-  for (const auto& entry : p.allocation.entries) {
-    if (entry.address < p.region.base || entry.address-p.region.base > p.region.length ||
-        entry.reserved_length > p.region.length-(entry.address-p.region.base))
-      return Status::InvalidState("invalid PreparePut allocation");
-    reservations.emplace_back(entry.address-p.region.base, entry.reserved_length);
-  }
-  std::sort(destinations.begin(), destinations.end());
-  std::sort(reservations.begin(), reservations.end());
-  std::size_t next = 0;
-  for (auto reservation : reservations) {
-    auto cursor = reservation.first;
-    const auto end = cursor + reservation.second;
-    while (next < destinations.size() && cursor < end) {
-      const auto segment = destinations[next++];
-      if (segment.first != cursor || segment.second > end-cursor)
-        return Status::InvalidArgument("CPU Pull must exactly cover this put without gaps, overlaps or crossing slots");
-      cursor += segment.second;
+  {
+    CpuPullStageTimer timer(profile ? &profile->cover_check_us : nullptr);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> destinations, reservations;
+    for (std::size_t i = 0; i < copies.source.size(); ++i) {
+      const auto n = copies.lengths[i];
+      const auto source_bytes = desc->mr_length;
+      if (copies.source[i] > source_bytes || n > source_bytes-copies.source[i] ||
+          copies.destination[i] > p.region.length || n > p.region.length-copies.destination[i])
+        return Status::InvalidArgument("CPU Pull range outside registered source/DDR");
+      destinations.emplace_back(copies.destination[i], n);
     }
-    if (cursor != end) return Status::InvalidArgument("CPU Pull leaves unwritten Put bytes");
+    for (const auto& entry : p.allocation.entries) {
+      if (entry.address < p.region.base || entry.address-p.region.base > p.region.length ||
+          entry.reserved_length > p.region.length-(entry.address-p.region.base))
+        return Status::InvalidState("invalid PreparePut allocation");
+      reservations.emplace_back(entry.address-p.region.base, entry.reserved_length);
+    }
+    std::sort(destinations.begin(), destinations.end());
+    std::sort(reservations.begin(), reservations.end());
+    std::size_t next = 0;
+    for (auto reservation : reservations) {
+      auto cursor = reservation.first;
+      const auto end = cursor + reservation.second;
+      while (next < destinations.size() && cursor < end) {
+        const auto segment = destinations[next++];
+        if (segment.first != cursor || segment.second > end-cursor)
+          return Status::InvalidArgument("CPU Pull must exactly cover this put without gaps, overlaps or crossing slots");
+        cursor += segment.second;
+      }
+      if (cursor != end) return Status::InvalidArgument("CPU Pull leaves unwritten Put bytes");
+    }
+    if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
   }
-  if (next != destinations.size()) return Status::InvalidArgument("CPU Pull targets bytes outside this put");
-  p.request = {*desc, ready.sequence, std::move(copies), ready.mr_id};
+  {
+    CpuPullStageTimer timer(profile ? &profile->request_save_us : nullptr);
+    p.request = {*desc, ready.sequence, std::move(copies), ready.mr_id};
+  }
   p.submitted = true; p.state = CpuPullState::Submitted;
   // Record the request on the caller's existing put before the first RPC.
   try {
-    status = timeout_ms ? access_operator_.SubmitCpuPullAndWait(p.request, *timeout_ms, &p.state)
+    status = timeout_ms ? access_operator_.SubmitCpuPullAndWait(p.request, *timeout_ms, &p.state, profile)
                         : access_operator_.SubmitCpuPull(p.request);
   }
   catch (const std::exception& e) { status = Status::InDoubt(std::string("CPU Pull submit exception: ")+e.what()); }

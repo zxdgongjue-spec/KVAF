@@ -214,6 +214,48 @@ bench 默认传入 `profile=True`，输出以下阶段（均为消费端 Host �
 `native_total = validation + prepare_put + dst_offsets + submit_wait_cpu_pull + wait_cpu_pull + commit_put + native_other`；
 `total = binding_prepare + native_total + python_and_binding_other`。父子计时存在包含关系，不能把所有行累加。
 
+开启 `profile=True` 后，bench 另外输出下面三组细分统计，沿用同一批请求和同一条 TCP 响应。
+这些采样及返回字典的开销计入原有 `total`；总计时范围不变，默认接口和 `--no-profile` 不采集细分时钟。
+重编译并重启 CPU service 和 NPU 扩展后，原 bench 命令即可输出。线协议仍为 KVRP v7，帧大小不变；
+SubmitAndWait 使用 profile 标志和原响应中未使用的 memory 区域返回 CPU 时长。
+若 CPU service 尚未支持此扩展，读取仍可完成，但会明确输出 `CPU_PULL_BENCH_SERVER_UNAVAILABLE`，不补零伪造样本。
+
+`CPU_PULL_BENCH_SUBMIT_STAGE role=reader` 拆分消费端的 `submit_wait_cpu_pull`：
+
+| 阶段 | 含义 |
+| --- | --- |
+| `snapshot` | 检查并快照 source/destination/length 三个数组 |
+| `cover_check` | 检查源/目的范围，排序并核对本次 Put 的精确覆盖关系 |
+| `span_prepare` | 构造 Span 数组并校验范围/目的重叠 |
+| `request_save` | 保存 Put 请求及 Operator 恢复快照 |
+| `channel_setup` | 检查长连接、必要时重连，设置 socket 参数 |
+| `send` | 将固定请求和 Span 数组写入 TCP；返回不代表 CPU 已接收 |
+| `receive` | 接收完整响应的等待，包含 CPU 请求处理及 READ |
+| `response_check` | 校验响应身份、完成状态并提取统计 |
+| `other` | submit_wait_cpu_pull 减去上述阶段之和，保留有符号余量 |
+
+`CPU_PULL_BENCH_SERVER_STAGE role=cpu` 是该请求在 CPU 服务端测量的时长，由原响应回传。
+这组统计由 `profile=True` 请求开启，不依赖 `KVAF_CPU_PULL_PROFILE`；后者继续控制 CPU backend 的 READ 汇总。
+
+| 阶段 | 含义 |
+| --- | --- |
+| `span_receive` | CPU 收到固定请求体后，分配并接收 Span 数组 |
+| `control_lock` | Dispatch 开始到取得共享控制锁 |
+| `validation` | 取得控制锁后校验请求、选择 MR、保存任务，至准备创建 READ 线程 |
+| `worker_start` | 准备创建线程到工作线程进入 READ，包含创建和启动调度 |
+| `backend_read` | 整个 backend->Read 调用，含其内部的 profile 记录/输出；略宽于 CPU_PULL_SUMMARY 的 total |
+| `completion` | backend->Read 返回到 Dispatch 返回，含状态发布、持锁日志、唤醒与锁竞争 |
+| `reply_prepare` | Dispatch 外部的返回与统计整理，至准备写出响应 |
+| `total` | 从开始接收 Span 数组到准备写出响应；等于上述七项之和 |
+
+`CPU_PULL_BENCH_RPC_STAGE role=reader stage=gap` 为 `send + receive - server.total`。
+它包含固定请求头/请求体接收、CPU 响应发送、TCP 栈及两端调度等尚未归入 CPU 统计的时间，不能等同于纯网络传输时间。
+这里相减的是各端独立测量的持续时间，不相减跨主机的绝对时间戳。
+
+分析原来约 254 微秒的未细分开销时，可先看 `snapshot/cover_check/span_prepare/request_save`，
+再看 CPU 的 `validation/worker_start/completion` 和 RPC 的 `gap`。
+`server.total` 已包含在消费端 `send + receive` 内，`backend_read` 又包含在 `server.total` 内，不重复相加。
+
 reader 另列 `last_offload_checksum`、`verification`、`batch_free`，均不包含在 `total` 中；
 checksum 属于 verification，不能重复相加。producer 继续单列 `ready`、`release_batch`；
 源写入与同步、业务通知 IPC、注册/建链均不计入传输总时间。

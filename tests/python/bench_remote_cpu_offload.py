@@ -17,6 +17,10 @@ from pull_bench_utils import print_stages, summarize_us
 
 INTERNAL_STAGES = ("binding_prepare", "native_total", "validation", "prepare_put", "dst_offsets",
                    "submit_wait_cpu_pull", "wait_cpu_pull", "commit_put", "native_other")
+SUBMIT_STAGES = ("snapshot", "cover_check", "span_prepare", "request_save", "channel_setup",
+                 "send", "receive", "response_check", "other")
+SERVER_STAGES = ("span_receive", "control_lock", "validation", "worker_start", "backend_read",
+                 "completion", "reply_prepare", "total")
 
 
 def measure_pull(runtime, ready, keys, src, sizes, *, profile=True,
@@ -28,6 +32,12 @@ def measure_pull(runtime, ready, keys, src, sizes, *, profile=True,
     timing = dict(total=elapsed)
     if profile:
         timing.update((name, result["profile"][name + "_us"]) for name in INTERNAL_STAGES)
+        timing.update(("submit_" + name, result["profile"]["submit_detail"][name + "_us"])
+                      for name in SUBMIT_STAGES)
+        if result["profile"]["server_detail"] is not None:
+            timing.update(("server_" + name, result["profile"]["server_detail"][name + "_us"])
+                          for name in SERVER_STAGES)
+            timing["rpc_gap"] = result["profile"]["rpc_gap_us"]
         # Durations on this Host only. Includes dispatch, GIL handling and result conversion.
         timing["python_and_binding_other"] = max(0.0, elapsed - timing["binding_prepare"] - timing["native_total"])
     return timing
@@ -146,6 +156,8 @@ def main():
         names = ("total", "last_offload_checksum", "verification", "batch_free")
         if args.profile:
             names += INTERNAL_STAGES + ("python_and_binding_other",)
+            names += tuple("submit_" + name for name in SUBMIT_STAGES)
+            names += tuple("server_" + name for name in SERVER_STAGES) + ("rpc_gap",)
         stages = {name: [] for name in names}
         for iteration in range(args.warmup + args.iterations):
             batch = receive(parent, "ready")
@@ -171,7 +183,19 @@ def main():
         runtime.shutdown()
         stats = summarize_us(stages["total"])
         mean = stats["mean_us"]
-        print_stages("CPU_PULL_BENCH_PROFILE", "reader", stages, args.warmup)
+        detail_names = {"submit_" + name for name in SUBMIT_STAGES} | {"server_" + name for name in SERVER_STAGES} | {"rpc_gap"}
+        print_stages("CPU_PULL_BENCH_PROFILE", "reader",
+                     {name: values for name, values in stages.items() if name not in detail_names}, args.warmup)
+        if args.profile:
+            print_stages("CPU_PULL_BENCH_SUBMIT", "reader",
+                         {name: stages["submit_" + name] for name in SUBMIT_STAGES}, args.warmup)
+            server_stages = {name: stages["server_" + name] for name in SERVER_STAGES if stages["server_" + name]}
+            if server_stages:
+                print_stages("CPU_PULL_BENCH_SERVER", "cpu", server_stages, args.warmup)
+                print_stages("CPU_PULL_BENCH_RPC", "reader", {"gap": stages["rpc_gap"]}, args.warmup)
+            if len(stages["server_total"]) != args.iterations:
+                print(f"CPU_PULL_BENCH_SERVER_UNAVAILABLE samples={len(stages['server_total'])} "
+                      f"expected={args.iterations} action=update_cpu_service", flush=True)
         print("CPU_PULL_BENCH_PASS metric=python_batch_cpu_pull_to_commit "
               f"iterations={stats['samples']} mean_us={mean:.1f} p50_us={stats['p50_us']:.1f} "
               f"p95_us={stats['p95_us']:.1f} p99_us={stats['p99_us']:.1f} "

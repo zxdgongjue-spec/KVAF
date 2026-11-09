@@ -2,6 +2,7 @@
 #include "remote_pull_protocol.h"
 #include "offload_service.h"
 #include <mutex>
+#include "cpu_pull_timing.h"
 
 namespace kvaf::remote_pull {
 class Service {
@@ -17,6 +18,8 @@ class Service {
   Status Shutdown();
  private:
   struct Impl;
+  struct Trace;
+  Response DispatchImpl(const Request&, const std::vector<Span>&, Trace*);
   std::unique_ptr<Impl> impl_;
 };
 Status Exchange(const std::string&, Request, const std::vector<Span>&, Response*);
@@ -28,7 +31,7 @@ class ControlChannel {
   ControlChannel() = default;
   ControlChannel(const ControlChannel&) = delete;
   ControlChannel& operator=(const ControlChannel&) = delete;
-  Status Exchange(const std::string&, Request, const std::vector<Span>&, Response*);
+  Status Exchange(const std::string&, Request, const std::vector<Span>&, Response*, CpuPullSubmitTiming* profile = nullptr);
   void Close();
  private:
   int fd_{-1};

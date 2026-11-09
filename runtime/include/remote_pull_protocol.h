@@ -1,11 +1,14 @@
 #pragma once
 #include "offload_protocol.h"
+#include "cpu_pull_timing.h"
 
 namespace kvaf::remote_pull {
 // Shared DDR with identity-only Ready and application-defined Submit ranges.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
 constexpr std::uint16_t kVersion = 7;
 constexpr std::uint32_t kMaxSourceMrs = 4096;
+constexpr std::uint32_t kSubmitProfile = 1;
+constexpr std::uint64_t kTimingMagic = 0x4b56525054494d31ULL;
 using MemoryDesc = offload::MemoryDesc;
 using ConnectionDesc = offload::ConnectionDesc;
 using Span = offload::Span;
@@ -22,7 +25,7 @@ struct Request {
   peer::MessageHeader header{};
   std::uint32_t count{};
   std::uint64_t region{}, epoch{}, source_id{}, task{}; // task = B's ready sequence
-  std::uint32_t token{}, flags{}; // Complete flags: 1=committed, 0=aborted
+  std::uint32_t token{}, flags{}; // Complete: commit/abort; SubmitAndWait: kSubmitProfile bit.
   std::uint64_t mr_id{1};
   std::uint32_t memory_count{1}, timeout_ms{}; // SubmitAndWait: wait budget after acceptance.
   MemoryDesc source{};
@@ -36,9 +39,18 @@ struct Response {
   std::uint32_t reserved{}; // SubmitAndWait: 1 if this task was accepted (even if still running).
   std::uint64_t mr_id{1};
   RegionInfo pool{};
-  MemoryDesc memory{};
+  MemoryDesc memory{}; // SubmitAndWait profiling uses this otherwise-unused response payload.
   ConnectionDesc connection{}; // Wire tail present only for Attach.
 };
+static_assert(sizeof(CpuPullServerTiming) <= sizeof(MemoryDesc));
+inline CpuPullServerTiming ServerTiming(const Response& response) {
+  CpuPullServerTiming timing{};
+  std::memcpy(&timing, &response.memory, sizeof(timing));
+  return timing;
+}
+inline void SetServerTiming(Response* response, const CpuPullServerTiming& timing) {
+  std::memcpy(&response->memory, &timing, sizeof(timing));
+}
 inline std::uint32_t RequestBytes(std::uint16_t command) {
   return command == static_cast<std::uint16_t>(Command::Attach) ? sizeof(Request) : offsetof(Request, connection);
 }

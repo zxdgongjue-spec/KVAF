@@ -19,6 +19,7 @@ struct BatchGetKernelProfile;
 struct CpuPullProfile {
   double validation_us{}, prepare_put_us{}, dst_offsets_us{}, submit_wait_cpu_pull_us{};
   double wait_cpu_pull_us{}, commit_put_us{}, total_us{};
+  CpuPullSubmitTiming submit;
 };
 
 struct NpuRuntimeOptions {

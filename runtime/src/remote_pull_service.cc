@@ -10,6 +10,11 @@
 
 namespace kvaf::remote_pull {
 namespace {
+using Clock = std::chrono::steady_clock;
+std::uint64_t Nanos(Clock::duration duration) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+}
+struct ReadTrace { Clock::time_point launch, begin, end; };
 Result Convert(const Status& s) { return s.ok() ? Result::Ok : s.code() == StatusCode::kInDoubt ? Result::InDoubt : Result::Failed; }
 struct Session {
   RegionInfo region{};
@@ -29,6 +34,11 @@ struct Session {
 };
 bool Pending(State s) { return s == State::Ready || s == State::Running || s == State::InDoubt; }
 }
+struct Service::Trace {
+  Clock::time_point begin{Clock::now()}, locked;
+  std::shared_ptr<ReadTrace> read;
+  bool completed{};
+};
 struct Service::Impl {
   Impl(Describe d, Attach a, std::mutex* shared)
       : describe(std::move(d)), attach(std::move(a)), control_mutex(shared ? *shared : owned_mutex) {}
@@ -67,7 +77,27 @@ Status Service::Shutdown() {
   return Status::OK();
 }
 Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
+  if (r.header.command != static_cast<std::uint16_t>(Command::SubmitAndWait) || !(r.flags & kSubmitProfile))
+    return DispatchImpl(r, spans, nullptr);
+  Trace trace;
+  auto response = DispatchImpl(r, spans, &trace);
+  const auto end = Clock::now();
+  if (trace.completed) {
+    CpuPullServerTiming timing{};
+    timing.magic = kTimingMagic;
+    timing.control_lock_ns = Nanos(trace.locked - trace.begin);
+    timing.validation_ns = Nanos(trace.read->launch - trace.locked);
+    timing.worker_start_ns = Nanos(trace.read->begin - trace.read->launch);
+    timing.backend_read_ns = Nanos(trace.read->end - trace.read->begin);
+    timing.completion_ns = Nanos(end - trace.read->end);
+    timing.dispatch_ns = timing.total_ns = Nanos(end - trace.begin);
+    SetServerTiming(&response, timing);
+  }
+  return response;
+}
+Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans, Trace* trace) {
   std::unique_lock<std::mutex> control(impl_->control_mutex);
+  if (trace) trace->locked = Clock::now();
   Response out{}; out.header = {kMagic, kVersion, std::uint16_t(r.header.command | 0x8000U), ResponseBytes(r.header.command)};
   out.region = r.region; out.epoch = r.epoch; out.source_id = r.source_id; out.task = r.task;
   out.mr_id = r.mr_id;
@@ -235,6 +265,7 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
       // A reconnecting client may already have finished this task. Never
       // report the state of a newer batch as completion of this request.
       out.state = s.sequence == r.task && s.mr_id == r.mr_id ? s.state : State::InDoubt;
+      if (trace) trace->completed = trace->read && out.state == State::Done;
     }
   };
   if (!s.submitted.empty()) {
@@ -270,10 +301,17 @@ Response Service::Dispatch(const Request& r, const std::vector<Span>& spans) {
   s.submitted = spans; s.state = State::Running;
   if (cmd == Command::SubmitAndWait) out.reserved = 1;
   try {
-    s.worker = std::thread([&s, id = r.source_id] {
+    std::shared_ptr<ReadTrace> read_trace;
+    if (trace) {
+      trace->read = read_trace = std::make_shared<ReadTrace>();
+      read_trace->launch = Clock::now();
+    }
+    s.worker = std::thread([&s, id = r.source_id, read_trace] {
       Status result;
+      if (read_trace) read_trace->begin = Clock::now();
       try { result = s.backend->Read(s.submitted); }
       catch (...) { result = Status::InDoubt("exception in remote READ worker"); }
+      if (read_trace) read_trace->end = Clock::now();
       std::lock_guard<std::mutex> guard(s.mutex);
       s.state = result.ok() ? State::Done : result.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
       s.completed.notify_all();
@@ -294,9 +332,22 @@ void Service::Serve(int fd, const peer::MessageHeader& header) {
   Request r{}; r.header = header;
   if (!offload::ReadBytes(fd, reinterpret_cast<char*>(&r)+sizeof(header), request_bytes-sizeof(header)) ||
       r.count > kMaxSpans || header.bytes != request_bytes+r.count*sizeof(Span)) { shutdown(fd, SHUT_RDWR); return; }
+  const bool profiling = header.command == static_cast<std::uint16_t>(Command::SubmitAndWait) && (r.flags & kSubmitProfile);
+  const auto receive_begin = profiling ? Clock::now() : Clock::time_point{};
   std::vector<Span> spans(r.count);
   if (!offload::ReadBytes(fd, spans.data(), spans.size()*sizeof(Span))) { shutdown(fd, SHUT_RDWR); return; }
-  const auto response = Dispatch(r, spans);
+  const auto received = profiling ? Clock::now() : Clock::time_point{};
+  auto response = Dispatch(r, spans);
+  if (profiling) {
+    auto timing = ServerTiming(response);
+    if (timing.magic == kTimingMagic) {
+      const auto reply_ready = Clock::now();
+      timing.receive_ns = Nanos(received - receive_begin);
+      timing.reply_prepare_ns = Nanos(reply_ready - received) - timing.dispatch_ns;
+      timing.total_ns = Nanos(reply_ready - receive_begin);
+      SetServerTiming(&response, timing);
+    }
+  }
   if (!offload::WriteBytes(fd, &response, ResponseBytes(header.command))) shutdown(fd, SHUT_RDWR);
 }
 }

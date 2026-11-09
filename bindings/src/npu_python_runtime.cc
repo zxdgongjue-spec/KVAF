@@ -269,6 +269,36 @@ class NpuPythonRuntime final {
     timing["native_other_us"] = std::max(0.0, profile.total_us - profile.validation_us
         - profile.prepare_put_us - profile.dst_offsets_us - profile.submit_wait_cpu_pull_us
         - profile.wait_cpu_pull_us - profile.commit_put_us);
+    const auto& detail = profile.submit;
+    py::dict submit;
+    submit["snapshot_us"] = detail.snapshot_us;
+    submit["cover_check_us"] = detail.cover_check_us;
+    submit["span_prepare_us"] = detail.span_prepare_us;
+    submit["request_save_us"] = detail.request_save_us;
+    submit["channel_setup_us"] = detail.channel_setup_us;
+    submit["send_us"] = detail.send_us;
+    submit["receive_us"] = detail.receive_us;
+    submit["response_check_us"] = detail.response_check_us;
+    submit["other_us"] = profile.submit_wait_cpu_pull_us - detail.snapshot_us - detail.cover_check_us
+        - detail.span_prepare_us - detail.request_save_us - detail.channel_setup_us
+        - detail.send_us - detail.receive_us - detail.response_check_us;
+    timing["submit_detail"] = std::move(submit);
+    timing["server_detail"] = py::none();
+    timing["rpc_gap_us"] = py::none();
+    if (detail.server_available) {
+      const auto& cpu = detail.server;
+      py::dict server;
+      server["span_receive_us"] = cpu.receive_ns / 1000.0;
+      server["control_lock_us"] = cpu.control_lock_ns / 1000.0;
+      server["validation_us"] = cpu.validation_ns / 1000.0;
+      server["worker_start_us"] = cpu.worker_start_ns / 1000.0;
+      server["backend_read_us"] = cpu.backend_read_ns / 1000.0;
+      server["completion_us"] = cpu.completion_ns / 1000.0;
+      server["reply_prepare_us"] = cpu.reply_prepare_ns / 1000.0;
+      server["total_us"] = cpu.total_ns / 1000.0;
+      timing["server_detail"] = std::move(server);
+      timing["rpc_gap_us"] = detail.send_us + detail.receive_us - cpu.total_ns / 1000.0;
+    }
     py::dict result;
     result["profile"] = std::move(timing);
     return result;
