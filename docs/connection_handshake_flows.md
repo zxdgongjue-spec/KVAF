@@ -630,3 +630,155 @@ TCP 重连与重新执行 DMA 是不同的事情。NPU 路径由 B 后台以同�
 | Python 接口与输入类型 | [bindings/src/npu_python_runtime.cc](../bindings/src/npu_python_runtime.cc)、[bindings/src/remote_offload_python.cc](../bindings/src/remote_offload_python.cc)、[bindings/src/hbm_read_python.cc](../bindings/src/hbm_read_python.cc) |
 
 关联说明：[共享 DDR](shared_ddr_remote_offload.md)、[NPU HBM 裸地址读取](hbm_raw_addr_read.md)、[Connector 接口设计](connector_pull_api_design.md)。本文的 A 始终是读取端、B 始终是生产端；关联文档若命名不同，以职责为准。
+
+## 13. CPU Pull 完整精简方案：交互时序（拟议，未实现）
+
+方案记录日期：2026-11-10。
+
+> 本节描述讨论后的目标方案，尚未修改实现。第 6、8、10、11 节仍描述当前行为，不能把本节当作现有接口的执行承诺。图中沿用现有接口名称说明职责；由 A 协调的 Cancel 是拟议控制流程，不表示当前已经存在对应的公开 Python 接口。
+
+目标与标准 BatchPut 的职责划分一致：**A 管理 DDR 槽位和元数据事务，CPU 管理 READ 的执行与结果，B 根据应用完成通知复用源。**保留单源一个冻结批次、A 统一管理 DDR 槽位的约束；DDR 分配、MR 注册、建链探测和正常注销顺序沿用前文。
+
+每批删除四次控制交互：TCP Ready、提交前 Query、TCP Complete、release 时 Query。正常路径保留异步 Submit 和等待完成的 Query；异常恢复复用原 Put、请求快照、取消和资源隔离机制。
+
+### 13.1 正常路径：CPU 只保存执行终态
+
+下面从第 3、4 节的初始化和注册成功后开始。三组偏移／长度仍在 Host，地址语义、目的范围精确覆盖检查和四个 Jetty 的 READ 执行方式不变。
+
+```mermaid
+sequenceDiagram
+    participant BC as B 应用 Connector
+    participant B as B CpuPullHbmSource
+    participant AC as A 应用 Connector
+    participant A as A Runtime / MetaManager
+    participant C as CPU Service / READ worker
+
+    Note over BC,C: 前提：DDR 池、HBM MR 和共享通道已注册并探测成功
+    BC->>BC: 生产 Tensor，确认 stream / event 完成
+    BC->>B: ready(tensor)
+    B->>B: 本地匹配 MR、生成 sequence、冻结本批
+    B-->>BC: ReadyToken
+    Note over B,C: 不发送 TCP Ready；CPU 在 Submit 时接纳批次
+
+    BC->>AC: 应用通道：ReadyToken + 业务元数据
+    AC->>AC: 组织 keys、src_offsets、lengths
+    AC->>A: batch_cpu_pull(keys, ready, src_offsets, lengths)
+    A->>A: PreparePut：预留 DDR 槽位，状态 Pending
+    A->>A: 提取 dst_offsets，校验范围与精确覆盖
+    A->>A: 在首次 RPC 前保存原 Put 和完整请求
+
+    A->>C: TCP Submit：池 / 源 / sequence / MR 身份、MR 长度、Span 列表
+    C->>C: 原子校验并接纳：身份、序列、MR、范围及资源可用性
+    C->>C: 保存请求，状态置 Running，启动 READ worker
+    C-->>A: 已接受
+    Note over A,C: 不再预先 Query；接受任务不表示 READ 完成
+
+    par CPU 执行数据搬运
+        C->>B: UB READ：通过已有四个 Jetty 分波次拉取
+        B-->>C: HBM 数据直接写入预留的 DDR 槽位
+        C->>C: 等待所有队列尾 CQ，保存 Done 结果
+    and A 等待原任务
+        loop 尚未取得完成结果
+            A->>C: TCP Query：查询原批次
+            C-->>A: Running / Done
+        end
+    end
+
+    A->>A: 确认 Done 后，CommitPut 发布本批元数据
+    A->>A: 记录本地提交结果，结束 Put 事务
+    A-->>AC: batch_cpu_pull() 成功返回
+    Note over A,C: 不发送 TCP Complete；CPU 保持 Done，不保存 Committed
+
+    opt 应用需要内容校验
+        AC->>A: last_offload_checksum()
+        A->>C: TCP Checksum：指定原批次
+        C-->>A: 当前 DDR checksum
+        A-->>AC: checksum
+        AC->>AC: 与预期值比较
+    end
+
+    AC->>BC: 应用通道：对应批次已完成
+    BC->>B: release_batch(ready)
+    B->>B: 根据应用确认，本地校验源 / sequence / MR 并解除冻结
+    B-->>BC: 允许复用源 Tensor
+    Note over B,C: release 不发送 TCP Query；MR 和通信资源继续保留
+    Note over BC,C: B 可生产下一批；CPU 保留原结果供恢复，并拒绝旧序列重放
+```
+
+- `ready()` 仍要求应用先确认生产完成；冻结仍是生命周期约束，不是 Tensor 内存写保护。
+- Submit 同时完成原 Ready 的批次接纳和原预查询的校验，包括 MR 长度一致性检查。同批次重复请求只返回已有状态，参数冲突必须拒绝。
+- 成功返回仍要求 READ 成功和 A 本地元数据提交成功。CPU 无需镜像保存该元数据决定；即使 A 在 Done 后选择 Abort，CPU 也可以保持 Done。
+- CPU 的 Done 不再阻挡同池后续任务；Running／InDoubt 的资源保护继续保留。A 在本地事务结束前仍保留原 Put 和槽位保护。
+- 本地 release 的调用契约是应用已收到对应批次的终态通知。ReadyToken 本身只标识批次，不能单独证明完成；若同一 Tensor 还有其他消费者，仍需等它们全部结束后覆盖。
+- Checksum 继续是独立可选诊断。拟议实现需允许查询本批 Done 的结果，并在目的槽位改变、源发布下一批或注销前完成校验。
+
+### 13.2 恢复和取消：继续处理原任务
+
+本图合并各端应用与 KVAF 对象，以突出恢复边界。显式路径使用原 Put 的 Query／Wait；便利入口使用内部保留事务的 `resolve_cpu_pull()`。两者都不重新 PreparePut 或重放 READ。主动取消可直接进入图中的 Cancel 分支，无需先做一次 Query。
+
+```mermaid
+sequenceDiagram
+    participant A as A 应用 / Runtime
+    participant C as CPU Service
+    participant B as B 应用 / 源对象
+
+    Note over A,B: Submit 回复丢失、查询失败或等待超时：保留原 Put、DDR 槽位和冻结的源
+    A->>C: TCP Query：查询原批次
+    C-->>A: 执行状态，或同一有效会话内的 NotSeen
+
+    alt Done：全部 READ 已成功结束
+        A->>A: 执行既定 Commit / Abort，保存本地结果
+    else Failed：确认已无在途 DMA，或 Cancelled：已禁止执行
+        A->>A: AbortPut，保存本地撤销结果
+    else NotSeen，或应用决定取消本批
+        A->>A: 保存撤销意图，停止本批后续提交
+        A->>C: TCP Cancel：指定原批次
+        C->>C: 与 Submit 原子裁决；尚未接纳则记录 Cancelled
+        C-->>A: Cancelled / Done / Failed / Running / InDoubt
+
+        alt Cancelled，或已安全终结的 Done / Failed
+            A->>A: AbortPut；已选择撤销，不因 Done 改为 Commit
+        else Running / InDoubt，或 Cancel 回复不可确认
+            A->>A: 保留撤销意图和原 Put，继续查询原任务
+            Note over A,B: 不释放源、目的槽位或仍可能被 DMA 使用的通信资源
+        end
+    else Running / InDoubt，或查询结果不可确认
+        A->>A: 保留原事务和资源，继续处理原任务
+        Note over A,C: A 查询超时不等于 CPU InDoubt；CPU 隔离状态不保证靠轮询恢复
+    end
+
+    Note over A,B: 本地 Commit / Abort 失败时保留原 Put 和决定；不重读，也不发送完成通知
+    opt 已确认执行安全终结，且本地元数据决定成功
+        A->>B: 应用通道：对应批次的完成 / 安全失败 / 取消结果
+        B->>B: 按源身份、sequence、MR 校验通知，幂等地本地释放
+    end
+```
+
+`NotSeen` 仅表示**同一 CPU 服务代次和有效源会话中尚未登记本批**，是查询结果，不是新增的持久任务状态。它不能证明迟到的 Submit 不会执行：必须先取得 Cancelled 确认，或查询到已安全结束的执行结果，才能回收资源。服务代次不匹配、源会话丢失和网络不可达不能归为这种可取消的 NotSeen。
+
+Submit 的明确拒绝若未留下阻止后续执行的批次记录，也按上述取消路径结束已发布批次。Cancel 回复丢失时查询或重试同一取消请求；重复取消不得重启任务。原方案已有“取消可能尚未到达的 Ready 序列”的处理，本方案复用这类取消记录，覆盖尚未到达的 Submit。
+
+### 13.3 状态与必要约束
+
+CPU 每个源会话不再保存 Ready 和 Committed。沿用当前单枚举结构时，目标状态为：
+
+| 状态 | 拟议含义 |
+|---|---|
+| Connecting | 正在注册、建链或探测，不接纳业务 READ |
+| Idle | 注册完成，尚无已接纳批次 |
+| Running | 批次已接纳，READ 正在推进 |
+| Done | 全部 READ 成功结束，结果可供原任务查询 |
+| Failed | 执行失败，且已确认没有在途 DMA |
+| InDoubt | 无法证明 DMA／资源已安全结束，继续保留并隔离相关资源 |
+| Cancelled | 本批已取消，迟到 Submit 也不得启动 READ |
+| Closed | CPU 侧源会话已安全退役，拒绝新任务 |
+
+A 仍保留自己的 Prepared／Committed／Aborted 等事务状态，B 仍保留当前批次和 frozen。三端按各自职责保存状态，不通过每批 Complete 再同步一份元数据决定。
+
+1. **固定任务身份和请求。**任务由服务代次、池、源和 sequence 标识；MR、长度和 Span 是不可更改的请求内容。CPU 在任何 READ 提交前保存记录，同批次同请求不重复执行，冲突请求必须拒绝。
+2. **取消与执行互斥接纳。**Cancel 先成功则封住该批次；Submit 先成功则 Cancel 返回实际执行状态。Running／InDoubt 不能仅靠修改状态变为安全取消。已发布但放弃的批次必须确认取消后再推进源序列。
+3. **保留结果和拒绝旧序列的记录。**结果不能在发送回复后立即丢弃。同源下一批只在 B 收到上一批终态通知并释放后发布；下一合法批次推进时仍须拒绝旧序列，且旧 worker 和队列必须已可安全复用。
+4. **通知和本地决策可恢复。**A 保存既定 Commit／Abort 决定；本地完成但业务通知未确认时，重发相同批次通知，不重做 READ。B 幂等处理重复通知，拒绝旧通知释放新批次。通知确认沿用应用 Connector 的机制，不新增 B 到 CPU 的释放查询。
+5. **保持现有安全边界。**数据面只有明确成功后才能提交元数据；只有确认无在途 DMA 且已阻止本批后续读取后才能回收。未决状态不能通过 shutdown 绕过；旧 epoch 的任务不能作为新实例任务重放。本方案不新增跨进程崩溃的透明续跑承诺。
+
+相对原方案，主要新增适配点是 Submit 的批次接纳、NotSeen 转取消的恢复分支，以及去掉 Committed 后的准入／收尾条件。丢失回复、重复请求、元数据失败和 DMA 未决仍复用现有恢复原则；后续实现应对这些边界做针对性故障注入验证。
