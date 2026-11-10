@@ -1,5 +1,6 @@
-"""Host-only regression for the public AICPU CLI and package installation."""
+"""Host-only regression for AICPU CLI, performance statistics and package installation."""
 import contextlib
+import csv
 import io
 import json
 import os
@@ -19,6 +20,90 @@ import benchmark_gather_read as benchmark
 
 EIDS = "00112233445566778899aabbccddeeff,102132435465768798a9bacbdcedfe0f"
 SCATTER = "KvafAicpuCpuPushScatterA12V24"
+
+
+class PerformanceStatisticsTests(unittest.TestCase):
+    @staticmethod
+    def samples():
+        fields = ("request_us", "source_write_us", "notify_us", "read_us", "wr_build_us",
+                  "ready_wait_us", "post_us", "cq_wait_us", "scatter_us", "ack_us")
+        # Python durations deliberately differ: headline statistics must use
+        # kernel time and exclude Host call overhead.
+        return [{"python_call_us": value * 2, "device_span_us": value,
+                 "workers": [dict.fromkeys(fields, 1), dict.fromkeys(fields, 2)]}
+                for value in (10, 20, 100)]
+
+    def test_rates_correspond_to_latency_statistics(self):
+        stats = functional.timing_stats([10, 20, 100], 1_000_000)
+        self.assertAlmostEqual(stats["mean_us"], 130 / 3)
+        self.assertEqual(stats["p50_us"], 20)
+        self.assertAlmostEqual(stats["p99_us"], 98.4)
+        self.assertAlmostEqual(stats["mean_GBps"], 1_000_000 / (130 / 3) / 1000)
+        self.assertEqual(stats["p50_GBps"], 50)
+        self.assertAlmostEqual(stats["p99_GBps"], 1_000_000 / 98.4 / 1000)
+        self.assertEqual(stats["GBps"], stats["mean_GBps"])
+        for payload in (0, 1_000_000):
+            single = functional.timing_stats([12.5], payload)
+            for metric in ("mean", "p50", "p99"):
+                self.assertEqual(single[metric + "_us"], 12.5)
+                self.assertEqual(single[metric + "_GBps"], payload / 12.5 / 1000)
+
+    def test_both_modes_report_six_kernel_metrics(self):
+        expected = {"mean_us": "43.3", "mean_GBps": "23.077",
+                    "p50_us": "20.0", "p50_GBps": "50.000",
+                    "p99_us": "98.4", "p99_GBps": "10.163"}
+        for mode, prefix in benchmark.PREFIXES.items():
+            with self.subTest(mode=mode):
+                summary = benchmark.summarize_measurements(self.samples(), 1_000_000, mode=mode)
+                args = benchmark.parse_args(["--token-bytes", "1000", "--miss-count", "1000"], mode=mode)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    benchmark.print_measurements(args, summary, mode=mode)
+                for suffix in ("_PROFILE ", "_RESULT "):
+                    line = next(line for line in output.getvalue().splitlines()
+                                if line.startswith(prefix + suffix))
+                    fields = dict(word.split("=", 1) for word in line.split()[1:])
+                    self.assertEqual(fields["metric"], "kernel_wall")
+                    self.assertFalse(any(key.startswith("device_") for key in fields))
+                    for key, value in expected.items():
+                        self.assertEqual(fields[key], value)
+
+    def test_both_sweeps_keep_metrics_in_csv_and_terminal(self):
+        # Exercise the real summarizer/formatter and shell CSV path with
+        # deterministic kernel timings, without allocating NPU/DDR buffers.
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            runner = directory / "python-profile-fixture"
+            runner.write_text(f"#!{sys.executable}\n" +
+                "import sys\nfrom pathlib import Path\n" +
+                f"sys.path.insert(0, {str(ROOT / 'access_operator/demo/aicpu_batch_get/python')!r})\n" +
+                "import benchmark_gather_read as b\n" +
+                "mode = 'cpu_push_scatter' if Path(sys.argv[1]).name == 'benchmark_cpu_push_scatter.py' else 'gather_read'\n" +
+                "a = b.parse_args(sys.argv[2:], mode=mode)\n" +
+                f"profiles = {self.samples()!r}\n" +
+                "b.print_measurements(a, b.summarize_measurements(profiles, a.token_bytes * a.miss_count, mode=mode), mode=mode)\n")
+            runner.chmod(0o755)
+            for mode, script in (("gather_read", "run_aicpu_gather_read_sweep.sh"),
+                                 ("cpu_push_scatter", "run_aicpu_cpu_push_scatter_sweep.sh")):
+                with self.subTest(mode=mode):
+                    log_dir = directory / mode
+                    env = dict(os.environ, PYTHON=str(runner), KVAF_AICPU_TOKEN_BYTES="1000",
+                               KVAF_AICPU_MISS_COUNTS="1000", KVAF_AICPU_WORKERS="2",
+                               KVAF_AICPU_SWEEP_LOG_DIR=str(log_dir))
+                    result = subprocess.run(["bash", str(ROOT / "tests" / script), str(directory / "build")],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with (log_dir / "summary.csv").open() as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual(len(rows), 1)
+                    row = rows[0]
+                    keys = ("mean_us", "mean_GBps", "p50_us", "p50_GBps", "p99_us", "p99_GBps")
+                    self.assertEqual(row["metric"], "kernel_wall")
+                    self.assertFalse(any(key.startswith("device_") for key in row))
+                    self.assertEqual([row[key] for key in keys],
+                                     ["43.3", "23.077", "20.0", "50.000", "98.4", "10.163"])
+                    self.assertIn("token_bytes miss_count workers " + " ".join(keys), result.stdout)
+                    self.assertIn("1000 1000 2 43.3 23.077 20.0 50.000 98.4 10.163", result.stdout)
 
 
 class PublicCliTests(unittest.TestCase):
