@@ -69,16 +69,12 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def timing_stats(values: list[float], payload_bytes: int = 0) -> dict:
     p50 = percentile(values, 0.50)
-    p99 = percentile(values, 0.99)
     mean = statistics.mean(values)
-    mean_gbps = payload_bytes / mean / 1000 if mean else 0.0
     return {
         "mean_us": mean, "p50_us": p50, "p90_us": percentile(values, 0.90),
-        "p95_us": percentile(values, 0.95), "p99_us": p99,
-        "GBps": mean_gbps, "mean_GBps": mean_gbps,
+        "p95_us": percentile(values, 0.95), "p99_us": percentile(values, 0.99),
+        "GBps": payload_bytes / mean / 1000 if mean else 0.0,
         "p50_GBps": payload_bytes / p50 / 1000 if p50 else 0.0,
-        # Bandwidth corresponding to P99 latency, rather than the P99 of rates.
-        "p99_GBps": payload_bytes / p99 / 1000 if p99 else 0.0,
     }
 
 
@@ -260,15 +256,14 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         runtime.shutdown()
 
     samples_us = [value / 1000 for value in samples_ns]
-    stats = timing_stats(samples_us, measured_count * token)
     bandwidth = sum(payload_bytes) / sum(samples_ns)  # bytes/ns == decimal GB/s.
     print(
         f"AICPU_BATCH_GET_PASS mode={mode} workers={workers} iterations={args.iterations} "
-        f"mean_us={stats['mean_us']:.1f} mean_GBps={bandwidth:.3f} "
-        f"p50_us={stats['p50_us']:.1f} p50_GBps={stats['p50_GBps']:.3f} "
-        f"p90_us={stats['p90_us']:.1f} "
-        f"p95_us={stats['p95_us']:.1f} "
-        f"p99_us={stats['p99_us']:.1f} p99_GBps={stats['p99_GBps']:.3f} GBps={bandwidth:.3f} "
+        f"mean_us={statistics.mean(samples_us):.1f} "
+        f"p50_us={percentile(samples_us, 0.50):.1f} "
+        f"p90_us={percentile(samples_us, 0.90):.1f} "
+        f"p95_us={percentile(samples_us, 0.95):.1f} "
+        f"p99_us={percentile(samples_us, 0.99):.1f} GBps={bandwidth:.3f} "
         f"output_order={args.output_order} output_row_step={args.output_row_step} "
         f"active_percent={args.active_percent} "
         "verification=every_round_full_output npu_consumer_checked=1 "

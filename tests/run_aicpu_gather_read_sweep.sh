@@ -59,14 +59,12 @@ done
 awk -F, '
   NR==1 {
     for (i=1; i<=NF; i++) col[$i]=i
-    print "token_bytes miss_count workers mean_us mean_GBps p50_us p50_GBps p99_us p99_GBps"
+    print "token_bytes miss_count workers device_p50_us p50_GBps"
     next
   }
   {
     print $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
-          $(col["mean_us"]), $(col["mean_GBps"]),
-          $(col["p50_us"]), $(col["p50_GBps"]),
-          $(col["p99_us"]), $(col["p99_GBps"])
+          $(col["device_p50_us"]), $(col["p50_GBps"])
   }
 ' "$csv_file"
 echo "AICPU_GATHER_READ_SWEEP_PASS cases=$index csv=$csv_file"
