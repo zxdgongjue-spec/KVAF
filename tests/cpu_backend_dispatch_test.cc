@@ -56,6 +56,9 @@ int main() {
       runtime, Command::kOpenCpuPushGet, Result::kResourceError);
   Exchange<OpenCpuPushGetRequest, OpenAivCpuPushGetResponse>(
       runtime, Command::kOpenCpuPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
+  Exchange<OpenCpuPushGetRequest, OpenAivCpuPushGetResponse>(
+      runtime, Command::kOpenAivCpuGatherPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
+  CHECK(!IsSupportedProtocolVersion(Command::kOpenAivCpuGatherPushGet, kProtocolVersion));
   Exchange<EnableDirectGatherRequest, StatusResponse>(
       runtime, Command::kEnableDirectGather, Result::kResourceError);
   Exchange<EnableGatherLanesRequest, StatusResponse>(

@@ -119,7 +119,7 @@ struct ScatterBatchGet::Impl {
     return Status::OK();
   }
 
-  Status InitializePush(const peer::PeerRegion& peer) {
+  Status InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
     cpu_push::Layout layout;
     if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout))
       return Status::InvalidArgument("invalid scatter workspace shape");
@@ -177,7 +177,7 @@ struct ScatterBatchGet::Impl {
     }
     peer::OpenAivCpuPushGetResponse response{};
     push_open = true;  // A lost response can still leave a live remote session.
-    auto result = config.peer_link->OpenAivCpuPushGet(region.base, open, &response);
+    auto result = config.peer_link->OpenAivCpuPushGet(region.base, open, &response, cpu_gather);
     if (!result.ok()) return result;
     if (response.mailbox_segment_bytes != kSegmentBytes || !response.mailbox_base ||
         response.mailbox_bytes < layout.staging || !(response.mailbox_token_id >> 8) ||
@@ -296,6 +296,10 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (pipeline_option && std::strcmp(pipeline_option, "0") && std::strcmp(pipeline_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_PIPELINE must be 0 or 1");
   const bool pipeline = !pipeline_option || pipeline_option[0] == '1';
+  const char* cpu_gather_option = std::getenv("KVAF_SCATTER_CPU_GATHER");
+  if (cpu_gather_option && std::strcmp(cpu_gather_option, "0") && std::strcmp(cpu_gather_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
+  const bool cpu_gather = cpu_gather_option && cpu_gather_option[0] == '1';
   s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
@@ -317,11 +321,12 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Error("initialize statuses");
   s.args.max_polls = 100000000U;
   s.args.source_base = region.base; s.args.source_bytes = region.length;
-  result = s.InitializePush(peer);
+  result = s.InitializePush(peer, cpu_gather);
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u\n", unsigned(pipeline));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u\n",
+               unsigned(pipeline), unsigned(cpu_gather));
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {

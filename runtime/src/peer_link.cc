@@ -480,10 +480,10 @@ Status PeerLink::StopCpuPushGet(uint64_t base) const {
   return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet);
 }
 Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
-                                   OpenAivCpuPushGetResponse* response) const {
+                                   OpenAivCpuPushGetResponse* response, bool cpu_gather) const {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
-  constexpr auto command = Command::kOpenCpuPushGet;
+  const auto command = cpu_gather ? Command::kOpenAivCpuGatherPushGet : Command::kOpenCpuPushGet;
   constexpr auto version = kAivCpuPushProtocolVersion;
   request.header = MakeHeader(command, sizeof(request), version);
   request.session_id = found->second.session_id;
@@ -491,7 +491,8 @@ Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
   if (!Exchange(address_, request, response, &error) ||
       !IsValidResponseHeader(response->header, command, sizeof(*response), version) ||
       !ResultOk(static_cast<Result>(response->result), &error))
-    return ToStatus("AIV CPU push setup failed", std::move(error));
+    return ToStatus(cpu_gather ? "AIV CPU gather push setup failed" : "AIV CPU push setup failed",
+                    std::move(error));
   return Status::OK();
 }
 Status PeerLink::StartAivCpuPushGet(uint64_t base) const {

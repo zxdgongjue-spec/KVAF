@@ -22,6 +22,7 @@ int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 void* mailbox_jetty{};
 bool fail_mailbox_destroy{}, fail_mailbox_import{};
+bool opened_cpu_gather{};
 int async_memsets{};
 uint64_t kernel_result{};
 std::vector<uint64_t> sequences;
@@ -140,7 +141,9 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
-Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenAivCpuPushGetResponse* r) const {
+Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenCpuPushGetRequest,
+                                   OpenAivCpuPushGetResponse* r, bool cpu_gather) const {
+  opened_cpu_gather = cpu_gather;
   r->mailbox_base = 0x1000000; r->mailbox_bytes = 0x100000;
   r->mailbox_segment_bytes = 48; r->mailbox_token_id = 0x800; r->max_write_bytes = 65536;
   return Status::OK();
@@ -216,6 +219,7 @@ bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint
 int main() {
   using namespace kvaf;
   unsetenv("KVAF_SCATTER_PIPELINE");
+  unsetenv("KVAF_SCATTER_CPU_GATHER");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -299,6 +303,7 @@ int main() {
     assert(owner->Shutdown().ok());
     assert(!allocations && !hccp_refs && !mailbox_jetty);
     assert(owner->Initialize(region).ok());
+    assert(!opened_cpu_gather);
     kernel_result = KVAF_SEQ_CQ_ERROR;
     exec.execution.synchronize = true;
     assert(!owner->Execute(exec).ok());
@@ -312,7 +317,10 @@ int main() {
     kernel_result = 0;
   }
   {
+    setenv("KVAF_SCATTER_CPU_GATHER", "1", 1);
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    assert(opened_cpu_gather);
+    unsetenv("KVAF_SCATTER_CPU_GATHER");
     const auto before = launches;
     const auto memsets_before = async_memsets;
     exec.execution.synchronize = false;

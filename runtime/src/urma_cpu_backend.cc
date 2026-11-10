@@ -683,11 +683,13 @@ class CpuService {
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<Transport>();
     if constexpr (std::is_same_v<Transport, cpu_push::aiv::Transport>) {
-      const auto status = transport->ConfigureGather(region.memory, region.base, gather_threads_,
-          min_bytes_per_thread_, gather_affinity_, ToGatherWaitMode(gather_mode_));
-      if (!status.ok()) {
-        Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
-        return Result::kResourceError;
+      if (request.header.command == static_cast<uint16_t>(Command::kOpenAivCpuGatherPushGet)) {
+        const auto status = transport->ConfigureGather(region.memory, region.base, gather_threads_,
+            min_bytes_per_thread_, gather_affinity_, ToGatherWaitMode(gather_mode_));
+        if (!status.ok()) {
+          Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
+          return Result::kResourceError;
+        }
       }
     }
     const auto status = transport->Initialize(region.resources->context(), region.segment,
@@ -1036,7 +1038,8 @@ void HandleClient(int fd, CpuService* service, const MessageHeader& header) {
       return;
     }
 
-    case Command::kOpenCpuPushGet: {
+    case Command::kOpenCpuPushGet:
+    case Command::kOpenAivCpuGatherPushGet: {
       const bool aiv = header.version == peer::kAivCpuPushProtocolVersion;
       peer::OpenCpuPushGetRequest request{};
       request.header = header;

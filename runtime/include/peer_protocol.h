@@ -33,17 +33,18 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kStopGatherLanes = 14U,
+  kOpenAivCpuGatherPushGet = 15U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
 
 inline constexpr bool IsAivCpuPushCommand(Command command) {
   return command == Command::kOpenCpuPushGet || command == Command::kStartCpuPushGet ||
-         command == Command::kStopCpuPushGet;
+         command == Command::kStopCpuPushGet || command == Command::kOpenAivCpuGatherPushGet;
 }
 
 inline constexpr bool IsSupportedProtocolVersion(Command command, uint16_t version) {
-  return version == kProtocolVersion ||
+  return (version == kProtocolVersion && command != Command::kOpenAivCpuGatherPushGet) ||
          (version == kAivCpuPushProtocolVersion && IsAivCpuPushCommand(command));
 }
 

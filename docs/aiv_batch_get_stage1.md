@@ -18,8 +18,10 @@ AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
 ### Scatter 的 CPU Gather 回推
 
-启动 CPU 服务时设置 `KVAF_SCATTER_CPU_GATHER=1`，NPU 继续使用
-`aiv_batch_get_mode="cpu_push_scatter"`。该开关默认关闭。
+启动 NPU 进程时设置 `KVAF_SCATTER_CPU_GATHER=1`，并使用
+`aiv_batch_get_mode="cpu_push_scatter"`。该开关默认关闭，在 Runtime 初始化时读取。
+NPU 通过专用的会话打开命令选择 CPU gather，同一个 CPU 服务可为不同会话选择不同的回推路径。
+启用时需部署支持该命令的 CPU 服务和 NPU Host。
 CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，再通过已有的四路
 Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
 使用一个源 SGE 和一个目标 SGE，并按当前传输长度上限拆分。AIV 复用现有的
@@ -28,7 +30,7 @@ Ready/Done 和 scatter。启用首段提前发布时，CPU 先 gather 并回推�
 
 CPU gather 使用服务的 `--gather-threads` 和 gather 绑核、等待配置。
 每个会话的额外 pinned DDR staging 按观察到的最大有效批次字节数增长，
-以 4 KiB 对齐并复用到会话关闭。可分别用开关 0 和 1 启动服务，沿用下方的
+以 4 KiB 对齐并复用到会话关闭。可分别用开关 0 和 1 启动 NPU 进程，沿用下方的
 正确性回归和性能脚本对照。
 
 Scatter 使用 64 KiB UB stage ring 执行 GM→UB→GM，通过 MTE3→MTE2 事件安全复用 bank。
@@ -52,6 +54,7 @@ GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
 每核 192 B 区域。AIV Scatter mailbox 的打开、启动和停止命令使用 V8，握手响应为 392 B。
+CPU Gather 回推使用单独的 V8 打开命令，复用 Scatter 的握手结构及启动、停止命令。
 V8 由 AIV 把地址清单和通知 WRITE 到 CPU DDR mailbox，CPU 从本地读取。
 AICPU Scatter 使用 V6，握手响应为 300 B，CPU 从 NPU HBM READ 通知、请求头和地址清单。
 两条路径分别通过 `aiv_batch_get_mode` 和 `aicpu_batch_get_mode` 选择。Gather 和公共控制命令

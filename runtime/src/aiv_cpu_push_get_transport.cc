@@ -60,10 +60,6 @@ Transport::~Transport() {
 
 Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t threads,
     std::size_t min_bytes, bool affinity, peer::GatherWaitMode mode) {
-  const auto* value = std::getenv("KVAF_SCATTER_CPU_GATHER");
-  if (!value || std::strcmp(value, "0") == 0) return Status::OK();
-  if (std::strcmp(value, "1") != 0)
-    return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);

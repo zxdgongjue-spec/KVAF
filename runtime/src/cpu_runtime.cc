@@ -108,6 +108,7 @@ Status CpuRuntime::ServeConnection(int fd) {
     case peer::Command::kCreateChannel:
       return Reply<peer::CreateChannelResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kOpenCpuPushGet:
+    case peer::Command::kOpenAivCpuGatherPushGet:
       if (header.version == peer::kAivCpuPushProtocolVersion)
         return Reply<peer::OpenAivCpuPushGetResponse>(fd, command, peer::Result::kResourceError,
                                                       header.version);
