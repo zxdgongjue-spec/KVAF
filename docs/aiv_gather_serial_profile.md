@@ -50,6 +50,11 @@ RUN_LABEL = "gather_prepared_prefix"
 合并用 KVAF_AIV_GATHER_COALESCE_SGES=0/1。调用快路径可用
 KVAF_GATHER_TRUSTED_INPUTS=0/1 对照，默认 1。
 
+准备阶段默认每次 BatchPut 灌入 128 个条目，复用固定 HBM source，直接在 NPU
+按全局 token ID 生成原有数据 pattern；建表 keys 使用连续 CPU int64 Tensor。
+`GATHER_PERF_PHASE_DONE` 分别输出 initialize、populate_table、prepare_access_table
+耗时（最后一项含 NPU 地址表上传），均不计入 BatchGet E2E 样本。
+
 先保持核数、SGL、源/目标布局、seed、CPU 线程/绑核/NUMA/页策略一致，再独立比较：
 
 ```bash

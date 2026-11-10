@@ -18,7 +18,7 @@ TOKENS_PER_BLOCK = 128
 GATHER_SGL_SIZE = 6             # 1..13; compare 5 / 9 / 13 on the confirmed NPU.
 SEED = 20261030
 PROFILE_CLOCK_MHZ = 1000        # Confirmed Ascend 950DT; A2/A3 use 50 (GetSystemCycle).
-POPULATE_CHUNK_ENTRIES = 16     # Setup only; does not change BatchGet request size.
+POPULATE_CHUNK_ENTRIES = 128    # Setup only; does not change BatchGet request size.
 CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
 RUN_LABEL = "gather_prepared_prefix"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
@@ -477,7 +477,7 @@ def export_csv_results(
 def token_pattern(torch, token_ids, token_bytes: int):
     """Deterministic bytes depend on the source token as well as its byte offset."""
     x = token_ids.to(torch.int64).unsqueeze(1)
-    y = torch.arange(token_bytes, dtype=torch.int64).unsqueeze(0)
+    y = torch.arange(token_bytes, dtype=torch.int64, device=token_ids.device).unsqueeze(0)
     return ((x * 37 + y * 13 + (y >> 3) + (x >> 8) * (y % 7)) % 251).to(torch.uint8)
 
 
@@ -505,7 +505,6 @@ def main() -> int:
         return 2
 
     from backend import detect_torch_backend
-    from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids
     import kvaf
 
@@ -541,6 +540,7 @@ def main() -> int:
             f"GATHER_PERF_CONFIG mode=gather_read cores={cores} token_bytes={TOKEN_BYTES} "
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
+            f"populate_chunk_entries={POPULATE_CHUNK_ENTRIES} "
             f"coalesce_sges={metadata['coalesce_sges']} "
             f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
             f"configured_first_chunk_divisor={metadata['configured_first_chunk_divisor']} "
@@ -548,17 +548,43 @@ def main() -> int:
             "plan=fixed_random timing=async_call_to_stream_completion",
             flush=True,
         )
+        print("GATHER_PERF_PHASE_BEGIN phase=initialize", flush=True)
+        phase_start = time.perf_counter()
         runtime.initialize(TABLE_CAPACITY * block_bytes, block_bytes)
-        for start in range(0, TABLE_CAPACITY, POPULATE_CHUNK_ENTRIES):
-            count = min(POPULATE_CHUNK_ENTRIES, TABLE_CAPACITY - start)
-            ids = torch.arange(start * TOKENS_PER_BLOCK, (start + count) * TOKENS_PER_BLOCK)
-            source = token_pattern(torch, ids, TOKEN_BYTES).reshape(count, block_bytes).to(device)
+        print(f"GATHER_PERF_PHASE_DONE phase=initialize "
+              f"elapsed_ms={(time.perf_counter() - phase_start) * 1000:.3f}", flush=True)
+
+        print("GATHER_PERF_PHASE_BEGIN phase=populate_table", flush=True)
+        phase_start = time.perf_counter()
+        populate_entries = min(POPULATE_CHUNK_ENTRIES, TABLE_CAPACITY)
+        # Keep one registered HBM source across all puts, including a short tail.
+        # Global token IDs preserve source-address checks; generate on NPU to
+        # avoid rebuilding and uploading the entire DDR payload through the CPU.
+        source = torch.empty((populate_entries, block_bytes), dtype=torch.uint8, device=device)
+        token_ids = torch.arange(populate_entries * TOKENS_PER_BLOCK, dtype=torch.int64, device=device)
+        populate_offsets = [i * block_bytes for i in range(populate_entries)]
+        populate_lengths = [block_bytes] * populate_entries
+        # Single pool row/layer: the DSA key is the block ordinal.
+        prepare_keys = torch.arange(TABLE_CAPACITY, dtype=torch.int64, device="cpu")
+        for start in range(0, TABLE_CAPACITY, populate_entries):
+            count = min(populate_entries, TABLE_CAPACITY - start)
+            ids = token_ids[:count * TOKENS_PER_BLOCK] + start * TOKENS_PER_BLOCK
+            source[:count].copy_(token_pattern(torch, ids, TOKEN_BYTES).reshape(count, block_bytes))
             runtime.batch_put(
-                build_dsa_keys(count, start=start, q_capacity=TABLE_CAPACITY), source,
-                [i * block_bytes for i in range(count)], [block_bytes] * count,
+                prepare_keys[start:start + count], source,
+                populate_offsets[:count], populate_lengths[:count],
             )
-        table = runtime.prepare_access_table(build_dsa_keys(TABLE_CAPACITY, q_capacity=TABLE_CAPACITY))
+        torch.npu.synchronize()
+        print(f"GATHER_PERF_PHASE_DONE phase=populate_table entries={TABLE_CAPACITY} "
+              f"elapsed_ms={(time.perf_counter() - phase_start) * 1000:.3f}", flush=True)
+
+        print("GATHER_PERF_PHASE_BEGIN phase=prepare_access_table", flush=True)
+        phase_start = time.perf_counter()
+        table = runtime.prepare_access_table(prepare_keys)
         view = runtime.access_table_view(table, device="npu", capacity=TABLE_CAPACITY)
+        torch.npu.synchronize()
+        print(f"GATHER_PERF_PHASE_DONE phase=prepare_access_table "
+              f"elapsed_ms={(time.perf_counter() - phase_start) * 1000:.3f}", flush=True)
         generator = torch.Generator().manual_seed(SEED)
         indices_cpu = torch.randint(TABLE_CAPACITY, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
         slots_cpu = torch.randint(TOKENS_PER_BLOCK, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
