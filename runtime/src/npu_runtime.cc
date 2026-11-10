@@ -444,6 +444,7 @@ struct NpuRuntime::Impl {
         options.transport, options.aicpu_batch_get_mode, &backend, options.aiv_batch_get_mode);
     if (!selected.ok()) throw std::invalid_argument(selected.message());
     config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
+    config.batch_get_token_bytes = options.batch_get_token_bytes;
     config.aiv_batch_get_mode = options.aiv_batch_get_mode;
     config.aiv_gather_sgl_size = options.aiv_gather_sgl_size;
     config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
