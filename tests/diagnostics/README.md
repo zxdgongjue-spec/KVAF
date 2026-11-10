@@ -13,7 +13,7 @@ python3 tests/diagnostics/bandwidth_scopes.py \
 ```
 
 Repeat with miss-count 2048 and 8192, using different output names. Keep the
-same machine, runtime build and network configuration for V9. Clock MHz is an
+same machine, runtime build and network configuration for V10. Clock MHz is an
 explicit assumption, not autodetection; retain raw ticks and confirm frequency.
 
 Each JSON sample pairs host elapsed, external NPU event elapsed, kernel wall

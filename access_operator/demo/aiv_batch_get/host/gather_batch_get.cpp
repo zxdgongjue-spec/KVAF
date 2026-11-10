@@ -261,7 +261,8 @@ Status GatherBatchGet::Impl::CaptureProfile() {
     else if (p.valid_mask != KVAF_GATHER_PROFILE_ALL_EVENTS) reason = "valid_mask";
     else if (p.kernel_start_cycle > p.input_done_cycle) reason = "timestamp_start_input";
     else if (p.input_done_cycle > p.descriptor_done_cycle) reason = "timestamp_input_descriptor";
-    else if (p.descriptor_done_cycle > p.notify_done_cycle) reason = "timestamp_descriptor_notify";
+    else if (!(args.head_start && !args.probe && p.requests > kGatherHeadRows) &&
+             p.descriptor_done_cycle > p.notify_done_cycle) reason = "timestamp_descriptor_notify";
     else if (p.notify_done_cycle > p.ack_done_cycle) reason = "timestamp_notify_ack";
     else if (!p.pipeline_chunk_bytes && p.ack_done_cycle > p.read_done_cycle) reason = "timestamp_ack_read";
     else if (p.ack_done_cycle > p.kernel_finish_cycle) reason = "timestamp_ack_finish";
@@ -506,6 +507,7 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     s.latest_profile = {};
   }
   auto args = s.args;
+  args.head_start = exec.execution.trusted_npu_request && !args.probe;
   if (exec.execution.trusted_npu_request) FillInput(*exec.request, s.config, &args.request);
   else result = Input(exec, s.config, &args.request);
   if (!result.ok()) return result;
@@ -515,6 +517,7 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Error("register output");
   args.request.core_status = Ptr(s.status_device); args.request.queue_state = Ptr(s.queues);
   s.args.request = args.request;
+  s.args.head_start = args.head_start;
   args.sequence = ++s.sequence;
   args.profile = s.profiling ? Ptr(s.profile_device) : 0;
   s.pending_profile = s.profiling;

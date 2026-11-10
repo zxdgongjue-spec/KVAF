@@ -1,6 +1,7 @@
 #include "cpu_gather_executor.h"
 
 #include <ctime>
+#include <stdexcept>
 
 namespace kvaf::peer {
 namespace {
@@ -47,7 +48,8 @@ bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t des
 
 std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
                                          std::uint64_t descriptor_address, std::uint64_t sequence,
-                                         std::size_t max_spans) {
+                                         std::size_t max_spans, const GatherControl* control,
+                                         const std::atomic<bool>* stop) {
   if (region_bytes < 64U || base_ > UINT64_MAX - region_bytes || descriptor_address % 64U != 0U ||
       !GatherRange(base_, GatherControlOffset(region_bytes), descriptor_address,
                    sizeof(GatherDescriptorHeader)))
@@ -55,6 +57,10 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   const auto* descriptor = memory_ + (descriptor_address - base_);
   GatherDescriptorHeader header;
   std::memcpy(&header, descriptor, sizeof(header));
+  const bool head_start = (header.magic & kGatherHeadStartFlag) != 0;
+  header.magic &= ~kGatherHeadStartFlag;
+  if (head_start && (!control || !header.span_bytes || header.span_count <= kGatherHeadRows))
+    return 0U;
   const bool configured = header.magic == kGatherConfiguredMagic;
   GatherChunkConfig config{};
   if (configured) {
@@ -93,6 +99,11 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
   }
+  descriptor_suffix_ = head_start ? &control->suffix : nullptr;
+  request_stop_ = stop;
+  sequence_ = sequence;
+  head_bytes_ = std::uint64_t{kGatherHeadRows} * span_bytes_;
+  copy_failed_.store(false, std::memory_order_relaxed);
   return Publish(header.staging_address, source_spans, header.span_count, header.total_bytes);
 }
 
@@ -110,6 +121,8 @@ void CpuGatherExecutor::Copy() {
     PublishReady();
     GatherSpinPause();
   }
+  if (copy_failed_.load(std::memory_order_relaxed))
+    throw std::runtime_error("gather descriptor suffix wait failed");
   PublishReady();
   if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
 }
@@ -137,6 +150,25 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
   profile.thread_cpu_ns = profile.cpu_time_valid ? cpu_end - cpu_begin : 0U;
 }
 
+bool CpuGatherExecutor::WaitSuffix() const {
+  if (__atomic_load_n(descriptor_suffix_, __ATOMIC_ACQUIRE) == sequence_) return true;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  std::uint32_t polls = 0;
+  for (;;) {
+    const auto suffix = __atomic_load_n(descriptor_suffix_, __ATOMIC_ACQUIRE);
+    if (suffix == sequence_) return true;
+    if (suffix > sequence_ || copy_failed_.load(std::memory_order_relaxed) ||
+        ((++polls & 255U) == 0U &&
+         (stopping_.load(std::memory_order_acquire) ||
+          (request_stop_ && request_stop_->load(std::memory_order_acquire)) ||
+          std::chrono::steady_clock::now() >= deadline))) {
+      copy_failed_.store(true, std::memory_order_relaxed);
+      return false;
+    }
+    GatherSpinPause();
+  }
+}
+
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
   if (offset >= end) return 0U;
@@ -147,16 +179,21 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
             variable_offsets_.end(), offset) - variable_offsets_.begin() - 1U);
   std::size_t index = static_cast<std::size_t>(index_for_offset);
   auto in_span = span_bytes_ != 0U ? offset % span_bytes_ : offset - variable_offsets_[index];
+  auto ready_end = descriptor_suffix_ ? std::min(end, head_bytes_) : end;
   while (offset < end) {
+    if (offset >= ready_end) {
+      if (!WaitSuffix()) return offset - begin;
+      ready_end = end;
+    }
     const auto source_address = spans_[index].address + in_span;
     const auto length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
-    auto bytes = std::min<std::uint64_t>(length - in_span, end - offset);
+    auto bytes = std::min<std::uint64_t>(length - in_span, ready_end - offset);
     ++index;
     in_span = 0U;
-    while (bytes < end - offset && index < span_count_ &&
+    while (bytes < ready_end - offset && index < span_count_ &&
            spans_[index].address == source_address + bytes) {
       const auto next_length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
-      bytes += std::min<std::uint64_t>(next_length, end - offset - bytes);
+      bytes += std::min<std::uint64_t>(next_length, ready_end - offset - bytes);
       ++index;
     }
     const auto* source = memory_ + (source_address - base_);
@@ -179,6 +216,7 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
       const auto local_begin = std::min(end, begin + lines * worker / active_threads_ * 64U);
       const auto local_end = std::min(end, begin + lines * (worker + 1U) / active_threads_ * 64U);
       copied += CopyRange(local_begin, local_end);
+      if (copy_failed_.load(std::memory_order_relaxed)) return copied;
       if (local_begin != local_end) GatherBarrier();
       auto& progress = cooperative_progress_[chunk];
       // The acquire chain collects every writer's completed payload stores.
@@ -203,6 +241,7 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
       const auto boundary = (offset / pipeline_chunk_bytes_ + 1U) * pipeline_chunk_bytes_;
       const auto next = std::min(end, boundary);
       copied += CopyRange(offset, next);
+      if (copy_failed_.load(std::memory_order_relaxed)) return copied;
       // This writer must finish its payload stores before advertising partial
       // progress. The task's remaining bytes can then be copied independently.
       GatherBarrier();

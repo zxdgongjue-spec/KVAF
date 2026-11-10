@@ -96,12 +96,14 @@ def configured_first_chunk_divisor() -> int:
 
 
 def profile_stage_cycles(lane: Mapping[str, object]) -> dict[str, int]:
-    """Serial stages partition time; chunk-mode wait_cpu and read overlap."""
+    """Descriptor publication, CPU work and chunk READs may overlap."""
     pipeline = int(lane.get("pipeline_chunk_bytes", 0)) != 0
     durations = {}
     for name, begin, end in STAGE_BOUNDARIES:
         first, last = int(lane[begin]), int(lane[end])
-        if pipeline and name == "read":
+        if name == "publish":
+            first = min(first, last)  # A head notify may precede the descriptor tail.
+        elif pipeline and name == "read":
             first = int(lane["first_read_submit_cycle"])
         elif pipeline and name == "finalize":
             first = max(first, int(lane["ack_done_cycle"]))

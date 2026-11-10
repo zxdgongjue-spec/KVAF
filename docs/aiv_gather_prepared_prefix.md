@@ -21,8 +21,8 @@ HBM workspace 只存清单和每 lane 64 B scratch；UB 存清单/WQE，不存 p
 | Python | 默认 `trusted_gather_inputs=True`；复用 method/vectorcall 和 current_stream callable。每次重读七个 data_ptr、容量和当前 stream，不缓存跨调用的 Tensor 指针或 stream。 |
 | Runtime/Host | trusted 请求快速分发；同 stream 普通异步调用连续排队，不逐次 Drain 或 D2H status；切流、显式 Drain、BatchPut 前和 shutdown 仍 fence。output MR/entity 缓存保留到 transport shutdown。 |
 | 初始化与输入 | workspace/queues 使用 `HUGE_FIRST` 并允许普通页回退；不逐次 Host 清零 status/profile。Scalar 只刷新请求数，SIMT 输入不做全量 Scalar Flush；大 token 回退只刷新有效 lane 的 output_indices。 |
-| descriptor | 128 个 SIMT 线程生成清单，两个 24 KiB UB bank 交替；构造下一块与 MTE3 搬运上一块重叠。发送前等待 MTE3，无逐行 Scalar 写出/Flush。 |
-| 控制发布 | descriptor 分段、command、notify 合为一个有序 WRITE wave，标准队列只用一次 doorbell/尾 CQ；容量不足时仍 drain。已知尾 WR 在编码时设置 order/completion，避免二次修改和 Flush。 |
+| descriptor | 128 个 SIMT 线程生成清单，两个 24 KiB UB bank 交替；每段 MTE3 完成后立即 WRITE 下发，与后续构造/搬运重叠，无逐行 Scalar 写出/Flush。 |
+| 控制发布 | 每段清单发布 doorbell，物理 wave 尾设置有序 completion 后才发布；队列容量允许时，普通请求仅最终 notify 等一次 CQ，首段提前启动请求分别等待 head/suffix 尾 CQ。 |
 | CPU | 线程复用、分 lane 预算和绑核；相邻源 span 合并 memcpy；固定 token 用除法定位，变长 span 保留前缀索引。旧 byte-prefix 与协作 chunk 调度均保留，详见下文。 |
 | READ | SIMT 直接在 UB 编码变长多 SGE WQE，两 bank 复用，按 `MTE(n−1) → VF(n) → commit(n−2)` 重叠搬运、构造和提交；首个 ready post 尽早发布。 |
 | 进度与提前准备 | ready 查询与 WQE 工作重叠；可提前准备两个 UB bank，按完整 WR 就绪范围部分提交；跨 chunk 保留 bank 和在途 READ。最终 ACK 查询与最后数据 READ 重叠。 |
@@ -31,6 +31,13 @@ HBM workspace 只存清单和每 lane 64 B scratch；UB 存清单/WQE，不存 p
 trusted 调用方保证 Tensor 连续、设备/类型/容量正确及存活到 stream 完成；仅支持 eager。
 `trusted_gather_inputs=False` 保留完整检查；C++ 通过
 `BatchGetExecutionOptions::trusted_npu_request` 选择同一合同。
+
+trusted 普通请求的每 lane 超过 1024 行时，先发布前 1024 行清单和首次 notify；
+首段 GM 按 64 B 对齐，48 B header 时会额外包含一条 span。剩余清单继续分段
+WRITE，最后向该 lane 的 control+24 写入 sequence，提交整个 suffix。
+CPU 线程数仍按整批 payload 决定，复制和相邻源合并均在 1024 行边界等待 suffix；
+ready_bytes 仍只表示已完成的 payload。超时/停止会中止等待，并在全部 helper 退出后
+返回错误。probe 保留完整清单后 notify；READ 阶段仍在全部清单发布后进入。
 
 ## 输出连续与 SGE 合并
 
@@ -149,11 +156,12 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 
 ## ABI 与兼容性
 
-- kernel `KvafGatherBatchGetAivKernelV9`，args 248 B；loader 拒绝 V1–V8。
+- kernel `KvafGatherBatchGetAivKernelV10`，args 256 B；loader 拒绝 V1–V9。
 - profile PRF5、256 B；CSV schema 10。profile 直接写每核独占的 GM 记录。
 - GDR2：整批/普通 byte-prefix；GDR4：均分协作块；均为 48 B header + 16 B span 数组。
 - GDR5：CPU 继续接受固定 1/32 首块 + 4 尾块的旧格式。
 - GDR6：48 B header 后附加 16 B（D、N、零保留位），再接 span 数组。
+- 首段提前启动复用以上布局，magic 最高位置 1；旧 CPU 拒绝该 magic，避免消费未发布清单。
 - 所有格式的 sequence/ready 偏移不变，ready_bytes 位于 +40；控制查询 READ `[8,48)`
   到 scratch `[16,56)`，一次缓存行维护后校验 sequence、错误位、范围、单调性和边界。
 - CPU 验证描述符/数据范围不重叠、配置、保留位及最多 33 个完成槽；变长 span 格式保留。
@@ -163,7 +171,7 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 ## 验证边界
 
 原分支已有的模型、Host/loader 和 Python 回归及其构建目标保留，Gather 相关模型
-已适配当前 V9 和异步流程；生产 ABI 静态断言及 Python binding 构建后导入检查也保留。
+已适配当前 V10 和异步流程；生产 ABI 静态断言及 Python binding 构建后导入检查也保留。
 真机功能入口、性能脚本及 CPU 日志分析工具继续保留，性能入口
 只依赖 `aiv_batch_get_common.py` 的路径解析与安全退出辅助函数。
 

@@ -58,8 +58,10 @@ struct KvafGatherBatchGetArgs {
   // Zero preserves equal chunks. >=2 selects GDR6: first payload/divisor, then
   // cooperative_chunks equal tails (1..32). Formerly a zero-only reserved word.
   uint32_t first_chunk_divisor;
+  // Trusted requests may notify the CPU before the descriptor suffix is ready.
+  uint32_t head_start;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 248);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 256);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

@@ -86,7 +86,9 @@ class CpuGatherExecutor {
   CpuGatherExecutor& operator=(const CpuGatherExecutor&) = delete;
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
-                            std::uint64_t sequence, std::size_t max_spans);
+                            std::uint64_t sequence, std::size_t max_spans,
+                            const GatherControl* control = nullptr,
+                            const std::atomic<bool>* stop = nullptr);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -183,6 +185,7 @@ class CpuGatherExecutor {
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
+  bool WaitSuffix() const;
 
   std::uint64_t ProcessSource(std::size_t worker);
   void PublishReady();
@@ -207,6 +210,10 @@ class CpuGatherExecutor {
   std::atomic<std::uint64_t> generation_{0U};
   // The sender retains this descriptor until all copy threads finish and ACK is published.
   const GatherSpan* spans_{nullptr};
+  const std::uint64_t* descriptor_suffix_{nullptr};
+  const std::atomic<bool>* request_stop_{nullptr};
+  std::uint64_t sequence_{}, head_bytes_{};
+  mutable std::atomic<bool> copy_failed_{false};
   std::uint32_t span_count_{0U}, span_bytes_{0U};
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};

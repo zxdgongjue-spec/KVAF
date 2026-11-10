@@ -2,6 +2,11 @@
 #include <cstdint>
 
 namespace kvaf {
+// Initial notify commits the first 1024 spans; control+24 commits the suffix.
+// Older CPU services reject the flagged magic instead of consuming an incomplete list.
+inline constexpr std::uint64_t kGatherHeadStartFlag = std::uint64_t{1} << 63;
+inline constexpr std::uint32_t kGatherHeadRows = 1024;
+inline constexpr std::uint32_t kGatherSuffixOffset = 24;
 // GDR4 changes CPU copy ownership only. The 48-byte GDR2 envelope, mutable
 // byte prefix and final ACK keep their meanings.
 inline constexpr std::uint64_t kGatherCooperativeMagic = 0x4b56414647445234ULL;

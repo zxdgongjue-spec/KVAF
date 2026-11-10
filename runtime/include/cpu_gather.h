@@ -11,8 +11,8 @@
 namespace kvaf::peer {
 
 struct alignas(64) GatherControl {
-  std::uint64_t notify, ack, command;
-  std::uint64_t reserved[5];
+  std::uint64_t notify, ack, command, suffix;
+  std::uint64_t reserved[4];
 };
 static_assert(sizeof(GatherControl) == 64U);
 

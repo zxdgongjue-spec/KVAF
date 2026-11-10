@@ -439,7 +439,8 @@ class CpuGatherWorker {
       try {
         {
           BatchGetProfileScope timer(profile_enabled_ ? &prepare_ns : nullptr);
-          active_threads = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
+          active_threads = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans,
+                                                   control_, &stop_);
         }
         valid = active_threads != 0U;
         if (valid) {

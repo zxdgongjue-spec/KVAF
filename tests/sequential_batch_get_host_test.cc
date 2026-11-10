@@ -510,7 +510,7 @@ int main() {
     for (const char* field : {"magic=0x", "expected_magic=0x", "observed_sequence=", "result=",
         "valid_mask=0x", "expected_mask=0x7f", "cycles=[start:", ",input:", ",descriptor:",
         ",notify:", ",ack:", ",read:", ",finish:", "requests=", "status_requests=",
-        "data_wrs=", "status_data_wrs=", "args_bytes=248", "record_bytes=256"})
+        "data_wrs=", "status_data_wrs=", "args_bytes=256", "record_bytes=256"})
       assert(failure.message().find(field) != std::string::npos);
     if (profile_fault == 13) {
       assert(failure.message().find("valid_mask=0x41") != std::string::npos);

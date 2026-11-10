@@ -1,7 +1,7 @@
 # Gather 性能采集与排障
 
 当前实现、各阶段优化和配置合同见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)。
-以下统一使用 V9 / args 248 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
+以下统一使用 V10 / args 256 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
 
 ## 构建与入口
 
@@ -25,7 +25,7 @@ export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.
 python -u tests/python/test_aiv_gather_batch_get.py
 ```
 
-启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV9 args_bytes=248`。
+启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV10 args_bytes=256`。
 功能脚本校验 payload/guard、空批及重复调用；probe 结果不能当完整回归 PASS。
 环境变量在 Runtime 初始化时捕获，换组须新建 Runtime。
 
@@ -98,12 +98,14 @@ D2H 和校验，合同为 `synchronous_call_with_status_check`，快照复制在
 | --- | --- |
 | input | kernel_start → input_done，含请求数检查及分区。 |
 | descriptor | input_done → descriptor_done，含队列准备、SIMT 清单和 MTE3 完成。 |
-| publish | descriptor_done → notify_done，即有序控制 WRITE 完成。 |
+| publish | max(0, notify_done − descriptor_done)；首段提前 notify 与剩余清单准备重叠时为 0。 |
 | wait_cpu | notify_done → ack_done，表示 AIV 观察区间，不是 CPU memcpy 时间。 |
 | read | 整批模式 ack_done → read_done；chunk 模式 first_read_submit → read_done。 |
 | finalize | 整批模式 read_done → kernel_finish；chunk 模式 max(ack_done,read_done) → kernel_finish。 |
 | total | kernel_start → kernel_finish；空 lane 仍保留入口/出口开销。 |
 
+notify_done 记录首次 notify 的有序 WRITE 完成；首段模式可早于 descriptor_done。
+descriptor 阶段包含后续清单准备及期间的控制发布等待，不能再与 wait_cpu 相加。
 chunk 的 wait_cpu/read 重叠；整批提前准备的 wait_cpu 与 WQE 构造重叠。
 ACK 和数据 CQ 的观察顺序可不同，成功必须同时满足；不可将重叠阶段或各核时间相加。
 
