@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run local CPU/DDR NUMA combinations and retain paired CPU/NPU diagnostics."""
+"""Compare NPU cards and CPU/DDR NUMA placement with paired CPU/NPU diagnostics."""
 from __future__ import annotations
 
 import argparse
@@ -60,6 +60,37 @@ def parse_cpu_profiles(text, workers, iterations):
     return summary, samples
 
 
+def selected_route(cpu_text, npu_text, region_base):
+    def fields(line):
+        return dict(word.split("=", 1) for word in line.split() if "=" in word)
+
+    allocations = [fields(line) for line in cpu_text.splitlines()
+                   if line.startswith("[KVAF_CPU] REGION_ALLOCATED ")]
+    region = next((item for item in reversed(allocations)
+                   if int(item["base"], 16) == int(region_base, 16)), None)
+    if region is None:
+        raise ValueError("no REGION_ALLOCATED record for the measured CPU region")
+    candidates = [fields(line) for line in cpu_text.splitlines()
+                  if line.startswith("[KVAF_CPU] CANDIDATE_DISCOVERED ")]
+    candidate = next((item for item in candidates if item["id"] == region["candidate"]), None)
+    if candidate is None:
+        raise ValueError("no CPU EID candidate for the measured region")
+    channels = [fields(line) for line in cpu_text.splitlines()
+                if line.startswith("[KVAF_CPU] CHANNEL_REQUEST ")]
+    eids = {item["npu_eid"] for item in channels if item["session"] == region["session"]}
+    if len(eids) != 1:
+        raise ValueError("expected one actual NPU EID for this GatherRead session")
+    npu_eid = eids.pop()
+    discovery = [fields(line) for line in npu_text.splitlines()
+                 if "PEER_LINK_NPU_EID_DISCOVERED " in line]
+    physical = {int(item["physical_device"]) for item in discovery if item["eid"] == npu_eid}
+    if len(physical) != 1:
+        raise ValueError("selected NPU EID cannot be matched to a physical device")
+    return {"physical_device_id": physical.pop(), "npu_eid": npu_eid,
+            "cpu_ub_device": region["ub_device"], "cpu_eid_index": int(region["eid_index"]),
+            "cpu_eid": candidate["eid"], "cpu_session": int(region["session"])}
+
+
 def stop_process(process):
     if process is not None and process.poll() is None:
         process.terminate()
@@ -98,7 +129,10 @@ def parse_args(argv=None):
     p.add_argument("--cpu-nodes", type=int, nargs="+", default=[1, 2])
     p.add_argument("--memory-nodes", type=int, nargs="+", default=[1, 2])
     p.add_argument("--ub-device", default="udmac1d1e2")
-    p.add_argument("--device-id", type=int, default=0)
+    device = p.add_mutually_exclusive_group()
+    device.add_argument("--device-id", type=int, help="single NPU; defaults to 0 (existing usage)")
+    device.add_argument("--device-ids", type=int, nargs="+",
+                        help="test each NPU serially while retaining the same CPU-side configuration")
     p.add_argument("--port", type=int, default=28888)
     p.add_argument("--gather-threads", type=int, default=10)
     p.add_argument("--gather-mode", choices=["active", "adaptive", "passive"], default="active")
@@ -114,6 +148,10 @@ def parse_args(argv=None):
     p.add_argument("--output", type=Path,
                    default=ROOT / "reports/aicpu-gather-numa" / datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
     a = p.parse_args(argv)
+    if a.device_ids is None:
+        if a.device_id is None:
+            a.device_id = 0
+        a.device_ids = [a.device_id]
     if not 1 <= a.workers <= min(8, a.gather_threads) or a.gather_threads > 64:
         p.error("workers must be in 1..8 and no greater than gather-threads (1..64)")
     if not a.workers <= a.miss_count <= 65536:
@@ -122,15 +160,17 @@ def parse_args(argv=None):
         p.error("invalid NUMA node or port")
     if len(set(a.cpu_nodes)) != len(a.cpu_nodes) or len(set(a.memory_nodes)) != len(a.memory_nodes):
         p.error("NUMA node lists must not contain duplicates")
-    if a.device_id < 0 or a.warmup < 0 or min(a.iterations, a.repeats) <= 0:
+    if (min(a.device_ids) < 0 or len(set(a.device_ids)) != len(a.device_ids) or
+            a.warmup < 0 or min(a.iterations, a.repeats) <= 0):
         p.error("invalid device ID, warmup, iterations or repeats")
     if min(a.token_bytes, a.tokens_per_block) <= 0 or (a.table_capacity is not None and a.table_capacity <= 0):
         p.error("token size, block size and table capacity must be positive")
     return a
 
 
-def run_case(a, repeat, cpu_node, memory_node, service, environment):
-    directory = a.output / f"run_{repeat}_cpu_{cpu_node}_mem_{memory_node}"
+def run_case(a, repeat, device_id, cpu_node, memory_node, service, environment):
+    suffix = f"_device_{device_id}" if len(a.device_ids) > 1 else ""
+    directory = a.output / f"run_{repeat}{suffix}_cpu_{cpu_node}_mem_{memory_node}"
     directory.mkdir()
     cpu_log = directory / "cpu.log"
     npu_json = directory / "npu_profiles.json"
@@ -139,14 +179,14 @@ def run_case(a, repeat, cpu_node, memory_node, service, environment):
                    "--gather-threads", str(a.gather_threads), "--gather-mode", a.gather_mode,
                    "--gather-profile"]
     require_free_port(a.port)
-    print(f"\n[{repeat}] CPU node={cpu_node} memory node={memory_node}: {directory}", flush=True)
+    print(f"\n[{repeat}] NPU={device_id} CPU node={cpu_node} memory node={memory_node}: {directory}", flush=True)
     print(shlex.join(cpu_command), flush=True)
     cpu = npu = None
     try:
         with cpu_log.open("w") as cpu_output, (directory / "npu.log").open("w") as npu_output:
             cpu = subprocess.Popen(cpu_command, stdout=cpu_output, stderr=subprocess.STDOUT)
             wait_for_listener(cpu, cpu_log, a.port)
-            npu_command = [sys.executable, "-u", str(BENCHMARK), "--device-id", str(a.device_id),
+            npu_command = [sys.executable, "-u", str(BENCHMARK), "--device-id", str(device_id),
                            "--peer", f"127.0.0.1:{a.port}", "--workers", str(a.workers),
                            "--token-bytes", str(a.token_bytes), "--miss-count", str(a.miss_count),
                            "--tokens-per-block", str(a.tokens_per_block), "--warmup", str(a.warmup),
@@ -179,8 +219,13 @@ def run_case(a, repeat, cpu_node, memory_node, service, environment):
                     if lane["bytes"] != worker["bytes"]:
                         raise ValueError("CPU/NPU lane payload mismatch")
             (directory / "cpu_profiles.json").write_text(json.dumps(cpu_samples, indent=2) + "\n")
+            route = selected_route(cpu_log.read_text(), (directory / "npu.log").read_text(),
+                                   cpu_samples[0]["lanes"][0]["region"])
+            if route["cpu_ub_device"] != a.ub_device:
+                raise ValueError("measured region uses an unexpected CPU UB device")
+            (directory / "route.json").write_text(json.dumps(route, indent=2) + "\n")
             return {"repeat": repeat, "cpu_node": cpu_node, "memory_node": memory_node,
-                    "device_id": a.device_id, "ub_device": a.ub_device,
+                    "device_id": device_id, "ub_device": a.ub_device, **route,
                     **report["summary"], **cpu_summary, "directory": str(directory)}
     finally:
         stop_process(npu)
@@ -216,20 +261,22 @@ def main(argv=None):
         subprocess.run(["numactl", "--hardware"], stdout=topology, stderr=subprocess.STDOUT, check=True)
         if shutil.which("lscpu"):
             subprocess.run(["lscpu"], stdout=topology, stderr=subprocess.STDOUT, check=True)
-    combinations = list(itertools.product(a.cpu_nodes, a.memory_nodes))
+    combinations = list(itertools.product(a.device_ids, a.cpu_nodes, a.memory_nodes))
     with (a.output / "summary.csv").open("w", newline="") as output:
         writer = None
         for repeat in range(1, a.repeats + 1):
             order = combinations if repeat % 2 else list(reversed(combinations))
-            for cpu_node, memory_node in order:
-                row = run_case(a, repeat, cpu_node, memory_node, service, environment)
+            for device_id, cpu_node, memory_node in order:
+                row = run_case(a, repeat, device_id, cpu_node, memory_node, service, environment)
                 if writer is None:
                     writer = csv.DictWriter(output, fieldnames=list(row))
                     writer.writeheader()
                 writer.writerow(row)
                 output.flush()
-                print(f"NUMA_RESULT cpu={cpu_node} mem={memory_node} "
+                print(f"NUMA_RESULT device={device_id} physical_device={row['physical_device_id']} "
+                      f"cpu={cpu_node} mem={memory_node} "
                       f"device_p50_us={row['device_p50_us']:.1f} "
+                      f"p50_GBps={row['p50_GBps']:.3f} read_us={row['read_total_us']:.1f} "
                       f"cpu_copy_us={row['cpu_copy_us']:.1f} "
                       f"cpu_first_ready_us={row['cpu_first_ready_us']:.1f} "
                       f"ready_wait_us={row['cpu_gather_wait_us']:.1f} "

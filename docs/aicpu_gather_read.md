@@ -363,10 +363,12 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 
 本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。
 
-## 一键诊断 CPU/内存 NUMA 偏好
+## 一键诊断 NPU 卡与 CPU/内存 NUMA 的关系
 
-在 CPU 服务和 NPU 位于同一台 Linux 服务器时，下面的脚本自动启动独立服务，分别运行
-`(CPU node, memory node) = (1,1)、(1,2)、(2,1)、(2,2)`，并关联 CPU 计时与 NPU profile。
+在 CPU 服务和 NPU 位于同一台 Linux 服务器时，先固定 CPU 执行位置、DDR 位置和 CPU UB device，
+只切换 NPU 卡，比较属于不同 CPU socket 的卡是否出现带宽差异。
+下面固定 CPU/内存 node 0、`udmac0d1e2`，依次测试逻辑卡 0、1、6、7。
+每张卡独立运行同一个 GatherRead workload，CPU 服务由脚本按相同参数重新启动。
 先加载 CANN 和原有 Python 环境，在仓库根目录执行：
 
 ```bash
@@ -376,23 +378,28 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 # 使用空闲端口；脚本不会停止已经运行的其他服务。
 python3 tests/run_aicpu_gather_read_numa.py \
   --cpu-build "$PWD/build-cpu" --npu-build "$PWD/build-npu" \
-  --device-id 0 --ub-device udmac1d1e2 --port 28889 \
-  --cpu-nodes 1 2 --memory-nodes 1 2 \
+  --device-ids 0 1 6 7 --ub-device udmac0d1e2 --port 28889 \
+  --cpu-nodes 0 --memory-nodes 0 \
   --gather-threads 10 --workers 5 --gather-mode active \
   --token-bytes 656 --miss-count 8192 --warmup 10 --iterations 100
 ```
 
 默认保留原性能扫描的 100 GiB DDR 总预算、每块 128 token、随机源访问和随机输出行，
 每轮仍校验全部输出。首次分配和数据填充需要等待；`--table-capacity 4096` 可用于快速检查流程，
-正式比较时省略该选项。`--repeats 3` 可重复三遍矩阵，偶数遍反转执行顺序。
-NPU EID 发现沿用原逻辑；如需固定候选，保持各组相同的 `KVAF_NPU_EIDS`。
+正式比较时省略该选项。`--repeats 3` 可重复三遍，偶数遍反转执行顺序。
+`--device-ids` 与原有单卡参数 `--device-id` 互斥；不传列表时仍默认测试单卡 0。
+原来的 CPU/内存四组合也可继续使用 `--device-id 0 --cpu-nodes 1 2 --memory-nodes 1 2`。
+NPU EID 发现沿用原逻辑；跨卡使用自动发现时，应先取消之前为单卡设置的 `KVAF_NPU_EIDS`。
+有卡号重映射时，以 CSV 中的 `physical_device_id` 核对实际物理卡。
 
 结果写入 `reports/aicpu-gather-numa/<时间戳>/`，也可用 `--output 新目录` 指定位置：
 
-- `summary.csv`：每组 CPU、NPU 的汇总指标。
+- `summary.csv`：逻辑/物理卡号、实际 EID、CPU 侧位置和 CPU/NPU 的汇总指标。
 - `config.json`、`topology.txt`：测试参数、构建目录和 NUMA/CPU 拓扑。
 - 每组的 `cpu.log`、`npu.log`、`commands.json`：原始输出和实际启动参数。
 - 每组的 `cpu_profiles.json`：按请求 sequence 保留各 lane 的 CPU 计时。
+- 每组的 `route.json`：从被测 region 的实际通道请求中提取的 NPU EID、对应物理卡号、
+  CPU UB device 和 CPU EID；已失败的候选连接不会被当成最终通路。
 - 每组的 `npu_profiles.json`：正式测量的每轮、每个 worker 的完整 profile；
   `cpu_placement` 保存测量前 CPU 服务的 `/proc/<pid>/numa_maps`、`smaps_rollup` 和线程状态。
 
@@ -409,8 +416,10 @@ CPU 服务增加可选 `--gather-profile`，默认关闭。开启后仅在内存
 | `cpu_first_ready_us` | 从 Copy 开始到首次发布非零就绪前缀；当前流水粒度为 128 KiB |
 | `cpu_total_us` | CPU 观察到新 notify 后，到完成复制并发布最终 ACK；不包含通知到达前的延迟 |
 
-这些是开启诊断时、与真实 NPU READ 并发的 CPU 墙钟耗时。先看 NUMA 变化是否也使
-`cpu_copy_us`、`cpu_first_ready_us` 明显增长；若 CPU 计时接近而 NPU 的
+这些是开启诊断时、与真实 NPU READ 并发的 CPU 墙钟耗时。固定 CPU 侧后，先比较不同物理卡的
+总耗时、`read_total_us`、就绪查询次数和 `cq_wait_us`，同时检查实际 EID。
+CPU 生产 staging 可能限制流水吞吐，因此端到端带宽接近不等于两条 UB 链路的峰值接近。
+若另外扫描 CPU/内存位置，则观察 `cpu_copy_us`、`cpu_first_ready_us` 是否随之增长；若 CPU 计时接近而 NPU 的
 `cpu_gather_wait_us`、`cq_wait_us` 大幅增长，再重点调查进度查询、数据 READ 和缓存一致性路径。
 CPU 与 NPU 使用各自时钟，只比较阶段时长及其变化，不相减两端绝对时间戳。
 各阶段分别取不同 worker 的最大值，阶段汇总不能相加为总时间。
