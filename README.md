@@ -231,12 +231,14 @@ AIV/UBmem 的 `.o` 仍需显式传入，参数要求见下方 Python 调用说�
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --gather-threads 8 --gather-mode active
 ```
 
-此启动命令可供全部四种后端共用。三个 `--gather-*` 参数仅控制 CPU Gather 的
-线程预算、等待方式和绑核行为，不影响 AIV、UBmem 或 CPU Push Scatter 的执行。
+此启动命令可供全部四种后端共用。两个 `--gather-*` 参数仅控制 CPU Gather 的
+线程预算和等待方式，不影响 AIV、UBmem 或 CPU Push Scatter 的执行。
 Gather 的 CPU 线程预算须不小于客户端 AICPU worker 数；上例支持后续的 1/2/4/5 worker 测试。
+Gather 线程继承外部 CPU 亲和性；可通过 `numactl --cpunodebind=N --membind=N` 限定
+CPU 调度范围和内存分配节点，或通过 `taskset -c CPU_LIST` 指定允许使用的 CPU。
 
 服务启动后打印 `LISTEN`；首次 URMA 请求触发 device/EID 枚举并打印 `CANDIDATE_DISCOVERED`。
 也可按需要传入 `--ub-device NAME --eid-index N` 来选定 URMA 端口。
