@@ -36,6 +36,7 @@
 #include <string>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -681,6 +682,14 @@ class CpuService {
         static_cast<unsigned long long>(request.session_id), request.workers, request.token_bytes,
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<Transport>();
+    if constexpr (std::is_same_v<Transport, cpu_push::aiv::Transport>) {
+      const auto status = transport->ConfigureGather(region.memory, region.base, gather_threads_,
+          min_bytes_per_thread_, gather_affinity_, ToGatherWaitMode(gather_mode_));
+      if (!status.ok()) {
+        Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
+        return Result::kResourceError;
+      }
+    }
     const auto status = transport->Initialize(region.resources->context(), region.segment,
         request, region.resources->tp_query(), region.resources->jetty_import(),
         NextPsn(), response);

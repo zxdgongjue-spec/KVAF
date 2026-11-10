@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "cpu_gather_executor.h"
 #include "cpu_push_get_layout.h"
 #include "cpu_urma_channel.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
@@ -17,6 +18,9 @@ namespace kvaf::cpu_push::aiv {
 class Transport {
  public:
   ~Transport();
+  Status ConfigureGather(void* memory, std::uint64_t base, std::size_t threads,
+                         std::size_t min_bytes, bool affinity, peer::GatherWaitMode mode);
+  void BindWorker() const { if (gather_) gather_->BindWorker(0); }
   Status Initialize(urma_context_t*, urma_target_seg_t* source,
                     const peer::OpenCpuPushGetRequest&, urma::GetTpList,
                     urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushGetResponse*);
@@ -64,8 +68,11 @@ class Transport {
     std::array<Tracker::Fence, kJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
+    Range gather_rows{};
     bool suffix{};
   };
+  Status EnsureGatherStaging(std::uint32_t count);
+  Status GatherRows(Range range);
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
@@ -93,6 +100,10 @@ class Transport {
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
+  std::unique_ptr<peer::CpuGatherExecutor> gather_;
+  urma_target_seg_t* gather_segment_{};
+  std::uint8_t* gather_staging_{};
+  std::uint64_t gather_staging_bytes_{}, source_bytes_{};
   std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t post_batch_wrs_{128};

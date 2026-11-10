@@ -62,7 +62,18 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
   }
-  return Publish(header.staging_address, source_spans, header.span_count, header.total_bytes);
+  return Publish(memory_ + (header.staging_address - base_), source_spans, nullptr,
+                 header.span_count, header.total_bytes);
+}
+
+std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
+    std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes) {
+  if (!count || !span_bytes || base_ > UINT64_MAX - source_bytes) return 0U;
+  for (std::uint32_t row = 0; row < count; ++row)
+    if (!GatherRange(base_, source_bytes, addresses[row], span_bytes)) return 0U;
+  span_bytes_ = span_bytes;
+  pipeline_ready_ = nullptr;
+  return Publish(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
 }
 
 void CpuGatherExecutor::Copy() {
@@ -76,6 +87,14 @@ void CpuGatherExecutor::Copy() {
 
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
+  if (addresses_)
+    return CopyRange(offset, end, [this](std::size_t index) { return addresses_[index]; });
+  return CopyRange(offset, end, [this](std::size_t index) { return spans_[index].address; });
+}
+
+template <typename Address>
+std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end,
+                                          Address address) const {
   if (offset >= end) return 0U;
   const auto begin = offset;
   const auto index_for_offset = span_bytes_ != 0U
@@ -85,13 +104,13 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
   std::size_t index = static_cast<std::size_t>(index_for_offset);
   auto in_span = span_bytes_ != 0U ? offset % span_bytes_ : offset - variable_offsets_[index];
   while (offset < end) {
-    const auto source_address = spans_[index].address + in_span;
+    const auto source_address = address(index) + in_span;
     const auto length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
     auto bytes = std::min<std::uint64_t>(length - in_span, end - offset);
     ++index;
     in_span = 0U;
     while (bytes < end - offset && index < span_count_ &&
-           spans_[index].address == source_address + bytes) {
+           address(index) == source_address + bytes) {
       const auto next_length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
       bytes += std::min<std::uint64_t>(next_length, end - offset - bytes);
       ++index;

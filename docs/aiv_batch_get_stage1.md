@@ -16,6 +16,21 @@ Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPE
 Gather 使用 `pipeline_chunk_bytes=0`，以最终 ACK 为完成条件。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
+### Scatter 的 CPU Gather 回推
+
+启动 CPU 服务时设置 `KVAF_SCATTER_CPU_GATHER=1`，NPU 继续使用
+`aiv_batch_get_mode="cpu_push_scatter"`。该开关默认关闭。
+CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，再通过已有的四路
+Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
+使用一个源 SGE 和一个目标 SGE，并按当前传输长度上限拆分。AIV 复用现有的
+Ready/Done 和 scatter。启用首段提前发布时，CPU 先 gather 并回推首段，再等
+后缀清单。已提交的首段回推可以与后缀 gather 重叠。
+
+CPU gather 使用服务的 `--gather-threads` 和 gather 绑核、等待配置。
+每个会话的额外 pinned DDR staging 按观察到的最大有效批次字节数增长，
+以 4 KiB 对齐并复用到会话关闭。可分别用开关 0 和 1 启动服务，沿用下方的
+正确性回归和性能脚本对照。
+
 Scatter 使用 64 KiB UB stage ring 执行 GM→UB→GM，通过 MTE3→MTE2 事件安全复用 bank。
 精确长度的 `DataCopyPad<uint8_t>` 用于读取 packed staging 和逐行写入目标。
 包含 SIMT VF 的当前二进制由 loader 设置 `dynUBufSize=65536` 预留共享 UB；

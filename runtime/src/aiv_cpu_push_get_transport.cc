@@ -58,6 +58,21 @@ Transport::~Transport() {
   }
 }
 
+Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t threads,
+    std::size_t min_bytes, bool affinity, peer::GatherWaitMode mode) {
+  const auto* value = std::getenv("KVAF_SCATTER_CPU_GATHER");
+  if (!value || std::strcmp(value, "0") == 0) return Status::OK();
+  if (std::strcmp(value, "1") != 0)
+    return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
+  try {
+    gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
+                                                      mode, affinity);
+  } catch (const std::exception& error) {
+    return Status::Internal(error.what());
+  }
+  return Status::OK();
+}
+
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     const peer::OpenCpuPushGetRequest& setup,
     urma::GetTpList query, urma::ImportJettyEx import, std::uint32_t psn,
@@ -80,6 +95,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   }
   session_ = setup.session_id;
   source_ = source;
+  source_bytes_ = setup.source_bytes;
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
@@ -92,7 +108,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
                "post_batch_wrs=%u optimized=%u source_refresh=%s\n",
                max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized,
-               std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map");
+               gather_ ? "cpu_gather" :
+               (std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map"));
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
@@ -207,6 +224,52 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   return Status::OK();
 }
 
+Status Transport::EnsureGatherStaging(std::uint32_t count) {
+  const auto bytes = (std::uint64_t{count} * token_bytes_ + 4095) & ~std::uint64_t{4095};
+  if (bytes <= gather_staging_bytes_) return Status::OK();
+  // Prepared local SGEs embed addresses in this registration. Grow only with
+  // the queues idle, and drop the old plans before unregistering it.
+  prepared_.clear();
+  prepared_count_ = UINT32_MAX;
+  if (gather_segment_) {
+    if (urma_unregister_seg(gather_segment_)) return Error("unregister gather staging");
+    gather_segment_ = nullptr;
+    std::free(gather_staging_);
+    gather_staging_ = nullptr;
+    gather_staging_bytes_ = 0;
+  }
+  void* staging = nullptr;
+  if (posix_memalign(&staging, 4096, bytes)) return Error("allocate gather staging");
+  urma_seg_cfg_t cfg{};
+  cfg.va = reinterpret_cast<std::uint64_t>(staging);
+  cfg.len = bytes;
+  cfg.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+  gather_segment_ = urma_register_seg(context_, &cfg);
+  if (!gather_segment_) {
+    std::free(staging);
+    return Error("register gather staging");
+  }
+  gather_staging_ = static_cast<std::uint8_t*>(staging);
+  gather_staging_bytes_ = bytes;
+  return Status::OK();
+}
+
+Status Transport::GatherRows(Range range) {
+  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
+  auto* staging = gather_staging_ + std::uint64_t{range.begin} * token_bytes_;
+  try {
+    const auto threads = gather_->PrepareFixed(staging, addresses + range.begin,
+        range.end - range.begin, token_bytes_, source_bytes_);
+    if (!threads) return Status::InvalidArgument("CPU push source outside registered DDR");
+    gather_->Copy();
+    if (profile_.enabled)
+      profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
+  } catch (const std::exception& error) {
+    return Status::Internal(error.what());
+  }
+  return Status::OK();
+}
+
 // Each prepared chain signals only its queue's strongly ordered tail.
 void Transport::AppendPrepared(PreparedQueue& q, std::uint32_t queue,
     std::uint64_t remote, std::uint32_t bytes, std::uint32_t sges, bool ordered) {
@@ -259,7 +322,8 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   prepared_.clear();
   const auto build_stage = [&](Range stage, bool suffix) {
     std::array<std::vector<PreparedQueue>, kJettyCount> shards;
-    const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
+    const auto source_sges = gather_ ? 1U : max_sge_;
+    const bool unsplit = !gather_ && std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
     for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
       auto& waves = shards[queue];
       waves.emplace_back();
@@ -274,21 +338,31 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           // The probe budgets source SGEs as well as WRs against SQ depth.
           // Continue large requests in another drained wave without narrowing
           // BatchGet's existing maximum request/token sizes.
-          if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
+          if (waves.back().local.size() + source_sges > kJettyDepth) waves.emplace_back();
           auto& q = waves.back();
           if (batch_done_only && q.local.empty() && unsplit)
             q.first_row = row;
           const auto first_local = static_cast<std::uint32_t>(q.local.size());
           const auto first_row = row;
-          const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
+          const auto payload_offset = std::uint64_t{row} * token_bytes_ + offset;
+          const auto destination = hbm_base_ + layout_.staging + payload_offset;
           std::uint32_t bytes = 0, sges = 0;
-          while (row < end && sges < max_sge_ && bytes < max_bytes_) {
-            const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-            if (!unsplit)
-              q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
-            q.local.push_back({0, length, source_, nullptr});
-            ++sges; bytes += length; offset += length;
-            if (offset == token_bytes_) { ++row; offset = 0; }
+          if (gather_) {
+            const auto remaining = std::uint64_t{end} * token_bytes_ - payload_offset;
+            bytes = static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, max_bytes_));
+            q.local.push_back({gather_segment_->seg.ubva.va + payload_offset, bytes, gather_segment_, nullptr});
+            sges = 1;
+            row += (offset + bytes) / token_bytes_;
+            offset = (offset + bytes) % token_bytes_;
+          } else {
+            while (row < end && sges < max_sge_ && bytes < max_bytes_) {
+              const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
+              if (!unsplit)
+                q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
+              q.local.push_back({0, length, source_, nullptr});
+              ++sges; bytes += length; offset += length;
+              if (offset == token_bytes_) { ++row; offset = 0; }
+            }
           }
           if (unsplit && !batch_done_only) {
             if (!q.source_runs.empty() && q.source_runs.back().local + q.source_runs.back().count == first_local &&
@@ -322,7 +396,10 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       for (std::uint32_t q = 0; q < kJettyCount; ++q)
         if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
       SealPrepared(*plan);
-      if (plan->fence_count) prepared_.push_back(std::move(plan));
+      if (plan->fence_count) {
+        if (gather_ && w == 0) plan->gather_rows = stage;
+        prepared_.push_back(std::move(plan));
+      }
     }
   };
   if (head_rows) build_stage({0, head_rows}, false);
@@ -471,9 +548,21 @@ Status Transport::DrainPrepared(Profile* profile) {
 }
 Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
+  auto* profile = profile_.enabled ? &profile_ : nullptr;
+  const auto fail_gather = [&](const Status& failure) {
+    // No WR from the failing stage has been posted. A valid prefix may still
+    // be in flight, so drain it before publishing the error on queue 0.
+    auto status = DrainPrepared(profile);
+    if (status.ok()) status = Complete(request().sequence, Result::kCopyError);
+    return status.ok() ? failure : status;
+  };
+  if (gather_) {
+    if (!tracker_.Empty()) return Error("grow gather staging while WRITE is in flight");
+    const auto status = EnsureGatherStaging(request().count);
+    if (!status.ok()) return fail_gather(status);
+  }
   auto status = PrepareWrites(request().count);
   if (!status.ok()) return status;
-  auto* profile = profile_.enabled ? &profile_ : nullptr;
   bool suffix_ready = false;
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
@@ -482,11 +571,15 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       if (!status.ok()) return status;
       suffix_ready = true;
     }
+    if (plan.gather_rows.begin < plan.gather_rows.end) {
+      status = GatherRows(plan.gather_rows);
+      if (!status.ok()) return fail_gather(status);
+    }
     // Only a physical SQ-credit shortage drains the prefix before the suffix.
     status = BeginPrepared(plan, w + 1, profile, true);
     if (!status.ok()) return status;
     if (profile) {
-      profile->cpu_threads = 1;
+      if (!gather_) profile->cpu_threads = 1;
       ++profile->waves;
       for (const auto& q : plan.queues) {
         profile->ready_wrs += q.markers.size();
@@ -553,6 +646,7 @@ void Transport::PrintProfile() const {
 }
 
 Status Transport::Shutdown() {
+  gather_.reset();
   // Deleting the initiator queues stops all DMA, including partial-post failures.
   // Do not let UrmaChannel's best-effort destructor discard a failed deletion.
   for (auto& q : queues_) {
@@ -575,6 +669,10 @@ Status Transport::Shutdown() {
     }
   }
   if (remote_) { if (urma_unimport_seg(remote_)) return Error("unimport HBM"); remote_ = nullptr; }
+  if (gather_segment_) {
+    if (urma_unregister_seg(gather_segment_)) return Error("unregister gather staging");
+    gather_segment_ = nullptr;
+  }
   if (control_) { if (urma_unregister_seg(control_)) return Error("unregister controls"); control_ = nullptr; }
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
   tracker_ = Tracker(kJettyCount, kJettyDepth);
@@ -587,6 +685,8 @@ Status Transport::Shutdown() {
   post_batch_wrs_ = 128;
   next_poll_queue_ = 0;
   for (auto& q : queues_) q.poisoned = false;
+  std::free(gather_staging_); gather_staging_ = nullptr;
+  gather_staging_bytes_ = 0;
   std::free(memory_); memory_ = nullptr;
   context_ = nullptr;
   return Status::OK();

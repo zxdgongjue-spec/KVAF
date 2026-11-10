@@ -74,6 +74,10 @@ class CpuGatherExecutor {
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
                             std::uint64_t sequence, std::size_t max_spans);
+  // The caller keeps the address list and destination stable until Copy returns.
+  std::size_t PrepareFixed(void* staging, const std::uint64_t* addresses,
+                           std::uint32_t count, std::uint32_t span_bytes,
+                           std::uint64_t source_bytes);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -96,8 +100,8 @@ class CpuGatherExecutor {
   void Copy();
 
  private:
-  std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
-                      std::uint32_t span_count, std::uint32_t total_bytes) {
+  std::size_t Publish(void* staging, const GatherSpan* spans, const std::uint64_t* addresses,
+                      std::uint32_t span_count, std::uint64_t total_bytes) {
     const std::size_t threads =
         std::min(max_threads_, std::max<std::size_t>(1U, total_bytes / min_bytes_per_thread_));
     std::unique_lock<std::mutex> lock(mutex_);
@@ -106,8 +110,9 @@ class CpuGatherExecutor {
       helpers_.emplace_back(&CpuGatherExecutor::RunHelper, this, index);
     }
     spans_ = spans;
+    addresses_ = addresses;
     span_count_ = span_count;
-    staging_ = memory_ + (staging - base_);
+    staging_ = static_cast<std::uint8_t*>(staging);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     phase_.store(0U, std::memory_order_release);
@@ -136,11 +141,14 @@ class CpuGatherExecutor {
     if (index == 0U) return 0U;
     if (index == active_threads_) return total_bytes_;
     const std::uint64_t target = total_bytes_ * index / active_threads_;
-    const auto address = reinterpret_cast<std::uintptr_t>(staging_) + target;
-    return ((address + 63U) & ~std::uintptr_t{63U}) - reinterpret_cast<std::uintptr_t>(staging_);
+    const auto base = reinterpret_cast<std::uintptr_t>(staging_);
+    const auto boundary = ((base + target + 63U) & ~std::uintptr_t{63U}) - base;
+    return std::min<std::uint64_t>(boundary, total_bytes_);
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
+  template <typename Address>
+  std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end, Address address) const;
 
   std::uint64_t ProcessSource(std::size_t worker);
 
@@ -158,6 +166,7 @@ class CpuGatherExecutor {
   std::atomic<std::uint64_t> generation_{0U};
   // The sender retains this descriptor until all copy threads finish and ACK is published.
   const GatherSpan* spans_{nullptr};
+  const std::uint64_t* addresses_{nullptr};
   std::uint32_t span_count_{0U}, span_bytes_{0U};
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};

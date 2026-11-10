@@ -498,6 +498,24 @@ void Poll(void* p) {
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  {
+    // Scatter gathers packed rows into a separate MR. In a short batch,
+    // cache-line rounding must leave the bytes past its tail untouched.
+    alignas(64) uint8_t staging[64];
+    uint8_t source[16];
+    for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = i;
+    std::memset(staging, 0xad, sizeof(staging));
+    uint64_t addresses[] = {Address(source + 3), Address(source + 6), Address(source + 3)};
+    kvaf::peer::CpuGatherExecutor executor(source, Address(source), 4, 1);
+    assert(executor.PrepareFixed(staging, addresses, 3, 3, sizeof(source)) == 4);
+    executor.Copy();
+    const uint8_t expected[] = {3, 4, 5, 6, 7, 8, 3, 4, 5};
+    assert(!std::memcmp(staging, expected, sizeof(expected)));
+    assert(std::all_of(staging + sizeof(expected), staging + sizeof(staging),
+                       [](uint8_t byte) { return byte == 0xad; }));
+    addresses[1] = Address(source + 15);
+    assert(!executor.PrepareFixed(staging, addresses, 3, 3, sizeof(source)));
+  }
   // Match the hardware smoke test: the first launch is empty, followed by
   // nonempty launches on the same queues. Empty work must finish all worker
   // statuses without notifying the CPU or advancing any SQ/CQ state.
