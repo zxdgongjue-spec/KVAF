@@ -457,20 +457,84 @@ output 注册不会每批注销；Python 保留其 Tensor 到 Runtime shutdown�
 
 它们继续访问第 3 节分配的 DDR 池，不经过 B 的 HBM 源对象。
 
+### 9.1 标准 BatchPut：实际写入、提交元数据与源复用
+
+下图与第 6.2 节采用相同粒度，描述已配置 `batch_put_kernel_object_path` 的标准 AIV Direct-HCCP 成功路径；本节按 `6f05981` 核对，补充日期为 2026-11-09。前提是第 3 节的 DDR 分配、MR 导入、Jetty 建链和启动探测已经完成。**本批源 Tensor 位于 A 的 HBM，由 A NPU 主动 WRITE 到 CPU DDR。**
+
+**部署为两台独立服务器**：NPU 服务器 A 的 Host 进程运行 Connector、NpuRuntime 和 MetaManager，其 NPU 执行 BatchPut；远端 CPU 服务器运行 CPU Service 并持有目的 DDR。“A 本地提交”指更新 NPU 服务器 A 进程内的 key／槽位元数据，目的数据仍在远端 CPU 服务器的 DDR 中。
+
+```python
+# A：source 是本地连续 NPU Tensor；应用保证生产与本次传输的 stream 顺序。
+# keys、input_offsets、lengths 是等长的 Host 整数序列或连续一维 CPU int64 Tensor。
+runtime.batch_put(keys, source, input_offsets, lengths, stream=stream)
+# 成功返回 None：数据写入完成，且本地 MetaManager 已提交本批 key。
+```
+
+```mermaid
+sequenceDiagram
+    box NPU 服务器 A
+        participant AC as A 应用 Connector
+        participant A as A NpuRuntime / Host 执行层
+        participant M as A Host 进程内 MetaManager
+        participant K as A NPU 上的 AIV BatchPut 算子
+    end
+    box 独立 CPU 服务器
+        participant C as CPU Service / 远端 DDR 端点
+    end
+
+    AC->>AC: 写入 source，保证生产完成后才能传输
+    AC->>AC: 组织 keys、input_offsets、lengths
+    AC->>A: batch_put(keys, source, input_offsets, lengths, stream)
+    A->>A: 复制 Host 元数据，检查数量、源布局及源范围
+    A->>M: PreparePut(keys, lengths)
+    M->>M: 检查 key 和长度，预留对应 DDR 槽位
+    Note over M: 本批槽位为 Pending，读路径尚不可见
+    M-->>A: PutContext + PutAccessDesc（目的绝对地址）
+
+    A->>A: 准备或复用元数据和状态缓冲
+    A->>A: 整理 input_offsets、lengths、destination_addresses
+    A->>A: LocalBufferAcquire(source 地址, bytes)
+    Note over A: 首次注册源 HBM MR 并上传通信实体<br/>相同地址和长度复用缓存 MR／实体
+    A->>A: 同一 stream 异步上传三组数组到 NPU
+    A->>K: KvafExecuteBatchPutSync：初始化状态并启动算子
+    Note over A,C: 本批无 TCP Ready / Submit / Query；复用已建好的 UB 通道
+
+    K->>K: 按 core 划分请求，读取三组设备数组
+    K->>K: src = source 基址 + input_offsets[i]<br/>dst = destination_addresses[i]
+    loop 每个 core 的提交组，每组最多 32 个 WQE
+        K->>K: 每段构建一个 WRITE WQE，整组轮转分配给 Jetty
+        K->>C: 跨服务器 UB WRITE：发布 SQ / doorbell，HBM 数据直达远端 DDR 槽位
+    end
+    Note over K,C: CPU 作为远端内存端点，由 UB 硬件完成写入<br/>不启动 CPU READ worker，不逐条处理应用回调
+    K->>K: 等待每个已使用 Jetty 的尾 WQE CQE
+    K->>K: 更新持久队列状态，写入各 core_status
+    A->>A: 同一 stream 回传少量状态并同步，逐 core 检查成功
+    A->>A: LocalBufferRelease：释放本次引用，保留缓存 MR 和队列
+    A->>M: CommitPut(PutContext)
+    M->>M: 将本批槽位置 Active，发布 key 对应的元数据
+    M-->>A: 提交成功
+    Note over A,M: CommitPut 只更新 A Host 进程内元数据
+    Note over A,C: 数据面已通过 CQE 检查完成；此处不再发送 TCP Complete RPC
+    A-->>AC: batch_put() 成功，返回 None
+    AC->>AC: 可复用 source 内容；本批 key 已可供后续读取
+```
+
+- **生产与源复用**：应用保证源数据对传输可见。同一 stream 可依赖执行顺序；跨 stream 需要应用建立 event／同步依赖。成功返回后可覆盖源内容，无需 `ReadyToken`、`release_batch()` 或 B 的完成通知。源 MR 按地址和长度缓存至 transport 销毁；覆盖内容与释放／更换底层 storage 是不同操作。
+- **地址语义**：每个 key 对应一段源数据和一个目的槽位，长度单位为字节。`destination_addresses[i] = put_desc.entries[i].address`，直接使用 DDR 绝对地址；此路径不减 DDR base，也不把目的偏移交给 CPU READ worker。
+- **Host 与设备的分工**：Python 接收 Host 元数据，Runtime 做源范围检查、`PreparePut` 和 `CommitPut`；执行层把偏移、长度、目的地址打包为三组 `uint64` 数组上传到 NPU。keys／PutContext 留在 Host，源 payload 始终从 HBM 经 UB 直达 DDR；算子不查 AccessTable，也不再次逐项校验范围。
+- **提交与完成粒度**：每段对应一个 WQE，不做 CPU Pull 的 64 KiB 拆分。各 core 按整组（最多 32 个 WQE）轮转使用配置的 Jetty；只有每个已使用 Jetty 的最后一个 WQE 请求 CQE。算子等这些尾 CQE 后才报告完成，不逐 WQE 等待，也不每提交一组就等一次 CQ。
+- **返回边界**：Host 在同一 stream 中排入算子和状态 D2H 回传，再同步并检查每个 core 的结果及处理数量；数据面成功后才执行本地 `CommitPut`。`batch_put()` 是同步接口，返回 `None`，没有 CPU Pull 的 `profile`／PutHandle 返回。
+- **完成确认与服务器边界**：跨服务器 WRITE 仍要等待 UB 数据面的 CQE；“无 TCP Complete”仅指完成后没有额外的 KVAF 控制 RPC。CPU Pull 同样先提交 A 本地元数据，但还要通知 CPU Service 将其维护的批次状态由 Done 改为 Committed；标准 BatchPut 没有创建这类 CPU Pull 批次，因此不需要该状态通知。这里的 key 可见性属于 A 的 MetaManager，不代表向其他 Runtime 广播了映射。
+- **失败边界**：图中只画成功路径。当前 `RuntimeCore::BatchPut` 在 `ExecuteBatchPut` 失败时调用 `AbortPut` 并返回错误；这不构成 CPU Pull 的未决 DMA 恢复协议，也不能把“元数据已撤销”等同于“所有 DMA 已安全结束”。
+
+### 9.2 普通 BatchGet：读取已提交的 DDR 数据
+
 ```mermaid
 sequenceDiagram
     participant AC as A 应用
     participant A as A Runtime / MetaManager
     participant K as A AIV 算子
     participant C as CPU DDR 端点
-
-    AC->>A: batch_put(keys, input, input_offsets, lengths)
-    A->>A: PreparePut，取得目的槽位绝对地址
-    A->>K: 启动 BatchPut，传入源信息和分配结果
-    K->>C: UB WRITE：A HBM 到 DDR
-    K->>K: 等待通信完成
-    A->>A: 数据面成功后 CommitPut
-    A-->>AC: 返回
 
     Note over AC,A: 应用已准备有效的 AccessTable 和读取请求
     AC->>A: batch_get(...)
@@ -549,6 +613,9 @@ TCP 重连与重新执行 DMA 是不同的事情。NPU 路径由 B 后台以同�
 | DDR 初始化、CPU 便利入口、监听入口 | [runtime/src/npu_runtime.cc](../runtime/src/npu_runtime.cc)：`InitializeDdr`、`BatchCpuPull`、`ListenHbm` |
 | 普通 DDR 分配与端点请求 | [runtime/src/peer_link.cc](../runtime/src/peer_link.cc)；[runtime/src/cpu_runtime.cc](../runtime/src/cpu_runtime.cc) |
 | Put 预留、提交校验、Wait／Commit／Abort | [runtime/src/connector_runtime.cc](../runtime/src/connector_runtime.cc) |
+| 标准 BatchPut 事务与槽位发布 | [runtime/src/runtime.cc](../runtime/src/runtime.cc)：`RuntimeCore::BatchPut`；[meta_manager/src/in_memory_meta_manager.cc](../meta_manager/src/in_memory_meta_manager.cc)：`PreparePut`、`CommitPut` |
+| 标准 BatchPut 参数上传、源 MR 缓存与同步检查 | [access_operator/src/access_operator.cc](../access_operator/src/access_operator.cc)：`DefaultAccessOperator::ExecuteBatchPut`；[access_operator/demo/aiv_batch_put/host/batch_put_host.cpp](../access_operator/demo/aiv_batch_put/host/batch_put_host.cpp)：`KvafBatchPutLocalBufferAcquire`、`KvafExecuteBatchPutSync` |
+| 标准 BatchPut WRITE 与尾 CQ 完成 | [access_operator/demo/aiv_batch_put/kernel/execute_batch_put_aiv.asc](../access_operator/demo/aiv_batch_put/kernel/execute_batch_put_aiv.asc)：`PostBatchPutRequests`、`KvafExecuteBatchPutAivKernel` |
 | CPU Pull 的 Query／Submit／Complete | [runtime/src/remote_pull_operator.cc](../runtime/src/remote_pull_operator.cc) |
 | B 注册 CPU 源、Ready、release、Detach | [runtime/src/remote_offload.cc](../runtime/src/remote_offload.cc) |
 | CPU 源会话状态机与后台 READ | [runtime/src/remote_pull_service.cc](../runtime/src/remote_pull_service.cc)：`Service::Dispatch` |
