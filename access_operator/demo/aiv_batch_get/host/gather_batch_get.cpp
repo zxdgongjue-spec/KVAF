@@ -8,12 +8,10 @@
 #include "peer_link.h"
 #include <acl/acl.h>
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <mutex>
 #include <sstream>
 #include <utility>
@@ -98,9 +96,7 @@ struct GatherBatchGet::Impl {
     if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
     if (!pending) return Status::OK();
     if (!pending_status_check) {
-      // Match direct_read's asynchronous contract: completion is a stream
-      // fence, not an implicit device-status readback. Same-stream submissions
-      // can stay queued; a stream switch, explicit Drain or shutdown fences it.
+      // Ordinary async calls fence only: same-stream launches can remain queued.
       const auto synchronized = aclrtSynchronizeStream(pending);
       if (synchronized != ACL_SUCCESS) {
         failed = true; return AclFailure("synchronize", synchronized);
@@ -202,8 +198,7 @@ struct GatherBatchGet::Impl {
     if (peer.length < region.length || peer.length - region.length <
         GatherRemoteWorkspaceBytes(config.batch_get_token_bytes, workers))
       return Status::InvalidArgument("remote DDR lacks reserved gather workspace");
-    // Prefer huge pages with the Runtime's normal-page fallback. Small queue
-    // state allocations may still use normal pages under HUGE_FIRST.
+    // Prefer huge pages; allow normal-page fallback, including small queue states.
     if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
         aclrtMemset(workspace, args.workspace_bytes, 0, args.workspace_bytes) != ACL_SUCCESS ||
         aclrtMalloc(&queues, workers * 2 * sizeof(KvafBatchGetQueueState), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
@@ -220,8 +215,7 @@ struct GatherBatchGet::Impl {
   }
 
   Status Shutdown() {
-    // A normal close must let the CPU finish serving the pending request first.
-    // On execution errors, keep closing the transports before releasing memory.
+    // Finish pending CPU work; on errors quiesce transports before freeing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
     failed = true;  // A partially closed transport cannot accept another Execute.
     if (pending) {
@@ -293,10 +287,7 @@ Status GatherBatchGet::Impl::CaptureProfile() {
          p.first_read_ready_bytes > p.requests * config.batch_get_token_bytes))
       reason = "timestamp_ready_submit_read";
     if (reason) {
-      // The stream and normal status already passed. Preserve the actual
-      // record in the exception before Shutdown frees it: a generic error here
-      // cannot distinguish missing publication, ABI mismatch, clock ordering
-      // or duplicate request/WR accounting. Never return a partial snapshot.
+      // Preserve the failed record before Shutdown; never return a partial snapshot.
       std::ostringstream detail;
       detail << "AIV sequential BatchGet: invalid gather profile worker=" << i
              << " sequence=" << sequence << " reason=" << reason
@@ -385,6 +376,7 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   }
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
+  const bool fast_read = uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size <= 65536;
   s.args.pipeline_chunk_bytes = kGatherChunkBytes;
   const char* chunk = std::getenv("KVAF_AIV_GATHER_CHUNK_BYTES");
   if (chunk && *chunk) {
@@ -394,9 +386,8 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
          (s.args.pipeline_chunk_bytes < 64 || s.args.pipeline_chunk_bytes % 64)))
       return Status::InvalidArgument("KVAF_AIV_GATHER_CHUNK_BYTES must be 0 or a uint32 multiple of 64");
   }
-  // Prefix diagnostics retain their original whole-batch contract. The general
-  // split-token encoder is unchanged in this first chunk-consumer version.
-  if (s.args.probe || uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
+  // Probes and split-token reads retain whole-batch ACK semantics.
+  if (s.args.probe || !fast_read)
     s.args.pipeline_chunk_bytes = 0;
   const char* cooperative = std::getenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
   if (cooperative && *cooperative) {
@@ -413,29 +404,23 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!GatherCooperativeLayoutValid(s.args.cooperative_chunks, s.args.first_chunk_divisor))
     return Status::InvalidArgument("COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode, "
                                   "or 1..32 with FIRST_CHUNK_DIVISOR>=2");
-  if (s.args.cooperative_chunks) {
-    if (!s.args.pipeline_chunk_bytes || s.args.probe ||
-        uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
-      return Status::InvalidArgument("cooperative gather requires nonzero chunk mode, no probe, token_bytes * SGL <= 65536");
-  }
+  if (s.args.cooperative_chunks && (!s.args.pipeline_chunk_bytes || s.args.probe || !fast_read))
+    return Status::InvalidArgument("cooperative gather requires nonzero chunk mode, no probe, token_bytes * SGL <= 65536");
   const char* prepare = std::getenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
   if (prepare && *prepare && std::strcmp(prepare, "0") && std::strcmp(prepare, "1"))
     return Status::InvalidArgument("KVAF_AIV_GATHER_PREPARE_AHEAD must be 0 or 1");
   s.args.prepare_ahead = prepare && *prepare ? std::strcmp(prepare, "1") == 0 : bool(s.args.cooperative_chunks);
   if (s.args.cooperative_chunks && !s.args.prepare_ahead)
     return Status::InvalidArgument("cooperative gather requires KVAF_AIV_GATHER_PREPARE_AHEAD=1");
-  if (s.args.prepare_ahead && (s.args.probe ||
-      uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536))
+  if (s.args.prepare_ahead && (s.args.probe || !fast_read))
     return Status::InvalidArgument("gather prepare-ahead requires whole-batch/prefix, no probe, token_bytes * SGL <= 65536");
   const char* coalesce = std::getenv("KVAF_AIV_GATHER_COALESCE_SGES");
   if (coalesce && *coalesce && std::strcmp(coalesce, "0") && std::strcmp(coalesce, "1"))
     return Status::InvalidArgument("KVAF_AIV_GATHER_COALESCE_SGES must be 0 or 1");
   s.args.coalesce_sges = coalesce && std::strcmp(coalesce, "1") == 0;
-  if (s.args.coalesce_sges &&
-      uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
+  if (s.args.coalesce_sges && !fast_read)
     return Status::InvalidArgument("coalesced gather requires token_bytes * SGL <= 65536");
-  if (s.args.probe > KVAF_GATHER_PROBE_ACK &&
-      uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size > 65536)
+  if (s.args.probe > KVAF_GATHER_PROBE_ACK && !fast_read)
     return Status::InvalidArgument("gather WQE/SQ probes require token_bytes * SGL <= 65536");
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
@@ -519,9 +504,7 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Status::InvalidArgument("gather profiling requires synchronize=True");
   if (s.args.probe && !exec.execution.synchronize)
     return Status::InvalidArgument("gather prefix probes require synchronize=True");
-  // Stream ordering protects the shared descriptor, staging and SQ/CQ state.
-  // Only a stream switch or a pending checked/diagnostic call needs a Host
-  // fence before the next launch. Ordinary same-stream calls remain async.
+  // Stream order protects shared workspace/queues; fence on stream switch or checked calls.
   Status result = Status::OK();
   gather_call::Timer prior_timer(gather_call::kPriorDrain);
   if (s.pending && (s.pending != exec.execution.stream || s.pending_status_check)) {
@@ -564,8 +547,7 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
         "token_bytes=%u request_capacity=%u\n", ProbeName(args.probe),
         static_cast<unsigned long long>(args.sequence), args.request.block_count,
         args.request.token_bytes, args.request.request_capacity);
-  // Every launched core initializes its complete status and, when enabled,
-  // profile record. Host clears add stream tasks without producing new data.
+  // Each core initializes status/profile; avoid redundant Host clears.
   gather_call::Timer call_launch_timer(gather_call::kLaunch);
   if (KvafGatherBatchGetLaunch(&args, s.pending)) {
     s.failed = true; return Error("enqueue failed; resources retained");
@@ -573,8 +555,7 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
   call_launch_timer.Stop();
   if (s.profiling) s.latest_profile.launch_ns = BatchGetProfileNowNs() - launch_begin;
   if (!s.pending_status_check) {
-    // Zero-reference registrations and entity tables remain cached until
-    // transport shutdown, exactly as in the direct asynchronous path.
+    // MR/entity cache outlives these references, until transport shutdown.
     KvafBatchGetLocalBufferRelease(s.output_buffer);
     s.output_buffer = nullptr;
   }

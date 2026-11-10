@@ -266,7 +266,8 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
   for (;;) {
     bool active = false;
     bool wait_path = false;
-    if (wait_mode_ != GatherWaitMode::kPassive && was_active) {
+    const bool spin = wait_mode_ != GatherWaitMode::kPassive && was_active;
+    if (spin) {
       const auto spin_start = std::chrono::steady_clock::now();
       std::uint32_t spin_count = 0U;
       std::uint64_t generation = generation_.load(std::memory_order_acquire);
@@ -278,24 +279,16 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
         GatherSpinPause();
         generation = generation_.load(std::memory_order_acquire);
       }
+    }
+    {
       std::unique_lock<std::mutex> lock(mutex_);
-      if (generation_.load(std::memory_order_acquire) == observed_generation) {
+      if (!spin || generation_.load(std::memory_order_acquire) == observed_generation) {
         wait_path = true;
         ready_.wait(lock, [this, &observed_generation] {
           return stopping_.load(std::memory_order_acquire) ||
                  generation_.load(std::memory_order_acquire) != observed_generation;
         });
       }
-      if (stopping_.load(std::memory_order_acquire)) return;
-      observed_generation = generation_.load(std::memory_order_acquire);
-      active = worker < active_threads_;
-    } else {
-      std::unique_lock<std::mutex> lock(mutex_);
-      wait_path = true;
-      ready_.wait(lock, [this, &observed_generation] {
-        return stopping_.load(std::memory_order_acquire) ||
-               generation_.load(std::memory_order_acquire) != observed_generation;
-      });
       if (stopping_.load(std::memory_order_acquire)) return;
       observed_generation = generation_.load(std::memory_order_acquire);
       active = worker < active_threads_;

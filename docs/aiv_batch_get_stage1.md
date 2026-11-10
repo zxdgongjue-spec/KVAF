@@ -1,11 +1,9 @@
 # AIV BatchGet 第一阶段实现与验证
 
-Gather 串行计时新增独立性能入口，参数在脚本顶部修改，见
-[Gather 阶段计时与内部流水](aiv_gather_serial_profile.md)。当前 gather launch ABI 为
-240 B，symbol 为 `KvafGatherBatchGetAivKernelV4`，需要同步更新 Host/Python 和 kernel。
-V4 接通 [CPU gather 与 payload READ 分块流水](aiv_gather_chunk_pipeline.md)，默认
-128 KiB；下文无 CPU chunk 的第一阶段行为可通过
-`KVAF_AIV_GATHER_CHUNK_BYTES=0` 对照。
+本文保留 Scatter 与第一阶段诊断记录。Gather 当前实现以
+[实现与配置](aiv_gather_prepared_prefix.md)、[性能与排障](aiv_gather_serial_profile.md)为准：
+V9 / args 248 B，默认 128 KiB byte-prefix；`KVAF_AIV_GATHER_CHUNK_BYTES=0`
+保留整批 ACK 对照，仍使用 AIV 内部流水。部署须同步更新 CPU 服务及 NPU 构建。
 
 ## 当前临时运行方式：只检查 CPU push / done
 
