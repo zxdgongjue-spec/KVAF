@@ -130,6 +130,86 @@ void PreparedSyncRequests(){
   Require(payload_reads==reads+2,"each valid prepared submission issues exactly one READ");
   Ok(source.ReleaseBatch(ready));Ok(source.Shutdown());Ok(core.Shutdown());NoResources();
 }
+void ReadWorkerReuse() {
+  SharedServer server;
+  kvaf::NpuRuntimeOptions options; options.enable_cpu_offload=true;
+  kvaf::NpuRuntime reader(options); Ok(reader.LinkTo({server.address})); Ok(reader.Initialize(1024,256));
+  kvaf::OffloadRegionTicket ticket; Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::uint8_t> data(4096,0x35); aclrtSetDevice(7);
+  kvaf::CpuPullHbmSource source(7,"00000000000000000000000000000001");
+  Ok(source.Register(ticket,{data.data(),data.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+  const int instances=read_worker_instances, active=active_read_workers;
+  for (int round=0; round<8; ++round) {
+    std::fill(data.begin(),data.end(),std::uint8_t(round+31));
+    kvaf::ReadyToken ready; Ok(source.Ready(&ready));
+    const int reads=payload_reads;
+    kvaf::CpuPullProfile profile;
+    if (round==2) {
+      fail_read=true;
+      const auto status=reader.BatchCpuPull({1},ready,std::vector<std::uint64_t>{17},{64},1000);
+      fail_read=false;
+      Require(!status.ok()&&!reader.pending_offload(),"failed READ aborts without stopping the reusable worker");
+    } else if (round==4) {
+      hold_read=true;
+      const auto status=reader.BatchCpuPull({1},ready,std::vector<std::uint64_t>{17},{64},0,&profile);
+      hold_read=false;
+      Require(status.code()==kvaf::StatusCode::kInDoubt,"worker remains owned after a profiled caller times out");
+      Ok(reader.ResolveCpuPull(1000));
+    } else if (round%2) {
+      kvaf::PutHandle put; Ok(reader.PreparePut({1},{64},&put));
+      const std::vector<std::uint64_t> offsets{17},destinations{put.entries()[0].address-server.info.base},lengths{64};
+      Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,lengths));
+      kvaf::CpuPullState state; Ok(reader.WaitCpuPull(put,1000,&state)); Ok(reader.CommitPut(put));
+    } else {
+      Ok(reader.BatchCpuPull({1},ready,std::vector<std::uint64_t>{17},{64},1000,&profile));
+      const auto& cpu=profile.submit.server;
+      Require(profile.submit.server_available&&cpu.worker_start_ns>0&&
+              cpu.control_lock_ns+cpu.validation_ns+cpu.worker_start_ns+cpu.backend_read_ns+cpu.completion_ns==cpu.dispatch_ns,
+              "reused worker retains per-request startup timing and complete duration partition");
+    }
+    Require(payload_reads==reads+1&&read_worker_instances==instances+1&&active_read_workers==active+1,
+            "success, failure and timeout recovery share one live READ worker without replay");
+    if (round!=2) {
+      Require(!std::memcmp(server.pool.data()+256,data.data()+17,64),"reused worker reads the current batch");
+      Ok(reader.core().BatchFree({{1}}));
+    }
+    Ok(source.ReleaseBatch(ready));
+  }
+  Ok(source.Shutdown());
+  Require(active_read_workers==active,"Detach stops and joins the idle READ worker");
+  Ok(reader.Shutdown()); NoResources();
+
+  // Service teardown must also drain a submitted READ and stop its worker
+  // when the caller has not sent Complete/Detach.
+  const int reads=payload_reads;
+  std::vector<std::uint8_t> pool(128,0);
+  const rp::RegionInfo region{42,1,reinterpret_cast<std::uint64_t>(pool.data()),128,128,0,7,0,{}};
+  {
+    rp::Service service([&](std::uint64_t id,rp::RegionInfo* out) {
+      if (id!=region.id) return Status::NotFound("region");
+      *out=region; return Status::OK();
+    },[&](const rp::RegionInfo&) { return std::make_unique<SharedBackend>(pool); });
+    const auto dispatch=[&](rp::Command command,std::uint64_t task,const std::vector<rp::Span>& spans) {
+      auto request=rp::MakeRequest(command);
+      request.region=region.id; request.epoch=region.epoch; request.token=region.token;
+      request.source_id=123; request.task=task;
+      request.source.base=reinterpret_cast<std::uint64_t>(data.data());
+      request.source.bytes=data.size(); request.source.token=region.token;
+      request.connection.token=region.token;
+      request.count=spans.size(); request.header.bytes+=spans.size()*sizeof(rp::Span);
+      return service.Dispatch(request,spans);
+    };
+    Require(dispatch(rp::Command::Attach,0,{}).result==rp::Result::Ok,"attach teardown source");
+    Require(dispatch(rp::Command::Bind,0,{}).result==rp::Result::Ok,"bind teardown source");
+    Require(dispatch(rp::Command::Ready,1,{}).result==rp::Result::Ok,"ready teardown source");
+    read_delay_ms=5;
+    Require(dispatch(rp::Command::Submit,1,{{17,0,32}}).result==rp::Result::Ok,"accept READ before teardown");
+  }
+  read_delay_ms=0;
+  Require(payload_reads==reads+1&&active_read_workers==active&&
+          !std::memcmp(pool.data(),data.data()+17,32),"service teardown drains accepted READ before joining and closing backend");
+  NoResources();
+}
 int producer_syncs=0;
 extern "C" aclError aclrtSynchronizeStream(aclrtStream){++producer_syncs;return 0;}
 void UnifiedBatchCpuPull() {
@@ -602,4 +682,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

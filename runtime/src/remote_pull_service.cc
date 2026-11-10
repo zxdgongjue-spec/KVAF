@@ -29,8 +29,49 @@ struct Session {
   State state{State::Connecting}, terminal{State::Connecting};
   std::mutex mutex;
   std::condition_variable completed;
+  std::condition_variable work_available;
+  std::shared_ptr<ReadTrace> queued_trace;
+  bool work_pending{}, worker_stopping{};
   std::thread worker;
-  ~Session() { if (worker.joinable()) worker.join(); }
+
+  // Called with mutex held. Start lazily so first-batch startup remains part
+  // of worker_start; later batches measure notification/lock/scheduling only.
+  void StartWorker(std::uint64_t source_id) {
+    if (worker.joinable()) return;
+    worker = std::thread([this, source_id] {
+      std::unique_lock<std::mutex> lock(mutex);
+      for (;;) {
+        work_available.wait(lock, [this] { return work_pending || worker_stopping; });
+        if (!work_pending) return;
+        auto read_trace = std::move(queued_trace);
+        work_pending = false;
+        lock.unlock();
+        Status result;
+        if (read_trace) read_trace->begin = Clock::now();
+        try { result = backend->Read(submitted); }
+        catch (...) { result = Status::InDoubt("exception in remote READ worker"); }
+        if (read_trace) read_trace->end = Clock::now();
+        lock.lock();
+        state = result.ok() ? State::Done : result.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
+        completed.notify_all();
+        std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_DONE region=%llu source=%llu sequence=%llu mr=%llu state=%u detail=%s\n",
+            (unsigned long long)region.id, (unsigned long long)source_id, (unsigned long long)sequence,
+            (unsigned long long)mr_id, unsigned(state), result.message().c_str());
+      }
+    });
+  }
+
+  void StopWorker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      worker_stopping = true;
+      work_available.notify_one();
+    }
+    // Drain an accepted READ before destroying its backend, including a task
+    // whose synchronous caller already timed out. Never join while holding mutex.
+    if (worker.joinable()) worker.join();
+  }
+  ~Session() { StopWorker(); }
 };
 bool Pending(State s) { return s == State::Ready || s == State::Running || s == State::InDoubt; }
 }
@@ -55,7 +96,7 @@ Service::Service(Describe describe, Attach attach, std::mutex* control_mutex)
 Service::~Service() {
   for (auto& item : impl_->sources) {
     auto& s = *item.second;
-    if (s.worker.joinable()) s.worker.join();
+    s.StopWorker();
     if (s.state != State::Closed && (Pending(s.state) || !s.backend->Close().ok()))
       (void)item.second.release();
   }
@@ -152,7 +193,12 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
   if (cmd == Command::Detach) {
     if (Pending(s.state)) { out.result = Result::Busy; return out; }
     if (s.state != State::Closed) {
+      s.worker_stopping = true;
+      s.work_available.notify_one();
+      // The idle worker must reacquire this mutex to observe the stop flag.
+      lock.unlock();
       if (s.worker.joinable()) s.worker.join();
+      lock.lock();
       status = s.backend->Close();
       if (!status.ok()) { s.state = State::InDoubt; out.state = s.state; out.result = Result::InDoubt; return out; }
       s.backend.reset(); s.state = State::Closed;
@@ -209,7 +255,6 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
       return out;
     }
     if (r.task != s.sequence + 1 || (s.state != State::Idle && s.state != State::Committed && s.state != State::Cancelled)) return out;
-    if (s.worker.joinable()) s.worker.join();
     s.sequence = r.task; s.mr_id = r.mr_id; s.source = memory->second; s.submitted.clear();
     s.state = out.state = State::Ready; out.result = Result::Ok; return out;
   }
@@ -306,19 +351,10 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
       trace->read = read_trace = std::make_shared<ReadTrace>();
       read_trace->launch = Clock::now();
     }
-    s.worker = std::thread([&s, id = r.source_id, read_trace] {
-      Status result;
-      if (read_trace) read_trace->begin = Clock::now();
-      try { result = s.backend->Read(s.submitted); }
-      catch (...) { result = Status::InDoubt("exception in remote READ worker"); }
-      if (read_trace) read_trace->end = Clock::now();
-      std::lock_guard<std::mutex> guard(s.mutex);
-      s.state = result.ok() ? State::Done : result.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
-      s.completed.notify_all();
-      std::fprintf(stderr, "[KVAF_CPU] REMOTE_PULL_DONE region=%llu source=%llu sequence=%llu mr=%llu state=%u detail=%s\n",
-          (unsigned long long)s.region.id, (unsigned long long)id, (unsigned long long)s.sequence,
-          (unsigned long long)s.mr_id, unsigned(s.state), result.message().c_str());
-    });
+    s.StartWorker(r.source_id);
+    s.queued_trace = std::move(read_trace);
+    s.work_pending = true;
+    s.work_available.notify_one();
   } catch (...) { s.state = State::Failed; out.state = s.state; out.result = Result::Failed; return out; }
   out.state = State::Running; out.result = Result::Ok;
   wait_for_completion();

@@ -248,12 +248,16 @@ SubmitAndWait 使用 profile 标志和原响应中未使用的 memory 区域返�
 | --- | --- |
 | `span_receive` | CPU 收到固定请求体后，分配并接收 Span 数组 |
 | `control_lock` | Dispatch 开始到取得共享控制锁 |
-| `validation` | 取得控制锁后校验请求、选择 MR、保存任务，至准备创建 READ 线程 |
-| `worker_start` | 准备创建线程到工作线程进入 READ，包含创建和启动调度 |
+| `validation` | 取得控制锁后校验请求、选择 MR、保存任务，至准备发布 READ 任务 |
+| `worker_start` | 准备发布任务到工作线程进入 READ；首批包含线程创建，后续批次包含唤醒、锁交接和调度 |
 | `backend_read` | 整个 backend->Read 调用，含其内部的 profile 记录/输出；略宽于 CPU_PULL_SUMMARY 的 total |
 | `completion` | backend->Read 返回到 Dispatch 返回，含状态发布、持锁日志、唤醒与锁竞争 |
 | `reply_prepare` | Dispatch 外部的返回与统计整理，至准备写出响应 |
 | `total` | 从开始接收 Span 数组到准备写出响应；等于上述七项之和 |
+
+CPU 为每个 HBM 源会话复用一个 READ 工作线程：首次提交时创建，后续批次唤醒同一线程，
+Detach 时停止并回收。同步超时不会停止线程或重放 READ，仍通过原任务查询和恢复。
+`worker_start` 保留原来的计时范围，首批创建和后续唤醒均计入调用耗时。
 
 `CPU_PULL_BENCH_RPC_STAGE role=reader stage=gap` 为 `send + receive - server.total`。
 它包含固定请求头/请求体接收、CPU 响应发送、TCP 栈及两端调度等尚未归入 CPU 统计的时间，不能等同于纯网络传输时间。

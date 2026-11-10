@@ -8,6 +8,11 @@ namespace rp = kvaf::remote_pull;
 using kvaf::Status;
 std::atomic<int> payload_reads{0}, scratch_reads{0}, checksum_calls{0}, leases{0};
 std::atomic<int> read_delay_ms{0};
+std::atomic<int> read_worker_instances{0}, active_read_workers{0};
+struct ReadWorkerLifetime {
+  ReadWorkerLifetime() { ++read_worker_instances; ++active_read_workers; }
+  ~ReadWorkerLifetime() { --active_read_workers; }
+};
 std::atomic<bool> hold_read{false}, uncertain_read{false}, fail_read{false}, fail_checksum{false}, fail_select{false};
 struct SharedBackend final : p::Backend {
   std::vector<std::uint8_t>& pool;
@@ -35,6 +40,9 @@ struct SharedBackend final : p::Backend {
     return Status::OK();
   }
   Status Read(const std::vector<p::Span>& spans) override {
+    // A thread-local lifetime distinguishes reuse from a new thread that was
+    // assigned the same OS thread ID, and verifies workers exit on Detach.
+    static thread_local ReadWorkerLifetime lifetime;
     ++payload_reads;
     if(const int delay=read_delay_ms.load())std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     while(hold_read)std::this_thread::sleep_for(std::chrono::milliseconds(1));
