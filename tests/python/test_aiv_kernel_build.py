@@ -49,11 +49,15 @@ def main():
     demo = repo / 'access_operator/demo/aiv_batch_get'
     with tempfile.TemporaryDirectory(prefix='kvaf kernel build-') as directory:
         root = Path(directory)
-        shutil.copytree(demo / 'kernel', root / 'kernel')
+        kernel = root / 'access_operator/demo/aiv_batch_get/kernel'
+        shutil.copytree(demo / 'kernel', kernel)
+        shutil.copytree(repo / 'access_operator/cmake', root / 'access_operator/cmake')
+        shutil.copytree(repo / 'access_operator/include/ubmem', root / 'access_operator/include/ubmem')
         sdk = root / 'sdk'
         (sdk / 'include/simt_api').mkdir(parents=True)
         (sdk / 'include/kernel_operator.h').touch()
         (sdk / 'include/simt_api/device_atomic_functions.h').touch()
+        (sdk / 'include/simt_api/device_functions.h').touch()
         for name in ('ccec', 'ld.lld'):
             tool = root / name
             tool.write_text(f'#!{sys.executable}\n' + TOOL)
@@ -68,7 +72,7 @@ set(KVAF_AIV_DEMO_INCLUDE_DIR "{demo.as_posix()}/include")
 set(KVAF_AIV_DEMO_BIN_DIR "${{CMAKE_BINARY_DIR}}/bin")
 set(KVAF_CCEC "{root.as_posix()}/ccec")
 set(KVAF_LLD "{root.as_posix()}/ld.lld")
-add_subdirectory(kernel)
+add_subdirectory(access_operator/demo/aiv_batch_get/kernel kernel)
 ''')
         build = root / 'build'
         run([cmake, '-S', root, '-B', build])
@@ -78,7 +82,7 @@ add_subdirectory(kernel)
         assert not (build / 'bin/kvaf_execute_batch_get_kernels.o').exists()
         command = [cmake, '--build', build, '--target', 'kvaf_batch_get_kernels', '-j4']
         run(command)
-        for stem, symbol in (('kvaf_execute_batch_get', 'execute_batch_get_aiv'),
+        for stem, symbol in (('kvaf_execute_batch_get', 'execute_batch_get_kernels'),
                              ('kvaf_scatter_batch_get', 'execute_scatter_batch_get_aiv'),
                              ('kvaf_gather_batch_get', 'execute_gather_batch_get_aiv')):
             product = build / 'kernel' / f'{stem}_kernels.o'
@@ -95,7 +99,7 @@ add_subdirectory(kernel)
         assert direct.stat().st_mtime_ns == old_mtime
         gather = build / 'kernel/kvaf_gather_batch_get_kernels.o'
         gather_before = (gather.read_bytes(), gather.stat().st_mtime_ns)
-        scatter_source = root / 'kernel/execute_scatter_batch_get_aiv.asc'
+        scatter_source = kernel / 'execute_scatter_batch_get_aiv.asc'
         scatter_source.write_text(scatter_source.read_text() + '\n// isolation rebuild\n')
         run([cmake, '--build', build, '--target', 'kvaf_scatter_batch_get_kernel', '-j4'])
         assert (gather.read_bytes(), gather.stat().st_mtime_ns) == gather_before

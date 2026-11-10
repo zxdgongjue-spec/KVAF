@@ -307,6 +307,7 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
 }
 
 Status PeerLink::ReleaseRegion(uint64_t base) {
+  if (ubmem_mappings_.count(base)) return Status::Busy("UBmem Device VA must be unmapped before releasing CPU DDR");
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   std::string error;
@@ -314,6 +315,56 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
     return ToStatus("peer DDR release failed", std::move(error));
   }
   regions_.erase(found);
+  return Status::OK();
+}
+
+Status PeerLink::RetainUbmemMapping(uint64_t base) {
+  const auto found = regions_.find(base);
+  if (found == regions_.end() || found->second.fabric_mapping_bytes == 0) {
+    return Status::NotFound("UBmem mapping has no allocated Fabric region");
+  }
+  ++ubmem_mappings_[base];
+  return Status::OK();
+}
+
+void PeerLink::ReleaseUbmemMapping(uint64_t base) {
+  auto found = ubmem_mappings_.find(base);
+  if (found != ubmem_mappings_.end() && --found->second == 0) ubmem_mappings_.erase(found);
+}
+
+Status PeerLink::AllocateUbmemRegion(uint64_t bytes, uint64_t slot_size, PeerRegion* region) {
+  if (region == nullptr || bytes == 0 || slot_size == 0 || bytes % slot_size != 0) {
+    return Status::InvalidArgument("invalid UBmem region request");
+  }
+  AllocateUbmemRegionRequest request{};
+  request.header = MakeHeader(Command::kAllocateUbmemRegion, sizeof(request));
+  request.ddr_bytes = bytes;
+  request.slot_size = slot_size;
+  AllocateUbmemRegionResponse response{};
+  std::string error;
+  if (!Exchange(address_, request, &response, &error)) {
+    return ToStatus("UBmem allocation exchange failed", std::move(error));
+  }
+  if (!IsValidResponseHeader(response.header, Command::kAllocateUbmemRegion, sizeof(response))) {
+    return Status::Internal("peer returned an invalid UBmem response");
+  }
+  if (response.result != static_cast<int32_t>(Result::kOk)) {
+    response.error_message[sizeof(response.error_message) - 1] = '\0';
+    return Status::Internal(std::string("CPU UBmem allocation failed: ") + response.error_message);
+  }
+  if (response.session_id == 0 || response.peer_base == 0 || response.peer_length != bytes ||
+      response.peer_base > UINT64_MAX - bytes || response.mapping_bytes < bytes ||
+      response.mapping_bytes % (2ULL * 1024 * 1024) != 0) {
+    return Status::Internal("peer returned an invalid UBmem region");
+  }
+  PeerRegion allocated{};
+  allocated.session_id = response.session_id;
+  allocated.base = response.peer_base;
+  allocated.length = response.peer_length;
+  allocated.fabric_mapping_bytes = response.mapping_bytes;
+  std::memcpy(allocated.fabric_handle.data(), response.fabric_handle, sizeof(response.fabric_handle));
+  regions_[allocated.base] = allocated;
+  *region = allocated;
   return Status::OK();
 }
 
@@ -402,19 +453,17 @@ Status PeerLink::OpenCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
 }
 
 namespace {
-Status PushSessionCommand(const std::string& address, uint64_t session, Command command) {
-  const char* name = command == Command::kStartCpuPushGet ? "StartCpuPushGet" :
-                     command == Command::kStopCpuPushGet ? "StopCpuPushGet" : "StopGatherLanes";
+Status PushSessionCommand(const std::string& address, uint64_t session, Command command,
+                          uint16_t version = kProtocolVersion) {
   CpuPushGetSessionRequest request{};
-  request.header = MakeHeader(command, sizeof(request));
+  request.header = MakeHeader(command, sizeof(request), version);
   request.session_id = session;
   StatusResponse response{};
   std::string error;
   if (!Exchange(address, request, &response, &error) ||
-      !IsValidResponseHeader(response.header, command, sizeof(response)) ||
+      !IsValidResponseHeader(response.header, command, sizeof(response), version) ||
       !ResultOk(static_cast<Result>(response.result), &error))
-    return ToStatus(std::string("peer session command failed: command=") + name +
-                    " session=" + std::to_string(session), std::move(error));
+    return ToStatus("CPU push session command failed", std::move(error));
   return Status::OK();
 }
 }  // namespace
@@ -429,6 +478,33 @@ Status PeerLink::StopCpuPushGet(uint64_t base) const {
   // ReleaseRegion succeeds only after the remote producer has stopped.
   if (found == regions_.end()) return Status::OK();
   return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet);
+}
+Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
+                                   OpenAivCpuPushGetResponse* response) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  constexpr auto command = Command::kOpenCpuPushGet;
+  constexpr auto version = kAivCpuPushProtocolVersion;
+  request.header = MakeHeader(command, sizeof(request), version);
+  request.session_id = found->second.session_id;
+  std::string error;
+  if (!Exchange(address_, request, response, &error) ||
+      !IsValidResponseHeader(response->header, command, sizeof(*response), version) ||
+      !ResultOk(static_cast<Result>(response->result), &error))
+    return ToStatus("AIV CPU push setup failed", std::move(error));
+  return Status::OK();
+}
+Status PeerLink::StartAivCpuPushGet(uint64_t base) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  return PushSessionCommand(address_, found->second.session_id, Command::kStartCpuPushGet,
+                            kAivCpuPushProtocolVersion);
+}
+Status PeerLink::StopAivCpuPushGet(uint64_t base) const {
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::OK();
+  return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet,
+                            kAivCpuPushProtocolVersion);
 }
 Status PeerLink::StopGatherLanes(uint64_t base) const {
   const auto found = regions_.find(base);

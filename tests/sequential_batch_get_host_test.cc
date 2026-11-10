@@ -140,13 +140,13 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
-Status PeerLink::OpenCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenCpuPushGetResponse* r) const {
+Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenAivCpuPushGetResponse* r) const {
   r->mailbox_base = 0x1000000; r->mailbox_bytes = 0x100000;
   r->mailbox_segment_bytes = 48; r->mailbox_token_id = 0x800; r->max_write_bytes = 65536;
   return Status::OK();
 }
-Status PeerLink::StartCpuPushGet(uint64_t) const { return Status::OK(); }
-Status PeerLink::StopCpuPushGet(uint64_t) const {
+Status PeerLink::StartAivCpuPushGet(uint64_t) const { return Status::OK(); }
+Status PeerLink::StopAivCpuPushGet(uint64_t) const {
   assert(work.empty());
   if (kernel_result) assert(!mailbox_jetty); // Failed initiator retired before remote MR release.
   ++push_stopped; return Status::OK();

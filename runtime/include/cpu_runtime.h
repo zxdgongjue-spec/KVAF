@@ -22,9 +22,10 @@ struct CpuRuntimeOptions {
   bool gather_affinity{true};
   CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
+  std::string hal_library{"libascend_hal.so"};
 };
 
-// CPU endpoint Runtime. It owns only CPU-side UMDK resources and sessions;
+// CPU endpoint Runtime. Allocation requests select URMA or UBmem per session;
 // RuntimeService owns the listening socket and calls ServeConnection.
 class CpuRuntime final : public Runtime {
  public:

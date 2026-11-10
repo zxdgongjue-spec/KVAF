@@ -8,6 +8,8 @@
 
 namespace kvaf {
 
+struct BatchGetProfile;
+
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
 struct RuntimeInitRequest {
@@ -48,7 +50,7 @@ struct AccessTableDeviceView {
 
 struct BatchGetRequest {
   // CPU BatchGet 必须提供有效 handle。NPU BatchGet 使用 DeviceAccessTable
-  // 重载时也会提供 handle，验证通路用其检查 Host 表生命周期；trusted 通路跳过；
+  // 重载时也会提供 handle，以便 Runtime 验证 Host 表生命周期；
   // 直接传入 addresses/valid Tensor 时 handle 可为空。
   AccessTableHandle access_table;
 
@@ -98,11 +100,10 @@ struct BatchFreeRequest {
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
-  // Caller guarantees a live, contiguous NPU request with the configured
-  // int32/address/uint8 layouts, capacities and token row size, plus valid
-  // active indices/offsets/source addresses and unique output rows, on an eager
-  // stream. Skip Host preflight and scatter's per-row validation; completion semantics
-  // are unchanged. The Python CPU-push scatter adapter supplies this contract.
+  // Optional AICPU stage timings; requires synchronize=true.
+  BatchGetProfile* profile{nullptr};
+  // AIV Scatter caller guarantees live contiguous device tensors, valid
+  // source indices and offsets, unique output rows and an eager stream.
   bool trusted_npu_request{false};
 };
 

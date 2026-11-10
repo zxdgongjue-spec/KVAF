@@ -21,6 +21,8 @@ struct PeerRegion {
   uint32_t segment_key_bytes = 0U;
   std::array<uint8_t, kEidBytes> eid{};
   std::array<uint8_t, kSegKeyBytes> segment_key{};
+  std::array<uint8_t, 128> fabric_handle{};
+  uint64_t fabric_mapping_bytes{};
 };
 
 struct PeerCandidateInfo {
@@ -44,15 +46,22 @@ class PeerLink {
   Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
+  Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);
+  Status RetainUbmemMapping(uint64_t base);
+  void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
-  Status StopGatherLanes(uint64_t region_base) const;
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
+  Status StopGatherLanes(uint64_t region_base) const;
   Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
                         OpenCpuPushGetResponse* response) const;
   Status StartCpuPushGet(uint64_t region_base) const;
   Status StopCpuPushGet(uint64_t region_base) const;
+  Status OpenAivCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
+                           OpenAivCpuPushGetResponse* response) const;
+  Status StartAivCpuPushGet(uint64_t region_base) const;
+  Status StopAivCpuPushGet(uint64_t region_base) const;
   Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
@@ -74,6 +83,7 @@ class PeerLink {
  private:
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
+  std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;
 };
 
 }  // namespace kvaf::peer

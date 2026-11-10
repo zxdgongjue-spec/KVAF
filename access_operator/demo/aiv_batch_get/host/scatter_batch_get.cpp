@@ -168,15 +168,16 @@ struct ScatterBatchGet::Impl {
     for (uint32_t q = 0; q < 4; ++q) {
       channels[q] = std::make_unique<d::TargetChannel>(api, context);
       // Queue 0 is bidirectional: CPU payload target and AIV mailbox initiator.
-      auto result = channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384, q == 0);
+      auto result = q == 0 ? channels[q]->InitializeAiv(token, peer.token_value, 1024, 16384)
+                           : channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384);
       if (!result.ok()) return result;
       const auto& key = channels[q]->jetty_info().key;
       open.channels[q].bytes = key.size;
       std::memcpy(open.channels[q].key, key.value, key.size);
     }
-    peer::OpenCpuPushGetResponse response{};
+    peer::OpenAivCpuPushGetResponse response{};
     push_open = true;  // A lost response can still leave a live remote session.
-    auto result = config.peer_link->OpenCpuPushGet(region.base, open, &response);
+    auto result = config.peer_link->OpenAivCpuPushGet(region.base, open, &response);
     if (!result.ok()) return result;
     if (response.mailbox_segment_bytes != kSegmentBytes || !response.mailbox_base ||
         response.mailbox_bytes < layout.staging || !(response.mailbox_token_id >> 8) ||
@@ -222,7 +223,7 @@ struct ScatterBatchGet::Impl {
     if (aclrtMemcpy(reinterpret_cast<void*>(mailbox_context), sizeof(mailbox), &mailbox,
                     sizeof(mailbox), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
       return Error("initialize AIV mailbox context");
-    return config.peer_link->StartCpuPushGet(region.base);
+    return config.peer_link->StartAivCpuPushGet(region.base);
   }
 
   Status Shutdown() {
@@ -244,7 +245,7 @@ struct ScatterBatchGet::Impl {
       channels[0].reset();
     }
     if (push_open) {
-      auto result = config.peer_link->StopCpuPushGet(region.base);
+      auto result = config.peer_link->StopAivCpuPushGet(region.base);
       if (!result.ok()) return result;
       push_open = false;
     }

@@ -1,100 +1,67 @@
-set(KVAF_CCEC_DIR "${ASCEND_CANN_PACKAGE_PATH}/tools/ccec_compiler/bin")
+set(KVAF_EXECUTE_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_kernels.asc")
+set(KVAF_URMA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_aiv.asc")
+set(KVAF_EXECUTE_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get.tmp.o")
+set(KVAF_EXECUTE_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_kernels.o")
+include("${CMAKE_CURRENT_LIST_DIR}/../../../cmake/aiv_toolchain.cmake")
+list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
 
-find_program(KVAF_CCEC NAMES ccec HINTS "${KVAF_CCEC_DIR}")
-find_program(KVAF_LLD NAMES ld.lld HINTS "${KVAF_CCEC_DIR}")
-if(NOT KVAF_CCEC OR NOT KVAF_LLD)
-  message(FATAL_ERROR "A5 ccec/ld.lld not found under ${KVAF_CCEC_DIR}")
-endif()
+set(KVAF_UBMEM_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_ubmem.asc")
+set(KVAF_OPERATOR_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/../../../include")
+list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_OPERATOR_INCLUDE}")
 
-find_path(KVAF_KERNEL_OPERATOR_DIR NAMES kernel_operator.h HINTS
-  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/interface"
-  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
-  "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/interface"
-  "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw"
-  "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw/interface"
-  "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw")
-if(NOT KVAF_KERNEL_OPERATOR_DIR)
-  message(FATAL_ERROR "kernel_operator.h not found under ${ASCEND_CANN_PACKAGE_PATH}")
-endif()
+add_custom_command(
+  OUTPUT "${KVAF_EXECUTE_KERNEL_OBJECT}"
+  COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${KVAF_EXECUTE_KERNEL_SOURCE}" -o "${KVAF_EXECUTE_KERNEL_TMP}"
+          ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
+  COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_EXECUTE_KERNEL_TMP}"
+          -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
+  DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_URMA_SOURCE}" "${KVAF_UBMEM_SOURCE}"
+          "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
+          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
+          "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+  VERBATIM)
+add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
+add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_EXECUTE_KERNEL_OBJECT}"
+          "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_kernels.o")
 
-find_path(KVAF_SIMT_API_DIR NAMES simt_api/device_atomic_functions.h HINTS
-  "$ENV{ASCEND_SIMT_API_DIR}"
-  "${ASCEND_CANN_PACKAGE_PATH}/include"
-  "${ASCEND_CANN_PACKAGE_PATH}/include/ascendc"
-  "${ASCEND_CANN_PACKAGE_PATH}/compiler/include"
-  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include"
-  "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include"
-  "${ASCEND_CANN_PACKAGE_PATH}/x86_64-linux/include"
-  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/include"
-  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
-  "${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
-  "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/lib"
-  "${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw"
-  "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw/lib"
-  "${ASCEND_CANN_PACKAGE_PATH}/include/tikcpp/tikcfw")
-if(NOT KVAF_SIMT_API_DIR)
-  message(FATAL_ERROR
-    "simt_api/device_atomic_functions.h was not found. Install the matching "
-    "CANN asc-devkit package, or set ASCEND_SIMT_API_DIR to the directory "
-    "that contains simt_api/device_atomic_functions.h. "
-    "ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH}")
-endif()
-message(STATUS "BatchGet SIMT API root: ${KVAF_SIMT_API_DIR}")
-
-set(KVAF_KERNEL_INCLUDES
-  "-I${KVAF_KERNEL_OPERATOR_DIR}"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/lib"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/interface"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/tikcfw/impl"
-  "-I${KVAF_SIMT_API_DIR}"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/interface"
-  "-I${ASCEND_CANN_PACKAGE_PATH}/tikcpp/tikcfw/impl"
-  "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
+# Scatter and Gather each emit AscendC globals. Keep their objects separate
+# from the main URMA/UBmem binary and from each other.
 get_filename_component(KVAF_AIV_COMMON_INCLUDE_DIR
   "${KVAF_AIV_DEMO_INCLUDE_DIR}/../../../../common/include" ABSOLUTE)
-list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_COMMON_INCLUDE_DIR}")
-
-# AscendC emits SDK globals (including g_tilingKey) in each translation unit.
-# Link each kernel separately; combining the two objects gives duplicate symbols.
-function(kvaf_compile_batch_get_kernel stem source)
+foreach(mode scatter gather)
+  set(stem kvaf_${mode}_batch_get)
+  set(source "${CMAKE_CURRENT_SOURCE_DIR}/execute_${mode}_batch_get_aiv.asc")
   set(object "${CMAKE_CURRENT_BINARY_DIR}/${stem}_kernels.o")
   set(temporary "${CMAKE_CURRENT_BINARY_DIR}/${stem}.tmp.o")
   set(installed "${KVAF_AIV_DEMO_BIN_DIR}/${stem}_kernels.o")
-  add_custom_command(
-    OUTPUT "${object}" "${installed}"
-    COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${CMAKE_CURRENT_SOURCE_DIR}/${source}" -o "${temporary}"
-            --cce-aicore-arch=dav-c310-vec --cce-aicore-input-parameter-size=8192 --cce-aicore-only
-            -mllvm -cce-aicore-function-stack-size=0x4000 -mllvm -cce-aicore-stack-size=0x4000
-            -mllvm -cce-aicore-record-overflow=false -mllvm -cce-aicore-addr-transform
-            -mllvm -cce-aicore-jump-expand=true -std=c++17 -fstack-protector-all ${KVAF_KERNEL_INCLUDES}
-    COMMAND "${KVAF_LLD}" -m aicorelinux -Ttext=0 "${temporary}" -static -o "${object}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${object}" "${installed}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-            "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
-            "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
-            ${ARGN}
-    VERBATIM)
-  add_custom_target(${stem}_kernel DEPENDS "${object}" "${installed}")
-endfunction()
-
-kvaf_compile_batch_get_kernel(kvaf_execute_batch_get execute_batch_get_aiv.asc
-  "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h")
-foreach(mode scatter gather)
-  set(profile_dependencies)
+  set(scatter_dependencies)
   if(mode STREQUAL "scatter")
-    list(APPEND profile_dependencies
+    list(APPEND scatter_dependencies
       "${CMAKE_CURRENT_SOURCE_DIR}/scatter_mailbox_kernel.h"
       "${KVAF_SIMT_API_DIR}/simt_api/device_functions.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/scatter_batch_get_profile.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/cpu_push_get_abi.h")
   endif()
-  kvaf_compile_batch_get_kernel(kvaf_${mode}_batch_get execute_${mode}_batch_get_aiv.asc
-    "${KVAF_AIV_DEMO_INCLUDE_DIR}/${mode}_batch_get_abi.h"
-    "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/batch_get_kernel_common.h" ${profile_dependencies})
+  add_custom_command(
+    OUTPUT "${object}" "${installed}"
+    COMMAND "${KVAF_CCEC}" -c -x cce -O2 "${source}" -o "${temporary}"
+            ${KVAF_AIV_COMPILE_OPTIONS} ${KVAF_KERNEL_INCLUDES}
+            "-I${KVAF_AIV_COMMON_INCLUDE_DIR}"
+    COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${temporary}" -o "${object}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${object}" "${installed}"
+    DEPENDS "${source}"
+            "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
+            "${KVAF_AIV_DEMO_INCLUDE_DIR}/${mode}_batch_get_abi.h"
+            "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/batch_get_kernel_common.h"
+            "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
+            ${scatter_dependencies}
+    VERBATIM)
+  add_custom_target(${stem}_kernel DEPENDS "${object}" "${installed}")
 endforeach()
 add_custom_target(kvaf_batch_get_kernels ALL)
 add_dependencies(kvaf_batch_get_kernels kvaf_execute_batch_get_kernel

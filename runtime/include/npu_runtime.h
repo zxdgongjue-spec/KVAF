@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "runtime.h"
+#include "npu_runtime_config.h"
 #include "scatter_batch_get_profile.h"
 
 namespace kvaf {
@@ -21,21 +22,28 @@ struct NpuRuntimeOptions {
         batch_get_token_bytes(token_bytes),
         batch_get_tokens_per_block(tokens_per_block) {}
 
+  // Select once per Runtime; existing callers use URMA by default.
+  Transport transport{Transport::kUrma};
   std::string batch_get_kernel_object_path;
-  std::string aiv_batch_get_mode{"direct_read"};
-  std::uint32_t aiv_gather_sgl_size{6};
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
   std::string batch_put_kernel_object_path;
   std::uint32_t device_id{0U};
   std::uint32_t npu_core_count{2U};
   std::uint32_t jettys_per_core{2U};
+  // Empty selects AIV. gather_read / cpu_push_scatter select AICPU Get and Put.
+  // The AICPU kernel package is resolved from the CANN installation internally.
+  std::string aicpu_batch_get_mode{};
+  // Sequential AIV modes use URMA; AICPU selection remains independent.
+  std::string aiv_batch_get_mode{"direct_read"};
+  std::uint32_t aiv_gather_sgl_size{6U};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and
-  // selects one working EID. Multiple entries create simultaneous BatchGet
+  // selects one working EID. For AIV, multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut
-  // remains on the first EID.
+  // remains on the first EID. Both AICPU modes try explicit EIDs one at a time
+  // as connectivity fallbacks; Get and Put share the selected EID.
   std::vector<std::string> npu_eids{};
   // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
   // explicit device uses the native first-working path without tuning.
@@ -66,17 +74,18 @@ class NpuRuntime final : public Runtime {
   const RuntimeCore& core() const;
 
   std::uint32_t device_id() const;
+  bool uses_aicpu() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
-  Status SetBatchGetKernelProfiling(bool enabled);
-  Status SetScatterProfiling(bool enabled);
-  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
+  Status SetScatterProfiling(bool enabled);
+  Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

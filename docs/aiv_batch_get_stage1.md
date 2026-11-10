@@ -36,7 +36,10 @@ GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
-每核 192 B 区域。Scatter mailbox 的打开、启动和停止命令使用 V8，Gather 和公共控制命令
+每核 192 B 区域。AIV Scatter mailbox 的打开、启动和停止命令使用 V8，握手响应为 392 B。
+V8 由 AIV 把地址清单和通知 WRITE 到 CPU DDR mailbox，CPU 从本地读取。
+AICPU Scatter 使用 V6，握手响应为 300 B，CPU 从 NPU HBM READ 通知、请求头和地址清单。
+两条路径分别通过 `aiv_batch_get_mode` 和 `aicpu_batch_get_mode` 选择。Gather 和公共控制命令
 使用 V6。部署 Scatter 时同步重编 CPU 服务、NPU Host 和 Scatter kernel。
 
 原 `direct_read` 继续使用 `kvaf_execute_batch_get_kernels.o`。三个模块独立编译，

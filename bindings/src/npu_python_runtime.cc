@@ -15,11 +15,13 @@
 #include <vector>
 
 #include "access_table_python.h"
+#include "batch_get_profile.h"
 #include "access_operator.h"
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
 #include "scatter_host_profile.h"
+#include "npu_runtime_constructor.h"
 
 namespace py = pybind11;
 
@@ -29,7 +31,7 @@ namespace {
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
   const std::string message = status.message().empty()
-                                  ? "KVAF AIV operation failed"
+                                  ? "KVAF NPU operation failed"
                                   : status.message();
   if (status.code() == StatusCode::kInvalidArgument ||
       status.code() == StatusCode::kInvalidState ||
@@ -283,6 +285,60 @@ aclrtStream ResolveStream(const py::object& stream) {
   return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
 }
 
+py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
+  py::dict result, host;
+#define HOST_TIME(name) host[#name "_us"] = profile.name##_ns / 1000.0
+  HOST_TIME(prepare);
+  HOST_TIME(launch);
+  HOST_TIME(status_enqueue);
+  HOST_TIME(wait);
+  HOST_TIME(finish);
+  HOST_TIME(total);
+#undef HOST_TIME
+  result["host"] = host;
+  py::list workers;
+  std::uint64_t first = UINT64_MAX;
+  std::uint64_t last = 0;
+  for (unsigned index = 0; index < profile.worker_count; ++index) {
+    first = std::min(first, profile.workers[index].enter_ns);
+    last = std::max(last, profile.workers[index].exit_ns);
+  }
+  for (unsigned index = 0; index < profile.worker_count; ++index) {
+    const auto& sample = profile.workers[index];
+    py::dict worker;
+    worker["worker"] = index;
+    worker["entry_us"] = (sample.enter_ns - first) / 1000.0;
+    worker["exit_us"] = (sample.exit_ns - first) / 1000.0;
+    worker["wall_us"] = (sample.exit_ns - sample.enter_ns) / 1000.0;
+#define WORKER_TIME(name) worker[#name "_us"] = sample.name##_ns / 1000.0
+    WORKER_TIME(request);
+    WORKER_TIME(input_cache);
+    WORKER_TIME(descriptor_cache);
+    WORKER_TIME(source_write);
+    WORKER_TIME(notify);
+    WORKER_TIME(read);
+    WORKER_TIME(ack);
+    WORKER_TIME(read_setup);
+    WORKER_TIME(wr_build);
+    WORKER_TIME(ready_wait);
+    WORKER_TIME(post);
+    WORKER_TIME(cq_wait);
+    WORKER_TIME(scatter);
+    WORKER_TIME(output_cache);
+#undef WORKER_TIME
+    worker["bytes"] = sample.bytes;
+    worker["spans"] = sample.spans;
+    worker["read_wqes"] = sample.read_wqes;
+    worker["post_calls"] = sample.post_calls;
+    worker["ready_queries"] = sample.ready_queries;
+    worker["scatter_copies"] = sample.scatter_copies;
+    workers.append(worker);
+  }
+  result["workers"] = workers;
+  result["device_span_us"] = profile.worker_count ? (last - first) / 1000.0 : 0.0;
+  return result;
+}
+
 class NpuPythonRuntime final {
  public:
   NpuPythonRuntime(std::string batch_get_kernel_object_path,
@@ -297,26 +353,32 @@ class NpuPythonRuntime final {
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
+                   const std::string& transport, std::string aicpu_batch_get_mode,
                    std::string aiv_batch_get_mode, std::uint32_t aiv_gather_sgl_size) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
+    if (transport == "urma") options.transport = Transport::kUrma;
+    else if (transport == "ubmem") options.transport = Transport::kUbmem;
+    else throw py::value_error("transport must be urma or ubmem");
     options.batch_put_kernel_object_path =
         std::move(batch_put_kernel_object_path);
     options.device_id = device_id;
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
-    options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     trusted_scatter_inputs_ = aiv_batch_get_mode == "cpu_push_scatter";
     if (trusted_scatter_inputs_) tensor_methods_.emplace();
     options.aiv_batch_get_mode = std::move(aiv_batch_get_mode);
     options.aiv_gather_sgl_size = aiv_gather_sgl_size;
+    options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
+    options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
     options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+    aicpu_backend_ = native_->uses_aicpu();
   }
 
   void LinkTo(std::string address) {
@@ -507,8 +569,8 @@ class NpuPythonRuntime final {
     return result;
   }
 
-  void StartBatchGetKernelProfile() {
-    ThrowIfError(native_->SetBatchGetKernelProfiling(true));
+  void StartBatchGetKernelProfile(bool detailed) {
+    ThrowIfError(native_->SetBatchGetKernelProfiling(true, detailed));
   }
 
   py::list BatchGetKernelProfileSnapshot() const {
@@ -534,6 +596,11 @@ class NpuPythonRuntime final {
       item["post_active_cycles"] = profile.post_active_cycles;
       item["drain_wait_cycles"] = profile.drain_wait_cycles;
       item["peak_submitted_not_drained"] = profile.peak_submitted_not_drained;
+      item["ubmem_profile_detail"] = profile.ubmem_profile_detail;
+      item["ubmem_setup_cycles"] = profile.ubmem_setup_cycles;
+      item["ubmem_address_cycles"] = profile.ubmem_address_cycles;
+      item["ubmem_submit_cycles"] = profile.ubmem_submit_cycles;
+      item["ubmem_drain_cycles"] = profile.ubmem_drain_cycles;
       item["jetty_completion_wait_cycles"] =
           profile.jetty_completion_wait_cycles;
       item["jetty_completion_polls"] = profile.jetty_completion_polls;
@@ -552,29 +619,29 @@ class NpuPythonRuntime final {
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
   // addresses/valid Tensors alive until their stream completes BatchGet.
-  void BatchGet(const DeviceAccessTable& access_table,
+  py::object BatchGet(const DeviceAccessTable& access_table,
                 const py::object& indices, const py::object& offsets,
                 const py::object& miss_count,
                 const py::object& output_indices, const py::object& output,
-                const py::object& stream, bool synchronize) {
-    BatchGetImpl(access_table.source(), access_table.addresses(),
-                 access_table.valid(), indices, offsets, miss_count,
-                 output_indices, output, stream, synchronize);
+                const py::object& stream, bool synchronize, bool profile) {
+    return BatchGetImpl(access_table.source(), access_table.addresses(),
+                 access_table.valid(), indices, offsets, miss_count, output_indices,
+                 output, stream, synchronize, profile);
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
-  // Tensors carry no AccessTableHandle. Checked modes validate their NPU
-  // layout; scatter uses the caller's trusted-input contract in either overload.
-  void BatchGetFromTensors(const py::object& addresses,
+  // Tensors carry no AccessTableHandle, Runtime validates their NPU layout but
+  // cannot validate a corresponding Host AccessTable lifetime or entry length.
+  py::object BatchGetFromTensors(const py::object& addresses,
                            const py::object& valid,
                            const py::object& indices,
                            const py::object& offsets,
                            const py::object& miss_count,
                            const py::object& output_indices,
                            const py::object& output,
-                           const py::object& stream, bool synchronize) {
-    BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets,
-                 miss_count, output_indices, output, stream, synchronize);
+                           const py::object& stream, bool synchronize, bool profile) {
+    return BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, miss_count,
+                 output_indices, output, stream, synchronize, profile);
   }
 
   // Prepare only immutable launch metadata. The kernel reads the current
@@ -626,13 +693,15 @@ class NpuPythonRuntime final {
   }
 
  private:
-  void BatchGetImpl(const AccessTableHandle& access_table,
+  py::object BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
                     const py::object& indices, const py::object& offsets,
                     const py::object& miss_count,
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
-                    bool synchronize) {
+                    bool synchronize, bool profile) {
+    if (profile && (!synchronize || !aicpu_backend_))
+      throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
     if (trusted_scatter_inputs_) {
       scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
       scatter_host::Timer binding_timer(scatter_host::kBinding);
@@ -646,9 +715,10 @@ class NpuPythonRuntime final {
       const auto acl_stream = tensor_methods_->Stream(stream);
       stream_timer.Stop();
       SubmitScatterBatchGet(request, acl_stream, synchronize);
-      return;
+      return py::none();
     }
 
+    const auto begin = profile ? BatchGetProfileNowNs() : 0U;
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
     const NpuTensorView miss_count_view =
@@ -685,8 +755,7 @@ class NpuPythonRuntime final {
         access_table,
         ConstBufferView{index_view.data, index_view.bytes, DeviceKind::kNpu},
         ConstBufferView{offset_view.data, offset_view.bytes, DeviceKind::kNpu},
-        ConstBufferView{miss_count_view.data, miss_count_view.bytes,
-                        DeviceKind::kNpu},
+        ConstBufferView{miss_count_view.data, miss_count_view.bytes, DeviceKind::kNpu},
         ConstBufferView{output_index_view.data, output_index_view.bytes,
                         DeviceKind::kNpu},
         MutableBufferView{output_view.data, output_view.bytes, DeviceKind::kNpu},
@@ -696,9 +765,18 @@ class NpuPythonRuntime final {
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     const aclrtStream acl_stream = ResolveStream(stream);
+    auto timings = profile ? std::make_unique<BatchGetProfile>() : nullptr;
+    const auto native_begin = profile ? BatchGetProfileNowNs() : 0U;
     ThrowIfError(native_->core().BatchGet(
         request, BatchGetExecutionOptions{acl_stream,
-                                           synchronize}));
+                                           synchronize, timings.get()}));
+    if (!profile) return py::none();
+    const auto end = BatchGetProfileNowNs();
+    auto result = BatchGetProfileDict(*timings);
+    result["binding_prepare_us"] = (native_begin - begin) / 1000.0;
+    result["native_call_us"] = (end - native_begin) / 1000.0;
+    result["binding_total_us"] = (end - begin) / 1000.0;
+    return result;
   }
 
   void SubmitScatterBatchGet(const BatchGetRequest& request, aclrtStream stream,
@@ -707,7 +785,7 @@ class NpuPythonRuntime final {
     {
       scatter_host::Timer native_timer(scatter_host::kNative);
       status = native_->core().BatchGet(
-          request, BatchGetExecutionOptions{stream, synchronize, true});
+          request, BatchGetExecutionOptions{stream, synchronize, nullptr, true});
     }
     ThrowIfError(status);
     host_profile_ready_ = host_profile_enabled_;
@@ -727,6 +805,7 @@ class NpuPythonRuntime final {
   bool trusted_scatter_inputs_{false};
   bool host_profile_enabled_{false}, host_profile_ready_{false};
   scatter_host::Profile host_profile_{};
+  bool aicpu_backend_{false};
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
@@ -742,27 +821,9 @@ void BindNpuPythonRuntime(py::module_& module) {
         return table.source().opaque;
       });
 
-  py::class_<NpuPythonRuntime>(module, "NpuRuntime")
-      .def(py::init<std::string, std::uint32_t, std::uint32_t, std::uint32_t,
-                    std::uint32_t, std::string, std::uint32_t,
-                    std::vector<std::string>, bool, std::uint32_t,
-                    std::string, std::vector<std::string>, std::uint32_t, std::string, std::uint32_t>(),
-           py::arg("batch_get_kernel_object_path"),
-           py::arg("batch_get_token_bytes"),
-           py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
-           py::arg("npu_core_count") = 2,
-           py::arg("batch_put_kernel_object_path") = "",
-           py::arg("jettys_per_core") = 2,
-           py::arg("npu_eids") = std::vector<std::string>{},
-           py::arg("adaptive_ub_device") = false,
-           py::arg("adaptive_ub_miss_count") = 2048,
-           py::arg("peer_ub_device") = "",
-           py::arg("adaptive_peer_ub_devices") =
-               std::vector<std::string>{},
-           py::arg("batch_get_max_inflight_total") = 2048,
-           py::arg("aiv_batch_get_mode") = "direct_read",
-           py::arg("aiv_gather_sgl_size") = 6)
-      .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
+  auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
+  python_binding::BindNpuRuntimeConstructor(runtime);
+  runtime.def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
@@ -802,6 +863,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("stop_scatter_profile", &NpuPythonRuntime::StopScatterProfile)
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
+           py::arg("detailed") = false,
            "Enable the per-core BatchGet kernel cycle timeline.")
       .def("batch_get_kernel_profile",
            &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
@@ -826,18 +888,20 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
+           py::arg("profile") = false,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
-           "the default returns after enqueueing work on that stream. CPU-push scatter trusts "
-           "the caller's contiguous NPU layouts and eager-stream/lifetime contract.")
+           "the default returns after enqueueing work on that stream. AICPU profile=True "
+           "requires synchronize=True and returns a stage timing dictionary.")
       .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
            py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
+           py::arg("profile") = false,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
            "stream=None uses torch.npu.current_stream(); the default returns "
-           "after enqueueing work on that stream. CPU-push scatter trusts the "
-           "caller's contiguous NPU layouts and eager-stream/lifetime contract.");
+           "after enqueueing work on that stream. AICPU profile=True requires "
+           "synchronize=True and returns a stage timing dictionary.");
 }
 
 }  // namespace kvaf

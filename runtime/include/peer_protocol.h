@@ -13,8 +13,7 @@ constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
 // Version 6 exposes candidate metadata before allocation so adaptive startup
 // can group EIDs by K-side UB device and benchmark each device only once.
 constexpr uint16_t kProtocolVersion = 6U;
-// Scatter's mailbox handshake and session commands require matching peers.
-constexpr uint16_t kCpuPushProtocolVersion = 8U;
+constexpr uint16_t kAivCpuPushProtocolVersion = 8U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -34,11 +33,18 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kStopGatherLanes = 14U,
+  kAllocateUbmemRegion = 6U,
+  // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
 
-inline constexpr uint16_t ProtocolVersion(Command command) {
+inline constexpr bool IsAivCpuPushCommand(Command command) {
   return command == Command::kOpenCpuPushGet || command == Command::kStartCpuPushGet ||
-         command == Command::kStopCpuPushGet ? kCpuPushProtocolVersion : kProtocolVersion;
+         command == Command::kStopCpuPushGet;
+}
+
+inline constexpr bool IsSupportedProtocolVersion(Command command, uint16_t version) {
+  return version == kProtocolVersion ||
+         (version == kAivCpuPushProtocolVersion && IsAivCpuPushCommand(command));
 }
 
 enum class Result : int32_t {
@@ -131,6 +137,25 @@ struct ReleaseRegionRequest {
   uint64_t session_id;
 };
 
+// UBmem allocation shares the service and session namespace with URMA.
+// Existing URMA v6 records and entry points stay usable.
+struct AllocateUbmemRegionRequest {
+  MessageHeader header;
+  uint64_t ddr_bytes;
+  uint64_t slot_size;
+};
+
+struct AllocateUbmemRegionResponse {
+  MessageHeader header;
+  int32_t result;
+  uint64_t session_id;
+  uint64_t peer_base;
+  uint64_t peer_length;
+  uint64_t mapping_bytes;
+  uint8_t fabric_handle[128];
+  char error_message[256];
+};
+
 struct StatusResponse {
   MessageHeader header;
   int32_t result;
@@ -165,6 +190,13 @@ struct OpenCpuPushGetResponse {
   uint64_t cpu_tp;
   uint32_t cpu_psn;
   CpuPushChannelKey channels[4];
+};
+struct OpenAivCpuPushGetResponse {
+  MessageHeader header;
+  int32_t result;
+  uint64_t cpu_tp;
+  uint32_t cpu_psn;
+  CpuPushChannelKey channels[4];
   uint64_t mailbox_base, mailbox_bytes;
   uint32_t mailbox_token_id, mailbox_segment_bytes, max_write_bytes;
   uint8_t mailbox_segment[kSegKeyBytes];
@@ -174,6 +206,9 @@ struct CpuPushGetSessionRequest {
   uint64_t session_id;
 };
 #pragma pack(pop)
+
+static_assert(sizeof(AllocateUbmemRegionRequest) == 28U, "UBmem allocation ABI changed");
+static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI changed");
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
@@ -185,30 +220,32 @@ static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
 static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
-static_assert(sizeof(OpenCpuPushGetResponse) == 392U, "CPU push setup response ABI changed");
+static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(OpenAivCpuPushGetResponse) == 392U, "AIV CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {
   return static_cast<uint16_t>(command) | 0x8000U;
 }
 
-inline constexpr MessageHeader MakeHeader(Command command, uint32_t bytes) {
-  return MessageHeader{kProtocolMagic, ProtocolVersion(command),
+inline constexpr MessageHeader MakeHeader(Command command, uint32_t bytes,
+                                          uint16_t version = kProtocolVersion) {
+  return MessageHeader{kProtocolMagic, version,
                        static_cast<uint16_t>(command), bytes};
 }
 
 inline bool IsValidHeader(const MessageHeader& header, Command command,
-                          std::size_t expected_bytes) {
+                          std::size_t expected_bytes, uint16_t version = kProtocolVersion) {
   return header.magic == kProtocolMagic &&
-         header.version == ProtocolVersion(command) &&
+         header.version == version &&
          header.command == static_cast<uint16_t>(command) &&
          header.bytes == expected_bytes;
 }
 
 inline bool IsValidResponseHeader(const MessageHeader& header, Command command,
-                                  std::size_t expected_bytes) {
+                                  std::size_t expected_bytes, uint16_t version = kProtocolVersion) {
   return header.magic == kProtocolMagic &&
-         header.version == ProtocolVersion(command) &&
+         header.version == version &&
          header.command == ResponseCommand(command) &&
          header.bytes == expected_bytes;
 }

@@ -392,7 +392,7 @@ def run_case(args):
         contiguous_source_token_ids = request_ids % (args.table_capacity * args.tokens_per_block)
 
         def refresh_inputs():
-            plan = reference.generate_request_plan(torch, args, device, request_ids, view.addresses,
+            plan = generate_request_plan(torch, args, device, request_ids, view.addresses,
                                                    contiguous_source_token_ids)
             refresh_request_buffers(plan, fixed_inputs)
 
@@ -436,6 +436,34 @@ def close_case(runtime, table):
             runtime.release_access_table(table)
     finally:
         shutdown_runtime(runtime)
+
+
+def generate_request_plan(torch, args, device, request_ids, address_table,
+                          contiguous_source_token_ids=None):
+    """Shared steady-state source/output distribution for transport comparisons."""
+    if args.source_access_pattern == "random":
+        indices = torch.randint(0, args.table_capacity, (args.request_length,),
+                                dtype=torch.int32, device=device)
+        token_slots = torch.randint(0, args.tokens_per_block, (args.request_length,),
+                                    dtype=torch.int32, device=device)
+    else:
+        source_token_ids = (request_ids % (args.table_capacity * args.tokens_per_block)
+                            if contiguous_source_token_ids is None else contiguous_source_token_ids)
+        if args.source_access_pattern == "shuffled-contiguous":
+            original = source_token_ids
+            source_token_ids = source_token_ids.clone()
+            permutation = torch.randperm(args.miss_count, device=device)
+            source_token_ids[:args.miss_count].copy_(
+                original[:args.miss_count].index_select(0, permutation))
+        indices = (source_token_ids // args.tokens_per_block).to(torch.int32)
+        token_slots = (source_token_ids % args.tokens_per_block).to(torch.int32)
+    offsets = token_slots * args.token_bytes
+    output_indices = (request_ids.to(torch.int32) if args.output_access_pattern == "contiguous"
+                      else torch.randperm(args.request_length, device=device).to(torch.int32))
+    if args.sort_input_indices:
+        indices, offsets, output_indices = reference.sort_request_plan_prefix(
+            torch, address_table, indices, offsets, output_indices, args.miss_count)
+    return indices, offsets, output_indices
 
 
 def refresh_request_buffers(plan, fixed_inputs):

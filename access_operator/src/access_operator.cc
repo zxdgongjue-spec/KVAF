@@ -130,10 +130,8 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
   }
 
   void* metadata = nullptr;
-  const aclError allocation = aclrtMalloc(&metadata, bytes, ACL_MEM_MALLOC_HUGE_FIRST);
-  if (allocation != ACL_SUCCESS) {
-    return Status::DeviceError("failed to grow BatchPut device metadata buffers, acl=" +
-                               std::to_string(allocation));
+  if (aclrtMalloc(&metadata, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+    return Internal("failed to grow BatchPut device metadata buffers");
   }
 
   if (execution->metadata != nullptr) {
@@ -713,15 +711,11 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     const std::size_t metadata_bytes = rows * 3U * sizeof(std::uint64_t);
 
     KvafBatchPutLocalBuffer* local_buffer = nullptr;
-    const int32_t acquire_result = KvafBatchPutLocalBufferAcquire(
+    if (KvafBatchPutLocalBufferAcquire(
             impl_->batch_put_transport, const_cast<void*>(exec.request->input.data),
-            exec.request->input.bytes, &local_buffer);
-    if (acquire_result != KVAF_BATCH_PUT_SUCCESS ||
+            exec.request->input.bytes, &local_buffer) != KVAF_BATCH_PUT_SUCCESS ||
         local_buffer == nullptr) {
-      const auto message = "failed to acquire caller input for BatchPut, result=" +
-                           std::to_string(acquire_result);
-      return acquire_result == KVAF_BATCH_PUT_RUNTIME_ERROR
-          ? Status::DeviceError(message) : Internal(message);
+      return Internal("failed to acquire caller input for BatchPut");
     }
 
     const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
@@ -742,33 +736,26 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     std::memset(execution.host_core_status, 0,
                 execution.host_core_status_count *
                     sizeof(KvafBatchPutCoreStatus));
-    const aclError upload_result = aclrtMemcpyAsync(execution.metadata, metadata_bytes,
+    if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
                          execution.host_metadata, metadata_bytes,
-                         ACL_MEMCPY_HOST_TO_DEVICE, stream);
-    if (upload_result != ACL_SUCCESS) {
+                         ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
       KvafBatchPutLocalBufferRelease(local_buffer);
-      return Status::DeviceError("failed to enqueue BatchPut metadata upload to NPU, acl=" +
-                                 std::to_string(upload_result));
+      return Internal("failed to enqueue BatchPut metadata upload to NPU");
     }
 
     const int32_t result = KvafExecuteBatchPutSync(
         local_buffer, &arguments, stream, execution.host_core_status,
         static_cast<std::uint32_t>(execution.host_core_status_count));
-    aclError drain_result = ACL_SUCCESS;
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       // The metadata upload may have been accepted even when launch or status
       // setup subsequently failed. Do not reuse its pinned source buffer until
       // the stream has stopped reading it.
-      drain_result = aclrtSynchronizeStream(stream);
+      (void)aclrtSynchronizeStream(stream);
     }
     KvafBatchPutLocalBufferRelease(local_buffer);
     if (result != KVAF_BATCH_PUT_SUCCESS) {
       LogBatchPutDeviceStatus(execution, impl_->config.npu_core_count, result);
-      const auto message = "AIV Direct-HCCP BatchPut execution failed, result=" +
-                           std::to_string(result) + ", drain_acl=" +
-                           std::to_string(drain_result);
-      return result == KVAF_BATCH_PUT_RUNTIME_ERROR || drain_result != ACL_SUCCESS
-          ? Status::DeviceError(message) : Internal(message);
+      return Internal("AIV Direct-HCCP BatchPut execution failed");
     }
     return Status::OK();
   }

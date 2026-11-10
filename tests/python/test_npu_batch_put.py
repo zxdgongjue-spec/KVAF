@@ -7,6 +7,7 @@ NPU EIDs. BatchPut uses the first EID when an explicit list is provided.
 
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import statistics
@@ -78,7 +79,7 @@ def validate_batch(
         runtime.release_access_table(table)
 
 
-def main() -> int:
+def main(transport: str = "urma") -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
@@ -199,6 +200,7 @@ def main() -> int:
 
     runtime = kvaf.NpuRuntime(
         str(batch_get_kernel),
+        transport=transport,
         batch_get_token_bytes=token_bytes,
         batch_get_tokens_per_block=tokens_per_block,
         device_id=device_id,
@@ -305,4 +307,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    raise SystemExit(main(parser.parse_args().transport))

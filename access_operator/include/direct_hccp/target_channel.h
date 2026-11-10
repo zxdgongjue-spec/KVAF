@@ -19,7 +19,20 @@ class TargetChannel {
 
   Status Initialize(void* token_id_handle, std::uint32_t token_value,
                     std::uint32_t sq_depth, std::uint32_t rq_depth,
-                    std::uint32_t cq_depth, bool device_initiator = false) {
+                    std::uint32_t cq_depth) {
+    return InitializeChannel<false>(token_id_handle, token_value, sq_depth, rq_depth, cq_depth);
+  }
+
+  Status InitializeAiv(void* token_id_handle, std::uint32_t token_value,
+                       std::uint32_t sq_depth, std::uint32_t cq_depth) {
+    return InitializeChannel<true>(token_id_handle, token_value, sq_depth, 0, cq_depth);
+  }
+
+ private:
+  template <bool device_initiator>
+  Status InitializeChannel(void* token_id_handle, std::uint32_t token_value,
+                           std::uint32_t sq_depth, std::uint32_t rq_depth,
+                           std::uint32_t cq_depth) {
     if (cq_handle_ != nullptr || jetty_handle_ != nullptr) {
       return Status::InvalidState("NPU target channel already initialized");
     }
@@ -31,6 +44,7 @@ class TargetChannel {
     }
     cq_info_ = {};
     jetty_info_ = {};
+    device_initiator_ = device_initiator;
     cq_info_.in.depth = cq_depth;
     cq_info_.in.ub.mode = device_initiator ? direct_hccp::kJfcUserCtlNormal : direct_hccp::kJfcNormal;
     const int cq_rc = api_.cq_create(context_, &cq_info_, &cq_handle_);
@@ -38,7 +52,7 @@ class TargetChannel {
       return Status::Internal("NPU target CQ creation failed (rc=" +
                               std::to_string(cq_rc) + ")");
     }
-    if (device_initiator) {
+    if constexpr (device_initiator) {
       if (!direct_hccp::CreateDeviceAivJetty(api_, context_, cq_handle_, token_id_handle,
           token_value, sq_depth, "scatter_mailbox", &jetty_info_, &jetty_handle_))
         return Status::Internal("NPU scatter mailbox Jetty creation failed");
@@ -68,6 +82,7 @@ class TargetChannel {
     return Status::OK();
   }
 
+ public:
   const direct_hccp::QpCreateInfo& jetty_info() const { return jetty_info_; }
   const direct_hccp::CqInfo& cq_info() const { return cq_info_; }
   // ImportPeerJetty may set a handle even when it reports failure. Retain the
@@ -75,15 +90,17 @@ class TargetChannel {
   void** peer_jetty_output() { return &peer_jetty_; }
 
   Status Shutdown() {
-    // Stop local DMA before releasing any imported target it may reference.
-    if (jetty_handle_ != nullptr && api_.qp_destroy != nullptr) {
-      if (api_.qp_destroy(jetty_handle_)) return Status::Internal("destroy NPU target Jetty failed");
-      jetty_handle_ = nullptr;
+    if (device_initiator_) {
+      // Its SQ may still refer to the remote mailbox after a control timeout.
+      const auto status = DestroyJetty();
+      if (!status.ok()) return status;
     }
     if (peer_jetty_ != nullptr && api_.qp_unimport != nullptr) {
       if (api_.qp_unimport(context_, peer_jetty_)) return Status::Internal("unimport CPU target Jetty failed");
       peer_jetty_ = nullptr;
     }
+    const auto status = DestroyJetty();
+    if (!status.ok()) return status;
     if (cq_handle_ != nullptr && api_.cq_destroy != nullptr) {
       if (api_.cq_destroy(context_, cq_handle_)) return Status::Internal("destroy NPU target CQ failed");
       cq_handle_ = nullptr;
@@ -92,11 +109,20 @@ class TargetChannel {
   }
 
  private:
+  Status DestroyJetty() {
+    if (jetty_handle_ != nullptr && api_.qp_destroy != nullptr) {
+      if (api_.qp_destroy(jetty_handle_)) return Status::Internal("destroy NPU target Jetty failed");
+      jetty_handle_ = nullptr;
+    }
+    return Status::OK();
+  }
+
   const direct_hccp::DirectHccpApi& api_;
   void* context_{nullptr};
   void* cq_handle_{nullptr};
   void* jetty_handle_{nullptr};
   void* peer_jetty_{nullptr};
+  bool device_initiator_{false};
   direct_hccp::CqInfo cq_info_{};
   direct_hccp::QpCreateInfo jetty_info_{};
 };

@@ -32,7 +32,7 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
 segment/token/Jetty 与会话。TCP 监听是无状态的 `RuntimeService`：它只接收连接并
 分发给 Runtime，不拥有硬件资源。
 
-CPU 服务只需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件和 `liburma.so`；不链接
+CPU 服务需要 UB 驱动、`/dev/uburma`、UMDK 公开头文件、`liburma.so` 和 OpenMP；不链接
 或加载 CANN、HCCP、ACL。仓库根目录的统一构建入口会自动拉取固定 UMDK 源码，并在系统
 缺少 `liburma.so` 时只构建所需的 UMDK `urma` target：
 

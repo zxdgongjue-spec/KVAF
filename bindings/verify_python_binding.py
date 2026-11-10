@@ -8,28 +8,29 @@ import argparse
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--require-aiv", action="store_true")
+    parser.add_argument("--require-npu", "--require-aiv", dest="require_npu", action="store_true")
     options = parser.parse_args()
 
     import kvaf
 
-    if options.require_aiv:
+    if options.require_npu:
         if (
             not hasattr(kvaf, "NpuRuntime")
             or not hasattr(kvaf, "DeviceAccessTable")
             or not hasattr(kvaf, "AclGraph")
             or not hasattr(kvaf.NpuRuntime, "batch_free")
+            or not hasattr(kvaf.NpuRuntime, "batch_get")
             or not hasattr(kvaf.NpuRuntime, "start_batch_get_kernel_profile")
             or not hasattr(kvaf.NpuRuntime, "batch_get_kernel_profile")
             or not hasattr(kvaf.NpuRuntime, "stop_batch_get_kernel_profile")
+            or not hasattr(kvaf.NpuRuntime, "prepare_scatter_batch_get")
             or not hasattr(kvaf.NpuRuntime, "start_scatter_profile")
             or not hasattr(kvaf.NpuRuntime, "scatter_profile")
             or not hasattr(kvaf.NpuRuntime, "stop_scatter_profile")
-            or not hasattr(kvaf.NpuRuntime, "prepare_scatter_batch_get")
         ):
             raise RuntimeError(
-                "KVAF AIV binding does not export NpuRuntime, DeviceAccessTable, "
-                "AclGraph, BatchFree, prepared scatter, and BatchGet/scatter profiling"
+                "KVAF NPU binding does not export NpuRuntime, DeviceAccessTable, "
+                "AclGraph, BatchFree, prepared Scatter, and BatchGet profiling"
             )
     return 0
 
