@@ -4,8 +4,8 @@ add_executable(kvaf_startup_selection_test startup_selection_test.cc)
 target_include_directories(kvaf_startup_selection_test PRIVATE
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)
 add_test(NAME kvaf_startup_selection_test COMMAND kvaf_startup_selection_test)
-add_test(NAME kvaf_aiv_test_cleanup_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_test_cleanup.py")
+add_test(NAME kvaf_aiv_test_common_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_test_common.py")
 add_test(NAME kvaf_gather_perf_summary_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_perf_summary.py")
 add_test(NAME kvaf_gather_binding_fastpath_python
@@ -101,10 +101,6 @@ foreach(mode scatter gather)
 endforeach()
 add_test(NAME kvaf_aiv_mode_isolation_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_aiv_mode_isolation.py")
-add_test(NAME kvaf_gather_probe_result_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_probe_result.py")
-add_test(NAME kvaf_scatter_probe_result_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_scatter_probe_result.py")
 
 # Compile hardware Host sources even on development machines without CANN.
 # Object-only: never link the declaration doubles into the production libraries.

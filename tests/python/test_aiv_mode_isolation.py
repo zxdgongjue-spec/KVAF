@@ -2,14 +2,11 @@
 import os
 from pathlib import Path
 import runpy
-import subprocess
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import aiv_batch_get_test_common as common
-import test_aiv_sequential_batch_get as suite
 
 
 class ModeIsolationTests(unittest.TestCase):
@@ -35,9 +32,9 @@ class ModeIsolationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'requires kvaf_gather'):
                     common.kernel_paths('gather_read')
 
-    def test_fixed_entry_ignores_suite_mode_selector(self):
+    def test_fixed_entry_selects_its_own_mode(self):
         for name, mode in (('scatter', 'cpu_push_scatter'), ('gather', 'gather_read')):
-            with patch.dict(os.environ, {'KVAF_AIV_BATCH_GET_MODES': 'invalid'}), \
+            with patch.dict(os.environ, {}), \
                  patch.object(common, 'run', return_value=0) as run:
                 with self.assertRaises(SystemExit) as result:
                     runpy.run_path(str(Path(__file__).with_name(f'test_aiv_{name}_batch_get.py')),
@@ -57,18 +54,6 @@ class ModeIsolationTests(unittest.TestCase):
                     runpy.run_path(str(Path(__file__).with_name('test_aiv_scatter_batch_get.py')),
                                    run_name='__main__')
                 self.assertEqual(result.exception.code, 0)
-
-    def test_suite_runs_next_process_after_failure(self):
-        with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1',
-                                     'KVAF_AIV_BATCH_GET_MODES': 'cpu_push_scatter,gather_read'}), \
-             patch.object(suite.subprocess, 'run', side_effect=[
-                 subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0)]) as run:
-            self.assertEqual(suite.main(), 1)
-            self.assertEqual(run.call_count, 2)
-            commands = [call.args[0] for call in run.call_args_list]
-            self.assertEqual([Path(c[1]).name for c in commands],
-                             ['test_aiv_scatter_batch_get.py', 'test_aiv_gather_batch_get.py'])
-            self.assertTrue(all(c[0] == sys.executable for c in commands))
 
     def test_gather_ignores_scatter_probe(self):
         # Stop at the first hardware import. A scatter-only invalid probe must

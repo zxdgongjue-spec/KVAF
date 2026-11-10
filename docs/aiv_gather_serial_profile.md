@@ -200,8 +200,15 @@ mean、线性插值 p50/p95/p99、min/max、样本标准差/方差/CV。单位 u
 
 ## 排障
 
-先运行 `KVAF_RUN_NPU_TESTS=1 python -u tests/python/test_aiv_gather_pipeline_debug.py`，
-按 ack → wqe → sq → first_read → full 独立子进程验证，首次失败停止；使用性能脚本配置形状。
+使用功能入口逐一设置 KVAF_AIV_GATHER_PROBE=ack/wqe/sq/first_read，每个检查点
+在独立进程运行，首次失败就停止；完整回归清空 PROBE。探针使用 KVAF_NPU_REQUESTS、
+KVAF_NPU_TOKEN_BYTES、KVAF_AIV_GATHER_SGL_SIZE 配置形状。
+
+```bash
+KVAF_AIV_GATHER_PROBE=wqe KVAF_RUN_NPU_TESTS=1 \
+  python -u tests/python/test_aiv_gather_batch_get.py
+```
+
 probe 只代表对应前缀完成，不是完整 BatchGet 成功，也不能用于性能采样。
 
 | 检查点/错误 | 定位范围 |
@@ -232,6 +239,6 @@ KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 KVAF_AIV_GATHER_SGL_SIZE=9 \
   python -u tests/python/test_aiv_gather_batch_get.py
 ```
 
-三组均一条 READ、bank 0、192 B WQE，实际 SGE 数分别 6/7/9；不要用覆盖请求数的 debug 总控。
+三组均一条 READ、bank 0、192 B WQE，实际 SGE 数分别 6/7/9。
 6 通过而 7/9 失败支持操作专用数量限制的判断；单条 9 通过而大批失败则继续查多 WR/队列。
 性能和设备 DMA/CANN 兼容性最终以目标双机回归为准。

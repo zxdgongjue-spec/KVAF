@@ -89,9 +89,9 @@ Python 继续使用统一的 `kvaf.NpuRuntime(..., aiv_batch_get_mode=...)` 和
 | --- | --- | --- |
 | Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
-| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，240 B |
+| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，248 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV4` |
+| Kernel symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV9` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 | 独立测试 | `tests/python/test_aiv_scatter_batch_get.py` | `tests/python/test_aiv_gather_batch_get.py` |
 
@@ -187,7 +187,7 @@ export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.
 ls -l "$KVAF_BATCH_GET_KERNEL" "$KVAF_BATCH_PUT_KERNEL" \
   "$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o" \
   "$PWD/build-npu/bin/kvaf_gather_batch_get_kernels.o"
-# 两个入口固定测试自己的模式，不受 KVAF_AIV_BATCH_GET_MODES 影响。
+# 两个入口分别测试自己的模式。
 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_gather_batch_get.py
 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=3 python tests/python/test_aiv_gather_batch_get.py
 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_gather_batch_get.py
@@ -202,10 +202,7 @@ DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_scatter_batch_get
 CPU `--gather-threads` 至少等于 gather 的 AIV 核数。
 上述命令在仓库根目录执行。单模式测试只检查对应 Get 二进制和 BatchPut，
 不要求另一模式的二进制存在；路径检查失败会在初始化 NPU 前报具体路径。
-兼容入口 `test_aiv_sequential_batch_get.py` 仍支持 `KVAF_AIV_BATCH_GET_MODES`，
-但现在为每种模式启动独立 Python 子进程，即使第一种失败也执行后一种，最后
-汇总非零退出码。这隔离了 Python/ACL 进程状态，不承诺设备故障后自动恢复硬件。
-CTest 也分别注册两个硬件用例。
+CTest 分别注册两个独立硬件入口。
 
 ## 初始化失败的定位
 
@@ -223,7 +220,6 @@ CPU 端现在记录 `CPU_PUSH_START_FAILED session=... reason=...`，区分
 NPU 端可单独运行 scatter 并开启阶段日志：
 
 ```bash
-DEVICE_ID=5 KVAF_NPU_CORE_COUNT=1 KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
   KVAF_AIV_VERBOSE_DIRECT_HCCP=1 \
   python -u tests/python/test_aiv_scatter_batch_get.py > npu-stage1.log 2>&1
 ```
@@ -513,7 +509,6 @@ export PYTHONPATH="$PWD/build-npu/python"
 set -o pipefail
 for stage in done flush setup dma load; do
   KVAF_RUN_NPU_TESTS=1 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 \
-    KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter KVAF_AIV_SCATTER_PROBE="$stage" \
     python -u tests/python/test_aiv_scatter_batch_get.py 2>&1 | tee "scatter-${stage}.log"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -555,7 +550,6 @@ abort 的 context 强行读取状态；保留本轮 `PROBE_BEGIN`、CPU 日志�
 
 ```bash
 KVAF_AIV_SCATTER_PROBE= DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 \
-  KVAF_AIV_BATCH_GET_MODES=cpu_push_scatter \
   python -u tests/python/test_aiv_scatter_batch_get.py
 ```
 
@@ -586,80 +580,13 @@ payload 的 UB→GM。首个 staging 源地址按参数计算为
 跑完整 scatter 回归。若 `load` 仍失败，应保留新 `.o` 和此次异常摘要，并核对
 部署端 CANN 版本、实际头文件和新二进制的故障指令；不能继续沿用旧 `+0xd28`。
 
-### 初始化修正后，异常前移到标量指令
-
-PID 8769、卡 7 的后续日志仍是 `load`（参数末字高 32 位为 3），但异常变为
-`errcode=259`、`SU_ERROR_T0_0=0x8`、`MTE_ERROR_T0_0=0`，修正偏移为
-`+0x148`，kernel hash 为 `2185961939610012134`。这表明初始化修正没有完成
-硬件验收；不能将保留的 `MTE_ERR_INFO=0x34a` 当成当前仍有 MTE 异常的证据。
-偏移靠近入口，优先核对新增 `InitSocState()` 及其编译结果，但在看到匹配的
-汇编前不能把 `+0x148` 直接对应到某个 C++ 调用，更不能判断原 MTE 问题已解决。
-
-这一轮先保留 kernel 逻辑，采集部署端实际编译环境。不要为采集先重编译或
-覆盖故障 `.o`；更新脚本后，在原有 Unix Makefiles 构建目录运行：
-
-```bash
-git pull --ff-only
-python tests/python/collect_aiv_scatter_debug.py build-npu
-```
-
-脚本打印新建的 `build-npu/scatter-debug-*/report.txt` 路径。它不导入
-torch/kvaf，也不运行 NPU kernel；读取 `build.make` 中现有的真实编译命令，
-保留原来的架构、优化和 include 参数，只将编译动作改为 `-E/-dM`，输出
-到独立目录。遇到多个候选命令或不支持的 recipe 会明确拒绝，不猜参数。
-
-采集内容：
-
-- 原部署、链接和临时 `.o` 的副本、SHA-256、时间戳，以及本地源码快照。
-  若设置了 `KVAF_BATCH_GET_KERNEL`，额外保存其实际 sequential 路径；也可用
-  `--kernel /path/to/kernel.o` 明确指定。
-- 实际调用的编译器及其 symlink 解析位置、版本、CMake 选择的头文件路径，
-  可发现的 CANN 版本文件和 `__CCE_AICORE__` / `__NPU_ARCH__` 等宏。
-- 编译器预处理后的完整 `.ii`、实际包含的 common/data-copy 实现头文件、
-  从 `.ii` 提取的 `InitSocState` 与 `InitSocStateImpl` 完整函数体及来源行号。
-  初始化实现所在头文件也会保存，不再受固定头文件名列表限制。
-- 每一步的命令、输出和退出码。某一步失败会保留其他结果并返回
-  `COLLECTION_PARTIAL`，不会误报采集完成或硬件通过。
-
-先提供 `report.txt`。预处理源码只能检查实际启用的 SDK 实现，不能映射故障
-PC；精确 `+0x148` 映射仍须对应原二进制。
-
-### CANN 9.1 采集报告：改为分析已保存的初始化源码
-
-用户提供的 `scatter-debug-ig6ic27m/report.txt` 显示：编译器解析到
-`cann-9.1.0/tools/bisheng_compiler/bin/bisheng`，实际包含的 SDK 头文件也来自
-`cann-9.1.0/aarch64-linux/asc`；当前没有版本混用证据。实际编译选项为
-`--cce-aicore-arch=dav-c310-vec`，预处理宏为 `__CCE_AICORE__=310`、
-`__NPU_ARCH__=3510`。不能仅凭两个宏的数值不同断言架构不匹配。
-driver 报告版本为 `25.6.rc1.b175`；现有材料不足以判断其兼容性。
-已保存的 installed/linked/configured 三份 `.o` 的 SHA-256 一致，但还没有
-取得原二进制 `+0x148` 对应的具体指令。
-
-旧采集脚本的设备侧 `-S` 被编译器明确拒绝，错误为
-`unsupported option '-S' on device side`。这是采集方法不适用，不能据此判断
-NPU 故障原因。旧报告只摘录了调用 `AscendCUtils::InitSocStateImpl()` 的包装
-函数，遗漏了真正实现；完整 `.ii` 已经成功保存，无需再次编译或运行 NPU。
-
-更新脚本后，在仓库根目录分析这次保存的目录：
-
-```bash
-git pull --ff-only
-python tests/python/collect_aiv_scatter_debug.py --analyze build-npu/scatter-debug-ig6ic27m
-```
-
-脚本打印新的 `init-report-*.txt` 路径，提供该文件内容即可。此模式只读取原
-manifest、宏和 `.ii`，按预处理后的有效定义提取初始化函数，保留源文件行号；
-不会调用编译器、读取后来更改的 SDK 头文件、覆盖旧报告或加载 kernel。
-若未找到 `InitSocStateImpl` 函数体会明确返回不完整，包装层不能算采集成功。
-后续新采集也已去掉不支持的 `-S`，不再输出大量无关的头文件保护宏。
-
 ## 当前验证状态
 
 本地无 CANN/NPU，已完成：
 
 - CMake 普通 C++ 构建和现有回归。
 - 拆分隔离回归：独立 loader 的路径/symbol/ABI 和交错调用、缺失另一模式二进制，
-  scatter 增量重编译不改变 gather/direct 产物、独立 Python 入口和组合子进程失败汇总。
+  scatter 增量重编译不改变 gather/direct 产物、独立 Python 入口。
 - Loader 启动参数回归：scatter 的纯 SIMD 动态 UB 参数为 0，direct SIMT
   路径仍为 160 KiB。
 - 候选选择回归覆盖连接回退、本地设备错误停止重试、普通/自适应选择及清理错误

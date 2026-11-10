@@ -495,7 +495,7 @@ def main() -> int:
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
     if os.environ.get("KVAF_AIV_GATHER_PROBE"):
-        print("FAIL: gather prefix probes cannot collect performance; use test_aiv_gather_pipeline_debug.py",
+        print("FAIL: gather prefix probes cannot collect performance; use KVAF_AIV_GATHER_PROBE with test_aiv_gather_batch_get.py",
               file=sys.stderr)
         return 2
     if os.environ.get("KVAF_AIV_GATHER_CHECK_STATUS") == "1":
