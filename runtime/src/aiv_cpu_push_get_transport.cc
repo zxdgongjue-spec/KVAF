@@ -99,6 +99,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
+  token_value_ = setup.token_value;
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
     return Error("query device");
@@ -238,12 +239,22 @@ Status Transport::EnsureGatherStaging(std::uint32_t count) {
     gather_staging_ = nullptr;
     gather_staging_bytes_ = 0;
   }
+  if (!gather_token_) {
+    gather_token_ = urma_alloc_token_id(context_);
+    if (!gather_token_) return Error("allocate gather staging token");
+  }
   void* staging = nullptr;
   if (posix_memalign(&staging, 4096, bytes)) return Error("allocate gather staging");
   urma_seg_cfg_t cfg{};
   cfg.va = reinterpret_cast<std::uint64_t>(staging);
   cfg.len = bytes;
-  cfg.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+  cfg.token_id = gather_token_;
+  cfg.token_value.token = token_value_;
+  cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+  // Match the AICPU CPU-push local buffer registration. The deployed
+  // UMDK headers call access bit 0 LOCAL_WRITE, newer headers LOCAL_ONLY.
+  cfg.flag.bs.access = 1U;
+  cfg.flag.bs.token_id_valid = 1;
   gather_segment_ = urma_register_seg(context_, &cfg);
   if (!gather_segment_) {
     std::free(staging);
@@ -672,6 +683,10 @@ Status Transport::Shutdown() {
   if (gather_segment_) {
     if (urma_unregister_seg(gather_segment_)) return Error("unregister gather staging");
     gather_segment_ = nullptr;
+  }
+  if (gather_token_) {
+    if (urma_free_token_id(gather_token_)) return Error("free gather staging token");
+    gather_token_ = nullptr;
   }
   if (control_) { if (urma_unregister_seg(control_)) return Error("unregister controls"); control_ = nullptr; }
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
