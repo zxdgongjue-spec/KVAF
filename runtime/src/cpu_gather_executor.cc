@@ -3,10 +3,6 @@
 #include <ctime>
 
 namespace kvaf::peer {
-#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
-// Test-only seam for holding a task tail after an earlier prefix is visible.
-void CpuGatherBeforeCopyRange(std::uint64_t begin, std::uint64_t end);
-#endif
 namespace {
 
 std::uint64_t ThreadCpuNs() {
@@ -144,9 +140,6 @@ void CpuGatherExecutor::CopyWorker(std::size_t worker) {
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
   if (offset >= end) return 0U;
-#if defined(KVAF_CPU_GATHER_COPY_TEST_HOOK)
-  CpuGatherBeforeCopyRange(offset, end);
-#endif
   const auto begin = offset;
   const auto index_for_offset = span_bytes_ != 0U
       ? offset / span_bytes_

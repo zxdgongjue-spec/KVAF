@@ -189,22 +189,10 @@ entry，`offsets[i]` 给出 entry 内
 默认 enqueue-only 调用由调用方在同一 stream 上的后续工作或自身同步决定何时观察
 完成。参数校验、ACL 分配/提交和显式 stream 同步失败仍以 Runtime 错误返回。
 
-## 测试
+## 构建与验证
 
-默认测试均由 Python 脚本定义场景和断言，并直接调用 pybind 的
-`kvaf.Runtime`；没有 C++ Mock driver 或子进程协议：
-
-```bash
-cmake -S . -B build -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=ON
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-```
-
-`tests/python/test_runtime_mock.py` 可以直接编辑；其中覆盖 Runtime 初始化、
-Put/Get 生命周期、AccessTable 锁定、slot 回收、参数校验和 Operator 失败回滚。
-脚本会以 `try/except` 探测 `torch_npu`、MPS、CPU 和无 PyTorch 环境：MPS 可用时
-用于在本机生成 caller-side 测试数据，然后直接传给 CPU Mock。MPS 不是 CANN
-AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
+构建只生成 Runtime、Host、kernel 和 Python binding，不再编译独立模型/单元测试。
+Python binding 保留构建后导入检查；真机功能、性能脚本保留，按下文直接运行。
 
 ## A5 / CANN BatchGet 集成
 
@@ -276,7 +264,7 @@ teardown 前完成每个使用过的 stream。只有排障或单独等待时才�
 `PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口
 从 `Runtime.BatchGet` 调用开始，到 AIV adapter 中的 stream 同步完成结束，排除
 DDR 注册、Device buffer 初始化和 Host-to-Device 表更新。输出包括 mean、p50、
-p90、p99 和 useful GiB/s。`ctest` 和上面的命令均设置 240 秒上限；未设置
+p90、p99 和 useful GiB/s。未设置
 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
 
 `DIRECT_LOCAL_BUFFER_ACQUIRE_NEW` 会始终记录新的 output HBM 注册；高频的
@@ -299,13 +287,11 @@ BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因�
 测试规模复用 BatchGet 的 `KVAF_NPU_REQUESTS`、`KVAF_NPU_TOKEN_BYTES`、
 `KVAF_NPU_TOKENS_PER_BLOCK`、
 `KVAF_NPU_CORE_COUNT`、`KVAF_NPU_JETTYS_PER_CORE`、`KVAF_NPU_WARMUP` 和
-`KVAF_NPU_ITERATIONS`。启用 `BUILD_TESTING` 后，该脚本也会注册为
-`kvaf_npu_batch_put_python`；没有设置 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
+`KVAF_NPU_ITERATIONS`。没有设置 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
 
 ## NPU Runtime 性能脚本
 
-`tests/python/test_npu_runtime_perf.py` 是独立的 steady-state 性能脚本，不纳入
-`ctest`。它分别测量：固定 128-key batch 的 `BatchPut`、一次全量
+`tests/python/test_npu_runtime_perf.py` 是独立的 steady-state 性能脚本。它分别测量：固定 128-key batch 的 `BatchPut`、一次全量
 `PrepareAccessTable`、一次全量 `access_table_view(device="npu")`、token 级随机请求
 的 `BatchGet`、全量 `ReleaseAccessTable`，以及 128-key batch 的 `BatchFree`。
 BatchGet/Put 的每个样本均在 Runtime 调用后由调用方 `torch.npu.synchronize()`

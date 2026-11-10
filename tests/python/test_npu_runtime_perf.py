@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NPU Runtime steady-state performance benchmark.
 
-This is intentionally a direct Python/pybind benchmark, not a CTest case.
+This is a standalone Python/pybind benchmark.
 Source request plans are created before the timed loops, BatchGet tensors are
 derived immediately before each call, and every sample ends with an external
 NPU stream synchronize.

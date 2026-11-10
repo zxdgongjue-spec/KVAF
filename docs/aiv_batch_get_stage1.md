@@ -194,7 +194,7 @@ DEVICE_ID=7 KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_gather_batch_get.
 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_scatter_batch_get.py
 ```
 
-两个入口复用 `aiv_batch_get_test_common.py` 中的数据准备和校验，使用 8193
+两个入口复用 `aiv_batch_get_regression.py` 中的数据准备和校验，使用 8193
 请求容量，覆盖空批次、尾批、重复调用、
 随机输出、重复源、guard、A/B/A 输出、两种 Tensor 重载以及跨 stream 顺序复用。
 可用 `KVAF_NPU_TOKEN_BYTES=13`、`KVAF_NPU_REQUESTS=65536`、
@@ -202,7 +202,7 @@ DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_scatter_batch_get
 CPU `--gather-threads` 至少等于 gather 的 AIV 核数。
 上述命令在仓库根目录执行。单模式测试只检查对应 Get 二进制和 BatchPut，
 不要求另一模式的二进制存在；路径检查失败会在初始化 NPU 前报具体路径。
-CTest 分别注册两个独立硬件入口。
+两个真机入口按上述命令直接运行。
 
 ## 初始化失败的定位
 
@@ -582,32 +582,9 @@ payload 的 UB→GM。首个 staging 源地址按参数计算为
 
 ## 当前验证状态
 
-本地无 CANN/NPU，已完成：
-
-- CMake 普通 C++ 构建和现有回归。
-- 拆分隔离回归：独立 loader 的路径/symbol/ABI 和交错调用、缺失另一模式二进制，
-  scatter 增量重编译不改变 gather/direct 产物、独立 Python 入口。
-- Loader 启动参数回归：scatter 的纯 SIMD 动态 UB 参数为 0，direct SIMT
-  路径仍为 160 KiB。
-- 候选选择回归覆盖连接回退、本地设备错误停止重试、普通/自适应选择及清理错误
-  不覆盖原始失败。
-- 生产 `.asc` 的 CPU 模型执行：解码 SQ/CQ，调用真实 CPU gather executor，
-  比较全部 output/guard。覆盖 1/3/8 核、1/13/656/4096/65535 B token、
-  1～6 SGE、65536 请求、SQ/CQ 回绕、旧序号、非法行、超时及控制/数据 CQ 错误。
-- payload 搬运模型延迟执行 MTE2/MTE3，验证同步后可见及单 UB 复用；覆盖
-  GM 地址的 64 种对齐余数、1～65535 B 尾部和 16 KiB 分块边界、重复源更新、
-  output 与 UB 边界 guard。模型不替代真实 CANN 编译和设备异常检查。
-- 真实 Host owner 的延迟 ACL 模型：串行复用、异步错误上报、capture 拒绝、
-  部分初始化和关闭失败时资源保留/重试。Host 集成源码使用 ACL 声明替身编译。
-- Scatter 六个检查点的模型覆盖：真实 notify/done 流程、1/3/8 核、656/16385 B
-  token、重复序号、预期 DMA 次数、output guard、空请求/非法模式/超时拒绝；
-  分别检查普通模式配置、S→MTE2/MTE2→S 等待次数，以及 UB 标量读取次数；
-  注入损坏 UB 时，dma 仅报告搬运完成，load 必须报告内容不匹配。
-  Host 覆盖旧 kernel、错误 phase、设备错误保留、同步要求和诊断后的资源回收。
-  Python 检查只接受对应 checkpoint 标记及匹配字节数，不吞掉 507015 或其他异常。
-- 新增内核模型和 Host 生命周期测试通过 AddressSanitizer / UndefinedBehaviorSanitizer。
-- CPU 新源码使用 UMDK 24.12 头文件通过语法检查；macOS 检查时仅补充 Linux
-  的 `MADV_HUGEPAGE` 常量，未链接或执行 CPU 硬件服务。
+独立模型/单元回归及其构建目标已移除。保留真机入口和性能采集，构建后应在
+目标 K/N 双机执行 payload/guard、重复调用及所需边界组合，不能以普通 C++ 构建
+成功代替 CANN 编译、DMA 可见性或设备性能验收。
 
 用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后撤回入口操作的独立
 gather 也已反馈成功（所给命令为 1 核）。scatter 探针此前反馈 flush 完成、

@@ -123,24 +123,6 @@ stateDiagram-v2
     Committed --> Reclaimed: BatchFree
 ```
 
-## 测试与验证
-
-测试文件：[in_memory_meta_manager_test.cc](C:/Urma/KVAF/meta_manager/tests/in_memory_meta_manager_test.cc:1)
-
-已覆盖：
-
-- region 注册与参数校验
-- `PreparePut -> CommitPut -> LockKeys -> BatchLookup -> UnlockKeys -> BatchFree`
-- `AbortPut` 回滚
-- pinned record 的 `kBusy`
-- slot 耗尽、非法上下文、重复释放等边界场景
-
-已在 Ubuntu 环境完成构建和测试验证：
-
-- `cmake -S . -B build-wsl -DBUILD_TESTING=ON`
-- `cmake --build build-wsl -j`
-- `ctest --test-dir build-wsl --output-on-failure`
-
 ## 后续建议
 
 1. 接入 Runtime 的 `BatchPut / BatchGet / Delete`

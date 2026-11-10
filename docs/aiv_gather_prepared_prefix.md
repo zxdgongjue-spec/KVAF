@@ -162,11 +162,10 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 
 ## 验证边界
 
-本地测试覆盖生产 kernel 模型、Host/loader、Python 快路径、CPU 并发发布、profile/CSV：
-空批/空 lane、重复调用、切 stream、所有 SGL/尾项、64 KiB 快速/Scalar 边界、SQ/CQ 环回、
-大小队列、部分 bank 提交、进度 CQ/VF 延迟、ACK 与数据 CQ 重叠、协作块及 D/N 组合、
-前缀空洞/回退/越界/旧序号、CPU/CQ 错误、超时和失败后资源保留。
-关闭 profile 的模型同时检查无诊断时钟读取。
+独立模型/单元回归及其构建目标已移除；保留生产 ABI 静态断言和 Python binding
+构建后导入检查。真机功能入口、性能脚本及 CPU 日志分析工具继续保留，性能入口
+只依赖 `aiv_batch_get_common.py` 的路径解析与安全退出辅助函数。
 
-模型不能证明 CANN 指令生成、设备缓存/DMA 可见性、opcode 专用 SGE 支持或实际性能收益。
-性能验收仍需目标 K/N 双机，方法见 [性能与排障](aiv_gather_serial_profile.md)。
+验证时应覆盖空批/重复输入/切 stream、SGL 与 64 KiB 边界、旧前缀与协作 D/N 组合、
+SGE 合并、profile 开关和错误退出；CANN 编译、设备缓存/DMA 可见性、opcode 专用
+SGE 支持及性能收益仍需目标双机确认，方法见 [性能与排障](aiv_gather_serial_profile.md)。

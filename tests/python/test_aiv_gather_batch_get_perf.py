@@ -35,7 +35,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from aiv_batch_get_test_common import kernel_paths, shutdown_runtime
+from aiv_batch_get_common import kernel_paths, shutdown_runtime
 
 
 STAGE_BOUNDARIES = (

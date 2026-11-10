@@ -70,14 +70,6 @@ CQE、检查点和标量调度都有成本，性能改善需在 A5 上验证。
 
 ## 验证
 
-本地 CTest 增加 `kvaf_batch_get_schedule_test`、`kvaf_batch_get_kernel_model_test`
-和 `kvaf_batch_get_inflight_config_python`，无需 CANN。调度测试直接使用 Kernel 的
-分组策略，检查独立推进的多核总预算、奇数预算、尾组、64 Jetty 轮转和边界计数；
-Kernel CPU 模型直接包含实际 `.asc` 源码，以同步 UB copy/SIMT 和延迟生成 CQE
-执行控制流，验证完整 payload、SQ/CQ owner 环回、索引持久化、尾组、多 Jetty
-及超时/CQ 错误后的复用拒绝。模型使用较小 CQ 深度加速环回；它不能验证真实
-AIV pipeline、DMA 可见性、硬件保序或 CANN 编译兼容性。
-
 在 A5 上整体重编后，开启现有 eager/graph 集成测试的边界扫描：
 
 ```bash
