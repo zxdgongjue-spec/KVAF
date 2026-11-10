@@ -183,7 +183,8 @@ Runtime 统一定位已安装的 AICPU 包；脚本不再接受 `--kernel-json`�
 多候选验证可追加 `--npu-eids "实际EID1,实际EID2"`。若要检查失败回退，第一项应是
 格式合法但对当前连接不可用的候选，后面放已确认可用的候选，并检查最终选中 EID 的日志。
 
-每个 worker 配置的通过日志包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
+每个 worker 配置的通过日志包含 mean、p50、p95、p99（µs，小数点后 1 位），以及 mean、p50、p99
+耗时对应的有效载荷 GB/s（小数点后 3 位）。`GBps` 保留为 `mean_GBps` 的兼容字段。
 计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
 输入准备、BatchPut、AccessTable 创建与上传、输出下载和正确性检查均在计时之外。
 正常带宽统计不启用 profile。需要定位阶段耗时时，在同一命令末尾加 `--profile-rounds 100`：
@@ -237,10 +238,17 @@ Shell 脚本循环调用
 | miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
 | workers | 1、2、4、5 |
 
-每组预热 10 轮、测量 100 轮，均开启 profile。汇总输出算子时间和各阶段耗时，
-不把该采样带宽等同于正确性脚本中关闭 profile 的 Python 端到端带宽。
-只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
-算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段每轮取 worker 最大耗时，再对测量轮次求均值。
+每组预热 10 轮、测量 100 轮，均开启 profile。主指标计时从 Python 调用
+`runtime.batch_get(..., synchronize=True)` 开始，到同步完成并返回结束，
+包含 Python 绑定、Host 提交、CPU/AICPU 执行、stream 同步以及 profile 回传和结果字典构造。
+数据和请求准备、BatchPut、建表、输出校验及预热轮次均不进入主指标。
+此计时边界与正确性脚本相同，本扫描额外开启 profile，相关开销也计入端到端时间。
+终端和 CSV 同时记录 mean、p50、p99 端到端耗时及对应带宽，
+`metric=python_batch_get_to_stream_completion`：
+`GBps = token_bytes × miss_count / 对应耗时(µs) / 1000`。
+`mean_GBps` 使用平均耗时计算；`p99_GBps` 对应 P99 耗时，是尾延迟对应的较低带宽，
+不是逐轮带宽的第 99 百分位。分位耗时沿用按排序位置线性插值的计算方式。
+辅助阶段耗时继续使用算子内部 profile，每轮取 worker 最大耗时，再对测量轮次求均值。
 
 通信 DDR 总预算固定为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
 按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
@@ -275,15 +283,18 @@ CPU 线程预算和外部 CPU/NUMA 限制在同一次扫描中保持一致；SGL
 
 上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
 请求准备包含地址查表、填写地址/长度清单及发送前的清单缓存维护；READ 下的子项包含在 READ 总时间内。
-阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
+阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为端到端时间。
 
-CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列为均值，算子耗时列为 P50：
+CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列为均值，端到端耗时包含 mean、p50、p99：
 
 | 表头 | 含义 |
 | --- | --- |
 | source_mode | `table` 为查表输入，`direct` 为本轮完整源地址输入 |
 | token_bytes / miss_count / workers | 测试配置 |
-| device_p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
+| metric | `python_batch_get_to_stream_completion`，Python 调用至同步完成返回 |
+| mean_us / mean_GBps | 平均端到端耗时及对应的有效载荷带宽 |
+| p50_us / p50_GBps | 端到端耗时中位数及对应的有效载荷带宽 |
+| p99_us / p99_GBps | 端到端 P99 耗时及对应的有效载荷带宽 |
 | lookup_table_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
 | prepare_request_us | 裸地址模式下替代 `lookup_table_us`：顺序读取源地址、填写清单并清理清单缓存 |
 | address_send_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
@@ -294,8 +305,12 @@ CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列�
 | post_us | provider 编码、SQ 写入及 doorbell |
 | cq_wait_us | 等待已提交 READ 完成 |
 
-`build_wqe_us`、`cpu_gather_wait_us`、`post_us` 和 `cq_wait_us` 已经包含在 `read_total_us` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
-耗时保留 1 位小数，带宽为十进制 GB/s。上述 8 个阶段字段表示均值（微秒），`device_p50_us` 表示算子耗时中位数（微秒）。`lookup_table_us` 沿用请求准备阶段打点，包含查表、填清单和清单缓存维护；`cpu_gather_wait_us` 是 AICPU 等待就绪前缀的时间，不是 CPU gather 的独立执行耗时。
+`build_wqe_us`、`cpu_gather_wait_us`、`post_us` 和 `cq_wait_us` 已经包含在 `read_total_us` 中。
+这些是内部阶段均值，不与端到端统计相加。
+耗时保留 1 位小数，带宽为十进制 GB/s，保留 3 位小数。上述 8 个阶段字段表示均值（微秒）；
+`mean_us`、`p50_us`、`p99_us` 分别表示端到端平均、P50、P99 耗时。
+`lookup_table_us` 沿用请求准备阶段打点，包含查表、填清单和清单缓存维护；
+`cpu_gather_wait_us` 是 AICPU 等待就绪前缀的时间，不是 CPU gather 的独立执行耗时。
 
 当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
 把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。

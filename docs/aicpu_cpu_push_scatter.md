@@ -121,6 +121,8 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 脚本每轮重新写入源数据和输入元数据，比较整个输出，并用后继 NPU 算子消费输出。
 预检包括部分/空 `miss_count`、两种 Tensor 重载和异步调用。
 需要阶段耗时时增加 `--profile-rounds 100`；采样轮次不计入正常带宽。
+通过日志同时输出 mean、p50、p99 耗时和对应的 `mean_GBps`、`p50_GBps`、`p99_GBps`；
+原有 `GBps` 字段保留为平均耗时对应带宽。
 验证多 EID 候选可追加 `--npu-eids "实际EID1,实际EID2"`，或设置 `KVAF_NPU_EIDS`。
 后者由脚本解析再传给 Runtime。若要验证失败回退，将格式合法但对当前连接不可用的
 候选放在前面，已确认可用的候选放在后面，并检查 `UMDK_EID_SELECTED` 日志。
@@ -138,14 +140,22 @@ CPU 服务启动后，在加载 CANN 环境的终端运行：
 默认与 GatherRead sweep 一样扫描 252 组：token 为 128、256、512、656、1024、2048、4096 B，
 miss_count 为 32、64、128、256、512、1024、2048、4096、8192，worker 为 1、2、4、5。
 每组预热 10 轮、测量 100 轮，均开启 profile。
-该采样带宽与正确性脚本中关闭 profile 的 Python 端到端带宽具有不同计时范围。
+主指标从 Python 调用 `runtime.batch_get(..., synchronize=True)` 开始，
+到同步完成并返回结束，包含 Python 绑定、Host 提交、CPU/AICPU 执行、stream 同步，
+以及 profile 回传和结果字典构造。数据和请求准备、BatchPut、建表、输出校验与预热轮次不计入。
+此计时边界与正确性脚本相同，本扫描额外开启 profile，相关开销也计入端到端时间。
 
 源数据池按 100 GiB DDR 预算初始化一次，每块默认 128 个 token；CPU push 的 staging 和地址清单在 HBM，
 不从 DDR 预算扣除 GatherRead 工作区。每轮有放回随机选择源 token，随机选择互不重复的输出行，
 输入和输出行数为 `max(32768, miss_count)`，逐轮校验整个输出及未写入行。
 `--table-capacity` 可缩小源池；与 GatherRead 对比时可指定相同容量。
 
-主指标为 `device_p50_us` 和 `p50_GBps`，带宽按有效字节数除以算子 P50 计算。
+终端和 CSV 同时输出 `mean_us / mean_GBps`、`p50_us / p50_GBps`、`p99_us / p99_GBps`，
+以及 `metric=python_batch_get_to_stream_completion`。
+每个带宽按 `token_bytes × miss_count / 对应端到端耗时(µs) / 1000`
+计算，耗时保留 1 位小数，十进制 GB/s 保留 3 位小数。
+`mean_GBps` 使用平均耗时计算；`p99_GBps` 使用 P99 耗时计算，表示尾延迟对应的较低带宽，
+不是逐轮带宽的第 99 百分位。分位耗时沿用按排序位置线性插值的计算方式。
 各阶段每轮取 worker 最大值，再对测量轮次求均值：`lookup_table_us`、`notify_cpu_us`、
 `push_total_us`、`ready_wait_us`、`scatter_us`、`done_wait_us`。
 ready 等待和 scatter 包含在 push 总时间内，各阶段最大值不能相加。

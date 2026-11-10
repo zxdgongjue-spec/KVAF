@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark AICPU BatchGet with full-pool random sources and random output rows."""
+"""Benchmark end-to-end AICPU BatchGet with full-pool random sources and random output rows."""
 from __future__ import annotations
 
 import argparse
@@ -89,8 +89,11 @@ def token_pattern(torch, token_ids, byte_ids):
 
 
 def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
-    device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
-    summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
+    timing = timing_stats([sample["python_call_us"] for sample in profiles], payload_bytes)
+    summary = dict(metric="python_batch_get_to_stream_completion",
+                   mean_us=timing["mean_us"], mean_GBps=timing["mean_GBps"],
+                   p50_us=timing["p50_us"], p50_GBps=timing["p50_GBps"],
+                   p99_us=timing["p99_us"], p99_GBps=timing["p99_GBps"])
     phases = (
         ("lookup_table_us", "request_us"),
         ("address_send_us", "source_write_us"),
@@ -117,8 +120,11 @@ def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
 def print_measurements(a, summary, *, mode="gather_read"):
     prefix = PREFIXES[mode]
     source_label = " source_mode=table" if mode == "gather_read" else ""
-    print(f"{prefix}_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
-          f"p50_GBps={summary['p50_GBps']:.3f}{source_label} phase_aggregation=mean_of_per_round_worker_max")
+    print(f"{prefix}_PROFILE metric={summary['metric']} mean_us={summary['mean_us']:.1f} "
+          f"mean_GBps={summary['mean_GBps']:.3f} "
+          f"p50_us={summary['p50_us']:.1f} p50_GBps={summary['p50_GBps']:.3f} "
+          f"p99_us={summary['p99_us']:.1f} p99_GBps={summary['p99_GBps']:.3f}"
+          f"{source_label} phase_aggregation=mean_of_per_round_worker_max")
     if mode == "gather_read":
         request_field = "lookup_table_us"
         print(f"  {request_field}={summary[request_field]:.1f} | "
@@ -140,7 +146,7 @@ def print_measurements(a, summary, *, mode="gather_read"):
         result = dict(source_mode="table", **result)
     fields = []
     for key, value in result.items():
-        formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
+        formatted = f"{value:.3f}" if key.endswith("_GBps") else f"{value:.1f}" if isinstance(value, float) else str(value)
         fields.append(f"{key}={formatted}")
     print(f"{prefix}_RESULT " + " ".join(fields), flush=True)
 
@@ -188,6 +194,8 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         stream.synchronize()
         begin = time.perf_counter_ns()
         measured = runtime.batch_get(*inputs, stream=stream, synchronize=True, profile=profile)
+        # synchronize=True has completed the stream before returning. Stop the
+        # end-to-end timer before output verification or profile bookkeeping.
         elapsed_us = (time.perf_counter_ns() - begin) / 1000
         # NPU comparison consumes BatchGet results and checks every row, including untouched rows.
         if not torch.equal(output, expected):
