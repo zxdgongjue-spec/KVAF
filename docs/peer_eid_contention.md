@@ -113,6 +113,45 @@ core 1 / Jetty 0 -> peer EID 1
 `reason=jetty_capacity` 表示因 Jetty 总数不足而截取。配置、建链和 CSV 都使用同一生效列表，
 `requested_peer_eids` 保留原候选列表。此规则无需随机选择，调整候选列表顺序即可控制使用哪些 EID。
 
+## 两条 NPU→CPU 流，每条流使用两个 CPU EID
+
+`run_concurrent_batch_get.py` 可以同时启动两条流，并为每条流单独指定本地 NPU EID
+和远端 CPU EID 列表。两条流完成初始化和预热后，再同步开始测量；每条流内部沿用
+`run_peer_eid_sweep.py` 所用 benchmark 的多 CPU EID kernel 路径。
+
+下面以 NPU7 和 NPU6 共同访问同一对 CPU EID 为例。先把 `CPU_EID_0`、`CPU_EID_1`、
+`NPU7_EID`、`NPU6_EID` 设置为目标机的实际 EID，并设置 `KVAF_CPU_SERVICE_ADDR`：
+
+```bash
+FLOW_ARGS="--token-bytes 656 --miss-count 8192 --aiv-cores 1 --jettys-per-core 4 --table-capacity 16384 --warmup 3 --iterations 100"
+
+python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
+    --flow1-device 7 --flow2-device 6 \
+    --flow1-npu-eid "$NPU7_EID" --flow2-npu-eid "$NPU6_EID" \
+    --flow1-peer-eids "$CPU_EID_0,$CPU_EID_1" \
+    --flow2-peer-eids "$CPU_EID_0,$CPU_EID_1" \
+    --flow1-priorities 3 --flow2-priorities 13 \
+    --flow1-args="$FLOW_ARGS" --flow2-args="$FLOW_ARGS" \
+    --output-dir results/two-flows-dual-eid-001
+```
+
+这里每条流有一个本地 NPU EID、两个远端 CPU EID。每条流的 4 个 Jetty 按
+`CPU_EID_0, CPU_EID_1, CPU_EID_0, CPU_EID_1` 分配，`miss-count=8192` 是该条流
+两个 CPU EID 的请求总数。两条流的设备、EID 列表、优先级和 shape 都可以分别配置；
+若在同一 NPU 上启动两条流，把两个 device 和本地 NPU EID 都设为该卡对应的值。
+
+`--flow*-args` 使用 benchmark 参数名 `--aiv-cores`、`--jettys-per-core`，每条流仍只跑
+一个 shape。新参数优先于其中的 `--peer-eids`、`--npu-eids`；旧的透传写法仍然可用。
+CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 EID，因此使用两个 CPU EID
+需保证每条流的 `aiv-cores * jettys-per-core >= 2`。上例每个 core 都有两个 EID 的流量。
+
+结果分别保存在 `output-dir/flow1`、`output-dir/flow2`。原有 shape 日志、Jetty CSV
+和两个汇总 CSV 保持原名；指定 CPU EID 后，每条流额外生成自己的 `peer_samples.csv`，
+自动覆盖 `--flow*-args` 中指定的 peer CSV 路径，避免两条流写入同一个文件。
+分别检查两份日志的两条 `PEER_EID_TRAFFIC` 和 `PEER_EID_CONCURRENCY`，以及两个
+`peer_samples.csv` 中是否都有预期的 CPU EID。同步启动只对齐首次测量的开始，
+后续迭代由各流独立运行。
+
 ## 参数和测量口径
 
 ### 一次测试多个组合

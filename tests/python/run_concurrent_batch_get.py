@@ -21,6 +21,7 @@ import threading
 import time
 
 import test_npu_batch_get_perf as perf
+from npu_eids import parse_npu_eids
 
 
 def parse_args(argv=None):
@@ -36,6 +37,11 @@ def parse_args(argv=None):
 Each --flow*-args string uses the existing benchmark options, without shell
 evaluation. Priority lists use the existing KVAF_BATCH_GET_JETTY_PRIORITIES
 semantics. The original sweep enables kernel profiling and manages CSV paths.
+For two CPU EIDs per flow, set --flow1-peer-eids EID0,EID1 and
+--flow2-peer-eids EID0,EID1, with --flow1-npu-eid and --flow2-npu-eid selecting
+one local NPU EID each. These options override EIDs in --flow*-args.
+Each peer-enabled flow writes its own peer_samples.csv under its output directory.
+Use at least two total Jettys per flow to select both CPU EIDs.
 Select a fixed peer device; adaptive calibration is not part of this launcher.
 KVAF_REMOTE_CPU_PERF_TIMEOUT (default 600 seconds) also bounds startup/waiting.
 Existing flow output directories are refused to prevent overwriting results.
@@ -44,6 +50,10 @@ Existing flow output directories are refused to prevent overwriting results.
     parser.add_argument("--output-dir", type=Path, required=True)
     for name in ("flow1", "flow2"):
         parser.add_argument(f"--{name}-device", type=int, required=True)
+        parser.add_argument(f"--{name}-peer-eids", type=parse_npu_eids,
+                            help="comma-separated CPU EIDs, as in run_peer_eid_sweep.py")
+        parser.add_argument(f"--{name}-npu-eid", type=parse_npu_eids,
+                            help="one local NPU EID for this flow's device")
         parser.add_argument(f"--{name}-priorities",
                             default=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES") or "15")
         parser.add_argument(f"--{name}-args", default="", help="quoted original benchmark options")
@@ -51,17 +61,32 @@ Existing flow output directories are refused to prevent overwriting results.
     for name in ("flow1", "flow2"):
         if getattr(args, f"{name}_device") < 0:
             parser.error(f"{name}-device must be non-negative")
+        peers = getattr(args, f"{name}_peer_eids")
+        npu = getattr(args, f"{name}_npu_eid")
+        if peers is not None and not peers:
+            parser.error(f"{name}-peer-eids must contain at least one CPU EID")
+        if npu is not None and len(npu) != 1:
+            parser.error(f"{name}-npu-eid must contain exactly one NPU EID")
     return args
 
 
 def build_flow(args, name):
     """Reuse benchmark parsing and the original shell's single-shape output path."""
     options = shlex.split(getattr(args, f"{name}_args"))
+    for suffix, option in (("peer_eids", "--peer-eids"), ("npu_eid", "--npu-eids")):
+        eids = getattr(args, f"{name}_{suffix}")
+        if eids is not None:
+            options.extend([option, ",".join(eids)])
     # Match the sweep's clock default, while allowing a per-flow CLI override.
     options = ["--kernel-profile-clock-mhz",
                os.environ.get("KVAF_BATCH_GET_KERNEL_CLOCK_MHZ", "1000"),
                *options, "--kernel-profile"]
     benchmark = perf.parse_args(options)
+    output = args.output_dir.resolve() / name
+    if benchmark.peer_eids:
+        # Keep peer reports isolated even when both flows inherit the same options.
+        benchmark.peer_csv = str(output / "peer_samples.csv")
+        options.extend(["--peer-csv", benchmark.peer_csv])
     error = perf.validate_args(benchmark)
     if error:
         raise ValueError(f"{name}: {error}")
@@ -71,7 +96,6 @@ def build_flow(args, name):
     if any(not re.fullmatch(r"[0-9]+", value.strip()) or not 0 <= int(value) <= 15
            for value in priorities):
         raise ValueError(f"{name}: priorities must be a comma-separated list in [0, 15]")
-    output = args.output_dir.resolve() / name
     env = dict(os.environ, DEVICE_ID=str(getattr(args, f"{name}_device")),
                PYTHONUNBUFFERED="1",
                KVAF_BATCH_GET_JETTY_PRIORITIES=",".join(str(int(p)) for p in priorities),

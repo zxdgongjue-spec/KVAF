@@ -23,6 +23,7 @@ from unittest.mock import patch
 import batch_get_jetty_profile as jetty_profile
 import run_concurrent_batch_get as launcher
 import test_npu_batch_get_perf as perf
+from npu_eids import peer_eid_path
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +32,11 @@ FLOW_ARGS = ("--token-bytes 656 --miss-count 8192 --aiv-cores 1 --jettys-per-cor
 STEM = "token_bytes_656_miss_count_8192_aiv_cores_1_jettys_per_core_4"
 OUTPUTS = {STEM + ".log", STEM + ".jetty.csv",
            "batch_get_miss_sweep_summary.csv", "batch_get_jetty_summary.csv"}
+PEERS = ["1" * 32, "2" * 32]
+NPU_EIDS = ["3" * 32, "4" * 32]
+PEER_OPTIONS = [option for index in range(2) for option in (
+    f"--flow{index + 1}-peer-eids", ",".join(PEERS),
+    f"--flow{index + 1}-npu-eid", NPU_EIDS[index])]
 
 
 def worker(mode, output):
@@ -89,6 +95,16 @@ def fake_perf(argv):
     print("JETTY_PROFILE_TABLE")
     print("original table row")
     print(f"BATCH_GET_JETTY_CSV_WRITTEN path={args.jetty_csv} rows={len(rows)}")
+    if args.peer_eids:
+        profiles = [{"jettys": [dict(
+            eid_path=peer_eid_path(core, slot, args.aiv_cores,
+                                   args.jettys_per_core, len(args.peer_eids)),
+            requests=128, completion_count=1,
+            first_doorbell_cycle=10 + slot, last_doorbell_cycle=20 + slot,
+            first_completion_cycle=100 + slot, last_completion_cycle=200 + slot)
+            for slot in range(args.jettys_per_core)]} for core in range(args.aiv_cores)]
+        perf.peer_eid_profile.report([profiles], args.peer_eids, args.aiv_cores,
+                                    args.jettys_per_core, args.token_bytes, args.peer_csv)
     return 0
 
 
@@ -102,13 +118,13 @@ class ConcurrentFixture(unittest.TestCase):
         self.env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
                         KVAF_REMOTE_CPU_PERF_TIMEOUT="10")
 
-    def args(self, device2=7, options=FLOW_ARGS):
+    def args(self, device2=7, options=FLOW_ARGS, extra=()):
         with patch.dict(os.environ, self.env, clear=True):
             return launcher.parse_args([
                 "build-npu", "--output-dir", str(self.output / "pair"),
                 "--flow1-device", "7", "--flow2-device", str(device2),
                 "--flow1-priorities", "3", "--flow2-priorities", "13",
-                "--flow1-args=" + options, "--flow2-args=" + options])
+                "--flow1-args=" + options, "--flow2-args=" + options, *extra])
 
     def flows(self, mode1="normal", mode2="slow"):
         return [(name, [sys.executable, "-B", str(Path(__file__).resolve()),
@@ -125,6 +141,58 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
+    def test_each_flow_passes_both_cpu_eids_and_its_own_npu_eid(self):
+        for dedicated_options in (False, True):
+            with self.subTest(dedicated_options=dedicated_options):
+                args = self.args(device2=6, extra=PEER_OPTIONS if dedicated_options else ())
+                # Explicit per-flow flags win over both nested options and the environment.
+                for index, name in enumerate(("flow1", "flow2")):
+                    source = "5" * 32 if dedicated_options else NPU_EIDS[index]
+                    peers = ["6" * 32] if dedicated_options else PEERS
+                    setattr(args, f"{name}_args", FLOW_ARGS +
+                            f" --peer-eids {','.join(peers)} --npu-eids {source} --peer-csv shared.csv")
+                with patch.dict(os.environ, dict(self.env, KVAF_NPU_EIDS="7" * 32), clear=True):
+                    flows = [launcher.build_flow(args, name) for name in ("flow1", "flow2")]
+                for index, (name, command, env) in enumerate(flows):
+                    parsed = perf.parse_args(command[3:])
+                    self.assertIsNone(perf.validate_args(parsed))
+                    self.assertEqual(parsed.peer_eids, PEERS)
+                    self.assertEqual(parsed.npu_eids, [NPU_EIDS[index]])
+                    self.assertEqual(Path(parsed.peer_csv), args.output_dir / name / "peer_samples.csv")
+                    self.assertEqual(env["DEVICE_ID"], str((7, 6)[index]))
+                    self.assertEqual(env["KVAF_BATCH_GET_JETTY_PRIORITIES"], ("3", "13")[index])
+
+    def test_invalid_per_flow_eids_fail_before_launch(self):
+        for extra in (["--flow1-peer-eids", ""], ["--flow1-peer-eids", "bad"],
+                      ["--flow1-peer-eids", ",".join([PEERS[0]] * 2)],
+                      ["--flow1-npu-eid", ""], ["--flow1-npu-eid", ",".join(NPU_EIDS)]):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                self.args(extra=extra)
+        args = self.args(extra=["--flow1-peer-eids", ",".join(PEERS)])
+        with patch.dict(os.environ, self.env, clear=True), self.assertRaisesRegex(ValueError, "one npu-eid"):
+            launcher.build_flow(args, "flow1")
+
+    def test_dual_peer_workers_synchronize_and_write_separate_reports(self):
+        args = self.args(device2=6, extra=PEER_OPTIONS)
+        with patch.dict(os.environ, self.env, clear=True):
+            flows = [launcher.build_flow(args, name) for name in ("flow1", "flow2")]
+        workers = []
+        for name, command, env in flows:
+            output = args.output_dir / name
+            output.mkdir(parents=True)
+            workers.append((name, [sys.executable, "-B", str(Path(__file__).resolve()),
+                                  "--fake-perf", *command[3:], "--jetty-csv", str(output / "jettys.csv")], env))
+        code, text = self.run_pair(workers)
+        self.assertEqual(code, 0, text)
+        self.assertIn("both flows ready; synchronized start scheduled", text)
+        self.assertEqual(text.count("PEER_EID_CONCURRENCY"), 2)
+        for name, _, _ in flows:
+            with (args.output_dir / name / "peer_samples.csv").open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual([row["peer_eid"] for row in rows], PEERS)
+            self.assertTrue(all(int(row["bytes"]) > 0 for row in rows))
+
     def test_single_benchmark_hook_is_silent_noop(self):
         output = io.StringIO()
         with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), \
@@ -259,6 +327,19 @@ class SweepCompatibilityTests(ConcurrentFixture):
         self.assertTrue(all(r["aiv_cores"] == "2" and r["jettys_per_core"] == "2" for r in rows))
         self.assertEqual(len(list(output.iterdir())), 8)
         self.assertNotIn("[launcher]", result.stdout)
+
+    def test_dual_peer_pair_keeps_sweep_outputs_and_adds_peer_reports(self):
+        args = self.args(device2=6, extra=PEER_OPTIONS)
+        with patch.dict(os.environ, self.env, clear=True):
+            flows = [launcher.build_flow(args, name) for name in ("flow1", "flow2")]
+        code, text = self.run_pair(flows, timeout=10)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(text.count("PEER_EID_CONCURRENCY"), 2)
+        for name, _, _ in flows:
+            output = args.output_dir / name
+            self.assertEqual({p.name for p in output.iterdir()}, OUTPUTS | {"peer_samples.csv"})
+            with (output / "peer_samples.csv").open() as stream:
+                self.assertEqual([row["peer_eid"] for row in csv.DictReader(stream)], PEERS)
 
     def test_pair_outputs_match_single_sweep_verbatim(self):
         for device2 in (7, 6):
