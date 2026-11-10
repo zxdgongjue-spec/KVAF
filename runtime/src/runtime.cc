@@ -1,5 +1,4 @@
 #include "runtime.h"
-#include "gather_call_profile.h"
 
 #include <cstdint>
 #include <limits>
@@ -251,14 +250,12 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
-  gather_call::Timer validation_timer(gather_call::kRuntimeValidation);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (execution.trusted_npu_request) {
     if (request.indices.device != DeviceKind::kNpu || !execution.stream)
       return Status::InvalidArgument("trusted BatchGet requires NPU inputs and an eager stream");
-    validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
   }
   const AccessTableState* table = nullptr;
@@ -348,7 +345,6 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
   }
-  validation_timer.Stop();
   return access_operator_.ExecuteBatchGet(
       BatchGetExecRequest{view, &request, execution});
 }

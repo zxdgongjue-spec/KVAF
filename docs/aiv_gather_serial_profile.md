@@ -1,7 +1,7 @@
 # Gather 性能采集与排障
 
 当前实现、各阶段优化和配置合同见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)。
-以下统一使用 V9 / args 248 B / PRF5 256 B / CSV schema 9，历史 ABI 命令已移除。
+以下统一使用 V9 / args 248 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
 
 ## 构建与入口
 
@@ -123,9 +123,7 @@ ACK 和数据 CQ 的观察顺序可不同，成功必须同时满足；不可将
 Host prepare_ns 含 owner 参数适配/output 注册，launch_ns 只含入队；status_enqueue_ns
 是诊断 D2H 入队，wait_ns 是剩余执行/复制等待，finish_ns 是校验/回收。
 total_ns 从上批 Drain 后的本批 owner 准备开始，不包含外层 Python/Runtime/capture。
-call_* 字段补充 binding、metadata、stream、native、Runtime validation、operator、mutex、
-capture、prior drain、input、launch、status copy、sync、validation、output acquire 的归因；
-它们是嵌套包含关系，不能相加。CPU/Host ns 与 AIV cycle 属于不同钟域，不直接相减。
+CPU/Host ns 与 AIV cycle 属于不同钟域，不直接相减。
 
 ## Profile API 与 CSV
 
@@ -144,12 +142,15 @@ runtime.stop_gather_batch_get_profile()
 
 | 文件 | 内容 |
 | --- | --- |
-| summary.csv | E2E/profile E2E 的 samples、mean/p50/p95/p99/useful_GiBps，Host/core 均值和 sampling_status。 |
+| summary.csv | E2E/profile E2E 的 samples、mean/p50/p95/p99/useful_GiBps、Host/core 均值；失败时附 error 行。 |
 | e2e.csv | profile=off 的逐样本延迟和带宽。 |
-| profile_host.csv | profile=on 的 sequence、外层调用时间、Host 及 call_* 归因。 |
-| profile_core.csv | 逐样本逐核原始 cycle、阶段耗时和计数。 |
+| profile_host.csv | profile=on 的 sequence、外层调用时间及六项 Host 耗时。 |
+| profile_core.csv | 逐样本逐核阶段耗时和计数。 |
 
-CSV 时间用 us，另保留 AIV cycle；Host/core 分行，不复制 Host 总时间到每核求和。
+CSV 时间用 us，另保留阶段耗时及计数的 AIV cycle；Host/core 分行，不复制 Host 总时间到每核求和。
+schema 10 移除 sampling_status 行/列、call_* 细分计时采集及原始时间戳列。
+七个边界时间戳及 first_ready/first_read_submit 仍在内部用于阶段计算、重叠和完整性校验，
+不再导出 CSV；kernel/profile ABI 保持不变。
 终端/summary 带宽统一按 `payload_bytes/(p50_us/1e6)/1024**3`；逐样本带宽用自身延迟。
 列按字段名定位。失败也导出已完成样本并标记异常，未采到的阶段只有表头，不伪造零值。
 CSV 导出及 shutdown 异常不覆盖先前的设备异常。

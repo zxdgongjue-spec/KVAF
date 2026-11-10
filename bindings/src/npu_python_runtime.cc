@@ -17,7 +17,6 @@
 #include "acl/acl.h"
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
-#include "gather_call_profile.h"
 
 namespace py = pybind11;
 
@@ -495,7 +494,6 @@ class NpuPythonRuntime final {
 
   void StartGatherBatchGetProfile() {
     ThrowIfError(native_->SetGatherBatchGetProfiling(true));
-    profile_calls_ = true;
   }
 
   py::dict GatherBatchGetProfileSnapshot() const {
@@ -508,8 +506,6 @@ class NpuPythonRuntime final {
     host["wait_ns"] = profile.wait_ns;
     host["finish_ns"] = profile.finish_ns;
     host["total_ns"] = profile.total_ns;
-    for (std::size_t i = 0; i < gather_call::kCount; ++i)
-      host[gather_call::kNames[i]] = call_profile_.ns[i];
     py::list cores;
     for (std::size_t core = 0; core < profile.cores.size(); ++core) {
       const auto& p = profile.cores[core];
@@ -554,7 +550,6 @@ class NpuPythonRuntime final {
     // Disabling also works before the first sample or after a failed launch.
     // Snapshot remains explicit so stopping never hides the original error.
     ThrowIfError(native_->SetGatherBatchGetProfiling(false));
-    profile_calls_ = false;
   }
 
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
@@ -594,9 +589,6 @@ class NpuPythonRuntime final {
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
                     bool synchronize) {
-    gather_call::Session session(profile_calls_ ? &call_profile_ : nullptr);
-    gather_call::Timer binding_timer(gather_call::kBinding);
-    gather_call::Timer metadata_timer(gather_call::kTensorMetadata);
     BatchGetRequest request;
     if (trusted_gather_inputs_) {
       request = TrustedGatherRequest(access_table, addresses, valid, indices, offsets,
@@ -650,12 +642,8 @@ class NpuPythonRuntime final {
               ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
               ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     }
-    metadata_timer.Stop();
-    gather_call::Timer stream_timer(gather_call::kStreamResolve);
     const aclrtStream acl_stream = trusted_gather_inputs_ ?
         tensor_methods_.Stream(stream) : ResolveStream(stream);
-    stream_timer.Stop();
-    gather_call::Timer native_timer(gather_call::kNative);
     ThrowIfError(native_->core().BatchGet(
         request, BatchGetExecutionOptions{acl_stream, synchronize, trusted_gather_inputs_}));
   }
@@ -663,15 +651,12 @@ class NpuPythonRuntime final {
  public:
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
-    profile_calls_ = false;
   }
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   TensorMetadataMethods tensor_methods_;
   bool trusted_gather_inputs_{false};
-  bool profile_calls_{false};
-  gather_call::Profile call_profile_{};
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;

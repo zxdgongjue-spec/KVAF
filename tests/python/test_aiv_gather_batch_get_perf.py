@@ -47,13 +47,8 @@ STAGE_BOUNDARIES = (
     ("finalize", "read_done_cycle", "kernel_finish_cycle"),
     ("total", "kernel_start_cycle", "kernel_finish_cycle"),
 )
-CALL_HOST_FIELDS = tuple("call_" + phase + "_ns" for phase in (
-    "binding", "tensor_metadata", "stream_resolve", "native", "runtime_validation",
-    "operator", "mutex_wait", "capture_query", "prior_drain", "input", "launch",
-    "status_copy_enqueue", "stream_sync", "status_validate", "output_acquire",
-))
 HOST_FIELDS = (
-    "prepare_ns", "launch_ns", "status_enqueue_ns", "wait_ns", "finish_ns", "total_ns", *CALL_HOST_FIELDS,
+    "prepare_ns", "launch_ns", "status_enqueue_ns", "wait_ns", "finish_ns", "total_ns",
 )
 COUNTERS = (
     "data_wrs", "ack_queries", "data_wqebbs", "data_doorbells",
@@ -61,7 +56,6 @@ COUNTERS = (
     "pipeline_chunk_bytes", "first_read_ready_bytes", "read_vf_calls",
     "prepare_ahead", "cooperative_chunks", "prepare_ahead_wrs", "prepare_ahead_cycles",
 )
-PIPELINE_EVENTS = ("first_ready_cycle", "first_read_submit_cycle")
 
 
 def configured_chunk_bytes() -> int:
@@ -338,7 +332,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 9,
+        "schema_version": 10,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
@@ -381,18 +375,14 @@ def export_csv_results(
     host_mean, core_means = summarize_profiles(snapshots, cores, requests) if snapshots else ({}, [])
     clock = metadata["clock_mhz"]
     stages = [name for name, _, _ in STAGE_BOUNDARIES]
-    boundaries = [STAGE_BOUNDARIES[0][1]] + [end for _, _, end in STAGE_BOUNDARIES[:-1]]
     host_columns = [field.removesuffix("_ns") + "_us" for field in HOST_FIELDS]
     timed_counters = [field for field in COUNTERS if field.endswith("_cycles")]
-    core_columns = ["requests", *boundaries, *PIPELINE_EVENTS, *(name + "_cycles" for name in stages),
+    core_columns = ["requests", *(name + "_cycles" for name in stages),
                     *(name + "_us" for name in stages), *COUNTERS,
                     *(field.removesuffix("_cycles") + "_us" for field in timed_counters)]
 
     def core_fields(lane: Mapping[str, object], mean: bool = False) -> dict[str, object]:
         row = {"requests": lane["requests"], **{key: lane.get(key, 0) for key in COUNTERS}}
-        if not mean:
-            row.update({key: lane[key] for key in boundaries})
-            row.update({key: lane.get(key, 0) for key in PIPELINE_EVENTS})
         durations = None if mean else profile_stage_cycles(lane)
         for name, begin, end in STAGE_BOUNDARIES:
             cycles = lane[name] if mean else durations[name]
@@ -405,8 +395,9 @@ def export_csv_results(
     def host_fields(host: Mapping[str, object]) -> dict[str, object]:
         return {field.removesuffix("_ns") + "_us": float(host[field]) / 1000 for field in HOST_FIELDS}
 
-    summary = [{"row_kind": "sampling_status", "sampling_status": "failed" if error else "complete",
-                "error_type": type(error).__name__ if error else "", "error_message": str(error) if error else ""}]
+    summary = []
+    if error is not None:
+        summary.append({"row_kind": "error", "error_type": type(error).__name__, "error_message": str(error)})
     e2e_rows = []
     if samples_us:
         summary.append({"row_kind": "e2e_summary", "profile": "off", "samples": len(samples_us),
@@ -457,13 +448,11 @@ def export_csv_results(
     stage_time_columns = [name + "_us" for name in stages if name != "total"]
     summary_core_columns = [field for field in core_columns
                             if field not in (*stage_cycle_columns, *stage_time_columns, "total_us")]
-    base_host_columns = [field for field in host_columns if not field.startswith("call_")]
-    call_host_columns = [field for field in host_columns if field.startswith("call_")]
     outputs = (
         ("summary", ["row_kind", "profile",
                      "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
-                     *base_host_columns, *stage_time_columns, *stage_cycle_columns, "sampling_status", "core",
-                     "error_type", "error_message", *call_host_columns, *summary_core_columns], summary),
+                     *host_columns, *stage_time_columns, *stage_cycle_columns, "core",
+                     "error_type", "error_message", *summary_core_columns], summary),
         ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps"], e2e_rows),
         ("profile_host", ["sample_index", "profile", "sequence", "call_e2e_us", *host_columns], host_rows),
         ("profile_core", ["sample_index", "profile", "sequence", "core", *core_columns], core_rows),

@@ -4,7 +4,6 @@
 #include "cpu_gather.h"
 #include "gather_workspace.h"
 #include "batch_get_profile.h"
-#include "gather_call_profile.h"
 #include "peer_link.h"
 #include <acl/acl.h>
 #include <algorithm>
@@ -105,7 +104,6 @@ struct GatherBatchGet::Impl {
       return Status::OK();
     }
     const auto enqueue_begin = pending_profile ? BatchGetProfileNowNs() : 0;
-    gather_call::Timer copy_timer(gather_call::kStatusCopy);
     const aclError copied = aclrtMemcpyAsync(status_host, StatusBytes(), status_device,
                                             StatusBytes(), ACL_MEMCPY_DEVICE_TO_HOST, pending);
     if (copied != ACL_SUCCESS) {
@@ -118,16 +116,12 @@ struct GatherBatchGet::Impl {
         failed = true; return AclFailure("copy_profile", profile_copied);
       }
     }
-    copy_timer.Stop();
     const auto wait_begin = pending_profile ? BatchGetProfileNowNs() : 0;
     if (pending_profile) latest_profile.status_enqueue_ns = wait_begin - enqueue_begin;
-    gather_call::Timer sync_timer(gather_call::kStreamSync);
     const aclError synchronized = aclrtSynchronizeStream(pending);
     if (synchronized != ACL_SUCCESS) {
       failed = true; return AclFailure("synchronize", synchronized);
     }
-    sync_timer.Stop();
-    gather_call::Timer validate_timer(gather_call::kStatusValidate);
     const auto finish_begin = pending_profile ? BatchGetProfileNowNs() : 0;
     if (pending_profile) latest_profile.wait_ns = finish_begin - wait_begin;
     pending = nullptr;
@@ -483,16 +477,12 @@ Status GatherBatchGet::CopyGatherProfile(GatherBatchGetProfile* profile) const {
   return Status::OK();
 }
 Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
-  gather_call::Timer operator_timer(gather_call::kOperator);
   auto& s = *impl_;
-  gather_call::Timer mutex_timer(gather_call::kMutexWait);
   std::lock_guard<std::mutex> lock(s.mutex);
-  mutex_timer.Stop();
   if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
   if (s.failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
   if (!exec.request || !exec.execution.stream) return Status::InvalidArgument("BatchGet needs request and stream");
   if (!exec.execution.trusted_npu_request) {
-    gather_call::Timer capture_timer(gather_call::kCaptureQuery);
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
     if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
@@ -506,29 +496,23 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     return Status::InvalidArgument("gather prefix probes require synchronize=True");
   // Stream order protects shared workspace/queues; fence on stream switch or checked calls.
   Status result = Status::OK();
-  gather_call::Timer prior_timer(gather_call::kPriorDrain);
   if (s.pending && (s.pending != exec.execution.stream || s.pending_status_check)) {
     result = s.Drain();
     if (!result.ok()) return result;
   }
-  prior_timer.Stop();
   s.profile_valid = false;
   if (s.profiling) {
     s.profile_begin_ns = BatchGetProfileNowNs();
     s.latest_profile = {};
   }
   auto args = s.args;
-  gather_call::Timer input_timer(gather_call::kInput);
   if (exec.execution.trusted_npu_request) FillInput(*exec.request, s.config, &args.request);
   else result = Input(exec, s.config, &args.request);
   if (!result.ok()) return result;
-  input_timer.Stop();
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
-  gather_call::Timer acquire_timer(gather_call::kOutputAcquire);
   if (KvafBatchGetLocalBufferAcquire(s.gather_transport, exec.request->output.data,
       exec.request->output.bytes, &s.output_buffer, &args.request.channel_entity))
     return Error("register output");
-  acquire_timer.Stop();
   args.request.core_status = Ptr(s.status_device); args.request.queue_state = Ptr(s.queues);
   s.args.request = args.request;
   args.sequence = ++s.sequence;
@@ -548,11 +532,9 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
         static_cast<unsigned long long>(args.sequence), args.request.block_count,
         args.request.token_bytes, args.request.request_capacity);
   // Each core initializes status/profile; avoid redundant Host clears.
-  gather_call::Timer call_launch_timer(gather_call::kLaunch);
   if (KvafGatherBatchGetLaunch(&args, s.pending)) {
     s.failed = true; return Error("enqueue failed; resources retained");
   }
-  call_launch_timer.Stop();
   if (s.profiling) s.latest_profile.launch_ns = BatchGetProfileNowNs() - launch_begin;
   if (!s.pending_status_check) {
     // MR/entity cache outlives these references, until transport shutdown.

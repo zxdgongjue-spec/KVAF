@@ -150,7 +150,7 @@ WQE 构造完成均不能替代最终完成。错误/超时停止补发，回收
 ## ABI 与兼容性
 
 - kernel `KvafGatherBatchGetAivKernelV9`，args 248 B；loader 拒绝 V1–V8。
-- profile PRF5、256 B；CSV schema 9。profile 直接写每核独占的 GM 记录。
+- profile PRF5、256 B；CSV schema 10。profile 直接写每核独占的 GM 记录。
 - GDR2：整批/普通 byte-prefix；GDR4：均分协作块；均为 48 B header + 16 B span 数组。
 - GDR5：CPU 继续接受固定 1/32 首块 + 4 尾块的旧格式。
 - GDR6：48 B header 后附加 16 B（D、N、零保留位），再接 span 数组。
