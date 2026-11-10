@@ -50,7 +50,8 @@ CPU 服务使用新二进制重启：
 ```
 
 同一服务也可供 AIV、UBmem 和 Scatter 使用。`--gather-threads` 是每个 Gather
-session 的 CPU 线程总预算，须不小于客户端 AICPU worker 数；`active` 使用主动等待。
+session 的 CPU 线程总预算，默认 10，须不小于客户端 AICPU worker 数；等待模式默认
+`active`，使用主动等待。上例显式将线程预算覆盖为 8。
 这两个参数不改变其他后端的执行。Gather 线程继承外部 CPU 亲和性；需要限定 NUMA 节点时，
 使用 `numactl --cpunodebind=N --membind=N` 启动服务，或使用 `taskset -c CPU_LIST` 指定 CPU。
 示例使用设备 7 和本机服务 `127.0.0.1:28990`，跨主机部署时替换为实际设备号和 CPU 地址。
@@ -362,72 +363,6 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 同一 AICPU 进程只支持一个活动 UMDK 会话。目前该后端使用 eager 调用，不支持 ACL Graph capture/replay。
 
 本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。
-
-## 一键诊断 NPU 卡与 CPU/内存 NUMA 的关系
-
-在 CPU 服务和 NPU 位于同一台 Linux 服务器时，先固定 CPU 执行位置、DDR 位置和 CPU UB device，
-只切换 NPU 卡，比较属于不同 CPU socket 的卡是否出现带宽差异。
-下面固定 CPU/内存 node 0、`udmac0d1e2`，依次测试逻辑卡 0、1、6、7。
-每张卡独立运行同一个 GatherRead workload，CPU 服务由脚本按相同参数重新启动。
-先加载 CANN 和原有 Python 环境，在仓库根目录执行：
-
-```bash
-# 只修改 CPU 服务与测试 Python，无需重建/安装 NPU 算子包。
-./build.sh cpu
-
-# 使用空闲端口；脚本不会停止已经运行的其他服务。
-python3 tests/run_aicpu_gather_read_numa.py \
-  --cpu-build "$PWD/build-cpu" --npu-build "$PWD/build-npu" \
-  --device-ids 0 1 6 7 --ub-device udmac0d1e2 --port 28889 \
-  --cpu-nodes 0 --memory-nodes 0 \
-  --gather-threads 10 --workers 5 --gather-mode active \
-  --token-bytes 656 --miss-count 8192 --warmup 10 --iterations 100
-```
-
-默认保留原性能扫描的 100 GiB DDR 总预算、每块 128 token、随机源访问和随机输出行，
-每轮仍校验全部输出。首次分配和数据填充需要等待；`--table-capacity 4096` 可用于快速检查流程，
-正式比较时省略该选项。`--repeats 3` 可重复三遍，偶数遍反转执行顺序。
-`--device-ids` 与原有单卡参数 `--device-id` 互斥；不传列表时仍默认测试单卡 0。
-原来的 CPU/内存四组合也可继续使用 `--device-id 0 --cpu-nodes 1 2 --memory-nodes 1 2`。
-NPU EID 发现沿用原逻辑；跨卡使用自动发现时，应先取消之前为单卡设置的 `KVAF_NPU_EIDS`。
-有卡号重映射时，以 CSV 中的 `physical_device_id` 核对实际物理卡。
-
-结果写入 `reports/aicpu-gather-numa/<时间戳>/`，也可用 `--output 新目录` 指定位置：
-
-- `summary.csv`：逻辑/物理卡号、实际 EID、CPU 侧位置和 CPU/NPU 的汇总指标。
-- `config.json`、`topology.txt`：测试参数、构建目录和 NUMA/CPU 拓扑。
-- 每组的 `cpu.log`、`npu.log`、`commands.json`：原始输出和实际启动参数。
-- 每组的 `cpu_profiles.json`：按请求 sequence 保留各 lane 的 CPU 计时。
-- 每组的 `route.json`：从被测 region 的实际通道请求中提取的 NPU EID、对应物理卡号、
-  CPU UB device 和 CPU EID；已失败的候选连接不会被当成最终通路。
-- 每组的 `npu_profiles.json`：正式测量的每轮、每个 worker 的完整 profile；
-  `cpu_placement` 保存测量前 CPU 服务的 `/proc/<pid>/numa_maps`、`smaps_rollup` 和线程状态。
-
-CPU 服务增加可选 `--gather-profile`，默认关闭。开启后仅在内存中记录计时，session 释放时
-才输出 `CPU_GATHER_PROFILE`，避免在复制期间打印日志；长时间诊断会持续积累记录。
-脚本从 CPU 记录中选取最后 `iterations` 轮，排除预检和预热，检查每轮 lane 完整性与 payload，
-再按“每轮 lane 最大值的均值”汇总。CPU 日志中的 `cpu_begin/cpu_end` 是 lane 主线程
-实际执行 CPU，不代表 helper 的执行位置；全部线程的允许核范围保存在 `cpu_placement.tasks`。
-
-| CPU 指标 | 计时范围 |
-| --- | --- |
-| `cpu_prepare_us` | 解析/检查描述符、设置复制任务、创建或唤醒 helper |
-| `cpu_copy_us` | 开始执行 Copy 到全部线程完成，包含复制、线程协作、屏障与进度发布 |
-| `cpu_first_ready_us` | 从 Copy 开始到首次发布非零就绪前缀；当前流水粒度为 128 KiB |
-| `cpu_total_us` | CPU 观察到新 notify 后，到完成复制并发布最终 ACK；不包含通知到达前的延迟 |
-
-这些是开启诊断时、与真实 NPU READ 并发的 CPU 墙钟耗时。固定 CPU 侧后，先比较不同物理卡的
-总耗时、`read_total_us`、就绪查询次数和 `cq_wait_us`，同时检查实际 EID。
-CPU 生产 staging 可能限制流水吞吐，因此端到端带宽接近不等于两条 UB 链路的峰值接近。
-若另外扫描 CPU/内存位置，则观察 `cpu_copy_us`、`cpu_first_ready_us` 是否随之增长；若 CPU 计时接近而 NPU 的
-`cpu_gather_wait_us`、`cq_wait_us` 大幅增长，再重点调查进度查询、数据 READ 和缓存一致性路径。
-CPU 与 NPU 使用各自时钟，只比较阶段时长及其变化，不相减两端绝对时间戳。
-各阶段分别取不同 worker 的最大值，阶段汇总不能相加为总时间。
-普通 sweep 现在也输出 `ack_us` 和 `ready_queries`；`cpu_gather_wait_us` 仍对应就绪前缀
-查询等待，包含查询的 URMA 往返。
-
-脚本只终止自己启动的进程。端口占用、服务启动失败或任一组测试失败会停止运行，
-保留已有日志和已完成的 CSV 行。中断后可从原始日志检查失败位置。
 
 ## 实现位置
 

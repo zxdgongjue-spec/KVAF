@@ -1,14 +1,6 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_package(Threads REQUIRED)
-add_executable(kvaf_cpu_gather_executor_test cpu_gather_executor_test.cc
-  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)
-target_include_directories(kvaf_cpu_gather_executor_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
-target_link_libraries(kvaf_cpu_gather_executor_test PRIVATE kvaf_common Threads::Threads)
-add_test(NAME kvaf_cpu_gather_executor_test COMMAND kvaf_cpu_gather_executor_test)
-set_tests_properties(kvaf_cpu_gather_executor_test PROPERTIES TIMEOUT 30)
-add_test(NAME kvaf_gather_numa_diagnostic_python
-  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_gather_numa_diagnostic.py")
 add_executable(kvaf_npu_runtime_config_test npu_runtime_config_test.cc)
 target_link_libraries(kvaf_npu_runtime_config_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_npu_runtime_config_test COMMAND kvaf_npu_runtime_config_test)

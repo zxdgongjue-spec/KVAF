@@ -44,6 +44,9 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
+CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
+`--gather-mode adaptive|active|passive` 显式覆盖。
+
 CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 
 ```bash
