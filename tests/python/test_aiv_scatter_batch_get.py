@@ -2,7 +2,7 @@
 """Temporary CPU-push/done check; skips the scatter payload copy entirely."""
 import os
 
-from aiv_batch_get_regression import run
+from aiv_batch_get_test_common import run
 
 if __name__ == "__main__":
     # Temporary bring-up: the kernel returns at AFTER_DONE, before CopyPayload.

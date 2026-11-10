@@ -33,6 +33,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+include(CTest)
+
 add_subdirectory(common)
 add_subdirectory(meta_manager)
 add_subdirectory(access_operator)
@@ -55,4 +57,8 @@ if(KVAF_BUILD_PYTHON)
   list(APPEND CMAKE_PREFIX_PATH "${KVAF_PYBIND11_CMAKE_DIR}")
   find_package(pybind11 CONFIG REQUIRED)
   add_subdirectory(bindings)
+endif()
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
 endif()

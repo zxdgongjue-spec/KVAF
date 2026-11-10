@@ -23,4 +23,5 @@ min/max timestamps, so it requires a common clock. Transfer overlaps posting:
 do not add those durations. Original correctness preflight remains active.
 The independent upstream script remains the uninstrumented control.
 
+Validation: python3 -m unittest discover -s tests/diagnostics -p 'test_*.py'.
 Actual device execution must be validated on an NPU.

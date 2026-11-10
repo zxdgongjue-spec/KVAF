@@ -194,7 +194,7 @@ DEVICE_ID=7 KVAF_NPU_CORE_COUNT=8 python tests/python/test_aiv_gather_batch_get.
 DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_scatter_batch_get.py
 ```
 
-两个入口复用 `aiv_batch_get_regression.py` 中的数据准备和校验，使用 8193
+两个入口复用 `aiv_batch_get_test_common.py` 中的数据准备和校验，使用 8193
 请求容量，覆盖空批次、尾批、重复调用、
 随机输出、重复源、guard、A/B/A 输出、两种 Tensor 重载以及跨 stream 顺序复用。
 可用 `KVAF_NPU_TOKEN_BYTES=13`、`KVAF_NPU_REQUESTS=65536`、
@@ -202,7 +202,8 @@ DEVICE_ID=7 KVAF_NPU_CORE_COUNT=1 python tests/python/test_aiv_scatter_batch_get
 CPU `--gather-threads` 至少等于 gather 的 AIV 核数。
 上述命令在仓库根目录执行。单模式测试只检查对应 Get 二进制和 BatchPut，
 不要求另一模式的二进制存在；路径检查失败会在初始化 NPU 前报具体路径。
-两个真机入口按上述命令直接运行。
+两个真机入口可直接运行，CTest 也分别注册。兼容总控 `test_aiv_sequential_batch_get.py`
+为每种模式启动独立进程，通过 `KVAF_AIV_BATCH_GET_MODES` 选择模式。
 
 ## 初始化失败的定位
 
@@ -582,9 +583,13 @@ payload 的 UB→GM。首个 staging 源地址按参数计算为
 
 ## 当前验证状态
 
-独立模型/单元回归及其构建目标已移除。保留真机入口和性能采集，构建后应在
-目标 K/N 双机执行 payload/guard、重复调用及所需边界组合，不能以普通 C++ 构建
-成功代替 CANN 编译、DMA 可见性或设备性能验收。
+原分支已有的独立模型/单元回归及其构建目标保留，Gather 模型和 Host/loader
+已适配当前 V9 与异步流程。真机入口和性能采集也保留，构建后仍应在目标 K/N 双机
+执行 payload/guard、重复调用及所需边界组合；本地测试不能替代 CANN/DMA/性能验收。
+
+Scatter 编译证据工具 `tests/python/collect_aiv_scatter_debug.py` 保留，可在原构建目录
+执行 `python tests/python/collect_aiv_scatter_debug.py build-npu`，或用 `--analyze` 分析
+已有报告。该工具只采集编译资料，不加载或替换运行中的 kernel。
 
 用户此前已在硬件反馈 gather 的 1/3/8 核回归通过；拆分后撤回入口操作的独立
 gather 也已反馈成功（所给命令为 1 核）。scatter 探针此前反馈 flush 完成、

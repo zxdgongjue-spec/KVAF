@@ -47,3 +47,19 @@ def detect_torch_backend() -> TorchBackend:
             pass
 
     return TorchBackend("cpu", torch, "no NPU or MPS device is available")
+
+
+def test_payload(values: list[int], backend: TorchBackend) -> bytes:
+    """Create caller data on the selected optional backend, then serialize it.
+
+    The CPU Mock operator runs in a separate native process, so its inputs are
+    serialized to host bytes. The point of this helper is repeatable Python
+    tensor input construction, not cross-device pointer validation.
+    """
+
+    if backend.torch is None:
+        return bytes(values)
+
+    device = backend.name if backend.name in {"npu", "mps"} else "cpu"
+    tensor = backend.torch.tensor(values, dtype=backend.torch.uint8, device=device)
+    return bytes(tensor.cpu().tolist())
