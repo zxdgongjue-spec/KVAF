@@ -40,8 +40,8 @@ class AccessOperator {
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
-  // Called after metadata commits/aborts. A remote producer can reuse its
-  // frozen batch only after this decision is acknowledged by the CPU.
+  // Finalize reader-local bookkeeping after the metadata decision. The
+  // application delivers the matching terminal outcome to the producer.
   virtual Status CompleteOffload(bool) { return Status::OK(); }
 
   // Local descriptor and DDR ownership checks only; no source attachment or RPC.
@@ -57,6 +57,9 @@ class AccessOperator {
   virtual Status SubmitCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
                                       CpuPullState* state, CpuPullSubmitTiming*) {
     return SubmitCpuPullAndWait(request, timeout_ms, state);
+  }
+  virtual Status CancelCpuPull(const ReadyToken&) {
+    return Status::NotImplemented("CPU Pull cancellation is unavailable");
   }
   virtual Status QueryCpuPull(CpuPullState*) {
     return Status::NotImplemented("CPU Pull query is unavailable");

@@ -81,7 +81,8 @@ def producer(pipe, args, ticket):
             batch = source.ready()
             ready_us = (time.perf_counter_ns() - begin) / 1000
             pipe.send(("ready", batch))
-            receive(pipe, "reuse")
+            if receive(pipe, "reuse") != iteration:
+                raise RuntimeError("reuse notification belongs to another batch")
             begin = time.perf_counter_ns()
             source.release_batch(batch)
             release_us = (time.perf_counter_ns() - begin) / 1000
@@ -92,10 +93,13 @@ def producer(pipe, args, ticket):
         print_stages("CPU_PULL_BENCH_PROFILE", "producer", stages, args.warmup)
         pipe.send(("closed", None))
     except BaseException:
-        pipe.send(("error", traceback.format_exc()))
+        try:
+            pipe.send(("error", traceback.format_exc()))
+        except OSError:
+            pass
         try:
             if source.frozen:
-                source.cancel_batch(source.ready())
+                retain("no matching consumer outcome; keep CPU Pull HBM registered")
             source.shutdown()
         except Exception as error:
             retain(str(error))

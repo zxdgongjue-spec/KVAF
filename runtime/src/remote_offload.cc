@@ -1,6 +1,7 @@
 #include "remote_offload.h"
 #include "remote_pull_service.h"
 #include "hbm_exporter.h"
+#include <mutex>
 
 namespace kvaf {
 namespace rp = remote_pull;
@@ -27,6 +28,7 @@ struct CpuPullHbmSource::Impl {
   std::unique_ptr<detail::Exporter> exporter;
   std::uint64_t id{}, sequence{}, mr_id{1};
   bool attached{}, bound{}, frozen{};
+  std::recursive_mutex mutex;
   Status Device() const {
     int32_t current = -1;
     return aclrtGetDevice(&current) == ACL_SUCCESS && current == static_cast<int32_t>(device)
@@ -42,7 +44,7 @@ struct CpuPullHbmSource::Impl {
     return rp::Exchange(ticket.address, r, spans, out);
   }
   Status Shutdown() {
-    if (frozen) return Status::InDoubt("B batch remains frozen; query/release or cancel it before shutdown");
+    if (frozen) return Status::InDoubt("B batch remains frozen; await the application outcome before shutdown");
     if (attached) {
       rp::Response response{}; auto status = Call(rp::Command::Detach, {}, &response, false);
       if (!status.ok()) return status;
@@ -65,6 +67,7 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, ConstBuffer
   return Register(ticket, std::vector<ConstBufferView>{input}, stream);
 }
 Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::vector<ConstBufferView>& inputs, void* stream) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   auto status = impl_->Device(); if (!status.ok()) return status;
   if (impl_->exporter || impl_->attached || impl_->frozen) return Status::InvalidState("source is already registered or unresolved");
   if (inputs.empty() || inputs.size() > rp::kMaxSourceMrs || !stream ||
@@ -154,15 +157,18 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
   return status;
 }
 Status CpuPullHbmSource::GetDescriptor(CpuPullSourceDesc* out) const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   if (!out || !impl_->bound) return Status::InvalidState("register CPU Pull HBM before exporting its descriptor");
   *out = {impl_->id, impl_->ticket.region_id, impl_->ticket.epoch, impl_->inputs[impl_->mr_id-1].bytes};
   return Status::OK();
 }
 Status CpuPullHbmSource::Ready(ReadyToken* out) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   if (impl_->inputs.size() != 1) return Status::InvalidArgument("ready(tensor) must select one registered tensor");
   return Ready(impl_->inputs.front(), out);
 }
 Status CpuPullHbmSource::Ready(ConstBufferView input, ReadyToken* out) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   auto status = impl_->Device(); if (!status.ok()) return status;
   CpuPullSourceDesc source;
   if (!out) return Status::InvalidArgument("missing ReadyToken output");
@@ -179,38 +185,36 @@ Status CpuPullHbmSource::Ready(ConstBufferView input, ReadyToken* out) {
     ++impl_->sequence; impl_->frozen = true; impl_->mr_id = mr_id;
   }
   status = GetDescriptor(&source); if (!status.ok()) return status;
-  *out = {source, impl_->sequence, impl_->mr_id}; // Recoverable after a lost Ready ACK.
-  rp::Response response{};
-  status = impl_->Call(rp::Command::Ready, {}, &response);
-  return status.ok() ? Result(response, "Ready") : status;
+  *out = {source, impl_->sequence, impl_->mr_id};
+  return Status::OK();
 }
 Status CpuPullHbmSource::ReleaseBatch(const ReadyToken& token) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
   CpuPullSourceDesc own; auto status = GetDescriptor(&own); if (!status.ok()) return status;
   const auto* source = std::get_if<CpuPullSourceDesc>(&token.source);
   if (!source || !SameSource(own, *source) || !token.sequence || token.sequence != impl_->sequence || token.mr_id != impl_->mr_id)
     return Status::InvalidArgument("stale CPU Pull batch release");
-  if (!impl_->frozen) return Status::OK();
-  rp::Response response{}; status = impl_->Call(rp::Command::Query, {}, &response);
-  if (!status.ok()) return status;
-  status = Result(response, "Query"); if (!status.ok()) return status;
-  if (response.state != rp::State::Committed && response.state != rp::State::Cancelled)
-    return Status::Busy("reader has not acknowledged this batch; keep HBM unchanged");
+  // The matching application outcome authorizes reuse; no remote validation.
   impl_->frozen = false; return Status::OK();
 }
 Status CpuPullHbmSource::CancelBatch(const ReadyToken& token) {
-  CpuPullSourceDesc own; auto status = GetDescriptor(&own); if (!status.ok()) return status;
-  const auto* source = std::get_if<CpuPullSourceDesc>(&token.source);
-  if (!source || !SameSource(own, *source) || !token.sequence || token.sequence != impl_->sequence || token.mr_id != impl_->mr_id)
-    return Status::InvalidArgument("stale CPU Pull batch cancellation");
-  if (!impl_->frozen) return Status::OK();
-  rp::Response response{}; status = impl_->Call(rp::Command::Cancel, {}, &response);
-  if (!status.ok()) return status;
-  status = Result(response, "Cancel"); if (!status.ok()) return status;
-  impl_->frozen = false; return Status::OK();
+  return ReleaseBatch(token); // Reader has confirmed cancellation and rolled back its Put.
 }
-Status CpuPullHbmSource::Shutdown() { return impl_->Shutdown(); }
-bool CpuPullHbmSource::frozen() const { return impl_->frozen; }
-bool CpuPullHbmSource::registered() const { return impl_->bound; }
+Status CpuPullHbmSource::Shutdown() {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  return impl_->Shutdown();
+}
+bool CpuPullHbmSource::frozen() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  return impl_->frozen;
+}
+bool CpuPullHbmSource::registered() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  return impl_->bound;
+}
 std::uint32_t CpuPullHbmSource::device_id() const { return impl_->device; }
-std::string CpuPullHbmSource::selected_npu_eid() const { return impl_->selected; }
+std::string CpuPullHbmSource::selected_npu_eid() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+  return impl_->selected;
+}
 }

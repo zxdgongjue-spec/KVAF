@@ -77,7 +77,7 @@ ready 发布本批读取许可，P 保持该 Tensor 内容稳定，直到应用�
 - 初始化后，控制 TCP 只用于注册、重连和关闭，不阻塞正常数据读取。P 后台重新建立 TCP 时，D 校验同一接收端代次、源身份和 MR 清单，复用原硬件连接。
 - DMA 状态不确定仍保留资源并返回 InDoubt，TCP 断开不代表 DMA 已结束。接收端重启或会话退役后，旧连接不能自动创建一套新硬件资源。
 - 正常关闭：应用停止任务 → P release_batch → P source.shutdown() → D runtime.shutdown()。source.shutdown 内部通知 D 关闭发起端资源，再关闭 P 导出资源并确认退役，无需应用持有 export_ticket。失败继续保留对象并重试；D 全局 shutdown 也会关闭所有源连接。
-- NPU 控制协议升级为 KVHR v8，要求 A/B 两端一起更新，旧版本拒绝连接。CPU Pull 独立使用 KVRP v7，其同步提交与长连接说明见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+- NPU 控制协议升级为 KVHR v8，要求 A/B 两端一起更新，旧版本拒绝连接。CPU Pull 独立使用 KVRP v8，其同步提交与长连接说明见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 可选 `profile=True` 在成功结果中增加 `profile` 字典，单位均为微秒：
 
@@ -159,7 +159,7 @@ KVHR v8 只负责初始化、硬件资源交换、重连和关闭，不承担每
 
 ## 编译与硬件验证
 
-本次更新需重编译 A/B 两端 NPU 运行库和 Python 扩展，并重启进程。控制协议为 KVHR v8，NPU receiver ticket 仍为 version=1；已有 V3 raw kernel 无需因移除通知而更新；同时使用 CPU Pull 时，CPU service 需匹配当前 KVRP v7 扩展。
+本次更新需重编译 A/B 两端 NPU 运行库和 Python 扩展，并重启进程。控制协议为 KVHR v8，NPU receiver ticket 仍为 version=1；已有 V3 raw kernel 无需因移除通知而更新；同时使用 CPU Pull 时，CPU service 需匹配当前 KVRP v8 扩展。
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash

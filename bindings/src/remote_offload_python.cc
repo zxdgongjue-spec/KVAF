@@ -62,8 +62,10 @@ void BindCpuPullHbmSource(py::module_& module) {
     .def(py::init<std::uint32_t, std::string>(), py::arg("device_id"), py::arg("npu_eid") = "")
     .def("register", &PythonSource::Register, py::arg("region_ticket"), py::arg("source"), py::arg("stream") = py::none())
     .def("ready", &PythonSource::Ready, py::arg("tensor") = py::none())
-    .def("release_batch", [](PythonSource& s,const ReadyToken& t) { Check(s.source_.ReleaseBatch(t)); },py::arg("ready_token"))
-    .def("cancel_batch", [](PythonSource& s,const ReadyToken& t) { Check(s.source_.CancelBatch(t)); },py::arg("ready_token"))
+    .def("release_batch", [](PythonSource& s,const ReadyToken& t) { Check(s.source_.ReleaseBatch(t)); },py::arg("ready_token"),
+         "Locally thaw only after the application receives the matching terminal outcome.")
+    .def("cancel_batch", [](PythonSource& s,const ReadyToken& t) { Check(s.source_.CancelBatch(t)); },py::arg("ready_token"),
+         "Locally thaw after reader cancellation is confirmed; use runtime.cancel_cpu_pull on the reader.")
     .def("shutdown", &PythonSource::Shutdown)
     .def_property_readonly("frozen", [](PythonSource& s) { return s.source_.frozen(); })
     .def_property_readonly("registered", [](PythonSource& s) { return s.source_.registered(); })

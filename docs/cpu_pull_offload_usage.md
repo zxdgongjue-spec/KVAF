@@ -1,6 +1,6 @@
 # CPU Pull 构建与验证
 
-当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，控制协议使用 KVRP v7；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
+当前使用统一 `NpuRuntime` 和共享 DDR。CPU 数据面保留参考分支的四 Jetty 批量 READ，控制协议使用 KVRP v8；CPU 服务与 NPU Python 扩展必须同时重编译、重启。
 
 ## CPU 服务
 
@@ -48,9 +48,9 @@ CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 
 ## 统一 CPU Pull 便利入口
 
-本卡和非本卡都使用已注册源的 ReadyToken。一次调用在内部准备 DDR 槽位、组织目的偏移、
-提交并等待 READ 完成，最后提交元数据。读取端复用 TCP 长连接；正常路径没有提交前 Query，
-也没有完成轮询。原来直接传本卡 tensor/stream 的形式已删除。
+正常成功批次从发布到释放只有一次 KVAF 控制 RPC。生产端在本地选 MR、冻结并发送应用 token。
+读取端 PreparePut 后用长连接发送 SubmitAndWait。CPU 原子登记下一序列，核对 MR 长度和 Span，执行 READ 并返回 Done。
+读取端本地 CommitPut 成功后，通过应用通道通知生产端。生产端核对对应源、代次、sequence、mr_id 后本地解冻。
 下面将生产和消费代码写在同一进程，跨进程时通过应用 Connector 交换 DDR ticket、ready 和完成通知：
 
 ```python
@@ -91,17 +91,22 @@ keys、src_offsets、lengths 使用三个等长的 Host 整数序列或连续一
 拆分或重排 entry 的请求继续使用排序覆盖检查。Core 同步提交在验证并保存自有快照后，
 通过私有 Operator 入口复用检查结果，避免再次排序同一请求；直接调用 Operator 仍执行完整校验，
 CPU service 也继续检查真实 MR、DDR 范围及目的重叠。计时范围和恢复快照不变。
-此优化仅需更新并重编译 NPU 扩展，已有匹配 KVRP v7 的 CPU service 可继续运行。
 
 `timeout=None` 使用 Runtime 的 `offload_timeout_ms`（默认 30000 毫秒），控制 CPU 接受同步任务后
 等待 READ 完成的时间；0 表示提交后立即检查，不等待。客户端接收超时为该预算加 5 秒控制通信余量，
 连接和发送超时仍为 5 秒。超时不会取消 READ。显式 `wait_cpu_pull` 和异常恢复仍使用 Query 查询原任务。
-明确失败内部 Abort；DMA 未决时保留内部 Put 和槽位，保持源数据不变，用
-`runtime.resolve_cpu_pull(timeout=30000)` 恢复。恢复只查询/等待原任务并 Commit/Abort，
-不重新发起 READ；成功提交返回 None，失败或仍未决抛异常。
-`pending_offload=True` 表示仍需保留；为 False 的明确失败已安全撤销，生产端可 Cancel/Release。
-同参数再次调用 batch_cpu_pull 是新操作，不能用于恢复；目标 keys 仍占用时也会被拒绝。
-Commit 或 Abort 确认丢失后只能继续原决定。shutdown 可尝试非阻塞恢复，但不会代替生产端注销源。
+出现未决结果时保留原 Put、DDR 预留和冻结的 HBM。便利接口用 `resolve_cpu_pull(timeout=30000)` 恢复，
+显式接口用原 Put 查询。有效源会话返回 NotSeen 时，读取端先通过 Cancel 封住迟到提交。Running、
+InDoubt、断连或服务代次不匹配时继续保留资源。同一次 Put 可以恢复，已消费 token 不能提交新 Put。
+
+主动放弃已发布批次（包括本地校验失败、尚未发送提交）时，读取端调用 `runtime.cancel_cpu_pull(ready)`。
+显式 Put 已预留但尚未提交时，先 `abort_put(put)`。取消遇到在途 READ 或回包丢失，保留原资源并重试同一取消；
+已确定的撤销决定在 READ 稍后成功时仍执行 Abort。取消成功表示迟到 READ 已被阻止或原 READ 已安全结束，
+关联 Put 已撤销。成功提交的批次沿用原成功结果。
+
+应用发送可重试、带批次身份的完成／安全撤销通知。生产端收到匹配通知后才调用 `release_batch(ready)`
+或 `cancel_batch(ready)`。这两个方法只核对本地身份。超时、异常、连接断开或仅持有 token 都不构成释放许可。
+元数据提交成功的 DDR 槽位继续保存业务数据，按正常 BatchFree 生命周期回收。
 
 ## 验收命令
 
@@ -162,10 +167,10 @@ CPU 的 `CPU_PULL_PROBE_END` 记录每个 MR 的探测结果，失败时包含�
 
 bench 现在每批仅调用一次 `runtime.batch_cpu_pull(keys, ready, src_offsets, lengths)`，
 不再在 Python 分别执行 Prepare/Submit/Wait/Commit，也不在 Python 组织目的偏移数组。
-KVRP v7 增加 SubmitAndWait，服务端在 READ 完成或等待超时后回复，读取端复用长连接。
+KVRP v8 沿用 SubmitAndWait，服务端在 READ 完成或等待超时后回复，读取端复用长连接。
 CPU service、NPU 运行库和 Python 扩展需要配套重编译、重启；四 Jetty READ 数据面与调用总计时边界不变。
 服务端每个连接独立处理请求，共享 DDR/会话状态由同一控制锁保护。
-等待 READ 时释放控制锁，生产端 Query、Ready/Release 和其他连接的控制请求可继续处理。
+等待 READ 时释放控制锁，其他连接可查询或取消原任务。
 
 CPU 服务开启统计后，每个源连接独立累计 READ 样本，正常注销源时输出汇总；READ
 失败时也会输出当时的汇总。探测与校验 RPC 不计入样本。可沿用已有构建目录，例如：
@@ -214,7 +219,7 @@ bench 默认传入 `profile=True`，输出以下阶段（均为消费端 Host �
 | `dst_offsets` | C++ 提取槽位地址并减 DDR base |
 | `submit_wait_cpu_pull` | 内部同步提交，包括请求检查、快照、控制 RPC、CPU READ 和完成响应等待 |
 | `wait_cpu_pull` | 返回后检查已缓存的完成状态；正常成功路径不发送 Query、不休眠 |
-| `commit_put` | 元数据提交及 CPU 完成确认 |
+| `commit_put` | 本地元数据提交与事务收尾 |
 | `native_other` | native_total 减去六个内部阶段之和 |
 | `python_and_binding_other` | total 减 binding_prepare 与 native_total，包含分派、GIL 和结果字典转换等 |
 
@@ -223,7 +228,7 @@ bench 默认传入 `profile=True`，输出以下阶段（均为消费端 Host �
 
 开启 `profile=True` 后，bench 另外输出下面三组细分统计，沿用同一批请求和同一条 TCP 响应。
 这些采样及返回字典的开销计入原有 `total`；总计时范围不变，默认接口和 `--no-profile` 不采集细分时钟。
-重编译并重启 CPU service 和 NPU 扩展后，原 bench 命令即可输出。线协议仍为 KVRP v7，帧大小不变；
+重编译并重启 CPU service 和 NPU 扩展后，原 bench 命令即可输出。线协议为 KVRP v8；
 SubmitAndWait 使用 profile 标志和原响应中未使用的 memory 区域返回 CPU 时长。
 若 CPU service 尚未支持此扩展，读取仍可完成，但会明确输出 `CPU_PULL_BENCH_SERVER_UNAVAILABLE`，不补零伪造样本。
 

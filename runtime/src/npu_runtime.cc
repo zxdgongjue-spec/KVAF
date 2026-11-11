@@ -21,6 +21,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <fcntl.h>
@@ -175,6 +176,8 @@ struct NpuRuntime::Impl {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   std::unique_ptr<HbmReader> hbm_reader;
 #endif
+  // Serialize CPU Pull transaction decisions and the reader-owned control socket.
+  std::recursive_mutex pull_mutex;
   NpuRuntimeOptions options;
   AccessOperatorConfig config;
   bool base_initialized{false};
@@ -198,6 +201,10 @@ struct NpuRuntime::Impl {
       return Status::InDoubt("CPU Pull unresolved; retain producer data and call resolve_cpu_pull: " + status.message());
     };
     try {
+      if (batch_pull_put.aborting() && !batch_pull_abort) {
+        batch_pull_abort = true;
+        batch_pull_failure = Status::InvalidState("CPU Pull was cancelled");
+      }
       if (!batch_pull_abort) {
         CpuPullState state = CpuPullState::InDoubt;
         Status status;
@@ -707,6 +714,7 @@ Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* ticket) const {
 Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken& ready,
                                 Uint64ArrayView src_offsets, const std::vector<std::uint64_t>& lengths,
                                 std::uint32_t timeout_ms, CpuPullProfile* profile) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   if (profile) *profile = {};
   ScopedCpuPullTimer total(profile ? &profile->total_us : nullptr);
@@ -765,7 +773,23 @@ Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys, const ReadyToken
   return Status::NotImplemented("CPU Offload was not built");
 #endif
 }
+Status NpuRuntime::CancelCpuPull(const ReadyToken& ready) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (!ddr_initialized() || !impl_->remote_operator) return Status::NotInitialized("initialize DDR before cancellation");
+  auto status = core().CancelCpuPull(ready);
+  if (status.ok() && impl_->batch_pull_put.id()) {
+    impl_->batch_pull_put = {};
+    impl_->batch_pull_abort = false;
+    impl_->batch_pull_failure = Status::OK();
+  }
+  return status;
+#else
+  return Status::NotImplemented("CPU Offload was not built");
+#endif
+}
 Status NpuRuntime::ResolveCpuPull(std::uint32_t timeout_ms) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before resolve_cpu_pull");
   return impl_->FinishBatchCpuPull(timeout_ms == UINT32_MAX ? impl_->options.offload_timeout_ms : timeout_ms);
@@ -774,12 +798,14 @@ Status NpuRuntime::ResolveCpuPull(std::uint32_t timeout_ms) {
 #endif
 }
 bool NpuRuntime::pending_offload() const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if (impl_->batch_pull_put.id()) return true;
+  if (impl_->batch_pull_put.id() || (impl_->remote_operator && impl_->remote_operator->pending())) return true;
 #endif
   return impl_->runtime_core && impl_->runtime_core->pending_offload();
 }
 Status NpuRuntime::LastOffloadChecksum(std::uint64_t* checksum) const {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   return impl_->remote_operator ? impl_->remote_operator->LastChecksum(checksum) : Status::NotInitialized("CPU Offload is not initialized");
 #else
@@ -810,6 +836,7 @@ Status NpuRuntime::ListenHbm(const std::string& address, const std::string& adve
 #endif
 }
 Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* put) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before PreparePut");
   if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   if (pending_offload()) return Status::Busy("finish the existing Put or resolve_cpu_pull before starting a new batch");
@@ -817,23 +844,28 @@ Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<s
 }
 Status NpuRuntime::SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
                                 Uint64ArrayView src_offsets,Uint64ArrayView dst_offsets,Uint64ArrayView lengths) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   if (!ddr_initialized()) return Status::NotInitialized("initialize_ddr before CPU Pull");
   if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
   return core().SubmitCpuPull(ready,put,src_offsets,dst_offsets,lengths);
 }
 Status NpuRuntime::QueryCpuPull(const PutHandle& put,CpuPullState* state) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().QueryCpuPull(put,state);
 }
 Status NpuRuntime::WaitCpuPull(const PutHandle& put,std::uint32_t timeout,CpuPullState* state) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().WaitCpuPull(put,timeout,state);
 }
 Status NpuRuntime::CommitPut(const PutHandle& put) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().CommitPut(put);
 }
 Status NpuRuntime::AbortPut(const PutHandle& put) {
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   if (!ddr_initialized()) return Status::NotInitialized("DDR is not initialized");
   return core().AbortPut(put);
 }
@@ -918,6 +950,7 @@ Status NpuRuntime::Shutdown() {
 
 Status NpuRuntime::ShutdownDdr() {
   if (impl_ == nullptr) return Status::OK();
+  std::lock_guard<std::recursive_mutex> lock(impl_->pull_mutex);
   // Cleanup may be called while the application is working on another card.
   // Select the owning device for teardown, then restore the caller's device.
   struct RestoreDevice {

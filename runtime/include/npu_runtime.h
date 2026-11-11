@@ -93,6 +93,8 @@ class NpuRuntime final : public Runtime {
   // Finish the internally retained batch, never replay READ. Explicit PutHandle
   // transactions still use Query/Wait/Commit/Abort with their original handle.
   Status ResolveCpuPull(std::uint32_t timeout_ms = UINT32_MAX);
+  // Fence an unused batch or abort its original Put. Retain both ends and retry on InDoubt.
+  Status CancelCpuPull(const ReadyToken&);
   bool pending_offload() const;
   // Diagnostic RPC: hashes current DDR after commit, outside CPU Pull's data path.
   // Call before freeing/overwriting destination slots, the source's next Ready,

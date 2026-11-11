@@ -24,6 +24,7 @@ class PutHandle {
   // True once the request is recorded, even if the Submit reply was lost.
   // This does not imply remote acceptance or DMA completion.
   bool submitted() const;
+  bool aborting() const;
  private:
   friend class RuntimeCore;
   std::shared_ptr<ConnectorPutState> state_;
@@ -125,6 +126,7 @@ class RuntimeCore {
                               CpuPullSubmitTiming* profile = nullptr);
   Status QueryCpuPull(const PutHandle&, CpuPullState*);
   Status WaitCpuPull(const PutHandle&, std::uint32_t timeout_ms, CpuPullState*);
+  Status CancelCpuPull(const ReadyToken&);
   Status CommitPut(const PutHandle&);
   Status AbortPut(const PutHandle&);
 

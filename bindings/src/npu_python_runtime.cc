@@ -303,6 +303,11 @@ class NpuPythonRuntime final {
     result["profile"] = std::move(timing);
     return result;
   }
+  void CancelCpuPull(const ReadyToken& ready) {
+    Status status;
+    { py::gil_scoped_release release; status = native_->CancelCpuPull(ready); }
+    ThrowIfError(status);
+  }
   void ResolveCpuPull(const py::object& timeout) {
     const auto timeout_ms = timeout.is_none() ? UINT32_MAX : timeout.cast<std::uint32_t>();
     Status status;
@@ -773,6 +778,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Producer synchronization and release_batch remain the application's responsibility. "
            "profile=True returns a profile dictionary with Host stage timings in microseconds instead of None; "
            "profiling is disabled by default and does not include verification or source release.")
+      .def("cancel_cpu_pull", &NpuPythonRuntime::CancelCpuPull,
+           py::arg("ready"), "Fence this batch and abort its Put before notifying the producer. Retry on an unresolved result.")
       .def("resolve_cpu_pull", &NpuPythonRuntime::ResolveCpuPull, py::kw_only(), py::arg("timeout") = py::none(),
            "Finish the internally retained batch_cpu_pull, without replaying READ. Returns None "
            "only after successful commit; failure raises. Does not recover explicit PutHandle transactions.")

@@ -28,6 +28,8 @@ class CpuPullHbmSource {
   Status Register(const OffloadRegionTicket&, const std::vector<ConstBufferView>& inputs, void* producer_stream);
   Status Ready(ReadyToken*); // Application has already synchronized production.
   Status Ready(ConstBufferView input, ReadyToken*); // Select one of the registered tensors.
+  // Local thaw only after the matching consumer outcome. CancelBatch requires
+  // reader-side cancellation or a safely rolled back transfer.
   Status ReleaseBatch(const ReadyToken&);
   Status CancelBatch(const ReadyToken&);
   Status Shutdown();

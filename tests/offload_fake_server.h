@@ -69,8 +69,8 @@ class SharedServer {
     if(id!=info.id||pool.empty())return Status::NotFound("region");*out=info;return Status::OK();
   },[this](const rp::RegionInfo&){return std::make_unique<SharedBackend>(pool);},&control_mutex};
   std::atomic<std::uint16_t> drop{0};
-  std::atomic<int> pool_allocations{0}, inspect_calls{0}, query_calls{0}, submit_calls{0}, sync_submit_calls{0}, connection_count{0};
-  std::atomic<bool> stop{false}, fail_release{false}, disconnect_submit{false}, omit_timing{false};
+  std::atomic<int> control_calls{0}, pool_allocations{0}, inspect_calls{0}, query_calls{0}, submit_calls{0}, sync_submit_calls{0}, connection_count{0};
+  std::atomic<bool> stop{false}, fail_release{false}, disconnect_submit{false}, lose_before_dispatch{false}, omit_timing{false};
   std::string address;
   int listener{-1};std::thread thread;
   std::set<std::uint16_t> ports;
@@ -116,6 +116,7 @@ class SharedServer {
       if(!p::ReadBytes(fd,&req.header,sizeof(req.header)))return Status::Internal("closed");
       if(req.header.magic==kvaf::peer::kProtocolMagic){std::lock_guard<std::mutex> guard(control_mutex);Peer(fd,req.header);}
       else{
+        ++control_calls;
         if(real_parser){service.Serve(fd,req.header);return Status::OK();}
         Require(p::ReadBytes(fd,reinterpret_cast<char*>(&req)+sizeof(req.header),rp::RequestBytes(req.header.command)-sizeof(req.header)),"read control body");Require(req.count<=rp::kMaxSpans,"bounded spans");std::vector<rp::Span> spans(req.count);
         Require(p::ReadBytes(fd,spans.data(),spans.size()*sizeof(rp::Span)),"read spans");
@@ -129,6 +130,8 @@ class SharedServer {
         if(req.header.command==unsigned(rp::Command::SubmitAndWait))++sync_submit_calls;
         if(req.header.command==unsigned(rp::Command::SubmitAndWait)&&disconnect_submit.exchange(false))
           shutdown(fd,SHUT_RDWR);
+        if(req.header.command==unsigned(rp::Command::SubmitAndWait)&&lose_before_dispatch.exchange(false))
+          return Status::Internal("lost request before admission");
         auto response=service.Dispatch(req,spans);auto expected=req.header.command;
         if(omit_timing&&req.header.command==unsigned(rp::Command::SubmitAndWait))response.memory={};
         if(drop.compare_exchange_strong(expected,0))return Status::Internal("dropped reply");
