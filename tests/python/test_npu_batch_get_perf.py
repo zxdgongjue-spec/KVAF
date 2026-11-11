@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
+from perf_execution import BenchmarkExecution, add_execution_mode
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
@@ -270,6 +271,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    add_execution_mode(parser)
     parser.set_defaults(
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
@@ -295,6 +297,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
+    if args.execution_mode == "per-call":
+        if args.adaptive_ub_device:
+            return "per-call mode does not support adaptive-ub-device; select peer-ub-device explicitly"
+        if args.kernel_profile:
+            return "per-call AIV/UBMEM has no kernel cycle profiling; use --no-kernel-profile (Host completion timing)"
+        if args.contention_control_dir is not None and args.contention_graph_calls != 1:
+            return "per-call graph leases support one Get per graph; use --graph-calls 1"
     if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
         return "adaptive-ub-device and peer-ub-device apply only to URMA"
     if args.ubmem_profile_detail and (args.transport != "ubmem" or not args.kernel_profile):
@@ -402,10 +411,12 @@ def print_samples(
     request_length: int,
     miss_count: int,
     token_bytes: int,
+    *, execution_mode: str = "legacy",
 ) -> None:
     mean_ms = statistics.mean(samples)
     result = (
         "PERF_RESULT "
+        f"execution_mode={execution_mode} "
         f"operation={operation} samples={len(samples)} warmup_excluded={warmup} "
         f"request_length={request_length} miss_count={miss_count} "
         f"mean_ms={mean_ms:.3f} "
@@ -761,6 +772,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch.manual_seed(args.seed)
     device = f"npu:{device_id}"
 
+    execution = BenchmarkExecution(
+        kvaf, args.execution_mode, transport=args.transport,
+        put_capacity=min(args.populate_chunk_entries, table_capacity),
+        get_capacity=request_length,
+    )
     runtime = kvaf.NpuRuntime(
         str(kernel),
         batch_get_token_bytes=token_bytes,
@@ -776,6 +792,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         peer_ub_device=args.peer_ub_device,
         adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
         transport=args.transport,
+        **execution.runtime_kwargs,
     )
     runtime.link_to(remote_cpu_service)
     table = None
@@ -784,6 +801,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         print(
             "BATCH_GET_PERF_CONFIG "
+            f"execution_mode={args.execution_mode} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
@@ -846,6 +864,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 populate_source[:count],
                 populate_offsets[:count],
                 populate_lengths[:count],
+                **execution.put_kwargs,
             )
             populated += count
         torch.npu.synchronize()
@@ -898,8 +917,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             miss_count,
             preflight_output_indices,
             output,
+            **execution.get_kwargs,
         )
         torch.npu.synchronize()
+        execution.drain_get(runtime)
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
             entry_pattern[preflight_token_slots[:miss_count_value]],
@@ -973,8 +994,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.contention_control_dir is not None:
             from batch_get_multicard_perf import run_worker
 
+            graph_options = dict(execution.get_kwargs)
+
             def submit(plan, stream):
-                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
+                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output,
+                                  stream=stream, **graph_options)
+
+            def prepare_graph(stream):
+                execution.drain_get(runtime)
+                if args.execution_mode == "per-call":
+                    graph_options["graph_lease"] = runtime.begin_get_graph(
+                        execution.get_config, output, request_length, stream)
+
+            def release_graph(stream, captured):
+                lease = graph_options.pop("graph_lease", None)
+                if lease is not None:
+                    runtime.end_get_graph(lease, stream, discard_result=not captured)
 
             def check_output(plan):
                 slots = (plan[1][:miss_count_value] // token_bytes).to(torch.int64)
@@ -982,7 +1017,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not torch.equal(output.index_select(0, destinations), entry_pattern.index_select(0, slots)):
                     raise AssertionError("contention graph replay payload validation failed")
 
-            run_worker(kvaf, torch, args, create_request_plan, submit, check_output)
+            run_worker(kvaf, torch, args, create_request_plan, submit, check_output,
+                       prepare_graph=prepare_graph, release_graph=release_graph)
             return 0
 
         if args.kernel_profile:
@@ -1004,9 +1040,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count,
                 output_indices,
                 output,
+                **execution.get_kwargs,
             )
             # Keep caller-owned request Tensors alive through completion.
             torch.npu.synchronize()
+            execution.drain_get(runtime)
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
@@ -1027,9 +1065,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count,
                 output_indices,
                 output,
+                **execution.get_kwargs,
             )
             submitted = time.perf_counter()
             torch.npu.synchronize()
+            execution.drain_get(runtime)
             completed = time.perf_counter()
             submit_samples.append((submitted - begin) * 1000.0)
             synchronize_samples.append((completed - submitted) * 1000.0)
@@ -1046,6 +1086,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            execution_mode=args.execution_mode,
         )
         print_samples(
             "batch_get_synchronize",
@@ -1054,6 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            execution_mode=args.execution_mode,
         )
         print_samples(
             "batch_get",
@@ -1062,6 +1104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            execution_mode=args.execution_mode,
         )
         if args.kernel_profile:
             print_kernel_profile(

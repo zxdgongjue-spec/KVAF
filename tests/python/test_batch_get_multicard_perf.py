@@ -27,6 +27,8 @@ device = int(os.environ["DEVICE_ID"])
 assert option("--token-bytes") == "656"
 assert option("--table-capacity") == "4096"
 assert "--no-kernel-profile" in sys.argv
+assert option("--execution-mode") in ("legacy", "per-call")
+if option("--execution-mode") == "per-call": assert option("--contention-graph-calls") == "1"
 transport = option("--transport")
 assert transport == os.environ["EXPECTED_TRANSPORT"]
 assert option("--aiv-cores") in os.environ["EXPECTED_CORES"].split()
@@ -56,6 +58,17 @@ pathlib.Path(option("--contention-result")).write_text(json.dumps(result))
 
 
 class MulticardTests(unittest.TestCase):
+    def test_per_call_controller_and_graph_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rejected = self.run_controller(root, options=("--execution-mode", "per-call"))
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("--graph-calls 1", rejected.stderr)
+            result = self.run_controller(root, options=("--execution-mode", "per-call", "--graph-calls", "1"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with (root / "results/summary.csv").open() as source:
+                self.assertTrue(all(row["execution_mode"] == "per-call" for row in csv.DictReader(source)))
+
     def run_controller(self, root, fail=None, transport="ubmem", options=(), cores=16,
                        jettys=2, inflight=2048, expected_transport=None, core_env="16"):
         runner = root / "runner"
@@ -223,9 +236,11 @@ class MulticardTests(unittest.TestCase):
             plans = iter(range(4))
             with patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()):
                 multi.run_worker(SimpleNamespace(AclGraph=Graph), torch, args, lambda: next(plans),
-                                 lambda plan, stream: submitted.append(plan), validated.append)
+                                 lambda plan, stream: submitted.append(plan), validated.append,
+                                 prepare_graph=lambda stream: submitted.append("lease"),
+                                 release_graph=lambda stream, captured: submitted.append(("release", captured)))
             result = json.loads(args.contention_result.read_text())
-            self.assertEqual(submitted, [0, "capture", 0, 1, 2, 3, "end_capture", "reset"])
+            self.assertEqual(submitted, [0, "lease", "capture", 0, 1, 2, 3, "end_capture", "reset", ("release", True)])
             self.assertEqual(validated, [3, 3])
             self.assertEqual(result["calls"] % 4, 0)
             self.assertEqual(result["payload_bytes"], result["calls"] * 4096 * 656)

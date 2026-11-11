@@ -14,8 +14,11 @@ import subprocess
 import sys
 import time
 
+from perf_execution import add_execution_mode
 
-def run_worker(kvaf, torch, args, make_plan, submit, check_output):
+
+def run_worker(kvaf, torch, args, make_plan, submit, check_output,
+               *, prepare_graph=None, release_graph=None):
     """Reuse the normal benchmark's table, request generator and validation."""
     control = args.contention_control_dir
     device = int(os.environ["DEVICE_ID"])
@@ -28,6 +31,8 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
     capturing = False
     captured = False
     try:
+        if prepare_graph:
+            prepare_graph(stream)
         print(f"MULTICARD_GRAPH_CAPTURE_BEGIN calls={len(plans)}", flush=True)
         graph.capture_begin(stream)
         capturing = True
@@ -74,6 +79,7 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
             "calls": calls, "payload_bytes": payload_bytes,
             "bandwidth_GBps": payload_bytes / (end - begin) / 1e9,
             "graph_calls": len(plans), "verified": True,
+            "execution_mode": getattr(args, "execution_mode", "legacy"),
         }
         args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
         print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)
@@ -86,6 +92,8 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
         if captured:
             graph.synchronize(stream)
         graph.reset()
+        if release_graph:
+            release_graph(stream, captured)
 
 
 def worker_error(device, process, log_path, phase):
@@ -114,6 +122,7 @@ def run_group(args, devices, directory):
             command = [
                 str(runner), str(args.build_dir),
                 "--transport", args.transport,
+                "--execution-mode", args.execution_mode,
                 "--request-length", str(args.requests), "--miss-count", str(args.requests),
                 "--table-capacity", str(args.table_capacity),
                 "--token-bytes", str(args.token_bytes), "--tokens-per-block", str(args.tokens_per_block),
@@ -193,6 +202,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     for solo, shared in zip(isolated, concurrent):
         ratio = shared["bandwidth_GBps"] / solo["bandwidth_GBps"]
         row = {
+            "execution_mode": config.get("execution_mode", "legacy"),
             "device": solo["device"], "isolated_GBps": solo["bandwidth_GBps"],
             "concurrent_GBps": shared["bandwidth_GBps"],
             "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
@@ -237,7 +247,7 @@ def write_summary(directory, isolated, concurrent, config=None):
         writer.writerows(rows)
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
-        "transport", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
+        "transport", "execution_mode", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
         "seconds", "graph_calls", "warmup", "seed", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
@@ -356,6 +366,7 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20260903)
     parser.add_argument("--transport", choices=("ubmem", "urma"), default="ubmem")
+    add_execution_mode(parser)
     parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"))
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
@@ -370,6 +381,8 @@ def main(argv=None):
             print(f"MULTICARD_SUMMARY_FAILED {error}", file=sys.stderr)
             return 1
         return 0
+    if args.execution_mode == "per-call" and args.graph_calls != 1:
+        parser.error("per-call graph leases support one Get; use --graph-calls 1 in both comparison runs")
     cores = args.aiv_cores
     if cores is None:
         cores = [int(value) for value in os.environ.get("KVAF_BATCH_GET_AIV_CORES", "16").split()]
@@ -392,7 +405,7 @@ def main(argv=None):
     config["peak_concurrent_ddr_bytes"] = len(args.devices) * config["ddr_bytes_per_device"]
     config["aiv_cores"] = cores if len(cores) > 1 else cores[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
+    print(f"MULTICARD_CONFIG execution_mode={args.execution_mode} transport={args.transport} devices={args.devices} aiv_cores={cores} "
           f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
           f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "

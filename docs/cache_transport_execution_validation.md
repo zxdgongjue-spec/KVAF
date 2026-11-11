@@ -416,3 +416,123 @@ bash -n tests/run_cache_execution_e2e.sh
 
 这些检查通过只表示脚本和便携模型通过，不会生成真机 PASS。当前开发机没有 Ascend
 设备，真机报告需要在目标 CPU/NPU 环境实际运行后取得。
+
+## 7. 新旧执行路径的性能对照
+
+性能脚本新增 `--execution-mode legacy|per-call`，默认仍为 `legacy`。
+legacy 不向绑定传入新接口参数，可继续用于旧接口回归；per-call 显式开启 Dispatcher，
+只启用本脚本实际使用的 Put/Get 配置，并在每次调用传入对应 execution。
+请求数据、随机种子、表容量、worker/core 数和预热规则保持原脚本行为。
+
+旧性能脚本通过只说明兼容路径没有明显回退；全量 E2E 通过说明新路径功能符合预期，
+二者都不能代替 per-call 性能测量。本节测试不实施设计文档第 14 节的资源共享方案。
+
+| 入口 | 两种模式的覆盖与计时 |
+|---|---|
+| `tests/run_aicpu_gather_read_sweep.sh` | Gather 设备分阶段计时及同步 Host 调用耗时 |
+| `tests/run_aicpu_cpu_push_scatter_sweep.sh` | Scatter 设备分阶段计时及同步 Host 调用耗时 |
+| `tests/run_remote_cpu_batch_get_perf.sh` | URMA AIV / UBMEM Get 的提交、完成等待和调用到完成耗时 |
+| `tests/run_remote_cpu_runtime_perf.sh` | 固定配置的 Put/Get 及 Runtime 操作耗时 |
+| `tests/python/test_npu_batch_put.py` | 同步 Put 调用耗时；在原构建和运行环境下追加模式参数 |
+| `tests/run_remote_cpu_batch_get_miss_count_perf.sh` | 两种模式可使用相同 Host 口径扫描；默认 legacy 保留原设备周期扫描 |
+| `tests/run_remote_cpu_batch_get_multicard_perf.sh` | 显式 graph 租约下的多卡重放吞吐；per-call 要求 `--graph-calls 1` |
+
+### 7.1 AICPU Gather / Scatter
+
+在 CPU 服务已启动且两端产物匹配的条件下，使用同一构建对比两个入口：
+
+```bash
+for perf_mode in legacy per-call; do
+  KVAF_AICPU_TOKEN_BYTES=656 \
+  KVAF_AICPU_MISS_COUNTS="2048 4096 8192" \
+  KVAF_AICPU_WORKERS=5 \
+  KVAF_AICPU_SWEEP_LOG_DIR="$PWD/reports/gather-$perf_mode" \
+  bash tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
+    --execution-mode "$perf_mode" \
+    --peer 127.0.0.1:38999 --device-id 6 --warmup 10 --iterations 100
+done
+```
+
+每轮使用尚不存在的输出目录。Scatter 使用相同参数，将入口替换为
+`tests/run_aicpu_cpu_push_scatter_sweep.sh`，并为其指定不同输出目录；其日志目录变量
+同样为 `KVAF_AICPU_SWEEP_LOG_DIR`。若原命令限制了 `--table-capacity` 等负载参数，
+两种模式均沿用相同值。建议交替运行几轮，不将单轮波动当成固定回退。
+
+日志及 CSV 新增 `execution_mode`、`host_p50_us`、`host_p50_GBps`：
+
+- `device_p50_us` / `p50_GBps` 保持原设备总耗时和带宽口径。
+- `host_p50_us` 是同步 `batch_get` 调用到返回的中位数，包括 Host 调度、注册/资源
+  准备、完成处理和 profile 收集；不包含请求生成、数据初始化及输出正确性比较。
+- `host_p50_GBps` 按有效字节数除以 Host P50 计算，采用十进制 GB/s。
+- 设备阶段仍为每轮 worker 最大耗时的均值，不能相加得到 Host 或设备 P50。
+
+### 7.2 AIV / UBMEM 的 Host 性能
+
+两个模式都可运行原单点脚本，只需追加 `--execution-mode`。例如：
+
+```bash
+for perf_mode in legacy per-call; do
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+  bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+    --execution-mode "$perf_mode" --transport urma \
+    --request-length 32768 --miss-count 4096 --table-capacity 4096 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --aiv-cores 5 --jettys-per-core 2 --no-kernel-profile \
+    --warmup 10 --iterations 100
+done
+```
+
+测试 UBMEM 时将 `--transport urma` 替换为 `--transport ubmem`。结果行带
+`execution_mode`；`operation=batch_get` 的 `p50_ms` 是调用到完成的 Host 耗时。
+per-call 在外部 stream synchronize 后调用 `drain_get()`，其完成检查、注册释放及
+租约回收计入当前样本，避免把这部分成本留到下一轮。`batch_get_synchronize` 包含
+这段完成处理，不能将其解释成纯设备等待。
+
+使用原 miss-count 扫描入口进行同口径对照：
+
+```bash
+for perf_mode in legacy per-call; do
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+  KVAF_BATCH_GET_TOKEN_BYTES=656 \
+  KVAF_BATCH_GET_MISS_COUNTS="2048 4096 8192" \
+  KVAF_BATCH_GET_AIV_CORES=5 KVAF_BATCH_GET_JETTYS_PER_CORE=2 \
+  KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR="$PWD/reports/aiv-host-$perf_mode" \
+  bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
+    --execution-mode "$perf_mode" --timing host --transport urma \
+    --table-capacity 4096 --request-length 32768 --warmup 10 --iterations 100
+done
+```
+
+Host 扫描 CSV 标记 `timing=host_call_to_completion`，输出 `host_*_us`、
+`submit_*_us`、`completion_*_us` 和 `host_p50_GBps`。UBMEM 不扫描无效的 Jetty 数。
+任一子进程失败或结果未标记为所选模式时，扫描失败，不生成 PASS。
+
+当前 per-call AIV/UBMEM 不支持 `start_batch_get_kernel_profile`。脚本遇到
+`--kernel-profile` 会明确报错，不退回 legacy。miss-count 扫描默认 legacy 使用
+原 kernel cycle 指标，默认 per-call 使用 Host 指标；对比时两边显式设置
+`--timing host`。`--timing kernel --execution-mode per-call` 不受支持。
+Host 对照扫描采用固定路由，不执行 adaptive 校准；如需固定 CPU UB 设备，两边使用
+相同 `--peer-ub-device`。单点 legacy 的原 adaptive 和 cycle profiling 能力保留。
+
+### 7.3 多卡 graph 与便携检查
+
+per-call graph 当前每个租约只允许捕获一次 Get，测试时两种模式均指定
+`--graph-calls 1`，例如在原多卡命令后追加：
+
+```text
+--execution-mode per-call --graph-calls 1
+```
+
+脚本在 capture 前申请 graph 租约，在 synchronize、销毁 graph 后归还。
+per-call 不支持默认的 256 次 Get 捕获，会在启动 worker 前提示修改参数。
+graph 重放吞吐只覆盖已捕获设备任务，不包含每次 eager 调用的 Host Dispatcher 开销，
+不能代替 7.2 节的调用到完成测量。
+
+本次只调整性能脚本及说明，不要求重新编译 kernel 或服务；per-call 需要当前分支
+匹配的绑定及 CPU 服务。便携检查覆盖模式及容量配置、计时口径、子进程参数传递、
+扫描失败传播和 graph 生命周期，不会宣称真机性能通过：
+
+```bash
+PYTHONPATH="$PWD/tests/python" python3 -m unittest \
+  test_perf_execution test_batch_get_inflight_config test_batch_get_multicard_perf
+```

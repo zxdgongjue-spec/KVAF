@@ -11,10 +11,20 @@ fi
 KVAF_BUILD_DIR="$1"
 shift
 transport=urma
+execution_mode=legacy
+timing=auto
 adaptive_requested=false
 base_options=()
 while (($#)); do
   case "$1" in
+    --timing)
+      if (($# < 2)); then echo "ERROR: --timing requires host or kernel" >&2; exit 2; fi
+      timing="$2"; shift 2 ;;
+    --timing=*) timing="${1#*=}"; shift ;;
+    --execution-mode)
+      if (($# < 2)); then echo "ERROR: --execution-mode requires legacy or per-call" >&2; exit 2; fi
+      execution_mode="$2"; shift 2 ;;
+    --execution-mode=*) execution_mode="${1#*=}"; shift ;;
     --transport)
       if (($# < 2)); then echo "ERROR: --transport requires urma or ubmem" >&2; exit 2; fi
       transport="$2"
@@ -27,6 +37,30 @@ while (($#)); do
 done
 base_options+=(--transport "$transport")
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "$execution_mode" in
+  legacy|per-call) ;;
+  *) echo "ERROR: --execution-mode must be legacy or per-call" >&2; exit 2 ;;
+esac
+if [[ "$timing" == auto ]]; then
+  if [[ "$execution_mode" == per-call ]]; then timing=host; else timing=kernel; fi
+fi
+case "$timing" in
+  host)
+    if [[ "$adaptive_requested" == true ]]; then
+      echo "ERROR: Host comparison sweep requires an explicitly selected peer UB device, not adaptive calibration" >&2
+      exit 2
+    fi
+    exec "${PYTHON:-python3}" "$KVAF_ROOT/tests/python/batch_get_host_sweep.py" \
+      "$KVAF_BUILD_DIR" --execution-mode "$execution_mode" "${base_options[@]}"
+    ;;
+  kernel)
+    if [[ "$execution_mode" == per-call ]]; then
+      echo "ERROR: per-call AIV/UBMEM kernel cycle profiling is unavailable; use --timing host" >&2
+      exit 2
+    fi
+    ;;
+  *) echo "ERROR: --timing must be host or kernel" >&2; exit 2 ;;
+esac
 : "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 # Space-separated overrides allow a focused shape without editing the script.
 read -r -a KVAF_BATCH_GET_TOKEN_BYTES <<< "${KVAF_BATCH_GET_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"
@@ -73,7 +107,7 @@ echo "BATCH_GET_MISS_SWEEP_LOG_DIR path=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"
 KVAF_BATCH_GET_SWEEP_COMBINATIONS=$((${#KVAF_BATCH_GET_TOKEN_BYTES[@]} *
   ${#KVAF_BATCH_GET_MISS_COUNTS[@]} * ${#KVAF_BATCH_GET_AIV_CORES[@]} *
   ${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]}))
-echo "BATCH_GET_MISS_SWEEP_PLAN transport=$transport token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
+echo "BATCH_GET_MISS_SWEEP_PLAN execution_mode=legacy timing=kernel_cycles transport=$transport token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
 
 extract_field() {
   local record="$1"
@@ -465,9 +499,9 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device'
+    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,execution_mode,timing'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,legacy,kernel_cycles\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \

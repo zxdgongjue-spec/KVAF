@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import statistics
 import sys
 import time
 
 from test_batch_get import timing_stats
 from npu_eids import parse_npu_eids
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tests" / "python"))
+from perf_execution import BenchmarkExecution, add_execution_mode
 
 DDR_BUDGET_BYTES = 100 * 1024**3
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -19,6 +23,7 @@ PREFIXES = {"gather_read": "AICPU_GATHER_READ", "cpu_push_scatter": "AICPU_CPU_P
 
 def parse_args(argv=None, *, mode="gather_read"):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    add_execution_mode(p)
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
     p.add_argument("--npu-eids", type=parse_npu_eids,
@@ -91,6 +96,8 @@ def token_pattern(torch, token_ids, byte_ids):
 def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
     device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
     summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
+    host = timing_stats([sample["python_call_us"] for sample in profiles], payload_bytes)
+    summary.update(host_p50_us=host["p50_us"], host_p50_GBps=host["p50_GBps"])
     phases = (
         ("lookup_table_us", "request_us"),
         ("address_send_us", "source_write_us"),
@@ -118,7 +125,9 @@ def print_measurements(a, summary, *, mode="gather_read"):
     prefix = PREFIXES[mode]
     source_label = " source_mode=table" if mode == "gather_read" else ""
     print(f"{prefix}_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
-          f"p50_GBps={summary['p50_GBps']:.3f}{source_label} phase_aggregation=mean_of_per_round_worker_max")
+          f"p50_GBps={summary['p50_GBps']:.3f}{source_label} execution_mode={a.execution_mode} "
+          f"host_p50_us={summary['host_p50_us']:.1f} host_p50_GBps={summary['host_p50_GBps']:.3f} "
+          "phase_aggregation=mean_of_per_round_worker_max")
     if mode == "gather_read":
         request_field = "lookup_table_us"
         print(f"  {request_field}={summary[request_field]:.1f} | "
@@ -135,12 +144,13 @@ def print_measurements(a, summary, *, mode="gather_read"):
         print(f"    ready_wait_us={summary['ready_wait_us']:.1f} | "
               f"scatter_us={summary['scatter_us']:.1f}")
         print(f"  done_wait_us={summary['done_wait_us']:.1f}")
-    result = dict(token_bytes=a.token_bytes, miss_count=a.miss_count, workers=a.workers, **summary)
+    result = dict(execution_mode=a.execution_mode, token_bytes=a.token_bytes,
+                  miss_count=a.miss_count, workers=a.workers, **summary)
     if mode == "gather_read":
         result = dict(source_mode="table", **result)
     fields = []
     for key, value in result.items():
-        formatted = f"{value:.3f}" if key == "p50_GBps" else f"{value:.1f}" if isinstance(value, float) else str(value)
+        formatted = f"{value:.3f}" if key.endswith("GBps") else f"{value:.1f}" if isinstance(value, float) else str(value)
         fields.append(f"{key}={formatted}")
     print(f"{prefix}_RESULT " + " ".join(fields), flush=True)
 
@@ -155,10 +165,16 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     _, reserved = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
+    execution = BenchmarkExecution(
+        kvaf, a.execution_mode, executor="aicpu",
+        algorithm="gather" if mode == "gather_read" else "scatter",
+        put_capacity=128, get_capacity=length,
+    )
     runtime = kvaf.NpuRuntime(
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
         npu_core_count=a.workers, aicpu_batch_get_mode=mode, npu_eids=a.npu_eids,
+        **execution.runtime_kwargs,
     )
     profiles = []
     # Source and output allocations stay alive until the session is closed.
@@ -167,7 +183,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     output = torch.empty((length, a.token_bytes), dtype=torch.uint8, device=device)
     byte_ids = torch.arange(a.token_bytes, dtype=torch.int64, device=device).unsqueeze(0)
     table = device_table = None
-    print(f"{prefix}_CONFIG table_capacity={a.table_capacity} "
+    print(f"{prefix}_CONFIG execution_mode={a.execution_mode} table_capacity={a.table_capacity} "
           f"tokens_per_block={a.tokens_per_block} request_length={length} "
           f"token_bytes={a.token_bytes} miss_count={a.miss_count} workers={a.workers} "
           f"source_pool_GiB={ddr_bytes / 1024**3:.3f} "
@@ -187,7 +203,8 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         inputs = (device_table, indices, offsets, miss_count, rows, output)
         stream.synchronize()
         begin = time.perf_counter_ns()
-        measured = runtime.batch_get(*inputs, stream=stream, synchronize=True, profile=profile)
+        measured = runtime.batch_get(*inputs, stream=stream, synchronize=True, profile=profile,
+                                     **execution.get_kwargs)
         elapsed_us = (time.perf_counter_ns() - begin) / 1000
         # NPU comparison consumes BatchGet results and checks every row, including untouched rows.
         if not torch.equal(output, expected):
@@ -208,7 +225,8 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
                                dtype=torch.int64, device=device)
             source[:count].copy_(token_pattern(torch, ids, byte_ids).reshape(count, block_bytes))
             runtime.batch_put(list(range(start, start + count)), source[:count],
-                              [i * block_bytes for i in range(count)], [block_bytes] * count, stream)
+                              [i * block_bytes for i in range(count)], [block_bytes] * count, stream,
+                              **execution.put_kwargs)
         table = runtime.prepare_access_table(torch.arange(a.table_capacity, dtype=torch.int64))
         device_table = runtime.access_table_view(table, device="npu", capacity=a.table_capacity)
         stream.synchronize()

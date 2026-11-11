@@ -20,6 +20,7 @@ import kvaf
 
 from backend import detect_torch_backend
 from npu_eids import parse_npu_eids
+from perf_execution import BenchmarkExecution, add_execution_mode
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
 DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
@@ -79,7 +80,7 @@ def validate_batch(
         runtime.release_access_table(table)
 
 
-def main(transport: str = "urma") -> int:
+def main(transport: str = "urma", execution_mode: str = "legacy") -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
@@ -198,6 +199,8 @@ def main(transport: str = "urma") -> int:
     torch.npu.synchronize()
     stream = torch.npu.current_stream()
 
+    execution = BenchmarkExecution(kvaf, execution_mode, transport=transport,
+                                   put_capacity=rows)
     runtime = kvaf.NpuRuntime(
         str(batch_get_kernel),
         transport=transport,
@@ -209,6 +212,7 @@ def main(transport: str = "urma") -> int:
         jettys_per_core=jettys_per_core,
         peer_ub_device=peer_ub_device,
         npu_eids=npu_eids,
+        **execution.runtime_kwargs,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -219,6 +223,7 @@ def main(transport: str = "urma") -> int:
     try:
         print(
             "RUNTIME_NPU_BATCH_PUT_CONFIG "
+            f"execution_mode={execution_mode} "
             f"rows={rows} block_bytes={block_bytes} npu_cores={npu_core_count} "
             f"scenario={'dsa_single_layer' if configured else 'bandwidth_baseline'} "
             f"pool_rows={pool_rows} n_layers={n_layers} q_capacity={q_capacity} "
@@ -243,7 +248,7 @@ def main(transport: str = "urma") -> int:
 
         def execute() -> None:
             nonlocal committed
-            runtime.batch_put(keys, source, offsets, lengths, stream)
+            runtime.batch_put(keys, source, offsets, lengths, stream, **execution.put_kwargs)
             committed = True
 
         def release() -> None:
@@ -282,6 +287,7 @@ def main(transport: str = "urma") -> int:
         useful_gbps = rows * block_bytes / 1_000_000_000.0 / (mean_ms / 1000.0)
         print(
             "PERF_RESULT metric=runtime_batch_put_sync_call_to_return "
+            f"execution_mode={execution_mode} "
             f"samples={iterations} warmup_excluded={warmup} rows={rows} "
             f"block_bytes={block_bytes} npu_cores={npu_core_count} "
             f"mean_ms={mean_ms:.3f} "
@@ -309,4 +315,6 @@ def main(transport: str = "urma") -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
-    raise SystemExit(main(parser.parse_args().transport))
+    add_execution_mode(parser)
+    args = parser.parse_args()
+    raise SystemExit(main(args.transport, args.execution_mode))

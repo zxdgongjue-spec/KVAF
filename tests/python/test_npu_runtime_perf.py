@@ -23,6 +23,7 @@ import kvaf
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
+from perf_execution import BenchmarkExecution, add_execution_mode
 
 
 AIV_CORES = 32
@@ -50,9 +51,11 @@ def print_samples(
     warmup: int,
     units: str,
     payload_bytes_per_call: int = 0,
+    *, execution_mode: str = "legacy",
 ) -> None:
     result = (
         "PERF_RESULT "
+        f"execution_mode={execution_mode} "
         f"operation={operation} samples={len(samples)} warmup_excluded={warmup} "
         f"mean_ms={statistics.mean(samples):.3f} "
         f"p50_ms={percentile(samples, 0.50):.3f} "
@@ -73,7 +76,7 @@ def print_samples(
     print(result)
 
 
-def main(batch: int = 16, transport: str = "urma") -> int:
+def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy") -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(f"SKIP: NPU benchmark requires torch_npu; detected {backend.name}.")
@@ -206,6 +209,8 @@ def main(batch: int = 16, transport: str = "urma") -> int:
     ).to(torch.uint8).contiguous()
     kv_data = entry_pattern.reshape(1, block_bytes).repeat(PUT_BATCH_SIZE, 1)
     output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
+    execution = BenchmarkExecution(kvaf, execution_mode, transport=transport,
+                                   put_capacity=PUT_BATCH_SIZE, get_capacity=max(requests, PUT_BATCH_SIZE))
     runtime = kvaf.NpuRuntime(
         str(kernel),
         transport=transport,
@@ -217,6 +222,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
         jettys_per_core=jettys_per_core,
         batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
+        **execution.runtime_kwargs,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -229,7 +235,8 @@ def main(batch: int = 16, transport: str = "urma") -> int:
     try:
         print(
             "RUNTIME_PERF_CONFIG "
-            f"transport=cpu_service_link batch={batch} table_capacity={table_capacity} "
+            f"execution_mode={execution_mode} "
+            f"transport={transport} batch={batch} table_capacity={table_capacity} "
             f"total_tokens={total_tokens} ddr_bytes={ddr_bytes} "
             f"put_batch_size={PUT_BATCH_SIZE} "
             f"requests={requests} active_percent={active_percent} "
@@ -240,20 +247,22 @@ def main(batch: int = 16, transport: str = "urma") -> int:
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
             f"warmup={warmup} iterations={iterations} "
-            "batch_put_backend=aiv_direct_hccp timing=call_to_stream_completion"
+            f"batch_put_backend={'ubmem' if transport == 'ubmem' else 'aiv_direct_hccp'} "
+            "timing=call_to_stream_completion"
         )
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
         begin = time.perf_counter()
         runtime.initialize(ddr_bytes, source_stride)
         initialize_ms = (time.perf_counter() - begin) * 1000.0
-        print(f"PERF_RESULT operation=initialize samples=1 elapsed_ms={initialize_ms:.3f} kind=lifecycle")
+        print(f"PERF_RESULT execution_mode={execution_mode} operation=initialize "
+              f"samples=1 elapsed_ms={initialize_ms:.3f} kind=lifecycle")
         print("RUNTIME_PERF_PHASE_DONE phase=initialize")
 
         # Verify the complete CPU-DDR data path before accepting steady-state samples.
         print("RUNTIME_PERF_PHASE_BEGIN phase=correctness_preflight")
         preflight_keys = all_keys[:PUT_BATCH_SIZE]
-        runtime.batch_put(preflight_keys, kv_data, put_offsets, lengths)
+        runtime.batch_put(preflight_keys, kv_data, put_offsets, lengths, **execution.put_kwargs)
         torch.npu.synchronize()
         preflight_table = runtime.prepare_access_table(preflight_keys)
         preflight_device_table = runtime.access_table_view(
@@ -274,6 +283,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
             preflight_miss_count,
             preflight_indices,
             preflight_output,
+            **execution.get_kwargs,
         )
         torch.npu.synchronize()
         if not torch.equal(
@@ -281,6 +291,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
             entry_pattern[0].expand(PUT_BATCH_SIZE, -1),
         ):
             raise AssertionError("Runtime performance preflight BatchPut/BatchGet validation failed")
+        execution.drain_get(runtime)
         runtime.release_access_table(preflight_table)
         preflight_table = None
         runtime.batch_free(preflight_keys)
@@ -292,25 +303,26 @@ def main(batch: int = 16, transport: str = "urma") -> int:
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_put")
         for key_batch in key_batches[:warmup]:
-            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths, **execution.put_kwargs)
         torch.npu.synchronize()
         batch_put_samples: list[float] = []
         for key_batch in key_batches[warmup : warmup + iterations]:
             begin = time.perf_counter()
-            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths, **execution.put_kwargs)
             torch.npu.synchronize()
             batch_put_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
             "batch_put", batch_put_samples, warmup,
             f"{PUT_BATCH_SIZE}_kv_blocks_per_call",
             PUT_BATCH_SIZE * block_bytes,
+            execution_mode=execution_mode,
         )
 
         # Finish the one-time data population. It is deliberately excluded
         # from BatchPut samples, but is necessary for a full AccessTable and
         # valid random BatchGet indices.
         for key_batch in key_batches[warmup + iterations :]:
-            runtime.batch_put(key_batch, kv_data, put_offsets, lengths)
+            runtime.batch_put(key_batch, kv_data, put_offsets, lengths, **execution.put_kwargs)
         torch.npu.synchronize()
         print("RUNTIME_PERF_PHASE_DONE phase=batch_put")
 
@@ -320,6 +332,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
         prepare_ms = (time.perf_counter() - begin) * 1000.0
         print(
             "PERF_RESULT "
+            f"execution_mode={execution_mode} "
             "operation=prepare_access_table samples=1 "
             f"keys={table_capacity} elapsed_ms={prepare_ms:.3f}"
         )
@@ -335,6 +348,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
         access_view_ms = (time.perf_counter() - begin) * 1000.0
         print(
             "PERF_RESULT "
+            f"execution_mode={execution_mode} "
             "operation=access_table_view_npu samples=1 "
             f"entries={table_capacity} elapsed_ms={access_view_ms:.3f}"
         )
@@ -387,10 +401,12 @@ def main(batch: int = 16, transport: str = "urma") -> int:
             torch.npu.synchronize()
             warmup_inputs.append((indices, offsets, output_indices, miss_count))
             runtime.batch_get(
-                device_table, indices, offsets, miss_count, output_indices, output
+                device_table, indices, offsets, miss_count, output_indices, output,
+                **execution.get_kwargs,
             )
         torch.npu.synchronize()
         warmup_inputs.clear()
+        execution.drain_get(runtime)
 
         batch_get_samples: list[float] = []
         submit_samples: list[float] = []
@@ -407,10 +423,12 @@ def main(batch: int = 16, transport: str = "urma") -> int:
 
             begin = time.perf_counter()
             runtime.batch_get(
-                device_table, indices, offsets, miss_count, output_indices, output
+                device_table, indices, offsets, miss_count, output_indices, output,
+                **execution.get_kwargs,
             )
             submitted = time.perf_counter()
             torch.npu.synchronize()
+            execution.drain_get(runtime)
             completed = time.perf_counter()
             submit_samples.append((submitted - begin) * 1000.0)
             synchronize_samples.append((completed - submitted) * 1000.0)
@@ -419,15 +437,18 @@ def main(batch: int = 16, transport: str = "urma") -> int:
         print_samples(
             "batch_get_submit", submit_samples, warmup,
             f"{requests}_requests_per_call",
+            execution_mode=execution_mode,
         )
         print_samples(
             "batch_get_synchronize", synchronize_samples, warmup,
             f"{requests}_requests_per_call",
+            execution_mode=execution_mode,
         )
         print_samples(
             "batch_get", batch_get_samples, warmup,
             f"{mean_active_requests:.3f}_mean_active_of_{requests}_requests_per_call",
             int(mean_active_requests * token_bytes),
+            execution_mode=execution_mode,
         )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_get")
 
@@ -441,6 +462,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
         device_table = None
         print(
             "PERF_RESULT "
+            f"execution_mode={execution_mode} "
             "operation=release_access_table samples=1 "
             f"keys={table_capacity} elapsed_ms={release_ms:.3f}"
         )
@@ -459,7 +481,8 @@ def main(batch: int = 16, transport: str = "urma") -> int:
             batch_free_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
             "batch_free", batch_free_samples, warmup,
-            f"{PUT_BATCH_SIZE}_keys_per_call"
+            f"{PUT_BATCH_SIZE}_keys_per_call",
+            execution_mode=execution_mode,
         )
         print("RUNTIME_PERF_PHASE_DONE phase=batch_free")
         return 0
@@ -473,11 +496,14 @@ def main(batch: int = 16, transport: str = "urma") -> int:
             begin = time.perf_counter()
             runtime.shutdown()
             shutdown_ms = (time.perf_counter() - begin) * 1000.0
-            print(f"PERF_RESULT operation=shutdown samples=1 elapsed_ms={shutdown_ms:.3f} kind=lifecycle")
+            print(f"PERF_RESULT execution_mode={execution_mode} operation=shutdown "
+                  f"samples=1 elapsed_ms={shutdown_ms:.3f} kind=lifecycle")
         print("RUNTIME_PERF_PHASE_DONE phase=shutdown")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
-    raise SystemExit(main(transport=parser.parse_args().transport))
+    add_execution_mode(parser)
+    args = parser.parse_args()
+    raise SystemExit(main(transport=args.transport, execution_mode=args.execution_mode))
