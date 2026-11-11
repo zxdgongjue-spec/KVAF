@@ -57,7 +57,7 @@ target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
   ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/access_operator/include)
 target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
 add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
-add_test(NAME kvaf_cpu_push_input_bounds_test COMMAND kvaf_cpu_push_scatter_test --input-bounds)
+add_test(NAME kvaf_cpu_push_request_shape_test COMMAND kvaf_cpu_push_scatter_test --request-shape)
 
 add_executable(kvaf_cpu_push_shutdown_test cpu_push_shutdown_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/host/cpu_push_host.cc)
@@ -190,6 +190,18 @@ if(KVAF_TEST_URMA_INCLUDE_DIR)
   target_link_libraries(kvaf_aicpu_session_registry_test PRIVATE kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME kvaf_aicpu_session_registry_test COMMAND kvaf_aicpu_session_registry_test)
   set_tests_properties(kvaf_aicpu_session_registry_test PROPERTIES TIMEOUT 10)
+  add_executable(kvaf_aicpu_gather_execution_test aicpu_gather_execution_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/control_kernel.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/transfer.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/gather_read.cc)
+  target_include_directories(kvaf_aicpu_gather_execution_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel
+    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel
+    ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/runtime/include
+    ${PROJECT_SOURCE_DIR}/access_operator/include ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_aicpu_gather_execution_test PRIVATE kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME kvaf_aicpu_gather_execution_test COMMAND kvaf_aicpu_gather_execution_test)
+  set_tests_properties(kvaf_aicpu_gather_execution_test PROPERTIES TIMEOUT 20)
 endif()
 
 add_executable(kvaf_cache_region_service_test cache_region_service_test.cc)

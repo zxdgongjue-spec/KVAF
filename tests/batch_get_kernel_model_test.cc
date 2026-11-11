@@ -205,6 +205,13 @@ struct Fixture {
 };
 
 int main() {
+  {
+    Fixture f(257, 1, 1, 128);
+    const auto canonical = reinterpret_cast<uint64_t>(f.remote.data()) + 0x100000;
+    for (unsigned i = 0; i < f.addresses.size(); ++i) f.addresses[i] = canonical + 16 * i;
+    f.entities[0].remote_host_ddr_address = canonical;
+    f.Run(257); // registered base below canonical base: unsigned bias wraps
+  }
   for (const auto& shape : {std::array<uint32_t, 3>{1, 1, 2048}, {1, 16, 2048},
                            {1, 64, 2048}, {4, 4, 2048}, {3, 3, 2049}, {1, 1, 2},
                            {1, 16, 0}}) {

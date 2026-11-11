@@ -33,11 +33,12 @@ bool PostBatch(Queue& worker, urma_jfs_wr_t* first, urma_jfs_wr_t* tail,
 bool WaitCompletion(Queue& worker, std::uint64_t context, std::uint64_t start,
                     std::uint32_t timeout_ms, UmdkControlStatus& status) {
   const auto deadline = start + static_cast<std::uint64_t>(timeout_ms) * 1000000;
+  const auto poll_jfc = CurrentState().api.urma_poll_jfc;
   std::uint32_t polls = 0;
   auto now = start;
   while (now < deadline) {
     urma_cr_t completion{};
-    const int count = CurrentState().api.urma_poll_jfc(worker.jfc, 1, &completion);
+    const int count = poll_jfc(worker.jfc, 1, &completion);
     if (count < 0) {
       Fail(status, "urma_poll_jfc", count);
       break;
@@ -76,27 +77,32 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
   requests.local_sges.clear();
   requests.remote_sges.clear();
   requests.wrs.clear();
+  const auto& binding = CurrentState().remote;
+  auto* remote_segment = binding.handle();
+  const auto canonical_base = binding.canonical();
   while (transfer_index < count && requests.wrs.size() < 4096) {
     const auto& transfer = transfers[transfer_index];
     if (transfer.bytes == 0 || offset >= transfer.bytes ||
-        !UmdkRange(CurrentState().remote.canonical(), CurrentState().remote.handle()->seg.len, transfer.remote,
+        !UmdkRange(canonical_base, remote_segment->seg.len, transfer.remote,
                    transfer.bytes))
       return Fail(status, "UMDK transfer outside remote region");
     auto* segment = LocalSegment(transfer.local, transfer.bytes);
     if (segment == nullptr) return Fail(status, "UMDK transfer outside registered HBM");
-    const auto bytes =
-        static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, transfer.bytes - offset));
-    requests.local_sges.push_back({transfer.local + offset, bytes, segment, nullptr});
-    requests.remote_sges.push_back({CurrentState().remote.handle()->seg.ubva.va +
-                                        (transfer.remote - CurrentState().remote.canonical()) + offset,
-                                    bytes, CurrentState().remote.handle(), nullptr});
-    urma_jfs_wr_t wr{};
-    wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
-    wr.flag.bs.comp_order = 1;
-    wr.tjetty = worker.target;
-    wr.user_ctx = ++worker.sequence;
-    requests.wrs.push_back(wr);
-    offset += bytes;
+    const auto remote = remote_segment->seg.ubva.va + (transfer.remote - canonical_base);
+    // Validate and resolve each span once per wave, then emit its 64 KiB fragments.
+    do {
+      const auto bytes =
+          static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, transfer.bytes - offset));
+      requests.local_sges.push_back({transfer.local + offset, bytes, segment, nullptr});
+      requests.remote_sges.push_back({remote + offset, bytes, remote_segment, nullptr});
+      urma_jfs_wr_t wr{};
+      wr.opcode = write ? URMA_OPC_WRITE : URMA_OPC_READ;
+      wr.flag.bs.comp_order = 1;
+      wr.tjetty = worker.target;
+      wr.user_ctx = ++worker.sequence;
+      requests.wrs.push_back(wr);
+      offset += bytes;
+    } while (offset < transfer.bytes && requests.wrs.size() < 4096);
     if (offset == transfer.bytes) {
       ++transfer_index;
       offset = 0;
@@ -120,7 +126,10 @@ bool BuildTransfers(Queue& worker, bool write, const UmdkTransfer* transfers, st
 // The caller holds the control lock and waits for the CQE before reusing these slots.
 bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
                  UmdkControlStatus& status) {
-  if (!UmdkRange(CurrentState().remote.canonical(), CurrentState().remote.handle()->seg.len, transfer.remote,
+  const auto& binding = CurrentState().remote;
+  auto* remote_segment = binding.handle();
+  const auto canonical_base = binding.canonical();
+  if (!UmdkRange(canonical_base, remote_segment->seg.len, transfer.remote,
                  transfer.bytes))
     return Fail(status, "UMDK transfer outside remote region");
   auto* segment = LocalSegment(transfer.local, transfer.bytes);
@@ -128,8 +137,8 @@ bool TransferOne(Queue& worker, bool write, const UmdkTransfer& transfer,
   const auto bytes = static_cast<std::uint32_t>(transfer.bytes);
   worker.single_local = {transfer.local, bytes, segment, nullptr};
   worker.single_remote = {
-      CurrentState().remote.handle()->seg.ubva.va + (transfer.remote - CurrentState().remote.canonical()), bytes,
-      CurrentState().remote.handle(), nullptr};
+      remote_segment->seg.ubva.va + (transfer.remote - canonical_base), bytes,
+      remote_segment, nullptr};
   urma_sg_t local{reinterpret_cast<urma_sge_t*>(&worker.single_local), 1};
   urma_sg_t remote{reinterpret_cast<urma_sge_t*>(&worker.single_remote), 1};
   auto& wr = worker.single_wr;
@@ -179,6 +188,18 @@ bool TransferControl(bool write, const UmdkTransfer* transfers, std::uint32_t co
   return TransferQueue(*control, write, transfers, count, status);
 }
 
+std::uint32_t TransferControlSync(bool write, const UmdkTransfer* transfers,
+                                  std::uint32_t count, std::uint32_t worker_index) {
+  UmdkControlStatus status{};
+  const bool success = TransferControl(write, transfers, count, status, worker_index);
+  if (!success)
+    std::fprintf(stderr,
+                 "UMDK_CONTROL_ERROR worker=%u write=%u stage=%s result=%d errno=%d cq_status=%d\n",
+                 worker_index, write ? 1U : 0U, status.stage, status.result, status.error_number,
+                 status.cq_status);
+  return success ? 0 : 16;
+}
+
 }  // namespace kvaf::aicpu_urma::detail
 
 namespace kvaf::aicpu_urma {
@@ -190,17 +211,10 @@ std::uint32_t UmdkTransferSync(const UmdkContext* args, bool write, const UmdkTr
   if (!session) return 16;
   std::shared_lock<std::shared_mutex> lock(session->mutex);
   SessionScope scope(*session);
-  if (args == nullptr || args->session != CurrentState().session ||
+  if (args->session != CurrentState().session ||
       args->owner_pid != static_cast<std::uint64_t>(getpid()) || worker_index >= CurrentState().worker_count)
     return 16;
-  UmdkControlStatus status{};
-  const bool success = TransferControl(write, transfers, count, status, worker_index);
-  if (!success)
-    std::fprintf(stderr,
-                 "UMDK_CONTROL_ERROR worker=%u write=%u stage=%s result=%d errno=%d cq_status=%d\n",
-                 worker_index, write ? 1U : 0U, status.stage, status.result, status.error_number,
-                 status.cq_status);
-  return success ? 0 : 16;
+  return TransferControlSync(write, transfers, count, worker_index);
 }
 
 }  // namespace kvaf::aicpu_urma

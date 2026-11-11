@@ -365,10 +365,11 @@ bool Connect(const UmdkControlArgs& args, UmdkControlStatus& status) {
 }
 
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes) {
-  if (CurrentState().local != nullptr && UmdkRange(CurrentState().buffer, CurrentState().buffer_bytes, address, bytes)) {
-    return CurrentState().local;
+  auto& state = CurrentState();
+  if (state.local != nullptr && UmdkRange(state.buffer, state.buffer_bytes, address, bytes)) {
+    return state.local;
   }
-  for (const auto& buffer : CurrentState().buffers)
+  for (const auto& buffer : state.buffers)
     if (UmdkRange(buffer.base, buffer.bytes, address, bytes)) {
       return buffer.segment;
     }

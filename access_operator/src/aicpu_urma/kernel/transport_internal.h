@@ -124,4 +124,9 @@ bool WaitCompletion(Queue&, std::uint64_t context, std::uint64_t start, std::uin
 urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes);
 bool TransferControl(bool write, const UmdkTransfer*, std::uint32_t count, UmdkControlStatus&,
                      std::uint32_t worker_index = 0U);
+// Internal synchronous transfer. Caller owns the session, holds its mutex
+// (shared or exclusive), and has installed SessionScope for the entire operation.
+// Session/context validation belongs at the execution entry, not each message.
+std::uint32_t TransferControlSync(bool write, const UmdkTransfer*, std::uint32_t count,
+                                  std::uint32_t worker_index);
 }  // namespace kvaf::aicpu_urma::detail

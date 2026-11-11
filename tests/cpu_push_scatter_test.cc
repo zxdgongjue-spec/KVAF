@@ -220,7 +220,7 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
   CHECK(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xA5; }));
 }
 
-void CheckInputBounds() {
+void CheckRequestShape() {
   Layout layout;
   CHECK(MakeLayout(16, 1, &layout));
   std::vector<CacheLine> workspace((layout.bytes + 63) / 64);
@@ -231,14 +231,6 @@ void CheckInputBounds() {
     std::uint8_t valid = 1;
     std::uint8_t output[16];
     std::fill_n(output, 16, 0xA5);
-    if (scenario == 0) index = -1;
-    if (scenario == 1) index = 1;
-    if (scenario == 2) offset = -1;
-    if (scenario == 3) offset = 1;
-    if (scenario == 4) valid = 0;
-    if (scenario == 5) address = 4095;
-    if (scenario == 6) row = 1;
-    if (scenario == 7) address = 4096 + 24;
     Coordination coordination{};
     WorkerStatus status{};
     KernelArgs args{};
@@ -260,6 +252,15 @@ void CheckInputBounds() {
     args.coordination = Pointer(&coordination);
     args.status = Pointer(&status);
     args.sequence = args.workers = 1;
+    // The original kernel checks shape/count, not each device-resident index.
+    if (scenario == 0) args.request.address_table = 0;
+    if (scenario == 1) args.request.indices = 0;
+    if (scenario == 2) args.request.offsets = 0;
+    if (scenario == 3) args.request.output_indices = 0;
+    if (scenario == 4) args.output = 0;
+    if (scenario == 5) count = -1;
+    if (scenario == 6) count = 2;
+    if (scenario == 7) args.request.request_capacity = kMaxRequests + 1;
     CHECK(ExecuteCpuPushScatter(&args) != 0);
     CHECK(status.result == static_cast<std::uint64_t>(Result::kInvalidRequest));
     CHECK(std::all_of(output, output + 16, [](auto value) { return value == 0xA5; }));
@@ -267,7 +268,7 @@ void CheckInputBounds() {
 }
 
 int main(int argc, char**) {
-  CheckInputBounds();
+  CheckRequestShape();
   if (argc > 1) return 0;
 
   CheckPipeline();

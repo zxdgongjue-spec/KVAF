@@ -52,7 +52,8 @@ struct GatherBuildLayout {
   GatherBuildLayout(Queue& worker, const GatherReadArgs& args,
                     const AicpuBatchGetInput& request)
       : output(args.output),
-        staging(args.remote_staging),
+        staging(CurrentState().remote.handle()->seg.ubva.va +
+                (args.remote_staging - CurrentState().remote.canonical())),
         sgl_size(std::min(args.sgl_size, kvaf::kGatherMaxSglSize)),
         token_bytes(request.token_bytes),
         rows(reinterpret_cast<const std::int32_t*>(request.output_indices)),
@@ -99,9 +100,7 @@ void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_
         offset = 0U;
       }
     }
-    remote[wr_index] = {
-        layout.remote_segment->seg.ubva.va + (source - CurrentState().remote.canonical()), bytes,
-        layout.remote_segment, nullptr};
+    remote[wr_index] = {source, bytes, layout.remote_segment, nullptr};
     auto wr = layout.prototype;
     wr.user_ctx = ++sequence;
     wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(&remote[wr_index]);
@@ -128,6 +127,7 @@ struct GatherPrefix {
   const GatherReadArgs& args;
   GatherReadStatus& gather;
   std::uint32_t worker_index;
+  std::uint64_t registered_staging;
   std::uint64_t ready_bytes = 0;
   BatchGetWorkerProfile* profile = nullptr;
 };
@@ -136,12 +136,7 @@ bool WaitBatchPrefix(GatherPrefix& prefix, const urma_jfs_wr_t& tail,
                      UmdkControlStatus& submitted) {
   const auto& args = prefix.args;
   const auto& source = *reinterpret_cast<const Sge*>(tail.rw.src.sge);
-  const auto registered_staging =
-      CurrentState().remote.handle()->seg.ubva.va + (args.remote_staging - CurrentState().remote.canonical());
-  if (source.addr < registered_staging)
-    return Fail(submitted, "Gather source precedes registered staging");
-  const auto required = source.addr - registered_staging + source.len;
-  if (required > args.bytes) return Fail(submitted, "Gather source exceeds request staging");
+  const auto required = source.addr - prefix.registered_staging + source.len;
   if (required <= prefix.ready_bytes) return true;
   auto& gather = prefix.gather;
   gather.phase = kWaitReadyPrefix;
@@ -195,7 +190,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
   const auto setup_start = profile ? BatchGetProfileNowNs() : 0U;
   const GatherBuildLayout layout(worker, args, request);
   if (!layout.local_segment) return Fail(error, "READ output is not registered");
-  GatherPrefix prefix{args, status, args.worker_index, 0U, profile};
+  GatherPrefix prefix{args, status, args.worker_index, layout.staging, 0U, profile};
   if (profile) profile->read_setup_ns += BatchGetProfileNowNs() - setup_start;
   // A WR ends at the SGL limit, the 64 KiB limit, or the end of this request.
   const auto max_wrs = (static_cast<std::uint64_t>(args.bytes) + 65535U) / 65536U +
@@ -248,20 +243,12 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
   return true;
 }
 
-std::uint32_t ReadStaging(const AicpuBatchGetInput& request,
+std::uint32_t ReadStaging(ExecutionSession& session, const AicpuBatchGetInput& request,
                          const GatherReadArgs& args, GatherReadStatus& status,
                          std::uint32_t first, std::uint32_t last,
                          BatchGetWorkerProfile* profile) {
-  auto session = FindSession(args.context.session);
-  if (!session) return kGatherTransportFailed;
-  std::shared_lock<std::shared_mutex> lock(session->mutex);
-  SessionScope scope(*session);
   const auto worker_index = args.worker_index;
-  if (worker_index >= CurrentState().worker_count || args.worker_count != CurrentState().worker_count ||
-      args.context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
-      args.context.session != CurrentState().session || args.sgl_size == 0 || args.sq_batch_wqes == 0)
-    return kGatherTransportFailed;
-  std::lock_guard<std::mutex> worker_lock(session->worker_mutexes[worker_index]);
+  std::lock_guard<std::mutex> worker_lock(session.worker_mutexes[worker_index]);
   auto& worker = DataQueue(worker_index);
   if (worker.poisoned || worker.target == nullptr) return kGatherTransportFailed;
   UmdkControlStatus error{};
@@ -282,7 +269,7 @@ void Flush(const void* address, std::uint64_t bytes) { FlushUmdkCache(address, b
 void WaitAck(const GatherReadArgs& args, GatherReadStatus& status) {
   const UmdkTransfer transfer{args.remote_ack, args.scratch + 8U, 8U};
   for (unsigned poll = 0; poll < 10000U; ++poll) {
-    status.result = UmdkTransferSync(&args.context, false, &transfer, 1U, args.worker_index);
+    status.result = TransferControlSync(false, &transfer, 1U, args.worker_index);
     if (status.result) return;
     // READ DMA replaced the ACK word in this running kernel, without a CANN handoff.
     Flush(reinterpret_cast<void*>(transfer.local), transfer.bytes);
@@ -312,10 +299,12 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
   // and CPU-push kernels. AICPU only reads them; no per-request cache sweep.
   auto* descriptor = reinterpret_cast<kvaf::peer::GatherDescriptorHeader*>(args.source_descriptor);
   auto* sources = reinterpret_cast<kvaf::peer::GatherSpan*>(descriptor + 1);
-  for (auto i = first; i < last; ++i) {
-    std::uint64_t source = 0;
-    if (!ResolveBatchGetSource(request, i, args.output_extent, &source)) return false;
-    sources[args.source_span_count++] = {source, request.token_bytes, 0U};
+  if (!request.indices) {
+    for (auto i = first; i < last; ++i)
+      sources[args.source_span_count++] = {addresses[i], request.token_bytes, 0U};
+  } else {
+    for (auto i = first; i < last; ++i)
+      sources[args.source_span_count++] = {addresses[indices[i]] + offsets[i], request.token_bytes, 0U};
   }
   const auto bytes = static_cast<std::uint64_t>(args.source_span_count) * request.token_bytes;
   if (bytes > UINT32_MAX) return false;
@@ -336,7 +325,7 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
   status.phase = kWriteSourceList;
   {
     BatchGetProfileScope timer(profile ? &profile->source_write_ns : nullptr);
-    status.result = UmdkTransferSync(&args.context, true, &descriptor, 1U, args.worker_index);
+    status.result = TransferControlSync(true, &descriptor, 1U, args.worker_index);
   }
   if (status.result) return false;
   status.phase = kNotifyCpu;
@@ -350,7 +339,7 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
                                  {args.remote_notify, args.scratch, 8U}};
   {
     BatchGetProfileScope timer(profile ? &profile->notify_ns : nullptr);
-    status.result = UmdkTransferSync(&args.context, true, notify, 2U, args.worker_index);
+    status.result = TransferControlSync(true, notify, 2U, args.worker_index);
   }
   if (!status.result && !args.pipeline_chunk_bytes) {
     status.phase = kWaitCpuAck;
@@ -372,6 +361,10 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   auto session = detail::FindSession(args.context.session);
   if (!session) return 1U;
+  // Keep one registry reference and read lock through all control messages,
+  // data READs and ACK polls. Teardown/registration waits for this invocation.
+  std::shared_lock<std::shared_mutex> lock(session->mutex);
+  SessionScope scope(*session);
   const auto worker = ClaimWorker(args.worker_count, session->next_worker);
   args.worker_index = worker;
   args.core_status += worker * sizeof(GatherReadStatus);
@@ -387,6 +380,12 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   status = {};
   status.magic = kGatherStatusMagic;
   status.sequence = args.sequence;
+  if (args.worker_count != session->state.worker_count ||
+      args.context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
+      args.context.session != session->state.session || args.sgl_size == 0 || args.sq_batch_wqes == 0) {
+    status.result = kGatherTransportFailed;
+    return 1U;
+  }
   const auto active = *reinterpret_cast<const volatile std::int32_t*>(launch->request.miss_count);
   if (active < 0 || static_cast<std::uint32_t>(active) > launch->request.request_capacity) {
     status.result = kInvalidGatherRequest;
@@ -408,7 +407,7 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
     {
       BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
       status.phase = kReadStaging;
-      status.result = ReadStaging(launch->request, args, status, first, last, profile);
+      status.result = ReadStaging(*session, launch->request, args, status, first, last, profile);
     }
     if (!status.result && args.pipeline_chunk_bytes) {
       BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);

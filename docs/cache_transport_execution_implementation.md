@@ -294,6 +294,31 @@ runtime.end_get_graph(lease, stream=last_replay_stream)
 `discard_result=True` 放弃结果检查后回收；它仍等待 stream 完成，不跳过 DMA 安全检查。
 Gather / Scatter 不声明 capture 能力；旧入口保留已有 graph 使用方式。
 
+## 设备执行路径与性能约束
+
+地址契约仍为 `registered_base + (canonical_address - canonical_base)`，
+公共 AccessTable 和 PreparePut 的输出仍保存 canonical 地址，不改为 offset。
+本轮优化仅调整计算位置与重复工作：
+
+- AICPU Gather 每个 worker 的 kernel 入口查询一次 session registry，持有会话引用、
+  session 读锁及 TLS scope，直到描述符发送、通知、数据 READ、ready/ACK 轮询全部结束。
+  内部控制传输复用该 scope；独立 `UmdkTransferSync` 入口仍自行查询和检查 session。
+  每个 worker 原有的数据队列锁、控制队列锁仍保留，资源注销/关闭需要 session 写锁。
+- Gather 每个 worker 一次性计算 registered staging 基址，构建 WQE 和 ready-prefix
+  检查复用它。AICPU 通用传输对一个 span 在一轮构建中只校验并查找一次本地注册区，
+  再生成 64 KiB 分片；4096 WR 分轮、post batch、CQE 顺序和超时行为保持不变。
+- AIV Put/Get 在调用向量函数前计算无符号地址差，lane 内做地址加法。
+  无符号模运算也覆盖 registered 基址小于 canonical 基址的情况。
+- Gather 同步 Host 路径复用已排入 stream 的 completion D2H，完成状态只检查一次；
+  异步调用和失败后的独立 Drain 仍执行状态拷贝与检查。
+
+设备侧输入校验保持基线 `1c13103` 的执行方式：Gather/Scatter 直接生成源清单，
+移除本分支新增的逐 token `ResolveBatchGetSource`；AIV Get 不再启用 main 中关闭的
+`RunBatchGetValidation` 预扫描。调用方仍须保证表项、索引、offset 和输出行有效。
+原有形状/计数检查、传输范围检查、CQE/超时检查保留；新地址绑定自身的有效性检查
+以及 Host 的资源 owner/代次检查继续保留，不在逐 token 循环中执行。
+UBMEM kernel 和 CPU 服务端 Gather/Push 的执行实现本轮未修改。
+
 ## 部署与验证
 
 CPU 服务、Host 库及设备 kernel 必须一起重建：
@@ -304,7 +329,7 @@ CPU 服务、Host 库及设备 kernel 必须一起重建：
 
 便携测试覆盖配置、Python 构造、独立方向、显式恢复、graph 排他与表 pin、未决事务、
 Region/session 状态机、epoch/重复 ID、截断协议、真实 TCP 回复丢失、AIV Get/Put kernel
-模型在不同规范/注册基址下的 payload、AICPU transfer 地址转换、输入边界及共享映射关闭失败。
+模型在不同规范/注册基址下的 payload、AICPU transfer 地址转换、请求形状及共享映射关闭失败。
 可通过 `KVAF_TEST_URMA_INCLUDE_DIR` 和 `KVAF_TEST_ACL_INCLUDE_DIR` 启用无需设备库的
 设备注册表及 ACL 映射 mock 测试。CPU 服务以 `KVAF_CPU_ENABLE_URMA=OFF` 完成便携构建。
 新增便携回归覆盖独立 owner、类型化租约、同资源并发首次获取、执行状态保留、

@@ -10,6 +10,8 @@
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
 int allocations = 0, registrations = 0, launches = 0, enables = 0;
+int sync_copies = 0, async_copies = 0;
+bool fail_sync = false;
 std::set<void*> buffers;
 }
 extern "C" {
@@ -21,12 +23,14 @@ aclError aclrtMallocHost(void** p, size_t n) { return aclrtMalloc(p, n, ACL_MEM_
 aclError aclrtFree(void* p) { CHECK(buffers.erase(p) == 1); std::free(p); return 0; }
 aclError aclrtFreeHost(void* p) { return aclrtFree(p); }
 aclError aclrtMemcpy(void* p, size_t, const void* s, size_t n, aclrtMemcpyKind) {
+  ++sync_copies;
   std::memcpy(p, s, n); return 0;
 }
 aclError aclrtMemcpyAsync(void* p, size_t size, const void* s, size_t n, aclrtMemcpyKind kind, aclrtStream) {
-  return aclrtMemcpy(p, size, s, n, kind);
+  ++async_copies;
+  std::memcpy(p, s, n); return 0;
 }
-aclError aclrtSynchronizeStream(aclrtStream) { return 0; }
+aclError aclrtSynchronizeStream(aclrtStream) { return fail_sync ? 1 : 0; }
 const char* aclGetRecentErrMsg() { return "fake"; }
 }
 namespace kvaf::peer {
@@ -85,16 +89,33 @@ int main() {
   auto mismatched = call; mismatched.request = &other;
   CHECK(!gather.ExecutePrepared(mismatched).ok() && launches == 0);
   CHECK(gather.ExecutePrepared(call).ok() && launches == 1);
+  CHECK(async_copies == 2 && sync_copies == 0); // status + profile, no duplicate D2H
   CHECK(allocations == allocations_before_launch && registrations == registrations_before_launch);
   CHECK(profile.worker_count == 2);
   CHECK(!gather.ExecutePrepared(call).ok() && launches == 1);
   // Warm workspaces and CPU Gather session are reused across invocations.
   CHECK(gather.Prepare(call).ok() && enables == 1 && allocations == allocations_before_launch);
   CHECK(gather.ExecutePrepared(call).ok() && launches == 2);
+  CHECK(async_copies == 4 && sync_copies == 0);
+  // Asynchronous execution still collects status when explicitly drained.
+  call.execution.synchronize = false;
+  call.execution.profile = nullptr;
+  CHECK(gather.Prepare(call).ok());
+  CHECK(gather.ExecutePrepared(call).ok() && launches == 3);
+  CHECK(async_copies == 4 && sync_copies == 0);
+  CHECK(gather.Drain().ok() && sync_copies == 1);
+  call.execution.synchronize = true;
+  call.execution.profile = &profile;
+  CHECK(gather.Prepare(call).ok());
+  fail_sync = true;
+  CHECK(!gather.ExecutePrepared(call).ok() && launches == 4);
+  CHECK(async_copies == 6 && sync_copies == 1);
+  fail_sync = false;
+  CHECK(gather.Drain().ok() && sync_copies == 2); // retry must collect status
   CHECK(gather.Prepare(call).ok());
   const auto bound_view = gather.View();
   CHECK(gather.BindExecutionState(nullptr).ok());
-  CHECK(!BatchGetTransport::LaunchPrepared(call, bound_view, state.get()).ok() && launches == 2);
+  CHECK(!BatchGetTransport::LaunchPrepared(call, bound_view, state.get()).ok() && launches == 4);
   state.reset();
   CHECK(gather.Shutdown().ok() && buffers.empty());
   std::cout << "Gather preparation, typed invocation and allocation-free launch passed\n";

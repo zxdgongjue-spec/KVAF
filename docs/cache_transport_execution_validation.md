@@ -351,6 +351,47 @@ ctest --test-dir build-verify --output-on-failure \
 AICPU 包；wire 协议未变。沿用第 3 节原全量命令即可，不设置 `--cases`，并在同一个
 CPU 服务进程下重复两轮。原性能脚本的公开参数不变；性能结果应在功能全量通过后采集。
 
+### 设备热路径优化的复验
+
+本轮保持 canonical 地址契约和 ABI，修改 NPU Host、AICPU kernel 和 AIV kernel。
+重新运行 `./build.sh npu` 及 `./build.sh npu --check-kernel`，使用新客户端进程。
+CPU 端若已部署同分支此前的实现，可沿用该 CPU 服务；本轮没有改 CPU 协议或服务代码。
+先运行第 3 节原全量验收（不设置 `--cases`），再运行原性能脚本。
+
+复测此前下降明显的三个点：
+
+```bash
+KVAF_AICPU_TOKEN_BYTES=656 \
+KVAF_AICPU_MISS_COUNTS="2048 4096 8192" \
+KVAF_AICPU_WORKERS=5 \
+bash tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
+  --peer 127.0.0.1:38999 --device-id 6 --warmup 10 --iterations 100
+```
+
+比较 main、`ef2aec43` 和优化后的分支时，保持构建选项、设备、CPU gather 配置、
+table capacity、tokens-per-block、预热和迭代次数一致；若原命令另有参数，继续沿用。
+分别使用各分支匹配的产物和 CPU 服务，不混用版本。建议各跑三轮，保存每轮 CSV。
+优先比较 `device_p50_us`、`lookup_table_us`、`address_send_us`、`notify_cpu_us`
+和 `build_wqe_us`；各阶段是 worker 最大耗时的统计量，不能简单相加当作 device P50。
+Host 重复 D2H 的消除不计入 device 耗时。便携回归通过不能代替真机性能对比。
+
+本轮相关便携测试：
+
+- `kvaf_aicpu_gather_execution_test`：运行真实 Gather/transfer/session 实现，替身 URMA
+  执行 WQE；检查每个 worker 一次 registry 查询、多次 ready/ACK 轮询、并发 session、
+  数据 payload、空 worker、64 KiB 分片、4096 WR 跨轮次、传输错误及 session 读锁保护。
+- `kvaf_aicpu_session_registry_test`：保留原注册/范围检查，并补充跨轮次的大 span 和
+  后续 span 的地址、offset、尾部 CQE 标志。
+- AIV Get/Put kernel model：新增 registered 基址低于 canonical 基址的 payload 检查。
+- `kvaf_aicpu_gather_resources_test`：同步完成不重复 D2H；异步 Drain 和同步失败后的
+  重试仍收集状态。`kvaf_cpu_push_request_shape_test` 只检查 main 原有的形状/计数校验，
+  不向已恢复的直接查表路径注入非法索引。
+
+```bash
+ctest --test-dir build-verify --output-on-failure \
+  -R 'kvaf_(aicpu_gather_execution|aicpu_gather_resources|aicpu_session_registry|batch_.*_kernel_model|cpu_push_request_shape)_test'
+```
+
 故障通过便携替身注入，不在真机上故意破坏正在执行的 DMA。真机应重新运行第 3 节
 全量测试，覆盖 matrix、overlap、lifetime、resources、graph 和 lifecycle；保持同一
 CPU 服务进程再跑一轮，确认资源跨调用复用及池重建正常。此前 HAL 修复的真机通过

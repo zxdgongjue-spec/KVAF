@@ -51,7 +51,8 @@ int main() {
     SessionScope scope(*put);
     urma_target_seg_t remote{}, local{};
     remote.seg.ubva.va = 0x9000;
-    remote.seg.len = 0x1000;
+    constexpr std::uint64_t large_transfer = 4097ULL * 65536 + 13;
+    remote.seg.len = large_transfer + 0x1000;
     auto* context = reinterpret_cast<urma_context_t*>(1);
     CHECK(CurrentState().remote.Import(context, Import, Unimport, remote.seg, 1, 0x1000, put_id) == 0);
     CHECK(CurrentState().remote.Import(context, Import, Unimport, remote.seg, 1, 0x1000, put_id) == 0);
@@ -59,13 +60,32 @@ int main() {
     CHECK(CurrentState().remote.Import(context, Import, Unimport, remote.seg, 2, 0x1000, put_id) != 0);
     CurrentState().local = &local;
     CurrentState().buffer = 0x3000;
-    CurrentState().buffer_bytes = 0x1000;
+    CurrentState().buffer_bytes = large_transfer + 0x1000;
     UmdkTransfer transfer{0x1040, 0x3080, 64};
     std::uint32_t index = 0;
     std::uint64_t offset = 0;
     auto& queue = CurrentState().data_queues[0];
     CHECK(BuildTransfers(queue, false, &transfer, 1, index, offset, status));
     CHECK(queue.requests.remote_sges[0].addr == 0x9040);
+    // A single span crosses both 64 KiB fragments and the 4096-WR wave cap.
+    // The second span must follow it without carrying over the first offset.
+    UmdkTransfer fragments[] = {{0x1040, 0x3080, large_transfer}, {0x1080, 0x3000, 7}};
+    index = 0; offset = 0;
+    CHECK(BuildTransfers(queue, true, fragments, 2, index, offset, status));
+    CHECK(index == 0 && offset == 4096ULL * 65536 && queue.requests.wrs.size() == 4096);
+    for (unsigned i = 0; i < 4096; ++i) {
+      CHECK(queue.requests.remote_sges[i].addr == 0x9040 + i * 65536ULL);
+      CHECK(queue.requests.local_sges[i].addr == 0x3080 + i * 65536ULL);
+      CHECK(queue.requests.remote_sges[i].len == 65536);
+    }
+    CHECK(queue.requests.wrs.back().next == nullptr && queue.requests.wrs.back().flag.bs.complete_enable);
+    CHECK(BuildTransfers(queue, true, fragments, 2, index, offset, status));
+    CHECK(index == 2 && offset == 0 && queue.requests.wrs.size() == 3);
+    CHECK(queue.requests.remote_sges[0].addr == 0x9040 + 4096ULL * 65536);
+    CHECK(queue.requests.remote_sges[1].addr == 0x9040 + 4097ULL * 65536);
+    CHECK(queue.requests.remote_sges[1].len == 13);
+    CHECK(queue.requests.remote_sges[2].addr == 0x9080 && queue.requests.remote_sges[2].len == 7);
+    CHECK(queue.requests.wrs[0].rw.dst.sge == reinterpret_cast<urma_sge_t*>(&queue.requests.remote_sges[0]));
     index = 0;
     offset = 0;
     transfer.remote = 0xFFF;

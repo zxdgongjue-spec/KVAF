@@ -106,6 +106,12 @@ int main() {
   // Run the production kernel, consume its WRITE WQEs, and verify actual payload.
   // Reuse the queue to catch state/credit regressions across submissions.
   for (unsigned replay = 0; replay < 2; ++replay) {
+    if (replay) {
+      // Exercise unsigned bias when the registration lies below canonical DDR.
+      entity.remote_host_ddr_address = entity.registered_base + 0x100000;
+      for (std::size_t i = 0; i < rows; ++i)
+        addresses[i] = entity.remote_host_ddr_address + (rows - i - 1) * bytes;
+    }
     destination.fill(0);
     KvafExecuteBatchPutAivKernelV2(args);
     CHECK(status.magic == KVAF_AIV_BATCH_PUT_STATUS_MAGIC && status.result == 0);

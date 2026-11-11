@@ -34,7 +34,8 @@ struct BatchGetTransport::Impl {
   bool initialized{false}, cpu_enabled{false};
   Status Drain(const char* stage = "drain");
 };
-static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call, const char* stage) {
+static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call, const char* stage,
+                           bool completion_enqueued = false) {
   if (!call.pending) return Status::OK();
   const auto result = aclrtSynchronizeStream(call.pending);
   if (result != ACL_SUCCESS) {
@@ -45,14 +46,18 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
                     " source_mode=" + (view.direct_addresses ? "direct" : "table") +
                     "; buffers retained; detail=" + (detail ? detail : "unavailable"));
   }
-  if (aclrtMemcpy(view.completion.host, view.completion.bytes, view.completion.device,
+  if (!completion_enqueued &&
+      aclrtMemcpy(view.completion.host, view.completion.bytes, view.completion.device,
                   view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
     return Internal("GatherRead completion status unavailable; buffers retained");
   const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
   for (unsigned worker = 0; worker < view.options.workers; ++worker)
     if (reports[worker].magic != kGatherStatusMagic || reports[worker].sequence != call.sequence ||
         reports[worker].result != 0)
-      return Internal("GatherRead worker failed; session retained for recovery");
+      return Internal("GatherRead worker " + std::to_string(worker) +
+                      " failed: phase=" + std::to_string(reports[worker].phase) +
+                      " result=" + std::to_string(reports[worker].result) +
+                      "; session retained for recovery");
   call.pending = nullptr;
   return Status::OK();
 }
@@ -262,20 +267,13 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     profile->status_enqueue_ns = now - stamp;
     stamp = now;
   }
-  auto completed = DrainGather(view, call, "completion");
+  auto completed = DrainGather(view, call, "completion", true);
   if (profile) {
     const auto now = BatchGetProfileNowNs();
     profile->wait_ns = now - stamp;
     stamp = now;
   }
   if (!completed.ok()) return completed;
-  const auto* statuses = static_cast<const GatherReadStatus*>(view.completion.host);
-  for (unsigned worker = 0; worker < args.worker_count; ++worker)
-    if (statuses[worker].magic != kGatherStatusMagic ||
-        statuses[worker].sequence != args.sequence || statuses[worker].result)
-      return Internal("BatchGet worker " + std::to_string(worker) +
-                      " failed: phase=" + std::to_string(statuses[worker].phase) +
-                      " result=" + std::to_string(statuses[worker].result));
   if (profile) {
     profile->worker_count = workers;
     std::copy_n(static_cast<const BatchGetWorkerProfile*>(view.profile.host), workers,
