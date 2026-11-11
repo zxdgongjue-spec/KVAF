@@ -178,6 +178,13 @@ payload CQE。`--pipeline 1` 的这段时间可包含后缀 gather 和 Ready WRI
 改用 `--pipeline 0` 可测完整 gather 后的提交到完成窗口，并在 CPU 日志中查看
 `CPU_PUSH_CAP` 的 `payload_write_bytes`。
 
+用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
+`prepare_ns` 记录 gather 任务发布，`copy_ns` 记录各线程的源地址校验、拷贝和汇合，
+`suffix_wait_ns` 记录等待后缀清单的时间。每会话保留前 512 条，`active_threads`
+记录单批实际使用的最大线程数。对照 `aiv_gather_yq` 的固定请求基准时，可以用
+`--pipeline 0 --fixed-request-plan`，并对齐源表、线程总数和 CPU 绑定。
+此时 Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane。
+
 ```bash
 DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
   bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
@@ -501,7 +502,7 @@ int main() {
   {
     // Scatter gathers packed rows into a separate MR. In a short batch,
     // cache-line rounding must leave the bytes past its tail untouched.
-    alignas(64) uint8_t staging[64];
+    alignas(64) uint8_t staging[128];
     uint8_t source[16];
     for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = i;
     std::memset(staging, 0xad, sizeof(staging));
@@ -513,8 +514,23 @@ int main() {
     assert(!std::memcmp(staging, expected, sizeof(expected)));
     assert(std::all_of(staging + sizeof(expected), staging + sizeof(staging),
                        [](uint8_t byte) { return byte == 0xad; }));
-    addresses[1] = Address(source + 15);
-    assert(!executor.PrepareFixed(staging, addresses, 3, 3, sizeof(source)));
+    // Place the invalid source in a helper's cache-line slice.
+    uint64_t repeated[8];
+    std::fill_n(repeated, 8, Address(source));
+    repeated[4] = Address(source + 1);
+    assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source)) == 4);
+    try {
+      executor.Copy();
+      assert(false && "invalid fixed source was accepted");
+    } catch (const std::invalid_argument&) {
+      assert(std::all_of(staging + 64, staging + sizeof(staging),
+                         [](uint8_t byte) { return byte == 0xad; }));
+    }
+    repeated[4] = Address(source);
+    assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source)) == 4);
+    executor.Copy();
+    for (uint32_t i = 0; i < 8; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
   }
   // Match the hardware smoke test: the first launch is empty, followed by
   // nonempty launches on the same queues. Empty work must finish all worker

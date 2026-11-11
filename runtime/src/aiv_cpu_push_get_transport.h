@@ -39,9 +39,16 @@ class Transport {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
     std::uint64_t first_post_ns{}, last_cqe_ns{};
+    std::uint64_t gather_prepare_ns{}, gather_copy_ns{}, suffix_wait_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
   } profile_;
+  struct GatherProfileSample {
+    std::uint64_t sequence, prepare_ns, copy_ns, suffix_wait_ns;
+    std::uint32_t rows, threads;
+  };
+  std::vector<GatherProfileSample> gather_profile_samples_;
+  std::size_t gather_profile_dropped_{};
   struct Queue {
     cpu_runtime_detail::UrmaChannel channel;
     bool poisoned{};
@@ -73,6 +80,7 @@ class Transport {
   };
   Status EnsureGatherStaging(std::uint32_t count);
   Status GatherRows(Range range);
+  void FlushGatherProfiles();
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,

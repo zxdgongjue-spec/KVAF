@@ -75,6 +75,8 @@ def arguments(argv=None):
                         help="whole-case seconds, including DDR allocation/registration, full-table population and measurement")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
+    parser.add_argument("--fixed-request-plan", action="store_true",
+                        help="reuse one request plan for warmup and measurement")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
@@ -228,7 +230,8 @@ def complete_outside_measurement(runtime, profiling):
 
 def warmup_calls(runtime, torch, args, refresh_inputs, submit):
     for _ in range(args.warmup):
-        refresh_inputs()
+        if not args.fixed_request_plan:
+            refresh_inputs()
         torch.npu.synchronize()
         submit()
         torch.npu.synchronize()
@@ -307,9 +310,11 @@ def run_case(args):
         read_inflight_budget_applies=False, device_id=device_id,
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
-        input_mode="steady_table_new_request_plan_per_call", calls_per_sample=1,
+        input_mode=("steady_table_fixed_request_plan" if args.fixed_request_plan
+                    else "steady_table_new_request_plan_per_call"), calls_per_sample=1,
         timing="enqueue_then_global_device_sync", stream_selection="fixed_stream_per_call_task_queue_fence",
-        input_storage="fixed_buffers_refreshed_per_call", host_timing_matches_reference=False,
+        input_storage=("fixed_buffers" if args.fixed_request_plan else "fixed_buffers_refreshed_per_call"),
+        host_timing_matches_reference=False,
         completion_scope="device",
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",
         verification="deterministic_preflight_prefix_and_guard_then_last_random_payload",
@@ -396,6 +401,8 @@ def run_case(args):
                                                    contiguous_source_token_ids)
             refresh_request_buffers(plan, fixed_inputs)
 
+        if args.fixed_request_plan:
+            refresh_inputs()
         if args.kernel_profile:
             runtime.start_scatter_profile()
         log_phase("warmup", "begin", calls=args.warmup)
@@ -403,7 +410,8 @@ def run_case(args):
         log_phase("warmup", "end")
         log_phase("measure", "begin", calls=args.iterations)
         for iteration in range(args.iterations):
-            refresh_inputs()
+            if not args.fixed_request_plan:
+                refresh_inputs()
             torch.npu.synchronize()  # Same pre-call isolation as the reference.
             report["samples"][phase].append(
                 measure_call(runtime, torch, args, iteration, submit))
@@ -481,6 +489,8 @@ def case_command(args):
     command.append("--kernel-profile" if args.kernel_profile else "--no-kernel-profile")
     command.append("--host-profile" if args.host_profile else "--no-host-profile")
     command.append("--sort-input-indices" if args.sort_input_indices else "--no-sort-input-indices")
+    if args.fixed_request_plan:
+        command.append("--fixed-request-plan")
     if args.npu_eids:
         command.extend(("--npu-eids", ",".join(args.npu_eids)))
     if args.peer_ub_device:
@@ -546,7 +556,7 @@ def main(argv=None, runner=None):
         expected = {key: getattr(case, key) for key in (
             "request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
             "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
-            "sort_input_indices", "pipeline")}
+            "sort_input_indices", "pipeline", "fixed_request_plan")}
         expected.update(SUBMISSION_CONFIG)
         for key, value in expected.items():
             if report["config"].get(key) != value:

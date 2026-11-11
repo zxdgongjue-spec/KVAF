@@ -1,5 +1,7 @@
 #include "cpu_gather_executor.h"
 
+#include <stdexcept>
+
 namespace kvaf::peer {
 namespace {
 
@@ -68,9 +70,10 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
     std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes) {
-  if (!count || !span_bytes || base_ > UINT64_MAX - source_bytes) return 0U;
-  for (std::uint32_t row = 0; row < count; ++row)
-    if (!GatherRange(base_, source_bytes, addresses[row], span_bytes)) return 0U;
+  if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes)
+    return 0U;
+  fixed_source_bytes_ = source_bytes;
+  fixed_copy_failed_.store(false, std::memory_order_relaxed);
   span_bytes_ = span_bytes;
   pipeline_ready_ = nullptr;
   return Publish(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
@@ -82,6 +85,8 @@ void CpuGatherExecutor::Copy() {
   (void)ProcessSource(0U);
   GatherBarrier();
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) GatherSpinPause();
+  if (addresses_ && fixed_copy_failed_.load(std::memory_order_relaxed))
+    throw std::invalid_argument("CPU gather source outside registered DDR");
   if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
 }
 
@@ -124,7 +129,20 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
 
 std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   if (pipeline_ready_ == nullptr) {
-    return CopyRange(Boundary(worker), Boundary(worker + 1U));
+    const auto begin = Boundary(worker);
+    const auto end = Boundary(worker + 1U);
+    if (addresses_ && begin < end) {
+      // Validate every token touched by this slice, including partial tokens
+      // at cache-line boundaries, before dereferencing any source in it.
+      const auto last = (end - 1U) / span_bytes_;
+      for (auto row = begin / span_bytes_; row <= last; ++row) {
+        if (!GatherRange(base_, fixed_source_bytes_, addresses_[row], span_bytes_)) {
+          fixed_copy_failed_.store(true, std::memory_order_relaxed);
+          return 0U;
+        }
+      }
+    }
+    return CopyRange(begin, end);
   }
   std::uint64_t copied = 0U;
   for (;;) {

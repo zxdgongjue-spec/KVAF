@@ -74,7 +74,8 @@ class CpuGatherExecutor {
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
                             std::uint64_t sequence, std::size_t max_spans);
-  // The caller keeps the address list and destination stable until Copy returns.
+  // Keep the address list and destination stable through Copy. Copy reports
+  // invalid fixed source addresses after all participating workers finish.
   std::size_t PrepareFixed(void* staging, const std::uint64_t* addresses,
                            std::uint32_t count, std::uint32_t span_bytes,
                            std::uint64_t source_bytes);
@@ -171,6 +172,8 @@ class CpuGatherExecutor {
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
+  std::uint64_t fixed_source_bytes_{0U};
+  std::atomic<bool> fixed_copy_failed_{false};
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};

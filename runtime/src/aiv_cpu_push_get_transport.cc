@@ -10,11 +10,13 @@
 #include <cstring>
 #include <exception>
 #include <sstream>
+#include <stdexcept>
 
 namespace kvaf::cpu_push::aiv {
 namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 constexpr std::size_t kJettyDepth = 8192;
+constexpr std::size_t kGatherProfileSamples = 512;
 #ifdef __OPTIMIZE__
 constexpr unsigned kOptimized = 1;
 #else
@@ -63,6 +65,7 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
+    gather_profile_samples_.reserve(kGatherProfileSamples);
   } catch (const std::exception& error) {
     return Status::Internal(error.what());
   }
@@ -271,12 +274,21 @@ Status Transport::GatherRows(Range range) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   auto* staging = gather_staging_ + std::uint64_t{range.begin} * token_bytes_;
   try {
-    const auto threads = gather_->PrepareFixed(staging, addresses + range.begin,
-        range.end - range.begin, token_bytes_, source_bytes_);
-    if (!threads) return Status::InvalidArgument("CPU push source outside registered DDR");
-    gather_->Copy();
+    std::size_t threads;
+    {
+      BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
+      threads = gather_->PrepareFixed(staging, addresses + range.begin,
+          range.end - range.begin, token_bytes_, source_bytes_);
+    }
+    if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
+    {
+      BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
+      gather_->Copy();
+    }
     if (profile_.enabled)
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
+  } catch (const std::invalid_argument& error) {
+    return Status::InvalidArgument(error.what());
   } catch (const std::exception& error) {
     return Status::Internal(error.what());
   }
@@ -585,6 +597,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
     if (plan.suffix && !suffix_ready) {
+      BatchGetProfileScope timer(profile && gather_ ? &profile->suffix_wait_ns : nullptr);
       status = WaitSuffix(stop);
       if (!status.ok()) return status;
       suffix_ready = true;
@@ -635,6 +648,8 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
     done->reserved[5] = profile_.post_ns;
     done->reserved[6] = profile_.cq_wait_ns;
   }
+  const auto profiled_gather_rows =
+      profile_.enabled && gather_ && result == Result::kOk ? request().count : 0U;
   // One post and one tail CQE for both paths. The 8-byte strongly ordered
   // token follows the report's placement; do not combine them into an
   // unordered 64-byte WRITE (the token could otherwise become visible first).
@@ -642,6 +657,14 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   auto status = BeginPrepared(plan, UINT64_MAX);
   if (status.ok()) status = PostPrepared(plan);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
+  if (status.ok() && profiled_gather_rows) {
+    if (gather_profile_samples_.size() < kGatherProfileSamples) {
+      gather_profile_samples_.push_back({sequence, profile_.gather_prepare_ns,
+          profile_.gather_copy_ns, profile_.suffix_wait_ns, profiled_gather_rows, profile_.cpu_threads});
+    } else {
+      ++gather_profile_dropped_;
+    }
+  }
   return status;
 }
 
@@ -663,8 +686,24 @@ void Transport::PrintProfile() const {
       unsigned(p.plan_reused), kOptimized);
 }
 
+void Transport::FlushGatherProfiles() {
+  for (const auto& sample : gather_profile_samples_) {
+    std::fprintf(stderr,
+        "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
+        " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64 " suffix_wait_ns=%" PRIu64 "\n",
+        session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
+        sample.threads, sample.prepare_ns, sample.copy_ns, sample.suffix_wait_ns);
+  }
+  if (gather_profile_dropped_)
+    std::fprintf(stderr, "CPU_PUSH_GATHER_PROFILE_DROPPED session=%" PRIu64 " samples=%zu\n",
+                 session_, gather_profile_dropped_);
+  gather_profile_samples_.clear();
+  gather_profile_dropped_ = 0;
+}
+
 Status Transport::Shutdown() {
   gather_.reset();
+  FlushGatherProfiles();
   // Deleting the initiator queues stops all DMA, including partial-post failures.
   // Do not let UrmaChannel's best-effort destructor discard a failed deletion.
   for (auto& q : queues_) {
