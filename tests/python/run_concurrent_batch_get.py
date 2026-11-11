@@ -42,6 +42,8 @@ For two CPU EIDs per flow, set --flow1-peer-eids EID0,EID1 and
 one local NPU EID each. These options override EIDs in --flow*-args.
 Each peer-enabled flow writes its own peer_samples.csv under its output directory.
 Use at least two total Jettys per flow to select both CPU EIDs.
+The inflight limit defaults to 2048 requests per flow for any core/Jetty count.
+CLI/environment overrides are kept.
 Select a fixed peer device; adaptive calibration is not part of this launcher.
 KVAF_REMOTE_CPU_PERF_TIMEOUT (default 600 seconds) also bounds startup/waiting.
 Existing flow output directories are refused to prevent overwriting results.

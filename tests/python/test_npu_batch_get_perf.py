@@ -358,14 +358,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         if args.aiv_cores * args.jettys_per_core < len(args.peer_eids):
             return "peer-eids count must not exceed aiv-cores * jettys-per-core"
     if len(args.peer_eids) > 1:
-        # A post carries 128 READs; ensure the first group reaches every Jetty
-        # before completion polling, including with the two-group inflight cap.
+        # A post carries 128 READs; ensure enough total traffic for every Jetty.
         minimum = args.aiv_cores * args.jettys_per_core * 128
         if args.miss_count < minimum:
             return f"peer-eids requires miss-count >= {minimum} to activate every Jetty"
-        if args.max_inflight_total and args.miss_count > args.max_inflight_total:
-            if args.max_inflight_total < 2 * minimum:
-                return f"peer-eids requires max-inflight-total=0 or >= {2 * minimum}"
     return None
 
 

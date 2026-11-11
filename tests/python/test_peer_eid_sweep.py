@@ -84,13 +84,20 @@ class PeerEidTests(unittest.TestCase):
                 self.assertEqual(parsed.aiv_cores, 1)
                 self.assertEqual(parsed.jettys_per_core, jettys)
                 self.assertTrue(parsed.kernel_profile)
-                self.assertEqual(parsed.max_inflight_total, max(2048, jettys * 256))
+                self.assertEqual(parsed.max_inflight_total, 2048)
                 self.assertIsNone(perf.validate_args(parsed))
 
-    def test_default_budget_scales_to_activate_all_routes(self):
+    def test_multi_peer_budget_keeps_original_default_and_limits(self):
         args = self.args('--cores', '4', '--jettys', '4')
-        self.assertEqual(args.max_inflight_total, 4096)
+        self.assertEqual(args.max_inflight_total, 2048)
         self.assertIsNone(perf.validate_args(perf.parse_args(sweep.benchmark_args(args))))
+        for budget in (0, 8, 2048, 4096, 0xFFFFFFFF):
+            with self.subTest(budget=budget):
+                args = self.args('--cores', '4', '--jettys', '4', '--miss-count', '8192',
+                                 '--max-inflight-total', str(budget))
+                parsed = perf.parse_args(sweep.benchmark_args(args))
+                self.assertEqual(parsed.max_inflight_total, budget)
+                self.assertIsNone(perf.validate_args(parsed))
 
     def test_single_peer_uses_original_shape_limits_and_budget(self):
         for extra in ([], ['--jettys', '1'], ['--miss-count', '1'], ['--miss-count', '0'],
@@ -140,7 +147,7 @@ class PeerEidTests(unittest.TestCase):
                 self.assertEqual(args.peer_eids, EIDS)
                 self.assertEqual(parsed.peer_eids, EIDS)
                 self.assertEqual(args.mode, 'dual_eid_concurrent')
-                self.assertEqual(args.max_inflight_total, max(2048, cores * 256))
+                self.assertEqual(args.max_inflight_total, 2048)
                 self.assertIsNone(perf.validate_args(parsed))
 
     def test_direct_benchmark_selects_and_logs_one_peer(self):
@@ -179,8 +186,11 @@ class PeerEidTests(unittest.TestCase):
                 mode = 'dual_eid_concurrent' if len(selected) == 2 else 'multi_eid_concurrent'
                 self.assertIn(f'mode={mode}', messages[0])
 
-    def test_rejects_serializing_or_idle_shapes(self):
-        for extra in [('--request-length', '128'), ('--max-inflight-total', '2'),
+    def test_rejects_invalid_or_idle_shapes(self):
+        for extra in [('--request-length', '128'),
+                      ('--cores', '4', '--max-inflight-total', '7'),
+                      ('--max-inflight-total', '-1'),
+                      ('--max-inflight-total', str(0x100000000)),
                       ('--cores', '0'), ('--iterations', '0'), ('--jettys', '0'),
                       ('--jettys', '4,0'), ('--cores', '1,1'), ('--miss-count', '2048,'),
                       ('--peer-eids', ''),
@@ -382,7 +392,7 @@ class PeerEidTests(unittest.TestCase):
                                   parsed.jettys_per_core), (t, m, c, j))
                 case = output / f'token_bytes_{t}_miss_count_{m}_aiv_cores_{c}_jettys_per_core_{j}'
                 config = json.loads((case / 'config.json').read_text())
-                self.assertEqual(config['max_inflight_total'], max(2048, c * j * 256))
+                self.assertEqual(config['max_inflight_total'], 2048)
                 self.assertEqual(config['peer_eids'], EIDS)
                 self.assertTrue((case / 'peer_samples.csv').is_file())
                 self.assertIn(f'p50_cycles={m}', (case / 'batch_get.log').read_text())

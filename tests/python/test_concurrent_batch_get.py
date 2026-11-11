@@ -140,6 +140,63 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
+    def test_three_peer_four_core_four_jetty_defaults_match_peer_sweep(self):
+        import run_peer_eid_sweep as sweep
+
+        peers = ["00000000000402000010000050100504",
+                 "00000000000403000010000050100504",
+                 "00000000000404000010000050100504"]
+        options = ("--token-bytes 656 --miss-count 8192 --aiv-cores 4 --jettys-per-core 4 "
+                   "--table-capacity 1277952 --warmup 20 --iterations 200")
+        args = self.args(device2=4, options=options, extra=PEER_OPTIONS)
+        args.flow1_device = 6
+        args.flow1_npu_eid = ["00000000003f030000100000df00cb00"]
+        args.flow2_npu_eid = ["00000000003f030000100000df008b00"]
+        args.flow1_peer_eids = args.flow2_peer_eids = peers
+        with patch.dict(os.environ, self.env, clear=True):
+            for name in ("flow1", "flow2"):
+                _, command, _ = launcher.build_flow(args, name)
+                parsed = perf.parse_args(command[3:])
+                _, (reference,) = sweep.parse_args([
+                    "build-npu", "--peer-eids", ",".join(peers),
+                    "--npu-eid", getattr(args, f"{name}_npu_eid")[0], "--cores", "4",
+                    "--jettys", "4", "--miss-count", "8192", "--output-dir", "unused"])
+                self.assertEqual(parsed.max_inflight_total, 2048)
+                self.assertEqual(parsed.max_inflight_total, reference.max_inflight_total)
+                self.assertEqual(parsed.peer_eids, peers)
+                self.assertIsNone(perf.validate_args(parsed))
+
+    def test_inflight_defaults_stay_fixed_across_flow_shapes_and_peer_counts(self):
+        args = self.args(extra=PEER_OPTIONS)
+        args.flow1_args = FLOW_ARGS + " --aiv-cores 4"
+        with patch.dict(os.environ, self.env, clear=True):
+            for name in ("flow1", "flow2"):
+                _, command, _ = launcher.build_flow(args, name)
+                self.assertEqual(perf.parse_args(command[3:]).max_inflight_total, 2048)
+            for peers in (None, PEERS[:1]):
+                args.flow1_peer_eids = peers
+                _, command, _ = launcher.build_flow(args, "flow1")
+                self.assertEqual(perf.parse_args(command[3:]).max_inflight_total, 2048)
+
+    def test_explicit_inflight_cli_and_environment_are_never_raised(self):
+        for extra, env_budget, expected in (
+                ("--max-inflight-total 0", None, 0),
+                ("--max-inflight-total=8192", None, 8192),
+                ("--max-inflight 8192", None, 8192),
+                ("", "8192", 8192), ("", "0", 0),
+                ("--max-inflight-total 0", "8192", 0),
+                ("--max-inflight-total 2048", None, 2048),
+                ("--max-inflight-total=2048", None, 2048),
+                ("", "2048", 2048)):
+            with self.subTest(extra=extra, env_budget=env_budget):
+                args = self.args(options=FLOW_ARGS + " --aiv-cores 4 " + extra, extra=PEER_OPTIONS)
+                env = dict(self.env)
+                if env_budget is not None:
+                    env["KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL"] = env_budget
+                with patch.dict(os.environ, env, clear=True):
+                    _, command, _ = launcher.build_flow(args, "flow1")
+                    self.assertEqual(perf.parse_args(command[3:]).max_inflight_total, expected)
+
     def test_each_flow_passes_both_cpu_eids_and_its_own_npu_eid(self):
         for dedicated_options in (False, True):
             with self.subTest(dedicated_options=dedicated_options):

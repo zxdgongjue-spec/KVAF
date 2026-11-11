@@ -146,6 +146,12 @@ python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
 CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 EID，因此使用两个 CPU EID
 需保证每条流的 `aiv-cores * jettys-per-core >= 2`。上例每个 core 都有两个 EID 的流量。
 
+每条流的 inflight 上限默认固定为 `2048`，与 EID sweep 一致，不随 core、Jetty 或 CPU EID
+数量增加。`--flow*-args` 中的 `--max-inflight-total` 优先于环境变量
+`KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`，未设置两者时使用默认值。例如 `4 core × 4 Jetty`、
+`miss-count=8192` 使用 `2048` 可以通过参数校验。inflight 仅保留 KVAF 原始校验：
+值必须在 `uint32` 范围内，且为 `0` 或至少 `2 * aiv-cores`；`0` 使用不限制 inflight 的基线路径。
+
 结果分别保存在 `output-dir/flow1`、`output-dir/flow2`。原有 shape 日志、Jetty CSV
 和两个汇总 CSV 保持原名；指定 CPU EID 后，每条流额外生成自己的 `peer_samples.csv`，
 自动覆盖 `--flow*-args` 中指定的 peer CSV 路径，避免两条流写入同一个文件。
@@ -192,7 +198,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 | `--miss-count` | 每次 BatchGet 的有效请求总数；单路全部搬运、多路分担；默认等于 request-length |
 | `--token-bytes` / `--tokens-per-block` | 默认 656 / 128 |
 | `--warmup` / `--iterations` | 默认 3 / 100，warmup 不计入结果 |
-| `--max-inflight-total` | 总 inflight 上限；单路默认 2048，与原性能测试一致；多路默认 `max(2048, cores * jettys * 256)` |
+| `--max-inflight-total` | 总 inflight 上限；单路、多路均默认 2048，不随 core/Jetty 数变化；值须在 uint32 范围内，且为 0 或至少 `2 * cores` |
 | `--timeout` | 每个组合的 benchmark 超时秒数，默认 600 |
 | `--kernel-profile-clock-mhz` | AIV 周期换算频率，默认读取 `KVAF_BATCH_GET_KERNEL_CLOCK_MHZ`，未设置时为 1000 MHz，与原 miss-count 脚本一致 |
 
@@ -215,9 +221,9 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
    数据直接经 UB 传输，CPU 的 TCP accept 循环不参与 BatchGet 数据搬运。
 2. NPU 将每个 Jetty 的远端 EID、token、TP 和队列信息写入 entity table。
    按全局 Jetty 编号依次绑定 peer EID，换核时接着上一核的分配位置轮转。
-3. 每个 core 的提交组先向参与的 Jetty 发出 doorbell，再检查完成；不会先等待一个 EID
-   的全部 BatchGet 完成再启动另一个。脚本检查请求数和 inflight 上限，确保首个组
-   足够覆盖所有配置的 Jetty。各条 doorbell 指令之间仍有指令执行时间，并非同一周期。
+3. 每个 core 的提交组先向参与的 Jetty 发出 doorbell，再检查完成，Jetty 分配在后续组中
+   继续轮转。首个组不要求覆盖所有 Jetty；实际核内多 EID 首波重叠由运行后的 profile
+   检查判定，未观测到时仍会报错。各条 doorbell 指令之间有指令执行时间，并非同一周期。
 4. kernel 原本对跨 Jetty 的远端 token 做相等校验，现允许每个注册使用独立凭证，
    同时继续校验所有路径的 DDR/HBM 地址范围一致。
 

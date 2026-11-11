@@ -63,8 +63,9 @@ def parse_args(argv=None):
     parser.add_argument("--tokens-per-block", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--max-inflight-total", type=int, default=None,
-                        help="default 2048 for one EID; max(2048, cores * Jettys * 256) for multiple EIDs")
+    parser.add_argument("--max-inflight-total", type=int, default=2048,
+                        help="total unconfirmed READ limit across AIV cores (default: 2048); "
+                             "0 uses the baseline")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=int(os.environ.get("KVAF_BATCH_GET_KERNEL_CLOCK_MHZ", "1000")),
@@ -89,9 +90,6 @@ def parse_args(argv=None):
         if multiple:
             name = "_".join(f"{key}_{value}" for key, value in shape_fields(run).items())
             run.output_dir = args.output_dir / name
-        if run.max_inflight_total is None:
-            run.max_inflight_total = (2048 if len(run.peer_eids) == 1 else
-                                      max(2048, cores * jettys * 256))
         error = perf.validate_args(perf.parse_args(benchmark_args(run)))
         if error:
             parser.error(f"{shape_fields(run)}: {error}")
