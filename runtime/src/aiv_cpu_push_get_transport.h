@@ -76,10 +76,11 @@ class Transport {
     std::size_t fence_count{};
     Tracker::Handle handle;
     Range gather_rows{};
+    std::uint32_t ready_rows{};
     bool suffix{};
   };
   Status EnsureGatherStaging(std::uint32_t count);
-  Status GatherRows(Range range);
+  Status GatherRows(Range range, const peer::CpuGatherExecutor::ChunkReady& on_chunk = {});
   void FlushGatherProfiles();
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();

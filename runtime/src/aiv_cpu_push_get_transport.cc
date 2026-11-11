@@ -270,7 +270,7 @@ Status Transport::EnsureGatherStaging(std::uint32_t count) {
   return Status::OK();
 }
 
-Status Transport::GatherRows(Range range) {
+Status Transport::GatherRows(Range range, const peer::CpuGatherExecutor::ChunkReady& on_chunk) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   auto* staging = gather_staging_ + std::uint64_t{range.begin} * token_bytes_;
   try {
@@ -278,12 +278,12 @@ Status Transport::GatherRows(Range range) {
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
       threads = gather_->PrepareFixed(staging, addresses + range.begin,
-          range.end - range.begin, token_bytes_, source_bytes_);
+          range.end - range.begin, token_bytes_, source_bytes_, on_chunk ? kChunkRows : 0U);
     }
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
-      gather_->Copy();
+      gather_->Copy(on_chunk);
     }
     if (profile_.enabled)
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
@@ -338,6 +338,7 @@ void Transport::SealPrepared(PreparedWrite& plan) {
 Status Transport::PrepareWrites(std::uint32_t count) {
   if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
   const bool batch_done_only = (request().reserved & kBatchDoneOnly) != 0;
+  const bool gather_pipeline = gather_ && !batch_done_only;
   const auto head_rows = (request().reserved & kHeadStart) ? kChunkRows : 0U;
   if (prepared_count_ == count && prepared_batch_done_only_ == batch_done_only &&
       prepared_head_rows_ == head_rows) {
@@ -345,6 +346,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   prepared_.clear();
+  const bool clip_to_stage = head_rows || gather_pipeline;
   const auto build_stage = [&](Range stage, bool suffix) {
     std::array<std::vector<PreparedQueue>, kJettyCount> shards;
     const auto source_sges = gather_ ? 1U : max_sge_;
@@ -356,7 +358,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         const auto shard = JettyRange(range, queue);
         const auto begin = batch_done_only ? shard.begin : std::max(shard.begin, stage.begin);
         const auto end = batch_done_only ? shard.end : std::min(shard.end, stage.end);
-        if (head_rows && begin >= end) return;
+        if (clip_to_stage && begin >= end) return;
         auto row = begin;
         std::uint32_t offset = 0;
         while (row < end) {
@@ -398,7 +400,9 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           }
           AppendPrepared(q, queue, destination, bytes, sges);
         }
-        if (batch_done_only || (head_rows && end < shard.end)) return;
+        // All parts of the shard use the same Jetty. Publish its Ready only
+        // after submitting the last part, ordered behind the earlier parts.
+        if (batch_done_only || end < shard.end) return;
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
@@ -423,7 +427,8 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
       SealPrepared(*plan);
       if (plan->fence_count) {
-        if (gather_ && w == 0) plan->gather_rows = stage;
+        if (gather_pipeline) plan->ready_rows = stage.end;
+        else if (gather_ && w == 0) plan->gather_rows = stage;
         prepared_.push_back(std::move(plan));
       }
     }
@@ -431,9 +436,14 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   // In the Gather done-only mode, wait for all descriptors and finish the
   // full gather before the first payload post. A head-start request still
   // requires the suffix notification even though it uses one payload stage.
-  const bool split = head_rows && (!gather_ || !batch_done_only);
-  if (split) build_stage({0, head_rows}, false);
-  build_stage({split ? head_rows : 0U, count}, head_rows != 0);
+  if (gather_pipeline) {
+    for (std::uint32_t begin = 0; begin < count; begin += kChunkRows)
+      build_stage({begin, std::min(count, begin + kChunkRows)}, false);
+  } else {
+    const bool split = head_rows && !gather_;
+    if (split) build_stage({0, head_rows}, false);
+    build_stage({split ? head_rows : 0U, count}, head_rows != 0);
+  }
   prepared_count_ = count;
   prepared_batch_done_only_ = batch_done_only;
   prepared_head_rows_ = head_rows;
@@ -570,7 +580,7 @@ Status Transport::WaitSuffix(const std::atomic<bool>* stop) {
 Status Transport::DrainPrepared(Profile* profile) {
   BatchGetProfileScope timer(profile ? &profile->cq_wait_ns : nullptr);
   while (!tracker_.Empty()) {
-    auto status = PollPrepared(0, profile); // A prefix and suffix can both be in flight.
+    auto status = PollPrepared(0, profile); // Multiple plans can be in flight.
     if (!status.ok()) return status;
   }
   if (profile) profile->last_cqe_ns = BatchGetProfileNowNs();
@@ -580,34 +590,27 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto* profile = profile_.enabled ? &profile_ : nullptr;
   const auto fail_gather = [&](const Status& failure) {
-    // No WR from the failing stage has been posted. A valid prefix may still
-    // be in flight, so drain it before publishing the error on queue 0.
+    // Earlier valid chunks may still be in flight. Drain them before
+    // publishing the error on queue 0.
     auto status = DrainPrepared(profile);
     if (status.ok()) status = Complete(request().sequence, Result::kCopyError);
     return status.ok() ? failure : status;
   };
+  const auto count = request().count;
   if (gather_) {
     if (!tracker_.Empty()) return Error("grow gather staging while WRITE is in flight");
-    const auto status = EnsureGatherStaging(request().count);
+    const auto status = EnsureGatherStaging(count);
     if (!status.ok()) return fail_gather(status);
   }
-  auto status = PrepareWrites(request().count);
+  auto status = PrepareWrites(count);
   if (!status.ok()) return status;
-  bool suffix_ready = false;
-  for (std::size_t w = 0; w < prepared_.size(); ++w) {
+  const auto wait_suffix = [&]() {
+    BatchGetProfileScope timer(profile && gather_ ? &profile->suffix_wait_ns : nullptr);
+    return WaitSuffix(stop);
+  };
+  const auto submit_plan = [&](std::size_t w) {
     auto& plan = *prepared_[w];
-    if (plan.suffix && !suffix_ready) {
-      BatchGetProfileScope timer(profile && gather_ ? &profile->suffix_wait_ns : nullptr);
-      status = WaitSuffix(stop);
-      if (!status.ok()) return status;
-      suffix_ready = true;
-    }
-    if (plan.gather_rows.begin < plan.gather_rows.end) {
-      status = GatherRows(plan.gather_rows);
-      if (!status.ok()) return fail_gather(status);
-    }
-    // Only a physical SQ-credit shortage drains the prefix before the suffix.
-    status = BeginPrepared(plan, w + 1, profile, true);
+    auto status = BeginPrepared(plan, w + 1, profile, true);
     if (!status.ok()) return status;
     if (profile) {
       if (!gather_) profile->cpu_threads = 1;
@@ -625,6 +628,48 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       if (!profile->first_post_ns) profile->first_post_ns = first_post;
       profile->post_ns += BatchGetProfileNowNs() - first_post;
     }
+    return Status::OK();
+  };
+  if (gather_ && !(request().reserved & kBatchDoneOnly)) {
+    std::size_t next_plan = 0;
+    const auto head = (request().reserved & kHeadStart) ? kChunkRows : 0U;
+    for (const auto range : {Range{0, head}, Range{head, count}}) {
+      if (range.begin == range.end) continue;
+      if (range.begin) {
+        status = wait_suffix();
+        if (!status.ok()) return fail_gather(status);
+      }
+      Status post_status = Status::OK();
+      status = GatherRows(range, [&](std::uint32_t rows) {
+        const auto ready = range.begin + rows;
+        while (next_plan < prepared_.size() && prepared_[next_plan]->ready_rows <= ready) {
+          post_status = submit_plan(next_plan);
+          if (!post_status.ok()) return false;
+          ++next_plan;
+        }
+        return true;
+      });
+      if (!post_status.ok()) return post_status;
+      if (!status.ok()) return fail_gather(status);
+    }
+    if (next_plan != prepared_.size()) return fail_gather(Error("missing gather WRITE plan"));
+    return DrainPrepared(profile);
+  }
+
+  bool suffix_ready = false;
+  for (std::size_t w = 0; w < prepared_.size(); ++w) {
+    auto& plan = *prepared_[w];
+    if (plan.suffix && !suffix_ready) {
+      status = wait_suffix();
+      if (!status.ok()) return status;
+      suffix_ready = true;
+    }
+    if (plan.gather_rows.begin < plan.gather_rows.end) {
+      status = GatherRows(plan.gather_rows);
+      if (!status.ok()) return fail_gather(status);
+    }
+    status = submit_plan(w);
+    if (!status.ok()) return status;
     const bool keep_prefix = !plan.suffix && w + 1 < prepared_.size() && prepared_[w + 1]->suffix;
     if (!keep_prefix) {
       status = DrainPrepared(profile);

@@ -26,7 +26,9 @@ CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，�
 Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
 使用一个源 SGE 和一个目标 SGE，按设备报告的消息及 WRITE 长度上限拆分。
 AIV 复用现有的 Ready/Done 和 scatter。`pipeline=1` 下启用首段提前发布时，
-CPU 先 gather 并回推首段，再等后缀清单。已提交的首段回推可以与后缀 gather 重叠。
+CPU 先 gather 并回推首段，再等后缀清单。CPU 线程协作拷贝每个最多 1024 行的块，
+块就绪后由队列所属的 CPU 线程提交 WRITE，其他线程继续拷贝后续块。
+每个 AIV 分片的 Ready 随该分片的最后一部分 WRITE 发布。
 `pipeline=0` 下 CPU 等完整清单，完成整批 gather 后才提交 WRITE。
 
 CPU gather 使用服务的 `--gather-threads` 和 gather 绑核、等待配置。
@@ -180,7 +182,9 @@ payload CQE。`--pipeline 1` 的这段时间可包含后缀 gather 和 Ready WRI
 
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务发布，`copy_ns` 记录各线程的源地址校验、拷贝和汇合，
-`suffix_wait_ns` 记录等待后缀清单的时间。每会话保留前 512 条，`active_threads`
+`suffix_wait_ns` 记录等待后缀清单的时间。`pipeline=1` 的 `copy_ns` 还覆盖
+拷贝期间的 WRITE 提交，单独比较 CPU gather 耗时用 `--pipeline 0`。
+每会话保留前 512 条，`active_threads`
 记录单批实际使用的最大线程数。对照 `aiv_gather_yq` 的固定请求基准时，可以用
 `--pipeline 0 --fixed-request-plan`，并对齐源表、线程总数和 CPU 绑定。
 此时 Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane。

@@ -502,7 +502,7 @@ int main() {
   {
     // Scatter gathers packed rows into a separate MR. In a short batch,
     // cache-line rounding must leave the bytes past its tail untouched.
-    alignas(64) uint8_t staging[128];
+    alignas(64) uint8_t staging[256];
     uint8_t source[16];
     for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = i;
     std::memset(staging, 0xad, sizeof(staging));
@@ -515,8 +515,8 @@ int main() {
     assert(std::all_of(staging + sizeof(expected), staging + sizeof(staging),
                        [](uint8_t byte) { return byte == 0xad; }));
     // Place the invalid source in a helper's cache-line slice.
-    uint64_t repeated[8];
-    std::fill_n(repeated, 8, Address(source));
+    uint64_t repeated[13];
+    std::fill_n(repeated, 13, Address(source));
     repeated[4] = Address(source + 1);
     assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source)) == 4);
     try {
@@ -531,6 +531,28 @@ int main() {
     executor.Copy();
     for (uint32_t i = 0; i < 8; ++i)
       assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+
+    // A prefix callback may submit DMA while helpers are copying the tail.
+    std::memset(staging, 0xad, sizeof(staging));
+    std::vector<uint32_t> ready;
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8) == 4);
+    executor.Copy([&](uint32_t rows) {
+      ready.push_back(rows);
+      for (uint32_t i = 0; i < rows; ++i)
+        assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+      return true;
+    });
+    assert((ready == std::vector<uint32_t>{8, 13}));
+    assert(std::all_of(staging + 13 * sizeof(source), staging + sizeof(staging),
+                       [](uint8_t byte) { return byte == 0xad; }));
+
+    repeated[12] = Address(source + 1);
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8) == 4);
+    try {
+      executor.Copy([](uint32_t rows) { assert(rows == 8); return true; });
+      assert(false && "invalid fixed chunk was accepted");
+    } catch (const std::invalid_argument&) {
+    }
   }
   // Match the hardware smoke test: the first launch is empty, followed by
   // nonempty launches on the same queues. Empty work must finish all worker

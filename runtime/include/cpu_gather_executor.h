@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -78,7 +79,7 @@ class CpuGatherExecutor {
   // invalid fixed source addresses after all participating workers finish.
   std::size_t PrepareFixed(void* staging, const std::uint64_t* addresses,
                            std::uint32_t count, std::uint32_t span_bytes,
-                           std::uint64_t source_bytes);
+                           std::uint64_t source_bytes, std::uint32_t chunk_rows = 0);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -98,7 +99,10 @@ class CpuGatherExecutor {
 #endif
   }
 
-  void Copy();
+  // For chunked fixed input, the coordinator calls on_chunk with the number
+  // of ready rows. Returning false stops publication and joins the helpers.
+  using ChunkReady = std::function<bool(std::uint32_t)>;
+  void Copy(const ChunkReady& on_chunk = {});
 
  private:
   std::size_t Publish(void* staging, const GatherSpan* spans, const std::uint64_t* addresses,
@@ -116,6 +120,7 @@ class CpuGatherExecutor {
     staging_ = static_cast<std::uint8_t*>(staging);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
+    for (auto& chunk : fixed_progress_) chunk.remaining = threads;
     phase_.store(0U, std::memory_order_release);
     generation_.fetch_add(1U, std::memory_order_release);
     lock.unlock();
@@ -138,18 +143,20 @@ class CpuGatherExecutor {
     return cpus;
   }
 
-  std::uint64_t Boundary(std::size_t index) const {
-    if (index == 0U) return 0U;
-    if (index == active_threads_) return total_bytes_;
-    const std::uint64_t target = total_bytes_ * index / active_threads_;
+  std::uint64_t Boundary(std::size_t index, std::uint64_t begin, std::uint64_t end) const {
+    if (index == 0U) return begin;
+    if (index == active_threads_) return end;
+    const auto target = begin + (end - begin) * index / active_threads_;
     const auto base = reinterpret_cast<std::uintptr_t>(staging_);
     const auto boundary = ((base + target + 63U) & ~std::uintptr_t{63U}) - base;
-    return std::min<std::uint64_t>(boundary, total_bytes_);
+    return std::min<std::uint64_t>(boundary, end);
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
   template <typename Address>
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end, Address address) const;
+  std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
+  std::uint64_t CopyFixedChunk(std::size_t worker, std::size_t chunk);
 
   std::uint64_t ProcessSource(std::size_t worker);
 
@@ -173,6 +180,9 @@ class CpuGatherExecutor {
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
   std::uint64_t fixed_source_bytes_{0U};
+  std::uint32_t fixed_chunk_rows_{};
+  struct alignas(64) FixedChunkProgress { std::size_t remaining{}; };
+  std::vector<FixedChunkProgress> fixed_progress_;
   std::atomic<bool> fixed_copy_failed_{false};
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
