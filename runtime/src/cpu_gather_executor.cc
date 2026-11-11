@@ -82,16 +82,28 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
     std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes,
-    std::uint32_t chunk_rows) {
+    std::uint32_t chunk_rows, const FixedSuffix* suffix, std::uint32_t first_chunk_rows) {
   if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes)
     return 0U;
   if (chunk_rows && (reinterpret_cast<std::uintptr_t>(staging) % 64U ||
                      std::uint64_t{chunk_rows} * span_bytes % 64U))
     return 0U;
+  if (suffix && (!suffix->ready_sequence || !chunk_rows || chunk_rows >= count))
+    return 0U;
+  if (first_chunk_rows && (first_chunk_rows >= chunk_rows || first_chunk_rows >= count ||
+                           std::uint64_t{first_chunk_rows} * span_bytes % 64U))
+    return 0U;
   fixed_chunk_rows_ = chunk_rows;
-  fixed_progress_.resize(chunk_rows ? (count - 1U) / chunk_rows + 1U : 0U);
-  fixed_source_bytes_ = source_bytes;
-  fixed_copy_failed_.store(false, std::memory_order_relaxed);
+  const auto small_first = first_chunk_rows != 0U;
+  fixed_progress_.resize(chunk_rows ? (count - 1U) / chunk_rows + 1U + small_first : 0U);
+  for (std::size_t i = 0; i < fixed_progress_.size(); ++i) {
+    const auto end = small_first && i == 0U
+        ? first_chunk_rows : std::uint64_t{chunk_rows} * (i + !small_first);
+    fixed_progress_[i].end_row = static_cast<std::uint32_t>(std::min<std::uint64_t>(count, end));
+  }
+  fixed_last_source_offset_ = source_bytes - span_bytes;
+  fixed_suffix_ = suffix ? *suffix : FixedSuffix{};
+  fixed_error_.store(FixedError::kNone, std::memory_order_relaxed);
   span_bytes_ = span_bytes;
   pipeline_ready_ = nullptr;
   return Publish(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
@@ -114,11 +126,10 @@ void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
     try {
       while (next_ready < fixed_progress_.size() &&
              !__atomic_load_n(&fixed_progress_[next_ready].remaining, __ATOMIC_ACQUIRE) &&
-             !fixed_copy_failed_.load(std::memory_order_relaxed)) {
-        const auto rows = std::min<std::uint64_t>(
-            span_count_, std::uint64_t{fixed_chunk_rows_} * (next_ready + 1U));
-        if (on_chunk && !on_chunk(static_cast<std::uint32_t>(rows))) {
+             fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
+        if (on_chunk && !on_chunk(fixed_progress_[next_ready].end_row)) {
           publishing = false;
+          SetFixedError(FixedError::kCancelled);
           return;
         }
         ++next_ready;
@@ -126,13 +137,23 @@ void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
     } catch (...) {
       publish_error = std::current_exception();
       publishing = false;
+      SetFixedError(FixedError::kCancelled);
     }
   };
   if (fixed_progress_.empty()) {
     copied = ProcessSource(0U);
   } else {
     for (std::size_t chunk = 0; chunk < fixed_progress_.size(); ++chunk) {
-      if (!publishing || fixed_copy_failed_.load(std::memory_order_relaxed)) break;
+      if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
+      if (fixed_suffix_.ready_sequence && FixedChunkBegin(chunk) == fixed_chunk_rows_) {
+        const auto begin = profiling_enabled_ &&
+            __atomic_load_n(fixed_suffix_.ready_sequence, __ATOMIC_ACQUIRE) != fixed_suffix_.sequence
+            ? NowNs() : 0U;
+        // Keep posting completed head chunks if suffix has yet to arrive.
+        const bool ready = WaitFixedSuffix(publish_ready);
+        if (begin) copy_profile_.suffix_wait_ns = NowNs() - begin;
+        if (!ready) break;
+      }
       copied += CopyFixedChunk(0U, chunk);
       publish_ready();
     }
@@ -146,21 +167,18 @@ void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
   publish_ready();
   if (profiling_enabled_) copy_profile_.done_ns = NowNs();
   if (publish_error) std::rethrow_exception(publish_error);
-  if (addresses_ && fixed_copy_failed_.load(std::memory_order_relaxed))
-    throw std::invalid_argument("CPU gather source outside registered DDR");
+  if (addresses_) {
+    const auto error = fixed_error_.load(std::memory_order_relaxed);
+    if (error == FixedError::kSource)
+      throw std::invalid_argument("CPU gather source outside registered DDR");
+    if (error == FixedError::kSuffix)
+      throw std::runtime_error("CPU gather descriptor suffix wait failed");
+  }
   if (pipeline_ready_ != nullptr) __atomic_store_n(pipeline_ready_, total_bytes_, __ATOMIC_RELEASE);
 }
 
 // Copy only this thread's staging range, combining adjacent source spans into one memcpy.
 std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end) const {
-  if (addresses_)
-    return CopyRange(offset, end, [this](std::size_t index) { return addresses_[index]; });
-  return CopyRange(offset, end, [this](std::size_t index) { return spans_[index].address; });
-}
-
-template <typename Address>
-std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t end,
-                                          Address address) const {
   if (offset >= end) return 0U;
   const auto begin = offset;
   const auto index_for_offset = span_bytes_ != 0U
@@ -170,13 +188,13 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
   std::size_t index = static_cast<std::size_t>(index_for_offset);
   auto in_span = span_bytes_ != 0U ? offset % span_bytes_ : offset - variable_offsets_[index];
   while (offset < end) {
-    const auto source_address = address(index) + in_span;
+    const auto source_address = spans_[index].address + in_span;
     const auto length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
     auto bytes = std::min<std::uint64_t>(length - in_span, end - offset);
     ++index;
     in_span = 0U;
     while (bytes < end - offset && index < span_count_ &&
-           address(index) == source_address + bytes) {
+           spans_[index].address == source_address + bytes) {
       const auto next_length = span_bytes_ != 0U ? span_bytes_ : spans_[index].length;
       bytes += std::min<std::uint64_t>(next_length, end - offset - bytes);
       ++index;
@@ -190,21 +208,67 @@ std::uint64_t CpuGatherExecutor::CopyRange(std::uint64_t offset, std::uint64_t e
 
 std::uint64_t CpuGatherExecutor::CopyFixedRange(std::uint64_t begin, std::uint64_t end) {
   if (begin == end) return 0U;
-  // Validate full tokens even where workers split a token at a cache line.
-  const auto last = (end - 1U) / span_bytes_;
-  for (auto row = begin / span_bytes_; row <= last; ++row) {
-    if (!GatherRange(base_, fixed_source_bytes_, addresses_[row], span_bytes_)) {
-      fixed_copy_failed_.store(true, std::memory_order_relaxed);
-      return 0U;
+  const auto span_bytes = span_bytes_;
+  const auto last_source = fixed_last_source_offset_;
+  auto row = begin / span_bytes;
+  auto in_span = begin % span_bytes;
+  auto offset = begin;
+  auto source = addresses_[row] - base_;
+  while (offset < end) {
+    // Check the full token even when a worker owns only part of it. Unsigned
+    // subtraction also rejects addresses below the registered base.
+    if (source > last_source) {
+      SetFixedError(FixedError::kSource);
+      return offset - begin;
     }
+    const auto source_begin = source + in_span;
+    const auto remaining = end - offset;
+    auto bytes = std::min(remaining, span_bytes - in_span);
+    in_span = 0U;
+    while (bytes < remaining) {
+      source = addresses_[++row] - base_;
+      if (source != source_begin + bytes) break;
+      if (source > last_source) {
+        SetFixedError(FixedError::kSource);
+        return offset - begin;
+      }
+      bytes += std::min<std::uint64_t>(span_bytes, remaining - bytes);
+    }
+    std::memcpy(staging_ + offset, memory_ + source_begin, bytes);
+    offset += bytes;
   }
-  return CopyRange(begin, end);
+  return offset - begin;
+}
+
+template <typename OnWait>
+bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
+  const auto& suffix = fixed_suffix_;
+  auto observed = __atomic_load_n(suffix.ready_sequence, __ATOMIC_ACQUIRE);
+  if (observed == suffix.sequence) return true;
+  const auto deadline = std::chrono::steady_clock::now() + suffix.timeout;
+  std::uint32_t polls = 0;
+  do {
+    if (observed > suffix.sequence ||
+        fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone)
+      break;
+    if ((++polls & 31U) == 0U &&
+        ((suffix.stop && suffix.stop->load(std::memory_order_acquire)) ||
+         std::chrono::steady_clock::now() >= deadline))
+      break;
+    on_wait();
+    GatherSpinPause();
+    observed = __atomic_load_n(suffix.ready_sequence, __ATOMIC_ACQUIRE);
+  } while (observed != suffix.sequence);
+  if (observed == suffix.sequence &&
+      fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone)
+    return true;
+  SetFixedError(FixedError::kSuffix);
+  return false;
 }
 
 std::uint64_t CpuGatherExecutor::CopyFixedChunk(std::size_t worker, std::size_t chunk) {
-  const auto chunk_bytes = std::uint64_t{fixed_chunk_rows_} * span_bytes_;
-  const auto begin = chunk * chunk_bytes;
-  const auto end = begin + std::min(chunk_bytes, total_bytes_ - begin);
+  const auto begin = std::uint64_t{FixedChunkBegin(chunk)} * span_bytes_;
+  const auto end = std::uint64_t{fixed_progress_[chunk].end_row} * span_bytes_;
   const auto copied = CopyFixedRange(Boundary(worker, begin, end), Boundary(worker + 1U, begin, end));
   if (copied) GatherBarrier();
   // The last decrement carries every writer's completed stores to the owner.
@@ -216,7 +280,9 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   if (!fixed_progress_.empty()) {
     std::uint64_t copied = 0U;
     for (std::size_t chunk = 0; chunk < fixed_progress_.size(); ++chunk) {
-      if (fixed_copy_failed_.load(std::memory_order_relaxed)) break;
+      if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
+      if (fixed_suffix_.ready_sequence && FixedChunkBegin(chunk) == fixed_chunk_rows_ &&
+          !WaitFixedSuffix([] {})) break;
       copied += CopyFixedChunk(worker, chunk);
     }
     return copied;
@@ -267,7 +333,8 @@ void CpuGatherExecutor::FinishWorker(std::size_t worker, std::uint64_t bytes) {
     thread_profiles_[worker].bytes = bytes;
     thread_profiles_[worker].copy_done_ns = NowNs();
   }
-  GatherBarrier();
+  // Chunk writers have already completed their stores before advertising progress.
+  if (fixed_progress_.empty()) GatherBarrier();
   if (!profiling_enabled_) return;
   auto& profile = thread_profiles_[worker];
   profile.done_ns = NowNs();

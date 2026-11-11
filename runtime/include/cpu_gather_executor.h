@@ -55,6 +55,7 @@ struct alignas(64) CpuGatherThreadProfile {
 
 struct CpuGatherCopyProfile {
   std::uint64_t publish_ns{}, begin_ns{}, coordinator_done_ns{}, done_ns{};
+  std::uint64_t suffix_wait_ns{};
 };
 
 class CpuGatherExecutor {
@@ -86,11 +87,21 @@ class CpuGatherExecutor {
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
                             std::uint64_t sequence, std::size_t max_spans);
+  struct FixedSuffix {
+    const std::uint64_t* ready_sequence{};
+    std::uint64_t sequence{};
+    const std::atomic<bool>* stop{};
+    std::chrono::milliseconds timeout{};
+  };
   // Keep the address list and destination stable through Copy. Copy reports
   // invalid fixed source addresses after all participating workers finish.
+  // A small first chunk can split the first regular chunk. Suffix, if
+  // supplied, still guards descriptors from chunk_rows onward.
   std::size_t PrepareFixed(void* staging, const std::uint64_t* addresses,
                            std::uint32_t count, std::uint32_t span_bytes,
-                           std::uint64_t source_bytes, std::uint32_t chunk_rows = 0);
+                           std::uint64_t source_bytes, std::uint32_t chunk_rows = 0,
+                           const FixedSuffix* suffix = nullptr,
+                           std::uint32_t first_chunk_rows = 0U);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -175,10 +186,13 @@ class CpuGatherExecutor {
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
-  template <typename Address>
-  std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end, Address address) const;
   std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
   std::uint64_t CopyFixedChunk(std::size_t worker, std::size_t chunk);
+  std::uint32_t FixedChunkBegin(std::size_t chunk) const {
+    return chunk ? fixed_progress_[chunk - 1U].end_row : 0U;
+  }
+  template <typename OnWait>
+  bool WaitFixedSuffix(OnWait on_wait);
 
   std::uint64_t ProcessSource(std::size_t worker);
 
@@ -207,11 +221,20 @@ class CpuGatherExecutor {
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
-  std::uint64_t fixed_source_bytes_{0U};
+  std::uint64_t fixed_last_source_offset_{0U};
   std::uint32_t fixed_chunk_rows_{};
-  struct alignas(64) FixedChunkProgress { std::size_t remaining{}; };
+  FixedSuffix fixed_suffix_{};
+  struct alignas(64) FixedChunkProgress {
+    std::size_t remaining{};
+    std::uint32_t end_row{};
+  };
   std::vector<FixedChunkProgress> fixed_progress_;
-  std::atomic<bool> fixed_copy_failed_{false};
+  enum class FixedError { kNone, kSource, kSuffix, kCancelled };
+  std::atomic<FixedError> fixed_error_{FixedError::kNone};
+  void SetFixedError(FixedError error) {
+    auto expected = FixedError::kNone;
+    fixed_error_.compare_exchange_strong(expected, error, std::memory_order_relaxed);
+  }
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};

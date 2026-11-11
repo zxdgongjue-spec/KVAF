@@ -180,14 +180,21 @@ payload CQE。`--pipeline 1` 的这段时间可包含后缀 gather 和 Ready WRI
 改用 `--pipeline 0` 可测完整 gather 后的提交到完成窗口，并在 CPU 日志中查看
 `CPU_PUSH_CAP` 的 `payload_write_bytes`。
 
+Scatter 的 CPU gather 复用了 `aiv_gather_yq` 的整批线程预算和分段清单消费方式。
+流水模式下只调度一次：各线程先拷贝首段，走到第 1024 行时才检查 suffix；
+连续前缀就绪后可以立即提交 WRITE。第一个 Jetty 分片的结束位置对齐 CPU
+cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批仍重新读取源清单，
+只复用与请求形状有关的 WRITE 计划。
+
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务发布，`copy_ns` 记录各线程的源地址校验、拷贝和汇合，
-`suffix_wait_ns` 记录等待后缀清单的时间。`pipeline=1` 的 `copy_ns` 还覆盖
-拷贝期间的 WRITE 提交，单独比较 CPU gather 耗时用 `--pipeline 0`。
-每会话保留前 512 条，`active_threads`
-记录单批实际使用的最大线程数。对照 `aiv_gather_yq` 的固定请求基准时，可以用
-`--pipeline 0 --fixed-request-plan`，并对齐源表、线程总数和 CPU 绑定。
-此时 Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane。
+`suffix_wait_ns` 记录协调线程等待后缀清单的时间。`pipeline=1` 的 `copy_ns`
+包含这段等待及拷贝期间的 WRITE 提交，不能与 `suffix_wait_ns` 相加。
+单独比较 CPU gather 耗时用 `--pipeline 0`，此时 suffix 在拷贝计时前等完。
+每会话保留前 512 条，`active_threads` 记录单批实际参与的 CPU 线程数。
+Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane。比较时先对齐
+总字节数、CPU 线程总预算、绑定、源表和请求分布；只有复现参考分支的固定请求基准时，
+才加 `--fixed-request-plan`。
 
 日志还记录协调线程完成自己拷贝后的 `join_wait_ns`，以及最晚完成线程的
 `slow_worker`、`slow_tid`、`slow_cpu`、`slow_bytes`、`slow_start_delay_ns`、

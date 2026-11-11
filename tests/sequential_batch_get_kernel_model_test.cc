@@ -2,6 +2,7 @@
 // DMA cache visibility and CANN code generation still require hardware tests.
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -535,15 +536,25 @@ int main() {
     // A prefix callback may submit DMA while helpers are copying the tail.
     std::memset(staging, 0xad, sizeof(staging));
     std::vector<uint32_t> ready;
+    alignas(8) uint64_t suffix_sequence = 0;
+    const kvaf::peer::CpuGatherExecutor::FixedSuffix suffix{
+        &suffix_sequence, 1, nullptr, std::chrono::seconds(1)};
+    std::fill(repeated + 8, repeated + 13, Address(source + 1));
     executor.EnableProfiling(true);
-    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8) == 4);
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8,
+                                 &suffix, 4) == 4);
     executor.Copy([&](uint32_t rows) {
       ready.push_back(rows);
       for (uint32_t i = 0; i < rows; ++i)
         assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+      if (rows == 8) {
+        // No worker may consume these descriptors until their sequence is visible.
+        std::fill(repeated + 8, repeated + 13, Address(source));
+        __atomic_store_n(&suffix_sequence, suffix.sequence, __ATOMIC_RELEASE);
+      }
       return true;
     });
-    assert((ready == std::vector<uint32_t>{8, 13}));
+    assert((ready == std::vector<uint32_t>{4, 8, 13}));
     const auto& copy = executor.CopyProfile();
     assert(copy.publish_ns <= copy.begin_ns && copy.coordinator_done_ns <= copy.done_ns);
     uint64_t copied_bytes = 0;

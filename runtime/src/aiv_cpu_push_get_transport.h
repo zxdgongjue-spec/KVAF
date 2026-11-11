@@ -79,12 +79,13 @@ class Transport {
     std::array<Tracker::Fence, kJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
-    Range gather_rows{};
     std::uint32_t ready_rows{};
-    bool suffix{};
+    bool suffix{}, gather_before_post{};
   };
   Status EnsureGatherStaging(std::uint32_t count);
-  Status GatherRows(Range range, const peer::CpuGatherExecutor::ChunkReady& on_chunk = {});
+  std::uint32_t FirstGatherChunkRows(std::uint32_t count) const;
+  Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::ChunkReady& on_chunk = {},
+                    const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr);
   void FlushGatherProfiles();
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();

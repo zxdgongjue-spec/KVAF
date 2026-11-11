@@ -270,16 +270,25 @@ Status Transport::EnsureGatherStaging(std::uint32_t count) {
   return Status::OK();
 }
 
-Status Transport::GatherRows(Range range, const peer::CpuGatherExecutor::ChunkReady& on_chunk) {
+std::uint32_t Transport::FirstGatherChunkRows(std::uint32_t count) const {
+  if (count <= kChunkRows) return 0U;
+  const auto lane = WorkerRange(count, token_bytes_, 0, workers_);
+  const auto shard = JettyRange(ChunkRange(lane, 0), 0);
+  // The first WRITE should make a whole shard consumable, with no cache
+  // line shared with workers gathering the next chunk.
+  return std::uint64_t{shard.end} * token_bytes_ % 64U == 0U ? shard.end : 0U;
+}
+
+Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::ChunkReady& on_chunk,
+                             const peer::CpuGatherExecutor::FixedSuffix* suffix) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  auto* staging = gather_staging_ + std::uint64_t{range.begin} * token_bytes_;
   try {
     std::size_t threads;
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
       gather_->EnableProfiling(profile_.enabled);
-      threads = gather_->PrepareFixed(staging, addresses + range.begin,
-          range.end - range.begin, token_bytes_, source_bytes_, on_chunk ? kChunkRows : 0U);
+      threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
+          on_chunk ? kChunkRows : 0U, suffix, on_chunk ? FirstGatherChunkRows(count) : 0U);
     }
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
     {
@@ -289,6 +298,7 @@ Status Transport::GatherRows(Range range, const peer::CpuGatherExecutor::ChunkRe
     if (profile_.enabled) {
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
       const auto& copy = gather_->CopyProfile();
+      profile_.suffix_wait_ns += copy.suffix_wait_ns;
       profile_.gather_join_wait_ns += copy.done_ns - copy.coordinator_done_ns;
       const auto& workers = gather_->ThreadProfiles();
       for (std::size_t worker = 0; worker < threads; ++worker) {
@@ -442,7 +452,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       SealPrepared(*plan);
       if (plan->fence_count) {
         if (gather_pipeline) plan->ready_rows = stage.end;
-        else if (gather_ && w == 0) plan->gather_rows = stage;
+        else if (gather_ && w == 0) plan->gather_before_post = true;
         prepared_.push_back(std::move(plan));
       }
     }
@@ -451,8 +461,13 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   // full gather before the first payload post. A head-start request still
   // requires the suffix notification even though it uses one payload stage.
   if (gather_pipeline) {
-    for (std::uint32_t begin = 0; begin < count; begin += kChunkRows)
-      build_stage({begin, std::min(count, begin + kChunkRows)}, false);
+    auto begin = FirstGatherChunkRows(count);
+    if (begin) build_stage({0, begin}, false);
+    while (begin < count) {
+      const auto end = std::min(count, (begin / kChunkRows + 1U) * kChunkRows);
+      build_stage({begin, end}, false);
+      begin = end;
+    }
   } else {
     const bool split = head_rows && !gather_;
     if (split) build_stage({0, head_rows}, false);
@@ -646,26 +661,20 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   };
   if (gather_ && !(request().reserved & kBatchDoneOnly)) {
     std::size_t next_plan = 0;
-    const auto head = (request().reserved & kHeadStart) ? kChunkRows : 0U;
-    for (const auto range : {Range{0, head}, Range{head, count}}) {
-      if (range.begin == range.end) continue;
-      if (range.begin) {
-        status = wait_suffix();
-        if (!status.ok()) return fail_gather(status);
+    const peer::CpuGatherExecutor::FixedSuffix suffix{
+        reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset),
+        request().sequence, stop, std::chrono::milliseconds(kTimeoutMs)};
+    Status post_status = Status::OK();
+    status = GatherRows(count, [&](std::uint32_t ready_rows) {
+      while (next_plan < prepared_.size() && prepared_[next_plan]->ready_rows <= ready_rows) {
+        post_status = submit_plan(next_plan);
+        if (!post_status.ok()) return false;
+        ++next_plan;
       }
-      Status post_status = Status::OK();
-      status = GatherRows(range, [&](std::uint32_t rows) {
-        const auto ready = range.begin + rows;
-        while (next_plan < prepared_.size() && prepared_[next_plan]->ready_rows <= ready) {
-          post_status = submit_plan(next_plan);
-          if (!post_status.ok()) return false;
-          ++next_plan;
-        }
-        return true;
-      });
-      if (!post_status.ok()) return post_status;
-      if (!status.ok()) return fail_gather(status);
-    }
+      return true;
+    }, (request().reserved & kHeadStart) ? &suffix : nullptr);
+    if (!post_status.ok()) return post_status;
+    if (!status.ok()) return fail_gather(status);
     if (next_plan != prepared_.size()) return fail_gather(Error("missing gather WRITE plan"));
     return DrainPrepared(profile);
   }
@@ -678,8 +687,8 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       if (!status.ok()) return status;
       suffix_ready = true;
     }
-    if (plan.gather_rows.begin < plan.gather_rows.end) {
-      status = GatherRows(plan.gather_rows);
+    if (plan.gather_before_post) {
+      status = GatherRows(count);
       if (!status.ok()) return fail_gather(status);
     }
     status = submit_plan(w);
