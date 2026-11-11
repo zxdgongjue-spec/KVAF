@@ -35,6 +35,7 @@ enum class Command : uint16_t {
   kStopGatherLanes = 14U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
+  // Command 15 is retired; keep all remaining wire command numbers unchanged.
 };
 
 inline constexpr bool IsAivCpuPushCommand(Command command) {

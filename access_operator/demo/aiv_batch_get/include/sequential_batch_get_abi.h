@@ -14,6 +14,8 @@ static const uint64_t KVAF_SEQ_STATUS_MAGIC = 0x4b56414653455131ULL;
 enum KvafSequentialResult : uint64_t {
   KVAF_SEQ_OK = 0, KVAF_SEQ_INVALID = 1, KVAF_SEQ_TIMEOUT = 2,
   KVAF_SEQ_REMOTE_ERROR = 3, KVAF_SEQ_CQ_ERROR = 4, KVAF_SEQ_QUEUE_ERROR = 5,
+  // Gather diagnostics are completed prefixes, never a successful BatchGet.
+  KVAF_SEQ_PROBE_COMPLETE = 6,
 };
 enum KvafSequentialPhase : uint64_t {
   KVAF_SEQ_VALIDATE = 1, KVAF_SEQ_BUILD = 2, KVAF_SEQ_NOTIFY = 3,

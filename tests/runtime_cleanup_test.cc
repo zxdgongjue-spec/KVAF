@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "batch_get_profile.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -13,6 +14,9 @@ using namespace kvaf;
 struct Operator final : AccessOperator {
   bool fail_initialize{false}, fail_shutdown{false};
   int shutdown_calls{0};
+  int get_calls{0};
+  const BatchGetRequest* last_request{};
+  BatchGetExecutionOptions last_execution;
   Status Initialize(const RemoteRegionDesc&) override {
     return fail_initialize ? Status::Internal("initialize failed") : Status::OK();
   }
@@ -20,7 +24,12 @@ struct Operator final : AccessOperator {
     ++shutdown_calls;
     return fail_shutdown ? Status::Internal("drain failed") : Status::OK();
   }
-  Status ExecuteBatchGet(const BatchGetExecRequest&) override { return Status::OK(); }
+  Status ExecuteBatchGet(const BatchGetExecRequest& exec) override {
+    ++get_calls;
+    last_request = exec.request;
+    last_execution = exec.execution;
+    return Status::OK();
+  }
   Status ExecuteBatchPut(const BatchPutExecRequest&) override { return Status::OK(); }
 };
 
@@ -105,11 +114,45 @@ void CheckPartialInitializationRetry() {
   }
   CHECK(!allocator.allocated && allocator.release_calls == 2);
 }
+
+void CheckTrustedNpuDispatch() {
+  auto meta = CreateInMemoryMetaManager();
+  Operator op;
+  Allocator allocator;
+  RuntimeCore runtime(*meta, op, allocator);
+  BatchGetRequest request;
+  request.access_table.opaque = 123;  // Trusted NPU tables come from device metadata.
+  request.indices.device = DeviceKind::kNpu;
+  BatchGetProfile profile;
+  BatchGetExecutionOptions execution;
+  execution.stream = reinterpret_cast<void*>(1);
+  execution.synchronize = true;
+  execution.profile = &profile;
+  execution.trusted_npu_request = true;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kNotInitialized);
+  CHECK(runtime.Initialize({128, 64, DeviceKind::kCpu}).ok());
+  execution.stream = nullptr;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
+  execution.stream = reinterpret_cast<void*>(1);
+  request.indices.device = DeviceKind::kCpu;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
+  CHECK(op.get_calls == 0);
+  request.indices.device = DeviceKind::kNpu;
+  CHECK(runtime.BatchGet(request, execution).ok());
+  CHECK(op.get_calls == 1 && op.last_request == &request);
+  CHECK(op.last_execution.stream == execution.stream && op.last_execution.synchronize);
+  CHECK(op.last_execution.profile == &profile && op.last_execution.trusted_npu_request);
+  execution.trusted_npu_request = false;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kNotFound);
+  CHECK(op.get_calls == 1);
+  CHECK(runtime.Shutdown().ok());
+}
 }  // namespace
 
 int main() {
   CheckDrainFailurePreservesTable();
   CheckReleaseRetry();
   CheckPartialInitializationRetry();
+  CheckTrustedNpuDispatch();
   std::cout << "Runtime cleanup ordering and retry tests passed\n";
 }

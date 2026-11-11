@@ -18,6 +18,12 @@ class SequentialBatchGet {
   virtual Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>*) {
     return Status::NotImplemented("scatter profiling requires cpu_push_scatter");
   }
+  virtual Status SetGatherProfiling(bool) {
+    return Status::NotImplemented("gather profiling requires gather_read mode");
+  }
+  virtual Status CopyGatherProfile(GatherBatchGetProfile*) const {
+    return Status::NotImplemented("gather profiling requires gather_read mode");
+  }
 };
 std::unique_ptr<SequentialBatchGet> CreateSequentialBatchGet(AccessOperatorConfig config);
 }  // namespace kvaf
