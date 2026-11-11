@@ -41,6 +41,7 @@ class Transport {
     std::uint64_t first_post_ns{}, last_cqe_ns{};
     std::uint64_t gather_prepare_ns{}, gather_copy_ns{}, suffix_wait_ns{};
     std::uint64_t gather_join_wait_ns{}, slowest_elapsed_ns{}, slowest_start_delay_ns{};
+    std::uint64_t slowest_ready_delay_ns{};
     peer::CpuGatherThreadProfile slowest_thread{};
     std::uint32_t slowest_worker{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
@@ -49,6 +50,7 @@ class Transport {
   struct GatherProfileSample {
     std::uint64_t sequence;
     std::uint32_t rows;
+    bool pipeline;
     Profile profile;
   };
   std::vector<GatherProfileSample> gather_profile_samples_;

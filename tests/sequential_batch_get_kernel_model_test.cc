@@ -508,13 +508,22 @@ int main() {
     for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = i;
     std::memset(staging, 0xad, sizeof(staging));
     uint64_t addresses[] = {Address(source + 3), Address(source + 6), Address(source + 3)};
-    kvaf::peer::CpuGatherExecutor executor(source, Address(source), 4, 1);
+    kvaf::peer::CpuGatherExecutor executor(source, Address(source), 4, 1,
+                                           kvaf::peer::GatherWaitMode::kActive);
     assert(executor.PrepareFixed(staging, addresses, 3, 3, sizeof(source)) == 4);
     executor.Copy();
     const uint8_t expected[] = {3, 4, 5, 6, 7, 8, 3, 4, 5};
     assert(!std::memcmp(staging, expected, sizeof(expected)));
     assert(std::all_of(staging + sizeof(expected), staging + sizeof(staging),
                        [](uint8_t byte) { return byte == 0xad; }));
+
+    // Reuse the pool with fewer participants, then include all helpers again.
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(executor.PrepareFixed(staging, addresses, 1, 2, sizeof(source)) == 2);
+    executor.Copy();
+    assert(!std::memcmp(staging, source + 3, 2));
+    assert(staging[2] == 0xad);
+
     // Place the invalid source in a helper's cache-line slice.
     uint64_t repeated[13];
     std::fill_n(repeated, 13, Address(source));
@@ -556,11 +565,12 @@ int main() {
     });
     assert((ready == std::vector<uint32_t>{4, 8, 13}));
     const auto& copy = executor.CopyProfile();
-    assert(copy.publish_ns <= copy.begin_ns && copy.coordinator_done_ns <= copy.done_ns);
+    assert(copy.begin_ns <= copy.coordinator_done_ns && copy.coordinator_done_ns <= copy.done_ns);
     uint64_t copied_bytes = 0;
     for (uint32_t worker = 0; worker < 4; ++worker) {
       const auto& profile = executor.ThreadProfiles()[worker];
-      assert(copy.begin_ns <= profile.start_ns && profile.start_ns <= profile.copy_done_ns &&
+      assert(copy.begin_ns <= profile.ready_ns && profile.ready_ns <= profile.start_ns &&
+             profile.start_ns <= profile.copy_done_ns &&
              profile.copy_done_ns <= profile.done_ns && profile.done_ns <= copy.done_ns);
       copied_bytes += profile.bytes;
     }

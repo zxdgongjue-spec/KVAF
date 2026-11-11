@@ -76,8 +76,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
         memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
   }
-  return Publish(memory_ + (header.staging_address - base_), source_spans, nullptr,
-                 header.span_count, header.total_bytes);
+  return PrepareJob(memory_ + (header.staging_address - base_), source_spans, nullptr,
+                    header.span_count, header.total_bytes);
 }
 
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
@@ -106,7 +106,7 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   fixed_error_.store(FixedError::kNone, std::memory_order_relaxed);
   span_bytes_ = span_bytes;
   pipeline_ready_ = nullptr;
-  return Publish(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
+  return PrepareJob(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
 }
 
 void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
@@ -115,7 +115,17 @@ void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
     copy_profile_.begin_ns = NowNs();
     thread_profiles_[0].ready_ns = copy_profile_.begin_ns;
   }
-  phase_.store(1U, std::memory_order_release);
+  if (active_threads_ > 1U) {
+    {
+      // Use the same mutex as the sleeping helpers so they cannot miss the
+      // notification. Helpers already spinning acquire the job via dispatch_.
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto previous = dispatch_.load(std::memory_order_relaxed);
+      const auto generation = (previous & ~kDispatchThreadMask) + kDispatchGenerationStep;
+      dispatch_.store(generation | active_threads_, std::memory_order_release);
+    }
+    ready_.notify_all();
+  }
   BeginWorker(0U);
   std::uint64_t copied = 0U;
   std::exception_ptr publish_error;
@@ -346,54 +356,38 @@ void CpuGatherExecutor::FinishWorker(std::size_t worker, std::uint64_t bytes) {
 
 void CpuGatherExecutor::RunHelper(std::size_t worker) {
   BindWorker(worker);
-  std::uint64_t observed_generation = 0U;
+  std::uint64_t previous = 0U;
   bool was_active = false;
   for (;;) {
-    bool active = false;
-    bool wait_path = false;
-    if (wait_mode_ != GatherWaitMode::kPassive && was_active) {
+    auto dispatch = dispatch_.load(std::memory_order_acquire);
+    if (wait_mode_ != GatherWaitMode::kPassive && was_active && dispatch == previous) {
       const auto spin_start = std::chrono::steady_clock::now();
       std::uint32_t spin_count = 0U;
-      std::uint64_t generation = generation_.load(std::memory_order_acquire);
-      while (generation == observed_generation) {
+      while (dispatch == previous) {
         if (stopping_.load(std::memory_order_acquire)) return;
         if (wait_mode_ == GatherWaitMode::kAdaptive && (++spin_count & 255U) == 0U &&
             std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds(100))
           break;
         GatherSpinPause();
-        generation = generation_.load(std::memory_order_acquire);
+        dispatch = dispatch_.load(std::memory_order_acquire);
       }
-      std::unique_lock<std::mutex> lock(mutex_);
-      if (generation_.load(std::memory_order_acquire) == observed_generation) {
-        wait_path = true;
-        ready_.wait(lock, [this, &observed_generation] {
-          return stopping_.load(std::memory_order_acquire) ||
-                 generation_.load(std::memory_order_acquire) != observed_generation;
-        });
-      }
-      if (stopping_.load(std::memory_order_acquire)) return;
-      observed_generation = generation_.load(std::memory_order_acquire);
-      active = worker < active_threads_;
-    } else {
-      wait_path = true;
-      std::unique_lock<std::mutex> lock(mutex_);
-      ready_.wait(lock, [this, &observed_generation] {
-        return stopping_.load(std::memory_order_acquire) ||
-               generation_.load(std::memory_order_acquire) != observed_generation;
-      });
-      if (stopping_.load(std::memory_order_acquire)) return;
-      observed_generation = generation_.load(std::memory_order_acquire);
-      active = worker < active_threads_;
     }
-    was_active = active;
-    if (!active) continue;
+    const bool wait_path = wait_mode_ == GatherWaitMode::kPassive || dispatch == previous;
+    if (wait_path) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      ready_.wait(lock, [this, previous] {
+        return stopping_.load(std::memory_order_acquire) ||
+               dispatch_.load(std::memory_order_acquire) != previous;
+      });
+      dispatch = dispatch_.load(std::memory_order_acquire);
+    }
+    if (stopping_.load(std::memory_order_acquire)) return;
+    previous = dispatch;
+    was_active = worker < (dispatch & kDispatchThreadMask);
+    if (!was_active) continue;
     if (profiling_enabled_) {
       thread_profiles_[worker].ready_ns = NowNs();
       thread_profiles_[worker].wait_path = wait_path;
-    }
-    while (phase_.load(std::memory_order_acquire) == 0U) {
-      if (stopping_.load(std::memory_order_acquire)) return;
-      GatherSpinPause();
     }
     BeginWorker(worker);
     const auto bytes = ProcessSource(worker);

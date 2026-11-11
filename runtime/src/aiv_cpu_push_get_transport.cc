@@ -306,6 +306,7 @@ Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor:
         if (elapsed > profile_.slowest_elapsed_ns) {
           profile_.slowest_elapsed_ns = elapsed;
           profile_.slowest_start_delay_ns = workers[worker].start_ns - copy.begin_ns;
+          profile_.slowest_ready_delay_ns = workers[worker].ready_ns - copy.begin_ns;
           profile_.slowest_thread = workers[worker];
           profile_.slowest_worker = static_cast<std::uint32_t>(worker);
         }
@@ -718,6 +719,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   }
   const auto profiled_gather_rows =
       profile_.enabled && gather_ && result == Result::kOk ? request().count : 0U;
+  const bool profiled_pipeline = profiled_gather_rows && !(request().reserved & kBatchDoneOnly);
   // One post and one tail CQE for both paths. The 8-byte strongly ordered
   // token follows the report's placement; do not combine them into an
   // unordered 64-byte WRITE (the token could otherwise become visible first).
@@ -727,7 +729,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   if (status.ok()) status = PollPrepared(UINT64_MAX);
   if (status.ok() && profiled_gather_rows) {
     if (gather_profile_samples_.size() < kGatherProfileSamples) {
-      gather_profile_samples_.push_back({sequence, profiled_gather_rows, profile_});
+      gather_profile_samples_.push_back({sequence, profiled_gather_rows, profiled_pipeline, profile_});
     } else {
       ++gather_profile_dropped_;
     }
@@ -759,15 +761,19 @@ void Transport::FlushGatherProfiles() {
     const auto& slow = p.slowest_thread;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64 " suffix_wait_ns=%" PRIu64
+        " pipeline=%u active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
+        " suffix_wait_ns=%" PRIu64
         " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
-        " slow_bytes=%" PRIu64 " slow_start_delay_ns=%" PRIu64 " slow_copy_ns=%" PRIu64
+        " slow_bytes=%" PRIu64 " slow_ready_delay_ns=%" PRIu64
+        " slow_start_delay_ns=%" PRIu64 " slow_copy_ns=%" PRIu64
         " slow_barrier_ns=%" PRIu64 " slow_thread_cpu_ns=%" PRIu64
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
-        p.cpu_threads, p.gather_prepare_ns, p.gather_copy_ns, p.suffix_wait_ns,
+        unsigned(sample.pipeline), p.cpu_threads, p.gather_prepare_ns, p.gather_copy_ns,
+        p.suffix_wait_ns,
         p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
-        p.slowest_start_delay_ns, slow.copy_done_ns - slow.start_ns, slow.done_ns - slow.copy_done_ns,
+        p.slowest_ready_delay_ns, p.slowest_start_delay_ns, slow.copy_done_ns - slow.start_ns,
+        slow.done_ns - slow.copy_done_ns,
         slow.thread_cpu_ns, unsigned(slow.cpu_time_valid), unsigned(slow.wait_path));
   }
   if (gather_profile_dropped_)

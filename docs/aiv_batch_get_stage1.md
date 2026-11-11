@@ -187,7 +187,7 @@ cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批�
 只复用与请求形状有关的 WRITE 计划。
 
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
-`prepare_ns` 记录 gather 任务发布，`copy_ns` 记录各线程的源地址校验、拷贝和汇合，
+`prepare_ns` 记录 gather 任务准备，`copy_ns` 记录任务发布、各线程的源地址校验、拷贝和汇合，
 `suffix_wait_ns` 记录协调线程等待后缀清单的时间。`pipeline=1` 的 `copy_ns`
 包含这段等待及拷贝期间的 WRITE 提交，不能与 `suffix_wait_ns` 相加。
 单独比较 CPU gather 耗时用 `--pipeline 0`，此时 suffix 在拷贝计时前等完。
@@ -197,8 +197,10 @@ Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane
 才加 `--fixed-request-plan`。
 
 日志还记录协调线程完成自己拷贝后的 `join_wait_ns`，以及最晚完成线程的
-`slow_worker`、`slow_tid`、`slow_cpu`、`slow_bytes`、`slow_start_delay_ns`、
+`slow_worker`、`slow_tid`、`slow_cpu`、`slow_bytes`、`slow_ready_delay_ns`、`slow_start_delay_ns`、
 `slow_copy_ns`、`slow_barrier_ns` 和 `slow_thread_cpu_ns`。
+`slow_ready_delay_ns` 从协调线程进入拷贝阶段计到该线程取得任务。
+`slow_start_delay_ns` 还计入该线程开始拷贝前的采样开销。
 `slow_cpu_time_valid=1` 时可对照工作墙钟和线程 CPU 时间判断该线程的运行区间。
 `pipeline=1` 的协调线程区间包含就绪块提交，块内 barrier 也包含在 `slow_copy_ns` 中。
 

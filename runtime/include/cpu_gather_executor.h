@@ -54,7 +54,7 @@ struct alignas(64) CpuGatherThreadProfile {
 };
 
 struct CpuGatherCopyProfile {
-  std::uint64_t publish_ns{}, begin_ns{}, coordinator_done_ns{}, done_ns{};
+  std::uint64_t begin_ns{}, coordinator_done_ns{}, done_ns{};
   std::uint64_t suffix_wait_ns{};
 };
 
@@ -133,11 +133,10 @@ class CpuGatherExecutor {
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
-  std::size_t Publish(void* staging, const GatherSpan* spans, const std::uint64_t* addresses,
-                      std::uint32_t span_count, std::uint64_t total_bytes) {
+  std::size_t PrepareJob(void* staging, const GatherSpan* spans, const std::uint64_t* addresses,
+                         std::uint32_t span_count, std::uint64_t total_bytes) {
     const std::size_t threads =
         std::min(max_threads_, std::max<std::size_t>(1U, total_bytes / min_bytes_per_thread_));
-    std::unique_lock<std::mutex> lock(mutex_);
     while (helpers_.size() + 1U < threads) {
       const std::size_t index = helpers_.size() + 1U;
       helpers_.emplace_back(&CpuGatherExecutor::RunHelper, this, index);
@@ -149,15 +148,10 @@ class CpuGatherExecutor {
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     for (auto& chunk : fixed_progress_) chunk.remaining = threads;
-    phase_.store(0U, std::memory_order_release);
     if (profiling_enabled_) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
       copy_profile_ = {};
-      copy_profile_.publish_ns = NowNs();
     }
-    generation_.fetch_add(1U, std::memory_order_release);
-    lock.unlock();
-    ready_.notify_all();
     return threads;
   }
 
@@ -213,7 +207,8 @@ class CpuGatherExecutor {
   std::vector<std::thread> helpers_;
   std::mutex mutex_;
   std::condition_variable ready_;
-  std::atomic<std::uint64_t> generation_{0U};
+  static constexpr std::uint64_t kDispatchThreadMask = UINT32_MAX;
+  static constexpr std::uint64_t kDispatchGenerationStep = std::uint64_t{1} << 32;
   // The sender retains this descriptor until all copy threads finish and ACK is published.
   const GatherSpan* spans_{nullptr};
   const std::uint64_t* addresses_{nullptr};
@@ -243,9 +238,11 @@ class CpuGatherExecutor {
   bool profiling_enabled_{};
   std::vector<CpuGatherThreadProfile> thread_profiles_;
   CpuGatherCopyProfile copy_profile_{};
-  alignas(64) std::atomic<std::uint32_t> phase_{0U};
-  alignas(64) std::atomic<std::size_t> completed_{0U};
   std::atomic<bool> stopping_{false};
+  // The low bits specify the participants of this generation. An inactive
+  // helper can skip a job without reading fields the coordinator may reuse.
+  alignas(64) std::atomic<std::uint64_t> dispatch_{0U};
+  alignas(64) std::atomic<std::size_t> completed_{0U};
 };
 
 }  // namespace kvaf::peer
