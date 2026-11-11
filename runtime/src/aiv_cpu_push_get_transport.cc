@@ -102,9 +102,15 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
+  // Keep the mailbox WRITE limit separate from contiguous payload WRs.
+  auto gather_write_limit = std::min<std::uint64_t>(UINT32_MAX, attr.dev_cap.max_msg_size);
+  if (attr.dev_cap.max_write_size)
+    gather_write_limit = std::min<std::uint64_t>(gather_write_limit, attr.dev_cap.max_write_size);
+  max_gather_write_bytes_ = static_cast<std::uint32_t>(gather_write_limit);
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "post_batch_wrs=%u optimized=%u source_refresh=%s\n",
-               max_sge_, max_bytes_, workers_, token_bytes_, post_batch_wrs_, kOptimized,
+               "payload_write_bytes=%u post_batch_wrs=%u optimized=%u source_refresh=%s\n",
+               max_sge_, max_bytes_, workers_, token_bytes_,
+               gather_ ? max_gather_write_bytes_ : max_bytes_, post_batch_wrs_, kOptimized,
                gather_ ? "cpu_gather" :
                (std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map"));
   urma_seg_t segment{};
@@ -356,11 +362,12 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           std::uint32_t bytes = 0, sges = 0;
           if (gather_) {
             const auto remaining = std::uint64_t{end} * token_bytes_ - payload_offset;
-            bytes = static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, max_bytes_));
+            bytes = static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, max_gather_write_bytes_));
             q.local.push_back({gather_segment_->seg.ubva.va + payload_offset, bytes, gather_segment_, nullptr});
             sges = 1;
-            row += (offset + bytes) / token_bytes_;
-            offset = (offset + bytes) % token_bytes_;
+            const auto next_offset = payload_offset + bytes;
+            row = static_cast<std::uint32_t>(next_offset / token_bytes_);
+            offset = static_cast<std::uint32_t>(next_offset % token_bytes_);
           } else {
             while (row < end && sges < max_sge_ && bytes < max_bytes_) {
               const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
@@ -409,8 +416,12 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       }
     }
   };
-  if (head_rows) build_stage({0, head_rows}, false);
-  build_stage({head_rows, count}, head_rows != 0);
+  // In the Gather done-only mode, wait for all descriptors and finish the
+  // full gather before the first payload post. A head-start request still
+  // requires the suffix notification even though it uses one payload stage.
+  const bool split = head_rows && (!gather_ || !batch_done_only);
+  if (split) build_stage({0, head_rows}, false);
+  build_stage({split ? head_rows : 0U, count}, head_rows != 0);
   prepared_count_ = count;
   prepared_batch_done_only_ = batch_done_only;
   prepared_head_rows_ = head_rows;

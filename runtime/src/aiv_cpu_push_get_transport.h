@@ -106,7 +106,7 @@ class Transport {
   std::uint8_t* gather_staging_{};
   std::uint64_t gather_staging_bytes_{}, source_bytes_{};
   std::uint64_t hbm_base_{}, session_{};
-  std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
+  std::uint32_t max_sge_{}, max_bytes_{}, max_gather_write_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t token_value_{};
   std::uint32_t post_batch_wrs_{128};
   Layout layout_;

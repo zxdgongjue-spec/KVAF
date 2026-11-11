@@ -24,9 +24,10 @@ NPU 通过专用的会话打开命令选择 CPU gather，同一个 CPU 服务可
 启用时需部署支持该命令的 CPU 服务和 NPU Host。
 CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，再通过已有的四路
 Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
-使用一个源 SGE 和一个目标 SGE，并按当前传输长度上限拆分。AIV 复用现有的
-Ready/Done 和 scatter。启用首段提前发布时，CPU 先 gather 并回推首段，再等
-后缀清单。已提交的首段回推可以与后缀 gather 重叠。
+使用一个源 SGE 和一个目标 SGE，按设备报告的消息及 WRITE 长度上限拆分。
+AIV 复用现有的 Ready/Done 和 scatter。`pipeline=1` 下启用首段提前发布时，
+CPU 先 gather 并回推首段，再等后缀清单。已提交的首段回推可以与后缀 gather 重叠。
+`pipeline=0` 下 CPU 等完整清单，完成整批 gather 后才提交 WRITE。
 
 CPU gather 使用服务的 `--gather-threads` 和 gather 绑核、等待配置。
 每个会话的额外 pinned DDR staging 按观察到的最大有效批次字节数增长，
@@ -171,6 +172,11 @@ Gather 使用 `test_aiv_gather_batch_get.py` 和对应 gather `.o`。兼容入�
 
 miss-count 脚本固定使用 prepared 提交，提交后调用 `torch.npu.synchronize()`，
 并将 profile 快照放在计时区间之外。以下示例使用每 block 128 个 token。
+
+开启 CPU Gather 回推时，`cpu_comm_us` 仍从首个 payload WR 提交计到最后的
+payload CQE。`--pipeline 1` 的这段时间可包含后缀 gather 和 Ready WRITE。
+改用 `--pipeline 0` 可测完整 gather 后的提交到完成窗口，并在 CPU 日志中查看
+`CPU_PUSH_CAP` 的 `payload_write_bytes`。
 
 ```bash
 DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
