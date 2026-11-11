@@ -124,6 +124,30 @@ class PublicCliTests(unittest.TestCase):
             self.assertEqual(functional.parse_args([]).npu_eids, EIDS.split(","))
             self.assertEqual(benchmark.parse_args([]).npu_eids, EIDS.split(","))
 
+    def test_explicit_table_capacity_can_exceed_default_ddr_budget(self):
+        for mode in benchmark.PREFIXES:
+            with self.subTest(mode=mode):
+                defaults = benchmark.parse_args([], mode=mode)
+                default_capacity, _ = benchmark.pool_layout(
+                    defaults.token_bytes, defaults.tokens_per_block, mode=mode)
+                self.assertEqual(defaults.table_capacity, default_capacity)
+
+                block_bytes = defaults.token_bytes * defaults.tokens_per_block
+                capacity = benchmark.DDR_BUDGET_BYTES // block_bytes + 1
+                args = benchmark.parse_args(["--table-capacity", str(capacity)], mode=mode)
+                self.assertEqual(args.table_capacity, capacity)
+
+    def test_table_capacity_must_fit_positive_int32(self):
+        for mode in benchmark.PREFIXES:
+            for capacity in (1, 0x7FFFFFFF):
+                with self.subTest(mode=mode, capacity=capacity):
+                    args = benchmark.parse_args(["--table-capacity", str(capacity)], mode=mode)
+                    self.assertEqual(args.table_capacity, capacity)
+            for capacity in (-1, 0, 0x80000000):
+                with self.subTest(mode=mode, capacity=capacity):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        benchmark.parse_args(["--table-capacity", str(capacity)], mode=mode)
+
     def test_retired_options_are_rejected(self):
         with patch.dict(os.environ, {}, clear=True):
             for parse in (functional.parse_args, benchmark.parse_args):

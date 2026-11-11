@@ -145,10 +145,11 @@ miss_count 为 32、64、128、256、512、1024、2048、4096、8192，worker �
 Python 绑定、Host launch、Host 同步返回和 profile D2H 回传不计入；
 数据和请求准备、BatchPut、建表、输出校验、预检与预热轮次也不计入。
 
-源数据池按 100 GiB DDR 预算初始化一次，每块默认 128 个 token；CPU push 的 staging 和地址清单在 HBM，
-不从 DDR 预算扣除 GatherRead 工作区。每轮有放回随机选择源 token，随机选择互不重复的输出行，
+源数据池初始化一次，默认容量按 100 GiB DDR 预算计算，每块默认 128 个 token。
+CPU push 的 staging 和地址清单分配在 HBM。每轮有放回随机选择源 token，随机选择互不重复的输出行，
 输入和输出行数为 `max(32768, miss_count)`，逐轮校验整个输出及未写入行。
-`--table-capacity` 可缩小源池；与 GatherRead 对比时可指定相同容量。
+`--table-capacity` 可显式指定 `1..INT32_MAX` 个源块，允许超过默认预算，实际分配取决于对端可用 DDR。
+与 GatherRead 对比时可指定相同容量。
 
 终端和 CSV 同时输出 `mean_us / mean_GBps`、`p50_us / p50_GBps`、`p99_us / p99_GBps`，
 以及 `metric=kernel_wall`。

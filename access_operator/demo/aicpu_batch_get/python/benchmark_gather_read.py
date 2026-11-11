@@ -27,7 +27,8 @@ def parse_args(argv=None, *, mode="gather_read"):
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--token-bytes", type=int, default=656)
     p.add_argument("--miss-count", type=int, default=4096)
-    p.add_argument("--table-capacity", type=int, help="optional smaller source pool; default fills the 100 GiB DDR budget")
+    p.add_argument("--table-capacity", type=int,
+                   help="number of source blocks (default: sized to a 100 GiB DDR budget)")
     p.add_argument("--tokens-per-block", type=int, default=DEFAULT_TOKENS_PER_BLOCK)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iterations", type=int, default=100)
@@ -40,11 +41,10 @@ def parse_args(argv=None, *, mode="gather_read"):
             a.token_bytes * a.tokens_per_block > 0xFFFFFFFF or
             a.token_bytes * (a.tokens_per_block - 1) > 0x7FFFFFFF):
         p.error("invalid token/block size for the AICPU input ABI")
-    max_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
     if a.table_capacity is None:
-        a.table_capacity = max_capacity
-    if not 1 <= a.table_capacity <= min(max_capacity, 0x7FFFFFFF):
-        p.error("source pool plus workspace must fit the 100 GiB DDR budget")
+        a.table_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
+    if not 1 <= a.table_capacity <= 0x7FFFFFFF:
+        p.error("--table-capacity must be in [1, INT32_MAX]")
     if a.warmup < 0 or a.iterations <= 0:
         p.error("invalid warmup or iterations")
     if a.device_id < 0:
@@ -178,7 +178,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
           f"token_bytes={a.token_bytes} miss_count={a.miss_count} workers={a.workers} "
           f"source_pool_GiB={ddr_bytes / 1024**3:.3f} "
           f"workspace_budget_MiB={reserved / 1024**2:.3f} "
-          f"total_budget_GiB={DDR_BUDGET_BYTES / 1024**3:.1f} "
+          f"default_ddr_budget_GiB={DDR_BUDGET_BYTES / 1024**3:.1f} "
           "source_mode=table source=random_with_replacement output=random_unique_rows "
           "guard_rows=0 source_initialized_once=1", flush=True)
 

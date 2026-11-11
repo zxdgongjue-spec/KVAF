@@ -339,7 +339,7 @@ KVAF_RUNTIME_PERF_ITERATIONS
 
 AICPU 性能测试分别使用 [Gather sweep](tests/run_aicpu_gather_read_sweep.sh) 和
 [Scatter sweep](tests/run_aicpu_cpu_push_scatter_sweep.sh)，构建目录参数均可填写
-`"$PWD/build-npu"`。默认扫描较大的源池；小规模验证可用 `--table-capacity` 缩小源池。
+`"$PWD/build-npu"`。默认按 100 GiB DDR 预算计算源池容量，`--table-capacity` 可指定源块数量。
 
 ### 6. 无 NPU 的主机回归
 

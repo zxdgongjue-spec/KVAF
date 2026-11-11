@@ -250,7 +250,7 @@ Python 绑定、Host launch、Host 同步返回和 profile D2H 回传不计入�
 不是逐轮带宽的第 99 百分位。分位耗时沿用按排序位置线性插值的计算方式。
 辅助阶段耗时继续使用算子内部 profile，每轮取 worker 最大耗时，再对测量轮次求均值。
 
-通信 DDR 总预算固定为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
+默认通信 DDR 预算为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
 按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
 再按完整块向下取整。同一 token 大小下，不同 worker 使用相同的源地址池。
 每块默认 128 个 token，数据和地址表初始化一次。
@@ -269,9 +269,10 @@ KVAF_AICPU_WORKERS="1 2 4" \
   --table-capacity 4096 --warmup 3 --iterations 20
 ```
 
-`--table-capacity` 仅用于选择更小的源池，不能超出上述预算；`--tokens-per-block` 控制每块 token 数。
+`--table-capacity` 可显式指定 `1..INT32_MAX` 个源块，允许超过默认预算，实际分配取决于对端可用 DDR。
+`--tokens-per-block` 控制每块 token 数。
 `miss_count` 只决定本轮从源池读取多少个 token，不决定源池分配大小。
-每组日志打印源池 GiB、工作区预算 MiB 和总预算，避免字节数用科学计数法显示。
+每组日志打印源池 GiB、工作区预算 MiB 和默认 DDR 预算 GiB。
 CPU 线程预算和外部 CPU/NUMA 限制在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
 
 结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
