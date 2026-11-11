@@ -36,7 +36,7 @@ python -u tests/python/test_aiv_gather_batch_get.py
 ```python
 TOKEN_BYTES = 656          # 另测 4096
 REQUEST_COUNT = 8192       # 可比较 1024 / 8192 / 8193 / 65536
-GATHER_SGL_SIZE = 6        # 软件实验范围 1..13，设备限制见排障
+GATHER_SGL_SIZE = 6        # 支持范围 1..6
 WARMUP = 20
 ITERATIONS = 100           # 无 profile E2E；0 跳过
 PROFILE_SAMPLES = 10       # 独立同步诊断组；0 跳过
@@ -232,21 +232,6 @@ probe 只代表对应前缀完成，不是完整 BatchGet 成功，也不能用�
 profile 快速复测可设 WARMUP=0、ITERATIONS=0、PROFILE_SAMPLES=1，仍执行 payload/guard
 预检，保留完整异常及当前部署版本。进度/CPU/CQ 错误或超时后重建 Runtime，不复用 poison 队列。
 
-软件允许 SGL=1..13，默认 6，但 `max_jfs_sge=13` 不能证明 READ 可用 13 个目的 SGE。
-已有公开 UDMA [READ 提交检查](https://github.com/openeuler-mirror/umdk/blob/master/src/urma/hw/udma/udma_u_jfs.c#L364)
-使用独立的 UDMA_JFS_MAX_SGE_READ=6，须结合目标 HCCP/SDK/真机判断。
-当前快速路径实际编码所选 9/13 个 SGE，不静默降为 6；模型仅验证编码布局。
-
-SGL=9 的 first_read 若报 phase=5 result=2 expected_phase=23，说明 ACK 后等首批数据 CQ
-超时，不能仅据此认定格式错误。排障时同时记录完整异常、SGL/token/request 配置及部署版本。
-为隔离实际 SGE 数，固定 1 核、656 B、SGL=9，在功能脚本依次请求 6/7/9 行：
-
-```bash
-KVAF_NPU_CORE_COUNT=1 KVAF_NPU_TOKEN_BYTES=656 KVAF_AIV_GATHER_SGL_SIZE=9 \
-  KVAF_NPU_REQUESTS=7 KVAF_AIV_GATHER_PROBE=first_read \
-  python -u tests/python/test_aiv_gather_batch_get.py
-```
-
-三组均一条 READ、bank 0、192 B WQE，实际 SGE 数分别 6/7/9。
-6 通过而 7/9 失败支持操作专用数量限制的判断；单条 9 通过而大批失败则继续查多 WR/队列。
+Gather 的可配置 SGL 范围为 1..6，默认 6；超过 6 的配置在 Runtime、Host 和 kernel
+入口拒绝，性能脚本也会在连接 CPU 服务前报错。开启 SGE 合并仍遵守该配置上限。
 性能和设备 DMA/CANN 兼容性最终以目标双机回归为准。

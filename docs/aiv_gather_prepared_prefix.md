@@ -83,8 +83,8 @@ prepare-ahead 可独立用于整批 ACK、普通 prefix 或协作 prefix。
 
 probe 和 `token_bytes*SGL>65536` 自动回到整批 ACK；后者走 Scalar 拆 token 编码，
 每条 READ 最多 64 KiB。两者不支持显式 prepare-ahead/cooperative；除 ack 外的
-WQE/SQ/first_read 探针也要求快速路径。所有 SGL 共用通用 encoder，软件实验范围
-1..13，默认 6；设备的 READ 实际 SGE 限制须按目标 SDK/硬件验证。
+WQE/SQ/first_read 探针也要求快速路径。所有 SGL 共用通用 encoder，支持范围
+1..6，默认 6；Runtime、Host 和 kernel 均拒绝超过 6 的配置。
 
 已移除的 SHARD_PIPELINE、PACKED_POSTS、PROGRESS_MODE 非空时明确报错，须 unset。
 `batch_get_max_inflight_total` 只控制 direct_read；gather 没有每 128 WR 等 CQ 的软件窗口。

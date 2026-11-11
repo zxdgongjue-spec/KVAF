@@ -373,7 +373,7 @@ struct Fixture {
         assert((header >> 31) == (1U - ((m.pi / depth) & 1)));
         const auto op = (word(m.pi, 1) >> 8) & 255;
         const auto sges = word(m.pi, 2) >> 24;
-        assert(sges >= 1 && sges <= 13);
+        assert(sges >= 1 && sges <= KVAF_SEQ_MAX_SGES);
         const auto& entity = q % 2 ? control_entities[q] : data_entities[q];
         assert((word(m.pi, 2) & 0xffffffU) == (entity.tp_id & 0xffffffU));
         assert(word(m.pi, 3) == (entity.remote_token_id & 0xfffffU));
@@ -731,7 +731,7 @@ int main() {
     assert(!f.data_reads && !f.states[0].initialized && !f.notified[0]);
   }
   for (bool coalesce : {false, true})
-    for (uint32_t sgl : {1U, 13U}) {
+    for (uint32_t sgl : {1U, 6U}) {
       Fixture f(1541, 656, 1, KVAF_SEQ_GATHER, sgl);
       f.args.prepare_ahead = 1; f.args.cooperative_chunks = 4;
       f.args.pipeline_chunk_bytes = 131072; f.args.coalesce_sges = coalesce;
@@ -806,11 +806,11 @@ int main() {
   // producer only copies the next chunk when queried: an early data doorbell
   // therefore proves that later staging bytes have not been gathered yet.
   for (uint32_t cores : {1U, 3U, 8U})
-    for (uint32_t sgl : {1U, 6U, 13U})
+    for (uint32_t sgl : {1U, 5U, 6U})
       for (uint32_t chunk : {64U, 4096U, 131072U}) {
         Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, sgl);
         f.args.pipeline_chunk_bytes = chunk;
-        f.args.max_polls = 256; // 64-byte chunks can bisect a 13-SGE READ.
+        f.args.max_polls = 256; // 64-byte chunks can bisect a multi-SGE READ.
         f.DataQueueDepth(32768); f.EnableProfile();
         for (uint32_t count : {8193U, 1U, 0U, 8193U}) {
           f.Next(count); f.Run(); f.CheckProfiles();
@@ -1004,7 +1004,7 @@ int main() {
   }
   for (uint32_t probe = KVAF_GATHER_PROBE_ACK; probe <= KVAF_GATHER_PROBE_FIRST_READ; ++probe)
     for (uint32_t cores : {1U, 3U, 8U})
-      for (uint32_t sgl : {1U, 6U, 13U}) {
+      for (uint32_t sgl : {1U, 5U, 6U}) {
         Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, sgl);
         f.DataQueueDepth(4096); f.args.gather_probe = probe;
         for (uint32_t count : {8193U, 1U, 8193U}) {
@@ -1035,22 +1035,22 @@ int main() {
   }
   // Real queue depth: early doorbells do not introduce per-post CQ waits.
   // VF(next bank) executes while the deferred MTE3(previous bank) is pending.
-  for (uint32_t sgl : {6U, 13U}) {
+  for (uint32_t sgl : {5U, 6U}) {
     Fixture f(8193, 656, 1, KVAF_SEQ_GATHER, sgl);
     f.DataQueueDepth(32768); f.EnableProfile();
     f.Run(); f.CheckProfiles();
     const auto& q = *f.queues[0];
-    const uint64_t doorbells = sgl == 6 ? 11 : 5;
+    const uint64_t doorbells = sgl == 6 ? 11 : 13;
     assert(q.doorbells == doorbells && q.cq_completed == 1 && q.first_db_vfs == 3);
-    assert(f.profiles[0].data_wrs == (sgl == 6 ? 1366 : 631));
-    assert(f.profiles[0].data_wqebbs == (sgl == 6 ? 4097 : 2522));
+    assert(f.profiles[0].data_wrs == (sgl == 6 ? 1366 : 1639));
+    assert(f.profiles[0].data_wqebbs == (sgl == 6 ? 4097 : 3278));
     assert(f.profiles[0].data_doorbells == doorbells);
     assert(aiv_model::vf_with_pending_mte3 > f.read_overlap_begin[0]);
     f.Next(8193); f.Run(); f.CheckProfiles();
   }
   // Bank/tail boundaries for every SGL, including a partially populated last
   // WR and an SQ ring wrap inside one multi-SGE WQE/MTE3 post.
-  for (uint32_t sgl = 1; sgl <= 13; ++sgl)
+  for (uint32_t sgl = 1; sgl <= KVAF_SEQ_MAX_SGES; ++sgl)
     for (uint32_t coalesce : {0U, 1U}) {
       Fixture f(257 * sgl, 13, 1, KVAF_SEQ_GATHER, sgl);
       f.args.coalesce_sges = coalesce;
@@ -1110,7 +1110,7 @@ int main() {
   }
   // Physical WR capacity drains and CQ owner wrap, rather than a 128-WR
   // outstanding budget. Multi-core lanes keep independent banks and queues.
-  for (uint32_t sgl : {1U, 6U, 13U}) {
+  for (uint32_t sgl : {1U, 5U, 6U}) {
     Fixture f(65536, 13, 1, KVAF_SEQ_GATHER, sgl);
     f.DataQueueDepth(32768); f.EnableProfile();
     f.Run(); f.CheckProfiles();
@@ -1119,13 +1119,13 @@ int main() {
     assert(f.queues[0]->doorbells == (wrs + 127) / 128);
   }
   for (uint32_t cores : {3U, 8U})
-    for (uint32_t sgl : {6U, 13U}) {
+    for (uint32_t sgl : {5U, 6U}) {
       Fixture f(8193, 656, cores, KVAF_SEQ_GATHER, sgl);
       f.DataQueueDepth(4096); f.Run(); f.Next(1024); f.Run();
     }
   const std::pair<uint32_t, uint32_t> read_shapes[] = {
       {10922, 6}, {10923, 6}, {65536, 1}, {65537, 1},
-      {5041, 13}, {5042, 13}, {65535, 13}};
+      {13107, 5}, {13108, 5}, {65535, 6}};
   for (const auto& [token, sgl] : read_shapes) {
     Fixture f(19, token, 1, KVAF_SEQ_GATHER, sgl);
     f.DataQueueDepth(520); f.EnableProfile();
@@ -1151,16 +1151,16 @@ int main() {
     assert(f.queues[0]->cq_completed == 3 && f.queues[0]->doorbells == 5);
   }
   {
-    Fixture f(257 * 13, 13, 1, KVAF_SEQ_GATHER, 13);
+    Fixture f(257 * 6, 13, 1, KVAF_SEQ_GATHER, 6);
     f.DataQueueDepth(520); f.EnableProfile();
-    for (uint32_t count : {257U * 13, 256U * 13 + 1, 257U * 13}) {
+    for (uint32_t count : {257U * 6, 256U * 6 + 1, 257U * 6}) {
       f.Next(count);
       const auto cq = f.queues[0]->cq_completed, db = f.queues[0]->doorbells;
       f.Run(); f.CheckProfiles();
       assert(f.queues[0]->cq_completed - cq == 2 && f.queues[0]->doorbells - db == 3);
     }
   }
-  for (uint32_t sgl : {0U, 14U}) {
+  for (uint32_t sgl : {0U, 7U}) {
     Fixture f(19, 656, 1, KVAF_SEQ_GATHER, sgl);
     f.EnableProfile(); f.Run(false);
     assert(f.status[0].result == KVAF_SEQ_INVALID && f.profiles[0].valid_mask == 0x41);
@@ -1177,7 +1177,7 @@ int main() {
   // Profile every lane, including empty lanes and repeated queue wraps. The
   // disabled executions throughout this fixture assert zero timer reads.
   for (uint32_t workers : {1U, 3U, 8U})
-    for (uint32_t sgl : {1U, 6U, 13U}) {
+    for (uint32_t sgl : {1U, 5U, 6U}) {
       Fixture f(127, 656, workers, KVAF_SEQ_GATHER, sgl);
       f.EnableProfile();
       for (uint32_t count : {0U, 1U, 127U, 7U, 0U, 127U}) {
@@ -1222,7 +1222,7 @@ int main() {
   // nonempty launches on the same queues. Empty work must finish all worker
   // statuses without notifying the CPU or advancing any SQ/CQ state.
   for (uint32_t workers : {1U, 3U, 8U})
-    for (uint32_t sgl : {1U, 6U, 13U}) {
+    for (uint32_t sgl : {1U, 5U, 6U}) {
       Fixture gather(19, 656, workers, KVAF_SEQ_GATHER, sgl);
       gather.active = 0;
       gather.Run();
@@ -1405,7 +1405,7 @@ int main() {
   Fixture future(7, 656, 1, KVAF_SEQ_SCATTER, 6); future.future_done = true; future.Run(false);
   Fixture cq(7, 656, 1, KVAF_SEQ_GATHER, 6); cq.cq_error = true; cq.Run(false);
   assert(cq.states[1].poisoned);
-  for (uint32_t sgl = 1; sgl <= 13; ++sgl) {
+  for (uint32_t sgl = 1; sgl <= KVAF_SEQ_MAX_SGES; ++sgl) {
     Fixture sges(19, 656, 1, KVAF_SEQ_GATHER, sgl); sges.Run();
     assert(sges.max_sges == sgl);
   }
