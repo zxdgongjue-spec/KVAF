@@ -782,3 +782,134 @@ A 仍保留自己的 Prepared／Committed／Aborted 等事务状态，B 仍保�
 5. **保持现有安全边界。**数据面只有明确成功后才能提交元数据；只有确认无在途 DMA 且已阻止本批后续读取后才能回收。未决状态不能通过 shutdown 绕过；旧 epoch 的任务不能作为新实例任务重放。本方案不新增跨进程崩溃的透明续跑承诺。
 
 相对原方案，主要新增适配点是 Submit 的批次接纳、NotSeen 转取消的恢复分支，以及去掉 Committed 后的准入／收尾条件。丢失回复、重复请求、元数据失败和 DMA 未决仍复用现有恢复原则；后续实现应对这些边界做针对性故障注入验证。
+
+## 14. NPU Pull 去掉 TCP Complete 后的交互时序（拟议，未实现）
+
+> 方案记录于 2026-11-11。第 7、8 节描述当前实现。本节拟将成功批次的跨端完成通知交给应用 Connector，保留取消路径的 TCP `Cancel`。以下从第 5 节的 MR 注册、建链和探测成功后开始。
+
+**B 仍要知道哪个批次已经发布，正常读取完成后可以直接释放。** 发布时，B 用 `frozen`、`sequence` 和 `mr_id` 记录本源当前允许 A 读取的 Tensor，直到应用确认本批结束。用这些字段就能表达 `Ready`。成功路径上，A 自己观察 READ 完成，B 收到应用通知才解冻，中间可以省掉 `Done`。取消路径有两个独立事件，B 先确认 TCP `Cancel`，稍后才收到应用通知并解冻，因此 B 仍须记住哪个批次已经确认取消。
+
+下文的“同一批”按 `(source_id, source_epoch, sequence, mr_id)` 匹配。每个源同一时间只冻结一批。应用通道负责传递批次身份与结果，TCP 控制通道用于 KVAF 协议，UB READ 搬运 HBM 数据。
+
+### 14.1 正常读取与源复用
+
+```mermaid
+sequenceDiagram
+    participant BC as B 应用 Connector
+    participant B as B NpuPullHbmSource
+    participant AC as A 应用 Connector
+    participant A as A Runtime / HbmReader
+    participant K as A NPU raw READ 算子
+
+    BC->>BC: 写入源 Tensor，等待生产 stream 或 event 完成
+    BC->>B: ready(tensor)
+    B->>B: 匹配注册 MR，分配 sequence，冻结本批
+    B-->>BC: ReadyToken
+    BC->>AC: 应用通道发送 ReadyToken 和业务元数据
+    AC->>A: batch_get_raw_addr(ready, src_offsets, dst_offsets, lengths, output)
+    A->>A: 匹配源和 MR，检查序列、未决任务、数组和 output 布局
+    A->>A: 记录本批正在执行，取得 MR 与 output 的通信资源
+    A->>K: 在指定 stream 启动 raw READ，传入三组 NPU 数组
+    K->>B: UB READ 读取选中 MR 的各段
+    B-->>K: HBM 数据直接写入 A 的 output
+    K->>K: 等待各提交组尾 CQ，写回各核执行状态
+    A->>A: 同步 stream，核对各核状态和 WQE 数，完成本批清理
+    A->>A: 记录本批成功和已消费的 sequence，阻止重复 READ
+    A-->>AC: 读取成功，output 可用
+    AC->>BC: 应用通道发送本批读取成功通知
+    BC->>B: release_batch(ready)
+    B->>B: 校验通知对应当前冻结批次，记录释放并解冻
+    B-->>BC: 可以覆盖本批源 Tensor
+```
+
+正常每批的 KVAF TCP 控制 RPC 从 **1 次降为 0 次**。A 成功返回的条件是 READ 完成且本地收尾成功。B 复用源的条件是应用收到了同批成功通知并完成本地释放。单独持有 `ReadyToken` 只证明这批已经发布。
+
+### 14.2 主动取消与可安全结束的失败
+
+取消由 A 协调，因为 A 能将“开始 READ”和“禁止本批以后启动 READ”串行裁决。B 若希望放弃一个已发布批次，通过应用通道请 A 取消，并继续保持冻结。A 发现本地校验错误并决定放弃时也走这条路径。若 A 已接纳本批，只有确认没有在途 DMA、完成必要清理后，才可因执行失败进入取消路径。
+
+```mermaid
+sequenceDiagram
+    participant AC as A 应用 Connector
+    participant A as A Runtime / HbmReader
+    participant B as B NpuPullHbmSource
+    participant BC as B 应用 Connector
+
+    opt B 请求放弃已发布批次
+        BC->>AC: 应用通道请求取消原批，B 保持冻结
+    end
+    alt 应用主动取消
+        AC->>A: cancel_raw_addr(ready)，与同批 READ 串行裁决
+    else 已接纳的 READ 安全失败
+        A->>A: 保存原始错误，确认没有在途 DMA，完成本地清理
+    end
+    alt 取消先于 READ，或执行已安全失败
+        A->>A: 记录原批次待取消，阻止迟到 READ
+        A->>B: TCP Cancel 携带源会话、client、sequence、mr_id
+        B->>B: 核对当前冻结批次，记录已确认取消，继续冻结
+        B-->>A: Cancel 确认
+        A->>A: 记录本批序列已消费，保留取消或安全失败结果
+        A-->>AC: 取消调用成功，或读取调用返回原始错误
+        AC->>BC: 应用通道发送本批取消或安全失败通知
+        BC->>B: cancel_batch(ready)
+        B->>B: 匹配本批取消记录，幂等解冻
+    else READ 先被接纳，执行或清理仍未决
+        A-->>AC: 等待或恢复原操作，暂时不能确认取消
+        Note over A,B: 两端保留资源，B 继续冻结
+    else READ 已成功且本地收尾完成
+        A-->>AC: 沿用已记录的成功结果
+        AC->>BC: 发送或重发同批成功通知
+        BC->>B: release_batch(ready)，按成功路径释放
+    end
+```
+
+例如，各核一致报告同一项校验失败且零 WQE 已提交时，A 可在清理后发送 TCP `Cancel`。取消确认只表示源可以安全回收，应用仍收到原始读取错误。B 的 `release_batch(ready)` 接受应用对成功的确认，`cancel_batch(ready)` 则要求本批已有 TCP 取消记录。当前共用的 `FinishBatch()` 需要分别检查这两个条件。
+
+### 14.3 异常恢复与重复消息
+
+```mermaid
+sequenceDiagram
+    participant AC as A 应用 Connector
+    participant A as A Runtime / HbmReader
+    participant B as B NpuPullHbmSource
+    participant BC as B 应用 Connector
+
+    alt READ 结果已知，本地清理失败
+        AC->>A: resolve_raw_addr(原 ready)
+        A->>A: 按已保存的执行结果重试清理
+        alt 清理成功且 READ 成功
+            A->>A: 记录成功和已消费序列
+            A-->>AC: 恢复成功，output 可用
+            AC->>BC: 应用通道发送本批读取成功通知
+            BC->>B: release_batch(ready)，匹配后解冻
+        else 清理成功且 READ 已安全失败
+            A->>B: 按 14.2 发送 TCP Cancel
+            Note over AC,BC: 取得取消确认后才通知 B 应用释放本批
+        else 清理仍未完成
+            Note over A,B: 保留原批次和所需资源，B 保持冻结
+        end
+    else TCP Cancel 请求或回复丢失
+        Note over A,B: A 保留待取消记录，继续拒绝同批 READ
+        opt 控制连接已断开
+            B->>A: TCP Resume，携带原会话身份和 MR 清单
+            A-->>B: 核对原会话后恢复控制连接
+        end
+        AC->>A: resolve_raw_addr(原 ready)
+        A->>B: 重发同一 TCP Cancel
+        B->>B: 首次到达则登记，重复到达则复用已有取消记录
+        B-->>A: 同批 Cancel 确认
+        A-->>AC: 原批取消已确认，或返回原始安全失败
+        AC->>BC: 应用通道发送对应终态通知
+        BC->>B: cancel_batch(ready)，匹配后解冻
+    else 应用终态通知丢失、重复或迟到
+        AC->>BC: 按 A 已记录的结果重发同批通知
+        BC->>B: 成功走 release_batch，取消或安全失败走 cancel_batch
+        B->>B: 匹配当前批次才解冻，重复释放幂等，旧通知不能释放新批
+    else DMA 是否结束无法确认
+        AC->>A: resolve_raw_addr(原 ready)
+        A-->>AC: InDoubt，A 保留 output、三组数组和通信资源
+        Note over AC,BC: A 不发终态通知，B 保持源冻结，等待原 DMA 有明确结论
+    end
+```
+
+应用 Connector 保留待送达的批次结果，按已有机制确认送达或重发。恢复应用通知只需重发消息，恢复取消只需重试原控制请求，两者都不重放 READ。若 `Resume` 遇到接收端重启、epoch 不符或原会话已退役，旧批次仍需保持隔离。恢复 TCP 和等待超时都不能证明硬件 DMA 已结束。
