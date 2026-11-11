@@ -266,14 +266,15 @@ int main() {
   for (const auto& routing : {
            RoutingCase{2, 1, 2, {0, 1}},
            RoutingCase{4, 1, 2, {0, 1, 0, 1}},
-           RoutingCase{2, 2, 3, {0, 2, 1, 0}},
-           RoutingCase{2, 3, 2, {0, 1, 0, 0, 1, 0}}}) {
+           RoutingCase{2, 2, 3, {0, 1, 2, 0}},
+           RoutingCase{2, 3, 2, {0, 1, 0, 1, 0, 1}},
+           RoutingCase{4, 4, 3, {0, 1, 2, 0, 1, 2, 0, 1,
+                                 2, 0, 1, 2, 0, 1, 2, 0}}}) {
     const uint32_t count = routing.cores * routing.jettys * 128;
     Fixture f(count, routing.cores, routing.jettys, 0);
     for (uint32_t lane = 0; lane < f.entities.size(); ++lane) {
       const uint32_t path = kvaf::direct_hccp::PeerEidPathIndexForWorker(
-          lane / routing.jettys, lane % routing.jettys,
-          routing.cores, routing.jettys, routing.peers);
+          lane, routing.peers);
       CHECK(path == routing.paths[lane]);
       auto& entity = f.entities[lane];
       auto& queue = aiv_model::hardware[lane];

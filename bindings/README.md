@@ -75,8 +75,8 @@ K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用
 [Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。
 
 `peer_eids=["CPU_EID_0", "CPU_EID_1"]` 严格选择远端 CPU EID，要求
-`npu_eids` 恰好指定一个本地 EID，且每 core 的 Jetty 数不少于远端 EID 数。
+`npu_eids` 恰好指定一个本地 EID，且 Jetty 总数不少于远端 EID 数。
 它与 `adaptive_ub_device`、`peer_ub_device` 互斥。CPU 对同一 DDR 分配建立
 多个设备注册；BatchPut 写第一条路径，BatchGet 在同一次 kernel 中按
-`jetty_slot % len(peer_eids)` 分流。用法及测量口径见
+`(core * jettys_per_core + jetty_slot) % len(peer_eids)` 绑定远端 EID。用法及测量口径见
 [双 CPU EID 并发测试](../docs/peer_eid_contention.md)。

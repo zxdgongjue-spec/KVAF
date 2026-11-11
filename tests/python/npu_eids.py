@@ -12,9 +12,9 @@ def select_peer_eids(peer_eids: list[str], cores: int, jettys_per_core: int) -> 
     return list(peer_eids)
 
 
-def peer_eid_path(core: int, slot: int, cores: int, jettys: int, peers: int) -> int:
-    """Match native PeerEidPathIndexForWorker, including cross-core routing."""
-    return (slot if jettys >= peers else slot * cores + core) % peers
+def peer_eid_path(core: int, slot: int, jettys: int, peers: int) -> int:
+    """Match the native round robin over Jettys in core-major order."""
+    return (core * jettys + slot) % peers
 
 
 def parse_npu_eids(value: str | None) -> list[str]:

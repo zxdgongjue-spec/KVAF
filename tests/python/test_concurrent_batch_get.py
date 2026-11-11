@@ -97,8 +97,7 @@ def fake_perf(argv):
     print(f"BATCH_GET_JETTY_CSV_WRITTEN path={args.jetty_csv} rows={len(rows)}")
     if args.peer_eids:
         profiles = [{"jettys": [dict(
-            eid_path=peer_eid_path(core, slot, args.aiv_cores,
-                                   args.jettys_per_core, len(args.peer_eids)),
+            eid_path=peer_eid_path(core, slot, args.jettys_per_core, len(args.peer_eids)),
             requests=128, completion_count=1,
             first_doorbell_cycle=10 + slot, last_doorbell_cycle=20 + slot,
             first_completion_cycle=100 + slot, last_completion_cycle=200 + slot)

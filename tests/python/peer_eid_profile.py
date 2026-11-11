@@ -20,7 +20,7 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
             groups = [[] for _ in peer_eids]
             for slot, lane in enumerate(lanes):
                 path = int(lane["eid_path"])
-                if path != peer_eid_path(core, slot, cores, jettys, len(peer_eids)):
+                if path != peer_eid_path(core, slot, jettys, len(peer_eids)):
                     raise ValueError("peer profile route does not match requested EID order")
                 if single_peer and int(lane["requests"]) == 0:
                     if any(int(lane[key]) != 0 for key in (

@@ -530,8 +530,7 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
     const uint32_t jetty_slot = entity_index % jettys_per_core;
     const uint8_t priority = priorities[entity_index % priorities.size()];
     const uint32_t path_index = remote_path_count > 1U
-        ? hccp::PeerEidPathIndexForWorker(core, jetty_slot, aiv_core_count,
-                                        jettys_per_core, remote_path_count)
+        ? hccp::PeerEidPathIndexForWorker(entity_index, remote_path_count)
         : hccp::EidPathIndexForWorker(core, jetty_slot, aiv_core_count, path_count);
     hccp::DeviceAivPathResources &path = state->paths[path_index];
     DirectAivWorker &worker = state->workers[entity_index];
@@ -654,8 +653,8 @@ int32_t CreateBatchGetTransport(void *host_ddr, uint64_t host_ddr_bytes,
                "local_hbm=deferred_acquire\n",
                static_cast<unsigned long long>(host_ddr_bytes), entity_count,
                path_count, remote_path_count,
-               remote_path_count > 1U && jettys_per_core >= remote_path_count
-                   ? "per_core_peer_round_robin" : "jetty_major_worker_round_robin");
+               remote_path_count > 1U
+                   ? "core_major_peer_round_robin" : "jetty_major_worker_round_robin");
   *transport = state;
   return KVAF_BATCH_GET_SUCCESS;
 

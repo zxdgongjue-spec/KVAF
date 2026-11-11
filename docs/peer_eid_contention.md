@@ -96,9 +96,10 @@ core 0 / Jetty 0 -> peer EID 0
 core 1 / Jetty 0 -> peer EID 1
 ```
 
-每核 Jetty 数不少于 EID 数 N 时，保持 `jetty_slot % N` 的原有映射。
-每核不足、但总数足够时，使用 `(jetty_slot * cores + core) % N` 跨 core 分配，
-先分配各 core 的第一个 Jetty，再分配第二个。这里 N 是截取后实际生效的 EID 数量。
+按核号、核内 Jetty 编号的顺序连续绑定对端 EID，路径下标为
+`(core * jettys_per_core + jetty_slot) % N`，其中 N 是实际生效的 EID 数量。
+例如 4 核、每核 4 个 Jetty、3 个 EID 时，四个核的路径依次为
+`[0,1,2,0]`、`[1,2,0,1]`、`[2,0,1,2]`、`[0,1,2,0]`，三个 EID 分别绑定 6、5、5 个 Jetty。
 
 候选 EID 超过 Jetty 总数时，两个 Python 入口都会在启动 Runtime 前截取列表，保持输入顺序。
 例如传入 `E0,E1,E2`，设置 `--cores 1,2,3,4,5,6 --jettys 1`：
@@ -197,7 +198,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 
 双路时，`--cores 1 --jettys 4` 是 1 core、共 4 Jetty，每个 CPU EID 分到 2 个。
 这不等同于两个各用 1 core、4 Jetty 的独立测试；比较基线时应匹配资源和流量。
-每核轮转时每核 Jetty 数、跨核分配时总 Jetty 数，宜为 EID 数量的整数倍，避免各路分配不对称。
+总 Jetty 数能被 EID 数量整除时，各 EID 绑定相同数量的 Jetty。有余数时，各路最多相差一个 Jetty。
 请求以每 post 最多 128 个 READ 的粒度轮转，尾部也可能使各路字节数不同，实际分配以 CSV 为准。
 多路测试要求 `miss-count >= cores * jettys * 128`，以保证所有 Jetty 都有流量；
 默认请求量不足时需同步增大 `--request-length` 和 `--miss-count`。
@@ -213,7 +214,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 1. CPU 的 TCP 请求只用于发现、注册和建链。建链完成后保留各路注册，READ
    数据直接经 UB 传输，CPU 的 TCP accept 循环不参与 BatchGet 数据搬运。
 2. NPU 将每个 Jetty 的远端 EID、token、TP 和队列信息写入 entity table。
-   每核 Jetty 足够时按 peer 顺序轮转；不足时在各 core 之间分配路径。
+   按全局 Jetty 编号依次绑定 peer EID，换核时接着上一核的分配位置轮转。
 3. 每个 core 的提交组先向参与的 Jetty 发出 doorbell，再检查完成；不会先等待一个 EID
    的全部 BatchGet 完成再启动另一个。脚本检查请求数和 inflight 上限，确保首个组
    足够覆盖所有配置的 Jetty。各条 doorbell 指令之间仍有指令执行时间，并非同一周期。

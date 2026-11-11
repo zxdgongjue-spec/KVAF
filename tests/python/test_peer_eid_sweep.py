@@ -293,10 +293,10 @@ class PeerEidTests(unittest.TestCase):
 
     def test_cross_core_distribution_keeps_local_overlap_and_coverage_checks(self):
         peers = EIDS + ['4' * 32]
-        profiles = sample(jettys=2, paths=[0, 2]) + sample(jettys=2, paths=[1, 0])
+        profiles = sample(jettys=2, paths=[0, 1]) + sample(jettys=2, paths=[2, 0])
         rows = report.summarize([profiles], peers, 2, 2, 656)
         self.assertEqual({(r['core'], r['peer_path']) for r in rows},
-                         {(0, 0), (0, 2), (1, 0), (1, 1)})
+                         {(0, 0), (0, 1), (1, 0), (1, 2)})
         self.assertTrue(all(r['first_wave_observed_overlap_cycles'] > 0 for r in rows))
         for key in ('first_doorbell_cycle', 'last_doorbell_cycle',
                     'first_completion_cycle', 'last_completion_cycle'):
