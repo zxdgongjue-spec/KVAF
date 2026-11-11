@@ -13,6 +13,7 @@
 namespace kvaf {
 
 struct BatchGetKernelProfile;
+struct GatherBatchGetProfile;
 
 struct NpuRuntimeOptions {
   NpuRuntimeOptions(std::string kernel_object_path,
@@ -86,6 +87,8 @@ class NpuRuntime final : public Runtime {
       std::vector<BatchGetKernelProfile>* profiles) const;
   Status SetScatterProfiling(bool enabled);
   Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
+  Status SetGatherBatchGetProfiling(bool enabled);
+  Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

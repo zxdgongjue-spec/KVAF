@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -45,6 +46,18 @@ inline void GatherSpinPause() {
 
 enum class GatherWaitMode { kActive, kAdaptive, kPassive };
 
+// CPU steady-clock timestamps only; they do not share the AIV clock.
+struct alignas(64) CpuGatherThreadProfile {
+  std::uint64_t ready_ns{}, start_ns{}, copy_done_ns{}, done_ns{};
+  std::uint64_t thread_cpu_ns{}, bytes{}, tid{}, progress_publications{};
+  int cpu{-1};
+  bool wait_path{}, cpu_time_valid{};
+};
+
+struct CpuGatherCopyProfile {
+  std::uint64_t publish_ns{}, begin_ns{}, coordinator_done_ns{}, done_ns{};
+};
+
 class CpuGatherExecutor {
  public:
   CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
@@ -73,7 +86,9 @@ class CpuGatherExecutor {
   CpuGatherExecutor& operator=(const CpuGatherExecutor&) = delete;
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
-                            std::uint64_t sequence, std::size_t max_spans);
+                            std::uint64_t sequence, std::size_t max_spans,
+                            const GatherControl* control = nullptr,
+                            const std::atomic<bool>* stop = nullptr);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -94,6 +109,12 @@ class CpuGatherExecutor {
   }
 
   void Copy();
+  // Enable before the first PrepareDirect. Disabled execution reads no clocks.
+  void EnableProfiling() { thread_profiles_.resize(max_threads_); }
+  std::size_t MaxThreads() const { return max_threads_; }
+  const CpuGatherCopyProfile& CopyProfile() const { return copy_profile_; }
+  // Read active entries only, after Copy has joined all helpers.
+  const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
   std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
@@ -110,7 +131,30 @@ class CpuGatherExecutor {
     staging_ = memory_ + (staging - base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
+    if (cooperative_) {
+      cooperative_count_ = GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_);
+      for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
+        cooperative_progress_[chunk].remaining.store(threads, std::memory_order_relaxed);
+        cooperative_progress_[chunk].complete.store(false, std::memory_order_relaxed);
+      }
+    } else if (pipeline_ready_ != nullptr) {
+      // Balanced static rounds, capped at 256 KiB per copy task. A 2.5625-MiB
+      // lane with 16 threads gets 16 x 164-KiB tasks, independent of ready chunk.
+      constexpr std::uint64_t kMaxTaskBytes = 256U * 1024U;
+      const auto round_bytes = threads * kMaxTaskBytes;
+      const auto rounds = (total_bytes_ + round_bytes - 1U) / round_bytes;
+      const auto slots = threads * rounds;
+      task_bytes_ = ((total_bytes_ + slots - 1U) / slots + 63U) & ~std::uint64_t{63U};
+      task_progress_.assign((total_bytes_ + task_bytes_ - 1U) / task_bytes_, TaskProgress{});
+      ready_tasks_ = 0U;
+      published_bytes_ = 0U;
+    }
     phase_.store(0U, std::memory_order_release);
+    if (!thread_profiles_.empty()) {
+      std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
+      copy_profile_ = {};
+      copy_profile_.publish_ns = NowNs();
+    }
     generation_.fetch_add(1U, std::memory_order_release);
     lock.unlock();
     ready_.notify_all();
@@ -141,9 +185,17 @@ class CpuGatherExecutor {
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
+  bool WaitSuffix() const;
 
   std::uint64_t ProcessSource(std::size_t worker);
+  void PublishReady();
+  void PublishCooperativeReady();
 
+  static std::uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  void CopyWorker(std::size_t worker);
   void RunHelper(std::size_t worker);
 
   std::uint8_t* memory_;
@@ -158,6 +210,10 @@ class CpuGatherExecutor {
   std::atomic<std::uint64_t> generation_{0U};
   // The sender retains this descriptor until all copy threads finish and ACK is published.
   const GatherSpan* spans_{nullptr};
+  const std::uint64_t* descriptor_suffix_{nullptr};
+  const std::atomic<bool>* request_stop_{nullptr};
+  std::uint64_t sequence_{}, head_bytes_{};
+  mutable std::atomic<bool> copy_failed_{false};
   std::uint32_t span_count_{0U}, span_bytes_{0U};
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
@@ -165,8 +221,25 @@ class CpuGatherExecutor {
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
-  std::vector<std::uint32_t> chunk_done_;
-  std::atomic<std::size_t> next_chunk_{0U};
+  std::uint32_t first_chunk_divisor_{0U};
+  bool cooperative_{};
+  std::uint32_t cooperative_count_{};
+  // One completion RMW per worker/block; only the last worker scans/publishes.
+  // Blocks have separate lines and no worker waits for another block's users.
+  struct alignas(64) CooperativeProgress {
+    std::atomic<std::size_t> remaining{0};
+    std::atomic<bool> complete{false};
+  };
+  std::array<CooperativeProgress, kGatherMaxProgressChunks> cooperative_progress_;
+  // Separate balanced task ownership from partial DMA-visible progress. Each
+  // slot has one writer; only the coordinator publishes the contiguous prefix.
+  struct alignas(64) TaskProgress { std::uint64_t bytes{}; };
+  std::vector<TaskProgress> task_progress_;
+  std::uint64_t task_bytes_{0U};
+  std::size_t ready_tasks_{0U};
+  std::uint64_t published_bytes_{0U};
+  std::vector<CpuGatherThreadProfile> thread_profiles_;
+  CpuGatherCopyProfile copy_profile_{};
   alignas(64) std::atomic<std::uint32_t> phase_{0U};
   alignas(64) std::atomic<std::size_t> completed_{0U};
   std::atomic<bool> stopping_{false};

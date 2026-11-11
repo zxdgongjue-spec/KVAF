@@ -251,6 +251,8 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   if (execution.trusted_npu_request) {
     scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
     if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+    if (request.indices.device != DeviceKind::kNpu || !execution.stream)
+      return Status::InvalidArgument("trusted BatchGet requires NPU inputs and an eager stream");
     validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
   }

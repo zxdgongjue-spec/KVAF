@@ -1,5 +1,10 @@
 # Python Bindings
 
+`gather_read` 的 Python 构造参数 `trusted_gather_inputs=True` 默认启用最小元数据
+读取和 Runtime/Host 快路径；调用方保证输入 Tensor 格式、容量和生命周期，且仅使用
+eager。设置为 `False` 保留完整布局检查；其他模式保持原行为。指针、容量和 stream
+handle 每轮重新读取。部署与性能对照见 [gather 提前准备与协作 chunk](../docs/aiv_gather_prepared_prefix.md)。
+
 本目录是 KVAF C++ 核心与 Python 之间的可选绑定层，使用 Pybind11 构建 `_kvaf` 原生扩展。
 
 `./build.sh npu` 默认将 AIV URMA、UBmem 和 AICPU Gather/Scatter 构建进同一个
@@ -43,7 +48,8 @@ batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
 adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048,
-transport="urma", *, aicpu_batch_get_mode="")`
+transport="urma", *, aicpu_batch_get_mode="", aiv_batch_get_mode="direct_read",
+aiv_gather_sgl_size=6, trusted_gather_inputs=True)`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。
@@ -54,8 +60,10 @@ transport="urma", *, aicpu_batch_get_mode="")`
 AICPU 包由 Runtime 从 CANN 安装目录自动定位，删除了公开 JSON 路径参数。
 Gather 和 Scatter 都支持 `npu_eids` 候选列表，按顺序尝试并选用一个 EID，
 不指定时自动发现；AIV 的多 EID 条带语义不变。
-保留原有参数直到 `transport` 的位置参数调用方式；新增的 `aicpu_batch_get_mode`
-仅接受关键字传参。新代码建议使用关键字明确各项配置。
+保留原有参数直到 `transport` 的位置参数调用方式；`aicpu_batch_get_mode`、
+`aiv_batch_get_mode`、`aiv_gather_sgl_size` 和 `trusted_gather_inputs` 仅接受关键字传参。
+`aiv_batch_get_mode="gather_read"` 使用 AIV Gather；SGL 范围为 1～6。
+Scatter 的 prepared-submit 和 profiling 接口与 Gather 的独立 profiling 接口同时保留。
 
 `transport` 默认使用 URMA；传入 `transport="ubmem"` 使用 UBmem。UBmem 的 CPU
 内存分配依赖 Ascend HAL 与驱动；CPU 服务根据分配请求选择后端，无需指定协议。

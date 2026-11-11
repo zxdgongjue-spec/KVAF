@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "gather_prefix_layout.h"
 
 namespace kvaf {
 inline constexpr std::uint32_t kGatherMaxRequests = 65536U;
