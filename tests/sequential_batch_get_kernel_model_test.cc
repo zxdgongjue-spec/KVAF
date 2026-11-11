@@ -535,6 +535,7 @@ int main() {
     // A prefix callback may submit DMA while helpers are copying the tail.
     std::memset(staging, 0xad, sizeof(staging));
     std::vector<uint32_t> ready;
+    executor.EnableProfiling(true);
     assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8) == 4);
     executor.Copy([&](uint32_t rows) {
       ready.push_back(rows);
@@ -543,6 +544,16 @@ int main() {
       return true;
     });
     assert((ready == std::vector<uint32_t>{8, 13}));
+    const auto& copy = executor.CopyProfile();
+    assert(copy.publish_ns <= copy.begin_ns && copy.coordinator_done_ns <= copy.done_ns);
+    uint64_t copied_bytes = 0;
+    for (uint32_t worker = 0; worker < 4; ++worker) {
+      const auto& profile = executor.ThreadProfiles()[worker];
+      assert(copy.begin_ns <= profile.start_ns && profile.start_ns <= profile.copy_done_ns &&
+             profile.copy_done_ns <= profile.done_ns && profile.done_ns <= copy.done_ns);
+      copied_bytes += profile.bytes;
+    }
+    assert(copied_bytes == 13 * sizeof(source));
     assert(std::all_of(staging + 13 * sizeof(source), staging + sizeof(staging),
                        [](uint8_t byte) { return byte == 0xad; }));
 

@@ -1,10 +1,20 @@
 #include "cpu_gather_executor.h"
 
 #include <exception>
+#include <ctime>
 #include <stdexcept>
 
 namespace kvaf::peer {
 namespace {
+
+std::uint64_t ThreadCpuNs() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+  timespec value{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0)
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000U + value.tv_nsec;
+#endif
+  return 0U;
+}
 
 bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t descriptor_address,
                       const GatherDescriptorHeader& header) {
@@ -89,29 +99,52 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
 
 void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
   completed_.store(0U, std::memory_order_relaxed);
+  if (profiling_enabled_) {
+    copy_profile_.begin_ns = NowNs();
+    thread_profiles_[0].ready_ns = copy_profile_.begin_ns;
+  }
   phase_.store(1U, std::memory_order_release);
+  BeginWorker(0U);
+  std::uint64_t copied = 0U;
   std::exception_ptr publish_error;
-  if (fixed_progress_.empty()) {
-    (void)ProcessSource(0U);
-  } else {
+  std::size_t next_ready = 0;
+  bool publishing = true;
+  const auto publish_ready = [&]() {
+    if (!publishing) return;
     try {
-      for (std::size_t chunk = 0; chunk < fixed_progress_.size(); ++chunk) {
-        if (fixed_copy_failed_.load(std::memory_order_relaxed)) break;
-        CopyFixedChunk(0U, chunk);
-        while (__atomic_load_n(&fixed_progress_[chunk].remaining, __ATOMIC_ACQUIRE) &&
-               !fixed_copy_failed_.load(std::memory_order_relaxed))
-          GatherSpinPause();
-        if (fixed_copy_failed_.load(std::memory_order_relaxed)) break;
+      while (next_ready < fixed_progress_.size() &&
+             !__atomic_load_n(&fixed_progress_[next_ready].remaining, __ATOMIC_ACQUIRE) &&
+             !fixed_copy_failed_.load(std::memory_order_relaxed)) {
         const auto rows = std::min<std::uint64_t>(
-            span_count_, std::uint64_t{fixed_chunk_rows_} * (chunk + 1U));
-        if (on_chunk && !on_chunk(static_cast<std::uint32_t>(rows))) break;
+            span_count_, std::uint64_t{fixed_chunk_rows_} * (next_ready + 1U));
+        if (on_chunk && !on_chunk(static_cast<std::uint32_t>(rows))) {
+          publishing = false;
+          return;
+        }
+        ++next_ready;
       }
     } catch (...) {
       publish_error = std::current_exception();
+      publishing = false;
+    }
+  };
+  if (fixed_progress_.empty()) {
+    copied = ProcessSource(0U);
+  } else {
+    for (std::size_t chunk = 0; chunk < fixed_progress_.size(); ++chunk) {
+      if (!publishing || fixed_copy_failed_.load(std::memory_order_relaxed)) break;
+      copied += CopyFixedChunk(0U, chunk);
+      publish_ready();
     }
   }
-  GatherBarrier();
-  while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) GatherSpinPause();
+  FinishWorker(0U, copied);
+  if (profiling_enabled_) copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
+  while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
+    publish_ready();
+    GatherSpinPause();
+  }
+  publish_ready();
+  if (profiling_enabled_) copy_profile_.done_ns = NowNs();
   if (publish_error) std::rethrow_exception(publish_error);
   if (addresses_ && fixed_copy_failed_.load(std::memory_order_relaxed))
     throw std::invalid_argument("CPU gather source outside registered DDR");
@@ -218,12 +251,39 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   }
 }
 
+void CpuGatherExecutor::BeginWorker(std::size_t worker) {
+  if (!profiling_enabled_) return;
+  auto& profile = thread_profiles_[worker];
+#if defined(__linux__)
+  profile.tid = static_cast<std::uint64_t>(syscall(SYS_gettid));
+  profile.cpu = sched_getcpu();
+#endif
+  profile.thread_cpu_ns = ThreadCpuNs();
+  profile.start_ns = NowNs();
+}
+
+void CpuGatherExecutor::FinishWorker(std::size_t worker, std::uint64_t bytes) {
+  if (profiling_enabled_) {
+    thread_profiles_[worker].bytes = bytes;
+    thread_profiles_[worker].copy_done_ns = NowNs();
+  }
+  GatherBarrier();
+  if (!profiling_enabled_) return;
+  auto& profile = thread_profiles_[worker];
+  profile.done_ns = NowNs();
+  const auto cpu_end = ThreadCpuNs();
+  const auto cpu_begin = profile.thread_cpu_ns;
+  profile.cpu_time_valid = cpu_begin && cpu_end >= cpu_begin;
+  profile.thread_cpu_ns = profile.cpu_time_valid ? cpu_end - cpu_begin : 0U;
+}
+
 void CpuGatherExecutor::RunHelper(std::size_t worker) {
   BindWorker(worker);
   std::uint64_t observed_generation = 0U;
   bool was_active = false;
   for (;;) {
     bool active = false;
+    bool wait_path = false;
     if (wait_mode_ != GatherWaitMode::kPassive && was_active) {
       const auto spin_start = std::chrono::steady_clock::now();
       std::uint32_t spin_count = 0U;
@@ -237,15 +297,18 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
         generation = generation_.load(std::memory_order_acquire);
       }
       std::unique_lock<std::mutex> lock(mutex_);
-      if (generation_.load(std::memory_order_acquire) == observed_generation)
+      if (generation_.load(std::memory_order_acquire) == observed_generation) {
+        wait_path = true;
         ready_.wait(lock, [this, &observed_generation] {
           return stopping_.load(std::memory_order_acquire) ||
                  generation_.load(std::memory_order_acquire) != observed_generation;
         });
+      }
       if (stopping_.load(std::memory_order_acquire)) return;
       observed_generation = generation_.load(std::memory_order_acquire);
       active = worker < active_threads_;
     } else {
+      wait_path = true;
       std::unique_lock<std::mutex> lock(mutex_);
       ready_.wait(lock, [this, &observed_generation] {
         return stopping_.load(std::memory_order_acquire) ||
@@ -257,12 +320,17 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
     }
     was_active = active;
     if (!active) continue;
+    if (profiling_enabled_) {
+      thread_profiles_[worker].ready_ns = NowNs();
+      thread_profiles_[worker].wait_path = wait_path;
+    }
     while (phase_.load(std::memory_order_acquire) == 0U) {
       if (stopping_.load(std::memory_order_acquire)) return;
       GatherSpinPause();
     }
-    (void)ProcessSource(worker);
-    GatherBarrier();
+    BeginWorker(worker);
+    const auto bytes = ProcessSource(worker);
+    FinishWorker(worker, bytes);
     completed_.fetch_add(1U, std::memory_order_release);
   }
 }

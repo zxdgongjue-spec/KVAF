@@ -189,6 +189,12 @@ payload CQE。`--pipeline 1` 的这段时间可包含后缀 gather 和 Ready WRI
 `--pipeline 0 --fixed-request-plan`，并对齐源表、线程总数和 CPU 绑定。
 此时 Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane。
 
+日志还记录协调线程完成自己拷贝后的 `join_wait_ns`，以及最晚完成线程的
+`slow_worker`、`slow_tid`、`slow_cpu`、`slow_bytes`、`slow_start_delay_ns`、
+`slow_copy_ns`、`slow_barrier_ns` 和 `slow_thread_cpu_ns`。
+`slow_cpu_time_valid=1` 时可对照工作墙钟和线程 CPU 时间判断该线程的运行区间。
+`pipeline=1` 的协调线程区间包含就绪块提交，块内 barrier 也包含在 `slow_copy_ns` 中。
+
 ```bash
 DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
   bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \

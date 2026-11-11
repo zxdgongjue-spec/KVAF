@@ -277,6 +277,7 @@ Status Transport::GatherRows(Range range, const peer::CpuGatherExecutor::ChunkRe
     std::size_t threads;
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
+      gather_->EnableProfiling(profile_.enabled);
       threads = gather_->PrepareFixed(staging, addresses + range.begin,
           range.end - range.begin, token_bytes_, source_bytes_, on_chunk ? kChunkRows : 0U);
     }
@@ -285,8 +286,21 @@ Status Transport::GatherRows(Range range, const peer::CpuGatherExecutor::ChunkRe
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
       gather_->Copy(on_chunk);
     }
-    if (profile_.enabled)
+    if (profile_.enabled) {
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
+      const auto& copy = gather_->CopyProfile();
+      profile_.gather_join_wait_ns += copy.done_ns - copy.coordinator_done_ns;
+      const auto& workers = gather_->ThreadProfiles();
+      for (std::size_t worker = 0; worker < threads; ++worker) {
+        const auto elapsed = workers[worker].done_ns - copy.begin_ns;
+        if (elapsed > profile_.slowest_elapsed_ns) {
+          profile_.slowest_elapsed_ns = elapsed;
+          profile_.slowest_start_delay_ns = workers[worker].start_ns - copy.begin_ns;
+          profile_.slowest_thread = workers[worker];
+          profile_.slowest_worker = static_cast<std::uint32_t>(worker);
+        }
+      }
+    }
   } catch (const std::invalid_argument& error) {
     return Status::InvalidArgument(error.what());
   } catch (const std::exception& error) {
@@ -704,8 +718,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   if (status.ok()) status = PollPrepared(UINT64_MAX);
   if (status.ok() && profiled_gather_rows) {
     if (gather_profile_samples_.size() < kGatherProfileSamples) {
-      gather_profile_samples_.push_back({sequence, profile_.gather_prepare_ns,
-          profile_.gather_copy_ns, profile_.suffix_wait_ns, profiled_gather_rows, profile_.cpu_threads});
+      gather_profile_samples_.push_back({sequence, profiled_gather_rows, profile_});
     } else {
       ++gather_profile_dropped_;
     }
@@ -733,11 +746,20 @@ void Transport::PrintProfile() const {
 
 void Transport::FlushGatherProfiles() {
   for (const auto& sample : gather_profile_samples_) {
+    const auto& p = sample.profile;
+    const auto& slow = p.slowest_thread;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64 " suffix_wait_ns=%" PRIu64 "\n",
+        " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64 " suffix_wait_ns=%" PRIu64
+        " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
+        " slow_bytes=%" PRIu64 " slow_start_delay_ns=%" PRIu64 " slow_copy_ns=%" PRIu64
+        " slow_barrier_ns=%" PRIu64 " slow_thread_cpu_ns=%" PRIu64
+        " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
-        sample.threads, sample.prepare_ns, sample.copy_ns, sample.suffix_wait_ns);
+        p.cpu_threads, p.gather_prepare_ns, p.gather_copy_ns, p.suffix_wait_ns,
+        p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
+        p.slowest_start_delay_ns, slow.copy_done_ns - slow.start_ns, slow.done_ns - slow.copy_done_ns,
+        slow.thread_cpu_ns, unsigned(slow.cpu_time_valid), unsigned(slow.wait_path));
   }
   if (gather_profile_dropped_)
     std::fprintf(stderr, "CPU_PUSH_GATHER_PROFILE_DROPPED session=%" PRIu64 " samples=%zu\n",
