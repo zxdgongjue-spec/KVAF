@@ -133,7 +133,6 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
 }
 
 void CpuGatherExecutor::RunHelper(std::size_t worker) {
-  BindWorker(worker);
   std::uint64_t observed_generation = 0U;
   bool was_active = false;
   for (;;) {

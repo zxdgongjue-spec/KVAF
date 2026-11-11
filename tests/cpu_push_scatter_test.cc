@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -59,17 +60,41 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   args.sequence = 1;
   args.workers = workers;
   args.timeout_ms = 5000;
+  const auto& notify_word = *reinterpret_cast<const Word*>(memory + layout.notify);
+  auto wait_for = [](const Word& word) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!__atomic_load_n(&word.value, __ATOMIC_ACQUIRE)) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::yield();
+    }
+  };
   std::vector<std::thread> threads;
-  for (std::uint32_t w = 0; w < workers; ++w)
+  auto launch = [&] {
     threads.emplace_back([&] { CHECK(ExecuteCpuPushScatter(&args) == 0); });
+  };
+  launch();
+  if (ActiveWorkers(active, bytes, workers) > 1) {
+    // Hold back all other builders until worker 0 has written its slice.
+    wait_for(coordination.built);
+    CHECK(__atomic_load_n(&notify_word.value, __ATOMIC_ACQUIRE) == 0);
+  }
+  for (std::uint32_t w = 1; w < workers; ++w) launch();
+  if (active) {
+    // Verify exactly what CPU may read as soon as the notification is visible.
+    wait_for(notify_word);
+    const auto& header = *reinterpret_cast<const Request*>(memory + layout.request);
+    CHECK(header.magic == kMagic && header.sequence == 1 && header.count == active);
+    CHECK(header.token_bytes == bytes && header.workers == workers);
+    const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
+    for (std::uint32_t i = 0; i < active; ++i)
+      CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
+    CHECK(active == kMaxRequests || sources[active] == 0);
+  }
   for (auto& thread : threads) thread.join();
   CHECK(output == expected);
-  const auto notify = reinterpret_cast<Word*>(memory + layout.notify)->value;
+  const auto notify = notify_word.value;
   CHECK((notify & ~kProfileNotify) == (active ? 1U : 0U));
   CHECK(((notify & kProfileNotify) != 0) == (active != 0));
-  const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
-  for (std::uint32_t i = 0; i < active; ++i)
-    CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
   std::uint64_t copies = 0;
   for (std::uint32_t w = 0; w < workers; ++w) {
     const auto range = WorkerRange(active, bytes, w, workers);
@@ -129,7 +154,7 @@ void CheckRound(std::uint32_t capacity, std::uint32_t active, std::uint32_t byte
 }
 
 struct Model {
-  std::vector<std::uint64_t> tokens;
+  std::vector<ReadySnapshot> snapshots;
   std::vector<std::pair<std::uint32_t, std::uint32_t>> copied;
   std::uint32_t polls{}, finishes{};
   std::uint64_t ticks{};
@@ -137,9 +162,9 @@ struct Model {
   Result status{Result::kPending};
   Result Status() { return status; }
   std::uint64_t Now() { return ++ticks; }
-  std::uint64_t ReadRangeDone(std::uint32_t) {
-    const auto index = std::min<std::size_t>(polls++, tokens.size() - 1);
-    return tokens[index];
+  ReadySnapshot ReadReady(std::uint32_t) {
+    const auto index = std::min<std::size_t>(polls++, snapshots.size() - 1);
+    return snapshots[index];
   }
   void Relax() {}
   bool Copy(Range range) {
@@ -151,40 +176,51 @@ struct Model {
 };
 
 void CheckPipeline() {
+  const auto all = [](std::uint64_t sequence, std::uint32_t chunks) {
+    ReadySnapshot snapshot;
+    snapshot.fill(Progress(sequence, chunks));
+    return snapshot;
+  };
   for (std::uint32_t worker = 0; worker < 4; ++worker) {
     const auto range = WorkerRange(10000, 656, worker, 4);
-    auto check = [&](std::vector<std::uint64_t> tokens, Result expected,
+    auto check = [&](std::vector<ReadySnapshot> snapshots, Result expected,
                      std::vector<std::pair<std::uint32_t, std::uint32_t>> copied,
                      std::uint32_t chunks, std::uint32_t finishes, bool fail = false) {
       Model io;
-      io.tokens = std::move(tokens); io.fail_copy = fail;
+      io.snapshots = std::move(snapshots); io.fail_copy = fail;
       std::uint32_t consumed = 0;
       CHECK(Consume(10000, 656, 4, worker, 7, 0, 30, io, &consumed) == expected);
       CHECK(io.copied == copied && consumed == chunks && io.finishes == finishes);
     };
-    check({Progress(6, 1), Progress(7, 1), Progress(7, 3)}, Result::kOk,
+    check({all(6, 1), all(7, 1), all(7, 3)}, Result::kOk,
           {{range.begin, range.begin + 1024}, {range.begin + 1024, range.end}}, 3, 1);
-    check({Progress(7, 3)}, Result::kOk, {{range.begin, range.end}}, 3, 1);
-    check({Progress(8, 1)}, Result::kSequenceError, {}, 0, 0);
-    check({Progress(7, 0)}, Result::kSequenceError, {}, 0, 0);
-    check({Progress(7, 4)}, Result::kSequenceError, {}, 0, 0);
-    check({Progress(7, 2), Progress(7, 1)}, Result::kSequenceError,
+    check({all(7, 3)}, Result::kOk, {{range.begin, range.end}}, 3, 1);
+    // Queue 0 reaches chunk 2 while queue 2 still has no current-batch data.
+    // Consume the ready intervals immediately, then fill the gaps exactly once.
+    check({{Progress(7, 2), Progress(7, 1), Progress(6, 3), Progress(7, 1)}, all(7, 3)},
+          Result::kOk, {{range.begin, range.begin + 512}, {range.begin + 768, range.begin + 1280},
+                        {range.begin + 512, range.begin + 768}, {range.begin + 1280, range.end}}, 3, 1);
+    check({all(8, 1)}, Result::kSequenceError, {}, 0, 0);
+    check({all(7, 0)}, Result::kSequenceError, {}, 0, 0);
+    check({all(7, 4)}, Result::kSequenceError, {}, 0, 0);
+    check({all(7, 2), all(7, 1)}, Result::kSequenceError,
           {{range.begin, range.begin + 2048}}, 2, 0);
-    check({Progress(6, 1)}, Result::kTimeout, {}, 0, 0);
-    check({Progress(7, 1)}, Result::kCopyError, {{range.begin, range.begin + 1024}}, 0, 0, true);
-    check({Progress(7, 3)}, Result::kCopyError, {{range.begin, range.end}}, 0, 1, true);
+    check({all(6, 1)}, Result::kTimeout, {}, 0, 0);
+    check({all(7, 1)}, Result::kCopyError, {{range.begin, range.begin + 1024}}, 0, 0, true);
   }
-  // A single slow/stale Jetty must prevent release of the other three.
-  for (const auto& tokens : std::vector<std::array<std::uint64_t, 4>>{
-      {Progress(7, 3), Progress(7, 2), Progress(7, 1), Progress(7, 3)},
-      {Progress(7, 3), Progress(6, 3), Progress(7, 3), Progress(7, 3)}}) {
-    const auto progress = ChainReadyProgress(3, 7, [&](auto q) { return tokens[q]; });
-    CHECK(progress == (tokens[1] == Progress(6, 3) ? 0 : Progress(7, 1)));
-  }
+  // A short last chunk can have empty Jetty shards.
+  Model short_tail;
+  short_tail.snapshots = {all(7, 1), {Progress(7, 2), Progress(7, 1), Progress(7, 1), Progress(7, 1)}};
+  std::uint32_t consumed = 0;
+  CHECK(Consume(1025, 656, 1, 0, 7, 0, 30, short_tail, &consumed) == Result::kOk);
+  CHECK(consumed == 2 && short_tail.copied.size() == 2);
+  CHECK(short_tail.copied.back().first == 1024 && short_tail.copied.back().second == 1025);
+
   for (const auto sequence : {std::uint64_t{7}, std::uint64_t{UINT32_MAX}})
     for (const auto progress : {0U, 4U}) {
-      const auto invalid = ChainReadyProgress(3, sequence, [&](auto) { return Progress(sequence, progress); });
-      Model io; io.tokens = {invalid};
+      Model io;
+      io.snapshots = {all(sequence, 1)};
+      io.snapshots.front()[2] = Progress(sequence, progress);
       std::uint32_t consumed = 0;
       CHECK(Consume(10000, 656, 4, 0, sequence, 0, 30, io, &consumed) == Result::kSequenceError);
       CHECK(io.copied.empty());

@@ -18,9 +18,8 @@ struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
-  std::uint32_t gather_threads{0U};
-  bool gather_affinity{true};
-  CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
+  std::uint32_t gather_threads{10U};
+  CpuGatherMode gather_mode{CpuGatherMode::kActive};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
   std::string hal_library{"libascend_hal.so"};
 };
