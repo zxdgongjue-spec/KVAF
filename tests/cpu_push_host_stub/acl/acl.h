@@ -2,7 +2,7 @@
 
 #include "../../aicpu_loader_stub/acl/acl.h"
 
-enum aclrtMemMallocPolicy { ACL_MEM_MALLOC_NORMAL_ONLY };
+enum aclrtMemMallocPolicy { ACL_MEM_MALLOC_NORMAL_ONLY, ACL_MEM_MALLOC_HUGE_FIRST };
 enum aclrtMemcpyKind { ACL_MEMCPY_DEVICE_TO_HOST };
 aclError aclrtMalloc(void**, std::size_t, aclrtMemMallocPolicy);
 aclError aclrtMallocHost(void**, std::size_t);
