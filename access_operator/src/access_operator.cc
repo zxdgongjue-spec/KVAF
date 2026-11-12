@@ -575,6 +575,12 @@ Status DefaultAccessOperator::CopyGatherBatchGetProfile(GatherBatchGetProfile* p
   return impl_->sequential->CopyGatherProfile(profile);
 }
 
+Status DefaultAccessOperator::CheckGatherGraphReplay() {
+  if (!impl_->sequential)
+    return Status::NotImplemented("gather graph requires gather_read mode");
+  return impl_->sequential->CheckGatherGraphReplay();
+}
+
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
   if (impl_->sequential) return Status::NotImplemented("direct-read profile is unavailable for sequential modes");
   if (!impl_->initialized || impl_->execution.status == nullptr) {

@@ -36,6 +36,14 @@ Status ReadProbe(uint32_t* probe) {
     if (std::strcmp(value, ProbeName(p)) == 0) { *probe = p; return Status::OK(); }
   return Status::InvalidArgument("KVAF_AIV_GATHER_PROBE must be ack/wqe/sq/first_read or empty");
 }
+Status QueryCapture(aclrtStream stream, bool* capturing) {
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (aclmdlRICaptureGetInfo(stream, &capture, &graph) != ACL_SUCCESS)
+    return Error("query stream capture state");
+  *capturing = capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  return Status::OK();
+}
 static_assert(sizeof(KvafSequentialGatherHeader) == sizeof(peer::GatherDescriptorHeader));
 static_assert(offsetof(KvafSequentialGatherHeader, ready_bytes) ==
               offsetof(peer::GatherDescriptorHeader, ready_bytes));
@@ -52,6 +60,7 @@ class GatherBatchGet final : public SequentialBatchGet {
   Status Shutdown() override;
   Status SetGatherProfiling(bool enabled) override;
   Status CopyGatherProfile(GatherBatchGetProfile* profile) const override;
+  Status CheckGatherGraphReplay() override;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -77,6 +86,9 @@ struct GatherBatchGet::Impl {
   KvafBatchGetLocalBuffer* workspace_buffer{};
   KvafBatchGetLocalBuffer* output_buffer{};
   aclrtStream pending{};
+  aclrtStream graph_stream{};
+  uint64_t graph_output_bytes{};
+  bool graph_mode{}, graph_captured{};
   uint64_t sequence{};
   bool gather_enabled{}, initialized{}, failed{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
@@ -212,8 +224,10 @@ struct GatherBatchGet::Impl {
     // Finish pending CPU work; on errors quiesce transports before freeing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
     failed = true;  // A partially closed transport cannot accept another Execute.
-    if (pending) {
-      const aclError synchronized = aclrtSynchronizeStream(pending);
+    // Replays bypass Execute and can enqueue work after the last status check.
+    const auto stream = pending ? pending : (graph_captured ? graph_stream : nullptr);
+    if (stream) {
+      const aclError synchronized = aclrtSynchronizeStream(stream);
       if (synchronized != ACL_SUCCESS) return AclFailure("shutdown_synchronize", synchronized);
     }
     pending = nullptr;
@@ -241,6 +255,9 @@ struct GatherBatchGet::Impl {
     profile_host = nullptr;
     profiling = pending_profile = profile_valid = false;
     check_async_status = pending_status_check = false;
+    graph_mode = graph_captured = false;
+    graph_stream = nullptr;
+    graph_output_bytes = 0;
     latest_profile = {};
     initialized = failed = false; sequence = 0; args = {};
     return execution_status;
@@ -371,6 +388,12 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   }
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
+  const char* check_status = std::getenv("KVAF_AIV_GATHER_CHECK_STATUS");
+  s.check_async_status = check_status && std::strcmp(check_status, "1") == 0;
+  const char* graph = std::getenv("KVAF_AIV_GATHER_GRAPH");
+  s.graph_mode = graph && std::strcmp(graph, "1") == 0;
+  if (s.graph_mode && (s.args.probe || s.check_async_status))
+    return Status::InvalidArgument("gather graph requires probe and async status checking to be disabled");
   const bool fast_read = uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size <= 65536;
   s.args.pipeline_chunk_bytes = kGatherChunkBytes;
   const char* chunk = std::getenv("KVAF_AIV_GATHER_CHUNK_BYTES");
@@ -431,8 +454,9 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
       aclrtMallocHost(&s.status_host, s.StatusBytes()) != ACL_SUCCESS)
     return Error("allocate statuses");
   s.args.sgl_size = s.config.aiv_gather_sgl_size;
-  const char* check_status = std::getenv("KVAF_AIV_GATHER_CHECK_STATUS");
-  s.check_async_status = check_status && std::strcmp(check_status, "1") == 0;
+  if (s.graph_mode &&
+      aclrtMemset(s.status_device, s.StatusBytes(), 0, s.StatusBytes()) != ACL_SUCCESS)
+    return Error("initialize gather graph status");
   s.args.max_polls = 100000000U;
   s.args.source_base = region.base; s.args.source_bytes = region.length;
   result = s.InitializeGather(peer);
@@ -447,13 +471,33 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
 }
 Status GatherBatchGet::Drain() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->graph_captured)
+    return Status::InvalidState("BatchPut cannot reuse a captured gather session");
   return impl_->Drain();
+}
+Status GatherBatchGet::CheckGatherGraphReplay() {
+  auto& s = *impl_;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.graph_captured || s.failed)
+    return Status::InvalidState("gather graph status requires a captured, usable session");
+  bool capturing = false;
+  auto result = QueryCapture(s.graph_stream, &capturing);
+  if (!result.ok()) return result;
+  if (capturing)
+    return Status::InvalidState("check gather graph status outside capture");
+  if (s.sequence == UINT32_MAX)
+    return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+  ++s.sequence;  // Exactly one replay is expected since the last checked execution.
+  s.pending = s.graph_stream;
+  s.pending_status_check = true;
+  return s.Drain();
 }
 Status GatherBatchGet::SetGatherProfiling(bool enabled) {
   auto& s = *impl_;
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!s.initialized) return Status::NotInitialized("gather transport is not initialized");
   if (!enabled) { s.profiling = false; return Status::OK(); }
+  if (s.graph_mode) return Status::InvalidState("gather graph does not support Host profiling");
   if (s.args.probe) return Status::InvalidState("gather prefix probes cannot collect performance profiles");
   auto result = s.Drain();
   if (!result.ok()) return result;
@@ -483,13 +527,25 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
   if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
   if (s.failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
   if (!exec.request || !exec.execution.stream) return Status::InvalidArgument("BatchGet needs request and stream");
-  if (!exec.execution.trusted_npu_request) {
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
-      return Error("query stream capture state");
-    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  bool capturing = false;
+  if (s.graph_mode || !exec.execution.trusted_npu_request) {
+    auto result = QueryCapture(stream, &capturing);
+    if (!result.ok()) return result;
+    if (capturing && !s.graph_mode)
       return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  }
+  if (s.graph_mode) {
+    if (s.graph_captured)
+      return Status::InvalidState("gather graph session already captured; replay the existing graph");
+    if (s.graph_stream && s.graph_stream != stream)
+      return Status::InvalidArgument("gather graph warmup and capture must use the same stream");
+    if (capturing == exec.execution.synchronize)
+      return Status::InvalidArgument("gather graph requires synchronous warmup and asynchronous capture");
+    if ((capturing && !s.graph_stream) || (s.graph_stream &&
+        (s.args.request.output != Ptr(exec.request->output.data) ||
+         s.graph_output_bytes != exec.request->output.bytes)))
+      return Status::InvalidArgument("gather graph requires the output registered during warmup");
   }
   if (s.profiling && !exec.execution.synchronize)
     return Status::InvalidArgument("gather profiling requires synchronize=True");
@@ -512,13 +568,28 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
   else result = Input(exec, s.config, &args.request);
   if (!result.ok()) return result;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+  args.request.core_status = Ptr(s.status_device); args.request.queue_state = Ptr(s.queues);
+  if (capturing) {
+    args.sequence = 0;
+    args.request.channel_entity = s.args.request.channel_entity;
+    if (KvafGatherBatchGetLaunch(&args, stream)) {
+      s.failed = true;
+      return Error("capture gather launch failed");
+    }
+    s.graph_captured = true;
+    return Status::OK();
+  }
   if (KvafBatchGetLocalBufferAcquire(s.gather_transport, exec.request->output.data,
       exec.request->output.bytes, &s.output_buffer, &args.request.channel_entity))
     return Error("register output");
-  args.request.core_status = Ptr(s.status_device); args.request.queue_state = Ptr(s.queues);
   s.args.request = args.request;
   s.args.head_start = args.head_start;
-  args.sequence = ++s.sequence;
+  ++s.sequence;
+  args.sequence = s.graph_mode ? 0 : s.sequence;
+  if (s.graph_mode) {
+    s.graph_stream = stream;
+    s.graph_output_bytes = exec.request->output.bytes;
+  }
   args.profile = s.profiling ? Ptr(s.profile_device) : 0;
   s.pending_profile = s.profiling;
   s.pending_status_check = exec.execution.synchronize || s.profiling ||
@@ -528,7 +599,7 @@ Status GatherBatchGet::Execute(const BatchGetExecRequest& exec) {
     s.latest_profile.sequence = s.sequence;
     s.latest_profile.prepare_ns = launch_begin - s.profile_begin_ns;
   }
-  s.pending = static_cast<aclrtStream>(exec.execution.stream);
+  s.pending = stream;
   if (args.probe)
     std::fprintf(stderr, "[KVAF_AIV_GATHER_PROBE_BEGIN] stage=%s sequence=%llu cores=%u "
         "token_bytes=%u request_capacity=%u\n", ProbeName(args.probe),

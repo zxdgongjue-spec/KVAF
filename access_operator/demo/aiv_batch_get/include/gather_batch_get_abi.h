@@ -39,7 +39,9 @@ struct KvafGatherBatchGetArgs {
   uint64_t workspace, workspace_bytes, workspace_entity, descriptor_offset;
   uint64_t lane_descriptor_bytes, lane_staging_bytes;
   uint64_t remote_staging, remote_descriptor, remote_control;
-  uint64_t source_base, source_bytes, sequence;
+  uint64_t source_base, source_bytes;
+  // Zero selects device sequencing from the persistent, initially zeroed core status.
+  uint64_t sequence;
   uint32_t sgl_size, max_polls;
   // Optional independent per-core profile array. Zero incurs no clock reads.
   uint64_t profile;

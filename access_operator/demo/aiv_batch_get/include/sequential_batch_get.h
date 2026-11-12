@@ -24,6 +24,9 @@ class SequentialBatchGet {
   virtual Status CopyGatherProfile(GatherBatchGetProfile*) const {
     return Status::NotImplemented("gather profiling requires gather_read mode");
   }
+  virtual Status CheckGatherGraphReplay() {
+    return Status::NotImplemented("gather graph requires gather_read mode");
+  }
 };
 std::unique_ptr<SequentialBatchGet> CreateSequentialBatchGet(AccessOperatorConfig config);
 }  // namespace kvaf

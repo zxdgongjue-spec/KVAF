@@ -1,7 +1,7 @@
 # Gather 性能采集与排障
 
 当前实现、各阶段优化和配置合同见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)。
-以下统一使用 V10 / args 256 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
+以下统一使用 V11 / args 256 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
 
 ## 构建与入口
 
@@ -25,7 +25,7 @@ export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.
 python -u tests/python/test_aiv_gather_batch_get.py
 ```
 
-启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV10 args_bytes=256`。
+启动日志须显示 `symbol=KvafGatherBatchGetAivKernelV11 args_bytes=256`。
 功能脚本校验 payload/guard、空批及重复调用；probe 结果不能当完整回归 PASS。
 环境变量在 Runtime 初始化时捕获，换组须新建 Runtime。
 

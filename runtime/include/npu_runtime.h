@@ -89,6 +89,7 @@ class NpuRuntime final : public Runtime {
   Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
   Status SetGatherBatchGetProfiling(bool enabled);
   Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const;
+  Status CheckGatherGraphReplay();
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

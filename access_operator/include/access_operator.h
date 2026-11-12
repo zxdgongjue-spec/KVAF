@@ -155,6 +155,7 @@ class DefaultAccessOperator final : public AccessOperator {
   Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
   Status SetGatherBatchGetProfiling(bool enabled);
   Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const;
+  Status CheckGatherGraphReplay();
 
  private:
   struct Impl;

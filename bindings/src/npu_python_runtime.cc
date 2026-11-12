@@ -646,6 +646,10 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->SetGatherBatchGetProfiling(true));
   }
 
+  void CheckGatherGraphReplay() {
+    ThrowIfError(native_->CheckGatherGraphReplay());
+  }
+
   py::dict GatherBatchGetProfileSnapshot() const {
     kvaf::GatherBatchGetProfile profile;
     ThrowIfError(native_->CopyGatherBatchGetProfile(&profile));
@@ -986,6 +990,9 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("start_gather_batch_get_profile",
            &NpuPythonRuntime::StartGatherBatchGetProfile,
            "Enable serial gather Host and per-core AIV timelines; use synchronize=True.")
+      .def("check_gather_graph_replay",
+           &NpuPythonRuntime::CheckGatherGraphReplay,
+           "Wait for and validate exactly one AIV gather graph replay on the capture stream.")
       .def("gather_batch_get_profile",
            &NpuPythonRuntime::GatherBatchGetProfileSnapshot,
            "Read the latest successful synchronous gather profile (Host ns, AIV cycles).")

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import aiv_batch_get_test_common as common
+import test_aiv_gather_batch_get as gather
 import test_aiv_sequential_batch_get as suite
 
 
@@ -38,12 +39,31 @@ class ModeIsolationTests(unittest.TestCase):
     def test_fixed_entry_ignores_suite_mode_selector(self):
         for name, mode in (('scatter', 'cpu_push_scatter'), ('gather', 'gather_read')):
             with patch.dict(os.environ, {'KVAF_AIV_BATCH_GET_MODES': 'invalid'}), \
+                 patch.object(sys, 'argv', [f'test_aiv_{name}_batch_get.py']), \
                  patch.object(common, 'run', return_value=0) as run:
                 with self.assertRaises(SystemExit) as result:
                     runpy.run_path(str(Path(__file__).with_name(f'test_aiv_{name}_batch_get.py')),
                                    run_name='__main__')
                 self.assertEqual(result.exception.code, 0)
                 run.assert_called_once_with(mode)
+
+    def test_gather_script_defaults_and_overrides(self):
+        with patch.dict(os.environ, clear=True), patch.object(gather, 'run', return_value=0) as run:
+            self.assertEqual(gather.main([]), 0)
+            self.assertEqual(os.environ['KVAF_NPU_CORE_COUNT'], '2')
+            self.assertEqual(os.environ['KVAF_NPU_REQUESTS'], '8192')
+            self.assertEqual(os.environ['KVAF_AIV_GATHER_GRAPH'], '0')
+            run.assert_called_once_with('gather_read')
+        overrides = {'KVAF_NPU_CORE_COUNT': '3', 'KVAF_NPU_REQUESTS': '8193',
+                     'KVAF_AIV_GATHER_GRAPH': '1'}
+        with patch.dict(os.environ, overrides, clear=True), patch.object(gather, 'run', return_value=0):
+            gather.main([])
+            for name, value in overrides.items():
+                self.assertEqual(os.environ[name], value)
+            gather.main(['--eager'])
+            self.assertEqual(os.environ['KVAF_AIV_GATHER_GRAPH'], '0')
+            gather.main(['--graph'])
+            self.assertEqual(os.environ['KVAF_AIV_GATHER_GRAPH'], '1')
 
     def test_suite_runs_next_process_after_failure(self):
         with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1',

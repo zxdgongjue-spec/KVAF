@@ -2,7 +2,7 @@
 
 Gather 当前实现与配置见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)，
 性能与排障见 [Gather 性能与排障](aiv_gather_serial_profile.md)。
-部署使用最新 Gather V10 / args 256 B，并同步更新 CPU 服务、NPU Host 和 kernel。
+部署使用最新 Gather V11 / args 256 B，并同步更新 NPU Host 和 kernel。
 
 ## 数据通路
 
@@ -37,7 +37,7 @@ GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
 | 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，256 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV10` |
+| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV11` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
@@ -95,7 +95,7 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
 - 同一 Runtime 复用 workspace，下一次 Get/Put 先 drain 上一批；
   `synchronize=False` 只表示入队成功，Tensor 和 stream 必须存活到执行完成。
-- Scatter 在 Drain/Shutdown 检查设备状态；Gather 默认在同步调用或关闭时检查状态，
+- Scatter 在 Drain/Shutdown 检查设备状态；Gather 默认在同步调用时检查状态，
   异步逐批检查可通过 `KVAF_AIV_GATHER_CHECK_STATUS=1` 启用。执行失败后拒绝继续提交；无法确认 DMA
   停止时保留注册资源，允许重试关闭。错误输出不能作为有效结果消费。
 - done 轮询有次数上限，loader 的 kernel 超时为 180 秒；轮询次数不是毫秒。
@@ -178,7 +178,7 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
 构造参数保留公共 Runtime 的位置参数契约（包括 `transport`）；`aicpu_batch_get_mode`、
 `aiv_batch_get_mode`、`aiv_gather_sgl_size` 和 `trusted_gather_inputs` 使用关键字。
 Gather SGL 范围为 1～6。`trusted_gather_inputs=True` 为默认快速路径，调用方负责正确的
-Tensor dtype、连续布局、索引、唯一输出行、生命周期和 eager stream；设为 False 使用带校验路径。
+Tensor dtype、连续布局、索引、唯一输出行和生命周期；设为 False 使用带校验路径。
 普通 Gather 每次重新读取 Tensor 指针和当前 stream，不缓存跨调用的存储地址。
 
 ```python
@@ -197,3 +197,32 @@ Scatter 的 `prepare_scatter_batch_get`、profiling 和已有 `batch_get(profile
 正确性回归使用 `test_aiv_gather_batch_get.py`，建议覆盖 1/3/8 核以及 SGL 1/5/6。
 性能脚本 `test_aiv_gather_batch_get_perf.py` 保留最新 NPU source buffer 复用、128 entries
 批量填表、分阶段初始化日志和独立计时样本；具体环境及输出见 Gather 文档。
+
+## Gather ACL Graph
+
+在初始化 Runtime 前设置 `KVAF_AIV_GATHER_GRAPH=1`。一个 Runtime 支持一次捕获，
+图中包含一个 Gather 节点。先在图外完成 BatchPut、准备 AccessTable，并用捕获 stream
+和固定输出调用一次 `batch_get(..., synchronize=True)`。随后用 `kvaf.AclGraph` 捕获
+`batch_get(..., stream=stream, synchronize=False)`。图模式预热和每次 replay 都由
+AIV 使用每核持久状态生成新序号，远端 Gather 协议沿用原格式。
+
+每轮在同一 stream 上原地更新输入，再调用 `graph.replay(stream)` 和
+`runtime.check_gather_graph_replay()`。后者同步该 stream 并核对各核的序号和执行结果，
+必须在下一次 replay 前调用。检查失败后结束当前会话。保持 Tensor、AccessTable、
+远端 KV slot 和 stream 存活，完成回放后先 `graph.reset()`，再关闭 Runtime。
+捕获后该 Runtime 专用于回放。Host profiling、prefix probe 和
+`KVAF_AIV_GATHER_CHECK_STATUS=1` 仅用于 eager 回归。
+
+在 A5/CANN 环境重新编译 NPU Host、Python 模块及 V11 kernel 后，使用现有 CPU 服务和
+kernel 路径变量运行回放测试。脚本开头可编辑核数、请求容量、token 大小、SGL 和
+Gather 流水配置，默认 2 核、8192 请求。环境变量可覆盖脚本默认值，
+`--graph` 和 `--eager` 可显式选择执行模式。
+
+```bash
+KVAF_RUN_NPU_TESTS=1 python3 tests/python/test_aiv_gather_batch_get.py --graph
+```
+
+测试先连续回放两次满批，每次改变源索引、偏移和输出行，再覆盖零请求、单请求、
+小批和满批。逐轮比对整块输出，包括未写行的哨兵。可分别用
+`KVAF_AIV_GATHER_CHUNK_BYTES=0` 和默认 chunk 跑 ACK 与 prefix 两条路径，再以
+`KVAF_AIV_GATHER_PREPARE_AHEAD=1` 验证预构建。用同一脚本加 `--eager` 覆盖 eager 回归。

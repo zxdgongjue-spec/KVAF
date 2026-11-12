@@ -59,6 +59,7 @@ struct ModelArgs {
   uint32_t pipeline_chunk_bytes{};
   uint32_t prepare_ahead{}, cooperative_chunks{}, first_chunk_divisor{};
   uint32_t head_start{};
+  bool graph_replay{};
 };
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
@@ -66,10 +67,10 @@ void Launch(const ModelArgs& a) {
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
       a.sequence, a.max_polls, a.reserved});
   } else {
-    KvafGatherBatchGetAivKernelV10({a.request, a.workspace, a.workspace_bytes,
+    KvafGatherBatchGetAivKernelV11({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
       a.lane_staging_bytes, a.remote_staging, a.remote_descriptor, a.remote_control,
-      a.source_base, a.source_bytes, a.sequence, a.sgl_size, a.max_polls, a.profile,
+      a.source_base, a.source_bytes, a.graph_replay ? 0 : a.sequence, a.sgl_size, a.max_polls, a.profile,
       a.gather_probe, a.coalesce_sges, a.pipeline_chunk_bytes, a.prepare_ahead,
       a.cooperative_chunks, a.first_chunk_divisor, a.head_start});
   }
@@ -854,8 +855,33 @@ void Poll(void* p) {
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
-  const auto& metadata = KvafGatherBatchGetAivKernelV10_kernel_type_section.value;
+  const auto& metadata = KvafGatherBatchGetAivKernelV11_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
+  for (uint32_t chunk : {0U, 4096U}) {
+    Fixture f(3075, 656, 3, KVAF_SEQ_GATHER, 6);
+    f.args.graph_replay = true;
+    f.args.pipeline_chunk_bytes = chunk;
+    f.args.prepare_ahead = chunk != 0;
+    f.args.head_start = 1;
+    // Every Run uses identical launch args. Next changes input contents and the
+    // model's expected sequence while preserving the old ACK and queue indices.
+    f.Run();
+    for (uint32_t active : {3075U, 0U, 1U, 3075U}) {
+      f.Next(active);
+      f.Run();
+    }
+  }
+  {
+    Fixture f(8, 656, 1, KVAF_SEQ_GATHER, 6);
+    f.args.graph_replay = true;
+    f.ack_error = true;
+    f.Run(false);
+    assert(f.status[0].result == KVAF_SEQ_REMOTE_ERROR);
+    f.ack_error = false;
+    f.active = 0;
+    f.Run(false);
+    assert(f.status[0].result == KVAF_SEQ_REMOTE_ERROR && f.status[0].sequence == 1);
+  }
   // Stage 1: WQEs precede the final ACK, but no payload READ does. Stage 2's
   // prefix gate must also submit a short ready slice of a 128-WR UB bank.
   for (uint32_t chunk : {0U, 64U, 4096U, 131072U})

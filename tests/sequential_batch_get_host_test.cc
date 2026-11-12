@@ -19,6 +19,7 @@
 
 namespace {
 std::vector<std::function<void()>> work;
+std::function<void()> graph_task;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 void* mailbox_jetty{};
@@ -122,6 +123,20 @@ extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, v
 }
 extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_GATHER);
+  if (!a->sequence) {
+    const auto args = *a;
+    auto execute = [args] {
+      auto* status = reinterpret_cast<KvafSequentialStatus*>(args.request.core_status);
+      for (uint32_t i = 0; i < args.request.block_count; ++i) {
+        const auto sequence = status[i].sequence + 1;
+        status[i] = {KVAF_SEQ_STATUS_MAGIC, sequence, kernel_result,
+                     kernel_result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE, 0, 0, 0, 0};
+      }
+    };
+    if (capturing) graph_task = execute;
+    else work.push_back(execute);
+    return 0;
+  }
   last_coalesce_sges = a->coalesce_sges;
   last_pipeline_chunk_bytes = a->pipeline_chunk_bytes;
   last_prepare_ahead = a->prepare_ahead;
@@ -309,6 +324,7 @@ int main() {
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   unsetenv("KVAF_AIV_GATHER_PROBE");
   unsetenv("KVAF_AIV_GATHER_COALESCE_SGES");
+  unsetenv("KVAF_AIV_GATHER_GRAPH");
   // Keep strict status-failure coverage, now an explicit async diagnostic mode.
   setenv("KVAF_AIV_GATHER_CHECK_STATUS", "1", 1);
   AccessOperatorConfig config;
@@ -699,6 +715,48 @@ int main() {
     assert(owner->Execute(exec).ok() && capture_queries == before + 1);
     assert(owner->Shutdown().ok() && !refs && !allocations);
   }
+  setenv("KVAF_AIV_GATHER_GRAPH", "1", 1);
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    assert(!owner->SetGatherProfiling(true).ok());
+    exec.execution.trusted_npu_request = true;
+    exec.execution.synchronize = false;
+    capturing = true;
+    assert(!owner->Execute(exec).ok() && !graph_task);
+    capturing = false;
+    exec.execution.synchronize = true;
+    assert(owner->Execute(exec).ok());
+    const auto syncs = stream_syncs, copies = status_copies;
+    exec.execution.synchronize = false;
+    capturing = true;
+    exec.execution.stream = reinterpret_cast<void*>(2);
+    assert(!owner->Execute(exec).ok() && !graph_task);
+    exec.execution.stream = reinterpret_cast<void*>(1);
+    uint8_t other_output[sizeof(output)]{};
+    request.output = {other_output, sizeof(other_output), npu};
+    assert(!owner->Execute(exec).ok() && !graph_task);
+    request.output = {output, sizeof(output), npu};
+    assert(owner->Execute(exec).ok() && graph_task && work.empty());
+    assert(!owner->CheckGatherGraphReplay().ok());
+    assert(stream_syncs == syncs && status_copies == copies);
+    capturing = false;
+    assert(!owner->Execute(exec).ok() && !owner->Drain().ok());
+    for (int i = 0; i < 2; ++i) {
+      work.push_back(graph_task);
+      assert(owner->CheckGatherGraphReplay().ok() && work.empty());
+    }
+    work.push_back(graph_task);
+    kernel_result = KVAF_SEQ_REMOTE_ERROR;
+    assert(owner->CheckGatherGraphReplay().code() == StatusCode::kInternal);
+    assert(!owner->CheckGatherGraphReplay().ok());
+    kernel_result = 0;
+    graph_task = {};
+    assert(owner->Shutdown().ok() && !refs && !allocations);
+    exec.execution.trusted_npu_request = false;
+    exec.execution.synchronize = true;
+  }
+  unsetenv("KVAF_AIV_GATHER_GRAPH");
   for (const char* name : {"KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_AIV_GATHER_PACKED_POSTS",
                            "KVAF_AIV_GATHER_PROGRESS_MODE"}) {
     setenv(name, "0", 1);
