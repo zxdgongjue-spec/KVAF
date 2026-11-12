@@ -7,19 +7,13 @@
 使用已经跑通 aicpu-urma 的同一套 liburma、provider 和头文件。在 CPU 环境中：
 
 ```bash
-cmake -S . -B build-cpu-pull-reference \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
-  -DKVAF_ENABLE_CPU_OFFLOAD=OFF \
-  -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
-  -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
-  -DBUILD_TESTING=OFF
-cmake --build build-cpu-pull-reference -j8
-./build-cpu-pull-reference/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+./build.sh cpu
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
 ```
 
-若 URMA 未安装在默认路径，配置时增加 `-DKVAF_URMA_ROOT=/实际安装目录`，或分别设置
-`KVAF_URMA_INCLUDE_DIR` 和 `KVAF_URMA_LIBRARY`。保留该环境运行参考分支所需的动态库搜索路径。
+默认输出目录为 `build-cpu`，可用 `./build.sh cpu --build-dir build-cpu-pull-reference`
+继续使用已有目录。非默认 UMDK 环境可设置 `KVAF_UMDK_ROOT=/实际源码或安装目录` 和
+`KVAF_URMA_LIBRARY=/实际路径/liburma.so`。保留该环境运行参考分支所需的动态库搜索路径。
 确认旧服务已停止后再启动新服务。候选 ID 以新进程的 `CANDIDATE_DISCOVERED` 日志为准。
 
 ## NPU Python 扩展
@@ -28,23 +22,21 @@ cmake --build build-cpu-pull-reference -j8
 的 Python：
 
 ```bash
-cmake -S . -B build-offload-reference \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DKVAF_ENABLE_CPU_OFFLOAD=ON \
-  -DKVAF_BUILD_PYTHON=ON \
-  -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
-  -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
-  -DBUILD_TESTING=OFF \
-  -DPython_EXECUTABLE="$(command -v python)"
-cmake --build build-offload-reference -j8
-export PYTHONPATH="$PWD/build-offload-reference/python${PYTHONPATH:+:$PYTHONPATH}"
-python -c 'import kvaf; print(kvaf.__file__); print(kvaf.NpuRuntime.batch_cpu_pull)'
+PYTHON="$(command -v python)" ./build.sh npu
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+python -c 'import kvaf; print(kvaf.__file__); print(kvaf.NpuRuntime.batch_cpu_pull); print(kvaf.NpuRuntime.cancel_cpu_pull)'
 ```
+
+默认同时编译 CPU Pull 和 NPU AIV BatchGet/BatchPut、raw HBM READ。
+仅编译当前 CPU Pull 路径时使用 `./build.sh npu --cpu-pull-only`，不需要 AIV 编译器；
+两种模式都输出到 `build-npu`。可通过 `--build-dir build-offload-reference` 继续使用旧目录。
+脚本默认使用 `python3`；使用其他 Python 环境时按上例设置 `PYTHON`，所有 Python CMake 检测
+使用同一解释器。两端均支持 `--jobs 8` 设置编译并行度。
 
 CANN 默认位置为 `/usr/local/Ascend/ascend-toolkit/latest`；也可通过
 `ASCEND_CANN_PACKAGE_PATH` 或 `ASCEND_HOME_PATH` 环境变量、或 CMake
-`-DASCEND_CANN_PACKAGE_PATH=/实际目录` 指定。此构建只需要 CANN host runtime，
-不编译 AIV kernel。最后一条命令应指向新构建目录内的 kvaf。
+`-DASCEND_CANN_PACKAGE_PATH=/实际目录` 指定。`--cpu-pull-only` 只需要 CANN host runtime，
+默认完整构建还需要 AIV kernel 工具链。最后一条命令应指向新构建目录内的 kvaf。
 
 ## 统一 CPU Pull 便利入口
 
@@ -176,11 +168,11 @@ CPU 服务开启统计后，每个源连接独立累计 READ 样本，正常注�
 失败时也会输出当时的汇总。探测与校验 RPC 不计入样本。可沿用已有构建目录，例如：
 
 ```bash
-cmake --build build-cpu-shared-ddr -j8
+./build.sh cpu --jobs 8
 KVAF_CPU_PULL_PROFILE=1 \
 KVAF_CPU_PULL_PROFILE_WARMUP=10 \
 KVAF_CPU_PULL_PROFILE_EACH=0 \
-  ./build-cpu-shared-ddr/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
+  ./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 28999
 ```
 
 `KVAF_CPU_PULL_PROFILE_WARMUP` 默认为 0，按每个源连接的 READ 调用次数排除前 N 批，

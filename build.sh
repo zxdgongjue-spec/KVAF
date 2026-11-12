@@ -14,12 +14,15 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N]
+Usage: ./build.sh <cpu|npu> [--build-dir DIR] [--jobs N] [--cpu-pull-only]
 
 cpu  Builds the liburma-only CPU Runtime service. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
-npu  Builds the CANN AIV BatchGet/BatchPut Runtime and Python binding. It
-     installs pybind11 for the selected Python interpreter when necessary.
+npu  Builds CPU Pull, CANN AIV BatchGet/BatchPut, raw HBM READ and the Python
+     binding. Use --cpu-pull-only to omit AIV kernels and their compiler.
+     Installs pybind11 for the selected Python interpreter when necessary.
+
+Default output directories: build-cpu and build-npu.
 
 Environment overrides:
   KVAF_UMDK_ROOT       UMDK source/header root for the CPU build
@@ -119,7 +122,13 @@ build_cpu() {
   [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DBUILD_TESTING=OFF \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+    -DKVAF_BUILD_PYTHON=OFF \
+    -DKVAF_ENABLE_CPU_OFFLOAD=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_GET=OFF \
+    -DKVAF_ENABLE_AIV_BATCH_PUT=OFF \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
   cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
@@ -143,31 +152,42 @@ find_cann_root() {
 build_npu() {
   local build_dir="$1"
   local jobs="$2"
+  local aiv_enabled="$3"
   local python_bin="${PYTHON:-python3}"
   local cann_root
   local pybind11_dir
 
   require_command cmake
   require_command "$python_bin"
+  python_bin="$("$python_bin" -c 'import sys; print(sys.executable)')"
   cann_root="$(find_cann_root)"
   [[ -n "$cann_root" ]] || die "CANN toolkit was not found; source CANN set_env.sh or set ASCEND_CANN_PACKAGE_PATH"
   if ! "$python_bin" -m pybind11 --cmakedir >/dev/null 2>&1; then
     echo "[KVAF_BUILD] installing pybind11 for $python_bin"
     "$python_bin" -m pip install --user pybind11
   fi
-  pybind11_dir="$($python_bin -m pybind11 --cmakedir)"
+  pybind11_dir="$("$python_bin" -m pybind11 --cmakedir)"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DBUILD_TESTING=ON \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF \
     -DKVAF_BUILD_PYTHON=ON \
-    -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-    -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
+    -DKVAF_ENABLE_CPU_OFFLOAD=ON \
+    -DKVAF_ENABLE_AIV_BATCH_GET="$aiv_enabled" \
+    -DKVAF_ENABLE_AIV_BATCH_PUT="$aiv_enabled" \
+    -DPython_EXECUTABLE="$python_bin" \
+    -DPython3_EXECUTABLE="$python_bin" \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     -Dpybind11_DIR="$pybind11_dir"
   cmake --build "$build_dir" --parallel "$jobs"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
-  echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
-  echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  echo "[KVAF_BUILD] CPU Pull: enabled"
+  if [[ "$aiv_enabled" == ON ]]; then
+    echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
+    echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+  fi
+  printf 'export PYTHONPATH="%s/python${PYTHONPATH:+:$PYTHONPATH}"\n' "$build_dir"
 }
 
 mode="${1:-}"
@@ -179,6 +199,7 @@ esac
 
 build_dir="$KVAF_ROOT/build-$mode"
 jobs="$(default_jobs)"
+aiv_enabled=ON
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -191,6 +212,11 @@ while [[ $# -gt 0 ]]; do
       jobs="$2"
       shift 2
       ;;
+    --cpu-pull-only)
+      [[ "$mode" == npu ]] || die "--cpu-pull-only is only valid with npu"
+      aiv_enabled=OFF
+      shift
+      ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -199,5 +225,5 @@ done
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"
 else
-  build_npu "$build_dir" "$jobs"
+  build_npu "$build_dir" "$jobs" "$aiv_enabled"
 fi

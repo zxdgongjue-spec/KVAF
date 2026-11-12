@@ -293,8 +293,9 @@ Direct-HCCP BatchPut 路径，不使用 demo test binary 或 ACL D2H mock。默�
 `runtime.batch_put()` 到 stream 完成的 mean、p50、p90、p99 和有效 GB/s。
 
 BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因此
-`build.sh npu` 一次构建两个 AIV kernel、host transport 与 Python binding。端到端
-正确性入口与上节相同；它会在 BatchGet 前验证 AIV Direct-HCCP BatchPut。
+`build.sh npu` 一次构建两个 AIV kernel、host transport 与 Python binding，并启用 CPU Pull。
+只使用 CPU Pull 时可运行 `./build.sh npu --cpu-pull-only`，同样输出到 `build-npu`。
+端到端正确性入口与上节相同；它会在 BatchGet 前验证 AIV Direct-HCCP BatchPut。
 
 测试规模复用 BatchGet 的 `KVAF_NPU_REQUESTS`、`KVAF_NPU_TOKEN_BYTES`、
 `KVAF_NPU_TOKENS_PER_BLOCK`、

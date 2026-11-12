@@ -160,12 +160,31 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ./build.sh npu
 ```
 
+默认同时启用 CPU Pull、NPU raw HBM READ 和 AIV BatchGet/BatchPut。
+脚本将当前选定的 Python 传给 CMake；可用 `PYTHON="$(command -v python)" ./build.sh npu`
+选择已安装 torch_npu 的解释器。
+
+只运行 CPU Pull、不需要编译 AIV kernel 时：
+
+```bash
+./build.sh npu --cpu-pull-only
+```
+
+两种模式都输出到 `build-npu`，重复执行会更新该目录的配置。
+可用 `--build-dir DIR` 指定其他目录，`--jobs N` 指定并行度。
+
 构建结果包括：
 
 ```text
 build-npu/python/kvaf/
 build-npu/bin/kvaf_execute_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
+```
+
+使用 `--cpu-pull-only` 时只更新 Python 包及 CPU Pull 所需库。运行前设置：
+
+```bash
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 
