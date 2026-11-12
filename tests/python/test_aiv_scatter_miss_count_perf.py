@@ -20,6 +20,7 @@ import sys
 import time
 
 import test_npu_batch_get_perf as reference
+from aiv_batch_get_common import capture_acl_graph, close_acl_graph
 from aiv_batch_get_test_common import shutdown_runtime
 from dsa_keys import build_dsa_keys
 from scatter_perf_common import PAYLOAD_TIMINGS, SCATTER_CHUNK_ROWS, profile_metrics, sample_metrics
@@ -33,6 +34,7 @@ SUBMISSION_CONFIG = {"host_submit": "prepared", "completion_mode": "reference"}
 STAGES = {
     "end_to_end_ns": "end_to_end", "host_call_ns": "host_call",
     "aiv_body_ns": "kernel_total", "device_sync_ns": "device_sync",
+    "status_validation_ns": "status_check", "checked_e2e_ns": "checked_e2e",
     "aiv_wall_ns": "kernel_wall", "cpu_comm_ns": "cpu_comm",
     "cpu_write_ns": "cpu_write", "aiv_build_notify_ns": "build_notify",
     "aiv_scatter_ns": "scatter", "call_outside_aiv_ns": "call_outside_aiv",
@@ -40,8 +42,12 @@ STAGES = {
 SUMMARY_COLUMNS = (
     "token_bytes", "miss_count", "aiv_cores", "jettys_per_core", "cpu_jettys",
     "phase", "completion_mode", "stage", "mean_us", "p50_us", "p99_us", "p90_us",
-    "effective_GBps", "p50_GBps", "case_json",
+    "effective_GBps", "p50_GBps", "case_json", "execution", "compare_round",
 )
+COMPARISON_TIMINGS = {
+    "end_to_end_ns": "e2e", "host_call_ns": "submit",
+    "status_validation_ns": "status_check", "checked_e2e_ns": "checked_e2e",
+}
 
 
 def positive_list(value):
@@ -63,6 +69,10 @@ def arguments(argv=None):
                "--kernel-profile/--no-kernel-profile, --sort-input-indices, --npu-eids, --peer-ub-device.")
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--single", action="store_true", help="one case; default is the miss-count sweep")
+    parser.add_argument("--execution", choices=("eager", "graph", "compare"), default="eager",
+                        help="compare pairs unprofiled eager and graph with the same request plan")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="comparison pairs per case, alternating which mode runs first")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="print plan without importing torch/kvaf")
     parser.add_argument("--token-sizes", type=positive_list)
@@ -78,7 +88,7 @@ def arguments(argv=None):
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
-        remaining.append("--kernel-profile")  # Reference sweep profiles every formal case.
+        remaining.append("--kernel-profile" if extra.execution == "eager" else "--no-kernel-profile")
     args = reference.parse_args(remaining)
     vars(args).update(vars(extra))
     args.build = args.build.expanduser().resolve()
@@ -92,6 +102,12 @@ def arguments(argv=None):
         args.pipeline = int(value)
     if args.host_profile is None:
         args.host_profile = False  # Reference sweep enables device profiling, not Host RAII clocks.
+    if args.execution != "eager" and (args.kernel_profile or args.host_profile):
+        parser.error("graph and compare require profiling off; use eager for phase timings")
+    if args.rounds < 1 or (args.execution != "compare" and args.rounds != 1):
+        parser.error("multiple rounds require --execution compare and rounds must be positive")
+    if args.execution == "compare" and (args.worker or args.json or args.csv):
+        parser.error("compare writes paired worker outputs under --output-dir")
     if args.single and any((args.token_sizes, args.miss_counts, args.core_counts)):
         parser.error("use scalar options with --single; list options select a sweep")
     if not args.single and (args.json or args.csv):
@@ -215,7 +231,10 @@ def statistics_ns(values, payload=None):
     return result
 
 
-def complete_outside_measurement(runtime, profiling):
+def complete_outside_measurement(runtime, profiling, graph_replay=False):
+    if graph_replay:
+        runtime.check_scatter_graph_replay()
+        return None
     if profiling:
         # Snapshot drains/checks all business statuses before copying records.
         return list(runtime.scatter_profile())
@@ -232,7 +251,9 @@ def warmup_calls(runtime, torch, args, refresh_inputs, submit):
         torch.npu.synchronize()
         submit()
         torch.npu.synchronize()
-    if args.warmup:
+        if args.execution == "graph":
+            runtime.check_scatter_graph_replay()
+    if args.warmup and args.execution == "eager":
         # No last-warmup status drain may spill into the first timed Execute.
         complete_outside_measurement(runtime, args.kernel_profile)
 
@@ -243,6 +264,9 @@ def measure_call(runtime, torch, args, iteration, submit, clock=time.perf_counte
     submitted = clock()
     torch.npu.synchronize()
     completed = clock()
+    if not args.kernel_profile:
+        complete_outside_measurement(runtime, False, graph_replay=args.execution == "graph")
+        checked = clock()
     sample = dict(iteration=iteration, payload_bytes=args.miss_count * args.token_bytes,
                   end_to_end_ns=completed - begin, host_call_ns=submitted - begin,
                   device_sync_ns=completed - submitted)
@@ -254,9 +278,8 @@ def measure_call(runtime, torch, args, iteration, submit, clock=time.perf_counte
         sample["workers"] = records
         sample["snapshot_ns"] = clock() - begin
     else:
-        begin = clock()
-        complete_outside_measurement(runtime, False)
-        sample["status_validation_ns"] = clock() - begin
+        sample["status_validation_ns"] = checked - completed
+        sample["checked_e2e_ns"] = checked - begin
     return sample_metrics(sample)
 
 
@@ -276,6 +299,10 @@ def run_case(args):
     backend = detect_torch_backend()
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("requested hardware benchmark requires torch_npu and NpuRuntime")
+    graph_mode = args.execution == "graph"
+    if graph_mode and (not hasattr(kvaf, "AclGraph") or
+                       not hasattr(kvaf.NpuRuntime, "check_scatter_graph_replay")):
+        raise RuntimeError("rebuild KVAF Host, Python and AIV kernel for scatter graph replay")
     torch = backend.torch
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     torch.npu.set_device(device_id)
@@ -285,6 +312,7 @@ def run_case(args):
     payload = args.miss_count * args.token_bytes
     os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
     os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
+    os.environ["KVAF_AIV_SCATTER_GRAPH"] = str(int(graph_mode))
     runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
         device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
         batch_put_kernel_object_path=str(put_kernel), npu_eids=args.npu_eids,
@@ -308,7 +336,8 @@ def run_case(args):
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
         input_mode="steady_table_new_request_plan_per_call", calls_per_sample=1,
-        timing="enqueue_then_global_device_sync", stream_selection="fixed_stream_per_call_task_queue_fence",
+        timing="enqueue_then_global_device_sync",
+        stream_selection=("capture_stream" if graph_mode else "fixed_stream_per_call_task_queue_fence"),
         input_storage="fixed_buffers_refreshed_per_call", host_timing_matches_reference=False,
         completion_scope="device",
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",
@@ -325,7 +354,7 @@ def run_case(args):
     print("SCATTER_ALIGNED_CONFIG " + json.dumps(config, sort_keys=True), flush=True)
     phase = "profiled" if args.kernel_profile else "baseline"
     report = dict(config=config, setup_us={}, samples={phase: []}, summary={})
-    table = None
+    table = graph = stream = None
     try:
         with setup_phase(report, "initialize", ddr_bytes=config["ddr_bytes"],
                          table_capacity=args.table_capacity):
@@ -362,6 +391,14 @@ def run_case(args):
                     torch.count_nonzero(output[args.miss_count:]).item():
                 raise AssertionError("aligned scatter wrote outside active output prefix")
 
+        def verify_graph_replay():
+            rows = fixed_inputs[2][:args.miss_count].cpu().to(torch.int64)
+            slots = fixed_inputs[1][:args.miss_count].cpu().to(torch.int64) // args.token_bytes
+            expected = torch.full(output.shape, 0xAD, dtype=torch.uint8, device="cpu")
+            expected.index_copy_(0, rows, pattern.cpu().index_select(0, slots))
+            if not torch.equal(output.cpu(), expected):
+                raise AssertionError("scatter graph replay payload/guard mismatch")
+
         log_phase("preflight", "begin")
         request_ids = torch.arange(args.request_length, dtype=torch.int64, device=device)
         linear = request_ids % (args.table_capacity * args.tokens_per_block)
@@ -374,10 +411,13 @@ def run_case(args):
             preflight = reference.sort_request_plan_prefix(torch, view.addresses, *preflight, args.miss_count)
         # Keep this storage for the entire case and refresh its contents in place.
         fixed_inputs = preflight
+        if graph_mode:
+            stream = torch.npu.current_stream()
         with setup_phase(report, "prepare_submit"):
-            submit = runtime.prepare_scatter_batch_get(
+            prepared_submit = runtime.prepare_scatter_batch_get(
                 view, fixed_inputs[0], fixed_inputs[1], count, fixed_inputs[2], output,
-                synchronize=False)
+                stream=stream, synchronize=False)
+        submit = prepared_submit
         output.zero_()
         submit()
         torch.npu.synchronize()
@@ -390,6 +430,29 @@ def run_case(args):
         print("SCATTER_ALIGNED_CORRECTNESS_PASS active_prefix_and_guard=1", flush=True)
         log_phase("preflight", "end")
         contiguous_source_token_ids = request_ids % (args.table_capacity * args.tokens_per_block)
+        if graph_mode:
+            with setup_phase(report, "capture"):
+                graph = kvaf.AclGraph()
+                capture_acl_graph(graph, stream, prepared_submit, label="SCATTER_GRAPH")
+
+            def replay():
+                graph.replay(stream)
+
+            submit = replay
+            with setup_phase(report, "graph_preflight"):
+                for replay in range(2):
+                    if replay:
+                        slots = (preflight_slots + 1) % args.tokens_per_block
+                        fixed_inputs[1].copy_((slots * args.token_bytes).to(torch.int32))
+                        fixed_inputs[2].copy_((args.request_length - 1 - request_ids).to(torch.int32))
+                    output.fill_(0xAD)
+                    torch.npu.synchronize()
+                    submit()
+                    runtime.check_scatter_graph_replay()
+                    verify_graph_replay()
+
+            # Restore the eager preflight guard before the timed request plans.
+            output.zero_()
 
         def refresh_inputs():
             plan = generate_request_plan(torch, args, device, request_ids, view.addresses,
@@ -426,7 +489,11 @@ def run_case(args):
     finally:
         # Preserve the execution exception if an aborted device also fails teardown.
         log_phase("teardown", "begin")
-        close_case(runtime, table)
+        try:
+            if graph is not None:
+                close_acl_graph(graph, stream, label="SCATTER_GRAPH")
+        finally:
+            close_case(runtime, table)
         log_phase("teardown", "end")
 
 
@@ -473,6 +540,7 @@ def refresh_request_buffers(plan, fixed_inputs):
 
 def case_command(args):
     command = [sys.executable, str(Path(__file__).resolve()), "--build", str(args.build), "--single", "--worker"]
+    command.extend(("--execution", args.execution))
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
                  "aiv_cores", "jettys_per_core", "warmup", "iterations", "populate_chunk_entries",
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
@@ -494,28 +562,68 @@ def summary_rows(report, json_path):
     return [dict(token_bytes=config["token_bytes"], miss_count=config["miss_count"],
                  aiv_cores=config["aiv_cores"], jettys_per_core=config["jettys_per_core"],
                  cpu_jettys=CPU_JETTYS, phase=phase, completion_mode=config["completion_mode"],
-                 stage=stage, case_json=str(json_path),
+                 stage=stage, case_json=str(json_path), execution=config["execution"],
                  **{k: stats[k] for k in SUMMARY_COLUMNS if k in stats})
             for phase, metrics in report["summary"].items()
             for key, stage in STAGES.items() if (stats := metrics.get(key)) is not None]
+
+
+def comparison_cases(args):
+    for case in cases(args):
+        for round_index in range(1, args.rounds + 1):
+            order = ("eager", "graph") if round_index % 2 else ("graph", "eager")
+            for execution in order:
+                run = copy.copy(case)
+                run.execution = execution
+                run.compare_round = round_index
+                yield run
+
+
+def comparison_row(case, pair):
+    row = dict(token_bytes=case.token_bytes, miss_count=case.miss_count, aiv_cores=case.aiv_cores,
+               compare_round=case.compare_round, order=",".join(pair))
+    for key, stage in COMPARISON_TIMINGS.items():
+        for execution in ("eager", "graph"):
+            stats = pair[execution][key]
+            for stat in ("mean_us", "p50_us", "p99_us"):
+                row[f"{execution}_{stage}_{stat}"] = stats[stat]
+        row[f"{stage}_p50_saved_us"] = row[f"eager_{stage}_p50_us"] - row[f"graph_{stage}_p50_us"]
+    row["e2e_p50_speedup"] = row["eager_e2e_p50_us"] / row["graph_e2e_p50_us"]
+    return row
+
+
+def write_summary(path, columns, rows):
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, columns)
+        writer.writeheader()
+        writer.writerows({k: f"{v:.3f}" if k.endswith("_us") else
+                         f"{v:.6f}" if isinstance(v, float) else v
+                         for k, v in row.items()} for row in rows)
 
 
 def main(argv=None, runner=None):
     args = arguments(argv)
     if args.worker and not args.dry_run:
         return run_case(args)
-    selected = cases(args)
+    comparing = args.execution == "compare"
+    selected = list(comparison_cases(args)) if comparing else cases(args)
+    single_output = args.single and not comparing
     root = args.output_dir or Path("results") / f"scatter-miss-{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
     for case in selected:
         name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_reference_prepared"
+        if comparing:
+            name += f"_{case.execution}_r{case.compare_round}"
+        elif case.execution == "graph":
+            name += "_graph"
         case.json = case.json or root / (name + ".json")
         case.csv = case.csv or root / (name + ".csv")
-    summary_path = args.csv.with_suffix(".summary.csv") if args.single else root / "summary.csv"
-    if args.single and summary_path.resolve() in (
+    summary_path = args.csv.with_suffix(".summary.csv") if single_output else root / "summary.csv"
+    if single_output and summary_path.resolve() in (
         args.json.resolve(), args.csv.resolve(), args.json.with_suffix(".log").resolve(),
     ):
         raise ValueError("summary CSV must differ from the case JSON, sample CSV and log")
-    plan = dict(mode="cpu_push_scatter", cpu_jettys=CPU_JETTYS, **SUBMISSION_CONFIG,
+    plan = dict(mode="cpu_push_scatter", execution=args.execution, rounds=args.rounds,
+                cpu_jettys=CPU_JETTYS, **SUBMISSION_CONFIG,
                 unsupported_reference_cores=[16, 32], jetty_axis="fixed_CPU_4_not_per_AIV_core",
                 cases=[dict(command=case_command(case), payload_bytes=case.miss_count * case.token_bytes,
                             ddr_bytes=case.table_capacity * case.tokens_per_block * case.token_bytes,
@@ -525,15 +633,16 @@ def main(argv=None, runner=None):
     if args.dry_run:
         print(json.dumps(dict(dry_run=True, combinations=len(selected), **plan), indent=2))
         return 0
-    if not args.single:
+    if not single_output:
         root.mkdir(parents=True, exist_ok=True)
         (root / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     rows = []
+    pair, comparison_rows = {}, []
     runner = runner or subprocess.run
     for index, case in enumerate(selected):
         print(f"SCATTER_ALIGNED_SWEEP_BEGIN case={index+1}/{len(selected)} token_bytes={case.token_bytes} "
               f"miss_count={case.miss_count} aiv_cores={case.aiv_cores} cpu_jettys={CPU_JETTYS} "
-              "host_submit=prepared completion_mode=reference", flush=True)
+              f"host_submit=prepared completion_mode=reference execution={case.execution}", flush=True)
         case.json.parent.mkdir(parents=True, exist_ok=True)
         with case.json.with_suffix(".log").open("w", encoding="utf-8") as log:
             try:
@@ -551,7 +660,7 @@ def main(argv=None, runner=None):
         expected = {key: getattr(case, key) for key in (
             "request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
             "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
-            "sort_input_indices", "pipeline")}
+            "sort_input_indices", "pipeline", "execution", "kernel_profile")}
         expected.update(SUBMISSION_CONFIG)
         for key, value in expected.items():
             if report["config"].get(key) != value:
@@ -564,20 +673,28 @@ def main(argv=None, runner=None):
         if not case.csv.is_file():
             raise ValueError("case completed without its sample CSV")
         current_rows = summary_rows(report, case.json)
+        if comparing:
+            for row in current_rows:
+                row["compare_round"] = case.compare_round
         rows.extend(current_rows)
         for row in current_rows:
             print("SCATTER_ALIGNED_SWEEP_RESULT " + json.dumps(row, sort_keys=True), flush=True)
-        with summary_path.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, SUMMARY_COLUMNS)
-            writer.writeheader()
-            writer.writerows({k: f"{v:.3f}" if k.endswith("_us") else
-                             f"{v:.6f}" if k in ("effective_GBps", "p50_GBps") else v
-                             for k, v in row.items()} for row in rows)
-    if args.single:
+        write_summary(summary_path, SUMMARY_COLUMNS, rows)
+        if comparing:
+            pair[case.execution] = report["summary"][phase]
+            if len(pair) == 2:
+                result = comparison_row(case, pair)
+                comparison_rows.append(result)
+                write_summary(root / "comparison.csv", result.keys(), comparison_rows)
+                print("SCATTER_ALIGNED_COMPARE " + json.dumps(result, sort_keys=True), flush=True)
+                pair.clear()
+    if single_output:
         print(f"SCATTER_ALIGNED_CASE_DONE json={args.json} csv={args.csv} "
               f"log={args.json.with_suffix('.log')} summary={summary_path}", flush=True)
     else:
         print(f"SCATTER_ALIGNED_SWEEP_DONE combinations={len(selected)} summary={summary_path}", flush=True)
+    if comparing:
+        print(f"SCATTER_ALIGNED_COMPARE_DONE pairs={len(comparison_rows)} csv={root / 'comparison.csv'}", flush=True)
     return 0
 
 

@@ -18,6 +18,9 @@ class SequentialBatchGet {
   virtual Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>*) {
     return Status::NotImplemented("scatter profiling requires cpu_push_scatter");
   }
+  virtual Status CheckScatterGraphReplay() {
+    return Status::NotImplemented("scatter graph requires cpu_push_scatter");
+  }
   virtual Status SetGatherProfiling(bool) {
     return Status::NotImplemented("gather profiling requires gather_read mode");
   }

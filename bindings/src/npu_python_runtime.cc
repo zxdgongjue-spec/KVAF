@@ -555,6 +555,9 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->SetScatterProfiling(false));
     host_profile_enabled_ = host_profile_ready_ = false;
   }
+  void CheckScatterGraphReplay() {
+    ThrowIfError(native_->CheckScatterGraphReplay());
+  }
   py::list ScatterProfileSnapshot() const {
     std::vector<kvaf::ScatterBatchGetCoreProfile> profiles;
     ThrowIfError(native_->CopyScatterProfiles(&profiles));
@@ -965,6 +968,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("scatter_profile", &NpuPythonRuntime::ScatterProfileSnapshot,
            "Drain and copy the latest scatter timing records outside the measured call.")
       .def("stop_scatter_profile", &NpuPythonRuntime::StopScatterProfile)
+      .def("check_scatter_graph_replay", &NpuPythonRuntime::CheckScatterGraphReplay,
+           "Wait for and validate exactly one AIV scatter graph replay on the capture stream.")
       .def("start_batch_get_kernel_profile",
            &NpuPythonRuntime::StartBatchGetKernelProfile,
            py::arg("detailed") = false,

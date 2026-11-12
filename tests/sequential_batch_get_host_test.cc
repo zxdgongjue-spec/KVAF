@@ -119,6 +119,19 @@ extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, v
     assert(words[2] == (1U << 24 | mailbox.entity.tp_id));
   }
   assert((a->workspace + a->workspace_bytes) % 64 == 0);
+  if (kvaf::ScatterOptionEnabled(a->reserved, kvaf::kScatterGraphReplay)) {
+    assert(capturing && !a->sequence);
+    const auto request = a->request;
+    graph_task = [request] {
+      auto* status = reinterpret_cast<KvafSequentialStatus*>(request.core_status);
+      for (uint32_t i = 0; i < request.block_count; ++i) {
+        const auto sequence = status[i].sequence + 1;
+        status[i] = {KVAF_SEQ_STATUS_MAGIC, sequence, kernel_result,
+                     kernel_result ? KVAF_SEQ_WAIT_REMOTE : KVAF_SEQ_COMPLETE, 0, 0, 0, 0};
+      }
+    };
+    return 0;
+  }
   return Launch(a);
 }
 extern "C" int32_t KvafGatherBatchGetLaunch(const KvafGatherBatchGetArgs* a, void*) {
@@ -522,6 +535,44 @@ int main() {
     assert(!owner->Shutdown().ok()); assert(!refs && !allocations && !hccp_refs);
     assert(owner->Shutdown().ok()); kernel_result = 0;
   }
+  setenv("KVAF_AIV_SCATTER_GRAPH", "1", 1);
+  for (const bool missing_replay : {false, true}) {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && !owner->SetScatterProfiling(true).ok());
+    assert(!owner->CheckScatterGraphReplay().ok());
+    exec.execution.synchronize = false;
+    exec.execution.trusted_npu_request = true;
+    assert(owner->Execute(exec).ok());
+    capturing = true;
+    assert(!owner->Execute(exec).ok() && !graph_task);
+    capturing = false;
+    assert(owner->Drain().ok());
+    const auto syncs = stream_syncs, copies = status_copies;
+    capturing = true;
+    exec.execution.synchronize = true;
+    assert(!owner->Execute(exec).ok() && !graph_task);
+    exec.execution.synchronize = false;
+    assert(owner->Execute(exec).ok() && graph_task && work.empty());
+    assert(!owner->CheckScatterGraphReplay().ok());
+    assert(stream_syncs == syncs && status_copies == copies);
+    capturing = false;
+    assert(!owner->Execute(exec).ok() && !owner->Drain().ok());
+    for (int i = 0; i < 2; ++i) {
+      work.push_back(graph_task);
+      assert(owner->CheckScatterGraphReplay().ok() && work.empty());
+    }
+    if (!missing_replay) {
+      kernel_result = KVAF_SEQ_REMOTE_ERROR;
+      work.push_back(graph_task);
+    }
+    assert(owner->CheckScatterGraphReplay().code() == StatusCode::kInternal);
+    assert(!owner->CheckScatterGraphReplay().ok());
+    kernel_result = 0;
+    graph_task = {};
+    assert(owner->Shutdown().ok() && !allocations && !hccp_refs && !refs);
+    exec.execution.trusted_npu_request = false;
+  }
+  unsetenv("KVAF_AIV_SCATTER_GRAPH");
   assert(!allocations && !refs && !hccp_refs);
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   config.aiv_batch_get_mode = "gather_read";

@@ -65,7 +65,8 @@ void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
     KvafScatterBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
       a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
-      a.sequence, a.max_polls, a.reserved});
+      a.graph_replay ? 0 : a.sequence, a.max_polls,
+      a.reserved | (a.graph_replay ? kvaf::kScatterGraphReplay : 0U)});
   } else {
     KvafGatherBatchGetAivKernelV11({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
@@ -1509,18 +1510,23 @@ int main() {
       gather.Next(19); gather.Run();
       assert(gather.completions && gather.data_reads);
     }
-  // Exercise the benchmark's Scatter path with and without payload overlap.
-  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline}) {
-    Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6);
-    scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs | pipeline;
-    scatter.args.max_polls = 1000000;
-    scatter.hold_done_until_scatter = pipeline != 0;
-    for (uint32_t count : {0U, 19U, 1024U, 8193U, 8193U}) {
-      scatter.Next(count);
-      scatter.Run();
-      assert(scatter.head_started_early == (count > kvaf::cpu_push::kChunkRows));
-      if (pipeline && count)
-        assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == count);
+  // Replays keep the previous sequence/Ready/Done but refresh payload and indices.
+  for (const bool graph : {false, true}) {
+    for (uint32_t pipeline : {0U, kvaf::kScatterPipeline}) {
+      Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6);
+      scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs | pipeline;
+      scatter.args.max_polls = 1000000;
+      scatter.hold_done_until_scatter = pipeline != 0;
+      scatter.Next(19);
+      scatter.Run(); // Eager warmup starts the shared sequence.
+      scatter.args.graph_replay = graph;
+      for (uint32_t count : {0U, 19U, 1024U, 1025U, 8193U, 8193U}) {
+        scatter.Next(count);
+        scatter.Run();
+        assert(scatter.head_started_early == (count > kvaf::cpu_push::kChunkRows));
+        if (pipeline && count)
+          assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == count);
+      }
     }
   }
   {

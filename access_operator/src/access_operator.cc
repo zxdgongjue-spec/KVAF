@@ -562,6 +562,11 @@ Status DefaultAccessOperator::CopyScatterProfiles(std::vector<ScatterBatchGetCor
   return impl_->sequential->CopyScatterProfiles(profiles);
 }
 
+Status DefaultAccessOperator::CheckScatterGraphReplay() {
+  if (!impl_->sequential) return Status::NotImplemented("scatter graph requires cpu_push_scatter");
+  return impl_->sequential->CheckScatterGraphReplay();
+}
+
 Status DefaultAccessOperator::SetGatherBatchGetProfiling(bool enabled) {
   if (!impl_->sequential)
     return Status::NotImplemented("gather profiling requires gather_read mode");

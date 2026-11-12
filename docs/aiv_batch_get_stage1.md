@@ -172,6 +172,34 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
 加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于
 请求和数据随样本变化的端到端性能回归。
 
+Scatter BatchGet 的 CPU payload 固定走 4 条 Jetty，AIV 用第 0 条向 CPU 发布请求。
+`--aiv-cores` 控制设备侧并行度。`--jettys-per-core` 在这个脚本中固定为 2，
+用于 Runtime 初始化和 BatchPut。调整 payload Jetty 数需要同步修改两端的
+通道配置、分片和 Ready 布局。
+
+### Scatter ACL Graph 与 eager 对比
+
+重新构建 NPU Host、Python 模块及 Scatter kernel 后，用同一入口运行对比。
+
+```bash
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --execution compare --rounds 3 --single --token-bytes 656 \
+  --table-capacity 16384 --miss-count 8192 --aiv-cores 4 --pipeline 1 \
+  --output-dir results/scatter-compare
+```
+
+`--execution graph` 只测回放，默认的 `--execution eager` 保留 AIV profiling。
+对比两边均关闭 profiling，每轮交替运行顺序，使用相同的 seed 和请求配置。
+`comparison.csv` 按 case 和轮次配对，报告 E2E、Host 提交、状态检查和包含状态
+检查的 E2E 的 mean、p50、p99。请求准备、预热和 capture 在计时区间外。
+
+调用侧在初始化前设置 `KVAF_AIV_SCATTER_GRAPH=1`，图外完成 BatchPut 和 eager
+预热及状态检查，再用 `kvaf.AclGraph` 捕获一个异步的 prepared Scatter 调用。
+固定 Tensor 地址，在捕获 stream 上逐次更新输入并串行 replay，每次调用
+`runtime.check_scatter_graph_replay()` 后再开始下一轮。AIV 逐核从上一轮状态
+取得新序号，CPU mailbox、Ready 和 Done 使用同一请求序号。图销毁后再释放
+AccessTable 和 Runtime。
+
 
 ## Gather 合并接口与回归
 

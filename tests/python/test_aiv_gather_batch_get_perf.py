@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
-from aiv_batch_get_common import capture_gather_graph, close_gather_graph, kernel_paths, shutdown_runtime
+from aiv_batch_get_common import capture_acl_graph, close_acl_graph, kernel_paths, shutdown_runtime
 
 
 STAGE_BOUNDARIES = (
@@ -693,7 +693,7 @@ def run(execution: str, results: dict, active_requests: int, *,
             raise AssertionError("gather correctness preflight payload/guard mismatch")
         if graph_mode:
             graph = kvaf.AclGraph()
-            capture_gather_graph(graph, stream, submit)
+            capture_acl_graph(graph, stream, submit, label="GATHER_GRAPH")
             for replay in range(2):
                 with torch.npu.stream(stream):
                     output.fill_(0xAD)
@@ -759,7 +759,7 @@ def run(execution: str, results: dict, active_requests: int, *,
             # Keep all request/output tensors alive through transport shutdown.
             try:
                 if graph is not None:
-                    close_gather_graph(graph, stream)
+                    close_acl_graph(graph, stream, label="GATHER_GRAPH")
             finally:
                 shutdown_runtime(runtime)
 

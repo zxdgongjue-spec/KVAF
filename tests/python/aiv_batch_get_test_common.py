@@ -7,7 +7,7 @@ from array import array
 from pathlib import Path
 import sys
 
-from aiv_batch_get_common import capture_gather_graph, close_gather_graph, kernel_paths, shutdown_runtime
+from aiv_batch_get_common import capture_acl_graph, close_acl_graph, kernel_paths, shutdown_runtime
 
 
 def expect_gather_probe(call, stage: str, *, requests: int, data_wrs: int) -> None:
@@ -56,7 +56,7 @@ def run_gather_graph(kvaf, torch, runtime, stream, view, source_cpu, output, cap
     submit(synchronize=True)
     graph = kvaf.AclGraph()
     try:
-        capture_gather_graph(graph, stream, submit)
+        capture_acl_graph(graph, stream, submit, label="GATHER_GRAPH")
         positions = torch.arange(capacity, dtype=torch.int32)
         for epoch, active in enumerate([capacity, capacity, *counts]):
             index_cpu = (positions * 7 + epoch) % blocks
@@ -89,7 +89,7 @@ def run_gather_graph(kvaf, torch, runtime, stream, view, source_cpu, output, cap
             assert torch.equal(actual, expected), ("gather graph", epoch, active)
             print(f"GATHER_GRAPH_REPLAY_PASS replay={epoch} active={active}", flush=True)
     finally:
-        close_gather_graph(graph, stream)
+        close_acl_graph(graph, stream, label="GATHER_GRAPH")
 
 
 def run(mode: str) -> int:

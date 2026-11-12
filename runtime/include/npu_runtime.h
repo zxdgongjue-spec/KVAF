@@ -90,6 +90,7 @@ class NpuRuntime final : public Runtime {
   Status SetGatherBatchGetProfiling(bool enabled);
   Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const;
   Status CheckGatherGraphReplay();
+  Status CheckScatterGraphReplay();
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

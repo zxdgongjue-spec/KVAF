@@ -1022,6 +1022,15 @@ Status NpuRuntime::CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) con
   return Status::NotImplemented("gather profiling requires linked AIV gather_read");
 }
 
+Status NpuRuntime::CheckScatterGraphReplay() {
+  if (!impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime requires LinkTo before checking scatter graph status");
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->urma_operator) return impl_->urma_operator->CheckScatterGraphReplay();
+#endif
+  return Status::NotImplemented("scatter graph requires linked AIV cpu_push_scatter");
+}
+
 Status NpuRuntime::CheckGatherGraphReplay() {
   if (!impl_->access_operator)
     return Status::NotInitialized("NpuRuntime requires LinkTo before checking gather graph status");

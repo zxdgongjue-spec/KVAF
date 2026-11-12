@@ -156,6 +156,7 @@ class DefaultAccessOperator final : public AccessOperator {
   Status SetGatherBatchGetProfiling(bool enabled);
   Status CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const;
   Status CheckGatherGraphReplay();
+  Status CheckScatterGraphReplay();
 
  private:
   struct Impl;

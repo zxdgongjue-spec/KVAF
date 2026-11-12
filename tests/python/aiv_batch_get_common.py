@@ -44,7 +44,7 @@ def shutdown_runtime(runtime) -> None:
                   file=sys.stderr, flush=True)
 
 
-def capture_gather_graph(graph, stream, submit) -> None:
+def capture_acl_graph(graph, stream, submit, *, label) -> None:
     graph.capture_begin(stream)
     try:
         submit()
@@ -52,12 +52,12 @@ def capture_gather_graph(graph, stream, submit) -> None:
         try:
             graph.capture_end()
         except Exception as error:
-            print(f"GATHER_GRAPH_CAPTURE_END_ERROR {error}", file=sys.stderr, flush=True)
+            print(f"{label}_CAPTURE_END_ERROR {error}", file=sys.stderr, flush=True)
         raise
     graph.capture_end()
 
 
-def close_gather_graph(graph, stream) -> None:
+def close_acl_graph(graph, stream, *, label) -> None:
     original = sys.exc_info()[1]
     try:
         stream.synchronize()
@@ -65,5 +65,5 @@ def close_gather_graph(graph, stream) -> None:
     except Exception as error:
         if original is None:
             raise
-        print(f"GATHER_GRAPH_CLEANUP_ERROR preserving original exception: {error}",
+        print(f"{label}_CLEANUP_ERROR preserving original exception: {error}",
               file=sys.stderr, flush=True)
