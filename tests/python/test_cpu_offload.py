@@ -32,6 +32,7 @@ def main():
                               npu_eids=[args.npu_eid] if args.npu_eid else [])
     cpu_source = kvaf.CpuPullHbmSource(device_id=args.device, npu_eid=args.npu_eid)
     ready = None
+    committed = False
     try:
         runtime.link_to(args.cpu)
         runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
@@ -48,8 +49,10 @@ def main():
                 source.copy_(expected, non_blocking=True)
             # Production and source reuse belong to the application on every device.
             stream.synchronize()
+            committed = False
             ready = cpu_source.ready()
             result = runtime.batch_cpu_pull([1, 3, 6], ready, offsets, lengths)
+            committed = True
             assert result is None and not runtime.pending_offload
             assert cpu_source.frozen  # Consumer success never releases the producer's source.
             payload = b"".join(bytes(expected[o:o + n].tolist()) for o, n in zip(offsets, lengths))
@@ -65,15 +68,17 @@ def main():
             if runtime.pending_offload:
                 try:
                     runtime.resolve_cpu_pull()
+                    committed = True
                 except Exception:
                     if runtime.pending_offload:
                         raise
             if cpu_source.frozen:
                 batch = ready if ready is not None else cpu_source.ready()
-                try:
+                if committed:
                     cpu_source.release_batch(batch)
-                except Exception:
-                    cpu_source.cancel_batch(batch)  # Only an unconsumed Ready can be cancelled.
+                else:
+                    runtime.cancel_cpu_pull(batch)
+                    cpu_source.cancel_batch(batch)
             cpu_source.shutdown()
             runtime.shutdown()
         except Exception as error:

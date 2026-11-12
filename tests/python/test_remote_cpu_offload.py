@@ -61,16 +61,20 @@ def producer(pipe, args, ticket, lengths):
             batch = source.ready(hbm) if args.tensors > 1 else source.ready()
             assert batch.source.mr_length == hbm.numel() * hbm.element_size()
             pipe.send(("ready", batch))
-            receive(pipe, "reuse")
+            if receive(pipe, "reuse") != round_id:
+                raise RuntimeError("reuse notification belongs to another batch")
             source.release_batch(batch)
             assert not source.frozen
         source.shutdown()
         pipe.send(("closed", None))
     except BaseException:
-        pipe.send(("error", traceback.format_exc()))
+        try:
+            pipe.send(("error", traceback.format_exc()))
+        except OSError:
+            pass
         try:
             if source.frozen:
-                source.cancel_batch(source.ready(hbm))  # Refused if any READ may still be active.
+                retain("no matching consumer outcome; keep CPU Pull HBM registered")
             source.shutdown()
         except Exception as error:
             retain(str(error))

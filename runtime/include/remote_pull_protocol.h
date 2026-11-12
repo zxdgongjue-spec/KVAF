@@ -3,9 +3,9 @@
 #include "cpu_pull_timing.h"
 
 namespace kvaf::remote_pull {
-// Shared DDR with identity-only Ready and application-defined Submit ranges.
+// Shared DDR with atomic first-submit admission and application-coordinated source reuse.
 constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
-constexpr std::uint16_t kVersion = 7;
+constexpr std::uint16_t kVersion = 8;
 constexpr std::uint32_t kMaxSourceMrs = 4096;
 constexpr std::uint32_t kSubmitProfile = 1;
 constexpr std::uint64_t kTimingMagic = 0x4b56525054494d31ULL;
@@ -14,8 +14,9 @@ using ConnectionDesc = offload::ConnectionDesc;
 using Span = offload::Span;
 using Result = offload::Result;
 constexpr auto kMaxSpans = offload::kMaxSpans;
-enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Ready, Submit, Query, Complete, Cancel, Detach, Checksum, InspectSource, AddMemory, SubmitAndWait };
-enum class State : std::uint32_t { Connecting, Idle, Ready, Running, Done, Failed, InDoubt, Committed, Cancelled, Closed };
+enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Submit = 6, Query, Cancel = 9, Detach, Checksum, InspectSource, AddMemory, SubmitAndWait };
+enum class State : std::uint32_t { Connecting, Idle, Running, Done, Failed, InDoubt, Cancelled, Closed, NotSeen };
+// NotSeen is a Query reply within a live registered session, never a stored state.
 struct RegionInfo {
   std::uint64_t epoch{}, id{}, base{}, bytes{}, slot_size{};
   std::uint32_t candidate{}, token{}, closing{};
@@ -25,7 +26,8 @@ struct Request {
   peer::MessageHeader header{};
   std::uint32_t count{};
   std::uint64_t region{}, epoch{}, source_id{}, task{}; // task = B's ready sequence
-  std::uint32_t token{}, flags{}; // Complete: commit/abort; SubmitAndWait: kSubmitProfile bit.
+  std::uint64_t operation{}; // Per-Put identity within the reader-owned DDR pool. Zero for an unused-token Cancel.
+  std::uint32_t token{}, flags{}; // SubmitAndWait: kSubmitProfile bit.
   std::uint64_t mr_id{1};
   std::uint32_t memory_count{1}, timeout_ms{}; // SubmitAndWait: wait budget after acceptance.
   MemoryDesc source{};
@@ -34,9 +36,9 @@ struct Request {
 struct Response {
   peer::MessageHeader header{};
   Result result{Result::Invalid};
-  std::uint64_t region{}, epoch{}, source_id{}, task{}, checksum{};
+  std::uint64_t region{}, epoch{}, source_id{}, task{}, operation{}, checksum{};
   State state{State::Connecting};
-  std::uint32_t reserved{}; // SubmitAndWait: 1 if this task was accepted (even if still running).
+  std::uint32_t reserved{}; // Submit/SubmitAndWait: 1 if this operation was accepted (even if still running).
   std::uint64_t mr_id{1};
   RegionInfo pool{};
   MemoryDesc memory{}; // SubmitAndWait profiling uses this otherwise-unused response payload.

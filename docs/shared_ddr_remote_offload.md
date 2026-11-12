@@ -66,16 +66,16 @@ runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, timeout=30000)
 
 Runtime 先分配共享 DDR，固定 CPU candidate。源注册在同一池上探测 CPU↔源卡 EID，使用 scratch READ，不覆盖缓存槽位。NPU↔NPU raw READ 的 fullmesh 链路独立配置。
 
-CPU Pull 控制协议 KVRP v7，支持一个源连接下多个 HBM MR，同步入口通过 TCP 长连接提交并等待完成回复；NPU Pull 控制协议为 KVHR v8，每批完成/取消通知由应用提供。NPU 两端需一起更新；CPU service 和 NPU 扩展需配套重编译、重启。旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+CPU Pull 控制协议 KVRP v8，支持一个源连接下多个 HBM MR，同步入口通过 TCP 长连接提交并等待完成回复；NPU Pull 控制协议为 KVHR v8，每批完成/取消通知由应用提供。NPU 两端需一起更新；CPU service 和 NPU 扩展需配套重编译、重启。旧协议拒绝连接。KVCP 的 DDR 分配协议保持不变，独立 KVOF 服务已删除。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
-同一共享池一次只允许一个未完成或未确认的 Pull；每批最多 4096 spans，CPU 内部四 Jetty 并行。服务保留 source 的关闭记录用于确认重试，源注册次数（包括失败候选）上限为 4096，推荐长驻注册复用。
+同一共享池一次只允许一个正在执行或 DMA 未决的 Pull；每批最多 4096 spans，CPU 内部四 Jetty 并行。服务保留 source 的关闭记录用于确认重试，源注册次数（包括失败候选）上限为 4096，推荐长驻注册复用。
 
 ## CPU Pull 性能验证
 
 CPU 数据面参考 `aicpu-urma@8bc5a2a` 的批量 WRITE 提交方式：每次最多链接 32 个 WQE，
 先向所有活跃 Jetty 提交，再轮询它们的 CQ。每个 Jetty 每轮最多 1024 个 READ（同时受返回的
 SQ depth 限制），只让本轮尾部 WQE 请求 CQE；comp_order 和尾部 READ fence 保证前面的
-READ 完成后才能正常确认该尾部。所有活跃 Jetty 尾部均成功才允许 CommitPut 和 B 复用源。
+READ 完成后才能正常确认该尾部。所有活跃 Jetty 尾部均成功才允许 CommitPut。B 收到本批应用完成通知后才复用源。
 错误 CQE（包括非尾部 WQE 的错误）、部分提交失败、异常 CQE、超时均隔离整个传输，保留
 所有队列、MR、SGE/WR 存储和 DDR lease，不重发 READ。
 
@@ -181,7 +181,7 @@ GB/s 使用十进制单位。CPU 数据面时间包含描述符准备、提交�
 
 ## 未决操作
 
-显式事务由应用持有一个 put：Submit 成功返回 None，查询、等待、提交和撤销均使用原 put。参数校验失败且 `put.submitted=False` 时可以修正参数后提交；`put.submitted=True` 表示请求已记录，即使 Submit 响应丢失也用原 put 恢复，不可重复 PreparePut 替代未决任务。它不表示 CPU 已接受或 DMA 已完成。生产端通过 `release_batch(ready)` 或尚未获取批次时的 `cancel_batch(ready)` 核验身份及状态。
+显式事务由应用持有一个 put：Submit 成功返回 None，查询、等待、提交和撤销均使用原 put。参数校验失败且 `put.submitted=False` 时可以修正参数后提交；`put.submitted=True` 表示请求已记录，即使 Submit 响应丢失也用原 put 恢复，不可重复 PreparePut 替代未决任务。它不表示 CPU 已接受或 DMA 已完成。读取端通过 cancel_cpu_pull(ready) 协调取消。生产端收到对应批次的应用通知后核对身份并本地释放。
 
 统一 `batch_cpu_pull()` 自动处理可确认失败的 Abort。未决 DMA 保留内部事务并阻止新调用，应用使用 `resolve_cpu_pull()` 查询、等待并完成原 Commit/Abort，不重发 READ。仍未决时保持源和 DDR 有效；Commit 已开始后不能逆转决定。生产端收到应用通知后 Release/Cancel，关闭源后才能释放消费端 DDR。shutdown 只尝试一次完成查询，不等待在途 DMA，也不代替生产端注销源。
 

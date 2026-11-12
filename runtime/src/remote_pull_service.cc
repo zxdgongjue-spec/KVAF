@@ -24,9 +24,9 @@ struct Session {
   std::uint32_t memory_count{1};
   std::uint64_t mr_id{1};
   std::unique_ptr<offload::Backend> backend;
-  std::uint64_t sequence{};
+  std::uint64_t sequence{}, operation{};
   std::vector<Span> submitted;
-  State state{State::Connecting}, terminal{State::Connecting};
+  State state{State::Connecting};
   std::mutex mutex;
   std::condition_variable completed;
   std::condition_variable work_available;
@@ -73,7 +73,7 @@ struct Session {
   }
   ~Session() { StopWorker(); }
 };
-bool Pending(State s) { return s == State::Ready || s == State::Running || s == State::InDoubt; }
+bool Pending(State s) { return s == State::Running || s == State::InDoubt; }
 }
 struct Service::Trace {
   Clock::time_point begin{Clock::now()}, locked;
@@ -87,7 +87,7 @@ struct Service::Impl {
   Attach attach;
   std::mutex owned_mutex;
   std::mutex& control_mutex;
-  // Closed records are retained for idempotent Detach/Complete. Registration
+  // Closed records are retained for idempotent Detach. Registration
   // is long-lived; bound the number rather than evicting unacknowledged IDs.
   std::unordered_map<std::uint64_t, std::unique_ptr<Session>> sources;
 };
@@ -141,12 +141,12 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
   if (trace) trace->locked = Clock::now();
   Response out{}; out.header = {kMagic, kVersion, std::uint16_t(r.header.command | 0x8000U), ResponseBytes(r.header.command)};
   out.region = r.region; out.epoch = r.epoch; out.source_id = r.source_id; out.task = r.task;
-  out.mr_id = r.mr_id;
+  out.mr_id = r.mr_id; out.operation = r.operation;
   if (r.header.magic != kMagic || r.header.version != kVersion || !r.region ||
       r.count != spans.size() || spans.size() > kMaxSpans ||
       r.header.bytes != RequestBytes(r.header.command) + spans.size()*sizeof(Span)) return out;
   const auto cmd = static_cast<Command>(r.header.command);
-  if (cmd != Command::Ready && cmd != Command::Submit && cmd != Command::SubmitAndWait &&
+  if (cmd != Command::Submit && cmd != Command::SubmitAndWait &&
       cmd != Command::Probe && !spans.empty()) return out;
   RegionInfo region{};
   auto status = impl_->describe(r.region, &region);
@@ -248,29 +248,27 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
   }
   const auto memory = s.memories.find(r.mr_id);
   if (!r.task || memory == s.memories.end()) return out;
-  if (cmd == Command::Ready) {
-    if (r.flags || !spans.empty()) return out;
-    if (r.task == s.sequence && s.state != State::Closed) {
-      if (r.mr_id == s.mr_id) out.result = Result::Ok;
+  if (s.state == State::Closed) return out;
+  const bool current = r.task == s.sequence && r.mr_id == s.mr_id;
+  const bool next = r.task == s.sequence + 1 &&
+      (s.state == State::Idle || s.state == State::Done || s.state == State::Cancelled ||
+       (s.state == State::Failed && s.sequence));
+  if (cmd == Command::Query || cmd == Command::Cancel) {
+    if (next && cmd == Command::Cancel) {
+      if (!r.operation && r.source.bytes != memory->second.bytes) return out;
+      s.sequence = r.task; s.mr_id = r.mr_id; s.operation = r.operation;
+      s.source = memory->second; s.submitted.clear(); s.state = State::Cancelled;
+    } else if (next) {
+      out.state = State::NotSeen; out.result = Result::Ok; return out;
+    } else if (!current || (s.state != State::Cancelled && (!r.operation || r.operation != s.operation))) {
       return out;
     }
-    if (r.task != s.sequence + 1 || (s.state != State::Idle && s.state != State::Committed && s.state != State::Cancelled)) return out;
-    s.sequence = r.task; s.mr_id = r.mr_id; s.source = memory->second; s.submitted.clear();
-    s.state = out.state = State::Ready; out.result = Result::Ok; return out;
+    out.state = s.state; out.result = Result::Ok; return out;
   }
-  // A Ready packet may never have reached the service. Cancel also records
-  // the next unused sequence, preventing a delayed Ready from reviving it.
-  if (cmd == Command::Cancel && r.task == s.sequence + 1 &&
-      (s.state == State::Idle || s.state == State::Committed || s.state == State::Cancelled)) {
-    s.sequence = r.task; s.mr_id = r.mr_id; s.source = memory->second; s.submitted.clear();
-    s.state = s.terminal = out.state = State::Cancelled; out.result = Result::Ok; return out;
-  }
-  if (r.task != s.sequence || r.mr_id != s.mr_id) return out; // Bind sequence AND MR identity.
-  if (cmd == Command::Query) { out.memory = s.source; out.result = Result::Ok; return out; }
   if (cmd == Command::Checksum) {
     // Diagnostic reads of CURRENT DDR are explicit and outside transfer/commit.
     // The caller must retain these slots unchanged until this RPC returns.
-    if (s.state != State::Done && s.state != State::Committed) { out.result = Result::Busy; return out; }
+    if (!current || r.operation != s.operation || s.state != State::Done) { out.result = Result::Busy; return out; }
     for (const auto& item : impl_->sources) {
       if (item.second.get() == &s || item.second->region.id != r.region) continue;
       std::lock_guard<std::mutex> guard(item.second->mutex);
@@ -282,24 +280,7 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
     catch (...) { out.result = Result::Failed; }
     return out;
   }
-  if (cmd == Command::Complete) {
-    if (r.flags > 1) return out;
-    const auto desired = r.flags ? State::Committed : State::Cancelled;
-    if (s.terminal == desired && (s.state == desired || s.state == State::Closed)) { out.result = Result::Ok; return out; }
-    if ((r.flags && s.state != State::Done) || (!r.flags && s.state != State::Ready && s.state != State::Failed && s.state != State::Cancelled && s.state != State::Done)) return out;
-    s.state = s.terminal = out.state = desired; out.result = Result::Ok; return out;
-  }
-  if (cmd == Command::Cancel) {
-    if (s.state == State::Ready || s.state == State::Cancelled) {
-      s.state = s.terminal = out.state = State::Cancelled; out.result = Result::Ok;
-    }
-    return out;
-  }
-  if (cmd != Command::Submit && cmd != Command::SubmitAndWait) return out;
-  // A new convenience call is not recovery of an already committed/cancelled
-  // batch. Reject it before claiming acceptance or touching the caller's slots.
-  if (cmd == Command::SubmitAndWait &&
-      (s.state == State::Committed || s.state == State::Cancelled || s.state == State::Closed)) return out;
+  if ((cmd != Command::Submit && cmd != Command::SubmitAndWait) || !r.operation) return out;
   const auto wait_for_completion = [&] {
     if (cmd == Command::SubmitAndWait) {
       // The READ worker publishes state under this same mutex. Waiting releases
@@ -309,42 +290,43 @@ Response Service::DispatchImpl(const Request& r, const std::vector<Span>& spans,
                            [&] { return s.state != State::Running; });
       // A reconnecting client may already have finished this task. Never
       // report the state of a newer batch as completion of this request.
-      out.state = s.sequence == r.task && s.mr_id == r.mr_id ? s.state : State::InDoubt;
+      out.state = s.sequence == r.task && s.mr_id == r.mr_id && s.operation == r.operation ? s.state : State::InDoubt;
       if (trace) trace->completed = trace->read && out.state == State::Done;
     }
   };
-  if (!s.submitted.empty()) {
-    if (cmd == Command::SubmitAndWait) out.reserved = 1;
-    if (SameSpans(spans, s.submitted) &&
-        (cmd != Command::SubmitAndWait || r.source.bytes == s.source.bytes)) {
+  if (!next) {
+    if (!current || r.operation != s.operation || s.state == State::Cancelled) return out;
+    out.reserved = 1;
+    if (SameSpans(spans, s.submitted) && r.source.bytes == s.source.bytes) {
       out.result = Result::Ok;
       wait_for_completion();
     }
     return out;
   }
-  // The synchronous request carries the expected selected-MR length, removing
-  // the separate pre-submit Query without weakening its source validation.
-  if (cmd == Command::SubmitAndWait && r.source.bytes != s.source.bytes) return out;
-  if (s.state != State::Ready || !offload::ValidateSpans(spans, s.source.bytes, region.bytes)) return out;
-  // One unresolved write per pool, including CQ failures with unknown DMA state.
+  // Validate before publishing the first request. A definitive rejection of a
+  // valid next batch fences it too, so a delayed copy can never start DMA.
+  bool valid = r.source.bytes == memory->second.bytes &&
+      offload::ValidateSpans(spans, memory->second.bytes, region.bytes);
   for (const auto& item : impl_->sources) {
-    if (item.second.get() == &s || item.second->region.id != r.region) continue;
+    if (!valid || item.second.get() == &s || item.second->region.id != r.region) continue;
     std::lock_guard<std::mutex> guard(item.second->mutex);
-    const auto state = item.second->state;
-    if (state == State::Running || state == State::InDoubt || state == State::Done) {
-      out.result = Result::Busy; return out;
-    }
+    if (Pending(item.second->state)) { valid = false; out.result = Result::Busy; }
   }
+  if (valid) s.submitted = spans; // Copy before changing the recorded batch.
+  else s.submitted.clear();
+  s.sequence = r.task; s.mr_id = r.mr_id; s.source = memory->second; s.operation = r.operation;
+  if (!valid) { s.state = out.state = State::Cancelled; return out; }
   // Resolve the MR once per batch, after prior work has completed. All WQEs
   // then use its imported segment/base with the existing shared queues.
-  status = s.backend->SelectSource(r.mr_id);
+  try { status = s.backend->SelectSource(r.mr_id); }
+  catch (...) { status = Status::InDoubt("exception selecting HBM MR"); }
   if (!status.ok()) {
-    if (cmd == Command::SubmitAndWait) out.reserved = 1;
+    out.reserved = 1;
     s.state = out.state = status.code() == StatusCode::kInDoubt ? State::InDoubt : State::Failed;
     out.result = Convert(status); return out;
   }
-  s.submitted = spans; s.state = State::Running;
-  if (cmd == Command::SubmitAndWait) out.reserved = 1;
+  s.state = State::Running;
+  out.reserved = 1;
   try {
     std::shared_ptr<ReadTrace> read_trace;
     if (trace) {

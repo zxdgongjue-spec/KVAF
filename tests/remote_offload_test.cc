@@ -19,7 +19,7 @@ void Lifecycle(){
   Ok(b.Register(ticket,{hbm.data(),hbm.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
   Require(std::all_of(server.pool.begin(),server.pool.end(),[](auto c){return c==0xA5;}),"probe preserves shared DDR");
   kvaf::ReadyToken ready;Ok(b.Ready(&ready));
-  Require(!b.ReleaseBatch(ready).ok()&&!a.Shutdown().ok(),"source lease blocks premature release");
+  Require(b.frozen()&&!a.Shutdown().ok(),"source lease blocks premature release");
   kvaf::PutHandle put;Ok(a.PreparePut({1,3},{64,128},&put));
   std::vector<std::uint64_t> src{16,512},dst{put.entries()[0].address-server.info.base,put.entries()[1].address-server.info.base},sizes{64,128};
   const int before=payload_reads, hashes=checksum_calls;
@@ -32,7 +32,7 @@ void Lifecycle(){
   server.drop=unsigned(rp::Command::Checksum);Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"lost diagnostic ACK is not pending DMA");
   Ok(a.LastOffloadChecksum(&corrupted));Require(corrupted==hash&&payload_reads==before+1,"diagnostic retry never replays READ");
   fail_checksum=true;Require(!a.LastOffloadChecksum(&corrupted).ok()&&!a.pending_offload(),"diagnostic failure leaves commit intact");fail_checksum=false;
-  Ok(b.ReleaseBatch(ready));Ok(b.Ready(&ready));Require(!a.LastOffloadChecksum(&hash).ok(),"next generation invalidates old checksum");Ok(b.CancelBatch(ready));
+  Ok(b.ReleaseBatch(ready));Ok(b.Ready(&ready));Ok(a.CancelCpuPull(ready));Ok(b.CancelBatch(ready));
   server.drop=unsigned(rp::Command::Detach);Require(!b.Shutdown().ok(),"lost detach ACK retains exporter");Ok(b.Shutdown());NoResources();
   server.fail_release=true;Require(!a.Shutdown().ok(),"DDR release can be retried");Ok(a.Shutdown());
 }
@@ -180,7 +180,7 @@ void ReadWorkerReuse() {
   Ok(reader.Shutdown()); NoResources();
 
   // Service teardown must also drain a submitted READ and stop its worker
-  // when the caller has not sent Complete/Detach.
+  // when the caller has not detached.
   const int reads=payload_reads;
   std::vector<std::uint8_t> pool(128,0);
   const rp::RegionInfo region{42,1,reinterpret_cast<std::uint64_t>(pool.data()),128,128,0,7,0,{}};
@@ -192,7 +192,7 @@ void ReadWorkerReuse() {
     const auto dispatch=[&](rp::Command command,std::uint64_t task,const std::vector<rp::Span>& spans) {
       auto request=rp::MakeRequest(command);
       request.region=region.id; request.epoch=region.epoch; request.token=region.token;
-      request.source_id=123; request.task=task;
+      request.source_id=123; request.task=task; request.operation=task;
       request.source.base=reinterpret_cast<std::uint64_t>(data.data());
       request.source.bytes=data.size(); request.source.token=region.token;
       request.connection.token=region.token;
@@ -201,7 +201,6 @@ void ReadWorkerReuse() {
     };
     Require(dispatch(rp::Command::Attach,0,{}).result==rp::Result::Ok,"attach teardown source");
     Require(dispatch(rp::Command::Bind,0,{}).result==rp::Result::Ok,"bind teardown source");
-    Require(dispatch(rp::Command::Ready,1,{}).result==rp::Result::Ok,"ready teardown source");
     read_delay_ms=5;
     Require(dispatch(rp::Command::Submit,1,{{17,0,32}}).result==rp::Result::Ok,"accept READ before teardown");
   }
@@ -209,6 +208,90 @@ void ReadWorkerReuse() {
   Require(payload_reads==reads+1&&active_read_workers==active&&
           !std::memcmp(pool.data(),data.data()+17,32),"service teardown drains accepted READ before joining and closing backend");
   NoResources();
+}
+void RejectedCancelPreservesLastBatch() {
+  SharedServer server;
+  kvaf::NpuRuntimeOptions options;
+  options.enable_cpu_offload = true;
+  kvaf::NpuRuntime reader(options);
+  Ok(reader.LinkTo({server.address}));
+  Ok(reader.Initialize(1024, 256));
+  kvaf::OffloadRegionTicket ticket;
+  Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::uint8_t> data(128, 0x13);
+  aclrtSetDevice(7);
+  kvaf::CpuPullHbmSource source(7, "00000000000000000000000000000001");
+  Ok(source.Register(ticket, {data.data(), data.size(), kvaf::DeviceKind::kNpu}, reinterpret_cast<void*>(1)));
+
+  const std::vector<std::uint64_t> offsets{0}, lengths{64};
+  kvaf::ReadyToken first, second;
+  Ok(source.Ready(&first));
+  Ok(reader.BatchCpuPull({0}, first, offsets, lengths));
+  Ok(source.ReleaseBatch(first));
+  std::fill(data.begin(), data.end(), 0x75);
+  Ok(source.Ready(&second));
+  const int calls = server.control_calls;
+  Ok(reader.BatchCpuPull({1}, second, offsets, lengths));
+  Require(server.control_calls == calls + 1, "successful batch uses one control RPC");
+  Ok(source.ReleaseBatch(second));
+
+  for (bool drop_reply : {false, true}) {
+    if (drop_reply) {
+      server.drop = unsigned(rp::Command::Cancel);
+      Require(reader.CancelCpuPull(first).code() == kvaf::StatusCode::kInDoubt && reader.pending_offload(),
+              "lost stale-token rejection keeps cancellation pending");
+      Require(reader.CancelCpuPull(second).code() == kvaf::StatusCode::kBusy &&
+              reader.BatchCpuPull({2}, second, offsets, lengths).code() == kvaf::StatusCode::kBusy,
+              "only the pending cancellation token can be retried");
+    }
+    Require(reader.CancelCpuPull(first).code() == kvaf::StatusCode::kInvalidState && !reader.pending_offload(),
+            "definitive stale-token rejection clears pending cancellation");
+    std::uint64_t checksum{};
+    Ok(reader.LastOffloadChecksum(&checksum));
+    Require(checksum == p::Hash(data.data(), lengths[0]), "rejected cancellation preserves the second batch checksum");
+  }
+  Ok(source.Shutdown());
+  Ok(reader.Shutdown());
+  NoResources();
+}
+// Exercise wire identities directly, including a delayed *original* frame.
+void AdmissionAndReplay() {
+  SharedServer server;
+  kvaf::NpuRuntimeOptions options; options.enable_cpu_offload=true;
+  kvaf::NpuRuntime reader(options); Ok(reader.LinkTo({server.address})); Ok(reader.Initialize(1024,256));
+  kvaf::OffloadRegionTicket ticket; Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::uint8_t> data(128,0x67); aclrtSetDevice(7);
+  kvaf::CpuPullHbmSource source(7,"00000000000000000000000000000001");
+  Ok(source.Register(ticket,{data.data(),data.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+  kvaf::ReadyToken ready; Ok(source.Ready(&ready));
+  const auto frame=[&](rp::Command command,std::uint64_t sequence,std::uint64_t operation) {
+    auto r=rp::MakeRequest(command); r.region=ticket.region_id; r.epoch=ticket.epoch; r.token=ticket.token;
+    r.source_id=std::get<kvaf::CpuPullSourceDesc>(ready.source).source_id; r.mr_id=ready.mr_id;
+    r.source.bytes=data.size(); r.task=sequence; r.operation=operation; r.timeout_ms=1000;
+    if(command==rp::Command::SubmitAndWait) { r.count=1; r.header.bytes+=sizeof(rp::Span); }
+    return r;
+  };
+  auto query=frame(rp::Command::Query,1,17);
+  auto late=frame(rp::Command::SubmitAndWait,1,17);
+  const auto reads=payload_reads.load();
+  Require(server.service.Dispatch(query,{}).state==rp::State::NotSeen,"only valid next batch reports NotSeen");
+  ++query.epoch;
+  Require(server.service.Dispatch(query,{}).state!=rp::State::NotSeen,"an old service epoch cannot authorize cancellation");
+  server.drop=unsigned(rp::Command::Cancel);
+  Require(!reader.CancelCpuPull(ready).ok()&&reader.pending_offload(),"unused-token Cancel retains its identity on lost ACK");
+  Ok(reader.CancelCpuPull(ready)); Ok(source.CancelBatch(ready));
+  Require(server.service.Dispatch(late,{{0,0,16}}).result!=rp::Result::Ok && payload_reads==reads,
+          "original delayed Submit cannot run after Cancel");
+  Ok(source.Ready(&ready));
+  auto submit=frame(rp::Command::SubmitAndWait,2,19);
+  Require(server.service.Dispatch(submit,{{0,0,16}}).state==rp::State::Done,"accept next sequence after cancel");
+  Require(server.service.Dispatch(submit,{{0,0,16}}).result==rp::Result::Ok && payload_reads==reads+1,
+          "duplicate original operation returns saved result without DMA");
+  Require(server.service.Dispatch(submit,{{1,0,16}}).result!=rp::Result::Ok,"same operation cannot change spans");
+  ++submit.operation;
+  Require(server.service.Dispatch(submit,{{0,0,16}}).result!=rp::Result::Ok && payload_reads==reads+1,
+          "new Put cannot consume old Done for identical spans");
+  Ok(source.ReleaseBatch(ready)); Ok(source.Shutdown()); Ok(reader.Shutdown()); NoResources();
 }
 int producer_syncs=0;
 extern "C" aclError aclrtSynchronizeStream(aclrtStream){++producer_syncs;return 0;}
@@ -242,11 +325,13 @@ void UnifiedBatchCpuPull() {
           "CPU rejects unknown source and the wrapper rolls back its internal Put");
   Require(payload_reads==reads,"invalid convenience calls do not submit READ");
   kvaf::CpuPullProfile profile;profile.total_us=1e12;
+  const int calls_before=server.control_calls;
   const int queries_before=server.query_calls, sync_before=server.sync_submit_calls, connections_before=server.connection_count;
   Ok(reader.BatchCpuPull({3,1},ready,offsets,lengths,1000,&profile));
   Require(server.query_calls==queries_before&&server.sync_submit_calls==sync_before+1,
           "synchronous batch uses one submit-and-wait without readiness/completion queries");
-  Require(server.connection_count==connections_before,"reader reuses initialized TCP connection for submit and complete");
+  Require(server.control_calls==calls_before+1 && server.connection_count==connections_before,
+          "batch_cpu_pull makes exactly one RPC over the initialized connection");
   const auto stage_sum=profile.validation_us+profile.prepare_put_us+profile.dst_offsets_us+
       profile.submit_wait_cpu_pull_us+profile.wait_cpu_pull_us+profile.commit_put_us;
   Require(profile.prepare_put_us>0&&profile.submit_wait_cpu_pull_us>0&&profile.wait_cpu_pull_us>0&&
@@ -262,7 +347,9 @@ void UnifiedBatchCpuPull() {
   Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+1,
           "new call with occupied keys fails without replay");
   Require(!reader.ResolveCpuPull().ok(),"no hidden batch remains after success");
+  const int before_release=server.control_calls;
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+  Require(server.control_calls==before_release,"application-confirmed release is local");
   Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+1,
           "a completed Ready cannot be submitted as a new transaction after freeing its keys");
 
@@ -274,7 +361,7 @@ void UnifiedBatchCpuPull() {
   Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok(),"cannot start a second hidden transaction");
   kvaf::PutHandle explicit_put;
   Require(!reader.PreparePut({0},{8},&explicit_put).ok()&&!reader.core().BatchFree({{3,1}}).ok(),"pending DMA protects DDR");
-  Require(!reader.ResolveCpuPull(0).ok()&&!source.ReleaseBatch(ready).ok(),"no premature completion or producer reuse");
+  Require(!reader.ResolveCpuPull(0).ok()&&source.frozen(),"no premature completion or producer reuse");
   hold_read=false;Ok(reader.ResolveCpuPull(1000));
   Require(payload_reads==reads+2&&!std::memcmp(server.pool.data()+768,second.data()+32,64),"recovery uses snapshot without replay");
   offsets[0]=32;lengths[0]=64;
@@ -291,7 +378,7 @@ void UnifiedBatchCpuPull() {
   Require(!reader.BatchCpuPull({3,1},wrong,offsets,lengths).ok()&&!reader.pending_offload()&&payload_reads==reads+3,
           "selected MR size mismatch is rejected before READ without a pre-submit query");
   Ok(source.CancelBatch(ready));
-  Ok(source.Ready(views[1],&ready));Ok(source.CancelBatch(ready));
+  Ok(source.Ready(views[1],&ready));Ok(reader.CancelCpuPull(ready));Ok(source.CancelBatch(ready));
   Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok()&&!reader.pending_offload(),"cancelled Ready rolls back Put");
 
   // Terminal DMA failure must not publish keys or report a successful resolve.
@@ -301,17 +388,33 @@ void UnifiedBatchCpuPull() {
   Require(reader.core().PrepareAccessTable({{3,1}},&table).code()==kvaf::StatusCode::kNotFound,
           "aborted data is not published");
 
-  // Failed abort acknowledgement retains the abort decision, never commits.
-  Ok(source.Ready(views[1],&ready));fail_read=true;server.drop=unsigned(rp::Command::Complete);
-  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).ok()&&reader.pending_offload(),"lost abort ACK stays pending");
-  Require(!reader.ResolveCpuPull(1000).ok()&&!reader.pending_offload(),"resolved failure still reports failure");
-  fail_read=false;Ok(source.ReleaseBatch(ready));
+  // Lost submit before admission: Query sees NotSeen, then Cancel fences the
+  // sequence. Losing that ACK must keep the original reservation and intent.
+  Ok(source.Ready(views[1],&ready));server.lose_before_dispatch=true;
+  Require(reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).code()==kvaf::StatusCode::kInDoubt,
+          "pre-admission disconnect retains original Put");
+  server.drop=unsigned(rp::Command::Cancel);
+  Require(!reader.ResolveCpuPull(1000).ok()&&reader.pending_offload()&&source.frozen(),"lost Cancel ACK retains both ends");
+  Require(!reader.ResolveCpuPull(1000).ok()&&!reader.pending_offload(),"confirmed cancellation rolls back original Put");
+  const int cancelled_reads=payload_reads;
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths).ok() && payload_reads==cancelled_reads,
+          "late SubmitAndWait cannot resurrect cancelled sequence");
+  Ok(source.CancelBatch(ready));
 
-  Ok(source.Ready(views[1],&ready));server.drop=unsigned(rp::Command::Complete);
-  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,1000).ok()&&reader.pending_offload(),"lost commit ACK retains decision");
-  const int committed=payload_reads;Ok(reader.ResolveCpuPull(1000));
-  Require(payload_reads==committed,"commit recovery never replays READ");
-  Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
+  // Submit wins the race: cancellation must wait for DMA and may never
+  // convert a late Done into a metadata commit.
+  Ok(source.Ready(views[1],&ready));hold_read=true;
+  Require(!reader.BatchCpuPull({3,1},ready,offsets,lengths,0).ok(),"accepted task outlives caller timeout");
+  Require(!reader.CancelCpuPull(ready).ok()&&reader.pending_offload()&&source.frozen(),"running READ cannot be cancelled early");
+  hold_read=false;
+  for(int i=0;i<1000 && reader.pending_offload();++i) {
+    reader.ResolveCpuPull(0);
+    if(reader.pending_offload())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Require(!reader.pending_offload()&&reader.core().PrepareAccessTable({{3,1}},&table).code()==kvaf::StatusCode::kNotFound,
+          "resolved cancellation aborts keys even when READ finishes successfully");
+  Ok(reader.CancelCpuPull(ready)); // Retry after a lost application notification.
+  Ok(source.CancelBatch(ready));
 
   // A disconnected blocking RPC must not cancel or automatically replay READ.
   Ok(source.Ready(views[1],&ready));hold_read=true;server.disconnect_submit=true;
@@ -338,15 +441,15 @@ void UnifiedBatchCpuPull() {
   });
   for(int i=0;i<1000&&payload_reads==before_wait&&!returned;++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  const bool premature_reuse=source.ReleaseBatch(ready).ok();
+  const bool source_frozen=source.frozen();
   const bool waiter_active=!returned;
   hold_read=false;blocking_reader.join();
   Ok(blocking_status);
-  Require(!premature_reuse&&waiter_active,"producer Query is served while synchronous READ remains in flight");
+  Require(source_frozen&&waiter_active,"source stays frozen until application completion");
   Require(payload_reads==before_wait+1,"blocking response waits for exactly one READ");
   Ok(source.ReleaseBatch(ready));Ok(reader.core().BatchFree({{3,1}}));
 
-  // A v7 peer without timing support still returns a valid READ result.
+  // A matching peer without timing support still returns a valid READ result.
   Ok(source.Ready(views[1],&ready));server.omit_timing=true;
   Ok(reader.BatchCpuPull({3,1},ready,offsets,lengths,1000,&profile));
   Require(!profile.submit.server_available&&!reader.pending_offload(),
@@ -423,8 +526,8 @@ void ConnectorApi(){
   aclrtSetDevice(7);kvaf::CpuPullHbmSource producer(7,"00000000000000000000000000000001");
   Ok(producer.Register(ticket,{hbm.data(),hbm.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
   kvaf::ReadyToken ready;
-  server.drop=unsigned(rp::Command::Ready);
-  Require(!producer.Ready(&ready).ok()&&producer.frozen(),"lost identity-only Ready keeps batch frozen");
+  const int before_ready=server.control_calls;
+  Ok(producer.Ready(&ready));Require(producer.frozen()&&server.control_calls==before_ready,"Ready freezes locally");
   const auto sequence=ready.sequence;Ok(producer.Ready(&ready));Require(ready.sequence==sequence,"Ready retry reuses sequence");
   kvaf::PutHandle put;Ok(reader.PreparePut({1,3},{64,32},&put));
   kvaf::CpuPullState state;
@@ -493,7 +596,7 @@ void ConnectorApi(){
   Require(reader.WaitCpuPull(put,1,&state).code()==kvaf::StatusCode::kInDoubt,"timeout retains original put");
   hold_read=false;Ok(reader.WaitCpuPull(original_put,1000,&state));Require(state==kvaf::CpuPullState::Done,"wait stops at DMA completion");
   Require(put.submitted() && put.state()==state,"wait refreshes the shared put state");
-  Require(!producer.ReleaseBatch(ready).ok(),"producer waits for metadata acknowledgement");
+  Require(producer.frozen(),"producer remains frozen before the application notification");
   Ok(reader.SubmitCpuPull(ready,put,src,dst,sizes));
   Require(dst[0]==put.entries()[1].address-server.info.base && dst[1]==put.entries()[0].address-server.info.base+32,
           "submission preserves application offset arrays");
@@ -506,9 +609,9 @@ void ConnectorApi(){
   Require(payload_reads==reads+1,"duplicate does not issue a second READ");
   Require(!std::memcmp(server.pool.data()+256,hbm.data()+100,32)&&!std::memcmp(server.pool.data()+288,hbm.data()+7,32)&&
           !std::memcmp(server.pool.data()+768,hbm.data()+200,32),"split/reordered CopyArrays copied correct data");
-  server.drop=unsigned(rp::Command::Complete);
-  Require(!reader.CommitPut(put).ok()&&reader.pending_offload(),"lost commit acknowledgement retains transaction");
-  Require(!reader.AbortPut(put).ok(),"cannot reverse committed metadata");
+  const int before_commit=server.control_calls;
+  Ok(reader.CommitPut(put));
+  Require(!reader.AbortPut(put).ok()&&server.control_calls==before_commit,"metadata commit is local and irreversible");
   Ok(reader.CommitPut(put));Ok(reader.CommitPut(put));Ok(producer.ReleaseBatch(ready));
   Ok(reader.QueryCpuPull(put,&state));Require(state==kvaf::CpuPullState::Committed&&payload_reads==reads+1,"completed handle remains queryable without replay");
   kvaf::AccessTableHandle table;Ok(reader.core().PrepareAccessTable({{1,3}},&table));
@@ -521,7 +624,7 @@ void ConnectorApi(){
   Ok(reader.CommitPut(put));Require(reader.pending_offload(),"old commit cannot finish a newer Put");
   Ok(reader.WaitCpuPull(put,0,&state));Require(state==kvaf::CpuPullState::Committed && !second.submitted(),
           "waiting on completed put cannot query or change a new reservation");
-  Ok(reader.AbortPut(second));Ok(producer.CancelBatch(ready));
+  Ok(reader.AbortPut(second));Ok(reader.CancelCpuPull(ready));Ok(producer.CancelBatch(ready));
   Ok(reader.QueryCpuPull(second,&state));Require(state==kvaf::CpuPullState::Aborted && !second.submitted(),
           "unsubmitted abort remains queryable on the original put");
   Require(!reader.WaitCpuPull(second,0,&state).ok(),"aborted put is not a successful READ");
@@ -532,7 +635,9 @@ void ConnectorApi(){
   Ok(reader.WaitCpuPull(second,1000,&state));Ok(reader.AbortPut(second));Ok(producer.ReleaseBatch(ready));
   // A recorded request may fail before CPU accepts it; submitted is not success.
   Ok(producer.Ready(&ready));Ok(reader.PreparePut({0},{32},&second));
-  destination={second.entries()[0].address-server.info.base};Ok(producer.CancelBatch(ready));
+  destination={second.entries()[0].address-server.info.base};
+  Ok(reader.AbortPut(second));Ok(reader.CancelCpuPull(ready));Ok(producer.CancelBatch(ready));
+  Ok(reader.PreparePut({0},{32},&second));
   const int before_rejection=payload_reads;
   Require(!reader.SubmitCpuPull(ready,second,one,destination,length).ok() && second.submitted(),
           "pre-submit remote rejection leaves the recorded request on put");
@@ -586,7 +691,7 @@ void ConnectorQuarantine(bool batch){
     if(batch) Require(!reader.ResolveCpuPull(0).ok(),"resolve cannot turn quarantine into completion");
     else Require(!reader.CommitPut(put).ok()&&!reader.AbortPut(put).ok(),"uncertain DMA forbids commit and abort");
     Require(!reader.Shutdown().ok(),"uncertain DMA retains DDR");
-    Require(!producer.CancelBatch(ready).ok()&&!producer.ReleaseBatch(ready).ok()&&!producer.Shutdown().ok(),"uncertain DMA retains producer registration");
+    Require(!reader.CancelCpuPull(ready).ok()&&producer.frozen()&&!producer.Shutdown().ok(),"uncertain DMA retains producer registration");
     if(batch) Require(!reader.BatchCpuPull({0},ready,offsets,sizes).ok(),"pending wrapper cannot resubmit");
     else Ok(reader.SubmitCpuPull(ready,put,offsets,destinations,sizes));
     Require(payload_reads==reads&&reader.pending_offload(),"quarantined duplicate never retries READ");
@@ -632,30 +737,16 @@ void MultipleMemorySource() {
     const auto index=n%78;
     std::fill(tensors[index].begin(),tensors[index].end(),std::uint8_t(n+11));
     if(n==0) {
-      server.drop=unsigned(rp::Command::Ready);
-      Require(!source.Ready(views[index],&ready).ok()&&source.frozen(),"lost Ready retains selected MR");
+      Ok(source.Ready(views[index],&ready));
       kvaf::ReadyToken other;
-      Require(!source.Ready(views[1],&other).ok(),"lost Ready cannot switch MR");
+      Require(!source.Ready(views[1],&other).ok(),"frozen batch cannot switch MR");
     }
     Ok(source.Ready(views[index],&ready));
     Require(ready.mr_id==index+1,"Ready selects tensor MR");
     const auto& desc=std::get<kvaf::CpuPullSourceDesc>(ready.source);
     Require(desc.mr_length==tensors[index].size(),"Ready carries only the selected MR length");
-    if(n==50) {
-      auto wrong=ready;std::get<kvaf::CpuPullSourceDesc>(wrong.source).mr_length++;
-      const int queries=server.query_calls,submits=server.submit_calls,sync_submits=server.sync_submit_calls;
-      Require(!reader.BatchCpuPull({1,2},wrong,std::vector<std::uint64_t>{7,300},{64,32}).ok()&&
-              !reader.pending_offload(),"CPU checks the selected MR size without an initialization manifest exchange");
-      Require(server.query_calls==queries&&server.submit_calls==submits&&
-              server.sync_submit_calls==sync_submits+1&&payload_reads==reads+50,
-              "synchronous Submit validates selected MR before READ without a pre-submit Query");
-    }
     auto stale=ready;stale.mr_id=index==0?2:1;
     Require(!source.ReleaseBatch(stale).ok()&&!source.CancelBatch(stale).ok(),"producer acknowledgement binds MR");
-    auto forged=rp::MakeRequest(rp::Command::Ready);forged.region=ticket.region_id;forged.epoch=ticket.epoch;
-    forged.token=ticket.token;forged.source_id=desc.source_id;forged.task=ready.sequence;forged.mr_id=stale.mr_id;
-    rp::Response response;Ok(rp::Exchange(ticket.address,forged,{},&response));
-    Require(response.result!=rp::Result::Ok,"server rejects same sequence with changed MR");
     if (n % 2) {
       std::vector<std::uint64_t> src{7,views[index].bytes-32},lengths{64,32};
       auto outside=src;outside[1]++;
@@ -682,4 +773,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();RejectedCancelPreservesLastBatch();AdmissionAndReplay();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

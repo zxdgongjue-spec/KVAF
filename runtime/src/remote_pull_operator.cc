@@ -27,7 +27,7 @@ Status RemotePullOperator::Initialize(const RemoteRegionDesc& region) {
   return aiv_ ? aiv_->Initialize(region) : Status::OK();
 }
 Status RemotePullOperator::CanShutdown() const {
-  if (active_) return Status::InDoubt("resolve remote source Offload before shutdown");
+  if (pending()) return Status::InDoubt("resolve remote source Offload before shutdown");
   if (ticket_.region_id) {
     auto r = rp::MakeRequest(rp::Command::Describe); r.region = ticket_.region_id;
     r.token = ticket_.token;
@@ -46,29 +46,29 @@ Status RemotePullOperator::Shutdown() {
   return status;
 }
 Status RemotePullOperator::ExecuteBatchGet(const BatchGetExecRequest& r) {
-  if (active_) return Status::Busy("remote source Offload pending");
+  if (pending()) return Status::Busy("remote source Offload pending");
   return aiv_ ? aiv_->ExecuteBatchGet(r) : Status::NotImplemented("BatchGet is not enabled");
 }
 Status RemotePullOperator::ExecuteBatchPut(const BatchPutExecRequest& r) {
-  if (active_) return Status::Busy("remote source Offload pending");
+  if (pending()) return Status::Busy("remote source Offload pending");
   return aiv_ ? aiv_->ExecuteBatchPut(r) : Status::NotImplemented("AIV BatchPut is not enabled");
 }
 Status RemotePullOperator::CompleteOffload(bool committed) {
   if (!active_) return Status::OK();
-  auto r = Request(ticket_, current_, rp::Command::Complete); r.flags = committed ? 1 : 0;
-  rp::Response response{}; auto status = channel_.Exchange(ticket_.address, r, {}, &response);
-  if (!status.ok()) return status;
-  if (response.result != rp::Result::Ok) return Status::InDoubt("CPU did not acknowledge A's metadata decision");
+  // RuntimeCore has finished the original Put's local metadata decision.
   committed_ = committed;
+  finished_ = true;
   active_ = false; return Status::OK();
 }
 Status RemotePullOperator::LastChecksum(std::uint64_t* checksum) const {
-  if (!checksum || active_ || !current_.sequence) return Status::InvalidState("no completed remote Offload checksum");
+  if (!checksum || pending() || !current_.sequence) return Status::InvalidState("no completed remote Offload checksum");
   if (!committed_) return Status::InvalidState("last CPU Pull was not committed");
   rp::Response response{};
-  auto status = channel_.Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Checksum), {}, &response);
+  auto r = Request(ticket_, current_, rp::Command::Checksum);
+  r.operation = operation_;
+  auto status = channel_.Exchange(ticket_.address, r, {}, &response);
   if (!status.ok()) return status;
-  if (response.result != rp::Result::Ok || response.state != rp::State::Committed)
+  if (response.result != rp::Result::Ok || response.state != rp::State::Done)
     return Status::InvalidState("remote Offload checksum unavailable; verify before next Ready or source detach, with DDR slots retained");
   *checksum = response.checksum; return Status::OK();
 }
@@ -79,7 +79,7 @@ Status RemotePullOperator::ValidateCpuSource(const CpuPullSourceDesc& source) {
   return Status::OK();
 }
 Status RemotePullOperator::BuildSpans(const CpuPullRequest& request, std::vector<rp::Span>* output, bool prepared) const {
-  if (active_) return Status::Busy("previous CPU Pull is unresolved");
+  if (pending()) return Status::Busy("previous CPU Pull is unresolved");
   const auto& source = request.source;
   if (source.region_id != ticket_.region_id || source.region_epoch != ticket_.epoch ||
       !request.sequence || !source.source_id || request.copies.source.size() != request.copies.lengths.size() ||
@@ -94,21 +94,8 @@ Status RemotePullOperator::BuildSpans(const CpuPullRequest& request, std::vector
   return Status::OK();
 }
 Status RemotePullOperator::SubmitCpuPull(const CpuPullRequest& request) {
-  std::vector<rp::Span> spans;
-  auto status = BuildSpans(request, &spans);
-  if (!status.ok()) return status;
-  const auto& source = request.source;
-  rp::Response response{};
-  status = channel_.Exchange(ticket_.address, Request(ticket_, request, rp::Command::Query), {}, &response);
-  if (!status.ok()) return Status::Internal("CPU Pull pre-submit query failed; no READ submitted: "+status.message());
-  if (response.result != rp::Result::Ok || response.state != rp::State::Ready || response.memory.bytes != source.mr_length)
-    return Status::InvalidState("CPU Pull batch is not Ready");
-  current_ = request; active_ = true; committed_ = false;
-  status = channel_.Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Submit), spans, &response);
-  if (!status.ok()) return status;
-  // Even a rejected Submit is resolved by Query before slots are released.
-  if (response.result != rp::Result::Ok) return Status::InDoubt("CPU Pull submit rejected; query the original task before aborting");
-  return Status::OK();
+  CpuPullState state;
+  return SubmitImpl(request, rp::Command::Submit, 0, &state, nullptr, false);
 }
 Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request,
                                                 std::uint32_t timeout_ms, CpuPullState* state) {
@@ -116,26 +103,28 @@ Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request,
 }
 Status RemotePullOperator::SubmitCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
                                                 CpuPullState* state, CpuPullSubmitTiming* profile) {
-  return SubmitCpuPullAndWaitImpl(request, timeout_ms, state, profile, false);
+  return SubmitImpl(request, rp::Command::SubmitAndWait, timeout_ms, state, profile, false);
 }
 Status RemotePullOperator::SubmitPreparedCpuPullAndWait(const CpuPullRequest& request, std::uint32_t timeout_ms,
                                                        CpuPullState* state, CpuPullSubmitTiming* profile) {
-  return SubmitCpuPullAndWaitImpl(request, timeout_ms, state, profile, true);
+  return SubmitImpl(request, rp::Command::SubmitAndWait, timeout_ms, state, profile, true);
 }
-Status RemotePullOperator::SubmitCpuPullAndWaitImpl(const CpuPullRequest& request, std::uint32_t timeout_ms,
-                                                   CpuPullState* state, CpuPullSubmitTiming* profile, bool prepared) {
+Status RemotePullOperator::SubmitImpl(const CpuPullRequest& request, rp::Command command, std::uint32_t timeout_ms,
+                                      CpuPullState* state, CpuPullSubmitTiming* profile, bool prepared) {
   if (!state) return Status::InvalidArgument("missing CPU Pull result");
   std::vector<rp::Span> spans;
   Status status;
   { CpuPullStageTimer timer(profile ? &profile->span_prepare_us : nullptr);
     status = BuildSpans(request, &spans, prepared); }
   if (!status.ok()) return status;
-  auto r = Request(ticket_, request, rp::Command::SubmitAndWait);
+  if (operation_ == UINT64_MAX) return Status::InvalidState("CPU Pull operation IDs exhausted");
+  auto r = Request(ticket_, request, command);
+  r.operation = ++operation_;
   r.timeout_ms = timeout_ms;
   if (profile) r.flags |= rp::kSubmitProfile;
   r.source.bytes = request.source.mr_length;
   { CpuPullStageTimer timer(profile ? &profile->request_save_us : nullptr);
-    current_ = request; active_ = true; committed_ = false; }
+    current_ = request; active_ = true; finished_ = committed_ = false; cancelling_ = false; }
   rp::Response response{};
   status = channel_.Exchange(ticket_.address, r, spans, &response, profile);
   if (!status.ok()) return status; // Never replay a possibly accepted READ.
@@ -149,12 +138,15 @@ Status RemotePullOperator::SubmitCpuPullAndWaitImpl(const CpuPullRequest& reques
     if (response.result == rp::Result::Ok) return Status::InDoubt("CPU omitted Pull acceptance state");
     // The CPU definitively rejected this submission before starting a READ.
     active_ = false;
-    return Status::InvalidState("CPU rejected synchronous Pull before READ acceptance");
+    return Status::InvalidState("CPU rejected Pull before READ acceptance");
   }
   if (response.result != rp::Result::Ok &&
       !(response.result == rp::Result::Failed && response.state == rp::State::Failed))
     return Status::InDoubt("CPU Pull request conflicts with an existing task; retain slots");
   switch (response.state) {
+    case rp::State::Running:
+      if (command == rp::Command::Submit) { *state = CpuPullState::Running; return Status::OK(); }
+      return Status::InDoubt("CPU Pull still running; retain original Put");
     case rp::State::Done: *state = CpuPullState::Done; return Status::OK();
     case rp::State::Failed:
       *state = CpuPullState::Failed;
@@ -165,17 +157,66 @@ Status RemotePullOperator::SubmitCpuPullAndWaitImpl(const CpuPullRequest& reques
   }
 }
 Status RemotePullOperator::QueryCpuPull(CpuPullState* state) {
-  if (!active_ || !state) return Status::InvalidState("no active CPU Pull task");
+  return InspectTask(rp::Command::Query, state);
+}
+Status RemotePullOperator::InspectTask(rp::Command command, CpuPullState* state) {
+  if (!active_ || !state || current_.copies.source.empty()) return Status::InvalidState("no submitted CPU Pull task");
   rp::Response response{};
-  auto status = channel_.Exchange(ticket_.address, Request(ticket_, current_, rp::Command::Query), {}, &response);
+  auto r = Request(ticket_, current_, command);
+  r.operation = operation_;
+  auto status = channel_.Exchange(ticket_.address, r, {}, &response);
   if (!status.ok()) return status;
-  if (response.result != rp::Result::Ok) return Status::InDoubt("cannot identify CPU Pull task");
+  if (response.result != rp::Result::Ok) return Status::InDoubt("cannot identify original CPU Pull task");
+  if (response.state == rp::State::NotSeen && command == rp::Command::Query) {
+    // Query may overtake the original submit. Fence it before exposing failure,
+    // and retain the abort decision even if Cancel loses the race or its ACK.
+    cancelling_ = true;
+    return InspectTask(rp::Command::Cancel, state);
+  }
   switch (response.state) {
-    case rp::State::Done: *state = CpuPullState::Done; break;
+    case rp::State::Done: *state = cancelling_ ? CpuPullState::Failed : CpuPullState::Done; break;
     case rp::State::Running: *state = CpuPullState::Running; break;
-    case rp::State::Ready: case rp::State::Failed: case rp::State::Cancelled: *state = CpuPullState::Failed; break;
+    case rp::State::Failed: case rp::State::Cancelled: *state = CpuPullState::Failed; break;
     default: *state = CpuPullState::InDoubt; break;
   }
   return Status::OK();
 }
+Status RemotePullOperator::CancelCpuPull(const ReadyToken& ready) {
+  const auto* source = std::get_if<CpuPullSourceDesc>(&ready.source);
+  if (!source || !ready.sequence || !ready.mr_id || ready.mr_id > rp::kMaxSourceMrs)
+    return Status::InvalidArgument("invalid CPU Pull cancellation token");
+  auto status = ValidateCpuSource(*source);
+  if (!status.ok()) return status;
+  const auto& tracked = pending_cancel_ ? *pending_cancel_ : current_;
+  const bool same = SameSource(tracked.source, *source) && tracked.sequence == ready.sequence &&
+                    tracked.mr_id == ready.mr_id;
+  if (!pending() && finished_ && same)
+    return committed_ ? Status::InvalidState("cannot cancel an already committed Put") : Status::OK();
+  if (pending() && !same)
+    return Status::Busy("another CPU Pull is pending");
+  if (active_) {
+    cancelling_ = true;
+    CpuPullState state;
+    status = InspectTask(rp::Command::Cancel, &state);
+    if (!status.ok()) return status;
+    return state == CpuPullState::Failed ? Status::OK() : Status::InDoubt("READ unresolved; retain original Put");
+  }
+  // Track the fence across a lost reply without replacing the last completed batch.
+  pending_cancel_ = CpuPullRequest{*source, ready.sequence, {}, ready.mr_id};
+  auto r = Request(ticket_, *pending_cancel_, rp::Command::Cancel);
+  r.source.bytes = source->mr_length;
+  rp::Response response{};
+  status = channel_.Exchange(ticket_.address, r, {}, &response);
+  if (!status.ok()) return status;
+  if (response.result == rp::Result::Ok && response.state == rp::State::Cancelled) {
+    current_ = std::move(*pending_cancel_);
+    finished_ = true;
+    committed_ = false;
+  } else {
+    status = Status::InvalidState("unused CPU Pull cancellation rejected");
+  }
+  pending_cancel_.reset();
+  return status;
+}
+
 }

@@ -21,6 +21,8 @@ const std::vector<PutAllocation>& PutHandle::entries() const {
 CpuPullState PutHandle::state() const { return state_ ? state_->state : CpuPullState::Aborted; }
 bool PutHandle::submitted() const { return state_ && state_->submitted; }
 
+bool PutHandle::aborting() const { return state_ && state_->decision_set && !state_->commit; }
+
 Status RuntimeCore::PreparePut(const std::vector<KeyId>& keys,
                                const std::vector<std::uint64_t>& lengths, PutHandle* out) {
   if (!initialized_ || closing_) return Status::InvalidState("initialize Runtime before PreparePut");
@@ -190,6 +192,27 @@ Status RuntimeCore::FinishConnectorPut(const PutHandle& put, bool commit) {
   p.state = commit ? CpuPullState::Committed : CpuPullState::Aborted;
   connector_put_.reset();
   return Status::OK();
+}
+Status RuntimeCore::CancelCpuPull(const ReadyToken& ready) {
+  if (!initialized_) return Status::NotInitialized("initialize DDR before cancelling CPU Pull");
+  if (!connector_put_) return access_operator_.CancelCpuPull(ready);
+  auto& p = *connector_put_;
+  if (p.submitted) {
+    const auto* source = std::get_if<CpuPullSourceDesc>(&ready.source);
+    if (!source || !SameSource(*source, p.request.source) || ready.sequence != p.request.sequence ||
+        ready.mr_id != p.request.mr_id) return Status::InvalidArgument("cancel token does not match the pending Put");
+  } else {
+    return Status::Busy("abort the unsubmitted Put before cancelling an unused token");
+  }
+  if (p.decision_set && p.commit) return Status::InvalidState("cannot reverse a commit decision");
+  p.decision_set = true; p.commit = false;
+  if (p.state != CpuPullState::Failed && p.state != CpuPullState::Done) {
+    auto status = access_operator_.CancelCpuPull(ready);
+    if (!status.ok()) return status;
+    p.state = CpuPullState::Failed;
+  }
+  PutHandle put; put.state_ = connector_put_;
+  return AbortPut(put);
 }
 Status RuntimeCore::CommitPut(const PutHandle& put) { return FinishConnectorPut(put, true); }
 Status RuntimeCore::AbortPut(const PutHandle& put) { return FinishConnectorPut(put, false); }

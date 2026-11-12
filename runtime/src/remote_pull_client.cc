@@ -102,7 +102,7 @@ Status ControlChannel::Exchange(const std::string& address, Request request,
     return Status::InDoubt("CPU control response unavailable or version mismatch; retain source and task");
   }
   if (response->region != request.region || response->source_id != request.source_id || response->task != request.task ||
-      response->mr_id != request.mr_id || (request.epoch && response->epoch != request.epoch)) {
+      response->mr_id != request.mr_id || response->operation != request.operation || (request.epoch && response->epoch != request.epoch)) {
     Close();
     return Status::InDoubt("CPU response identity/version mismatch");
   }
