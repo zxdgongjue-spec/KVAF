@@ -8,6 +8,7 @@
 #include "execution_context.h"
 
 namespace kvaf {
+class GetDispatchTrace;
 // Policy and direction scheduling. ResourceManager owns sessions/workspaces;
 // execution contexts retain typed exclusive leases until actual completion.
 class ExecutionDispatcher final : public AccessOperator {
@@ -46,6 +47,7 @@ class ExecutionDispatcher final : public AccessOperator {
   mutable std::shared_mutex lifecycle_;
   std::mutex put_mutex_, get_mutex_;
   ExecutionResourceManager resources_;
+  std::unique_ptr<GetDispatchTrace> get_trace_;
   std::unique_ptr<PutExecutionContext> pending_put_;
   std::unique_ptr<GetExecutionContext> pending_get_;
   std::uint64_t graph_id_{0}, next_graph_id_{1};

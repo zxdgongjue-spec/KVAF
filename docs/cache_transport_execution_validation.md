@@ -514,7 +514,43 @@ Host 扫描 CSV 标记 `timing=host_call_to_completion`，输出 `host_*_us`、
 Host 对照扫描采用固定路由，不执行 adaptive 校准；如需固定 CPU UB 设备，两边使用
 相同 `--peer-ub-device`。单点 legacy 的原 adaptive 和 cycle profiling 能力保留。
 
-### 7.3 多卡 graph 与便携检查
+### 7.3 按次 Get 调度分段计时
+
+仅诊断普通 per-call Get。设置 `KVAF_GET_DISPATCH_TRACE` 后，Runtime 将样本缓存在
+内存中，在 `shutdown()` 时写成 CSV；未设置时不读时钟，也不写文件。每次测试使用
+不同的 CSV 路径。需重新构建 NPU 客户端，CPU 服务无须修改。UBMEM 示例：
+
+```bash
+KVAF_GET_DISPATCH_TRACE="$PWD/ubmem-dispatch.csv" \
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+  --execution-mode per-call --transport ubmem \
+  --request-length 32768 --miss-count 4096 --table-capacity 4096 \
+  --token-bytes 656 --tokens-per-block 128 --aiv-cores 5 \
+  --no-kernel-profile --warmup 10 --iterations 100
+python3 tests/python/summarize_get_dispatch_trace.py ubmem-dispatch.csv --last 100
+```
+
+Scatter 示例（使用原单点负载；`PYTHONPATH` 指向同一次构建）：
+
+```bash
+PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
+KVAF_GET_DISPATCH_TRACE="$PWD/scatter-dispatch.csv" \
+python3 access_operator/demo/aicpu_batch_get/python/benchmark_cpu_push_scatter.py \
+  --execution-mode per-call --peer 127.0.0.1:38999 --device-id 6 \
+  --workers 5 --token-bytes 656 --miss-count 8192 --warmup 10 --iterations 100
+python3 tests/python/summarize_get_dispatch_trace.py scatter-dispatch.csv --last 100
+```
+
+`--last` 排除前面的正确性检查和预热调用。提交样本拆为锁等待、配置解析、前次
+完成处理、上下文构造、资源需求查询、租约获取、状态绑定、provider 的需求查询、
+Warmup、provider 执行及同步调用的上下文释放。`outside_provider` 是整段提交减去
+provider 执行，包含计时本身及未单独列出的少量代码。异步 UBMEM 的 `provider`
+主要是提交；`drain` 行另计事件等待、状态回拷和上下文释放。同步 Scatter 的
+`provider` 包含设备完成等待，通常不会产生独立的 `drain` 行。各字段的 P50
+来自不同样本，不应相加；这份诊断数据也不替代关闭计时后的最终性能对照。
+
+### 7.4 多卡 graph 与便携检查
 
 per-call graph 当前每个租约只允许捕获一次 Get，测试时两种模式均指定
 `--graph-calls 1`，例如在原多卡命令后追加：

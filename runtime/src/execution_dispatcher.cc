@@ -1,11 +1,58 @@
 #include "execution_dispatcher.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
+#include <vector>
 
 namespace kvaf {
+class GetDispatchTrace {
+ public:
+  struct Row {
+    const char* event{};
+    std::uint64_t lock_ns{}, resolve_ns{}, previous_drain_ns{}, context_ns{};
+    std::uint64_t describe_ns{}, acquire_ns{}, bind_ns{};
+    GetLaunchTiming launch;
+    std::uint64_t context_release_ns{}, drain_provider_ns{}, drain_release_ns{}, total_ns{};
+  };
+  explicit GetDispatchTrace(std::string path) : path_(std::move(path)) { rows_.reserve(256); }
+  ~GetDispatchTrace() { Flush(); }
+  void Flush() {
+    if (rows_.empty()) return;
+    std::ofstream output(path_, std::ios::app);
+    if (!output) {
+      std::fprintf(stderr, "[KVAF] cannot write Get dispatch trace: %s\n", path_.c_str());
+      return;
+    }
+    output.seekp(0, std::ios::end);
+    if (output.tellp() == 0)
+      output << "event,index,lock_ns,resolve_ns,previous_drain_ns,context_ns,describe_ns,"
+                "acquire_ns,bind_ns,requirements_ns,warmup_ns,provider_ns,context_release_ns,"
+                "drain_provider_ns,drain_release_ns,total_ns\n";
+    for (const auto& row : rows_)
+      output << row.event << ',' << ++next_index_ << ',' << row.lock_ns << ',' << row.resolve_ns
+             << ',' << row.previous_drain_ns << ',' << row.context_ns << ',' << row.describe_ns
+             << ',' << row.acquire_ns << ',' << row.bind_ns << ',' << row.launch.requirements_ns
+             << ',' << row.launch.warmup_ns << ',' << row.launch.provider_ns << ','
+             << row.context_release_ns << ',' << row.drain_provider_ns << ','
+             << row.drain_release_ns << ',' << row.total_ns << '\n';
+    rows_.clear();
+  }
+  void Record(Row row) { rows_.push_back(row); }
+ private:
+  std::string path_;
+  std::vector<Row> rows_;
+  std::uint64_t next_index_{};
+};
 namespace {
-Status LaunchGet(GetExecutionContext& context) {
+std::uint64_t TraceNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+Status LaunchGet(GetExecutionContext& context, GetLaunchTiming* timing = nullptr) {
   try {
-    return context.lease.view().Launch(context.invocation());
+    return context.lease.view().Launch(context.invocation(), timing);
   } catch (const std::exception& e) {
     return Status::CompletionUnknown(std::string("provider Get threw after submission: ") + e.what());
   } catch (...) {
@@ -15,6 +62,8 @@ Status LaunchGet(GetExecutionContext& context) {
 }  // namespace
 ExecutionDispatcher::ExecutionDispatcher(ExecutionPolicy policy) : policy_(std::move(policy)) {
   policy_status_ = NormalizeExecutionPolicy(&policy_);
+  if (const char* path = std::getenv("KVAF_GET_DISPATCH_TRACE"); path && *path)
+    get_trace_ = std::make_unique<GetDispatchTrace>(path);
 }
 ExecutionDispatcher::~ExecutionDispatcher() {
   if (!Shutdown().ok()) {
@@ -166,19 +215,32 @@ Status ExecutionDispatcher::DrainGetLocked() {
   if (graph_id_) return Status::Busy("Get graph lease owns this direction");
   if (output_context_) return output_context_->lease.view().Drain();
   if (!pending_get_) return Status::OK();
+  GetDispatchTrace::Row row{};
+  const auto started = get_trace_ ? TraceNowNs() : 0;
   auto s = pending_get_->cleanup_only ? resources_.Close(pending_get_->lease)
                                       : pending_get_->lease.view().Drain();
+  const auto drained = get_trace_ ? TraceNowNs() : 0;
   if (s.ok()) pending_get_.reset();
+  if (get_trace_) {
+    row.event = "drain";
+    row.drain_provider_ns = drained - started;
+    row.drain_release_ns = TraceNowNs() - drained;
+    row.total_ns = TraceNowNs() - started;
+    get_trace_->Record(row);
+  }
   return s;
 }
 Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) {
+  const auto started = get_trace_ ? TraceNowNs() : 0;
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
+  const auto locked = get_trace_ ? TraceNowNs() : 0;
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   if (!request.request) return Status::InvalidArgument("missing Get request");
   GetExecutionConfig c;
   auto s = ResolveExecution(policy_, request.execution.config, &c);
   if (!s.ok()) return s;
+  const auto resolved = get_trace_ ? TraceNowNs() : 0;
   if (output_id_ || request.execution.output_lease) {
     if (!output_id_ || request.execution.output_lease != output_id_ ||
         request.execution.graph_lease || !(c == output_context_->config))
@@ -209,22 +271,44 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
     graph_captured_ = true;
     return LaunchGet(*graph_context_);
   }
+  GetDispatchTrace::Row row{};
+  if (get_trace_) {
+    row.event = "submit";
+    row.lock_ns = locked - started;
+    row.resolve_ns = resolved - locked;
+  }
+  auto phase = get_trace_ ? TraceNowNs() : 0;
   s = DrainGetLocked();
   if (!s.ok()) return s;
+  if (get_trace_) row.previous_drain_ns = TraceNowNs() - phase;
+  phase = get_trace_ ? TraceNowNs() : 0;
   auto context = std::make_unique<GetExecutionContext>();
   context->config = c;
   context->request = *request.request;
   context->table = request.host_access_table;
   context->options = request.execution;
   context->options.config = c;
+  if (get_trace_) row.context_ns = TraceNowNs() - phase;
   GetResourceRequirements requirements;
+  phase = get_trace_ ? TraceNowNs() : 0;
   s = resources_.Describe(c, context->request, &requirements);
+  if (get_trace_) row.describe_ns = TraceNowNs() - phase;
+  phase = get_trace_ ? TraceNowNs() : 0;
   if (s.ok()) s = resources_.AcquireGet(requirements, &context->lease);
+  if (get_trace_) row.acquire_ns = TraceNowNs() - phase;
+  phase = get_trace_ ? TraceNowNs() : 0;
   if (s.ok()) s = context->Bind();
+  if (get_trace_) row.bind_ns = TraceNowNs() - phase;
   if (!s.ok()) return s;
   pending_get_ = std::move(context);
-  s = LaunchGet(*pending_get_);
+  s = LaunchGet(*pending_get_, get_trace_ ? &row.launch : nullptr);
+  phase = get_trace_ ? TraceNowNs() : 0;
   if (s.ok() && request.execution.synchronize) pending_get_.reset();
+  if (get_trace_) {
+    row.context_release_ns = TraceNowNs() - phase;
+    row.total_ns = TraceNowNs() - started;
+    get_trace_->Record(row);
+  }
   return s;
 }
 Status ExecutionDispatcher::DrainGet() {
@@ -368,6 +452,7 @@ Status ExecutionDispatcher::Shutdown() {
   auto s = resources_.Shutdown();
   if (!s.ok() && first.ok()) first = s;
   if (first.ok()) region_ = {};
+  if (get_trace_) get_trace_->Flush();
   return first;
 }
 }  // namespace kvaf

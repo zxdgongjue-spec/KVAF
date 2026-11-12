@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -53,14 +55,38 @@ class PutResourceView {
   AccessOperator* op_;
   ExecutionResourceOwner* resources_;
 };
+struct GetLaunchTiming {
+  std::uint64_t requirements_ns{}, warmup_ns{}, provider_ns{};
+};
 class GetResourceView {
  public:
-  Status Launch(const BatchGetExecRequest& r) const {
+  Status Launch(const BatchGetExecRequest& r, GetLaunchTiming* timing = nullptr) const {
     if (!r.request) return Status::InvalidArgument("missing Get request");
+    if (!timing) {
+      std::uint32_t capacity{};
+      auto s = op_->DescribeRequirements(*r.request, &capacity);
+      if (s.ok() && !r.execution.graph_lease) s = Warmup({capacity, r.execution.stream});
+      return s.ok() ? op_->ExecuteBatchGet(r) : s;
+    }
+    const auto now = [] {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     std::uint32_t capacity{};
+    auto start = now();
     auto s = op_->DescribeRequirements(*r.request, &capacity);
-    if (s.ok() && !r.execution.graph_lease) s = Warmup({capacity, r.execution.stream});
-    return s.ok() ? op_->ExecuteBatchGet(r) : s;
+    timing->requirements_ns = now() - start;
+    if (s.ok() && !r.execution.graph_lease) {
+      start = now();
+      s = Warmup({capacity, r.execution.stream});
+      timing->warmup_ns = now() - start;
+    }
+    if (s.ok()) {
+      start = now();
+      s = op_->ExecuteBatchGet(r);
+      timing->provider_ns = now() - start;
+    }
+    return s;
   }
   Status Drain() const { return op_->DrainGet(); }
   Status PrepareOutput(const GetOutputOptions& r) const {

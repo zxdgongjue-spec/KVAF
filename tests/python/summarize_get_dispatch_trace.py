@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Summarize opt-in per-call Get dispatcher timing CSV from the NPU runtime."""
+
+import argparse
+import csv
+from pathlib import Path
+
+
+SUBMIT_FIELDS = (
+    "total_ns", "lock_ns", "resolve_ns", "previous_drain_ns", "context_ns",
+    "describe_ns", "acquire_ns", "bind_ns", "requirements_ns", "warmup_ns",
+    "provider_ns", "context_release_ns", "outside_provider_ns",
+)
+DRAIN_FIELDS = ("total_ns", "drain_provider_ns", "drain_release_ns")
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def summarize(rows, event, fields):
+    if not rows:
+        print(f"GET_DISPATCH_TIMING event={event} samples=0")
+        return
+    print(f"GET_DISPATCH_TIMING event={event} samples={len(rows)} unit=us")
+    for field in fields:
+        values = [row[field] / 1000 for row in rows]
+        print(f"  {field.removesuffix('_ns')}: p50={percentile(values, 0.5):.2f} "
+              f"p90={percentile(values, 0.9):.2f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trace", type=Path)
+    parser.add_argument("--last", type=int, default=0,
+                        help="take the last N samples of each event, excluding preflight and warmup")
+    args = parser.parse_args()
+    if args.last < 0:
+        parser.error("--last must be nonnegative")
+    with args.trace.open(newline="") as source:
+        rows = list(csv.DictReader(source))
+    for event, fields in (("submit", SUBMIT_FIELDS), ("drain", DRAIN_FIELDS)):
+        selected = [row for row in rows if row["event"] == event]
+        if args.last:
+            selected = selected[-args.last:]
+        parsed = [{key: int(value) for key, value in row.items()
+                   if key not in ("event", "index")} for row in selected]
+        for row in parsed:
+            row["outside_provider_ns"] = row["total_ns"] - row["provider_ns"]
+        summarize(parsed, event, fields)
+
+
+if __name__ == "__main__":
+    main()
