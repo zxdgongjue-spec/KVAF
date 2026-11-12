@@ -388,12 +388,13 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   }
   auto result = ReadProbe(&s.args.probe);
   if (!result.ok()) return result;
-  const char* check_status = std::getenv("KVAF_AIV_GATHER_CHECK_STATUS");
-  s.check_async_status = check_status && std::strcmp(check_status, "1") == 0;
   const char* graph = std::getenv("KVAF_AIV_GATHER_GRAPH");
   s.graph_mode = graph && std::strcmp(graph, "1") == 0;
-  if (s.graph_mode && (s.args.probe || s.check_async_status))
-    return Status::InvalidArgument("gather graph requires probe and async status checking to be disabled");
+  if (s.graph_mode && s.args.probe)
+    return Status::InvalidArgument("gather graph requires prefix probes to be disabled");
+  const char* check_status = std::getenv("KVAF_AIV_GATHER_CHECK_STATUS");
+  // Graph warmup and each replay are already checked outside capture.
+  s.check_async_status = !s.graph_mode && check_status && std::strcmp(check_status, "1") == 0;
   s.args.max_polls = 100000000U;
   const char* max_polls = std::getenv("KVAF_AIV_GATHER_MAX_POLLS");
   if (max_polls && *max_polls) {

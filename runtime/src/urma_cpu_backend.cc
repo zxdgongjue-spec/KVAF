@@ -581,6 +581,8 @@ class CpuService {
     }
     UrmaResources* resources = resource_pool_->Get(candidate_id);
     if (resources == nullptr) {
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=urma_context candidate=%u bytes=%" PRIu64 "\n",
+          candidate_id, bytes);
       return Result::kResourceError;
     }
     auto region = std::make_unique<Region>();

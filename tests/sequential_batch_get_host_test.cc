@@ -716,6 +716,7 @@ int main() {
     assert(owner->Shutdown().ok() && !refs && !allocations);
   }
   setenv("KVAF_AIV_GATHER_GRAPH", "1", 1);
+  setenv("KVAF_AIV_GATHER_CHECK_STATUS", "1", 1);
   {
     auto owner = CreateSequentialBatchGet(config);
     assert(owner->Initialize(region).ok());
@@ -745,6 +746,7 @@ int main() {
     for (int i = 0; i < 2; ++i) {
       work.push_back(graph_task);
       assert(owner->CheckGatherGraphReplay().ok() && work.empty());
+      assert(status_copies == copies + i + 1);
     }
     work.push_back(graph_task);
     kernel_result = KVAF_SEQ_REMOTE_ERROR;
@@ -757,6 +759,7 @@ int main() {
     exec.execution.synchronize = true;
   }
   unsetenv("KVAF_AIV_GATHER_GRAPH");
+  unsetenv("KVAF_AIV_GATHER_CHECK_STATUS");
   for (const char* name : {"KVAF_AIV_GATHER_SHARD_PIPELINE", "KVAF_AIV_GATHER_PACKED_POSTS",
                            "KVAF_AIV_GATHER_PROGRESS_MODE"}) {
     setenv(name, "0", 1);

@@ -210,8 +210,9 @@ AIV 使用每核持久状态生成新序号，远端 Gather 协议沿用原格�
 `runtime.check_gather_graph_replay()`。后者同步该 stream 并核对各核的序号和执行结果，
 必须在下一次 replay 前调用。检查失败后结束当前会话。保持 Tensor、AccessTable、
 远端 KV slot 和 stream 存活，完成回放后先 `graph.reset()`，再关闭 Runtime。
-捕获后该 Runtime 专用于回放。Host profiling、prefix probe 和
-`KVAF_AIV_GATHER_CHECK_STATUS=1` 仅用于 eager 回归。
+捕获后该 Runtime 专用于回放。Host profiling 和 prefix probe 用于 eager 回归。
+`KVAF_AIV_GATHER_CHECK_STATUS=1` 可保留在环境中，它控制 eager 的异步状态检查。
+图路径始终通过图外的 `check_gather_graph_replay()` 读回状态。
 
 在 A5/CANN 环境重新编译 NPU Host、Python 模块及 V11 kernel 后，使用现有 CPU 服务和
 kernel 路径变量运行回放测试。脚本开头可编辑核数、请求容量、token 大小、SGL 和

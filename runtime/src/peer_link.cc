@@ -299,7 +299,10 @@ Status PeerLink::AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
   std::string error;
   PeerRegion allocated{};
   if (!AllocateRegionAt(address_, ddr_bytes, slot_size, candidate_id, &allocated, &error)) {
-    return ToStatus("peer DDR allocation failed", std::move(error));
+    return ToStatus("peer DDR allocation failed (candidate=" + std::to_string(candidate_id) +
+                        " bytes=" + std::to_string(ddr_bytes) +
+                        " slot_size=" + std::to_string(slot_size) + ")",
+                    std::move(error));
   }
   regions_[allocated.base] = allocated;
   if (region != nullptr) *region = allocated;
