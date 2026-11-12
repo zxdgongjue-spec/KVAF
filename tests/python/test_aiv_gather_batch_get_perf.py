@@ -399,7 +399,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
         "clock_source": "configured" if PROFILE_CLOCK_MHZ is not None else "unverified",
         "cpu_profile": "external", "kernel_path": kernel, "put_kernel_path": put_kernel,
         "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR", ""),
-        "request_plan": "fixed_random", "timing_contract": "async_call_to_stream_completion",
+        "request_plan": "fixed_random", "timing_contract": "async_call_to_device_completion",
     }
 
 
@@ -589,12 +589,11 @@ def run(execution: str, results: dict, active_requests: int, *,
                     comparison_id=comparison_id, compare_round=compare_round,
                     compare_position=compare_position,
                     run_directory=f"{metadata['run_directory']}-{execution}",
-                    timing_contract=("graph_replay_to_stream_completion" if graph_mode
-                                     else "async_call_to_stream_completion"))
+                    timing_contract=("graph_replay_to_device_completion" if graph_mode
+                                     else "async_call_to_device_completion"))
     layout = metadata["output_layout"]
     samples: list[PerfSample] = []
     snapshots, profile_calls_us = [], []
-    stream = torch.npu.Stream(device=device_id)
     graph = None
     try:
         runtime.link_to(endpoint)
@@ -663,13 +662,15 @@ def run(execution: str, results: dict, active_requests: int, *,
         miss_count = torch.tensor([active_requests], dtype=torch.int32, device=device)
         output = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8, device=device)
         torch.npu.synchronize()
+        stream = torch.npu.current_stream() if graph_mode else None
 
         def submit(*, checked: bool = False) -> None:
-            runtime.batch_get(view, indices, offsets, miss_count, rows, output,
-                              stream=stream, synchronize=checked)
+            runtime.batch_get(view, indices, offsets, miss_count, rows, output, synchronize=checked)
 
         enqueue = (lambda: graph.replay(stream)) if graph_mode else submit
-        synchronize = stream.synchronize
+        # Match the pre-graph benchmark: implicit current stream and device-wide
+        # completion. Capture and replay use that same current stream explicitly.
+        synchronize = torch.npu.synchronize
         check_status = runtime.check_gather_graph_replay if graph_mode else None
 
         # Check all payload bytes and the two untouched guard rows outside timing.

@@ -83,10 +83,12 @@ CPU profile 由远端服务的 KVAF_GATHER_PROFILE 单独控制，正式 E2E 关
 脚本的请求 Tensor 只准备一次并复用，初始化、BatchPut、预检、数据校验和 CSV I/O
 均在计时循环外。合并 SGE/小首块会在计时前采 profile 检查配置实际生效。
 
-无 profile 组调用 `synchronize=False`，再由 Python 同步至本批完成，不做状态 D2H；
-计时合同为 `async_call_to_stream_completion`。profile 组用同步调用，含 status/profile
-D2H 和校验，合同为 `synchronous_call_with_status_check`，快照复制在外层计时之外。
-二者差值包含诊断回收成本，不能全归为设备打点开销。
+无 profile 组沿用旧脚本的设备同步口径，从 eager 提交或 graph replay 前计到
+`torch.npu.synchronize()` 返回。CSV 分别标为 `async_call_to_device_completion` 和
+`graph_replay_to_device_completion`。graph 状态 D2H 另行计时。
+profile 组用同步调用，含 status/profile D2H 和校验，合同为
+`synchronous_call_with_status_check`，快照复制在外层计时之外。与无 profile 组的
+差值也包含诊断回收成本。
 
 比较 direct 时对齐数据 Jetty 数：gather 每核仅一条数据 Jetty，控制 Jetty 不搬 payload。
 还须对齐软件在途预算、有效字节、统计量和计时范围；kernel-only 带宽不能直接比 E2E。

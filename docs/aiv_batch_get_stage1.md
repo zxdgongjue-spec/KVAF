@@ -242,10 +242,11 @@ python3 tests/python/test_aiv_gather_batch_get_perf.py --execution compare --rou
 `comparison_id` 和 `compare_round` 区分并配对。单测一边时用 `--execution eager`
 或 `--execution graph`。
 
-主指标 `e2e_us` 保持提交到 caller stream 完成的口径，capture、预热、输入准备和
-状态读回在窗口外。`submit_us` 量提交 API 返回前的耗时。图路径另记 stream 完成后的
+主指标 `e2e_us` 沿用图模式引入前的口径，从提交前到 `torch.npu.synchronize()` 返回。
+eager 由 Runtime 解析当前 stream，graph 在同一当前 stream 捕获和回放。capture、预热、
+输入准备和状态读回在窗口外。`submit_us` 量提交 API 返回前的耗时。图路径另记设备同步后的
 `status_check_us` 和从提交到完成状态检查的 `checked_e2e_us`，后者包含这次显式
-stream 同步。每轮输出的 `p50_saved_us` 和 `submit_p50_saved_us` 均为 eager P50
+设备同步。每轮输出的 `p50_saved_us` 和 `submit_p50_saved_us` 均为 eager P50
 减 graph P50，正值表示图更快。阶段 profiling 由 eager 执行。graph 计时前连续
 两次核对 payload 和 guard。默认 chunk 走原前缀流水，可设置
 `KVAF_AIV_GATHER_CHUNK_BYTES=0` 对两边运行整批 ACK 对照。
