@@ -17,6 +17,8 @@ struct AicpuInvocation final : ExecutionState {
   PutCompletion put_completion;
   aicpu_urma::UmdkSession::WriteState write;
   std::unique_ptr<ExecutionState> put, get, push;
+  MutableBufferView get_output;
+  bool output_bound{false};
 };
 
 // Same common contract across all directions; provider pieces remain typed.
@@ -45,6 +47,8 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   Status PrepareGetResources(const BatchGetExecRequest&);
   Status ReleasePutBuffers();
   Status ReleaseGetBuffers();
+  Status PrepareGetOutput(const GetOutputOptions&);
+  Status FinishGetOutput();
   Status ResolvePut(PutCompletion*);
   Status AcknowledgePut();
   Status DrainGet();

@@ -50,7 +50,7 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
     pending_ = stream;
   }
   const auto launch = launch_kernel ? launch_kernel(&args_, stream)
-                                    : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV3", &args_,
+                                    : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV4", &args_,
                                                        sizeof(args_), stream);
   if (launch != 0) {
     failed_ = true;
@@ -108,6 +108,32 @@ Status UmdkSession::ReleaseBuffers() {
   auto released = Run(UmdkControlOp::kUnregisterBuffers, status);
   if (released.ok()) registered_buffers_.clear();
   return released;
+}
+Status UmdkSession::ReleaseBuffer(void* buffer, std::size_t bytes) {
+  const auto address = reinterpret_cast<std::uint64_t>(buffer);
+  const auto found = std::find(registered_buffers_.begin(), registered_buffers_.end(),
+                              std::make_pair(address, bytes));
+  if (found == registered_buffers_.end()) return Status::OK();
+  if (failed_) {
+    if (args_.op != UmdkControlOp::kUnregisterBuffer || !pending_ ||
+        args_.local_buffer != address || args_.buffer_bytes != bytes)
+      return Status::CompletionUnknown("UMDK buffer unregister is unresolved");
+    UmdkControlStatus status{};
+    auto s = CompletePending(status);
+    if (!s.ok()) return s;
+    if (status.result) return Status::CompletionUnknown("UMDK buffer unregister failed; close session");
+    failed_ = false;
+  } else {
+    auto s = Drain();
+    if (!s.ok()) return s;
+    args_.local_buffer = address;
+    args_.buffer_bytes = bytes;
+    UmdkControlStatus status{};
+    s = Run(UmdkControlOp::kUnregisterBuffer, status);
+    if (!s.ok()) return s;
+  }
+  registered_buffers_.erase(found);
+  return Status::OK();
 }
 
 Status UmdkSession::Load() {

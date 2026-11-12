@@ -42,6 +42,7 @@ class UmdkSession {
   // A failed launch/completion blocks reuse until Shutdown succeeds.
   Status Drain();
   Status ReleaseBuffers();
+  Status ReleaseBuffer(void* buffer, std::size_t bytes);
   struct WriteState {
     bool attempted{false};
     PutCompletion completion;

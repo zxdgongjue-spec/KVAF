@@ -521,18 +521,18 @@ class NpuPythonRuntime final {
     return result;
   }
 
-  // Tensor ownership remains with Python. KVAF creates no output Tensor and
-  // only retains its internal Direct-HCCP execution state; callers must keep
-  // input/output Tensors and either the DeviceAccessTable or the direct
-  // addresses/valid Tensors alive until their stream completes BatchGet.
+  // KVAF creates no output Tensor. Managed calls retain request storage through
+  // completion; explicit output bindings retain output until successful release.
+  // Legacy calls require caller-owned tensors to outlive stream completion.
   py::object BatchGet(const DeviceAccessTable& access_table, const py::object& indices,
                       const py::object& offsets, const py::object& miss_count,
                       const py::object& output_indices, const py::object& output,
                       const py::object& stream, bool synchronize, bool profile,
-                      std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease) {
+                      std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease,
+                      std::uint64_t output_lease) {
     return BatchGetImpl(access_table.source(), access_table.addresses(), access_table.valid(),
                         indices, offsets, miss_count, output_indices, output, stream, synchronize,
-                        profile, execution, graph_lease);
+                        profile, execution, graph_lease, output_lease);
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
@@ -544,10 +544,10 @@ class NpuPythonRuntime final {
                                  const py::object& output, const py::object& stream,
                                  bool synchronize, bool profile,
                                  std::optional<GetExecutionConfig> execution,
-                                 std::uint64_t graph_lease) {
+                                 std::uint64_t graph_lease, std::uint64_t output_lease) {
     return BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, miss_count,
                         output_indices, output, stream, synchronize, profile, execution,
-                        graph_lease);
+                        graph_lease, output_lease);
   }
 
  private:
@@ -556,7 +556,8 @@ class NpuPythonRuntime final {
                           const py::object& offsets, const py::object& miss_count,
                           const py::object& output_indices, const py::object& output,
                           const py::object& stream, bool synchronize, bool profile,
-                          std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease) {
+                          std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease,
+                          std::uint64_t output_lease) {
     if (profile && (!synchronize || !(execution ? execution->executor == Executor::Aicpu : aicpu_backend_)))
       throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
     const auto begin = profile ? BatchGetProfileNowNs() : 0U;
@@ -618,7 +619,7 @@ class NpuPythonRuntime final {
       else
         status = native_->core().BatchGet(
             request, BatchGetExecutionOptions{acl_stream, synchronize, timings.get(), execution,
-                                              graph_lease});
+                                              graph_lease, output_lease});
     }
     if (graph_lease) {
       auto it = graph_refs_.find(graph_lease);
@@ -638,6 +639,48 @@ class NpuPythonRuntime final {
   }
 
  public:
+  std::uint64_t BeginGetOutput(GetExecutionConfig config, const py::object& output,
+                              std::uint32_t capacity, const py::object& stream) {
+    const auto view = GetNpuTensorView(output, "output");
+    const auto native_stream = ResolveStream(stream);
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; lock.lock(); }
+    // Allocate Python ownership before native registration. Failed setup keeps
+    // this reference until native cleanup is positively confirmed.
+    output_refs_.reserve(output_refs_.size() + 1);
+    auto reserved = output_refs_.emplace(0, py::make_tuple(output, stream));
+    auto node = output_refs_.extract(reserved.first);
+    pending_get_refs_.push_back(node.mapped());
+    std::uint64_t id = 0;
+    Status status;
+    {
+      py::gil_scoped_release release;
+      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
+        status = Status::Internal("aclrtSetDevice failed");
+      else status = native_->core().BeginGetOutput(
+          config, {{view.data, view.bytes, DeviceKind::kNpu}, native_stream, capacity}, &id);
+    }
+    if (status.ok()) {
+      node.key() = id;
+      output_refs_.insert(std::move(node));
+      pending_get_refs_.clear();
+    }
+    ThrowIfError(status);
+    return id;
+  }
+  void EndGetOutput(std::uint64_t id) {
+    Status status;
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    {
+      py::gil_scoped_release release;
+      lock.lock();
+      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
+        status = Status::Internal("aclrtSetDevice failed");
+      else status = native_->core().EndGetOutput(id);
+    }
+    if (status.ok()) { output_refs_.erase(id); pending_get_refs_.clear(); }
+    ThrowIfError(status);
+  }
   void DrainGet() {
     Status status;
     std::unique_lock<std::mutex> direction(get_mutex_, std::defer_lock);
@@ -744,7 +787,7 @@ class NpuPythonRuntime final {
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else status = native_->Shutdown();
     }
-    if (status.ok()) { pending_get_refs_.clear(); pending_put_ref_ = py::object{}; }
+    if (status.ok()) { pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{}; }
     ThrowIfError(status);
   }
   ~NpuPythonRuntime() {
@@ -756,6 +799,7 @@ class NpuPythonRuntime final {
       (void)pending_put_ref_.release();
       for (auto& entry : graph_refs_)
         for (auto& ref : entry.second) (void)ref.release();
+      for (auto& entry : output_refs_) (void)entry.second.release();
       (void)native_.release();
     }
   }
@@ -767,6 +811,7 @@ class NpuPythonRuntime final {
   std::vector<py::object> pending_get_refs_;
   py::object pending_put_ref_;
   std::unordered_map<std::uint64_t, std::vector<py::object>> graph_refs_;
+  std::unordered_map<std::uint64_t, py::object> output_refs_;
 };
 
 }  // namespace
@@ -805,6 +850,12 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("recover", &NpuPythonRuntime::RecoverPut, py::arg("execution"))
       .def("recover", &NpuPythonRuntime::RecoverGet, py::arg("execution"))
       .def("drain_get", &NpuPythonRuntime::DrainGet)
+      .def("begin_get_output", &NpuPythonRuntime::BeginGetOutput, py::arg("execution"),
+           py::arg("output"), py::arg("request_capacity"), py::arg("stream") = py::none(),
+           "Bind URMA AIV Direct or AICPU Gather output for repeated eager Gets. "
+           "Do not resize, replace or free its storage (including aliases) until end_get_output succeeds.")
+      .def("end_get_output", &NpuPythonRuntime::EndGetOutput, py::arg("lease"),
+           "Drain pending Get and unregister its reusable output; failure retains the binding.")
       .def("begin_get_graph", &NpuPythonRuntime::BeginGetGraph, py::arg("execution"),
            py::arg("output"), py::arg("request_capacity"), py::arg("stream") = py::none())
       .def("end_get_graph", &NpuPythonRuntime::EndGetGraph, py::arg("lease"),
@@ -831,7 +882,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("indices"), py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(), py::arg("synchronize") = false,
            py::arg("profile") = false, py::kw_only(), py::arg("execution") = py::none(),
-           py::arg("graph_lease") = 0,
+           py::arg("graph_lease") = 0, py::arg("output_lease") = 0,
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
            "the default returns after enqueueing work on that stream. AICPU profile=True "
            "requires synchronize=True and returns a stage timing dictionary.")
@@ -839,7 +890,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("valid"), py::arg("indices"), py::arg("offsets"), py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false, py::arg("profile") = false, py::kw_only(),
-           py::arg("execution") = py::none(), py::arg("graph_lease") = 0,
+           py::arg("execution") = py::none(), py::arg("graph_lease") = 0, py::arg("output_lease") = 0,
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
            "stream=None uses torch.npu.current_stream(); the default returns "
            "after enqueueing work on that stream. AICPU profile=True requires "

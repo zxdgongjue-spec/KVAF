@@ -85,6 +85,18 @@ class AccessOperator {
   }
   virtual Status Warmup(const ExecutionWarmup&) { return Status::OK(); }
   virtual Status DrainGet() { return Status::OK(); }
+  virtual Status PrepareGetOutput(const GetOutputOptions&) {
+    return Status::NotImplemented("provider does not support reusable output bindings");
+  }
+  virtual Status FinishGetOutput() {
+    return Status::NotImplemented("provider does not support reusable output bindings");
+  }
+  virtual Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*) {
+    return Status::NotImplemented("output bindings require execution dispatcher");
+  }
+  virtual Status EndGetOutput(std::uint64_t) {
+    return Status::NotImplemented("output bindings require execution dispatcher");
+  }
   virtual Status PrepareGetGraph(const GetGraphOptions&) {
     return Status::NotImplemented("provider does not support graph leases");
   }
@@ -191,6 +203,8 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Warmup(const ExecutionWarmup&) override;
   Status PrepareGetGraph(const GetGraphOptions&) override;
   Status FinishGetGraph(void*, bool) override;
+  Status PrepareGetOutput(const GetOutputOptions&) override;
+  Status FinishGetOutput() override;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

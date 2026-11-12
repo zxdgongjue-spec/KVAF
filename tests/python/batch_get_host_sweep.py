@@ -28,6 +28,12 @@ def parse_measurements(log, execution_mode):
             record = dict(item.split("=", 1) for item in line.split()[1:])
             records[record.get("operation")] = record
     result = {}
+    for line in log.splitlines():
+        if line.startswith("PERF_OUTPUT_BINDING "):
+            binding = dict(item.split("=", 1) for item in line.split()[1:])
+            result["output_binding"] = binding["output_binding"]
+            phase = {"begin": "setup", "end": "teardown"}[binding["operation"]]
+            result[f"binding_{phase}_us"] = float(binding["elapsed_us"])
     for operation, prefix in (("batch_get", "host"), ("batch_get_submit", "submit"),
                               ("batch_get_synchronize", "completion")):
         record = records.get(operation, {})

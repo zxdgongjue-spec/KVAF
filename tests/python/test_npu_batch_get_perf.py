@@ -1029,6 +1029,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             kernel_profile_started = True
             print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
 
+        execution.bind_output(runtime, output)
         print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
             indices, offsets, output_indices = create_request_plan()
@@ -1122,6 +1123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             kernel_profile_started = False
             print("BATCH_GET_KERNEL_PROFILE_DISABLED")
         print("BATCH_GET_PERF_PHASE_DONE phase=batch_get")
+        execution.release_output(runtime)
         return 0
     except Exception as error:
         print(

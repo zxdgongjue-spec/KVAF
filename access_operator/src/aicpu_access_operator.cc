@@ -51,6 +51,8 @@ Status UmdkAccessOperator::Shutdown() { return resources_->Close(); }
 Status UmdkAccessOperator::ResolvePut(PutCompletion* result) { return resources_->ResolvePut(result); }
 Status UmdkAccessOperator::AcknowledgePut() { return resources_->AcknowledgePut(); }
 Status UmdkAccessOperator::DrainGet() { return resources_->DrainGet(); }
+Status UmdkAccessOperator::PrepareGetOutput(const GetOutputOptions& r) { return resources_->PrepareGetOutput(r); }
+Status UmdkAccessOperator::FinishGetOutput() { return resources_->FinishGetOutput(); }
 Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
   std::lock_guard<std::mutex> lock(resources_->put_mutex());
   auto& call = resources_->invocation();

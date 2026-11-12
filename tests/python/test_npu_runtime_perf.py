@@ -388,6 +388,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
             "source_token_ids=random destination_slots=random_permutation "
             "request_layout=miss_count_prefix"
         )
+        execution.bind_output(runtime, output)
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_get")
         warmup_inputs = []
         for source_token_ids, destination_slots, miss_count in zip(
@@ -471,6 +472,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
         # Free different 128-key batches only after BatchGet, so it cannot
         # invalidate the AccessTable used by the dataplane benchmark.
         print("RUNTIME_PERF_PHASE_BEGIN phase=batch_free")
+        execution.release_output(runtime)
         free_batches = key_batches[-(warmup + iterations) :]
         for key_batch in free_batches[:warmup]:
             runtime.batch_free(key_batch)

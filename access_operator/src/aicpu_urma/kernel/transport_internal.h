@@ -116,6 +116,7 @@ bool DescribeWorker(const UmdkControlArgs&, std::uint32_t index, UmdkControlStat
 bool RegisterBuffer(const UmdkControlArgs&, UmdkControlStatus&);
 bool Cleanup(UmdkControlStatus&);
 bool UnregisterBuffers(UmdkControlStatus&);
+bool UnregisterBuffer(const UmdkControlArgs&, UmdkControlStatus&);
 void Stage(UmdkControlStatus&, const char*);
 bool Fail(UmdkControlStatus&, const char*, int result = -1, const char* detail = "");
 bool PostBatch(Queue&, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&);

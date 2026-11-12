@@ -102,6 +102,30 @@ bool UnregisterBuffers(UmdkControlStatus& status) {
   CurrentState().buffer = CurrentState().buffer_bytes = 0;
   return true;
 }
+bool UnregisterBuffer(const UmdkControlArgs& args, UmdkControlStatus& status) {
+  auto& s = CurrentState();
+  for (auto it = s.buffers.begin(); it != s.buffers.end(); ++it) {
+    if (it->base != args.local_buffer || it->bytes != args.buffer_bytes) continue;
+    if (it->segment) {
+      if (s.api.urma_unregister_seg(it->segment)) return Fail(status, "urma_unregister_seg");
+      it->segment = nullptr;
+    }
+    if (it->token && s.api.urma_free_token_id(it->token)) return Fail(status, "urma_free_token_id");
+    s.buffers.erase(it);
+    return true;
+  }
+  if (s.buffer == args.local_buffer && s.buffer_bytes == args.buffer_bytes) {
+    if (s.local) {
+      if (s.api.urma_unregister_seg(s.local)) return Fail(status, "urma_unregister_seg");
+      s.local = nullptr;
+    }
+    if (s.token && s.api.urma_free_token_id(s.token)) return Fail(status, "urma_free_token_id");
+    s.token = nullptr;
+    s.buffer = s.buffer_bytes = 0;
+    return true;
+  }
+  return Fail(status, "buffer registration was not found");
+}
 
 bool Cleanup(UmdkControlStatus& status) {
   for (std::uint32_t index = 0; index < CurrentState().worker_count; ++index)

@@ -60,6 +60,34 @@ class ExecutionTests(unittest.TestCase):
                 execution.drain_get(runtime)
                 runtime.drain_get.assert_called_once_with()
 
+    def test_reusable_output_and_release_failure(self):
+        api = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                              ExecutionResources=lambda **a: a)
+        for executor, algorithm in (("aiv", "direct"), ("aicpu", "gather")):
+            execution = BenchmarkExecution(api, "per-call", executor=executor, algorithm=algorithm,
+                                           get_capacity=1024)
+            runtime = Mock(); runtime.begin_get_output.return_value = 17
+            execution.bind_output(runtime, "output", "stream")
+            runtime.begin_get_output.assert_called_once_with(execution.get_config, "output", 1024, "stream")
+            self.assertEqual(execution.get_kwargs["output_lease"], 17)
+            execution.drain_get(runtime)
+            runtime.end_get_output.side_effect = RuntimeError("unresolved")
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                execution.release_output(runtime)
+            self.assertEqual(execution.get_kwargs["output_lease"], 17)
+            runtime.end_get_output.side_effect = None
+            execution.release_output(runtime)
+            self.assertNotIn("output_lease", execution.get_kwargs)
+        for mode, transport, executor, algorithm in (("legacy", "urma", "aiv", "direct"),
+                ("per-call", "ubmem", "aiv", "direct"), ("per-call", "urma", "aicpu", "scatter")):
+            execution = BenchmarkExecution(api, mode, transport=transport, executor=executor, algorithm=algorithm)
+            execution.bind_output(object(), "output")
+            execution.release_output(object())
+        with patch.dict(os.environ, KVAF_PERF_REUSE_GET_OUTPUT="0"):
+            execution = BenchmarkExecution(api, "per-call")
+            execution.bind_output(object(), "output")
+            self.assertEqual(execution.output_binding, "transient")
+
     def test_unsupported_profiling_and_graph_shapes_fail_before_running(self):
         with patch.dict(os.environ, {}, clear=True):
             for options, error in ((["--kernel-profile"], "no kernel cycle profiling"),

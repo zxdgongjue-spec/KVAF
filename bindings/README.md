@@ -91,3 +91,16 @@ CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
 K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用于跨进程复用
 选择结果且不重新标定。默认关闭；用法与协议升级要求见
 [Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。
+
+
+### 重复 Get 的输出绑定（per-call）
+
+URMA AIV Direct / AICPU Gather 可使用 `begin_get_output(execution, output,
+request_capacity, stream=None)`，将返回 ID 作为后续 `batch_get(..., output_lease=id)`
+的参数。`drain_get()` 完成本次调用但保留注册；`end_get_output(id)` 等待并注销。
+成功 shutdown 也会释放绑定。输出绑定期间不得 resize/set_ 或通过别名替换、释放
+底层 storage；Python 引用保活不等于 storage 不可变。
+
+一个绑定占用 Get 方向，固定配置和输出分配；Put 不受影响。未绑定调用继续按次
+完成后注销。完整例子、错误处理和性能计时方式见
+[验证文档第 8 节](../docs/cache_transport_execution_validation.md#8-get-输出绑定与注册复用)。

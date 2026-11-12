@@ -12,6 +12,7 @@
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
 using namespace kvaf::aicpu_urma;
+int single_unregisters = 0;
 int writes = 0, unregisters = 0, allocations = 0, registrations = 0, destroys = 0, frees = 0;
 bool fail_wait = false, fail_copy = false, write_error = false;
 bool fail_launch = false, fail_memset = false, fail_wait_on_write = false;
@@ -49,14 +50,22 @@ Status PeerLink::CreateChannel(uint64_t, const uint8_t*, uint32_t, const uint8_t
 namespace kvaf::aicpu_urma {
 // This test exercises real Put transport/session code. The unused Gather
 // resource is a fake so the test needs neither the Get kernel nor NPU hardware.
-struct BatchGetTransport::Impl {};
-BatchGetTransport::BatchGetTransport(UmdkSession&, std::uint32_t, bool) : impl_(std::make_unique<Impl>()) {}
+struct BatchGetTransport::Impl {
+  explicit Impl(UmdkSession& s) : session(s) {}
+  UmdkSession& session;
+  uint64_t region = 0;
+  uint8_t workspace[64]{};
+};
+BatchGetTransport::BatchGetTransport(UmdkSession& s, std::uint32_t, bool) : impl_(std::make_unique<Impl>(s)) {}
 BatchGetTransport::~BatchGetTransport() = default;
-Status BatchGetTransport::Initialize(const RemoteRegionDesc&) { return Status::OK(); }
-Status BatchGetTransport::Warmup() { return Status::OK(); }
+Status BatchGetTransport::Initialize(const RemoteRegionDesc& r) { impl_->region = r.base; return Status::OK(); }
+Status BatchGetTransport::Warmup() { return impl_->session.Ensure(impl_->region, impl_->workspace, sizeof(impl_->workspace)); }
 Status BatchGetTransport::Shutdown() { return Status::OK(); }
 Status BatchGetTransport::Drain() { return Status::OK(); }
-Status BatchGetTransport::Prepare(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
+Status BatchGetTransport::Prepare(const BatchGetExecRequest& r) {
+  auto s = Warmup();
+  return s.ok() ? impl_->session.Ensure(impl_->region, r.request->output.data, r.request->output.bytes) : s;
+}
 Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
 GatherLaunchView BatchGetTransport::View() const { return {}; }
 Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*) { return Status::NotImplemented("unused"); }
@@ -70,6 +79,7 @@ int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, ui
   status.key_bytes = 28;
   std::memcpy(status.eid, args.local_eid, sizeof(status.eid));
   if (args.op == UmdkControlOp::kUnregisterBuffers) ++unregisters;
+  if (args.op == UmdkControlOp::kUnregisterBuffer) ++single_unregisters;
   if (args.op == UmdkControlOp::kPrepare || args.op == UmdkControlOp::kRegisterBuffer) ++registrations;
   if (args.op == UmdkControlOp::kDestroy) ++destroys;
   return 0;
@@ -206,5 +216,40 @@ int main() {
   // A stale view from a closed owner cannot launch a prepared transfer.
   AicpuInvocation closed_call(resources);
   CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(), closed_call).ok());
+  provider.enable_get = true;
+  UmdkAccessOperator gather(provider);
+  auto gather_owner = gather.TakeResources();
+  auto* gather_resources = dynamic_cast<AicpuExecutionResources*>(gather_owner.get());
+  CHECK(gather_owner->Initialize(region).ok());
+  auto gather_state = gather.CreateExecutionState();
+  CHECK(gather.BindExecutionState(gather_state.get()).ok());
+  const auto base_regs = registrations, base_unregs = single_unregisters, base_all = unregisters;
+  GetOutputOptions binding{{input, sizeof(input), DeviceKind::kNpu}, call.execution.stream, 3};
+  CHECK(gather.PrepareGetOutput(binding).ok());
+  CHECK(registrations == base_regs + 2); // Workspace and output, once each.
+  BatchGetRequest r; r.output = binding.output;
+  BatchGetExecRequest g; g.request = &r; g.execution.stream = call.execution.stream;
+  for (int i = 0; i < 3; ++i) {
+    CHECK(gather_resources->PrepareGetResources(g).ok());
+    CHECK(gather_resources->ReleaseGetBuffers().ok());
+    CHECK(gather.DrainGet().ok());
+  }
+  CHECK(registrations == base_regs + 2 && single_unregisters == base_unregs);
+  CHECK(gather.BindExecutionState(nullptr).code() == StatusCode::kBusy);
+  fail_wait = true;
+  CHECK(!gather.FinishGetOutput().ok() && single_unregisters == base_unregs + 1);
+  fail_wait = false;
+  CHECK(gather.FinishGetOutput().ok() && single_unregisters == base_unregs + 1); // Never resubmit.
+  CHECK(unregisters == base_all);
+  CHECK(gather.PrepareGetOutput(binding).ok() && registrations == base_regs + 3); // Workspace reused.
+  CHECK(gather.FinishGetOutput().ok());
+  for (int i = 0; i < 2; ++i) {
+    CHECK(gather_resources->PrepareGetResources(g).ok());
+    CHECK(gather.DrainGet().ok());
+  }
+  CHECK(registrations == base_regs + 5 && single_unregisters == base_unregs + 4);
+  CHECK(unregisters == base_all); // Ordinary transient Gets also keep workspace.
+  CHECK(gather.BindExecutionState(nullptr).ok());
+  CHECK(gather_owner->Close().ok());
   std::cout << "AICPU typed resources, prepare/launch separation and WRITE recovery passed\n";
 }

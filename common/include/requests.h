@@ -106,6 +106,14 @@ struct GetGraphOptions {
   void* stream{nullptr};
   std::uint32_t request_capacity{0};
 };
+// Reusable eager output registration. Keep this allocation (including aliases)
+// alive and at the same address/size until EndGetOutput or Shutdown succeeds.
+// One lease owns the Get direction; requests may change but output/config may not.
+struct GetOutputOptions {
+  MutableBufferView output;
+  void* stream{nullptr};
+  std::uint32_t request_capacity{0};
+};
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
@@ -113,6 +121,7 @@ struct BatchGetExecutionOptions {
   BatchGetProfile* profile{nullptr};
   std::optional<GetExecutionConfig> config;
   std::uint64_t graph_lease{0};
+  std::uint64_t output_lease{0};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

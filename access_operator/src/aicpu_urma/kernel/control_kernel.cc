@@ -55,6 +55,9 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
       case UmdkControlOp::kUnregisterBuffers:
         UnregisterBuffers(status);
         break;
+      case UmdkControlOp::kUnregisterBuffer:
+        UnregisterBuffer(*args, status);
+        break;
       case UmdkControlOp::kDestroy:
         Cleanup(status);
         break;
@@ -71,6 +74,11 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
 // Explicit entry capability: old packages lack independent sessions and
 // completion-scoped buffer unregistration. Host preflight requires this name.
 extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV3(
+    UmdkControlArgs* args) {
+  return KvafAicpuUmdkControl(args);
+}
+// V4 supports selective output retirement while internal workspace stays registered.
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV4(
     UmdkControlArgs* args) {
   return KvafAicpuUmdkControl(args);
 }

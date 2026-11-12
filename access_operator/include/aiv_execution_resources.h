@@ -39,6 +39,10 @@ struct AivInvocation final : ExecutionState {
   std::uint64_t get_entity{};
   MutableBufferView get_output;
   std::size_t get_capacity{};
+  KvafBatchGetLocalBuffer* output_buffer{};
+  std::uint64_t output_entity{};
+  GetOutputOptions output_options;
+  bool output_retiring{false};
   KvafBatchGetLocalBuffer* graph_buffer{};
   std::uint64_t graph_entity{};
   GetGraphOptions graph_options;
@@ -108,6 +112,7 @@ class AivExecutionResources final : public ExecutionResourceOwner {
   Status PrepareGetResources(const BatchGetExecRequest&, AivInvocation&, UrmaAivGetView*);
   Status PreparePutResources(const BatchPutExecRequest&, AivInvocation&, UrmaAivPutView*);
   Status PrepareGraph(const GetGraphOptions&, AivInvocation&);
+  Status PrepareOutput(const GetOutputOptions&, AivInvocation&);
   std::unique_ptr<ExecutionState> CreateState() const;
   Status Bind(ExecutionState*);
   AivInvocation& invocation();

@@ -400,6 +400,22 @@ Status RuntimeCore::BeginGetGraph(GetExecutionConfig config, const GetGraphOptio
   if (s.ok()) graph_tables_.emplace(*id, nullptr);
   return s;
 }
+Status RuntimeCore::BeginGetOutput(GetExecutionConfig config, const GetOutputOptions& request,
+                                    std::uint64_t* id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  auto s = DrainGetLocked();
+  return s.ok() ? access_operator_.BeginGetOutput(config, request, id) : s;
+}
+Status RuntimeCore::EndGetOutput(std::uint64_t id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  auto s = access_operator_.EndGetOutput(id);
+  if (s.ok()) pending_get_table_.reset();
+  return s;
+}
 Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);

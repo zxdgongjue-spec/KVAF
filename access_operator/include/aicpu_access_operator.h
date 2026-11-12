@@ -29,6 +29,8 @@ class UmdkAccessOperator final : public AccessOperator {
   Status Initialize(const RemoteRegionDesc&) override;
   Status Shutdown() override;
   Status DrainGet() override;
+  Status PrepareGetOutput(const GetOutputOptions&) override;
+  Status FinishGetOutput() override;
   Status Warmup(const ExecutionWarmup&) override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;

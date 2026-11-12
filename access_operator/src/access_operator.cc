@@ -212,6 +212,33 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
 Status DefaultAccessOperator::DrainGet() {
   return UrmaAivGetOperator::Drain(resources_->GetView(), resources_->invocation());
 }
+Status DefaultAccessOperator::PrepareGetOutput(const GetOutputOptions& options) {
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (!options.stream || aclmdlRICaptureGetInfo(static_cast<aclrtStream>(options.stream), &capture, &graph) != ACL_SUCCESS)
+    return InvalidArgument("output binding requires a valid stream");
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("bind Get output before graph capture");
+  auto s = DrainGet();
+  if (s.ok()) s = resources_->Warmup({options.request_capacity, options.stream});
+  return s.ok() ? resources_->PrepareOutput(options, resources_->invocation()) : s;
+}
+Status DefaultAccessOperator::FinishGetOutput() {
+  auto s = DrainGet();
+  if (!s.ok()) return s;
+  auto& call = resources_->invocation();
+  if (!call.output_buffer) return Status::OK();
+  // Retire can unregister the MR before a later token/entity release fails.
+  // That partially retired binding must never be used by another Get.
+  call.output_retiring = true;
+  if (KvafBatchGetLocalBufferRetire(call.output_buffer) != KVAF_BATCH_GET_SUCCESS)
+    return Internal("cannot retire bound Get output; binding retained");
+  call.output_buffer = nullptr;
+  call.output_entity = 0;
+  call.output_options = {};
+  call.output_retiring = false;
+  return Status::OK();
+}
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
   return UrmaAivGetOperator::SetProfiling(enabled, resources_->GetView());
 }
@@ -416,7 +443,8 @@ Status UrmaAivGetOperator::Drain(UrmaAivGetView view, AivInvocation& invocation)
       if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result != 0)
         return Internal("BatchGet kernel reported an execution error; session retained");
   }
-  if (KvafBatchGetLocalBufferRetire(invocation.pending_buffer) != KVAF_BATCH_GET_SUCCESS)
+  if (invocation.pending_buffer != invocation.output_buffer &&
+      KvafBatchGetLocalBufferRetire(invocation.pending_buffer) != KVAF_BATCH_GET_SUCCESS)
     return Internal("failed to retire Get registration; resources retained");
   invocation.pending_buffer = nullptr;
   invocation.pending_get = nullptr;

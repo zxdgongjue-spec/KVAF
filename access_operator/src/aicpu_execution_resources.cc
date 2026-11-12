@@ -72,6 +72,8 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
   auto* call = state ? dynamic_cast<AicpuInvocation*>(state) : &state_->legacy;
   if (!call || call->owner != this)
     return Status::InvalidArgument("AICPU invocation belongs to another resource");
+  if (state_->invocation != call && state_->invocation->output_bound)
+    return Status::Busy("release Get output binding before replacing invocation");
   auto bound = state_->put.BindExecutionState(call->put.get());
   if (!bound.ok()) return bound;
   bound = state_->get.BindExecutionState(call->get.get());
@@ -119,6 +121,7 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
   state_->views.Prepare(ExecutionDirection::Get);
   if (!state_->initialized || !state_->enable_get)
     return Status::NotInitialized("AICPU Get resources not initialized");
+  if (!request.request) return Status::InvalidArgument("missing Get request");
   if (state_->managed_completion && request.execution.stream) {
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
@@ -130,10 +133,51 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   if (state_->push) return state_->push->Prepare(request);
 #endif
+  if (state_->invocation->output_bound &&
+      (request.request->output.data != state_->invocation->get_output.data ||
+       request.request->output.bytes != state_->invocation->get_output.bytes))
+    return Status::InvalidArgument("request differs from bound Get output");
+  state_->invocation->get_output = request.request->output;
   return state_->get.Prepare(request);
 }
 Status AicpuExecutionResources::ReleasePutBuffers() { return state_->put_session.ReleaseBuffers(); }
-Status AicpuExecutionResources::ReleaseGetBuffers() { return state_->get_session.ReleaseBuffers(); }
+Status AicpuExecutionResources::ReleaseGetBuffers() {
+  auto& call = *state_->invocation;
+  if (call.output_bound || !call.get_output.valid()) return Status::OK();
+  auto s = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
+  if (s.ok()) call.get_output = {};
+  return s;
+}
+Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options) {
+  std::lock_guard<std::mutex> lock(state_->get_mutex);
+  auto& call = *state_->invocation;
+  if (!state_->initialized || !state_->enable_get || scatter() || call.output_bound ||
+      !options.stream || !options.request_capacity ||
+      !options.output.valid() || options.output.device != DeviceKind::kNpu)
+    return Status::InvalidArgument("invalid Gather output binding");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(options.stream), &capture, &graph) != ACL_SUCCESS)
+    return Status::Internal("cannot query graph capture state");
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("bind Get output before graph capture");
+  auto s = state_->DrainGet();
+  if (s.ok()) s = state_->get.Warmup();
+  if (!s.ok()) return s;
+  call.get_output = options.output;
+  s = state_->get_session.Ensure(state_->region.base, options.output.data, options.output.bytes);
+  if (s.ok()) call.output_bound = true;
+  return s;
+}
+Status AicpuExecutionResources::FinishGetOutput() {
+  std::lock_guard<std::mutex> lock(state_->get_mutex);
+  auto s = state_->DrainGet();
+  if (!s.ok()) return s;
+  auto& call = *state_->invocation;
+  s = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
+  if (s.ok()) { call.get_output = {}; call.output_bound = false; }
+  return s;
+}
 UrmaAicpuPutView AicpuExecutionResources::PutView() {
   return {state_->views.View(ExecutionDirection::Put), state_->put.View()};
 }
@@ -213,6 +257,8 @@ Status AicpuExecutionResources::Close() {
     state_->warmup_buffer = nullptr;
   }
   state_->initialized = false;
+  state_->invocation->get_output = {};
+  state_->invocation->output_bound = false;
   return Status::OK();
 }
 Status AicpuExecutionResources::ResolvePut(PutCompletion* out) {
@@ -240,7 +286,7 @@ Status AicpuExecutionResources::AcknowledgePut() {
 Status AicpuExecutionResources::DrainGet() {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
   auto status = state_->DrainGet();
-  if (status.ok() && state_->managed_completion) status = state_->get_session.ReleaseBuffers();
+  if (status.ok() && state_->managed_completion) status = ReleaseGetBuffers();
   return status;
 }
 }  // namespace kvaf

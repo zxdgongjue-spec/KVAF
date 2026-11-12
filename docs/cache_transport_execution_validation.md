@@ -64,7 +64,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 
 Get 文件包含 URMA AIV 与 UBMEM Get 入口，Put 文件同理；本脚本使用标准合并产物，
 不需要额外生成 UBMEM 专用 `.o`。版本入口为 AIV Get V3、Put V2 和
-`KvafAicpuUmdkControlSessionsV3`。
+`KvafAicpuUmdkControlSessionsV4`（新增按输出定向注销，旧 V3 包需重新安装）。
 
 ## 3. 运行真机验收
 
@@ -484,8 +484,8 @@ done
 
 测试 UBMEM 时将 `--transport urma` 替换为 `--transport ubmem`。结果行带
 `execution_mode`；`operation=batch_get` 的 `p50_ms` 是调用到完成的 Host 耗时。
-per-call 在外部 stream synchronize 后调用 `drain_get()`，其完成检查、注册释放及
-租约回收计入当前样本，避免把这部分成本留到下一轮。`batch_get_synchronize` 包含
+per-call 在外部 stream synchronize 后调用 `drain_get()`，其完成检查计入当前样本，
+避免把这部分成本留到下一轮。输出注册是否每轮释放由第 8 节的绑定模式决定。`batch_get_synchronize` 包含
 这段完成处理，不能将其解释成纯设备等待。
 
 使用原 miss-count 扫描入口进行同口径对照：
@@ -528,11 +528,109 @@ per-call 不支持默认的 256 次 Get 捕获，会在启动 worker 前提示�
 graph 重放吞吐只覆盖已捕获设备任务，不包含每次 eager 调用的 Host Dispatcher 开销，
 不能代替 7.2 节的调用到完成测量。
 
-本次只调整性能脚本及说明，不要求重新编译 kernel 或服务；per-call 需要当前分支
-匹配的绑定及 CPU 服务。便携检查覆盖模式及容量配置、计时口径、子进程参数传递、
+第 8 节的输出复用需要重新构建 NPU 客户端和 AICPU 包；CPU 服务协议没有改变。
+便携检查覆盖模式及容量配置、计时口径、子进程参数传递、
 扫描失败传播和 graph 生命周期，不会宣称真机性能通过：
 
 ```bash
 PYTHONPATH="$PWD/tests/python" python3 -m unittest \
   test_perf_execution test_batch_get_inflight_config test_batch_get_multicard_perf
 ```
+
+
+## 8. Get 输出绑定与注册复用
+
+本轮优化针对 per-call URMA AIV Direct 和 AICPU Gather 的反复注册/注销：
+
+| 资源 | 当前生命周期 |
+| --- | --- |
+| Gather 内部 workspace 及其注册 | Get provider 生命周期；普通调用和绑定调用都复用，provider 关闭时注销后释放 |
+| Gather 调用方输出注册 | 普通调用完成后定向注销；显式输出绑定跨调用保留，到解绑或 shutdown |
+| AIV Direct 输出注册、token 和设备 entity 表 | 普通调用完成后释放；显式输出绑定跨调用保留，到解绑或 shutdown |
+| 请求 Tensor、输入地址表、访问表/key pin | 仍按调用保留到完成；不会跟随输出绑定长期占用 |
+| UBMEM / Scatter | 沿用已有资源生命周期，不使用这个输出绑定接口 |
+
+地址转换契约和设备数据 kernel 保持现有版本。未删掉流同步、状态收集和错误判断。
+AICPU 只新增控制操作 `kUnregisterBuffer`，用来单独释放输出注册；不再为一个普通
+Get 的结束连带注销 workspace。对应入口升级到 `KvafAicpuUmdkControlSessionsV4`。
+
+### 8.1 调用方式和约束
+
+Runtime 必须按 `per_call_execution=True` 初始化，并启用对应 Get 配置：
+
+```python
+cfg = kvaf.GetExecutionConfig("urma", "aiv", "direct")
+# Gather 改成 kvaf.GetExecutionConfig("urma", "aicpu", "gather")
+lease = runtime.begin_get_output(cfg, output, request_capacity, stream)
+try:
+    for indices, offsets, miss_count, output_indices in requests:
+        runtime.batch_get(device_table, indices, offsets, miss_count,
+                          output_indices, output, stream=stream,
+                          execution=cfg, output_lease=lease)
+        runtime.drain_get()  # 完成检查；保留绑定的注册和 entity 表
+finally:
+    runtime.end_get_output(lease)  # 等待未完成 Get，再注销输出
+```
+
+- Python 在绑定期间持有输出 Tensor 和传入的 stream 对象。C++ 调用方自行持有底层分配。
+  **绑定期间禁止 resize、set_、替换/释放底层 storage，也不能通过别名改变 storage**；
+  保留 Python 引用不能防止调用方主动改变 storage。完成后可改写输出内容。
+- 绑定固定配置、输出地址和字节数，以及最大请求容量（indices 长度，不是 miss_count）。
+  请求、访问表和 active count 可以变化；可跨 stream 顺序提交，Get 仍按原规则串行完成。
+  跨 stream 的输入/输出内容依赖由调用方建立。
+- 一个 Runtime 同时只允许一个输出绑定；绑定期间占用 Get 方向，所有 Get 必须携带
+  相同 lease。切换 Get 算法/输出、recover、额外 warmup 或 graph 前先解绑。
+  Put 仍可独立执行。graph 使用原来的 graph lease。
+- `drain_get()` 不解绑；`end_get_output()` 成功后 lease 失效。同一地址重新绑定会重新注册，
+  不因地址相同就沿用旧分配的注册。`shutdown()` 会关闭绑定和对应资源。
+- 等待/注销失败时保留原生资源及 Python 引用。等待失败可重试完成；无法恢复的错误
+  通过 shutdown 关闭资源。只有成功解绑或成功 shutdown 后，才能释放/改动原输出分配。
+- 不传 `output_lease` 的普通调用仍支持临时输出，完成后注销；不会按裸地址建立跨调用缓存。
+
+### 8.2 性能脚本
+
+第 7 节原命令继续可用。per-call 的 Gather、AIV Direct 及 runtime perf 脚本在预热前
+绑定它们一直复用的输出，在测量结束后解绑；legacy、UBMEM、Scatter 和 graph 路径不新增绑定。
+所有输出正确性校验仍然保留。
+
+新增 `PERF_OUTPUT_BINDING` 日志，Gather/Scatter 和 Host sweep CSV 也包含：
+
+- `output_binding`：`reused` / `transient` / `legacy` / `not-needed`。
+- `binding_setup_us` / `binding_teardown_us`：一次性绑定及解绑耗时。
+
+`reused` 的稳态 Host 延迟不含一次性绑定/解绑；每次调用的数据传输、完成检查仍计入。
+需要计算完整任务成本时，再加上 setup/teardown。普通临时输出的对照可通过环境变量运行：
+
+```bash
+KVAF_PERF_REUSE_GET_OUTPUT=0 \
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+  --execution-mode per-call --transport urma --no-kernel-profile \
+  --request-length 32768 --miss-count 4096 --table-capacity 4096 \
+  --token-bytes 656 --tokens-per-block 128 --aiv-cores 5 --jettys-per-core 2 \
+  --warmup 10 --iterations 100
+```
+
+删除 `KVAF_PERF_REUSE_GET_OUTPUT=0` 即恢复默认复用。Gather sweep 也读取此变量；
+对比两轮时使用不同的日志目录，其余参数保持一致。
+
+### 8.3 构建和验收
+
+```bash
+./build.sh npu
+./build.sh npu --check-kernel
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
+  --report "$PWD/validation-output-reuse.json"
+```
+
+更新 NPU binding 和已安装 AICPU 包后使用新客户端进程，不能搭配旧 V3 控制包。
+CPU 服务无需为本轮改动重新编译或重启。
+
+原全量入口的 `resources` 组已包含 `output-binding`、`output-rebind`、`output-shutdown`：
+变 active count/stream、多次复用、错输出/超容量/过期 lease 拒绝、访问表在完成后解锁、
+Python Tensor 在绑定期间保活、解绑和 shutdown 后释放、重新绑定及普通调用回归。
+可先单跑 `--modes urma --cases resources`，随后仍需执行全量验证。
+
+便携故障测试检查实际注册次数、workspace 不被连带注销、同地址解绑后重新注册、
+等待/状态读取/注销失败时资源保留及重试；它们不能替代真机正确性和性能测量。

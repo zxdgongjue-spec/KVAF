@@ -11,6 +11,8 @@ from array import array
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+import gc
+import weakref
 import importlib
 import json
 import os
@@ -278,11 +280,11 @@ class Suite:
         self.t.npu.synchronize()  # Explicit dependency before using either caller stream.
         return request, tensors, output
 
-    def get(self, data, route, buffers, *, synchronize=False, lease=0):
+    def get(self, data, route, buffers, *, synchronize=False, lease=0, output_lease=0, stream=None):
         _, tensors, output = buffers
-        self.runtime.batch_get(data.device_table, *tensors, output, stream=self.read_stream,
+        self.runtime.batch_get(data.device_table, *tensors, output, stream=stream if stream is not None else self.read_stream,
                                synchronize=synchronize, execution=route.config(self.k),
-                               graph_lease=lease)
+                               graph_lease=lease, output_lease=output_lease)
 
     def verify(self, data, buffers):
         request, _, output = buffers
@@ -387,6 +389,77 @@ class Suite:
                 buffers = self.buffers()
                 expect_error(lambda: self.get(data, disabled, buffers), ValueError, "not enabled")
                 self.runtime.drain_get()
+
+        self.output_binding()
+
+    def output_binding(self):
+        for g in (r for r in self.gets if r.transport == "urma" and r.algorithm in ("direct", "gather")):
+            with self.case("resources/output-binding/" + g.name), self.data(seed=39) as data:
+                buffers = self.buffers()
+                output = buffers[2]
+                cfg = g.config(self.k)
+                lease = self.runtime.begin_get_output(cfg, output, self.a.rows, self.read_stream)
+                try:
+                    expect_error(lambda: self.get(data, g, buffers), ValueError, "output lease")
+                    wrong = self.buffers()
+                    expect_error(lambda: self.get(data, g, wrong, output_lease=lease), ValueError, "output")
+                    oversized = self.buffers(active=0, capacity=self.a.rows + 1)
+                    expect_error(lambda: self.get(data, g, (oversized[0], oversized[1], output),
+                                                 output_lease=lease), ValueError, "capacity")
+                    expect_error(lambda: self.runtime.begin_get_graph(cfg, output, self.a.rows,
+                                 self.read_stream), ValueError, "output lease")
+                    for i, active in enumerate((0, self.a.rows // 2, self.a.rows, self.a.rows)):
+                        request, tensors, _ = self.buffers(active, epoch=i)
+                        output.fill_(0xA5)
+                        self.t.npu.synchronize()
+                        buffers = request, tensors, output
+                        self.get(data, g, buffers, synchronize=bool(i % 2), output_lease=lease,
+                                 stream=self.write_stream if i % 2 else self.read_stream)
+                        self.runtime.drain_get()
+                        self.verify(data, buffers)
+                    self.get(data, g, buffers, output_lease=lease)
+                    self.runtime.release_access_table(data.table)
+                    data.released = True
+                    expect_error(lambda: self.runtime.batch_free(data.keys), ValueError, "pinned")
+                    self.runtime.drain_get()
+                    self.verify(data, buffers)
+                    self.runtime.batch_free(data.keys)  # Output lease does not retain table/key pins.
+                    data.freed = True
+                    ref = weakref.ref(output)
+                    del output, buffers
+                    gc.collect()
+                    check(ref() is not None, "output storage released while registration is live")
+                finally:
+                    self.runtime.end_get_output(lease)
+                gc.collect()
+                check(ref() is None, "output Tensor retained after output lease ended")
+                expect_error(lambda: self.runtime.end_get_output(lease), KeyError, "not found")
+            # Rebinding gets a fresh ID; ordinary calls also work after release.
+            with self.case("resources/output-rebind/" + g.name), self.data(seed=40) as data:
+                fresh = self.buffers()
+                next_lease = self.runtime.begin_get_output(cfg, fresh[2], self.a.rows, self.read_stream)
+                try:
+                    check(next_lease != lease, "stale output lease ID was reused")
+                    expect_error(lambda: self.get(data, g, fresh, output_lease=lease), ValueError, "lease")
+                    self.get(data, g, fresh, output_lease=next_lease, synchronize=True)
+                    self.verify(data, fresh)
+                finally:
+                    self.runtime.end_get_output(next_lease)
+                self.get(data, g, fresh, synchronize=True)  # Ordinary calls remain supported.
+                self.verify(data, fresh)
+
+            with self.case("resources/output-shutdown/" + g.name):
+                output = self.t.empty((2 * self.a.rows + 2, self.a.token_bytes),
+                                      dtype=self.t.uint8, device=self.device)
+                self.runtime.begin_get_output(cfg, output, self.a.rows, self.read_stream)
+                ref = weakref.ref(output)
+                del output
+                gc.collect()
+                check(ref() is not None, "idle binding did not retain output")
+                self.shutdown()
+                gc.collect()
+                check(ref() is None, "shutdown retained output registration ownership")
+                self.initialize()
 
     def graph(self):
         for g in (r for r in self.gets if r.algorithm == "direct"):
@@ -520,7 +593,8 @@ def run(args, report):
               "kvaf was imported from a different build")
         for symbol in ("NpuRuntime", "ExecutionResources", "PutExecutionConfig", "GetExecutionConfig"):
             check(hasattr(kvaf, symbol), f"missing kvaf.{symbol}; rebuild this branch")
-        for method in ("warmup", "recover", "drain_get", "begin_get_graph", "end_get_graph"):
+        for method in ("warmup", "recover", "drain_get", "begin_get_graph", "end_get_graph",
+                       "begin_get_output", "end_get_output"):
             check(hasattr(kvaf.NpuRuntime, method), f"missing NpuRuntime.{method}; rebuild this branch")
         if "graph" in args.cases:
             check(hasattr(kvaf, "AclGraph"), "missing kvaf.AclGraph")

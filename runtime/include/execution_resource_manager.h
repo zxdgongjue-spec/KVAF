@@ -63,6 +63,10 @@ class GetResourceView {
     return s.ok() ? op_->ExecuteBatchGet(r) : s;
   }
   Status Drain() const { return op_->DrainGet(); }
+  Status PrepareOutput(const GetOutputOptions& r) const {
+    return op_->PrepareGetOutput(r);
+  }
+  Status FinishOutput() const { return op_->FinishGetOutput(); }
   Status Warmup(const ExecutionWarmup& r) const {
     return resources_ ? resources_->Warmup(r) : op_->Warmup(r);
   }

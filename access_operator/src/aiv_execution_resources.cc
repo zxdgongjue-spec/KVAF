@@ -168,7 +168,7 @@ Status AivExecutionResources::Bind(ExecutionState* state) {
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("AIV execution state belongs to another resource");
   const auto& active = *state_->active;
-  if (typed != state_->active && (active.pending_get || active.pending_buffer || active.graph_buffer
+  if (typed != state_->active && (active.pending_get || active.pending_buffer || active.graph_buffer || active.output_buffer
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
       || active.pending_put || active.pending_put_buffer
 #endif
@@ -218,11 +218,23 @@ Status AivExecutionResources::PrepareGetResources(const BatchGetExecRequest& exe
   }
   if (call.pending_buffer || call.pending_get)
     return Status::Busy("drain the preceding Get before preparing resources");
+  if (call.output_retiring)
+    return Status::InvalidState("output registration is retiring; retry end_get_output or shutdown");
   state_->views.Prepare(ExecutionDirection::Get);
   KvafBatchGetLocalBuffer* buffer = nullptr;
   std::uint64_t entity = 0;
-  const auto result = state_->get.AcquireOutput(exec.request->output.data,
-      exec.request->output.bytes, &buffer, &entity);
+  int result = KVAF_BATCH_GET_SUCCESS;
+  if (call.output_buffer) {
+    if (exec.request->output.data != call.output_options.output.data ||
+        exec.request->output.bytes != call.output_options.output.bytes ||
+        exec.request->indices.bytes / sizeof(std::int32_t) > call.output_options.request_capacity)
+      return InvalidArgument("request differs from bound Get output/capacity");
+    buffer = call.output_buffer;
+    entity = call.output_entity;
+  } else {
+    result = state_->get.AcquireOutput(exec.request->output.data,
+        exec.request->output.bytes, &buffer, &entity);
+  }
   if (buffer) {
     call.pending_get = static_cast<aclrtStream>(exec.execution.stream);
     call.pending_buffer = buffer;
@@ -254,6 +266,26 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   call.graph_entity = call.get_entity;
   call.graph_options = options;
   call.graph_recorded = false;
+  call.pending_buffer = nullptr;
+  call.pending_get = nullptr;
+  call.get_entity = 0;
+  return Status::OK();
+}
+Status AivExecutionResources::PrepareOutput(const GetOutputOptions& options, AivInvocation& call) {
+  if (call.output_buffer || call.graph_buffer || !options.request_capacity || !options.stream ||
+      !options.output.valid() || options.output.device != DeviceKind::kNpu)
+    return InvalidArgument("invalid or already bound Get output");
+  BatchGetRequest request;
+  request.output = options.output;
+  BatchGetExecRequest exec;
+  exec.request = &request;
+  exec.execution.stream = options.stream;
+  auto view = GetView();
+  auto s = PrepareGetResources(exec, call, &view);
+  if (!s.ok()) return s;
+  call.output_buffer = call.pending_buffer;
+  call.output_entity = call.get_entity;
+  call.output_options = options;
   call.pending_buffer = nullptr;
   call.pending_get = nullptr;
   call.get_entity = 0;
@@ -486,6 +518,10 @@ Status AivExecutionResources::Close() {
   state_->active->pending_buffer = nullptr;
   state_->active->pending_get = nullptr;
   state_->active->get_issued = false;
+  state_->active->output_buffer = nullptr;
+  state_->active->output_entity = 0;
+  state_->active->output_options = {};
+  state_->active->output_retiring = false;
   if (state_->get.workspace.queue_state != nullptr) {
     if (aclrtFree(state_->get.workspace.queue_state) != ACL_SUCCESS)
       return Status::CompletionUnknown("Get queue state release failed; allocation retained");

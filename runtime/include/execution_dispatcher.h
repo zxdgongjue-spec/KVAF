@@ -29,6 +29,8 @@ class ExecutionDispatcher final : public AccessOperator {
   Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
   Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*) override;
   Status EndGetGraph(std::uint64_t, void*, bool) override;
+  Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*) override;
+  Status EndGetOutput(std::uint64_t) override;
   Status Recover(PutExecutionConfig) override;
   Status Recover(GetExecutionConfig);
   Status ResolvePut(PutExecutionConfig, PutCompletion*) override;
@@ -36,6 +38,7 @@ class ExecutionDispatcher final : public AccessOperator {
   const ExecutionPolicy& policy() const { return policy_; }
  private:
   Status DrainGetLocked();
+  Status FinishOutputLocked();
   ExecutionPolicy policy_;
   Status policy_status_;
   RemoteRegionDesc region_{};
@@ -48,5 +51,8 @@ class ExecutionDispatcher final : public AccessOperator {
   std::uint64_t graph_id_{0}, next_graph_id_{1};
   std::unique_ptr<GetExecutionContext> graph_context_;
   bool graph_captured_{false};
+  std::uint64_t output_id_{0}, next_output_id_{1};
+  GetOutputOptions output_options_;
+  std::unique_ptr<GetExecutionContext> output_context_;
 };
 }  // namespace kvaf

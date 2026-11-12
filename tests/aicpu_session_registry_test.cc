@@ -2,6 +2,7 @@
 // but never loads liburma, creates a context, or accesses a device.
 #include "transport_internal.h"
 #include <future>
+#include <unistd.h>
 #include <iostream>
 #include <stdexcept>
 using namespace kvaf::aicpu_urma;
@@ -9,7 +10,10 @@ using namespace kvaf::aicpu_urma::detail;
 #define CHECK(c) do { if (!(c)) throw std::runtime_error(#c); } while (false)
 static urma_target_seg_t imported;
 static bool fail_unimport;
-static int imports, unimports;
+static int imports, unimports, unregisters, token_frees;
+static bool fail_token;
+static urma_status_t Unregister(urma_target_seg_t*) { ++unregisters; return URMA_SUCCESS; }
+static urma_status_t FreeToken(urma_token_id_t*) { ++token_frees; return fail_token ? URMA_FAIL : URMA_SUCCESS; }
 static urma_target_seg_t* Import(urma_context_t*, urma_seg_t* segment, urma_token_t*, uint64_t, urma_import_seg_flag_t) {
   ++imports; imported.seg = *segment; return &imported;
 }
@@ -98,6 +102,27 @@ int main() {
     CurrentState().local = nullptr;
     CurrentState().buffer = 789;
   }
+  // Selective output teardown must not touch the session's initial workspace.
+  urma_target_seg_t workspace{}, output_segment{};
+  urma_token_id_t workspace_token{}, output_token{};
+  get->state.local = &workspace; get->state.token = &workspace_token;
+  get->state.buffer = 0x1000; get->state.buffer_bytes = 4096;
+  get->state.buffers.push_back({0x3000, 128, &output_token, &output_segment});
+  get->state.api.urma_unregister_seg = Unregister;
+  get->state.api.urma_free_token_id = FreeToken;
+  args.op = UmdkControlOp::kUnregisterBuffer; args.session = get_id;
+  args.owner_pid = getpid(); args.local_buffer = 0x3000; args.buffer_bytes = 128;
+  fail_token = true;
+  CHECK(KvafAicpuUmdkControl(&args) == 0 && status.result);
+  CHECK(unregisters == 1 && token_frees == 1 && get->state.buffers.size() == 1);
+  CHECK(!get->state.buffers[0].segment && get->state.buffers[0].token == &output_token);
+  fail_token = false;
+  CHECK(KvafAicpuUmdkControl(&args) == 0 && !status.result);
+  CHECK(unregisters == 1 && token_frees == 2 && get->state.buffers.empty());
+  CHECK(get->state.local == &workspace && get->state.buffer == 0x1000);
+  args.op = UmdkControlOp::kUnregisterBuffers;
+  CHECK(KvafAicpuUmdkControl(&args) == 0 && !status.result);
+  CHECK(unregisters == 2 && token_frees == 3 && !get->state.local && !get->state.token);
   RemoveSession(put_id);
   CHECK(!FindSession(put_id) && FindSession(get_id) == get);
   CHECK(put->state.buffer == 789); // in-flight ownership outlives index removal

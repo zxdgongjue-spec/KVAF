@@ -233,11 +233,13 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         print(f"{prefix}_POPULATE_DONE", flush=True)
         run_round(0)
         run_round(a.miss_count)
+        execution.bind_output(runtime, output, stream)
         for _ in range(a.warmup):
             run_round(a.miss_count, profile=True)
         profiles.clear()
         for _ in range(a.iterations):
             run_round(a.miss_count, profile=True)
+        execution.release_output(runtime)
     except BaseException:
         try:
             runtime.shutdown()
@@ -250,6 +252,9 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     print(f"{prefix}_PASS workers={a.workers} iterations={a.iterations} "
           "verification=every_round_full_output_npu_compare", flush=True)
     summary = summarize_measurements(profiles, payload_bytes, mode=mode)
+    summary.update(output_binding=execution.output_binding,
+                   binding_setup_us=execution.binding_setup_us,
+                   binding_teardown_us=execution.binding_teardown_us)
     print_measurements(a, summary, mode=mode)
 
 

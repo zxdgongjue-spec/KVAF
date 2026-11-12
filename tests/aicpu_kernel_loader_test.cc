@@ -10,7 +10,7 @@
   std::cerr << "line " << __LINE__ << ": " #condition "\n"; std::exit(1); \
 } } while (false)
 
-std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV3", "KvafAicpuBatchPut",
+std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV4", "KvafAicpuBatchPut",
                               "KvafAicpuGatherRead"};
 unsigned loads = 0, lookups = 0, launches = 0;
 int handle;
@@ -41,8 +41,14 @@ int main() {
   int fd = mkstemp(path);
   CHECK(fd >= 0);
   close(fd);
+  entries.erase("KvafAicpuUmdkControlSessionsV4");
+  entries.insert("KvafAicpuUmdkControlSessionsV3");
+  auto old = PrepareUmdkKernel(path, false);
+  CHECK(!old.ok() && old.message().find("SessionsV4") != std::string::npos);
+  CHECK(launches == 0);
+  entries.insert("KvafAicpuUmdkControlSessionsV4");
   CHECK(PrepareUmdkKernel(path, false).ok());
-  CHECK(loads == 1 && lookups == 3 && launches == 0);
+  CHECK(loads == 1 && launches == 0);
   auto status = PrepareUmdkKernel(path, true);
   CHECK(!status.ok());
   CHECK(status.message().find("KvafAicpuCpuPushScatterA12V24") != std::string::npos);

@@ -19,7 +19,8 @@ int launches = 0, destroys = 0, retirements = 0, acquisitions = 0;
 bool fail_wait = false, fail_copy = false, fail_retire = false, complete_payload = true;
 bool fail_close = false, fail_create = false, fail_free = false;
 bool fail_acquire = false, fail_get_acquire = false, fail_memset = false;
-int get_launches = 0, get_retirements = 0;
+int get_launches = 0, get_retirements = 0, get_acquisitions = 0;
+bool get_success = false;
 std::vector<KvafBatchPutLocalBuffer*> registrations;
 std::vector<KvafBatchGetLocalBuffer*> get_registrations;
 }
@@ -95,6 +96,7 @@ int32_t KvafBatchGetTransportClose(KvafBatchGetTransport* p) {
   get_registrations.clear(); delete p; return 0;
 }
 int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport*, void*, uint64_t, KvafBatchGetLocalBuffer** out, uint64_t* entity) {
+  ++get_acquisitions;
   *out = new KvafBatchGetLocalBuffer; get_registrations.push_back(*out);
   *entity = fail_get_acquire ? 0 : 1; return fail_get_acquire ? -1 : 0;
 }
@@ -104,7 +106,15 @@ int32_t KvafBatchGetLocalBufferRetire(KvafBatchGetLocalBuffer* p) {
   get_registrations.erase(std::remove(get_registrations.begin(), get_registrations.end(), p), get_registrations.end());
   ++get_retirements; delete p; return 0;
 }
-int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs*, aclrtStream) { ++get_launches; return -1; }
+int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs* args, aclrtStream) {
+  ++get_launches;
+  if (!get_success) return -1;
+  auto* reports = reinterpret_cast<KvafBatchGetCoreStatus*>(args->core_status);
+  for (unsigned i = 0; i < 2; ++i) {
+    reports[i] = {}; reports[i].magic = KVAF_AIV_BATCH_GET_STATUS_MAGIC;
+  }
+  return 0;
+}
 }
 int main() {
   using namespace kvaf;
@@ -219,6 +229,42 @@ int main() {
   CHECK(partial_get.Shutdown().code() == StatusCode::kCompletionUnknown); // Not a graph-lease Busy.
   fail_close = false;
   CHECK(partial_get.Shutdown().ok() && get_registrations.empty());
+  // One explicit output binding reuses both MR and entity across calls/streams.
+  fail_get_acquire = false; get_success = true;
+  DefaultAccessOperator reused(config);
+  CHECK(reused.Initialize(region).ok());
+  auto reused_state = reused.CreateExecutionState();
+  CHECK(reused.BindExecutionState(reused_state.get()).ok());
+  const auto registered = get_acquisitions, retired = get_retirements;
+  CHECK(reused.PrepareGetOutput({get.output, get_call.execution.stream, 1}).ok());
+  CHECK(get_acquisitions == registered + 1);
+  for (int i = 0; i < 3; ++i) {
+    get_call.execution.stream = reinterpret_cast<void*>(i + 1);
+    get_call.execution.synchronize = i % 2;
+    CHECK(reused.ExecuteBatchGet(get_call).ok());
+    CHECK(reused.DrainGet().ok());
+    CHECK(get_acquisitions == registered + 1 && get_retirements == retired);
+  }
+  get_call.execution.synchronize = false;
+  CHECK(reused.ExecuteBatchGet(get_call).ok());
+  fail_wait = true;
+  CHECK(!reused.FinishGetOutput().ok() && get_retirements == retired);
+  fail_wait = false; fail_copy = true;
+  CHECK(!reused.FinishGetOutput().ok() && get_retirements == retired);
+  fail_copy = false; fail_retire = true;
+  CHECK(!reused.FinishGetOutput().ok() && get_registrations.size() == 1);
+  const auto before_failed_reuse = get_launches;
+  CHECK(!reused.ExecuteBatchGet(get_call).ok() && get_launches == before_failed_reuse);
+  fail_retire = false;
+  CHECK(reused.FinishGetOutput().ok() && get_retirements == retired + 1);
+  // Even an identical address must register anew once its lease has ended.
+  CHECK(reused.PrepareGetOutput({get.output, get_call.execution.stream, 1}).ok());
+  CHECK(get_acquisitions == registered + 2);
+  CHECK(reused.FinishGetOutput().ok());
+  CHECK(reused.ExecuteBatchGet(get_call).ok());
+  CHECK(reused.DrainGet().ok() && get_retirements == retired + 3);
+  CHECK(reused.Shutdown().ok() && get_registrations.empty());
+  CHECK(reused.BindExecutionState(nullptr).ok());
   // Resource setup/teardown must work after the compatibility operator is gone.
   config.enable_get = false;
   config.batch_put_kernel_object_path = "test-put.o";

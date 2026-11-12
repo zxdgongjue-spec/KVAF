@@ -24,7 +24,8 @@ ExecutionPolicy Policy() {
   return p;
 }
 struct State {
-  std::atomic<int> creates{0}, calls{0}, drains{0}, closes{0};
+  std::atomic<int> creates{0}, calls{0}, drains{0}, closes{0}, bindings{0}, releases{0};
+  bool fail_bind{false}, fail_release{false};
   std::atomic<bool> fail_create{false}, fail_put{false}, fail_drain{false}, fail_close{false};
   std::mutex mutex;
   std::condition_variable changed;
@@ -62,6 +63,14 @@ class Provider final : public AccessOperator {
     table_ = e.host_access_table;
     pending_ = true;
     return e.execution.synchronize ? DrainGet() : Status::OK();
+  }
+  Status PrepareGetOutput(const GetOutputOptions&) override {
+    ++s_.bindings;
+    return s_.fail_bind ? Status::Internal("bind") : Status::OK();
+  }
+  Status FinishGetOutput() override {
+    ++s_.releases;
+    return s_.fail_release ? Status::Internal("release") : DrainGet();
   }
   Status PrepareGetGraph(const GetGraphOptions&) override { return Status::OK(); }
   Status FinishGetGraph(void*, bool) override { return DrainGet(); }
@@ -253,11 +262,90 @@ void GraphLeasePinsAndIsolation() {
   CHECK(runtime.BatchFree({{1}}).ok());
   CHECK(runtime.Shutdown().ok());
 }
+void OutputLeaseReuseAndPins() {
+  State p, g, a;
+  ExecutionDispatcher dispatch(Policy()); Register(dispatch, p, g, a);
+  auto meta = CreateInMemoryMetaManager();
+  auto allocator = CreateHostDdrMemoryAllocator();
+  RuntimeCore runtime(*meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({128, 16, DeviceKind::kCpu}).ok());
+  char input[16] = "bound output", output[16]{}, other[16]{};
+  CHECK(runtime.BatchPut({{1}, {input, 16, DeviceKind::kCpu}, {0}, {16}}).ok());
+  AccessTableHandle table;
+  CHECK(runtime.PrepareAccessTable({{1}}, &table).ok());
+  int index = 0, offset = 0, count = 1, row = 0;
+  BatchGetRequest request{table, {&index,4,DeviceKind::kNpu}, {&offset,4,DeviceKind::kNpu},
+      {&count,4,DeviceKind::kNpu}, {&row,4,DeviceKind::kNpu},
+      {output,16,DeviceKind::kNpu},16,1,{}};
+  Address address = 0; std::uint8_t valid = 1;
+  request.device_access_table = {{&address,8,DeviceKind::kNpu}, {&valid,1,DeviceKind::kNpu}};
+  GetOutputOptions binding{request.output, reinterpret_cast<void*>(1), 1};
+  std::uint64_t lease = 0, unused = 0;
+  CHECK(runtime.BeginGetOutput(get, binding, &lease).ok() && lease && g.bindings == 1);
+  CHECK(runtime.BeginGetOutput(gather, binding, &unused).code() == StatusCode::kBusy);
+  CHECK(runtime.BeginGetGraph(get, {binding.output, binding.stream, 1}, &unused).code() == StatusCode::kBusy);
+  CHECK(dispatch.Recover(get).code() == StatusCode::kBusy);
+  CHECK(dispatch.Warmup(gather).code() == StatusCode::kBusy);
+  CHECK(runtime.BatchGet(request).code() == StatusCode::kBusy);
+  BatchGetExecutionOptions options; options.config = get; options.output_lease = lease;
+  auto changed = request; changed.output.data = other;
+  CHECK(!runtime.BatchGet(changed, options).ok());
+  changed = request; changed.indices.bytes = changed.offsets.bytes = changed.output_indices.bytes = 8;
+  CHECK(!runtime.BatchGet(changed, options).ok());
+  auto mismatched = options; mismatched.config = gather;
+  CHECK(!runtime.BatchGet(request, mismatched).ok());
+  CHECK(g.calls == 0 && a.creates == 0);
+  for (int i = 0; i < 3; ++i) {
+    options.synchronize = i % 2;
+    CHECK(runtime.BatchGet(request, options).ok());
+    CHECK(runtime.DrainGet().ok());
+    CHECK(std::memcmp(input, output, 16) == 0);
+  }
+  CHECK(g.bindings == 1 && g.releases == 0);
+  options.synchronize = false;
+  CHECK(runtime.BatchGet(request, options).ok());
+  CHECK(runtime.ReleaseAccessTable(table).ok());
+  CHECK(runtime.BatchFree({{1}}).code() == StatusCode::kBusy);
+  CHECK(runtime.BatchPut({{2}, {input, 16, DeviceKind::kCpu}, {0}, {16}}).ok());
+  g.fail_drain = true;
+  CHECK(!runtime.EndGetOutput(lease).ok() && g.releases == 0);
+  CHECK(runtime.BatchFree({{1}}).code() == StatusCode::kBusy);
+  g.fail_drain = false;
+  CHECK(runtime.DrainGet().ok());
+  CHECK(runtime.BatchFree({{1}}).ok()); // Tables do not stay pinned for the output lease.
+  g.fail_release = true;
+  CHECK(!runtime.EndGetOutput(lease).ok());
+  CHECK(runtime.BeginGetOutput(get, binding, &unused).code() == StatusCode::kBusy);
+  g.fail_release = false;
+  CHECK(runtime.EndGetOutput(lease).ok());
+  CHECK(runtime.EndGetOutput(lease).code() == StatusCode::kNotFound);
+  CHECK(runtime.BeginGetOutput(get, binding, &unused).ok() && unused != lease);
+  CHECK(runtime.EndGetOutput(lease).code() == StatusCode::kNotFound);
+  g.fail_close = true;
+  CHECK(!runtime.Shutdown().ok());
+  g.fail_close = false;
+  CHECK(runtime.Shutdown().ok()); // Also releases an idle output lease.
+
+  auto fresh_meta = CreateInMemoryMetaManager();
+  RuntimeCore retry_runtime(*fresh_meta, dispatch, *allocator);
+  CHECK(retry_runtime.Initialize({128, 16, DeviceKind::kCpu}).ok());
+  a.fail_bind = true; a.fail_close = true;
+  CHECK(!retry_runtime.BeginGetOutput(gather, binding, &unused).ok() && !unused);
+  CHECK(!retry_runtime.DrainGet().ok()); // Failed preparation retains partial resources.
+  a.fail_close = false;
+  CHECK(retry_runtime.DrainGet().ok());
+  a.fail_bind = false;
+  CHECK(dispatch.Recover(gather).ok());
+  CHECK(retry_runtime.BeginGetOutput(gather, binding, &unused).ok());
+  CHECK(retry_runtime.EndGetOutput(unused).ok());
+  CHECK(retry_runtime.Shutdown().ok());
+}
 }  // namespace
 int main() {
   Configurations();
   LazyAndIndependent();
   RuntimePinsAndTransactions();
   GraphLeasePinsAndIsolation();
+  OutputLeaseReuseAndPins();
   std::cout << "Execution registry, lazy domains, pins, overlap and recovery passed\n";
 }

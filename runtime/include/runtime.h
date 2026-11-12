@@ -104,6 +104,8 @@ class RuntimeCore {
   bool HasPendingPut() const;
   Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*);
   Status EndGetGraph(std::uint64_t, void* stream, bool discard_result = false);
+  Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*);
+  Status EndGetOutput(std::uint64_t);
 
  protected:
   MetaManager& meta_manager_;

@@ -22,6 +22,7 @@ ExecutionDispatcher::~ExecutionDispatcher() {
     (void)pending_put_.release();
     (void)pending_get_.release();
     (void)graph_context_.release();
+    (void)output_context_.release();
   }
 }
 Status ExecutionDispatcher::RegisterPut(PutExecutionConfig c, Factory f) {
@@ -86,6 +87,7 @@ Status ExecutionDispatcher::Recover(GetExecutionConfig c) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  if (output_id_) return Status::Busy("release Get output lease before recovery");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (s.ok()) s = DrainGetLocked();
@@ -162,6 +164,7 @@ Status ExecutionDispatcher::AcknowledgePut() {
 }
 Status ExecutionDispatcher::DrainGetLocked() {
   if (graph_id_) return Status::Busy("Get graph lease owns this direction");
+  if (output_context_) return output_context_->lease.view().Drain();
   if (!pending_get_) return Status::OK();
   auto s = pending_get_->cleanup_only ? resources_.Close(pending_get_->lease)
                                       : pending_get_->lease.view().Drain();
@@ -176,6 +179,24 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   GetExecutionConfig c;
   auto s = ResolveExecution(policy_, request.execution.config, &c);
   if (!s.ok()) return s;
+  if (output_id_ || request.execution.output_lease) {
+    if (!output_id_ || request.execution.output_lease != output_id_ ||
+        request.execution.graph_lease || !(c == output_context_->config))
+      return Status::Busy("Get output lease/configuration mismatch");
+    const auto& r = *request.request;
+    if (r.output.data != output_options_.output.data || r.output.bytes != output_options_.output.bytes ||
+        r.output.device != output_options_.output.device ||
+        r.indices.bytes % sizeof(std::int32_t) ||
+        r.indices.bytes / sizeof(std::int32_t) > output_options_.request_capacity)
+      return Status::InvalidArgument("request differs from bound Get output/capacity");
+    s = DrainGetLocked();
+    if (!s.ok()) return s;
+    output_context_->request = r;
+    output_context_->table = request.host_access_table;
+    output_context_->options = request.execution;
+    output_context_->options.config = c;
+    return LaunchGet(*output_context_);
+  }
   if (graph_id_ || request.execution.graph_lease) {
     if (!graph_id_ || request.execution.graph_lease != graph_id_ || !(c == graph_context_->config))
       return Status::Busy("Get graph lease/configuration mismatch");
@@ -224,6 +245,7 @@ Status ExecutionDispatcher::Warmup(PutExecutionConfig c, const ExecutionWarmup& 
 Status ExecutionDispatcher::Warmup(GetExecutionConfig c, const ExecutionWarmup& r) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
+  if (output_id_) return Status::Busy("release Get output lease before warmup");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (s.ok()) s = DrainGetLocked();
@@ -237,6 +259,7 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
   if (!r.request_capacity) return Status::InvalidArgument("graph capacity must be positive");
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
+  if (output_id_) return Status::Busy("release Get output lease before graph capture");
   if (c.executor != Executor::Aiv || c.algorithm != GetAlgorithm::Direct)
     return Status::NotImplemented("only AIV Direct Get supports graph leases");
   auto context = std::make_unique<GetExecutionContext>();
@@ -273,6 +296,58 @@ Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool dis
   if (s.ok()) { graph_id_ = 0; graph_context_.reset(); graph_captured_ = false; }
   return s;
 }
+Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutputOptions& r,
+                                            std::uint64_t* id) {
+  if (!id) return Status::InvalidArgument("null output lease ID");
+  *id = 0;
+  if (!r.output.valid() || r.output.device != DeviceKind::kNpu || !r.stream || !r.request_capacity)
+    return Status::InvalidArgument("output binding requires NPU output, stream and capacity");
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  if (output_id_) return Status::Busy("Get output lease already exists");
+  if (c.transport != Transport::Urma ||
+      !((c.executor == Executor::Aiv && c.algorithm == GetAlgorithm::Direct) ||
+        (c.executor == Executor::Aicpu && c.algorithm == GetAlgorithm::Gather)))
+    return Status::NotImplemented("output binding supports URMA AIV Direct and AICPU Gather");
+  auto context = std::make_unique<GetExecutionContext>();
+  auto s = ResolveExecution(policy_, c, &context->config);
+  if (s.ok()) s = DrainGetLocked();
+  if (s.ok()) s = resources_.AcquireGet({c, r.request_capacity}, &context->lease);
+  if (s.ok()) s = context->Bind();
+  if (!s.ok()) return s;
+  if (!next_output_id_) return Status::InvalidState("output lease ID exhausted");
+  try {
+    s = context->lease.view().PrepareOutput(r);
+  } catch (const std::exception& e) {
+    s = Status::Internal(std::string("output preparation failed: ") + e.what());
+  } catch (...) {
+    s = Status::Internal("output preparation failed");
+  }
+  if (!s.ok()) {
+    context->cleanup_only = true;
+    if (!resources_.Close(context->lease).ok()) pending_get_ = std::move(context);
+    return s;
+  }
+  output_options_ = r;
+  output_id_ = next_output_id_++;
+  output_context_ = std::move(context);
+  *id = output_id_;
+  return Status::OK();
+}
+Status ExecutionDispatcher::FinishOutputLocked() {
+  if (!output_context_) return Status::OK();
+  auto s = output_context_->lease.view().Drain();
+  if (s.ok()) s = output_context_->lease.view().FinishOutput();
+  if (s.ok()) { output_context_.reset(); output_id_ = 0; output_options_ = {}; }
+  return s;
+}
+Status ExecutionDispatcher::EndGetOutput(std::uint64_t id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!id || id != output_id_) return Status::NotFound("Get output lease not found");
+  return FinishOutputLocked();
+}
 Status ExecutionDispatcher::Shutdown() {
   std::unique_lock<std::shared_mutex> life(lifecycle_);
   if (graph_id_) return Status::Busy("release Get graph lease before shutdown");
@@ -284,6 +359,10 @@ Status ExecutionDispatcher::Shutdown() {
     if (s.ok()) context.reset();
     else if (first.ok()) first = s;
   };
+  // Queue teardown can recover a failed completion report/unregistration.
+  // Keep the output lease (and the caller's storage) if teardown also fails.
+  close(output_context_);
+  if (!output_context_) { output_id_ = 0; output_options_ = {}; }
   close(pending_put_);
   close(pending_get_);
   auto s = resources_.Shutdown();

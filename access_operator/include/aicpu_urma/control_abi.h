@@ -14,7 +14,8 @@ enum class UmdkControlOp : std::uint32_t {
   kQueryWorker,
   kRegisterBuffer,
   kWrite,
-  kUnregisterBuffers
+  kUnregisterBuffers,
+  kUnregisterBuffer
 };
 
 struct UmdkControlArgs {
