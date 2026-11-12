@@ -50,7 +50,7 @@ class Transport {
   struct GatherProfileSample {
     std::uint64_t sequence;
     std::uint32_t rows;
-    bool pipeline, gather_pipeline, interleaved;
+    bool pipeline, gather_pipeline, interleaved, shard_pipeline;
     Profile profile;
   };
   std::vector<GatherProfileSample> gather_profile_samples_;
@@ -87,23 +87,26 @@ class Transport {
   Status EnsureGatherStaging(std::uint32_t count);
   std::uint32_t FirstGatherChunkRows(std::uint32_t count) const;
   Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave = {},
-                    const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr);
+                    const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr,
+                    const peer::CpuGatherExecutor::ShardProgress& on_shards = {});
   void FlushGatherProfiles();
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
+  Status TryBeginPrepared(PreparedWrite&, std::uint64_t id, bool* submitted);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
                        bool drain_for_credits = false);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
                       std::uint64_t* first_post_ns = nullptr);
-  Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
+  Status PollPrepared(std::uint64_t id, Profile* profile = nullptr, bool wait = true);
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
+  std::array<std::vector<std::size_t>, kJettyCount> prepared_shards_;
   std::vector<GatherWave> gather_waves_;
   std::size_t gather_suffix_wave_{};
   PreparedWrite done_;
@@ -111,7 +114,7 @@ class Transport {
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
-  bool gather_interleave_{}, prepared_interleaved_{};
+  bool gather_interleave_{}, prepared_interleaved_{}, gather_shard_pipeline_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};

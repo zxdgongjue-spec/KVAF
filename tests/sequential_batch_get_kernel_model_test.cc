@@ -617,6 +617,38 @@ int main() {
     assert(std::all_of(staging + 13 * sizeof(source), staging + sizeof(staging),
                        [](uint8_t byte) { return byte == 0xad; }));
 
+    // The coordinator can publish one shard from a wave before another
+    // shard from that same wave is copied. With one worker this is deterministic.
+    kvaf::peer::CpuGatherExecutor shard_executor(source, Address(source), 1, 1);
+    const std::vector<GatherWave> one_wave{GatherWave{Range{4, 8}, Range{0, 4}}};
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(shard_executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source),
+                                       one_wave, nullptr, 0) == 1);
+    bool first_shard_seen = false;
+    shard_executor.Copy({}, [&] {
+      if (!first_shard_seen && shard_executor.ShardReady(0, 0)) {
+        assert(!shard_executor.ShardReady(0, 1));
+        assert(staging[0] == 0xad);
+        assert(!std::memcmp(staging + 4 * sizeof(source), source, sizeof(source)));
+        first_shard_seen = true;
+      }
+      return true;
+    });
+    assert(first_shard_seen && shard_executor.ShardReady(0, 1));
+
+    // In multi-worker mode an invalid contributor must keep its shard from
+    // being submitted even after all the other contributors complete.
+    repeated[4] = Address(source + 1);
+    assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source),
+                                 one_wave, nullptr, 0) == 4);
+    try {
+      executor.Copy({}, [&] { assert(!executor.ShardReady(0, 0)); return true; });
+      assert(false && "invalid gather shard was accepted");
+    } catch (const std::invalid_argument&) {
+      assert(!executor.ShardReady(0, 0));
+    }
+    repeated[4] = Address(source);
+
     repeated[12] = Address(source + 1);
     const std::vector<GatherWave> contiguous{GatherWave{Range{0, 8}}, GatherWave{Range{8, 13}}};
     assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), contiguous) == 4);

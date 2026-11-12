@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -103,7 +104,8 @@ class CpuGatherExecutor {
                            std::uint32_t count, std::uint32_t span_bytes,
                            std::uint64_t source_bytes,
                            const std::vector<cpu_push::GatherWave>& waves = {},
-                           const FixedSuffix* suffix = nullptr);
+                           const FixedSuffix* suffix = nullptr,
+                           std::size_t first_shard_wave = SIZE_MAX);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -126,7 +128,11 @@ class CpuGatherExecutor {
   // The coordinator calls on_wave with the number of completed waves in
   // plan order. Returning false stops publication and joins the helpers.
   using WaveReady = std::function<bool(std::size_t)>;
-  void Copy(const WaveReady& on_wave = {});
+  // After the whole-wave prefix, on_shards can inspect the completion of
+  // each shard independently. Wave indices passed to ShardReady are zero-based.
+  using ShardProgress = std::function<bool()>;
+  void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {});
+  bool ShardReady(std::size_t wave, std::size_t queue) const;
   void EnableProfiling(bool enabled) {
     if (enabled) thread_profiles_.resize(max_threads_);
     profiling_enabled_ = enabled;
@@ -150,6 +156,7 @@ class CpuGatherExecutor {
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     for (auto& wave : fixed_progress_) wave.remaining = threads;
+    PrepareShardProgress();
     if (profiling_enabled_) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
       copy_profile_ = {};
@@ -183,7 +190,9 @@ class CpuGatherExecutor {
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
   std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
-  std::uint64_t CopyFixedWave(std::size_t worker, std::size_t wave);
+  void PrepareShardProgress();
+  template <typename OnProgress>
+  std::uint64_t CopyFixedWave(std::size_t worker, std::size_t wave, OnProgress on_progress);
   template <typename OnWait>
   bool WaitFixedSuffix(OnWait on_wait);
 
@@ -223,6 +232,11 @@ class CpuGatherExecutor {
     cpu_push::GatherWave rows{};
   };
   std::vector<FixedWaveProgress> fixed_progress_;
+  struct alignas(64) FixedShardProgress {
+    std::size_t remaining{};
+  };
+  std::size_t fixed_first_shard_wave_{SIZE_MAX};
+  std::vector<std::array<FixedShardProgress, cpu_push::kJettyCount>> fixed_shards_;
   enum class FixedError { kNone, kSource, kSuffix, kCancelled };
   std::atomic<FixedError> fixed_error_{FixedError::kNone};
   void SetFixedError(FixedError error) {

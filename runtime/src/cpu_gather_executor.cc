@@ -66,6 +66,8 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     if (variable_offsets_.back() != header.total_bytes) return 0U;
   }
   fixed_progress_.clear();
+  fixed_shards_.clear();
+  fixed_first_shard_wave_ = SIZE_MAX;
   pipeline_ready_ = nullptr;
   if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
@@ -82,11 +84,13 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
     std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes,
-    const std::vector<cpu_push::GatherWave>& waves, const FixedSuffix* suffix) {
+    const std::vector<cpu_push::GatherWave>& waves, const FixedSuffix* suffix,
+    std::size_t first_shard_wave) {
   if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes)
     return 0U;
   if ((!waves.empty() && reinterpret_cast<std::uintptr_t>(staging) % 64U) ||
-      (suffix && (!suffix->ready_sequence || suffix->first_wave >= waves.size())))
+      (suffix && (!suffix->ready_sequence || suffix->first_wave >= waves.size())) ||
+      (first_shard_wave != SIZE_MAX && first_shard_wave >= waves.size()))
     return 0U;
   fixed_progress_.resize(waves.size());
   std::uint64_t planned_rows = 0U;
@@ -108,6 +112,8 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
     if (!wave.aligned_bytes) return 0U;
   }
   if (!waves.empty() && planned_rows != count) return 0U;
+  fixed_first_shard_wave_ = first_shard_wave;
+  fixed_shards_.resize(first_shard_wave == SIZE_MAX ? 0U : waves.size() - first_shard_wave);
   fixed_last_source_offset_ = source_bytes - span_bytes;
   fixed_suffix_ = suffix ? *suffix : FixedSuffix{};
   fixed_error_.store(FixedError::kNone, std::memory_order_relaxed);
@@ -116,7 +122,7 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   return PrepareJob(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
 }
 
-void CpuGatherExecutor::Copy(const WaveReady& on_wave) {
+void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_shards) {
   completed_.store(0U, std::memory_order_relaxed);
   if (profiling_enabled_) {
     copy_profile_.begin_ns = NowNs();
@@ -138,10 +144,11 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave) {
   std::exception_ptr publish_error;
   std::size_t next_ready = 0;
   bool publishing = true;
+  const auto whole_waves = std::min(fixed_progress_.size(), fixed_first_shard_wave_);
   const auto publish_ready = [&]() {
     if (!publishing) return;
     try {
-      while (next_ready < fixed_progress_.size() &&
+      while (next_ready < whole_waves &&
              !__atomic_load_n(&fixed_progress_[next_ready].remaining, __ATOMIC_ACQUIRE) &&
              fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
         if (on_wave && !on_wave(next_ready + 1U)) {
@@ -150,6 +157,11 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave) {
           return;
         }
         ++next_ready;
+      }
+      if (on_shards && next_ready == whole_waves &&
+          fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone && !on_shards()) {
+        publishing = false;
+        SetFixedError(FixedError::kCancelled);
       }
     } catch (...) {
       publish_error = std::current_exception();
@@ -171,7 +183,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave) {
         if (begin) copy_profile_.suffix_wait_ns = NowNs() - begin;
         if (!ready) break;
       }
-      copied += CopyFixedWave(0U, wave);
+      copied += CopyFixedWave(0U, wave, publish_ready);
       publish_ready();
     }
   }
@@ -283,8 +295,48 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
   return false;
 }
 
-std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t index) {
+void CpuGatherExecutor::PrepareShardProgress() {
+  for (std::size_t index = 0; index < fixed_shards_.size(); ++index) {
+    const auto& wave = fixed_progress_[fixed_first_shard_wave_ + index];
+    auto& shards = fixed_shards_[index];
+    shards = {};
+    std::array<std::uint64_t, cpu_push::kJettyCount> starts{}, ends{};
+    std::uint64_t offset = 0U;
+    for (std::size_t queue = 0; queue < shards.size(); ++queue) {
+      const auto rows = wave.rows[queue];
+      const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;
+      starts[queue] = offset;
+      ends[queue] = offset + bytes;
+      offset += cpu_push::Align64(bytes);
+    }
+    std::uint64_t first = 0U;
+    for (std::size_t worker = 1; worker <= active_threads_; ++worker) {
+      const auto last = Boundary(worker, 0U, wave.aligned_bytes);
+      for (std::size_t queue = 0; queue < shards.size(); ++queue) {
+        if (std::max(first, starts[queue]) < std::min(last, ends[queue]))
+          ++shards[queue].remaining;
+      }
+      first = last;
+    }
+  }
+}
+
+bool CpuGatherExecutor::ShardReady(std::size_t wave, std::size_t queue) const {
+  if (wave < fixed_first_shard_wave_ || wave >= fixed_progress_.size() ||
+      queue >= cpu_push::kJettyCount)
+    return false;
+  const auto rows = fixed_progress_[wave].rows[queue];
+  return rows.begin < rows.end &&
+         !__atomic_load_n(&fixed_shards_[wave - fixed_first_shard_wave_][queue].remaining,
+                          __ATOMIC_ACQUIRE) &&
+         fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone;
+}
+
+template <typename OnProgress>
+std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t index,
+                                             OnProgress on_progress) {
   auto& wave = fixed_progress_[index];
+  const bool shard_mode = index >= fixed_first_shard_wave_;
   const auto first = Boundary(worker, 0U, wave.aligned_bytes);
   const auto last = Boundary(worker + 1U, 0U, wave.aligned_bytes);
   std::uint64_t copied = 0U;
@@ -292,21 +344,34 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
   // Divide the combined wave evenly, then translate each worker's slice
   // back to the original staging addresses. Pad a short final range in
   // this calculation only, so the next range still starts on a cache line.
-  for (const auto rows : wave.rows) {
+  for (std::size_t queue = 0; queue < wave.rows.size(); ++queue) {
+    const auto rows = wave.rows[queue];
     if (rows.begin == rows.end) continue;
     const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;
     const auto begin = std::max(first, offset);
     const auto end = std::min(last, offset + bytes);
     if (begin < end) {
       const auto staging_offset = std::uint64_t{rows.begin} * span_bytes_;
-      copied += CopyFixedRange(staging_offset + (begin - offset), staging_offset + (end - offset));
+      const auto bytes_copied =
+          CopyFixedRange(staging_offset + (begin - offset), staging_offset + (end - offset));
+      copied += bytes_copied;
+      if (shard_mode) {
+        if (bytes_copied) GatherBarrier();
+        auto& remaining = fixed_shards_[index - fixed_first_shard_wave_][queue].remaining;
+        // Acquire the previous writers' stores before making this shard ready.
+        __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
+        on_progress();
+        if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
+      }
     }
     offset += cpu_push::Align64(bytes);
     if (offset >= last) break;
   }
-  if (copied) GatherBarrier();
-  // The last decrement carries every writer's completed stores to the owner.
-  __atomic_fetch_sub(&wave.remaining, 1U, __ATOMIC_ACQ_REL);
+  if (!shard_mode) {
+    if (copied) GatherBarrier();
+    // The last decrement carries every writer's completed stores to the owner.
+    __atomic_fetch_sub(&wave.remaining, 1U, __ATOMIC_ACQ_REL);
+  }
   return copied;
 }
 
@@ -317,7 +382,7 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
       if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
       if (fixed_suffix_.ready_sequence && wave == fixed_suffix_.first_wave &&
           !WaitFixedSuffix([] {})) break;
-      copied += CopyFixedWave(worker, wave);
+      copied += CopyFixedWave(worker, wave, [] {});
     }
     return copied;
   }

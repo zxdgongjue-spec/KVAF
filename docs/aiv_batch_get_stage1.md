@@ -201,6 +201,13 @@ cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批�
 CPU profile 的 `pipeline` 表示 AIV 模式，`gather_pipeline` 表示 CPU 是否实际分波，
 `interleaved` 表示是否采用交错顺序，`ready_wrs` 记录逐分片 Ready WRITE 数。
 
+在交错模式上加 `KVAF_CPU_GATHER_SHARD_PIPELINE=1` 可测试分片提交。首段仍提前发送，
+后缀中每条 Jetty 可以在自身分片的 CPU 拷贝完成后独立提交，沿用同一 Jetty 上的
+payload 和 Ready 顺序。队列缺额度时，提交线程先检查其他 Jetty，并回收 CQE。
+`shard_pipeline=1` 表示该批实际采用分片提交，`waves` 计的是 WRITE 计划提交次数，
+一个 gather 波可以对应多个计划。用同样的交错配置、绑核和请求分布，将分片开关设为
+`0` 或 `1` 对比端到端和 AIV scatter 尾部。
+
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务准备，`copy_ns` 记录任务发布、各线程的源地址校验、拷贝和汇合，
 `suffix_wait_ns` 记录协调线程等待后缀清单的时间。`gather_pipeline=1` 的 `copy_ns`

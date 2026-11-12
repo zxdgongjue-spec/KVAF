@@ -66,6 +66,11 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
   if (interleave && ((interleave[0] != '0' && interleave[0] != '1') || interleave[1] != '\0'))
     return Status::InvalidArgument("KVAF_CPU_GATHER_INTERLEAVE must be 0 or 1");
   gather_interleave_ = interleave && interleave[0] == '1';
+  const auto* shard_pipeline = std::getenv("KVAF_CPU_GATHER_SHARD_PIPELINE");
+  if (shard_pipeline &&
+      ((shard_pipeline[0] != '0' && shard_pipeline[0] != '1') || shard_pipeline[1] != '\0'))
+    return Status::InvalidArgument("KVAF_CPU_GATHER_SHARD_PIPELINE must be 0 or 1");
+  gather_shard_pipeline_ = shard_pipeline && shard_pipeline[0] == '1';
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
@@ -284,7 +289,8 @@ std::uint32_t Transport::FirstGatherChunkRows(std::uint32_t count) const {
 }
 
 Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave,
-                             const peer::CpuGatherExecutor::FixedSuffix* suffix) {
+                             const peer::CpuGatherExecutor::FixedSuffix* suffix,
+                             const peer::CpuGatherExecutor::ShardProgress& on_shards) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   try {
     std::size_t threads;
@@ -292,12 +298,13 @@ Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor:
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
       gather_->EnableProfiling(profile_.enabled);
       threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
-                                      gather_waves_, suffix);
+                                      gather_waves_, suffix,
+                                      on_shards ? gather_suffix_wave_ : SIZE_MAX);
     }
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
-      gather_->Copy(on_wave);
+      gather_->Copy(on_wave, on_shards);
     }
     if (profile_.enabled) {
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
@@ -377,6 +384,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   prepared_.clear();
+  for (auto& shards : prepared_shards_) shards.clear();
   gather_waves_.clear();
   gather_suffix_wave_ = 0U;
   prepared_interleaved_ = false;
@@ -453,19 +461,27 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       if (batch_done_only && !gather_pipeline) append(0, 0, stage);
       else ForEachPipelineChunk(count, token_bytes_, workers_, append);
     }
-    std::size_t waves = 0;
-    for (const auto& shard : shards) waves = std::max(waves, shard.size());
-    for (std::size_t w = 0; w < waves; ++w) {
+    const auto add_plan = [&](std::size_t w, std::uint32_t only_queue) {
       auto plan = std::make_unique<PreparedWrite>();
       plan->suffix = suffix;
       for (std::uint32_t q = 0; q < kJettyCount; ++q)
-        if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
+        if ((only_queue == kJettyCount || q == only_queue) && w < shards[q].size())
+          plan->queues[q] = std::move(shards[q][w]);
       SealPrepared(*plan);
       if (plan->fence_count) {
         if (gather_pipeline) plan->ready_waves = gather_waves_.size();
         else if (gather_ && w == 0) plan->gather_before_post = true;
+        if (only_queue < kJettyCount) prepared_shards_[only_queue].push_back(prepared_.size());
         prepared_.push_back(std::move(plan));
       }
+    };
+    if (wave && gather_shard_pipeline_) {
+      for (std::uint32_t q = 0; q < kJettyCount; ++q)
+        for (std::size_t w = 0; w < shards[q].size(); ++w) add_plan(w, q);
+    } else {
+      std::size_t waves = 0;
+      for (const auto& shard : shards) waves = std::max(waves, shard.size());
+      for (std::size_t w = 0; w < waves; ++w) add_plan(w, kJettyCount);
     }
   };
   // A gather plan can start on the head and gate subsequent waves on suffix.
@@ -529,25 +545,29 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
   for (; marker != q.markers.end() && marker->local < post.end_sge; ++marker)
     *marker->value = Progress(request().sequence, marker->progress);
 }
-Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, Profile* drain_profile,
-                                  bool drain_for_credits) {
+Status Transport::TryBeginPrepared(PreparedWrite& plan, std::uint64_t id, bool* submitted) {
   for (const auto& q : queues_)
     if (q.poisoned) return Error("queue unavailable");
-  bool submitted = false;
-  auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
-  if (!status.ok()) return status;
-  if (!submitted && drain_for_credits) {
-    status = DrainPrepared(drain_profile);
-    if (!status.ok()) return status;
-    status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, &submitted);
-    if (!status.ok()) return status;
-  }
-  if (!submitted) return Error("drained queue has insufficient credits");
+  auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, submitted);
+  if (!status.ok() || !*submitted) return status;
   for (std::size_t i = 0; i < plan.fence_count; ++i) {
     const auto& fence = plan.fences[i];
     plan.queues[fence.queue].wrs.back().user_ctx = fence.context;
   }
   return Status::OK();
+}
+Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, Profile* drain_profile,
+                                bool drain_for_credits) {
+  bool submitted = false;
+  auto status = TryBeginPrepared(plan, id, &submitted);
+  if (!status.ok()) return status;
+  if (!submitted && drain_for_credits) {
+    status = DrainPrepared(drain_profile);
+    if (!status.ok()) return status;
+    status = TryBeginPrepared(plan, id, &submitted);
+    if (!status.ok()) return status;
+  }
+  return submitted ? Status::OK() : Error("drained queue has insufficient credits");
 }
 Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources,
                                std::uint64_t* first_post_ns) {
@@ -574,8 +594,9 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources,
   }
   return Status::OK();
 }
-Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
+  const auto deadline = wait ? std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs)
+                             : std::chrono::steady_clock::time_point{};
   std::uint32_t polls = 0;
   for (;;) {
     std::array<urma_cr_t, 8> crs;
@@ -609,7 +630,7 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
         });
     next_poll_queue_ = (next_poll_queue_ + 1) % kJettyCount;
     if (!status.ok()) return status;
-    if (count) return Status::OK();
+    if (count || !wait) return Status::OK();
     if ((++polls & 31) == 0 && std::chrono::steady_clock::now() >= deadline) {
       for (auto& q : queues_) q.poisoned = true;
       return Error("prepared CQ timeout; resources retained");
@@ -661,10 +682,11 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     BatchGetProfileScope timer(profile && gather_ ? &profile->suffix_wait_ns : nullptr);
     return WaitSuffix(stop);
   };
-  const auto submit_plan = [&](std::size_t w) {
+  const auto submit_plan = [&](std::size_t w, bool* submitted = nullptr) {
     auto& plan = *prepared_[w];
-    auto status = BeginPrepared(plan, w + 1, profile, true);
-    if (!status.ok()) return status;
+    auto status = submitted ? TryBeginPrepared(plan, w + 1, submitted)
+                            : BeginPrepared(plan, w + 1, profile, true);
+    if (!status.ok() || (submitted && !*submitted)) return status;
     if (profile) {
       if (!gather_) profile->cpu_threads = 1;
       ++profile->waves;
@@ -685,21 +707,61 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   };
   if (!gather_waves_.empty()) {
     std::size_t next_plan = 0;
+    std::array<std::size_t, kJettyCount> next_shard{};
+    std::size_t shards_left = 0U;
+    for (const auto& shards : prepared_shards_) shards_left += shards.size();
+    const auto whole_plans = prepared_.size() - shards_left;
     const peer::CpuGatherExecutor::FixedSuffix suffix{
         reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset),
         request().sequence, stop, std::chrono::milliseconds(kTimeoutMs), gather_suffix_wave_};
     Status post_status = Status::OK();
+    const auto post_ready_shards = [&](bool poll_for_credits) {
+      if (!shards_left) return true;
+      // Keep submission order within each Jetty. A slow shard or exhausted
+      // queue cannot prevent posting the next ready shard on another Jetty.
+      bool blocked = false, made_progress;
+      do {
+        made_progress = false;
+        for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+          if (next_shard[q] == prepared_shards_[q].size()) continue;
+          const auto plan = prepared_shards_[q][next_shard[q]];
+          if (!gather_->ShardReady(prepared_[plan]->ready_waves - 1U, q)) continue;
+          bool submitted = false;
+          post_status = submit_plan(plan, &submitted);
+          if (!post_status.ok()) return false;
+          if (submitted) {
+            ++next_shard[q];
+            --shards_left;
+            made_progress = true;
+          } else {
+            blocked = true;
+          }
+        }
+      } while (made_progress && shards_left);
+      if (poll_for_credits && blocked && shards_left) post_status = PollPrepared(0, profile, false);
+      return post_status.ok();
+    };
+    peer::CpuGatherExecutor::ShardProgress on_shards;
+    if (shards_left) on_shards = [&] { return post_ready_shards(true); };
     status = GatherRows(count, [&](std::size_t ready_waves) {
-      while (next_plan < prepared_.size() && prepared_[next_plan]->ready_waves <= ready_waves) {
+      while (next_plan < whole_plans && prepared_[next_plan]->ready_waves <= ready_waves) {
         post_status = submit_plan(next_plan);
         if (!post_status.ok()) return false;
         ++next_plan;
       }
       return true;
-    }, (request().reserved & kHeadStart) ? &suffix : nullptr);
+    }, (request().reserved & kHeadStart) ? &suffix : nullptr, on_shards);
     if (!post_status.ok()) return post_status;
     if (!status.ok()) return fail_gather(status);
-    if (next_plan != prepared_.size()) return fail_gather(Error("missing gather WRITE plan"));
+    if (next_plan != whole_plans) return fail_gather(Error("missing gather WRITE plan"));
+    while (shards_left) {
+      if (!post_ready_shards(false)) return post_status;
+      if (shards_left) {
+        if (tracker_.Empty()) return fail_gather(Error("missing ready gather shard"));
+        status = PollPrepared(0, profile);
+        if (!status.ok()) return status;
+      }
+    }
     return DrainPrepared(profile);
   }
 
@@ -754,7 +816,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
     if (gather_profile_samples_.size() < kGatherProfileSamples) {
       gather_profile_samples_.push_back(
           {sequence, profiled_gather_rows, profiled_pipeline, !gather_waves_.empty(),
-           prepared_interleaved_, profile_});
+           prepared_interleaved_, prepared_interleaved_ && gather_shard_pipeline_, profile_});
     } else {
       ++gather_profile_dropped_;
     }
@@ -786,7 +848,7 @@ void Transport::FlushGatherProfiles() {
     const auto& slow = p.slowest_thread;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u gather_pipeline=%u interleaved=%u waves=%u ready_wrs=%u"
+        " pipeline=%u gather_pipeline=%u interleaved=%u shard_pipeline=%u waves=%u ready_wrs=%u"
         " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
         " suffix_wait_ns=%" PRIu64
         " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
@@ -796,7 +858,7 @@ void Transport::FlushGatherProfiles() {
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
         unsigned(sample.pipeline), unsigned(sample.gather_pipeline), unsigned(sample.interleaved),
-        p.waves, p.ready_wrs, p.cpu_threads,
+        unsigned(sample.shard_pipeline), p.waves, p.ready_wrs, p.cpu_threads,
         p.gather_prepare_ns, p.gather_copy_ns,
         p.suffix_wait_ns,
         p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
@@ -848,6 +910,7 @@ Status Transport::Shutdown() {
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
   tracker_ = Tracker(kJettyCount, kJettyDepth);
   prepared_.clear();
+  for (auto& shards : prepared_shards_) shards.clear();
   gather_waves_.clear();
   gather_suffix_wave_ = 0U;
   done_ = {};
