@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Start two independent, single-shape BatchGet sweeps at a common ready time.
+"""Start two to four independent, single-shape BatchGet sweeps at a common ready time.
 
-The original sweep owns all logs, tables and CSVs, under output-dir/flow1 and
-output-dir/flow2. Only terminal lines get a flow prefix. Each worker prepares
+The original sweep owns all logs, tables and CSVs under output-dir/flowN.
+Only terminal lines get a flow prefix. Each worker prepares
 and warms up normally, then waits just before its first measured BatchGet.
 """
 
@@ -23,6 +23,9 @@ import time
 import test_npu_batch_get_perf as perf
 
 
+FLOW_NAMES = ("flow1", "flow2", "flow3", "flow4")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -33,6 +36,8 @@ def parse_args(argv=None):
     --flow2-args="--token-bytes 656 --miss-count 8192 --aiv-cores 1 --jettys-per-core 4 --table-capacity 16384 --warmup 3 --iterations 100" \\
     --output-dir results/two-flows
 
+Add --flow3-device and --flow4-device to run four flows. Each additional flow
+accepts its own --flowN-priorities and --flowN-args, even when sharing an NPU.
 Each --flow*-args string uses the existing benchmark options, without shell
 evaluation. Priority lists use the existing KVAF_BATCH_GET_JETTY_PRIORITIES
 semantics. The original sweep enables kernel profiling and manages CSV paths.
@@ -42,21 +47,27 @@ Existing flow output directories are refused to prevent overwriting results.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
-    for name in ("flow1", "flow2"):
-        parser.add_argument(f"--{name}-device", type=int, required=True)
-        parser.add_argument(f"--{name}-priorities",
-                            default=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES") or "15")
-        parser.add_argument(f"--{name}-args", default="", help="quoted original benchmark options")
+    for name in FLOW_NAMES:
+        parser.add_argument(f"--{name}-device", type=int, required=name in ("flow1", "flow2"))
+        parser.add_argument(f"--{name}-priorities", default=argparse.SUPPRESS)
+        parser.add_argument(f"--{name}-args", default=argparse.SUPPRESS, help="quoted original benchmark options")
     args = parser.parse_args(argv)
-    for name in ("flow1", "flow2"):
-        if getattr(args, f"{name}_device") < 0:
+    args.flow_names = []
+    for name in FLOW_NAMES:
+        device = getattr(args, f"{name}_device")
+        if device is None:
+            if hasattr(args, f"{name}_priorities") or hasattr(args, f"{name}_args"):
+                parser.error(f"--{name}-device is required when configuring {name}")
+            continue
+        if device < 0:
             parser.error(f"{name}-device must be non-negative")
+        args.flow_names.append(name)
     return args
 
 
 def build_flow(args, name):
     """Reuse benchmark parsing and the original shell's single-shape output path."""
-    options = shlex.split(getattr(args, f"{name}_args"))
+    options = shlex.split(getattr(args, f"{name}_args", ""))
     # Match the sweep's clock default, while allowing a per-flow CLI override.
     options = ["--kernel-profile-clock-mhz",
                os.environ.get("KVAF_BATCH_GET_KERNEL_CLOCK_MHZ", "1000"),
@@ -67,7 +78,8 @@ def build_flow(args, name):
         raise ValueError(f"{name}: {error}")
     if benchmark.adaptive_ub_device or benchmark.adaptive_calibration_only:
         raise ValueError(f"{name}: select a fixed peer; adaptive calibration is not supported")
-    priorities = getattr(args, f"{name}_priorities").split(",")
+    default_priorities = os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES") or "15"
+    priorities = getattr(args, f"{name}_priorities", default_priorities).split(",")
     if any(not re.fullmatch(r"[0-9]+", value.strip()) or not 0 <= int(value) <= 15
            for value in priorities):
         raise ValueError(f"{name}: priorities must be a comma-separated list in [0, 15]")
@@ -138,7 +150,7 @@ def run_flows(flows, timeout):
     deadline = time.monotonic() + timeout
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        listener.listen(2)
+        listener.listen(len(flows))
         listener.settimeout(0.1)
         endpoint = f"127.0.0.1:{listener.getsockname()[1]}"
         tokens = {secrets.token_hex(16): name for name, _, _ in flows}
@@ -162,7 +174,7 @@ def run_flows(flows, timeout):
                     if process.poll() is not None:
                         raise RuntimeError(f"{name} exited before synchronized start (status={process.returncode})")
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("waiting for both flows to become ready")
+                    raise TimeoutError(f"waiting for all {len(flows)} flows to become ready")
                 try:
                     connection, _ = listener.accept()
                 except socket.timeout:
@@ -180,11 +192,11 @@ def run_flows(flows, timeout):
             for connection in connections:
                 connection.sendall(f"{start_ns}\n".encode("ascii"))
                 connection.close()
-            emit("[launcher] both flows ready; synchronized start scheduled")
+            emit(f"[launcher] all {len(flows)} flows ready; synchronized start scheduled")
             # After release, each original benchmark runs its own iterations.
             while any(p.poll() is None for p in processes) or any(t.is_alive() for t in readers):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("waiting for the two sweeps to finish")
+                    raise TimeoutError(f"waiting for all {len(flows)} sweeps to finish")
                 time.sleep(0.05)
             finished = True
             return next((p.returncode if p.returncode > 0 else 128 - p.returncode
@@ -210,7 +222,7 @@ def main(argv=None):
         timeout = int(os.environ.get("KVAF_REMOTE_CPU_PERF_TIMEOUT", "600"))
         if timeout <= 0:
             raise ValueError("KVAF_REMOTE_CPU_PERF_TIMEOUT must be positive")
-        flows = [build_flow(args, name) for name in ("flow1", "flow2")]
+        flows = [build_flow(args, name) for name in args.flow_names]
         for name, _, _ in flows:
             output = args.output_dir.resolve() / name
             if output.exists():

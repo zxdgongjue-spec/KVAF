@@ -176,6 +176,42 @@ class ConcurrentTests(ConcurrentFixture):
         self.assertEqual(text.count(block), 2)
         self.assertLess(text.index("flow1 / DEVICE_ID=7"), text.index("flow2 / DEVICE_ID=6"))
 
+    def test_four_flow_cli_waits_for_last_worker_on_shared_devices(self):
+        argv = ["build-npu", "--output-dir", str(self.output)]
+        devices = (7, 6, 7, 6)
+        for index, device in enumerate(devices, 1):
+            argv.extend([f"--flow{index}-device", str(device),
+                         f"--flow{index}-priorities", str(index),
+                         f"--flow{index}-args=--miss-count {index * 100}"])
+
+        popen = subprocess.Popen
+
+        def launch_worker(command, **kwargs):
+            # Replace the hardware sweep with a process using the real benchmark gate.
+            env = kwargs["env"]
+            output = Path(env["KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"])
+            index = int(output.name.removeprefix("flow"))
+            self.assertEqual(perf.parse_args(command[3:]).miss_count, index * 100)
+            mode = "slow" if index == 4 else "normal"
+            return popen([sys.executable, "-B", __file__, "--worker", mode, str(output)], **kwargs)
+
+        captured = io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(captured), \
+                patch.object(launcher.subprocess, "Popen", side_effect=launch_worker):
+            code = launcher.main(argv)
+        self.assertEqual(code, 0, captured.getvalue())
+        results = [json.loads((self.output / f"flow{i}" / f"{device}.json").read_text())
+                   for i, device in enumerate(devices, 1)]
+        self.assertEqual([r["priorities"] for r in results], ["1", "2", "3", "4"])
+        self.assertGreaterEqual(min(r["started_ns"] for r in results), max(r["ready_ns"] for r in results))
+
+    def test_optional_flow_settings_require_its_device(self):
+        for option in ("--flow3-priorities=15", "--flow4-args=--miss-count 8192"):
+            with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                launcher.parse_args(["build-npu", "--output-dir", str(self.output),
+                                     "--flow1-device", "7", "--flow2-device", "6", option])
+
     def assert_cleanup_on_error(self, flows, exception, timeout=5):
         created = []
         popen = subprocess.Popen
