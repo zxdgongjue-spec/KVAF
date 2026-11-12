@@ -82,25 +82,32 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
     std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes,
-    std::uint32_t chunk_rows, const FixedSuffix* suffix, std::uint32_t first_chunk_rows) {
+    const std::vector<cpu_push::GatherWave>& waves, const FixedSuffix* suffix) {
   if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes)
     return 0U;
-  if (chunk_rows && (reinterpret_cast<std::uintptr_t>(staging) % 64U ||
-                     std::uint64_t{chunk_rows} * span_bytes % 64U))
+  if ((!waves.empty() && reinterpret_cast<std::uintptr_t>(staging) % 64U) ||
+      (suffix && (!suffix->ready_sequence || suffix->first_wave >= waves.size())))
     return 0U;
-  if (suffix && (!suffix->ready_sequence || !chunk_rows || chunk_rows >= count))
-    return 0U;
-  if (first_chunk_rows && (first_chunk_rows >= chunk_rows || first_chunk_rows >= count ||
-                           std::uint64_t{first_chunk_rows} * span_bytes % 64U))
-    return 0U;
-  fixed_chunk_rows_ = chunk_rows;
-  const auto small_first = first_chunk_rows != 0U;
-  fixed_progress_.resize(chunk_rows ? (count - 1U) / chunk_rows + 1U + small_first : 0U);
+  fixed_progress_.resize(waves.size());
+  std::uint64_t planned_rows = 0U;
   for (std::size_t i = 0; i < fixed_progress_.size(); ++i) {
-    const auto end = small_first && i == 0U
-        ? first_chunk_rows : std::uint64_t{chunk_rows} * (i + !small_first);
-    fixed_progress_[i].end_row = static_cast<std::uint32_t>(std::min<std::uint64_t>(count, end));
+    auto& wave = fixed_progress_[i];
+    wave.aligned_bytes = 0U;
+    wave.rows = waves[i];
+    for (const auto rows : wave.rows) {
+      if (rows.begin == rows.end) continue;
+      if (rows.begin > rows.end || rows.end > count ||
+          std::uint64_t{rows.begin} * span_bytes % 64U ||
+          (rows.end != count && std::uint64_t{rows.end} * span_bytes % 64U))
+        return 0U;
+      const auto row_count = rows.end - rows.begin;
+      planned_rows += row_count;
+      if (planned_rows > count) return 0U;
+      wave.aligned_bytes += cpu_push::Align64(std::uint64_t{row_count} * span_bytes);
+    }
+    if (!wave.aligned_bytes) return 0U;
   }
+  if (!waves.empty() && planned_rows != count) return 0U;
   fixed_last_source_offset_ = source_bytes - span_bytes;
   fixed_suffix_ = suffix ? *suffix : FixedSuffix{};
   fixed_error_.store(FixedError::kNone, std::memory_order_relaxed);
@@ -109,7 +116,7 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   return PrepareJob(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
 }
 
-void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
+void CpuGatherExecutor::Copy(const WaveReady& on_wave) {
   completed_.store(0U, std::memory_order_relaxed);
   if (profiling_enabled_) {
     copy_profile_.begin_ns = NowNs();
@@ -137,7 +144,7 @@ void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
       while (next_ready < fixed_progress_.size() &&
              !__atomic_load_n(&fixed_progress_[next_ready].remaining, __ATOMIC_ACQUIRE) &&
              fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
-        if (on_chunk && !on_chunk(fixed_progress_[next_ready].end_row)) {
+        if (on_wave && !on_wave(next_ready + 1U)) {
           publishing = false;
           SetFixedError(FixedError::kCancelled);
           return;
@@ -153,18 +160,18 @@ void CpuGatherExecutor::Copy(const ChunkReady& on_chunk) {
   if (fixed_progress_.empty()) {
     copied = ProcessSource(0U);
   } else {
-    for (std::size_t chunk = 0; chunk < fixed_progress_.size(); ++chunk) {
+    for (std::size_t wave = 0; wave < fixed_progress_.size(); ++wave) {
       if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
-      if (fixed_suffix_.ready_sequence && FixedChunkBegin(chunk) == fixed_chunk_rows_) {
+      if (fixed_suffix_.ready_sequence && wave == fixed_suffix_.first_wave) {
         const auto begin = profiling_enabled_ &&
             __atomic_load_n(fixed_suffix_.ready_sequence, __ATOMIC_ACQUIRE) != fixed_suffix_.sequence
             ? NowNs() : 0U;
-        // Keep posting completed head chunks if suffix has yet to arrive.
+        // Keep posting completed head waves if suffix has yet to arrive.
         const bool ready = WaitFixedSuffix(publish_ready);
         if (begin) copy_profile_.suffix_wait_ns = NowNs() - begin;
         if (!ready) break;
       }
-      copied += CopyFixedChunk(0U, chunk);
+      copied += CopyFixedWave(0U, wave);
       publish_ready();
     }
   }
@@ -276,24 +283,41 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
   return false;
 }
 
-std::uint64_t CpuGatherExecutor::CopyFixedChunk(std::size_t worker, std::size_t chunk) {
-  const auto begin = std::uint64_t{FixedChunkBegin(chunk)} * span_bytes_;
-  const auto end = std::uint64_t{fixed_progress_[chunk].end_row} * span_bytes_;
-  const auto copied = CopyFixedRange(Boundary(worker, begin, end), Boundary(worker + 1U, begin, end));
+std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t index) {
+  auto& wave = fixed_progress_[index];
+  const auto first = Boundary(worker, 0U, wave.aligned_bytes);
+  const auto last = Boundary(worker + 1U, 0U, wave.aligned_bytes);
+  std::uint64_t copied = 0U;
+  std::uint64_t offset = 0U;
+  // Divide the combined wave evenly, then translate each worker's slice
+  // back to the original staging addresses. Pad a short final range in
+  // this calculation only, so the next range still starts on a cache line.
+  for (const auto rows : wave.rows) {
+    if (rows.begin == rows.end) continue;
+    const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;
+    const auto begin = std::max(first, offset);
+    const auto end = std::min(last, offset + bytes);
+    if (begin < end) {
+      const auto staging_offset = std::uint64_t{rows.begin} * span_bytes_;
+      copied += CopyFixedRange(staging_offset + (begin - offset), staging_offset + (end - offset));
+    }
+    offset += cpu_push::Align64(bytes);
+    if (offset >= last) break;
+  }
   if (copied) GatherBarrier();
   // The last decrement carries every writer's completed stores to the owner.
-  __atomic_fetch_sub(&fixed_progress_[chunk].remaining, 1U, __ATOMIC_ACQ_REL);
+  __atomic_fetch_sub(&wave.remaining, 1U, __ATOMIC_ACQ_REL);
   return copied;
 }
 
 std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
   if (!fixed_progress_.empty()) {
     std::uint64_t copied = 0U;
-    for (std::size_t chunk = 0; chunk < fixed_progress_.size(); ++chunk) {
+    for (std::size_t wave = 0; wave < fixed_progress_.size(); ++wave) {
       if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
-      if (fixed_suffix_.ready_sequence && FixedChunkBegin(chunk) == fixed_chunk_rows_ &&
+      if (fixed_suffix_.ready_sequence && wave == fixed_suffix_.first_wave &&
           !WaitFixedSuffix([] {})) break;
-      copied += CopyFixedChunk(worker, chunk);
+      copied += CopyFixedWave(worker, wave);
     }
     return copied;
   }

@@ -62,6 +62,10 @@ Transport::~Transport() {
 
 Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t threads,
     std::size_t min_bytes, bool affinity, peer::GatherWaitMode mode) {
+  const auto* interleave = std::getenv("KVAF_CPU_GATHER_INTERLEAVE");
+  if (interleave && ((interleave[0] != '0' && interleave[0] != '1') || interleave[1] != '\0'))
+    return Status::InvalidArgument("KVAF_CPU_GATHER_INTERLEAVE must be 0 or 1");
+  gather_interleave_ = interleave && interleave[0] == '1';
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
@@ -279,7 +283,7 @@ std::uint32_t Transport::FirstGatherChunkRows(std::uint32_t count) const {
   return std::uint64_t{shard.end} * token_bytes_ % 64U == 0U ? shard.end : 0U;
 }
 
-Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::ChunkReady& on_chunk,
+Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave,
                              const peer::CpuGatherExecutor::FixedSuffix* suffix) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   try {
@@ -288,12 +292,12 @@ Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor:
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
       gather_->EnableProfiling(profile_.enabled);
       threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
-          on_chunk ? kChunkRows : 0U, suffix, on_chunk ? FirstGatherChunkRows(count) : 0U);
+                                      gather_waves_, suffix);
     }
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
-      gather_->Copy(on_chunk);
+      gather_->Copy(on_wave);
     }
     if (profile_.enabled) {
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
@@ -371,18 +375,23 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   prepared_.clear();
+  gather_waves_.clear();
+  gather_suffix_wave_ = 0U;
+  prepared_interleaved_ = false;
   const bool clip_to_stage = head_rows || gather_pipeline;
-  const auto build_stage = [&](Range stage, bool suffix) {
+  const auto build_stage = [&](Range stage, bool suffix, const GatherWave* wave = nullptr) {
     std::array<std::vector<PreparedQueue>, kJettyCount> shards;
     const auto source_sges = gather_ ? 1U : max_sge_;
     const bool unsplit = !gather_ && std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
     for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
+      const auto window = wave ? (*wave)[queue] : stage;
+      if (wave && window.begin == window.end) continue;
       auto& waves = shards[queue];
       waves.emplace_back();
       const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
         const auto shard = JettyRange(range, queue);
-        const auto begin = batch_done_only ? shard.begin : std::max(shard.begin, stage.begin);
-        const auto end = batch_done_only ? shard.end : std::min(shard.end, stage.end);
+        const auto begin = batch_done_only ? shard.begin : std::max(shard.begin, window.begin);
+        const auto end = batch_done_only ? shard.end : std::min(shard.end, window.end);
         if (clip_to_stage && begin >= end) return;
         auto row = begin;
         std::uint32_t offset = 0;
@@ -452,7 +461,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
       SealPrepared(*plan);
       if (plan->fence_count) {
-        if (gather_pipeline) plan->ready_rows = stage.end;
+        if (gather_pipeline) plan->ready_waves = gather_waves_.size();
         else if (gather_ && w == 0) plan->gather_before_post = true;
         prepared_.push_back(std::move(plan));
       }
@@ -462,12 +471,26 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   // full gather before the first payload post. A head-start request still
   // requires the suffix notification even though it uses one payload stage.
   if (gather_pipeline) {
-    auto begin = FirstGatherChunkRows(count);
-    if (begin) build_stage({0, begin}, false);
-    while (begin < count) {
-      const auto end = std::min(count, (begin / kChunkRows + 1U) * kChunkRows);
-      build_stage({begin, end}, false);
+    const auto interleaved = gather_interleave_
+        ? InterleavedGatherWaves(count, token_bytes_, workers_, head_rows) : std::vector<GatherWave>{};
+    prepared_interleaved_ = !interleaved.empty();
+    const auto contiguous_end = prepared_interleaved_ ? head_rows : count;
+    const auto build_contiguous = [&](Range rows) {
+      gather_waves_.push_back(GatherWave{rows});
+      build_stage(rows, false);
+    };
+    auto begin = contiguous_end ? FirstGatherChunkRows(count) : 0U;
+    if (begin) build_contiguous({0, begin});
+    while (begin < contiguous_end) {
+      if (head_rows && begin == head_rows) gather_suffix_wave_ = gather_waves_.size();
+      const auto end = std::min(contiguous_end, (begin / kChunkRows + 1U) * kChunkRows);
+      build_contiguous({begin, end});
       begin = end;
+    }
+    if (prepared_interleaved_) gather_suffix_wave_ = gather_waves_.size();
+    for (const auto& wave : interleaved) {
+      gather_waves_.push_back(wave);
+      build_stage({}, false, &wave);
     }
   } else {
     const bool split = head_rows && !gather_;
@@ -664,10 +687,10 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     std::size_t next_plan = 0;
     const peer::CpuGatherExecutor::FixedSuffix suffix{
         reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset),
-        request().sequence, stop, std::chrono::milliseconds(kTimeoutMs)};
+        request().sequence, stop, std::chrono::milliseconds(kTimeoutMs), gather_suffix_wave_};
     Status post_status = Status::OK();
-    status = GatherRows(count, [&](std::uint32_t ready_rows) {
-      while (next_plan < prepared_.size() && prepared_[next_plan]->ready_rows <= ready_rows) {
+    status = GatherRows(count, [&](std::size_t ready_waves) {
+      while (next_plan < prepared_.size() && prepared_[next_plan]->ready_waves <= ready_waves) {
         post_status = submit_plan(next_plan);
         if (!post_status.ok()) return false;
         ++next_plan;
@@ -729,7 +752,8 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   if (status.ok()) status = PollPrepared(UINT64_MAX);
   if (status.ok() && profiled_gather_rows) {
     if (gather_profile_samples_.size() < kGatherProfileSamples) {
-      gather_profile_samples_.push_back({sequence, profiled_gather_rows, profiled_pipeline, profile_});
+      gather_profile_samples_.push_back(
+          {sequence, profiled_gather_rows, profiled_pipeline, prepared_interleaved_, profile_});
     } else {
       ++gather_profile_dropped_;
     }
@@ -761,7 +785,7 @@ void Transport::FlushGatherProfiles() {
     const auto& slow = p.slowest_thread;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
+        " pipeline=%u interleaved=%u active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
         " suffix_wait_ns=%" PRIu64
         " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
         " slow_bytes=%" PRIu64 " slow_ready_delay_ns=%" PRIu64
@@ -769,7 +793,8 @@ void Transport::FlushGatherProfiles() {
         " slow_barrier_ns=%" PRIu64 " slow_thread_cpu_ns=%" PRIu64
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
-        unsigned(sample.pipeline), p.cpu_threads, p.gather_prepare_ns, p.gather_copy_ns,
+        unsigned(sample.pipeline), unsigned(sample.interleaved), p.cpu_threads,
+        p.gather_prepare_ns, p.gather_copy_ns,
         p.suffix_wait_ns,
         p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
         p.slowest_ready_delay_ns, p.slowest_start_delay_ns, slow.copy_done_ns - slow.start_ns,
@@ -820,10 +845,13 @@ Status Transport::Shutdown() {
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
   tracker_ = Tracker(kJettyCount, kJettyDepth);
   prepared_.clear();
+  gather_waves_.clear();
+  gather_suffix_wave_ = 0U;
   done_ = {};
   profiled_done_ = {};
   prepared_count_ = UINT32_MAX;
   prepared_batch_done_only_ = false;
+  prepared_interleaved_ = false;
   prepared_head_rows_ = 0;
   post_batch_wrs_ = 128;
   next_poll_queue_ = 0;

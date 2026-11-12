@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "cpu_gather.h"
+#include "cpu_push_gather_schedule.h"
 
 #if defined(__linux__)
 #include <sched.h>
@@ -92,16 +93,17 @@ class CpuGatherExecutor {
     std::uint64_t sequence{};
     const std::atomic<bool>* stop{};
     std::chrono::milliseconds timeout{};
+    std::size_t first_wave{};
   };
   // Keep the address list and destination stable through Copy. Copy reports
   // invalid fixed source addresses after all participating workers finish.
-  // A small first chunk can split the first regular chunk. Suffix, if
-  // supplied, still guards descriptors from chunk_rows onward.
+  // Wave ranges partition [0, count). Suffix guards first_wave and all later
+  // waves. An empty plan gathers the entire batch before returning.
   std::size_t PrepareFixed(void* staging, const std::uint64_t* addresses,
                            std::uint32_t count, std::uint32_t span_bytes,
-                           std::uint64_t source_bytes, std::uint32_t chunk_rows = 0,
-                           const FixedSuffix* suffix = nullptr,
-                           std::uint32_t first_chunk_rows = 0U);
+                           std::uint64_t source_bytes,
+                           const std::vector<cpu_push::GatherWave>& waves = {},
+                           const FixedSuffix* suffix = nullptr);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -121,10 +123,10 @@ class CpuGatherExecutor {
 #endif
   }
 
-  // For chunked fixed input, the coordinator calls on_chunk with the number
-  // of ready rows. Returning false stops publication and joins the helpers.
-  using ChunkReady = std::function<bool(std::uint32_t)>;
-  void Copy(const ChunkReady& on_chunk = {});
+  // The coordinator calls on_wave with the number of completed waves in
+  // plan order. Returning false stops publication and joins the helpers.
+  using WaveReady = std::function<bool(std::size_t)>;
+  void Copy(const WaveReady& on_wave = {});
   void EnableProfiling(bool enabled) {
     if (enabled) thread_profiles_.resize(max_threads_);
     profiling_enabled_ = enabled;
@@ -147,7 +149,7 @@ class CpuGatherExecutor {
     staging_ = static_cast<std::uint8_t*>(staging);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
-    for (auto& chunk : fixed_progress_) chunk.remaining = threads;
+    for (auto& wave : fixed_progress_) wave.remaining = threads;
     if (profiling_enabled_) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
       copy_profile_ = {};
@@ -181,10 +183,7 @@ class CpuGatherExecutor {
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
   std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
-  std::uint64_t CopyFixedChunk(std::size_t worker, std::size_t chunk);
-  std::uint32_t FixedChunkBegin(std::size_t chunk) const {
-    return chunk ? fixed_progress_[chunk - 1U].end_row : 0U;
-  }
+  std::uint64_t CopyFixedWave(std::size_t worker, std::size_t wave);
   template <typename OnWait>
   bool WaitFixedSuffix(OnWait on_wait);
 
@@ -217,13 +216,13 @@ class CpuGatherExecutor {
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
   std::uint64_t fixed_last_source_offset_{0U};
-  std::uint32_t fixed_chunk_rows_{};
   FixedSuffix fixed_suffix_{};
-  struct alignas(64) FixedChunkProgress {
+  struct alignas(64) FixedWaveProgress {
     std::size_t remaining{};
-    std::uint32_t end_row{};
+    std::uint64_t aligned_bytes{};
+    cpu_push::GatherWave rows{};
   };
-  std::vector<FixedChunkProgress> fixed_progress_;
+  std::vector<FixedWaveProgress> fixed_progress_;
   enum class FixedError { kNone, kSource, kSuffix, kCancelled };
   std::atomic<FixedError> fixed_error_{FixedError::kNone};
   void SetFixedError(FixedError error) {

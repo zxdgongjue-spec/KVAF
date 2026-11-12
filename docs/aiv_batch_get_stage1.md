@@ -186,6 +186,12 @@ Scatter 的 CPU gather 复用了 `aiv_gather_yq` 的整批线程预算和分段�
 cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批仍重新读取源清单，
 只复用与请求形状有关的 WRITE 计划。
 
+在 K 端启动 CPU 服务时设 `KVAF_CPU_GATHER_INTERLEAVE=1`，可与默认的全局前缀顺序
+做 A/B。N 端保持 `KVAF_SCATTER_CPU_GATHER=1` 和 `--pipeline 1`。首段仍可提前提交，
+后续每波优先为不同 AIV 核和 Jetty 各准备一个分片，Ready 仍随同一 Jetty 的 payload 有序提交。
+分片跨越首段边界或内部边界未按 cache line 对齐时走原流水。
+CPU profile 中的 `interleaved=1` 表示该批实际采用交错顺序。
+
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务准备，`copy_ns` 记录任务发布、各线程的源地址校验、拷贝和汇合，
 `suffix_wait_ns` 记录协调线程等待后缀清单的时间。`pipeline=1` 的 `copy_ns`

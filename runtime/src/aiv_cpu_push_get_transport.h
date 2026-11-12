@@ -50,7 +50,7 @@ class Transport {
   struct GatherProfileSample {
     std::uint64_t sequence;
     std::uint32_t rows;
-    bool pipeline;
+    bool pipeline, interleaved;
     Profile profile;
   };
   std::vector<GatherProfileSample> gather_profile_samples_;
@@ -81,12 +81,12 @@ class Transport {
     std::array<Tracker::Fence, kJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
-    std::uint32_t ready_rows{};
+    std::size_t ready_waves{};
     bool suffix{}, gather_before_post{};
   };
   Status EnsureGatherStaging(std::uint32_t count);
   std::uint32_t FirstGatherChunkRows(std::uint32_t count) const;
-  Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::ChunkReady& on_chunk = {},
+  Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave = {},
                     const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr);
   void FlushGatherProfiles();
   Status PrepareWrites(std::uint32_t count);
@@ -104,11 +104,14 @@ class Transport {
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
+  std::vector<GatherWave> gather_waves_;
+  std::size_t gather_suffix_wave_{};
   PreparedWrite done_;
   PreparedWrite profiled_done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
+  bool gather_interleave_{}, prepared_interleaved_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};

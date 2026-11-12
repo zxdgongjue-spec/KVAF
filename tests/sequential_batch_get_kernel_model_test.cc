@@ -1,6 +1,7 @@
 // Executes the production .asc against decoded SQ/CQ and a real CPU gather executor.
 // DMA cache visibility and CANN code generation still require hardware tests.
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
 #include "cpu_push_get_layout.h"
+#include "cpu_push_gather_schedule.h"
 #include "sequential_batch_get_abi.h"
 // The CPU model exercises the kernel body, without Ascend ELF section placement.
 #define __attribute__(...)
@@ -501,6 +503,37 @@ void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
   {
+    using namespace kvaf::cpu_push;
+    const auto waves = InterleavedGatherWaves(8192, 656, 4, 1024);
+    assert(!waves.empty());
+    // Each Jetty starts with a shard from a different AIV core.
+    const std::array<uint32_t, 4> first{1024, 2304, 4608, 6912};
+    for (std::size_t q = 0; q < first.size(); ++q) {
+      assert(waves.front()[q].begin == first[q]);
+      assert(waves.front()[q].end == first[q] + 256);
+    }
+    std::vector<bool> covered(8192, false);
+    std::fill_n(covered.begin(), 1024, true);
+    std::array<std::array<uint32_t, kJettyCount>, 4> next_chunk{};
+    next_chunk[0].fill(1);  // Lane 0's first chunk was sent in the head.
+    for (const auto& wave : waves) {
+      for (std::size_t q = 0; q < wave.size(); ++q) {
+        const auto rows = wave[q];
+        if (rows.begin == rows.end) continue;
+        const auto lane = rows.begin / 2048U;
+        const auto chunk = ChunkRange(WorkerRange(8192, 656, lane, 4), next_chunk[lane][q]++);
+        const auto shard = JettyRange(chunk, q);
+        assert(rows.begin == shard.begin && rows.end == shard.end);
+        for (auto row = rows.begin; row < rows.end; ++row) {
+          assert(!covered[row]);
+          covered[row] = true;
+        }
+      }
+    }
+    assert(std::all_of(covered.begin(), covered.end(), [](bool seen) { return seen; }));
+    assert(InterleavedGatherWaves(8200, 656, 4, 1024).empty());
+  }
+  {
     // Scatter gathers packed rows into a separate MR. In a short batch,
     // cache-line rounding must leave the bytes past its tail untouched.
     alignas(64) uint8_t staging[256];
@@ -544,26 +577,32 @@ int main() {
 
     // A prefix callback may submit DMA while helpers are copying the tail.
     std::memset(staging, 0xad, sizeof(staging));
-    std::vector<uint32_t> ready;
+    using kvaf::cpu_push::GatherWave;
+    using kvaf::cpu_push::Range;
+    const std::vector<GatherWave> waves{
+        GatherWave{Range{0, 4}}, GatherWave{Range{4, 8}},
+        GatherWave{Range{12, 13}, Range{8, 12}}};
+    std::vector<std::size_t> ready;
     alignas(8) uint64_t suffix_sequence = 0;
     const kvaf::peer::CpuGatherExecutor::FixedSuffix suffix{
-        &suffix_sequence, 1, nullptr, std::chrono::seconds(1)};
+        &suffix_sequence, 1, nullptr, std::chrono::seconds(1), 2};
     std::fill(repeated + 8, repeated + 13, Address(source + 1));
     executor.EnableProfiling(true);
-    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8,
-                                 &suffix, 4) == 4);
-    executor.Copy([&](uint32_t rows) {
-      ready.push_back(rows);
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), waves,
+                                 &suffix) == 4);
+    executor.Copy([&](std::size_t completed) {
+      ready.push_back(completed);
+      const auto rows = completed == 3U ? 13U : completed * 4U;
       for (uint32_t i = 0; i < rows; ++i)
         assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
-      if (rows == 8) {
+      if (completed == 2U) {
         // No worker may consume these descriptors until their sequence is visible.
         std::fill(repeated + 8, repeated + 13, Address(source));
         __atomic_store_n(&suffix_sequence, suffix.sequence, __ATOMIC_RELEASE);
       }
       return true;
     });
-    assert((ready == std::vector<uint32_t>{4, 8, 13}));
+    assert((ready == std::vector<std::size_t>{1, 2, 3}));
     const auto& copy = executor.CopyProfile();
     assert(copy.begin_ns <= copy.coordinator_done_ns && copy.coordinator_done_ns <= copy.done_ns);
     uint64_t copied_bytes = 0;
@@ -579,9 +618,10 @@ int main() {
                        [](uint8_t byte) { return byte == 0xad; }));
 
     repeated[12] = Address(source + 1);
-    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), 8) == 4);
+    const std::vector<GatherWave> contiguous{GatherWave{Range{0, 8}}, GatherWave{Range{8, 13}}};
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), contiguous) == 4);
     try {
-      executor.Copy([](uint32_t rows) { assert(rows == 8); return true; });
+      executor.Copy([](std::size_t completed) { assert(completed == 1U); return true; });
       assert(false && "invalid fixed chunk was accepted");
     } catch (const std::invalid_argument&) {
     }
