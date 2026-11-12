@@ -23,6 +23,7 @@ CSV_OUTPUT_DIR = "gather-perf-results"  # Relative to the working directory.
 RUN_LABEL = "gather_prepared_prefix"  # KVAF_AIV_GATHER_CHUNK_BYTES=0 selects the AIV-only baseline.
 # ---------------------------------------------------------------------------
 
+import argparse
 import csv
 import math
 import os
@@ -35,7 +36,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from aiv_batch_get_common import kernel_paths, shutdown_runtime
+from aiv_batch_get_common import capture_gather_graph, close_gather_graph, kernel_paths, shutdown_runtime
 
 
 STAGE_BOUNDARIES = (
@@ -481,7 +482,9 @@ def token_pattern(torch, token_ids, token_bytes: int):
     return ((x * 37 + y * 13 + (y >> 3) + (x >> 8) * (y % 7)) % 251).to(torch.uint8)
 
 
-def main() -> int:
+def run(execution: str, results: dict) -> int:
+    graph_mode = execution == "graph"
+    os.environ["KVAF_AIV_GATHER_GRAPH"] = str(int(graph_mode))
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
@@ -512,7 +515,12 @@ def main() -> int:
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware benchmark was requested but NPU Runtime is unavailable")
     coalesce = os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1"
-    if (PROFILE_SAMPLES or coalesce) and not all(hasattr(kvaf.NpuRuntime, method) for method in (
+    if graph_mode and (not hasattr(kvaf, "AclGraph") or
+                       not hasattr(kvaf.NpuRuntime, "check_gather_graph_replay")):
+        raise RuntimeError("rebuild KVAF Host/Python for Gather graph replay")
+    profile_samples = 0 if graph_mode else PROFILE_SAMPLES
+    if not graph_mode and (profile_samples or coalesce or configured_first_chunk_divisor()) and not all(
+            hasattr(kvaf.NpuRuntime, method) for method in (
         "start_gather_batch_get_profile", "gather_batch_get_profile", "stop_gather_batch_get_profile",
     )):
         raise RuntimeError("rebuild KVAF Host/Python and gather kernel for gather profiling")
@@ -532,20 +540,28 @@ def main() -> int:
         trusted_gather_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1",
     )
     metadata = csv_metadata(cores, device_id, kernel, put_kernel)
+    metadata.update(execution=execution, profile_samples=profile_samples,
+                    run_directory=f"{metadata['run_directory']}-{execution}",
+                    timing_contract=("graph_replay_to_stream_completion" if graph_mode
+                                     else "async_call_to_stream_completion"))
     layout = metadata["output_layout"]
     samples_us, snapshots, profile_calls_us = [], [], []
+    stream = torch.npu.Stream(device=device_id)
+    graph = None
     try:
         runtime.link_to(endpoint)
         print(
-            f"GATHER_PERF_CONFIG mode=gather_read cores={cores} token_bytes={TOKEN_BYTES} "
+            f"GATHER_PERF_CONFIG mode=gather_read execution={execution} cores={cores} token_bytes={TOKEN_BYTES} "
             f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"populate_chunk_entries={POPULATE_CHUNK_ENTRIES} "
             f"coalesce_sges={metadata['coalesce_sges']} "
             f"configured_chunk_bytes={metadata['configured_chunk_bytes']} "
+            f"configured_prepare_ahead={metadata['configured_prepare_ahead']} "
+            f"configured_cooperative_chunks={metadata['configured_cooperative_chunks']} "
             f"configured_first_chunk_divisor={metadata['configured_first_chunk_divisor']} "
-            f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={PROFILE_SAMPLES} "
-            "plan=fixed_random timing=async_call_to_stream_completion",
+            f"warmup={WARMUP} iterations={ITERATIONS} profile_samples={profile_samples} "
+            f"plan=fixed_random timing={metadata['timing_contract']}",
             flush=True,
         )
         print("GATHER_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -598,18 +614,23 @@ def main() -> int:
         output = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8, device=device)
         torch.npu.synchronize()
 
-        def batch_get(*, checked: bool = False) -> None:
-            runtime.batch_get(view, indices, offsets, miss_count, rows, output, synchronize=checked)
-            if not checked:
-                # Same timing contract as the direct benchmark: asynchronous
-                # submission followed by caller-owned completion, without D2H.
-                torch.npu.synchronize()
+        def submit(*, checked: bool = False) -> None:
+            runtime.batch_get(view, indices, offsets, miss_count, rows, output,
+                              stream=stream, synchronize=checked)
+
+        def submit_and_wait() -> None:
+            if graph_mode:
+                graph.replay(stream)
+            else:
+                submit()
+            stream.synchronize()
 
         # Check all payload bytes and the two untouched guard rows outside timing.
-        if coalesce or configured_first_chunk_divisor():
+        profile_preflight = not graph_mode and (coalesce or configured_first_chunk_divisor())
+        if profile_preflight:
             runtime.start_gather_batch_get_profile()
-        batch_get(checked=True)
-        if coalesce or configured_first_chunk_divisor():
+        submit(checked=True)
+        if profile_preflight:
             preflight_profile = runtime.gather_batch_get_profile()
             runtime.stop_gather_batch_get_profile()
             if coalesce:
@@ -622,18 +643,37 @@ def main() -> int:
             expected[rows_cpu[start:end].long()] = token_pattern(torch, source_ids[start:end], TOKEN_BYTES)
         if not torch.equal(output.cpu(), expected):
             raise AssertionError("gather correctness preflight payload/guard mismatch")
-        print("GATHER_PERF_CORRECTNESS_PASS", flush=True)
+        if graph_mode:
+            graph = kvaf.AclGraph()
+            capture_gather_graph(graph, stream, submit)
+            for replay in range(2):
+                with torch.npu.stream(stream):
+                    output.fill_(0xAD)
+                stream.synchronize()
+                print(f"GATHER_PERF_GRAPH_PREFLIGHT_BEGIN replay={replay}", flush=True)
+                submit_and_wait()
+                runtime.check_gather_graph_replay()
+                if not torch.equal(output.cpu(), expected):
+                    raise AssertionError(f"gather graph replay {replay} payload/guard mismatch")
+        print(f"GATHER_PERF_CORRECTNESS_PASS execution={execution}", flush=True)
 
         for _ in range(WARMUP):
-            batch_get()
+            submit_and_wait()
+            if graph_mode:
+                runtime.check_gather_graph_replay()
         for _ in range(ITERATIONS):
             begin = time.perf_counter_ns()
-            batch_get()
-            samples_us.append((time.perf_counter_ns() - begin) / 1000)
+            submit_and_wait()
+            elapsed = (time.perf_counter_ns() - begin) / 1000
+            if graph_mode:
+                runtime.check_gather_graph_replay()
+            samples_us.append(elapsed)
         if samples_us:
             result = latency_summary(samples_us, payload_bytes)
+            results[execution] = result
             print(
-                f"GATHER_PERF_RESULT profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
+                f"GATHER_PERF_RESULT execution={execution} timing={metadata['timing_contract']} "
+                f"profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
                 f"mean_us={result['mean_us']:.3f} p50_us={result['p50_us']:.3f} "
                 f"p95_us={result['p95_us']:.3f} p99_us={result['p99_us']:.3f} "
                 f"useful_GiBps={result['useful_GiBps']:.3f} bandwidth_basis=p50_us",
@@ -641,13 +681,13 @@ def main() -> int:
             )
         else:
             print("GATHER_PERF_SKIPPED profile=off reason=iterations_zero", flush=True)
-        if PROFILE_SAMPLES:
-            print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={PROFILE_SAMPLES}", flush=True)
+        if profile_samples:
+            print(f"GATHER_PROFILE_PHASE_BEGIN warmup=1 samples={profile_samples}", flush=True)
             runtime.start_gather_batch_get_profile()
-            batch_get(checked=True)  # Warm the profiling path; exclude this sample.
-            for _ in range(PROFILE_SAMPLES):
+            submit(checked=True)  # Warm the profiling path; exclude this sample.
+            for _ in range(profile_samples):
                 begin = time.perf_counter_ns()
-                batch_get(checked=True)
+                submit(checked=True)
                 elapsed = (time.perf_counter_ns() - begin) / 1000
                 snapshots.append(dict(runtime.gather_batch_get_profile()))
                 profile_calls_us.append(elapsed)
@@ -670,7 +710,34 @@ def main() -> int:
             print(f"GATHER_CSV_ERROR preserving original exception: {export_error}", file=sys.stderr)
         finally:
             # Keep all request/output tensors alive through transport shutdown.
-            shutdown_runtime(runtime)
+            try:
+                if graph is not None:
+                    close_gather_graph(graph, stream)
+            finally:
+                shutdown_runtime(runtime)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execution", choices=("eager", "graph", "compare"), default="eager",
+                        help="compare runs eager and graph with the same Gather configuration")
+    execution = parser.parse_args(argv).execution
+    if execution != "eager" and not ITERATIONS:
+        parser.error("graph performance requires ITERATIONS > 0")
+    results = {}
+    if execution != "compare":
+        return run(execution, results)
+    for mode in ("eager", "graph"):
+        status = run(mode, results)
+        if status:
+            return status
+    eager, graph = results["eager"], results["graph"]
+    print(f"GATHER_PERF_COMPARE eager_p50_us={eager['p50_us']:.3f} graph_p50_us={graph['p50_us']:.3f} "
+          f"eager_p95_us={eager['p95_us']:.3f} graph_p95_us={graph['p95_us']:.3f} "
+          f"eager_p99_us={eager['p99_us']:.3f} graph_p99_us={graph['p99_us']:.3f} "
+          f"eager_useful_GiBps={eager['useful_GiBps']:.3f} graph_useful_GiBps={graph['useful_GiBps']:.3f} "
+          f"p50_speedup={eager['p50_us'] / graph['p50_us']:.3f}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

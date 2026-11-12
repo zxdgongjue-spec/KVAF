@@ -42,3 +42,28 @@ def shutdown_runtime(runtime) -> None:
                 raise
             print(f"[KVAF_TEST] shutdown also failed; preserving original exception: {error}",
                   file=sys.stderr, flush=True)
+
+
+def capture_gather_graph(graph, stream, submit) -> None:
+    graph.capture_begin(stream)
+    try:
+        submit()
+    except Exception:
+        try:
+            graph.capture_end()
+        except Exception as error:
+            print(f"GATHER_GRAPH_CAPTURE_END_ERROR {error}", file=sys.stderr, flush=True)
+        raise
+    graph.capture_end()
+
+
+def close_gather_graph(graph, stream) -> None:
+    original = sys.exc_info()[1]
+    try:
+        stream.synchronize()
+        graph.reset()
+    except Exception as error:
+        if original is None:
+            raise
+        print(f"GATHER_GRAPH_CLEANUP_ERROR preserving original exception: {error}",
+              file=sys.stderr, flush=True)

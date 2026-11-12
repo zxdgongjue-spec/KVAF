@@ -394,6 +394,13 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   s.graph_mode = graph && std::strcmp(graph, "1") == 0;
   if (s.graph_mode && (s.args.probe || s.check_async_status))
     return Status::InvalidArgument("gather graph requires probe and async status checking to be disabled");
+  s.args.max_polls = 100000000U;
+  const char* max_polls = std::getenv("KVAF_AIV_GATHER_MAX_POLLS");
+  if (max_polls && *max_polls) {
+    const auto parsed = std::from_chars(max_polls, max_polls + std::strlen(max_polls), s.args.max_polls);
+    if (parsed.ec != std::errc{} || *parsed.ptr != '\0' || !s.args.max_polls)
+      return Status::InvalidArgument("KVAF_AIV_GATHER_MAX_POLLS must be a positive uint32");
+  }
   const bool fast_read = uint64_t(s.config.batch_get_token_bytes) * s.config.aiv_gather_sgl_size <= 65536;
   s.args.pipeline_chunk_bytes = kGatherChunkBytes;
   const char* chunk = std::getenv("KVAF_AIV_GATHER_CHUNK_BYTES");
@@ -457,16 +464,16 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (s.graph_mode &&
       aclrtMemset(s.status_device, s.StatusBytes(), 0, s.StatusBytes()) != ACL_SUCCESS)
     return Error("initialize gather graph status");
-  s.args.max_polls = 100000000U;
   s.args.source_base = region.base; s.args.source_bytes = region.length;
   result = s.InitializeGather(peer);
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u first_chunk_divisor=%u\n",
+  std::fprintf(stderr, "[KVAF_AIV] GATHER_OPTIONS pipeline=%s scheduler=%s chunk_bytes=%u prepare_ahead=%u cooperative_chunks=%u first_chunk_divisor=%u max_polls=%u\n",
       s.args.first_chunk_divisor ? "bootstrap_prefix" : s.args.cooperative_chunks ? "cooperative_prefix" : s.args.pipeline_chunk_bytes ? "prefix" : "whole_batch",
       s.args.prepare_ahead ? "prepared" : "baseline",
-      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks, s.args.first_chunk_divisor);
+      s.args.pipeline_chunk_bytes, s.args.prepare_ahead, s.args.cooperative_chunks,
+      s.args.first_chunk_divisor, s.args.max_polls);
   return Status::OK();
 }
 Status GatherBatchGet::Drain() {

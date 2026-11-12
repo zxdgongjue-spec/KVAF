@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 import re
+from array import array
 from pathlib import Path
 import sys
 
-from aiv_batch_get_common import kernel_paths, shutdown_runtime
+from aiv_batch_get_common import capture_gather_graph, close_gather_graph, kernel_paths, shutdown_runtime
 
 
 def expect_gather_probe(call, stage: str, *, requests: int, data_wrs: int) -> None:
@@ -55,25 +56,31 @@ def run_gather_graph(kvaf, torch, runtime, stream, view, source_cpu, output, cap
     submit(synchronize=True)
     graph = kvaf.AclGraph()
     try:
-        graph.capture_begin(stream)
-        try:
-            submit()
-        finally:
-            graph.capture_end()
+        capture_gather_graph(graph, stream, submit)
         positions = torch.arange(capacity, dtype=torch.int32)
         for epoch, active in enumerate([capacity, capacity, *counts]):
             index_cpu = (positions * 7 + epoch) % blocks
             token_cpu = (positions + epoch) % tokens_per_block
             row_cpu = positions * 2 + epoch % 2
             offset_cpu = token_cpu * token
-            count_cpu = torch.tensor([active], dtype=torch.int32)
             with torch.npu.stream(stream):
-                indices.copy_(index_cpu)
-                offsets.copy_(offset_cpu)
-                rows.copy_(row_cpu)
-                count.copy_(count_cpu)
                 output.fill_(0xAD)
+            # Finish the Torch fill before using raw ACL for input copies and
+            # replay, following the existing direct-read graph test contract.
+            stream.synchronize()
+            updates = (
+                (indices, array("i", index_cpu.tolist())),
+                (offsets, array("i", offset_cpu.tolist())),
+                (rows, array("i", row_cpu.tolist())),
+                (count, array("i", [active])),
+            )
+            for tensor, host in updates:
+                graph.copy_host_to_device_async(
+                    tensor.data_ptr(), tensor.numel() * tensor.element_size(), host, stream)
+            print(f"GATHER_GRAPH_REPLAY_BEGIN replay={epoch} active={active}", flush=True)
             graph.replay(stream)
+            graph.synchronize(stream)
+            print(f"GATHER_GRAPH_STREAM_DONE replay={epoch} active={active}", flush=True)
             runtime.check_gather_graph_replay()
             actual = output.cpu()
             expected = torch.full_like(actual, 0xAD)
@@ -82,8 +89,7 @@ def run_gather_graph(kvaf, torch, runtime, stream, view, source_cpu, output, cap
             assert torch.equal(actual, expected), ("gather graph", epoch, active)
             print(f"GATHER_GRAPH_REPLAY_PASS replay={epoch} active={active}", flush=True)
     finally:
-        stream.synchronize()
-        graph.reset()
+        close_gather_graph(graph, stream)
 
 
 def run(mode: str) -> int:
@@ -118,6 +124,8 @@ def run(mode: str) -> int:
     import kvaf
 
     gather_graph = mode == "gather_read" and os.environ.get("KVAF_AIV_GATHER_GRAPH") == "1"
+    gather_check_status = (mode == "gather_read" and
+                           os.environ.get("KVAF_AIV_GATHER_CHECK_STATUS") == "1")
     if gather_probe or gather_graph:
         report_gather_kernel(kernel, kvaf)
     backend = detect_torch_backend()
@@ -195,7 +203,7 @@ def run(mode: str) -> int:
             count = torch.tensor([active], dtype=torch.int32, device=device)
             output = outputs[epoch % 2]
             output.fill_(0xAD)
-            kwargs = dict(synchronize=bool(gather_probe) or bool(epoch % 2))
+            kwargs = dict(synchronize=bool(gather_probe) or gather_check_status or bool(epoch % 2))
             if gather_probe:
                 wrs = sum(min(128, ((active * (c + 1) // cores - active * c // cores) + sgl - 1) // sgl)
                           for c in range(cores)) if gather_probe == "first_read" else 0

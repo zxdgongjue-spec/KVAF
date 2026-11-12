@@ -226,3 +226,26 @@ KVAF_RUN_NPU_TESTS=1 python3 tests/python/test_aiv_gather_batch_get.py --graph
 小批和满批。逐轮比对整块输出，包括未写行的哨兵。可分别用
 `KVAF_AIV_GATHER_CHUNK_BYTES=0` 和默认 chunk 跑 ACK 与 prefix 两条路径，再以
 `KVAF_AIV_GATHER_PREPARE_AHEAD=1` 验证预构建。用同一脚本加 `--eager` 覆盖 eager 回归。
+
+### 图模式与 eager 性能对比
+
+```bash
+KVAF_RUN_NPU_TESTS=1 KVAF_NPU_CORE_COUNT=2 \
+python3 tests/python/test_aiv_gather_batch_get_perf.py --execution compare
+```
+
+`compare` 依次创建 eager 和 graph Runtime，使用相同的请求、随机种子、SGL、输出布局及
+流水参数。脚本默认 8192 请求，沿用性能脚本顶部配置。结果包含 P50、P95、P99 和按
+P50 计算的有效 GiB/s，两个运行目录的 CSV 通过 `execution` 区分。单测一边时用
+`--execution eager` 或 `--execution graph`。
+
+两边都计时到同一 caller stream 完成，capture、预热、输入准备和 graph 状态读回在计时
+窗口外。graph 每轮仍检查序号和状态，阶段 profiling 由 eager 执行。graph 计时前连续
+两次核对 payload 和 guard。默认 chunk 走原前缀流水，可设置
+`KVAF_AIV_GATHER_CHUNK_BYTES=0` 对两边运行整批 ACK 对照。
+
+排查超时可单次设置 `KVAF_AIV_GATHER_MAX_POLLS=10000`，让软件轮询更早返回。
+eager 正确性测试可同时设置 `KVAF_AIV_GATHER_CHECK_STATUS=1`，逐批同步读回状态。
+baseline prefix 的失败状态中，phase 7 对应前缀进度读取，phase 8 对应数据 CQ，
+phase 4 对应最终 ACK。图用例打印 `GATHER_GRAPH_REPLAY_BEGIN` 和
+`GATHER_GRAPH_STREAM_DONE`，可区分回放执行失败与图外状态读回失败。

@@ -871,6 +871,25 @@ int main() {
       f.Run();
     }
   }
+  for (bool graph : {false, true}) {
+    for (uint32_t chunk : {0U, 131072U}) {
+      Fixture f(8192, 656, 2, KVAF_SEQ_GATHER, 6);
+      f.args.graph_replay = graph;
+      f.args.pipeline_chunk_bytes = chunk;
+      f.args.head_start = 1;
+      f.DataQueueDepth(32768);
+      f.active = 1;
+      f.Run();
+      for (uint32_t replay = 0; replay < 2; ++replay) {
+        f.Next(8192);
+        for (uint32_t i = 0; i < 8192; ++i) {
+          f.indices[i] = (i * 7 + replay) % 16;
+          f.rows[i] = i * 2 + replay;
+        }
+        f.Run();
+      }
+    }
+  }
   {
     Fixture f(8, 656, 1, KVAF_SEQ_GATHER, 6);
     f.args.graph_replay = true;
