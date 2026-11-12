@@ -431,10 +431,10 @@ legacy 不向绑定传入新接口参数，可继续用于旧接口回归；per-
 |---|---|
 | `tests/run_aicpu_gather_read_sweep.sh` | Gather 设备分阶段计时及同步 Host 调用耗时 |
 | `tests/run_aicpu_cpu_push_scatter_sweep.sh` | Scatter 设备分阶段计时及同步 Host 调用耗时 |
-| `tests/run_remote_cpu_batch_get_perf.sh` | URMA AIV / UBMEM Get 的提交、完成等待和调用到完成耗时 |
+| `tests/run_remote_cpu_batch_get_perf.sh` | URMA AIV / UBMEM Get 的异步提交、完成等待；`--get-timing sync-call` 测同步调用 |
 | `tests/run_remote_cpu_runtime_perf.sh` | 固定配置的 Put/Get 及 Runtime 操作耗时 |
 | `tests/python/test_npu_batch_put.py` | 同步 Put 调用耗时；在原构建和运行环境下追加模式参数 |
-| `tests/run_remote_cpu_batch_get_miss_count_perf.sh` | 两种模式可使用相同 Host 口径扫描；默认 legacy 保留原设备周期扫描 |
+| `tests/run_remote_cpu_batch_get_miss_count_perf.sh` | 两种模式的 Host 扫描均测同步 `batch_get`；默认 legacy 保留原设备周期扫描 |
 | `tests/run_remote_cpu_batch_get_multicard_perf.sh` | 显式 graph 租约下的多卡重放吞吐；per-call 要求 `--graph-calls 1` |
 
 ### 7.1 AICPU Gather / Scatter
@@ -478,15 +478,20 @@ for perf_mode in legacy per-call; do
     --request-length 32768 --miss-count 4096 --table-capacity 4096 \
     --token-bytes 656 --tokens-per-block 128 \
     --aiv-cores 5 --jettys-per-core 2 --no-kernel-profile \
+    --get-timing sync-call \
     --warmup 10 --iterations 100
 done
 ```
 
 测试 UBMEM 时将 `--transport urma` 替换为 `--transport ubmem`。结果行带
-`execution_mode`；`operation=batch_get` 的 `p50_ms` 是调用到完成的 Host 耗时。
-per-call 在外部 stream synchronize 后调用 `drain_get()`，其完成检查计入当前样本，
-避免把这部分成本留到下一轮。输出注册是否每轮释放由第 8 节的绑定模式决定。`batch_get_synchronize` 包含
-这段完成处理，不能将其解释成纯设备等待。
+`execution_mode`；`--get-timing sync-call` 下，`operation=batch_get` 的 `p50_ms` 是一次
+同步 API 调用的 Host 耗时，与 Gather/Scatter 的 `host_p50_us` 使用相同计时边界。
+Gather/Scatter 的同步调用还会收集设备分段 profile；AIV/UBMEM Host 扫描禁用
+kernel profile。因此应比较同一算法的 legacy 与 per-call，不能把不同算法的
+Host 绝对值直接当作仅由算法本身造成的差异。
+输出注册是否每轮释放由第 8 节的绑定模式决定。默认 `--get-timing async-drain`
+保留原提交和完成等待分段；per-call 的 `drain_get()` 包含完成检查，因此该模式的
+`batch_get_synchronize` 不能解释为纯设备等待，也不用于四种算法的 Host 对比。
 
 使用原 miss-count 扫描入口进行同口径对照：
 
@@ -503,8 +508,9 @@ for perf_mode in legacy per-call; do
 done
 ```
 
-Host 扫描 CSV 标记 `timing=host_call_to_completion`，输出 `host_*_us`、
-`submit_*_us`、`completion_*_us` 和 `host_p50_GBps`。UBMEM 不扫描无效的 Jetty 数。
+Host 扫描 CSV 标记 `timing=synchronous_batch_get`，输出 `host_*_us` 和
+`host_p50_GBps`。`submit_*_us` 和 `completion_*_us` 仅由异步分段模式输出，
+不作为同步调用的阶段数据。UBMEM 不扫描无效的 Jetty 数。
 任一子进程失败或结果未标记为所选模式时，扫描失败，不生成 PASS。
 
 当前 per-call AIV/UBMEM 不支持 `start_batch_get_kernel_profile`。脚本遇到

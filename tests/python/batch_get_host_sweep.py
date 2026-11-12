@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep AIV/UBMEM Host completion latency with identical API-mode workloads."""
+"""Sweep AIV/UBMEM synchronous BatchGet latency with identical API-mode workloads."""
 
 import argparse
 import csv
@@ -22,6 +22,10 @@ def values(name, default):
 
 
 def parse_measurements(log, execution_mode):
+    if not any(line.startswith("BATCH_GET_PERF_CONFIG ") and
+               "timing=synchronous_batch_get" in line.split()
+               for line in log.splitlines()):
+        raise ValueError("missing synchronous BatchGet timing configuration")
     records = {}
     for line in log.splitlines():
         if line.startswith("PERF_RESULT "):
@@ -34,8 +38,7 @@ def parse_measurements(log, execution_mode):
             result["output_binding"] = binding["output_binding"]
             phase = {"begin": "setup", "end": "teardown"}[binding["operation"]]
             result[f"binding_{phase}_us"] = float(binding["elapsed_us"])
-    for operation, prefix in (("batch_get", "host"), ("batch_get_submit", "submit"),
-                              ("batch_get_synchronize", "completion")):
+    for operation, prefix in (("batch_get", "host"),):
         record = records.get(operation, {})
         if record.get("execution_mode") != execution_mode:
             raise ValueError(f"missing {execution_mode} {operation} measurement")
@@ -56,7 +59,7 @@ def main(argv=None):
     add_execution_mode(parser)
     args, options = parser.parse_known_args(argv)
     if any(option.split("=", 1)[0] in ("--kernel-profile", "--ubmem-profile-detail",
-                                       "--adaptive-ub-device", "--adaptive-calibration-only")
+                                       "--adaptive-ub-device", "--adaptive-calibration-only", "--get-timing")
            for option in options):
         parser.error("Host sweep requires fixed routing without kernel profiling or adaptive calibration")
     root = Path(__file__).resolve().parents[2]
@@ -77,6 +80,7 @@ def main(argv=None):
             log_path = directory / f"token_{token}_miss_{miss}_cores_{core}_jettys_{jetty}.log"
             command = [str(runner), args.build_dir, *options, "--transport", args.transport,
                        "--execution-mode", args.execution_mode, "--no-kernel-profile",
+                       "--get-timing", "sync-call",
                        "--token-bytes", str(token), "--miss-count", str(miss),
                        "--aiv-cores", str(core), "--jettys-per-core", str(jetty)]
             print(f"BATCH_GET_HOST_BEGIN execution_mode={args.execution_mode} token_bytes={token} miss_count={miss} cores={core} log={log_path}", flush=True)
@@ -87,7 +91,7 @@ def main(argv=None):
                 raise RuntimeError(f"benchmark exited {process.returncode}; {log_path}\n" + "\n".join(text.splitlines()[-30:]))
             measured = parse_measurements(text, args.execution_mode)
             row = dict(execution_mode=args.execution_mode, transport=args.transport,
-                       timing="host_call_to_completion", token_bytes=token, miss_count=miss,
+                       timing="synchronous_batch_get", token_bytes=token, miss_count=miss,
                        aiv_cores=core, jettys_per_core=jetty if args.transport == "urma" else "n/a",
                        **measured, host_p50_GBps=token * miss / measured["host_p50_us"] / 1000)
             if writer is None:

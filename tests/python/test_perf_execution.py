@@ -120,7 +120,16 @@ class ExecutionTests(unittest.TestCase):
 
     def test_per_call_report_refuses_legacy_or_missing_measurements(self):
         with self.assertRaisesRegex(ValueError, "missing per-call"):
-            parse_measurements("PERF_RESULT operation=batch_get execution_mode=legacy p50_ms=1", "per-call")
+            parse_measurements("BATCH_GET_PERF_CONFIG timing=synchronous_batch_get\n"
+                               "PERF_RESULT operation=batch_get execution_mode=legacy p50_ms=1", "per-call")
+        with self.assertRaisesRegex(ValueError, "missing synchronous BatchGet"):
+            parse_measurements("PERF_RESULT operation=batch_get execution_mode=per-call p50_ms=1", "per-call")
+
+    def test_synchronous_get_timing_requires_host_mode(self):
+        args = direct.parse_args(["--get-timing", "sync-call", "--no-kernel-profile"])
+        self.assertIsNone(direct.validate_args(args))
+        args = direct.parse_args(["--get-timing", "sync-call", "--kernel-profile"])
+        self.assertIn("--no-kernel-profile", direct.validate_args(args))
 
     def test_per_call_sweep_forwards_options_and_labels_host_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -135,9 +144,10 @@ assert option("--token-bytes") == "656"
 assert option("--miss-count") == "32"
 assert option("--table-capacity") == "64"
 assert "--no-kernel-profile" in sys.argv and "--kernel-profile" not in sys.argv
+assert option("--get-timing") == "sync-call"
 if os.environ.get("FAKE_FAIL"): sys.exit(3)
-for op in ("batch_get", "batch_get_submit", "batch_get_synchronize"):
-    print(f"PERF_RESULT operation={op} execution_mode={mode} mean_ms=0.1 p50_ms=0.1 p90_ms=0.2 p99_ms=0.3")
+print("BATCH_GET_PERF_CONFIG timing=synchronous_batch_get")
+print(f"PERF_RESULT operation=batch_get execution_mode={mode} mean_ms=0.1 p50_ms=0.1 p90_ms=0.2 p99_ms=0.3")
 ''')
             runner.chmod(0o755)
             for mode, transport, fail, count in (("per-call", "urma", False, 2), ("per-call", "ubmem", False, 1),
@@ -165,10 +175,11 @@ for op in ("batch_get", "batch_get_submit", "batch_get_synchronize"):
                 self.assertEqual(len(rows), count)
                 for row in rows:
                     self.assertEqual(row["execution_mode"], mode)
-                    self.assertEqual(row["timing"], "host_call_to_completion")
+                    self.assertEqual(row["timing"], "synchronous_batch_get")
                     self.assertEqual(float(row["host_p50_us"]), 100)
                     self.assertAlmostEqual(float(row["host_p50_GBps"]), 656 * 32 / 100 / 1000)
                     self.assertNotIn("device_p50_us", row)
+                    self.assertNotIn("submit_p50_us", row)
 
 
 if __name__ == "__main__":

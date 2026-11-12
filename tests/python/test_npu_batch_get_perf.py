@@ -271,6 +271,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    parser.add_argument(
+        "--get-timing", choices=("async-drain", "sync-call"), default="async-drain",
+        help="asynchronous submit plus external completion (default), or time one synchronous batch_get call",
+    )
     add_execution_mode(parser)
     parser.set_defaults(
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
@@ -297,6 +301,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
+    if args.get_timing == "sync-call" and (args.kernel_profile or args.contention_control_dir is not None):
+        return "sync-call timing requires --no-kernel-profile and no contention graph"
     if args.execution_mode == "per-call":
         if args.adaptive_ub_device:
             return "per-call mode does not support adaptive-ub-device; select peer-ub-device explicitly"
@@ -818,7 +824,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
-            "timing=call_to_stream_completion"
+            f"timing={'synchronous_batch_get' if args.get_timing == 'sync-call' else 'async_submit_to_drain'}"
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -1041,6 +1047,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count,
                 output_indices,
                 output,
+                synchronize=args.get_timing == "sync-call",
                 **execution.get_kwargs,
             )
             # Keep caller-owned request Tensors alive through completion.
@@ -1066,38 +1073,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count,
                 output_indices,
                 output,
+                synchronize=args.get_timing == "sync-call",
                 **execution.get_kwargs,
             )
             submitted = time.perf_counter()
-            torch.npu.synchronize()
-            execution.drain_get(runtime)
-            completed = time.perf_counter()
-            submit_samples.append((submitted - begin) * 1000.0)
-            synchronize_samples.append((completed - submitted) * 1000.0)
+            if args.get_timing == "sync-call":
+                completed = submitted
+            else:
+                torch.npu.synchronize()
+                execution.drain_get(runtime)
+                completed = time.perf_counter()
+                submit_samples.append((submitted - begin) * 1000.0)
+                synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
             if args.kernel_profile:
                 kernel_profile_samples.append(
                     list(runtime.batch_get_kernel_profile())
                 )
 
-        print_samples(
-            "batch_get_submit",
-            submit_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
-            execution_mode=args.execution_mode,
-        )
-        print_samples(
-            "batch_get_synchronize",
-            synchronize_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
-            execution_mode=args.execution_mode,
-        )
+        if args.get_timing == "async-drain":
+            print_samples(
+                "batch_get_submit",
+                submit_samples,
+                args.warmup,
+                request_length,
+                miss_count_value,
+                token_bytes,
+                execution_mode=args.execution_mode,
+            )
+            print_samples(
+                "batch_get_synchronize",
+                synchronize_samples,
+                args.warmup,
+                request_length,
+                miss_count_value,
+                token_bytes,
+                execution_mode=args.execution_mode,
+            )
         print_samples(
             "batch_get",
             batch_get_samples,
