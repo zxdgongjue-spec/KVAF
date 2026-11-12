@@ -522,22 +522,29 @@ Host 对照扫描采用固定路由，不执行 adaptive 校准；如需固定 C
 
 ### 7.3 按次 Get 调度分段计时
 
-仅诊断普通 per-call Get。设置 `KVAF_GET_DISPATCH_TRACE` 后，Runtime 将样本缓存在
-内存中，在 `shutdown()` 时写成 CSV；未设置时不读时钟，也不写文件。每次测试使用
-不同的 CSV 路径。需重新构建 NPU 客户端，CPU 服务无须修改。UBMEM 示例：
+诊断四种 eager Get 的 legacy 与 per-call。per-call 包括 Gather/AIV Direct 的
+复用输出路径和 Scatter/UBMEM 的普通路径；legacy 记录同一 provider 的准备、
+提交、完成及清理阶段，便于对照变化。设置 `KVAF_GET_DISPATCH_TRACE` 后，Runtime 将样本
+缓存在内存中，在 `shutdown()` 时写成 CSV；未设置时不读这些分段时钟，也不写文件。
+每次测试使用新的 CSV 路径，避免与旧版列格式混写。需重新构建 NPU 客户端；
+AICPU Gather/Scatter 还需重新构建对应 Host 包，CPU 服务无须修改。
+UBMEM 同步调用示例：
 
 ```bash
 KVAF_GET_DISPATCH_TRACE="$PWD/ubmem-dispatch.csv" \
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
 bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
-  --execution-mode per-call --transport ubmem \
+  --execution-mode per-call --transport ubmem --get-timing sync-call \
   --request-length 32768 --miss-count 4096 --table-capacity 4096 \
   --token-bytes 656 --tokens-per-block 128 --aiv-cores 5 \
   --no-kernel-profile --warmup 10 --iterations 100
 python3 tests/python/summarize_get_dispatch_trace.py ubmem-dispatch.csv --last 100
 ```
 
-Scatter 示例（使用原单点负载；`PYTHONPATH` 指向同一次构建）：
+URMA AIV Direct 使用相同命令，改为 `--transport urma` 和独立的 trace 文件名。
+对照 legacy 时改为 `--execution-mode legacy`，也使用独立的 trace 文件；
+两种模式都保留 `--get-timing sync-call`，并分别运行摘要脚本。
+Gather/Scatter 使用原单点负载；`PYTHONPATH` 指向同一次构建。Scatter 示例：
 
 ```bash
 PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
@@ -548,13 +555,28 @@ python3 access_operator/demo/aicpu_batch_get/python/benchmark_cpu_push_scatter.p
 python3 tests/python/summarize_get_dispatch_trace.py scatter-dispatch.csv --last 100
 ```
 
-`--last` 排除前面的正确性检查和预热调用。提交样本拆为锁等待、配置解析、前次
-完成处理、上下文构造、资源需求查询、租约获取、状态绑定、provider 的需求查询、
-Warmup、provider 执行及同步调用的上下文释放。`outside_provider` 是整段提交减去
-provider 执行，包含计时本身及未单独列出的少量代码。异步 UBMEM 的 `provider`
-主要是提交；`drain` 行另计事件等待、状态回拷和上下文释放。同步 Scatter 的
-`provider` 包含设备完成等待，通常不会产生独立的 `drain` 行。各字段的 P50
-来自不同样本，不应相加；这份诊断数据也不替代关闭计时后的最终性能对照。
+Gather 将脚本改为 `benchmark_gather_read.py` 并使用独立 trace 文件名。
+Gather/Scatter 的 legacy 对照同样只改 `--execution-mode legacy` 与 trace 文件名。
+`--last` 对每个算法、执行路径、事件分别取最后 100 个样本，以排除正确性检查
+和预热。输出的 `algorithm` 为 `gather`、`scatter`、`aiv_direct` 或 `ubmem`；
+`path=output` 表示复用输出绑定，`path=ordinary` 表示每次构造 Get 上下文。
+legacy 的标签为 `algorithm=legacy path=legacy`，由文件名区分所测算法。
+
+提交样本包含锁等待、配置解析、输出绑定检查、前次完成处理、上下文构造或更新、
+资源需求查询、租约获取、状态绑定，以及 provider 的需求查询与 Warmup。
+`provider_prepare` 是各 provider 的请求准备；`provider_submit` 包含参数组装、
+状态初始化和内核提交；`provider_completion` 包含同步等待、状态回拷与校验；
+`provider_cleanup` 是 provider 内的调用后资源释放。`provider_other` 为 provider
+总耗时中尚未归入这些阶段的部分；`outside_provider` 是 dispatcher 总耗时减去
+provider 执行时间。各字段 P50 来自不同样本，不应相加。
+
+同步调用的 `provider_completion` 包含真实设备等待，不等于新模式独有的纯 Host
+开销。各 provider 的具体参数准备方式不同，应在相同算法、相同负载下比较两种模式的
+provider 阶段，再看 per-call 的 dispatcher
+阶段；必要时继续测设备时间。per-call trace 的 `total` 只覆盖 dispatcher，
+legacy trace 的 `total` 覆盖 RuntimeCore 到 provider 返回，两者不能直接相减；
+Python 绑定耗时均未覆盖。trace 会增加计时开销。
+最终性能比较使用关闭 trace 后的 Host 扫描结果。
 
 ### 7.4 多卡 graph 与便携检查
 

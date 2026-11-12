@@ -10,6 +10,11 @@
 namespace kvaf {
 
 struct BatchGetProfile;
+// Optional Host diagnostics for one Get launch. The caller owns this storage;
+// providers write it only before ExecuteBatchGet returns.
+struct GetProviderTiming {
+  std::uint64_t prepare_ns{}, submit_ns{}, completion_ns{}, cleanup_ns{};
+};
 
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
@@ -130,6 +135,7 @@ struct BatchGetExecRequest {
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
   BatchGetExecutionOptions execution;
+  GetProviderTiming* host_timing{nullptr};
 };
 
 // Runtime 向 AccessOperator 提交的同步 BatchPut 描述。put_desc 的具体

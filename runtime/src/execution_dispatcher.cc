@@ -11,7 +11,10 @@ class GetDispatchTrace {
  public:
   struct Row {
     const char* event{};
+    const char* algorithm{};
+    const char* path{};
     std::uint64_t lock_ns{}, resolve_ns{}, previous_drain_ns{}, context_ns{};
+    std::uint64_t output_check_ns{};
     std::uint64_t describe_ns{}, acquire_ns{}, bind_ns{};
     GetLaunchTiming launch;
     std::uint64_t context_release_ns{}, drain_provider_ns{}, drain_release_ns{}, total_ns{};
@@ -27,14 +30,18 @@ class GetDispatchTrace {
     }
     output.seekp(0, std::ios::end);
     if (output.tellp() == 0)
-      output << "event,index,lock_ns,resolve_ns,previous_drain_ns,context_ns,describe_ns,"
-                "acquire_ns,bind_ns,requirements_ns,warmup_ns,provider_ns,context_release_ns,"
+      output << "event,index,algorithm,path,lock_ns,resolve_ns,output_check_ns,previous_drain_ns,"
+                "context_ns,describe_ns,acquire_ns,bind_ns,requirements_ns,warmup_ns,provider_ns,"
+                "provider_prepare_ns,provider_submit_ns,provider_completion_ns,provider_cleanup_ns,context_release_ns,"
                 "drain_provider_ns,drain_release_ns,total_ns\n";
     for (const auto& row : rows_)
-      output << row.event << ',' << ++next_index_ << ',' << row.lock_ns << ',' << row.resolve_ns
-             << ',' << row.previous_drain_ns << ',' << row.context_ns << ',' << row.describe_ns
+      output << row.event << ',' << ++next_index_ << ',' << (row.algorithm ? row.algorithm : "")
+             << ',' << (row.path ? row.path : "") << ',' << row.lock_ns << ',' << row.resolve_ns
+             << ',' << row.output_check_ns << ',' << row.previous_drain_ns << ',' << row.context_ns << ',' << row.describe_ns
              << ',' << row.acquire_ns << ',' << row.bind_ns << ',' << row.launch.requirements_ns
              << ',' << row.launch.warmup_ns << ',' << row.launch.provider_ns << ','
+             << row.launch.provider_detail.prepare_ns << ',' << row.launch.provider_detail.submit_ns
+             << ',' << row.launch.provider_detail.completion_ns << ',' << row.launch.provider_detail.cleanup_ns << ','
              << row.context_release_ns << ',' << row.drain_provider_ns << ','
              << row.drain_release_ns << ',' << row.total_ns << '\n';
     rows_.clear();
@@ -46,6 +53,12 @@ class GetDispatchTrace {
   std::uint64_t next_index_{};
 };
 namespace {
+const char* GetAlgorithmLabel(GetExecutionConfig c) {
+  if (c.transport == Transport::Ubmem) return "ubmem";
+  if (c.executor == Executor::Aicpu)
+    return c.algorithm == GetAlgorithm::Scatter ? "scatter" : "gather";
+  return "aiv_direct";
+}
 std::uint64_t TraceNowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -216,6 +229,10 @@ Status ExecutionDispatcher::DrainGetLocked() {
   if (output_context_) return output_context_->lease.view().Drain();
   if (!pending_get_) return Status::OK();
   GetDispatchTrace::Row row{};
+  if (get_trace_) {
+    row.algorithm = GetAlgorithmLabel(pending_get_->config);
+    row.path = "ordinary";
+  }
   const auto started = get_trace_ ? TraceNowNs() : 0;
   auto s = pending_get_->cleanup_only ? resources_.Close(pending_get_->lease)
                                       : pending_get_->lease.view().Drain();
@@ -251,13 +268,31 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
         r.indices.bytes % sizeof(std::int32_t) ||
         r.indices.bytes / sizeof(std::int32_t) > output_options_.request_capacity)
       return Status::InvalidArgument("request differs from bound Get output/capacity");
+    GetDispatchTrace::Row row{};
+    if (get_trace_) {
+      row.event = "submit";
+      row.algorithm = GetAlgorithmLabel(c);
+      row.path = "output";
+      row.lock_ns = locked - started;
+      row.resolve_ns = resolved - locked;
+      row.output_check_ns = TraceNowNs() - resolved;
+    }
+    auto phase = get_trace_ ? TraceNowNs() : 0;
     s = DrainGetLocked();
     if (!s.ok()) return s;
+    if (get_trace_) row.previous_drain_ns = TraceNowNs() - phase;
+    phase = get_trace_ ? TraceNowNs() : 0;
     output_context_->request = r;
     output_context_->table = request.host_access_table;
     output_context_->options = request.execution;
     output_context_->options.config = c;
-    return LaunchGet(*output_context_);
+    if (get_trace_) row.context_ns = TraceNowNs() - phase;
+    s = LaunchGet(*output_context_, get_trace_ ? &row.launch : nullptr);
+    if (get_trace_) {
+      row.total_ns = TraceNowNs() - started;
+      get_trace_->Record(row);
+    }
+    return s;
   }
   if (graph_id_ || request.execution.graph_lease) {
     if (!graph_id_ || request.execution.graph_lease != graph_id_ || !(c == graph_context_->config))
@@ -274,6 +309,8 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   GetDispatchTrace::Row row{};
   if (get_trace_) {
     row.event = "submit";
+    row.algorithm = GetAlgorithmLabel(c);
+    row.path = "ordinary";
     row.lock_ns = locked - started;
     row.resolve_ns = resolved - locked;
   }

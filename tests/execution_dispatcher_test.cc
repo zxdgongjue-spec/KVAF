@@ -5,9 +5,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 using namespace kvaf;
@@ -59,6 +63,12 @@ class Provider final : public AccessOperator {
   Status ExecuteBatchGet(const BatchGetExecRequest& e) override {
     ++s_.calls;
     CHECK(e.execution.config == get || e.execution.config == gather);
+    if (e.host_timing) {
+      e.host_timing->prepare_ns = 11;
+      e.host_timing->submit_ns = 12;
+      e.host_timing->completion_ns = 13;
+      e.host_timing->cleanup_ns = 14;
+    }
     request_ = *e.request;
     table_ = e.host_access_table;
     pending_ = true;
@@ -340,6 +350,99 @@ void OutputLeaseReuseAndPins() {
   CHECK(retry_runtime.EndGetOutput(unused).ok());
   CHECK(retry_runtime.Shutdown().ok());
 }
+void TraceOutputAndOrdinary() {
+  const std::string path = "/tmp/kvaf-get-dispatch-test-" +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".csv";
+  std::remove(path.c_str());
+  CHECK(setenv("KVAF_GET_DISPATCH_TRACE", path.c_str(), 1) == 0);
+  State p, g, a;
+  ExecutionDispatcher d(Policy());
+  CHECK(unsetenv("KVAF_GET_DISPATCH_TRACE") == 0);
+  Register(d, p, g, a);
+  CHECK(d.Initialize({4096, 128, 64, DeviceKind::kCpu}).ok());
+  char input[16] = "trace payload", output[16]{};
+  Address addresses[]{reinterpret_cast<Address>(input)};
+  std::uint64_t lengths[]{16};
+  std::uint8_t valid[]{1};
+  int index = 0, offset = 0, count = 1, output_index = 0;
+  BatchGetRequest request{};
+  request.indices = {&index, 4, DeviceKind::kNpu};
+  request.offsets = {&offset, 4, DeviceKind::kNpu};
+  request.miss_count = {&count, 4, DeviceKind::kNpu};
+  request.output_indices = {&output_index, 4, DeviceKind::kNpu};
+  request.output = {output, sizeof(output), DeviceKind::kNpu};
+  request.output_block_bytes = sizeof(output);
+  BatchGetExecutionOptions options{};
+  options.stream = reinterpret_cast<void*>(1);
+  options.synchronize = true;
+  options.config = get;
+  std::uint64_t lease{};
+  CHECK(d.BeginGetOutput(get, {request.output, options.stream, 1}, &lease).ok());
+  options.output_lease = lease;
+  CHECK(d.ExecuteBatchGet({{addresses, lengths, valid, 1}, &request, options}).ok());
+  CHECK(std::memcmp(input, output, sizeof(output)) == 0);
+  CHECK(d.EndGetOutput(lease).ok());
+  options.output_lease = 0;
+  options.config = gather;
+  CHECK(d.ExecuteBatchGet({{addresses, lengths, valid, 1}, &request, options}).ok());
+  CHECK(d.Shutdown().ok());
+  std::ifstream trace(path);
+  CHECK(trace.good());
+  const std::string contents((std::istreambuf_iterator<char>(trace)), std::istreambuf_iterator<char>());
+  CHECK(contents.find("algorithm,path") != std::string::npos);
+  CHECK(contents.find("provider_prepare_ns,provider_submit_ns,provider_completion_ns,provider_cleanup_ns")
+        != std::string::npos);
+  CHECK(contents.find(",aiv_direct,output,") != std::string::npos);
+  CHECK(contents.find(",gather,ordinary,") != std::string::npos);
+  CHECK(contents.find(",11,12,13,14,") != std::string::npos);
+  std::remove(path.c_str());
+}
+void TraceLegacyProvider() {
+  class LegacyProvider final : public AccessOperator {
+   public:
+    Status Initialize(const RemoteRegionDesc&) override { return Status::OK(); }
+    Status Shutdown() override { return Status::OK(); }
+    Status ExecuteBatchPut(const BatchPutExecRequest&) override { return Status::OK(); }
+    Status ExecuteBatchGet(const BatchGetExecRequest& r) override {
+      CHECK(r.host_timing != nullptr);
+      r.host_timing->prepare_ns = 21;
+      r.host_timing->submit_ns = 22;
+      r.host_timing->completion_ns = 23;
+      return Status::OK();
+    }
+  } provider;
+  const std::string path = "/tmp/kvaf-get-legacy-trace-test-" +
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".csv";
+  std::remove(path.c_str());
+  CHECK(setenv("KVAF_GET_DISPATCH_TRACE", path.c_str(), 1) == 0);
+  auto meta = CreateInMemoryMetaManager();
+  auto allocator = CreateHostDdrMemoryAllocator();
+  RuntimeCore runtime(*meta, provider, *allocator);
+  CHECK(unsetenv("KVAF_GET_DISPATCH_TRACE") == 0);
+  CHECK(runtime.Initialize({128, 16, DeviceKind::kCpu}).ok());
+  Address addresses[]{1};
+  std::uint8_t valid[]{1};
+  int index = 0, offset = 0, count = 0, output_index = 0;
+  char output[16]{};
+  BatchGetRequest request{};
+  request.indices = {&index, 4, DeviceKind::kNpu};
+  request.offsets = {&offset, 4, DeviceKind::kNpu};
+  request.miss_count = {&count, 4, DeviceKind::kNpu};
+  request.output_indices = {&output_index, 4, DeviceKind::kNpu};
+  request.output = {output, sizeof(output), DeviceKind::kNpu};
+  request.output_block_bytes = sizeof(output);
+  request.tokens_per_block = 1;
+  request.device_access_table = {{addresses, sizeof(addresses), DeviceKind::kNpu},
+                                 {valid, sizeof(valid), DeviceKind::kNpu}};
+  CHECK(runtime.BatchGet(request).ok());
+  CHECK(runtime.Shutdown().ok());
+  std::ifstream trace(path);
+  CHECK(trace.good());
+  const std::string contents((std::istreambuf_iterator<char>(trace)), std::istreambuf_iterator<char>());
+  CHECK(contents.find(",legacy,legacy,") != std::string::npos);
+  CHECK(contents.find(",21,22,23,0\n") != std::string::npos);
+  std::remove(path.c_str());
+}
 }  // namespace
 int main() {
   Configurations();
@@ -347,5 +450,7 @@ int main() {
   RuntimePinsAndTransactions();
   GraphLeasePinsAndIsolation();
   OutputLeaseReuseAndPins();
+  TraceOutputAndOrdinary();
+  TraceLegacyProvider();
   std::cout << "Execution registry, lazy domains, pins, overlap and recovery passed\n";
 }

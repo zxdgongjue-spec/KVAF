@@ -132,7 +132,14 @@ class RuntimeCore {
       const AccessTableHandle& handle) const;
 
   Status DrainGetLocked();
+  void FlushLegacyGetTrace();
   Status FinalizePutLocked();
+  struct LegacyGetTraceRow {
+    std::uint64_t total_ns{}, provider_ns{};
+    GetProviderTiming provider_detail;
+  };
+  std::string legacy_get_trace_path_;
+  std::vector<LegacyGetTraceRow> legacy_get_trace_rows_;
   struct PendingPut {
     PutContext transaction;
     PutCompletion completion;

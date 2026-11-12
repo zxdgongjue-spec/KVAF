@@ -5,6 +5,7 @@
 #include "direct_hccp/direct_hccp_session.h"
 #include "direct_hccp/target_channel.h"
 #include "peer_link.h"
+#include "get_host_timing.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -220,6 +221,7 @@ Status CpuPushTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
 }
 Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
                                         const aicpu_urma::ScatterLaunchView& view, ExecutionState* state) {
+  const auto submit_started = GetHostTimingStart(exec.host_timing);
   auto* invocation = dynamic_cast<aicpu_urma::AicpuGetInvocation*>(state);
   auto valid_view = view.common.Validate(invocation, ExecutionDirection::Get);
   if (!valid_view.ok()) return valid_view;
@@ -259,6 +261,8 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   auto stamp = profile ? BatchGetProfileNowNs() : 0;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchCpuPushScatter(&args, stream)) { view.health->failed = true; return Error("launch kernel"); }
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::submit_ns, submit_started);
+  const auto completion_started = GetHostTimingStart(exec.host_timing);
   if (profile) { const auto now = BatchGetProfileNowNs(); profile->launch_ns = now - stamp; stamp = now; }
   if (!exec.execution.synchronize) return Status::OK();
   if (profile && aclrtMemcpyAsync(view.profile.host, profile_bytes, view.profile.device, profile_bytes,
@@ -274,6 +278,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     std::copy_n(static_cast<const BatchGetWorkerProfile*>(view.profile.host), view.options.workers, profile->workers.begin());
     const auto end = BatchGetProfileNowNs(); profile->finish_ns = end - stamp; profile->total_ns = end - begin;
   }
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::completion_ns, completion_started);
   return Status::OK();
 }
 

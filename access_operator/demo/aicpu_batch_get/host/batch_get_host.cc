@@ -5,6 +5,7 @@
 #include "batch_get_args.h"
 #include "cpu_gather.h"
 #include "aicpu_urma/session.h"
+#include "get_host_timing.h"
 namespace kvaf::aicpu_urma {
 namespace {
 Status InvalidArgument(std::string s) { return Status::InvalidArgument(std::move(s)); }
@@ -194,6 +195,7 @@ Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest& exec) {
 }
 Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
                                          const GatherLaunchView& view, ExecutionState* state) {
+  const auto submit_started = GetHostTimingStart(exec.host_timing);
   auto* invocation = dynamic_cast<AicpuGetInvocation*>(state);
   auto valid_view = view.common.Validate(invocation, ExecutionDirection::Get);
   if (!valid_view.ok()) return valid_view;
@@ -249,6 +251,8 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchBatchGet(&launch, stream)) return Internal("UMDK BatchGet launch failed");
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::submit_ns, submit_started);
+  const auto completion_started = GetHostTimingStart(exec.host_timing);
   if (profile) {
     const auto now = BatchGetProfileNowNs();
     profile->launch_ns = now - stamp;
@@ -282,6 +286,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     profile->finish_ns = end - stamp;
     profile->total_ns = end - begin;
   }
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::completion_ns, completion_started);
   return Status::OK();
 }
 }  // namespace kvaf::aicpu_urma

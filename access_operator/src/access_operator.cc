@@ -14,6 +14,7 @@
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
+#include "get_host_timing.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -199,6 +200,7 @@ Status DefaultAccessOperator::FinishGetGraph(void* stream, bool discard) {
   return UrmaAivGetOperator::FinishGraph(stream, discard, resources_->GetView(), resources_->invocation());
 }
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
+  const auto prepare_started = GetHostTimingStart(request.host_timing);
   auto& call = resources_->invocation();
   auto view = resources_->GetView();
   if (view.options.managed_completion && !call.graph_buffer) {
@@ -207,6 +209,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
   }
   auto status = UrmaAivGetOperator::Validate(request, view, call);
   if (status.ok()) status = resources_->PrepareGetResources(request, call, &view);
+  GetHostTimingRecord(request.host_timing, &GetProviderTiming::prepare_ns, prepare_started);
   return status.ok() ? UrmaAivGetOperator::Launch(request, view, call) : status;
 }
 Status DefaultAccessOperator::DrainGet() {
@@ -365,6 +368,7 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
 }
 
 Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetView view, AivInvocation& invocation) {
+  const auto submit_started = GetHostTimingStart(exec.host_timing);
   auto status = Validate(exec, view, invocation);
   if (!status.ok()) return status;
   const bool graph_lease = invocation.graph_buffer != nullptr;
@@ -406,9 +410,14 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
         invocation.pending_get = nullptr; invocation.get_entity = 0; }
     return Internal("failed to launch BatchGet");
   }
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::submit_ns, submit_started);
+  const auto completion_started = GetHostTimingStart(exec.host_timing);
   if (graph_lease) return Status::OK();
-  if (view.options.managed_completion)
-    return exec.execution.synchronize ? Drain(view, invocation) : Status::OK();
+  if (view.options.managed_completion) {
+    auto completed = exec.execution.synchronize ? Drain(view, invocation) : Status::OK();
+    GetHostTimingRecord(exec.host_timing, &GetProviderTiming::completion_ns, completion_started);
+    return completed;
+  }
   if (exec.execution.synchronize) {
     const aclError sync_result = aclrtSynchronizeStream(stream);
     KvafBatchGetLocalBufferRelease(local_buffer);
@@ -424,6 +433,7 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
     KvafBatchGetLocalBufferRelease(local_buffer);
     invocation.pending_buffer = nullptr; invocation.pending_get = nullptr; invocation.get_entity = 0;
   }
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::completion_ns, completion_started);
   return Status::OK();
 }
 

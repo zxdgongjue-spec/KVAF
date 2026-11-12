@@ -7,9 +7,10 @@ from pathlib import Path
 
 
 SUBMIT_FIELDS = (
-    "total_ns", "lock_ns", "resolve_ns", "previous_drain_ns", "context_ns",
+    "total_ns", "lock_ns", "resolve_ns", "output_check_ns", "previous_drain_ns", "context_ns",
     "describe_ns", "acquire_ns", "bind_ns", "requirements_ns", "warmup_ns",
-    "provider_ns", "context_release_ns", "outside_provider_ns",
+    "provider_ns", "provider_prepare_ns", "provider_submit_ns", "provider_completion_ns",
+    "provider_cleanup_ns", "provider_other_ns", "context_release_ns", "outside_provider_ns",
 )
 DRAIN_FIELDS = ("total_ns", "drain_provider_ns", "drain_release_ns")
 
@@ -22,11 +23,12 @@ def percentile(values, fraction):
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def summarize(rows, event, fields):
+def summarize(rows, algorithm, path, event, fields):
     if not rows:
-        print(f"GET_DISPATCH_TIMING event={event} samples=0")
+        print(f"GET_DISPATCH_TIMING algorithm={algorithm} path={path} event={event} samples=0")
         return
-    print(f"GET_DISPATCH_TIMING event={event} samples={len(rows)} unit=us")
+    print(f"GET_DISPATCH_TIMING algorithm={algorithm} path={path} event={event} "
+          f"samples={len(rows)} unit=us")
     for field in fields:
         values = [row[field] / 1000 for row in rows]
         print(f"  {field.removesuffix('_ns')}: p50={percentile(values, 0.5):.2f} "
@@ -43,15 +45,27 @@ def main():
         parser.error("--last must be nonnegative")
     with args.trace.open(newline="") as source:
         rows = list(csv.DictReader(source))
-    for event, fields in (("submit", SUBMIT_FIELDS), ("drain", DRAIN_FIELDS)):
-        selected = [row for row in rows if row["event"] == event]
-        if args.last:
-            selected = selected[-args.last:]
-        parsed = [{key: int(value) for key, value in row.items()
-                   if key not in ("event", "index")} for row in selected]
-        for row in parsed:
-            row["outside_provider_ns"] = row["total_ns"] - row["provider_ns"]
-        summarize(parsed, event, fields)
+    groups = sorted({(row.get("algorithm") or "unknown", row.get("path") or "ordinary")
+                     for row in rows})
+    for algorithm, path in groups:
+        for event, fields in (("submit", SUBMIT_FIELDS), ("drain", DRAIN_FIELDS)):
+            selected = [row for row in rows if row["event"] == event and
+                        (row.get("algorithm") or "unknown") == algorithm and
+                        (row.get("path") or "ordinary") == path]
+            if args.last:
+                selected = selected[-args.last:]
+            parsed = [{key: int(value) for key, value in row.items()
+                       if key not in ("event", "index", "algorithm", "path")}
+                      for row in selected]
+            for row in parsed:
+                row["outside_provider_ns"] = row["total_ns"] - row["provider_ns"]
+                row["provider_other_ns"] = max(0, row["provider_ns"] - sum(
+                    row.get(field, 0) for field in ("provider_prepare_ns", "provider_submit_ns",
+                                                    "provider_completion_ns", "provider_cleanup_ns")))
+                for field in fields:
+                    row.setdefault(field, 0)
+            if selected:
+                summarize(parsed, algorithm, path, event, fields)
 
 
 if __name__ == "__main__":

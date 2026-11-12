@@ -3,6 +3,7 @@
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_batch_get/include/cpu_push_transport.h"
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
+#include "get_host_timing.h"
 
 namespace kvaf {
 Status UrmaAicpuPutOperator::Launch(const BatchPutExecRequest& request,
@@ -66,13 +67,18 @@ Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
 }
 Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
   std::lock_guard<std::mutex> lock(resources_->get_mutex());
+  const auto prepare_started = GetHostTimingStart(request.host_timing);
   auto ready = resources_->PrepareGetResources(request);
+  GetHostTimingRecord(request.host_timing, &GetProviderTiming::prepare_ns, prepare_started);
   if (!ready.ok()) return ready;
   auto result = resources_->scatter()
       ? UrmaAicpuScatterOperator::Launch(request, resources_->ScatterView(), resources_->invocation())
       : UrmaAicpuGatherOperator::Launch(request, resources_->GatherView(), resources_->invocation());
-  if (result.ok() && request.execution.synchronize && resources_->managed_completion())
+  if (result.ok() && request.execution.synchronize && resources_->managed_completion()) {
+    const auto cleanup_started = GetHostTimingStart(request.host_timing);
     result = resources_->ReleaseGetBuffers();
+    GetHostTimingRecord(request.host_timing, &GetProviderTiming::cleanup_ns, cleanup_started);
+  }
   return result;
 }
 }  // namespace kvaf

@@ -1,5 +1,6 @@
 #include "ubmem/access_operator.h"
 #include "meta_manager.h"
+#include "get_host_timing.h"
 #include <cstdio>
 
 namespace kvaf::ubmem {
@@ -18,7 +19,8 @@ BatchArgs Args(Operation operation, void* local, std::size_t bytes, const Mapped
   return a;
 }
 Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionView& view,
-                  UbmemInvocation& call, bool synchronize) {
+                  UbmemInvocation& call, bool synchronize, GetProviderTiming* host_timing = nullptr) {
+  const auto submit_started = GetHostTimingStart(host_timing);
   auto& state = *view.slot;
 
   args.profile = view.profiling && args.operation == Operation::kGet ? (view.profile_detail ? 2 : 1) : 0;
@@ -55,6 +57,8 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   auto status = Acl("aclrtLaunchKernelWithHostArgs", aclrtLaunchKernelWithHostArgs(
       view.kernel.function, view.kernel.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
   if (!status.ok()) return status;
+  GetHostTimingRecord(host_timing, &GetProviderTiming::submit_ns, submit_started);
+  const auto completion_started = GetHostTimingStart(host_timing);
   if (call.graph_active) {
     call.graph_recorded = true;
     return status;
@@ -111,6 +115,7 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
       return Status::Internal("UBmem Put completion report does not cover the submitted rows");
     }
   }
+  GetHostTimingRecord(host_timing, &GetProviderTiming::completion_ns, completion_started);
   return Status::OK();
 }
 }  // namespace
@@ -323,12 +328,14 @@ Status UbmemGetOperator::Launch(const BatchGetExecRequest& exec, const UbmemGetV
   a.table_entries = r.device_access_table.valid.bytes;
   a.token_bytes = r.output_block_bytes;
   a.tokens_per_block = r.tokens_per_block;
-  return LaunchKernel(a, stream, view.execution_, call, exec.execution.synchronize);
+  return LaunchKernel(a, stream, view.execution_, call, exec.execution.synchronize, exec.host_timing);
 }
 Status AccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   std::lock_guard<std::mutex> lock(resources_->mutex);
   UbmemGetView view;
+  const auto prepare_started = GetHostTimingStart(exec.host_timing);
   auto s = resources_->PrepareGetResources(static_cast<aclrtStream>(exec.execution.stream), &view);
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::prepare_ns, prepare_started);
   return s.ok() ? UbmemGetOperator::Launch(exec, view, *resources_->invocation) : s;
 }
 Status UbmemPutOperator::Launch(const BatchPutExecRequest& exec, const UbmemPutView& view,

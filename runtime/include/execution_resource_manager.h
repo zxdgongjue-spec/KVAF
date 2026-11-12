@@ -57,6 +57,7 @@ class PutResourceView {
 };
 struct GetLaunchTiming {
   std::uint64_t requirements_ns{}, warmup_ns{}, provider_ns{};
+  GetProviderTiming provider_detail;
 };
 class GetResourceView {
  public:
@@ -83,7 +84,9 @@ class GetResourceView {
     }
     if (s.ok()) {
       start = now();
-      s = op_->ExecuteBatchGet(r);
+      auto profiled = r;
+      profiled.host_timing = &timing->provider_detail;
+      s = op_->ExecuteBatchGet(profiled);
       timing->provider_ns = now() - start;
     }
     return s;

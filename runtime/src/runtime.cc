@@ -1,7 +1,11 @@
 #include "runtime.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
@@ -13,6 +17,11 @@
 namespace kvaf {
 
 namespace {
+
+std::uint64_t LegacyGetTraceNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
@@ -67,7 +76,12 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
                          DdrMemoryAllocator& ddr_allocator)
     : meta_manager_(meta_manager),
       access_operator_(access_operator),
-      ddr_allocator_(ddr_allocator) {}
+      ddr_allocator_(ddr_allocator) {
+  if (!access_operator_.TracksGetCompletion()) {
+    if (const char* path = std::getenv("KVAF_GET_DISPATCH_TRACE"); path && *path)
+      legacy_get_trace_path_ = path;
+  }
+}
 
 RuntimeCore::~RuntimeCore() {
   if (needs_cleanup_ && !Shutdown().ok()) {
@@ -78,6 +92,26 @@ RuntimeCore::~RuntimeCore() {
     if (pending_get_table_) (void)new std::shared_ptr<AccessTableState>(std::move(pending_get_table_));
     if (!graph_tables_.empty()) (void)new decltype(graph_tables_)(std::move(graph_tables_));
   }
+  FlushLegacyGetTrace();
+}
+
+void RuntimeCore::FlushLegacyGetTrace() {
+  if (legacy_get_trace_rows_.empty()) return;
+  std::ofstream output(legacy_get_trace_path_, std::ios::app);
+  if (!output) {
+    std::fprintf(stderr, "[KVAF] cannot write legacy Get trace: %s\n", legacy_get_trace_path_.c_str());
+    return;
+  }
+  output.seekp(0, std::ios::end);
+  if (output.tellp() == 0)
+    output << "event,index,algorithm,path,total_ns,provider_ns,provider_prepare_ns,"
+              "provider_submit_ns,provider_completion_ns,provider_cleanup_ns\n";
+  std::size_t index = 0;
+  for (const auto& row : legacy_get_trace_rows_)
+    output << "submit," << ++index << ",legacy,legacy," << row.total_ns << ',' << row.provider_ns
+           << ',' << row.provider_detail.prepare_ns << ',' << row.provider_detail.submit_ns
+           << ',' << row.provider_detail.completion_ns << ',' << row.provider_detail.cleanup_ns << '\n';
+  legacy_get_trace_rows_.clear();
 }
 
 Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
@@ -136,6 +170,7 @@ Status RuntimeCore::Shutdown() {
   // Pending transfers may still reference the region and access tables.
   // Keep ownership intact if the operator cannot drain or close its session.
   const Status operator_status = access_operator_.Shutdown();
+  FlushLegacyGetTrace();
   if (!operator_status.ok()) return operator_status;
 
   pending_get_table_.reset();
@@ -268,6 +303,7 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
+  const auto trace_started = legacy_get_trace_path_.empty() ? 0 : LegacyGetTraceNowNs();
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
@@ -378,14 +414,24 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     pinned = table_ref;
   } else if (access_operator_.TracksGetCompletion())
     pending_get_table_ = table_ref;
-  const auto status = access_operator_.ExecuteBatchGet(
-      BatchGetExecRequest{view, &request, execution});
+  GetProviderTiming provider_detail{};
+  std::uint64_t provider_ns = 0;
+  Status status;
+  if (trace_started) {
+    const auto provider_started = LegacyGetTraceNowNs();
+    status = access_operator_.ExecuteBatchGet({view, &request, execution, &provider_detail});
+    provider_ns = LegacyGetTraceNowNs() - provider_started;
+  } else {
+    status = access_operator_.ExecuteBatchGet({view, &request, execution});
+  }
   if (status.ok() && execution.synchronize && !execution.graph_lease) pending_get_table_.reset();
   if (!status.ok() && access_operator_.TracksGetCompletion() && !execution.graph_lease) {
     // Preparation failures have no outstanding DMA. Failed submissions retain
     // their pin unless the provider can positively establish completion.
     (void)DrainGetLocked();
   }
+  if (trace_started && status.ok())
+    legacy_get_trace_rows_.push_back({LegacyGetTraceNowNs() - trace_started, provider_ns, provider_detail});
   return status;
 }
 
