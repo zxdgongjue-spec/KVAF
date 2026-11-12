@@ -50,7 +50,7 @@ class Transport {
   struct GatherProfileSample {
     std::uint64_t sequence;
     std::uint32_t rows;
-    bool pipeline, interleaved;
+    bool pipeline, gather_pipeline, interleaved;
     Profile profile;
   };
   std::vector<GatherProfileSample> gather_profile_samples_;

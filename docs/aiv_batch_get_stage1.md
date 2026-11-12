@@ -25,11 +25,12 @@ NPU 通过专用的会话打开命令选择 CPU gather，同一个 CPU 服务可
 CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，再通过已有的四路
 Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
 使用一个源 SGE 和一个目标 SGE，按设备报告的消息及 WRITE 长度上限拆分。
-AIV 复用现有的 Ready/Done 和 scatter。`pipeline=1` 下启用首段提前发布时，
+AIV 复用现有的 Ready/Done 和 scatter。CPU 启用分波且收到首段通知时，
 CPU 先 gather 并回推首段，再等后缀清单。CPU 线程协作拷贝每个最多 1024 行的块，
 块就绪后由队列所属的 CPU 线程提交 WRITE，其他线程继续拷贝后续块。
-每个 AIV 分片的 Ready 随该分片的最后一部分 WRITE 发布。
-`pipeline=0` 下 CPU 等完整清单，完成整批 gather 后才提交 WRITE。
+`pipeline=1` 时每个 AIV 分片的 Ready 随该分片的最后一部分 WRITE 发布。
+`pipeline=0` 时 AIV 等最终 Done，CPU 仍可用 `KVAF_CPU_GATHER_INTERLEAVE=1`
+分波 gather 和 WRITE。两端都关闭时，CPU 等完整清单并完成整批 gather 后提交 WRITE。
 
 CPU gather 使用服务的 `--gather-threads` 和 gather 绑核、等待配置。
 每个会话的额外 pinned DDR staging 按观察到的最大有效批次字节数增长，
@@ -176,9 +177,9 @@ miss-count 脚本固定使用 prepared 提交，提交后调用 `torch.npu.synch
 并将 profile 快照放在计时区间之外。以下示例使用每 block 128 个 token。
 
 开启 CPU Gather 回推时，`cpu_comm_us` 仍从首个 payload WR 提交计到最后的
-payload CQE。`--pipeline 1` 的这段时间可包含后缀 gather 和 Ready WRITE。
-改用 `--pipeline 0` 可测完整 gather 后的提交到完成窗口，并在 CPU 日志中查看
-`CPU_PUSH_CAP` 的 `payload_write_bytes`。
+payload CQE。CPU 分波时这段时间可包含后缀 gather，`--pipeline 1` 还包含 Ready WRITE。
+用 `--pipeline 0` 和 `KVAF_CPU_GATHER_INTERLEAVE=0` 可测完整 gather 后的提交到完成窗口，
+并在 CPU 日志中查看 `CPU_PUSH_CAP` 的 `payload_write_bytes`。
 
 Scatter 的 CPU gather 复用了 `aiv_gather_yq` 的整批线程预算和分段清单消费方式。
 流水模式下只调度一次：各线程先拷贝首段，走到第 1024 行时才检查 suffix；
@@ -186,17 +187,25 @@ Scatter 的 CPU gather 复用了 `aiv_gather_yq` 的整批线程预算和分段�
 cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批仍重新读取源清单，
 只复用与请求形状有关的 WRITE 计划。
 
-在 K 端启动 CPU 服务时设 `KVAF_CPU_GATHER_INTERLEAVE=1`，可与默认的全局前缀顺序
-做 A/B。N 端保持 `KVAF_SCATTER_CPU_GATHER=1` 和 `--pipeline 1`。首段仍可提前提交，
-后续每波优先为不同 AIV 核和 Jetty 各准备一个分片，Ready 仍随同一 Jetty 的 payload 有序提交。
-分片跨越首段边界或内部边界未按 cache line 对齐时走原流水。
-CPU profile 中的 `interleaved=1` 表示该批实际采用交错顺序。
+在 N 端保持 `KVAF_SCATTER_CPU_GATHER=1`，用以下组合对照。K 端开关在启动服务时设置。
+
+| N 端 `--pipeline` | K 端 `KVAF_CPU_GATHER_INTERLEAVE` | CPU 提交 | AIV scatter |
+| --- | --- | --- | --- |
+| 0 | 0 | 整批 gather 后提交 | 等 Done |
+| 0 | 1 | 交错分波 | 等 Done |
+| 1 | 0 | 按连续行分波 | 按 Ready |
+| 1 | 1 | 交错分波 | 按 Ready |
+
+交错模式保留首段提前提交，后续每波优先为不同 AIV 核和 Jetty 各准备一个分片。
+分片跨越首段边界或内部边界未按 cache line 对齐时，CPU 回退到按连续行分波。
+CPU profile 的 `pipeline` 表示 AIV 模式，`gather_pipeline` 表示 CPU 是否实际分波，
+`interleaved` 表示是否采用交错顺序，`ready_wrs` 记录逐分片 Ready WRITE 数。
 
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务准备，`copy_ns` 记录任务发布、各线程的源地址校验、拷贝和汇合，
-`suffix_wait_ns` 记录协调线程等待后缀清单的时间。`pipeline=1` 的 `copy_ns`
+`suffix_wait_ns` 记录协调线程等待后缀清单的时间。`gather_pipeline=1` 的 `copy_ns`
 包含这段等待及拷贝期间的 WRITE 提交，不能与 `suffix_wait_ns` 相加。
-单独比较 CPU gather 耗时用 `--pipeline 0`，此时 suffix 在拷贝计时前等完。
+单独比较 CPU gather 耗时用两端开关都关闭的组合，此时 suffix 在拷贝计时前等完。
 每会话保留前 512 条，`active_threads` 记录单批实际参与的 CPU 线程数。
 Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane。比较时先对齐
 总字节数、CPU 线程总预算、绑定、源表和请求分布；只有复现参考分支的固定请求基准时，
@@ -208,7 +217,7 @@ Scatter 的一条记录覆盖整批，`aiv_gather_yq` 的记录覆盖单个 lane
 `slow_ready_delay_ns` 从协调线程进入拷贝阶段计到该线程取得任务。
 `slow_start_delay_ns` 还计入该线程开始拷贝前的采样开销。
 `slow_cpu_time_valid=1` 时可对照工作墙钟和线程 CPU 时间判断该线程的运行区间。
-`pipeline=1` 的协调线程区间包含就绪块提交，块内 barrier 也包含在 `slow_copy_ns` 中。
+`gather_pipeline=1` 的协调线程区间包含就绪块提交，块内 barrier 也包含在 `slow_copy_ns` 中。
 
 ```bash
 DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \

@@ -367,7 +367,9 @@ void Transport::SealPrepared(PreparedWrite& plan) {
 Status Transport::PrepareWrites(std::uint32_t count) {
   if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
   const bool batch_done_only = (request().reserved & kBatchDoneOnly) != 0;
-  const bool gather_pipeline = gather_ && !batch_done_only;
+  // Done-only controls what AIV waits for. The CPU can still overlap gather
+  // and payload WRITE when interleaving is enabled.
+  const bool gather_pipeline = gather_ && (gather_interleave_ || !batch_done_only);
   const auto head_rows = (request().reserved & kHeadStart) ? kChunkRows : 0U;
   if (prepared_count_ == count && prepared_batch_done_only_ == batch_done_only &&
       prepared_head_rows_ == head_rows) {
@@ -390,8 +392,8 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       waves.emplace_back();
       const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
         const auto shard = JettyRange(range, queue);
-        const auto begin = batch_done_only ? shard.begin : std::max(shard.begin, window.begin);
-        const auto end = batch_done_only ? shard.end : std::min(shard.end, window.end);
+        const auto begin = clip_to_stage ? std::max(shard.begin, window.begin) : shard.begin;
+        const auto end = clip_to_stage ? std::min(shard.end, window.end) : shard.end;
         if (clip_to_stage && begin >= end) return;
         auto row = begin;
         std::uint32_t offset = 0;
@@ -446,10 +448,9 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
       };
-      // Whole-batch completion has no CPU worker/chunk boundaries. Partition
-      // this stage across Jettys; all ordered CQ tails still finish before
-      // Complete publishes done on queue 0.
-      if (batch_done_only) append(0, 0, stage);
+      // Without waves or per-shard Ready, partition the entire stage across
+      // Jettys. Gather waves use the shard boundaries even in Done-only mode.
+      if (batch_done_only && !gather_pipeline) append(0, 0, stage);
       else ForEachPipelineChunk(count, token_bytes_, workers_, append);
     }
     std::size_t waves = 0;
@@ -467,9 +468,8 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       }
     }
   };
-  // In the Gather done-only mode, wait for all descriptors and finish the
-  // full gather before the first payload post. A head-start request still
-  // requires the suffix notification even though it uses one payload stage.
+  // A gather plan can start on the head and gate subsequent waves on suffix.
+  // The serial gather baseline waits for the entire list before gathering.
   if (gather_pipeline) {
     const auto interleaved = gather_interleave_
         ? InterleavedGatherWaves(count, token_bytes_, workers_, head_rows) : std::vector<GatherWave>{};
@@ -683,7 +683,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     }
     return Status::OK();
   };
-  if (gather_ && !(request().reserved & kBatchDoneOnly)) {
+  if (!gather_waves_.empty()) {
     std::size_t next_plan = 0;
     const peer::CpuGatherExecutor::FixedSuffix suffix{
         reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset),
@@ -753,7 +753,8 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   if (status.ok() && profiled_gather_rows) {
     if (gather_profile_samples_.size() < kGatherProfileSamples) {
       gather_profile_samples_.push_back(
-          {sequence, profiled_gather_rows, profiled_pipeline, prepared_interleaved_, profile_});
+          {sequence, profiled_gather_rows, profiled_pipeline, !gather_waves_.empty(),
+           prepared_interleaved_, profile_});
     } else {
       ++gather_profile_dropped_;
     }
@@ -785,7 +786,8 @@ void Transport::FlushGatherProfiles() {
     const auto& slow = p.slowest_thread;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u interleaved=%u active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
+        " pipeline=%u gather_pipeline=%u interleaved=%u waves=%u ready_wrs=%u"
+        " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
         " suffix_wait_ns=%" PRIu64
         " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
         " slow_bytes=%" PRIu64 " slow_ready_delay_ns=%" PRIu64
@@ -793,7 +795,8 @@ void Transport::FlushGatherProfiles() {
         " slow_barrier_ns=%" PRIu64 " slow_thread_cpu_ns=%" PRIu64
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
-        unsigned(sample.pipeline), unsigned(sample.interleaved), p.cpu_threads,
+        unsigned(sample.pipeline), unsigned(sample.gather_pipeline), unsigned(sample.interleaved),
+        p.waves, p.ready_wrs, p.cpu_threads,
         p.gather_prepare_ns, p.gather_copy_ns,
         p.suffix_wait_ns,
         p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
