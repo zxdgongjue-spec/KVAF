@@ -231,10 +231,7 @@ def statistics_ns(values, payload=None):
     return result
 
 
-def complete_outside_measurement(runtime, profiling, graph_replay=False):
-    if graph_replay:
-        runtime.check_scatter_graph_replay()
-        return None
+def complete_outside_measurement(runtime, profiling):
     if profiling:
         # Snapshot drains/checks all business statuses before copying records.
         return list(runtime.scatter_profile())
@@ -264,21 +261,28 @@ def measure_call(runtime, torch, args, iteration, submit, clock=time.perf_counte
     submitted = clock()
     torch.npu.synchronize()
     completed = clock()
-    if not args.kernel_profile:
-        complete_outside_measurement(runtime, False, graph_replay=args.execution == "graph")
+    graph_mode = args.execution == "graph"
+    if graph_mode:
+        status_begin = completed
+        runtime.check_scatter_graph_replay()
         checked = clock()
     sample = dict(iteration=iteration, payload_bytes=args.miss_count * args.token_bytes,
                   end_to_end_ns=completed - begin, host_call_ns=submitted - begin,
                   device_sync_ns=completed - submitted)
     if args.kernel_profile:
-        begin = clock()
+        snapshot_begin = clock()
         records = complete_outside_measurement(runtime, True)
         sample.update(profile_metrics(records, args.aiv_cores, args.miss_count,
                                       args.token_bytes, args.kernel_profile_clock_mhz))
         sample["workers"] = records
-        sample["snapshot_ns"] = clock() - begin
+        sample["snapshot_ns"] = clock() - snapshot_begin
     else:
-        sample["status_validation_ns"] = checked - completed
+        if not graph_mode:
+            # Keep eager's original boundary after building the sample.
+            status_begin = clock()
+            complete_outside_measurement(runtime, False)
+            checked = clock()
+        sample["status_validation_ns"] = checked - status_begin
         sample["checked_e2e_ns"] = checked - begin
     return sample_metrics(sample)
 

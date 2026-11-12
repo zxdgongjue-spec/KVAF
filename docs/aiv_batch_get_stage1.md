@@ -192,6 +192,9 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 对比两边均关闭 profiling，每轮交替运行顺序，使用相同的 seed 和请求配置。
 `comparison.csv` 按 case 和轮次配对，报告 E2E、Host 提交、状态检查和包含状态
 检查的 E2E 的 mean、p50、p99。请求准备、预热和 capture 在计时区间外。
+Host 提交与 Gather 的 `submit_us` 一样量到提交 API 返回。Scatter eager 使用
+prepared callable，Graph 使用 `AclGraph.replay`。E2E 量到设备同步返回。Graph
+状态检查从设备同步返回开始计时，eager 沿用旧口径，从调用状态校验前开始计时。
 
 调用侧在初始化前设置 `KVAF_AIV_SCATTER_GRAPH=1`，图外完成 BatchPut 和 eager
 预热及状态检查，再用 `kvaf.AclGraph` 捕获一个异步的 prepared Scatter 调用。
