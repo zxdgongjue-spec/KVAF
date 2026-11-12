@@ -125,12 +125,15 @@ class ConcurrentFixture(unittest.TestCase):
                 "--flow1-priorities", "3", "--flow2-priorities", "13",
                 "--flow1-args=" + options, "--flow2-args=" + options, *extra])
 
-    def flows(self, mode1="normal", mode2="slow"):
-        return [(name, [sys.executable, "-B", str(Path(__file__).resolve()),
-                        "--worker", mode, str(self.output)],
-                 dict(self.env, DEVICE_ID=device, KVAF_BATCH_GET_JETTY_PRIORITIES=priority))
-                for name, device, priority, mode in
-                (("flow1", "7", "3", mode1), ("flow2", "6", "13", mode2))]
+    def flows(self, mode1="normal", mode2="slow", *extra_modes):
+        flows = []
+        for index, mode in enumerate((mode1, mode2, *extra_modes), start=1):
+            command = [sys.executable, "-B", str(Path(__file__).resolve()),
+                       "--worker", mode, str(self.output)]
+            env = dict(self.env, DEVICE_ID=str(8 - index),
+                       KVAF_BATCH_GET_JETTY_PRIORITIES="3" if index == 1 else "13")
+            flows.append((f"flow{index}", command, env))
+        return flows
 
     def run_pair(self, flows, timeout=5):
         captured = io.StringIO()
@@ -140,6 +143,46 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
+    def test_three_and_four_flows_from_cli_wait_for_last_worker(self):
+        popen = subprocess.Popen
+        for count in (3, 4):
+            output = self.output / f"run-{count}"
+            argv = ["build-npu", "--output-dir", str(output)]
+            for i in range(1, count + 1):
+                argv.extend([f"--flow{i}-device=6", f"--flow{i}-priorities", str(i),
+                             f"--flow{i}-npu-eid", NPU_EIDS[0],
+                             f"--flow{i}-peer-eids", ",".join(PEERS),
+                             f"--flow{i}-args=--iterations {i}"])
+
+            def start_worker(command, **kwargs):
+                folder = Path(kwargs["env"]["KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"])
+                options = perf.parse_args(command[3:])
+                self.assertEqual(options.peer_eids, PEERS)
+                self.assertEqual(options.npu_eids, NPU_EIDS[:1])
+                self.assertEqual(Path(options.peer_csv), folder / "peer_samples.csv")
+                self.assertEqual(folder, output / f"flow{options.iterations}")
+                mode = "slow" if folder.name == f"flow{count}" else "normal"
+                return popen([sys.executable, "-B", str(Path(__file__).resolve()),
+                              "--worker", mode, str(folder)], **kwargs)
+
+            with self.subTest(count=count), patch.dict(os.environ, self.env, clear=True), \
+                    patch.object(launcher.subprocess, "Popen", side_effect=start_worker), \
+                    contextlib.redirect_stdout(io.StringIO()) as console:
+                self.assertEqual(launcher.main(argv), 0, console.getvalue())
+                results = [json.loads((output / f"flow{i}" / "6.json").read_text())
+                           for i in range(1, count + 1)]
+                self.assertEqual([row["priorities"] for row in results],
+                                 [str(i) for i in range(1, count + 1)])
+                self.assertGreaterEqual(min(row["started_ns"] for row in results),
+                                        max(row["ready_ns"] for row in results))
+                self.assertIn(f"all {count} flows ready", console.getvalue())
+
+    def test_extra_flow_requires_consecutive_numbers_and_device(self):
+        for options in (["--flow4-device", "5"], ["--flow3-priorities", "15"]):
+            with self.subTest(options=options), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                self.args(extra=options)
+
     def test_three_peer_four_core_four_jetty_defaults_match_peer_sweep(self):
         import run_peer_eid_sweep as sweep
 
@@ -312,14 +355,16 @@ class ConcurrentTests(ConcurrentFixture):
         with patch.object(launcher.subprocess, "Popen", side_effect=track), \
                 contextlib.redirect_stdout(io.StringIO()), self.assertRaises(exception):
             launcher.run_flows(flows, timeout)
-        self.assertEqual(len(created), 2)
+        self.assertEqual(len(created), len(flows))
         self.assertTrue(all(process.poll() is not None for process in created))
-        self.assertFalse((self.output / "7.json").exists())
+        for _, _, env in flows:
+            self.assertFalse((self.output / (env["DEVICE_ID"] + ".json")).exists())
 
     def test_preparation_failure_and_skip_release_no_worker(self):
         for mode in ("fail", "skip"):
             with self.subTest(mode=mode):
                 self.assert_cleanup_on_error(self.flows(mode2=mode), RuntimeError)
+        self.assert_cleanup_on_error(self.flows("normal", "normal", "normal", "fail"), RuntimeError)
 
     def test_startup_timeout_reaps_workers(self):
         self.assert_cleanup_on_error(self.flows(mode2="hang"), TimeoutError, timeout=0.6)

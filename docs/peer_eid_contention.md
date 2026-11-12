@@ -114,10 +114,11 @@ core 1 / Jetty 0 -> peer EID 1
 `reason=jetty_capacity` 表示因 Jetty 总数不足而截取。配置、建链和 CSV 都使用同一生效列表，
 `requested_peer_eids` 保留原候选列表。此规则无需随机选择，调整候选列表顺序即可控制使用哪些 EID。
 
-## 两条 NPU→CPU 流，每条流使用两个 CPU EID
+## 多条 NPU→CPU 流，每条流使用两个 CPU EID
 
-`run_concurrent_batch_get.py` 可以同时启动两条流，并为每条流单独指定本地 NPU EID
-和远端 CPU EID 列表。两条流完成初始化和预热后，再同步开始测量；每条流内部沿用
+`run_concurrent_batch_get.py` 支持两条及以上并发流，按 `flow1`、`flow2`、`flow3` 等连续编号。
+每条流可单独指定设备、本地 NPU EID、远端 CPU EID 列表、优先级和 benchmark 参数。
+全部流完成初始化和预热后同步开始首次测量。每条流内部沿用
 `run_peer_eid_sweep.py` 所用 benchmark 的多 CPU EID kernel 路径。
 
 下面以 NPU7 和 NPU6 共同访问同一对 CPU EID 为例。先把 `CPU_EID_0`、`CPU_EID_1`、
@@ -136,6 +137,16 @@ python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
     --output-dir results/two-flows-dual-eid-001
 ```
 
+在上例的 `--output-dir` 前加入下面第一组参数即可启动三条流，两组都加入即可启动四条。
+将设备 ID 和本地 EID 变量设为对应 NPU 的实际值，并为本次运行指定新的输出目录。
+
+```bash
+    --flow3-device "$DEVICE3" --flow3-npu-eid "$NPU_EID3" \
+    --flow3-peer-eids "$CPU_EID_0,$CPU_EID_1" --flow3-priorities 15 --flow3-args="$FLOW_ARGS" \
+    --flow4-device "$DEVICE4" --flow4-npu-eid "$NPU_EID4" \
+    --flow4-peer-eids "$CPU_EID_0,$CPU_EID_1" --flow4-priorities 15 --flow4-args="$FLOW_ARGS" \
+```
+
 这里每条流有一个本地 NPU EID、两个远端 CPU EID。每条流的 4 个 Jetty 按
 `CPU_EID_0, CPU_EID_1, CPU_EID_0, CPU_EID_1` 分配，`miss-count=8192` 是该条流
 两个 CPU EID 的请求总数。两条流的设备、EID 列表、优先级和 shape 都可以分别配置；
@@ -152,12 +163,11 @@ CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 E
 `miss-count=8192` 使用 `2048` 可以通过参数校验。inflight 仅保留 KVAF 原始校验：
 值必须在 `uint32` 范围内，且为 `0` 或至少 `2 * aiv-cores`；`0` 使用不限制 inflight 的基线路径。
 
-结果分别保存在 `output-dir/flow1`、`output-dir/flow2`。原有 shape 日志、Jetty CSV
+每条流的结果保存在对应的 `output-dir/flowN` 目录。原有 shape 日志、Jetty CSV
 和两个汇总 CSV 保持原名；指定 CPU EID 后，每条流额外生成自己的 `peer_samples.csv`，
 自动覆盖 `--flow*-args` 中指定的 peer CSV 路径，避免两条流写入同一个文件。
-分别检查两份日志的两条 `PEER_EID_TRAFFIC` 和 `PEER_EID_CONCURRENCY`，以及两个
-`peer_samples.csv` 中是否都有预期的 CPU EID。同步启动只对齐首次测量的开始，
-后续迭代由各流独立运行。
+对于上例，检查每条流日志中的两条 `PEER_EID_TRAFFIC` 和 `PEER_EID_CONCURRENCY`，
+并核对该流 `peer_samples.csv` 中的 CPU EID。首次测量同步开始后，各流独立执行后续迭代。
 
 ## 参数和测量口径
 

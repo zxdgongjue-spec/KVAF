@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Start two independent, single-shape BatchGet sweeps at a common ready time.
+"""Start two or more independent, single-shape BatchGet sweeps at a common ready time.
 
-The original sweep owns all logs, tables and CSVs, under output-dir/flow1 and
-output-dir/flow2. Only terminal lines get a flow prefix. Each worker prepares
+Each sweep owns all logs, tables and CSVs under output-dir/flowN.
+Only terminal lines get a flow prefix. Each worker prepares
 and warms up normally, then waits just before its first measured BatchGet.
 """
 
@@ -17,6 +17,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 
@@ -37,6 +38,8 @@ def parse_args(argv=None):
 Each --flow*-args string uses the existing benchmark options, without shell
 evaluation. Priority lists use the existing KVAF_BATCH_GET_JETTY_PRIORITIES
 semantics. The original sweep enables kernel profiling and manages CSV paths.
+Add --flow3-device ID, --flow4-device ID, etc. to launch more flows. Number
+flows consecutively from 1. Each supports the same five --flowN-* options.
 For two CPU EIDs per flow, set --flow1-peer-eids EID0,EID1 and
 --flow2-peer-eids EID0,EID1, with --flow1-npu-eid and --flow2-npu-eid selecting
 one local NPU EID each. These options override EIDs in --flow*-args.
@@ -50,7 +53,17 @@ Existing flow output directories are refused to prevent overwriting results.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
-    for name in ("flow1", "flow2"):
+    if argv is None:
+        argv = sys.argv[1:]
+    flow_numbers = {1, 2}
+    for option in argv:
+        match = re.match(r"--flow([1-9][0-9]*)-", option)
+        if match:
+            flow_numbers.add(int(match[1]))
+    if max(flow_numbers) != len(flow_numbers):
+        parser.error("flow numbers must be consecutive starting at 1")
+    flow_names = [f"flow{number}" for number in sorted(flow_numbers)]
+    for name in flow_names:
         parser.add_argument(f"--{name}-device", type=int, required=True)
         parser.add_argument(f"--{name}-peer-eids", type=parse_npu_eids,
                             help="comma-separated CPU EIDs, as in run_peer_eid_sweep.py")
@@ -60,7 +73,8 @@ Existing flow output directories are refused to prevent overwriting results.
                             default=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES") or "15")
         parser.add_argument(f"--{name}-args", default="", help="quoted original benchmark options")
     args = parser.parse_args(argv)
-    for name in ("flow1", "flow2"):
+    args.flow_names = flow_names
+    for name in flow_names:
         if getattr(args, f"{name}_device") < 0:
             parser.error(f"{name}-device must be non-negative")
         peers = getattr(args, f"{name}_peer_eids")
@@ -86,7 +100,7 @@ def build_flow(args, name):
     benchmark = perf.parse_args(options)
     output = args.output_dir.resolve() / name
     if benchmark.peer_eids:
-        # Keep peer reports isolated even when both flows inherit the same options.
+        # Keep peer reports isolated when flows inherit the same options.
         benchmark.peer_csv = str(output / "peer_samples.csv")
         options.extend(["--peer-csv", benchmark.peer_csv])
     error = perf.validate_args(benchmark)
@@ -164,7 +178,7 @@ def run_flows(flows, timeout):
     deadline = time.monotonic() + timeout
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        listener.listen(2)
+        listener.listen(len(flows))
         listener.settimeout(0.1)
         endpoint = f"127.0.0.1:{listener.getsockname()[1]}"
         tokens = {secrets.token_hex(16): name for name, _, _ in flows}
@@ -188,7 +202,8 @@ def run_flows(flows, timeout):
                     if process.poll() is not None:
                         raise RuntimeError(f"{name} exited before synchronized start (status={process.returncode})")
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("waiting for both flows to become ready")
+                    pending = ", ".join(name for token, name in tokens.items() if token not in ready)
+                    raise TimeoutError(f"waiting for {pending} to become ready")
                 try:
                     connection, _ = listener.accept()
                 except socket.timeout:
@@ -206,11 +221,12 @@ def run_flows(flows, timeout):
             for connection in connections:
                 connection.sendall(f"{start_ns}\n".encode("ascii"))
                 connection.close()
-            emit("[launcher] both flows ready; synchronized start scheduled")
+            group = "both flows" if len(flows) == 2 else f"all {len(flows)} flows"
+            emit(f"[launcher] {group} ready; synchronized start scheduled")
             # After release, each original benchmark runs its own iterations.
             while any(p.poll() is None for p in processes) or any(t.is_alive() for t in readers):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("waiting for the two sweeps to finish")
+                    raise TimeoutError(f"waiting for {len(flows)} sweeps to finish")
                 time.sleep(0.05)
             finished = True
             return next((p.returncode if p.returncode > 0 else 128 - p.returncode
@@ -236,7 +252,7 @@ def main(argv=None):
         timeout = int(os.environ.get("KVAF_REMOTE_CPU_PERF_TIMEOUT", "600"))
         if timeout <= 0:
             raise ValueError("KVAF_REMOTE_CPU_PERF_TIMEOUT must be positive")
-        flows = [build_flow(args, name) for name in ("flow1", "flow2")]
+        flows = [build_flow(args, name) for name in args.flow_names]
         for name, _, _ in flows:
             output = args.output_dir.resolve() / name
             if output.exists():
