@@ -31,15 +31,15 @@ CORE_COUNTS = (1, 2, 4, 8)
 CPU_JETTYS = 4
 SUBMISSION_CONFIG = {"host_submit": "prepared", "completion_mode": "reference"}
 STAGES = {
-    "end_to_end_ns": "end_to_end", "aiv_body_ns": "kernel_total",
-    "host_call_ns": "host_call", "device_sync_ns": "device_sync",
+    "end_to_end_ns": "end_to_end", "host_call_ns": "host_call",
+    "aiv_body_ns": "kernel_total", "device_sync_ns": "device_sync",
     "aiv_wall_ns": "kernel_wall", "cpu_comm_ns": "cpu_comm",
     "cpu_write_ns": "cpu_write", "aiv_build_notify_ns": "build_notify",
     "aiv_scatter_ns": "scatter", "call_outside_aiv_ns": "call_outside_aiv",
 }
 SUMMARY_COLUMNS = (
     "token_bytes", "miss_count", "aiv_cores", "jettys_per_core", "cpu_jettys",
-    "phase", "completion_mode", "stage", "mean_us", "p50_us", "p90_us", "p99_us",
+    "phase", "completion_mode", "stage", "mean_us", "p50_us", "p99_us", "p90_us",
     "effective_GBps", "p50_GBps", "case_json",
 )
 
@@ -510,6 +510,11 @@ def main(argv=None, runner=None):
         name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_reference_prepared"
         case.json = case.json or root / (name + ".json")
         case.csv = case.csv or root / (name + ".csv")
+    summary_path = args.csv.with_suffix(".summary.csv") if args.single else root / "summary.csv"
+    if args.single and summary_path.resolve() in (
+        args.json.resolve(), args.csv.resolve(), args.json.with_suffix(".log").resolve(),
+    ):
+        raise ValueError("summary CSV must differ from the case JSON, sample CSV and log")
     plan = dict(mode="cpu_push_scatter", cpu_jettys=CPU_JETTYS, **SUBMISSION_CONFIG,
                 unsupported_reference_cores=[16, 32], jetty_axis="fixed_CPU_4_not_per_AIV_core",
                 cases=[dict(command=case_command(case), payload_bytes=case.miss_count * case.token_bytes,
@@ -562,17 +567,17 @@ def main(argv=None, runner=None):
         rows.extend(current_rows)
         for row in current_rows:
             print("SCATTER_ALIGNED_SWEEP_RESULT " + json.dumps(row, sort_keys=True), flush=True)
-        if not args.single:
-            with (root / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, SUMMARY_COLUMNS)
-                writer.writeheader()
-                writer.writerows({k: f"{v:.3f}" if k.endswith("_us") else
-                                 f"{v:.6f}" if k in ("effective_GBps", "p50_GBps") else v
-                                 for k, v in row.items()} for row in rows)
+        with summary_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, SUMMARY_COLUMNS)
+            writer.writeheader()
+            writer.writerows({k: f"{v:.3f}" if k.endswith("_us") else
+                             f"{v:.6f}" if k in ("effective_GBps", "p50_GBps") else v
+                             for k, v in row.items()} for row in rows)
     if args.single:
-        print(f"SCATTER_ALIGNED_CASE_DONE json={args.json} csv={args.csv} log={args.json.with_suffix('.log')}", flush=True)
+        print(f"SCATTER_ALIGNED_CASE_DONE json={args.json} csv={args.csv} "
+              f"log={args.json.with_suffix('.log')} summary={summary_path}", flush=True)
     else:
-        print(f"SCATTER_ALIGNED_SWEEP_DONE combinations={len(selected)} summary={root/'summary.csv'}", flush=True)
+        print(f"SCATTER_ALIGNED_SWEEP_DONE combinations={len(selected)} summary={summary_path}", flush=True)
     return 0
 
 
