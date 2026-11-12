@@ -209,6 +209,51 @@ void ReadWorkerReuse() {
           !std::memcmp(pool.data(),data.data()+17,32),"service teardown drains accepted READ before joining and closing backend");
   NoResources();
 }
+void RejectedCancelPreservesLastBatch() {
+  SharedServer server;
+  kvaf::NpuRuntimeOptions options;
+  options.enable_cpu_offload = true;
+  kvaf::NpuRuntime reader(options);
+  Ok(reader.LinkTo({server.address}));
+  Ok(reader.Initialize(1024, 256));
+  kvaf::OffloadRegionTicket ticket;
+  Ok(reader.GetOffloadRegion(&ticket));
+  std::vector<std::uint8_t> data(128, 0x13);
+  aclrtSetDevice(7);
+  kvaf::CpuPullHbmSource source(7, "00000000000000000000000000000001");
+  Ok(source.Register(ticket, {data.data(), data.size(), kvaf::DeviceKind::kNpu}, reinterpret_cast<void*>(1)));
+
+  const std::vector<std::uint64_t> offsets{0}, lengths{64};
+  kvaf::ReadyToken first, second;
+  Ok(source.Ready(&first));
+  Ok(reader.BatchCpuPull({0}, first, offsets, lengths));
+  Ok(source.ReleaseBatch(first));
+  std::fill(data.begin(), data.end(), 0x75);
+  Ok(source.Ready(&second));
+  const int calls = server.control_calls;
+  Ok(reader.BatchCpuPull({1}, second, offsets, lengths));
+  Require(server.control_calls == calls + 1, "successful batch uses one control RPC");
+  Ok(source.ReleaseBatch(second));
+
+  for (bool drop_reply : {false, true}) {
+    if (drop_reply) {
+      server.drop = unsigned(rp::Command::Cancel);
+      Require(reader.CancelCpuPull(first).code() == kvaf::StatusCode::kInDoubt && reader.pending_offload(),
+              "lost stale-token rejection keeps cancellation pending");
+      Require(reader.CancelCpuPull(second).code() == kvaf::StatusCode::kBusy &&
+              reader.BatchCpuPull({2}, second, offsets, lengths).code() == kvaf::StatusCode::kBusy,
+              "only the pending cancellation token can be retried");
+    }
+    Require(reader.CancelCpuPull(first).code() == kvaf::StatusCode::kInvalidState && !reader.pending_offload(),
+            "definitive stale-token rejection clears pending cancellation");
+    std::uint64_t checksum{};
+    Ok(reader.LastOffloadChecksum(&checksum));
+    Require(checksum == p::Hash(data.data(), lengths[0]), "rejected cancellation preserves the second batch checksum");
+  }
+  Ok(source.Shutdown());
+  Ok(reader.Shutdown());
+  NoResources();
+}
 // Exercise wire identities directly, including a delayed *original* frame.
 void AdmissionAndReplay() {
   SharedServer server;
@@ -728,4 +773,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();AdmissionAndReplay();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();RejectedCancelPreservesLastBatch();AdmissionAndReplay();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
