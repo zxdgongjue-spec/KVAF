@@ -1,7 +1,7 @@
 # Gather 性能采集与排障
 
 当前实现、各阶段优化和配置合同见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)。
-以下统一使用 V11 / args 256 B / PRF5 256 B / CSV schema 10，历史 ABI 命令已移除。
+以下统一使用 V11 / args 256 B / PRF5 256 B / CSV schema 11，历史 ABI 命令已移除。
 
 ## 构建与入口
 
@@ -149,13 +149,14 @@ runtime.stop_gather_batch_get_profile()
 
 | 文件 | 内容 |
 | --- | --- |
-| summary.csv | E2E/profile E2E 的 samples、mean/p50/p95/p99/useful_GiBps、Host/core 均值；失败时附 error 行。 |
-| e2e.csv | profile=off 的逐样本延迟和带宽。 |
+| summary.csv | E2E/profile E2E 的 samples、mean/p50/p95/p99/useful_GiBps，提交和图状态检查分位数，Host/core 均值；失败时附 error 行。 |
+| e2e.csv | profile=off 的逐样本延迟、带宽、提交耗时和图状态检查耗时。 |
 | profile_host.csv | profile=on 的 sequence、外层调用时间及六项 Host 耗时。 |
 | profile_core.csv | 逐样本逐核阶段耗时和计数。 |
 
 CSV 时间用 us，另保留阶段耗时及计数的 AIV cycle；Host/core 分行，不复制 Host 总时间到每核求和。
-schema 10 移除 sampling_status 行/列、call_* 细分计时采集及原始时间戳列。
+schema 11 保留 `e2e_us`，新增 `submit_us`、`status_check_us`、`checked_e2e_us` 和
+对比轮次信息。状态检查两列只在 graph 中填写。带宽按 `miss_count` 对应的有效字节计算。
 七个边界时间戳及 first_ready/first_read_submit 仍在内部用于阶段计算、重叠和完整性校验，
 不再导出 CSV；kernel/profile ABI 保持不变。
 终端/summary 带宽统一按 `payload_bytes/(p50_us/1e6)/1024**3`；逐样本带宽用自身延迟。

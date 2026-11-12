@@ -232,16 +232,21 @@ KVAF_RUN_NPU_TESTS=1 python3 tests/python/test_aiv_gather_batch_get.py --graph
 
 ```bash
 KVAF_RUN_NPU_TESTS=1 KVAF_NPU_CORE_COUNT=2 \
-python3 tests/python/test_aiv_gather_batch_get_perf.py --execution compare
+python3 tests/python/test_aiv_gather_batch_get_perf.py --execution compare --rounds 3 --miss-count 8192
 ```
 
 `compare` 依次创建 eager 和 graph Runtime，使用相同的请求、随机种子、SGL、输出布局及
-流水参数。脚本默认 8192 请求，沿用性能脚本顶部配置。结果包含 P50、P95、P99 和按
-P50 计算的有效 GiB/s，两个运行目录的 CSV 通过 `execution` 区分。单测一边时用
-`--execution eager` 或 `--execution graph`。
+流水参数。每轮独立初始化，两种模式交替先跑，初始化耗时在计时窗口外。默认张量容量为
+8192，`--miss-count` 只改变有效前缀，例如用 128、512、1024 对照满批的提交占比。
+结果包含 P50、P95、P99 和按 P50 计算的有效 GiB/s。CSV 用 `execution`、
+`comparison_id` 和 `compare_round` 区分并配对。单测一边时用 `--execution eager`
+或 `--execution graph`。
 
-两边都计时到同一 caller stream 完成，capture、预热、输入准备和 graph 状态读回在计时
-窗口外。graph 每轮仍检查序号和状态，阶段 profiling 由 eager 执行。graph 计时前连续
+主指标 `e2e_us` 保持提交到 caller stream 完成的口径，capture、预热、输入准备和
+状态读回在窗口外。`submit_us` 量提交 API 返回前的耗时。图路径另记 stream 完成后的
+`status_check_us` 和从提交到完成状态检查的 `checked_e2e_us`，后者包含这次显式
+stream 同步。每轮输出的 `p50_saved_us` 和 `submit_p50_saved_us` 均为 eager P50
+减 graph P50，正值表示图更快。阶段 profiling 由 eager 执行。graph 计时前连续
 两次核对 payload 和 guard。默认 chunk 走原前缀流水，可设置
 `KVAF_AIV_GATHER_CHUNK_BYTES=0` 对两边运行整批 ACK 对照。
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 # ---- Edit benchmark settings here. ------------------------------------------
 TOKEN_BYTES = 656
-REQUEST_COUNT = 8192             # Try 1024, 8192, 8193, 65536; all requests are active.
+REQUEST_COUNT = 8192             # Tensor capacity; --miss-count sets the active prefix.
 WARMUP = 20                     # Excluded from performance results.
 ITERATIONS = 100                # Profile OFF samples; 0 skips E2E for profile debugging.
 PROFILE_SAMPLES = 10            # Profile ON: diagnostic stage samples, separately.
@@ -35,6 +35,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from aiv_batch_get_common import capture_gather_graph, close_gather_graph, kernel_paths, shutdown_runtime
 
@@ -185,7 +186,8 @@ def validate_config(cores: int) -> None:
         raise ValueError("RUN_LABEL must be a string")
 
 
-def make_output_rows(requests: int, cores: int, sgl: int, layout: str, randperm) -> list[int]:
+def make_output_rows(requests: int, cores: int, sgl: int, layout: str, randperm,
+                     *, miss_count: int) -> list[int]:
     """Keep guard rows untouched; shuffle whole WQE destinations, retaining tails."""
     if layout == "random":
         return [row + 1 for row in randperm(requests)]
@@ -193,7 +195,7 @@ def make_output_rows(requests: int, cores: int, sgl: int, layout: str, randperm)
     if layout == "segmented":
         starts = []
         for core in range(cores):
-            first, last = requests * core // cores, requests * (core + 1) // cores
+            first, last = miss_count * core // cores, miss_count * (core + 1) // cores
             starts.extend(range(first, last - sgl + 1, sgl))
         # Full segments can move across lanes; partial tails keep their rows.
         for target, index in zip(starts, randperm(len(starts))):
@@ -289,8 +291,8 @@ def summarize_profiles(
     )
 
 
-def print_profiles(samples: list[dict[str, object]], cores: int) -> None:
-    host, lanes = summarize_profiles(samples, cores, REQUEST_COUNT)
+def print_profiles(samples: list[dict[str, object]], cores: int, miss_count: int) -> None:
+    host, lanes = summarize_profiles(samples, cores, miss_count)
     print(
         f"GATHER_PROFILE_CONFIG profile=on cpu_profile=external samples={len(samples)} "
         f"first_sequence={samples[0]['sequence']} last_sequence={samples[-1]['sequence']} "
@@ -321,7 +323,45 @@ def latency_summary(samples_us: Sequence[float], payload_bytes: int) -> dict[str
     }
 
 
-def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> dict[str, object]:
+class PerfSample(NamedTuple):
+    e2e_us: float
+    submit_us: float
+    status_check_us: float | None = None
+    checked_e2e_us: float | None = None
+
+
+TIMING_FIELDS = ("submit_us", "status_check_us", "checked_e2e_us")
+TIMING_PERCENTILES = ((50, 0.50), (95, 0.95), (99, 0.99))
+TIMING_SUMMARY_FIELDS = tuple(f"{field.removesuffix('_us')}_p{label}_us"
+                              for field in TIMING_FIELDS for label, _ in TIMING_PERCENTILES)
+
+
+def measure_sample(enqueue, synchronize, check_status=None) -> PerfSample:
+    begin = time.perf_counter_ns()
+    enqueue()
+    submitted = time.perf_counter_ns()
+    synchronize()
+    completed = time.perf_counter_ns()
+    if check_status is None:
+        return PerfSample((completed - begin) / 1000, (submitted - begin) / 1000)
+    check_status()
+    checked = time.perf_counter_ns()
+    return PerfSample((completed - begin) / 1000, (submitted - begin) / 1000,
+                      (checked - completed) / 1000, (checked - begin) / 1000)
+
+
+def sample_summary(samples: Sequence[PerfSample], payload_bytes: int) -> dict[str, float]:
+    result = latency_summary([sample.e2e_us for sample in samples], payload_bytes)
+    for field in TIMING_FIELDS:
+        values = [value for sample in samples if (value := getattr(sample, field)) is not None]
+        if values:
+            for label, fraction in TIMING_PERCENTILES:
+                result[f"{field.removesuffix('_us')}_p{label}_us"] = percentile(values, fraction)
+    return result
+
+
+def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str,
+                 miss_count: int) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     local = now.astimezone(timezone(timedelta(hours=8)))
     revision, dirty = "", "unknown"
@@ -335,16 +375,17 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
     except (OSError, subprocess.CalledProcessError):
         pass  # A deployed source bundle need not contain .git.
     return {
-        "schema_version": 10,
+        "schema_version": 11,
         "run_id": now.strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8],
         "started_at_utc": now.isoformat(), "run_label": RUN_LABEL,
         "started_at_local": local.isoformat(), "timezone": "Asia/Shanghai",
         "run_directory": (local.strftime("%Y%m%d_%H%M%S") +
-                          f"-cores{cores}-token-bytes{TOKEN_BYTES}-request-count{REQUEST_COUNT}"),
+                          f"-cores{cores}-token-bytes{TOKEN_BYTES}-request-count{REQUEST_COUNT}"
+                          f"-miss-count{miss_count}"),
         "git_revision": revision, "git_dirty": dirty,
         "mode": "gather_read", "device_id": device_id, "cores": cores,
-        "token_bytes": TOKEN_BYTES, "request_count": REQUEST_COUNT,
-        "payload_bytes": REQUEST_COUNT * TOKEN_BYTES, "table_capacity": TABLE_CAPACITY,
+        "token_bytes": TOKEN_BYTES, "request_count": REQUEST_COUNT, "miss_count": miss_count,
+        "payload_bytes": miss_count * TOKEN_BYTES, "table_capacity": TABLE_CAPACITY,
         "tokens_per_block": TOKENS_PER_BLOCK, "sgl": GATHER_SGL_SIZE, "seed": SEED,
         "output_layout": os.environ.get("KVAF_GATHER_OUTPUT_LAYOUT", "random"),
         "coalesce_sges": int(os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES", "0") or "0"),
@@ -363,7 +404,7 @@ def csv_metadata(cores: int, device_id: int, kernel: str, put_kernel: str) -> di
 
 
 def export_csv_results(
-    directory: str | Path, metadata: Mapping[str, object], samples_us: Sequence[float],
+    directory: str | Path, metadata: Mapping[str, object], samples: Sequence[PerfSample],
     snapshots: Sequence[Mapping[str, object]], profile_calls_us: Sequence[float],
     error: BaseException | None = None,
 ) -> list[Path]:
@@ -374,7 +415,7 @@ def export_csv_results(
     """
     if len(snapshots) != len(profile_calls_us):
         raise ValueError("profile snapshots and synchronous call samples must match")
-    cores, requests = int(metadata["cores"]), int(metadata["request_count"])
+    cores, requests = int(metadata["cores"]), int(metadata["miss_count"])
     host_mean, core_means = summarize_profiles(snapshots, cores, requests) if snapshots else ({}, [])
     clock = metadata["clock_mhz"]
     stages = [name for name, _, _ in STAGE_BOUNDARIES]
@@ -402,12 +443,13 @@ def export_csv_results(
     if error is not None:
         summary.append({"row_kind": "error", "error_type": type(error).__name__, "error_message": str(error)})
     e2e_rows = []
-    if samples_us:
-        summary.append({"row_kind": "e2e_summary", "profile": "off", "samples": len(samples_us),
-                        **latency_summary(samples_us, int(metadata["payload_bytes"]))})
-        e2e_rows = [{"sample_index": index, "profile": "off", "e2e_us": elapsed,
-                     "useful_GiBps": int(metadata["payload_bytes"]) / (elapsed / 1e6) / 1024**3}
-                    for index, elapsed in enumerate(samples_us, 1)]
+    if samples:
+        payload_bytes = int(metadata["payload_bytes"])
+        summary.append({"row_kind": "e2e_summary", "profile": "off", "samples": len(samples),
+                        **sample_summary(samples, payload_bytes)})
+        e2e_rows = [{"sample_index": index, "profile": "off", **sample._asdict(),
+                     "useful_GiBps": payload_bytes / (sample.e2e_us / 1e6) / 1024**3}
+                    for index, sample in enumerate(samples, 1)]
     host_rows, core_rows = [], []
     if snapshots:
         sequence_range = {"first_sequence": snapshots[0]["sequence"],
@@ -454,9 +496,10 @@ def export_csv_results(
     outputs = (
         ("summary", ["row_kind", "profile",
                      "samples", "first_sequence", "last_sequence", "mean_us", "p50_us", "p95_us", "p99_us", "useful_GiBps",
+                     *TIMING_SUMMARY_FIELDS,
                      *host_columns, *stage_time_columns, *stage_cycle_columns, "core",
                      "error_type", "error_message", *summary_core_columns], summary),
-        ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps"], e2e_rows),
+        ("e2e", ["sample_index", "profile", "e2e_us", "useful_GiBps", *TIMING_FIELDS], e2e_rows),
         ("profile_host", ["sample_index", "profile", "sequence", "call_e2e_us", *host_columns], host_rows),
         ("profile_core", ["sample_index", "profile", "sequence", "core", *core_columns], core_rows),
     )
@@ -482,7 +525,9 @@ def token_pattern(torch, token_ids, token_bytes: int):
     return ((x * 37 + y * 13 + (y >> 3) + (x >> 8) * (y % 7)) % 251).to(torch.uint8)
 
 
-def run(execution: str, results: dict) -> int:
+def run(execution: str, results: dict, active_requests: int, *,
+        comparison_id: str = "", compare_round: int | None = None,
+        compare_position: int | None = None) -> int:
     graph_mode = execution == "graph"
     os.environ["KVAF_AIV_GATHER_GRAPH"] = str(int(graph_mode))
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
@@ -529,7 +574,7 @@ def run(execution: str, results: dict) -> int:
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     block_bytes = TOKEN_BYTES * TOKENS_PER_BLOCK
-    payload_bytes = REQUEST_COUNT * TOKEN_BYTES
+    payload_bytes = active_requests * TOKEN_BYTES
     runtime = kvaf.NpuRuntime(
         kernel, TOKEN_BYTES, TOKENS_PER_BLOCK,
         device_id=device_id, npu_core_count=cores,
@@ -539,20 +584,24 @@ def run(execution: str, results: dict) -> int:
         batch_get_max_inflight_total=0,
         trusted_gather_inputs=(os.environ.get("KVAF_GATHER_TRUSTED_INPUTS", "1") or "1") == "1",
     )
-    metadata = csv_metadata(cores, device_id, kernel, put_kernel)
+    metadata = csv_metadata(cores, device_id, kernel, put_kernel, active_requests)
     metadata.update(execution=execution, profile_samples=profile_samples,
+                    comparison_id=comparison_id, compare_round=compare_round,
+                    compare_position=compare_position,
                     run_directory=f"{metadata['run_directory']}-{execution}",
                     timing_contract=("graph_replay_to_stream_completion" if graph_mode
                                      else "async_call_to_stream_completion"))
     layout = metadata["output_layout"]
-    samples_us, snapshots, profile_calls_us = [], [], []
+    samples: list[PerfSample] = []
+    snapshots, profile_calls_us = [], []
     stream = torch.npu.Stream(device=device_id)
     graph = None
     try:
         runtime.link_to(endpoint)
         print(
             f"GATHER_PERF_CONFIG mode=gather_read execution={execution} cores={cores} token_bytes={TOKEN_BYTES} "
-            f"requests={REQUEST_COUNT} payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
+            f"requests={REQUEST_COUNT} miss_count={active_requests} "
+            f"payload_bytes={payload_bytes} table_capacity={TABLE_CAPACITY} "
             f"tokens_per_block={TOKENS_PER_BLOCK} sgl={GATHER_SGL_SIZE} seed={SEED} output_layout={layout} "
             f"populate_chunk_entries={POPULATE_CHUNK_ENTRIES} "
             f"coalesce_sges={metadata['coalesce_sges']} "
@@ -606,11 +655,12 @@ def run(execution: str, results: dict) -> int:
         slots_cpu = torch.randint(TOKENS_PER_BLOCK, (REQUEST_COUNT,), generator=generator, dtype=torch.int32)
         rows_cpu = torch.tensor(make_output_rows(
             REQUEST_COUNT, cores, GATHER_SGL_SIZE, layout,
-            lambda count: torch.randperm(count, generator=generator).tolist()), dtype=torch.int32)
+            lambda count: torch.randperm(count, generator=generator).tolist(),
+            miss_count=active_requests), dtype=torch.int32)
         indices = indices_cpu.to(device)
         offsets = (slots_cpu * TOKEN_BYTES).to(device)
         rows = rows_cpu.to(device)
-        miss_count = torch.tensor([REQUEST_COUNT], dtype=torch.int32, device=device)
+        miss_count = torch.tensor([active_requests], dtype=torch.int32, device=device)
         output = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8, device=device)
         torch.npu.synchronize()
 
@@ -618,12 +668,9 @@ def run(execution: str, results: dict) -> int:
             runtime.batch_get(view, indices, offsets, miss_count, rows, output,
                               stream=stream, synchronize=checked)
 
-        def submit_and_wait() -> None:
-            if graph_mode:
-                graph.replay(stream)
-            else:
-                submit()
-            stream.synchronize()
+        enqueue = (lambda: graph.replay(stream)) if graph_mode else submit
+        synchronize = stream.synchronize
+        check_status = runtime.check_gather_graph_replay if graph_mode else None
 
         # Check all payload bytes and the two untouched guard rows outside timing.
         profile_preflight = not graph_mode and (coalesce or configured_first_chunk_divisor())
@@ -638,8 +685,8 @@ def run(execution: str, results: dict) -> int:
             check_first_chunk_profile(preflight_profile)
         expected = torch.full((REQUEST_COUNT + 2, TOKEN_BYTES), 0xAD, dtype=torch.uint8)
         source_ids = indices_cpu.to(torch.int64) * TOKENS_PER_BLOCK + slots_cpu
-        for start in range(0, REQUEST_COUNT, 128):
-            end = min(start + 128, REQUEST_COUNT)
+        for start in range(0, active_requests, 128):
+            end = min(start + 128, active_requests)
             expected[rows_cpu[start:end].long()] = token_pattern(torch, source_ids[start:end], TOKEN_BYTES)
         if not torch.equal(output.cpu(), expected):
             raise AssertionError("gather correctness preflight payload/guard mismatch")
@@ -651,32 +698,31 @@ def run(execution: str, results: dict) -> int:
                     output.fill_(0xAD)
                 stream.synchronize()
                 print(f"GATHER_PERF_GRAPH_PREFLIGHT_BEGIN replay={replay}", flush=True)
-                submit_and_wait()
-                runtime.check_gather_graph_replay()
+                enqueue()
+                synchronize()
+                check_status()
                 if not torch.equal(output.cpu(), expected):
                     raise AssertionError(f"gather graph replay {replay} payload/guard mismatch")
         print(f"GATHER_PERF_CORRECTNESS_PASS execution={execution}", flush=True)
 
         for _ in range(WARMUP):
-            submit_and_wait()
-            if graph_mode:
-                runtime.check_gather_graph_replay()
+            enqueue()
+            synchronize()
+            if check_status is not None:
+                check_status()
         for _ in range(ITERATIONS):
-            begin = time.perf_counter_ns()
-            submit_and_wait()
-            elapsed = (time.perf_counter_ns() - begin) / 1000
-            if graph_mode:
-                runtime.check_gather_graph_replay()
-            samples_us.append(elapsed)
-        if samples_us:
-            result = latency_summary(samples_us, payload_bytes)
+            samples.append(measure_sample(enqueue, synchronize, check_status))
+        if samples:
+            result = sample_summary(samples, payload_bytes)
             results[execution] = result
+            timing_fields = " ".join(f"{field}={result[field]:.3f}" for field in TIMING_SUMMARY_FIELDS
+                                     if field in result)
             print(
                 f"GATHER_PERF_RESULT execution={execution} timing={metadata['timing_contract']} "
                 f"profile=off cpu_profile=external samples={ITERATIONS} warmup_excluded={WARMUP} "
                 f"mean_us={result['mean_us']:.3f} p50_us={result['p50_us']:.3f} "
                 f"p95_us={result['p95_us']:.3f} p99_us={result['p99_us']:.3f} "
-                f"useful_GiBps={result['useful_GiBps']:.3f} bandwidth_basis=p50_us",
+                f"useful_GiBps={result['useful_GiBps']:.3f} bandwidth_basis=p50_us {timing_fields}",
                 flush=True,
             )
         else:
@@ -692,7 +738,7 @@ def run(execution: str, results: dict) -> int:
                 snapshots.append(dict(runtime.gather_batch_get_profile()))
                 profile_calls_us.append(elapsed)
             runtime.stop_gather_batch_get_profile()
-            print_profiles(snapshots, cores)
+            print_profiles(snapshots, cores, active_requests)
         return 0
     finally:
         # CSV I/O is outside both timed groups. Preserve successful baseline or
@@ -700,7 +746,7 @@ def run(execution: str, results: dict) -> int:
         # device exception if export or shutdown fails as well.
         original = sys.exc_info()[1]
         try:
-            paths = export_csv_results(CSV_OUTPUT_DIR, metadata, samples_us, snapshots,
+            paths = export_csv_results(CSV_OUTPUT_DIR, metadata, samples, snapshots,
                                        profile_calls_us, original)
             for path in paths:
                 print(f"GATHER_CSV_FILE path={path}", flush=True)
@@ -721,22 +767,50 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execution", choices=("eager", "graph", "compare"), default="eager",
                         help="compare runs eager and graph with the same Gather configuration")
-    execution = parser.parse_args(argv).execution
-    if execution != "eager" and not ITERATIONS:
+    parser.add_argument("--miss-count", type=int, default=REQUEST_COUNT,
+                        help="active requests per batch (tensor capacity stays at REQUEST_COUNT)")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="comparison pairs to run, alternating which mode starts")
+    args = parser.parse_args(argv)
+    if not 0 <= args.miss_count <= REQUEST_COUNT:
+        parser.error(f"--miss-count must be in 0..{REQUEST_COUNT}")
+    if args.rounds < 1 or (args.rounds != 1 and args.execution != "compare"):
+        parser.error("--rounds must be positive and requires --execution compare for multiple rounds")
+    if args.execution != "eager" and not ITERATIONS:
         parser.error("graph performance requires ITERATIONS > 0")
-    results = {}
-    if execution != "compare":
-        return run(execution, results)
-    for mode in ("eager", "graph"):
-        status = run(mode, results)
-        if status:
-            return status
-    eager, graph = results["eager"], results["graph"]
-    print(f"GATHER_PERF_COMPARE eager_p50_us={eager['p50_us']:.3f} graph_p50_us={graph['p50_us']:.3f} "
-          f"eager_p95_us={eager['p95_us']:.3f} graph_p95_us={graph['p95_us']:.3f} "
-          f"eager_p99_us={eager['p99_us']:.3f} graph_p99_us={graph['p99_us']:.3f} "
-          f"eager_useful_GiBps={eager['useful_GiBps']:.3f} graph_useful_GiBps={graph['useful_GiBps']:.3f} "
-          f"p50_speedup={eager['p50_us'] / graph['p50_us']:.3f}", flush=True)
+    if args.execution != "compare":
+        return run(args.execution, {}, args.miss_count)
+
+    comparison_id = uuid.uuid4().hex[:12]
+    e2e_deltas, submit_deltas = [], []
+    for round_index in range(1, args.rounds + 1):
+        results = {}
+        order = ("eager", "graph") if round_index % 2 else ("graph", "eager")
+        for position, mode in enumerate(order, 1):
+            status = run(mode, results, args.miss_count, comparison_id=comparison_id,
+                         compare_round=round_index, compare_position=position)
+            if status:
+                return status
+        eager, graph = results["eager"], results["graph"]
+        e2e_deltas.append(eager["p50_us"] - graph["p50_us"])
+        submit_deltas.append(eager["submit_p50_us"] - graph["submit_p50_us"])
+        print(f"GATHER_PERF_COMPARE comparison_id={comparison_id} round={round_index} "
+              f"order={','.join(order)} miss_count={args.miss_count} "
+              f"eager_p50_us={eager['p50_us']:.3f} graph_p50_us={graph['p50_us']:.3f} "
+              f"eager_p95_us={eager['p95_us']:.3f} graph_p95_us={graph['p95_us']:.3f} "
+              f"eager_p99_us={eager['p99_us']:.3f} graph_p99_us={graph['p99_us']:.3f} "
+              f"eager_useful_GiBps={eager['useful_GiBps']:.3f} graph_useful_GiBps={graph['useful_GiBps']:.3f} "
+              f"p50_speedup={eager['p50_us'] / graph['p50_us']:.3f} "
+              f"p50_saved_us={e2e_deltas[-1]:.3f} submit_p50_saved_us={submit_deltas[-1]:.3f} "
+              f"eager_submit_p50_us={eager['submit_p50_us']:.3f} graph_submit_p50_us={graph['submit_p50_us']:.3f} "
+              f"graph_status_check_p50_us={graph['status_check_p50_us']:.3f} "
+              f"graph_checked_e2e_p50_us={graph['checked_e2e_p50_us']:.3f}", flush=True)
+    if args.rounds > 1:
+        print(f"GATHER_PERF_COMPARE_ROUNDS comparison_id={comparison_id} rounds={args.rounds} "
+              f"miss_count={args.miss_count} graph_faster_rounds={sum(delta > 0 for delta in e2e_deltas)} "
+              f"median_p50_saved_us={statistics.median(e2e_deltas):.3f} "
+              f"min_p50_saved_us={min(e2e_deltas):.3f} max_p50_saved_us={max(e2e_deltas):.3f} "
+              f"median_submit_p50_saved_us={statistics.median(submit_deltas):.3f}", flush=True)
     return 0
 
 
