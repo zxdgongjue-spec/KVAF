@@ -38,7 +38,7 @@ class Transport {
   struct Profile {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
-    std::uint64_t first_post_ns{}, last_cqe_ns{};
+    std::uint64_t first_post_ns{}, last_post_return_ns{}, last_cqe_ns{};
     std::uint64_t gather_prepare_ns{}, gather_copy_ns{}, suffix_wait_ns{};
     std::uint64_t gather_join_wait_ns{}, slowest_elapsed_ns{}, slowest_start_delay_ns{};
     std::uint64_t slowest_ready_delay_ns{};

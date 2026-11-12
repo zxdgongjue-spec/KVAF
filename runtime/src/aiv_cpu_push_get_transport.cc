@@ -678,6 +678,9 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   }
   auto status = PrepareWrites(count);
   if (!status.ok()) return status;
+  // Gather plans already point into the registered staging buffer. Only
+  // Ready markers need a refresh when the AIV consumes per-shard progress.
+  const bool refresh_for_post = !gather_ || !(request().reserved & kBatchDoneOnly);
   const auto wait_suffix = [&]() {
     BatchGetProfileScope timer(profile && gather_ ? &profile->suffix_wait_ns : nullptr);
     return WaitSuffix(stop);
@@ -697,11 +700,12 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       }
     }
     std::uint64_t first_post = 0;
-    status = PostPrepared(plan, true, profile ? &first_post : nullptr);
+    status = PostPrepared(plan, refresh_for_post, profile ? &first_post : nullptr);
     if (!status.ok()) return status;
     if (profile) {
       if (!profile->first_post_ns) profile->first_post_ns = first_post;
-      profile->post_ns += BatchGetProfileNowNs() - first_post;
+      profile->last_post_return_ns = BatchGetProfileNowNs();
+      profile->post_ns += profile->last_post_return_ns - first_post;
     }
     return Status::OK();
   };
@@ -846,9 +850,15 @@ void Transport::FlushGatherProfiles() {
   for (const auto& sample : gather_profile_samples_) {
     const auto& p = sample.profile;
     const auto& slow = p.slowest_thread;
+    const auto post_window_ns = p.first_post_ns ? p.last_post_return_ns - p.first_post_ns : 0U;
+    const auto post_tail_ns = p.last_post_return_ns && p.last_cqe_ns >= p.last_post_return_ns
+        ? p.last_cqe_ns - p.last_post_return_ns : 0U;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u gather_pipeline=%u interleaved=%u shard_pipeline=%u waves=%u ready_wrs=%u"
+        " pipeline=%u gather_pipeline=%u interleaved=%u shard_pipeline=%u waves=%u"
+        " data_wrs=%u ready_wrs=%u post_calls=%u tail_cqes=%u"
+        " write_ns=%" PRIu64 " post_window_ns=%" PRIu64 " post_tail_ns=%" PRIu64
+        " post_ns=%" PRIu64 " cq_wait_ns=%" PRIu64
         " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
         " suffix_wait_ns=%" PRIu64
         " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
@@ -858,7 +868,8 @@ void Transport::FlushGatherProfiles() {
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
         unsigned(sample.pipeline), unsigned(sample.gather_pipeline), unsigned(sample.interleaved),
-        unsigned(sample.shard_pipeline), p.waves, p.ready_wrs, p.cpu_threads,
+        unsigned(sample.shard_pipeline), p.waves, p.data_wrs, p.ready_wrs, p.post_calls, p.tail_cqes,
+        p.write_ns, post_window_ns, post_tail_ns, p.post_ns, p.cq_wait_ns, p.cpu_threads,
         p.gather_prepare_ns, p.gather_copy_ns,
         p.suffix_wait_ns,
         p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,

@@ -200,6 +200,9 @@ cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批�
 分片跨越首段边界或内部边界未按 cache line 对齐时，CPU 回退到按连续行分波。
 CPU profile 的 `pipeline` 表示 AIV 模式，`gather_pipeline` 表示 CPU 是否实际分波，
 `interleaved` 表示是否采用交错顺序，`ready_wrs` 记录逐分片 Ready WRITE 数。
+同一条记录也输出 payload WR 数、提交次数和回收的 tail CQE 数。用 `post_window_ns`
+（首条提交前到最后一次提交返回）和 `post_tail_ns`（最后一次提交返回到完成回收）
+拆解 `cpu_comm_us`。分波时提交窗口包含供数间隔。
 
 在交错模式上加 `KVAF_CPU_GATHER_SHARD_PIPELINE=1` 可测试分片提交。首段仍提前发送，
 后缀中每条 Jetty 可以在自身分片的 CPU 拷贝完成后独立提交，沿用同一 Jetty 上的
