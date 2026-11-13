@@ -16,6 +16,12 @@ Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPE
 Gather 使用 `pipeline_chunk_bytes=0`，以最终 ACK 为完成条件。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
+在 `pipeline=1` 下，设置 `KVAF_SCATTER_JETTY_CURSORS=1` 或为性能脚本传入
+`--jetty-cursors 1`，可让每核在所覆盖的 worker 范围内按 Jetty 独立推进消费。
+默认值 `0` 按 chunk 消费。同一 chunk 内相邻且已就绪的分片仍可合并搬运。
+两组可直接对比端到端耗时和 AIV 墙钟。profiled CSV 中的 `aiv_cross_chunk_shards`
+统计本批跨过尚未消费的早期 chunk 提交的分片数。
+
 ### Scatter 的 CPU Gather 回推
 
 启动 NPU 进程时设置 `KVAF_SCATTER_CPU_GATHER=1`，并使用

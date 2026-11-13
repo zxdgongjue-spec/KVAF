@@ -19,7 +19,8 @@ struct alignas(64) ScatterBatchGetCoreProfile {
   // DMA-busy counter. The start/finish span includes inter-shard waits.
   std::uint64_t scatter_cycles{}, ready_wait_cycles{};
   std::uint64_t scatter_start_cycle{}, scatter_finish_cycle{}, scatter_chunks{}, pipeline{};
-  std::uint64_t reserved[2]{};
+  // Shards submitted while an earlier chunk still has unconsumed shards.
+  std::uint64_t cross_chunk_shards{}, reserved{};
 };
 static_assert(sizeof(ScatterBatchGetCoreProfile) == 192);
 }  // namespace kvaf

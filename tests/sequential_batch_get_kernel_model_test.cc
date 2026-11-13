@@ -120,6 +120,7 @@ struct Fixture {
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
   bool hold_done_until_scatter{}, copied_before_done{};
+  bool jetty_lookahead{}, copied_across_chunk{};
   struct PushPart { uint32_t worker, chunk; kvaf::cpu_push::Range range; };
   std::vector<PushPart> push_parts;
   struct HeadPart { uint32_t worker, chunk, queue; kvaf::cpu_push::Range range; bool suffix, ready; };
@@ -127,6 +128,7 @@ struct Fixture {
   bool head_started_early{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
+  uint32_t lookahead_polls{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   std::mutex poll_mutex;
 
@@ -263,14 +265,25 @@ struct Fixture {
             push_parts.push_back({worker, chunk, range});
           });
       if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
-        const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
-        const auto q = push_step % kvaf::cpu_push::kJettyCount;
+        constexpr auto jetty_count = kvaf::cpu_push::kJettyCount;
+        auto step = push_step;
+        if (jetty_lookahead && step == jetty_count - 1) {
+          // Jetty 0 delivers chunk 1 before Jetty 3 delivers chunk 0.
+          step = jetty_count;
+        } else if (jetty_lookahead && step == jetty_count) {
+          copied_across_chunk = payload_read[kvaf::cpu_push::kChunkRows];
+          if (!copied_across_chunk && ++lookahead_polls < 8) return;
+          step = jetty_count - 1;
+        }
+        const auto& part = push_parts[step / jetty_count];
+        const auto q = step % jetty_count;
         const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
         for (auto row = shard.begin; row < shard.end; ++row)
           std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
                       reinterpret_cast<void*>(src[row]), token);
-        aiv_model::AtomicStoreWord(args.workspace + 192 + part.worker * 64 + q * 8,
-                                   kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
+        if (shard.begin < shard.end)
+          aiv_model::AtomicStoreWord(args.workspace + 192 + part.worker * 64 + q * 8,
+                                     kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
         ++push_step;
         return; // Delay other queues/chunks and final done until later polls.
       }
@@ -304,6 +317,7 @@ struct Fixture {
           if (i >= shard.begin && i < shard.end) assert(ready);
         }
       }
+      if (jetty_lookahead) assert(!payload_read[i]);
       if (!payload_read[i]) { payload_read[i] = true; ++read_rows; }
     }
     copied_before_done |= !push_done;
@@ -479,6 +493,7 @@ struct Fixture {
     std::fill(ack_reads.begin(), ack_reads.end(), 0);
     push_done = false; push_polls = 0;
     push_parts.clear(); head_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
+    lookahead_polls = 0; copied_across_chunk = false;
     head_started_early = false;
     std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
@@ -681,7 +696,8 @@ int main() {
       assert(gather.completions && gather.data_reads);
     }
   // Exercise the benchmark's Scatter path with and without payload overlap.
-  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline}) {
+  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline,
+                            kvaf::kScatterPipeline | kvaf::kScatterJettyCursors}) {
     Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6);
     scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs | pipeline;
     scatter.args.max_polls = 1000000;
@@ -693,6 +709,17 @@ int main() {
       if (pipeline && count)
         assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == count);
     }
+  }
+  for (uint32_t cursors : {0U, kvaf::kScatterJettyCursors}) {
+    // Three chunks with a one-row tail. Keep the full mailbox path so the
+    // producer can deliberately deliver a later chunk ahead of a lagging Jetty.
+    Fixture scatter(2 * kvaf::cpu_push::kChunkRows + 1, 656, 1, KVAF_SEQ_SCATTER, 6);
+    scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline | cursors;
+    scatter.args.max_polls = 1000;
+    scatter.jetty_lookahead = scatter.hold_done_until_scatter = true;
+    scatter.Run();
+    assert(scatter.copied_across_chunk == (cursors != 0));
+    assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == scatter.count);
   }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,

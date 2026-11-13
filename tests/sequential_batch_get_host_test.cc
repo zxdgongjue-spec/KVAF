@@ -219,6 +219,7 @@ bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint
 int main() {
   using namespace kvaf;
   unsetenv("KVAF_SCATTER_PIPELINE");
+  unsetenv("KVAF_SCATTER_JETTY_CURSORS");
   unsetenv("KVAF_SCATTER_CPU_GATHER");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
@@ -318,9 +319,11 @@ int main() {
   }
   {
     setenv("KVAF_SCATTER_CPU_GATHER", "1", 1);
+    setenv("KVAF_SCATTER_JETTY_CURSORS", "1", 1);
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
     assert(opened_cpu_gather);
     unsetenv("KVAF_SCATTER_CPU_GATHER");
+    unsetenv("KVAF_SCATTER_JETTY_CURSORS");
     const auto before = launches;
     const auto memsets_before = async_memsets;
     exec.execution.synchronize = false;
@@ -329,7 +332,7 @@ int main() {
     exec.execution.synchronize = true;
     assert(owner->Execute(exec).ok()); assert(completed == before + 3);
     assert(async_memsets == memsets_before); // No extra device task per call.
-    assert(launch_options.back() == (kScatterOptionsV1 | kScatterPipeline));
+    assert(launch_options.back() == (kScatterOptionsV1 | kScatterPipeline | kScatterJettyCursors));
     capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
     count = 0; assert(owner->Execute(exec).ok()); count = 1;
     assert(owner->Shutdown().ok()); assert(owner->Shutdown().ok());

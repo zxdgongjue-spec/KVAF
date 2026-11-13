@@ -19,8 +19,10 @@ constexpr uint32_t kScatterProfiling = 4U;
 // Host's existing trusted-input contract also applies to device list contents.
 constexpr uint32_t kScatterTrustedInputs = 8U;
 constexpr uint32_t kScatterPipeline = 32U;
+constexpr uint32_t kScatterJettyCursors = 64U;
 constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
-constexpr uint32_t kScatterOptionsMask = kScatterProfiling | kScatterTrustedInputs | kScatterPipeline;
+constexpr uint32_t kScatterOptionsMask =
+    kScatterProfiling | kScatterTrustedInputs | kScatterPipeline | kScatterJettyCursors;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
       (value & ~kScatterOptionsMask) == kScatterOptionsV1;

@@ -558,6 +558,7 @@ class NpuPythonRuntime final {
       item["scatter_start_cycle"] = profile.scatter_start_cycle;
       item["scatter_finish_cycle"] = profile.scatter_finish_cycle;
       item["scatter_chunks"] = profile.scatter_chunks;
+      item["cross_chunk_shards"] = profile.cross_chunk_shards;
       if (!core && host_profile_enabled_ && host_profile_ready_) {
         py::dict host;
         for (std::size_t phase = 0; phase < scatter_host::kCount; ++phase)

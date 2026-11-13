@@ -23,7 +23,7 @@ import test_npu_batch_get_perf as reference
 from aiv_batch_get_test_common import shutdown_runtime
 from dsa_keys import build_dsa_keys
 from scatter_perf_common import PAYLOAD_TIMINGS, SCATTER_CHUNK_ROWS, profile_metrics, sample_metrics
-from test_aiv_scatter_perf import write_results
+from test_aiv_scatter_perf import resolve_jetty_cursors, write_results
 
 TOKEN_SIZES = (128, 256, 512, 656, 1024, 2048, 4096)
 MISS_COUNTS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
@@ -75,6 +75,8 @@ def arguments(argv=None):
                         help="whole-case seconds, including DDR allocation/registration, full-table population and measurement")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
+    parser.add_argument("--jetty-cursors", type=int, choices=(0, 1),
+                        help="consume ready shards independently per Jetty (default: 0)")
     parser.add_argument("--fixed-request-plan", action="store_true",
                         help="reuse one request plan for warmup and measurement")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
@@ -92,6 +94,7 @@ def arguments(argv=None):
         if value not in ("0", "1"):
             parser.error("KVAF_SCATTER_PIPELINE must be 0 or 1")
         args.pipeline = int(value)
+    resolve_jetty_cursors(parser, args)
     if args.host_profile is None:
         args.host_profile = False  # Reference sweep enables device profiling, not Host RAII clocks.
     if args.single and any((args.token_sizes, args.miss_counts, args.core_counts)):
@@ -287,6 +290,7 @@ def run_case(args):
     block_bytes = args.tokens_per_block * args.token_bytes
     payload = args.miss_count * args.token_bytes
     os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
+    os.environ["KVAF_SCATTER_JETTY_CURSORS"] = str(args.jetty_cursors)
     os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
     runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
         device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
@@ -303,7 +307,8 @@ def run_case(args):
         scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar",
         transport=("CPU_SGL_WRITE_overlapped_AIV_scatter" if args.pipeline else "CPU_SGL_WRITE_then_AIV_scatter"),
         pipeline_chunk_rows=SCATTER_CHUNK_ROWS,
-        pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
+        pipeline_consumer=("independent_jetty_cursors" if args.jetty_cursors else
+                           "jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
         cpu_jettys=CPU_JETTYS, host_jettys_per_core_scope="setup_and_BatchPut",
         queue_matched_direct_jettys_per_core=(CPU_JETTYS // args.aiv_cores
                                              if CPU_JETTYS % args.aiv_cores == 0 else None),
@@ -484,7 +489,7 @@ def case_command(args):
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
                  "aiv_cores", "jettys_per_core", "warmup", "iterations", "populate_chunk_entries",
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
-                 "max_inflight_total", "pipeline", "case_timeout"):
+                 "max_inflight_total", "pipeline", "jetty_cursors", "case_timeout"):
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
     command.append("--kernel-profile" if args.kernel_profile else "--no-kernel-profile")
     command.append("--host-profile" if args.host_profile else "--no-host-profile")
@@ -556,7 +561,7 @@ def main(argv=None, runner=None):
         expected = {key: getattr(case, key) for key in (
             "request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
             "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
-            "sort_input_indices", "pipeline", "fixed_request_plan")}
+            "sort_input_indices", "pipeline", "jetty_cursors", "fixed_request_plan")}
         expected.update(SUBMISSION_CONFIG)
         for key, value in expected.items():
             if report["config"].get(key) != value:

@@ -29,7 +29,18 @@ CSV_COLUMNS = (
     "aiv_scatter_tail_us", "aiv_ready_wait_us", "call_outside_aiv_us",
     "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
     "host_stream_sync_us", "host_python_dispatch_us",
+    "jetty_cursors", "aiv_cross_chunk_shards",
 )
+
+
+def resolve_jetty_cursors(parser, args):
+    if args.jetty_cursors is None:
+        value = os.environ.get("KVAF_SCATTER_JETTY_CURSORS", "0")
+        if value not in ("0", "1"):
+            parser.error("KVAF_SCATTER_JETTY_CURSORS must be 0 or 1")
+        args.jetty_cursors = int(value)
+    if args.jetty_cursors and not args.pipeline:
+        parser.error("--jetty-cursors 1 requires --pipeline 1")
 
 
 def arguments(argv=None):
@@ -45,6 +56,8 @@ def arguments(argv=None):
     parser.add_argument("--cores", type=int, default=1)
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter with chunk Ready (default: 1)")
+    parser.add_argument("--jetty-cursors", type=int, choices=(0, 1),
+                        help="consume ready shards independently per Jetty (default: 0)")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
@@ -73,6 +86,7 @@ def arguments(argv=None):
         if value not in ("0", "1"):
             parser.error("KVAF_SCATTER_PIPELINE must be 0 or 1")
         args.pipeline = int(value)
+    resolve_jetty_cursors(parser, args)
     for field, lo, hi in (("token_bytes", 1, 65535), ("cores", 1, 8),
                           ("blocks", 1, 65536), ("tokens_per_block", 1, 65536), ("plans", 1, 64)):
         if not lo <= getattr(args, field) <= hi:
@@ -175,7 +189,7 @@ def write_results(args, report):
             writer.writeheader()
             for phase, samples in report["samples"].items():
                 for sample in samples:
-                    values = dict(phase=phase, cores=args.cores,
+                    values = dict(phase=phase, cores=args.cores, jetty_cursors=args.jetty_cursors,
                                   request_length=args.request_length,
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
                                   **sample_metrics(sample))
@@ -219,7 +233,8 @@ def main(argv=None):
                   scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar")
     config.update(device_id=device_id, mode="cpu_push_scatter",
                   pipeline_chunk_rows=SCATTER_CHUNK_ROWS,
-                  pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
+                  pipeline_consumer=("independent_jetty_cursors" if args.jetty_cursors else
+                                     "jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
                   units="decimal GB/s; sample durations ns/us; summary durations ms",
                   cpu_service=os.environ.get("KVAF_CPU_SERVICE_ADDR"),
                   npu_eids=os.environ.get("KVAF_NPU_EIDS"),
@@ -271,6 +286,7 @@ def main(argv=None):
         # CLI overrides the environment. Host snapshots these during initialize;
         # baseline/profiled phases then use the same algorithms and binary.
         os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
+        os.environ["KVAF_SCATTER_JETTY_CURSORS"] = str(args.jetty_cursors)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
