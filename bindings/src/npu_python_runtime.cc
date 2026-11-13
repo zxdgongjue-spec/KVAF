@@ -905,7 +905,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("drain_get", &NpuPythonRuntime::DrainGet)
       .def("begin_put_input", &NpuPythonRuntime::BeginPutInput, py::arg("execution"),
            py::arg("input"), py::arg("request_capacity"), py::arg("stream") = py::none(),
-           "Bind URMA AIV input for repeated synchronous Puts. Keep its storage and stream "
+           "Bind URMA AIV or AICPU input for repeated synchronous Puts. Keep its storage and stream "
            "alive and do not resize or replace storage until end_put_input succeeds.")
       .def("end_put_input", &NpuPythonRuntime::EndPutInput, py::arg("lease"),
            "Release reusable Put input registration after its transaction completes; failure retains owners.")

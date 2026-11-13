@@ -758,15 +758,21 @@ UBMEM 不支持 `--executor aicpu`。两种执行模式都使用当前分支的�
 两种模式都不额外在每个样本后追加一次设备同步。初始化、输入构造、预热、正确性检查、
 `batch_free()` 和最终 shutdown 位于计时区间外；每次重新 Put 之前先在区间外释放同一组 key。
 
-输入 Tensor 在整轮测量中保持不变并重复使用。URMA AIV 的 per-call 默认在测量前调用
+输入 Tensor 在整轮测量中保持不变并重复使用。URMA AIV 和 URMA AICPU 的 per-call 默认在测量前调用
 `begin_put_input()`，预检、预热和正式样本使用同一个 `input_lease`，测后调用
 `end_put_input()`。输入注册、workspace 和执行上下文跨调用复用，绑定和解绑单独计时，
-均不计入稳态 `batch_put()` 样本。其他 Put 路径不需要这个输入绑定。
+均不计入稳态 `batch_put()` 样本。UBMEM 没有本地输入 MR 注册，不需要这个输入绑定。
 
 日志中 `input_binding` 为 `legacy`、`reused`、`not-needed` 或 `transient`。
 需要对照每次调用注册/注销的普通路径时，设置 `KVAF_PERF_REUSE_PUT_INPUT=0`；
-此时 URMA AIV per-call 标记为 `transient`，调用内的注册/注销仍包含在样本耗时内。
+此时 URMA AIV/AICPU per-call 标记为 `transient`，调用内的注册/注销仍包含在样本耗时内。
 两个模式的请求、源数据和设备完成语义保持一致，不应将单次绑定成本当成每次 Put 的成本。
+
+legacy 的两条 URMA Put 都跨调用缓存输入注册，关闭 transport/session 时注销；
+AICPU legacy 已恢复 main 的这一行为，不再在每次 `AcknowledgePut` 时注销输入。
+因此不能把修复前 legacy 的逐次注册/注销结果当作现在的基线，应使用同一构建重新比较。
+`binding_setup_us` 包含首次绑定可能触发的 provider、通信和 workspace 初始化，
+不只是 MR 注册耗时；legacy 的此字段为零也不表示它没有初始化成本。
 
 Put 的 `rows` 是写入 block 数，不能直接等同于 Get 的 `miss_count`：
 
@@ -845,21 +851,23 @@ bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
   --report "$PWD/validation-put-perf.json"
 ```
 
-`resources` 用例还覆盖显式 Put 输入绑定：同一输入存储改变内容后多次 Put，并通过已启用的
-Get 路径逐字节读回；错输入、错 stream、超容量和过期 lease 必须在元数据提交前拒绝；
+`resources` 用例还覆盖 URMA AIV/AICPU 的显式 Put 输入绑定：同一输入存储改变内容、
+keys 顺序及 source offsets 后多次 Put，并通过已启用的 Get 路径逐字节读回；
+错输入、错 stream、超容量和过期 lease 必须在元数据提交前拒绝；
 检查 Python Tensor 在绑定期间保活、解绑和 shutdown 后释放、重新绑定和普通 Put 回归。
 可先单跑 `--modes urma --cases resources`，然后执行上面的全量验证。
 本地无 NPU 时只能检查脚本和参数路径；是否存在性能劣化以同机实测结果为准。
 
 ### 9.4 应用中复用 Put 输入
 
-当前显式输入绑定支持 `Urma + Aiv`，使用 per-call Runtime。绑定限定输入的起始地址、
+当前显式输入绑定支持 `Urma + Aiv` 和 `Urma + Aicpu`，使用 per-call Runtime。绑定限定输入的起始地址、
 总字节数、配置、stream 和最大请求数；同一次绑定中 keys、offsets、lengths 可以变化。
 上次同步 Put 完成后可以修改输入内容，但不能 resize 或替换其底层存储（包括其他别名）。
 每次调用仍进行事务准备、数据写入和完成处理，只复用输入注册及相关执行资源。
 
 ```python
 cfg = kvaf.PutExecutionConfig("urma", "aiv")
+# AICPU Put 使用 kvaf.PutExecutionConfig("urma", "aicpu")，其余调用相同。
 lease = runtime.begin_put_input(cfg, source, max_requests, stream)
 try:
     runtime.batch_put(keys, source, offsets, lengths,
@@ -910,7 +918,7 @@ done
 | `execute` | 执行调度及 provider 调用 |
 | `metadata_finalize`、`acknowledge` | 提交/中止元数据事务及完成确认 |
 | `dispatch_lock`、`dispatch_resolve` | dispatcher 锁及执行配置解析 |
-| `context`、`describe`、`acquire`、`bind` | 上下文构造、需求描述、资源获取和视图绑定 |
+| `context`、`describe`、`acquire`、`bind` | 上下文准备、需求描述、资源获取和视图绑定 |
 | `provider_prepare` | 算子准备，包括必要的输入/通信资源准备 |
 | `provider_registration` | prepare 中发生的注册子段，可检查稳态是否仍重复注册 |
 | `provider_metadata` | 本次请求的设备元数据构造/复制 |
@@ -924,3 +932,13 @@ dispatcher 子段也可能出现在 Runtime 的 `prepare/execute` 内。各段 p
 其和不保证等于 total p50。绑定/解绑成本查看 `PERF_INPUT_BINDING`；稳态 `path=input`
 应避免反复注册输入，但仍需保留完成和事务检查。最终吞吐对比关闭 trace，再运行 9.2，
 避免将计时采样开销混入结论；CSV 在 shutdown/析构时落盘，不在每次 Put 内写文件。
+
+Put 调度层在同步 Launch 期间借用本次请求及目标地址描述，不再把 keys、offsets、lengths
+和目标地址 vector 完整复制到执行上下文；恢复所需的资源租约和完成状态仍保持到事务结束。
+`context` 是整个上下文准备阶段，不能直接解释为纯 memcpy 时间。设备描述符的构造及上传
+仍位于 `provider_metadata`，legacy 和 per-call 都保留这部分算法所需的工作。
+
+复验时，两条 URMA per-call 的默认结果应显示 `input_binding=reused` 和 `path=input`，
+稳态不再反复执行 MR 注册及注销；AICPU legacy 也不应每次出现约数百微秒的注册和
+`acknowledge` 注销成本。对照 `KVAF_PERF_REUSE_PUT_INPUT=0` 的普通调用，确认复用来自
+显式绑定，并未取消临时输入的生命周期清理。调用成功、吞吐及错误恢复仍需真机验证。

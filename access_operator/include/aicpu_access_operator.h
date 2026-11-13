@@ -31,6 +31,8 @@ class UmdkAccessOperator final : public AccessOperator {
   Status DrainGet() override;
   Status PrepareGetOutput(const GetOutputOptions&) override;
   Status FinishGetOutput() override;
+  Status PreparePutInput(const PutInputOptions&) override;
+  Status FinishPutInput() override;
   Status Warmup(const ExecutionWarmup&) override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;

@@ -199,8 +199,8 @@ Status ExecutionDispatcher::BeginPutInput(PutExecutionConfig c, const PutInputOp
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   if (pending_put_ || input_id_ || failed_input_context_)
     return Status::Busy("Put input binding or unresolved execution already exists");
-  if (c.transport != Transport::Urma || c.executor != Executor::Aiv)
-    return Status::NotImplemented("input binding supports URMA AIV Put");
+  if (c.transport != Transport::Urma)
+    return Status::NotImplemented("input binding supports URMA Put");
   if (!next_input_id_) return Status::InvalidState("input lease ID exhausted");
   auto context = std::make_unique<PutExecutionContext>();
   auto s = ResolveExecution(policy_, c, &context->config);
@@ -277,19 +277,12 @@ Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) 
       PutDispatchPhase phase(timing, &PutDispatchTiming::context_ns);
       context = input_id_ ? std::move(input_context_) : std::make_unique<PutExecutionContext>();
       context->config = c;
-      context->request = *request.request;
-      context->destination = *request.put_desc;
-      context->options = request.execution;
-      context->options.config = c;
-      // Timing storage belongs to this call; recovery must never borrow it.
-      context->options.host_timing = nullptr;
-      context->options.dispatch_timing = nullptr;
     }
     if (!input_id_) {
       PutResourceRequirements requirements;
       {
         PutDispatchPhase phase(timing, &PutDispatchTiming::describe_ns);
-        s = resources_.Describe(c, context->request, &requirements);
+        s = resources_.Describe(c, *request.request, &requirements);
       }
       if (s.ok()) {
         PutDispatchPhase phase(timing, &PutDispatchTiming::acquire_ns);
@@ -317,8 +310,11 @@ Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) 
   {
     PutDispatchPhase phase(timing, &PutDispatchTiming::provider_ns);
     try {
-      auto invocation = pending_put_->invocation();
-      invocation.execution.host_timing = request.execution.host_timing;
+      // Launch consumes request metadata in this call. Recovery retains the
+      // provider state/lease, not copies of request vectors or timing pointers.
+      auto invocation = request;
+      invocation.execution.config = c;
+      invocation.execution.dispatch_timing = nullptr;
       s = pending_put_->lease.view().Launch(invocation);
     } catch (const std::exception& e) {
       s = Status::CompletionUnknown(std::string("provider Put threw after submission: ") + e.what());
@@ -357,11 +353,6 @@ Status ExecutionDispatcher::AcknowledgePut() {
   auto s = pending_put_->launched ? pending_put_->lease.view().Acknowledge() : Status::OK();
   if (s.ok()) {
     if (input_id_) {
-      pending_put_->request.keys.clear();
-      pending_put_->request.input_offsets.clear();
-      pending_put_->request.lengths.clear();
-      pending_put_->destination.entries.clear();
-      pending_put_->options = {};
       pending_put_->completion = {};
       pending_put_->launched = false;
       input_context_ = std::move(pending_put_);

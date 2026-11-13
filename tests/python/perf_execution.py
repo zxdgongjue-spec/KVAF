@@ -28,8 +28,9 @@ class BenchmarkExecution:
         self.output_lease = 0
         self.binding_setup_us = self.binding_teardown_us = 0.0
         self.input_setup_us = self.input_teardown_us = 0.0
+        reusable_input = transport == "urma" and executor in ("aiv", "aicpu")
         self.input_binding = ("legacy" if mode == "legacy"
-                              else "not-needed" if (transport, executor) != ("urma", "aiv")
+                              else "not-needed" if not reusable_input
                               else "transient" if os.environ.get("KVAF_PERF_REUSE_PUT_INPUT", "1") == "0"
                               else "reused")
         supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aicpu", "gather"))

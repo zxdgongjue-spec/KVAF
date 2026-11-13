@@ -123,6 +123,10 @@ class AccessOperator {
   }
   virtual bool TracksGetCompletion() const { return false; }
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
+  // Request vectors and destination descriptors are borrowed only until this
+  // method returns. Stage asynchronous metadata in provider-owned storage;
+  // ResolvePut/AcknowledgePut/Shutdown must not dereference these descriptions.
+  // The caller still keeps the input allocation alive until completion resolves.
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
 };

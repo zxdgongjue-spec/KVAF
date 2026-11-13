@@ -29,8 +29,11 @@ struct Counters {
   std::uint32_t requirement_padding{0}, warmed_capacity{0};
   std::atomic<bool> fail_initialize{false}, fail_close{false}, fail_drain{false};
   std::atomic<bool> fail_put{false}, fail_resolve{false}, fail_ack{false}, fail_get{false};
-  bool throw_get{false};
+  bool throw_get{false}, throw_put{false};
   std::atomic<bool> bad_order{false}, copied_metadata_ok{true};
+  bool put_request_borrowed{false}, put_state_ok{true};
+  const BatchPutRequest* expected_put_request{};
+  const PutAccessDesc* expected_put_destination{};
   std::uint32_t capacity{65536};
   std::mutex mutex;
   std::condition_variable changed;
@@ -49,8 +52,10 @@ struct Invocation final : ExecutionState {
     counters.Event("state destroyed");
   }
   Counters& counters;
-  const BatchPutRequest* put_request{};
-  const PutAccessDesc* put_destination{};
+  // A provider retains its submitted state, not the caller's request vectors.
+  std::size_t put_rows{};
+  KeyId put_key{};
+  Address put_destination{};
   const BatchGetRequest* get_request{};
   bool pending_put{}, pending_get{};
 };
@@ -149,9 +154,15 @@ class BorrowedOperation final : public AccessOperator {
     auto* state = physical_->invocation;
     if (!state) return Status::InvalidState("missing Put state");
     ++c.put_launches;
-    state->put_request = e.request;
-    state->put_destination = e.put_desc;
+    c.put_request_borrowed = e.request == c.expected_put_request &&
+                             e.put_desc == c.expected_put_destination;
+    CHECK(e.request && e.put_desc && e.request->keys.size() == 1 &&
+          e.put_desc->entries.size() == 1);
+    state->put_rows = e.request->keys.size();
+    state->put_key = e.request->keys[0];
+    state->put_destination = e.put_desc->entries[0].address;
     state->pending_put = true;
+    if (c.throw_put) throw std::runtime_error("WRITE threw after submission");
     return c.fail_put ? Status::CompletionUnknown("WRITE submitted, wait interrupted") : Status::OK();
   }
   Status ResolvePut(PutCompletion* out) override {
@@ -159,14 +170,16 @@ class BorrowedOperation final : public AccessOperator {
     auto* state = physical_->invocation;
     if (!state || !state->pending_put) return Status::InvalidState("missing original WRITE");
     ++c.resolves;
-    if (state->put_request->keys != std::vector<KeyId>{42} ||
-        state->put_destination->entries[0].address != 4096)
-      c.copied_metadata_ok = false;
+    if (state->put_rows != 1 || state->put_key != 42 || state->put_destination != 4096)
+      c.put_state_ok = false;
     if (c.fail_resolve) return Status::CompletionUnknown("original WRITE still pending");
     *out = {PutOutcome::Succeeded, Status::OK()};
     return Status::OK();
   }
   Status AcknowledgePut() override {
+    auto* state = physical_->invocation;
+    if (!state || state->put_rows != 1 || state->put_key != 42 || state->put_destination != 4096)
+      physical_->counters.put_state_ok = false;
     if (physical_->counters.fail_ack) return Status::Internal("metadata acknowledgement failed");
     physical_->invocation->pending_put = false;
     return Status::OK();
@@ -391,32 +404,44 @@ void FailedCloseMustNotReplaceLiveOwner() {
   CheckDestroyed(c);
 }
 
-void PutStateSurvivesResolutionAndAcknowledgementFailure() {
+void PutStateSurvivesResolutionAndAcknowledgementFailure(bool throw_put) {
   Counters p, g;
   ExecutionDispatcher dispatch(Policy());
   Register(dispatch, p, g);
   p.fail_put = p.fail_resolve = true;
+  p.throw_put = throw_put;
   char data[64]{};
-  BatchPutRequest request{{42}, {data, sizeof(data), DeviceKind::kCpu}, {0}, {64}};
-  PutAccessDesc destination{{{42, 4096, 64}}};
-  CHECK(dispatch.ExecuteBatchPut({&request, &destination, {}}).code() == StatusCode::kCompletionUnknown);
-  request.keys[0] = 99;
-  destination.entries[0].address = 9999;
+  {
+    BatchPutRequest request{{42}, {data, sizeof(data), DeviceKind::kCpu}, {0}, {64}};
+    PutAccessDesc destination{{{42, 4096, 64}}};
+    p.expected_put_request = &request;
+    p.expected_put_destination = &destination;
+    CHECK(dispatch.ExecuteBatchPut({&request, &destination, {}}).code() == StatusCode::kCompletionUnknown);
+    CHECK(p.put_request_borrowed); // Launch sees the originals, without dispatcher copies.
+    request.keys[0] = 99;
+    destination.entries[0].address = 9999;
+    PutCompletion unresolved;
+    CHECK(!dispatch.ResolvePut(put, &unresolved).ok() && p.put_state_ok);
+  }
+  // Request objects and their vector storage are gone; input storage remains
+  // alive until the original write is resolved and acknowledged.
+  p.expected_put_request = nullptr;
+  p.expected_put_destination = nullptr;
   CHECK(p.live_states == 1 && p.owners == 1 && p.put_launches == 1);
   CHECK(dispatch.Warmup(put).code() == StatusCode::kBusy);
   CHECK(dispatch.Warmup(get).ok());
   PutCompletion completion;
   CHECK(!dispatch.ResolvePut(put, &completion).ok());
-  CHECK(p.live_states == 1 && p.copied_metadata_ok);
+  CHECK(p.live_states == 1 && p.put_state_ok);
   p.fail_resolve = false;
   CHECK(dispatch.ResolvePut(put, &completion).ok());
   CHECK(completion.outcome == PutOutcome::Succeeded && p.put_launches == 1);
   p.fail_ack = true;
   CHECK(!dispatch.AcknowledgePut().ok());
-  CHECK(p.live_states == 1 && p.owners == 1);
+  CHECK(p.live_states == 1 && p.owners == 1 && p.put_state_ok);
   p.fail_ack = false;
   CHECK(dispatch.AcknowledgePut().ok());
-  CHECK(p.live_states == 0 && p.owners == 1 && p.state_destroys == 1);
+  CHECK(p.live_states == 0 && p.owners == 1 && p.state_destroys == 1 && p.put_state_ok);
   CHECK(dispatch.Shutdown().ok());
   CheckDestroyed(p); CheckDestroyed(g);
 }
@@ -476,7 +501,8 @@ int main() {
     CapacityFailureDoesNotPoisonResources();
     FailedInitializationRequiresExplicitRecovery();
     FailedCloseMustNotReplaceLiveOwner();
-    PutStateSurvivesResolutionAndAcknowledgementFailure();
+    PutStateSurvivesResolutionAndAcknowledgementFailure(false);
+    PutStateSurvivesResolutionAndAcknowledgementFailure(true);
     GetFailureRetainsCopiedContextThroughShutdown(false);
     GetFailureRetainsCopiedContextThroughShutdown(true);
     FailedGraphPreparationMustRetryClose();

@@ -1,3 +1,4 @@
+#include <utility>
 #include <vector>
 
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
@@ -55,6 +56,22 @@ Status BatchPutTransport::Prepare(const RemoteRegionDesc& region, const BatchPut
   if (!ready.ok()) return ready;
   ready = Reserve(static_cast<std::uint32_t>(request.keys.size()));
   if (!ready.ok()) return ready;
+  return RecordPreparation(region, request);
+}
+Status BatchPutTransport::PrepareBound(const RemoteRegionDesc& region, const BatchPutRequest& request,
+                                       const PutInputOptions& input) {
+  views_.Prepare();
+  preparation_->request = nullptr;
+  if (request.input.data != input.input.data || request.input.bytes != input.input.bytes ||
+      request.input.device != input.input.device || request.keys.empty() ||
+      request.keys.size() > input.request_capacity || request.keys.size() > kUmdkMaxTransfers ||
+      request.keys.size() != request.input_offsets.size() ||
+      request.keys.size() != request.lengths.size() ||
+      request.keys.size() * sizeof(UmdkTransfer) > capacity_)
+    return Status::InvalidArgument("request differs from prepared Put input/capacity");
+  return RecordPreparation(region, request);
+}
+Status BatchPutTransport::RecordPreparation(const RemoteRegionDesc& region, const BatchPutRequest& request) {
   views_.Initialize(region);
   views_.Bind(preparation_);
   preparation_->request = &request;
@@ -86,6 +103,9 @@ Status BatchPutTransport::LaunchPrepared(const BatchPutExecRequest& exec, const 
   auto* preparation = dynamic_cast<PutPreparation*>(state);
   auto valid = view.common.Validate(preparation, ExecutionDirection::Put);
   if (!valid.ok()) return valid;
+  // Only this synchronous Prepare/Launch pair may borrow the caller's request.
+  // Consume the marker even when validation fails; recovery never consults it.
+  const auto* prepared_request = std::exchange(preparation->request, nullptr);
   if (!exec.request || !exec.put_desc || !exec.execution.stream)
     return Status::InvalidArgument(
         "UMDK BatchPut requires initialized operator, input, destination and stream");
@@ -95,12 +115,11 @@ Status BatchPutTransport::LaunchPrepared(const BatchPutExecRequest& exec, const 
       request.keys.size() != request.lengths.size() ||
       request.keys.size() != exec.put_desc->entries.size())
     return Status::InvalidArgument("invalid BatchPut layout");
-  if (preparation->request != &request || preparation->region != view.common.region().canonical_base ||
+  if (prepared_request != &request || preparation->region != view.common.region().canonical_base ||
       preparation->input != request.input.data || preparation->bytes != request.input.bytes ||
       preparation->rows != request.keys.size() ||
       request.keys.size() * sizeof(UmdkTransfer) > view.capacity)
     return Status::InvalidState("AICPU Put resources were not prepared for this request");
-  preparation->request = nullptr;
   PutHostTimingScope metadata_timing(exec.execution.host_timing, &PutProviderTiming::metadata_ns);
   auto& transfers = (*view.host_descriptors);
   transfers.clear();

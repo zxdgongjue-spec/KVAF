@@ -203,6 +203,7 @@ int main() {
   auto swapped = request;
   auto swapped_call = call; swapped_call.request = &swapped;
   CHECK(!UrmaAicpuPutOperator::Launch(swapped_call, resources->PutView(), *invocation_state).ok());
+  CHECK(resources->PreparePutResources(call).ok()); // A rejected launch consumed the borrowed marker.
   // Concrete views reject foreign invocation identities before any submission.
   CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(),
         *static_cast<AicpuInvocation*>(foreign_state.get())).ok());
@@ -258,6 +259,100 @@ int main() {
   // A stale view from a closed owner cannot launch a prepared transfer.
   AicpuInvocation closed_call(resources);
   CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(), closed_call).ok());
+
+  // An explicit Put binding owns its registration and workspace across calls.
+  {
+    UmdkAccessOperator bound(provider);
+    auto bound_owner = bound.TakeResources();
+    CHECK(bound_owner->Initialize(region).ok());
+    auto bound_state = bound.CreateExecutionState();
+    CHECK(bound.BindExecutionState(bound_state.get()).ok());
+    auto* bound_resources = dynamic_cast<AicpuExecutionResources*>(bound_owner.get());
+    CHECK(bound_resources);
+    PutInputOptions binding{request.input, call.execution.stream, 3};
+    const auto regs = registrations, all_unregs = unregisters, single_unregs = single_unregisters;
+    CHECK(bound.PreparePutInput(binding).ok());
+    CHECK(registrations == regs + 1);
+    CHECK(!bound.PreparePutInput(binding).ok());
+    CHECK(bound.BindExecutionState(nullptr).code() == StatusCode::kBusy);
+    const auto bound_allocations = allocations;
+    for (int i = 0; i < 3; ++i) {
+      request.input_offsets[0] = i; // The buffer is fixed, batch metadata may change.
+      PutProviderTiming timing;
+      call.execution.host_timing = &timing;
+      CHECK(bound.ExecuteBatchPut(call).ok());
+      call.execution.host_timing = nullptr;
+      CHECK(submitted[0].local == reinterpret_cast<uint64_t>(input) + i);
+      CHECK(bound.FinishPutInput().code() == StatusCode::kBusy); // Await transaction ACK.
+      CHECK(bound.AcknowledgePut().ok());
+      CHECK(registrations == regs + 1 && allocations == bound_allocations);
+      CHECK(unregisters == all_unregs && single_unregisters == single_unregs);
+      CHECK(timing.registration_ns == 0 && timing.cleanup_ns == 0);
+    }
+    request.input_offsets[0] = 0;
+    auto invalid_request = request;
+    auto invalid_call = call; invalid_call.request = &invalid_request;
+    const auto before_rejections = writes;
+    invalid_request.input.data = input + 1;
+    CHECK(!bound.ExecuteBatchPut(invalid_call).ok());
+    invalid_request.input = request.input; invalid_request.input.bytes--;
+    CHECK(!bound.ExecuteBatchPut(invalid_call).ok());
+    invalid_request.input = request.input; invalid_request.input.device = DeviceKind::kCpu;
+    CHECK(!bound.ExecuteBatchPut(invalid_call).ok());
+    invalid_request = request;
+    invalid_call.execution.stream = reinterpret_cast<void*>(3);
+    CHECK(!bound.ExecuteBatchPut(invalid_call).ok());
+    invalid_call.execution.stream = call.execution.stream;
+    invalid_request.keys.push_back(4); invalid_request.input_offsets.push_back(0); invalid_request.lengths.push_back(1);
+    CHECK(!bound.ExecuteBatchPut(invalid_call).ok());
+    CHECK(writes == before_rejections && registrations == regs + 1);
+    // Unknown WRITE completion must neither release nor replay the input.
+    fail_wait_on_write = true;
+    CHECK(!bound.ExecuteBatchPut(call).ok());
+    fail_wait_on_write = false;
+    const auto pending_bound_writes = writes;
+    CHECK(!bound.FinishPutInput().ok());
+    CHECK(!bound.AcknowledgePut().ok());
+    CHECK(!bound.ExecuteBatchPut(call).ok() && writes == pending_bound_writes);
+    fail_wait = false;
+    CHECK(bound.ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Succeeded);
+    CHECK(bound.AcknowledgePut().ok());
+    CHECK(writes == pending_bound_writes && registrations == regs + 1);
+    CHECK(unregisters == all_unregs && single_unregisters == single_unregs);
+    // A partially retired input cannot be submitted, rebound or discarded.
+    fail_wait = true;
+    CHECK(!bound.FinishPutInput().ok());
+    CHECK(single_unregisters == single_unregs + 1);
+    CHECK(!UrmaAicpuPutOperator::Launch(call, bound_resources->PutView(),
+          *static_cast<AicpuInvocation*>(bound_state.get())).ok());
+    CHECK(!bound.ExecuteBatchPut(call).ok() && writes == pending_bound_writes);
+    CHECK(bound.BindExecutionState(nullptr).code() == StatusCode::kBusy);
+    CHECK(!bound.PreparePutInput(binding).ok());
+    fail_wait = false;
+    CHECK(bound.FinishPutInput().ok());
+    CHECK(single_unregisters == single_unregs + 1); // Finish retry only reads the original result.
+    CHECK(bound.PreparePutInput(binding).ok() && registrations == regs + 2);
+    CHECK(bound.ExecuteBatchPut(call).ok());
+    CHECK(bound.AcknowledgePut().ok());
+    const auto before_bound_close = destroys;
+    CHECK(bound_owner->Close().ok() && destroys == before_bound_close + 1);
+    CHECK(bound.BindExecutionState(nullptr).ok());
+  }
+  // Legacy uses the original main policy: cache input MR until session close.
+  {
+    auto legacy_config = provider; legacy_config.managed_completion = false;
+    UmdkAccessOperator legacy(legacy_config);
+    CHECK(legacy.Initialize(region).ok());
+    const auto regs = registrations, unregs = unregisters, single_unregs = single_unregisters;
+    for (int i = 0; i < 3; ++i) {
+      CHECK(legacy.ExecuteBatchPut(call).ok());
+      CHECK(legacy.AcknowledgePut().ok());
+      CHECK(registrations == regs + 1);
+      CHECK(unregisters == unregs && single_unregisters == single_unregs);
+    }
+    const auto before_legacy_close = destroys;
+    CHECK(legacy.Shutdown().ok() && destroys == before_legacy_close + 1);
+  }
   provider.enable_get = true;
   UmdkAccessOperator gather(provider);
   auto gather_owner = gather.TakeResources();

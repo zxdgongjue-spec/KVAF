@@ -72,8 +72,9 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
   auto* call = state ? dynamic_cast<AicpuInvocation*>(state) : &state_->legacy;
   if (!call || call->owner != this)
     return Status::InvalidArgument("AICPU invocation belongs to another resource");
-  if (state_->invocation != call && state_->invocation->output_bound)
-    return Status::Busy("release Get output binding before replacing invocation");
+  if (state_->invocation != call &&
+      (state_->invocation->output_bound || state_->invocation->input_bound))
+    return Status::Busy("release input/output binding before replacing invocation");
   auto bound = state_->put.BindExecutionState(call->put.get());
   if (!bound.ok()) return bound;
   bound = state_->get.BindExecutionState(call->get.get());
@@ -112,6 +113,14 @@ Status AicpuExecutionResources::PreparePutResources(const BatchPutExecRequest& r
   if (!state_->initialized) return Status::NotInitialized("AICPU resources not initialized");
   if (!request.request || !request.put_desc || !request.execution.stream)
     return Status::InvalidArgument("AICPU Put needs input, destination and stream");
+  auto& call = *state_->invocation;
+  if (call.input_retiring)
+    return Status::Busy("retry ending the partially retired Put input binding");
+  if (call.input_bound) {
+    if (request.execution.stream != call.put_input.stream)
+      return Status::InvalidArgument("request differs from bound Put stream");
+    return state_->put.PrepareBound(state_->region, *request.request, call.put_input);
+  }
   auto loaded = state_->put_session.Load();
   if (!loaded.ok()) return loaded;
   state_->put_session.BindWriteState(&state_->invocation->write);
@@ -140,7 +149,53 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
   state_->invocation->get_output = request.request->output;
   return state_->get.Prepare(request);
 }
-Status AicpuExecutionResources::ReleasePutBuffers() { return state_->put_session.ReleaseBuffers(); }
+Status AicpuExecutionResources::ReleasePutBuffers() {
+  // Legacy retains registrations until session shutdown, as on main. Managed
+  // ordinary calls retire temporary input; explicit bindings own it until End.
+  if (!state_->managed_completion || state_->invocation->input_bound) return Status::OK();
+  return state_->put_session.ReleaseBuffers();
+}
+Status AicpuExecutionResources::PreparePutInput(const PutInputOptions& options) {
+  std::lock_guard<std::mutex> lock(state_->put_mutex);
+  auto& call = *state_->invocation;
+  if (!state_->initialized || call.input_bound || call.write.attempted ||
+      !options.stream || !options.request_capacity ||
+      !options.input.valid() || options.input.device != DeviceKind::kNpu)
+    return Status::InvalidArgument("invalid AICPU Put input binding");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(options.stream), &capture, &graph) != ACL_SUCCESS)
+    return Status::Internal("cannot query graph capture state");
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("bind Put input before graph capture");
+  auto s = state_->put_session.Load();
+  if (s.ok()) s = state_->put.Reserve(options.request_capacity);
+  if (s.ok()) s = state_->put_session.Ensure(state_->region.base,
+      const_cast<void*>(options.input.data), options.input.bytes);
+  if (!s.ok()) return s;
+  state_->put_session.BindWriteState(&call.write);
+  call.put_input = options;
+  call.input_bound = true;
+  call.input_retiring = false;
+  return Status::OK();
+}
+Status AicpuExecutionResources::FinishPutInput() {
+  std::lock_guard<std::mutex> lock(state_->put_mutex);
+  auto& call = *state_->invocation;
+  if (!call.input_bound) return Status::OK();
+  // Even a completed WRITE keeps its binding until metadata finalization/ACK.
+  if (call.write.attempted)
+    return Status::Busy("acknowledge the preceding Put before ending its input binding");
+  call.input_retiring = true;
+  state_->views.Prepare(ExecutionDirection::Put);
+  auto s = state_->put_session.ReleaseBuffer(const_cast<void*>(call.put_input.input.data),
+                                            call.put_input.input.bytes);
+  if (s.ok()) {
+    call.put_input = {};
+    call.input_bound = call.input_retiring = false;
+  }
+  return s;
+}
 Status AicpuExecutionResources::ReleaseGetBuffers() {
   auto& call = *state_->invocation;
   if (call.output_bound || !call.get_output.valid()) return Status::OK();
@@ -259,6 +314,10 @@ Status AicpuExecutionResources::Close() {
   state_->initialized = false;
   state_->invocation->get_output = {};
   state_->invocation->output_bound = false;
+  state_->invocation->put_input = {};
+  state_->invocation->input_bound = state_->invocation->input_retiring = false;
+  state_->invocation->put_completion = {};
+  state_->invocation->write = {};
   return Status::OK();
 }
 Status AicpuExecutionResources::ResolvePut(PutCompletion* out) {
@@ -277,7 +336,7 @@ Status AicpuExecutionResources::AcknowledgePut() {
   auto& call = *state_->invocation;
   if (call.put_completion.outcome == PutOutcome::Unknown)
     return Status::CompletionUnknown("cannot acknowledge unresolved AICPU Put");
-  auto released = state_->put_session.ReleaseBuffers();
+  auto released = ReleasePutBuffers();
   if (!released.ok()) return released;
   call.put_completion = {};
   call.write = {};

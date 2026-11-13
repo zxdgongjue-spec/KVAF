@@ -248,36 +248,37 @@ void CheckPreparationFailure(bool throw_bind) {
   CHECK(runtime.BatchPut(request).ok());
   CHECK(state.launches == 1 && runtime.Shutdown().ok());
 }
-void CheckInputBinding() {
+void CheckInputBinding(PutExecutionConfig config = put) {
+  const auto mismatch = config == put ? other : put;
   FaultMeta meta;
   ProviderState state, unrelated;
   auto allocator = CreateHostDdrMemoryAllocator();
   ExecutionDispatcher dispatch(Policy());
-  CHECK(dispatch.RegisterPut(put, [&] { return std::make_unique<Provider>(state); }).ok());
-  CHECK(dispatch.RegisterPut(other, [&] { return std::make_unique<Provider>(unrelated); }).ok());
+  CHECK(dispatch.RegisterPut(config, [&] { return std::make_unique<Provider>(state); }).ok());
+  CHECK(dispatch.RegisterPut(mismatch, [&] { return std::make_unique<Provider>(unrelated); }).ok());
   RuntimeCore runtime(meta, dispatch, *allocator);
   CHECK(runtime.Initialize({256, 16, DeviceKind::kCpu}).ok());
   char payload[16] = "bound-input", alternate[16]{};
   void* stream = reinterpret_cast<void*>(1);
   const PutInputOptions binding{{payload, 16, DeviceKind::kNpu}, stream, 1};
   std::uint64_t id{};
-  CHECK(runtime.BeginPutInput(put, binding, &id).ok() && id);
+  CHECK(runtime.BeginPutInput(config, binding, &id).ok() && id);
   CHECK(state.states == 1 && state.input_setups == 1);
   auto write = [&](KeyId key) {
-    return runtime.BatchPut({{key}, binding.input, {0}, {16}}, {stream, put, id});
+    return runtime.BatchPut({{key}, binding.input, {0}, {16}}, {stream, config, id});
   };
   auto rejected = [&](BatchPutRequest request, BatchPutExecutionOptions options) {
     const auto calls = state.launches, commits = meta.commits;
     CHECK(!runtime.BatchPut(request, options).ok());
     CHECK(!runtime.HasPendingPut() && state.launches == calls && meta.commits == commits);
   };
-  rejected({{0}, {alternate, 16, DeviceKind::kNpu}, {0}, {16}}, {stream, put, id});
-  rejected({{0}, {payload, 8, DeviceKind::kNpu}, {0}, {8}}, {stream, put, id});
-  rejected({{0}, binding.input, {0}, {16}}, {reinterpret_cast<void*>(2), put, id});
-  rejected({{0, 1}, binding.input, {0, 8}, {8, 8}}, {stream, put, id});
-  rejected({{0}, binding.input, {0}, {16}}, {stream, other, id});
-  rejected({{0}, binding.input, {0}, {16}}, {stream, put, 0});
-  CHECK(!dispatch.Warmup(put).ok() && !runtime.RecoverPut(put).ok());
+  rejected({{0}, {alternate, 16, DeviceKind::kNpu}, {0}, {16}}, {stream, config, id});
+  rejected({{0}, {payload, 8, DeviceKind::kNpu}, {0}, {8}}, {stream, config, id});
+  rejected({{0}, binding.input, {0}, {16}}, {reinterpret_cast<void*>(2), config, id});
+  rejected({{0, 1}, binding.input, {0, 8}, {8, 8}}, {stream, config, id});
+  rejected({{0}, binding.input, {0}, {16}}, {stream, mismatch, id});
+  rejected({{0}, binding.input, {0}, {16}}, {stream, config, 0});
+  CHECK(!dispatch.Warmup(config).ok() && !runtime.RecoverPut(config).ok());
   CHECK(write(0).ok() && write(1).ok());
   CHECK(state.states == 1 && state.input_setups == 1 && state.input_finishes == 0);
 
@@ -286,17 +287,17 @@ void CheckInputBinding() {
   CHECK(!write(2).ok() && runtime.HasPendingPut());
   CHECK(runtime.EndPutInput(id).code() == StatusCode::kBusy);
   state.completion = {PutOutcome::Succeeded, Status::OK()};
-  CHECK(runtime.RecoverPut(put).ok() && state.launches == 3);
+  CHECK(runtime.RecoverPut(config).ok() && state.launches == 3);
   state.launch = Status::OK();
   meta.fail_commit = 1;
   CHECK(!write(3).ok() && runtime.HasPendingPut());
   CHECK(runtime.EndPutInput(id).code() == StatusCode::kBusy);
-  CHECK(runtime.RecoverPut(put).ok() && state.launches == 4);
+  CHECK(runtime.RecoverPut(config).ok() && state.launches == 4);
   state.fail_ack = 1;
   CHECK(!write(4).ok() && runtime.HasPendingPut());
   const auto commits = meta.commits;
   CHECK(runtime.EndPutInput(id).code() == StatusCode::kBusy);
-  CHECK(runtime.RecoverPut(put).ok() && meta.commits == commits && state.launches == 5);
+  CHECK(runtime.RecoverPut(config).ok() && meta.commits == commits && state.launches == 5);
   CHECK(write(5).ok() && state.states == 1);
 
   state.fail_input_finish = true;
@@ -304,9 +305,9 @@ void CheckInputBinding() {
   state.fail_input_finish = false;
   CHECK(runtime.EndPutInput(id).ok());
   CHECK(!runtime.EndPutInput(id).ok());
-  rejected({{6}, binding.input, {0}, {16}}, {stream, put, id});
+  rejected({{6}, binding.input, {0}, {16}}, {stream, config, id});
   const auto previous_id = id;
-  CHECK(runtime.BeginPutInput(put, binding, &id).ok() && id != previous_id);
+  CHECK(runtime.BeginPutInput(config, binding, &id).ok() && id != previous_id);
   CHECK(write(6).ok() && state.states == 2);
   state.fail_shutdown = true;
   CHECK(!runtime.Shutdown().ok());
@@ -380,6 +381,7 @@ void CheckPutTrace() {
 int main() {
   CheckOnlineRecovery();
   CheckInputBinding();
+  CheckInputBinding(other);
   CheckFailedInputSetup();
   CheckPutTrace();
   CheckAcknowledgementAndException(false);

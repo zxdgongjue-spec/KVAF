@@ -19,6 +19,9 @@ struct AicpuInvocation final : ExecutionState {
   std::unique_ptr<ExecutionState> put, get, push;
   MutableBufferView get_output;
   bool output_bound{false};
+  PutInputOptions put_input;
+  bool input_bound{false};
+  bool input_retiring{false};
 };
 
 // Same common contract across all directions; provider pieces remain typed.
@@ -49,6 +52,8 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   Status ReleaseGetBuffers();
   Status PrepareGetOutput(const GetOutputOptions&);
   Status FinishGetOutput();
+  Status PreparePutInput(const PutInputOptions&);
+  Status FinishPutInput();
   Status ResolvePut(PutCompletion*);
   Status AcknowledgePut();
   Status DrainGet();

@@ -4,15 +4,13 @@
 #include "meta_manager.h"
 
 namespace kvaf {
-// One context owns the exclusive direction lease and copied request metadata
-// until device completion AND (for Put) the metadata transaction decision.
+// A Put context retains only resources and completion state through the metadata
+// transaction decision. Request vectors are borrowed during Launch, never kept
+// for recovery; providers stage any asynchronous metadata in their own storage.
 // Buffer storage remains governed by the public C++/Python ownership contract.
 struct PutExecutionContext {
   PutResourceLease lease;
   PutExecutionConfig config;
-  BatchPutRequest request;
-  PutAccessDesc destination;
-  BatchPutExecutionOptions options;
   std::unique_ptr<ExecutionState> state;
   PutCompletion completion;
   bool launched{false};
@@ -24,7 +22,6 @@ struct PutExecutionContext {
     return s;
   }
   ~PutExecutionContext() { if (bound) (void)lease.view().Bind(nullptr); }
-  BatchPutExecRequest invocation() const { return {&request, &destination, options}; }
 };
 struct GetExecutionContext {
   GetResourceLease lease;

@@ -119,7 +119,7 @@ class ExecutionTests(unittest.TestCase):
                         else:
                             self.assertEqual(constructor["enabled_put_configs"], [(transport, executor)])
                             expected = {"execution": (transport, executor)}
-                            if (transport, executor) == ("urma", "aiv"):
+                            if transport == "urma":
                                 expected["input_lease"] = 19
                                 runtime.begin_put_input.assert_called_once()
                                 runtime.end_put_input.assert_called_once_with(19)
@@ -193,33 +193,40 @@ class ExecutionTests(unittest.TestCase):
     def test_reusable_put_input_keeps_lease_on_release_failure(self):
         api = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
                               ExecutionResources=lambda **a: a)
-        execution = BenchmarkExecution(api, "per-call", put_capacity=512)
-        runtime = Mock()
-        runtime.begin_put_input.return_value = 23
-        execution.bind_input(runtime, "source", "stream")
-        runtime.begin_put_input.assert_called_once_with(("urma", "aiv"), "source", 512, "stream")
-        self.assertEqual(execution.put_kwargs["input_lease"], 23)
-        with self.assertRaisesRegex(RuntimeError, "already bound"):
-            execution.bind_input(runtime, "source", "stream")
-        runtime.end_put_input.side_effect = RuntimeError("transaction unresolved")
-        with self.assertRaisesRegex(RuntimeError, "transaction unresolved"):
-            execution.release_input(runtime)
-        self.assertEqual(execution.input_lease, 23)
-        self.assertEqual(execution.put_kwargs["input_lease"], 23)
-        runtime.end_put_input.side_effect = None
-        execution.release_input(runtime)
-        self.assertEqual(execution.input_lease, 0)
-        self.assertNotIn("input_lease", execution.put_kwargs)
+        for executor in ("aiv", "aicpu"):
+            with self.subTest(executor=executor):
+                execution = BenchmarkExecution(api, "per-call", executor=executor,
+                    algorithm="gather" if executor == "aicpu" else "direct", put_capacity=512)
+                runtime = Mock()
+                runtime.begin_put_input.return_value = 23
+                execution.bind_input(runtime, "source", "stream")
+                runtime.begin_put_input.assert_called_once_with(("urma", executor), "source", 512, "stream")
+                self.assertEqual(execution.put_kwargs["input_lease"], 23)
+                with self.assertRaisesRegex(RuntimeError, "already bound"):
+                    execution.bind_input(runtime, "source", "stream")
+                runtime.end_put_input.side_effect = RuntimeError("transaction unresolved")
+                with self.assertRaisesRegex(RuntimeError, "transaction unresolved"):
+                    execution.release_input(runtime)
+                self.assertEqual(execution.input_lease, 23)
+                self.assertEqual(execution.put_kwargs["input_lease"], 23)
+                runtime.end_put_input.side_effect = None
+                execution.release_input(runtime)
+                self.assertEqual(execution.input_lease, 0)
+                self.assertNotIn("input_lease", execution.put_kwargs)
         for mode, transport, executor, algorithm in (("legacy", "urma", "aiv", "direct"),
-                ("per-call", "ubmem", "aiv", "direct"), ("per-call", "urma", "aicpu", "gather")):
+                ("per-call", "ubmem", "aiv", "direct"), ("legacy", "urma", "aicpu", "gather")):
             execution = BenchmarkExecution(api, mode, transport=transport, executor=executor, algorithm=algorithm)
             execution.bind_input(object(), "source")
             execution.release_input(object())
             self.assertNotIn("input_lease", execution.put_kwargs)
         with patch.dict(os.environ, KVAF_PERF_REUSE_PUT_INPUT="0"):
-            execution = BenchmarkExecution(api, "per-call")
-            execution.bind_input(object(), "source")
-            self.assertEqual(execution.input_binding, "transient")
+            for executor in ("aiv", "aicpu"):
+                execution = BenchmarkExecution(api, "per-call", executor=executor,
+                    algorithm="gather" if executor == "aicpu" else "direct")
+                execution.bind_input(object(), "source")
+                execution.release_input(object())
+                self.assertEqual(execution.input_binding, "transient")
+                self.assertNotIn("input_lease", execution.put_kwargs)
 
     def test_unsupported_profiling_and_graph_shapes_fail_before_running(self):
         with patch.dict(os.environ, {}, clear=True):

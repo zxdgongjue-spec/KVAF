@@ -394,7 +394,7 @@ class Suite:
         self.input_binding()
 
     def input_binding(self):
-        for p in (r for r in self.puts if r.transport == "urma" and r.executor == "aiv"):
+        for p in (r for r in self.puts if r.transport == "urma"):
             cfg = p.config(self.k)
             with self.case("resources/input-binding/" + p.name):
                 host, source = self.source(self.a.rows, 43)
@@ -414,14 +414,19 @@ class Suite:
                         stream=self.write_stream, execution=cfg, input_lease=lease),
                         ValueError, "capacity")
                     check_missing_keys(self.runtime, oversized)
-                    # Reuse the registration while changing the bytes at the same source address.
+                    # Reuse the registration while changing the source bytes and request metadata.
                     for seed in (43, 45):
                         host, replacement = self.source(self.a.rows, seed)
                         source.copy_(replacement)
                         self.t.npu.synchronize()
-                        self.put(p, self.keys, source, input_lease=lease)
+                        keys = self.keys if seed == 43 else list(reversed(self.keys))
+                        offsets = ([i * self.block for i in range(self.a.rows)] if seed == 43
+                                   else [((i + 1) % self.a.rows) * self.block for i in range(self.a.rows)])
+                        expected = b"".join(host[offset:offset + self.block] for offset in offsets)
+                        self.runtime.batch_put(keys, source, offsets, [self.block] * self.a.rows,
+                                               stream=self.write_stream, execution=cfg, input_lease=lease)
                         # The binding is the only retained source owner after local refs go away.
-                        with self.existing_data(self.keys, host, None) as data:
+                        with self.existing_data(keys, expected, None) as data:
                             for g in self.gets:
                                 buffers = self.buffers(epoch=seed)
                                 self.get(data, g, buffers, synchronize=True)
