@@ -141,7 +141,7 @@ Host 不再提交 status D2H 拷贝，也不检查启动编号、执行结果或
 
 ## 算子与资源
 
-raw READ V4 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总数等于输入请求数，各核按请求数量划分任务；默认不预扫描长度，也不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。所有请求均按下标直接索引，无分段前缀表或查找；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。
+raw READ V2 在同一次算子中直接生成 WQE、提交并等待 CQ。WQE 总数等于输入请求数，各核按请求数量划分任务；默认不预扫描长度，也不执行逐段源/目的边界诊断；显式启用诊断时，各核独立检查整批，在任何 READ 提交前拒绝越界输入。目的区间两两比较已删除。三数组不回传 Host，没有独立准备算子。所有请求均按下标直接索引，无分段前缀表或查找；沿用 BatchGet 的 WQE 编码、双 bank、多 Jetty、inflight 窗口和 CQ 处理。
 
 Host 不再生成或校验 kernel 启动编号，也不分配固定页 Host status 缓冲。设备诊断结构仍为每核 1280 B，只在初始化时清零；kernel 仍记录范围检查、WQE/CQ 结果并保留队列错误标记。这些诊断不参与 Host 成功判定。ReadyToken 的 sequence 和源身份校验继续保留，用于防止批次重放。
 
@@ -155,11 +155,11 @@ KVHR v8 只负责初始化、硬件资源交换、重连和关闭，不承担每
 
 每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 2 核 × 2 Jetty，总计最多 4 个 Jetty。接口同步，不支持同一 reader 的并发调用或 graph capture。
 
-使用 `KvafExecuteBatchGetRawAddrAivKernelV4`，移除启动编号后参数为 80 B，旧 V1/V2/V3 object 会拒绝加载。Host 运行库和 raw kernel object 必须一起重新编译。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
+统一使用 `KvafExecuteBatchGetRawAddrAivKernelV2` 入口，启动参数为 80 B。Host 运行库和 raw kernel object 必须使用当前源码一起重新编译。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
 
 ## 编译与硬件验证
 
-本次更新需重编译 A/B 两端 NPU 运行库、Python 扩展和 V4 raw kernel，并重启进程。控制协议仍为 KVHR v8，NPU receiver ticket 仍为 version=1；同时使用 CPU Pull 时，CPU service 继续使用匹配的 KVRP v8。
+本次更新需重编译 A/B 两端 NPU 运行库、Python 扩展和 V2 raw kernel，并重启进程。控制协议仍为 KVHR v8，NPU receiver ticket 仍为 version=1；同时使用 CPU Pull 时，CPU service 继续使用匹配的 KVRP v8。
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash

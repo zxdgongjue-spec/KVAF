@@ -9,7 +9,7 @@
 #include "acl/acl.h"
 
 namespace {
-constexpr char kKernelName[] = "KvafExecuteBatchGetRawAddrAivKernelV4";
+constexpr char kKernelName[] = "KvafExecuteBatchGetRawAddrAivKernelV2";
 constexpr uint32_t kKernelTimeoutSeconds = 180U;
 constexpr uint32_t kKernelLocalMemoryBytes =
     KVAF_AIV_BATCH_GET_LOCAL_MEMORY_BYTES;
@@ -40,7 +40,7 @@ extern "C" int32_t KvafExecuteBatchGetRawAddrLoadKernel(const char *kernel_objec
   const aclError load = aclrtBinaryLoad(binary, &g_binary);
   aclrtDestroyBinary(binary);
   if (load != ACL_SUCCESS || aclrtBinaryGetFunction(g_binary, kKernelName, &g_function) != ACL_SUCCESS) {
-    std::fprintf(stderr, "[KVAF_NPU] rebuild raw-address kernel object: READ V4 entry with 80-byte arguments is required\n");
+    std::fprintf(stderr, "[KVAF_NPU] rebuild raw-address kernel object: READ V2 entry with 80-byte arguments is required\n");
     return KVAF_BATCH_GET_RUNTIME_ERROR;
   }
   g_loaded = true;
