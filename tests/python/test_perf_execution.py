@@ -12,10 +12,11 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from perf_execution import BenchmarkExecution, add_execution_mode
 import test_npu_batch_get_perf as direct
+import test_npu_batch_put as put
 from batch_get_host_sweep import parse_measurements
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,98 @@ with patch.object(sys, "path", [str(DEMO), *sys.path]):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_put_backend_and_aicpu_only_kernel_resolution(self):
+        for transport, executor in (("urma", "aiv"), ("urma", "aicpu"), ("ubmem", "aiv")):
+            self.assertEqual(put.put_backend(transport, executor), f"{transport}_{executor}")
+        with self.assertRaisesRegex(ValueError, "UBMEM Put requires"):
+            put.put_backend("ubmem", "aicpu")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(put.kernel_paths("aicpu"), ("", ""))
+            with self.assertRaisesRegex(ValueError, "KVAF_BATCH_PUT_KERNEL"):
+                put.kernel_paths("aiv")
+
+    def test_put_aiv_requires_both_kernel_objects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            put_kernel = directory / "kvaf_execute_batch_put_kernels.o"
+            get_kernel = directory / "kvaf_execute_batch_get_kernels.o"
+            put_kernel.write_bytes(b"kernel")
+            with patch.dict(os.environ, {"KVAF_BATCH_PUT_KERNEL": str(put_kernel)}, clear=True):
+                with self.assertRaisesRegex(ValueError, "KVAF_BATCH_GET_KERNEL"):
+                    put.kernel_paths("aiv")
+                get_kernel.write_bytes(b"kernel")
+                self.assertEqual(put.kernel_paths("aiv"), (str(get_kernel), str(put_kernel)))
+
+    def test_put_result_distinguishes_block_payload_and_bandwidth_statistic(self):
+        result = put.format_measurements([1.0, 1.0, 4.0], execution_mode="per-call",
+            transport="ubmem", executor="aiv", warmup=10, rows=1000, block_bytes=1000, cores=2)
+        fields = dict(item.split("=", 1) for item in result.split()[1:])
+        self.assertEqual(fields["metric"], "runtime_batch_put_sync_call_to_return")
+        self.assertEqual(fields["timing"], "synchronous_batch_put")
+        self.assertEqual(fields["backend"], "ubmem_aiv")
+        self.assertEqual(fields["execution_mode"], "per-call")
+        self.assertEqual(fields["operation"], "batch_put")
+        self.assertEqual(int(fields["payload_bytes_per_call"]), 1000000)
+        self.assertEqual(float(fields["useful_GBps"]), 0.5)
+        self.assertEqual(float(fields["p50_GBps"]), 1.0)
+        self.assertEqual(int(fields["samples"]), 3)
+
+    def test_put_benchmark_selects_each_backend_and_frees_between_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for direction in ("get", "put"):
+                (directory / f"kvaf_execute_batch_{direction}_kernels.o").write_bytes(b"kernel")
+            for transport, executor in (("urma", "aiv"), ("urma", "aicpu"), ("ubmem", "aiv")):
+                for mode in ("legacy", "per-call"):
+                    with self.subTest(transport=transport, executor=executor, mode=mode):
+                        committed = False
+
+                        def write(*args, **kwargs):
+                            nonlocal committed
+                            self.assertFalse(committed, "duplicate Put without Free")
+                            committed = True
+
+                        def free(*args):
+                            nonlocal committed
+                            self.assertTrue(committed, "Free without a committed Put")
+                            committed = False
+
+                        runtime = Mock(initialized=True, remote_region={"base": 4096, "slot_size": 4096})
+                        runtime.batch_put.side_effect = write
+                        runtime.batch_free.side_effect = free
+                        runtime.access_table_view.return_value = dict(
+                            lengths=[8] * 4, valid=[1] * 4, addresses=[4096 * (i + 1) for i in range(4)])
+                        api = SimpleNamespace(NpuRuntime=Mock(return_value=runtime),
+                            PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                            ExecutionResources=lambda **a: a)
+                        env = dict(KVAF_RUN_NPU_TESTS="1", KVAF_CPU_SERVICE_ADDR="127.0.0.1:38999",
+                            KVAF_NPU_REQUESTS="4", KVAF_NPU_TOKEN_BYTES="8", KVAF_NPU_TOKENS_PER_BLOCK="1",
+                            KVAF_NPU_CORE_COUNT="2", KVAF_NPU_WARMUP="1", KVAF_NPU_ITERATIONS="2")
+                        if executor == "aiv":
+                            env["KVAF_BATCH_PUT_KERNEL"] = str(directory / "kvaf_execute_batch_put_kernels.o")
+                        output = io.StringIO()
+                        with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"kvaf": api}), \
+                             patch.object(put, "detect_torch_backend", return_value=SimpleNamespace(
+                                 name="npu", torch=MagicMock())), contextlib.redirect_stdout(output):
+                            self.assertEqual(put.main(transport, mode, executor), 0)
+                        self.assertFalse(committed)
+                        self.assertEqual(runtime.batch_put.call_count, 4)  # preflight + warmup + two samples
+                        self.assertEqual(runtime.batch_free.call_count, 4)
+                        runtime.batch_get.assert_not_called()
+                        runtime.shutdown.assert_called_once()
+                        constructor = api.NpuRuntime.call_args.kwargs
+                        self.assertEqual(constructor["transport"], transport)
+                        if executor == "aicpu":
+                            self.assertEqual(api.NpuRuntime.call_args.args, ("",))
+                            self.assertEqual(constructor["aicpu_batch_get_mode"], "gather_read")
+                        if mode == "legacy":
+                            self.assertNotIn("per_call_execution", constructor)
+                            self.assertEqual(runtime.batch_put.call_args.kwargs, {})
+                        else:
+                            self.assertEqual(constructor["enabled_put_configs"], [(transport, executor)])
+                            self.assertEqual(runtime.batch_put.call_args.kwargs, {"execution": (transport, executor)})
+                        self.assertIn("samples=2 warmup_excluded=1", output.getvalue())
+
     def test_legacy_does_not_require_new_binding_symbols(self):
         execution = BenchmarkExecution(object(), "legacy")
         self.assertEqual(execution.runtime_kwargs, {})

@@ -733,3 +733,110 @@ Python Tensor 在绑定期间保活、解绑和 shutdown 后释放、重新绑�
 
 便携故障测试检查实际注册次数、workspace 不被连带注销、同地址解绑后重新注册、
 等待/状态读取/注销失败时资源保留及重试；它们不能替代真机正确性和性能测量。
+
+## 9. Put 的 legacy / per-call 性能对比
+
+使用独立入口 `tests/run_remote_cpu_batch_put_perf.sh`，底层仍运行
+`tests/python/test_npu_batch_put.py`。支持以下三组配置；每组只改变
+`--execution-mode`，其余参数保持一致：
+
+| Put 路径 | 参数 | 示例核数 |
+| --- | --- | --- |
+| URMA AIV | `--transport urma --executor aiv` | 2 |
+| UBMEM AIV | `--transport ubmem --executor aiv` | 16 |
+| URMA AICPU | `--transport urma --executor aicpu` | 5 |
+
+AICPU 使用已安装的配套设备包，允许仅包含 AICPU 的构建，不要求 AIV `.o`。
+UBMEM 不支持 `--executor aicpu`。两种执行模式都使用当前分支的同一份构建；
+这里比较接口与调度路径，不将旧 main 构建的结果混入对照。CPU 服务保持运行，
+不需要在两个模式之间重启；每个命令会创建并关闭自己的 Runtime。
+
+### 9.1 测量口径
+
+`timing=synchronous_batch_put` 测量 Python 调用 `batch_put()` 到同步返回的耗时，
+包含绑定层、元数据准备、实际写入、等待完成和提交结果，以及调用内发生的资源清理。
+两种模式都不额外在每个样本后追加一次设备同步。初始化、输入构造、预热、正确性检查、
+`batch_free()` 和最终 shutdown 位于计时区间外；每次重新 Put 之前先在区间外释放同一组 key。
+
+输入 Tensor 在整轮测量中保持不变并重复使用，但当前没有与 Get output binding 对称的
+Put input binding 接口。相同的源地址不代表两条执行路径都跨调用保留注册；若某条路径
+每次调用发生注册/注销，其开销会自然包含在结果中。本轮测试不改变这些生命周期。
+
+Put 的 `rows` 是写入 block 数，不能直接等同于 Get 的 `miss_count`：
+
+```text
+block_bytes = token_bytes * tokens_per_block
+payload_bytes_per_call = rows * block_bytes
+```
+
+例如 `token_bytes=656`、`tokens_per_block=128` 时，每个 block 为 83,968 B；
+512 个 block 的一次 Put 有效载荷为 42,991,616 B。对比模式时应同时固定
+rows、block 大小、核数、Jetty 数、输入分配、设备和 CPU 服务参数。
+
+### 9.2 单点及扫描命令
+
+在仓库根目录执行。以下函数将两种模式的日志分别保存在 `reports/put`，
+所有测试环境变量仅作用于对应子进程。示例按默认单层布局运行；若此前设置过
+`KVAF_DSA_*`，先在新的终端运行，或使用相同的显式 DSA 布局完成两种模式的比较。
+
+```bash
+mkdir -p reports/put
+set -o pipefail
+
+compare_put() {
+  local put_transport="$1" put_executor="$2" put_cores="$3" put_rows="$4"
+  local perf_mode
+  for perf_mode in legacy per-call; do
+    env -u KVAF_NPU_BLOCK_BYTES \
+      KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+      KVAF_NPU_REQUESTS="$put_rows" \
+      KVAF_NPU_TOKEN_BYTES=656 KVAF_NPU_TOKENS_PER_BLOCK=128 \
+      KVAF_NPU_CORE_COUNT="$put_cores" KVAF_NPU_JETTYS_PER_CORE=2 \
+      KVAF_NPU_WARMUP=10 KVAF_NPU_ITERATIONS=100 \
+      bash tests/run_remote_cpu_batch_put_perf.sh "$PWD/build-npu" \
+        --transport "$put_transport" --executor "$put_executor" \
+        --execution-mode "$perf_mode" \
+      | tee "reports/put/${put_transport}-${put_executor}-${put_rows}-${perf_mode}.log" \
+      || return
+  done
+}
+
+# 先固定一个规模，分别比较三种 Put。
+compare_put urma aiv 2 512
+compare_put ubmem aiv 16 512
+compare_put urma aicpu 5 512
+
+# 需要扫描时，使用同一函数；以下命令会覆盖同名的 512 行日志。
+for put_rows in 128 512 2048; do
+  compare_put urma aiv 2 "$put_rows" || break
+  compare_put ubmem aiv 16 "$put_rows" || break
+  compare_put urma aicpu 5 "$put_rows" || break
+done
+```
+
+出现失败时先查看相应日志，不将缺失结果作为零耗时或测试通过。若出现小幅差异，
+以反向顺序再跑一轮并使用另一个日志目录，确认结果是否稳定，避免把运行顺序或机器负载
+变化当作执行模式差异。`KVAF_REMOTE_CPU_PERF_TIMEOUT` 可调整单进程超时秒数，默认 600。
+
+### 9.3 结果与验证范围
+
+收集每份日志的 `PERF_RESULT metric=runtime_batch_put_sync_call_to_return` 行。
+结果同时标记 `operation=batch_put`、`execution_mode`、`transport`、`executor`、
+`backend`、`timing` 和 `payload_bytes_per_call`。优先比较同配置的 `p50_ms`，
+同时观察 `p90_ms`、`p99_ms` 和均值；相对差异按
+`(per_call_p50 / legacy_p50 - 1) * 100%` 计算。
+`p50_GBps` 使用 p50 耗时计算；兼容字段 `useful_GBps` 使用平均耗时计算，
+两者均为十进制 GB/s，不能直接当作同一个指标。
+
+脚本的预检和测后校验检查提交后的 key、长度、有效位及槽位地址，当前属于
+`kind=metadata` 校验，不宣称逐字节读取 DDR。数据正确性仍使用原全量入口验证：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
+  --report "$PWD/validation-put-perf.json"
+```
+
+本地无 NPU 时只能检查脚本和参数路径；是否存在性能劣化以同机实测结果为准。
+本轮先比较同步端到端耗时，不把它标成纯 kernel 时间；若确认存在差异，再增加 Put
+准备、注册、提交、完成和事务收尾的分段计时定位原因。
