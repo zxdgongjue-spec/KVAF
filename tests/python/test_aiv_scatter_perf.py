@@ -161,7 +161,7 @@ def request_plans(torch, args, device):
     return plans
 
 
-def write_results(args, report):
+def write_results(args, report, *, extra_csv_columns=()):
     for samples in report["samples"].values():
         if any(sample["payload_bytes"] != args.miss_count * args.token_bytes for sample in samples):
             raise ValueError("sample payload does not match this call's active miss-count")
@@ -170,8 +170,9 @@ def write_results(args, report):
         args.json.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if args.csv:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
+        columns = CSV_COLUMNS + extra_csv_columns
         with args.csv.open("w", newline="", encoding="utf-8") as output:
-            writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
+            writer = csv.DictWriter(output, fieldnames=columns)
             writer.writeheader()
             for phase, samples in report["samples"].items():
                 for sample in samples:
@@ -181,7 +182,7 @@ def write_results(args, report):
                                   **sample_metrics(sample))
                     values.setdefault("pipeline", args.pipeline)
                     row = {}
-                    for key in CSV_COLUMNS:
+                    for key in columns:
                         value = values.get(key, "")
                         if value != "" and key.endswith("_us"):
                             value = f"{value:.3f}"

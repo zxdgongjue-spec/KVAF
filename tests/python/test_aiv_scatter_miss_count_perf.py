@@ -35,6 +35,7 @@ STAGES = {
     "end_to_end_ns": "end_to_end", "host_call_ns": "host_call",
     "aiv_body_ns": "kernel_total", "device_sync_ns": "device_sync",
     "status_validation_ns": "status_check", "checked_e2e_ns": "checked_e2e",
+    "input_prepare_ns": "input_prepare", "e2e_with_input_ns": "e2e_with_input",
     "aiv_wall_ns": "kernel_wall", "cpu_comm_ns": "cpu_comm",
     "cpu_write_ns": "cpu_write", "aiv_build_notify_ns": "build_notify",
     "aiv_scatter_ns": "scatter", "call_outside_aiv_ns": "call_outside_aiv",
@@ -47,6 +48,7 @@ SUMMARY_COLUMNS = (
 COMPARISON_TIMINGS = {
     "end_to_end_ns": "e2e", "host_call_ns": "submit",
     "status_validation_ns": "status_check", "checked_e2e_ns": "checked_e2e",
+    "input_prepare_ns": "input_prepare", "e2e_with_input_ns": "e2e_with_input",
 }
 
 
@@ -255,7 +257,7 @@ def warmup_calls(runtime, torch, args, refresh_inputs, submit):
         complete_outside_measurement(runtime, args.kernel_profile)
 
 
-def measure_call(runtime, torch, args, iteration, submit, clock=time.perf_counter_ns):
+def measure_call(runtime, torch, args, iteration, submit, *, input_begin, clock=time.perf_counter_ns):
     begin = clock()
     submit()
     submitted = clock()
@@ -284,6 +286,8 @@ def measure_call(runtime, torch, args, iteration, submit, clock=time.perf_counte
             checked = clock()
         sample["status_validation_ns"] = checked - status_begin
         sample["checked_e2e_ns"] = checked - begin
+    sample["input_prepare_ns"] = begin - input_begin
+    sample["e2e_with_input_ns"] = completed - input_begin
     return sample_metrics(sample)
 
 
@@ -470,10 +474,11 @@ def run_case(args):
         log_phase("warmup", "end")
         log_phase("measure", "begin", calls=args.iterations)
         for iteration in range(args.iterations):
+            input_begin = time.perf_counter_ns()
             refresh_inputs()
             torch.npu.synchronize()  # Same pre-call isolation as the reference.
             report["samples"][phase].append(
-                measure_call(runtime, torch, args, iteration, submit))
+                measure_call(runtime, torch, args, iteration, submit, input_begin=input_begin))
         log_phase("measure", "end")
         verify(fixed_inputs, guard=args.output_access_pattern == "contiguous")
         samples = report["samples"][phase]
@@ -482,7 +487,7 @@ def run_case(args):
             for key in samples[0] if key.endswith("_ns")}
         if args.kernel_profile:
             runtime.stop_scatter_profile()
-        write_results(args, report)
+        write_results(args, report, extra_csv_columns=("input_prepare_us", "e2e_with_input_us"))
         for key, stage in STAGES.items():
             if key in report["summary"][phase]:
                 operation = "batch_get" if stage == "end_to_end" else "batch_get_" + stage
@@ -588,11 +593,14 @@ def comparison_row(case, pair):
                compare_round=case.compare_round, order=",".join(pair))
     for key, stage in COMPARISON_TIMINGS.items():
         for execution in ("eager", "graph"):
-            stats = pair[execution][key]
+            stats = pair[execution]["summary"]["baseline"][key]
             for stat in ("mean_us", "p50_us", "p99_us"):
                 row[f"{execution}_{stage}_{stat}"] = stats[stat]
         row[f"{stage}_p50_saved_us"] = row[f"eager_{stage}_p50_us"] - row[f"graph_{stage}_p50_us"]
     row["e2e_p50_speedup"] = row["eager_e2e_p50_us"] / row["graph_e2e_p50_us"]
+    for execution in ("eager", "graph"):
+        row[f"{execution}_prepare_submit_us"] = pair[execution]["setup_us"]["prepare_submit"]
+    row["graph_capture_us"] = pair["graph"]["setup_us"]["capture"]
     return row
 
 
@@ -685,7 +693,7 @@ def main(argv=None, runner=None):
             print("SCATTER_ALIGNED_SWEEP_RESULT " + json.dumps(row, sort_keys=True), flush=True)
         write_summary(summary_path, SUMMARY_COLUMNS, rows)
         if comparing:
-            pair[case.execution] = report["summary"][phase]
+            pair[case.execution] = report
             if len(pair) == 2:
                 result = comparison_row(case, pair)
                 comparison_rows.append(result)

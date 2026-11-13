@@ -172,6 +172,13 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
 加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于
 请求和数据随样本变化的端到端性能回归。
 
+每个正式样本还记录 `input_prepare` 和 `e2e_with_input`。前者从生成请求计划
+开始，包含原地更新固定输入 Tensor 和提交前的设备同步。后者从同一起点量到
+Scatter 的设备同步返回。两项都输出 mean、p50、p99。单 case JSON 的
+`setup_us.prepare_submit` 记录一次性的 Tensor 元数据准备和 callable 创建耗时。
+填表和 AccessTable 准备分别记录在 `setup_us.populate_table` 和
+`setup_us.prepare_access_table`。
+
 Scatter BatchGet 的 CPU payload 固定走 4 条 Jetty，AIV 用第 0 条向 CPU 发布请求。
 `--aiv-cores` 控制设备侧并行度。`--jettys-per-core` 在这个脚本中固定为 2，
 用于 Runtime 初始化和 BatchPut。调整 payload Jetty 数需要同步修改两端的
@@ -190,8 +197,9 @@ bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
 
 `--execution graph` 只测回放，默认的 `--execution eager` 保留 AIV profiling。
 对比两边均关闭 profiling，每轮交替运行顺序，使用相同的 seed 和请求配置。
-`comparison.csv` 按 case 和轮次配对，报告 E2E、Host 提交、状态检查和包含状态
-检查的 E2E 的 mean、p50、p99。请求准备、预热和 capture 在计时区间外。
+`comparison.csv` 按 case 和轮次配对，报告 E2E、Host 提交、状态检查、包含状态
+检查的 E2E、输入准备和含输入 E2E 的 mean、p50、p99。每行也记录两边一次性的
+prepared callable 创建耗时和 Graph capture 耗时。原 E2E 从提交前开始计时。
 Host 提交与 Gather 的 `submit_us` 一样量到提交 API 返回。Scatter eager 使用
 prepared callable，Graph 使用 `AclGraph.replay`。E2E 量到设备同步返回。Graph
 状态检查从设备同步返回开始计时，eager 沿用旧口径，从调用状态校验前开始计时。
