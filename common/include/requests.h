@@ -19,6 +19,20 @@ struct GetProviderTiming {
   std::uint64_t aiv_status_reset_ns{}, aiv_kernel_launch_ns{};
 };
 
+// Optional host-only diagnostics. Pointers to this storage are borrowed only
+// until the public Put call returns, never by retained/recovery state.
+struct PutProviderTiming {
+  const char* transport{"unknown"};
+  const char* executor{"unknown"};
+  std::uint64_t prepare_ns{}, registration_ns{}, metadata_ns{};
+  std::uint64_t submit_ns{}, completion_ns{}, cleanup_ns{};
+};
+struct PutDispatchTiming {
+  std::optional<PutExecutionConfig> config;
+  std::uint64_t lock_ns{}, resolve_ns{}, context_ns{}, describe_ns{}, acquire_ns{}, bind_ns{};
+  std::uint64_t provider_ns{};
+};
+
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
 struct RuntimeInitRequest {
@@ -97,6 +111,18 @@ struct BatchPutRequest {
 struct BatchPutExecutionOptions {
   void* stream{nullptr};
   std::optional<PutExecutionConfig> config;
+  std::uint64_t input_lease{0};
+  PutProviderTiming* host_timing{nullptr};
+  PutDispatchTiming* dispatch_timing{nullptr};
+};
+
+// Eager input registration lease. The caller keeps the allocation and stream
+// alive until EndPutInput/Shutdown succeeds; request keys/offsets may change.
+// A failed Put must be resolved before this binding can be released.
+struct PutInputOptions {
+  ConstBufferView input;
+  void* stream{nullptr};
+  std::uint32_t request_capacity{0};
 };
 
 struct BatchFreeRequest {

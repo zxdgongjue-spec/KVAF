@@ -353,7 +353,8 @@ class NpuPythonRuntime final {
   // the Direct-HCCP implementation synchronously completes this stream.
   void BatchPut(const py::object& keys, const py::object& source,
                 const py::object& input_offsets, const py::object& lengths,
-                const py::object& stream, std::optional<PutExecutionConfig> execution) {
+                const py::object& stream, std::optional<PutExecutionConfig> execution,
+                std::uint64_t input_lease) {
     BatchPutRequest batch_put_request;
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
@@ -388,7 +389,8 @@ class NpuPythonRuntime final {
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else {
         try {
-          status = native_->core().BatchPut(batch_put_request, BatchPutExecutionOptions{acl_stream, execution});
+          status = native_->core().BatchPut(
+              batch_put_request, BatchPutExecutionOptions{acl_stream, execution, input_lease});
         } catch (...) {
           failure = std::current_exception();
         }
@@ -639,6 +641,50 @@ class NpuPythonRuntime final {
   }
 
  public:
+  std::uint64_t BeginPutInput(PutExecutionConfig config, const py::object& input,
+                              std::uint32_t capacity, const py::object& stream) {
+    const auto view = GetNpuTensorView(input, "Put input");
+    const auto native_stream = ResolveStream(stream);
+    std::unique_lock<std::mutex> lock(put_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; lock.lock(); }
+    // Preallocate the Python owner before native registration, including the
+    // map node needed to publish a successfully created lease without allocating.
+    put_input_refs_.reserve(put_input_refs_.size() + 1);
+    auto reserved = put_input_refs_.emplace(0, py::make_tuple(input, stream));
+    auto node = put_input_refs_.extract(reserved.first);
+    pending_put_input_refs_.push_back(node.mapped());
+    std::uint64_t id = 0;
+    Status status;
+    {
+      py::gil_scoped_release release;
+      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
+        status = Status::Internal("aclrtSetDevice failed");
+      else status = native_->core().BeginPutInput(
+          config, {{view.data, view.bytes, DeviceKind::kNpu}, native_stream, capacity}, &id);
+    }
+    if (status.ok()) {
+      node.key() = id;
+      put_input_refs_.insert(std::move(node));
+      pending_put_input_refs_.pop_back();
+    }
+    // A failed setup may leave native registrations awaiting cleanup. Keep its
+    // source alive until Shutdown; do not replace an unresolved Put's owners.
+    ThrowIfError(status);
+    return id;
+  }
+  void EndPutInput(std::uint64_t id) {
+    Status status;
+    std::unique_lock<std::mutex> lock(put_mutex_, std::defer_lock);
+    {
+      py::gil_scoped_release release;
+      lock.lock();
+      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
+        status = Status::Internal("aclrtSetDevice failed");
+      else status = native_->core().EndPutInput(id);
+    }
+    if (status.ok()) put_input_refs_.erase(id);
+    ThrowIfError(status);
+  }
   std::uint64_t BeginGetOutput(GetExecutionConfig config, const py::object& output,
                               std::uint32_t capacity, const py::object& stream) {
     const auto view = GetNpuTensorView(output, "output");
@@ -787,7 +833,10 @@ class NpuPythonRuntime final {
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else status = native_->Shutdown();
     }
-    if (status.ok()) { pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{}; }
+    if (status.ok()) {
+      pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{};
+      put_input_refs_.clear(); pending_put_input_refs_.clear();
+    }
     ThrowIfError(status);
   }
   ~NpuPythonRuntime() {
@@ -800,6 +849,8 @@ class NpuPythonRuntime final {
       for (auto& entry : graph_refs_)
         for (auto& ref : entry.second) (void)ref.release();
       for (auto& entry : output_refs_) (void)entry.second.release();
+      for (auto& entry : put_input_refs_) (void)entry.second.release();
+      for (auto& ref : pending_put_input_refs_) (void)ref.release();
       (void)native_.release();
     }
   }
@@ -812,6 +863,8 @@ class NpuPythonRuntime final {
   py::object pending_put_ref_;
   std::unordered_map<std::uint64_t, std::vector<py::object>> graph_refs_;
   std::unordered_map<std::uint64_t, py::object> output_refs_;
+  std::unordered_map<std::uint64_t, py::object> put_input_refs_;
+  std::vector<py::object> pending_put_input_refs_;
 };
 
 }  // namespace
@@ -842,7 +895,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"), py::arg("source"),
            py::arg("input_offsets"), py::arg("lengths"), py::arg("stream") = py::none(),
-           py::kw_only(), py::arg("execution") = py::none(),
+           py::kw_only(), py::arg("execution") = py::none(), py::arg("input_lease") = 0,
            "Synchronously write variable-size packed NPU blocks. keys, input_offsets, and "
            "lengths are CPU integer sequences or contiguous CPU int64 tensors "
            "with one entry per key; "
@@ -850,6 +903,12 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("recover", &NpuPythonRuntime::RecoverPut, py::arg("execution"))
       .def("recover", &NpuPythonRuntime::RecoverGet, py::arg("execution"))
       .def("drain_get", &NpuPythonRuntime::DrainGet)
+      .def("begin_put_input", &NpuPythonRuntime::BeginPutInput, py::arg("execution"),
+           py::arg("input"), py::arg("request_capacity"), py::arg("stream") = py::none(),
+           "Bind URMA AIV input for repeated synchronous Puts. Keep its storage and stream "
+           "alive and do not resize or replace storage until end_put_input succeeds.")
+      .def("end_put_input", &NpuPythonRuntime::EndPutInput, py::arg("lease"),
+           "Release reusable Put input registration after its transaction completes; failure retains owners.")
       .def("begin_get_output", &NpuPythonRuntime::BeginGetOutput, py::arg("execution"),
            py::arg("output"), py::arg("request_capacity"), py::arg("stream") = py::none(),
            "Bind URMA AIV Direct or AICPU Gather output for repeated eager Gets. "

@@ -12,7 +12,7 @@ class BatchPutTransport {
  public:
   explicit BatchPutTransport(UmdkSession& session) : session_(session) {}
   Status Execute(const RemoteRegionDesc&, const BatchPutExecRequest&);
-  Status Prepare(const RemoteRegionDesc&, const BatchPutRequest&);
+  Status Prepare(const RemoteRegionDesc&, const BatchPutRequest&, PutProviderTiming* timing = nullptr);
   Status ExecutePrepared(const RemoteRegionDesc&, const BatchPutExecRequest&);
   PutLaunchView View();
   static Status LaunchPrepared(const BatchPutExecRequest&, const PutLaunchView&, ExecutionState*);

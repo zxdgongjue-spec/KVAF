@@ -22,14 +22,16 @@ bool fail_wait = false, fail_copy = false, fail_retire = false, complete_payload
 bool fail_close = false, fail_create = false, fail_free = false;
 bool fail_acquire = false, fail_get_acquire = false, fail_memset = false;
 bool measure_timing_stubs = false;
+bool put_success = false;
+int allocations = 0;
 int get_launches = 0, get_retirements = 0, get_acquisitions = 0, get_async_memsets = 0;
 bool get_success = false, get_status_error = false, graph_capturing = false;
 std::vector<KvafBatchPutLocalBuffer*> registrations;
 std::vector<KvafBatchGetLocalBuffer*> get_registrations;
 }
 extern "C" {
-aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { *p = std::malloc(n); return *p ? 0 : 1; }
-aclError aclrtMallocHost(void** p, size_t n) { *p = std::malloc(n); return *p ? 0 : 1; }
+aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) { ++allocations; *p = std::malloc(n); return *p ? 0 : 1; }
+aclError aclrtMallocHost(void** p, size_t n) { ++allocations; *p = std::malloc(n); return *p ? 0 : 1; }
 aclError aclrtFree(void* p) { if (fail_free) return 1; std::free(p); return 0; }
 aclError aclrtFreeHost(void* p) { std::free(p); return 0; }
 aclError aclrtMemset(void* p, size_t, int value, size_t n) {
@@ -92,7 +94,15 @@ int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer*, const KvafExecuteBatch
     }
   }
   // Simulate a Host wait/report failure after a potentially accepted launch.
-  return KVAF_BATCH_PUT_RUNTIME_ERROR;
+  return put_success ? KVAF_BATCH_PUT_SUCCESS : KVAF_BATCH_PUT_RUNTIME_ERROR;
+}
+int32_t KvafExecuteBatchPutSyncTimed(KvafBatchPutLocalBuffer* buffer,
+    const KvafExecuteBatchPutKernelArgs* args, aclrtStream stream,
+    KvafBatchPutCoreStatus* status, uint32_t count, uint64_t* submit, uint64_t* completion) {
+  // Deterministic stub costs verify that provider phases route independently.
+  if (submit) *submit += 100;
+  if (completion) *completion += 200;
+  return KvafExecuteBatchPutSync(buffer, args, stream, status, count);
 }
 int32_t KvafExecuteBatchGetLoadKernel(const char*) { return 0; }
 int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(void*, uint64_t, uint32_t, uint32_t, void*, const uint8_t*, uint32_t, KvafBatchGetTransport** out) {
@@ -211,6 +221,96 @@ int main() {
   CHECK(partial_registration.ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Failed);
   CHECK(partial_registration.AcknowledgePut().ok());
   CHECK(partial_registration.Shutdown().ok());
+  // An explicit input lease registers once and retains workspace/entity across
+  // Puts, including failure resolution; ending the lease is the only retirement.
+  DefaultAccessOperator reused_input(config);
+  CHECK(reused_input.Initialize(region).ok());
+  auto input_state = reused_input.CreateExecutionState();
+  CHECK(reused_input.BindExecutionState(input_state.get()).ok());
+  const auto put_registered = acquisitions, put_retired = retirements;
+  graph_capturing = true;
+  CHECK(!reused_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  CHECK(acquisitions == put_registered);
+  graph_capturing = false;
+  CHECK(reused_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  CHECK(acquisitions == put_registered + 1 && !reused_input.BindExecutionState(nullptr).ok());
+  const auto input_allocations = allocations;
+  put_success = true;
+  for (int i = 0; i < 3; ++i) {
+    PutProviderTiming timing{};
+    call.execution.host_timing = &timing;
+    call.execution.stream = reinterpret_cast<void*>(i + 1);
+    request.keys[0] = i + 1;
+    CHECK(reused_input.ExecuteBatchPut(call).ok());
+    CHECK(std::string(timing.transport) == "urma" && std::string(timing.executor) == "aiv");
+    CHECK(timing.prepare_ns >= timing.registration_ns);
+    CHECK(timing.registration_ns == 0);  // bound input does not acquire/register again
+    CHECK(timing.metadata_ns && timing.submit_ns >= 100 && timing.completion_ns == 200);
+    CHECK(reused_input.ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Succeeded);
+    CHECK(reused_input.AcknowledgePut().ok());
+    CHECK(acquisitions == put_registered + 1 && retirements == put_retired);
+    CHECK(allocations == input_allocations);
+  }
+  call.execution.host_timing = nullptr;
+  const auto input_launches = launches;
+  request.input.data = input + 1;
+  CHECK(!reused_input.ExecuteBatchPut(call).ok());
+  request.input.data = input;
+  request.input.bytes += 64;
+  CHECK(!reused_input.ExecuteBatchPut(call).ok());
+  request.input.bytes -= 64;
+  request.keys.push_back(10); request.input_offsets.push_back(0); request.lengths.push_back(64);
+  destinations.entries.push_back({10, 0x100040, 64});
+  CHECK(!reused_input.ExecuteBatchPut(call).ok() && launches == input_launches);
+  request.keys.resize(1); request.input_offsets.resize(1); request.lengths.resize(1);
+  destinations.entries.resize(1);
+  put_success = false;
+  CHECK(!reused_input.ExecuteBatchPut(call).ok());
+  CHECK(!reused_input.FinishPutInput().ok());
+  fail_wait = true;
+  CHECK(!reused_input.ResolvePut(&completion).ok());
+  fail_wait = false; fail_copy = true;
+  CHECK(!reused_input.ResolvePut(&completion).ok());
+  fail_copy = false;
+  CHECK(reused_input.ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Succeeded);
+  CHECK(reused_input.AcknowledgePut().ok() && retirements == put_retired);
+  fail_retire = true;
+  CHECK(!reused_input.FinishPutInput().ok());
+  const auto before_retiring_launch = launches;
+  CHECK(!reused_input.ExecuteBatchPut(call).ok() && launches == before_retiring_launch);
+  CHECK(!reused_input.BindExecutionState(nullptr).ok());
+  fail_retire = false;
+  CHECK(reused_input.FinishPutInput().ok() && retirements == put_retired + 1);
+  CHECK(reused_input.FinishPutInput().ok() && retirements == put_retired + 1);
+  CHECK(reused_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  CHECK(acquisitions == put_registered + 2);
+  CHECK(reused_input.FinishPutInput().ok());
+  put_success = true;
+  CHECK(reused_input.ExecuteBatchPut(call).ok());
+  CHECK(reused_input.AcknowledgePut().ok() && retirements == put_retired + 3);
+  CHECK(reused_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  fail_close = true;
+  CHECK(!reused_input.Shutdown().ok() && registrations.size() == 1);
+  CHECK(!reused_input.FinishPutInput().ok());
+  fail_close = false;
+  CHECK(reused_input.Shutdown().ok() && registrations.empty());
+  CHECK(reused_input.FinishPutInput().ok() && reused_input.BindExecutionState(nullptr).ok());
+  // Failed registration never becomes a reusable binding and remains retryable.
+  DefaultAccessOperator partial_input(config);
+  CHECK(partial_input.Initialize(region).ok());
+  fail_acquire = true;
+  CHECK(!partial_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  CHECK(!partial_input.FinishPutInput().ok());
+  CHECK(!partial_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  fail_retire = true;
+  CHECK(!partial_input.ResolvePut(&completion).ok() && registrations.size() == 1);
+  fail_retire = false; fail_acquire = false;
+  CHECK(partial_input.ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Failed);
+  CHECK(partial_input.AcknowledgePut().ok());
+  CHECK(partial_input.PreparePutInput({request.input, call.execution.stream, 1}).ok());
+  CHECK(partial_input.FinishPutInput().ok());
+  CHECK(partial_input.Shutdown().ok());
+  put_success = false;
   config.enable_get = true;
   config.batch_get_kernel_object_path = "test-get.o";
   config.batch_put_kernel_object_path.clear();

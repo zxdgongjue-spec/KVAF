@@ -4,6 +4,11 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <cstdio>
+#include <unistd.h>
+#include <vector>
 #include <stdexcept>
 
 #define CHECK(c) do { if (!(c)) { \
@@ -48,6 +53,8 @@ struct ProviderState {
   Status launch;
   PutCompletion completion;
   int launches{0}, resolves{0}, fail_ack{0};
+  int input_setups{0}, input_finishes{0}, states{0}, prepares{0};
+  bool fail_input_setup{false}, fail_input_finish{false};
   bool fail_shutdown{false};
   bool throw_after_submit{false};
   bool fail_bind{false};
@@ -65,8 +72,26 @@ class Provider final : public AccessOperator {
     if (state_.throw_bind) throw std::runtime_error("injected state binding exception");
     return state_.fail_bind ? Status::Internal("injected state binding failure") : Status::OK();
   }
+  std::unique_ptr<ExecutionState> CreateExecutionState() override { ++state_.states; return {}; }
+  Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions&) override {
+    ++state_.prepares;
+    return Status::OK();
+  }
+  Status PreparePutInput(const PutInputOptions&) override {
+    ++state_.input_setups;
+    return state_.fail_input_setup ? Status::Internal("injected input setup failure") : Status::OK();
+  }
+  Status FinishPutInput() override {
+    ++state_.input_finishes;
+    return state_.fail_input_finish ? Status::Internal("injected input finish failure") : Status::OK();
+  }
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override {
     ++state_.launches;
+    if (auto* t = request.execution.host_timing) {
+      t->transport = "urma"; t->executor = "aiv";
+      t->prepare_ns = 5; t->registration_ns = 2; t->metadata_ns = 7;
+      t->submit_ns = 11; t->completion_ns = 13; t->cleanup_ns = 17;
+    }
     for (std::size_t i = 0; i < request.request->keys.size(); ++i)
       std::memcpy(reinterpret_cast<void*>(request.put_desc->entries[i].address),
                   static_cast<const char*>(request.request->input.data) + request.request->input_offsets[i],
@@ -223,10 +248,140 @@ void CheckPreparationFailure(bool throw_bind) {
   CHECK(runtime.BatchPut(request).ok());
   CHECK(state.launches == 1 && runtime.Shutdown().ok());
 }
+void CheckInputBinding() {
+  FaultMeta meta;
+  ProviderState state, unrelated;
+  auto allocator = CreateHostDdrMemoryAllocator();
+  ExecutionDispatcher dispatch(Policy());
+  CHECK(dispatch.RegisterPut(put, [&] { return std::make_unique<Provider>(state); }).ok());
+  CHECK(dispatch.RegisterPut(other, [&] { return std::make_unique<Provider>(unrelated); }).ok());
+  RuntimeCore runtime(meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({256, 16, DeviceKind::kCpu}).ok());
+  char payload[16] = "bound-input", alternate[16]{};
+  void* stream = reinterpret_cast<void*>(1);
+  const PutInputOptions binding{{payload, 16, DeviceKind::kNpu}, stream, 1};
+  std::uint64_t id{};
+  CHECK(runtime.BeginPutInput(put, binding, &id).ok() && id);
+  CHECK(state.states == 1 && state.input_setups == 1);
+  auto write = [&](KeyId key) {
+    return runtime.BatchPut({{key}, binding.input, {0}, {16}}, {stream, put, id});
+  };
+  auto rejected = [&](BatchPutRequest request, BatchPutExecutionOptions options) {
+    const auto calls = state.launches, commits = meta.commits;
+    CHECK(!runtime.BatchPut(request, options).ok());
+    CHECK(!runtime.HasPendingPut() && state.launches == calls && meta.commits == commits);
+  };
+  rejected({{0}, {alternate, 16, DeviceKind::kNpu}, {0}, {16}}, {stream, put, id});
+  rejected({{0}, {payload, 8, DeviceKind::kNpu}, {0}, {8}}, {stream, put, id});
+  rejected({{0}, binding.input, {0}, {16}}, {reinterpret_cast<void*>(2), put, id});
+  rejected({{0, 1}, binding.input, {0, 8}, {8, 8}}, {stream, put, id});
+  rejected({{0}, binding.input, {0}, {16}}, {stream, other, id});
+  rejected({{0}, binding.input, {0}, {16}}, {stream, put, 0});
+  CHECK(!dispatch.Warmup(put).ok() && !runtime.RecoverPut(put).ok());
+  CHECK(write(0).ok() && write(1).ok());
+  CHECK(state.states == 1 && state.input_setups == 1 && state.input_finishes == 0);
+
+  // Both unknown completion and metadata errors retain the same bound context.
+  state.launch = Status::CompletionUnknown("unknown completion");
+  CHECK(!write(2).ok() && runtime.HasPendingPut());
+  CHECK(runtime.EndPutInput(id).code() == StatusCode::kBusy);
+  state.completion = {PutOutcome::Succeeded, Status::OK()};
+  CHECK(runtime.RecoverPut(put).ok() && state.launches == 3);
+  state.launch = Status::OK();
+  meta.fail_commit = 1;
+  CHECK(!write(3).ok() && runtime.HasPendingPut());
+  CHECK(runtime.EndPutInput(id).code() == StatusCode::kBusy);
+  CHECK(runtime.RecoverPut(put).ok() && state.launches == 4);
+  state.fail_ack = 1;
+  CHECK(!write(4).ok() && runtime.HasPendingPut());
+  const auto commits = meta.commits;
+  CHECK(runtime.EndPutInput(id).code() == StatusCode::kBusy);
+  CHECK(runtime.RecoverPut(put).ok() && meta.commits == commits && state.launches == 5);
+  CHECK(write(5).ok() && state.states == 1);
+
+  state.fail_input_finish = true;
+  CHECK(!runtime.EndPutInput(id).ok());
+  state.fail_input_finish = false;
+  CHECK(runtime.EndPutInput(id).ok());
+  CHECK(!runtime.EndPutInput(id).ok());
+  rejected({{6}, binding.input, {0}, {16}}, {stream, put, id});
+  const auto previous_id = id;
+  CHECK(runtime.BeginPutInput(put, binding, &id).ok() && id != previous_id);
+  CHECK(write(6).ok() && state.states == 2);
+  state.fail_shutdown = true;
+  CHECK(!runtime.Shutdown().ok());
+  state.fail_shutdown = false;
+  CHECK(runtime.Shutdown().ok());
+}
+
+void CheckFailedInputSetup() {
+  FaultMeta meta;
+  ProviderState state, unrelated;
+  auto allocator = CreateHostDdrMemoryAllocator();
+  ExecutionDispatcher dispatch(Policy());
+  CHECK(dispatch.RegisterPut(put, [&] { return std::make_unique<Provider>(state); }).ok());
+  CHECK(dispatch.RegisterPut(other, [&] { return std::make_unique<Provider>(unrelated); }).ok());
+  RuntimeCore runtime(meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({256, 16, DeviceKind::kCpu}).ok());
+  char payload[16]{};
+  PutInputOptions binding{{payload, 16, DeviceKind::kNpu}, reinterpret_cast<void*>(1), 1};
+  std::uint64_t id = 99;
+  state.fail_input_setup = state.fail_shutdown = true;
+  CHECK(!runtime.BeginPutInput(put, binding, &id).ok() && id == 0);
+  CHECK(!runtime.BatchPut({{0}, binding.input, {0}, {16}}, {binding.stream, put}).ok());
+  CHECK(!runtime.BeginPutInput(put, binding, &id).ok());
+  CHECK(!runtime.RecoverPut(put).ok() && !runtime.Shutdown().ok());
+  state.fail_shutdown = false;
+  CHECK(runtime.Shutdown().ok() && state.launches == 0);
+}
+
+void CheckPutTrace() {
+  const auto trace = "/tmp/kvaf-put-trace-" + std::to_string(getpid()) + ".csv";
+  std::remove(trace.c_str());
+  CHECK(setenv("KVAF_PUT_DISPATCH_TRACE", trace.c_str(), 1) == 0);
+  CheckInputBinding();
+  CHECK(unsetenv("KVAF_PUT_DISPATCH_TRACE") == 0);
+  std::ifstream input(trace);
+  std::string line;
+  CHECK(std::getline(input, line));
+  auto split = [](const std::string& value) {
+    std::vector<std::string> fields;
+    std::istringstream row(value);
+    std::string field;
+    while (std::getline(row, field, ',')) fields.push_back(field);
+    return fields;
+  };
+  const auto header = split(line);
+  auto column = [&](const char* name) {
+    for (std::size_t i = 0; i < header.size(); ++i) if (header[i] == name) return i;
+    CHECK(false); return header.size();
+  };
+  int success = 0, recovery = 0, failures = 0;
+  while (std::getline(input, line)) {
+    const auto fields = split(line);
+    CHECK(fields.size() == header.size());
+    CHECK(std::stoull(fields[column("total_ns")]) > 0);
+    if (fields[column("event")] == "recover") { ++recovery; continue; }
+    if (fields[column("result")] != "0") { ++failures; continue; }
+    CHECK(fields[column("transport")] == "urma" && fields[column("executor")] == "aiv");
+    CHECK(fields[column("path")] == "input");
+    CHECK(fields[column("provider_registration_ns")] == "2");
+    CHECK(fields[column("provider_prepare_ns")] == "5");
+    CHECK(fields[column("acquire_ns")] == "0" && fields[column("bind_ns")] == "0");
+    CHECK(std::stoull(fields[column("provider_ns")]) > 0);
+    ++success;
+  }
+  CHECK(success == 4 && recovery == 4 && failures >= 6);
+  std::remove(trace.c_str());
+}
+
 }
 
 int main() {
   CheckOnlineRecovery();
+  CheckInputBinding();
+  CheckFailedInputSetup();
+  CheckPutTrace();
   CheckAcknowledgementAndException(false);
   CheckAcknowledgementAndException(true);
   CheckPreparationFailure(false);

@@ -236,10 +236,10 @@ class Suite:
         self.t.npu.synchronize()
         return host, source
 
-    def put(self, route, keys, source):
+    def put(self, route, keys, source, *, input_lease=0):
         self.runtime.batch_put(keys, source, [i * self.block for i in range(len(keys))],
                                [self.block] * len(keys), stream=self.write_stream,
-                               execution=route.config(self.k))
+                               execution=route.config(self.k), input_lease=input_lease)
 
     @contextmanager
     def data(self, put=None, keys=None, seed=1):
@@ -391,6 +391,83 @@ class Suite:
                 self.runtime.drain_get()
 
         self.output_binding()
+        self.input_binding()
+
+    def input_binding(self):
+        for p in (r for r in self.puts if r.transport == "urma" and r.executor == "aiv"):
+            cfg = p.config(self.k)
+            with self.case("resources/input-binding/" + p.name):
+                host, source = self.source(self.a.rows, 43)
+                lease = self.runtime.begin_put_input(cfg, source, self.a.rows, self.write_stream)
+                try:
+                    expect_error(lambda: self.put(p, self.keys, source), ValueError, "input lease")
+                    _, wrong = self.source(self.a.rows, 44)
+                    expect_error(lambda: self.put(p, self.keys, wrong, input_lease=lease),
+                                 ValueError, "bound Put input")
+                    expect_error(lambda: self.runtime.batch_put(
+                        self.keys, source, [i * self.block for i in self.keys],
+                        [self.block] * self.a.rows, stream=self.read_stream,
+                        execution=cfg, input_lease=lease), ValueError, "stream")
+                    oversized = list(range(self.a.rows + 1))
+                    expect_error(lambda: self.runtime.batch_put(
+                        oversized, source, [0] * len(oversized), [self.block] * len(oversized),
+                        stream=self.write_stream, execution=cfg, input_lease=lease),
+                        ValueError, "capacity")
+                    check_missing_keys(self.runtime, oversized)
+                    # Reuse the registration while changing the bytes at the same source address.
+                    for seed in (43, 45):
+                        host, replacement = self.source(self.a.rows, seed)
+                        source.copy_(replacement)
+                        self.t.npu.synchronize()
+                        self.put(p, self.keys, source, input_lease=lease)
+                        # The binding is the only retained source owner after local refs go away.
+                        with self.existing_data(self.keys, host, None) as data:
+                            for g in self.gets:
+                                buffers = self.buffers(epoch=seed)
+                                self.get(data, g, buffers, synchronize=True)
+                                self.verify(data, buffers)
+                    ref = weakref.ref(source)
+                    del source
+                    gc.collect()
+                    check(ref() is not None, "input storage released while registration is live")
+                finally:
+                    self.runtime.end_put_input(lease)
+                gc.collect()
+                check(ref() is None, "input Tensor retained after input lease ended")
+                expect_error(lambda: self.runtime.end_put_input(lease), KeyError, "not found")
+
+            with self.case("resources/input-rebind/" + p.name):
+                host, source = self.source(self.a.rows, 46)
+                next_lease = self.runtime.begin_put_input(cfg, source, self.a.rows, self.write_stream)
+                try:
+                    check(next_lease != lease, "stale input lease ID was reused")
+                    expect_error(lambda: self.put(p, self.keys, source, input_lease=lease),
+                                 ValueError, "input lease")
+                    check_missing_keys(self.runtime, self.keys)
+                    self.put(p, self.keys, source, input_lease=next_lease)
+                    with self.existing_data(self.keys, host, None) as data:
+                        buffers = self.buffers()
+                        self.get(data, self.gets[0], buffers, synchronize=True)
+                        self.verify(data, buffers)
+                finally:
+                    self.runtime.end_put_input(next_lease)
+                self.put(p, self.keys, source)
+                with self.existing_data(self.keys, host, None) as data:
+                    buffers = self.buffers()
+                    self.get(data, self.gets[0], buffers, synchronize=True)
+                    self.verify(data, buffers)
+
+            with self.case("resources/input-shutdown/" + p.name):
+                _, source = self.source(self.a.rows, 47)
+                self.runtime.begin_put_input(cfg, source, self.a.rows, self.write_stream)
+                ref = weakref.ref(source)
+                del source
+                gc.collect()
+                check(ref() is not None, "idle binding did not retain input")
+                self.shutdown()
+                gc.collect()
+                check(ref() is None, "shutdown retained input registration ownership")
+                self.initialize()
 
     def output_binding(self):
         for g in (r for r in self.gets if r.transport == "urma" and r.algorithm in ("direct", "gather")):
@@ -594,7 +671,7 @@ def run(args, report):
         for symbol in ("NpuRuntime", "ExecutionResources", "PutExecutionConfig", "GetExecutionConfig"):
             check(hasattr(kvaf, symbol), f"missing kvaf.{symbol}; rebuild this branch")
         for method in ("warmup", "recover", "drain_get", "begin_get_graph", "end_get_graph",
-                       "begin_get_output", "end_get_output"):
+                       "begin_get_output", "end_get_output", "begin_put_input", "end_put_input"):
             check(hasattr(kvaf.NpuRuntime, method), f"missing NpuRuntime.{method}; rebuild this branch")
         if "graph" in args.cases:
             check(hasattr(kvaf, "AclGraph"), "missing kvaf.AclGraph")

@@ -23,6 +23,9 @@ void* fail_handle{};
 int failures{}, released_sessions{}, closed_libraries{};
 bool freed_too_soon{}, repeated_release{}, create_failure{}, acquire_failure{};
 Kind acquire_failure_kind{};
+#ifdef KVAF_TEST_CLOSE_PUT
+bool sync_launch_success{}, sync_wait_failure{}, sync_bad_status{};
+#endif
 void* Add(Kind kind, void* context = nullptr) {
   void* handle;
   if (kind == Kind::Entity || kind == Kind::QueueState) handle = std::malloc(64);
@@ -308,10 +311,51 @@ aclError aclrtMemsetAsync(void* p, size_t size, int value, size_t n, aclrtStream
 aclError aclrtMemcpyAsync(void* p, size_t size, const void* s, size_t n, aclrtMemcpyKind kind, aclrtStream) {
   return aclrtMemcpy(p, size, s, n, kind);
 }
-aclError aclrtSynchronizeStream(aclrtStream) { return 0; }
-int32_t KvafExecuteBatchPutLaunchInternal(const KvafExecuteBatchPutLaunchArgs*, aclrtStream) { return -1; }
+aclError aclrtSynchronizeStream(aclrtStream) { return sync_wait_failure ? 1 : 0; }
+int32_t KvafExecuteBatchPutLaunchInternal(const KvafExecuteBatchPutLaunchArgs* args, aclrtStream) {
+  if (!sync_launch_success) return -1;
+  auto* report = reinterpret_cast<KvafBatchPutCoreStatus*>(args->request.core_status);
+  report->magic = KVAF_AIV_BATCH_PUT_STATUS_MAGIC;
+  report->result = sync_bad_status ? 1 : KVAF_BATCH_PUT_CORE_SUCCESS;
+  report->processed_request_count = args->request.row_count;
+  report->failed_request_index = UINT64_MAX;
+  return 0;
+}
 #endif
 }
+#ifdef KVAF_TEST_CLOSE_PUT
+void SyncTimingAndStatus() {
+  KvafBatchPutTransport transport;
+  transport.aiv_core_count = 1;
+  KvafBatchPutLocalBuffer buffer;
+  buffer.transport = &transport; buffer.reference_count = 1; buffer.ready = true;
+  buffer.input_hbm_address = 0x1000; buffer.input_hbm_bytes = 64;
+  KvafBatchPutCoreStatus device{}, host{};
+  KvafExecuteBatchPutKernelArgs args{};
+  args.input = buffer.input_hbm_address; args.input_bytes = buffer.input_hbm_bytes;
+  args.input_offsets = args.lengths = args.destination_addresses = 1;
+  args.core_status = reinterpret_cast<uint64_t>(&device);
+  args.row_count = args.aiv_core_count = 1;
+  uint64_t submit = 0, completion = 0;
+  auto run = [&] {
+    return KvafExecuteBatchPutSyncTimed(&buffer, &args, reinterpret_cast<void*>(1),
+                                        &host, 1, &submit, &completion);
+  };
+  device.magic = KVAF_AIV_BATCH_PUT_STATUS_MAGIC;
+  CHECK(run() == KVAF_BATCH_PUT_RUNTIME_ERROR);
+  CHECK(submit > 0 && completion == 0 && device.magic == 0);
+  sync_launch_success = true;
+  CHECK(run() == KVAF_BATCH_PUT_SUCCESS && completion > 0);
+  CHECK(host.magic == KVAF_AIV_BATCH_PUT_STATUS_MAGIC && host.processed_request_count == 1);
+  sync_wait_failure = true;
+  CHECK(run() == KVAF_BATCH_PUT_RUNTIME_ERROR);
+  sync_wait_failure = false; sync_bad_status = true;
+  CHECK(run() == KVAF_BATCH_PUT_KERNEL_ERROR);
+  sync_bad_status = false;
+  CHECK(KvafExecuteBatchPutSync(&buffer, &args, reinterpret_cast<void*>(1), &host, 1) ==
+        KVAF_BATCH_PUT_SUCCESS);
+}
+#endif
 int main() {
   try {
     CHECK(Close(nullptr) == 0);
@@ -323,6 +367,9 @@ int main() {
 #endif
     PartialCreationFailure();
     for (auto kind : {Kind::LocalMr, Kind::LocalToken, Kind::Entity}) PartialBufferFailure(kind);
+#ifdef KVAF_TEST_CLOSE_PUT
+    SyncTimingAndStatus();
+#endif
     std::cout << "AIV transport close retains failed handles, retries, and respects dependencies\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

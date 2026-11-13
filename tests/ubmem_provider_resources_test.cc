@@ -123,7 +123,13 @@ int main() {
   CHECK(op->AcknowledgePut().ok());
   // Failed submission after a preceding success cannot reuse its status contents.
   incomplete = false;
+  PutProviderTiming timing;
+  call.execution.host_timing = &timing;
   CHECK(op->ExecuteBatchPut(call).ok() && launches == 3);
+  call.execution.host_timing = nullptr;
+  CHECK(std::strcmp(timing.transport, "ubmem") == 0 && std::strcmp(timing.executor, "aiv") == 0);
+  CHECK(timing.prepare_ns > 0 && timing.metadata_ns > 0 && timing.submit_ns > 0);
+  CHECK(timing.completion_ns > 0 && timing.registration_ns == 0 && timing.cleanup_ns == 0);
   CHECK(op->AcknowledgePut().ok());
   fail_launch = true;
   CHECK(!op->ExecuteBatchPut(call).ok() && launches == 4);

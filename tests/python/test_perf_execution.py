@@ -85,6 +85,7 @@ class ExecutionTests(unittest.TestCase):
                             committed = False
 
                         runtime = Mock(initialized=True, remote_region={"base": 4096, "slot_size": 4096})
+                        runtime.begin_put_input.return_value = 19
                         runtime.batch_put.side_effect = write
                         runtime.batch_free.side_effect = free
                         runtime.access_table_view.return_value = dict(
@@ -117,7 +118,15 @@ class ExecutionTests(unittest.TestCase):
                             self.assertEqual(runtime.batch_put.call_args.kwargs, {})
                         else:
                             self.assertEqual(constructor["enabled_put_configs"], [(transport, executor)])
-                            self.assertEqual(runtime.batch_put.call_args.kwargs, {"execution": (transport, executor)})
+                            expected = {"execution": (transport, executor)}
+                            if (transport, executor) == ("urma", "aiv"):
+                                expected["input_lease"] = 19
+                                runtime.begin_put_input.assert_called_once()
+                                runtime.end_put_input.assert_called_once_with(19)
+                                self.assertIn("input_binding=reused", output.getvalue())
+                            else:
+                                runtime.begin_put_input.assert_not_called()
+                            self.assertEqual(runtime.batch_put.call_args.kwargs, expected)
                         self.assertIn("samples=2 warmup_excluded=1", output.getvalue())
 
     def test_legacy_does_not_require_new_binding_symbols(self):
@@ -180,6 +189,37 @@ class ExecutionTests(unittest.TestCase):
             execution = BenchmarkExecution(api, "per-call")
             execution.bind_output(object(), "output")
             self.assertEqual(execution.output_binding, "transient")
+
+    def test_reusable_put_input_keeps_lease_on_release_failure(self):
+        api = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                              ExecutionResources=lambda **a: a)
+        execution = BenchmarkExecution(api, "per-call", put_capacity=512)
+        runtime = Mock()
+        runtime.begin_put_input.return_value = 23
+        execution.bind_input(runtime, "source", "stream")
+        runtime.begin_put_input.assert_called_once_with(("urma", "aiv"), "source", 512, "stream")
+        self.assertEqual(execution.put_kwargs["input_lease"], 23)
+        with self.assertRaisesRegex(RuntimeError, "already bound"):
+            execution.bind_input(runtime, "source", "stream")
+        runtime.end_put_input.side_effect = RuntimeError("transaction unresolved")
+        with self.assertRaisesRegex(RuntimeError, "transaction unresolved"):
+            execution.release_input(runtime)
+        self.assertEqual(execution.input_lease, 23)
+        self.assertEqual(execution.put_kwargs["input_lease"], 23)
+        runtime.end_put_input.side_effect = None
+        execution.release_input(runtime)
+        self.assertEqual(execution.input_lease, 0)
+        self.assertNotIn("input_lease", execution.put_kwargs)
+        for mode, transport, executor, algorithm in (("legacy", "urma", "aiv", "direct"),
+                ("per-call", "ubmem", "aiv", "direct"), ("per-call", "urma", "aicpu", "gather")):
+            execution = BenchmarkExecution(api, mode, transport=transport, executor=executor, algorithm=algorithm)
+            execution.bind_input(object(), "source")
+            execution.release_input(object())
+            self.assertNotIn("input_lease", execution.put_kwargs)
+        with patch.dict(os.environ, KVAF_PERF_REUSE_PUT_INPUT="0"):
+            execution = BenchmarkExecution(api, "per-call")
+            execution.bind_input(object(), "source")
+            self.assertEqual(execution.input_binding, "transient")
 
     def test_unsupported_profiling_and_graph_shapes_fail_before_running(self):
         with patch.dict(os.environ, {}, clear=True):

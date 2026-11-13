@@ -4,6 +4,7 @@
 #include "aicpu_batch_get/include/cpu_push_transport.h"
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
 #include "get_host_timing.h"
+#include "put_host_timing.h"
 
 namespace kvaf {
 Status UrmaAicpuPutOperator::Launch(const BatchPutExecRequest& request,
@@ -55,14 +56,21 @@ Status UmdkAccessOperator::DrainGet() { return resources_->DrainGet(); }
 Status UmdkAccessOperator::PrepareGetOutput(const GetOutputOptions& r) { return resources_->PrepareGetOutput(r); }
 Status UmdkAccessOperator::FinishGetOutput() { return resources_->FinishGetOutput(); }
 Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
+  auto* timing = request.execution.host_timing;
+  if (timing) { timing->transport = "urma"; timing->executor = "aicpu"; }
   std::lock_guard<std::mutex> lock(resources_->put_mutex());
+  PutHostTimingScope prepare_timing(timing, &PutProviderTiming::prepare_ns);
   auto& call = resources_->invocation();
   call.put_completion = {};
   call.write = {};
   auto result = resources_->PreparePutResources(request);
+  prepare_timing.Finish();
   if (!result.ok()) { call.put_completion = {PutOutcome::Failed, result}; return result; }
   result = UrmaAicpuPutOperator::Launch(request, resources_->PutView(), call);
-  if (result.ok() && resources_->managed_completion()) result = resources_->ReleasePutBuffers();
+  if (result.ok() && resources_->managed_completion()) {
+    PutHostTimingScope cleanup_timing(timing, &PutProviderTiming::cleanup_ns);
+    result = resources_->ReleasePutBuffers();
+  }
   return result;
 }
 Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {

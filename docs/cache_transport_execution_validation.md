@@ -758,9 +758,15 @@ UBMEM 不支持 `--executor aicpu`。两种执行模式都使用当前分支的�
 两种模式都不额外在每个样本后追加一次设备同步。初始化、输入构造、预热、正确性检查、
 `batch_free()` 和最终 shutdown 位于计时区间外；每次重新 Put 之前先在区间外释放同一组 key。
 
-输入 Tensor 在整轮测量中保持不变并重复使用，但当前没有与 Get output binding 对称的
-Put input binding 接口。相同的源地址不代表两条执行路径都跨调用保留注册；若某条路径
-每次调用发生注册/注销，其开销会自然包含在结果中。本轮测试不改变这些生命周期。
+输入 Tensor 在整轮测量中保持不变并重复使用。URMA AIV 的 per-call 默认在测量前调用
+`begin_put_input()`，预检、预热和正式样本使用同一个 `input_lease`，测后调用
+`end_put_input()`。输入注册、workspace 和执行上下文跨调用复用，绑定和解绑单独计时，
+均不计入稳态 `batch_put()` 样本。其他 Put 路径不需要这个输入绑定。
+
+日志中 `input_binding` 为 `legacy`、`reused`、`not-needed` 或 `transient`。
+需要对照每次调用注册/注销的普通路径时，设置 `KVAF_PERF_REUSE_PUT_INPUT=0`；
+此时 URMA AIV per-call 标记为 `transient`，调用内的注册/注销仍包含在样本耗时内。
+两个模式的请求、源数据和设备完成语义保持一致，不应将单次绑定成本当成每次 Put 的成本。
 
 Put 的 `rows` 是写入 block 数，不能直接等同于 Get 的 `miss_count`：
 
@@ -822,7 +828,9 @@ done
 
 收集每份日志的 `PERF_RESULT metric=runtime_batch_put_sync_call_to_return` 行。
 结果同时标记 `operation=batch_put`、`execution_mode`、`transport`、`executor`、
-`backend`、`timing` 和 `payload_bytes_per_call`。优先比较同配置的 `p50_ms`，
+`backend`、`timing`、`input_binding` 和 `payload_bytes_per_call`。
+`binding_setup_us`、`binding_teardown_us` 是这一轮仅发生一次的绑定/解绑耗时，
+也会分别输出 `PERF_INPUT_BINDING operation=begin/end`。优先比较同配置的 `p50_ms`，
 同时观察 `p90_ms`、`p99_ms` 和均值；相对差异按
 `(per_call_p50 / legacy_p50 - 1) * 100%` 计算。
 `p50_GBps` 使用 p50 耗时计算；兼容字段 `useful_GBps` 使用平均耗时计算，
@@ -837,6 +845,82 @@ bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
   --report "$PWD/validation-put-perf.json"
 ```
 
+`resources` 用例还覆盖显式 Put 输入绑定：同一输入存储改变内容后多次 Put，并通过已启用的
+Get 路径逐字节读回；错输入、错 stream、超容量和过期 lease 必须在元数据提交前拒绝；
+检查 Python Tensor 在绑定期间保活、解绑和 shutdown 后释放、重新绑定和普通 Put 回归。
+可先单跑 `--modes urma --cases resources`，然后执行上面的全量验证。
 本地无 NPU 时只能检查脚本和参数路径；是否存在性能劣化以同机实测结果为准。
-本轮先比较同步端到端耗时，不把它标成纯 kernel 时间；若确认存在差异，再增加 Put
-准备、注册、提交、完成和事务收尾的分段计时定位原因。
+
+### 9.4 应用中复用 Put 输入
+
+当前显式输入绑定支持 `Urma + Aiv`，使用 per-call Runtime。绑定限定输入的起始地址、
+总字节数、配置、stream 和最大请求数；同一次绑定中 keys、offsets、lengths 可以变化。
+上次同步 Put 完成后可以修改输入内容，但不能 resize 或替换其底层存储（包括其他别名）。
+每次调用仍进行事务准备、数据写入和完成处理，只复用输入注册及相关执行资源。
+
+```python
+cfg = kvaf.PutExecutionConfig("urma", "aiv")
+lease = runtime.begin_put_input(cfg, source, max_requests, stream)
+try:
+    runtime.batch_put(keys, source, offsets, lengths,
+                      stream=stream, execution=cfg, input_lease=lease)
+    # 继续使用同一 source 和 stream，传入下一批 keys/offsets/lengths。
+finally:
+    runtime.end_put_input(lease)
+```
+
+绑定生效时，Put 必须携带匹配的 lease；需要切换输入、stream 或 Put 算法时，先解绑。
+Python 绑定持有输入和 stream 的强引用，解绑成功才释放。若 Put 完成状态不确定，
+先按事务恢复流程调用 `recover(cfg)`；`end_put_input()` 不会强行释放仍被事务使用的资源。
+绑定或解绑失败时不能释放或更换输入存储，成功 shutdown 也可以完成清理。
+
+### 9.5 三条 Put 路径的主机分段计时
+
+三条 Put 路径及 legacy 对照都支持 `KVAF_PUT_DISPATCH_TRACE`。以下为 URMA AIV 示例；
+UBMEM AIV 和 URMA AICPU 按 9.2 替换 transport、executor 和核数即可。
+
+```bash
+mkdir -p reports/put
+for perf_mode in legacy per-call; do
+  env -u KVAF_NPU_BLOCK_BYTES \
+    KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+    KVAF_NPU_REQUESTS=1024 KVAF_NPU_TOKEN_BYTES=656 KVAF_NPU_TOKENS_PER_BLOCK=128 \
+    KVAF_NPU_CORE_COUNT=2 KVAF_NPU_JETTYS_PER_CORE=2 \
+    KVAF_NPU_WARMUP=10 KVAF_NPU_ITERATIONS=100 \
+    KVAF_PUT_DISPATCH_TRACE="$PWD/reports/put/urma-aiv-${perf_mode}-dispatch.csv" \
+    bash tests/run_remote_cpu_batch_put_perf.sh "$PWD/build-npu" \
+      --transport urma --executor aiv --execution-mode "$perf_mode" || break
+  python3 tests/python/summarize_put_dispatch_trace.py \
+    "reports/put/urma-aiv-${perf_mode}-dispatch.csv" --last 100 || break
+done
+```
+
+汇总按 transport、executor、path、event 和 result 分组，每组取最后 100 次，分别显示
+`p50/p90` 微秒数。`path=input` 是复用输入，`ordinary` 是未绑定的 per-call，
+`legacy` 为原接口；`event=recover` 和失败记录单独展示，不混入成功 Put 样本。
+`PERF_RESULT` 是 Python 同步端到端时间；CSV 是 C++ 内部分段，两者边界不同。
+
+主要分段为：
+
+| 字段 | 内容 |
+| --- | --- |
+| `lock`、`validation` | Runtime Put 锁及请求校验 |
+| `prepare` | 执行资源和请求准备，可能含首次资源初始化 |
+| `metadata_prepare` | 元数据事务准备 |
+| `execute` | 执行调度及 provider 调用 |
+| `metadata_finalize`、`acknowledge` | 提交/中止元数据事务及完成确认 |
+| `dispatch_lock`、`dispatch_resolve` | dispatcher 锁及执行配置解析 |
+| `context`、`describe`、`acquire`、`bind` | 上下文构造、需求描述、资源获取和视图绑定 |
+| `provider_prepare` | 算子准备，包括必要的输入/通信资源准备 |
+| `provider_registration` | prepare 中发生的注册子段，可检查稳态是否仍重复注册 |
+| `provider_metadata` | 本次请求的设备元数据构造/复制 |
+| `provider_submit`、`provider_completion` | 提交计算及等待完成/结果读取 |
+| `provider_cleanup` | 本次调用内的资源清理 |
+| `provider_other` | provider 总时间扣除一级子段后的剩余部分 |
+| `outside_provider` | Runtime 总时间减去 provider 时间 |
+
+层级包含关系不能直接相加：例如 `provider_registration` 已包含在 `provider_prepare`，
+dispatcher 子段也可能出现在 Runtime 的 `prepare/execute` 内。各段 p50 来自各自分布，
+其和不保证等于 total p50。绑定/解绑成本查看 `PERF_INPUT_BINDING`；稳态 `path=input`
+应避免反复注册输入，但仍需保留完成和事务检查。最终吞吐对比关闭 trace，再运行 9.2，
+避免将计时采样开销混入结论；CSV 在 shutdown/析构时落盘，不在每次 Put 内写文件。

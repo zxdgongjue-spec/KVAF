@@ -14,6 +14,7 @@
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
+#include "put_host_timing.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -170,7 +171,7 @@ Status AivExecutionResources::Bind(ExecutionState* state) {
   const auto& active = *state_->active;
   if (typed != state_->active && (active.pending_get || active.pending_buffer || active.graph_buffer || active.output_buffer
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-      || active.pending_put || active.pending_put_buffer
+      || active.pending_put || active.pending_put_buffer || active.input_buffer
 #endif
       )) return Status::Busy("cannot replace an AIV invocation with pending resources");
   state_->views.Bind(typed);
@@ -290,6 +291,41 @@ Status AivExecutionResources::PrepareOutput(const GetOutputOptions& options, Aiv
   call.get_entity = 0;
   return Status::OK();
 }
+Status AivExecutionResources::PrepareInput(const PutInputOptions& options, AivInvocation& call) {
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (call.owner != this || state_->active != &call)
+    return InvalidArgument("input binding requires the bound AIV invocation");
+  if (!state_->initialized || !state_->put.transport)
+    return Status::NotInitialized("AIV Put resource not initialized");
+  if (call.input_buffer || call.pending_put || call.pending_put_buffer)
+    return Status::Busy("resolve the preceding Put or finish its input binding first");
+  if (!options.input.valid() || options.input.device != DeviceKind::kNpu ||
+      !options.stream || !options.request_capacity)
+    return InvalidArgument("input binding requires NPU input, stream and capacity");
+  auto status = Warmup({options.request_capacity, options.stream});
+  if (!status.ok()) return status;
+  KvafBatchPutLocalBuffer* buffer = nullptr;
+  const auto result = state_->put.AcquireInput(const_cast<void*>(options.input.data),
+                                              options.input.bytes, &buffer);
+  if (result != KVAF_BATCH_PUT_SUCCESS || !buffer) {
+    // Acquire can leave a partial registration. Keep the caller's memory and
+    // handle alive for Resolve/Close; never publish a partial input binding.
+    call.pending_put = buffer ? static_cast<aclrtStream>(options.stream) : nullptr;
+    call.pending_put_buffer = buffer;
+    call.put_issued = false;
+    auto failure = Internal("failed to register bound Put input");
+    call.put_completion = {buffer ? PutOutcome::Unknown : PutOutcome::Failed, failure};
+    return failure;
+  }
+  call.input_buffer = buffer;
+  call.input_options = options;
+  call.input_retiring = false;
+  return Status::OK();
+#else
+  (void)options; (void)call;
+  return Status::NotImplemented("AIV Put input binding is not built");
+#endif
+}
 Status AivExecutionResources::PreparePutResources(const BatchPutExecRequest& exec,
     AivInvocation& call, UrmaAivPutView* out) {
   if (!out || !out->common.Validate(&call, ExecutionDirection::Put).ok() || call.owner != this || state_->active != &call)
@@ -301,10 +337,22 @@ Status AivExecutionResources::PreparePutResources(const BatchPutExecRequest& exe
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (call.pending_put || call.pending_put_buffer)
     return Status::Busy("resolve the preceding Put before preparing resources");
+  if (call.input_retiring)
+    return Status::Busy("retry ending the partially retired Put input binding");
+  if (call.input_buffer &&
+      (exec.request->input.data != call.input_options.input.data ||
+       exec.request->input.bytes != call.input_options.input.bytes ||
+       exec.request->input.device != call.input_options.input.device ||
+       exec.request->keys.size() > call.input_options.request_capacity))
+    return InvalidArgument("Put input or request capacity does not match its binding");
 #endif
   state_->views.Prepare(ExecutionDirection::Put);
   call.put_completion = {};
-  auto status = Warmup({static_cast<std::uint32_t>(exec.request->keys.size()), exec.execution.stream});
+  auto status = Status::OK();
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  if (!call.input_buffer)
+#endif
+    status = Warmup({static_cast<std::uint32_t>(exec.request->keys.size()), exec.execution.stream});
   if (!status.ok()) { call.put_completion = {PutOutcome::Failed, status}; return status; }
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   call.put_rows = exec.request->keys.size();
@@ -312,9 +360,13 @@ Status AivExecutionResources::PreparePutResources(const BatchPutExecRequest& exe
   call.put_issued = false;
   if (state_->put.transport) {
     if (!exec.execution.stream) return InvalidArgument("AIV Put requires a stream");
-    KvafBatchPutLocalBuffer* buffer = nullptr;
-    const auto result = state_->put.AcquireInput(const_cast<void*>(exec.request->input.data),
-        exec.request->input.bytes, &buffer);
+    KvafBatchPutLocalBuffer* buffer = call.input_buffer;
+    int32_t result = KVAF_BATCH_PUT_SUCCESS;
+    if (!buffer) {
+      PutHostTimingScope registration(exec.execution.host_timing, &PutProviderTiming::registration_ns);
+      result = state_->put.AcquireInput(const_cast<void*>(exec.request->input.data),
+                                       exec.request->input.bytes, &buffer);
+    }
     if (buffer) {
       call.pending_put = static_cast<aclrtStream>(exec.execution.stream);
       call.pending_put_buffer = buffer;
@@ -505,6 +557,9 @@ Status AivExecutionResources::Close() {
   state_->put.transport = nullptr;
   state_->active->pending_put_buffer = nullptr;
   state_->active->pending_put = nullptr;
+  state_->active->input_buffer = nullptr;
+  state_->active->input_options = {};
+  state_->active->input_retiring = false;
   auto released = ReleaseAivPutWorkspace(&state_->put.workspace);
   if (!released.ok()) return released;
 #endif

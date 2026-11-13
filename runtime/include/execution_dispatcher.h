@@ -32,6 +32,8 @@ class ExecutionDispatcher final : public AccessOperator {
   Status EndGetGraph(std::uint64_t, void*, bool) override;
   Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*) override;
   Status EndGetOutput(std::uint64_t) override;
+  Status BeginPutInput(PutExecutionConfig, const PutInputOptions&, std::uint64_t*) override;
+  Status EndPutInput(std::uint64_t) override;
   Status Recover(PutExecutionConfig) override;
   Status Recover(GetExecutionConfig);
   Status ResolvePut(PutExecutionConfig, PutCompletion*) override;
@@ -40,6 +42,8 @@ class ExecutionDispatcher final : public AccessOperator {
  private:
   Status DrainGetLocked();
   Status FinishOutputLocked();
+  Status ValidateInputLocked(const BatchPutRequest&, const BatchPutExecutionOptions&,
+                             PutExecutionConfig) const;
   ExecutionPolicy policy_;
   Status policy_status_;
   RemoteRegionDesc region_{};
@@ -49,6 +53,11 @@ class ExecutionDispatcher final : public AccessOperator {
   ExecutionResourceManager resources_;
   std::unique_ptr<GetDispatchTrace> get_trace_;
   std::unique_ptr<PutExecutionContext> pending_put_;
+  std::uint64_t input_id_{0}, next_input_id_{1};
+  PutInputOptions input_options_;
+  std::unique_ptr<PutExecutionContext> input_context_;
+  // A failed Begin may still own a partially registered input until shutdown.
+  std::unique_ptr<PutExecutionContext> failed_input_context_;
   std::unique_ptr<GetExecutionContext> pending_get_;
   std::uint64_t graph_id_{0}, next_graph_id_{1};
   std::unique_ptr<GetExecutionContext> graph_context_;

@@ -40,9 +40,14 @@ class PutResourceView {
     if (s.ok()) s = Warmup({capacity, o.stream});
     return s.ok() ? op_->PreparePut(r, o) : s;
   }
+  Status PrepareBound(const BatchPutRequest& r, const BatchPutExecutionOptions& o) const {
+    return op_->PreparePut(r, o);
+  }
   Status Launch(const BatchPutExecRequest& r) const { return op_->ExecuteBatchPut(r); }
   Status Resolve(PutCompletion* result) const { return op_->ResolvePut(result); }
   Status Acknowledge() const { return op_->AcknowledgePut(); }
+  Status PrepareInput(const PutInputOptions& r) const { return op_->PreparePutInput(r); }
+  Status FinishInput() const { return op_->FinishPutInput(); }
   Status Warmup(const ExecutionWarmup& r) const {
     return resources_ ? resources_->Warmup(r) : op_->Warmup(r);
   }

@@ -50,7 +50,8 @@ def kernel_paths(executor: str) -> tuple[str, str]:
 
 def format_measurements(samples: list[float], *, execution_mode: str,
                         transport: str, executor: str, warmup: int, rows: int,
-                        block_bytes: int, cores: int) -> str:
+                        block_bytes: int, cores: int, input_binding: str = "transient",
+                        binding_setup_us: float = 0, binding_teardown_us: float = 0) -> str:
     mean_ms = statistics.mean(samples)
     p50_ms = percentile(samples, 0.50)
     payload = rows * block_bytes
@@ -60,6 +61,8 @@ def format_measurements(samples: list[float], *, execution_mode: str,
         "PERF_RESULT metric=runtime_batch_put_sync_call_to_return "
         f"execution_mode={execution_mode} operation=batch_put "
         f"transport={transport} executor={executor} backend={put_backend(transport, executor)} "
+        f"input_binding={input_binding} binding_setup_us={binding_setup_us:.3f} "
+        f"binding_teardown_us={binding_teardown_us:.3f} "
         "timing=synchronous_batch_put "
         f"samples={len(samples)} warmup_excluded={warmup} rows={rows} "
         f"block_bytes={block_bytes} npu_cores={cores} payload_bytes_per_call={payload} "
@@ -281,6 +284,7 @@ def main(transport: str = "urma", execution_mode: str = "legacy",
                 f"..{min(jettys_per_core, (max_rows_per_core + 31) // 32)}"
             )
         runtime.initialize(ddr_bytes, slot_bytes)
+        execution.bind_input(runtime, source, stream)
 
         def execute() -> None:
             nonlocal committed
@@ -318,10 +322,12 @@ def main(transport: str = "urma", execution_mode: str = "legacy",
         validate_batch(runtime, keys, rows, block_bytes)
         release()
         print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
+        execution.release_input(runtime)
 
         print(format_measurements(samples, execution_mode=execution_mode,
             transport=transport, executor=executor, warmup=warmup, rows=rows,
-            block_bytes=block_bytes, cores=npu_core_count))
+            block_bytes=block_bytes, cores=npu_core_count, input_binding=execution.input_binding,
+            binding_setup_us=execution.input_setup_us, binding_teardown_us=execution.input_teardown_us))
         return 0
     except Exception as error:
         print(

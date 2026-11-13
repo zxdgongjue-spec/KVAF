@@ -10,6 +10,8 @@
 #include "peer_link.h"
 #include "aicpu_urma/control_abi.h"
 
+namespace kvaf { struct PutProviderTiming; }
+
 namespace kvaf::aicpu_urma {
 
 struct UmdkSessionConfig {
@@ -25,7 +27,8 @@ class UmdkWriteView {
  public:
   UmdkWriteView() = default;
   using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
-  Status Submit(std::uint64_t, std::uint32_t, aclrtStream, Launch) const;
+  Status Submit(std::uint64_t, std::uint32_t, aclrtStream, Launch,
+                PutProviderTiming* timing = nullptr) const;
  private:
   friend class UmdkSession;
   explicit UmdkWriteView(UmdkSession* session) : session_(session) {}
@@ -38,6 +41,8 @@ class UmdkSession {
   UmdkWriteView WriteView() { return UmdkWriteView(this); }
   Status Load();
   Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes);
+  // Establish transport once without re-registering a released setup buffer.
+  Status EnsureSession(std::uint64_t region_base, void* setup_buffer, std::size_t setup_bytes);
   Status Shutdown();
   // A failed launch/completion blocks reuse until Shutdown succeeds.
   Status Drain();
@@ -52,14 +57,14 @@ class UmdkSession {
 
   using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
   Status WriteDescriptors(std::uint64_t descriptors, std::uint32_t count, aclrtStream stream,
-                          Launch);
+                          Launch, PutProviderTiming* timing = nullptr);
   const UmdkSessionConfig& config() const { return config_; }
   std::uint64_t session() const { return args_.session; }
   std::uint64_t owner_pid() const { return args_.owner_pid; }
 
  private:
   Status Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream stream = nullptr,
-             Launch launch = nullptr);
+             Launch launch = nullptr, PutProviderTiming* timing = nullptr);
   Status CompletePending(UmdkControlStatus& status);
   UmdkSessionConfig config_;
   UmdkControlArgs args_{};
@@ -72,8 +77,8 @@ class UmdkSession {
 };
 
 inline Status UmdkWriteView::Submit(std::uint64_t descriptors, std::uint32_t count,
-                                  aclrtStream stream, Launch launch) const {
-  return session_ ? session_->WriteDescriptors(descriptors, count, stream, launch)
+                                  aclrtStream stream, Launch launch, PutProviderTiming* timing) const {
+  return session_ ? session_->WriteDescriptors(descriptors, count, stream, launch, timing)
       : Status::InvalidState("empty UMDK write capability");
 }
 

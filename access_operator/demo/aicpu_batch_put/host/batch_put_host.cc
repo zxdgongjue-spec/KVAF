@@ -3,6 +3,7 @@
 #include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
 #include "meta_manager.h"
 #include "aicpu_urma/session.h"
+#include "put_host_timing.h"
 namespace kvaf::aicpu_urma {
 std::unique_ptr<ExecutionState> BatchPutTransport::CreateExecutionState() {
   return std::make_unique<Preparation>(this);
@@ -40,14 +41,17 @@ Status BatchPutTransport::Reserve(std::uint32_t count) {
   host_transfers_.reserve(count);
   return Status::OK();
 }
-Status BatchPutTransport::Prepare(const RemoteRegionDesc& region, const BatchPutRequest& request) {
+Status BatchPutTransport::Prepare(const RemoteRegionDesc& region, const BatchPutRequest& request,
+                                  PutProviderTiming* timing) {
   views_.Prepare();
   preparation_->request = nullptr;
   if (!request.input.valid() || request.input.device != DeviceKind::kNpu || request.keys.empty() ||
       request.keys.size() > kUmdkMaxTransfers || request.keys.size() != request.input_offsets.size() ||
       request.keys.size() != request.lengths.size())
     return Status::InvalidArgument("invalid BatchPut layout");
+  PutHostTimingScope registration_timing(timing, &PutProviderTiming::registration_ns);
   auto ready = session_.Ensure(region.base, const_cast<void*>(request.input.data), request.input.bytes);
+  registration_timing.Finish();
   if (!ready.ok()) return ready;
   ready = Reserve(static_cast<std::uint32_t>(request.keys.size()));
   if (!ready.ok()) return ready;
@@ -62,7 +66,9 @@ Status BatchPutTransport::Prepare(const RemoteRegionDesc& region, const BatchPut
 }
 Status BatchPutTransport::Execute(const RemoteRegionDesc& region, const BatchPutExecRequest& exec) {
   if (!exec.request) return Status::InvalidArgument("null BatchPut request");
-  auto prepared = Prepare(region, *exec.request);
+  PutHostTimingScope prepare_timing(exec.execution.host_timing, &PutProviderTiming::prepare_ns);
+  auto prepared = Prepare(region, *exec.request, exec.execution.host_timing);
+  prepare_timing.Finish();
   return prepared.ok() ? ExecutePrepared(region, exec) : prepared;
 }
 PutLaunchView BatchPutTransport::View() {
@@ -95,6 +101,7 @@ Status BatchPutTransport::LaunchPrepared(const BatchPutExecRequest& exec, const 
       request.keys.size() * sizeof(UmdkTransfer) > view.capacity)
     return Status::InvalidState("AICPU Put resources were not prepared for this request");
   preparation->request = nullptr;
+  PutHostTimingScope metadata_timing(exec.execution.host_timing, &PutProviderTiming::metadata_ns);
   auto& transfers = (*view.host_descriptors);
   transfers.clear();
   for (std::size_t index = 0; index < request.keys.size(); ++index) {
@@ -117,8 +124,9 @@ Status BatchPutTransport::LaunchPrepared(const BatchPutExecRequest& exec, const 
   if (aclrtMemcpy(view.descriptors, view.capacity, transfers.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE) !=
       ACL_SUCCESS)
     return Status::Internal("failed to upload UMDK WRITE descriptors");
+  metadata_timing.Finish();
   return view.transport.Submit(reinterpret_cast<std::uint64_t>(view.descriptors), transfers.size(),
-                                   static_cast<aclrtStream>(exec.execution.stream), LaunchBatchPut);
+      static_cast<aclrtStream>(exec.execution.stream), LaunchBatchPut, exec.execution.host_timing);
 }
 
 }  // namespace kvaf::aicpu_urma

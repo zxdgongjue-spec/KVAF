@@ -92,6 +92,10 @@ add_test(NAME kvaf_batch_get_inflight_config_python
 add_test(NAME kvaf_batch_get_multicard_perf_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_multicard_perf.py")
+add_test(NAME kvaf_put_dispatch_trace_python
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/python/test_put_dispatch_trace.py")
+
 add_test(NAME kvaf_perf_execution_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_perf_execution.py")

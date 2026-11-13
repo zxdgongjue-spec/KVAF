@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "aicpu_urma/kernel_loader.h"
+#include "put_host_timing.h"
 
 namespace kvaf::aicpu_urma {
 
@@ -35,7 +36,8 @@ Status UmdkSession::Drain() {
 }
 
 Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream stream,
-                        Launch launch_kernel) {
+                        Launch launch_kernel, PutProviderTiming* timing) {
+  PutHostTimingScope submit_timing(timing, &PutProviderTiming::submit_ns);
   if (failed_ && op != UmdkControlOp::kDestroy)
     return Status::InvalidState("UMDK session failed; shut down before reuse");
   if (stream == nullptr) stream = stream_;
@@ -57,6 +59,8 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
     return Status::Internal("UMDK kernel launch failed");
   }
   pending_ = stream;
+  submit_timing.Finish();
+  PutHostTimingScope completion_timing(timing, &PutProviderTiming::completion_ns);
   auto completed = CompletePending(status);
   if (!completed.ok()) {
     failed_ = true;
@@ -221,6 +225,15 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   return Status::OK();
 }
 
+Status UmdkSession::EnsureSession(std::uint64_t region_base, void* setup_buffer,
+                                  std::size_t setup_bytes) {
+  if (failed_ || pending_)
+    return Status::InvalidState("UMDK session failed; shut down before reuse");
+  if (connected_ && args_.remote_address == region_base && args_.worker_count == config_.workers)
+    return Status::OK();
+  return Ensure(region_base, setup_buffer, setup_bytes);
+}
+
 Status UmdkSession::ResolveWrite(PutCompletion* out) {
   if (!out) return Status::InvalidArgument("null WRITE completion output");
   if (write_->completion.outcome == PutOutcome::Succeeded) {
@@ -246,7 +259,7 @@ Status UmdkSession::ResolveWrite(PutCompletion* out) {
 }
 
 Status UmdkSession::WriteDescriptors(std::uint64_t descriptors, std::uint32_t count,
-                                     aclrtStream stream, Launch launch) {
+                                     aclrtStream stream, Launch launch, PutProviderTiming* timing) {
   if (failed_ || pending_)
     return Status::InvalidState("UMDK session failed; shut down before reuse");
   if (!connected_ || !stream || !descriptors || !count || count > kUmdkMaxTransfers)
@@ -256,7 +269,7 @@ Status UmdkSession::WriteDescriptors(std::uint64_t descriptors, std::uint32_t co
   UmdkControlStatus status{};
   write_->attempted = false;
   write_->completion = {};
-  auto result = Run(UmdkControlOp::kWrite, status, stream, launch);
+  auto result = Run(UmdkControlOp::kWrite, status, stream, launch, timing);
   if (!result.ok() && write_->completion.outcome != PutOutcome::Succeeded)
     write_->completion.result = result;
   return result;

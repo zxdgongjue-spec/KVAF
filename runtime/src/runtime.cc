@@ -77,6 +77,10 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
     : meta_manager_(meta_manager),
       access_operator_(access_operator),
       ddr_allocator_(ddr_allocator) {
+  if (const char* path = std::getenv("KVAF_PUT_DISPATCH_TRACE"); path && *path) {
+    put_trace_path_ = path;
+    put_trace_rows_.reserve(256);
+  }
   if (!access_operator_.TracksGetCompletion()) {
     if (const char* path = std::getenv("KVAF_GET_DISPATCH_TRACE"); path && *path)
       legacy_get_trace_path_ = path;
@@ -93,6 +97,7 @@ RuntimeCore::~RuntimeCore() {
     if (!graph_tables_.empty()) (void)new decltype(graph_tables_)(std::move(graph_tables_));
   }
   FlushLegacyGetTrace();
+  FlushPutTrace();
 }
 
 void RuntimeCore::FlushLegacyGetTrace() {
@@ -115,6 +120,39 @@ void RuntimeCore::FlushLegacyGetTrace() {
            << ',' << row.provider_detail.aiv_capture_prepare_ns << ',' << row.provider_detail.aiv_capture_submit_ns
            << ',' << row.provider_detail.aiv_status_reset_ns << ',' << row.provider_detail.aiv_kernel_launch_ns << '\n';
   legacy_get_trace_rows_.clear();
+}
+
+void RuntimeCore::FlushPutTrace() {
+  if (put_trace_rows_.empty()) return;
+  std::ofstream output(put_trace_path_, std::ios::app);
+  if (!output) {
+    std::fprintf(stderr, "[KVAF] cannot write Put dispatch trace: %s\n", put_trace_path_.c_str());
+    return;
+  }
+  output.seekp(0, std::ios::end);
+  if (output.tellp() == 0)
+    output << "event,index,transport,executor,path,result,total_ns,lock_ns,validation_ns,prepare_ns,"
+              "metadata_prepare_ns,execute_ns,metadata_finalize_ns,acknowledge_ns,resolve_ns,"
+              "dispatch_lock_ns,dispatch_resolve_ns,context_ns,describe_ns,acquire_ns,bind_ns,provider_ns,"
+              "provider_prepare_ns,provider_registration_ns,provider_metadata_ns,provider_submit_ns,"
+              "provider_completion_ns,provider_cleanup_ns,provider_other_ns\n";
+  for (const auto& row : put_trace_rows_) {
+    const auto& d = row.dispatch;
+    const auto& p = row.provider;
+    const char* transport = d.config ? (d.config->transport == Transport::Ubmem ? "ubmem" : "urma") : p.transport;
+    const char* executor = d.config ? (d.config->executor == Executor::Aicpu ? "aicpu" : "aiv") : p.executor;
+    const auto phases = p.prepare_ns + p.metadata_ns + p.submit_ns + p.completion_ns + p.cleanup_ns;
+    output << row.event << ',' << ++put_trace_index_ << ',' << transport << ',' << executor << ','
+           << row.path << ',' << row.result << ',' << row.total_ns << ',' << row.lock_ns << ','
+           << row.validation_ns << ',' << row.prepare_ns << ',' << row.metadata_prepare_ns << ','
+           << row.execute_ns << ',' << row.metadata_finalize_ns << ',' << row.acknowledge_ns << ','
+           << row.resolve_ns << ',' << d.lock_ns << ',' << d.resolve_ns << ',' << d.context_ns << ','
+           << d.describe_ns << ',' << d.acquire_ns << ',' << d.bind_ns << ',' << d.provider_ns << ','
+           << p.prepare_ns << ',' << p.registration_ns << ',' << p.metadata_ns << ',' << p.submit_ns << ','
+           << p.completion_ns << ',' << p.cleanup_ns << ','
+           << (d.provider_ns > phases ? d.provider_ns - phases : 0) << '\n';
+  }
+  put_trace_rows_.clear();
 }
 
 Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
@@ -174,6 +212,7 @@ Status RuntimeCore::Shutdown() {
   // Keep ownership intact if the operator cannot drain or close its session.
   const Status operator_status = access_operator_.Shutdown();
   FlushLegacyGetTrace();
+  FlushPutTrace();
   if (!operator_status.ok()) return operator_status;
 
   pending_get_table_.reset();
@@ -474,80 +513,125 @@ Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
   return s;
 }
 
-Status RuntimeCore::BatchPut(const BatchPutRequest& request,
-                             BatchPutExecutionOptions execution) {
-  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-  std::lock_guard<std::mutex> direction(put_mutex_);
-  if (!initialized_) {
-    return Status::NotInitialized("Runtime has not been initialized");
-  }
-  if (request.keys.empty() || request.input.data == nullptr ||
-      request.input.bytes == 0 ||
-      request.keys.size() != request.input_offsets.size() ||
-      request.keys.size() != request.lengths.size()) {
-    return Status::InvalidArgument(
-        "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
-  }
-
-  for (std::size_t index = 0; index < request.keys.size(); ++index) {
-    const std::uint64_t offset = request.input_offsets[index];
-    const std::uint64_t length = request.lengths[index];
-    if (length == 0 || offset > request.input.bytes ||
-        length > request.input.bytes - offset) {
-      return Status::InvalidArgument(
-          "BatchPut input_offsets and lengths must describe bytes inside input");
-    }
-  }
-  if (execution.config && !access_operator_.TracksGetCompletion())
-    return Status::NotImplemented("per-call execution requires an execution policy at construction");
+Status RuntimeCore::BeginPutInput(PutExecutionConfig config, const PutInputOptions& request,
+                                   std::uint64_t* id) {
+  if (id) *id = 0;
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
   if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
-  auto prepared = access_operator_.PreparePut(request, execution);
-  if (!prepared.ok()) return prepared;
-  // Construct the retained completion record before reserving metadata; its
-  // status message may allocate. Moving it into the optional after PreparePut
-  // succeeds does not require another allocation.
-  PendingPut pending;
-  PutContext put_context;
-  PutAccessDesc put_desc;
-  Status status = meta_manager_.PreparePut(request.keys, request.lengths,
-                                           &put_context, &put_desc);
-  if (!status.ok()) {
-    return status;
-  }
-
-  pending.transaction = put_context;
-  pending_put_.emplace(std::move(pending));
-  try {
-    status = access_operator_.ExecuteBatchPut(
-        BatchPutExecRequest{&request, &put_desc, execution});
-  } catch (const std::exception& error) {
-    return Status::CompletionUnknown(std::string("Put execution threw after preparation: ") + error.what());
-  } catch (...) {
-    return Status::CompletionUnknown("Put execution threw after preparation");
-  }
-  if (!status.ok()) {
-    if (status.code() == StatusCode::kCompletionUnknown) return status;
-    pending_put_->completion = {PutOutcome::Failed, status};
-  } else {
-    pending_put_->completion = {PutOutcome::Succeeded, Status::OK()};
-  }
-  return FinalizePutLocked();
+  return access_operator_.BeginPutInput(config, request, id);
+}
+Status RuntimeCore::EndPutInput(std::uint64_t id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
+  return access_operator_.EndPutInput(id);
 }
 
-Status RuntimeCore::FinalizePutLocked() {
+Status RuntimeCore::BatchPut(const BatchPutRequest& request,
+                             BatchPutExecutionOptions execution) {
+  const bool tracing = !put_trace_path_.empty();
+  const auto started = tracing ? LegacyGetTraceNowNs() : 0;
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
+  PutTraceRow row;
+  row.path = !access_operator_.TracksGetCompletion() ? "legacy" : execution.input_lease ? "input" : "ordinary";
+  row.dispatch.config = execution.config;
+  if (tracing) {
+    row.lock_ns = LegacyGetTraceNowNs() - started;
+    execution.host_timing = &row.provider;
+    execution.dispatch_timing = &row.dispatch;
+  }
+  // The trace is buffered only after the operation has finished. No CSV I/O
+  // occurs in the measured path. Each phase also records early failures.
+  auto measure = [&](std::uint64_t& elapsed, auto&& work) {
+    if (!tracing) return work();
+    const auto phase = LegacyGetTraceNowNs();
+    auto result = work();
+    elapsed += LegacyGetTraceNowNs() - phase;
+    return result;
+  };
+  auto run = [&]() -> Status {
+    auto validated = measure(row.validation_ns, [&]() -> Status {
+      if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+      if (request.keys.empty() || request.input.data == nullptr || request.input.bytes == 0 ||
+          request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
+        return Status::InvalidArgument("BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
+      for (std::size_t index = 0; index < request.keys.size(); ++index) {
+        const std::uint64_t offset = request.input_offsets[index];
+        const std::uint64_t length = request.lengths[index];
+        if (length == 0 || offset > request.input.bytes || length > request.input.bytes - offset)
+          return Status::InvalidArgument("BatchPut input_offsets and lengths must describe bytes inside input");
+      }
+      if ((execution.config || execution.input_lease) && !access_operator_.TracksGetCompletion())
+        return Status::NotImplemented("per-call execution requires an execution policy at construction");
+      if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
+      return Status::OK();
+    });
+    if (!validated.ok()) return validated;
+    auto prepared = measure(row.prepare_ns, [&] { return access_operator_.PreparePut(request, execution); });
+    if (!prepared.ok()) return prepared;
+    // Allocate the completion record before reserving metadata; retain it until
+    // data-plane completion, metadata finalization and provider acknowledgement.
+    PendingPut pending;
+    PutContext put_context;
+    PutAccessDesc put_desc;
+    auto status = measure(row.metadata_prepare_ns, [&] {
+      return meta_manager_.PreparePut(request.keys, request.lengths, &put_context, &put_desc);
+    });
+    if (!status.ok()) return status;
+    pending.transaction = put_context;
+    pending.input_bound = execution.input_lease != 0;
+    pending_put_.emplace(std::move(pending));
+    status = measure(row.execute_ns, [&]() -> Status {
+      const auto provider_started = tracing ? LegacyGetTraceNowNs() : 0;
+      Status result;
+      try {
+        result = access_operator_.ExecuteBatchPut({&request, &put_desc, execution});
+      } catch (const std::exception& error) {
+        result = Status::CompletionUnknown(std::string("Put execution threw after preparation: ") + error.what());
+      } catch (...) {
+        result = Status::CompletionUnknown("Put execution threw after preparation");
+      }
+      if (tracing && !access_operator_.TracksGetCompletion())
+        row.dispatch.provider_ns += LegacyGetTraceNowNs() - provider_started;
+      return result;
+    });
+    if (!status.ok()) {
+      if (status.code() == StatusCode::kCompletionUnknown) return status;
+      pending_put_->completion = {PutOutcome::Failed, status};
+    } else pending_put_->completion = {PutOutcome::Succeeded, Status::OK()};
+    return FinalizePutLocked(tracing ? &row : nullptr);
+  };
+  const auto result = run();
+  if (tracing) {
+    row.total_ns = LegacyGetTraceNowNs() - started;
+    row.result = static_cast<int>(result.code());
+    put_trace_rows_.push_back(row);
+  }
+  return result;
+}
+
+Status RuntimeCore::FinalizePutLocked(PutTraceRow* timing) {
   auto& pending = *pending_put_;
   if (pending.completion.outcome == PutOutcome::Unknown)
     return Status::CompletionUnknown("Put data-plane completion remains unresolved");
   if (!pending.metadata_finalized) {
+    const auto started = timing ? LegacyGetTraceNowNs() : 0;
     const auto status = pending.completion.outcome == PutOutcome::Succeeded
                             ? meta_manager_.CommitPut(pending.transaction)
                             : meta_manager_.AbortPut(pending.transaction);
+    if (timing) timing->metadata_finalize_ns += LegacyGetTraceNowNs() - started;
     if (!status.ok()) return status;
     pending.metadata_finalized = true;
   }
-  // Metadata failure must not release the provider's completion record. Likewise
-  // an acknowledgement retry must not repeat a successful CommitPut/AbortPut.
+  // An acknowledgement retry must not repeat CommitPut/AbortPut. Input leases
+  // also remain pinned if either metadata finalization or acknowledgement fails.
+  const auto started = timing ? LegacyGetTraceNowNs() : 0;
   const auto acknowledged = access_operator_.AcknowledgePut();
+  if (timing) timing->acknowledge_ns += LegacyGetTraceNowNs() - started;
   if (!acknowledged.ok()) return acknowledged;
   const auto result = pending.completion.result;
   pending_put_.reset();
@@ -555,24 +639,42 @@ Status RuntimeCore::FinalizePutLocked() {
 }
 
 Status RuntimeCore::RecoverPut(PutExecutionConfig config) {
+  const bool tracing = !put_trace_path_.empty();
+  const auto started = tracing ? LegacyGetTraceNowNs() : 0;
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   std::lock_guard<std::mutex> direction(put_mutex_);
-  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-  if (!pending_put_) return access_operator_.Recover(config);
-  PutCompletion completion;
-  // The dispatcher checks against the saved effective configuration, including
-  // a default selected by the original call. Never recover a different route.
-  const auto resolved = access_operator_.ResolvePut(config, &completion);
-  if (!resolved.ok()) return resolved;
-  if (completion.outcome == PutOutcome::Unknown)
-    return Status::CompletionUnknown("Put data-plane completion remains unresolved");
-  if ((completion.outcome == PutOutcome::Succeeded) != completion.result.ok())
-    return Status::Internal("inconsistent Put completion result");
-  if (pending_put_->completion.outcome == PutOutcome::Unknown)
-    pending_put_->completion = completion;
-  else if (pending_put_->completion.outcome != completion.outcome)
-    return Status::Internal("Put completion changed after it was resolved");
-  return FinalizePutLocked();
+  PutTraceRow row;
+  row.event = "recover";
+  row.path = !access_operator_.TracksGetCompletion() ? "legacy"
+             : pending_put_ && pending_put_->input_bound ? "input" : "ordinary";
+  row.dispatch.config = config;
+  if (tracing) row.lock_ns = LegacyGetTraceNowNs() - started;
+  auto run = [&]() -> Status {
+    if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+    const auto phase = tracing ? LegacyGetTraceNowNs() : 0;
+    PutCompletion completion;
+    // Never replay the Put, or recover a route different from the original.
+    const auto resolved = pending_put_ ? access_operator_.ResolvePut(config, &completion)
+                                       : access_operator_.Recover(config);
+    if (tracing) row.resolve_ns = LegacyGetTraceNowNs() - phase;
+    if (!resolved.ok() || !pending_put_) return resolved;
+    if (completion.outcome == PutOutcome::Unknown)
+      return Status::CompletionUnknown("Put data-plane completion remains unresolved");
+    if ((completion.outcome == PutOutcome::Succeeded) != completion.result.ok())
+      return Status::Internal("inconsistent Put completion result");
+    if (pending_put_->completion.outcome == PutOutcome::Unknown)
+      pending_put_->completion = completion;
+    else if (pending_put_->completion.outcome != completion.outcome)
+      return Status::Internal("Put completion changed after it was resolved");
+    return FinalizePutLocked(tracing ? &row : nullptr);
+  };
+  auto result = run();
+  if (tracing) {
+    row.total_ns = LegacyGetTraceNowNs() - started;
+    row.result = static_cast<int>(result.code());
+    put_trace_rows_.push_back(row);
+  }
+  return result;
 }
 
 bool RuntimeCore::HasPendingPut() const {

@@ -115,7 +115,7 @@ Status AicpuExecutionResources::PreparePutResources(const BatchPutExecRequest& r
   auto loaded = state_->put_session.Load();
   if (!loaded.ok()) return loaded;
   state_->put_session.BindWriteState(&state_->invocation->write);
-  return state_->put.Prepare(state_->region, *request.request);
+  return state_->put.Prepare(state_->region, *request.request, request.execution.host_timing);
 }
 Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& request) {
   state_->views.Prepare(ExecutionDirection::Get);
@@ -227,7 +227,7 @@ Status AicpuExecutionResources::Warmup(const ExecutionWarmup& request) {
   if (!state_->warmup_buffer &&
       aclrtMalloc(&state_->warmup_buffer, 64, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS)
     return Status::OutOfMemory("cannot allocate session setup buffer");
-  auto s = state_->put_session.Ensure(state_->region.base, state_->warmup_buffer, 64);
+  auto s = state_->put_session.EnsureSession(state_->region.base, state_->warmup_buffer, 64);
   return s.ok() ? state_->put.Reserve(request.request_capacity ? request.request_capacity : 65536)
                 : s;
 }

@@ -84,6 +84,18 @@ class AccessOperator {
     return PreparePut(options);
   }
   virtual Status Warmup(const ExecutionWarmup&) { return Status::OK(); }
+  virtual Status PreparePutInput(const PutInputOptions&) {
+    return Status::NotImplemented("provider does not support reusable input bindings");
+  }
+  virtual Status FinishPutInput() {
+    return Status::NotImplemented("provider does not support reusable input bindings");
+  }
+  virtual Status BeginPutInput(PutExecutionConfig, const PutInputOptions&, std::uint64_t*) {
+    return Status::NotImplemented("input bindings require execution dispatcher");
+  }
+  virtual Status EndPutInput(std::uint64_t) {
+    return Status::NotImplemented("input bindings require execution dispatcher");
+  }
   virtual Status DrainGet() { return Status::OK(); }
   virtual Status PrepareGetOutput(const GetOutputOptions&) {
     return Status::NotImplemented("provider does not support reusable output bindings");
@@ -205,6 +217,8 @@ class DefaultAccessOperator final : public AccessOperator {
   Status FinishGetGraph(void*, bool) override;
   Status PrepareGetOutput(const GetOutputOptions&) override;
   Status FinishGetOutput() override;
+  Status PreparePutInput(const PutInputOptions&) override;
+  Status FinishPutInput() override;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

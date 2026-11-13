@@ -55,6 +55,14 @@ int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
                                aclrtStream stream,
                                KvafBatchPutCoreStatus *core_status,
                                uint32_t core_status_count);
+// Optional host diagnostics. Fields accumulate nanoseconds; submit includes
+// status reset, launch and report-copy enqueue, completion includes wait/check.
+int32_t KvafExecuteBatchPutSyncTimed(KvafBatchPutLocalBuffer *local_buffer,
+                                    const KvafExecuteBatchPutKernelArgs *arguments,
+                                    aclrtStream stream,
+                                    KvafBatchPutCoreStatus *core_status,
+                                    uint32_t core_status_count,
+                                    uint64_t *submit_ns, uint64_t *completion_ns);
 
 #ifdef __cplusplus
 }

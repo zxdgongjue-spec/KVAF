@@ -15,7 +15,7 @@ using namespace kvaf::aicpu_urma;
 int single_unregisters = 0;
 int writes = 0, unregisters = 0, allocations = 0, registrations = 0, destroys = 0, frees = 0;
 bool fail_wait = false, fail_copy = false, write_error = false;
-bool fail_launch = false, fail_memset = false, fail_wait_on_write = false;
+bool fail_launch = false, fail_memset = false, fail_wait_on_write = false, fail_wait_on_prepare = false;
 std::vector<UmdkTransfer> submitted;
 }
 extern "C" {
@@ -81,6 +81,7 @@ int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, ui
   if (args.op == UmdkControlOp::kUnregisterBuffers) ++unregisters;
   if (args.op == UmdkControlOp::kUnregisterBuffer) ++single_unregisters;
   if (args.op == UmdkControlOp::kPrepare || args.op == UmdkControlOp::kRegisterBuffer) ++registrations;
+  if (args.op == UmdkControlOp::kPrepare && fail_wait_on_prepare) fail_wait = true;
   if (args.op == UmdkControlOp::kDestroy) ++destroys;
   return 0;
 }
@@ -101,6 +102,20 @@ int main() {
   UmdkSessionConfig config;
   config.peer_link = std::make_shared<PeerLink>("fake:0");
   config.kernel_json = "fake.json"; config.workers = 2; config.local_eid[0] = 1;
+  {
+    UmdkSession partial(config);
+    uint8_t setup[64]{};
+    fail_wait_on_prepare = true;
+    CHECK(!partial.EnsureSession(0x100000, setup, sizeof(setup)).ok());
+    const auto partial_regs = registrations;
+    CHECK(!partial.EnsureSession(0x100000, setup, sizeof(setup)).ok());
+    CHECK(registrations == partial_regs); // A pending Prepare must not be replayed.
+    fail_wait_on_prepare = false; fail_wait = false;
+    CHECK(partial.Shutdown().ok()); // Recover ownership, then destroy the partial session.
+    CHECK(partial.EnsureSession(0x100000, setup, sizeof(setup)).ok());
+    CHECK(registrations == partial_regs + 1);
+    CHECK(partial.Shutdown().ok());
+  }
   UmdkSession session(config);
   BatchPutTransport transport(session);
   UmdkSession::WriteState invocation;
@@ -197,10 +212,33 @@ int main() {
   CHECK(adapter->AcknowledgePut().ok());
   CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(), *invocation_state).ok());
   CHECK(writes == before_writes + 1); // A prepared transfer slot is consumed once.
+  // The owned setup buffer is only needed to establish the session. Ack removed
+  // it with the input registrations; later warmups must keep the session and
+  // descriptor storage without repeatedly registering those same 64 bytes.
+  const auto warmed_allocations = allocations;
+  for (int i = 0; i < 3; ++i) {
+    const auto regs = registrations, unregs = unregisters;
+    CHECK(owner->Warmup({3, call.execution.stream}).ok());
+    CHECK(registrations == regs && allocations == warmed_allocations);
+    PutProviderTiming timing;
+    call.execution.host_timing = &timing;
+    CHECK(adapter->ExecuteBatchPut(call).ok());
+    call.execution.host_timing = nullptr;
+    CHECK(registrations == regs + 1 && unregisters == unregs + 1);
+    CHECK(allocations == warmed_allocations);
+    CHECK(std::strcmp(timing.transport, "urma") == 0 && std::strcmp(timing.executor, "aicpu") == 0);
+    CHECK(timing.prepare_ns >= timing.registration_ns && timing.registration_ns > 0);
+    CHECK(timing.metadata_ns > 0 && timing.submit_ns > 0 && timing.completion_ns > 0);
+    CHECK(timing.cleanup_ns > 0);
+    CHECK(adapter->AcknowledgePut().ok());
+    CHECK(unregisters == unregs + 1); // Managed completion already released inputs.
+  }
   fail_wait_on_write = true;
   CHECK(!adapter->ExecuteBatchPut(call).ok());
   fail_wait_on_write = false;
   const auto pending_writes = writes, pending_frees = frees;
+  const auto pending_regs = registrations;
+  CHECK(!owner->Warmup({3, call.execution.stream}).ok() && registrations == pending_regs);
   CHECK(!owner->Close().ok() && frees == pending_frees);
   fail_wait = false;
   CHECK(adapter->ResolvePut(&completion).ok() && completion.outcome == PutOutcome::Succeeded);
@@ -213,6 +251,10 @@ int main() {
   CHECK(destroys == before_destroys); // Destroying the borrowed algorithm does not close communication.
   CHECK(owner->Close().ok() && destroys == before_destroys + 1);
   CHECK(owner->Close().ok() && destroys == before_destroys + 1);
+  const auto closed_regs = registrations;
+  CHECK(owner->Initialize(region).ok());
+  CHECK(owner->Warmup({3, call.execution.stream}).ok() && registrations == closed_regs + 1);
+  CHECK(owner->Close().ok());
   // A stale view from a closed owner cannot launch a prepared transfer.
   AicpuInvocation closed_call(resources);
   CHECK(!UrmaAicpuPutOperator::Launch(call, resources->PutView(), closed_call).ok());

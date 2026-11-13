@@ -106,6 +106,8 @@ class RuntimeCore {
   Status EndGetGraph(std::uint64_t, void* stream, bool discard_result = false);
   Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*);
   Status EndGetOutput(std::uint64_t);
+  Status BeginPutInput(PutExecutionConfig, const PutInputOptions&, std::uint64_t*);
+  Status EndPutInput(std::uint64_t);
 
  protected:
   MetaManager& meta_manager_;
@@ -133,7 +135,21 @@ class RuntimeCore {
 
   Status DrainGetLocked();
   void FlushLegacyGetTrace();
-  Status FinalizePutLocked();
+  struct PutTraceRow;
+  Status FinalizePutLocked(PutTraceRow* timing = nullptr);
+  void FlushPutTrace();
+  struct PutTraceRow {
+    const char* event{"batch_put"};
+    const char* path{"legacy"};
+    int result{};
+    std::uint64_t total_ns{}, lock_ns{}, validation_ns{}, prepare_ns{}, metadata_prepare_ns{};
+    std::uint64_t execute_ns{}, metadata_finalize_ns{}, acknowledge_ns{}, resolve_ns{};
+    PutDispatchTiming dispatch;
+    PutProviderTiming provider;
+  };
+  std::string put_trace_path_;
+  std::vector<PutTraceRow> put_trace_rows_;
+  std::uint64_t put_trace_index_{};
   struct LegacyGetTraceRow {
     std::uint64_t total_ns{}, provider_ns{};
     GetProviderTiming provider_detail;
@@ -144,6 +160,7 @@ class RuntimeCore {
     PutContext transaction;
     PutCompletion completion;
     bool metadata_finalized{false};
+    bool input_bound{false};
   };
   mutable std::shared_mutex lifecycle_mutex_;
   mutable std::mutex table_mutex_;

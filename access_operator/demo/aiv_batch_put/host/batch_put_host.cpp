@@ -1,6 +1,7 @@
 #include "kvaf_aiv_batch_put.h"
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -578,6 +579,36 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                                             aclrtStream stream,
                                             KvafBatchPutCoreStatus *core_status,
                                             uint32_t core_status_count) {
+  return KvafExecuteBatchPutSyncTimed(local_buffer, arguments, stream, core_status,
+                                     core_status_count, nullptr, nullptr);
+}
+
+namespace {
+class PutSyncTimingScope {
+ public:
+  explicit PutSyncTimingScope(uint64_t* result) : result_(result) {
+    if (result_) start_ = std::chrono::steady_clock::now();
+  }
+  ~PutSyncTimingScope() { Finish(); }
+  void Finish() {
+    if (!result_) return;
+    *result_ += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start_).count());
+    result_ = nullptr;
+  }
+ private:
+  uint64_t* result_;
+  std::chrono::steady_clock::time_point start_;
+};
+}  // namespace
+
+extern "C" int32_t KvafExecuteBatchPutSyncTimed(KvafBatchPutLocalBuffer *local_buffer,
+                                            const KvafExecuteBatchPutKernelArgs *arguments,
+                                            aclrtStream stream,
+                                            KvafBatchPutCoreStatus *core_status,
+                                            uint32_t core_status_count,
+                                            uint64_t *submit_ns, uint64_t *completion_ns) {
+  PutSyncTimingScope submit(submit_ns);
   if (local_buffer == nullptr || !local_buffer->ready || local_buffer->reference_count == 0U ||
       local_buffer->transport == nullptr || local_buffer->transport->closing || arguments == nullptr || stream == nullptr || core_status == nullptr ||
       arguments->input == 0U || arguments->input_offsets == 0U || arguments->lengths == 0U ||
@@ -624,6 +655,8 @@ extern "C" int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer
                  static_cast<int>(status_copy_result));
     return KVAF_BATCH_PUT_RUNTIME_ERROR;
   }
+  submit.Finish();
+  PutSyncTimingScope completion(completion_ns);
   const aclError synchronize_result = aclrtSynchronizeStream(stream);
   if (synchronize_result != ACL_SUCCESS) {
     std::fprintf(stderr, "[KVAF_AIV] DIRECT_BATCH_PUT_RUNTIME_ERROR phase=synchronize acl=%d\n",

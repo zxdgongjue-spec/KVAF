@@ -21,9 +21,17 @@ class BenchmarkExecution:
         self.put_kwargs = {}
         self.get_kwargs = {}
         self.get_config = None
+        self.put_config = None
+        self.put_capacity = put_capacity
         self.get_capacity = get_capacity
+        self.input_lease = 0
         self.output_lease = 0
         self.binding_setup_us = self.binding_teardown_us = 0.0
+        self.input_setup_us = self.input_teardown_us = 0.0
+        self.input_binding = ("legacy" if mode == "legacy"
+                              else "not-needed" if (transport, executor) != ("urma", "aiv")
+                              else "transient" if os.environ.get("KVAF_PERF_REUSE_PUT_INPUT", "1") == "0"
+                              else "reused")
         supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aicpu", "gather"))
         self.output_binding = ("legacy" if mode == "legacy" else "not-needed" if not supported
                                else "transient" if os.environ.get("KVAF_PERF_REUSE_GET_OUTPUT", "1") == "0"
@@ -32,6 +40,7 @@ class BenchmarkExecution:
         if mode == "legacy":
             return
         put = kvaf.PutExecutionConfig(transport, executor)
+        self.put_config = put
         get = kvaf.GetExecutionConfig(transport, executor, algorithm)
         self.get_config = get
         self.runtime_kwargs = dict(
@@ -42,6 +51,30 @@ class BenchmarkExecution:
         )
         self.put_kwargs = dict(execution=put)
         self.get_kwargs = dict(execution=get)
+
+    def bind_input(self, runtime, source, stream=None):
+        if self.input_binding == "reused":
+            if self.input_lease:
+                raise RuntimeError("benchmark input is already bound")
+            begin = time.perf_counter_ns()
+            self.input_lease = runtime.begin_put_input(
+                self.put_config, source, self.put_capacity, stream)
+            self.input_setup_us = (time.perf_counter_ns() - begin) / 1000
+            self.put_kwargs["input_lease"] = self.input_lease
+        self._print_input_binding("begin", self.input_setup_us)
+
+    def release_input(self, runtime):
+        if self.input_lease:
+            begin = time.perf_counter_ns()
+            runtime.end_put_input(self.input_lease)
+            self.input_teardown_us = (time.perf_counter_ns() - begin) / 1000
+            self.input_lease = 0
+            self.put_kwargs.pop("input_lease")
+        self._print_input_binding("end", self.input_teardown_us)
+
+    def _print_input_binding(self, operation, elapsed):
+        print(f"PERF_INPUT_BINDING execution_mode={self.mode} input_binding={self.input_binding} "
+              f"operation={operation} elapsed_us={elapsed:.3f}", flush=True)
 
     def drain_get(self, runtime):
         # An external stream synchronize does not retire the dispatcher's lease.

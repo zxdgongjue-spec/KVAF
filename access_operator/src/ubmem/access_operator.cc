@@ -1,6 +1,7 @@
 #include "ubmem/access_operator.h"
 #include "meta_manager.h"
 #include "get_host_timing.h"
+#include "put_host_timing.h"
 #include <cstdio>
 
 namespace kvaf::ubmem {
@@ -19,8 +20,10 @@ BatchArgs Args(Operation operation, void* local, std::size_t bytes, const Mapped
   return a;
 }
 Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionView& view,
-                  UbmemInvocation& call, bool synchronize, GetProviderTiming* host_timing = nullptr) {
+                  UbmemInvocation& call, bool synchronize, GetProviderTiming* host_timing = nullptr,
+                  PutProviderTiming* put_timing = nullptr) {
   const auto submit_started = GetHostTimingStart(host_timing);
+  PutHostTimingScope put_submit_timing(put_timing, &PutProviderTiming::submit_ns);
   auto& state = *view.slot;
 
   args.profile = view.profiling && args.operation == Operation::kGet ? (view.profile_detail ? 2 : 1) : 0;
@@ -58,6 +61,8 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
       view.kernel.function, view.kernel.cores, stream, &cfg, &args, sizeof(args), nullptr, 0));
   if (!status.ok()) return status;
   GetHostTimingRecord(host_timing, &GetProviderTiming::submit_ns, submit_started);
+  put_submit_timing.Finish();
+  PutHostTimingScope put_completion_timing(put_timing, &PutProviderTiming::completion_ns);
   const auto completion_started = GetHostTimingStart(host_timing);
   if (call.graph_active) {
     call.graph_recorded = true;
@@ -355,6 +360,7 @@ Status UbmemPutOperator::Launch(const BatchPutExecRequest& exec, const UbmemPutV
   }
   // RuntimeCore checked source ranges; MetaManager allocated these destination
   // ranges in the region supplied to Initialize, in request order.
+  PutHostTimingScope metadata_timing(exec.execution.host_timing, &PutProviderTiming::metadata_ns);
   std::vector<std::uint64_t> metadata(rows * 3);
   for (std::size_t i = 0; i < rows; ++i) {
     metadata[i] = r.input_offsets[i]; metadata[rows + i] = r.lengths[i];
@@ -374,10 +380,14 @@ Status UbmemPutOperator::Launch(const BatchPutExecRequest& exec, const UbmemPutV
   a.put_offsets = AddressOf(state->metadata);
   a.put_lengths = a.put_offsets + rows * 8;
   a.put_destinations = a.put_lengths + rows * 8;
-  return LaunchKernel(a, stream, view.execution_, call, true);
+  metadata_timing.Finish();
+  return LaunchKernel(a, stream, view.execution_, call, true, nullptr, exec.execution.host_timing);
 }
 Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  auto* timing = exec.execution.host_timing;
+  if (timing) { timing->transport = "ubmem"; timing->executor = "aiv"; }
   std::lock_guard<std::mutex> lock(resources_->mutex);
+  PutHostTimingScope prepare_timing(timing, &PutProviderTiming::prepare_ns);
   auto& call = *resources_->invocation;
   call.put_completion = {};
   call.put_stream = nullptr;
@@ -387,6 +397,7 @@ Status AccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
       ? Status::InvalidArgument("invalid UBMEM Put request capacity")
       : resources_->PreparePutResources(static_cast<aclrtStream>(exec.execution.stream),
                                static_cast<std::uint32_t>(exec.request->keys.size()), &view);
+  prepare_timing.Finish();
   if (result.ok()) result = UbmemPutOperator::Launch(exec, view, call);
   if (result.ok()) call.put_completion = {PutOutcome::Succeeded, result};
   else if (!call.put_stream) call.put_completion = {PutOutcome::Failed, result};

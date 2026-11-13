@@ -28,6 +28,11 @@ class SessionAccessOperator final : public AccessOperator {
   Status Initialize(const RemoteRegionDesc& region) override { return resources_->Initialize(region); }
   Status Shutdown() override { return resources_->Close(); }
   Status Warmup(const ExecutionWarmup& r) override { return resources_->Warmup(r); }
+  Status PreparePutInput(const PutInputOptions& r) override {
+    auto s = ValidateRequestCapacity(r.request_capacity);
+    return s.ok() ? resources_->operation()->PreparePutInput(r) : s;
+  }
+  Status FinishPutInput() override { return resources_->operation()->FinishPutInput(); }
   Status PrepareGetGraph(const GetGraphOptions& r) override {
     auto s = ValidateRequestCapacity(r.request_capacity);
     if (!r.request_capacity) return Status::InvalidArgument("graph capacity must be positive");

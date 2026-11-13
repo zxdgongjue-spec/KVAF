@@ -52,6 +52,10 @@ struct AivInvocation final : ExecutionState {
   std::size_t put_rows{};
   ConstBufferView put_input;
   bool put_issued{};
+  // Exclusive registration retained until the caller ends its input lease.
+  KvafBatchPutLocalBuffer* input_buffer{};
+  PutInputOptions input_options;
+  bool input_retiring{false};
 #endif
   PutCompletion put_completion;
 };
@@ -112,6 +116,7 @@ class AivExecutionResources final : public ExecutionResourceOwner {
   Status PreparePutResources(const BatchPutExecRequest&, AivInvocation&, UrmaAivPutView*);
   Status PrepareGraph(const GetGraphOptions&, AivInvocation&);
   Status PrepareOutput(const GetOutputOptions&, AivInvocation&);
+  Status PrepareInput(const PutInputOptions&, AivInvocation&);
   std::unique_ptr<ExecutionState> CreateState() const;
   Status Bind(ExecutionState*);
   AivInvocation& invocation();
