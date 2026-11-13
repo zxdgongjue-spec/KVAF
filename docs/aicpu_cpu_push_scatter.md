@@ -309,17 +309,5 @@ profile 中同时检查 `request_us`、`ready_wait_us`、`scatter_us` 和 `scatt
 端到端仍然计入每次 Python 调用、kernel launch 和状态同步。
 旧常驻 kernel 的设备内循环带宽和当前 Python 端到端带宽具有不同计时范围。
 
-不依赖 NPU 的回归测试可单独构建运行：
-
-```bash
-cmake -S . -B build-scatter-tests -DBUILD_TESTING=ON
-cmake --build build-scatter-tests --target kvaf_cpu_push_scatter_test
-ctest --test-dir build-scatter-tests -R '^kvaf_cpu_push_scatter_test$' --output-on-failure
-```
-
-回归测试覆盖 ready 延迟、跳跃、回退、
-未来序号、超时和复制失败；并执行生产 kernel 的本地线程模型，校验动态源地址、
-输出索引、空/部分前缀、非整除 worker 分区、远端错误及完整输出 guard。
-
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。

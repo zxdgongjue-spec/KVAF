@@ -14,7 +14,10 @@ class BatchGetTransport {
   ~BatchGetTransport();
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
-  Status Drain();
+  Status Drain(bool check_status = true);
+  Status Check(aclrtStream);
+  Status SetKernelProfiling(bool);
+  Status CopyKernelProfiles(std::vector<BatchGetKernelProfile>*) const;
   // Release after the shared session has unregistered its HBM buffers.
   Status Shutdown();
 

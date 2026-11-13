@@ -78,6 +78,9 @@ class NpuRuntime final : public Runtime {
   std::uint32_t batch_get_tokens_per_block() const;
 
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
+  // Outside capture: synchronize the execution stream and report retained
+  // AICPU protocol errors, including errors from earlier graph replays.
+  Status CheckBatchGetStatus(void* stream);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

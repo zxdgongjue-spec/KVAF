@@ -22,7 +22,8 @@ class UmdkSession {
  public:
   explicit UmdkSession(UmdkSessionConfig config) : config_(std::move(config)) {}
   Status Load();
-  Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes);
+  Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,
+                bool prepared_only = false);
   Status Shutdown();
   // A failed launch/completion blocks reuse until Shutdown succeeds.
   Status Drain();

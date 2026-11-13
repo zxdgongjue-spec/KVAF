@@ -5,6 +5,9 @@ Unlike ``test_npu_runtime_perf.py``, this benchmark has no derived ``batch``
 dimension. The request-array length, AccessTable capacity, block layout and
 exact ``miss_count`` are independent inputs. BatchPut is used only to populate
 the remote table before measurement and is never included in the timing.
+Select implementations with --backend and eager/graph with --execution.
+Host and operator time/bandwidth reuse the existing device profiling data.
+--kernel-profile additionally prints stage/per-worker diagnostics.
 
 The five primary settings can be supplied as command-line options or through
 environment variables:
@@ -43,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
+from batch_get_workload import token_pattern
 
 
 DEFAULT_REQUEST_LENGTH = 32_768
@@ -162,7 +166,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--aiv-cores",
+        "--aiv-cores", "--workers", dest="aiv_cores",
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", DEFAULT_AIV_CORES),
     )
@@ -245,13 +249,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--kernel-profile",
         dest="kernel_profile",
         action="store_true",
-        help="collect the per-core AIV kernel timeline for every measured sample",
+        help="print detailed stage/per-worker results from the existing device profiling data",
     )
     kernel_profile.add_argument(
         "--no-kernel-profile",
         dest="kernel_profile",
         action="store_false",
-        help="disable AIV kernel cycle profiling",
+        help="hide detailed profiling output; operator time/bandwidth are still reported",
     )
     parser.add_argument(
         "--ubmem-profile-detail", action="store_true",
@@ -269,7 +273,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
         help="AIV clock used to convert profile cycles to milliseconds",
     )
-    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    parser.add_argument("--transport", choices=("urma", "ubmem"), default=None,
+                        help="legacy transport selection; --backend selects all implementations")
+    parser.add_argument("--backend", choices=("aiv", "ubmem", "gather_read", "cpu_push_scatter"),
+                        help="BatchGet implementation; explicit selection enables NPU testing")
+    parser.add_argument("--build-dir", type=Path,
+                        help="build directory containing python/kvaf and, for AIV/UBmem, bin/*.o")
+    parser.add_argument("--device-id", type=int, default=environment_int("DEVICE_ID", 0))
+    parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28999"))
+    parser.add_argument("--execution", choices=("eager", "graph", "both"), default="eager")
+    parser.add_argument("--graph", dest="execution", action="store_const", const="graph",
+                        help="shorthand for --execution graph")
+    parser.add_argument("--graph-api", choices=("acl", "torch"), default="torch")
+    parser.add_argument("--graph-replays", type=int, default=5,
+                        help="correctness replays with changing inputs before graph timing")
+    parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
+                        help="enable a hardware run with the legacy transport arguments")
     parser.set_defaults(
         adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
@@ -286,6 +305,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    args.backend_explicit = args.backend is not None
+    expected_transport = "ubmem" if args.backend == "ubmem" else "urma"
+    if args.backend is not None and args.transport not in (None, expected_transport):
+        parser.error("--backend conflicts with --transport")
+    args.transport = args.transport or expected_transport
+    args.backend = args.backend or ("ubmem" if args.transport == "ubmem" else "aiv")
     if args.miss_count is None:
         args.miss_count = args.request_length
     args.adaptive_ub_miss_count = environment_int(
@@ -295,6 +320,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
+    if args.device_id < 0:
+        return "device-id must be non-negative"
+    if args.graph_replays <= 0:
+        return "graph-replays must be positive"
+    if args.backend in ("gather_read", "cpu_push_scatter"):
+        if args.request_length > 65536 or not 1 <= args.aiv_cores <= 8:
+            return "AICPU requires request-length <= 65536 and workers in 1..8"
+        if args.token_bytes * 65536 > 0xFFFFFFFF or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
+            return "AICPU token workspace and block bytes must fit uint32"
+        if args.adaptive_ub_device:
+            return "adaptive-ub-device applies only to AIV URMA"
     if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
         return "adaptive-ub-device and peer-ub-device apply only to URMA"
     if args.ubmem_profile_detail and (args.transport != "ubmem" or not args.kernel_profile):
@@ -333,11 +369,11 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "KVAF_ADAPTIVE_UB_DEVICES must contain unique non-empty names"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
-    if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
+    if not uses_aicpu(args) and len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
         return "npu-eids count must not exceed aiv-cores * jettys-per-core"
     if not 0 <= args.max_inflight_total <= 0xFFFFFFFF:
         return "max-inflight-total must fit uint32"
-    if args.max_inflight_total and args.max_inflight_total < 2 * args.aiv_cores:
+    if not uses_aicpu(args) and args.max_inflight_total and args.max_inflight_total < 2 * args.aiv_cores:
         return "max-inflight-total must be zero or at least twice aiv-cores"
     if args.warmup < 0:
         return "warmup must be non-negative"
@@ -348,6 +384,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     if args.contention_control_dir is not None:
+        if args.execution != "eager" or args.backend in ("gather_read", "cpu_push_scatter"):
+            return "contention controller currently supports AIV/UBmem with its own graph execution"
         if args.contention_result is None or args.contention_graph_calls <= 0 or args.miss_count <= 0:
             return "contention mode requires a result path, positive graph calls and positive miss-count"
         if args.kernel_profile:
@@ -361,6 +399,174 @@ def percentile(values: list[float], fraction: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(ordered) - 1)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def uses_aicpu(args):
+    return args.backend in ("gather_read", "cpu_push_scatter")
+
+
+def runtime_options(args, put_kernel):
+    options = dict(
+        batch_get_token_bytes=args.token_bytes, batch_get_tokens_per_block=args.tokens_per_block,
+        device_id=args.device_id, npu_core_count=args.aiv_cores,
+        batch_put_kernel_object_path=put_kernel, jettys_per_core=args.jettys_per_core,
+        batch_get_max_inflight_total=args.max_inflight_total, npu_eids=args.npu_eids,
+        adaptive_ub_device=args.adaptive_ub_device, adaptive_ub_miss_count=args.adaptive_ub_miss_count,
+        peer_ub_device=args.peer_ub_device, adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
+        transport=args.transport,
+    )
+    if uses_aicpu(args):
+        options["aicpu_batch_get_mode"] = args.backend
+    return options
+
+
+def device_profile_ms(profiles, clock_mhz):
+    if not profiles:
+        raise AssertionError("missing BatchGet device timestamps")
+    nanoseconds = "device_start_ns" in profiles[0]
+    begin, end = (("device_start_ns", "device_finish_ns") if nanoseconds else
+                  ("kernel_start_cycle", "kernel_finish_cycle"))
+    starts, finishes = [], []
+    for p in profiles:
+        if ("device_start_ns" in p) != nanoseconds:
+            raise AssertionError("cannot mix AICPU nanoseconds with AIV cycles")
+        start, finish = int(p[begin]), int(p[end])
+        if start <= 0 or finish < start:
+            raise AssertionError("invalid BatchGet device timeline")
+        starts.append(start)
+        finishes.append(finish)
+    elapsed = max(finishes) - min(starts)
+    if elapsed <= 0:
+        raise AssertionError("empty BatchGet device timeline")
+    return elapsed / (1_000_000 if nanoseconds else clock_mhz * 1000)
+
+
+def start_kernel_measurement(args, runtime):
+    # The sweeps already use these timestamps. Keep their sampling unchanged.
+    runtime.start_batch_get_kernel_profile(detailed=args.ubmem_profile_detail)
+
+
+def print_aicpu_details(args, execution, samples):
+    fields = ("request_us", "descriptor_cache_us", "source_write_us", "notify_us", "read_us",
+              "read_setup_us", "wr_build_us", "ready_wait_us", "post_us", "cq_wait_us", "scatter_us", "ack_us")
+    if any("stages" not in worker for sample in samples for worker in sample):
+        raise AssertionError("missing detailed AICPU profiling; rebuild the matching Host/device package")
+    print(f"BATCH_GET_PROFILE_CONTRACT backend={args.backend} execution={execution} "
+          "aggregation=per_sample_worker_max stages_overlap=1 profiling_overhead_included=1")
+    for field in fields:
+        values = [max(float(worker["stages"][field]) for worker in sample) for sample in samples]
+        print(f"BATCH_GET_PROFILE backend={args.backend} execution={execution} stage={field[:-3]} "
+              f"mean_us={statistics.mean(values):.6f} p50_us={percentile(values, .5):.6f} "
+              f"p99_us={percentile(values, .99):.6f}")
+    for worker in range(args.aiv_cores):
+        print(f"BATCH_GET_PROFILE_WORKER backend={args.backend} execution={execution} worker={worker} " +
+              " ".join(f"{field}_mean={statistics.mean(float(sample[worker]['stages'][field]) for sample in samples):.6f}"
+                       for field in fields))
+
+
+def print_measurements(args, execution, samples, profiles):
+    """Keep end-to-end and operator wall time distinct; count payload once."""
+    scopes = [("end_to_end", samples, "host_perf_counter")]
+    if len(profiles) != len(samples) or any(len(p) != args.aiv_cores for p in profiles):
+        raise AssertionError("BatchGet profile sample/worker count mismatch")
+    scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
+                   "device_ns" if uses_aicpu(args) else "device_cycles"))
+    payload = args.miss_count * args.token_bytes
+    for scope, durations, source in scopes:
+        mean = statistics.mean(durations)
+        if mean <= 0:
+            raise AssertionError("nonpositive BatchGet timing")
+        p50, p90, p99 = (percentile(durations, q) for q in (.5, .9, .99))
+        print(
+            f"BATCH_GET_RESULT backend={args.backend} execution={execution} scope={scope} "
+            f"samples={len(durations)} table_capacity={args.table_capacity} "
+            f"request_length={args.request_length} miss_count={args.miss_count} "
+            f"token_bytes={args.token_bytes} payload_bytes_per_call={payload} workers={args.aiv_cores} "
+            f"mean_us={mean * 1000:.6f} p50_us={p50 * 1000:.6f} "
+            f"p90_us={p90 * 1000:.6f} p99_us={p99 * 1000:.6f} "
+            f"mean_GBps={payload / mean / 1e6:.6f} p50_GBps={payload / p50 / 1e6:.6f} "
+            f"p99_GBps={payload / p99 / 1e6:.6f} "
+            f"mean_GiBps={payload / (mean / 1000) / 1024**3:.6f} "
+            f"timing_source={source} profiling_enabled=1 detail_output_enabled={int(args.kernel_profile)} "
+            "input_updates_and_validation_excluded=1 status_readback_excluded=1",
+            flush=True,
+        )
+    if args.kernel_profile:
+        if uses_aicpu(args):
+            print_aicpu_details(args, execution, profiles)
+        else:
+            print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.aiv_cores,
+                                 args.jettys_per_core, args.request_length, args.miss_count,
+                                 args.token_bytes, args.transport)
+
+
+def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
+                         miss_count, output, check_output):
+    stream = torch.npu.current_stream()
+    fixed = make_plan()
+
+    def submit():
+        runtime.batch_get(device_table, fixed[0], fixed[1], miss_count, fixed[2], output, stream=stream)
+
+    def prepare(count):
+        fresh = make_plan()
+        for target, source in zip(fixed, fresh):
+            target.copy_(source)
+        miss_count.fill_(count)
+        output.zero_()
+        stream.synchronize()
+
+    def check(count):
+        if uses_aicpu(args):
+            runtime.check_batch_get_status(stream)
+        check_output(fixed, count)
+
+    prepare(args.miss_count)
+    submit()  # Register the fixed output and prepare state before capture.
+    stream.synchronize()
+    check(args.miss_count)
+    graph = kvaf.AclGraph() if args.graph_api == "acl" else torch.npu.NPUGraph()
+    capturing = False
+    try:
+        if args.graph_api == "acl":
+            graph.capture_begin(stream)
+            capturing = True
+            submit()
+            graph.capture_end()
+            capturing = False
+        else:
+            with torch.npu.graph(graph, stream=stream):
+                submit()
+        replay = (lambda: graph.replay(stream)) if args.graph_api == "acl" else graph.replay
+        counts = (args.miss_count, args.miss_count // 2, 0, min(1, args.miss_count), args.miss_count)
+        for iteration in range(max(5, args.graph_replays)):
+            count = counts[iteration % len(counts)]
+            prepare(count)
+            replay()
+            stream.synchronize()
+            check(count)
+        for iteration in range(args.warmup):
+            prepare(args.miss_count)
+            replay()
+            stream.synchronize()
+            check(args.miss_count)
+        durations, profiles = [], []
+        for iteration in range(args.iterations):
+            prepare(args.miss_count)
+            start = time.perf_counter()
+            replay()
+            stream.synchronize()
+            durations.append((time.perf_counter() - start) * 1000)
+            check(args.miss_count)
+            profiles.append(list(runtime.batch_get_kernel_profile()))
+        print_measurements(args, "graph", durations, profiles)
+        print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
+              "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
+    finally:
+        if capturing:
+            graph.capture_end()
+        stream.synchronize()
+        graph.reset()
 
 
 def sort_request_plan_prefix(
@@ -684,60 +890,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
-            "SKIP: NPU benchmark requires torch_npu; "
+            ("FAIL: " if args.backend_explicit else "SKIP: ") + "NPU benchmark requires torch_npu; "
             f"detected {backend.name} ({backend.reason})."
         )
-        return 0
+        return 2 if args.backend_explicit else 0
+    if args.build_dir is not None:
+        sys.path.insert(0, str(args.build_dir.resolve() / "python"))
     import kvaf
 
     if not hasattr(kvaf, "NpuRuntime"):
         print(
-            "SKIP: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
-            "and KVAF_BUILD_PYTHON=ON."
+            "FAIL: rebuild KVAF with the selected NPU backend and Python bindings."
         )
-        return 0
-    if args.kernel_profile and not all(
+        return 2
+    if args.contention_control_dir is None and not all(
         hasattr(kvaf.NpuRuntime, method)
-        for method in (
-            "start_batch_get_kernel_profile",
-            "batch_get_kernel_profile",
-            "stop_batch_get_kernel_profile",
-        )
+        for method in ("start_batch_get_kernel_profile", "stop_batch_get_kernel_profile", "batch_get_kernel_profile")
     ):
         print(
             "FAIL: the loaded KVAF binding does not expose BatchGet kernel profiling",
             file=sys.stderr,
         )
         return 2
-    if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
-        print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
+    if not (args.run or args.backend_explicit):
+        print("SKIP: select --backend or pass --run on the A5/CANN target")
         return 0
 
-    kernel = Path(
+    build_dir = args.build_dir or Path(__file__).resolve().parents[2] / "build-npu"
+    kernel = (build_dir / "bin/kvaf_execute_batch_get_kernels.o" if args.build_dir is not None else Path(
         os.environ.get(
             "KVAF_BATCH_GET_KERNEL",
-            os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", ""),
+            os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", str(build_dir / "bin/kvaf_execute_batch_get_kernels.o")),
         )
-    )
-    if not kernel.is_file():
+    ))
+    if not uses_aicpu(args) and not kernel.is_file():
         print(
             "FAIL: KVAF_BATCH_GET_KERNEL must name the built kernel object",
             file=sys.stderr,
         )
         return 2
-    batch_put_kernel = Path(
+    batch_put_kernel = (build_dir / "bin/kvaf_execute_batch_put_kernels.o" if args.build_dir is not None else Path(
         os.environ.get(
             "KVAF_BATCH_PUT_KERNEL",
             str(kernel.with_name("kvaf_execute_batch_put_kernels.o")),
         )
-    )
-    if not batch_put_kernel.is_file():
+    ))
+    if not uses_aicpu(args) and not batch_put_kernel.is_file():
         print(
             "FAIL: KVAF_BATCH_PUT_KERNEL must name the built BatchPut kernel object",
             file=sys.stderr,
         )
         return 2
-    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
+    remote_cpu_service = args.peer
     if not remote_cpu_service:
         print(
             "FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service",
@@ -747,7 +951,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     torch = backend.torch
     assert torch is not None
-    device_id = int(os.environ.get("DEVICE_ID", "0"))
+    torch.npu.set_device(args.device_id)
+    if args.execution != "eager":
+        with torch.npu.stream(torch.npu.Stream(device=args.device_id)):
+            return run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service)
+    return run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service)
+
+
+def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
+    device_id = args.device_id
     request_length = args.request_length
     token_bytes = args.token_bytes
     tokens_per_block = args.tokens_per_block
@@ -761,22 +973,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch.manual_seed(args.seed)
     device = f"npu:{device_id}"
 
-    runtime = kvaf.NpuRuntime(
-        str(kernel),
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=args.aiv_cores,
-        batch_put_kernel_object_path=str(batch_put_kernel),
-        jettys_per_core=args.jettys_per_core,
-        batch_get_max_inflight_total=args.max_inflight_total,
-        npu_eids=args.npu_eids,
-        adaptive_ub_device=args.adaptive_ub_device,
-        adaptive_ub_miss_count=args.adaptive_ub_miss_count,
-        peer_ub_device=args.peer_ub_device,
-        adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
-        transport=args.transport,
-    )
+    runtime = kvaf.NpuRuntime("" if uses_aicpu(args) else str(kernel),
+        **runtime_options(args, "" if uses_aicpu(args) else str(batch_put_kernel)))
     runtime.link_to(remote_cpu_service)
     table = None
     device_table = None
@@ -784,6 +982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         print(
             "BATCH_GET_PERF_CONFIG "
+            f"backend={args.backend} execution={args.execution} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
@@ -810,25 +1009,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
             return 0
 
-        # Every table entry contains the same deterministic token pattern. Reusing
-        # a bounded source Tensor keeps setup memory independent of table capacity;
-        # each BatchPut still allocates a distinct remote entry for every key.
-        token_rows = torch.arange(
-            tokens_per_block, dtype=torch.int64, device=device
-        ).unsqueeze(1)
+        # Distinct global token IDs expose wrong-block reads and stale staging.
+        # Populate in bounded chunks even when the table is much larger than HBM.
         token_byte_indices = torch.arange(
             token_bytes, dtype=torch.int64, device=device
         ).unsqueeze(0)
-        entry_pattern = (
-            (
-                (token_rows * 131 + token_byte_indices * 17 + (token_byte_indices >> 3))
-                & 0xFF
-            )
-            .to(torch.uint8)
-            .contiguous()
-        )
         populate_entries = min(args.populate_chunk_entries, table_capacity)
-        populate_source = entry_pattern.reshape(1, block_bytes).repeat(populate_entries, 1)
+        populate_source = torch.empty((populate_entries, block_bytes), dtype=torch.uint8, device=device)
         populate_offsets = [row * block_bytes for row in range(populate_entries)]
         populate_lengths = [block_bytes] * populate_entries
         output = torch.empty(
@@ -840,6 +1027,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         populated = 0
         while populated < table_capacity:
             count = min(populate_entries, table_capacity - populated)
+            token_ids = torch.arange(populated * tokens_per_block, (populated + count) * tokens_per_block,
+                                     dtype=torch.int64, device=device)
+            populate_source[:count].copy_(token_pattern(torch, token_ids, token_byte_indices).reshape(count, block_bytes))
             keys = build_dsa_keys(count, start=populated, q_capacity=table_capacity)
             runtime.batch_put(
                 keys,
@@ -902,7 +1092,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.npu.synchronize()
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
-            entry_pattern[preflight_token_slots[:miss_count_value]],
+            token_pattern(torch, preflight_token_ids[:miss_count_value], token_byte_indices),
         ):
             raise AssertionError("BatchGet preflight payload validation failed")
         if miss_count_value < request_length and bool(
@@ -970,28 +1160,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return indices, offsets, output_indices
 
+        def check_output(plan, count, full=True):
+            if not count:
+                if bool(torch.count_nonzero(output).item()):
+                    raise AssertionError("BatchGet modified output for an empty request")
+                return
+            ids = plan[0][:count].to(torch.int64) * tokens_per_block + plan[1][:count].to(torch.int64) // token_bytes
+            destinations = plan[2][:count].to(torch.int64)
+            pattern = token_pattern(torch, ids, token_byte_indices)
+            if full:
+                expected = torch.zeros_like(output)
+                if count:
+                    expected.index_copy_(0, destinations, pattern)
+                valid = torch.equal(output, expected)
+            else:
+                valid = torch.equal(output.index_select(0, destinations), pattern)
+            if not valid:
+                raise AssertionError(f"BatchGet output mismatch: backend={args.backend}, miss_count={count}")
+
         if args.contention_control_dir is not None:
             from batch_get_multicard_perf import run_worker
 
             def submit(plan, stream):
                 runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
 
-            def check_output(plan):
-                slots = (plan[1][:miss_count_value] // token_bytes).to(torch.int64)
-                destinations = plan[2][:miss_count_value].to(torch.int64)
-                if not torch.equal(output.index_select(0, destinations), entry_pattern.index_select(0, slots)):
-                    raise AssertionError("contention graph replay payload validation failed")
-
-            run_worker(kvaf, torch, args, create_request_plan, submit, check_output)
+            run_worker(kvaf, torch, args, create_request_plan, submit,
+                       lambda plan: check_output(plan, miss_count_value, full=False))
             return 0
 
-        if args.kernel_profile:
-            if args.ubmem_profile_detail:
-                runtime.start_batch_get_kernel_profile(detailed=True)
-            else:
-                runtime.start_batch_get_kernel_profile()
-            kernel_profile_started = True
-            print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
+        start_kernel_measurement(args, runtime)
+        kernel_profile_started = True
+        print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
+
+        print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
+              "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "
+              f"profile_overhead_included=1 detail_output_enabled={int(args.kernel_profile)} "
+              "bandwidth=useful_payload_once")
+        if args.execution == "graph":
+            run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
+                                device_table, miss_count, output, check_output)
+            return 0
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
@@ -1008,6 +1216,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Keep caller-owned request Tensors alive through completion.
             torch.npu.synchronize()
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
+        if uses_aicpu(args):
+            # Do not charge deferred warmup status D2H to the first sample.
+            runtime.check_batch_get_status(torch.npu.current_stream())
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
         submit_samples: list[float] = []
@@ -1016,6 +1227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
+            output.zero_()
             # Request generation and Tensor work are deliberately excluded.
             torch.npu.synchronize()
 
@@ -1034,10 +1246,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             submit_samples.append((submitted - begin) * 1000.0)
             synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
-            if args.kernel_profile:
-                kernel_profile_samples.append(
-                    list(runtime.batch_get_kernel_profile())
-                )
+            if uses_aicpu(args):
+                runtime.check_batch_get_status(torch.npu.current_stream())
+            check_output((indices, offsets, output_indices), miss_count_value)
+            kernel_profile_samples.append(
+                list(runtime.batch_get_kernel_profile())
+            )
 
         print_samples(
             "batch_get_submit",
@@ -1063,21 +1277,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             miss_count_value,
             token_bytes,
         )
-        if args.kernel_profile:
-            print_kernel_profile(
-                kernel_profile_samples,
-                args.warmup,
-                args.kernel_profile_clock_mhz,
-                args.aiv_cores,
-                args.jettys_per_core,
-                request_length,
-                miss_count_value,
-                token_bytes,
-                args.transport,
-            )
-            runtime.stop_batch_get_kernel_profile()
-            kernel_profile_started = False
-            print("BATCH_GET_KERNEL_PROFILE_DISABLED")
+        print_measurements(args, "eager", batch_get_samples, kernel_profile_samples)
+        if args.execution == "both":
+            run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
+                                device_table, miss_count, output, check_output)
+        runtime.stop_batch_get_kernel_profile()
+        kernel_profile_started = False
+        print("BATCH_GET_KERNEL_PROFILE_DISABLED")
         print("BATCH_GET_PERF_PHASE_DONE phase=batch_get")
         return 0
     except Exception as error:
