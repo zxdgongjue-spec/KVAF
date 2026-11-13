@@ -153,6 +153,16 @@ def raw_profile_sample(result, elapsed_us):
     return sample
 
 
+def measure_raw_read(runtime, ready, src, dst, lengths, output, stream, *, profile=False, validate_ranges=False):
+    """Measure through stream completion, including the caller's async wait."""
+    begin = time.perf_counter_ns()
+    result = runtime.batch_get_raw_addr(ready, src, dst, lengths, output, stream=stream,
+                                       profile=profile, validate_ranges=validate_ranges, synchronize=profile)
+    if not profile:
+        stream.synchronize()
+    return result, (time.perf_counter_ns() - begin) / 1000
+
+
 def packet_payload(torch, offsets, packet_bytes, phase):
     # Same row/byte pattern family as BatchGet, with distinct source-slot IDs
     # and alternating contents so stale output cannot pass the next round.
@@ -270,7 +280,7 @@ def main():
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
-              "status_reset=init_only status_generation=0 status_readback=none completion=stream_sync binding_profile=1 "
+              "status_reset=init_only status_generation=0 status_readback=none completion=caller_stream_sync binding_profile=1 "
               "completion_notification=application batch_control_rpcs=0", flush=True)
         stages = {"batch_get_raw_addr": [], "verification": []}
         internal_stages = {}
@@ -291,10 +301,8 @@ def main():
                 output.fill_(0xCC)
             stream.synchronize()
             instrumented = iteration >= normal_rounds
-            begin = time.perf_counter_ns()
-            result = runtime.batch_get_raw_addr(ready, src, dst, lengths, output,
-                                               stream=stream, profile=instrumented, validate_ranges=args.validate_ranges)
-            elapsed_us = (time.perf_counter_ns() - begin) / 1000
+            result, elapsed_us = measure_raw_read(runtime, ready, src, dst, lengths, output, stream,
+                                                 profile=instrumented, validate_ranges=args.validate_ranges)
             verify_begin = time.perf_counter_ns()
             if not torch.equal(output, expected_hbm):
                 raise RuntimeError(f"NPU consumer mismatch at iteration {iteration}")
@@ -325,13 +333,13 @@ def main():
                   "device_time_overlaps_host_launch_and_synchronize=1 instrumented_rounds_excluded_from_bandwidth=1",
                   flush=True)
         stats = summarize_us(stages["batch_get_raw_addr"])
-        print("NPU_HBM_BENCH_PASS metric=python_batch_get_raw_addr_call "
+        print("NPU_HBM_BENCH_PASS metric=python_batch_get_raw_addr_to_stream_sync "
               f"packets={args.packets} packet_groups={group_description} payload_bytes={payload_bytes} "
               f"source_count={args.source_count} iterations={stats['samples']} warmup_excluded={args.warmup} "
               f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
               f"p95_us={stats['p95_us']:.3f} p99_us={stats['p99_us']:.3f} "
               f"effective_GBps={payload_bytes / stats['mean_us'] / 1000:.3f} "
-              "return_condition=data_ready completion_notification=application "
+              "return_condition=caller_stream_complete completion_notification=application "
               f"profile_iterations={args.profile_iterations} instrumented_rounds_excluded_from_bandwidth=1 "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "percentile=linear verification_included=0 setup_and_producer_and_ipc_excluded=1 "

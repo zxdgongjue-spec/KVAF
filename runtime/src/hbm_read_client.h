@@ -15,7 +15,8 @@ class HbmReader {
   Status Cancel(const ReadyToken&);
   Status Read(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
               NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
-              HbmReadProfile* profile = nullptr, bool validate_ranges = false);
+              HbmReadProfile* profile = nullptr, bool validate_ranges = false,
+              bool synchronize = false);
   Status Resolve(const ReadyToken&);
   Status Detach(const HbmReadTicket&);
   Status Shutdown();

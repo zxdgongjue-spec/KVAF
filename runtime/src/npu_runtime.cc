@@ -871,11 +871,11 @@ Status NpuRuntime::AbortPut(const PutHandle& put) {
 }
 Status NpuRuntime::BatchGetRawAddr(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
                                   NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
-                                  bool validate_ranges) {
+                                  bool validate_ranges, bool synchronize) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!initialized() || !impl_->hbm_reader) return Status::NotInitialized("attach source HBM before raw READ");
   if (impl_->closing) return Status::InvalidState("Runtime shutdown is incomplete; retry shutdown");
-  return impl_->hbm_reader->Read(ready,src,dst,lengths,output,stream,profile,validate_ranges);
+  return impl_->hbm_reader->Read(ready,src,dst,lengths,output,stream,profile,validate_ranges,synchronize);
 #else
   return Status::NotImplemented("raw-address READ requires AIV BatchGet build");
 #endif

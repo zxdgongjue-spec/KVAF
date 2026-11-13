@@ -31,10 +31,12 @@ bool fail_raw_launch=false,fail_raw_sync=false;
 std::atomic<int> pinned_buffers{0},pinned_allocation_calls{0},status_copies{0};
 std::mutex fake_stream_mutex;
 std::map<aclrtStream,std::vector<std::function<void()>>> fake_stream_tasks;
+aclrtStream capturing_stream{};
+std::vector<std::function<void()>> captured_raw_tasks;
 std::map<void*,std::size_t> pinned_memory;
 void EnqueueRawTask(aclrtStream stream,std::function<void()> task) {
   std::lock_guard<std::mutex> lock(fake_stream_mutex);
-  fake_stream_tasks[stream].push_back(std::move(task));
+  (capturing_stream==stream?captured_raw_tasks:fake_stream_tasks[stream]).push_back(std::move(task));
 }
 extern "C" aclError aclrtMallocHost(void** memory,std::size_t bytes) {
   ++pinned_allocation_calls;
@@ -59,6 +61,7 @@ extern "C" aclError aclrtMemcpyAsync(void* dst,std::size_t capacity,const void* 
   fake_stream_tasks[stream].push_back([=]{std::memcpy(dst,src,bytes);});return 0;
 }
 extern "C" aclError aclrtSynchronizeStream(aclrtStream stream) {
+  Require(capturing_stream!=stream,"raw READ must not synchronize during graph capture");
   ++raw_syncs;
   if(fail_raw_sync)return 1; // Leave queued work live, as on an uncertain wait.
   std::vector<std::function<void()>> tasks;
@@ -240,7 +243,7 @@ void RuntimeInitialization() {
     Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},receiver,reinterpret_cast<void*>(1)));
     auto read=[&] {
       kvaf::ReadyToken ready;Check(b.Ready(&ready));int64_t src=11,dst=7,n=64;
-      Check(a.BatchGetRawAddr(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+      Check(a.BatchGetRawAddr(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,false,true));
       Require(!std::memcmp(output.data()+dst,source.data()+src,n),"raw payload survives DDR lifecycle");Check(b.ReleaseBatch(ready));
     };
     read();
@@ -278,7 +281,7 @@ void ReceiverTopology() {
   int64_t src=9,dst=3,n=64;kvaf::ReadyToken t1,t2;Check(p1.Ready(&t1));Check(p2.Ready(&t2));
   Require(!d1.Read(t2,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)).ok(),"other D source identity rejected");
   Check(d1.Cancel(t1));Check(p1.ReleaseBatch(t1));Check(p1.Shutdown());
-  Check(d2.Read(t2,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+  Check(d2.Read(t2,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,false,true));
   Require(!std::memcmp(output.data()+dst,storage.data()+src,n),"second D unaffected by first D teardown");
   Check(p2.ReleaseBatch(t2));Check(p2.Shutdown());Check(d1.Shutdown());Check(d2.Shutdown());
   Require(!registrations&&!raw_transports&&!local_buffers,"topology resources released");
@@ -321,7 +324,7 @@ void MultiMemory() {
     Require(!b.Ready(tensors[(mr+1)%78],&ready).ok(),"cannot change frozen MR");
     auto bad=ready;bad.mr_id=79;
     Require(!a.Read(bad,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)).ok(),"unknown MR rejected");
-    Check(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+    Check(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,false,true));
     Require(!std::memcmp(output.data()+dst,static_cast<const uint8_t*>(tensors[mr].data)+src,n),"selected MR payload");
     Check(b.ReleaseBatch(ready));
   }
@@ -344,7 +347,7 @@ void NoHostStatusReadback() {
     const auto calls=raw_calls.load();const auto requests=proxy.requests.load();
     kvaf::HbmReadProfile profile;
     Check(a.Read(token,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},
-                 reinterpret_cast<void*>(1),&profile));
+                 reinterpret_cast<void*>(1),&profile,false,true));
     skip_all_statuses=false;skip_status_core=-1;fail_device_status=false;
     Require(!a.pending()&&raw_calls==calls+1&&profile.status_us==0,
             "ACL completion succeeds without interpreting per-core device diagnostics");
@@ -354,6 +357,50 @@ void NoHostStatusReadback() {
     Require(proxy.requests==requests,"no batch control messages for status handling");
     Check(b.ReleaseBatch(token));
   }
+  Check(b.Shutdown());Check(a.Shutdown());
+}
+
+void AsyncAndGraphReplay() {
+  raw_mode=true;fake_device=0;
+  std::vector<uint8_t> source(4096,0x37),output(128,0xcc);
+  kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::HbmReceiverTicket receiver;
+  Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));Proxy proxy(receiver);
+  kvaf::NpuPullHbmSource b(0,producer_eid);
+  Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},proxy.receiver,reinterpret_cast<void*>(1)));
+  auto stream=reinterpret_cast<aclrtStream>(1);
+  kvaf::ReadyToken token;int64_t src=7,dst=11,n=64;Check(b.Ready(&token));
+  const auto syncs=raw_syncs;
+  kvaf::HbmReadProfile profile;
+  Check(a.Read(token,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},stream,&profile));
+  Require(raw_syncs==syncs&&!a.pending()&&profile.synchronize_us==0&&!profile.kernel_event_valid,
+          "default call only enqueues, including Host-only profiling");
+  Require(std::all_of(output.begin(),output.end(),[](auto byte){return byte==0xcc;}),"queued READ has not executed on return");
+  Require(aclrtSynchronizeStream(stream)==ACL_SUCCESS,"caller synchronizes warmup");
+  Require(!std::memcmp(output.data()+dst,source.data()+src,n),"external sync makes output ready");
+  Check(b.ReleaseBatch(token));
+
+  std::fill(source.begin(),source.end(),0x51);Check(b.Ready(&token));
+  const auto allocations=acl_allocation_calls.load();const int acquired=local_acquires,sync_before_capture=raw_syncs;
+  capturing_stream=stream;
+  Check(a.Read(token,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},stream));
+  // A consumer captured after READ must see each replay's current data.
+  EnqueueRawTask(stream,[&]{Require(!std::memcmp(output.data()+dst,source.data()+src,n),"same-stream graph consumer sees READ data");});
+  capturing_stream=nullptr;
+  Require(captured_raw_tasks.size()==2&&raw_syncs==sync_before_capture&&
+          acl_allocation_calls==allocations&&local_acquires==acquired,"warmed capture only records the READ and consumer");
+  const auto host_launches=raw_calls.load();
+  for(int round=0;round<3;++round) {
+    if(round) {
+      std::fill(source.begin(),source.end(),std::uint8_t(0x51+round));
+      src+=13;dst+=2;n-=3;Check(b.Ready(&token));
+    }
+    const auto wqes=raw_wqes.load();
+    for(const auto& task:captured_raw_tasks)EnqueueRawTask(stream,task);
+    Require(aclrtSynchronizeStream(stream)==ACL_SUCCESS,"caller waits for graph replay");
+    Require(raw_calls==host_launches&&raw_wqes==wqes+1,"graph replay executes READ without running Host submission or batch state");
+    Check(b.ReleaseBatch(token));
+  }
+  captured_raw_tasks.clear(); // Destroy graph before retiring cached registrations.
   Check(b.Shutdown());Check(a.Shutdown());
 }
 
@@ -371,7 +418,7 @@ void SubmissionFailure(const std::string& mode) {
   const auto requests=proxy.requests.load();
   fail_raw_launch=mode=="launch-failure";fail_raw_sync=mode=="sync-failure";
   const auto status=a.Read(token,{&src,1},{&dst,1},{&n,1},
-      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1));
+      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,false,true);
   Require(status.code()==kvaf::StatusCode::kInDoubt&&a.pending(),"failed ACL completion retains batch");
   Require(raw_calls==calls+1&&raw_syncs==syncs+(fail_raw_launch?0:1)&&!status_copies,
           "submission and synchronization have no Host status copy");
@@ -391,6 +438,7 @@ int main(int argc,char** argv){try{
     Require(mode=="launch-failure"||mode=="sync-failure","known ACL fault mode");
     SubmissionFailure(mode);
   }
+  AsyncAndGraphReplay();
   NoHostStatusReadback();
   ReceiverTopology();
   MultiMemory();
@@ -420,7 +468,7 @@ int main(int argc,char** argv){try{
     const auto calls=raw_calls.load(),syncs=raw_syncs;
     const auto requests=proxy.requests.load();
     const auto status=a.Read(t,{src.data(),src.size()},{dst.data(),dst.size()},
-                             {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1),nullptr,true);
+                             {sizes.data(),sizes.size()},out,reinterpret_cast<void*>(1),nullptr,true,true);
     Require(raw_calls-calls<=1 && raw_syncs-syncs==raw_calls-calls,"single fused launch and final synchronization");
     Require(proxy.requests==requests,"READ success/rejection performs no batch control RPC");
     return status;
@@ -448,7 +496,7 @@ int main(int argc,char** argv){try{
   const int cached_acquires=local_acquires,allocated=acl_allocation_calls,memsets=acl_memset_calls;
   kvaf::HbmReadProfile profile;
   Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
-               {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
+               {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile,false,true));
   Require(raw_wqes-before_wqes==sources.size(),"one WQE per request, including lengths above 64 KiB");
   const double host_phases=profile.validation_us+profile.buffers_us+profile.register_output_us+
       profile.event_record_us+profile.launch_us+profile.synchronize_us+profile.event_query_us+
@@ -460,7 +508,7 @@ int main(int argc,char** argv){try{
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   fail_timing_query=true;
   Check(a.Read(token,{sources.data(),sources.size()},{destinations.data(),destinations.size()},
-               {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile));
+               {lengths.data(),lengths.size()},out,reinterpret_cast<void*>(1),&profile,false,true));
   Require(!profile.kernel_event_valid && profile.event_error==123 && !a.pending(),
           "timing query failure does not change successful DMA result");
   Require(local_acquires==cached_acquires && local_buffers==1,"output registration reused across batches");
@@ -478,7 +526,8 @@ int main(int argc,char** argv){try{
   Require(timing_queries==queries,"unprofiled READ does not query timing events");
   Require(!std::memcmp(output.data()+7,source+9,67)&&!std::memcmp(output.data()+5000,source+90001,70001),"raw-array offsets are relative to logical source/output");
   Require(b.frozen(),"successful READ does not release producer state through Runtime");
-  Require(!read(token,sources,destinations,lengths).ok() && raw_calls==before+1,"completed sequence cannot replay even before app releases source");
+  Check(read(token,sources,destinations,lengths));
+  Require(raw_calls==before+2,"one frozen source batch may be read repeatedly, like BatchGet and graph replay");
   // This release represents the application's own consumer-done notification.
   Check(b.ReleaseBatch(token));Check(b.Ready(&token));
   Require(!b.ReleaseBatch(saved).ok()&&!b.CancelBatch(saved).ok(),"explicit source token rejects delayed notifications");

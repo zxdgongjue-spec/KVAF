@@ -35,13 +35,13 @@ struct HbmReceiverTicket {
   std::uint64_t receiver_id{}, receiver_epoch{};
   bool valid() const { return !control_address.empty() && receiver_id && receiver_epoch; }
 };
-// Opt-in diagnostics for one synchronous call. Host stages use steady_clock;
-// kernel_event_us is the device event interval around the kernel on its stream
-// and overlaps launch/synchronize (never add it to the Host phase sum).
+// Opt-in Host diagnostics for one call, using steady_clock. Device event timing
+// requires synchronize=true; asynchronous calls neither record events nor wait.
+// kernel_event_us overlaps launch/synchronize (never add it to the Host phase sum).
 struct HbmReadProfile {
   double total_us{}, validation_us{}, buffers_us{}, register_output_us{};
   // status_us is retained for profile compatibility and stays zero:
-  // completion uses stream synchronization without Host status readback.
+  // the caller owns stream completion; there is no Host status readback.
   double event_record_us{}, launch_us{}, synchronize_us{}, event_query_us{}, status_us{};
   double cleanup_us{}, kernel_event_us{};
   bool kernel_event_valid{};

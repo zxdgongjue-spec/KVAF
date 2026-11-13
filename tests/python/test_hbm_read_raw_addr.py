@@ -96,6 +96,8 @@ def main():
     parser.add_argument("--hbm-mrs", type=int, default=1,
                         help="shared source tensors, independently registered for both CPU and NPU Pull")
     parser.add_argument("--rounds", type=int, default=None)
+    parser.add_argument("--graph", action="store_true",
+                        help="warm up and capture one raw READ graph per MR, then replay changing data")
     args = parser.parse_args()
     if not 1 <= args.hbm_mrs <= 4096:
         parser.error("hbm-mrs must be in 1..4096")
@@ -137,6 +139,12 @@ def main():
     try:
         stream = torch.npu.Stream(device=args.device_a)
         output = torch.empty(110000, dtype=torch.uint8, device=f"npu:{args.device_a}")
+        with torch.npu.stream(stream):
+            raw_sources = torch.tensor(OFFSETS, dtype=torch.int64, device=output.device)
+            raw_destinations = torch.tensor(RAW_DESTINATIONS, dtype=torch.int64, device=output.device)
+            raw_lengths = torch.tensor(RAW_LENGTHS, dtype=torch.int64, device=output.device)
+        stream.synchronize()
+        graphs = {}
         for round_id in range(args.rounds):
             cpu_batch, raw_batch = receive(parent, "ready")
             assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
@@ -153,12 +161,29 @@ def main():
             assert runtime.last_offload_checksum() == fnv64(b"".join(bytes(row.tolist()) for row in rows))
             with torch.npu.stream(stream):
                 output.fill_(0xCC)
-            with torch.npu.stream(stream):
-                raw_sources = torch.tensor(OFFSETS, dtype=torch.int64, device=output.device)
-                raw_destinations = torch.tensor(RAW_DESTINATIONS, dtype=torch.int64, device=output.device)
-                raw_lengths = torch.tensor(RAW_LENGTHS, dtype=torch.int64, device=output.device)
-            runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
-                                      raw_lengths, output, stream=stream)
+            if args.graph:
+                # A graph fixes source/MR, output and metadata addresses. It bypasses
+                # Host ReadyToken checks on replay; select the matching MR here.
+                if raw_batch.mr_id not in graphs:
+                    runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
+                                              raw_lengths, output, stream=stream)
+                    stream.synchronize()  # Register this MR/output before capture.
+                    graph = kvaf.AclGraph()
+                    graph.capture_begin(stream)
+                    try:
+                        runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
+                                                  raw_lengths, output, stream=stream)
+                    finally:
+                        graph.capture_end()
+                    graphs[raw_batch.mr_id] = graph
+                    # Erase warmup's result so only replay can satisfy verification.
+                    with torch.npu.stream(stream):
+                        output.fill_(0xCC)
+                graphs[raw_batch.mr_id].replay(stream)
+            else:
+                runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
+                                          raw_lengths, output, stream=stream)
+            stream.synchronize()  # Completion belongs to the caller, in both modes.
             raw_expected = cpu_expected  # Both paths read this round's same tensor contents.
             expected = torch.full((110000,), 0xCC, dtype=torch.uint8)
             for src, dst, n in zip(OFFSETS, RAW_DESTINATIONS, RAW_LENGTHS):
@@ -173,14 +198,19 @@ def main():
             parent.send(("reuse", round_id))
             assert receive(parent, "released") == round_id
             print(f"HBM_RAW_ROUND_PASS round={round_id} mr_id={raw_batch.mr_id} raw_bytes={sum(RAW_LENGTHS)} "
-                  "ddr_batch_get=1 cpu_pull=1 shared_source_tensors=1 padding_checked=1 npu_consumer_checked=1", flush=True)
+                  f"graph={int(args.graph)} ddr_batch_get=1 cpu_pull=1 shared_source_tensors=1 "
+                  "padding_checked=1 npu_consumer_checked=1", flush=True)
+        for graph in graphs.values():
+            graph.reset()  # Retire graphs before source shutdown retires their transport.
+        graphs.clear()
         parent.send(("shutdown", None))
         receive(parent, "closed")
         worker.join(10)
         assert worker.exitcode == 0
         runtime.shutdown()
         print(f"HBM_RAW_PASS npu_mrs={args.hbm_mrs} cpu_mrs={args.hbm_mrs} "
-              "shared_source_tensors=1 shared_runtime=1 no_access_table_for_hbm=1 connector_api=1", flush=True)
+              f"graph={int(args.graph)} shared_source_tensors=1 shared_runtime=1 "
+              "no_access_table_for_hbm=1 connector_api=1", flush=True)
     except BaseException:
         traceback.print_exc()
         if runtime.pending_raw_addr or runtime.pending_offload or worker.is_alive():

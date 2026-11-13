@@ -116,19 +116,24 @@ class NpuRuntime final : public Runtime {
   // Saved connections are selected by ReadyToken; no AccessTable/DDR is used.
   Status ListenHbm(const std::string& listen_address, const std::string& advertise_address,
                    const std::string& local_eid, HbmReceiverTicket*);
-  // Fence this batch locally against late READs; application coordinates producer reuse.
+  // Fence future Host submissions; queued work/graphs still need caller completion.
   Status CancelRawAddr(const ReadyToken&);
   // As with BatchGet, output registrations are cached until detach/shutdown.
   // Keep output storage alive and at a stable address until then. Callers guarantee
   // valid, disjoint ranges and lengths in 1..UINT32_MAX within device READ limits.
-  // Each request produces one WQE; validate_ranges checks lengths/bounds on device.
-  // Success means ACL submission and stream synchronization succeeded. Device
-  // diagnostics are not copied to Host or turned into errors. The application
-  // owns data validation and reuse notifications; no per-batch control RPC.
+  // Enqueue one WQE per request on the caller's stream, like ordinary BatchGet.
+  // Default success means submitted, not completed. Warm up registrations before
+  // graph capture; keep metadata/output/source and communication resources alive
+  // until all work finishes and captured graphs are destroyed. The caller owns
+  // synchronization and producer reuse. Optional synchronize waits on this stream.
+  // validate_ranges checks lengths/bounds on device; no Host status readback.
   Status BatchGetRawAddr(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
-                         HbmReadProfile* profile = nullptr, bool validate_ranges = false);
-  Status ResolveRawAddr(const ReadyToken&); // Retries local cleanup only, never DMA or notifications.
+                         HbmReadProfile* profile = nullptr, bool validate_ranges = false,
+                         bool synchronize = false);
+  // Reports quarantined submission/wait failures; never replays READ or notifies.
+  Status ResolveRawAddr(const ReadyToken&);
+  // Failure quarantine only, not a completion query for normally queued work.
   bool pending_raw_addr() const;
 
   std::uint32_t device_id() const;

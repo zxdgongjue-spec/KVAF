@@ -218,7 +218,7 @@ class NpuPythonRuntime final {
 
   ~NpuPythonRuntime() {
     if (!native_->Shutdown().ok()) {
-      (void)raw_retained_.release();
+      (void)raw_failed_inputs_.release();
       (void)raw_outputs_.release();
     }
   }
@@ -355,11 +355,11 @@ class NpuPythonRuntime final {
   }
   void ResolveRawAddr(const ReadyToken& ready) {
     Status status;{py::gil_scoped_release release;status=native_->ResolveRawAddr(ready);}
-    if (!native_->pending_raw_addr()) raw_retained_ = py::none();
     ThrowIfError(status);
   }
   py::dict BatchGetRawArrays(const ReadyToken& ready,const py::object& src,const py::object& dst,
-                         const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges) {
+                         const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges,
+                         bool synchronize) {
     using Clock = std::chrono::steady_clock;
     const auto begin=profiling?Clock::now():Clock::time_point{};
     auto previous=begin;
@@ -388,7 +388,6 @@ class NpuPythonRuntime final {
     mark(binding.lengths);
     if (sources.size != destinations.size || sources.size != sizes.size || sources.size > 4096)
       throw py::value_error("raw READ metadata must have equal lengths in 1..4096");
-    if(native_->pending_raw_addr())throw py::value_error("resolve the pending raw READ first");
     mark(binding.checks);
     const auto view=GetNpuTensorView(output,"output",false);
     if(view.device.attr("index").cast<std::uint32_t>()!=native_->device_id())
@@ -406,16 +405,18 @@ class NpuPythonRuntime final {
     if(!raw_outputs_.contains(source_key))raw_outputs_[source_key]=py::dict();
     auto outputs=raw_outputs_[source_key].cast<py::dict>();
     outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data),view.bytes)]=output;
-    raw_retained_=py::make_tuple(src,dst,lengths,output,stream);
     HbmReadProfile profile;
     mark(binding.retain);
     const auto status=native_->BatchGetRawAddr(ready,sources,destinations,sizes,
-        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr,validate_ranges);
+        {const_cast<void*>(view.data),view.bytes,DeviceKind::kNpu},acl_stream,profiling?&profile:nullptr,validate_ranges,synchronize);
     mark(binding.native);
-    if(!native_->pending_raw_addr())raw_retained_=py::none();
+    // Normal async input lifetimes belong to the caller, just like BatchGet.
+    // Preserve inputs if submission/wait failed and device execution is uncertain.
+    if(!status.ok() && native_->pending_raw_addr() && !raw_failed_inputs_.contains(source_key))
+      raw_failed_inputs_[source_key]=py::make_tuple(src,dst,lengths,output,stream);
     ThrowIfError(status);
     mark(binding.release);
-    py::dict result; result["state"]="done"; result["sequence"]=ready.sequence;
+    py::dict result; result["state"]=synchronize?"done":"submitted"; result["sequence"]=ready.sequence;
     mark(binding.result);
     if(profiling) {
       py::dict timing;
@@ -708,11 +709,11 @@ class NpuPythonRuntime final {
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
     raw_outputs_=py::dict();
-    raw_retained_=py::none();
+    raw_failed_inputs_=py::dict();
   }
 
  private:
-  py::object raw_retained_{py::none()};
+  py::dict raw_failed_inputs_;
   py::dict raw_outputs_;
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
@@ -756,17 +757,19 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
-           "Return after kernel submission and stream synchronization succeed; device status is not read back. "
-           "Application owns data validation and completion/reuse notifications. "
-           "profile=True adds Host stage timings and a device event "
-           "interval around the kernel to the returned profile dictionary; profiling is off by default. "
+           py::arg("synchronize")=false,
+           "Enqueue peer HBM READ on the caller's stream, like batch_get. Default success means submitted. "
+           "Warm up registrations before graph capture; synchronize=False supports capture and replay. "
+           "Caller owns metadata lifetime, stream completion, graph lifetime and producer reuse. "
+           "synchronize=True waits for completion. profile=True adds Host timings; device event timing "
+           "is available only with synchronize=True. Device status is not read back. "
            "Output Tensors are retained until Runtime shutdown; do not resize their storage. "
            "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
            "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
       .def("cancel_raw_addr", &NpuPythonRuntime::CancelRawAddr, py::arg("ready"),
-           "Locally fence a published batch without reading it; application coordinates producer reuse. "
-           "Does not send a notification. Pending DMA must be resolved first.")
+           "Fence future Host submissions for this batch. Does not cancel queued work or captured graphs. "
+           "Application waits for execution and retires graphs before producer reuse; no notification is sent.")
       .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
       .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("ready"),

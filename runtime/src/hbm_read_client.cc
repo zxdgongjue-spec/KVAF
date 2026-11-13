@@ -148,7 +148,7 @@ struct Engine {
     return RunKernel(args,output,stream);
   }
   Status RunDevice(NpuInt64ArrayView src,NpuInt64ArrayView dst,NpuInt64ArrayView lengths,
-                   MutableBufferView output,void* stream,HbmReadProfile* profile,bool validate_ranges) {
+                   MutableBufferView output,void* stream,HbmReadProfile* profile,bool validate_ranges,bool synchronize) {
     if(!transport || !stream || uncertain || local || descriptors.data)
       return Status::InvalidState("raw READ engine is not idle");
     KvafExecuteBatchGetRawAddrKernelArgs args{};
@@ -158,10 +158,10 @@ struct Engine {
     args.request_count=src.size;args.input_mode=KVAF_RAW_NPU_OFFSETS;
     args.validate_ranges=validate_ranges;
     cache_output=true;
-    return RunKernel(args,output,stream,profile);
+    return RunKernel(args,output,stream,profile,synchronize);
   }
   Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream,
-                   HbmReadProfile* profile=nullptr) {
+                   HbmReadProfile* profile=nullptr,bool synchronize=true) {
     auto s=Timed(profile?&profile->buffers_us:nullptr,[&]() -> Status {
     if(!statuses.data) {
       auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
@@ -177,7 +177,7 @@ struct Engine {
       auto allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
     }
-    if(profile)for(auto* event:{&profile_start,&profile_end})
+    if(profile && synchronize)for(auto* event:{&profile_start,&profile_end})
       if(!*event && aclrtCreateEventWithFlag(event,ACL_EVENT_TIME_LINE)!=ACL_SUCCESS)
         return Status::Internal("create raw READ timing event");
     return Status::OK();
@@ -192,20 +192,22 @@ struct Engine {
     args.channel_entity=entity;args.block_count=cores;args.jettys_per_core=jettys;args.batch_get_max_inflight_total=budget;
     kernel_finished=false;
     uncertain=true; // Includes launch errors: never assume the device saw no work.
-    if(profile)profile->event_error=Timed(&profile->event_record_us,[&]{
+    if(profile && synchronize)profile->event_error=Timed(&profile->event_record_us,[&]{
       return aclrtRecordEvent(profile_start,static_cast<aclrtStream>(stream));});
     if(Timed(profile?&profile->launch_us:nullptr,[&]{
         return KvafExecuteBatchGetRawAddrLaunch(&args,static_cast<aclrtStream>(stream));}))
       return Status::InDoubt("raw READ launch/stream completion uncertain");
-    if(profile && !profile->event_error)profile->event_error=Timed(&profile->event_record_us,[&]{
+    if(profile && synchronize && !profile->event_error)profile->event_error=Timed(&profile->event_record_us,[&]{
       return aclrtRecordEvent(profile_end,static_cast<aclrtStream>(stream));});
-    // Completion follows the ACL launch/stream result. Per-core diagnostics
-    // stay on device and are not turned into a Host return status.
-    if(Timed(profile?&profile->synchronize_us:nullptr,[&]{
-        return aclrtSynchronizeStream(static_cast<aclrtStream>(stream));})!=ACL_SUCCESS)
-      return Status::InDoubt("raw READ launch/stream completion uncertain");
-    kernel_finished=true;
-    if(profile && !profile->event_error) {
+    // The default path only enqueues work, including during graph capture.
+    // Synchronization and result readiness belong to the caller.
+    if(synchronize) {
+      if(Timed(profile?&profile->synchronize_us:nullptr,[&]{
+          return aclrtSynchronizeStream(static_cast<aclrtStream>(stream));})!=ACL_SUCCESS)
+        return Status::InDoubt("raw READ launch/stream completion uncertain");
+      kernel_finished=true;
+    }
+    if(profile && synchronize && !profile->event_error) {
       float ms{};
       profile->event_error=Timed(&profile->event_query_us,[&]{return aclrtEventElapsedTime(&ms,profile_start,profile_end);});
       profile->kernel_event_valid=!profile->event_error && std::isfinite(ms) && ms>=0;
@@ -214,25 +216,15 @@ struct Engine {
     uncertain=false;return Status::OK();
   }
 };
-enum class Pending { None, Dma, Cleanup };
 struct Connection {
   std::unique_ptr<ReadLink> link;
   std::string local_eid;
   Engine engine;
-  Pending pending{Pending::None};
-  std::uint64_t sequence{},last_sequence{},mr_id{1};
+  std::uint64_t cancelled_sequence{},cancelled_mr{1};
+  std::uint64_t failed_sequence{},failed_mr{1};
   bool ready{};
-  Status result;
   Connection(std::shared_ptr<hr::ControlChannel> a,const HbmReadTicket& t,const std::string& eid,std::uint32_t c,std::uint32_t j,std::uint32_t b):
       link(new ReadLink(a,t)),local_eid(eid),engine(c,j,b){}
-  Status Resolve(HbmReadProfile* profile=nullptr) {
-    if(pending==Pending::None)return Status::InvalidState("no pending raw READ");
-    if(pending==Pending::Dma || engine.uncertain)return Status::InDoubt("raw READ DMA unresolved; retain A output and B source; no READ replay");
-    auto s=Timed(profile?&profile->cleanup_us:nullptr,[&]{return engine.Cleanup();});if(!s.ok())return s;
-    // Successful stream completion is the end of this operation. The application delivers
-    // completion/reuse notifications through its own channel, outside Runtime.
-    pending=Pending::None;last_sequence=sequence;return result;
-  }
 };
 }
 struct HbmReader::Impl {
@@ -331,12 +323,13 @@ Status HbmReader::Cancel(const ReadyToken& ready) {
   auto& c=*it->second;
   if(!c.link->ticket.matches(*source) || !c.link->ticket.bytes_for(ready.mr_id) || !ready.sequence)
     return Status::InvalidArgument("invalid NPU Pull cancellation identity");
-  if(c.pending!=Pending::None)return Status::Busy("resolve the existing raw READ/cancellation first");
-  if(ready.sequence==c.last_sequence && ready.mr_id==c.mr_id)return Status::OK();
-  if(ready.sequence<=c.last_sequence)return Status::InvalidState("NPU Pull batch already consumed");
+  if(c.engine.uncertain)return Status::Busy("raw READ submission/completion is unresolved");
+  if(ready.sequence==c.cancelled_sequence && ready.mr_id==c.cancelled_mr)return Status::OK();
+  if(ready.sequence<=c.cancelled_sequence)return Status::InvalidState("NPU Pull batch already cancelled");
   // Fence a skipped batch locally. The application coordinates source reuse;
   // this operation neither notifies the producer nor changes its state.
-  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.last_sequence=ready.sequence;
+  // Already enqueued work and captured graphs remain the caller's responsibility.
+  c.cancelled_sequence=ready.sequence;c.cancelled_mr=ready.mr_id;
   return Status::OK();
 }
 Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmReadTicket& ticket,const std::string& local_eid) {
@@ -427,7 +420,6 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
       if(c.engine.uncertain) {
         const auto quiesced=c.engine.QuiesceProbe();
         if(!quiesced.ok()) {
-          c.pending=Pending::Dma;
           return Status::InDoubt("HBM attach probe quarantined; source="+std::to_string(ticket.source_id)+"; retain producer source; "+s.message()+"; "+quiesced.message());
         }
         s=Status::Internal("startup probe READ failed; transport quiesced: "+s.message());
@@ -455,7 +447,7 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
 }
 Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
                        NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
-                       bool validate_ranges) {
+                       bool validate_ranges,bool synchronize) {
   if(profile)*profile={};
   ProfileTimer total_timer(profile?&profile->total_us:nullptr);
   const auto validation_begin=profile?ProfileClock::now():ProfileClock::time_point{};
@@ -466,11 +458,11 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
   auto it=impl_->connections.find({source->source_id,source->source_epoch});
   if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not attached");
   auto& c=*it->second;
-  if(!c.ready || c.pending!=Pending::None)return Status::Busy("raw READ region not ready or has unresolved work");
+  if(!c.ready || c.engine.uncertain)return Status::Busy("raw READ region not ready or has unresolved work");
   const auto& ticket=c.link->ticket;
   if(!ticket.matches(*source) || !ticket.bytes_for(ready.mr_id) ||
-      !ready.sequence || ready.sequence<=c.last_sequence)
-    return Status::InvalidArgument("NPU Pull ReadyToken belongs to another source or consumed batch");
+      !ready.sequence || ready.sequence<=c.cancelled_sequence)
+    return Status::InvalidArgument("NPU Pull ReadyToken belongs to another source or cancelled batch");
   const auto base=reinterpret_cast<std::uint64_t>(output.data);
   if(!output.valid() || output.device!=DeviceKind::kNpu || !stream || output.bytes>UINT64_MAX-base ||
       !src.data || !dst.data || !lengths.data || !src.size || src.size>offload::kMaxSpans ||
@@ -486,13 +478,17 @@ Status HbmReader::Read(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64Arr
     if(address>UINT64_MAX-bytes || (address<=base ? base-address<bytes : address-base<output.bytes))
       return Status::InvalidArgument("NPU raw READ metadata must not overlap output");
   }
-  c.sequence=ready.sequence;c.mr_id=ready.mr_id;c.engine.mr_id=ready.mr_id;c.result=Status::OK();
+  c.engine.mr_id=ready.mr_id;
   if(profile)profile->validation_us=std::chrono::duration<double,std::micro>(ProfileClock::now()-validation_begin).count();
-  c.pending=Pending::Dma;
-  s=c.engine.RunDevice(src,dst,lengths,output,stream,profile,validate_ranges);
-  if(c.engine.uncertain)return s;
-  c.result=s;c.pending=Pending::Cleanup;
-  return c.Resolve(profile);
+  s=c.engine.RunDevice(src,dst,lengths,output,stream,profile,validate_ranges,synchronize);
+  if(c.engine.uncertain) {
+    c.failed_sequence=ready.sequence;c.failed_mr=ready.mr_id;
+    return s;
+  }
+  // Release the temporary reference, retaining cached registrations for queued
+  // work and graph replay exactly as ordinary BatchGet does.
+  const auto cleanup=Timed(profile?&profile->cleanup_us:nullptr,[&]{return c.engine.Cleanup();});
+  return s.ok()?cleanup:s;
 }
 Status HbmReader::Resolve(const ReadyToken& ready){
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
@@ -503,9 +499,11 @@ Status HbmReader::Resolve(const ReadyToken& ready){
   if(it==impl_->connections.end())return Status::NotFound("NPU Pull source is not attached");
   const auto& ticket=it->second->link->ticket;
   if(!ticket.matches(*source) || !ticket.bytes_for(ready.mr_id) ||
-      !ready.sequence || ready.sequence!=it->second->sequence || ready.mr_id!=it->second->mr_id)
+      !ready.sequence || ready.sequence!=it->second->failed_sequence || ready.mr_id!=it->second->failed_mr)
     return Status::InvalidArgument("raw READ recovery token does not match the pending batch");
-  return it->second->Resolve();
+  return it->second->engine.uncertain
+      ?Status::InDoubt("raw READ submission/completion unresolved; retain resources; no READ replay")
+      :Status::InvalidState("no unresolved raw READ");
 }
 Status HbmReader::Detach(const HbmReadTicket& ticket){
   std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
@@ -517,7 +515,7 @@ Status HbmReader::Detach(const HbmReadTicket& ticket){
   auto& c=*it->second;
   if(!c.link->ticket.same_registration(ticket))
     return Status::InvalidArgument("HBM detach ticket does not match the attached source");
-  if(c.pending!=Pending::None)return Status::InDoubt("resolve raw READ before detach");
+  if(c.engine.uncertain)return Status::InDoubt("raw READ submission/completion unresolved; retain resources before detach");
   // Close may destroy queues before a later MR unregister fails. Retrying
   // teardown is safe; admitting another READ on that transport is not.
   c.ready=false;
@@ -538,5 +536,5 @@ Status HbmReader::Shutdown(){
   while(!impl_->connections.empty()){const auto ticket=impl_->connections.begin()->second->link->ticket;auto s=Detach(ticket);if(!s.ok()){impl_->stop=false;impl_->thread=std::thread([this]{Serve();});return s;}}
   if(impl_->listener>=0){close(impl_->listener);impl_->listener=-1;}
   impl_->receiver={};return Status::OK();}
-bool HbmReader::pending()const{std::lock_guard<std::recursive_mutex> lock(impl_->mutex);for(auto& item:impl_->connections)if(item.second->pending!=Pending::None)return true;return false;}
+bool HbmReader::pending()const{std::lock_guard<std::recursive_mutex> lock(impl_->mutex);for(auto& item:impl_->connections)if(item.second->engine.uncertain)return true;return false;}
 }

@@ -13,6 +13,28 @@ from pull_bench_utils import scattered_offsets, summarize_us
 
 
 class PullBenchmarks(unittest.TestCase):
+    def test_raw_read_timing_includes_external_wait(self):
+        clock = [0]
+        calls = []
+
+        def submit(*args, **kwargs):
+            self.assertFalse(kwargs["synchronize"])
+            calls.append("enqueue")
+            clock[0] += 10_000
+            return {"state": "submitted"}
+
+        def synchronize():
+            calls.append("wait")
+            clock[0] += 40_000
+
+        with patch.object(raw_bench.time, "perf_counter_ns", side_effect=lambda: clock[0]):
+            result, elapsed = raw_bench.measure_raw_read(
+                SimpleNamespace(batch_get_raw_addr=submit), object(), (), (), (), object(),
+                SimpleNamespace(synchronize=synchronize))
+        self.assertEqual(calls, ["enqueue", "wait"])
+        self.assertEqual(result["state"], "submitted")
+        self.assertEqual(elapsed, 50)
+
     def test_percentiles_and_single_sample(self):
         result = summarize_us([100, 0, 20, 10])
         for name, value in dict(samples=4, mean_us=32.5, p50_us=15, p95_us=88,

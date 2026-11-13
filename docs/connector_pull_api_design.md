@@ -140,9 +140,9 @@ lengths[N]
 
 NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数量，Host 另检查元数据存储不与整个 output 分配范围重叠。随后只启动一次 raw READ V2 算子，每个输入段直接生成一个 WQE，填写时计算基址加偏移并读取对应长度。默认不预扫描长度，由应用保证每条长度为 1..UINT32_MAX 且符合设备单次 READ 上限、源/目的范围合法、目的段不重叠；`validate_ranges=True` 可开启正长度、32 位长度字段及源/目的边界诊断，不检查目的重叠或查询设备能力。最多 4096 个输入段，对应最多 4096 个 WQE，无 64 KiB 拆分或前缀表。
 
-各核直接按输入请求数量划分任务，单个请求完整交给一个核处理；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 在算子提交和 stream 同步成功后结束该批次，不生成启动编号、不回读或检查设备 status。设备 status/队列缓冲仅在初始化时清零；每核的 WQE/CQ 诊断及队列错误标记继续留在设备上。提交或同步失败时保留未决资源，恢复不重放 READ。
+各核直接按输入请求数量划分任务，单个请求完整交给一个核处理；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 默认只提交算子，由外层等待 stream 完成，不生成启动编号、不回读或检查设备 status。设备 status/队列缓冲仅在初始化时清零；每核的 WQE/CQ 诊断及队列错误标记继续留在设备上。提交或同步失败时保留未决资源，恢复不重放 READ。
 
-NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。接口执行期间不得修改或释放它们。Python 绑定保留三数组和 stream 到正常完成或本地清理成功；output 硬件注册缓存保留到连接关闭，Python Tensor 引用保守保留到 Runtime shutdown 成功。如果 `pending_raw_addr` 为真，应用仍不得修改或复用本批存储。C++ 调用者自行保持存储有效。已启用的设备内容检查发现非法范围时不发 READ，但 Host 不会因此收到 status 异常；应用负责合法范围及输出校验。每次同步完成后，ReadyToken 会被标记为已消费；下一次读取使用新批次。
+NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。入队到执行完成期间不得修改或释放它们，捕获图使用的存储还要保留到图销毁。正常调用由调用方保活三个数组和 stream；output 硬件注册缓存保留到连接关闭，Python output 引用保守保留到 Runtime shutdown 成功。`pending_raw_addr` 仅表示提交/显式同步失败后的隔离状态，不是正常异步任务的完成查询；失败时绑定额外保留输入，应用仍不得修改或复用本批存储。C++ 调用者自行保持存储有效。已启用的设备内容检查发现非法范围时不发 READ，但 Host 不会因此收到 status 异常；应用负责合法范围及输出校验。不记录成功批次的“已消费”状态，同一冻结源可重复读取。应用负责避免释放后的迟到读取。
 
 应用不再逐段创建对象，原 READ 的 WQE 编码、多 Jetty 调度及 CQ 处理规则保持不变。公开入口只保留 NPU Tensor 三数组形式；建链探测内部保留专用 Host 描述符路径。
 
@@ -464,17 +464,17 @@ result = runtime.batch_get_raw_addr(
 
 | 接口 | 作用 |
 |---|---|
-| `batch_get_raw_addr(...) → result` | 按三个数组描述的区间读取 A HBM 到 B output，算子提交和 stream 同步成功后返回，不回读设备 status；不发送完成通知 |
-| `resolve_raw_addr(ready)` | 校验源身份及批次号后只重试本地资源清理，不重发 READ、不发送通知；DMA 不确定时继续保留资源 |
-| `cancel_raw_addr(ready)` | 只在读取端记录本批不可再读；应用自行通知生产端；未决 DMA 不能通过取消释放 |
+| `batch_get_raw_addr(...) → result` | 与普通 BatchGet 一样默认 synchronize=False，只入队并返回 submitted；显式 True 等待 stream 完成并返回 done；不回读设备 status、不发送完成通知 |
+| `resolve_raw_addr(ready)` | 校验失败批次并报告隔离状态，不执行外层同步、不重发 READ、不发送通知；执行不确定时保留资源 |
+| `cancel_raw_addr(ready)` | 围栏拦截后续 Host 提交，不能撤回已入队任务/捕获图；应用等待执行结束并协调源复用 |
 
 KVAF 在 Host 检查数组布局、元数据/output 不重叠和批次身份；NPU raw READ V2 直接从三个 Tensor 为每条请求生成一个 WQE；完整批次的长度/边界诊断仅在显式启用时执行。不会先生成展开的设备描述符数组。
 
-该路径不需要 PreparePut、CommitPut 或 AccessTable。A 的源描述符无需绑定 B 的目标 HBM；B 每次传入 output，KVAF 管理读取所需的本地注册和缓冲引用。调用在传入 stream 同步后返回，应用校验 output 并自行通知源端释放批次。Host 不将设备侧范围/CQ 诊断转换为返回异常，Runtime 不提供每批完成或取消通知接口。
+该路径不需要 PreparePut、CommitPut 或 AccessTable。A 的源描述符无需绑定 B 的目标 HBM；B 每次传入 output，KVAF 管理读取所需的本地注册和缓冲引用。调用默认提交后返回，应用在传入 stream 上接消费者，或显式同步后使用 output，再自行通知源端释放批次。Host 不将设备侧范围/CQ 诊断转换为返回异常，Runtime 不提供每批完成或取消通知接口。
 
 ### 9.1 output 的含义
 
-`output` 是 **B 应用分配的本地接收 HBM 缓冲**，Python 接口中为位于 B 卡、内存连续的 NPU Tensor。它是输入参数中的目标缓冲，调用会直接写入它；接口返回的 `result` 表示完成状态，数据本身位于 output 中。读取按字节搬运，不进行 Tensor dtype 转换。
+`output` 是 **B 应用分配的本地接收 HBM 缓冲**，Python 接口中为位于 B 卡、内存连续的 NPU Tensor。它是输入参数中的目标缓冲，调用会直接写入它；接口返回的 `result` 表示提交或显式等待后的状态，数据本身位于 output 中。读取按字节搬运，不进行 Tensor dtype 转换。
 
 每一段的目的地址为 `output.data_ptr() + dst_offsets[i]`，目的范围必须位于 `output.numel() * output.element_size()` 字节以内。偏移相对本次传入 Tensor 的逻辑起点，KVAF 在注册时处理底层对齐。多个目的区间可以有间隔，未覆盖的字节不属于本次读取结果。
 
@@ -492,7 +492,8 @@ with torch.npu.stream(stream):
 result = runtime.batch_get_raw_addr(
     ready, src_offsets, dst_offsets, lengths, output, stream,
 )
-# 成功返回后，output[0:4096] 和 output[4096:8192] 分别包含上述两段数据。
+stream.synchronize()
+# 外层同步后，output[0:4096] 和 output[4096:8192] 分别包含上述两段数据。
 ```
 
 output 在读取完成前不得并发覆写。其注册按地址/长度缓存到连接关闭，Python 保守保留 Tensor 引用到 Runtime shutdown，C++ 调用方负责保活；缓存期间不得调整大小或替换底层 storage。若接口因未决传输而失败，应用不得复用该缓冲，直到恢复流程确认可以安全使用。调用方负责范围合法、目的区间不重叠以及长度为 1..UINT32_MAX 且符合设备单次 READ 上限；默认关闭长度/边界诊断，可用 `validate_ranges=True` 显式开启，目的区间两两重叠检查已删除。
@@ -517,15 +518,15 @@ sequenceDiagram
     AC->>BC: 应用消息：业务元数据和 ReadyToken
     BC->>BC: 准备 output HBM 和三个连续、等长数组
     BC->>BR: batch_get_raw_addr(ready, src_offsets, dst_offsets, lengths, output, stream)
-    BR->>BR: 一次 raw READ：可选长度/边界诊断、每段生成一个 WQE、等待 CQ
-    BR->>BR: Host 检查各核最终状态及 WQE 数量
-    BR-->>BC: 输出就绪，返回结果
+    BR-->>BC: 已入队，返回 submitted
+    Note over BR: stream 上执行 raw READ：生成 WQE、等待 CQ
+    BC->>BC: 同 stream 消费或外层同步，确认执行完成
     BC->>AC: 应用自己的业务完成通知
     AC->>AS: release_batch(ready)
     AS-->>AC: 允许复用源缓冲
 ```
 
-NPU ready 发布本批读取许可；D 本地检查后直接 READ，同步完成并校验 status 后返回。三数组只供本地 NPU 使用，每批没有 AcquireRaw、Complete 或 Cancel RPC。P 保持数据稳定，直到应用确认消费者完成并 release。取消时 D 通过 cancel_raw_addr 记录本地禁止迟到 READ 的状态，再由应用将取消结果通知 P。CPU Pull 仍通过 Submit 将三数组发送给 CPU service，应用通知生产端本地释放。
+NPU ready 发布本批读取许可；B 本地检查后向 stream 提交 READ，Host 不回读 status。三数组只供本地 NPU 使用，每批没有 AcquireRaw、Complete 或 Cancel RPC。A 保持数据稳定，直到应用确认消费者完成并 release。取消时 B 通过 cancel_raw_addr 拦截后续 Host 提交，应用还需等待已有执行结束，再通知 A。CPU Pull 仍通过 Submit 将三数组发送给 CPU service，应用通知生产端本地释放。
 
 NPU Pull 的完成/取消通知、重试和消息去重由应用实现，例如 bench 的 Pipe。源端 release_batch/cancel_batch 只核对本地批次身份，不核验远端 DMA；应用在未知 DMA 状态或未收到匹配的复用消息时保持源和 output 存活。
 
@@ -537,23 +538,23 @@ NPU Pull 的完成/取消通知、重试和消息去重由应用实现，例如 
 | READ 全部完成、尚未 CommitPut | 可以 Commit，或在确认 DMA 结束后撤销写事务 |
 | 提交响应丢失、超时或 DMA 状态不确定 | 保留原 put、目标槽位和源缓冲，用原 put 查询；不能释放并复用地址 |
 | Meta 已提交，应用完成通知丢失 | 重发同批应用通知，不重做 READ 或逆转提交 |
-| NPU READ 成功返回、应用完成通知丢失 | 应用重试匹配源和批次的通知，不重读数据；通知前源保持不变 |
-| NPU READ 本地清理失败或 DMA 不确定 | 用原 ReadyToken 调用 resolve_raw_addr，只重试本地清理；DMA 不确定时继续保留资源，不重放 READ |
+| NPU READ 已外层同步完成、应用完成通知丢失 | 应用重试匹配源和批次的通知，不重读数据；通知前源保持不变 |
+| NPU READ 提交/显式同步失败 | 用原 ReadyToken 调用 resolve_raw_addr 查询隔离状态；不确定时继续保留资源，不重放 READ |
 | A 收到延迟或重复的业务完成消息 | 按源和 sequence 匹配；不能释放另一个批次 |
 
-重复提交必须关联原任务且参数一致。已完成请求返回原结果或明确的已完成状态，不能再次产生 READ；冲突参数必须拒绝。未知 DMA 状态不自动重建链路或重放请求。
+CPU Pull 的重复提交必须关联原任务且参数一致。已完成请求返回原结果或明确的已完成状态，不能再次产生 READ；冲突参数必须拒绝。NPU Pull 可重复读取同一冻结源，应用负责生产同步和重复消息处理。未知 DMA 状态不自动重建链路或重放请求。
 
 公开的 put 状态与现有 Offload 的 pending 保护共用，避免拆出接口后普通 BatchPut、BatchFree 或 Shutdown 绕过未决资源保护。句柄超时、退出作用域或异常都不代表 DMA 已结束。
 
 生产端注册持有底层缓冲直到 shutdown 成功。批次 release 只允许覆写下一批，不代表已经可以释放整块注册内存。
 
-正常关闭顺序为：停止新任务并处理完已有批次，A 释放对应批次；NPU Pull 由 A source.shutdown 内部请求 B 关闭链路并确认退役；CPU Pull 由 A 关闭 CPU 源以释放 CPU service 上的源连接和 DDR lease；最后 B 关闭 Runtime 和共享 DDR。业务协调仍由 Connector 执行。
+正常关闭顺序为：停止新任务并处理完已有批次，等待所有 stream 完成、销毁捕获图，A 释放对应批次；NPU Pull 由 A source.shutdown 内部请求 B 关闭链路并确认退役；CPU Pull 由 A 关闭 CPU 源以释放 CPU service 上的源连接和 DDR lease；最后 B 关闭 Runtime 和共享 DDR。业务协调仍由 Connector 执行。
 
 数据 checksum 保持独立诊断，不纳入传输计时。若应用需要校验，应在目的数据释放/覆写、下一次 Ready 或源注销前完成；校验结束后再通知 A 复用可直接沿用当前验收流程。
 
 ## 11. 现有代码的调整范围
 
-CPU Pull 当前使用 `src_offsets + dst_offsets`，在提取 PreparePut 的 address 时减去 DDR base；Submit 不再转换目的数组。NPU 源绑定由 Runtime 管理；CPU 源连接由 CPU service 管理，Runtime 直接使用 ReadyToken.source 提交，保存本次事务以支持恢复。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。基础初始化与 DDR 初始化现已分离，纯 NPU Pull 不再依赖 DDR。本次描述符精简不改变 Raw READ 算子、批次同步与恢复语义，但更新了 ReadyToken 序列化格式、DDR ticket 和 KVRP/KVHR 报文；CPU service、两端 NPU 运行库和 Python 绑定需一起重编译、重启。
+CPU Pull 当前使用 `src_offsets + dst_offsets`，在提取 PreparePut 的 address 时减去 DDR base；Submit 不再转换目的数组。NPU 源绑定由 Runtime 管理；CPU 源连接由 CPU service 管理，Runtime 直接使用 ReadyToken.source 提交，保存本次事务以支持恢复。CPU Pull 的公开事务进一步统一为 PutHandle：Submit 成功返回 None，Query/Wait/Commit/Abort 均使用原 put，已删除 CpuPullTask 和 put.task。基础初始化与 DDR 初始化现已分离，纯 NPU Pull 不再依赖 DDR。此前描述符精简更新了 ReadyToken 序列化格式、DDR ticket 和 KVRP/KVHR 报文，需要配套构建。当前 raw READ 改为默认入队、外层同步，仍使用 V2 算子和原控制协议；更新 NPU 运行库及 Python 扩展即可，CPU Pull 流程不变。
 
 | 当前实现 | 目标调整 |
 |---|---|
@@ -643,7 +644,7 @@ runtime.resolve_cpu_pull(timeout=30000)
 
 ## 12. 第一版范围
 
-- 一个源同时一个活动批次；一个 Ready 批次对应一次读取消费。
+- 一个源同时一个活动批次；CPU Pull 事务仍按批次消费，NPU Pull 可在源冻结期间多次读取。
 - 一个 Put 事务对应一个 CPU Pull 任务，不引入多任务拼接提交。
 - 同一 DDR 池一次只有一个未完成或未确认的 CPU Pull。
 - 同一 Runtime 的这些控制接口按顺序调用，不新增并发调用保证。
@@ -662,14 +663,15 @@ runtime.resolve_cpu_pull(timeout=30000)
 - `submit_cpu_pull(...)` 成功返回 `None`，失败抛异常。响应丢失时请求仍保存在原 put 上，继续通过它 Query/Wait；不得重新 PreparePut 替代未决任务。`submitted=True` 不表示 CPU 已接受或完成读取。
 - `query_cpu_pull(put)` 返回 `CpuPullState`，需要时查询远端并更新 put.state；尚未提交时返回 `PREPARED`。`wait_cpu_pull(put, timeout=30000)` 的 timeout 单位为毫秒，成功返回 `DONE` 或已提交的 `COMMITTED`，不会自动 Commit；未提交即调用 Wait 会立即报错。
 - `commit_put(put)` 返回 `COMMITTED`，`abort_put(put)` 返回 `ABORTED`。提交响应丢失后重试原 commit，不能反向 Abort。PreparePut 后尚未提交任务时，可以直接 Abort。
-- `batch_get_raw_addr(...)` 成功返回 `{"state": "done", "sequence": ready.sequence}`，表示 output 已可用；不再发送或等待 Complete。其未决恢复使用原批次的 `resolve_raw_addr(ready)`，只重试本地清理、不会重发 READ。应用通过自己的消息通道通知源端，源端收到匹配批次的通知后调用 release_batch。
-- 可选 `profile=True` 会在成功返回值中增加 `profile` 字典，提供 Host 大阶段和设备事件测得的算子区间；默认关闭，详见 [raw READ 计时与基准](hbm_raw_addr_read.md)。
+- `batch_get_raw_addr(...)` 默认返回 `{"state": "submitted", "sequence": ready.sequence}`；显式 `synchronize=True` 等待完成后返回 done。应用外层等待 stream 完成后，通过自己的消息通道通知源端 release_batch；Runtime 不发送 Complete。失败隔离状态用原批次 `resolve_raw_addr(ready)` 查询，不重发 READ。
+- 图模式先对同一 MR/output 预热并同步，再捕获 `synchronize=False, profile=False` 的调用。图固定源 MR 和缓冲地址，回放不重新执行 Host ReadyToken 校验；应用负责匹配每批源/MR、保活输入和资源、等待完成，并在注销源/关闭 Runtime 前销毁图。同一连接的队列状态共用，跨 stream 执行必须建立依赖。
+- 可选 `profile=True` 会在成功返回值中增加 `profile` 字典，提供 Host 大阶段；只有同时 `synchronize=True` 才记录设备事件区间，异步 profile 不等待设备；默认关闭，详见 [raw READ 计时与基准](hbm_raw_addr_read.md)。
 
 显式事务使用 `query_cpu_pull`、`wait_cpu_pull`、`commit_put`、`abort_put` 恢复。统一 `batch_cpu_pull()` 内部管理事务，异常恢复使用 `resolve_cpu_pull()`；生产端源生命周期由应用管理。当前版本从 PreparePut 起保护这笔事务，完成或撤销前会拒绝同一 Runtime 的其他 DDR 访问操作。
 
 如果提交前的参数校验失败，`put.submitted` 为 false，可以修正数组后继续提交，或撤销 put。请求记录后即使 CPU 尚未接受也保持 submitted 为 true，使用原 put 查询：`DONE` 可提交或撤销，`FAILED` 可撤销，`RUNNING` / `IN_DOUBT` 保留资源。已记录请求的参数不能更换；重复提交只确认与原请求一致，不重发 READ。放弃已发布批次由读取端调用 `cancel_cpu_pull(ready)`，确认安全后应用通知源端本地解冻。
 
-C++ 的共享类型与数组视图在 `common/include/connector_types.h`，事务句柄与 RuntimeCore 接口在 `runtime/include/runtime.h`，NPU 包装接口在 `runtime/include/npu_runtime.h`。CPU 源仍通过 `runtime/include/remote_offload.h` 引入，NPU 源通过 `runtime/include/hbm_read.h` 引入。C++ 调用者在未决期间自行保持源和输出内存有效，Python 绑定保留对应 Tensor 引用。
+C++ 的共享类型与数组视图在 `common/include/connector_types.h`，事务句柄与 RuntimeCore 接口在 `runtime/include/runtime.h`，NPU 包装接口在 `runtime/include/npu_runtime.h`。CPU 源仍通过 `runtime/include/remote_offload.h` 引入，NPU 源通过 `runtime/include/hbm_read.h` 引入。C++ 调用者自行保持源、输入和输出内存有效。NPU 异步正常调用的输入 Tensor/stream 由应用保活，Python 绑定保留 output；提交/同步失败时额外保留失败输入。
 
 ### 13.2 硬件验收入口
 
@@ -699,4 +701,4 @@ CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checks
 - `tests/python/bench_remote_cpu_offload.py`：统一 batch_cpu_pull 封装，测量整个 Python 调用的总时间；
   默认开启可选 profile，输出绑定转换及内部 PreparePut、地址组织、Submit、Wait、Commit，
   校验/释放仍在总时间之外。`--no-profile` 关闭内部计时。CPU 服务通过 `KVAF_CPU_PULL_PROFILE=1` 汇总每个源的 READ 阶段。命令与统计口径见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
-- `tests/python/bench_hbm_read_raw_addr.py`：两卡 NPU Pull，可配置等大包数量、包大小及随机散布的源空间大小。分别执行完整调用带宽轮次和开启内部阶段/设备事件的诊断轮次，校验均在传输计时外。命令见 [NPU raw READ](hbm_raw_addr_read.md)。
+- `tests/python/bench_hbm_read_raw_addr.py`：两卡 NPU Pull，可配置等大包数量、包大小及随机散布的源空间大小。分别执行“入队调用至外层 stream 同步”带宽轮次和显式同步、开启内部阶段/设备事件的诊断轮次，校验均在传输计时外。命令见 [NPU raw READ](hbm_raw_addr_read.md)。

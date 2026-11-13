@@ -63,6 +63,13 @@ stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
 
+`batch_get_raw_addr(ready, src_offsets, dst_offsets, lengths, output, stream=None,
+profile=False, validate_ranges=False, synchronize=False)` 同样默认只入队；外层同步后才能在
+Host 使用结果或通知生产端复用。三个元数据 Tensor 和 stream 由调用方保活，output 注册
+及 Tensor 引用按连接/Runtime 生命周期缓存。图模式先对同一 MR/output 预热并同步，再捕获
+默认调用；回放固定源 MR 与各缓冲地址，不重新执行 Host ReadyToken 检查。关闭源或 Runtime
+前先完成执行并销毁图。详见 [NPU raw READ](../docs/hbm_raw_addr_read.md)。
+
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
