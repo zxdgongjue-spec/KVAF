@@ -123,7 +123,8 @@ class AivExecutionResources final : public ExecutionResourceOwner {
 // Stateless execution algorithms; views cannot be interchanged across directions.
 class UrmaAivGetOperator {
  public:
-  static Status Validate(const BatchGetExecRequest&, UrmaAivGetView, AivInvocation&);
+  static Status Validate(const BatchGetExecRequest&, UrmaAivGetView, AivInvocation&,
+                         std::uint64_t* capture_query_ns = nullptr);
   static Status Launch(const BatchGetExecRequest&, UrmaAivGetView, AivInvocation&);
   static Status Drain(UrmaAivGetView, AivInvocation&);
   static Status PrepareGraph(const GetGraphOptions&, UrmaAivGetView, AivInvocation&);

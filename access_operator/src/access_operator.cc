@@ -207,7 +207,9 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
     auto status = UrmaAivGetOperator::Drain(view, call);
     if (!status.ok()) return status;
   }
-  auto status = UrmaAivGetOperator::Validate(request, view, call);
+  auto status = UrmaAivGetOperator::Validate(
+      request, view, call,
+      request.host_timing ? &request.host_timing->aiv_capture_prepare_ns : nullptr);
   if (status.ok()) status = resources_->PrepareGetResources(request, call, &view);
   GetHostTimingRecord(request.host_timing, &GetProviderTiming::prepare_ns, prepare_started);
   return status.ok() ? UrmaAivGetOperator::Launch(request, view, call) : status;
@@ -321,7 +323,8 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetVie
   return Status::OK();
 }
 
-Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetView view, AivInvocation& invocation) {
+Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetView view,
+                                    AivInvocation& invocation, std::uint64_t* capture_query_ns) {
   if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (!view.common.ready()) {
@@ -331,6 +334,13 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
+  const auto query_capture = [&](aclmdlRICaptureStatus* capture, aclmdlRI* graph) {
+    const auto started = capture_query_ns ? GetHostTimingStart(exec.host_timing) : 0;
+    const auto result = aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream),
+                                                capture, graph);
+    if (capture_query_ns) *capture_query_ns += GetHostTimingStart(exec.host_timing) - started;
+    return result;
+  };
   const bool graph_lease = invocation.graph_buffer != nullptr;
   if (graph_lease) {
     if (!exec.request || exec.request->output.data != invocation.graph_options.output.data ||
@@ -342,8 +352,7 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
       return InvalidArgument("captured request differs from prepared graph lease");
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
-    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) !=
-        ACL_SUCCESS)
+    if (query_capture(&capture, &graph) != ACL_SUCCESS)
       return Internal("cannot query graph capture state");
     if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
       return Status::InvalidState("graph lease submissions require active capture");
@@ -351,7 +360,7 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
   if (view.options.managed_completion && !graph_lease) {
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
-    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph) != ACL_SUCCESS)
+    if (query_capture(&capture, &graph) != ACL_SUCCESS)
       return Internal("cannot query graph capture state");
     if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
       return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
@@ -369,7 +378,8 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
 
 Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetView view, AivInvocation& invocation) {
   const auto submit_started = GetHostTimingStart(exec.host_timing);
-  auto status = Validate(exec, view, invocation);
+  auto status = Validate(exec, view, invocation,
+                         exec.host_timing ? &exec.host_timing->aiv_capture_submit_ns : nullptr);
   if (!status.ok()) return status;
   const bool graph_lease = invocation.graph_buffer != nullptr;
   if (!graph_lease && invocation.get_issued)
@@ -397,13 +407,18 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
       invocation.pending_buffer = local_buffer;
       invocation.get_issued = false;
     }
-    if (aclrtMemsetAsync(view.workspace.status, view.workspace.status_bytes, 0xFF,
-                         view.workspace.status_bytes, stream) != ACL_SUCCESS)
+    const auto reset_started = GetHostTimingStart(exec.host_timing);
+    const auto reset_result = aclrtMemsetAsync(view.workspace.status, view.workspace.status_bytes, 0xFF,
+                                              view.workspace.status_bytes, stream);
+    GetHostTimingRecord(exec.host_timing, &GetProviderTiming::aiv_status_reset_ns, reset_started);
+    if (reset_result != ACL_SUCCESS)
       return Status::CompletionUnknown("failed to initialize Get completion status");
   }
   if (graph_lease) invocation.graph_recorded = true;
   else invocation.get_issued = true;
+  const auto launch_started = GetHostTimingStart(exec.host_timing);
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::aiv_kernel_launch_ns, launch_started);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
     if (!view.options.managed_completion && !graph_lease)
       { KvafBatchGetLocalBufferRelease(local_buffer); invocation.pending_buffer = nullptr;

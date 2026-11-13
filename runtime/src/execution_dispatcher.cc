@@ -32,7 +32,8 @@ class GetDispatchTrace {
     if (output.tellp() == 0)
       output << "event,index,algorithm,path,lock_ns,resolve_ns,output_check_ns,previous_drain_ns,"
                 "context_ns,describe_ns,acquire_ns,bind_ns,requirements_ns,warmup_ns,provider_ns,"
-                "provider_prepare_ns,provider_submit_ns,provider_completion_ns,provider_cleanup_ns,context_release_ns,"
+                "provider_prepare_ns,provider_submit_ns,provider_completion_ns,provider_cleanup_ns,"
+                "aiv_capture_prepare_ns,aiv_capture_submit_ns,aiv_status_reset_ns,aiv_kernel_launch_ns,context_release_ns,"
                 "drain_provider_ns,drain_release_ns,total_ns\n";
     for (const auto& row : rows_)
       output << row.event << ',' << ++next_index_ << ',' << (row.algorithm ? row.algorithm : "")
@@ -42,6 +43,8 @@ class GetDispatchTrace {
              << ',' << row.launch.warmup_ns << ',' << row.launch.provider_ns << ','
              << row.launch.provider_detail.prepare_ns << ',' << row.launch.provider_detail.submit_ns
              << ',' << row.launch.provider_detail.completion_ns << ',' << row.launch.provider_detail.cleanup_ns << ','
+             << row.launch.provider_detail.aiv_capture_prepare_ns << ',' << row.launch.provider_detail.aiv_capture_submit_ns
+             << ',' << row.launch.provider_detail.aiv_status_reset_ns << ',' << row.launch.provider_detail.aiv_kernel_launch_ns << ','
              << row.context_release_ns << ',' << row.drain_provider_ns << ','
              << row.drain_release_ns << ',' << row.total_ns << '\n';
     rows_.clear();

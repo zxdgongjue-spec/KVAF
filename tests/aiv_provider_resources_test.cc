@@ -8,6 +8,8 @@
 #include <cstring>
 #include <iostream>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 struct KvafBatchPutTransport {};
@@ -19,6 +21,7 @@ int launches = 0, destroys = 0, retirements = 0, acquisitions = 0;
 bool fail_wait = false, fail_copy = false, fail_retire = false, complete_payload = true;
 bool fail_close = false, fail_create = false, fail_free = false;
 bool fail_acquire = false, fail_get_acquire = false, fail_memset = false;
+bool measure_timing_stubs = false;
 int get_launches = 0, get_retirements = 0, get_acquisitions = 0;
 bool get_success = false;
 std::vector<KvafBatchPutLocalBuffer*> registrations;
@@ -33,7 +36,10 @@ aclError aclrtMemset(void* p, size_t, int value, size_t n) {
   if (fail_memset) return 1;
   std::memset(p, value, n); return 0;
 }
-aclError aclrtMemsetAsync(void* p, size_t size, int value, size_t n, aclrtStream) { return aclrtMemset(p, size, value, n); }
+aclError aclrtMemsetAsync(void* p, size_t size, int value, size_t n, aclrtStream) {
+  if (measure_timing_stubs) std::this_thread::sleep_for(std::chrono::microseconds(10));
+  return aclrtMemset(p, size, value, n);
+}
 aclError aclrtMemcpy(void* p, size_t, const void* s, size_t n, aclrtMemcpyKind kind) {
   if (fail_copy && kind == ACL_MEMCPY_DEVICE_TO_HOST) return 1;
   std::memcpy(p, s, n); return 0;
@@ -43,6 +49,7 @@ aclError aclrtMemcpyAsync(void* p, size_t size, const void* s, size_t n, aclrtMe
 }
 aclError aclrtSynchronizeStream(aclrtStream) { return fail_wait ? 1 : 0; }
 aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI*) {
+  if (measure_timing_stubs) std::this_thread::sleep_for(std::chrono::microseconds(10));
   *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
 int32_t KvafExecuteBatchPutLoadKernel(const char*) { return 0; }
@@ -107,6 +114,7 @@ int32_t KvafBatchGetLocalBufferRetire(KvafBatchGetLocalBuffer* p) {
   ++get_retirements; delete p; return 0;
 }
 int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs* args, aclrtStream) {
+  if (measure_timing_stubs) std::this_thread::sleep_for(std::chrono::microseconds(10));
   ++get_launches;
   if (!get_success) return -1;
   auto* reports = reinterpret_cast<KvafBatchGetCoreStatus*>(args->core_status);
@@ -238,13 +246,22 @@ int main() {
   const auto registered = get_acquisitions, retired = get_retirements;
   CHECK(reused.PrepareGetOutput({get.output, get_call.execution.stream, 1}).ok());
   CHECK(get_acquisitions == registered + 1);
+  measure_timing_stubs = true;
   for (int i = 0; i < 3; ++i) {
+    GetProviderTiming timing{};
+    get_call.host_timing = &timing;
     get_call.execution.stream = reinterpret_cast<void*>(i + 1);
     get_call.execution.synchronize = i % 2;
     CHECK(reused.ExecuteBatchGet(get_call).ok());
+    CHECK(timing.aiv_capture_prepare_ns > 0 && timing.aiv_capture_submit_ns > 0);
+    CHECK(timing.aiv_status_reset_ns > 0 && timing.aiv_kernel_launch_ns > 0);
+    CHECK(timing.aiv_capture_submit_ns + timing.aiv_status_reset_ns +
+          timing.aiv_kernel_launch_ns <= timing.submit_ns);
     CHECK(reused.DrainGet().ok());
     CHECK(get_acquisitions == registered + 1 && get_retirements == retired);
   }
+  measure_timing_stubs = false;
+  get_call.host_timing = nullptr;
   get_call.execution.synchronize = false;
   CHECK(reused.ExecuteBatchGet(get_call).ok());
   fail_wait = true;

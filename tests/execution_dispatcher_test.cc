@@ -440,7 +440,7 @@ void TraceLegacyProvider() {
   CHECK(trace.good());
   const std::string contents((std::istreambuf_iterator<char>(trace)), std::istreambuf_iterator<char>());
   CHECK(contents.find(",legacy,legacy,") != std::string::npos);
-  CHECK(contents.find(",21,22,23,0\n") != std::string::npos);
+  CHECK(contents.find(",21,22,23,0,0,0,0,0\n") != std::string::npos);
   std::remove(path.c_str());
 }
 }  // namespace

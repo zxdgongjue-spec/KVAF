@@ -12,6 +12,10 @@ SUBMIT_FIELDS = (
     "provider_ns", "provider_prepare_ns", "provider_submit_ns", "provider_completion_ns",
     "provider_cleanup_ns", "provider_other_ns", "context_release_ns", "outside_provider_ns",
 )
+AIV_FIELDS = (
+    "aiv_capture_prepare_ns", "aiv_capture_submit_ns", "aiv_status_reset_ns",
+    "aiv_kernel_launch_ns", "aiv_submit_other_ns",
+)
 DRAIN_FIELDS = ("total_ns", "drain_provider_ns", "drain_release_ns")
 
 
@@ -62,10 +66,22 @@ def main():
                 row["provider_other_ns"] = max(0, row["provider_ns"] - sum(
                     row.get(field, 0) for field in ("provider_prepare_ns", "provider_submit_ns",
                                                     "provider_completion_ns", "provider_cleanup_ns")))
-                for field in fields:
+                row["aiv_submit_other_ns"] = max(0, row.get("provider_submit_ns", 0) - sum(
+                    row.get(field, 0) for field in ("aiv_capture_submit_ns", "aiv_status_reset_ns",
+                                                    "aiv_kernel_launch_ns")))
+                for field in (*fields, *AIV_FIELDS):
                     row.setdefault(field, 0)
             if selected:
-                summarize(parsed, algorithm, path, event, fields)
+                display_fields = fields
+                if event == "submit" and any(
+                    any(row[field] for field in AIV_FIELDS[:-1]) for row in parsed
+                ):
+                    prepare_at = fields.index("provider_prepare_ns") + 1
+                    submit_at = fields.index("provider_submit_ns") + 1
+                    display_fields = (fields[:prepare_at] + AIV_FIELDS[:1] +
+                                      fields[prepare_at:submit_at] + AIV_FIELDS[1:] +
+                                      fields[submit_at:])
+                summarize(parsed, algorithm, path, event, display_fields)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ struct BatchGetProfile;
 // providers write it only before ExecuteBatchGet returns.
 struct GetProviderTiming {
   std::uint64_t prepare_ns{}, submit_ns{}, completion_ns{}, cleanup_ns{};
+  // AIV Direct diagnostics nested within prepare/submit. Zero for other providers.
+  std::uint64_t aiv_capture_prepare_ns{}, aiv_capture_submit_ns{};
+  std::uint64_t aiv_status_reset_ns{}, aiv_kernel_launch_ns{};
 };
 
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。

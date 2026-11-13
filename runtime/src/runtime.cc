@@ -105,12 +105,15 @@ void RuntimeCore::FlushLegacyGetTrace() {
   output.seekp(0, std::ios::end);
   if (output.tellp() == 0)
     output << "event,index,algorithm,path,total_ns,provider_ns,provider_prepare_ns,"
-              "provider_submit_ns,provider_completion_ns,provider_cleanup_ns\n";
+              "provider_submit_ns,provider_completion_ns,provider_cleanup_ns,"
+              "aiv_capture_prepare_ns,aiv_capture_submit_ns,aiv_status_reset_ns,aiv_kernel_launch_ns\n";
   std::size_t index = 0;
   for (const auto& row : legacy_get_trace_rows_)
     output << "submit," << ++index << ",legacy,legacy," << row.total_ns << ',' << row.provider_ns
            << ',' << row.provider_detail.prepare_ns << ',' << row.provider_detail.submit_ns
-           << ',' << row.provider_detail.completion_ns << ',' << row.provider_detail.cleanup_ns << '\n';
+           << ',' << row.provider_detail.completion_ns << ',' << row.provider_detail.cleanup_ns
+           << ',' << row.provider_detail.aiv_capture_prepare_ns << ',' << row.provider_detail.aiv_capture_submit_ns
+           << ',' << row.provider_detail.aiv_status_reset_ns << ',' << row.provider_detail.aiv_kernel_launch_ns << '\n';
   legacy_get_trace_rows_.clear();
 }
 

@@ -562,6 +562,36 @@ Gather/Scatter 的 legacy 对照同样只改 `--execution-mode legacy` 与 trace
 `path=output` 表示复用输出绑定，`path=ordinary` 表示每次构造 Get 上下文。
 legacy 的标签为 `algorithm=legacy path=legacy`，由文件名区分所测算法。
 
+AIV Direct 还会输出 `aiv_capture_prepare`、`aiv_capture_submit`、
+`aiv_status_reset`、`aiv_kernel_launch` 和 `aiv_submit_other`（单位 µs）。
+前两项分别是请求准备与提交阶段的 `aclmdlRICaptureGetInfo`；
+`aiv_status_reset` 是提交到 stream 的 `aclrtMemsetAsync` **Host 调用耗时**，
+`aiv_kernel_launch` 是 `KvafExecuteBatchGetLaunch` 的 Host 调用耗时，
+`aiv_submit_other` 为提交阶段剩余的参数组装、校验和计时开销。
+这些字段嵌套在 `provider_prepare` / `provider_submit` 内，不应再次加到总耗时。
+legacy 同步路径没有状态清零和普通请求的 capture 查询，对应字段为 0。
+其他 provider 的这些列为 0，摘要中不显示。旧版 CSV 不含这些列，仍可由摘要脚本读取。
+两种模式须使用**新建且不同名**的 trace 文件；修改代码后需重新构建 NPU 客户端，
+CPU 服务不需要重建。例如复测 656 字节、4096 miss、2 核、每核 2 Jetty：
+
+```bash
+mkdir -p reports
+for perf_mode in legacy per-call; do
+  trace="$PWD/reports/aiv-${perf_mode}-submit-$(date +%s).csv"
+  KVAF_GET_DISPATCH_TRACE="$trace" \
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+  bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+    --execution-mode "$perf_mode" --transport urma --get-timing sync-call \
+    --request-length 32768 --miss-count 4096 --table-capacity 4096 \
+    --token-bytes 656 --tokens-per-block 128 --aiv-cores 2 --jettys-per-core 2 \
+    --no-kernel-profile --warmup 10 --iterations 100
+  python3 tests/python/summarize_get_dispatch_trace.py "$trace" --last 100
+done
+```
+
+请对照两种模式的 `aiv_capture_submit`、`aiv_status_reset`、
+`aiv_kernel_launch` 和 `aiv_submit_other`，同时保留 `provider_submit` 作为总量检查。
+
 提交样本包含锁等待、配置解析、输出绑定检查、前次完成处理、上下文构造或更新、
 资源需求查询、租约获取、状态绑定，以及 provider 的需求查询与 Warmup。
 `provider_prepare` 是各 provider 的请求准备；`provider_submit` 包含参数组装、
