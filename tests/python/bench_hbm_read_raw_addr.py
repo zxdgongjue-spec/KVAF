@@ -42,9 +42,11 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--graph", action="store_true",
+                        help="capture one raw READ per MR and measure replay through stream completion")
     parser.add_argument("--profile-warmup", type=int, default=1)
-    parser.add_argument("--profile-iterations", type=int, default=20,
-                        help="separate instrumented rounds, excluded from bandwidth; 0 disables")
+    parser.add_argument("--profile-iterations", type=int, default=None,
+                        help="eager-only instrumented rounds (default: 20 eager, 0 graph); 0 disables")
     parser.add_argument("--validate-ranges", action="store_true",
                         help="enable optional length/source/output bounds diagnostics; no overlap detection")
     parser.add_argument("--aiv-cores", type=int, default=2)
@@ -52,6 +54,10 @@ def parse_args(argv=None):
     parser.add_argument("--max-inflight-total", type=int, default=2048)
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
     args = parser.parse_args(argv)
+    if args.profile_iterations is None:
+        args.profile_iterations = 0 if args.graph else 20
+    if args.graph and args.profile_iterations:
+        parser.error("graph replay bypasses Host call profiling; use --profile-iterations 0")
     if not 1 <= args.source_count <= 4096:
         parser.error("source-count must be in 1..4096")
     # Visit every MR/output pair before timed samples; retain single-MR defaults.
@@ -163,6 +169,29 @@ def measure_raw_read(runtime, ready, src, dst, lengths, output, stream, *, profi
     return result, (time.perf_counter_ns() - begin) / 1000
 
 
+def capture_raw_read(runtime, graph, ready, src, dst, lengths, output, stream, *, validate_ranges=False):
+    """Prepare cached resources outside capture; keep source frozen throughout."""
+    def enqueue():
+        runtime.batch_get_raw_addr(ready, src, dst, lengths, output, stream=stream,
+                                   profile=False, validate_ranges=validate_ranges, synchronize=False)
+
+    enqueue()
+    stream.synchronize()
+    graph.capture_begin(stream)
+    try:
+        enqueue()
+    finally:
+        graph.capture_end()
+
+
+def measure_graph_read(graph, stream):
+    """Include both replay submission and actual READ completion in bandwidth."""
+    begin = time.perf_counter_ns()
+    graph.replay(stream)
+    stream.synchronize()
+    return (time.perf_counter_ns() - begin) / 1000
+
+
 def packet_payload(torch, offsets, packet_bytes, phase):
     # Same row/byte pattern family as BatchGet, with distinct source-slot IDs
     # and alternating contents so stale output cannot pass the next round.
@@ -252,6 +281,7 @@ def main():
         npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
         batch_get_max_inflight_total=args.max_inflight_total)
     worker = None
+    graphs = {}
     try:
         runtime.initialize()
         assert runtime.initialized and not runtime.ddr_initialized
@@ -280,9 +310,11 @@ def main():
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
-              "status_reset=init_only status_generation=0 status_readback=none completion=caller_stream_sync binding_profile=1 "
+              "status_reset=init_only status_generation=0 status_readback=none completion=caller_stream_sync "
+              f"execution={'graph' if args.graph else 'eager'} graph={int(args.graph)} binding_profile={int(not args.graph)} "
               "completion_notification=application batch_control_rpcs=0", flush=True)
-        stages = {"batch_get_raw_addr": [], "verification": []}
+        read_stage = "graph_replay" if args.graph else "batch_get_raw_addr"
+        stages = {read_stage: [], "verification": []}
         internal_stages = {}
         event_errors = set()
         normal_rounds, total_rounds = round_counts(args)
@@ -297,12 +329,23 @@ def main():
                     torch, group.offsets, group.packet_bytes, phase + index * 17).flatten()
             expected_hbm = expected.to(device)
             torch.npu.synchronize()
+            if args.graph and ready.mr_id not in graphs:
+                # This source's MRs have distinct fixed device descriptors. Keep
+                # one graph per MR, sharing stable output and metadata buffers.
+                graph = kvaf.AclGraph()
+                graphs[ready.mr_id] = graph
+                capture_raw_read(runtime, graph, ready, src, dst, lengths, output, stream,
+                                 validate_ranges=args.validate_ranges)
+            # Clear even after capture warmup so stale warmup output cannot pass.
             with torch.npu.stream(stream):
                 output.fill_(0xCC)
             stream.synchronize()
             instrumented = iteration >= normal_rounds
-            result, elapsed_us = measure_raw_read(runtime, ready, src, dst, lengths, output, stream,
-                                                 profile=instrumented, validate_ranges=args.validate_ranges)
+            if args.graph:
+                elapsed_us = measure_graph_read(graphs[ready.mr_id], stream)
+            else:
+                result, elapsed_us = measure_raw_read(runtime, ready, src, dst, lengths, output, stream,
+                                                     profile=instrumented, validate_ranges=args.validate_ranges)
             verify_begin = time.perf_counter_ns()
             if not torch.equal(output, expected_hbm):
                 raise RuntimeError(f"NPU consumer mismatch at iteration {iteration}")
@@ -310,7 +353,7 @@ def main():
                 raise RuntimeError(f"payload/guard mismatch at iteration {iteration}")
             verify_us = (time.perf_counter_ns() - verify_begin) / 1000
             if args.warmup <= iteration < normal_rounds:
-                stages["batch_get_raw_addr"].append(elapsed_us)
+                stages[read_stage].append(elapsed_us)
                 stages["verification"].append(verify_us)
             elif iteration >= normal_rounds + args.profile_warmup:
                 for name, value in raw_profile_sample(result, elapsed_us).items():
@@ -319,6 +362,10 @@ def main():
                     event_errors.add(result["profile"]["kernel_event_error"])
             parent.send(("reuse", iteration))
             assert receive(parent, "released") == iteration
+        capture_count = len(graphs)
+        for graph in graphs.values():
+            graph.reset()  # The source shutdown below retires graph communication resources.
+        graphs.clear()
         parent.send(("shutdown", None))
         receive(parent, "closed")
         worker.join(10)
@@ -332,8 +379,10 @@ def main():
                   f"profile_iterations={args.profile_iterations} event_errors={sorted(event_errors)} "
                   "device_time_overlaps_host_launch_and_synchronize=1 instrumented_rounds_excluded_from_bandwidth=1",
                   flush=True)
-        stats = summarize_us(stages["batch_get_raw_addr"])
-        print("NPU_HBM_BENCH_PASS metric=python_batch_get_raw_addr_to_stream_sync "
+        stats = summarize_us(stages[read_stage])
+        metric = "graph_replay_to_stream_sync" if args.graph else "python_batch_get_raw_addr_to_stream_sync"
+        print(f"NPU_HBM_BENCH_PASS metric={metric} graph={int(args.graph)} "
+              f"graph_captures={capture_count} graph_setup_excluded=1 "
               f"packets={args.packets} packet_groups={group_description} payload_bytes={payload_bytes} "
               f"source_count={args.source_count} iterations={stats['samples']} warmup_excluded={args.warmup} "
               f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
@@ -347,7 +396,7 @@ def main():
               flush=True)
     except BaseException:
         traceback.print_exc()
-        if runtime.pending_raw_addr or (worker is not None and worker.is_alive()):
+        if graphs or runtime.pending_raw_addr or (worker is not None and worker.is_alive()):
             retain("NPU HBM benchmark output or source remains retained")
         runtime.shutdown()
         raise

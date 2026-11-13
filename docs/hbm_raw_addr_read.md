@@ -264,7 +264,8 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已
 - `--seed`：默认 123，可复现布局。目的 output 连续排列，首尾各留 64 字节 guard。
 - `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
 - `--max-inflight-total`：默认 2048，含义与 BatchGet 一致。
-- `--profile-warmup` / `--profile-iterations`：单独的内部计时轮次，默认 1/20；设为 `--profile-iterations 0` 即只运行未插桩的带宽测试。
+- `--profile-warmup` / `--profile-iterations`：普通调用的单独内部计时轮次，默认 1/20；设为 `--profile-iterations 0` 即只运行未插桩的带宽测试。图模式默认 profile-iterations=0，不接受非零值，因为回放不执行 Host 调用入口。
+- `--graph`：每个 MR 先预热注册并捕获一次 raw READ，后续通过 `kvaf.AclGraph.replay()` 执行。带宽计时包含 replay 提交和外层 stream 同步；首次预热/捕获、源写入、输出清空及校验在计时之外。源数据每轮改变，完整 output/guard 每轮校验，全部执行完成并销毁图后才关闭源连接。
 - `--validate-ranges`：打开可选正长度、32 位长度字段及源/目的边界诊断，默认关闭；不包含目的重叠检测。日志标记 `validate_ranges` 和 `output_registration_cache=1`，首次 output 注册计入 warmup（warmup 为 0 时计入测量）。
 
 输出 `NPU_HBM_BENCH_PASS` 的吞吐和分位数只使用 `--iterations` 轮的
@@ -330,6 +331,28 @@ python tests/python/bench_hbm_read_raw_addr.py \
 日志应包含 `packets=2048 packet_groups=1024x16384,1024x512 payload_bytes=17301504`。
 带宽分子使用两组数据量之和，计时范围仍是同一次调用至数据就绪；源写入、期望值生成和校验都在计时之外。
 此场景只修改 Python bench，已安装当前绑定和 raw kernel 时，拉取脚本更新即可运行。
+
+### 两组 block 的图回放性能测试
+
+沿用上面的 2048 段、16.5 MiB 数据规模，加 `--graph` 并将内部 Host profiling 关闭：
+
+```bash
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+python tests/python/bench_hbm_read_raw_addr.py \
+  --device-a 6 --device-b 7 \
+  --npu-eid-a-raw 000000000047050000100000df00d806 \
+  --npu-eid-b-raw 000000000047050000100000df00f807 \
+  --block-group 1024:16384 --block-group 1024:512 \
+  --source-space-bytes 268435456 \
+  --warmup 10 --iterations 100 \
+  --graph --profile-iterations 0 \
+  --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+```
+
+无需 CPU service。需先使用支持默认异步入队的 NPU 扩展/V2 kernel；已安装该版本时只更新脚本。
+图中仅捕获 READ；源写入、期望值生成、output 清空和应用通知在图外。一次回放读取两组数据，使用同一份稳定地址的 output 和三数组，源内容逐轮改变。
+最终通过标志为 `NPU_HBM_BENCH_PASS metric=graph_replay_to_stream_sync graph=1`；`graph_captures` 应与 source-count 一致，`effective_GBps` 用两组 payload 总和除以回放至同步完成的平均时间。
+对比普通调用时，去掉 `--graph`，仍用 `--profile-iterations 0` 及相同数据规模、核数、Jetty 数和采样轮次。
 
 ### 78 MR 的纯 NPU 验收与性能测量
 

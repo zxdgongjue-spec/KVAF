@@ -35,6 +35,56 @@ class PullBenchmarks(unittest.TestCase):
         self.assertEqual(result["state"], "submitted")
         self.assertEqual(elapsed, 50)
 
+    def test_graph_read_timing_includes_replay_and_external_wait(self):
+        clock = [0]
+        calls = []
+        stream = SimpleNamespace()
+
+        def replay(actual):
+            self.assertIs(actual, stream)
+            calls.append("replay")
+            clock[0] += 5_000
+
+        def synchronize():
+            calls.append("wait")
+            clock[0] += 40_000
+
+        stream.synchronize = synchronize
+        with patch.object(raw_bench.time, "perf_counter_ns", side_effect=lambda: clock[0]):
+            elapsed = raw_bench.measure_graph_read(SimpleNamespace(replay=replay), stream)
+        self.assertEqual(calls, ["replay", "wait"])
+        self.assertEqual(elapsed, 45)
+
+    def test_graph_capture_warms_resources_and_never_synchronizes_inside_capture(self):
+        calls = []
+        capturing = False
+
+        def enqueue(*args, **kwargs):
+            self.assertFalse(kwargs["synchronize"])
+            self.assertFalse(kwargs["profile"])
+            self.assertTrue(kwargs["validate_ranges"])
+            calls.append("capture_read" if capturing else "warmup_read")
+
+        def synchronize():
+            self.assertFalse(capturing)
+            calls.append("warmup_wait")
+
+        def begin(stream):
+            nonlocal capturing
+            capturing = True
+            calls.append("begin")
+
+        def end():
+            nonlocal capturing
+            capturing = False
+            calls.append("end")
+
+        raw_bench.capture_raw_read(SimpleNamespace(batch_get_raw_addr=enqueue),
+                                  SimpleNamespace(capture_begin=begin, capture_end=end),
+                                  object(), (), (), (), object(), SimpleNamespace(synchronize=synchronize),
+                                  validate_ranges=True)
+        self.assertEqual(calls, ["warmup_read", "warmup_wait", "begin", "capture_read", "end"])
+
     def test_percentiles_and_single_sample(self):
         result = summarize_us([100, 0, 20, 10])
         for name, value in dict(samples=4, mean_us=32.5, p50_us=15, p95_us=88,
@@ -148,6 +198,65 @@ class PullBenchmarks(unittest.TestCase):
         self.assertEqual(call.args[3], (16, 4, 16, 4))
         self.assertIs(call.args[4], torch.empty.return_value)
         self.assertFalse(call.kwargs["profile"])
+
+    def test_mixed_graph_bench_reuses_per_mr_graph_and_retires_before_source(self):
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--graph",
+                           "--packet-group", "2:16", "--packet-group", "2:4",
+                           "--source-space-bytes", "128", "--source-count", "2",
+                           "--warmup", "2", "--iterations", "4"])
+        layout = packet_layout(args)
+        torch, runtime, ctx = MagicMock(), MagicMock(), MagicMock()
+        runtime.initialized, runtime.ddr_initialized = True, False
+        torch.npu.stream.side_effect = lambda stream: contextlib.nullcontext()
+        torch.tensor.side_effect = lambda values, **kwargs: tuple(values)
+        torch.empty.return_value.numel.return_value = args.payload_bytes + 2 * GUARD_BYTES
+        torch.equal.return_value = True
+        parent, child = MagicMock(), MagicMock()
+        ctx.Pipe.return_value = parent, child
+        ctx.Process.return_value.exitcode = 0
+        graphs = [MagicMock(), MagicMock()]
+        events = MagicMock()
+        for i, graph in enumerate(graphs):
+            events.attach_mock(graph, f"graph{i}")
+        events.attach_mock(parent, "pipe")
+        iteration = [-1]
+
+        def receive(pipe, kind):
+            if kind == "ready":
+                iteration[0] += 1
+                return SimpleNamespace(mr_id=iteration[0] % 2 + 1)
+            if kind == "released":
+                return iteration[0]
+
+        modules = dict(torch=torch, torch_npu=SimpleNamespace(),
+                       kvaf=SimpleNamespace(NpuRuntime=lambda **kwargs: runtime,
+                                            AclGraph=MagicMock(side_effect=graphs)))
+        output = io.StringIO()
+        with patch.dict(sys.modules, modules), patch.object(raw_bench, "parse_args", return_value=args), \
+                patch.object(raw_bench.mp, "get_context", return_value=ctx), \
+                patch.object(raw_bench, "receive", side_effect=receive), \
+                patch.object(raw_bench, "packet_payload", return_value=MagicMock()), \
+                patch.object(raw_bench, "measure_raw_read") as eager, contextlib.redirect_stdout(output):
+            raw_bench.main()
+        eager.assert_not_called()
+        # Only warmup and capture call Runtime. Timed rounds use graph replay.
+        self.assertEqual(runtime.batch_get_raw_addr.call_count, 4)
+        for call in runtime.batch_get_raw_addr.call_args_list:
+            self.assertEqual(call.args[1:4], (layout.sources, layout.destinations, layout.lengths))
+            self.assertFalse(call.kwargs["synchronize"])
+        for graph in graphs:
+            graph.capture_begin.assert_called_once()
+            graph.capture_end.assert_called_once()
+            self.assertEqual(graph.replay.call_count, 3)
+            graph.reset.assert_called_once()
+        names = [call[0] for call in events.mock_calls]
+        shutdown_index = next(i for i, call in enumerate(events.mock_calls)
+                              if call[0] == "pipe.send" and call.args[0][0] == "shutdown")
+        self.assertLess(names.index("graph0.reset"), shutdown_index)
+        self.assertLess(names.index("graph1.reset"), shutdown_index)
+        self.assertEqual(torch.equal.call_count, 12)  # Device and Host checks every round.
+        self.assertIn("metric=graph_replay_to_stream_sync graph=1 graph_captures=2", output.getvalue())
+        self.assertIn("iterations=4 warmup_excluded=2", output.getvalue())
 
     def test_cpu_bench_uses_one_wrapper_call_and_excludes_diagnostics(self):
         for profiling, server_available in ((False, False), (True, False), (True, True)):
@@ -314,11 +423,15 @@ class PullBenchmarks(unittest.TestCase):
         args = parse_args(common + ["--packets", "1", "--packet-bytes", str((1 << 32) - 1),
                                    "--source-space-bytes", str(1 << 32)])
         self.assertEqual(args.packet_bytes, (1 << 32) - 1)
+        graph = parse_args(common + ["--graph", "--block-group", "1024:16384", "--block-group", "1024:512"])
+        self.assertEqual((graph.packets, graph.payload_bytes, graph.profile_iterations), (2048, 17301504, 0))
+        self.assertEqual(round_counts(graph), (110, 110))
         for invalid in (["--packets", "4097"], ["--packet-bytes", "0"],
                         ["--source-space-bytes", "1"], ["--device-a", "7"],
                         ["--aiv-cores", "4", "--jettys-per-core", "2"],
                         ["--max-inflight-total", "3"], ["--iterations", "0"],
                         ["--profile-iterations", "-1"], ["--source-count", "0"], ["--source-count", "4097"],
+                        ["--graph", "--profile-iterations", "20"],
                         ["--packet-group", "1024:0"], ["--packet-group", "0:512"],
                         ["--packet-group", "1024x512"], ["--packet-group", "1:2:3"],
                         ["--packet-group", "2049:512", "--packet-group", "2048:512"],
