@@ -195,12 +195,13 @@ cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批�
 
 在 N 端保持 `KVAF_SCATTER_CPU_GATHER=1`，用以下组合对照。K 端开关在启动服务时设置。
 
-| N 端 `--pipeline` | K 端 `KVAF_CPU_GATHER_INTERLEAVE` | CPU 提交 | AIV scatter |
-| --- | --- | --- | --- |
-| 0 | 0 | 整批 gather 后提交 | 等 Done |
-| 0 | 1 | 交错分波 | 等 Done |
-| 1 | 0 | 按连续行分波 | 按 Ready |
-| 1 | 1 | 交错分波 | 按 Ready |
+| N 端 `--pipeline` | K 端 `KVAF_CPU_GATHER_INTERLEAVE` | K 端 `KVAF_CPU_GATHER_JETTY_SUPPLY` | CPU 提交 | AIV scatter |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | 0 | 整批 gather 后提交 | 等 Done |
+| 0 | 1 | 0 | 交错分波 | 等 Done |
+| 1 | 0 | 0 | 按连续行分波 | 按 Ready |
+| 1 | 1 | 0 | 交错分波 | 按 Ready |
+| 1 | 任意 | 1 | 首段提前提交，后缀按 Jetty 提交 | 按 Ready，可启用 Jetty cursor |
 
 交错模式保留首段提前提交，后续每波优先为不同 AIV 核和 Jetty 各准备一个分片。
 分片跨越首段边界或内部边界未按 cache line 对齐时，CPU 回退到按连续行分波。
@@ -210,24 +211,12 @@ CPU profile 的 `pipeline` 表示 AIV 模式，`gather_pipeline` 表示 CPU 是�
 （首条提交前到最后一次提交返回）和 `post_tail_ns`（最后一次提交返回到完成回收）
 拆解 `cpu_comm_us`。分波时提交窗口包含供数间隔。
 
-在交错模式上加 `KVAF_CPU_GATHER_SHARD_PIPELINE=1` 可测试分片提交。首段仍提前发送，
-后缀中每条 Jetty 可以在自身分片的 CPU 拷贝完成后独立提交，沿用同一 Jetty 上的
-payload 和 Ready 顺序。队列缺额度时，提交线程先检查其他 Jetty，并回收 CQE。
-`shard_pipeline=1` 表示该批实际采用分片提交，`waves` 计的是 WRITE 计划提交次数，
-一个 gather 波可以对应多个计划。用同样的交错配置、绑核和请求分布，将分片开关设为
-`0` 或 `1` 对比端到端和 AIV scatter 尾部。
+K 端设置 `KVAF_CPU_GATHER_JETTY_SUPPLY=1` 会启用交错调度，后缀分片按 Jetty 独立提交。
+满足 cache-line 对齐并有至少四个活跃 gather 线程时，每条 Jetty 有独立的 gather 线程组，
+日志记录 `jetty_supply=1`。每条 Jetty 按自身队首分片的就绪顺序提交，保留有序 Ready。
+最终 Done 在全部 payload CQE 回收后发布。N 端使用 `--pipeline 1 --jetty-cursors 1` 按 Jetty 消费 Ready。
+`waves` 记录 WRITE 计划提交次数，一个 gather 波可对应多个提交计划。
 
-K 端可用三个开关分别对照独立供数、合批和 CQ 回收。对照时固定
-`KVAF_CPU_GATHER_INTERLEAVE=1`、`KVAF_CPU_GATHER_SHARD_PIPELINE=1` 和 N 端流水设置。
-
-| K 端开关 | 默认 | 实验值及行为 |
-| --- | --- | --- |
-| `KVAF_CPU_GATHER_JETTY_SUPPLY` | `0` | `1` 启用交错和分片提交。首段沿用原调度，后缀为每条 Jetty 分配独立的 gather 线程组。至少需要四个活跃线程和 cache-line 对齐的交错计划，实际生效时 profile 记录 `jetty_supply=1`。 |
-| `KVAF_CPU_PUSH_SHARD_BATCH` | `1` | `2` 允许同一 Jetty 的两个已就绪队首分片共用一次 post 和一个尾 CQE。每条 Jetty 的第一个独立分片立即单发，后续无第二片可用时也立即单发。每片保留有序 Ready，合批遵守 WR 上限。 |
-| `KVAF_CPU_PUSH_CQ_BATCH` | `1` | `2`～`8` 批量回收 payload CQE。分片提交期间，在提交推进或缺额度时做非阻塞轮询，最终 Done 仍在 payload CQ 全部回收后发送。 |
-
-`merged_shard_posts` 统计实际合批数，`credit_retries` 统计单片因额度不足未能提交的次数，
-`cq_poll_calls` 和 `max_cqes_per_poll` 统计 payload CQ 轮询次数和单次轮询最多回收数。
 `max_jetty_post_gap_ns` 是同一 Jetty 相邻提交之间的最大间隔，包含在途数据仍可搬运的时间。
 对照 `post_calls`、`tail_cqes`、`post_window_ns`、`post_tail_ns`、`write_ns` 和端到端 P50/P90。
 

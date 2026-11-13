@@ -17,19 +17,6 @@ namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 constexpr std::size_t kJettyDepth = 8192;
 constexpr std::size_t kGatherProfileSamples = 512;
-constexpr std::uint32_t kMaxCqBatch = 8;
-
-Status ReadLimit(const char* name, std::uint32_t max, std::uint32_t& result) {
-  const auto* value = std::getenv(name);
-  if (!value) return Status::OK();
-  char* end = nullptr;
-  errno = 0;
-  const auto limit = std::strtoul(value, &end, 10);
-  if (errno || end == value || *end || !limit || limit > max)
-    return Status::InvalidArgument(std::string(name) + " must be in 1.." + std::to_string(max));
-  result = static_cast<std::uint32_t>(limit);
-  return Status::OK();
-}
 #ifdef __OPTIMIZE__
 constexpr unsigned kOptimized = 1;
 #else
@@ -79,17 +66,11 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
   if (interleave && ((interleave[0] != '0' && interleave[0] != '1') || interleave[1] != '\0'))
     return Status::InvalidArgument("KVAF_CPU_GATHER_INTERLEAVE must be 0 or 1");
   gather_interleave_ = interleave && interleave[0] == '1';
-  const auto* shard_pipeline = std::getenv("KVAF_CPU_GATHER_SHARD_PIPELINE");
-  if (shard_pipeline &&
-      ((shard_pipeline[0] != '0' && shard_pipeline[0] != '1') || shard_pipeline[1] != '\0'))
-    return Status::InvalidArgument("KVAF_CPU_GATHER_SHARD_PIPELINE must be 0 or 1");
-  gather_shard_pipeline_ = shard_pipeline && shard_pipeline[0] == '1';
   const auto* jetty_supply = std::getenv("KVAF_CPU_GATHER_JETTY_SUPPLY");
   if (jetty_supply && ((jetty_supply[0] != '0' && jetty_supply[0] != '1') || jetty_supply[1] != '\0'))
     return Status::InvalidArgument("KVAF_CPU_GATHER_JETTY_SUPPLY must be 0 or 1");
   gather_jetty_supply_ = jetty_supply && jetty_supply[0] == '1';
   gather_interleave_ |= gather_jetty_supply_;
-  gather_shard_pipeline_ |= gather_jetty_supply_;
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
@@ -111,10 +92,14 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
-  auto limits = ReadLimit("KVAF_CPU_PUSH_POST_BATCH_WRS", kJettyDepth, post_batch_wrs_);
-  if (limits.ok()) limits = ReadLimit("KVAF_CPU_PUSH_SHARD_BATCH", 2, shard_batch_);
-  if (limits.ok()) limits = ReadLimit("KVAF_CPU_PUSH_CQ_BATCH", kMaxCqBatch, cq_batch_);
-  if (!limits.ok()) return limits;
+  if (const auto* value = std::getenv("KVAF_CPU_PUSH_POST_BATCH_WRS")) {
+    char* end = nullptr;
+    errno = 0;
+    const auto limit = std::strtoul(value, &end, 10);
+    if (errno || end == value || *end || !limit || limit > kJettyDepth)
+      return Status::InvalidArgument("KVAF_CPU_PUSH_POST_BATCH_WRS must be in 1..8192");
+    post_batch_wrs_ = static_cast<std::uint32_t>(limit);
+  }
   context_ = context;
   session_ = setup.session_id;
   source_ = source;
@@ -135,9 +120,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     gather_write_limit = std::min<std::uint64_t>(gather_write_limit, attr.dev_cap.max_write_size);
   max_gather_write_bytes_ = static_cast<std::uint32_t>(gather_write_limit);
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "payload_write_bytes=%u post_batch_wrs=%u shard_batch=%u cq_batch=%u optimized=%u source_refresh=%s\n",
+               "payload_write_bytes=%u post_batch_wrs=%u optimized=%u source_refresh=%s\n",
                max_sge_, max_bytes_, workers_, token_bytes_,
-               gather_ ? max_gather_write_bytes_ : max_bytes_, post_batch_wrs_, shard_batch_, cq_batch_, kOptimized,
+               gather_ ? max_gather_write_bytes_ : max_bytes_, post_batch_wrs_, kOptimized,
                gather_ ? "cpu_gather" :
                (std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map"));
   urma_seg_t segment{};
@@ -491,7 +476,9 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         prepared_.push_back(std::move(plan));
       }
     };
-    if (wave && gather_shard_pipeline_) {
+    if (wave && gather_jetty_supply_) {
+      // The Jetty gather groups publish their own shards, so each queue
+      // needs a separately tracked WRITE plan for its part of the wave.
       for (std::uint32_t q = 0; q < kJettyCount; ++q)
         for (std::size_t w = 0; w < shards[q].size(); ++w) add_plan(w, q);
     } else {
@@ -619,78 +606,23 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
   }
   return Status::OK();
 }
-Status Transport::TryPostShardPair(std::uint32_t queue, std::size_t first, std::size_t second,
-                                   bool refresh, Profile* profile, bool* submitted) {
-  *submitted = false;
-  auto& plan = *prepared_[first];
-  auto& head = plan.queues[queue];
-  auto& tail = prepared_[second]->queues[queue];
-  const auto wrs = head.wrs.size() + tail.wrs.size();
-  const auto markers = head.markers.size() + tail.markers.size();
-  const auto payloads = wrs - markers;
-  if (head.posts.size() != 1 || tail.posts.size() != 1 || wrs > kJettyDepth ||
-      payloads > post_batch_wrs_) return Status::OK();
-  for (const auto& q : queues_)
-    if (q.poisoned) return Error("queue unavailable");
-
-  Tracker::Fence fence{queue, wrs, 0};
-  auto status = tracker_.TryBegin(first + 1, plan.handle, &fence, 1, submitted);
-  if (!status.ok() || !*submitted) return status;
-  if (refresh) {
-    RefreshPrepared(head, head.posts.front());
-    RefreshPrepared(tail, tail.posts.front());
-  }
-  // Keep both shards' original ordering (including each Ready). Only the
-  // second tail requests a CQE, which retires the credits for both plans.
-  plan.merged_tail = &head.wrs.back();
-  plan.merged_tail->flag.bs.complete_enable = 0;
-  plan.merged_tail->next = tail.wrs.data();
-  tail.wrs.back().user_ctx = fence.context;
-  urma_jfs_wr_t* bad = nullptr;
-  const auto begin = profile ? BatchGetProfileNowNs() : 0;
-  if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, head.wrs.data(), &bad)) {
-    queues_[queue].poisoned = true;
-    // A partial post may have left DMA in flight. Shutdown retains both plans
-    // until the Jetty has been destroyed, just as for an ordinary post error.
-    return Error("post merged shard WRITE chain");
-  }
-  if (profile) {
-    const auto end = BatchGetProfileNowNs();
-    profile->RecordJettyPost(queue, begin);
-    if (!profile->first_post_ns) profile->first_post_ns = begin;
-    profile->last_post_return_ns = end;
-    profile->post_ns += end - begin;
-    profile->waves += 2;
-    profile->data_wrs += payloads;
-    profile->ready_wrs += markers;
-    ++profile->post_calls;
-    ++profile->merged_shard_posts;
-  }
-  return Status::OK();
-}
 Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
   const auto deadline = wait ? std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs)
                              : std::chrono::steady_clock::time_point{};
   std::uint32_t polls = 0;
   for (;;) {
-    std::array<urma_cr_t, kMaxCqBatch> crs;
+    urma_cr_t cr;
     std::size_t count = 0;
-    const auto batch_size = id ? 1U : cq_batch_;
-    auto status = cpu_urma_detail::SweepAsyncCqs(kJettyCount, next_poll_queue_, batch_size, batch_size, &count,
+    auto status = cpu_urma_detail::SweepAsyncCqs(kJettyCount, next_poll_queue_, 1, 1, &count,
         [&](std::size_t q) { return tracker_.Pending(q); },
         [&](std::size_t q, std::size_t limit, std::size_t* polled) -> Status {
-          const auto n = urma_poll_jfc(queues_[q].channel.local_jfc, static_cast<int>(limit), crs.data());
+          const auto n = urma_poll_jfc(queues_[q].channel.local_jfc, static_cast<int>(limit), &cr);
           if (n < 0) { queues_[q].poisoned = true; return Error("poll prepared CQ"); }
           *polled = static_cast<std::size_t>(n);
-          if (profile) {
-            ++profile->cq_poll_calls;
-            profile->tail_cqes += n;
-            profile->max_cqes_per_poll = std::max(profile->max_cqes_per_poll, static_cast<std::uint32_t>(n));
-          }
+          if (profile) profile->tail_cqes += n;
           return Status::OK();
         },
-        [&](std::size_t q, std::size_t index, bool* finished) -> Status {
-          const auto& cr = crs[index];
+        [&](std::size_t q, std::size_t, bool* finished) -> Status {
           if (cr.status != URMA_CR_SUCCESS) {
             queues_[q].poisoned = true;
             return Status::Internal("CPU push: prepared CQ failed" +
@@ -704,14 +636,6 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
                                  CqDetails(q, cr, queues_[q].channel));
           }
           if (completed && id && completed != id) return Error("unexpected prepared completion");
-          if (completed && completed <= prepared_.size()) {
-            auto& plan = *prepared_[completed - 1];
-            if (plan.merged_tail) {
-              plan.merged_tail->next = nullptr;
-              plan.merged_tail->flag.bs.complete_enable = 1;
-              plan.merged_tail = nullptr;
-            }
-          }
           *finished = completed != 0;
           return Status::OK();
         });
@@ -802,43 +726,26 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       if (!shards_left) return true;
       // Keep submission order within each Jetty. A slow shard or exhausted
       // queue cannot prevent posting the next ready shard on another Jetty.
-      bool blocked = false, made_progress, posted = false;
+      bool blocked = false, made_progress;
       do {
         made_progress = false;
         for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-          const auto& shards = prepared_shards_[q];
-          const auto next = next_shard[q];
-          if (next == shards.size()) continue;
-          const auto plan = shards[next];
+          if (next_shard[q] == prepared_shards_[q].size()) continue;
+          const auto plan = prepared_shards_[q][next_shard[q]];
           if (!gather_->ShardReady(prepared_[plan]->ready_waves - 1U, q)) continue;
           bool submitted = false;
-          std::size_t consumed = 0;
-          if (shard_batch_ == 2 && next && next + 1 < shards.size()) {
-            const auto second = shards[next + 1];
-            if (gather_->ShardReady(prepared_[second]->ready_waves - 1U, q)) {
-              post_status = TryPostShardPair(q, plan, second, refresh_for_post, profile, &submitted);
-              if (!post_status.ok()) return false;
-              if (submitted) consumed = 2;
-            }
-          }
-          if (!consumed) {
-            post_status = submit_plan(plan, &submitted);
-            if (!post_status.ok()) return false;
-            if (submitted) consumed = 1;
-          }
-          if (consumed) {
-            next_shard[q] += consumed;
-            shards_left -= consumed;
+          post_status = submit_plan(plan, &submitted);
+          if (!post_status.ok()) return false;
+          if (submitted) {
+            ++next_shard[q];
+            --shards_left;
             made_progress = true;
-            posted = true;
           } else {
             blocked = true;
-            if (profile) ++profile->credit_retries;
           }
         }
       } while (made_progress && shards_left);
-      if (poll_for_credits && shards_left && (blocked || (posted && cq_batch_ > 1)))
-        post_status = PollPrepared(0, profile, false);
+      if (poll_for_credits && blocked && shards_left) post_status = PollPrepared(0, profile, false);
       return post_status.ok();
     };
     peer::CpuGatherExecutor::ShardProgress on_shards;
@@ -916,7 +823,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
     if (gather_profile_samples_.size() < kGatherProfileSamples) {
       gather_profile_samples_.push_back(
           {sequence, profiled_gather_rows, profiled_pipeline, !gather_waves_.empty(),
-           prepared_interleaved_, prepared_interleaved_ && gather_shard_pipeline_, profile_});
+           prepared_interleaved_, profile_});
     } else {
       ++gather_profile_dropped_;
     }
@@ -951,9 +858,7 @@ void Transport::FlushGatherProfiles() {
         ? p.last_cqe_ns - p.last_post_return_ns : 0U;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u gather_pipeline=%u interleaved=%u shard_pipeline=%u waves=%u"
-        " jetty_supply=%u shard_batch=%u cq_batch=%u merged_shard_posts=%u credit_retries=%u"
-        " cq_poll_calls=%u max_cqes_per_poll=%u"
+        " pipeline=%u gather_pipeline=%u interleaved=%u waves=%u jetty_supply=%u"
         " max_jetty_post_gap_ns=%" PRIu64
         " data_wrs=%u ready_wrs=%u post_calls=%u tail_cqes=%u"
         " write_ns=%" PRIu64 " post_window_ns=%" PRIu64 " post_tail_ns=%" PRIu64
@@ -967,8 +872,7 @@ void Transport::FlushGatherProfiles() {
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
         unsigned(sample.pipeline), unsigned(sample.gather_pipeline), unsigned(sample.interleaved),
-        unsigned(sample.shard_pipeline), p.waves, unsigned(p.jetty_supply), shard_batch_, cq_batch_,
-        p.merged_shard_posts, p.credit_retries, p.cq_poll_calls, p.max_cqes_per_poll, p.max_jetty_post_gap_ns,
+        p.waves, unsigned(p.jetty_supply), p.max_jetty_post_gap_ns,
         p.data_wrs, p.ready_wrs, p.post_calls, p.tail_cqes,
         p.write_ns, post_window_ns, post_tail_ns, p.post_ns, p.cq_wait_ns, p.cpu_threads,
         p.gather_prepare_ns, p.gather_copy_ns,
@@ -1032,7 +936,6 @@ Status Transport::Shutdown() {
   prepared_interleaved_ = false;
   prepared_head_rows_ = 0;
   post_batch_wrs_ = 128;
-  shard_batch_ = cq_batch_ = 1;
   next_poll_queue_ = 0;
   for (auto& q : queues_) q.poisoned = false;
   std::free(gather_staging_); gather_staging_ = nullptr;

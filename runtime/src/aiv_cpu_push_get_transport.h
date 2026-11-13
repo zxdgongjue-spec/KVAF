@@ -53,13 +53,12 @@ class Transport {
     peer::CpuGatherThreadProfile slowest_thread{};
     std::uint32_t slowest_worker{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
-    std::uint32_t merged_shard_posts{}, credit_retries{}, cq_poll_calls{}, max_cqes_per_poll{};
     bool plan_reused{}, jetty_supply{};
   } profile_;
   struct GatherProfileSample {
     std::uint64_t sequence;
     std::uint32_t rows;
-    bool pipeline, gather_pipeline, interleaved, shard_pipeline;
+    bool pipeline, gather_pipeline, interleaved;
     Profile profile;
   };
   std::vector<GatherProfileSample> gather_profile_samples_;
@@ -91,7 +90,6 @@ class Transport {
     std::size_t fence_count{};
     Tracker::Handle handle;
     std::size_t ready_waves{};
-    urma_jfs_wr_t* merged_tail{};
     bool suffix{}, gather_before_post{};
   };
   Status EnsureGatherStaging(std::uint32_t count);
@@ -109,8 +107,6 @@ class Transport {
   Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
                        bool drain_for_credits = false);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
-  Status TryPostShardPair(std::uint32_t queue, std::size_t first, std::size_t second,
-                          bool refresh, Profile*, bool* submitted);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr, bool wait = true);
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);
@@ -125,7 +121,7 @@ class Transport {
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
-  bool gather_interleave_{}, prepared_interleaved_{}, gather_shard_pipeline_{}, gather_jetty_supply_{};
+  bool gather_interleave_{}, prepared_interleaved_{}, gather_jetty_supply_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
@@ -142,7 +138,6 @@ class Transport {
   std::uint32_t max_sge_{}, max_bytes_{}, max_gather_write_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t token_value_{};
   std::uint32_t post_batch_wrs_{128};
-  std::uint32_t shard_batch_{1}, cq_batch_{1};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push::aiv
