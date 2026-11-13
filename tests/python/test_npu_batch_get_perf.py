@@ -6,11 +6,12 @@ dimension. The request-array length, AccessTable capacity, block layout and
 exact ``miss_count`` are independent inputs. BatchPut is used only to populate
 the remote table before measurement and is never included in the timing.
 
-The five primary settings can be supplied as command-line options or through
+The primary settings can be supplied as command-line options or through
 environment variables:
 
     --request-length       KVAF_BATCH_GET_PERF_REQUEST_LENGTH
     --table-capacity       KVAF_BATCH_GET_PERF_TABLE_CAPACITY
+    --address-space-bytes  KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES
     --tokens-per-block     KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK
     --token-bytes          KVAF_BATCH_GET_PERF_TOKEN_BYTES
     --miss-count           KVAF_BATCH_GET_PERF_MISS_COUNT
@@ -113,7 +114,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=environment_int(
             "KVAF_BATCH_GET_PERF_TABLE_CAPACITY", DEFAULT_TABLE_CAPACITY
         ),
-        help="number of valid AccessTable entries",
+        help="number of valid AccessTable entries (overridden by --address-space-bytes)",
+    )
+    parser.add_argument(
+        "--address-space-bytes",
+        type=int,
+        default=os.environ.get("KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES"),
+        help="remote data budget in bytes, rounded down to whole blocks",
     )
     parser.add_argument(
         "--tokens-per-block",
@@ -288,6 +295,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.adaptive_ub_miss_count = environment_int(
         "KVAF_ADAPTIVE_UB_MISS_COUNT", DEFAULT_ADAPTIVE_UB_MISS_COUNT
     )
+    if args.address_space_bytes is not None and args.token_bytes > 0 and args.tokens_per_block > 0:
+        args.table_capacity = args.address_space_bytes // (args.token_bytes * args.tokens_per_block)
     return args
 
 
@@ -296,14 +305,19 @@ def validate_args(args: argparse.Namespace) -> str | None:
     ddr_bytes = args.table_capacity * block_bytes
     if args.request_length <= 0 or args.request_length > MAX_INT32:
         return "request-length must be in [1, INT32_MAX]"
-    if args.table_capacity <= 0 or args.table_capacity > MAX_INT32:
-        return "table-capacity must be in [1, INT32_MAX]"
     if args.tokens_per_block <= 0 or args.tokens_per_block > MAX_INT32:
         return "tokens-per-block must be in [1, INT32_MAX]"
     if args.token_bytes <= 0 or args.token_bytes > MAX_INT32:
         return "token-bytes must be in [1, INT32_MAX]"
     if (args.tokens_per_block - 1) * args.token_bytes > MAX_INT32:
         return "the largest per-block token offset must fit int32"
+    if args.address_space_bytes is not None:
+        if not 1 <= args.address_space_bytes <= MAX_UINT64:
+            return "address-space-bytes must be in [1, UINT64_MAX]"
+        if args.address_space_bytes < block_bytes:
+            return "address-space-bytes must fit at least one complete block"
+    if args.table_capacity <= 0 or args.table_capacity > MAX_INT32:
+        return "table-capacity (explicit or derived) must be in [1, INT32_MAX]"
     if block_bytes <= 0 or ddr_bytes > MAX_UINT64:
         return "configured table size must fit uint64"
     if args.miss_count < 0 or args.miss_count > args.request_length:
@@ -728,6 +742,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"source_access_pattern={args.source_access_pattern} "
             f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} "
+            f"address_space_budget_bytes={args.address_space_bytes or 0} "
+            f"address_space_bytes={ddr_bytes} "
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "

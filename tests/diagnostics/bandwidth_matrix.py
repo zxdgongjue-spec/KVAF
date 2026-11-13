@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -27,10 +28,15 @@ def main():
     p.add_argument('--iterations', type=int, default=30)
     p.add_argument('--table-capacity', type=int, default=65536,
                    help='Constant logical remote table size; largest token case needs 64 GiB DDR')
+    p.add_argument('--address-space-bytes', type=int, default=os.environ.get('KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES'),
+                   help='Remote data budget per case in bytes, overriding --table-capacity')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
-    if a.clock_mhz <= 0 or a.iterations <= 0 or a.table_capacity < 40:
+    if a.clock_mhz <= 0 or a.iterations <= 0 or (a.address_space_bytes is None and a.table_capacity < 40):
         p.error('Invalid clock, iterations or table capacity')
+    capacity_args = ['--table-capacity', str(a.table_capacity)]
+    if a.address_space_bytes is not None:
+        capacity_args = ['--address-space-bytes', str(a.address_space_bytes)]
     if a.output.exists():
         p.error('Use a new output directory')
     a.output.mkdir(parents=True)
@@ -42,7 +48,7 @@ def main():
         command = [sys.executable, str(runner), '--build', str(a.build.resolve()),
                    '--output', str(output), '--clock-mhz', str(a.clock_mhz),
                    '--token-bytes', str(token), '--miss-count', str(count),
-                   '--request-length', '32768', '--table-capacity', str(a.table_capacity),
+                   '--request-length', '32768', *capacity_args,
                    '--aiv-cores', '2', '--jettys-per-core', str(jettys),
                    '--source-access-pattern', pattern, '--output-access-pattern', 'contiguous',
                    '--warmup', '3', '--iterations', str(a.iterations)]

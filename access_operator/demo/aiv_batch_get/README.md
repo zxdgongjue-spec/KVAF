@@ -243,7 +243,8 @@ KVAF_BATCH_GET_JETTY_PRIORITIES=3,10,13,15 \
 tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu"
 ```
 
-- `batch_get_miss_sweep_summary.csv`: existing overall summary, same columns.
+- `batch_get_miss_sweep_summary.csv`: overall summary including `table_capacity`,
+  `tokens_per_block`, `address_space_budget_bytes` and actual `address_space_bytes`.
 - `batch_get_jetty_summary.csv`: combined per-Jetty summary for all shapes.
 - `token_bytes_..._jettys_per_core_....jetty.csv`: per-shape Jetty summary,
   beside the corresponding `.log`.

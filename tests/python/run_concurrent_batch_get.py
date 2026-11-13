@@ -47,6 +47,8 @@ Existing flow output directories are refused to prevent overwriting results.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--address-space-bytes", type=int,
+                        help="remote data budget in bytes for each flow; override in --flowN-args")
     for name in FLOW_NAMES:
         parser.add_argument(f"--{name}-device", type=int, required=name in ("flow1", "flow2"))
         parser.add_argument(f"--{name}-priorities", default=argparse.SUPPRESS)
@@ -68,6 +70,8 @@ Existing flow output directories are refused to prevent overwriting results.
 def build_flow(args, name):
     """Reuse benchmark parsing and the original shell's single-shape output path."""
     options = shlex.split(getattr(args, f"{name}_args", ""))
+    if args.address_space_bytes is not None:
+        options = ["--address-space-bytes", str(args.address_space_bytes), *options]
     # Match the sweep's clock default, while allowing a per-flow CLI override.
     options = ["--kernel-profile-clock-mhz",
                os.environ.get("KVAF_BATCH_GET_KERNEL_CLOCK_MHZ", "1000"),

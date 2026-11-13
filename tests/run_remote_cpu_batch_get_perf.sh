@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [batch-get-perf-options...]" >&2
+  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--address-space-bytes BYTES] [batch-get-perf-options...]" >&2
   exit 2
 fi
 

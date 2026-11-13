@@ -4,7 +4,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [batch-get-perf-options...]" >&2
+  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--address-space-bytes BYTES] [batch-get-perf-options...]" >&2
   exit 2
 fi
 
@@ -206,6 +206,7 @@ completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 selected_ub_device_values=()
+address_space_csv_rows=()
 jetty_csv_files=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
@@ -241,6 +242,14 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           exit 1
         fi
         jetty_csv_files+=("$jetty_csv_file")
+
+        # Read the resolved layout from the worker for this token size.
+        config_record="$(awk '$1 == "BATCH_GET_PERF_CONFIG" { record = $0 } END { print record }' "$log_file")"
+        table_capacity="$(extract_field "$config_record" table_capacity || true)"
+        tokens_per_block="$(extract_field "$config_record" tokens_per_block || true)"
+        address_space_budget_bytes="$(extract_field "$config_record" address_space_budget_bytes || true)"
+        address_space_bytes="$(extract_field "$config_record" address_space_bytes || true)"
+        address_space_csv_rows+=("$table_capacity,$tokens_per_block,$address_space_budget_bytes,$address_space_bytes")
 
     total_profile_result="$(
       extract_profile_result "$log_file" batch_get_kernel_total
@@ -361,6 +370,10 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "payload_bytes=$payload_bytes"
       "p50_GBps=$p50_gbps"
       "selected_ub_device=$shape_ub_device"
+      "table_capacity=$table_capacity"
+      "tokens_per_block=$tokens_per_block"
+      "address_space_budget_bytes=$address_space_budget_bytes"
+      "address_space_bytes=$address_space_bytes"
     )
     printf '%s\n' "${result[*]}"
         echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
@@ -426,9 +439,9 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device'
+    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,table_capacity,tokens_per_block,address_space_budget_bytes,address_space_bytes'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -446,7 +459,8 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_p50_us_values[$index]}" \
       "${completion_wait_p90_us_values[$index]}" \
       "${completion_wait_p99_us_values[$index]}" \
-      "${selected_ub_device_values[$index]}"
+      "${selected_ub_device_values[$index]}" \
+      "${address_space_csv_rows[$index]}"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"

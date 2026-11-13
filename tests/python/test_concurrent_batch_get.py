@@ -67,8 +67,14 @@ def worker(mode, output):
 
 
 def fake_perf(argv):
-    """Deterministic PERF_RESULT/Jetty fixture consumed by the unchanged sweep."""
+    """Deterministic config, PERF_RESULT and Jetty fixture consumed by the sweep."""
     args = perf.parse_args(argv)
+    error = perf.validate_args(args)
+    if error:
+        raise ValueError(error)
+    print(f"BATCH_GET_PERF_CONFIG table_capacity={args.table_capacity} "
+          f"tokens_per_block={args.tokens_per_block} address_space_budget_bytes={args.address_space_bytes or 0} "
+          f"address_space_bytes={args.table_capacity * args.tokens_per_block * args.token_bytes}")
     perf.wait_for_concurrent_start()
     print("BATCH_GET_PERF_CORRECTNESS_PASS fixture=1")
     for stage in ("kernel_total", "kernel_post", "kernel_completion_wait"):
@@ -177,12 +183,15 @@ class ConcurrentTests(ConcurrentFixture):
         self.assertLess(text.index("flow1 / DEVICE_ID=7"), text.index("flow2 / DEVICE_ID=6"))
 
     def test_four_flow_cli_waits_for_last_worker_on_shared_devices(self):
-        argv = ["build-npu", "--output-dir", str(self.output)]
+        argv = ["build-npu", "--output-dir", str(self.output), "--address-space-bytes", "1048576"]
         devices = (7, 6, 7, 6)
         for index, device in enumerate(devices, 1):
+            options = f"--miss-count {index * 100} --token-bytes {index * 128}"
+            if index == 4:
+                options += " --address-space-bytes 2097152"
             argv.extend([f"--flow{index}-device", str(device),
                          f"--flow{index}-priorities", str(index),
-                         f"--flow{index}-args=--miss-count {index * 100}"])
+                         f"--flow{index}-args={options}"])
 
         popen = subprocess.Popen
 
@@ -191,7 +200,9 @@ class ConcurrentTests(ConcurrentFixture):
             env = kwargs["env"]
             output = Path(env["KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"])
             index = int(output.name.removeprefix("flow"))
-            self.assertEqual(perf.parse_args(command[3:]).miss_count, index * 100)
+            benchmark = perf.parse_args(command[3:])
+            self.assertEqual(benchmark.miss_count, index * 100)
+            self.assertEqual(benchmark.table_capacity, (64, 32, 21, 32)[index - 1])
             mode = "slow" if index == 4 else "normal"
             return popen([sys.executable, "-B", __file__, "--worker", mode, str(output)], **kwargs)
 
@@ -296,10 +307,26 @@ class SweepCompatibilityTests(ConcurrentFixture):
         self.assertEqual(len(list(output.iterdir())), 8)
         self.assertNotIn("[launcher]", result.stdout)
 
+    def test_budget_recomputes_capacity_for_each_sweep_shape(self):
+        env = dict(self.env, KVAF_BATCH_GET_SWEEP_TOKEN_BYTES="128 656",
+                   KVAF_BATCH_GET_SWEEP_MISS_COUNTS="2048",
+                   KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=str(self.output))
+        command = ["bash", str(ROOT / "tests/run_remote_cpu_batch_get_miss_count_perf.sh"),
+                   "build-npu", "--address-space-bytes", "1048576", "--table-capacity", "99"]
+        result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with (self.output / "batch_get_miss_sweep_summary.csv").open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([(row["token_bytes"], row["table_capacity"], row["address_space_bytes"])
+                          for row in rows], [("128", "64", "1048576"), ("656", "12", "1007616")])
+        self.assertTrue(all(row["address_space_budget_bytes"] == "1048576" for row in rows))
+
     def test_pair_outputs_match_single_sweep_verbatim(self):
         for device2 in (7, 6):
             with self.subTest(device2=device2):
                 args = self.args(device2)
+                args.address_space_bytes = 1048576
+                args.flow2_args += " --address-space-bytes 2097152"
                 args.output_dir = self.output / f"pair-{device2}"
                 with patch.dict(os.environ, self.env, clear=True):
                     flows = [launcher.build_flow(args, name) for name in ("flow1", "flow2")]
@@ -319,13 +346,16 @@ class SweepCompatibilityTests(ConcurrentFixture):
                             (pair_output / filename).read_text().replace(str(pair_output), "OUTPUT"),
                             (solo_output / filename).read_text().replace(str(solo_output), "OUTPUT"))
                     with (pair_output / "batch_get_miss_sweep_summary.csv").open() as stream:
-                        header = next(csv.reader(stream))
-                    self.assertEqual(header, [
+                        row, = csv.DictReader(stream)
+                    self.assertEqual((row["address_space_budget_bytes"], row["table_capacity"]),
+                                     ("1048576", "12") if name == "flow1" else ("2097152", "24"))
+                    self.assertEqual(list(row), [
                         "token_bytes", "miss_count", "aiv_cores", "jettys_per_core",
                         "mean_us", "p50_us", "p90_us", "p99_us", "p50_GBps",
                         "post_mean_us", "post_p50_us", "post_p90_us", "post_p99_us",
                         "completion_wait_mean_us", "completion_wait_p50_us",
-                        "completion_wait_p90_us", "completion_wait_p99_us", "selected_ub_device"])
+                        "completion_wait_p90_us", "completion_wait_p99_us", "selected_ub_device",
+                        "table_capacity", "tokens_per_block", "address_space_budget_bytes", "address_space_bytes"])
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux timeout/process group check")
     def test_real_perf_timeout_stays_in_launcher_group(self):
