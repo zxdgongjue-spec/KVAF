@@ -352,8 +352,6 @@ ctest --test-dir build-host-tests --output-on-failure
 ```
 
 其中 [npu_runtime_config_test.cc](tests/npu_runtime_config_test.cc) 验证后端和安装路径，
-[aicpu_kernel_loader_test.cc](tests/aicpu_kernel_loader_test.cc) 用 ACL 桩检查内核入口，
-[test_aicpu_configuration.py](tests/python/test_aicpu_configuration.py) 验证 CLI 与包检查，
 [test_build_script.py](tests/python/test_build_script.py) 模拟编译步骤并实际执行临时目录安装。
 这些回归不能替代 CANN 设备编译和真机 Put/Get 验证。
 

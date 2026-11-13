@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "requests.h"
+#include "batch_get_profile.h"
 #include "status.h"
 #include "types.h"
 
@@ -66,6 +67,12 @@ struct AccessOperatorConfig {
 };
 
 struct BatchGetKernelProfile {
+  // AICPU workers use a shared monotonic nanosecond clock. AIV backends keep
+  // their existing cycle fields; timestamps from different clocks are not mixed.
+  std::uint64_t device_start_ns{0};
+  std::uint64_t device_finish_ns{0};
+  // Preserve the stages already collected by the AICPU profile buffer.
+  BatchGetWorkerProfile aicpu_profile{};
   std::uint64_t kernel_start_cycle{0};
   std::uint64_t setup_done_cycle{0};
   std::uint64_t compact_done_cycle{0};

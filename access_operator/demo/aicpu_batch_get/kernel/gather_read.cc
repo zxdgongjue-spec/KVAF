@@ -12,20 +12,6 @@ namespace kvaf::aicpu_urma {
 namespace {
 using namespace detail;
 
-unsigned ClaimWorker(unsigned count) {
-  if (count == 1U) return 0U;
-  // Runtime drains the previous launch before reuse. Exactly N claims assign
-  // every slot once, even if a new session changes N or starts at another slot.
-  static std::atomic<unsigned> next{0U};
-  auto observed = next.load(std::memory_order_relaxed);
-  for (;;) {
-    const auto worker = observed % count;
-    const auto successor = (worker + 1U) % count;
-    if (next.compare_exchange_weak(observed, successor, std::memory_order_relaxed))
-      return worker;
-  }
-}
-
 template <typename T>
 void EnsureSlots(std::vector<T>& slots, std::size_t count) {
   if (count > slots.size()) slots.resize(count);
@@ -356,14 +342,19 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
 
 std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (!launch || !launch->request.miss_count || !launch->gather.core_status || !launch->gather.scratch ||
+      !launch->gather.execution_control ||
       !launch->gather.worker_count ||
       launch->gather.worker_count > kGatherMaxWorkers)
     return 1U;
   auto args = launch->gather;
+  auto& control = *reinterpret_cast<GatherExecutionControl*>(args.execution_control);
+  if (__atomic_load_n(&control.failed, __ATOMIC_ACQUIRE)) return 1U;
   BatchGetWorkerProfile measured{};
   auto* profile = args.profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
-  const auto worker = ClaimWorker(args.worker_count);
+  const auto ticket = ClaimBatchGetTicket(&control.claimed, args.worker_count);
+  args.sequence = ticket.sequence;
+  const auto worker = ticket.worker;
   args.worker_index = worker;
   args.core_status += worker * sizeof(GatherReadStatus);
   args.scratch += worker * 64U;
@@ -379,8 +370,16 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   status.magic = kGatherStatusMagic;
   status.sequence = args.sequence;
   const auto active = *reinterpret_cast<const volatile std::int32_t*>(launch->request.miss_count);
+  // Retain GatherRead's wide wire sequence. Leave enough ticket headroom for
+  // every instance of the failed launch, so the counter cannot wrap first.
+  if (args.sequence > (peer::kGatherErrorBit - 1U) / args.worker_count) {
+    status.result = kGatherSequenceExhausted;
+    __atomic_store_n(&control.failed, std::uint64_t{1}, __ATOMIC_RELEASE);
+    return 1U;
+  }
   if (active < 0 || static_cast<std::uint32_t>(active) > launch->request.request_capacity) {
     status.result = kInvalidGatherRequest;
+    __atomic_store_n(&control.failed, std::uint64_t{1}, __ATOMIC_RELEASE);
     return 1U;
   }
   const auto count = static_cast<std::uint32_t>(active);
@@ -414,6 +413,7 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
     auto* destination = reinterpret_cast<BatchGetWorkerProfile*>(args.profile) + worker;
     *destination = *profile;
   }
+  if (status.result) __atomic_store_n(&control.failed, std::uint64_t{1}, __ATOMIC_RELEASE);
   return status.result ? 1U : 0U;
 }
 

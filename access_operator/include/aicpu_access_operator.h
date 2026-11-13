@@ -20,6 +20,9 @@ class UmdkAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
+  Status CheckBatchGetStatus(void* stream);
+  Status SetBatchGetKernelProfiling(bool enabled);
+  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const;
 
  private:
   struct Impl;

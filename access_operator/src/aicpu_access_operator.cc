@@ -64,7 +64,9 @@ Status UmdkAccessOperator::Shutdown() {
     if (!stopped.ok()) return stopped;
   }
 #endif
-  auto drained = impl_->DrainGet();
+  // Gather teardown must still unregister buffers after a reported protocol
+  // error; a failed stream synchronization continues to retain resources.
+  auto drained = impl_->get.Drain(false);
   if (!drained.ok()) return drained;
   auto closed = impl_->session.Shutdown();
   if (!closed.ok()) return closed;
@@ -89,5 +91,29 @@ Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   auto drained = impl_->DrainGet();
   if (!drained.ok()) return drained;
   return impl_->put.Execute(impl_->region, exec);
+}
+Status UmdkAccessOperator::CheckBatchGetStatus(void* stream) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->initialized) return Status::NotInitialized("AICPU operator is not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) return impl_->push->Check(stream);
+#endif
+  return impl_->get.Check(static_cast<aclrtStream>(stream));
+}
+Status UmdkAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->initialized) return Status::NotInitialized("AICPU operator is not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) return impl_->push->SetKernelProfiling(enabled);
+#endif
+  return impl_->get.SetKernelProfiling(enabled);
+}
+Status UmdkAccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->initialized) return Status::NotInitialized("AICPU operator is not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) return impl_->push->CopyKernelProfiles(profiles);
+#endif
+  return impl_->get.CopyKernelProfiles(profiles);
 }
 }  // namespace kvaf

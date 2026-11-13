@@ -136,12 +136,18 @@ struct Execution {
 
 std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   Layout layout;
-  if (!args || !args->workspace || !args->coordination || !args->status || !args->sequence ||
-      args->sequence > UINT32_MAX || !args->timeout_ms ||
+  if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
-  const auto worker = static_cast<std::uint32_t>(__atomic_fetch_add(&c.claimed.value, 1, __ATOMIC_ACQ_REL));
-  if (worker >= args->workers) { Fail(c, Result::kInvalidRequest); return 1; }
+  // Preserve the failed execution's reports across later graph replays.
+  if (Load(c.result)) return 1;
+  const auto ticket = ClaimBatchGetTicket(&c.claimed.value, args->workers);
+  const auto worker = ticket.worker;
+  auto current = *args;
+  current.sequence = ticket.sequence;
+  args = &current;
+  if (args->sequence > UINT32_MAX) Fail(c, Result::kSequenceError);
+  const auto target = args->sequence * args->workers;
   BatchGetWorkerProfile measured{};
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
@@ -151,18 +157,15 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   Range range{};
   if (io.Status() == Result::kPending && !io.Build(worker, &count, &range))
     Fail(c, Result::kInvalidRequest);
-  if (count && io.Status() == Result::kPending) {
-    const auto builders = ActiveWorkers(count, args->request.token_bytes, args->workers);
-    // Each slice is visible before arrival; the extra tick releases scatter after notify.
-    if (range.begin < range.end) __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
-    if (!worker) {
-      if (io.Wait(c.built, builders, false) && io.Status() == Result::kPending) {
-        io.Notify();
-        Store(c.built, builders + 1);
-      }
-    } else {
-      io.Wait(c.built, builders + 1, false);
+  // Empty slices participate as well, keeping the target independent of shape.
+  __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
+  if (!worker) {
+    if (io.Wait(c.built, target, false) && io.Status() == Result::kPending) {
+      if (count) io.Notify();
+      Store(c.published, args->sequence);
     }
+  } else {
+    io.Wait(c.published, args->sequence, false);
   }
   std::uint32_t consumed = 0;
   if (io.Status() == Result::kPending && range.begin < range.end) {
@@ -173,7 +176,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   }
   __atomic_fetch_add(&c.arrivals.value, 1, __ATOMIC_ACQ_REL);
   if (!worker) {
-    if (io.Wait(c.arrivals, args->workers) && Load(c.result) == 0 && count) {
+    if (io.Wait(c.arrivals, target) && Load(c.result) == 0 && count) {
       {
         BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
         for (;;) {
@@ -185,8 +188,8 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
         }
       }
     }
-    Store(c.finished, 1);
-  } else io.Wait(c.finished, 1);
+    Store(c.finished, args->sequence);
+  } else io.Wait(c.finished, args->sequence);
   auto* status = reinterpret_cast<WorkerStatus*>(args->status) + worker;
   *status = {kMagic, args->sequence, Load(c.result) ? Load(c.result) : std::uint64_t(Result::kOk),
              worker, consumed, {}};
