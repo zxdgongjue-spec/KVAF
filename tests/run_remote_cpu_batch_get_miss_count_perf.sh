@@ -4,10 +4,12 @@
 # --batch-get-mode (default lookup); --raw-addresses remains an alias for raw.
 # The runner supports CPU DDR and NPU HBM; --peer-device/--peer-service-addr
 # and KVAF_PEER_DEVICE/KVAF_PEER_SERVICE_ADDR are passed through to each shape.
+# --address-space-bytes fixes the remote data budget across token sizes; the
+# Python benchmark derives table-capacity for each shape, rounding down to blocks.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--batch-get-mode lookup|no-pipeline|raw] [batch-get-perf-options...]" >&2
+  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [--batch-get-mode lookup|no-pipeline|raw] [--address-space-bytes BYTES] [batch-get-perf-options...]" >&2
   exit 2
 fi
 
@@ -156,6 +158,10 @@ completion_wait_p50_us_values=()
 completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 selected_ub_device_values=()
+table_capacity_values=()
+tokens_per_block_values=()
+address_space_budget_bytes_values=()
+address_space_bytes_values=()
 post_stage_names=(wqe_fill mte_copy doorbell)
 post_stage_statistics=(mean p50 p90 p99)
 # Flat shape-major, stage-major, statistic-major storage works with Bash 3.2.
@@ -198,6 +204,17 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core status=$run_status" >&2
           exit "$run_status"
         fi
+
+        config_record="$(awk '$1 == "BATCH_GET_PERF_CONFIG" { result = $0 }
+          END { print result }' "$log_file")"
+        table_capacity="$(extract_field "$config_record" table_capacity)"
+        tokens_per_block="$(extract_field "$config_record" tokens_per_block)"
+        address_space_budget_bytes="$(extract_field "$config_record" address_space_budget_bytes)"
+        address_space_bytes="$(extract_field "$config_record" address_space_bytes)"
+        table_capacity_values+=("$table_capacity")
+        tokens_per_block_values+=("$tokens_per_block")
+        address_space_budget_bytes_values+=("$address_space_budget_bytes")
+        address_space_bytes_values+=("$address_space_bytes")
 
     total_profile_result="$(
       extract_profile_result "$log_file" batch_get_kernel_total
@@ -356,6 +373,10 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "selected_ub_device=$shape_ub_device"
       "address_mode=$address_mode"
       "batch_get_mode=$batch_get_mode"
+      "table_capacity=$table_capacity"
+      "tokens_per_block=$tokens_per_block"
+      "address_space_budget_bytes=$address_space_budget_bytes"
+      "address_space_bytes=$address_space_bytes"
     )
     if [[ "$batch_get_mode" == no-pipeline ]]; then
       result+=("${post_stage_result_fields[@]}")
@@ -448,6 +469,7 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       printf ',%s_%s_us' "$stage" "$statistic"
     done
   done
+  printf ',table_capacity,tokens_per_block,address_space_budget_bytes,address_space_bytes'
   printf '\n'
   for index in "${!mean_us_values[@]}"; do
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s' \
@@ -474,6 +496,11 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
     for ((stage_field = 0; stage_field < post_stage_width; ++stage_field)); do
       printf ',%s' "${post_stage_us_values[$((index * post_stage_width + stage_field))]}"
     done
+    printf ',%s,%s,%s,%s' \
+      "${table_capacity_values[$index]}" \
+      "${tokens_per_block_values[$index]}" \
+      "${address_space_budget_bytes_values[$index]}" \
+      "${address_space_bytes_values[$index]}"
     printf '\n'
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"

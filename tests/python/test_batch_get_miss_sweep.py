@@ -6,7 +6,9 @@ parsing/profile formatting, so forwarding, cycle conversion and CSV aggregation
 can be checked without CANN or an NPU.
 """
 
+import contextlib
 import csv
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -14,9 +16,88 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
+
+import test_npu_batch_get_perf as perf
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class AddressSpaceConfigTests(unittest.TestCase):
+    def parse(self, *arguments, environment=None):
+        with patch.dict(os.environ, environment or {}, clear=True):
+            return perf.parse_args(list(arguments))
+
+    def test_capacity_without_address_budget_is_unchanged(self):
+        self.assertEqual(self.parse().table_capacity, perf.DEFAULT_TABLE_CAPACITY)
+        args = self.parse("--table-capacity", "17")
+        self.assertIsNone(args.address_space_bytes)
+        self.assertEqual(args.table_capacity, 17)
+        self.assertIsNone(perf.validate_args(args))
+        args = self.parse(environment={"KVAF_BATCH_GET_PERF_TABLE_CAPACITY": "23"})
+        self.assertEqual(args.table_capacity, 23)
+
+    def test_budget_rounds_down_and_overrides_capacity(self):
+        for token_bytes, capacity, actual_bytes in (
+            (128, 64, 1048576), (656, 12, 1007616), (4096, 2, 1048576),
+        ):
+            with self.subTest(token_bytes=token_bytes):
+                args = self.parse(
+                    "--address-space-bytes", "1048576", "--table-capacity", "99",
+                    "--token-bytes", str(token_bytes), "--tokens-per-block", "128",
+                )
+                self.assertIsNone(perf.validate_args(args))
+                self.assertEqual(args.table_capacity, capacity)
+                self.assertEqual(args.table_capacity * args.token_bytes * args.tokens_per_block,
+                                 actual_bytes)
+
+    def test_environment_and_cli_budget_precedence(self):
+        environment = {
+            "KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES": "1048576",
+            "KVAF_BATCH_GET_PERF_TABLE_CAPACITY": "99",
+            "KVAF_BATCH_GET_PERF_TOKEN_BYTES": "128",
+            "KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK": "128",
+        }
+        self.assertEqual(self.parse(environment=environment).table_capacity, 64)
+        args = self.parse("--address-space-bytes=2097152", environment=environment)
+        self.assertEqual(args.table_capacity, 128)
+        self.assertEqual(args.address_space_bytes, 2097152)
+
+    def test_budget_boundaries_and_invalid_layout(self):
+        for options, expected in (
+            (("--address-space-bytes", "0"), "address-space-bytes"),
+            (("--address-space-bytes", "-1"), "address-space-bytes"),
+            (("--address-space-bytes", str(1 << 64)), "address-space-bytes"),
+            (("--address-space-bytes", "83967"), "one complete block"),
+            (("--address-space-bytes", str(1 << 31), "--token-bytes", "1",
+              "--tokens-per-block", "1"), "table-capacity"),
+            (("--address-space-bytes", "1048576", "--token-bytes", "0"), "token-bytes"),
+            (("--address-space-bytes", "1048576", "--tokens-per-block", "0"),
+             "tokens-per-block"),
+        ):
+            with self.subTest(options=options):
+                self.assertIn(expected, perf.validate_args(self.parse(*options)))
+        for budget, capacity in ((83968, 1), (83969, 1), (8589934592, 102300)):
+            args = self.parse("--address-space-bytes", str(budget))
+            self.assertIsNone(perf.validate_args(args))
+            self.assertEqual(args.table_capacity, capacity)
+        args = self.parse("--address-space-bytes", str(perf.MAX_INT32),
+                          "--token-bytes", "1", "--tokens-per-block", "1")
+        self.assertIsNone(perf.validate_args(args))
+        self.assertEqual(args.table_capacity, perf.MAX_INT32)
+
+    def test_malformed_budget_is_a_cli_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for options, environment in (
+                (("--address-space-bytes",), {}),
+                (("--address-space-bytes", "1GiB"), {}),
+                ((), {"KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES": "bad"}),
+            ):
+                with self.subTest(options=options, environment=environment):
+                    with self.assertRaises(SystemExit) as caught:
+                        self.parse(*options, environment=environment)
+                    self.assertEqual(caught.exception.code, 2)
 
 
 class MissSweepTests(unittest.TestCase):
@@ -44,7 +125,10 @@ class MissSweepTests(unittest.TestCase):
 
             assert sys.argv[1].endswith("test_npu_batch_get_perf.py")
             args = perf.parse_args(sys.argv[2:])
-            assert perf.validate_args(args) is None
+            error = perf.validate_args(args)
+            if error is not None:
+                print(f"FAIL: invalid BatchGet performance configuration: {{error}}", file=sys.stderr)
+                sys.exit(2)
             assert args.kernel_profile
             mode = "raw" if args.raw_addresses else "lookup"
             assert mode == os.environ["EXPECTED_ADDRESS_MODE"]
@@ -56,7 +140,10 @@ class MissSweepTests(unittest.TestCase):
             assert perf.batch_get_kernel_path(args.batch_get_mode).name == filename
             assert args.peer_service_addr == "test-peer:28999"
             assert args.max_inflight_total == 8
-            print(f"BATCH_GET_PERF_CONFIG address_mode={{mode}} batch_get_mode={{args.batch_get_mode}}")
+            print(f"BATCH_GET_PERF_CONFIG address_mode={{mode}} batch_get_mode={{args.batch_get_mode}} "
+                  f"table_capacity={{args.table_capacity}} tokens_per_block={{args.tokens_per_block}} "
+                  f"address_space_budget_bytes={{args.address_space_bytes or 0}} "
+                  f"address_space_bytes={{args.table_capacity * args.token_bytes * args.tokens_per_block}}")
             # An unrelated host timing must never be used by the sweep.
             print("PERF_RESULT operation=batch_get mean_ms=200 p50_ms=200")
             sample = []
@@ -150,6 +237,10 @@ class MissSweepTests(unittest.TestCase):
                     rows = list(csv.DictReader(handle))
                 self.assertEqual(len(rows), 2)
                 for row, count in zip(rows, (0, 64)):
+                    self.assertEqual(row["table_capacity"], "64")
+                    self.assertEqual(row["tokens_per_block"], "1")
+                    self.assertEqual(row["address_space_budget_bytes"], "0")
+                    self.assertEqual(row["address_space_bytes"], "8192")
                     self.assertEqual(row["address_mode"], mode)
                     self.assertEqual(row["batch_get_mode"], batch_get_mode)
                     for stage, expected in (("wqe_fill", 0.6), ("mte_copy", 0.8), ("doorbell", 0.1)):
@@ -177,6 +268,44 @@ class MissSweepTests(unittest.TestCase):
                     self.assertEqual(fields["batch_get_mode"], batch_get_mode)
                     expected_gibps = count * 128 / (16 / 1_000_000) / (1024 ** 3)
                     self.assertAlmostEqual(float(fields["useful_GiBps"]), expected_gibps, places=3)
+
+    def test_fixed_address_space_across_token_sizes_and_modes(self):
+        self.environment["KVAF_BATCH_GET_SWEEP_TOKEN_BYTES"] = "128 656 4096"
+        self.environment["KVAF_BATCH_GET_SWEEP_MISS_COUNTS"] = "64"
+        for mode, use_environment in (("lookup", False), ("no-pipeline", False),
+                                      ("raw", False), ("raw", True)):
+            with self.subTest(mode=mode, use_environment=use_environment):
+                self.environment["EXPECTED_BATCH_GET_MODE"] = mode
+                self.environment["EXPECTED_ADDRESS_MODE"] = "raw" if mode == "raw" else "lookup"
+                options = ["--batch-get-mode", mode, "--tokens-per-block", "128"]
+                if use_environment:
+                    self.environment["KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES"] = "1048576"
+                else:
+                    options += ["--address-space-bytes", "1048576"]
+                result = self.run_sweep(*options)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with (self.directory / "logs/batch_get_miss_sweep_summary.csv").open() as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual(len(rows), 3)
+                for row, token_bytes, capacity, actual in zip(
+                    rows, (128, 656, 4096), (64, 12, 2), (1048576, 1007616, 1048576),
+                ):
+                    self.assertEqual(int(row["token_bytes"]), token_bytes)
+                    self.assertEqual(int(row["table_capacity"]), capacity)
+                    self.assertEqual(row["tokens_per_block"], "128")
+                    self.assertEqual(row["address_space_budget_bytes"], "1048576")
+                    self.assertEqual(int(row["address_space_bytes"]), actual)
+                    self.assertEqual(row["batch_get_mode"], mode)
+                    self.assertIn(f"table_capacity={capacity} tokens_per_block=128 "
+                                  f"address_space_budget_bytes=1048576 address_space_bytes={actual}",
+                                  result.stdout)
+
+    def test_invalid_budget_stops_sweep_before_measurement(self):
+        result = self.run_sweep("--address-space-bytes", "127")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("one complete block", result.stdout)
+        self.assertNotIn("BATCH_GET_PERF_CONFIG", result.stdout)
+        self.assertFalse((self.directory / "logs/batch_get_miss_sweep_summary.csv").exists())
 
     def test_old_profile_fails_without_zero_stage_fallback(self):
         self.environment["EXPECTED_BATCH_GET_MODE"] = "no-pipeline"

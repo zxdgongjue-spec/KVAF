@@ -277,6 +277,36 @@ bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
   --tokens-per-block 128 --warmup 3 --iterations 100
 ```
 
+To keep the remote data address space fixed while sweeping token sizes, replace
+`--table-capacity` with `--address-space-bytes` (an integer byte count). For an
+8 GiB budget, for example:
+
+```bash
+KVAF_CPU_SERVICE_ADDR=CPU_HOST_IP:28999 \
+bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
+  --batch-get-mode raw --address-space-bytes "$((8 * 1024 * 1024 * 1024))" \
+  --tokens-per-block 128 --warmup 3 --iterations 100
+```
+
+Both shell runners and the Python benchmark accept this option, or the default
+`KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES` environment variable (CLI takes
+precedence). For each shape, `block_bytes = token_bytes * tokens_per_block` and
+`table_capacity = address_space_bytes // block_bytes`. The resulting capacity
+overrides `--table-capacity` and `KVAF_BATCH_GET_PERF_TABLE_CAPACITY`. Without an
+address-space budget, capacity keeps its existing behavior and defaults.
+
+The budget is rounded down to whole blocks: the actual remote data size is
+`table_capacity * block_bytes`, leaving less than one block unused. For example,
+1 MiB with 656 bytes/token and 128 tokens/block gives 12 entries and 1,007,616
+actual bytes. The budget must be positive, fit uint64, and hold at least one
+block; the derived capacity must fit positive int32. This controls the populated
+remote data space for CPU DDR and NPU HBM in all three modes; it excludes metadata,
+local output buffers and transport allocations. Configuration logs, sweep result
+records and CSV include `table_capacity`, `tokens_per_block`,
+`address_space_budget_bytes` (0 when unspecified), and `address_space_bytes`
+(actual whole-block size). The existing `ddr_bytes` config field has the same
+actual size, including for an NPU peer.
+
 The four `KVAF_BATCH_GET_SWEEP_*` variables accept space-separated values.
 Omit them to retain the original 2646-shape sweep. Set
 `KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR` to choose a persistent output directory;

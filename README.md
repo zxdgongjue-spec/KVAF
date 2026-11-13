@@ -306,6 +306,13 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 `batch_get_mode` 字段标明所测版本，也可用 `KVAF_BATCH_GET_MODE` 设置默认值。
 完整命令见 [BatchGet 性能测试说明](access_operator/demo/aiv_batch_get/README.md#batchget-variant-miss-count-performance-sweep)。
 
+扫描不同 token 大小时，可通过 `--address-space-bytes`（单位为字节）或
+`KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES` 固定远端数据空间预算。例如传入
+`--address-space-bytes 8589934592` 使用 8 GiB 预算，每组配置自动计算
+`table_capacity = address_space_bytes // (token_bytes * tokens_per_block)`，
+优先于显式或环境变量中的 table capacity。不能整除时向下取整到完整 block；
+日志和 CSV 会记录目标预算、实际字节数及计算出的容量。不指定则保留原有行为。
+
 `no-pipeline` 开启 `--kernel-profile` 后还会输出 WQE 填充、MTE3 拷贝和
 doorbell 三阶段耗时。miss-count sweep 默认开启 profiling，汇总表和 CSV 会
 自动包含三阶段的 mean/p50/p90/p99（微秒）。耗时按每核单次调用内所有 post
