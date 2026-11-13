@@ -105,7 +105,8 @@ class CpuGatherExecutor {
                            std::uint64_t source_bytes,
                            const std::vector<cpu_push::GatherWave>& waves = {},
                            const FixedSuffix* suffix = nullptr,
-                           std::size_t first_shard_wave = SIZE_MAX);
+                           std::size_t first_shard_wave = SIZE_MAX,
+                           bool jetty_supply = false);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -133,6 +134,7 @@ class CpuGatherExecutor {
   using ShardProgress = std::function<bool()>;
   void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {});
   bool ShardReady(std::size_t wave, std::size_t queue) const;
+  bool UsesJettySupply() const { return fixed_jetty_supply_; }
   void EnableProfiling(bool enabled) {
     if (enabled) thread_profiles_.resize(max_threads_);
     profiling_enabled_ = enabled;
@@ -179,10 +181,11 @@ class CpuGatherExecutor {
     return cpus;
   }
 
-  std::uint64_t Boundary(std::size_t index, std::uint64_t begin, std::uint64_t end) const {
+  std::uint64_t Boundary(std::size_t index, std::uint64_t begin, std::uint64_t end,
+                         std::size_t threads) const {
     if (index == 0U) return begin;
-    if (index == active_threads_) return end;
-    const auto target = begin + (end - begin) * index / active_threads_;
+    if (index == threads) return end;
+    const auto target = begin + (end - begin) * index / threads;
     const auto base = reinterpret_cast<std::uintptr_t>(staging_);
     const auto boundary = ((base + target + 63U) & ~std::uintptr_t{63U}) - base;
     return std::min<std::uint64_t>(boundary, end);
@@ -236,6 +239,7 @@ class CpuGatherExecutor {
     std::size_t remaining{};
   };
   std::size_t fixed_first_shard_wave_{SIZE_MAX};
+  bool fixed_jetty_supply_{};
   std::vector<std::array<FixedShardProgress, cpu_push::kJettyCount>> fixed_shards_;
   enum class FixedError { kNone, kSource, kSuffix, kCancelled };
   std::atomic<FixedError> fixed_error_{FixedError::kNone};

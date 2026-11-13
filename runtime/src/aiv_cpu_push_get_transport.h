@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -39,13 +40,21 @@ class Transport {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
     std::uint64_t first_post_ns{}, last_post_return_ns{}, last_cqe_ns{};
+    std::array<std::uint64_t, kJettyCount> jetty_last_post_ns{};
+    std::uint64_t max_jetty_post_gap_ns{};
+    void RecordJettyPost(std::uint32_t queue, std::uint64_t now) {
+      auto& previous = jetty_last_post_ns[queue];
+      if (previous) max_jetty_post_gap_ns = std::max(max_jetty_post_gap_ns, now - previous);
+      previous = now;
+    }
     std::uint64_t gather_prepare_ns{}, gather_copy_ns{}, suffix_wait_ns{};
     std::uint64_t gather_join_wait_ns{}, slowest_elapsed_ns{}, slowest_start_delay_ns{};
     std::uint64_t slowest_ready_delay_ns{};
     peer::CpuGatherThreadProfile slowest_thread{};
     std::uint32_t slowest_worker{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
-    bool plan_reused{};
+    std::uint32_t merged_shard_posts{}, credit_retries{}, cq_poll_calls{}, max_cqes_per_poll{};
+    bool plan_reused{}, jetty_supply{};
   } profile_;
   struct GatherProfileSample {
     std::uint64_t sequence;
@@ -82,6 +91,7 @@ class Transport {
     std::size_t fence_count{};
     Tracker::Handle handle;
     std::size_t ready_waves{};
+    urma_jfs_wr_t* merged_tail{};
     bool suffix{}, gather_before_post{};
   };
   Status EnsureGatherStaging(std::uint32_t count);
@@ -98,8 +108,9 @@ class Transport {
   Status TryBeginPrepared(PreparedWrite&, std::uint64_t id, bool* submitted);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
                        bool drain_for_credits = false);
-  Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
-                      std::uint64_t* first_post_ns = nullptr);
+  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
+  Status TryPostShardPair(std::uint32_t queue, std::size_t first, std::size_t second,
+                          bool refresh, Profile*, bool* submitted);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr, bool wait = true);
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);
@@ -114,7 +125,7 @@ class Transport {
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
-  bool gather_interleave_{}, prepared_interleaved_{}, gather_shard_pipeline_{};
+  bool gather_interleave_{}, prepared_interleaved_{}, gather_shard_pipeline_{}, gather_jetty_supply_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
@@ -131,6 +142,7 @@ class Transport {
   std::uint32_t max_sge_{}, max_bytes_{}, max_gather_write_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t token_value_{};
   std::uint32_t post_batch_wrs_{128};
+  std::uint32_t shard_batch_{1}, cq_batch_{1};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push::aiv

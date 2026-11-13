@@ -68,6 +68,7 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
   fixed_progress_.clear();
   fixed_shards_.clear();
   fixed_first_shard_wave_ = SIZE_MAX;
+  fixed_jetty_supply_ = false;
   pipeline_ready_ = nullptr;
   if (header.pipeline_chunk_bytes != 0U) {
     pipeline_chunk_bytes_ = header.pipeline_chunk_bytes;
@@ -85,7 +86,7 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
     std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes,
     const std::vector<cpu_push::GatherWave>& waves, const FixedSuffix* suffix,
-    std::size_t first_shard_wave) {
+    std::size_t first_shard_wave, bool jetty_supply) {
   if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes)
     return 0U;
   if ((!waves.empty() && reinterpret_cast<std::uintptr_t>(staging) % 64U) ||
@@ -113,6 +114,7 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   }
   if (!waves.empty() && planned_rows != count) return 0U;
   fixed_first_shard_wave_ = first_shard_wave;
+  fixed_jetty_supply_ = jetty_supply && first_shard_wave != SIZE_MAX;
   fixed_shards_.resize(first_shard_wave == SIZE_MAX ? 0U : waves.size() - first_shard_wave);
   fixed_last_source_offset_ = source_bytes - span_bytes;
   fixed_suffix_ = suffix ? *suffix : FixedSuffix{};
@@ -296,10 +298,26 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
 }
 
 void CpuGatherExecutor::PrepareShardProgress() {
+  constexpr auto queues = cpu_push::kJettyCount;
+  fixed_jetty_supply_ &= active_threads_ >= queues;
   for (std::size_t index = 0; index < fixed_shards_.size(); ++index) {
     const auto& wave = fixed_progress_[fixed_first_shard_wave_ + index];
     auto& shards = fixed_shards_[index];
     shards = {};
+    if (fixed_jetty_supply_) {
+      for (std::size_t q = 0; q < queues; ++q) {
+        const auto rows = wave.rows[q];
+        const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;
+        const auto threads = active_threads_ / queues + (q < active_threads_ % queues);
+        std::uint64_t first = 0;
+        for (std::size_t i = 1; i <= threads && first < bytes; ++i) {
+          const auto last = Boundary(i, 0U, bytes, threads);
+          shards[q].remaining += first < last;
+          first = last;
+        }
+      }
+      continue;
+    }
     std::array<std::uint64_t, cpu_push::kJettyCount> starts{}, ends{};
     std::uint64_t offset = 0U;
     for (std::size_t queue = 0; queue < shards.size(); ++queue) {
@@ -311,7 +329,7 @@ void CpuGatherExecutor::PrepareShardProgress() {
     }
     std::uint64_t first = 0U;
     for (std::size_t worker = 1; worker <= active_threads_; ++worker) {
-      const auto last = Boundary(worker, 0U, wave.aligned_bytes);
+      const auto last = Boundary(worker, 0U, wave.aligned_bytes, active_threads_);
       for (std::size_t queue = 0; queue < shards.size(); ++queue) {
         if (std::max(first, starts[queue]) < std::min(last, ends[queue]))
           ++shards[queue].remaining;
@@ -337,8 +355,28 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
                                              OnProgress on_progress) {
   auto& wave = fixed_progress_[index];
   const bool shard_mode = index >= fixed_first_shard_wave_;
-  const auto first = Boundary(worker, 0U, wave.aligned_bytes);
-  const auto last = Boundary(worker + 1U, 0U, wave.aligned_bytes);
+  if (shard_mode && fixed_jetty_supply_) {
+    // Each group advances through its Jetty's shards independently, even
+    // when another group is still copying the preceding wave.
+    constexpr auto queues = cpu_push::kJettyCount;
+    const auto q = worker % queues;
+    const auto rank = worker / queues;
+    const auto threads = active_threads_ / queues + (q < active_threads_ % queues);
+    const auto rows = wave.rows[q];
+    const auto base = std::uint64_t{rows.begin} * span_bytes_;
+    const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;
+    const auto first = Boundary(rank, 0U, bytes, threads);
+    const auto last = Boundary(rank + 1U, 0U, bytes, threads);
+    if (first == last) return 0;
+    const auto copied = CopyFixedRange(base + first, base + last);
+    if (copied) GatherBarrier();
+    auto& remaining = fixed_shards_[index - fixed_first_shard_wave_][q].remaining;
+    __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
+    // The coordinator calls publish_ready after returning from this slice.
+    return copied;
+  }
+  const auto first = Boundary(worker, 0U, wave.aligned_bytes, active_threads_);
+  const auto last = Boundary(worker + 1U, 0U, wave.aligned_bytes, active_threads_);
   std::uint64_t copied = 0U;
   std::uint64_t offset = 0U;
   // Divide the combined wave evenly, then translate each worker's slice
@@ -387,8 +425,8 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
     return copied;
   }
   if (pipeline_ready_ == nullptr) {
-    const auto begin = Boundary(worker, 0U, total_bytes_);
-    const auto end = Boundary(worker + 1U, 0U, total_bytes_);
+    const auto begin = Boundary(worker, 0U, total_bytes_, active_threads_);
+    const auto end = Boundary(worker + 1U, 0U, total_bytes_, active_threads_);
     return addresses_ ? CopyFixedRange(begin, end) : CopyRange(begin, end);
   }
   std::uint64_t copied = 0U;

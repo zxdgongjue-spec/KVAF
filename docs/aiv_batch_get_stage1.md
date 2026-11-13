@@ -217,6 +217,20 @@ payload 和 Ready 顺序。队列缺额度时，提交线程先检查其他 Jett
 一个 gather 波可以对应多个计划。用同样的交错配置、绑核和请求分布，将分片开关设为
 `0` 或 `1` 对比端到端和 AIV scatter 尾部。
 
+K 端可用三个开关分别对照独立供数、合批和 CQ 回收。对照时固定
+`KVAF_CPU_GATHER_INTERLEAVE=1`、`KVAF_CPU_GATHER_SHARD_PIPELINE=1` 和 N 端流水设置。
+
+| K 端开关 | 默认 | 实验值及行为 |
+| --- | --- | --- |
+| `KVAF_CPU_GATHER_JETTY_SUPPLY` | `0` | `1` 启用交错和分片提交。首段沿用原调度，后缀为每条 Jetty 分配独立的 gather 线程组。至少需要四个活跃线程和 cache-line 对齐的交错计划，实际生效时 profile 记录 `jetty_supply=1`。 |
+| `KVAF_CPU_PUSH_SHARD_BATCH` | `1` | `2` 允许同一 Jetty 的两个已就绪队首分片共用一次 post 和一个尾 CQE。每条 Jetty 的第一个独立分片立即单发，后续无第二片可用时也立即单发。每片保留有序 Ready，合批遵守 WR 上限。 |
+| `KVAF_CPU_PUSH_CQ_BATCH` | `1` | `2`～`8` 批量回收 payload CQE。分片提交期间，在提交推进或缺额度时做非阻塞轮询，最终 Done 仍在 payload CQ 全部回收后发送。 |
+
+`merged_shard_posts` 统计实际合批数，`credit_retries` 统计单片因额度不足未能提交的次数，
+`cq_poll_calls` 和 `max_cqes_per_poll` 统计 payload CQ 轮询次数和单次轮询最多回收数。
+`max_jetty_post_gap_ns` 是同一 Jetty 相邻提交之间的最大间隔，包含在途数据仍可搬运的时间。
+对照 `post_calls`、`tail_cqes`、`post_window_ns`、`post_tail_ns`、`write_ns` 和端到端 P50/P90。
+
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务准备，`copy_ns` 记录任务发布、各线程的源地址校验、拷贝和汇合，
 `suffix_wait_ns` 记录协调线程等待后缀清单的时间。`gather_pipeline=1` 的 `copy_ns`

@@ -651,6 +651,36 @@ int main() {
     });
     assert(first_shard_seen && shard_executor.ShardReady(0, 1));
 
+    // Fixed Jetty groups must handle an empty shard and a short last slice.
+    using kvaf::cpu_push::kJettyCount;
+    const std::vector<GatherWave> jetty_waves{
+        GatherWave{Range{0, 4}, Range{4, 8}},
+        GatherWave{Range{8, 12}, Range{}, Range{12, 13}}};
+    kvaf::peer::CpuGatherExecutor jetty_executor(source, Address(source), 9, 1);
+    jetty_executor.EnableProfiling(true);
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(jetty_executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
+                                      jetty_waves, nullptr, 0, true) == 9);
+    assert(jetty_executor.UsesJettySupply());
+    jetty_executor.Copy({}, [] { return true; });
+    for (std::size_t w = 0; w < jetty_waves.size(); ++w)
+      for (std::size_t q = 0; q < kJettyCount; ++q)
+        assert(jetty_executor.ShardReady(w, q) == (jetty_waves[w][q].begin < jetty_waves[w][q].end));
+    for (uint32_t i = 0; i < 13; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+    assert(jetty_executor.ThreadProfiles()[3].bytes == 0);
+    assert(staging[13 * sizeof(source)] == 0xad);
+
+    kvaf::peer::CpuGatherExecutor small_pool(source, Address(source), 3, 1);
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(small_pool.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
+                                   jetty_waves, nullptr, 0, true) == 3);
+    assert(!small_pool.UsesJettySupply());
+    small_pool.Copy({}, [] { return true; });
+    for (uint32_t i = 0; i < 13; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+    assert(staging[13 * sizeof(source)] == 0xad);
+
     // In multi-worker mode an invalid contributor must keep its shard from
     // being submitted even after all the other contributors complete.
     repeated[4] = Address(source + 1);
