@@ -290,7 +290,7 @@ Status UrmaAivGetOperator::PrepareGraph(const GetGraphOptions& options, UrmaAivG
   if (!s.ok()) return s;
   return Status::OK();
 }
-Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetView view, AivInvocation& invocation) {
+Status UrmaAivGetOperator::FinishGraph(void* stream, bool /*discard*/, UrmaAivGetView view, AivInvocation& invocation) {
   if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (!invocation.graph_buffer) return Status::NotFound("AIV graph lease not found");
@@ -303,23 +303,11 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool discard, UrmaAivGetVie
     return Status::InvalidState("finish capture before releasing graph");
   if (aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) != ACL_SUCCESS)
     return Status::CompletionUnknown("graph replay completion unresolved");
-  if (invocation.graph_recorded && !discard) {
-    std::vector<KvafBatchGetCoreStatus> reports(view.options.npu_core_count);
-    if (aclrtMemcpy(reports.data(), view.workspace.status_bytes, view.workspace.status,
-                    view.workspace.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
-      return Internal("cannot collect graph completion");
-    for (const auto& r : reports)
-      if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result)
-        return Internal(
-            "graph result failed or graph was never replayed; inspect then release with "
-            "discard_result=True");
-  }
   if (KvafBatchGetLocalBufferRetire(invocation.graph_buffer) != KVAF_BATCH_GET_SUCCESS)
     return Internal("cannot retire graph registration");
   invocation.graph_buffer = nullptr;
   invocation.graph_entity = 0;
   invocation.graph_options = {};
-  invocation.graph_recorded = false;
   return Status::OK();
 }
 
@@ -401,21 +389,12 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
     return InvalidState("AIV Get registration must be prepared before Launch");
   arguments.channel_entity = channel_entity;
 
-  if (view.options.managed_completion) {
-    if (!graph_lease) {
-      invocation.pending_get = stream;
-      invocation.pending_buffer = local_buffer;
-      invocation.get_issued = false;
-    }
-    const auto reset_started = GetHostTimingStart(exec.host_timing);
-    const auto reset_result = aclrtMemsetAsync(view.workspace.status, view.workspace.status_bytes, 0xFF,
-                                              view.workspace.status_bytes, stream);
-    GetHostTimingRecord(exec.host_timing, &GetProviderTiming::aiv_status_reset_ns, reset_started);
-    if (reset_result != ACL_SUCCESS)
-      return Status::CompletionUnknown("failed to initialize Get completion status");
+  if (view.options.managed_completion && !graph_lease) {
+    invocation.pending_get = stream;
+    invocation.pending_buffer = local_buffer;
+    invocation.get_issued = false;
   }
-  if (graph_lease) invocation.graph_recorded = true;
-  else invocation.get_issued = true;
+  if (!graph_lease) invocation.get_issued = true;
   const auto launch_started = GetHostTimingStart(exec.host_timing);
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   GetHostTimingRecord(exec.host_timing, &GetProviderTiming::aiv_kernel_launch_ns, launch_started);
@@ -459,15 +438,7 @@ Status UrmaAivGetOperator::Drain(UrmaAivGetView view, AivInvocation& invocation)
   if (!invocation.pending_get) return Status::OK();
   if (aclrtSynchronizeStream(invocation.pending_get) != ACL_SUCCESS)
     return Status::CompletionUnknown("BatchGet stream completion failed; resources retained");
-  if (invocation.get_issued) {
-    std::vector<KvafBatchGetCoreStatus> reports(view.options.npu_core_count);
-    if (aclrtMemcpy(reports.data(), view.workspace.status_bytes, view.workspace.status,
-                    view.workspace.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
-      return Internal("failed to collect BatchGet completion status");
-    for (const auto& r : reports)
-      if (r.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || r.result != 0)
-        return Internal("BatchGet kernel reported an execution error; session retained");
-  }
+  if (invocation.get_issued) LogBatchGetDeviceStatus(view.workspace, view.options.npu_core_count);
   if (invocation.pending_buffer != invocation.output_buffer &&
       KvafBatchGetLocalBufferRetire(invocation.pending_buffer) != KVAF_BATCH_GET_SUCCESS)
     return Internal("failed to retire Get registration; resources retained");

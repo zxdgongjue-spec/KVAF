@@ -173,6 +173,9 @@ NPU 端沿用已构建的同分支接口即可，此修复没有改变协议或�
 | `graph` | 两种可用 AIV Direct Get 分别 prepare/capture/replay；同一输出和请求 buffer 地址下更新 indices、offsets、miss_count、output_indices；graph 期间 eager Get、Get 预热/恢复、drain、shutdown 被拒绝，独立 Put 可成功；释放后普通 Get 可继续 |
 | `lifecycle` | 每轮连续调用两次 shutdown，再初始化、预热各 provider、写入并读取数据；最终 shutdown 成功 |
 
+AIV Direct 的 `end_get_graph` 等待 stream 并释放注册资源，不读取 kernel status；
+`discard_result` 对该 provider 仅作为通用接口参数保留。
+
 请求使用非零 token 偏移和分散、反向的输出行号。有效请求前缀之外故意放入越界索引、
 负偏移和负输出行号，确认后端只消费 `miss_count` 指定的前缀。输出先填充 `0xA5`，
 同时检查被写区域及没有被请求的区域。两端不能用跳过 payload 的 done 探针替代这些测试。
@@ -314,7 +317,7 @@ ctest --test-dir build-verify --output-on-failure \
 - `kvaf_runtime_put_recovery_test`：未知完成后成功提交或安全回滚、配置不匹配、元数据及
   完成确认失败重试、提交异常、绑定失败；断言恢复不重复提交 WRITE，也不重复 Commit/Abort。
 - `kvaf_aiv_provider_resources_test`：使用实际 AIV Host provider 和替身设备接口检查
-  执行状态绑定、原次 status 校验、迟到完成、临时注册回收及资源关闭失败重试；
+  执行状态绑定、普通 Get 的诊断式 status 读取、迟到完成、临时注册回收及资源关闭失败重试；
   独立 owner 生命周期、准备后的具体视图、错配状态拒绝和 Launch 不创建注册/工作区。
 - `kvaf_ubmem_provider_resources_test`：检查 stream/status 收集失败后保留执行状态、
   恢复不重发、完整完成数量校验，以及旧报告不能让新调用误判成功；独立资源初始化、
@@ -565,7 +568,9 @@ legacy 的标签为 `algorithm=legacy path=legacy`，由文件名区分所测算
 AIV Direct 还会输出 `aiv_capture_prepare`、`aiv_capture_submit`、
 `aiv_status_reset`、`aiv_kernel_launch` 和 `aiv_submit_other`（单位 µs）。
 前两项分别是请求准备与提交阶段的 `aclmdlRICaptureGetInfo`；
-`aiv_status_reset` 是提交到 stream 的 `aclrtMemsetAsync` **Host 调用耗时**，
+`aiv_status_reset` 保留为兼容旧 trace 的列；AIV Direct 的普通 Get 和 graph
+租约都不逐次清零状态，该字段应为 0。普通 Get 完成后的设备状态仅用于诊断；
+graph 释放会等待 stream 完成，不读取设备状态，和旧图捕获路径一致。
 `aiv_kernel_launch` 是 `KvafExecuteBatchGetLaunch` 的 Host 调用耗时，
 `aiv_submit_other` 为提交阶段剩余的参数组装、校验和计时开销。
 这些字段嵌套在 `provider_prepare` / `provider_submit` 内，不应再次加到总耗时。

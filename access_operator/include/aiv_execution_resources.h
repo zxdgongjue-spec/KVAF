@@ -46,7 +46,6 @@ struct AivInvocation final : ExecutionState {
   KvafBatchGetLocalBuffer* graph_buffer{};
   std::uint64_t graph_entity{};
   GetGraphOptions graph_options;
-  bool graph_recorded{};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   aclrtStream pending_put{};
   KvafBatchPutLocalBuffer* pending_put_buffer{};

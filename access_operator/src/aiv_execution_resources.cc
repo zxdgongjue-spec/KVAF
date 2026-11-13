@@ -265,7 +265,6 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   call.graph_buffer = call.pending_buffer;
   call.graph_entity = call.get_entity;
   call.graph_options = options;
-  call.graph_recorded = false;
   call.pending_buffer = nullptr;
   call.pending_get = nullptr;
   call.get_entity = 0;

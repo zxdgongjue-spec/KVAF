@@ -22,8 +22,8 @@ bool fail_wait = false, fail_copy = false, fail_retire = false, complete_payload
 bool fail_close = false, fail_create = false, fail_free = false;
 bool fail_acquire = false, fail_get_acquire = false, fail_memset = false;
 bool measure_timing_stubs = false;
-int get_launches = 0, get_retirements = 0, get_acquisitions = 0;
-bool get_success = false;
+int get_launches = 0, get_retirements = 0, get_acquisitions = 0, get_async_memsets = 0;
+bool get_success = false, get_status_error = false, graph_capturing = false;
 std::vector<KvafBatchPutLocalBuffer*> registrations;
 std::vector<KvafBatchGetLocalBuffer*> get_registrations;
 }
@@ -37,6 +37,7 @@ aclError aclrtMemset(void* p, size_t, int value, size_t n) {
   std::memset(p, value, n); return 0;
 }
 aclError aclrtMemsetAsync(void* p, size_t size, int value, size_t n, aclrtStream) {
+  ++get_async_memsets;
   if (measure_timing_stubs) std::this_thread::sleep_for(std::chrono::microseconds(10));
   return aclrtMemset(p, size, value, n);
 }
@@ -50,7 +51,8 @@ aclError aclrtMemcpyAsync(void* p, size_t size, const void* s, size_t n, aclrtMe
 aclError aclrtSynchronizeStream(aclrtStream) { return fail_wait ? 1 : 0; }
 aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI*) {
   if (measure_timing_stubs) std::this_thread::sleep_for(std::chrono::microseconds(10));
-  *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
+  *status = graph_capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  return 0;
 }
 int32_t KvafExecuteBatchPutLoadKernel(const char*) { return 0; }
 int32_t KvafBatchPutTransportCreateWithPeerLink(void*, uint64_t, uint32_t, uint32_t, void*, const uint8_t*, KvafBatchPutTransport** out) {
@@ -120,6 +122,7 @@ int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs* args, acl
   auto* reports = reinterpret_cast<KvafBatchGetCoreStatus*>(args->core_status);
   for (unsigned i = 0; i < 2; ++i) {
     reports[i] = {}; reports[i].magic = KVAF_AIV_BATCH_GET_STATUS_MAGIC;
+    reports[i].result = get_status_error ? 7 : 0;
   }
   return 0;
 }
@@ -247,6 +250,7 @@ int main() {
   CHECK(reused.PrepareGetOutput({get.output, get_call.execution.stream, 1}).ok());
   CHECK(get_acquisitions == registered + 1);
   measure_timing_stubs = true;
+  const auto before_eager_memsets = get_async_memsets;
   for (int i = 0; i < 3; ++i) {
     GetProviderTiming timing{};
     get_call.host_timing = &timing;
@@ -254,20 +258,24 @@ int main() {
     get_call.execution.synchronize = i % 2;
     CHECK(reused.ExecuteBatchGet(get_call).ok());
     CHECK(timing.aiv_capture_prepare_ns > 0 && timing.aiv_capture_submit_ns > 0);
-    CHECK(timing.aiv_status_reset_ns > 0 && timing.aiv_kernel_launch_ns > 0);
-    CHECK(timing.aiv_capture_submit_ns + timing.aiv_status_reset_ns +
-          timing.aiv_kernel_launch_ns <= timing.submit_ns);
+    CHECK(timing.aiv_status_reset_ns == 0 && timing.aiv_kernel_launch_ns > 0);
+    CHECK(timing.aiv_capture_submit_ns + timing.aiv_kernel_launch_ns <= timing.submit_ns);
     CHECK(reused.DrainGet().ok());
     CHECK(get_acquisitions == registered + 1 && get_retirements == retired);
   }
+  CHECK(get_async_memsets == before_eager_memsets);
   measure_timing_stubs = false;
   get_call.host_timing = nullptr;
+  get_status_error = true;
+  get_call.execution.synchronize = true;
+  CHECK(reused.ExecuteBatchGet(get_call).ok() && reused.DrainGet().ok());
+  get_status_error = false;
   get_call.execution.synchronize = false;
   CHECK(reused.ExecuteBatchGet(get_call).ok());
   fail_wait = true;
   CHECK(!reused.FinishGetOutput().ok() && get_retirements == retired);
   fail_wait = false; fail_copy = true;
-  CHECK(!reused.FinishGetOutput().ok() && get_retirements == retired);
+  CHECK(reused.DrainGet().ok() && get_retirements == retired);
   fail_copy = false; fail_retire = true;
   CHECK(!reused.FinishGetOutput().ok() && get_registrations.size() == 1);
   const auto before_failed_reuse = get_launches;
@@ -282,6 +290,24 @@ int main() {
   CHECK(reused.DrainGet().ok() && get_retirements == retired + 3);
   CHECK(reused.Shutdown().ok() && get_registrations.empty());
   CHECK(reused.BindExecutionState(nullptr).ok());
+  // Graph capture follows legacy async Get: no status reset or result check.
+  DefaultAccessOperator graph_get(config);
+  CHECK(graph_get.Initialize(region).ok());
+  auto graph_state = graph_get.CreateExecutionState();
+  CHECK(graph_get.BindExecutionState(graph_state.get()).ok());
+  CHECK(graph_get.PrepareGetGraph({get.output, get_call.execution.stream, 1}).ok());
+  const auto before_graph_memsets = get_async_memsets;
+  graph_capturing = true; get_status_error = true;
+  CHECK(graph_get.ExecuteBatchGet(get_call).ok());
+  graph_capturing = false;
+  CHECK(get_async_memsets == before_graph_memsets);
+  fail_wait = true;
+  CHECK(!graph_get.FinishGetGraph(get_call.execution.stream, false).ok());
+  fail_wait = false; fail_copy = true;
+  CHECK(graph_get.FinishGetGraph(get_call.execution.stream, false).ok());
+  fail_copy = false; get_status_error = false;
+  CHECK(graph_get.Shutdown().ok() && get_registrations.empty());
+  CHECK(graph_get.BindExecutionState(nullptr).ok());
   // Resource setup/teardown must work after the compatibility operator is gone.
   config.enable_get = false;
   config.batch_put_kernel_object_path = "test-put.o";
