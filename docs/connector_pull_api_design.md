@@ -43,7 +43,7 @@ B 的普通 BatchPut、BatchGet、本卡 Offload 和跨卡 CPU Pull 共用一个
 | 数据路径 | A HBM → CPU DDR | A HBM → B HBM |
 | 初始化关联 | 指定的 CPU DDR region | NPU reader 连接 |
 | 目的内存确定时机 | 初始化时确定 DDR 池，每批通过 PreparePut 确定槽位 | 每次读取时由 B 提供 output 缓冲 |
-| 完成条件 | READ 完成后，B 在本地提交或撤销写事务 | NPU READ 结束且状态校验通过；应用自行通知源端 |
+| 完成条件 | READ 完成后，B 在本地提交或撤销写事务 | 算子提交和 stream 同步成功；应用负责数据校验并通知源端 |
 | 路由 | CPU↔NPU 路由 EID | NPU↔NPU fullmesh EID |
 
 两个对象共用底层 `Exporter` 的 HBM 注册、地址对齐、资源创建和清理代码，但分别持有注册、连接和状态。CPU 与 NPU 对端的描述符格式、TP 绑定和控制协议仍分别处理，不合并资源实例。
@@ -138,11 +138,11 @@ lengths[N]
 
 三个数组的元素数量必须相同，范围为 1～4096，偏移非负，每个 `lengths[i]` 大于零。CPU Pull 在 Host 检查数值并保存连续 `uint64_t` 快照，然后通过控制协议发送到 CPU service；接口返回或抛出异常后，应用可以复用这三组 CPU 元数据。
 
-NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数量，Host 另检查元数据存储不与整个 output 分配范围重叠。随后只启动一次 raw READ V3 算子，每个输入段直接生成一个 WQE，填写时计算基址加偏移并读取对应长度。默认不预扫描长度，由应用保证每条长度为 1..UINT32_MAX 且符合设备单次 READ 上限、源/目的范围合法、目的段不重叠；`validate_ranges=True` 可开启正长度、32 位长度字段及源/目的边界诊断，不检查目的重叠或查询设备能力。最多 4096 个输入段，对应最多 4096 个 WQE，无 64 KiB 拆分或前缀表。
+NPU Pull 在 Python 入口检查类型、形状、连续性、设备及元素数量，Host 另检查元数据存储不与整个 output 分配范围重叠。随后只启动一次 raw READ V4 算子，每个输入段直接生成一个 WQE，填写时计算基址加偏移并读取对应长度。默认不预扫描长度，由应用保证每条长度为 1..UINT32_MAX 且符合设备单次 READ 上限、源/目的范围合法、目的段不重叠；`validate_ranges=True` 可开启正长度、32 位长度字段及源/目的边界诊断，不检查目的重叠或查询设备能力。最多 4096 个输入段，对应最多 4096 个 WQE，无 64 KiB 拆分或前缀表。
 
-各核直接按输入请求数量划分任务，单个请求完整交给一个核处理；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 在同一次算子完成后读取最终状态，先检查每核写回本次启动编号，再检查各核总 WQE 数等于输入请求数，以及各自已提交/处理数量。编号使用结果结构的预留位置，状态缓冲只初始化清零一次，不增加 HBM 大小；缺失新结果时保留未决资源。该实现的真实性能仍需硬件验证。
+各核直接按输入请求数量划分任务，单个请求完整交给一个核处理；双 bank、多 Jetty、inflight 窗口和 CQ 调度沿用原实现。没有独立准备算子、中间状态回传或展开描述符的 HBM 缓冲，三数组不经 Host 中转。Host 在算子提交和 stream 同步成功后结束该批次，不生成启动编号、不回读或检查设备 status。设备 status/队列缓冲仅在初始化时清零；每核的 WQE/CQ 诊断及队列错误标记继续留在设备上。提交或同步失败时保留未决资源，恢复不重放 READ。
 
-NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。接口执行期间不得修改或释放它们。Python 绑定保留三数组和 stream 到正常完成或本地清理成功；output 硬件注册缓存保留到连接关闭，Python Tensor 引用保守保留到 Runtime shutdown 成功。如果 `pending_raw_addr` 为真，应用仍不得修改或复用本批存储。C++ 调用者自行保持存储有效。已启用的设备内容检查失败时不会发 READ，读取端本地结束该批次；应用通知生产端释放后，才能发布新的 ReadyToken 重试。
+NPU 三数组不得与整个 output 分配范围重叠，且必须与 output 一起在传入 stream 上就绪；如果应用在其他 stream 生成它们，应先建立事件依赖。接口执行期间不得修改或释放它们。Python 绑定保留三数组和 stream 到正常完成或本地清理成功；output 硬件注册缓存保留到连接关闭，Python Tensor 引用保守保留到 Runtime shutdown 成功。如果 `pending_raw_addr` 为真，应用仍不得修改或复用本批存储。C++ 调用者自行保持存储有效。已启用的设备内容检查发现非法范围时不发 READ，但 Host 不会因此收到 status 异常；应用负责合法范围及输出校验。每次同步完成后，ReadyToken 会被标记为已消费；下一次读取使用新批次。
 
 应用不再逐段创建对象，原 READ 的 WQE 编码、多 Jetty 调度及 CQ 处理规则保持不变。公开入口只保留 NPU Tensor 三数组形式；建链探测内部保留专用 Host 描述符路径。
 
@@ -464,13 +464,13 @@ result = runtime.batch_get_raw_addr(
 
 | 接口 | 作用 |
 |---|---|
-| `batch_get_raw_addr(...) → result` | 按三个数组描述的区间读取 A HBM 到 B output，数据就绪且状态检查通过后返回；不发送完成通知 |
+| `batch_get_raw_addr(...) → result` | 按三个数组描述的区间读取 A HBM 到 B output，算子提交和 stream 同步成功后返回，不回读设备 status；不发送完成通知 |
 | `resolve_raw_addr(ready)` | 校验源身份及批次号后只重试本地资源清理，不重发 READ、不发送通知；DMA 不确定时继续保留资源 |
 | `cancel_raw_addr(ready)` | 只在读取端记录本批不可再读；应用自行通知生产端；未决 DMA 不能通过取消释放 |
 
-KVAF 在 Host 检查数组布局、元数据/output 不重叠和批次身份；NPU raw READ V3 直接从三个 Tensor 为每条请求生成一个 WQE；完整批次的长度/边界诊断仅在显式启用时执行。不会先生成展开的设备描述符数组。
+KVAF 在 Host 检查数组布局、元数据/output 不重叠和批次身份；NPU raw READ V4 直接从三个 Tensor 为每条请求生成一个 WQE；完整批次的长度/边界诊断仅在显式启用时执行。不会先生成展开的设备描述符数组。
 
-该路径不需要 PreparePut、CommitPut 或 AccessTable。A 的源描述符无需绑定 B 的目标 HBM；B 每次传入 output，KVAF 管理读取所需的本地注册和缓冲引用。成功返回时 output 已可用；应用自行通知源端释放批次，Runtime 不提供每批完成或取消通知接口。
+该路径不需要 PreparePut、CommitPut 或 AccessTable。A 的源描述符无需绑定 B 的目标 HBM；B 每次传入 output，KVAF 管理读取所需的本地注册和缓冲引用。调用在传入 stream 同步后返回，应用校验 output 并自行通知源端释放批次。Host 不将设备侧范围/CQ 诊断转换为返回异常，Runtime 不提供每批完成或取消通知接口。
 
 ### 9.1 output 的含义
 
@@ -692,7 +692,7 @@ python tests/python/test_hbm_read_raw_addr.py \
 
 CPU 验收覆盖显式 PreparePut/Submit/Wait/Commit、重复提交、DDR checksum 和批次复用确认。组合验收同时覆盖共享 DDR 的普通 BatchPut/BatchGet、CPU Pull 和三数组 NPU 直读，包括非页对齐源、输出间隔及 NPU 消费者校验。组合脚本的 `--hbm-mrs` 同时控制 CPU/NPU Pull 独立注册的同一份 tensor 列表，每轮选择同一个 tensor，等待两条路径完成后复用。统一便利入口的本卡场景另外通过 `python tests/python/test_cpu_offload.py --cpu 127.0.0.1:28999 --device 7` 验证；该脚本无需 AIV 算子。跨卡便利入口使用 `test_remote_cpu_offload.py --pull-api batch`，可同时传入 `--tensors 78 --rounds 156`。
 
-需要同时重新编译 NPU 运行库和 raw-address kernel object。当前入口为 `KvafExecuteBatchGetRawAddrAivKernelV3`，启动参数增加 8 字节编号，最终状态使用原有预留空间；旧 V1/V2 object 会拒绝加载。已删除独立准备算子及其状态 ABI。
+需要同时重新编译 NPU 运行库和 raw-address kernel object。当前入口为 `KvafExecuteBatchGetRawAddrAivKernelV4`，移除启动编号后参数为 80 B，旧 V1/V2/V3 object 会拒绝加载。Host 不再回读 status；设备诊断缓冲和队列错误标记继续保留。
 
 ### 13.3 性能入口
 

@@ -40,20 +40,6 @@ struct DeviceBuffer {
     data=nullptr;bytes=0;return Status::OK();
   }
 };
-struct HostStatusBuffer {
-  KvafRawReadCoreStatus* data{};
-  Status Allocate(std::size_t bytes) {
-    if(data)return Status::InvalidState("raw READ host status already allocated");
-    void* memory{};
-    if(aclrtMallocHost(&memory,bytes)!=ACL_SUCCESS || !memory)
-      return Status::OutOfMemory("allocate raw READ pinned host status");
-    data=static_cast<KvafRawReadCoreStatus*>(memory);return Status::OK();
-  }
-  Status Free() {
-    if(data && aclrtFreeHost(data)!=ACL_SUCCESS)return Status::InDoubt("free raw READ pinned host status");
-    data=nullptr;return Status::OK();
-  }
-};
 class ReadLink final:public peer::PeerLink {
  public:
   ReadLink(std::shared_ptr<hr::ControlChannel> channel,HbmReadTicket t):PeerLink("reverse-hbm"),control(std::move(channel)),ticket(t),client(detail::Nonce()){}
@@ -98,10 +84,8 @@ struct Engine {
   KvafBatchGetTransport* transport{};
   KvafBatchGetLocalBuffer* local{};
   DeviceBuffer descriptors,statuses,queues,scratch;
-  HostStatusBuffer host_statuses;
   std::uint32_t cores,jettys,budget;
   std::uint64_t mr_id{1};
-  std::uint64_t launch_generation{};
   bool statuses_initialized{};
   bool uncertain{},kernel_finished{},cache_output{};
   aclrtStream probe_stream{};
@@ -128,7 +112,6 @@ struct Engine {
       *event=nullptr;
     }
     if(KvafBatchGetTransportClose(&transport))return Status::InDoubt("raw READ transport teardown pending");
-    s=host_statuses.Free();if(!s.ok())return s;
     s=statuses.Free();if(!s.ok())return s;
     statuses_initialized=false;
     s=queues.Free();if(!s.ok())return s;
@@ -179,15 +162,12 @@ struct Engine {
   }
   Status RunKernel(KvafExecuteBatchGetRawAddrKernelArgs args,MutableBufferView output,void* stream,
                    HbmReadProfile* profile=nullptr) {
-    if(launch_generation==UINT64_MAX)return Status::InvalidState("raw READ launch generation exhausted; recreate connection");
-    args.generation=++launch_generation;
     auto s=Timed(profile?&profile->buffers_us:nullptr,[&]() -> Status {
     if(!statuses.data) {
       auto allocated=statuses.Allocate(cores*sizeof(KvafRawReadCoreStatus));if(!allocated.ok())return allocated;
     }
-    // Initialize once. Every subsequent result must carry this launch's
-    // generation, so an unwritten core cannot reuse an earlier success/error.
-    // Keep the flag false on failure so retry never uses uninitialized status.
+    // Device diagnostics are initialized once, like ordinary BatchGet. The
+    // Host does not copy or interpret them on the synchronous READ path.
     if(!statuses_initialized) {
       if(aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
         return Status::Internal("initialize raw READ status");
@@ -196,9 +176,6 @@ struct Engine {
     if(!queues.data) {
       auto allocated=queues.Allocate(cores*jettys*sizeof(KvafBatchGetQueueState));if(!allocated.ok())return allocated;
       if(aclrtMemset(queues.data,queues.bytes,0,queues.bytes)!=ACL_SUCCESS)return Status::Internal("clear raw READ queues");
-    }
-    if(!host_statuses.data) {
-      auto allocated=host_statuses.Allocate(statuses.bytes);if(!allocated.ok())return allocated;
     }
     if(profile)for(auto* event:{&profile_start,&profile_end})
       if(!*event && aclrtCreateEventWithFlag(event,ACL_EVENT_TIME_LINE)!=ACL_SUCCESS)
@@ -222,57 +199,17 @@ struct Engine {
       return Status::InDoubt("raw READ launch/stream completion uncertain");
     if(profile && !profile->event_error)profile->event_error=Timed(&profile->event_record_us,[&]{
       return aclrtRecordEvent(profile_end,static_cast<aclrtStream>(stream));});
-    // Same-stream ordering puts the status copy after the kernel (and its end
-    // event). Reuse pinned memory and wait once for both tasks before reading it.
-    const auto copy_error=Timed(profile?&profile->status_us:nullptr,[&]{
-      return aclrtMemcpyAsync(host_statuses.data,statuses.bytes,statuses.data,statuses.bytes,
-                              ACL_MEMCPY_DEVICE_TO_HOST,static_cast<aclrtStream>(stream));});
-    // Even a copy submission failure must not skip waiting for a launched
-    // kernel. A failed wait keeps both device and pinned host buffers retained.
+    // Completion follows the ACL launch/stream result. Per-core diagnostics
+    // stay on device and are not turned into a Host return status.
     if(Timed(profile?&profile->synchronize_us:nullptr,[&]{
         return aclrtSynchronizeStream(static_cast<aclrtStream>(stream));})!=ACL_SUCCESS)
       return Status::InDoubt("raw READ launch/stream completion uncertain");
     kernel_finished=true;
-    if(copy_error!=ACL_SUCCESS)return Status::InDoubt("cannot enqueue raw READ completion copy");
     if(profile && !profile->event_error) {
       float ms{};
       profile->event_error=Timed(&profile->event_query_us,[&]{return aclrtEventElapsedTime(&ms,profile_start,profile_end);});
       profile->kernel_event_valid=!profile->event_error && std::isfinite(ms) && ms>=0;
       if(profile->kernel_event_valid)profile->kernel_event_us=static_cast<double>(ms)*1000;
-    }
-    ProfileTimer status_timer(profile?&profile->status_us:nullptr);
-    const auto* host=host_statuses.data;
-    // Check ALL cores before interpreting either success or pre-DMA rejection.
-    // A stale validation error must not release read references either.
-    for(std::uint32_t c=0;c<cores;++c)
-      if(host[c].completed_generation!=args.generation)
-        return Status::InDoubt("raw READ completion generation mismatch: core="+std::to_string(c));
-    // Ending a rejected read is safe only when EVERY core reports the same full-batch
-    // validation failure and explicitly reports zero posted/processed WQEs.
-    const auto& first=host[0].execution;
-    bool rejected=args.input_mode==KVAF_RAW_NPU_OFFSETS &&
-        (first.result==1 || first.result==4 || first.result==8);
-    for(std::uint32_t c=0;c<cores;++c) {
-      const auto& record=host[c];
-      rejected=rejected && record.execution.magic==KVAF_AIV_BATCH_GET_STATUS_MAGIC &&
-          record.execution.result==first.result && record.execution.failed_request_index==first.failed_request_index &&
-          !record.total_wqes && !record.posted_wqes && !record.execution.processed_request_count;
-    }
-    if(rejected) {
-      uncertain=false;
-      return Status::InvalidArgument("NPU raw READ metadata rejected before DMA: result="+std::to_string(first.result)+
-                                     " span="+std::to_string(first.failed_request_index));
-    }
-    const auto n=host[0].total_wqes;
-    if(!n || n!=args.request_count)
-      return Status::InDoubt("invalid raw READ final WQE count");
-    for(std::uint32_t c=0;c<cores;++c) {
-      const auto& record=host[c];const auto& status=record.execution;
-      const auto expected=n*(c+1)/cores-n*c/cores;
-      if(status.magic!=KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result || record.total_wqes!=n ||
-          status.processed_request_count!=expected || record.posted_wqes!=expected)
-        return Status::InDoubt("raw READ CQ/kernel failure: core="+std::to_string(c)+" result="+std::to_string(status.result)+
-                              " failed_request="+std::to_string(status.failed_request_index));
     }
     uncertain=false;return Status::OK();
   }
@@ -292,7 +229,7 @@ struct Connection {
     if(pending==Pending::None)return Status::InvalidState("no pending raw READ");
     if(pending==Pending::Dma || engine.uncertain)return Status::InDoubt("raw READ DMA unresolved; retain A output and B source; no READ replay");
     auto s=Timed(profile?&profile->cleanup_us:nullptr,[&]{return engine.Cleanup();});if(!s.ok())return s;
-    // Data readiness is the end of this operation. The application delivers
+    // Successful stream completion is the end of this operation. The application delivers
     // completion/reuse notifications through its own channel, outside Runtime.
     pending=Pending::None;last_sequence=sequence;return result;
   }
@@ -484,6 +421,9 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
         }
         if(s.ok()) s=c.engine.Cleanup();
       }
+      // Failed data probes still need checked queue retirement. Stream success
+      // alone no longer exposes a device CQ error through a Host status copy.
+      if(!s.ok() && c.engine.kernel_finished)c.engine.uncertain=true;
       if(c.engine.uncertain) {
         const auto quiesced=c.engine.QuiesceProbe();
         if(!quiesced.ok()) {

@@ -121,9 +121,10 @@ class NpuRuntime final : public Runtime {
   // As with BatchGet, output registrations are cached until detach/shutdown.
   // Keep output storage alive and at a stable address until then. Callers guarantee
   // valid, disjoint ranges and lengths in 1..UINT32_MAX within device READ limits.
-  // Each request produces one WQE; validate_ranges checks lengths and bounds.
-  // Success means data is ready. Completion/reuse notifications belong to the
-  // application; Runtime performs no per-batch control RPC.
+  // Each request produces one WQE; validate_ranges checks lengths/bounds on device.
+  // Success means ACL submission and stream synchronization succeeded. Device
+  // diagnostics are not copied to Host or turned into errors. The application
+  // owns data validation and reuse notifications; no per-batch control RPC.
   Status BatchGetRawAddr(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
                          HbmReadProfile* profile = nullptr, bool validate_ranges = false);

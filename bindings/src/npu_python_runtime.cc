@@ -756,7 +756,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
-           "Return after peer HBM data is ready and status checked; application owns completion/reuse notifications. "
+           "Return after kernel submission and stream synchronization succeed; device status is not read back. "
+           "Application owns data validation and completion/reuse notifications. "
            "profile=True adds Host stage timings and a device event "
            "interval around the kernel to the returned profile dictionary; profiling is off by default. "
            "Output Tensors are retained until Runtime shutdown; do not resize their storage. "
