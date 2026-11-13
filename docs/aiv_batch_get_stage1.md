@@ -165,12 +165,14 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
   bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
     --single --token-bytes 656 --tokens-per-block 128 --table-capacity 16384 \
     --request-length 32768 --miss-count 8192 --aiv-cores 4 --pipeline 1 \
-    --warmup 3 --iterations 100 \
-    --json results/scatter-aligned.json --csv results/scatter-aligned.csv
+    --warmup 3 --iterations 100
 ```
 
-加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于
-请求和数据随样本变化的端到端性能回归。
+日志、样本和汇总默认保存在当前目录的
+`results/YYYYMMDD-HHMMSS-微秒-scatter-模式-token656-miss8192-cores4/`。
+多用例扫参用 `sweep-<用例数>cases` 作为目录后缀。开始运行时会打印绝对路径，
+`--dry-run` 可预览路径和配置，`--output-dir` 可覆盖默认目录。另一个入口
+`tests/run_remote_cpu_scatter_perf.sh` 用于请求和数据随样本变化的端到端性能回归。
 
 每个正式样本还记录 `input_prepare` 和 `e2e_with_input`。前者从生成请求计划
 开始，包含原地更新固定输入 Tensor 和提交前的设备同步。后者从同一起点量到
@@ -191,8 +193,7 @@ Scatter BatchGet 的 CPU payload 固定走 4 条 Jetty，AIV 用第 0 条向 CPU
 ```bash
 bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
   --execution compare --rounds 3 --single --token-bytes 656 \
-  --table-capacity 16384 --miss-count 8192 --aiv-cores 4 --pipeline 1 \
-  --output-dir results/scatter-compare
+  --table-capacity 16384 --miss-count 8192 --aiv-cores 4 --pipeline 1
 ```
 
 `--execution graph` 只测回放，默认的 `--execution eager` 保留 AIV profiling。

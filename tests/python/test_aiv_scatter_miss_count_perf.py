@@ -80,7 +80,8 @@ def arguments(argv=None):
     parser.add_argument("--token-sizes", type=positive_list)
     parser.add_argument("--miss-counts", type=positive_list)
     parser.add_argument("--core-counts", type=positive_list)
-    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--output-dir", type=Path,
+                        help="override the timestamped case directory under results/")
     parser.add_argument("--json", type=Path, help="single-case raw samples/configuration")
     parser.add_argument("--csv", type=Path, help="single-case compact timing/bandwidth samples")
     parser.add_argument("--case-timeout", type=int, default=600,
@@ -109,11 +110,11 @@ def arguments(argv=None):
     if args.rounds < 1 or (args.execution != "compare" and args.rounds != 1):
         parser.error("multiple rounds require --execution compare and rounds must be positive")
     if args.execution == "compare" and (args.worker or args.json or args.csv):
-        parser.error("compare writes paired worker outputs under --output-dir")
+        parser.error("compare writes paired worker outputs to the run directory")
     if args.single and any((args.token_sizes, args.miss_counts, args.core_counts)):
         parser.error("use scalar options with --single; list options select a sweep")
     if not args.single and (args.json or args.csv):
-        parser.error("sweep writes per-case JSON/CSV and summary.csv under --output-dir")
+        parser.error("sweep writes per-case JSON/CSV and summary.csv to the run directory")
     if args.worker and (not args.single or not args.json or not args.csv):
         parser.error("internal worker requires a single case and JSON/CSV paths")
     for plural, scalar, defaults in (
@@ -620,7 +621,13 @@ def main(argv=None, runner=None):
     comparing = args.execution == "compare"
     selected = list(comparison_cases(args)) if comparing else cases(args)
     single_output = args.single and not comparing
-    root = args.output_dir or Path("results") / f"scatter-miss-{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}"
+    root = args.output_dir
+    if root is None:
+        case_count = len(selected) // (2 * args.rounds) if comparing else len(selected)
+        first = selected[0]
+        label = (f"token{first.token_bytes}-miss{first.miss_count}-cores{first.aiv_cores}"
+                 if case_count == 1 else f"sweep-{case_count}cases")
+        root = Path("results") / f"{datetime.now():%Y%m%d-%H%M%S-%f}-scatter-{args.execution}-{label}"
     for case in selected:
         name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_reference_prepared"
         if comparing:
@@ -634,7 +641,7 @@ def main(argv=None, runner=None):
         args.json.resolve(), args.csv.resolve(), args.json.with_suffix(".log").resolve(),
     ):
         raise ValueError("summary CSV must differ from the case JSON, sample CSV and log")
-    plan = dict(mode="cpu_push_scatter", execution=args.execution, rounds=args.rounds,
+    plan = dict(mode="cpu_push_scatter", execution=args.execution, rounds=args.rounds, output_dir=str(root),
                 cpu_jettys=CPU_JETTYS, **SUBMISSION_CONFIG,
                 unsupported_reference_cores=[16, 32], jetty_axis="fixed_CPU_4_not_per_AIV_core",
                 cases=[dict(command=case_command(case), payload_bytes=case.miss_count * case.token_bytes,
@@ -645,6 +652,8 @@ def main(argv=None, runner=None):
     if args.dry_run:
         print(json.dumps(dict(dry_run=True, combinations=len(selected), **plan), indent=2))
         return 0
+    if not single_output or root in (args.json.parent, args.csv.parent):
+        print(f"SCATTER_ALIGNED_OUTPUT_DIR path={root.resolve()}", flush=True)
     if not single_output:
         root.mkdir(parents=True, exist_ok=True)
         (root / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
