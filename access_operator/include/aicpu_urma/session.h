@@ -40,7 +40,8 @@ class UmdkSession {
   explicit UmdkSession(UmdkSessionConfig config) : config_(std::move(config)) {}
   UmdkWriteView WriteView() { return UmdkWriteView(this); }
   Status Load();
-  Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes);
+  Status Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,
+                bool prepared_only = false);
   // Establish transport once without re-registering a released setup buffer.
   Status EnsureSession(std::uint64_t region_base, void* setup_buffer, std::size_t setup_bytes);
   Status Shutdown();

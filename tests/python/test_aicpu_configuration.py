@@ -18,7 +18,7 @@ import test_batch_get as functional
 import benchmark_gather_read as benchmark
 
 EIDS = "00112233445566778899aabbccddeeff,102132435465768798a9bacbdcedfe0f"
-SCATTER = "KvafAicpuCpuPushScatterA12V24"
+SCATTER = "KvafAicpuCpuPushScatterExecutionV3"
 
 
 class PublicCliTests(unittest.TestCase):
@@ -59,7 +59,7 @@ class InstallTests(unittest.TestCase):
         (self.root / "conf/ascend_package_load.ini").write_text("# loader\n")
         self.artifacts = Path(self.temp.name) / "artifacts"
         self.artifacts.mkdir()
-        self.entries = {name: {} for name in ("KvafAicpuBatchPut", "KvafAicpuGatherRead", "KvafAicpuUmdkControl")}
+        self.entries = {name: {} for name in ("KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV4")}
         self.revision = 0
         self.write_json()
         self.write_archive(b"old kernel")

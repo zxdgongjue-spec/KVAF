@@ -489,6 +489,18 @@ class NpuPythonRuntime final {
       const kvaf::BatchGetKernelProfile& profile = profiles[core];
       py::dict item;
       item["core"] = core;
+      if (profile.device_start_ns) {
+        item["device_start_ns"] = profile.device_start_ns;
+        item["device_finish_ns"] = profile.device_finish_ns;
+        BatchGetProfile detailed{};
+        detailed.worker_count = 1;
+        detailed.workers[0] = profile.aicpu_profile;
+        auto fields = BatchGetProfileDict(detailed);
+        auto workers = fields["workers"].cast<py::list>();
+        auto stages = workers[0].cast<py::dict>();
+        stages["worker"] = core;
+        item["stages"] = stages;
+      }
       item["kernel_start_cycle"] = profile.kernel_start_cycle;
       item["setup_done_cycle"] = profile.setup_done_cycle;
       item["compact_done_cycle"] = profile.compact_done_cycle;
@@ -855,6 +867,20 @@ class NpuPythonRuntime final {
     }
   }
 
+  void CheckBatchGetStatus(const py::object& stream) {
+    const auto native_stream = ResolveStream(stream);
+    Status status;
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    {
+      py::gil_scoped_release release;
+      lock.lock();
+      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
+        status = Status::Internal("aclrtSetDevice failed");
+      else status = native_->CheckBatchGetStatus(native_stream);
+    }
+    ThrowIfError(status);
+  }
+
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   bool aicpu_backend_{false};
@@ -884,6 +910,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"), py::arg("slot_size"))
       .def("shutdown", &NpuPythonRuntime::Shutdown)
+      .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,
+           py::arg("stream") = py::none(),
+           "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)

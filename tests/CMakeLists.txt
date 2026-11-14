@@ -58,6 +58,7 @@ target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
 target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
 add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
 add_test(NAME kvaf_cpu_push_request_shape_test COMMAND kvaf_cpu_push_scatter_test --request-shape)
+set_tests_properties(kvaf_cpu_push_scatter_test kvaf_cpu_push_request_shape_test PROPERTIES TIMEOUT 180)
 
 add_executable(kvaf_cpu_push_shutdown_test cpu_push_shutdown_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/host/cpu_push_host.cc)
@@ -89,6 +90,8 @@ set_tests_properties(kvaf_batch_put_kernel_model_test PROPERTIES TIMEOUT 10)
 add_test(NAME kvaf_batch_get_inflight_config_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_inflight_config.py")
+add_test(NAME kvaf_batch_get_unified_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_unified.py")
 add_test(NAME kvaf_batch_get_multicard_perf_python
   COMMAND "${Python3_EXECUTABLE}"
           "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_multicard_perf.py")

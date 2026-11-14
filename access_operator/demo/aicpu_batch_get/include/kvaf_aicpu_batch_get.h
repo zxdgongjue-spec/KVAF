@@ -19,7 +19,10 @@ class BatchGetTransport {
   Status ExecutePrepared(const BatchGetExecRequest&);
   GatherLaunchView View() const;
   static Status LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*);
-  Status Drain();
+  Status Drain(bool check_status = true);
+  Status Check(aclrtStream);
+  Status SetKernelProfiling(bool);
+  Status CopyKernelProfiles(std::vector<BatchGetKernelProfile>*) const;
   std::unique_ptr<ExecutionState> CreateExecutionState();
   Status BindExecutionState(ExecutionState*);
   Status Warmup();

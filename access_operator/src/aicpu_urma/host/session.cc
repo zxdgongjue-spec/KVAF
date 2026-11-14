@@ -149,7 +149,8 @@ Status UmdkSession::Load() {
   return Status::OK();
 }
 
-Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes) {
+Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,
+                           bool prepared_only) {
   if (failed_ || pending_)
     return Status::InvalidState("UMDK session failed; shut down before reuse");
   auto& link = *config_.peer_link;
@@ -160,6 +161,8 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
       if (address >= buffer.first && address - buffer.first <= buffer.second &&
           output_bytes <= buffer.second - (address - buffer.first))
         return Status::OK();
+    if (prepared_only)
+      return Status::InvalidState("AICPU BatchGet output is not registered; warm up outside capture");
     args_.local_buffer = address;
     args_.buffer_bytes = output_bytes;
     UmdkControlStatus registered{};
@@ -167,6 +170,8 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     if (result.ok()) registered_buffers_.push_back({address, output_bytes});
     return result;
   }
+  if (prepared_only)
+    return Status::InvalidState("AICPU BatchGet session is not prepared; warm up outside capture");
   auto result = Shutdown();
   if (!result.ok()) return result;
   peer::PeerRegion region;

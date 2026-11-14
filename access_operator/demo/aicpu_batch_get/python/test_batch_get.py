@@ -40,6 +40,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-rounds", type=int, default=0,
                         help="extra instrumented rounds, excluded from bandwidth statistics")
+    parser.add_argument("--graph-replays", type=int, default=0,
+                        help="extra correctness replays with mutable inputs and two Gets per graph")
+    parser.add_argument("--graph-api", choices=["acl", "torch", "both"], default="both")
     args = parser.parse_args(argv)
     if not all(1 <= workers <= 8 for workers in args.workers):
         parser.error("--workers must contain values from 1 to 8")
@@ -54,7 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (args.tokens_per_block - 1) * args.token_bytes > 0x7FFFFFFF:
         parser.error("token offsets must fit the int32 input Tensor")
     if (not 0 <= args.active_percent <= 100 or args.warmup < 0 or args.iterations <= 0
-            or args.profile_rounds < 0):
+            or args.profile_rounds < 0 or args.graph_replays < 0):
         parser.error("invalid active percentage, warmup or iteration count")
     return args
 
@@ -69,12 +72,16 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def timing_stats(values: list[float], payload_bytes: int = 0) -> dict:
     p50 = percentile(values, 0.50)
+    p99 = percentile(values, 0.99)
     mean = statistics.mean(values)
+    mean_gbps = payload_bytes / mean / 1000 if mean else 0.0
     return {
         "mean_us": mean, "p50_us": p50, "p90_us": percentile(values, 0.90),
-        "p95_us": percentile(values, 0.95), "p99_us": percentile(values, 0.99),
-        "GBps": payload_bytes / mean / 1000 if mean else 0.0,
+        "p95_us": percentile(values, 0.95), "p99_us": p99,
+        "GBps": mean_gbps, "mean_GBps": mean_gbps,
         "p50_GBps": payload_bytes / p50 / 1000 if p50 else 0.0,
+        # Bandwidth corresponding to P99 latency, rather than the P99 of rates.
+        "p99_GBps": payload_bytes / p99 / 1000 if p99 else 0.0,
     }
 
 
@@ -168,6 +175,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     payload_bytes: list[int] = []
     profiles: list[dict] = []
     device_table = None
+    graph_buffers = []  # Keep registered outputs alive through Runtime shutdown.
 
     def run_round(epoch: int, active_count: int, raw_tensors: bool = False,
                   synchronize: bool = True, profile: bool = False) -> tuple[int, int]:
@@ -228,6 +236,111 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         runtime.batch_free(keys)
         return elapsed, active_count * token
 
+    def run_graph_checks() -> None:
+        nonlocal device_table
+        payload = bytearray(rng.randbytes(n * block_bytes))
+        source.copy_(torch.frombuffer(payload, dtype=torch.uint8).reshape(n, block_bytes))
+        runtime.batch_put(keys, source, input_offsets, lengths, stream)
+        table = runtime.prepare_access_table(keys)
+        device_table = runtime.access_table_view(table, device="npu")
+        base_addresses = device_table.addresses.cpu().tolist()
+        second_output = torch.empty_like(output)
+        consumer = torch.empty_like(output)
+        graph_buffers.extend((second_output, consumer))
+
+        def update(epoch: int) -> bytearray:
+            rotation = epoch % n
+            address_values = base_addresses[rotation:] + base_addresses[:rotation]
+            index_values = list(range(n))
+            row_values = list(range(n))
+            rng.shuffle(index_values)
+            rng.shuffle(row_values)
+            row_values = [2 * row for row in row_values]
+            offset_values = [rng.randrange(args.tokens_per_block) * token for _ in range(n)]
+            active = (n, n * 3 // 4, 0, min(1, n), n)[epoch % 5]
+            for target, values in (
+                (device_table.addresses, address_values), (indices, index_values),
+                (offsets, offset_values), (miss_count, [active]), (rows, row_values),
+            ):
+                target.copy_(torch.tensor(values, dtype=target.dtype))
+            output.fill_(0xA5)
+            second_output.fill_(0xA5)
+            expected = bytearray([0xA5]) * (n * 2 * token)
+            for i in range(active):
+                slot = (index_values[i] + rotation) % n
+                begin = slot * block_bytes + offset_values[i]
+                target = row_values[i] * token
+                expected[target:target + token] = payload[begin:begin + token]
+            return expected
+
+        def execute(target: object, synchronize: bool = False) -> None:
+            runtime.batch_get(device_table, indices, offsets, miss_count, rows, target,
+                              stream=stream, synchronize=synchronize)
+
+        def body() -> None:
+            execute(output)
+            execute(second_output)
+            torch.bitwise_xor(second_output, 0xFF, out=consumer)
+
+        apis = ("acl", "torch") if args.graph_api == "both" else (args.graph_api,)
+        for api in apis:
+            update(0)
+            execute(output, True)
+            execute(second_output, True)
+            graph = kvaf.AclGraph() if api == "acl" else torch.npu.NPUGraph()
+            capture_active = False
+            try:
+                if api == "acl":
+                    graph.capture_begin(stream)
+                    capture_active = True
+                    body()
+                    graph.capture_end()
+                    capture_active = False
+                else:
+                    with torch.npu.graph(graph, stream=stream):
+                        body()
+                for epoch in range(max(5, args.graph_replays)):
+                    expected = update(epoch + 1)
+                    graph.replay(stream) if api == "acl" else graph.replay()
+                    runtime.check_batch_get_status(stream)
+                    expected_tensor = torch.frombuffer(expected, dtype=torch.uint8).reshape(n * 2, token)
+                    for actual in (output, second_output):
+                        if not torch.equal(actual.cpu(), expected_tensor):
+                            raise AssertionError(f"graph output mismatch: api={api}, mode={mode}, epoch={epoch}")
+                    if not torch.equal(consumer.cpu(), torch.bitwise_xor(expected_tensor, 0xFF)):
+                        raise AssertionError(f"graph consumer mismatch: api={api}, epoch={epoch}")
+                    if epoch % 2 == 0:
+                        execute(output, True)  # Eager and graph share the device sequence.
+                print(f"AICPU_BATCH_GET_GRAPH_PASS mode={mode} workers={workers} api={api} "
+                      f"replays={max(5, args.graph_replays)} gets_per_graph=2 changing_inputs=1 "
+                      "empty_prefix_checked=1 npu_consumer_checked=1", flush=True)
+                update(0)
+                stream.synchronize()
+                replay = (lambda: graph.replay(stream)) if api == "acl" else graph.replay
+                for _ in range(args.warmup):
+                    replay()
+                stream.synchronize()
+                for label, submit in (("eager", body), ("graph", replay)):
+                    samples = []
+                    for _ in range(args.iterations):
+                        begin = time.perf_counter_ns()
+                        submit()
+                        stream.synchronize()
+                        samples.append((time.perf_counter_ns() - begin) / 1000)
+                    runtime.check_batch_get_status(stream)
+                    stats = timing_stats(samples, 2 * n * token)
+                    print(f"AICPU_BATCH_GET_GRAPH_PERF mode={mode} workers={workers} api={api} "
+                          f"execution={label} gets_per_iteration=2 samples={args.iterations} "
+                          f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
+                          f"p99_us={stats['p99_us']:.3f} mean_GBps={stats['mean_GBps']:.3f}", flush=True)
+            finally:
+                if capture_active:
+                    graph.capture_end()
+                stream.synchronize()
+                graph.reset()
+        runtime.release_access_table(table)
+        runtime.batch_free(keys)
+
     try:
         runtime.link_to(args.peer)
         runtime.initialize(ddr_bytes=(n * 2 + 1) * block_bytes, slot_size=block_bytes)
@@ -251,19 +364,22 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
             profiles.clear()
             for epoch in range(args.profile_rounds):
                 run_round(profile_epoch + 1 + epoch, measured_count, profile=True)
+        if args.graph_replays:
+            run_graph_checks()
     finally:
         # Registered source/output allocations remain alive until teardown.
         runtime.shutdown()
 
     samples_us = [value / 1000 for value in samples_ns]
+    stats = timing_stats(samples_us, measured_count * token)
     bandwidth = sum(payload_bytes) / sum(samples_ns)  # bytes/ns == decimal GB/s.
     print(
         f"AICPU_BATCH_GET_PASS mode={mode} workers={workers} iterations={args.iterations} "
-        f"mean_us={statistics.mean(samples_us):.1f} "
-        f"p50_us={percentile(samples_us, 0.50):.1f} "
-        f"p90_us={percentile(samples_us, 0.90):.1f} "
-        f"p95_us={percentile(samples_us, 0.95):.1f} "
-        f"p99_us={percentile(samples_us, 0.99):.1f} GBps={bandwidth:.3f} "
+        f"mean_us={stats['mean_us']:.1f} mean_GBps={bandwidth:.3f} "
+        f"p50_us={stats['p50_us']:.1f} p50_GBps={stats['p50_GBps']:.3f} "
+        f"p90_us={stats['p90_us']:.1f} "
+        f"p95_us={stats['p95_us']:.1f} "
+        f"p99_us={stats['p99_us']:.1f} p99_GBps={stats['p99_GBps']:.3f} GBps={bandwidth:.3f} "
         f"output_order={args.output_order} output_row_step={args.output_row_step} "
         f"active_percent={args.active_percent} "
         "verification=every_round_full_output npu_consumer_checked=1 "
@@ -289,7 +405,13 @@ def main() -> None:
     )
     for mode in args.modes:
         for workers in args.workers:
-            run_case(args, workers, torch, kvaf, mode)
+            if args.graph_replays:
+                # Framework graph capture requires a non-default stream; all
+                # Tensor preparation, raw ACL replay and consumers use it too.
+                with torch.npu.stream(torch.npu.Stream(device=args.device_id)):
+                    run_case(args, workers, torch, kvaf, mode)
+            else:
+                run_case(args, workers, torch, kvaf, mode)
 
 
 if __name__ == "__main__":

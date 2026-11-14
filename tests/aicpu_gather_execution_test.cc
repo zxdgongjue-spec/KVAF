@@ -54,6 +54,8 @@ struct Fixture {
   urma_target_seg_t local{};
   std::int32_t active;
   UmdkBatchGetArgs launch{};
+  GatherExecutionControl execution_control{};
+  std::uint64_t expected_sequence{1};
   bool check_lock = false;
   std::uint64_t source_bytes{}, staging_offset{}, descriptor_offset{}, control_offset{};
   Fixture(unsigned n, unsigned bytes, unsigned w, bool pipeline, bool direct = false)
@@ -111,7 +113,7 @@ struct Fixture {
     a.remote_notify = canonical + control_offset;
     a.remote_ack = a.remote_notify + offsetof(peer::GatherControl, ack);
     a.remote_command = a.remote_notify + offsetof(peer::GatherControl, command);
-    a.worker_count = w; a.sequence = 7;
+    a.worker_count = w; a.execution_control = Address(&execution_control);
     a.pipeline_chunk_bytes = pipeline ? kGatherChunkBytes : 0;
   }
   ~Fixture() { CHECK(session->state.remote.Close() == 0); RemoveSession(session->state.session); }
@@ -125,7 +127,7 @@ struct Fixture {
   void Gather(unsigned w) {
     auto& control = Control(w);
     auto* header = reinterpret_cast<peer::GatherDescriptorHeader*>(Remote(control.command));
-    CHECK(header->magic == peer::kGatherDescriptorMagic && control.notify == launch.gather.sequence);
+    CHECK(header->magic == peer::kGatherDescriptorMagic && control.notify == expected_sequence);
     auto* spans = reinterpret_cast<peer::GatherSpan*>(header + 1);
     auto* staging = Remote(header->staging_address);
     std::uint64_t bytes = 0;
@@ -139,6 +141,7 @@ struct Fixture {
     control.ack = control.notify;
   }
   void Run(bool success = true) {
+    expected_sequence = execution_control.claimed / workers + 1;
     std::vector<std::future<unsigned>> executions;
     for (unsigned i = 0; i < workers; ++i)
       executions.push_back(std::async(std::launch::async, [&] {
@@ -148,13 +151,13 @@ struct Fixture {
       }));
     for (auto& execution : executions) CHECK((execution.get() == 0) == success);
     if (!success) return;
-    for (unsigned i = 0; i < rows; ++i)
+    for (unsigned i = 0; i < static_cast<unsigned>(active); ++i)
       CHECK(std::memcmp(output.data() + outputs[i] * token,
                         Remote(canonical + indices[i] * (token + 8) + offsets[i]), token) == 0);
     for (unsigned w = 0; w < workers; ++w) {
       CHECK(statuses[w].magic == kGatherStatusMagic && statuses[w].result == 0);
-      CHECK(statuses[w].ack_seen == launch.gather.sequence);
-      const auto spans = std::uint64_t(rows) * (w + 1) / workers - std::uint64_t(rows) * w / workers;
+      CHECK(statuses[w].ack_seen == expected_sequence);
+      const auto spans = std::uint64_t(active) * (w + 1) / workers - std::uint64_t(active) * w / workers;
       CHECK(profiles[w].spans == spans);
       if (spans) {
         CHECK(controls[w].ack_reads >= 3);
@@ -224,6 +227,8 @@ int main() {
       registry_lookups = 0;
       f.Run();
       CHECK(registry_lookups == 1);
+      f.Run();
+      CHECK(registry_lookups == 2 && f.expected_sequence == 2);
     }
   }
   { // One token can cross a 64 KiB WR boundary.
@@ -236,6 +241,14 @@ int main() {
     auto first = std::async(std::launch::async, [&] { f.Run(); });
     g.Run(); first.get();
     CHECK(registry_lookups == 13);
+  }
+  { // A captured argument block remains unchanged while input data varies.
+    Fixture f(9, 16, 5, true);
+    f.Run();
+    f.active = 0; f.Run();
+    f.active = 3; f.Run();
+    CHECK(f.execution_control.claimed == 15 && f.expected_sequence == 3);
+    CHECK(f.launch.gather.sequence == 0); // device never patches captured Host arguments
   }
   for (bool post_error : {false, true}) {
     Fixture f(3, 16, 1, true);

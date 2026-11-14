@@ -3,6 +3,7 @@
 
 #include "gather_workspace.h"
 #include "batch_get_profile.h"
+#include "batch_get_ticket.h"
 #include "aicpu_urma/control_abi.h"
 #include "cpu_push_get_layout.h"
 namespace kvaf {
@@ -26,10 +27,14 @@ enum GatherReadError : std::uint64_t {
   kGatherTimeout = 9,
   kCpuGatherFailed = 10,
   kGatherTransportFailed = 16,
+  kGatherSequenceExhausted = 17,
 };
 
 struct alignas(64) GatherReadStatus {
   std::uint64_t magic, result, phase, ack_seen, cqe_word, sequence;
+};
+struct alignas(64) GatherExecutionControl {
+  std::uint64_t claimed{}, failed{}, reserved[6]{};
 };
 struct GatherReadArgs {
   UmdkContext context;
@@ -37,12 +42,14 @@ struct GatherReadArgs {
   std::uint64_t output{0U}, output_extent{0U}, scratch{0U};
   std::uint64_t remote_staging{0U}, remote_descriptor{0U};
   std::uint64_t remote_command{0U}, remote_notify{0U}, remote_ack{0U};
+  // sequence is assigned in the worker's local copy, never by the Host.
   std::uint64_t source_descriptor{0U}, sequence{0U};
   std::uint32_t bytes{0U}, source_span_count{0U};
   std::uint32_t sgl_size{6U}, worker_count{1U}, sq_batch_wqes{32U};
   std::uint32_t worker_index{0U};
   std::uint32_t pipeline_chunk_bytes{kGatherChunkBytes};
   std::uint64_t profile{0U};
+  std::uint64_t execution_control{0U};
 };
 // One stable registered HBM workspace, independent of caller output allocations.
 constexpr std::uint64_t kGatherDescriptorOffset = kGatherMaxWorkers * 64U;
@@ -69,7 +76,7 @@ namespace kvaf::cpu_push {
 struct KernelArgs {
   aicpu_urma::AicpuBatchGetInput request;
   std::uint64_t workspace{}, output{}, output_bytes{}, coordination{}, status{}, profile{};
-  std::uint64_t sequence{};
+  std::uint64_t sequence{};  // Assigned in each instance's local copy after claiming a ticket.
   std::uint32_t workers{}, timeout_ms{kTimeoutMs};
 };
 }  // namespace kvaf::cpu_push

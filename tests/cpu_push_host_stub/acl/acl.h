@@ -2,7 +2,7 @@
 
 #include "../../aicpu_loader_stub/acl/acl.h"
 
-enum aclrtMemMallocPolicy { ACL_MEM_MALLOC_NORMAL_ONLY };
+enum aclrtMemMallocPolicy { ACL_MEM_MALLOC_NORMAL_ONLY, ACL_MEM_MALLOC_HUGE_FIRST };
 enum aclrtMemcpyKind { ACL_MEMCPY_DEVICE_TO_HOST };
 aclError aclrtMalloc(void**, std::size_t, aclrtMemMallocPolicy);
 aclError aclrtMallocHost(void**, std::size_t);
@@ -12,3 +12,9 @@ aclError aclrtMemset(void*, std::size_t, int, std::size_t);
 aclError aclrtMemsetAsync(void*, std::size_t, int, std::size_t, aclrtStream);
 aclError aclrtMemcpyAsync(void*, std::size_t, const void*, std::size_t, aclrtMemcpyKind, aclrtStream);
 aclError aclrtSynchronizeStream(aclrtStream);
+
+using aclmdlRI = void*;
+enum aclmdlRICaptureStatus { ACL_MODEL_RI_CAPTURE_STATUS_NONE, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE,
+                           ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED };
+aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus*, aclmdlRI*);
+aclError aclrtMemcpy(void*, std::size_t, const void*, std::size_t, aclrtMemcpyKind);

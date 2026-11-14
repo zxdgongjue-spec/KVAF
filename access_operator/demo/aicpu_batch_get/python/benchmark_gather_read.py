@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark AICPU BatchGet with full-pool random sources and random output rows."""
+"""Benchmark AICPU BatchGet kernel time with full-pool random sources and random output rows."""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +11,7 @@ import time
 
 from test_batch_get import timing_stats
 from npu_eids import parse_npu_eids
+from batch_get_workload import token_pattern
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tests" / "python"))
 from perf_execution import BenchmarkExecution, add_execution_mode
@@ -32,7 +33,8 @@ def parse_args(argv=None, *, mode="gather_read"):
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--token-bytes", type=int, default=656)
     p.add_argument("--miss-count", type=int, default=4096)
-    p.add_argument("--table-capacity", type=int, help="optional smaller source pool; default fills the 100 GiB DDR budget")
+    p.add_argument("--table-capacity", type=int,
+                   help="number of source blocks (default: sized to a 100 GiB DDR budget)")
     p.add_argument("--tokens-per-block", type=int, default=DEFAULT_TOKENS_PER_BLOCK)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iterations", type=int, default=100)
@@ -45,11 +47,10 @@ def parse_args(argv=None, *, mode="gather_read"):
             a.token_bytes * a.tokens_per_block > 0xFFFFFFFF or
             a.token_bytes * (a.tokens_per_block - 1) > 0x7FFFFFFF):
         p.error("invalid token/block size for the AICPU input ABI")
-    max_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
     if a.table_capacity is None:
-        a.table_capacity = max_capacity
-    if not 1 <= a.table_capacity <= min(max_capacity, 0x7FFFFFFF):
-        p.error("source pool plus workspace must fit the 100 GiB DDR budget")
+        a.table_capacity, _ = pool_layout(a.token_bytes, a.tokens_per_block, mode=mode)
+    if not 1 <= a.table_capacity <= 0x7FFFFFFF:
+        p.error("--table-capacity must be in [1, INT32_MAX]")
     if a.warmup < 0 or a.iterations <= 0:
         p.error("invalid warmup or iterations")
     if a.device_id < 0:
@@ -83,21 +84,16 @@ def create_request_plan(torch, a, length, device):
     return indices, slots * a.token_bytes, rows
 
 
-def token_pattern(torch, token_ids, byte_ids):
-    # Encode the source token ID across eight bytes so wrong-block READs are visible.
-    # torch_npu bitwise ops require equal shapes here; materialize broadcasts.
-    shifts = ((byte_ids % 8) * 8).expand(token_ids.numel(), -1).contiguous()
-    ids = token_ids.unsqueeze(1).expand_as(shifts).contiguous()
-    encoded = ((ids >> shifts) & 0xFF).to(torch.uint8)
-    pattern = ((byte_ids * 17 + (byte_ids >> 3)) & 0xFF).to(torch.uint8)
-    return encoded ^ pattern.expand_as(encoded).contiguous()
-
-
 def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
     device = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
     summary = dict(device_p50_us=device["p50_us"], p50_GBps=device["p50_GBps"])
     host = timing_stats([sample["python_call_us"] for sample in profiles], payload_bytes)
     summary.update(host_p50_us=host["p50_us"], host_p50_GBps=host["p50_GBps"])
+    timing = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
+    summary.update(metric="kernel_wall",
+                   mean_us=timing["mean_us"], mean_GBps=timing["mean_GBps"],
+                   p50_us=timing["p50_us"], p50_GBps=timing["p50_GBps"],
+                   p99_us=timing["p99_us"], p99_GBps=timing["p99_GBps"])
     phases = (
         ("lookup_table_us", "request_us"),
         ("address_send_us", "source_write_us"),
@@ -127,7 +123,11 @@ def print_measurements(a, summary, *, mode="gather_read"):
     print(f"{prefix}_PROFILE device_p50_us={summary['device_p50_us']:.1f} "
           f"p50_GBps={summary['p50_GBps']:.3f}{source_label} execution_mode={a.execution_mode} "
           f"host_p50_us={summary['host_p50_us']:.1f} host_p50_GBps={summary['host_p50_GBps']:.3f} "
-          "phase_aggregation=mean_of_per_round_worker_max")
+          f"metric={summary['metric']} mean_us={summary['mean_us']:.1f} "
+          f"mean_GBps={summary['mean_GBps']:.3f} "
+          f"p50_us={summary['p50_us']:.1f} p50_GBps={summary['p50_GBps']:.3f} "
+          f"p99_us={summary['p99_us']:.1f} p99_GBps={summary['p99_GBps']:.3f}"
+          " phase_aggregation=mean_of_per_round_worker_max")
     if mode == "gather_read":
         request_field = "lookup_table_us"
         print(f"  {request_field}={summary[request_field]:.1f} | "
@@ -188,7 +188,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
           f"token_bytes={a.token_bytes} miss_count={a.miss_count} workers={a.workers} "
           f"source_pool_GiB={ddr_bytes / 1024**3:.3f} "
           f"workspace_budget_MiB={reserved / 1024**2:.3f} "
-          f"total_budget_GiB={DDR_BUDGET_BYTES / 1024**3:.1f} "
+          f"default_ddr_budget_GiB={DDR_BUDGET_BYTES / 1024**3:.1f} "
           "source_mode=table source=random_with_replacement output=random_unique_rows "
           "guard_rows=0 source_initialized_once=1", flush=True)
 

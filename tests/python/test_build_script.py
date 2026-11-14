@@ -9,7 +9,7 @@ import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCATTER = "KvafAicpuCpuPushScatterA12V24"
+SCATTER = "KvafAicpuCpuPushScatterExecutionV3"
 JSON_PATH = "opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json"
 TAR_PATH = "opp/vendors/cust/op_impl/aicpu/kernel/kvaf-aicpu-urma.tar.gz"
 
@@ -45,9 +45,9 @@ else:
         artifacts = build / "access_operator/src/aicpu_urma"
         artifacts.mkdir(parents=True, exist_ok=True)
         entries = {name: {} for name in (
-            "KvafAicpuBatchPut", "KvafAicpuGatherRead", "KvafAicpuUmdkControl")}
+            "KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV4")}
         if options["KVAF_ENABLE_AICPU_CPU_PUSH"] == "ON" and not os.environ.get("KVAF_TEST_OMIT_SCATTER"):
-            entries["KvafAicpuCpuPushScatterA12V24"] = {}
+            entries["KvafAicpuCpuPushScatterExecutionV3"] = {}
         (artifacts / "kernel.json").write_text(json.dumps(entries))
         with tarfile.open(artifacts / "kvaf-aicpu-urma.tar.gz", "w:gz") as archive:
             info = tarfile.TarInfo("aicpu_kernels_device/libkvaf_aicpu_urma.so")

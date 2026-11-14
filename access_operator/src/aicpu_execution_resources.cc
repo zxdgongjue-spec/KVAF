@@ -296,7 +296,8 @@ Status AicpuExecutionResources::Close() {
     if (!stopped.ok()) return stopped;
   }
 #endif
-  auto drained = state_->DrainGet();
+  // Reported protocol errors do not prevent synchronized resource retirement.
+  auto drained = state_->get.Drain(false);
   if (!drained.ok()) return drained;
   auto closed = state_->get_session.Shutdown();
   if (!closed.ok()) return closed;
@@ -347,5 +348,29 @@ Status AicpuExecutionResources::DrainGet() {
   auto status = state_->DrainGet();
   if (status.ok() && state_->managed_completion) status = ReleaseGetBuffers();
   return status;
+}
+Status AicpuExecutionResources::CheckBatchGetStatus(void* stream) {
+  std::lock_guard<std::mutex> lock(state_->get_mutex);
+  if (!state_->initialized) return Status::NotInitialized("AICPU resources are not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) return state_->push->Check(stream);
+#endif
+  return state_->get.Check(static_cast<aclrtStream>(stream));
+}
+Status AicpuExecutionResources::SetBatchGetKernelProfiling(bool enabled) {
+  std::lock_guard<std::mutex> lock(state_->get_mutex);
+  if (!state_->initialized) return Status::NotInitialized("AICPU resources are not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) return state_->push->SetKernelProfiling(enabled);
+#endif
+  return state_->get.SetKernelProfiling(enabled);
+}
+Status AicpuExecutionResources::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  std::lock_guard<std::mutex> lock(state_->get_mutex);
+  if (!state_->initialized) return Status::NotInitialized("AICPU resources are not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) return state_->push->CopyKernelProfiles(profiles);
+#endif
+  return state_->get.CopyKernelProfiles(profiles);
 }
 }  // namespace kvaf

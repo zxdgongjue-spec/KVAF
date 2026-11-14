@@ -1216,6 +1216,12 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->options.per_call_execution && detail::UsesAicpu(impl_->backend)) {
+    if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBmem");
+    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
+  }
+#endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled, detailed);
@@ -1226,12 +1232,26 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
   return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
 }
 
+Status NpuRuntime::CheckBatchGetStatus(void* stream) {
+  if (!initialized() || !impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime is not initialized");
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->options.per_call_execution && detail::UsesAicpu(impl_->backend))
+    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CheckBatchGetStatus(stream);
+#endif
+  return Status::NotImplemented("check_batch_get_status requires an AICPU backend");
+}
+
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (!impl_->options.per_call_execution && detail::UsesAicpu(impl_->backend))
+    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
+#endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);

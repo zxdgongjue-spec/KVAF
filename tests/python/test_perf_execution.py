@@ -265,10 +265,13 @@ class ExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing synchronous BatchGet"):
             parse_measurements("PERF_RESULT operation=batch_get execution_mode=per-call p50_ms=1", "per-call")
 
-    def test_synchronous_get_timing_requires_host_mode(self):
+    def test_synchronous_get_timing_accepts_profile_outside_call(self):
         args = direct.parse_args(["--get-timing", "sync-call", "--no-kernel-profile"])
         self.assertIsNone(direct.validate_args(args))
         args = direct.parse_args(["--get-timing", "sync-call", "--kernel-profile"])
+        self.assertIsNone(direct.validate_args(args))
+        args = direct.parse_args(["--get-timing", "sync-call", "--kernel-profile",
+                                  "--execution-mode", "per-call"])
         self.assertIn("--no-kernel-profile", direct.validate_args(args))
 
     def test_per_call_sweep_forwards_options_and_labels_host_metrics(self):

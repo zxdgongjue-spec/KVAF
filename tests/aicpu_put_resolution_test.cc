@@ -61,7 +61,10 @@ BatchGetTransport::~BatchGetTransport() = default;
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& r) { impl_->region = r.base; return Status::OK(); }
 Status BatchGetTransport::Warmup() { return impl_->session.Ensure(impl_->region, impl_->workspace, sizeof(impl_->workspace)); }
 Status BatchGetTransport::Shutdown() { return Status::OK(); }
-Status BatchGetTransport::Drain() { return Status::OK(); }
+Status BatchGetTransport::Drain(bool) { return Status::OK(); }
+Status BatchGetTransport::Check(aclrtStream) { return Status::OK(); }
+Status BatchGetTransport::SetKernelProfiling(bool) { return Status::OK(); }
+Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*) const { return Status::OK(); }
 Status BatchGetTransport::Prepare(const BatchGetExecRequest& r) {
   auto s = Warmup();
   return s.ok() ? impl_->session.Ensure(impl_->region, r.request->output.data, r.request->output.bytes) : s;

@@ -11,10 +11,17 @@
 namespace {
 int allocations = 0, registrations = 0, launches = 0, enables = 0;
 int sync_copies = 0, async_copies = 0;
-bool fail_sync = false;
+bool fail_sync = false, capturing = false;
+std::set<void*> registered;
+kvaf::aicpu_urma::UmdkBatchGetArgs captured_args{};
 std::set<void*> buffers;
 }
 extern "C" {
+aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI* graph) {
+  *status = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  *graph = nullptr; return ACL_SUCCESS;
+}
+aclError aclrtMemset(void* p, size_t, int value, size_t bytes) { std::memset(p, value, bytes); return ACL_SUCCESS; }
 aclError aclrtMalloc(void** p, size_t n, aclrtMemMallocPolicy) {
   *p = std::calloc(1, n); if (!*p) return 1;
   ++allocations; buffers.insert(*p); return 0;
@@ -43,14 +50,19 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const { ++enabl
 namespace kvaf::aicpu_urma {
 // Session registration is a counted resource service. The real Gather host
 // algorithm below must not invoke it or allocate memory during prepared Launch.
-Status UmdkSession::Ensure(std::uint64_t, void*, std::size_t) { ++registrations; return Status::OK(); }
+Status UmdkSession::Ensure(std::uint64_t, void* address, std::size_t, bool prepared_only) {
+  if (prepared_only && !registered.count(address)) return Status::InvalidState("not prepared");
+  registered.insert(address); ++registrations; return Status::OK();
+}
 int32_t LaunchBatchGet(const UmdkBatchGetArgs* args, aclrtStream) {
   ++launches;
+  if (capturing) { captured_args = *args; return 0; }
   auto* statuses = reinterpret_cast<GatherReadStatus*>(args->gather.core_status);
   for (unsigned w = 0; w < args->gather.worker_count; ++w) {
     statuses[w] = {};
     statuses[w].magic = kGatherStatusMagic;
-    statuses[w].sequence = args->gather.sequence;
+    auto* control = reinterpret_cast<GatherExecutionControl*>(args->gather.execution_control);
+    statuses[w].sequence = ClaimBatchGetTicket(&control->claimed, args->gather.worker_count).sequence;
   }
   return 0;
 }
@@ -80,7 +92,7 @@ int main() {
   call.execution.stream = reinterpret_cast<void*>(1);
   call.execution.synchronize = true; call.execution.profile = &profile;
   CHECK(!gather.ExecutePrepared(call).ok() && launches == 0);
-  CHECK(gather.Prepare(call).ok() && registrations == 2 && enables == 1);
+  CHECK(gather.Prepare(call).ok() && registrations == 3 && enables == 1);
   const auto old_view = gather.View();
   CHECK(gather.Prepare(call).ok());
   CHECK(!BatchGetTransport::LaunchPrepared(call, old_view, state.get()).ok() && launches == 0);
@@ -103,19 +115,44 @@ int main() {
   CHECK(gather.Prepare(call).ok());
   CHECK(gather.ExecutePrepared(call).ok() && launches == 3);
   CHECK(async_copies == 4 && sync_copies == 0);
-  CHECK(gather.Drain().ok() && sync_copies == 1);
+  CHECK(gather.Drain().ok() && async_copies == 5 && sync_copies == 0);
   call.execution.synchronize = true;
   call.execution.profile = &profile;
   CHECK(gather.Prepare(call).ok());
   fail_sync = true;
   CHECK(!gather.ExecutePrepared(call).ok() && launches == 4);
-  CHECK(async_copies == 6 && sync_copies == 1);
+  CHECK(async_copies == 7 && sync_copies == 0);
   fail_sync = false;
-  CHECK(gather.Drain().ok() && sync_copies == 2); // retry must collect status
+  CHECK(gather.Drain().ok() && async_copies == 8 && sync_copies == 0); // retry must collect status
+  // Capture performs no registration/allocation. The device issues a fresh
+  // sequence on every replay, including an empty launch.
+  call.execution.synchronize = false;
+  call.execution.profile = nullptr;
+  capturing = true;
+  const auto capture_allocations = allocations;
+  CHECK(gather.Prepare(call).ok());
+  CHECK(gather.ExecutePrepared(call).ok() && launches == 5);
+  CHECK(allocations == capture_allocations);
+  CHECK(!gather.Drain().ok());
+  CHECK(!gather.Check(call.execution.stream).ok());
+  capturing = false;
+  auto* capture_control = reinterpret_cast<GatherExecutionControl*>(captured_args.gather.execution_control);
+  const auto ticket_before = capture_control->claimed;
+  CHECK(LaunchBatchGet(&captured_args, call.execution.stream) == 0);
+  CHECK(gather.Check(call.execution.stream).ok());
+  CHECK(capture_control->claimed == ticket_before + 2);
+  count = 0;
+  CHECK(LaunchBatchGet(&captured_args, call.execution.stream) == 0);
+  CHECK(gather.Check(call.execution.stream).ok());
+  CHECK(capture_control->claimed == ticket_before + 4);
+  CHECK(!gather.Check(reinterpret_cast<void*>(2)).ok());
+  auto wrong_stream = call;
+  wrong_stream.execution.stream = reinterpret_cast<void*>(2);
+  CHECK(!gather.Prepare(wrong_stream).ok());
   CHECK(gather.Prepare(call).ok());
   const auto bound_view = gather.View();
   CHECK(gather.BindExecutionState(nullptr).ok());
-  CHECK(!BatchGetTransport::LaunchPrepared(call, bound_view, state.get()).ok() && launches == 4);
+  CHECK(!BatchGetTransport::LaunchPrepared(call, bound_view, state.get()).ok() && launches == 7);
   state.reset();
   CHECK(gather.Shutdown().ok() && buffers.empty());
   std::cout << "Gather preparation, typed invocation and allocation-free launch passed\n";

@@ -14,7 +14,8 @@
 namespace kvaf::cpu_push {
 namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
-constexpr std::size_t kJettyDepth = 8192, kDoorbellWrs = 32;
+constexpr std::size_t kJettyDepth = 8192;
+constexpr std::uint32_t kPostPayloadWrs = 128;
 constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
@@ -59,8 +60,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
-  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u\n",
-               max_sge_, max_bytes_, workers_, token_bytes_);
+  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u"
+               " post_payload_wrs=%u\n", max_sge_, max_bytes_, workers_, token_bytes_, kPostPayloadWrs);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
@@ -262,14 +263,23 @@ void Transport::SealPrepared(PreparedWrite& plan) {
   for (std::uint32_t index = 0; index < kJettyCount; ++index) {
     auto& q = plan.queues[index];
     if (q.wrs.empty()) continue;
-    std::size_t local = 0;
-    for (std::size_t i = 0; i < q.wrs.size(); ++i) {
+    std::uint32_t local = 0, payloads = 0;
+    for (std::uint32_t i = 0; i < q.wrs.size(); ++i) {
       auto& wr = q.wrs[i];
+      const bool payload = q.remote[i].addr >= hbm_base_ + layout_.staging;
+      // Keep a trailing ordered Ready in the same post when payload hits the budget.
+      if (!i || (payload && payloads == kPostPayloadWrs)) {
+        if (i) { q.wrs[i - 1].next = nullptr; q.posts.back().end_sge = local; }
+        q.posts.push_back({i, local, 0});
+        payloads = 0;
+      }
+      payloads += payload;
       wr.rw.src.sge = reinterpret_cast<urma_sge_t*>(q.local.data() + local);
       wr.rw.dst.sge = reinterpret_cast<urma_sge_t*>(q.remote.data() + i);
       local += wr.rw.src.num_sge;
-      wr.next = i + 1 < q.wrs.size() && (i + 1) % kDoorbellWrs ? &q.wrs[i + 1] : nullptr;
+      wr.next = i + 1 < q.wrs.size() ? &q.wrs[i + 1] : nullptr;
     }
+    q.posts.back().end_sge = local;
     q.wrs.back().flag.bs.complete_enable = 1;
     q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
     plan.fences[plan.fence_count++] = {index, q.wrs.size(), 0};
@@ -282,15 +292,15 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+  const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
     ForEachPipelineChunk(count, token_bytes_, workers_,
       [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
-        const auto rows = range.end - range.begin;
-        const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
-        auto row = range.begin + queue * base + std::min(queue, remainder);
-        const auto end = row + base + (queue < remainder ? 1U : 0U);
+        const auto shard = JettyRange(range, queue);
+        auto row = shard.begin;
+        const auto end = shard.end;
         std::uint32_t offset = 0;
         while (row < end) {
           // The probe budgets source SGEs as well as WRs against SQ depth.
@@ -298,14 +308,26 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           // BatchGet's existing maximum request/token sizes.
           if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
           auto& q = waves.back();
+          const auto first_local = static_cast<std::uint32_t>(q.local.size());
+          const auto first_row = row;
           const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
           std::uint32_t bytes = 0, sges = 0;
           while (row < end && sges < max_sge_ && bytes < max_bytes_) {
             const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-            q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
+            if (!unsplit)
+              q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
             q.local.push_back({0, length, source_, nullptr});
             ++sges; bytes += length; offset += length;
             if (offset == token_bytes_) { ++row; offset = 0; }
+          }
+          if (unsplit) {
+            // Walk the contiguous descriptor entries directly for whole-token SGEs.
+            if (!q.source_runs.empty() &&
+                q.source_runs.back().local + q.source_runs.back().count == first_local &&
+                q.source_runs.back().row + q.source_runs.back().count == first_row)
+              q.source_runs.back().count += sges;
+            else
+              q.source_runs.push_back({first_local, first_row, sges});
           }
           AppendPrepared(q, queue, destination, bytes, sges);
         }
@@ -313,7 +335,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
             (worker * kMaxChunks + chunk) * kJettyCount + queue;
-        q.markers.push_back({marker, chunk + 1});
+        q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
                        8, 1, true);
@@ -332,12 +354,29 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   prepared_count_ = count;
   return Status::OK();
 }
-void Transport::RefreshPrepared(PreparedQueue& q) {
+void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& post) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  for (const auto& source : q.sources)
-    q.local[source.local].addr =
-        source_->seg.ubva.va + (addresses[source.row] - source_base_) + source.offset;
-  for (const auto& marker : q.markers) *marker.value = Progress(request().sequence, marker.progress);
+  if (!q.source_runs.empty()) {
+    auto run = std::lower_bound(q.source_runs.begin(), q.source_runs.end(), post.first_sge,
+        [](const PreparedQueue::SourceRun& r, std::uint32_t i) { return r.local + r.count <= i; });
+    for (; run != q.source_runs.end() && run->local < post.end_sge; ++run) {
+      const auto first = std::max(run->local, post.first_sge);
+      const auto end = std::min(run->local + run->count, post.end_sge);
+      for (auto i = first; i < end; ++i) q.local[i].addr = source_->seg.ubva.va +
+          (addresses[run->row + i - run->local] - source_base_);
+    }
+  } else {
+    auto source = std::lower_bound(q.sources.begin(), q.sources.end(), post.first_sge,
+        [](const PreparedQueue::Source& s, std::uint32_t i) { return s.local < i; });
+    for (; source != q.sources.end() && source->local < post.end_sge; ++source)
+      q.local[source->local].addr = source_->seg.ubva.va +
+          (addresses[source->row] - source_base_) + source->offset;
+  }
+  auto marker = std::lower_bound(q.markers.begin(), q.markers.end(), post.first_sge,
+      [](const PreparedQueue::Marker& m, std::uint32_t i) { return m.local < i; });
+  for (; marker != q.markers.end() && marker->local < post.end_sge; ++marker)
+    *marker->value = Progress(request().sequence, marker->progress);
+
 }
 Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   for (const auto& q : queues_)
@@ -352,12 +391,27 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   }
   return Status::OK();
 }
-Status Transport::PostPrepared(PreparedQueue& q, std::uint32_t queue) {
-  for (std::size_t first = 0; first < q.wrs.size(); first += kDoorbellWrs) {
-    urma_jfs_wr_t* bad = nullptr;
-    if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[first], &bad)) {
-      queues_[queue].poisoned = true;
-      return Error("post prepared WRITE chain");
+Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile) {
+  std::size_t posts = 0;
+  for (const auto& q : plan.queues) posts = std::max(posts, q.posts.size());
+  // Give every Jetty a doorbell before preparing the next slice of any Jetty.
+  for (std::size_t batch = 0; batch < posts; ++batch) {
+    for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
+      auto& q = plan.queues[queue];
+      if (batch >= q.posts.size()) continue;
+      const auto& post = q.posts[batch];
+      if (refresh_sources) RefreshPrepared(q, post);
+      const auto start = profile ? BatchGetProfileNowNs() : 0;
+      urma_jfs_wr_t* bad = nullptr;
+      if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[post.wr], &bad)) {
+        queues_[queue].poisoned = true;
+        return Error("post prepared WRITE chain");
+      }
+      if (profile) {
+        if (!profile->first_post_ns) profile->first_post_ns = start;
+        profile->post_ns += BatchGetProfileNowNs() - start;
+        ++profile->post_calls;
+      }
     }
   }
   return Status::OK();
@@ -407,7 +461,6 @@ Status Transport::WriteBatch() {
   // and crossing several team barriers for each short request.
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
-    for (auto& queue : plan.queues) RefreshPrepared(queue);
     status = BeginPrepared(plan, w + 1);
     if (!status.ok()) return status;
     if (profile_.enabled) {
@@ -416,17 +469,11 @@ Status Transport::WriteBatch() {
       for (const auto& q : plan.queues) {
         profile_.ready_wrs += q.markers.size();
         profile_.data_wrs += q.wrs.size() - q.markers.size();
-        profile_.post_calls += (q.wrs.size() + kDoorbellWrs - 1) / kDoorbellWrs;
       }
     }
-    const auto phase_begin = profile_.enabled ? BatchGetProfileNowNs() : 0;
-    if (profile_.enabled && !profile_.first_post_ns) profile_.first_post_ns = phase_begin;
-    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-      status = PostPrepared(plan.queues[q], q);
-      if (!status.ok()) return status;
-    }
+    status = PostPrepared(plan, true, profile_.enabled ? &profile_ : nullptr);
+    if (!status.ok()) return status;
     const auto posted = profile_.enabled ? BatchGetProfileNowNs() : 0;
-    if (profile_.enabled) profile_.post_ns += posted - phase_begin;
     status = PollPrepared(w + 1, profile_.enabled ? &profile_ : nullptr);
     if (profile_.enabled) {
       profile_.last_cqe_ns = BatchGetProfileNowNs();
@@ -441,7 +488,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
   auto status = BeginPrepared(done_, UINT64_MAX);
-  if (status.ok()) status = PostPrepared(done_.queues[0], 0);
+  if (status.ok()) status = PostPrepared(done_);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
   return status;
 }

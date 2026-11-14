@@ -11,7 +11,7 @@
 } } while (false)
 
 std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV4", "KvafAicpuBatchPut",
-                              "KvafAicpuGatherRead"};
+                              "KvafAicpuGatherReadExecutionV3"};
 unsigned loads = 0, lookups = 0, launches = 0;
 int handle;
 aclError aclrtBinaryLoadFromFile(const char*, const aclrtBinaryLoadOptions*, aclrtBinHandle* out) {
@@ -51,16 +51,16 @@ int main() {
   CHECK(loads == 1 && launches == 0);
   auto status = PrepareUmdkKernel(path, true);
   CHECK(!status.ok());
-  CHECK(status.message().find("KvafAicpuCpuPushScatterA12V24") != std::string::npos);
+  CHECK(status.message().find("KvafAicpuCpuPushScatterExecutionV3") != std::string::npos);
   CHECK(status.message().find("cpu_push_scatter") != std::string::npos);
   CHECK(launches == 0);  // Missing Scatter is reported before any device work.
-  entries.insert("KvafAicpuCpuPushScatterA12V24");
+  entries.insert("KvafAicpuCpuPushScatterExecutionV3");
   CHECK(PrepareUmdkKernel(path, true).ok());
   const auto prepared_lookups = lookups;
   CHECK(PrepareUmdkKernel(path, false).ok());
   CHECK(loads == 1 && lookups == prepared_lookups);
   int argument = 0;
-  CHECK(kvaf::aicpu_urma::LaunchUmdkKernel("KvafAicpuGatherRead", &argument,
+  CHECK(kvaf::aicpu_urma::LaunchUmdkKernel("KvafAicpuGatherReadExecutionV3", &argument,
                                         sizeof(argument), &handle, 4) == 0);
   CHECK(launches == 1 && lookups == prepared_lookups);
   char other[] = "/tmp/kvaf-loader-other-XXXXXX";

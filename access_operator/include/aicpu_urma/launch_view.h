@@ -30,6 +30,9 @@ struct AicpuGetInvocation final : ExecutionState {
   const void* owner;
   aclrtStream pending{};
   std::uint64_t sequence{};
+  aclrtStream captured_stream{}, last_stream{};
+  bool prepared_capturing{false}, submitted{false}, profile_submitted{false};
+  Status failure;
   const BatchGetRequest* prepared{};
   void* prepared_stream{};
   BatchGetProfile* prepared_profile{};
@@ -42,7 +45,8 @@ struct GatherLaunchView {
   bool direct_addresses{};
   void* workspace{};
   AicpuBufferView completion, profile;
-  std::uint64_t* sequence{};
+  void* control{};
+  bool profiling{false};
 };
 struct ScatterLaunchView {
   ExecutionViewCommon common;
@@ -50,7 +54,7 @@ struct ScatterLaunchView {
   void* workspace{};
   void* coordination{};
   AicpuBufferView completion, profile;
-  std::uint64_t* sequence{};
   ExecutionHealth* health{};
+  bool profiling{false};
 };
 }  // namespace kvaf::aicpu_urma

@@ -63,12 +63,12 @@ done
 awk -F, '
   NR==1 {
     for (i=1; i<=NF; i++) col[$i]=i
-    print "execution_mode token_bytes miss_count workers device_p50_us p50_GBps host_p50_us host_p50_GBps"
+    print "execution_mode token_bytes miss_count workers device_p50_us p50_GBps host_p50_us host_p50_GBps mean_us mean_GBps p99_us p99_GBps"
     next
   }
   {
     print $(col["execution_mode"]), $(col["token_bytes"]), $(col["miss_count"]), $(col["workers"]),
-          $(col["device_p50_us"]), $(col["p50_GBps"]), $(col["host_p50_us"]), $(col["host_p50_GBps"])
+          $(col["device_p50_us"]), $(col["p50_GBps"]), $(col["host_p50_us"]), $(col["host_p50_GBps mean_us mean_GBps p99_us p99_GBps"])
   }
 ' "$csv_file"
 echo "AICPU_CPU_PUSH_SCATTER_SWEEP_PASS cases=$index csv=$csv_file"

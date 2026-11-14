@@ -20,7 +20,8 @@
 } } while (false)
 
 namespace {
-bool cpu_running = false, fail_launch = false, bad_result = false;
+bool cpu_running = false, fail_launch = false, bad_result = false, capturing = false;
+std::vector<std::function<void()>> captured;
 unsigned sync_failures = 0, stop_failures = 0;
 int handle;
 std::set<void*> allocations;
@@ -35,12 +36,14 @@ std::size_t Event(const std::string& name) {
 void Reset() {
   CHECK(allocations.empty() && queued.empty() && !cpu_running);
   events.clear();
-  fail_launch = bad_result = false;
+  fail_launch = bad_result = capturing = false;
+  captured.clear();
   sync_failures = stop_failures = 0;
 }
 }  // namespace
 
 aclError aclrtMalloc(void** out, std::size_t bytes, aclrtMemMallocPolicy) {
+  CHECK(!capturing);
   CHECK(posix_memalign(out, 64, bytes) == 0);
   allocations.insert(*out);
   return ACL_SUCCESS;
@@ -57,6 +60,7 @@ aclError aclrtFree(void* buffer) {
 }
 aclError aclrtFreeHost(void* buffer) { return aclrtFree(buffer); }
 aclError aclrtMemset(void* buffer, std::size_t, int value, std::size_t bytes) {
+  CHECK(!capturing);
   std::memset(buffer, value, bytes);
   return ACL_SUCCESS;
 }
@@ -66,10 +70,22 @@ aclError aclrtMemsetAsync(void* buffer, std::size_t, int value, std::size_t byte
 }
 aclError aclrtMemcpyAsync(void* dst, std::size_t, const void* src, std::size_t bytes,
                           aclrtMemcpyKind, aclrtStream) {
+  CHECK(!capturing);
   queued.emplace_back([=] { std::memcpy(dst, src, bytes); });
   return ACL_SUCCESS;
 }
+aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI* graph) {
+  *status = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  *graph = nullptr;
+  return ACL_SUCCESS;
+}
+aclError aclrtMemcpy(void* dst, std::size_t, const void* src, std::size_t bytes, aclrtMemcpyKind) {
+  CHECK(!capturing);
+  std::memcpy(dst, src, bytes);
+  return ACL_SUCCESS;
+}
 aclError aclrtSynchronizeStream(aclrtStream) {
+  CHECK(!capturing);
   events.push_back("sync");
   if (sync_failures) { --sync_failures; return 1; }
   while (!queued.empty()) { queued.front()(); queued.pop_front(); }
@@ -83,15 +99,27 @@ namespace kvaf::cpu_push {
 int32_t LaunchCpuPushScatter(const KernelArgs* input, aclrtStream) {
   if (fail_launch) return -1;
   const auto args = *input;
-  queued.emplace_back([=] {
+  auto launch = [=] {
     // The CPU has not accepted the request until this queued kernel runs.
     CHECK(cpu_running);
     events.push_back("kernel completed");
     auto* statuses = reinterpret_cast<WorkerStatus*>(args.status);
+    auto* coordination = reinterpret_cast<Coordination*>(args.coordination);
+    const auto sequence = ++coordination->finished.value;
     for (std::uint32_t w = 0; w < args.workers; ++w)
-      statuses[w] = {kMagic, args.sequence,
+      statuses[w] = {kMagic, sequence,
           std::uint64_t(bad_result ? Result::kTransportError : Result::kOk), w, 0, {}};
-  });
+    if (args.profile) {
+      auto* profiles = reinterpret_cast<BatchGetWorkerProfile*>(args.profile);
+      for (std::uint32_t w = 0; w < args.workers; ++w) {
+        profiles[w].enter_ns = 100 * sequence;
+        profiles[w].exit_ns = 100 * sequence + 50;
+        profiles[w].spans = 1;
+      }
+    }
+  };
+  if (capturing) captured.push_back(launch);
+  else queued.push_back(launch);
   return 0;
 }
 }
@@ -172,7 +200,7 @@ cpu_push::Config Config() {
   config.workers = 5;
   return config;
 }
-Status Enqueue(cpu_push::CpuPushTransport& transport) {
+Status Enqueue(cpu_push::CpuPushTransport& transport, void* stream = &handle) {
   static std::uint64_t address = 4096;
   static std::int32_t index = 0, offset = 0, count = 1, row = 0;
   static std::uint8_t output[16];
@@ -185,7 +213,7 @@ Status Enqueue(cpu_push::CpuPushTransport& transport) {
   request.output_block_bytes = sizeof(output);
   request.tokens_per_block = 1;
   request.device_access_table.addresses = {&address, sizeof(address), DeviceKind::kNpu};
-  return transport.Execute({{}, &request, {&handle, false}});
+  return transport.Execute({{}, &request, {stream, false}});
 }
 
 void CheckShutdown(unsigned scenario) {
@@ -217,11 +245,42 @@ void CheckShutdown(unsigned scenario) {
   CHECK(allocations.empty() && queued.empty() && !cpu_running);
   CHECK(transport.Shutdown().ok());
 }
+void CheckCapturedReplay() {
+  Reset();
+  cpu_push::CpuPushTransport transport(Config());
+  CHECK(transport.Initialize({4096, 4096, 16, DeviceKind::kCpu}).ok());
+  CHECK(!transport.Check(&handle).ok());
+  CHECK(transport.SetKernelProfiling(true).ok());
+  capturing = true;
+  CHECK(Enqueue(transport).ok());
+  CHECK(captured.size() == 1 && queued.empty());
+  CHECK(!transport.Drain().ok());
+  CHECK(!transport.Check(&handle).ok());
+  std::vector<BatchGetKernelProfile> profiles;
+  CHECK(!transport.CopyKernelProfiles(&profiles).ok());
+  CHECK(!transport.Shutdown().ok());
+  CHECK(cpu_running && std::find(events.begin(), events.end(), "stop CPU") == events.end());
+  capturing = false;
+  for (std::uint64_t sequence = 1; sequence <= 3; ++sequence) {
+    queued.push_back(captured.front());
+    CHECK(transport.Check(&handle).ok());
+    CHECK(transport.CopyKernelProfiles(&profiles).ok());
+    CHECK(profiles.size() == Config().workers);
+    CHECK(profiles.front().device_start_ns == 100 * sequence);
+  }
+  int other_stream;
+  CHECK(!Enqueue(transport, &other_stream).ok());
+  CHECK(!transport.Check(&other_stream).ok());
+  CHECK(transport.Shutdown().ok());
+  CHECK(allocations.empty() && queued.empty() && !cpu_running);
+}
+
 }
 
 int main() {
   // Healthy asynchronous work, known failure, STOP failure, stream failure,
   // and an execution error first observed during shutdown.
   for (unsigned scenario = 0; scenario < 5; ++scenario) CheckShutdown(scenario);
+  CheckCapturedReplay();
   std::cout << "Scatter asynchronous shutdown and cleanup retry tests passed\n";
 }

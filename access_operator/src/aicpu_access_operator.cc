@@ -95,4 +95,13 @@ Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
   }
   return result;
 }
+Status UmdkAccessOperator::CheckBatchGetStatus(void* stream) {
+  return resources_->CheckBatchGetStatus(stream);
+}
+Status UmdkAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  return resources_->SetBatchGetKernelProfiling(enabled);
+}
+Status UmdkAccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  return resources_->CopyBatchGetKernelProfiles(profiles);
+}
 }  // namespace kvaf

@@ -30,7 +30,9 @@ struct alignas(64) Completion {
 // CPU owns all four words; each Jetty updates only its own 8-byte progress.
 struct alignas(64) Ready { std::uint64_t jetty[kJettyCount]{}, reserved[4]{}; };
 struct alignas(64) Coordination {
-  Word claimed, built, arrivals, finished, result;
+  // Cumulative counts/epochs, initialized once per transport. result retains
+  // the first error; failed transports must be rebuilt, never reset in place.
+  Word claimed, built, arrivals, finished, result, published;
 };
 struct alignas(64) WorkerStatus {
   std::uint64_t magic{kMagic}, sequence{}, result{}, worker{}, consumed{}, reserved[3]{};

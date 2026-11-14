@@ -59,28 +59,38 @@ void CheckDeviceKernel(const std::vector<std::uint64_t>& addresses,
   args.sequence = 1;
   args.workers = workers;
   args.timeout_ms = 5000;
-  std::vector<std::thread> threads;
-  for (std::uint32_t w = 0; w < workers; ++w)
-    threads.emplace_back([&] { CHECK(ExecuteCpuPushScatter(&args) == 0); });
-  for (auto& thread : threads) thread.join();
-  CHECK(output == expected);
-  const auto notify = reinterpret_cast<Word*>(memory + layout.notify)->value;
-  CHECK((notify & ~kProfileNotify) == (active ? 1U : 0U));
-  CHECK(((notify & kProfileNotify) != 0) == (active != 0));
-  const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
-  for (std::uint32_t i = 0; i < active; ++i)
-    CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
-  std::uint64_t copies = 0;
-  for (std::uint32_t w = 0; w < workers; ++w) {
-    const auto range = WorkerRange(active, bytes, w, workers);
-    CHECK(statuses[w].magic == kMagic && statuses[w].sequence == 1);
-    CHECK(statuses[w].result == static_cast<std::uint64_t>(Result::kOk));
-    CHECK(statuses[w].worker == w && statuses[w].consumed == ChunkCount(range));
-    CHECK(profiles[w].bytes == std::uint64_t{range.end - range.begin} * bytes);
-    CHECK(profiles[w].scatter_copies == range.end - range.begin);
-    copies += profiles[w].scatter_copies;
+  // Captured nodes reuse the same host arguments and control workspace. The
+  // ticket and completion epoch must advance on the device for every replay.
+  for (std::uint64_t sequence = 1; sequence <= 3; ++sequence) {
+    std::fill(output.begin(), output.end(), 0xA5);
+    reinterpret_cast<Completion*>(memory + layout.done)->token = Progress(sequence, 1);
+    for (std::uint32_t w = 0; w < workers; ++w)
+      for (auto& token : ready[w].jetty)
+        token = Progress(sequence, ChunkCount(WorkerRange(active, bytes, w, workers)));
+    std::vector<std::thread> threads;
+    for (std::uint32_t w = 0; w < workers; ++w)
+      threads.emplace_back([&] { CHECK(ExecuteCpuPushScatter(&args) == 0); });
+    for (auto& thread : threads) thread.join();
+    CHECK(output == expected);
+    const auto notify = reinterpret_cast<Word*>(memory + layout.notify)->value;
+    CHECK((notify & ~kProfileNotify) == (active ? sequence : 0U));
+    CHECK(((notify & kProfileNotify) != 0) == (active != 0));
+    const auto* sources = reinterpret_cast<const std::uint64_t*>(memory + layout.descriptor);
+    for (std::uint32_t i = 0; i < active; ++i)
+      CHECK(sources[i] == addresses[indices[i]] + offsets[i]);
+    std::uint64_t copies = 0;
+    for (std::uint32_t w = 0; w < workers; ++w) {
+      const auto range = WorkerRange(active, bytes, w, workers);
+      CHECK(statuses[w].magic == kMagic && statuses[w].sequence == sequence);
+      CHECK(statuses[w].result == static_cast<std::uint64_t>(Result::kOk));
+      CHECK(statuses[w].worker == w && statuses[w].consumed == ChunkCount(range));
+      CHECK(profiles[w].bytes == std::uint64_t{range.end - range.begin} * bytes);
+      CHECK(profiles[w].scatter_copies == range.end - range.begin);
+      copies += profiles[w].scatter_copies;
+    }
+    CHECK(copies == active);
+    CHECK(coordination.claimed.value == sequence * workers);
   }
-  CHECK(copies == active);
 }
 
 void CheckRound(std::uint32_t capacity, std::uint32_t active, std::uint32_t bytes,
@@ -129,7 +139,7 @@ void CheckRound(std::uint32_t capacity, std::uint32_t active, std::uint32_t byte
 }
 
 struct Model {
-  std::vector<std::uint64_t> tokens;
+  std::vector<ReadySnapshot> tokens;
   std::vector<std::pair<std::uint32_t, std::uint32_t>> copied;
   std::uint32_t polls{}, finishes{};
   std::uint64_t ticks{};
@@ -137,7 +147,7 @@ struct Model {
   Result status{Result::kPending};
   Result Status() { return status; }
   std::uint64_t Now() { return ++ticks; }
-  std::uint64_t ReadRangeDone(std::uint32_t) {
+  ReadySnapshot ReadReady(std::uint32_t) {
     const auto index = std::min<std::size_t>(polls++, tokens.size() - 1);
     return tokens[index];
   }
@@ -157,7 +167,8 @@ void CheckPipeline() {
                      std::vector<std::pair<std::uint32_t, std::uint32_t>> copied,
                      std::uint32_t chunks, std::uint32_t finishes, bool fail = false) {
       Model io;
-      io.tokens = std::move(tokens); io.fail_copy = fail;
+      for (const auto token : tokens) io.tokens.push_back({token, token, token, token});
+      io.fail_copy = fail;
       std::uint32_t consumed = 0;
       CHECK(Consume(10000, 656, 4, worker, 7, 0, 30, io, &consumed) == expected);
       CHECK(io.copied == copied && consumed == chunks && io.finishes == finishes);
@@ -172,22 +183,30 @@ void CheckPipeline() {
           {{range.begin, range.begin + 2048}}, 2, 0);
     check({Progress(6, 1)}, Result::kTimeout, {}, 0, 0);
     check({Progress(7, 1)}, Result::kCopyError, {{range.begin, range.begin + 1024}}, 0, 0, true);
-    check({Progress(7, 3)}, Result::kCopyError, {{range.begin, range.end}}, 0, 1, true);
+    check({Progress(7, 3)}, Result::kCopyError, {{range.begin, range.end}}, 0, 0, true);
   }
-  // A single slow/stale Jetty must prevent release of the other three.
-  for (const auto& tokens : std::vector<std::array<std::uint64_t, 4>>{
-      {Progress(7, 3), Progress(7, 2), Progress(7, 1), Progress(7, 3)},
-      {Progress(7, 3), Progress(6, 3), Progress(7, 3), Progress(7, 3)}}) {
-    const auto progress = ChainReadyProgress(3, 7, [&](auto q) { return tokens[q]; });
-    CHECK(progress == (tokens[1] == Progress(6, 3) ? 0 : Progress(7, 1)));
-  }
+  // Three ready Jettys progress while a fourth is stale. Each staging row is
+  // copied exactly once when its Jetty becomes ready, without a global minimum.
+  Model io;
+  io.tokens = {{Progress(7, 3), Progress(6, 3), Progress(7, 1), Progress(7, 3)},
+               {Progress(7, 3), Progress(7, 3), Progress(7, 3), Progress(7, 3)}};
+  std::uint32_t consumed = 0;
+  CHECK(Consume(10000, 656, 4, 0, 7, 0, 30, io, &consumed) == Result::kOk);
+  CHECK(consumed == 3 && io.finishes == 1 && io.polls == 2);
+  const auto range = WorkerRange(10000, 656, 0, 4);
+  const auto first_shard = JettyRange(ChunkRange(range, 0), 0);
+  CHECK(io.copied.front() == std::make_pair(first_shard.begin, first_shard.end));
+  std::vector<unsigned> coverage(range.end - range.begin);
+  for (const auto& span : io.copied)
+    for (auto row = span.first; row < span.second; ++row) ++coverage[row - range.begin];
+  CHECK(std::all_of(coverage.begin(), coverage.end(), [](auto n) { return n == 1; }));
   for (const auto sequence : {std::uint64_t{7}, std::uint64_t{UINT32_MAX}})
     for (const auto progress : {0U, 4U}) {
-      const auto invalid = ChainReadyProgress(3, sequence, [&](auto) { return Progress(sequence, progress); });
-      Model io; io.tokens = {invalid};
-      std::uint32_t consumed = 0;
-      CHECK(Consume(10000, 656, 4, 0, sequence, 0, 30, io, &consumed) == Result::kSequenceError);
-      CHECK(io.copied.empty());
+      const auto invalid = Progress(sequence, progress);
+      Model invalid_io; invalid_io.tokens = {{invalid, invalid, invalid, invalid}};
+      std::uint32_t done = 0;
+      CHECK(Consume(10000, 656, 4, 0, sequence, 0, 30, invalid_io, &done) == Result::kSequenceError);
+      CHECK(invalid_io.copied.empty());
     }
 }
 
@@ -218,6 +237,11 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
   CHECK(status.result == static_cast<std::uint64_t>(expected));
   CHECK(profile.scatter_copies == 0);
   CHECK(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xA5; }));
+  const auto failed = status;
+  reinterpret_cast<Completion*>(memory + layout.done)->token = Progress(2, 1);
+  CHECK(ExecuteCpuPushScatter(&args) != 0);
+  CHECK(std::memcmp(&status, &failed, sizeof(status)) == 0);
+  CHECK(coordination.claimed.value == 1);
 }
 
 void CheckRequestShape() {

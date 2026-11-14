@@ -26,6 +26,9 @@ class CpuPushTransport {
   Status Drain();
   std::unique_ptr<ExecutionState> CreateExecutionState();
   Status BindExecutionState(ExecutionState*);
+  Status Check(void* stream);
+  Status SetKernelProfiling(bool);
+  Status CopyKernelProfiles(std::vector<BatchGetKernelProfile>*) const;
   Status Shutdown();
  private:
   struct Impl;

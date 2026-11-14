@@ -38,7 +38,7 @@ CPU 与 NPU 两端都更新到同一个分支和提交。不要将新 Host 库�
 ./build.sh cpu
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --gather-threads 8 --gather-mode active
 ```
 
 确认日志出现 `LISTEN`。按实际路由需要增加 `--ub-device NAME --eid-index N`。
@@ -64,7 +64,10 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 
 Get 文件包含 URMA AIV 与 UBMEM Get 入口，Put 文件同理；本脚本使用标准合并产物，
 不需要额外生成 UBMEM 专用 `.o`。版本入口为 AIV Get V3、Put V2 和
-`KvafAicpuUmdkControlSessionsV4`（新增按输出定向注销，旧 V3 包需重新安装）。
+`KvafAicpuUmdkControlSessionsV4`、`KvafAicpuGatherReadExecutionV3` 和
+`KvafAicpuCpuPushScatterExecutionV3`。Get 的设备 ticket ABI 与 main 的 V2 不同，
+两端和 AICPU 包需一起更新。CPU 服务沿用 main 的线程调度，已移除 `--gather-affinity`；
+对比性能时两边显式使用相同的 `--gather-threads` 和 `--gather-mode`。
 
 ## 3. 运行真机验收
 

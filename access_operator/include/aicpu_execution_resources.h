@@ -57,6 +57,9 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   Status ResolvePut(PutCompletion*);
   Status AcknowledgePut();
   Status DrainGet();
+  Status CheckBatchGetStatus(void*);
+  Status SetBatchGetKernelProfiling(bool);
+  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>*) const;
   UrmaAicpuPutView PutView();
   UrmaAicpuGatherView GatherView();
   UrmaAicpuScatterView ScatterView();
