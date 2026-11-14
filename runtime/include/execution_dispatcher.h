@@ -40,8 +40,15 @@ class ExecutionDispatcher final : public AccessOperator {
   Status AcknowledgePut() override;
   const ExecutionPolicy& policy() const { return policy_; }
  private:
+  struct GetPreparationTiming {
+    std::uint64_t context_ns{}, describe_ns{}, acquire_ns{}, bind_ns{}, warmup_ns{};
+  };
+  GetExecutionContext* FindGetInstanceLocked(GetExecutionConfig) const;
+  Status PrepareGetInstanceLocked(GetExecutionConfig, const BatchGetRequest*, const ExecutionWarmup&,
+                                  GetExecutionContext**, GetPreparationTiming* = nullptr);
+  Status CloseGetInstanceLocked(GetExecutionContext*);
   Status DrainGetLocked();
-  Status FinishOutputLocked();
+  Status FinishOutputLocked(GetExecutionContext&);
   Status ValidateInputLocked(const BatchPutRequest&, const BatchPutExecutionOptions&,
                              PutExecutionConfig) const;
   ExecutionPolicy policy_;
@@ -58,12 +65,11 @@ class ExecutionDispatcher final : public AccessOperator {
   std::unique_ptr<PutExecutionContext> input_context_;
   // A failed Begin may still own a partially registered input until shutdown.
   std::unique_ptr<PutExecutionContext> failed_input_context_;
-  std::unique_ptr<GetExecutionContext> pending_get_;
+  std::vector<std::unique_ptr<GetExecutionContext>> get_instances_;
+  GetExecutionContext* pending_get_{nullptr};
   std::uint64_t graph_id_{0}, next_graph_id_{1};
-  std::unique_ptr<GetExecutionContext> graph_context_;
+  GetExecutionContext* graph_context_{nullptr};
   bool graph_captured_{false};
-  std::uint64_t output_id_{0}, next_output_id_{1};
-  GetOutputOptions output_options_;
-  std::unique_ptr<GetExecutionContext> output_context_;
+  std::uint64_t next_output_id_{1};
 };
 }  // namespace kvaf

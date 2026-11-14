@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 using namespace kvaf;
 using namespace std::chrono_literals;
@@ -21,6 +22,7 @@ namespace {
 constexpr PutExecutionConfig put{Transport::Urma, Executor::Aiv};
 constexpr GetExecutionConfig get{Transport::Urma, Executor::Aiv, GetAlgorithm::Direct};
 constexpr GetExecutionConfig gather{Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather};
+constexpr GetExecutionConfig scatter{Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter};
 ExecutionPolicy Policy() {
   ExecutionPolicy p;
   p.enabled_put_configs = std::vector<PutExecutionConfig>{put};
@@ -62,7 +64,7 @@ class Provider final : public AccessOperator {
   }
   Status ExecuteBatchGet(const BatchGetExecRequest& e) override {
     ++s_.calls;
-    CHECK(e.execution.config == get || e.execution.config == gather);
+    CHECK(e.execution.config == get || e.execution.config == gather || e.execution.config == scatter);
     if (e.host_timing) {
       e.host_timing->prepare_ns = 11;
       e.host_timing->submit_ns = 12;
@@ -252,7 +254,11 @@ void GraphLeasePinsAndIsolation() {
   CHECK(dispatch.Recover(get).code() == StatusCode::kBusy);
   BatchGetExecutionOptions options;
   options.config = get;
+  options.stream = reinterpret_cast<void*>(1);
   options.graph_lease = lease;
+  auto bad_options = options;
+  bad_options.stream = reinterpret_cast<void*>(2);
+  CHECK(runtime.BatchGet(request, bad_options).code() == StatusCode::kInvalidArgument);
   CHECK(runtime.BatchGet(request, options).ok());
   const auto drains = g.drains.load();
   CHECK(runtime.BatchGet(request, options).code() == StatusCode::kInvalidState);
@@ -292,10 +298,11 @@ void OutputLeaseReuseAndPins() {
   GetOutputOptions binding{request.output, reinterpret_cast<void*>(1), 1};
   std::uint64_t lease = 0, unused = 0;
   CHECK(runtime.BeginGetOutput(get, binding, &lease).ok() && lease && g.bindings == 1);
-  CHECK(runtime.BeginGetOutput(gather, binding, &unused).code() == StatusCode::kBusy);
+  CHECK(runtime.BeginGetOutput(gather, binding, &unused).ok());
+  CHECK(runtime.EndGetOutput(unused).ok());
   CHECK(runtime.BeginGetGraph(get, {binding.output, binding.stream, 1}, &unused).code() == StatusCode::kBusy);
   CHECK(dispatch.Recover(get).code() == StatusCode::kBusy);
-  CHECK(dispatch.Warmup(gather).code() == StatusCode::kBusy);
+  CHECK(dispatch.Warmup(gather).ok());
   CHECK(runtime.BatchGet(request).code() == StatusCode::kBusy);
   BatchGetExecutionOptions options; options.config = get; options.output_lease = lease;
   auto changed = request; changed.output.data = other;
@@ -304,7 +311,7 @@ void OutputLeaseReuseAndPins() {
   CHECK(!runtime.BatchGet(changed, options).ok());
   auto mismatched = options; mismatched.config = gather;
   CHECK(!runtime.BatchGet(request, mismatched).ok());
-  CHECK(g.calls == 0 && a.creates == 0);
+  CHECK(g.calls == 0 && a.creates == 1);
   for (int i = 0; i < 3; ++i) {
     options.synchronize = i % 2;
     CHECK(runtime.BatchGet(request, options).ok());
@@ -385,6 +392,7 @@ void TraceOutputAndOrdinary() {
   options.output_lease = 0;
   options.config = gather;
   CHECK(d.ExecuteBatchGet({{addresses, lengths, valid, 1}, &request, options}).ok());
+  CHECK(d.ExecuteBatchGet({{addresses, lengths, valid, 1}, &request, options}).ok());
   CHECK(d.Shutdown().ok());
   std::ifstream trace(path);
   CHECK(trace.good());
@@ -395,7 +403,89 @@ void TraceOutputAndOrdinary() {
   CHECK(contents.find(",aiv_direct,output,") != std::string::npos);
   CHECK(contents.find(",gather,ordinary,") != std::string::npos);
   CHECK(contents.find(",11,12,13,14,") != std::string::npos);
+  std::istringstream lines(contents);
+  std::string line, last;
+  std::getline(lines, line);
+  const auto fields = [](const std::string& input) {
+    std::vector<std::string> result;
+    std::istringstream stream(input);
+    std::string value;
+    while (std::getline(stream, value, ',')) result.push_back(value);
+    return result;
+  };
+  const auto columns = fields(line);
+  while (std::getline(lines, line)) if (!line.empty()) last = line;
+  const auto values = fields(last);
+  CHECK(values.size() == columns.size());
+  for (std::size_t i = 0; i < columns.size(); ++i)
+    if (columns[i] == "describe_ns" || columns[i] == "bind_ns" || columns[i] == "warmup_ns")
+      CHECK(values[i] == "0");
   std::remove(path.c_str());
+}
+
+void IndependentBindingsAndOtherPendingRequest() {
+  State p, g, a, b;
+  auto policy = Policy();
+  policy.enabled_get_configs->push_back(scatter);
+  ExecutionDispatcher dispatch(policy);
+  Register(dispatch, p, g, a);
+  CHECK(dispatch.RegisterGet(scatter, [&] { return std::make_unique<Provider>(b); }).ok());
+  auto meta = CreateInMemoryMetaManager();
+  auto allocator = CreateHostDdrMemoryAllocator();
+  RuntimeCore runtime(*meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({128, 16, DeviceKind::kCpu}).ok());
+  char input[16] = "mixed outputs", direct_output[16]{}, gather_output[16]{}, other_output[16]{};
+  CHECK(runtime.BatchPut({{1}, {input, 16, DeviceKind::kCpu}, {0}, {16}}).ok());
+  AccessTableHandle table;
+  CHECK(runtime.PrepareAccessTable({{1}}, &table).ok());
+  int index = 0, offset = 0, count = 1, row = 0;
+  Address address = 0;
+  std::uint8_t valid = 1;
+  BatchGetRequest request{table, {&index,4,DeviceKind::kNpu}, {&offset,4,DeviceKind::kNpu},
+      {&count,4,DeviceKind::kNpu}, {&row,4,DeviceKind::kNpu},
+      {direct_output,16,DeviceKind::kNpu},16,1,{}};
+  request.device_access_table = {{&address,8,DeviceKind::kNpu}, {&valid,1,DeviceKind::kNpu}};
+  void* stream = reinterpret_cast<void*>(1);
+  std::uint64_t direct_id{}, gather_id{};
+  CHECK(runtime.BeginGetOutput(get, {request.output, stream, 1}, &direct_id).ok());
+  request.output.data = gather_output;
+  CHECK(runtime.BeginGetOutput(gather, {request.output, stream, 1}, &gather_id).ok());
+  CHECK(direct_id != gather_id);
+  BatchGetExecutionOptions options;
+  options.stream = stream;
+  options.synchronize = true;
+  for (int iteration = 0; iteration < 4; ++iteration) {
+    const bool direct = iteration % 2 == 0;
+    options.config = direct ? get : gather;
+    options.output_lease = direct ? direct_id : gather_id;
+    // An output binding prewarms one stream, but later calls may use another.
+    options.stream = reinterpret_cast<void*>(static_cast<std::uintptr_t>(iteration % 2 + 1));
+    request.output.data = direct ? direct_output : gather_output;
+    CHECK(runtime.BatchGet(request, options).ok());
+    CHECK(std::memcmp(input, request.output.data, sizeof(input)) == 0);
+  }
+  CHECK(g.creates == 1 && a.creates == 1 && g.bindings == 1 && a.bindings == 1);
+  options.config = gather;
+  options.output_lease = direct_id;
+  CHECK(runtime.BatchGet(request, options).code() == StatusCode::kBusy);
+  CHECK(dispatch.Recover(get).code() == StatusCode::kBusy);
+  options.config = scatter;
+  options.output_lease = 0;
+  options.synchronize = false;
+  request.output.data = other_output;
+  CHECK(runtime.BatchGet(request, options).ok());
+  CHECK(b.drains == 0);
+  CHECK(runtime.EndGetOutput(direct_id).ok());
+  CHECK(runtime.EndGetOutput(gather_id).ok());
+  CHECK(b.drains == 0); // Ending idle bindings does not complete the third algorithm.
+  CHECK(dispatch.Recover(get).code() == StatusCode::kBusy);
+  CHECK(runtime.ReleaseAccessTable(table).ok());
+  CHECK(runtime.BatchFree({{1}}).code() == StatusCode::kBusy);
+  CHECK(runtime.DrainGet().ok());
+  CHECK(std::memcmp(input, other_output, sizeof(input)) == 0);
+  CHECK(runtime.BatchFree({{1}}).ok());
+  CHECK(runtime.EndGetOutput(direct_id).code() == StatusCode::kNotFound);
+  CHECK(runtime.Shutdown().ok());
 }
 void TraceLegacyProvider() {
   class LegacyProvider final : public AccessOperator {
@@ -450,6 +540,7 @@ int main() {
   RuntimePinsAndTransactions();
   GraphLeasePinsAndIsolation();
   OutputLeaseReuseAndPins();
+  IndependentBindingsAndOtherPendingRequest();
   TraceOutputAndOrdinary();
   TraceLegacyProvider();
   std::cout << "Execution registry, lazy domains, pins, overlap and recovery passed\n";

@@ -24,6 +24,7 @@ constexpr RemoteRegionDesc region{4096, 1024, 64, DeviceKind::kCpu};
 struct Counters {
   std::atomic<int> factories{0}, initializes{0}, closes{0}, owners{0}, operators{0};
   std::atomic<int> live_states{0}, state_destroys{0}, legacy_shutdowns{0}, close_with_state{0};
+  std::atomic<int> state_creates{0}, binds{0}, unbinds{0};
   std::atomic<int> put_launches{0}, get_launches{0}, resolves{0};
   std::atomic<int> legacy_initializes{0}, legacy_warmups{0}, warmups{0}, descriptions{0};
   std::uint32_t requirement_padding{0}, warmed_capacity{0};
@@ -34,6 +35,7 @@ struct Counters {
   bool put_request_borrowed{false}, put_state_ok{true};
   const BatchPutRequest* expected_put_request{};
   const PutAccessDesc* expected_put_destination{};
+  const BatchGetRequest* last_get_request{};
   std::uint32_t capacity{65536};
   std::mutex mutex;
   std::condition_variable changed;
@@ -45,7 +47,7 @@ struct Counters {
   }
 };
 struct Invocation final : ExecutionState {
-  explicit Invocation(Counters& c) : counters(c) { ++counters.live_states; }
+  explicit Invocation(Counters& c) : counters(c) { ++counters.live_states; ++counters.state_creates; }
   ~Invocation() override {
     --counters.live_states;
     ++counters.state_destroys;
@@ -123,10 +125,11 @@ class BorrowedOperation final : public AccessOperator {
     return std::make_unique<Invocation>(physical_->counters);
   }
   Status BindExecutionState(ExecutionState* state) override {
-    if (!state) { physical_->invocation = nullptr; return Status::OK(); }
+    if (!state) { ++physical_->counters.unbinds; physical_->invocation = nullptr; return Status::OK(); }
     auto* invocation = dynamic_cast<Invocation*>(state);
     if (!invocation || physical_->invocation) return Status::InvalidState("invalid invocation bind");
     physical_->invocation = invocation;
+    ++physical_->counters.binds;
     return Status::OK();
   }
   Status Initialize(const RemoteRegionDesc&) override {
@@ -190,6 +193,7 @@ class BorrowedOperation final : public AccessOperator {
     if (!state) return Status::InvalidState("missing Get state");
     ++c.get_launches;
     state->get_request = e.request;
+    c.last_get_request = e.request;
     state->pending_get = true;
     if (c.throw_get) throw std::runtime_error("Get threw after submission");
     return c.fail_get ? Status::CompletionUnknown("READ submitted, wait interrupted") : Status::OK();
@@ -291,6 +295,106 @@ void ExclusiveLeaseAndIndependentOwner() {
   CheckDestroyed(c);
   CHECK(c.events == std::vector<std::string>({"owner closed", "state destroyed",
                                            "operator destroyed", "owner destroyed"}));
+}
+
+void ResidentReferenceIsNotExecutionOccupancy() {
+  Counters c;
+  ExecutionResourceManager manager;
+  CHECK(manager.Register(get, Factory(c)).ok());
+  CHECK(manager.Initialize(region).ok());
+  auto context = std::make_unique<GetExecutionContext>();
+  CHECK(manager.PinGet({get, 4}, &context->resources).ok());
+  CHECK(!context->lease && context->Bind().ok());
+  GetResourceLease first, competing;
+  CHECK(context->resources.Acquire(&first).ok());
+  CHECK(context->resources.Acquire(&competing).code() == StatusCode::kBusy);
+  first = {};
+  CHECK(context->resources.Acquire(&competing).ok());
+  competing = {};
+  CHECK(c.state_creates == 1 && c.binds == 1 && c.initializes == 1);
+  CHECK(manager.AcquireGet({get, 4}, &competing).code() == StatusCode::kBusy);
+  CHECK(manager.Recover(get).code() == StatusCode::kBusy);
+  CHECK(manager.Shutdown().code() == StatusCode::kBusy);
+  CHECK(c.closes == 0 && c.live_states == 1);
+  CHECK(context->resources.Acquire(&competing).code() == StatusCode::kNotInitialized);
+  CHECK(manager.Close(context->resources).ok());
+  CHECK(context->resources.Acquire(&competing).code() == StatusCode::kNotInitialized);
+  CHECK(c.close_with_state == 1 && c.operators == 1);
+  context.reset();
+  CHECK(manager.Shutdown().ok());
+  CheckDestroyed(c);
+}
+
+void ResidentContextReusesPreparationAndRetiresRequest() {
+  Counters p, g;
+  g.capacity = 8;
+  g.requirement_padding = 2;
+  ExecutionDispatcher dispatch(Policy());
+  Register(dispatch, p, g);
+  BatchGetRequest request;
+  request.indices.bytes = 4 * sizeof(std::int32_t);
+  request.output_block_bytes = 64;
+  BatchGetExecutionOptions options;
+  options.config = get;
+  options.stream = reinterpret_cast<void*>(1);
+  for (int i = 0; i < 4; ++i) {
+    CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).ok());
+    CHECK(dispatch.DrainGet().ok());
+    CHECK(g.last_get_request->indices.bytes == 0 && g.last_get_request->output_block_bytes == 0);
+  }
+  CHECK(g.factories == 1 && g.initializes == 1 && g.state_creates == 1 && g.binds == 1);
+  CHECK(g.live_states == 1 && g.state_destroys == 0 && g.unbinds == 0);
+  CHECK(g.descriptions == 1 && g.warmups == 1 && g.warmed_capacity == 6);
+  request.indices.bytes = 6 * sizeof(std::int32_t);
+  CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).ok());
+  CHECK(dispatch.DrainGet().ok());
+  CHECK(g.descriptions == 2 && g.warmups == 2 && g.warmed_capacity == 8);
+  request.indices.bytes = 7 * sizeof(std::int32_t);
+  CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).code() == StatusCode::kInvalidArgument);
+  CHECK(g.warmups == 2 && g.state_creates == 1);
+  request.indices.bytes = 3;
+  CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).code() == StatusCode::kInvalidArgument);
+  CHECK(g.descriptions == 3);
+  request.indices.bytes = 4 * sizeof(std::int32_t);
+  options.stream = reinterpret_cast<void*>(2);
+  CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).ok());
+  CHECK(dispatch.DrainGet().ok());
+  CHECK(g.warmups == 3 && g.warmed_capacity == 8 && g.state_creates == 1);
+  CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).ok());
+  g.fail_drain = true;
+  CHECK(!dispatch.Recover(get).ok());
+  CHECK(g.live_states == 1 && g.factories == 1);
+  g.fail_drain = false;
+  CHECK(dispatch.Recover(get).ok());
+  CHECK(g.state_destroys == 1 && g.factories == 2 && g.initializes == 2);
+  CHECK(dispatch.ExecuteBatchGet({{}, &request, options}).ok());
+  CHECK(dispatch.DrainGet().ok());
+  CHECK(g.state_creates == 2 && g.binds == 2 && g.unbinds == 1);
+  CHECK(dispatch.Shutdown().ok());
+  CheckDestroyed(g); CheckDestroyed(p);
+}
+
+void FailedResidentCloseRetainsOnlyAffectedInstance() {
+  constexpr GetExecutionConfig second{Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather};
+  Counters p, g, other;
+  auto policy = Policy();
+  policy.enabled_get_configs->push_back(second);
+  ExecutionDispatcher dispatch(policy);
+  CHECK(dispatch.RegisterPut(put, Factory(p)).ok());
+  CHECK(dispatch.RegisterGet(get, Factory(g)).ok());
+  CHECK(dispatch.RegisterGet(second, Factory(other)).ok());
+  CHECK(dispatch.Initialize(region).ok());
+  CHECK(dispatch.Warmup(get, {4, nullptr}).ok());
+  CHECK(dispatch.Warmup(second, {4, nullptr}).ok());
+  CHECK(g.live_states == 1 && other.live_states == 1);
+  g.fail_close = true;
+  CHECK(!dispatch.Shutdown().ok());
+  CHECK(g.live_states == 1 && g.owners == 1 && g.operators == 1);
+  CheckDestroyed(other);
+  g.fail_close = false;
+  CHECK(dispatch.Shutdown().ok());
+  CHECK(g.close_with_state == 2 && g.unbinds == 1);
+  CheckDestroyed(g); CheckDestroyed(p);
 }
 
 void ConcurrentFirstUseAndDirectionIsolation() {
@@ -496,7 +600,10 @@ void FailedGraphPreparationMustRetryClose() {
 int main() {
   try {
     DescriptionBeforeAllocation();
-  ExclusiveLeaseAndIndependentOwner();
+    ExclusiveLeaseAndIndependentOwner();
+    ResidentReferenceIsNotExecutionOccupancy();
+    ResidentContextReusesPreparationAndRetiresRequest();
+    FailedResidentCloseRetainsOnlyAffectedInstance();
     ConcurrentFirstUseAndDirectionIsolation();
     CapacityFailureDoesNotPoisonResources();
     FailedInitializationRequiresExplicitRecovery();

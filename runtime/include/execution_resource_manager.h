@@ -22,6 +22,8 @@ struct ExecutionResourceRecord {
   ResourceState state{ResourceState::Empty};
   Status failure;
   bool leased{false};
+  std::size_t resident_refs{0};
+  bool accepting_work{false};
   Status Create();
   Status Initialize(const RemoteRegionDesc&);
   Status Close();
@@ -66,6 +68,23 @@ struct GetLaunchTiming {
 };
 class GetResourceView {
  public:
+  Status Describe(const BatchGetRequest& r, std::uint32_t* capacity) const {
+    return op_->DescribeRequirements(r, capacity);
+  }
+  Status ValidateCapacity(std::uint32_t capacity) const { return op_->ValidateRequestCapacity(capacity); }
+  // Preparation is owned by the resident dispatcher instance. Never warm or
+  // allocate here: a graph invocation must use its already pinned resources.
+  Status LaunchPrepared(const BatchGetExecRequest& r, GetLaunchTiming* timing = nullptr) const {
+    if (!r.request) return Status::InvalidArgument("missing Get request");
+    if (!timing) return op_->ExecuteBatchGet(r);
+    const auto start = std::chrono::steady_clock::now();
+    auto profiled = r;
+    profiled.host_timing = &timing->provider_detail;
+    auto s = op_->ExecuteBatchGet(profiled);
+    timing->provider_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    return s;
+  }
   Status Launch(const BatchGetExecRequest& r, GetLaunchTiming* timing = nullptr) const {
     if (!r.request) return Status::InvalidArgument("missing Get request");
     if (!timing) {
@@ -109,11 +128,14 @@ class GetResourceView {
     auto s = Warmup({r.request_capacity, r.stream});
     return s.ok() ? op_->PrepareGetGraph(r) : s;
   }
+  Status PrepareGraphPrepared(const GetGraphOptions& r) const { return op_->PrepareGetGraph(r); }
   Status FinishGraph(void* stream, bool discard) const { return op_->FinishGetGraph(stream, discard); }
   std::unique_ptr<ExecutionState> CreateState() const { return op_->CreateExecutionState(); }
   Status Bind(ExecutionState* s) const { return op_->BindExecutionState(s); }
+  AccessOperator* operation() const { return op_; }
  private:
   friend class GetResourceLease;
+  friend class GetResourceReference;
   explicit GetResourceView(AccessOperator* op, ExecutionResourceOwner* resources)
       : op_(op), resources_(resources) {}
   AccessOperator* op_;
@@ -131,6 +153,7 @@ class ResourceLease {
   explicit operator bool() const { return bool(record_); }
  protected:
   friend class ExecutionResourceManager;
+  friend class GetResourceReference;
   std::shared_ptr<detail::ExecutionResourceRecord> record_;
   void Reset();
 };
@@ -141,6 +164,25 @@ class PutResourceLease final : public ResourceLease {
 class GetResourceLease final : public ResourceLease {
  public:
   GetResourceView view() const { return GetResourceView(record_->operation.get(), record_->resources.get()); }
+};
+// A resident state pins its provider/owner without claiming execution. Only its
+// holder can acquire the short exclusive lease; completion returns that lease
+// while keeping this reference and the bound provider state alive.
+class GetResourceReference final {
+ public:
+  GetResourceReference() = default;
+  GetResourceReference(GetResourceReference&& other) noexcept : record_(std::move(other.record_)) {}
+  GetResourceReference& operator=(GetResourceReference&&) noexcept;
+  GetResourceReference(const GetResourceReference&) = delete;
+  GetResourceReference& operator=(const GetResourceReference&) = delete;
+  ~GetResourceReference();
+  explicit operator bool() const { return bool(record_); }
+  GetResourceView view() const { return GetResourceView(record_->operation.get(), record_->resources.get()); }
+  Status Acquire(GetResourceLease*) const;
+ private:
+  friend class ExecutionResourceManager;
+  std::shared_ptr<detail::ExecutionResourceRecord> record_;
+  void Reset();
 };
 struct PutResourceRequirements { PutExecutionConfig config; std::uint32_t capacity{0}; };
 struct GetResourceRequirements { GetExecutionConfig config; std::uint32_t capacity{0}; };
@@ -161,12 +203,14 @@ class ExecutionResourceManager {
   Status Describe(GetExecutionConfig, const BatchGetRequest&, GetResourceRequirements*);
   Status AcquirePut(const PutResourceRequirements&, PutResourceLease*);
   Status AcquireGet(const GetResourceRequirements&, GetResourceLease*);
+  Status PinGet(const GetResourceRequirements&, GetResourceReference*);
   Status Recover(PutExecutionConfig);
   Status Recover(GetExecutionConfig);
   // Only the exclusive lease holder may close a still-leased resource. This
   // drains/tears down through its owner while invocation state is still alive.
   Status Close(PutResourceLease&);
   Status Close(GetResourceLease&);
+  Status Close(GetResourceReference&);
   Status Shutdown();
  private:
   template<class C> struct Entry { C config; std::shared_ptr<detail::ExecutionResourceRecord> record; };

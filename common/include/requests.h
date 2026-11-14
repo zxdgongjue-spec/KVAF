@@ -142,7 +142,8 @@ struct GetGraphOptions {
 };
 // Reusable eager output registration. Keep this allocation (including aliases)
 // alive and at the same address/size until EndGetOutput or Shutdown succeeds.
-// One lease owns the Get direction; requests may change but output/config may not.
+// One binding belongs to one Get algorithm instance. Bindings of different
+// configurations may coexist; requests may change but output/config may not.
 struct GetOutputOptions {
   MutableBufferView output;
   void* stream{nullptr};

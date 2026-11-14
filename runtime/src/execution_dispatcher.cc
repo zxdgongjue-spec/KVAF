@@ -1,4 +1,5 @@
 #include "execution_dispatcher.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -81,7 +82,7 @@ class PutDispatchPhase {
 };
 Status LaunchGet(GetExecutionContext& context, GetLaunchTiming* timing = nullptr) {
   try {
-    return context.lease.view().Launch(context.invocation(), timing);
+    return context.view().LaunchPrepared(context.invocation(), timing);
   } catch (const std::exception& e) {
     return Status::CompletionUnknown(std::string("provider Get threw after submission: ") + e.what());
   } catch (...) {
@@ -100,9 +101,7 @@ ExecutionDispatcher::~ExecutionDispatcher() {
     (void)pending_put_.release();
     (void)input_context_.release();
     (void)failed_input_context_.release();
-    (void)pending_get_.release();
-    (void)graph_context_.release();
-    (void)output_context_.release();
+    for (auto& instance : get_instances_) (void)instance.release();
   }
 }
 Status ExecutionDispatcher::RegisterPut(PutExecutionConfig c, Factory f) {
@@ -247,10 +246,20 @@ Status ExecutionDispatcher::Recover(GetExecutionConfig c) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (output_id_) return Status::Busy("release Get output lease before recovery");
+  if (graph_id_) return Status::Busy("release Get graph lease before recovery");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
-  if (s.ok()) s = DrainGetLocked();
+  if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  if (instance && instance->output_id) return Status::Busy("release this Get output lease before recovery");
+  if (pending_get_ && pending_get_ != instance)
+    return Status::Busy("complete the active Get before resource recovery");
+  if (pending_get_) {
+    s = DrainGetLocked();
+    if (!s.ok()) return s;
+    instance = FindGetInstanceLocked(resolved);
+  }
+  if (instance) s = CloseGetInstanceLocked(instance);
   return s.ok() ? resources_.Recover(resolved) : s;
 }
 Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) {
@@ -360,20 +369,103 @@ Status ExecutionDispatcher::AcknowledgePut() {
   }
   return s;
 }
+GetExecutionContext* ExecutionDispatcher::FindGetInstanceLocked(GetExecutionConfig c) const {
+  for (const auto& instance : get_instances_)
+    if (instance->config == c) return instance.get();
+  return nullptr;
+}
+Status ExecutionDispatcher::CloseGetInstanceLocked(GetExecutionContext* instance) {
+  if (!instance) return Status::OK();
+  auto s = resources_.Close(instance->resources);
+  if (!s.ok()) {
+    instance->cleanup_only = true;
+    pending_get_ = instance;
+    return s;
+  }
+  if (pending_get_ == instance) pending_get_ = nullptr;
+  get_instances_.erase(std::find_if(get_instances_.begin(), get_instances_.end(),
+      [instance](const auto& entry) { return entry.get() == instance; }));
+  return Status::OK();
+}
+Status ExecutionDispatcher::PrepareGetInstanceLocked(GetExecutionConfig config,
+    const BatchGetRequest* request, const ExecutionWarmup& warmup,
+    GetExecutionContext** out, GetPreparationTiming* timing) {
+  auto* instance = FindGetInstanceLocked(config);
+  if (instance && instance->cleanup_only) return Status::Busy("Get instance requires cleanup");
+  const bool prepare = !instance || !instance->warmed ||
+      instance->warmed_stream != warmup.stream ||
+      instance->warmed_request_capacity < warmup.request_capacity;
+  std::uint32_t capacity = warmup.request_capacity;
+  Status s;
+  if (prepare) {
+    const auto started = timing ? TraceNowNs() : 0;
+    if (request) {
+      if (instance) s = instance->view().Describe(*request, &capacity);
+      else {
+        GetResourceRequirements requirements;
+        s = resources_.Describe(config, *request, &requirements);
+        if (s.ok()) capacity = requirements.capacity;
+      }
+    } else if (instance) s = instance->view().ValidateCapacity(capacity);
+    if (timing) timing->describe_ns += TraceNowNs() - started;
+    if (!s.ok()) return s;
+  }
+  if (!instance) {
+    auto started = timing ? TraceNowNs() : 0;
+    auto created = std::make_unique<GetExecutionContext>();
+    created->config = config;
+    if (timing) timing->context_ns += TraceNowNs() - started;
+    started = timing ? TraceNowNs() : 0;
+    s = resources_.PinGet({config, capacity}, &created->resources);
+    if (timing) timing->acquire_ns += TraceNowNs() - started;
+    if (!s.ok()) return s;
+    instance = created.get();
+    get_instances_.push_back(std::move(created));
+    started = timing ? TraceNowNs() : 0;
+    try { s = instance->Bind(); }
+    catch (const std::exception& e) { s = Status::Internal(std::string("Get state creation failed: ") + e.what()); }
+    catch (...) { s = Status::Internal("Get state creation failed"); }
+    if (timing) timing->bind_ns += TraceNowNs() - started;
+    if (!s.ok()) { (void)CloseGetInstanceLocked(instance); return s; }
+  }
+  auto started = timing ? TraceNowNs() : 0;
+  // This only claims occupancy on an already initialized record. Resident
+  // references never keep the old exclusive leased flag set while idle.
+  s = instance->resources.Acquire(&instance->lease);
+  if (timing) timing->acquire_ns += TraceNowNs() - started;
+  if (!s.ok()) return s;
+  if (prepare) {
+    capacity = std::max(capacity, instance->warmed_capacity);
+    started = timing ? TraceNowNs() : 0;
+    try { s = instance->view().Warmup({capacity, warmup.stream}); }
+    catch (const std::exception& e) { s = Status::Internal(std::string("Get warmup failed: ") + e.what()); }
+    catch (...) { s = Status::Internal("Get warmup failed"); }
+    if (timing) timing->warmup_ns += TraceNowNs() - started;
+    if (!s.ok()) { instance->lease = {}; return s; }
+    instance->warmed = true;
+    instance->warmed_capacity = capacity;
+    instance->warmed_request_capacity = std::max(instance->warmed_request_capacity, warmup.request_capacity);
+    instance->warmed_stream = warmup.stream;
+  }
+  *out = instance;
+  return Status::OK();
+}
 Status ExecutionDispatcher::DrainGetLocked() {
   if (graph_id_) return Status::Busy("Get graph lease owns this direction");
-  if (output_context_) return output_context_->lease.view().Drain();
   if (!pending_get_) return Status::OK();
+  auto* instance = pending_get_;
   GetDispatchTrace::Row row{};
   if (get_trace_) {
-    row.algorithm = GetAlgorithmLabel(pending_get_->config);
-    row.path = "ordinary";
+    row.algorithm = GetAlgorithmLabel(instance->config);
+    row.path = instance->output_id ? "output" : "ordinary";
   }
   const auto started = get_trace_ ? TraceNowNs() : 0;
-  auto s = pending_get_->cleanup_only ? resources_.Close(pending_get_->lease)
-                                      : pending_get_->lease.view().Drain();
+  auto s = instance->cleanup_only ? CloseGetInstanceLocked(instance) : instance->view().Drain();
   const auto drained = get_trace_ ? TraceNowNs() : 0;
-  if (s.ok()) pending_get_.reset();
+  if (s.ok() && pending_get_) {
+    instance->ClearRequest();
+    pending_get_ = nullptr;
+  }
   if (get_trace_) {
     row.event = "drain";
     row.drain_provider_ns = drained - started;
@@ -394,89 +486,75 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   auto s = ResolveExecution(policy_, request.execution.config, &c);
   if (!s.ok()) return s;
   const auto resolved = get_trace_ ? TraceNowNs() : 0;
-  if (output_id_ || request.execution.output_lease) {
-    if (!output_id_ || request.execution.output_lease != output_id_ ||
-        request.execution.graph_lease || !(c == output_context_->config))
-      return Status::Busy("Get output lease/configuration mismatch");
-    const auto& r = *request.request;
-    if (r.output.data != output_options_.output.data || r.output.bytes != output_options_.output.bytes ||
-        r.output.device != output_options_.output.device ||
-        r.indices.bytes % sizeof(std::int32_t) ||
-        r.indices.bytes / sizeof(std::int32_t) > output_options_.request_capacity)
-      return Status::InvalidArgument("request differs from bound Get output/capacity");
-    GetDispatchTrace::Row row{};
-    if (get_trace_) {
-      row.event = "submit";
-      row.algorithm = GetAlgorithmLabel(c);
-      row.path = "output";
-      row.lock_ns = locked - started;
-      row.resolve_ns = resolved - locked;
-      row.output_check_ns = TraceNowNs() - resolved;
-    }
-    auto phase = get_trace_ ? TraceNowNs() : 0;
-    s = DrainGetLocked();
-    if (!s.ok()) return s;
-    if (get_trace_) row.previous_drain_ns = TraceNowNs() - phase;
-    phase = get_trace_ ? TraceNowNs() : 0;
-    output_context_->request = r;
-    output_context_->table = request.host_access_table;
-    output_context_->options = request.execution;
-    output_context_->options.config = c;
-    if (get_trace_) row.context_ns = TraceNowNs() - phase;
-    s = LaunchGet(*output_context_, get_trace_ ? &row.launch : nullptr);
-    if (get_trace_) {
-      row.total_ns = TraceNowNs() - started;
-      get_trace_->Record(row);
-    }
-    return s;
-  }
+  const auto& r = *request.request;
+  if (r.indices.bytes % sizeof(std::int32_t) || r.indices.bytes / sizeof(std::int32_t) > UINT32_MAX)
+    return Status::InvalidArgument("invalid Get request capacity");
+  const auto capacity = static_cast<std::uint32_t>(r.indices.bytes / sizeof(std::int32_t));
   if (graph_id_ || request.execution.graph_lease) {
-    if (!graph_id_ || request.execution.graph_lease != graph_id_ || !(c == graph_context_->config))
+    if (!graph_id_ || request.execution.graph_lease != graph_id_ || !(c == graph_context_->config) ||
+        request.execution.output_lease)
       return Status::Busy("Get graph lease/configuration mismatch");
     if (graph_captured_ || request.execution.synchronize || request.execution.profile)
       return Status::InvalidState("one asynchronous Get capture is allowed per lease");
-    graph_context_->request = *request.request;
+    const auto& bound = graph_context_->graph_options;
+    if (r.output.data != bound.output.data || r.output.bytes != bound.output.bytes ||
+        r.output.device != bound.output.device || request.execution.stream != bound.stream ||
+        capacity > bound.request_capacity)
+      return Status::InvalidArgument("request differs from Get graph output/stream/capacity");
+    graph_context_->request = r;
     graph_context_->table = request.host_access_table;
     graph_context_->options = request.execution;
     graph_context_->options.config = c;
     graph_captured_ = true;
     return LaunchGet(*graph_context_);
   }
+  auto* instance = FindGetInstanceLocked(c);
+  const bool output_bound = instance && instance->output_id;
+  if (output_bound || request.execution.output_lease) {
+    if (!output_bound || instance->output_id != request.execution.output_lease)
+      return Status::Busy("Get output lease/configuration mismatch");
+    const auto& bound = instance->output_options;
+    if (r.output.data != bound.output.data || r.output.bytes != bound.output.bytes ||
+        r.output.device != bound.output.device || capacity > bound.request_capacity)
+      return Status::InvalidArgument("request differs from bound Get output/capacity");
+  }
   GetDispatchTrace::Row row{};
   if (get_trace_) {
     row.event = "submit";
     row.algorithm = GetAlgorithmLabel(c);
-    row.path = "ordinary";
+    row.path = output_bound ? "output" : "ordinary";
     row.lock_ns = locked - started;
     row.resolve_ns = resolved - locked;
+    row.output_check_ns = TraceNowNs() - resolved;
   }
   auto phase = get_trace_ ? TraceNowNs() : 0;
   s = DrainGetLocked();
   if (!s.ok()) return s;
   if (get_trace_) row.previous_drain_ns = TraceNowNs() - phase;
-  phase = get_trace_ ? TraceNowNs() : 0;
-  auto context = std::make_unique<GetExecutionContext>();
-  context->config = c;
-  context->request = *request.request;
-  context->table = request.host_access_table;
-  context->options = request.execution;
-  context->options.config = c;
-  if (get_trace_) row.context_ns = TraceNowNs() - phase;
-  GetResourceRequirements requirements;
-  phase = get_trace_ ? TraceNowNs() : 0;
-  s = resources_.Describe(c, context->request, &requirements);
-  if (get_trace_) row.describe_ns = TraceNowNs() - phase;
-  phase = get_trace_ ? TraceNowNs() : 0;
-  if (s.ok()) s = resources_.AcquireGet(requirements, &context->lease);
-  if (get_trace_) row.acquire_ns = TraceNowNs() - phase;
-  phase = get_trace_ ? TraceNowNs() : 0;
-  if (s.ok()) s = context->Bind();
-  if (get_trace_) row.bind_ns = TraceNowNs() - phase;
+  GetPreparationTiming preparation{};
+  s = PrepareGetInstanceLocked(c, &r, {capacity, request.execution.stream}, &instance,
+                              get_trace_ ? &preparation : nullptr);
   if (!s.ok()) return s;
-  pending_get_ = std::move(context);
-  s = LaunchGet(*pending_get_, get_trace_ ? &row.launch : nullptr);
+  if (get_trace_) {
+    row.context_ns = preparation.context_ns;
+    row.describe_ns = preparation.describe_ns;
+    row.acquire_ns = preparation.acquire_ns;
+    row.bind_ns = preparation.bind_ns;
+    row.launch.warmup_ns = preparation.warmup_ns;
+  }
   phase = get_trace_ ? TraceNowNs() : 0;
-  if (s.ok() && request.execution.synchronize) pending_get_.reset();
+  instance->request = r;
+  instance->table = request.host_access_table;
+  instance->options = request.execution;
+  instance->options.config = c;
+  if (get_trace_) row.context_ns += TraceNowNs() - phase;
+  pending_get_ = instance;
+  s = LaunchGet(*instance, get_trace_ ? &row.launch : nullptr);
+  phase = get_trace_ ? TraceNowNs() : 0;
+  if (s.ok() && request.execution.synchronize) {
+    instance->ClearRequest();
+    pending_get_ = nullptr;
+  }
   if (get_trace_) {
     row.context_release_ns = TraceNowNs() - phase;
     row.total_ns = TraceNowNs() - started;
@@ -503,13 +581,16 @@ Status ExecutionDispatcher::Warmup(PutExecutionConfig c, const ExecutionWarmup& 
 Status ExecutionDispatcher::Warmup(GetExecutionConfig c, const ExecutionWarmup& r) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  if (output_id_) return Status::Busy("release Get output lease before warmup");
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
-  if (s.ok()) s = DrainGetLocked();
-  GetResourceLease lease;
-  if (s.ok()) s = resources_.AcquireGet({resolved, r.request_capacity}, &lease);
-  return s.ok() ? lease.view().Warmup(r) : s;
+  if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  if (instance && instance->output_id) return Status::Busy("release this Get output lease before warmup");
+  s = DrainGetLocked();
+  if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, r, &instance);
+  if (s.ok()) instance->ClearRequest();
+  return s;
 }
 Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOptions& r, std::uint64_t* id) {
   if (!id) return Status::InvalidArgument("null graph lease output");
@@ -517,41 +598,43 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
   if (!r.request_capacity) return Status::InvalidArgument("graph capacity must be positive");
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  if (output_id_) return Status::Busy("release Get output lease before graph capture");
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   if (c.executor != Executor::Aiv || c.algorithm != GetAlgorithm::Direct)
     return Status::NotImplemented("only AIV Direct Get supports graph leases");
-  auto context = std::make_unique<GetExecutionContext>();
-  auto s = ResolveExecution(policy_, c, &context->config);
-  if (s.ok()) s = DrainGetLocked();
-  if (s.ok()) s = resources_.AcquireGet({c, r.request_capacity}, &context->lease);
-  if (s.ok()) s = context->Bind();
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, c, &resolved);
   if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  if (instance && instance->output_id) return Status::Busy("release this Get output lease before graph capture");
   if (!next_graph_id_) return Status::InvalidState("graph lease ID exhausted");
-  try {
-    s = context->lease.view().PrepareGraph(r);
-  } catch (const std::exception& e) {
-    s = Status::Internal(std::string("graph preparation failed: ") + e.what());
-  } catch (...) {
-    s = Status::Internal("graph preparation failed");
-  }
-  if (!s.ok()) {
-    context->cleanup_only = true;
-    const auto closed = resources_.Close(context->lease);
-    if (!closed.ok()) pending_get_ = std::move(context);
-    return s;
-  }
+  s = DrainGetLocked();
+  if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, {r.request_capacity, r.stream}, &instance);
+  if (!s.ok()) return s;
+  try { s = instance->view().PrepareGraphPrepared(r); }
+  catch (const std::exception& e) { s = Status::Internal(std::string("graph preparation failed: ") + e.what()); }
+  catch (...) { s = Status::Internal("graph preparation failed"); }
+  if (!s.ok()) { (void)CloseGetInstanceLocked(instance); return s; }
+  instance->graph_options = r;
   graph_id_ = next_graph_id_++;
-  graph_context_ = std::move(context);
+  graph_context_ = instance;
   graph_captured_ = false;
   *id = graph_id_;
-  return s;
+  return Status::OK();
 }
 Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!id || id != graph_id_) return Status::NotFound("Get graph lease not found");
-  auto s = graph_context_->lease.view().FinishGraph(stream, discard);
-  if (s.ok()) { graph_id_ = 0; graph_context_.reset(); graph_captured_ = false; }
+  if (stream != graph_context_->graph_options.stream)
+    return Status::InvalidArgument("Get graph must end on its capture stream");
+  auto s = graph_context_->view().FinishGraph(stream, discard);
+  if (s.ok()) {
+    graph_context_->ClearRequest();
+    graph_context_->graph_options = {};
+    graph_id_ = 0;
+    graph_context_ = nullptr;
+    graph_captured_ = false;
+  }
   return s;
 }
 Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutputOptions& r,
@@ -563,48 +646,45 @@ Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutput
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (output_id_) return Status::Busy("Get output lease already exists");
   if (c.transport != Transport::Urma ||
       !((c.executor == Executor::Aiv && c.algorithm == GetAlgorithm::Direct) ||
         (c.executor == Executor::Aicpu && c.algorithm == GetAlgorithm::Gather)))
     return Status::NotImplemented("output binding supports URMA AIV Direct and AICPU Gather");
-  auto context = std::make_unique<GetExecutionContext>();
-  auto s = ResolveExecution(policy_, c, &context->config);
-  if (s.ok()) s = DrainGetLocked();
-  if (s.ok()) s = resources_.AcquireGet({c, r.request_capacity}, &context->lease);
-  if (s.ok()) s = context->Bind();
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, c, &resolved);
   if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  if (instance && instance->output_id) return Status::Busy("this Get instance already has an output binding");
   if (!next_output_id_) return Status::InvalidState("output lease ID exhausted");
-  try {
-    s = context->lease.view().PrepareOutput(r);
-  } catch (const std::exception& e) {
-    s = Status::Internal(std::string("output preparation failed: ") + e.what());
-  } catch (...) {
-    s = Status::Internal("output preparation failed");
-  }
-  if (!s.ok()) {
-    context->cleanup_only = true;
-    if (!resources_.Close(context->lease).ok()) pending_get_ = std::move(context);
-    return s;
-  }
-  output_options_ = r;
-  output_id_ = next_output_id_++;
-  output_context_ = std::move(context);
-  *id = output_id_;
+  s = DrainGetLocked();
+  if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, {r.request_capacity, r.stream}, &instance);
+  if (!s.ok()) return s;
+  try { s = instance->view().PrepareOutput(r); }
+  catch (const std::exception& e) { s = Status::Internal(std::string("output preparation failed: ") + e.what()); }
+  catch (...) { s = Status::Internal("output preparation failed"); }
+  if (!s.ok()) { (void)CloseGetInstanceLocked(instance); return s; }
+  instance->output_options = r;
+  instance->output_id = next_output_id_++;
+  instance->ClearRequest();
+  *id = instance->output_id;
   return Status::OK();
 }
-Status ExecutionDispatcher::FinishOutputLocked() {
-  if (!output_context_) return Status::OK();
-  auto s = output_context_->lease.view().Drain();
-  if (s.ok()) s = output_context_->lease.view().FinishOutput();
-  if (s.ok()) { output_context_.reset(); output_id_ = 0; output_options_ = {}; }
+Status ExecutionDispatcher::FinishOutputLocked(GetExecutionContext& instance) {
+  if (graph_id_) return Status::Busy("Get graph lease owns this direction");
+  if (pending_get_ == &instance) {
+    auto s = DrainGetLocked();
+    if (!s.ok()) return s;
+  }
+  auto s = instance.view().FinishOutput();
+  if (s.ok()) { instance.output_id = 0; instance.output_options = {}; }
   return s;
 }
 Status ExecutionDispatcher::EndGetOutput(std::uint64_t id) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  if (!id || id != output_id_) return Status::NotFound("Get output lease not found");
-  return FinishOutputLocked();
+  for (auto& instance : get_instances_)
+    if (id && instance->output_id == id) return FinishOutputLocked(*instance);
+  return Status::NotFound("Get output lease not found");
 }
 Status ExecutionDispatcher::Shutdown() {
   std::unique_lock<std::shared_mutex> life(lifecycle_);
@@ -617,15 +697,22 @@ Status ExecutionDispatcher::Shutdown() {
     if (s.ok()) context.reset();
     else if (first.ok()) first = s;
   };
-  // Queue teardown can recover a failed completion report/unregistration.
-  // Keep the output lease (and the caller's storage) if teardown also fails.
-  close(output_context_);
-  if (!output_context_) { output_id_ = 0; output_options_ = {}; }
   close(pending_put_);
   close(input_context_);
   close(failed_input_context_);
   if (!pending_put_ && !input_context_) { input_id_ = 0; input_options_ = {}; }
-  close(pending_get_);
+  // Close owners with resident execution state and bindings still alive. Only
+  // successful closes may erase a pin; failed instances retain every dependency.
+  for (auto it = get_instances_.begin(); it != get_instances_.end();) {
+    auto s = resources_.Close((*it)->resources);
+    if (s.ok()) {
+      if (pending_get_ == it->get()) pending_get_ = nullptr;
+      it = get_instances_.erase(it);
+    } else {
+      if (first.ok()) first = s;
+      ++it;
+    }
+  }
   auto s = resources_.Shutdown();
   if (!s.ok() && first.ok()) first = s;
   if (first.ok()) region_ = {};

@@ -736,7 +736,8 @@ class NpuPythonRuntime final {
         status = Status::Internal("aclrtSetDevice failed");
       else status = native_->core().EndGetOutput(id);
     }
-    if (status.ok()) { output_refs_.erase(id); pending_get_refs_.clear(); }
+    // Another algorithm may still be using pending tensors on the Get direction.
+    if (status.ok()) output_refs_.erase(id);
     ThrowIfError(status);
   }
   void DrainGet() {

@@ -23,7 +23,10 @@ struct PutExecutionContext {
   }
   ~PutExecutionContext() { if (bound) (void)lease.view().Bind(nullptr); }
 };
+// One resident instance per Get configuration. The reference and state survive
+// completion; lease/request/table/options belong only to current execution.
 struct GetExecutionContext {
+  GetResourceReference resources;
   GetResourceLease lease;
   GetExecutionConfig config;
   BatchGetRequest request;
@@ -32,13 +35,26 @@ struct GetExecutionContext {
   std::unique_ptr<ExecutionState> state;
   bool bound{false};
   bool cleanup_only{false};
+  bool warmed{false};
+  std::uint32_t warmed_request_capacity{0}, warmed_capacity{0};
+  void* warmed_stream{nullptr};
+  std::uint64_t output_id{0};
+  GetOutputOptions output_options;
+  GetGraphOptions graph_options;
+  GetResourceView view() const { return resources ? resources.view() : lease.view(); }
   Status Bind() {
-    state = lease.view().CreateState();
-    auto s = lease.view().Bind(state.get());
+    state = view().CreateState();
+    auto s = view().Bind(state.get());
     bound = s.ok();
     return s;
   }
-  ~GetExecutionContext() { if (bound) (void)lease.view().Bind(nullptr); }
+  ~GetExecutionContext() { if (bound) (void)view().Bind(nullptr); }
+  void ClearRequest() {
+    request = {};
+    table = {};
+    options = {};
+    lease = {};
+  }
   BatchGetExecRequest invocation() const { return {table, &request, options}; }
 };
 }  // namespace kvaf

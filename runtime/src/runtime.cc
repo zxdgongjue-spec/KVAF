@@ -500,9 +500,9 @@ Status RuntimeCore::EndGetOutput(std::uint64_t id) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
-  auto s = access_operator_.EndGetOutput(id);
-  if (s.ok()) pending_get_table_.reset();
-  return s;
+  // Ending an idle algorithm's output binding need not drain another algorithm.
+  // Keep the active table pin until the direction's next successful DrainGet.
+  return access_operator_.EndGetOutput(id);
 }
 Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
