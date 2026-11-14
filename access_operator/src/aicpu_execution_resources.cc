@@ -15,7 +15,8 @@ struct AicpuExecutionResources::State {
                    config.batch_get_mode == "cpu_push_scatter"),
         get_session({config.kernel_json, config.workers,
                  config.peer_link, config.local_eid}),
-        put_session({config.kernel_json, config.workers, config.peer_link, config.local_eid}),
+        put_session({config.kernel_json, config.workers, config.peer_link, config.local_eid,
+                     aicpu_urma::UmdkQueueProfile::Put}),
         get(get_session, config.token_bytes),
         put(put_session), enable_get(config.enable_get), managed_completion(config.managed_completion) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)

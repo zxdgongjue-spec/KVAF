@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(kvaf_execute_batch_get LANGUAGES CXX)
+project(kvaf_execute_batch_put LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,14 +18,13 @@ if(NOT EXISTS "${ASCEND_CANN_PACKAGE_PATH}")
   message(FATAL_ERROR "CANN toolkit not found: ${ASCEND_CANN_PACKAGE_PATH}")
 endif()
 
-set(KVAF_AIV_DEMO_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set(KVAF_AIV_DEMO_BIN_DIR "${CMAKE_BINARY_DIR}/bin")
-file(MAKE_DIRECTORY "${KVAF_AIV_DEMO_BIN_DIR}")
+set(KVAF_AIV_ALGORITHM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(KVAF_AIV_ALGORITHM_BIN_DIR "${CMAKE_BINARY_DIR}/bin")
+file(MAKE_DIRECTORY "${KVAF_AIV_ALGORITHM_BIN_DIR}")
 
 if(NOT TARGET kvaf_direct_hccp_session)
-  add_subdirectory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/direct_hccp"
-    "${CMAKE_CURRENT_BINARY_DIR}/direct_hccp_session")
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../src/direct_hccp"
+                   "${CMAKE_CURRENT_BINARY_DIR}/direct_hccp_session")
 endif()
 
 add_subdirectory(kernel)

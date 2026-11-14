@@ -19,6 +19,7 @@ struct UmdkSessionConfig {
   std::uint32_t workers{1U};
   std::shared_ptr<peer::PeerLink> peer_link;
   std::array<std::uint8_t, 16> local_eid{};
+  UmdkQueueProfile queue_profile{UmdkQueueProfile::Gather};
 };
 
 class UmdkSession;

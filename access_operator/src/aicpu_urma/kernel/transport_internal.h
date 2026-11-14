@@ -44,6 +44,19 @@ struct Api {
   ImportJettyEx import_jetty_ex = nullptr;
 };
 
+// Process-local provider environment. Sessions borrow its immutable function
+// table and keep it alive until every queue, registration and context is gone.
+struct ApiEnvironment {
+  std::mutex mutex;
+  Api api;
+  void* library = nullptr;
+  void* common_library = nullptr;
+  std::shared_ptr<ApiEnvironment> redirect;
+  std::size_t references = 0;
+  bool loaded = false, owns_init = false, initialized = false;
+  bool failed = false, retiring = false;
+};
+
 struct RequestBuffer {
   std::vector<Sge> local_sges;
   std::vector<Sge> remote_sges;
@@ -72,10 +85,10 @@ struct RegisteredBuffer {
 };
 
 struct SessionState {
+  // A cold-path copy avoids adding a pointer chase to each WR/CQ operation.
+  // Ownership and dynamic symbol resolution belong only to environment.
   Api api;
-  void* library = nullptr;
-  void* common_library = nullptr;
-  bool owns_init = false;
+  std::shared_ptr<ApiEnvironment> environment;
   urma_context_t* context = nullptr;
   urma_token_id_t* token = nullptr;
   urma_target_seg_t* local = nullptr;
@@ -86,6 +99,7 @@ struct SessionState {
   std::array<std::uint8_t, 16> peer_eid{};
   std::uint64_t buffer = 0, buffer_bytes = 0;
   std::uint32_t worker_count = 1;
+  UmdkQueueProfile queue_profile{UmdkQueueProfile::Gather};
   std::array<Queue, kUmdkControlQueueIndex> data_queues;
   std::array<Queue, kUmdkControlQueueIndex> control_queues;
   std::vector<RegisteredBuffer> buffers;
@@ -110,6 +124,7 @@ struct SessionScope {
 std::uint64_t NowNs();
 Queue& DataQueue(std::uint32_t index);
 Queue* FindQueue(std::uint32_t index);
+bool CreateSessionQueues(const UmdkControlArgs&, UmdkControlStatus&);
 bool Prepare(const UmdkControlArgs&, UmdkControlStatus&);
 bool Connect(const UmdkControlArgs&, UmdkControlStatus&);
 bool DescribeWorker(const UmdkControlArgs&, std::uint32_t index, UmdkControlStatus&);

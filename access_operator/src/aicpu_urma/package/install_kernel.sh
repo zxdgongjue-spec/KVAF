@@ -29,7 +29,7 @@ check_artifacts() {
   check_archive "$dir/$package"
   grep -Fq '"KvafAicpuBatchPut"' "$dir/kernel.json" || die "BatchPut missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuGatherReadExecutionV3"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
-  grep -Fq '"KvafAicpuUmdkControlSessionsV4"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
+  grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
   if [[ "$require_scatter" == true ]]; then
     grep -Fq '"KvafAicpuCpuPushScatterExecutionV3"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
   fi
@@ -42,7 +42,7 @@ check_installed() {
   check_archive "$kernel_dir/$package"
   grep -Fq '"KvafAicpuBatchPut"' "$config_dir/$json" || die "installed JSON lacks BatchPut"
   grep -Fq '"KvafAicpuGatherReadExecutionV3"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
-  grep -Fq '"KvafAicpuUmdkControlSessionsV4"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
+  grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
   if [[ "$require_scatter" == true ]]; then
     grep -Fq '"KvafAicpuCpuPushScatterExecutionV3"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
   fi

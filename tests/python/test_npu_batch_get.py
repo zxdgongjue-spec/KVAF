@@ -495,7 +495,7 @@ def main(transport: str = "urma") -> int:
             # The graph captures only BatchGet. Its caller-owned device
             # tensors keep their addresses, while this host staging storage
             # updates their contents on the same ACL stream before each
-            # replay. This is the AIV demo's verified graph contract.
+            # replay. This is the AIV algorithm's verified graph contract.
             host_view = runtime.access_table_view(table, device="cpu")
             host_addresses_buffer = bytearray(host_view["addresses"])
             graph_address_table_host = bytearray(tensor_bytes(address_table))

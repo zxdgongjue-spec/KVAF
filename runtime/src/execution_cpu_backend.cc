@@ -15,6 +15,13 @@ class PoolAllocation final : public execution::Allocation {
     if (!Close().ok()) (void)mapping.release();
   }
   Status Close() override {
+#ifdef KVAF_CPU_HAS_URMA
+    if (urma_memory) {
+      auto s = urma_memory->Close();
+      if (!s.ok()) return s;
+      urma_memory.reset();
+    }
+#endif
     if (mapping) {
       auto s = mapping->Close();
       if (!s.ok()) return s;
@@ -28,6 +35,9 @@ class PoolAllocation final : public execution::Allocation {
   }
   void* memory = nullptr;
   std::unique_ptr<ubmem::Mapping> mapping;
+#ifdef KVAF_CPU_HAS_URMA
+  std::shared_ptr<CpuUrmaMemoryPool> urma_memory;
+#endif
 };
 class FabricSession final : public execution::Session {
  public:
@@ -51,7 +61,10 @@ class UrmaSession final : public execution::Session {
               peer::PeerRegion* out) override {
     profile_ = q;
     if (q.cpu_threads) options_.gather_threads = q.cpu_threads;
-    auto s = backend_.Initialize(options_, next_);
+    auto* allocation = dynamic_cast<PoolAllocation*>(&pool);
+    if (!allocation || !allocation->urma_memory)
+      return Status::InvalidState("allocation has no shared CPU URMA memory owner");
+    auto s = backend_.Initialize(options_, next_, allocation->urma_memory);
     if (s.ok())
       s = backend_.AttachRegion(reinterpret_cast<void*>(pool.descriptor.base),
                                 pool.descriptor.length, 1, q.candidate, out);
@@ -122,6 +135,11 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
       p->descriptor.base = reinterpret_cast<std::uintptr_t>(p->memory);
     }
     p->descriptor.length = bytes;
+#ifdef KVAF_CPU_HAS_URMA
+    if (q.mode != TransportMode::Ubmem)
+      p->urma_memory = std::make_shared<CpuUrmaMemoryPool>(options,
+          reinterpret_cast<void*>(p->descriptor.base), bytes, q.epoch, q.request);
+#endif
     // Initialize auxiliary controls once, never on each registration of this pool.
     if (q.auxiliary_bytes)
       std::memset(reinterpret_cast<void*>(p->descriptor.base + q.logical_bytes), 0,

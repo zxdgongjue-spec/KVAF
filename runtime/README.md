@@ -212,8 +212,8 @@ AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
 
 ## A5 / CANN BatchGet 集成
 
-`KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 merged
-demo 的 kernel/host 库、`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。
+`KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 AIV BatchGet
+算法的 kernel/host 库、`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。
 Python 脚本创建 NPU Tensor；通过 Runtime materialize `DeviceAccessTable`，然后
 直接传入 `batch_get`：
 
@@ -264,7 +264,7 @@ capture 中只 capture `runtime.batch_get(..., stream=capture_stream)`。
 `runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
 与 eager 一律使用相同的 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS` 采样计划。
 
-AIV demo 使用原生
+AIV 算法使用原生
 `aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。
 Python 测试使用调用方持有的 `torch.npu.Stream`；`AclGraph.replay(stream)` 显式传入
 capture 使用的同一 stream。图对象会在 Runtime shutdown 前 reset，避免图仍持有调用方
@@ -290,7 +290,7 @@ cache-hit / release 日志默认关闭，避免压测污染终端。如需排查
 ## A5 / CANN BatchPut 集成
 
 `tests/python/test_npu_batch_put.py` 通过 `kvaf.NpuRuntime` 验证真实的 AIV
-Direct-HCCP BatchPut 路径，不使用 demo test binary 或 ACL D2H mock。默认每轮写入
+Direct-HCCP BatchPut 路径，不使用独立测试程序或 ACL D2H mock。默认每轮写入
 4096 个 1 KiB block。写入完成后通过 Runtime 的 Host AccessTable 检查 Meta 已提交
 的长度、有效位和远端 DDR payload。测试流程与 BatchGet 一致：先进行一次正确性
 验证，再执行 warmup 和正式采样，最后重新校验采样结果。测试会输出 `PERF_RESULT`，统计

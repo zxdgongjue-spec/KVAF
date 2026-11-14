@@ -21,6 +21,13 @@
       "opKernelLib": "AICPUKernel"
     }
   },
+  "KvafAicpuUmdkControlSessionsV5": {
+    "opInfo": {
+      "functionName": "KvafAicpuUmdkControlSessionsV5",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
   "KvafAicpuUmdkControl": {
     "opInfo": {
       "functionName": "KvafAicpuUmdkControl",

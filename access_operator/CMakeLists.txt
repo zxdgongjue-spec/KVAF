@@ -26,9 +26,9 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH)
 endif()
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  add_subdirectory(demo/aiv_batch_get)
+  add_subdirectory(algorithms/aiv_batch_get)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
-    add_subdirectory(demo/aiv_batch_put)
+    add_subdirectory(algorithms/aiv_batch_put)
   endif()
 
   add_library(kvaf_default_access_operator
@@ -40,13 +40,13 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_get/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/aiv_batch_get/include
       ${ASCEND_CANN_PACKAGE_PATH}/include
   )
 
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_include_directories(kvaf_default_access_operator
-      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_put/include)
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/aiv_batch_put/include)
   endif()
 
   target_compile_definitions(kvaf_default_access_operator
@@ -80,8 +80,8 @@ endif()
 
 if(KVAF_ENABLE_AICPU_URMA)
   add_subdirectory(src/aicpu_urma)
-  add_subdirectory(demo/aicpu_batch_get)
-  add_subdirectory(demo/aicpu_batch_put)
+  add_subdirectory(algorithms/aicpu_batch_get)
+  add_subdirectory(algorithms/aicpu_batch_put)
   add_subdirectory(src/aicpu_urma/kernel)
   add_library(kvaf_aicpu_access_operator STATIC src/aicpu_access_operator.cc src/aicpu_execution_resources.cc)
   if(KVAF_ENABLE_AICPU_CPU_PUSH)

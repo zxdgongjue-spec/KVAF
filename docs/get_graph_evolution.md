@@ -13,7 +13,7 @@ canonical 地址转换，以及按输入/输出绑定复用注册的接口。
 
 设备 ABI 不混用：
 
-- `KvafAicpuUmdkControlSessionsV4`
+- `KvafAicpuUmdkControlSessionsV5`（第 5 步增加 QueueProfile；V4 只保留兼容入口）
 - `KvafAicpuGatherReadExecutionV3`
 - `KvafAicpuCpuPushScatterExecutionV3`
 
@@ -92,3 +92,56 @@ done
 kernel profile 用于设备分析；Host 延迟对照使用两种接口模式相同的 profile 设置与
 `--get-timing sync-call`。便携回归覆盖四算法路由、捕获限制、stream 校验、失败重试、
 空/部分/全量请求及 profile 收尾；它们不替代真机 E2E 和性能验证。
+
+## 5. 共享资源和生产目录
+
+本轮把可共用且生命周期明确的依赖从执行会话中提取出来：
+
+| 对象 | 共享身份 / 生命周期 | 保持独立的对象 |
+|---|---|---|
+| HCCP transport API 表 | 进程首次完整加载成功的 provider；库引用保留至退出 | RaCtx、Jetty/CQ、entity、注册与执行状态 |
+| AICPU `ApiEnvironment` | 实际加载的 liburma 对象；多 session 共享初始化与函数表 | 各 session 的 context、MR、远端导入和队列 |
+| CPU `CpuUrmaMemoryPool` | 一次 allocation 的代次；按 candidate/EID/context 创建兼容 DDR 注册 | 各执行 session 的通道、Gather/Scatter worker 和控制状态 |
+| UBMEM HAL / mapping | 沿用进程级 HAL、带 allocation 代次的设备映射引用 | Put/Get 的 metadata、完成状态和槽位 |
+
+AICPU 的执行入口只解析一次 session；函数表在准备时复制到 session，WR/CQ 热路径
+不增加环境查找。最后使用者关闭环境前先释放所有队列、注册和 context；失败保留句柄
+以便重试。HCCP 的成功加载引用进程驻留，所有 transport 复用这一份表，避免每次
+创建 transport 都增加一份永不释放的 dlopen 引用。首次成功后锁定当前进程 provider；
+更换 SDK/库应使用新进程。
+
+CPU 的共享 MR 不再随每个执行 session 注销。同一 allocation、context、candidate/EID、
+地址范围、权限和凭据完全一致才复用；context/allocation 代次参与身份，同址新分配不会
+命中旧注册。关闭一个 session 只关闭自己的工作与队列并归还引用；Region 关闭时先注销
+MR/token，再关 context，最后释放 DDR。任何一步失败保留下游内存与所有权，允许重试。
+
+本轮 CPU wire 协议不变，execution session 身份仍独立。CPU 注册共享不意味着 NPU/AICPU
+的远端导入句柄共享：不同本地 context 继续独立导入，也不把 session ID 当作内存绑定 ID。
+更大范围的 context、HBM 注册和远端导入共享仍需明确存储代次及协议绑定身份。
+
+AICPU 队列用显式 `UmdkQueueProfile` 配置：Put 为 **1 control / 0 data**，Gather 为
+**N control / N data**，CPU 侧通道数与之对应。Put 的提交、完成与事务处理语义不变。
+Control 使用 V5 能力检查；在原 4 字节 padding 放 profile，不改变原结构大小或其他字段
+偏移。旧 Control/V3/V4 入口保留原 Gather 队列布局，新 Host 不静默退回旧包。
+
+生产实现迁移到：
+
+```text
+access_operator/algorithms/
+  aiv_batch_get/       host/ include/ kernel/
+  aiv_batch_put/       host/ include/ kernel/ scripts/
+  aicpu_batch_get/     host/ include/ kernel/ python/
+  aicpu_batch_put/     host/ include/ kernel/
+```
+
+资源 owner、公共 view、传输和映射仍在 `access_operator/src` / `include`；Runtime
+调度和 CPU 分配仍在 `runtime`。CMake、测试、脚本和公开文档路径一起迁移，库名、kernel
+符号和 `build-npu/bin` 产物路径保持不变。此前要求保留的本地设计草稿未修改、未提交。
+
+需重新配置并构建 CPU/NPU，重新安装 AICPU 包，并启动新的客户端和 CPU 服务进程。
+功能验收沿用第 3 节全量脚本；`resources/output-coexistence` 新增检查两个算法的输出
+绑定同时存在、交替使用以及释放空闲绑定不解除另一在途请求的 table pin。便携测试额外
+覆盖并发首次注册、共享引用、队列数量、同址新代次以及注销/context 关闭失败重试。
+
+本轮未加入同图多 Get 节点、图内混合算法或 Put 图模式。硬件验收通过前，便携测试仅证明
+资源控制与模拟执行路径，不能据此宣称真实 DMA、图回放或性能已通过。

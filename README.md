@@ -6,7 +6,11 @@ KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备�
 
 当前支持 AIV URMA、AIV UBmem、AICPU Put/Gather 和 AICPU Put/Scatter。
 CPU 端使用同一个服务程序，NPU 端默认构建一份包含全部后端的 Python 包，
-通过 `NpuRuntime` 构造参数选择本次 Runtime 使用的实现。
+通过 `NpuRuntime` 配置默认及启用的实现；per-call 模式允许在调用时选择算法，
+每种 Get 的资源和执行状态首次准备后驻留复用。四种 Get 均提供单节点图租约。
+
+实现边界与部署步骤见 [Get 图模式演进](docs/get_graph_evolution.md)，
+功能和性能验证见 [验证指南](docs/cache_transport_execution_validation.md)。
 
 
 ## KVAF-Runtime 核心能力
@@ -273,7 +277,7 @@ BatchGet 结果和 teardown。正常完成时：
 保持同一个 CPU 服务和上面的 NPU 环境，使用统一构建的 Python 包：
 
 ```bash
-python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
+python3 access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py \
   --device-id "$DEVICE_ID" --peer "$KVAF_CPU_SERVICE_ADDR" \
   --modes gather_read cpu_push_scatter --workers 1 2 4 5 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
@@ -283,7 +287,7 @@ python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
 实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，当前测试示例统一使用
 1、2、4、5 个 worker，暂不推荐 Scatter 使用 8 个 worker。
 
-[test_batch_get.py](access_operator/demo/aicpu_batch_get/python/test_batch_get.py)
+[test_batch_get.py](access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py)
 每轮先执行 AICPU BatchPut，再执行 Gather/Scatter 并比较整个输出。它还检查两种
 Table 重载、空/部分请求前缀、随机输入和输出行、异步调用后同 stream 的 NPU 消费。
 两种模式乘以四种 worker 数，应输出 8 条 `AICPU_BATCH_GET_PASS`。

@@ -45,7 +45,7 @@ if(KVAF_AICPU_UMDK_RUNTIME_DIR)
     "${KVAF_AICPU_UMDK_RUNTIME_DIR}/urma/*.so*")
 endif()
 configure_file(../package/kernel.json.in "${package_dir}/kernel.json" @ONLY)
-# One SO keeps the transport/session state shared by both demos.
+# One SO keeps the transport/session state shared by the Get and Put algorithms.
 set(device_sources "${CMAKE_CURRENT_SOURCE_DIR}/session.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/transfer.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/control_kernel.cc"
@@ -65,11 +65,11 @@ set(device_headers "${CMAKE_CURRENT_SOURCE_DIR}/transport_internal.h"
   "${CMAKE_SOURCE_DIR}/common/include/batch_get_ticket.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_abi.h"
   "${CMAKE_SOURCE_DIR}/common/include/cpu_push_get_layout.h"
-  "${CMAKE_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include/batch_get_abi.h")
+  "${CMAKE_SOURCE_DIR}/access_operator/algorithms/aiv_batch_get/include/batch_get_abi.h")
 set(cpu_push_objects)
 if(KVAF_ENABLE_AICPU_CPU_PUSH)
   # Optimize scatter separately from the UMDK/session sources.
-  set(cpu_push_source "${CMAKE_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc")
+  set(cpu_push_source "${CMAKE_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_get/kernel/cpu_push_scatter.cc")
   set(cpu_push_object "${CMAKE_CURRENT_BINARY_DIR}/cpu_push_scatter.o")
   list(REMOVE_ITEM device_sources "${cpu_push_source}")
   add_custom_command(OUTPUT "${cpu_push_object}"
@@ -77,7 +77,7 @@ if(KVAF_ENABLE_AICPU_CPU_PUSH)
     COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O3 -fPIC -c -DKVAF_CPU_PUSH_DEVICE_KERNEL=1
       -I "${CMAKE_CURRENT_SOURCE_DIR}"
       -I "${CMAKE_SOURCE_DIR}/access_operator/include"
-      -I "${CMAKE_SOURCE_DIR}/access_operator/demo"
+      -I "${CMAKE_SOURCE_DIR}/access_operator/algorithms"
       -I "${CMAKE_SOURCE_DIR}/runtime/include"
       -I "${CMAKE_SOURCE_DIR}/common/include" -I "${KVAF_AICPU_UMDK_INCLUDE_DIR}"
       ${cpu_push_options} "${cpu_push_source}" -o "${cpu_push_object}"
@@ -90,7 +90,7 @@ add_custom_command(OUTPUT "${kernel_so}"
   COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O2 -shared -fPIC
     -I "${CMAKE_CURRENT_SOURCE_DIR}"
     -I "${CMAKE_SOURCE_DIR}/access_operator/include"
-    -I "${CMAKE_SOURCE_DIR}/access_operator/demo"
+    -I "${CMAKE_SOURCE_DIR}/access_operator/algorithms"
     -I "${CMAKE_SOURCE_DIR}/runtime/include"
     -I "${CMAKE_SOURCE_DIR}/common/include" -I "${KVAF_AICPU_UMDK_INCLUDE_DIR}"
     ${cpu_push_options} ${device_sources} ${cpu_push_objects} ${cpu_push_libraries}

@@ -4,11 +4,25 @@
 #include "peer_link.h"
 
 namespace kvaf {
+// Allocation-scoped CPU context and DDR registration owner. Execution
+// backends keep independent channels, gather workers and Scatter state.
+class CpuUrmaMemoryPool {
+ public:
+  CpuUrmaMemoryPool(const CpuRuntimeOptions&, void* memory, std::uint64_t bytes,
+                    std::uint64_t epoch, std::uint64_t allocation_request);
+  ~CpuUrmaMemoryPool();
+  Status Close();
+ private:
+  friend class UrmaCpuBackend;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 class UrmaCpuBackend {
  public:
   UrmaCpuBackend();
   ~UrmaCpuBackend();
-  Status Initialize(const CpuRuntimeOptions&, std::uint64_t& next_session);
+  Status Initialize(const CpuRuntimeOptions&, std::uint64_t& next_session,
+                    std::shared_ptr<CpuUrmaMemoryPool> memory_pool = {});
   Status AttachRegion(void* memory, std::uint64_t bytes, std::uint64_t slot_size,
                       std::uint32_t candidate, peer::PeerRegion* binding);
   Status Call(const std::vector<std::uint8_t>& request, std::vector<std::uint8_t>* response);

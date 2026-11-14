@@ -1,5 +1,6 @@
 #include "cpu_backends.h"
 #include "cpu_ddr_registration.h"
+#include "cpu_shared_registration.h"
 #include "cpu_urma_channel.h"
 #include "urma_transport.h"
 #include "peer_protocol.h"
@@ -168,6 +169,7 @@ class UrmaResources {
   }
 
   urma_context_t* context() const { return context_; }
+  std::uint64_t generation() const { return generation_; }
   const std::string& device_name() const { return selected_device_name_; }
   uint32_t eid_index() const { return eid_index_; }
   urma::GetTpList tp_query() const { return get_tp_list_; }
@@ -194,6 +196,7 @@ class UrmaResources {
   }
 
  private:
+  const std::uint64_t generation_{NewBindingGeneration()};
   std::string selected_device_name_;
   uint32_t eid_index_ = 0U;
   urma_device_t* device_ = nullptr;
@@ -317,6 +320,66 @@ class UrmaResourcePool {
   std::vector<UrmaCandidate> candidates_;
 };
 
+// Kept within a single allocation. Session creation synchronizes discovery
+// and context setup here; data-plane calls continue on independent sessions.
+class SharedUrmaMemory {
+ public:
+  SharedUrmaMemory(CpuRuntimeOptions options, void* memory, std::uint64_t bytes,
+                   std::uint64_t epoch, std::uint64_t allocation)
+      : options_(std::move(options)), memory_(memory), bytes_(bytes), epoch_(epoch),
+        allocation_(allocation), generation_(NewBindingGeneration()) {}
+  Status Initialize(const CpuRuntimeOptions& options) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_) return Status::InvalidState("CPU URMA memory pool is closing");
+    if (options.ub_device != options_.ub_device || options.has_eid_index != options_.has_eid_index ||
+        (options.has_eid_index && options.eid_index != options_.eid_index))
+      return Status::InvalidArgument("CPU URMA memory pool endpoint configuration mismatch");
+    if (!attempted_) {
+      attempted_ = true;
+      ready_ = resources.Initialize(options_.ub_device, options_.has_eid_index, options_.eid_index);
+    }
+    return ready_ ? Status::OK() : Status::Internal("shared CPU URMA discovery failed; close pool");
+  }
+  Status Acquire(std::uint32_t candidate, void* memory, std::uint64_t bytes,
+                 UrmaResources** context, std::shared_ptr<CpuDdrRegistration>* lease) {
+    CpuDdrRegistrationPool::Key key;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (closing_ || !ready_) return Status::InvalidState("CPU URMA memory pool is unavailable");
+      if (memory != memory_ || bytes != bytes_)
+        return Status::InvalidArgument("CPU URMA allocation identity mismatch");
+      *context = resources.Get(candidate);
+      if (!*context) return Status::Internal("shared CPU URMA context initialization failed");
+      key.epoch = epoch_; key.allocation = allocation_; key.allocation_generation = generation_;
+      key.context = reinterpret_cast<std::uintptr_t>((*context)->context());
+      key.context_generation = (*context)->generation();
+      key.base = reinterpret_cast<std::uintptr_t>(memory_);
+      key.bytes = bytes_; key.candidate = candidate;
+      key.flags = CpuDdrRegistration::Flags().value;
+      key.token = 2;  // Per-allocation credential; ownership is not process-global.
+      std::memcpy(key.eid.data(), (*context)->context()->eid.raw, key.eid.size());
+    }
+    return registrations_.Acquire(key, lease);
+  }
+  Status Close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closing_ = true;
+    auto status = registrations_.Close();
+    if (!status.ok()) return status;
+    if (!resources.Shutdown()) return Status::Internal("shared CPU URMA context close failed");
+    ready_ = false;
+    return Status::OK();
+  }
+  UrmaResourcePool resources;
+ private:
+  CpuRuntimeOptions options_;
+  void* memory_;
+  std::uint64_t bytes_, epoch_, allocation_, generation_;
+  bool attempted_{false}, ready_{false}, closing_{false};
+  std::mutex mutex_;
+  CpuDdrRegistrationPool registrations_;
+};
+
 using Channel = cpu_runtime_detail::UrmaChannel;
 
 peer::GatherWaitMode ToGatherWaitMode(CpuGatherMode mode) {
@@ -398,7 +461,8 @@ struct Region {
   bool borrowed = false;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
-  CpuDdrRegistration registration;
+  std::shared_ptr<CpuDdrRegistration> registration;
+  bool shared_registration{false};
   std::vector<Channel> channels;
   std::unique_ptr<CpuGatherWorker> gather;
   std::vector<std::unique_ptr<CpuGatherWorker>> gather_lanes;
@@ -411,8 +475,9 @@ class CpuService {
              std::size_t min_bytes_per_thread,
              CpuGatherMode gather_mode,
              CpuMemoryPageMode memory_page_mode,
-             bool device_filter_applied, uint64_t& next_session)
-      : resource_pool_(resource_pool), gather_threads_(gather_threads),
+             bool device_filter_applied, uint64_t& next_session,
+             std::shared_ptr<SharedUrmaMemory> shared_memory = {})
+      : resource_pool_(resource_pool), shared_memory_(std::move(shared_memory)), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
         gather_mode_(gather_mode),
         memory_page_mode_(memory_page_mode), device_filter_applied_(device_filter_applied), next_region_id_(next_session) {}
@@ -455,9 +520,10 @@ class CpuService {
         bytes > std::numeric_limits<size_t>::max() || resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
     }
-    UrmaResources* resources = resource_pool_->Get(candidate_id);
-    if (resources == nullptr) {
-      return Result::kResourceError;
+    UrmaResources* resources = nullptr;
+    if (!borrowed || !shared_memory_) {
+      resources = resource_pool_->Get(candidate_id);
+      if (!resources) return Result::kResourceError;
     }
     auto region = std::make_unique<Region>();
     const uint64_t id = next_region_id_++;
@@ -477,7 +543,15 @@ class CpuService {
     region->bytes = bytes;
     if (!borrowed && bytes >= 64U)
       std::memset(static_cast<uint8_t*>(region->memory) + peer::GatherControlOffset(bytes), 0, 64U);
-    auto registered = region->registration.Register(resources->context(), region->memory, bytes, NextToken());
+    Status registered;
+    if (borrowed && shared_memory_) {
+      region->shared_registration = true;
+      registered = shared_memory_->Acquire(candidate_id, borrowed, bytes, &resources, &region->registration);
+      region->resources = resources;
+    } else {
+      region->registration = std::make_shared<CpuDdrRegistration>();
+      registered = region->registration->Register(resources->context(), region->memory, bytes, NextToken());
+    }
     if (!registered.ok()) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED base=%p bytes=%" PRIu64 " error=%s\n",
           region->memory, bytes, registered.message().c_str());
@@ -485,8 +559,8 @@ class CpuService {
     }
 
     region->base =
-        borrowed ? reinterpret_cast<std::uint64_t>(borrowed) : region->registration.segment()->seg.ubva.va;
-    const auto descriptor = region->registration.Describe(id);
+        borrowed ? reinterpret_cast<std::uint64_t>(borrowed) : region->registration->segment()->seg.ubva.va;
+    const auto descriptor = region->registration->Describe(id);
     response->session_id = descriptor.session_id;
     response->peer_base = descriptor.registered_address;
     // Preserve the legacy advertised allocation extent. Driver padding, if
@@ -525,7 +599,10 @@ class CpuService {
           static_cast<unsigned long long>(request.local_tp_handle), request.local_psn);
       return Result::kInvalidRequest;
     }
-    const auto found = regions_.find(request.session_id);
+    // Wire records are packed; unordered_map binds its key by reference.
+    // Load the field by value before passing an aligned native key to STL.
+    const std::uint64_t session_id = request.session_id;
+    const auto found = regions_.find(session_id);
     if (found == regions_.end()) {
       return Result::kNotFound;
     }
@@ -544,8 +621,8 @@ class CpuService {
     };
     const bool share_tp = (request.reserved & peer::kChannelSharedTp) != 0U;
     const bool created = share_tp
-        ? channel.CreateLocal(region.resources->context(), region.registration.token_value())
-        : CreateLocalJetty(region.resources, region.registration.token_value(), &channel.local_jfc,
+        ? channel.CreateLocal(region.resources->context(), region.registration->token_value())
+        : CreateLocalJetty(region.resources, region.registration->token_value(), &channel.local_jfc,
                             &channel.local_jfr, &channel.local_jetty);
     if (!created) return failed();
     const auto* shared = share_tp ? cpu_runtime_detail::FindSharedChannelTp(
@@ -645,7 +722,8 @@ class CpuService {
 
   Result OpenCpuPushGet(const peer::OpenCpuPushGetRequest& request,
                         peer::OpenCpuPushGetResponse* response) {
-    const auto found = regions_.find(request.session_id);
+    const std::uint64_t session_id = request.session_id;
+    const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kNotFound;
     auto& region = *found->second;
     if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
@@ -656,7 +734,7 @@ class CpuService {
         static_cast<unsigned long long>(request.hbm_bytes));
     auto transport = std::make_unique<cpu_push::Transport>();
     const auto status = transport->Initialize(
-        region.resources->context(), region.registration.segment(), request, region.resources->tp_query(),
+        region.resources->context(), region.registration->segment(), request, region.resources->tp_query(),
         region.resources->jetty_import(), NextPsn(), response, region.base);
     if (!status.ok()) {
       Log("[KVAF_CPU] CPU_PUSH_OPEN_FAILED reason=%s\n", status.message().c_str());
@@ -844,7 +922,10 @@ class CpuService {
       if (!region->channels.back().Close()) return false;
       region->channels.pop_back();
     }
-    if (!region->registration.Close().ok()) return false;
+    if (region->registration) {
+      if (!region->shared_registration && !region->registration->Close().ok()) return false;
+      region->registration.reset();
+    }
     if (region->memory != nullptr) {
       if (!region->borrowed) free(region->memory);
       region->memory = nullptr;
@@ -863,6 +944,7 @@ class CpuService {
 
  private:
   UrmaResourcePool* resource_pool_ = nullptr;
+  std::shared_ptr<SharedUrmaMemory> shared_memory_;
   std::size_t gather_threads_{1U};
   std::size_t min_bytes_per_thread_{256U * 1024U};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
@@ -1049,8 +1131,24 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
 
 }  // namespace
 
+struct CpuUrmaMemoryPool::Impl {
+  std::shared_ptr<SharedUrmaMemory> memory;
+};
+CpuUrmaMemoryPool::CpuUrmaMemoryPool(const CpuRuntimeOptions& options, void* memory,
+    std::uint64_t bytes, std::uint64_t epoch, std::uint64_t allocation_request)
+    : impl_(std::make_unique<Impl>()) {
+  impl_->memory = std::make_shared<SharedUrmaMemory>(options, memory, bytes, epoch, allocation_request);
+}
+CpuUrmaMemoryPool::~CpuUrmaMemoryPool() { if (!Close().ok()) (void)impl_.release(); }
+Status CpuUrmaMemoryPool::Close() {
+  if (impl_->memory.use_count() != 1)
+    return Status::Busy("CPU URMA memory pool still has execution sessions");
+  return impl_->memory->Close();
+}
+
 struct UrmaCpuBackend::Impl {
   UrmaResourcePool resources;
+  std::shared_ptr<CpuUrmaMemoryPool> memory_pool;
   std::unique_ptr<CpuService> service;
 };
 
@@ -1058,7 +1156,8 @@ UrmaCpuBackend::UrmaCpuBackend() = default;
 
 UrmaCpuBackend::~UrmaCpuBackend() { if (!Shutdown().ok()) (void)impl_.release(); }
 
-Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& next_session) {
+Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& next_session,
+                                  std::shared_ptr<CpuUrmaMemoryPool> memory_pool) {
   if (impl_ != nullptr) return Status::InvalidState("CpuRuntime has already been initialized");
   if (options.has_eid_index && options.ub_device.empty()) {
     return Status::InvalidArgument("CpuRuntime eid_index requires ub_device");
@@ -1070,16 +1169,23 @@ Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& ne
       ? std::min<std::size_t>(detected == 0U ? 1U : detected, 32U)
       : options.gather_threads;
   auto impl = std::make_unique<Impl>();
-  if (!impl->resources.Initialize(options.ub_device, options.has_eid_index,
-                                  options.eid_index)) {
+  UrmaResourcePool* resources = &impl->resources;
+  std::shared_ptr<SharedUrmaMemory> shared_memory;
+  if (memory_pool) {
+    shared_memory = memory_pool->impl_->memory;
+    auto ready = shared_memory->Initialize(options);
+    if (!ready.ok()) return ready;
+    resources = &shared_memory->resources;
+    impl->memory_pool = std::move(memory_pool);
+  } else if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
   const std::size_t min_bytes_per_thread = options.gather_threads == 0U
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
-      &impl->resources, gather_threads, min_bytes_per_thread,
+      resources, gather_threads, min_bytes_per_thread,
       options.gather_mode,
-      options.memory_page_mode, !options.ub_device.empty(), next_session);
+      options.memory_page_mode, !options.ub_device.empty(), next_session, std::move(shared_memory));
   impl_ = std::move(impl);
   return Status::OK();
 }
@@ -1147,7 +1253,7 @@ Status UrmaCpuBackend::Shutdown() {
   if (!stopped.ok()) return stopped;
   if (!impl_->service->ReleaseAll())
     return Status::Internal("URMA resources still in use; retry close");
-  if (!impl_->resources.Shutdown())
+  if (!impl_->memory_pool && !impl_->resources.Shutdown())
     return Status::Internal("URMA contexts still in use; retry close");
   impl_.reset();
   return Status::OK();

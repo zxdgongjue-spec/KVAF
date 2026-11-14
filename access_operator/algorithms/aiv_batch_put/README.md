@@ -1,6 +1,6 @@
 # A5 AIV BatchPut V1
 
-This demo provides the synchronous eager Direct-HCCP BatchPut data plane used
+This algorithm module provides the synchronous eager Direct-HCCP BatchPut data plane used
 by KVAF Runtime. It does not call MetaManager and does not support graph mode.
 
 Runtime owns the transaction boundary:
@@ -142,7 +142,7 @@ are always printed, regardless of this setting.
 ## A5 eager test
 
 ```bash
-cd access_operator/demo/aiv_batch_put
+cd access_operator/algorithms/aiv_batch_put
 bash scripts/build.sh
 bash scripts/run_execute_batch_put.sh
 ```

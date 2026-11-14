@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -124,8 +125,8 @@ bool GetPeerTp(const DirectHccpApi& api, void* context,
   return GetPeerCtp(api, context, local_eid, peer_eid, role, tp);
 }
 
-bool LoadDirectHccp(DirectHccpApi* api) {
-  if (api == nullptr) return false;
+namespace {
+bool LoadDirectHccpUncached(DirectHccpApi* api) {
   for (const char* candidate : {"libra.so", "libra.so.0", "libhccp.so", "libhccp.so.0"}) {
     api->library = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
     if (api->library != nullptr) break;
@@ -161,13 +162,37 @@ bool LoadDirectHccp(DirectHccpApi* api) {
   std::fprintf(stderr, "[KVAF_AIV] DIRECT_HCCP_TRANSPORT_API_READY backend=RaCtx_no_HCOMM\n");
   return true;
 }
+}  // namespace
+
+bool LoadDirectHccp(DirectHccpApi* api) {
+  if (api == nullptr) return false;
+  struct Environment {
+    std::mutex mutex;
+    DirectHccpApi api;
+  };
+  // RA/HDC can retain service/TLS callbacks past Runtime teardown. Keep one
+  // successful loader reference and immutable symbol table for this process,
+  // including static destruction. The first successful search locks the
+  // provider; switching SDKs in a running process is deliberately unsupported.
+  // Contexts, memory registrations and queues still belong to each transport.
+  static auto* environment = new Environment;
+  std::lock_guard<std::mutex> lock(environment->mutex);
+  if (!environment->api.library) {
+    DirectHccpApi candidate;
+    if (!LoadDirectHccpUncached(&candidate)) {
+      *api = {};
+      return false;  // No partial table is published; a later call may retry.
+    }
+    environment->api = candidate;
+  }
+  *api = environment->api;
+  return true;
+}
 
 void CloseDirectHccp(DirectHccpApi* api) {
   if (api == nullptr) return;
-  // A successfully published transport shares the RA/HDC process bootstrap.
-  // Keep this DSO mapped until process exit: RA can retain service/TLS
-  // callbacks after an individual Runtime has torn down its queues.
-  // LoadDirectHccp still dlcloses an API handle that failed before publication.
+  // Drop this transport's borrowed table; the process environment owns the
+  // single successful loader reference. Failed loads close before publication.
   *api = {};
 }
 

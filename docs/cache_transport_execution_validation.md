@@ -64,7 +64,7 @@ build-npu/bin/kvaf_execute_batch_put_kernels.o
 
 Get 文件包含 URMA AIV 与 UBMEM Get 入口，Put 文件同理；本脚本使用标准合并产物，
 不需要额外生成 UBMEM 专用 `.o`。版本入口为 AIV Get V3、Put V2 和
-`KvafAicpuUmdkControlSessionsV4`、`KvafAicpuGatherReadExecutionV3` 和
+`KvafAicpuUmdkControlSessionsV5`、`KvafAicpuGatherReadExecutionV3` 和
 `KvafAicpuCpuPushScatterExecutionV3`。Get 的设备 ticket ABI 与 main 的 V2 不同，
 两端和 AICPU 包需一起更新。CPU 服务沿用 main 的线程调度，已移除 `--gather-affinity`；
 对比性能时两边显式使用相同的 `--gather-threads` 和 `--gather-mode`。
@@ -558,7 +558,7 @@ Gather/Scatter 使用原单点负载；`PYTHONPATH` 指向同一次构建。Scat
 ```bash
 PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
 KVAF_GET_DISPATCH_TRACE="$PWD/scatter-dispatch.csv" \
-python3 access_operator/demo/aicpu_batch_get/python/benchmark_cpu_push_scatter.py \
+python3 access_operator/algorithms/aicpu_batch_get/python/benchmark_cpu_push_scatter.py \
   --execution-mode per-call --peer 127.0.0.1:38999 --device-id 6 \
   --workers 5 --token-bytes 656 --miss-count 8192 --warmup 10 --iterations 100
 python3 tests/python/summarize_get_dispatch_trace.py scatter-dispatch.csv --last 100
@@ -657,7 +657,8 @@ PYTHONPATH="$PWD/tests/python" python3 -m unittest \
 
 地址转换契约和设备数据 kernel 保持现有版本。未删掉流同步、状态收集和错误判断。
 AICPU 只新增控制操作 `kUnregisterBuffer`，用来单独释放输出注册；不再为一个普通
-Get 的结束连带注销 workspace。对应入口升级到 `KvafAicpuUmdkControlSessionsV4`。
+Get 的结束连带注销 workspace。当前入口为 `KvafAicpuUmdkControlSessionsV5`，
+同时支持按 Put/Gather 创建不同队列布局；V4 仅保留旧布局兼容入口。
 
 ### 8.1 调用方式和约束
 
@@ -730,7 +731,7 @@ bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
   --report "$PWD/validation-output-reuse.json"
 ```
 
-更新 NPU binding 和已安装 AICPU 包后使用新客户端进程，不能搭配旧 V3 控制包。
+更新 NPU binding 和已安装 AICPU 包后使用新客户端进程，不能搭配旧 V4 及更早的控制包。
 CPU 服务无需为本轮改动重新编译或重启。
 
 原全量入口的 `resources` 组已包含 `output-binding`、`output-rebind`、`output-shutdown`：
@@ -949,3 +950,15 @@ Put 调度层在同步 Launch 期间借用本次请求及目标地址描述，�
 稳态不再反复执行 MR 注册及注销；AICPU legacy 也不应每次出现约数百微秒的注册和
 `acknowledge` 注销成本。对照 `KVAF_PERF_REUSE_PUT_INPUT=0` 的普通调用，确认复用来自
 显式绑定，并未取消临时输入的生命周期清理。调用成功、吞吐及错误恢复仍需真机验证。
+
+
+## 10. 驻留实例、四种 Get 图模式及共享资源
+
+当前演进与接口边界见 [Get 图模式演进](get_graph_evolution.md)。四种 Get 的 `graph`
+案例均纳入原全量命令，且始终限制一个图租约、一个 Get 节点。`resources` 新增两个
+算法输出绑定同时驻留、交替使用和释放空闲绑定时保持另一在途请求 pin 的验证。
+
+CPU 的兼容 context/DDR 注册按 allocation 共享，执行队列独立；AICPU 的库/API 环境
+共享，Put 只建一条控制队列，Gather 保持 N control / N data。控制包需升级 V5。
+生产算子迁到 `access_operator/algorithms`，仓库根目录 `tests/run_*.sh` 入口不变。
+必须重新配置构建两端、安装新包并使用新进程后，再执行原全量功能与相同参数的性能对照。

@@ -374,7 +374,8 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   status = {};
   status.magic = kGatherStatusMagic;
   status.sequence = args.sequence;
-  if (args.worker_count != session->state.worker_count ||
+  if (session->state.queue_profile != UmdkQueueProfile::Gather ||
+      args.worker_count != session->state.worker_count ||
       args.context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
       args.context.session != session->state.session || args.sgl_size == 0 || args.sq_batch_wqes == 0) {
     status.result = kGatherTransportFailed;

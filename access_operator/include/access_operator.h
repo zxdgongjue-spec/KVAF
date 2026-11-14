@@ -150,7 +150,7 @@ class AccessOperator {
 // 不绑定 ACL stream；每次 BatchGet 都通过 request.execution 接收调用方 stream。
 struct AccessOperatorConfig {
   // BatchGet remains available whenever this kernel is configured. BatchPut
-  // uses a separate AIV binary and transport because the two current demos do
+  // uses a separate AIV binary and transport because the two current algorithms do
   // not establish a shared Direct-HCCP ABI.
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;

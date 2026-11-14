@@ -7,9 +7,13 @@
 
 using namespace kvaf::aicpu_urma;
 using namespace kvaf::aicpu_urma::detail;
-extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControl(
-    UmdkControlArgs* args) {
+static std::uint32_t DispatchControl(UmdkControlArgs* args, bool queue_profiles) {
   if (!args || !args->status) return 1;
+
+  // Legacy hosts sent unspecified padding at this offset. Only the V5 entry
+  // interprets it; their existing per-worker queue layout stays unchanged.
+  if (args->op == UmdkControlOp::kPrepare && !queue_profiles)
+    args->queue_profile = UmdkQueueProfile::Gather;
 
   auto& status = *reinterpret_cast<UmdkControlStatus*>(args->status);
   status = {};
@@ -26,7 +30,8 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
   if (args->op == UmdkControlOp::kPrepare) {
     if (!args->worker_count || args->worker_count > 8 || !args->local_buffer ||
         !args->buffer_bytes || args->local_buffer > UINT64_MAX - args->buffer_bytes ||
-        args->library[255]) {
+        args->library[255] || (args->queue_profile != UmdkQueueProfile::Gather &&
+                              args->queue_profile != UmdkQueueProfile::Put)) {
       Fail(status, "invalid UMDK session arguments");
       CurrentState().session = 0;
       status.session = 0;
@@ -71,6 +76,11 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
   return 0;
 }
 
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControl(
+    UmdkControlArgs* args) {
+  return DispatchControl(args, false);
+}
+
 // Explicit entry capability: old packages lack independent sessions and
 // completion-scoped buffer unregistration. Host preflight requires this name.
 extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV3(
@@ -81,4 +91,9 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkCon
 extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV4(
     UmdkControlArgs* args) {
   return KvafAicpuUmdkControl(args);
+}
+// V5 explicitly selects Gather N-control/N-data or Put one-control/no-data.
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuUmdkControlSessionsV5(
+    UmdkControlArgs* args) {
+  return DispatchControl(args, true);
 }

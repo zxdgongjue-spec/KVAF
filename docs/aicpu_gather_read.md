@@ -161,7 +161,7 @@ CPU 服务启动后，在仓库根目录运行：
 
 ```bash
 export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
+python3 access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
   --modes gather_read --workers 1 2 4 5 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
@@ -228,7 +228,7 @@ Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳�
 ```
 
 Shell 脚本循环调用
-[benchmark_gather_read.py](../access_operator/demo/aicpu_batch_get/python/benchmark_gather_read.py)，
+[benchmark_gather_read.py](../access_operator/algorithms/aicpu_batch_get/python/benchmark_gather_read.py)，
 通过 `NpuRuntime.batch_get` 测量。
 默认扫描 252 组：
 
@@ -385,9 +385,9 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 | 目录/文件 | 职责 |
 | --- | --- |
 | `access_operator/src/aicpu_access_operator.cc` | Runtime 适配、Get/Put 共享会话和跨操作同步 |
-| `access_operator/demo/aicpu_batch_get/host/` | BatchGet workspace、参数和 kernel 提交 |
-| `access_operator/demo/aicpu_batch_get/kernel/gather_read.cc` | 当前流水算法、READ WR/SGL 组装和调度 |
-| `access_operator/demo/aicpu_batch_put/` | 原有同步 BatchPut 的 Host/设备实现 |
+| `access_operator/algorithms/aicpu_batch_get/host/` | BatchGet workspace、参数和 kernel 提交 |
+| `access_operator/algorithms/aicpu_batch_get/kernel/gather_read.cc` | 当前流水算法、READ WR/SGL 组装和调度 |
+| `access_operator/algorithms/aicpu_batch_put/` | 原有同步 BatchPut 的 Host/设备实现 |
 | `access_operator/include/aicpu_urma/` | Host 会话、算子加载、Host/设备控制 ABI、设备通信接口和缓存工具 |
 | `access_operator/src/aicpu_urma/host/` | Host 侧会话组织和 kernel 加载 |
 | `access_operator/src/aicpu_urma/kernel/session.cc` | AICPU 加载 liburma、创建/连接队列、注册内存和资源释放 |
@@ -397,5 +397,5 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 
 BatchGet 还提供 `cpu_push_scatter` 入口，通过 `aicpu_batch_get_mode` 在 Runtime 构造时选择；
 两条路径使用相同的输入前缀和输出地址语义。
-两个 demo 均按 `include/host/kernel` 分层，共用一个设备包。Gather 与 Put 共用 UMDK
+两个算法模块均按 `include/host/kernel` 分层，共用一个设备包。Gather 与 Put 共用 UMDK
 会话；Scatter Get 使用独立的 Host HCCP 通道，配套 Put 仍使用 UMDK，会话生命周期分别管理。

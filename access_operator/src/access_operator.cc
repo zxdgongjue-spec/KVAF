@@ -467,7 +467,7 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
     }
     LogBatchGetDeviceStatus(view.workspace, view.options.npu_core_count);
   } else {
-    // The demo transport caches zero-reference registrations until shutdown.
+    // The transport caches zero-reference registrations until shutdown.
     // Releasing after an externally captured launch keeps KVAF graph-agnostic;
     // the caller owns stream completion and tensor lifetime.
     KvafBatchGetLocalBufferRelease(local_buffer);

@@ -11,7 +11,7 @@
 // The Ascend metadata section is not a native Mach-O/ELF section. All device
 // code otherwise comes directly from the production source, without a copy.
 #define __attribute__(...)
-#include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
+#include "../access_operator/algorithms/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
 #undef __attribute__
 
 #define CHECK(condition) do { if (!(condition)) { \

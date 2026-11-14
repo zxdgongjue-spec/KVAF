@@ -52,7 +52,7 @@ Status UmdkSession::Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream
     pending_ = stream;
   }
   const auto launch = launch_kernel ? launch_kernel(&args_, stream)
-                                    : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV4", &args_,
+                                    : LaunchUmdkKernel("KvafAicpuUmdkControlSessionsV5", &args_,
                                                        sizeof(args_), stream);
   if (launch != 0) {
     failed_ = true;
@@ -143,6 +143,7 @@ Status UmdkSession::ReleaseBuffer(void* buffer, std::size_t bytes) {
 Status UmdkSession::Load() {
   if (!config_.peer_link || config_.kernel_json.empty() || !config_.workers ||
       config_.workers > 8U ||
+      (config_.queue_profile != UmdkQueueProfile::Gather && config_.queue_profile != UmdkQueueProfile::Put) ||
       std::all_of(config_.local_eid.begin(), config_.local_eid.end(), [](auto b) { return b == 0; }) ||
       !PrepareUmdkKernel(config_.kernel_json, false).ok())
     return Status::InvalidArgument("UMDK requires PeerLink, kernel JSON, Host-selected EID and 1..8 workers");
@@ -189,6 +190,7 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   args_.local_buffer = reinterpret_cast<std::uint64_t>(output);
   args_.buffer_bytes = output_bytes;
   args_.worker_count = workers;
+  args_.queue_profile = config_.queue_profile;
   args_.token = region.token_value;
   args_.remote_address = region_base;
   std::copy(region.eid.begin(), region.eid.end(), args_.route_eid);
@@ -202,12 +204,15 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     return Status::Internal("invalid UMDK peer descriptor");
   args_.segment_bytes = region.segment_key_bytes;
   std::copy_n(region.segment_key.begin(), args_.segment_bytes, args_.segment);
-  for (std::uint32_t queue = 0; queue < workers * 2U; ++queue) {
-    const bool control = queue < workers;
-    const auto index = control ? kUmdkControlQueueIndex + queue : queue - workers;
+  const auto controls = UmdkControlQueueCount(config_.queue_profile, workers);
+  const auto data = UmdkDataQueueCount(config_.queue_profile, workers);
+  const auto prepared_index = data ? 0U : kUmdkControlQueueIndex;
+  for (std::uint32_t queue = 0; queue < controls + data; ++queue) {
+    const bool control = queue < controls;
+    const auto index = control ? kUmdkControlQueueIndex + queue : queue - controls;
     args_.worker_index = index;
     auto descriptor = prepared;
-    if (index != 0) {
+    if (index != prepared_index) {
       result = Run(UmdkControlOp::kQueryWorker, descriptor);
       if (!result.ok()) return result;
     }

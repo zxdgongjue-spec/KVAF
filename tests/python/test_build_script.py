@@ -45,7 +45,7 @@ else:
         artifacts = build / "access_operator/src/aicpu_urma"
         artifacts.mkdir(parents=True, exist_ok=True)
         entries = {name: {} for name in (
-            "KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV4")}
+            "KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV5")}
         if options["KVAF_ENABLE_AICPU_CPU_PUSH"] == "ON" and not os.environ.get("KVAF_TEST_OMIT_SCATTER"):
             entries["KvafAicpuCpuPushScatterExecutionV3"] = {}
         (artifacts / "kernel.json").write_text(json.dumps(entries))

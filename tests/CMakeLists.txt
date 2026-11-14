@@ -1,6 +1,12 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_package(Threads REQUIRED)
+add_executable(kvaf_direct_hccp_environment_test direct_hccp_environment_test.cc)
+target_include_directories(kvaf_direct_hccp_environment_test PRIVATE aicpu_loader_stub
+  ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/runtime/include)
+target_link_libraries(kvaf_direct_hccp_environment_test PRIVATE kvaf_common Threads::Threads)
+add_test(NAME kvaf_direct_hccp_environment_test COMMAND kvaf_direct_hccp_environment_test)
+set_tests_properties(kvaf_direct_hccp_environment_test PROPERTIES TIMEOUT 20)
 add_executable(kvaf_execution_view_binding_test execution_view_binding_test.cc)
 target_link_libraries(kvaf_execution_view_binding_test PRIVATE kvaf_access_operator Threads::Threads)
 add_test(NAME kvaf_execution_view_binding_test COMMAND kvaf_execution_view_binding_test)
@@ -58,18 +64,18 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
 endif()
 
 add_executable(kvaf_cpu_push_scatter_test cpu_push_scatter_test.cc
-  ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/cpu_push_scatter.cc)
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_get/kernel/cpu_push_scatter.cc)
 target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/access_operator/include)
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms ${PROJECT_SOURCE_DIR}/access_operator/include)
 target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
 add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
 add_test(NAME kvaf_cpu_push_request_shape_test COMMAND kvaf_cpu_push_scatter_test --request-shape)
 set_tests_properties(kvaf_cpu_push_scatter_test kvaf_cpu_push_request_shape_test PROPERTIES TIMEOUT 180)
 
 add_executable(kvaf_cpu_push_shutdown_test cpu_push_shutdown_test.cc
-  ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/host/cpu_push_host.cc)
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_get/host/cpu_push_host.cc)
 target_include_directories(kvaf_cpu_push_shutdown_test PRIVATE cpu_push_host_stub
-  ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/access_operator/demo
+  ${PROJECT_SOURCE_DIR}/access_operator/include ${PROJECT_SOURCE_DIR}/access_operator/algorithms
   ${PROJECT_SOURCE_DIR}/access_operator/src ${PROJECT_SOURCE_DIR}/runtime/include)
 target_link_libraries(kvaf_cpu_push_shutdown_test PRIVATE kvaf_common)
 add_test(NAME kvaf_cpu_push_shutdown_test COMMAND kvaf_cpu_push_shutdown_test)
@@ -80,17 +86,17 @@ add_test(NAME kvaf_dsa_keys_python
 
 add_executable(kvaf_batch_get_schedule_test batch_get_schedule_test.cc)
 target_include_directories(kvaf_batch_get_schedule_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aiv_batch_get/include)
 add_test(NAME kvaf_batch_get_schedule_test COMMAND kvaf_batch_get_schedule_test)
 add_executable(kvaf_batch_get_kernel_model_test batch_get_kernel_model_test.cc)
 target_include_directories(kvaf_batch_get_kernel_model_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
-  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aiv_batch_get/include)
 add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_model_test)
 add_executable(kvaf_batch_put_kernel_model_test batch_put_kernel_model_test.cc)
 target_include_directories(kvaf_batch_put_kernel_model_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aiv_model
-  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include)
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aiv_batch_put/include)
 add_test(NAME kvaf_batch_put_kernel_model_test COMMAND kvaf_batch_put_kernel_model_test)
 set_tests_properties(kvaf_batch_put_kernel_model_test PROPERTIES TIMEOUT 10)
 add_test(NAME kvaf_batch_get_inflight_config_python
@@ -190,6 +196,48 @@ endif()
 # Optional host-only validation against real/stub URMA headers; no liburma or NPU.
 set(KVAF_TEST_URMA_INCLUDE_DIR "" CACHE PATH "URMA headers for host session registry tests")
 if(KVAF_TEST_URMA_INCLUDE_DIR)
+  add_executable(kvaf_aicpu_environment_test aicpu_environment_test.cc)
+  target_include_directories(kvaf_aicpu_environment_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel
+    ${PROJECT_SOURCE_DIR}/access_operator/include ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_aicpu_environment_test PRIVATE kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME kvaf_aicpu_environment_test COMMAND kvaf_aicpu_environment_test)
+  set_tests_properties(kvaf_aicpu_environment_test PROPERTIES TIMEOUT 20)
+  add_executable(kvaf_aicpu_queue_profile_test aicpu_queue_profile_test.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/session.cc
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/control_kernel.cc)
+  target_include_directories(kvaf_aicpu_queue_profile_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel
+    ${PROJECT_SOURCE_DIR}/access_operator/include ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_aicpu_queue_profile_test PRIVATE kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME kvaf_aicpu_queue_profile_test COMMAND kvaf_aicpu_queue_profile_test)
+  set_tests_properties(kvaf_aicpu_queue_profile_test PROPERTIES TIMEOUT 20)
+  add_executable(kvaf_cpu_shared_registration_test cpu_shared_registration_test.cc)
+  target_include_directories(kvaf_cpu_shared_registration_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/runtime/src ${PROJECT_SOURCE_DIR}/access_operator/include
+    ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_cpu_shared_registration_test PRIVATE kvaf_common Threads::Threads)
+  add_test(NAME kvaf_cpu_shared_registration_test COMMAND kvaf_cpu_shared_registration_test)
+  set_tests_properties(kvaf_cpu_shared_registration_test PROPERTIES TIMEOUT 20)
+  add_executable(kvaf_cpu_shared_memory_backend_test cpu_shared_memory_backend_test.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/urma_cpu_backend.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/cpu_urma_discovery.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/cpu_push_get_transport.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/cpu_push_get_worker.cc
+    ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)
+  target_include_directories(kvaf_cpu_shared_memory_backend_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/runtime/src ${PROJECT_SOURCE_DIR}/runtime/include
+    ${PROJECT_SOURCE_DIR}/meta_manager/include ${PROJECT_SOURCE_DIR}/access_operator/include
+    ${KVAF_TEST_URMA_INCLUDE_DIR})
+  target_link_libraries(kvaf_cpu_shared_memory_backend_test PRIVATE
+    kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
+  # The production backend resolves its expanded CTP symbols through dlsym.
+  set_target_properties(kvaf_cpu_shared_memory_backend_test PROPERTIES ENABLE_EXPORTS ON)
+  if(APPLE)
+    target_compile_definitions(kvaf_cpu_shared_memory_backend_test PRIVATE MADV_HUGEPAGE=14)
+  endif()
+  add_test(NAME kvaf_cpu_shared_memory_backend_test COMMAND kvaf_cpu_shared_memory_backend_test)
+  set_tests_properties(kvaf_cpu_shared_memory_backend_test PROPERTIES TIMEOUT 20)
   add_executable(kvaf_cpu_ddr_registration_test cpu_ddr_registration_test.cc)
   target_include_directories(kvaf_cpu_ddr_registration_test PRIVATE
     ${PROJECT_SOURCE_DIR}/runtime/src ${PROJECT_SOURCE_DIR}/access_operator/include
@@ -209,11 +257,11 @@ if(KVAF_TEST_URMA_INCLUDE_DIR)
   add_executable(kvaf_aicpu_gather_execution_test aicpu_gather_execution_test.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/control_kernel.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel/transfer.cc
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel/gather_read.cc)
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_get/kernel/gather_read.cc)
   target_include_directories(kvaf_aicpu_gather_execution_test PRIVATE
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/kernel
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/kernel
-    ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/runtime/include
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_get/kernel
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms ${PROJECT_SOURCE_DIR}/runtime/include
     ${PROJECT_SOURCE_DIR}/access_operator/include ${KVAF_TEST_URMA_INCLUDE_DIR})
   target_link_libraries(kvaf_aicpu_gather_execution_test PRIVATE kvaf_common Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME kvaf_aicpu_gather_execution_test COMMAND kvaf_aicpu_gather_execution_test)
@@ -234,7 +282,7 @@ if(KVAF_TEST_ACL_INCLUDE_DIR)
     add_executable(kvaf_aiv_${direction}_transport_close_test aiv_transport_close_test.cc)
     target_include_directories(kvaf_aiv_${direction}_transport_close_test PRIVATE
       ${KVAF_TEST_ACL_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/access_operator/include
-      ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_${direction}/include)
+      ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aiv_batch_${direction}/include)
     target_link_libraries(kvaf_aiv_${direction}_transport_close_test PRIVATE kvaf_common Threads::Threads)
     add_test(NAME kvaf_aiv_${direction}_transport_close_test COMMAND kvaf_aiv_${direction}_transport_close_test)
     set_tests_properties(kvaf_aiv_${direction}_transport_close_test PROPERTIES TIMEOUT 20)
@@ -244,15 +292,15 @@ if(KVAF_TEST_ACL_INCLUDE_DIR)
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_access_operator.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_execution_resources.cc
     ${PROJECT_SOURCE_DIR}/access_operator/src/aicpu_urma/host/session.cc
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_put/host/batch_put_host.cc)
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_put/host/batch_put_host.cc)
   target_include_directories(kvaf_aicpu_put_resolution_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
-    ${PROJECT_SOURCE_DIR}/access_operator/demo)
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms)
   add_test(NAME kvaf_aicpu_put_resolution_test COMMAND kvaf_aicpu_put_resolution_test)
   set_tests_properties(kvaf_aicpu_put_resolution_test PROPERTIES TIMEOUT 20)
   add_executable(kvaf_aicpu_gather_resources_test aicpu_gather_resources_test.cc
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aicpu_batch_get/host/batch_get_host.cc)
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aicpu_batch_get/host/batch_get_host.cc)
   target_include_directories(kvaf_aicpu_gather_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
-    ${PROJECT_SOURCE_DIR}/access_operator/demo ${PROJECT_SOURCE_DIR}/access_operator/src)
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms ${PROJECT_SOURCE_DIR}/access_operator/src)
   add_test(NAME kvaf_aicpu_gather_resources_test COMMAND kvaf_aicpu_gather_resources_test)
   set_tests_properties(kvaf_aicpu_gather_resources_test PROPERTIES TIMEOUT 20)
   add_executable(kvaf_ubmem_provider_resources_test ubmem_provider_resources_test.cc
@@ -282,8 +330,8 @@ if(KVAF_TEST_ACL_INCLUDE_DIR)
     ${PROJECT_SOURCE_DIR}/access_operator/src/aiv_execution_resources.cc)
   target_compile_definitions(kvaf_aiv_provider_resources_test PRIVATE KVAF_ENABLE_AIV_BATCH_PUT=1)
   target_include_directories(kvaf_aiv_provider_resources_test PRIVATE ${KVAF_TEST_ACL_INCLUDE_DIR}
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
-    ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_put/include)
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aiv_batch_get/include
+    ${PROJECT_SOURCE_DIR}/access_operator/algorithms/aiv_batch_put/include)
   foreach(provider_test kvaf_aicpu_put_resolution_test kvaf_aicpu_gather_resources_test kvaf_ubmem_provider_resources_test
                         kvaf_aiv_provider_resources_test)
     target_include_directories(${provider_test} PRIVATE

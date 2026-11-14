@@ -10,7 +10,7 @@
   std::cerr << "line " << __LINE__ << ": " #condition "\n"; std::exit(1); \
 } } while (false)
 
-std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV4", "KvafAicpuBatchPut",
+std::set<std::string> entries{"KvafAicpuUmdkControlSessionsV5", "KvafAicpuBatchPut",
                               "KvafAicpuGatherReadExecutionV3"};
 unsigned loads = 0, lookups = 0, launches = 0;
 int handle;
@@ -41,12 +41,12 @@ int main() {
   int fd = mkstemp(path);
   CHECK(fd >= 0);
   close(fd);
-  entries.erase("KvafAicpuUmdkControlSessionsV4");
+  entries.erase("KvafAicpuUmdkControlSessionsV5");
   entries.insert("KvafAicpuUmdkControlSessionsV3");
   auto old = PrepareUmdkKernel(path, false);
-  CHECK(!old.ok() && old.message().find("SessionsV4") != std::string::npos);
+  CHECK(!old.ok() && old.message().find("SessionsV5") != std::string::npos);
   CHECK(launches == 0);
-  entries.insert("KvafAicpuUmdkControlSessionsV4");
+  entries.insert("KvafAicpuUmdkControlSessionsV5");
   CHECK(PrepareUmdkKernel(path, false).ok());
   CHECK(loads == 1 && launches == 0);
   auto status = PrepareUmdkKernel(path, true);

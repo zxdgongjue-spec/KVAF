@@ -2,9 +2,9 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-demo_dir=$(cd "${script_dir}/.." && pwd)
-build_dir=${BUILD_DIR:-"${demo_dir}/build"}
-result_dir=${RESULT_DIR:-"${demo_dir}/results/execute_batch_put_$(date +%Y%m%d_%H%M%S)"}
+algorithm_dir=$(cd "${script_dir}/.." && pwd)
+build_dir=${BUILD_DIR:-"${algorithm_dir}/build"}
+result_dir=${RESULT_DIR:-"${algorithm_dir}/results/execute_batch_put_$(date +%Y%m%d_%H%M%S)"}
 timeout_seconds=${TIMEOUT_SECONDS:-180}
 toolkit=${ASCEND_CANN_PACKAGE_PATH:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}
 
@@ -24,7 +24,7 @@ kernel=${KERNEL_OBJECT:-"${build_dir}/bin/kvaf_execute_batch_put_kernels.o"}
 test_binary="${build_dir}/bin/kvaf_execute_batch_put_test"
 
 if [[ ! -x "${test_binary}" || ! -f "${kernel}" ||
-      -n "$(find "${demo_dir}" \( -path "${demo_dir}/build*" -o -path "${demo_dir}/results" \) -prune -o \
+      -n "$(find "${algorithm_dir}" \( -path "${algorithm_dir}/build*" -o -path "${algorithm_dir}/results" \) -prune -o \
             -type f -newer "${test_binary}" -print -quit)" ]]; then
   echo "[EXECUTE_BATCH_PUT] build artifact missing_or_stale; running scripts/build.sh" | tee "${log_file}"
   BUILD_DIR="${build_dir}" bash "${script_dir}/build.sh" 2>&1 | tee -a "${log_file}"

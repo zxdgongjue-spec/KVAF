@@ -3,7 +3,7 @@ set(KVAF_URMA_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_aiv.asc")
 set(KVAF_EXECUTE_KERNEL_TMP "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get.tmp.o")
 set(KVAF_EXECUTE_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/kvaf_execute_batch_get_kernels.o")
 include("${CMAKE_CURRENT_LIST_DIR}/../../../cmake/aiv_toolchain.cmake")
-list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_DEMO_INCLUDE_DIR}")
+list(APPEND KVAF_KERNEL_INCLUDES "-I${KVAF_AIV_ALGORITHM_INCLUDE_DIR}")
 
 set(KVAF_UBMEM_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_ubmem.asc")
 set(KVAF_OPERATOR_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/../../../include")
@@ -17,12 +17,12 @@ add_custom_command(
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_URMA_SOURCE}" "${KVAF_UBMEM_SOURCE}"
           "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
-          "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"
+          "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_abi.h"
+          "${KVAF_AIV_ALGORITHM_INCLUDE_DIR}/batch_get_schedule.h"
           "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
   VERBATIM)
 add_custom_target(kvaf_execute_batch_get_kernel ALL DEPENDS "${KVAF_EXECUTE_KERNEL_OBJECT}")
 add_custom_command(TARGET kvaf_execute_batch_get_kernel POST_BUILD
-  COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_DEMO_BIN_DIR}"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_ALGORITHM_BIN_DIR}"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${KVAF_EXECUTE_KERNEL_OBJECT}"
-          "${KVAF_AIV_DEMO_BIN_DIR}/kvaf_execute_batch_get_kernels.o")
+          "${KVAF_AIV_ALGORITHM_BIN_DIR}/kvaf_execute_batch_get_kernels.o")

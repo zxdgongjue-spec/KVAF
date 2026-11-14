@@ -13,6 +13,7 @@
 namespace {
 using namespace kvaf::aicpu_urma;
 int single_unregisters = 0;
+int channels = 0;
 int writes = 0, unregisters = 0, allocations = 0, registrations = 0, destroys = 0, frees = 0;
 bool fail_wait = false, fail_copy = false, write_error = false, capturing = false;
 bool fail_launch = false, fail_memset = false, fail_wait_on_write = false, fail_wait_on_prepare = false;
@@ -46,6 +47,7 @@ Status PeerLink::LookupRegion(uint64_t, PeerRegion* region) const {
 Status PeerLink::CreateChannel(uint64_t, const uint8_t*, uint32_t, const uint8_t*, uint32_t,
     uint64_t, uint32_t, std::array<uint8_t, kQpKeyBytes>*, uint32_t* bytes,
     uint64_t* tp, uint32_t* psn, bool) {
+  ++channels;
   *bytes = 28; *tp = 1; *psn = 1; return Status::OK();
 }
 }
@@ -130,6 +132,7 @@ int main() {
   UmdkSessionConfig config;
   config.peer_link = std::make_shared<PeerLink>("fake:0");
   config.kernel_json = "fake.json"; config.workers = 2; config.local_eid[0] = 1;
+  config.queue_profile = UmdkQueueProfile::Put;
   {
     UmdkSession partial(config);
     uint8_t setup[64]{};
@@ -142,6 +145,7 @@ int main() {
     CHECK(partial.Shutdown().ok()); // Recover ownership, then destroy the partial session.
     CHECK(partial.EnsureSession(0x100000, setup, sizeof(setup)).ok());
     CHECK(registrations == partial_regs + 1);
+    CHECK(channels == 1); // Put creates only its single control connection.
     CHECK(partial.Shutdown().ok());
   }
   UmdkSession session(config);
@@ -389,8 +393,10 @@ int main() {
   auto gather_state = gather.CreateExecutionState();
   CHECK(gather.BindExecutionState(gather_state.get()).ok());
   const auto base_regs = registrations, base_unregs = single_unregisters, base_all = unregisters;
+  const auto base_channels = channels;
   GetOutputOptions binding{{input, sizeof(input), DeviceKind::kNpu}, call.execution.stream, 3};
   CHECK(gather.PrepareGetOutput(binding).ok());
+  CHECK(channels == base_channels + 2 * provider.workers); // Gather retains N control + N data.
   CHECK(registrations == base_regs + 2); // Workspace and output, once each.
   BatchGetRequest r; r.output = binding.output;
   BatchGetExecRequest g; g.request = &r; g.execution.stream = call.execution.stream;

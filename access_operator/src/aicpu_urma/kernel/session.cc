@@ -11,17 +11,19 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <limits.h>
+#include <cstdlib>
 #include <unordered_map>
 
 namespace kvaf::aicpu_urma::detail {
 
 thread_local ExecutionSession* active_session = nullptr;
 namespace {
-std::mutex registry_mutex, init_mutex;
+std::mutex registry_mutex, environment_mutex;
 std::uint64_t generation = 0;
 std::unordered_map<std::uint64_t, std::shared_ptr<ExecutionSession>> sessions;
-std::size_t init_references = 0;
-bool owns_provider_init = false;
+std::unordered_map<std::string, std::weak_ptr<ApiEnvironment>> environments;
+std::unordered_map<void*, std::weak_ptr<ApiEnvironment>> loaded_environments;
 }  // namespace
 std::shared_ptr<ExecutionSession> CreateSession() {
   std::lock_guard<std::mutex> lock(registry_mutex);
@@ -46,9 +48,11 @@ Queue& DataQueue(std::uint32_t index) {
 }
 
 Queue* FindQueue(std::uint32_t index) {
-  if (index < CurrentState().worker_count) return &DataQueue(index);
-  if (index >= kUmdkControlQueueIndex && index < kUmdkControlQueueIndex + CurrentState().worker_count)
-    return &CurrentState().control_queues[index - kUmdkControlQueueIndex];
+  auto& state = CurrentState();
+  if (index < UmdkDataQueueCount(state.queue_profile, state.worker_count)) return &DataQueue(index);
+  if (index >= kUmdkControlQueueIndex &&
+      index < kUmdkControlQueueIndex + UmdkControlQueueCount(state.queue_profile, state.worker_count))
+    return &state.control_queues[index - kUmdkControlQueueIndex];
   return nullptr;
 }
 
@@ -127,10 +131,44 @@ bool UnregisterBuffer(const UmdkControlArgs& args, UmdkControlStatus& status) {
   return Fail(status, "buffer registration was not found");
 }
 
+bool ReleaseApiEnvironment(UmdkControlStatus& status) {
+  auto& reference = CurrentState().environment;
+  if (!reference) return true;
+  const auto environment = reference;
+  std::lock_guard<std::mutex> lock(environment->mutex);
+  if (environment->references > 1) {
+    --environment->references;
+    reference.reset();
+    return true;
+  }
+  // Failed final retirement remains attached to this session. Other sessions
+  // cannot acquire a half-uninitialized provider while cleanup is retried.
+  environment->retiring = true;
+  if (environment->initialized && environment->owns_init) {
+    const int result = environment->api.urma_uninit();
+    if (result != 0) return Fail(status, "urma_uninit", result);
+    environment->owns_init = false;
+  }
+  environment->initialized = false;
+  if (environment->library) {
+    if (dlclose(environment->library)) return Fail(status, "dlclose liburma", -1, dlerror());
+    environment->library = nullptr;
+  }
+  if (environment->common_library) {
+    if (dlclose(environment->common_library)) return Fail(status, "dlclose liburma_common", -1, dlerror());
+    environment->common_library = nullptr;
+  }
+  environment->references = 0;
+  reference.reset();
+  return true;
+}
+
 bool Cleanup(UmdkControlStatus& status) {
-  for (std::uint32_t index = 0; index < CurrentState().worker_count; ++index)
+  const auto profile = CurrentState().queue_profile;
+  const auto workers = CurrentState().worker_count;
+  for (std::uint32_t index = 0; index < UmdkDataQueueCount(profile, workers); ++index)
     if (!CleanupQueue(CurrentState().data_queues[index], status)) return false;
-  for (std::uint32_t index = 0; index < CurrentState().worker_count; ++index)
+  for (std::uint32_t index = 0; index < UmdkControlQueueCount(profile, workers); ++index)
     if (!CleanupQueue(CurrentState().control_queues[index], status)) return false;
 #define KVAF_RELEASE(member, function)                       \
   if (CurrentState().member != nullptr) {                             \
@@ -155,18 +193,7 @@ bool Cleanup(UmdkControlStatus& status) {
   KVAF_RELEASE(token, urma_free_token_id)
   KVAF_RELEASE(context, urma_delete_context)
 #undef KVAF_RELEASE
-  if (CurrentState().owns_init) {
-    std::lock_guard<std::mutex> lock(init_mutex);
-    if (init_references == 1 && owns_provider_init) {
-      const int result = CurrentState().api.urma_uninit();
-      if (result != 0) return Fail(status, "urma_uninit", result);
-      owns_provider_init = false;
-    }
-    --init_references;
-    CurrentState().owns_init = false;
-  }
-  if (CurrentState().library != nullptr) dlclose(CurrentState().library);
-  if (CurrentState().common_library != nullptr) dlclose(CurrentState().common_library);
+  if (!ReleaseApiEnvironment(status)) return false;
   CurrentState() = {};
   return true;
 }
@@ -198,13 +225,13 @@ std::string ResidentUrmaPath() {
   return path;
 }
 
-bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
+bool OpenApiLibraries(const UmdkControlArgs& args, UmdkControlStatus& status, ApiEnvironment& environment) {
   Stage(status, "dlopen liburma (inside AICPU)");
   const auto resident = args.library[0] == '\0' ? ResidentUrmaPath() : std::string{};
   if (args.library[0] != '\0') {
-    CurrentState().library = dlopen(args.library, RTLD_NOW | RTLD_GLOBAL);
+    environment.library = dlopen(args.library, RTLD_NOW | RTLD_GLOBAL);
   } else if (!resident.empty()) {
-    CurrentState().library = dlopen(resident.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+    environment.library = dlopen(resident.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
   } else {
     Dl_info info{};
     std::string bundled;
@@ -220,32 +247,122 @@ bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
       auto common = bundled + "liburma_common.so.0";
       if (access(common.c_str(), R_OK) != 0) common = bundled + "liburma_common.so";
       if (access(common.c_str(), R_OK) == 0) {
-        CurrentState().common_library = dlopen(common.c_str(), RTLD_NOW | RTLD_GLOBAL);
-        if (CurrentState().common_library == nullptr)
+        environment.common_library = dlopen(common.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (environment.common_library == nullptr)
           return Fail(status, "dlopen bundled liburma_common", -1, dlerror());
       }
-      CurrentState().library = dlopen(core.c_str(), RTLD_NOW | RTLD_GLOBAL);
+      environment.library = dlopen(core.c_str(), RTLD_NOW | RTLD_GLOBAL);
     } else {
-      CurrentState().library = dlopen("liburma.so.0", RTLD_NOW | RTLD_GLOBAL);
-      if (CurrentState().library == nullptr) CurrentState().library = dlopen("liburma.so", RTLD_NOW | RTLD_GLOBAL);
+      environment.library = dlopen("liburma.so.0", RTLD_NOW | RTLD_GLOBAL);
+      if (environment.library == nullptr) environment.library = dlopen("liburma.so", RTLD_NOW | RTLD_GLOBAL);
     }
   }
-  if (CurrentState().library == nullptr) {
+  if (environment.library == nullptr) {
     const char* error = dlerror();
     return Fail(status, "dlopen liburma (inside AICPU)", -1, error == nullptr ? "" : error);
   }
+  return true;
+}
+
+bool ResolveApi(ApiEnvironment& environment, UmdkControlStatus& status) {
 #define KVAF_LOAD_API(name)                                                                 \
-  CurrentState().api.name = reinterpret_cast<decltype(CurrentState().api.name)>(dlsym(CurrentState().library, #name)); \
-  if (CurrentState().api.name == nullptr) return Fail(status, "dlsym " #name, -1, dlerror());
+  environment.api.name = reinterpret_cast<decltype(environment.api.name)>(dlsym(environment.library, #name)); \
+  if (environment.api.name == nullptr) return Fail(status, "dlsym " #name, -1, dlerror());
   KVAF_UMDK_APIS(KVAF_LOAD_API)
 #undef KVAF_LOAD_API
-  CurrentState().api.get_tp_list = reinterpret_cast<GetTpList>(dlsym(CurrentState().library, "urma_get_tp_list"));
-  if (CurrentState().api.get_tp_list == nullptr) return Fail(status, "dlsym urma_get_tp_list");
-  CurrentState().api.import_jetty_ex =
-      reinterpret_cast<ImportJettyEx>(dlsym(CurrentState().library, "urma_import_jetty_ex"));
-  if (CurrentState().api.import_jetty_ex == nullptr) return Fail(status, "dlsym urma_import_jetty_ex");
+  environment.api.get_tp_list = reinterpret_cast<GetTpList>(dlsym(environment.library, "urma_get_tp_list"));
+  if (environment.api.get_tp_list == nullptr) return Fail(status, "dlsym urma_get_tp_list");
+  environment.api.import_jetty_ex =
+      reinterpret_cast<ImportJettyEx>(dlsym(environment.library, "urma_import_jetty_ex"));
+  if (environment.api.import_jetty_ex == nullptr) return Fail(status, "dlsym urma_import_jetty_ex");
 
   return true;
+}
+
+std::string EnvironmentKey(const UmdkControlArgs& args) {
+  if (!args.library[0]) return "default";
+  char path[PATH_MAX];
+  return std::string("explicit:") + (realpath(args.library, path) ? path : args.library);
+}
+
+bool AttachApiEnvironment(std::shared_ptr<ApiEnvironment> environment,
+                           const std::string& key, const UmdkControlArgs& args,
+                           UmdkControlStatus& status) {
+  std::unique_lock<std::mutex> lock(environment->mutex);
+  if (environment->redirect) {
+    const auto redirect = environment->redirect;
+    lock.unlock();
+    return AttachApiEnvironment(redirect, key, args, status);
+  }
+  if (environment->failed || environment->retiring)
+    return Fail(status, "URMA environment awaits cleanup");
+  if (!environment->loaded) {
+    // The per-environment mutex admits one creator. The cache-index lock is
+    // released before dynamic loading and provider initialization.
+    const bool opened = OpenApiLibraries(args, status, *environment);
+    if (opened) {
+      std::shared_ptr<ApiEnvironment> existing;
+      {
+        std::lock_guard<std::mutex> cache_lock(environment_mutex);
+        existing = loaded_environments[environment->library].lock();
+        if (!existing) loaded_environments[environment->library] = environment;
+      }
+      if (existing && existing != environment) {
+        // dlopen aliases (SONAME, absolute path, or symlink) resolve to the same
+        // loaded object. Drop only these extra load references before sharing.
+        if (dlclose(environment->library) == 0) {
+          environment->library = nullptr;
+          if (!environment->common_library || dlclose(environment->common_library) == 0) {
+            environment->common_library = nullptr;
+            environment->redirect = existing;
+            { std::lock_guard<std::mutex> cache_lock(environment_mutex); environments[key] = existing; }
+            lock.unlock();
+            return AttachApiEnvironment(existing, key, args, status);
+          }
+        }
+        environment->failed = true;
+        ++environment->references;
+        CurrentState().environment = environment;
+        return Fail(status, "close duplicate URMA library reference", -1, dlerror());
+      }
+    }
+    environment->loaded = true;
+    ++environment->references;
+    CurrentState().environment = environment;
+    if (!opened || !ResolveApi(*environment, status)) {
+      CurrentState().api = environment->api;
+      environment->failed = true;
+      return false;
+    }
+    Stage(status, "urma_init");
+    const int result = environment->api.urma_init(nullptr);
+    if (result != 0 && result != EEXIST && result != -EEXIST) {
+      CurrentState().api = environment->api;
+      environment->failed = true;
+      return Fail(status, "urma_init", result);
+    }
+    environment->owns_init = result == 0;
+    environment->initialized = true;
+  } else {
+    ++environment->references;
+    CurrentState().environment = environment;
+  }
+  CurrentState().api = environment->api;
+  return true;
+}
+
+bool LoadApi(const UmdkControlArgs& args, UmdkControlStatus& status) {
+  const auto key = EnvironmentKey(args);
+  std::shared_ptr<ApiEnvironment> environment;
+  {
+    std::lock_guard<std::mutex> lock(environment_mutex);
+    environment = environments[key].lock();
+    if (!environment) {
+      environment = std::make_shared<ApiEnvironment>();
+      environments[key] = environment;
+    }
+  }
+  return AttachApiEnvironment(environment, key, args, status);
 }
 
 bool CreateQueue(const UmdkControlArgs& args, UmdkControlStatus& status, Queue& worker) {
@@ -253,6 +370,19 @@ bool CreateQueue(const UmdkControlArgs& args, UmdkControlStatus& status, Queue& 
       kvaf::urma::CreateQueues(CurrentState().api, CurrentState().context, args.token, {64U, 64U, 6U, true},
                                worker.jfc, worker.jfr, worker.jetty);
   return error ? Fail(status, error) : true;
+}
+
+bool CreateSessionQueues(const UmdkControlArgs& args, UmdkControlStatus& status) {
+  auto& state = CurrentState();
+  state.worker_count = args.worker_count;
+  state.queue_profile = args.queue_profile;
+  // Gather preserves its existing order; Put only posts through control[0].
+  if (!CreateQueue(args, status, state.control_queues[0])) return false;
+  for (std::uint32_t index = 0; index < UmdkDataQueueCount(state.queue_profile, state.worker_count); ++index) {
+    if (!CreateQueue(args, status, state.data_queues[index])) return false;
+    if (index != 0 && !CreateQueue(args, status, state.control_queues[index])) return false;
+  }
+  return true;
 }
 
 bool DescribeWorker(const UmdkControlArgs& args, std::uint32_t index, UmdkControlStatus& status) {
@@ -313,27 +443,9 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   status.session = CurrentState().session;
 
   if (!LoadApi(args, status)) return false;
-  Stage(status, "urma_init");
-  {
-    std::lock_guard<std::mutex> lock(init_mutex);
-    if (init_references == 0) {
-      const int result = CurrentState().api.urma_init(nullptr);
-      if (result != 0 && result != EEXIST && result != -EEXIST)
-        return Fail(status, "urma_init", result);
-      owns_provider_init = result == 0;
-    }
-    ++init_references;
-    CurrentState().owns_init = true;  // one reference, not exclusive ownership
-  }
   if (!CreateContext(args, status)) return false;
   std::copy_n(args.route_eid, 16, CurrentState().peer_eid.begin());
-  CurrentState().worker_count = args.worker_count;
-  // Preserve queue creation order while storing every worker uniformly.
-  if (!CreateQueue(args, status, CurrentState().control_queues[0])) return false;
-  for (std::uint32_t index = 0; index < CurrentState().worker_count; ++index) {
-    if (!CreateQueue(args, status, CurrentState().data_queues[index])) return false;
-    if (index != 0 && !CreateQueue(args, status, CurrentState().control_queues[index])) return false;
-  }
+  if (!CreateSessionQueues(args, status)) return false;
   Stage(status, "urma_alloc_token_id");
   CurrentState().token = CurrentState().api.urma_alloc_token_id(CurrentState().context);
   if (CurrentState().token == nullptr) return Fail(status, "urma_alloc_token_id");
@@ -354,7 +466,7 @@ bool Prepare(const UmdkControlArgs& args, UmdkControlStatus& status) {
   CurrentState().buffer = args.local_buffer;
   CurrentState().buffer_bytes = args.buffer_bytes;
   if (!DescribeWorker(args, kUmdkControlQueueIndex, status)) return false;
-  if (!DescribeWorker(args, 0, status)) return false;
+  if (args.queue_profile == UmdkQueueProfile::Gather && !DescribeWorker(args, 0, status)) return false;
   return true;
 }
 

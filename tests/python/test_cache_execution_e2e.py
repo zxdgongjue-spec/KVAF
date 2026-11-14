@@ -391,6 +391,7 @@ class Suite:
                 self.runtime.drain_get()
 
         self.output_binding()
+        self.output_coexistence()
         self.input_binding()
 
     def input_binding(self):
@@ -542,6 +543,43 @@ class Suite:
                 gc.collect()
                 check(ref() is None, "shutdown retained output registration ownership")
                 self.initialize()
+
+    def output_coexistence(self):
+        bound = [g for g in self.gets if g.transport == "urma" and
+                 g.algorithm in ("direct", "gather")]
+        if len(bound) < 2:
+            return  # UBMEM has no output registration/binding.
+        with self.case("resources/output-coexistence"), self.data(seed=48) as data:
+            buffers = [self.buffers(epoch=i) for i in range(len(bound))]
+            leases = []
+            try:
+                for g, b in zip(bound, buffers):
+                    leases.append(self.runtime.begin_get_output(g.config(self.k), b[2],
+                                                                 self.a.rows, self.read_stream))
+                # Each instance keeps its own binding across algorithm switches.
+                for i in (0, 1, 0, 1):
+                    self.get(data, bound[i], buffers[i], synchronize=True, output_lease=leases[i])
+                    self.verify(data, buffers[i])
+                for g in (g for g in self.gets if g not in bound):
+                    other = self.buffers(epoch=3)
+                    self.get(data, g, other, synchronize=True)
+                    self.verify(data, other)
+                self.get(data, bound[1], buffers[1], output_lease=leases[1])
+                self.runtime.release_access_table(data.table)
+                data.released = True
+                self.runtime.end_get_output(leases[0])
+                leases[0] = 0
+                # Releasing the idle algorithm must keep the active request's
+                # native table pin (and Python Tensor references) until Drain.
+                expect_error(lambda: self.runtime.batch_free(data.keys), ValueError, "pinned")
+                self.runtime.drain_get()
+                self.verify(data, buffers[1])
+                self.runtime.batch_free(data.keys)
+                data.freed = True
+            finally:
+                for lease in reversed(leases):
+                    if lease:
+                        self.runtime.end_get_output(lease)
 
     def graph(self):
         for g in self.gets:

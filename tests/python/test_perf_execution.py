@@ -20,9 +20,9 @@ import test_npu_batch_put as put
 from batch_get_host_sweep import parse_measurements
 
 ROOT = Path(__file__).resolve().parents[2]
-DEMO = ROOT / "access_operator/demo/aicpu_batch_get/python"
-with patch.object(sys, "path", [str(DEMO), *sys.path]):
-    spec = importlib.util.spec_from_file_location("gather_benchmark", DEMO / "benchmark_gather_read.py")
+ALGORITHM_PYTHON_DIR = ROOT / "access_operator/algorithms/aicpu_batch_get/python"
+with patch.object(sys, "path", [str(ALGORITHM_PYTHON_DIR), *sys.path]):
+    spec = importlib.util.spec_from_file_location("gather_benchmark", ALGORITHM_PYTHON_DIR / "benchmark_gather_read.py")
     gather = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gather)
 

@@ -55,13 +55,16 @@ struct UbmemCpuBackend::Impl {
       status = region->AllocateHost(mapping_bytes, &handle);
     }
     response.result = static_cast<int>(status.ok() ? peer::Result::kOk : peer::Result::kResourceError);
+    std::uint64_t session_id = 0;
     if (status.ok()) {
-      response.session_id = next_session++;
+      session_id = next_session++;
+      response.session_id = session_id;
       response.peer_base = region->address();
       response.peer_length = request.ddr_bytes;
       response.mapping_bytes = region->bytes();
       std::memcpy(response.fabric_handle, handle.data(), handle.size());
-      regions.emplace(response.session_id, std::move(region));
+      // A packed wire member must not become the map's aligned key reference.
+      regions.emplace(session_id, std::move(region));
       std::fprintf(stderr, "[KVAF_UBMEM] DDR_EXPORTED session=%llu bytes=%llu\n",
           static_cast<unsigned long long>(response.session_id),
           static_cast<unsigned long long>(response.peer_length));
@@ -69,7 +72,7 @@ struct UbmemCpuBackend::Impl {
       std::snprintf(response.error_message, sizeof(response.error_message), "%s", status.message().c_str());
     }
     if (!Transfer(fd, &response, 0, true)) {
-      if (response.session_id != 0) regions.erase(response.session_id);
+      if (session_id != 0) regions.erase(session_id);
       return Status::Internal("failed to send UBmem allocation response");
     }
     return status;

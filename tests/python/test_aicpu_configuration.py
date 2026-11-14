@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "access_operator/demo/aicpu_batch_get/python"))
+sys.path.insert(0, str(ROOT / "access_operator/algorithms/aicpu_batch_get/python"))
 import test_batch_get as functional
 import benchmark_gather_read as benchmark
 
@@ -59,7 +59,7 @@ class InstallTests(unittest.TestCase):
         (self.root / "conf/ascend_package_load.ini").write_text("# loader\n")
         self.artifacts = Path(self.temp.name) / "artifacts"
         self.artifacts.mkdir()
-        self.entries = {name: {} for name in ("KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV4")}
+        self.entries = {name: {} for name in ("KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV5")}
         self.revision = 0
         self.write_json()
         self.write_archive(b"old kernel")

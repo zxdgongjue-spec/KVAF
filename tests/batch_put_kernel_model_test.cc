@@ -5,7 +5,7 @@
 #include <vector>
 
 #define __attribute__(...)
-#include "../access_operator/demo/aiv_batch_put/kernel/execute_batch_put_aiv.asc"
+#include "../access_operator/algorithms/aiv_batch_put/kernel/execute_batch_put_aiv.asc"
 #undef __attribute__
 
 #define CHECK(c)                                        \
