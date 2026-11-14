@@ -544,7 +544,7 @@ class Suite:
                 self.initialize()
 
     def graph(self):
-        for g in (r for r in self.gets if r.algorithm == "direct"):
+        for g in self.gets:
             with self.case("graph/" + g.name), self.data(seed=51) as data:
                 buffers = self.buffers()
                 _, tensors, output = buffers
@@ -583,6 +583,8 @@ class Suite:
                                                         sentinel, self.read_stream)
                         graph.replay(self.read_stream)
                         graph.synchronize(self.read_stream)
+                        if g.executor == "aicpu":
+                            self.runtime.check_batch_get_status(self.read_stream, execution=g.config(self.k))
                         self.verify(data, (request, tensors, output))
                     graph.reset()  # No future replay is possible before ending the lease.
                     self.runtime.end_get_graph(lease, self.read_stream)
@@ -653,6 +655,7 @@ def validate(args):
 def plan(args):
     return {mode: {"puts": [p.name for p in routes(mode)[0]],
                    "gets": [g.name for g in routes(mode)[1]],
+                   "graph_gets": [g.name for g in routes(mode)[1]],
                    "matrix_pairs": len(routes(mode)[0]) * len(routes(mode)[1]),
                    "cases": [c for c in CASES if c in args.cases]} for mode in args.modes}
 
@@ -676,7 +679,8 @@ def run(args, report):
         for symbol in ("NpuRuntime", "ExecutionResources", "PutExecutionConfig", "GetExecutionConfig"):
             check(hasattr(kvaf, symbol), f"missing kvaf.{symbol}; rebuild this branch")
         for method in ("warmup", "recover", "drain_get", "begin_get_graph", "end_get_graph",
-                       "begin_get_output", "end_get_output", "begin_put_input", "end_put_input"):
+                       "begin_get_output", "end_get_output", "begin_put_input", "end_put_input",
+                       "check_batch_get_status"):
             check(hasattr(kvaf.NpuRuntime, method), f"missing NpuRuntime.{method}; rebuild this branch")
         if "graph" in args.cases:
             check(hasattr(kvaf, "AclGraph"), "missing kvaf.AclGraph")

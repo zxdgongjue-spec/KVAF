@@ -57,7 +57,7 @@ class UnifiedConfigTests(unittest.TestCase):
                 self.assertIsNone(perf.validate_args(args))
         for backend in ("gather_read", "cpu_push_scatter"):
             args = self.parse("--backend", backend, "--execution-mode", "per-call", "--graph")
-            self.assertIn("per-call AICPU graph", perf.validate_args(args))
+            self.assertIsNone(perf.validate_args(args))
 
     def test_backend_specific_limits_do_not_restrict_aiv(self):
         self.assertIsNone(perf.validate_args(self.parse("--request-length", "100000", "--workers", "16")))
@@ -299,17 +299,17 @@ class GraphRunnerTests(unittest.TestCase):
         self.assertFalse(engine.pending)
         if fail_on:
             self.assertFalse(records(captured_output.getvalue()))
+            if execution_mode == "per-call":
+                self.assertEqual(runtime.released_leases, [(23, True)])
         else:
             self.assertEqual(engine.calls, 11)  # warmup Get + 5 checks + 2 warmups + 3 measurements.
             self.assertIn(0, checked)
             self.assertIn(1, checked)
             self.assertEqual(count.values, [4])
             results = records(captured_output.getvalue())
-            self.assertEqual([r["samples"] for r in results],
-                             ["3", "3"] if execution_mode == "legacy" else ["3"])
-            if execution_mode == "legacy":
-                self.assertEqual(results[1]["mean_us"], "0.111000")  # Actual measured replays 9, 10, 11.
-            else:
+            self.assertEqual([r["samples"] for r in results], ["3", "3"])
+            self.assertEqual(results[1]["mean_us"], "0.111000")  # Actual measured replays 9, 10, 11.
+            if execution_mode == "per-call":
                 self.assertEqual(len(runtime.graph_leases), 1)
                 self.assertEqual(runtime.released_leases, [(23, False)])
                 self.assertEqual(runtime.drains, 1)
@@ -328,12 +328,13 @@ class GraphRunnerTests(unittest.TestCase):
 
     def test_protocol_failure_does_not_emit_success_and_releases_graph(self):
         self.run_graph("cpu_push_scatter", "torch", fail_on=4)
+        self.run_graph("cpu_push_scatter", "acl", fail_on=4, execution_mode="per-call")
 
     def test_explicit_aicpu_profile_reports_stages_and_workers(self):
         self.run_graph("cpu_push_scatter", "torch", detailed=True)
 
-    def test_per_call_direct_graphs_keep_resources_until_graph_reset(self):
-        for backend in ("aiv", "ubmem"):
+    def test_per_call_all_graphs_keep_resources_until_graph_reset(self):
+        for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):
             for api in ("acl", "torch"):
                 with self.subTest(backend=backend, api=api):
                     self.run_graph(backend, api, execution_mode="per-call")

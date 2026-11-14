@@ -173,11 +173,13 @@ NPU 端沿用已构建的同分支接口即可，此修复没有改变协议或�
 | `overlap` | 每对 Put/Get 分别运行双 stream 和双 Host 线程；Get 读旧 key，Put 写不同新 key，随后验证两份 payload；Get 提交后不先调用 `drain_get` 再 Put |
 | `lifetime` | Get 异步提交后释放公共 AccessTable handle；该 handle 随即不可查询，源 key 仍因 pin 返回 Busy；`drain_get` 后数据正确且 key 可释放 |
 | `resources` | 对全部 provider 预热；过量 warmup、Get、Put 被拒绝；拒绝的 Put 未提交 key；重复 Put、未启用配置被拒绝；显式 `recover` 重建会话后原 DDR 数据仍可读 |
-| `graph` | 两种可用 AIV Direct Get 分别 prepare/capture/replay；同一输出和请求 buffer 地址下更新 indices、offsets、miss_count、output_indices；graph 期间 eager Get、Get 预热/恢复、drain、shutdown 被拒绝，独立 Put 可成功；释放后普通 Get 可继续 |
+| `graph` | 当前模式启用的四种 Get（URMA AIV Direct、UBMEM Direct、AICPU Gather、AICPU Scatter）分别 prepare/capture/replay；同一输出和请求 buffer 地址下更新 indices、offsets、miss_count、output_indices；graph 期间 eager Get、Get 预热/恢复、drain、shutdown 被拒绝，独立 Put 可成功；释放后普通 Get 可继续 |
 | `lifecycle` | 每轮连续调用两次 shutdown，再初始化、预热各 provider、写入并读取数据；最终 shutdown 成功 |
 
 AIV Direct 的 `end_get_graph` 等待 stream 并释放注册资源，不读取 kernel status；
-`discard_result` 对该 provider 仅作为通用接口参数保留。
+`discard_result` 对该 provider 仅作为通用接口参数保留。AICPU 两种 Get 在 capture 前准备
+工作区和通信资源，通过设备 ticket 支持重复 replay，检查完成状态；协议错误后显式
+丢弃会关闭该算法资源，需要 `recover(config)` 后再用。同步或注销失败保留租约供重试。
 
 请求使用非零 token 偏移和分散、反向的输出行号。有效请求前缀之外故意放入越界索引、
 负偏移和负输出行号，确认后端只消费 `miss_count` 指定的前缀。输出先填充 `0xA5`，
@@ -519,10 +521,11 @@ Host 扫描 CSV 标记 `timing=synchronous_batch_get`，输出 `host_*_us` 和
 不作为同步调用的阶段数据。UBMEM 不扫描无效的 Jetty 数。
 任一子进程失败或结果未标记为所选模式时，扫描失败，不生成 PASS。
 
-当前 per-call AIV/UBMEM 不支持 `start_batch_get_kernel_profile`。脚本遇到
-`--kernel-profile` 会明确报错，不退回 legacy。miss-count 扫描默认 legacy 使用
-原 kernel cycle 指标，默认 per-call 使用 Host 指标；对比时两边显式设置
-`--timing host`。`--timing kernel --execution-mode per-call` 不受支持。
+四种 Get 的 per-call 实例均支持 kernel profile。混合 Runtime 使用
+`start_batch_get_kernel_profile(execution=config)` 选择算法，snapshot/stop 使用相同
+配置；省略配置取默认 Get。须在获取图租约前启用，完成后读取，释放图后停用。
+miss-count 扫描默认 legacy 使用 kernel cycle 指标，默认 per-call 使用 Host 指标；
+对比时两边显式设置相同的 `--timing host` 或 `--timing kernel`。
 Host 对照扫描采用固定路由，不执行 adaptive 校准；如需固定 CPU UB 设备，两边使用
 相同 `--peer-ub-device`。单点 legacy 的原 adaptive 和 cycle profiling 能力保留。
 
@@ -565,7 +568,7 @@ Gather 将脚本改为 `benchmark_gather_read.py` 并使用独立 trace 文件�
 Gather/Scatter 的 legacy 对照同样只改 `--execution-mode legacy` 与 trace 文件名。
 `--last` 对每个算法、执行路径、事件分别取最后 100 个样本，以排除正确性检查
 和预热。输出的 `algorithm` 为 `gather`、`scatter`、`aiv_direct` 或 `ubmem`；
-`path=output` 表示复用输出绑定，`path=ordinary` 表示每次构造 Get 上下文。
+`path=output` 表示复用输出绑定，`path=ordinary` 表示没有显式输出绑定，执行状态仍按算法驻留复用。
 legacy 的标签为 `algorithm=legacy path=legacy`，由文件名区分所测算法。
 
 AIV Direct 还会输出 `aiv_capture_prepare`、`aiv_capture_submit`、
@@ -680,9 +683,10 @@ finally:
 - 绑定固定配置、输出地址和字节数，以及最大请求容量（indices 长度，不是 miss_count）。
   请求、访问表和 active count 可以变化；可跨 stream 顺序提交，Get 仍按原规则串行完成。
   跨 stream 的输入/输出内容依赖由调用方建立。
-- 一个 Runtime 同时只允许一个输出绑定；绑定期间占用 Get 方向，所有 Get 必须携带
-  相同 lease。切换 Get 算法/输出、recover、额外 warmup 或 graph 前先解绑。
-  Put 仍可独立执行。graph 使用原来的 graph lease。
+- 每种算法实例允许一个输出绑定；AIV Direct 和 Gather 的绑定可同时存在并交替使用，
+  每次携带对应 lease。同一实例换输出、recover、额外 warmup 或 graph 前先解绑；
+  其他算法可普通调用。Get 仍按完成顺序复用资源，Put 可独立执行。
+  一个 Runtime 同时仅允许一个图租约，图中仅一个 Get 节点。
 - `drain_get()` 不解绑；`end_get_output()` 成功后 lease 失效。同一地址重新绑定会重新注册，
   不因地址相同就沿用旧分配的注册。`shutdown()` 会关闭绑定和对应资源。
 - 等待/注销失败时保留原生资源及 Python 引用。等待失败可重试完成；无法恢复的错误

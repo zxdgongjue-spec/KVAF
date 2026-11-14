@@ -1,6 +1,7 @@
 #include "aicpu_execution_resources.h"
 
 #include <mutex>
+#include "aicpu_batch_get_capture.h"
 
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_batch_get/include/cpu_push_transport.h"
@@ -73,7 +74,8 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
   if (!call || call->owner != this)
     return Status::InvalidArgument("AICPU invocation belongs to another resource");
   if (state_->invocation != call &&
-      (state_->invocation->output_bound || state_->invocation->input_bound))
+      (state_->invocation->output_bound || state_->invocation->input_bound ||
+       state_->invocation->graph_active))
     return Status::Busy("release input/output binding before replacing invocation");
   auto bound = state_->put.BindExecutionState(call->put.get());
   if (!bound.ok()) return bound;
@@ -131,13 +133,26 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
   if (!state_->initialized || !state_->enable_get)
     return Status::NotInitialized("AICPU Get resources not initialized");
   if (!request.request) return Status::InvalidArgument("missing Get request");
-  if (state_->managed_completion && request.execution.stream) {
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(request.execution.stream), &capture, &graph) != ACL_SUCCESS)
-      return Status::Internal("cannot query graph capture state");
-    if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::NotImplemented("per-call AICPU graph leases are not implemented");
+  auto& call = *state_->invocation;
+  if (call.graph_active) {
+    const auto& options = call.graph_options;
+    if (call.graph_retiring) return Status::Busy("graph retirement is still pending");
+    if (call.graph_recorded) return Status::NotImplemented("one Get node per graph lease is supported");
+    if (request.execution.stream != options.stream || request.execution.synchronize ||
+        request.execution.profile || request.request->output.data != options.output.data ||
+        request.request->output.bytes != options.output.bytes ||
+        request.request->indices.bytes / sizeof(std::int32_t) > options.request_capacity)
+      return Status::InvalidArgument("captured request differs from prepared graph lease");
+    bool capturing = false;
+    auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), false, false, &capturing);
+    if (!allowed.ok()) return allowed;
+    if (!capturing) return Status::InvalidState("graph lease submission requires active capture");
+  } else if (state_->managed_completion && request.execution.stream) {
+    bool capturing = false;
+    auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(request.execution.stream),
+                                          false, false, &capturing);
+    if (!allowed.ok()) return allowed;
+    if (capturing) return Status::InvalidState("prepare an AICPU Get graph lease before capture");
   }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   if (state_->push) return state_->push->Prepare(request);
@@ -198,15 +213,82 @@ Status AicpuExecutionResources::FinishPutInput() {
 }
 Status AicpuExecutionResources::ReleaseGetBuffers() {
   auto& call = *state_->invocation;
-  if (call.output_bound || !call.get_output.valid()) return Status::OK();
+  if (call.output_bound || call.graph_active || !call.get_output.valid()) return Status::OK();
   auto s = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
   if (s.ok()) call.get_output = {};
   return s;
 }
+Status AicpuExecutionResources::PrepareGetGraph(const GetGraphOptions& options) {
+  std::lock_guard<std::mutex> lock(state_->get_mutex);
+  auto& call = *state_->invocation;
+  if (!state_->initialized || !state_->enable_get)
+    return Status::NotInitialized("AICPU Get resources not initialized");
+  if (call.graph_active || call.output_bound) return Status::Busy("Get resources already leased");
+  Status ready;
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) ready = state_->push->PrepareGraph(options);
+  else
+#endif
+    ready = state_->get.PrepareGraph(options);
+  if (!ready.ok()) return ready;
+  call.graph_options = options;
+  call.get_output = options.output;
+  call.graph_active = true;
+  call.graph_recorded = call.graph_retiring = call.graph_close_required = false;
+  return Status::OK();
+}
+Status AicpuExecutionResources::FinishGetGraph(void* stream, bool discard) {
+  std::unique_lock<std::mutex> lock(state_->get_mutex);
+  auto& call = *state_->invocation;
+  if (!call.graph_active) return Status::NotFound("AICPU graph lease not found");
+  if (!stream || stream != call.graph_options.stream)
+    return Status::InvalidArgument("graph release requires its prepared execution stream");
+  bool capturing = false;
+  auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(stream), true, false, &capturing);
+  if (!allowed.ok()) return allowed;
+  if (call.graph_retiring && discard && !call.graph_close_required) {
+    // Output unregister can fail permanently after device completion is known.
+    // An explicit discard must still be able to retire the complete transport,
+    // rather than leave an unrecoverable graph lease blocking Shutdown/Recover.
+    if (aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) != ACL_SUCCESS)
+      return Status::CompletionUnknown("graph discard completion unknown; resources retained");
+    call.graph_close_required = true;
+  }
+  if (!call.graph_retiring) {
+    Status ready;
+    auto* low = dynamic_cast<aicpu_urma::AicpuGetInvocation*>(call.get.get());
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+    if (state_->push) {
+      low = dynamic_cast<aicpu_urma::AicpuGetInvocation*>(call.push.get());
+      ready = state_->push->FinishGraph(stream, discard);
+    } else
+#endif
+      ready = state_->get.FinishGraph(stream, discard);
+    if (!ready.ok()) {
+      if (!discard || !low || low->failure.ok()) return ready;
+      // Discard cannot make a failed DMA transport safe. Retire its complete
+      // session (Scatter sends STOP first), retaining the lease on any failure.
+      call.graph_close_required = true;
+    }
+    call.graph_retiring = true;
+  }
+  if (call.graph_close_required) {
+    lock.unlock();
+    return Close();
+  }
+  if (!scatter()) {
+    auto retired = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
+    if (!retired.ok()) return retired;
+  }
+  call.graph_active = call.graph_recorded = call.graph_retiring = false;
+  call.graph_options = {};
+  call.get_output = {};
+  return Status::OK();
+}
 Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options) {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
   auto& call = *state_->invocation;
-  if (!state_->initialized || !state_->enable_get || scatter() || call.output_bound ||
+  if (!state_->initialized || !state_->enable_get || scatter() || call.output_bound || call.graph_active ||
       !options.stream || !options.request_capacity ||
       !options.output.valid() || options.output.device != DeviceKind::kNpu)
     return Status::InvalidArgument("invalid Gather output binding");
@@ -226,6 +308,7 @@ Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options
 }
 Status AicpuExecutionResources::FinishGetOutput() {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
+  if (state_->invocation->graph_active) return Status::Busy("Get output belongs to a graph lease");
   auto s = state_->DrainGet();
   if (!s.ok()) return s;
   auto& call = *state_->invocation;
@@ -288,6 +371,8 @@ Status AicpuExecutionResources::Warmup(const ExecutionWarmup& request) {
 }
 Status AicpuExecutionResources::Close() {
   std::scoped_lock lock(state_->get_mutex, state_->put_mutex);
+  if (state_->invocation->graph_active && !state_->invocation->graph_retiring)
+    return Status::Busy("release Get graph before closing AICPU resources");
   state_->views.Close();
   // Push shutdown must stop the remote DMA producer even after a kernel failure.
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
@@ -315,6 +400,9 @@ Status AicpuExecutionResources::Close() {
   state_->initialized = false;
   state_->invocation->get_output = {};
   state_->invocation->output_bound = false;
+  state_->invocation->graph_active = state_->invocation->graph_recorded = false;
+  state_->invocation->graph_retiring = state_->invocation->graph_close_required = false;
+  state_->invocation->graph_options = {};
   state_->invocation->put_input = {};
   state_->invocation->input_bound = state_->invocation->input_retiring = false;
   state_->invocation->put_completion = {};
@@ -359,6 +447,8 @@ Status AicpuExecutionResources::CheckBatchGetStatus(void* stream) {
 }
 Status AicpuExecutionResources::SetBatchGetKernelProfiling(bool enabled) {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
+  if (state_->invocation->graph_recorded || state_->invocation->graph_retiring)
+    return Status::Busy("configure profiling before recording the graph");
   if (!state_->initialized) return Status::NotInitialized("AICPU resources are not initialized");
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   if (state_->push) return state_->push->SetKernelProfiling(enabled);

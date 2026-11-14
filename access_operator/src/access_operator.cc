@@ -280,6 +280,15 @@ Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
   return UrmaAivGetOperator::SetProfiling(enabled, resources_->GetView());
 }
 Status DefaultAccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  const auto& call = resources_->invocation();
+  if (call.graph_buffer) {
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(call.graph_options.stream), &capture, &graph) != ACL_SUCCESS)
+      return Internal("cannot query graph capture state");
+    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+      return InvalidState("read Get profiling outside graph capture");
+  }
   return UrmaAivGetOperator::CopyProfiles(profiles, resources_->GetView());
 }
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
@@ -330,7 +339,8 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool /*discard*/, UrmaAivGe
   if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (!invocation.graph_buffer) return Status::NotFound("AIV graph lease not found");
-  if (!stream) return InvalidArgument("graph release requires its last replay stream");
+  if (!stream || stream != invocation.graph_options.stream)
+    return InvalidArgument("graph release requires its prepared replay stream");
   aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
   aclmdlRI graph = nullptr;
   if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(stream), &capture, &graph) != ACL_SUCCESS)

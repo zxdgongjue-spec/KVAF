@@ -38,6 +38,28 @@ struct BatchGetTransport::Impl {
   bool initialized{false}, cpu_enabled{false};
   Status Drain(const char* stage = "drain", bool check_status = true);
 };
+static Status ValidateGather(const GatherLaunchView& view, AicpuGetInvocation& call) {
+  const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
+  const auto sequence = reports[0].sequence;
+  if (call.graph_active) {
+    bool replayed = false;
+    for (unsigned worker = 0; worker < view.options.workers; ++worker)
+      replayed = replayed || reports[worker].sequence > call.graph_start_sequence;
+    if (!replayed) return Status::InvalidState("Gather graph has not been replayed");
+  }
+  // Preserve the actual worker error before reporting stale slots from a partial launch.
+  for (unsigned worker = 0; worker < view.options.workers; ++worker)
+    if (reports[worker].magic == kGatherStatusMagic && reports[worker].result)
+      return call.failure = Internal("GatherRead worker " + std::to_string(worker) +
+          " failed: sequence=" + std::to_string(reports[worker].sequence) +
+          " phase=" + std::to_string(reports[worker].phase) +
+          " result=" + std::to_string(reports[worker].result));
+  for (unsigned worker = 0; worker < view.options.workers; ++worker)
+    if (reports[worker].magic != kGatherStatusMagic || !sequence || reports[worker].sequence != sequence)
+      return call.failure = Internal("GatherRead worker status is stale or incomplete");
+  call.sequence = sequence;
+  return Status::OK();
+}
 static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call, const char* stage,
                            bool completion_enqueued = false, bool check_status = true) {
   const auto stream = call.pending ? call.pending : call.captured_stream;
@@ -60,21 +82,9 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
   call.pending = nullptr;
   if (!check_status || !call.submitted) return Status::OK();
   if (!call.failure.ok()) return call.failure;
-  const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
-  const auto sequence = reports[0].sequence;
-  // Preserve the actual worker error before reporting stale slots from a partial launch.
-  for (unsigned worker = 0; worker < view.options.workers; ++worker)
-    if (reports[worker].magic == kGatherStatusMagic && reports[worker].result)
-      return call.failure = Internal("GatherRead worker " + std::to_string(worker) +
-          " failed: sequence=" + std::to_string(reports[worker].sequence) +
-          " phase=" + std::to_string(reports[worker].phase) +
-          " result=" + std::to_string(reports[worker].result));
-  for (unsigned worker = 0; worker < view.options.workers; ++worker)
-    if (reports[worker].magic != kGatherStatusMagic || !sequence || reports[worker].sequence != sequence)
-      return call.failure = Internal("GatherRead worker status is stale or incomplete");
-  call.sequence = sequence;
-  return Status::OK();
+  return ValidateGather(view, call);
 }
+
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
                                      bool direct_addresses)
     : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses)) {}
@@ -113,6 +123,77 @@ Status BatchGetTransport::Check(aclrtStream stream) {
   call.pending = stream;
   return impl_->Drain("check");
 }
+Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
+  auto& call = *impl_->invocation;
+  if (!impl_->initialized) return Status::NotInitialized("Gather is not initialized");
+  if (call.graph_active || call.captured_stream) return Status::Busy("Gather capture already bound");
+  if (!options.output.valid() || options.output.device != DeviceKind::kNpu ||
+      !options.request_capacity || options.request_capacity > kGatherMaxRequests)
+    return InvalidArgument("Gather graph requires output and valid request capacity");
+  bool capturing = false;
+  auto ready = kvaf::detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), true, false, &capturing);
+  if (!ready.ok()) return ready;
+  ready = impl_->Drain("graph_prepare");
+  if (ready.ok()) ready = Warmup();
+  if (ready.ok()) ready = impl_->session.Ensure(impl_->region.base, options.output.data, options.output.bytes);
+  if (!ready.ok()) return ready;
+  GatherExecutionControl control{};
+  if (aclrtMemcpy(&control, sizeof(control), impl_->control, sizeof(control), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    return Internal("cannot read Gather graph sequence baseline");
+  if (control.failed || control.claimed % impl_->session.config().workers)
+    return Status::InvalidState("Gather execution failed or incomplete; shutdown required");
+  call.graph_start_sequence = control.claimed / impl_->session.config().workers;
+  call.graph_stream = static_cast<aclrtStream>(options.stream);
+  call.graph_active = true;
+  call.submitted = call.profile_submitted = call.profile_complete = false;
+  call.last_stream = nullptr;
+  return Status::OK();
+}
+Status BatchGetTransport::FinishGraph(void* stream, bool discard) {
+  auto& call = *impl_->invocation;
+  if (!call.graph_active) return Status::NotFound("Gather graph lease not found");
+  if (!stream || stream != call.graph_stream)
+    return InvalidArgument("graph release requires its prepared execution stream");
+  bool capturing = false;
+  auto ready = kvaf::detail::BatchGetCapture(static_cast<aclrtStream>(stream), true, false, &capturing);
+  if (!ready.ok()) return ready;
+  if (aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) != ACL_SUCCESS)
+    return Status::CompletionUnknown("Gather graph completion unresolved; resources retained");
+  if (!call.failure.ok()) return call.failure;
+  bool replay_completed = false;
+  if (call.captured_stream) {
+    const auto view = View();
+    GatherExecutionControl control{};
+    if (aclrtMemcpy(&control, sizeof(control), impl_->control, sizeof(control), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
+        aclrtMemcpy(view.completion.host, view.completion.bytes, view.completion.device,
+                    view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+      return Status::CompletionUnknown("cannot read Gather graph status; resources retained");
+    const auto sequence = control.claimed / view.options.workers;
+    if (control.failed || control.claimed % view.options.workers || sequence < call.graph_start_sequence)
+      return call.failure = Internal("Gather graph device failed or ticket sequence is incomplete");
+    if (sequence == call.graph_start_sequence) {
+      if (!discard) return Status::InvalidState("Gather graph has not been replayed");
+    } else {
+      ready = ValidateGather(view, call);
+      if (!ready.ok()) return ready;
+      if (call.sequence != sequence)
+        return call.failure = Internal("Gather graph status does not match its latest replay");
+      replay_completed = true;
+    }
+  }
+  // The caller owns graph destruction. Only after it has stopped replaying may
+  // the owner retire this graph's registrations and release its execution lease.
+  call.graph_active = false;
+  call.graph_stream = call.captured_stream = call.pending = call.last_stream = nullptr;
+  call.prepared = nullptr;
+  call.prepared_stream = nullptr;
+  call.prepared_profile = nullptr;
+  call.prepared_capturing = false;
+  call.submitted = false;
+  call.profile_complete = call.profile_submitted && replay_completed;
+  call.profile_submitted = call.profile_complete;
+  return Status::OK();
+}
 Status BatchGetTransport::SetKernelProfiling(bool enabled) {
   if (!impl_->initialized) return Status::NotInitialized("GatherRead is not initialized");
   auto ready = impl_->Drain();
@@ -123,16 +204,18 @@ Status BatchGetTransport::SetKernelProfiling(bool enabled) {
     if (!ready.ok()) return ready;
   }
   impl_->profiling = enabled;
-  impl_->invocation->profile_submitted = false;
+  impl_->invocation->profile_submitted = impl_->invocation->profile_complete = false;
   return Status::OK();
 }
 Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
   const auto& call = *impl_->invocation;
   if (!impl_->profiling || !call.profile_submitted)
     return Status::InvalidState("no profiled GatherRead launch");
-  bool capturing = false;
-  auto ready = kvaf::detail::BatchGetCapture(call.last_stream, true, false, &capturing);
-  if (!ready.ok()) return ready;
+  if (!call.profile_complete) {
+    bool capturing = false;
+    auto ready = kvaf::detail::BatchGetCapture(call.last_stream, true, false, &capturing);
+    if (!ready.ok()) return ready;
+  }
   return kvaf::detail::CopyAicpuProfiles(impl_->profile_device, impl_->profile_host,
       impl_->session.config().workers, profiles);
 }
@@ -327,6 +410,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     return call.failure = Internal("UMDK BatchGet launch failed; shutdown required");
   call.submitted = true;
   call.profile_submitted = args.profile != 0;
+  call.profile_complete = false;
   GetHostTimingRecord(exec.host_timing, &GetProviderTiming::submit_ns, submit_started);
   const auto completion_started = GetHostTimingStart(exec.host_timing);
   if (profile) {

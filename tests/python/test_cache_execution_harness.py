@@ -20,7 +20,9 @@ class HarnessTests(unittest.TestCase):
         e2e.validate(args)
         plan = e2e.plan(args)
         self.assertEqual([plan[m]["matrix_pairs"] for m in e2e.MODES], [6, 1, 12])
+        self.assertEqual(len(plan["urma+ubmem"]["graph_gets"]), 4)
         for mode in plan.values():
+            self.assertEqual(mode["graph_gets"], mode["gets"])
             self.assertNotIn("urma/aiv/scatter", mode["gets"])
             self.assertNotIn("urma/aiv/gather", mode["gets"])
         self.assertEqual(e2e.plan(e2e.parser().parse_args(

@@ -329,10 +329,6 @@ def validate_args(args: argparse.Namespace) -> str | None:
     if args.execution_mode == "per-call":
         if args.adaptive_ub_device:
             return "per-call mode does not support adaptive-ub-device; select peer-ub-device explicitly"
-        if args.kernel_profile:
-            return "per-call has no kernel cycle profiling yet; use --no-kernel-profile (Host completion timing)"
-        if uses_aicpu(args) and args.execution != "eager":
-            return "per-call AICPU graph execution is not supported yet"
         if args.contention_control_dir is not None and args.contention_graph_calls != 1:
             return "per-call graph leases support one Get per graph; use --graph-calls 1"
     if args.device_id < 0:
@@ -458,9 +454,6 @@ def device_profile_ms(profiles, clock_mhz):
 
 def start_kernel_measurement(args, runtime):
     # The sweeps already use these timestamps. Keep their sampling unchanged.
-    # The dispatcher profile API is wired separately from legacy operator state.
-    if args.execution_mode == "per-call":
-        return False
     runtime.start_batch_get_kernel_profile(detailed=args.ubmem_profile_detail)
     return True
 
@@ -486,7 +479,7 @@ def print_aicpu_details(args, execution, samples):
 def print_measurements(args, execution, samples, profiles):
     """Keep end-to-end and operator wall time distinct; count payload once."""
     scopes = [("end_to_end", samples, "host_perf_counter")]
-    profiling = args.execution_mode == "legacy"
+    profiling = True
     if profiling and (len(profiles) != len(samples) or any(len(p) != args.aiv_cores for p in profiles)):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     if profiling:
@@ -530,8 +523,6 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
         get_capacity=args.request_length,
     )
-    if args.execution_mode == "per-call" and uses_aicpu(args):
-        raise ValueError("per-call AICPU graph execution is not supported yet")
     stream = torch.npu.current_stream()
     fixed = make_plan()
     options = dict(execution.get_kwargs)
@@ -563,7 +554,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     graph = kvaf.AclGraph() if args.graph_api == "acl" else torch.npu.NPUGraph()
     capturing = False
     graph_lease = 0
-    replayed = False
+    validated = False
     try:
         if args.execution_mode == "per-call":
             graph_lease = runtime.begin_get_graph(execution.get_config, output, args.request_length, stream)
@@ -584,7 +575,6 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             prepare(count)
             replay()
             stream.synchronize()
-            replayed = True
             check(count)
         for iteration in range(args.warmup):
             prepare(args.miss_count)
@@ -599,18 +589,18 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             stream.synchronize()
             durations.append((time.perf_counter() - start) * 1000)
             check(args.miss_count)
-            if args.execution_mode == "legacy":
-                profiles.append(list(runtime.batch_get_kernel_profile()))
+            profiles.append(list(runtime.batch_get_kernel_profile()))
         print_measurements(args, "graph", durations, profiles)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
               "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
+        validated = True
     finally:
         if capturing:
             graph.capture_end()
         stream.synchronize()
         graph.reset()
         if graph_lease:
-            runtime.end_get_graph(graph_lease, stream, discard_result=not replayed)
+            runtime.end_get_graph(graph_lease, stream, discard_result=not validated)
 
 
 def sort_request_plan_prefix(
@@ -949,7 +939,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "FAIL: rebuild KVAF with the selected NPU backend and Python bindings."
         )
         return 2
-    if args.execution_mode == "legacy" and args.contention_control_dir is None and not all(
+    if args.contention_control_dir is None and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in ("start_batch_get_kernel_profile", "stop_batch_get_kernel_profile", "batch_get_kernel_profile")
     ):
@@ -1293,7 +1283,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             torch.npu.synchronize()
             execution.drain_get(runtime)
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
-        if uses_aicpu(args) and args.execution_mode == "legacy":
+        if uses_aicpu(args):
             # Do not charge deferred warmup status D2H to the first sample.
             runtime.check_batch_get_status(torch.npu.current_stream())
 
@@ -1329,7 +1319,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 submit_samples.append((submitted - begin) * 1000.0)
                 synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
-            if uses_aicpu(args) and args.execution_mode == "legacy":
+            if uses_aicpu(args):
                 runtime.check_batch_get_status(torch.npu.current_stream())
             check_output((indices, offsets, output_indices), miss_count_value)
             if kernel_profile_started:

@@ -106,6 +106,8 @@ int32_t LaunchCpuPushScatter(const KernelArgs* input, aclrtStream) {
     auto* statuses = reinterpret_cast<WorkerStatus*>(args.status);
     auto* coordination = reinterpret_cast<Coordination*>(args.coordination);
     const auto sequence = ++coordination->finished.value;
+    coordination->claimed.value += args.workers;
+    if (bad_result) coordination->result.value = std::uint64_t(Result::kTransportError);
     for (std::uint32_t w = 0; w < args.workers; ++w)
       statuses[w] = {kMagic, sequence,
           std::uint64_t(bad_result ? Result::kTransportError : Result::kOk), w, 0, {}};
@@ -275,6 +277,67 @@ void CheckCapturedReplay() {
   CHECK(allocations.empty() && queued.empty() && !cpu_running);
 }
 
+void CheckManagedGraph(unsigned scenario) {
+  Reset();
+  cpu_push::CpuPushTransport transport(Config());
+  CHECK(transport.Initialize({4096, 4096, 16, DeviceKind::kCpu}).ok());
+  // Establish an old report; it cannot be mistaken for this graph's replay.
+  CHECK(transport.SetKernelProfiling(true).ok());
+  CHECK(Enqueue(transport).ok());
+  CHECK(transport.Drain().ok());
+  std::uint8_t output[16]{};
+  GetGraphOptions options{{output, sizeof(output), DeviceKind::kNpu}, &handle, 1};
+  CHECK(transport.PrepareGraph(options).ok());
+  CHECK(!transport.PrepareGraph(options).ok());
+  int other_stream;
+  CHECK(!transport.FinishGraph(&other_stream, true).ok());
+  capturing = true;
+  CHECK(Enqueue(transport).ok());
+  CHECK(!transport.FinishGraph(&handle, true).ok());
+  capturing = false;
+  CHECK(!transport.Check(&handle).ok());
+  CHECK(!transport.FinishGraph(&handle, false).ok());
+  if (scenario == 0) {
+    // Explicitly discard an unexecuted capture, then reuse the same resource.
+    CHECK(transport.FinishGraph(&handle, true).ok());
+  } else {
+    queued.push_back(captured.front());
+    if (scenario == 2) sync_failures = 1;
+    if (scenario == 3) bad_result = true;
+    if (scenario == 2) {
+      CHECK(!transport.FinishGraph(&handle, true).ok());
+      CHECK(!queued.empty() && cpu_running && !allocations.empty());
+    }
+    if (scenario == 3) {
+      CHECK(!transport.FinishGraph(&handle, true).ok());
+      CHECK(!Enqueue(transport).ok());
+      // discard does not swallow a real device error. The owner must STOP the
+      // remote producer and close the transport before releasing its lease.
+      stop_failures = 1;
+      CHECK(!transport.Shutdown().ok() && !allocations.empty());
+      CHECK(transport.Shutdown().ok());
+      return;
+    }
+    CHECK(transport.FinishGraph(&handle, false).ok());
+  }
+  CHECK(!transport.FinishGraph(&handle, true).ok());
+  // EndGraph releases its stream association, but the last replay's resident
+  // profile must remain readable until profiling is disabled or reused.
+  std::vector<BatchGetKernelProfile> profiles;
+  CHECK(transport.CopyKernelProfiles(&profiles).ok() == (scenario != 0));
+  if (scenario != 0) {
+    CHECK(profiles.size() == Config().workers);
+    CHECK(profiles.front().device_start_ns == 200);
+  }
+  CHECK(transport.SetKernelProfiling(false).ok());
+  CHECK(!transport.CopyKernelProfiles(&profiles).ok());
+  CHECK(Enqueue(transport, &other_stream).ok());
+  CHECK(transport.Drain().ok());
+  CHECK(transport.PrepareGraph(options).ok());
+  CHECK(transport.FinishGraph(&handle, true).ok());
+  CHECK(transport.Shutdown().ok());
+}
+
 }
 
 int main() {
@@ -282,5 +345,6 @@ int main() {
   // and an execution error first observed during shutdown.
   for (unsigned scenario = 0; scenario < 5; ++scenario) CheckShutdown(scenario);
   CheckCapturedReplay();
+  for (unsigned scenario = 0; scenario < 4; ++scenario) CheckManagedGraph(scenario);
   std::cout << "Scatter asynchronous shutdown and cleanup retry tests passed\n";
 }

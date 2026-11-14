@@ -4,6 +4,9 @@ find_package(Threads REQUIRED)
 add_executable(kvaf_execution_view_binding_test execution_view_binding_test.cc)
 target_link_libraries(kvaf_execution_view_binding_test PRIVATE kvaf_access_operator Threads::Threads)
 add_test(NAME kvaf_execution_view_binding_test COMMAND kvaf_execution_view_binding_test)
+add_executable(kvaf_get_diagnostics_test get_diagnostics_test.cc)
+target_link_libraries(kvaf_get_diagnostics_test PRIVATE kvaf_runtime Threads::Threads)
+add_test(NAME kvaf_get_diagnostics_test COMMAND kvaf_get_diagnostics_test)
 add_executable(kvaf_npu_runtime_config_test npu_runtime_config_test.cc)
 target_link_libraries(kvaf_npu_runtime_config_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_npu_runtime_config_test COMMAND kvaf_npu_runtime_config_test)
@@ -14,6 +17,9 @@ add_test(NAME kvaf_build_script_python
 add_test(NAME kvaf_cache_execution_harness_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_cache_execution_harness.py")
 set_tests_properties(kvaf_cache_execution_harness_python PROPERTIES TIMEOUT 30)
+add_test(NAME kvaf_kernel_profile_sweep_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_kernel_profile_sweep.py")
+set_tests_properties(kvaf_kernel_profile_sweep_python PROPERTIES TIMEOUT 30)
 add_test(NAME kvaf_runtime_build_flags_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_runtime_build_flags.py")
 set_tests_properties(kvaf_runtime_build_flags_python PROPERTIES

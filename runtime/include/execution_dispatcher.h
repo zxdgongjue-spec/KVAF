@@ -38,6 +38,9 @@ class ExecutionDispatcher final : public AccessOperator {
   Status Recover(GetExecutionConfig);
   Status ResolvePut(PutExecutionConfig, PutCompletion*) override;
   Status AcknowledgePut() override;
+  Status ConfigureGetProfiling(std::optional<GetExecutionConfig>, bool enabled, bool detailed);
+  Status CopyGetProfiles(std::optional<GetExecutionConfig>, std::vector<BatchGetKernelProfile>*);
+  Status CheckGetStatus(std::optional<GetExecutionConfig>, void* stream);
   const ExecutionPolicy& policy() const { return policy_; }
  private:
   struct GetPreparationTiming {

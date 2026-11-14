@@ -592,6 +592,52 @@ Status ExecutionDispatcher::Warmup(GetExecutionConfig c, const ExecutionWarmup& 
   if (s.ok()) instance->ClearRequest();
   return s;
 }
+Status ExecutionDispatcher::ConfigureGetProfiling(std::optional<GetExecutionConfig> config,
+                                                   bool enabled, bool detailed) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  if (graph_id_) return Status::Busy("configure profiling before acquiring a Get graph lease");
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, config, &resolved);
+  if (s.ok()) s = DrainGetLocked();
+  GetExecutionContext* instance = nullptr;
+  if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, {}, &instance);
+  if (!s.ok()) return s;
+  s = instance->view().operation()->SetBatchGetKernelProfiling(enabled, detailed);
+  instance->ClearRequest();
+  return s;
+}
+Status ExecutionDispatcher::CopyGetProfiles(std::optional<GetExecutionConfig> config,
+                                             std::vector<BatchGetKernelProfile>* profiles) {
+  if (!profiles) return Status::InvalidArgument("null Get profile output");
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, config, &resolved);
+  if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  if (!instance || instance->cleanup_only)
+    return Status::NotInitialized("Get instance has no readable profile");
+  if (pending_get_ == instance)
+    return Status::Busy("complete Get with DrainGet before reading its profile");
+  return instance->view().operation()->CopyBatchGetKernelProfiles(profiles);
+}
+Status ExecutionDispatcher::CheckGetStatus(std::optional<GetExecutionConfig> config, void* stream) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  GetExecutionConfig resolved;
+  auto s = ResolveExecution(policy_, config, &resolved);
+  if (!s.ok()) return s;
+  auto* instance = FindGetInstanceLocked(resolved);
+  if (!instance || instance->cleanup_only)
+    return Status::NotInitialized("Get instance is not available for status checking");
+  if (graph_context_ == instance && stream != instance->graph_options.stream)
+    return Status::InvalidArgument("check Get graph status on its prepared stream");
+  return instance->view().operation()->CheckBatchGetStatus(stream);
+}
 Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOptions& r, std::uint64_t* id) {
   if (!id) return Status::InvalidArgument("null graph lease output");
   *id = 0;
@@ -599,8 +645,6 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (c.executor != Executor::Aiv || c.algorithm != GetAlgorithm::Direct)
-    return Status::NotImplemented("only AIV Direct Get supports graph leases");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (!s.ok()) return s;

@@ -29,6 +29,8 @@ class UmdkAccessOperator final : public AccessOperator {
   Status Initialize(const RemoteRegionDesc&) override;
   Status Shutdown() override;
   Status DrainGet() override;
+  Status PrepareGetGraph(const GetGraphOptions&) override;
+  Status FinishGetGraph(void*, bool) override;
   Status PrepareGetOutput(const GetOutputOptions&) override;
   Status FinishGetOutput() override;
   Status PreparePutInput(const PutInputOptions&) override;
@@ -36,9 +38,9 @@ class UmdkAccessOperator final : public AccessOperator {
   Status Warmup(const ExecutionWarmup&) override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
-  Status CheckBatchGetStatus(void* stream);
-  Status SetBatchGetKernelProfiling(bool enabled);
-  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const;
+  Status CheckBatchGetStatus(void* stream) override;
+  Status SetBatchGetKernelProfiling(bool enabled) override;
+  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const override;
 
  private:
   std::unique_ptr<AicpuExecutionResources> owned_resources_;

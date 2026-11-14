@@ -19,6 +19,9 @@ struct AicpuInvocation final : ExecutionState {
   std::unique_ptr<ExecutionState> put, get, push;
   MutableBufferView get_output;
   bool output_bound{false};
+  GetGraphOptions graph_options;
+  bool graph_active{false}, graph_recorded{false};
+  bool graph_retiring{false}, graph_close_required{false};
   PutInputOptions put_input;
   bool input_bound{false};
   bool input_retiring{false};
@@ -50,6 +53,8 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   Status PrepareGetResources(const BatchGetExecRequest&);
   Status ReleasePutBuffers();
   Status ReleaseGetBuffers();
+  Status PrepareGetGraph(const GetGraphOptions&);
+  Status FinishGetGraph(void*, bool);
   Status PrepareGetOutput(const GetOutputOptions&);
   Status FinishGetOutput();
   Status PreparePutInput(const PutInputOptions&);

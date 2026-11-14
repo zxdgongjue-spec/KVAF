@@ -45,3 +45,50 @@ main 的线程调度行为，`--gather-affinity` 已移除；性能对比显式�
 
 Recover 要求目标实例无输出/图绑定，先完成在途操作，再关闭并重建资源。关闭失败
 保留实例、状态及资源引用，允许重试；成功 Shutdown 才统一释放它们。
+
+## 3. 四种 Get 的图模式
+
+四个后端均通过 `begin_get_graph(config, output, capacity, stream)` 提前准备资源；
+捕获时 `batch_get(..., execution=config, graph_lease=lease, synchronize=False)`
+只提交已准备的设备任务。固定配置、stream、输出地址和容量后，可在相同输入存储中
+更新 indices、offsets、miss_count、output_indices，重放全量、部分和零请求。
+图期间禁止同一 Runtime 的额外 Get / Drain / Warmup / Recover / Shutdown。
+一个租约仅允许一个 Get 节点，Put 不进入图。
+
+AIV Direct 保持原状态处理语义：不增加每次状态清零或结果回拷。UBMEM 保留自身
+完成检查。AICPU Gather/Scatter 使用设备侧 ticket 推进跨 replay 的通信序号；
+捕获阶段不注册、不分配、不同步，显式状态检查须在 replay 完成后执行。
+未重放的 AICPU 图正常结束会报未完成，可 `discard_result=True` 取消。
+同步/注销失败保留资源和租约以供重试；AICPU 协议错误后显式 discard 会关闭该算法
+owner，之后必须 `recover(config)`，不会复用可能损坏的队列。
+
+Profiling 和状态查询通过算法配置路由到驻留实例，默认取 Runtime 的默认 Get。
+图前启用 profile、每轮完成后读取，销毁图并结束租约后停用。保留最后成功 profile
+供结束后读取。AICPU 的 `check_batch_get_status(stream, execution=config)` 检查
+实际对应算法；AIV 无需新增这一检查。
+
+更新 CPU、NPU 和 AICPU 包后，先验证全部功能（同一 CPU 服务进程）：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
+  --report "$PWD/validation-four-get-graph.json"
+```
+
+`graph` 案例已覆盖四种 Get；聚焦验证可加 `--modes urma+ubmem --cases graph`。
+统一性能入口也可逐个比较 eager / graph，不改变接口模式：
+
+```bash
+for backend in aiv ubmem gather_read cpu_push_scatter; do
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+  bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
+    --execution-mode per-call --backend "$backend" --execution both \
+    --request-length 32768 --miss-count 4096 --table-capacity 4096 \
+    --token-bytes 656 --tokens-per-block 128 --aiv-cores 2 --jettys-per-core 2 \
+    --warmup 10 --iterations 100 --graph-replays 100 --kernel-profile || break
+done
+```
+
+kernel profile 用于设备分析；Host 延迟对照使用两种接口模式相同的 profile 设置与
+`--get-timing sync-call`。便携回归覆盖四算法路由、捕获限制、stream 校验、失败重试、
+空/部分/全量请求及 profile 收尾；它们不替代真机 E2E 和性能验证。

@@ -46,6 +46,21 @@ class SessionAccessOperator final : public AccessOperator {
     return s.ok() ? resources_->operation()->PrepareGetOutput(r) : s;
   }
   Status FinishGetOutput() override { return resources_->operation()->FinishGetOutput(); }
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed) override {
+    auto* op = resources_->operation();
+    return op ? op->SetBatchGetKernelProfiling(enabled, detailed)
+              : Status::NotInitialized("session not initialized");
+  }
+  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const override {
+    auto* op = resources_->operation();
+    return op ? op->CopyBatchGetKernelProfiles(profiles)
+              : Status::NotInitialized("session not initialized");
+  }
+  Status CheckBatchGetStatus(void* stream) override {
+    auto* op = resources_->operation();
+    return op ? op->CheckBatchGetStatus(stream)
+              : Status::NotInitialized("session not initialized");
+  }
   Status DrainGet() override {
     auto* op = resources_->operation();
     return op ? op->DrainGet() : Status::OK();

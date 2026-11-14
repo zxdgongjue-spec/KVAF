@@ -53,14 +53,10 @@ case "$timing" in
     exec "${PYTHON:-python3}" "$KVAF_ROOT/tests/python/batch_get_host_sweep.py" \
       "$KVAF_BUILD_DIR" --execution-mode "$execution_mode" "${base_options[@]}"
     ;;
-  kernel)
-    if [[ "$execution_mode" == per-call ]]; then
-      echo "ERROR: per-call AIV/UBMEM kernel cycle profiling is unavailable; use --timing host" >&2
-      exit 2
-    fi
-    ;;
+  kernel) ;;
   *) echo "ERROR: --timing must be host or kernel" >&2; exit 2 ;;
 esac
+base_options+=(--execution-mode "$execution_mode")
 : "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 # Space-separated overrides allow a focused shape without editing the script.
 read -r -a KVAF_BATCH_GET_TOKEN_BYTES <<< "${KVAF_BATCH_GET_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"
@@ -107,7 +103,7 @@ echo "BATCH_GET_MISS_SWEEP_LOG_DIR path=$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"
 KVAF_BATCH_GET_SWEEP_COMBINATIONS=$((${#KVAF_BATCH_GET_TOKEN_BYTES[@]} *
   ${#KVAF_BATCH_GET_MISS_COUNTS[@]} * ${#KVAF_BATCH_GET_AIV_CORES[@]} *
   ${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]}))
-echo "BATCH_GET_MISS_SWEEP_PLAN execution_mode=legacy timing=kernel_cycles transport=$transport token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
+echo "BATCH_GET_MISS_SWEEP_PLAN execution_mode=$execution_mode timing=kernel_cycles transport=$transport token_sizes=${#KVAF_BATCH_GET_TOKEN_BYTES[@]} miss_counts=${#KVAF_BATCH_GET_MISS_COUNTS[@]} aiv_core_counts=${#KVAF_BATCH_GET_AIV_CORES[@]} jetty_counts=${#KVAF_BATCH_GET_JETTYS_PER_CORE[@]} combinations=$KVAF_BATCH_GET_SWEEP_COMBINATIONS"
 
 extract_field() {
   local record="$1"
@@ -126,8 +122,20 @@ extract_profile_result() {
   local log_file="$1"
   local operation="$2"
   awk -v target="operation=$operation" \
-    '$1 == "PERF_RESULT" && $2 == target { result = $0 } END { print result }' \
+    '$1 == "PERF_RESULT" { for (i = 2; i <= NF; ++i) if ($i == target) result = $0 }
+     END { print result }' \
     "$log_file"
+}
+
+verify_execution_mode() {
+  local log_file="$1"
+  local config actual_mode
+  config="$(awk '$1 == "BATCH_GET_PERF_CONFIG" { result = $0 } END { print result }' "$log_file")"
+  actual_mode="$(extract_field "$config" execution_mode || true)"
+  if [[ "$actual_mode" != "$execution_mode" ]]; then
+    echo "ERROR: expected execution_mode=$execution_mode, runner reported ${actual_mode:-no execution mode}: $log_file" >&2
+    return 1
+  fi
 }
 
 cycles_to_us() {
@@ -288,6 +296,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
           echo "BATCH_GET_MISS_SWEEP_FAILED token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label status=$run_status" >&2
           exit "$run_status"
         fi
+        verify_execution_mode "$log_file"
 
     total_profile_result="$(
       extract_profile_result "$log_file" batch_get_kernel_total
@@ -314,7 +323,7 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
             for statistic in mean p50 p90 p99; do
               stage_values+=("$(cycles_to_us "$(extract_field "$stage_result" "${statistic}_cycles")")")
             done
-            ubmem_stage_rows+=("$token_bytes,$miss_count,$aiv_cores,kernel_$stage,${stage_values[0]},${stage_values[1]},${stage_values[2]},${stage_values[3]}")
+            ubmem_stage_rows+=("$token_bytes,$miss_count,$aiv_cores,kernel_$stage,${stage_values[0]},${stage_values[1]},${stage_values[2]},${stage_values[3]},$execution_mode,kernel_cycles")
           done
         fi
 
@@ -402,6 +411,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
 
     result=(
       "BATCH_GET_MISS_SWEEP_RESULT"
+      "execution_mode=$execution_mode"
+      "timing=kernel_cycles"
       "transport=$transport"
       "token_bytes=$token_bytes"
       "miss_count=$miss_count"
@@ -442,8 +453,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_DONE token_bytes=$token_bytes"
 done
 
-printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores\n' \
-  "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
+printf '\nBATCH_GET_MISS_SWEEP_SUMMARY execution_mode=%s timing=kernel_cycles combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores\n' \
+  "$execution_mode" "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
 printf 'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_total\n'
 printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s %15s\n' \
   token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us p50_GB/s
@@ -501,7 +512,7 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
   printf '%s\n' \
     'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,execution_mode,timing'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,legacy,kernel_cycles\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,kernel_cycles\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -519,7 +530,7 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_p50_us_values[$index]}" \
       "${completion_wait_p90_us_values[$index]}" \
       "${completion_wait_p99_us_values[$index]}" \
-      "${selected_ub_device_values[$index]}"
+      "${selected_ub_device_values[$index]}" "$execution_mode"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"
@@ -527,7 +538,7 @@ echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=
 if ((${#ubmem_stage_rows[@]} > 0)); then
   ubmem_stage_csv="${KVAF_BATCH_GET_MISS_SWEEP_CSV%.csv}_ubmem_stages.csv"
   {
-    echo 'token_bytes,miss_count,aiv_cores,stage,mean_us,p50_us,p90_us,p99_us'
+    echo 'token_bytes,miss_count,aiv_cores,stage,mean_us,p50_us,p90_us,p99_us,execution_mode,timing'
     printf '%s\n' "${ubmem_stage_rows[@]}"
   } > "$ubmem_stage_csv"
   printf '\nBATCH_GET_UBMEM_DETAIL_SUMMARY units=us aggregation=on_slowest_total_core_per_sample profile_overhead_included=1\n'

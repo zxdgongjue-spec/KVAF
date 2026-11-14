@@ -33,6 +33,10 @@ struct AicpuGetInvocation final : ExecutionState {
   aclrtStream captured_stream{}, last_stream{};
   bool prepared_capturing{false}, submitted{false}, profile_submitted{false};
   Status failure;
+  bool profile_complete{false};
+  bool graph_active{false};
+  aclrtStream graph_stream{};
+  std::uint64_t graph_start_sequence{};
   const BatchGetRequest* prepared{};
   void* prepared_stream{};
   BatchGetProfile* prepared_profile{};

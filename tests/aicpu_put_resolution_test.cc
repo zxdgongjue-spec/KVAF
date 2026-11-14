@@ -14,8 +14,10 @@ namespace {
 using namespace kvaf::aicpu_urma;
 int single_unregisters = 0;
 int writes = 0, unregisters = 0, allocations = 0, registrations = 0, destroys = 0, frees = 0;
-bool fail_wait = false, fail_copy = false, write_error = false;
+bool fail_wait = false, fail_copy = false, write_error = false, capturing = false;
 bool fail_launch = false, fail_memset = false, fail_wait_on_write = false, fail_wait_on_prepare = false;
+bool fail_graph_retirement = false;
+bool unregister_error = false, destroy_error = false;
 std::vector<UmdkTransfer> submitted;
 }
 extern "C" {
@@ -33,7 +35,7 @@ aclError aclrtMemcpy(void* p, size_t, const void* s, size_t n, aclrtMemcpyKind k
 }
 aclError aclrtSynchronizeStream(aclrtStream) { return fail_wait ? 1 : 0; }
 aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI*) {
-  *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
+  *status = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
 }
 namespace kvaf::peer {
@@ -53,6 +55,8 @@ namespace kvaf::aicpu_urma {
 struct BatchGetTransport::Impl {
   explicit Impl(UmdkSession& s) : session(s) {}
   UmdkSession& session;
+  AicpuGetInvocation legacy{this};
+  AicpuGetInvocation* call{&legacy};
   uint64_t region = 0;
   uint8_t workspace[64]{};
 };
@@ -62,6 +66,20 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& r) { impl_->region 
 Status BatchGetTransport::Warmup() { return impl_->session.Ensure(impl_->region, impl_->workspace, sizeof(impl_->workspace)); }
 Status BatchGetTransport::Shutdown() { return Status::OK(); }
 Status BatchGetTransport::Drain(bool) { return Status::OK(); }
+Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
+  if (capturing) return Status::InvalidState("capture active");
+  auto s = Warmup();
+  if (s.ok()) s = impl_->session.Ensure(impl_->region, options.output.data, options.output.bytes);
+  if (s.ok()) { impl_->call->graph_active = true; impl_->call->graph_stream = options.stream; }
+  return s;
+}
+Status BatchGetTransport::FinishGraph(void*, bool) {
+  if (capturing || fail_wait) return Status::CompletionUnknown("capture/pending");
+  if (!impl_->call->failure.ok()) return impl_->call->failure;
+  impl_->call->graph_active = false;
+  if (fail_graph_retirement) fail_wait = true;
+  return Status::OK();
+}
 Status BatchGetTransport::Check(aclrtStream) { return Status::OK(); }
 Status BatchGetTransport::SetKernelProfiling(bool) { return Status::OK(); }
 Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*) const { return Status::OK(); }
@@ -71,9 +89,14 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& r) {
 }
 Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
 GatherLaunchView BatchGetTransport::View() const { return {}; }
-Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*) { return Status::NotImplemented("unused"); }
-std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() { return {}; }
-Status BatchGetTransport::BindExecutionState(ExecutionState*) { return Status::OK(); }
+Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*) { return Status::OK(); }
+std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
+  return std::make_unique<AicpuGetInvocation>(impl_.get());
+}
+Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
+  impl_->call = state ? static_cast<AicpuGetInvocation*>(state) : &impl_->legacy;
+  return Status::OK();
+}
 Status PrepareUmdkKernel(const std::string&, bool) { return Status::OK(); }
 int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, uint32_t) {
   const auto& args = *static_cast<const UmdkControlArgs*>(input);
@@ -86,6 +109,8 @@ int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, ui
   if (args.op == UmdkControlOp::kPrepare || args.op == UmdkControlOp::kRegisterBuffer) ++registrations;
   if (args.op == UmdkControlOp::kPrepare && fail_wait_on_prepare) fail_wait = true;
   if (args.op == UmdkControlOp::kDestroy) ++destroys;
+  if ((args.op == UmdkControlOp::kUnregisterBuffer && unregister_error) ||
+      (args.op == UmdkControlOp::kDestroy && destroy_error)) status.result = -1;
   return 0;
 }
 int32_t LaunchBatchPut(const BatchPutKernelArgs* args, aclrtStream stream) {
@@ -389,6 +414,83 @@ int main() {
   }
   CHECK(registrations == base_regs + 5 && single_unregisters == base_unregs + 4);
   CHECK(unregisters == base_all); // Ordinary transient Gets also keep workspace.
+  // Managed graph pins the same invocation/output and excludes ordinary use.
+  GetGraphOptions graph_options{binding.output, binding.stream, 3};
+  CHECK(gather.PrepareGetGraph(graph_options).ok());
+  auto* graph_state = static_cast<AicpuInvocation*>(gather_state.get());
+  CHECK(graph_state->graph_active);
+  CHECK(!gather.PrepareGetOutput(binding).ok());
+  CHECK(!gather.FinishGetOutput().ok());
+  CHECK(gather.BindExecutionState(nullptr).code() == StatusCode::kBusy);
+  CHECK(gather_owner->Close().code() == StatusCode::kBusy);
+  CHECK(!gather.ExecuteBatchGet(g).ok()); // must capture
+  capturing = true;
+  auto wrong_graph = g; wrong_graph.execution.stream = reinterpret_cast<void*>(77);
+  CHECK(!gather.ExecuteBatchGet(wrong_graph).ok());
+  auto wrong_output = r; wrong_output.output.bytes -= 1;
+  wrong_graph = g; wrong_graph.request = &wrong_output;
+  CHECK(!gather.ExecuteBatchGet(wrong_graph).ok());
+  auto oversized = r; oversized.indices = {input, 4 * sizeof(std::int32_t), DeviceKind::kNpu};
+  wrong_graph = g; wrong_graph.request = &oversized;
+  CHECK(!gather.ExecuteBatchGet(wrong_graph).ok());
+  wrong_graph = g; wrong_graph.execution.synchronize = true;
+  CHECK(!gather.ExecuteBatchGet(wrong_graph).ok());
+  const auto graph_regs = registrations, graph_unregs = single_unregisters;
+  CHECK(gather.ExecuteBatchGet(g).ok());
+  CHECK(graph_state->graph_recorded);
+  CHECK(!gather.SetBatchGetKernelProfiling(true).ok());
+  CHECK(!gather.ExecuteBatchGet(g).ok()); // exactly one captured node
+  CHECK(gather_resources->ReleaseGetBuffers().ok());
+  CHECK(registrations == graph_regs && single_unregisters == graph_unregs);
+  CHECK(!gather.FinishGetGraph(binding.stream, true).ok());
+  capturing = false;
+  fail_wait = true;
+  CHECK(!gather.FinishGetGraph(binding.stream, false).ok());
+  CHECK(graph_state->graph_active && single_unregisters == graph_unregs);
+  fail_wait = false;
+  fail_graph_retirement = true;
+  CHECK(!gather.FinishGetGraph(binding.stream, false).ok());
+  CHECK(graph_state->graph_active && graph_state->graph_retiring);
+  CHECK(single_unregisters == graph_unregs + 1);
+  fail_wait = fail_graph_retirement = false;
+  CHECK(gather.FinishGetGraph(binding.stream, false).ok());
+  CHECK(!graph_state->graph_active && single_unregisters == graph_unregs + 1);
+  // A permanent MR unregister failure cannot be recovered by retrying that
+  // control command. Explicit discard upgrades retirement to full Close.
+  CHECK(gather.PrepareGetGraph(graph_options).ok());
+  unregister_error = true;
+  CHECK(!gather.FinishGetGraph(binding.stream, false).ok());
+  CHECK(graph_state->graph_active && graph_state->graph_retiring);
+  const auto failed_mr_unregs = single_unregisters;
+  CHECK(!gather.FinishGetGraph(binding.stream, false).ok());
+  CHECK(single_unregisters == failed_mr_unregs);
+  unregister_error = false;
+  fail_wait = true;
+  CHECK(!gather.FinishGetGraph(binding.stream, true).ok());
+  CHECK(graph_state->graph_active && !graph_state->graph_close_required);
+  fail_wait = false; destroy_error = true;
+  CHECK(!gather.FinishGetGraph(binding.stream, true).ok());
+  CHECK(graph_state->graph_active && graph_state->graph_close_required);
+  destroy_error = false;
+  CHECK(gather.FinishGetGraph(binding.stream, true).ok());
+  CHECK(!graph_state->graph_active && !graph_state->graph_retiring);
+  CHECK(single_unregisters == failed_mr_unregs);
+  // The owner can now be rebuilt, as Recover does after dropping its graph id.
+  CHECK(gather_owner->Initialize(region).ok());
+  CHECK(gather.PrepareGetGraph(graph_options).ok());
+  CHECK(gather.FinishGetGraph(binding.stream, true).ok());
+  // Explicitly discarding a protocol failure closes the entire transport;
+  // the graph lease is cleared only once that close succeeds.
+  CHECK(gather.PrepareGetGraph(graph_options).ok());
+  static_cast<AicpuGetInvocation*>(graph_state->get.get())->failure = Status::Internal("device failure");
+  CHECK(!gather.FinishGetGraph(binding.stream, false).ok());
+  const auto prior_close = destroys;
+  fail_wait = true;
+  CHECK(!gather.FinishGetGraph(binding.stream, true).ok());
+  CHECK(graph_state->graph_active && graph_state->graph_retiring);
+  fail_wait = false;
+  CHECK(gather.FinishGetGraph(binding.stream, true).ok());
+  CHECK(!graph_state->graph_active && destroys == prior_close + 1);
   CHECK(gather.BindExecutionState(nullptr).ok());
   CHECK(gather_owner->Close().ok());
   std::cout << "AICPU typed resources, prepare/launch separation and WRITE recovery passed\n";

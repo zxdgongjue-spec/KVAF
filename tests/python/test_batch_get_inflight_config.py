@@ -81,6 +81,8 @@ class InflightConfigTests(unittest.TestCase):
 import json, os, pathlib, sys
 with pathlib.Path(os.environ["CALL_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
+mode = sys.argv[sys.argv.index("--execution-mode") + 1]
+print(f"BATCH_GET_PERF_CONFIG execution_mode={mode}")
 if "--adaptive-calibration-only" in sys.argv:
     print("[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED reason=k_side_device_filter")
 for stage in ("total", "post", "completion_wait"):

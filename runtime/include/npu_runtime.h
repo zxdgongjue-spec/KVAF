@@ -88,12 +88,15 @@ class NpuRuntime final : public Runtime {
   Status Recover(GetExecutionConfig);
   bool per_call_execution() const;
 
-  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false,
+                                    std::optional<GetExecutionConfig> config = std::nullopt);
   // Outside capture: synchronize the execution stream and report retained
   // AICPU protocol errors, including errors from earlier graph replays.
-  Status CheckBatchGetStatus(void* stream);
+  Status CheckBatchGetStatus(void* stream,
+                            std::optional<GetExecutionConfig> config = std::nullopt);
   Status CopyBatchGetKernelProfiles(
-      std::vector<BatchGetKernelProfile>* profiles) const;
+      std::vector<BatchGetKernelProfile>* profiles,
+      std::optional<GetExecutionConfig> config = std::nullopt) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

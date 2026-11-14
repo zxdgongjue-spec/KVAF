@@ -20,6 +20,7 @@ class PeerLink;
 namespace kvaf {
 
 struct PutAccessDesc;
+struct BatchGetKernelProfile;
 using PeerLink = peer::PeerLink;
 
 struct BatchPutExecRequest {
@@ -98,6 +99,19 @@ class AccessOperator {
     return Status::NotImplemented("input bindings require execution dispatcher");
   }
   virtual Status DrainGet() { return Status::OK(); }
+  virtual Status SetBatchGetKernelProfiling(bool) {
+    return Status::NotImplemented("provider does not support Get profiling");
+  }
+  virtual Status SetBatchGetKernelProfiling(bool enabled, bool detailed) {
+    if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBMEM");
+    return SetBatchGetKernelProfiling(enabled);
+  }
+  virtual Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>*) const {
+    return Status::NotImplemented("provider does not support Get profiling");
+  }
+  virtual Status CheckBatchGetStatus(void*) {
+    return Status::NotImplemented("explicit Get status checking requires an AICPU backend");
+  }
   virtual Status PrepareGetOutput(const GetOutputOptions&) {
     return Status::NotImplemented("provider does not support reusable output bindings");
   }
@@ -233,9 +247,9 @@ class DefaultAccessOperator final : public AccessOperator {
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.
-  Status SetBatchGetKernelProfiling(bool enabled);
+  Status SetBatchGetKernelProfiling(bool enabled) override;
   Status CopyBatchGetKernelProfiles(
-      std::vector<BatchGetKernelProfile>* profiles) const;
+      std::vector<BatchGetKernelProfile>* profiles) const override;
 
  private:
   // Compatibility ownership for standalone users; managed entry transfers it.

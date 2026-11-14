@@ -12,7 +12,7 @@
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
 int launches = 0, mappings_closed = 0, releases = 0, allocations = 0;
-bool fail_free = false;
+bool fail_free = false, capturing = false;
 bool fail_wait = false, fail_copy = false, incomplete = false, fail_launch = false;
 }
 extern "C" {
@@ -37,7 +37,7 @@ aclError aclrtMemcpyAsync(void* p, size_t size, const void* s, size_t n, aclrtMe
 }
 aclError aclrtSynchronizeStream(aclrtStream) { return fail_wait ? 1 : 0; }
 aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* status, aclmdlRI*) {
-  *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
+  *status = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
 aclrtBinary aclrtCreateBinary(const void*, size_t) { return reinterpret_cast<aclrtBinary>(1); }
 aclError aclrtDestroyBinary(aclrtBinary) { return 0; }
@@ -217,5 +217,32 @@ int main() {
   invocation.reset();
   independent.reset();
   CHECK(mappings_closed == 2 && releases == 2);
+  // Graph preparation owns stream slots once; capture only submits device work.
+  ubmem::AccessOperator graph_op(options);
+  CHECK(graph_op.Initialize(region).ok());
+  auto graph_state = graph_op.CreateExecutionState();
+  CHECK(graph_op.BindExecutionState(graph_state.get()).ok());
+  CHECK(graph_op.SetBatchGetKernelProfiling(true).ok());
+  CHECK(graph_op.PrepareGetGraph({get.output, get_call.execution.stream, 1}).ok());
+  const auto graph_allocations = allocations;
+  get_call.execution.synchronize = false;
+  capturing = true;
+  CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+  CHECK(allocations == graph_allocations);
+  std::vector<BatchGetKernelProfile> profiles;
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, true).ok());
+  capturing = false;
+  CHECK(!graph_op.FinishGetGraph(reinterpret_cast<void*>(99), false).ok());
+  fail_wait = true;
+  CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, true).ok());
+  CHECK(graph_op.Shutdown().code() == StatusCode::kBusy);
+  fail_wait = false;
+  fail_copy = true;
+  CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, false).ok());
+  fail_copy = false;
+  CHECK(graph_op.FinishGetGraph(get_call.execution.stream, false).ok());
+  CHECK(graph_op.Shutdown().ok());
+  CHECK(graph_op.BindExecutionState(nullptr).ok());
   std::cout << "UBMEM independent resources, typed launch views and completion recovery passed\n";
 }

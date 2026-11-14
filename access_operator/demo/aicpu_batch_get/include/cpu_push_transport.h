@@ -24,6 +24,8 @@ class CpuPushTransport {
   aicpu_urma::ScatterLaunchView View() const;
   static Status LaunchPrepared(const BatchGetExecRequest&, const aicpu_urma::ScatterLaunchView&, ExecutionState*);
   Status Drain();
+  Status PrepareGraph(const GetGraphOptions&);
+  Status FinishGraph(void* stream, bool discard);
   std::unique_ptr<ExecutionState> CreateExecutionState();
   Status BindExecutionState(ExecutionState*);
   Status Check(void* stream);

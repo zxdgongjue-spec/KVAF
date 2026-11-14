@@ -1211,54 +1211,30 @@ Status NpuRuntime::Warmup(GetExecutionConfig c, const ExecutionWarmup& request) 
                            : Status::NotImplemented("warmup requires per-call execution");
 }
 
-Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
-  if (impl_->access_operator == nullptr) {
-    return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before configuring BatchGet profiling");
-  }
-#if defined(KVAF_ENABLE_AICPU_URMA)
-  if (!impl_->options.per_call_execution && detail::UsesAicpu(impl_->backend)) {
-    if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBmem");
-    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
-  }
-#endif
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem)
-    return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled, detailed);
-  if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBmem");
-  if (impl_->urma_operator != nullptr)
-    return impl_->urma_operator->SetBatchGetKernelProfiling(enabled);
-#endif
-  return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
+Status NpuRuntime::SetBatchGetKernelProfiling(
+    bool enabled, bool detailed, std::optional<GetExecutionConfig> config) {
+  if (!initialized() || !impl_->access_operator)
+    return Status::NotInitialized("initialize Runtime before configuring Get profiling");
+  if (impl_->dispatcher) return impl_->dispatcher->ConfigureGetProfiling(config, enabled, detailed);
+  if (config) return Status::InvalidArgument("explicit Get configuration requires per-call execution");
+  return impl_->access_operator->SetBatchGetKernelProfiling(enabled, detailed);
 }
 
-Status NpuRuntime::CheckBatchGetStatus(void* stream) {
+Status NpuRuntime::CheckBatchGetStatus(void* stream, std::optional<GetExecutionConfig> config) {
   if (!initialized() || !impl_->access_operator)
     return Status::NotInitialized("NpuRuntime is not initialized");
-#if defined(KVAF_ENABLE_AICPU_URMA)
-  if (!impl_->options.per_call_execution && detail::UsesAicpu(impl_->backend))
-    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CheckBatchGetStatus(stream);
-#endif
-  return Status::NotImplemented("check_batch_get_status requires an AICPU backend");
+  if (impl_->dispatcher) return impl_->dispatcher->CheckGetStatus(config, stream);
+  if (config) return Status::InvalidArgument("explicit Get configuration requires per-call execution");
+  return impl_->access_operator->CheckBatchGetStatus(stream);
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
-    std::vector<BatchGetKernelProfile>* profiles) const {
-  if (impl_->access_operator == nullptr) {
-    return Status::NotInitialized(
-        "NpuRuntime requires LinkTo before reading BatchGet profiling");
-  }
-#if defined(KVAF_ENABLE_AICPU_URMA)
-  if (!impl_->options.per_call_execution && detail::UsesAicpu(impl_->backend))
-    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
-#endif
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem)
-    return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
-  if (impl_->urma_operator != nullptr)
-    return impl_->urma_operator->CopyBatchGetKernelProfiles(profiles);
-#endif
-  return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
+    std::vector<BatchGetKernelProfile>* profiles, std::optional<GetExecutionConfig> config) const {
+  if (!initialized() || !impl_->access_operator)
+    return Status::NotInitialized("initialize Runtime before reading Get profiling");
+  if (impl_->dispatcher) return impl_->dispatcher->CopyGetProfiles(config, profiles);
+  if (config) return Status::InvalidArgument("explicit Get configuration requires per-call execution");
+  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

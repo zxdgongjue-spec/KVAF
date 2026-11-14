@@ -63,6 +63,10 @@ int32_t LaunchBatchGet(const UmdkBatchGetArgs* args, aclrtStream) {
     statuses[w].magic = kGatherStatusMagic;
     auto* control = reinterpret_cast<GatherExecutionControl*>(args->gather.execution_control);
     statuses[w].sequence = ClaimBatchGetTicket(&control->claimed, args->gather.worker_count).sequence;
+    if (args->gather.profile) {
+      auto* profile = reinterpret_cast<kvaf::BatchGetWorkerProfile*>(args->gather.profile) + w;
+      *profile = {}; profile->enter_ns = 10; profile->exit_ns = 20; profile->spans = 1;
+    }
   }
   return 0;
 }
@@ -155,5 +159,48 @@ int main() {
   CHECK(!BatchGetTransport::LaunchPrepared(call, bound_view, state.get()).ok() && launches == 7);
   state.reset();
   CHECK(gather.Shutdown().ok() && buffers.empty());
+  // Managed graph lifecycle keeps a sequence baseline and never mistakes the
+  // warmup's old report for a new replay. Retry retains all prepared storage.
+  BatchGetTransport graph_get(session, 16);
+  CHECK(graph_get.Initialize({0x100000, 4096, 16, DeviceKind::kCpu}).ok());
+  CHECK(graph_get.SetKernelProfiling(true).ok());
+  std::vector<BatchGetKernelProfile> kernel_profiles;
+  call.execution.synchronize = true;
+  CHECK(graph_get.Execute(call).ok());
+  call.execution.synchronize = false;
+  GetGraphOptions options{request.output, call.execution.stream, 1};
+  CHECK(graph_get.PrepareGraph(options).ok());
+  CHECK(!graph_get.PrepareGraph(options).ok());
+  capturing = true;
+  CHECK(graph_get.Execute(call).ok());
+  CHECK(!graph_get.FinishGraph(call.execution.stream, true).ok());
+  CHECK(!graph_get.CopyKernelProfiles(&kernel_profiles).ok());
+  capturing = false;
+  CHECK(!graph_get.FinishGraph(call.execution.stream, false).ok());
+  CHECK(graph_get.FinishGraph(call.execution.stream, true).ok());
+  CHECK(graph_get.PrepareGraph(options).ok());
+  capturing = true;
+  CHECK(graph_get.Execute(call).ok());
+  capturing = false;
+  CHECK(LaunchBatchGet(&captured_args, call.execution.stream) == 0);
+  CHECK(graph_get.CopyKernelProfiles(&kernel_profiles).ok() && kernel_profiles.size() == 2);
+  CHECK(kernel_profiles[0].device_finish_ns == 20);
+  fail_sync = true;
+  const auto retained = buffers.size();
+  CHECK(!graph_get.FinishGraph(call.execution.stream, false).ok() && buffers.size() == retained);
+  fail_sync = false;
+  CHECK(!graph_get.FinishGraph(reinterpret_cast<void*>(2), true).ok());
+  CHECK(graph_get.FinishGraph(call.execution.stream, false).ok());
+  CHECK(graph_get.CopyKernelProfiles(&kernel_profiles).ok() && kernel_profiles.size() == 2);
+  CHECK(graph_get.SetKernelProfiling(false).ok());
+  CHECK(!graph_get.CopyKernelProfiles(&kernel_profiles).ok());
+  CHECK(graph_get.PrepareGraph(options).ok());
+  capturing = true;
+  CHECK(graph_get.Execute(call).ok());
+  capturing = false;
+  CHECK(LaunchBatchGet(&captured_args, call.execution.stream) == 0);
+  reinterpret_cast<GatherExecutionControl*>(captured_args.gather.execution_control)->failed = 1;
+  CHECK(!graph_get.FinishGraph(call.execution.stream, true).ok());
+  CHECK(graph_get.Shutdown().ok() && buffers.empty());
   std::cout << "Gather preparation, typed invocation and allocation-free launch passed\n";
 }

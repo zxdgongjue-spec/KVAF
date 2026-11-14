@@ -228,16 +228,16 @@ class ExecutionTests(unittest.TestCase):
                 self.assertEqual(execution.input_binding, "transient")
                 self.assertNotIn("input_lease", execution.put_kwargs)
 
-    def test_unsupported_profiling_and_graph_shapes_fail_before_running(self):
+    def test_unsupported_configuration_and_graph_shapes_fail_before_running(self):
         with patch.dict(os.environ, {}, clear=True):
-            for options, error in ((["--kernel-profile"], "no kernel cycle profiling"),
-                                   (["--adaptive-ub-device"], "adaptive-ub-device"),
+            for options, error in ((["--adaptive-ub-device"], "adaptive-ub-device"),
                                    (["--contention-control-dir", "/tmp/control",
                                      "--contention-result", "/tmp/result"], "one Get")):
                 args = direct.parse_args(["--execution-mode", "per-call", *options])
                 self.assertIn(error, direct.validate_args(args))
-            args = direct.parse_args(["--execution-mode", "per-call", "--no-kernel-profile"])
-            self.assertIsNone(direct.validate_args(args))
+            for flag in ("--no-kernel-profile", "--kernel-profile"):
+                args = direct.parse_args(["--execution-mode", "per-call", flag])
+                self.assertIsNone(direct.validate_args(args))
 
     def test_aicpu_host_and_device_statistics_remain_separate(self):
         args = gather.parse_args(["--execution-mode", "per-call", "--table-capacity", "4"])
@@ -272,7 +272,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertIsNone(direct.validate_args(args))
         args = direct.parse_args(["--get-timing", "sync-call", "--kernel-profile",
                                   "--execution-mode", "per-call"])
-        self.assertIn("--no-kernel-profile", direct.validate_args(args))
+        self.assertIsNone(direct.validate_args(args))
 
     def test_per_call_sweep_forwards_options_and_labels_host_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:

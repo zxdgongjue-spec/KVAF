@@ -399,7 +399,10 @@ int main() {
   const auto before_graph_memsets = get_async_memsets;
   graph_capturing = true; get_status_error = true;
   CHECK(graph_get.ExecuteBatchGet(get_call).ok());
+  std::vector<BatchGetKernelProfile> graph_profiles;
+  CHECK(!graph_get.CopyBatchGetKernelProfiles(&graph_profiles).ok());
   graph_capturing = false;
+  CHECK(!graph_get.FinishGetGraph(reinterpret_cast<void*>(99), false).ok());
   CHECK(get_async_memsets == before_graph_memsets);
   fail_wait = true;
   CHECK(!graph_get.FinishGetGraph(get_call.execution.stream, false).ok());

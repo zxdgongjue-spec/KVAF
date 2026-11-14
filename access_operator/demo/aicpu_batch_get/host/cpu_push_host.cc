@@ -68,6 +68,9 @@ static Status DrainScatter(const aicpu_urma::ScatterLaunchView& view, aicpu_urma
       Status::InvalidState("CPU push failed; shutdown required") : call.failure;
   const auto* statuses = static_cast<const WorkerStatus*>(view.completion.host);
   const auto sequence = statuses[0].sequence;
+  if (call.graph_active && std::all_of(statuses, statuses + view.options.workers,
+      [&](const WorkerStatus& status) { return status.sequence <= call.graph_start_sequence; }))
+    return Status::InvalidState("Scatter graph has not replayed; replay or discard it");
   // Report the first real failure before checking agreement between workers.
   for (std::uint32_t w = 0; w < view.options.workers; ++w)
     if (statuses[w].magic == kMagic && statuses[w].sequence &&
@@ -112,6 +115,87 @@ Status CpuPushTransport::Impl::Drain() {
   return DrainScatter(view, *invocation);
 }
 Status CpuPushTransport::Drain() { return impl_->Drain(); }
+Status CpuPushTransport::PrepareGraph(const GetGraphOptions& options) {
+  auto& s = *impl_;
+  auto& call = *s.invocation;
+  if (!s.initialized) return Status::NotInitialized("CPU push is not initialized");
+  if (!options.stream || !options.output.data || !options.output.bytes ||
+      options.output.device != DeviceKind::kNpu || !options.request_capacity ||
+      options.request_capacity > kMaxRequests)
+    return Status::InvalidArgument("invalid Scatter graph options");
+  if (call.graph_active || call.captured_stream)
+    return Status::Busy("Scatter capture already owns this execution state");
+  bool capturing = false;
+  auto ready = detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), true, false, &capturing);
+  if (!ready.ok()) return ready;
+  ready = s.Drain();
+  if (!ready.ok()) return ready;
+  Coordination coordination{};
+  if (aclrtMemcpy(&coordination, sizeof(coordination), s.coordination, sizeof(coordination),
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    return Error("cannot read Scatter graph ticket baseline");
+  if (coordination.result.value || coordination.claimed.value % s.config.workers)
+    return Status::InvalidState("Scatter ticket state is incomplete; shutdown required");
+  call.graph_start_sequence = coordination.claimed.value / s.config.workers;
+  call.graph_stream = static_cast<aclrtStream>(options.stream);
+  call.graph_active = true;
+  call.submitted = call.profile_submitted = call.profile_complete = false;
+  call.last_stream = nullptr;
+  return Status::OK();
+}
+Status CpuPushTransport::FinishGraph(void* stream, bool discard) {
+  auto& s = *impl_;
+  auto& call = *s.invocation;
+  if (!call.graph_active || stream != call.graph_stream)
+    return Status::InvalidArgument("Scatter graph stream or lease does not match");
+  bool capturing = false;
+  auto ready = detail::BatchGetCapture(call.graph_stream, true, false, &capturing);
+  if (!ready.ok()) return ready;
+  // A failed fence is retryable. It does not prove that the graph or remote
+  // producer has completed, so the caller must retain the execution lease.
+  if (aclrtSynchronizeStream(call.graph_stream) != ACL_SUCCESS)
+    return Status::CompletionUnknown("Scatter graph stream is still pending; lease retained");
+  if (s.health.failed)
+    return call.failure.ok() ? Status::InvalidState("Scatter graph failed; shutdown required") : call.failure;
+  Coordination coordination{};
+  const auto status_bytes = s.config.workers * sizeof(WorkerStatus);
+  if (aclrtMemcpy(&coordination, sizeof(coordination), s.coordination, sizeof(coordination),
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
+      aclrtMemcpy(s.status_host, status_bytes, s.status_device, status_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+    return Status::CompletionUnknown("Scatter graph status unavailable; lease retained");
+  const auto fail = [&](const std::string& reason) {
+    s.health.failed = true;
+    return call.failure = Status::Internal(reason);
+  };
+  if (coordination.result.value)
+    return fail("Scatter graph device result=" + std::to_string(coordination.result.value));
+  const auto sequence = coordination.claimed.value / s.config.workers;
+  if (coordination.claimed.value % s.config.workers || sequence < call.graph_start_sequence)
+    return fail("Scatter graph ticket sequence is inconsistent");
+  if (sequence == call.graph_start_sequence) {
+    if (!discard) return Status::InvalidState("Scatter graph has not replayed; replay or discard it");
+  } else {
+    const auto* statuses = static_cast<const WorkerStatus*>(s.status_host);
+    for (std::uint32_t worker = 0; worker < s.config.workers; ++worker)
+      if (statuses[worker].magic != kMagic || statuses[worker].sequence != sequence ||
+          statuses[worker].result != static_cast<std::uint64_t>(Result::kOk))
+        return fail("Scatter graph worker " + std::to_string(worker) + " result=" +
+            std::to_string(statuses[worker].result) + " sequence=" +
+            std::to_string(statuses[worker].sequence));
+  }
+  // Graph destruction/discard is the caller's responsibility. These buffers
+  // and cumulative device tickets remain resident for the next execution.
+  call.graph_active = false;
+  call.graph_stream = call.captured_stream = call.pending = call.last_stream = nullptr;
+  call.prepared = nullptr;
+  call.prepared_stream = nullptr;
+  call.prepared_profile = nullptr;
+  call.profile_complete = call.profile_submitted && sequence > call.graph_start_sequence;
+  call.profile_submitted = call.profile_complete;
+  call.prepared_capturing = call.submitted = false;
+  return Status::OK();
+}
 Status CpuPushTransport::Check(void* stream) {
   auto& s = *impl_;
   if (!s.initialized || !s.invocation->last_stream)
@@ -132,16 +216,18 @@ Status CpuPushTransport::SetKernelProfiling(bool enabled) {
     if (!ready.ok()) return ready;
   }
   s.profiling = enabled;
-  s.invocation->profile_submitted = false;
+  s.invocation->profile_submitted = s.invocation->profile_complete = false;
   return Status::OK();
 }
 Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
   const auto& s = *impl_;
   if (!s.profiling || !s.invocation->profile_submitted)
     return Status::InvalidState("no profiled CPU push launch");
-  bool capturing = false;
-  auto ready = detail::BatchGetCapture(s.invocation->last_stream, true, false, &capturing);
-  if (!ready.ok()) return ready;
+  if (!s.invocation->profile_complete) {
+    bool capturing = false;
+    auto ready = detail::BatchGetCapture(s.invocation->last_stream, true, false, &capturing);
+    if (!ready.ok()) return ready;
+  }
   return detail::CopyAicpuProfiles(s.profile_device, s.profile_host, s.config.workers, profiles);
 }
 
@@ -249,6 +335,7 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec) {
     return Status::InvalidState("CPU push needs initialization and stream");
   if (s.health.failed) return Status::InvalidState("CPU push failed; shutdown required");
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  call.profile_complete = false;
   bool capturing = false;
   auto ready = detail::BatchGetCapture(stream, exec.execution.synchronize,
                                        exec.execution.profile != nullptr, &capturing);
@@ -393,9 +480,11 @@ Status CpuPushTransport::Shutdown() {
     if (*buffer && aclrtFreeHost(*buffer) != ACL_SUCCESS) return Error("free Host buffer");
     *buffer = nullptr;
   }
-  s.invocation->last_stream = s.invocation->captured_stream = nullptr;
+  s.invocation->last_stream = s.invocation->captured_stream = s.invocation->graph_stream = nullptr;
+  s.invocation->graph_active = false;
   s.initialized = s.health.failed = false;
-  s.profiling = s.invocation->profile_submitted = s.invocation->submitted = false;
+  s.profiling = s.invocation->profile_submitted = s.invocation->profile_complete =
+      s.invocation->submitted = false;
   s.invocation->failure = Status::OK();
   return drained;
 }

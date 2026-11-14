@@ -161,7 +161,8 @@ Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
 Status AccessOperator::FinishGetGraph(void* stream, bool discard) {
   std::lock_guard<std::mutex> lock(resources_->mutex);
   if (!resources_->invocation->graph_active) return Status::NotFound("UBMEM graph lease not found");
-  if (!stream) return Status::InvalidArgument("graph release requires its last replay stream");
+  if (!stream || stream != resources_->invocation->graph_options.stream)
+    return Status::InvalidArgument("graph release requires its prepared replay stream");
   aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
   aclmdlRI graph = nullptr;
   auto s = Acl("aclmdlRICaptureGetInfo",
@@ -223,6 +224,13 @@ Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProf
   if (!profiles) return Status::InvalidArgument("profile output is null");
   if (!resources_->ready || resources_->health.failed || !resources_->profiling || !resources_->invocation->profile_stream)
     return Status::InvalidState("no profiled UBmem BatchGet launch");
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  auto capture_status = Acl("aclmdlRICaptureGetInfo(profile)",
+      aclmdlRICaptureGetInfo(resources_->invocation->profile_stream, &capture, &graph));
+  if (!capture_status.ok()) return capture_status;
+  if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+    return Status::InvalidState("read Get profiling outside graph capture");
   const auto& state = resources_->streams.at(resources_->invocation->profile_stream);
   std::vector<CoreStatus> reports(resources_->options.cores);
   // As for URMA profiling, the caller completes the stream before this snapshot.

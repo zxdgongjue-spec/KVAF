@@ -55,6 +55,8 @@ Status UmdkAccessOperator::Shutdown() { return resources_->Close(); }
 Status UmdkAccessOperator::ResolvePut(PutCompletion* result) { return resources_->ResolvePut(result); }
 Status UmdkAccessOperator::AcknowledgePut() { return resources_->AcknowledgePut(); }
 Status UmdkAccessOperator::DrainGet() { return resources_->DrainGet(); }
+Status UmdkAccessOperator::PrepareGetGraph(const GetGraphOptions& options) { return resources_->PrepareGetGraph(options); }
+Status UmdkAccessOperator::FinishGetGraph(void* stream, bool discard) { return resources_->FinishGetGraph(stream, discard); }
 Status UmdkAccessOperator::PrepareGetOutput(const GetOutputOptions& r) { return resources_->PrepareGetOutput(r); }
 Status UmdkAccessOperator::FinishGetOutput() { return resources_->FinishGetOutput(); }
 Status UmdkAccessOperator::PreparePutInput(const PutInputOptions& r) { return resources_->PreparePutInput(r); }
@@ -88,6 +90,8 @@ Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
   auto result = resources_->scatter()
       ? UrmaAicpuScatterOperator::Launch(request, resources_->ScatterView(), resources_->invocation())
       : UrmaAicpuGatherOperator::Launch(request, resources_->GatherView(), resources_->invocation());
+  if (result.ok() && resources_->invocation().graph_active)
+    resources_->invocation().graph_recorded = true;
   if (result.ok() && request.execution.synchronize && resources_->managed_completion()) {
     const auto cleanup_started = GetHostTimingStart(request.host_timing);
     result = resources_->ReleaseGetBuffers();

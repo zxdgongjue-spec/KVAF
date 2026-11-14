@@ -23,8 +23,8 @@ class AccessOperator final : public kvaf::AccessOperator {
   Status FinishGetGraph(void*, bool) override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
-  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
-  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const;
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false) override;
+  Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const override;
  private:
   std::unique_ptr<UbmemResources> owned_resources_;
   UbmemResources* resources_;
