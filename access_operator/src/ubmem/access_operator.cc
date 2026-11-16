@@ -64,12 +64,13 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   put_submit_timing.Finish();
   PutHostTimingScope put_completion_timing(put_timing, &PutProviderTiming::completion_ns);
   const auto completion_started = GetHostTimingStart(host_timing);
+  // Capture also needs the stream to read device profiles after each replay.
+  if (args.profile) call.profile_stream = stream;
   if (call.graph_active) {
     call.graph_recorded = true;
     return status;
   }
   call.pending[stream] = ExecutionSlot::Pending::kStream;
-  if (args.profile) call.profile_stream = stream;
   if (!synchronize) {
     // Ordinary events cannot be recorded during ACL Graph capture. The
     // graph owner completes replay on this stream before releasing it;

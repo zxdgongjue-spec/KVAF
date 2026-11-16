@@ -14,6 +14,35 @@ namespace {
 int launches = 0, mappings_closed = 0, releases = 0, allocations = 0;
 bool fail_free = false, capturing = false;
 bool fail_wait = false, fail_copy = false, incomplete = false, fail_launch = false;
+kvaf::ubmem::BatchArgs captured_args{};
+std::uint32_t captured_blocks = 0;
+std::uint64_t profile_cycle = 1000;
+
+void ExecuteKernel(const kvaf::ubmem::BatchArgs& args, std::uint32_t blocks) {
+  using namespace kvaf::ubmem;
+  auto* reports = reinterpret_cast<CoreStatus*>(args.statuses);
+  const auto count = args.operation == Operation::kGet
+      ? static_cast<std::uint64_t>(*reinterpret_cast<const std::int32_t*>(args.miss_count))
+      : args.capacity;
+  profile_cycle += 1000;
+  for (unsigned i = 0; i < blocks; ++i) {
+    reports[i] = {};
+    reports[i].completed = count * (i + 1) / blocks - count * i / blocks;
+    if (args.profile) {
+      reports[i].profile_magic = kProfileMagic;
+      reports[i].start_cycle = profile_cycle + i;
+      reports[i].finish_cycle = profile_cycle + i + 100;
+      reports[i].profile_detail = args.profile == 2;
+      if (args.profile == 2) {
+        reports[i].setup_cycles = 10;
+        reports[i].address_cycles = 20;
+        reports[i].submit_cycles = 30;
+        reports[i].drain_cycles = 40;
+      }
+    }
+  }
+  if (incomplete) reports[blocks - 1].completed = 0;
+}
 }
 extern "C" {
 aclError aclrtSetDevice(int32_t) { return 0; }
@@ -51,13 +80,13 @@ aclError aclrtLaunchKernelWithHostArgs(aclrtFuncHandle, uint32_t blocks, aclrtSt
   ++launches;
   if (fail_launch) return 1;
   const auto& a = *static_cast<kvaf::ubmem::BatchArgs*>(args);
-  auto* reports = reinterpret_cast<kvaf::ubmem::CoreStatus*>(a.statuses);
-  for (unsigned i = 0; i < blocks; ++i) {
-    reports[i] = {};
-    reports[i].completed = std::uint64_t(a.capacity) * (i + 1) / blocks -
-                           std::uint64_t(a.capacity) * i / blocks;
+  if (capturing) {
+    // Capture stores kernel arguments; only replay produces a device report.
+    captured_args = a;
+    captured_blocks = blocks;
+  } else {
+    ExecuteKernel(a, blocks);
   }
-  if (incomplete) reports[blocks - 1].completed = 0;
   return 0;
 }
 }
@@ -223,16 +252,42 @@ int main() {
   auto graph_state = graph_op.CreateExecutionState();
   CHECK(graph_op.BindExecutionState(graph_state.get()).ok());
   CHECK(graph_op.SetBatchGetKernelProfiling(true).ok());
+  std::vector<BatchGetKernelProfile> profiles;
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  // The unified benchmark first profiles eager calls, then captures/replays
+  // on the same bound invocation. Capture must replace the eager sample.
+  CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+  CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(profiles.size() == options.cores);
+  auto previous_cycle = profiles.front().kernel_start_cycle;
   CHECK(graph_op.PrepareGetGraph({get.output, get_call.execution.stream, 1}).ok());
   const auto graph_allocations = allocations;
   get_call.execution.synchronize = false;
   capturing = true;
   CHECK(graph_op.ExecuteBatchGet(get_call).ok());
   CHECK(allocations == graph_allocations);
-  std::vector<BatchGetKernelProfile> profiles;
-  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  const auto capture_profile = graph_op.CopyBatchGetKernelProfiles(&profiles);
+  CHECK(capture_profile.code() == StatusCode::kInvalidState);
   CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, true).ok());
   capturing = false;
+  // Capturing alone has not executed the kernel or produced valid timestamps.
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(captured_blocks == options.cores && captured_args.profile == 1);
+  for (int active : {1, 0, 1}) {
+    count = active;
+    ExecuteKernel(captured_args, captured_blocks);
+    CHECK(aclrtSynchronizeStream(get_call.execution.stream) == ACL_SUCCESS);
+    CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+    CHECK(profiles.size() == options.cores);
+    CHECK(profiles.front().kernel_start_cycle > previous_cycle);
+    previous_cycle = profiles.front().kernel_start_cycle;
+    for (unsigned i = 0; i < options.cores; ++i) {
+      CHECK(profiles[i].kernel_finish_cycle > profiles[i].kernel_start_cycle);
+      CHECK(profiles[i].active_requests == std::uint64_t(active) * (i + 1) / options.cores -
+                                         std::uint64_t(active) * i / options.cores);
+      CHECK(!profiles[i].ubmem_profile_detail);
+    }
+  }
   CHECK(!graph_op.FinishGetGraph(reinterpret_cast<void*>(99), false).ok());
   fail_wait = true;
   CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, true).ok());
@@ -242,6 +297,28 @@ int main() {
   CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, false).ok());
   fail_copy = false;
   CHECK(graph_op.FinishGetGraph(get_call.execution.stream, false).ok());
+  CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(profiles.front().kernel_start_cycle == previous_cycle);
+  // Detailed graph profiling uses the same replay stream and supports a new
+  // graph lease after the preceding graph has been released.
+  CHECK(graph_op.SetBatchGetKernelProfiling(true, true).ok());
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(graph_op.PrepareGetGraph({get.output, get_call.execution.stream, 1}).ok());
+  capturing = true;
+  CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+  capturing = false;
+  CHECK(captured_args.profile == 2);
+  ExecuteKernel(captured_args, captured_blocks);
+  CHECK(aclrtSynchronizeStream(get_call.execution.stream) == ACL_SUCCESS);
+  CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  for (const auto& profile : profiles) {
+    CHECK(profile.ubmem_profile_detail);
+    CHECK(profile.ubmem_setup_cycles == 10 && profile.ubmem_address_cycles == 20);
+    CHECK(profile.ubmem_submit_cycles == 30 && profile.ubmem_drain_cycles == 40);
+  }
+  CHECK(graph_op.FinishGetGraph(get_call.execution.stream, false).ok());
+  CHECK(graph_op.SetBatchGetKernelProfiling(false).ok());
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
   CHECK(graph_op.Shutdown().ok());
   CHECK(graph_op.BindExecutionState(nullptr).ok());
   std::cout << "UBMEM independent resources, typed launch views and completion recovery passed\n";
