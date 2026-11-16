@@ -39,7 +39,9 @@ Each --flow*-args string uses the existing benchmark options, without shell
 evaluation. Priority lists use the existing KVAF_BATCH_GET_JETTY_PRIORITIES
 semantics. The original sweep enables kernel profiling and manages CSV paths.
 Add --flow3-device ID, --flow4-device ID, etc. to launch more flows. Number
-flows consecutively from 1. Each supports the same five --flowN-* options.
+flows consecutively from 1. Each supports the same --flowN-* options.
+Use --flowN-cpu-service-addr HOST:PORT to select a CPU service for that flow.
+Flows without an override inherit KVAF_CPU_SERVICE_ADDR (runner default: 127.0.0.1:28999).
 For two CPU EIDs per flow, set --flow1-peer-eids EID0,EID1 and
 --flow2-peer-eids EID0,EID1, with --flow1-npu-eid and --flow2-npu-eid selecting
 one local NPU EID each. These options override EIDs in --flow*-args.
@@ -67,6 +69,8 @@ Existing flow output directories are refused to prevent overwriting results.
     flow_names = [f"flow{number}" for number in sorted(flow_numbers)]
     for name in flow_names:
         parser.add_argument(f"--{name}-device", type=int, required=True)
+        parser.add_argument(f"--{name}-cpu-service-addr", metavar="HOST:PORT",
+                            help="override KVAF_CPU_SERVICE_ADDR for this flow")
         parser.add_argument(f"--{name}-peer-eids", type=parse_npu_eids,
                             help="comma-separated CPU EIDs, as in run_peer_eid_sweep.py")
         parser.add_argument(f"--{name}-npu-eid", type=parse_npu_eids,
@@ -79,6 +83,9 @@ Existing flow output directories are refused to prevent overwriting results.
     for name in flow_names:
         if getattr(args, f"{name}_device") < 0:
             parser.error(f"{name}-device must be non-negative")
+        service_addr = getattr(args, f"{name}_cpu_service_addr")
+        if service_addr is not None and not service_addr.strip():
+            parser.error(f"--{name}-cpu-service-addr requires a non-empty HOST:PORT")
         peers = getattr(args, f"{name}_peer_eids")
         npu = getattr(args, f"{name}_npu_eid")
         if peers is not None and not peers:
@@ -127,6 +134,9 @@ def build_flow(args, name):
                KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=str(output),
                KVAF_BATCH_GET_MISS_SWEEP_CSV=str(output / "batch_get_miss_sweep_summary.csv"),
                KVAF_BATCH_GET_JETTY_SWEEP_CSV=str(output / "batch_get_jetty_summary.csv"))
+    service_addr = getattr(args, f"{name}_cpu_service_addr")
+    if service_addr is not None:
+        env["KVAF_CPU_SERVICE_ADDR"] = service_addr
     runner = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_miss_count_perf.sh"
     return name, ["bash", str(runner), str(args.build_dir.resolve()), *options], env
 
@@ -198,7 +208,9 @@ def run_flows(flows, timeout):
                 reader = threading.Thread(target=read_output, args=(index,), daemon=True)
                 readers.append(reader)
                 reader.start()
-                emit(f"[launcher] {name} pid={process.pid} DEVICE_ID={env['DEVICE_ID']}")
+                service_addr = env.get("KVAF_CPU_SERVICE_ADDR") or "127.0.0.1:28999"
+                emit(f"[launcher] {name} pid={process.pid} DEVICE_ID={env['DEVICE_ID']} "
+                     f"KVAF_CPU_SERVICE_ADDR={service_addr}")
 
             ready = set()
             while len(ready) < len(flows):

@@ -171,6 +171,33 @@ CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 E
 对于上例，检查每条流日志中的两条 `PEER_EID_TRAFFIC` 和 `PEER_EID_CONCURRENCY`，
 并核对该流 `peer_samples.csv` 中的 CPU EID。首次测量同步开始后，各流独立执行后续迭代。
 
+### 四张 NPU 分别访问四个 CPU service
+
+在 NPU 主机上运行下面的命令。假设四个 CPU service 已分别监听在
+`10.0.0.11` 至 `10.0.0.14` 的 `29000` 端口，请替换为实际可达地址。
+将 `NPU0_EID` 至 `NPU3_EID` 设为对应卡的本地 EID，
+将 `SVC1_EID` 至 `SVC4_EID` 设为对应 CPU service 公布的 EID。
+
+```bash
+FLOW_ARGS="--token-bytes 656 --miss-count 8192 --aiv-cores 1 --jettys-per-core 4 --table-capacity 16384 --warmup 3 --iterations 100"
+
+python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
+    --flow1-device 0 --flow1-cpu-service-addr 10.0.0.11:29000 \
+    --flow1-npu-eid "$NPU0_EID" --flow1-peer-eids "$SVC1_EID" --flow1-args="$FLOW_ARGS" \
+    --flow2-device 1 --flow2-cpu-service-addr 10.0.0.12:29000 \
+    --flow2-npu-eid "$NPU1_EID" --flow2-peer-eids "$SVC2_EID" --flow2-args="$FLOW_ARGS" \
+    --flow3-device 2 --flow3-cpu-service-addr 10.0.0.13:29000 \
+    --flow3-npu-eid "$NPU2_EID" --flow3-peer-eids "$SVC3_EID" --flow3-args="$FLOW_ARGS" \
+    --flow4-device 3 --flow4-cpu-service-addr 10.0.0.14:29000 \
+    --flow4-npu-eid "$NPU3_EID" --flow4-peer-eids "$SVC4_EID" --flow4-args="$FLOW_ARGS" \
+    --output-dir results/four-npu-four-services-001
+```
+
+同一台 CPU 主机上的多个 service 可以使用相同 IP 和不同端口。
+省略 `--flowN-cpu-service-addr` 的流沿用全局 `KVAF_CPU_SERVICE_ADDR`。
+多卡共用一个 service 时，只需像原先一样设置全局变量。两处都未设置时使用默认地址
+`127.0.0.1:28999`。启动日志中的 `DEVICE_ID` 和 `KVAF_CPU_SERVICE_ADDR` 可用于核对映射。
+
 ## 参数和测量口径
 
 ### 一次测试多个组合

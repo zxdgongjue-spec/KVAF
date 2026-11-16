@@ -60,6 +60,7 @@ def worker(mode, output):
     (output / (os.environ["DEVICE_ID"] + ".json")).write_text(json.dumps({
         "ready_ns": ready_ns, "started_ns": started_ns,
         "device": os.environ["DEVICE_ID"],
+        "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR"),
         "priorities": os.environ["KVAF_BATCH_GET_JETTY_PRIORITIES"],
     }))
     print("JETTY_PROFILE_CONTRACT original", flush=True)
@@ -153,15 +154,18 @@ class ConcurrentTests(ConcurrentFixture):
         popen = subprocess.Popen
         for count in (3, 4):
             output = self.output / f"run-{count}"
+            shared_addr = "192.0.2.10:29000"
             argv = ["build-npu", "--output-dir", str(output), "--address-space-bytes", "1048576"]
             for i in range(1, count + 1):
                 options = f"--iterations {i} --token-bytes {128 * i}"
                 if i == count:
                     options += " --address-space-bytes 2097152"
-                argv.extend([f"--flow{i}-device=6", f"--flow{i}-priorities", str(i),
+                argv.extend([f"--flow{i}-device={i - 1}", f"--flow{i}-priorities", str(i),
                              f"--flow{i}-npu-eid", NPU_EIDS[0],
                              f"--flow{i}-peer-eids", ",".join(PEERS),
                              f"--flow{i}-args={options}"])
+                if count == 4:
+                    argv.extend([f"--flow{i}-cpu-service-addr", f"192.0.2.{i}:29000"])
 
             def start_worker(command, **kwargs):
                 folder = Path(kwargs["env"]["KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"])
@@ -176,17 +180,38 @@ class ConcurrentTests(ConcurrentFixture):
                 return popen([sys.executable, "-B", str(Path(__file__).resolve()),
                               "--worker", mode, str(folder)], **kwargs)
 
-            with self.subTest(count=count), patch.dict(os.environ, self.env, clear=True), \
+            env = dict(self.env, KVAF_CPU_SERVICE_ADDR=shared_addr)
+            with self.subTest(count=count), patch.dict(os.environ, env, clear=True), \
                     patch.object(launcher.subprocess, "Popen", side_effect=start_worker), \
                     contextlib.redirect_stdout(io.StringIO()) as console:
                 self.assertEqual(launcher.main(argv), 0, console.getvalue())
-                results = [json.loads((output / f"flow{i}" / "6.json").read_text())
+                results = [json.loads((output / f"flow{i}" / f"{i - 1}.json").read_text())
                            for i in range(1, count + 1)]
+                for i, row in enumerate(results, start=1):
+                    expected_addr = f"192.0.2.{i}:29000" if count == 4 else shared_addr
+                    self.assertEqual(row["cpu_service_addr"], expected_addr)
+                    self.assertIn(f"DEVICE_ID={i - 1} KVAF_CPU_SERVICE_ADDR={expected_addr}",
+                                  console.getvalue())
                 self.assertEqual([row["priorities"] for row in results],
                                  [str(i) for i in range(1, count + 1)])
                 self.assertGreaterEqual(min(row["started_ns"] for row in results),
                                         max(row["ready_ns"] for row in results))
                 self.assertIn(f"all {count} flows ready", console.getvalue())
+
+    def test_service_override_only_changes_its_own_flow(self):
+        shared_addr = "192.0.2.1:29000"
+        override = "192.0.2.1:29001"
+        args = self.args(device2=6, extra=["--flow1-cpu-service-addr", override])
+        for inherited in (shared_addr, None):
+            env = self.env.copy()
+            if inherited is not None:
+                env["KVAF_CPU_SERVICE_ADDR"] = inherited
+            with self.subTest(inherited=inherited), patch.dict(os.environ, env, clear=True):
+                _, _, first = launcher.build_flow(args, "flow1")
+                _, _, second = launcher.build_flow(args, "flow2")
+                self.assertEqual(first["KVAF_CPU_SERVICE_ADDR"], override)
+                self.assertEqual(second.get("KVAF_CPU_SERVICE_ADDR"), inherited)
+                self.assertEqual(os.environ.get("KVAF_CPU_SERVICE_ADDR"), inherited)
 
     def test_extra_flow_requires_consecutive_numbers_and_device(self):
         for options in (["--flow4-device", "5"], ["--flow3-priorities", "15"]):
