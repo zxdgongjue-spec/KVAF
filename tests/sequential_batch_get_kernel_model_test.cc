@@ -55,11 +55,13 @@ struct ModelArgs {
   uint32_t max_polls;
   uint32_t reserved;
 };
+KvafScatterBatchGetArgs ScatterLaunchArgs(const ModelArgs& a) {
+  return {a.request, a.workspace, a.workspace_bytes, a.descriptor_offset,
+          a.staging_offset, a.source_base, a.source_bytes, a.sequence, a.max_polls, a.reserved};
+}
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
-    KvafScatterBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
-      a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
-      a.sequence, a.max_polls, a.reserved});
+    KvafScatterBatchGetAivKernelV1(ScatterLaunchArgs(a));
   } else {
     KvafGatherBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
@@ -771,7 +773,7 @@ int main() {
     scatter.args.request.jettys_per_core = 8;
     scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs |
         kvaf::kScatterConfiguredJettys | pipeline;
-    assert(kvaf::ScatterPayloadJettys(scatter.args) == scatter.payload_jettys);
+    assert(kvaf::ScatterPayloadJettys(ScatterLaunchArgs(scatter.args)) == scatter.payload_jettys);
     scatter.args.max_polls = 1000000;
     scatter.hold_done_until_scatter = pipeline != 0;
     for (uint32_t count : {7U, 8193U, 8193U}) {
