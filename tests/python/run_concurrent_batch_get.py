@@ -53,6 +53,8 @@ Existing flow output directories are refused to prevent overwriting results.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--address-space-bytes", type=int,
+                        help="remote DDR budget in bytes per flow; override in --flowN-args")
     if argv is None:
         argv = sys.argv[1:]
     flow_numbers = {1, 2}
@@ -89,6 +91,8 @@ Existing flow output directories are refused to prevent overwriting results.
 def build_flow(args, name):
     """Reuse benchmark parsing and the original shell's single-shape output path."""
     options = shlex.split(getattr(args, f"{name}_args"))
+    if args.address_space_bytes is not None:
+        options = ["--address-space-bytes", str(args.address_space_bytes), *options]
     for suffix, option in (("peer_eids", "--peer-eids"), ("npu_eid", "--npu-eids")):
         eids = getattr(args, f"{name}_{suffix}")
         if eids is not None:

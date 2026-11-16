@@ -118,6 +118,8 @@ core 1 / Jetty 0 -> peer EID 1
 
 `run_concurrent_batch_get.py` 支持两条及以上并发流，按 `flow1`、`flow2`、`flow3` 等连续编号。
 每条流可单独指定设备、本地 NPU EID、远端 CPU EID 列表、优先级和 benchmark 参数。
+顶层 `--address-space-bytes` 分别应用于每条流。例如设为 `1073741824` 时，每条流的远端表预算均为
+1 GiB。在 `--flowN-args` 中传入同一选项可覆盖该流的预算。
 全部流完成初始化和预热后同步开始首次测量。每条流内部沿用
 `run_peer_eid_sweep.py` 所用 benchmark 的多 CPU EID kernel 路径。
 
@@ -183,7 +185,7 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
     --peer-eids 00000000003f020000100000df080b00,000000000000060000100000df080100 \
     --npu-eid 00000000003f030000100000df00eb00 \
     --token-bytes 656,1024 --miss-count 2048,4096,8192 \
-    --cores 1,2 --jettys 2,4 \
+    --cores 1,2 --jettys 2,4 --address-space-bytes 1073741824 \
     --output-dir results/peer-sweep-001
 ```
 
@@ -203,7 +205,8 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 | `--npu-eid` | 一个本地 NPU EID；设备由 `DEVICE_ID` 选择 |
 | `--cores` | 一次 kernel 使用的 AIV core 总数，1–48 |
 | `--jettys` | **每 core 的 Jetty 总数**，1–64；总数为 `cores * jettys`，决定最多使用多少个候选 EID |
-| `--table-capacity` | 共享 DDR 表的条目数 |
+| `--table-capacity` | 共享 DDR 表的条目数，省略地址空间预算时生效 |
+| `--address-space-bytes` | 单组测试中所有选中 CPU EID 共用的远端表字节预算。每组按 `预算 // (token_bytes * tokens_per_block)` 计算完整 block 数。命令行优先于 `KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES` |
 | `--request-length` | 请求数组容量，默认 32768 |
 | `--miss-count` | 每次 BatchGet 的有效请求总数；单路全部搬运、多路分担；默认等于 request-length |
 | `--token-bytes` / `--tokens-per-block` | 默认 656 / 128 |
@@ -259,9 +262,9 @@ python3 tests/python/run_peer_eid_sweep.py "$PWD/build-npu" \
 
 | 输出文件 | 内容 |
 | --- | --- |
-| 根目录 `batch_get_miss_sweep_summary.csv` | 每个组合一行，顺序与执行顺序一致。列顺序与旧脚本相同，`selected_ub_device` 留空，精确 EID 见各组明细 |
+| 根目录 `batch_get_miss_sweep_summary.csv` | 每个组合一行，列顺序与 miss-count 扫描相同。末尾记录 `table_capacity`、`tokens_per_block`、`address_space_budget_bytes`（未指定时为 0）和 `address_space_bytes`（实际远端数据字节数）。`selected_ub_device` 留空，精确 EID 见各组明细 |
 | 根目录 `batch_get_jetty_summary.csv` | 合并全部组合的每 Jetty 测量结果，可按 `token_bytes`、`miss_count`、`aiv_cores`、`jettys_per_core` 筛选 |
-| 每组 `config.json` | 候选与实际 EID 列表、实际启动参数、命令、设备、CPU 地址及该组 inflight 上限 |
+| 每组 `config.json` | 候选与实际 EID 列表、启动命令、设备、CPU 地址和 inflight 上限。顶层记录与汇总 CSV 一致的预算、实际字节数及容量 |
 | 每组 `jettys.csv` | 测量迭代的每 Jetty 汇总，`eid_path` 为实际 CPU EID 列表下标 |
 | 每组 `peer_samples.csv` | 每次迭代、每个 core 实际分配的 CPU EID 的请求数、字节数、首末 doorbell/CQE 观测周期及核内 `first_wave_observed_overlap_cycles` |
 

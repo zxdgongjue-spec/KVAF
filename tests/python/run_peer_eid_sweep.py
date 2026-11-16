@@ -37,6 +37,12 @@ def shape_fields(args):
     return dict(zip(SHAPE_COLUMNS, (args.token_bytes, args.miss_count, args.cores, args.jettys)))
 
 
+def layout_fields(args):
+    return dict(table_capacity=args.table_capacity, tokens_per_block=args.tokens_per_block,
+                address_space_budget_bytes=args.address_space_bytes or 0,
+                address_space_bytes=args.table_capacity * args.tokens_per_block * args.token_bytes)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=Path)
@@ -52,6 +58,9 @@ def parse_args(argv=None):
                         default=os.environ.get("KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE") or "4",
                         help="Jetty counts per core (1-64), striped over the selected CPU EIDs")
     parser.add_argument("--table-capacity", type=int, default=16384)
+    parser.add_argument("--address-space-bytes", type=int,
+                        default=os.environ.get("KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES"),
+                        help="remote DDR budget shared by the selected EIDs; overrides --table-capacity per shape")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--request-length", type=int, default=32768)
     parser.add_argument("--miss-count", type=sweep_values, metavar="N[,N...]",
@@ -90,18 +99,22 @@ def parse_args(argv=None):
         if multiple:
             name = "_".join(f"{key}_{value}" for key, value in shape_fields(run).items())
             run.output_dir = args.output_dir / name
-        error = perf.validate_args(perf.parse_args(benchmark_args(run)))
+        benchmark = perf.parse_args(benchmark_args(run))
+        error = perf.validate_args(benchmark)
         if error:
             parser.error(f"{shape_fields(run)}: {error}")
+        run.table_capacity = benchmark.table_capacity
         runs.append(run)
     return args, runs
 
 
 def benchmark_args(args):
+    capacity = (["--address-space-bytes", str(args.address_space_bytes)] if args.address_space_bytes is not None
+                else ["--table-capacity", str(args.table_capacity)])
     return [
         "--peer-eids", ",".join(args.peer_eids), "--npu-eids", args.npu_eid[0],
         "--aiv-cores", str(args.cores), "--jettys-per-core", str(args.jettys),
-        "--table-capacity", str(args.table_capacity),
+        *capacity,
         "--request-length", str(args.request_length), "--miss-count", str(args.miss_count),
         "--token-bytes", str(args.token_bytes), "--tokens-per-block", str(args.tokens_per_block),
         "--warmup", str(args.warmup), "--iterations", str(args.iterations),
@@ -170,6 +183,7 @@ def summary_row(args, log_text):
     # Selection uses exact EIDs, not a device name. Identities are in
     # config.json/peer_samples.csv; keep the original sweep's CSV schema exact.
     row["selected_ub_device"] = ""
+    row.update(layout_fields(args))
     return row
 
 
@@ -206,6 +220,7 @@ def run_case(args, env, stream):
                   device_id=env.get("DEVICE_ID", "0"), execution="single_kernel",
                   benchmark=vars(perf.parse_args(options)),
                   jetty_priorities=env.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "default"))
+    config.update(layout_fields(args))
     (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2) + "\n", encoding="utf-8")
 
     def emit(message):

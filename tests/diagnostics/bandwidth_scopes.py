@@ -10,8 +10,8 @@ import sys
 
 def instrument(source):
     replacements = [
-        ('        for _ in range(args.iterations):\n',
-         '        scope_events = []\n        for _ in range(args.iterations):\n'),
+        ('        for iteration in range(args.iterations):\n',
+         '        scope_events = []\n        for iteration in range(args.iterations):\n'),
         ('            begin = time.perf_counter()\n',
          '            scope_start = torch.npu.Event(enable_timing=True)\n'
          '            scope_end = torch.npu.Event(enable_timing=True)\n'

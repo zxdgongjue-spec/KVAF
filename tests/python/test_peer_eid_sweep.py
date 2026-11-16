@@ -378,7 +378,8 @@ class PeerEidTests(unittest.TestCase):
             output = root / 'logs'
             args = [str(root), '--peer-eids', ','.join(EIDS), '--npu-eid', '3' * 32,
                     '--output-dir', str(output), '--token-bytes', '656,1024', '--miss-count', '2048,4096',
-                    '--cores', '1,4', '--jettys', '2,4']
+                    '--cores', '1,4', '--jettys', '2,4', '--table-capacity', '99',
+                    '--address-space-bytes', '1048576']
             expected = [(t, m, c, j) for t in (656, 1024) for m in (2048, 4096)
                         for c in (1, 4) for j in (2, 4)]
             with patch.dict(os.environ, {'KVAF_CPU_SERVICE_ADDR': 'localhost:29000'}, clear=True), \
@@ -394,6 +395,12 @@ class PeerEidTests(unittest.TestCase):
                 config = json.loads((case / 'config.json').read_text())
                 self.assertEqual(config['max_inflight_total'], 2048)
                 self.assertEqual(config['peer_eids'], EIDS)
+                capacity = {656: 12, 1024: 8}[t]
+                self.assertEqual(parsed.address_space_bytes, 1048576)
+                self.assertEqual(parsed.table_capacity, capacity)
+                self.assertEqual(config['table_capacity'], capacity)
+                self.assertEqual(config['address_space_budget_bytes'], 1048576)
+                self.assertEqual(config['address_space_bytes'], capacity * t * 128)
                 self.assertTrue((case / 'peer_samples.csv').is_file())
                 self.assertIn(f'p50_cycles={m}', (case / 'batch_get.log').read_text())
             for filename in ('batch_get_miss_sweep_summary.csv', 'batch_get_jetty_summary.csv'):
@@ -402,6 +409,10 @@ class PeerEidTests(unittest.TestCase):
                 self.assertEqual([tuple(int(row[k]) for k in sweep.SHAPE_COLUMNS) for row in rows], expected)
                 if filename == 'batch_get_miss_sweep_summary.csv':
                     self.assertEqual([r['p50_us'] for r in rows], [f'{m / 1000:.3f}' for _, m, _, _ in expected])
+                    for row in rows:
+                        self.assertEqual((row['table_capacity'], row['address_space_bytes']),
+                                         ('12', '1007616') if row['token_bytes'] == '656' else ('8', '1048576'))
+                        self.assertEqual(row['address_space_budget_bytes'], '1048576')
             log = (output / 'batch_get.log').read_text()
             self.assertIn('jetty_counts=2 combinations=16', log)
             self.assertIn('BATCH_GET_MISS_SWEEP_SUMMARY combinations=16', log)

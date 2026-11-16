@@ -290,6 +290,35 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
 `output_indices`；请求构造和排序不计入 BatchGet 计时。
 
+### 固定 BatchGet 远端数据空间
+
+单次性能测试、miss-count 扫描、peer EID 扫描和带宽矩阵均接受 `--address-space-bytes`。每组配置用
+`table_capacity = address_space_bytes // (token_bytes * tokens_per_block)` 计算容量，
+只分配完整 block。指定预算时，它优先于 `--table-capacity` 和环境变量中的容量。
+例如使用 1 MiB 预算、每个 block 放 128 个 token，token 大小为 128 字节时可放
+64 个 block，改为 656 字节时可放 12 个 block，实际占用 1,007,616 字节。
+
+```bash
+KVAF_BATCH_GET_SWEEP_TOKEN_BYTES="128 656" \
+bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
+  --address-space-bytes 1048576 --tokens-per-block 128
+```
+
+并发测试的顶层预算按 **每条 flow** 生效。把同一选项写入 `--flowN-args`
+可单独覆盖该 flow 的预算。下面两条 flow 各使用 1 GiB 预算：
+
+```bash
+python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
+  --output-dir results/fixed-budget --address-space-bytes 1073741824 \
+  --flow1-device 7 --flow1-priorities 3 --flow1-args="--token-bytes 128" \
+  --flow2-device 6 --flow2-priorities 13 --flow2-args="--token-bytes 656"
+```
+
+可用 `KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES` 设置默认预算，命令行优先。
+每个测试的配置日志和 miss-count 汇总 CSV 都会记录 `table_capacity`、
+`tokens_per_block`、`address_space_budget_bytes`（未设置时为 0）和
+`address_space_bytes`（实际远端数据字节数）。
+
 `link_to()` 必须先于 `initialize()` 调用。调用方需要在 BatchGet 所在 stream 完成前保持
 输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 只管理内部 DDR、元数据和内部
 传输资源。
