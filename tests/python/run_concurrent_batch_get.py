@@ -38,6 +38,8 @@ def parse_args(argv=None):
 
 Add --flow3-device and --flow4-device to run four flows. Each additional flow
 accepts its own --flowN-priorities and --flowN-args, even when sharing an NPU.
+Use --flowN-cpu-service-addr HOST:PORT for flows with their own CPU service.
+Other flows inherit KVAF_CPU_SERVICE_ADDR (runner default: 127.0.0.1:28999).
 Each --flow*-args string uses the existing benchmark options, without shell
 evaluation. Priority lists use the existing KVAF_BATCH_GET_JETTY_PRIORITIES
 semantics. The original sweep enables kernel profiling and manages CSV paths.
@@ -51,18 +53,23 @@ Existing flow output directories are refused to prevent overwriting results.
                         help="remote data budget in bytes for each flow; override in --flowN-args")
     for name in FLOW_NAMES:
         parser.add_argument(f"--{name}-device", type=int, required=name in ("flow1", "flow2"))
+        parser.add_argument(f"--{name}-cpu-service-addr", metavar="HOST:PORT",
+                            help="override KVAF_CPU_SERVICE_ADDR for this flow")
         parser.add_argument(f"--{name}-priorities", default=argparse.SUPPRESS)
         parser.add_argument(f"--{name}-args", default=argparse.SUPPRESS, help="quoted original benchmark options")
     args = parser.parse_args(argv)
     args.flow_names = []
     for name in FLOW_NAMES:
         device = getattr(args, f"{name}_device")
+        service_addr = getattr(args, f"{name}_cpu_service_addr")
         if device is None:
-            if hasattr(args, f"{name}_priorities") or hasattr(args, f"{name}_args"):
+            if service_addr is not None or hasattr(args, f"{name}_priorities") or hasattr(args, f"{name}_args"):
                 parser.error(f"--{name}-device is required when configuring {name}")
             continue
         if device < 0:
             parser.error(f"{name}-device must be non-negative")
+        if service_addr is not None and not service_addr.strip():
+            parser.error(f"--{name}-cpu-service-addr requires a non-empty HOST:PORT")
         args.flow_names.append(name)
     return args
 
@@ -99,6 +106,9 @@ def build_flow(args, name):
                KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=str(output),
                KVAF_BATCH_GET_MISS_SWEEP_CSV=str(output / "batch_get_miss_sweep_summary.csv"),
                KVAF_BATCH_GET_JETTY_SWEEP_CSV=str(output / "batch_get_jetty_summary.csv"))
+    service_addr = getattr(args, f"{name}_cpu_service_addr")
+    if service_addr is not None:
+        env["KVAF_CPU_SERVICE_ADDR"] = service_addr
     runner = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_miss_count_perf.sh"
     return name, ["bash", str(runner), str(args.build_dir.resolve()), *options], env
 
@@ -170,7 +180,9 @@ def run_flows(flows, timeout):
                 reader = threading.Thread(target=read_output, args=(index,), daemon=True)
                 readers.append(reader)
                 reader.start()
-                emit(f"[launcher] {name} pid={process.pid} DEVICE_ID={env['DEVICE_ID']}")
+                service_addr = env.get("KVAF_CPU_SERVICE_ADDR") or "127.0.0.1:28999"
+                emit(f"[launcher] {name} pid={process.pid} DEVICE_ID={env['DEVICE_ID']} "
+                     f"KVAF_CPU_SERVICE_ADDR={service_addr}")
 
             ready = set()
             while len(ready) < len(flows):

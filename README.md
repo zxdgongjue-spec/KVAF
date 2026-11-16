@@ -290,6 +290,24 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
 `output_indices`；请求构造和排序不计入 BatchGet 计时。
 
+### 多卡并发访问多个 CPU service
+
+在 NPU 主机上运行以下命令，NPU 7、6、5、4 会分别连接本机已启动的四个 CPU service。
+服务位于其他主机时，将对应的 `127.0.0.1` 换为该主机的可达地址。
+
+```bash
+python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
+  --flow1-device 7 --flow1-priorities 15 --flow1-cpu-service-addr 127.0.0.1:29001 \
+  --flow2-device 6 --flow2-priorities 15 --flow2-cpu-service-addr 127.0.0.1:29002 \
+  --flow3-device 5 --flow3-priorities 15 --flow3-cpu-service-addr 127.0.0.1:29003 \
+  --flow4-device 4 --flow4-priorities 15 --flow4-cpu-service-addr 127.0.0.1:29004 \
+  --output-dir results/four-cpu-services
+```
+
+省略 `--flowN-cpu-service-addr` 的流会继承全局 `KVAF_CPU_SERVICE_ADDR`，默认地址为
+`127.0.0.1:28999`。原来的共享服务命令可以直接使用，也可以只覆盖其中几条流。
+启动日志会显示每条流的 `DEVICE_ID` 和目标地址。
+
 ### 固定 BatchGet 远端数据空间
 
 单次性能测试和 miss-count 扫描均接受 `--address-space-bytes`。每组配置用

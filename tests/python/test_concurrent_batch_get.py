@@ -54,6 +54,7 @@ def worker(mode, output):
     (output / (os.environ["DEVICE_ID"] + ".json")).write_text(json.dumps({
         "ready_ns": ready_ns, "started_ns": started_ns,
         "device": os.environ["DEVICE_ID"],
+        "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR"),
         "priorities": os.environ["KVAF_BATCH_GET_JETTY_PRIORITIES"],
     }))
     print("JETTY_PROFILE_CONTRACT original", flush=True)
@@ -190,6 +191,7 @@ class ConcurrentTests(ConcurrentFixture):
             if index == 4:
                 options += " --address-space-bytes 2097152"
             argv.extend([f"--flow{index}-device", str(device),
+                         f"--flow{index}-cpu-service-addr", f"127.0.0.1:{29000 + index}",
                          f"--flow{index}-priorities", str(index),
                          f"--flow{index}-args={options}"])
 
@@ -214,10 +216,30 @@ class ConcurrentTests(ConcurrentFixture):
         results = [json.loads((self.output / f"flow{i}" / f"{device}.json").read_text())
                    for i, device in enumerate(devices, 1)]
         self.assertEqual([r["priorities"] for r in results], ["1", "2", "3", "4"])
+        for index, row in enumerate(results, 1):
+            addr = f"127.0.0.1:{29000 + index}"
+            self.assertEqual(row["cpu_service_addr"], addr)
+            self.assertIn(f"DEVICE_ID={row['device']} KVAF_CPU_SERVICE_ADDR={addr}", captured.getvalue())
         self.assertGreaterEqual(min(r["started_ns"] for r in results), max(r["ready_ns"] for r in results))
 
+    def test_each_flow_inherits_or_overrides_cpu_service_independently(self):
+        argv = ["build-npu", "--output-dir", str(self.output), "--flow1-device", "7", "--flow2-device", "6"]
+        override = "127.0.0.1:29001"
+        for shared in (None, "127.0.0.1:29007"):
+            env = self.env.copy()
+            if shared is not None:
+                env["KVAF_CPU_SERVICE_ADDR"] = shared
+            for options in ([], ["--flow1-cpu-service-addr", override]):
+                with self.subTest(shared=shared, options=options), patch.dict(os.environ, env, clear=True):
+                    args = launcher.parse_args(argv + options)
+                    addresses = [launcher.build_flow(args, name)[2].get("KVAF_CPU_SERVICE_ADDR")
+                                 for name in args.flow_names]
+                    self.assertEqual(addresses, [override if options else shared, shared])
+                    self.assertEqual(os.environ.get("KVAF_CPU_SERVICE_ADDR"), shared)
+
     def test_optional_flow_settings_require_its_device(self):
-        for option in ("--flow3-priorities=15", "--flow4-args=--miss-count 8192"):
+        for option in ("--flow3-priorities=15", "--flow4-args=--miss-count 8192",
+                       "--flow4-cpu-service-addr=127.0.0.1:29004"):
             with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit):
                 launcher.parse_args(["build-npu", "--output-dir", str(self.output),
