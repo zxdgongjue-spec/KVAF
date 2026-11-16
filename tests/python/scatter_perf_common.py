@@ -206,6 +206,9 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
         result["aiv_ready_wait_ns"] = max(r["ready_wait_cycles"] for r in records) * ns_per_cycle
     if all("cross_chunk_shards" in r for r in records):
         result["aiv_cross_chunk_shards"] = sum(r["cross_chunk_shards"] for r in records)
+    for name in ("ready_refreshes", "ready_refresh_hits"):
+        if all(name in r for r in records):
+            result[f"aiv_{name}"] = sum(r[name] for r in records)
     host = cpu.get("host_profile")
     if host is not None:
         if any(key not in host or not math.isfinite(host[key]) or host[key] < 0

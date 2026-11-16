@@ -35,6 +35,7 @@ CSV_COLUMNS = (
     "overlap_head_cq",
     "aiv_tail_core", "aiv_tail_to_last_enqueue_us", "aiv_tail_to_local_done_us", "aiv_tail_after_local_done_us",
     "jettys_per_core", "cpu_jettys",
+    "ready_refresh", "aiv_ready_refreshes", "aiv_ready_refresh_hits",
 )
 
 
@@ -52,6 +53,12 @@ def resolve_scatter_options(parser, args):
         args.jetty_cursors = int(value)
     if args.jetty_cursors and not args.pipeline:
         parser.error("--jetty-cursors 1 requires --pipeline 1")
+    refresh = os.environ.get("KVAF_SCATTER_READY_REFRESH", "0")
+    if refresh not in ("0", "1"):
+        parser.error("KVAF_SCATTER_READY_REFRESH must be 0 or 1")
+    args.ready_refresh = int(refresh)
+    if args.ready_refresh and not args.jetty_cursors:
+        parser.error("KVAF_SCATTER_READY_REFRESH=1 requires --jetty-cursors 1")
     if args.overlap_head_cq is None:
         overlap = os.environ.get("KVAF_SCATTER_OVERLAP_HEAD_CQ", "0")
         if overlap not in ("0", "1"):
@@ -217,6 +224,7 @@ def write_results(args, report):
                 for sample in samples:
                     values = dict(phase=phase, cores=args.cores, jetty_cursors=args.jetty_cursors,
                                   overlap_head_cq=args.overlap_head_cq,
+                                  ready_refresh=args.ready_refresh,
                                   jettys_per_core=args.jettys_per_core or "",
                                   cpu_jettys=scatter_payload_jettys(args),
                                   request_length=args.request_length,

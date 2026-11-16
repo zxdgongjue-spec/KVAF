@@ -26,6 +26,11 @@ AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 两组可直接对比端到端耗时和 AIV 墙钟。profiled CSV 中的 `aiv_cross_chunk_shards`
 统计本批跨过尚未消费的早期 chunk 提交的分片数。
 
+N 端可设置 `KVAF_SCATTER_READY_REFRESH=1`，配合 `--pipeline 1 --jetty-cursors 1`
+对照默认值 `0`。AIV 即将跨过未消费的前序分片时，最多为每个目标 chunk 额外读取一次
+Ready，让本次读取发现的前序分片优先进入 Scatter。profiled CSV 中的
+`aiv_ready_refreshes` 统计额外读取次数，`aiv_ready_refresh_hits` 统计选中更早 chunk 的次数。
+
 Scatter 默认在每个会话创建 4 条共享 payload Jetty。N 端在初始化前设置
 `KVAF_SCATTER_JETTYS_PER_CORE`，或给两个 Scatter 性能脚本传入 `--jettys-per-core`，
 可按 `AIV 核数 × jettys-per-core` 设置共享 Jetty 总数，上限为 32。

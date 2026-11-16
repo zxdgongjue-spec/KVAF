@@ -308,6 +308,12 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   const bool jetty_cursors = cursor_option && cursor_option[0] == '1';
   if (jetty_cursors && !pipeline)
     return Status::InvalidArgument("KVAF_SCATTER_JETTY_CURSORS=1 requires KVAF_SCATTER_PIPELINE=1");
+  const char* ready_refresh_option = std::getenv("KVAF_SCATTER_READY_REFRESH");
+  if (ready_refresh_option && std::strcmp(ready_refresh_option, "0") && std::strcmp(ready_refresh_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_READY_REFRESH must be 0 or 1");
+  const bool ready_refresh = ready_refresh_option && ready_refresh_option[0] == '1';
+  if (ready_refresh && !jetty_cursors)
+    return Status::InvalidArgument("KVAF_SCATTER_READY_REFRESH=1 requires KVAF_SCATTER_JETTY_CURSORS=1");
   const char* overlap_option = std::getenv("KVAF_SCATTER_OVERLAP_HEAD_CQ");
   if (overlap_option && std::strcmp(overlap_option, "0") && std::strcmp(overlap_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_OVERLAP_HEAD_CQ must be 0 or 1");
@@ -330,6 +336,7 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   }
   s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
       (jetty_cursors ? kScatterJettyCursors : 0U) |
+      (ready_refresh ? kScatterReadyRefresh : 0U) |
       (overlap_head_cq ? kScatterOverlapHeadCq : 0U) |
       (s.payload_jettys != cpu_push::kJettyCount ? kScatterConfiguredJettys : 0U);
   s.region = region;
@@ -356,8 +363,8 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u\n",
-               unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys);
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u ready_refresh=%u\n",
+               unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys, unsigned(ready_refresh));
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {

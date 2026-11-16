@@ -16,6 +16,7 @@ constexpr uint32_t kScatterLocalMemoryBytes = 64U * 1024U;
 // Versioned runtime options in the existing reserved word. Unknown versions or
 // bits must fail validation rather than silently select a different algorithm.
 constexpr uint32_t kScatterOptionsV1 = 0x53430100U;
+constexpr uint32_t kScatterReadyRefresh = 2U;
 constexpr uint32_t kScatterProfiling = 4U;
 // Host's existing trusted-input contract also applies to device list contents.
 constexpr uint32_t kScatterTrustedInputs = 8U;
@@ -26,7 +27,7 @@ constexpr uint32_t kScatterOverlapHeadCq = 128U;
 constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
 constexpr uint32_t kScatterOptionsMask =
     kScatterProfiling | kScatterTrustedInputs | kScatterConfiguredJettys | kScatterPipeline | kScatterJettyCursors |
-    kScatterOverlapHeadCq;
+    kScatterOverlapHeadCq | kScatterReadyRefresh;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
       (value & ~kScatterOptionsMask) == kScatterOptionsV1;

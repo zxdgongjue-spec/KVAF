@@ -578,7 +578,8 @@ def main(argv=None, runner=None):
         expected = {key: getattr(case, key) for key in (
             "request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
             "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
-            "sort_input_indices", "pipeline", "jetty_cursors", "overlap_head_cq", "fixed_request_plan")}
+            "sort_input_indices", "pipeline", "jetty_cursors", "overlap_head_cq", "ready_refresh",
+            "fixed_request_plan")}
         expected.update(SUBMISSION_CONFIG)
         expected["cpu_jettys"] = scatter_payload_jettys(case)
         for key, value in expected.items():
