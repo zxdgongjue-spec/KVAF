@@ -57,7 +57,7 @@ Status PeerLink::CreateChannel(std::uint64_t, const std::uint8_t*, std::uint32_t
 #define dlsym Symbol
 #define dlclose Close
 #define dlerror Error
-#include "../access_operator/src/direct_hccp/direct_hccp_remote_transport.cc"
+#include "../access_operator/transports/direct_hccp/direct_hccp_remote_transport.cc"
 #undef dlopen
 #undef dlsym
 #undef dlclose

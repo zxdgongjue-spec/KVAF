@@ -1,5 +1,5 @@
-#include "aicpu_batch_get/kernel/cpu_push_scatter.h"
-#include "aicpu_batch_get/kernel/cpu_push_pipeline.h"
+#include "get/scatter/urma_aicpu/kernel/cpu_push_scatter.h"
+#include "get/scatter/urma_aicpu/kernel/cpu_push_pipeline.h"
 
 #include <algorithm>
 #include <array>

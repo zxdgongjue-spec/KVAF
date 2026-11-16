@@ -1,4 +1,4 @@
-#include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
+#include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_urma/session.h"
 #include "cpu_gather.h"
 

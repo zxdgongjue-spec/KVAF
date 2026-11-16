@@ -1,9 +1,9 @@
 #include "aicpu_urma/session.h"
 #include "aicpu_urma/kernel_loader.h"
-#include "aicpu_batch_put/include/kvaf_aicpu_batch_put.h"
+#include "put/urma_aicpu/include/kvaf_aicpu_batch_put.h"
 #include "meta_manager.h"
 #include "aicpu_execution_resources.h"
-#include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
+#include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
 
 #include <cstdlib>
 #include <cstring>

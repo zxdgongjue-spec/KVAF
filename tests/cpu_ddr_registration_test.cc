@@ -1,4 +1,4 @@
-#include "cpu_ddr_registration.h"
+#include "memory/cpu_ddr_registration.h"
 #include <iostream>
 #include <stdexcept>
 #define CHECK(c) do { if (!(c)) throw std::runtime_error(#c); } while (false)

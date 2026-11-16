@@ -101,7 +101,7 @@ CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 co
 ```
 
 ```bash
-python3 access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py \
+python3 access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
   --modes gather_read cpu_push_scatter --workers 1 2 4 5 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
@@ -176,7 +176,7 @@ KVAF_AICPU_WORKERS="1 2 4 5" \
 每组 `.log` 和 `summary.csv` 默认写入 `reports/aicpu-cpu-push-scatter/<时间戳>`。
 `KVAF_AICPU_SWEEP_LOG_DIR` 可指定一个新目录；任一组失败后停止并保留已完成结果。
 单组入口为
-[benchmark_cpu_push_scatter.py](../access_operator/algorithms/aicpu_batch_get/python/benchmark_cpu_push_scatter.py)，
+[benchmark_cpu_push_scatter.py](../access_operator/algorithms/get/scatter/urma_aicpu/python/benchmark_cpu_push_scatter.py)，
 参数与 GatherRead 相同，复用 `--npu-eids` / `KVAF_NPU_EIDS` 及共享解析器。
 
 ## 请求与数据流
@@ -290,7 +290,7 @@ push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 
 ```bash
 set -o pipefail
 mkdir -p results
-python3 -u access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py \
+python3 -u access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
   --device-id 7 --peer 127.0.0.1:28990 \
   --modes cpu_push_scatter --workers 4 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 1 \

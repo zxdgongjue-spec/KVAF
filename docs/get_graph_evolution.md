@@ -124,19 +124,23 @@ AICPU 队列用显式 `UmdkQueueProfile` 配置：Put 为 **1 control / 0 data**
 Control 使用 V5 能力检查；在原 4 字节 padding 放 profile，不改变原结构大小或其他字段
 偏移。旧 Control/V3/V4 入口保留原 Gather 队列布局，新 Host 不静默退回旧包。
 
-生产实现迁移到：
+生产实现已进一步按算法迁移到（共享 ABI 和组合编译入口保留在 common）：
 
 ```text
 access_operator/algorithms/
-  aiv_batch_get/       host/ include/ kernel/
-  aiv_batch_put/       host/ include/ kernel/ scripts/
-  aicpu_batch_get/     host/ include/ kernel/ python/
-  aicpu_batch_put/     host/ include/ kernel/
+  get/direct/{urma_aiv,ubmem_aiv,common}/
+  get/gather/urma_aicpu/
+  get/scatter/urma_aicpu/
+  get/common/aicpu/
+  put/{urma_aiv,urma_aicpu,ubmem_aiv,common}/
 ```
 
-资源 owner、公共 view、传输和映射仍在 `access_operator/src` / `include`；Runtime
-调度和 CPU 分配仍在 `runtime`。CMake、测试、脚本和公开文档路径一起迁移，库名、kernel
-符号和 `build-npu/bin` 产物路径保持不变。此前要求保留的本地设计草稿未修改、未提交。
+跨方向的适配器和资源 owner 位于 `access_operator/providers`，公共 view 位于
+`access_operator/include`，传输和映射位于 `access_operator/transports`。Runtime 调度、
+CPU 内存及服务分别位于 `runtime/execution`、`runtime/memory`、`runtime/cpu_service`。
+CMake、测试、脚本和公开文档路径一起迁移，库名、kernel 符号和 `build-npu/bin` 产物路径
+保持不变。AICPU 构建包改在 `build-npu/access_operator/transports/aicpu_urma`，安装脚本
+同步使用新路径。此前要求保留的本地设计草稿未修改、未提交。
 
 需重新配置并构建 CPU/NPU，重新安装 AICPU 包，并启动新的客户端和 CPU 服务进程。
 功能验收沿用第 3 节全量脚本；`resources/output-coexistence` 新增检查两个算法的输出

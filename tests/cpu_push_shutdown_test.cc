@@ -1,5 +1,5 @@
-#include "aicpu_batch_get/include/cpu_push_transport.h"
-#include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
+#include "get/scatter/urma_aicpu/include/cpu_push_transport.h"
+#include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"

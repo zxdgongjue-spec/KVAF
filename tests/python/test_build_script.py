@@ -42,7 +42,7 @@ else:
         (build / "python/kvaf").mkdir(parents=True, exist_ok=True)
         (build / "python/kvaf/_kvaf.so").write_bytes(b"simulated Host binding")
     if options["KVAF_ENABLE_AICPU_URMA"] == "ON":
-        artifacts = build / "access_operator/src/aicpu_urma"
+        artifacts = build / "access_operator/transports/aicpu_urma"
         artifacts.mkdir(parents=True, exist_ok=True)
         entries = {name: {} for name in (
             "KvafAicpuBatchPut", "KvafAicpuGatherReadExecutionV3", "KvafAicpuUmdkControlSessionsV5")}
@@ -137,7 +137,7 @@ class BuildScriptTests(unittest.TestCase):
         self.assertIn(SCATTER, json.loads((self.cann / JSON_PATH).read_text()))
         self.assertIn("CHECK_OK", result.stdout)
         self.assertEqual((self.cann / TAR_PATH).read_bytes(),
-                         (self.build / "access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz").read_bytes())
+                         (self.build / "access_operator/transports/aicpu_urma/kvaf-aicpu-urma.tar.gz").read_bytes())
 
     def test_trim_clears_cached_aicpu_flags_and_leaves_installed_package(self):
         self.assert_success(self.run_build())

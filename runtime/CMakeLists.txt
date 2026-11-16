@@ -1,26 +1,30 @@
 find_package(Threads REQUIRED)
-add_library(kvaf_peer_link STATIC src/peer_link.cc src/execution_protocol.cc)
+add_library(kvaf_peer_link STATIC peer/peer_link.cc peer/execution_protocol.cc)
 
 target_include_directories(kvaf_peer_link
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
 add_library(kvaf_runtime
-  src/cache_region_service.cc
-  src/execution_config.cc
-  src/execution_dispatcher.cc
-  src/execution_resource_manager.cc
+  memory/cache_region_service.cc
+  execution/execution_config.cc
+  execution/execution_dispatcher.cc
+  execution/execution_resource_manager.cc
   src/runtime.cc
-  src/runtime_service.cc
+  cpu_service/runtime_service.cc
   src/npu_runtime_config.cc
 )
 
 target_include_directories(kvaf_runtime
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(kvaf_runtime
@@ -40,13 +44,13 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/algorithms/aiv_batch_get/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/algorithms/get/direct/urma_aiv/include
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
     PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_GET)
-    target_sources(kvaf_npu_runtime PRIVATE src/ubmem_allocator.cc)
+    target_sources(kvaf_npu_runtime PRIVATE memory/ubmem_allocator.cc)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator
       kvaf_ubmem_operator kvaf_execute_batch_get_host)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)
@@ -68,8 +72,10 @@ endif()
 
 option(KVAF_CPU_ENABLE_URMA "Include the URMA CPU backend" ON)
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
-  add_library(kvaf_cpu_runtime STATIC src/cpu_runtime.cc src/ubmem_cpu_backend.cc src/execution_cpu_backend.cc)
-  target_include_directories(kvaf_cpu_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_library(kvaf_cpu_runtime STATIC cpu_service/cpu_runtime.cc cpu_service/backends/ubmem_cpu_backend.cc memory/execution_cpu_backend.cc)
+  target_include_directories(kvaf_cpu_runtime
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(kvaf_cpu_runtime PUBLIC kvaf_runtime PRIVATE kvaf_ubmem_hal kvaf_peer_link)
   if(KVAF_CPU_ENABLE_URMA)
     set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
@@ -82,12 +88,12 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     endif()
     find_package(Threads REQUIRED)
     find_package(OpenMP REQUIRED COMPONENTS CXX)
-    add_library(kvaf_cpu_gather_executor STATIC src/cpu_gather_executor.cc)
+    add_library(kvaf_cpu_gather_executor STATIC cpu_service/gather/cpu_gather_executor.cc)
     target_include_directories(kvaf_cpu_gather_executor PUBLIC include)
     target_link_libraries(kvaf_cpu_gather_executor PUBLIC kvaf_common kvaf_access_operator Threads::Threads)
     target_compile_options(kvaf_cpu_gather_executor PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
-    target_sources(kvaf_cpu_runtime PRIVATE src/urma_cpu_backend.cc src/cpu_urma_discovery.cc
-      src/cpu_push_get_transport.cc src/cpu_push_get_worker.cc)
+    target_sources(kvaf_cpu_runtime PRIVATE cpu_service/backends/urma_cpu_backend.cc cpu_service/urma/cpu_urma_discovery.cc
+      cpu_service/push/cpu_push_get_transport.cc cpu_service/push/cpu_push_get_worker.cc)
     target_link_libraries(kvaf_cpu_runtime PRIVATE Threads::Threads OpenMP::OpenMP_CXX kvaf_cpu_gather_executor)
     target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2;-g>")
     target_include_directories(kvaf_cpu_runtime PRIVATE "${KVAF_URMA_INCLUDE_DIR}")
@@ -96,7 +102,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   endif()
 endif()
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
-  add_executable(kvaf_cpu_service src/cpu_service_main.cc)
+  add_executable(kvaf_cpu_service cpu_service/cpu_service_main.cc)
   target_link_libraries(kvaf_cpu_service PRIVATE kvaf_cpu_runtime)
   if(KVAF_CPU_ENABLE_URMA)
     get_filename_component(KVAF_URMA_LIBRARY_DIR "${KVAF_URMA_LIBRARY}" DIRECTORY)

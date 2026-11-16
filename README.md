@@ -40,15 +40,30 @@ AccessTable 锁和内部传输资源。调用方必须在同一 BatchGet stream 
 
 ```text
 kvaf/
-├── common/include/        # 模块间共享的类型、请求与 Status
-├── runtime/               # KVAF Runtime
-├── meta_manager/          # Meta Manager
-├── access_operator/       # KV Access Operator
-├── bindings/              # 可选的 Python/Pybind 注册入口
-├── python/kvaf/           # Python 包入口
-├── scripts/               # 构建辅助脚本
-└── tests/                 # 主机回归、硬件功能及性能测试
+├── common/include/          # 跨模块的类型、请求、Status 和协议布局
+├── meta_manager/            # Key → DDR 元数据、slot 与访问表锁
+├── runtime/
+│   ├── include/             # 公共 Runtime 接口
+│   ├── src/                 # RuntimeCore、NpuRuntime 入口和配置
+│   ├── execution/           # 调度、执行资源管理；上下文和绑定接口在 include/
+│   ├── memory/              # 缓存池、DDR 注册与分配
+│   ├── peer/                # 链路与控制协议
+│   └── cpu_service/         # 服务入口、backends、URMA 基础、Gather/Push worker
+├── access_operator/
+│   ├── algorithms/get/      # Direct、Gather、Scatter，按执行实现细分
+│   ├── algorithms/put/      # URMA AIV、URMA AICPU、UBMEM AIV
+│   ├── providers/           # Runtime adapter 和算法资源 owner
+│   ├── transports/          # Direct-HCCP、AICPU URMA、UBMEM
+│   └── include/             # 公共接口与资源视图
+├── bindings/                # Python/Pybind 注册入口
+├── python/kvaf/             # Python 包入口
+├── scripts/                 # 构建辅助脚本
+└── tests/                   # 主机回归、硬件功能及性能测试
 ```
+
+具体算法的 Host、ABI、kernel 分布见 [AccessOperator 目录](access_operator/README.md#目录)，
+Runtime 的内部划分见 [Runtime 源码目录](runtime/README.md#源码目录)。公共接口、CMake
+目标和算法行为保持不变；尚未合入的 AIV Gather/Scatter 与 CPU Pull 不创建占位目录。
 
 ```text
 调用方 / vLLM Adapter（仓外）
@@ -66,15 +81,6 @@ Key → DDR 地址    BatchPut / BatchGet 数据面
          远端 DDR region
 ```
 `CacheOS-vLLM Adaptor` 在 vLLM 侧实现，不属于当前代码仓。
-
-| 模块 | 职责 |
-| --- | --- |
-| `common/` | 跨模块共享的类型、请求和 `Status`。 |
-| `meta_manager/` | Key 到远端 DDR 地址的内存态元数据、slot 分配、访问表锁定和释放。 |
-| `access_operator/` | AIV URMA、UBmem、AICPU Gather/Scatter/Put 算子，以及 HCCP/UMDK 和内存映射资源。 |
-| `runtime/` | `Runtime` 接口、`RuntimeCore`、`NpuRuntime`、`CpuRuntime`、TCP `RuntimeService` 与 peer 控制协议。 |
-| `bindings/` | 可选的 pybind 模块，导出 Python `kvaf.NpuRuntime` 和 Mock Runtime。 |
-| `tests/` | 配置、构建和清理回归，Python Mock 测试，CPU/NPU 端到端及性能测试。 |
 
 ## CPU/NPU 分离部署
 
@@ -126,11 +132,11 @@ URMA、UBmem 请求，后端资源按需初始化。URMA 依赖 UB 驱动、UMDK
 - `BatchGet`：通过所选后端搬运数据；默认仅入队到调用方 stream；
 - `BatchFree`：释放 Key 对应的 slot。仍被 AccessTable 持有的 Key 会返回 busy。
 
-一个 `NpuRuntime` 连接一个 CPU 服务并使用一个远端 DDR region。后端在构造时固定，
-Get/Put 成对使用；本期不支持同一 Runtime 混用 UBmem 和 URMA，也不支持按次切换算法。
-切换配置需关闭原 Runtime 后创建新 Runtime，缓存数据不会自动迁移。
+一个 `NpuRuntime` 连接一个 CPU 服务并使用一个远端 DDR region。legacy 模式使用构造时
+固定的后端组合；per-call 模式按已启用的 Put/Get 配置选择算法，混合模式可在同一缓存池上
+使用 URMA 和 UBMEM。Get 的执行上下文按配置驻留，用户输出的长期注册绑定是可选能力。
 
-### 后端选择
+### Legacy 后端选择
 
 | `transport` | `aicpu_batch_get_mode` | BatchPut | BatchGet |
 | --- | --- | --- | --- |
@@ -212,8 +218,8 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 build-npu/python/kvaf/
 build-npu/bin/kvaf_execute_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
-build-npu/access_operator/src/aicpu_urma/kernel.json
-build-npu/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz
+build-npu/access_operator/transports/aicpu_urma/kernel.json
+build-npu/access_operator/transports/aicpu_urma/kvaf-aicpu-urma.tar.gz
 ```
 
 构建与运行选择相同的 CANN 根目录。AICPU 的固定安装位置为：
@@ -277,7 +283,7 @@ BatchGet 结果和 teardown。正常完成时：
 保持同一个 CPU 服务和上面的 NPU 环境，使用统一构建的 Python 包：
 
 ```bash
-python3 access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py \
+python3 access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
   --device-id "$DEVICE_ID" --peer "$KVAF_CPU_SERVICE_ADDR" \
   --modes gather_read cpu_push_scatter --workers 1 2 4 5 \
   --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
@@ -287,7 +293,7 @@ python3 access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py \
 实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，当前测试示例统一使用
 1、2、4、5 个 worker，暂不推荐 Scatter 使用 8 个 worker。
 
-[test_batch_get.py](access_operator/algorithms/aicpu_batch_get/python/test_batch_get.py)
+[test_batch_get.py](access_operator/algorithms/get/common/aicpu/python/test_batch_get.py)
 每轮先执行 AICPU BatchPut，再执行 Gather/Scatter 并比较整个输出。它还检查两种
 Table 重载、空/部分请求前缀、随机输入和输出行、异步调用后同 stream 的 NPU 消费。
 两种模式乘以四种 worker 数，应输出 8 条 `AICPU_BATCH_GET_PASS`。

@@ -558,7 +558,7 @@ Gather/Scatter 使用原单点负载；`PYTHONPATH` 指向同一次构建。Scat
 ```bash
 PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
 KVAF_GET_DISPATCH_TRACE="$PWD/scatter-dispatch.csv" \
-python3 access_operator/algorithms/aicpu_batch_get/python/benchmark_cpu_push_scatter.py \
+python3 access_operator/algorithms/get/scatter/urma_aicpu/python/benchmark_cpu_push_scatter.py \
   --execution-mode per-call --peer 127.0.0.1:38999 --device-id 6 \
   --workers 5 --token-bytes 656 --miss-count 8192 --warmup 10 --iterations 100
 python3 tests/python/summarize_get_dispatch_trace.py scatter-dispatch.csv --last 100

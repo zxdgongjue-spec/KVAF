@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "access_operator/algorithms/aicpu_batch_get/python"))
+sys.path.insert(0, str(ROOT / "access_operator/algorithms/get/common/aicpu/python"))
 import test_batch_get as functional
 import benchmark_gather_read as benchmark
 
@@ -74,7 +74,7 @@ class InstallTests(unittest.TestCase):
         (self.artifacts / "kernel.json").write_text(json.dumps(self.entries))
 
     def installer(self, *args, env=None):
-        return subprocess.run(["bash", str(ROOT / "access_operator/src/aicpu_urma/package/install_kernel.sh"), *map(str, args)],
+        return subprocess.run(["bash", str(ROOT / "access_operator/transports/aicpu_urma/package/install_kernel.sh"), *map(str, args)],
                               capture_output=True, text=True, env=env)
 
     def installed_paths(self):

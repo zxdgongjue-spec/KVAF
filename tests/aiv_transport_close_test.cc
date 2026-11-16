@@ -1,9 +1,9 @@
 // Compile twice to exercise the real Get and Put teardown implementations.
 // Only the external driver/ACL calls are replaced; transports and retries are real.
 #ifdef KVAF_TEST_CLOSE_PUT
-#include "../access_operator/algorithms/aiv_batch_put/host/batch_put_host.cpp"
+#include "../access_operator/algorithms/put/urma_aiv/host/batch_put_host.cpp"
 #else
-#include "../access_operator/algorithms/aiv_batch_get/host/batch_get_host.cpp"
+#include "../access_operator/algorithms/get/direct/urma_aiv/host/batch_get_host.cpp"
 #endif
 
 #include <iostream>

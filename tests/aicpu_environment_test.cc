@@ -30,7 +30,7 @@ char* Error() { static char message[] = "injected loader error"; return message;
 #define dlsym Symbol
 #define dlclose Close
 #define dlerror Error
-#include "../access_operator/src/aicpu_urma/kernel/session.cc"
+#include "../access_operator/transports/aicpu_urma/kernel/session.cc"
 #undef dlopen
 #undef dlsym
 #undef dlclose

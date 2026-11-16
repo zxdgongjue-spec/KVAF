@@ -2,7 +2,7 @@
 // Rename only the registry entry point to count lookups without a production hook.
 #include "transport_internal.h"
 #define FindSession FindSessionUncounted
-#include "../access_operator/src/aicpu_urma/kernel/session.cc"
+#include "../access_operator/transports/aicpu_urma/kernel/session.cc"
 #undef FindSession
 #include "gather_read.h"
 #include "cpu_gather.h"

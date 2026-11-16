@@ -1,5 +1,19 @@
 # KVAF Runtime
 
+## 源码目录
+
+公共 C++ 头文件继续放在 `include/`，包含方式与构建 target 不变。实现按职责组织：
+
+- `src/`：`RuntimeCore`、`NpuRuntime` 入口、NPU 配置及启动探测。
+- `execution/`：执行配置解析、Dispatcher 与执行资源管理；驻留上下文及绑定的公共定义仍在 `include/`。
+- `memory/`：缓存池服务、池分配与 session 工厂、CPU DDR 注册复用、UBMEM allocator。
+- `peer/`：NPU/CPU 链路和 execution 控制协议。
+- `cpu_service/`：CPU Runtime 与服务入口、TCP 分发；`backends/` 放 URMA/UBMEM backend，`urma/` 放发现和通道基础，`gather/`、`push/` 放对应 worker。
+
+私有头文件以 Runtime 根目录为包含根，例如 `memory/cpu_shared_registration.h`；
+公开头文件不依赖这些私有路径。CPU 服务可执行文件仍输出到 `build-*/runtime/kvaf_cpu_service`。
+
+
 ## 模块定位
 
 KVAF Runtime 是对外的 KV 控制面入口。它不处理 Prefix Key 或

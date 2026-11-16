@@ -16,21 +16,48 @@ caller-owned buffer 与远端 DDR 组织为一次数据搬运。它不拥有 Key
 ```text
 access_operator/
   algorithms/
-    aiv_batch_get/       # URMA Direct、UBMEM Get 的 Host、ABI、设备 kernel
-    aiv_batch_put/       # URMA AIV、UBMEM Put 的 Host、ABI、设备 kernel
-    aicpu_batch_get/     # Gather、Scatter 的 Host、ABI、设备 kernel、Python benchmark
-    aicpu_batch_put/     # AICPU Put 的 Host、ABI、设备 kernel
-  include/              # 算子接口、资源视图、传输接口
-  src/                  # 资源 owner、Runtime adapter、共享通信实现
-    direct_hccp/        # 进程级 HCCP session 与传输封装
-    aicpu_urma/          # AICPU 会话、控制 ABI、设备包构建与安装
-    ubmem/              # DDR 映射、执行资源、算子适配
-  cmake/                # AIV 编译工具链
+    get/
+      direct/
+        urma_aiv/         # URMA Direct Host、ABI、AIV kernel
+        ubmem_aiv/        # UBMEM Direct AIV kernel
+        common/           # 两种 Direct kernel 的组合编译单元
+      gather/urma_aicpu/   # CPU Gather + AICPU READ
+      scatter/urma_aicpu/  # CPU Push + AICPU Scatter
+      common/aicpu/       # Gather/Scatter 共享 ABI、loader、设备入口和测试
+    put/
+      urma_aiv/           # URMA AIV Put
+      urma_aicpu/         # URMA AICPU Put
+      ubmem_aiv/          # UBMEM AIV Put kernel
+      common/aiv_kernel/  # 两种 AIV Put kernel 的组合编译单元
+  providers/
+    urma_aiv/             # 跨 Put/Get 的 Runtime adapter、资源 owner
+    urma_aicpu/           # 跨 Put/Gather/Scatter 的 adapter、资源 owner
+    ubmem_aiv/            # 跨 Put/Get 的 adapter、资源 owner
+    common/               # 请求参数、capture/profile 辅助实现
+  transports/
+    direct_hccp/          # HCCP session 与传输封装
+    aicpu_urma/           # AICPU 会话、通信实现、设备包构建与安装
+    ubmem/                # HAL 生命周期与 DDR 设备映射
+  include/                # 稳定的公开接口、资源视图与传输头文件
+  cmake/                  # AIV 编译工具链
 ```
 
-`algorithms/` 是生产实现。目录迁移不改变 CMake target、库名、导出符号，或
-`build-npu/bin/` 与 `build-npu/access_operator/src/aicpu_urma/` 的构建产物位置。
-验证入口仍在仓库根目录的 `tests/run_*.sh`；算法目录中的 Python benchmark 随实现一同迁移。
+`algorithms/` 按数据搬运算法分类；`providers/` 保留目前跨 Put/Get 的适配器和
+资源 owner 组合，负责将 Runtime 请求接到具体算法。此次仅迁移目录，不拆分这些
+对象的生命周期，不改变算法执行和资源复用行为。
+
+算法目录的 `common/` 只保留已有的共享 ABI、loader、设备入口或组合编译单元，
+不表示合并不同算法的 session、Jetty、队列、workspace 或完成状态。
+例如 URMA Direct 和 UBMEM Direct 仍使用原有组合 `.o`，各自 kernel 实现分目录存放。
+UBMEM provider 和公共映射代码分别位于 `providers/ubmem_aiv/` 与 `transports/ubmem/`。
+
+CMake target、库名和导出符号保持不变。AIV 产物仍在 `build-npu/bin/`；
+AICPU 构建包位于 `build-npu/access_operator/transports/aicpu_urma/`，统一构建与
+安装脚本已使用该路径。验证入口仍在仓库根目录的 `tests/run_*.sh`。
+
+后续 AIV Gather/Scatter 可分别接入 `algorithms/get/gather/urma_aiv/` 和
+`algorithms/get/scatter/urma_aiv/`，当前尚未创建这些目录。CPU Pull 的独立
+`offload/cpu_pull/` 及 CPU 服务 worker 也待代码合入时建立，不作为普通 Get 算法。
 
 四种 Get 的显式图租约、常驻实例和资源边界见
 [Get 图模式演进](../docs/get_graph_evolution.md)，运行方式见
