@@ -288,6 +288,8 @@ K 端设置 `KVAF_CPU_PUSH_PREFILL_STAGING=1` 启用预填对照。每个会话�
 
 分别以 `KVAF_CPU_PUSH_PREFILL_STAGING=0` 和 `1` 启动两次 K 端服务，其他配置相同。N 端两次使用同一命令，
 分别保存日志和 CSV。使用不设 `KVAF_SCATTER_JETTYS_PER_CORE` 的默认 4 条共享 Jetty。
+如果用 `tests/run_remote_cpu_scatter_miss_count_perf.sh`，两组都加 `--fixed-request-plan`。该选项让正确性预检、
+warmup 和正式采样共用一份请求清单。预填组在预检时填充 staging。
 
 ```bash
 python tests/python/test_aiv_scatter_perf.py --input-mode steady --plans 1 \

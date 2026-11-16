@@ -82,7 +82,7 @@ def arguments(argv=None):
     parser.add_argument("--overlap-head-cq", type=int, choices=(0, 1),
                         help="build the suffix while the head control WRITE is in flight (default: 0)")
     parser.add_argument("--fixed-request-plan", action="store_true",
-                        help="reuse one request plan for warmup and measurement")
+                        help="reuse one request plan for preflight, warmup and measurement")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
@@ -330,7 +330,8 @@ def run_case(args):
         host_timing_matches_reference=False,
         completion_scope="device",
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",
-        verification="deterministic_preflight_prefix_and_guard_then_last_random_payload",
+        verification=("fixed_plan_preflight_and_last_payload" if args.fixed_request_plan
+                      else "deterministic_preflight_prefix_and_guard_then_last_random_payload"),
         profile_snapshot_in_sample=False, setup_in_sample=False,
         instrumentation_overhead_included=args.kernel_profile,
         cpu_profile_report_before_done=args.kernel_profile,
@@ -374,24 +375,32 @@ def run_case(args):
         def verify(inputs, guard=False):
             rows = inputs[2][:args.miss_count].to(torch.int64)
             slots = (inputs[1][:args.miss_count] // args.token_bytes).to(torch.int64)
-            if not torch.equal(output.index_select(0, rows), pattern.index_select(0, slots)):
+            actual = output.index_select(0, rows)
+            if not torch.equal(actual, pattern.index_select(0, slots)):
                 raise AssertionError("aligned scatter payload mismatch")
             if guard and args.miss_count < args.request_length and \
-                    torch.count_nonzero(output[args.miss_count:]).item():
-                raise AssertionError("aligned scatter wrote outside active output prefix")
+                    torch.count_nonzero(output).item() != torch.count_nonzero(actual).item():
+                raise AssertionError("aligned scatter wrote outside active output rows")
 
         log_phase("preflight", "begin")
         request_ids = torch.arange(args.request_length, dtype=torch.int64, device=device)
-        linear = request_ids % (args.table_capacity * args.tokens_per_block)
-        preflight_indices = (linear // args.tokens_per_block).to(torch.int32)
-        preflight_slots = linear % args.tokens_per_block
-        preflight = (preflight_indices,
-                     (preflight_slots * args.token_bytes).to(torch.int32),
-                     request_ids.to(torch.int32))
-        if args.sort_input_indices:
-            preflight = reference.sort_request_plan_prefix(torch, view.addresses, *preflight, args.miss_count)
-        # Keep this storage for the entire case and refresh its contents in place.
-        fixed_inputs = preflight
+        contiguous_source_token_ids = request_ids % (args.table_capacity * args.tokens_per_block)
+
+        def request_plan():
+            return generate_request_plan(torch, args, device, request_ids, view.addresses,
+                                         contiguous_source_token_ids)
+
+        if args.fixed_request_plan:
+            # The peer can seed staging on the first successful request.
+            fixed_inputs = request_plan()
+        else:
+            preflight_slots = contiguous_source_token_ids % args.tokens_per_block
+            fixed_inputs = ((contiguous_source_token_ids // args.tokens_per_block).to(torch.int32),
+                            (preflight_slots * args.token_bytes).to(torch.int32),
+                            request_ids.to(torch.int32))
+            if args.sort_input_indices:
+                fixed_inputs = reference.sort_request_plan_prefix(
+                    torch, view.addresses, *fixed_inputs, args.miss_count)
         with setup_phase(report, "prepare_submit"):
             submit = runtime.prepare_scatter_batch_get(
                 view, fixed_inputs[0], fixed_inputs[1], count, fixed_inputs[2], output,
@@ -400,22 +409,15 @@ def run_case(args):
         submit()
         torch.npu.synchronize()
         complete_outside_measurement(runtime, False)
-        # Same contiguous-prefix correctness comparison as the reference.
-        if not torch.equal(output[:args.miss_count], pattern[preflight_slots[:args.miss_count]]):
-            raise AssertionError("aligned scatter preflight payload mismatch")
-        if args.miss_count < args.request_length and torch.count_nonzero(output[args.miss_count:]).item():
-            raise AssertionError("aligned scatter preflight modified the output suffix")
-        print("SCATTER_ALIGNED_CORRECTNESS_PASS active_prefix_and_guard=1", flush=True)
+        verify(fixed_inputs, guard=True)
+        check = ("active_payload_and_guard" if args.fixed_request_plan and
+                 args.output_access_pattern != "contiguous" else "active_prefix_and_guard")
+        print(f"SCATTER_ALIGNED_CORRECTNESS_PASS {check}=1", flush=True)
         log_phase("preflight", "end")
-        contiguous_source_token_ids = request_ids % (args.table_capacity * args.tokens_per_block)
 
         def refresh_inputs():
-            plan = generate_request_plan(torch, args, device, request_ids, view.addresses,
-                                                   contiguous_source_token_ids)
-            refresh_request_buffers(plan, fixed_inputs)
+            refresh_request_buffers(request_plan(), fixed_inputs)
 
-        if args.fixed_request_plan:
-            refresh_inputs()
         if args.kernel_profile:
             runtime.start_scatter_profile()
         log_phase("warmup", "begin", calls=args.warmup)
