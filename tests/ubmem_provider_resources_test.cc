@@ -12,6 +12,8 @@
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
 int launches = 0, mappings_closed = 0, releases = 0, allocations = 0;
+int status_resets = 0, captured_status_resets = 0;
+std::size_t status_reset_bytes = 0;
 bool fail_free = false, capturing = false;
 bool fail_wait = false, fail_copy = false, incomplete = false, fail_launch = false;
 kvaf::ubmem::BatchArgs captured_args{};
@@ -54,7 +56,16 @@ aclError aclrtCreateEvent(aclrtEvent* p) { *p = reinterpret_cast<aclrtEvent>(1);
 aclError aclrtDestroyEvent(aclrtEvent) { return 0; }
 aclError aclrtRecordEvent(aclrtEvent, aclrtStream) { return 0; }
 aclError aclrtSynchronizeEvent(aclrtEvent) { return fail_wait ? 1 : 0; }
-aclError aclrtMemsetAsync(void* p, size_t, int value, size_t n, aclrtStream) {
+aclError aclrtMemsetAsync(void* p, size_t capacity, int value, size_t n, aclrtStream) {
+  ++status_resets;
+  if (capturing) {
+    ++captured_status_resets;
+    // This test requires a kernel-only Get graph. Never execute a captured
+    // memset immediately: capture must not mutate the preceding eager report.
+    return 1;
+  }
+  CHECK(value == 0xFF && n <= capacity);
+  status_reset_bytes = n;
   std::memset(p, value, n); return 0;
 }
 aclError aclrtMemcpy(void* p, size_t, const void* s, size_t n, aclrtMemcpyKind kind) {
@@ -132,7 +143,10 @@ int main() {
   PutAccessDesc destinations; destinations.entries.push_back({1, region.base, 64});
   BatchPutExecRequest call{&request, &destinations, {reinterpret_cast<void*>(1)}};
   fail_wait = true;
+  const auto put_resets = status_resets;
   CHECK(!op->ExecuteBatchPut(call).ok() && launches == 1);
+  CHECK(status_resets == put_resets + 1);
+  CHECK(status_reset_bytes == options.cores * sizeof(ubmem::CoreStatus));
   PutCompletion completion;
   CHECK(!op->ResolvePut(&completion).ok());
   CHECK(!op->AcknowledgePut().ok());
@@ -219,7 +233,10 @@ int main() {
   ubmem::UbmemGetView get_view;
   CHECK(mapped->PrepareGetResources(reinterpret_cast<aclrtStream>(1), &get_view).ok());
   CHECK(!ubmem::UbmemGetOperator::Launch(get_call, get_view, *wrong).ok());
+  const auto synchronous_get_resets = status_resets;
   CHECK(ubmem::UbmemGetOperator::Launch(get_call, get_view, *typed).ok());
+  CHECK(status_resets == synchronous_get_resets + 1);
+  CHECK(status_reset_bytes == options.cores * sizeof(ubmem::CoreStatus));
   CHECK(launches == launch_count + 2 && allocations == allocation_count);
 
   // A borrowed view becomes unusable after Close; incomplete work and graph
@@ -255,23 +272,33 @@ int main() {
   std::vector<BatchGetKernelProfile> profiles;
   CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
   // The unified benchmark first profiles eager calls, then captures/replays
-  // on the same bound invocation. Capture must replace the eager sample.
+  // on the same bound invocation. Only replay replaces the eager sample.
   CHECK(graph_op.ExecuteBatchGet(get_call).ok());
   CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
   CHECK(profiles.size() == options.cores);
+  get_call.execution.synchronize = false;
+  const auto asynchronous_get_resets = status_resets;
+  CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+  CHECK(status_resets == asynchronous_get_resets + 1);
+  CHECK(status_reset_bytes == options.cores * sizeof(ubmem::CoreStatus));
+  CHECK(graph_op.DrainGet().ok());
+  CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
   auto previous_cycle = profiles.front().kernel_start_cycle;
   CHECK(graph_op.PrepareGetGraph({get.output, get_call.execution.stream, 1}).ok());
   const auto graph_allocations = allocations;
-  get_call.execution.synchronize = false;
+  const auto graph_resets = status_resets;
   capturing = true;
   CHECK(graph_op.ExecuteBatchGet(get_call).ok());
   CHECK(allocations == graph_allocations);
+  CHECK(status_resets == graph_resets && captured_status_resets == 0);
   const auto capture_profile = graph_op.CopyBatchGetKernelProfiles(&profiles);
   CHECK(capture_profile.code() == StatusCode::kInvalidState);
   CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, true).ok());
   capturing = false;
-  // Capturing alone has not executed the kernel or produced valid timestamps.
-  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  // Capture has not executed any work. A snapshot can still contain the last
+  // eager report; callers must replay and complete the stream for a new sample.
+  CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(profiles.front().kernel_start_cycle == previous_cycle);
   CHECK(captured_blocks == options.cores && captured_args.profile == 1);
   for (int active : {1, 0, 1}) {
     count = active;
@@ -288,6 +315,14 @@ int main() {
       CHECK(!profiles[i].ubmem_profile_detail);
     }
   }
+  // Removing the graph's reset must not remove result validation at release.
+  auto* graph_reports = reinterpret_cast<ubmem::CoreStatus*>(captured_args.statuses);
+  graph_reports[0].result = 2;
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, false).ok());
+  ExecuteKernel(captured_args, captured_blocks);
+  CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  previous_cycle = profiles.front().kernel_start_cycle;
   CHECK(!graph_op.FinishGetGraph(reinterpret_cast<void*>(99), false).ok());
   fail_wait = true;
   CHECK(!graph_op.FinishGetGraph(get_call.execution.stream, true).ok());
@@ -306,6 +341,7 @@ int main() {
   CHECK(graph_op.PrepareGetGraph({get.output, get_call.execution.stream, 1}).ok());
   capturing = true;
   CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+  CHECK(status_resets == graph_resets && captured_status_resets == 0);
   capturing = false;
   CHECK(captured_args.profile == 2);
   ExecuteKernel(captured_args, captured_blocks);

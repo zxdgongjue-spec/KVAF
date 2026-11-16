@@ -39,7 +39,11 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
       capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
     return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
   const auto size = view.kernel.cores * sizeof(CoreStatus);
-  if (synchronize || view.managed_completion) {
+  const bool graph_get = args.operation == Operation::kGet &&
+      capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+  // Match legacy Get capture: replay contains only the Get kernel, which
+  // overwrites its report. Keep the sentinel for ordinary calls and Put.
+  if ((synchronize || view.managed_completion) && !graph_get) {
     // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
     // not look like a successful zero-row kernel.
     auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
