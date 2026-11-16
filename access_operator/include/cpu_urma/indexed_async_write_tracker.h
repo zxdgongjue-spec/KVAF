@@ -106,7 +106,7 @@ Status SweepAsyncCqs(std::size_t queues, std::size_t first, std::size_t batch_si
   if (!queues || !batch_size || !capacity || !count)
     return Status::InvalidArgument("invalid async CQ sweep");
   *count = 0;
-  for (std::size_t i = 0, q = first % queues; i < queues && *count < capacity;
+  for (std::size_t i = 0, q = first < queues ? first : first % queues; i < queues && *count < capacity;
        ++i, q = q + 1 == queues ? 0 : q + 1) {
     const auto limit = std::min({batch_size, capacity - *count, pending(q)});
     if (!limit) continue;

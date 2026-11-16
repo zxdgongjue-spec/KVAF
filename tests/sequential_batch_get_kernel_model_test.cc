@@ -12,6 +12,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <malloc.h>
@@ -696,6 +697,20 @@ int main() {
     for (uint32_t i = 0; i < 13; ++i)
       assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
     assert(staging[13 * sizeof(source)] == 0xad);
+
+    // Reuse the pool with a wider schedule and exercise the last progress
+    // word in more than one wave.
+    auto wide_waves = jetty_waves;
+    const auto jettys = kvaf::cpu_push::kMaxJettyCount;
+    wide_waves[0].back() = std::exchange(wide_waves[0][1], Range{});
+    wide_waves[1].back() = std::exchange(wide_waves[1][2], Range{});
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(small_pool.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
+                                   wide_waves, nullptr, 0, true, jettys) == 3);
+    small_pool.Copy({}, [] { return true; });
+    assert(small_pool.ShardReady(0, jettys - 1) && small_pool.ShardReady(1, jettys - 1));
+    for (uint32_t i = 0; i < 13; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
 
     // In multi-worker mode an invalid contributor must keep its shard from
     // being submitted even after all the other contributors complete.

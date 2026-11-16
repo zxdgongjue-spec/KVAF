@@ -649,7 +649,7 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
           *finished = completed != 0;
           return Status::OK();
         });
-    next_poll_queue_ = (next_poll_queue_ + 1) % jetty_count_;
+    if (++next_poll_queue_ == jetty_count_) next_poll_queue_ = 0;
     if (!status.ok()) return status;
     if (profile && count && tracker_.Empty()) profile->last_cqe_ns = BatchGetProfileNowNs();
     if (count || !wait) return Status::OK();
@@ -726,7 +726,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     std::size_t next_plan = 0;
     std::array<std::size_t, kMaxJettyCount> next_shard{};
     std::size_t shards_left = 0U;
-    for (const auto& shards : prepared_shards_) shards_left += shards.size();
+    for (std::uint32_t q = 0; q < jetty_count_; ++q) shards_left += prepared_shards_[q].size();
     const auto whole_plans = prepared_.size() - shards_left;
     const peer::CpuGatherExecutor::FixedSuffix suffix{
         reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset),

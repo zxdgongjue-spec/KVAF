@@ -98,6 +98,7 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   std::uint64_t planned_rows = 0U;
   for (std::size_t i = 0; i < fixed_progress_.size(); ++i) {
     auto& wave = fixed_progress_[i];
+    if (i >= first_shard_wave) wave.first_shard = (i - first_shard_wave) * jettys;
     wave.aligned_bytes = 0U;
     wave.rows = waves[i];
     for (std::uint32_t q = 0; q < jettys; ++q) {
@@ -118,7 +119,8 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   fixed_first_shard_wave_ = first_shard_wave;
   fixed_jetty_supply_ = jetty_supply && first_shard_wave != SIZE_MAX;
   fixed_jetty_count_ = jettys;
-  fixed_shards_.resize(first_shard_wave == SIZE_MAX ? 0U : waves.size() - first_shard_wave);
+  const auto shard_waves = first_shard_wave == SIZE_MAX ? 0U : waves.size() - first_shard_wave;
+  fixed_shards_.resize(shard_waves * jettys);
   fixed_last_source_offset_ = source_bytes - span_bytes;
   fixed_suffix_ = suffix ? *suffix : FixedSuffix{};
   fixed_error_.store(FixedError::kNone, std::memory_order_relaxed);
@@ -303,10 +305,10 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
 void CpuGatherExecutor::PrepareShardProgress() {
   const auto queues = fixed_jetty_count_;
   fixed_jetty_supply_ &= active_threads_ >= queues;
-  for (std::size_t index = 0; index < fixed_shards_.size(); ++index) {
-    const auto& wave = fixed_progress_[fixed_first_shard_wave_ + index];
-    auto& shards = fixed_shards_[index];
-    shards = {};
+  for (auto& shard : fixed_shards_) shard.remaining = 0;
+  for (std::size_t index = fixed_first_shard_wave_; index < fixed_progress_.size(); ++index) {
+    const auto& wave = fixed_progress_[index];
+    auto* shards = fixed_shards_.data() + wave.first_shard;
     if (fixed_jetty_supply_) {
       for (std::size_t q = 0; q < queues; ++q) {
         const auto rows = wave.rows[q];
@@ -346,10 +348,10 @@ bool CpuGatherExecutor::ShardReady(std::size_t wave, std::size_t queue) const {
   if (wave < fixed_first_shard_wave_ || wave >= fixed_progress_.size() ||
       queue >= fixed_jetty_count_)
     return false;
-  const auto rows = fixed_progress_[wave].rows[queue];
+  const auto& progress = fixed_progress_[wave];
+  const auto rows = progress.rows[queue];
   return rows.begin < rows.end &&
-         !__atomic_load_n(&fixed_shards_[wave - fixed_first_shard_wave_][queue].remaining,
-                          __ATOMIC_ACQUIRE) &&
+         !__atomic_load_n(&fixed_shards_[progress.first_shard + queue].remaining, __ATOMIC_ACQUIRE) &&
          fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone;
 }
 
@@ -373,7 +375,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
     if (first == last) return 0;
     const auto copied = CopyFixedRange(base + first, base + last);
     if (copied) GatherBarrier();
-    auto& remaining = fixed_shards_[index - fixed_first_shard_wave_][q].remaining;
+    auto& remaining = fixed_shards_[wave.first_shard + q].remaining;
     __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
     // The coordinator calls publish_ready after returning from this slice.
     return copied;
@@ -398,7 +400,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
       copied += bytes_copied;
       if (shard_mode) {
         if (bytes_copied) GatherBarrier();
-        auto& remaining = fixed_shards_[index - fixed_first_shard_wave_][queue].remaining;
+        auto& remaining = fixed_shards_[wave.first_shard + queue].remaining;
         // Acquire the previous writers' stores before making this shard ready.
         __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
         on_progress();

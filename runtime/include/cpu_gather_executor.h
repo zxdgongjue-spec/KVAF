@@ -232,6 +232,7 @@ class CpuGatherExecutor {
   FixedSuffix fixed_suffix_{};
   struct alignas(64) FixedWaveProgress {
     std::size_t remaining{};
+    std::size_t first_shard{};
     std::uint64_t aligned_bytes{};
     cpu_push::GatherWave rows{};
   };
@@ -242,7 +243,7 @@ class CpuGatherExecutor {
   std::size_t fixed_first_shard_wave_{SIZE_MAX};
   bool fixed_jetty_supply_{};
   std::uint32_t fixed_jetty_count_{cpu_push::kJettyCount};
-  std::vector<std::array<FixedShardProgress, cpu_push::kMaxJettyCount>> fixed_shards_;
+  std::vector<FixedShardProgress> fixed_shards_;
   enum class FixedError { kNone, kSource, kSuffix, kCancelled };
   std::atomic<FixedError> fixed_error_{FixedError::kNone};
   void SetFixedError(FixedError error) {
