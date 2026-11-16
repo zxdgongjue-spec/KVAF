@@ -1,16 +1,52 @@
 #pragma once
 
 // Core 0 publishes request phases to registered CPU memory using the same
-// device USER_CTL WRITE format as BatchPut. UB is reused only after list-build
-// DMA has drained, and returned to payload scatter after the control CQ drains.
+// device USER_CTL WRITE format as BatchPut. UB can be reused once the SQ DMA
+// has drained. The control CQ must be checked before publishing the suffix.
 namespace kvaf_scatter {
 using namespace AscendC;
 using namespace kvaf_aiv;
 enum class MailboxPhase { Full, Head, Suffix };
 
+__aicore__ inline uint64_t WaitMailboxCqe(const KvafScatterBatchGetArgs& a,
+    const __gm__ KvafBatchGetDirectUrmaEntity* e, __gm__ KvafBatchGetQueueState* state) {
+  const auto ci = state->cq_consumer_index;
+  const auto cqe = e->cq_va + (ci % e->cq_depth) * e->cqe_size;
+  uint64_t result = KVAF_SEQ_TIMEOUT;
+  for (uint32_t poll = 0; poll < a.max_polls; ++poll) {
+    Flush(cqe, 32);
+    const auto word = *reinterpret_cast<__gm__ volatile uint32_t*>(cqe);
+    if (((word >> 2) & 1) == ((ci / e->cq_depth) & 1)) continue;
+    ++state->cq_consumer_index;
+    st_dev(static_cast<uint32_t>(ci + 1) & 0x003fffffU,
+           reinterpret_cast<__gm__ uint32_t*>(e->cq_db_va), 0);
+    result = (word & 0xffff0000U) ? KVAF_SEQ_CQ_ERROR : KVAF_SEQ_OK;
+    break;
+  }
+  if (result) {
+    state->last_error = result;
+    state->poisoned = 1;
+    Flush(reinterpret_cast<uint64_t>(state), sizeof(*state));
+  }
+  return result;
+}
+
+__aicore__ inline void MarkMailboxPhaseComplete(__gm__ KvafBatchGetQueueState* state) {
+  ++state->completed_batch_count;
+  Flush(reinterpret_cast<uint64_t>(state), sizeof(*state));
+}
+
+__aicore__ inline uint64_t FinishDeferredHead(const KvafScatterBatchGetArgs& a) {
+  auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
+  auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
+  const auto result = WaitMailboxCqe(a, &context->entity, state);
+  if (result == KVAF_SEQ_OK) MarkMailboxPhaseComplete(state);
+  return result;
+}
+
 __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_t count,
     __gm__ kvaf::ScatterBatchGetCoreProfile* profile,
-    MailboxPhase phase = MailboxPhase::Full) {
+    MailboxPhase phase = MailboxPhase::Full, bool defer_head_cqe = false) {
   auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
   if (!context || !state) return KVAF_SEQ_QUEUE_ERROR;
@@ -92,27 +128,11 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
     // start payload DMA while core 0 retires this control completion.
     if (region == regions && profile && !suffix) profile->notify_cycle = GetSystemCycle();
     st_dev(static_cast<uint32_t>(pi + wrs), reinterpret_cast<__gm__ uint32_t*>(e.sq_db_va), 0);
-    const auto ci = state->cq_consumer_index;
-    const auto cqe = e.cq_va + (ci % e.cq_depth) * e.cqe_size;
-    uint64_t result = KVAF_SEQ_TIMEOUT;
-    for (uint32_t poll = 0; poll < a.max_polls; ++poll) {
-      Flush(cqe, 32);
-      const auto word = *reinterpret_cast<__gm__ volatile uint32_t*>(cqe);
-      if (((word >> 2) & 1) == ((ci / e.cq_depth) & 1)) continue;
-      ++state->cq_consumer_index;
-      st_dev(static_cast<uint32_t>(ci + 1) & 0x003fffffU,
-             reinterpret_cast<__gm__ uint32_t*>(e.cq_db_va), 0);
-      result = (word & 0xffff0000U) ? KVAF_SEQ_CQ_ERROR : KVAF_SEQ_OK;
-      break;
-    }
-    if (result) {
-      state->last_error = result; state->poisoned = 1;
-      Flush(reinterpret_cast<uint64_t>(state), sizeof(*state));
-      return result;
-    }
+    if (phase == MailboxPhase::Head && defer_head_cqe && region == regions) return KVAF_SEQ_OK;
+    const auto result = WaitMailboxCqe(a, &context->entity, state);
+    if (result) return result;
   }
-  ++state->completed_batch_count;
-  Flush(reinterpret_cast<uint64_t>(state), sizeof(*state));
+  MarkMailboxPhaseComplete(state);
   return KVAF_SEQ_OK;
 }
 }  // namespace kvaf_scatter

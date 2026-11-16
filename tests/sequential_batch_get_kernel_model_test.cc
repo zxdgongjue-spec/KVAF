@@ -126,6 +126,7 @@ struct Fixture {
   struct HeadPart { uint32_t worker, chunk, queue; kvaf::cpu_push::Range range; bool suffix, ready; };
   std::vector<HeadPart> head_parts;
   bool head_started_early{};
+  bool check_head_cq_overlap{}, saw_head_cq{}, built_suffix_before_head_cq{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
   uint32_t lookahead_polls{};
@@ -226,6 +227,12 @@ struct Fixture {
         assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
     }
     const auto* src = reinterpret_cast<const uint64_t*>(mailbox_memory.data() + args.descriptor_offset);
+    if (check_head_cq_overlap && control_cq && head && !saw_head_cq) {
+      const auto row = uint32_t(request->reserved_words[0]);
+      const auto* local = reinterpret_cast<const uint64_t*>(workspace.data() + args.descriptor_offset);
+      saw_head_cq = true;
+      built_suffix_before_head_cq = local[row] == addresses[indices[row]] + offsets[row];
+    }
     if (head) {
       const auto cut = uint32_t(request->reserved_words[0]);
       if (head_parts.empty()) {
@@ -329,7 +336,7 @@ struct Fixture {
       if (p == &m.cq_db) { m.cq_db = value; return; }
       if (p != &m.db) continue;
       const bool scatter = args.mode == KVAF_SEQ_SCATTER;
-      if (scatter) assert(q == 0 && aiv_model::mte3.empty());
+      if (scatter) assert(q == 0 && aiv_model::mte3.empty() && m.cq_pi == m.cq_db);
       const uint32_t worker = q / 2;
       auto word = [&](uint64_t base, uint32_t index) {
         return m.sq[((base * 16) + index) % m.sq.size()];
@@ -495,6 +502,7 @@ struct Fixture {
     push_parts.clear(); head_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
     lookahead_polls = 0; copied_across_chunk = false;
     head_started_early = false;
+    saw_head_cq = built_suffix_before_head_cq = false;
     std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
     for (uint64_t i = 0; i < args.source_bytes; ++i) remote[i] ^= 0x35;
@@ -750,6 +758,23 @@ int main() {
     scatter.Run();
     assert(scatter.copied_across_chunk == (cursors != 0));
     assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == scatter.count);
+  }
+  for (uint32_t overlap : {0U, kvaf::kScatterOverlapHeadCq}) {
+    for (bool head_cq_error : {false, true}) {
+      Fixture scatter(kvaf::cpu_push::kChunkRows + 1, 656, 1, KVAF_SEQ_SCATTER, 6);
+      scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs |
+          kvaf::kScatterPipeline | kvaf::kScatterJettyCursors | overlap;
+      scatter.args.max_polls = 1000;
+      scatter.check_head_cq_overlap = true;
+      scatter.cq_error = head_cq_error;
+      scatter.Run(!head_cq_error);
+      assert(scatter.saw_head_cq && scatter.built_suffix_before_head_cq == (overlap != 0));
+      assert(scatter.mailbox.queue.poisoned == uint64_t(head_cq_error));
+      assert(scatter.mailbox.queue.cq_consumer_index == (head_cq_error ? 1U : 2U));
+      assert(scatter.mailbox.queue.completed_batch_count == (head_cq_error ? 0U : 2U));
+      const auto suffix = Address(scatter.mailbox_memory.data()) + kvaf::cpu_push::kSuffixNotifyOffset;
+      assert(aiv_model::AtomicLoadWord(suffix) == (head_cq_error ? 0 : scatter.args.sequence));
+    }
   }
   {
     // Isolate the real payload helper from URMA: all GM alignment residues,

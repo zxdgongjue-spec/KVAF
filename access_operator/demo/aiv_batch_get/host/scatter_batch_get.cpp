@@ -302,12 +302,17 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   const bool jetty_cursors = cursor_option && cursor_option[0] == '1';
   if (jetty_cursors && !pipeline)
     return Status::InvalidArgument("KVAF_SCATTER_JETTY_CURSORS=1 requires KVAF_SCATTER_PIPELINE=1");
+  const char* overlap_option = std::getenv("KVAF_SCATTER_OVERLAP_HEAD_CQ");
+  if (overlap_option && std::strcmp(overlap_option, "0") && std::strcmp(overlap_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_OVERLAP_HEAD_CQ must be 0 or 1");
+  const bool overlap_head_cq = overlap_option && overlap_option[0] == '1';
   const char* cpu_gather_option = std::getenv("KVAF_SCATTER_CPU_GATHER");
   if (cpu_gather_option && std::strcmp(cpu_gather_option, "0") && std::strcmp(cpu_gather_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
   const bool cpu_gather = cpu_gather_option && cpu_gather_option[0] == '1';
   s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
-      (jetty_cursors ? kScatterJettyCursors : 0U);
+      (jetty_cursors ? kScatterJettyCursors : 0U) |
+      (overlap_head_cq ? kScatterOverlapHeadCq : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;

@@ -13,6 +13,10 @@
 Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 后，CPU 省略
 分片 Ready，AIV 等到整批 done 成功再开始搬运。两种模式下，可信请求超过 1024 个有效行时，
 内核都会先发布首段清单，再合批发布剩余清单。
+N 端可用 `--overlap-head-cq 1`（`KVAF_SCATTER_OVERLAP_HEAD_CQ=1`）让 core 0 在首段
+WRITE 在途时构造剩余清单。首段 CQE 成功后才发布后缀。默认值 `0` 先等首段 CQE，
+再构造剩余清单。对照时固定 gather、Jetty cursor 和请求分布，比较 AIV 墙钟、
+CPU `WriteBatch`、`suffix_wait_ns` 及端到端延迟。
 Gather 使用 `pipeline_chunk_bytes=0`，以最终 ACK 为完成条件。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
@@ -219,6 +223,10 @@ K 端设置 `KVAF_CPU_GATHER_JETTY_SUPPLY=1` 会启用交错调度，后缀分�
 
 `max_jetty_post_gap_ns` 是同一 Jetty 相邻提交之间的最大间隔，包含在途数据仍可搬运的时间。
 对照 `post_calls`、`tail_cqes`、`post_window_ns`、`post_tail_ns`、`write_ns` 和端到端 P50/P90。
+Scatter profiled CSV 的 `sequence` 可与 CPU 日志对应。`aiv_tail_core` 是最后结束的核，
+`aiv_tail_to_last_enqueue_us`、`aiv_tail_to_local_done_us` 和 `aiv_tail_after_local_done_us`
+依次记录 core 0 观察 Done 后，最后结束的核在最后一次 scatter 入队、本核观察 Done、收尾
+之间的可见时间。若入队或本核 Done 在此之前完成，对应区间为零。收尾区间含 MTE 排空和状态准备。
 
 用 `--kernel-profile` 采集时，CPU 服务在会话关闭后输出 `CPU_PUSH_GATHER_PROFILE`。
 `prepare_ns` 记录 gather 任务准备，`copy_ns` 记录任务发布、各线程的源地址校验、拷贝和汇合，

@@ -557,6 +557,7 @@ class NpuPythonRuntime final {
       item["ready_wait_cycles"] = profile.ready_wait_cycles;
       item["scatter_start_cycle"] = profile.scatter_start_cycle;
       item["scatter_finish_cycle"] = profile.scatter_finish_cycle;
+      item["scatter_enqueue_finish_cycle"] = profile.scatter_enqueue_finish_cycle;
       item["scatter_chunks"] = profile.scatter_chunks;
       item["cross_chunk_shards"] = profile.cross_chunk_shards;
       if (!core && host_profile_enabled_ && host_profile_ready_) {

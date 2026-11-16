@@ -20,7 +20,9 @@ struct alignas(64) ScatterBatchGetCoreProfile {
   std::uint64_t scatter_cycles{}, ready_wait_cycles{};
   std::uint64_t scatter_start_cycle{}, scatter_finish_cycle{}, scatter_chunks{}, pipeline{};
   // Shards submitted while an earlier chunk still has unconsumed shards.
-  std::uint64_t cross_chunk_shards{}, reserved{};
+  std::uint64_t cross_chunk_shards{};
+  // Last payload enqueue/copy, before the final MTE drain in pipeline mode.
+  std::uint64_t scatter_enqueue_finish_cycle{};
 };
 static_assert(sizeof(ScatterBatchGetCoreProfile) == 192);
 }  // namespace kvaf

@@ -20,9 +20,11 @@ constexpr uint32_t kScatterProfiling = 4U;
 constexpr uint32_t kScatterTrustedInputs = 8U;
 constexpr uint32_t kScatterPipeline = 32U;
 constexpr uint32_t kScatterJettyCursors = 64U;
+constexpr uint32_t kScatterOverlapHeadCq = 128U;
 constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
 constexpr uint32_t kScatterOptionsMask =
-    kScatterProfiling | kScatterTrustedInputs | kScatterPipeline | kScatterJettyCursors;
+    kScatterProfiling | kScatterTrustedInputs | kScatterPipeline | kScatterJettyCursors |
+    kScatterOverlapHeadCq;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
       (value & ~kScatterOptionsMask) == kScatterOptionsV1;

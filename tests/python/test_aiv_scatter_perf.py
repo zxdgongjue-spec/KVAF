@@ -30,10 +30,12 @@ CSV_COLUMNS = (
     "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
     "host_stream_sync_us", "host_python_dispatch_us",
     "jetty_cursors", "aiv_cross_chunk_shards",
+    "overlap_head_cq",
+    "aiv_tail_core", "aiv_tail_to_last_enqueue_us", "aiv_tail_to_local_done_us", "aiv_tail_after_local_done_us",
 )
 
 
-def resolve_jetty_cursors(parser, args):
+def resolve_scatter_options(parser, args):
     if args.jetty_cursors is None:
         value = os.environ.get("KVAF_SCATTER_JETTY_CURSORS", "0")
         if value not in ("0", "1"):
@@ -41,6 +43,11 @@ def resolve_jetty_cursors(parser, args):
         args.jetty_cursors = int(value)
     if args.jetty_cursors and not args.pipeline:
         parser.error("--jetty-cursors 1 requires --pipeline 1")
+    if args.overlap_head_cq is None:
+        overlap = os.environ.get("KVAF_SCATTER_OVERLAP_HEAD_CQ", "0")
+        if overlap not in ("0", "1"):
+            parser.error("KVAF_SCATTER_OVERLAP_HEAD_CQ must be 0 or 1")
+        args.overlap_head_cq = int(overlap)
 
 
 def arguments(argv=None):
@@ -58,6 +65,8 @@ def arguments(argv=None):
                         help="overlap CPU WRITE and AIV scatter with chunk Ready (default: 1)")
     parser.add_argument("--jetty-cursors", type=int, choices=(0, 1),
                         help="consume ready shards independently per Jetty (default: 0)")
+    parser.add_argument("--overlap-head-cq", type=int, choices=(0, 1),
+                        help="build the suffix while the head control WRITE is in flight (default: 0)")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
@@ -86,7 +95,7 @@ def arguments(argv=None):
         if value not in ("0", "1"):
             parser.error("KVAF_SCATTER_PIPELINE must be 0 or 1")
         args.pipeline = int(value)
-    resolve_jetty_cursors(parser, args)
+    resolve_scatter_options(parser, args)
     for field, lo, hi in (("token_bytes", 1, 65535), ("cores", 1, 8),
                           ("blocks", 1, 65536), ("tokens_per_block", 1, 65536), ("plans", 1, 64)):
         if not lo <= getattr(args, field) <= hi:
@@ -190,6 +199,7 @@ def write_results(args, report):
             for phase, samples in report["samples"].items():
                 for sample in samples:
                     values = dict(phase=phase, cores=args.cores, jetty_cursors=args.jetty_cursors,
+                                  overlap_head_cq=args.overlap_head_cq,
                                   request_length=args.request_length,
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
                                   **sample_metrics(sample))
@@ -287,6 +297,7 @@ def main(argv=None):
         # baseline/profiled phases then use the same algorithms and binary.
         os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
         os.environ["KVAF_SCATTER_JETTY_CURSORS"] = str(args.jetty_cursors)
+        os.environ["KVAF_SCATTER_OVERLAP_HEAD_CQ"] = str(args.overlap_head_cq)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
@@ -366,7 +377,7 @@ def main(argv=None):
                 records = [dict(r) for r in runtime.scatter_profile()]
                 if args.host_profile and "host_profile" not in records[0]:
                     raise RuntimeError("rebuild Python binding, Runtime and Host for --host-profile")
-                return dict(workers=records, sequence=records[0]["sequence"],
+                return dict(workers=records,
                             **profile_metrics(records, args.cores, args.miss_count,
                                                               args.token_bytes, args.aiv_clock_mhz))
             samples, wall_ns = measure_pass(call, iterations, payload, snapshot if profiling else None,
@@ -379,6 +390,7 @@ def main(argv=None):
             for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns",
                         "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns",
                         "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_ready_wait_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns",
+                        "aiv_tail_to_last_enqueue_ns", "aiv_tail_to_local_done_ns", "aiv_tail_after_local_done_ns",
                         *HOST_TIMINGS, "host_python_dispatch_ns"):
                 if key in samples[0]:
                     values = [s[key] for s in samples]
