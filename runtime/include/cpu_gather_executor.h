@@ -57,7 +57,7 @@ struct alignas(64) CpuGatherThreadProfile {
 
 struct CpuGatherCopyProfile {
   std::uint64_t begin_ns{}, coordinator_done_ns{}, done_ns{};
-  std::uint64_t suffix_wait_ns{};
+  std::uint64_t suffix_wait_ns{}, suffix_seen_ns{};
 };
 
 class CpuGatherExecutor {
@@ -135,10 +135,12 @@ class CpuGatherExecutor {
   using ShardProgress = std::function<bool()>;
   void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {});
   bool ShardReady(std::size_t wave, std::size_t queue) const;
+  std::uint64_t FixedReadyNs(std::size_t wave, std::size_t queue, bool shard) const;
   bool UsesJettySupply() const { return fixed_jetty_supply_; }
-  void EnableProfiling(bool enabled) {
+  void EnableProfiling(bool enabled, bool trace_ready = false) {
     if (enabled) thread_profiles_.resize(max_threads_);
     profiling_enabled_ = enabled;
+    trace_ready_ = enabled && trace_ready;
   }
   const CpuGatherCopyProfile& CopyProfile() const { return copy_profile_; }
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
@@ -158,7 +160,10 @@ class CpuGatherExecutor {
     staging_ = static_cast<std::uint8_t*>(staging);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
-    for (auto& wave : fixed_progress_) wave.remaining = threads;
+    for (auto& wave : fixed_progress_) {
+      wave.remaining = threads;
+      wave.ready_ns = 0;
+    }
     PrepareShardProgress();
     if (profiling_enabled_) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
@@ -195,6 +200,8 @@ class CpuGatherExecutor {
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
   std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
   void PrepareShardProgress();
+  void FinishFixedRange(std::size_t& remaining, std::uint64_t& ready_ns);
+  void RecordSuffixSeen();
   template <typename OnProgress>
   std::uint64_t CopyFixedWave(std::size_t worker, std::size_t wave, OnProgress on_progress);
   template <typename OnWait>
@@ -235,10 +242,12 @@ class CpuGatherExecutor {
     std::size_t first_shard{};
     std::uint64_t aligned_bytes{};
     cpu_push::GatherWave rows{};
+    std::uint64_t ready_ns{};
   };
   std::vector<FixedWaveProgress> fixed_progress_;
   struct alignas(64) FixedShardProgress {
     std::size_t remaining{};
+    std::uint64_t ready_ns{};
   };
   std::size_t fixed_first_shard_wave_{SIZE_MAX};
   bool fixed_jetty_supply_{};
@@ -255,7 +264,7 @@ class CpuGatherExecutor {
   std::uint32_t pipeline_chunk_bytes_{0U};
   std::vector<std::uint32_t> chunk_done_;
   std::atomic<std::size_t> next_chunk_{0U};
-  bool profiling_enabled_{};
+  bool profiling_enabled_{}, trace_ready_{};
   std::vector<CpuGatherThreadProfile> thread_profiles_;
   CpuGatherCopyProfile copy_profile_{};
   std::atomic<bool> stopping_{false};

@@ -51,7 +51,8 @@ class IndexedAsyncWriteTracker {
     *submitted = true;
     return Status::OK();
   }
-  Status Complete(std::size_t queue, std::uint64_t context, std::uint64_t* completed) {
+  Status Complete(std::size_t queue, std::uint64_t context, std::uint64_t* completed,
+                  std::uint64_t* fence_batch = nullptr) {
     if (!completed || queue >= queues_ || queues_ > kMaxQueues)
       return Status::InvalidArgument("invalid indexed CQ queue");
     *completed = 0;
@@ -62,6 +63,7 @@ class IndexedAsyncWriteTracker {
         !(active_ & (UINT64_C(1) << slot)) || !(batch.mask & bit) ||
         (context & ~kQueueMask) != batch.handle->token)
       return Status::Internal("unexpected/stale indexed async completion context");
+    if (fence_batch) *fence_batch = batch.id;
     used_[queue] -= batch.wrs[queue]; batch.mask &= ~bit;
     --pending_[queue];
     if (!batch.mask) {

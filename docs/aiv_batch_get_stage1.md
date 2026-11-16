@@ -265,3 +265,38 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
 
 加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于
 请求和数据随样本变化的端到端性能回归。
+
+### Jetty 时间戳与预填 staging 对照
+
+在 K 端启动服务时设置 `KVAF_CPU_PUSH_JETTY_TRACE_SAMPLES=8`，采集每会话前 8 个带 profiling 的请求，
+包含 profile warmup。默认值为 0。会话关闭后，`CPU_PUSH_JETTY_TRACE` 按 `session / sequence / jetty / plan`
+输出每条 Jetty 的 WRITE 计划，按 `sequence` 关联同一会话的 `CPU_PUSH_GATHER_PROFILE` 和 N 端 CSV。
+
+- `gather_ready_ns` 记录最后一个 Gather 写入线程完成的时间。整波计划共用同一就绪时间。
+  `suffix_seen_ns` 在该请求的 Gather 日志里，记录 K 端首次采样到后缀标记的时间。无后缀时为 0。
+- `post_begin_ns` 和 `post_return_ns` 分别记录该 Jetty 的首个 post 开始和最后一个 post 返回。
+  `cqe_seen_ns` 是 K 端实际轮询到该计划末尾 CQE 的时间，包含等待轮询的时间。
+- `pending_fences_before_post` 统计该 Jetty 提交前尚未回收的此前计划，含已完成但尚未轮询的 CQE。
+  所有时间戳使用同一 K 端单调时钟。`trace_write_begin_ns` 可作请求内时间原点。
+
+K 端设置 `KVAF_CPU_PUSH_PREFILL_STAGING=1` 启用预填对照。每个会话的第一次请求正常 Gather，用 warmup
+填充 staging。后续请求复用相同的 staging、WRITE 计划与 Ready，在各段描述符可用后核对地址清单，
+清单变化会返回错误。测试期间要固定源数据和请求清单，尤其要避免原地更新源数据。K 端只核对地址。
+`staging_reused=1` 标记复用的样本。此时 `gather_ready_ns` 表示允许提交的最早时点，即 head 的
+`trace_write_begin_ns` 或 suffix 的 `suffix_seen_ns`。地址核对和实际提交仍在计时窗口内，
+`prefill_verify_ns` 单独记录地址核对的时间。
+
+分别以 `KVAF_CPU_PUSH_PREFILL_STAGING=0` 和 `1` 启动两次 K 端服务，其他配置相同。N 端两次使用同一命令，
+分别保存日志和 CSV。使用不设 `KVAF_SCATTER_JETTYS_PER_CORE` 的默认 4 条共享 Jetty。
+
+```bash
+python tests/python/test_aiv_scatter_perf.py --input-mode steady --plans 1 \
+  --workload sampled-tokens --blocks 1024 --tokens-per-block 128 \
+  --request-length 32768 --miss-count 8192 --token-bytes 656 --cores 8 \
+  --pipeline 1 --jetty-cursors 1 --overlap-head-cq 1 \
+  --warmup 3 --iterations 100 --profile-iterations 20 --csv results/scatter-jetty.csv
+```
+
+从 trace 比较 `suffix_seen → gather_ready`、`gather_ready → post_begin`、`post_return → cqe_seen`。
+用脚本的无 profiling 阶段对比端到端 P50/P90，从 profiled CSV 选取未记录 Jetty 时间戳的样本比较
+`cpu_comm_us` 与 `cpu_write_us`。

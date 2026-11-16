@@ -157,6 +157,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
     try {
       while (next_ready < whole_waves &&
              !__atomic_load_n(&fixed_progress_[next_ready].remaining, __ATOMIC_ACQUIRE) &&
+             (!trace_ready_ || FixedReadyNs(next_ready, 0U, false)) &&
              fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
         if (on_wave && !on_wave(next_ready + 1U)) {
           publishing = false;
@@ -276,11 +277,21 @@ std::uint64_t CpuGatherExecutor::CopyFixedRange(std::uint64_t begin, std::uint64
   return offset - begin;
 }
 
+void CpuGatherExecutor::RecordSuffixSeen() {
+  if (!trace_ready_ || __atomic_load_n(&copy_profile_.suffix_seen_ns, __ATOMIC_RELAXED)) return;
+  std::uint64_t expected = 0;
+  __atomic_compare_exchange_n(&copy_profile_.suffix_seen_ns, &expected, NowNs(), false,
+                              __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
 template <typename OnWait>
 bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
   const auto& suffix = fixed_suffix_;
   auto observed = __atomic_load_n(suffix.ready_sequence, __ATOMIC_ACQUIRE);
-  if (observed == suffix.sequence) return true;
+  if (observed == suffix.sequence) {
+    RecordSuffixSeen();
+    return true;
+  }
   const auto deadline = std::chrono::steady_clock::now() + suffix.timeout;
   std::uint32_t polls = 0;
   do {
@@ -296,8 +307,10 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
     observed = __atomic_load_n(suffix.ready_sequence, __ATOMIC_ACQUIRE);
   } while (observed != suffix.sequence);
   if (observed == suffix.sequence &&
-      fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone)
+      fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
+    RecordSuffixSeen();
     return true;
+  }
   SetFixedError(FixedError::kSuffix);
   return false;
 }
@@ -305,7 +318,10 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
 void CpuGatherExecutor::PrepareShardProgress() {
   const auto queues = fixed_jetty_count_;
   fixed_jetty_supply_ &= active_threads_ >= queues;
-  for (auto& shard : fixed_shards_) shard.remaining = 0;
+  for (auto& shard : fixed_shards_) {
+    shard.remaining = 0;
+    shard.ready_ns = 0;
+  }
   for (std::size_t index = fixed_first_shard_wave_; index < fixed_progress_.size(); ++index) {
     const auto& wave = fixed_progress_[index];
     auto* shards = fixed_shards_.data() + wave.first_shard;
@@ -352,7 +368,21 @@ bool CpuGatherExecutor::ShardReady(std::size_t wave, std::size_t queue) const {
   const auto rows = progress.rows[queue];
   return rows.begin < rows.end &&
          !__atomic_load_n(&fixed_shards_[progress.first_shard + queue].remaining, __ATOMIC_ACQUIRE) &&
+         (!trace_ready_ || FixedReadyNs(wave, queue, true)) &&
          fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone;
+}
+
+std::uint64_t CpuGatherExecutor::FixedReadyNs(std::size_t wave, std::size_t queue, bool shard) const {
+  const auto& progress = fixed_progress_[wave];
+  const auto& ns = shard ? fixed_shards_[progress.first_shard + queue].ready_ns : progress.ready_ns;
+  return __atomic_load_n(&ns, __ATOMIC_ACQUIRE);
+}
+
+void CpuGatherExecutor::FinishFixedRange(std::size_t& remaining, std::uint64_t& ready_ns) {
+  // The final decrement acquires the preceding writers' stores. A traced
+  // consumer also waits for that writer's timestamp before recording its post.
+  if (__atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL) == 1U && trace_ready_)
+    __atomic_store_n(&ready_ns, NowNs(), __ATOMIC_RELEASE);
 }
 
 template <typename OnProgress>
@@ -375,8 +405,8 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
     if (first == last) return 0;
     const auto copied = CopyFixedRange(base + first, base + last);
     if (copied) GatherBarrier();
-    auto& remaining = fixed_shards_[wave.first_shard + q].remaining;
-    __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
+    auto& shard = fixed_shards_[wave.first_shard + q];
+    FinishFixedRange(shard.remaining, shard.ready_ns);
     // The coordinator calls publish_ready after returning from this slice.
     return copied;
   }
@@ -400,9 +430,8 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
       copied += bytes_copied;
       if (shard_mode) {
         if (bytes_copied) GatherBarrier();
-        auto& remaining = fixed_shards_[wave.first_shard + queue].remaining;
-        // Acquire the previous writers' stores before making this shard ready.
-        __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
+        auto& shard = fixed_shards_[wave.first_shard + queue];
+        FinishFixedRange(shard.remaining, shard.ready_ns);
         on_progress();
         if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
       }
@@ -412,8 +441,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
   }
   if (!shard_mode) {
     if (copied) GatherBarrier();
-    // The last decrement carries every writer's completed stores to the owner.
-    __atomic_fetch_sub(&wave.remaining, 1U, __ATOMIC_ACQ_REL);
+    FinishFixedRange(wave.remaining, wave.ready_ns);
   }
   return copied;
 }

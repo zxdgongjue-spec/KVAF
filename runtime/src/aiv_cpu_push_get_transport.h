@@ -48,12 +48,13 @@ class Transport {
       previous = now;
     }
     std::uint64_t gather_prepare_ns{}, gather_copy_ns{}, suffix_wait_ns{};
+    std::uint64_t trace_write_begin_ns{}, suffix_seen_ns{}, gather_ready_ns{}, prefill_verify_ns{};
     std::uint64_t gather_join_wait_ns{}, slowest_elapsed_ns{}, slowest_start_delay_ns{};
     std::uint64_t slowest_ready_delay_ns{};
     peer::CpuGatherThreadProfile slowest_thread{};
     std::uint32_t slowest_worker{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
-    bool plan_reused{}, jetty_supply{};
+    bool plan_reused{}, jetty_supply{}, staging_reused{};
   } profile_;
   struct GatherProfileSample {
     std::uint64_t sequence;
@@ -63,6 +64,14 @@ class Transport {
   };
   std::vector<GatherProfileSample> gather_profile_samples_;
   std::size_t gather_profile_dropped_{};
+  struct JettyTrace {
+    std::uint64_t sequence, plan, ready_ns, post_begin_ns, post_return_ns{}, cqe_seen_ns{};
+    std::size_t wave, pending_fences, wrs, ready_wrs;
+    std::uint32_t jetty;
+    bool suffix, staging_reused;
+  };
+  std::vector<JettyTrace> jetty_trace_;
+  std::size_t jetty_trace_budget_{}, jetty_trace_dropped_{};
   struct Queue {
     cpu_runtime_detail::UrmaChannel channel;
     bool poisoned{};
@@ -83,6 +92,7 @@ class Transport {
     std::vector<Post> posts;
     // Whole-batch, unsplit tokens have one SGE per contiguous descriptor row.
     std::uint32_t first_row{UINT32_MAX};
+    std::size_t trace_index{SIZE_MAX};
   };
   struct PreparedWrite {
     std::array<PreparedQueue, kMaxJettyCount> queues;
@@ -98,6 +108,7 @@ class Transport {
                     const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr,
                     const peer::CpuGatherExecutor::ShardProgress& on_shards = {});
   void FlushGatherProfiles();
+  void TraceJettyPost(PreparedWrite&, std::uint64_t id, std::uint32_t queue, std::uint64_t now);
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
@@ -106,7 +117,8 @@ class Transport {
   Status TryBeginPrepared(PreparedWrite&, std::uint64_t id, bool* submitted);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
                        bool drain_for_credits = false);
-  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
+  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr,
+                      std::uint64_t plan_id = 0);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr, bool wait = true);
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);
@@ -135,6 +147,9 @@ class Transport {
   urma_token_id_t* gather_token_{};
   std::uint8_t* gather_staging_{};
   std::uint64_t gather_staging_bytes_{}, source_bytes_{};
+  std::vector<std::uint64_t> prefill_addresses_;
+  std::uint32_t prefill_rows_{};
+  bool prefill_staging_{};
   std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, max_gather_write_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t token_value_{};
