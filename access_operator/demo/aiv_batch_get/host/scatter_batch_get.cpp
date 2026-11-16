@@ -72,7 +72,8 @@ struct ScatterBatchGet::Impl {
   void* memory_handle{};
   void* mailbox_import{};
   uint64_t mailbox_context{};
-  std::array<std::unique_ptr<d::TargetChannel>, 4> channels;
+  std::array<std::unique_ptr<d::TargetChannel>, cpu_push::kMaxJettyCount> channels;
+  uint32_t payload_jettys{cpu_push::kJettyCount}, payload_jettys_per_core{};
   aclrtStream pending{};
   uint64_t sequence{};
   bool push_open{}, initialized{}, failed{}, profile_ready{};
@@ -121,11 +122,11 @@ struct ScatterBatchGet::Impl {
 
   Status InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
     cpu_push::Layout layout;
-    if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout))
+    if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout, payload_jettys))
       return Status::InvalidArgument("invalid scatter workspace shape");
     args.descriptor_offset = layout.descriptor; args.staging_offset = layout.staging;
-    // Queue context precedes the private build-ready/failure lines. Shared
-    // request/descriptor/staging offsets and the launch ABI remain unchanged.
+    // Queue context follows the shared layout and precedes the private
+    // build-ready/failure lines.
     args.workspace_bytes = layout.bytes + sizeof(KvafScatterMailboxContext) +
                            uint64_t(config.npu_core_count + 1) * 64;
     // Prefer huge pages for the persistent CPU WRITE target and scatter staging;
@@ -149,7 +150,9 @@ struct ScatterBatchGet::Impl {
     if (api.lmem_register(context, &mr, &memory_handle) || !memory_handle ||
         mr.out.key.size < kSegmentBytes || mr.out.key.size > peer::kSegKeyBytes)
       return Error("register scatter HBM segment");
-    peer::OpenCpuPushGetRequest open{};
+    peer::OpenAivCpuPushJettyRequest request{};
+    request.payload_jettys = payload_jettys;
+    auto& open = request.base;
     open.source_bytes = region.length; open.hbm_bytes = args.workspace_bytes;
     std::memcpy(&open.hbm_base, mr.out.key.value + 20, sizeof(open.hbm_base));
     uint64_t exported_bytes = 0;
@@ -165,19 +168,21 @@ struct ScatterBatchGet::Impl {
     if (!d::GetPeerTp(api, context, config.peer_local_eid, peer.eid, "aiv_scatter", &npu_tp))
       return Error("query scatter TP");
     open.npu_tp = npu_tp;
-    for (uint32_t q = 0; q < 4; ++q) {
+    for (uint32_t q = 0; q < payload_jettys; ++q) {
       channels[q] = std::make_unique<d::TargetChannel>(api, context);
       // Queue 0 is bidirectional: CPU payload target and AIV mailbox initiator.
       auto result = q == 0 ? channels[q]->InitializeAiv(token, peer.token_value, 1024, 16384)
                            : channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384);
       if (!result.ok()) return result;
       const auto& key = channels[q]->jetty_info().key;
-      open.channels[q].bytes = key.size;
-      std::memcpy(open.channels[q].key, key.value, key.size);
+      auto& channel = request.Channel(q);
+      channel.bytes = key.size;
+      std::memcpy(channel.key, key.value, key.size);
     }
-    peer::OpenAivCpuPushGetResponse response{};
+    peer::OpenAivCpuPushJettyResponse reply{};
+    const auto& response = reply.base;
     push_open = true;  // A lost response can still leave a live remote session.
-    auto result = config.peer_link->OpenAivCpuPushGet(region.base, open, &response, cpu_gather);
+    auto result = config.peer_link->OpenAivCpuPushGet(region.base, request, &reply, cpu_gather);
     if (!result.ok()) return result;
     if (response.mailbox_segment_bytes != kSegmentBytes || !response.mailbox_base ||
         response.mailbox_bytes < layout.staging || !(response.mailbox_token_id >> 8) ||
@@ -200,9 +205,10 @@ struct ScatterBatchGet::Impl {
     e.remote_token_value = peer.token_value;
     e.local_hbm_address = Ptr(workspace); e.local_hbm_size = args.workspace_bytes;
     e.local_token_id = id.token_id; e.local_token_value = peer.token_value;
-    for (uint32_t q = 0; q < 4; ++q) {
+    for (uint32_t q = 0; q < payload_jettys; ++q) {
       d::QpImportInfoT info{};
-      if (!d::ImportPeerJetty(api, context, response.channels[q].key, response.channels[q].bytes,
+      const auto& channel = reply.Channel(q);
+      if (!d::ImportPeerJetty(api, context, channel.key, channel.bytes,
           peer.token_value, open.npu_tp, response.cpu_tp, open.npu_psn, response.cpu_psn,
           "aiv_scatter", &info, channels[q]->peer_jetty_output())) return Error("import CPU Jetty");
       if (!q) e.tp_id = info.out.ub.tpn;
@@ -310,9 +316,22 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (cpu_gather_option && std::strcmp(cpu_gather_option, "0") && std::strcmp(cpu_gather_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
   const bool cpu_gather = cpu_gather_option && cpu_gather_option[0] == '1';
+  s.payload_jettys = cpu_push::kJettyCount;
+  s.payload_jettys_per_core = 0;
+  if (const auto* value = std::getenv("KVAF_SCATTER_JETTYS_PER_CORE")) {
+    char* end = nullptr;
+    const auto per_core = std::strtoul(value, &end, 10);
+    if (value[0] < '1' || value[0] > '9' || *end || !per_core || per_core > cpu_push::kMaxJettyCount)
+      return Status::InvalidArgument("KVAF_SCATTER_JETTYS_PER_CORE must be in 1..32");
+    if (s.config.npu_core_count * per_core > cpu_push::kMaxJettyCount)
+      return Status::InvalidArgument("Scatter AIV core count times Jettys per core must be at most 32");
+    s.payload_jettys_per_core = per_core;
+    s.payload_jettys = s.config.npu_core_count * per_core;
+  }
   s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
       (jetty_cursors ? kScatterJettyCursors : 0U) |
-      (overlap_head_cq ? kScatterOverlapHeadCq : 0U);
+      (overlap_head_cq ? kScatterOverlapHeadCq : 0U) |
+      (s.payload_jettys != cpu_push::kJettyCount ? kScatterConfiguredJettys : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
@@ -337,8 +356,8 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u\n",
-               unsigned(pipeline), unsigned(cpu_gather));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u\n",
+               unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys);
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {
@@ -376,6 +395,7 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   else result = Input(exec, s.config, &args.request);
   input_timer.Stop();
   if (!result.ok()) return result;
+  if (s.payload_jettys_per_core) args.request.jettys_per_core = s.payload_jettys_per_core;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
   args.request.core_status = Ptr(s.status_device);
   args.request.channel_entity = s.mailbox_context;

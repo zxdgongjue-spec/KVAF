@@ -479,18 +479,21 @@ Status PeerLink::StopCpuPushGet(uint64_t base) const {
   if (found == regions_.end()) return Status::OK();
   return PushSessionCommand(address_, found->second.session_id, Command::kStopCpuPushGet);
 }
-Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
-                                   OpenAivCpuPushGetResponse* response, bool cpu_gather) const {
+Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenAivCpuPushJettyRequest request,
+                                  OpenAivCpuPushJettyResponse* response, bool cpu_gather) const {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
   const auto command = cpu_gather ? Command::kOpenAivCpuGatherPushGet : Command::kOpenCpuPushGet;
-  constexpr auto version = kAivCpuPushProtocolVersion;
-  request.header = MakeHeader(command, sizeof(request), version);
-  request.session_id = found->second.session_id;
+  const bool extended = request.payload_jettys != cpu_push::kJettyCount;
+  const auto version = extended ? kAivCpuPushJettyProtocolVersion : kAivCpuPushProtocolVersion;
+  request.base.header = MakeHeader(command, extended ? sizeof(request) : sizeof(request.base), version);
+  request.base.session_id = found->second.session_id;
   std::string error;
-  if (!Exchange(address_, request, response, &error) ||
-      !IsValidResponseHeader(response->header, command, sizeof(*response), version) ||
-      !ResultOk(static_cast<Result>(response->result), &error))
+  const bool exchanged = extended ? Exchange(address_, request, response, &error)
+                                  : Exchange(address_, request.base, &response->base, &error);
+  if (!exchanged || !IsValidResponseHeader(response->base.header, command,
+          extended ? sizeof(*response) : sizeof(response->base), version) ||
+      !ResultOk(static_cast<Result>(response->base.result), &error))
     return ToStatus(cpu_gather ? "AIV CPU gather push setup failed" : "AIV CPU push setup failed",
                     std::move(error));
   return Status::OK();

@@ -94,7 +94,8 @@ int Launch(const KvafScatterBatchGetArgs* a) {
 extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_SCATTER);
   kvaf::cpu_push::Layout layout;
-  assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout));
+  assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout,
+                                   kvaf::ScatterPayloadJettys(*a)));
   assert(a->descriptor_offset == layout.descriptor && a->staging_offset == layout.staging);
   assert(a->workspace_bytes == layout.bytes + sizeof(KvafScatterMailboxContext) +
          uint64_t(a->request.block_count + 1) * 64);
@@ -141,9 +142,12 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
-Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenCpuPushGetRequest,
-                                   OpenAivCpuPushGetResponse* r, bool cpu_gather) const {
+Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenAivCpuPushJettyRequest request,
+                                  OpenAivCpuPushJettyResponse* reply, bool cpu_gather) const {
   opened_cpu_gather = cpu_gather;
+  for (uint32_t q = 0; q < request.payload_jettys; ++q)
+    assert(request.Channel(q).bytes == 32);
+  auto* r = &reply->base;
   r->mailbox_base = 0x1000000; r->mailbox_bytes = 0x100000;
   r->mailbox_segment_bytes = 48; r->mailbox_token_id = 0x800; r->max_write_bytes = 65536;
   return Status::OK();
@@ -221,6 +225,7 @@ int main() {
   unsetenv("KVAF_SCATTER_PIPELINE");
   unsetenv("KVAF_SCATTER_JETTY_CURSORS");
   unsetenv("KVAF_SCATTER_CPU_GATHER");
+  unsetenv("KVAF_SCATTER_JETTYS_PER_CORE");
   AccessOperatorConfig config;
   config.aiv_batch_get_mode = "gather_read"; config.batch_get_token_bytes = 16;
   config.npu_core_count = 3; config.peer_link = std::make_shared<peer::PeerLink>("test");
@@ -296,6 +301,20 @@ int main() {
   assert(stopped == 6 && quiesced == 6);
   config.aiv_batch_get_mode = "cpu_push_scatter";
   config.aiv_gather_sgl_size = 0; // A gather-only option must not affect scatter.
+  {
+    auto configured = config;
+    configured.npu_core_count = 4;
+    auto owner = CreateSequentialBatchGet(configured);
+    setenv("KVAF_SCATTER_JETTYS_PER_CORE", "9", 1);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
+    setenv("KVAF_SCATTER_JETTYS_PER_CORE", "8", 1);
+    assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_SCATTER_JETTYS_PER_CORE");
+    assert(owner->Execute(exec).ok());
+    assert(launch_options.back() & kScatterConfiguredJettys);
+    assert(owner->Shutdown().ok());
+    assert(!allocations && !hccp_refs);
+  }
   {
     auto owner = CreateSequentialBatchGet(config);
     fail_mailbox_import = true;

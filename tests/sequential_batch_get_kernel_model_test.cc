@@ -129,15 +129,17 @@ struct Fixture {
   bool check_head_cq_overlap{}, saw_head_cq{}, built_suffix_before_head_cq{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
+  uint32_t payload_jettys{kvaf::cpu_push::kJettyCount};
   uint32_t lookahead_polls{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   std::mutex poll_mutex;
 
-  Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
+  Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl,
+          uint32_t jettys = kvaf::cpu_push::kJettyCount)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
         indices(n), offsets(n), rows(n), status(cores), states(cores * 2),
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
-        ack_reads(cores), cpu_done(cores) {
+        ack_reads(cores), cpu_done(cores), payload_jettys(jettys) {
     fixture = this;
     aiv_model::payload_observer = [](const void* p, uint64_t bytes) { fixture->PayloadRead(p, bytes); };
     payload_read.resize(n);
@@ -172,7 +174,8 @@ struct Fixture {
     args.remote_staging = Address(remote.data()) + staging_offset;
     args.remote_descriptor = Address(remote.data()) + descriptor_offset;
     args.remote_control = Address(remote.data()) + control_offset;
-    args.descriptor_offset = mode == KVAF_SEQ_SCATTER ? 192 + cores * 64 : cores * 64;
+    args.descriptor_offset = mode == KVAF_SEQ_SCATTER
+        ? 192 + cores * kvaf::cpu_push::ReadyStride(jettys) : cores * 64;
     args.staging_offset = Align(args.descriptor_offset + n * 8ULL);
     args.workspace_bytes = mode == KVAF_SEQ_SCATTER ?
         Align(args.staging_offset + n * uint64_t(bytes)) + sizeof(mailbox) + uint64_t(cores + 1) * 64 :
@@ -202,6 +205,9 @@ struct Fixture {
       r.channel_entity = Address(&mailbox);
       r.queue_state = Address(&mailbox.queue);
     }
+  }
+  uint64_t ReadyWord(uint32_t worker, uint32_t queue) const {
+    return args.workspace + 192 + worker * kvaf::cpu_push::ReadyStride(payload_jettys) + queue * 8;
   }
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
   void Poll(void* p) {
@@ -239,8 +245,8 @@ struct Fixture {
         for (uint32_t phase = 0; phase < 2; ++phase)
           kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
             [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
-              for (uint32_t q = 0; q < 4; ++q) {
-                const auto shard = kvaf::cpu_push::JettyRange(range, q);
+              for (uint32_t q = 0; q < payload_jettys; ++q) {
+                const auto shard = kvaf::cpu_push::JettyRange(range, q, payload_jettys);
                 const auto first = std::max(shard.begin, phase ? cut : 0U);
                 const auto last = std::min(shard.end, phase ? uint32_t(active) : cut);
                 if (first < last) head_parts.push_back({worker, chunk, q, {first, last},
@@ -259,7 +265,7 @@ struct Fixture {
           std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
                       reinterpret_cast<void*>(src[row]), token);
         if (pipeline && part.ready) aiv_model::AtomicStoreWord(
-            args.workspace + 192 + part.worker * 64 + part.queue * 8,
+            ReadyWord(part.worker, part.queue),
             kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
         ++push_step;
         return;
@@ -271,8 +277,8 @@ struct Fixture {
           [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
             push_parts.push_back({worker, chunk, range});
           });
-      if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
-        constexpr auto jetty_count = kvaf::cpu_push::kJettyCount;
+      if (push_step < push_parts.size() * payload_jettys) {
+        const auto jetty_count = payload_jettys;
         auto step = push_step;
         if (jetty_lookahead && step == jetty_count - 1) {
           // Jetty 0 delivers chunk 1 before Jetty 3 delivers chunk 0.
@@ -284,12 +290,12 @@ struct Fixture {
         }
         const auto& part = push_parts[step / jetty_count];
         const auto q = step % jetty_count;
-        const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
+        const auto shard = kvaf::cpu_push::JettyRange(part.range, q, jetty_count);
         for (auto row = shard.begin; row < shard.end; ++row)
           std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
                       reinterpret_cast<void*>(src[row]), token);
         if (shard.begin < shard.end)
-          aiv_model::AtomicStoreWord(args.workspace + 192 + part.worker * 64 + q * 8,
+          aiv_model::AtomicStoreWord(ReadyWord(part.worker, q),
                                      kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
         ++push_step;
         return; // Delay other queues/chunks and final done until later polls.
@@ -317,10 +323,10 @@ struct Fixture {
         if (i < range.begin || i >= range.end) continue;
         const auto chunk = (i - range.begin) / kvaf::cpu_push::kChunkRows + 1;
         const auto part = kvaf::cpu_push::ChunkRange(range, chunk - 1);
-        for (uint32_t q = 0; q < kvaf::cpu_push::kJettyCount; ++q) {
-          const auto progress = aiv_model::AtomicLoadWord(args.workspace + 192 + worker * 64 + q * 8);
+        for (uint32_t q = 0; q < payload_jettys; ++q) {
+          const auto progress = aiv_model::AtomicLoadWord(ReadyWord(worker, q));
           const bool ready = progress >> 32 == args.sequence && uint32_t(progress) >= chunk;
-          const auto shard = kvaf::cpu_push::JettyRange(part, q);
+          const auto shard = kvaf::cpu_push::JettyRange(part, q, payload_jettys);
           if (i >= shard.begin && i < shard.end) assert(ready);
         }
       }
@@ -758,6 +764,22 @@ int main() {
     scatter.Run();
     assert(scatter.copied_across_chunk == (cursors != 0));
     assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == scatter.count);
+  }
+  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline,
+                            kvaf::kScatterPipeline | kvaf::kScatterJettyCursors}) {
+    Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6, 32);
+    scatter.args.request.jettys_per_core = 8;
+    scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs |
+        kvaf::kScatterConfiguredJettys | pipeline;
+    assert(kvaf::ScatterPayloadJettys(scatter.args) == scatter.payload_jettys);
+    scatter.args.max_polls = 1000000;
+    scatter.hold_done_until_scatter = pipeline != 0;
+    for (uint32_t count : {7U, 8193U, 8193U}) {
+      scatter.Next(count);
+      scatter.Run();
+      assert(scatter.push_done);
+      if (pipeline) assert(scatter.copied_before_done && scatter.read_rows == count);
+    }
   }
   for (uint32_t overlap : {0U, kvaf::kScatterOverlapHeadCq}) {
     for (bool head_cq_error : {false, true}) {

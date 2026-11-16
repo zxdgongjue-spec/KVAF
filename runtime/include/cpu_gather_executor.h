@@ -106,7 +106,8 @@ class CpuGatherExecutor {
                            const std::vector<cpu_push::GatherWave>& waves = {},
                            const FixedSuffix* suffix = nullptr,
                            std::size_t first_shard_wave = SIZE_MAX,
-                           bool jetty_supply = false);
+                           bool jetty_supply = false,
+                           std::uint32_t jettys = cpu_push::kJettyCount);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -240,7 +241,8 @@ class CpuGatherExecutor {
   };
   std::size_t fixed_first_shard_wave_{SIZE_MAX};
   bool fixed_jetty_supply_{};
-  std::vector<std::array<FixedShardProgress, cpu_push::kJettyCount>> fixed_shards_;
+  std::uint32_t fixed_jetty_count_{cpu_push::kJettyCount};
+  std::vector<std::array<FixedShardProgress, cpu_push::kMaxJettyCount>> fixed_shards_;
   enum class FixedError { kNone, kSource, kSuffix, kCancelled };
   std::atomic<FixedError> fixed_error_{FixedError::kNone};
   void SetFixedError(FixedError error) {

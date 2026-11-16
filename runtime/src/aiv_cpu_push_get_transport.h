@@ -15,7 +15,7 @@
 #include "status.h"
 
 namespace kvaf::cpu_push::aiv {
-// One service thread owns and submits the four prepared Jetty chains.
+// One service thread owns and submits the prepared Jetty chains.
 class Transport {
  public:
   ~Transport();
@@ -23,8 +23,8 @@ class Transport {
                          std::size_t min_bytes, bool affinity, peer::GatherWaitMode mode);
   void BindWorker() const { if (gather_) gather_->BindWorker(0); }
   Status Initialize(urma_context_t*, urma_target_seg_t* source,
-                    const peer::OpenCpuPushGetRequest&, urma::GetTpList,
-                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushGetResponse*);
+                    const peer::OpenAivCpuPushJettyRequest&, urma::GetTpList,
+                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushJettyResponse*);
   Status ReadRequest(std::uint64_t* sequence);
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch(const std::atomic<bool>* stop = nullptr);
@@ -40,7 +40,7 @@ class Transport {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
     std::uint64_t first_post_ns{}, last_post_return_ns{}, last_cqe_ns{};
-    std::array<std::uint64_t, kJettyCount> jetty_last_post_ns{};
+    std::array<std::uint64_t, kMaxJettyCount> jetty_last_post_ns{};
     std::uint64_t max_jetty_post_gap_ns{};
     void RecordJettyPost(std::uint32_t queue, std::uint64_t now) {
       auto& previous = jetty_last_post_ns[queue];
@@ -85,8 +85,8 @@ class Transport {
     std::uint32_t first_row{UINT32_MAX};
   };
   struct PreparedWrite {
-    std::array<PreparedQueue, kJettyCount> queues;
-    std::array<Tracker::Fence, kJettyCount> fences;
+    std::array<PreparedQueue, kMaxJettyCount> queues;
+    std::array<Tracker::Fence, kMaxJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
     std::size_t ready_waves{};
@@ -111,14 +111,15 @@ class Transport {
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
-  std::array<Queue, kJettyCount> queues_;
+  std::array<Queue, kMaxJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
-  std::array<std::vector<std::size_t>, kJettyCount> prepared_shards_;
+  std::array<std::vector<std::size_t>, kMaxJettyCount> prepared_shards_;
   std::vector<GatherWave> gather_waves_;
   std::size_t gather_suffix_wave_{};
   PreparedWrite done_;
   PreparedWrite profiled_done_;
   Tracker tracker_{kJettyCount, 8192};
+  std::uint32_t jetty_count_{kJettyCount};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
   bool gather_interleave_{}, prepared_interleaved_{}, gather_jetty_supply_{};

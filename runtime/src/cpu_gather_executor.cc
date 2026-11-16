@@ -86,8 +86,9 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
 std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* addresses,
     std::uint32_t count, std::uint32_t span_bytes, std::uint64_t source_bytes,
     const std::vector<cpu_push::GatherWave>& waves, const FixedSuffix* suffix,
-    std::size_t first_shard_wave, bool jetty_supply) {
-  if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes)
+    std::size_t first_shard_wave, bool jetty_supply, std::uint32_t jettys) {
+  if (!count || !span_bytes || span_bytes > source_bytes || base_ > UINT64_MAX - source_bytes ||
+      !jettys || jettys > cpu_push::kMaxJettyCount)
     return 0U;
   if ((!waves.empty() && reinterpret_cast<std::uintptr_t>(staging) % 64U) ||
       (suffix && (!suffix->ready_sequence || suffix->first_wave >= waves.size())) ||
@@ -99,7 +100,8 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
     auto& wave = fixed_progress_[i];
     wave.aligned_bytes = 0U;
     wave.rows = waves[i];
-    for (const auto rows : wave.rows) {
+    for (std::uint32_t q = 0; q < jettys; ++q) {
+      const auto rows = wave.rows[q];
       if (rows.begin == rows.end) continue;
       if (rows.begin > rows.end || rows.end > count ||
           std::uint64_t{rows.begin} * span_bytes % 64U ||
@@ -115,6 +117,7 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   if (!waves.empty() && planned_rows != count) return 0U;
   fixed_first_shard_wave_ = first_shard_wave;
   fixed_jetty_supply_ = jetty_supply && first_shard_wave != SIZE_MAX;
+  fixed_jetty_count_ = jettys;
   fixed_shards_.resize(first_shard_wave == SIZE_MAX ? 0U : waves.size() - first_shard_wave);
   fixed_last_source_offset_ = source_bytes - span_bytes;
   fixed_suffix_ = suffix ? *suffix : FixedSuffix{};
@@ -298,7 +301,7 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
 }
 
 void CpuGatherExecutor::PrepareShardProgress() {
-  constexpr auto queues = cpu_push::kJettyCount;
+  const auto queues = fixed_jetty_count_;
   fixed_jetty_supply_ &= active_threads_ >= queues;
   for (std::size_t index = 0; index < fixed_shards_.size(); ++index) {
     const auto& wave = fixed_progress_[fixed_first_shard_wave_ + index];
@@ -318,9 +321,9 @@ void CpuGatherExecutor::PrepareShardProgress() {
       }
       continue;
     }
-    std::array<std::uint64_t, cpu_push::kJettyCount> starts{}, ends{};
+    std::array<std::uint64_t, cpu_push::kMaxJettyCount> starts{}, ends{};
     std::uint64_t offset = 0U;
-    for (std::size_t queue = 0; queue < shards.size(); ++queue) {
+    for (std::size_t queue = 0; queue < queues; ++queue) {
       const auto rows = wave.rows[queue];
       const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;
       starts[queue] = offset;
@@ -330,7 +333,7 @@ void CpuGatherExecutor::PrepareShardProgress() {
     std::uint64_t first = 0U;
     for (std::size_t worker = 1; worker <= active_threads_; ++worker) {
       const auto last = Boundary(worker, 0U, wave.aligned_bytes, active_threads_);
-      for (std::size_t queue = 0; queue < shards.size(); ++queue) {
+      for (std::size_t queue = 0; queue < queues; ++queue) {
         if (std::max(first, starts[queue]) < std::min(last, ends[queue]))
           ++shards[queue].remaining;
       }
@@ -341,7 +344,7 @@ void CpuGatherExecutor::PrepareShardProgress() {
 
 bool CpuGatherExecutor::ShardReady(std::size_t wave, std::size_t queue) const {
   if (wave < fixed_first_shard_wave_ || wave >= fixed_progress_.size() ||
-      queue >= cpu_push::kJettyCount)
+      queue >= fixed_jetty_count_)
     return false;
   const auto rows = fixed_progress_[wave].rows[queue];
   return rows.begin < rows.end &&
@@ -358,7 +361,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
   if (shard_mode && fixed_jetty_supply_) {
     // Each group advances through its Jetty's shards independently, even
     // when another group is still copying the preceding wave.
-    constexpr auto queues = cpu_push::kJettyCount;
+    const auto queues = fixed_jetty_count_;
     const auto q = worker % queues;
     const auto rank = worker / queues;
     const auto threads = active_threads_ / queues + (q < active_threads_ % queues);
@@ -382,7 +385,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
   // Divide the combined wave evenly, then translate each worker's slice
   // back to the original staging addresses. Pad a short final range in
   // this calculation only, so the next range still starts on a cache line.
-  for (std::size_t queue = 0; queue < wave.rows.size(); ++queue) {
+  for (std::size_t queue = 0; queue < fixed_jetty_count_; ++queue) {
     const auto rows = wave.rows[queue];
     if (rows.begin == rows.end) continue;
     const auto bytes = std::uint64_t{rows.end - rows.begin} * span_bytes_;

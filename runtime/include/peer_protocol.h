@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "cpu_push_get_abi.h"
+
 // This protocol carries control-plane records between two Runtime peers. The
 // first deployment is CPU DDR served to an Ascend NPU, but the records carry
 // no role-specific wire semantics: data continues over UB.
@@ -14,6 +16,7 @@ constexpr uint32_t kProtocolMagic = 0x4b564350U;  // "KVCP"
 // can group EIDs by K-side UB device and benchmark each device only once.
 constexpr uint16_t kProtocolVersion = 6U;
 constexpr uint16_t kAivCpuPushProtocolVersion = 8U;
+constexpr uint16_t kAivCpuPushJettyProtocolVersion = 9U;
 constexpr uint32_t kQpKeyBytes = 64U;
 constexpr uint32_t kSegKeyBytes = 64U;
 constexpr uint32_t kEidBytes = 16U;
@@ -45,7 +48,9 @@ inline constexpr bool IsAivCpuPushCommand(Command command) {
 
 inline constexpr bool IsSupportedProtocolVersion(Command command, uint16_t version) {
   return (version == kProtocolVersion && command != Command::kOpenAivCpuGatherPushGet) ||
-         (version == kAivCpuPushProtocolVersion && IsAivCpuPushCommand(command));
+         (version == kAivCpuPushProtocolVersion && IsAivCpuPushCommand(command)) ||
+         (version == kAivCpuPushJettyProtocolVersion &&
+          (command == Command::kOpenCpuPushGet || command == Command::kOpenAivCpuGatherPushGet));
 }
 
 enum class Result : int32_t {
@@ -202,6 +207,26 @@ struct OpenAivCpuPushGetResponse {
   uint32_t mailbox_token_id, mailbox_segment_bytes, max_write_bytes;
   uint8_t mailbox_segment[kSegKeyBytes];
 };
+// The extended open records retain their legacy wire prefixes. START and
+// STOP use the same AIV command version for every queue count.
+struct OpenAivCpuPushJettyRequest {
+  OpenCpuPushGetRequest base;
+  uint32_t payload_jettys;
+  CpuPushChannelKey extra_channels[cpu_push::kMaxJettyCount - cpu_push::kJettyCount];
+  const CpuPushChannelKey& Channel(uint32_t q) const {
+    return q < cpu_push::kJettyCount ? base.channels[q] : extra_channels[q - cpu_push::kJettyCount];
+  }
+  CpuPushChannelKey& Channel(uint32_t q) {
+    return q < cpu_push::kJettyCount ? base.channels[q] : extra_channels[q - cpu_push::kJettyCount];
+  }
+};
+struct OpenAivCpuPushJettyResponse {
+  OpenAivCpuPushGetResponse base;
+  CpuPushChannelKey extra_channels[cpu_push::kMaxJettyCount - cpu_push::kJettyCount];
+  CpuPushChannelKey& Channel(uint32_t q) {
+    return q < cpu_push::kJettyCount ? base.channels[q] : extra_channels[q - cpu_push::kJettyCount];
+  }
+};
 struct CpuPushGetSessionRequest {
   MessageHeader header;
   uint64_t session_id;
@@ -223,6 +248,8 @@ static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI
 static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
 static_assert(sizeof(OpenAivCpuPushGetResponse) == 392U, "AIV CPU push setup response ABI changed");
+static_assert(sizeof(OpenAivCpuPushJettyRequest) == 2332U && sizeof(OpenAivCpuPushJettyResponse) == 2296U,
+              "AIV CPU push Jetty setup ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {

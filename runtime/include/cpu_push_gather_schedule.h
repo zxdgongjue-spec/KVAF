@@ -9,10 +9,11 @@
 namespace kvaf::cpu_push {
 // A wave can gather disjoint ranges. In an interleaved wave each range belongs
 // to the Jetty at the same index.
-using GatherWave = std::array<Range, kJettyCount>;
+using GatherWave = std::array<Range, kMaxJettyCount>;
 
 inline std::vector<GatherWave> InterleavedGatherWaves(std::uint32_t count,
-    std::uint32_t bytes, std::uint32_t workers, std::uint32_t head_rows) {
+    std::uint32_t bytes, std::uint32_t workers, std::uint32_t head_rows,
+    std::uint32_t jettys = kJettyCount) {
   struct Shard {
     Range rows;
     std::uint32_t queue;
@@ -23,9 +24,9 @@ inline std::vector<GatherWave> InterleavedGatherWaves(std::uint32_t count,
   const auto quantum = RowsPerCacheGroup(bytes);
   bool aligned = true;
   ForEachPipelineChunk(count, bytes, workers, [&](std::uint32_t lane, std::uint32_t, Range chunk) {
-    for (std::uint32_t turn = 0; turn < kJettyCount; ++turn) {
-      const auto queue = (lane + turn) % kJettyCount;
-      const auto rows = JettyRange(chunk, queue);
+    for (std::uint32_t turn = 0; turn < jettys; ++turn) {
+      const auto queue = (lane + turn) % jettys;
+      const auto rows = JettyRange(chunk, queue, jettys);
       if (rows.begin == rows.end || rows.end <= head_rows) continue;
       // Keep DMA and workers copying subsequent waves on separate cache
       // lines. Leave mixed head/suffix shards to the contiguous schedule.

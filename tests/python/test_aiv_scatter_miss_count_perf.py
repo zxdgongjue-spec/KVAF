@@ -23,12 +23,12 @@ import test_npu_batch_get_perf as reference
 from aiv_batch_get_test_common import shutdown_runtime
 from dsa_keys import build_dsa_keys
 from scatter_perf_common import PAYLOAD_TIMINGS, SCATTER_CHUNK_ROWS, profile_metrics, sample_metrics
-from test_aiv_scatter_perf import resolve_scatter_options, write_results
+from test_aiv_scatter_perf import (SCATTER_MAX_JETTYS, resolve_scatter_options,
+                                   scatter_payload_jettys, write_results)
 
 TOKEN_SIZES = (128, 256, 512, 656, 1024, 2048, 4096)
 MISS_COUNTS = (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 CORE_COUNTS = (1, 2, 4, 8)
-CPU_JETTYS = 4
 SUBMISSION_CONFIG = {"host_submit": "prepared", "completion_mode": "reference"}
 STAGES = {
     "end_to_end_ns": "end_to_end", "aiv_body_ns": "kernel_total",
@@ -75,6 +75,8 @@ def arguments(argv=None):
                         help="whole-case seconds, including DDR allocation/registration, full-table population and measurement")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter via chunk Ready (default: 1)")
+    parser.add_argument("--jettys-per-core", type=int, choices=range(1, SCATTER_MAX_JETTYS + 1),
+                        help="size the shared CPU payload pool as cores times Jettys (default: 4 total)")
     parser.add_argument("--jetty-cursors", type=int, choices=(0, 1),
                         help="consume ready shards independently per Jetty (default: 0)")
     parser.add_argument("--overlap-head-cq", type=int, choices=(0, 1),
@@ -89,8 +91,6 @@ def arguments(argv=None):
     vars(args).update(vars(extra))
     args.build = args.build.expanduser().resolve()
     args.cores = args.aiv_cores  # Reuse the existing compact sample writer.
-    if not any(x.split("=", 1)[0] == "--jettys-per-core" for x in remaining):
-        args.jettys_per_core = 2  # This benchmark fixes setup topology, irrespective of scalar sweep env.
     if args.pipeline is None:
         value = os.environ.get("KVAF_SCATTER_PIPELINE", "1")
         if value not in ("0", "1"):
@@ -116,7 +116,9 @@ def arguments(argv=None):
             # at every point. Only an explicit CLI scalar narrows this sweep.
             setattr(args, plural, (getattr(args, scalar),) if supplied else defaults)
     for case in cases(args):
-        error = reference.validate_args(case) or validate_scatter(case)
+        reference_case = copy.copy(case)
+        reference_case.jettys_per_core = 2  # Match the Host topology used for BatchPut.
+        error = validate_scatter(case) or reference.validate_args(reference_case)
         if error:
             parser.error(f"token={case.token_bytes} miss={case.miss_count} cores={case.aiv_cores}: {error}")
     return args
@@ -125,8 +127,8 @@ def arguments(argv=None):
 def validate_scatter(args):
     if not 1 <= args.aiv_cores <= 8:
         return "CPU-push scatter supports 1..8 AIV cores; 16/32-core reference points are unsupported"
-    if args.jettys_per_core != 2:
-        return "this benchmark fixes jettys-per-core=2 for Host setup; CPU payload uses 4 fixed Jettys"
+    if scatter_payload_jettys(args) > SCATTER_MAX_JETTYS:
+        return f"aiv-cores times jettys-per-core must be at most {SCATTER_MAX_JETTYS}"
     if len(args.npu_eids) > 1 or args.adaptive_ub_device or args.adaptive_calibration_only:
         return "scatter supports one EID and a fixed peer-ub-device, without adaptive UB calibration"
     if not 1 <= args.miss_count <= args.request_length <= 65536:
@@ -294,14 +296,17 @@ def run_case(args):
     os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
     os.environ["KVAF_SCATTER_JETTY_CURSORS"] = str(args.jetty_cursors)
     os.environ["KVAF_SCATTER_OVERLAP_HEAD_CQ"] = str(args.overlap_head_cq)
+    if args.jettys_per_core is not None:
+        os.environ["KVAF_SCATTER_JETTYS_PER_CORE"] = str(args.jettys_per_core)
     os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
     runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
-        device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
+        device_id=device_id, npu_core_count=args.aiv_cores, jettys_per_core=2,
         batch_put_kernel_object_path=str(put_kernel), npu_eids=args.npu_eids,
         peer_ub_device=args.peer_ub_device, batch_get_max_inflight_total=args.max_inflight_total,
         aiv_batch_get_mode="cpu_push_scatter")
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "worker"}
+    cpu_jettys = scatter_payload_jettys(args)
     config.update(mode="cpu_push_scatter", source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
         request_control=("AIV_WRITE_prefix_then_suffix" if args.miss_count > SCATTER_CHUNK_ROWS
                          else "AIV_WRITE_mailbox_then_ordered_notify"),
@@ -312,9 +317,9 @@ def run_case(args):
         pipeline_chunk_rows=SCATTER_CHUNK_ROWS,
         pipeline_consumer=("independent_jetty_cursors" if args.jetty_cursors else
                            "jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
-        cpu_jettys=CPU_JETTYS, host_jettys_per_core_scope="setup_and_BatchPut",
-        queue_matched_direct_jettys_per_core=(CPU_JETTYS // args.aiv_cores
-                                             if CPU_JETTYS % args.aiv_cores == 0 else None),
+        cpu_jettys=cpu_jettys, host_jettys_per_core=2,
+        queue_matched_direct_jettys_per_core=(cpu_jettys // args.aiv_cores
+                                             if cpu_jettys % args.aiv_cores == 0 else None),
         read_inflight_budget_applies=False, device_id=device_id,
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
@@ -490,10 +495,12 @@ def refresh_request_buffers(plan, fixed_inputs):
 def case_command(args):
     command = [sys.executable, str(Path(__file__).resolve()), "--build", str(args.build), "--single", "--worker"]
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
-                 "aiv_cores", "jettys_per_core", "warmup", "iterations", "populate_chunk_entries",
+                 "aiv_cores", "warmup", "iterations", "populate_chunk_entries",
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
                  "max_inflight_total", "pipeline", "jetty_cursors", "overlap_head_cq", "case_timeout"):
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
+    if args.jettys_per_core is not None:
+        command.extend(("--jettys-per-core", str(args.jettys_per_core)))
     command.append("--kernel-profile" if args.kernel_profile else "--no-kernel-profile")
     command.append("--host-profile" if args.host_profile else "--no-host-profile")
     command.append("--sort-input-indices" if args.sort_input_indices else "--no-sort-input-indices")
@@ -511,7 +518,7 @@ def summary_rows(report, json_path):
     config = report["config"]
     return [dict(token_bytes=config["token_bytes"], miss_count=config["miss_count"],
                  aiv_cores=config["aiv_cores"], jettys_per_core=config["jettys_per_core"],
-                 cpu_jettys=CPU_JETTYS, phase=phase, completion_mode=config["completion_mode"],
+                 cpu_jettys=config["cpu_jettys"], phase=phase, completion_mode=config["completion_mode"],
                  stage=stage, case_json=str(json_path),
                  **{k: stats[k] for k in SUMMARY_COLUMNS if k in stats})
             for phase, metrics in report["summary"].items()
@@ -528,13 +535,17 @@ def main(argv=None, runner=None):
         name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_reference_prepared"
         case.json = case.json or root / (name + ".json")
         case.csv = case.csv or root / (name + ".csv")
-    plan = dict(mode="cpu_push_scatter", cpu_jettys=CPU_JETTYS, **SUBMISSION_CONFIG,
-                unsupported_reference_cores=[16, 32], jetty_axis="fixed_CPU_4_not_per_AIV_core",
-                cases=[dict(command=case_command(case), payload_bytes=case.miss_count * case.token_bytes,
-                            ddr_bytes=case.table_capacity * case.tokens_per_block * case.token_bytes,
-                            queue_matched_direct_jettys_per_core=(CPU_JETTYS // case.aiv_cores
-                                                                 if CPU_JETTYS % case.aiv_cores == 0 else None))
-                       for case in selected])
+    counts = {scatter_payload_jettys(case) for case in selected}
+    plan = dict(mode="cpu_push_scatter", **SUBMISSION_CONFIG,
+                unsupported_reference_cores=[16, 32],
+                cpu_jettys=next(iter(counts)) if len(counts) == 1 else None, cases=[])
+    for case in selected:
+        cpu_jettys = scatter_payload_jettys(case)
+        plan["cases"].append(dict(command=case_command(case), cpu_jettys=cpu_jettys,
+            payload_bytes=case.miss_count * case.token_bytes,
+            ddr_bytes=case.table_capacity * case.tokens_per_block * case.token_bytes,
+            queue_matched_direct_jettys_per_core=(cpu_jettys // case.aiv_cores
+                                                 if cpu_jettys % case.aiv_cores == 0 else None)))
     if args.dry_run:
         print(json.dumps(dict(dry_run=True, combinations=len(selected), **plan), indent=2))
         return 0
@@ -545,7 +556,8 @@ def main(argv=None, runner=None):
     runner = runner or subprocess.run
     for index, case in enumerate(selected):
         print(f"SCATTER_ALIGNED_SWEEP_BEGIN case={index+1}/{len(selected)} token_bytes={case.token_bytes} "
-              f"miss_count={case.miss_count} aiv_cores={case.aiv_cores} cpu_jettys={CPU_JETTYS} "
+              f"miss_count={case.miss_count} aiv_cores={case.aiv_cores} "
+              f"cpu_jettys={scatter_payload_jettys(case)} "
               "host_submit=prepared completion_mode=reference", flush=True)
         case.json.parent.mkdir(parents=True, exist_ok=True)
         with case.json.with_suffix(".log").open("w", encoding="utf-8") as log:
@@ -566,6 +578,7 @@ def main(argv=None, runner=None):
             "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
             "sort_input_indices", "pipeline", "jetty_cursors", "overlap_head_cq", "fixed_request_plan")}
         expected.update(SUBMISSION_CONFIG)
+        expected["cpu_jettys"] = scatter_payload_jettys(case)
         for key, value in expected.items():
             if report["config"].get(key) != value:
                 raise ValueError(f"case report configuration mismatch: {key}")

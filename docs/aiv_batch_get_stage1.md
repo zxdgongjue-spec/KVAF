@@ -7,7 +7,7 @@
 
 | 模式 | 执行顺序 |
 | --- | --- |
-| `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 四路 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
+| `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 多条 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
 | `gather_read` | AIV WRITE 清单、command、notify → CPU gather → 最终 ACK → AIV 多 SGE READ 到 output → CQ 完成 |
 
 Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 后，CPU 省略
@@ -26,18 +26,26 @@ AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 两组可直接对比端到端耗时和 AIV 墙钟。profiled CSV 中的 `aiv_cross_chunk_shards`
 统计本批跨过尚未消费的早期 chunk 提交的分片数。
 
+Scatter 默认在每个会话创建 4 条共享 payload Jetty。N 端在初始化前设置
+`KVAF_SCATTER_JETTYS_PER_CORE`，或给两个 Scatter 性能脚本传入 `--jettys-per-core`，
+可按 `AIV 核数 × jettys-per-core` 设置共享 Jetty 总数，上限为 32。
+例如 `--aiv-cores 4 --jettys-per-core 8` 会创建 32 条。每个 worker 的 Ready 区按实际
+Jetty 数分配 1～4 条 cache line。非 4 条配置使用扩展建链协议，需要配套部署 K 端服务、
+N 端 Runtime 和 Scatter 内核。两端的 `payload_jettys` 日志和性能输出的 `cpu_jettys`
+可用于确认测试配置。
+
 ### Scatter 的 CPU Gather 回推
 
 启动 NPU 进程时设置 `KVAF_SCATTER_CPU_GATHER=1`，并使用
 `aiv_batch_get_mode="cpu_push_scatter"`。该开关默认关闭，在 Runtime 初始化时读取。
 NPU 通过专用的会话打开命令选择 CPU gather，同一个 CPU 服务可为不同会话选择不同的回推路径。
 启用时需部署支持该命令的 CPU 服务和 NPU Host。
-CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，再通过已有的四路
-Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
+CPU 按请求行顺序将离散 DDR 源复制到连续的注册 DDR staging，再通过会话的
+payload Jetty 将连续 DDR 区间 WRITE 到 HBM staging 的对应连续区间。每个数据 WR
 使用一个源 SGE 和一个目标 SGE，按设备报告的消息及 WRITE 长度上限拆分。
 AIV 复用现有的 Ready/Done 和 scatter。CPU 启用分波且收到首段通知时，
 CPU 先 gather 并回推首段，再等后缀清单。CPU 线程协作拷贝每个最多 1024 行的块，
-块就绪后由队列所属的 CPU 线程提交 WRITE，其他线程继续拷贝后续块。
+块就绪后由服务线程提交 WRITE，其他线程继续拷贝后续块。
 `pipeline=1` 时每个 AIV 分片的 Ready 随该分片的最后一部分 WRITE 发布。
 `pipeline=0` 时 AIV 等最终 Done，CPU 仍可用 `KVAF_CPU_GATHER_INTERLEAVE=1`
 分波 gather 和 WRITE。两端都关闭时，CPU 等完整清单并完成整批 gather 后提交 WRITE。
@@ -216,7 +224,7 @@ CPU profile 的 `pipeline` 表示 AIV 模式，`gather_pipeline` 表示 CPU 是�
 拆解 `cpu_comm_us`。分波时提交窗口包含供数间隔。
 
 K 端设置 `KVAF_CPU_GATHER_JETTY_SUPPLY=1` 会启用交错调度，后缀分片按 Jetty 独立提交。
-满足 cache-line 对齐并有至少四个活跃 gather 线程时，每条 Jetty 有独立的 gather 线程组，
+满足 cache-line 对齐且活跃 gather 线程数至少等于 Jetty 数时，每条 Jetty 有独立的 gather 线程组，
 日志记录 `jetty_supply=1`。每条 Jetty 按自身队首分片的就绪顺序提交，保留有序 Ready。
 最终 Done 在全部 payload CQE 回收后发布。N 端使用 `--pipeline 1 --jetty-cursors 1` 按 Jetty 消费 Ready。
 `waves` 记录 WRITE 计划提交次数，一个 gather 波可对应多个提交计划。

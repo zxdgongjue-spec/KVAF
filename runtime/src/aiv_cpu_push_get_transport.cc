@@ -16,6 +16,7 @@ namespace kvaf::cpu_push::aiv {
 namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 constexpr std::size_t kJettyDepth = 8192;
+static_assert(kMaxJettyCount <= cpu_urma_detail::IndexedAsyncWriteTracker::kMaxQueues);
 constexpr std::size_t kGatherProfileSamples = 512;
 #ifdef __OPTIMIZE__
 constexpr unsigned kOptimized = 1;
@@ -82,13 +83,16 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
 }
 
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
-    const peer::OpenCpuPushGetRequest& setup,
+    const peer::OpenAivCpuPushJettyRequest& request,
     urma::GetTpList query, urma::ImportJettyEx import, std::uint32_t psn,
-    peer::OpenAivCpuPushGetResponse* response) {
-  if (context_ || !context || !source || !query || !import || !response || !psn ||
+    peer::OpenAivCpuPushJettyResponse* result) {
+  const auto& setup = request.base;
+  const auto jettys = request.payload_jettys;
+  if (context_ || !context || !source || !query || !import || !result || !psn ||
+      !jettys || jettys > kMaxJettyCount ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      !MakeLayout(setup.token_bytes, setup.workers, &layout_) ||
+      !MakeLayout(setup.token_bytes, setup.workers, &layout_, jettys) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
@@ -100,6 +104,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       return Status::InvalidArgument("KVAF_CPU_PUSH_POST_BATCH_WRS must be in 1..8192");
     post_batch_wrs_ = static_cast<std::uint32_t>(limit);
   }
+  auto* response = &result->base;
+  jetty_count_ = jettys;
+  tracker_ = Tracker(jetty_count_, kJettyDepth);
   context_ = context;
   session_ = setup.session_id;
   source_ = source;
@@ -120,8 +127,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     gather_write_limit = std::min<std::uint64_t>(gather_write_limit, attr.dev_cap.max_write_size);
   max_gather_write_bytes_ = static_cast<std::uint32_t>(gather_write_limit);
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "payload_write_bytes=%u post_batch_wrs=%u optimized=%u source_refresh=%s\n",
-               max_sge_, max_bytes_, workers_, token_bytes_,
+               "payload_jettys=%u payload_write_bytes=%u post_batch_wrs=%u optimized=%u source_refresh=%s\n",
+               max_sge_, max_bytes_, workers_, token_bytes_, jetty_count_,
                gather_ ? max_gather_write_bytes_ : max_bytes_, post_batch_wrs_, kOptimized,
                gather_ ? "cpu_gather" :
                (std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map"));
@@ -140,7 +147,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (!remote_) return Error("import HBM segment");
   void* buffer = nullptr;
   // Each in-flight ready WRITE has its own immutable registered source word.
-  const auto marker_bytes = workers_ * kMaxChunks * kJettyCount * sizeof(std::uint64_t);
+  const auto marker_bytes = workers_ * kMaxChunks * jetty_count_ * sizeof(std::uint64_t);
   const auto bytes = (layout_.staging + marker_bytes + 4095) & ~std::uint64_t{4095};
   if (posix_memalign(&buffer, 4096, bytes)) return Error("allocate control buffer");
   memory_ = static_cast<std::uint8_t*>(buffer);
@@ -172,15 +179,16 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
   response->cpu_tp = cpu_tp;
   response->cpu_psn = psn;
-  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-    if (setup.channels[q].bytes != 28 && setup.channels[q].bytes != 32)
+  for (std::uint32_t q = 0; q < jetty_count_; ++q) {
+    const auto& target = request.Channel(q);
+    if (target.bytes != 28 && target.bytes != 32)
       return Error("invalid NPU Jetty key");
     auto& queue = queues_[q];
     auto& c = queue.channel;
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
         {16384, kJettyDepth, max_sge_, false, true}, c.local_jfc, c.local_jfr, c.local_jetty);
     if (error) return Error(error);
-    c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
+    c.remote_jetty = urma::ImportJetty(import, context_, target.key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
     // Keep the negotiated initial values for CQ failure diagnostics. These
@@ -188,7 +196,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     std::copy_n(setup.eid, c.tp.peer_eid.size(), c.tp.peer_eid.begin());
     c.tp.local = cpu_tp; c.tp.peer = setup.npu_tp;
     c.tp.local_psn = psn; c.tp.peer_psn = setup.npu_psn;
-    auto& key = response->channels[q];
+    auto& key = result->Channel(q);
     key.bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
     std::memcpy(key.key, &c.local_jetty->jetty_id, sizeof(urma_jetty_id_t));
     std::memcpy(key.key + sizeof(urma_jetty_id_t), &c.local_jetty->jetty_cfg.jfs_cfg.trans_mode,
@@ -282,7 +290,7 @@ Status Transport::EnsureGatherStaging(std::uint32_t count) {
 std::uint32_t Transport::FirstGatherChunkRows(std::uint32_t count) const {
   if (count <= kChunkRows) return 0U;
   const auto lane = WorkerRange(count, token_bytes_, 0, workers_);
-  const auto shard = JettyRange(ChunkRange(lane, 0), 0);
+  const auto shard = JettyRange(ChunkRange(lane, 0), 0, jetty_count_);
   // The first WRITE should make a whole shard consumable, with no cache
   // line shared with workers gathering the next chunk.
   return std::uint64_t{shard.end} * token_bytes_ % 64U == 0U ? shard.end : 0U;
@@ -299,7 +307,8 @@ Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor:
       gather_->EnableProfiling(profile_.enabled);
       threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
                                       gather_waves_, suffix,
-                                      on_shards ? gather_suffix_wave_ : SIZE_MAX, gather_jetty_supply_);
+                                      on_shards ? gather_suffix_wave_ : SIZE_MAX, gather_jetty_supply_,
+                                      jetty_count_);
     }
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
     {
@@ -346,7 +355,7 @@ void Transport::AppendPrepared(PreparedQueue& q, std::uint32_t queue,
   q.wrs.push_back(wr);
 }
 void Transport::SealPrepared(PreparedWrite& plan) {
-  for (std::uint32_t index = 0; index < kJettyCount; ++index) {
+  for (std::uint32_t index = 0; index < jetty_count_; ++index) {
     auto& q = plan.queues[index];
     if (q.wrs.empty()) continue;
     std::uint32_t local = 0, payloads = 0;
@@ -391,19 +400,19 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   prepared_interleaved_ = false;
   const bool clip_to_stage = head_rows || gather_pipeline;
   const auto build_stage = [&](Range stage, bool suffix, const GatherWave* wave = nullptr) {
-    std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+    std::array<std::vector<PreparedQueue>, kMaxJettyCount> shards;
     const auto source_sges = gather_ ? 1U : max_sge_;
     const bool unsplit = !gather_ && std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
-    for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
+    for (std::uint32_t queue = 0; queue < jetty_count_; ++queue) {
       const auto window = wave ? (*wave)[queue] : stage;
       if (wave && window.begin == window.end) continue;
       auto& waves = shards[queue];
       waves.emplace_back();
       const auto append = [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
-        const auto shard = JettyRange(range, queue);
+        const auto shard = JettyRange(range, queue, jetty_count_);
         const auto begin = clip_to_stage ? std::max(shard.begin, window.begin) : shard.begin;
         const auto end = clip_to_stage ? std::min(shard.end, window.end) : shard.end;
-        if (clip_to_stage && begin >= end) return;
+        if (begin >= end) return;
         auto row = begin;
         std::uint32_t offset = 0;
         while (row < end) {
@@ -451,10 +460,10 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
-            (worker * kMaxChunks + chunk) * kJettyCount + queue;
+            (worker * kMaxChunks + chunk) * jetty_count_ + queue;
         q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
-        AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
+        AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * ReadyStride(jetty_count_) + queue * 8,
                        8, 1, true);
       };
       // Without waves or per-shard Ready, partition the entire stage across
@@ -465,33 +474,34 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     const auto add_plan = [&](std::size_t w, std::uint32_t only_queue) {
       auto plan = std::make_unique<PreparedWrite>();
       plan->suffix = suffix;
-      for (std::uint32_t q = 0; q < kJettyCount; ++q)
-        if ((only_queue == kJettyCount || q == only_queue) && w < shards[q].size())
+      for (std::uint32_t q = 0; q < jetty_count_; ++q)
+        if ((only_queue == jetty_count_ || q == only_queue) && w < shards[q].size())
           plan->queues[q] = std::move(shards[q][w]);
       SealPrepared(*plan);
       if (plan->fence_count) {
         if (gather_pipeline) plan->ready_waves = gather_waves_.size();
         else if (gather_ && w == 0) plan->gather_before_post = true;
-        if (only_queue < kJettyCount) prepared_shards_[only_queue].push_back(prepared_.size());
+        if (only_queue < jetty_count_) prepared_shards_[only_queue].push_back(prepared_.size());
         prepared_.push_back(std::move(plan));
       }
     };
     if (wave && gather_jetty_supply_) {
       // The Jetty gather groups publish their own shards, so each queue
       // needs a separately tracked WRITE plan for its part of the wave.
-      for (std::uint32_t q = 0; q < kJettyCount; ++q)
+      for (std::uint32_t q = 0; q < jetty_count_; ++q)
         for (std::size_t w = 0; w < shards[q].size(); ++w) add_plan(w, q);
     } else {
       std::size_t waves = 0;
       for (const auto& shard : shards) waves = std::max(waves, shard.size());
-      for (std::size_t w = 0; w < waves; ++w) add_plan(w, kJettyCount);
+      for (std::size_t w = 0; w < waves; ++w) add_plan(w, jetty_count_);
     }
   };
   // A gather plan can start on the head and gate subsequent waves on suffix.
   // The serial gather baseline waits for the entire list before gathering.
   if (gather_pipeline) {
     const auto interleaved = gather_interleave_
-        ? InterleavedGatherWaves(count, token_bytes_, workers_, head_rows) : std::vector<GatherWave>{};
+        ? InterleavedGatherWaves(count, token_bytes_, workers_, head_rows, jetty_count_)
+        : std::vector<GatherWave>{};
     prepared_interleaved_ = !interleaved.empty();
     const auto contiguous_end = prepared_interleaved_ ? head_rows : count;
     const auto build_contiguous = [&](Range rows) {
@@ -549,8 +559,8 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
     *marker->value = Progress(request().sequence, marker->progress);
 }
 Status Transport::TryBeginPrepared(PreparedWrite& plan, std::uint64_t id, bool* submitted) {
-  for (const auto& q : queues_)
-    if (q.poisoned) return Error("queue unavailable");
+  for (std::uint32_t q = 0; q < jetty_count_; ++q)
+    if (queues_[q].poisoned) return Error("queue unavailable");
   auto status = tracker_.TryBegin(id, plan.handle, plan.fences.data(), plan.fence_count, submitted);
   if (!status.ok() || !*submitted) return status;
   for (std::size_t i = 0; i < plan.fence_count; ++i) {
@@ -575,11 +585,11 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, Profile* 
 Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile) {
   std::size_t largest = 0;
   std::uint64_t first_post = 0;
-  for (const auto& q : plan.queues) largest = std::max(largest, q.posts.size());
-  // Start all four Jettys before posting the next slice of any queue. A long
-  // queue must not delay the first doorbell to the remaining three Jettys.
+  for (std::uint32_t q = 0; q < jetty_count_; ++q)
+    largest = std::max(largest, plan.queues[q].posts.size());
+  // Start all Jettys before posting the next slice of any queue.
   for (std::size_t batch = 0; batch < largest; ++batch) {
-    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+    for (std::uint32_t q = 0; q < jetty_count_; ++q) {
       auto& queue = plan.queues[q];
       if (batch >= queue.posts.size()) continue;
       const auto& post = queue.posts[batch];
@@ -613,7 +623,7 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
   for (;;) {
     urma_cr_t cr;
     std::size_t count = 0;
-    auto status = cpu_urma_detail::SweepAsyncCqs(kJettyCount, next_poll_queue_, 1, 1, &count,
+    auto status = cpu_urma_detail::SweepAsyncCqs(jetty_count_, next_poll_queue_, 1, 1, &count,
         [&](std::size_t q) { return tracker_.Pending(q); },
         [&](std::size_t q, std::size_t limit, std::size_t* polled) -> Status {
           const auto n = urma_poll_jfc(queues_[q].channel.local_jfc, static_cast<int>(limit), &cr);
@@ -639,7 +649,7 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
           *finished = completed != 0;
           return Status::OK();
         });
-    next_poll_queue_ = (next_poll_queue_ + 1) % kJettyCount;
+    next_poll_queue_ = (next_poll_queue_ + 1) % jetty_count_;
     if (!status.ok()) return status;
     if (profile && count && tracker_.Empty()) profile->last_cqe_ns = BatchGetProfileNowNs();
     if (count || !wait) return Status::OK();
@@ -714,7 +724,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   };
   if (!gather_waves_.empty()) {
     std::size_t next_plan = 0;
-    std::array<std::size_t, kJettyCount> next_shard{};
+    std::array<std::size_t, kMaxJettyCount> next_shard{};
     std::size_t shards_left = 0U;
     for (const auto& shards : prepared_shards_) shards_left += shards.size();
     const auto whole_plans = prepared_.size() - shards_left;
@@ -729,7 +739,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       bool blocked = false, made_progress;
       do {
         made_progress = false;
-        for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+        for (std::uint32_t q = 0; q < jetty_count_; ++q) {
           if (next_shard[q] == prepared_shards_[q].size()) continue;
           const auto plan = prepared_shards_[q][next_shard[q]];
           if (!gather_->ShardReady(prepared_[plan]->ready_waves - 1U, q)) continue;
@@ -924,7 +934,8 @@ Status Transport::Shutdown() {
   }
   if (control_) { if (urma_unregister_seg(control_)) return Error("unregister controls"); control_ = nullptr; }
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
-  tracker_ = Tracker(kJettyCount, kJettyDepth);
+  jetty_count_ = kJettyCount;
+  tracker_ = Tracker(jetty_count_, kJettyDepth);
   prepared_.clear();
   for (auto& shards : prepared_shards_) shards.clear();
   gather_waves_.clear();

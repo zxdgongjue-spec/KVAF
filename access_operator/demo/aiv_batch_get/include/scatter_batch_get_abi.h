@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include "cpu_push_get_abi.h"
 #include "sequential_batch_get_abi.h"
 #include "scatter_batch_get_profile.h"
 
@@ -18,12 +19,13 @@ constexpr uint32_t kScatterOptionsV1 = 0x53430100U;
 constexpr uint32_t kScatterProfiling = 4U;
 // Host's existing trusted-input contract also applies to device list contents.
 constexpr uint32_t kScatterTrustedInputs = 8U;
+constexpr uint32_t kScatterConfiguredJettys = 16U;
 constexpr uint32_t kScatterPipeline = 32U;
 constexpr uint32_t kScatterJettyCursors = 64U;
 constexpr uint32_t kScatterOverlapHeadCq = 128U;
 constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
 constexpr uint32_t kScatterOptionsMask =
-    kScatterProfiling | kScatterTrustedInputs | kScatterPipeline | kScatterJettyCursors |
+    kScatterProfiling | kScatterTrustedInputs | kScatterConfiguredJettys | kScatterPipeline | kScatterJettyCursors |
     kScatterOverlapHeadCq;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
@@ -67,3 +69,11 @@ struct KvafScatterBatchGetArgs {
   uint32_t max_polls, reserved;
 };
 static_assert(sizeof(KvafScatterBatchGetArgs) == 176);
+
+namespace kvaf {
+KVAF_SCATTER_OPTIONS_INLINE constexpr uint32_t ScatterPayloadJettys(const KvafScatterBatchGetArgs& args) {
+  if (!ScatterOptionEnabled(args.reserved, kScatterConfiguredJettys)) return cpu_push::kJettyCount;
+  const uint64_t total = uint64_t(args.request.block_count) * args.request.jettys_per_core;
+  return total <= cpu_push::kMaxJettyCount ? static_cast<uint32_t>(total) : 0U;
+}
+}  // namespace kvaf

@@ -669,21 +669,26 @@ class CpuService {
     return Result::kOk;
   }
 
-  template <class Transport, class Worker, class Response>
-  Result OpenCpuPushGet(const peer::OpenCpuPushGetRequest& request, Response* response,
+  template <class Transport, class Worker, class Request, class Response>
+  Result OpenCpuPushGet(const Request& request, Response* response,
                         std::unique_ptr<Worker> Region::*slot) {
-    const auto found = regions_.find(request.session_id);
+    constexpr bool aiv = std::is_same_v<Transport, cpu_push::aiv::Transport>;
+    const auto& setup = [&]() -> const peer::OpenCpuPushGetRequest& {
+      if constexpr (aiv) return request.base;
+      else return request;
+    }();
+    const auto found = regions_.find(setup.session_id);
     if (found == regions_.end()) return Result::kNotFound;
     auto& region = *found->second;
     if (region.HasPush() || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
-    if (!request.source_bytes || request.source_bytes > region.bytes)
+    if (!setup.source_bytes || setup.source_bytes > region.bytes)
       return Result::kInvalidRequest;
     Log("[KVAF_CPU] CPU_PUSH_OPEN session=%llu workers=%u token_bytes=%u hbm_bytes=%llu\n",
-        static_cast<unsigned long long>(request.session_id), request.workers, request.token_bytes,
-        static_cast<unsigned long long>(request.hbm_bytes));
+        static_cast<unsigned long long>(setup.session_id), setup.workers, setup.token_bytes,
+        static_cast<unsigned long long>(setup.hbm_bytes));
     auto transport = std::make_unique<Transport>();
-    if constexpr (std::is_same_v<Transport, cpu_push::aiv::Transport>) {
-      if (request.header.command == static_cast<uint16_t>(Command::kOpenAivCpuGatherPushGet)) {
+    if constexpr (aiv) {
+      if (setup.header.command == static_cast<uint16_t>(Command::kOpenAivCpuGatherPushGet)) {
         const auto status = transport->ConfigureGather(region.memory, region.base, gather_threads_,
             min_bytes_per_thread_, gather_affinity_, ToGatherWaitMode(gather_mode_));
         if (!status.ok()) {
@@ -1040,22 +1045,28 @@ void HandleClient(int fd, CpuService* service, const MessageHeader& header) {
 
     case Command::kOpenCpuPushGet:
     case Command::kOpenAivCpuGatherPushGet: {
-      const bool aiv = header.version == peer::kAivCpuPushProtocolVersion;
-      peer::OpenCpuPushGetRequest request{};
-      request.header = header;
-      const bool valid = IsValidHeader(header, command, sizeof(request), header.version) &&
-          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header));
-      if (aiv) {
-        peer::OpenAivCpuPushGetResponse response{};
-        response.header = MakeHeader(command, sizeof(response), header.version);
-        response.header.command = ResponseCommand(command);
-        response.result = static_cast<int32_t>(valid ?
+      if (header.version != peer::kProtocolVersion) {
+        const bool extended = header.version == peer::kAivCpuPushJettyProtocolVersion;
+        peer::OpenAivCpuPushJettyRequest request{};
+        request.base.header = header;
+        const auto request_bytes = extended ? sizeof(request) : sizeof(request.base);
+        const bool valid = IsValidHeader(header, command, request_bytes, header.version) &&
+            ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), request_bytes - sizeof(header));
+        if (!extended) request.payload_jettys = cpu_push::kJettyCount;
+        peer::OpenAivCpuPushJettyResponse response{};
+        const auto response_bytes = extended ? sizeof(response) : sizeof(response.base);
+        response.base.header = MakeHeader(command, response_bytes, header.version);
+        response.base.header.command = ResponseCommand(command);
+        response.base.result = static_cast<int32_t>(valid ?
             service->OpenCpuPushGet<cpu_push::aiv::Transport>(request, &response, &Region::aiv_push) :
             Result::kInvalidRequest);
-        (void)WriteAll(fd, &response, sizeof(response));
+        (void)WriteAll(fd, &response, response_bytes);
         return;
       }
-      if (!valid) {
+      peer::OpenCpuPushGetRequest request{};
+      request.header = header;
+      if (!IsValidHeader(header, command, sizeof(request)) ||
+          !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header), sizeof(request) - sizeof(header))) {
         SendStatus(fd, command, Result::kInvalidRequest);
         return;
       }

@@ -9,9 +9,10 @@
 namespace kvaf::cpu_urma_detail {
 // Track queue credits and CQE identity with slot/generation/queue contexts.
 class IndexedAsyncWriteTracker {
+  static constexpr unsigned kQueueBits = 5, kSlotBits = 6;
  public:
   struct Fence { std::size_t queue{}, wrs{}; std::uint64_t context{}; };
-  static constexpr std::size_t kMaxQueues = 16, kMaxBatches = 64;
+  static constexpr std::size_t kMaxQueues = 1U << kQueueBits, kMaxBatches = 1U << kSlotBits;
   struct Handle { std::uint64_t token{}; };
   explicit IndexedAsyncWriteTracker(std::size_t queues = 0, std::size_t depth = 8192)
       : queues_(queues), depth_(depth) {}
@@ -35,7 +36,8 @@ class IndexedAsyncWriteTracker {
     if (generation_ == kGenerationMask)
       return Status::InvalidState("async completion generation exhausted; reinitialize transport");
     const auto slot = FirstBit(~active_);
-    const auto token = kTag | (++generation_ << 10) | (std::uint64_t(slot) << 4);
+    const auto token = kTag | (++generation_ << (kSlotBits + kQueueBits)) |
+                       (std::uint64_t(slot) << kQueueBits);
     auto& batch = batches_[slot];
     batch.id = id; batch.mask = mask; batch.handle = &handle;
     handle.token = token;
@@ -53,12 +55,12 @@ class IndexedAsyncWriteTracker {
     if (!completed || queue >= queues_ || queues_ > kMaxQueues)
       return Status::InvalidArgument("invalid indexed CQ queue");
     *completed = 0;
-    const auto slot = static_cast<std::size_t>((context >> 4) & 63);
+    const auto slot = static_cast<std::size_t>((context >> kQueueBits) & (kMaxBatches - 1));
     const auto bit = 1U << queue;
     auto& batch = batches_[slot];
-    if ((context & kTagMask) != kTag || (context & 15) != queue ||
+    if ((context & kTagMask) != kTag || (context & kQueueMask) != queue ||
         !(active_ & (UINT64_C(1) << slot)) || !(batch.mask & bit) ||
-        (context & ~UINT64_C(15)) != batch.handle->token)
+        (context & ~kQueueMask) != batch.handle->token)
       return Status::Internal("unexpected/stale indexed async completion context");
     used_[queue] -= batch.wrs[queue]; batch.mask &= ~bit;
     --pending_[queue];
@@ -83,7 +85,8 @@ class IndexedAsyncWriteTracker {
   }
   static constexpr std::uint64_t kTag = UINT64_C(0xA700000000000000);
   static constexpr std::uint64_t kTagMask = UINT64_C(0xFF00000000000000);
-  static constexpr std::uint64_t kGenerationMask = (UINT64_C(1) << 46) - 1;
+  static constexpr std::uint64_t kQueueMask = kMaxQueues - 1;
+  static constexpr std::uint64_t kGenerationMask = (UINT64_C(1) << (56 - kSlotBits - kQueueBits)) - 1;
   struct Batch {
     std::uint64_t id{}; std::uint32_t mask{}; Handle* handle{};
     std::array<std::size_t, kMaxQueues> wrs{};

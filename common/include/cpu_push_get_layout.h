@@ -11,11 +11,13 @@ struct Layout {
   std::uint64_t request{0}, notify{64}, done{128}, ready{192};
   std::uint64_t descriptor{}, staging{}, bytes{};
 };
-inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out) {
+inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out,
+                       std::uint32_t jettys = kJettyCount) {
   if (!out || !token_bytes || !workers || workers > kMaxWorkers ||
+      !jettys || jettys > kMaxJettyCount ||
       std::uint64_t{token_bytes} * kMaxRequests > UINT32_MAX) return false;
   Layout l;
-  l.descriptor = l.ready + workers * sizeof(Ready);
+  l.descriptor = l.ready + workers * ReadyStride(jettys);
   l.staging = Align64(l.descriptor + kMaxRequests * sizeof(std::uint64_t));
   l.bytes = Align64(l.staging + std::uint64_t{token_bytes} * kMaxRequests);
   *out = l;
