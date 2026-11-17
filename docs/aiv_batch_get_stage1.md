@@ -154,6 +154,11 @@ Tensor 和 stream，运行时会检查完成状态。用 `synchronize=True` 可�
 选项或重新准备图。比较性能时，N 端性能脚本两组都用 `--completion-scope stream`，其中一组
 额外加 `--acl-graph`。捕获与结果验证在样本计时窗口外。
 
+对照 Host 完成开销时，可以把 `--completion-scope stream` 改成 `--completion-scope native-stream`。
+原生 prepared callable 在同一次 Python 调用里提交并等待同一条 stream，CSV 的 `host_call_us`
+此时包含等待。开启 Host profiling 时可用 `host_launch_us` 和 `host_stream_sync_us` 分开查看。
+两种完成方式的单请求端到端都计到同一条 stream 执行完成。
+
 单次 replay 的优化可用 N 端 `KVAF_SCATTER_GRAPH_MAILBOX=0/1` 做对照，默认 `0`。设为
 `1` 时，首段清单发布后，Suffix 复用本次请求已校验的 mailbox。Scatter pipeline 开启时，
 core 0 在 Suffix 提交后即可消费已经 Ready 的分片，在等 Ready 的间隔检查最后一个控制 CQE。

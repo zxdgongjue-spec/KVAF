@@ -37,6 +37,8 @@ CSV_COLUMNS = (
     "jettys_per_core", "cpu_jettys",
     "ready_refresh", "aiv_ready_refreshes", "aiv_ready_refresh_hits",
     "aiv_suffix_cq_blocked_us",
+    "host_submit", "completion_scope", "graph_mailbox",
+    "host_call_us", "host_stream_resolve_us", "stream_sync_us", "device_sync_us",
 )
 
 
@@ -221,6 +223,10 @@ def write_results(args, report):
         with args.csv.open("w", newline="", encoding="utf-8") as output:
             writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
             writer.writeheader()
+            config = report["config"]
+            submission = {key: config.get(key, "") for key in ("host_submit", "completion_scope", "graph_mailbox")}
+            if "graph_mailbox" in config:
+                submission["graph_mailbox"] = int(config["graph_mailbox"])
             for phase, samples in report["samples"].items():
                 for sample in samples:
                     values = dict(phase=phase, cores=args.cores, jetty_cursors=args.jetty_cursors,
@@ -230,7 +236,7 @@ def write_results(args, report):
                                   cpu_jettys=scatter_payload_jettys(args),
                                   request_length=args.request_length,
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
-                                  **sample_metrics(sample))
+                                  **submission, **sample_metrics(sample))
                     values.setdefault("pipeline", args.pipeline)
                     row = {}
                     for key in CSV_COLUMNS:

@@ -46,7 +46,7 @@ SUMMARY_COLUMNS = (
 
 def submission_config(args):
     return dict(host_submit="acl_graph" if args.acl_graph else "prepared",
-                completion_mode="reference" if args.completion_scope == "device" else "stream",
+                completion_mode="reference" if args.completion_scope == "device" else args.completion_scope,
                 completion_scope=args.completion_scope)
 
 
@@ -91,8 +91,8 @@ def arguments(argv=None):
                         help="reuse one request plan for preflight, warmup and measurement")
     parser.add_argument("--acl-graph", action="store_true",
                         help="capture the prepared Scatter BatchGet once and replay it per request")
-    parser.add_argument("--completion-scope", choices=("device", "stream"), default="device",
-                        help="completion wait used identically for eager and graph samples")
+    parser.add_argument("--completion-scope", choices=("device", "stream", "native-stream"), default="device",
+                        help="wait on the device, the Python stream, or the stream inside the prepared native call")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
@@ -251,7 +251,8 @@ def warmup_calls(runtime, torch, args, refresh_inputs, submit, wait):
             refresh_inputs()
         torch.npu.synchronize()
         submit()
-        wait()
+        if wait is not None:
+            wait()
     if args.warmup:
         # No last-warmup status drain may spill into the first timed Execute.
         complete_outside_measurement(runtime, args.kernel_profile)
@@ -261,11 +262,14 @@ def measure_call(runtime, args, iteration, submit, wait, clock=time.perf_counter
     begin = clock()
     submit()
     submitted = clock()
-    wait()
-    completed = clock()
+    completed = submitted
+    if wait is not None:
+        wait()
+        completed = clock()
     sample = dict(iteration=iteration, payload_bytes=args.miss_count * args.token_bytes,
                   end_to_end_ns=completed - begin, host_call_ns=submitted - begin)
-    sample[f"{args.completion_scope}_sync_ns"] = completed - submitted
+    if wait is not None:
+        sample[f"{args.completion_scope}_sync_ns"] = completed - submitted
     if args.kernel_profile:
         begin = clock()
         records = complete_outside_measurement(runtime, True)
@@ -335,8 +339,9 @@ def run_case(args):
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
         input_mode=("steady_table_fixed_request_plan" if args.fixed_request_plan
                     else "steady_table_new_request_plan_per_call"), calls_per_sample=1,
-        timing=("enqueue_then_global_device_sync" if args.completion_scope == "device"
-                else "enqueue_then_stream_sync"), stream_selection="fixed_stream_per_call_task_queue_fence",
+        timing={"device": "enqueue_then_global_device_sync", "stream": "enqueue_then_stream_sync",
+                "native-stream": "enqueue_and_stream_sync_in_native_call"}[args.completion_scope],
+        stream_selection="fixed_stream_per_call_task_queue_fence",
         graph_mailbox=args.acl_graph and os.environ.get("KVAF_SCATTER_GRAPH_MAILBOX") == "1",
         input_storage=("fixed_buffers" if args.fixed_request_plan else "fixed_buffers_refreshed_per_call"),
         host_timing_matches_reference=False,
@@ -413,19 +418,22 @@ def run_case(args):
                 fixed_inputs = reference.sort_request_plan_prefix(
                     torch, view.addresses, *fixed_inputs, args.miss_count)
         # Dedicated stream for capture and for the same-stream eager comparison.
-        stream = torch.npu.Stream() if args.acl_graph or args.completion_scope == "stream" else None
-        wait = stream.synchronize if args.completion_scope == "stream" else torch.npu.synchronize
+        stream = torch.npu.Stream() if args.acl_graph or args.completion_scope != "device" else None
+        native_wait = args.completion_scope == "native-stream"
+        wait = None if native_wait else (
+            stream.synchronize if args.completion_scope == "stream" else torch.npu.synchronize)
         if args.acl_graph and args.kernel_profile:
             runtime.start_scatter_profile()  # Captured kernel options are fixed at preparation.
         with setup_phase(report, "prepare_submit"):
             submit = runtime.prepare_scatter_batch_get(
                 view, fixed_inputs[0], fixed_inputs[1], count, fixed_inputs[2], output,
-                stream=stream, synchronize=False, acl_graph=args.acl_graph)
+                stream=stream, synchronize=False, wait_stream=native_wait, acl_graph=args.acl_graph)
         output.zero_()
         if stream is not None:
             torch.npu.synchronize()  # Default-stream fixtures must precede the first replay.
         submit()
-        wait()
+        if wait is not None:
+            wait()
         complete_outside_measurement(runtime, args.acl_graph and args.kernel_profile)
         verify(fixed_inputs, guard=True)
         check = ("active_payload_and_guard" if args.fixed_request_plan and
