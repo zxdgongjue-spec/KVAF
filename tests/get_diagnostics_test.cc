@@ -81,8 +81,6 @@ class FailedGraphProvider final : public AccessOperator {
 void CheckFailedGraphRecovery(GetExecutionConfig target) {
   const GetExecutionConfig direct{Transport::Urma, Executor::Aiv, GetAlgorithm::Direct};
   ExecutionPolicy policy;
-  policy.enabled_put_configs = std::vector<PutExecutionConfig>{};
-  policy.enabled_get_configs = std::vector<GetExecutionConfig>{direct, target};
   policy.default_get = direct;
   ExecutionDispatcher dispatcher(policy);
   RecoveryCounters bound, failed;
@@ -134,8 +132,6 @@ int main() {
       {Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter}}};
   ExecutionPolicy policy;
   policy.transport_mode = TransportMode::UrmaAndUbmem;
-  policy.enabled_put_configs = std::vector<PutExecutionConfig>{};
-  policy.enabled_get_configs = std::vector<GetExecutionConfig>(configs.begin(), configs.end());
   policy.default_get = configs[2];
   ExecutionDispatcher dispatcher(policy);
   std::array<Counters, 4> counters{};

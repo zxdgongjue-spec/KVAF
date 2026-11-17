@@ -535,7 +535,11 @@ Status PeerLink::ReleaseRegion(uint64_t base) {
   if (!ReleaseRegionAt(address_, found->second, &error)) {
     return ToStatus("peer DDR release failed", std::move(error));
   }
-  regions_.erase(found);
+  const auto session_id = found->second.session_id;
+  for (auto it = regions_.begin(); it != regions_.end();) {
+    if (it->second.session_id == session_id) it = regions_.erase(it);
+    else ++it;
+  }
   return Status::OK();
 }
 
@@ -596,6 +600,44 @@ Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer region was not found");
   *region = found->second;
+  return Status::OK();
+}
+
+Status PeerLink::PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes,
+                                        PeerRegion* workspace) {
+  if (!workspace || bytes < 128U || bytes % 64U)
+    return Status::InvalidArgument("invalid Gather workspace request");
+  PeerRegion source;
+  auto status = LookupRegion(region_base, &source);
+  if (!status.ok()) return status;
+  PrepareGatherWorkspaceRequest request{};
+  request.header = MakeHeader(Command::kPrepareGatherWorkspace, sizeof(request));
+  request.session_id = source.session_id;
+  request.bytes = bytes;
+  AllocateRegionResponse response{};
+  std::string error;
+  if (!Exchange(*this, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kPrepareGatherWorkspace, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("peer Gather workspace preparation failed", std::move(error));
+  if (response.session_id != source.session_id || !response.peer_base ||
+      response.peer_length < bytes || response.peer_base > UINT64_MAX - response.peer_length ||
+      !response.token_id || !response.token_value || !response.segment_key_bytes ||
+      response.segment_key_bytes > kSegKeyBytes)
+    return Status::Internal("peer returned an invalid Gather workspace");
+  PeerRegion prepared{};
+  prepared.session_id = response.session_id;
+  prepared.base = response.peer_base;
+  prepared.length = response.peer_length;
+  prepared.token_id = response.token_id;
+  prepared.token_value = response.token_value;
+  prepared.segment_key_bytes = response.segment_key_bytes;
+  prepared.epoch = source.epoch;
+  prepared.region_id = source.region_id;
+  std::memcpy(prepared.eid.data(), response.peer_eid, prepared.eid.size());
+  std::memcpy(prepared.segment_key.data(), response.segment_key, prepared.segment_key_bytes);
+  regions_[prepared.base] = prepared;
+  *workspace = prepared;
   return Status::OK();
 }
 

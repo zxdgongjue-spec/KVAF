@@ -63,14 +63,24 @@ bool LoadUmdkKernel(const char* json_path) {
   binary = loaded;
   return true;
 }
-Status PrepareUmdkKernel(const std::string& json, bool scatter) {
-  const std::string context = "AICPU mode=" + std::string(scatter ? "cpu_push_scatter" : "gather_read") +
-                              " json=" + json;
+Status PrepareUmdkKernel(const std::string& json, UmdkKernelKind kind) {
+  const char* mode = nullptr;
+  const char* entry = nullptr;
+  switch (kind) {
+    case UmdkKernelKind::Control: mode = "control"; break;
+    case UmdkKernelKind::Put: mode = "put"; entry = "KvafAicpuBatchPut"; break;
+    case UmdkKernelKind::Gather: mode = "gather_read"; entry = "KvafAicpuGatherReadExecutionV3"; break;
+    case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV3"; break;
+    default: return Status::InvalidArgument("unknown AICPU kernel kind");
+  }
+  const std::string context = "AICPU mode=" + std::string(mode) + " json=" + json;
   if (!LoadUmdkKernel(json.c_str()))
     return Status::Internal(context + ": failed to load installed device package");
   std::lock_guard<std::mutex> lock(kernel_mutex);
-  for (const char* name : {"KvafAicpuUmdkControlSessionsV5", "KvafAicpuBatchPut",
-                          scatter ? "KvafAicpuCpuPushScatterExecutionV3" : "KvafAicpuGatherReadExecutionV3"}) {
+  // Scatter uses its Host RA transport, not the AICPU URMA control session.
+  for (const char* name : {kind == UmdkKernelKind::Scatter ? nullptr : "KvafAicpuUmdkControlSessionsV5",
+                          entry}) {
+    if (!name) continue;
     if (functions.find(name) != functions.end()) continue;
     aclrtFuncHandle function = nullptr;
     if (aclrtBinaryGetFunction(binary, name, &function) != ACL_SUCCESS || !function)

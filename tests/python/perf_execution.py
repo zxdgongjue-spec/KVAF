@@ -46,7 +46,6 @@ class BenchmarkExecution:
         self.get_config = get
         self.runtime_kwargs = dict(
             per_call_execution=True, default_put=put, default_get=get,
-            enabled_put_configs=[put], enabled_get_configs=[get],
             put_resources=[(put, kvaf.ExecutionResources(request_capacity=put_capacity))],
             get_resources=[(get, kvaf.ExecutionResources(request_capacity=get_capacity))],
         )

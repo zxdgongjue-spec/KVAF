@@ -77,7 +77,8 @@ class UrmaSession final : public execution::Session {
     std::memcpy(&header, in.data(), sizeof(header));
     const auto command = static_cast<peer::Command>(header.command);
     if ((command == peer::Command::kEnableDirectGather ||
-         command == peer::Command::kEnableGatherLanes) &&
+         command == peer::Command::kEnableGatherLanes ||
+         command == peer::Command::kPrepareGatherWorkspace) &&
         (profile_.put || profile_.algorithm != GetAlgorithm::Gather))
       return Status::InvalidArgument("session has no Gather profile");
     if ((command == peer::Command::kOpenCpuPushGet || command == peer::Command::kStartCpuPushGet ||

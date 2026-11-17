@@ -24,6 +24,7 @@ struct BatchGetTransport::Impl {
   std::uint32_t token_bytes;
   bool direct_addresses;
   RemoteRegionDesc region;
+  RemoteRegionDesc remote_workspace;
   BatchGetExecutionState execution;
   void* workspace{nullptr};
   void* control{nullptr};
@@ -103,7 +104,8 @@ GatherLaunchView BatchGetTransport::View() const {
   return {impl_->views.View(ExecutionDirection::Get),
       {impl_->session.session(), impl_->session.owner_pid()},
       {impl_->session.config().workers, impl_->token_bytes}, impl_->direct_addresses,
-      impl_->workspace, {impl_->execution.status, impl_->status_host, impl_->execution.status_bytes},
+      impl_->remote_workspace, impl_->workspace,
+      {impl_->execution.status, impl_->status_host, impl_->execution.status_bytes},
       {impl_->profile_device, impl_->profile_host, impl_->session.config().workers * sizeof(BatchGetWorkerProfile)},
       impl_->control, impl_->profiling};
 }
@@ -135,7 +137,7 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
   if (!ready.ok()) return ready;
   ready = impl_->Drain("graph_prepare");
   if (ready.ok()) ready = Warmup();
-  if (ready.ok()) ready = impl_->session.Ensure(impl_->region.base, options.output.data, options.output.bytes);
+  if (ready.ok()) ready = impl_->session.Ensure(impl_->remote_workspace.base, options.output.data, options.output.bytes);
   if (!ready.ok()) return ready;
   GatherExecutionControl control{};
   if (aclrtMemcpy(&control, sizeof(control), impl_->control, sizeof(control), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
@@ -221,6 +223,10 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
 }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
+  const auto workers = impl_->session.config().workers;
+  if (!impl_->session.config().peer_link || !impl_->token_bytes || !workers ||
+      workers > kGatherMaxWorkers)
+    return InvalidArgument("Gather requires a peer link, token size and valid worker count");
   auto& state = impl_->execution;
   state.status_bytes = impl_->session.config().workers * sizeof(GatherReadStatus);
   if (aclrtMalloc(&state.status, state.status_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
@@ -234,19 +240,21 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
     (void)Shutdown();
     return Internal("failed to allocate UMDK execution buffers");
   }
-  peer::PeerRegion registered;
-  auto found = impl_->session.config().peer_link->LookupRegion(region.base, &registered);
+  peer::PeerRegion workspace;
+  const auto workspace_bytes = GatherRemoteWorkspaceBytes(impl_->token_bytes, workers);
+  auto found = impl_->session.config().peer_link->PrepareGatherWorkspace(
+      region.base, workspace_bytes, &workspace);
   if (!found.ok()) {
     (void)Shutdown();
     return found;
   }
-  if (!impl_->token_bytes ||
-      registered.length < region.length +
-          GatherRemoteWorkspaceBytes(impl_->token_bytes, impl_->session.config().workers)) {
+  if (!workspace.base || (workspace.base & 63U) || workspace.length < workspace_bytes ||
+      workspace.base > UINT64_MAX - workspace.length) {
     (void)Shutdown();
-    return InvalidArgument("UMDK BatchGet requires reserved remote gather workspace");
+    return InvalidArgument("Gather received an invalid remote workspace");
   }
   impl_->region = region;
+  impl_->remote_workspace = {workspace.base, workspace.length, 0, DeviceKind::kCpu};
   impl_->initialized = true;
   impl_->views.Bind(impl_->invocation);
   impl_->views.Initialize(region);
@@ -265,6 +273,7 @@ Status BatchGetTransport::Shutdown() {
   impl_->workspace = impl_->status_host = nullptr;
   impl_->profile_device = impl_->profile_host = nullptr;
   impl_->execution = {};
+  impl_->remote_workspace = {};
   impl_->control = nullptr;
   *impl_->invocation = Impl::Invocation{impl_.get()};
   impl_->profiling = false;
@@ -275,10 +284,10 @@ Status BatchGetTransport::Warmup() {
   if (!impl_->initialized) return Status::NotInitialized("Gather not initialized");
   const auto workers = impl_->session.config().workers;
   auto s =
-      impl_->session.Ensure(impl_->region.base, impl_->workspace, GatherWorkspaceBytes(workers));
+      impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace, GatherWorkspaceBytes(workers));
   if (!s.ok()) return s;
   if (!impl_->cpu_enabled) {
-    const auto staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
+    const auto staging = impl_->remote_workspace.base;
     const auto controls = staging + GatherStagingBytes(impl_->token_bytes, workers) +
                           workers * GatherLaneDescriptorBytes(workers);
     s = impl_->session.config().peer_link->EnableGatherLanes(impl_->region.base, controls, workers);
@@ -326,10 +335,10 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec) {
     auto allocated = kvaf::detail::AllocateAicpuProfiles(&impl_->profile_device, &impl_->profile_host, profile_bytes);
     if (!allocated.ok()) return allocated;
   }
-  auto ready = impl_->session.Ensure(impl_->region.base, impl_->workspace,
+  auto ready = impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace,
       GatherWorkspaceBytes(impl_->session.config().workers), capturing);
   if (!ready.ok()) return ready;
-  ready = impl_->session.Ensure(impl_->region.base, exec.request->output.data,
+  ready = impl_->session.Ensure(impl_->remote_workspace.base, exec.request->output.data,
                                 exec.request->output.bytes, capturing);
   if (!ready.ok()) return ready;
   if (!impl_->cpu_enabled) {
@@ -382,7 +391,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   }
   const auto workers = view.options.workers;
   const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
-  const auto staging = (view.common.region().canonical_base + view.common.region().logical_bytes + 63U) & ~std::uint64_t{63U};
+  const auto staging = view.remote_workspace.base;
   const auto descriptors = staging + GatherStagingBytes(view.options.token_bytes, workers);
   const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers);
   auto& args = launch.gather;

@@ -34,6 +34,11 @@ class ConstructorTests(unittest.TestCase):
             NpuRuntime("", 656, 2, 7, 5, "", 2, [], False, 2048, "", [], 2048,
                        "urma", "gather_read")
 
+    def test_enable_lists_are_removed(self):
+        for name in ("enabled_put_configs", "enabled_get_configs"):
+            with self.subTest(name=name), self.assertRaises(TypeError):
+                NpuRuntime("", 656, 128, **{name: []})
+
 
 if __name__ == "__main__":
     unittest.main()

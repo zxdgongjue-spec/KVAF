@@ -277,7 +277,7 @@ class NpuPythonRuntime final {
                    std::string peer_ub_device, std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total, const std::string& transport,
                    std::string aicpu_batch_get_mode, py::object default_put, py::object default_get,
-                   py::object enabled_put, py::object enabled_get, bool per_call_execution,
+                   bool per_call_execution,
                    py::object put_resources, py::object get_resources) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
@@ -291,15 +291,12 @@ class NpuPythonRuntime final {
       options.get_resources = get_resources.cast<decltype(options.get_resources)>();
     options.per_call_execution = per_call_execution || !put_resources.is_none() ||
                                  !get_resources.is_none() || !default_put.is_none() ||
-                                 !default_get.is_none() || !enabled_put.is_none() ||
-                                 !enabled_get.is_none() || transport == "urma+ubmem";
+                                 !default_get.is_none() || transport == "urma+ubmem";
     if (options.per_call_execution) {
       options.transport_mode = transport == "ubmem" ? TransportMode::Ubmem :
           transport == "urma+ubmem" ? TransportMode::UrmaAndUbmem : TransportMode::Urma;
       if (!default_put.is_none()) options.default_put = default_put.cast<PutExecutionConfig>();
       if (!default_get.is_none()) options.default_get = default_get.cast<GetExecutionConfig>();
-      if (!enabled_put.is_none()) options.enabled_put_configs = enabled_put.cast<std::vector<PutExecutionConfig>>();
-      if (!enabled_get.is_none()) options.enabled_get_configs = enabled_get.cast<std::vector<GetExecutionConfig>>();
     }
     options.batch_put_kernel_object_path =
         std::move(batch_put_kernel_object_path);

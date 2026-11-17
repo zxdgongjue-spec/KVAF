@@ -73,6 +73,7 @@ class UmdkSession {
   aclrtStream stream_{nullptr};
   aclrtStream pending_{nullptr};
   bool connected_{false}, failed_{false};
+  bool kernel_loaded_{false};
   std::vector<std::pair<std::uint64_t, std::size_t>> registered_buffers_;
   WriteState legacy_write_;
   WriteState* write_{&legacy_write_};

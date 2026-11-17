@@ -137,6 +137,7 @@ Status CpuRuntime::ServeConnection(int fd) {
   // Match the requested response layout even when this backend is unavailable.
   switch (command) {
     case peer::Command::kAllocateRegion:
+    case peer::Command::kPrepareGatherWorkspace:
       return Reply<peer::AllocateRegionResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kGetCandidateCount:
       return Reply<peer::CandidateCountResponse>(fd, command, peer::Result::kResourceError);

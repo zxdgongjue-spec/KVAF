@@ -32,7 +32,7 @@ class ExecutionConfigTests(unittest.TestCase):
             kvaf.GetExecutionConfig("urma", "aiv", "auto")
 
     def test_reserved_algorithm_has_a_value(self):
-        # Availability is checked against the runtime's enabled provider set.
+        # Availability is checked against providers supported by the current build.
         get = kvaf.GetExecutionConfig("urma", "aiv", "scatter")
         self.assertEqual(get.algorithm, "scatter")
 

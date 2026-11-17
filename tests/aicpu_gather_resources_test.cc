@@ -10,8 +10,12 @@
 #define CHECK(c) do { if (!(c)) { std::cerr << "line " << __LINE__ << ": " #c "\n"; std::abort(); } } while (false)
 namespace {
 int allocations = 0, registrations = 0, launches = 0, enables = 0;
+int workspace_prepares = 0;
 int sync_copies = 0, async_copies = 0;
 bool fail_sync = false, capturing = false;
+bool fail_workspace = false, short_workspace = false;
+constexpr uint64_t source_base = 0x100000, source_bytes = 4096;
+constexpr uint64_t workspace_base = 0x50000000;
 std::set<void*> registered;
 kvaf::aicpu_urma::UmdkBatchGetArgs captured_args{};
 std::set<void*> buffers;
@@ -42,19 +46,41 @@ const char* aclGetRecentErrMsg() { return "fake"; }
 }
 namespace kvaf::peer {
 PeerLink::PeerLink(std::string address) : address_(std::move(address)) {}
-Status PeerLink::LookupRegion(uint64_t, PeerRegion* region) const {
-  region->length = 128ULL * 1024 * 1024; return Status::OK();
+Status PeerLink::LookupRegion(uint64_t base, PeerRegion* region) const {
+  CHECK(base == source_base);
+  // The cache pool has exactly its logical capacity: no reserved Gather tail.
+  region->base = source_base; region->length = source_bytes; return Status::OK();
 }
-Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const { ++enables; return Status::OK(); }
+Status PeerLink::PrepareGatherWorkspace(uint64_t base, uint64_t bytes, PeerRegion* region) {
+  CHECK(base == source_base && !capturing);
+  CHECK(bytes == GatherRemoteWorkspaceBytes(16, 2));
+  ++workspace_prepares;
+  if (fail_workspace) return Status::Internal("workspace allocation failed");
+  region->base = workspace_base;
+  region->length = bytes - (short_workspace ? 1 : 0);
+  region->session_id = 1;
+  return Status::OK();
+}
+Status PeerLink::EnableGatherLanes(uint64_t base, uint64_t controls, uint32_t workers) const {
+  CHECK(base == source_base && workers == 2);
+  CHECK(controls == workspace_base + GatherStagingBytes(16, workers) +
+                    workers * GatherLaneDescriptorBytes(workers));
+  ++enables; return Status::OK();
+}
 }
 namespace kvaf::aicpu_urma {
 // Session registration is a counted resource service. The real Gather host
 // algorithm below must not invoke it or allocate memory during prepared Launch.
-Status UmdkSession::Ensure(std::uint64_t, void* address, std::size_t, bool prepared_only) {
+Status UmdkSession::Ensure(std::uint64_t remote, void* address, std::size_t, bool prepared_only) {
+  CHECK(remote == workspace_base);
   if (prepared_only && !registered.count(address)) return Status::InvalidState("not prepared");
   registered.insert(address); ++registrations; return Status::OK();
 }
 int32_t LaunchBatchGet(const UmdkBatchGetArgs* args, aclrtStream) {
+  CHECK(args->request.canonical_base == source_base && args->request.logical_bytes == source_bytes);
+  CHECK(args->gather.remote_staging == workspace_base);
+  CHECK(args->gather.remote_descriptor == workspace_base + GatherStagingBytes(16, 2));
+  CHECK(args->gather.remote_notify == args->gather.remote_descriptor + 2 * GatherLaneDescriptorBytes(2));
   ++launches;
   if (capturing) { captured_args = *args; return 0; }
   auto* statuses = reinterpret_cast<GatherReadStatus*>(args->gather.core_status);
@@ -78,7 +104,11 @@ int main() {
   config.peer_link = std::make_shared<PeerLink>("fake:0"); config.workers = 2;
   UmdkSession session(config);
   BatchGetTransport gather(session, 16);
+  CHECK(workspace_prepares == 0);
   CHECK(gather.Initialize({0x100000, 4096, 16, DeviceKind::kCpu}).ok());
+  CHECK(workspace_prepares == 1);
+  CHECK(gather.View().remote_workspace.base == workspace_base);
+  CHECK(gather.View().remote_workspace.length == GatherRemoteWorkspaceBytes(16, 2));
   auto state = gather.CreateExecutionState();
   CHECK(gather.BindExecutionState(state.get()).ok());
   uint64_t address = 0x100000;
@@ -137,6 +167,7 @@ int main() {
   CHECK(gather.Prepare(call).ok());
   CHECK(gather.ExecutePrepared(call).ok() && launches == 5);
   CHECK(allocations == capture_allocations);
+  CHECK(workspace_prepares == 1); // Capture uses the existing remote registration.
   CHECK(!gather.Drain().ok());
   CHECK(!gather.Check(call.execution.stream).ok());
   capturing = false;
@@ -170,6 +201,7 @@ int main() {
   call.execution.synchronize = false;
   GetGraphOptions options{request.output, call.execution.stream, 1};
   CHECK(graph_get.PrepareGraph(options).ok());
+  const auto graph_workspace_prepares = workspace_prepares;
   CHECK(!graph_get.PrepareGraph(options).ok());
   capturing = true;
   CHECK(graph_get.Execute(call).ok());
@@ -202,5 +234,18 @@ int main() {
   reinterpret_cast<GatherExecutionControl*>(captured_args.gather.execution_control)->failed = 1;
   CHECK(!graph_get.FinishGraph(call.execution.stream, true).ok());
   CHECK(graph_get.Shutdown().ok() && buffers.empty());
+  CHECK(workspace_prepares == graph_workspace_prepares);
+  // A failed first use must release partial local storage and remain retryable.
+  BatchGetTransport retry(session, 16);
+  fail_workspace = true;
+  CHECK(!retry.Initialize({source_base, source_bytes, 16, DeviceKind::kCpu}).ok());
+  CHECK(buffers.empty());
+  fail_workspace = false;
+  short_workspace = true;
+  CHECK(!retry.Initialize({source_base, source_bytes, 16, DeviceKind::kCpu}).ok());
+  CHECK(buffers.empty());
+  short_workspace = false;
+  CHECK(retry.Initialize({source_base, source_bytes, 16, DeviceKind::kCpu}).ok());
+  CHECK(retry.Shutdown().ok() && buffers.empty());
   std::cout << "Gather preparation, typed invocation and allocation-free launch passed\n";
 }

@@ -53,6 +53,25 @@ struct Backend : Session {
     ++c.calls;
     peer::MessageHeader header{};
     std::memcpy(&header, request.data(), sizeof(header));
+    if (header.command == static_cast<std::uint16_t>(peer::Command::kPrepareGatherWorkspace)) {
+      CHECK(request.size() == sizeof(peer::PrepareGatherWorkspaceRequest));
+      peer::PrepareGatherWorkspaceRequest prepared{};
+      std::memcpy(&prepared, request.data(), sizeof(prepared));
+      CHECK(prepared.session_id == 1 && prepared.bytes == 8192);
+      peer::AllocateRegionResponse response{};
+      response.header = peer::MakeHeader(peer::Command::kPrepareGatherWorkspace, sizeof(response));
+      response.header.command = peer::ResponseCommand(peer::Command::kPrepareGatherWorkspace);
+      response.session_id = prepared.session_id;
+      response.peer_base = 0x30000;
+      response.peer_length = prepared.bytes;
+      response.token_id = 7;
+      response.token_value = 2;
+      response.segment_key_bytes = 8;
+      response.segment_key[0] = 13;
+      const auto* begin = reinterpret_cast<const std::uint8_t*>(&response);
+      out->assign(begin, begin + sizeof(response));
+      return Status::OK();
+    }
     peer::StatusResponse response{};
     response.header =
         peer::MakeHeader(static_cast<peer::Command>(header.command), sizeof(response));
@@ -165,11 +184,20 @@ int main() {
   CHECK(!session->StartCpuPushGet(region.base).ok());
   CHECK(session->ResolveExecutionControl().ok() && server.count.calls == 2);
   CHECK(session->StopCpuPushGet(region.base).ok() && server.count.calls == 3);
+  peer::PeerRegion workspace, cached;
+  server.drop_call = true;
+  CHECK(!session->PrepareGatherWorkspace(region.base, 8192, &workspace).ok());
+  CHECK(session->PrepareGatherWorkspace(region.base, 8192, &workspace).ok());
+  CHECK(server.count.calls == 4 && server.count.allocations == 1);
+  CHECK(workspace.base == 0x30000 && workspace.length == 8192 && workspace.session_id == binding.session_id);
+  CHECK(session->LookupRegion(workspace.base, &cached).ok() && cached.token_id == 7 &&
+        cached.segment_key[0] == 13 && cached.region_id == binding.region_id && cached.epoch == binding.epoch);
   CHECK(root->ReleaseRegion(region.base).code() ==
         StatusCode::kCompletionUnknown);  // dropped Busy response
   CHECK(root->ReleaseRegion(region.base).code() == StatusCode::kBusy);
   CHECK(session->CloseExecution().code() == StatusCode::kCompletionUnknown);
   CHECK(session->CloseExecution().ok() && server.count.closed == 1);
+  CHECK(!session->LookupRegion(workspace.base, &cached).ok());
   CHECK(root->ReleaseRegion(region.base).ok() && server.count.freed == 1);
   std::cout << "lost create/control/close replies recovered with original IDs; no duplicate "
                "allocation or worker\n";

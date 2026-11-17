@@ -31,6 +31,7 @@ enum class Command : uint16_t {
   kOpenCpuPushGet = 11U,
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
+  kPrepareGatherWorkspace = 14U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
@@ -96,6 +97,15 @@ struct AllocateRegionResponse {
   uint32_t token_value;
   uint8_t peer_eid[kEidBytes];
   uint8_t segment_key[kSegKeyBytes];
+};
+
+// The workspace belongs to this session; its registration is independent of
+// the cache allocation. Replies use AllocateRegionResponse with the same
+// session_id and the workspace's registered base/length/key.
+struct PrepareGatherWorkspaceRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t bytes;
 };
 
 struct CreateChannelRequest {
@@ -190,6 +200,7 @@ static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
+static_assert(sizeof(PrepareGatherWorkspaceRequest) == 28U, "Gather workspace request ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");

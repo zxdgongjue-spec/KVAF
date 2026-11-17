@@ -118,11 +118,6 @@ Status ExecutionDispatcher::Initialize(const RemoteRegionDesc& region) {
   std::unique_lock<std::shared_mutex> lock(lifecycle_);
   if (!policy_status_.ok()) return policy_status_;
   if (ready_ || region_.base) return Status::InvalidState("dispatcher requires shutdown before initialize");
-  for (auto c : *policy_.enabled_put_configs)
-    if (!resources_.Contains(c)) return Status::NotImplemented("enabled Put provider is not built or registered");
-  for (auto c : *policy_.enabled_get_configs)
-    if (!resources_.Contains(c))
-      return Status::NotImplemented("enabled Get provider is not built or registered (AIV Gather/Scatter reserved)");
   auto s = resources_.Initialize(region);
   if (s.ok()) { region_ = region; ready_ = true; }
   return s;

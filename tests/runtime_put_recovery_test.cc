@@ -146,8 +146,6 @@ class Provider final : public AccessOperator {
 
 ExecutionPolicy Policy() {
   ExecutionPolicy policy;
-  policy.enabled_put_configs = std::vector<PutExecutionConfig>{put, other};
-  policy.enabled_get_configs = std::vector<GetExecutionConfig>{};
   return policy;
 }
 

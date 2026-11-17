@@ -44,6 +44,8 @@ int main() {
   CHECK(runtime.Initialize(options).ok());  // No backend is eagerly loaded.
   Exchange<AllocateRegionRequest, AllocateRegionResponse>(
       runtime, Command::kAllocateRegion, Result::kResourceError);
+  Exchange<PrepareGatherWorkspaceRequest, AllocateRegionResponse>(
+      runtime, Command::kPrepareGatherWorkspace, Result::kResourceError);
   Exchange<CandidateCountRequest, CandidateCountResponse>(
       runtime, Command::kGetCandidateCount, Result::kResourceError);
   Exchange<CandidateInfoRequest, CandidateInfoResponse>(

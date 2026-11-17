@@ -141,13 +141,16 @@ Status UmdkSession::ReleaseBuffer(void* buffer, std::size_t bytes) {
 }
 
 Status UmdkSession::Load() {
+  if (kernel_loaded_) return Status::OK();
   if (!config_.peer_link || config_.kernel_json.empty() || !config_.workers ||
       config_.workers > 8U ||
       (config_.queue_profile != UmdkQueueProfile::Gather && config_.queue_profile != UmdkQueueProfile::Put) ||
-      std::all_of(config_.local_eid.begin(), config_.local_eid.end(), [](auto b) { return b == 0; }) ||
-      !PrepareUmdkKernel(config_.kernel_json, false).ok())
+      std::all_of(config_.local_eid.begin(), config_.local_eid.end(), [](auto b) { return b == 0; }))
     return Status::InvalidArgument("UMDK requires PeerLink, kernel JSON, Host-selected EID and 1..8 workers");
-  return Status::OK();
+  auto ready = PrepareUmdkKernel(config_.kernel_json,
+      config_.queue_profile == UmdkQueueProfile::Put ? UmdkKernelKind::Put : UmdkKernelKind::Gather);
+  if (ready.ok()) kernel_loaded_ = true;
+  return ready;
 }
 
 Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t output_bytes,

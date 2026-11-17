@@ -39,9 +39,12 @@ class CpuGatherExecutor {
  public:
   CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
                 std::size_t min_bytes_per_thread = 256U * 1024U,
-                GatherWaitMode wait_mode = GatherWaitMode::kPassive)
+                GatherWaitMode wait_mode = GatherWaitMode::kPassive,
+                void* workspace_memory = nullptr, std::uint64_t workspace_base = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)),
         base_(base),
+        workspace_memory_(static_cast<std::uint8_t*>(workspace_memory ? workspace_memory : memory)),
+        workspace_base_(workspace_memory ? workspace_base : base),
         max_threads_(std::max<std::size_t>(1U, max_threads)),
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
         wait_mode_(wait_mode) {}
@@ -75,7 +78,7 @@ class CpuGatherExecutor {
     }
     spans_ = spans;
     span_count_ = span_count;
-    staging_ = memory_ + (staging - base_);
+    staging_ = workspace_memory_ + (staging - workspace_base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     phase_.store(0U, std::memory_order_release);
@@ -101,6 +104,10 @@ class CpuGatherExecutor {
 
   std::uint8_t* memory_;
   std::uint64_t base_;
+  // Source addresses remain cache-canonical; descriptor/staging addresses are
+  // relative to the independently registered Gather workspace.
+  std::uint8_t* workspace_memory_;
+  std::uint64_t workspace_base_;
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;
   GatherWaitMode wait_mode_;

@@ -395,11 +395,15 @@ class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
                   std::size_t threads, std::size_t min_bytes,
-                  CpuGatherMode mode, uint64_t control_address = 0U)
-      : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
+                  CpuGatherMode mode, uint64_t control_address = 0U,
+                  void* workspace_memory = nullptr, uint64_t workspace_base = 0U,
+                  uint64_t workspace_bytes = 0U)
+      : memory_(static_cast<std::uint8_t*>(workspace_memory ? workspace_memory : memory)),
+        base_(workspace_memory ? workspace_base : base),
+        bytes_(workspace_memory ? workspace_bytes : bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
-            (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
-        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode)), mode_(mode) {
+            (control_address ? control_address - base_ : peer::GatherControlOffset(bytes_)))),
+        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), memory_, base_), mode_(mode) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -453,6 +457,12 @@ class CpuGatherWorker {
   std::thread worker_;
 };
 
+struct GatherWorkspace {
+  void* memory = nullptr;
+  uint64_t bytes = 0U, base = 0U;
+  std::unique_ptr<CpuDdrRegistration> registration;
+};
+
 struct Region {
   uint64_t id = 0U;
   uint32_t candidate_id = 0U;
@@ -463,6 +473,7 @@ struct Region {
   uint64_t base = 0U;
   std::shared_ptr<CpuDdrRegistration> registration;
   bool shared_registration{false};
+  std::unique_ptr<GatherWorkspace> gather_workspace;
   std::vector<Channel> channels;
   std::unique_ptr<CpuGatherWorker> gather;
   std::vector<std::unique_ptr<CpuGatherWorker>> gather_lanes;
@@ -537,7 +548,7 @@ class CpuService {
     region->bytes = bytes;
     region->borrowed = borrowed != nullptr;
     region->memory = borrowed;
-    if (!borrowed && !AllocateMemory(region.get())) {
+    if (!borrowed && !AllocateMemory(&region->memory, region->bytes)) {
       return Result::kResourceError;
     }
     region->bytes = bytes;
@@ -582,6 +593,58 @@ class CpuService {
         "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
         response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, MemoryPageModeName());
+    return Result::kOk;
+  }
+
+  Result PrepareGatherWorkspace(uint64_t session_id, uint64_t bytes,
+                                AllocateRegionResponse* response) {
+    const auto found = regions_.find(session_id);
+    if (found == regions_.end()) return Result::kNotFound;
+    auto& region = *found->second;
+    if (!response || bytes < 128U || bytes % 64U ||
+        bytes > std::numeric_limits<std::size_t>::max())
+      return Result::kInvalidRequest;
+    if (region.push) return Result::kInvalidRequest;
+    if (!region.gather_workspace) {
+      // Never move a running legacy worker's descriptor/control addresses.
+      if (region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
+      region.gather_workspace = std::make_unique<GatherWorkspace>();
+      region.gather_workspace->bytes = bytes;
+    }
+    auto& workspace = *region.gather_workspace;
+    if (bytes > workspace.bytes) return Result::kInvalidRequest;
+    if (!workspace.memory && !AllocateMemory(&workspace.memory, workspace.bytes))
+      return Result::kResourceError;
+    if (!workspace.base) {
+      // A failed registration can retain a token. Retire it before retrying,
+      // keeping its memory and context alive if retirement itself fails.
+      if (workspace.registration && !workspace.registration->Close().ok())
+        return Result::kResourceError;
+      workspace.registration = std::make_unique<CpuDdrRegistration>();
+      auto status = workspace.registration->Register(region.resources->context(), workspace.memory,
+          workspace.bytes, region.registration->token_value());
+      if (!status.ok()) {
+        Log("[KVAF_CPU] GATHER_WORKSPACE_PREPARE_FAILED session=%" PRIu64 " error=%s\n",
+            session_id, status.message().c_str());
+        return Result::kResourceError;
+      }
+      const auto descriptor = workspace.registration->Describe(session_id);
+      if (!descriptor.registered_address || !descriptor.token_id) return Result::kResourceError;
+      workspace.base = descriptor.registered_address;
+      std::memset(static_cast<std::uint8_t*>(workspace.memory) +
+                      peer::GatherControlOffset(workspace.bytes), 0, 64U);
+      Log("[KVAF_CPU] GATHER_WORKSPACE_READY session=%" PRIu64 " bytes=%" PRIu64
+          " base=0x%" PRIx64 "\n", session_id, workspace.bytes, workspace.base);
+    }
+    const auto descriptor = workspace.registration->Describe(session_id);
+    response->session_id = session_id;
+    response->peer_base = workspace.base;
+    response->peer_length = workspace.bytes;
+    response->token_id = descriptor.token_id;
+    response->token_value = descriptor.token_value;
+    response->segment_key_bytes = descriptor.key_bytes;
+    std::memcpy(response->peer_eid, descriptor.eid.data(), kEidBytes);
+    std::memcpy(response->segment_key, descriptor.key.data(), descriptor.key_bytes);
     return Result::kOk;
   }
 
@@ -685,9 +748,13 @@ class CpuService {
     Region& region = *found->second;
     if (region.push || region.gather != nullptr || !region.gather_lanes.empty()) return Result::kResourceError;
     try {
+      const auto* workspace = region.gather_workspace.get();
+      if (workspace && !workspace->base) return Result::kResourceError;
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_mode_);
+          min_bytes_per_thread_, gather_mode_, 0U,
+          workspace ? workspace->memory : nullptr, workspace ? workspace->base : 0U,
+          workspace ? workspace->bytes : 0U);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -699,8 +766,12 @@ class CpuService {
     const auto found = regions_.find(session_id);
     if (found == regions_.end()) return Result::kNotFound;
     auto& region = *found->second;
+    const auto* workspace = region.gather_workspace.get();
+    if (workspace && !workspace->base) return Result::kResourceError;
+    const auto workspace_base = workspace ? workspace->base : region.base;
+    const auto workspace_bytes = workspace ? workspace->bytes : region.bytes;
     if (!lanes || lanes > kGatherMaxWorkers || lanes > gather_threads_ || control_address % 64U ||
-        !peer::GatherRange(region.base, peer::GatherControlOffset(region.bytes), control_address,
+        !peer::GatherRange(workspace_base, peer::GatherControlOffset(workspace_bytes), control_address,
                            lanes * sizeof(peer::GatherControl)))
       return Result::kInvalidRequest;
     if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
@@ -710,7 +781,8 @@ class CpuService {
         const auto budget = gather_threads_ / lanes + (lane < gather_threads_ % lanes ? 1U : 0U);
         created.push_back(std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
-            gather_mode_, control_address + lane * sizeof(peer::GatherControl)));
+            gather_mode_, control_address + lane * sizeof(peer::GatherControl),
+            workspace ? workspace->memory : nullptr, workspace_base, workspace_bytes));
       }
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_LANE_SETUP_FAILED reason=%s\n", error.what());
@@ -784,36 +856,36 @@ class CpuService {
     return "unknown";
   }
 
-  bool AllocateMemory(Region* region) {
-    if (region == nullptr || region->bytes == 0U ||
-        region->bytes > std::numeric_limits<std::size_t>::max()) {
+  bool AllocateMemory(void** memory, uint64_t requested_bytes) {
+    if (memory == nullptr || requested_bytes == 0U ||
+        requested_bytes > std::numeric_limits<std::size_t>::max()) {
       return false;
     }
-    const std::size_t bytes = static_cast<std::size_t>(region->bytes);
+    const std::size_t bytes = static_cast<std::size_t>(requested_bytes);
     const std::size_t alignment =
         memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
             ? kHugePage2MBytes
             : kBasePageBytes;
-    const int allocation_status = posix_memalign(&region->memory, alignment, bytes);
-    if (allocation_status != 0 || region->memory == nullptr) {
+    const int allocation_status = posix_memalign(memory, alignment, bytes);
+    if (allocation_status != 0 || *memory == nullptr) {
       Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
           " alignment=%zu status=%d memory=%p page_mode=%s\n",
-          region->bytes, alignment, allocation_status, region->memory,
+          requested_bytes, alignment, allocation_status, *memory,
           MemoryPageModeName());
       return false;
     }
     if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
-      if (madvise(region->memory, bytes, MADV_HUGEPAGE) != 0) {
+      if (madvise(*memory, bytes, MADV_HUGEPAGE) != 0) {
         Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
             " errno=%d\n",
-            region->bytes, errno);
-        free(region->memory);
-        region->memory = nullptr;
+            requested_bytes, errno);
+        free(*memory);
+        *memory = nullptr;
         return false;
       }
       // Fault the range while huge-page advice is active. Launching the service
       // under a NUMA memory policy makes placement deterministic as well.
-      std::memset(region->memory, 0, bytes);
+      std::memset(*memory, 0, bytes);
     }
     return true;
   }
@@ -922,6 +994,13 @@ class CpuService {
       if (!region->channels.back().Close()) return false;
       region->channels.pop_back();
     }
+    if (region->gather_workspace) {
+      auto& workspace = *region->gather_workspace;
+      if (workspace.registration && !workspace.registration->Close().ok()) return false;
+      workspace.registration.reset();
+      free(workspace.memory);
+      region->gather_workspace.reset();
+    }
     if (region->registration) {
       if (!region->shared_registration && !region->registration->Close().ok()) return false;
       region->registration.reset();
@@ -1001,6 +1080,21 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       response.header.command = ResponseCommand(command);
       response.result = static_cast<int32_t>(
           service->Allocate(request.ddr_bytes, request.slot_size, request.candidate_id, &response));
+      (void)WriteAll(fd, &response, sizeof(response));
+      return;
+    }
+    case Command::kPrepareGatherWorkspace: {
+      peer::PrepareGatherWorkspaceRequest request{};
+      request.header = header;
+      AllocateRegionResponse response{};
+      response.header = MakeHeader(command, sizeof(response));
+      response.header.command = ResponseCommand(command);
+      response.result = static_cast<int32_t>(Result::kInvalidRequest);
+      if (IsValidHeader(header, command, sizeof(request)) &&
+          ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
+                  sizeof(request) - sizeof(header)))
+        response.result = static_cast<int32_t>(
+            service->PrepareGatherWorkspace(request.session_id, request.bytes, &response));
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
@@ -1217,6 +1311,7 @@ Status UrmaCpuBackend::Call(const std::vector<std::uint8_t>& input,
     case Command::kCreateChannel:
     case Command::kEnableDirectGather:
     case Command::kEnableGatherLanes:
+    case Command::kPrepareGatherWorkspace:
     case Command::kOpenCpuPushGet:
     case Command::kStartCpuPushGet:
     case Command::kStopCpuPushGet:

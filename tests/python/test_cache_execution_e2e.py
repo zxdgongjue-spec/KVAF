@@ -215,8 +215,6 @@ class Suite:
                 transport=self.mode, per_call_execution=True,
                 npu_eids=parse_npu_eids(self.a.npu_eids), peer_ub_device=self.a.peer_ub_device,
                 default_put=self.puts[0].config(self.k), default_get=self.gets[0].config(self.k),
-                enabled_put_configs=[p.config(self.k) for p in self.puts],
-                enabled_get_configs=[g.config(self.k) for g in self.gets],
                 put_resources=[(p.config(self.k), budget(p)) for p in self.puts],
                 get_resources=[(g.config(self.k), budget(g)) for g in self.gets])
             self.runtime.link_to(self.a.peer)
@@ -384,10 +382,11 @@ class Suite:
                     buffers = self.buffers(epoch=4)
                     self.get(data, r if r.algorithm else self.gets[0], buffers, synchronize=True)
                     self.verify(data, buffers)
-            with self.case("resources/disabled-get"):
-                disabled = Route("urma", "aiv", "gather")
+            with self.case("resources/unavailable-get"):
+                unavailable = Route("urma", "aiv", "gather")
                 buffers = self.buffers()
-                expect_error(lambda: self.get(data, disabled, buffers), ValueError, "not enabled")
+                expect_error(lambda: self.get(data, unavailable, buffers),
+                             (ValueError, RuntimeError), "transport|provider|implemented")
                 self.runtime.drain_get()
 
         self.output_binding()

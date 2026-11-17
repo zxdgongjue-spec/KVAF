@@ -42,8 +42,6 @@ struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};
   std::optional<PutExecutionConfig> default_put;
   std::optional<GetExecutionConfig> default_get;
-  std::optional<std::vector<PutExecutionConfig>> enabled_put_configs;
-  std::optional<std::vector<GetExecutionConfig>> enabled_get_configs;
 };
 // Target registry, independent of build capabilities. Reserved AIV algorithms
 // are valid configurations but have no provider until their kernels merge.

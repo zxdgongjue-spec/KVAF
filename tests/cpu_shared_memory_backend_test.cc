@@ -1,4 +1,5 @@
 #include "cpu_service/backends/cpu_backends.h"
+#include "cpu_gather_executor.h"
 #include <urma_api.h>
 #include <atomic>
 #include <cstring>
@@ -16,7 +17,8 @@ std::mutex driver;
 std::set<urma_context_t*> contexts;
 std::map<urma_target_seg_t*, urma_context_t*> segments;
 std::set<urma_jetty_t*> jettys;
-bool fail_unregister{}, fail_delete_jetty{}, fail_delete_context{};
+bool fail_unregister{}, fail_register{}, fail_delete_jetty{}, fail_delete_context{};
+unsigned live_tokens{};
 urma_device_t device;
 urma_eid_info_t eids[2];
 }
@@ -41,11 +43,12 @@ urma_status_t urma_delete_context(urma_context_t* context) {
   CHECK(contexts.erase(context) == 1); ++contexts_deleted; delete context; return URMA_SUCCESS;
 }
 urma_token_id_t* urma_alloc_token_id(urma_context_t*) {
-  auto* token = new urma_token_id_t{}; token->token_id = next_id++; return token;
+  auto* token = new urma_token_id_t{}; token->token_id = next_id++; ++live_tokens; return token;
 }
-urma_status_t urma_free_token_id(urma_token_id_t* token) { delete token; return URMA_SUCCESS; }
+urma_status_t urma_free_token_id(urma_token_id_t* token) { --live_tokens; delete token; return URMA_SUCCESS; }
 urma_target_seg_t* urma_register_seg(urma_context_t* context, urma_seg_cfg_t* config) {
   std::lock_guard<std::mutex> lock(driver); CHECK(contexts.count(context));
+  if (fail_register) return nullptr;
   auto* segment = new urma_target_seg_t{};
   segment->seg.ubva.va = config->va + 0x1000;
   segment->seg.ubva.eid = context->eid;
@@ -103,6 +106,126 @@ std::uint32_t Channel(kvaf::UrmaCpuBackend& backend, const kvaf::peer::PeerRegio
   std::memcpy(&jetty, result.peer_qp_key, sizeof(jetty));
   return jetty.id;
 }
+
+template <typename Response, typename Request>
+Response Call(kvaf::UrmaCpuBackend& backend, const Request& request) {
+  const auto* data = reinterpret_cast<const std::uint8_t*>(&request);
+  std::vector<std::uint8_t> response;
+  CHECK(backend.Call({data, data + sizeof(request)}, &response).ok());
+  CHECK(response.size() == sizeof(Response));
+  Response result{};
+  std::memcpy(&result, response.data(), sizeof(result));
+  CHECK(result.header.command == (request.header.command | 0x8000));
+  return result;
+}
+
+void LazyGatherWorkspace() {
+  using namespace kvaf;
+  using namespace kvaf::peer;
+  alignas(64) std::uint8_t memory[4096];
+  for (std::size_t i = 0; i < sizeof(memory); ++i) memory[i] = i % 251;
+  std::vector<std::uint8_t> source_snapshot(memory, memory + sizeof(memory));
+  CpuRuntimeOptions options;
+  options.memory_page_mode = CpuMemoryPageMode::kDefault;
+  options.gather_threads = 2;
+  auto pool = std::make_shared<CpuUrmaMemoryPool>(options, memory, sizeof(memory), 123, 999);
+  UrmaCpuBackend backend;
+  std::uint64_t next_session = 1;
+  CHECK(backend.Initialize(options, next_session, pool).ok());
+  PeerRegion source;
+  const auto old_registered = registered.load();
+  const auto old_contexts = contexts_created.load();
+  CHECK(backend.AttachRegion(memory, sizeof(memory), 1, 0, &source).ok());
+  CHECK(registered == old_registered + 1 && contexts_created == old_contexts + 1);
+  PrepareGatherWorkspaceRequest prepare{};
+  prepare.header = MakeHeader(Command::kPrepareGatherWorkspace, sizeof(prepare));
+  prepare.session_id = source.session_id;
+  prepare.bytes = 4096;
+  fail_register = true;
+  CHECK(Call<AllocateRegionResponse>(backend, prepare).result == int(Result::kResourceError));
+  CHECK(live_tokens == 2);  // Source and the failed workspace registration token.
+  fail_register = false;
+  const auto workspace = Call<AllocateRegionResponse>(backend, prepare);
+  CHECK(workspace.result == int(Result::kOk));
+  CHECK(workspace.session_id == source.session_id && workspace.peer_base != source.base);
+  CHECK(workspace.token_id != source.token_id && workspace.token_value == source.token_value);
+  CHECK(live_tokens == 2 && registered == old_registered + 2 && contexts_created == old_contexts + 1);
+  prepare.bytes = 2048;
+  const auto reused = Call<AllocateRegionResponse>(backend, prepare);
+  CHECK(reused.peer_base == workspace.peer_base && reused.peer_length == 4096 &&
+        reused.token_id == workspace.token_id && registered == old_registered + 2);
+  prepare.bytes = 8192;
+  CHECK(Call<AllocateRegionResponse>(backend, prepare).result == int(Result::kInvalidRequest));
+  PeerRegion workspace_binding;
+  workspace_binding.session_id = workspace.session_id;
+  workspace_binding.token_value = workspace.token_value;
+  CHECK(Channel(backend, workspace_binding) != 0);
+
+  // Stub registrations intentionally translate addresses by 4 KiB. Source
+  // spans still use the allocation's canonical address, while every command,
+  // descriptor and staging address uses the workspace's registered address.
+  auto* workspace_memory = reinterpret_cast<std::uint8_t*>(workspace.peer_base - 0x1000);
+  auto* header = reinterpret_cast<GatherDescriptorHeader*>(workspace_memory);
+  auto* spans = reinterpret_cast<GatherSpan*>(workspace_memory + sizeof(*header));
+  auto* control = reinterpret_cast<GatherControl*>(workspace_memory + 4096 - 128);
+  EnableGatherLanesRequest enable{};
+  enable.header = MakeHeader(Command::kEnableGatherLanes, sizeof(enable));
+  enable.session_id = source.session_id;
+  enable.control_address = workspace.peer_base + 4096 - 128;
+  enable.lanes = 1;
+  CHECK(Call<StatusResponse>(backend, enable).result == int(Result::kOk));
+  for (std::uint64_t sequence = 1; sequence <= 2; ++sequence) {
+    *header = {};
+    header->magic = kGatherDescriptorMagic;
+    header->sequence = sequence;
+    header->span_count = 4;
+    header->span_bytes = sequence == 1 ? 64 : 0;
+    header->total_bytes = 256;
+    header->staging_address = workspace.peer_base + 512;
+    header->pipeline_chunk_bytes = sequence == 1 ? 128 : 0;
+    for (unsigned i = 0; i < 4; ++i) {
+      spans[i].address = reinterpret_cast<std::uint64_t>(memory) + i * 128;
+      spans[i].length = 64;
+    }
+    __atomic_store_n(&control->command, workspace.peer_base, __ATOMIC_RELEASE);
+    __atomic_store_n(&control->notify, sequence, __ATOMIC_RELEASE);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (__atomic_load_n(&control->ack, __ATOMIC_ACQUIRE) != sequence) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::yield();
+    }
+    for (unsigned i = 0; i < 4; ++i)
+      CHECK(std::memcmp(workspace_memory + 512 + i * 64, memory + i * 128, 64) == 0);
+    CHECK(std::memcmp(memory, source_snapshot.data(), sizeof(memory)) == 0);
+  }
+  prepare.bytes = 4096;
+  CHECK(Call<AllocateRegionResponse>(backend, prepare).peer_base == workspace.peer_base);
+  fail_delete_jetty = true;
+  CHECK(!backend.Shutdown().ok() && segments.size() == 2 && live_tokens == 2);
+  fail_delete_jetty = false;
+  fail_unregister = true;
+  CHECK(!backend.Shutdown().ok() && jettys.empty() && segments.size() == 2 && live_tokens == 2);
+  fail_unregister = false;
+  CHECK(backend.Shutdown().ok() && segments.size() == 1 && live_tokens == 1);
+  CHECK(pool->Close().ok() && segments.empty() && contexts.empty() && live_tokens == 0);
+
+  // Existing same-region descriptors retain their original interpretation.
+  alignas(64) std::uint8_t legacy[1024]{};
+  const std::uint64_t base = 0x100000;
+  auto* legacy_header = reinterpret_cast<GatherDescriptorHeader*>(legacy);
+  legacy_header->magic = kGatherDescriptorMagic;
+  legacy_header->sequence = 1;
+  legacy_header->span_count = 1;
+  legacy_header->span_bytes = legacy_header->total_bytes = 64;
+  legacy_header->staging_address = base + 512;
+  auto* legacy_span = reinterpret_cast<GatherSpan*>(legacy + sizeof(*legacy_header));
+  legacy_span->address = base + 256;
+  std::memset(legacy + 256, 0x42, 64);
+  CpuGatherExecutor executor(legacy, base, 1);
+  CHECK(executor.PrepareDirect(sizeof(legacy), base, 1, 1) == 1);
+  executor.Copy();
+  CHECK(std::memcmp(legacy + 256, legacy + 512, 64) == 0);
+}
 int main() {
   using namespace kvaf;
   device.type = URMA_TRANSPORT_UB; std::strcpy(device.name, "test_ub");
@@ -144,5 +267,7 @@ int main() {
   CHECK(put.Initialize(options, put_id, pool).ok());
   CHECK(put.AttachRegion(memory, sizeof(memory), 1, 0, &p).ok() && registered == 3);
   CHECK(put.Shutdown().ok() && pool->Close().ok());
+  CHECK(live_tokens == 0);
+  LazyGatherWorkspace();
   std::cout << "CPU shared context/DDR with independent execution queues passed\n";
 }

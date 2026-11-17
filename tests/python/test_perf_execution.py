@@ -112,7 +112,7 @@ class ExecutionTests(unittest.TestCase):
                             self.assertNotIn("per_call_execution", constructor)
                             self.assertEqual(runtime.batch_put.call_args.kwargs, {})
                         else:
-                            self.assertEqual(constructor["enabled_put_configs"], [(transport, executor)])
+                            self.assertEqual(constructor["default_put"], (transport, executor))
                             expected = {"execution": (transport, executor)}
                             if transport == "urma":
                                 expected["input_lease"] = 19
@@ -134,7 +134,7 @@ class ExecutionTests(unittest.TestCase):
         add_execution_mode(parser)
         self.assertEqual(parser.parse_args([]).execution_mode, "legacy")
 
-    def test_per_call_enables_only_the_requested_providers_and_capacities(self):
+    def test_per_call_sets_defaults_and_capacities_without_an_enable_list(self):
         api = SimpleNamespace(PutExecutionConfig=lambda *args: args,
                               GetExecutionConfig=lambda *args: args,
                               ExecutionResources=lambda **args: args)
@@ -147,8 +147,8 @@ class ExecutionTests(unittest.TestCase):
                     executor=executor, algorithm=algorithm, put_capacity=17, get_capacity=32768)
                 options = execution.runtime_kwargs
                 self.assertTrue(options["per_call_execution"])
-                self.assertEqual(options["enabled_put_configs"], [(transport, executor)])
-                self.assertEqual(options["enabled_get_configs"], [(transport, executor, algorithm)])
+                self.assertNotIn("enabled_put_configs", options)
+                self.assertNotIn("enabled_get_configs", options)
                 self.assertEqual(execution.put_kwargs["execution"], options["default_put"])
                 self.assertEqual(execution.get_kwargs["execution"], options["default_get"])
                 self.assertEqual(options["put_resources"][0][1]["request_capacity"], 17)

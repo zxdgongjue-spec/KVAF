@@ -227,8 +227,6 @@ void CheckDestroyed(const Counters& c) {
 }
 ExecutionPolicy Policy() {
   ExecutionPolicy p;
-  p.enabled_put_configs = std::vector<PutExecutionConfig>{put};
-  p.enabled_get_configs = std::vector<GetExecutionConfig>{get};
   return p;
 }
 void Register(ExecutionDispatcher& d, Counters& p, Counters& g) {
@@ -458,7 +456,6 @@ void FailedResidentCloseRetainsOnlyAffectedInstance() {
   constexpr GetExecutionConfig second{Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather};
   Counters p, g, other;
   auto policy = Policy();
-  policy.enabled_get_configs->push_back(second);
   ExecutionDispatcher dispatch(policy);
   CHECK(dispatch.RegisterPut(put, Factory(p)).ok());
   CHECK(dispatch.RegisterGet(get, Factory(g)).ok());

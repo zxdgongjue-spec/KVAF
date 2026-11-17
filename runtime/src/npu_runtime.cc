@@ -15,6 +15,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <fcntl.h>
@@ -35,7 +36,6 @@
 #include "gather_workspace.h"
 #if defined(KVAF_ENABLE_AICPU_URMA)
 #include "aicpu_access_operator.h"
-#include "aicpu_urma/kernel_loader.h"
 #endif
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
@@ -47,9 +47,9 @@ Status Internal(std::string message) { return Status::Internal(std::move(message
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, std::uint64_t workspace = 0U,
-                            bool execution = false, TransportMode mode = TransportMode::Urma)
-      : link_(std::move(link)), workspace_(workspace), execution_(execution), mode_(mode) {}
+  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, bool execution = false,
+                            TransportMode mode = TransportMode::Urma)
+      : link_(std::move(link)), execution_(execution), mode_(mode) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
@@ -61,15 +61,10 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    if (workspace_ > UINT64_MAX - (request.slot_size - 1U))
-      return Status::InvalidArgument("gather workspace size overflow");
-    const auto reserved = (workspace_ + request.slot_size - 1U) / request.slot_size * request.slot_size;
-    if (request.ddr_bytes > UINT64_MAX - reserved)
-      return Status::InvalidArgument("DDR allocation size overflow");
     Status status = execution_
-                        ? link_->AllocateCacheRegion(request.ddr_bytes, request.slot_size, reserved,
+                        ? link_->AllocateCacheRegion(request.ddr_bytes, request.slot_size, 0,
                                                      mode_, &allocated_)
-                        : link_->AllocateRegion(request.ddr_bytes + reserved, request.slot_size,
+                        : link_->AllocateRegion(request.ddr_bytes, request.slot_size,
                                                 candidate_id_, &allocated_);
     if (!status.ok()) return status;
     *region = RemoteRegionDesc{allocated_.base, request.ddr_bytes, request.slot_size, DeviceKind::kCpu};
@@ -87,7 +82,6 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
-  std::uint64_t workspace_{0U};
   bool execution_{false};
   TransportMode mode_{TransportMode::Urma};
   std::uint32_t candidate_id_{0U};
@@ -448,29 +442,84 @@ std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
   return std::min(ddr_bytes / slot_size, desired_rows);
 }
 
+// Register only compiled implementations. Registration stores factories and does
+// not load kernels, open communication sessions, or reserve algorithm workspace.
+std::vector<PutExecutionConfig> BuiltPutConfigs(TransportMode mode) {
+  std::vector<PutExecutionConfig> result;
+  auto add = [&](PutExecutionConfig c) {
+    if (ValidateExecution(mode, c).ok()) result.push_back(c);
+  };
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+  add({Transport::Urma, Executor::Aiv});
+#endif
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  add({Transport::Urma, Executor::Aicpu});
+#endif
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  add({Transport::Ubmem, Executor::Aiv});
+#endif
+  return result;
+}
+std::vector<GetExecutionConfig> BuiltGetConfigs(TransportMode mode) {
+  std::vector<GetExecutionConfig> result;
+  auto add = [&](GetExecutionConfig c) {
+    if (ValidateExecution(mode, c).ok()) result.push_back(c);
+  };
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  add({Transport::Urma, Executor::Aiv, GetAlgorithm::Direct});
+#endif
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  add({Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather});
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  add({Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter});
+#endif
+#endif
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  add({Transport::Ubmem, Executor::Aiv, GetAlgorithm::Direct});
+#endif
+  return result;
+}
+
 }  // namespace
 
 struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
     options.per_call_execution = options.per_call_execution || options.default_put ||
-                                 options.default_get || options.enabled_put_configs ||
-                                 options.enabled_get_configs ||
+                                 options.default_get ||
                                  options.transport_mode != TransportMode::Urma ||
                                  !options.put_resources.empty() || !options.get_resources.empty();
     if (options.per_call_execution) {
+      // Honor explicit choices, including ones not compiled into this build;
+      // selecting an unavailable provider fails on first use, not construction.
+      const auto puts = BuiltPutConfigs(options.transport_mode);
+      const auto gets = BuiltGetConfigs(options.transport_mode);
+      if (!options.default_put) {
+        if (!options.aicpu_batch_get_mode.empty())
+          options.default_put = PutExecutionConfig{Transport::Urma, Executor::Aicpu};
+        else if (!puts.empty()) options.default_put = puts.front();
+      }
+      if (!options.default_get) {
+        if (!options.aicpu_batch_get_mode.empty()) {
+          detail::RuntimeBackend selected;
+          auto status = detail::ResolveRuntimeBackend(Transport::Urma, options.aicpu_batch_get_mode, &selected);
+          if (!status.ok()) throw std::invalid_argument(status.message());
+          options.default_get = GetExecutionConfig{Transport::Urma, Executor::Aicpu,
+              selected == detail::RuntimeBackend::kUrmaAicpuScatter ? GetAlgorithm::Scatter : GetAlgorithm::Gather};
+        } else if (!gets.empty()) options.default_get = gets.front();
+      }
       auto normalized = NormalizeExecutionPolicy(&options);
       if (!normalized.ok()) throw std::invalid_argument(normalized.message());
-      auto validate_resources = [&](const auto& entries, const auto& enabled) {
+      auto validate_resources = [&](const auto& entries) {
         for (std::size_t i = 0; i < entries.size(); ++i) {
-          if (std::find(enabled.begin(), enabled.end(), entries[i].first) == enabled.end())
-            throw std::invalid_argument("resource budget refers to a disabled configuration");
+          const auto valid = ValidateExecution(options.transport_mode, entries[i].first);
+          if (!valid.ok()) throw std::invalid_argument(valid.message());
           for (std::size_t j = 0; j < i; ++j)
             if (entries[i].first == entries[j].first)
               throw std::invalid_argument("duplicate execution resource budget");
         }
       };
-      validate_resources(options.put_resources, *options.enabled_put_configs);
-      validate_resources(options.get_resources, *options.enabled_get_configs);
+      validate_resources(options.put_resources);
+      validate_resources(options.get_resources);
       options.transport = options.transport_mode == TransportMode::Ubmem ? Transport::Ubmem : Transport::Urma;
       if (options.default_get && options.default_get->executor == Executor::Aicpu)
         options.aicpu_batch_get_mode = options.default_get->algorithm == GetAlgorithm::Gather ? "gather_read" : "cpu_push_scatter";
@@ -499,11 +548,11 @@ struct NpuRuntime::Impl {
     dispatcher = nullptr;
     if (options.per_call_execution) {
       auto dispatch = std::make_unique<ExecutionDispatcher>(options);
-      for (auto c : *options.enabled_put_configs) {
+      for (auto c : BuiltPutConfigs(options.transport_mode)) {
         auto status = dispatch->RegisterPut(c, [this, c]() { return MakeProvider(c.transport, c.executor, GetAlgorithm::Direct, false); });
         if (!status.ok()) throw std::invalid_argument(status.message());
       }
-      for (auto c : *options.enabled_get_configs) {
+      for (auto c : BuiltGetConfigs(options.transport_mode)) {
         auto status = dispatch->RegisterGet(c, [this, c]() { return MakeProvider(c.transport, c.executor, c.algorithm, true); });
         if (!status.ok()) throw std::invalid_argument(status.message());
       }
@@ -519,6 +568,7 @@ struct NpuRuntime::Impl {
 #endif
     } else if (detail::UsesAicpu(backend)) {
 #if defined(KVAF_ENABLE_AICPU_URMA)
+      EnsureAicpuPackage();
       access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
           kernel_package.json_path, options.npu_core_count,
           peer_link, options.batch_get_token_bytes,
@@ -566,17 +616,59 @@ struct NpuRuntime::Impl {
     }
     return r;
   }
-  std::uint64_t GatherWorkspace() const {
-    std::uint64_t bytes = 0;
-    if (options.per_call_execution) {
-      for (auto c : *options.enabled_get_configs)
-        if (c.algorithm == GetAlgorithm::Gather)
-          bytes = std::max(bytes, GatherRemoteWorkspaceBytes(
-                                      options.batch_get_token_bytes,
-                                      Resources(c.transport, c.executor, c.algorithm, true).cores));
-    } else if (backend == detail::RuntimeBackend::kUrmaAicpuGather)
-      bytes = GatherRemoteWorkspaceBytes(options.batch_get_token_bytes, options.npu_core_count);
-    return bytes;
+  void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
+                                 const ExecutionResources& budget) const {
+    const ExecutionResources* explicit_resources = nullptr;
+    if (get) {
+      for (const auto& entry : options.get_resources)
+        if (entry.first == GetExecutionConfig{t, e, algorithm}) explicit_resources = &entry.second;
+    } else {
+      for (const auto& entry : options.put_resources)
+        if (entry.first == PutExecutionConfig{t, e}) explicit_resources = &entry.second;
+    }
+    if (explicit_resources) {
+      const auto& r = *explicit_resources;
+      if (r.jettys && (e != Executor::Aiv || t != Transport::Urma))
+        throw std::invalid_argument("Jetty budget is configurable only for URMA AIV");
+      if (r.max_inflight_total && (!get || e != Executor::Aiv || t != Transport::Urma))
+        throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
+      if (r.cpu_threads && (!get || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
+        throw std::invalid_argument("CPU thread budget requires AICPU Gather");
+      if (!r.kernel_path.empty() && e == Executor::Aicpu)
+        throw std::invalid_argument("AICPU kernel package is resolved through the CANN installation");
+    }
+    if (!budget.cores || budget.cores > (e == Executor::Aicpu ? 8U : 48U) ||
+        !budget.request_capacity || budget.request_capacity > 65536U || budget.cpu_threads > 64U ||
+        (t == Transport::Urma && e == Executor::Aiv &&
+         (!budget.jettys || budget.jettys > (get ? 64U : 2U) ||
+          (get && *budget.max_inflight_total && *budget.max_inflight_total < 2U * budget.cores))))
+      throw std::invalid_argument("invalid execution resource budget");
+    if (e == Executor::Aicpu) {
+      if (get && algorithm == GetAlgorithm::Gather &&
+          GatherStagingBytes(options.batch_get_token_bytes) > UINT32_MAX)
+        throw std::invalid_argument("AICPU Gather payload must fit uint32");
+    } else {
+      if (budget.kernel_path.empty())
+        throw std::invalid_argument("selected AIV provider requires its kernel path");
+      if (!std::ifstream(budget.kernel_path, std::ios::binary).good())
+        throw std::invalid_argument("selected provider kernel is not readable: " + budget.kernel_path);
+    }
+  }
+  void EnsureAicpuPackage() {
+    // Put and Get can first use AICPU concurrently. Publish one complete package
+    // description for this Runtime/device; the loader owns device-safe loading.
+    std::lock_guard<std::mutex> lock(aicpu_package_mutex);
+    if (aicpu_package_ready) return;
+    detail::AicpuPackageSearch search;
+    if (const char* path = std::getenv("ASCEND_HOME_PATH")) search.ascend_home_path = path;
+    if (const char* path = std::getenv("ASCEND_CANN_PACKAGE_PATH")) search.ascend_cann_package_path = path;
+    detail::AicpuKernelPackage selected;
+    const auto status = detail::ResolveAicpuKernelPackage(search, &selected);
+    if (!status.ok()) throw std::invalid_argument("AICPU package: " + status.message());
+    kernel_package = std::move(selected);
+    aicpu_package_ready = true;
+    std::fprintf(stderr, "[KVAF] AICPU_PACKAGE root=%s json=%s\n",
+        kernel_package.cann_root.c_str(), kernel_package.json_path.c_str());
   }
   std::unique_ptr<AccessOperator> MakeProvider(Transport transport, Executor executor,
                                                GetAlgorithm algorithm, bool get) {
@@ -586,16 +678,14 @@ struct NpuRuntime::Impl {
     q.algorithm = algorithm;
     q.put = !get;
     const auto budget = Resources(transport, executor, algorithm, get);
+    ValidateProviderResources(transport, executor, algorithm, get, budget);
     q.candidate = selected_candidate;
     q.workers = budget.cores;
     q.jettys = budget.jettys;
     q.request_capacity = budget.request_capacity;
     q.token_bytes = options.batch_get_token_bytes;
     q.cpu_threads = budget.cpu_threads;
-    q.auxiliary_bytes =
-        (get && algorithm == GetAlgorithm::Gather)
-            ? GatherRemoteWorkspaceBytes(options.batch_get_token_bytes, budget.cores)
-            : 0;
+    q.auxiliary_bytes = 0;
     q.local_eid = config.peer_local_eid;
     return std::make_unique<SessionAccessOperator>(
         peer_link, q,
@@ -632,6 +722,7 @@ struct NpuRuntime::Impl {
     }
 #endif
 #if defined(KVAF_ENABLE_AICPU_URMA)
+    EnsureAicpuPackage();
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
@@ -652,6 +743,8 @@ struct NpuRuntime::Impl {
   NpuRuntimeOptions options;
   detail::RuntimeBackend backend{detail::RuntimeBackend::kUrmaAiv};
   detail::AicpuKernelPackage kernel_package;
+  std::mutex aicpu_package_mutex;
+  bool aicpu_package_ready{false};
   AccessOperatorConfig config;
   std::uint32_t selected_candidate = 0;
   std::unique_ptr<MetaManager> meta_manager;
@@ -673,82 +766,21 @@ struct NpuRuntime::Impl {
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& config = impl_->options;
   const bool aicpu = detail::UsesAicpu(impl_->backend);
-  bool any_aicpu = aicpu;
-  if (config.per_call_execution) {
-    auto check = [&](Transport t, Executor e, bool put,
-                     GetAlgorithm algorithm = GetAlgorithm::Direct) {
-      const auto budget = impl_->Resources(t, e, algorithm, !put);
-      const ExecutionResources* explicit_resources = nullptr;
-      if (put) {
-        for (const auto& entry : config.put_resources)
-          if (entry.first == PutExecutionConfig{t, e}) explicit_resources = &entry.second;
-      } else {
-        for (const auto& entry : config.get_resources)
-          if (entry.first == GetExecutionConfig{t, e, algorithm})
-            explicit_resources = &entry.second;
-      }
-      if (explicit_resources) {
-        const auto& r = *explicit_resources;
-        if (r.jettys && (e != Executor::Aiv || t != Transport::Urma))
-          throw std::invalid_argument("Jetty budget is configurable only for URMA AIV");
-        if (r.max_inflight_total && (put || e != Executor::Aiv || t != Transport::Urma))
-          throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
-        if (r.cpu_threads && (put || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
-          throw std::invalid_argument("CPU thread budget requires AICPU Gather");
-        if (!r.kernel_path.empty() && e == Executor::Aicpu)
-          throw std::invalid_argument(
-              "AICPU kernel package is resolved through the CANN installation");
-      }
-      if (!budget.cores || budget.cores > (e == Executor::Aicpu ? 8U : 48U) || !budget.jettys ||
-          budget.jettys > (put ? 2U : 64U) || !budget.request_capacity ||
-          budget.request_capacity > 65536U || budget.cpu_threads > 64U ||
-          (!put && t == Transport::Urma && e == Executor::Aiv && *budget.max_inflight_total &&
-           *budget.max_inflight_total < 2U * budget.cores))
-        throw std::invalid_argument("invalid execution resource budget");
-      if (e == Executor::Aicpu) {
-        any_aicpu = true;
-#if !defined(KVAF_ENABLE_AICPU_URMA)
-        throw std::invalid_argument("enabled AICPU provider was not built");
-#endif
-      } else {
-#if !defined(KVAF_ENABLE_AIV_BATCH_GET)
-        throw std::invalid_argument("enabled AIV/UBMEM provider was not built");
-#endif
-        if (budget.kernel_path.empty())
-          throw std::invalid_argument("enabled AIV provider requires its kernel path");
-        if (!std::ifstream(budget.kernel_path, std::ios::binary).good())
-          throw std::invalid_argument("enabled provider kernel is not readable: " +
-                                      budget.kernel_path);
-#if !defined(KVAF_ENABLE_AIV_BATCH_PUT)
-        if (put && t == Transport::Urma)
-          throw std::invalid_argument("enabled AIV Put provider was not built");
-#endif
-      }
-    };
-    for (auto c : *config.enabled_put_configs) check(c.transport, c.executor, true);
-    for (auto c : *config.enabled_get_configs) {
-      check(c.transport, c.executor, false, c.algorithm);
-      if (c.executor == Executor::Aiv && c.algorithm != GetAlgorithm::Direct)
-        throw std::invalid_argument("AIV Gather/Scatter interfaces are reserved; kernels are not integrated");
-#if !defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-      if (c.algorithm == GetAlgorithm::Scatter) throw std::invalid_argument("CPU push provider was not built");
-#endif
-    }
-  }
 
 #if !defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!aicpu && !config.per_call_execution)
     throw std::invalid_argument("AIV/UBmem support was not built; select gather_read or cpu_push_scatter");
 #endif
 #if !defined(KVAF_ENABLE_AICPU_URMA)
-  if (aicpu) throw std::invalid_argument("AICPU UMDK support was not built");
+  if (aicpu && !config.per_call_execution) throw std::invalid_argument("AICPU UMDK support was not built");
 #endif
 #if !defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  if (impl_->backend == detail::RuntimeBackend::kUrmaAicpuScatter)
+  if (!config.per_call_execution && impl_->backend == detail::RuntimeBackend::kUrmaAicpuScatter)
     throw std::invalid_argument("cpu_push_scatter was not built; rebuild with --cpu-push");
 #endif
   if ((!config.per_call_execution && config.batch_get_kernel_object_path.empty() && !aicpu) ||
-      config.npu_core_count == 0 || config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES ||
+      (!config.per_call_execution && (config.npu_core_count == 0 ||
+       config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES)) ||
       config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0) {
     throw std::invalid_argument("invalid NPU Runtime configuration");
   }
@@ -765,25 +797,16 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   }
   if (aicpu && config.adaptive_ub_device)
     throw std::invalid_argument("AICPU startup bandwidth tuning is unavailable");
-  if (any_aicpu && ((!config.per_call_execution && config.npu_core_count > 8U) ||
-                    GatherStagingBytes(config.batch_get_token_bytes) > UINT32_MAX))
+  if (!config.per_call_execution && aicpu && (config.npu_core_count > 8U ||
+      (impl_->backend == detail::RuntimeBackend::kUrmaAicpuGather &&
+       GatherStagingBytes(config.batch_get_token_bytes) > UINT32_MAX)))
     throw std::invalid_argument("UMDK supports 1..8 workers and a gather payload fitting uint32");
-  if (any_aicpu) {
-    detail::AicpuPackageSearch search;
-    if (const char* path = std::getenv("ASCEND_HOME_PATH")) search.ascend_home_path = path;
-    if (const char* path = std::getenv("ASCEND_CANN_PACKAGE_PATH")) search.ascend_cann_package_path = path;
-    const auto resolved = detail::ResolveAicpuKernelPackage(search, &impl_->kernel_package);
-    if (!resolved.ok()) throw std::invalid_argument(
-        "AICPU mode=" + config.aicpu_batch_get_mode + ": " + resolved.message());
-  }
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
   }
   std::fprintf(stderr, "[KVAF] NPU_RUNTIME transport=%s aicpu_mode=%s device=%u cores=%u\n",
       config.transport == Transport::kUbmem ? "ubmem" : "urma",
       aicpu ? config.aicpu_batch_get_mode.c_str() : "off", config.device_id, config.npu_core_count);
-  if (aicpu) std::fprintf(stderr, "[KVAF] AICPU_PACKAGE root=%s json=%s\n",
-      impl_->kernel_package.cann_root.c_str(), impl_->kernel_package.json_path.c_str());
 }
 
 NpuRuntime::~NpuRuntime() {
@@ -811,8 +834,7 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
     impl_->allocator = std::make_unique<ubmem::DdrAllocator>(impl_->peer_link);
 #endif
   } else {
-    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, impl_->GatherWorkspace(),
-                                                        impl_->options.per_call_execution,
+    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, impl_->options.per_call_execution,
                                                         impl_->options.transport_mode);
     impl_->peer_allocator = allocator.get();
     impl_->allocator = std::move(allocator);
@@ -837,23 +859,6 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     const Status status = Shutdown();
     if (!status.ok()) return status;
   }
-#if defined(KVAF_ENABLE_AICPU_URMA)
-  bool requires_aicpu = uses_aicpu(),
-       requires_scatter = impl_->backend == detail::RuntimeBackend::kUrmaAicpuScatter;
-  if (impl_->options.per_call_execution) {
-    for (auto c : *impl_->options.enabled_put_configs)
-      requires_aicpu |= c.executor == Executor::Aicpu;
-    for (auto c : *impl_->options.enabled_get_configs) {
-      requires_aicpu |= c.executor == Executor::Aicpu;
-      requires_scatter |= c.algorithm == GetAlgorithm::Scatter;
-    }
-  }
-  if (requires_aicpu) {
-    const auto ready =
-        aicpu_urma::PrepareUmdkKernel(impl_->kernel_package.json_path, requires_scatter);
-    if (!ready.ok()) return ready;
-  }
-#endif
   if (impl_->options.transport == Transport::kUbmem) {
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
@@ -1277,8 +1282,8 @@ bool NpuRuntime::initialized() const {
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
   if (impl_->options.per_call_execution)
-    return RuntimeCapabilities{!impl_->options.enabled_get_configs->empty(),
-        !impl_->options.enabled_put_configs->empty(), false, true};
+    return RuntimeCapabilities{!BuiltGetConfigs(impl_->options.transport_mode).empty(),
+        !BuiltPutConfigs(impl_->options.transport_mode).empty(), false, true};
   return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
       uses_aicpu(), false, true};
 }

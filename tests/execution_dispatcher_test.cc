@@ -25,8 +25,6 @@ constexpr GetExecutionConfig gather{Transport::Urma, Executor::Aicpu, GetAlgorit
 constexpr GetExecutionConfig scatter{Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter};
 ExecutionPolicy Policy() {
   ExecutionPolicy p;
-  p.enabled_put_configs = std::vector<PutExecutionConfig>{put};
-  p.enabled_get_configs = std::vector<GetExecutionConfig>{get, gather};
   return p;
 }
 struct State {
@@ -115,31 +113,38 @@ void Register(ExecutionDispatcher& d, State& p, State& g, State& a) {
 void Configurations() {
   ExecutionPolicy p;
   CHECK(NormalizeExecutionPolicy(&p).ok());
-  CHECK(p.enabled_put_configs->size() == 2 && p.enabled_get_configs->size() == 5);
+  CHECK(p.default_put == put && p.default_get == get);
   CHECK(ValidateExecution(TransportMode::Urma, {Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter}).ok());
   CHECK(!ValidateExecution(TransportMode::Ubmem, {Transport::Ubmem, Executor::Aiv, GetAlgorithm::Gather}).ok());
   CHECK(!ValidateExecution(TransportMode::Urma, {Transport::Urma, Executor::Aicpu, GetAlgorithm::Direct}).ok());
   CHECK(!ValidateExecution(TransportMode::Urma, PutExecutionConfig{Transport::Ubmem, Executor::Aiv}).ok());
-  p = {}; p.transport_mode = TransportMode::UrmaAndUbmem;
-  CHECK(NormalizeExecutionPolicy(&p).ok());
-  CHECK(p.enabled_put_configs->size() == 3 && p.enabled_get_configs->size() == 6);
-  p = Policy(); p.enabled_put_configs = std::vector<PutExecutionConfig>{};
-  CHECK(NormalizeExecutionPolicy(&p).ok() && !p.default_put);
   PutExecutionConfig c;
-  CHECK(ResolveExecution(p, put, &c).code() == StatusCode::kNotImplemented);
-  p.default_put = put;
-  CHECK(!NormalizeExecutionPolicy(&p).ok());
+  GetExecutionConfig selected;
+  CHECK(ResolveExecution(p, std::nullopt, &c).ok() && c == put);
+  CHECK(ResolveExecution(p, gather, &selected).ok() && selected == gather);
+  const PutExecutionConfig ubmem{Transport::Ubmem, Executor::Aiv};
+  CHECK(!ResolveExecution(p, ubmem, &c).ok());
+  p.transport_mode = TransportMode::UrmaAndUbmem;
+  CHECK(NormalizeExecutionPolicy(&p).ok());
+  CHECK(ResolveExecution(p, ubmem, &c).ok() && c == ubmem);
+  p = {}; p.transport_mode = TransportMode::Ubmem;
+  CHECK(NormalizeExecutionPolicy(&p).ok());
+  CHECK(p.default_put == ubmem && p.default_get->transport == Transport::Ubmem);
   p = Policy(); p.default_get = {Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter};
+  CHECK(NormalizeExecutionPolicy(&p).ok());  // Reserved providers fail at use, not policy creation.
+  p = {}; p.default_get = {Transport::Ubmem, Executor::Aiv, GetAlgorithm::Direct};
   CHECK(!NormalizeExecutionPolicy(&p).ok());
-  p = Policy(); p.enabled_put_configs->push_back(put);
-  CHECK(!NormalizeExecutionPolicy(&p).ok());
+  CHECK(!p.default_put);  // Failed normalization leaves the policy untouched.
   CacheRegionDesc region{1, 2, 100, 64, 8}; Address translated;
   CHECK(region.Translate(120, 8, 1000, &translated).ok() && translated == 1020);
   CHECK(!region.Translate(99, 1, 1000, &translated).ok());
   CHECK(!region.Translate(160, 8, 1000, &translated).ok());
   CHECK(!region.Translate(120, 8, UINT64_MAX - 10, &translated).ok());
   ExecutionDispatcher missing(Policy());
-  CHECK(missing.Initialize({4096, 128, 64, DeviceKind::kCpu}).code() == StatusCode::kNotImplemented);
+  CHECK(missing.Initialize({4096, 128, 64, DeviceKind::kCpu}).ok());
+  CHECK(missing.Warmup(put, {}).code() == StatusCode::kNotImplemented);
+  CHECK(missing.Warmup(get, {}).code() == StatusCode::kNotImplemented);
+  CHECK(missing.Shutdown().ok());
 }
 void LazyAndIndependent() {
   State p, g, a;
@@ -426,7 +431,6 @@ void TraceOutputAndOrdinary() {
 void IndependentBindingsAndOtherPendingRequest() {
   State p, g, a, b;
   auto policy = Policy();
-  policy.enabled_get_configs->push_back(scatter);
   ExecutionDispatcher dispatch(policy);
   Register(dispatch, p, g, a);
   CHECK(dispatch.RegisterGet(scatter, [&] { return std::make_unique<Provider>(b); }).ok());

@@ -47,6 +47,9 @@ struct GatherLaunchView {
   UmdkContext context;
   AicpuKernelOptions options;
   bool direct_addresses{};
+  // Registered CPU staging/descriptor/control storage owned by the session.
+  // Source addresses still belong to common.region(), not this workspace.
+  RemoteRegionDesc remote_workspace;
   void* workspace{};
   AicpuBufferView completion, profile;
   void* control{};

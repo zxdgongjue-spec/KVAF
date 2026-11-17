@@ -90,7 +90,11 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& r) {
   return s.ok() ? impl_->session.Ensure(impl_->region, r.request->output.data, r.request->output.bytes) : s;
 }
 Status BatchGetTransport::ExecutePrepared(const BatchGetExecRequest&) { return Status::NotImplemented("unused"); }
-GatherLaunchView BatchGetTransport::View() const { return {}; }
+GatherLaunchView BatchGetTransport::View() const {
+  GatherLaunchView view;
+  view.remote_workspace.base = impl_->region;
+  return view;
+}
 Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*) { return Status::OK(); }
 std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
   return std::make_unique<AicpuGetInvocation>(impl_.get());
@@ -99,7 +103,7 @@ Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
   impl_->call = state ? static_cast<AicpuGetInvocation*>(state) : &impl_->legacy;
   return Status::OK();
 }
-Status PrepareUmdkKernel(const std::string&, bool) { return Status::OK(); }
+Status PrepareUmdkKernel(const std::string&, UmdkKernelKind) { return Status::OK(); }
 int32_t LaunchUmdkKernel(const char*, const void* input, size_t, aclrtStream, uint32_t) {
   const auto& args = *static_cast<const UmdkControlArgs*>(input);
   auto& status = *reinterpret_cast<UmdkControlStatus*>(args.status);

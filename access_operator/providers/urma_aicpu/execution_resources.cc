@@ -303,7 +303,8 @@ Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options
   if (s.ok()) s = state_->get.Warmup();
   if (!s.ok()) return s;
   call.get_output = options.output;
-  s = state_->get_session.Ensure(state_->region.base, options.output.data, options.output.bytes);
+  s = state_->get_session.Ensure(state_->get.View().remote_workspace.base,
+                                 options.output.data, options.output.bytes);
   if (s.ok()) call.output_bound = true;
   return s;
 }
@@ -334,12 +335,13 @@ Status AicpuExecutionResources::Initialize(const RemoteRegionDesc& region) {
   if (!state_->valid_mode) return Status::InvalidArgument("unknown AICPU BatchGet mode");
   if (state_->initialized) return Status::InvalidState("AICPU resources already initialized");
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  if (state_->push) {
-    auto checked = aicpu_urma::PrepareUmdkKernel(state_->get_session.config().kernel_json, true);
-    if (!checked.ok()) return checked;
-  }
-#endif
+  auto loaded = state_->enable_get && state_->push
+      ? aicpu_urma::PrepareUmdkKernel(state_->get_session.config().kernel_json,
+                                    aicpu_urma::UmdkKernelKind::Scatter)
+      : state_->enable_get ? state_->get_session.Load() : state_->put_session.Load();
+#else
   auto loaded = state_->enable_get ? state_->get_session.Load() : state_->put_session.Load();
+#endif
   if (!loaded.ok()) return loaded;
   if (!state_->enable_get) { state_->region = region; state_->initialized = true; state_->views.Initialize(region); return Status::OK(); }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)

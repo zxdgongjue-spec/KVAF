@@ -16,6 +16,9 @@ struct BatchGetKernelProfile;
 struct NpuRuntimeOptions : ExecutionPolicy {
   // Legacy constructors keep their selected backend and graph behavior.
   bool per_call_execution{false};
+  // Per-call providers are discovered from the build and prepared on first use.
+  // Defaults select an algorithm; resource entries do not pre-enable providers.
+  // Unspecified defaults prefer an available implementation for transport_mode.
   std::vector<std::pair<PutExecutionConfig, ExecutionResources>> put_resources;
   std::vector<std::pair<GetExecutionConfig, ExecutionResources>> get_resources;
   NpuRuntimeOptions(std::string kernel_object_path,

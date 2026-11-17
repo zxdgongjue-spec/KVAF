@@ -24,15 +24,15 @@ bool ValidateEnvelope(std::uint64_t base, std::uint64_t bytes, std::uint64_t des
 std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
                                          std::uint64_t descriptor_address, std::uint64_t sequence,
                                          std::size_t max_spans) {
-  if (region_bytes < 64U || base_ > UINT64_MAX - region_bytes || descriptor_address % 64U != 0U ||
-      !GatherRange(base_, GatherControlOffset(region_bytes), descriptor_address,
+  if (region_bytes < 64U || workspace_base_ > UINT64_MAX - region_bytes || descriptor_address % 64U != 0U ||
+      !GatherRange(workspace_base_, GatherControlOffset(region_bytes), descriptor_address,
                    sizeof(GatherDescriptorHeader)))
     return 0U;
-  const auto* descriptor = memory_ + (descriptor_address - base_);
+  const auto* descriptor = workspace_memory_ + (descriptor_address - workspace_base_);
   GatherDescriptorHeader header;
   std::memcpy(&header, descriptor, sizeof(header));
   if (header.sequence != sequence || header.span_count > max_spans ||
-      !ValidateEnvelope(base_, region_bytes, descriptor_address, header))
+      !ValidateEnvelope(workspace_base_, region_bytes, descriptor_address, header))
     return 0U;
   const auto* source_spans = reinterpret_cast<const GatherSpan*>(descriptor + sizeof(header));
   span_bytes_ = header.span_bytes;
@@ -60,7 +60,7 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
     chunk_done_.assign(chunks, 0U);
     next_chunk_.store(0U, std::memory_order_relaxed);
     pipeline_ready_ = reinterpret_cast<std::uint64_t*>(
-        memory_ + (descriptor_address - base_) + offsetof(GatherDescriptorHeader, ready_bytes));
+        workspace_memory_ + (descriptor_address - workspace_base_) + offsetof(GatherDescriptorHeader, ready_bytes));
   }
   return Publish(header.staging_address, source_spans, header.span_count, header.total_bytes);
 }
