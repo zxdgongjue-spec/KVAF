@@ -17,6 +17,7 @@ FIELDS = (
     "first_completion_seen_us_mean", "last_completion_seen_us_mean",
     "observed_window_us_mean", "observed_window_us_p50", "observed_window_us_p90",
     "observed_window_us_p99", "effective_GBps", "probe_active_us_mean", "polls_mean",
+    "execution_mode", "calls_per_replay", "profile_scope",
 )
 
 
@@ -29,7 +30,8 @@ def percentile(values: list[float], fraction: float) -> float:
 
 
 def summarize(samples, *, clock_mhz, npu_core_count, jettys_per_core,
-              token_bytes, miss_count, request_length, max_inflight_total, warmup):
+              token_bytes, miss_count, request_length, max_inflight_total, warmup,
+              execution_mode="eager", calls_per_replay=1):
     """Aggregate measured launches only; unused Jettys have blank timing/rate cells."""
     if not samples or clock_mhz <= 0 or token_bytes <= 0:
         raise ValueError("Jetty profiles require samples and positive clock/token size")
@@ -108,6 +110,8 @@ def summarize(samples, *, clock_mhz, npu_core_count, jettys_per_core,
                            observed_window_us_p90=percentile(windows, .90),
                            observed_window_us_p99=percentile(windows, .99),
                            effective_GBps=requests_total * token_bytes / sum(windows) / 1000.0)
+            row.update(execution_mode=execution_mode, calls_per_replay=calls_per_replay,
+                       profile_scope="last_get_in_replay" if execution_mode == "graph" else "single_get")
             rows.append(row)
     return rows
 
@@ -125,7 +129,9 @@ def print_table(rows):
     print("JETTY_PROFILE_CONTRACT version=3 polling=round_robin_all_pending_groups "
           "window=first_doorbell_to_last_cqe_observed timestamps=relative_to_own_core_start "
           "effective_GBps=sum_bytes/sum_observed_windows timing_samples=active_only "
-          "hardware_timestamps=0 profile_overhead_included=1")
+          "hardware_timestamps=0 profile_overhead_included=1 "
+          f"execution_mode={rows[0]['execution_mode']} "
+          f"calls_per_replay={rows[0]['calls_per_replay']} profile_scope={rows[0]['profile_scope']}")
     columns = ("core", "jetty_slot", "priority", "requests_mean", "bytes_mean",
                "observed_window_us_p50", "observed_window_us_p99", "effective_GBps")
     print("JETTY_PROFILE_TABLE")

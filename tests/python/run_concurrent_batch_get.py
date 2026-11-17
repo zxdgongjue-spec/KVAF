@@ -3,7 +3,7 @@
 
 Each sweep owns all logs, tables and CSVs under output-dir/flowN.
 Only terminal lines get a flow prefix. Each worker prepares and warms up
-normally, then waits before and after every measured BatchGet. Common-window
+normally, then waits before and after every measured graph replay. Common-window
 host throughput and raw timestamps are saved in the parent output directory.
 """
 
@@ -57,9 +57,17 @@ Existing flow output directories are refused to prevent overwriting results.
 All flows must use the same --iterations. Preparation, barrier waits and
 profile collection are outside the per-round host timing window. The parent
 directory receives concurrent_batch_get_{samples,flows}.csv and a summary JSON.
+Graph mode is the default: each iteration replays --graph-ring BatchGet calls
+(default 8). --warmup counts graph replays. Kernel/Jetty/peer profiles describe
+only the last call in each replay. NPU Event durations cover the entire graph.
+Use --execution-mode eager to compare with the original per-call benchmark.
+Both execution options can also be overridden in --flowN-args.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--execution-mode", choices=("graph", "eager"), default="graph")
+    parser.add_argument("--graph-ring", type=int, default=8,
+                        help="BatchGet calls per graph replay (default: 8)")
     parser.add_argument("--address-space-bytes", type=int,
                         help="remote DDR budget in bytes per flow; override in --flowN-args")
     if argv is None:
@@ -84,6 +92,8 @@ directory receives concurrent_batch_get_{samples,flows}.csv and a summary JSON.
                             default=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES") or "15")
         parser.add_argument(f"--{name}-args", default="", help="quoted original benchmark options")
     args = parser.parse_args(argv)
+    if args.graph_ring < 1:
+        parser.error("--graph-ring must be positive")
     args.flow_names = flow_names
     for name in flow_names:
         if getattr(args, f"{name}_device") < 0:
@@ -102,7 +112,8 @@ directory receives concurrent_batch_get_{samples,flows}.csv and a summary JSON.
 
 def build_flow(args, name):
     """Reuse benchmark parsing and the original shell's single-shape output path."""
-    options = shlex.split(getattr(args, f"{name}_args"))
+    options = ["--execution-mode", args.execution_mode, "--graph-ring", str(args.graph_ring),
+               *shlex.split(getattr(args, f"{name}_args"))]
     if args.address_space_bytes is not None:
         options = ["--address-space-bytes", str(args.address_space_bytes), *options]
     for suffix, option in (("peer_eids", "--peer-eids"), ("npu_eid", "--npu-eids")):

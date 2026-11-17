@@ -58,7 +58,10 @@ def worker(mode, output):
     ready_ns = time.monotonic_ns()
     rounds = []
     iterations = int(os.environ.get("KVAF_BATCH_GET_CONCURRENT_ITERATIONS", "3"))
-    with perf.ConcurrentMeasurement(iterations, 1024) as measurement:
+    execution_mode = os.environ.get("KVAF_TEST_EXECUTION_MODE", "eager")
+    calls = int(os.environ.get("KVAF_TEST_GRAPH_RING", "8")) if execution_mode == "graph" else 1
+    with perf.ConcurrentMeasurement(iterations, 1024 * calls,
+                                    execution_mode=execution_mode, calls_per_round=calls) as measurement:
         for iteration in range(iterations):
             if mode == "slow_round" and iteration == 1:
                 time.sleep(0.2)
@@ -71,7 +74,8 @@ def worker(mode, output):
                 time.sleep(60)
             time.sleep(0.02 if mode == "slow_round" else 0.002)
             end = time.monotonic_ns()
-            measurement.after(iteration, begin, end)
+            measurement.after(iteration, begin, end,
+                              device_elapsed_ms=float(calls) if execution_mode == "graph" else None)
             rounds.append(dict(ready_ns=round_ready, begin_ns=begin, end_ns=end))
     started_ns = rounds[0]["begin_ns"]
     (output / (os.environ["DEVICE_ID"] + ".json")).write_text(json.dumps({
@@ -97,15 +101,19 @@ def fake_perf(argv):
     error = perf.validate_args(args)
     if error:
         raise ValueError(error)
+    calls = args.graph_ring if args.execution_mode == "graph" else 1
     print(f"BATCH_GET_PERF_CONFIG table_capacity={args.table_capacity} "
           f"tokens_per_block={args.tokens_per_block} address_space_budget_bytes={args.address_space_bytes or 0} "
-          f"address_space_bytes={args.table_capacity * args.tokens_per_block * args.token_bytes}")
-    with perf.ConcurrentMeasurement(args.iterations, args.miss_count * args.token_bytes) as measurement:
+          f"address_space_bytes={args.table_capacity * args.tokens_per_block * args.token_bytes} "
+          f"execution_mode={args.execution_mode} calls_per_round={calls}")
+    with perf.ConcurrentMeasurement(args.iterations, args.miss_count * args.token_bytes * calls,
+                                    execution_mode=args.execution_mode, calls_per_round=calls) as measurement:
         for iteration in range(args.iterations):
             measurement.before(iteration)
             begin = time.monotonic_ns()
             end = time.monotonic_ns()
-            measurement.after(iteration, begin, end)
+            measurement.after(iteration, begin, end,
+                              device_elapsed_ms=float(calls) if args.execution_mode == "graph" else None)
     print("BATCH_GET_PERF_CORRECTNESS_PASS fixture=1")
     for stage in ("kernel_total", "kernel_post", "kernel_completion_wait"):
         print(f"PERF_RESULT operation=batch_get_{stage} " + " ".join(
@@ -118,7 +126,9 @@ def fake_perf(argv):
             row.update(token_bytes=args.token_bytes, miss_count=args.miss_count,
                        aiv_cores=args.aiv_cores, jettys_per_core=args.jettys_per_core,
                        core=core, jetty_slot=slot,
-                       priority=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "15"))
+                       priority=os.environ.get("KVAF_BATCH_GET_JETTY_PRIORITIES", "15"),
+                       execution_mode=args.execution_mode, calls_per_replay=calls,
+                       profile_scope="last_get_in_replay" if args.execution_mode == "graph" else "single_get")
             rows.append(row)
     jetty_profile.write_csv(args.jetty_csv, rows)
     print("JETTY_PROFILE_CONTRACT fixture=1")
@@ -133,7 +143,8 @@ def fake_perf(argv):
             first_completion_cycle=100 + slot, last_completion_cycle=200 + slot)
             for slot in range(args.jettys_per_core)]} for core in range(args.aiv_cores)]
         perf.peer_eid_profile.report([profiles], args.peer_eids, args.aiv_cores,
-                                    args.jettys_per_core, args.token_bytes, args.peer_csv)
+                                    args.jettys_per_core, args.token_bytes, args.peer_csv,
+                                    execution_mode=args.execution_mode, calls_per_replay=calls)
     return 0
 
 
@@ -173,6 +184,43 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
+    def test_graph_defaults_and_explicit_execution_overrides(self):
+        for extra, flow_options, expected_mode, expected_ring in (
+                ([], "", "graph", 8),
+                (["--graph-ring", "4"], "", "graph", 4),
+                (["--execution-mode", "eager"], "", "eager", 8),
+                (["--graph-ring", "4"], "--execution-mode graph --graph-ring 2", "graph", 2),
+                ([], "--execution-mode eager", "eager", 8)):
+            with self.subTest(extra=extra, flow_options=flow_options), patch.dict(os.environ, self.env, clear=True):
+                args = self.args(options=flow_options, extra=extra)
+                _, command, _ = launcher.build_flow(args, "flow1")
+                benchmark = perf.parse_args(command[3:])
+                self.assertEqual(benchmark.execution_mode, expected_mode)
+                self.assertEqual(benchmark.graph_ring, expected_ring)
+        self.assertEqual(perf.parse_args([]).execution_mode, "eager")
+
+    def test_graph_summary_uses_ring_bytes_and_separate_device_event_durations(self):
+        flows = self.flows("normal", "normal")
+        for (_, _, env), ring in zip(flows, (8, 4)):
+            env.update(KVAF_TEST_EXECUTION_MODE="graph", KVAF_TEST_GRAPH_RING=str(ring))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(launcher.run_flows(flows, 5, self.output), 0)
+        summary = json.loads((self.output / concurrency.REPORT_FILES[2]).read_text())
+        self.assertEqual(summary["total_payload_bytes"], 3 * (8 + 4) * 1024)
+        self.assertEqual(summary["execution_mode"], "graph")
+        self.assertEqual(summary["timing"], "host_graph_replay_to_event_completion")
+        for name, ring in (("flow1", 8), ("flow2", 4)):
+            row = summary["flows"][name]
+            self.assertEqual(row["calls_per_round"], ring)
+            self.assertEqual(row["payload_bytes_per_round"], ring * 1024)
+            self.assertEqual(row["device_event_mean_us_per_replay"], ring * 1000)
+            self.assertEqual(row["device_event_mean_us_per_get"], 1000)
+            self.assertEqual(row["profile_scope"], "last_get_in_replay")
+            self.assertAlmostEqual(row["device_event_GBps"], 0.001024)
+        with (self.output / concurrency.REPORT_FILES[1]).open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([float(row["device_elapsed_ms"]) for row in rows], [8.0, 4.0] * 3)
+
     def test_three_four_and_eight_flows_wait_for_every_round(self):
         popen = subprocess.Popen
         for count in (3, 4, 8):
@@ -193,6 +241,9 @@ class ConcurrentTests(ConcurrentFixture):
             def start_worker(command, **kwargs):
                 folder = Path(kwargs["env"]["KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR"])
                 options = perf.parse_args(command[3:])
+                self.assertEqual(options.execution_mode, "graph")
+                kwargs["env"].update(KVAF_TEST_EXECUTION_MODE=options.execution_mode,
+                                     KVAF_TEST_GRAPH_RING=str(options.graph_ring))
                 self.assertEqual(options.peer_eids, PEERS)
                 self.assertEqual(options.npu_eids, NPU_EIDS[:1])
                 self.assertEqual(Path(options.peer_csv), folder / "peer_samples.csv")
@@ -230,7 +281,8 @@ class ConcurrentTests(ConcurrentFixture):
                 summary = json.loads((output / concurrency.REPORT_FILES[2]).read_text())
                 self.assertEqual(summary["samples"], 3)
                 self.assertEqual(summary["flow_count"], count)
-                self.assertEqual(summary["total_payload_bytes"], count * 3 * 1024)
+                self.assertEqual(summary["total_payload_bytes"], count * 3 * 1024 * 8)
+                self.assertEqual(summary["execution_mode"], "graph")
 
     def test_service_override_only_changes_its_own_flow(self):
         shared_addr = "192.0.2.1:29000"
@@ -638,7 +690,12 @@ class SweepCompatibilityTests(ConcurrentFixture):
                         "post_mean_us", "post_p50_us", "post_p90_us", "post_p99_us",
                         "completion_wait_mean_us", "completion_wait_p50_us",
                         "completion_wait_p90_us", "completion_wait_p99_us", "selected_ub_device",
-                        "table_capacity", "tokens_per_block", "address_space_budget_bytes", "address_space_bytes"])
+                        "table_capacity", "tokens_per_block", "address_space_budget_bytes", "address_space_bytes",
+                        "execution_mode", "calls_per_replay", "profile_scope"])
+                    with (pair_output / "batch_get_miss_sweep_summary.csv").open() as stream:
+                        row, = csv.DictReader(stream)
+                    self.assertEqual((row["execution_mode"], row["calls_per_replay"], row["profile_scope"]),
+                                     ("graph", "8", "last_get_in_replay"))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux timeout/process group check")
     def test_real_perf_timeout_stays_in_launcher_group(self):

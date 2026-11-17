@@ -176,22 +176,36 @@ CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 E
 
 ### 多流共同窗口与总吞吐
 
-多流启动命令不变，新同步协议需要同时更新 `run_concurrent_batch_get.py`、
-`test_npu_batch_get_perf.py` 和 `batch_get_concurrency.py`，仅此脚本修改无需重新编译。
-每条流仍使用原来的逐次 BatchGet 调用，按原配置生成请求，不切换为 Graph replay。
-请求生成、预热、屏障等待及 profile 读取均在每轮计时窗口之外。
+多流启动命令默认切换为 **Graph replay**，使用本分支已有的 `kvaf.AclGraph`
+捕获接口。需要更新整套测试脚本（包括新增的 `batch_get_graph.py` 和 profile 工具）；
+已有绑定提供 `kvaf.AclGraph` 时无需重新编译，缺少该接口会直接报错，需重新构建绑定。
+
+每条流在计时前按原访问模式生成固定请求 ring，保持所有请求张量的地址和生命周期，
+在独立 NPU Stream 上捕获 ring 次 BatchGet。各次 Get 顺序执行，共用输出 HBM。
+默认 `--graph-ring 8`，每轮屏障后只提交一次图重放。`--warmup 3` 表示预热 3 次整图，
+`--iterations 100` 表示测量 100 次整图，即每条流测量 800 次 Get。
+Graph 捕获后另做一次重放，并校验最后一组请求的输出；该校验不计入 warmup 或 samples。
+请求生成、注册预备调用、捕获、校验、预热、屏障等待及 profile 读取均不计入测量窗口。
+
+在已有多流命令中可加 `--graph-ring 1` 测单次 Get 的图重放，或加
+`--execution-mode eager` 恢复原来的逐次调用；这两个选项也可放在 `--flowN-args`
+中覆盖单条流。各流允许不同 ring，仍须使用相同的 `--iterations`。
+直接运行单卡 `run_remote_cpu_batch_get_miss_count_perf.sh` 默认仍为 eager，
+加 `--execution-mode graph --graph-ring 8` 即可启用图模式。
+random 模式在准备 ring 时采样，之后每轮重放相同 ring；contiguous 模式仍遵循原有连续访问规则。
 
 父输出目录新增三个文件，原有 `flowN` 内的日志、profile 和 CSV 保留：
 
 | 文件 | 内容 |
 | --- | --- |
 | `concurrent_batch_get_samples.csv` | 每轮总字节数、计划放行时间、最早/最晚开始、最晚完成、共同窗口 `window_ns`、启动偏差 `start_skew_ns`、Host 窗口交集 `host_overlap_ns` 和 `aggregate_GBps` |
-| `concurrent_batch_get_flows.csv` | 每轮每条流的设备 ID、Host 开始/完成时间和有效字节数，可对应检查轮次与重叠情况 |
-| `concurrent_batch_get_summary.json` | 流数、轮数、总字节数、窗口总时间、聚合吞吐、平均/p50 窗口时延、最大启动偏差以及全部流 Host 窗口存在交集的轮数 |
+| `concurrent_batch_get_flows.csv` | 每轮每条流的设备 ID、执行模式、`calls_per_round`、Host 开始/完成时间、有效字节数和整图 `device_elapsed_ms`（eager 为空） |
+| `concurrent_batch_get_summary.json` | 流数、轮数、总字节数、窗口总时间、聚合吞吐、平均/p50 窗口时延、最大启动偏差、Host 窗口有交集的轮数，以及 `flows` 下各流的模式、ring 和 Event 统计 |
 
 终端输出 `BATCH_GET_CONCURRENT_SUMMARY`。其计算口径为：
 
 ```text
+payload_bytes[flow, round] = miss_count * token_bytes * calls_per_round
 window_ns[round] = max(end_ns[flow]) - min(begin_ns[flow])
 aggregate_GBps[round] = sum(payload_bytes[flow]) / window_ns[round]
 aggregate_GBps[summary] = sum(all payload_bytes) / sum(window_ns[round])
@@ -201,9 +215,32 @@ aggregate_GBps[summary] = sum(all payload_bytes) / sum(window_ns[round])
 p50 带宽相加，也不对每轮带宽做简单平均。此指标是**排除轮间屏障的共同窗口有效吞吐**，
 并非包含整个测试墙钟时间的持续吞吐。
 
-所有进程在同一 Host 上使用 `time.monotonic_ns()`：起点在 Python 调用 BatchGet 前，
-终点在 `torch.npu.synchronize()` 返回后。因此时间包含 Host 提交和同步开销，不能
-与原来的 `kernel_total` 周期带宽混用。不能直接比较不同 NPU 的 kernel 周期绝对值。
+所有进程在同一 Host 上使用 `time.monotonic_ns()`。Graph 模式下，起点在记录 start
+Event 前，依次提交图重放和 end Event，终点在 end Event 同步返回后，
+汇总 `timing=host_graph_replay_to_event_completion`。因此共同窗口包含 Host 提交、
+Event 记录和同步开销。eager 模式维持调用前到 `torch.npu.synchronize()` 返回后的口径。
+
+同一条流在同一 NPU Stream 上用两个启用计时的 Event 包围整图，每轮取得
+`device_elapsed_ms`，不比较不同设备的 Event 绝对时间。JSON 的 `flows.flowN` 包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `execution_mode` / `calls_per_round` | 执行模式 / 每轮 Get 次数；eager 为 1 |
+| `payload_bytes_per_round` | 该流一整轮的有效字节数，已乘以 ring |
+| `device_event_mean_us_per_replay` | 整图 Event 时间的算术平均值，微秒 |
+| `device_event_mean_us_per_get` | 上项除以 ring，平均摊到每次 Get 的时间，并非逐个 Get 的独立时延 |
+| `device_event_GBps` | 该流总字节数 / Event 总时间，十进制 GB/s；不会相加冒充多卡共同窗口吞吐 |
+| `profile_scope` | Graph 下为 `last_get_in_replay` |
+
+单流日志同时输出 `PERF_RESULT operation=batch_get_graph_host` 和
+`operation=batch_get_graph_device`，分别记录整图 Host / Event 时间及摊到每次 Get 的均值。
+Event 区间覆盖整图，也可能包含提交间隙，不能直接视为纯 READ 或纯 kernel 时间。
+
+**原有 kernel/Jetty/peer profile buffer 在每次 Get 时覆盖，Graph 下只保留每轮最后一次 Get。**
+原有 sweep 三阶段表及 `p50_GBps` 也只描述这个 Get，不是整图带宽。
+miss-count 和 Jetty CSV 增加 `execution_mode`、`calls_per_replay`、`profile_scope`；
+Graph 下的 peer CSV 也带这些标注。这些 profile 的字节数不乘 ring。
+Graph Event 和共同窗口测量仍包含启用 kernel profiling 后的执行开销。
 
 屏障协调 Host 提交，不保证多卡 READ 在硬件上同周期启动。脚本每轮预留 5 ms
 接收放行时间，此等待不计入窗口。检查 `max_start_skew_us` 和

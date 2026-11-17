@@ -60,6 +60,16 @@ class JettyProfileTests(unittest.TestCase):
         self.assertEqual(row["effective_GBps"], "")
         self.assertEqual(row["observed_window_us_p50"], "")
 
+    def test_graph_profile_counts_only_last_get_not_whole_ring(self):
+        rows = self.rows(execution_mode="graph", calls_per_replay=8)
+        self.assertTrue(all(row["execution_mode"] == "graph" and row["calls_per_replay"] == 8
+                            and row["profile_scope"] == "last_get_in_replay" for row in rows))
+        self.assertEqual(rows[0]["bytes_total"], 256000)
+        self.assertAlmostEqual(rows[0]["effective_GBps"], 51.2)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            report.print_table(rows)
+        self.assertIn("profile_scope=last_get_in_replay", output.getvalue())
+
     def test_priority_is_observed_metadata_not_current_environment(self):
         with patch.dict(os.environ, {"KVAF_BATCH_GET_JETTY_PRIORITIES": "0"}):
             self.assertEqual([row["priority"] for row in self.rows()], [3, 13, 15])

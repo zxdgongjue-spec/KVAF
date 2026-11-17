@@ -67,8 +67,14 @@ def summarize(samples, peer_eids, cores, jettys, token_bytes):
     return rows
 
 
-def report(samples, peer_eids, cores, jettys, token_bytes, csv_path):
+def report(samples, peer_eids, cores, jettys, token_bytes, csv_path, *,
+           execution_mode="eager", calls_per_replay=1):
     rows = summarize(samples, peer_eids, cores, jettys, token_bytes)
+    if execution_mode == "graph":
+        for row in rows:
+            row.update(execution_mode=execution_mode, calls_per_replay=calls_per_replay,
+                       profile_scope="last_get_in_replay")
+        print(f"PEER_EID_PROFILE_SCOPE scope=last_get_in_replay calls_per_replay={calls_per_replay}")
     if csv_path:
         with Path(csv_path).open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=list(rows[0]))

@@ -8,6 +8,7 @@ execution. A host barrier cannot prove simultaneous READs on different NPUs.
 import csv
 from contextlib import ExitStack
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -16,7 +17,7 @@ import statistics
 import time
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_MESSAGE_BYTES = 4096
 REPORT_FILES = ("concurrent_batch_get_samples.csv", "concurrent_batch_get_flows.csv",
                 "concurrent_batch_get_summary.json")
@@ -42,9 +43,11 @@ def read_message(stream):
 class ConcurrentMeasurement:
     """Silent no-op for standalone runs; persistent rendezvous for multi-flow runs."""
 
-    def __init__(self, iterations, payload_bytes):
+    def __init__(self, iterations, payload_bytes, *, execution_mode="eager", calls_per_round=1):
         self.iterations = iterations
         self.payload_bytes = payload_bytes
+        self.execution_mode = execution_mode
+        self.calls_per_round = calls_per_round
         self.connection = self.stream = None
 
     def __enter__(self):
@@ -59,7 +62,8 @@ class ConcurrentMeasurement:
             self.stream = self.connection.makefile("rb")
             send_message(self.connection, kind="hello", version=PROTOCOL_VERSION,
                          token=os.environ["KVAF_BATCH_GET_START_TOKEN"],
-                         iterations=self.iterations, payload_bytes=self.payload_bytes)
+                         iterations=self.iterations, payload_bytes=self.payload_bytes,
+                         execution_mode=self.execution_mode, calls_per_round=self.calls_per_round)
             if read_message(self.stream) != {"kind": "accepted"}:
                 raise RuntimeError("concurrent launcher did not accept this worker")
             return self
@@ -81,11 +85,11 @@ class ConcurrentMeasurement:
                 return
             time.sleep(remaining / 1_000_000_000)
 
-    def after(self, iteration, begin_ns, end_ns):
+    def after(self, iteration, begin_ns, end_ns, *, device_elapsed_ms=None):
         if self.connection is None:
             return
         send_message(self.connection, kind="done", iteration=iteration,
-                     begin_ns=begin_ns, end_ns=end_ns)
+                     begin_ns=begin_ns, end_ns=end_ns, device_elapsed_ms=device_elapsed_ms)
         if read_message(self.stream) != {"kind": "complete", "iteration": iteration}:
             raise RuntimeError("concurrent launcher disconnected before round completion")
 
@@ -140,6 +144,11 @@ def coordinate_rounds(listener, tokens, check_health, deadline, emit):
             if (type(message.get("iterations")) is not int or message["iterations"] < 1
                     or type(message.get("payload_bytes")) is not int or message["payload_bytes"] < 0):
                 raise RuntimeError("invalid concurrent iteration count or payload size")
+            if (message.get("execution_mode") not in ("eager", "graph")
+                    or type(message.get("calls_per_round")) is not int
+                    or message["calls_per_round"] < 1
+                    or (message["execution_mode"] == "eager" and message["calls_per_round"] != 1)):
+                raise RuntimeError("invalid concurrent execution mode or calls per round")
             peers[token] = dict(connection=connection, stream=stream, name=tokens[token], **message)
             emit(f"[launcher] {tokens[token]} ready")
 
@@ -177,9 +186,20 @@ def coordinate_rounds(listener, tokens, check_health, deadline, emit):
             for peer in peers.values():
                 send_message(peer["connection"], kind="start", iteration=iteration, start_ns=start_ns)
             done = collect("done", iteration)
-            rows = [dict(iteration=iteration, flow=name, payload_bytes=peers[token]["payload_bytes"],
-                         begin_ns=done[name].get("begin_ns"), end_ns=done[name].get("end_ns"))
-                    for token, name in tokens.items()]
+            rows = []
+            for token, name in tokens.items():
+                peer = peers[token]
+                device_ms = done[name].get("device_elapsed_ms")
+                if peer["execution_mode"] == "graph" and (
+                        type(device_ms) not in (int, float)
+                        or not math.isfinite(device_ms) or device_ms <= 0):
+                    raise RuntimeError(f"{name}: graph round requires a positive finite NPU Event duration")
+                rows.append(dict(iteration=iteration, flow=name,
+                                 execution_mode=peer["execution_mode"],
+                                 calls_per_round=peer["calls_per_round"],
+                                 payload_bytes=peer["payload_bytes"],
+                                 begin_ns=done[name].get("begin_ns"), end_ns=done[name].get("end_ns"),
+                                 device_elapsed_ms=device_ms))
             samples.append(round_sample(iteration, start_ns, rows))
             measurements.extend(rows)
             for peer in peers.values():
@@ -198,6 +218,26 @@ def report_results(samples, measurements, output_dir, emit):
                    p50_window_us=statistics.median(row["window_ns"] for row in samples) / 1000,
                    max_start_skew_us=max(row["start_skew_ns"] for row in samples) / 1000,
                    all_flow_host_overlap_samples=sum(row["host_overlap_ns"] > 0 for row in samples))
+    modes = {row["execution_mode"] for row in measurements}
+    summary["execution_mode"] = next(iter(modes)) if len(modes) == 1 else "mixed"
+    if modes == {"graph"}:
+        summary["timing"] = "host_graph_replay_to_event_completion"
+    elif len(modes) > 1:
+        summary["timing"] = "host_submit_to_completion"
+    summary["flows"] = {}
+    for name in dict.fromkeys(row["flow"] for row in measurements):
+        rows = [row for row in measurements if row["flow"] == name]
+        first = rows[0]
+        flow = dict(device_id=first.get("device_id"), execution_mode=first["execution_mode"],
+                    calls_per_round=first["calls_per_round"],
+                    payload_bytes_per_round=first["payload_bytes"])
+        if first["execution_mode"] == "graph":
+            device_ms = sum(row["device_elapsed_ms"] for row in rows)
+            flow.update(device_event_mean_us_per_replay=device_ms * 1000 / len(rows),
+                        device_event_mean_us_per_get=device_ms * 1000 / len(rows) / first["calls_per_round"],
+                        device_event_GBps=sum(row["payload_bytes"] for row in rows) / (device_ms * 1_000_000),
+                        profile_scope="last_get_in_replay")
+        summary["flows"][name] = flow
     if output_dir is not None:
         output = Path(output_dir)
         for filename, rows in zip(REPORT_FILES[:2], (samples, measurements)):
@@ -208,5 +248,9 @@ def report_results(samples, measurements, output_dir, emit):
         with (output / REPORT_FILES[2]).open("x", encoding="utf-8") as stream:
             json.dump(summary, stream, indent=2)
             stream.write("\n")
-    emit("BATCH_GET_CONCURRENT_SUMMARY " + " ".join(f"{key}={value}" for key, value in summary.items()))
+    emit("BATCH_GET_CONCURRENT_SUMMARY " + " ".join(
+        f"{key}={value}" for key, value in summary.items() if key != "flows"))
+    for name, flow in summary["flows"].items():
+        emit(f"BATCH_GET_CONCURRENT_FLOW_SUMMARY flow={name} " + " ".join(
+            f"{key}={value}" for key, value in flow.items()))
     return summary

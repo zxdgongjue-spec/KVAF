@@ -25,6 +25,8 @@ environment variables:
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
     --jetty-csv            KVAF_BATCH_GET_JETTY_CSV
+    --execution-mode      eager (default) or graph
+    --graph-ring          BatchGet calls per graph replay (default 8)
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
     adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
@@ -32,6 +34,8 @@ environment variables:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+import math
 import os
 from pathlib import Path
 import statistics
@@ -43,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
 from batch_get_concurrency import ConcurrentMeasurement
+from batch_get_graph import capture_batch_get
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids, select_peer_eids
 import batch_get_jetty_profile as jetty_profile
@@ -225,6 +230,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", DEFAULT_ITERATIONS),
     )
+    parser.add_argument("--execution-mode", choices=("eager", "graph"), default="eager",
+                        help="graph captures a fixed request ring and replays it per iteration")
+    parser.add_argument("--graph-ring", type=int, default=8,
+                        help="BatchGet calls per graph replay (default: 8); ignored in eager mode")
     parser.add_argument(
         "--populate-chunk-entries",
         type=int,
@@ -359,6 +368,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "warmup must be non-negative"
     if args.iterations <= 0:
         return "iterations must be positive"
+    if args.graph_ring <= 0:
+        return "graph-ring must be positive"
     if args.populate_chunk_entries <= 0:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
@@ -459,6 +470,97 @@ def print_samples(
             f"useful_GiBps={useful_gibps:.3f}"
         )
     print(result)
+
+
+def measure_batch_get(args, torch, runtime, device_table, miss_count, output,
+                      create_request_plan, graph_type=None, validate_graph_output=None):
+    """Warm up and measure either one eager call or one fixed graph per round."""
+    calls = args.graph_ring if args.execution_mode == "graph" else 1
+    payload = args.miss_count * args.token_bytes * calls
+
+    def enqueue(plan, stream):
+        indices, offsets, output_indices = plan
+        runtime.batch_get(device_table, indices, offsets, miss_count,
+                          output_indices, output, stream=stream, synchronize=False)
+
+    capture = (capture_batch_get(torch.npu, graph_type, create_request_plan, enqueue, calls)
+               if args.execution_mode == "graph" else nullcontext(None))
+    results = dict(submit=[], synchronize=[], total=[], device=[], profiles=[])
+    with capture as replay:
+        if replay is not None:
+            print("BATCH_GET_GRAPH_CONTRACT api=kvaf.AclGraph "
+                  f"calls_per_replay={calls} fixed_request_ring=1 shared_output=1 "
+                  "capture_excluded=1 device_timing=npu_event "
+                  "profile_scope=last_get_in_replay")
+            if validate_graph_output is not None:
+                replay.graph.replay(replay.stream)
+                replay.stream.synchronize()
+                validate_graph_output(replay.last_plan)
+                torch.npu.synchronize()
+                print("BATCH_GET_GRAPH_CORRECTNESS_PASS scope=last_get_in_replay")
+        print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
+        for _ in range(args.warmup):
+            if replay is None:
+                plan = create_request_plan()
+                torch.npu.synchronize()
+                enqueue(plan, None)
+                torch.npu.synchronize()
+            else:
+                replay.graph.replay(replay.stream)
+                replay.stream.synchronize()
+        print(f"BATCH_GET_PERF_PHASE_DONE phase=warmup iterations={args.warmup}")
+
+        print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
+        with ConcurrentMeasurement(args.iterations, payload,
+                                   execution_mode=args.execution_mode,
+                                   calls_per_round=calls) as measurement:
+            for iteration in range(args.iterations):
+                if replay is None:
+                    plan = create_request_plan()
+                    torch.npu.synchronize()
+                measurement.before(iteration)
+                begin = time.monotonic_ns()
+                if replay is None:
+                    enqueue(plan, None)
+                else:
+                    replay.start.record(replay.stream)
+                    replay.graph.replay(replay.stream)
+                    replay.end.record(replay.stream)
+                submitted = time.monotonic_ns()
+                if replay is None:
+                    torch.npu.synchronize()
+                else:
+                    replay.end.synchronize()
+                completed = time.monotonic_ns()
+                results["submit"].append((submitted - begin) / 1_000_000.0)
+                results["synchronize"].append((completed - submitted) / 1_000_000.0)
+                results["total"].append((completed - begin) / 1_000_000.0)
+                device_ms = None if replay is None else replay.start.elapsed_time(replay.end)
+                if device_ms is not None:
+                    if not math.isfinite(device_ms) or device_ms <= 0:
+                        raise RuntimeError("graph timing requires a positive finite NPU Event duration")
+                    results["device"].append(device_ms)
+                measurement.after(iteration, begin, completed, device_elapsed_ms=device_ms)
+                if args.kernel_profile:
+                    # All captured calls share the native profile buffer. Only
+                    # the last call's core/Jetty/peer counters remain after replay.
+                    results["profiles"].append(list(runtime.batch_get_kernel_profile()))
+    return results
+
+
+def print_graph_samples(results, args):
+    calls = args.graph_ring
+    payload = args.miss_count * args.token_bytes * calls
+    for name, samples in (("host", results["total"]), ("device", results["device"])):
+        mean_ms = statistics.mean(samples)
+        print(f"PERF_RESULT operation=batch_get_graph_{name} samples={len(samples)} "
+              f"warmup_excluded={args.warmup} calls_per_replay={calls} "
+              f"payload_bytes_per_replay={payload} mean_ms={mean_ms:.6f} "
+              f"p50_ms={percentile(samples, 0.50):.6f} "
+              f"p90_ms={percentile(samples, 0.90):.6f} "
+              f"p99_ms={percentile(samples, 0.99):.6f} "
+              f"mean_us_per_get={mean_ms * 1000 / calls:.6f} "
+              f"useful_GBps={payload / (mean_ms * 1_000_000):.6f}")
 
 
 def print_kernel_profile(
@@ -642,21 +744,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     report_peer_eid_selection(args)
+    require_npu = bool(args.peer_eids) or args.execution_mode == "graph"
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
-            f"{'FAIL' if args.peer_eids else 'SKIP'}: NPU benchmark requires torch_npu; "
+            f"{'FAIL' if require_npu else 'SKIP'}: NPU benchmark requires torch_npu; "
             f"detected {backend.name} ({backend.reason})."
         )
-        return 2 if args.peer_eids else 0
+        return 2 if require_npu else 0
     import kvaf
 
     if not hasattr(kvaf, "NpuRuntime"):
         print(
-            f"{'FAIL' if args.peer_eids else 'SKIP'}: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
+            f"{'FAIL' if require_npu else 'SKIP'}: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
             "and KVAF_BUILD_PYTHON=ON."
         )
-        return 2 if args.peer_eids else 0
+        return 2 if require_npu else 0
+    if args.execution_mode == "graph" and not hasattr(kvaf, "AclGraph"):
+        print("FAIL: graph mode requires kvaf.AclGraph; rebuild with "
+              "KVAF_ENABLE_AIV_BATCH_GET=ON and KVAF_BUILD_PYTHON=ON", file=sys.stderr)
+        return 2
     if args.kernel_profile and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in (
@@ -671,8 +778,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
-        print(f"{'FAIL' if args.peer_eids else 'SKIP'}: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
-        return 2 if args.peer_eids else 0
+        print(f"{'FAIL' if require_npu else 'SKIP'}: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
+        return 2 if require_npu else 0
 
     kernel = Path(
         os.environ.get(
@@ -765,7 +872,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
-            "timing=call_to_stream_completion"
+            f"execution_mode={args.execution_mode} "
+            f"calls_per_round={args.graph_ring if args.execution_mode == 'graph' else 1} "
+            f"timing={'graph_replay_to_event_completion' if args.execution_mode == 'graph' else 'call_to_stream_completion'}"
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -940,80 +1049,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             kernel_profile_started = True
             print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
 
-        print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
-        for _ in range(args.warmup):
-            indices, offsets, output_indices = create_request_plan()
-            torch.npu.synchronize()
-            runtime.batch_get(
-                device_table,
-                indices,
-                offsets,
-                miss_count,
-                output_indices,
-                output,
-            )
-            # Keep caller-owned request Tensors alive through completion.
-            torch.npu.synchronize()
-        print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
+        def validate_graph_output(plan):
+            _, offsets, output_indices = plan
+            if miss_count_value:
+                destinations = output_indices[:miss_count_value].to(torch.int64)
+                slots = (offsets[:miss_count_value] // token_bytes).to(torch.int64)
+                if not torch.equal(output.index_select(0, destinations), entry_pattern.index_select(0, slots)):
+                    raise AssertionError("BatchGet graph replay payload validation failed")
 
-        print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
-        submit_samples: list[float] = []
-        synchronize_samples: list[float] = []
-        batch_get_samples: list[float] = []
-        kernel_profile_samples: list[list[dict[str, object]]] = []
-        with ConcurrentMeasurement(args.iterations, miss_count_value * token_bytes) as measurement:
-            for iteration in range(args.iterations):
-                indices, offsets, output_indices = create_request_plan()
-                # Request generation and Tensor work are deliberately excluded.
-                torch.npu.synchronize()
-                measurement.before(iteration)
-
-                begin = time.monotonic_ns()
-                runtime.batch_get(
-                    device_table,
-                    indices,
-                    offsets,
-                    miss_count,
-                    output_indices,
-                    output,
-                )
-                submitted = time.monotonic_ns()
-                torch.npu.synchronize()
-                completed = time.monotonic_ns()
-                submit_samples.append((submitted - begin) / 1_000_000.0)
-                synchronize_samples.append((completed - submitted) / 1_000_000.0)
-                batch_get_samples.append((completed - begin) / 1_000_000.0)
-                measurement.after(iteration, begin, completed)
-                if args.kernel_profile:
-                    kernel_profile_samples.append(
-                        list(runtime.batch_get_kernel_profile())
-                    )
-
-        print_samples(
-            "batch_get_submit",
-            submit_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
+        results = measure_batch_get(
+            args, torch, runtime, device_table, miss_count, output, create_request_plan,
+            graph_type=getattr(kvaf, "AclGraph", None),
+            validate_graph_output=validate_graph_output,
         )
-        print_samples(
-            "batch_get_synchronize",
-            synchronize_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
-        )
-        print_samples(
-            "batch_get",
-            batch_get_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
-        )
+        if args.execution_mode == "graph":
+            print_graph_samples(results, args)
+        else:
+            for operation, key in (("batch_get_submit", "submit"),
+                                   ("batch_get_synchronize", "synchronize"),
+                                   ("batch_get", "total")):
+                print_samples(operation, results[key], args.warmup, request_length,
+                              miss_count_value, token_bytes)
+        kernel_profile_samples = results["profiles"]
         if args.kernel_profile:
+            if args.execution_mode == "graph":
+                print("BATCH_GET_PROFILE_SCOPE scope=last_get_in_replay "
+                      f"calls_per_replay={args.graph_ring} "
+                      "reports=kernel,jetty,peer,sweep")
             print_kernel_profile(
                 kernel_profile_samples,
                 args.warmup,
@@ -1030,6 +1092,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token_bytes=token_bytes, miss_count=miss_count_value,
                 request_length=request_length, max_inflight_total=args.max_inflight_total,
                 warmup=args.warmup,
+                execution_mode=args.execution_mode,
+                calls_per_replay=args.graph_ring if args.execution_mode == "graph" else 1,
             )
             jetty_profile.print_table(jetty_rows)
             if args.jetty_csv:
@@ -1039,6 +1103,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 peer_eid_profile.report(
                     kernel_profile_samples, args.peer_eids, args.aiv_cores,
                     args.jettys_per_core, token_bytes, args.peer_csv,
+                    execution_mode=args.execution_mode,
+                    calls_per_replay=args.graph_ring if args.execution_mode == "graph" else 1,
                 )
             runtime.stop_batch_get_kernel_profile()
             kernel_profile_started = False

@@ -207,6 +207,7 @@ completion_wait_p90_us_values=()
 completion_wait_p99_us_values=()
 selected_ub_device_values=()
 address_space_csv_rows=()
+execution_csv_rows=()
 jetty_csv_files=()
 
 for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
@@ -250,6 +251,15 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
         address_space_budget_bytes="$(extract_field "$config_record" address_space_budget_bytes || true)"
         address_space_bytes="$(extract_field "$config_record" address_space_bytes || true)"
         address_space_csv_rows+=("$table_capacity,$tokens_per_block,$address_space_budget_bytes,$address_space_bytes")
+        execution_mode="$(extract_field "$config_record" execution_mode || true)"
+        calls_per_round="$(extract_field "$config_record" calls_per_round || true)"
+        execution_mode="${execution_mode:-eager}"
+        calls_per_round="${calls_per_round:-1}"
+        profile_scope=single_get
+        if [[ "$execution_mode" == graph ]]; then
+          profile_scope=last_get_in_replay
+        fi
+        execution_csv_rows+=("$execution_mode,$calls_per_round,$profile_scope")
 
     total_profile_result="$(
       extract_profile_result "$log_file" batch_get_kernel_total
@@ -374,6 +384,9 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
       "tokens_per_block=$tokens_per_block"
       "address_space_budget_bytes=$address_space_budget_bytes"
       "address_space_bytes=$address_space_bytes"
+      "execution_mode=$execution_mode"
+      "calls_per_replay=$calls_per_round"
+      "profile_scope=$profile_scope"
     )
     printf '%s\n' "${result[*]}"
         echo "BATCH_GET_CONFIG_SWEEP_DONE token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jettys_per_core"
@@ -385,8 +398,8 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
   echo "BATCH_GET_TOKEN_SWEEP_DONE token_bytes=$token_bytes"
 done
 
-printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores\n' \
-  "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ"
+printf '\nBATCH_GET_MISS_SWEEP_SUMMARY combinations=%s units=us clock_mhz=%s aggregation=max_elapsed_across_cores profile_scope=%s calls_per_replay=%s\n' \
+  "${#mean_us_values[@]}" "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" "$profile_scope" "$calls_per_round"
 printf 'BATCH_GET_MISS_SWEEP_STAGE_SUMMARY stage=kernel_total\n'
 printf '%-12s %-12s %-12s %-18s %15s %15s %15s %15s %15s\n' \
   token_bytes miss_count aiv_cores jettys_per_core mean_us p50_us p90_us p99_us p50_GB/s
@@ -439,9 +452,9 @@ echo "BATCH_GET_MISS_SWEEP_CLOCK clock_mhz=$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ conv
 mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
 {
   printf '%s\n' \
-    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,table_capacity,tokens_per_block,address_space_budget_bytes,address_space_bytes'
+    'token_bytes,miss_count,aiv_cores,jettys_per_core,mean_us,p50_us,p90_us,p99_us,p50_GBps,post_mean_us,post_p50_us,post_p90_us,post_p99_us,completion_wait_mean_us,completion_wait_p50_us,completion_wait_p90_us,completion_wait_p99_us,selected_ub_device,table_capacity,tokens_per_block,address_space_budget_bytes,address_space_bytes,execution_mode,calls_per_replay,profile_scope'
   for index in "${!mean_us_values[@]}"; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${token_bytes_values[$index]}" \
       "${miss_count_values[$index]}" \
       "${aiv_core_values[$index]}" \
@@ -460,7 +473,8 @@ mkdir -p "$(dirname "$KVAF_BATCH_GET_MISS_SWEEP_CSV")"
       "${completion_wait_p90_us_values[$index]}" \
       "${completion_wait_p99_us_values[$index]}" \
       "${selected_ub_device_values[$index]}" \
-      "${address_space_csv_rows[$index]}"
+      "${address_space_csv_rows[$index]}" \
+      "${execution_csv_rows[$index]}"
   done
 } >"$KVAF_BATCH_GET_MISS_SWEEP_CSV"
 echo "BATCH_GET_MISS_SWEEP_CSV_WRITTEN path=$KVAF_BATCH_GET_MISS_SWEEP_CSV rows=${#mean_us_values[@]}"

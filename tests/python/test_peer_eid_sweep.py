@@ -361,7 +361,10 @@ class PeerEidTests(unittest.TestCase):
                 reader = csv.DictReader(stream)
                 row = next(reader)
                 reference = (Path(__file__).parents[1] / 'run_remote_cpu_batch_get_miss_count_perf.sh').read_text()
-                self.assertIn("'" + ','.join(reader.fieldnames) + "'", reference)
+                # The shell adds execution/profile scope metadata for graph
+                # runs; the peer sweep keeps the same base metric columns.
+                self.assertIn("'" + ','.join(reader.fieldnames)
+                              + ",execution_mode,calls_per_replay,profile_scope'", reference)
             self.assertEqual(row['p50_us'], '0.500')
             self.assertEqual(row['post_p50_us'], '0.125')
             self.assertEqual(row['completion_wait_p50_us'], '0.250')
