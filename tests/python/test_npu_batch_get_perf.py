@@ -8,6 +8,8 @@ the remote table before measurement and is never included in the timing.
 Select implementations with --backend and eager/graph with --execution.
 Host and operator time/bandwidth reuse the existing device profiling data.
 --kernel-profile additionally prints stage/per-worker diagnostics.
+--get-timing async-wait measures submit plus device synchronization like main;
+completion checks and request retirement still run after each timed call.
 
 The five primary settings can be supplied as command-line options or through
 environment variables:
@@ -262,8 +264,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
                         help="enable a hardware run with the transport arguments")
     parser.add_argument(
-        "--get-timing", choices=("async-drain", "sync-call"), default="async-drain",
-        help="asynchronous submit plus drain (default), or time one synchronous batch_get call",
+        "--get-timing", choices=("async-drain", "async-wait", "sync-call"), default="async-drain",
+        help=("async-drain: submit plus drain (default); "
+              "async-wait: submit plus device synchronization, then drain outside timing to match main; "
+              "sync-call: time one synchronous batch_get call"),
     )
     add_execution_metadata(parser)
     parser.set_defaults(
@@ -429,9 +433,12 @@ def print_measurements(args, execution, samples, profiles):
         if mean <= 0:
             raise AssertionError("nonpositive BatchGet timing")
         p50, p90, p99 = (percentile(durations, q) for q in (.5, .9, .99))
+        timing = args.get_timing if execution == "eager" else "graph-replay-wait"
+        cleanup_excluded = scope == "kernel" or execution == "graph" or args.get_timing == "async-wait"
         print(
             f"BATCH_GET_RESULT backend={args.backend} execution={execution} "
             f"execution_mode={args.execution_mode} scope={scope} "
+            f"get_timing={timing} completion_cleanup_excluded={int(cleanup_excluded)} "
             f"samples={len(durations)} table_capacity={args.table_capacity} "
             f"request_length={args.request_length} miss_count={args.miss_count} "
             f"token_bytes={args.token_bytes} payload_bytes_per_call={payload} workers={args.aiv_cores} "
@@ -963,6 +970,11 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
     device_table = None
     kernel_profile_started = False
     try:
+        timing = {
+            "sync-call": "synchronous_batch_get",
+            "async-drain": "async_submit_to_drain",
+            "async-wait": "async_submit_to_wait",
+        }[args.get_timing]
         print(
             "BATCH_GET_PERF_CONFIG "
             f"execution_mode={args.execution_mode} "
@@ -981,7 +993,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
-            f"timing={'synchronous_batch_get' if args.get_timing == 'sync-call' else 'async_submit_to_drain'}"
+            f"get_timing={args.get_timing} timing={timing}"
         )
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
@@ -1190,6 +1202,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
         print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
               "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "
               f"profile_overhead_included={int(kernel_profile_started)} detail_output_enabled={int(args.kernel_profile)} "
+              f"eager_get_timing={args.get_timing} "
+              f"eager_post_wait_drain={int(args.execution != 'graph' and args.get_timing == 'async-wait')} "
               "bandwidth=useful_payload_once")
         if args.execution == "graph":
             run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
@@ -1212,7 +1226,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 **execution.get_kwargs,
             )
             # Keep caller-owned request Tensors alive through completion.
-            if args.get_timing == "sync-call":
+            if args.get_timing in ("sync-call", "async-wait"):
                 torch.npu.synchronize()
                 execution.drain_get(runtime)
             else:
@@ -1225,6 +1239,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
         print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
         submit_samples: list[float] = []
         synchronize_samples: list[float] = []
+        post_wait_drain_samples: list[float] = []
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
@@ -1248,8 +1263,16 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             if args.get_timing == "sync-call":
                 completed = submitted
             else:
-                execution.complete_async_get(runtime)
+                if args.get_timing == "async-wait":
+                    torch.npu.synchronize()
+                else:
+                    execution.complete_async_get(runtime)
                 completed = time.perf_counter()
+                if args.get_timing == "async-wait":
+                    # External synchronization does not retire framework leases.
+                    # Match main's timer while completing every request before reuse.
+                    execution.drain_get(runtime)
+                    post_wait_drain_samples.append((time.perf_counter() - completed) * 1000.0)
                 submit_samples.append((submitted - begin) * 1000.0)
                 synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
@@ -1259,7 +1282,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             if kernel_profile_started:
                 kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
 
-        if args.get_timing == "async-drain":
+        if args.get_timing != "sync-call":
             print_samples(
                 "batch_get_submit",
                 submit_samples,
@@ -1272,6 +1295,16 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             print_samples(
                 "batch_get_synchronize",
                 synchronize_samples,
+                args.warmup,
+                request_length,
+                miss_count_value,
+                token_bytes,
+                execution_mode=args.execution_mode,
+            )
+        if post_wait_drain_samples:
+            print_samples(
+                "batch_get_post_wait_drain",
+                post_wait_drain_samples,
                 args.warmup,
                 request_length,
                 miss_count_value,

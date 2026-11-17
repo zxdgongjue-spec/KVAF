@@ -143,12 +143,12 @@ class TimingTests(unittest.TestCase):
 
 
 class EagerCompletionTests(unittest.TestCase):
-    def run_eager(self, backend, mode, timing="async-drain", fail_drain=False):
+    def run_eager(self, backend, mode, timing="async-drain", fail_drain=False, fail_drain_on=1):
         with patch.dict(os.environ, {}, clear=True):
             args = perf.parse_args(["--backend", backend, "--get-timing", timing, "--workers", "2",
                                    "--table-capacity", "4", "--request-length", "4",
                                    "--miss-count", "4", "--warmup", "2", "--iterations", "3"])
-        events, pending = [], []
+        events, pending, leases = [], [], []
         runtime, torch = Mock(initialized=True), MagicMock()
         runtime.begin_get_output.return_value = 17
         runtime.batch_get_kernel_profile.return_value = [
@@ -158,9 +158,11 @@ class EagerCompletionTests(unittest.TestCase):
 
         def submit(*unused, synchronize=False, **kwargs):
             self.assertFalse(pending, "the preceding Get must have completed")
+            self.assertFalse(leases, "the preceding request lease must have retired")
             events.append("sync_submit" if synchronize else "submit")
             if not synchronize:
                 pending.append("Get")
+                leases.append("Get")
 
         def wait():
             events.append("wait")
@@ -168,12 +170,14 @@ class EagerCompletionTests(unittest.TestCase):
 
         def drain():
             events.append("drain")
-            if fail_drain:
+            if fail_drain and runtime.drain_get.call_count == fail_drain_on:
                 raise RuntimeError("injected drain failure")
             pending.clear()
+            leases.clear()
 
         def validate(*unused):
             self.assertFalse(pending, "validation must follow completed Get")
+            self.assertFalse(leases, "validation must follow request retirement")
             return True
 
         def clock():
@@ -213,21 +217,59 @@ class EagerCompletionTests(unittest.TestCase):
                                          ["clock", "submit", "clock", completion, "clock"])
                     self.assertEqual(runtime.drain_get.call_count, 6 if mode == "unified" else 0)
                     self.assertEqual([row["samples"] for row in records(output)], ["3", "3"])
+                    self.assertEqual(records(output)[0]["get_timing"], "async-drain")
+                    self.assertEqual(records(output)[0]["completion_cleanup_excluded"], "0")
+                    self.assertIn("operation=batch_get_synchronize samples=3", output)
+                    self.assertNotIn("operation=batch_get_post_wait_drain ", output)
+
+    def test_async_wait_matches_main_timer_and_retires_every_request(self):
+        for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):
+            with self.subTest(backend=backend):
+                events, runtime, output = self.run_eager(backend, "unified", "async-wait")
+                submissions = [i for i, event in enumerate(events) if event == "submit"]
+                self.assertEqual(len(submissions), 6)
+                for i in submissions[1:3]:
+                    self.assertEqual(events[i + 1:i + 3], ["wait", "drain"])
+                for i in submissions[3:]:
+                    self.assertEqual(events[i - 1:i + 6],
+                                     ["clock", "submit", "clock", "wait", "clock", "drain", "clock"])
+                self.assertEqual(runtime.drain_get.call_count, 6)
+                host, kernel = records(output)
+                self.assertEqual(host["get_timing"], "async-wait")
+                self.assertEqual(host["completion_cleanup_excluded"], "1")
+                self.assertEqual(host["p50_us"], "4000.000000")
+                self.assertEqual(kernel["completion_cleanup_excluded"], "1")
+                self.assertIn("timing=async_submit_to_wait", output)
+                self.assertIn("operation=batch_get_synchronize samples=3", output)
+                cleanup = [line for line in output.splitlines()
+                           if "operation=batch_get_post_wait_drain " in line]
+                self.assertEqual(len(cleanup), 1)
+                self.assertIn("samples=3", cleanup[0])
+                self.assertIn("p50_ms=2.000", cleanup[0])
 
     def test_sync_call_measurement_has_no_external_wait_or_drain(self):
         for mode in ("unified",):
             with self.subTest(mode=mode):
-                events, _, _ = self.run_eager("ubmem", mode, "sync-call")
+                events, _, output = self.run_eager("ubmem", mode, "sync-call")
                 submissions = [i for i, event in enumerate(events) if event == "sync_submit"]
                 self.assertEqual(len(submissions), 5)
                 self.assertEqual(events[submissions[2] - 1:],
                                  ["clock", "sync_submit", "clock"] +
                                  ["wait", "clock", "sync_submit", "clock"] * 2)
+                self.assertEqual(records(output)[0]["get_timing"], "sync-call")
+                self.assertEqual(records(output)[0]["completion_cleanup_excluded"], "0")
 
     def test_drain_failure_is_not_hidden_by_external_wait(self):
         events, runtime, output = self.run_eager("ubmem", "unified", fail_drain=True)
         i = events.index("submit")
         self.assertEqual(events[i + 1:], ["drain"])
+        self.assertNotIn("BATCH_GET_RESULT ", output)
+        runtime.shutdown.assert_called_once()
+
+    def test_post_wait_drain_failure_prevents_success_results(self):
+        events, runtime, output = self.run_eager(
+            "ubmem", "unified", "async-wait", fail_drain=True, fail_drain_on=4)
+        self.assertEqual(events[-6:], ["clock", "submit", "clock", "wait", "clock", "drain"])
         self.assertNotIn("BATCH_GET_RESULT ", output)
         runtime.shutdown.assert_called_once()
 
@@ -400,6 +442,8 @@ class GraphRunnerTests(unittest.TestCase):
             results = records(captured_output.getvalue())
             self.assertEqual([r["samples"] for r in results], ["3", "3"])
             self.assertEqual(results[1]["mean_us"], "0.111000")  # Actual measured replays 9, 10, 11.
+            self.assertTrue(all(row["get_timing"] == "graph-replay-wait" for row in results))
+            self.assertTrue(all(row["completion_cleanup_excluded"] == "1" for row in results))
             if execution_mode == "unified":
                 self.assertEqual(len(runtime.graph_leases), 1)
                 self.assertEqual(runtime.released_leases, [(23, False)])
