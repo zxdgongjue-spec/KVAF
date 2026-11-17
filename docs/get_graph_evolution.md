@@ -55,10 +55,11 @@ Recover 要求目标实例无输出/图绑定，先完成在途操作，再关�
 图期间禁止同一 Runtime 的额外 Get / Drain / Warmup / Recover / Shutdown。
 一个租约仅允许一个 Get 节点，Put 不进入图。
 
-AIV Direct 保持原状态处理语义：不增加每次状态清零或结果回拷。UBMEM Get 图捕获
-与 legacy 一致，不在 kernel 前追加 status 的 `aclrtMemsetAsync`；普通调用和 Put
-的状态初始化保持不变，图结束时仍同步并检查结果。图中报告由 kernel 覆盖，未写回时
-不提供逐次初始化哨兵检测，profile 也应在 replay 完成后读取。AICPU Gather/Scatter
+AIV Direct 保持原状态处理语义：不增加每次状态清零或结果回拷。UBMEM Get 的状态
+初始化与 legacy 一致：非图异步调用和图捕获不在 kernel 前追加 status 的
+`aclrtMemsetAsync`，同步 Get 和 Put 保留状态初始化。异步 Get 的 `drain_get()`
+仍等待完成并回读检查状态，图结束时仍同步并检查结果。未初始化的报告依靠 kernel
+覆盖，不提供逐次初始化哨兵检测，profile 应在本次执行完成后读取。AICPU Gather/Scatter
 使用设备侧 ticket 推进跨 replay 的通信序号；
 捕获阶段不注册、不分配、不同步，显式状态检查须在 replay 完成后执行。
 未重放的 AICPU 图正常结束会报未完成，可 `discard_result=True` 取消。

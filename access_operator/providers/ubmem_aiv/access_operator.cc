@@ -41,15 +41,19 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   const auto size = view.kernel.cores * sizeof(CoreStatus);
   const bool graph_get = args.operation == Operation::kGet &&
       capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
-  // Match legacy Get capture: replay contains only the Get kernel, which
-  // overwrites its report. Keep the sentinel for ordinary calls and Put.
-  if ((synchronize || view.managed_completion) && !graph_get) {
+  // Match legacy Get: only synchronous calls initialize the report. Async
+  // eager calls and graph replay rely on the kernel to overwrite it.
+  const bool reset_status = synchronize ||
+      (args.operation == Operation::kPut && view.managed_completion);
+  if (reset_status && !graph_get) {
     // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
     // not look like a successful zero-row kernel.
     auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
     if (!status.ok()) return status;
-    if (!call.graph_active) call.pending[stream] = ExecutionSlot::Pending::kStream;
   }
+  // Keep completion tracking even when an async Get has no status reset.
+  if ((synchronize || view.managed_completion) && !call.graph_active)
+    call.pending[stream] = ExecutionSlot::Pending::kStream;
   aclrtLaunchKernelAttr attrs[4]{};
   attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
   attrs[0].value.schemMode = 1;

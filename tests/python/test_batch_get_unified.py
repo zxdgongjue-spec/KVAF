@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 import test_npu_batch_get_perf as perf
 
@@ -139,6 +139,97 @@ class TimingTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             perf.print_measurements(args, "graph", [1, 3], [sample, sample])
         self.assertTrue(all(row["mean_GBps"] == "0.000000" for row in records(output.getvalue())))
+
+
+class EagerCompletionTests(unittest.TestCase):
+    def run_eager(self, backend, mode, timing="async-drain", fail_drain=False):
+        with patch.dict(os.environ, {}, clear=True):
+            args = perf.parse_args(["--backend", backend, "--execution-mode", mode,
+                                   "--get-timing", timing, "--workers", "2",
+                                   "--table-capacity", "4", "--request-length", "4",
+                                   "--miss-count", "4", "--warmup", "2", "--iterations", "3"])
+        events, pending = [], []
+        runtime, torch = Mock(initialized=True), MagicMock()
+        runtime.begin_get_output.return_value = 17
+        runtime.batch_get_kernel_profile.return_value = [
+            {"device_start_ns": 1000, "device_finish_ns": 1100},
+            {"device_start_ns": 1001, "device_finish_ns": 1101},
+        ]
+
+        def submit(*unused, synchronize=False, **kwargs):
+            self.assertFalse(pending, "the preceding Get must have completed")
+            events.append("sync_submit" if synchronize else "submit")
+            if not synchronize:
+                pending.append("Get")
+
+        def wait():
+            events.append("wait")
+            pending.clear()
+
+        def drain():
+            events.append("drain")
+            if fail_drain:
+                raise RuntimeError("injected drain failure")
+            pending.clear()
+
+        def validate(*unused):
+            self.assertFalse(pending, "validation must follow completed Get")
+            return True
+
+        def clock():
+            events.append("clock")
+            return len(events) / 1000
+
+        runtime.batch_get.side_effect = submit
+        runtime.drain_get.side_effect = drain
+        torch.npu.synchronize.side_effect = wait
+        torch.equal.side_effect = validate
+        kvaf = SimpleNamespace(NpuRuntime=lambda *a, **k: runtime,
+                               PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                               ExecutionResources=lambda **k: k)
+        output = io.StringIO()
+        with patch.object(perf, "token_pattern", return_value=MagicMock()), \
+             patch.object(perf.time, "perf_counter", side_effect=clock), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            if fail_drain:
+                with self.assertRaisesRegex(RuntimeError, "injected drain failure"):
+                    perf.run_case(args, torch, kvaf, "get.o", "put.o", "127.0.0.1:1")
+            else:
+                self.assertEqual(perf.run_case(args, torch, kvaf, "get.o", "put.o", "127.0.0.1:1"), 0)
+        return events, runtime, output.getvalue()
+
+    def test_async_completion_is_single_wait_for_all_backends(self):
+        for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):
+            for mode in ("legacy", "per-call"):
+                with self.subTest(backend=backend, mode=mode):
+                    events, runtime, output = self.run_eager(backend, mode)
+                    completion = "drain" if mode == "per-call" else "wait"
+                    submissions = [i for i, event in enumerate(events) if event == "submit"]
+                    self.assertEqual(len(submissions), 6)  # Preflight + warmup + measured calls.
+                    for i in submissions[:3]:
+                        self.assertEqual(events[i + 1], completion)
+                    for i in submissions[3:]:
+                        self.assertEqual(events[i - 1:i + 4],
+                                         ["clock", "submit", "clock", completion, "clock"])
+                    self.assertEqual(runtime.drain_get.call_count, 6 if mode == "per-call" else 0)
+                    self.assertEqual([row["samples"] for row in records(output)], ["3", "3"])
+
+    def test_sync_call_measurement_has_no_external_wait_or_drain(self):
+        for mode in ("legacy", "per-call"):
+            with self.subTest(mode=mode):
+                events, _, _ = self.run_eager("ubmem", mode, "sync-call")
+                submissions = [i for i, event in enumerate(events) if event == "sync_submit"]
+                self.assertEqual(len(submissions), 5)
+                self.assertEqual(events[submissions[2] - 1:],
+                                 ["clock", "sync_submit", "clock"] +
+                                 ["wait", "clock", "sync_submit", "clock"] * 2)
+
+    def test_drain_failure_is_not_hidden_by_external_wait(self):
+        events, runtime, output = self.run_eager("ubmem", "per-call", fail_drain=True)
+        i = events.index("submit")
+        self.assertEqual(events[i + 1:], ["drain"])
+        self.assertNotIn("BATCH_GET_RESULT ", output)
+        runtime.shutdown.assert_called_once()
 
 
 class Tensor:

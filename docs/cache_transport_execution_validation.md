@@ -498,7 +498,10 @@ Gather/Scatter 的同步调用还会收集设备分段 profile；AIV/UBMEM Host 
 kernel profile。因此应比较同一算法的 legacy 与 per-call，不能把不同算法的
 Host 绝对值直接当作仅由算法本身造成的差异。
 输出注册是否每轮释放由第 8 节的绑定模式决定。默认 `--get-timing async-drain`
-保留原提交和完成等待分段；per-call 的 `drain_get()` 包含完成检查，因此该模式的
+保留原提交和完成等待分段：legacy 提交后通过 `torch.npu.synchronize()` 等待；
+per-call 提交后直接 `drain_get()`，由 Runtime 等待并收尾，不再先重复外部同步。
+四种算法的预热和采样采用相同的完成方式；Graph replay 仍通过原 stream 同步。
+per-call 的 `drain_get()` 包含完成检查，因此该模式的
 `batch_get_synchronize` 不能解释为纯设备等待，也不用于四种算法的 Host 对比。
 
 使用原 miss-count 扫描入口进行同口径对照：

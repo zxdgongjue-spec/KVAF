@@ -83,6 +83,14 @@ class BenchmarkExecution:
         if self.mode == "per-call":
             runtime.drain_get()
 
+    def complete_async_get(self, runtime, legacy_synchronize):
+        # Drain waits for a managed Get itself; do not wait once more in Python.
+        # Legacy has no managed completion API and retains its external wait.
+        if self.mode == "per-call":
+            self.drain_get(runtime)
+        else:
+            legacy_synchronize()
+
     def bind_output(self, runtime, output, stream=None):
         if self.output_binding == "reused":
             if self.output_lease:

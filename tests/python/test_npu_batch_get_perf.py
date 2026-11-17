@@ -546,8 +546,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
 
     prepare(args.miss_count)
     submit()  # Register the fixed output and prepare state before capture.
-    stream.synchronize()
-    execution.drain_get(runtime)
+    execution.complete_async_get(runtime, stream.synchronize)
     check(args.miss_count)
     execution.release_output(runtime)
     options.pop("output_lease", None)
@@ -1136,8 +1135,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             output,
             **execution.get_kwargs,
         )
-        torch.npu.synchronize()
-        execution.drain_get(runtime)
+        execution.complete_async_get(runtime, torch.npu.synchronize)
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
             token_pattern(torch, preflight_token_ids[:miss_count_value], token_byte_indices),
@@ -1280,8 +1278,11 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 **execution.get_kwargs,
             )
             # Keep caller-owned request Tensors alive through completion.
-            torch.npu.synchronize()
-            execution.drain_get(runtime)
+            if args.get_timing == "sync-call":
+                torch.npu.synchronize()
+                execution.drain_get(runtime)
+            else:
+                execution.complete_async_get(runtime, torch.npu.synchronize)
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
         if uses_aicpu(args):
             # Do not charge deferred warmup status D2H to the first sample.
@@ -1313,8 +1314,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             if args.get_timing == "sync-call":
                 completed = submitted
             else:
-                torch.npu.synchronize()
-                execution.drain_get(runtime)
+                execution.complete_async_get(runtime, torch.npu.synchronize)
                 completed = time.perf_counter()
                 submit_samples.append((submitted - begin) * 1000.0)
                 synchronize_samples.append((completed - submitted) * 1000.0)

@@ -17,6 +17,7 @@ std::size_t status_reset_bytes = 0;
 bool fail_free = false, capturing = false;
 bool fail_wait = false, fail_copy = false, incomplete = false, fail_launch = false;
 kvaf::ubmem::BatchArgs captured_args{};
+kvaf::ubmem::BatchArgs eager_args{};
 std::uint32_t captured_blocks = 0;
 std::uint64_t profile_cycle = 1000;
 
@@ -96,6 +97,7 @@ aclError aclrtLaunchKernelWithHostArgs(aclrtFuncHandle, uint32_t blocks, aclrtSt
     captured_args = a;
     captured_blocks = blocks;
   } else {
+    eager_args = a;
     ExecuteKernel(a, blocks);
   }
   return 0;
@@ -279,8 +281,42 @@ int main() {
   get_call.execution.synchronize = false;
   const auto asynchronous_get_resets = status_resets;
   CHECK(graph_op.ExecuteBatchGet(get_call).ok());
-  CHECK(status_resets == asynchronous_get_resets + 1);
-  CHECK(status_reset_bytes == options.cores * sizeof(ubmem::CoreStatus));
+  CHECK(status_resets == asynchronous_get_resets);
+  // Direct Drain still waits and checks the report without a preceding reset
+  // or an external stream synchronize. Failures retain work for retry.
+  fail_wait = true;
+  CHECK(!graph_op.DrainGet().ok());
+  fail_wait = false;
+  fail_copy = true;
+  CHECK(!graph_op.DrainGet().ok());
+  fail_copy = false;
+  auto* eager_reports = reinterpret_cast<ubmem::CoreStatus*>(eager_args.statuses);
+  eager_reports[0].result = 2;
+  CHECK(!graph_op.DrainGet().ok());
+  eager_reports[0].result = 0;
+  CHECK(graph_op.DrainGet().ok());
+  for (int active : {0, 1}) {
+    count = active;
+    CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+    CHECK(status_resets == asynchronous_get_resets);
+    CHECK(graph_op.DrainGet().ok());
+    CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+    for (unsigned i = 0; i < options.cores; ++i)
+      CHECK(profiles[i].active_requests == std::uint64_t(active) * (i + 1) / options.cores -
+                                           std::uint64_t(active) * i / options.cores);
+  }
+  // A failed launch still leaves completion tracking for a safe drain.
+  fail_launch = true;
+  CHECK(!graph_op.ExecuteBatchGet(get_call).ok());
+  fail_launch = false;
+  CHECK(status_resets == asynchronous_get_resets);
+  fail_wait = true;
+  CHECK(!graph_op.DrainGet().ok());
+  fail_wait = false;
+  CHECK(graph_op.DrainGet().ok());
+  CHECK(!graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
+  CHECK(graph_op.ExecuteBatchGet(get_call).ok());
+  CHECK(status_resets == asynchronous_get_resets);
   CHECK(graph_op.DrainGet().ok());
   CHECK(graph_op.CopyBatchGetKernelProfiles(&profiles).ok());
   auto previous_cycle = profiles.front().kernel_start_cycle;
