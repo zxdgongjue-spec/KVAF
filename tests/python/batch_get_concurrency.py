@@ -43,11 +43,13 @@ def read_message(stream):
 class ConcurrentMeasurement:
     """Silent no-op for standalone runs; persistent rendezvous for multi-flow runs."""
 
-    def __init__(self, iterations, payload_bytes, *, execution_mode="eager", calls_per_round=1):
+    def __init__(self, iterations, payload_bytes, *, execution_mode="eager", calls_per_round=1,
+                 torch_npu_profiler=False):
         self.iterations = iterations
         self.payload_bytes = payload_bytes
         self.execution_mode = execution_mode
         self.calls_per_round = calls_per_round
+        self.torch_npu_profiler = torch_npu_profiler
         self.connection = self.stream = None
 
     def __enter__(self):
@@ -63,7 +65,8 @@ class ConcurrentMeasurement:
             send_message(self.connection, kind="hello", version=PROTOCOL_VERSION,
                          token=os.environ["KVAF_BATCH_GET_START_TOKEN"],
                          iterations=self.iterations, payload_bytes=self.payload_bytes,
-                         execution_mode=self.execution_mode, calls_per_round=self.calls_per_round)
+                         execution_mode=self.execution_mode, calls_per_round=self.calls_per_round,
+                         torch_npu_profiler=self.torch_npu_profiler)
             if read_message(self.stream) != {"kind": "accepted"}:
                 raise RuntimeError("concurrent launcher did not accept this worker")
             return self
@@ -196,6 +199,7 @@ def coordinate_rounds(listener, tokens, check_health, deadline, emit):
                     raise RuntimeError(f"{name}: graph round requires a positive finite NPU Event duration")
                 rows.append(dict(iteration=iteration, flow=name,
                                  execution_mode=peer["execution_mode"],
+                                 torch_npu_profiler=bool(peer.get("torch_npu_profiler", False)),
                                  calls_per_round=peer["calls_per_round"],
                                  payload_bytes=peer["payload_bytes"],
                                  begin_ns=done[name].get("begin_ns"), end_ns=done[name].get("end_ns"),
@@ -225,10 +229,12 @@ def report_results(samples, measurements, output_dir, emit):
     elif len(modes) > 1:
         summary["timing"] = "host_submit_to_completion"
     summary["flows"] = {}
+    summary["torch_npu_profiler"] = any(row["torch_npu_profiler"] for row in measurements)
     for name in dict.fromkeys(row["flow"] for row in measurements):
         rows = [row for row in measurements if row["flow"] == name]
         first = rows[0]
         flow = dict(device_id=first.get("device_id"), execution_mode=first["execution_mode"],
+                    torch_npu_profiler=first["torch_npu_profiler"],
                     calls_per_round=first["calls_per_round"],
                     payload_bytes_per_round=first["payload_bytes"])
         if first["execution_mode"] == "graph":

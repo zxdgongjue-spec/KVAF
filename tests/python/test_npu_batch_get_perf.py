@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend import detect_torch_backend
 from batch_get_concurrency import ConcurrentMeasurement
 from batch_get_graph import capture_batch_get
+from batch_get_profiler import BatchGetProfiler, add_profiler_arguments, validate_profiler_args
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids, select_peer_eids
 import batch_get_jetty_profile as jetty_profile
@@ -305,6 +306,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048),
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
+    add_profiler_arguments(parser)
     args = parser.parse_args(argv)
     args.requested_peer_eids = args.peer_eids
     args.peer_eids = select_peer_eids(args.requested_peer_eids, args.aiv_cores, args.jettys_per_core)
@@ -370,6 +372,9 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "iterations must be positive"
     if args.graph_ring <= 0:
         return "graph-ring must be positive"
+    profiler_error = validate_profiler_args(args)
+    if profiler_error:
+        return profiler_error
     if args.populate_chunk_entries <= 0:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
@@ -511,26 +516,31 @@ def measure_batch_get(args, torch, runtime, device_table, miss_count, output,
         print(f"BATCH_GET_PERF_PHASE_DONE phase=warmup iterations={args.warmup}")
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
-        with ConcurrentMeasurement(args.iterations, payload,
-                                   execution_mode=args.execution_mode,
-                                   calls_per_round=calls) as measurement:
+        with BatchGetProfiler(args, torch) as timeline, \
+                ConcurrentMeasurement(args.iterations, payload,
+                                      execution_mode=args.execution_mode, calls_per_round=calls,
+                                      torch_npu_profiler=args.torch_npu_profiler) as measurement:
             for iteration in range(args.iterations):
                 if replay is None:
-                    plan = create_request_plan()
-                    torch.npu.synchronize()
-                measurement.before(iteration)
+                    with timeline.range("prepare_request", iteration):
+                        plan = create_request_plan()
+                        torch.npu.synchronize()
+                with timeline.range("barrier_before", iteration):
+                    measurement.before(iteration)
                 begin = time.monotonic_ns()
-                if replay is None:
-                    enqueue(plan, None)
-                else:
-                    replay.start.record(replay.stream)
-                    replay.graph.replay(replay.stream)
-                    replay.end.record(replay.stream)
+                with timeline.range("batch_get" if replay is None else "graph_replay", iteration):
+                    if replay is None:
+                        enqueue(plan, None)
+                    else:
+                        replay.start.record(replay.stream)
+                        replay.graph.replay(replay.stream)
+                        replay.end.record(replay.stream)
                 submitted = time.monotonic_ns()
-                if replay is None:
-                    torch.npu.synchronize()
-                else:
-                    replay.end.synchronize()
+                with timeline.range("wait_completion", iteration):
+                    if replay is None:
+                        torch.npu.synchronize()
+                    else:
+                        replay.end.synchronize()
                 completed = time.monotonic_ns()
                 results["submit"].append((submitted - begin) / 1_000_000.0)
                 results["synchronize"].append((completed - submitted) / 1_000_000.0)
@@ -540,11 +550,14 @@ def measure_batch_get(args, torch, runtime, device_table, miss_count, output,
                     if not math.isfinite(device_ms) or device_ms <= 0:
                         raise RuntimeError("graph timing requires a positive finite NPU Event duration")
                     results["device"].append(device_ms)
-                measurement.after(iteration, begin, completed, device_elapsed_ms=device_ms)
+                with timeline.range("barrier_after", iteration):
+                    measurement.after(iteration, begin, completed, device_elapsed_ms=device_ms)
                 if args.kernel_profile:
                     # All captured calls share the native profile buffer. Only
                     # the last call's core/Jetty/peer counters remain after replay.
-                    results["profiles"].append(list(runtime.batch_get_kernel_profile()))
+                    with timeline.range("kernel_profile_snapshot", iteration):
+                        results["profiles"].append(list(runtime.batch_get_kernel_profile()))
+                timeline.step()
     return results
 
 
@@ -744,7 +757,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     report_peer_eid_selection(args)
-    require_npu = bool(args.peer_eids) or args.execution_mode == "graph"
+    require_npu = bool(args.peer_eids) or args.execution_mode == "graph" or args.torch_npu_profiler
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
@@ -873,6 +886,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
             f"execution_mode={args.execution_mode} "
+            f"torch_npu_profiler={int(args.torch_npu_profiler)} "
             f"calls_per_round={args.graph_ring if args.execution_mode == 'graph' else 1} "
             f"timing={'graph_replay_to_event_completion' if args.execution_mode == 'graph' else 'call_to_stream_completion'}"
         )

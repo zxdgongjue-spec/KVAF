@@ -24,6 +24,7 @@ import time
 
 import test_npu_batch_get_perf as perf
 import batch_get_concurrency as concurrency
+from batch_get_profiler import add_profiler_arguments
 from npu_eids import parse_npu_eids
 
 
@@ -62,12 +63,17 @@ Graph mode is the default: each iteration replays --graph-ring BatchGet calls
 only the last call in each replay. NPU Event durations cover the entire graph.
 Use --execution-mode eager to compare with the original per-call benchmark.
 Both execution options can also be overridden in --flowN-args.
+Use --torch-npu-profiler to record CPU/NPU timelines under output-dir/flowN/profiler.
+By default the profiler warms up for 1 measured round and records 3 rounds once.
+iterations must cover profiler-wait + profiler-warmup + profiler-active.
+Profiling adds overhead; raw data parsing happens after all measured rounds.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--execution-mode", choices=("graph", "eager"), default="graph")
     parser.add_argument("--graph-ring", type=int, default=8,
                         help="BatchGet calls per graph replay (default: 8)")
+    add_profiler_arguments(parser, output=False)
     parser.add_argument("--address-space-bytes", type=int,
                         help="remote DDR budget in bytes per flow; override in --flowN-args")
     if argv is None:
@@ -113,6 +119,11 @@ Both execution options can also be overridden in --flowN-args.
 def build_flow(args, name):
     """Reuse benchmark parsing and the original shell's single-shape output path."""
     options = ["--execution-mode", args.execution_mode, "--graph-ring", str(args.graph_ring),
+               "--profiler-wait", str(args.profiler_wait),
+               "--profiler-warmup", str(args.profiler_warmup),
+               "--profiler-active", str(args.profiler_active),
+               "--profiler-level", args.profiler_level,
+               *(["--torch-npu-profiler"] if args.torch_npu_profiler else []),
                *shlex.split(getattr(args, f"{name}_args"))]
     if args.address_space_bytes is not None:
         options = ["--address-space-bytes", str(args.address_space_bytes), *options]
@@ -126,6 +137,9 @@ def build_flow(args, name):
                *options, "--kernel-profile"]
     benchmark = perf.parse_args(options)
     output = args.output_dir.resolve() / name
+    if benchmark.torch_npu_profiler:
+        benchmark.profiler_dir = output / "profiler"
+        options.extend(["--profiler-dir", str(benchmark.profiler_dir)])
     if benchmark.peer_eids:
         # Keep peer reports isolated when flows inherit the same options.
         benchmark.peer_csv = str(output / "peer_samples.csv")
@@ -141,6 +155,7 @@ def build_flow(args, name):
         raise ValueError(f"{name}: priorities must be a comma-separated list in [0, 15]")
     env = dict(os.environ, DEVICE_ID=str(getattr(args, f"{name}_device")),
                PYTHONUNBUFFERED="1",
+               KVAF_BATCH_GET_FLOW_NAME=name,
                KVAF_BATCH_GET_JETTY_PRIORITIES=",".join(str(int(p)) for p in priorities),
                KVAF_BATCH_GET_SWEEP_TOKEN_BYTES=str(benchmark.token_bytes),
                KVAF_BATCH_GET_SWEEP_MISS_COUNTS=str(benchmark.miss_count),

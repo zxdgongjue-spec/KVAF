@@ -322,6 +322,9 @@ python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
 父输出目录的 `concurrent_batch_get_summary.json` 记录共同 Host 窗口吞吐和各流的
 整图 NPU Event 耗时；`flowN` 中的 kernel/Jetty profile 仅代表每轮最后一次 Get。
 详见[多流测量口径](docs/peer_eid_contention.md#多流共同窗口与总吞吐)。
+在多流命令上追加 `--torch-npu-profiler` 可采集可视化流水图，各流写入
+`flowN/profiler`；默认预热 profiler 1 轮、采集 3 轮，需至少 4 个 iterations。
+查看方式与完整示例见 [torch_npu profiler 时间线](docs/peer_eid_contention.md#torch_npu-profiler-时间线)。
 
 可用 `KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES` 设置默认预算，命令行优先。
 每个测试的配置日志和 miss-count 汇总 CSV 都会记录 `table_capacity`、

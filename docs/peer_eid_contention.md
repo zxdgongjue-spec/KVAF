@@ -248,6 +248,93 @@ Graph Event 和共同窗口测量仍包含启用 kernel profiling 后的执行�
 Host 调用窗口，即使有交集也不能单凭它证明物理链路同时传输，需结合设备时间线或端口统计。
 某条流提前退出、漏报轮次或超时会终止整组，不生成成功的聚合汇总。
 
+### torch_npu profiler 时间线
+
+在已有多流命令上追加 `--torch-npu-profiler`。各流使用独立的 `torch_npu.profiler`
+采集 CPU 和 NPU 活动，输出目录固定在 `output-dir/flowN/profiler`；不需要单独设置
+每流 profiler 路径。下面沿用前面的 EID 变量，两个 CPU EID 的流量配置也保持一致：
+
+```bash
+FLOW_ARGS="--token-bytes 656 --miss-count 8192 --aiv-cores 1 --jettys-per-core 4 --warmup 3 --iterations 10"
+
+KVAF_REMOTE_CPU_PERF_TIMEOUT=1200 \
+python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
+    --flow1-device 7 --flow2-device 6 \
+    --flow1-npu-eid "$NPU7_EID" --flow2-npu-eid "$NPU6_EID" \
+    --flow1-peer-eids "$CPU_EID_0,$CPU_EID_1" \
+    --flow2-peer-eids "$CPU_EID_0,$CPU_EID_1" \
+    --flow1-priorities 3 --flow2-priorities 13 \
+    --flow1-args="$FLOW_ARGS" --flow2-args="$FLOW_ARGS" \
+    --address-space-bytes 1073741824 \
+    --torch-npu-profiler --profiler-wait 0 --profiler-warmup 1 --profiler-active 3 \
+    --profiler-level Level1 \
+    --output-dir results/two-flows-profiler-001
+```
+
+`--warmup` 是 benchmark 预热；`--profiler-warmup` 是测量循环内的 profiler 预热，
+两者独立。默认 profiler 在 benchmark 预热完成后启动，跳过 0 轮，预热 1 轮，
+记录第 1、2、3 轮（从 0 编号），只采集一个周期：
+`iterations >= profiler-wait + profiler-warmup + profiler-active`。
+默认 `ring=8` 时，3 个 active 轮次包含每流 24 次 Get。后续测量轮次照常运行。
+这些选项也可在 `--flowN-args` 中覆盖；建议各流使用相同采集计划，
+单条流可用 `--no-torch-npu-profiler` 关闭。
+采集配置使用 `ProfilerActivity.CPU/NPU`、`repeat=1` 和 Text 导出，
+默认 `Level1`；可改为 `Level2` 增加 CANN Runtime API 信息。
+接口说明见昇腾官方 [schedule](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu-profiler/torch_npu-profiler-schedule.md)
+和 [采集配置](https://www.hiascend.com/doc_center/source/en/mindstudio/700/TITools/Profiling/atlasprofiling_16_0033.html)。
+
+每个 shape 单独创建目录，重复采集同一 shape 需更换输出目录。结构如下：
+
+```text
+output-dir/flowN/profiler/
+  token_bytes_656_miss_count_8192_aiv_cores_1_jettys_per_core_4/
+    collection.json
+    flowN_deviceD_pidP_<timestamp>_ascend_pt/
+      ASCEND_PROFILER_OUTPUT/
+        trace_view.json
+        kernel_details.csv
+      ... raw data and profiler logs ...
+```
+
+`collection.json` 记录 flow/device/PID、执行模式、ring、采集计划和首个 active 轮次。
+屏障前后、图提交、等待完成及 kernel profile 读取，在 CPU 时间线上分别标为
+`KVAF/<flow_device_pid>/roundN/barrier_before`、`barrier_after`、`graph_replay`、
+`wait_completion`、`kernel_profile_snapshot`。eager 模式对应 `prepare_request` 和
+`batch_get`。这些标记表示 Host 区间，NPU 任务的起止时间需查看实际设备泳道。
+KVAF 通过原生 ACL 接口提交自定义 kernel，因此框架泳道可能没有完整的 PyTorch 算子关联；
+检查设备任务和 Stream、模型/任务 ID，而不要只看 CPU 标记推断执行重叠。
+
+按以下方式打开真实采集结果：
+
+1. 查看多卡：在 MindStudio Insight 导入这次运行的输出目录；工具可递归查找各卡的
+   profiler 数据。若工具版本提示目录层级过深，改为导入各流的 profiler 数据目录。
+2. 查看单流：将对应的 `trace_view.json` 打开到 [Perfetto](https://ui.perfetto.dev/)。
+3. 定位短间隙：放大同一轮的设备 Stream，查看 ring 内相邻 kernel 的时长和间隙；
+   比较多卡时保留采集工具的原始时间基准，不将每条流首事件强行对齐。
+
+官方说明中，`trace_view.json` 包含应用层、CANN 和底层 NPU 时间线，支持
+[MindStudio Insight / Perfetto](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/850/devaids/profiling/atlasprofiling_16_1149.html)；
+MindStudio Insight 的多卡导入说明见[官方介绍](https://www.hiascend.com/document/detail/en/mindstudio/830/GUI_baseddevelopmenttool/MindStudioInsight/Insight_userguide_0002.html)。
+
+采集周期结束时只保存原始数据，所有测量轮次及屏障完成后才解析，
+每个流最多使用 1 个离线解析进程。终端输出 `BATCH_GET_TORCH_NPU_TRACE_WRITTEN path=...`
+定位结果；没有生成非空 `trace_view.json` 会报错并保留原始数据和日志。
+解析时间也受 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 约束，上例预留 1200 秒。
+异常退出保留部分原始数据，不自动解析。
+
+Profiler 采集和打点会增加运行开销；开启时 JSON 顶层和各流都标记
+`torch_npu_profiler=true`，本次性能数值用于观察流水和定位间隙。
+正式带宽对比应另跑一次关闭 profiler 的命令。
+它独立于原来的 `--kernel-profile`；后者的 last-get profile 语义不变。
+
+单卡原脚本也支持采集；在原有选卡/EID/shape 参数后追加：
+
+```bash
+--execution-mode graph --graph-ring 8 \
+--torch-npu-profiler --profiler-dir "$PWD/results/single-profiler-001" \
+--profiler-warmup 1 --profiler-active 3 --iterations 10
+```
+
 ### 四张 NPU 分别访问四个 CPU service
 
 在 NPU 主机上运行下面的命令。假设四个 CPU service 已分别监听在

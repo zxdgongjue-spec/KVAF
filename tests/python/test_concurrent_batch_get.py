@@ -61,7 +61,8 @@ def worker(mode, output):
     execution_mode = os.environ.get("KVAF_TEST_EXECUTION_MODE", "eager")
     calls = int(os.environ.get("KVAF_TEST_GRAPH_RING", "8")) if execution_mode == "graph" else 1
     with perf.ConcurrentMeasurement(iterations, 1024 * calls,
-                                    execution_mode=execution_mode, calls_per_round=calls) as measurement:
+                                    execution_mode=execution_mode, calls_per_round=calls,
+                                    torch_npu_profiler=os.environ.get("KVAF_TEST_PROFILER") == "1") as measurement:
         for iteration in range(iterations):
             if mode == "slow_round" and iteration == 1:
                 time.sleep(0.2)
@@ -184,6 +185,30 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
+    def test_profiler_options_and_paths_are_isolated_per_flow(self):
+        args = self.args(extra=["--torch-npu-profiler", "--profiler-wait", "2",
+                                "--profiler-warmup", "1", "--profiler-active", "4",
+                                "--profiler-level", "Level2"])
+        args.flow1_args += " --profiler-dir ignored-shared-path --profiler-active 5"
+        with patch.dict(os.environ, self.env, clear=True):
+            for name, active in (("flow1", 5), ("flow2", 4)):
+                _, command, env = launcher.build_flow(args, name)
+                parsed = perf.parse_args(command[3:])
+                self.assertTrue(parsed.torch_npu_profiler)
+                self.assertEqual(parsed.profiler_dir, args.output_dir.resolve() / name / "profiler")
+                self.assertEqual((parsed.profiler_wait, parsed.profiler_warmup, parsed.profiler_active,
+                                  parsed.profiler_level), (2, 1, active, "Level2"))
+                self.assertEqual(env["KVAF_BATCH_GET_FLOW_NAME"], name)
+            args.flow2_args += " --no-torch-npu-profiler"
+            _, command, _ = launcher.build_flow(args, "flow2")
+            self.assertFalse(perf.parse_args(command[3:]).torch_npu_profiler)
+
+    def test_profiler_needs_enough_rounds_before_any_launch(self):
+        args = self.args(options="--iterations 2", extra=["--torch-npu-profiler"])
+        with patch.dict(os.environ, self.env, clear=True), self.assertRaisesRegex(ValueError, "iterations"):
+            launcher.build_flow(args, "flow1")
+        self.assertFalse(args.output_dir.exists())
+
     def test_graph_defaults_and_explicit_execution_overrides(self):
         for extra, flow_options, expected_mode, expected_ring in (
                 ([], "", "graph", 8),
@@ -202,12 +227,13 @@ class ConcurrentTests(ConcurrentFixture):
     def test_graph_summary_uses_ring_bytes_and_separate_device_event_durations(self):
         flows = self.flows("normal", "normal")
         for (_, _, env), ring in zip(flows, (8, 4)):
-            env.update(KVAF_TEST_EXECUTION_MODE="graph", KVAF_TEST_GRAPH_RING=str(ring))
+            env.update(KVAF_TEST_EXECUTION_MODE="graph", KVAF_TEST_GRAPH_RING=str(ring), KVAF_TEST_PROFILER="1")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(launcher.run_flows(flows, 5, self.output), 0)
         summary = json.loads((self.output / concurrency.REPORT_FILES[2]).read_text())
         self.assertEqual(summary["total_payload_bytes"], 3 * (8 + 4) * 1024)
         self.assertEqual(summary["execution_mode"], "graph")
+        self.assertTrue(summary["torch_npu_profiler"])
         self.assertEqual(summary["timing"], "host_graph_replay_to_event_completion")
         for name, ring in (("flow1", 8), ("flow2", 4)):
             row = summary["flows"][name]
@@ -216,6 +242,7 @@ class ConcurrentTests(ConcurrentFixture):
             self.assertEqual(row["device_event_mean_us_per_replay"], ring * 1000)
             self.assertEqual(row["device_event_mean_us_per_get"], 1000)
             self.assertEqual(row["profile_scope"], "last_get_in_replay")
+            self.assertTrue(row["torch_npu_profiler"])
             self.assertAlmostEqual(row["device_event_GBps"], 0.001024)
         with (self.output / concurrency.REPORT_FILES[1]).open() as stream:
             rows = list(csv.DictReader(stream))

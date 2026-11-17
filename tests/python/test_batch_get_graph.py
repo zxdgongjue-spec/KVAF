@@ -123,10 +123,13 @@ class GraphFixture(unittest.TestCase):
         self.assertEqual(self.output.last, plan[0].value)
         self.trace.append("validate")
 
-    def run_benchmark(self, mode="graph", ring=8, warmup=2, validate=True):
+    def run_benchmark(self, mode="graph", ring=8, warmup=2, validate=True, profiler_dir=None):
         args = perf.parse_args(["--execution-mode", mode, "--graph-ring", str(ring),
                                 "--warmup", str(warmup), "--iterations", "2",
-                                "--miss-count", "50", "--token-bytes", "64", "--kernel-profile"])
+                                "--miss-count", "50", "--token-bytes", "64", "--kernel-profile",
+                                *(["--torch-npu-profiler", "--profiler-dir", str(profiler_dir),
+                                   "--profiler-warmup", "0", "--profiler-active", "2"]
+                                  if profiler_dir else [])])
         with patch.object(perf, "ConcurrentMeasurement", self.measurement_type), \
                 patch.object(perf.time, "monotonic_ns", side_effect=[
                     1_000_000, 2_000_000, 10_000_000, 11_000_000, 12_000_000, 20_000_000]), \
@@ -141,7 +144,8 @@ class GraphTests(GraphFixture):
     def test_fixed_ring_capture_events_barriers_and_byte_accounting(self):
         args, results = self.run_benchmark()
         self.assertEqual(self.metadata, dict(iterations=2, payload_bytes=50 * 64 * 8,
-                                            execution_mode="graph", calls_per_round=8))
+                                            execution_mode="graph", calls_per_round=8,
+                                            torch_npu_profiler=False))
         self.assertEqual(self.trace.count("prepare"), 8)
         self.assertEqual(self.trace.count("capture_get"), 8)
         self.assertEqual(self.trace.count("replay"), 5)  # validation, warmup x2, measured x2
