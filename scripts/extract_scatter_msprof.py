@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the Host and device events needed to time a Scatter Graph replay."""
+"""Extract Host and device timing events for Scatter eager and Graph runs."""
 
 import argparse
 import csv
@@ -34,6 +34,8 @@ def event_kind(name, args):
     api = label.lower()
     if api.startswith(("aclmdlriexecute", "aclmdlexecute", "rtmodelexecute", "modelexecute")):
         return "host_replay"
+    if "launchkernel" in api or "kernellaunch" in api:
+        return "host_launch"
     if "synchronizestream" in api or "streamsynchronize" in api:
         return "host_sync"
     for candidate in (api, args.get("kernelname", ""), args.get("opname", "")):
@@ -80,7 +82,7 @@ def select_window(rows, last, context_us):
               file=sys.stderr)
         return rows
     if last > len(scatter):
-        print(f"Requested {last} Scatter replays but found {len(scatter)}.", file=sys.stderr)
+        print(f"Requested {last} Scatter tasks but found {len(scatter)}.", file=sys.stderr)
     if last and last < len(scatter):
         start = scatter[-last - 1]["end_us"]
     else:
@@ -95,7 +97,7 @@ def main():
     parser.add_argument("trace", type=Path, help="one msprof_*.json timeline")
     parser.add_argument("-o", "--output", type=Path, help="CSV path; defaults to standard output")
     parser.add_argument("--last", type=int, default=0,
-                        help="keep the last N Scatter replays; 0 keeps all")
+                        help="keep the last N Scatter tasks; 0 keeps all")
     parser.add_argument("--context-us", type=int, default=500,
                         help="time around the first and last Scatter task, in microseconds")
     args = parser.parse_args()
@@ -119,9 +121,10 @@ def main():
 
     print(f"Extracted {len(rows)} events.", file=sys.stderr)
     present = {row["kind"] for row in rows}
-    for kind in ("host_replay", "host_sync"):
-        if kind not in present:
-            print(f"No {kind} events found in the selected window.", file=sys.stderr)
+    if not present.intersection({"host_launch", "host_replay"}):
+        print("No Host launch or replay events found in the selected window.", file=sys.stderr)
+    if "host_sync" not in present:
+        print("No Host synchronization events found in the selected window.", file=sys.stderr)
 
 
 if __name__ == "__main__":
