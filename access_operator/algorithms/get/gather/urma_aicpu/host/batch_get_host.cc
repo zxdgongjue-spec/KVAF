@@ -33,8 +33,8 @@ struct BatchGetTransport::Impl {
   void* profile_host{nullptr};
   using Invocation = AicpuGetInvocation;
   ExecutionViewState views;
-  Invocation legacy{this};
-  Invocation* invocation{&legacy};
+  Invocation default_invocation{this};
+  Invocation* invocation{&default_invocation};
   bool profiling{false};
   bool initialized{false}, cpu_enabled{false};
   Status Drain(const char* stage = "drain", bool check_status = true);
@@ -94,7 +94,7 @@ std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
   return std::make_unique<Impl::Invocation>(impl_.get());
 }
 Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
-  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
+  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->default_invocation;
   if (!typed || typed->owner != impl_.get()) return Status::InvalidArgument("Get invocation belongs to another resource");
   impl_->invocation = typed;
   impl_->views.Bind(typed);

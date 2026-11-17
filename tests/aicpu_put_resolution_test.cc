@@ -57,8 +57,8 @@ namespace kvaf::aicpu_urma {
 struct BatchGetTransport::Impl {
   explicit Impl(UmdkSession& s) : session(s) {}
   UmdkSession& session;
-  AicpuGetInvocation legacy{this};
-  AicpuGetInvocation* call{&legacy};
+  AicpuGetInvocation default_invocation{this};
+  AicpuGetInvocation* call{&default_invocation};
   uint64_t region = 0;
   uint8_t workspace[64]{};
 };
@@ -100,7 +100,7 @@ std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
   return std::make_unique<AicpuGetInvocation>(impl_.get());
 }
 Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
-  impl_->call = state ? static_cast<AicpuGetInvocation*>(state) : &impl_->legacy;
+  impl_->call = state ? static_cast<AicpuGetInvocation*>(state) : &impl_->default_invocation;
   return Status::OK();
 }
 Status PrepareUmdkKernel(const std::string&, UmdkKernelKind) { return Status::OK(); }
@@ -212,7 +212,7 @@ int main() {
   UmdkAccessOperatorConfig provider;
   provider.kernel_json = config.kernel_json; provider.workers = config.workers;
   provider.local_eid = config.local_eid; provider.peer_link = config.peer_link;
-  provider.enable_get = false; provider.managed_completion = true;
+  provider.enable_get = false;
   auto adapter = std::make_unique<UmdkAccessOperator>(provider);
   auto owner = adapter->TakeResources();
   CHECK(owner && !adapter->TakeResources());
@@ -374,20 +374,20 @@ int main() {
     CHECK(bound_owner->Close().ok() && destroys == before_bound_close + 1);
     CHECK(bound.BindExecutionState(nullptr).ok());
   }
-  // Legacy uses the original main policy: cache input MR until session close.
+  // The provider's default state follows the same retirement policy as a
+  // dispatcher-bound state: ordinary inputs are released after each Put.
   {
-    auto legacy_config = provider; legacy_config.managed_completion = false;
-    UmdkAccessOperator legacy(legacy_config);
-    CHECK(legacy.Initialize(region).ok());
+    UmdkAccessOperator standalone(provider);
+    CHECK(standalone.Initialize(region).ok());
     const auto regs = registrations, unregs = unregisters, single_unregs = single_unregisters;
     for (int i = 0; i < 3; ++i) {
-      CHECK(legacy.ExecuteBatchPut(call).ok());
-      CHECK(legacy.AcknowledgePut().ok());
-      CHECK(registrations == regs + 1);
-      CHECK(unregisters == unregs && single_unregisters == single_unregs);
+      CHECK(standalone.ExecuteBatchPut(call).ok());
+      CHECK(standalone.AcknowledgePut().ok());
+      CHECK(registrations == regs + i + 1);
+      CHECK(unregisters == unregs + i + 1 && single_unregisters == single_unregs);
     }
-    const auto before_legacy_close = destroys;
-    CHECK(legacy.Shutdown().ok() && destroys == before_legacy_close + 1);
+    const auto before_close = destroys;
+    CHECK(standalone.Shutdown().ok() && destroys == before_close + 1);
   }
   provider.enable_get = true;
   UmdkAccessOperator gather(provider);

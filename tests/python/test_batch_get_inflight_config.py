@@ -81,7 +81,7 @@ class InflightConfigTests(unittest.TestCase):
 import json, os, pathlib, sys
 with pathlib.Path(os.environ["CALL_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
-mode = sys.argv[sys.argv.index("--execution-mode") + 1]
+mode = "unified"
 print(f"BATCH_GET_PERF_CONFIG execution_mode={mode}")
 if "--adaptive-calibration-only" in sys.argv:
     print("[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED reason=k_side_device_filter")
@@ -95,7 +95,6 @@ for stage in ("total", "post", "completion_wait"):
                 ([], "urma", 2),
                 (["--transport", "ubmem"], "ubmem", 1),
                 (["--transport=ubmem"], "ubmem", 1),
-                (["--transport", "urma", "--adaptive-ub-device"], "urma", 3),
             )):
                 with self.subTest(options=options):
                     log = root / f"calls_{number}.jsonl"
@@ -107,7 +106,7 @@ for stage in ("total", "post", "completion_wait"):
                                KVAF_BATCH_GET_MISS_SWEEP_CSV=str(root / f"summary_{number}.csv"))
                     result = subprocess.run([
                         str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_miss_count_perf.sh"),
-                        str(root / "build"), *options,
+                        str(root / "build"), "--timing", "kernel", *options,
                     ], env=env, capture_output=True, text=True, timeout=15)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     records = [json.loads(line) for line in log.read_text().splitlines()]

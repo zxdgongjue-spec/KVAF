@@ -39,8 +39,8 @@ struct CpuPushTransport::Impl {
   Layout layout;
   using Invocation = aicpu_urma::AicpuGetInvocation;
   ExecutionViewState views;
-  Invocation legacy{this};
-  Invocation* invocation{&legacy};
+  Invocation default_invocation{this};
+  Invocation* invocation{&default_invocation};
   bool peer_open{}, initialized{}, profiling{};
   ExecutionHealth health;
 
@@ -96,7 +96,7 @@ std::unique_ptr<ExecutionState> CpuPushTransport::CreateExecutionState() {
   return std::make_unique<Impl::Invocation>(impl_.get());
 }
 Status CpuPushTransport::BindExecutionState(ExecutionState* state) {
-  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->legacy;
+  auto* typed = state ? dynamic_cast<Impl::Invocation*>(state) : &impl_->default_invocation;
   if (!typed || typed->owner != impl_.get()) return Status::InvalidArgument("Get invocation belongs to another resource");
   impl_->invocation = typed;
   impl_->views.Bind(typed);

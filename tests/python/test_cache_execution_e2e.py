@@ -201,22 +201,20 @@ class Suite:
             build = Path(self.a.build_dir).resolve()
             get_kernel = str(build / "bin/kvaf_execute_batch_get_kernels.o")
             put_kernel = str(build / "bin/kvaf_execute_batch_put_kernels.o")
-            def budget(route):
-                kw = dict(cores=self.a.cores, request_capacity=self.a.rows)
+            def budget(route, kernel):
+                kw = dict(cores=self.a.cores, request_capacity=self.a.rows, kernel_path=kernel if route.executor == "aiv" else "")
                 if route.transport == "urma" and route.executor == "aiv":
                     kw["jettys"] = 2
                 if route.algorithm == "gather":
                     kw["cpu_threads"] = self.a.cpu_threads
                 return self.k.ExecutionResources(**kw)
             self.runtime = self.k.NpuRuntime(
-                get_kernel, self.a.token_bytes, self.a.tokens_per_block,
-                device_id=self.a.device, npu_core_count=self.a.cores,
-                batch_put_kernel_object_path=put_kernel, jettys_per_core=2,
-                transport=self.mode, per_call_execution=True,
+                self.a.token_bytes, self.a.tokens_per_block,
+                device_id=self.a.device, transport_mode=self.mode,
                 npu_eids=parse_npu_eids(self.a.npu_eids), peer_ub_device=self.a.peer_ub_device,
                 default_put=self.puts[0].config(self.k), default_get=self.gets[0].config(self.k),
-                put_resources=[(p.config(self.k), budget(p)) for p in self.puts],
-                get_resources=[(g.config(self.k), budget(g)) for g in self.gets])
+                put_resources=[(p.config(self.k), budget(p, put_kernel)) for p in self.puts],
+                get_resources=[(g.config(self.k), budget(g, get_kernel)) for g in self.gets])
             self.runtime.link_to(self.a.peer)
         self.runtime.initialize(4 * (self.a.rows + 1) * self.slot, self.slot)
         self.region = dict(self.runtime.remote_region)

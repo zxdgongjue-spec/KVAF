@@ -17,7 +17,7 @@ import json, os, pathlib, sys
 def option(name): return sys.argv[sys.argv.index(name) + 1]
 with pathlib.Path(os.environ["CALL_LOG"]).open("a") as output:
     output.write(json.dumps(sys.argv[1:]) + "\\n")
-mode = os.environ.get("REPORTED_MODE", option("--execution-mode"))
+mode = os.environ.get("REPORTED_MODE", "unified")
 if not os.environ.get("MISSING_CONFIG"):
     print(f"BATCH_GET_PERF_CONFIG execution_mode={mode} timing=synchronous_batch_get")
 if "--adaptive-calibration-only" in sys.argv:
@@ -73,16 +73,16 @@ class KernelProfileSweepTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_explicit_kernel_modes_forward_and_label_results(self):
-        for mode in ("legacy", "per-call"):
+        for mode in ("unified",):
             for transport in ("urma", "ubmem"):
                 with self.subTest(mode=mode, transport=transport):
                     result, calls, rows, _ = self.run_sweep([
-                        f"--execution-mode={mode}", "--timing", "kernel", "--transport", transport,
+                        "--timing", "kernel", "--transport", transport,
                         "--table-capacity", "64"])
                     self.assert_success(result)
                     self.assertEqual(len(calls), 2 if transport == "urma" else 1)
                     for call in calls:
-                        self.assertEqual(call[call.index("--execution-mode") + 1], mode)
+                        self.assertNotIn("--execution-mode", call)
                         self.assertEqual(call[call.index("--transport") + 1], transport)
                         self.assertEqual(call[call.index("--table-capacity") + 1], "64")
                         self.assertIn("--kernel-profile", call)
@@ -97,58 +97,55 @@ class KernelProfileSweepTests(unittest.TestCase):
                     for tag in ("PLAN", "RESULT", "SUMMARY"):
                         self.assertIn(f"BATCH_GET_MISS_SWEEP_{tag} execution_mode={mode} timing=kernel_cycles", result.stdout)
 
-    def test_auto_defaults_are_preserved(self):
-        for options, mode, timing in (([], "legacy", "kernel_cycles"),
-                (["--execution-mode", "per-call"], "per-call", "synchronous_batch_get")):
+    def test_host_default_and_explicit_kernel_timing(self):
+        for options, timing in (([], "synchronous_batch_get"), (["--timing", "kernel"], "kernel_cycles")):
             result, calls, rows, _ = self.run_sweep(options)
             self.assert_success(result)
             self.assertEqual(len(rows), 2)
             for row in rows:
-                self.assertEqual((row["execution_mode"], row["timing"]), (mode, timing))
-            self.assertEqual("--kernel-profile" in calls[0], mode == "legacy")
-            self.assertEqual("--no-kernel-profile" in calls[0], mode == "per-call")
+                self.assertEqual((row["execution_mode"], row["timing"]), ("unified", timing))
+            self.assertEqual("--kernel-profile" in calls[0], timing == "kernel_cycles")
+            self.assertEqual("--no-kernel-profile" in calls[0], timing == "synchronous_batch_get")
 
     def test_missing_or_wrong_reported_mode_is_not_accepted(self):
         for overrides in ({"REPORTED_MODE": "legacy"}, {"MISSING_CONFIG": "1"}):
-            result, _, rows, _ = self.run_sweep(["--execution-mode", "per-call", "--timing=kernel"], **overrides)
+            result, _, rows, _ = self.run_sweep(["--timing=kernel"], **overrides)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("expected execution_mode=per-call", result.stderr)
+            self.assertIn("expected execution_mode=unified", result.stderr)
             self.assertFalse(rows)
 
     def test_missing_profile_stages_fail(self):
         for transport, missing in (("urma", "total"), ("urma", "post"),
                 ("urma", "completion_wait"), ("ubmem", "total"), ("ubmem", "address_prepare")):
             with self.subTest(transport=transport, missing=missing):
-                result, _, rows, _ = self.run_sweep(["--execution-mode", "per-call",
-                    "--timing", "kernel", "--transport", transport], MISSING_STAGE=missing, DETAIL="1")
+                result, _, rows, _ = self.run_sweep(["--timing", "kernel", "--transport", transport], MISSING_STAGE=missing, DETAIL="1")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("profile", result.stderr)
                 self.assertFalse(rows)
 
     def test_child_failure_propagates_even_after_profiles(self):
-        result, calls, rows, _ = self.run_sweep(["--execution-mode", "per-call", "--timing", "kernel"], RUNNER_EXIT="37")
+        result, calls, rows, _ = self.run_sweep(["--timing", "kernel"], RUNNER_EXIT="37")
         self.assertEqual(result.returncode, 37)
         self.assertEqual(len(calls), 1)
         self.assertIn("status=37", result.stderr)
         self.assertFalse(rows)
 
     def test_ubmem_detail_labels_use_selected_mode(self):
-        result, _, _, summary = self.run_sweep(["--execution-mode", "per-call",
-            "--timing", "kernel", "--transport", "ubmem"], DETAIL="1")
+        result, _, _, summary = self.run_sweep(["--timing", "kernel", "--transport", "ubmem"], DETAIL="1")
         self.assert_success(result)
         with summary.with_name("summary_ubmem_stages.csv").open() as source:
             rows = list(csv.DictReader(source))
         self.assertEqual(len(rows), 5)
         self.assertEqual({(row["execution_mode"], row["timing"]) for row in rows},
-                         {("per-call", "kernel_cycles")})
+                         {("unified", "kernel_cycles")})
 
-    def test_adaptive_preflight_preserves_execution_mode(self):
-        result, calls, _, _ = self.run_sweep(["--execution-mode", "per-call", "--timing", "kernel", "--adaptive-ub-device"])
-        self.assert_success(result)
-        self.assertEqual(len(calls), 3)
-        self.assertIn("--adaptive-calibration-only", calls[0])
-        for call in calls:
-            self.assertEqual(call[call.index("--execution-mode") + 1], "per-call")
+    def test_retired_switches_rejected(self):
+        for options in (["--adaptive-ub-device"], ["--execution-mode", "legacy"]):
+            result, calls, rows, _ = self.run_sweep(options)
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse(calls)
+            self.assertFalse(rows)
+
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from perf_execution import add_execution_mode
+from perf_execution import add_execution_metadata
 
 
 def values(name, default):
@@ -56,12 +56,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("build_dir")
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
-    add_execution_mode(parser)
+    add_execution_metadata(parser)
     args, options = parser.parse_known_args(argv)
     if any(option.split("=", 1)[0] in ("--kernel-profile", "--ubmem-profile-detail",
-                                       "--adaptive-ub-device", "--adaptive-calibration-only", "--get-timing")
+                                       "--adaptive-ub-device", "--adaptive-calibration-only", "--execution-mode", "--get-timing")
            for option in options):
-        parser.error("Host sweep requires fixed routing without kernel profiling or adaptive calibration")
+        parser.error("Host sweep uses unified synchronous execution; remove unsupported profiling/routing/timing switches")
     root = Path(__file__).resolve().parents[2]
     runner = Path(os.environ.get("KVAF_BATCH_GET_PERF_RUNNER",
                                  str(root / "tests/run_remote_cpu_batch_get_perf.sh")))
@@ -79,7 +79,7 @@ def main(argv=None):
         for token, miss, core, jetty in itertools.product(tokens, misses, cores, jettys):
             log_path = directory / f"token_{token}_miss_{miss}_cores_{core}_jettys_{jetty}.log"
             command = [str(runner), args.build_dir, *options, "--transport", args.transport,
-                       "--execution-mode", args.execution_mode, "--no-kernel-profile",
+                        "--no-kernel-profile",
                        "--get-timing", "sync-call",
                        "--token-bytes", str(token), "--miss-count", str(miss),
                        "--aiv-cores", str(core), "--jettys-per-core", str(jetty)]

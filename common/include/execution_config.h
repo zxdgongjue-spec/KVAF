@@ -27,13 +27,14 @@ inline bool operator==(PutExecutionConfig a, PutExecutionConfig b) {
 inline bool operator==(GetExecutionConfig a, GetExecutionConfig b) {
   return a.transport == b.transport && a.executor == b.executor && a.algorithm == b.algorithm;
 }
-// Zero cores/Jettys inherit legacy constructor defaults; an explicit in-flight
-// value of zero disables the limiter. Kernel paths can differ by provider.
 struct ExecutionWarmup {
   std::uint32_t request_capacity{0};
   void* stream{nullptr};
 };
 struct ExecutionResources {
+  // Zero cores/Jettys use the provider defaults (2 each); an absent in-flight
+  // budget uses 2048 and an explicit zero disables the limiter. AIV kernel
+  // paths are supplied per provider; AICPU packages resolve through CANN.
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};
   std::optional<std::uint32_t> max_inflight_total;
   std::string kernel_path;

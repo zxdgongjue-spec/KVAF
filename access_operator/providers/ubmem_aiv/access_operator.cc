@@ -30,21 +30,21 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   call.profile_stream = nullptr;
   aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
   aclmdlRI graph = nullptr;
-  if (!synchronize || view.managed_completion) {
+  {
     auto status = Acl("aclmdlRICaptureGetInfo",
         aclmdlRICaptureGetInfo(stream, &capture, &graph));
     if (!status.ok()) return status;
   }
-  if (view.managed_completion && !call.graph_active &&
+  if (!call.graph_active &&
       capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
     return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
   const auto size = view.kernel.cores * sizeof(CoreStatus);
   const bool graph_get = args.operation == Operation::kGet &&
       capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
-  // Match legacy Get: only synchronous calls initialize the report. Async
+  // Only synchronous Get calls initialize the report. Async
   // eager calls and graph replay rely on the kernel to overwrite it.
   const bool reset_status = synchronize ||
-      (args.operation == Operation::kPut && view.managed_completion);
+      args.operation == Operation::kPut;
   if (reset_status && !graph_get) {
     // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
     // not look like a successful zero-row kernel.
@@ -52,7 +52,7 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
     if (!status.ok()) return status;
   }
   // Keep completion tracking even when an async Get has no status reset.
-  if ((synchronize || view.managed_completion) && !call.graph_active)
+  if (!call.graph_active)
     call.pending[stream] = ExecutionSlot::Pending::kStream;
   aclrtLaunchKernelAttr attrs[4]{};
   attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;

@@ -269,49 +269,26 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
 
 class NpuPythonRuntime final {
  public:
-  NpuPythonRuntime(std::string batch_get_kernel_object_path, std::uint32_t batch_get_token_bytes,
+  NpuPythonRuntime(std::uint32_t batch_get_token_bytes,
                    std::uint32_t batch_get_tokens_per_block, std::uint32_t device_id,
-                   std::uint32_t npu_core_count, std::string batch_put_kernel_object_path,
-                   std::uint32_t jettys_per_core, std::vector<std::string> npu_eids,
-                   bool adaptive_ub_device, std::uint32_t adaptive_ub_miss_count,
-                   std::string peer_ub_device, std::vector<std::string> adaptive_peer_ub_devices,
-                   std::uint32_t batch_get_max_inflight_total, const std::string& transport,
-                   std::string aicpu_batch_get_mode, py::object default_put, py::object default_get,
-                   bool per_call_execution,
-                   py::object put_resources, py::object get_resources) {
-    NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
-                              batch_get_token_bytes,
-                              batch_get_tokens_per_block};
-    if (transport == "urma") options.transport = Transport::kUrma;
-    else if (transport == "ubmem") options.transport = Transport::kUbmem;
-    else if (transport != "urma+ubmem") throw py::value_error("transport must be urma, ubmem or urma+ubmem");
+                   const std::string& transport_mode, py::object default_put,
+                   py::object default_get, py::object put_resources, py::object get_resources,
+                   std::vector<std::string> npu_eids, std::string peer_ub_device) {
+    NpuRuntimeOptions options{batch_get_token_bytes, batch_get_tokens_per_block};
+    if (transport_mode == "urma") options.transport_mode = TransportMode::Urma;
+    else if (transport_mode == "ubmem") options.transport_mode = TransportMode::Ubmem;
+    else if (transport_mode == "urma+ubmem") options.transport_mode = TransportMode::UrmaAndUbmem;
+    else throw py::value_error("transport_mode must be urma, ubmem or urma+ubmem");
     if (!put_resources.is_none())
       options.put_resources = put_resources.cast<decltype(options.put_resources)>();
     if (!get_resources.is_none())
       options.get_resources = get_resources.cast<decltype(options.get_resources)>();
-    options.per_call_execution = per_call_execution || !put_resources.is_none() ||
-                                 !get_resources.is_none() || !default_put.is_none() ||
-                                 !default_get.is_none() || transport == "urma+ubmem";
-    if (options.per_call_execution) {
-      options.transport_mode = transport == "ubmem" ? TransportMode::Ubmem :
-          transport == "urma+ubmem" ? TransportMode::UrmaAndUbmem : TransportMode::Urma;
-      if (!default_put.is_none()) options.default_put = default_put.cast<PutExecutionConfig>();
-      if (!default_get.is_none()) options.default_get = default_get.cast<GetExecutionConfig>();
-    }
-    options.batch_put_kernel_object_path =
-        std::move(batch_put_kernel_object_path);
+    if (!default_put.is_none()) options.default_put = default_put.cast<PutExecutionConfig>();
+    if (!default_get.is_none()) options.default_get = default_get.cast<GetExecutionConfig>();
     options.device_id = device_id;
-    options.npu_core_count = npu_core_count;
-    options.jettys_per_core = jettys_per_core;
-    options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
-    options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
-    options.adaptive_ub_device = adaptive_ub_device;
-    options.adaptive_ub_miss_count = adaptive_ub_miss_count;
     options.peer_ub_device = std::move(peer_ub_device);
-    options.adaptive_peer_ub_devices = std::move(adaptive_peer_ub_devices);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
-    aicpu_backend_ = native_->uses_aicpu();
   }
 
   void LinkTo(std::string address) {
@@ -324,8 +301,6 @@ class NpuPythonRuntime final {
 
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
-  std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
-  std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
   std::uint32_t BatchGetTokenBytes() const {
     return native_->batch_get_token_bytes();
@@ -591,8 +566,11 @@ class NpuPythonRuntime final {
                           const py::object& stream, bool synchronize, bool profile,
                           std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease,
                           std::uint64_t output_lease) {
-    if (profile && (!synchronize || !(execution ? execution->executor == Executor::Aicpu : aicpu_backend_)))
-      throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
+    if (profile) {
+      const auto selected = execution ? execution : native_->default_get();
+      if (!synchronize || !selected || selected->executor != Executor::Aicpu)
+        throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
+    }
     const auto begin = profile ? BatchGetProfileNowNs() : 0U;
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
@@ -657,7 +635,7 @@ class NpuPythonRuntime final {
     if (graph_lease) {
       auto it = graph_refs_.find(graph_lease);
       if (it != graph_refs_.end()) it->second.push_back(std::move(refs));
-    } else if (native_->per_call_execution()) {
+    } else {
       if (status.ok()) pending_get_refs_.clear();  // Native completed the preceding Get.
       if (!status.ok() || !synchronize) pending_get_refs_.push_back(std::move(refs));
     }
@@ -903,7 +881,6 @@ class NpuPythonRuntime final {
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
-  bool aicpu_backend_{false};
   std::mutex get_mutex_, put_mutex_;
   std::vector<py::object> pending_get_refs_;
   py::object pending_put_ref_;
@@ -935,8 +912,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
-      .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
-      .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
       .def_property_readonly("npu_eids", &NpuPythonRuntime::NpuEids)
       .def_property_readonly("batch_get_token_bytes", &NpuPythonRuntime::BatchGetTokenBytes)
       .def_property_readonly("batch_get_tokens_per_block",

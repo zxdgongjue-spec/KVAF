@@ -9,7 +9,6 @@ Usage: bash $0 /absolute/path/to/build-npu [options]
 Options:
   --transport urma|ubmem          Default: urma
   --executor aiv|aicpu           Default: aiv; aicpu requires urma
-  --execution-mode legacy|per-call  Default: legacy
   -h, --help                     Show this help
 
 Shape and sampling use KVAF_NPU_REQUESTS, KVAF_NPU_TOKEN_BYTES,
@@ -17,7 +16,7 @@ KVAF_NPU_TOKENS_PER_BLOCK, KVAF_NPU_CORE_COUNT, KVAF_NPU_JETTYS_PER_CORE,
 KVAF_NPU_WARMUP and KVAF_NPU_ITERATIONS. The CPU service must be running.
 KVAF_CPU_SERVICE_ADDR defaults to 127.0.0.1:28999; DEVICE_ID defaults to 0.
 KVAF_REMOTE_CPU_PERF_TIMEOUT defaults to 600 seconds.
-Per-call URMA AIV/AICPU reuse an input binding by default; set
+URMA AIV/AICPU reuse an input binding by default; set
 KVAF_PERF_REUSE_PUT_INPUT=0 to measure transient registration per call.
 EOF
 }

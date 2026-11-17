@@ -28,6 +28,7 @@ import kvaf
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
+from perf_execution import BenchmarkExecution
 
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -149,7 +150,7 @@ def main(transport: str = "urma") -> int:
     graph_iterations = iterations
     if not (
         table_capacity > 0
-        and requests > 0
+        and 0 < requests <= 65536
         and requests <= output_rows
         and token_bytes > 0
         and tokens_per_block > 0
@@ -219,22 +220,18 @@ def main(transport: str = "urma") -> int:
     # passing its caller-owned streams through the pybind Runtime.
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
-    runtime = kvaf.NpuRuntime(
-        str(kernel),
-        transport=transport,
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=npu_core_count,
-        batch_put_kernel_object_path=str(batch_put_kernel),
-        jettys_per_core=jettys_per_core,
-        batch_get_max_inflight_total=max_inflight_total,
-        npu_eids=npu_eids,
-    )
+    execution = BenchmarkExecution(kvaf, transport=transport, cores=npu_core_count,
+        jettys=jettys_per_core, get_kernel=str(kernel), put_kernel=str(batch_put_kernel),
+        max_inflight_total=max_inflight_total, get_capacity=requests,
+        put_capacity=max(active_requests, len(variable_payloads)))
+    runtime = kvaf.NpuRuntime(token_bytes, tokens_per_block,
+        device_id=device_id, npu_eids=npu_eids, **execution.runtime_kwargs)
     runtime.link_to(remote_cpu_service)
     table = None
     graph = None
     graph_stream = None
+    graph_lease = 0
+    graph_profiling = False
     try:
         print(
             "RUNTIME_NPU_SPARSE_LAYOUT "
@@ -360,29 +357,27 @@ def main(transport: str = "urma") -> int:
                 miss_count,
                 output_indices,
                 output,
-                stream,
+                stream, **({"graph_lease": graph_lease} if graph_lease else {}),
             )
+            if not graph_lease:
+                runtime.drain_get()
 
         print("RUNTIME_NPU_PHASE_BEGIN phase=runtime_batch_get")
         execute(output_a)
-        torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
             payload_slots, token_bytes
         )
         print(f"RUNTIME_NPU_BATCH_GET_VALIDATION_PASS requests={requests}")
 
-        # Runtime must acquire A and B independently, then reuse A's cached
-        # local HBM registration on the third call. The transport is owned by
-        # the operator and remains unchanged throughout this sequence.
+        # Exercise A -> B -> A with transient output registrations. The
+        # transport remains resident while each completed call retires its lease.
         execute(output_b)
-        torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_b), mask_values, output_indices_values,
             payload_slots, token_bytes
         )
         execute(output_a)
-        torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
             payload_slots, token_bytes
@@ -423,7 +418,6 @@ def main(transport: str = "urma") -> int:
                 miss_count.fill_(count)
                 torch.npu.synchronize()
                 execute(output_a)
-                torch.npu.synchronize()
                 validate_output(
                     tensor_to_bytes(output_a),
                     [int(i < count) for i in range(requests)],
@@ -437,12 +431,10 @@ def main(transport: str = "urma") -> int:
 
         for _ in range(warmup):
             execute(output_a)
-        torch.npu.synchronize()
         samples = []
         for _ in range(iterations):
             begin = time.perf_counter()
             execute(output_a)
-            torch.npu.synchronize()
             samples.append((time.perf_counter() - begin) * 1000.0)
         print("RUNTIME_NPU_PHASE_BEGIN phase=post_perf_validation")
         validate_output(
@@ -456,7 +448,7 @@ def main(transport: str = "urma") -> int:
             active_requests * token_bytes / (1024.0**3) / (mean_ms / 1000.0)
         )
         print(
-            "PERF_RESULT metric=runtime_batch_get_call_to_stream_completion "
+            "PERF_RESULT metric=runtime_batch_get_call_to_drain timing=async_submit_to_drain "
             f"samples={iterations} warmup_excluded={warmup} "
             f"active_requests={active_requests} token_bytes={token_bytes} "
             f"npu_cores={npu_core_count} mean_ms={mean_ms:.3f} "
@@ -567,10 +559,13 @@ def main(transport: str = "urma") -> int:
                 f"output_indices_bytes={len(graph_output_indices_host) * graph_output_indices_host.itemsize}"
             )
             print("RUNTIME_NPU_PHASE_BEGIN phase=graph_capture")
-            # output_a was already used by eager A -> B -> A above, so its
-            # Direct-HCCP local HBM registration is cached before capture.
-            # Python owns this ACL graph; KVAF only submits BatchGet to
-            # the caller-provided stream while capture is active.
+            # Prepare profiling and output resources before acquiring the graph lease.
+            # They remain fixed until the captured graph has been destroyed.
+            if inflight_checks:
+                runtime.start_batch_get_kernel_profile()
+                graph_profiling = True
+            graph_lease = runtime.begin_get_graph(
+                execution.get_config, output_a, requests, capture_stream)
             capture_started = False
             try:
                 graph.capture_begin(capture_stream)
@@ -625,7 +620,6 @@ def main(transport: str = "urma") -> int:
                 print(f"RUNTIME_NPU_GRAPH_REPLAY_VALIDATION_PASS replay={replay}")
 
             if inflight_checks:
-                runtime.start_batch_get_kernel_profile()
                 for epoch, count in enumerate(boundary_counts + list(reversed(boundary_counts))):
                     output_a.zero_()
                     torch.npu.synchronize()
@@ -640,7 +634,6 @@ def main(transport: str = "urma") -> int:
                         output_indices_values, graph_payload_slots, token_bytes,
                     )
                     check_inflight_profile(count)
-                runtime.stop_batch_get_kernel_profile()
                 graph_miss_count_host[0] = active_requests
                 print(f"RUNTIME_NPU_INFLIGHT_GRAPH_PASS counts={boundary_counts}")
 
@@ -704,6 +697,11 @@ def main(transport: str = "urma") -> int:
             )
             graph.reset()
             graph = None
+            runtime.end_get_graph(graph_lease, capture_stream)
+            graph_lease = 0
+            if graph_profiling:
+                runtime.stop_batch_get_kernel_profile()
+                graph_profiling = False
         if transport == "ubmem":
             runtime.release_access_table(table)
             table = None
@@ -731,6 +729,13 @@ def main(transport: str = "urma") -> int:
                     f"type={type(error).__name__} message={error}",
                     file=sys.stderr,
                 )
+                raise
+        if graph_lease:
+            runtime.end_get_graph(graph_lease, graph_stream, discard_result=True)
+        if runtime.initialized:
+            if graph_profiling:
+                runtime.stop_batch_get_kernel_profile()
+            runtime.drain_get()
         if table is not None and runtime.initialized:
             runtime.release_access_table(table)
         if runtime.initialized:

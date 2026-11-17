@@ -75,7 +75,7 @@ Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
   prepare_timing.Finish();
   if (!result.ok()) { call.put_completion = {PutOutcome::Failed, result}; return result; }
   result = UrmaAicpuPutOperator::Launch(request, resources_->PutView(), call);
-  if (result.ok() && resources_->managed_completion() && !call.input_bound) {
+  if (result.ok() && !call.input_bound) {
     PutHostTimingScope cleanup_timing(timing, &PutProviderTiming::cleanup_ns);
     result = resources_->ReleasePutBuffers();
   }
@@ -92,7 +92,7 @@ Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
       : UrmaAicpuGatherOperator::Launch(request, resources_->GatherView(), resources_->invocation());
   if (result.ok() && resources_->invocation().graph_active)
     resources_->invocation().graph_recorded = true;
-  if (result.ok() && request.execution.synchronize && resources_->managed_completion()) {
+  if (result.ok() && request.execution.synchronize) {
     const auto cleanup_started = GetHostTimingStart(request.host_timing);
     result = resources_->ReleaseGetBuffers();
     GetHostTimingRecord(request.host_timing, &GetProviderTiming::cleanup_ns, cleanup_started);

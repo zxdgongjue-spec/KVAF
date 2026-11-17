@@ -9,23 +9,24 @@
 #include <utility>
 
 namespace kvaf::detail {
-Status ResolveRuntimeBackend(Transport transport, const std::string& mode,
-                             RuntimeBackend* backend) {
-  if (!backend) return Status::InvalidArgument("backend output is null");
-  if (transport != Transport::kUrma && transport != Transport::kUbmem)
-    return Status::InvalidArgument("transport must be urma or ubmem");
-  if (!mode.empty() && mode != "gather_read" && mode != "cpu_push_scatter")
-    return Status::InvalidArgument(
-        "aicpu_batch_get_mode must be empty, gather_read or cpu_push_scatter");
-  if (transport == Transport::kUbmem) {
-    if (!mode.empty()) return Status::InvalidArgument(
-        "ubmem requires an empty aicpu_batch_get_mode");
-    *backend = RuntimeBackend::kUbmem;
-  } else if (mode.empty()) {
-    *backend = RuntimeBackend::kUrmaAiv;
+
+Status SelectProviderEids(Transport transport, Executor executor, bool get,
+                          bool explicit_eids, const ExecutionResources& resources,
+                          const std::vector<NpuEid>& candidates,
+                          std::vector<NpuEid>* selected) {
+  if (!selected) return Status::InvalidArgument("EID output is null");
+  if (transport == Transport::Ubmem) {
+    selected->clear();
+    return Status::OK();
+  }
+  if (candidates.empty()) return Status::NotInitialized("URMA local EIDs are not initialized");
+  if (get && executor == Executor::Aiv && explicit_eids) {
+    const auto workers = static_cast<std::uint64_t>(resources.cores) * resources.jettys;
+    if (candidates.size() > workers)
+      return Status::InvalidArgument("npu_eids count exceeds selected AIV Get cores * jettys workers");
+    *selected = candidates;
   } else {
-    *backend = mode == "gather_read" ? RuntimeBackend::kUrmaAicpuGather
-                                     : RuntimeBackend::kUrmaAicpuScatter;
+    selected->assign(1, candidates.front());
   }
   return Status::OK();
 }

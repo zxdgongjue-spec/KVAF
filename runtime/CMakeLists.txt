@@ -50,7 +50,6 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
     PUBLIC kvaf_runtime
     PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_GET)
-    target_sources(kvaf_npu_runtime PRIVATE memory/ubmem_allocator.cc)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator
       kvaf_ubmem_operator kvaf_execute_batch_get_host)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AIV_BATCH_GET=1)

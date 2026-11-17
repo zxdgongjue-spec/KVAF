@@ -11,14 +11,14 @@
 namespace kvaf {
 struct AicpuExecutionResources::State {
   State(AicpuExecutionResources* owner, UmdkAccessOperatorConfig config)
-      : legacy(owner), valid_mode(config.batch_get_mode == "gather_read" ||
+      : default_invocation(owner), valid_mode(config.batch_get_mode == "gather_read" ||
                    config.batch_get_mode == "cpu_push_scatter"),
         get_session({config.kernel_json, config.workers,
                  config.peer_link, config.local_eid}),
         put_session({config.kernel_json, config.workers, config.peer_link, config.local_eid,
                      aicpu_urma::UmdkQueueProfile::Put}),
         get(get_session, config.token_bytes),
-        put(put_session), enable_get(config.enable_get), managed_completion(config.managed_completion) {
+        put(put_session), enable_get(config.enable_get) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
     if (config.batch_get_mode == "cpu_push_scatter")
       push = std::make_unique<cpu_push::CpuPushTransport>(cpu_push::Config{
@@ -26,17 +26,18 @@ struct AicpuExecutionResources::State {
 #else
     valid_mode = config.batch_get_mode == "gather_read";
 #endif
-    legacy.put = put.CreateExecutionState();
-    legacy.get = get.CreateExecutionState();
-    (void)put.BindExecutionState(legacy.put.get());
-    (void)get.BindExecutionState(legacy.get.get());
+    default_invocation.put = put.CreateExecutionState();
+    default_invocation.get = get.CreateExecutionState();
+    (void)put.BindExecutionState(default_invocation.put.get());
+    (void)get.BindExecutionState(default_invocation.get.get());
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-    if (push) { legacy.push = push->CreateExecutionState(); (void)push->BindExecutionState(legacy.push.get()); }
+    if (push) { default_invocation.push = push->CreateExecutionState(); (void)push->BindExecutionState(default_invocation.push.get()); }
 #endif
   }
   ExecutionViewState views;
-  AicpuInvocation legacy;
-  AicpuInvocation* invocation{&legacy};
+  // Keeps initialization and Close valid before binding and after unbinding.
+  AicpuInvocation default_invocation;
+  AicpuInvocation* invocation{&default_invocation};
   bool valid_mode;
   aicpu_urma::UmdkSession get_session, put_session;
   aicpu_urma::BatchGetTransport get;
@@ -48,7 +49,6 @@ struct AicpuExecutionResources::State {
   Status DrainGet() { return get.Drain(); }
 #endif
   bool enable_get;
-  bool managed_completion;
   RemoteRegionDesc region;
   bool initialized{false};
   void* warmup_buffer{nullptr};
@@ -56,7 +56,7 @@ struct AicpuExecutionResources::State {
 };
 
 AicpuExecutionResources::AicpuExecutionResources(UmdkAccessOperatorConfig config)
-    : state_(std::make_unique<State>(this, std::move(config))) { state_->views.Bind(&state_->legacy); }
+    : state_(std::make_unique<State>(this, std::move(config))) { state_->views.Bind(&state_->default_invocation); }
 AicpuExecutionResources::~AicpuExecutionResources() {
   // An unresolved DMA/failed release keeps every handle and backing buffer.
   if (!Close().ok()) (void)state_.release();
@@ -71,7 +71,7 @@ std::unique_ptr<ExecutionState> AicpuExecutionResources::CreateInvocation() {
   return call;
 }
 Status AicpuExecutionResources::Bind(ExecutionState* state) {
-  auto* call = state ? dynamic_cast<AicpuInvocation*>(state) : &state_->legacy;
+  auto* call = state ? dynamic_cast<AicpuInvocation*>(state) : &state_->default_invocation;
   if (!call || call->owner != this)
     return Status::InvalidArgument("AICPU invocation belongs to another resource");
   if (state_->invocation != call &&
@@ -103,7 +103,6 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
 AicpuInvocation& AicpuExecutionResources::invocation() { return *state_->invocation; }
 std::mutex& AicpuExecutionResources::put_mutex() { return state_->put_mutex; }
 std::mutex& AicpuExecutionResources::get_mutex() { return state_->get_mutex; }
-bool AicpuExecutionResources::managed_completion() const { return state_->managed_completion; }
 bool AicpuExecutionResources::scatter() const {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   return bool(state_->push);
@@ -148,7 +147,7 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
     auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), false, false, &capturing);
     if (!allowed.ok()) return allowed;
     if (!capturing) return Status::InvalidState("graph lease submission requires active capture");
-  } else if (state_->managed_completion && request.execution.stream) {
+  } else if (request.execution.stream) {
     bool capturing = false;
     auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(request.execution.stream),
                                           false, false, &capturing);
@@ -166,9 +165,8 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
   return state_->get.Prepare(request);
 }
 Status AicpuExecutionResources::ReleasePutBuffers() {
-  // Legacy retains registrations until session shutdown, as on main. Managed
-  // ordinary calls retire temporary input; explicit bindings own it until End.
-  if (!state_->managed_completion || state_->invocation->input_bound) return Status::OK();
+  // Ordinary calls retire temporary input; explicit bindings own it until End.
+  if (state_->invocation->input_bound) return Status::OK();
   return state_->put_session.ReleaseBuffers();
 }
 Status AicpuExecutionResources::PreparePutInput(const PutInputOptions& options) {
@@ -437,7 +435,7 @@ Status AicpuExecutionResources::AcknowledgePut() {
 Status AicpuExecutionResources::DrainGet() {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
   auto status = state_->DrainGet();
-  if (status.ok() && state_->managed_completion) status = ReleaseGetBuffers();
+  if (status.ok()) status = ReleaseGetBuffers();
   return status;
 }
 Status AicpuExecutionResources::CheckBatchGetStatus(void* stream) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize opt-in per-call Get dispatcher timing CSV from the NPU runtime."""
+"""Summarize opt-in Get dispatcher timing CSV from the NPU runtime."""
 
 import argparse
 import csv

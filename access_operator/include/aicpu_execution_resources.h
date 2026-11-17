@@ -44,7 +44,6 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   std::unique_ptr<ExecutionState> CreateInvocation();
   Status Bind(ExecutionState*);
   AicpuInvocation& invocation();
-  bool managed_completion() const;
   bool scatter() const;
   std::mutex& put_mutex();
   std::mutex& get_mutex();

@@ -142,7 +142,6 @@ int main() {
   AccessOperatorConfig config;
   config.npu_core_count = 2;
   config.enable_get = false;
-  config.managed_completion = true;
   config.batch_put_kernel_object_path = "test-put.o";
   config.peer_local_eid[0] = 1;
   // This test's transport factory treats bootstrap identity as opaque.
@@ -390,7 +389,7 @@ int main() {
   CHECK(reused.DrainGet().ok() && get_retirements == retired + 3);
   CHECK(reused.Shutdown().ok() && get_registrations.empty());
   CHECK(reused.BindExecutionState(nullptr).ok());
-  // Graph capture follows legacy async Get: no status reset or result check.
+  // Graph capture follows async Get: no status reset or result check.
   DefaultAccessOperator graph_get(config);
   CHECK(graph_get.Initialize(region).ok());
   auto graph_state = graph_get.CreateExecutionState();

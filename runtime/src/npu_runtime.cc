@@ -24,35 +24,25 @@
 #include <utility>
 #include <vector>
 
-#include "batch_get_abi.h"
 #include "access_operator.h"
-#include "ubmem/access_operator.h"
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
+#include "ubmem/access_operator.h"
 #include "ubmem/device_mapping.h"
 #endif
-#include "ubmem_allocator.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 #include "gather_workspace.h"
 #if defined(KVAF_ENABLE_AICPU_URMA)
 #include "aicpu_access_operator.h"
 #endif
-#include "startup_bandwidth_probe.h"
-#include "startup_selection.h"
 
 namespace kvaf {
 namespace {
 
-Status Internal(std::string message) { return Status::Internal(std::move(message)); }
-
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, bool execution = false,
-                            TransportMode mode = TransportMode::Urma)
-      : link_(std::move(link)), execution_(execution), mode_(mode) {}
-
-  void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
-  bool has_allocation() const { return allocated_.base != 0U; }
+  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, TransportMode mode)
+      : link_(std::move(link)), mode_(mode) {}
 
   Status Allocate(const RuntimeInitRequest& request, RemoteRegionDesc* region) override {
     if (link_ == nullptr || region == nullptr || request.ddr_device != DeviceKind::kCpu ||
@@ -61,11 +51,8 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    Status status = execution_
-                        ? link_->AllocateCacheRegion(request.ddr_bytes, request.slot_size, 0,
-                                                     mode_, &allocated_)
-                        : link_->AllocateRegion(request.ddr_bytes, request.slot_size,
-                                                candidate_id_, &allocated_);
+    const Status status = link_->AllocateCacheRegion(
+        request.ddr_bytes, request.slot_size, 0, mode_, &allocated_);
     if (!status.ok()) return status;
     *region = RemoteRegionDesc{allocated_.base, request.ddr_bytes, request.slot_size, DeviceKind::kCpu};
     return Status::OK();
@@ -82,9 +69,7 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
-  bool execution_{false};
   TransportMode mode_{TransportMode::Urma};
-  std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
 };
 
@@ -419,29 +404,6 @@ bool ParseConfiguredNpuLocalEids(
   return true;
 }
 
-// Keep this aligned with the BatchPut AIV kernel. A real 128-KiB KV dump
-// spreads roughly one 32-WQE post across every AIV core. The startup probe
-// deliberately uses the same fan-out, but only 64 bytes per WQE: it validates
-// every queue/CQ lane without retaining an 80+ MiB source buffer for process
-// lifetime. The extra one-row post reaches each configured additional jetty.
-constexpr std::uint64_t kBatchPutProbeWqesPerPost = 32U;
-constexpr std::uint64_t kBatchPutProbeBytesPerRow = 64U;
-
-std::uint64_t BatchPutStartupProbeRows(std::uint64_t ddr_bytes,
-                                       std::uint64_t slot_size,
-                                       std::uint32_t npu_core_count,
-                                       std::uint32_t jettys_per_core) {
-  if (ddr_bytes == 0U || slot_size == 0U || npu_core_count == 0U ||
-      jettys_per_core == 0U) {
-    return 0U;
-  }
-  const std::uint64_t rows_per_core =
-      kBatchPutProbeWqesPerPost + static_cast<std::uint64_t>(jettys_per_core - 1U);
-  const std::uint64_t desired_rows =
-      static_cast<std::uint64_t>(npu_core_count) * rows_per_core;
-  return std::min(ddr_bytes / slot_size, desired_rows);
-}
-
 // Register only compiled implementations. Registration stores factories and does
 // not load kernels, open communication sessions, or reserve algorithm workspace.
 std::vector<PutExecutionConfig> BuiltPutConfigs(TransportMode mode) {
@@ -484,119 +446,52 @@ std::vector<GetExecutionConfig> BuiltGetConfigs(TransportMode mode) {
 
 struct NpuRuntime::Impl {
   explicit Impl(NpuRuntimeOptions init_options) : options(std::move(init_options)) {
-    options.per_call_execution = options.per_call_execution || options.default_put ||
-                                 options.default_get ||
-                                 options.transport_mode != TransportMode::Urma ||
-                                 !options.put_resources.empty() || !options.get_resources.empty();
-    if (options.per_call_execution) {
-      // Honor explicit choices, including ones not compiled into this build;
-      // selecting an unavailable provider fails on first use, not construction.
-      const auto puts = BuiltPutConfigs(options.transport_mode);
-      const auto gets = BuiltGetConfigs(options.transport_mode);
-      if (!options.default_put) {
-        if (!options.aicpu_batch_get_mode.empty())
-          options.default_put = PutExecutionConfig{Transport::Urma, Executor::Aicpu};
-        else if (!puts.empty()) options.default_put = puts.front();
+    // Honor explicit choices, including providers not compiled into this build.
+    // An unavailable provider fails on first use, not at construction.
+    const auto puts = BuiltPutConfigs(options.transport_mode);
+    const auto gets = BuiltGetConfigs(options.transport_mode);
+    if (!options.default_put && !puts.empty()) options.default_put = puts.front();
+    if (!options.default_get && !gets.empty()) options.default_get = gets.front();
+    auto normalized = NormalizeExecutionPolicy(&options);
+    if (!normalized.ok()) throw std::invalid_argument(normalized.message());
+    auto validate_resources = [&](const auto& entries) {
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto valid = ValidateExecution(options.transport_mode, entries[i].first);
+        if (!valid.ok()) throw std::invalid_argument(valid.message());
+        for (std::size_t j = 0; j < i; ++j)
+          if (entries[i].first == entries[j].first)
+            throw std::invalid_argument("duplicate execution resource budget");
       }
-      if (!options.default_get) {
-        if (!options.aicpu_batch_get_mode.empty()) {
-          detail::RuntimeBackend selected;
-          auto status = detail::ResolveRuntimeBackend(Transport::Urma, options.aicpu_batch_get_mode, &selected);
-          if (!status.ok()) throw std::invalid_argument(status.message());
-          options.default_get = GetExecutionConfig{Transport::Urma, Executor::Aicpu,
-              selected == detail::RuntimeBackend::kUrmaAicpuScatter ? GetAlgorithm::Scatter : GetAlgorithm::Gather};
-        } else if (!gets.empty()) options.default_get = gets.front();
-      }
-      auto normalized = NormalizeExecutionPolicy(&options);
-      if (!normalized.ok()) throw std::invalid_argument(normalized.message());
-      auto validate_resources = [&](const auto& entries) {
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-          const auto valid = ValidateExecution(options.transport_mode, entries[i].first);
-          if (!valid.ok()) throw std::invalid_argument(valid.message());
-          for (std::size_t j = 0; j < i; ++j)
-            if (entries[i].first == entries[j].first)
-              throw std::invalid_argument("duplicate execution resource budget");
-        }
-      };
-      validate_resources(options.put_resources);
-      validate_resources(options.get_resources);
-      options.transport = options.transport_mode == TransportMode::Ubmem ? Transport::Ubmem : Transport::Urma;
-      if (options.default_get && options.default_get->executor == Executor::Aicpu)
-        options.aicpu_batch_get_mode = options.default_get->algorithm == GetAlgorithm::Gather ? "gather_read" : "cpu_push_scatter";
-      else options.aicpu_batch_get_mode.clear();
-      if (options.adaptive_ub_device)
-        throw std::invalid_argument("per-call execution uses lazy preparation; adaptive startup probing is not supported");
-    }
-    const auto selected = detail::ResolveRuntimeBackend(
-        options.transport, options.aicpu_batch_get_mode, &backend);
-    if (!selected.ok()) throw std::invalid_argument(selected.message());
-    config.batch_get_kernel_object_path = options.batch_get_kernel_object_path;
-    config.batch_put_kernel_object_path = options.batch_put_kernel_object_path;
-    config.npu_core_count = options.npu_core_count;
-    config.jettys_per_core = options.jettys_per_core;
-    config.batch_get_max_inflight_total = options.batch_get_max_inflight_total;
-    // AIV BatchPut keeps its two-Jetty maximum. AICPU uses one probe lane per
-    // worker, independent of the unused AIV jettys_per_core option.
-    config.batch_put_jettys_per_core =
-        detail::UsesAicpu(backend) ? 1U
-                                  : std::min(options.jettys_per_core, std::uint32_t{2U});
+    };
+    validate_resources(options.put_resources);
+    validate_resources(options.get_resources);
   }
 
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager();
-    urma_operator = nullptr;
-    dispatcher = nullptr;
-    if (options.per_call_execution) {
-      auto dispatch = std::make_unique<ExecutionDispatcher>(options);
-      for (auto c : BuiltPutConfigs(options.transport_mode)) {
-        auto status = dispatch->RegisterPut(c, [this, c]() { return MakeProvider(c.transport, c.executor, GetAlgorithm::Direct, false); });
-        if (!status.ok()) throw std::invalid_argument(status.message());
-      }
-      for (auto c : BuiltGetConfigs(options.transport_mode)) {
-        auto status = dispatch->RegisterGet(c, [this, c]() { return MakeProvider(c.transport, c.executor, c.algorithm, true); });
-        if (!status.ok()) throw std::invalid_argument(status.message());
-      }
-      dispatcher = dispatch.get();
-      access_operator = std::move(dispatch);
-    } else if (backend == detail::RuntimeBackend::kUbmem) {
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-      access_operator = std::make_unique<ubmem::AccessOperator>(ubmem::OperatorOptions{
-          options.batch_get_kernel_object_path, options.batch_put_kernel_object_path,
-          options.device_id, options.npu_core_count, peer_link});
-#else
-      throw std::invalid_argument("UBmem support was not built; build the AIV data plane");
-#endif
-    } else if (detail::UsesAicpu(backend)) {
-#if defined(KVAF_ENABLE_AICPU_URMA)
-      EnsureAicpuPackage();
-      access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
-          kernel_package.json_path, options.npu_core_count,
-          peer_link, options.batch_get_token_bytes,
-          options.aicpu_batch_get_mode, config.peer_local_eid});
-#else
-      throw std::invalid_argument("AICPU UMDK support was not built");
-#endif
-    } else {
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-      auto op = std::make_unique<DefaultAccessOperator>(config);
-      urma_operator = op.get();
-      access_operator = std::move(op);
-#else
-      throw std::invalid_argument("AIV data plane is not built; select an AICPU BatchGet mode");
-#endif
+    auto dispatch = std::make_unique<ExecutionDispatcher>(options);
+    for (auto c : BuiltPutConfigs(options.transport_mode)) {
+      auto status = dispatch->RegisterPut(c, [this, c]() {
+        return MakeProvider(c.transport, c.executor, GetAlgorithm::Direct, false);
+      });
+      if (!status.ok()) throw std::invalid_argument(status.message());
     }
-    runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *access_operator, *allocator);
+    for (auto c : BuiltGetConfigs(options.transport_mode)) {
+      auto status = dispatch->RegisterGet(c, [this, c]() {
+        return MakeProvider(c.transport, c.executor, c.algorithm, true);
+      });
+      if (!status.ok()) throw std::invalid_argument(status.message());
+    }
+    dispatcher = std::move(dispatch);
+    runtime_core = std::make_unique<RuntimeCore>(*meta_manager, *dispatcher, *allocator);
   }
 
   ExecutionResources Resources(Transport transport, Executor executor, GetAlgorithm algorithm,
                                bool get) const {
     ExecutionResources r;
-    r.cores = options.npu_core_count;
-    r.jettys = options.jettys_per_core;
-    if (!get) r.jettys = std::min(r.jettys, 2U);
-    r.max_inflight_total = options.batch_get_max_inflight_total;
-    r.kernel_path =
-        get ? options.batch_get_kernel_object_path : options.batch_put_kernel_object_path;
+    r.cores = 2U;
+    r.jettys = 2U;
+    r.max_inflight_total = 2048U;
     const ExecutionResources* selected = nullptr;
     if (get) {
       for (const auto& entry : options.get_resources)
@@ -686,7 +581,8 @@ struct NpuRuntime::Impl {
     q.token_bytes = options.batch_get_token_bytes;
     q.cpu_threads = budget.cpu_threads;
     q.auxiliary_bytes = 0;
-    q.local_eid = config.peer_local_eid;
+    const auto eids = ProviderEids(transport, executor, get, budget);
+    if (!eids.empty()) q.local_eid = eids.front();
     return std::make_unique<SessionAccessOperator>(
         peer_link, q,
         [this, transport, executor, algorithm, get](std::shared_ptr<peer::PeerLink> link) {
@@ -694,19 +590,30 @@ struct NpuRuntime::Impl {
         },
         budget.request_capacity);
   }
+  std::vector<detail::NpuEid> ProviderEids(Transport transport, Executor executor, bool get,
+                                         const ExecutionResources& budget) const {
+    std::vector<detail::NpuEid> selected;
+    const auto status = detail::SelectProviderEids(transport, executor, get,
+        !options.npu_eids.empty(), budget, local_eids, &selected);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    return selected;
+  }
   std::unique_ptr<AccessOperator> MakeLocalProvider(Transport transport, Executor executor,
                                                     GetAlgorithm algorithm, bool get,
                                                     std::shared_ptr<peer::PeerLink> link) {
     const auto budget = Resources(transport, executor, algorithm, get);
+    const auto eids = ProviderEids(transport, executor, get, budget);
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
     if (transport == Transport::Ubmem) {
       return std::make_unique<ubmem::AccessOperator>(
           ubmem::OperatorOptions{get ? budget.kernel_path : "", get ? "" : budget.kernel_path,
-                                 options.device_id, budget.cores, link, true, mappings});
+                                 options.device_id, budget.cores, link, mappings});
     }
     if (executor == Executor::Aiv) {
-      auto c = config;
+      AccessOperatorConfig c;
       c.peer_link = link;
+      c.peer_local_eids = eids;
+      c.peer_local_eid = eids.front();
       c.npu_core_count = budget.cores;
       c.jettys_per_core = budget.jettys;
       c.batch_put_jettys_per_core = std::min(budget.jettys, 2U);
@@ -716,7 +623,6 @@ struct NpuRuntime::Impl {
       else
         c.batch_put_kernel_object_path = budget.kernel_path;
       c.enable_get = get;
-      c.managed_completion = true;
       if (get) c.batch_put_kernel_object_path.clear();
       return std::make_unique<DefaultAccessOperator>(std::move(c));
     }
@@ -726,87 +632,38 @@ struct NpuRuntime::Impl {
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        config.peer_local_eid, get, true});
+        eids.front(), get});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif
   }
 
-  void ReleaseProbe() {
-    bandwidth_probe.reset();
-    if (probe_buffer != nullptr) {
-      (void)aclrtFree(probe_buffer);
-      probe_buffer = nullptr;
-    }
-  }
-
   NpuRuntimeOptions options;
-  detail::RuntimeBackend backend{detail::RuntimeBackend::kUrmaAiv};
   detail::AicpuKernelPackage kernel_package;
   std::mutex aicpu_package_mutex;
   bool aicpu_package_ready{false};
-  AccessOperatorConfig config;
   std::uint32_t selected_candidate = 0;
+  std::vector<detail::NpuEid> local_eids;
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
-  PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   std::shared_ptr<ubmem::DeviceMappingCache> mappings =
       std::make_shared<ubmem::DeviceMappingCache>();
 #endif
-  std::unique_ptr<AccessOperator> access_operator;
-  DefaultAccessOperator* urma_operator{nullptr};
-  ExecutionDispatcher* dispatcher{nullptr};
+  std::unique_ptr<ExecutionDispatcher> dispatcher;
   std::unique_ptr<RuntimeCore> runtime_core;
-  void* probe_buffer{nullptr};
-  std::unique_ptr<detail::StartupBandwidthProbe> bandwidth_probe;
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& config = impl_->options;
-  const bool aicpu = detail::UsesAicpu(impl_->backend);
-
-#if !defined(KVAF_ENABLE_AIV_BATCH_GET)
-  if (!aicpu && !config.per_call_execution)
-    throw std::invalid_argument("AIV/UBmem support was not built; select gather_read or cpu_push_scatter");
-#endif
-#if !defined(KVAF_ENABLE_AICPU_URMA)
-  if (aicpu && !config.per_call_execution) throw std::invalid_argument("AICPU UMDK support was not built");
-#endif
-#if !defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  if (!config.per_call_execution && impl_->backend == detail::RuntimeBackend::kUrmaAicpuScatter)
-    throw std::invalid_argument("cpu_push_scatter was not built; rebuild with --cpu-push");
-#endif
-  if ((!config.per_call_execution && config.batch_get_kernel_object_path.empty() && !aicpu) ||
-      (!config.per_call_execution && (config.npu_core_count == 0 ||
-       config.npu_core_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES)) ||
-      config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0) {
-    throw std::invalid_argument("invalid NPU Runtime configuration");
-  }
-  if (!config.per_call_execution && impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
-      (config.jettys_per_core == 0 ||
-       config.jettys_per_core > KVAF_AIV_BATCH_GET_MAX_JETTYS_PER_CORE ||
-       (config.batch_get_max_inflight_total != 0 &&
-        config.batch_get_max_inflight_total < 2 * config.npu_core_count) ||
-       (config.adaptive_ub_device && !config.peer_ub_device.empty()) ||
-       (config.adaptive_ub_device &&
-        (config.adaptive_ub_miss_count == 0 ||
-         config.adaptive_ub_miss_count > static_cast<std::uint32_t>(INT32_MAX))))) {
-    throw std::invalid_argument("invalid URMA Runtime configuration");
-  }
-  if (aicpu && config.adaptive_ub_device)
-    throw std::invalid_argument("AICPU startup bandwidth tuning is unavailable");
-  if (!config.per_call_execution && aicpu && (config.npu_core_count > 8U ||
-      (impl_->backend == detail::RuntimeBackend::kUrmaAicpuGather &&
-       GatherStagingBytes(config.batch_get_token_bytes) > UINT32_MAX)))
-    throw std::invalid_argument("UMDK supports 1..8 workers and a gather payload fitting uint32");
-  if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS) {
+  if (config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0)
+    throw std::invalid_argument("invalid NPU Runtime token layout");
+  if (aclrtSetDevice(config.device_id) != ACL_SUCCESS)
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
-  }
-  std::fprintf(stderr, "[KVAF] NPU_RUNTIME transport=%s aicpu_mode=%s device=%u cores=%u\n",
-      config.transport == Transport::kUbmem ? "ubmem" : "urma",
-      aicpu ? config.aicpu_batch_get_mode.c_str() : "off", config.device_id, config.npu_core_count);
+  const auto mode = config.transport_mode == TransportMode::Ubmem ? "ubmem" :
+      config.transport_mode == TransportMode::UrmaAndUbmem ? "urma+ubmem" : "urma";
+  std::fprintf(stderr, "[KVAF] NPU_RUNTIME transport_mode=%s device=%u\n", mode, config.device_id);
 }
 
 NpuRuntime::~NpuRuntime() {
@@ -814,8 +671,7 @@ NpuRuntime::~NpuRuntime() {
     const auto status = Shutdown();
     if (!status.ok()) { (void)impl_.release(); return; }
     impl_->runtime_core.reset();
-    impl_->access_operator.reset();
-    if (status.ok()) impl_->ReleaseProbe();
+    impl_->dispatcher.reset();
   }
 }
 
@@ -823,24 +679,10 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
-  if (!impl_->options.per_call_execution && impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
-      impl_->config.batch_put_kernel_object_path.empty()) {
-    return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
-  }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
-  impl_->config.peer_link = impl_->peer_link;
-  if (!impl_->options.per_call_execution && impl_->options.transport == Transport::kUbmem) {
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-    impl_->allocator = std::make_unique<ubmem::DdrAllocator>(impl_->peer_link);
-#endif
-  } else {
-    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, impl_->options.per_call_execution,
-                                                        impl_->options.transport_mode);
-    impl_->peer_allocator = allocator.get();
-    impl_->allocator = std::move(allocator);
-  }
+  impl_->allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, impl_->options.transport_mode);
   impl_->runtime_core.reset();
-  impl_->access_operator.reset();
+  impl_->dispatcher.reset();
   impl_->CreateCore();
   return Status::OK();
 }
@@ -859,306 +701,52 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     const Status status = Shutdown();
     if (!status.ok()) return status;
   }
-  if (impl_->options.transport == Transport::kUbmem) {
-    impl_->runtime_core.reset();
-    impl_->access_operator.reset();
-    impl_->CreateCore();
-    return impl_->runtime_core->Initialize(request);
-  }
-
-  std::uint32_t candidate_count = 0U;
-  std::uint32_t device_count = 0U;
-  bool device_filter_applied = false;
-  Status last = impl_->peer_link->GetCandidateCount(
-      &candidate_count, &device_count, &device_filter_applied);
-  if (!last.ok()) return last;
-  if (candidate_count == 0U) {
-    return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
-  }
-  std::vector<NpuLocalEidCandidate> npu_candidates;
-  std::string discovery_error;
-  const bool explicit_eids = !impl_->options.npu_eids.empty();
-  // AIV stripes an explicit list; AICPU tries those EIDs one at a time.
-  const bool multi_eid_group = detail::StripesEids(impl_->backend, explicit_eids);
-  if (explicit_eids) {
-    if (!ParseConfiguredNpuLocalEids(impl_->options.device_id,
-                                     impl_->options.npu_eids,
-                                     &npu_candidates, &discovery_error)) {
-      return Status::InvalidArgument(discovery_error);
-    }
-  } else if (!DiscoverNpuLocalEidCandidates(
-                 impl_->options.device_id, &npu_candidates,
-                 &discovery_error)) {
-    return Status::NotFound(discovery_error);
-  }
-  const std::size_t worker_count =
-      static_cast<std::size_t>(impl_->options.npu_core_count) *
-      impl_->options.jettys_per_core;
-  if (multi_eid_group && npu_candidates.size() > worker_count) {
-    return Status::InvalidArgument(
-        "npu_eids count exceeds npu_core_count * jettys_per_core workers");
-  }
-  const bool fixed_peer_device = !impl_->options.peer_ub_device.empty();
-  const bool has_n_side_allowlist =
-      !impl_->options.adaptive_peer_ub_devices.empty();
-  const bool tune_candidates = impl_->options.adaptive_ub_device &&
-                               !device_filter_applied && has_n_side_allowlist;
-  if (impl_->options.adaptive_ub_device && !tune_candidates) {
-    std::fprintf(stderr,
-                 "[KVAF_AIV] UB_DEVICE_ADAPTIVE_SKIPPED device_id=%u "
-                 "reason=%s\n",
-                 impl_->options.device_id,
-                 device_filter_applied ? "k_side_device_filter"
-                                       : "no_n_side_candidates");
-  }
-  const detail::StartupProbeConfig probe_config{
-      impl_->options.batch_get_token_bytes,
-      impl_->options.batch_get_tokens_per_block,
-      impl_->options.adaptive_ub_miss_count};
-  detail::StartupProbeLayout probe_layout{};
-  if (tune_candidates) {
-    last = detail::BuildStartupProbeLayout(probe_config, &probe_layout);
-    if (!last.ok()) return last;
-  }
-  // AICPU reuses the existing Host discovery and candidate validation loop.
-  const std::size_t npu_group_count = multi_eid_group ? 1U : npu_candidates.size();
-  std::vector<std::string> peer_candidate_device_names;
-  std::vector<bool> peer_candidate_allowed;
-  if (fixed_peer_device) {
-    peer_candidate_allowed.assign(candidate_count, false);
-    std::uint32_t fixed_candidate_count = 0U;
-    for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
-         ++peer_candidate) {
-      peer::PeerCandidateInfo info{};
-      last = impl_->peer_link->GetCandidateInfo(peer_candidate, &info);
-      if (!last.ok()) return last;
-      if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
-        return Status::Internal("peer Runtime returned invalid candidate metadata");
-      }
-      if (info.device_name == impl_->options.peer_ub_device) {
-        peer_candidate_allowed[peer_candidate] = true;
-        ++fixed_candidate_count;
-      }
-    }
-    if (fixed_candidate_count == 0U) {
-      return Status::NotFound("peer Runtime did not advertise fixed UB device " +
-                              impl_->options.peer_ub_device);
-    }
-  }
-  auto initialize_candidate = [&](const detail::StartupCandidate& candidate,
-                                  bool measure, double* cycles) -> Status {
-    const std::uint32_t peer_candidate = candidate.peer;
-    const RuntimeInitRequest candidate_request = measure
-        ? RuntimeInitRequest{probe_layout.ddr_bytes,
-                             probe_layout.block_bytes,
-                             DeviceKind::kCpu}
-        : request;
-    const auto ddr_bytes = candidate_request.ddr_bytes;
-    const auto slot_size = candidate_request.slot_size;
-    impl_->peer_allocator->SetCandidate(peer_candidate);
-    impl_->selected_candidate = peer_candidate;
-    Status last;
-    for (const std::size_t npu_group : std::array<std::size_t, 1U>{candidate.local_group}) {
-      const std::size_t group_begin = multi_eid_group ? 0U : npu_group;
-      const std::size_t group_size = multi_eid_group ? npu_candidates.size() : 1U;
-      impl_->runtime_core.reset();
-      impl_->access_operator.reset();
-      impl_->ReleaseProbe();
-      impl_->config.peer_local_eids.clear();
-      impl_->config.peer_local_eids.reserve(group_size);
-      for (std::size_t offset = 0U; offset < group_size; ++offset) {
-        const NpuLocalEidCandidate& candidate = npu_candidates[group_begin + offset];
-        impl_->config.peer_local_eids.push_back(candidate.eid);
-      }
-      // BatchPut intentionally remains on the established single-EID path.
-      // Multi-EID striping applies only to BatchGet and uses the vector above.
-      impl_->config.peer_local_eid = impl_->config.peer_local_eids.front();
-      impl_->CreateCore();
-      last = impl_->runtime_core->Initialize(candidate_request);
-      if (impl_->options.per_call_execution) return last;
-      if (last.ok()) {
-        const std::uint64_t probe_bytes =
-            std::min<std::uint64_t>(slot_size, kBatchPutProbeBytesPerRow);
-        const std::uint64_t probe_rows = BatchPutStartupProbeRows(
-            ddr_bytes, slot_size, impl_->options.npu_core_count,
-            impl_->config.batch_put_jettys_per_core);
-        const std::uint64_t probe_total_bytes = probe_rows * probe_bytes;
-        aclrtStream stream = nullptr;
-        if (probe_bytes == 0U || probe_rows == 0U ||
-            aclrtMalloc(&impl_->probe_buffer, probe_total_bytes,
-                        ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-            impl_->probe_buffer == nullptr ||
-            aclrtMemset(impl_->probe_buffer, probe_total_bytes, 0xA5U,
-                        probe_total_bytes) != ACL_SUCCESS ||
-            aclrtCreateStream(&stream) != ACL_SUCCESS || stream == nullptr) {
-          last = Internal("failed to prepare peer candidate RMA probe");
-        } else {
-          std::vector<KeyId> probe_keys;
-          std::vector<std::uint64_t> probe_offsets;
-          std::vector<std::uint64_t> probe_lengths;
-          probe_keys.reserve(static_cast<std::size_t>(probe_rows));
-          probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
-          probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
-          for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            // MetaManager maps each bounded DSA key directly to its slot.
-            probe_keys.push_back(row);
-            probe_offsets.push_back(row * probe_bytes);
-            probe_lengths.push_back(probe_bytes);
-          }
-          last = impl_->runtime_core->BatchPut(
-              BatchPutRequest{probe_keys,
-                              ConstBufferView{impl_->probe_buffer,
-                                              static_cast<std::size_t>(probe_total_bytes),
-                                              DeviceKind::kNpu},
-                              probe_offsets, probe_lengths},
-              BatchPutExecutionOptions{stream});
-          if (last.ok()) {
-            last = impl_->runtime_core->BatchFree(BatchFreeRequest{probe_keys});
-          }
-        }
-        if (stream != nullptr && aclrtDestroyStream(stream) != ACL_SUCCESS && last.ok()) {
-          last = Internal("failed to destroy peer candidate probe stream");
+  // Cache allocation does not initialize a transport or prepare an algorithm.
+  // Keep the entire explicit EID list until the selected provider applies its
+  // own routing and worker budget; the default Get must not choose that policy.
+  impl_->local_eids.clear();
+  impl_->selected_candidate = 0;
+  if (impl_->options.transport_mode != TransportMode::Ubmem) {
+    std::uint32_t candidate_count = 0U;
+    std::uint32_t device_count = 0U;
+    bool device_filter_applied = false;
+    auto status = impl_->peer_link->GetCandidateCount(
+        &candidate_count, &device_count, &device_filter_applied);
+    if (!status.ok()) return status;
+    if (candidate_count == 0U)
+      return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
+    if (!impl_->options.peer_ub_device.empty()) {
+      bool found = false;
+      for (std::uint32_t candidate = 0; candidate < candidate_count; ++candidate) {
+        peer::PeerCandidateInfo info{};
+        status = impl_->peer_link->GetCandidateInfo(candidate, &info);
+        if (!status.ok()) return status;
+        if (info.candidate_id != candidate || info.device_id >= device_count)
+          return Status::Internal("peer Runtime returned invalid candidate metadata");
+        if (info.device_name == impl_->options.peer_ub_device) {
+          impl_->selected_candidate = candidate;
+          found = true;
+          break;
         }
       }
-      if (last.ok() && measure) {
-        impl_->bandwidth_probe =
-            std::make_unique<detail::StartupBandwidthProbe>(probe_config);
-#if defined(KVAF_ENABLE_AIV_BATCH_GET)
-        last = impl_->urma_operator == nullptr
-            ? Status::NotImplemented("startup profiling requires AIV URMA")
-            : impl_->bandwidth_probe->Run(*impl_->runtime_core, *impl_->urma_operator, cycles);
-#else
-        last = Status::NotImplemented("AIV startup profiling was not built");
-#endif
-        if (last.ok()) {
-          std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u "
-                       "ub_device=%s miss_count=%u cycles=%.0f\n",
-                       impl_->options.device_id,
-                       peer_candidate_device_names[peer_candidate].c_str(),
-                       probe_config.miss_count, *cycles);
-          return last;
-        }
-      }
-      if (last.ok()) {
-        if (tune_candidates) {
-          std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u "
-                       "ub_device=%s cycles=%.0f\n",
-                       impl_->options.device_id,
-                       peer_candidate_device_names[peer_candidate].c_str(),
-                       *cycles);
-        } else if (fixed_peer_device) {
-          std::fprintf(stderr,
-                       "[KVAF_AIV] UB_DEVICE_REUSED device_id=%u ub_device=%s\n",
-                       impl_->options.device_id,
-                       impl_->options.peer_ub_device.c_str());
-        }
-        return Status::OK();
-      }
-      return last;
+      if (!found) return Status::NotFound(
+          "peer Runtime did not advertise fixed UB device " + impl_->options.peer_ub_device);
     }
-    return last;
-  };
-  auto cleanup = [&]() -> Status {
-    if (impl_->runtime_core->needs_cleanup()) {
-      const Status status = impl_->runtime_core->Shutdown();
-      if (!status.ok()) return status;
+    std::vector<NpuLocalEidCandidate> candidates;
+    std::string error;
+    if (!impl_->options.npu_eids.empty()) {
+      if (!ParseConfiguredNpuLocalEids(impl_->options.device_id, impl_->options.npu_eids,
+                                      &candidates, &error))
+        return Status::InvalidArgument(error);
+    } else if (!DiscoverNpuLocalEidCandidates(impl_->options.device_id, &candidates, &error)) {
+      return Status::NotFound(error);
     }
-    if (impl_->peer_allocator->has_allocation()) {
-      return Status::Internal("peer candidate left DDR allocated");
-    }
-    // Registered source/output buffers outlive the transports even on errors.
-    impl_->runtime_core.reset();
-    impl_->access_operator.reset();
-    impl_->ReleaseProbe();
-    return Status::OK();
-  };
-  if (!tune_candidates) {
-    for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
-         ++peer_candidate) {
-      if (fixed_peer_device && !peer_candidate_allowed[peer_candidate]) continue;
-      for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
-        last = initialize_candidate(
-            detail::StartupCandidate{peer_candidate, npu_group}, false, nullptr);
-        if (last.ok()) return last;
-        const Status released = cleanup();
-        if (!released.ok()) return Status::Internal(last.message() +
-            "; candidate cleanup failed: " + released.message());
-      }
-    }
-    if (!last.ok() && fixed_peer_device) {
-      return Status::Internal("failed to initialize fixed peer UB device " +
-                              impl_->options.peer_ub_device + ": " +
-                              last.message());
-    }
-    return last;
+    for (const auto& candidate : candidates) impl_->local_eids.push_back(candidate.eid);
   }
-
-  peer_candidate_device_names.resize(candidate_count);
-  std::vector<std::vector<detail::StartupCandidate>> all_device_candidates(
-      device_count);
-  std::vector<std::string> all_device_names(device_count);
-  for (std::uint32_t peer_candidate = 0U; peer_candidate < candidate_count;
-       ++peer_candidate) {
-    peer::PeerCandidateInfo info{};
-    last = impl_->peer_link->GetCandidateInfo(peer_candidate, &info);
-    if (!last.ok()) return last;
-    if (info.candidate_id != peer_candidate || info.device_id >= device_count) {
-      return Status::Internal("peer Runtime returned invalid candidate metadata");
-    }
-    peer_candidate_device_names[peer_candidate] = info.device_name;
-    std::string& known_name = all_device_names[info.device_id];
-    if (known_name.empty()) {
-      known_name = info.device_name;
-    } else if (known_name != info.device_name) {
-      return Status::Internal("peer Runtime returned inconsistent candidate device grouping");
-    }
-    auto& group = all_device_candidates[info.device_id];
-    for (std::size_t npu_group = 0U; npu_group < npu_group_count; ++npu_group) {
-      group.push_back(detail::StartupCandidate{peer_candidate, npu_group});
-    }
-  }
-  for (std::size_t device = 0U; device < all_device_candidates.size(); ++device) {
-    if (all_device_candidates[device].empty() ||
-        all_device_names[device].empty()) {
-      return Status::Internal("peer Runtime returned incomplete candidate device grouping");
-    }
-  }
-  std::vector<std::size_t> selected_device_indices;
-  for (std::size_t device = 0U; device < all_device_names.size(); ++device) {
-    if (std::find(impl_->options.adaptive_peer_ub_devices.begin(),
-                  impl_->options.adaptive_peer_ub_devices.end(),
-                  all_device_names[device]) !=
-        impl_->options.adaptive_peer_ub_devices.end()) {
-      selected_device_indices.push_back(device);
-    }
-  }
-  if (selected_device_indices.empty()) {
-    return Status::NotFound(
-        "none of the script-configured adaptive UB devices were advertised by the peer");
-  }
-  std::vector<std::vector<detail::StartupCandidate>> device_candidates;
-  std::vector<std::string> device_names;
-  device_candidates.reserve(selected_device_indices.size());
-  device_names.reserve(selected_device_indices.size());
-  for (const std::size_t device : selected_device_indices) {
-    device_candidates.push_back(std::move(all_device_candidates[device]));
-    device_names.push_back(std::move(all_device_names[device]));
-  }
-  for (std::size_t device = 0U; device < device_candidates.size(); ++device) {
-    std::fprintf(stderr,
-                 "[KVAF_AIV] UB_DEVICE_PROBE_PLAN device_id=%u ub_device=%s "
-                 "pairs=%zu token_bytes=%u tokens_per_block=%u miss_count=%u "
-                 "aiv_cores=%u jettys_per_core=%u warmup=%u samples=%u\n",
-                 impl_->options.device_id, device_names[device].c_str(),
-                 device_candidates[device].size(), probe_config.token_bytes,
-                 probe_config.tokens_per_block, probe_config.miss_count,
-                 impl_->options.npu_core_count, impl_->options.jettys_per_core,
-                 detail::kStartupWarmup, detail::kStartupSamples);
-  }
-  return detail::SelectStartupDeviceCandidate(
-      device_candidates, initialize_candidate, cleanup);
+  impl_->runtime_core.reset();
+  impl_->dispatcher.reset();
+  impl_->CreateCore();
+  return impl_->runtime_core->Initialize(request);
 }
 
 
@@ -1175,8 +763,6 @@ const RuntimeCore& NpuRuntime::core() const {
   return *impl_->runtime_core;
 }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
-std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
-std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
 const std::vector<std::string>& NpuRuntime::npu_eids() const {
   return impl_->options.npu_eids;
 }
@@ -1187,59 +773,49 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
-bool NpuRuntime::per_call_execution() const { return impl_->options.per_call_execution; }
 Status NpuRuntime::DrainGet() {
-  if (!impl_->options.per_call_execution)
-    return Status::NotImplemented("drain_get requires per-call execution; legacy callers synchronize their stream");
+  if (!initialized()) return Status::NotInitialized("initialize Runtime before draining Get");
   return core().DrainGet();
 }
 Status NpuRuntime::Recover(PutExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
     return Status::Internal("aclrtSetDevice failed");
-  return impl_->dispatcher ? core().RecoverPut(c)
-                           : Status::NotImplemented("recovery requires per-call execution");
+  if (!initialized()) return Status::NotInitialized("initialize Runtime before recovery");
+  return core().RecoverPut(c);
 }
 Status NpuRuntime::Recover(GetExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
     return Status::Internal("aclrtSetDevice failed");
-  return impl_->dispatcher ? impl_->dispatcher->Recover(c)
-                           : Status::NotImplemented("recovery requires per-call execution");
+  if (!initialized()) return Status::NotInitialized("initialize Runtime before recovery");
+  return impl_->dispatcher->Recover(c);
 }
 Status NpuRuntime::Warmup(PutExecutionConfig c, const ExecutionWarmup& request) {
   if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");
-  return impl_->dispatcher ? impl_->dispatcher->Warmup(c, request)
-                           : Status::NotImplemented("warmup requires per-call execution");
+  return impl_->dispatcher->Warmup(c, request);
 }
 Status NpuRuntime::Warmup(GetExecutionConfig c, const ExecutionWarmup& request) {
   if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");
-  return impl_->dispatcher ? impl_->dispatcher->Warmup(c, request)
-                           : Status::NotImplemented("warmup requires per-call execution");
+  return impl_->dispatcher->Warmup(c, request);
 }
 
 Status NpuRuntime::SetBatchGetKernelProfiling(
     bool enabled, bool detailed, std::optional<GetExecutionConfig> config) {
-  if (!initialized() || !impl_->access_operator)
+  if (!initialized() || !impl_->dispatcher)
     return Status::NotInitialized("initialize Runtime before configuring Get profiling");
-  if (impl_->dispatcher) return impl_->dispatcher->ConfigureGetProfiling(config, enabled, detailed);
-  if (config) return Status::InvalidArgument("explicit Get configuration requires per-call execution");
-  return impl_->access_operator->SetBatchGetKernelProfiling(enabled, detailed);
+  return impl_->dispatcher->ConfigureGetProfiling(config, enabled, detailed);
 }
 
 Status NpuRuntime::CheckBatchGetStatus(void* stream, std::optional<GetExecutionConfig> config) {
-  if (!initialized() || !impl_->access_operator)
+  if (!initialized() || !impl_->dispatcher)
     return Status::NotInitialized("NpuRuntime is not initialized");
-  if (impl_->dispatcher) return impl_->dispatcher->CheckGetStatus(config, stream);
-  if (config) return Status::InvalidArgument("explicit Get configuration requires per-call execution");
-  return impl_->access_operator->CheckBatchGetStatus(stream);
+  return impl_->dispatcher->CheckGetStatus(config, stream);
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles, std::optional<GetExecutionConfig> config) const {
-  if (!initialized() || !impl_->access_operator)
+  if (!initialized() || !impl_->dispatcher)
     return Status::NotInitialized("initialize Runtime before reading Get profiling");
-  if (impl_->dispatcher) return impl_->dispatcher->CopyGetProfiles(config, profiles);
-  if (config) return Status::InvalidArgument("explicit Get configuration requires per-call execution");
-  return impl_->access_operator->CopyBatchGetKernelProfiles(profiles);
+  return impl_->dispatcher->CopyGetProfiles(config, profiles);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
@@ -1250,14 +826,11 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
   if (!shutdown.ok()) return shutdown;
-  impl_->peer_link.reset();
-  impl_->config.peer_link.reset();
-  impl_->config.peer_local_eid = {};
-  impl_->config.peer_local_eids.clear();
-  impl_->peer_allocator = nullptr;
-  impl_->allocator.reset();
   impl_->runtime_core.reset();
-  impl_->access_operator.reset();
+  impl_->dispatcher.reset();
+  impl_->allocator.reset();
+  impl_->peer_link.reset();
+  impl_->local_eids.clear();
   return Status::OK();
 }
 
@@ -1270,9 +843,8 @@ Status NpuRuntime::Shutdown() {
   Status status = impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()
                       ? impl_->runtime_core->Shutdown()
                       : Status::OK();
-  if (status.ok() && impl_->options.per_call_execution && impl_->peer_link)
+  if (status.ok() && impl_->peer_link)
     status = impl_->peer_link->CloseExecution();
-  if (status.ok()) impl_->ReleaseProbe();
   return status;
 }
 
@@ -1281,13 +853,12 @@ bool NpuRuntime::initialized() const {
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  if (impl_->options.per_call_execution)
-    return RuntimeCapabilities{!BuiltGetConfigs(impl_->options.transport_mode).empty(),
-        !BuiltPutConfigs(impl_->options.transport_mode).empty(), false, true};
-  return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
-      uses_aicpu(), false, true};
+  return RuntimeCapabilities{!BuiltGetConfigs(impl_->options.transport_mode).empty(),
+      !BuiltPutConfigs(impl_->options.transport_mode).empty(), false, true};
 }
 
-bool NpuRuntime::uses_aicpu() const { return detail::UsesAicpu(impl_->backend); }
+std::optional<GetExecutionConfig> NpuRuntime::default_get() const {
+  return impl_->options.default_get;
+}
 
 }  // namespace kvaf

@@ -126,7 +126,6 @@ int main() {
   ubmem::OperatorOptions options;
   options.batch_put_kernel_object_path = __FILE__; // The fake loader accepts any nonempty bytes.
   options.cores = 2;
-  options.managed_completion = true;
   options.peer_link = std::make_shared<PeerLink>("fake:0");
   auto op = std::make_unique<ubmem::AccessOperator>(options);
   auto resources = op->TakeResources();

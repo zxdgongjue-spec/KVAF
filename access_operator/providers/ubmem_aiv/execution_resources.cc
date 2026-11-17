@@ -166,7 +166,7 @@ MappedExecutionView UbmemResources::View(unsigned index, aclrtStream stream, Exe
   invocation->prepared_stream = stream;
   return {views.View(index ? ExecutionDirection::Put : ExecutionDirection::Get),
           {mapping->address(), remote.length}, {functions[index], options.cores},
-          options.managed_completion, profiling, profile_detail, &slot, &health};
+          profiling, profile_detail, &slot, &health};
 }
 Status UbmemResources::PreparePutResources(aclrtStream stream, std::uint32_t capacity, UbmemPutView* out) {
   if (!out) return Status::InvalidArgument("null UBMEM Put view");
@@ -202,7 +202,7 @@ std::unique_ptr<ExecutionState> UbmemResources::CreateState() const {
 }
 Status UbmemResources::Bind(ExecutionState* state) {
   std::lock_guard<std::mutex> lock(mutex);
-  auto* typed = state ? dynamic_cast<UbmemInvocation*>(state) : &legacy;
+  auto* typed = state ? dynamic_cast<UbmemInvocation*>(state) : &default_invocation;
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("UBMEM execution state belongs to another resource");
   views.Bind(typed);

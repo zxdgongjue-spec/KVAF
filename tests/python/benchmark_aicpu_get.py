@@ -12,7 +12,7 @@ from test_aicpu_batch_get import timing_stats
 from npu_eids import parse_npu_eids
 from batch_get_workload import token_pattern
 
-from perf_execution import BenchmarkExecution, add_execution_mode
+from perf_execution import BenchmarkExecution, add_execution_metadata
 
 DDR_BUDGET_BYTES = 100 * 1024**3
 DEFAULT_TOKENS_PER_BLOCK = 128
@@ -22,7 +22,7 @@ PREFIXES = {"gather_read": "AICPU_GATHER_READ", "cpu_push_scatter": "AICPU_CPU_P
 
 def parse_args(argv=None, *, mode="gather_read"):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    add_execution_mode(p)
+    add_execution_metadata(p)
     p.add_argument("--device-id", type=int, default=7)
     p.add_argument("--peer", default="127.0.0.1:28990")
     p.add_argument("--npu-eids", type=parse_npu_eids,
@@ -164,14 +164,14 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     torch.manual_seed(20260903)
     stream = torch.npu.current_stream()
     execution = BenchmarkExecution(
-        kvaf, a.execution_mode, executor="aicpu",
+        kvaf, executor="aicpu",
         algorithm="gather" if mode == "gather_read" else "scatter",
-        put_capacity=128, get_capacity=length,
+        put_capacity=128, get_capacity=length, cores=a.workers,
     )
     runtime = kvaf.NpuRuntime(
-        batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
+        batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
-        npu_core_count=a.workers, aicpu_batch_get_mode=mode, npu_eids=a.npu_eids,
+        npu_eids=a.npu_eids,
         **execution.runtime_kwargs,
     )
     profiles = []

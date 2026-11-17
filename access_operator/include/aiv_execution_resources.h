@@ -85,7 +85,6 @@ struct AivPutSession {
 // Immutable launch options, not the resource-creation configuration.
 struct AivLaunchOptions {
   std::uint32_t npu_core_count{}, jettys_per_core{}, batch_get_max_inflight_total{};
-  bool managed_completion{};
 };
 struct UrmaAivGetView {
   ExecutionViewCommon common;

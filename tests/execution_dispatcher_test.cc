@@ -491,52 +491,7 @@ void IndependentBindingsAndOtherPendingRequest() {
   CHECK(runtime.EndGetOutput(direct_id).code() == StatusCode::kNotFound);
   CHECK(runtime.Shutdown().ok());
 }
-void TraceLegacyProvider() {
-  class LegacyProvider final : public AccessOperator {
-   public:
-    Status Initialize(const RemoteRegionDesc&) override { return Status::OK(); }
-    Status Shutdown() override { return Status::OK(); }
-    Status ExecuteBatchPut(const BatchPutExecRequest&) override { return Status::OK(); }
-    Status ExecuteBatchGet(const BatchGetExecRequest& r) override {
-      CHECK(r.host_timing != nullptr);
-      r.host_timing->prepare_ns = 21;
-      r.host_timing->submit_ns = 22;
-      r.host_timing->completion_ns = 23;
-      return Status::OK();
-    }
-  } provider;
-  const std::string path = "/tmp/kvaf-get-legacy-trace-test-" +
-      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".csv";
-  std::remove(path.c_str());
-  CHECK(setenv("KVAF_GET_DISPATCH_TRACE", path.c_str(), 1) == 0);
-  auto meta = CreateInMemoryMetaManager();
-  auto allocator = CreateHostDdrMemoryAllocator();
-  RuntimeCore runtime(*meta, provider, *allocator);
-  CHECK(unsetenv("KVAF_GET_DISPATCH_TRACE") == 0);
-  CHECK(runtime.Initialize({128, 16, DeviceKind::kCpu}).ok());
-  Address addresses[]{1};
-  std::uint8_t valid[]{1};
-  int index = 0, offset = 0, count = 0, output_index = 0;
-  char output[16]{};
-  BatchGetRequest request{};
-  request.indices = {&index, 4, DeviceKind::kNpu};
-  request.offsets = {&offset, 4, DeviceKind::kNpu};
-  request.miss_count = {&count, 4, DeviceKind::kNpu};
-  request.output_indices = {&output_index, 4, DeviceKind::kNpu};
-  request.output = {output, sizeof(output), DeviceKind::kNpu};
-  request.output_block_bytes = sizeof(output);
-  request.tokens_per_block = 1;
-  request.device_access_table = {{addresses, sizeof(addresses), DeviceKind::kNpu},
-                                 {valid, sizeof(valid), DeviceKind::kNpu}};
-  CHECK(runtime.BatchGet(request).ok());
-  CHECK(runtime.Shutdown().ok());
-  std::ifstream trace(path);
-  CHECK(trace.good());
-  const std::string contents((std::istreambuf_iterator<char>(trace)), std::istreambuf_iterator<char>());
-  CHECK(contents.find(",legacy,legacy,") != std::string::npos);
-  CHECK(contents.find(",21,22,23,0,0,0,0,0\n") != std::string::npos);
-  std::remove(path.c_str());
-}
+
 }  // namespace
 int main() {
   Configurations();
@@ -546,6 +501,5 @@ int main() {
   OutputLeaseReuseAndPins();
   IndependentBindingsAndOtherPendingRequest();
   TraceOutputAndOrdinary();
-  TraceLegacyProvider();
   std::cout << "Execution registry, lazy domains, pins, overlap and recovery passed\n";
 }

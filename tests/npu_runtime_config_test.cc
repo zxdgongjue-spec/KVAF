@@ -28,31 +28,43 @@ void Write(const fs::path& path, const std::string& contents) {
 }
 
 int main() {
-  NpuRuntimeOptions defaults{"get.o", 656, 2};
-  RuntimeBackend backend;
-  CHECK(defaults.aicpu_batch_get_mode.empty());
-  CHECK(ResolveRuntimeBackend(defaults.transport, defaults.aicpu_batch_get_mode, &backend).ok());
-  CHECK(backend == RuntimeBackend::kUrmaAiv);
-  CHECK(StripesEids(backend, true));
-  CHECK(!StripesEids(backend, false));
-  for (const auto& mode : {"gather_read", "cpu_push_scatter"}) {
-    CHECK(ResolveRuntimeBackend(Transport::kUrma, mode, &backend).ok());
-    CHECK(backend == (std::string(mode) == "gather_read"
-        ? RuntimeBackend::kUrmaAicpuGather : RuntimeBackend::kUrmaAicpuScatter));
-    CHECK(UsesAicpu(backend));
-    // An explicit list is iterated one EID at a time for both modes.
-    CHECK(!StripesEids(backend, true));
-    CHECK(!StripesEids(backend, false));
-    CHECK(!ResolveRuntimeBackend(Transport::kUbmem, mode, &backend).ok());
+  NpuRuntimeOptions defaults{656, 2};
+  CHECK(defaults.batch_get_token_bytes == 656);
+  CHECK(defaults.batch_get_tokens_per_block == 2);
+  CHECK(defaults.transport_mode == TransportMode::Urma);
+  CHECK(!defaults.default_put && !defaults.default_get);
+  CHECK(defaults.put_resources.empty() && defaults.get_resources.empty());
+
+  std::vector<NpuEid> candidates(3), selected;
+  for (std::size_t i = 0; i < candidates.size(); ++i) candidates[i][0] = i + 1;
+  ExecutionResources budget;
+  budget.cores = 2;
+  budget.jettys = 2;
+  // EID routing depends on the selected provider and its resolved worker budget.
+  CHECK(SelectProviderEids(Transport::Urma, Executor::Aiv, true, true,
+                           budget, candidates, &selected).ok());
+  CHECK(selected == candidates);
+  budget.cores = 1;
+  CHECK(!SelectProviderEids(Transport::Urma, Executor::Aiv, true, true,
+                            budget, candidates, &selected).ok());
+  CHECK(selected == candidates);  // A failing budget check does not truncate the list.
+  for (const auto executor : {Executor::Aiv, Executor::Aicpu}) {
+    for (const bool get : {false, true}) {
+      if (executor == Executor::Aiv && get) continue;
+      CHECK(SelectProviderEids(Transport::Urma, executor, get, true,
+                               budget, candidates, &selected).ok());
+      CHECK(selected.size() == 1 && selected.front() == candidates.front());
+    }
   }
-  CHECK(ResolveRuntimeBackend(Transport::kUbmem, "", &backend).ok());
-  CHECK(backend == RuntimeBackend::kUbmem && !UsesAicpu(backend));
-  for (const auto& mode : {"gather_read_direct", "GATHER_READ", " ", "auto", "scatter"}) {
-    CHECK(!ResolveRuntimeBackend(Transport::kUrma, mode, &backend).ok());
-    CHECK(!ResolveRuntimeBackend(Transport::kUbmem, mode, &backend).ok());
-  }
-  CHECK(!ResolveRuntimeBackend(static_cast<Transport>(99), "", &backend).ok());
-  CHECK(!ResolveRuntimeBackend(Transport::kUrma, "", nullptr).ok());
+  CHECK(SelectProviderEids(Transport::Urma, Executor::Aiv, true, false,
+                           budget, candidates, &selected).ok());
+  CHECK(selected.size() == 1 && selected.front() == candidates.front());
+  CHECK(SelectProviderEids(Transport::Ubmem, Executor::Aiv, true, true,
+                           budget, {}, &selected).ok() && selected.empty());
+  CHECK(!SelectProviderEids(Transport::Urma, Executor::Aicpu, true, true,
+                            budget, {}, &selected).ok());
+  CHECK(!SelectProviderEids(Transport::Urma, Executor::Aiv, true, true,
+                            budget, candidates, nullptr).ok());
 
   char pattern[] = "/tmp/kvaf-config-XXXXXX";
   const auto* directory = mkdtemp(pattern);
@@ -100,5 +112,5 @@ int main() {
   search.default_roots = {(temp / "missing").string()};
   CHECK(!ResolveAicpuKernelPackage(search, &package).ok());
   fs::remove_all(temp);
-  std::cout << "Backend selection and installed AICPU package resolution passed\n";
+  std::cout << "Provider configuration and installed AICPU package resolution passed\n";
 }

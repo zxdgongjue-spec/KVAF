@@ -10,6 +10,7 @@ import statistics
 import time
 
 from npu_eids import parse_npu_eids
+from perf_execution import BenchmarkExecution
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -37,7 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-rounds", type=int, default=0,
                         help="extra instrumented rounds, excluded from bandwidth statistics")
     parser.add_argument("--graph-replays", type=int, default=0,
-                        help="extra correctness replays with mutable inputs and two Gets per graph")
+                        help="extra correctness replays with mutable inputs and one Get per graph")
     parser.add_argument("--graph-api", choices=["acl", "torch", "both"], default="both")
     args = parser.parse_args(argv)
     if not all(1 <= workers <= 8 for workers in args.workers):
@@ -151,15 +152,10 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
     input_offsets = [i * block_bytes for i in range(n)]
     lengths = [block_bytes] * n
     stream = torch.npu.current_stream()
-    runtime = kvaf.NpuRuntime(
-        batch_get_kernel_object_path="",
-        batch_get_token_bytes=token,
-        batch_get_tokens_per_block=args.tokens_per_block,
-        device_id=args.device_id,
-        npu_core_count=workers,
-        aicpu_batch_get_mode=mode,
-        npu_eids=args.npu_eids,
-    )
+    execution = BenchmarkExecution(kvaf, executor="aicpu", cores=workers,
+        algorithm="gather" if mode == "gather_read" else "scatter", put_capacity=n, get_capacity=n)
+    runtime = kvaf.NpuRuntime(token, args.tokens_per_block,
+        device_id=args.device_id, npu_eids=args.npu_eids, **execution.runtime_kwargs)
     # Reuse registered allocations while changing their contents each round.
     source = torch.empty((n, block_bytes), dtype=torch.uint8, device=device)
     output = torch.empty((n * 2, token), dtype=torch.uint8, device=device)
@@ -228,6 +224,7 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
             raise AssertionError(f"NPU consumer mismatch: workers={workers}, round={epoch}")
         if not torch.equal(output.cpu(), expected_tensor):
             raise AssertionError(f"output mismatch: workers={workers}, round={epoch}")
+        runtime.drain_get()
         runtime.release_access_table(table)
         runtime.batch_free(keys)
         return elapsed, active_count * token
@@ -240,9 +237,8 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
         table = runtime.prepare_access_table(keys)
         device_table = runtime.access_table_view(table, device="npu")
         base_addresses = device_table.addresses.cpu().tolist()
-        second_output = torch.empty_like(output)
         consumer = torch.empty_like(output)
-        graph_buffers.extend((second_output, consumer))
+        graph_buffers.append(consumer)
 
         def update(epoch: int) -> bytearray:
             rotation = epoch % n
@@ -260,7 +256,6 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
             ):
                 target.copy_(torch.tensor(values, dtype=target.dtype))
             output.fill_(0xA5)
-            second_output.fill_(0xA5)
             expected = bytearray([0xA5]) * (n * 2 * token)
             for i in range(active):
                 slot = (index_values[i] + rotation) % n
@@ -269,22 +264,25 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
                 expected[target:target + token] = payload[begin:begin + token]
             return expected
 
+        graph_lease = 0
+
         def execute(target: object, synchronize: bool = False) -> None:
             runtime.batch_get(device_table, indices, offsets, miss_count, rows, target,
-                              stream=stream, synchronize=synchronize)
+                              stream=stream, synchronize=synchronize,
+                              **({"graph_lease": graph_lease} if graph_lease else {}))
 
         def body() -> None:
             execute(output)
-            execute(second_output)
-            torch.bitwise_xor(second_output, 0xFF, out=consumer)
+            torch.bitwise_xor(output, 0xFF, out=consumer)
 
         apis = ("acl", "torch") if args.graph_api == "both" else (args.graph_api,)
         for api in apis:
             update(0)
             execute(output, True)
-            execute(second_output, True)
             graph = kvaf.AclGraph() if api == "acl" else torch.npu.NPUGraph()
+            graph_lease = runtime.begin_get_graph(execution.get_config, output, n, stream)
             capture_active = False
+            validated = False
             try:
                 if api == "acl":
                     graph.capture_begin(stream)
@@ -300,15 +298,12 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
                     graph.replay(stream) if api == "acl" else graph.replay()
                     runtime.check_batch_get_status(stream)
                     expected_tensor = torch.frombuffer(expected, dtype=torch.uint8).reshape(n * 2, token)
-                    for actual in (output, second_output):
-                        if not torch.equal(actual.cpu(), expected_tensor):
-                            raise AssertionError(f"graph output mismatch: api={api}, mode={mode}, epoch={epoch}")
+                    if not torch.equal(output.cpu(), expected_tensor):
+                        raise AssertionError(f"graph output mismatch: api={api}, mode={mode}, epoch={epoch}")
                     if not torch.equal(consumer.cpu(), torch.bitwise_xor(expected_tensor, 0xFF)):
                         raise AssertionError(f"graph consumer mismatch: api={api}, epoch={epoch}")
-                    if epoch % 2 == 0:
-                        execute(output, True)  # Eager and graph share the device sequence.
                 print(f"AICPU_BATCH_GET_GRAPH_PASS mode={mode} workers={workers} api={api} "
-                      f"replays={max(5, args.graph_replays)} gets_per_graph=2 changing_inputs=1 "
+                      f"replays={max(5, args.graph_replays)} gets_per_graph=1 changing_inputs=1 "
                       "empty_prefix_checked=1 npu_consumer_checked=1", flush=True)
                 update(0)
                 stream.synchronize()
@@ -316,24 +311,27 @@ def run_case(args: argparse.Namespace, workers: int, torch: object, kvaf: object
                 for _ in range(args.warmup):
                     replay()
                 stream.synchronize()
-                for label, submit in (("eager", body), ("graph", replay)):
-                    samples = []
-                    for _ in range(args.iterations):
-                        begin = time.perf_counter_ns()
-                        submit()
-                        stream.synchronize()
-                        samples.append((time.perf_counter_ns() - begin) / 1000)
-                    runtime.check_batch_get_status(stream)
-                    stats = timing_stats(samples, 2 * n * token)
-                    print(f"AICPU_BATCH_GET_GRAPH_PERF mode={mode} workers={workers} api={api} "
-                          f"execution={label} gets_per_iteration=2 samples={args.iterations} "
-                          f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
-                          f"p99_us={stats['p99_us']:.3f} mean_GBps={stats['mean_GBps']:.3f}", flush=True)
+                samples = []
+                for _ in range(args.iterations):
+                    begin = time.perf_counter_ns()
+                    replay()
+                    stream.synchronize()
+                    samples.append((time.perf_counter_ns() - begin) / 1000)
+                runtime.check_batch_get_status(stream)
+                stats = timing_stats(samples, n * token)
+                print(f"AICPU_BATCH_GET_GRAPH_PERF mode={mode} workers={workers} api={api} "
+                      f"execution=graph gets_per_iteration=1 samples={args.iterations} "
+                      f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
+                      f"p99_us={stats['p99_us']:.3f} mean_GBps={stats['mean_GBps']:.3f}", flush=True)
+                validated = True
             finally:
                 if capture_active:
                     graph.capture_end()
                 stream.synchronize()
                 graph.reset()
+                runtime.end_get_graph(graph_lease, stream, discard_result=not validated)
+                graph_lease = 0
+        runtime.drain_get()
         runtime.release_access_table(table)
         runtime.batch_free(keys)
 

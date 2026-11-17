@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from perf_execution import add_execution_mode
+from perf_execution import add_execution_metadata
 
 
 def run_worker(kvaf, torch, args, make_plan, submit, check_output,
@@ -79,7 +79,7 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output,
             "calls": calls, "payload_bytes": payload_bytes,
             "bandwidth_GBps": payload_bytes / (end - begin) / 1e9,
             "graph_calls": len(plans), "verified": True,
-            "execution_mode": getattr(args, "execution_mode", "legacy"),
+            "execution_mode": getattr(args, "execution_mode", "unified"),
         }
         args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
         print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)
@@ -122,7 +122,6 @@ def run_group(args, devices, directory):
             command = [
                 str(runner), str(args.build_dir),
                 "--transport", args.transport,
-                "--execution-mode", args.execution_mode,
                 "--request-length", str(args.requests), "--miss-count", str(args.requests),
                 "--table-capacity", str(args.table_capacity),
                 "--token-bytes", str(args.token_bytes), "--tokens-per-block", str(args.tokens_per_block),
@@ -202,7 +201,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     for solo, shared in zip(isolated, concurrent):
         ratio = shared["bandwidth_GBps"] / solo["bandwidth_GBps"]
         row = {
-            "execution_mode": config.get("execution_mode", "legacy"),
+            "execution_mode": config.get("execution_mode", "unified"),
             "device": solo["device"], "isolated_GBps": solo["bandwidth_GBps"],
             "concurrent_GBps": shared["bandwidth_GBps"],
             "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
@@ -353,7 +352,7 @@ def main(argv=None):
     parser.add_argument("--aiv-cores", nargs="+", type=int,
                         help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
     parser.add_argument("--seconds", type=float, default=10)
-    parser.add_argument("--graph-calls", type=int, default=256,
+    parser.add_argument("--graph-calls", type=int, default=1,
                         help="BatchGet calls per captured graph; replayed continuously during measurement")
     parser.add_argument("--requests", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
@@ -366,7 +365,7 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20260903)
     parser.add_argument("--transport", choices=("ubmem", "urma"), default="ubmem")
-    add_execution_mode(parser)
+    add_execution_metadata(parser)
     parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"))
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
@@ -381,8 +380,8 @@ def main(argv=None):
             print(f"MULTICARD_SUMMARY_FAILED {error}", file=sys.stderr)
             return 1
         return 0
-    if args.execution_mode == "per-call" and args.graph_calls != 1:
-        parser.error("per-call graph leases support one Get; use --graph-calls 1 in both comparison runs")
+    if args.graph_calls != 1:
+        parser.error("graph leases support one Get; use --graph-calls 1")
     cores = args.aiv_cores
     if cores is None:
         cores = [int(value) for value in os.environ.get("KVAF_BATCH_GET_AIV_CORES", "16").split()]

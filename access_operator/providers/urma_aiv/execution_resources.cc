@@ -127,14 +127,15 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
 }  // namespace
 struct AivExecutionResources::State {
   State(AccessOperatorConfig value, const AivExecutionResources* owner)
-      : config(std::move(value)), legacy(owner), active(&legacy) { views.Bind(active); }
+      : config(std::move(value)), default_invocation(owner), active(&default_invocation) { views.Bind(active); }
   ExecutionViewState views;
   AccessOperatorConfig config;
   RemoteRegionDesc remote_region;
   AivGetSession get;
   AivPutSession put;
   bool initialized{false}, closing{false};
-  AivInvocation legacy;
+  // Keeps initialization and Close valid before binding and after unbinding.
+  AivInvocation default_invocation;
   AivInvocation* active;
 };
 AivExecutionResources::AivExecutionResources(AccessOperatorConfig config)
@@ -147,7 +148,7 @@ UrmaAivGetView AivExecutionResources::GetView() {
   const auto& call = *state_->active;
   const auto& c = state_->config;
   return {state_->views.View(ExecutionDirection::Get),
-          {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total, c.managed_completion},
+          {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total},
           state_->get.workspace,
           call.graph_buffer ? call.graph_buffer : call.pending_buffer,
           call.graph_buffer ? call.graph_entity : call.get_entity};
@@ -155,7 +156,7 @@ UrmaAivGetView AivExecutionResources::GetView() {
 UrmaAivPutView AivExecutionResources::PutView() {
   const auto& c = state_->config;
   return {state_->views.View(ExecutionDirection::Put),
-          {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total, c.managed_completion}
+          {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total}
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
           , state_->put.transport != nullptr, state_->put.workspace, state_->active->pending_put_buffer
 #endif
@@ -165,7 +166,7 @@ std::unique_ptr<ExecutionState> AivExecutionResources::CreateState() const {
   return std::make_unique<AivInvocation>(this);
 }
 Status AivExecutionResources::Bind(ExecutionState* state) {
-  auto* typed = state ? dynamic_cast<AivInvocation*>(state) : &state_->legacy;
+  auto* typed = state ? dynamic_cast<AivInvocation*>(state) : &state_->default_invocation;
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("AIV execution state belongs to another resource");
   const auto& active = *state_->active;

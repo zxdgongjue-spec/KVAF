@@ -1,53 +1,49 @@
-"""Select the benchmark API path without changing its workload or providers."""
+"""Configure benchmark providers, resource budgets and reusable buffer leases."""
 
 import os
 import time
 
 
-def add_execution_mode(parser):
-    parser.add_argument(
-        "--execution-mode", choices=("legacy", "per-call"), default="legacy",
-        help="legacy fixed provider (default), or per-call dispatcher and resource leases",
-    )
+def add_execution_metadata(parser):
+    # Keep a stable label in reports, without exposing a second execution path.
+    parser.set_defaults(execution_mode="unified")
 
 
 class BenchmarkExecution:
-    def __init__(self, kvaf, mode, *, transport="urma", executor="aiv",
-                 algorithm="direct", put_capacity=128, get_capacity=65536):
-        if mode not in ("legacy", "per-call"):
-            raise ValueError("execution mode must be legacy or per-call")
-        self.mode = mode
-        self.runtime_kwargs = {}
-        self.put_kwargs = {}
-        self.get_kwargs = {}
-        self.get_config = None
-        self.put_config = None
+    def __init__(self, kvaf, *, transport="urma", executor="aiv",
+                 algorithm="direct", put_capacity=128, get_capacity=65536,
+                 cores=2, jettys=2, get_kernel="", put_kernel="",
+                 max_inflight_total=2048):
+        if not 1 <= put_capacity <= 65536 or not 1 <= get_capacity <= 65536:
+            raise ValueError("Put/Get request capacities must be in [1, 65536]")
+        self.mode = "unified"
         self.put_capacity = put_capacity
         self.get_capacity = get_capacity
-        self.input_lease = 0
-        self.output_lease = 0
+        self.input_lease = self.output_lease = 0
         self.binding_setup_us = self.binding_teardown_us = 0.0
         self.input_setup_us = self.input_teardown_us = 0.0
         reusable_input = transport == "urma" and executor in ("aiv", "aicpu")
-        self.input_binding = ("legacy" if mode == "legacy"
-                              else "not-needed" if not reusable_input
+        self.input_binding = ("not-needed" if not reusable_input
                               else "transient" if os.environ.get("KVAF_PERF_REUSE_PUT_INPUT", "1") == "0"
                               else "reused")
         supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aicpu", "gather"))
-        self.output_binding = ("legacy" if mode == "legacy" else "not-needed" if not supported
+        self.output_binding = ("not-needed" if not supported
                                else "transient" if os.environ.get("KVAF_PERF_REUSE_GET_OUTPUT", "1") == "0"
                                else "reused")
-        # Do not reference new binding symbols or pass new kwargs to main's API.
-        if mode == "legacy":
-            return
-        put = kvaf.PutExecutionConfig(transport, executor)
-        self.put_config = put
-        get = kvaf.GetExecutionConfig(transport, executor, algorithm)
-        self.get_config = get
+        self.put_config = put = kvaf.PutExecutionConfig(transport, executor)
+        self.get_config = get = kvaf.GetExecutionConfig(transport, executor, algorithm)
+        put_budget = dict(cores=cores, request_capacity=put_capacity)
+        get_budget = dict(cores=cores, request_capacity=get_capacity)
+        if executor == "aiv":
+            put_budget["kernel_path"] = put_kernel
+            get_budget["kernel_path"] = get_kernel
+            if transport == "urma":
+                put_budget["jettys"] = min(jettys, 2)
+                get_budget.update(jettys=jettys, max_inflight_total=max_inflight_total)
         self.runtime_kwargs = dict(
-            per_call_execution=True, default_put=put, default_get=get,
-            put_resources=[(put, kvaf.ExecutionResources(request_capacity=put_capacity))],
-            get_resources=[(get, kvaf.ExecutionResources(request_capacity=get_capacity))],
+            transport_mode=transport, default_put=put, default_get=get,
+            put_resources=[(put, kvaf.ExecutionResources(**put_budget))],
+            get_resources=[(get, kvaf.ExecutionResources(**get_budget))],
         )
         self.put_kwargs = dict(execution=put)
         self.get_kwargs = dict(execution=get)
@@ -77,18 +73,11 @@ class BenchmarkExecution:
               f"operation={operation} elapsed_us={elapsed:.3f}", flush=True)
 
     def drain_get(self, runtime):
-        # An external stream synchronize does not retire the dispatcher's lease.
-        # Include this completion work in timed call-to-completion measurements.
-        if self.mode == "per-call":
-            runtime.drain_get()
+        runtime.drain_get()
 
-    def complete_async_get(self, runtime, legacy_synchronize):
-        # Drain waits for a managed Get itself; do not wait once more in Python.
-        # Legacy has no managed completion API and retains its external wait.
-        if self.mode == "per-call":
-            self.drain_get(runtime)
-        else:
-            legacy_synchronize()
+    def complete_async_get(self, runtime):
+        # Drain performs the device wait and retires framework references.
+        runtime.drain_get()
 
     def bind_output(self, runtime, output, stream=None):
         if self.output_binding == "reused":

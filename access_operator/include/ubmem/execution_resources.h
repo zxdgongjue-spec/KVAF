@@ -15,7 +15,6 @@ struct OperatorOptions {
   std::uint32_t device_id{0};
   std::uint32_t cores{2};
   std::shared_ptr<peer::PeerLink> peer_link;
-  bool managed_completion{false};
   std::shared_ptr<DeviceMappingCache> mappings;
 };
 
@@ -56,7 +55,7 @@ struct MappedExecutionView {
   ExecutionViewCommon common;
   MappedRegionView memory;
   AivKernelView kernel;
-  bool managed_completion{}, profiling{}, profile_detail{};
+  bool profiling{}, profile_detail{};
   ExecutionSlot* slot{};
   ExecutionHealth* health{};
 };
@@ -119,9 +118,10 @@ class UbmemResources final : public ExecutionResourceOwner {
   std::vector<char> binary_bytes[2];
   std::unordered_map<aclrtStream, ExecutionSlot> streams;
   bool ready{}, retained{}, profiling{}, profile_detail{};
-  UbmemInvocation legacy{this};
+  // Keeps initialization and Close valid before binding and after unbinding.
+  UbmemInvocation default_invocation{this};
   // Borrowed while the execution context holds its resource lease. Close uses
   // this state to fence work before releasing any physical storage.
-  UbmemInvocation* invocation{&legacy};
+  UbmemInvocation* invocation{&default_invocation};
 };
 }  // namespace kvaf::ubmem

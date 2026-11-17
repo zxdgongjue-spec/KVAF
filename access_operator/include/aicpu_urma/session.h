@@ -54,7 +54,7 @@ class UmdkSession {
     bool attempted{false};
     PutCompletion completion;
   };
-  void BindWriteState(WriteState* state) { write_ = state ? state : &legacy_write_; }
+  void BindWriteState(WriteState* state) { write_ = state ? state : &default_write_; }
   Status ResolveWrite(PutCompletion*);
 
   using Launch = int32_t (*)(const UmdkControlArgs*, aclrtStream);
@@ -75,8 +75,8 @@ class UmdkSession {
   bool connected_{false}, failed_{false};
   bool kernel_loaded_{false};
   std::vector<std::pair<std::uint64_t, std::size_t>> registered_buffers_;
-  WriteState legacy_write_;
-  WriteState* write_{&legacy_write_};
+  WriteState default_write_;
+  WriteState* write_{&default_write_};
 };
 
 inline Status UmdkWriteView::Submit(std::uint64_t descriptors, std::uint32_t count,

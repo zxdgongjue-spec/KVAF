@@ -11,9 +11,8 @@ fi
 KVAF_BUILD_DIR="$1"
 shift
 transport=urma
-execution_mode=legacy
-timing=auto
-adaptive_requested=false
+execution_mode=unified
+timing=host
 base_options=()
 while (($#)); do
   case "$1" in
@@ -21,42 +20,29 @@ while (($#)); do
       if (($# < 2)); then echo "ERROR: --timing requires host or kernel" >&2; exit 2; fi
       timing="$2"; shift 2 ;;
     --timing=*) timing="${1#*=}"; shift ;;
-    --execution-mode)
-      if (($# < 2)); then echo "ERROR: --execution-mode requires legacy or per-call" >&2; exit 2; fi
-      execution_mode="$2"; shift 2 ;;
-    --execution-mode=*) execution_mode="${1#*=}"; shift ;;
+    --execution-mode|--execution-mode=*)
+      echo "ERROR: --execution-mode was removed; all algorithms use unified execution" >&2; exit 2 ;;
     --transport)
       if (($# < 2)); then echo "ERROR: --transport requires urma or ubmem" >&2; exit 2; fi
       transport="$2"
       shift 2
       ;;
     --transport=*) transport="${1#*=}"; shift ;;
-    --adaptive-ub-device) adaptive_requested=true; shift ;;
+    --adaptive-ub-device|--adaptive-calibration-only)
+      echo "ERROR: adaptive startup probing was removed; use --peer-ub-device" >&2; exit 2 ;;
     *) base_options+=("$1"); shift ;;
   esac
 done
 base_options+=(--transport "$transport")
 KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-case "$execution_mode" in
-  legacy|per-call) ;;
-  *) echo "ERROR: --execution-mode must be legacy or per-call" >&2; exit 2 ;;
-esac
-if [[ "$timing" == auto ]]; then
-  if [[ "$execution_mode" == per-call ]]; then timing=host; else timing=kernel; fi
-fi
 case "$timing" in
   host)
-    if [[ "$adaptive_requested" == true ]]; then
-      echo "ERROR: Host comparison sweep requires an explicitly selected peer UB device, not adaptive calibration" >&2
-      exit 2
-    fi
     exec "${PYTHON:-python3}" "$KVAF_ROOT/tests/python/batch_get_host_sweep.py" \
-      "$KVAF_BUILD_DIR" --execution-mode "$execution_mode" "${base_options[@]}"
+      "$KVAF_BUILD_DIR" "${base_options[@]}"
     ;;
   kernel) ;;
   *) echo "ERROR: --timing must be host or kernel" >&2; exit 2 ;;
 esac
-base_options+=(--execution-mode "$execution_mode")
 : "${KVAF_BATCH_GET_PERF_RUNNER:=$KVAF_ROOT/tests/run_remote_cpu_batch_get_perf.sh}"
 # Space-separated overrides allow a focused shape without editing the script.
 read -r -a KVAF_BATCH_GET_TOKEN_BYTES <<< "${KVAF_BATCH_GET_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"
@@ -82,15 +68,6 @@ if [[ ! "$KVAF_BATCH_GET_KERNEL_CLOCK_MHZ" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: KVAF_BATCH_GET_KERNEL_CLOCK_MHZ must be a positive integer" >&2
   exit 2
 fi
-: "${KVAF_ADAPTIVE_UB_MISS_COUNT:=2048}"
-if [[ ! "$KVAF_ADAPTIVE_UB_MISS_COUNT" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ERROR: KVAF_ADAPTIVE_UB_MISS_COUNT must be a positive integer" >&2
-  exit 2
-fi
-export KVAF_ADAPTIVE_UB_MISS_COUNT
-: "${KVAF_ADAPTIVE_UB_DEVICES:=udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3}"
-export KVAF_ADAPTIVE_UB_DEVICES
-
 : "${KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR:=}"
 if [[ -z "$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR" ]]; then
   KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR="$(
@@ -144,108 +121,8 @@ cycles_to_us() {
     'BEGIN { printf "%.3f", cycles / mhz }'
 }
 
-if [[ "$transport" == ubmem && "$adaptive_requested" == true ]]; then
-  echo "ERROR: --adaptive-ub-device applies only to URMA" >&2
-  exit 2
-fi
-
 selected_ub_device=""
-adaptive_selection_skipped=false
-selection_log="$KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR/ub_device_selection.log"
-sweep_options=()
-if ((${#base_options[@]} > 0)); then
-  sweep_options=("${base_options[@]}")
-fi
-if [[ "$adaptive_requested" == true ]]; then
-  IFS=',' read -r -a adaptive_ub_devices <<< "$KVAF_ADAPTIVE_UB_DEVICES"
-  for index in "${!adaptive_ub_devices[@]}"; do
-    device="${adaptive_ub_devices[$index]}"
-    device="${device#"${device%%[![:space:]]*}"}"
-    device="${device%"${device##*[![:space:]]}"}"
-    adaptive_ub_devices[$index]="$device"
-  done
-  calibration_token_bytes=656
-  calibration_miss_count="$KVAF_ADAPTIVE_UB_MISS_COUNT"
-  calibration_options=(
-    --request-length "$calibration_miss_count"
-    --token-bytes "$calibration_token_bytes" --tokens-per-block 128
-    --miss-count "$calibration_miss_count"
-    --aiv-cores 2 --jettys-per-core 2
-    --warmup 1 --iterations 5 --no-kernel-profile
-  )
-  echo "BATCH_GET_UB_DEVICE_FILTER_CHECK_BEGIN" |
-    tee "$selection_log"
-  filter_check_status=0
-  if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
-    ${base_options[@]+"${base_options[@]}"} \
-    --adaptive-ub-device --adaptive-calibration-only \
-    "${calibration_options[@]}" \
-    2>&1 | tee -a "$selection_log"; then
-    :
-  else
-    filter_check_status=$?
-  fi
-  if ((filter_check_status != 0)); then
-    echo "BATCH_GET_UB_DEVICE_FILTER_CHECK_FAILED status=$filter_check_status" >&2
-    exit "$filter_check_status"
-  fi
-  if awk '$1 == "[KVAF_AIV]" && $2 == "UB_DEVICE_ADAPTIVE_SKIPPED" &&
-           $0 ~ /reason=k_side_device_filter/ { found = 1 }
-           END { exit !found }' "$selection_log"; then
-    adaptive_selection_skipped=true
-    echo "BATCH_GET_UB_DEVICE_CALIBRATION_SKIPPED reason=k_side_device_filter" |
-      tee -a "$selection_log"
-  else
-    best_gibps=""
-    echo "BATCH_GET_UB_DEVICE_CALIBRATION_BEGIN token_bytes=$calibration_token_bytes miss_count=$calibration_miss_count aiv_cores=2 jettys_per_core=2 warmup=1 samples=5 metric=batch_get_useful_GiBps mode=full_perf_path" |
-      tee -a "$selection_log"
-    for candidate_ub_device in "${adaptive_ub_devices[@]}"; do
-      echo "BATCH_GET_UB_DEVICE_CANDIDATE_BEGIN ub_device=$candidate_ub_device" |
-        tee -a "$selection_log"
-      candidate_status=0
-      if "$KVAF_BATCH_GET_PERF_RUNNER" "$KVAF_BUILD_DIR" \
-        ${base_options[@]+"${base_options[@]}"} \
-        --peer-ub-device "$candidate_ub_device" \
-        "${calibration_options[@]}" \
-        2>&1 | tee -a "$selection_log"; then
-        :
-      else
-        candidate_status=$?
-      fi
-      if ((candidate_status != 0)); then
-        echo "BATCH_GET_UB_DEVICE_CANDIDATE_FAILED ub_device=$candidate_ub_device status=$candidate_status" |
-          tee -a "$selection_log"
-        continue
-      fi
-      candidate_result="$(extract_profile_result "$selection_log" batch_get)"
-      candidate_gibps="$(extract_field "$candidate_result" useful_GiBps || true)"
-      if [[ ! "$candidate_gibps" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        echo "ERROR: invalid BatchGet result for UB device $candidate_ub_device: $candidate_result" >&2
-        exit 1
-      fi
-      echo "BATCH_GET_UB_DEVICE_CANDIDATE_RESULT ub_device=$candidate_ub_device useful_GiBps=$candidate_gibps" |
-        tee -a "$selection_log"
-      if [[ -z "$best_gibps" ]] ||
-        awk -v candidate="$candidate_gibps" -v best="$best_gibps" \
-          'BEGIN { exit !(candidate > best) }'; then
-        selected_ub_device="$candidate_ub_device"
-        best_gibps="$candidate_gibps"
-      fi
-    done
-    if [[ -z "$selected_ub_device" ]]; then
-      echo "ERROR: no configured UB device completed full-path calibration" >&2
-      exit 1
-    fi
-    sweep_options=()
-    if ((${#base_options[@]} > 0)); then
-      sweep_options=("${base_options[@]}")
-    fi
-    sweep_options+=(--peer-ub-device "$selected_ub_device")
-    echo "BATCH_GET_UB_DEVICE_CALIBRATION_DONE selected_ub_device=$selected_ub_device useful_GiBps=$best_gibps reuse=all_formal_shapes" |
-      tee -a "$selection_log"
-  fi
-  echo "BATCH_GET_UB_DEVICE_SELECTION_LOG_WRITTEN path=$selection_log"
-fi
+sweep_options=("${base_options[@]}")
 
 token_bytes_values=()
 miss_count_values=()
@@ -343,11 +220,6 @@ for token_bytes in "${KVAF_BATCH_GET_TOKEN_BYTES[@]}"; do
             exit 1
           fi
           shape_ub_device="$active_ub_device"
-        fi
-        if [[ "$adaptive_requested" == true && "$adaptive_selection_skipped" == false &&
-          -z "$shape_ub_device" ]]; then
-          echo "ERROR: fixed UB device was not reported for token_bytes=$token_bytes miss_count=$miss_count aiv_cores=$aiv_cores jettys_per_core=$jetty_label" >&2
-          exit 1
         fi
 
     mean_ms="$(extract_field "$total_profile_result" mean_ms)"

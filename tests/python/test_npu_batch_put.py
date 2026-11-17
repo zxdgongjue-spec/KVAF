@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
 from npu_eids import parse_npu_eids
-from perf_execution import BenchmarkExecution, add_execution_mode
+from perf_execution import BenchmarkExecution, add_execution_metadata
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
 DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
@@ -41,11 +41,7 @@ def kernel_paths(executor: str) -> tuple[str, str]:
     put = Path(os.environ.get("KVAF_BATCH_PUT_KERNEL", ""))
     if not put.is_file():
         raise ValueError("KVAF_BATCH_PUT_KERNEL must name the built BatchPut kernel object")
-    get = Path(os.environ.get("KVAF_BATCH_GET_KERNEL", os.environ.get(
-        "KVAF_AIV_BATCH_GET_KERNEL", str(put.with_name("kvaf_execute_batch_get_kernels.o")))))
-    if not get.is_file():
-        raise ValueError("KVAF_BATCH_GET_KERNEL must name the built BatchGet kernel object")
-    return str(get), str(put)
+    return "", str(put)
 
 
 def format_measurements(samples: list[float], *, execution_mode: str,
@@ -126,7 +122,7 @@ def validate_batch(
         runtime.release_access_table(table)
 
 
-def main(transport: str = "urma", execution_mode: str = "legacy",
+def main(transport: str = "urma", execution_mode: str = "unified",
          executor: str = "aiv") -> int:
     try:
         provider = put_backend(transport, executor)
@@ -176,7 +172,7 @@ def main(transport: str = "urma", execution_mode: str = "legacy",
         warmup = int(os.environ.get("KVAF_NPU_WARMUP", "20"))
         iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "500"))
         if not (
-            device_id >= 0 and 0 < rows <= (1 << 32) - 1
+            device_id >= 0 and 0 < rows <= 65536
             and 0 < block_bytes <= (1 << 32) - 1
             and token_bytes > 0 and tokens_per_block > 0
             and block_bytes == token_bytes * tokens_per_block
@@ -231,25 +227,14 @@ def main(transport: str = "urma", execution_mode: str = "legacy",
     torch.npu.synchronize()
     stream = torch.npu.current_stream()
 
-    execution = BenchmarkExecution(kvaf, execution_mode, transport=transport,
+    execution = BenchmarkExecution(kvaf, transport=transport,
                                    executor=executor,
                                    algorithm="gather" if executor == "aicpu" else "direct",
-                                   put_capacity=rows)
-    # Legacy selects AICPU Put through its fixed Gather backend. The benchmark
-    # only executes Put; per-call selects the corresponding Put provider.
-    provider_options = {"aicpu_batch_get_mode": "gather_read"} if executor == "aicpu" else {}
+                                   put_capacity=rows, cores=npu_core_count, jettys=jettys_per_core,
+                                   get_kernel=batch_get_kernel, put_kernel=batch_put_kernel)
     runtime = kvaf.NpuRuntime(
-        batch_get_kernel,
-        transport=transport,
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=npu_core_count,
-        batch_put_kernel_object_path=batch_put_kernel,
-        jettys_per_core=jettys_per_core,
-        peer_ub_device=peer_ub_device,
-        npu_eids=npu_eids,
-        **provider_options,
+        batch_get_token_bytes=token_bytes, batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id, peer_ub_device=peer_ub_device, npu_eids=npu_eids,
         **execution.runtime_kwargs,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
@@ -349,6 +334,6 @@ if __name__ == "__main__":
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
     parser.add_argument("--executor", choices=("aiv", "aicpu"), default="aiv",
                         help="Put executor; aicpu requires URMA and the installed AICPU package")
-    add_execution_mode(parser)
+    add_execution_metadata(parser)
     args = parser.parse_args()
     raise SystemExit(main(args.transport, args.execution_mode, args.executor))

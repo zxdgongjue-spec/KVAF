@@ -37,33 +37,6 @@ Status Internal(std::string message) {
   return Status::Internal(std::move(message));
 }
 
-#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
-void LogBatchPutDeviceStatus(const AivPutWorkspace& execution,
-                             std::uint32_t npu_core_count,
-                             int32_t result) {
-  std::fprintf(stderr, "[KVAF_AIV] BATCH_PUT_EXECUTION_ERROR result=%d\n",
-               static_cast<int>(result));
-  for (std::uint32_t core = 0; core < npu_core_count; ++core) {
-    const KvafBatchPutCoreStatus& status = execution.host_core_status[core];
-    std::fprintf(stderr,
-                 "[KVAF_AIV] BATCH_PUT_DEVICE_ERROR core=%u magic=0x%llx "
-                 "result=%llu processed=%llu failed_request=%llu cq_status=%llu "
-                 "cq_sub_status=%llu completed_batches=%llu sq_pi=%llu cq_ci=%llu "
-                 "last_wqe=0x%llx\n",
-                 core, static_cast<unsigned long long>(status.magic),
-                 static_cast<unsigned long long>(status.result),
-                 static_cast<unsigned long long>(status.processed_request_count),
-                 static_cast<unsigned long long>(status.failed_request_index),
-                 static_cast<unsigned long long>(status.cq_status),
-                 static_cast<unsigned long long>(status.cq_sub_status),
-                 static_cast<unsigned long long>(status.completed_batch_count),
-                 static_cast<unsigned long long>(status.sq_producer_index),
-                 static_cast<unsigned long long>(status.cq_consumer_index),
-                 static_cast<unsigned long long>(status.last_wqe_protocol));
-  }
-}
-#endif
-
 std::uint64_t PointerValue(const void* pointer) {
   return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
 }
@@ -204,7 +177,7 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
   const auto prepare_started = GetHostTimingStart(request.host_timing);
   auto& call = resources_->invocation();
   auto view = resources_->GetView();
-  if (view.options.managed_completion && !call.graph_buffer) {
+  if (!call.graph_buffer) {
     auto status = UrmaAivGetOperator::Drain(view, call);
     if (!status.ok()) return status;
   }
@@ -391,7 +364,7 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
     if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
       return Status::InvalidState("graph lease submissions require active capture");
   }
-  if (view.options.managed_completion && !graph_lease) {
+  if (!graph_lease) {
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI graph = nullptr;
     if (query_capture(&capture, &graph) != ACL_SUCCESS)
@@ -435,7 +408,7 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
     return InvalidState("AIV Get registration must be prepared before Launch");
   arguments.channel_entity = channel_entity;
 
-  if (view.options.managed_completion && !graph_lease) {
+  if (!graph_lease) {
     invocation.pending_get = stream;
     invocation.pending_buffer = local_buffer;
     invocation.get_issued = false;
@@ -445,36 +418,14 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
   const int32_t launch_result = KvafExecuteBatchGetLaunch(&arguments, stream);
   GetHostTimingRecord(exec.host_timing, &GetProviderTiming::aiv_kernel_launch_ns, launch_started);
   if (launch_result != KVAF_BATCH_GET_SUCCESS) {
-    if (!view.options.managed_completion && !graph_lease)
-      { KvafBatchGetLocalBufferRelease(local_buffer); invocation.pending_buffer = nullptr;
-        invocation.pending_get = nullptr; invocation.get_entity = 0; }
     return Internal("failed to launch BatchGet");
   }
   GetHostTimingRecord(exec.host_timing, &GetProviderTiming::submit_ns, submit_started);
   const auto completion_started = GetHostTimingStart(exec.host_timing);
   if (graph_lease) return Status::OK();
-  if (view.options.managed_completion) {
-    auto completed = exec.execution.synchronize ? Drain(view, invocation) : Status::OK();
-    GetHostTimingRecord(exec.host_timing, &GetProviderTiming::completion_ns, completion_started);
-    return completed;
-  }
-  if (exec.execution.synchronize) {
-    const aclError sync_result = aclrtSynchronizeStream(stream);
-    KvafBatchGetLocalBufferRelease(local_buffer);
-    invocation.pending_buffer = nullptr; invocation.pending_get = nullptr; invocation.get_entity = 0;
-    if (sync_result != ACL_SUCCESS) {
-      return Internal("BatchGet stream synchronization failed");
-    }
-    LogBatchGetDeviceStatus(view.workspace, view.options.npu_core_count);
-  } else {
-    // The transport caches zero-reference registrations until shutdown.
-    // Releasing after an externally captured launch keeps KVAF graph-agnostic;
-    // the caller owns stream completion and tensor lifetime.
-    KvafBatchGetLocalBufferRelease(local_buffer);
-    invocation.pending_buffer = nullptr; invocation.pending_get = nullptr; invocation.get_entity = 0;
-  }
+  auto completed = exec.execution.synchronize ? Drain(view, invocation) : Status::OK();
   GetHostTimingRecord(exec.host_timing, &GetProviderTiming::completion_ns, completion_started);
-  return Status::OK();
+  return completed;
 }
 
 Status UrmaAivGetOperator::Drain(UrmaAivGetView view, AivInvocation& invocation) {
@@ -702,7 +653,6 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
   const auto* input = static_cast<const std::uint8_t*>(exec.request->input.data);
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   if (view.device_execution) {
-    const bool managed = view.options.managed_completion || invocation.input_buffer;
     auto* timing = exec.execution.host_timing;
     PutHostTimingScope metadata(timing, &PutProviderTiming::metadata_ns);
     if (exec.execution.stream == nullptr) {
@@ -738,10 +688,8 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
         exec.execution.stream != invocation.pending_put)
       return InvalidState("AIV Put registration must be prepared before Launch");
 
-    if (managed) {
-      invocation.pending_put = stream;
-      invocation.pending_put_buffer = local_buffer;
-    }
+    invocation.pending_put = stream;
+    invocation.pending_put_buffer = local_buffer;
     metadata.Finish();
     const auto status_bytes = execution.host_core_status_count * sizeof(KvafBatchPutCoreStatus);
     aclError reset_result;
@@ -750,10 +698,6 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
       reset_result = aclrtMemset(execution.core_status, status_bytes, 0, status_bytes);
     }
     if (reset_result != ACL_SUCCESS) {
-      if (!managed) {
-        KvafBatchPutLocalBufferRelease(local_buffer);
-        invocation.pending_put = nullptr; invocation.pending_put_buffer = nullptr;
-      }
       return Internal("failed to reset Put completion status");
     }
     PutHostTimingScope upload(timing, &PutProviderTiming::metadata_ns);
@@ -777,18 +721,12 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
     if (aclrtMemcpyAsync(execution.metadata, metadata_bytes,
                          execution.host_metadata, metadata_bytes,
                          ACL_MEMCPY_HOST_TO_DEVICE, stream) != ACL_SUCCESS) {
-      if (!managed) {
-        KvafBatchPutLocalBufferRelease(local_buffer);
-        invocation.pending_put = nullptr; invocation.pending_put_buffer = nullptr;
-      }
       return Status::CompletionUnknown("failed to enqueue BatchPut metadata upload to NPU");
     }
     upload.Finish();
 
-    if (managed) {
-      invocation.pending_put = stream;
-      invocation.pending_put_buffer = local_buffer;
-    }
+    invocation.pending_put = stream;
+    invocation.pending_put_buffer = local_buffer;
     invocation.put_issued = true;
     const int32_t result = timing ? KvafExecuteBatchPutSyncTimed(
         local_buffer, &arguments, stream, execution.host_core_status,
@@ -803,22 +741,16 @@ Status UrmaAivPutOperator::Execute(const BatchPutExecRequest& exec, UrmaAivPutVi
       // the stream has stopped reading it.
       (void)aclrtSynchronizeStream(stream);
     }
-    if (managed && result != KVAF_BATCH_PUT_SUCCESS)
+    if (result != KVAF_BATCH_PUT_SUCCESS)
       return Status::CompletionUnknown("AIV BatchPut execution failed; session retained for shutdown");
     PutHostTimingScope cleanup(timing, &PutProviderTiming::cleanup_ns);
     // The explicit lease owns the only registration reference across calls.
     if (local_buffer != invocation.input_buffer) {
-      if (managed) {
-        if (KvafBatchPutLocalBufferRetire(local_buffer) != KVAF_BATCH_PUT_SUCCESS)
-          return Status::CompletionUnknown("failed to retire Put registration; resources retained");
-      } else KvafBatchPutLocalBufferRelease(local_buffer);
+      if (KvafBatchPutLocalBufferRetire(local_buffer) != KVAF_BATCH_PUT_SUCCESS)
+        return Status::CompletionUnknown("failed to retire Put registration; resources retained");
     }
     invocation.pending_put = nullptr;
     invocation.pending_put_buffer = nullptr;
-    if (result != KVAF_BATCH_PUT_SUCCESS) {
-      LogBatchPutDeviceStatus(execution, view.options.npu_core_count, result);
-      return Internal("AIV Direct-HCCP BatchPut execution failed");
-    }
     return Status::OK();
   }
 #endif

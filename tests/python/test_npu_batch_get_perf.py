@@ -27,8 +27,6 @@ environment variables:
     --ubmem-profile-detail  per-row diagnostic timing (requires --kernel-profile)
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
-    adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
-    adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
 
 from __future__ import annotations
@@ -46,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
-from perf_execution import BenchmarkExecution, add_execution_mode
+from perf_execution import BenchmarkExecution, add_execution_metadata
 from batch_get_workload import token_pattern
 
 
@@ -61,13 +59,6 @@ DEFAULT_WARMUP = 3
 DEFAULT_ITERATIONS = 100
 DEFAULT_POPULATE_CHUNK_ENTRIES = 128
 DEFAULT_KERNEL_PROFILE_CLOCK_MHZ = 1000
-DEFAULT_ADAPTIVE_UB_MISS_COUNT = 2048
-DEFAULT_ADAPTIVE_PEER_UB_DEVICES = (
-    "udmac0d1e2",
-    "udmac0d1e3",
-    "udmac1d1e2",
-    "udmac1d1e3",
-)
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
 
@@ -86,14 +77,6 @@ def environment_bool(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off")
-
-
-def configured_adaptive_ub_devices() -> list[str]:
-    configured = os.environ.get(
-        "KVAF_ADAPTIVE_UB_DEVICES",
-        ",".join(DEFAULT_ADAPTIVE_PEER_UB_DEVICES),
-    )
-    return [device.strip() for device in configured.split(",")]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -189,21 +172,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--adaptive-ub-device", action="store_true",
-        help=(
-            "startup tuning over the N-side peer-device allowlist when K has "
-            "no explicit device filter"
-        ),
-    )
-    parser.add_argument(
         "--peer-ub-device",
         default="",
         help="strict K-side UB device selected by an earlier process",
-    )
-    parser.add_argument(
-        "--adaptive-calibration-only",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--warmup",
@@ -275,7 +246,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="AIV clock used to convert profile cycles to milliseconds",
     )
     parser.add_argument("--transport", choices=("urma", "ubmem"), default=None,
-                        help="legacy transport selection; --backend selects all implementations")
+                        help="transport selection; --backend selects all implementations")
     parser.add_argument("--backend", choices=("aiv", "ubmem", "gather_read", "cpu_push_scatter"),
                         help="BatchGet implementation; explicit selection enables NPU testing")
     parser.add_argument("--build-dir", type=Path,
@@ -289,14 +260,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
     parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
-                        help="enable a hardware run with the legacy transport arguments")
+                        help="enable a hardware run with the transport arguments")
     parser.add_argument(
         "--get-timing", choices=("async-drain", "sync-call"), default="async-drain",
-        help="asynchronous submit plus external completion (default), or time one synchronous batch_get call",
+        help="asynchronous submit plus drain (default), or time one synchronous batch_get call",
     )
-    add_execution_mode(parser)
+    add_execution_metadata(parser)
     parser.set_defaults(
-        adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
         kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
         sort_input_indices=environment_bool(
             "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
@@ -309,7 +279,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-graph-calls", type=int, default=1, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.backend_explicit = args.backend is not None
     expected_transport = "ubmem" if args.backend == "ubmem" else "urma"
@@ -319,18 +289,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.backend = args.backend or ("ubmem" if args.transport == "ubmem" else "aiv")
     if args.miss_count is None:
         args.miss_count = args.request_length
-    args.adaptive_ub_miss_count = environment_int(
-        "KVAF_ADAPTIVE_UB_MISS_COUNT", DEFAULT_ADAPTIVE_UB_MISS_COUNT
-    )
     return args
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
-    if args.execution_mode == "per-call":
-        if args.adaptive_ub_device:
-            return "per-call mode does not support adaptive-ub-device; select peer-ub-device explicitly"
-        if args.contention_control_dir is not None and args.contention_graph_calls != 1:
-            return "per-call graph leases support one Get per graph; use --graph-calls 1"
+    if args.contention_control_dir is not None and args.contention_graph_calls != 1:
+        return "graph leases support one Get per graph; use --graph-calls 1"
     if args.device_id < 0:
         return "device-id must be non-negative"
     if args.graph_replays <= 0:
@@ -340,16 +304,14 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "AICPU requires request-length <= 65536 and workers in 1..8"
         if args.token_bytes * 65536 > 0xFFFFFFFF or args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
             return "AICPU token workspace and block bytes must fit uint32"
-        if args.adaptive_ub_device:
-            return "adaptive-ub-device applies only to AIV URMA"
-    if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
-        return "adaptive-ub-device and peer-ub-device apply only to URMA"
+    if args.transport == "ubmem" and args.peer_ub_device:
+        return "peer-ub-device applies only to URMA"
     if args.ubmem_profile_detail and (args.transport != "ubmem" or not args.kernel_profile):
         return "ubmem-profile-detail requires --transport ubmem and --kernel-profile"
     block_bytes = args.token_bytes * args.tokens_per_block
     ddr_bytes = args.table_capacity * block_bytes
-    if args.request_length <= 0 or args.request_length > MAX_INT32:
-        return "request-length must be in [1, INT32_MAX]"
+    if args.request_length <= 0 or args.request_length > 65536:
+        return "request-length must be in [1, 65536]"
     if args.table_capacity <= 0 or args.table_capacity > MAX_INT32:
         return "table-capacity must be in [1, INT32_MAX]"
     if args.tokens_per_block <= 0 or args.tokens_per_block > MAX_INT32:
@@ -362,22 +324,6 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "configured table size must fit uint64"
     if args.miss_count < 0 or args.miss_count > args.request_length:
         return "miss-count must be between zero and request-length"
-    if args.adaptive_ub_device and args.miss_count == 0:
-        return "adaptive UB device tuning requires a positive miss-count"
-    if args.adaptive_ub_device and (
-        args.adaptive_ub_miss_count <= 0 or args.adaptive_ub_miss_count > MAX_INT32
-    ):
-        return "KVAF_ADAPTIVE_UB_MISS_COUNT must be in [1, INT32_MAX]"
-    if args.adaptive_ub_device and args.peer_ub_device:
-        return "adaptive-ub-device and peer-ub-device are mutually exclusive"
-    if args.adaptive_calibration_only and not args.adaptive_ub_device:
-        return "adaptive-calibration-only requires adaptive-ub-device"
-    if args.adaptive_ub_device and (
-        any(not device for device in args.adaptive_peer_ub_devices)
-        or len(set(args.adaptive_peer_ub_devices))
-        != len(args.adaptive_peer_ub_devices)
-    ):
-        return "KVAF_ADAPTIVE_UB_DEVICES must contain unique non-empty names"
     if args.aiv_cores <= 0 or args.aiv_cores > 48:
         return "aiv-cores must be in [1, 48]"
     if not uses_aicpu(args) and len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
@@ -390,8 +336,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "warmup must be non-negative"
     if args.iterations <= 0:
         return "iterations must be positive"
-    if args.populate_chunk_entries <= 0:
-        return "populate-chunk-entries must be positive"
+    if args.populate_chunk_entries <= 0 or min(args.populate_chunk_entries, args.table_capacity) > 65536:
+        return "populate-chunk-entries must be positive and each Put batch must fit 65536 entries"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     if args.contention_control_dir is not None:
@@ -416,19 +362,11 @@ def uses_aicpu(args):
     return args.backend in ("gather_read", "cpu_push_scatter")
 
 
-def runtime_options(args, put_kernel):
-    options = dict(
+def runtime_options(args):
+    return dict(
         batch_get_token_bytes=args.token_bytes, batch_get_tokens_per_block=args.tokens_per_block,
-        device_id=args.device_id, npu_core_count=args.aiv_cores,
-        batch_put_kernel_object_path=put_kernel, jettys_per_core=args.jettys_per_core,
-        batch_get_max_inflight_total=args.max_inflight_total, npu_eids=args.npu_eids,
-        adaptive_ub_device=args.adaptive_ub_device, adaptive_ub_miss_count=args.adaptive_ub_miss_count,
-        peer_ub_device=args.peer_ub_device, adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
-        transport=args.transport,
+        device_id=args.device_id, npu_eids=args.npu_eids, peer_ub_device=args.peer_ub_device,
     )
-    if uses_aicpu(args):
-        options["aicpu_batch_get_mode"] = args.backend
-    return options
 
 
 def device_profile_ms(profiles, clock_mhz):
@@ -503,7 +441,7 @@ def print_measurements(args, execution, samples, profiles):
             f"p99_GBps={payload / p99 / 1e6:.6f} "
             f"mean_GiBps={payload / (mean / 1000) / 1024**3:.6f} "
             f"timing_source={source} profiling_enabled={int(profiling)} detail_output_enabled={int(args.kernel_profile)} "
-            "input_updates_and_validation_excluded=1 status_readback_excluded=1",
+            "input_updates_and_validation_excluded=1 profile_readback_excluded=1",
             flush=True,
         )
     if args.kernel_profile:
@@ -518,7 +456,7 @@ def print_measurements(args, execution, samples, profiles):
 def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
                          miss_count, output, check_output, execution=None):
     execution = execution or BenchmarkExecution(
-        kvaf, args.execution_mode, transport=args.transport,
+        kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
         get_capacity=args.request_length,
@@ -546,7 +484,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
 
     prepare(args.miss_count)
     submit()  # Register the fixed output and prepare state before capture.
-    execution.complete_async_get(runtime, stream.synchronize)
+    execution.complete_async_get(runtime)
     check(args.miss_count)
     execution.release_output(runtime)
     options.pop("output_lease", None)
@@ -555,9 +493,8 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     graph_lease = 0
     validated = False
     try:
-        if args.execution_mode == "per-call":
-            graph_lease = runtime.begin_get_graph(execution.get_config, output, args.request_length, stream)
-            options["graph_lease"] = graph_lease
+        graph_lease = runtime.begin_get_graph(execution.get_config, output, args.request_length, stream)
+        options["graph_lease"] = graph_lease
         if args.graph_api == "acl":
             graph.capture_begin(stream)
             capturing = True
@@ -641,7 +578,7 @@ def print_samples(
     request_length: int,
     miss_count: int,
     token_bytes: int,
-    *, execution_mode: str = "legacy",
+    *, execution_mode: str = "unified",
 ) -> None:
     mean_ms = statistics.mean(samples)
     result = (
@@ -1009,14 +946,17 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
     device = f"npu:{device_id}"
 
     execution = BenchmarkExecution(
-        kvaf, args.execution_mode, transport=args.transport,
+        kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
         put_capacity=min(args.populate_chunk_entries, table_capacity),
-        get_capacity=request_length,
+        get_capacity=request_length, cores=args.aiv_cores, jettys=args.jettys_per_core,
+        get_kernel="" if uses_aicpu(args) else str(kernel),
+        put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
+        max_inflight_total=args.max_inflight_total,
     )
-    runtime = kvaf.NpuRuntime("" if uses_aicpu(args) else str(kernel),
-        **runtime_options(args, "" if uses_aicpu(args) else str(batch_put_kernel)),
+    runtime = kvaf.NpuRuntime(
+        **runtime_options(args),
         **execution.runtime_kwargs)
     runtime.link_to(remote_cpu_service)
     table = None
@@ -1036,8 +976,6 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
-            f"adaptive_ub_device={int(args.adaptive_ub_device)} "
-            f"adaptive_ub_miss_count={args.adaptive_ub_miss_count} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "
@@ -1049,9 +987,6 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
         print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
         runtime.initialize(ddr_bytes, block_bytes)
         print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
-        if args.adaptive_calibration_only:
-            print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
-            return 0
 
         # Distinct global token IDs expose wrong-block reads and stale staging.
         # Populate in bounded chunks even when the table is much larger than HBM.
@@ -1135,7 +1070,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             output,
             **execution.get_kwargs,
         )
-        execution.complete_async_get(runtime, torch.npu.synchronize)
+        execution.complete_async_get(runtime)
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
             token_pattern(torch, preflight_token_ids[:miss_count_value], token_byte_indices),
@@ -1235,9 +1170,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
 
             def prepare_graph(stream):
                 execution.drain_get(runtime)
-                if args.execution_mode == "per-call":
-                    graph_options["graph_lease"] = runtime.begin_get_graph(
-                        execution.get_config, output, request_length, stream)
+                graph_options["graph_lease"] = runtime.begin_get_graph(
+                    execution.get_config, output, request_length, stream)
 
             def release_graph(stream, captured):
                 lease = graph_options.pop("graph_lease", None)
@@ -1282,7 +1216,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 torch.npu.synchronize()
                 execution.drain_get(runtime)
             else:
-                execution.complete_async_get(runtime, torch.npu.synchronize)
+                execution.complete_async_get(runtime)
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
         if uses_aicpu(args):
             # Do not charge deferred warmup status D2H to the first sample.
@@ -1314,7 +1248,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             if args.get_timing == "sync-call":
                 completed = submitted
             else:
-                execution.complete_async_get(runtime, torch.npu.synchronize)
+                execution.complete_async_get(runtime)
                 completed = time.perf_counter()
                 submit_samples.append((submitted - begin) * 1000.0)
                 synchronize_samples.append((completed - submitted) * 1000.0)

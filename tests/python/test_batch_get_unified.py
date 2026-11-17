@@ -29,13 +29,13 @@ class UnifiedConfigTests(unittest.TestCase):
             args = self.parse("--backend", backend, "--table-capacity", "1000000",
                               "--request-length", "32768", "--miss-count", "4096", "--workers", "4")
             self.assertIsNone(perf.validate_args(args))
-            options = perf.runtime_options(args, "put.o")
+            options = perf.runtime_options(args)
             self.assertEqual((args.table_capacity, args.request_length, args.miss_count), (1000000, 32768, 4096))
-            self.assertEqual(options["transport"], "ubmem" if backend == "ubmem" else "urma")
-            self.assertEqual(options["npu_core_count"], 4)
-            self.assertEqual(options.get("aicpu_batch_get_mode", ""), backend if perf.uses_aicpu(args) else "")
+            self.assertEqual(options["batch_get_token_bytes"], args.token_bytes)
+            self.assertNotIn("aicpu_batch_get_mode", options)
+            self.assertNotIn("npu_core_count", options)
 
-    def test_legacy_defaults_and_explicit_cli_overrides(self):
+    def test_defaults_and_explicit_cli_overrides(self):
         args = self.parse()
         self.assertEqual((args.backend, args.transport, args.execution), ("aiv", "urma", "eager"))
         self.assertFalse(args.kernel_profile)
@@ -49,20 +49,19 @@ class UnifiedConfigTests(unittest.TestCase):
             self.parse("--backend", "gather_read", "--transport", "ubmem")
 
     def test_execution_axes_are_independent(self):
-        for mode in ("legacy", "per-call"):
+        for mode in ("unified",):
             for execution in ("eager", "graph", "both"):
-                args = self.parse("--backend", "ubmem", "--execution-mode", mode,
-                                  "--execution", execution)
+                args = self.parse("--backend", "ubmem", "--execution", execution)
                 self.assertEqual((args.execution_mode, args.execution), (mode, execution))
                 self.assertIsNone(perf.validate_args(args))
         for backend in ("gather_read", "cpu_push_scatter"):
-            args = self.parse("--backend", backend, "--execution-mode", "per-call", "--graph")
+            args = self.parse("--backend", backend, "--graph")
             self.assertIsNone(perf.validate_args(args))
 
     def test_backend_specific_limits_do_not_restrict_aiv(self):
-        self.assertIsNone(perf.validate_args(self.parse("--request-length", "100000", "--workers", "16")))
+        self.assertIsNone(perf.validate_args(self.parse("--request-length", "65536", "--workers", "16")))
         for backend in ("gather_read", "cpu_push_scatter"):
-            for options in (("--request-length", "65537"), ("--workers", "9"), ("--adaptive-ub-device",)):
+            for options in (("--request-length", "65537"), ("--workers", "9")):
                 self.assertIsNotNone(perf.validate_args(self.parse("--backend", backend, *options)))
             self.assertIsNone(perf.validate_args(self.parse("--backend", backend, "--peer-ub-device", "udma0")))
         self.assertIn("graph-replays", perf.validate_args(self.parse("--graph-replays", "0")))
@@ -127,6 +126,8 @@ class TimingTests(unittest.TestCase):
             perf.print_measurements(args, "graph", [1, 3], [sample, sample])
         host, kernel = records(output.getvalue())
         self.assertEqual((host["scope"], kernel["scope"]), ("end_to_end", "kernel"))
+        self.assertEqual(host["profile_readback_excluded"], "1")
+        self.assertNotIn("status_readback_excluded", host)
         self.assertEqual(host["mean_GBps"], "0.005000")  # payload / mean latency, not mean of rates.
         self.assertEqual(kernel["mean_us"], "60.000000")
         self.assertEqual(kernel["mean_GBps"], "0.166667")
@@ -144,8 +145,7 @@ class TimingTests(unittest.TestCase):
 class EagerCompletionTests(unittest.TestCase):
     def run_eager(self, backend, mode, timing="async-drain", fail_drain=False):
         with patch.dict(os.environ, {}, clear=True):
-            args = perf.parse_args(["--backend", backend, "--execution-mode", mode,
-                                   "--get-timing", timing, "--workers", "2",
+            args = perf.parse_args(["--backend", backend, "--get-timing", timing, "--workers", "2",
                                    "--table-capacity", "4", "--request-length", "4",
                                    "--miss-count", "4", "--warmup", "2", "--iterations", "3"])
         events, pending = [], []
@@ -200,10 +200,10 @@ class EagerCompletionTests(unittest.TestCase):
 
     def test_async_completion_is_single_wait_for_all_backends(self):
         for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):
-            for mode in ("legacy", "per-call"):
+            for mode in ("unified",):
                 with self.subTest(backend=backend, mode=mode):
                     events, runtime, output = self.run_eager(backend, mode)
-                    completion = "drain" if mode == "per-call" else "wait"
+                    completion = "drain" if mode == "unified" else "wait"
                     submissions = [i for i, event in enumerate(events) if event == "submit"]
                     self.assertEqual(len(submissions), 6)  # Preflight + warmup + measured calls.
                     for i in submissions[:3]:
@@ -211,11 +211,11 @@ class EagerCompletionTests(unittest.TestCase):
                     for i in submissions[3:]:
                         self.assertEqual(events[i - 1:i + 4],
                                          ["clock", "submit", "clock", completion, "clock"])
-                    self.assertEqual(runtime.drain_get.call_count, 6 if mode == "per-call" else 0)
+                    self.assertEqual(runtime.drain_get.call_count, 6 if mode == "unified" else 0)
                     self.assertEqual([row["samples"] for row in records(output)], ["3", "3"])
 
     def test_sync_call_measurement_has_no_external_wait_or_drain(self):
-        for mode in ("legacy", "per-call"):
+        for mode in ("unified",):
             with self.subTest(mode=mode):
                 events, _, _ = self.run_eager("ubmem", mode, "sync-call")
                 submissions = [i for i, event in enumerate(events) if event == "sync_submit"]
@@ -225,7 +225,7 @@ class EagerCompletionTests(unittest.TestCase):
                                  ["wait", "clock", "sync_submit", "clock"] * 2)
 
     def test_drain_failure_is_not_hidden_by_external_wait(self):
-        events, runtime, output = self.run_eager("ubmem", "per-call", fail_drain=True)
+        events, runtime, output = self.run_eager("ubmem", "unified", fail_drain=True)
         i = events.index("submit")
         self.assertEqual(events[i + 1:], ["drain"])
         self.assertNotIn("BATCH_GET_RESULT ", output)
@@ -290,7 +290,7 @@ class Runtime:
     def batch_get(self, table, indices, offsets, count, rows, output, stream, **kwargs):
         if self.engine.capturing and "execution" in kwargs:
             if kwargs.get("graph_lease") != 23:
-                raise AssertionError("per-call capture must own a graph lease")
+                raise AssertionError("graph capture must own a graph lease")
         def kernel():
             self.engine.calls += 1
             for i in range(count.values[0]):
@@ -340,12 +340,12 @@ class Runtime:
 
 
 class GraphRunnerTests(unittest.TestCase):
-    def run_graph(self, backend, api, fail_on=0, detailed=False, execution_mode="legacy"):
+    def run_graph(self, backend, api, fail_on=0, detailed=False, execution_mode="unified"):
         with patch.dict(os.environ, {}, clear=True):
             args = perf.parse_args(["--backend", backend, "--workers", "2",
                                     "--request-length", "4", "--miss-count", "4", "--warmup", "2",
                                     "--iterations", "3", "--graph-api", api,
-                                    "--execution-mode", execution_mode])
+                                    ])
             args.kernel_profile = detailed
         engine = Engine()
         runtime = Runtime(engine, perf.uses_aicpu(args), fail_on, detailed)
@@ -390,7 +390,7 @@ class GraphRunnerTests(unittest.TestCase):
         self.assertFalse(engine.pending)
         if fail_on:
             self.assertFalse(records(captured_output.getvalue()))
-            if execution_mode == "per-call":
+            if execution_mode == "unified":
                 self.assertEqual(runtime.released_leases, [(23, True)])
         else:
             self.assertEqual(engine.calls, 11)  # warmup Get + 5 checks + 2 warmups + 3 measurements.
@@ -400,7 +400,7 @@ class GraphRunnerTests(unittest.TestCase):
             results = records(captured_output.getvalue())
             self.assertEqual([r["samples"] for r in results], ["3", "3"])
             self.assertEqual(results[1]["mean_us"], "0.111000")  # Actual measured replays 9, 10, 11.
-            if execution_mode == "per-call":
+            if execution_mode == "unified":
                 self.assertEqual(len(runtime.graph_leases), 1)
                 self.assertEqual(runtime.released_leases, [(23, False)])
                 self.assertEqual(runtime.drains, 1)
@@ -419,16 +419,16 @@ class GraphRunnerTests(unittest.TestCase):
 
     def test_protocol_failure_does_not_emit_success_and_releases_graph(self):
         self.run_graph("cpu_push_scatter", "torch", fail_on=4)
-        self.run_graph("cpu_push_scatter", "acl", fail_on=4, execution_mode="per-call")
+        self.run_graph("cpu_push_scatter", "acl", fail_on=4, execution_mode="unified")
 
     def test_explicit_aicpu_profile_reports_stages_and_workers(self):
         self.run_graph("cpu_push_scatter", "torch", detailed=True)
 
-    def test_per_call_all_graphs_keep_resources_until_graph_reset(self):
+    def test_unified_all_graphs_keep_resources_until_graph_reset(self):
         for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):
             for api in ("acl", "torch"):
                 with self.subTest(backend=backend, api=api):
-                    self.run_graph(backend, api, execution_mode="per-call")
+                    self.run_graph(backend, api, execution_mode="unified")
 
 
 if __name__ == "__main__":

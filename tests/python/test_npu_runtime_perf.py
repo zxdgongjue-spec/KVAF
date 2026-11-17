@@ -23,7 +23,7 @@ import kvaf
 from backend import detect_torch_backend
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
-from perf_execution import BenchmarkExecution, add_execution_mode
+from perf_execution import BenchmarkExecution, add_execution_metadata
 
 
 AIV_CORES = 32
@@ -51,7 +51,7 @@ def print_samples(
     warmup: int,
     units: str,
     payload_bytes_per_call: int = 0,
-    *, execution_mode: str = "legacy",
+    *, execution_mode: str = "unified",
 ) -> None:
     result = (
         "PERF_RESULT "
@@ -76,7 +76,7 @@ def print_samples(
     print(result)
 
 
-def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy") -> int:
+def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unified") -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(f"SKIP: NPU benchmark requires torch_npu; detected {backend.name}.")
@@ -142,7 +142,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
         and token_bytes > 0
         and tokens_per_block > 0
         and source_stride == block_bytes
-        and requests > 0
+        and 0 < requests <= 65536
         and requests % REQUESTS_PER_BATCH == 0
         and table_capacity >= PUT_BATCH_SIZE
         and table_capacity % PUT_BATCH_SIZE == 0
@@ -209,20 +209,14 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
     ).to(torch.uint8).contiguous()
     kv_data = entry_pattern.reshape(1, block_bytes).repeat(PUT_BATCH_SIZE, 1)
     output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
-    execution = BenchmarkExecution(kvaf, execution_mode, transport=transport,
-                                   put_capacity=PUT_BATCH_SIZE, get_capacity=max(requests, PUT_BATCH_SIZE))
+    execution = BenchmarkExecution(kvaf, transport=transport,
+                                   put_capacity=PUT_BATCH_SIZE, get_capacity=max(requests, PUT_BATCH_SIZE),
+                                   cores=npu_core_count, jettys=jettys_per_core,
+                                   get_kernel=str(kernel), put_kernel=str(batch_put_kernel),
+                                   max_inflight_total=max_inflight_total)
     runtime = kvaf.NpuRuntime(
-        str(kernel),
-        transport=transport,
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=npu_core_count,
-        batch_put_kernel_object_path=str(batch_put_kernel),
-        jettys_per_core=jettys_per_core,
-        batch_get_max_inflight_total=max_inflight_total,
-        npu_eids=npu_eids,
-        **execution.runtime_kwargs,
+        batch_get_token_bytes=token_bytes, batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id, npu_eids=npu_eids, **execution.runtime_kwargs,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -248,7 +242,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
             f"npu_eids={','.join(npu_eids) or 'auto'} "
             f"warmup={warmup} iterations={iterations} "
             f"batch_put_backend={'ubmem' if transport == 'ubmem' else 'aiv_direct_hccp'} "
-            "timing=call_to_stream_completion"
+            "get_timing=async_submit_to_drain put_timing=synchronous_batch_put"
         )
 
         print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
@@ -285,13 +279,12 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
             preflight_output,
             **execution.get_kwargs,
         )
-        torch.npu.synchronize()
+        execution.drain_get(runtime)
         if not torch.equal(
             preflight_output,
             entry_pattern[0].expand(PUT_BATCH_SIZE, -1),
         ):
             raise AssertionError("Runtime performance preflight BatchPut/BatchGet validation failed")
-        execution.drain_get(runtime)
         runtime.release_access_table(preflight_table)
         preflight_table = None
         runtime.batch_free(preflight_keys)
@@ -309,7 +302,6 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
         for key_batch in key_batches[warmup : warmup + iterations]:
             begin = time.perf_counter()
             runtime.batch_put(key_batch, kv_data, put_offsets, lengths, **execution.put_kwargs)
-            torch.npu.synchronize()
             batch_put_samples.append((time.perf_counter() - begin) * 1000.0)
         print_samples(
             "batch_put", batch_put_samples, warmup,
@@ -405,9 +397,8 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
                 device_table, indices, offsets, miss_count, output_indices, output,
                 **execution.get_kwargs,
             )
-        torch.npu.synchronize()
-        warmup_inputs.clear()
         execution.drain_get(runtime)
+        warmup_inputs.clear()
 
         batch_get_samples: list[float] = []
         submit_samples: list[float] = []
@@ -428,7 +419,6 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
                 **execution.get_kwargs,
             )
             submitted = time.perf_counter()
-            torch.npu.synchronize()
             execution.drain_get(runtime)
             completed = time.perf_counter()
             submit_samples.append((submitted - begin) * 1000.0)
@@ -506,6 +496,6 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "legacy
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
-    add_execution_mode(parser)
+    add_execution_metadata(parser)
     args = parser.parse_args()
     raise SystemExit(main(transport=args.transport, execution_mode=args.execution_mode))

@@ -40,7 +40,7 @@ class AccessOperator {
   virtual Status Shutdown() = 0;
 
   // Hardware providers transfer ownership once to ResourceManager and retain
-  // only their concrete borrowed view. Legacy/mock providers may return null.
+  // only their concrete borrowed view. Synchronous mock providers may return null.
   virtual std::unique_ptr<ExecutionResourceOwner> TakeResources() { return {}; }
   // Pure request description: no registration, allocation or device work. The
   // registry fixes the provider/ABI/profile; the invocation supplies capacity.
@@ -63,7 +63,7 @@ class AccessOperator {
   virtual Status ValidateRequestCapacity(std::uint32_t) const { return Status::OK(); }
   virtual std::unique_ptr<ExecutionState> CreateExecutionState() { return {}; }
   // A failed bind must leave the previously bound state intact. Passing null
-  // restores the legacy state before the invocation's state object is destroyed.
+  // restores the default state before the invocation's state object is destroyed.
   virtual Status BindExecutionState(ExecutionState* state) {
     return state ? Status::InvalidArgument("provider does not accept execution state") : Status::OK();
   }
@@ -80,7 +80,7 @@ class AccessOperator {
     return Status::NotImplemented("resource recovery requires execution dispatcher");
   }
 
-  // Legacy synchronous implementations require no completion action.
+  // Synchronous implementations require no completion preparation.
   virtual Status PreparePut(const BatchPutExecutionOptions&) { return Status::OK(); }
   virtual Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions& options) {
     return PreparePut(options);
@@ -175,7 +175,6 @@ struct AccessOperatorConfig {
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
   bool enable_get{true};
-  bool managed_completion{false};
 };
 
 struct BatchGetKernelProfile {

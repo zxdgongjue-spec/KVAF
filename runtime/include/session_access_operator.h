@@ -4,7 +4,7 @@
 
 namespace kvaf {
 
-// Compatibility dispatch adapter. PeerExecutionResources owns all control-plane
+// Session dispatch adapter. PeerExecutionResources owns all control-plane
 // lifecycle; concrete providers receive their own typed views for execution.
 class SessionAccessOperator final : public AccessOperator {
  public:

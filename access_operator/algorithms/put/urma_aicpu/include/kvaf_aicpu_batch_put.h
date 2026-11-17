@@ -31,8 +31,8 @@ class BatchPutTransport {
   std::vector<UmdkTransfer> host_transfers_;
   using Preparation = PutPreparation;
   ExecutionViewState views_;
-  Preparation legacy_preparation_{this};
-  Preparation* preparation_{&legacy_preparation_};
+  Preparation default_preparation_{this};
+  Preparation* preparation_{&default_preparation_};
 };
 int32_t LaunchBatchPut(const BatchPutKernelArgs*, aclrtStream);
 }  // namespace kvaf::aicpu_urma

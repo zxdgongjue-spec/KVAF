@@ -10,7 +10,7 @@ std::unique_ptr<ExecutionState> BatchPutTransport::CreateExecutionState() {
   return std::make_unique<Preparation>(this);
 }
 Status BatchPutTransport::BindExecutionState(ExecutionState* state) {
-  auto* typed = state ? dynamic_cast<Preparation*>(state) : &legacy_preparation_;
+  auto* typed = state ? dynamic_cast<Preparation*>(state) : &default_preparation_;
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("Put preparation belongs to another resource");
   preparation_ = typed;
