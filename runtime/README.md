@@ -85,6 +85,62 @@ CPU 宿主机可用 `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages` �
 `--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
 
+### 按 NUMA 预留 30 GiB 的 1 GiB HugeTLB 页
+
+以下命令在 **CPU 服务所在的 Linux 宿主机**执行。先确认本次测试使用的 CPU 侧
+UB device，可从已有测试（例如默认 THP 测试）的 `REGION_ALLOCATED` 日志读取 `ub_device=`。用
+`numactl --hardware` 查看节点，再查该设备的 NUMA 归属。将下面的设备名替换为本机值。
+
+```bash
+ub_device=udmac0d1e2
+numactl --hardware
+for ub_class in ubcore uburma; do
+  numa_file="/sys/class/$ub_class/$ub_device/device/numa_node"
+  if [ -r "$numa_file" ]; then
+    cat "$numa_file"
+    break
+  fi
+done
+```
+
+如果文件缺失或返回 `-1`，用宿主机的设备拓扑确认节点。已知设备的 PCI BDF 时，
+也可以查看 `/sys/bus/pci/devices/<BDF>/numa_node`。下面以设备位于 **NUMA 0**
+为例。30 GiB 需要 **30 个 1 GiB 页**，对应 `hugepages-1048576kB` 页池。
+
+```bash
+node=0
+pool="/sys/devices/system/node/node${node}/hugepages/hugepages-1048576kB"
+
+# 查看本节点现有页池。
+cat "$pool/nr_hugepages" "$pool/free_hugepages"
+
+# 将该节点的持久页池目标总数设为 30。
+printf '%s\n' 30 | sudo tee "$pool/nr_hugepages" >/dev/null
+
+# 回读实际总页数和空闲页数。
+printf 'total: '; cat "$pool/nr_hugepages"
+printf 'free:  '; cat "$pool/free_hugepages"
+```
+
+`nr_hugepages` 写入的是目标总页数。如果该节点仍有其他任务占用大页，
+按已有用量和本次所需的 30 个空闲页确定目标总数。目标小于现有总数时会缩减页池。
+运行时预留 1 GiB 页需要足够的
+连续物理内存，写入后应以回读值为准。若页池路径缺失，先确认内核和平台是否支持
+1 GiB HugeTLB。若运行时预留不足，可以在系统启动时配置大页，再核对各节点的分布。
+[Linux HugeTLB 页池说明](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html#per-node-hugepages-attributes)
+
+页池预留完成后，启动 CPU 服务并绑定到同一 NUMA 节点。NPU 创建会话、申请 DDR
+时，KVAF 才会从页池取页。按 1 GiB 向上取整后的大小可从日志的 `backing_bytes` 核对。
+
+```bash
+sudo numactl --cpunodebind="$node" --membind="$node" \
+  ./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 \
+  --ub-device "$ub_device" --memory-mode hugetlb-1g
+```
+
+### NPU 连接方式
+
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
 
 ```python

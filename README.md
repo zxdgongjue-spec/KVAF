@@ -99,6 +99,9 @@ TCP 用于交换控制信息，初始化UB建链；KV 数据 通过 NPU AIV kern
 - 支持多个独立 session；NPU 正常 shutdown 后回收其 DDR、segment、token 和 Jetty；
 - `RuntimeService` 只负责 TCP 监听和连接分发，资源生命周期由 `CpuRuntime` 管理。
 
+CPU 服务默认使用 THP。测试显式大页时，可用 `--memory-mode` 选择页大小。
+在 CPU 服务机上按节点预留页池的步骤见 [按 NUMA 预留 30 GiB 的 1 GiB HugeTLB 页](runtime/README.md#按-numa-预留-30-gib-的-1-gib-hugetlb-页)。
+
 ### NPU Runtime
 
 `NpuRuntime` 在连接 CPU 服务后初始化远端 DDR。
