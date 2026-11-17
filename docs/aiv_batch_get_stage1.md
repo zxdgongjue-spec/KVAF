@@ -150,6 +150,11 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 Tensor 和 stream，运行时会检查完成状态。用 `synchronize=True` 可在每次调用内验证结果，
 异步调用可以同 stream 连续入队，在 `scatter_profile()` 或图销毁时检查状态。
 
+prepared callable 通过专用入口提交已捕获的图，每次回放会读取一次 `npu_stream`，确保调用前
+已交给 Torch 的同 stream 任务先入队。启用 Host profiling 后，`host_native_us` 记录原生提交，
+包含 `host_operator_us` 和 `host_launch_us`。`host_runtime_validation_us` 记录通用 BatchGet
+入口的校验，专用回放入口跳过该入口并检查图所属 Runtime 的状态。
+
 使用 `reset_scatter_batch_get_graph()` 等待并销毁图后，可以释放 AccessTable、改变 profiling
 选项或重新准备图。比较性能时，N 端性能脚本两组都用 `--completion-scope stream`，其中一组
 额外加 `--acl-graph`。捕获与结果验证在样本计时窗口外。

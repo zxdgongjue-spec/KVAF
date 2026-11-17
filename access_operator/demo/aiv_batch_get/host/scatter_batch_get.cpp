@@ -47,6 +47,7 @@ class ScatterBatchGet final : public SequentialBatchGet {
   ~ScatterBatchGet() override;
   Status Initialize(const RemoteRegionDesc& region) override;
   Status Execute(const BatchGetExecRequest& exec) override;
+  Status ReplayScatterGraph(void* stream, bool synchronize) override;
   Status Drain() override;
   Status Shutdown() override;
   Status SetScatterProfiling(bool enabled) override;
@@ -81,6 +82,12 @@ struct ScatterBatchGet::Impl {
   bool push_open{}, initialized{}, failed{}, profile_ready{}, graph_mailbox{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
   uint64_t ProfileBytes() const { return config.npu_core_count * sizeof(ScatterBatchGetCoreProfile); }
+
+  Status CheckExecutionState() const {
+    if (!initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
+    if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
+    return Status::OK();
+  }
 
   Status AclFailure(const char* phase, aclError code) const {
     return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
@@ -443,22 +450,35 @@ Status ScatterBatchGet::Drain() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->Drain();
 }
-Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
+Status ScatterBatchGet::ReplayScatterGraph(void* stream, bool synchronize) {
   scatter_host::Timer operator_timer(scatter_host::kOperator);
   auto& s = *impl_;
   scatter_host::Timer mutex_timer(scatter_host::kMutexWait);
   std::lock_guard<std::mutex> lock(s.mutex);
   mutex_timer.Stop();
-  if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
-  if (s.failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
+  auto state = s.CheckExecutionState();
+  if (!state.ok()) return state;
+  if (!stream) return Status::InvalidArgument("BatchGet needs a stream");
+  return s.ReplayGraph(static_cast<aclrtStream>(stream), synchronize);
+}
+
+Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   const auto graph_action = exec.execution.scatter_graph;
+  if (graph_action == ScatterGraphAction::kReplay)
+    return ReplayScatterGraph(exec.execution.stream, exec.execution.synchronize);
+  scatter_host::Timer operator_timer(scatter_host::kOperator);
+  auto& s = *impl_;
+  scatter_host::Timer mutex_timer(scatter_host::kMutexWait);
+  std::lock_guard<std::mutex> lock(s.mutex);
+  mutex_timer.Stop();
+  auto state = s.CheckExecutionState();
+  if (!state.ok()) return state;
   if (graph_action == ScatterGraphAction::kReset) {
     auto status = s.Drain();
     return status.ok() ? s.DestroyGraph() : status;
   }
   if (!exec.execution.stream) return Status::InvalidArgument("BatchGet needs a stream");
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
-  if (graph_action == ScatterGraphAction::kReplay) return s.ReplayGraph(stream, exec.execution.synchronize);
   if (s.graph) return Status::InvalidState("reset the prepared Scatter graph before another BatchGet");
   const bool capture_graph = graph_action == ScatterGraphAction::kCapture;
   if (capture_graph || !exec.execution.trusted_npu_request) {

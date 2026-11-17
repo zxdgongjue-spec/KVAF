@@ -700,8 +700,15 @@ class NpuPythonRuntime final {
           scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
           const auto acl_stream = tensor_methods_->Stream(selected);
           stream_timer.Stop();
-          SubmitScatterBatchGet(request, acl_stream, synchronize,
-              acl_graph ? ScatterGraphAction::kReplay : ScatterGraphAction::kNone);
+          if (acl_graph) {
+            scatter_host::Timer native_timer(scatter_host::kNative);
+            const auto status = native_->ReplayScatterGraph(acl_stream, synchronize);
+            native_timer.Stop();
+            ThrowIfError(status);
+            host_profile_ready_ = host_profile_enabled_;
+          } else {
+            SubmitScatterBatchGet(request, acl_stream, synchronize);
+          }
           if (wait_stream) {
             // Complete this request's stream in the same native invocation.
             // Keep status drain/validation in scatter_profile()/the next call,

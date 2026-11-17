@@ -39,6 +39,7 @@ CSV_COLUMNS = (
     "aiv_suffix_cq_blocked_us",
     "host_submit", "completion_scope", "graph_mailbox",
     "host_call_us", "host_stream_resolve_us", "stream_sync_us", "device_sync_us",
+    "host_native_us", "host_runtime_validation_us", "host_operator_us",
 )
 
 

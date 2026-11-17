@@ -955,6 +955,18 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
+Status NpuRuntime::ReplayScatterGraph(void* stream, bool synchronize) {
+  if (!impl_->runtime_core || !impl_->runtime_core->initialized())
+    return Status::NotInitialized("Runtime has not been initialized");
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->urma_operator) return impl_->urma_operator->ReplayScatterGraph(stream, synchronize);
+#else
+  (void)stream;
+  (void)synchronize;
+#endif
+  return Status::NotImplemented("scatter graph replay requires linked AIV cpu_push_scatter");
+}
+
 Status NpuRuntime::SetScatterProfiling(bool enabled) {
   if (!impl_->access_operator)
     return Status::NotInitialized("NpuRuntime requires LinkTo before configuring Scatter profiling");
