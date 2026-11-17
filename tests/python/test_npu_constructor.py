@@ -5,6 +5,10 @@ from _kvaf_constructor_test import NpuRuntime
 
 
 class ConstructorTests(unittest.TestCase):
+    def test_reuse_device_ra_keyword(self):
+        self.assertFalse(NpuRuntime("", 656, 128).reuse_device_ra)
+        self.assertTrue(NpuRuntime("", 656, 128, reuse_device_ra=True).reuse_device_ra)
+
     def test_original_defaults(self):
         self.assertEqual(NpuRuntime("get.o", 656, 128).values,
                          ("get.o", 656, 128, 0, 2, "", 2, [], False, 2048, "", [], 2048, "urma", ""))

@@ -146,7 +146,7 @@ bool LoadDirectHccp(DirectHccpApi* api) {
 }
 void CloseDirectHccp(DirectHccpApi*) {}
 bool GetCurrentNpuPhysicalDeviceId(std::uint32_t* device) { *device = 0; return true; }
-bool AcquireDirectHccpSession(std::uint32_t, std::uint32_t, DirectHccpSession** out) {
+bool AcquireDirectHccpSession(std::uint32_t, std::uint32_t, DirectHccpSession** out, bool) {
   *out = reinterpret_cast<DirectHccpSession*>(&handle); return true;
 }
 void ReleaseDirectHccpSession(DirectHccpSession*) {}

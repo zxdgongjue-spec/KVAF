@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,6 +43,25 @@ struct BatchGetExecutionState {
   void* queue_state{nullptr};
   std::size_t queue_state_bytes{0};
 };
+
+Status CheckBatchGetQueueHealth(const BatchGetExecutionState& execution,
+                               std::uint32_t workers,
+                               std::uint32_t jettys_per_core) {
+  std::vector<KvafBatchGetQueueState> queues(
+      static_cast<std::size_t>(workers) * jettys_per_core);
+  if (aclrtMemcpy(queues.data(), queues.size() * sizeof(queues.front()),
+                  execution.queue_state, execution.queue_state_bytes,
+                  ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+    return Internal("failed to inspect BatchGet queue completion state");
+  }
+  for (const auto& queue : queues) {
+    if (queue.last_error != 0U || queue.poisoned != 0U) {
+      return Internal("BatchGet queue has a transport error; keep its output "
+                      "and registrations alive until device/process teardown");
+    }
+  }
+  return Status::OK();
+}
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 // BatchPut request metadata is transient from the caller's perspective, but
@@ -290,6 +310,12 @@ struct DefaultAccessOperator::Impl {
   RemoteRegionDesc remote_region;
   KvafBatchGetTransport* transport{nullptr};
   BatchGetExecutionState execution;
+  std::mutex batch_get_mutex;
+  FusedBatchGetContext fused_context;
+  KvafBatchGetLocalBuffer* fused_local_buffer{nullptr};
+  std::vector<KvafBatchGetLocalBuffer*> fused_output_buffers;
+  bool fused_completion_uncertain{false};
+  std::uint64_t next_fused_lease_id{1};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   KvafBatchPutTransport* batch_put_transport{nullptr};
   BatchPutExecutionState batch_put_execution;
@@ -300,9 +326,18 @@ struct DefaultAccessOperator::Impl {
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {}
 
-DefaultAccessOperator::~DefaultAccessOperator() { (void)Shutdown(); }
+DefaultAccessOperator::~DefaultAccessOperator() {
+  if (!Shutdown().ok()) {
+    // A borrowed device context may still be referenced by a running kernel
+    // or late DMA. Leak the owning state rather than deregister live memory.
+    std::fprintf(stderr, "[KVAF_AIV] FUSED_CONTEXT_RETAINED_ON_DESTRUCTION "
+                         "reason=active_or_failed_lease\n");
+    (void)impl_.release();
+  }
+}
 
 Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
   if (impl_->initialized) {
     return InvalidState("AccessOperator has already been initialized");
   }
@@ -454,8 +489,13 @@ Status DefaultAccessOperator::Initialize(const RemoteRegionDesc& remote_region) 
 }
 
 Status DefaultAccessOperator::Shutdown() {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
   if (!impl_->initialized) {
     return Status::OK();
+  }
+  if (impl_->fused_context.lease_id != 0U) {
+    return Status::Busy("release the fused BatchGet context before shutdown; "
+                        "a failed release requires device/process teardown");
   }
 
   // Callers must complete all submitted streams before Runtime::Shutdown,
@@ -484,9 +524,13 @@ Status DefaultAccessOperator::Shutdown() {
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
+  }
+  if (impl_->fused_context.lease_id != 0U) {
+    return Status::Busy("BatchGet queues are leased to a fused kernel");
   }
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
@@ -532,10 +576,135 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::AcquireFusedBatchGetContext(
+    void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
+    std::uint32_t tokens_per_block, FusedBatchGetContext* context) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+  if (!impl_->initialized || impl_->transport == nullptr) {
+    return Status::NotInitialized("AccessOperator has not been initialized");
+  }
+  if (impl_->fused_context.lease_id != 0U) {
+    return Status::Busy("BatchGet queues already have a fused lease");
+  }
+  if (context == nullptr || output == nullptr || output_bytes == 0U ||
+      token_bytes == 0U || tokens_per_block == 0U ||
+      output_bytes % token_bytes != 0U ||
+      output_bytes > std::numeric_limits<std::uint64_t>::max() - PointerValue(output) ||
+      impl_->next_fused_lease_id == 0U) {
+    return InvalidArgument("invalid fused BatchGet output or context");
+  }
+  // Setup-only boundary: any previous enqueue-only ordinary BatchGet must
+  // finish before its persistent queues are handed to the external kernel.
+  if (aclrtSynchronizeDevice() != ACL_SUCCESS) {
+    return Internal("failed to drain device before acquiring fused BatchGet queues");
+  }
+  Status status = CheckBatchGetQueueHealth(
+      impl_->execution, impl_->config.npu_core_count,
+      impl_->config.jettys_per_core);
+  if (!status.ok()) return status;
+
+  KvafBatchGetLocalBuffer* local_buffer = nullptr;
+  std::uint64_t entity = 0U;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, output, output_bytes,
+                                     &local_buffer, &entity) !=
+          KVAF_BATCH_GET_SUCCESS || local_buffer == nullptr || entity == 0U) {
+    if (local_buffer != nullptr) KvafBatchGetLocalBufferRelease(local_buffer);
+    return Internal("failed to register fused BatchGet output");
+  }
+  impl_->fused_context = FusedBatchGetContext{
+      impl_->next_fused_lease_id++, entity,
+      PointerValue(impl_->execution.queue_state),
+      PointerValue(impl_->execution.status), PointerValue(output), output_bytes,
+      impl_->config.npu_core_count, impl_->config.jettys_per_core,
+      token_bytes, tokens_per_block};
+  impl_->fused_local_buffer = local_buffer;
+  *context = impl_->fused_context;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::RegisterFusedBatchGetOutput(
+    const FusedBatchGetContext& owner, void* output,
+    std::uint64_t output_bytes, FusedBatchGetContext* view) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+  const auto& active = impl_->fused_context;
+  if (active.lease_id == 0U || owner.lease_id != active.lease_id ||
+      owner.device_channel_entity != active.device_channel_entity ||
+      owner.device_queue_state != active.device_queue_state ||
+      owner.output_address != active.output_address ||
+      owner.output_bytes != active.output_bytes) {
+    return InvalidArgument("output registration requires the original live fused lease");
+  }
+  if (impl_->fused_completion_uncertain) {
+    return Internal("fused BatchGet context is quarantined");
+  }
+  if (view == nullptr || output == nullptr || output_bytes == 0U ||
+      output_bytes % active.token_bytes != 0U ||
+      output_bytes > std::numeric_limits<std::uint64_t>::max() - PointerValue(output)) {
+    return InvalidArgument("invalid fused output view");
+  }
+  // Reserve before registration so allocation failure cannot orphan a native
+  // reference. Registering HBM does not reset or synchronize leased queues.
+  impl_->fused_output_buffers.reserve(impl_->fused_output_buffers.size() + 1U);
+  KvafBatchGetLocalBuffer* buffer = nullptr;
+  std::uint64_t entity = 0U;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, output, output_bytes,
+                                    &buffer, &entity) != KVAF_BATCH_GET_SUCCESS ||
+      buffer == nullptr || entity == 0U) {
+    if (buffer != nullptr) KvafBatchGetLocalBufferRelease(buffer);
+    return Internal("failed to register fused output view");
+  }
+  impl_->fused_output_buffers.push_back(buffer);
+  *view = active;
+  view->device_channel_entity = entity;
+  view->output_address = PointerValue(output);
+  view->output_bytes = output_bytes;
+  return Status::OK();
+}
+
+Status DefaultAccessOperator::ReleaseFusedBatchGetContext(
+    const FusedBatchGetContext& context, void* stream) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+  if (impl_->fused_context.lease_id == 0U ||
+      context.lease_id != impl_->fused_context.lease_id ||
+      context.device_channel_entity != impl_->fused_context.device_channel_entity ||
+      context.device_queue_state != impl_->fused_context.device_queue_state ||
+      context.output_address != impl_->fused_context.output_address ||
+      context.output_bytes != impl_->fused_context.output_bytes) {
+    return InvalidArgument("fused BatchGet context does not own the current lease");
+  }
+  if (stream == nullptr) return InvalidArgument("fused release requires its launch stream");
+  if (impl_->fused_completion_uncertain) {
+    return Internal("fused BatchGet context is quarantined after a failed completion check");
+  }
+  if (aclrtSynchronizeStream(static_cast<aclrtStream>(stream)) != ACL_SUCCESS) {
+    impl_->fused_completion_uncertain = true;
+    return Internal("fused BatchGet stream did not complete; retain output and context");
+  }
+  Status status = CheckBatchGetQueueHealth(
+      impl_->execution, impl_->config.npu_core_count,
+      impl_->config.jettys_per_core);
+  if (!status.ok()) {
+    impl_->fused_completion_uncertain = true;
+    return status;
+  }
+  KvafBatchGetLocalBufferRelease(impl_->fused_local_buffer);
+  for (auto* buffer : impl_->fused_output_buffers) {
+    KvafBatchGetLocalBufferRelease(buffer);
+  }
+  impl_->fused_output_buffers.clear();
+  impl_->fused_local_buffer = nullptr;
+  impl_->fused_context = FusedBatchGetContext{};
+  return Status::OK();
+}
+
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
   if (!impl_->initialized || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
+  }
+  if (impl_->fused_context.lease_id != 0U) {
+    return Status::Busy("cannot reset BatchGet status while a fused lease is active");
   }
   std::vector<KvafBatchGetCoreStatus> statuses(
       impl_->config.npu_core_count);

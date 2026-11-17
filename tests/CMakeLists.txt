@@ -112,3 +112,13 @@ else()
   message(STATUS
     "Skipping direct Runtime Python tests; configure with -DKVAF_BUILD_PYTHON=ON")
 endif()
+
+# CPU-only lease ownership test; no NPU/transport correctness claim.
+add_executable(kvaf_fused_batch_get_context_test
+  fused_batch_get_context_test.cc ../access_operator/src/access_operator.cc)
+target_include_directories(kvaf_fused_batch_get_context_test PRIVATE
+  fused_context_stubs ../access_operator/demo/aiv_batch_get/include)
+target_link_libraries(kvaf_fused_batch_get_context_test PRIVATE
+  kvaf_runtime kvaf_meta_manager kvaf_peer_link)
+add_test(NAME kvaf_fused_batch_get_context_host
+  COMMAND kvaf_fused_batch_get_context_test)
