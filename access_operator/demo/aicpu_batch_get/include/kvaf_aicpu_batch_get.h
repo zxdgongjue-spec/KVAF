@@ -10,7 +10,8 @@ class UmdkSession;
 // Owns gather_read workspace and execution; borrows the Get/Put session.
 class BatchGetTransport {
  public:
-  BatchGetTransport(UmdkSession&, std::uint32_t token_bytes, bool direct_addresses = false);
+  BatchGetTransport(UmdkSession&, std::uint32_t token_bytes, bool direct_addresses = false,
+                    std::uint64_t staging_offset = 0U);
   ~BatchGetTransport();
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);

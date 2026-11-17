@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <utility>
 
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
@@ -17,11 +18,13 @@ using kvaf::detail::PointerValue;
 
 }  // namespace
 struct BatchGetTransport::Impl {
-  Impl(UmdkSession& shared, std::uint32_t token, bool direct)
-      : session(shared), token_bytes(token), direct_addresses(direct) {}
+  Impl(UmdkSession& shared, std::uint32_t token, bool direct, std::uint64_t offset)
+      : session(shared), token_bytes(token), direct_addresses(direct), staging_offset(offset) {}
   UmdkSession& session;
   std::uint32_t token_bytes;
   bool direct_addresses;
+  // Bytes into the reserved remote workspace where this width's staging starts.
+  std::uint64_t staging_offset;
   RemoteRegionDesc region;
   BatchGetExecutionState execution;
   void* workspace{nullptr};
@@ -29,23 +32,58 @@ struct BatchGetTransport::Impl {
   void* status_host{nullptr};
   void* profile_device{nullptr};
   void* profile_host{nullptr};
-  aclrtStream pending{nullptr};
-  aclrtStream captured_stream{nullptr};
-  aclrtStream last_stream{nullptr};
-  bool submitted{false};
+  // One AICPU session serves both the main and the prefetch stream, so every
+  // stream that runs BatchGet owns a slot and a private status window.
+  static constexpr std::size_t kMaxStreams = 4;
+  struct StreamSlot {
+    aclrtStream stream{nullptr};
+    bool submitted{false};
+  };
+  std::array<StreamSlot, kMaxStreams> slots{};
   bool profiling{false}, profile_submitted{false};
   Status failure;
   bool initialized{false}, cpu_enabled{false};
-  Status Drain(const char* stage = "drain", bool check_status = true) {
-    const auto stream = pending ? pending : captured_stream;
-    if (!stream) return check_status ? failure : Status::OK();
+
+  StreamSlot* FindSlot(aclrtStream stream) {
+    for (auto& slot : slots)
+      if (slot.stream == stream) return &slot;
+    return nullptr;
+  }
+  StreamSlot* ClaimSlot(aclrtStream stream) {
+    if (auto* existing = FindSlot(stream)) return existing;
+    for (auto& slot : slots)
+      if (slot.stream == nullptr) {
+        slot.stream = stream;
+        slot.submitted = false;
+        return &slot;
+      }
+    return nullptr;
+  }
+  std::size_t SlotIndex(const StreamSlot& slot) const {
+    return static_cast<std::size_t>(&slot - slots.data());
+  }
+  void* StatusWindow(std::size_t index) const {
+    return static_cast<std::uint8_t*>(execution.status) + index * execution.status_bytes;
+  }
+  void* StatusHostWindow(std::size_t index) const {
+    return static_cast<std::uint8_t*>(status_host) + index * execution.status_bytes;
+  }
+  aclrtStream ActiveStream() const {
+    for (const auto& slot : slots)
+      if (slot.stream != nullptr) return slot.stream;
+    return nullptr;
+  }
+  Status DrainSlot(StreamSlot& slot, const char* stage, bool check_status) {
+    if (!slot.stream) return check_status ? failure : Status::OK();
     bool capturing = false;
-    auto allowed = kvaf::detail::BatchGetCapture(stream, true, false, &capturing);
+    auto allowed = kvaf::detail::BatchGetCapture(slot.stream, true, false, &capturing);
     if (!allowed.ok()) return allowed;
-    if (check_status && failure.ok() && submitted && aclrtMemcpyAsync(status_host, execution.status_bytes, execution.status,
-          execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS)
+    const std::size_t index = SlotIndex(slot);
+    if (check_status && failure.ok() && slot.submitted &&
+        aclrtMemcpyAsync(StatusHostWindow(index), execution.status_bytes, StatusWindow(index),
+                         execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, slot.stream) != ACL_SUCCESS)
       return Internal("GatherRead status enqueue failed; resources retained");
-    const auto result = aclrtSynchronizeStream(stream);
+    const auto result = aclrtSynchronizeStream(slot.stream);
     if (result != ACL_SUCCESS) {
       const char* detail = aclGetRecentErrMsg();
       return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
@@ -54,12 +92,19 @@ struct BatchGetTransport::Impl {
                       " source_mode=" + (direct_addresses ? "direct" : "table") +
                       "; buffers retained; detail=" + (detail ? detail : "unavailable"));
     }
-    pending = nullptr;
     if (check_status && !failure.ok()) return failure;
-    return check_status && submitted ? ValidateStatus() : Status::OK();
+    if (check_status && slot.submitted) return ValidateStatus(index);
+    return Status::OK();
   }
-  Status ValidateStatus() {
-    const auto* statuses = static_cast<const GatherReadStatus*>(status_host);
+  Status Drain(const char* stage = "drain", bool check_status = true) {
+    for (auto& slot : slots) {
+      const Status status = DrainSlot(slot, stage, check_status);
+      if (!status.ok()) return status;
+    }
+    return Status::OK();
+  }
+  Status ValidateStatus(std::size_t index) {
+    const auto* statuses = static_cast<const GatherReadStatus*>(StatusHostWindow(index));
     const auto sequence = statuses[0].sequence;
     // Report an actual worker failure before a partial launch's stale slots.
     for (unsigned worker = 0; worker < session.config().workers; ++worker)
@@ -81,17 +126,16 @@ struct BatchGetTransport::Impl {
   }
 };
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
-                                     bool direct_addresses)
-    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses)) {}
+                                     bool direct_addresses, std::uint64_t staging_offset)
+    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses, staging_offset)) {}
 BatchGetTransport::~BatchGetTransport() = default;
 Status BatchGetTransport::Drain(bool check_status) { return impl_->Drain("drain", check_status); }
 Status BatchGetTransport::Check(aclrtStream stream) {
-  if (!impl_->initialized || !impl_->submitted)
-    return Status::InvalidState("no AICPU BatchGet has been submitted");
-  if (stream != impl_->last_stream)
-    return InvalidArgument("check_batch_get_status requires the BatchGet execution stream");
-  impl_->pending = stream;
-  return impl_->Drain("check");
+  if (!impl_->initialized) return Status::NotInitialized("GatherRead is not initialized");
+  auto* slot = impl_->FindSlot(stream);
+  if (slot == nullptr || !slot->submitted)
+    return Status::InvalidState("no AICPU BatchGet has been submitted on this stream");
+  return impl_->DrainSlot(*slot, "check", true);
 }
 Status BatchGetTransport::SetKernelProfiling(bool enabled) {
   if (!impl_->initialized) return Status::NotInitialized("GatherRead is not initialized");
@@ -110,7 +154,7 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
   if (!impl_->profiling || !impl_->profile_submitted)
     return Status::InvalidState("no profiled GatherRead launch");
   bool capturing = false;
-  auto ready = kvaf::detail::BatchGetCapture(impl_->last_stream, true, false, &capturing);
+  auto ready = kvaf::detail::BatchGetCapture(impl_->ActiveStream(), true, false, &capturing);
   if (!ready.ok()) return ready;
   return kvaf::detail::CopyAicpuProfiles(impl_->profile_device, impl_->profile_host,
       impl_->session.config().workers, profiles);
@@ -119,14 +163,16 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
   auto& state = impl_->execution;
   state.status_bytes = impl_->session.config().workers * sizeof(GatherReadStatus);
-  if (aclrtMalloc(&state.status, state.status_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
+  // One status window per concurrent stream; kernels write their worker state there.
+  const auto status_total = Impl::kMaxStreams * state.status_bytes;
+  if (aclrtMalloc(&state.status, status_total, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMalloc(&impl_->workspace, GatherWorkspaceBytes(impl_->session.config().workers),
                   ACL_MEM_MALLOC_HUGE_FIRST) !=
           ACL_SUCCESS ||
-      aclrtMallocHost(&impl_->status_host, state.status_bytes) != ACL_SUCCESS ||
+      aclrtMallocHost(&impl_->status_host, status_total) != ACL_SUCCESS ||
       aclrtMalloc(&impl_->control, sizeof(GatherExecutionControl), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMemset(impl_->control, sizeof(GatherExecutionControl), 0, sizeof(GatherExecutionControl)) != ACL_SUCCESS ||
-      aclrtMemset(state.status, state.status_bytes, 0, state.status_bytes) != ACL_SUCCESS) {
+      aclrtMemset(state.status, status_total, 0, status_total) != ACL_SUCCESS) {
     (void)Shutdown();
     return Internal("failed to allocate UMDK execution buffers");
   }
@@ -137,7 +183,7 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
     return found;
   }
   if (!impl_->token_bytes ||
-      registered.length < region.length +
+      registered.length < region.length + impl_->staging_offset +
           GatherRemoteWorkspaceBytes(impl_->token_bytes, impl_->session.config().workers)) {
     (void)Shutdown();
     return InvalidArgument("UMDK BatchGet requires reserved remote gather workspace");
@@ -159,8 +205,7 @@ Status BatchGetTransport::Shutdown() {
   impl_->profile_device = impl_->profile_host = nullptr;
   impl_->execution = {};
   impl_->control = nullptr;
-  impl_->pending = impl_->captured_stream = impl_->last_stream = nullptr;
-  impl_->submitted = false;
+  for (auto& slot : impl_->slots) slot = Impl::StreamSlot{};
   impl_->profiling = impl_->profile_submitted = false;
   impl_->failure = Status::OK();
   impl_->initialized = impl_->cpu_enabled = false;
@@ -179,15 +224,15 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   bool capturing = false;
   auto capture = kvaf::detail::BatchGetCapture(stream, exec.execution.synchronize, profile != nullptr, &capturing);
   if (!capture.ok()) return capture;
-  if (impl_->captured_stream && impl_->captured_stream != stream)
-    return InvalidArgument("captured AICPU transport must use its capture stream");
-  if (capturing) {
-    if (impl_->pending && impl_->pending != stream)
-      return Status::InvalidState("drain previous AICPU work outside capture on its stream");
-  } else {
-    auto drained = impl_->Drain("previous_request");
+  auto* slot = impl_->ClaimSlot(stream);
+  if (slot == nullptr)
+    return InvalidArgument("AICPU BatchGet exceeds the concurrent stream limit");
+  if (!capturing) {
+    // Eager launches on the same stream must not overlap.
+    auto drained = impl_->DrainSlot(*slot, "previous_request", false);
     if (!drained.ok()) return drained;
   }
+  const std::size_t slot_index = impl_->SlotIndex(*slot);
   UmdkBatchGetArgs launch{};
   auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
   if (!valid.ok()) return valid;
@@ -214,7 +259,8 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   if (!ready.ok()) return ready;
   ready = ensure(exec.request->output.data, exec.request->output.bytes);
   if (!ready.ok()) return ready;
-  const auto staging = (impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U};
+  const auto staging = ((impl_->region.base + impl_->region.length + 63U) & ~std::uint64_t{63U}) +
+                       impl_->staging_offset;
   const auto descriptors = staging + GatherStagingBytes(impl_->token_bytes, workers);
   const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers);
   if (!impl_->cpu_enabled) {
@@ -227,7 +273,7 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   auto& args = launch.gather;
   args.execution_control = PointerValue(impl_->control);
   args.context = {impl_->session.session(), impl_->session.owner_pid()};
-  args.core_status = PointerValue(impl_->execution.status);
+  args.core_status = PointerValue(impl_->StatusWindow(slot_index));
   args.scratch = PointerValue(impl_->workspace);
   args.source_descriptor = args.scratch + kGatherDescriptorOffset;
   args.output = PointerValue(exec.request->output.data);
@@ -239,14 +285,12 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   args.remote_command = args.remote_notify + 16U;
   args.worker_count = impl_->session.config().workers;
   args.profile = (profile || impl_->profiling) ? PointerValue(impl_->profile_device) : 0U;
-  impl_->pending = stream;
-  impl_->last_stream = stream;
-  if (capturing) impl_->captured_stream = stream;
+  slot->submitted = false;
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchBatchGet(&launch, stream))
     return impl_->failure = Internal("UMDK BatchGet launch failed; shutdown required");
-  impl_->submitted = true;
+  slot->submitted = true;
   impl_->profile_submitted = args.profile != 0;
   if (profile) {
     const auto now = BatchGetProfileNowNs();
@@ -254,7 +298,8 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
     stamp = now;
   }
   if (!exec.execution.synchronize) return Status::OK();
-  if (aclrtMemcpyAsync(impl_->status_host, impl_->execution.status_bytes, impl_->execution.status,
+  if (aclrtMemcpyAsync(impl_->StatusHostWindow(slot_index), impl_->execution.status_bytes,
+                       impl_->StatusWindow(slot_index),
                        impl_->execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS)
     return Internal("BatchGet status enqueue failed");
   if (profile) {
@@ -265,14 +310,14 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
     profile->status_enqueue_ns = now - stamp;
     stamp = now;
   }
-  auto completed = impl_->Drain("completion", false);
+  auto completed = impl_->DrainSlot(*slot, "completion", false);
   if (profile) {
     const auto now = BatchGetProfileNowNs();
     profile->wait_ns = now - stamp;
     stamp = now;
   }
   if (!completed.ok()) return completed;
-  auto checked = impl_->ValidateStatus();
+  auto checked = impl_->ValidateStatus(slot_index);
   if (!checked.ok()) return checked;
   if (profile) {
     profile->worker_count = workers;

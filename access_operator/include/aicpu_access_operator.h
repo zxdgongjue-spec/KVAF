@@ -1,6 +1,7 @@
 #pragma once
 #include "access_operator.h"
 #include <array>
+#include <vector>
 namespace kvaf {
 struct UmdkAccessOperatorConfig {
   std::string kernel_json;
@@ -9,6 +10,9 @@ struct UmdkAccessOperatorConfig {
   std::uint32_t token_bytes{0U};
   std::string batch_get_mode{"gather_read"};
   std::array<std::uint8_t, 16> local_eid{};
+  // Row widths one AICPU session must serve. Empty keeps the single-width path;
+  // each width owns a transport with its own remote staging offset.
+  std::vector<std::uint32_t> token_bytes_list{};
 };
 // Runtime adapter for the AICPU demos. gather_read and BatchPut share UMDK;
 // cpu_push_scatter owns an independent Host-side direct HCCP target.

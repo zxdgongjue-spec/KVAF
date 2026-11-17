@@ -278,7 +278,8 @@ class NpuPythonRuntime final {
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
-                   const std::string& transport, std::string aicpu_batch_get_mode) {
+                   const std::string& transport, std::string aicpu_batch_get_mode,
+                   std::vector<std::uint32_t> batch_get_token_bytes_list) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -291,6 +292,7 @@ class NpuPythonRuntime final {
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
+    options.batch_get_token_bytes_list = std::move(batch_get_token_bytes_list);
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
@@ -561,9 +563,13 @@ class NpuPythonRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes != native_->batch_get_token_bytes()) {
+    // One AICPU session may serve several row widths; the request's own row
+    // width selects the transport that owns its staging slice and kernels.
+    std::vector<std::uint32_t> widths = native_->batch_get_token_bytes_list();
+    if (widths.empty()) widths.push_back(native_->batch_get_token_bytes());
+    if (std::find(widths.begin(), widths.end(), output_block_bytes) == widths.end()) {
       throw py::value_error(
-          "BatchGet output Tensor row size does not match batch_get_token_bytes");
+          "BatchGet output Tensor row size is not one of batch_get_token_bytes_list");
     }
     const BatchGetRequest request{
         access_table,

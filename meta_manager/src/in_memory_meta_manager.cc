@@ -1,5 +1,6 @@
 #include "meta_manager.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -16,7 +17,9 @@ namespace kvaf {
 namespace {
 
 // DSA keys are bounded slot IDs. Visibility belongs to each fixed slot.
-enum class SlotState : std::uint8_t { kEmpty, kPending, kActive };
+// kSpan marks the tail slots of a payload wider than one slot; they belong to
+// the payload's head key and must never be locked or freed on their own.
+enum class SlotState : std::uint8_t { kEmpty, kPending, kActive, kSpan };
 
 // 单条 key 当前绑定的地址记录。
 struct AddressRecord {
@@ -25,6 +28,8 @@ struct AddressRecord {
   std::uint64_t valid_length{0};
   std::size_t slot_id{0};
   std::uint32_t pin_count{0};
+  // Consecutive slots owned by this payload when it is the head key.
+  std::uint32_t span{0};
   SlotState state{SlotState::kEmpty};
 };
 
@@ -33,6 +38,7 @@ struct PendingPutItem {
   KeyId key{0};
   std::size_t slot_id{0};
   std::uint64_t valid_length{0};
+  std::uint32_t span{0};
 };
 
 // 一次 PreparePut 对应的事务上下文。
@@ -163,7 +169,13 @@ class InMemoryMetaManager final : public MetaManager {
     if (!region_registered_) {
       return NotInitialized("remote region has not been registered");
     }
-    // Validate the whole batch before reserving any fixed slot.
+    // Validate the whole batch before reserving any fixed slot. A payload may be
+    // wider than one slot when the same session serves mixed row widths: it then
+    // owns consecutive slots starting at its key, rounded up so an unaligned
+    // slot_size still keeps every byte whole.
+    std::vector<std::uint32_t> spans(flat_keys.size(), 0U);
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    ranges.reserve(flat_keys.size());
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
       if (flat_keys[i] >= records_.size()) {
         return InvalidArgument(
@@ -172,11 +184,28 @@ class InMemoryMetaManager final : public MetaManager {
       if (lengths[i] == 0) {
         return InvalidArgument("PreparePut length must be greater than zero");
       }
-      if (lengths[i] > region_.slot_size) {
-        return InvalidArgument("PreparePut length exceeds slot_size");
+      // Divide before rounding so a near-maximum length cannot overflow the add.
+      const std::uint64_t span = lengths[i] / region_.slot_size +
+                                 (lengths[i] % region_.slot_size != 0 ? 1U : 0U);
+      // Subtract instead of adding, for the same overflow reason.
+      if (span > records_.size() - flat_keys[i]) {
+        return InvalidArgument("PreparePut span runs past the DSA region");
       }
-      if (records_[flat_keys[i]].state != SlotState::kEmpty) {
-        return AlreadyExists("PreparePut key already exists or is pending");
+      for (std::uint64_t extra = 0; extra < span; ++extra) {
+        if (records_[flat_keys[i] + extra].state != SlotState::kEmpty) {
+          return AlreadyExists("PreparePut key already exists or is pending");
+        }
+      }
+      spans[i] = static_cast<std::uint32_t>(span);
+      ranges.emplace_back(static_cast<std::size_t>(flat_keys[i]),
+                          static_cast<std::size_t>(flat_keys[i] + span));
+    }
+    // Reject spans that overlap each other inside one batch; the fixed-slot
+    // table cannot represent two live payloads sharing a slot.
+    std::sort(ranges.begin(), ranges.end());
+    for (std::size_t i = 1; i < ranges.size(); ++i) {
+      if (ranges[i].first < ranges[i - 1].second) {
+        return InvalidArgument("PreparePut spans overlap inside the batch");
       }
     }
 
@@ -187,7 +216,8 @@ class InMemoryMetaManager final : public MetaManager {
     put_desc->entries.reserve(flat_keys.size());
     for (std::size_t i = 0; i < flat_keys.size(); ++i) {
       const std::size_t slot_id = static_cast<std::size_t>(flat_keys[i]);
-      pending_context.items.push_back(PendingPutItem{flat_keys[i], slot_id, lengths[i]});
+      pending_context.items.push_back(
+          PendingPutItem{flat_keys[i], slot_id, lengths[i], spans[i]});
       put_desc->entries.push_back(
           PutAllocation{flat_keys[i], SlotAddress(slot_id), lengths[i]});
     }
@@ -196,6 +226,9 @@ class InMemoryMetaManager final : public MetaManager {
         pending_puts_.emplace(ctx_id, std::move(pending_context)).first;
     for (const PendingPutItem& item : pending_it->second.items) {
       records_[item.slot_id].state = SlotState::kPending;
+      for (std::uint32_t extra = 1; extra < item.span; ++extra) {
+        records_[item.slot_id + extra].state = SlotState::kSpan;
+      }
     }
     put_context->id = ctx_id;
     return Status::OK();
@@ -230,7 +263,14 @@ class InMemoryMetaManager final : public MetaManager {
       record.valid_length = item.valid_length;
       record.slot_id = item.slot_id;
       record.pin_count = 0;
+      record.span = item.span;
       record.state = SlotState::kActive;
+      for (std::uint32_t extra = 1; extra < item.span; ++extra) {
+        AddressRecord& tail = records_[item.slot_id + extra];
+        tail = AddressRecord{};
+        tail.slot_id = item.slot_id + extra;
+        tail.state = SlotState::kSpan;
+      }
     }
     pending_puts_.erase(pending_it);
     return Status::OK();
@@ -253,7 +293,9 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (const PendingPutItem& item : pending_it->second.items) {
-      records_[item.slot_id] = AddressRecord{};
+      for (std::uint32_t extra = 0; extra < item.span; ++extra) {
+        records_[item.slot_id + extra] = AddressRecord{};
+      }
     }
 
     pending_puts_.erase(pending_it);
@@ -407,7 +449,11 @@ class InMemoryMetaManager final : public MetaManager {
     }
 
     for (KeyId key : flat_keys) {
-      records_[key] = AddressRecord{};
+      // Free the head key and every tail slot its payload owns.
+      const std::uint32_t span = records_[key].span == 0U ? 1U : records_[key].span;
+      for (std::uint32_t extra = 0; extra < span; ++extra) {
+        records_[key + extra] = AddressRecord{};
+      }
     }
 
     return Status::OK();

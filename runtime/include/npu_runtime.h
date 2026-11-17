@@ -53,6 +53,9 @@ struct NpuRuntimeOptions {
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};
+  // Row widths one AICPU session serves. Empty keeps the single-width path that
+  // uses batch_get_token_bytes. AICPU only: one session, one transport per width.
+  std::vector<std::uint32_t> batch_get_token_bytes_list{};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -75,6 +78,8 @@ class NpuRuntime final : public Runtime {
   std::uint32_t jettys_per_core() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
+  // Row widths one AICPU session serves; empty means "use batch_get_token_bytes".
+  const std::vector<std::uint32_t>& batch_get_token_bytes_list() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);

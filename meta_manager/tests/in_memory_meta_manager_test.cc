@@ -376,18 +376,111 @@ bool TestInvalidContextPaths() {
 }
 
 // 验证单条写入长度不能超过 slot 容量。
-bool TestPreparePutRejectsOversizedLength() {
-  auto manager = MakeInitializedManager(1);
+// A payload wider than one slot owns consecutive slots: the head key is the
+// only handle, and every tail slot is released with it.
+bool TestWidePayloadSpansConsecutiveSlots() {
+  auto manager = MakeInitializedManager(8);
+  if (!manager) {
+    return false;
+  }
+
+  // Key 2 owns slots 2,3,4 (three 256-byte slots).
+  PutContext put_context;
+  PutAccessDesc put_desc;
+  if (!ExpectOk(manager->PreparePut({2}, {3 * kSlotSize}, &put_context, &put_desc),
+                "wide PreparePut should accept a three-slot payload")) {
+    return false;
+  }
+  if (!Expect(put_desc.entries.size() == 1,
+              "wide PreparePut should return one reservation per key")) {
+    return false;
+  }
+  if (!Expect(put_desc.entries[0].address == kBaseAddress + 2 * kSlotSize,
+              "wide payload must start at its head slot")) {
+    return false;
+  }
+  if (!Expect(put_desc.entries[0].reserved_length == 3 * kSlotSize,
+              "wide payload must reserve its full byte length")) {
+    return false;
+  }
+
+  // A tail slot is already owned while the head is only pending.
+  PutContext tail_put;
+  PutAccessDesc tail_desc;
+  if (!ExpectStatusCode(manager->PreparePut({3}, {kSlotSize}, &tail_put, &tail_desc),
+                        StatusCode::kAlreadyExists,
+                        "tail slot must stay reserved while the head is pending")) {
+    return false;
+  }
+
+  if (!ExpectOk(manager->CommitPut(put_context), "wide CommitPut should succeed")) {
+    return false;
+  }
+
+  // Tail slots never act as independent handles.
+  LockContext tail_lock;
+  if (!ExpectStatusCode(
+          manager->LockKeys({3}, MetaManagerLockMode::kStableReadAllowAppend, &tail_lock),
+          StatusCode::kNotFound, "tail slot must not be lockable on its own")) {
+    return false;
+  }
+  if (!ExpectStatusCode(manager->BatchFree({3}), StatusCode::kNotFound,
+                        "tail slot must not be freeable on its own")) {
+    return false;
+  }
+
+  // The head key exposes the whole contiguous payload.
+  LockContext lock_context;
+  if (!ExpectOk(manager->LockKeys({2}, MetaManagerLockMode::kStableReadAllowAppend,
+                                  &lock_context),
+                "head key should be lockable")) {
+    return false;
+  }
+  FlatAccessDesc access_desc;
+  if (!ExpectOk(manager->BatchLookup({2}, lock_context, &access_desc),
+                "head key should be lookuppable")) {
+    return false;
+  }
+  if (!Expect(access_desc.addresses[0] == kBaseAddress + 2 * kSlotSize &&
+                  access_desc.lengths[0] == 3 * kSlotSize,
+              "lookup must expose the whole wide payload")) {
+    return false;
+  }
+  if (!ExpectOk(manager->UnlockKeys(lock_context), "UnlockKeys should succeed")) {
+    return false;
+  }
+
+  // Freeing the head releases every slot it owns.
+  if (!ExpectOk(manager->BatchFree({2}), "wide BatchFree should release every slot")) {
+    return false;
+  }
+  for (KeyId slot : {2, 3, 4}) {
+    PutContext reused_put;
+    PutAccessDesc reused_desc;
+    if (!ExpectOk(manager->PreparePut({slot}, {kSlotSize}, &reused_put, &reused_desc),
+                  "released span slot should be reusable")) {
+      return false;
+    }
+    if (!ExpectOk(manager->AbortPut(reused_put), "AbortPut should succeed")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Spans that overlap inside one batch cannot describe two live payloads.
+bool TestWidePayloadRejectsOverlappingSpans() {
+  auto manager = MakeInitializedManager(8);
   if (!manager) {
     return false;
   }
 
   PutContext put_context;
   PutAccessDesc put_desc;
+  // Key 0 owns 0,1,2 while key 1 falls inside that span.
   return ExpectStatusCode(
-      manager->PreparePut({DsaKey(0, 0, 0)}, {kSlotSize + 1}, &put_context, &put_desc),
-      StatusCode::kInvalidArgument,
-      "PreparePut should reject payload larger than one slot");
+      manager->PreparePut({0, 1}, {3 * kSlotSize, kSlotSize}, &put_context, &put_desc),
+      StatusCode::kInvalidArgument, "overlapping spans must be rejected");
 }
 
 // 固定映射要求 Key 小于注册的 slot 数量。
@@ -479,7 +572,9 @@ int main() {
        TestInvalidArgumentAndDuplicateKeyPaths},
       {"NotInitializedPaths", TestNotInitializedPaths},
       {"InvalidContextPaths", TestInvalidContextPaths},
-      {"PreparePutRejectsOversizedLength", TestPreparePutRejectsOversizedLength},
+      {"WidePayloadSpansConsecutiveSlots", TestWidePayloadSpansConsecutiveSlots},
+      {"WidePayloadRejectsOverlappingSpans",
+       TestWidePayloadRejectsOverlappingSpans},
       {"PreparePutRejectsOutOfRangeKey", TestPreparePutRejectsOutOfRangeKey},
       {"DoubleUnlockReturnsNotFound", TestDoubleUnlockReturnsNotFound},
   };
