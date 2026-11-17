@@ -69,6 +69,10 @@ int aclrtSynchronizeStream(aclrtStream) {
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus* s, aclmdlRI*) {
   *s = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE; return 0;
 }
+int aclmdlRICaptureBegin(aclrtStream, aclmdlRICaptureMode) { return 1; }
+int aclmdlRICaptureEnd(aclrtStream, aclmdlRI*) { return 1; }
+int aclmdlRIExecuteAsync(aclmdlRI, aclrtStream) { return 1; }
+int aclmdlRIDestroy(aclmdlRI) { return 1; }
 uint32_t loaded_mode{};
 extern "C" int32_t KvafScatterBatchGetLoadKernel(const char*) { loaded_mode = KVAF_SEQ_SCATTER; return 0; }
 extern "C" int32_t KvafGatherBatchGetLoadKernel(const char*) { loaded_mode = KVAF_SEQ_GATHER; return 0; }

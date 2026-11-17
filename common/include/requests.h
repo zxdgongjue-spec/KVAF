@@ -97,14 +97,17 @@ struct BatchFreeRequest {
 // 类型；当前 CANN Adapter 将它解释为 aclrtStream。默认只向 stream enqueue，
 // 不替调用方同步；同一 stream 上的后续 Torch/ACL 操作天然按序执行。跨 stream
 // 依赖、buffer 生命周期与显式 synchronize 由调用方/框架负责。
+enum class ScatterGraphAction { kNone, kCapture, kReplay, kReset };
+
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
   // Optional AICPU stage timings; requires synchronize=true.
   BatchGetProfile* profile{nullptr};
   // AIV Scatter caller guarantees live contiguous device tensors, valid
-  // source indices and offsets, unique output rows and an eager stream.
+  // source indices and offsets, and unique output rows.
   bool trusted_npu_request{false};
+  ScatterGraphAction scatter_graph{ScatterGraphAction::kNone};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

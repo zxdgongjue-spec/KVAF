@@ -504,6 +504,9 @@ Status DefaultAccessOperator::Shutdown() {
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  if (exec.execution.scatter_graph != ScatterGraphAction::kNone &&
+      (!impl_->sequential || impl_->config.aiv_batch_get_mode != "cpu_push_scatter"))
+    return Status::NotImplemented("ACL Graph preparation requires cpu_push_scatter");
   if (impl_->sequential) return impl_->sequential->Execute(exec);
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,

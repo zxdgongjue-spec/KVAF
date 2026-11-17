@@ -128,8 +128,8 @@ runtime.link_to(cpu_service_address)
 runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 ```
 
-- 支持 1～8 核、单 EID 和 eager 执行。可信 Scatter 入口由调用方保证 stream 未处于
-  graph capture 中，带校验的入口会检查 capture 状态并拒绝 capture。
+- 支持 1～8 核和单 EID。Scatter 支持 eager 和由 `prepare_scatter_batch_get` 管理的 ACL Graph。
+  请在调用方图捕获之外准备和提交 Scatter。
 - 请求容量 1～65536，固定 token 长度 1～65535 B；`miss_count=0` 是合法空批次。
 - 仅搬运有效前缀，允许重复源和不连续输出行；输出行必须唯一，offset 不能越过源 block。
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
@@ -140,6 +140,19 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 - done 轮询有次数上限，loader 的 kernel 超时为 180 秒；轮询次数不是毫秒。
 - Scatter HBM workspace 按最大 65536 请求配置，包括 `65536 * token_bytes` staging、
   512 KiB 地址清单和控制区。大 token 回归使用较小请求容量以缩小测试输出，workspace 仍按上限分配。
+
+### Scatter ACL Graph
+
+使用同一条 NPU stream 捕获和重放，更新固定地址 Tensor 的内容即可发送新请求。
+设置 profiling 后调用 `prepare_scatter_batch_get(..., stream=stream, acl_graph=True)`，返回的
+无参 callable 每次调用提交一次 replay。AIV 在 kernel 内推进序号并通知 K 端，K 端执行 Gather
+和 payload WRITE，AIV 按原有 Ready/Done 协议执行 Scatter。图持有输入、输出、AccessTable 的
+Tensor 和 stream，运行时会检查完成状态。用 `synchronize=True` 可在每次调用内验证结果，
+异步调用可以同 stream 连续入队，在 `scatter_profile()` 或图销毁时检查状态。
+
+使用 `reset_scatter_batch_get_graph()` 等待并销毁图后，可以释放 AccessTable、改变 profiling
+选项或重新准备图。比较性能时，N 端性能脚本两组都用 `--completion-scope stream`，其中一组
+额外加 `--acl-graph`。捕获与结果验证在样本计时窗口外。
 
 ## 构建与完整回归
 

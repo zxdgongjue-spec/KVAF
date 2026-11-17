@@ -10,6 +10,7 @@ using aclrtBinHandle = void*;
 using aclrtFuncHandle = void*;
 using aclmdlRI = void*;
 enum aclmdlRICaptureStatus { ACL_MODEL_RI_CAPTURE_STATUS_NONE, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE };
+enum aclmdlRICaptureMode { ACL_MODEL_RI_CAPTURE_MODE_RELAXED };
 enum { ACL_SUCCESS = 0, ACL_MEM_MALLOC_HUGE_FIRST = 0, ACL_MEM_MALLOC_NORMAL_ONLY = 1 };
 enum aclrtMemcpyKind { ACL_MEMCPY_HOST_TO_DEVICE, ACL_MEMCPY_DEVICE_TO_HOST };
 int aclrtGetDevice(int32_t*);
@@ -26,6 +27,10 @@ int aclrtCreateStream(aclrtStream*);
 int aclrtDestroyStream(aclrtStream);
 int aclrtSynchronizeStream(aclrtStream);
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus*, aclmdlRI*);
+int aclmdlRICaptureBegin(aclrtStream, aclmdlRICaptureMode);
+int aclmdlRICaptureEnd(aclrtStream, aclmdlRI*);
+int aclmdlRIExecuteAsync(aclmdlRI, aclrtStream);
+int aclmdlRIDestroy(aclmdlRI);
 enum {
   ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE, ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE,
   ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US, ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE,
