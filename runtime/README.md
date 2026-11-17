@@ -44,7 +44,8 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
-CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
+CPU DDR region 的页模式由 CPU 服务的 `--memory-mode` 指定，默认使用
+`thp`。`--memory-page-mode` 也可使用。
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -54,8 +55,26 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 
 # 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 --memory-page-mode default
+  --listen 0.0.0.0 --port 28999 --memory-mode default
+
+# 显式使用 2 MiB HugeTLB 页。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 29000 --memory-mode hugetlb-2m
+
+# 显式使用 1 GiB HugeTLB 页。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 29001 --memory-mode hugetlb-1g
 ```
+
+显式 HugeTLB 模式从对应大小的 Linux 页池分配，页池不足时分配失败。
+CPU 宿主机可用 `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages` 和
+`/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages` 检查可用页数。
+绑定 NUMA 内存时检查对应节点的页池。映射长度按页大小向上取整，URMA 注册长度
+沿用 NPU 的申请值。多个 EID 会话共享同一块 DDR 时，最后一个会话释放后才解除映射。
+
+`REGION_ALLOCATED` 日志中的 `bytes` 是申请长度，`backing_bytes` 是分配长度。
+使用 `memory` 定位 `/proc/<pid>/smaps` 中的映射。显式 HugeTLB 模式查看
+`KernelPageSize` 和 `VmFlags` 中的 `ht`。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。`REGION_ALLOCATED` 日志会记录

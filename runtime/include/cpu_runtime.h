@@ -11,6 +11,8 @@ namespace kvaf {
 enum class CpuMemoryPageMode {
   kDefault,
   kTransparentHugePage,
+  kHugeTlb2M,
+  kHugeTlb1G,
 };
 
 struct CpuRuntimeOptions {

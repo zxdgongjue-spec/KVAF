@@ -12,7 +12,8 @@ namespace {
 void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
-               "[--memory-page-mode default|thp]\n"
+               "[--memory-mode default|thp|hugetlb-2m|hugetlb-1g]\n"
+               "--memory-page-mode is an alias for --memory-mode.\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. "
                "The default memory page mode is thp. The service requires only liburma and /dev/uburma.\n",
@@ -39,6 +40,14 @@ bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode)
     *mode = kvaf::CpuMemoryPageMode::kTransparentHugePage;
     return true;
   }
+  if (text == "hugetlb-2m") {
+    *mode = kvaf::CpuMemoryPageMode::kHugeTlb2M;
+    return true;
+  }
+  if (text == "hugetlb-1g") {
+    *mode = kvaf::CpuMemoryPageMode::kHugeTlb1G;
+    return true;
+  }
   return false;
 }
 
@@ -53,8 +62,9 @@ int main(int argc, char** argv) {
       PrintUsage(argv[0]);
       return 0;
     }
+    const bool memory_mode = argument == "--memory-mode" || argument == "--memory-page-mode";
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
-         argument == "--eid-index" || argument == "--memory-page-mode") && index + 1 >= argc) {
+         argument == "--eid-index" || memory_mode) && index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
     }
@@ -77,9 +87,10 @@ int main(int argc, char** argv) {
         return 2;
       }
       cpu_options.has_eid_index = true;
-    } else if (argument == "--memory-page-mode") {
+    } else if (memory_mode) {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
-        std::fprintf(stderr, "invalid --memory-page-mode; expected default or thp\n");
+        std::fprintf(stderr, "invalid %s; expected default|thp|hugetlb-2m|hugetlb-1g\n",
+                     argument.c_str());
         return 2;
       }
     } else {
