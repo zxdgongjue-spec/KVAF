@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdio>
 
 #include "cpu_gather.h"
 #include "transport_internal.h"
