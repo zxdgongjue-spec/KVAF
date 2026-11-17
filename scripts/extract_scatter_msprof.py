@@ -36,6 +36,8 @@ def event_kind(name, args):
         return "host_replay"
     if "launchkernel" in api or "kernellaunch" in api:
         return "host_launch"
+    if "synchronizedevice" in api or "devicesynchronize" in api:
+        return "host_device_sync"
     if "synchronizestream" in api or "streamsynchronize" in api:
         return "host_sync"
     for candidate in (api, args.get("kernelname", ""), args.get("opname", "")):
@@ -123,7 +125,7 @@ def main():
     present = {row["kind"] for row in rows}
     if not present.intersection({"host_launch", "host_replay"}):
         print("No Host launch or replay events found in the selected window.", file=sys.stderr)
-    if "host_sync" not in present:
+    if not present.intersection({"host_sync", "host_device_sync"}):
         print("No Host synchronization events found in the selected window.", file=sys.stderr)
 
 
