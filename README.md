@@ -317,6 +317,10 @@ python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
   --flow2-device 6 --flow2-priorities 13 --flow2-args="--token-bytes 656"
 ```
 
+多流测试在每一轮 BatchGet 前后同步，所有流的 `--iterations` 必须一致。
+父输出目录的 `concurrent_batch_get_summary.json` 记录共同 Host 时间窗口的总吞吐，
+各流原有 kernel 性能结果仍在 `flowN` 中，详见[多流测量口径](docs/peer_eid_contention.md#多流共同窗口与总吞吐)。
+
 可用 `KVAF_BATCH_GET_PERF_ADDRESS_SPACE_BYTES` 设置默认预算，命令行优先。
 每个测试的配置日志和 miss-count 汇总 CSV 都会记录 `table_capacity`、
 `tokens_per_block`、`address_space_budget_bytes`（未设置时为 0）和

@@ -21,6 +21,7 @@ import unittest
 from unittest.mock import patch
 
 import batch_get_jetty_profile as jetty_profile
+import batch_get_concurrency as concurrency
 import run_concurrent_batch_get as launcher
 import test_npu_batch_get_perf as perf
 from npu_eids import peer_eid_path
@@ -55,10 +56,27 @@ def worker(mode, output):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         (output / "child.pid").write_text(str(child.pid))
     ready_ns = time.monotonic_ns()
-    perf.wait_for_concurrent_start()
-    started_ns = time.monotonic_ns()
+    rounds = []
+    iterations = int(os.environ.get("KVAF_BATCH_GET_CONCURRENT_ITERATIONS", "3"))
+    with perf.ConcurrentMeasurement(iterations, 1024) as measurement:
+        for iteration in range(iterations):
+            if mode == "slow_round" and iteration == 1:
+                time.sleep(0.2)
+            round_ready = time.monotonic_ns()
+            measurement.before(iteration)
+            begin = time.monotonic_ns()
+            if mode == "fail_in_round" and iteration == 1:
+                return 9
+            if mode == "hang_in_round" and iteration == 1:
+                time.sleep(60)
+            time.sleep(0.02 if mode == "slow_round" else 0.002)
+            end = time.monotonic_ns()
+            measurement.after(iteration, begin, end)
+            rounds.append(dict(ready_ns=round_ready, begin_ns=begin, end_ns=end))
+    started_ns = rounds[0]["begin_ns"]
     (output / (os.environ["DEVICE_ID"] + ".json")).write_text(json.dumps({
         "ready_ns": ready_ns, "started_ns": started_ns,
+        "rounds": rounds,
         "device": os.environ["DEVICE_ID"],
         "cpu_service_addr": os.environ.get("KVAF_CPU_SERVICE_ADDR"),
         "priorities": os.environ["KVAF_BATCH_GET_JETTY_PRIORITIES"],
@@ -82,7 +100,12 @@ def fake_perf(argv):
     print(f"BATCH_GET_PERF_CONFIG table_capacity={args.table_capacity} "
           f"tokens_per_block={args.tokens_per_block} address_space_budget_bytes={args.address_space_bytes or 0} "
           f"address_space_bytes={args.table_capacity * args.tokens_per_block * args.token_bytes}")
-    perf.wait_for_concurrent_start()
+    with perf.ConcurrentMeasurement(args.iterations, args.miss_count * args.token_bytes) as measurement:
+        for iteration in range(args.iterations):
+            measurement.before(iteration)
+            begin = time.monotonic_ns()
+            end = time.monotonic_ns()
+            measurement.after(iteration, begin, end)
     print("BATCH_GET_PERF_CORRECTNESS_PASS fixture=1")
     for stage in ("kernel_total", "kernel_post", "kernel_completion_wait"):
         print(f"PERF_RESULT operation=batch_get_{stage} " + " ".join(
@@ -118,7 +141,7 @@ class ConcurrentFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.output = Path(self.temp.name)
+        self.output = Path(self.temp.name).resolve()
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith("KVAF_")}
         self.env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
@@ -150,14 +173,14 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
-    def test_three_and_four_flows_from_cli_wait_for_last_worker(self):
+    def test_three_four_and_eight_flows_wait_for_every_round(self):
         popen = subprocess.Popen
-        for count in (3, 4):
+        for count in (3, 4, 8):
             output = self.output / f"run-{count}"
             shared_addr = "192.0.2.10:29000"
             argv = ["build-npu", "--output-dir", str(output), "--address-space-bytes", "1048576"]
             for i in range(1, count + 1):
-                options = f"--iterations {i} --token-bytes {128 * i}"
+                options = f"--iterations 3 --token-bytes {128 * i}"
                 if i == count:
                     options += " --address-space-bytes 2097152"
                 argv.extend([f"--flow{i}-device={i - 1}", f"--flow{i}-priorities", str(i),
@@ -173,8 +196,9 @@ class ConcurrentTests(ConcurrentFixture):
                 self.assertEqual(options.peer_eids, PEERS)
                 self.assertEqual(options.npu_eids, NPU_EIDS[:1])
                 self.assertEqual(Path(options.peer_csv), folder / "peer_samples.csv")
-                self.assertEqual(folder, output / f"flow{options.iterations}")
-                expected_bytes = 2097152 if options.iterations == count else 1048576
+                flow_number = options.token_bytes // 128
+                self.assertEqual(folder, output / f"flow{flow_number}")
+                expected_bytes = 2097152 if flow_number == count else 1048576
                 self.assertEqual(options.table_capacity, expected_bytes // (options.token_bytes * 128))
                 mode = "slow" if folder.name == f"flow{count}" else "normal"
                 return popen([sys.executable, "-B", str(Path(__file__).resolve()),
@@ -197,6 +221,16 @@ class ConcurrentTests(ConcurrentFixture):
                 self.assertGreaterEqual(min(row["started_ns"] for row in results),
                                         max(row["ready_ns"] for row in results))
                 self.assertIn(f"all {count} flows ready", console.getvalue())
+                for iteration in range(3):
+                    self.assertGreaterEqual(min(row["rounds"][iteration]["begin_ns"] for row in results),
+                                            max(row["rounds"][iteration]["ready_ns"] for row in results))
+                    if iteration:
+                        self.assertGreaterEqual(min(row["rounds"][iteration]["begin_ns"] for row in results),
+                                                max(row["rounds"][iteration - 1]["end_ns"] for row in results))
+                summary = json.loads((output / concurrency.REPORT_FILES[2]).read_text())
+                self.assertEqual(summary["samples"], 3)
+                self.assertEqual(summary["flow_count"], count)
+                self.assertEqual(summary["total_payload_bytes"], count * 3 * 1024)
 
     def test_service_override_only_changes_its_own_flow(self):
         shared_addr = "192.0.2.1:29000"
@@ -332,7 +366,10 @@ class ConcurrentTests(ConcurrentFixture):
         output = io.StringIO()
         with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(output), \
                 patch("socket.create_connection", side_effect=AssertionError("unexpected connection")):
-            perf.wait_for_concurrent_start()
+            with perf.ConcurrentMeasurement(2, 1024) as measurement:
+                for iteration in range(2):
+                    measurement.before(iteration)
+                    measurement.after(iteration, 10, 20)
         self.assertEqual(output.getvalue(), "")
 
     def test_independent_devices_priorities_and_paths(self):
@@ -379,6 +416,44 @@ class ConcurrentTests(ConcurrentFixture):
         self.assertEqual(text.count(block), 2)
         self.assertLess(text.index("flow1 / DEVICE_ID=7"), text.index("flow2 / DEVICE_ID=6"))
 
+    def test_later_rounds_wait_for_slow_preparation_and_completion(self):
+        with contextlib.redirect_stdout(io.StringIO()) as console:
+            code = launcher.run_flows(self.flows("normal", "slow_round"), 5, self.output)
+        self.assertEqual(code, 0, console.getvalue())
+        results = [json.loads((self.output / f"{device}.json").read_text()) for device in (7, 6)]
+        fast, slow = [row["rounds"] for row in results]
+        for iteration in range(3):
+            self.assertGreaterEqual(fast[iteration]["begin_ns"], slow[iteration]["ready_ns"])
+            if iteration:
+                self.assertGreaterEqual(fast[iteration]["begin_ns"], slow[iteration - 1]["end_ns"])
+        self.assertGreater(fast[1]["begin_ns"] - fast[1]["ready_ns"], 150_000_000)
+        with (self.output / concurrency.REPORT_FILES[0]).open() as stream:
+            samples = list(csv.DictReader(stream))
+        self.assertEqual(len(samples), 3)
+        for iteration, sample in enumerate(samples):
+            expected_ns = max(row["rounds"][iteration]["end_ns"] for row in results) - min(
+                row["rounds"][iteration]["begin_ns"] for row in results)
+            self.assertEqual(int(sample["window_ns"]), expected_ns)
+            self.assertAlmostEqual(float(sample["aggregate_GBps"]), 2048 / expected_ns)
+        with (self.output / concurrency.REPORT_FILES[1]).open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 6)
+        self.assertEqual({row["device_id"] for row in rows}, {"6", "7"})
+
+    def test_mismatched_iterations_fail_before_creating_outputs(self):
+        argv = ["build-npu", "--output-dir", str(self.output / "mismatch"),
+                "--flow1-device", "7", "--flow2-device", "6",
+                "--flow1-args=--iterations 3", "--flow2-args=--iterations 4"]
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()) as console, \
+                patch.object(launcher.subprocess, "Popen", side_effect=AssertionError("must not launch")):
+            self.assertEqual(launcher.main(argv), 1)
+        self.assertIn("same --iterations", console.getvalue())
+        self.assertFalse((self.output / "mismatch").exists())
+
+    def test_failed_or_stalled_round_reaps_waiting_workers(self):
+        self.assert_cleanup_on_error(self.flows("normal", "fail_in_round"), RuntimeError)
+        self.assert_cleanup_on_error(self.flows("normal", "hang_in_round"), TimeoutError, timeout=0.7)
+
     def assert_cleanup_on_error(self, flows, exception, timeout=5):
         created = []
         popen = subprocess.Popen
@@ -412,7 +487,7 @@ class ConcurrentTests(ConcurrentFixture):
     def test_failure_after_start_returns_original_exit_code(self):
         code, text = self.run_pair(self.flows(mode1="fail_after_start"))
         self.assertEqual(code, 9)
-        self.assertIn("flow2 exit_status=0", text)
+        self.assertNotIn("BATCH_GET_CONCURRENT_SUMMARY", text)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process group check")
     def test_failure_kills_descendant_in_worker_group(self):
@@ -435,6 +510,42 @@ class ConcurrentTests(ConcurrentFixture):
         self.assertEqual(code, 1)
         self.assertEqual(existing.read_text(), "keep me")
         self.assertFalse((pair / "flow2").exists())
+
+    def test_existing_concurrent_summary_is_not_overwritten(self):
+        report = self.output / concurrency.REPORT_FILES[2]
+        report.write_text("keep me")
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()), \
+                patch.object(launcher, "run_flows", side_effect=AssertionError("must not launch")):
+            code = launcher.main(["build-npu", "--output-dir", str(self.output),
+                                  "--flow1-device", "7", "--flow2-device", "6"])
+        self.assertEqual(code, 1)
+        self.assertEqual(report.read_text(), "keep me")
+        self.assertFalse((self.output / "flow1").exists())
+
+
+class AggregateTests(unittest.TestCase):
+    def test_uses_common_window_and_byte_weighted_total_not_sum_of_rates(self):
+        first = concurrency.round_sample(0, 100, [
+            dict(begin_ns=100, end_ns=1100, payload_bytes=1000),
+            dict(begin_ns=200, end_ns=2200, payload_bytes=1000)])
+        second = concurrency.round_sample(1, 3000, [
+            dict(begin_ns=3000, end_ns=4000, payload_bytes=1000),
+            dict(begin_ns=5000, end_ns=6000, payload_bytes=1000)])
+        self.assertEqual(first["window_ns"], 2100)
+        self.assertEqual(first["start_skew_ns"], 100)
+        self.assertEqual(first["host_overlap_ns"], 900)
+        self.assertAlmostEqual(first["aggregate_GBps"], 2000 / 2100)
+        self.assertEqual(second["host_overlap_ns"], 0)
+        summary = concurrency.report_results([first, second], [], None, lambda _: None)
+        self.assertAlmostEqual(summary["aggregate_GBps"], 4000 / 5100)
+        self.assertEqual(summary["all_flow_host_overlap_samples"], 1)
+
+    def test_rejects_invalid_intervals_and_accepts_zero_payload(self):
+        for begin, end in ((99, 200), (100, 100), (200, 100), (None, 200), (100, "200")):
+            with self.subTest(begin=begin, end=end), self.assertRaises(RuntimeError):
+                concurrency.round_sample(0, 100, [dict(begin_ns=begin, end_ns=end, payload_bytes=1000)])
+        sample = concurrency.round_sample(0, 100, [dict(begin_ns=100, end_ns=200, payload_bytes=0)])
+        self.assertEqual(sample["aggregate_GBps"], 0)
 
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "POSIX Bash integration")

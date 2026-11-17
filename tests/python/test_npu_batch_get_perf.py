@@ -42,6 +42,7 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
+from batch_get_concurrency import ConcurrentMeasurement
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids, select_peer_eids
 import batch_get_jetty_profile as jetty_profile
@@ -386,29 +387,6 @@ def report_peer_eid_selection(args, emit=print):
         emit(f"BATCH_GET_PEER_EID_SELECTION requested_peer_eids={','.join(args.requested_peer_eids)} "
              f"selected_peer_eids={','.join(args.peer_eids)} reason=jetty_capacity "
              f"mode={mode}")
-
-
-def wait_for_concurrent_start() -> None:
-    """Optional launcher rendezvous, outside measurement and silent in benchmark logs."""
-    endpoint = os.environ.get("KVAF_BATCH_GET_START_GATE")
-    if not endpoint:
-        return
-    import socket
-
-    host, port = endpoint.rsplit(":", 1)
-    timeout = int(os.environ.get("KVAF_REMOTE_CPU_PERF_TIMEOUT", "600"))
-    with socket.create_connection((host, int(port)), timeout=timeout) as connection:
-        connection.sendall((os.environ["KVAF_BATCH_GET_START_TOKEN"] + "\n").encode("ascii"))
-        with connection.makefile("rb") as response:
-            message = response.readline(64)
-        if not message.endswith(b"\n") or not message.strip().isdigit():
-            raise RuntimeError("concurrent launcher disconnected before start")
-        start_ns = int(message)
-    while True:
-        remaining_ns = start_ns - time.monotonic_ns()
-        if remaining_ns <= 0:
-            return
-        time.sleep(remaining_ns / 1_000_000_000)
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -983,32 +961,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
-        for iteration in range(args.iterations):
-            indices, offsets, output_indices = create_request_plan()
-            # Request generation and Tensor work are deliberately excluded.
-            torch.npu.synchronize()
-            if iteration == 0:
-                wait_for_concurrent_start()
+        with ConcurrentMeasurement(args.iterations, miss_count_value * token_bytes) as measurement:
+            for iteration in range(args.iterations):
+                indices, offsets, output_indices = create_request_plan()
+                # Request generation and Tensor work are deliberately excluded.
+                torch.npu.synchronize()
+                measurement.before(iteration)
 
-            begin = time.perf_counter()
-            runtime.batch_get(
-                device_table,
-                indices,
-                offsets,
-                miss_count,
-                output_indices,
-                output,
-            )
-            submitted = time.perf_counter()
-            torch.npu.synchronize()
-            completed = time.perf_counter()
-            submit_samples.append((submitted - begin) * 1000.0)
-            synchronize_samples.append((completed - submitted) * 1000.0)
-            batch_get_samples.append((completed - begin) * 1000.0)
-            if args.kernel_profile:
-                kernel_profile_samples.append(
-                    list(runtime.batch_get_kernel_profile())
+                begin = time.monotonic_ns()
+                runtime.batch_get(
+                    device_table,
+                    indices,
+                    offsets,
+                    miss_count,
+                    output_indices,
+                    output,
                 )
+                submitted = time.monotonic_ns()
+                torch.npu.synchronize()
+                completed = time.monotonic_ns()
+                submit_samples.append((submitted - begin) / 1_000_000.0)
+                synchronize_samples.append((completed - submitted) / 1_000_000.0)
+                batch_get_samples.append((completed - begin) / 1_000_000.0)
+                measurement.after(iteration, begin, completed)
+                if args.kernel_profile:
+                    kernel_profile_samples.append(
+                        list(runtime.batch_get_kernel_profile())
+                    )
 
         print_samples(
             "batch_get_submit",

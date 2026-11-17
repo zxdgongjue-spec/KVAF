@@ -120,8 +120,11 @@ core 1 / Jetty 0 -> peer EID 1
 每条流可单独指定设备、本地 NPU EID、远端 CPU EID 列表、优先级和 benchmark 参数。
 顶层 `--address-space-bytes` 分别应用于每条流。例如设为 `1073741824` 时，每条流的远端表预算均为
 1 GiB。在 `--flowN-args` 中传入同一选项可覆盖该流的预算。
-全部流完成初始化和预热后同步开始首次测量。每条流内部沿用
-`run_peer_eid_sweep.py` 所用 benchmark 的多 CPU EID kernel 路径。
+全部流完成初始化和预热后进入逐轮同步测量。每一轮都等所有流准备好请求 Tensor、
+完成设备同步，再按同一个未来 Host 时间放行；该轮全部完成后才进入下一轮。
+每条流内部沿用 `run_peer_eid_sweep.py` 所用 benchmark 的多 CPU EID kernel 路径。
+所有流的 `--iterations` 必须相同，否则在启动子进程前报错；预热次数、请求量、
+token 大小、core 和 Jetty 数仍可分别配置。此机制适用于两条及以上流，包括 8 流。
 
 下面以 NPU7 和 NPU6 共同访问同一对 CPU EID 为例。先把 `CPU_EID_0`、`CPU_EID_1`、
 `NPU7_EID`、`NPU6_EID` 设置为目标机的实际 EID，并设置 `KVAF_CPU_SERVICE_ADDR`：
@@ -169,7 +172,44 @@ CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 E
 和两个汇总 CSV 保持原名；指定 CPU EID 后，每条流额外生成自己的 `peer_samples.csv`，
 自动覆盖 `--flow*-args` 中指定的 peer CSV 路径，避免两条流写入同一个文件。
 对于上例，检查每条流日志中的两条 `PEER_EID_TRAFFIC` 和 `PEER_EID_CONCURRENCY`，
-并核对该流 `peer_samples.csv` 中的 CPU EID。首次测量同步开始后，各流独立执行后续迭代。
+并核对该流 `peer_samples.csv` 中的 CPU EID。每轮都同步，不再只同步首次测量。
+
+### 多流共同窗口与总吞吐
+
+多流启动命令不变，新同步协议需要同时更新 `run_concurrent_batch_get.py`、
+`test_npu_batch_get_perf.py` 和 `batch_get_concurrency.py`，仅此脚本修改无需重新编译。
+每条流仍使用原来的逐次 BatchGet 调用，按原配置生成请求，不切换为 Graph replay。
+请求生成、预热、屏障等待及 profile 读取均在每轮计时窗口之外。
+
+父输出目录新增三个文件，原有 `flowN` 内的日志、profile 和 CSV 保留：
+
+| 文件 | 内容 |
+| --- | --- |
+| `concurrent_batch_get_samples.csv` | 每轮总字节数、计划放行时间、最早/最晚开始、最晚完成、共同窗口 `window_ns`、启动偏差 `start_skew_ns`、Host 窗口交集 `host_overlap_ns` 和 `aggregate_GBps` |
+| `concurrent_batch_get_flows.csv` | 每轮每条流的设备 ID、Host 开始/完成时间和有效字节数，可对应检查轮次与重叠情况 |
+| `concurrent_batch_get_summary.json` | 流数、轮数、总字节数、窗口总时间、聚合吞吐、平均/p50 窗口时延、最大启动偏差以及全部流 Host 窗口存在交集的轮数 |
+
+终端输出 `BATCH_GET_CONCURRENT_SUMMARY`。其计算口径为：
+
+```text
+window_ns[round] = max(end_ns[flow]) - min(begin_ns[flow])
+aggregate_GBps[round] = sum(payload_bytes[flow]) / window_ns[round]
+aggregate_GBps[summary] = sum(all payload_bytes) / sum(window_ns[round])
+```
+
+字节/ns 等于十进制 GB/s。汇总使用总字节数除以窗口总时间，不把各流带宽或各流
+p50 带宽相加，也不对每轮带宽做简单平均。此指标是**排除轮间屏障的共同窗口有效吞吐**，
+并非包含整个测试墙钟时间的持续吞吐。
+
+所有进程在同一 Host 上使用 `time.monotonic_ns()`：起点在 Python 调用 BatchGet 前，
+终点在 `torch.npu.synchronize()` 返回后。因此时间包含 Host 提交和同步开销，不能
+与原来的 `kernel_total` 周期带宽混用。不能直接比较不同 NPU 的 kernel 周期绝对值。
+
+屏障协调 Host 提交，不保证多卡 READ 在硬件上同周期启动。脚本每轮预留 5 ms
+接收放行时间，此等待不计入窗口。检查 `max_start_skew_us` 和
+`all_flow_host_overlap_samples`；某轮 `host_overlap_ns=0` 表示没有全部流共同的
+Host 调用窗口，即使有交集也不能单凭它证明物理链路同时传输，需结合设备时间线或端口统计。
+某条流提前退出、漏报轮次或超时会终止整组，不生成成功的聚合汇总。
 
 ### 四张 NPU 分别访问四个 CPU service
 

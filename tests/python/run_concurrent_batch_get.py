@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Start two or more independent, single-shape BatchGet sweeps at a common ready time.
+"""Run two or more single-shape BatchGet sweeps with a barrier on every iteration.
 
 Each sweep owns all logs, tables and CSVs under output-dir/flowN.
-Only terminal lines get a flow prefix. Each worker prepares
-and warms up normally, then waits just before its first measured BatchGet.
+Only terminal lines get a flow prefix. Each worker prepares and warms up
+normally, then waits before and after every measured BatchGet. Common-window
+host throughput and raw timestamps are saved in the parent output directory.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import threading
 import time
 
 import test_npu_batch_get_perf as perf
+import batch_get_concurrency as concurrency
 from npu_eids import parse_npu_eids
 
 
@@ -52,6 +54,9 @@ CLI/environment overrides are kept.
 Select a fixed peer device; adaptive calibration is not part of this launcher.
 KVAF_REMOTE_CPU_PERF_TIMEOUT (default 600 seconds) also bounds startup/waiting.
 Existing flow output directories are refused to prevent overwriting results.
+All flows must use the same --iterations. Preparation, barrier waits and
+profile collection are outside the per-round host timing window. The parent
+directory receives concurrent_batch_get_{samples,flows}.csv and a summary JSON.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -131,6 +136,7 @@ def build_flow(args, name):
                KVAF_BATCH_GET_SWEEP_AIV_CORES=str(benchmark.aiv_cores),
                KVAF_BATCH_GET_SWEEP_JETTYS_PER_CORE=str(benchmark.jettys_per_core),
                KVAF_BATCH_GET_KERNEL_CLOCK_MHZ=str(benchmark.kernel_profile_clock_mhz),
+               KVAF_BATCH_GET_CONCURRENT_ITERATIONS=str(benchmark.iterations),
                KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=str(output),
                KVAF_BATCH_GET_MISS_SWEEP_CSV=str(output / "batch_get_miss_sweep_summary.csv"),
                KVAF_BATCH_GET_JETTY_SWEEP_CSV=str(output / "batch_get_jetty_summary.csv"))
@@ -166,8 +172,12 @@ def stop_processes(processes):
         process.wait()
 
 
-def run_flows(flows, timeout):
-    processes, readers, connections = [], [], []
+def run_flows(flows, timeout, output_dir=None):
+    counts = {env["KVAF_BATCH_GET_CONCURRENT_ITERATIONS"] for _, _, env in flows
+              if "KVAF_BATCH_GET_CONCURRENT_ITERATIONS" in env}
+    if len(counts) > 1:
+        raise ValueError("all flows must use the same --iterations for per-iteration synchronization")
+    processes, readers = [], []
     summaries = [[] for _ in flows]
     output_lock = threading.Lock()
     finished = False
@@ -212,44 +222,33 @@ def run_flows(flows, timeout):
                 emit(f"[launcher] {name} pid={process.pid} DEVICE_ID={env['DEVICE_ID']} "
                      f"KVAF_CPU_SERVICE_ADDR={service_addr}")
 
-            ready = set()
-            while len(ready) < len(flows):
+            def check_health():
                 for (name, _, _), process in zip(flows, processes):
                     if process.poll() is not None:
-                        raise RuntimeError(f"{name} exited before synchronized start (status={process.returncode})")
-                if time.monotonic() >= deadline:
-                    pending = ", ".join(name for token, name in tokens.items() if token not in ready)
-                    raise TimeoutError(f"waiting for {pending} to become ready")
-                try:
-                    connection, _ = listener.accept()
-                except socket.timeout:
-                    continue
-                connections.append(connection)
-                connection.settimeout(min(1.0, max(0.01, deadline - time.monotonic())))
-                with connection.makefile("rb") as request:
-                    token = request.readline(128).decode("ascii").strip()
-                if token not in tokens or token in ready:
-                    raise RuntimeError("invalid or duplicate start rendezvous")
-                ready.add(token)
-                emit(f"[launcher] {tokens[token]} ready")
+                        raise RuntimeError(f"{name} exited before all synchronized rounds completed "
+                                           f"(status={process.returncode})")
 
-            start_ns = time.monotonic_ns() + 200_000_000
-            for connection in connections:
-                connection.sendall(f"{start_ns}\n".encode("ascii"))
-                connection.close()
-            group = "both flows" if len(flows) == 2 else f"all {len(flows)} flows"
-            emit(f"[launcher] {group} ready; synchronized start scheduled")
-            # After release, each original benchmark runs its own iterations.
+            samples, measurements = concurrency.coordinate_rounds(
+                listener, tokens, check_health, deadline, emit)
+            devices = {name: env["DEVICE_ID"] for name, _, env in flows}
+            for row in measurements:
+                row["device_id"] = devices[row["flow"]]
+            # All measured rounds are complete; workers now produce their
+            # original per-flow profiles/CSVs and release device resources.
             while any(p.poll() is None for p in processes) or any(t.is_alive() for t in readers):
+                failure = next((p for p in processes if p.poll() not in (None, 0)), None)
+                if failure is not None:
+                    return failure.returncode if failure.returncode > 0 else 128 - failure.returncode
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"waiting for {len(flows)} sweeps to finish")
                 time.sleep(0.05)
-            finished = True
-            return next((p.returncode if p.returncode > 0 else 128 - p.returncode
+            code = next((p.returncode if p.returncode > 0 else 128 - p.returncode
                          for p in processes if p.returncode), 0)
+            if code == 0:
+                concurrency.report_results(samples, measurements, output_dir, emit)
+            finished = True
+            return code
         finally:
-            for connection in connections:
-                connection.close()
             if not finished:
                 stop_processes(processes)
             for reader in readers:
@@ -269,13 +268,18 @@ def main(argv=None):
         if timeout <= 0:
             raise ValueError("KVAF_REMOTE_CPU_PERF_TIMEOUT must be positive")
         flows = [build_flow(args, name) for name in args.flow_names]
+        if len({env["KVAF_BATCH_GET_CONCURRENT_ITERATIONS"] for _, _, env in flows}) != 1:
+            raise ValueError("all flows must use the same --iterations for per-iteration synchronization")
+        for filename in concurrency.REPORT_FILES:
+            if (args.output_dir / filename).exists():
+                raise ValueError(f"output already exists: {args.output_dir / filename}")
         for name, _, _ in flows:
             output = args.output_dir.resolve() / name
             if output.exists():
                 raise ValueError(f"output already exists: {output}")
         for name, _, _ in flows:
             (args.output_dir.resolve() / name).mkdir(parents=True, exist_ok=False)
-        return run_flows(flows, timeout)
+        return run_flows(flows, timeout, args.output_dir.resolve())
     except KeyboardInterrupt:
         print("[launcher] interrupted", flush=True)
         return 130
