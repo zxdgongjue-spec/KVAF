@@ -22,6 +22,7 @@ class ExecutionDispatcher final : public AccessOperator {
   Status Shutdown() override;
   Status PreparePut(const BatchPutExecutionOptions&) override;
   Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions&) override;
+  Status CancelPreparedPut() override;
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
   Status DrainGet() override;
@@ -43,6 +44,11 @@ class ExecutionDispatcher final : public AccessOperator {
   Status CheckGetStatus(std::optional<GetExecutionConfig>, void* stream);
   const ExecutionPolicy& policy() const { return policy_; }
  private:
+  PutExecutionContext* FindPutInstanceLocked(PutExecutionConfig) const;
+  Status PreparePutInstanceLocked(PutExecutionConfig, const BatchPutRequest*, const ExecutionWarmup&,
+                                  PutExecutionContext**, PutDispatchTiming* = nullptr);
+  Status PreparePutLocked(PutExecutionConfig, const BatchPutRequest&, const BatchPutExecutionOptions&);
+  Status ClosePutInstanceLocked(PutExecutionContext*);
   struct GetPreparationTiming {
     std::uint64_t context_ns{}, describe_ns{}, acquire_ns{}, bind_ns{}, warmup_ns{};
   };
@@ -62,12 +68,17 @@ class ExecutionDispatcher final : public AccessOperator {
   std::mutex put_mutex_, get_mutex_;
   ExecutionResourceManager resources_;
   std::unique_ptr<GetDispatchTrace> get_trace_;
-  std::unique_ptr<PutExecutionContext> pending_put_;
+  std::vector<std::unique_ptr<PutExecutionContext>> put_instances_;
+  PutExecutionContext* pending_put_{nullptr};
+  PutExecutionContext* prepared_put_{nullptr};
+  // Borrowed only between Prepare and Execute/Cancel, never through recovery.
+  const BatchPutRequest* prepared_request_{nullptr};
+  void* prepared_stream_{nullptr};
   std::uint64_t input_id_{0}, next_input_id_{1};
   PutInputOptions input_options_;
-  std::unique_ptr<PutExecutionContext> input_context_;
+  PutExecutionContext* input_context_{nullptr};
   // A failed Begin may still own a partially registered input until shutdown.
-  std::unique_ptr<PutExecutionContext> failed_input_context_;
+  PutExecutionContext* failed_input_context_{nullptr};
   std::vector<std::unique_ptr<GetExecutionContext>> get_instances_;
   GetExecutionContext* pending_get_{nullptr};
   std::uint64_t graph_id_{0}, next_graph_id_{1};

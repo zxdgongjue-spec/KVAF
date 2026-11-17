@@ -30,7 +30,7 @@ struct Counters {
   std::uint32_t requirement_padding{0}, warmed_capacity{0};
   std::atomic<bool> fail_initialize{false}, fail_close{false}, fail_drain{false};
   std::atomic<bool> fail_put{false}, fail_resolve{false}, fail_ack{false}, fail_get{false};
-  bool throw_get{false}, throw_put{false};
+  bool throw_get{false}, throw_put{false}, throw_warmup{false};
   std::atomic<bool> bad_order{false}, copied_metadata_ok{true};
   bool put_request_borrowed{false}, put_state_ok{true};
   const BatchPutRequest* expected_put_request{};
@@ -85,6 +85,7 @@ class Owner final : public ExecutionResourceOwner {
   }
   Status Warmup(const ExecutionWarmup& r) override {
     ++physical.counters.warmups;
+    if (physical.counters.throw_warmup) throw std::runtime_error("warmup interrupted");
     physical.counters.warmed_capacity = r.request_capacity;
     return Status::OK();
   }
@@ -325,6 +326,85 @@ void ResidentReferenceIsNotExecutionOccupancy() {
   CheckDestroyed(c);
 }
 
+void PutResidentReferenceIsNotExecutionOccupancy() {
+  Counters c;
+  c.capacity = 4;
+  ExecutionResourceManager manager;
+  CHECK(manager.Register(put, Factory(c)).ok());
+  CHECK(manager.Initialize(region).ok());
+  PutResourceReference resources, competing_reference;
+  CHECK(manager.PinPut({put, 5}, &resources).code() == StatusCode::kInvalidArgument);
+  CHECK(!resources && c.factories == 1 && c.initializes == 0);
+  CHECK(manager.PinPut({put, 4}, &resources).ok());
+  auto state = resources.view().CreateState();
+  CHECK(resources.view().Bind(state.get()).ok());
+  BatchPutRequest request;
+  request.keys = {41, 42};
+  std::uint32_t capacity{};
+  CHECK(resources.view().Describe(request, &capacity).ok() && capacity == 2);
+  CHECK(resources.view().ValidateCapacity(4).ok());
+  CHECK(resources.view().ValidateCapacity(5).code() == StatusCode::kInvalidArgument);
+  PutResourceRequirements requirements;
+  CHECK(manager.Describe(put, request, &requirements).code() == StatusCode::kBusy);
+  CHECK(manager.PinPut({put, 4}, &competing_reference).code() == StatusCode::kBusy);
+  PutResourceLease first, competing;
+  CHECK(resources.Acquire(&first).ok());
+  CHECK(resources.Acquire(&competing).code() == StatusCode::kBusy);
+  first = {};
+  CHECK(resources.Acquire(&competing).ok());
+  competing = {};
+  PutResourceReference moved(std::move(resources));
+  CHECK(!resources && moved);
+  resources = std::move(moved);
+  CHECK(resources && !moved);
+  CHECK(c.state_creates == 1 && c.binds == 1 && c.initializes == 1);
+  CHECK(manager.AcquirePut({put, 4}, &competing).code() == StatusCode::kBusy);
+  CHECK(manager.Recover(put).code() == StatusCode::kBusy);
+  CHECK(manager.Shutdown().code() == StatusCode::kBusy);
+  CHECK(c.closes == 0 && c.live_states == 1);
+  CHECK(resources.Acquire(&competing).code() == StatusCode::kNotInitialized);
+  CHECK(manager.Close(resources).ok());
+  CHECK(resources.Acquire(&competing).code() == StatusCode::kNotInitialized);
+  CHECK(c.close_with_state == 1 && c.operators == 1 && c.live_states == 1);
+  CHECK(resources.view().Bind(nullptr).ok());
+  state.reset();
+  resources = {};
+  CHECK(manager.Shutdown().ok());
+  CheckDestroyed(c);
+}
+
+void FailedPutResidentCloseKeepsStateAndOwner() {
+  Counters c;
+  ExecutionResourceManager manager;
+  CHECK(manager.Register(put, Factory(c)).ok());
+  CHECK(manager.Initialize(region).ok());
+  PutResourceReference resources;
+  CHECK(manager.PinPut({put, 1}, &resources).ok());
+  auto state = resources.view().CreateState();
+  CHECK(resources.view().Bind(state.get()).ok());
+  PutResourceLease lease, competing;
+  CHECK(resources.Acquire(&lease).ok());
+  c.fail_close = true;
+  CHECK(manager.Close(resources).code() == StatusCode::kCompletionUnknown);
+  CHECK(resources && lease && c.live_states == 1 && c.owners == 1 && c.operators == 1);
+  CHECK(resources.Acquire(&competing).code() == StatusCode::kNotInitialized);
+  CHECK(manager.Recover(put).code() == StatusCode::kBusy);
+  c.fail_close = false;
+  CHECK(manager.Close(resources).ok());
+  CHECK(c.close_with_state == 2 && c.live_states == 1 && c.owners == 1);
+  CHECK(resources.view().Bind(nullptr).ok());
+  state.reset();
+  resources = {};
+  // Successful close does not destroy the borrowed operator while the last
+  // execution lease still refers to it, even after the resident state retires.
+  CHECK(c.operators == 1 && c.owners == 1 && c.live_states == 0);
+  lease = {};
+  CHECK(manager.Shutdown().ok());
+  CheckDestroyed(c);
+  CHECK(c.events == std::vector<std::string>({"owner closed", "state destroyed",
+                                           "operator destroyed", "owner destroyed"}));
+}
+
 void ResidentContextReusesPreparationAndRetiresRequest() {
   Counters p, g;
   g.capacity = 8;
@@ -508,6 +588,52 @@ void FailedCloseMustNotReplaceLiveOwner() {
   CheckDestroyed(c);
 }
 
+void PutPreparationOccupancyAndFailedClose() {
+  Counters p, g;
+  ExecutionDispatcher dispatch(Policy());
+  Register(dispatch, p, g);
+  char data[64]{};
+  BatchPutRequest request{{42}, {data, sizeof(data), DeviceKind::kCpu}, {0}, {64}};
+  BatchPutRequest different = request;
+  PutAccessDesc destination{{{42, 4096, 64}}};
+  CHECK(dispatch.PreparePut(request, {}).ok());
+  CHECK(dispatch.PreparePut(different, {}).code() == StatusCode::kBusy);
+  CHECK(dispatch.Warmup(put).code() == StatusCode::kBusy);
+  CHECK(dispatch.Recover(put).code() == StatusCode::kBusy);
+  CHECK(dispatch.ExecuteBatchPut({&different, &destination, {}}).code() == StatusCode::kInvalidArgument);
+  CHECK(p.put_launches == 0 && p.state_creates == 1 && p.binds == 1);
+  CHECK(dispatch.CancelPreparedPut().ok());
+  CHECK(dispatch.CancelPreparedPut().ok());
+  CHECK(dispatch.PreparePut(request, {}).ok());
+  CHECK(dispatch.ExecuteBatchPut({&request, &destination, {}}).ok());
+  // Cancellation after submission must not release the transaction's lease.
+  CHECK(dispatch.CancelPreparedPut().ok());
+  CHECK(dispatch.Warmup(put).code() == StatusCode::kBusy);
+  CHECK(dispatch.AcknowledgePut().ok());
+  CHECK(p.state_creates == 1 && p.binds == 1 && p.warmups == 1);
+  p.fail_close = true;
+  CHECK(!dispatch.Shutdown().ok());
+  CHECK(p.live_states == 1 && p.owners == 1 && p.close_with_state > 0);
+  p.fail_close = false;
+  CHECK(dispatch.Shutdown().ok());
+  CheckDestroyed(p); CheckDestroyed(g);
+}
+void PutWarmupFailureKeepsResidentButReturnsOccupancy() {
+  Counters p, g;
+  ExecutionDispatcher dispatch(Policy());
+  Register(dispatch, p, g);
+  auto* stream = reinterpret_cast<void*>(1);
+  CHECK(dispatch.Warmup(put, {1, stream}).ok());
+  p.throw_warmup = true;
+  CHECK(!dispatch.Warmup(put, {2, stream}).ok());
+  p.throw_warmup = false;
+  CHECK(dispatch.Warmup(put, {1, stream}).ok());
+  CHECK(p.warmups == 3 && p.state_creates == 1 && p.binds == 1);
+  CHECK(dispatch.Warmup(put, {1, stream}).ok());
+  CHECK(p.warmups == 3);
+  CHECK(dispatch.Shutdown().ok());
+  CheckDestroyed(p); CheckDestroyed(g);
+}
 void PutStateSurvivesResolutionAndAcknowledgementFailure(bool throw_put) {
   Counters p, g;
   ExecutionDispatcher dispatch(Policy());
@@ -545,7 +671,9 @@ void PutStateSurvivesResolutionAndAcknowledgementFailure(bool throw_put) {
   CHECK(p.live_states == 1 && p.owners == 1 && p.put_state_ok);
   p.fail_ack = false;
   CHECK(dispatch.AcknowledgePut().ok());
-  CHECK(p.live_states == 0 && p.owners == 1 && p.state_destroys == 1 && p.put_state_ok);
+  CHECK(p.live_states == 1 && p.owners == 1 && p.state_destroys == 0 && p.put_state_ok);
+  // Completion returns execution occupancy, retaining the same bound state.
+  CHECK(dispatch.Warmup(put).ok() && p.state_creates == 1 && p.binds == 1);
   CHECK(dispatch.Shutdown().ok());
   CheckDestroyed(p); CheckDestroyed(g);
 }
@@ -602,12 +730,16 @@ int main() {
     DescriptionBeforeAllocation();
     ExclusiveLeaseAndIndependentOwner();
     ResidentReferenceIsNotExecutionOccupancy();
+    PutResidentReferenceIsNotExecutionOccupancy();
+    FailedPutResidentCloseKeepsStateAndOwner();
     ResidentContextReusesPreparationAndRetiresRequest();
     FailedResidentCloseRetainsOnlyAffectedInstance();
     ConcurrentFirstUseAndDirectionIsolation();
     CapacityFailureDoesNotPoisonResources();
     FailedInitializationRequiresExplicitRecovery();
     FailedCloseMustNotReplaceLiveOwner();
+    PutPreparationOccupancyAndFailedClose();
+    PutWarmupFailureKeepsResidentButReturnsOccupancy();
     PutStateSurvivesResolutionAndAcknowledgementFailure(false);
     PutStateSurvivesResolutionAndAcknowledgementFailure(true);
     GetFailureRetainsCopiedContextThroughShutdown(false);

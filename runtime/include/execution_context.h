@@ -4,24 +4,36 @@
 #include "meta_manager.h"
 
 namespace kvaf {
-// A Put context retains only resources and completion state through the metadata
-// transaction decision. Request vectors are borrowed during Launch, never kept
+// One resident instance per Put configuration. Only the execution lease and
+// completion state last through the metadata transaction. Request vectors are
+// borrowed during Launch, never kept
 // for recovery; providers stage any asynchronous metadata in their own storage.
 // Buffer storage remains governed by the public C++/Python ownership contract.
 struct PutExecutionContext {
+  PutResourceReference resources;
   PutResourceLease lease;
   PutExecutionConfig config;
   std::unique_ptr<ExecutionState> state;
   PutCompletion completion;
   bool launched{false};
   bool bound{false};
+  bool cleanup_only{false};
+  bool warmed{false};
+  std::uint32_t warmed_request_capacity{0}, warmed_capacity{0};
+  void* warmed_stream{nullptr};
+  PutResourceView view() const { return resources ? resources.view() : lease.view(); }
   Status Bind() {
-    state = lease.view().CreateState();
-    auto s = lease.view().Bind(state.get());
+    state = view().CreateState();
+    auto s = view().Bind(state.get());
     bound = s.ok();
     return s;
   }
-  ~PutExecutionContext() { if (bound) (void)lease.view().Bind(nullptr); }
+  ~PutExecutionContext() { if (bound) (void)view().Bind(nullptr); }
+  void ClearExecution() {
+    completion = {};
+    launched = false;
+    lease = {};
+  }
 };
 // One resident instance per Get configuration. The reference and state survive
 // completion; lease/request/table/options belong only to current execution.

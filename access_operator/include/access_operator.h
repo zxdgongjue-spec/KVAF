@@ -85,6 +85,10 @@ class AccessOperator {
   virtual Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions& options) {
     return PreparePut(options);
   }
+  // Cancel only an unsubmitted PreparePut reservation. Keep resident resources,
+  // and leave submitted/pending execution and its acknowledgement untouched.
+  // Idempotent and host-only: Runtime also calls this after Execute consumed it.
+  virtual Status CancelPreparedPut() { return Status::OK(); }
   virtual Status Warmup(const ExecutionWarmup&) { return Status::OK(); }
   virtual Status PreparePutInput(const PutInputOptions&) {
     return Status::NotImplemented("provider does not support reusable input bindings");

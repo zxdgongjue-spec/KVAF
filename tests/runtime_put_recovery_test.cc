@@ -22,11 +22,15 @@ constexpr PutExecutionConfig other{Transport::Urma, Executor::Aicpu};
 
 class FaultMeta final : public MetaManager {
  public:
-  int fail_commit{0}, fail_abort{0}, commits{0}, aborts{0};
+  int fail_prepare{0}, fail_commit{0}, fail_abort{0}, prepares{0}, commits{0}, aborts{0};
+  bool throw_prepare{false};
   std::unique_ptr<MetaManager> real = CreateInMemoryMetaManager();
   Status RegisterRemoteRegion(const RemoteRegionDesc& r) override { return real->RegisterRemoteRegion(r); }
   Status PreparePut(const std::vector<KeyId>& keys, const std::vector<std::uint64_t>& lengths,
                     PutContext* txn, PutAccessDesc* desc) override {
+    ++prepares;
+    if (throw_prepare) throw std::runtime_error("injected metadata preparation exception");
+    if (fail_prepare) { --fail_prepare; return Status::OutOfMemory("injected metadata preparation failure"); }
     return real->PreparePut(keys, lengths, txn, desc);
   }
   Status CommitPut(const PutContext& txn) override {
@@ -54,11 +58,17 @@ struct ProviderState {
   PutCompletion completion;
   int launches{0}, resolves{0}, fail_ack{0};
   int input_setups{0}, input_finishes{0}, states{0}, prepares{0};
+  int binds{0}, describes{0}, warmups{0};
+  int launched_state{0}, resolved_state{0}, acknowledged_state{0};
   bool fail_input_setup{false}, fail_input_finish{false};
   bool fail_shutdown{false};
   bool throw_after_submit{false};
   bool fail_bind{false};
   bool throw_bind{false};
+};
+struct ProviderInvocation final : ExecutionState {
+  explicit ProviderInvocation(int value) : id(value) {}
+  int id;
 };
 class Provider final : public AccessOperator {
  public:
@@ -68,11 +78,26 @@ class Provider final : public AccessOperator {
     return state_.fail_shutdown ? Status::CompletionUnknown("DMA still active") : Status::OK();
   }
   Status ExecuteBatchGet(const BatchGetExecRequest&) override { return Status::OK(); }
-  Status BindExecutionState(ExecutionState*) override {
+  Status BindExecutionState(ExecutionState* state) override {
+    if (!state) { active_ = nullptr; return Status::OK(); }
     if (state_.throw_bind) throw std::runtime_error("injected state binding exception");
-    return state_.fail_bind ? Status::Internal("injected state binding failure") : Status::OK();
+    if (state_.fail_bind) return Status::Internal("injected state binding failure");
+    active_ = dynamic_cast<ProviderInvocation*>(state);
+    CHECK(active_);
+    ++state_.binds;
+    return Status::OK();
   }
-  std::unique_ptr<ExecutionState> CreateExecutionState() override { ++state_.states; return {}; }
+  std::unique_ptr<ExecutionState> CreateExecutionState() override {
+    return std::make_unique<ProviderInvocation>(++state_.states);
+  }
+  Status DescribeRequirements(const BatchPutRequest& request, std::uint32_t* capacity) const override {
+    ++state_.describes;
+    return AccessOperator::DescribeRequirements(request, capacity);
+  }
+  Status Warmup(const ExecutionWarmup&) override {
+    ++state_.warmups;
+    return Status::OK();
+  }
   Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions&) override {
     ++state_.prepares;
     return Status::OK();
@@ -86,6 +111,8 @@ class Provider final : public AccessOperator {
     return state_.fail_input_finish ? Status::Internal("injected input finish failure") : Status::OK();
   }
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override {
+    CHECK(active_);
+    state_.launched_state = active_->id;
     ++state_.launches;
     if (auto* t = request.execution.host_timing) {
       t->transport = "urma"; t->executor = "aiv";
@@ -100,16 +127,21 @@ class Provider final : public AccessOperator {
     return state_.launch;
   }
   Status ResolvePut(PutCompletion* completion) override {
+    CHECK(active_);
+    state_.resolved_state = active_->id;
     ++state_.resolves;
     *completion = state_.completion;
     return Status::OK();
   }
   Status AcknowledgePut() override {
+    CHECK(active_);
+    state_.acknowledged_state = active_->id;
     if (state_.fail_ack) { --state_.fail_ack; return Status::Internal("injected acknowledgement failure"); }
     return Status::OK();
   }
  private:
   ProviderState& state_;
+  ProviderInvocation* active_{nullptr};
 };
 
 ExecutionPolicy Policy() {
@@ -118,6 +150,142 @@ ExecutionPolicy Policy() {
   policy.enabled_get_configs = std::vector<GetExecutionConfig>{};
   return policy;
 }
+
+void CheckRuntimePreparationGuard() {
+  class PreparationProbe final : public AccessOperator {
+   public:
+    bool reserved{false};
+    int cancellations{0}, launches{0};
+    Status Initialize(const RemoteRegionDesc&) override { return Status::OK(); }
+    Status Shutdown() override { CHECK(!reserved); return Status::OK(); }
+    Status PreparePut(const BatchPutRequest&, const BatchPutExecutionOptions&) override {
+      CHECK(!reserved);
+      reserved = true;
+      return Status::OK();
+    }
+    Status CancelPreparedPut() override {
+      if (reserved) { reserved = false; ++cancellations; }
+      return Status::OK();
+    }
+    Status ExecuteBatchPut(const BatchPutExecRequest&) override {
+      CHECK(reserved);
+      ++launches;
+      // A rejection before accepting the launch leaves preparation to Runtime.
+      return Status::InvalidArgument("injected rejection before submission");
+    }
+    Status ExecuteBatchGet(const BatchGetExecRequest&) override { return Status::OK(); }
+  } provider;
+  FaultMeta meta;
+  auto allocator = CreateHostDdrMemoryAllocator();
+  RuntimeCore runtime(meta, provider, *allocator);
+  CHECK(runtime.Initialize({256, 16, DeviceKind::kCpu}).ok());
+  char payload[16]{};
+  const BatchPutRequest request{{0}, {payload, 16, DeviceKind::kCpu}, {0}, {16}};
+  meta.fail_prepare = 1;
+  CHECK(runtime.BatchPut(request).code() == StatusCode::kOutOfMemory);
+  CHECK(!provider.reserved && provider.cancellations == 1 && provider.launches == 0);
+  CHECK(!runtime.HasPendingPut() && meta.aborts == 0);
+
+  meta.throw_prepare = true;
+  bool threw = false;
+  try { (void)runtime.BatchPut(request); }
+  catch (const std::runtime_error&) { threw = true; }
+  CHECK(threw && !provider.reserved && provider.cancellations == 2 && provider.launches == 0);
+  CHECK(!runtime.HasPendingPut() && meta.aborts == 0);
+  meta.throw_prepare = false;
+
+  CHECK(runtime.BatchPut(request).code() == StatusCode::kInvalidArgument);
+  CHECK(!provider.reserved && provider.cancellations == 3 && provider.launches == 1);
+  CHECK(!runtime.HasPendingPut() && meta.aborts == 1);
+  CHECK(runtime.Shutdown().ok());
+}
+
+void CheckResidentPutInstances() {
+  FaultMeta meta;
+  ProviderState state, alternate;
+  auto allocator = CreateHostDdrMemoryAllocator();
+  ExecutionDispatcher dispatch(Policy());
+  CHECK(dispatch.RegisterPut(put, [&] { return std::make_unique<Provider>(state); }).ok());
+  CHECK(dispatch.RegisterPut(other, [&] { return std::make_unique<Provider>(alternate); }).ok());
+  RuntimeCore runtime(meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({512, 16, DeviceKind::kCpu}).ok());
+  char payload[32]{};
+  void* stream = reinterpret_cast<void*>(1);
+  auto write = [&](KeyId key, PutExecutionConfig config, void* on_stream) {
+    return runtime.BatchPut({{key}, {payload, sizeof(payload), DeviceKind::kCpu}, {0}, {16}},
+                            {on_stream, config});
+  };
+  CHECK(write(0, put, stream).ok());
+  CHECK(state.states == 1 && state.binds == 1 && state.describes == 1 && state.warmups == 1);
+  CHECK(write(1, put, stream).ok());
+  CHECK(write(2, other, stream).ok());
+  CHECK(write(3, put, stream).ok());
+  CHECK(state.states == 1 && state.binds == 1 && state.describes == 1 && state.warmups == 1);
+  CHECK(alternate.states == 1 && alternate.binds == 1);
+  CHECK(state.launched_state == 1 && state.acknowledged_state == 1);
+
+  // Growing capacity and changing stream may prepare resources again, but must
+  // retain the invocation state rather than rebind an unrelated context.
+  CHECK(runtime.BatchPut({{4, 5}, {payload, sizeof(payload), DeviceKind::kCpu}, {0, 16}, {16, 16}},
+                         {stream, put}).ok());
+  CHECK(write(6, put, reinterpret_cast<void*>(2)).ok());
+  CHECK(state.states == 1 && state.binds == 1 && state.warmups > 1);
+
+  // An input lease temporarily uses the already resident algorithm instance.
+  const PutInputOptions input{{payload, sizeof(payload), DeviceKind::kNpu}, stream, 2};
+  std::uint64_t id{};
+  CHECK(runtime.BeginPutInput(put, input, &id).ok());
+  CHECK(runtime.BatchPut({{7}, input.input, {0}, {16}}, {stream, put, id}).ok());
+  CHECK(runtime.EndPutInput(id).ok());
+  CHECK(write(8, put, stream).ok());
+  CHECK(state.states == 1 && state.binds == 1 && state.input_setups == 1 && state.input_finishes == 1);
+
+  CHECK(runtime.RecoverPut(other).ok());
+  CHECK(write(9, other, stream).ok());
+  CHECK(alternate.states == 2 && alternate.binds == 2);
+  CHECK(write(10, put, stream).ok() && state.states == 1 && state.binds == 1);
+  CHECK(runtime.Shutdown().ok());
+}
+
+void CheckMetadataPreparationCancellation() {
+  FaultMeta meta;
+  ProviderState state, alternate;
+  auto allocator = CreateHostDdrMemoryAllocator();
+  ExecutionDispatcher dispatch(Policy());
+  CHECK(dispatch.RegisterPut(put, [&] { return std::make_unique<Provider>(state); }).ok());
+  CHECK(dispatch.RegisterPut(other, [&] { return std::make_unique<Provider>(alternate); }).ok());
+  RuntimeCore runtime(meta, dispatch, *allocator);
+  CHECK(runtime.Initialize({256, 16, DeviceKind::kCpu}).ok());
+  char payload[32]{};
+  void* stream = reinterpret_cast<void*>(1);
+  auto write = [&](KeyId key, PutExecutionConfig config = put, std::uint64_t bytes = 16) {
+    return runtime.BatchPut({{key}, {payload, sizeof(payload), DeviceKind::kCpu}, {0}, {bytes}},
+                            {stream, config});
+  };
+  CHECK(write(0).ok());
+  CHECK(write(0).code() == StatusCode::kAlreadyExists);
+  CHECK(!runtime.HasPendingPut() && state.launches == 1 && meta.aborts == 0);
+  CHECK(write(1, other).ok());
+  CHECK(write(16).code() == StatusCode::kInvalidArgument);
+  CHECK(!runtime.HasPendingPut() && write(2).ok());
+  CHECK(write(3, put, 32).code() == StatusCode::kInvalidArgument);
+  CHECK(!runtime.HasPendingPut() && write(3).ok());
+  meta.fail_prepare = 1;
+  CHECK(write(4).code() == StatusCode::kOutOfMemory);
+  CHECK(!runtime.HasPendingPut() && write(4).ok());
+  meta.throw_prepare = true;
+  bool threw = false;
+  try { (void)write(5); }
+  catch (const std::runtime_error&) { threw = true; }
+  CHECK(threw && !runtime.HasPendingPut());
+  meta.throw_prepare = false;
+  CHECK(write(5).ok());
+  CHECK(state.states == 1 && state.binds == 1 && state.launches == 5);
+  CHECK(alternate.states == 1 && alternate.binds == 1 && alternate.launches == 1);
+  CHECK(meta.aborts == 0 && meta.commits == 6);
+  CHECK(runtime.Shutdown().ok());
+}
+
 void CheckOnlineRecovery() {
   FaultMeta meta;
   ProviderState state, unrelated;
@@ -182,6 +350,8 @@ void CheckOnlineRecovery() {
   const auto commits = meta.commits;
   CHECK(runtime.RecoverPut(put).ok() && !runtime.HasPendingPut());
   CHECK(meta.commits == commits && state.launches == 6);
+  CHECK(state.states == 1 && state.binds == 1);
+  CHECK(state.launched_state == 1 && state.resolved_state == 1 && state.acknowledged_state == 1);
 
   state.launch = Status::CompletionUnknown("pending until teardown");
   CHECK(!write(5).ok());
@@ -237,14 +407,14 @@ void CheckPreparationFailure(bool throw_bind) {
   const BatchPutRequest request{{0}, {payload, 16, DeviceKind::kCpu}, {0}, {16}};
   state.fail_bind = !throw_bind;
   state.throw_bind = throw_bind;
-  meta.fail_abort = 1;
   CHECK(!runtime.BatchPut(request).ok());
-  CHECK(runtime.HasPendingPut() && state.launches == 0);
-  CHECK(!runtime.RecoverPut(other).ok() && runtime.HasPendingPut());
-  CHECK(!runtime.RecoverPut(put).ok());  // Original bind failure is reported.
+  // Binding now precedes MetaManager::PreparePut: there is no transaction to
+  // abort, or original DMA to resolve, after a failed/throwing bind.
+  CHECK(!runtime.HasPendingPut() && meta.prepares == 0 && meta.aborts == 0 && meta.commits == 0);
   CHECK(!runtime.HasPendingPut() && state.launches == 0 && state.resolves == 0);
   state.fail_bind = false;
   state.throw_bind = false;
+  CHECK(runtime.RecoverPut(put).ok());
   CHECK(runtime.BatchPut(request).ok());
   CHECK(state.launches == 1 && runtime.Shutdown().ok());
 }
@@ -280,7 +450,9 @@ void CheckInputBinding(PutExecutionConfig config = put) {
   rejected({{0}, binding.input, {0}, {16}}, {stream, config, 0});
   CHECK(!dispatch.Warmup(config).ok() && !runtime.RecoverPut(config).ok());
   CHECK(write(0).ok() && write(1).ok());
-  CHECK(state.states == 1 && state.input_setups == 1 && state.input_finishes == 0);
+  CHECK(state.states == 1 && state.binds == 1 && state.input_setups == 1 && state.input_finishes == 0);
+  CHECK(write(0).code() == StatusCode::kAlreadyExists && !runtime.HasPendingPut());
+  CHECK(state.launches == 2);  // Metadata rejection also cancels bound preparation.
 
   // Both unknown completion and metadata errors retain the same bound context.
   state.launch = Status::CompletionUnknown("unknown completion");
@@ -308,7 +480,7 @@ void CheckInputBinding(PutExecutionConfig config = put) {
   rejected({{6}, binding.input, {0}, {16}}, {stream, config, id});
   const auto previous_id = id;
   CHECK(runtime.BeginPutInput(config, binding, &id).ok() && id != previous_id);
-  CHECK(write(6).ok() && state.states == 2);
+  CHECK(write(6).ok() && state.states == 1 && state.binds == 1);
   state.fail_shutdown = true;
   CHECK(!runtime.Shutdown().ok());
   state.fail_shutdown = false;
@@ -368,7 +540,9 @@ void CheckPutTrace() {
     CHECK(fields[column("path")] == "input");
     CHECK(fields[column("provider_registration_ns")] == "2");
     CHECK(fields[column("provider_prepare_ns")] == "5");
-    CHECK(fields[column("acquire_ns")] == "0" && fields[column("bind_ns")] == "0");
+    // A bound input keeps its resident reference; each transaction still takes
+    // a short execution lease, without describing or binding another state.
+    CHECK(fields[column("describe_ns")] == "0" && fields[column("bind_ns")] == "0");
     CHECK(std::stoull(fields[column("provider_ns")]) > 0);
     ++success;
   }
@@ -379,6 +553,9 @@ void CheckPutTrace() {
 }
 
 int main() {
+  CheckRuntimePreparationGuard();
+  CheckResidentPutInstances();
+  CheckMetadataPreparationCancellation();
   CheckOnlineRecovery();
   CheckInputBinding();
   CheckInputBinding(other);

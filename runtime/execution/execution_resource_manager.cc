@@ -65,6 +65,31 @@ void ResourceLease::Reset() {
     if (record->state == detail::ResourceState::Closed && !record->resident_refs) record->Reset();
   }
 }
+PutResourceReference::~PutResourceReference() { Reset(); }
+PutResourceReference& PutResourceReference::operator=(PutResourceReference&& other) noexcept {
+  if (this != &other) { Reset(); record_ = std::move(other.record_); }
+  return *this;
+}
+void PutResourceReference::Reset() {
+  if (!record_) return;
+  auto record = std::move(record_);
+  std::lock_guard<std::mutex> lock(record->mutex);
+  --record->resident_refs;
+  if (!record->resident_refs && !record->leased && record->state == detail::ResourceState::Closed)
+    record->Reset();
+}
+Status PutResourceReference::Acquire(PutResourceLease* out) const {
+  if (!record_ || !out || *out) return Status::InvalidArgument("Put execution lease must be empty");
+  std::lock_guard<std::mutex> lock(record_->mutex);
+  if (!record_->accepting_work) return Status::NotInitialized("Put resources are closing");
+  if (!record_->failure.ok()) return record_->failure;
+  if (record_->state != detail::ResourceState::Ready)
+    return Status::InvalidState("resident Put resources are not ready");
+  if (record_->leased) return Status::Busy("Put resources are already executing");
+  record_->leased = true;
+  out->record_ = record_;
+  return Status::OK();
+}
 GetResourceReference::~GetResourceReference() { Reset(); }
 GetResourceReference& GetResourceReference::operator=(GetResourceReference&& other) noexcept {
   if (this != &other) { Reset(); record_ = std::move(other.record_); }
@@ -185,6 +210,22 @@ Status ExecutionResourceManager::AcquirePut(const PutResourceRequirements& r, Pu
 Status ExecutionResourceManager::AcquireGet(const GetResourceRequirements& r, GetResourceLease* out) {
   return Acquire(gets_, r.config, r.capacity, out);
 }
+Status ExecutionResourceManager::PinPut(const PutResourceRequirements& r, PutResourceReference* out) {
+  if (!out || *out) return Status::InvalidArgument("Put resource reference must be empty");
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  if (!ready_) return Status::NotInitialized("resource manager is not accepting work");
+  auto record = Find(puts_, r.config);
+  if (!record) return Status::NotImplemented("execution provider is unavailable");
+  std::lock_guard<std::mutex> lock(record->mutex);
+  if (record->leased || record->resident_refs) return Status::Busy("Put resources already have an owner");
+  auto s = record->Create();
+  if (s.ok()) s = record->operation->ValidateRequestCapacity(r.capacity);
+  if (s.ok()) s = record->Initialize(region_);
+  if (!s.ok()) return s;
+  ++record->resident_refs;
+  out->record_ = std::move(record);
+  return Status::OK();
+}
 Status ExecutionResourceManager::PinGet(const GetResourceRequirements& r, GetResourceReference* out) {
   if (!out || *out) return Status::InvalidArgument("Get resource reference must be empty");
   std::shared_lock<std::shared_mutex> life(lifecycle_);
@@ -224,6 +265,12 @@ Status ExecutionResourceManager::Close(ResourceLease& lease) {
 }
 Status ExecutionResourceManager::Close(PutResourceLease& lease) { return Close(static_cast<ResourceLease&>(lease)); }
 Status ExecutionResourceManager::Close(GetResourceLease& lease) { return Close(static_cast<ResourceLease&>(lease)); }
+Status ExecutionResourceManager::Close(PutResourceReference& reference) {
+  if (!reference) return Status::OK();
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(reference.record_->mutex);
+  return reference.record_->Close();
+}
 Status ExecutionResourceManager::Close(GetResourceReference& reference) {
   if (!reference) return Status::OK();
   std::shared_lock<std::shared_mutex> life(lifecycle_);

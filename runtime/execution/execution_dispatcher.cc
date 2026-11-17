@@ -98,9 +98,7 @@ ExecutionDispatcher::ExecutionDispatcher(ExecutionPolicy policy) : policy_(std::
 ExecutionDispatcher::~ExecutionDispatcher() {
   if (!Shutdown().ok()) {
     // Retain invocation state as well as the resource lease after unsafe close.
-    (void)pending_put_.release();
-    (void)input_context_.release();
-    (void)failed_input_context_.release();
+    for (auto& instance : put_instances_) (void)instance.release();
     for (auto& instance : get_instances_) (void)instance.release();
   }
 }
@@ -144,17 +142,140 @@ Status ExecutionDispatcher::ValidateInputLocked(const BatchPutRequest& request,
     return Status::InvalidArgument("request differs from bound Put input/stream/capacity");
   return Status::OK();
 }
+PutExecutionContext* ExecutionDispatcher::FindPutInstanceLocked(PutExecutionConfig c) const {
+  for (const auto& instance : put_instances_)
+    if (instance->config == c) return instance.get();
+  return nullptr;
+}
+Status ExecutionDispatcher::ClosePutInstanceLocked(PutExecutionContext* instance) {
+  auto s = resources_.Close(instance->resources);
+  if (!s.ok()) { instance->cleanup_only = true; return s; }
+  if (pending_put_ == instance) pending_put_ = nullptr;
+  if (prepared_put_ == instance) {
+    prepared_put_ = nullptr;
+    prepared_request_ = nullptr;
+    prepared_stream_ = nullptr;
+  }
+  if (input_context_ == instance) {
+    input_context_ = nullptr;
+    input_id_ = 0;
+    input_options_ = {};
+  }
+  if (failed_input_context_ == instance) failed_input_context_ = nullptr;
+  put_instances_.erase(std::remove_if(put_instances_.begin(), put_instances_.end(),
+      [instance](const auto& entry) { return entry.get() == instance; }), put_instances_.end());
+  return Status::OK();
+}
+Status ExecutionDispatcher::PreparePutInstanceLocked(PutExecutionConfig config,
+    const BatchPutRequest* request, const ExecutionWarmup& warmup,
+    PutExecutionContext** out, PutDispatchTiming* timing) {
+  PutExecutionContext* instance;
+  {
+    PutDispatchPhase phase(timing, &PutDispatchTiming::context_ns);
+    instance = FindPutInstanceLocked(config);
+  }
+  if (instance && instance->cleanup_only) return Status::Busy("Put instance requires recovery or shutdown");
+  const bool prepare = !instance || !instance->warmed ||
+      instance->warmed_stream != warmup.stream ||
+      instance->warmed_request_capacity < warmup.request_capacity;
+  std::uint32_t capacity = warmup.request_capacity;
+  Status s;
+  if (prepare) {
+    PutDispatchPhase phase(timing, &PutDispatchTiming::describe_ns);
+    if (request) {
+      if (instance) s = instance->view().Describe(*request, &capacity);
+      else {
+        PutResourceRequirements requirements;
+        s = resources_.Describe(config, *request, &requirements);
+        if (s.ok()) capacity = requirements.capacity;
+      }
+    } else if (instance) s = instance->view().ValidateCapacity(capacity);
+    if (!s.ok()) return s;
+  }
+  if (!instance) {
+    auto created = std::make_unique<PutExecutionContext>();
+    created->config = config;
+    {
+      PutDispatchPhase phase(timing, &PutDispatchTiming::acquire_ns);
+      s = resources_.PinPut({config, capacity}, &created->resources);
+    }
+    if (!s.ok()) return s;
+    instance = created.get();
+    put_instances_.push_back(std::move(created));
+    {
+      PutDispatchPhase phase(timing, &PutDispatchTiming::bind_ns);
+      try { s = instance->Bind(); }
+      catch (const std::exception& e) { s = Status::Internal(std::string("Put state creation failed: ") + e.what()); }
+      catch (...) { s = Status::Internal("Put state creation failed"); }
+    }
+    if (!s.ok()) { (void)ClosePutInstanceLocked(instance); return s; }
+  }
+  {
+    PutDispatchPhase phase(timing, &PutDispatchTiming::acquire_ns);
+    s = instance->resources.Acquire(&instance->lease);
+  }
+  if (!s.ok()) return s;
+  if (prepare) {
+    capacity = std::max(capacity, instance->warmed_capacity);
+    // A failed warmup can have changed internal staging, so a retry must warm
+    // again even when it returns to the previously successful capacity/stream.
+    instance->warmed = false;
+    try { s = instance->view().Warmup({capacity, warmup.stream}); }
+    catch (const std::exception& e) { s = Status::Internal(std::string("Put warmup failed: ") + e.what()); }
+    catch (...) { s = Status::Internal("Put warmup failed"); }
+    if (!s.ok()) { instance->ClearExecution(); return s; }
+    instance->warmed = true;
+    instance->warmed_capacity = capacity;
+    instance->warmed_request_capacity = std::max(instance->warmed_request_capacity, warmup.request_capacity);
+    instance->warmed_stream = warmup.stream;
+  }
+  *out = instance;
+  return Status::OK();
+}
+Status ExecutionDispatcher::PreparePutLocked(PutExecutionConfig config,
+    const BatchPutRequest& request, const BatchPutExecutionOptions& options) {
+  if (request.keys.size() > std::numeric_limits<std::uint32_t>::max())
+    return Status::InvalidArgument("invalid Put request capacity");
+  PutExecutionContext* instance = nullptr;
+  Status s;
+  try {
+    if (input_id_) {
+      instance = input_context_;
+      PutDispatchPhase phase(options.dispatch_timing, &PutDispatchTiming::acquire_ns);
+      s = instance->resources.Acquire(&instance->lease);
+    } else {
+      s = PreparePutInstanceLocked(config, &request,
+          {static_cast<std::uint32_t>(request.keys.size()), options.stream}, &instance,
+          options.dispatch_timing);
+    }
+    // Per-request provider validation remains separate from cached capacity and
+    // state preparation. This must not submit work or retain application input.
+    if (s.ok()) s = instance->view().PrepareBound(request, options);
+  } catch (const std::exception& e) {
+    s = Status::Internal(std::string("Put preparation failed before submission: ") + e.what());
+  } catch (...) { s = Status::Internal("Put preparation failed before submission"); }
+  if (!s.ok()) {
+    if (instance) instance->ClearExecution();
+    return s;
+  }
+  prepared_put_ = instance;
+  prepared_request_ = &request;
+  prepared_stream_ = options.stream;
+  return Status::OK();
+}
 Status ExecutionDispatcher::PreparePut(const BatchPutExecutionOptions& options) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(put_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (pending_put_) return Status::InvalidState("Put awaits completion/transaction acknowledgement");
+  if (pending_put_ || prepared_put_) return Status::Busy("Put is prepared or awaits transaction acknowledgement");
   if (input_id_ || options.input_lease || failed_input_context_)
     return Status::Busy("bound Put requires a matching request");
   PutExecutionConfig c;
   auto s = ResolveExecution(policy_, options.config, &c);
-  PutResourceLease lease;
-  return s.ok() ? resources_.AcquirePut({c}, &lease) : s;
+  PutExecutionContext* instance = nullptr;
+  if (s.ok()) s = PreparePutInstanceLocked(c, nullptr, {0, options.stream}, &instance);
+  if (s.ok()) instance->ClearExecution();
+  return s;
 }
 Status ExecutionDispatcher::PreparePut(const BatchPutRequest& request,
                                        const BatchPutExecutionOptions& options) {
@@ -164,7 +285,7 @@ Status ExecutionDispatcher::PreparePut(const BatchPutRequest& request,
   std::lock_guard<std::mutex> lock(put_mutex_);
   locking.Finish();
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (pending_put_) return Status::InvalidState("Put awaits completion/transaction acknowledgement");
+  if (pending_put_ || prepared_put_) return Status::Busy("Put is prepared or awaits transaction acknowledgement");
   PutExecutionConfig c;
   Status s;
   {
@@ -173,19 +294,16 @@ Status ExecutionDispatcher::PreparePut(const BatchPutRequest& request,
     if (s.ok() && timing) timing->config = c;
   }
   if (s.ok()) s = ValidateInputLocked(request, options, c);
-  if (!s.ok()) return s;
-  if (input_id_) return input_context_->lease.view().PrepareBound(request, options);
-  PutResourceLease lease;
-  PutResourceRequirements requirements;
-  {
-    PutDispatchPhase phase(timing, &PutDispatchTiming::describe_ns);
-    s = resources_.Describe(c, request, &requirements);
-  }
-  if (s.ok()) {
-    PutDispatchPhase phase(timing, &PutDispatchTiming::acquire_ns);
-    s = resources_.AcquirePut(requirements, &lease);
-  }
-  return s.ok() ? lease.view().Prepare(request, options) : s;
+  return s.ok() ? PreparePutLocked(c, request, options) : s;
+}
+Status ExecutionDispatcher::CancelPreparedPut() {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  if (prepared_put_) prepared_put_->ClearExecution();
+  prepared_put_ = nullptr;
+  prepared_request_ = nullptr;
+  prepared_stream_ = nullptr;
+  return Status::OK();
 }
 Status ExecutionDispatcher::BeginPutInput(PutExecutionConfig c, const PutInputOptions& r,
                                           std::uint64_t* id) {
@@ -196,30 +314,28 @@ Status ExecutionDispatcher::BeginPutInput(PutExecutionConfig c, const PutInputOp
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(put_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (pending_put_ || input_id_ || failed_input_context_)
+  if (pending_put_ || prepared_put_ || input_id_ || failed_input_context_)
     return Status::Busy("Put input binding or unresolved execution already exists");
   if (c.transport != Transport::Urma)
     return Status::NotImplemented("input binding supports URMA Put");
   if (!next_input_id_) return Status::InvalidState("input lease ID exhausted");
-  auto context = std::make_unique<PutExecutionContext>();
-  auto s = ResolveExecution(policy_, c, &context->config);
+  PutExecutionConfig config;
+  auto s = ResolveExecution(policy_, c, &config);
+  PutExecutionContext* context = nullptr;
   try {
-    if (s.ok()) s = resources_.AcquirePut({context->config, r.request_capacity}, &context->lease);
-    if (s.ok()) s = context->Bind();
-    if (s.ok()) s = context->lease.view().PrepareInput(r);
+    if (s.ok()) s = PreparePutInstanceLocked(config, nullptr, {r.request_capacity, r.stream}, &context);
+    if (s.ok()) s = context->view().PrepareInput(r);
   } catch (const std::exception& e) {
     s = Status::Internal(std::string("input preparation failed: ") + e.what());
-  } catch (...) {
-    s = Status::Internal("input preparation failed");
-  }
+  } catch (...) { s = Status::Internal("input preparation failed"); }
   if (!s.ok()) {
-    if (context->lease && !resources_.Close(context->lease).ok())
-      failed_input_context_ = std::move(context);
+    if (context && !ClosePutInstanceLocked(context).ok()) failed_input_context_ = context;
     return s;
   }
+  context->ClearExecution();
   input_options_ = r;
   input_id_ = next_input_id_++;
-  input_context_ = std::move(context);
+  input_context_ = context;
   *id = input_id_;
   return Status::OK();
 }
@@ -227,19 +343,21 @@ Status ExecutionDispatcher::EndPutInput(std::uint64_t id) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(put_mutex_);
   if (!id || id != input_id_) return Status::NotFound("Put input lease not found");
-  if (pending_put_) return Status::Busy("Put transaction must be acknowledged before releasing input");
-  auto s = input_context_->lease.view().FinishInput();
-  if (s.ok()) { input_context_.reset(); input_id_ = 0; input_options_ = {}; }
+  if (pending_put_ || prepared_put_) return Status::Busy("Put must be cancelled or acknowledged before releasing input");
+  auto s = input_context_->view().FinishInput();
+  if (s.ok()) { input_context_ = nullptr; input_id_ = 0; input_options_ = {}; }
   return s;
 }
 Status ExecutionDispatcher::Recover(PutExecutionConfig c) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(put_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (pending_put_) return Status::Busy("resolve pending Put through Runtime before resource recovery");
+  if (pending_put_ || prepared_put_) return Status::Busy("cancel preparation or resolve pending Put before resource recovery");
   if (input_id_ || failed_input_context_) return Status::Busy("release Put input lease before resource recovery");
   PutExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
+  if (!s.ok()) return s;
+  if (auto* instance = FindPutInstanceLocked(resolved)) s = ClosePutInstanceLocked(instance);
   return s.ok() ? resources_.Recover(resolved) : s;
 }
 Status ExecutionDispatcher::Recover(GetExecutionConfig c) {
@@ -280,41 +398,20 @@ Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) 
   }
   if (s.ok()) s = ValidateInputLocked(*request.request, request.execution, c);
   if (!s.ok()) return s;
-  std::unique_ptr<PutExecutionContext> context;
-  try {
-    {
-      PutDispatchPhase phase(timing, &PutDispatchTiming::context_ns);
-      context = input_id_ ? std::move(input_context_) : std::make_unique<PutExecutionContext>();
-      context->config = c;
-    }
-    if (!input_id_) {
-      PutResourceRequirements requirements;
-      {
-        PutDispatchPhase phase(timing, &PutDispatchTiming::describe_ns);
-        s = resources_.Describe(c, *request.request, &requirements);
-      }
-      if (s.ok()) {
-        PutDispatchPhase phase(timing, &PutDispatchTiming::acquire_ns);
-        s = resources_.AcquirePut(requirements, &context->lease);
-      }
-      if (s.ok()) {
-        PutDispatchPhase phase(timing, &PutDispatchTiming::bind_ns);
-        s = context->Bind();
-      }
-    }
-  } catch (const std::exception& e) {
-    s = Status::Internal(std::string("Put preparation failed before submission: ") + e.what());
-  } catch (...) {
-    s = Status::Internal("Put preparation failed before submission");
+  if (prepared_put_) {
+    if (!(prepared_put_->config == c) || prepared_request_ != request.request ||
+        prepared_stream_ != request.execution.stream)
+      return Status::InvalidArgument("Put execution differs from prepared request; cancel preparation first");
+  } else {
+    // Direct dispatcher users may omit Prepare. Runtime normally arrives with
+    // this instance and its execution lease already prepared before metadata.
+    s = PreparePutLocked(c, *request.request, request.execution);
+    if (!s.ok()) return s;
   }
-  if (!s.ok()) {
-    if (context) {
-      context->completion = {PutOutcome::Failed, s};
-      pending_put_ = std::move(context);
-    }
-    return s;
-  }
-  pending_put_ = std::move(context);
+  pending_put_ = prepared_put_;
+  prepared_put_ = nullptr;
+  prepared_request_ = nullptr;
+  prepared_stream_ = nullptr;
   pending_put_->launched = true;
   {
     PutDispatchPhase phase(timing, &PutDispatchTiming::provider_ns);
@@ -324,7 +421,7 @@ Status ExecutionDispatcher::ExecuteBatchPut(const BatchPutExecRequest& request) 
       auto invocation = request;
       invocation.execution.config = c;
       invocation.execution.dispatch_timing = nullptr;
-      s = pending_put_->lease.view().Launch(invocation);
+      s = pending_put_->view().Launch(invocation);
     } catch (const std::exception& e) {
       s = Status::CompletionUnknown(std::string("provider Put threw after submission: ") + e.what());
     } catch (...) {
@@ -343,7 +440,7 @@ Status ExecutionDispatcher::ResolvePut(PutExecutionConfig c, PutCompletion* out)
   if (!(pending_put_->config == c)) return Status::InvalidArgument("recovery configuration differs from original Put");
   if (pending_put_->completion.outcome == PutOutcome::Unknown) {
     PutCompletion result;
-    auto s = pending_put_->lease.view().Resolve(&result);
+    auto s = pending_put_->view().Resolve(&result);
     if (!s.ok()) return s;
     if ((result.outcome == PutOutcome::Succeeded && !result.result.ok()) ||
         (result.outcome == PutOutcome::Failed && result.result.ok()))
@@ -359,13 +456,10 @@ Status ExecutionDispatcher::AcknowledgePut() {
   if (!pending_put_) return Status::OK();
   if (pending_put_->completion.outcome == PutOutcome::Unknown)
     return Status::Busy("cannot acknowledge unresolved Put");
-  auto s = pending_put_->launched ? pending_put_->lease.view().Acknowledge() : Status::OK();
+  auto s = pending_put_->launched ? pending_put_->view().Acknowledge() : Status::OK();
   if (s.ok()) {
-    if (input_id_) {
-      pending_put_->completion = {};
-      pending_put_->launched = false;
-      input_context_ = std::move(pending_put_);
-    } else pending_put_.reset();
+    pending_put_->ClearExecution();
+    pending_put_ = nullptr;
   }
   return s;
 }
@@ -570,13 +664,15 @@ Status ExecutionDispatcher::DrainGet() {
 Status ExecutionDispatcher::Warmup(PutExecutionConfig c, const ExecutionWarmup& r) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(put_mutex_);
-  if (pending_put_) return Status::Busy("Put awaits completion/transaction acknowledgement");
+  if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
+  if (pending_put_ || prepared_put_) return Status::Busy("Put is prepared or awaits transaction acknowledgement");
   if (input_id_ || failed_input_context_) return Status::Busy("release Put input lease before warmup");
   PutExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
-  PutResourceLease lease;
-  if (s.ok()) s = resources_.AcquirePut({resolved, r.request_capacity}, &lease);
-  return s.ok() ? lease.view().Warmup(r) : s;
+  PutExecutionContext* instance = nullptr;
+  if (s.ok()) s = PreparePutInstanceLocked(resolved, nullptr, r, &instance);
+  if (s.ok()) instance->ClearExecution();
+  return s;
 }
 Status ExecutionDispatcher::Warmup(GetExecutionConfig c, const ExecutionWarmup& r) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
@@ -735,16 +831,29 @@ Status ExecutionDispatcher::Shutdown() {
   if (graph_id_) return Status::Busy("release Get graph lease before shutdown");
   ready_ = false;
   Status first;
-  auto close = [&](auto& context) {
-    if (!context) return;
-    auto s = resources_.Close(context->lease);
-    if (s.ok()) context.reset();
-    else if (first.ok()) first = s;
-  };
-  close(pending_put_);
-  close(input_context_);
-  close(failed_input_context_);
-  if (!pending_put_ && !input_context_) { input_id_ = 0; input_options_ = {}; }
+  for (auto it = put_instances_.begin(); it != put_instances_.end();) {
+    auto* instance = it->get();
+    auto s = resources_.Close(instance->resources);
+    if (s.ok()) {
+      if (pending_put_ == instance) pending_put_ = nullptr;
+      if (prepared_put_ == instance) {
+        prepared_put_ = nullptr;
+        prepared_request_ = nullptr;
+        prepared_stream_ = nullptr;
+      }
+      if (input_context_ == instance) {
+        input_context_ = nullptr;
+        input_id_ = 0;
+        input_options_ = {};
+      }
+      if (failed_input_context_ == instance) failed_input_context_ = nullptr;
+      it = put_instances_.erase(it);
+    } else {
+      instance->cleanup_only = true;
+      if (first.ok()) first = s;
+      ++it;
+    }
+  }
   // Close owners with resident execution state and bindings still alive. Only
   // successful closes may erase a pin; failed instances retain every dependency.
   for (auto it = get_instances_.begin(); it != get_instances_.end();) {

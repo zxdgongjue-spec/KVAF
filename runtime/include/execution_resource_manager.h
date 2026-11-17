@@ -36,6 +36,10 @@ struct ExecutionResourceRecord {
 // algorithms; these adapters route lifecycle work directly to the resource owner.
 class PutResourceView {
  public:
+  Status Describe(const BatchPutRequest& r, std::uint32_t* capacity) const {
+    return op_->DescribeRequirements(r, capacity);
+  }
+  Status ValidateCapacity(std::uint32_t capacity) const { return op_->ValidateRequestCapacity(capacity); }
   Status Prepare(const BatchPutRequest& r, const BatchPutExecutionOptions& o) const {
     std::uint32_t capacity{};
     auto s = op_->DescribeRequirements(r, &capacity);
@@ -57,6 +61,7 @@ class PutResourceView {
   Status Bind(ExecutionState* s) const { return op_->BindExecutionState(s); }
  private:
   friend class PutResourceLease;
+  friend class PutResourceReference;
   explicit PutResourceView(AccessOperator* op, ExecutionResourceOwner* resources)
       : op_(op), resources_(resources) {}
   AccessOperator* op_;
@@ -153,6 +158,7 @@ class ResourceLease {
   explicit operator bool() const { return bool(record_); }
  protected:
   friend class ExecutionResourceManager;
+  friend class PutResourceReference;
   friend class GetResourceReference;
   std::shared_ptr<detail::ExecutionResourceRecord> record_;
   void Reset();
@@ -168,6 +174,22 @@ class GetResourceLease final : public ResourceLease {
 // A resident state pins its provider/owner without claiming execution. Only its
 // holder can acquire the short exclusive lease; completion returns that lease
 // while keeping this reference and the bound provider state alive.
+class PutResourceReference final {
+ public:
+  PutResourceReference() = default;
+  PutResourceReference(PutResourceReference&& other) noexcept : record_(std::move(other.record_)) {}
+  PutResourceReference& operator=(PutResourceReference&&) noexcept;
+  PutResourceReference(const PutResourceReference&) = delete;
+  PutResourceReference& operator=(const PutResourceReference&) = delete;
+  ~PutResourceReference();
+  explicit operator bool() const { return bool(record_); }
+  PutResourceView view() const { return PutResourceView(record_->operation.get(), record_->resources.get()); }
+  Status Acquire(PutResourceLease*) const;
+ private:
+  friend class ExecutionResourceManager;
+  std::shared_ptr<detail::ExecutionResourceRecord> record_;
+  void Reset();
+};
 class GetResourceReference final {
  public:
   GetResourceReference() = default;
@@ -203,6 +225,7 @@ class ExecutionResourceManager {
   Status Describe(GetExecutionConfig, const BatchGetRequest&, GetResourceRequirements*);
   Status AcquirePut(const PutResourceRequirements&, PutResourceLease*);
   Status AcquireGet(const GetResourceRequirements&, GetResourceLease*);
+  Status PinPut(const PutResourceRequirements&, PutResourceReference*);
   Status PinGet(const GetResourceRequirements&, GetResourceReference*);
   Status Recover(PutExecutionConfig);
   Status Recover(GetExecutionConfig);
@@ -210,6 +233,7 @@ class ExecutionResourceManager {
   // drains/tears down through its owner while invocation state is still alive.
   Status Close(PutResourceLease&);
   Status Close(GetResourceLease&);
+  Status Close(PutResourceReference&);
   Status Close(GetResourceReference&);
   Status Shutdown();
  private:

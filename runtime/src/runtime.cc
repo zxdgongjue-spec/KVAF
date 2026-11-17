@@ -23,6 +23,23 @@ std::uint64_t LegacyGetTraceNowNs() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+class PutPreparationGuard {
+ public:
+  explicit PutPreparationGuard(AccessOperator& operation) : operation_(operation) {}
+  ~PutPreparationGuard() noexcept {
+    try {
+      (void)operation_.CancelPreparedPut();
+    } catch (...) {
+      // Preserve the original failure during metadata exception unwinding.
+      std::fprintf(stderr, "[KVAF] unsubmitted Put preparation cleanup threw\n");
+    }
+  }
+  PutPreparationGuard(const PutPreparationGuard&) = delete;
+  PutPreparationGuard& operator=(const PutPreparationGuard&) = delete;
+ private:
+  AccessOperator& operation_;
+};
+
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
   Status Allocate(const RuntimeInitRequest& request,
@@ -573,6 +590,10 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
     if (!validated.ok()) return validated;
     auto prepared = measure(row.prepare_ns, [&] { return access_operator_.PreparePut(request, execution); });
     if (!prepared.ok()) return prepared;
+    // Metadata can reject or throw after preparation. Execute consumes the
+    // reservation on submission; cancellation then becomes a no-op, including
+    // unresolved DMA and metadata/acknowledgement recovery paths.
+    PutPreparationGuard preparation_guard(access_operator_);
     // Allocate the completion record before reserving metadata; retain it until
     // data-plane completion, metadata finalization and provider acknowledgement.
     PendingPut pending;
