@@ -234,6 +234,11 @@ K 端设置 `KVAF_CPU_GATHER_JETTY_SUPPLY=1` 会启用交错调度，后缀分�
 最终 Done 在全部 payload CQE 回收后发布。N 端使用 `--pipeline 1 --jetty-cursors 1` 按 Jetty 消费 Ready。
 `waves` 记录 WRITE 计划提交次数，一个 gather 波可对应多个提交计划。
 
+K 端可用 `KVAF_CPU_PUSH_IDLE_CQ_REAP=1` 对照默认值 `0`。流水 Gather 的协调线程在等待后缀或工作线程时，
+先提交就绪 WRITE，有待回收 CQE 的情况下每 32 轮等待最多做一次非阻塞 CQ 扫描。`CPU_PUSH_GATHER_PROFILE`
+中的 `idle_cq_sweeps`、`idle_cqes`、`idle_cq_poll_ns` 分别记录扫描次数、回收数和耗时。
+空档轮询的耗时计在 `copy_ns` 内。对照 `write_ns` 和端到端耗时验证收益。
+
 `max_jetty_post_gap_ns` 是同一 Jetty 相邻提交之间的最大间隔，包含在途数据仍可搬运的时间。
 对照 `post_calls`、`tail_cqes`、`post_window_ns`、`post_tail_ns`、`write_ns` 和端到端 P50/P90。
 Scatter profiled CSV 的 `sequence` 可与 CPU 日志对应。`aiv_tail_core` 是最后结束的核，

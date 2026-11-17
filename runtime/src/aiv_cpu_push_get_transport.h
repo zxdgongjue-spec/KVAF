@@ -40,6 +40,8 @@ class Transport {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
     std::uint64_t first_post_ns{}, last_post_return_ns{}, last_cqe_ns{};
+    std::uint64_t idle_cq_poll_ns{};
+    std::uint32_t idle_cq_sweeps{}, idle_cqes{};
     std::array<std::uint64_t, kMaxJettyCount> jetty_last_post_ns{};
     std::uint64_t max_jetty_post_gap_ns{};
     void RecordJettyPost(std::uint32_t queue, std::uint64_t now) {
@@ -106,7 +108,8 @@ class Transport {
   std::uint32_t FirstGatherChunkRows(std::uint32_t count) const;
   Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave = {},
                     const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr,
-                    const peer::CpuGatherExecutor::ShardProgress& on_shards = {});
+                    const peer::CpuGatherExecutor::ShardProgress& on_shards = {},
+                    const peer::CpuGatherExecutor::IdleProgress& on_idle = {});
   void FlushGatherProfiles();
   void TraceJettyPost(PreparedWrite&, std::uint64_t id, std::uint32_t queue, std::uint64_t now);
   Status PrepareWrites(std::uint32_t count);
@@ -135,6 +138,7 @@ class Transport {
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
   bool gather_interleave_{}, prepared_interleaved_{}, gather_jetty_supply_{};
+  bool idle_cq_reap_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};

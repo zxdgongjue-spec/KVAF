@@ -129,7 +129,8 @@ std::size_t CpuGatherExecutor::PrepareFixed(void* staging, const std::uint64_t* 
   return PrepareJob(staging, nullptr, addresses, count, std::uint64_t{count} * span_bytes);
 }
 
-void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_shards) {
+void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_shards,
+                             const IdleProgress& on_idle) {
   completed_.store(0U, std::memory_order_relaxed);
   if (profiling_enabled_) {
     copy_profile_.begin_ns = NowNs();
@@ -152,7 +153,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
   std::size_t next_ready = 0;
   bool publishing = true;
   const auto whole_waves = std::min(fixed_progress_.size(), fixed_first_shard_wave_);
-  const auto publish_ready = [&]() {
+  const auto publish_ready = [&](bool waiting = false) {
     if (!publishing) return;
     try {
       while (next_ready < whole_waves &&
@@ -170,6 +171,11 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
           fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone && !on_shards()) {
         publishing = false;
         SetFixedError(FixedError::kCancelled);
+        return;
+      }
+      if (waiting && on_idle && fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone && !on_idle()) {
+        publishing = false;
+        SetFixedError(FixedError::kCancelled);
       }
     } catch (...) {
       publish_error = std::current_exception();
@@ -177,6 +183,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
       SetFixedError(FixedError::kCancelled);
     }
   };
+  const auto progress_while_waiting = [&] { publish_ready(true); };
   if (fixed_progress_.empty()) {
     copied = ProcessSource(0U);
   } else {
@@ -187,7 +194,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
             __atomic_load_n(fixed_suffix_.ready_sequence, __ATOMIC_ACQUIRE) != fixed_suffix_.sequence
             ? NowNs() : 0U;
         // Keep posting completed head waves if suffix has yet to arrive.
-        const bool ready = WaitFixedSuffix(publish_ready);
+        const bool ready = WaitFixedSuffix(progress_while_waiting);
         if (begin) copy_profile_.suffix_wait_ns = NowNs() - begin;
         if (!ready) break;
       }
@@ -198,7 +205,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
   FinishWorker(0U, copied);
   if (profiling_enabled_) copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
-    publish_ready();
+    progress_while_waiting();
     GatherSpinPause();
   }
   publish_ready();
