@@ -10,7 +10,7 @@ fi
 build_dir="$1"
 shift
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runner="$repo_root/access_operator/algorithms/get/scatter/urma_aicpu/python/benchmark_cpu_push_scatter.py"
+runner="$repo_root/tests/python/benchmark_cpu_push_scatter.py"
 export PYTHONPATH="$build_dir/python${PYTHONPATH:+:$PYTHONPATH}"
 
 read -r -a token_sizes <<< "${KVAF_AICPU_TOKEN_BYTES:-128 256 512 656 1024 2048 4096}"

@@ -13,9 +13,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "access_operator/algorithms/get/common/aicpu/python"))
-import test_batch_get as functional
-import benchmark_gather_read as benchmark
+import test_aicpu_batch_get as functional
+import benchmark_aicpu_get as benchmark
 
 EIDS = "00112233445566778899aabbccddeeff,102132435465768798a9bacbdcedfe0f"
 SCATTER = "KvafAicpuCpuPushScatterExecutionV3"

@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import statistics
 import sys
 import time
 
-from test_batch_get import timing_stats
+from test_aicpu_batch_get import timing_stats
 from npu_eids import parse_npu_eids
 from batch_get_workload import token_pattern
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "tests" / "python"))
 from perf_execution import BenchmarkExecution, add_execution_mode
 
 DDR_BUDGET_BYTES = 100 * 1024**3

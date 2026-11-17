@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import csv
-import importlib.util
 import io
 import os
 from pathlib import Path
@@ -18,13 +17,9 @@ from perf_execution import BenchmarkExecution, add_execution_mode
 import test_npu_batch_get_perf as direct
 import test_npu_batch_put as put
 from batch_get_host_sweep import parse_measurements
+import benchmark_aicpu_get as gather
 
 ROOT = Path(__file__).resolve().parents[2]
-ALGORITHM_PYTHON_DIR = ROOT / "access_operator/algorithms/get/common/aicpu/python"
-with patch.object(sys, "path", [str(ALGORITHM_PYTHON_DIR), *sys.path]):
-    spec = importlib.util.spec_from_file_location("gather_benchmark", ALGORITHM_PYTHON_DIR / "benchmark_gather_read.py")
-    gather = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gather)
 
 
 class ExecutionTests(unittest.TestCase):

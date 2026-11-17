@@ -5,14 +5,10 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import random
 import statistics
-import sys
 import time
 
-# Share the original hardware tests' EID parser.
-sys.path.insert(0, str(Path(__file__).resolve().parents[6] / "tests" / "python"))
 from npu_eids import parse_npu_eids
 
 
