@@ -7,21 +7,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "cpu_gather.h"
-
-#if defined(__linux__)
-#include <sched.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-#include <cerrno>
-#include <cstdio>
-#endif
 
 namespace kvaf::peer {
 
@@ -49,14 +39,10 @@ class CpuGatherExecutor {
  public:
   CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
                 std::size_t min_bytes_per_thread = 256U * 1024U,
-                GatherWaitMode wait_mode = GatherWaitMode::kPassive, bool bind_cores = false,
-                std::size_t cpu_offset = 0U)
+                GatherWaitMode wait_mode = GatherWaitMode::kPassive)
       : memory_(static_cast<std::uint8_t*>(memory)),
         base_(base),
-        cpu_ids_(bind_cores ? AllowedCpus(cpu_offset) : std::vector<int>{}),
-        max_threads_(
-            std::min(std::max<std::size_t>(1U, max_threads),
-                     cpu_ids_.empty() ? std::max<std::size_t>(1U, max_threads) : cpu_ids_.size())),
+        max_threads_(std::max<std::size_t>(1U, max_threads)),
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
         wait_mode_(wait_mode) {}
 
@@ -74,24 +60,6 @@ class CpuGatherExecutor {
 
   std::size_t PrepareDirect(std::uint64_t region_bytes, std::uint64_t descriptor_address,
                             std::uint64_t sequence, std::size_t max_spans);
-
-  void BindWorker(std::size_t worker) const {
-#if defined(__linux__)
-    const long tid = syscall(SYS_gettid);
-    if (worker >= cpu_ids_.size()) {
-      return;
-    }
-    cpu_set_t mask{};
-    CPU_ZERO(&mask);
-    CPU_SET(cpu_ids_[worker], &mask);
-    const int result = sched_setaffinity(0, sizeof(mask), &mask);
-    if (result)
-      std::fprintf(stderr, "[KVAF_CPU] gather affinity failed tid=%ld cpu=%d errno=%d\n", tid,
-                   cpu_ids_[worker], errno);
-#else
-    (void)worker;
-#endif
-  }
 
   void Copy();
 
@@ -117,21 +85,6 @@ class CpuGatherExecutor {
     return threads;
   }
 
-  static std::vector<int> AllowedCpus(std::size_t offset) {
-    std::vector<int> cpus;
-#if defined(__linux__)
-    cpu_set_t mask{};
-    if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
-      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-        if (CPU_ISSET(cpu, &mask)) cpus.push_back(cpu);
-#endif
-    if (offset < cpus.size())
-      cpus.erase(cpus.begin(), cpus.begin() + offset);
-    else
-      cpus.clear();
-    return cpus;
-  }
-
   std::uint64_t Boundary(std::size_t index) const {
     if (index == 0U) return 0U;
     if (index == active_threads_) return total_bytes_;
@@ -148,7 +101,6 @@ class CpuGatherExecutor {
 
   std::uint8_t* memory_;
   std::uint64_t base_;
-  std::vector<int> cpu_ids_;
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;
   GatherWaitMode wait_mode_;

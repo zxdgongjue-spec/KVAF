@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "cpu_push_get_layout.h"
 #if defined(KVAF_CPU_PUSH_DEVICE_KERNEL)
 #include <securec.h>
@@ -8,22 +10,10 @@
 #endif
 
 namespace kvaf::cpu_push {
-// Release only the prefix reached by every Jetty.
-template <class Read>
-std::uint64_t ChainReadyProgress(std::uint32_t chunks, std::uint64_t sequence, Read read) {
-  auto progress = chunks;
-  bool stale = false;
-  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-    const auto token = read(q), seq = token >> 32, value = token & UINT32_MAX;
-    if (seq > sequence || (seq == sequence && (!value || value > chunks)))
-      return Progress(sequence, UINT32_MAX);
-    stale |= seq < sequence;
-    if (seq == sequence) progress = std::min(progress, static_cast<std::uint32_t>(value));
-  }
-  return stale ? 0 : Progress(sequence, progress);
-}
+using ReadySnapshot = std::array<std::uint64_t, kJettyCount>;
 
-// Merge ready chunks into one copy span and finalize once per worker.
+// Advance each Jetty independently. Coalesce consecutive staging rows from
+// the same snapshot, including across chunk boundaries when all are ready.
 template <class IO>
 Result Consume(std::uint32_t count, std::uint32_t bytes, std::uint32_t workers,
                std::uint32_t worker, std::uint64_t sequence, std::uint64_t start,
@@ -31,26 +21,51 @@ Result Consume(std::uint32_t count, std::uint32_t bytes, std::uint32_t workers,
   const auto range = WorkerRange(count, bytes, worker, workers);
   const auto chunks = ChunkCount(range);
   if (!chunks) return Result::kOk;
-  std::uint32_t cursor = 0;
-  Result copy_status = Result::kPending;
-  while (cursor < chunks) {
-    if (copy_status != Result::kPending) return copy_status;
+  std::array<std::uint32_t, kJettyCount> copied{}, required{};
+  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+    const auto last = JettyRange(ChunkRange(range, chunks - 1), q);
+    required[q] = chunks - (last.begin == last.end);
+  }
+  while (*consumed < chunks) {
     if (const auto status = io.Status(); status != Result::kPending) return status;
-    const auto token = io.ReadRangeDone(worker), observed = io.Now();
-    const auto seq = token >> 32;
-    const auto progress = static_cast<std::uint32_t>(token);
-    if (seq > sequence || (seq == sequence && (!progress || progress > chunks || progress < cursor)))
-      return Result::kSequenceError;
-    if (observed - start >= timeout) return Result::kTimeout;
-    if (seq == sequence && progress > cursor) {
-      if (io.Copy({ChunkRange(range, cursor).begin, ChunkRange(range, progress - 1).end}))
-        *consumed = progress;
-      else copy_status = Result::kCopyError;
-      cursor = progress;
-    } else io.Relax();
+    const auto snapshot = io.ReadReady(worker);
+    auto ready = copied;
+    auto first = chunks;
+    std::uint32_t last = 0;
+    for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+      const auto seq = snapshot[q] >> 32;
+      const auto progress = static_cast<std::uint32_t>(snapshot[q]);
+      if (seq > sequence || (seq == sequence &&
+          (!progress || progress > chunks || progress < copied[q])))
+        return Result::kSequenceError;
+      if (seq == sequence) ready[q] = std::min(progress, required[q]);
+      if (ready[q] > copied[q]) {
+        first = std::min(first, copied[q]);
+        last = std::max(last, ready[q]);
+      }
+    }
+    if (io.Now() - start >= timeout) return Result::kTimeout;
+    if (first == chunks) { io.Relax(); continue; }
+    Range span{};
+    for (auto chunk = first; chunk < last; ++chunk) {
+      const auto part = ChunkRange(range, chunk);
+      for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+        if (chunk < copied[q] || chunk >= ready[q]) continue;
+        const auto shard = JettyRange(part, q);
+        if (span.end != shard.begin) {
+          if (span.begin != span.end && !io.Copy(span)) return Result::kCopyError;
+          span.begin = shard.begin;
+        }
+        span.end = shard.end;
+      }
+    }
+    if (!io.Copy(span)) return Result::kCopyError;
+    copied = ready;
+    *consumed = chunks;
+    for (std::uint32_t q = 0; q < kJettyCount; ++q)
+      if (copied[q] < required[q]) *consumed = std::min(*consumed, copied[q]);
   }
   io.FinishRange();
-  if (copy_status != Result::kPending) return copy_status;
   if (const auto status = io.Status(); status != Result::kPending) return status;
   return io.Now() - start >= timeout ? Result::kTimeout : Result::kOk;
 }

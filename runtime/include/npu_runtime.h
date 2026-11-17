@@ -57,6 +57,9 @@ struct NpuRuntimeOptions {
   // Caller already initialized device RA (for example through HCCL). Borrow
   // it without calling RaInit again; the caller retains its lifetime.
   bool reuse_device_ra{false};
+  // Row widths one AICPU session serves. Empty keeps the single-width path that
+  // uses batch_get_token_bytes. AICPU only: one session, one transport per width.
+  std::vector<std::uint32_t> batch_get_token_bytes_list{};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
@@ -79,9 +82,14 @@ class NpuRuntime final : public Runtime {
   std::uint32_t jettys_per_core() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
+  // Row widths one AICPU session serves; empty means "use batch_get_token_bytes".
+  const std::vector<std::uint32_t>& batch_get_token_bytes_list() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
+  // Outside capture: synchronize the execution stream and report retained
+  // AICPU protocol errors, including errors from earlier graph replays.
+  Status CheckBatchGetStatus(void* stream);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
 

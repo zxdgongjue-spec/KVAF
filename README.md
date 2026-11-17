@@ -231,12 +231,14 @@ AIV/UBmem 的 `.o` 仍需显式传入，参数要求见下方 Python 调用说�
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --gather-threads 8 --gather-mode active
 ```
 
-此启动命令可供全部四种后端共用。三个 `--gather-*` 参数仅控制 CPU Gather 的
-线程预算、等待方式和绑核行为，不影响 AIV、UBmem 或 CPU Push Scatter 的执行。
+此启动命令可供全部四种后端共用。两个 `--gather-*` 参数仅控制 CPU Gather 的
+线程预算和等待方式，不影响 AIV、UBmem 或 CPU Push Scatter 的执行。
 Gather 的 CPU 线程预算须不小于客户端 AICPU worker 数；上例支持后续的 1/2/4/5 worker 测试。
+Gather 线程继承外部 CPU 亲和性；可通过 `numactl --cpunodebind=N --membind=N` 限定
+CPU 调度范围和内存分配节点，或通过 `taskset -c CPU_LIST` 指定允许使用的 CPU。
 
 服务启动后打印 `LISTEN`；首次 URMA 请求触发 device/EID 枚举并打印 `CANDIDATE_DISCOVERED`。
 也可按需要传入 `--ub-device NAME --eid-index N` 来选定 URMA 端口。
@@ -337,7 +339,7 @@ KVAF_RUNTIME_PERF_ITERATIONS
 
 AICPU 性能测试分别使用 [Gather sweep](tests/run_aicpu_gather_read_sweep.sh) 和
 [Scatter sweep](tests/run_aicpu_cpu_push_scatter_sweep.sh)，构建目录参数均可填写
-`"$PWD/build-npu"`。默认扫描较大的源池；小规模验证可用 `--table-capacity` 缩小源池。
+`"$PWD/build-npu"`。默认按 100 GiB DDR 预算计算源池容量，`--table-capacity` 可指定源块数量。
 
 ### 6. 无 NPU 的主机回归
 
@@ -350,8 +352,6 @@ ctest --test-dir build-host-tests --output-on-failure
 ```
 
 其中 [npu_runtime_config_test.cc](tests/npu_runtime_config_test.cc) 验证后端和安装路径，
-[aicpu_kernel_loader_test.cc](tests/aicpu_kernel_loader_test.cc) 用 ACL 桩检查内核入口，
-[test_aicpu_configuration.py](tests/python/test_aicpu_configuration.py) 验证 CLI 与包检查，
 [test_build_script.py](tests/python/test_build_script.py) 模拟编译步骤并实际执行临时目录安装。
 这些回归不能替代 CANN 设备编译和真机 Put/Get 验证。
 

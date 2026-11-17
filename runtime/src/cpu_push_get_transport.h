@@ -44,11 +44,15 @@ class Transport {
   };
   using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
   struct PreparedQueue {
+    struct Post { std::uint32_t wr, first_sge, end_sge; };
     struct Source { std::uint32_t local, row, offset; };
-    struct Marker { std::uint64_t* value; std::uint32_t progress; };
+    struct SourceRun { std::uint32_t local, row, count; };
+    struct Marker { std::uint64_t* value; std::uint32_t progress, local; };
     std::vector<urma::Sge> local, remote;
     std::vector<urma_jfs_wr_t> wrs;
+    std::vector<Post> posts;
     std::vector<Source> sources;
+    std::vector<SourceRun> source_runs;
     std::vector<Marker> markers;
   };
   struct PreparedWrite {
@@ -62,9 +66,9 @@ class Transport {
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
-  Status PostPrepared(PreparedQueue&, std::uint32_t queue);
+  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
-  void RefreshPrepared(PreparedQueue&);
+  void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
   Status Post(Queue&);
   Status Wait(Queue&);

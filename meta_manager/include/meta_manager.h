@@ -60,6 +60,8 @@ class MetaManager {
 
   // 为一批 key 预留远端 slot。
   // 该阶段只分配地址，不暴露映射；只有 CommitPut 之后读路径才能看到这些 key。
+  // A length may exceed slot_size: the key then owns ceil(length / slot_size)
+  // consecutive slots, and only its head key is visible to LockKeys/BatchFree.
   virtual Status PreparePut(const std::vector<KeyId>& flat_keys,
                             const std::vector<std::uint64_t>& lengths,
                             PutContext* put_context,

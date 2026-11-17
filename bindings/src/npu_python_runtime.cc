@@ -295,7 +295,8 @@ class NpuPythonRuntime final {
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
                    const std::string& transport, std::string aicpu_batch_get_mode,
-                   bool reuse_device_ra) {
+                   bool reuse_device_ra,
+                   std::vector<std::uint32_t> batch_get_token_bytes_list) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -308,6 +309,7 @@ class NpuPythonRuntime final {
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
+    options.batch_get_token_bytes_list = std::move(batch_get_token_bytes_list);
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.reuse_device_ra = reuse_device_ra;
     options.npu_eids = std::move(npu_eids);
@@ -590,6 +592,18 @@ class NpuPythonRuntime final {
       const kvaf::BatchGetKernelProfile& profile = profiles[core];
       py::dict item;
       item["core"] = core;
+      if (profile.device_start_ns) {
+        item["device_start_ns"] = profile.device_start_ns;
+        item["device_finish_ns"] = profile.device_finish_ns;
+        BatchGetProfile detailed{};
+        detailed.worker_count = 1;
+        detailed.workers[0] = profile.aicpu_profile;
+        auto fields = BatchGetProfileDict(detailed);
+        auto workers = fields["workers"].cast<py::list>();
+        auto stages = workers[0].cast<py::dict>();
+        stages["worker"] = core;
+        item["stages"] = stages;
+      }
       item["kernel_start_cycle"] = profile.kernel_start_cycle;
       item["setup_done_cycle"] = profile.setup_done_cycle;
       item["compact_done_cycle"] = profile.compact_done_cycle;
@@ -692,9 +706,13 @@ class NpuPythonRuntime final {
     const std::uint64_t output_rows =
         static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
-    if (output_block_bytes != native_->batch_get_token_bytes()) {
+    // One AICPU session may serve several row widths; the request's own row
+    // width selects the transport that owns its staging slice and kernels.
+    std::vector<std::uint32_t> widths = native_->batch_get_token_bytes_list();
+    if (widths.empty()) widths.push_back(native_->batch_get_token_bytes());
+    if (std::find(widths.begin(), widths.end(), output_block_bytes) == widths.end()) {
       throw py::value_error(
-          "BatchGet output Tensor row size does not match batch_get_token_bytes");
+          "BatchGet output Tensor row size is not one of batch_get_token_bytes_list");
     }
     const BatchGetRequest request{
         access_table,
@@ -732,6 +750,10 @@ class NpuPythonRuntime final {
           "uncertain DMA completion requires retaining output and Runtime until process teardown");
     }
     ThrowIfError(native_->Shutdown());
+  }
+
+  void CheckBatchGetStatus(const py::object& stream) {
+    ThrowIfError(native_->CheckBatchGetStatus(ResolveStream(stream)));
   }
 
  private:
@@ -788,6 +810,9 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Pass the unmodified acquire dict. stream=None uses the retained acquire "
            "stream, not the current stream. Failure retains all resources and blocks "
            "shutdown; unknown DMA completion requires process/device teardown.")
+      .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,
+           py::arg("stream") = py::none(),
+           "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)

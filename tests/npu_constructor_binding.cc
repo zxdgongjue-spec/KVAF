@@ -6,13 +6,17 @@ namespace py = pybind11;
 struct ConstructorProbe {
   py::tuple values;
   bool reuse_device_ra;
+  std::vector<std::uint32_t> token_bytes_list;
   ConstructorProbe(std::string get, std::uint32_t bytes, std::uint32_t tokens,
                    std::uint32_t device, std::uint32_t cores, std::string put,
                    std::uint32_t jettys, std::vector<std::string> eids, bool adaptive,
                    std::uint32_t misses, std::string peer, std::vector<std::string> peers,
-                   std::uint32_t inflight, const std::string& transport, std::string mode, bool reuse)
+                   std::uint32_t inflight, const std::string& transport, std::string mode,
+                   bool reuse, std::vector<std::uint32_t> widths)
       : values(py::make_tuple(get, bytes, tokens, device, cores, put, jettys, eids,
-                              adaptive, misses, peer, peers, inflight, transport, mode)), reuse_device_ra(reuse) {}
+                              adaptive, misses, peer, peers, inflight, transport, mode,
+                              widths)),
+        reuse_device_ra(reuse), token_bytes_list(std::move(widths)) {}
 };
 
 PYBIND11_MODULE(_kvaf_constructor_test, module) {
@@ -20,4 +24,5 @@ PYBIND11_MODULE(_kvaf_constructor_test, module) {
   kvaf::python_binding::BindNpuRuntimeConstructor(runtime);
   runtime.def_readonly("values", &ConstructorProbe::values);
   runtime.def_readonly("reuse_device_ra", &ConstructorProbe::reuse_device_ra);
+  runtime.def_readonly("token_bytes_list", &ConstructorProbe::token_bytes_list);
 }

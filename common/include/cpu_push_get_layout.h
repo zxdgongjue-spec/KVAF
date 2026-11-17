@@ -50,6 +50,12 @@ inline Range ChunkRange(Range r, std::uint32_t chunk) {
   const auto begin = r.begin + chunk * kChunkRows;
   return {begin, std::min(r.end, begin + kChunkRows)};
 }
+inline Range JettyRange(Range range, std::uint32_t queue) {
+  const auto rows = range.end - range.begin;
+  const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
+  const auto begin = range.begin + queue * base + std::min(queue, remainder);
+  return {begin, begin + base + (queue < remainder ? 1U : 0U)};
+}
 template <class Emit>
 void ForEachPipelineChunk(std::uint32_t count, std::uint32_t bytes,
                           std::uint32_t workers, Emit emit) {

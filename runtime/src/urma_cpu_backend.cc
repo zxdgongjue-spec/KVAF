@@ -323,13 +323,12 @@ peer::GatherWaitMode ToGatherWaitMode(CpuGatherMode mode) {
 class CpuGatherWorker {
  public:
   CpuGatherWorker(void* memory, uint64_t base, uint64_t bytes,
-                  std::size_t threads, std::size_t min_bytes, bool affinity,
-                  CpuGatherMode mode, uint64_t control_address = 0U,
-                  std::size_t cpu_offset = 0U)
+                  std::size_t threads, std::size_t min_bytes,
+                  CpuGatherMode mode, uint64_t control_address = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)), base_(base), bytes_(bytes),
         control_(reinterpret_cast<peer::GatherControl*>(memory_ +
             (control_address ? control_address - base : peer::GatherControlOffset(bytes)))),
-        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode), affinity, cpu_offset), mode_(mode) {
+        executor_(memory, base, threads, min_bytes, ToGatherWaitMode(mode)), mode_(mode) {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
@@ -340,7 +339,6 @@ class CpuGatherWorker {
   }
  private:
   void Run() {
-    executor_.BindWorker(0U);
     std::uint64_t last = 0U;
     while (!stop_.load(std::memory_order_acquire)) {
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
@@ -403,13 +401,13 @@ struct Region {
 class CpuService {
  public:
   CpuService(UrmaResourcePool* resource_pool, std::size_t gather_threads,
-             std::size_t min_bytes_per_thread, bool gather_affinity,
+             std::size_t min_bytes_per_thread,
              CpuGatherMode gather_mode,
              CpuMemoryPageMode memory_page_mode,
              bool device_filter_applied, uint64_t& next_session)
       : resource_pool_(resource_pool), gather_threads_(gather_threads),
         min_bytes_per_thread_(min_bytes_per_thread),
-        gather_affinity_(gather_affinity), gather_mode_(gather_mode),
+        gather_mode_(gather_mode),
         memory_page_mode_(memory_page_mode), device_filter_applied_(device_filter_applied), next_region_id_(next_session) {}
   ~CpuService() { ReleaseAll(); }
 
@@ -621,7 +619,7 @@ class CpuService {
     try {
       region.gather = std::make_unique<CpuGatherWorker>(
           region.memory, region.base, region.bytes, gather_threads_,
-          min_bytes_per_thread_, gather_affinity_, gather_mode_);
+          min_bytes_per_thread_, gather_mode_);
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_DIRECT_ENABLE_FAILED reason=%s\n", error.what());
       return Result::kResourceError;
@@ -639,15 +637,12 @@ class CpuService {
       return Result::kInvalidRequest;
     if (region.push || region.gather || !region.gather_lanes.empty()) return Result::kResourceError;
     std::vector<std::unique_ptr<CpuGatherWorker>> created;
-    std::size_t cpu_offset = 0U;
     try {
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const auto budget = gather_threads_ / lanes + (lane < gather_threads_ % lanes ? 1U : 0U);
         created.push_back(std::make_unique<CpuGatherWorker>(
             region.memory, region.base, region.bytes, budget, min_bytes_per_thread_,
-            gather_affinity_, gather_mode_, control_address + lane * sizeof(peer::GatherControl),
-            cpu_offset));
-        cpu_offset += budget;
+            gather_mode_, control_address + lane * sizeof(peer::GatherControl)));
       }
     } catch (const std::exception& error) {
       Log("[KVAF_CPU] GATHER_LANE_SETUP_FAILED reason=%s\n", error.what());
@@ -881,7 +876,6 @@ class CpuService {
   UrmaResourcePool* resource_pool_ = nullptr;
   std::size_t gather_threads_{1U};
   std::size_t min_bytes_per_thread_{256U * 1024U};
-  bool gather_affinity_{true};
   CpuGatherMode gather_mode_{CpuGatherMode::kAdaptive};
   CpuMemoryPageMode memory_page_mode_{CpuMemoryPageMode::kTransparentHugePage};
   bool device_filter_applied_{false};
@@ -1075,7 +1069,7 @@ Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& ne
       ? 256U * 1024U : 64U * 1024U;
   impl->service = std::make_unique<CpuService>(
       &impl->resources, gather_threads, min_bytes_per_thread,
-      options.gather_affinity, options.gather_mode,
+      options.gather_mode,
       options.memory_page_mode, !options.ub_device.empty(), next_session);
   impl_ = std::move(impl);
   return Status::OK();

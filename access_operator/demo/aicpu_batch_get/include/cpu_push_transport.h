@@ -19,6 +19,9 @@ class CpuPushTransport {
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
   Status Drain();
+  Status Check(void* stream);
+  Status SetKernelProfiling(bool);
+  Status CopyKernelProfiles(std::vector<BatchGetKernelProfile>*) const;
   Status Shutdown();
  private:
   struct Impl;

@@ -2,6 +2,8 @@
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
 #include "aicpu_urma/kernel_loader.h"
 #include "batch_get_args.h"
+#include "aicpu_batch_get_capture.h"
+#include "aicpu_batch_get_profile.h"
 #include "direct_hccp/direct_hccp_session.h"
 #include "direct_hccp/target_channel.h"
 #include "peer_link.h"
@@ -35,30 +37,45 @@ struct CpuPushTransport::Impl {
   std::array<std::unique_ptr<d::TargetChannel>, kJettyCount> channels;
   Layout layout;
   aclrtStream pending{};
-  std::uint64_t sequence{};
+  aclrtStream captured_stream{}, last_stream{};
   bool peer_open{}, initialized{}, failed{};
+  bool profiling{}, profile_submitted{};
+  Status failure;
 
   Status Drain() {
-    if (failed) return Status::InvalidState("CPU push failed; shutdown required");
-    if (!pending) return Status::OK();
+    const auto stream = pending ? pending : captured_stream;
+    if (!stream) return failed ? failure : Status::OK();
+    bool capturing = false;
+    auto allowed = detail::BatchGetCapture(stream, true, false, &capturing);
+    if (!allowed.ok()) return allowed;
     const auto bytes = config.workers * sizeof(WorkerStatus);
-    if (aclrtMemcpyAsync(status_host, bytes, status_device, bytes,
-                         ACL_MEMCPY_DEVICE_TO_HOST, pending) != ACL_SUCCESS) {
+    if (!failed && aclrtMemcpyAsync(status_host, bytes, status_device, bytes,
+                         ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS) {
       failed = true;
-      return Error("cannot enqueue execution status; resources retained");
+      return failure = Error("cannot enqueue execution status; resources retained");
     }
-    if (aclrtSynchronizeStream(pending) != ACL_SUCCESS) {
+    if (aclrtSynchronizeStream(stream) != ACL_SUCCESS) {
       failed = true;
-      return Error("stream failed; resources retained");
+      return failure = Error("stream failed; resources retained");
     }
     pending = nullptr;
+    if (failed) return failure.ok() ? Status::InvalidState("CPU push failed; shutdown required") : failure;
     const auto* statuses = static_cast<const WorkerStatus*>(status_host);
+    const auto sequence = statuses[0].sequence;
     for (std::uint32_t w = 0; w < config.workers; ++w)
-      if (statuses[w].magic != kMagic || statuses[w].sequence != sequence ||
+      if (statuses[w].magic == kMagic && statuses[w].result != std::uint64_t(Result::kOk) &&
+          statuses[w].sequence) {
+        failed = true;
+        return failure = Status::Internal("CPU push worker " + std::to_string(w) + " result=" +
+            std::to_string(statuses[w].result) + " sequence=" + std::to_string(statuses[w].sequence));
+      }
+    for (std::uint32_t w = 0; w < config.workers; ++w)
+      if (statuses[w].magic != kMagic || !sequence || statuses[w].sequence != sequence ||
           statuses[w].result != static_cast<std::uint64_t>(Result::kOk)) {
         failed = true;
-        return Status::Internal("CPU push worker " + std::to_string(w) + " result=" +
-                                std::to_string(statuses[w].result));
+        return failure = Status::Internal("CPU push worker " + std::to_string(w) + " result=" +
+                                std::to_string(statuses[w].result) + " sequence=" +
+                                std::to_string(statuses[w].sequence));
       }
     return Status::OK();
   }
@@ -68,6 +85,38 @@ CpuPushTransport::~CpuPushTransport() {
   if (!Shutdown().ok()) (void)impl_.release();
 }
 Status CpuPushTransport::Drain() { return impl_->Drain(); }
+Status CpuPushTransport::Check(void* stream) {
+  auto& s = *impl_;
+  if (!s.initialized || !s.last_stream)
+    return Status::InvalidState("no AICPU BatchGet has been submitted");
+  if (stream != s.last_stream)
+    return Status::InvalidArgument("check_batch_get_status requires the BatchGet execution stream");
+  s.pending = static_cast<aclrtStream>(stream);
+  return s.Drain();
+}
+Status CpuPushTransport::SetKernelProfiling(bool enabled) {
+  auto& s = *impl_;
+  if (!s.initialized) return Status::NotInitialized("CPU push is not initialized");
+  auto ready = s.Drain();
+  if (!ready.ok()) return ready;
+  if (enabled) {
+    ready = detail::AllocateAicpuProfiles(&s.profile_device, &s.profile_host,
+        s.config.workers * sizeof(BatchGetWorkerProfile));
+    if (!ready.ok()) return ready;
+  }
+  s.profiling = enabled;
+  s.profile_submitted = false;
+  return Status::OK();
+}
+Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
+  const auto& s = *impl_;
+  if (!s.profiling || !s.profile_submitted)
+    return Status::InvalidState("no profiled CPU push launch");
+  bool capturing = false;
+  auto ready = detail::BatchGetCapture(s.last_stream, true, false, &capturing);
+  if (!ready.ok()) return ready;
+  return detail::CopyAicpuProfiles(s.profile_device, s.profile_host, s.config.workers, profiles);
+}
 
 Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   auto& s = *impl_;
@@ -92,11 +141,14 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   d::TokenId token{};
   if (s.api.token_alloc(s.context, &token, &s.token) || !s.token) return Error("allocate RA token");
   const auto status_bytes = s.config.workers * sizeof(WorkerStatus);
-  if (aclrtMalloc(&s.memory, s.layout.bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
+  if (aclrtMalloc(&s.memory, s.layout.bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
       aclrtMemset(s.memory, s.layout.bytes, 0, s.layout.staging) != ACL_SUCCESS ||
       aclrtMalloc(&s.coordination, sizeof(Coordination), ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
       aclrtMalloc(&s.status_device, status_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS ||
-      aclrtMallocHost(&s.status_host, status_bytes) != ACL_SUCCESS) return Error("allocate workspace");
+      aclrtMallocHost(&s.status_host, status_bytes) != ACL_SUCCESS ||
+      aclrtMemset(s.coordination, sizeof(Coordination), 0, sizeof(Coordination)) != ACL_SUCCESS ||
+      aclrtMemset(s.status_device, status_bytes, 0, status_bytes) != ACL_SUCCESS)
+    return Error("allocate workspace");
   // Match the probe's HBM registration contract; the token is session-local.
   const auto token_value = region.token_value;
   d::MrRegInfo mr{};
@@ -150,7 +202,8 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   if (!result.ok()) return result;
   s.initialized = true;
   std::fprintf(stderr, "[KVAF_AICPU] CPU_PUSH_REFERENCE commit=%s protocol=3 "
-      "copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3\n", kReferenceCommit);
+      "copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 "
+      "workspace_policy=huge_first\n", kReferenceCommit);
   return Status::OK();
 }
 
@@ -160,37 +213,45 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
   if (profile && !exec.execution.synchronize) return Status::InvalidArgument("profiling requires synchronize=true");
   if (profile) *profile = {};
   const auto begin = profile ? BatchGetProfileNowNs() : 0;
-  auto result = s.Drain();
-  if (!result.ok()) return result;
   if (!s.initialized || !exec.execution.stream) return Status::InvalidState("CPU push needs initialization and stream");
+  if (s.failed) return Status::InvalidState("CPU push failed; shutdown required");
+  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  bool capturing = false;
+  auto result = detail::BatchGetCapture(stream, exec.execution.synchronize, profile != nullptr, &capturing);
+  if (!result.ok()) return result;
+  if (s.captured_stream && s.captured_stream != stream)
+    return Status::InvalidArgument("captured AICPU transport must use its capture stream");
+  if (capturing) {
+    if (s.pending && s.pending != stream)
+      return Status::InvalidState("drain previous AICPU work outside capture on its stream");
+  } else {
+    result = s.Drain();
+    if (!result.ok()) return result;
+  }
   KernelArgs args{};
   result = detail::BuildBatchGetKernelArgs(exec, &args.request);
   if (!result.ok()) return result;
   if (args.request.request_capacity > kMaxRequests || args.request.token_bytes != s.config.token_bytes)
     return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
-  if (s.sequence == UINT32_MAX) return Status::InvalidState("CPU push sequence exhausted");
   const auto profile_bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
-  if (profile && ((!s.profile_device && aclrtMalloc(&s.profile_device, profile_bytes,
-          ACL_MEM_MALLOC_NORMAL_ONLY) != ACL_SUCCESS) ||
-      (!s.profile_host && aclrtMallocHost(&s.profile_host, profile_bytes) != ACL_SUCCESS)))
-    return Error("allocate profiling buffers");
+  if (profile || s.profiling) {
+    auto allocated = detail::AllocateAicpuProfiles(&s.profile_device, &s.profile_host, profile_bytes);
+    if (!allocated.ok()) return allocated;
+  }
   args.workspace = detail::PointerValue(s.memory);
   args.output = detail::PointerValue(exec.request->output.data);
   args.output_bytes = exec.request->output.bytes;
   args.coordination = detail::PointerValue(s.coordination);
   args.status = detail::PointerValue(s.status_device);
-  args.profile = profile ? detail::PointerValue(s.profile_device) : 0;
-  args.sequence = ++s.sequence;
+  args.profile = (profile || s.profiling) ? detail::PointerValue(s.profile_device) : 0;
   args.workers = s.config.workers;
-  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   s.pending = stream;
-  // Coordination belongs to this launch; reset on the caller stream before execution.
-  if (aclrtMemsetAsync(s.coordination, sizeof(Coordination), 0, sizeof(Coordination), stream) != ACL_SUCCESS) {
-    s.failed = true; return Error("reset launch coordination");
-  }
+  s.last_stream = stream;
+  if (capturing) s.captured_stream = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchCpuPushScatter(&args, stream)) { s.failed = true; return Error("launch kernel"); }
+  s.profile_submitted = args.profile != 0;
   if (profile) { const auto now = BatchGetProfileNowNs(); profile->launch_ns = now - stamp; stamp = now; }
   if (!exec.execution.synchronize) return Status::OK();
   if (profile && aclrtMemcpyAsync(s.profile_host, profile_bytes, s.profile_device, profile_bytes,
@@ -211,6 +272,12 @@ Status CpuPushTransport::Execute(const BatchGetExecRequest& exec) {
 
 Status CpuPushTransport::Shutdown() {
   auto& s = *impl_;
+  // Completed eager work no longer depends on its caller-owned stream.
+  if (const auto stream = s.pending ? s.pending : s.captured_stream) {
+    bool capturing = false;
+    auto allowed = detail::BatchGetCapture(stream, true, false, &capturing);
+    if (!allowed.ok()) return allowed;
+  }
   // A healthy enqueued request still needs the CPU producer. Drain it before
   // STOP; after an execution failure, STOP must run even if draining failed.
   const auto drained = s.failed ? Status::OK() : s.Drain();
@@ -220,7 +287,8 @@ Status CpuPushTransport::Shutdown() {
     if (!stopped.ok()) return stopped;
     s.peer_open = false;
   }
-  if (s.pending && aclrtSynchronizeStream(s.pending) != ACL_SUCCESS)
+  const auto remaining = s.pending ? s.pending : s.captured_stream;
+  if (remaining && aclrtSynchronizeStream(remaining) != ACL_SUCCESS)
     return Error("stream still failed/pending; HBM retained");
   s.pending = nullptr;
   for (auto& channel : s.channels) if (channel) {
@@ -244,8 +312,10 @@ Status CpuPushTransport::Shutdown() {
     if (*buffer && aclrtFreeHost(*buffer) != ACL_SUCCESS) return Error("free Host buffer");
     *buffer = nullptr;
   }
-  s.sequence = 0;
+  s.last_stream = s.captured_stream = nullptr;
   s.initialized = s.failed = false;
+  s.profiling = s.profile_submitted = false;
+  s.failure = Status::OK();
   return drained;
 }
 }  // namespace kvaf::cpu_push

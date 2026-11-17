@@ -474,7 +474,8 @@ struct NpuRuntime::Impl {
       access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
           kernel_package.json_path, options.npu_core_count,
           peer_link, options.batch_get_token_bytes,
-          options.aicpu_batch_get_mode, config.peer_local_eid});
+          options.aicpu_batch_get_mode, config.peer_local_eid,
+          options.batch_get_token_bytes_list});
 #else
       throw std::invalid_argument("AICPU UMDK support was not built");
 #endif
@@ -593,10 +594,15 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
     impl_->allocator = std::make_unique<ubmem::DdrAllocator>(impl_->peer_link);
 #endif
   } else {
-    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
-        impl_->backend != detail::RuntimeBackend::kUrmaAicpuGather ? 0U :
-            GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes,
-                                       impl_->options.npu_core_count));
+    // Every width served by the one AICPU session reserves its own staging slice.
+    std::uint64_t gather_workspace = 0U;
+    if (impl_->backend == detail::RuntimeBackend::kUrmaAicpuGather) {
+      std::vector<std::uint32_t> widths = impl_->options.batch_get_token_bytes_list;
+      if (widths.empty()) widths.push_back(impl_->options.batch_get_token_bytes);
+      for (const std::uint32_t width : widths)
+        gather_workspace += GatherRemoteWorkspaceBytes(width, impl_->options.npu_core_count);
+    }
+    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, gather_workspace);
     impl_->peer_allocator = allocator.get();
     impl_->allocator = std::move(allocator);
   }
@@ -963,6 +969,9 @@ const std::vector<std::string>& NpuRuntime::npu_eids() const {
 std::uint32_t NpuRuntime::batch_get_token_bytes() const {
   return impl_->options.batch_get_token_bytes;
 }
+const std::vector<std::uint32_t>& NpuRuntime::batch_get_token_bytes_list() const {
+  return impl_->options.batch_get_token_bytes_list;
+}
 std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
@@ -972,6 +981,12 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before configuring BatchGet profiling");
   }
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (detail::UsesAicpu(impl_->backend)) {
+    if (detailed) return Status::InvalidArgument("detailed per-row profiling requires UBmem");
+    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
+  }
+#endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled, detailed);
@@ -982,12 +997,26 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
   return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
 }
 
+Status NpuRuntime::CheckBatchGetStatus(void* stream) {
+  if (!initialized() || !impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime is not initialized");
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (detail::UsesAicpu(impl_->backend))
+    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CheckBatchGetStatus(stream);
+#endif
+  return Status::NotImplemented("check_batch_get_status requires an AICPU backend");
+}
+
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles) const {
   if (impl_->access_operator == nullptr) {
     return Status::NotInitialized(
         "NpuRuntime requires LinkTo before reading BatchGet profiling");
   }
+#if defined(KVAF_ENABLE_AICPU_URMA)
+  if (detail::UsesAicpu(impl_->backend))
+    return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
+#endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
