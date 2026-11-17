@@ -18,7 +18,9 @@ struct alignas(64) ScatterBatchGetCoreProfile {
   // polling. Async MTE3 may also run during that polling; this is NOT a hardware
   // DMA-busy counter. The start/finish span includes inter-shard waits.
   std::uint64_t scatter_cycles{}, ready_wait_cycles{};
-  std::uint64_t scatter_start_cycle{}, scatter_finish_cycle{}, scatter_chunks{}, pipeline{};
+  std::uint64_t scatter_start_cycle{}, scatter_finish_cycle{}, scatter_chunks{};
+  // Blocking wait for the final Suffix CQE on core 0.
+  std::uint32_t pipeline{}, suffix_cq_blocked_cycles{};
   // Shards submitted while an earlier chunk still has unconsumed shards.
   std::uint32_t cross_chunk_shards{};
   // Extra Ready scans and scans that selected an earlier chunk.

@@ -154,6 +154,13 @@ Tensor 和 stream，运行时会检查完成状态。用 `synchronize=True` 可�
 选项或重新准备图。比较性能时，N 端性能脚本两组都用 `--completion-scope stream`，其中一组
 额外加 `--acl-graph`。捕获与结果验证在样本计时窗口外。
 
+单次 replay 的优化可用 N 端 `KVAF_SCATTER_GRAPH_MAILBOX=0/1` 做对照，默认 `0`。设为
+`1` 时，首段清单发布后，Suffix 复用本次请求已校验的 mailbox。Scatter pipeline 开启时，
+core 0 在 Suffix 提交后即可消费已经 Ready 的分片，在等 Ready 的间隔检查最后一个控制 CQE。
+成功返回前仍确认该 CQE 和整批 Done。分段发布用于可信入口中超过 `1024` 行的请求。
+`aiv_suffix_cq_blocked_us` 记录最后一个 Suffix CQE 的阻塞等待。CQE 已在 Ready 空档回收时，
+该指标为零。端到端对照可先关闭 profiling，再开 profiling 对比这个计时和 `aiv_wall_us`。
+
 ## 构建与完整回归
 
 CPU 端使用与部署环境匹配的 UMDK 重编并启动服务：

@@ -35,6 +35,7 @@ STAGES = {
     "aiv_wall_ns": "kernel_wall", "cpu_comm_ns": "cpu_comm",
     "cpu_write_ns": "cpu_write", "aiv_build_notify_ns": "build_notify",
     "aiv_scatter_ns": "scatter", "call_outside_aiv_ns": "call_outside_aiv",
+    "aiv_suffix_cq_blocked_ns": "suffix_cq_blocked",
 }
 SUMMARY_COLUMNS = (
     "token_bytes", "miss_count", "aiv_cores", "jettys_per_core", "cpu_jettys",
@@ -336,6 +337,7 @@ def run_case(args):
                     else "steady_table_new_request_plan_per_call"), calls_per_sample=1,
         timing=("enqueue_then_global_device_sync" if args.completion_scope == "device"
                 else "enqueue_then_stream_sync"), stream_selection="fixed_stream_per_call_task_queue_fence",
+        graph_mailbox=args.acl_graph and os.environ.get("KVAF_SCATTER_GRAPH_MAILBOX") == "1",
         input_storage=("fixed_buffers" if args.fixed_request_plan else "fixed_buffers_refreshed_per_call"),
         host_timing_matches_reference=False,
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",

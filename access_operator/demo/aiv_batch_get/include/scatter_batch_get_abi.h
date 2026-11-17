@@ -25,10 +25,12 @@ constexpr uint32_t kScatterConfiguredJettys = 16U;
 constexpr uint32_t kScatterPipeline = 32U;
 constexpr uint32_t kScatterJettyCursors = 64U;
 constexpr uint32_t kScatterOverlapHeadCq = 128U;
+// The low option byte is full. This bit is outside the version byte.
+constexpr uint32_t kScatterGraphMailbox = 1U << 31;
 constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
 constexpr uint32_t kScatterOptionsMask =
     kScatterProfiling | kScatterTrustedInputs | kScatterConfiguredJettys | kScatterPipeline | kScatterJettyCursors |
-    kScatterOverlapHeadCq | kScatterReadyRefresh | kScatterDeviceSequence;
+    kScatterOverlapHeadCq | kScatterReadyRefresh | kScatterDeviceSequence | kScatterGraphMailbox;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
       (value & ~kScatterOptionsMask) == kScatterOptionsV1;

@@ -36,6 +36,7 @@ CSV_COLUMNS = (
     "aiv_tail_core", "aiv_tail_to_last_enqueue_us", "aiv_tail_to_local_done_us", "aiv_tail_after_local_done_us",
     "jettys_per_core", "cpu_jettys",
     "ready_refresh", "aiv_ready_refreshes", "aiv_ready_refresh_hits",
+    "aiv_suffix_cq_blocked_us",
 )
 
 

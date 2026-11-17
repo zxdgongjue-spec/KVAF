@@ -204,6 +204,8 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
         )
     if all("ready_wait_cycles" in r for r in records):
         result["aiv_ready_wait_ns"] = max(r["ready_wait_cycles"] for r in records) * ns_per_cycle
+    if "suffix_cq_blocked_cycles" in cpu:
+        result["aiv_suffix_cq_blocked_ns"] = cpu["suffix_cq_blocked_cycles"] * ns_per_cycle
     if all("cross_chunk_shards" in r for r in records):
         result["aiv_cross_chunk_shards"] = sum(r["cross_chunk_shards"] for r in records)
     for name in ("ready_refreshes", "ready_refresh_hits"):

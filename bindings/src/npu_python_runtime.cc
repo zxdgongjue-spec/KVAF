@@ -555,6 +555,7 @@ class NpuPythonRuntime final {
       item["cpu_post_ns"] = profile.cpu_post_ns;
       item["cpu_cq_wait_ns"] = profile.cpu_cq_wait_ns;
       item["pipeline"] = profile.pipeline;
+      item["suffix_cq_blocked_cycles"] = profile.suffix_cq_blocked_cycles;
       item["scatter_cycles"] = profile.scatter_cycles;
       item["ready_wait_cycles"] = profile.ready_wait_cycles;
       item["scatter_start_cycle"] = profile.scatter_start_cycle;

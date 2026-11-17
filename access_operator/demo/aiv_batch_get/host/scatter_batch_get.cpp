@@ -78,7 +78,7 @@ struct ScatterBatchGet::Impl {
   aclmdlRI graph{};
   aclrtStream graph_stream{}, capture_pending{};
   uint64_t sequence{};
-  bool push_open{}, initialized{}, failed{}, profile_ready{};
+  bool push_open{}, initialized{}, failed{}, profile_ready{}, graph_mailbox{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
   uint64_t ProfileBytes() const { return config.npu_core_count * sizeof(ScatterBatchGetCoreProfile); }
 
@@ -125,6 +125,7 @@ struct ScatterBatchGet::Impl {
   Status CaptureGraph(KvafScatterBatchGetArgs args, aclrtStream stream) {
     args.sequence = 0;
     args.reserved |= kScatterDeviceSequence;
+    if (graph_mailbox) args.reserved |= kScatterGraphMailbox;
     const auto begin = aclmdlRICaptureBegin(stream, ACL_MODEL_RI_CAPTURE_MODE_RELAXED);
     if (begin != ACL_SUCCESS) return AclFailure("graph_capture_begin", begin);
     capture_pending = stream;
@@ -385,6 +386,10 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (overlap_option && std::strcmp(overlap_option, "0") && std::strcmp(overlap_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_OVERLAP_HEAD_CQ must be 0 or 1");
   const bool overlap_head_cq = overlap_option && overlap_option[0] == '1';
+  const char* graph_mailbox_option = std::getenv("KVAF_SCATTER_GRAPH_MAILBOX");
+  if (graph_mailbox_option && std::strcmp(graph_mailbox_option, "0") && std::strcmp(graph_mailbox_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_GRAPH_MAILBOX must be 0 or 1");
+  s.graph_mailbox = graph_mailbox_option && graph_mailbox_option[0] == '1';
   const char* cpu_gather_option = std::getenv("KVAF_SCATTER_CPU_GATHER");
   if (cpu_gather_option && std::strcmp(cpu_gather_option, "0") && std::strcmp(cpu_gather_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
@@ -430,8 +435,8 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u ready_refresh=%u\n",
-               unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys, unsigned(ready_refresh));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u ready_refresh=%u graph_mailbox=%u\n",
+               unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys, unsigned(ready_refresh), unsigned(s.graph_mailbox));
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {

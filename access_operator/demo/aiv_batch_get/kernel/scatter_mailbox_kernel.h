@@ -2,18 +2,21 @@
 
 // Core 0 publishes request phases to registered CPU memory using the same
 // device USER_CTL WRITE format as BatchPut. UB can be reused once the SQ DMA
-// has drained. The control CQ must be checked before publishing the suffix.
+// has drained. A deferred head CQE is checked before publishing the suffix.
 namespace kvaf_scatter {
 using namespace AscendC;
 using namespace kvaf_aiv;
 enum class MailboxPhase { Full, Head, Suffix };
 
 __aicore__ inline uint64_t WaitMailboxCqe(const KvafScatterBatchGetArgs& a,
-    const __gm__ KvafBatchGetDirectUrmaEntity* e, __gm__ KvafBatchGetQueueState* state) {
+    const __gm__ KvafBatchGetDirectUrmaEntity* e, __gm__ KvafBatchGetQueueState* state,
+    bool* pending = nullptr) {
   const auto ci = state->cq_consumer_index;
   const auto cqe = e->cq_va + (ci % e->cq_depth) * e->cqe_size;
   uint64_t result = KVAF_SEQ_TIMEOUT;
-  for (uint32_t poll = 0; poll < a.max_polls; ++poll) {
+  // The Ready wait can try one poll without blocking on this control CQE.
+  const auto polls = pending ? 1U : a.max_polls;
+  for (uint32_t poll = 0; poll < polls; ++poll) {
     Flush(cqe, 32);
     const auto word = *reinterpret_cast<__gm__ volatile uint32_t*>(cqe);
     if (((word >> 2) & 1) == ((ci / e->cq_depth) & 1)) continue;
@@ -22,6 +25,10 @@ __aicore__ inline uint64_t WaitMailboxCqe(const KvafScatterBatchGetArgs& a,
            reinterpret_cast<__gm__ uint32_t*>(e->cq_db_va), 0);
     result = (word & 0xffff0000U) ? KVAF_SEQ_CQ_ERROR : KVAF_SEQ_OK;
     break;
+  }
+  if (pending) {
+    if (result == KVAF_SEQ_TIMEOUT) return KVAF_SEQ_OK;
+    *pending = false;
   }
   if (result) {
     state->last_error = result;
@@ -36,34 +43,46 @@ __aicore__ inline void MarkMailboxPhaseComplete(__gm__ KvafBatchGetQueueState* s
   Flush(reinterpret_cast<uint64_t>(state), sizeof(*state));
 }
 
-__aicore__ inline uint64_t FinishDeferredHead(const KvafScatterBatchGetArgs& a) {
+__aicore__ inline uint64_t RetireDeferredMailbox(const KvafScatterBatchGetArgs& a, bool* pending = nullptr) {
   auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
-  const auto result = WaitMailboxCqe(a, &context->entity, state);
-  if (result == KVAF_SEQ_OK) MarkMailboxPhaseComplete(state);
+  const auto result = WaitMailboxCqe(a, &context->entity, state, pending);
+  if (result == KVAF_SEQ_OK && (!pending || !*pending)) MarkMailboxPhaseComplete(state);
   return result;
+}
+
+__aicore__ inline void RecordSuffixCqWait(__gm__ kvaf::ScatterBatchGetCoreProfile* profile, uint64_t start) {
+  if (profile && start) {
+    const auto elapsed = GetSystemCycle() - start;
+    profile->suffix_cq_blocked_cycles = elapsed > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(elapsed);
+  }
 }
 
 __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_t count,
     __gm__ kvaf::ScatterBatchGetCoreProfile* profile,
-    MailboxPhase phase = MailboxPhase::Full, bool defer_head_cqe = false) {
+    MailboxPhase phase = MailboxPhase::Full, bool defer_tail_cqe = false,
+    bool mailbox_prepared = false) {
   auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
-  if (!context || !state) return KVAF_SEQ_QUEUE_ERROR;
-  // Templates are read by DMA, not Scalar cache.
-  Flush(reinterpret_cast<uint64_t>(context), kvaf::kScatterMailboxTemplateOffset);
-  const auto& e = context->entity;
-  if (e.magic != 0x4b564155U || e.version != 1 || !e.sq_va || !e.sq_db_va ||
-      !e.cq_va || !e.cq_db_va || e.sq_depth < 4 || e.sq_depth % 4 ||
-      !e.cq_depth || e.cqe_size < 32 || e.wqe_size != 64 || !e.local_token_id ||
-      !context->max_write_bytes || context->max_write_bytes > 65536)
-    return KVAF_SEQ_QUEUE_ERROR;
-  if (state->initialized && (state->magic != 0x4b564151U || state->poisoned))
-    return KVAF_SEQ_QUEUE_ERROR;
-  if (!state->initialized) {
-    state->magic = 0x4b564151U; state->initialized = 1;
-    state->sq_producer_index = state->cq_consumer_index = 0;
+  if (!mailbox_prepared) {
+    if (!context || !state) return KVAF_SEQ_QUEUE_ERROR;
+    // Templates are read by DMA, not Scalar cache.
+    Flush(reinterpret_cast<uint64_t>(context), kvaf::kScatterMailboxTemplateOffset);
+    const auto& e = context->entity;
+    if (e.magic != 0x4b564155U || e.version != 1 || !e.sq_va || !e.sq_db_va ||
+        !e.cq_va || !e.cq_db_va || e.sq_depth < 4 || e.sq_depth % 4 ||
+        !e.cq_depth || e.cqe_size < 32 || e.wqe_size != 64 || !e.local_token_id ||
+        !context->max_write_bytes || context->max_write_bytes > 65536)
+      return KVAF_SEQ_QUEUE_ERROR;
+    if (state->initialized && (state->magic != 0x4b564151U || state->poisoned))
+      return KVAF_SEQ_QUEUE_ERROR;
+    if (!state->initialized) {
+      state->magic = 0x4b564151U; state->initialized = 1;
+      state->sq_producer_index = state->cq_consumer_index = 0;
+    }
   }
+  const auto& e = context->entity;
+  const auto max_write_bytes = context->max_write_bytes;
   // Never copy the intervening done/Ready lines: CPU owns them as WRITE
   // sources and could still be retiring the previous request's final CQE.
   const uint32_t head = phase == MailboxPhase::Full ? count : kvaf::cpu_push::kChunkRows;
@@ -93,8 +112,7 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
     uint32_t wrs = 0;
     while (wrs < limit && region < regions) {
       const auto remaining = lengths[region] - offset;
-      const auto bytes = remaining < context->max_write_bytes ?
-          static_cast<uint32_t>(remaining) : context->max_write_bytes;
+      const auto bytes = remaining < max_write_bytes ? static_cast<uint32_t>(remaining) : max_write_bytes;
       const auto local = a.workspace + offsets[region] + offset;
       const auto remote = e.remote_host_ddr_address + offsets[region] + offset;
       offset += bytes;
@@ -126,10 +144,13 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
     state->sq_producer_index = pi + wrs;
     // Timestamp publication, before waiting for its CQE. CPU can already
     // start payload DMA while core 0 retires this control completion.
-    if (region == regions && profile && !suffix) profile->notify_cycle = GetSystemCycle();
+    const bool last = region == regions;
+    if (last && profile && !suffix) profile->notify_cycle = GetSystemCycle();
     st_dev(static_cast<uint32_t>(pi + wrs), reinterpret_cast<__gm__ uint32_t*>(e.sq_db_va), 0);
-    if (phase == MailboxPhase::Head && defer_head_cqe && region == regions) return KVAF_SEQ_OK;
+    if (last && defer_tail_cqe) return KVAF_SEQ_OK;
+    const auto start = last && suffix && profile ? GetSystemCycle() : 0;
     const auto result = WaitMailboxCqe(a, &context->entity, state);
+    RecordSuffixCqWait(profile, start);
     if (result) return result;
   }
   MarkMailboxPhaseComplete(state);
