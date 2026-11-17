@@ -171,6 +171,42 @@ core 0 在 Suffix 提交后即可消费已经 Ready 的分片，在等 Ready 的
 `aiv_suffix_cq_blocked_us` 记录最后一个 Suffix CQE 的阻塞等待。CQE 已在 Ready 空档回收时，
 该指标为零。端到端对照可先关闭 profiling，再开 profiling 对比这个计时和 `aiv_wall_us`。
 
+### 将 Scatter 捕获到调用方的图
+
+先在图外完成 Runtime 初始化、填表和 AccessTable 准备。如果已经提交过 Scatter，先完成状态校验。
+调用方持有图和 stream，KVAF 将一个异步 Scatter 节点提交到正在捕获的 stream。图中依赖输出的
+NPU 操作可以在同一 stream 排在该节点后面。
+
+```python
+capture_batch_get = runtime.prepare_scatter_batch_get(
+    view, indices, offsets, miss_count, output_indices, output,
+    stream=stream, capture_into_graph=True,
+)
+graph = torch.npu.NPUGraph()
+with torch.npu.graph(graph, stream=stream):
+    capture_batch_get()
+    # 在这里提交现有推理图中依赖 output 的操作。
+
+# 可以按 stream 顺序原地更新固定地址的输入。
+with torch.npu.stream(stream):
+    graph.replay()
+runtime.check_scatter_graph_replay()  # 整图提交后同步并校验本次 KVAF 状态。
+
+stream.synchronize()
+graph.reset()
+runtime.detach_scatter_batch_get_graph()
+```
+
+每个 Runtime 支持挂接一个 Scatter 节点。保留 prepared callable、Runtime、stream、Tensor 和
+AccessTable，直到调用方完成回放、销毁图并 detach。每次 replay 后调用一次
+`check_scatter_graph_replay()`，再开始下一轮。检查失败时丢弃该次推理结果并结束会话。
+框架若在检查前写入持久状态，需要在设备侧门控这些写入，或提供回滚。
+启用 Scatter profiling 时，在状态检查后调用 `scatter_profile()` 读取 AIV/K 端数据。
+
+性能脚本使用 `--caller-acl-graph --completion-scope stream` 验证调用方捕获、回放和校验，
+CSV 标记为 `caller_acl_graph`。脚本只捕获 BatchGet，状态校验在样本计时窗口外。
+共享提交的收益应在包含该节点的实际推理图里测量。
+
 ## 构建与完整回归
 
 CPU 端使用与部署环境匹配的 UMDK 重编并启动服务：

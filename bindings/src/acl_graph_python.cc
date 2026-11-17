@@ -158,10 +158,9 @@ class AclGraph final {
           "ACLGraph capture is active; call capture_end before reset");
     }
     if (graph_ != nullptr) {
-      const aclError error = aclmdlRIDestroy(graph_);
+      ThrowIfAclError(aclmdlRIDestroy(graph_), "aclmdlRIDestroy");
       graph_ = nullptr;
       stream_ = nullptr;
-      ThrowIfAclError(error, "aclmdlRIDestroy");
     }
   }
 

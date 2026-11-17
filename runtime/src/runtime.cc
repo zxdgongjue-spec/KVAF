@@ -250,7 +250,11 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
   if (execution.trusted_npu_request) {
     scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
-    if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+    // A failed shutdown leaves the operator alive so the caller can detach
+    // its graph and retry cleanup.
+    const bool detach_for_cleanup = needs_cleanup_ && execution.scatter_graph == ScatterGraphAction::kDetach;
+    if (!initialized_ && !detach_for_cleanup)
+      return Status::NotInitialized("Runtime has not been initialized");
     validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
   }
