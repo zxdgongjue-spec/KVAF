@@ -18,6 +18,9 @@ CPU service；分支内全部用例共用这个服务，切换分支前停止服
 四种后端分别使用 AIV 2 核、UBMEM 16 核、Gather 5 worker、Scatter 5 worker，
 覆盖 2048、4096、8192 个有效请求，每组预热 10 次、正式采样 100 次。
 每组均测 eager 和 graph，并保留设备 kernel 时间与对应带宽。
+脚本显式使用 `--kernel-profile`。当前分支的该参数会开启设备采集，
+UBMEM 同时采集细分阶段；旧 main 的 UBMEM 默认只采总时间，
+这两种采集粒度下的耗时包含不同的打点开销，比较 UBMEM 时须按此区分结果。
 
 ## Eager 只计提交和设备完成等待
 

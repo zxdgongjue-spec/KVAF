@@ -79,8 +79,10 @@ Get 性能测试的具体计时与带宽定义见[统一 Get 性能测试](batch
 
 AIV/UBMEM eager 完成路径不清零、回读或检查 Get 状态报告；ACL 失败仍返回错误。
 显式 profile 快照在计时外读取并验证设备报告。UBMEM Put 和 graph 释放保留各自检查。
-`scope=end_to_end` 报告 Host 时间，`scope=kernel` 报告设备时间；两者分别计算带宽。
-`--kernel-profile` 增加详细分段输出；`--no-kernel-profile` 仍保留 kernel 指标。
+默认关闭 profiling，仅 `scope=end_to_end` 报告 Host 时间和带宽。
+上面的命令显式加入 `--kernel-profile`，开启算子打点、profile 回读及详细输出，
+并增加 `scope=kernel` 的设备时间与带宽；UBMEM 同时采集地址/MTE/drain 细分时间。
+测无 profiling 的端到端性能时去掉该参数，eager 和 graph 均适用。
 Graph 回放不重新进入 Host Dispatcher，不能代替 eager 调度开销测量。
 
 ## Put 使用同步性能入口

@@ -213,9 +213,7 @@ def configure_backend_help(parser, argv=None):
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
-    if backend != "ubmem":
-        hidden.add("ubmem_profile_detail")
-    else:
+    if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:
         hidden.add("kernel_profile_clock_mhz")

@@ -6,8 +6,8 @@ dimension. The request-array length, AccessTable capacity, block layout and
 exact ``miss_count`` are independent inputs. BatchPut is used only to populate
 the remote table before measurement and is never included in the timing.
 Select implementations with --backend and eager/graph with --execution.
-Host and operator time/bandwidth reuse the existing device profiling data.
---kernel-profile additionally prints stage/per-worker diagnostics.
+Host time/bandwidth are always reported. --kernel-profile enables device
+profiling, readback and stage/per-worker diagnostics; profiling is off by default.
 --get-timing async-wait measures submit plus device synchronization like main;
 completion checks and request retirement still run after each timed call.
 
@@ -25,8 +25,7 @@ environment variables:
     --output-access-pattern
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
-    --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
-    --ubmem-profile-detail  per-row diagnostic timing (requires --kernel-profile)
+    --kernel-profile       enable device profiling, including UBMEM detail
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
 """
@@ -49,7 +48,7 @@ from utils.dsa_keys import build_dsa_keys
 from utils.get_graph import GraphInputs, captured_get, validate_graph_inputs
 from utils.get_options import (
     MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
-    environment_bool, environment_int, resolve_backend, uses_aicpu, validate_workload,
+    environment_int, resolve_backend, uses_aicpu, validate_workload,
 )
 from utils.perf_execution import BenchmarkExecution, add_execution_metadata
 from utils.statistics import percentile
@@ -64,14 +63,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_backend_arguments(parser)
     parser.add_argument("--iterations", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
-    profiling = parser.add_mutually_exclusive_group()
-    profiling.add_argument("--kernel-profile", dest="kernel_profile", action="store_true",
-                           help="print detailed stages; device time/bandwidth are always collected")
-    profiling.add_argument("--no-kernel-profile", dest="kernel_profile", action="store_false",
-                           help="hide detailed output; device profiling remains enabled")
-    parser.set_defaults(kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"))
-    parser.add_argument("--ubmem-profile-detail", action="store_true",
-                        help="UBMEM only: collect extra address/MTE/drain timings; requires --kernel-profile")
+    parser.add_argument("--kernel-profile", action="store_true",
+                        help="enable device profiling and detailed output, including UBMEM address/MTE/drain timings; default: off")
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
                             environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
@@ -108,11 +101,9 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "device-id must be non-negative"
     if args.graph_replays <= 0:
         return "graph-replays must be positive"
-    if args.ubmem_profile_detail and (args.backend != "ubmem" or not args.kernel_profile):
-        return "ubmem-profile-detail requires --backend ubmem and --kernel-profile"
     if args.iterations <= 0:
         return "iterations must be positive"
-    if args.kernel_profile_clock_mhz <= 0:
+    if args.kernel_profile and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     if args.contention_control_dir is not None:
         if args.contention_graph_calls != 1:
@@ -121,7 +112,7 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "contention worker uses its own graph execution; omit --execution"
         if args.contention_result is None or args.miss_count <= 0:
             return "contention mode requires a result path and positive miss-count"
-        if args.kernel_profile or args.ubmem_profile_detail:
+        if args.kernel_profile:
             return "contention mode measures sustained graph throughput without device profiling"
     return None
 
@@ -155,8 +146,9 @@ def device_profile_ms(profiles, clock_mhz):
 
 
 def start_kernel_measurement(args, runtime):
-    # The sweeps already use these timestamps. Keep their sampling unchanged.
-    runtime.start_batch_get_kernel_profile(detailed=args.ubmem_profile_detail)
+    if not args.kernel_profile:
+        return False
+    runtime.start_batch_get_kernel_profile(detailed=args.backend == "ubmem")
     return True
 
 
@@ -181,7 +173,7 @@ def print_aicpu_details(args, execution, samples):
 def print_measurements(args, execution, samples, profiles):
     """Keep end-to-end and operator wall time distinct; count payload once."""
     scopes = [("end_to_end", samples, "host_perf_counter")]
-    profiling = True
+    profiling = args.kernel_profile
     if profiling and (len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles)):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     if profiling:
@@ -259,7 +251,8 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             graph.synchronize()
             durations.append((time.perf_counter() - start) * 1000)
             check(inputs.fixed, args.miss_count)
-            profiles.append(list(runtime.batch_get_kernel_profile()))
+            if args.kernel_profile:
+                profiles.append(list(runtime.batch_get_kernel_profile()))
         graph.validated = True
         print_measurements(args, "graph", durations, profiles)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
@@ -602,7 +595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "FAIL: rebuild KVAF with the selected NPU backend and Python bindings."
         )
         return 2
-    if args.contention_control_dir is None and not all(
+    if args.kernel_profile and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in ("start_batch_get_kernel_profile", "stop_batch_get_kernel_profile", "batch_get_kernel_profile")
     ):
@@ -910,6 +903,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
         kernel_profile_started = start_kernel_measurement(args, runtime)
         if kernel_profile_started:
             print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
+        else:
+            print("BATCH_GET_KERNEL_PROFILE_DISABLED")
 
         print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
               "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "
@@ -1038,8 +1033,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                                 device_table, miss_count, output, check_output, execution)
         if kernel_profile_started:
             runtime.stop_batch_get_kernel_profile()
+            print("BATCH_GET_KERNEL_PROFILE_DISABLED")
         kernel_profile_started = False
-        print("BATCH_GET_KERNEL_PROFILE_DISABLED")
         print("BATCH_GET_PERF_PHASE_DONE phase=batch_get")
         execution.release_output(runtime)
         return 0

@@ -48,7 +48,6 @@ def run_group(args, devices, directory):
                 str(runner), str(args.build_dir),
                 *workload_command(args),
                 "--graph-api", args.graph_api, "--graph-replays", str(args.graph_replays),
-                "--no-kernel-profile",
                 "--contention-control-dir", str(directory),
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),

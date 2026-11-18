@@ -41,9 +41,16 @@ UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 提交后外部同步设备并停止计时，再单独测量 drain。该选项不降低实际的请求清理成本。
 Graph 固定测 replay 加 stream 等待，资源准备、输出校验和 profile 读取均在计时外。
 
-`BATCH_GET_RESULT` 同时输出 `scope=end_to_end` 和 `scope=kernel`，
+默认关闭算子 profiling，只输出 `BATCH_GET_RESULT scope=end_to_end` 的 Host 延迟和带宽。
+加上 `--kernel-profile` 才开启设备打点、每轮 profile 回读和详细分段输出，
+并增加 `scope=kernel` 的设备时间和带宽。eager 和 graph 使用同一开关。
+UBMEM 同时开启地址准备、MTE 提交和最终 drain 的细分采样。
+仅显式传入 `--kernel-profile` 时启用采集。
+关闭 profiling 时没有设备时间戳，因此不输出 kernel 指标。
+
 时间单位为微秒，带宽使用有效载荷一次除以对应耗时；`p50_GBps` 对应 P50 延迟。
-`--kernel-profile` 增加阶段明细；`--no-kernel-profile` 仅隐藏明细，保留 kernel 指标。
+上述示例显式启用了 profiling；测无 profiling 的端到端性能时，去掉 `--kernel-profile`。
+开启后算子内打点的开销计入测得时间，profile 回读和结果打印在计时外。
 阶段可嵌套或重叠，各段 P50 不能相加得到总 P50。
 
 ## 扫描负载与比较分支
