@@ -26,7 +26,7 @@ environment variables:
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
     --jetty-csv            KVAF_BATCH_GET_JETTY_CSV
     --execution-mode      eager (default) or graph
-    --graph-ring          BatchGet calls per graph replay (default 8)
+    --graph-ring          BatchGet calls per graph replay (default 100)
     adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
     adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
@@ -233,8 +233,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--execution-mode", choices=("eager", "graph"), default="eager",
                         help="graph captures a fixed request ring and replays it per iteration")
-    parser.add_argument("--graph-ring", type=int, default=8,
-                        help="BatchGet calls per graph replay (default: 8); ignored in eager mode")
+    parser.add_argument("--graph-ring", type=int, default=100,
+                        help="BatchGet calls captured in one graph (default: 100); ignored in eager mode")
     parser.add_argument(
         "--populate-chunk-entries",
         type=int,

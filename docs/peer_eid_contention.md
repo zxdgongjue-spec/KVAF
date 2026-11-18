@@ -182,8 +182,9 @@ CPU EID 的选择规则不变：总 Jetty 数不足时仅选择列表前面的 E
 
 每条流在计时前按原访问模式生成固定请求 ring，保持所有请求张量的地址和生命周期，
 在独立 NPU Stream 上捕获 ring 次 BatchGet。各次 Get 顺序执行，共用输出 HBM。
-默认 `--graph-ring 8`，每轮屏障后只提交一次图重放。`--warmup 3` 表示预热 3 次整图，
-`--iterations 100` 表示测量 100 次整图，即每条流测量 800 次 Get。
+默认 `--graph-ring 100`，即**一张图内捕获 100 次 Get，每轮屏障后只提交一次整图重放**。
+`--warmup 3` 表示预热 3 次整图，`--iterations 100` 表示测量 100 轮整图，
+即每条流测量 10000 次 Get；图内 100 次 Get 之间不插入 Host 屏障。
 Graph 捕获后另做一次重放，并校验最后一组请求的输出；该校验不计入 warmup 或 samples。
 请求生成、注册预备调用、捕获、校验、预热、屏障等待及 profile 读取均不计入测量窗口。
 
@@ -191,7 +192,7 @@ Graph 捕获后另做一次重放，并校验最后一组请求的输出；该�
 `--execution-mode eager` 恢复原来的逐次调用；这两个选项也可放在 `--flowN-args`
 中覆盖单条流。各流允许不同 ring，仍须使用相同的 `--iterations`。
 直接运行单卡 `run_remote_cpu_batch_get_miss_count_perf.sh` 默认仍为 eager，
-加 `--execution-mode graph --graph-ring 8` 即可启用图模式。
+加 `--execution-mode graph --graph-ring 100` 即可启用图模式。
 random 模式在准备 ring 时采样，之后每轮重放相同 ring；contiguous 模式仍遵循原有连续访问规则。
 
 父输出目录新增三个文件，原有 `flowN` 内的日志、profile 和 CSV 保留：
@@ -275,7 +276,7 @@ python3 tests/python/run_concurrent_batch_get.py "$PWD/build-npu" \
 两者独立。默认 profiler 在 benchmark 预热完成后启动，跳过 0 轮，预热 1 轮，
 记录第 1、2、3 轮（从 0 编号），只采集一个周期：
 `iterations >= profiler-wait + profiler-warmup + profiler-active`。
-默认 `ring=8` 时，3 个 active 轮次包含每流 24 次 Get。后续测量轮次照常运行。
+默认 `ring=100` 时，3 个 active 轮次包含每流 300 次 Get。后续测量轮次照常运行。
 这些选项也可在 `--flowN-args` 中覆盖；建议各流使用相同采集计划，
 单条流可用 `--no-torch-npu-profiler` 关闭。
 采集配置使用 `ProfilerActivity.CPU/NPU`、`repeat=1` 和 Text 导出，
@@ -330,9 +331,80 @@ Profiler 采集和打点会增加运行开销；开启时 JSON 顶层和各流�
 单卡原脚本也支持采集；在原有选卡/EID/shape 参数后追加：
 
 ```bash
---execution-mode graph --graph-ring 8 \
+--execution-mode graph --graph-ring 100 \
 --torch-npu-profiler --profiler-dir "$PWD/results/single-profiler-001" \
 --profiler-warmup 1 --profiler-active 3 --iterations 10
+```
+
+### profiler 共同区间与空泡
+
+所有流都是 graph 模式且都开启 `--torch-npu-profiler` 时，父进程在各流完成并导出
+`trace_view.json` 后自动计算。本功能读取设备任务 `KvafExecuteBatchGetAivKernelV3`
+的起止时间；使用 CANN 导出的原始对齐时间基准，不将各卡第一次事件平移对齐，
+不直接比较各卡的 Event 或 core cycle 绝对时间。时间戳中的微秒转换为整数纳秒后计算。
+kernel 必须出现在对应轮次的 Host 提交至同步完成区间中，且数量与该流 graph-ring 一致；
+缺少任务、符号不匹配、重复任务或缺少轮次标记时会报错，保留原始 trace，避免生成错误带宽。
+
+以四卡各一条流为例，每轮的公式如下：
+
+```text
+T0 = max(卡0第1次Get开始, 卡1第1次Get开始, 卡2第1次Get开始, 卡3第1次Get开始)
+T1 = min(卡0第100次Get结束, 卡1第100次Get结束, 卡2第100次Get结束, 卡3第100次Get结束)
+
+入选 Get：begin >= T0 且 end <= T1
+每卡平均带宽 GB/s = sum(入选 Get 的 miss_count * token_bytes) / sum(入选 Get 的 duration_ns)
+```
+
+边界相等的 Get 纳入；跨越边界的 Get 整次剔除，不按比例估算部分流量。
+跨轮汇总也使用总入选字节数除以总入选耗时，不平均各轮的带宽。
+若某轮没有共同区间或某卡没有完整 Get，记录入选次数 0、带宽 `null`（CSV 空白），
+不将带宽记为 0 或无穷大。单卡多流场景，各流分别筛选，device 汇总按入选 Get
+的总字节数/总 kernel 耗时计算平均 Get 带宽，不表示多条流相加的端口总吞吐。
+
+只使用**各流共同被 profiler 记录的轮次**，记录在 `profiler_overlap.round_indices`。
+默认采集第 1～3 轮，仍只分析这 3 轮。要分析所有 10 个测量轮次，在已有多流命令中使用：
+
+```bash
+--torch-npu-profiler --graph-ring 100 \
+--profiler-wait 0 --profiler-warmup 0 --profiler-active 10
+```
+
+同时将每条流 `--flowN-args` 中的 `--iterations` 设为 10。benchmark 自身的 `--warmup 3`
+仍然生效。Profiler 开启时的采集开销会影响执行，因此应在相同 profiler 配置下比较。
+未在所有 graph 流上启用 profiler 时，`profiler_overlap=null`，不提供筛选后的平均带宽。
+
+结果写入以下位置：
+
+| 位置 | 内容 |
+| --- | --- |
+| JSON `profiler_overlap.devices.<device_id>.mean_GBps` | 每卡入选 Get 的平均带宽 |
+| JSON `flows.flowN.overlap_mean_GBps` | 每条流入选 Get 的平均带宽 |
+| JSON `profiler_overlap.flows.flowN` | 入选次数、字节数、kernel 总耗时、使用的轮次和空泡统计 |
+| `concurrent_batch_get_overlap_rounds.csv` | 每轮/每流的 T0、T1、入选次数、带宽和空泡统计 |
+| `concurrent_batch_get_gets.csv` | 各次 Get 的起止/耗时、设备 Stream、字节数和 `selected` 标记 |
+| `concurrent_batch_get_devices.csv` | 每卡入选次数、总字节数、总 kernel 耗时和平均带宽 |
+| `flowN/batch_get_miss_sweep_summary.csv` | 新增 `overlap_mean_GBps`、入选计数/耗时及空泡字段；原 `p50_GBps` 仍是 last-get kernel 诊断值 |
+
+原 JSON `device_event_GBps` 仍表示整图 Event 带宽，顶层 `aggregate_GBps` 仍表示共同
+Host 包络的总吞吐；查看本次要求的各卡平均带宽，应使用上表的 `mean_GBps`。
+新指标的分母来自 profiler 的 kernel 时长，明确区别于原整图 Event 时长。
+
+空泡按同一设备 Stream 的相邻 Get 计算：
+
+```text
+gap[i] = begin[i+1] - end[i]
+gap_fraction = sum(整图内 gap) / (最后一次 Get 结束 - 第一次 Get 开始)
+```
+
+`gap_mean_us`、`gap_p50_us`、`gap_max_us` 分别是间隙的均值、中位数和最大值。
+空泡统计覆盖共同采集轮次内的完整图，包含边界之外的 Get；平均带宽的分母只包含入选
+kernel 时间，不包含间隙。不能仅由整图 Event 带宽与单次 Get 的 p50 带宽差值推断空泡大小。
+
+已有 profiler 输出也可离线重算，不修改原 CSV；新目录写入三张明细表和独立汇总 JSON：
+
+```bash
+python3 tests/python/batch_get_profiler_overlap.py results/two-flows-profiler-001 \
+    --report-dir results/two-flows-profiler-analysis-001
 ```
 
 ### 四张 NPU 分别访问四个 CPU service

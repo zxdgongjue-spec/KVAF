@@ -143,7 +143,7 @@ class ProfilerTests(unittest.TestCase):
             self.assertEqual(api.parse_calls[0][1], dict(max_process_number=1))
             metadata = json.loads((api.output / "collection.json").read_text())
             self.assertEqual(metadata["first_active_round"], 2)
-            self.assertEqual(metadata["calls_per_round"], 8)
+            self.assertEqual(metadata["calls_per_round"], 100)
             self.assertTrue(metadata["performance_numbers_include_profiler_overhead"])
             self.assertIn("BATCH_GET_TORCH_NPU_TRACE_WRITTEN", output.getvalue())
             # Rerunning the same shape cannot masquerade as a fresh collection.

@@ -60,6 +60,8 @@ class BatchGetProfiler:
         calls = args.graph_ring if args.execution_mode == "graph" else 1
         self.metadata = dict(worker=self.worker, device_id=os.environ.get("DEVICE_ID", "0"),
                              execution_mode=args.execution_mode, calls_per_round=calls,
+                             iterations=args.iterations, payload_bytes_per_get=args.miss_count * args.token_bytes,
+                             kernel_name="KvafExecuteBatchGetAivKernelV3",
                              wait=args.profiler_wait, warmup=args.profiler_warmup,
                              active=args.profiler_active, repeat=1, level=args.profiler_level,
                              first_active_round=args.profiler_wait + args.profiler_warmup,

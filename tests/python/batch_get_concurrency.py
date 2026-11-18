@@ -211,7 +211,7 @@ def coordinate_rounds(listener, tokens, check_health, deadline, emit):
     return samples, measurements
 
 
-def report_results(samples, measurements, output_dir, emit):
+def report_results(samples, measurements, output_dir, emit, *, profiler_overlap=None):
     total_bytes = sum(row["payload_bytes"] for row in samples)
     total_ns = sum(row["window_ns"] for row in samples)
     summary = dict(synchronization="per_iteration", timing="host_call_to_device_synchronize",
@@ -244,6 +244,15 @@ def report_results(samples, measurements, output_dir, emit):
                         device_event_GBps=sum(row["payload_bytes"] for row in rows) / (device_ms * 1_000_000),
                         profile_scope="last_get_in_replay")
         summary["flows"][name] = flow
+    summary["profiler_overlap"] = profiler_overlap
+    if profiler_overlap is not None:
+        for name, flow in summary["flows"].items():
+            selected = profiler_overlap["flows"][name]
+            flow.update(overlap_mean_GBps=selected["mean_GBps"],
+                        overlap_selected_gets=selected["selected_gets"],
+                        overlap_selected_payload_bytes=selected["selected_payload_bytes"],
+                        overlap_selected_kernel_ns=selected["selected_kernel_ns"],
+                        overlap_rounds=profiler_overlap["rounds"])
     if output_dir is not None:
         output = Path(output_dir)
         for filename, rows in zip(REPORT_FILES[:2], (samples, measurements)):
@@ -255,7 +264,7 @@ def report_results(samples, measurements, output_dir, emit):
             json.dump(summary, stream, indent=2)
             stream.write("\n")
     emit("BATCH_GET_CONCURRENT_SUMMARY " + " ".join(
-        f"{key}={value}" for key, value in summary.items() if key != "flows"))
+        f"{key}={value}" for key, value in summary.items() if key not in ("flows", "profiler_overlap")))
     for name, flow in summary["flows"].items():
         emit(f"BATCH_GET_CONCURRENT_FLOW_SUMMARY flow={name} " + " ".join(
             f"{key}={value}" for key, value in flow.items()))

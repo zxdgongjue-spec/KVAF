@@ -25,6 +25,7 @@ import time
 import test_npu_batch_get_perf as perf
 import batch_get_concurrency as concurrency
 from batch_get_profiler import add_profiler_arguments
+import batch_get_profiler_overlap as profiler_overlap
 from npu_eids import parse_npu_eids
 
 
@@ -58,8 +59,8 @@ Existing flow output directories are refused to prevent overwriting results.
 All flows must use the same --iterations. Preparation, barrier waits and
 profile collection are outside the per-round host timing window. The parent
 directory receives concurrent_batch_get_{samples,flows}.csv and a summary JSON.
-Graph mode is the default: each iteration replays --graph-ring BatchGet calls
-(default 8). --warmup counts graph replays. Kernel/Jetty/peer profiles describe
+Graph mode is the default: each iteration replays ONE graph containing
+--graph-ring BatchGet calls (default 100). --warmup counts graph replays. Kernel/Jetty/peer profiles describe
 only the last call in each replay. NPU Event durations cover the entire graph.
 Use --execution-mode eager to compare with the original per-call benchmark.
 Both execution options can also be overridden in --flowN-args.
@@ -67,12 +68,17 @@ Use --torch-npu-profiler to record CPU/NPU timelines under output-dir/flowN/prof
 By default the profiler warms up for 1 measured round and records 3 rounds once.
 iterations must cover profiler-wait + profiler-warmup + profiler-active.
 Profiling adds overhead; raw data parsing happens after all measured rounds.
+When all graph flows enable profiling, the launcher also selects complete Gets
+inside the shared device interval (latest first start to earliest last end).
+Their mean bandwidth is selected bytes / sum(selected kernel durations).
+Only profiler-active rounds are included; use --profiler-warmup 0 and
+--profiler-active equal to iterations to analyze every measured round.
 """)
     parser.add_argument("build_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--execution-mode", choices=("graph", "eager"), default="graph")
-    parser.add_argument("--graph-ring", type=int, default=8,
-                        help="BatchGet calls per graph replay (default: 8)")
+    parser.add_argument("--graph-ring", type=int, default=100,
+                        help="BatchGet calls captured in one graph (default: 100)")
     add_profiler_arguments(parser, output=False)
     parser.add_argument("--address-space-bytes", type=int,
                         help="remote DDR budget in bytes per flow; override in --flowN-args")
@@ -156,6 +162,8 @@ def build_flow(args, name):
     env = dict(os.environ, DEVICE_ID=str(getattr(args, f"{name}_device")),
                PYTHONUNBUFFERED="1",
                KVAF_BATCH_GET_FLOW_NAME=name,
+               KVAF_BATCH_GET_PROFILER_OVERLAP=str(int(benchmark.torch_npu_profiler
+                                                      and benchmark.execution_mode == "graph")),
                KVAF_BATCH_GET_JETTY_PRIORITIES=",".join(str(int(p)) for p in priorities),
                KVAF_BATCH_GET_SWEEP_TOKEN_BYTES=str(benchmark.token_bytes),
                KVAF_BATCH_GET_SWEEP_MISS_COUNTS=str(benchmark.miss_count),
@@ -271,7 +279,18 @@ def run_flows(flows, timeout, output_dir=None):
             code = next((p.returncode if p.returncode > 0 else 128 - p.returncode
                          for p in processes if p.returncode), 0)
             if code == 0:
-                concurrency.report_results(samples, measurements, output_dir, emit)
+                overlap = None
+                if all(env.get("KVAF_BATCH_GET_PROFILER_OVERLAP") == "1" for _, _, env in flows):
+                    overlap = profiler_overlap.analyze_flows(flows)
+                    profiler_overlap.write_reports(overlap, output_dir, flows)
+                    emit("BATCH_GET_PROFILER_OVERLAP_SUMMARY "
+                         f"rounds={overlap['summary']['rounds']} "
+                         "mean_bandwidth=selected_bytes/sum_selected_kernel_durations")
+                    for name, row in overlap["summary"]["flows"].items():
+                        emit(f"BATCH_GET_PROFILER_OVERLAP_FLOW flow={name} "
+                             f"selected_gets={row['selected_gets']} mean_GBps={row['mean_GBps']}")
+                concurrency.report_results(samples, measurements, output_dir, emit,
+                                           profiler_overlap=None if overlap is None else overlap["summary"])
             finished = True
             return code
         finally:
@@ -296,7 +315,7 @@ def main(argv=None):
         flows = [build_flow(args, name) for name in args.flow_names]
         if len({env["KVAF_BATCH_GET_CONCURRENT_ITERATIONS"] for _, _, env in flows}) != 1:
             raise ValueError("all flows must use the same --iterations for per-iteration synchronization")
-        for filename in concurrency.REPORT_FILES:
+        for filename in (*concurrency.REPORT_FILES, *profiler_overlap.REPORT_FILES):
             if (args.output_dir / filename).exists():
                 raise ValueError(f"output already exists: {args.output_dir / filename}")
         for name, _, _ in flows:

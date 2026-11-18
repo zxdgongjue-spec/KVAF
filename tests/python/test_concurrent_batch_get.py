@@ -185,6 +185,33 @@ class ConcurrentFixture(unittest.TestCase):
 
 
 class ConcurrentTests(ConcurrentFixture):
+    def test_launcher_adds_profiler_overlap_reports_after_workers_finish(self):
+        from test_batch_get_profiler_overlap import make_trace
+
+        flows = self.flows("normal", "normal")
+        for index, (name, _, env) in enumerate(flows):
+            folder = self.output / name
+            device = int(env["DEVICE_ID"])
+            start = 100 + index * 2
+            make_trace(folder, device, [[(start + i * 10, start + i * 10 + 8) for i in range(3)]])
+            env.update(KVAF_BATCH_GET_PROFILER_OVERLAP="1", KVAF_TEST_EXECUTION_MODE="graph",
+                       KVAF_TEST_GRAPH_RING="3", KVAF_TEST_PROFILER="1",
+                       KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=str(folder),
+                       KVAF_BATCH_GET_MISS_SWEEP_CSV=str(folder / "batch_get_miss_sweep_summary.csv"))
+        with contextlib.redirect_stdout(io.StringIO()) as console:
+            self.assertEqual(launcher.run_flows(flows, 5, self.output), 0)
+        summary = json.loads((self.output / concurrency.REPORT_FILES[2]).read_text())
+        self.assertEqual(summary["profiler_overlap"]["round_indices"], [0])
+        self.assertEqual(summary["flows"]["flow1"]["overlap_selected_gets"], 2)
+        self.assertEqual(summary["flows"]["flow2"]["overlap_selected_gets"], 2)
+        self.assertAlmostEqual(summary["profiler_overlap"]["devices"]["7"]["mean_GBps"], 0.125)
+        self.assertIn("BATCH_GET_PROFILER_OVERLAP_SUMMARY", console.getvalue())
+        for name, _, env in flows:
+            with Path(env["KVAF_BATCH_GET_MISS_SWEEP_CSV"]).open() as stream:
+                row, = csv.DictReader(stream)
+            self.assertEqual(row["overlap_selected_gets"], "2")
+            self.assertEqual(row["p50_GBps"], "777.000")
+
     def test_profiler_options_and_paths_are_isolated_per_flow(self):
         args = self.args(extra=["--torch-npu-profiler", "--profiler-wait", "2",
                                 "--profiler-warmup", "1", "--profiler-active", "4",
@@ -211,11 +238,11 @@ class ConcurrentTests(ConcurrentFixture):
 
     def test_graph_defaults_and_explicit_execution_overrides(self):
         for extra, flow_options, expected_mode, expected_ring in (
-                ([], "", "graph", 8),
+                ([], "", "graph", 100),
                 (["--graph-ring", "4"], "", "graph", 4),
-                (["--execution-mode", "eager"], "", "eager", 8),
+                (["--execution-mode", "eager"], "", "eager", 100),
                 (["--graph-ring", "4"], "--execution-mode graph --graph-ring 2", "graph", 2),
-                ([], "--execution-mode eager", "eager", 8)):
+                ([], "--execution-mode eager", "eager", 100)):
             with self.subTest(extra=extra, flow_options=flow_options), patch.dict(os.environ, self.env, clear=True):
                 args = self.args(options=flow_options, extra=extra)
                 _, command, _ = launcher.build_flow(args, "flow1")
@@ -308,8 +335,9 @@ class ConcurrentTests(ConcurrentFixture):
                 summary = json.loads((output / concurrency.REPORT_FILES[2]).read_text())
                 self.assertEqual(summary["samples"], 3)
                 self.assertEqual(summary["flow_count"], count)
-                self.assertEqual(summary["total_payload_bytes"], count * 3 * 1024 * 8)
+                self.assertEqual(summary["total_payload_bytes"], count * 3 * 1024 * 100)
                 self.assertEqual(summary["execution_mode"], "graph")
+                self.assertIsNone(summary["profiler_overlap"])
 
     def test_service_override_only_changes_its_own_flow(self):
         shared_addr = "192.0.2.1:29000"
@@ -722,7 +750,7 @@ class SweepCompatibilityTests(ConcurrentFixture):
                     with (pair_output / "batch_get_miss_sweep_summary.csv").open() as stream:
                         row, = csv.DictReader(stream)
                     self.assertEqual((row["execution_mode"], row["calls_per_replay"], row["profile_scope"]),
-                                     ("graph", "8", "last_get_in_replay"))
+                                     ("graph", "100", "last_get_in_replay"))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux timeout/process group check")
     def test_real_perf_timeout_stays_in_launcher_group(self):
