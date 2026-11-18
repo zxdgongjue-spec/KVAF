@@ -109,14 +109,17 @@ struct BatchGetTransport::Impl {
   // DrainSlot runs before the next launch is built, so this still describes the
   // kernel that actually failed even when the error surfaces one submit later.
   struct LastLaunch {
-    std::string number, bytes, capacity, token_bytes, spans, workers, output, extent, sequence;
+    std::string number, bytes, capacity, token_bytes, spans, workers, output, extent, sequence,
+        notify, ack, command, staging, descriptor;
   };
   std::string LastLaunchText() const {
     return " #" + last_launch.number + " bytes=" + last_launch.bytes +
            " cap=" + last_launch.capacity + " token_bytes=" + last_launch.token_bytes +
            " spans=" + last_launch.spans + " workers=" + last_launch.workers +
            " output=" + last_launch.output + " extent=" + last_launch.extent +
-           " sid=" + last_launch.sequence;
+           " sid=" + last_launch.sequence + " notify=" + last_launch.notify +
+           " ack=" + last_launch.ack + " cmd=" + last_launch.command +
+           " staging=" + last_launch.staging + " desc=" + last_launch.descriptor;
   }
   LastLaunch last_launch;
   // One-based launch number, so a crash report can be matched to a dump.
@@ -345,7 +348,12 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
                         std::to_string(launch.gather.worker_count),
                         std::to_string(launch.gather.output),
                         std::to_string(launch.gather.output_extent),
-                        std::to_string(launch.gather.sequence)};
+                        std::to_string(launch.gather.sequence),
+                        std::to_string(launch.gather.remote_notify),
+                        std::to_string(launch.gather.remote_ack),
+                        std::to_string(launch.gather.remote_command),
+                        std::to_string(launch.gather.remote_staging),
+                        std::to_string(launch.gather.remote_descriptor)};
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchBatchGet(&launch, stream))

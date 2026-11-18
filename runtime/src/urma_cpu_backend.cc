@@ -311,6 +311,17 @@ class UrmaResourcePool {
 
 using Channel = cpu_runtime_detail::UrmaChannel;
 
+// Per-request gather tracing. One line per accepted sequence per lane, so keep it
+// off unless a run is being diagnosed: KVAF_CPU_TRACE=1 turns it on in the
+// service process started by scripts/kvaf_bc_smoke.sh.
+bool GatherTraceEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("KVAF_CPU_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
 peer::GatherWaitMode ToGatherWaitMode(CpuGatherMode mode) {
   switch (mode) {
     case CpuGatherMode::kAdaptive: return peer::GatherWaitMode::kAdaptive;
@@ -353,6 +364,12 @@ class CpuGatherWorker {
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
       peer::GatherBarrier();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
+      if (GatherTraceEnabled())
+        Log("[KVAF_CPU] GATHER_ACCEPT control=0x%llx seq=%llu command=0x%llx bytes=%llu\n",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(control_)),
+            static_cast<unsigned long long>(sequence),
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(bytes_));
       bool valid = false;
       try {
         valid = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
@@ -360,6 +377,30 @@ class CpuGatherWorker {
       } catch (const std::exception& error) {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
         valid = false;
+      }
+      // When PrepareDirect refuses, the descriptor is the only record of why.
+      // Dump it before the AICPU moves on to the next sequence.
+      if (!valid) {
+        const auto offset = address >= base_ ? address - base_ : bytes_;
+        if (address % 64U == 0U && offset <= bytes_ &&
+            sizeof(peer::GatherDescriptorHeader) <= bytes_ - offset) {
+          const auto header = *reinterpret_cast<const peer::GatherDescriptorHeader*>(
+              memory_ + offset);
+          Log("[KVAF_CPU] GATHER_REJECT seq=%llu header{magic=0x%llx seq=%llu spans=%u "
+              "bytes=%u chunk=%u span_bytes=%u ready=%llu staging=0x%llx}\n",
+              static_cast<unsigned long long>(sequence),
+              static_cast<unsigned long long>(header.magic),
+              static_cast<unsigned long long>(header.sequence), header.span_count,
+              header.total_bytes, header.pipeline_chunk_bytes, header.span_bytes,
+              static_cast<unsigned long long>(header.ready_bytes),
+              static_cast<unsigned long long>(header.staging_address));
+        } else {
+          Log("[KVAF_CPU] GATHER_REJECT seq=%llu command=0x%llx outside base=0x%llx bytes=%llu\n",
+              static_cast<unsigned long long>(sequence),
+              static_cast<unsigned long long>(address),
+              static_cast<unsigned long long>(base_),
+              static_cast<unsigned long long>(bytes_));
+        }
       }
       if (!valid && address % 64U == 0U &&
           peer::GatherRange(base_, peer::GatherControlOffset(bytes_), address,
@@ -649,6 +690,16 @@ class CpuService {
       return Result::kResourceError;
     }
     region.gather_lanes = std::move(created);
+    // The AICPU computes the same three addresses from its own region view, so
+    // print them once: a lane mismatch shows up here and nowhere else.
+    Log("[KVAF_CPU] GATHER_LANES_READY control=0x%llx lanes=%u stride=%zu base=0x%llx "
+        "bytes=%llu control_limit=0x%llx max_workers=%u threads=%u\n",
+        static_cast<unsigned long long>(control_address), lanes, sizeof(peer::GatherControl),
+        static_cast<unsigned long long>(region.base),
+        static_cast<unsigned long long>(region.bytes),
+        static_cast<unsigned long long>(peer::GatherControlOffset(region.bytes)),
+        static_cast<unsigned>(kGatherMaxWorkers),
+        static_cast<unsigned>(gather_threads_));
     return Result::kOk;
   }
 
