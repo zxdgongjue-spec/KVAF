@@ -1,5 +1,15 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+if(KVAF_BUILD_REMOTE_CPU_SERVICE)
+  foreach(page_mode IN ITEMS hugetlb-2m hugetlb-1g)
+    add_test(NAME kvaf_cpu_service_${page_mode}
+      COMMAND kvaf_cpu_service --memory-page-mode "${page_mode}" --help)
+  endforeach()
+  add_test(NAME kvaf_cpu_service_invalid_page_mode
+    COMMAND kvaf_cpu_service --memory-page-mode invalid --help)
+  set_tests_properties(kvaf_cpu_service_invalid_page_mode PROPERTIES WILL_FAIL TRUE)
+endif()
+
 add_executable(kvaf_npu_runtime_config_test npu_runtime_config_test.cc)
 target_link_libraries(kvaf_npu_runtime_config_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_npu_runtime_config_test COMMAND kvaf_npu_runtime_config_test)

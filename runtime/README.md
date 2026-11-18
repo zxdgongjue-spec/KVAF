@@ -47,7 +47,8 @@ cd /path/to/kvaf
 CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
-CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
+`--memory-page-mode` 选择 URMA 后端的 CPU DDR 分配方式，默认为 `thp`。
+UBmem 的 Host P2P DDR 页规格由 Ascend HAL 管理。
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -58,7 +59,24 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 # 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
+
+# 显式使用 2 MiB HugeTLB 页。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
+
+# 显式使用 1 GiB HugeTLB 页。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
 ```
+
+显式模式从对应尺寸的 Linux HugeTLB 页池分配。可在 CPU 宿主机通过
+`/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages` 或
+`/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages` 检查可用页数。
+绑定 NUMA 时还需检查目标节点的页池。映射长度按页大小向上取整，URMA 注册长度和
+slot 容量沿用请求值。HugeTLB 分配失败会返回错误。`REGION_ALLOCATED` 日志中的
+`backing_bytes` 给出映射大小，`memory` 可用于在 `/proc/<pid>/smaps` 中定位映射，
+核对 `KernelPageSize` 和 `VmFlags` 的 `ht` 标志。
+[Linux HugeTLB 页池说明](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html)
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的

@@ -84,7 +84,9 @@ constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transp
 constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
 constexpr std::size_t kBasePageBytes = 4096U;
-constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
+constexpr int kHugePage2MShift = 21;
+constexpr int kHugePage1GShift = 30;
+constexpr std::size_t kHugePage2MBytes = std::size_t{1} << kHugePage2MShift;
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -389,6 +391,7 @@ struct Region {
   void* memory = nullptr;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
+  std::size_t mapped_bytes = 0U;
   urma_token_id_t* token_id = nullptr;
   urma_target_seg_t* segment = nullptr;
   uint32_t token_value = 0U;
@@ -514,11 +517,15 @@ class CpuService {
       ReleaseRegion(region.get());
       return Result::kResourceError;
     }
-    regions_.emplace(id, std::move(region));
+    const auto& allocated = *regions_.emplace(id, std::move(region)).first->second;
+    const std::size_t backing_bytes = allocated.mapped_bytes != 0U
+        ? allocated.mapped_bytes : static_cast<std::size_t>(bytes);
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s "
+        "memory=%p backing_bytes=%zu\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, flag.value, MemoryPageModeName());
+        response->peer_base, response->token_id, flag.value, MemoryPageModeName(),
+        allocated.memory, backing_bytes);
     return Result::kOk;
   }
 
@@ -711,8 +718,53 @@ class CpuService {
         return "default";
       case CpuMemoryPageMode::kTransparentHugePage:
         return "thp";
+      case CpuMemoryPageMode::kHugeTlb2M:
+        return "hugetlb-2m";
+      case CpuMemoryPageMode::kHugeTlb1G:
+        return "hugetlb-1g";
     }
     return "unknown";
+  }
+
+  bool AllocateHugeTlb(Region* region, std::size_t bytes, int page_shift) {
+    const std::size_t page_bytes = std::size_t{1} << page_shift;
+    const std::size_t padding = (page_bytes - bytes % page_bytes) % page_bytes;
+    if (bytes > std::numeric_limits<std::size_t>::max() - padding) {
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=round_hugetlb bytes=%zu page_mode=%s\n",
+          bytes, MemoryPageModeName());
+      return false;
+    }
+
+    // The registered region retains the requested length. mmap and munmap
+    // operate on complete HugeTLB pages.
+    const std::size_t mapped_bytes = bytes + padding;
+    const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (page_shift << MAP_HUGE_SHIFT);
+    void* memory = mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (memory == MAP_FAILED) {
+      const int error = errno;
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=mmap_hugetlb bytes=%zu backing_bytes=%zu "
+          "page_mode=%s errno=%d (%s)\n",
+          bytes, mapped_bytes, MemoryPageModeName(), error, std::strerror(error));
+      return false;
+    }
+
+    region->memory = memory;
+    region->mapped_bytes = mapped_bytes;
+#ifdef MADV_POPULATE_WRITE
+    // Probe kernel support before prefaulting the full mapping. Older kernels
+    // populate it on access below.
+    if (madvise(nullptr, 0U, MADV_POPULATE_WRITE) == 0) {
+      if (madvise(memory, mapped_bytes, MADV_POPULATE_WRITE) == 0) return true;
+      const int error = errno;
+      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=prefault_hugetlb bytes=%zu backing_bytes=%zu "
+          "page_mode=%s errno=%d (%s)\n",
+          bytes, mapped_bytes, MemoryPageModeName(), error, std::strerror(error));
+      ReleaseRegion(region);
+      return false;
+    }
+#endif
+    std::memset(memory, 0, bytes);
+    return true;
   }
 
   bool AllocateMemory(Region* region) {
@@ -721,6 +773,12 @@ class CpuService {
       return false;
     }
     const std::size_t bytes = static_cast<std::size_t>(region->bytes);
+    if (memory_page_mode_ == CpuMemoryPageMode::kHugeTlb2M) {
+      return AllocateHugeTlb(region, bytes, kHugePage2MShift);
+    }
+    if (memory_page_mode_ == CpuMemoryPageMode::kHugeTlb1G) {
+      return AllocateHugeTlb(region, bytes, kHugePage1GShift);
+    }
     const std::size_t alignment =
         memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
             ? kHugePage2MBytes
@@ -861,7 +919,15 @@ class CpuService {
       region->token_id = nullptr;
     }
     if (region->memory != nullptr) {
-      free(region->memory);
+      if (region->mapped_bytes != 0U) {
+        if (munmap(region->memory, region->mapped_bytes) != 0) {
+          const int error = errno;
+          Log("[KVAF_CPU] REGION_RELEASE_FAILED stage=munmap_hugetlb backing_bytes=%zu "
+              "errno=%d (%s)\n", region->mapped_bytes, error, std::strerror(error));
+        }
+      } else {
+        free(region->memory);
+      }
       region->memory = nullptr;
     }
   }
