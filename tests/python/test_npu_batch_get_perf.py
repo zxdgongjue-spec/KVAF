@@ -392,9 +392,9 @@ def validate_args(args: argparse.Namespace) -> str | None:
         if args.kernel_profile:
             return "contention mode measures graph throughput and requires --no-kernel-profile"
     if args.contention_barrier_fd is not None and (
-        args.contention_control_dir is None or args.contention_graph_calls != 1 or args.contention_barrier_fd < 0
+        args.contention_control_dir is None or args.contention_barrier_fd < 0
     ):
-        return "per-call barrier requires contention mode, one BatchGet per graph and a valid socket descriptor"
+        return "per-call barrier requires contention mode and a valid socket descriptor"
     return None
 
 

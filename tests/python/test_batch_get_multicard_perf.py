@@ -14,7 +14,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import batch_get_multicard_perf as multi
 import test_npu_batch_get_perf as perf
@@ -50,7 +50,7 @@ window = json.loads((directory / "start.json").read_text())
 # Synthetic results use the coordinator's timestamps; no worker clock is needed.
 calls = 100
 if "--contention-barrier-fd" in sys.argv:
-    assert option("--contention-graph-calls") == "1"
+    assert int(option("--contention-graph-calls")) > 0
     calls = 0
     time.sleep(max(0, window["start"] - time.monotonic()))
     with socket.socket(fileno=int(option("--contention-barrier-fd"))) as barrier:
@@ -209,18 +209,22 @@ class MulticardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = self.run_controller(root, devices=range(8),
-                                         options=("--barrier-per-call", "--seconds", "0.2"))
+                                         options=("--barrier-per-call", "--graph-calls", "256",
+                                                  "--seconds", "0.2"))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             output = root / "results"
             config = json.loads((output / "config.json").read_text())
             self.assertTrue(config["barrier_per_call"])
-            self.assertEqual(config["graph_calls"], 1)
+            self.assertEqual(config["graph_calls"], 256)
             calls = [json.loads((output / "concurrent" / f"device_{device}.json").read_text())["calls"]
                      for device in range(8)]
             self.assertGreater(calls[0], 1)
             self.assertEqual(calls, [calls[0]] * 8)
             self.assertIn(f"MULTICARD_BARRIER_DONE phase=concurrent rounds={calls[0]}", result.stdout)
-            self.assertIn("吞吐计时包含轮间同步等待", (output / "report.md").read_text())
+            report = (output / "report.md").read_text()
+            self.assertIn("吞吐计时包含轮间同步等待", report)
+            self.assertIn("| Graph 数 / 卡 | 256 |", report)
+            self.assertIn("| 每张 Graph 的 BatchGet 次数 | 1 |", report)
 
     def test_failed_barrier_worker_aborts_peers(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -234,25 +238,107 @@ class MulticardTests(unittest.TestCase):
 
     def test_worker_waits_before_each_replay_and_until_previous_replay_completes(self):
         events = []
-        graph = SimpleNamespace(replay=lambda _: events.append("replay"),
-                                synchronize=lambda _: events.append("completed"))
+        graphs = [SimpleNamespace(replay=lambda _, index=index: events.append(index),
+                                  synchronize=lambda _: events.append("completed"))
+                  for index in range(2)]
         controller, worker = socket.socketpair()
         with controller, worker, ThreadPoolExecutor(max_workers=1) as executor:
             controller.settimeout(2)
-            outcome = executor.submit(multi.measure_barrier_replays, graph, None, worker.detach())
+            outcome = executor.submit(multi.measure_barrier_replays, graphs, None, worker.detach())
             try:
-                for previous_rounds in range(2):
+                expected = []
+                for index in (0, 1, 0):
                     self.assertEqual(controller.recv(1), b"R")
-                    self.assertEqual(events, ["replay", "completed"] * previous_rounds)
+                    self.assertEqual(events, expected)
                     controller.sendall(b"G")
+                    expected.extend((index, "completed"))
                 self.assertEqual(controller.recv(1), b"R")
-                self.assertEqual(events, ["replay", "completed"] * 2)
+                self.assertEqual(events, expected)
                 controller.sendall(b"S")
                 begin, end, replays = outcome.result(timeout=2)
                 self.assertLessEqual(begin, end)
-                self.assertEqual(replays, 2)
+                self.assertEqual(replays, 3)
             finally:
                 controller.close()
+
+    def test_worker_captures_256_single_call_graphs_and_checks_final_output(self):
+        graph_count = 256
+        measured = graph_count + 2
+        captured, reset, validated = [], [], []
+        active_capture = []
+        output = []
+
+        class Graph:
+            def __init__(self):
+                self.plans = []
+
+            def capture_begin(self, stream):
+                active_capture.append(self)
+
+            def capture_end(self):
+                self.plan, = self.plans
+                active_capture.pop()
+                captured.append(self.plan)
+
+            def replay(self, stream):
+                output[:] = [self.plan]
+
+            def synchronize(self, stream):
+                pass
+
+            def reset(self):
+                reset.append(self.plan)
+
+        def submit(plan, stream):
+            if active_capture:
+                active_capture[-1].plans.append(plan)
+
+        def check_output(plan):
+            self.assertEqual(output, [plan])
+            validated.append(plan)
+
+        def measure(graphs, stream, barrier_fd):
+            self.assertEqual(len(graphs), graph_count)
+            for index in range(measured):
+                graphs[index % graph_count].replay(stream)
+            return 1.0, 2.0, measured
+
+        torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: 1, synchronize=lambda: None))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "start.json").write_text(json.dumps({"start": 0, "stop": 2}))
+            args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
+                                   contention_graph_calls=graph_count, contention_barrier_fd=3,
+                                   warmup=1, miss_count=4096, token_bytes=656)
+            plans = iter(range(graph_count))
+            with (patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()),
+                  patch.object(multi, "measure_barrier_replays", side_effect=measure)):
+                multi.run_worker(SimpleNamespace(AclGraph=Graph), torch, args, lambda: next(plans),
+                                 submit, check_output)
+            result = json.loads(args.contention_result.read_text())
+            self.assertEqual(result["calls"], measured)
+            self.assertEqual(result["payload_bytes"], measured * 4096 * 656)
+            self.assertEqual(result["graph_calls"], 1)
+            self.assertEqual(result["graph_count"], graph_count)
+        self.assertEqual(captured, list(range(graph_count)))
+        self.assertEqual(reset, list(reversed(captured)))
+        self.assertEqual(validated, captured + [1])
+
+    def test_worker_releases_completed_graphs_when_later_capture_fails(self):
+        graphs = [Mock() for _ in range(3)]
+        graphs[-1].capture_end.side_effect = RuntimeError("capture resources exhausted")
+        kvaf = SimpleNamespace(AclGraph=Mock(side_effect=graphs))
+        torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: 1, synchronize=lambda: None))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
+                                   contention_graph_calls=len(graphs), contention_barrier_fd=3)
+            with patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "graph 3/3: capture resources exhausted"):
+                    multi.run_worker(kvaf, torch, args, lambda: 0, Mock(), Mock())
+            self.assertFalse((root / "ready_6").exists())
+        for graph in graphs:
+            graph.reset.assert_called_once_with()
 
     def test_aggregate_uses_shared_wall_time_and_checks_overlap(self):
         def record(device, begin, end):

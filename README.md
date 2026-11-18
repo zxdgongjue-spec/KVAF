@@ -347,11 +347,12 @@ AICPU 性能测试分别使用 [Gather sweep](tests/run_aicpu_gather_read_sweep.
 ```bash
 tests/run_remote_cpu_batch_get_multicard_perf.sh "$PWD/build-npu" \
   --transport ubmem --peer 127.0.0.1:28999 --devices 0 1 2 3 4 5 6 7 \
-  --table-capacity 64 --barrier-per-call
+  --table-capacity 64 --barrier-per-call --graph-calls 256
 ```
 
-此模式每张 ACL Graph 只录一次 BatchGet。所有 worker 等上一轮完成后才发起下一轮，
-同一组卡完成相同轮数。计时包含轮间的 Host 同步等待，报告会标明此模式。
+此模式将 `--graph-calls` 组请求分别录成单次 BatchGet Graph，计时阶段按录制顺序循环
+回放。所有 worker 等上一轮完成后才发起下一轮，同一组卡完成相同轮数。计时包含轮间
+的 Host 同步等待，报告会标明此模式。Graph 数受设备和 CANN 的可用录图资源限制。
 
 ### 6. 无 NPU 的主机回归
 

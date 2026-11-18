@@ -22,11 +22,12 @@ REPLAY = b"G"
 STOP = b"S"
 
 
-def measure_barrier_replays(graph, stream, barrier_fd):
+def measure_barrier_replays(graphs, stream, barrier_fd):
     begin = end = 0.0
     replays = 0
     with socket.socket(fileno=barrier_fd) as barrier:
         while True:
+            graph = graphs[replays % len(graphs)]
             barrier.sendall(ARRIVED)
             command = barrier.recv(1)
             if command == STOP:
@@ -41,6 +42,23 @@ def measure_barrier_replays(graph, stream, barrier_fd):
             replays += 1
 
 
+def capture_graph(kvaf, stream, plans, submit, cleanup):
+    graph = kvaf.AclGraph()
+    cleanup.callback(graph.reset)
+    graph.capture_begin(stream)
+    try:
+        for plan in plans:
+            submit(plan, stream)
+    except BaseException:
+        try:
+            graph.capture_end()
+        except Exception as error:
+            print(f"MULTICARD_CAPTURE_CLEANUP_ERROR {error}", file=sys.stderr)
+        raise
+    graph.capture_end()
+    return graph
+
+
 def run_worker(kvaf, torch, args, make_plan, submit, check_output):
     """Reuse the normal benchmark's table, request generator and validation."""
     control = args.contention_control_dir
@@ -50,26 +68,30 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
     # Allocate/cache the stream's runtime state before entering capture.
     submit(plans[0], stream)
     torch.npu.synchronize()
-    graph = kvaf.AclGraph()
-    capturing = False
-    captured = False
+    barrier_fd = args.contention_barrier_fd
+    plan_groups = [plans] if barrier_fd is None else [(plan,) for plan in plans]
+    graphs = []
+    cleanup = contextlib.ExitStack()
     try:
-        print(f"MULTICARD_GRAPH_CAPTURE_BEGIN calls={len(plans)}", flush=True)
-        graph.capture_begin(stream)
-        capturing = True
-        for plan in plans:
-            submit(plan, stream)
-        capturing = False
-        graph.capture_end()
-        captured = True
-        print("MULTICARD_GRAPH_CAPTURE_DONE", flush=True)
-        # A validation replay is separate from the configured warmup replays.
-        graph.replay(stream)
-        graph.synchronize(stream)
-        check_output(plans[-1])
+        print(f"MULTICARD_GRAPH_CAPTURE_BEGIN calls={len(plans)} graphs={len(plan_groups)}", flush=True)
+        for index, group in enumerate(plan_groups, 1):
+            try:
+                graphs.append(capture_graph(kvaf, stream, group, submit, cleanup))
+            except Exception as error:
+                raise RuntimeError(f"BatchGet capture failed for graph {index}/{len(plan_groups)}: {error}") from error
+        print(f"MULTICARD_GRAPH_CAPTURE_DONE graphs={len(graphs)}", flush=True)
+        # The graphs share an output buffer. Validate each before the next replay overwrites it.
+        for index, (graph, group) in enumerate(zip(graphs, plan_groups), 1):
+            try:
+                graph.replay(stream)
+                graph.synchronize(stream)
+                check_output(group[-1])
+            except Exception as error:
+                raise RuntimeError(f"BatchGet validation failed for graph {index}/{len(graphs)}: {error}") from error
         for _ in range(args.warmup):
-            graph.replay(stream)
-            graph.synchronize(stream)
+            for graph in graphs:
+                graph.replay(stream)
+                graph.synchronize(stream)
 
         print(f"MULTICARD_READY device={device}", flush=True)
         (control / f"ready_{device}").touch()
@@ -81,9 +103,10 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
         remaining = window["start"] - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
-        if args.contention_barrier_fd is not None:
-            begin, end, replays = measure_barrier_replays(graph, stream, args.contention_barrier_fd)
+        if barrier_fd is not None:
+            begin, end, replays = measure_barrier_replays(graphs, stream, barrier_fd)
         else:
+            graph = graphs[0]
             begin = time.monotonic()
             replays = 0
             while time.monotonic() < window["stop"]:
@@ -95,26 +118,24 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
             end = time.monotonic()
         if not replays:
             raise RuntimeError("worker missed the measurement window")
-        check_output(plans[-1])
-        calls = replays * len(plans)
+        check_output(plan_groups[(replays - 1) % len(graphs)][-1])
+        calls_per_graph = len(plan_groups[0])
+        calls = replays * calls_per_graph
         payload_bytes = calls * args.miss_count * args.token_bytes
         result = {
             "device": device, "start": begin, "end": end,
             "calls": calls, "payload_bytes": payload_bytes,
             "bandwidth_GBps": payload_bytes / (end - begin) / 1e9,
-            "graph_calls": len(plans), "verified": True,
+            "graph_calls": calls_per_graph, "graph_count": len(graphs), "verified": True,
         }
         args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
         print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)
     finally:
-        if capturing:
-            try:
-                graph.capture_end()
-            except Exception as error:
-                print(f"MULTICARD_CAPTURE_CLEANUP_ERROR {error}", file=sys.stderr)
-        if captured:
-            graph.synchronize(stream)
-        graph.reset()
+        try:
+            if graphs:
+                graphs[0].synchronize(stream)
+        finally:
+            cleanup.close()
 
 
 def worker_error(device, process, log_path, phase):
@@ -327,7 +348,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     report = ["# 多卡 BatchGet 带宽测试", "", f"结果目录：`{directory.name}`", "",
               "带宽单位为十进制 GB/s；统计持续 ACL Graph 回放至完成的有效数据吞吐。", ""]
     if config.get("barrier_per_call"):
-        report += ["每轮在 Host 侧同步各卡后发起一次 BatchGet。吞吐计时包含轮间同步等待。", ""]
+        report += ["每轮在 Host 侧同步各卡后发起一次 BatchGet，按录制顺序循环回放。吞吐计时包含轮间同步等待。", ""]
     if config:
         per_device = config.get("ddr_bytes_per_device",
                                 config["table_capacity"] * config["tokens_per_block"] * config["token_bytes"])
@@ -339,7 +360,8 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("地址表布局", f"{config['table_capacity']} 个表项，{config['tokens_per_block']} token / 块"),
             ("CPU DDR 数据区", f"每卡独立 {per_device / 2**20:g} MiB；并发合计 {len(isolated) * per_device / 2**30:g} GiB"),
             ("每阶段测量时长", f"{config['seconds']:g} s"),
-            ("每张 Graph 的 BatchGet 次数", config["graph_calls"]),
+            ("Graph 数 / 卡", config["graph_calls"] if config.get("barrier_per_call") else 1),
+            ("每张 Graph 的 BatchGet 次数", 1 if config.get("barrier_per_call") else config["graph_calls"]),
             ("预热", f"{config['warmup']} 次 Graph 回放"),
             ("访问模式 / 随机种子", f"随机读取、连续输出；seed={config['seed']}"),
             ("CPU service", config["peer"]),
@@ -421,9 +443,9 @@ def main(argv=None):
                         help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--graph-calls", type=int,
-                        help="BatchGet calls per captured graph (default: 256, or 1 with --barrier-per-call)")
+                        help="total calls to capture (default: 256, or 1 with --barrier-per-call)")
     parser.add_argument("--barrier-per-call", action="store_true",
-                        help="wait for all devices before each measured BatchGet; requires one call per graph")
+                        help="capture a separate graph for each call and wait for all devices before each replay")
     parser.add_argument("--requests", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--table-capacity", type=int, default=4096)
@@ -458,8 +480,6 @@ def main(argv=None):
         parser.error("--devices requires at least two distinct nonnegative device IDs")
     if args.graph_calls is None:
         args.graph_calls = 1 if args.barrier_per_call else 256
-    if args.barrier_per_call and args.graph_calls != 1:
-        parser.error("--barrier-per-call requires --graph-calls 1")
     for name in ("seconds", "graph_calls", "requests", "token_bytes", "table_capacity", "tokens_per_block", "ready_timeout"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
