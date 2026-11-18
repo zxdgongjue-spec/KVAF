@@ -364,6 +364,12 @@ class CpuGatherWorker {
       __atomic_store_n(&control_->ack, peer::GatherStartedAck(sequence), __ATOMIC_RELEASE);
       peer::GatherBarrier();
       const auto address = __atomic_load_n(&control_->command, __ATOMIC_ACQUIRE);
+      const auto offset = address >= base_ ? address - base_ : bytes_;
+      const bool header_visible = address % 64U == 0U && offset <= bytes_ &&
+                                  sizeof(peer::GatherDescriptorHeader) <= bytes_ - offset;
+      peer::GatherDescriptorHeader header{};
+      if (header_visible)
+        header = *reinterpret_cast<const peer::GatherDescriptorHeader*>(memory_ + offset);
       if (GatherTraceEnabled())
         Log("[KVAF_CPU] GATHER_ACCEPT control=0x%llx seq=%llu command=0x%llx bytes=%llu\n",
             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(control_)),
@@ -371,21 +377,37 @@ class CpuGatherWorker {
             static_cast<unsigned long long>(address),
             static_cast<unsigned long long>(bytes_));
       bool valid = false;
+      std::size_t threads = 0U;
+      const auto copy_begin = std::chrono::steady_clock::now();
       try {
-        valid = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans) != 0U;
+        threads = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
+        valid = threads != 0U;
         if (valid) executor_.Copy();
       } catch (const std::exception& error) {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
         valid = false;
       }
+      // A DONE line is the only proof the copy actually returned; a stuck copy
+      // leaves the AICPU spinning on ready_bytes with no trace at all.
+      if (GatherTraceEnabled() || !valid) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - copy_begin).count();
+        const auto ready = header_visible
+            ? __atomic_load_n(reinterpret_cast<const std::uint64_t*>(
+                  memory_ + offset + offsetof(peer::GatherDescriptorHeader, ready_bytes)),
+                  __ATOMIC_ACQUIRE)
+            : 0U;
+        Log("[KVAF_CPU] GATHER_DONE seq=%llu ok=%d threads=%zu spans=%u bytes=%u chunk=%u "
+            "span_bytes=%u ready=%llu usec=%lld\n",
+            static_cast<unsigned long long>(sequence), valid ? 1 : 0, threads,
+            header.span_count, header.total_bytes, header.pipeline_chunk_bytes,
+            header.span_bytes, static_cast<unsigned long long>(ready),
+            static_cast<long long>(elapsed));
+      }
       // When PrepareDirect refuses, the descriptor is the only record of why.
       // Dump it before the AICPU moves on to the next sequence.
       if (!valid) {
-        const auto offset = address >= base_ ? address - base_ : bytes_;
-        if (address % 64U == 0U && offset <= bytes_ &&
-            sizeof(peer::GatherDescriptorHeader) <= bytes_ - offset) {
-          const auto header = *reinterpret_cast<const peer::GatherDescriptorHeader*>(
-              memory_ + offset);
+        if (header_visible) {
           Log("[KVAF_CPU] GATHER_REJECT seq=%llu header{magic=0x%llx seq=%llu spans=%u "
               "bytes=%u chunk=%u span_bytes=%u ready=%llu staging=0x%llx}\n",
               static_cast<unsigned long long>(sequence),
