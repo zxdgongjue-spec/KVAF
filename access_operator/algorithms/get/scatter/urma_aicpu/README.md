@@ -4,4 +4,4 @@
 
 共同 ABI、Host loader和设备导出入口保留在 [Get 公共目录](../../common/aicpu/README.md)。本算法仍由 `KVAF_ENABLE_AICPU_CPU_PUSH` 控制，构建目标与安装包保持不变。
 
-`python/benchmark_cpu_push_scatter.py` 调用公共性能测试负载。完整说明见 [Scatter 使用说明](../../../../../docs/aicpu_cpu_push_scatter.md)。
+性能测试使用仓库根目录的 `tests/run_remote_cpu_batch_get_perf.sh --backend cpu_push_scatter`。完整说明见 [Scatter 使用说明](../../../../../docs/aicpu_cpu_push_scatter.md)。

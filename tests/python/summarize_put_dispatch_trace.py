@@ -5,7 +5,7 @@ import argparse
 import csv
 from pathlib import Path
 
-from summarize_get_dispatch_trace import percentile
+from utils.statistics import percentile
 
 
 FIELDS = (

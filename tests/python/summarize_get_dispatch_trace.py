@@ -5,6 +5,8 @@ import argparse
 import csv
 from pathlib import Path
 
+from utils.statistics import percentile
+
 
 SUBMIT_FIELDS = (
     "total_ns", "lock_ns", "resolve_ns", "output_check_ns", "previous_drain_ns", "context_ns",
@@ -17,14 +19,6 @@ AIV_FIELDS = (
     "aiv_kernel_launch_ns", "aiv_submit_other_ns",
 )
 DRAIN_FIELDS = ("total_ns", "drain_provider_ns", "drain_release_ns")
-
-
-def percentile(values, fraction):
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * fraction
-    low = int(position)
-    high = min(low + 1, len(ordered) - 1)
-    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
 def summarize(rows, algorithm, path, event, fields):

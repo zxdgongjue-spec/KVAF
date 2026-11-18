@@ -459,10 +459,17 @@ Status RuntimeCore::BeginGetGraph(GetExecutionConfig config, const GetGraphOptio
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
-  auto s = DrainGetLocked();
-  if (!s.ok()) return s;
-  s = access_operator_.BeginGetGraph(config, request, id);
-  if (s.ok()) graph_tables_.emplace(*id, nullptr);
+  if (graph_tables_.empty()) {
+    auto s = DrainGetLocked();
+    if (!s.ok()) return s;
+  }
+  // Reserve the table pin before publishing a provider lease.
+  auto node = graph_tables_.extract(graph_tables_.emplace(0, nullptr).first);
+  auto s = access_operator_.BeginGetGraph(config, request, id);
+  if (s.ok()) {
+    node.key() = *id;
+    graph_tables_.insert(std::move(node));
+  }
   return s;
 }
 Status RuntimeCore::BeginGetOutput(GetExecutionConfig config, const GetOutputOptions& request,

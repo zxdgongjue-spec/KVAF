@@ -1,11 +1,11 @@
 # 缓存访问执行框架：实现与使用
 
-本文描述 `codex/cache-transport-execution` 已提交的 `ed61a31`：算法首次使用准备和
-统一执行路径均已接入，本地便携回归通过，本轮真机与性能待验收。文档本身仍为本地
-未提交草稿；这与代码是否已提交分开记录。初始开发基线为
+本文描述 `codex/cache-transport-execution` 的 `5cce05e7`：算法首次使用准备、
+统一执行路径、同 stream 多图及多个 Get 节点均已接入；实现状态不代表真机或性能验收通过。
+初始开发基线为
 `1c13103`，本分支已合入 main 的 `de4fd37e02fa86357f71fe4fcbbbecc3e75d1d58`。
-设计与后续边界见[框架设计](cache_transport_execution_design.md)；构建、功能及性能
-验收命令集中在[验证步骤](cache_transport_execution_validation.md)。
+设计与后续边界见[框架设计](cache_transport_execution_design.md)；构建、性能入口及
+验证覆盖边界集中在[验证步骤](cache_transport_execution_validation.md)。
 
 ## 当前范围
 
@@ -19,19 +19,19 @@
 | 输入绑定 | URMA AIV、AICPU Put 显式保留输入注册；整个 Put 方向同时只能有一个绑定 |
 | 混合池 | `urma+ubmem` 初始化时分配同一份 Fabric DDR，URMA 注册与 UBMEM 映射使用同一 allocation |
 | 并发 | Put/Get 两方向独立；同方向串行，多个实例驻留不增加同方向并发请求数 |
-| Graph | 四种 Get 均支持显式图租约；一个租约捕获一个 Get 节点，独占 Get 执行方向 |
+| Graph | 四种 Get 均支持显式图租约；每租约一个 Get 节点，多图及多节点在同一 stream 串行执行，存活租约专用 Get 方向 |
 | 恢复 | 资源重建、幂等控制协议、原次 Put 完成查询及事务恢复、失败保留资源以供重试 |
 | 诊断 | Get/Put Host 分段计时、四种 Get kernel profile、AICPU 显式结果检查 |
 
 普通访问组合为 3 种 Put × 4 种 Get。AIV Gather/Scatter 仍只预留配置和 provider 接口，
-首次请求时明确报 provider 不可用；独立 CPU Pull/HBM Pull 模块按约定暂不接入。当前不支持同一张图
-内多个 KVAF Get 节点、图内混合算法或 Put 图模式。
+首次请求时明确报 provider 不可用；独立 CPU Pull/HBM Pull 模块按约定暂不接入。
+图内混合算法不在本轮验收范围；Put 不进入图，也不支持跨 stream 并发回放。
 
 所有请求统一通过 Dispatcher 按本次配置或默认配置选择驻留实例，不会每次重新创建
 通信资源。旧构造参数与执行模式开关已移除；初始化只建立缓存与元数据，首次使用
 或 warmup 按已选路由准备数据面，不执行启动探测写入、自动测速或切换路由。
 
-实现和便携测试覆盖不等于硬件验收。真实 DMA、混合可见性、图回放和性能结果以目标
+历史便携测试结果不等于当前版本的硬件验收。真实 DMA、混合可见性、图回放和性能结果以目标
 Ascend 环境的验证为准。
 
 ## 目录与调用结构
@@ -79,8 +79,9 @@ RuntimeCore 管理 DDR 生命周期、AccessTable pin 和 Put 事务；Dispatche
 | `RuntimeCore` | Put 元数据事务、Host AccessTable 和槽位 pin；完成/恢复前保持依赖 |
 | `ExecutionResourceManager` | 两方向的配置记录、provider 和资源 owner；管理初始化、失败、恢复和关闭 |
 | `PutResourceReference` / `GetResourceReference` | 长期固定对应 owner 和绑定状态，不占用执行；随驻留实例保留 |
-| `PutResourceLease` / `GetResourceLease` | 独占执行占用；Put 保留至事务及确认成功，普通 Get 保留至安全完成，graph 保留至图租约结束 |
+| `PutResourceLease` / `GetResourceLease` | 普通调用的独占执行占用；Put 保留至事务及确认成功，普通 Get 保留至安全完成 |
 | `GetExecutionContext` | 每 Get 配置一个驻留实例；含 provider 状态、预热容量/stream、输出绑定和当前请求字段 |
+| `GetGraphNode` | 每图租约独立保存节点状态和完成报告，复用驻留实例的 owner；Dispatcher 在任何图租约存活时禁止 eager Get |
 | `PutExecutionContext` | 每 Put 配置一个驻留实例；含长期资源引用、provider 状态和准备缓存；短期租约及完成记录按次保留到事务确认 |
 | Python Runtime | 持有在途、输入/输出绑定和 graph 所需 Tensor/stream 强引用 |
 
@@ -164,8 +165,8 @@ Initialize/Warmup/Close。外层 `PutResourceView/GetResourceView` 是适配接�
 
 `AivInvocation/AicpuInvocation/UbmemInvocation` 是 provider 调用状态。owner 借用当前
 绑定状态，以便关闭时先等待在途工作。旧执行模式分支已删除，但仍保留初始化前或解绑后
-使用的默认状态。持久 SQ/CQ 位置、通信序号、队列、物理 status/event 槽位和工作区属于
-资源，不能随着清除一次请求而重置。
+使用的默认状态。持久 SQ/CQ 位置、通信序号、队列和共享工作区不能随着清除一次请求而重置；
+graph 节点另有独立调用状态及完成报告，避免同算法多个节点相互覆盖报告。
 
 `ExecutionViewCommon` 包含 Region、方向和资源/绑定/准备代次，无分配、注册或关闭接口。
 owner 重建、重新绑定状态、相关工作区重新准备会使旧 view 失效；独立 Put/Get 工作区
@@ -396,7 +397,8 @@ UBMEM 不需要输入 MR，使用普通 Put。URMA Put 的普通调用临时注�
 
 四种 Get 使用同一套 `begin_get_graph/batch_get/end_get_graph` 接口。开始租约前准备固定
 配置、stream、输出地址及容量；捕获阶段只提交准备好的设备任务，不注册、不分配、不
-执行 Host 同步或 Drain。图拥有 Get 方向，一个租约只记录一个 KVAF Get 节点；期间
+执行 Host 同步或 Drain。每个节点在图外准备独立租约，一个租约只记录一个 KVAF Get 节点；
+一张图可使用多个租约，多张图也可同时存活，但必须在同一 stream 串行回放。任何租约存活期间
 额外 eager Get、Drain、Get 预热/恢复、profile 开关及 Runtime 关闭返回 Busy。Put 仍可
 在其他合法 key 上执行，不进入这张图。
 
@@ -417,8 +419,8 @@ graph.capture_end()
 graph.replay(read_stream)
 graph.synchronize(read_stream)
 # cfg 为 gather/scatter 时可显式检查这一轮结果：
-runtime.check_batch_get_status(read_stream, execution=cfg)
-profiles = runtime.batch_get_kernel_profile(execution=cfg)
+runtime.check_batch_get_status(read_stream, execution=cfg, graph_lease=lease)
+profiles = runtime.batch_get_kernel_profile(execution=cfg, graph_lease=lease)
 
 # 此后不再 replay；先销毁 graph，再结束租约。
 graph.reset()
@@ -431,16 +433,24 @@ runtime.stop_batch_get_kernel_profile(execution=cfg)
 分段 profile 可使用 `batch_get(..., synchronize=True, profile=True)`，与上述持续
 kernel profile 开关是两种接口。
 
-准备、捕获和 `end_get_graph` 使用同一 stream，不能任意替换成另一条所谓最后 replay
-stream。请求 Tensor 存储/输出地址保持固定；可原地更新 indices、offsets、miss_count、
+准备、捕获、回放和 `end_get_graph` 使用同一 stream；同一 Runtime 的所有存活图租约也
+必须使用该 stream。Torch Graph 的外部 replay 无法由 Runtime 拦截，调用方须遵守此约束。
+请求 Tensor 存储/输出地址保持固定；可原地更新 indices、offsets、miss_count、
 output_indices，覆盖全量、部分和零请求。调用方保证所有更新/重放顺序，停止后续 replay
 并完成所有已提交 replay 后才能释放。Runtime/Python 持有 graph 所需表和 Tensor 引用；
 不能因释放公共 AccessTable handle 就重用其槽位。
 
-AICPU Gather/Scatter 用设备侧 ticket 推进每次 replay 的通信序号。正常结束检查最后
-replay 状态；未 replay 的图可能报未完成，可明确 `discard_result=True` 取消。同步或
-注销失败保留租约。AICPU 协议错误后显式 discard 会关闭整个算法 owner，之后须
-`recover(cfg)`，不能直接复用可能损坏的队列。discard 不跳过 DMA 安全完成要求。
+各节点分别保留输出注册引用、Tensor、AccessTable 和完成报告；同算法节点共用通信会话、
+队列、工作区及连续的设备 ticket。回放不增加 Host 调度或节点间同步。销毁一张图并结束
+其全部租约后，其他正常图仍可回放；Get 方向在最后一个图租约结束后才恢复 eager 调用。
+
+AICPU Gather/Scatter 用设备侧 ticket 推进每次 replay 的通信序号。正常结束检查该节点
+最后一次 replay 状态；未 replay 的图可能报未完成，可明确 `discard_result=True` 取消。
+同步或注销失败保留租约。共享 AICPU 会话失败后，先停止回放并销毁引用该算法实例的所有图，
+再逐个调用 `end_get_graph(lease, stream, discard_result=True)`。同实例尚有租约未进入
+丢弃流程时返回 Busy 并保留资源；最后一个租约关闭会话后，重试先前收到 Busy 的租约。
+结束全部图租约后调用 `recover(cfg)`，不能直接复用可能损坏的队列。discard 不跳过 DMA
+安全完成要求。
 URMA AIV 和 UBMEM 的结果处理差异见下表。
 
 ## 状态、profiling 与计时口径
@@ -450,20 +460,22 @@ URMA AIV 和 UBMEM 的结果处理差异见下表。
 
 | Get 路径 | 每次 status 初始化 | 同步调用 / 异步 Drain | Graph 结束 |
 |---|---|---|---|
-| URMA AIV Direct | 不逐次清零 | 等待 stream；D2H status 用于诊断日志，设备报告错误不转换为调用结果 | 等待 stream 并退役注册，不回读校验 status |
-| UBMEM Direct | 同步 Get 清 `0xFF`；异步 eager/capture 不清 | 同步 Get 随 stream 回拷检查；异步 Drain 等待 event/stream 后 D2H 检查 | 同步并回读检查；discard 跳结果检查但不跳同步 |
+| URMA AIV Direct | 不逐次清零 | 等待完成并清理请求，不回读或检查 Get 状态报告；ACL 提交/同步失败仍返回错误 | 等待 stream 并退役注册，不回读校验 status |
+| UBMEM Direct | 同步/异步 eager 和 capture 均不逐次清零 | 等待完成并清理请求，不回读或检查 Get 状态报告；ACL 提交/同步失败仍返回错误 | 同步并回读检查；discard 跳结果检查但不跳同步 |
 | AICPU Gather | 依赖设备 ticket/序号及报告；准备阶段初始化工作区 | 同步排入状态 D2H 并完成检查；异步 submit 不回拷，Drain 才执行 | 检查最新 replay 的完成和序号 |
 | AICPU Scatter | 依赖设备 ticket/序号及报告；准备阶段初始化工作区 | 同步执行 Drain；异步 submit 不回拷，Drain 才执行 | 检查最新 replay 的 worker 状态和序号 |
 
-UBMEM Put 继续保留状态初始化和覆盖行数检查；异步 Get/graph 不提供逐次初始化哨兵
-检测，而依赖 kernel 覆盖报告。URMA AIV Get status 的诊断语义不适用于 Put 事务：Put
-仍必须确认完成结果，未知结果保留事务。
+UBMEM Put 继续保留状态初始化和覆盖行数检查；Get 不提供逐次初始化哨兵检测，
+而依赖 kernel 覆盖报告。AIV/UBMEM 的显式 profile 快照在执行完成后读取并校验设备报告；
+eager 完成路径的状态处理不适用于 Put 事务，Put 仍必须确认完成结果，未知结果保留事务。
 
 `start_batch_get_kernel_profile`、`batch_get_kernel_profile`、`stop_batch_get_kernel_profile`
 按 `execution=cfg` 路由至相应实例，省略时取默认 Get。图前启用、每轮安全完成后读取、
-结束租约后停用。AICPU 保留最后成功 profile 供结束后读取；不能在 capture 内复制或
-切换 profiling。AICPU 的 `check_batch_get_status(stream, execution=cfg)` 检查具体
-算法，保留首个失败结果；它不代替 Dispatcher 的执行租约回收。
+结束租约后停用。同一算法实例有多个图节点时，profile 和 AICPU 状态查询须传
+`graph_lease=lease`，报告对应该节点最近一次完成的结果；也可仅传租约定位节点。
+正常结束租约时保存最后成功的 profile 供结束后按配置读取；不能在 capture 内复制或
+切换 profiling。AICPU 的 `check_batch_get_status(stream, execution=cfg, graph_lease=lease)`
+检查具体节点，保留首个失败结果；它不代替 Dispatcher 的图租约回收。
 
 设备计算保留 canonical 地址转换：AIV 在向量执行前计算地址差，lane 内加法；Gather
 每 worker 预计算 registered staging 基址。AICPU Gather 每 worker 的入口解析一次
@@ -475,8 +487,11 @@ session registry，持有 session 读锁及 TLS scope，内部描述符发送、
 Scatter 不增加逐 token 资源代次检查。调用方须保证索引、offset、地址及输出行有效，
 形状、资源代次、范围、CQE/超时和完成检查按各层契约保留。
 
-性能入口使用唯一执行路径，保留 `--execution eager|graph` 及同步/异步完成选项；
+性能入口使用唯一执行路径，保留 `--execution eager|graph|both` 及同步/异步完成选项；
 不再接受 `--execution-mode`。旧版本基线从独立 commit 构建并使用其匹配脚本与服务。
+性能入口默认关闭 kernel profiling；显式加入 `--kernel-profile` 才启用设备打点、报告回读及
+设备时间输出。数据预检、输出校验和 profile 快照在性能计时之外；多图检查通过
+`--multi-graph-check` 在计时前执行，正式 graph 性能样本仍使用单节点图。
 端到端对照须固定同步、profile、工作规模和线程配置：同步 call-to-return 与异步
 submit-only 不能混比。当前异步 call-to-completion 直接使用 `drain_get()`，不先重复
 外部同步；旧版本若使用外部 stream 同步，须单独注明其完成与清理边界。绑定 setup/teardown、首次建链及预热单独计量，不计入热调用
@@ -499,9 +514,11 @@ CPU 服务进程。库名和 `build-npu/bin` 产物位置保留；AICPU 构建�
 QueueProfile 使用原结构的 4 字节 padding，不改变其余字段偏移或 Put ABI；不能据此
 混装旧设备包，因为新 Host 依赖 V5 能力。控制协议的兼容性也不替代全部组件一起更新。
 
-便携回归覆盖配置与 owner/view 生命周期、Get 驻留/绑定共存、Put 恢复、共享注册与关闭
-失败、HAL 重建、四种图路由、ticket、零/部分/全量请求及状态/profile 收尾。统一执行路径、
-旧构造参数拒绝、按算法资源配置与首次使用准备的本地便携回归已通过；本轮真机与性能
-待验收。模型/stub 验证不能证明真实 DMA
-或性能已通过；硬件全量与分项验收统一见
-[验证步骤](cache_transport_execution_validation.md)。
+原 `tests/` 顶层 C++ 功能测试及其 ACL/URMA stub、kernel CPU 模型已移除，
+不再配置独立 SDK 头文件目录来启用这些测试。
+独立 Python 功能、配置与单元测试及其 CMake 注册也已移除。
+性能入口保留数据预检和输出校验，公共模块集中在 `tests/python/utils/`；
+构建、性能测量和计时范围见验证文档。
+
+本机没有 Ascend 设备或正式 CANN 编译环境。目标环境须完成正式 SDK 编译、新 kernel 部署、真实
+payload 的交叉写读、Get/Put 重叠、混合可见性、graph replay 和故障退出验收。

@@ -99,7 +99,7 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 ```
 
 已知设备名时也可设置 `peer_ub_device="udmac0d1e2"`，只在该设备的 EID 中按
-连通性选择，不执行带宽标定。`peer_ub_device` 与 `adaptive_ub_device=True` 互斥。
+连通性选择，不执行带宽标定。
 
 `link_to` 必须在 `initialize` 前调用。初始化会从 HCCL root-info 读取当前物理卡的
 CLOS PG EID、追加 `/proc/asdrv_ub/pair_info` fallback，并组合 CPU UMDK 候选。只有
@@ -109,24 +109,18 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
-### 可选启动 UB device 选优
+### 固定 UB device 后测量
 
-`--adaptive-ub-device` 仅在 K 端未指定 `--ub-device` 时启用启动测速：N 端脚本从
-`KVAF_ADAPTIVE_UB_DEVICES` 配置的候选中选择，默认值为
-`udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3`，探测请求数由
-`KVAF_ADAPTIVE_UB_MISS_COUNT` 控制（默认 2048）。脚本先用轻量初始化识别 K 侧固定
-设备；未固定时依次通过 `peer_ub_device` 运行完整建表和随机 BatchGet，以固定的
-656B token、128 tokens-per-block、2 个 AIV core、每 core 2 个 Jetty、1 次预热和
-5 次采样所得 `useful_GiBps` 最高者为最佳设备。K 端指定单个 `--ub-device` 时走原生
-路径；后续正式 shape 均复用选择结果。完整校准日志写入 `ub_device_selection.log`，CSV
-的 `selected_ub_device` 列记录设备名。N/K 两端必须同时使用控制协议 v6。
+启动带宽选优已移除。需要固定 CPU 侧 UB 设备时，直接在统一 Get 性能入口传入
+`--peer-ub-device`，并在各组对照中保持相同设置：
 
 ```bash
-KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
-KVAF_ADAPTIVE_UB_DEVICES=udmac0d1e2,udmac0d1e3,udmac1d1e2,udmac1d1e3 \
-KVAF_ADAPTIVE_UB_MISS_COUNT=2048 \
-  ./tests/run_remote_cpu_batch_get_miss_count_perf.sh /absolute/path/to/build-npu \
-  --adaptive-ub-device
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv --peer-ub-device udmac0d1e2 \
+  --aiv-cores 2 --request-length 32768 --table-capacity 4096 \
+  --miss-count 4096 --token-bytes 656 --tokens-per-block 128 \
+  --warmup 10 --iterations 100
 ```
 
 需要同时使用多个 NPU EID 时，设置 `NpuRuntimeOptions::npu_eids`（Python
@@ -137,7 +131,7 @@ core/Jetty worker 按 Jetty-major 顺序轮转分配。BatchPut 保持原有单 
 任一 EID 失败即使整组初始化失败。当前这些 NPU 路径仍共享一个已选
 CPU EID 和 DDR region。测试脚本可用逗号分隔的 `KVAF_NPU_EIDS` 传入。
 
-现有 `tests/run_remote_cpu_e2e.sh` 与
+现有 `tests/run_remote_cpu_batch_get_perf.sh` 与
 `tests/run_remote_cpu_runtime_perf.sh` 接受 `KVAF_CPU_SERVICE_ADDR`，但该变量
 只由测试脚本转换为上述 `link_to` 调用，不再是 Runtime 内部配置来源。
 
@@ -164,9 +158,8 @@ Operator 内部诊断状态，不是 Python 参数或返回值。
 
 NPU BatchGet 的 `status` 和 `queue_state` 是 AIV kernel ABI 必需的内部 device
 buffer，由 `DefaultAccessOperator.Initialize` 申请并在 `Shutdown` 释放；Python
-和 `BatchGetRequest` 都不传它们。显式 `synchronize=True` 时，Operator 可读取
-其 completion status 并以 `[KVAF_AIV] BATCH_GET_DEVICE_ERROR` 诊断日志记录
-设备侧错误；它不会成为 Python 的额外返回值。
+和 `BatchGetRequest` 都不传它们。AIV/UBMEM eager 完成路径只等待并释放请求资源，
+不回读或检查 Get 状态报告；显式 profile 快照仍读取并验证设备报告。
 
 ## 当前 POC 的 NPU AccessTable 边界
 
@@ -203,122 +196,62 @@ entry，`offsets[i]` 给出 entry 内
 整张表。
 
 设备侧 `core_status.result`（例如 `kInvalidLookup`）是 Operator 内部诊断状态，
-不是 Python BatchGet 的输入/输出。显式 `synchronize=True` 时会记录错误 marker；
-默认 enqueue-only 调用由调用方在同一 stream 上的后续工作或自身同步决定何时观察
-完成。参数校验、ACL 分配/提交和显式 stream 同步失败仍以 Runtime 错误返回。
+不是 Python BatchGet 的输入/输出。默认 enqueue-only 调用由调用方在同一 stream
+上的后续工作或自身同步决定何时观察完成。参数校验、ACL 分配/提交和显式 stream 同步失败仍以 Runtime 错误返回。
 
-## 测试
+## A5 / CANN BatchGet 性能测试
 
-默认测试均由 Python 脚本定义场景和断言，并直接调用 pybind 的
-`kvaf.Runtime`；没有 C++ Mock driver 或子进程协议：
-
-```bash
-cmake -S . -B build -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=ON
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-```
-
-`tests/python/test_runtime_mock.py` 可以直接编辑；其中覆盖 Runtime 初始化、
-Put/Get 生命周期、AccessTable 锁定、slot 回收、参数校验和 Operator 失败回滚。
-脚本会以 `try/except` 探测 `torch_npu`、MPS、CPU 和无 PyTorch 环境：MPS 可用时
-用于在本机生成 caller-side 测试数据，然后直接传给 CPU Mock。MPS 不是 CANN
-AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
-
-## A5 / CANN BatchGet 集成
-
-`KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 AIV BatchGet
-算法的 kernel/host 库、`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。
-Python 脚本创建 NPU Tensor；通过 Runtime materialize `DeviceAccessTable`，然后
-直接传入 `batch_get`：
+`KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 构建 AIV kernel/host 库、
+`DefaultAccessOperator` 和 `kvaf.NpuRuntime`。统一构建命令包含四种 Get 后端：
 
 ```bash
 ./build.sh npu
-
-KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
-DEVICE_ID=0 \
-KVAF_NPU_TOKEN_BYTES=656 \
-KVAF_NPU_TOKENS_PER_BLOCK=128 \
-KVAF_NPU_ACTIVE_PERCENT=5 \
-tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv --aiv-cores 2 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
-该脚本用小规模 case 验证 Runtime 初始化、调用方 Device Tensor、Runtime
-materialize 的 `DeviceAccessTable`、BatchGet 输出字节、`output A -> B -> A` 的 local-buffer 缓存复用及
-teardown。它以 `KVAF_NPU_ACTIVE_PERCENT` 决定 `miss_count`（例如 `5` 表示约 5%
-请求有效），只为 `[0, miss_count)` 前缀写入 KV；随后可用 Runtime 的 ACL D2H mock
-`batch_put` 将 caller-owned NPU source Tensor 写入 Runtime-owned DDR。该小型
-BatchGet 用例不传 BatchPut kernel，因而不启动 Direct-HCCP BatchPut transport。
-默认使用 2 个 AIV core，每个 core 使用 2 个 Jetty；可通过
-`KVAF_NPU_CORE_COUNT` 和 `KVAF_NPU_JETTYS_PER_CORE` 覆盖。BatchGet 每个 core
-支持 1 到 64 个 Jetty，BatchPut 仍最多使用 2 个。
+CPU service 须预先启动。替换 `--backend` 及对应的 `--aiv-cores` / `--aicpu-workers` 可测 UBMEM、Gather、Scatter，
+具体参数及计时范围见[统一 Get 性能测试](../docs/batch_get_performance.md)。
+独立功能测试及其 CMake 注册已移除，数据预检和输出校验继续在性能计时外执行。
 
-设置 `KVAF_NPU_GRAPH_REPLAYS` 可在同一个 Python 用例中额外运行 Python-owned 的
-raw `kvaf.AclGraph` 图模式：
+图对象由 Python 持有；Runtime 不创建或保存图。`kvaf.AclGraph` 直接封装
+`aclmdlRICaptureBegin`、`aclmdlRICaptureEnd`、`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`；
+统一性能入口也支持 `--graph-api torch`。捕获前通过 `begin_get_graph` 准备配置、stream、
+输出和容量，捕获只提交 Get。回放前完成输入更新，计时只包含 replay 与 stream 等待。
+同一 Runtime 可在同一 stream 上串行回放多张图，每个 Get 节点使用独立租约。
+销毁一张图后结束它的全部租约；所有租约释放后才能关闭 Runtime。
+用法见 [多图与多个 Get 节点](../docs/get_graph_evolution.md#4-多图与多个-get-节点)。
 
-```bash
-KVAF_NPU_GRAPH_REPLAYS=2 \
-KVAF_NPU_WARMUP=10 \
-KVAF_NPU_ITERATIONS=100 \
-# 其余 KVAF_RUN_NPU_TESTS / kernel / shape 环境变量与上例相同
-timeout 240s python3 tests/python/test_npu_batch_get.py
-```
+`batch_get(stream=None, synchronize=False)` 默认在 `torch.npu.current_stream()` 上提交。
+同一 stream 的后续操作等待 Get；换 stream 时由调用方建立 event/wait 依赖。
+`drain_get()` 完成在途请求并清理请求引用。普通性能测试可使用 `async-drain`，
+与 main 对齐时使用 `async-wait`，一次同步调用使用 `sync-call`。
+AIV/UBMEM eager Get 不回读设备状态；ACL 提交与同步失败仍返回错误。
 
-图对象、capture、replay 和销毁都由 Python 测试持有的 `kvaf.AclGraph` 管理；KVAF
-Runtime 与 AccessOperator 不创建或保存图。`AclGraph` 是 pybind 暴露的薄封装，直接
-调用 ACL Runtime Graph 的 `aclmdlRICaptureBegin`、`aclmdlRICaptureEnd`、
-`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`。脚本先在图外 eager 执行
-`output A -> B -> A`，使 A 的 local HBM 注册进入 transport cache；再在 raw ACL
-capture 中只 capture `runtime.batch_get(..., stream=capture_stream)`。
-
-每次 replay 前，Python 在同一 ACL stream 上以
-`AclGraph.copy_host_to_device_async` 更新固定地址的 `address_table`、`indices`、
-`miss_count`、`output_indices`；capture 中的 BatchGet 参数和所有 NPU tensor 地址不变。正常
-性能口径是 `graph_replay_to_stream_completion`：五项 H2D 更新会在 replay 前完成并同步，
-不进入计时窗口；计时仅包含 graph replay 到同一 stream 完成，与 eager 的
-`runtime_batch_get_call_to_stream_completion` 口径对齐。默认 graph 的 warmup/iterations
-与 eager 一律使用相同的 `KVAF_NPU_WARMUP` / `KVAF_NPU_ITERATIONS` 采样计划。
-
-AIV 算法使用原生
-`aclrtMemcpyAsync(fixed_device_inputs, stream) -> aclmdlRIExecuteAsync(graph, stream)`。
-Python 测试使用调用方持有的 `torch.npu.Stream`；`AclGraph.replay(stream)` 显式传入
-capture 使用的同一 stream。图对象会在 Runtime shutdown 前 reset，避免图仍持有调用方
-buffer 时释放 HCCP transport。
-
-Python `batch_get` 的 `stream=None` 默认解析为 `torch.npu.current_stream()`，
-`synchronize=False` 默认只提交工作。同一 stream 的后续 Torch/ACL 运算天然等待
-BatchGet；如果调用方显式切换 stream，则由调用方建立 event/wait 依赖，并在
-teardown 前完成每个使用过的 stream。只有排障或单独等待时才需要
-`synchronize=True`。
-
-正确性验证完成后，脚本会输出
-`PERF_RESULT metric=runtime_batch_get_call_to_stream_completion`。这个计时窗口
-从 `Runtime.BatchGet` 调用开始，到 AIV adapter 中的 stream 同步完成结束，排除
-DDR 注册、Device buffer 初始化和 Host-to-Device 表更新。输出包括 mean、p50、
-p90、p99 和 useful GiB/s。`ctest` 和上面的命令均设置 240 秒上限；未设置
-`KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
-
-`DIRECT_LOCAL_BUFFER_ACQUIRE_NEW` 会始终记录新的 output HBM 注册；高频的
-cache-hit / release 日志默认关闭，避免压测污染终端。如需排查 LocalBuffer 引用
-计数，可额外设置 `KVAF_AIV_VERBOSE_LOCAL_BUFFER=1`。
+`DIRECT_LOCAL_BUFFER_ACQUIRE_NEW` 记录新 output HBM 注册；排查引用计数时可设置
+`KVAF_AIV_VERBOSE_LOCAL_BUFFER=1`，正式性能测量应关闭高频日志。
 
 ## A5 / CANN BatchPut 集成
 
 `tests/python/test_npu_batch_put.py` 通过 `kvaf.NpuRuntime` 验证真实的 AIV
 Direct-HCCP BatchPut 路径，不使用独立测试程序或 ACL D2H mock。默认每轮写入
-4096 个 1 KiB block。写入完成后通过 Runtime 的 Host AccessTable 检查 Meta 已提交
-的长度、有效位和远端 DDR payload。测试流程与 BatchGet 一致：先进行一次正确性
+4096 个 83,968 B block（656 B/token × 128 token/block）。写入完成后通过 Runtime 的 Host AccessTable 检查 Meta 已提交
+的长度、有效位和槽位地址；当前预检属于 metadata 校验。测试流程与 BatchGet 一致：先进行一次正确性
 验证，再执行 warmup 和正式采样，最后重新校验采样结果。测试会输出 `PERF_RESULT`，统计
 `runtime.batch_put()` 到 stream 完成的 mean、p50、p90、p99 和有效 GB/s。
 
 BatchPut 的 Runtime binding 依赖 BatchGet 的公共 NPU Runtime 构建，因此
-`build.sh npu` 一次构建两个 AIV kernel、host transport 与 Python binding。端到端
-正确性入口与上节相同；它会在 BatchGet 前验证 AIV Direct-HCCP BatchPut。
+`build.sh npu` 一次构建两个 AIV kernel、host transport 与 Python binding。性能入口为
+`tests/run_remote_cpu_batch_put_perf.sh`，支持 `--transport urma|ubmem --executor aiv|aicpu`。
 
-测试规模复用 BatchGet 的 `KVAF_NPU_REQUESTS`、`KVAF_NPU_TOKEN_BYTES`、
+测试规模使用 `KVAF_NPU_REQUESTS`、`KVAF_NPU_TOKEN_BYTES`、
 `KVAF_NPU_TOKENS_PER_BLOCK`、
 `KVAF_NPU_CORE_COUNT`、`KVAF_NPU_JETTYS_PER_CORE`、`KVAF_NPU_WARMUP` 和
-`KVAF_NPU_ITERATIONS`。启用 `BUILD_TESTING` 后，该脚本也会注册为
-`kvaf_npu_batch_put_python`；没有设置 `KVAF_RUN_NPU_TESTS=1` 时会明确跳过。
+`KVAF_NPU_ITERATIONS`，由上述 shell 入口设置设备测试环境。
 
 ## NPU Runtime 性能脚本
 

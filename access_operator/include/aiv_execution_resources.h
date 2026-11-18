@@ -2,6 +2,7 @@
 
 #include "access_operator.h"
 #include "execution_view.h"
+#include "get_graph_report.h"
 #include "acl/acl.h"
 #include "kvaf_aiv_batch_get.h"
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -16,6 +17,7 @@ struct AivGetWorkspace {
   std::size_t status_bytes{};
   void* queue_state{};
   std::size_t queue_state_bytes{};
+  bool profiling{};
 };
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 struct AivPutWorkspace {
@@ -46,6 +48,7 @@ struct AivInvocation final : ExecutionState {
   KvafBatchGetLocalBuffer* graph_buffer{};
   std::uint64_t graph_entity{};
   GetGraphOptions graph_options;
+  GetGraphReport graph_report;
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
   aclrtStream pending_put{};
   KvafBatchPutLocalBuffer* pending_put_buffer{};
@@ -89,7 +92,7 @@ struct AivLaunchOptions {
 struct UrmaAivGetView {
   ExecutionViewCommon common;
   AivLaunchOptions options;
-  AivGetWorkspace& workspace;
+  AivGetWorkspace workspace;
   KvafBatchGetLocalBuffer* buffer{};
   std::uint64_t channel_entity{};
 };
@@ -114,6 +117,7 @@ class AivExecutionResources final : public ExecutionResourceOwner {
   Status PrepareGetResources(const BatchGetExecRequest&, AivInvocation&, UrmaAivGetView*);
   Status PreparePutResources(const BatchPutExecRequest&, AivInvocation&, UrmaAivPutView*);
   Status PrepareGraph(const GetGraphOptions&, AivInvocation&);
+  Status SetGetProfiling(bool);
   Status PrepareOutput(const GetOutputOptions&, AivInvocation&);
   Status PrepareInput(const PutInputOptions&, AivInvocation&);
   std::unique_ptr<ExecutionState> CreateState() const;
@@ -126,9 +130,10 @@ class AivExecutionResources final : public ExecutionResourceOwner {
 // Stateless execution algorithms; views cannot be interchanged across directions.
 class UrmaAivGetOperator {
  public:
-  static Status Validate(const BatchGetExecRequest&, UrmaAivGetView, AivInvocation&,
-                         std::uint64_t* capture_query_ns = nullptr);
-  static Status Launch(const BatchGetExecRequest&, UrmaAivGetView, AivInvocation&);
+  static Status PrepareArguments(const BatchGetExecRequest&, UrmaAivGetView,
+                                 const AivInvocation&, KvafExecuteBatchGetKernelArgs*);
+  static Status Launch(const BatchGetExecRequest&, UrmaAivGetView, AivInvocation&,
+                       KvafExecuteBatchGetKernelArgs);
   static Status Drain(UrmaAivGetView, AivInvocation&);
   static Status PrepareGraph(const GetGraphOptions&, UrmaAivGetView, AivInvocation&);
   static Status FinishGraph(void*, bool, UrmaAivGetView, AivInvocation&);

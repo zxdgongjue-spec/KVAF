@@ -1,8 +1,8 @@
 # KVAF 缓存访问执行框架设计
 
-实现基线：`codex/cache-transport-execution` 的 `ed61a31`。该版本已统一执行路径、移除 legacy 模式及旧构造配置，算法资源按构建能力注册并在首次使用时准备；本轮统一执行路径的真机与性能仍待验收。第 1–13 节说明当前设计、实现边界和剩余工作；“已实现”不等于目标硬件上的数据正确性、跨 transport 可见性或性能已经验收。公开 API 与后端细节见[实现与使用](cache_transport_execution_implementation.md)，测试覆盖及执行方法见[验证步骤](cache_transport_execution_validation.md)。
+实现基线：`codex/cache-transport-execution` 的 `5cce05e7`。该版本已统一执行路径、移除 legacy 模式及旧构造配置，算法资源按构建能力注册并在首次使用时准备；支持同 stream 多图及多个 Get 节点。第 1–13 节说明当前设计、实现边界和剩余工作；“已实现”不等于目标硬件上的数据正确性、跨 transport 可见性或性能已经验收。公开 API 与后端细节见[实现与使用](cache_transport_execution_implementation.md)，当前性能入口及验证覆盖边界见[验证步骤](cache_transport_execution_validation.md)。
 
-第 14、15 节保留原有未提交设计草稿及后续目标；第 15 节开头补充了已落地能力的状态说明。阅读时以[第 12 节状态对照](#12-已实现范围与后续工作)区分现状与后续目标，草稿的历史基线不代表当前工作区的整体状态。
+第 14、15 节保留原有历史设计草稿及后续目标；第 15 节开头补充了已落地能力的状态说明。阅读时以[第 12 节状态对照](#12-已实现范围与后续工作)区分现状与后续目标，草稿的历史基线不代表当前工作区的整体状态。
 
 ## 1 模式与当前支持范围
 
@@ -169,7 +169,7 @@ AICPU 使用显式 `UmdkQueueProfile`：当前 Put 创建 **1 条 control、0 �
 | 单次执行 | 短期租约、请求/表引用、完成信息 | Get 确认完成；Put 还须完成事务及确认 |
 | graph / 显式 buffer 绑定 | 固定 buffer、资源引用及必要调用方引用 | 对应 End 成功，或允许的安全关闭流程 |
 
-长期 `PutResourceReference` / `GetResourceReference` 固定 owner 与绑定状态，不设置执行占用；普通请求取得对应的 `PutResourceLease` / `GetResourceLease`。Put 的执行租约从准备请求保留至数据面完成、元数据事务及 Acknowledge 成功；普通 Get 在安全完成后归还。graph 使用同类执行资源保护，但占用延续到图租约成功结束，不能按单次 replay 归还。归还执行租约保留驻留实例。关闭失败保留 owner、状态和依赖，不能用相同身份静默创建另一份资源。
+长期 `PutResourceReference` / `GetResourceReference` 固定 owner 与绑定状态，不设置执行占用；普通请求取得对应的 `PutResourceLease` / `GetResourceLease`。Put 的执行租约从准备请求保留至数据面完成、元数据事务及 Acknowledge 成功；普通 Get 在安全完成后归还。graph 节点复用驻留 owner，并由 `GetGraphNode` 单独保存状态；准备结束即归还普通 Get 执行租约，Dispatcher 在图租约存活期间禁止 eager Get。图节点依赖不能按单次 replay 归还。归还执行租约保留驻留实例。关闭失败保留 owner、状态和依赖，不能用相同身份静默创建另一份资源。
 
 “释放本次租约”表示取消执行占用，允许后续调用使用这套资源，不等于销毁上下文、关闭队列或注销显式 buffer 绑定。Get 的 `ClearRequest()` 清空 request、借用 table、options 和短期 lease，保留长期资源引用、provider ExecutionState、准备缓存及输出绑定。具体临时注册是否需要在完成阶段注销，由 provider 和绑定方式决定，不能由“释放引用”一词推断。
 
@@ -239,7 +239,7 @@ CPU DDR 注册共享位于服务端内部，当前未新增共享 binding 的 wi
 
 ### 8.1 方向调度
 
-每个 Runtime 最多一批 Put 和一批 Get 同时在途；各方向内部串行。Put/Get 多实例驻留不增加同方向并发能力，同算法的多个 stream slot 也不代表能并行借用同一组队列和工作区。
+普通调用中每个 Runtime 最多一批 Put 和一批 Get 同时在途；各方向内部串行。图模式允许多个节点和多张图在同一 stream 排队串行执行，不允许跨 stream 并发回放。Put/Get 多实例驻留不增加同方向并发能力，同算法的多个 stream slot 也不代表能并行借用同一组队列和工作区。
 
 | 场景 | 当前行为 |
 |---|---|
@@ -307,9 +307,9 @@ Python 绑定持有相关 Tensor 和 stream 对象的强引用，防止异步返
 
 | 后端 | 当前状态处理边界 |
 |---|---|
-| URMA AIV Direct | 普通同步/Drain 中设备状态用于诊断日志，不转成统一 BatchGet 结果错误；stream 同步和注册清理失败仍返回错误 |
+| URMA AIV Direct | eager 同步/Drain 等待完成并清理请求，不回读或检查设备状态；ACL 提交/同步和注册清理失败仍返回错误，显式 profile 快照另行读取并校验报告 |
 | URMA AICPU Gather/Scatter | 完成与显式检查按设备状态/协议结果处理；graph replay 的通信序号由设备 ticket 推进 |
-| UBMEM Direct | 异步 Drain 与 graph 结束仍等待并回读检查；非图异步 Get 和 graph 捕获不逐次清零 status，依赖 kernel 覆盖报告 |
+| UBMEM Direct | eager 同步/异步 Get 均不清零、回读或检查状态报告；完成仍等待并处理 ACL 错误，显式 profile 和 graph 结束保留各自的报告检查 |
 
 未确认完成或清理失败时保留必要依赖。恢复限定在受影响配置；共享 context、注册或设备失效不能简单当作独立队列错误。当前共享机制和关闭失败保留规则不代表已提供所有共享故障场景的自动恢复。
 
@@ -349,27 +349,27 @@ runtime.batch_get(
 
 ```text
 begin_get_graph(config, output, capacity, stream)
-  → 捕获前完成准备并独占 Get 方向
+  → 每节点在捕获前准备独立租约；存活租约使 Get 方向专用于图
   → capture: 一次 batch_get(graph_lease=lease, synchronize=False)
   → replay: 在相同输入存储中更新请求内容并重放
   → 停止 replay、销毁图，end_get_graph(lease, stream)
-  → 释放 graph 依赖和执行占用，Get 实例继续驻留
+  → 释放该节点依赖；最后一个图租约结束后恢复 eager Get，实例继续驻留
 ```
 
 - 固定执行配置、stream、输出地址/大小和容量上限。indices、offsets、miss_count、output_indices 可在原存储内更新，以覆盖全量、部分及零请求；不能替换仍被图使用的 allocation。
-- 一租约只允许一个异步 Get capture；同图多个 Get 节点、混合算法和 Put graph 均未支持。捕获不携带逐调用同步 profile 输出。
+- 一租约只允许一个异步 Get capture；一张图可含多个节点，多张图也可同时存活，全部使用同一 stream 串行回放。图内混合算法不在本轮验收范围，Put 不进入图。捕获不携带逐调用同步 profile 输出。
 - 捕获前完成模块、注册、workspace 与 slot 准备；捕获/重放不触发首次建链、动态注册/分配或 Host Drain。AICPU 用设备 ticket 推进 replay 序号。
 - graph 持有整个 Get 方向，拒绝额外 eager Get、Get Drain/Warmup/Recover 和 Runtime 关闭。它不把 Put 变成图操作，也不取消 Put/Get 原有数据冲突与 stream 顺序约束。
 - 已有 eager 输出绑定只阻止**同一实例**进入 graph；其他实例的空闲输出绑定可以继续保留。graph 期间不解除这些绑定。
-- caller 保持 graph 使用的表、输入输出和 stream 有效，并在释放租约前停止回放。Python 与 RuntimeCore 分别保留必要 Tensor 和 AccessTable 引用。
+- caller 保持 graph 使用的表、输入输出和 stream 有效，并在释放租约前停止回放。Python 与 RuntimeCore 为各节点分别保留必要 Tensor 和 AccessTable 引用；同算法节点共享会话、队列和工作区，完成报告独立。Torch Graph 的外部 replay 也须遵守捕获 stream 约束，Runtime 无法拦截该调用。
 
 ### 11.2 状态、profiling 与释放
 
 AIV Direct graph 不增加逐次 status 清零或结果回拷；UBMEM graph 不在 kernel 前追加 status memset，结束时仍同步并检查结果；AICPU 显式状态检查在 replay 完成后执行。不能用统一的“每次重放先清零并回读状态”描述四种算法。
 
-kernel profiling 在取得 graph lease 前按配置启用，每轮执行完成后读取，结束图与租约后再关闭。状态查询和 profile 路由到指定配置的驻留实例；省略配置使用 Runtime 默认 Get。具体可调用接口及保留最后 profile 的规则见实现文档。
+kernel profiling 在取得 graph lease 前按配置启用，每轮执行完成后读取，结束图与租约后再关闭。状态查询和 profile 路由到指定配置的驻留实例；省略配置使用 Runtime 默认 Get。同实例有多个图节点时须用 `graph_lease=lease` 选择节点，报告为该节点最近一次完成的结果。性能入口默认关闭 profiling，显式 `--kernel-profile` 才开启。具体接口及结束后保留最后 profile 的规则见实现文档。
 
-正常结束和 discard 均须保证回放已停止；同步或注销失败保留资源与租约供重试。AICPU 捕获但未重放的图正常结束会报告未完成，可显式 discard；协议错误后的 discard 可能关闭该算法 owner，之后需 `recover(config)`，不能复用可能损坏的队列。后端状态语义不同，discard 也不能解释为无条件忽略未决 DMA。
+正常结束和 discard 均须保证回放已停止；同步或注销失败保留资源与租约供重试。AICPU 捕获但未重放的图正常结束会报告未完成，可显式 discard。共享 AICPU 会话失败后，先销毁引用同一算法实例的全部图，再对各租约调用 `end_get_graph(..., discard_result=True)`；尚有同实例租约未进入丢弃流程时返回 Busy。最后一个租约关闭会话后，重试此前收到 Busy 的租约；结束全部图租约后再 `recover(config)`。具体顺序见实现文档，不能复用可能损坏的队列，也不能把 discard 解释为忽略未决 DMA。
 
 ### 11.3 关闭与 Pull 模块
 
@@ -381,11 +381,12 @@ Runtime 关闭前先显式结束 graph。关闭在 provider 执行状态仍绑�
 
 ## 12 已实现范围与后续工作
 
-| 事项 | 当前代码状态（基于 `ed61a31`） | 原草稿阅读方式 |
+| 事项 | 当前代码状态（基于 `5cce05e7`） | 原草稿阅读方式 |
 |---|---|---|
 | 3 Put、4 Get、固定 allocation、方向隔离、事务恢复 | 已接入；硬件覆盖按验证文档单列 | 第 1–13 节使用当前范围，不沿用 18 对目标组合 |
 | Get 按配置驻留、长期引用/执行占用分离、输出绑定归实例 | `d95eb64` 已实现 | §15 中相应“改造目标”已落地 |
 | 四种 Get graph、设备 ticket、配置路由的 profiling/状态接口 | `52b59de` 已接入；后续修复至 `0d788bd` | 当前契约见第 11 节 |
+| 同 stream 多图及多个 Get 节点、独立节点报告和按租约查询 | 已接入；图内混合算法不在本轮验收范围 | 第 11 节及实现文档说明共享会话与节点依赖 |
 | HCCP/AICPU provider 环境、CPU context/DDR 注册共享 | `33e6311` 已实现限定范围 | §14 只完成其中一部分，不等同全局公共内存层 |
 | AICPU Put 1 control / 0 data QueueProfile | `33e6311` 已实现 | §14.3 不再作为待办 |
 | URMA Put 输入绑定复用及 metadata 拷贝优化 | `f27baa8`、`3f60fbf` 已实现；当前接入同一驻留实例 | 输入注册的绑定期限与上下文驻留期限仍不同 |
@@ -393,11 +394,11 @@ Runtime 关闭前先显式结束 graph。关闭在 provider 执行状态仍绑�
 | AICPU 公共包、Gather 工作区延后；按构建支持替代 enabled 集合 | `e35a14d` 已实现 | 初始化与首次使用边界见第 1、2 节 |
 | 统一 Dispatcher 路径、移除 legacy/旧构造参数及启动探测 | `ed61a31` 已实现；本地检查通过，本轮真机与性能待验收 | 旧版本性能基线须使用对应提交的构建及脚本 |
 | NPU/AICPU 跨算法 context、HBM 注册与远端导入共享 | 尚未实现完整公共模型 | §14 的身份、所有权及协议扩展仍是后续设计 |
-| AIV Gather/Scatter；同图多 Get/混合算法；Put graph；同方向多请求并发 | 不在当前能力集合 | 需要独立实现和验收，不由资源共享/驻留自动获得 |
+| AIV Gather/Scatter；Put graph；同方向并发执行 | 不在当前能力集合 | 需要独立实现和验收，不由资源共享/驻留自动获得 |
 
 生产目录已由 `904d12d` 按 algorithms、providers、transports 及 Runtime 职责重组，库名、kernel 符号和 `build-npu/bin` 产物路径保持原约定。调度器及资源管理器位于 `runtime/execution/`；`runtime/src/runtime.cc` 仍在原处。
 
-设计契约、实现状态、验证证据分开维护：本篇解释所有权和约束，实现篇说明 API/后端/目录，验证篇记录覆盖、执行条件、结果与未验证项。便携模型或 stub 测试不能代替真实 DMA、graph replay、跨 transport 可见性和性能验收。
+设计契约、实现状态、验证证据分开维护：本篇解释所有权和约束，实现篇说明 API/后端/目录，验证篇记录当前性能入口、执行条件与覆盖边界。独立 C++/Python 功能测试及 stub/model、CTest 注册已移除；历史便携结果不能代替当前版本的真实 DMA、graph replay、跨 transport 可见性和性能验收。
 
 ## 13 实现依据与文档导航
 
@@ -415,9 +416,9 @@ Runtime 关闭前先显式结束 graph。关闭在 provider 执行状态仍绑�
 | Python API 与引用保留 | [npu_python_runtime.cc](../bindings/src/npu_python_runtime.cc) |
 
 - [实现与使用](cache_transport_execution_implementation.md)：当前类型、接口、后端约束、部署和目录。
-- [验证步骤](cache_transport_execution_validation.md)：12 对普通组合、四算法 graph、资源/恢复检查及性能入口。
+- [验证步骤](cache_transport_execution_validation.md)：当前 Get/Put 性能入口、图回放预检与验证覆盖边界。
 
-以下 §14/§15 保留历史设计草稿及未来目标，仍未提交；§15 开头增加当前落地范围说明。旧基线、路径和实施顺序应结合第 12 节阅读，不作为覆盖当前正文的实现状态声明。
+以下 §14/§15 保留历史设计草稿及未来目标；§15 开头增加当前落地范围说明。旧基线、路径和实施顺序应结合第 12 节阅读，不作为覆盖当前正文的实现状态声明。
 
 ## 14 资源共享与执行隔离的后续设计
 
@@ -628,7 +629,7 @@ kernel 模块缓存按设备/context、模块身份和 ABI 管理，不仅凭文
 
 ## 15 固定算法组合下的上下文驻留设计
 
-本节保留上下文驻留的设计依据和后续优化目标。Get 驻留已在 `d95eb64` 实现；普通 Put 按配置驻留、Prepare/Execute 复用、元数据失败取消准备和确认后保留状态已在 `56d5b4e` 实现。当前 `ed61a31` 已统一执行路径；本地回归不能代替本轮真机与性能验收。当前契约见第 6 节与第 12 节；下文的历史分析不表示当前仍按次创建上下文，进一步优化目标也不等于已经实现。
+本节保留上下文驻留的设计依据和后续优化目标。Get 驻留已在 `d95eb64` 实现；普通 Put 按配置驻留、Prepare/Execute 复用、元数据失败取消准备和确认后保留状态已在 `56d5b4e` 实现；`ed61a31` 已统一执行路径。下文保留当时的状态读取和 graph 描述，当前契约以第 6、9、11、12 节为准；历史回归不能代替当前版本的真机与性能验收。历史分析不表示当前仍按次创建上下文，进一步优化目标也不等于已经实现。
 
 目标使用场景是：一个应用在同一缓存池上混合使用固定的几种 Put/Get 算法，各配置首次使用时准备资源和上下文，之后直接复用。调用仍可选择不同算法，不要求每次调用重新创建执行上下文，也不新增一种执行模式。当前每次执行仍取得轻量租约，Put 不复制请求向量到驻留对象；跨算法内存共享、provider 内重复查找消除和任意 stream 切换免准备仍需独立完成。
 

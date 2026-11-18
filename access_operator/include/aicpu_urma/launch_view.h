@@ -1,4 +1,6 @@
 #pragma once
+
+#include "get_graph_report.h"
 #include <acl/acl.h>
 #include "access_operator.h"
 #include "execution_view.h"
@@ -37,6 +39,7 @@ struct AicpuGetInvocation final : ExecutionState {
   bool graph_active{false};
   aclrtStream graph_stream{};
   std::uint64_t graph_start_sequence{};
+  std::unique_ptr<GetGraphReport> graph_completion, graph_profile;
   const BatchGetRequest* prepared{};
   void* prepared_stream{};
   BatchGetProfile* prepared_profile{};

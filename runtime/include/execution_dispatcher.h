@@ -3,6 +3,7 @@
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 #include <vector>
 #include "access_operator.h"
 #include "execution_context.h"
@@ -40,8 +41,9 @@ class ExecutionDispatcher final : public AccessOperator {
   Status ResolvePut(PutExecutionConfig, PutCompletion*) override;
   Status AcknowledgePut() override;
   Status ConfigureGetProfiling(std::optional<GetExecutionConfig>, bool enabled, bool detailed);
-  Status CopyGetProfiles(std::optional<GetExecutionConfig>, std::vector<BatchGetKernelProfile>*);
-  Status CheckGetStatus(std::optional<GetExecutionConfig>, void* stream);
+  Status CopyGetProfiles(std::optional<GetExecutionConfig>, std::vector<BatchGetKernelProfile>*,
+                         std::uint64_t graph_lease = 0);
+  Status CheckGetStatus(std::optional<GetExecutionConfig>, void* stream, std::uint64_t graph_lease = 0);
   const ExecutionPolicy& policy() const { return policy_; }
  private:
   PutExecutionContext* FindPutInstanceLocked(PutExecutionConfig) const;
@@ -57,6 +59,7 @@ class ExecutionDispatcher final : public AccessOperator {
                                   GetExecutionContext**, GetPreparationTiming* = nullptr);
   Status CloseGetInstanceLocked(GetExecutionContext*);
   Status DrainGetLocked();
+  Status FindGraphNode(GetExecutionContext*, std::uint64_t, GetGraphNode**);
   Status FinishOutputLocked(GetExecutionContext&);
   Status ValidateInputLocked(const BatchPutRequest&, const BatchPutExecutionOptions&,
                              PutExecutionConfig) const;
@@ -81,9 +84,9 @@ class ExecutionDispatcher final : public AccessOperator {
   PutExecutionContext* failed_input_context_{nullptr};
   std::vector<std::unique_ptr<GetExecutionContext>> get_instances_;
   GetExecutionContext* pending_get_{nullptr};
-  std::uint64_t graph_id_{0}, next_graph_id_{1};
-  GetExecutionContext* graph_context_{nullptr};
-  bool graph_captured_{false};
+  std::uint64_t next_graph_id_{1};
+  void* graph_stream_{nullptr};
+  std::unordered_map<std::uint64_t, GetGraphNode> graph_nodes_;
   std::uint64_t next_output_id_{1};
 };
 }  // namespace kvaf

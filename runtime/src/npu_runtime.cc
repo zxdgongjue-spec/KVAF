@@ -805,17 +805,19 @@ Status NpuRuntime::SetBatchGetKernelProfiling(
   return impl_->dispatcher->ConfigureGetProfiling(config, enabled, detailed);
 }
 
-Status NpuRuntime::CheckBatchGetStatus(void* stream, std::optional<GetExecutionConfig> config) {
+Status NpuRuntime::CheckBatchGetStatus(void* stream, std::optional<GetExecutionConfig> config,
+                                      std::uint64_t graph_lease) {
   if (!initialized() || !impl_->dispatcher)
     return Status::NotInitialized("NpuRuntime is not initialized");
-  return impl_->dispatcher->CheckGetStatus(config, stream);
+  return impl_->dispatcher->CheckGetStatus(config, stream, graph_lease);
 }
 
 Status NpuRuntime::CopyBatchGetKernelProfiles(
-    std::vector<BatchGetKernelProfile>* profiles, std::optional<GetExecutionConfig> config) const {
+    std::vector<BatchGetKernelProfile>* profiles, std::optional<GetExecutionConfig> config,
+    std::uint64_t graph_lease) const {
   if (!initialized() || !impl_->dispatcher)
     return Status::NotInitialized("initialize Runtime before reading Get profiling");
-  return impl_->dispatcher->CopyGetProfiles(config, profiles);
+  return impl_->dispatcher->CopyGetProfiles(config, profiles, graph_lease);
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

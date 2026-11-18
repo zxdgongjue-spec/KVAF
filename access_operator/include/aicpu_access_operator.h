@@ -30,6 +30,7 @@ class UmdkAccessOperator final : public AccessOperator {
   Status DrainGet() override;
   Status PrepareGetGraph(const GetGraphOptions&) override;
   Status FinishGetGraph(void*, bool) override;
+  bool GetGraphNeedsRecovery() const override;
   Status PrepareGetOutput(const GetOutputOptions&) override;
   Status FinishGetOutput() override;
   Status PreparePutInput(const PutInputOptions&) override;

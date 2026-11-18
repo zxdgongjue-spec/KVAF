@@ -54,6 +54,7 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   Status ReleaseGetBuffers();
   Status PrepareGetGraph(const GetGraphOptions&);
   Status FinishGetGraph(void*, bool);
+  bool GetGraphNeedsRecovery() const;
   Status PrepareGetOutput(const GetOutputOptions&);
   Status FinishGetOutput();
   Status PreparePutInput(const PutInputOptions&);

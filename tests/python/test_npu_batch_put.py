@@ -16,9 +16,10 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backend import detect_torch_backend
-from npu_eids import parse_npu_eids
-from perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.backend import detect_torch_backend
+from utils.npu_eids import parse_npu_eids
+from utils.perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.statistics import percentile
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
 DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
@@ -89,14 +90,6 @@ def build_keys(
     ]
 
 
-def percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
-    position = fraction * (len(ordered) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
-
 def validate_batch(
     runtime: object,
     keys: list[int],
@@ -114,9 +107,8 @@ def validate_batch(
         slot_bytes = runtime.remote_region["slot_size"]
         if list(view["addresses"]) != [base + key * slot_bytes for key in keys]:
             raise AssertionError("BatchPut addresses must follow DSA key_id == slot_id")
-        # DDR belongs to the CPU service process. The companion BatchGet
-        # integration test validates the bytes through AIV UB rather than
-        # dereferencing a remote process address from Python.
+        # DDR belongs to the CPU service process. Payload validation is done
+        # by the Get benchmark, not by dereferencing remote addresses here.
         print("RUNTIME_NPU_REMOTE_CPU_DIRECT_DEREFERENCE_SKIPPED")
     finally:
         runtime.release_access_table(table)

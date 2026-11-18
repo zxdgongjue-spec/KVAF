@@ -1,5 +1,7 @@
 #pragma once
 
+#include "get_graph_report.h"
+
 #include "../access_operator.h"
 #include "execution_view.h"
 #include "ubmem/batch_abi.h"
@@ -34,6 +36,7 @@ struct UbmemInvocation final : ExecutionState {
   std::unordered_map<aclrtStream, ExecutionSlot::Pending> pending;
   bool graph_active{}, graph_recorded{};
   GetGraphOptions graph_options;
+  GetGraphReport graph_report;
   aclrtStream profile_stream{};
   aclrtStream put_stream{};
   std::uint64_t put_rows{};

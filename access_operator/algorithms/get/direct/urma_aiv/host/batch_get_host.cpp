@@ -237,8 +237,9 @@ bool AcquireLocalBuffer(KvafBatchGetTransport *transport, void *output_hbm, uint
   *device_channel_entity = 0;
   const uint64_t output_address = reinterpret_cast<uint64_t>(output_hbm);
   for (const auto &existing : transport->local_buffers) {
-    if (existing != nullptr && existing->ready && existing->output_hbm_address == output_address &&
+    if (existing != nullptr && existing->output_hbm_address == output_address &&
         existing->output_hbm_bytes == output_hbm_bytes) {
+      if (!existing->ready) return false;  // Registration is awaiting retirement.
       ++existing->reference_count;
       *local_buffer = existing.get();
       *device_channel_entity = existing->device_channel_entity;
@@ -663,7 +664,12 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport *transpo
 }
 
 extern "C" int32_t KvafBatchGetLocalBufferRetire(KvafBatchGetLocalBuffer* local) {
-  if (!local || !local->transport || local->reference_count != 1U) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  if (!local || !local->transport || !local->reference_count) return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  if (local->reference_count > 1U) {
+    --local->reference_count;
+    return KVAF_BATCH_GET_SUCCESS;
+  }
+  local->ready = false;
   auto* transport = local->transport;
   for (std::size_t i = 0; i < local->path_registrations.size(); ++i) {
     auto& registration = local->path_registrations[i];
