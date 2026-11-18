@@ -13,6 +13,7 @@ constexpr std::uint32_t kGiantPage = 2;
 constexpr std::uint32_t kP2pDdr = 3;
 constexpr std::uint64_t kHostUva = 1ULL << 10;
 constexpr std::size_t kGiantPageBytes = 1ULL << 30;
+constexpr int kHalNotSupported = 0xfffe;
 
 template <typename T>
 bool Symbol(void* library, const char* name, T* result) {
@@ -78,6 +79,12 @@ Status Mapping::AllocateHost(std::uint64_t requested_bytes, FabricHandle* descri
   const auto page_type = giant_pages ? kGiantPage : kHugePage;
   const MemoryProperty prop{kHostSide, 0, 0, page_type, kP2pDdr, 0};
   int ret = hal_->create(&handle_, mapping_bytes, &prop, 0);
+  if (giant_pages && ret == kHalNotSupported) {
+    const std::string message = "1 GiB UBmem Host P2P DDR is unsupported by this driver or platform "
+        "(halMemCreate ret=" + std::to_string(ret) + "). Use --ubmem-page-size 2m.";
+    std::fprintf(stderr, "[KVAF_UBMEM] %s\n", message.c_str());
+    return Status::NotImplemented(message);
+  }
   if (ret != 0) {
     return HalError(giant_pages ? "halMemCreate(Host P2P DDR, 1 GiB pages)"
                                : "halMemCreate(Host P2P DDR)", ret);

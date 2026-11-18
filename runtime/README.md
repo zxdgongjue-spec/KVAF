@@ -89,6 +89,8 @@ UBmem 默认向 Ascend HAL 申请 2 MiB 大页。支持 Host P2P DDR giant page 
 构建的服务。`1g` 会把每次 DDR 申请的映射长度按 1 GiB 向上取整，客户端可用长度
 保持为请求值。HAL 拒绝申请时直接返回错误。客户端用 `--transport ubmem`；CPU
 服务的 `DDR_EXPORTED` 日志记录 `page_size` 和 `mapping_bytes`。
+`halMemCreate` 返回 `65534`（`DRV_ERROR_NOT_SUPPORT`）时，当前驱动或平台不支持
+这次 1 GiB 申请，可用 `--ubmem-page-size 2m` 继续测试 UBmem。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的

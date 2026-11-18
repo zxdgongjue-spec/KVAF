@@ -14,7 +14,8 @@ using kvaf::ubmem::MemoryProperty;
 constexpr std::size_t kTwoMiB = 2ULL << 20;
 constexpr std::size_t kOneGiB = 1ULL << 30;
 constexpr std::size_t kRequestBytes = kTwoMiB + 4096;
-constexpr int kMockError = 25;
+constexpr int kDriverNotSupported = 0xfffe;
+constexpr int kDriverOutOfMemory = 6;
 
 void Check(bool passed, const char* detail) {
   if (passed) return;
@@ -79,13 +80,22 @@ int main() {
 
   hal->create = [](void**, std::size_t, const MemoryProperty* prop, std::uint64_t) {
     Check(prop->page_type == 2, "1 GiB failure must not retry with 2 MiB pages");
-    return kMockError;
+    return kDriverNotSupported;
   };
   Mapping failed(hal);
   FabricHandle descriptor{};
   const auto status = failed.AllocateHost(kRequestBytes, &descriptor, true);
-  Check(!status.ok() && status.message().find("1 GiB") != std::string::npos,
-        "1 GiB driver error must reach the caller");
+  Check(status.code() == kvaf::StatusCode::kNotImplemented &&
+        status.message().find("--ubmem-page-size 2m") != std::string::npos,
+        "unsupported 1 GiB pages need an actionable error");
   Check(!failed.AllocateHost(std::numeric_limits<std::uint64_t>::max(), &descriptor, true).ok(),
         "rounding overflow must fail before allocation");
+
+  hal->create = [](void**, std::size_t, const MemoryProperty*, std::uint64_t) {
+    return kDriverOutOfMemory;
+  };
+  const auto out_of_memory = failed.AllocateHost(kRequestBytes, &descriptor, true);
+  Check(out_of_memory.code() == kvaf::StatusCode::kInternal &&
+        out_of_memory.message().find("ret=6") != std::string::npos,
+        "driver OOM must stay distinct from unsupported 1 GiB pages");
 }
