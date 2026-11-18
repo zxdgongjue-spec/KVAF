@@ -531,8 +531,6 @@ class NpuPythonRuntime final {
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
-    if (scatter_graph_storage_ && scatter_graph_table_.opaque == handle.opaque)
-      throw py::value_error("reset or detach the Scatter graph before releasing its AccessTable");
     for (const auto& node : scatter_graph_nodes_) {
       if (node.table.opaque == handle.opaque)
         throw py::value_error("detach the Scatter graph before releasing its AccessTable");
@@ -586,14 +584,11 @@ class NpuPythonRuntime final {
       item["cpu_post_ns"] = profile.cpu_post_ns;
       item["cpu_cq_wait_ns"] = profile.cpu_cq_wait_ns;
       item["pipeline"] = profile.pipeline;
-      item["suffix_cq_blocked_cycles"] = profile.suffix_cq_blocked_cycles;
       item["scatter_cycles"] = profile.scatter_cycles;
       item["ready_wait_cycles"] = profile.ready_wait_cycles;
       item["scatter_start_cycle"] = profile.scatter_start_cycle;
       item["scatter_finish_cycle"] = profile.scatter_finish_cycle;
-      item["scatter_enqueue_finish_cycle"] = profile.scatter_enqueue_finish_cycle;
       item["scatter_chunks"] = profile.scatter_chunks;
-      item["cross_chunk_shards"] = profile.cross_chunk_shards;
       if (!core && host_profile_enabled_ && host_profile_ready_) {
         py::dict host;
         for (std::size_t phase = 0; phase < scatter_host::kCount; ++phase)
@@ -746,54 +741,34 @@ class NpuPythonRuntime final {
                                    const py::object& indices, const py::object& offsets,
                                    const py::object& miss_count, const py::object& output_indices,
                                    const py::object& output, const py::object& stream,
-                                   bool synchronize, bool wait_stream, bool acl_graph,
-                                   bool capture_into_graph) {
+                                   bool synchronize, bool capture_into_graph) {
     if (!trusted_scatter_inputs_ || !Initialized())
       throw py::value_error("prepare_scatter_batch_get requires initialized cpu_push_scatter");
-    if (synchronize && wait_stream)
-      throw py::value_error("choose synchronize (validated) or wait_stream (deferred status), not both");
-    if (capture_into_graph && (acl_graph || synchronize || wait_stream))
-      throw py::value_error("caller-managed capture requires an asynchronous node and no standalone graph");
+    if (capture_into_graph && synchronize)
+      throw py::value_error("graph capture requires an asynchronous node");
     const auto selected = tensor_methods_->SelectStream(stream);
     const auto request = TrustedScatterRequest(table.source(), table.addresses(), table.valid(),
         indices, offsets, miss_count, output_indices, output, native_->batch_get_token_bytes(),
         native_->batch_get_tokens_per_block(), *tensor_methods_);
     const auto generation = generation_;
-    // The returned no-argument callable owns all Python storage and the Runtime.
-    // No implicit pointer cache is added to the ordinary, stream-dynamic API.
     auto storage = py::make_tuple(selected, table.addresses(), table.valid(), indices,
                                   offsets, miss_count, output_indices, output);
     auto retained = py::make_tuple(py::cast(this, py::return_value_policy::reference), storage);
-    const auto graph_generation = scatter_graph_generation_;
-    if (acl_graph) {
-      if (scatter_graph_storage_) throw py::value_error("reset the prepared Scatter graph before recapturing");
-      const auto acl_stream = tensor_methods_->Stream(selected);
-      scatter_graph_storage_ = storage;
-      scatter_graph_table_ = table.source();
-      SubmitScatterBatchGet(request, acl_stream, false, ScatterGraphAction::kCapture);
-    }
     return py::cpp_function(
-        [this, request, selected, synchronize, wait_stream, generation, acl_graph, graph_generation,
-         capture_into_graph, storage = std::move(storage), retained = std::move(retained)]() {
+        [this, request, selected, synchronize, generation, capture_into_graph,
+         storage = std::move(storage), retained = std::move(retained)]() {
           (void)retained;
           scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
           scatter_host::Timer binding_timer(scatter_host::kBinding);
           host_profile_ready_ = false;
           if (generation != generation_)
             throw py::value_error("prepared scatter request expired after Runtime shutdown/reinitialize");
-          if (acl_graph && graph_generation != scatter_graph_generation_)
-            throw py::value_error("prepared Scatter graph expired after reset");
-          // torch_npu's npu_stream getter drains its Host task queue before
-          // returning the ACL handle. Keep this producer->raw-launch ordering
-          // on EVERY call: work such as output.zero_()/input.copy_() may have
-          // been queued since preparation. Retain the Stream object, never
-          // cache away this dispatch fence; no device-wide sync is added.
+          // Read the stream handle on every submission to fence torch_npu's
+          // Host task queue before consuming in-place Tensor updates.
           scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
           const auto acl_stream = tensor_methods_->Stream(selected);
           stream_timer.Stop();
           if (capture_into_graph) {
-            if (scatter_graph_storage_ && !scatter_graph_external_)
-              throw py::value_error("reset the standalone Scatter graph before caller-managed capture");
             scatter_graph_nodes_.push_back({storage, request.access_table});
             try {
               SubmitScatterBatchGet(request, acl_stream, false, ScatterGraphAction::kAttach);
@@ -801,59 +776,24 @@ class NpuPythonRuntime final {
               scatter_graph_nodes_.pop_back();
               throw;
             }
-            if (!scatter_graph_external_) {
-              scatter_graph_storage_ = storage;
-              scatter_graph_table_ = request.access_table;
-            }
-            scatter_graph_external_ = true;
             host_profile_ready_ = false;
             return;
           }
-          if (acl_graph) {
-            scatter_host::Timer native_timer(scatter_host::kNative);
-            const auto status = native_->ReplayScatterGraph(acl_stream, synchronize);
-            native_timer.Stop();
-            ThrowIfError(status);
-            host_profile_ready_ = host_profile_enabled_;
-          } else {
-            SubmitScatterBatchGet(request, acl_stream, synchronize);
-          }
-          if (wait_stream) {
-            // Complete this request's stream in the same native invocation.
-            // Keep status drain/validation in scatter_profile()/the next call,
-            // as in enqueue + external sync. Do not add a status-copy task.
-            scatter_host::Timer sync_timer(scatter_host::kStreamSync);
-            ThrowIfAclError(aclrtSynchronizeStream(acl_stream), "synchronize prepared scatter stream");
-          }
+          SubmitScatterBatchGet(request, acl_stream, synchronize);
         }, py::name("submit_scatter_batch_get"));
   }
 
-  void ResetScatterGraph() {
-    if (!scatter_graph_storage_) return;
-    if (scatter_graph_external_)
-      throw py::value_error("destroy the caller's graph and use detach_scatter_batch_get_graph");
-    SubmitScatterBatchGet({}, nullptr, false, ScatterGraphAction::kReset);
-    ++scatter_graph_generation_;
-    scatter_graph_storage_ = py::object{};
-    scatter_graph_table_ = {};
-    host_profile_ready_ = false;
-  }
-
   void CheckScatterGraphReplay() {
-    if (!scatter_graph_external_) throw py::value_error("no caller-managed Scatter graph attached");
-    const auto storage = scatter_graph_storage_.cast<py::tuple>();
-    const auto stream = tensor_methods_->Stream(storage[0]);
+    if (scatter_graph_nodes_.empty()) throw py::value_error("no Scatter graph attached");
+    const auto stream = tensor_methods_->Stream(scatter_graph_nodes_.front().storage[0]);
     SubmitScatterBatchGet({}, stream, false, ScatterGraphAction::kCheck);
     host_profile_ready_ = false;
   }
 
   void DetachScatterGraph() {
-    if (!scatter_graph_external_) return;
+    if (scatter_graph_nodes_.empty()) return;
     SubmitScatterBatchGet({}, nullptr, false, ScatterGraphAction::kDetach);
-    scatter_graph_external_ = false;
     scatter_graph_nodes_.clear();
-    scatter_graph_storage_ = py::object{};
-    scatter_graph_table_ = {};
     host_profile_ready_ = false;
   }
 
@@ -970,12 +910,10 @@ class NpuPythonRuntime final {
 
  public:
   void Shutdown() {
-    if (scatter_graph_external_)
+    if (!scatter_graph_nodes_.empty())
       throw py::value_error("destroy and detach the caller's Scatter graph before shutdown");
     if (trusted_scatter_inputs_) ++generation_;
     ThrowIfError(native_->Shutdown());
-    scatter_graph_storage_ = py::object{};
-    scatter_graph_table_ = {};
     if (trusted_scatter_inputs_) host_profile_enabled_ = host_profile_ready_ = false;
   }
 
@@ -984,12 +922,8 @@ class NpuPythonRuntime final {
     py::tuple storage;
     AccessTableHandle table;
   };
-  // Destroy the native graph before releasing its captured buffers and stream.
-  py::object scatter_graph_storage_;
+  // Retain captured inputs until the caller destroys and detaches its graph.
   std::vector<ScatterGraphNode> scatter_graph_nodes_;
-  AccessTableHandle scatter_graph_table_{};
-  std::uint64_t scatter_graph_generation_{};
-  bool scatter_graph_external_{false};
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   std::uint64_t generation_{};
   std::optional<TensorMetadataMethods> tensor_methods_;
@@ -1067,21 +1001,15 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"), py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
-           py::arg("wait_stream") = false, py::arg("acl_graph") = false,
            py::arg("capture_into_graph") = false,
            "Return a no-argument submit callable for fixed Tensor storage and stream. "
            "In-place contents may change; do not resize/rebind storage or release the table. "
            "Retains Runtime, Tensors and stream; keep callable alive until completion. "
            "Expires on shutdown/reinitialize. "
-           "synchronize=True includes status validation. wait_stream=True waits for this stream's "
-           "DMA completion in the same call, with status validation deferred to the usual drain; "
-           "the two options are mutually exclusive. acl_graph=True captures at preparation "
-           "and each invocation replays on the selected stream. capture_into_graph=True "
-           "instead attaches one asynchronous Scatter node when called during capture. "
-           "Keep the callable and its Runtime alive until the caller destroys and detaches the graph. "
+           "synchronize=True includes status validation. capture_into_graph=True attaches "
+           "one asynchronous Scatter node when called during capture. "
+           "Keep the callable and Runtime alive until the caller destroys and detaches the graph. "
            "Set profiling before capture.")
-      .def("reset_scatter_batch_get_graph", &NpuPythonRuntime::ResetScatterGraph,
-           "Drain and destroy the prepared Scatter graph before reusing its Runtime or table.")
       .def("check_scatter_graph_replay", &NpuPythonRuntime::CheckScatterGraphReplay,
            "Synchronize and validate one caller-managed replay, including all captured Scatter nodes.")
       .def("detach_scatter_batch_get_graph", &NpuPythonRuntime::DetachScatterGraph,

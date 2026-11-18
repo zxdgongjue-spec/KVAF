@@ -51,13 +51,6 @@ __aicore__ inline uint64_t RetireDeferredMailbox(const KvafScatterBatchGetArgs& 
   return result;
 }
 
-__aicore__ inline void RecordSuffixCqWait(__gm__ kvaf::ScatterBatchGetCoreProfile* profile, uint64_t start) {
-  if (profile && start) {
-    const auto elapsed = GetSystemCycle() - start;
-    profile->suffix_cq_blocked_cycles = elapsed > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(elapsed);
-  }
-}
-
 __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_t count,
     __gm__ kvaf::ScatterBatchGetCoreProfile* profile,
     MailboxPhase phase = MailboxPhase::Full, bool defer_tail_cqe = false,
@@ -148,9 +141,7 @@ __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_
     if (last && profile && !suffix) profile->notify_cycle = GetSystemCycle();
     st_dev(static_cast<uint32_t>(pi + wrs), reinterpret_cast<__gm__ uint32_t*>(e.sq_db_va), 0);
     if (last && defer_tail_cqe) return KVAF_SEQ_OK;
-    const auto start = last && suffix && profile ? GetSystemCycle() : 0;
     const auto result = WaitMailboxCqe(a, &context->entity, state);
-    RecordSuffixCqWait(profile, start);
     if (result) return result;
   }
   MarkMailboxPhaseComplete(state);

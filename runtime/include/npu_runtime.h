@@ -85,8 +85,6 @@ class NpuRuntime final : public Runtime {
   Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles) const;
-  // Submit the existing prepared graph on its capture stream.
-  Status ReplayScatterGraph(void* stream, bool synchronize);
   Status SetScatterProfiling(bool enabled);
   Status CopyScatterProfiles(std::vector<ScatterBatchGetCoreProfile>* profiles) const;
   Status SetGatherBatchGetProfiling(bool enabled);

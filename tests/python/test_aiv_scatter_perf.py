@@ -31,14 +31,11 @@ CSV_COLUMNS = (
     "aiv_scatter_tail_us", "aiv_ready_wait_us", "call_outside_aiv_us",
     "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
     "host_stream_sync_us", "host_python_dispatch_us",
-    "jetty_cursors", "aiv_cross_chunk_shards",
+    "jetty_cursors",
     "overlap_head_cq",
-    "aiv_tail_core", "aiv_tail_to_last_enqueue_us", "aiv_tail_to_local_done_us", "aiv_tail_after_local_done_us",
     "jettys_per_core", "cpu_jettys",
-    "aiv_suffix_cq_blocked_us",
     "host_submit", "completion_scope", "graph_mailbox",
-    "host_call_us", "host_stream_resolve_us", "stream_sync_us", "device_sync_us",
-    "host_native_us", "host_runtime_validation_us", "host_operator_us",
+    "host_call_us", "stream_sync_us", "device_sync_us",
     "calls_per_sample", "graph_total_us", "graph_payload_bytes", "graph_total_gbps",
     "sequence_first", "last_call_cpu_comm_us", "last_call_cpu_write_us",
     "last_call_aiv_wall_us", "last_call_aiv_scatter_us",
@@ -424,7 +421,6 @@ def main(argv=None):
             for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_post_ns", "cpu_cq_wait_ns",
                         "aiv_input_ns", "aiv_build_notify_ns", "aiv_notify_to_done_ns", "snapshot_ns",
                         "aiv_input_wall_ns", "aiv_scatter_tail_ns", "aiv_ready_wait_ns", "aiv_launch_skew_ns", "call_outside_aiv_ns",
-                        "aiv_tail_to_last_enqueue_ns", "aiv_tail_to_local_done_ns", "aiv_tail_after_local_done_ns",
                         *HOST_TIMINGS, "host_python_dispatch_ns"):
                 if key in samples[0]:
                     values = [s[key] for s in samples]

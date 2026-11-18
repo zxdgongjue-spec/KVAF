@@ -17,8 +17,6 @@ namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 constexpr std::size_t kJettyDepth = 8192;
 static_assert(kMaxJettyCount <= cpu_urma_detail::IndexedAsyncWriteTracker::kMaxQueues);
-constexpr std::size_t kGatherProfileSamples = 512;
-constexpr std::size_t kMaxJettyTraceRecords = 16384;
 #ifdef __OPTIMIZE__
 constexpr unsigned kOptimized = 1;
 #else
@@ -70,19 +68,9 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
   // One switch selects interleaved gather and independent per-Jetty supply.
   // Planning and copying retain their alignment and small-thread-pool fallbacks.
   gather_interleave_ = interleave && interleave[0] == '1';
-  if (const auto* value = std::getenv("KVAF_CPU_PUSH_JETTY_TRACE_SAMPLES")) {
-    char* end = nullptr;
-    errno = 0;
-    const auto samples = std::strtoul(value, &end, 10);
-    if (errno || end == value || *end || samples > kGatherProfileSamples)
-      return Status::InvalidArgument("KVAF_CPU_PUSH_JETTY_TRACE_SAMPLES must be in 0..512");
-    jetty_trace_budget_ = samples;
-  }
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
-    gather_profile_samples_.reserve(kGatherProfileSamples);
-    if (jetty_trace_budget_) jetty_trace_.reserve(kMaxJettyTraceRecords);
   } catch (const std::exception& error) {
     return Status::Internal(error.what());
   }
@@ -310,42 +298,14 @@ Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor:
                              const peer::CpuGatherExecutor::ShardProgress& on_shards) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   try {
-    std::size_t threads;
-    {
-      BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_prepare_ns : nullptr);
-      gather_->EnableProfiling(profile_.enabled, profile_.trace_write_begin_ns != 0U);
-      threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
-                                      gather_waves_, suffix,
-                                      on_shards ? gather_suffix_wave_ : SIZE_MAX, gather_interleave_,
-                                      jetty_count_);
-    }
+    const auto threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
+                                               gather_waves_, suffix,
+                                               on_shards ? gather_suffix_wave_ : SIZE_MAX, gather_interleave_,
+                                               jetty_count_);
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
-    {
-      BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
-      gather_->Copy(on_wave, on_shards);
-    }
-    if (profile_.enabled) {
+    gather_->Copy(on_wave, on_shards);
+    if (profile_.enabled)
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
-      profile_.jetty_supply = gather_->UsesJettySupply();
-      const auto& copy = gather_->CopyProfile();
-      profile_.suffix_wait_ns += copy.suffix_wait_ns;
-      if (profile_.trace_write_begin_ns) {
-        if (copy.suffix_seen_ns) profile_.suffix_seen_ns = copy.suffix_seen_ns;
-        profile_.gather_ready_ns = copy.done_ns;
-      }
-      profile_.gather_join_wait_ns += copy.done_ns - copy.coordinator_done_ns;
-      const auto& workers = gather_->ThreadProfiles();
-      for (std::size_t worker = 0; worker < threads; ++worker) {
-        const auto elapsed = workers[worker].done_ns - copy.begin_ns;
-        if (elapsed > profile_.slowest_elapsed_ns) {
-          profile_.slowest_elapsed_ns = elapsed;
-          profile_.slowest_start_delay_ns = workers[worker].start_ns - copy.begin_ns;
-          profile_.slowest_ready_delay_ns = workers[worker].ready_ns - copy.begin_ns;
-          profile_.slowest_thread = workers[worker];
-          profile_.slowest_worker = static_cast<std::uint32_t>(worker);
-        }
-      }
-    }
   } catch (const std::invalid_argument& error) {
     return Status::InvalidArgument(error.what());
   } catch (const std::exception& error) {
@@ -595,32 +555,11 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, Profile* 
   }
   return submitted ? Status::OK() : Error("drained queue has insufficient credits");
 }
-void Transport::TraceJettyPost(PreparedWrite& plan, std::uint64_t id, std::uint32_t queue,
-                               std::uint64_t now) {
-  auto& q = plan.queues[queue];
-  q.trace_index = SIZE_MAX;
-  if (jetty_trace_.size() == kMaxJettyTraceRecords) {
-    ++jetty_trace_dropped_;
-    return;
-  }
-  const bool shard = prepared_interleaved_ && plan.ready_waves > gather_suffix_wave_;
-  auto ready = profile_.gather_ready_ns;
-  if (plan.ready_waves)
-    ready = gather_->FixedReadyNs(plan.ready_waves - 1U, queue, shard);
-  q.trace_index = jetty_trace_.size();
-  jetty_trace_.push_back({request().sequence, id, ready, now, 0, 0, plan.ready_waves,
-                         tracker_.Pending(queue) - 1U, q.wrs.size(), q.markers.size(),
-                         queue, plan.suffix});
-}
-
-Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile,
-                               std::uint64_t plan_id) {
+Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources,
+                               std::uint64_t* first_post_ns) {
   std::size_t largest = 0;
-  std::uint64_t first_post = 0;
-  const bool trace = profile && profile->trace_write_begin_ns && plan_id;
-  for (std::uint32_t q = 0; q < jetty_count_; ++q)
-    largest = std::max(largest, plan.queues[q].posts.size());
-  // Start all Jettys before posting the next slice of any queue.
+  for (const auto& q : plan.queues) largest = std::max(largest, q.posts.size());
+  // Start every Jetty before posting the next slice of any queue.
   for (std::size_t batch = 0; batch < largest; ++batch) {
     for (std::uint32_t q = 0; q < jetty_count_; ++q) {
       auto& queue = plan.queues[q];
@@ -630,30 +569,17 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
       // until CQ completion, while other queues/batches can be prepared.
       if (refresh_sources) RefreshPrepared(queue, post);
       urma_jfs_wr_t* bad = nullptr;
-      if (profile) {
-        const auto now = BatchGetProfileNowNs();
-        if (!first_post) first_post = now;
-        profile->RecordJettyPost(q, now);
-        if (trace && batch == 0) TraceJettyPost(plan, plan_id, q, now);
-      }
+      if (first_post_ns && !*first_post_ns) *first_post_ns = BatchGetProfileNowNs();
       if (urma_post_jetty_send_wr(queues_[q].channel.local_jetty,
                                 &queue.wrs[post.wr], &bad)) {
         queues_[q].poisoned = true;
         return Error("post prepared WRITE chain");
       }
-      if (trace && queue.trace_index != SIZE_MAX)
-        jetty_trace_[queue.trace_index].post_return_ns = BatchGetProfileNowNs();
     }
-  }
-  if (profile && first_post) {
-    if (!profile->first_post_ns) profile->first_post_ns = first_post;
-    profile->last_post_return_ns = BatchGetProfileNowNs();
-    profile->post_ns += profile->last_post_return_ns - first_post;
   }
   return Status::OK();
 }
 Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
-  const bool trace = profile && profile->trace_write_begin_ns;
   const auto deadline = wait ? std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs)
                              : std::chrono::steady_clock::time_point{};
   std::uint32_t polls = 0;
@@ -676,16 +602,11 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile, bool wait) {
                                     CqDetails(q, cr, queues_[q].channel));
           }
           std::uint64_t completed = 0;
-          std::uint64_t fence_batch = 0;
-          auto status = tracker_.Complete(q, cr.user_ctx, &completed, trace ? &fence_batch : nullptr);
+          auto status = tracker_.Complete(q, cr.user_ctx, &completed);
           if (!status.ok()) {
             queues_[q].poisoned = true;
             return Status::Error(status.code(), status.message() +
                                  CqDetails(q, cr, queues_[q].channel));
-          }
-          if (trace && fence_batch && fence_batch <= prepared_.size()) {
-            const auto index = prepared_[fence_batch - 1U]->queues[q].trace_index;
-            if (index != SIZE_MAX) jetty_trace_[index].cqe_seen_ns = BatchGetProfileNowNs();
           }
           if (completed && id && completed != id) return Error("unexpected prepared completion");
           *finished = completed != 0;
@@ -726,10 +647,6 @@ Status Transport::DrainPrepared(Profile* profile) {
 Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto* profile = profile_.enabled ? &profile_ : nullptr;
-  if (profile && jetty_trace_budget_) {
-    --jetty_trace_budget_;
-    profile_.trace_write_begin_ns = BatchGetProfileNowNs();
-  }
   const auto fail_gather = [&](const Status& failure) {
     // Earlier valid chunks may still be in flight. Drain them before
     // publishing the error on queue 0.
@@ -748,12 +665,6 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   // Gather plans already point into the registered staging buffer. Only
   // Ready markers need a refresh when the AIV consumes per-shard progress.
   const bool refresh_for_post = !gather_ || !(request().reserved & kBatchDoneOnly);
-  const auto wait_suffix = [&]() {
-    BatchGetProfileScope timer(profile && gather_ ? &profile->suffix_wait_ns : nullptr);
-    auto result = WaitSuffix(stop);
-    if (result.ok() && profile_.trace_write_begin_ns) profile_.suffix_seen_ns = BatchGetProfileNowNs();
-    return result;
-  };
   const auto submit_plan = [&](std::size_t w, bool* submitted = nullptr) {
     auto& plan = *prepared_[w];
     auto status = submitted ? TryBeginPrepared(plan, w + 1, submitted)
@@ -768,7 +679,8 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
         profile->post_calls += q.posts.size();
       }
     }
-    return PostPrepared(plan, refresh_for_post, profile, w + 1U);
+    BatchGetProfileScope post_timer(profile ? &profile->post_ns : nullptr);
+    return PostPrepared(plan, refresh_for_post, profile ? &profile->first_post_ns : nullptr);
   };
   if (!gather_waves_.empty()) {
     std::size_t next_plan = 0;
@@ -834,7 +746,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
     if (plan.suffix && !suffix_ready) {
-      status = wait_suffix();
+      status = WaitSuffix(stop);
       if (!status.ok()) return status;
       suffix_ready = true;
     }
@@ -867,9 +779,6 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
     done->reserved[5] = profile_.post_ns;
     done->reserved[6] = profile_.cq_wait_ns;
   }
-  const auto profiled_gather_rows =
-      profile_.enabled && gather_ && result == Result::kOk ? request().count : 0U;
-  const bool profiled_pipeline = profiled_gather_rows && !(request().reserved & kBatchDoneOnly);
   // One post and one tail CQE for both paths. The 8-byte strongly ordered
   // token follows the report's placement; do not combine them into an
   // unordered 64-byte WRITE (the token could otherwise become visible first).
@@ -877,15 +786,6 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   auto status = BeginPrepared(plan, UINT64_MAX);
   if (status.ok()) status = PostPrepared(plan);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
-  if (status.ok() && profiled_gather_rows) {
-    if (gather_profile_samples_.size() < kGatherProfileSamples) {
-      gather_profile_samples_.push_back(
-          {sequence, profiled_gather_rows, profiled_pipeline, !gather_waves_.empty(),
-           prepared_interleaved_, profile_});
-    } else {
-      ++gather_profile_dropped_;
-    }
-  }
   return status;
 }
 
@@ -907,64 +807,8 @@ void Transport::PrintProfile() const {
       unsigned(p.plan_reused), kOptimized);
 }
 
-void Transport::FlushGatherProfiles() {
-  for (const auto& sample : gather_profile_samples_) {
-    const auto& p = sample.profile;
-    const auto& slow = p.slowest_thread;
-    const auto post_window_ns = p.first_post_ns ? p.last_post_return_ns - p.first_post_ns : 0U;
-    const auto post_tail_ns = p.last_post_return_ns && p.last_cqe_ns >= p.last_post_return_ns
-        ? p.last_cqe_ns - p.last_post_return_ns : 0U;
-    std::fprintf(stderr,
-        "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u gather_pipeline=%u interleaved=%u waves=%u jetty_supply=%u"
-        " max_jetty_post_gap_ns=%" PRIu64
-        " data_wrs=%u ready_wrs=%u post_calls=%u tail_cqes=%u"
-        " write_ns=%" PRIu64 " post_window_ns=%" PRIu64 " post_tail_ns=%" PRIu64
-        " post_ns=%" PRIu64 " cq_wait_ns=%" PRIu64
-        " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
-        " suffix_wait_ns=%" PRIu64 " trace_write_begin_ns=%" PRIu64 " suffix_seen_ns=%" PRIu64
-        " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
-        " slow_bytes=%" PRIu64 " slow_ready_delay_ns=%" PRIu64
-        " slow_start_delay_ns=%" PRIu64 " slow_copy_ns=%" PRIu64
-        " slow_barrier_ns=%" PRIu64 " slow_thread_cpu_ns=%" PRIu64
-        " slow_cpu_time_valid=%u slow_wait_path=%u\n",
-        session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
-        unsigned(sample.pipeline), unsigned(sample.gather_pipeline), unsigned(sample.interleaved),
-        p.waves, unsigned(p.jetty_supply), p.max_jetty_post_gap_ns,
-        p.data_wrs, p.ready_wrs, p.post_calls, p.tail_cqes,
-        p.write_ns, post_window_ns, post_tail_ns, p.post_ns, p.cq_wait_ns,
-        p.cpu_threads, p.gather_prepare_ns, p.gather_copy_ns,
-        p.suffix_wait_ns, p.trace_write_begin_ns, p.suffix_seen_ns,
-        p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
-        p.slowest_ready_delay_ns, p.slowest_start_delay_ns, slow.copy_done_ns - slow.start_ns,
-        slow.done_ns - slow.copy_done_ns,
-        slow.thread_cpu_ns, unsigned(slow.cpu_time_valid), unsigned(slow.wait_path));
-  }
-  if (gather_profile_dropped_)
-    std::fprintf(stderr, "CPU_PUSH_GATHER_PROFILE_DROPPED session=%" PRIu64 " samples=%zu\n",
-                 session_, gather_profile_dropped_);
-  gather_profile_samples_.clear();
-  gather_profile_dropped_ = 0;
-  for (const auto& trace : jetty_trace_) {
-    std::fprintf(stderr,
-        "CPU_PUSH_JETTY_TRACE session=%" PRIu64 " sequence=%" PRIu64 " jetty=%u plan=%" PRIu64
-        " wave=%zu suffix=%u wrs=%zu ready_wrs=%zu pending_fences_before_post=%zu"
-        " gather_ready_ns=%" PRIu64 " post_begin_ns=%" PRIu64 " post_return_ns=%" PRIu64
-        " cqe_seen_ns=%" PRIu64 "\n",
-        session_, trace.sequence, trace.jetty, trace.plan, trace.wave, unsigned(trace.suffix),
-        trace.wrs, trace.ready_wrs, trace.pending_fences,
-        trace.ready_ns, trace.post_begin_ns, trace.post_return_ns, trace.cqe_seen_ns);
-  }
-  if (jetty_trace_dropped_)
-    std::fprintf(stderr, "CPU_PUSH_JETTY_TRACE_DROPPED session=%" PRIu64 " records=%zu\n",
-                 session_, jetty_trace_dropped_);
-  jetty_trace_.clear();
-  jetty_trace_dropped_ = 0;
-}
-
 Status Transport::Shutdown() {
   gather_.reset();
-  FlushGatherProfiles();
   // Deleting the initiator queues stops all DMA, including partial-post failures.
   // Do not let UrmaChannel's best-effort destructor discard a failed deletion.
   for (auto& q : queues_) {

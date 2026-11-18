@@ -975,7 +975,6 @@ int main() {
     const kvaf::peer::CpuGatherExecutor::FixedSuffix suffix{
         &suffix_sequence, 1, nullptr, std::chrono::seconds(1), 2};
     std::fill(repeated + 8, repeated + 13, Address(source + 1));
-    executor.EnableProfiling(true);
     assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), waves,
                                  &suffix) == 4);
     executor.Copy([&](std::size_t completed) {
@@ -991,17 +990,6 @@ int main() {
       return true;
     });
     assert((ready == std::vector<std::size_t>{1, 2, 3}));
-    const auto& copy = executor.CopyProfile();
-    assert(copy.begin_ns <= copy.coordinator_done_ns && copy.coordinator_done_ns <= copy.done_ns);
-    uint64_t copied_bytes = 0;
-    for (uint32_t worker = 0; worker < 4; ++worker) {
-      const auto& profile = executor.ThreadProfiles()[worker];
-      assert(copy.begin_ns <= profile.ready_ns && profile.ready_ns <= profile.start_ns &&
-             profile.start_ns <= profile.copy_done_ns &&
-             profile.copy_done_ns <= profile.done_ns && profile.done_ns <= copy.done_ns);
-      copied_bytes += profile.bytes;
-    }
-    assert(copied_bytes == 13 * sizeof(source));
     assert(std::all_of(staging + 13 * sizeof(source), staging + sizeof(staging),
                        [](uint8_t byte) { return byte == 0xad; }));
 
@@ -1030,7 +1018,6 @@ int main() {
         GatherWave{Range{0, 4}, Range{4, 8}},
         GatherWave{Range{8, 12}, Range{}, Range{12, 13}}};
     kvaf::peer::CpuGatherExecutor jetty_executor(source, Address(source), 9, 1);
-    jetty_executor.EnableProfiling(true);
     std::memset(staging, 0xad, sizeof(staging));
     assert(jetty_executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
                                       jetty_waves, nullptr, 0, true) == 9);
@@ -1041,7 +1028,6 @@ int main() {
         assert(jetty_executor.ShardReady(w, q) == (jetty_waves[w][q].begin < jetty_waves[w][q].end));
     for (uint32_t i = 0; i < 13; ++i)
       assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
-    assert(jetty_executor.ThreadProfiles()[3].bytes == 0);
     assert(staging[13 * sizeof(source)] == 0xad);
 
     kvaf::peer::CpuGatherExecutor small_pool(source, Address(source), 3, 1);

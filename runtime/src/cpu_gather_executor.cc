@@ -178,7 +178,7 @@ void CpuGatherExecutor::DispatchJob() {
 
 void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_shards) {
   completed_.store(0U, std::memory_order_relaxed);
-  if (profiling_enabled_) {
+  if (!thread_profiles_.empty()) {
     copy_profile_.begin_ns = NowNs();
     thread_profiles_[0].ready_ns = copy_profile_.begin_ns;
   }
@@ -188,7 +188,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
   if (!addresses_) {
     const auto copied = ProcessSource(0U);
     FinishWorker(0U, copied);
-    if (profiling_enabled_) copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
+    if (!thread_profiles_.empty()) copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
     while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
       PublishReady();
       GatherSpinPause();
@@ -196,7 +196,7 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
     if (copy_failed_.load(std::memory_order_relaxed))
       throw std::runtime_error("gather descriptor suffix wait failed");
     PublishReady();
-    if (profiling_enabled_) copy_profile_.done_ns = NowNs();
+    if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
     return;
   }
   std::uint64_t copied = 0U;
@@ -209,7 +209,6 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
     try {
       while (next_ready < whole_waves &&
              !__atomic_load_n(&fixed_progress_[next_ready].remaining, __ATOMIC_ACQUIRE) &&
-             (!trace_ready_ || FixedReadyNs(next_ready, 0U, false)) &&
              fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
         if (on_wave && !on_wave(next_ready + 1U)) {
           publishing = false;
@@ -236,12 +235,8 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
     for (std::size_t wave = 0; wave < fixed_progress_.size(); ++wave) {
       if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
       if (fixed_suffix_.ready_sequence && wave == fixed_suffix_.first_wave) {
-        const auto begin = profiling_enabled_ &&
-            __atomic_load_n(fixed_suffix_.ready_sequence, __ATOMIC_ACQUIRE) != fixed_suffix_.sequence
-            ? NowNs() : 0U;
         // Keep posting completed head waves if suffix has yet to arrive.
         const bool ready = WaitFixedSuffix(publish_ready);
-        if (begin) copy_profile_.suffix_wait_ns = NowNs() - begin;
         if (!ready) break;
       }
       copied += CopyFixedWave(0U, wave, publish_ready);
@@ -249,13 +244,13 @@ void CpuGatherExecutor::Copy(const WaveReady& on_wave, const ShardProgress& on_s
     }
   }
   FinishWorker(0U, copied);
-  if (profiling_enabled_) copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
+  if (!thread_profiles_.empty()) copy_profile_.coordinator_done_ns = thread_profiles_[0].done_ns;
   while (completed_.load(std::memory_order_acquire) != active_threads_ - 1U) {
     publish_ready();
     GatherSpinPause();
   }
   publish_ready();
-  if (profiling_enabled_) copy_profile_.done_ns = NowNs();
+  if (!thread_profiles_.empty()) copy_profile_.done_ns = NowNs();
   if (publish_error) std::rethrow_exception(publish_error);
   if (addresses_) {
     const auto error = fixed_error_.load(std::memory_order_relaxed);
@@ -354,19 +349,11 @@ std::uint64_t CpuGatherExecutor::CopyFixedRange(std::uint64_t begin, std::uint64
   return offset - begin;
 }
 
-void CpuGatherExecutor::RecordSuffixSeen() {
-  if (!trace_ready_ || __atomic_load_n(&copy_profile_.suffix_seen_ns, __ATOMIC_RELAXED)) return;
-  std::uint64_t expected = 0;
-  __atomic_compare_exchange_n(&copy_profile_.suffix_seen_ns, &expected, NowNs(), false,
-                              __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-}
-
 template <typename OnWait>
 bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
   const auto& suffix = fixed_suffix_;
   auto observed = __atomic_load_n(suffix.ready_sequence, __ATOMIC_ACQUIRE);
   if (observed == suffix.sequence) {
-    RecordSuffixSeen();
     return true;
   }
   const auto deadline = std::chrono::steady_clock::now() + suffix.timeout;
@@ -385,7 +372,6 @@ bool CpuGatherExecutor::WaitFixedSuffix(OnWait on_wait) {
   } while (observed != suffix.sequence);
   if (observed == suffix.sequence &&
       fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone) {
-    RecordSuffixSeen();
     return true;
   }
   SetFixedError(FixedError::kSuffix);
@@ -397,7 +383,6 @@ void CpuGatherExecutor::PrepareShardProgress() {
   fixed_jetty_supply_ &= active_threads_ >= queues;
   for (auto& shard : fixed_shards_) {
     shard.remaining = 0;
-    shard.ready_ns = 0;
   }
   for (std::size_t index = fixed_first_shard_wave_; index < fixed_progress_.size(); ++index) {
     const auto& wave = fixed_progress_[index];
@@ -445,21 +430,11 @@ bool CpuGatherExecutor::ShardReady(std::size_t wave, std::size_t queue) const {
   const auto rows = progress.rows[queue];
   return rows.begin < rows.end &&
          !__atomic_load_n(&fixed_shards_[progress.first_shard + queue].remaining, __ATOMIC_ACQUIRE) &&
-         (!trace_ready_ || FixedReadyNs(wave, queue, true)) &&
          fixed_error_.load(std::memory_order_relaxed) == FixedError::kNone;
 }
 
-std::uint64_t CpuGatherExecutor::FixedReadyNs(std::size_t wave, std::size_t queue, bool shard) const {
-  const auto& progress = fixed_progress_[wave];
-  const auto& ns = shard ? fixed_shards_[progress.first_shard + queue].ready_ns : progress.ready_ns;
-  return __atomic_load_n(&ns, __ATOMIC_ACQUIRE);
-}
-
-void CpuGatherExecutor::FinishFixedRange(std::size_t& remaining, std::uint64_t& ready_ns) {
-  // The final decrement acquires the preceding writers' stores. A traced
-  // consumer also waits for that writer's timestamp before recording its post.
-  if (__atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL) == 1U && trace_ready_)
-    __atomic_store_n(&ready_ns, NowNs(), __ATOMIC_RELEASE);
+void CpuGatherExecutor::FinishFixedRange(std::size_t& remaining) {
+  __atomic_fetch_sub(&remaining, 1U, __ATOMIC_ACQ_REL);
 }
 
 template <typename OnProgress>
@@ -483,7 +458,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
     const auto copied = CopyFixedRange(base + first, base + last);
     if (copied) GatherBarrier();
     auto& shard = fixed_shards_[wave.first_shard + q];
-    FinishFixedRange(shard.remaining, shard.ready_ns);
+    FinishFixedRange(shard.remaining);
     // The coordinator calls publish_ready after returning from this slice.
     return copied;
   }
@@ -508,7 +483,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
       if (shard_mode) {
         if (bytes_copied) GatherBarrier();
         auto& shard = fixed_shards_[wave.first_shard + queue];
-        FinishFixedRange(shard.remaining, shard.ready_ns);
+        FinishFixedRange(shard.remaining);
         on_progress();
         if (fixed_error_.load(std::memory_order_relaxed) != FixedError::kNone) break;
       }
@@ -518,7 +493,7 @@ std::uint64_t CpuGatherExecutor::CopyFixedWave(std::size_t worker, std::size_t i
   }
   if (!shard_mode) {
     if (copied) GatherBarrier();
-    FinishFixedRange(wave.remaining, wave.ready_ns);
+    FinishFixedRange(wave.remaining);
   }
   return copied;
 }
@@ -554,7 +529,7 @@ std::uint64_t CpuGatherExecutor::ProcessSource(std::size_t worker) {
         progress.complete.store(true, std::memory_order_release);
         PublishCooperativeReady();
       }
-      if (profiling_enabled_) ++thread_profiles_[worker].progress_publications;
+      if (!thread_profiles_.empty()) ++thread_profiles_[worker].progress_publications;
     }
     return copied;
   }
@@ -624,7 +599,7 @@ void CpuGatherExecutor::PublishCooperativeReady() {
 }
 
 void CpuGatherExecutor::BeginWorker(std::size_t worker) {
-  if (!profiling_enabled_) return;
+  if (thread_profiles_.empty()) return;
   auto& profile = thread_profiles_[worker];
 #if defined(__linux__)
   profile.tid = static_cast<std::uint64_t>(syscall(SYS_gettid));
@@ -635,13 +610,13 @@ void CpuGatherExecutor::BeginWorker(std::size_t worker) {
 }
 
 void CpuGatherExecutor::FinishWorker(std::size_t worker, std::uint64_t bytes) {
-  if (profiling_enabled_) {
+  if (!thread_profiles_.empty()) {
     thread_profiles_[worker].bytes = bytes;
     thread_profiles_[worker].copy_done_ns = NowNs();
   }
   // Chunk writers have already completed their stores before advertising progress.
   if (fixed_progress_.empty() && pipeline_ready_ == nullptr) GatherBarrier();
-  if (!profiling_enabled_) return;
+  if (thread_profiles_.empty()) return;
   auto& profile = thread_profiles_[worker];
   profile.done_ns = NowNs();
   const auto cpu_end = ThreadCpuNs();
@@ -681,7 +656,7 @@ void CpuGatherExecutor::RunHelper(std::size_t worker) {
     previous = dispatch;
     was_active = worker < (dispatch & kDispatchThreadMask);
     if (!was_active) continue;
-    if (profiling_enabled_) {
+    if (!thread_profiles_.empty()) {
       thread_profiles_[worker].ready_ns = NowNs();
       thread_profiles_[worker].wait_path = wait_path;
     }

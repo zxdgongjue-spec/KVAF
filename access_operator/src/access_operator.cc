@@ -556,12 +556,6 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
-Status DefaultAccessOperator::ReplayScatterGraph(void* stream, bool synchronize) {
-  if (!impl_->sequential)
-    return Status::NotImplemented("scatter graph replay requires cpu_push_scatter");
-  return impl_->sequential->ReplayScatterGraph(stream, synchronize);
-}
-
 Status DefaultAccessOperator::SetScatterProfiling(bool enabled) {
   if (!impl_->sequential) return Status::NotImplemented("scatter profiling requires cpu_push_scatter");
   return impl_->sequential->SetScatterProfiling(enabled);

@@ -158,10 +158,8 @@ void CheckScatterGraphControlDispatch() {
   BatchGetExecutionOptions execution;
   execution.trusted_npu_request = true;
   execution.stream = reinterpret_cast<void*>(1);
-  for (const auto action : {ScatterGraphAction::kCapture, ScatterGraphAction::kAttach}) {
-    execution.scatter_graph = action;
-    CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
-  }
+  execution.scatter_graph = ScatterGraphAction::kAttach;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
   // Replay checks and graph cleanup carry no input tensors. The owner checks
   // their graph/stream identity; only capture and payload launches need inputs.
   execution.scatter_graph = ScatterGraphAction::kCheck;
@@ -170,17 +168,15 @@ void CheckScatterGraphControlDispatch() {
   execution.stream = reinterpret_cast<void*>(1);
   CHECK(runtime.BatchGet(request, execution).ok());
   execution.stream = nullptr;
-  for (const auto action : {ScatterGraphAction::kReset, ScatterGraphAction::kDetach}) {
-    execution.scatter_graph = action;
-    CHECK(runtime.BatchGet(request, execution).ok());
-    CHECK(op.last_execution.scatter_graph == action);
-  }
-  CHECK(op.get_calls == 3);
+  execution.scatter_graph = ScatterGraphAction::kDetach;
+  CHECK(runtime.BatchGet(request, execution).ok());
+  CHECK(op.last_execution.scatter_graph == ScatterGraphAction::kDetach);
+  CHECK(op.get_calls == 2);
   op.fail_shutdown = true;
   CHECK(!runtime.Shutdown().ok() && runtime.needs_cleanup());
   execution.scatter_graph = ScatterGraphAction::kDetach;
   CHECK(runtime.BatchGet(request, execution).ok());
-  execution.scatter_graph = ScatterGraphAction::kReset;
+  execution.scatter_graph = ScatterGraphAction::kCheck;
   CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kNotInitialized);
   op.fail_shutdown = false;
   CHECK(runtime.Shutdown().ok());

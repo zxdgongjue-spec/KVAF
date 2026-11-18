@@ -51,8 +51,7 @@ class IndexedAsyncWriteTracker {
     *submitted = true;
     return Status::OK();
   }
-  Status Complete(std::size_t queue, std::uint64_t context, std::uint64_t* completed,
-                  std::uint64_t* fence_batch = nullptr) {
+  Status Complete(std::size_t queue, std::uint64_t context, std::uint64_t* completed) {
     if (!completed || queue >= queues_ || queues_ > kMaxQueues)
       return Status::InvalidArgument("invalid indexed CQ queue");
     *completed = 0;
@@ -63,7 +62,6 @@ class IndexedAsyncWriteTracker {
         !(active_ & (UINT64_C(1) << slot)) || !(batch.mask & bit) ||
         (context & ~kQueueMask) != batch.handle->token)
       return Status::Internal("unexpected/stale indexed async completion context");
-    if (fence_batch) *fence_batch = batch.id;
     used_[queue] -= batch.wrs[queue]; batch.mask &= ~bit;
     --pending_[queue];
     if (!batch.mask) {
@@ -108,7 +106,7 @@ Status SweepAsyncCqs(std::size_t queues, std::size_t first, std::size_t batch_si
   if (!queues || !batch_size || !capacity || !count)
     return Status::InvalidArgument("invalid async CQ sweep");
   *count = 0;
-  for (std::size_t i = 0, q = first < queues ? first : first % queues; i < queues && *count < capacity;
+  for (std::size_t i = 0, q = first % queues; i < queues && *count < capacity;
        ++i, q = q + 1 == queues ? 0 : q + 1) {
     const auto limit = std::min({batch_size, capacity - *count, pending(q)});
     if (!limit) continue;

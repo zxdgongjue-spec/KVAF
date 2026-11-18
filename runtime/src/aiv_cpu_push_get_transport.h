@@ -39,39 +39,10 @@ class Transport {
   struct Profile {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
-    std::uint64_t first_post_ns{}, last_post_return_ns{}, last_cqe_ns{};
-    std::array<std::uint64_t, kMaxJettyCount> jetty_last_post_ns{};
-    std::uint64_t max_jetty_post_gap_ns{};
-    void RecordJettyPost(std::uint32_t queue, std::uint64_t now) {
-      auto& previous = jetty_last_post_ns[queue];
-      if (previous) max_jetty_post_gap_ns = std::max(max_jetty_post_gap_ns, now - previous);
-      previous = now;
-    }
-    std::uint64_t gather_prepare_ns{}, gather_copy_ns{}, suffix_wait_ns{};
-    std::uint64_t trace_write_begin_ns{}, suffix_seen_ns{}, gather_ready_ns{};
-    std::uint64_t gather_join_wait_ns{}, slowest_elapsed_ns{}, slowest_start_delay_ns{};
-    std::uint64_t slowest_ready_delay_ns{};
-    peer::CpuGatherThreadProfile slowest_thread{};
-    std::uint32_t slowest_worker{};
+    std::uint64_t first_post_ns{}, last_cqe_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
-    bool plan_reused{}, jetty_supply{};
+    bool plan_reused{};
   } profile_;
-  struct GatherProfileSample {
-    std::uint64_t sequence;
-    std::uint32_t rows;
-    bool pipeline, gather_pipeline, interleaved;
-    Profile profile;
-  };
-  std::vector<GatherProfileSample> gather_profile_samples_;
-  std::size_t gather_profile_dropped_{};
-  struct JettyTrace {
-    std::uint64_t sequence, plan, ready_ns, post_begin_ns, post_return_ns{}, cqe_seen_ns{};
-    std::size_t wave, pending_fences, wrs, ready_wrs;
-    std::uint32_t jetty;
-    bool suffix;
-  };
-  std::vector<JettyTrace> jetty_trace_;
-  std::size_t jetty_trace_budget_{}, jetty_trace_dropped_{};
   struct Queue {
     cpu_runtime_detail::UrmaChannel channel;
     bool poisoned{};
@@ -92,7 +63,6 @@ class Transport {
     std::vector<Post> posts;
     // Whole-batch, unsplit tokens have one SGE per contiguous descriptor row.
     std::uint32_t first_row{UINT32_MAX};
-    std::size_t trace_index{SIZE_MAX};
   };
   struct PreparedWrite {
     std::array<PreparedQueue, kMaxJettyCount> queues;
@@ -107,8 +77,6 @@ class Transport {
   Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave = {},
                     const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr,
                     const peer::CpuGatherExecutor::ShardProgress& on_shards = {});
-  void FlushGatherProfiles();
-  void TraceJettyPost(PreparedWrite&, std::uint64_t id, std::uint32_t queue, std::uint64_t now);
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
@@ -117,8 +85,8 @@ class Transport {
   Status TryBeginPrepared(PreparedWrite&, std::uint64_t id, bool* submitted);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
                        bool drain_for_credits = false);
-  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr,
-                      std::uint64_t plan_id = 0);
+  Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
+                      std::uint64_t* first_post_ns = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr, bool wait = true);
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);

@@ -186,28 +186,8 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
         aiv_scatter_tail_ns=(last_finish - cpu["done_cycle"]) * ns_per_cycle,
         aiv_launch_skew_ns=(max(r["start_cycle"] for r in records) - first_start) * ns_per_cycle,
     )
-    tail_core = max(records, key=lambda r: r["finish_cycle"])
-    enqueue = tail_core.get("scatter_enqueue_finish_cycle")
-    if enqueue is not None and (enqueue or not tail_core["requests"]):
-        if enqueue and not tail_core["scatter_start_cycle"] <= enqueue <= tail_core["scatter_finish_cycle"]:
-            raise ValueError("invalid scatter enqueue finish")
-        done = cpu["done_cycle"]
-        # Partition the exposed tail on the last-finishing core. Its Done
-        # observation can occur while the core is still consuming Ready shards.
-        after_enqueue = max(done, enqueue)
-        after_done = max(after_enqueue, tail_core["done_cycle"])
-        result.update(
-            aiv_tail_core=tail_core["core"],
-            aiv_tail_to_last_enqueue_ns=(after_enqueue - done) * ns_per_cycle,
-            aiv_tail_to_local_done_ns=(after_done - after_enqueue) * ns_per_cycle,
-            aiv_tail_after_local_done_ns=(last_finish - after_done) * ns_per_cycle,
-        )
     if all("ready_wait_cycles" in r for r in records):
         result["aiv_ready_wait_ns"] = max(r["ready_wait_cycles"] for r in records) * ns_per_cycle
-    if "suffix_cq_blocked_cycles" in cpu:
-        result["aiv_suffix_cq_blocked_ns"] = cpu["suffix_cq_blocked_cycles"] * ns_per_cycle
-    if all("cross_chunk_shards" in r for r in records):
-        result["aiv_cross_chunk_shards"] = sum(r["cross_chunk_shards"] for r in records)
     host = cpu.get("host_profile")
     if host is not None:
         if any(key not in host or not math.isfinite(host[key]) or host[key] < 0

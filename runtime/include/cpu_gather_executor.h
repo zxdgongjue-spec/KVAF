@@ -58,7 +58,6 @@ struct alignas(64) CpuGatherThreadProfile {
 
 struct CpuGatherCopyProfile {
   std::uint64_t publish_ns{}, begin_ns{}, coordinator_done_ns{}, done_ns{};
-  std::uint64_t suffix_wait_ns{}, suffix_seen_ns{};
 };
 
 class CpuGatherExecutor {
@@ -138,15 +137,12 @@ class CpuGatherExecutor {
   using ShardProgress = std::function<bool()>;
   void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {});
   bool ShardReady(std::size_t wave, std::size_t queue) const;
-  std::uint64_t FixedReadyNs(std::size_t wave, std::size_t queue, bool shard) const;
   bool UsesJettySupply() const { return fixed_jetty_supply_; }
-  void EnableProfiling(bool enabled = true, bool trace_ready = false) {
-    if (enabled) thread_profiles_.resize(max_threads_);
-    profiling_enabled_ = enabled;
-    trace_ready_ = enabled && trace_ready;
-  }
+  // Enable before the first PrepareDirect. Disabled execution reads no clocks.
+  void EnableProfiling() { thread_profiles_.resize(max_threads_); }
   std::size_t MaxThreads() const { return max_threads_; }
   const CpuGatherCopyProfile& CopyProfile() const { return copy_profile_; }
+  // Read active entries only, after Copy has joined all helpers.
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
@@ -166,7 +162,6 @@ class CpuGatherExecutor {
     active_threads_ = threads;
     for (auto& wave : fixed_progress_) {
       wave.remaining = threads;
-      wave.ready_ns = 0;
     }
     PrepareShardProgress();
     if (cooperative_) {
@@ -176,6 +171,8 @@ class CpuGatherExecutor {
         cooperative_progress_[chunk].complete.store(false, std::memory_order_relaxed);
       }
     } else if (pipeline_ready_ != nullptr) {
+      // Balanced static rounds, capped at 256 KiB per copy task. A 2.5625-MiB
+      // lane with 16 threads gets 16 x 164-KiB tasks, independent of ready chunk.
       constexpr std::uint64_t kMaxTaskBytes = 256U * 1024U;
       const auto round_bytes = threads * kMaxTaskBytes;
       const auto rounds = (total_bytes_ + round_bytes - 1U) / round_bytes;
@@ -185,7 +182,7 @@ class CpuGatherExecutor {
       ready_tasks_ = 0U;
       published_bytes_ = 0U;
     }
-    if (profiling_enabled_) {
+    if (!thread_profiles_.empty()) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
       copy_profile_ = {};
     }
@@ -193,7 +190,7 @@ class CpuGatherExecutor {
     // validation. Scatter keeps its existing dispatch-at-Copy timing.
     if (!addresses_) {
       phase_.store(0U, std::memory_order_release);
-      if (profiling_enabled_) copy_profile_.publish_ns = NowNs();
+      if (!thread_profiles_.empty()) copy_profile_.publish_ns = NowNs();
       DispatchJob();
     }
     return threads;
@@ -228,8 +225,7 @@ class CpuGatherExecutor {
   bool WaitSuffix() const;
   std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
   void PrepareShardProgress();
-  void FinishFixedRange(std::size_t& remaining, std::uint64_t& ready_ns);
-  void RecordSuffixSeen();
+  void FinishFixedRange(std::size_t& remaining);
   template <typename OnProgress>
   std::uint64_t CopyFixedWave(std::size_t worker, std::size_t wave, OnProgress on_progress);
   template <typename OnWait>
@@ -277,12 +273,10 @@ class CpuGatherExecutor {
     std::size_t first_shard{};
     std::uint64_t aligned_bytes{};
     cpu_push::GatherWave rows{};
-    std::uint64_t ready_ns{};
   };
   std::vector<FixedWaveProgress> fixed_progress_;
   struct alignas(64) FixedShardProgress {
     std::size_t remaining{};
-    std::uint64_t ready_ns{};
   };
   std::size_t fixed_first_shard_wave_{SIZE_MAX};
   bool fixed_jetty_supply_{};
@@ -310,7 +304,6 @@ class CpuGatherExecutor {
   std::uint64_t task_bytes_{0U};
   std::size_t ready_tasks_{0U};
   std::uint64_t published_bytes_{0U};
-  bool profiling_enabled_{}, trace_ready_{};
   std::vector<CpuGatherThreadProfile> thread_profiles_;
   CpuGatherCopyProfile copy_profile_{};
   alignas(64) std::atomic<std::uint32_t> phase_{0U};

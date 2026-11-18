@@ -10,9 +10,6 @@ class SequentialBatchGet {
   virtual ~SequentialBatchGet() = default;
   virtual Status Initialize(const RemoteRegionDesc& region) = 0;
   virtual Status Execute(const BatchGetExecRequest& exec) = 0;
-  virtual Status ReplayScatterGraph(void*, bool) {
-    return Status::NotImplemented("scatter graph replay requires cpu_push_scatter");
-  }
   virtual Status Drain() = 0;
   virtual Status Shutdown() = 0;
   virtual Status SetScatterProfiling(bool) {
