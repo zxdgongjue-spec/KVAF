@@ -39,19 +39,13 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
       capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
     return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
   const auto size = view.kernel.cores * sizeof(CoreStatus);
-  const bool graph_get = args.operation == Operation::kGet &&
-      capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
-  // Only synchronous Get calls initialize the report. Async
-  // eager calls and graph replay rely on the kernel to overwrite it.
-  const bool reset_status = synchronize ||
-      args.operation == Operation::kPut;
-  if (reset_status && !graph_get) {
+  if (args.operation == Operation::kPut) {
     // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
     // not look like a successful zero-row kernel.
     auto status = Acl("aclrtMemsetAsync(status)", aclrtMemsetAsync(state.statuses, size, 0xFF, size, stream));
     if (!status.ok()) return status;
   }
-  // Keep completion tracking even when an async Get has no status reset.
+  // Get completion tracks device execution without reading a result report.
   if (!call.graph_active)
     call.pending[stream] = ExecutionSlot::Pending::kStream;
   aclrtLaunchKernelAttr attrs[4]{};
@@ -94,10 +88,10 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
     call.pending[stream] = ExecutionSlot::Pending::kEvent;
     return Status::OK();
   }
-  // Keep the kernel, status D2H and completion wait on the caller's stream,
-  // exactly as the existing synchronous BatchPut path does.
-  status = Acl("aclrtMemcpyAsync(status)", aclrtMemcpyAsync(state.host_statuses, size,
-      state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
+  // Put needs its report to resolve the transaction; Get only waits for work.
+  if (args.operation == Operation::kPut)
+    status = Acl("aclrtMemcpyAsync(status)", aclrtMemcpyAsync(state.host_statuses, size,
+        state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST, stream));
   if (status.ok()) status = Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(stream));
   if (!status.ok()) {
     std::fprintf(stderr, "[KVAF_UBMEM] FAILED_LAUNCH op=%u rows=%u local_base=0x%llx local_bytes=%llu "
@@ -112,6 +106,10 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
     return status;
   }
   call.pending[stream] = ExecutionSlot::Pending::kNone;
+  if (args.operation == Operation::kGet) {
+    GetHostTimingRecord(host_timing, &GetProviderTiming::completion_ns, completion_started);
+    return Status::OK();
+  }
   const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
   for (std::size_t i = 0; i < view.kernel.cores; ++i) {
     if (reports[i].result == UINT64_MAX) {
@@ -123,8 +121,7 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
           static_cast<unsigned long long>(reports[i].failed_request));
       return Status::InvalidArgument("UBmem kernel rejected a request; see KERNEL_ERROR");
     }
-    if (args.operation == Operation::kPut &&
-        reports[i].completed != static_cast<std::uint64_t>(args.capacity) * (i + 1) / args.blocks -
+    if (reports[i].completed != static_cast<std::uint64_t>(args.capacity) * (i + 1) / args.blocks -
             static_cast<std::uint64_t>(args.capacity) * i / args.blocks) {
       return Status::Internal("UBmem Put completion report does not cover the submitted rows");
     }
@@ -209,13 +206,6 @@ Status AccessOperator::DrainGet() {
         ? Acl("aclrtSynchronizeEvent", aclrtSynchronizeEvent(state.event))
         : Acl("aclrtSynchronizeStream", aclrtSynchronizeStream(entry.first));
     if (!status.ok()) return status;
-    const auto size = resources_->options.cores * sizeof(CoreStatus);
-    status = Acl("aclrtMemcpy(completion)", aclrtMemcpy(state.host_statuses, size,
-        state.statuses, size, ACL_MEMCPY_DEVICE_TO_HOST));
-    if (!status.ok()) return status;
-    const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
-    for (std::size_t i = 0; i < resources_->options.cores; ++i)
-      if (reports[i].result != 0) return Status::Internal("UBMEM Get kernel reported an error");
     resources_->invocation->pending[entry.first] = ExecutionSlot::Pending::kNone;
   }
   return Status::OK();

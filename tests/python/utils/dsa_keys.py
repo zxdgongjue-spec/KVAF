@@ -1,4 +1,4 @@
-"""DSA directory keys shared by the BatchGet test setup paths."""
+"""DSA directory keys shared by benchmark setup paths."""
 
 from __future__ import annotations
 

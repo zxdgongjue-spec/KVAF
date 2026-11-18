@@ -122,35 +122,6 @@ Status BuildBatchGetKernelArgs(const BatchGetExecRequest& exec,
   return Status::OK();
 }
 
-void LogBatchGetDeviceStatus(const AivGetWorkspace& execution,
-                             std::uint32_t npu_core_count) {
-  std::vector<KvafBatchGetCoreStatus> statuses(npu_core_count);
-  const aclError copy_result = aclrtMemcpy(
-      statuses.data(), statuses.size() * sizeof(statuses.front()),
-      execution.status, execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-  if (copy_result != ACL_SUCCESS) {
-    std::fprintf(stderr,
-                 "[KVAF_AIV] BATCH_GET_STATUS_LOG_ERROR aclrtMemcpy=%d\n",
-                 static_cast<int>(copy_result));
-    return;
-  }
-  for (std::uint32_t core = 0; core < npu_core_count; ++core) {
-    const KvafBatchGetCoreStatus& status = statuses[core];
-    if (status.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || status.result != 0U) {
-      // Keep device execution faults in the operator diagnostic channel rather
-      // than turning the kernel status buffer into a Python BatchGet result.
-      // Deployments can route this marker through their CANN/plog collection.
-      std::fprintf(stderr,
-                   "[KVAF_AIV] BATCH_GET_DEVICE_ERROR core=%u magic=0x%llx "
-                   "result=%llu processed=%llu failed_request=%llu\n",
-                   core, static_cast<unsigned long long>(status.magic),
-                   static_cast<unsigned long long>(status.result),
-                   static_cast<unsigned long long>(status.processed_request_count),
-                   static_cast<unsigned long long>(status.failed_request_index));
-    }
-  }
-}
-
 }  // namespace
 
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
@@ -435,7 +406,6 @@ Status UrmaAivGetOperator::Drain(UrmaAivGetView view, AivInvocation& invocation)
   if (!invocation.pending_get) return Status::OK();
   if (aclrtSynchronizeStream(invocation.pending_get) != ACL_SUCCESS)
     return Status::CompletionUnknown("BatchGet stream completion failed; resources retained");
-  if (invocation.get_issued) LogBatchGetDeviceStatus(view.workspace, view.options.npu_core_count);
   if (invocation.pending_buffer != invocation.output_buffer &&
       KvafBatchGetLocalBufferRetire(invocation.pending_buffer) != KVAF_BATCH_GET_SUCCESS)
     return Internal("failed to retire Get registration; resources retained");

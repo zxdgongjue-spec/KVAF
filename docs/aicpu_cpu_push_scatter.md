@@ -38,7 +38,7 @@ UMDK 根据选定 EID 自动匹配 device/index；没有匹配端点就尝试下
 控制参数有更新，Host 库和设备包必须一起重建；仍保留单一 UMDK 控制入口。
 CPU push 的 V3 数据/请求协议及 TP 管理保持本分支原有实现。
 CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
-`npu_core_count` / `--workers` 控制 AICPU worker 数。
+`npu_core_count` / `--aicpu-workers` 控制 AICPU worker 数。
 
 ## 构建并验证
 
@@ -86,98 +86,48 @@ CPU 端启动同一个服务：
 
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28990 \
+  --listen 0.0.0.0 --port 21111 \
   --gather-threads 8 --gather-mode active
 ```
 
 两个 `--gather-*` 参数只影响 Gather，供下面的双模式对照使用；单独运行 Scatter 时
 可省略，它们不控制 CPU Push 的线程数。CPU Push 由所属服务线程提交，AICPU worker
-数由客户端 `npu_core_count` / `--workers` 控制。
-示例设备号 7 和本机服务地址按部署调整；跨主机时替换为 CPU 服务的可达地址。
+数由客户端 `npu_core_count` / `--aicpu-workers` 控制。
+示例设备号 2 和本机服务地址按部署调整；跨主机时替换为 CPU 服务的可达地址。
 初始化日志必须包含：
 
 ```text
 CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first
 ```
 
-```bash
-python3 access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --modes gather_read cpu_push_scatter --workers 1 2 4 5 \
-  --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
-  --output-row-step 1 --warmup 3 --iterations 20
-```
+性能测试使用下一节的统一入口；通过 `--backend` 选择 Gather 或 Scatter，
+通过 `--aicpu-workers` 设置 worker 数。实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，
+示例使用 5 个 worker。
 
-实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，因此本例使用
-1、2、4、5 个 worker，暂不推荐 Scatter 使用 8 个 worker。
+## 使用统一性能入口
 
-上例应输出 8 条 `AICPU_BATCH_GET_PASS`（两种 mode，各四种 worker 数）。只测 Scatter 时
-改为 `--modes cpu_push_scatter`，应输出 4 条。两种模式均会先执行配套 AICPU BatchPut，
-再用 Get 回读并校验数据。
-
-`--output-row-step 1` 检查相邻输出行；改为 2 检查输出间隔。
-`--output-order random`（默认）随机排列目标行；`sequential` 按目标行顺序请求。
-这个选项只改变测试输入，算子按调用方给定的顺序执行，不排序 Tensor。
-脚本每轮重新写入源数据和输入元数据，比较整个输出，并用后继 NPU 算子消费输出。
-预检包括部分/空 `miss_count`、两种 Tensor 重载和异步调用。
-需要阶段耗时时增加 `--profile-rounds 100`；采样轮次不计入正常带宽。
-通过日志同时输出 mean、p50、p99 耗时和对应的 `mean_GBps`、`p50_GBps`、`p99_GBps`；
-原有 `GBps` 字段保留为平均耗时对应带宽。
-验证多 EID 候选可追加 `--npu-eids "实际EID1,实际EID2"`，或设置 `KVAF_NPU_EIDS`。
-后者由脚本解析再传给 Runtime。若要验证失败回退，将格式合法但对当前连接不可用的
-候选放在前面，已确认可用的候选放在后面，并检查 `UMDK_EID_SELECTED` 日志。
-公共脚本不再接受 `--kernel-json`。
-
-## 全量性能扫描
-
-CPU 服务启动后，在加载 CANN 环境的终端运行：
+CPU 服务启动并加载 CANN 环境后，运行四种 Get 共用的入口：
 
 ```bash
-./tests/run_aicpu_cpu_push_scatter_sweep.sh "$PWD/build-npu" \
-  --device-id 7 --peer 127.0.0.1:28990
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend cpu_push_scatter --aicpu-workers 5 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --seed 20260903 --no-sort-input-indices \
+  --source-access-pattern random --output-access-pattern contiguous \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
-默认与 GatherRead sweep 一样扫描 252 组：token 为 128、256、512、656、1024、2048、4096 B，
-miss_count 为 32、64、128、256、512、1024、2048、4096、8192，worker 为 1、2、4、5。
-每组预热 10 轮、测量 100 轮，均开启 profile。
-主指标使用算子内部的 wall time，从最早进入的 AICPU worker 到最晚退出的 worker，
-即 `max(exit_ns) - min(enter_ns)`，包含算子内的 profile 打点开销。
-Python 绑定、Host launch、Host 同步返回和 profile D2H 回传不计入；
-数据和请求准备、BatchPut、建表、输出校验、预检与预热轮次也不计入。
+`BATCH_GET_RESULT scope=end_to_end` 报告 Host 调用到完成的延迟和带宽；
+`scope=kernel` 报告最早 worker 进入到最晚 worker 退出的设备时间和带宽。
+设备时间包含算子中的 CPU/网络等待及 profile 打点。
+`BATCH_GET_PROFILE` 保留各 worker 阶段的统计，阶段可嵌套和重叠，不能相加为设备总时间。
+数据初始化、请求生成、预热、输出校验和 profile 快照在正式性能采样之外。
 
-源数据池初始化一次，默认容量按 100 GiB DDR 预算计算，每块默认 128 个 token。
-CPU push 的 staging 和地址清单分配在 HBM。每轮有放回随机选择源 token，随机选择互不重复的输出行，
-输入和输出行数为 `max(32768, miss_count)`，逐轮校验整个输出及未写入行。
-`--table-capacity` 可显式指定 `1..INT32_MAX` 个源块，允许超过默认预算，实际分配取决于对端可用 DDR。
-与 GatherRead 对比时可指定相同容量。
-
-终端和 CSV 同时输出 `mean_us / mean_GBps`、`p50_us / p50_GBps`、`p99_us / p99_GBps`，
-以及 `metric=kernel_wall`。
-每个带宽按 `token_bytes × miss_count / 对应算子耗时(µs) / 1000`
-计算，耗时保留 1 位小数，十进制 GB/s 保留 3 位小数。
-`mean_GBps` 使用平均耗时计算；`p99_GBps` 使用 P99 耗时计算，表示尾延迟对应的较低带宽，
-不是逐轮带宽的第 99 百分位。分位耗时沿用按排序位置线性插值的计算方式。
-各阶段每轮取 worker 最大值，再对测量轮次求均值：`lookup_table_us`、`notify_cpu_us`、
-`push_total_us`、`ready_wait_us`、`scatter_us`、`done_wait_us`。
-ready 等待和 scatter 包含在 push 总时间内，各阶段最大值不能相加。
-CPU 自身的 READ/WRITE 分段耗时仍在服务端 `CPU_PUSH_PROFILE` 日志中。
-
-缩小扫描范围示例：
-
-```bash
-KVAF_AICPU_TOKEN_BYTES="656" \
-KVAF_AICPU_MISS_COUNTS="32 4096" \
-KVAF_AICPU_WORKERS="1 2 4 5" \
-./tests/run_aicpu_cpu_push_scatter_sweep.sh "$PWD/build-npu" \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --table-capacity 4096 --warmup 3 --iterations 20
-```
-
-每组 `.log` 和 `summary.csv` 默认写入 `reports/aicpu-cpu-push-scatter/<时间戳>`。
-`KVAF_AICPU_SWEEP_LOG_DIR` 可指定一个新目录；任一组失败后停止并保留已完成结果。
-单组入口为
-[benchmark_cpu_push_scatter.py](../access_operator/algorithms/get/scatter/urma_aicpu/python/benchmark_cpu_push_scatter.py)，
-参数与 GatherRead 相同，复用 `--npu-eids` / `KVAF_NPU_EIDS` 及共享解析器。
+源池大小由 `--table-capacity` 和块布局显式决定，不再由独立后端脚本分配 100 GiB。
+扫描不同 miss 数、token 大小或 worker 数时，循环调用同一个入口。
+详细口径及其他后端参数见 [统一 Get 性能测试](batch_get_performance.md)。
 
 ## 请求与数据流
 
@@ -270,8 +220,8 @@ push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 
 `source_write_us` 为零，因为本轮源清单由 CPU READ 获取。
 缓存维护相关字段为零。设备 worker 的区间重叠，不能相加作为端到端时长。
 
-`--profile-rounds` 同时开启 CPU 分段计时。CPU 服务在每个采样请求完成后输出一行
-`CPU_PUSH_PROFILE`，包含 profile 预热轮；普通带宽轮次不采集或打印这些计时。
+启用 CPU Push profiling 时，CPU 服务在采样请求完成后输出
+`CPU_PUSH_PROFILE`。统一性能入口的 `--kernel-profile` 控制详细分段输出。
 `header_read_us` 是请求头 READ 耗时，`address_read_us` 是有效源地址数组 READ 耗时；
 `write_us` 包含 `build_us`、`post_us`
 和 `cq_wait_us`，分别表示计划构建/源地址更新、URMA post 调用、提交后的 CQ 等待。
@@ -285,29 +235,31 @@ push 路径的 `read_us` 是消费 ready 并执行 scatter 的区间，`ack_us` 
 
 ## 4096 × 656 B 性能复测
 
-完成上述双端重建、设备包安装和 CPU 服务重启后，在 NPU 终端运行：
+完成双端重建、设备包安装和 CPU 服务重启后，在 NPU 终端运行：
 
 ```bash
-set -o pipefail
+bash <<'BASH'
+set -euo pipefail
 mkdir -p results
-python3 -u access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --modes cpu_push_scatter --workers 4 \
-  --blocks 4096 --token-bytes 656 --tokens-per-block 1 \
-  --active-percent 100 --output-row-step 1 --output-order random \
-  --warmup 50 --iterations 1000 --profile-rounds 100 \
-  2>&1 | tee results/cpu-push-a12bb16-4096x656.log
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend cpu_push_scatter --aicpu-workers 4 --execution both \
+  --request-length 4096 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 1 \
+  --seed 20260903 --no-sort-input-indices \
+  --source-access-pattern random --output-access-pattern random \
+  --warmup 50 --iterations 1000 --kernel-profile \
+  2>&1 | tee results/cpu-push-4096x656.log
+BASH
 ```
 
-保留相同通路、NUMA 策略和测试参数，比较正常轮次的 `GBps`、`mean_us`、`p99_us`。
-profile 中同时检查 `request_us`、`ready_wait_us`、`scatter_us` 和 `scatter_copies`：
-该配置每 worker 为 1024 次复制；CPU 应为 `cpu_threads=1`，
-预热后 `plan_reused=1`。保留 NPU 日志及 CPU 端的 `CPU_PUSH_PROFILE`。
-在单独一次运行中改用 `--output-order sequential`，其余参数不变，可观察输出顺序的影响。
-将 `--output-row-step` 改为 2 或 `--active-percent` 改为 75，继续验证间隔和部分前缀。
+固定通路、NUMA 策略和测试参数，分别比较 `scope=end_to_end` 与 `scope=kernel` 的
+`p50_us`、`p99_us` 和 `p50_GBps`。4 worker 下每 worker 应有 1024 次复制。
+另一次运行改为 `--output-access-pattern contiguous`，其余参数不变，可观察输出顺序的影响。
+部分前缀使用较小的 `--miss-count`。
 
-端到端仍然计入每次 Python 调用、kernel launch 和状态同步。
-旧常驻 kernel 的设备内循环带宽和当前 Python 端到端带宽具有不同计时范围。
+端到端计时包含每次 Python 调用、kernel launch 和所选完成等待；
+旧常驻 kernel 的设备内循环带宽具有不同计时范围。
 
 主要文件对应：`cpu_push_host.cc` 管 Host 资源，`cpu_push_get_worker.cc` 管 CPU 请求循环，
 `cpu_push_get_transport.cc` 管 URMA 数据链，`cpu_push_scatter.cc` 管设备消费与本地复制。

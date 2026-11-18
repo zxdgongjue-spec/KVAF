@@ -76,7 +76,7 @@ the transport.
   USER_CTL SQ/CQ/Jettys per AIV.
 - `host/execute_batch_get_loader.cpp`: ACL binary load and AIV launch.
 - Runtime/Python integration coverage lives in
-  `tests/python/test_npu_batch_get.py` and
+  `tests/python/test_npu_batch_get_perf.py` and
   `tests/python/test_npu_runtime_perf.py`.
 
 The checked Direct-HCCP declarations in `include/direct_hccp_abi.h` are the
@@ -116,12 +116,12 @@ base; the entity layout uses a formerly reserved word for `registered_base`.
 ```bash
 ./build.sh npu
 
-KVAF_CPU_SERVICE_ADDR=141.61.92.71:28999 \
-DEVICE_ID=0 \
-KVAF_NPU_TOKEN_BYTES=656 \
-KVAF_NPU_TOKENS_PER_BLOCK=128 \
-KVAF_NPU_ACTIVE_PERCENT=5 \
-tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv --aiv-cores 2 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
 The kernel uses the Ascend C SIMT API. The build automatically checks the
@@ -136,7 +136,7 @@ ASCEND_SIMT_API_DIR=/path/to/asc-devkit/include ./build.sh npu
 If that header is absent from both the CANN toolkit and asc-devkit, install the
 asc-devkit package matching the target CANN version before building; mixing
 headers from a different CANN release is not supported. The example above uses
-656 bytes per token, 128 tokens per block, and a 5% active probability.
+656 bytes per token, 128 tokens per block, and 4096 active requests.
 
 ## Graph boundary
 

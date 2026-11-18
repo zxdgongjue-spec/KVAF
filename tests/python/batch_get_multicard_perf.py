@@ -14,86 +14,11 @@ import subprocess
 import sys
 import time
 
-from perf_execution import add_execution_metadata
-
-
-def run_worker(kvaf, torch, args, make_plan, submit, check_output,
-               *, prepare_graph=None, release_graph=None):
-    """Reuse the normal benchmark's table, request generator and validation."""
-    control = args.contention_control_dir
-    device = int(os.environ["DEVICE_ID"])
-    plans = [make_plan() for _ in range(args.contention_graph_calls)]
-    stream = torch.npu.current_stream()
-    # Allocate/cache the stream's runtime state before entering capture.
-    submit(plans[0], stream)
-    torch.npu.synchronize()
-    graph = kvaf.AclGraph()
-    capturing = False
-    captured = False
-    try:
-        if prepare_graph:
-            prepare_graph(stream)
-        print(f"MULTICARD_GRAPH_CAPTURE_BEGIN calls={len(plans)}", flush=True)
-        graph.capture_begin(stream)
-        capturing = True
-        for plan in plans:
-            submit(plan, stream)
-        capturing = False
-        graph.capture_end()
-        captured = True
-        print("MULTICARD_GRAPH_CAPTURE_DONE", flush=True)
-        # A validation replay is separate from the configured warmup replays.
-        graph.replay(stream)
-        graph.synchronize(stream)
-        check_output(plans[-1])
-        for _ in range(args.warmup):
-            graph.replay(stream)
-            graph.synchronize(stream)
-
-        print(f"MULTICARD_READY device={device}", flush=True)
-        (control / f"ready_{device}").touch()
-        while not (control / "start.json").exists():
-            if (control / "abort").exists():
-                raise RuntimeError("multi-card run aborted before start")
-            time.sleep(0.02)
-        window = json.loads((control / "start.json").read_text())
-        remaining = window["start"] - time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
-        begin = time.monotonic()
-        replays = 0
-        while time.monotonic() < window["stop"]:
-            if (control / "abort").exists():
-                raise RuntimeError("multi-card run aborted during measurement")
-            graph.replay(stream)
-            graph.synchronize(stream)
-            replays += 1
-        end = time.monotonic()
-        if not replays:
-            raise RuntimeError("worker missed the measurement window")
-        check_output(plans[-1])
-        calls = replays * len(plans)
-        payload_bytes = calls * args.miss_count * args.token_bytes
-        result = {
-            "device": device, "start": begin, "end": end,
-            "calls": calls, "payload_bytes": payload_bytes,
-            "bandwidth_GBps": payload_bytes / (end - begin) / 1e9,
-            "graph_calls": len(plans), "verified": True,
-            "execution_mode": getattr(args, "execution_mode", "unified"),
-        }
-        args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
-        print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)
-    finally:
-        if capturing:
-            try:
-                graph.capture_end()
-            except Exception as error:
-                print(f"MULTICARD_CAPTURE_CLEANUP_ERROR {error}", file=sys.stderr)
-        if captured:
-            graph.synchronize(stream)
-        graph.reset()
-        if release_graph:
-            release_graph(stream, captured)
+from utils.get_options import (
+    add_backend_arguments, add_workload_arguments, configure_backend_help, parallelism_field,
+    resolve_backend, validate_workload, workload_command,
+)
+from utils.perf_execution import add_execution_metadata
 
 
 def worker_error(device, process, log_path, phase):
@@ -121,15 +46,9 @@ def run_group(args, devices, directory):
             env["KVAF_REMOTE_CPU_PERF_TIMEOUT"] = str(math.ceil(args.ready_timeout + args.seconds + 60))
             command = [
                 str(runner), str(args.build_dir),
-                "--transport", args.transport,
-                "--request-length", str(args.requests), "--miss-count", str(args.requests),
-                "--table-capacity", str(args.table_capacity),
-                "--token-bytes", str(args.token_bytes), "--tokens-per-block", str(args.tokens_per_block),
-                "--aiv-cores", str(args.aiv_cores), "--jettys-per-core", str(args.jettys_per_core),
-                "--max-inflight-total", str(args.max_inflight_total),
-                "--warmup", str(args.warmup), "--seed", str(args.seed),
-                "--source-access-pattern", "random", "--output-access-pattern", "contiguous",
-                "--no-sort-input-indices", "--no-kernel-profile",
+                *workload_command(args),
+                "--graph-api", args.graph_api, "--graph-replays", str(args.graph_replays),
+                "--no-kernel-profile",
                 "--contention-control-dir", str(directory),
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
@@ -201,6 +120,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     for solo, shared in zip(isolated, concurrent):
         ratio = shared["bandwidth_GBps"] / solo["bandwidth_GBps"]
         row = {
+            "backend": config.get("backend", "ubmem" if config.get("transport") == "ubmem" else "aiv"),
             "execution_mode": config.get("execution_mode", "unified"),
             "device": solo["device"], "isolated_GBps": solo["bandwidth_GBps"],
             "concurrent_GBps": shared["bandwidth_GBps"],
@@ -246,8 +166,8 @@ def write_summary(directory, isolated, concurrent, config=None):
         writer.writerows(rows)
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
-        "transport", "execution_mode", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
-        "seconds", "graph_calls", "warmup", "seed", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
+        "backend", "transport", "execution_mode", "aiv_cores", "aicpu_workers", "requests", "request_length", "miss_count", "token_bytes", "table_capacity", "tokens_per_block",
+        "seconds", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
     metadata["run"] = directory.name
@@ -259,24 +179,29 @@ def write_summary(directory, isolated, concurrent, config=None):
         writer.writerow(aggregate_row)
 
     report = ["# 多卡 BatchGet 带宽测试", "", f"结果目录：`{directory.name}`", "",
-              "带宽单位为十进制 GB/s；统计持续 ACL Graph 回放至完成的有效数据吞吐。", ""]
+              "带宽单位为十进制 GB/s；统计固定输入的持续 Graph 回放至完成的有效数据吞吐。", ""]
     if config:
+        backend = config.get("backend", "ubmem" if config["transport"] == "ubmem" else "aiv")
+        field = parallelism_field(backend)
+        active = config.get("miss_count", config["requests"])
         per_device = config.get("ddr_bytes_per_device",
                                 config["table_capacity"] * config["tokens_per_block"] * config["token_bytes"])
         settings = [
-            ("协议", config["transport"]),
+            ("后端 / 传输", f"{backend} / {config['transport']}"),
+            ("Graph API", config.get("graph_api", "acl")),
             ("设备启动顺序", " → ".join(str(device) for device in config["devices"])),
-            ("AIV 核数 / 卡", config["aiv_cores"]),
-            ("每批有效搬运量", f"{config['requests']} × {config['token_bytes']} B = {config['requests'] * config['token_bytes'] / 2**20:g} MiB"),
+            ("AICPU worker 数 / 卡" if field == "aicpu_workers" else "AIV 核数 / 卡", config[field]),
+            ("请求容量", config.get("request_length", config["requests"])),
+            ("每批有效搬运量", f"{active} × {config['token_bytes']} B = {active * config['token_bytes'] / 2**20:g} MiB"),
             ("地址表布局", f"{config['table_capacity']} 个表项，{config['tokens_per_block']} token / 块"),
             ("CPU DDR 数据区", f"每卡独立 {per_device / 2**20:g} MiB；并发合计 {len(isolated) * per_device / 2**30:g} GiB"),
             ("每阶段测量时长", f"{config['seconds']:g} s"),
             ("每张 Graph 的 BatchGet 次数", config["graph_calls"]),
             ("预热", f"{config['warmup']} 次 Graph 回放"),
-            ("访问模式 / 随机种子", f"随机读取、连续输出；seed={config['seed']}"),
+            ("访问模式 / 随机种子", f"source={config.get('source_access_pattern', 'random')} output={config.get('output_access_pattern', 'contiguous')} sort={config.get('sort_input_indices', False)} seed={config['seed']}"),
             ("CPU service", config["peer"]),
         ]
-        if config["transport"] == "urma":
+        if backend == "aiv":
             settings += [(label, config[key]) for label, key in (
                 ("Jetty 数 / AIV 核", "jettys_per_core"),
                 ("未完成 READ 上限 / 卡", "max_inflight_total"),
@@ -305,35 +230,41 @@ def write_summary(directory, isolated, concurrent, config=None):
         raise RuntimeError("measurement windows overlapped less than 95%; inspect worker logs before judging contention")
 
 
-def write_sweep_summary(directory, cores):
+def sweep_case(directory, field, count):
+    return directory / f"{'workers' if field == 'aicpu_workers' else 'cores'}_{count}"
+
+
+def write_sweep_summary(directory, counts, field="aiv_cores"):
     for filename in ("summary.csv", "aggregate.csv"):
         rows = []
-        for core in cores:
-            with (directory / f"cores_{core}" / filename).open() as source:
-                rows.extend(dict(row, aiv_cores=core) for row in csv.DictReader(source))
+        for count in counts:
+            with (sweep_case(directory, field, count) / filename).open() as source:
+                rows.extend(dict(row, **{field: count}) for row in csv.DictReader(source))
         with (directory / filename).open("w", newline="") as output:
             writer = csv.DictWriter(output, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-    headers = ["AIV 核数 / 卡", "独立带宽之和 GB/s", "并发总吞吐 GB/s", "保留 %", "下降 %"]
-    values = [(row["aiv_cores"], *(f"{float(row[key]):.3f}" for key in (
+    label = "AICPU worker 数 / 卡" if field == "aicpu_workers" else "AIV 核数 / 卡"
+    headers = [label, "独立带宽之和 GB/s", "并发总吞吐 GB/s", "保留 %", "下降 %"]
+    values = [(row[field], *(f"{float(row[key]):.3f}" for key in (
         "isolated_sum_GBps", "concurrent_wall_GBps", "retained_percent", "drop_percent"))) for row in rows]
     table = markdown_table(headers, values)
-    report = ["# 多卡 BatchGet 核数扫描", "",
-              f"协议：{rows[0]['transport']}；每批 {rows[0]['requests']} × {rows[0]['token_bytes']} B；带宽单位为十进制 GB/s。",
+    report = ["# 多卡 BatchGet 并行度扫描", "",
+              f"后端：{rows[0].get('backend', rows[0]['transport'])}；每批 {rows[0].get('miss_count', rows[0]['requests'])} × {rows[0]['token_bytes']} B；带宽单位为十进制 GB/s。",
               "", table, ""]
-    report += [f"- [{core} 核详细结果](cores_{core}/report.md)" for core in cores]
+    report += [f"- [{count} 详细结果]({sweep_case(directory, field, count).name}/report.md)" for count in counts]
     (directory / "report.md").write_text("\n".join(report) + "\n")
-    print(f"MULTICARD_CORE_SWEEP_SUMMARY\n{table}")
+    print(f"MULTICARD_SWEEP_SUMMARY\n{table}")
     print(f"MULTICARD_REPORT path={directory / 'report.md'}")
 
 
 def summarize(directory):
     config = json.loads((directory / "config.json").read_text())
-    if isinstance(config["aiv_cores"], list):
-        for core in config["aiv_cores"]:
-            summarize(directory / f"cores_{core}")
-        write_sweep_summary(directory, config["aiv_cores"])
+    field = parallelism_field(config.get("backend", "aiv"))
+    if isinstance(config[field], list):
+        for count in config[field]:
+            summarize(sweep_case(directory, field, count))
+        write_sweep_summary(directory, config[field], field)
         return
     isolated = [json.loads((directory / f"isolated_{device}/device_{device}.json").read_text())
                 for device in config["devices"]]
@@ -346,85 +277,87 @@ def summarize(directory):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("build_dir", type=Path)
+    add_workload_arguments(parser, defaults=dict(
+        request_length=4096, table_capacity=4096, tokens_per_block=128, token_bytes=656,
+        miss_count=None, warmup=3, seed=20260903), request_aliases=("--requests",))
+    add_backend_arguments(parser, sweep=True)
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
-    parser.add_argument("--aiv-cores", nargs="+", type=int,
-                        help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
-    parser.add_argument("--seconds", type=float, default=10)
-    parser.add_argument("--graph-calls", type=int, default=1,
-                        help="BatchGet calls per captured graph; replayed continuously during measurement")
-    parser.add_argument("--requests", type=int, default=4096)
-    parser.add_argument("--token-bytes", type=int, default=656)
-    parser.add_argument("--table-capacity", type=int, default=4096)
-    parser.add_argument("--tokens-per-block", type=int, default=128)
-    parser.add_argument("--jettys-per-core", type=int, default=2)
-    parser.add_argument("--max-inflight-total", type=int,
-                        default=int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048")),
-                        help="URMA unconfirmed READ limit per card; 0 uses the baseline")
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=20260903)
-    parser.add_argument("--transport", choices=("ubmem", "urma"), default="ubmem")
+    parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
+    parser.add_argument("--graph-calls", type=int, default=1, help="one Get node per graph; only 1 is supported")
+    parser.add_argument("--graph-api", choices=("acl", "torch"), default="acl")
+    parser.add_argument("--graph-replays", type=int, default=5, help="dynamic input checks before measurement")
     add_execution_metadata(parser)
     parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"))
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summarize", type=Path,
-                        help="regenerate tables from an existing result directory without running NPU tests")
+                        help="regenerate tables from saved results without NPU execution")
+    configure_backend_help(parser, argv)
     args = parser.parse_args(argv)
     if args.summarize is not None:
-        directory = args.summarize.resolve()
         try:
-            summarize(directory)
+            summarize(args.summarize.resolve())
         except Exception as error:
             print(f"MULTICARD_SUMMARY_FAILED {error}", file=sys.stderr)
             return 1
         return 0
+    resolve_backend(args, parser, default_backend="ubmem", sweep=True)
+    field = parallelism_field(args.backend)
+    counts = args.parallelism
+    if not counts or len(set(counts)) != len(counts):
+        parser.error(f"--{field.replace('_', '-')} requires distinct positive counts")
+    for count in counts:
+        args.parallelism = count
+        error = validate_workload(args)
+        if error:
+            parser.error(error)
+    if args.miss_count <= 0:
+        parser.error("sustained bandwidth requires positive --miss-count")
     if args.graph_calls != 1:
         parser.error("graph leases support one Get; use --graph-calls 1")
-    cores = args.aiv_cores
-    if cores is None:
-        cores = [int(value) for value in os.environ.get("KVAF_BATCH_GET_AIV_CORES", "16").split()]
-    if not cores or min(cores) < 1 or len(set(cores)) != len(cores):
-        parser.error("--aiv-cores requires distinct positive core counts")
+    if args.graph_replays <= 0:
+        parser.error("--graph-replays must be positive")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
-    for name in ("seconds", "graph_calls", "requests", "token_bytes", "table_capacity", "tokens_per_block", "ready_timeout"):
-        value = getattr(args, name)
-        if not math.isfinite(value) or value <= 0:
+    for name in ("seconds", "ready_timeout"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     args.build_dir = args.build_dir.resolve()
-    directory = (args.output or Path.cwd() / time.strftime(f"kvaf_multicard_{args.transport}_%Y%m%d_%H%M%S")).resolve()
-    directory.mkdir()
+    directory = (args.output or Path.cwd() / time.strftime(f"kvaf_multicard_{args.backend}_%Y%m%d_%H%M%S")).resolve()
+    directory.mkdir(parents=True)
     config = vars(args).copy()
     config.pop("summarize")
+    config.pop("parallelism")
+    config.pop("aicpu_workers" if field == "aiv_cores" else "aiv_cores")
+    config["requests"] = args.request_length  # Existing report consumers use this capacity field.
     config["build_dir"] = str(args.build_dir)
     config["output"] = str(directory)
     config["ddr_bytes_per_device"] = args.table_capacity * args.tokens_per_block * args.token_bytes
     config["peak_concurrent_ddr_bytes"] = len(args.devices) * config["ddr_bytes_per_device"]
-    config["aiv_cores"] = cores if len(cores) > 1 else cores[0]
+    config[field] = counts if len(counts) > 1 else counts[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    print(f"MULTICARD_CONFIG execution_mode={args.execution_mode} transport={args.transport} devices={args.devices} aiv_cores={cores} "
-          f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
-          f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
+    print(f"MULTICARD_CONFIG execution_mode={args.execution_mode} backend={args.backend} transport={args.transport} "
+          f"devices={args.devices} {field}={counts} graph_api={args.graph_api} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
           f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
-          "timing=sustained_graph_replay_to_completion units=decimal_GBps", flush=True)
+          "timing=sustained_graph_replay_to_completion profiling_enabled=0 units=decimal_GBps", flush=True)
     print(f"MULTICARD_RESULTS path={directory}", flush=True)
     try:
-        for core in cores:
-            args.aiv_cores = core
-            case = directory / f"cores_{core}" if len(cores) > 1 else directory
+        for count in counts:
+            args.parallelism = count
+            setattr(args, field, count)
+            case = sweep_case(directory, field, count) if len(counts) > 1 else directory
             if case != directory:
                 case.mkdir()
-                case_config = dict(config, aiv_cores=core, output=str(case))
-                (case / "config.json").write_text(json.dumps(case_config, indent=2) + "\n")
-            print(f"MULTICARD_CORE_SWEEP_BEGIN aiv_cores={core}", flush=True)
+                (case / "config.json").write_text(json.dumps(dict(config, **{field: count}, output=str(case)), indent=2) + "\n")
+            print(f"MULTICARD_SWEEP_BEGIN {field}={count}", flush=True)
             isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
             concurrent = run_group(args, args.devices, case / "concurrent")
-            write_summary(case, isolated, concurrent, dict(config, aiv_cores=core))
-        if len(cores) > 1:
-            write_sweep_summary(directory, cores)
+            write_summary(case, isolated, concurrent, dict(config, **{field: count}))
+        if len(counts) > 1:
+            write_sweep_summary(directory, counts, field)
     except (Exception, KeyboardInterrupt) as error:
         print(f"MULTICARD_FAILED {error}", file=sys.stderr)
         return 1

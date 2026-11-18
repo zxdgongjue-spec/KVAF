@@ -1,4 +1,4 @@
-"""Deterministic source data shared by BatchGet correctness and performance tests."""
+"""Deterministic source data for BatchGet benchmark validation."""
 
 
 def token_pattern(torch, token_ids, byte_ids):

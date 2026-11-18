@@ -327,15 +327,11 @@ CPU 服务、Host 库及设备 kernel 必须一起重建：
 - AICPU 包要求 `KvafAicpuUmdkControlSessionsV3`，包含多会话协议及新的请求布局。
 - 旧 CPU 服务不能用于新模式；能力协商会在分配缓存前拒绝不兼容服务。
 
-便携测试覆盖配置、Python 构造、独立方向、显式恢复、graph 排他与表 pin、未决事务、
-Region/session 状态机、epoch/重复 ID、截断协议、真实 TCP 回复丢失、AIV Get/Put kernel
-模型在不同规范/注册基址下的 payload、AICPU transfer 地址转换、请求形状及共享映射关闭失败。
-可通过 `KVAF_TEST_URMA_INCLUDE_DIR` 和 `KVAF_TEST_ACL_INCLUDE_DIR` 启用无需设备库的
-设备注册表及 ACL 映射 mock 测试。CPU 服务以 `KVAF_CPU_ENABLE_URMA=OFF` 完成便携构建。
-新增便携回归覆盖独立 owner、类型化租约、同资源并发首次获取、执行状态保留、
-原次 Put 的完成恢复、元数据及确认失败重试和不重复提交。TCP 测试需要允许本机
-回环监听；测试名称及命令见验证文档。
+原 `tests/` 顶层 C++ 功能测试及其 ACL/URMA stub、kernel CPU 模型已移除，
+不再配置独立 SDK 头文件目录来启用这些测试。
+独立 Python 功能、配置与单元测试及其 CMake 注册也已移除。
+性能入口保留数据预检和输出校验，公共模块集中在 `tests/python/utils/`；
+构建、性能测量和计时范围见验证文档。
 
-本机没有 Ascend 设备或正式 CANN 编译环境；NPU Host、AICPU 与 CPU URMA 源码使用
-本地 SDK stub 进行语法检查。目标环境仍须完成正式 SDK 编译、新 kernel 部署、真实
+本机没有 Ascend 设备或正式 CANN 编译环境。目标环境须完成正式 SDK 编译、新 kernel 部署、真实
 payload 的交叉写读、Get/Put 重叠、混合可见性、graph replay 和故障退出验收。

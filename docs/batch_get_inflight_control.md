@@ -48,8 +48,7 @@ Host/Kernel 混用会在加载符号时失败。必须整体重编 Host、Python
 预算按值 capture，改变预算需重建 Runtime/graph；`miss_count` 内容仍可动态更新。
 
 性能入口接受 `--max-inflight-total`，环境变量为
-`KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`，默认 2048。原 miss sweep 脚本会透传 CLI
-参数。比较预算时固定核数、Jetty 数、请求分布、token 大小和 EID/UB 设备。
+`KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`，默认 2048。通过统一性能入口扫描该参数。比较预算时固定核数、Jetty 数、请求分布、token 大小和 EID/UB 设备。
 
 ```bash
 tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
@@ -69,37 +68,29 @@ Profile 增加 `submitted_group_count`、`completed_group_count`、`completion_c
 提交时间。各核峰值相加只是一种保守上界，并非同一时刻的全局硬件峰值。新增
 CQE、检查点和标量调度都有成本，性能改善需在 A5 上验证。
 
-## 验证
+## 性能与边界检查
 
-本地 CTest 增加 `kvaf_batch_get_schedule_test`、`kvaf_batch_get_kernel_model_test`
-和 `kvaf_batch_get_inflight_config_python`，无需 CANN。调度测试直接使用 Kernel 的
-分组策略，检查独立推进的多核总预算、奇数预算、尾组、64 Jetty 轮转和边界计数；
-Kernel CPU 模型直接包含实际 `.asc` 源码，以同步 UB copy/SIMT 和延迟生成 CQE
-执行控制流，验证完整 payload、SQ/CQ owner 环回、索引持久化、尾组、多 Jetty
-及超时/CQ 错误后的复用拒绝。模型使用较小 CQ 深度加速环回；它不能验证真实
-AIV pipeline、DMA 可见性、硬件保序或 CANN 编译兼容性。
-
-在 A5 上整体重编后，开启现有 eager/graph 集成测试的边界扫描：
+在 A5 上整体重编后，使用统一性能入口，固定源池、请求布局及核/Jetty 数，
+扫描预算两侧的有效请求数：
 
 ```bash
-./build.sh npu
-KVAF_CPU_SERVICE_ADDR=CPU_IP:28999 \
-KVAF_NPU_TABLE_CAPACITY=8193 KVAF_NPU_REQUESTS=8193 KVAF_NPU_OUTPUT_ROWS=8193 \
-KVAF_NPU_TOKEN_BYTES=656 KVAF_NPU_TOKENS_PER_BLOCK=1 \
-KVAF_NPU_CORE_COUNT=1 KVAF_NPU_JETTYS_PER_CORE=16 \
-KVAF_NPU_GRAPH_REPLAYS=2 KVAF_BATCH_GET_INFLIGHT_CHECKS=1 \
-KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL=2048 \
-tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
+bash <<'BASH'
+set -euo pipefail
+for misses in 2047 2048 2049 8193; do
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend aiv --execution both \
+    --request-length 8193 --table-capacity 8193 --miss-count "$misses" \
+    --token-bytes 656 --tokens-per-block 1 \
+    --workers 4 --jettys-per-core 4 --max-inflight-total 2048 \
+    --warmup 10 --iterations 100 --kernel-profile
+done
+BASH
 ```
 
-边界扫描在相同 SQ/CQ 上交替执行 0、小请求、2048/2049、尾组及大请求，并在
-同一 captured graph 中改变 miss_count，检查完整 payload、未写入行和 profile
-预算/组回收。继续覆盖以下配置：
+改为 `--max-inflight-total 0` 测整批提交基线；使用 `3/3/2049` 的核/Jetty/预算组合
+观察预算余数。检查完整输出和 profile 中的组数、CQE 数及峰值在途统计。
+图性能采样之前还会验证动态输入、部分请求和零请求回放。
 
-- 核/Jetty/预算为 `4/4/2048`、`3/3/2049`：多核及预算余数。
-- `1/64/2048`：跨组使用后续 Jetty。
-- `1/1/2`：8193 请求的多轮边界扫描推动 SQ 和 CQ owner 环回。
-- `1/16/0`：关闭限流，对照数据及性能。
-
-CQ 错误和超时需目标环境故障注入，检查停止补发及下一次 replay 拒绝复用；
-CPU 模型覆盖了错误路径，但不能替代硬件检查。当前基线中被注释的请求地址校验维持原状。
+独立参数检查、C++ 调度和 kernel CPU 模型测试已移除。
+CQ 错误与超时恢复需要目标设备上的故障注入证据，性能预检不覆盖这些路径。

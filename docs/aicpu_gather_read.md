@@ -155,42 +155,10 @@ AICPU 初始化输出 `UMDK_EID_SELECTED source=host device=... eid_index=... ei
 测试及 sweep 不再提供 `--source-mode direct`。裸 `addresses/valid` Tensor 重载
 仍表示地址表，源地址为 `addresses[indices[i]] + offsets[i]`，不能传入逐请求最终地址替代。
 
-## 用 Python 检查正确性和比较 worker 数
+## Python 分段采样
 
-CPU 服务启动后，在仓库根目录运行：
-
-```bash
-export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-python3 access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --modes gather_read --workers 1 2 4 5 \
-  --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
-  --output-row-step 2 --warmup 3 --iterations 20
-```
-
-为与 Scatter 对照配置保持一致，本例使用 1、2、4、5 个 worker。
-实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，暂不推荐 Scatter 使用该配置。
-
-Runtime 统一定位已安装的 AICPU 包；脚本不再接受 `--kernel-json`。
-每轮重新生成源数据、输入索引、偏移和输出行号；先完成 BatchPut，再执行 BatchGet，
-逐字节检查整个输出，包括未写入的行和间隔；还在 NPU 上执行转换和加法，检查后续算子读取结果。
-预检覆盖两种 Python 重载、完整/部分/空前缀，以及异步 BatchGet 后同 stream 的 NPU 消费者。
-源和输出 Tensor 的注册地址持续有效到 Runtime 关闭；每轮释放 AccessTable 和 key 后重新写入，
-不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试前 75% 的请求。
-
-上例应输出 4 条 `AICPU_BATCH_GET_PASS mode=gather_read`。
-改用 `--output-row-step 1` 检查相邻输出行；增加测量轮次可做性能复测。
-多候选验证可追加 `--npu-eids "实际EID1,实际EID2"`。若要检查失败回退，第一项应是
-格式合法但对当前连接不可用的候选，后面放已确认可用的候选，并检查最终选中 EID 的日志。
-
-每个 worker 配置的通过日志包含 mean、p50、p95、p99（µs，小数点后 1 位），以及 mean、p50、p99
-耗时对应的有效载荷 GB/s（小数点后 3 位）。`GBps` 保留为 `mean_GBps` 的兼容字段。
-计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
-输入准备、BatchPut、AccessTable 创建与上传、输出下载和正确性检查均在计时之外。
-正常带宽统计不启用 profile。需要定位阶段耗时时，在同一命令末尾加 `--profile-rounds 100`：
-脚本会在正常测量后另跑 100 轮采样，打印平均阶段耗时，不逐轮刷日志。
-
-Python 也可直接获取单次采样：
+使用下一节的统一性能入口比较 worker 数和 eager/graph。
+若需在应用中分析单次同步 AICPU 调用，可使用原生 profile 返回值：
 
 ```python
 profile = runtime.batch_get(device_table, indices, offsets, miss_count, output_indices, output,
@@ -218,108 +186,30 @@ print(profile["workers"])
 provider 提交包含编码、写 SQ 和 doorbell，不能单独当作写 SQ 耗时。
 Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳不相减。
 
-## 全量性能扫描
+## 使用统一性能入口
 
-按前文完成构建和安装并保持 CPU 服务运行，在 NPU 终端加载 CANN 环境后执行：
-
-```bash
-./tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
-  --device-id 7 --peer 127.0.0.1:28990
-```
-
-Shell 脚本循环调用
-[benchmark_gather_read.py](../access_operator/algorithms/get/common/aicpu/python/benchmark_gather_read.py)，
-通过 `NpuRuntime.batch_get` 测量。
-默认扫描 252 组：
-
-| 参数 | 扫描值 |
-| --- | --- |
-| token_bytes | 128、256、512、656、1024、2048、4096 B |
-| miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
-| workers | 1、2、4、5 |
-
-每组预热 10 轮、测量 100 轮，均开启 profile。主指标使用算子内部的 wall time：
-从最早进入的 AICPU worker 到最晚退出的 worker，
-即 `max(exit_ns) - min(enter_ns)`，包含算子内的 profile 打点开销。
-Python 绑定、Host launch、Host 同步返回和 profile D2H 回传不计入；
-数据和请求准备、BatchPut、建表、输出校验、预检及预热轮次也不进入主指标。
-终端和 CSV 同时记录 mean、p50、p99 算子耗时及对应带宽，
-`metric=kernel_wall`：
-`GBps = token_bytes × miss_count / 对应耗时(µs) / 1000`。
-`mean_GBps` 使用平均耗时计算；`p99_GBps` 对应 P99 耗时，是尾延迟对应的较低带宽，
-不是逐轮带宽的第 99 百分位。分位耗时沿用按排序位置线性插值的计算方式。
-辅助阶段耗时继续使用算子内部 profile，每轮取 worker 最大耗时，再对测量轮次求均值。
-
-默认通信 DDR 预算为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
-按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
-再按完整块向下取整。同一 token 大小下，不同 worker 使用相同的源地址池。
-每块默认 128 个 token，数据和地址表初始化一次。
-每轮有放回随机选择源块和块内 token，输出随机选择互不重复的 HBM 行，没有固定隔行保护区。
-输入数组和输出行数为 `max(32768, miss_count)`，每轮校验整个输出和未写入行。
-准备数据、BatchPut、生成请求和结果校验在计时之外。
-
-缩小扫描范围和源池时，设置三个列表并传入 `--table-capacity`：
+CPU 服务启动并加载 CANN 环境后，运行四种 Get 共用的入口：
 
 ```bash
-KVAF_AICPU_TOKEN_BYTES="656" \
-KVAF_AICPU_MISS_COUNTS="32 4096" \
-KVAF_AICPU_WORKERS="1 2 4" \
-./tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --table-capacity 4096 --warmup 3 --iterations 20
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend gather_read --aicpu-workers 5 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --seed 20260903 --no-sort-input-indices \
+  --source-access-pattern random --output-access-pattern contiguous \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
-`--table-capacity` 可显式指定 `1..INT32_MAX` 个源块，允许超过默认预算，实际分配取决于对端可用 DDR。
-`--tokens-per-block` 控制每块 token 数。
-`miss_count` 只决定本轮从源池读取多少个 token，不决定源池分配大小。
-每组日志打印源池 GiB、工作区预算 MiB 和默认 DDR 预算 GiB。
-CPU 线程预算和外部 CPU/NUMA 限制在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
+`BATCH_GET_RESULT scope=end_to_end` 报告 Host 调用到完成的延迟和带宽；
+`scope=kernel` 报告最早 worker 进入到最晚 worker 退出的设备时间和带宽。
+设备时间包含算子中的 CPU/网络等待及 profile 打点。
+`BATCH_GET_PROFILE` 保留各 worker 阶段的统计，阶段可嵌套和重叠，不能相加为设备总时间。
+数据初始化、请求生成、预热、输出校验和 profile 快照在正式性能采样之外。
 
-结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
-可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
-终端按现有 profile 的执行顺序显示每组配置的一份汇总，省略 worker 明细、缓存细项、计数和 Host/Python 杂项：
-
-- 准备 CPU 读取请求（地址查表、填写清单并交给 DMA）、发送地址清单、通知 CPU。
-- 流水 READ 总时间，以及其中的 WR/SGL 构建、等待 CPU 就绪前缀、提交 READ、等待 READ CQE。
-
-上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
-请求准备包含地址查表、填写地址/长度清单及发送前的清单缓存维护；READ 下的子项包含在 READ 总时间内。
-阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
-
-CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列为均值，算子耗时包含 mean、p50、p99：
-
-| 表头 | 含义 |
-| --- | --- |
-| source_mode | `table` 为查表输入，`direct` 为本轮完整源地址输入 |
-| token_bytes / miss_count / workers | 测试配置 |
-| metric | `kernel_wall`，最早 worker 进入至最晚 worker 退出 |
-| mean_us / mean_GBps | 平均算子耗时及对应的有效载荷带宽 |
-| p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
-| p99_us / p99_GBps | 算子 P99 耗时及对应的有效载荷带宽 |
-| lookup_table_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
-| prepare_request_us | 裸地址模式下替代 `lookup_table_us`：顺序读取源地址、填写清单并清理清单缓存 |
-| address_send_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
-| notify_cpu_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
-| read_total_us | 从 staging READ 到输出 HBM 的整个流水阶段 |
-| build_wqe_us | 构建 URMA READ 请求及目标分散地址 |
-| cpu_gather_wait_us | 等待 CPU 完成当前需要的 staging 前缀 |
-| post_us | provider 编码、SQ 写入及 doorbell |
-| cq_wait_us | 等待已提交 READ 完成 |
-
-`build_wqe_us`、`cpu_gather_wait_us`、`post_us` 和 `cq_wait_us` 已经包含在 `read_total_us` 中。
-这些是内部阶段均值，不与算子总耗时统计相加。
-耗时保留 1 位小数，带宽为十进制 GB/s，保留 3 位小数。上述 8 个阶段字段表示均值（微秒）；
-`mean_us`、`p50_us`、`p99_us` 分别表示算子内平均、P50、P99 耗时。
-`lookup_table_us` 沿用请求准备阶段打点，包含查表、填清单和清单缓存维护；
-`cpu_gather_wait_us` 是 AICPU 等待就绪前缀的时间，不是 CPU gather 的独立执行耗时。
-
-当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
-把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。
-这一步只准备请求元数据，不搬运实际 payload。地址表、索引、偏移、输出行号和 miss_count
-遵循 CANN 输入 Tensor 的交接方式，AICPU 直接读取，不再额外刷新地址表或逐项刷新输入。
-输入内容可以每轮更新，不依赖上一轮内容不变。
-
-原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
+源池大小由 `--table-capacity` 和块布局显式决定，不再由独立后端脚本分配 100 GiB。
+扫描不同 miss 数、token 大小或 worker 数时，循环调用同一个入口。
+详细口径及其他后端参数见 [统一 Get 性能测试](batch_get_performance.md)。
 
 ## 执行和资源约定
 

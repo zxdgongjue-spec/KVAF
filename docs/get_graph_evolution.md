@@ -20,12 +20,11 @@ canonical 地址转换，以及按输入/输出绑定复用注册的接口。
 CPU 服务、NPU host 与 AICPU 包一起重编译、安装并启动新进程。CPU 服务使用
 main 的线程调度行为，`--gather-affinity` 已移除；性能对比显式固定线程数和模式。
 
-性能入口的两个参数独立：`--execution-mode legacy|per-call` 选择 Runtime API，
-`--execution eager|graph` 选择执行方式。不能把 per-call 自动降级成 legacy。
+性能入口统一为 `tests/run_remote_cpu_batch_get_perf.sh`：`--backend` 选择四种 Get，
+`--execution eager|graph|both` 选择执行方式。当前 Runtime 只有 unified 路径。
 
-保留了 main 删除的资源关闭、HAL 生命周期、加载器和安装事务回归；新增设备 ticket
-重复 replay、零请求、动态请求数、捕获期间不得分配/注册/同步和 stream 匹配检查。
-本地测试使用模型或 stub；实际通信、图回放和性能仍需在 NPU 上验证。
+独立 C++/Python 功能测试及配套 stub/model 已移除。统一性能入口保留数据预检、
+动态输入和图回放校验；它们随目标设备上的性能测试执行。
 
 ## 2. Get 驻留实例
 
@@ -55,11 +54,10 @@ Recover 要求目标实例无输出/图绑定，先完成在途操作，再关�
 图期间禁止同一 Runtime 的额外 Get / Drain / Warmup / Recover / Shutdown。
 一个租约仅允许一个 Get 节点，Put 不进入图。
 
-AIV Direct 保持原状态处理语义：不增加每次状态清零或结果回拷。UBMEM Get 的状态
-初始化与 legacy 一致：非图异步调用和图捕获不在 kernel 前追加 status 的
-`aclrtMemsetAsync`，同步 Get 和 Put 保留状态初始化。异步 Get 的 `drain_get()`
-仍等待完成并回读检查状态，图结束时仍同步并检查结果。未初始化的报告依靠 kernel
-覆盖，不提供逐次初始化哨兵检测，profile 应在本次执行完成后读取。AICPU Gather/Scatter
+AIV Direct 和 UBMEM eager Get 均不在完成时回读或检查设备状态，
+UBMEM 同步 Get 也不再清零状态报告。完成路径只等待并释放请求资源，ACL 提交和同步错误仍返回失败。
+显式 profile 快照在执行完成后读取并校验报告；UBMEM Put 的状态初始化、事务确认和
+Get graph 释放时的状态检查保留各自语义。AICPU Gather/Scatter
 使用设备侧 ticket 推进跨 replay 的通信序号；
 捕获阶段不注册、不分配、不同步，显式状态检查须在 replay 完成后执行。
 未重放的 AICPU 图正常结束会报未完成，可 `discard_result=True` 取消。
@@ -71,31 +69,11 @@ Profiling 和状态查询通过算法配置路由到驻留实例，默认取 Run
 供结束后读取。AICPU 的 `check_batch_get_status(stream, execution=config)` 检查
 实际对应算法；AIV 无需新增这一检查。
 
-更新 CPU、NPU 和 AICPU 包后，先验证全部功能（同一 CPU 服务进程）：
-
-```bash
-KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
-bash tests/run_cache_execution_e2e.sh "$PWD/build-npu" \
-  --report "$PWD/validation-four-get-graph.json"
-```
-
-`graph` 案例已覆盖四种 Get；聚焦验证可加 `--modes urma+ubmem --cases graph`。
-统一性能入口也可逐个比较 eager / graph，不改变接口模式：
-
-```bash
-for backend in aiv ubmem gather_read cpu_push_scatter; do
-  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
-  bash tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
-    --execution-mode per-call --backend "$backend" --execution both \
-    --request-length 32768 --miss-count 4096 --table-capacity 4096 \
-    --token-bytes 656 --tokens-per-block 128 --aiv-cores 2 --jettys-per-core 2 \
-    --warmup 10 --iterations 100 --graph-replays 100 --kernel-profile || break
-done
-```
-
-kernel profile 用于设备分析；Host 延迟对照使用两种接口模式相同的 profile 设置与
-`--get-timing sync-call`。便携回归覆盖四算法路由、捕获限制、stream 校验、失败重试、
-空/部分/全量请求及 profile 收尾；它们不替代真机 E2E 和性能验证。
+更新 CPU、NPU 和 AICPU 包后，通过统一性能入口逐个测量 eager / graph，
+使用[统一 Get 性能测试](batch_get_performance.md)中的各后端核数。
+`--graph-replays` 控制正式计时前的动态输入、部分和零请求验证；
+性能样本数由 `--iterations` 决定。
+Host 延迟对照需使用相同的 `--get-timing` 和 profile 设置。
 
 ## 5. 共享资源和生产目录
 
@@ -147,9 +125,5 @@ CMake、测试、脚本和公开文档路径一起迁移，库名、kernel 符�
 同步使用新路径。此前要求保留的本地设计草稿未修改、未提交。
 
 需重新配置并构建 CPU/NPU，重新安装 AICPU 包，并启动新的客户端和 CPU 服务进程。
-功能验收沿用第 3 节全量脚本；`resources/output-coexistence` 新增检查两个算法的输出
-绑定同时存在、交替使用以及释放空闲绑定不解除另一在途请求的 table pin。便携测试额外
-覆盖并发首次注册、共享引用、队列数量、同址新代次以及注销/context 关闭失败重试。
-
-本轮未加入同图多 Get 节点、图内混合算法或 Put 图模式。硬件验收通过前，便携测试仅证明
-资源控制与模拟执行路径，不能据此宣称真实 DMA、图回放或性能已通过。
+统一性能入口在正式计时之外验证数据与 graph 回放。
+同图多 Get 节点、图内混合算法或 Put 图模式仍不在本轮范围。

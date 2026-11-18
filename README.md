@@ -232,138 +232,55 @@ build-npu/access_operator/transports/aicpu_urma/kvaf-aicpu-urma.tar.gz
 Runtime 自动定位已安装的 AICPU 包，不再接受 `aicpu_urma_kernel_json_path`。
 AIV/UBmem 的 `.o` 仍需显式传入，参数要求见下方 Python 调用说明。
 
-## 启动与端到端验证
+## 启动与性能测试
 
-### 1. 启动 CPU 服务
-
-在 CPU 主机上执行：
+在 CPU 主机上启动与 NPU 构建来自同一提交的服务：
 
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 \
+  --listen 0.0.0.0 --port 21111 \
   --gather-threads 8 --gather-mode active
 ```
 
-此启动命令可供全部四种后端共用。两个 `--gather-*` 参数仅控制 CPU Gather 的
-线程预算和等待方式，不影响 AIV、UBmem 或 CPU Push Scatter 的执行。
-Gather 的 CPU 线程预算须不小于客户端 AICPU worker 数；上例支持后续的 1/2/4/5 worker 测试。
-Gather 线程继承外部 CPU 亲和性；可通过 `numactl --cpunodebind=N --membind=N` 限定
-CPU 调度范围和内存分配节点，或通过 `taskset -c CPU_LIST` 指定允许使用的 CPU。
+四种 Get 共用这个服务。Gather 的 CPU 线程预算须不小于客户端 AICPU worker 数；
+其他后端不使用这两个 `--gather-*` 参数。服务启动后打印 `LISTEN`。
+按实际路由可增加 `--ub-device NAME --eid-index N`。
+CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
 
-服务启动后打印 `LISTEN`；首次 URMA 请求触发 device/EID 枚举并打印 `CANDIDATE_DISCOVERED`。
-也可按需要传入 `--ub-device NAME --eid-index N` 来选定 URMA 端口。
-AIV N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
-`KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
-详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
-
-### 2. 验证 AIV URMA
-
-在 NPU 主机上加载 CANN 环境后执行。以下用本机 CPU 服务举例；跨主机部署时将
-`127.0.0.1` 替换为 CPU 服务的可达地址，`DEVICE_ID` 改为实际设备号。
+在 NPU 主机加载 CANN 环境、构建并安装设备包后，从仓库根目录运行：
 
 ```bash
-export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-export KVAF_CPU_SERVICE_ADDR="127.0.0.1:28999"
-export DEVICE_ID=0
-
-tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv --aiv-cores 2 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 --jettys-per-core 2 \
+  --seed 20260903 --no-sort-input-indices \
+  --source-access-pattern random --output-access-pattern contiguous \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
-测试会依次验证 Runtime 初始化、CPU DDR 分配、EID/Jetty 建链、AIV BatchPut、
-BatchGet 结果和 teardown。正常完成时：
+跨主机部署时将 `127.0.0.1` 替换为 CPU 服务的可达地址。
+`--backend` 支持 `aiv`、`ubmem`、`gather_read`、`cpu_push_scatter`；
+各后端的核数和完整计时范围见[统一 Get 性能测试](docs/batch_get_performance.md)。
+脚本在正式计时之外执行数据预检和输出校验。
 
-- NPU 侧输出 Runtime 初始化和正确性通过信息；
-- CPU 侧出现 `REGION_ALLOCATED`、`CHANNEL_CREATED` 与 `REGION_RELEASE`。
+Put 使用 `tests/run_remote_cpu_batch_put_perf.sh`，支持 URMA AIV、UBMEM AIV、URMA AICPU。
+三种 Put 的命令、输入复用及验证范围见[性能验证步骤](docs/cache_transport_execution_validation.md)。
 
-该入口调用 [test_npu_batch_get.py](tests/python/test_npu_batch_get.py)，mode 省略时验证
-默认 AIV 路径。硬件测试出现 `SKIP` 表示未实际执行，不应视为通过。
-
-### 3. 验证 AICPU Gather / Scatter
-
-保持同一个 CPU 服务和上面的 NPU 环境，使用统一构建的 Python 包：
+需要分析整个 Runtime 的 API 成本时运行：
 
 ```bash
-python3 access_operator/algorithms/get/common/aicpu/python/test_batch_get.py \
-  --device-id "$DEVICE_ID" --peer "$KVAF_CPU_SERVICE_ADDR" \
-  --modes gather_read cpu_push_scatter --workers 1 2 4 5 \
-  --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
-  --output-row-step 1 --warmup 3 --iterations 20
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_runtime_perf.sh build-npu
 ```
 
-实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，当前测试示例统一使用
-1、2、4、5 个 worker，暂不推荐 Scatter 使用 8 个 worker。
+该性能脚本测量初始化、BatchPut、AccessTable 准备和上传、BatchGet、BatchFree、shutdown，
+输出各 API 的 `PERF_RESULT`。追加 `--transport ubmem` 可测 UBMEM。
+默认总超时 600 秒，可通过 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 调整。
 
-[test_batch_get.py](access_operator/algorithms/get/common/aicpu/python/test_batch_get.py)
-每轮先执行 AICPU BatchPut，再执行 Gather/Scatter 并比较整个输出。它还检查两种
-Table 重载、空/部分请求前缀、随机输入和输出行、异步调用后同 stream 的 NPU 消费。
-两种模式乘以四种 worker 数，应输出 8 条 `AICPU_BATCH_GET_PASS`。
-将 `--output-row-step` 改为 `2` 可进一步检查输出间隔未被误写。
-
-可追加 `--npu-eids "实际EID1,实际EID2"`，或设置 `KVAF_NPU_EIDS`。Gather 和 Scatter
-都会逐一尝试候选，最终选用一个 EID。要验证失败回退，应将格式合法但对当前连接
-不可用的候选放在前面，已确认可用的候选放在后面，并检查 `UMDK_EID_SELECTED` 日志。
-脚本不再接受 `--kernel-json` 或 `--source-mode direct`。
-
-### 4. 验证 UBmem
-
-使用支持 Host P2P DDR/Fabric 映射的硬件和驱动，保持上述 CPU 服务运行：
-
-```bash
-export KVAF_RUN_NPU_TESTS=1
-export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_get_kernels.o"
-export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
-
-python3 tests/python/test_npu_batch_get.py --transport ubmem
-```
-
-同一个测试文件覆盖 UBmem Put/Get 和数据校验；不设置 AICPU mode。
-
-### 5. Runtime 性能测试
-
-CPU 服务保持运行，在 NPU 主机执行：
-
-```bash
-tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
-```
-
-此脚本默认测 AIV URMA；追加 `--transport ubmem` 可测 UBmem。
-脚本先执行完整数据路径正确性 preflight；通过后输出各 Runtime API 的
-`PERF_RESULT`，包括初始化、BatchPut、AccessTable、BatchGet、BatchFree 和 shutdown。
-默认总超时为 600 秒，可通过 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 调整。
-
-性能场景可通过以下变量调整：
-
-```text
-KVAF_RUNTIME_PERF_BATCH
-KVAF_RUNTIME_PERF_TABLE_CAPACITY
-KVAF_RUNTIME_PERF_REQUESTS
-KVAF_RUNTIME_PERF_ACTIVE_PERCENT
-KVAF_RUNTIME_PERF_BLOCK_BYTES
-KVAF_RUNTIME_PERF_SOURCE_STRIDE
-KVAF_RUNTIME_PERF_AIV_CORES
-KVAF_RUNTIME_PERF_JETTYS_PER_CORE
-KVAF_NPU_EIDS
-KVAF_RUNTIME_PERF_WARMUP
-KVAF_RUNTIME_PERF_ITERATIONS
-```
-
-AICPU 性能测试分别使用 [Gather sweep](tests/run_aicpu_gather_read_sweep.sh) 和
-[Scatter sweep](tests/run_aicpu_cpu_push_scatter_sweep.sh)，构建目录参数均可填写
-`"$PWD/build-npu"`。默认按 100 GiB DDR 预算计算源池容量，`--table-capacity` 可指定源块数量。
-
-### 6. 无 NPU 的主机回归
-
-使用新的主机构建目录，默认不启用任何设备后端：
-
-```bash
-cmake -S . -B build-host-tests -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF
-cmake --build build-host-tests --parallel 4
-ctest --test-dir build-host-tests --output-on-failure
-```
-
-其中 [npu_runtime_config_test.cc](tests/npu_runtime_config_test.cc) 验证后端和安装路径，
-[test_build_script.py](tests/python/test_build_script.py) 模拟编译步骤并实际执行临时目录安装。
-这些回归不能替代 CANN 设备编译和真机 Put/Get 验证。
+`tests/python/` 保留性能入口和 trace 汇总工具，公共模块位于 `tests/python/utils/`。
+独立功能、配置和单元测试及其 CMake 注册已移除。
 
 ## Python 调用流程
 

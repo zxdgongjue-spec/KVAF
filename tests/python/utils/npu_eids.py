@@ -1,4 +1,4 @@
-"""Shared parsing for explicit NPU EID path lists used by hardware tests."""
+"""Parse explicit NPU EID path lists for hardware benchmarks."""
 
 from __future__ import annotations
 

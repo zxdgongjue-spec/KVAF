@@ -20,10 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import kvaf
 
-from backend import detect_torch_backend
-from dsa_keys import build_dsa_keys
-from npu_eids import parse_npu_eids
-from perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.backend import detect_torch_backend
+from utils.dsa_keys import build_dsa_keys
+from utils.npu_eids import parse_npu_eids
+from utils.perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.statistics import percentile
 
 
 AIV_CORES = 32
@@ -35,14 +36,6 @@ ACTIVE_PERCENT = 5
 DEFAULT_TOKEN_BYTES = 656
 DEFAULT_TOKENS_PER_BLOCK = 128
 REQUESTS_PER_BATCH = 2048
-
-
-def percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
-    position = fraction * (len(ordered) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def print_samples(

@@ -3,13 +3,21 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/kvaf/build-npu [batch-get-perf-options...]" >&2
+  echo "Usage: bash $0 build-npu --backend aiv|ubmem|gather_read|cpu_push_scatter [options...]" >&2
   exit 2
 fi
 
+KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$1" == --help || "$1" == -h ]]; then
+  exec "${PYTHON:-python3}" "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" --help
+fi
 KVAF_BUILD_DIR="$1"
 shift
-KVAF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+for argument in "$@"; do
+  if [[ "$argument" == --help || "$argument" == -h ]]; then
+    exec "${PYTHON:-python3}" "$KVAF_ROOT/tests/python/test_npu_batch_get_perf.py" --build-dir "$KVAF_BUILD_DIR" "$@"
+  fi
+done
 KVAF_GET_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_get_kernels.o"
 KVAF_PUT_KERNEL="$KVAF_BUILD_DIR/bin/kvaf_execute_batch_put_kernels.o"
 
