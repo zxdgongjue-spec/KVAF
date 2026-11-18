@@ -74,7 +74,6 @@ Get 性能测试的具体计时与带宽定义见[统一 Get 性能测试](batch
 | eager 计时参数 | 计时结束位置 |
 |---|---|
 | `async-drain`（默认） | 异步提交后 `drain_get()` 返回，包括完成处理和请求清理 |
-| `async-wait` | 异步提交后外部 `torch.npu.synchronize()` 返回，drain 单独计时 |
 | `sync-call` | `batch_get(synchronize=True)` 同步返回 |
 
 AIV/UBMEM eager 完成路径不清零、回读或检查 Get 状态报告；ACL 失败仍返回错误。

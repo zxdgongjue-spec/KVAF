@@ -37,9 +37,6 @@ AIV、UBMEM 的 eager 完成路径只等待并释放资源，不清零、回读�
 Get 输出正确性由计时后的 Tensor 校验验证；显式 profile 快照仍读取并验证设备报告。
 UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 
-与 main 的异步计时边界对齐时，execution 可使用 `--get-timing async-wait`：
-提交后外部同步设备并停止计时，再通过 `PERF_RESULT operation=batch_get_post_wait_drain`
-单独报告 drain 耗时（毫秒）。这段包含请求清理，AICPU 还可能包含状态回读和检查。
 Graph 固定测 replay 加 stream 等待，资源准备、输出校验和 profile 读取均在计时外。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
