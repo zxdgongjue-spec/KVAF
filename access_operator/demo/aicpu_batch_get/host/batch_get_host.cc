@@ -1,5 +1,9 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
@@ -15,6 +19,69 @@ Status Internal(std::string s) { return Status::Internal(std::move(s)); }
 using kvaf::detail::BatchGetExecutionState;
 using kvaf::detail::BuildBatchGetKernelArgs;
 using kvaf::detail::PointerValue;
+
+bool ArgsDumpEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("KVAF_ARGS_DUMP");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+// Print the exact byte block handed to the AICPU launcher. CANN rejects the
+// captured func call with a bare "execute kernel param invalid" and no field
+// name, so the eager and captured dumps must be diffed to see what changed.
+void DumpLaunchArgs(const UmdkBatchGetArgs& launch, aclrtStream stream, bool capturing,
+                    std::size_t slot_index) {
+  if (!ArgsDumpEnabled()) return;
+  static std::atomic<unsigned long long> counter{0};
+  const unsigned long long seq = ++counter;
+  const auto& r = launch.request;
+  const auto& g = launch.gather;
+  std::fprintf(stderr,
+               "[KVAF_ARGS] seq=%llu capturing=%d stream=%p slot=%zu bytes=%zu blocks=%u "
+               "off{token_bytes=%zu gather=%zu}\n",
+               seq, capturing ? 1 : 0, static_cast<void*>(stream), slot_index, sizeof(launch),
+               g.worker_count, offsetof(UmdkBatchGetArgs, request.token_bytes),
+               offsetof(UmdkBatchGetArgs, gather));
+  std::fprintf(stderr,
+               "[KVAF_ARGS] request table=%llu indices=%llu offsets=%llu miss=%llu out_idx=%llu "
+               "table_cap=%u req_cap=%u token_bytes=%u\n",
+               static_cast<unsigned long long>(r.address_table),
+               static_cast<unsigned long long>(r.indices),
+               static_cast<unsigned long long>(r.offsets),
+               static_cast<unsigned long long>(r.miss_count),
+               static_cast<unsigned long long>(r.output_indices), r.table_capacity,
+               r.request_capacity, r.token_bytes);
+  std::fprintf(stderr,
+               "[KVAF_ARGS] gather session=%llu pid=%llu core_status=%llu output=%llu extent=%llu "
+               "scratch=%llu spans_ptr=%llu exec_ctl=%llu\n",
+               static_cast<unsigned long long>(g.context.session),
+               static_cast<unsigned long long>(g.context.owner_pid),
+               static_cast<unsigned long long>(g.core_status),
+               static_cast<unsigned long long>(g.output),
+               static_cast<unsigned long long>(g.output_extent),
+               static_cast<unsigned long long>(g.scratch),
+               static_cast<unsigned long long>(g.source_descriptor),
+               static_cast<unsigned long long>(g.execution_control));
+  std::fprintf(stderr,
+               "[KVAF_ARGS] gather staging=%llu desc=%llu cmd=%llu notify=%llu ack=%llu "
+               "bytes=%u seq=%llu spans=%u sgl=%u workers=%u wqes=%u widx=%u chunk=%u "
+               "profile=%llu\n",
+               static_cast<unsigned long long>(g.remote_staging),
+               static_cast<unsigned long long>(g.remote_descriptor),
+               static_cast<unsigned long long>(g.remote_command),
+               static_cast<unsigned long long>(g.remote_notify),
+               static_cast<unsigned long long>(g.remote_ack), g.bytes, g.source_span_count,
+               static_cast<unsigned long long>(g.sequence), g.sgl_size, g.worker_count,
+               g.sq_batch_wqes, g.worker_index, g.pipeline_chunk_bytes,
+               static_cast<unsigned long long>(g.profile));
+  const auto* raw = reinterpret_cast<const unsigned char*>(&launch);
+  std::fprintf(stderr, "[KVAF_ARGS] hex=");
+  for (std::size_t i = 0; i < sizeof(launch); ++i) std::fprintf(stderr, "%02x", raw[i]);
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+}
 
 }  // namespace
 struct BatchGetTransport::Impl {
@@ -288,6 +355,7 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   slot->submitted = false;
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
+  DumpLaunchArgs(launch, stream, capturing, slot_index);
   if (LaunchBatchGet(&launch, stream))
     return impl_->failure = Internal("UMDK BatchGet launch failed; shutdown required");
   slot->submitted = true;
