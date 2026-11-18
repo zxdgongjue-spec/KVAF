@@ -190,10 +190,9 @@ struct ScatterBatchGet::Impl {
     // build-ready/failure lines.
     args.workspace_bytes = layout.bytes + sizeof(KvafScatterMailboxContext) +
                            uint64_t(config.npu_core_count + 1) * 64;
-    // Huge-page preference belongs to the CPU-gather optimization. Preserve
-    // the original Scatter allocation policy when that path is disabled.
-    const auto policy = cpu_gather ? ACL_MEM_MALLOC_HUGE_FIRST : ACL_MEM_MALLOC_NORMAL_ONLY;
-    if (aclrtMalloc(&workspace, args.workspace_bytes, policy) != ACL_SUCCESS ||
+    // Keep the original Scatter policy for both payload sources. This HBM
+    // region is the persistent CPU WRITE target, including the SGL path.
+    if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
         aclrtMemset(workspace, args.workspace_bytes, 0, args.workspace_bytes) != ACL_SUCCESS)
       return Error("allocate scatter workspace");
     uint32_t physical = 0;

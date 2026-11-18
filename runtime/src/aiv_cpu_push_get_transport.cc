@@ -644,7 +644,48 @@ Status Transport::DrainPrepared(Profile* profile) {
   }
   return Status::OK();
 }
+Status Transport::WriteSglBatch(const std::atomic<bool>* stop) {
+  BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
+  auto status = PrepareWrites(request().count);
+  if (!status.ok()) return status;
+  auto* profile = profile_.enabled ? &profile_ : nullptr;
+  bool suffix_ready = false;
+  for (std::size_t w = 0; w < prepared_.size(); ++w) {
+    auto& plan = *prepared_[w];
+    if (plan.suffix && !suffix_ready) {
+      status = WaitSuffix(stop);
+      if (!status.ok()) return status;
+      suffix_ready = true;
+    }
+    // Only a physical SQ-credit shortage drains the prefix before the suffix.
+    status = BeginPrepared(plan, w + 1, profile, true);
+    if (!status.ok()) return status;
+    if (profile) {
+      profile->cpu_threads = 1;
+      ++profile->waves;
+      for (const auto& q : plan.queues) {
+        profile->ready_wrs += q.markers.size();
+        profile->data_wrs += q.wrs.size() - q.markers.size();
+        profile->post_calls += q.posts.size();
+      }
+    }
+    std::uint64_t first_post = 0;
+    status = PostPrepared(plan, true, profile ? &first_post : nullptr);
+    if (!status.ok()) return status;
+    if (profile) {
+      if (!profile->first_post_ns) profile->first_post_ns = first_post;
+      profile->post_ns += BatchGetProfileNowNs() - first_post;
+    }
+    const bool keep_prefix = !plan.suffix && w + 1 < prepared_.size() && prepared_[w + 1]->suffix;
+    if (!keep_prefix) {
+      status = DrainPrepared(profile);
+      if (!status.ok()) return status;
+    }
+  }
+  return tracker_.Empty() ? Status::OK() : DrainPrepared(profile);
+}
 Status Transport::WriteBatch(const std::atomic<bool>* stop) {
+  if (!gather_) return WriteSglBatch(stop);
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto* profile = profile_.enabled ? &profile_ : nullptr;
   const auto fail_gather = [&](const Status& failure) {

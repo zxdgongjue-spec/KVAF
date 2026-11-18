@@ -49,6 +49,9 @@ CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 
 CPU Push 使用独立的 `CpuPushGatherExecutor`；`aiv-gather` 的
 `CpuGatherExecutor` 保留原有描述符、前缀发布和线程调度实现。默认四 Jetty 且未启用 CPU
 Gather 的 Scatter 保留 V8 握手；未启用 CPU Gather 时保留原有内存分配策略。
+两种通路的 HBM staging 都沿用 `ACL_MEM_MALLOC_HUGE_FIRST`；关闭 CPU Gather 不会切换为
+`NORMAL_ONLY`。CPU Gather 关闭时使用独立的 SGL WRITE 提交路径，保留原有 prefix/suffix 重叠、
+SQ credit 等待、最终 CQ 回收以及 `cpu_post` 计时口径。
 显式配置非四 Jetty 数量时，只有该 Scatter 的打开命令使用 V9 扩展；AICPU Scatter 保留 V6 协议。
 
 ## 独立二进制与类型声明

@@ -77,6 +77,7 @@ class Transport {
   Status GatherRows(std::uint32_t count, const peer::CpuPushGatherExecutor::WaveReady& on_wave = {},
                     const peer::CpuPushGatherExecutor::FixedSuffix* suffix = nullptr,
                     const peer::CpuPushGatherExecutor::ShardProgress& on_shards = {});
+  Status WriteSglBatch(const std::atomic<bool>* stop);
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,

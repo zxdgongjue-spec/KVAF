@@ -19,6 +19,8 @@
 
 namespace {
 std::vector<std::function<void()>> work;
+struct AllocationPolicy { void* address; int policy; };
+std::vector<AllocationPolicy> allocation_policies;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 void* mailbox_jetty{};
@@ -36,18 +38,24 @@ uint32_t profile_fault{};
 std::vector<uint64_t> sequences;
 std::vector<uint32_t> launch_options;
 }
-int aclrtMalloc(void** p, size_t n, int) {
+int aclrtMalloc(void** p, size_t n, int policy) {
 #ifdef _WIN32
   *p = _aligned_malloc(n, 64); const int rc = *p ? 0 : 1;
 #else
   const int rc = posix_memalign(p, 64, n);
 #endif
-  if (!rc) ++allocations; return rc;
+  if (!rc) {
+    ++allocations;
+    allocation_policies.push_back({*p, policy});
+  }
+  return rc;
 }
 int aclrtMallocHost(void** p, size_t n) { return aclrtMalloc(p, n, 0); }
 int aclrtFree(void* p) {
   if (p) {
     --allocations;
+    allocation_policies.erase(std::remove_if(allocation_policies.begin(), allocation_policies.end(),
+        [p](const AllocationPolicy& allocation) { return allocation.address == p; }), allocation_policies.end());
 #ifdef _WIN32
     _aligned_free(p);
 #else
@@ -104,6 +112,13 @@ int Launch(const KvafScatterBatchGetArgs* a) {
 }
 extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_SCATTER);
+  // CPU_GATHER=0 must retain the original SGL WRITE target's huge-page
+  // preference. Cover eager/graph and gather-enabled launches as well.
+  const auto allocation = std::find_if(allocation_policies.begin(), allocation_policies.end(),
+      [a](const AllocationPolicy& item) {
+        return item.address == reinterpret_cast<void*>(a->workspace);
+      });
+  assert(allocation != allocation_policies.end() && allocation->policy == ACL_MEM_MALLOC_HUGE_FIRST);
   kvaf::cpu_push::Layout layout;
   assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout,
                                    kvaf::ScatterPayloadJettys(*a)));
