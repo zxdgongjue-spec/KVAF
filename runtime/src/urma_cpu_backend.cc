@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <time.h>
@@ -343,13 +344,69 @@ class CpuGatherWorker {
     std::memset(control_, 0, sizeof(*control_));
     peer::GatherBarrier();
     worker_ = std::thread(&CpuGatherWorker::Run, this);
+    watchdog_ = std::thread(&CpuGatherWorker::Watch, this);
   }
   ~CpuGatherWorker() {
     stop_.store(true, std::memory_order_release);
     worker_.join();
+    if (watchdog_.joinable()) watchdog_.join();
   }
  private:
+  // A stalled copy leaves the AICPU spinning on ready_bytes with no trace, so
+  // report the worker thread's kernel wait state from a side thread instead.
+  static std::uint64_t SteadyNowNs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+  static void ThreadWaitState(long tid, char* state, std::size_t state_size,
+                              char* wchan, std::size_t wchan_size) {
+    state[0] = '\0';
+    wchan[0] = '\0';
+    if (tid <= 0) return;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%ld/stat", tid);
+    if (auto* file = std::fopen(path, "r")) {
+      int pid = 0;
+      char comm[64] = {0};
+      char code = '?';
+      if (std::fscanf(file, "%d %63s %c", &pid, comm, &code) == 3) state[0] = code;
+      std::fclose(file);
+    }
+    state[state_size - 1U] = '\0';
+    std::snprintf(path, sizeof(path), "/proc/self/task/%ld/wchan", tid);
+    if (auto* file = std::fopen(path, "r")) {
+      if (!std::fgets(wchan, static_cast<int>(wchan_size), file)) wchan[0] = '\0';
+      std::fclose(file);
+      wchan[wchan_size - 1U] = '\0';
+      for (char* cursor = wchan; *cursor; ++cursor)
+        if (*cursor == '\n') { *cursor = '\0'; break; }
+    }
+  }
+  void Watch() {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (stop_.load(std::memory_order_acquire)) return;
+      const auto sequence = inflight_sequence_.load(std::memory_order_acquire);
+      if (!sequence) continue;
+      const auto started = inflight_started_ns_.load(std::memory_order_acquire);
+      if (!started) continue;
+      const auto elapsed_ms = (SteadyNowNs() - started) / 1000000U;
+      if (elapsed_ms < 1000U) continue;
+      char state[8], wchan[64];
+      ThreadWaitState(worker_tid_.load(std::memory_order_acquire), state, sizeof(state),
+                      wchan, sizeof(wchan));
+      Log("[KVAF_CPU] GATHER_STALL control=0x%llx seq=%llu elapsed_ms=%llu state=%s "
+          "wchan=%s spans=%u bytes=%u staging=0x%llx\n",
+          static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(control_)),
+          static_cast<unsigned long long>(sequence),
+          static_cast<unsigned long long>(elapsed_ms), state, wchan,
+          inflight_spans_.load(std::memory_order_acquire),
+          inflight_bytes_.load(std::memory_order_acquire),
+          static_cast<unsigned long long>(inflight_staging_.load(std::memory_order_acquire)));
+    }
+  }
   void Run() {
+    worker_tid_.store(static_cast<long>(::syscall(SYS_gettid)), std::memory_order_release);
     std::uint64_t last = 0U;
     while (!stop_.load(std::memory_order_acquire)) {
       const auto sequence = __atomic_load_n(&control_->notify, __ATOMIC_ACQUIRE);
@@ -378,6 +435,21 @@ class CpuGatherWorker {
             static_cast<unsigned long long>(bytes_));
       bool valid = false;
       std::size_t threads = 0U;
+      if (GatherTraceEnabled() && header_visible && header.span_count != 0U) {
+        const auto* first_span = reinterpret_cast<const peer::GatherSpan*>(
+            memory_ + offset + sizeof(peer::GatherDescriptorHeader));
+        Log("[KVAF_CPU] GATHER_COPY_BEGIN seq=%llu spans=%u bytes=%u chunk=%u staging=0x%llx "
+            "first=0x%llx first_len=%u\n",
+            static_cast<unsigned long long>(sequence), header.span_count, header.total_bytes,
+            header.pipeline_chunk_bytes,
+            static_cast<unsigned long long>(header.staging_address),
+            static_cast<unsigned long long>(first_span->address), first_span->length);
+      }
+      inflight_spans_.store(header.span_count, std::memory_order_release);
+      inflight_bytes_.store(header.total_bytes, std::memory_order_release);
+      inflight_staging_.store(header.staging_address, std::memory_order_release);
+      inflight_started_ns_.store(SteadyNowNs(), std::memory_order_release);
+      inflight_sequence_.store(sequence, std::memory_order_release);
       const auto copy_begin = std::chrono::steady_clock::now();
       try {
         threads = executor_.PrepareDirect(bytes_, address, sequence, peer::kMaxGatherSpans);
@@ -387,6 +459,8 @@ class CpuGatherWorker {
         Log("[KVAF_CPU] GatherRead failed: %s\n", error.what());
         valid = false;
       }
+      inflight_sequence_.store(0U, std::memory_order_release);
+      inflight_started_ns_.store(0U, std::memory_order_release);
       // A DONE line is the only proof the copy actually returned; a stuck copy
       // leaves the AICPU spinning on ready_bytes with no trace at all.
       if (GatherTraceEnabled() || !valid) {
@@ -442,7 +516,12 @@ class CpuGatherWorker {
   peer::CpuGatherExecutor executor_;
   CpuGatherMode mode_;
   std::atomic<bool> stop_{false};
+  std::atomic<long> worker_tid_{0};
+  std::atomic<std::uint64_t> inflight_sequence_{0U}, inflight_started_ns_{0U};
+  std::atomic<std::uint32_t> inflight_spans_{0U}, inflight_bytes_{0U};
+  std::atomic<std::uint64_t> inflight_staging_{0U};
   std::thread worker_;
+  std::thread watchdog_;
 };
 
 struct Region {
