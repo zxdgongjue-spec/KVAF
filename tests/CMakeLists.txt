@@ -8,6 +8,17 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_test(NAME kvaf_cpu_service_invalid_page_mode
     COMMAND kvaf_cpu_service --memory-page-mode invalid --help)
   set_tests_properties(kvaf_cpu_service_invalid_page_mode PROPERTIES WILL_FAIL TRUE)
+  foreach(page_size IN ITEMS 2m 1g)
+    add_test(NAME kvaf_cpu_service_ubmem_${page_size}
+      COMMAND kvaf_cpu_service --ubmem-page-size "${page_size}" --help)
+  endforeach()
+  add_test(NAME kvaf_cpu_service_invalid_ubmem_page_size
+    COMMAND kvaf_cpu_service --ubmem-page-size invalid --help)
+  set_tests_properties(kvaf_cpu_service_invalid_ubmem_page_size PROPERTIES WILL_FAIL TRUE)
+
+  add_executable(kvaf_ubmem_hal_test ubmem_hal_test.cc)
+  target_link_libraries(kvaf_ubmem_hal_test PRIVATE kvaf_ubmem_hal)
+  add_test(NAME kvaf_ubmem_hal_test COMMAND kvaf_ubmem_hal_test)
 endif()
 
 add_executable(kvaf_npu_runtime_config_test npu_runtime_config_test.cc)

@@ -13,10 +13,11 @@ void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
                "[--gather-threads N] [--gather-mode adaptive|active|passive] "
-               "[--memory-page-mode default|thp|hugetlb-2m|hugetlb-1g] [--hal-library PATH]\n"
+               "[--memory-page-mode default|thp|hugetlb-2m|hugetlb-1g] "
+               "[--ubmem-page-size 2m|1g] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates are discovered automatically. Gather threads default to 10, "
-               "mode to active; URMA memory page mode defaults to thp. "
+               "mode to active; URMA memory page mode defaults to thp and UBmem page size to 2m. "
                "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
                program);
 }
@@ -66,7 +67,8 @@ int main(int argc, char** argv) {
     if ((argument == "--listen" || argument == "--port" || argument == "--ub-device" ||
          argument == "--eid-index" || argument == "--gather-threads" ||
          argument == "--gather-mode" ||
-         argument == "--memory-page-mode" || argument == "--hal-library") &&
+         argument == "--memory-page-mode" || argument == "--ubmem-page-size" ||
+         argument == "--hal-library") &&
         index + 1 >= argc) {
       PrintUsage(argv[0]);
       return 2;
@@ -108,6 +110,13 @@ int main(int argc, char** argv) {
 
     } else if (argument == "--hal-library") {
       cpu_options.hal_library = argv[++index];
+    } else if (argument == "--ubmem-page-size") {
+      const std::string value(argv[++index]);
+      if (value != "2m" && value != "1g") {
+        std::fprintf(stderr, "invalid --ubmem-page-size (expected 2m|1g)\n");
+        return 2;
+      }
+      cpu_options.ubmem_giant_pages = value == "1g";
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
         std::fprintf(stderr,

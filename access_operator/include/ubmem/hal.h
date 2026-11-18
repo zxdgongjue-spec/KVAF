@@ -55,13 +55,14 @@ class Mapping {
   Mapping(const Mapping&) = delete;
   Mapping& operator=(const Mapping&) = delete;
 
-  Status AllocateHost(std::uint64_t bytes, FabricHandle* descriptor);
+  Status AllocateHost(std::uint64_t requested_bytes, FabricHandle* descriptor,
+                      bool giant_pages = false);
   Status Close();
   std::uint64_t address() const { return reinterpret_cast<std::uintptr_t>(address_); }
   std::uint64_t bytes() const { return bytes_; }
 
  private:
-  Status ReserveAndMap();
+  Status ReserveAndMap(std::uint64_t page_flag);
   std::shared_ptr<Hal> hal_;
   void* handle_{};
   void* address_{};

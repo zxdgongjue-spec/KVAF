@@ -24,6 +24,7 @@ struct CpuRuntimeOptions {
   CpuGatherMode gather_mode{CpuGatherMode::kActive};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
   std::string hal_library{"libascend_hal.so"};
+  bool ubmem_giant_pages{false};
 };
 
 // CPU endpoint Runtime. Allocation requests select URMA or UBmem per session;

@@ -48,7 +48,6 @@ CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--ga
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
 `--memory-page-mode` 选择 URMA 后端的 CPU DDR 分配方式，默认为 `thp`。
-UBmem 的 Host P2P DDR 页规格由 Ascend HAL 管理。
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -77,6 +76,19 @@ slot 容量沿用请求值。HugeTLB 分配失败会返回错误。`REGION_ALLOC
 `backing_bytes` 给出映射大小，`memory` 可用于在 `/proc/<pid>/smaps` 中定位映射，
 核对 `KernelPageSize` 和 `VmFlags` 的 `ht` 标志。
 [Linux HugeTLB 页池说明](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html)
+
+UBmem 默认向 Ascend HAL 申请 2 MiB 大页。支持 Host P2P DDR giant page 的驱动
+可以显式申请 1 GiB 页：
+
+```bash
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --ubmem-page-size 1g
+```
+
+`--ubmem-page-size` 接受 `2m` 和 `1g`。该选项也适用于 `./build.sh cpu --without-urma`
+构建的服务。`1g` 会把每次 DDR 申请的映射长度按 1 GiB 向上取整，客户端可用长度
+保持为请求值。HAL 拒绝申请时直接返回错误。客户端用 `--transport ubmem`；CPU
+服务的 `DDR_EXPORTED` 日志记录 `page_size` 和 `mapping_bytes`。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的

@@ -7,8 +7,12 @@
 namespace kvaf::ubmem {
 namespace {
 constexpr int kFabric = 1;
-constexpr std::uint64_t kHugePage = 1;
+constexpr std::uint32_t kHostSide = 0;
+constexpr std::uint32_t kHugePage = 1;
+constexpr std::uint32_t kGiantPage = 2;
+constexpr std::uint32_t kP2pDdr = 3;
 constexpr std::uint64_t kHostUva = 1ULL << 10;
+constexpr std::size_t kGiantPageBytes = 1ULL << 30;
 
 template <typename T>
 bool Symbol(void* library, const char* name, T* result) {
@@ -54,8 +58,8 @@ Status Hal::Load(const std::string& path) {
 
 Mapping::~Mapping() { (void)Close(); }
 
-Status Mapping::ReserveAndMap() {
-  int ret = hal_->reserve(&address_, bytes_, 0, nullptr, kHugePage | kHostUva);
+Status Mapping::ReserveAndMap(std::uint64_t page_flag) {
+  int ret = hal_->reserve(&address_, bytes_, 0, nullptr, page_flag | kHostUva);
   if (ret != 0) return HalError("reserve virtual address", ret);
   ret = hal_->map(address_, bytes_, 0, handle_, 0);
   if (ret != 0) return HalError("halMemMap", ret);
@@ -63,17 +67,23 @@ Status Mapping::ReserveAndMap() {
   return Status::OK();
 }
 
-Status Mapping::AllocateHost(std::uint64_t bytes, FabricHandle* descriptor) {
-  if (handle_ != nullptr || descriptor == nullptr || bytes == 0 || bytes % kPageBytes != 0 ||
-      bytes > std::numeric_limits<std::size_t>::max()) {
-    return Status::InvalidArgument("Host DDR requires a 2-MiB-aligned size");
+Status Mapping::AllocateHost(std::uint64_t requested_bytes, FabricHandle* descriptor,
+                             bool giant_pages) {
+  const std::size_t page_bytes = giant_pages ? kGiantPageBytes : kPageBytes;
+  if (handle_ != nullptr || descriptor == nullptr || requested_bytes == 0 ||
+      requested_bytes > std::numeric_limits<std::size_t>::max() - (page_bytes - 1)) {
+    return Status::InvalidArgument("invalid UBmem Host P2P DDR allocation size or mapping state");
   }
-  // MEM_HOST_SIDE, MEM_HUGE_PAGE_TYPE, MEM_P2P_DDR_TYPE.
-  MemoryProperty prop{0, 0, 0, 1, 3, 0};
-  int ret = hal_->create(&handle_, bytes, &prop, 0);
-  if (ret != 0) return HalError("halMemCreate(Host P2P DDR)", ret);
-  bytes_ = bytes;
-  Status status = ReserveAndMap();
+  const std::size_t mapping_bytes = (requested_bytes + page_bytes - 1) / page_bytes * page_bytes;
+  const auto page_type = giant_pages ? kGiantPage : kHugePage;
+  const MemoryProperty prop{kHostSide, 0, 0, page_type, kP2pDdr, 0};
+  int ret = hal_->create(&handle_, mapping_bytes, &prop, 0);
+  if (ret != 0) {
+    return HalError(giant_pages ? "halMemCreate(Host P2P DDR, 1 GiB pages)"
+                               : "halMemCreate(Host P2P DDR)", ret);
+  }
+  bytes_ = mapping_bytes;
+  Status status = ReserveAndMap(page_type);
   if (!status.ok()) return status;
   ret = hal_->export_memory(handle_, kFabric, 0, descriptor);
   if (ret != 0) return HalError("halMemExportToShareableHandleV2(FABRIC)", ret);
