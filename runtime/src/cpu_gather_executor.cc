@@ -1,5 +1,7 @@
 #include "cpu_gather_executor.h"
 
+#include <cstdio>
+
 namespace kvaf::peer {
 namespace {
 
@@ -51,6 +53,22 @@ std::size_t CpuGatherExecutor::PrepareDirect(std::uint64_t region_bytes,
       variable_offsets_[index + 1U] = end;
     }
     if (variable_offsets_.back() != header.total_bytes) return 0U;
+  }
+  // Every source span is read as memory_ + (span.address - base_). Nothing above
+  // validates it, so a stale slot address turns into a read of an unrelated page
+  // instead of a clean rejection.
+  for (std::size_t index = 0; index < header.span_count; ++index) {
+    const auto& span = source_spans[index];
+    const auto length = span_bytes_ != 0U ? span_bytes_ : span.length;
+    if (GatherRange(base_, GatherControlOffset(region_bytes), span.address, length)) continue;
+    std::fprintf(stderr,
+                 "[KVAF_CPU] GATHER_BADSPAN seq=%llu index=%zu/%u address=0x%llx length=%u "
+                 "base=0x%llx limit=0x%llx\n",
+                 static_cast<unsigned long long>(sequence), index, header.span_count,
+                 static_cast<unsigned long long>(span.address), length,
+                 static_cast<unsigned long long>(base_),
+                 static_cast<unsigned long long>(base_ + GatherControlOffset(region_bytes)));
+    return 0U;
   }
   pipeline_ready_ = nullptr;
   if (header.pipeline_chunk_bytes != 0U) {
