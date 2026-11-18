@@ -1,7 +1,11 @@
 # AICPU CPU Push Scatter：构建、调用与验证
 
+本页描述 Scatter 数据流和兼容接口示例。按调用选择算法、驻留资源和 Get 图模式见
+[实现与使用](cache_transport_execution_implementation.md)；统一功能与性能比较见
+[验证步骤](cache_transport_execution_validation.md)。
+
 需要由 CPU 将离散 DDR 数据直接送入连续 HBM、再由 AICPU 写入调用方输出时，
-在现有 `NpuRuntime` 构造参数中设置：
+使用独立的 Put/Get 执行配置和资源预算：
 
 ```python
 import torch
@@ -9,14 +13,15 @@ import torch_npu
 import kvaf
 
 torch.npu.set_device(7)
+put = kvaf.PutExecutionConfig("urma", "aicpu")
+get = kvaf.GetExecutionConfig("urma", "aicpu", "scatter")
 runtime = kvaf.NpuRuntime(
-    batch_get_kernel_object_path="",
     batch_get_token_bytes=656,
     batch_get_tokens_per_block=2,
     device_id=7,
-    npu_core_count=4,
-    transport="urma",
-    aicpu_batch_get_mode="cpu_push_scatter",
+    transport_mode="urma", default_put=put, default_get=get,
+    put_resources=[(put, kvaf.ExecutionResources(cores=4))],
+    get_resources=[(get, kvaf.ExecutionResources(cores=4))],
 )
 runtime.link_to("127.0.0.1:28990")
 runtime.initialize(ddr_bytes=656 * 2 * 8192, slot_size=656 * 2)
@@ -25,27 +30,25 @@ runtime.initialize(ddr_bytes=656 * 2 * 8192, slot_size=656 * 2)
 
 其余 `batch_put`、AccessTable 和 `batch_get` 调用保持现有方式。
 Runtime 自动定位 CANN 安装目录中的 AICPU kernel JSON，无需公开路径参数；安装路径规则见 [Gather 使用说明](aicpu_gather_read.md)。
-`aicpu_batch_get_mode` 默认为空，表示 AIV。显式选择 `gather_read` 或 `cpu_push_scatter` 后使用 AICPU，两者均可使用原有两种 Table 重载。
-此路径只支持 `transport="urma"`；`ubmem` 搭配非空 mode 会报错。
-`batch_get_kernel_object_path` 仍须传入，但填 `""` 即可；Put 的 `.o` 路径可省略，
-两者均不参与 AICPU 包加载。`gather_read_direct` 不对外开放。
-CPU push 默认自动发现候选，也可通过 `npu_eids=[eid1, eid2]` 指定按顺序尝试的候选，最终选用一个 EID。
-自动发现的候选按现有 Runtime 初始化流程尝试；多 EID 条带和 AIV 自适应调优不用于此路径。
-Get 使用 Host direct HCCP/RA；Put 使用 AICPU UMDK session。两者使用同一个 Host 选定 EID，
-复用仓库原有的 CLOS/pair_info 发现与候选验证流程，UMDK 不再独立选择端点。
-UMDK 根据选定 EID 自动匹配 device/index；没有匹配端点就尝试下一候选，不再提供独立过滤参数。
-候选切换前先清理资源，清理失败则停止并保留状态供重试。
+`GetExecutionConfig("urma", "aicpu", "scatter")` 选择 Scatter，`gather` 选择 Gather；
+两者均支持原有两种 Table 重载。Put 由独立的 `default_put` 或本次 `execution` 选择。
+AICPU 仅支持 URMA；Runtime 的 transport 模式须允许 URMA。AICPU 资源项不传 kernel
+路径，设备包在首次准备时解析；`gather_read_direct` 不对外开放。
+CPU push 使用首个自动发现候选，也可通过严格的 `npu_eids=[eid1, eid2]` 指定列表并使用首项；
+不执行启动探测、候选自动切换、多 EID 条带或自适应调优。
+Get 使用 Host direct HCCP/RA；Put 使用 AICPU UMDK session，两者使用同一个 Host 选定 EID。
+UMDK 根据选定 EID 匹配 device/index，匹配或准备失败会报错，不再提供独立过滤参数。
 控制参数有更新，Host 库和设备包必须一起重建；仍保留单一 UMDK 控制入口。
 CPU push 的 V3 数据/请求协议及 TP 管理保持本分支原有实现。
 CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
-`npu_core_count` / `--aicpu-workers` 控制 AICPU worker 数。
+资源项 `cores` / `--aicpu-workers` 控制 AICPU worker 数。
 
 ## 构建并验证
 
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
 当前 push 协议为 V3，逐行复制源于 `codex/aicpu-ordered-write` 的
 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24），Ready 由 AICPU 按 Jetty 分片消费。
-设备入口为 `KvafAicpuCpuPushScatterA12V24`。主机库和设备 SO 必须一起更新，
+当前设备入口为 `KvafAicpuCpuPushScatterExecutionV3`。主机库和设备 SO 必须一起更新，
 包括移除废弃排序字段后的 profile 布局。以下命令从各自仓库根目录执行。
 CPU 端构建服务：
 
@@ -92,9 +95,9 @@ CPU 端启动同一个服务：
 
 两个 `--gather-*` 参数只影响 Gather，供下面的双模式对照使用；单独运行 Scatter 时
 可省略，它们不控制 CPU Push 的线程数。CPU Push 由所属服务线程提交，AICPU worker
-数由客户端 `npu_core_count` / `--aicpu-workers` 控制。
-示例设备号 2 和本机服务地址按部署调整；跨主机时替换为 CPU 服务的可达地址。
-初始化日志必须包含：
+数由客户端 资源项 `cores` / `--aicpu-workers` 控制。
+示例设备号和本机服务地址按部署调整；跨主机时替换为 CPU 服务的可达地址。
+首次准备 Scatter 时的日志应包含：
 
 ```text
 CPU_PUSH_REFERENCE commit=a12bb16c120e885eb18ed61581739e1c212c32e8 protocol=3 copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first
@@ -147,7 +150,8 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
 
 每轮过程如下：
 
-1. Host 在调用方 stream 清零本次 AICPU coordination，再启动配置数量的实例。
+1. Host 在调用方 stream 启动配置数量的实例；设备通过常驻 coordination 的 ticket
+   取得本轮 worker 编号和 sequence，不在每次提交前由 Host 清零 coordination。
 2. 各 worker 并行查表，将本核分片的源地址写入原请求位置；worker 0 填写请求头。
 3. 所有非空分片可见后，worker 0 发布一次 notify，携带 sequence 和可选 profile 位。
    CPU READ 请求头，验证后 READ 有效源地址前缀，
@@ -160,9 +164,11 @@ CPU 建立专用回写队列，返回对端信息；Host 完成导入后才激�
 7. CPU 收齐数据链尾 CQE 后发布 done；全部 scatter 与 done 均完成后 kernel 结束。
 
 ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64 位字内编码 sequence 和结果。
-请求序号从 Host 递增，达到 uint32 上限后要求重建 session。
+请求序号由设备 ticket 推进，达到 uint32 上限后要求重建相应执行资源。
 空前缀不通知 CPU、不修改输出；CPU 允许此类调用造成的序号间隔。
-当前实现针对普通 stream enqueue，Host 固定序号不能用于 graph replay。
+普通 stream enqueue 和 graph replay 使用相同的设备序号机制；图租约固定
+算法、stream、输出和容量；每个 Get 节点使用独立租约，同一 Runtime 的存活图共用一个 stream。
+捕获与结束流程见实现文档。
 
 CPU 数据面沿用该提交 V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描，
 CPU 与设备共享 worker 分区和 chunk 枚举逻辑。
@@ -186,13 +192,13 @@ ready 热循环与 V24 一样只读 worker 协调状态；Runtime 的远端错�
 
 | 项目 | a12bb16 V24 独立测试 | 当前 Runtime |
 | --- | --- | --- |
-| 执行 | 一次 launch，设备内循环所有轮次 | 每次 BatchGet 独立 launch；本页测试同步并检查状态，API 也支持异步入队 |
+| 执行 | 一次 launch，设备内循环所有轮次 | 每次 BatchGet 独立 launch；统一性能入口支持异步入队和同步调用 |
 | 源 SGL | CPU 预先构建，逐轮修改 ready 序号和源数据标签 | 每轮从动态 Tensor 解析源地址，CPU READ 地址清单并更新 SGL |
 | 输出 | 预先安排顺序输出，656 B 行使用 768 B stride | 按动态 `output_indices` 写入 656 B slot，默认测试随机排列 |
-| 校验 | 源标签每轮变化，末轮完整读回输出 | 每轮变化输入、校验整个输出并由后继 NPU 算子消费 |
-| 带宽计时 | 驻留 kernel 内 request 到 scatter/done | Python 调用开始到本次 stream 完成 |
+| 校验 | 源标签每轮变化，末轮完整读回输出 | 请求生成与输出校验在性能计时之外 |
+| 带宽计时 | 驻留 kernel 内 request 到 scatter/done | Host 端到端时间；启用 profile 后另报设备时间 |
 
-`--output-order sequential` 可单独测量目标访问顺序的影响；它不改变 slot 大小或带宽计时范围，
+`--output-access-pattern contiguous` 可单独测量目标访问顺序的影响；它不改变 slot 大小或带宽计时范围，
 也不能把当前结果等同于旧常驻测试的结果。
 
 ## 内存、缓存和完成
@@ -207,7 +213,7 @@ workspace 在初始化时分配，每轮复用，总 payload 必须能用 uint32
 算子只遍历输入生成源清单和执行 scatter，不逐项校验 Tensor 内容或校验 payload。
 调用方须提供有效的索引、偏移、源地址和输出行；保留请求容量和有效前缀长度检查。
 
-一次执行完成前不复用 staging。异步返回表示已经入队；下次 Get/Put 会先 Drain，
+一次执行完成前不复用 staging。异步返回表示已经入队；同一 Get 方向的下次普通调用会先 Drain，
 检查前一轮执行状态。`synchronize=True` 在本次调用内完成等待和状态检查。
 Shutdown 先停止 CPU worker 并销毁其 DMA 队列，再等待设备执行、释放 HBM。
 传输或 stream 失败会阻止执行资源复用；关闭失败时保留资源以便重试。

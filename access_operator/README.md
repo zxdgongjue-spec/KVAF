@@ -43,8 +43,8 @@ access_operator/
 ```
 
 `algorithms/` 按数据搬运算法分类；`providers/` 保留目前跨 Put/Get 的适配器和
-资源 owner 组合，负责将 Runtime 请求接到具体算法。此次仅迁移目录，不拆分这些
-对象的生命周期，不改变算法执行和资源复用行为。
+资源 owner 组合，负责将 Runtime 请求接到具体算法。目录分层与对象的生命周期
+分开管理，具体所有权和复用边界见实现文档。
 
 算法目录的 `common/` 只保留已有的共享 ABI、loader、设备入口或组合编译单元，
 不表示合并不同算法的 session、Jetty、队列、workspace 或完成状态。
@@ -60,15 +60,18 @@ AICPU 构建包位于 `build-npu/access_operator/transports/aicpu_urma/`，统�
 `offload/cpu_pull/` 及 CPU 服务 worker 也待代码合入时建立，不作为普通 Get 算法。
 
 四种 Get 的显式图租约、常驻实例和资源边界见
-[Get 图模式演进](../docs/get_graph_evolution.md)，运行方式见
+[实现与使用](../docs/cache_transport_execution_implementation.md)，运行方式见
 [功能与性能验证](../docs/cache_transport_execution_validation.md)。Put 保持同步调用。
 
 ## Legacy AIV 接口与能力
 
+以下两节保留旧适配器的历史说明，不作为当前统一 Runtime 的调用契约。当前 AIV/UBMEM eager Get
+不回读检查设备状态；普通注册、显式绑定和图节点租约的生命周期以[实现与使用](../docs/cache_transport_execution_implementation.md)为准。
+
 | 接口 | 当前行为 | 目的 |
 | --- | --- | --- |
 | `Initialize(remote_region)` | 已支持 | 加载 kernel，并先取得按物理 NPU 共享的 Direct-HCCP RA/HDC session；随后分别创建可复用的 BatchGet、BatchPut transport。初始化不接收 caller HBM。 |
-| `ExecuteBatchGet(request)` | 已支持，默认仅提交 | 使用 request 内 caller-owned NPU Tensor 与 stream，Acquire 对应的 local HBM buffer 并 launch。`status` / `queue_state` 是 Operator 内部 AIV ABI buffer；显式同步只等待 stream 完成，不新增状态清零或校验。相同 `(output 地址, bytes)` 由底层 transport 缓存复用。 |
+| `ExecuteBatchGet(request)` | 已支持，默认仅提交 | 使用 request 内 caller-owned NPU Tensor 与 stream，Acquire 对应的 local HBM buffer 并 launch。`status` / `queue_state` 是 Operator 内部 AIV ABI buffer；不逐次清零 status，显式同步等待 stream 后回读诊断日志，设备 status 不转换为调用失败。相同 `(output 地址, bytes)` 由底层 transport 缓存复用。 |
 | `ExecuteBatchPut(request)` | 已支持，同步 eager | 使用 caller-owned packed NPU `input`、每条 CPU `input_offsets/lengths` 和 Runtime `PreparePut` 返回的地址。Operator 将 metadata 上传到 NPU，调用 AIV Direct-HCCP WRITE，并在成功后由 Runtime CommitPut；确定失败则 Runtime AbortPut，完成状态未决时保留事务供恢复。未配置 BatchPut kernel 时保留 ACL D2H mock 供本地/BatchGet-only 构建使用。 |
 | `Shutdown()` | 已支持 | 释放两个独立 transport 及其缓存的 local HBM MR；归还共享 RA/HDC session 引用，进程级 bootstrap 保持驻留。调用方必须先完成所有外部 stream/graph 工作。 |
 
@@ -77,7 +80,7 @@ BatchGet 按固定 token 大小搬运：NPU 侧 `indices`、`offsets`、`miss_co
 `queue_state` 由 Operator 内部申请。Python 通过 `DeviceAccessTable` 和 Tensor
 调用，不传裸指针/字节数。per-call 模式可通过 `begin_get_output/end_get_output` 管理显式输出绑定。
 
-## 生命周期
+## Legacy AIV 生命周期
 
 ```text
 Runtime.Initialize
@@ -142,6 +145,6 @@ kernel entity。
 - 硬件验收应确认第二个 transport 可以跨过 `RaCtxInit`、CTP、Jetty 创建，并完成
   Get/Put 数据校验；这验证的是两个数据面 transport 并存。
 - 后续若共享更多资源，仍需先确认 token 语义、访问权限和队列并发模型兼容；
-  本轮资源共享边界详见 [Get 图模式演进](../docs/get_graph_evolution.md)。
+  当前共享边界详见 [实现与使用](../docs/cache_transport_execution_implementation.md)。
 
 当前 Runtime 始终保留独立 transport，不在 Get/Put 之间销毁、重建或切换链路。

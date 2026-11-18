@@ -1,13 +1,13 @@
 # AICPU Get 公共入口
 
-本目录保留 Gather 和 Scatter 现有的共同 ABI、Host loader、设备导出入口和 Python 验证负载。目录迁移不改变导出符号、Host library target 或设备安装包。
+本目录保留 Gather 和 Scatter 现有的共同 ABI、Host loader 和设备导出入口。Python 验证与性能负载位于 `tests/python`。目录迁移不改变导出符号、Host library target 或设备安装包。
 
 - `include/batch_get_abi.h`：现有 Gather/Scatter 参数与状态布局。
 - `include/kvaf_aicpu_batch_get.h`：现有 Host API 声明。
 - `host/execute_batch_get_loader.cc`：按原入口提交 Gather/Scatter。
 - `kernel/batch_get.cc`：导出原设备入口。
-- `python/benchmark_gather_read.py`：两种算法共用的性能测试实现。
-- `python/test_batch_get.py`：两种算法共用的数据与图回放验证。
+
+两种算法共用 [统一 Get 性能入口](../../../../../tests/run_remote_cpu_batch_get_perf.sh)，通过 `--backend gather_read|cpu_push_scatter` 选择算法；数据预检与图回放验证随性能入口执行。
 
 算法实现分别位于 [Gather](../../gather/urma_aicpu/README.md) 和 [Scatter](../../scatter/urma_aicpu/README.md)。通信基础位于 `access_operator/transports/aicpu_urma`。
 

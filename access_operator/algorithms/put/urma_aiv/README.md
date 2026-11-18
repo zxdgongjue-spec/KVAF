@@ -149,7 +149,7 @@ repository root:
 
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=0 \
   bash tests/run_remote_cpu_batch_put_perf.sh "$PWD/build-npu" \
-    --transport urma --executor aiv --execution-mode per-call
+    --transport urma --executor aiv
 ```
 
 The `scripts/` directory retains the historical standalone commands. The
