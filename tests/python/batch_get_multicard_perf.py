@@ -4,15 +4,41 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import math
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import time
+
+
+ARRIVED = b"R"
+REPLAY = b"G"
+STOP = b"S"
+
+
+def measure_barrier_replays(graph, stream, barrier_fd):
+    begin = end = 0.0
+    replays = 0
+    with socket.socket(fileno=barrier_fd) as barrier:
+        while True:
+            barrier.sendall(ARRIVED)
+            command = barrier.recv(1)
+            if command == STOP:
+                return begin, end, replays
+            if command != REPLAY:
+                raise RuntimeError("BatchGet barrier closed before the round was released")
+            if replays == 0:
+                begin = time.monotonic()
+            graph.replay(stream)
+            graph.synchronize(stream)
+            end = time.monotonic()
+            replays += 1
 
 
 def run_worker(kvaf, torch, args, make_plan, submit, check_output):
@@ -55,15 +81,18 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
         remaining = window["start"] - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
-        begin = time.monotonic()
-        replays = 0
-        while time.monotonic() < window["stop"]:
-            if (control / "abort").exists():
-                raise RuntimeError("multi-card run aborted during measurement")
-            graph.replay(stream)
-            graph.synchronize(stream)
-            replays += 1
-        end = time.monotonic()
+        if args.contention_barrier_fd is not None:
+            begin, end, replays = measure_barrier_replays(graph, stream, args.contention_barrier_fd)
+        else:
+            begin = time.monotonic()
+            replays = 0
+            while time.monotonic() < window["stop"]:
+                if (control / "abort").exists():
+                    raise RuntimeError("multi-card run aborted during measurement")
+                graph.replay(stream)
+                graph.synchronize(stream)
+                replays += 1
+            end = time.monotonic()
         if not replays:
             raise RuntimeError("worker missed the measurement window")
         check_output(plans[-1])
@@ -95,6 +124,35 @@ def worker_error(device, process, log_path, phase):
     )
 
 
+def release_barrier_rounds(barriers, children, stop, deadline):
+    rounds = 0
+    while True:
+        for device, process, log_path in children:
+            barrier = barriers[device]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise worker_error(device, process, log_path, "BatchGet barrier timed out")
+            barrier.settimeout(remaining)
+            try:
+                arrived = barrier.recv(1)
+            except OSError as error:
+                raise worker_error(device, process, log_path, f"BatchGet barrier receive failed ({error})") from error
+            if arrived != ARRIVED:
+                raise worker_error(device, process, log_path, "left the BatchGet barrier")
+
+        # Every worker has finished the previous replay. Make the stop decision
+        # once for the entire group so all workers complete the same rounds.
+        command = REPLAY if time.monotonic() < stop else STOP
+        for device, process, log_path in children:
+            try:
+                barriers[device].sendall(command)
+            except OSError as error:
+                raise worker_error(device, process, log_path, f"BatchGet barrier send failed ({error})") from error
+        if command == STOP:
+            return rounds
+        rounds += 1
+
+
 def run_group(args, devices, directory):
     directory.mkdir()
     runner = Path(os.environ.get(
@@ -103,6 +161,7 @@ def run_group(args, devices, directory):
     )).resolve()
     children = []
     logs = []
+    barriers = {}
     try:
         for device in devices:
             log_path = directory / f"device_{device}.log"
@@ -126,8 +185,15 @@ def run_group(args, devices, directory):
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
             ]
-            process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+            with contextlib.ExitStack() as child_resources:
+                pass_fds = ()
+                if args.barrier_per_call:
+                    barriers[device], child_barrier = socket.socketpair()
+                    child_resources.enter_context(child_barrier)
+                    pass_fds = (child_barrier.fileno(),)
+                    command.extend(("--contention-barrier-fd", str(child_barrier.fileno())))
+                process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                           start_new_session=True, pass_fds=pass_fds)
             children.append((device, process, log_path))
 
         deadline = time.monotonic() + args.ready_timeout
@@ -140,10 +206,14 @@ def run_group(args, devices, directory):
             time.sleep(0.05)
         start = time.monotonic() + 0.25
         temporary = directory / "start.tmp"
-        temporary.write_text(json.dumps({"start": start, "stop": start + args.seconds}))
+        stop = start + args.seconds
+        temporary.write_text(json.dumps({"start": start, "stop": stop}))
         temporary.replace(directory / "start.json")
         print(f"MULTICARD_MEASURE phase={directory.name} devices={devices} seconds={args.seconds}", flush=True)
-        deadline = start + args.seconds + 60
+        deadline = stop + 60
+        if barriers:
+            rounds = release_barrier_rounds(barriers, children, stop, deadline)
+            print(f"MULTICARD_BARRIER_DONE phase={directory.name} rounds={rounds}", flush=True)
         while any(process.poll() is None for _, process, _ in children):
             for device, process, log_path in children:
                 if process.poll() not in (None, 0):
@@ -158,8 +228,12 @@ def run_group(args, devices, directory):
         for device, result in zip(devices, results):
             if result["device"] != device or not result["verified"] or result["end"] <= result["start"]:
                 raise RuntimeError(f"invalid result for device {device}")
+            if barriers and result["calls"] != rounds:
+                raise RuntimeError(f"device {device} completed {result['calls']} calls for {rounds} barrier rounds")
         return results
     finally:
+        for barrier in barriers.values():
+            barrier.close()
         # Let healthy workers leave their barrier/loop and release remote DDR.
         if any(process.poll() is None for _, process, _ in children):
             (directory / "abort").touch()
@@ -238,7 +312,8 @@ def write_summary(directory, isolated, concurrent, config=None):
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
         "transport", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
-        "seconds", "graph_calls", "warmup", "seed", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
+        "seconds", "graph_calls", "barrier_per_call", "warmup", "seed", "peer",
+        "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
     metadata["run"] = directory.name
@@ -251,6 +326,8 @@ def write_summary(directory, isolated, concurrent, config=None):
 
     report = ["# 多卡 BatchGet 带宽测试", "", f"结果目录：`{directory.name}`", "",
               "带宽单位为十进制 GB/s；统计持续 ACL Graph 回放至完成的有效数据吞吐。", ""]
+    if config.get("barrier_per_call"):
+        report += ["每轮在 Host 侧同步各卡后发起一次 BatchGet。吞吐计时包含轮间同步等待。", ""]
     if config:
         per_device = config.get("ddr_bytes_per_device",
                                 config["table_capacity"] * config["tokens_per_block"] * config["token_bytes"])
@@ -343,8 +420,10 @@ def main(argv=None):
     parser.add_argument("--aiv-cores", nargs="+", type=int,
                         help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
     parser.add_argument("--seconds", type=float, default=10)
-    parser.add_argument("--graph-calls", type=int, default=256,
-                        help="BatchGet calls per captured graph; replayed continuously during measurement")
+    parser.add_argument("--graph-calls", type=int,
+                        help="BatchGet calls per captured graph (default: 256, or 1 with --barrier-per-call)")
+    parser.add_argument("--barrier-per-call", action="store_true",
+                        help="wait for all devices before each measured BatchGet; requires one call per graph")
     parser.add_argument("--requests", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--table-capacity", type=int, default=4096)
@@ -377,6 +456,10 @@ def main(argv=None):
         parser.error("--aiv-cores requires distinct positive core counts")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
+    if args.graph_calls is None:
+        args.graph_calls = 1 if args.barrier_per_call else 256
+    if args.barrier_per_call and args.graph_calls != 1:
+        parser.error("--barrier-per-call requires --graph-calls 1")
     for name in ("seconds", "graph_calls", "requests", "token_bytes", "table_capacity", "tokens_per_block", "ready_timeout"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
@@ -393,6 +476,7 @@ def main(argv=None):
     config["aiv_cores"] = cores if len(cores) > 1 else cores[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
+          f"barrier_per_call={int(args.barrier_per_call)} graph_calls={args.graph_calls} "
           f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
           f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "

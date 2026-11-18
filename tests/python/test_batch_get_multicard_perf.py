@@ -2,11 +2,13 @@
 """Host checks for multi-card coordination, accounting and graph lifecycle."""
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
 import time
@@ -19,7 +21,7 @@ import test_npu_batch_get_perf as perf
 
 
 FAKE_RUNNER = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import json, os, pathlib, socket, sys, time
 def option(name):
     return sys.argv[sys.argv.index(name) + 1]
 directory = pathlib.Path(option("--contention-control-dir"))
@@ -42,22 +44,46 @@ while not (directory / "start.json").exists():
         (directory / f"cleaned_{device}").touch()
         sys.exit(1)
     time.sleep(0.005)
-assert all((directory / f"ready_{d}").exists() for d in ([0, 1] if directory.name == "concurrent" else [device]))
+devices = os.environ["EXPECTED_DEVICES"].split() if directory.name == "concurrent" else [device]
+assert all((directory / f"ready_{d}").exists() for d in devices)
 window = json.loads((directory / "start.json").read_text())
 # Synthetic results use the coordinator's timestamps; no worker clock is needed.
-time.sleep(window["stop"] - window["start"])
+calls = 100
+if "--contention-barrier-fd" in sys.argv:
+    assert option("--contention-graph-calls") == "1"
+    calls = 0
+    time.sleep(max(0, window["start"] - time.monotonic()))
+    with socket.socket(fileno=int(option("--contention-barrier-fd"))) as barrier:
+        while True:
+            barrier.sendall(b"R")
+            action = barrier.recv(1)
+            if action == b"S":
+                break
+            assert action == b"G"
+            if directory.name == "concurrent" and device == int(os.environ.get("FAIL_BARRIER_DEVICE", "-1")):
+                print("FAKE_BARRIER_DEVICE_ERROR", flush=True)
+                sys.exit(4)
+            if calls:
+                assert all((directory / f"done_{d}_{calls}").exists() for d in devices)
+            time.sleep(0.001 * (device + 1))
+            calls += 1
+            (directory / f"done_{device}_{calls}").touch()
+    assert calls > 0
+else:
+    time.sleep(window["stop"] - window["start"])
 rate = 15 if directory.name == "concurrent" else 30
 elapsed = window["stop"] - window["start"]
 result = dict(device=device, start=window["start"], end=window["stop"],
               bandwidth_GBps=rate, payload_bytes=round(elapsed * rate * 1e9),
-              p50_call_us=90, calls=100, verified=True)
+              p50_call_us=90, calls=calls, verified=True)
 pathlib.Path(option("--contention-result")).write_text(json.dumps(result))
 '''
 
 
 class MulticardTests(unittest.TestCase):
     def run_controller(self, root, fail=None, transport="ubmem", options=(), cores=16,
-                       jettys=2, inflight=2048, expected_transport=None, core_env="16"):
+                       jettys=2, inflight=2048, expected_transport=None, core_env="16",
+                       devices=(0, 1), fail_barrier=None):
         runner = root / "runner"
         runner.write_text(FAKE_RUNNER)
         runner.chmod(0o755)
@@ -65,12 +91,15 @@ class MulticardTests(unittest.TestCase):
                    KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048",
                    KVAF_BATCH_GET_AIV_CORES=core_env,
                    EXPECTED_TRANSPORT=expected_transport or transport, EXPECTED_CORES=str(cores),
-                   EXPECTED_JETTYS=str(jettys), EXPECTED_INFLIGHT=str(inflight))
+                   EXPECTED_JETTYS=str(jettys), EXPECTED_INFLIGHT=str(inflight),
+                   EXPECTED_DEVICES=" ".join(map(str, devices)))
         if fail is not None:
             env["FAIL_DEVICE"] = str(fail)
+        if fail_barrier is not None:
+            env["FAIL_BARRIER_DEVICE"] = str(fail_barrier)
         return subprocess.run([
             str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_multicard_perf.sh"),
-            str(root / "build"), "--devices", "0", "1", "--seconds", "0.05",
+            str(root / "build"), "--devices", *map(str, devices), "--seconds", "0.05",
             "--ready-timeout", "10", "--output", str(root / "results"),
             "--transport", transport,
             *options,
@@ -176,6 +205,55 @@ class MulticardTests(unittest.TestCase):
             self.assertTrue((root / "results/concurrent/cleaned_0").exists())
             self.assertFalse((root / "results/summary.csv").exists())
 
+    def test_eight_workers_finish_the_same_barrier_rounds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, devices=range(8),
+                                         options=("--barrier-per-call", "--seconds", "0.2"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = root / "results"
+            config = json.loads((output / "config.json").read_text())
+            self.assertTrue(config["barrier_per_call"])
+            self.assertEqual(config["graph_calls"], 1)
+            calls = [json.loads((output / "concurrent" / f"device_{device}.json").read_text())["calls"]
+                     for device in range(8)]
+            self.assertGreater(calls[0], 1)
+            self.assertEqual(calls, [calls[0]] * 8)
+            self.assertIn(f"MULTICARD_BARRIER_DONE phase=concurrent rounds={calls[0]}", result.stdout)
+            self.assertIn("吞吐计时包含轮间同步等待", (output / "report.md").read_text())
+
+    def test_failed_barrier_worker_aborts_peers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, fail_barrier=1, options=("--barrier-per-call",))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("device 1", result.stderr)
+            self.assertIn("FAKE_BARRIER_DEVICE_ERROR", result.stderr)
+            self.assertTrue((root / "results/concurrent/abort").exists())
+            self.assertFalse((root / "results/summary.csv").exists())
+
+    def test_worker_waits_before_each_replay_and_until_previous_replay_completes(self):
+        events = []
+        graph = SimpleNamespace(replay=lambda _: events.append("replay"),
+                                synchronize=lambda _: events.append("completed"))
+        controller, worker = socket.socketpair()
+        with controller, worker, ThreadPoolExecutor(max_workers=1) as executor:
+            controller.settimeout(2)
+            outcome = executor.submit(multi.measure_barrier_replays, graph, None, worker.detach())
+            try:
+                for previous_rounds in range(2):
+                    self.assertEqual(controller.recv(1), b"R")
+                    self.assertEqual(events, ["replay", "completed"] * previous_rounds)
+                    controller.sendall(b"G")
+                self.assertEqual(controller.recv(1), b"R")
+                self.assertEqual(events, ["replay", "completed"] * 2)
+                controller.sendall(b"S")
+                begin, end, replays = outcome.result(timeout=2)
+                self.assertLessEqual(begin, end)
+                self.assertEqual(replays, 2)
+            finally:
+                controller.close()
+
     def test_aggregate_uses_shared_wall_time_and_checks_overlap(self):
         def record(device, begin, end):
             return dict(device=device, start=begin, end=end, payload_bytes=10_000_000_000,
@@ -219,7 +297,8 @@ class MulticardTests(unittest.TestCase):
             root = Path(temporary)
             root.joinpath("start.json").write_text(json.dumps({"start": time.monotonic(), "stop": time.monotonic() + 0.1}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
-                                   contention_graph_calls=4, warmup=3, miss_count=4096, token_bytes=656)
+                                   contention_graph_calls=4, contention_barrier_fd=None,
+                                   warmup=3, miss_count=4096, token_bytes=656)
             plans = iter(range(4))
             with patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()):
                 multi.run_worker(SimpleNamespace(AclGraph=Graph), torch, args, lambda: next(plans),

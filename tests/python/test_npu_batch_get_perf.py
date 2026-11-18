@@ -304,6 +304,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-barrier-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.backend_explicit = args.backend is not None
     expected_transport = "ubmem" if args.backend == "ubmem" else "urma"
@@ -390,6 +391,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "contention mode requires a result path, positive graph calls and positive miss-count"
         if args.kernel_profile:
             return "contention mode measures graph throughput and requires --no-kernel-profile"
+    if args.contention_barrier_fd is not None and (
+        args.contention_control_dir is None or args.contention_graph_calls != 1 or args.contention_barrier_fd < 0
+    ):
+        return "per-call barrier requires contention mode, one BatchGet per graph and a valid socket descriptor"
     return None
 
 
