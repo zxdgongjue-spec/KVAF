@@ -242,8 +242,8 @@ Get 方向专用于图。同算法有多个图节点时，状态和 profile 查�
 
 `batch_get(stream=None, synchronize=False)` 默认在 `torch.npu.current_stream()` 上提交。
 同一 stream 的后续操作等待 Get；换 stream 时由调用方建立 event/wait 依赖。
-`drain_get()` 完成在途请求并清理请求引用。普通性能测试可使用 `async-drain`，
-与 main 对齐时使用 `async-wait`，一次同步调用使用 `sync-call`。
+`drain_get()` 完成在途请求并清理请求引用。性能测试默认使用 `async-drain`，
+一次同步调用使用 `sync-call`。
 AIV/UBMEM eager Get 不回读设备状态；ACL 提交与同步失败仍返回错误。
 
 `DIRECT_LOCAL_BUFFER_ACQUIRE_NEW` 记录新 output HBM 注册；排查引用计数时可设置
