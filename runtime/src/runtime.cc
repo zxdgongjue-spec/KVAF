@@ -255,6 +255,13 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     const bool detach_for_cleanup = needs_cleanup_ && execution.scatter_graph == ScatterGraphAction::kDetach;
     if (!initialized_ && !detach_for_cleanup)
       return Status::NotInitialized("Runtime has not been initialized");
+    const auto action = execution.scatter_graph;
+    const bool needs_inputs = action == ScatterGraphAction::kNone ||
+        action == ScatterGraphAction::kCapture || action == ScatterGraphAction::kAttach;
+    const bool needs_stream = action != ScatterGraphAction::kReset && action != ScatterGraphAction::kDetach;
+    if ((needs_inputs && request.indices.device != DeviceKind::kNpu) ||
+        (needs_stream && !execution.stream))
+      return Status::InvalidArgument("trusted BatchGet requires NPU inputs and a valid stream");
     validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
   }

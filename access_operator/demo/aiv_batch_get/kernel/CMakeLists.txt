@@ -37,13 +37,15 @@ foreach(mode scatter gather)
   set(object "${CMAKE_CURRENT_BINARY_DIR}/${stem}_kernels.o")
   set(temporary "${CMAKE_CURRENT_BINARY_DIR}/${stem}.tmp.o")
   set(installed "${KVAF_AIV_DEMO_BIN_DIR}/${stem}_kernels.o")
-  set(scatter_dependencies)
+  set(mode_dependencies)
   if(mode STREQUAL "scatter")
-    list(APPEND scatter_dependencies
+    list(APPEND mode_dependencies
       "${CMAKE_CURRENT_SOURCE_DIR}/scatter_mailbox_kernel.h"
       "${KVAF_SIMT_API_DIR}/simt_api/device_functions.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/scatter_batch_get_profile.h"
       "${KVAF_AIV_COMMON_INCLUDE_DIR}/cpu_push_get_abi.h")
+  elseif(mode STREQUAL "gather")
+    list(APPEND mode_dependencies "${KVAF_AIV_COMMON_INCLUDE_DIR}/gather_prefix_layout.h")
   endif()
   add_custom_command(
     OUTPUT "${object}" "${installed}"
@@ -59,7 +61,7 @@ foreach(mode scatter gather)
             "${KVAF_AIV_DEMO_INCLUDE_DIR}/sequential_batch_get_abi.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/batch_get_kernel_common.h"
             "${KVAF_SIMT_API_DIR}/simt_api/device_atomic_functions.h"
-            ${scatter_dependencies}
+            ${mode_dependencies}
     VERBATIM)
   add_custom_target(${stem}_kernel DEPENDS "${object}" "${installed}")
 endforeach()

@@ -49,6 +49,7 @@ enum { PIPE_S, PIPE_V, PIPE_MTE3, PIPE_MTE2, PIPE_ALL };
 using event_t = uint32_t;
 inline thread_local bool model_events[4][4][3]{};
 inline thread_local uint64_t model_event_fences[4][4][3]{};
+inline thread_local uint64_t model_mte3_fences[4][3]{};
 namespace aiv_model {
 // Defer public DMA copies until their producer event is waited on. DMA-to-DMA
 // waits are queued on the consumer, so Scalar can issue a stage ring ahead.
@@ -124,6 +125,26 @@ struct CopyQueue {
 static thread_local CopyQueue mte2, mte3;
 inline Counter mte2_copies, mte3_copies;
 inline Counter payload_cache_lines;
+struct RawCopy {
+  uint8_t* destination;
+  const uint8_t* source;
+  std::vector<uint8_t> snapshot;
+};
+inline thread_local std::deque<RawCopy> raw_copies;
+inline thread_local uint64_t raw_submitted{}, raw_completed{};
+inline Counter vf_calls, vf_with_pending_mte3;
+inline void FinishRawCopies(uint64_t fence) {
+  while (raw_completed < fence) {
+    if (raw_copies.empty()) std::abort();
+    const auto& copy = raw_copies.front();
+    // UB can be reused after MTE3, not while a queued DMA still reads it.
+    if (std::memcmp(copy.source, copy.snapshot.data(), copy.snapshot.size())) std::abort();
+    std::memcpy(copy.destination, copy.source, copy.snapshot.size());
+    raw_copies.pop_front();
+    ++raw_completed;
+  }
+}
+inline Counter ub_to_out_config_writes;
 // Optional exact source interval for tests: a padded UB tail must never cause
 // a read outside the requested GM token, even if the allocation has slack.
 inline thread_local uintptr_t mte2_source_begin{}, mte2_source_end{};
@@ -153,6 +174,7 @@ inline void set_flag(int source, int target, event_t event) {
   // on the other bank. Waiting for bank 0 must not prematurely drain bank 1.
   model_event_fences[source][target][event] = source == PIPE_MTE2 ? aiv_model::mte2.submitted :
       source == PIPE_MTE3 ? aiv_model::mte3.submitted : 0;
+  if (source == PIPE_MTE3) model_mte3_fences[target][event] = aiv_model::raw_submitted;
 }
 inline void wait_flag(int source, int target, event_t event) {
   if (!model_events[source][target][event]) std::abort();
@@ -161,16 +183,18 @@ inline void wait_flag(int source, int target, event_t event) {
   if (source == PIPE_MTE2 && target == PIPE_MTE3) {
     aiv_model::mte3.Wait(aiv_model::mte2, fence); return;
   }
+  if (source == PIPE_MTE3)
+    aiv_model::FinishRawCopies(model_mte3_fences[target][event]);
   if (source == PIPE_MTE3 && target == PIPE_MTE2) {
     aiv_model::mte2.Wait(aiv_model::mte3, fence); return;
   }
   if (source == PIPE_MTE2) aiv_model::mte2.FinishThrough(fence);
   if (source == PIPE_MTE3) aiv_model::mte3.FinishThrough(fence);
 }
-inline void set_loop_size_ubtoout(uint64_t) {}
-inline void set_loop1_stride_ubtoout(uint64_t) {}
-inline void set_loop2_stride_ubtoout(uint64_t) {}
-inline void set_atomic_none() {}
+inline void set_loop_size_ubtoout(uint64_t) { ++aiv_model::ub_to_out_config_writes; }
+inline void set_loop1_stride_ubtoout(uint64_t) { ++aiv_model::ub_to_out_config_writes; }
+inline void set_loop2_stride_ubtoout(uint64_t) { ++aiv_model::ub_to_out_config_writes; }
+inline void set_atomic_none() { ++aiv_model::ub_to_out_config_writes; }
 inline uintptr_t get_imm(uint32_t offset) {
   return reinterpret_cast<uintptr_t>(aiv_model::ub + offset);
 }
@@ -179,7 +203,13 @@ template <class T> inline T asc_ldcg(T* source) {
   return *source;
 }
 inline void copy_ubuf_to_gm_align_v2(float* dst, float* src, uint64_t config, uint64_t) {
-  std::memcpy(dst, src, config >> 25U);
+  const auto bytes = config >> 25U;
+  const auto* source = reinterpret_cast<const uint8_t*>(src);
+  if (!bytes || bytes % 64 || source < aiv_model::ub ||
+      source + bytes > aiv_model::ub + sizeof(aiv_model::ub)) std::abort();
+  aiv_model::raw_copies.push_back({reinterpret_cast<uint8_t*>(dst), source,
+                                 std::vector<uint8_t>(source, source + bytes)});
+  ++aiv_model::raw_submitted;
 }
 inline void st_dev(uint32_t value, uint32_t* address, int) {
   aiv_model::Doorbell(value, address);
@@ -193,6 +223,7 @@ template <int pipe> inline void PipeBarrier() {
       for (bool pending : direction) if (pending) std::abort();
   aiv_model::mte2.Finish();
   aiv_model::mte3.Finish();
+  aiv_model::FinishRawCopies(aiv_model::raw_submitted);
 }
 inline uint32_t GetBlockIdx() { return aiv_model::core; }
 inline uint64_t GetSystemCycle() { return ++aiv_model::cycle; }
@@ -317,6 +348,8 @@ namespace Simt {
 struct Dim3 { uint32_t x, y, z; };
 template <auto Function, typename... Args>
 void VF_CALL(Dim3 dim, Args... args) {
+  ++aiv_model::vf_calls;
+  if (!aiv_model::raw_copies.empty()) ++aiv_model::vf_with_pending_mte3;
   for (threadIdx.x = 0; threadIdx.x < dim.x; ++threadIdx.x) Function(args...);
 }
 }  // namespace Simt

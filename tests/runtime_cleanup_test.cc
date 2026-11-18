@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "batch_get_profile.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -13,6 +14,9 @@ using namespace kvaf;
 struct Operator final : AccessOperator {
   bool fail_initialize{false}, fail_shutdown{false};
   int shutdown_calls{0};
+  int get_calls{0};
+  const BatchGetRequest* last_request{};
+  BatchGetExecutionOptions last_execution;
   Status Initialize(const RemoteRegionDesc&) override {
     return fail_initialize ? Status::Internal("initialize failed") : Status::OK();
   }
@@ -20,7 +24,12 @@ struct Operator final : AccessOperator {
     ++shutdown_calls;
     return fail_shutdown ? Status::Internal("drain failed") : Status::OK();
   }
-  Status ExecuteBatchGet(const BatchGetExecRequest&) override { return Status::OK(); }
+  Status ExecuteBatchGet(const BatchGetExecRequest& exec) override {
+    ++get_calls;
+    last_request = exec.request;
+    last_execution = exec.execution;
+    return Status::OK();
+  }
   Status ExecuteBatchPut(const BatchPutExecRequest&) override { return Status::OK(); }
 };
 
@@ -105,11 +114,84 @@ void CheckPartialInitializationRetry() {
   }
   CHECK(!allocator.allocated && allocator.release_calls == 2);
 }
+
+void CheckTrustedNpuDispatch() {
+  auto meta = CreateInMemoryMetaManager();
+  Operator op;
+  Allocator allocator;
+  RuntimeCore runtime(*meta, op, allocator);
+  BatchGetRequest request;
+  request.access_table.opaque = 123;  // Trusted NPU tables come from device metadata.
+  request.indices.device = DeviceKind::kNpu;
+  BatchGetProfile profile;
+  BatchGetExecutionOptions execution;
+  execution.stream = reinterpret_cast<void*>(1);
+  execution.synchronize = true;
+  execution.profile = &profile;
+  execution.trusted_npu_request = true;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kNotInitialized);
+  CHECK(runtime.Initialize({128, 64, DeviceKind::kCpu}).ok());
+  execution.stream = nullptr;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
+  execution.stream = reinterpret_cast<void*>(1);
+  request.indices.device = DeviceKind::kCpu;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
+  CHECK(op.get_calls == 0);
+  request.indices.device = DeviceKind::kNpu;
+  CHECK(runtime.BatchGet(request, execution).ok());
+  CHECK(op.get_calls == 1 && op.last_request == &request);
+  CHECK(op.last_execution.stream == execution.stream && op.last_execution.synchronize);
+  CHECK(op.last_execution.profile == &profile && op.last_execution.trusted_npu_request);
+  execution.trusted_npu_request = false;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kNotFound);
+  CHECK(op.get_calls == 1);
+  CHECK(runtime.Shutdown().ok());
+}
+
+void CheckScatterGraphControlDispatch() {
+  auto meta = CreateInMemoryMetaManager();
+  Operator op;
+  Allocator allocator;
+  RuntimeCore runtime(*meta, op, allocator);
+  CHECK(runtime.Initialize({128, 64, DeviceKind::kCpu}).ok());
+  BatchGetRequest request;
+  BatchGetExecutionOptions execution;
+  execution.trusted_npu_request = true;
+  execution.stream = reinterpret_cast<void*>(1);
+  for (const auto action : {ScatterGraphAction::kCapture, ScatterGraphAction::kAttach}) {
+    execution.scatter_graph = action;
+    CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
+  }
+  // Replay checks and graph cleanup carry no input tensors. The owner checks
+  // their graph/stream identity; only capture and payload launches need inputs.
+  execution.scatter_graph = ScatterGraphAction::kCheck;
+  execution.stream = nullptr;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kInvalidArgument);
+  execution.stream = reinterpret_cast<void*>(1);
+  CHECK(runtime.BatchGet(request, execution).ok());
+  execution.stream = nullptr;
+  for (const auto action : {ScatterGraphAction::kReset, ScatterGraphAction::kDetach}) {
+    execution.scatter_graph = action;
+    CHECK(runtime.BatchGet(request, execution).ok());
+    CHECK(op.last_execution.scatter_graph == action);
+  }
+  CHECK(op.get_calls == 3);
+  op.fail_shutdown = true;
+  CHECK(!runtime.Shutdown().ok() && runtime.needs_cleanup());
+  execution.scatter_graph = ScatterGraphAction::kDetach;
+  CHECK(runtime.BatchGet(request, execution).ok());
+  execution.scatter_graph = ScatterGraphAction::kReset;
+  CHECK(runtime.BatchGet(request, execution).code() == StatusCode::kNotInitialized);
+  op.fail_shutdown = false;
+  CHECK(runtime.Shutdown().ok());
+}
 }  // namespace
 
 int main() {
   CheckDrainFailurePreservesTable();
   CheckReleaseRetry();
   CheckPartialInitializationRetry();
+  CheckTrustedNpuDispatch();
+  CheckScatterGraphControlDispatch();
   std::cout << "Runtime cleanup ordering and retry tests passed\n";
 }

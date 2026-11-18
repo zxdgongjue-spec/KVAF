@@ -1,5 +1,9 @@
 # AIV BatchGet 第一阶段实现与验证
 
+Gather 当前实现与配置见 [Gather 实现与配置](aiv_gather_prepared_prefix.md)，
+性能与排障见 [Gather 性能与排障](aiv_gather_serial_profile.md)。
+部署使用最新 Gather V10 / args 256 B，并同步更新 CPU 服务、NPU Host 和 kernel。
+
 ## 数据通路
 
 默认 BatchGet 模式为 `direct_read`。总体设计见
@@ -8,7 +12,7 @@
 | 模式 | 执行顺序 |
 | --- | --- |
 | `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 多条 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
-| `gather_read` | AIV WRITE 清单、command、notify → CPU gather → 最终 ACK → AIV 多 SGE READ 到 output → CQ 完成 |
+| `gather_read` | AIV 流式发布清单、command、notify → CPU 按连续前缀 gather → AIV 随 ready prefix 提交多 SGE READ → 最终 ACK 与 CQ 完成 |
 
 Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 后，CPU 省略
 分片 Ready，AIV 等到整批 done 成功再开始搬运。两种模式下，可信请求超过 1024 个有效行时，
@@ -17,7 +21,8 @@ N 端可用 `--overlap-head-cq 1`（`KVAF_SCATTER_OVERLAP_HEAD_CQ=1`）让 core 
 WRITE 在途时构造剩余清单。首段 CQE 成功后才发布后缀。默认值 `0` 先等首段 CQE，
 再构造剩余清单。对照时固定 gather、Jetty cursor 和请求分布，比较 AIV 墙钟、
 CPU `WriteBatch`、`suffix_wait_ns` 及端到端延迟。
-Gather 使用 `pipeline_chunk_bytes=0`，以最终 ACK 为完成条件。
+Gather 默认使用 128 KiB byte-prefix；可信输入超过每核 1024 行时，在首段清单发布后通知 CPU，
+剩余清单通过 suffix 通知完成。`KVAF_AIV_GATHER_CHUNK_BYTES=0` 保留整批 ACK 对照。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
 在 `pipeline=1` 下，设置 `KVAF_SCATTER_JETTY_CURSORS=1` 或为性能脚本传入
@@ -69,9 +74,9 @@ GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 | --- | --- | --- |
 | Host owner | `host/scatter_batch_get.cpp` | `host/gather_batch_get.cpp` |
 | Loader | `host/execute_scatter_batch_get_loader.cpp` | `host/execute_gather_batch_get_loader.cpp` |
-| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，216 B |
+| 参数 ABI | `include/scatter_batch_get_abi.h`，176 B | `include/gather_batch_get_abi.h`，256 B |
 | AIV 源码 | `kernel/execute_scatter_batch_get_aiv.asc` | `kernel/execute_gather_batch_get_aiv.asc` |
-| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV1` |
+| Symbol | `KvafScatterBatchGetAivKernelV1` | `KvafGatherBatchGetAivKernelV10` |
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
@@ -130,7 +135,8 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
 - 同一 Runtime 复用 workspace，下一次 Get/Put 先 drain 上一批；
   `synchronize=False` 只表示入队成功，Tensor 和 stream 必须存活到执行完成。
-- Host 在 Drain/Shutdown 检查设备状态。执行失败后拒绝继续提交；无法确认 DMA
+- Scatter 在 Drain/Shutdown 检查设备状态；Gather 默认在同步调用或关闭时检查状态，
+  异步逐批检查可通过 `KVAF_AIV_GATHER_CHECK_STATUS=1` 启用。执行失败后拒绝继续提交；无法确认 DMA
   停止时保留注册资源，允许重试关闭。错误输出不能作为有效结果消费。
 - done 轮询有次数上限，loader 的 kernel 超时为 180 秒；轮询次数不是毫秒。
 - Scatter HBM workspace 按最大 65536 请求配置，包括 `65536 * token_bytes` staging、
@@ -391,3 +397,28 @@ python tests/python/test_aiv_scatter_perf.py --input-mode steady --plans 1 \
 从 trace 比较 `suffix_seen → gather_ready`、`gather_ready → post_begin`、`post_return → cqe_seen`。
 用脚本的无 profiling 阶段对比端到端 P50/P90，从 profiled CSV 选取未记录 Jetty 时间戳的样本比较
 `cpu_comm_us` 与 `cpu_write_us`。
+
+## Gather 合并接口与回归
+
+构造参数保留公共 Runtime 的位置参数契约（包括 `transport`）；`aicpu_batch_get_mode`、
+`aiv_batch_get_mode`、`aiv_gather_sgl_size` 和 `trusted_gather_inputs` 使用关键字。
+Gather SGL 范围为 1～6。`trusted_gather_inputs=True` 为默认快速路径，调用方负责正确的
+Tensor dtype、连续布局、索引、唯一输出行、生命周期和 eager stream；设为 False 使用带校验路径。
+普通 Gather 每次重新读取 Tensor 指针和当前 stream，不缓存跨调用的存储地址。
+
+```python
+runtime = kvaf.NpuRuntime(
+    get_kernel_path, 656, 128,
+    batch_put_kernel_object_path=put_kernel_path,
+    transport="urma", aiv_batch_get_mode="gather_read",
+    aiv_gather_sgl_size=6, trusted_gather_inputs=True,
+)
+```
+
+Scatter 的 `prepare_scatter_batch_get`、profiling 和已有 `batch_get(profile=False)` 接口保留。
+`profile=True` 仍只用于 AICPU 且要求同步；Gather 使用独立的
+`start_gather_batch_get_profile` / `gather_batch_get_profile` / `stop_gather_batch_get_profile`。
+
+正确性回归使用 `test_aiv_gather_batch_get.py`，建议覆盖 1/3/8 核以及 SGL 1/5/6。
+性能脚本 `test_aiv_gather_batch_get_perf.py` 保留最新 NPU source buffer 复用、128 entries
+批量填表、分阶段初始化日志和独立计时样本；具体环境及输出见 Gather 文档。

@@ -1,5 +1,38 @@
 #pragma once
 #include "sequential_batch_get_abi.h"
+#include "gather_prefix_layout.h"
+
+constexpr uint64_t KVAF_GATHER_PROFILE_MAGIC = 0x4b56414750524635ULL;
+// A completed successful profile has all seven boundary timestamps. On error,
+// only the boundaries reached by this launch are marked valid.
+constexpr uint64_t KVAF_GATHER_PROFILE_ALL_EVENTS = 0x7f;
+struct alignas(64) KvafGatherBatchGetCoreProfile {
+  uint64_t magic, sequence, result, valid_mask;
+  uint64_t kernel_start_cycle, input_done_cycle, descriptor_done_cycle;
+  uint64_t notify_done_cycle, ack_done_cycle, read_done_cycle, kernel_finish_cycle;
+  uint64_t requests, data_wrs, ack_queries, data_wqebbs, data_doorbells;
+  uint64_t data_cq_wait_cycles, read_build_cycles;
+  // CPU progress and data submissions overlap in chunk mode. Event cycles use
+  // the AIV clock; first_read_ready_bytes is the progress snapshot at submission
+  // as a contiguous prefix in GDR2/GDR4/GDR5/GDR6.
+  uint64_t first_ready_cycle, first_read_submit_cycle, first_read_ready_bytes;
+  uint64_t ready_queries, ready_wait_cycles, pipeline_chunk_bytes;
+  uint64_t read_vf_calls;
+  // Preparation is allowed before remote readiness, execution is not.
+  uint64_t prepare_ahead, cooperative_chunks, prepare_ahead_wrs, prepare_ahead_cycles;
+};
+static_assert(sizeof(KvafGatherBatchGetCoreProfile) == 256);
+
+enum KvafGatherProbe : uint32_t {
+  KVAF_GATHER_PROBE_NONE = 0, KVAF_GATHER_PROBE_ACK = 1,
+  KVAF_GATHER_PROBE_WQE = 2, KVAF_GATHER_PROBE_SQ = 3,
+  KVAF_GATHER_PROBE_FIRST_READ = 4,
+};
+constexpr uint32_t KVAF_GATHER_WRS_PER_POST = 128;
+enum : uint64_t {
+  KVAF_GATHER_AFTER_ACK = 20, KVAF_GATHER_AFTER_WQE = 21,
+  KVAF_GATHER_AFTER_SQ = 22, KVAF_GATHER_AFTER_FIRST_READ = 23,
+};
 
 struct KvafGatherBatchGetArgs {
   KvafExecuteBatchGetKernelArgs request;
@@ -8,8 +41,27 @@ struct KvafGatherBatchGetArgs {
   uint64_t remote_staging, remote_descriptor, remote_control;
   uint64_t source_base, source_bytes, sequence;
   uint32_t sgl_size, max_polls;
+  // Optional independent per-core profile array. Zero incurs no clock reads.
+  uint64_t profile;
+  // Optional prefix diagnostics. V3 prevents older kernels from silently
+  // ignoring a requested checkpoint. Zero preserves normal execution.
+  uint32_t probe;
+  // Experimental: one SGE per logical READ. The caller must supply consecutive
+  // output rows within each sgl_size group; token_bytes * sgl_size <= 65536.
+  // Reuses V3's zero-only reserved word: old kernels reject an enabled flag.
+  uint32_t coalesce_sges;
+  // Zero: whole-batch ACK before READ. Nonzero: contiguous prefix granularity.
+  uint32_t pipeline_chunk_bytes;
+  uint32_t prepare_ahead;
+  // Zero retains the existing CPU schedule. 2/4/8/16/32 select cooperative prefixes.
+  uint32_t cooperative_chunks;
+  // Zero preserves equal chunks. >=2 selects GDR6: first payload/divisor, then
+  // cooperative_chunks equal tails (1..32). Formerly a zero-only reserved word.
+  uint32_t first_chunk_divisor;
+  // Trusted requests may notify the CPU before the descriptor suffix is ready.
+  uint32_t head_start;
 };
-static_assert(sizeof(KvafGatherBatchGetArgs) == 216);
+static_assert(sizeof(KvafGatherBatchGetArgs) == 256);
 
 // Device-friendly subset of the shared CPU gather wire protocol.
 struct KvafSequentialGatherHeader {

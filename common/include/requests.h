@@ -104,8 +104,9 @@ struct BatchGetExecutionOptions {
   bool synchronize{false};
   // Optional AICPU stage timings; requires synchronize=true.
   BatchGetProfile* profile{nullptr};
-  // AIV Scatter caller guarantees live contiguous device tensors, valid
-  // source indices and offsets, and unique output rows.
+  // Scatter/Gather callers guarantee live contiguous, correctly typed NPU
+  // tensors, valid indices/offsets, unique output rows and a valid stream.
+  // Gather uses eager submission; Scatter capture uses scatter_graph actions.
   bool trusted_npu_request{false};
   ScatterGraphAction scatter_graph{ScatterGraphAction::kNone};
 };

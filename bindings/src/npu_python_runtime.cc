@@ -60,40 +60,45 @@ struct NpuTensorView {
   void* data{nullptr};
   std::size_t bytes{0};
   std::size_t element_bytes{0};
-  std::vector<py::ssize_t> shape;
+  std::size_t dimensions{0};
+  py::ssize_t first_dimension{0};
 };
 
 NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
-  if (!py::hasattr(tensor, "data_ptr") || !py::hasattr(tensor, "numel") ||
-      !py::hasattr(tensor, "element_size") ||
-      !py::hasattr(tensor, "is_contiguous") ||
-      !py::hasattr(tensor, "device") || !py::hasattr(tensor, "shape")) {
-    throw py::type_error(std::string(name) + " must be a contiguous NPU Tensor");
+  // Read metadata once. A hasattr preflight repeats six Python attribute
+  // lookups per Tensor; it neither validates their values nor freezes storage.
+  try {
+    if (!tensor.attr("is_contiguous")().cast<bool>()) {
+      throw py::value_error(std::string(name) + " must be contiguous");
+    }
+    const std::string device = py::str(tensor.attr("device")).cast<std::string>();
+    if (device.rfind("npu", 0) != 0) {
+      throw py::value_error(std::string(name) + " must reside on an NPU");
+    }
+    const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
+    const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
+    const std::uint64_t element_bytes =
+        tensor.attr("element_size")().cast<std::uint64_t>();
+    if (pointer == 0 || elements == 0 || element_bytes == 0 ||
+        elements > std::numeric_limits<std::size_t>::max() ||
+        element_bytes > std::numeric_limits<std::size_t>::max() ||
+        static_cast<std::size_t>(elements) >
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(element_bytes)) {
+      throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
+    }
+    const py::sequence shape = tensor.attr("shape");
+    const auto dimensions = shape.size();
+    return NpuTensorView{
+        PointerFromValue(pointer),
+        static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
+        static_cast<std::size_t>(element_bytes),
+        dimensions, dimensions ? shape[0].cast<py::ssize_t>() : 0};
+  } catch (const py::error_already_set& error) {
+    if (error.matches(PyExc_AttributeError))
+      throw py::type_error(std::string(name) + " must be a contiguous NPU Tensor");
+    throw;
   }
-  if (!tensor.attr("is_contiguous")().cast<bool>()) {
-    throw py::value_error(std::string(name) + " must be contiguous");
-  }
-  const std::string device = py::str(tensor.attr("device")).cast<std::string>();
-  if (device.rfind("npu", 0) != 0) {
-    throw py::value_error(std::string(name) + " must reside on an NPU");
-  }
-  const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
-  const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
-  const std::uint64_t element_bytes =
-      tensor.attr("element_size")().cast<std::uint64_t>();
-  if (pointer == 0 || elements == 0 || element_bytes == 0 ||
-      elements > std::numeric_limits<std::size_t>::max() ||
-      element_bytes > std::numeric_limits<std::size_t>::max() ||
-      static_cast<std::size_t>(elements) >
-          std::numeric_limits<std::size_t>::max() /
-              static_cast<std::size_t>(element_bytes)) {
-    throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
-  }
-  return NpuTensorView{
-      PointerFromValue(pointer),
-      static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
-      static_cast<std::size_t>(element_bytes),
-      tensor.attr("shape").cast<std::vector<py::ssize_t>>()};
 }
 
 // Reuse method-name objects and use CPython's method vectorcall, avoiding an
@@ -144,7 +149,7 @@ struct TensorMetadataMethods {
   }
 };
 
-BatchGetRequest TrustedScatterRequest(
+BatchGetRequest TrustedNpuRequest(
     const AccessTableHandle& table, const py::object& addresses,
     const py::object& valid, const py::object& indices, const py::object& offsets,
     const py::object& miss_count, const py::object& output_indices,
@@ -166,6 +171,26 @@ BatchGetRequest TrustedScatterRequest(
       token_bytes, tokens_per_block,
       {{methods.Pointer(addresses), entries * sizeof(Address), DeviceKind::kNpu},
        {methods.Pointer(valid), entries, DeviceKind::kNpu}}};
+}
+
+BatchGetRequest TrustedGatherRequest(
+    const AccessTableHandle& table, const py::object& addresses,
+    const py::object& valid, const py::object& indices, const py::object& offsets,
+    const py::object& miss_count, const py::object& output_indices,
+    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block,
+    const TensorMetadataMethods& methods) {
+  return TrustedNpuRequest(table, addresses, valid, indices, offsets, miss_count,
+      output_indices, output, token_bytes, tokens_per_block, methods);
+}
+
+BatchGetRequest TrustedScatterRequest(
+    const AccessTableHandle& table, const py::object& addresses,
+    const py::object& valid, const py::object& indices, const py::object& offsets,
+    const py::object& miss_count, const py::object& output_indices,
+    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block,
+    const TensorMetadataMethods& methods) {
+  return TrustedNpuRequest(table, addresses, valid, indices, offsets, miss_count,
+      output_indices, output, token_bytes, tokens_per_block, methods);
 }
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
@@ -354,7 +379,8 @@ class NpuPythonRuntime final {
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
                    const std::string& transport, std::string aicpu_batch_get_mode,
-                   std::string aiv_batch_get_mode, std::uint32_t aiv_gather_sgl_size) {
+                   std::string aiv_batch_get_mode, std::uint32_t aiv_gather_sgl_size,
+                   bool trusted_gather_inputs) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -367,7 +393,8 @@ class NpuPythonRuntime final {
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
     trusted_scatter_inputs_ = aiv_batch_get_mode == "cpu_push_scatter";
-    if (trusted_scatter_inputs_) tensor_methods_.emplace();
+    trusted_gather_inputs_ = aiv_batch_get_mode == "gather_read" && trusted_gather_inputs;
+    if (trusted_scatter_inputs_ || trusted_gather_inputs_) tensor_methods_.emplace();
     options.aiv_batch_get_mode = std::move(aiv_batch_get_mode);
     options.aiv_gather_sgl_size = aiv_gather_sgl_size;
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
@@ -624,6 +651,66 @@ class NpuPythonRuntime final {
     return result;
   }
 
+  void StartGatherBatchGetProfile() {
+    ThrowIfError(native_->SetGatherBatchGetProfiling(true));
+  }
+
+  py::dict GatherBatchGetProfileSnapshot() const {
+    kvaf::GatherBatchGetProfile profile;
+    ThrowIfError(native_->CopyGatherBatchGetProfile(&profile));
+    py::dict host;
+    host["prepare_ns"] = profile.prepare_ns;
+    host["launch_ns"] = profile.launch_ns;
+    host["status_enqueue_ns"] = profile.status_enqueue_ns;
+    host["wait_ns"] = profile.wait_ns;
+    host["finish_ns"] = profile.finish_ns;
+    host["total_ns"] = profile.total_ns;
+    py::list cores;
+    for (std::size_t core = 0; core < profile.cores.size(); ++core) {
+      const auto& p = profile.cores[core];
+      py::dict item;
+      item["core"] = core;
+      item["sequence"] = p.sequence;
+      item["kernel_start_cycle"] = p.kernel_start_cycle;
+      item["input_done_cycle"] = p.input_done_cycle;
+      item["descriptor_done_cycle"] = p.descriptor_done_cycle;
+      item["notify_done_cycle"] = p.notify_done_cycle;
+      item["ack_done_cycle"] = p.ack_done_cycle;
+      item["read_done_cycle"] = p.read_done_cycle;
+      item["kernel_finish_cycle"] = p.kernel_finish_cycle;
+      item["requests"] = p.requests;
+      item["data_wrs"] = p.data_wrs;
+      item["ack_queries"] = p.ack_queries;
+      item["data_wqebbs"] = p.data_wqebbs;
+      item["data_doorbells"] = p.data_doorbells;
+      item["data_cq_wait_cycles"] = p.data_cq_wait_cycles;
+      item["read_build_cycles"] = p.read_build_cycles;
+      item["first_ready_cycle"] = p.first_ready_cycle;
+      item["first_read_submit_cycle"] = p.first_read_submit_cycle;
+      item["first_read_ready_bytes"] = p.first_read_ready_bytes;
+      item["ready_queries"] = p.ready_queries;
+      item["ready_wait_cycles"] = p.ready_wait_cycles;
+      item["pipeline_chunk_bytes"] = p.pipeline_chunk_bytes;
+      item["read_vf_calls"] = p.read_vf_calls;
+      item["prepare_ahead"] = p.prepare_ahead;
+      item["cooperative_chunks"] = p.cooperative_chunks;
+      item["prepare_ahead_wrs"] = p.prepare_ahead_wrs;
+      item["prepare_ahead_cycles"] = p.prepare_ahead_cycles;
+      cores.append(std::move(item));
+    }
+    py::dict result;
+    result["sequence"] = profile.sequence;
+    result["host"] = std::move(host);
+    result["cores"] = std::move(cores);
+    return result;
+  }
+
+  void StopGatherBatchGetProfile() {
+    // Disabling also works before the first sample or after a failed launch.
+    // Snapshot remains explicit so stopping never hides the original error.
+    ThrowIfError(native_->SetGatherBatchGetProfiling(false));
+  }
+
   // Tensor ownership remains with Python. KVAF creates no output Tensor and
   // only retains its internal Direct-HCCP execution state; callers must keep
   // input/output Tensors and either the DeviceAccessTable or the direct
@@ -796,6 +883,18 @@ class NpuPythonRuntime final {
       return py::none();
     }
 
+    if (trusted_gather_inputs_) {
+      const auto request = TrustedGatherRequest(access_table, addresses, valid, indices, offsets,
+          miss_count, output_indices, output, native_->batch_get_token_bytes(),
+          native_->batch_get_tokens_per_block(), *tensor_methods_);
+      BatchGetExecutionOptions execution;
+      execution.stream = tensor_methods_->Stream(stream);
+      execution.synchronize = synchronize;
+      execution.trusted_npu_request = true;
+      ThrowIfError(native_->core().BatchGet(request, execution));
+      return py::none();
+    }
+
     const auto begin = profile ? BatchGetProfileNowNs() : 0U;
     const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
     const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
@@ -806,8 +905,8 @@ class NpuPythonRuntime final {
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
-    if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
-        output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
+    if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
+        output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
         offset_view.element_bytes != sizeof(std::int32_t) ||
         output_index_view.element_bytes != sizeof(std::int32_t) ||
@@ -818,12 +917,12 @@ class NpuPythonRuntime final {
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
-        output_view.shape.front() <= 0 ||
-        output_view.bytes % static_cast<std::size_t>(output_view.shape.front()) != 0) {
+        output_view.first_dimension <= 0 ||
+        output_view.bytes % static_cast<std::size_t>(output_view.first_dimension) != 0) {
       throw py::value_error("BatchGet Tensors do not satisfy the NPU layout contract");
     }
     const std::uint64_t output_rows =
-        static_cast<std::uint64_t>(output_view.shape.front());
+        static_cast<std::uint64_t>(output_view.first_dimension);
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
     if (output_block_bytes != native_->batch_get_token_bytes()) {
       throw py::value_error(
@@ -898,6 +997,7 @@ class NpuPythonRuntime final {
   bool host_profile_enabled_{false}, host_profile_ready_{false};
   scatter_host::Profile host_profile_{};
   bool aicpu_backend_{false};
+  bool trusted_gather_inputs_{false};
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
@@ -986,6 +1086,15 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Synchronize and validate one caller-managed replay, including all captured Scatter nodes.")
       .def("detach_scatter_batch_get_graph", &NpuPythonRuntime::DetachScatterGraph,
            "Release a caller-managed Scatter attachment after the caller destroys its graph.")
+      .def("start_gather_batch_get_profile",
+           &NpuPythonRuntime::StartGatherBatchGetProfile,
+           "Enable serial gather Host and per-core AIV timelines; use synchronize=True.")
+      .def("gather_batch_get_profile",
+           &NpuPythonRuntime::GatherBatchGetProfileSnapshot,
+           "Read the latest successful synchronous gather profile (Host ns, AIV cycles).")
+      .def("stop_gather_batch_get_profile",
+           &NpuPythonRuntime::StopGatherBatchGetProfile,
+           "Disable gather profiling; reading snapshots is explicit.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"),

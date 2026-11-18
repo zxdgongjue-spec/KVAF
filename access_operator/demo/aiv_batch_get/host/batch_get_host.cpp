@@ -17,6 +17,7 @@
 #include "direct_hccp/direct_hccp_abi.h"
 #include "direct_hccp/direct_hccp_remote_transport.h"
 #include "direct_hccp/direct_hccp_session.h"
+#include "peer_link.h"
 
 namespace hccp = kvaf::direct_hccp;
 

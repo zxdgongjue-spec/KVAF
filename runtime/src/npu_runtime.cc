@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "batch_get_abi.h"
+#include "sequential_batch_get_abi.h"
 #include "access_operator.h"
 #include "ubmem/access_operator.h"
 #include "ubmem_allocator.h"
@@ -1013,6 +1014,24 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
     return impl_->urma_operator->CopyBatchGetKernelProfiles(profiles);
 #endif
   return Status::NotImplemented("Use BatchGet profile=True for AICPU stage timings");
+}
+
+Status NpuRuntime::SetGatherBatchGetProfiling(bool enabled) {
+  if (!impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime requires LinkTo before configuring gather profiling");
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->urma_operator) return impl_->urma_operator->SetGatherBatchGetProfiling(enabled);
+#endif
+  return Status::NotImplemented("gather profiling requires linked AIV gather_read");
+}
+
+Status NpuRuntime::CopyGatherBatchGetProfile(GatherBatchGetProfile* profile) const {
+  if (!impl_->access_operator)
+    return Status::NotInitialized("NpuRuntime requires LinkTo before reading gather profiling");
+#if defined(KVAF_ENABLE_AIV_BATCH_GET)
+  if (impl_->urma_operator) return impl_->urma_operator->CopyGatherBatchGetProfile(profile);
+#endif
+  return Status::NotImplemented("gather profiling requires linked AIV gather_read");
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {

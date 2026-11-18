@@ -1,57 +1,53 @@
-#!/usr/bin/env python3
-"""Hardware regression for stage 1; opt in with KVAF_RUN_NPU_TESTS=1.
-
-Both peers and the AIV kernel must be rebuilt from this branch. See
-docs/aiv_batch_get_stage1.md for build and environment examples.
-"""
+"""Shared implementation of the standalone Gather/Scatter hardware regressions."""
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import sys
 
-def kernel_paths(mode: str) -> tuple[str, str]:
-    paths = {}
-    errors = []
-    for name in ("KVAF_BATCH_GET_KERNEL", "KVAF_BATCH_PUT_KERNEL"):
-        value = os.environ.get(name, "")
-        if not value:
-            errors.append(f"{name} is not set")
-            continue
-        path = Path(value).expanduser().resolve()
-        if name == "KVAF_BATCH_GET_KERNEL":
-            filename = "kvaf_scatter_batch_get_kernels.o" if mode == "cpu_push_scatter" else "kvaf_gather_batch_get_kernels.o"
-            if path.name in ("kvaf_execute_batch_get_kernels.o", "kvaf_sequential_batch_get_kernels.o"):
-                path = path.with_name(filename)
-            elif path.name in ("kvaf_scatter_batch_get_kernels.o", "kvaf_gather_batch_get_kernels.o") and path.name != filename:
-                errors.append(f"{mode} requires {filename}, got {path.name}")
-        paths[name] = path
-        if not path.is_file():
-            errors.append(f"{name} does not name an existing file for {mode}: {path}")
-    if errors:
-        raise ValueError("\n".join(errors) +
-                         "\nBuild with cmake --build build-npu -j, then point the kernel "
-                         "variables to the .o files in build-npu/bin/.")
-    return str(paths["KVAF_BATCH_GET_KERNEL"]), str(paths["KVAF_BATCH_PUT_KERNEL"])
+from aiv_batch_get_common import kernel_paths, shutdown_runtime
 
 
-def shutdown_runtime(runtime) -> None:
-    """Retain a test failure when device/transport teardown fails as well."""
-    original = sys.exc_info()[1]
-    if runtime.initialized:
-        try:
-            runtime.shutdown()
-        except Exception as error:
-            if original is None:
-                raise
-            print(f"[KVAF_TEST] shutdown also failed; preserving original exception: {error}",
-                  file=sys.stderr, flush=True)
+def expect_gather_probe(call, stage: str, *, requests: int, data_wrs: int) -> None:
+    marker = f"[KVAF_AIV_GATHER_PROBE_COMPLETE] stage={stage} "
+    try:
+        call()
+    except RuntimeError as error:
+        if not str(error).startswith(marker):
+            raise
+        for field, expected in (("requests", requests), ("data_wrs", data_wrs)):
+            match = re.search(rf"(?:^| ){field}=(\d+)(?: |$)", str(error))
+            if not match or int(match[1]) != expected:
+                raise AssertionError(f"gather {stage} checkpoint {field} does not match the request") from error
+        print(str(error), flush=True)
+    else:
+        raise AssertionError("gather probe returned ordinary success; rebuild Host and kernel together")
+
+
+def report_gather_kernel(path: str, module) -> None:
+    """Report deployment inputs, not whether ACL can load this binary."""
+    data = Path(path).read_bytes()
+    # Name markers are useful for spotting an old .o. They are not an ELF
+    # symbol-table check and do not replace aclrtBinaryGetFunction validation.
+    versions = sorted({int(v) for v in re.findall(rb"KvafGatherBatchGetAivKernelV(\d+)\x00", data)})
+    native = getattr(module, "_native", None)
+    print(f"GATHER_KERNEL_FILE path={path} bytes={len(data)} "
+          f"name_markers={','.join('V' + str(v) for v in versions) or 'unknown'} "
+          "expected_symbol=KvafGatherBatchGetAivKernelV10", flush=True)
+    print(f"GATHER_PYTHON_IMPORT executable={sys.executable} "
+          f"package={getattr(module, '__file__', 'unknown')} "
+          f"native={getattr(native, '__file__', 'unknown')}", flush=True)
 
 
 def run(mode: str) -> int:
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
         return 77
+    if mode == "gather_read" and os.environ.get("KVAF_AIV_GATHER_COALESCE_SGES") == "1":
+        print("FAIL: SGE coalescing requires consecutive rows; use test_aiv_gather_batch_get_perf.py",
+              file=sys.stderr)
+        return 2
     try:
         kernel, put_kernel = kernel_paths(mode)
     except ValueError as error:
@@ -67,11 +63,16 @@ def run(mode: str) -> int:
                 "Rebuild the scatter kernel with its K_TYPE_AIV declaration.") from error
         print(f"[KVAF_TEST] AIV_METADATA_OK kernel=KvafScatterBatchGetAivKernelV1 "
               f"type=K_TYPE_AIV(3) binary={kernel}", flush=True)
+    gather_probe = os.environ.get("KVAF_AIV_GATHER_PROBE", "") if mode == "gather_read" else ""
+    if gather_probe and gather_probe not in ("ack", "wqe", "sq", "first_read"):
+        raise ValueError("gather probe must be ack/wqe/sq/first_read")
     from backend import detect_torch_backend
     from dsa_keys import build_dsa_keys
     from npu_eids import parse_npu_eids
     import kvaf
 
+    if gather_probe:
+        report_gather_kernel(kernel, kvaf)
     backend = detect_torch_backend()
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):
         raise RuntimeError("hardware test was requested but NPU Runtime is unavailable")
@@ -94,6 +95,8 @@ def run(mode: str) -> int:
     keys = build_dsa_keys(blocks, q_capacity=blocks)
     counts = sorted({0, 1, min(7, capacity), min(19, capacity), capacity})
     counts += list(reversed(counts))
+    if gather_probe:
+        counts = [capacity]
     runtime = kvaf.NpuRuntime(
         kernel, token, tokens_per_block, device_id=device_id,
         npu_core_count=cores, batch_put_kernel_object_path=put_kernel,
@@ -130,17 +133,38 @@ def run(mode: str) -> int:
             count = torch.tensor([active], dtype=torch.int32, device=device)
             output = outputs[epoch % 2]
             output.fill_(0xAD)
-            kwargs = dict(synchronize=bool(epoch % 2))
-            if epoch % 2:
+            kwargs = dict(synchronize=bool(gather_probe) or bool(epoch % 2))
+            if gather_probe:
+                sgl = int(os.environ.get("KVAF_AIV_GATHER_SGL_SIZE", "6"))
+                wrs = sum(min(128, ((active * (c + 1) // cores - active * c // cores) + sgl - 1) // sgl)
+                          for c in range(cores)) if gather_probe == "first_read" else 0
+                expect_gather_probe(lambda: runtime.batch_get(
+                    view, indices, offsets, count, rows, output, **kwargs), gather_probe,
+                    requests=active, data_wrs=wrs)
+            elif epoch % 2:
                 runtime.batch_get(view, indices, offsets, count, rows, output, **kwargs)
             else:
                 runtime.batch_get(view.addresses, view.valid, indices, offsets,
                                   count, rows, output, **kwargs)
             torch.npu.synchronize()
             expected = torch.full_like(output.cpu(), 0xAD)
-            src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
-            expected[row_cpu[:active].long()] = source_cpu[src_rows]
+            if gather_probe == "first_read":
+                for core in range(cores):
+                    first = active * core // cores
+                    last = min(active * (core + 1) // cores, first + 128 * sgl)
+                    src_rows = index_cpu[first:last].long() * 4 + offset_cpu[first:last].long() // token
+                    expected[row_cpu[first:last].long()] = source_cpu[src_rows]
+            elif not gather_probe:
+                src_rows = index_cpu[:active].long() * 4 + offset_cpu[:active].long() // token
+                expected[row_cpu[:active].long()] = source_cpu[src_rows]
             assert torch.equal(output.cpu(), expected), (mode, cores, token, active, epoch)
+
+        if gather_probe:
+            runtime.shutdown()
+            print(f"GATHER_PROBE_PASS stage={gather_probe} cores={cores} token_bytes={token} "
+                  f"requests={capacity} output={'first_post_verified' if gather_probe == 'first_read' else 'guard_unchanged'}",
+                  flush=True)
+            return 0
 
         # Enqueue on two caller streams without an intervening caller sync.
         # The owner must drain the first request before reusing workspace.

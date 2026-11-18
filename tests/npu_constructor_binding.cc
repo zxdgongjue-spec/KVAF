@@ -10,10 +10,11 @@ struct ConstructorProbe {
                    std::uint32_t jettys, std::vector<std::string> eids, bool adaptive,
                    std::uint32_t misses, std::string peer, std::vector<std::string> peers,
                    std::uint32_t inflight, const std::string& transport, std::string mode,
-                   std::string aiv_mode, std::uint32_t gather_sgl_size)
+                   std::string aiv_mode, std::uint32_t gather_sgl_size,
+                   bool trusted_gather_inputs)
       : values(py::make_tuple(get, bytes, tokens, device, cores, put, jettys, eids,
                               adaptive, misses, peer, peers, inflight, transport, mode,
-                              aiv_mode, gather_sgl_size)) {}
+                              aiv_mode, gather_sgl_size, trusted_gather_inputs)) {}
 };
 
 PYBIND11_MODULE(_kvaf_constructor_test, module) {
