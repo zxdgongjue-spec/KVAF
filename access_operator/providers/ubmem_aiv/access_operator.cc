@@ -35,9 +35,9 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
         aclmdlRICaptureGetInfo(stream, &capture, &graph));
     if (!status.ok()) return status;
   }
-  if (!call.graph_active &&
-      capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-    return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
+  if (capture != (call.graph_active ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE))
+    return Status::InvalidState(call.graph_active ? "graph submission requires active capture"
+        : "ordinary UBMEM work requires a stream outside graph capture");
   const auto size = view.kernel.cores * sizeof(CoreStatus);
   if (args.operation == Operation::kPut) {
     // Same ordering as KvafExecuteBatchPutSync. An unwritten report must
@@ -74,10 +74,6 @@ Status LaunchKernel(BatchArgs& args, aclrtStream stream, const MappedExecutionVi
   }
   call.pending[stream] = ExecutionSlot::Pending::kStream;
   if (!synchronize) {
-    // Ordinary events cannot be recorded during ACL Graph capture. The
-    // graph owner completes replay on this stream before releasing it;
-    // Shutdown retains the stream drain for captured work.
-    if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE) return Status::OK();
     status = Acl("aclrtRecordEvent", aclrtRecordEvent(state.event, stream));
     if (!status.ok()) {
       view.health->failed = true;
@@ -159,6 +155,13 @@ Status AccessOperator::PrepareGetGraph(const GetGraphOptions& options) {
   if (!s.ok()) return s;
   if (resources_->invocation->pending[static_cast<aclrtStream>(options.stream)] != ExecutionSlot::Pending::kNone)
     return Status::Busy("UBMEM work is still pending");
+  auto& report = resources_->invocation->graph_report;
+  if (resources_->invocation->graph_node) {
+    s = Acl("aclrtSynchronizeStream(graph prepare)", aclrtSynchronizeStream(static_cast<aclrtStream>(options.stream)));
+    if (!s.ok()) return s;
+    s = report.Allocate(resources_->options.cores * sizeof(CoreStatus), 0xFF);
+    if (!s.ok()) return s;
+  }
   resources_->invocation->graph_options = options;
   resources_->invocation->graph_active = true;
   resources_->invocation->graph_recorded = false;
@@ -182,10 +185,13 @@ Status AccessOperator::FinishGetGraph(void* stream, bool discard) {
   if (resources_->invocation->graph_recorded && !discard) {
     auto& state = resources_->streams.at(static_cast<aclrtStream>(resources_->invocation->graph_options.stream));
     const auto bytes = resources_->options.cores * sizeof(CoreStatus);
-    s = Acl("aclrtMemcpy(graph status)", aclrtMemcpy(state.host_statuses, bytes, state.statuses,
+    const auto& report = resources_->invocation->graph_report;
+    const auto host = report.host ? report.host : state.host_statuses;
+    const auto device = report.device ? report.device : state.statuses;
+    s = Acl("aclrtMemcpy(graph status)", aclrtMemcpy(host, bytes, device,
                                                      bytes, ACL_MEMCPY_DEVICE_TO_HOST));
     if (!s.ok()) return s;
-    const auto* reports = static_cast<const CoreStatus*>(state.host_statuses);
+    const auto* reports = static_cast<const CoreStatus*>(host);
     for (std::uint32_t i = 0; i < resources_->options.cores; ++i)
       if (reports[i].result)
         return Status::Internal(
@@ -234,7 +240,9 @@ Status AccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProf
   std::vector<CoreStatus> reports(resources_->options.cores);
   // As for URMA profiling, the caller completes the stream before this snapshot.
   auto status = Acl("aclrtMemcpy(profile)", aclrtMemcpy(reports.data(), reports.size() * sizeof(CoreStatus),
-      state.statuses, reports.size() * sizeof(CoreStatus), ACL_MEMCPY_DEVICE_TO_HOST));
+      resources_->invocation->graph_report.device
+          ? resources_->invocation->graph_report.device : state.statuses,
+      reports.size() * sizeof(CoreStatus), ACL_MEMCPY_DEVICE_TO_HOST));
   if (!status.ok()) return status;
   profiles->clear();
   for (const auto& report : reports) {
@@ -314,14 +322,6 @@ Status UbmemGetOperator::Launch(const BatchGetExecRequest& exec, const UbmemGetV
         exec.execution.stream != call.graph_options.stream ||
         r.indices.bytes / 4 > call.graph_options.request_capacity || exec.execution.synchronize)
       return Status::InvalidArgument("captured request differs from prepared graph lease");
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    auto s = Acl(
-        "aclmdlRICaptureGetInfo",
-        aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph));
-    if (!s.ok()) return s;
-    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::InvalidState("graph submission requires active capture");
   }
   if (r.output.device != DeviceKind::kNpu ||
       r.output_block_bytes > UINT32_MAX || r.tokens_per_block > UINT32_MAX ||
@@ -330,6 +330,7 @@ Status UbmemGetOperator::Launch(const BatchGetExecRequest& exec, const UbmemGetV
   }
   auto stream = static_cast<aclrtStream>(exec.execution.stream);
   auto a = Args(Operation::kGet, r.output.data, r.output.bytes, view.execution_);
+  if (call.graph_report.device) a.statuses = AddressOf(call.graph_report.device);
   a.addresses = AddressOf(r.device_access_table.addresses.data);
   a.valid = AddressOf(r.device_access_table.valid.data);
   a.indices = AddressOf(r.indices.data);

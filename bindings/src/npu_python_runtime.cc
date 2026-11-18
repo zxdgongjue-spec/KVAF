@@ -466,7 +466,8 @@ class NpuPythonRuntime final {
     ConfigureGetKernelProfile(true, detailed, config);
   }
 
-  py::list BatchGetKernelProfileSnapshot(std::optional<GetExecutionConfig> config) {
+  py::list BatchGetKernelProfileSnapshot(std::optional<GetExecutionConfig> config,
+                                         std::uint64_t graph_lease = 0) {
     std::vector<kvaf::BatchGetKernelProfile> profiles;
     Status status;
     std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
@@ -475,7 +476,7 @@ class NpuPythonRuntime final {
       lock.lock();
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
         status = Status::Internal("aclrtSetDevice failed");
-      else status = native_->CopyBatchGetKernelProfiles(&profiles, config);
+      else status = native_->CopyBatchGetKernelProfiles(&profiles, config, graph_lease);
     }
     ThrowIfError(status);
     py::list result;
@@ -623,9 +624,18 @@ class NpuPythonRuntime final {
     auto refs = py::make_tuple(addresses, valid, indices, offsets, miss_count, output_indices, output, stream);
     Status status;
     std::unique_lock<std::mutex> direction(get_mutex_, std::defer_lock);
+    decltype(graph_refs_)::iterator graph_ref;
     {
       py::gil_scoped_release release;
       direction.lock();
+    }
+    if (graph_lease) {
+      graph_ref = graph_refs_.find(graph_lease);
+      if (graph_ref != graph_refs_.end())
+        graph_ref->second.reserve(graph_ref->second.size() + 1);
+    }
+    {
+      py::gil_scoped_release release;
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else
         status = native_->core().BatchGet(
@@ -633,8 +643,7 @@ class NpuPythonRuntime final {
                                               graph_lease, output_lease});
     }
     if (graph_lease) {
-      auto it = graph_refs_.find(graph_lease);
-      if (it != graph_refs_.end()) it->second.push_back(std::move(refs));
+      if (graph_ref != graph_refs_.end()) graph_ref->second.push_back(std::move(refs));
     } else {
       if (status.ok()) pending_get_refs_.clear();  // Native completed the preceding Get.
       if (!status.ok() || !synchronize) pending_get_refs_.push_back(std::move(refs));
@@ -865,7 +874,8 @@ class NpuPythonRuntime final {
     }
   }
 
-  void CheckBatchGetStatus(const py::object& stream, std::optional<GetExecutionConfig> config) {
+  void CheckBatchGetStatus(const py::object& stream, std::optional<GetExecutionConfig> config,
+                           std::uint64_t graph_lease) {
     const auto native_stream = ResolveStream(stream);
     Status status;
     std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
@@ -874,7 +884,7 @@ class NpuPythonRuntime final {
       lock.lock();
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
         status = Status::Internal("aclrtSetDevice failed");
-      else status = native_->CheckBatchGetStatus(native_stream, config);
+      else status = native_->CheckBatchGetStatus(native_stream, config, graph_lease);
     }
     ThrowIfError(status);
   }
@@ -909,6 +919,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("shutdown", &NpuPythonRuntime::Shutdown)
       .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,
            py::arg("stream") = py::none(), py::kw_only(), py::arg("execution") = py::none(),
+           py::arg("graph_lease") = 0,
            "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
@@ -959,7 +970,8 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("detailed") = false, py::kw_only(), py::arg("execution") = py::none(),
            "Enable the selected Get instance's per-core kernel timeline.")
       .def("batch_get_kernel_profile", &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
-           py::kw_only(), py::arg("execution") = py::none(), "Copy the latest completed per-core BatchGet kernel timeline.")
+           py::kw_only(), py::arg("execution") = py::none(), py::arg("graph_lease") = 0,
+           "Copy the latest completed per-core timeline; select a node with graph_lease.")
       .def("stop_batch_get_kernel_profile", &NpuPythonRuntime::StopBatchGetKernelProfile,
            py::kw_only(), py::arg("execution") = py::none(), "Copy the latest timeline and disable BatchGet kernel profiling.")
       .def("batch_get", &NpuPythonRuntime::BatchGet, py::arg("device_access_table"),

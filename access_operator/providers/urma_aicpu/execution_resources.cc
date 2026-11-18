@@ -76,7 +76,7 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
     return Status::InvalidArgument("AICPU invocation belongs to another resource");
   if (state_->invocation != call &&
       (state_->invocation->output_bound || state_->invocation->input_bound ||
-       state_->invocation->graph_active))
+       (state_->invocation->graph_active && !state_->invocation->graph_node)))
     return Status::Busy("release input/output binding before replacing invocation");
   auto bound = state_->put.BindExecutionState(call->put.get());
   if (!bound.ok()) return bound;
@@ -143,26 +143,16 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
         request.request->output.bytes != options.output.bytes ||
         request.request->indices.bytes / sizeof(std::int32_t) > options.request_capacity)
       return Status::InvalidArgument("captured request differs from prepared graph lease");
-    bool capturing = false;
-    auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), false, false, &capturing);
-    if (!allowed.ok()) return allowed;
-    if (!capturing) return Status::InvalidState("graph lease submission requires active capture");
-  } else if (request.execution.stream) {
-    bool capturing = false;
-    auto allowed = detail::BatchGetCapture(static_cast<aclrtStream>(request.execution.stream),
-                                          false, false, &capturing);
-    if (!allowed.ok()) return allowed;
-    if (capturing) return Status::InvalidState("prepare an AICPU Get graph lease before capture");
   }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  if (state_->push) return state_->push->Prepare(request);
+  if (state_->push) return state_->push->Prepare(request, call.graph_active);
 #endif
   if (state_->invocation->output_bound &&
       (request.request->output.data != state_->invocation->get_output.data ||
        request.request->output.bytes != state_->invocation->get_output.bytes))
     return Status::InvalidArgument("request differs from bound Get output");
   state_->invocation->get_output = request.request->output;
-  return state_->get.Prepare(request);
+  return state_->get.Prepare(request, call.graph_active);
 }
 Status AicpuExecutionResources::ReleasePutBuffers() {
   // Ordinary calls retire temporary input; explicit bindings own it until End.
@@ -264,25 +254,35 @@ Status AicpuExecutionResources::FinishGetGraph(void* stream, bool discard) {
 #endif
       ready = state_->get.FinishGraph(stream, discard);
     if (!ready.ok()) {
-      if (!discard || !low || low->failure.ok()) return ready;
+      if (!low || low->failure.ok() || ready.code() == StatusCode::kCompletionUnknown) return ready;
+      if (!discard && !call.graph_node) return ready;
       // Discard cannot make a failed DMA transport safe. Retire its complete
       // session (Scatter sends STOP first), retaining the lease on any failure.
       call.graph_close_required = true;
+      if (call.graph_node) {
+        call.graph_retiring = true;
+        return ready;
+      }
     }
     call.graph_retiring = true;
   }
   if (call.graph_close_required) {
+    if (call.graph_node)
+      return Status::InvalidState("Get graph communication domain requires recovery");
     lock.unlock();
     return Close();
   }
   if (!scatter()) {
-    auto retired = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
+    auto retired = state_->get_session.UnpinGraphBuffer(call.get_output.data, call.get_output.bytes);
     if (!retired.ok()) return retired;
   }
   call.graph_active = call.graph_recorded = call.graph_retiring = false;
   call.graph_options = {};
   call.get_output = {};
   return Status::OK();
+}
+bool AicpuExecutionResources::GetGraphNeedsRecovery() const {
+  return state_->invocation->graph_close_required;
 }
 Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options) {
   std::lock_guard<std::mutex> lock(state_->get_mutex);

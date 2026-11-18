@@ -22,6 +22,7 @@ class ExecutionResourceOwner {
 class ExecutionState {
  public:
   virtual ~ExecutionState() = default;
+  bool graph_node{false};
 };
 
 enum class PutOutcome { Unknown, Succeeded, Failed };

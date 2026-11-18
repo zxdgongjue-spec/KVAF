@@ -57,6 +57,7 @@ Status UmdkAccessOperator::AcknowledgePut() { return resources_->AcknowledgePut(
 Status UmdkAccessOperator::DrainGet() { return resources_->DrainGet(); }
 Status UmdkAccessOperator::PrepareGetGraph(const GetGraphOptions& options) { return resources_->PrepareGetGraph(options); }
 Status UmdkAccessOperator::FinishGetGraph(void* stream, bool discard) { return resources_->FinishGetGraph(stream, discard); }
+bool UmdkAccessOperator::GetGraphNeedsRecovery() const { return resources_->GetGraphNeedsRecovery(); }
 Status UmdkAccessOperator::PrepareGetOutput(const GetOutputOptions& r) { return resources_->PrepareGetOutput(r); }
 Status UmdkAccessOperator::FinishGetOutput() { return resources_->FinishGetOutput(); }
 Status UmdkAccessOperator::PreparePutInput(const PutInputOptions& r) { return resources_->PreparePutInput(r); }

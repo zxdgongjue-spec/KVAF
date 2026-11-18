@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.backend import detect_torch_backend
 from utils.batch_get_workload import token_pattern
 from utils.dsa_keys import build_dsa_keys
-from utils.get_graph import GraphInputs, captured_get, validate_graph_inputs
+from utils.get_graph import GraphInputs, captured_get, captured_get_nodes, validate_graph_inputs
 from utils.get_options import (
     MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
     environment_int, resolve_backend, uses_aicpu, validate_workload,
@@ -79,6 +79,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph-api", choices=("acl", "torch"), default="torch")
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
+    parser.add_argument("--multi-graph-check", action="store_true",
+                        help="validate two live graphs on one stream, including a graph with two Get nodes")
     parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
                         help="enable a hardware run; selecting --backend also enables it")
     parser.add_argument("--get-timing", choices=("async-drain", "async-wait", "sync-call"), default="async-drain",
@@ -101,6 +103,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "device-id must be non-negative"
     if args.graph_replays <= 0:
         return "graph-replays must be positive"
+    if args.multi_graph_check and (args.execution == "eager" or args.miss_count <= 0):
+        return "multi-graph-check requires graph or both execution and a positive miss-count"
     if args.iterations <= 0:
         return "iterations must be positive"
     if args.kernel_profile and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
@@ -212,6 +216,61 @@ def print_measurements(args, execution, samples, profiles):
                                  args.token_bytes, args.transport)
 
 
+def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
+                         miss_count, output, check_output, execution, stream):
+    execution.drain_get(runtime)
+    execution.release_output(runtime)
+    inputs = [GraphInputs(make_plan, torch.empty_like(miss_count), torch.empty_like(output), stream)
+              for _ in range(3)]
+
+    def node(inp):
+        def submit(options):
+            runtime.batch_get(device_table, inp.fixed[0], inp.fixed[1], inp.miss_count,
+                              inp.fixed[2], inp.output, stream=stream, **options)
+        return inp.output, submit
+
+    def check(indices, leases, counts):
+        for i, lease, count in zip(indices, leases, counts):
+            if uses_aicpu(args):
+                runtime.check_batch_get_status(stream, graph_lease=lease)
+            check_output(inputs[i].fixed, count, result=inputs[i].output)
+            if args.kernel_profile and count:
+                profiles = runtime.batch_get_kernel_profile(graph_lease=lease)
+                if len(profiles) != args.parallelism:
+                    raise AssertionError("multi-graph profile worker count mismatch")
+
+    full = args.miss_count
+    partial = full // 2
+    # Capture the graph that must survive first, then give the two-node graph
+    # its own scope so it can be destroyed without disturbing the survivor.
+    for inp in inputs:
+        inp.prepare(full)
+    with captured_get_nodes(args, runtime, torch, kvaf, execution, stream, [node(inputs[2])]) as (b, bl):
+        with captured_get_nodes(args, runtime, torch, kvaf, execution, stream,
+                                [node(inputs[0]), node(inputs[1])]) as (a, al):
+            for i, count in enumerate((full, partial, full)):
+                inputs[i].prepare(count)
+            a.replay()
+            b.replay()
+            a.replay()
+            a.synchronize()
+            check((0, 1, 2), al + bl, (full, partial, full))
+            for i, count in enumerate((0, full, partial)):
+                inputs[i].prepare(count)
+            b.replay()
+            a.replay()
+            a.synchronize()
+            check((0, 1, 2), al + bl, (0, full, partial))
+            a.validated = True
+        inputs[2].prepare(full)
+        b.replay()
+        b.synchronize()
+        check((2,), bl, (full,))
+        b.validated = True
+    print(f"BATCH_GET_MULTI_GRAPH_PASS backend={args.backend} api={args.graph_api} "
+          "graphs=2 max_nodes_per_graph=2 shared_stream=1 survivor_replayed=1", flush=True)
+
+
 def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
                          miss_count, output, check_output, execution=None):
     execution = execution or BenchmarkExecution(
@@ -221,6 +280,9 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         get_capacity=args.request_length,
     )
     stream = torch.npu.current_stream()
+    if args.multi_graph_check:
+        check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
+                              miss_count, output, check_output, execution, stream)
     inputs = GraphInputs(make_plan, miss_count, output, stream)
 
     def submit(options):
@@ -866,21 +928,21 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 )
             return indices, offsets, output_indices
 
-        def check_output(plan, count, full=True):
+        def check_output(plan, count, full=True, *, result=output):
             if not count:
-                if bool(torch.count_nonzero(output).item()):
+                if bool(torch.count_nonzero(result).item()):
                     raise AssertionError("BatchGet modified output for an empty request")
                 return
             ids = plan[0][:count].to(torch.int64) * tokens_per_block + plan[1][:count].to(torch.int64) // token_bytes
             destinations = plan[2][:count].to(torch.int64)
             pattern = token_pattern(torch, ids, token_byte_indices)
             if full:
-                expected = torch.zeros_like(output)
+                expected = torch.zeros_like(result)
                 if count:
                     expected.index_copy_(0, destinations, pattern)
-                valid = torch.equal(output, expected)
+                valid = torch.equal(result, expected)
             else:
-                valid = torch.equal(output.index_select(0, destinations), pattern)
+                valid = torch.equal(result.index_select(0, destinations), pattern)
             if not valid:
                 raise AssertionError(f"BatchGet output mismatch: backend={args.backend}, miss_count={count}")
 

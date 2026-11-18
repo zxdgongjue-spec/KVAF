@@ -2,7 +2,7 @@
 
 本文记录请求级执行分支合入 main 后的实现与验证边界。范围是四种 Get：
 URMA AIV Direct、UBMEM Direct、AICPU Gather Read、AICPU CPU Push Scatter。
-Put 保持同步事务语义；同一张图的多个 Get 节点和混合算法不在本轮范围内。
+Put 保持同步事务语义。多图和多 Get 节点使用同一 stream 串行执行。
 
 ## 1. 合并 main
 
@@ -29,8 +29,8 @@ main 的线程调度行为，`--gather-affinity` 已移除；性能对比显式�
 ## 2. Get 驻留实例
 
 每个 Runtime / DDR 代次内，每种已启用 Get 配置首次使用时建立一个实例。
-`GetResourceReference` 保留 owner 和绑定的执行状态；`GetResourceLease` 仅表示本次
-执行或图所占用的资源。普通同步调用或成功 Drain 后释放执行占用、清空借用的请求与
+`GetResourceReference` 保留 owner 和绑定的执行状态；`GetResourceLease` 表示本次
+调用占用的资源。图节点复用驻留 owner，单独保留节点状态。普通同步调用或成功 Drain 后释放执行占用、清空借用的请求与
 表信息，实例继续存在；不重复构造和绑定执行状态。
 
 同一 stream、容量未增长的热调用跳过 Describe 和 Warmup。容量增长或换 stream
@@ -39,8 +39,8 @@ main 的线程调度行为，`--gather-affinity` 已移除；性能对比显式�
 
 输出绑定由具体算法实例保存。URMA AIV Direct 与 AICPU Gather 可各持有一个绑定，
 并交替调用；UBMEM / Scatter 仍不要求输出注册。释放空闲算法的绑定不释放另一个
-在途算法持有的 Tensor 或 AccessTable。一个图仍独占 Get 执行方向，限制一个 Get
-节点；已有输出绑定只阻止相同实例进入图模式。
+在途算法持有的 Tensor 或 AccessTable。图租约存活期间，Get 方向专用于图；
+已有输出绑定只阻止相同实例进入图模式。
 
 Recover 要求目标实例无输出/图绑定，先完成在途操作，再关闭并重建资源。关闭失败
 保留实例、状态及资源引用，允许重试；成功 Shutdown 才统一释放它们。
@@ -51,8 +51,8 @@ Recover 要求目标实例无输出/图绑定，先完成在途操作，再关�
 捕获时 `batch_get(..., execution=config, graph_lease=lease, synchronize=False)`
 只提交已准备的设备任务。固定配置、stream、输出地址和容量后，可在相同输入存储中
 更新 indices、offsets、miss_count、output_indices，重放全量、部分和零请求。
-图期间禁止同一 Runtime 的额外 Get / Drain / Warmup / Recover / Shutdown。
-一个租约仅允许一个 Get 节点，Put 不进入图。
+图租约存活时禁止同一 Runtime 的 eager Get、Drain、Warmup、Recover 和 Shutdown。
+一个租约仅允许一个 Get 节点，一张图可使用多个租约。Put 不进入图。
 
 AIV Direct 和 UBMEM eager Get 均不在完成时回读或检查设备状态，
 UBMEM 同步 Get 也不再清零状态报告。完成路径只等待并释放请求资源，ACL 提交和同步错误仍返回失败。
@@ -61,8 +61,10 @@ Get graph 释放时的状态检查保留各自语义。AICPU Gather/Scatter
 使用设备侧 ticket 推进跨 replay 的通信序号；
 捕获阶段不注册、不分配、不同步，显式状态检查须在 replay 完成后执行。
 未重放的 AICPU 图正常结束会报未完成，可 `discard_result=True` 取消。
-同步/注销失败保留资源和租约以供重试；AICPU 协议错误后显式 discard 会关闭该算法
-owner，之后必须 `recover(config)`，不会复用可能损坏的队列。
+同步/注销失败保留资源和租约以供重试。共享 AICPU 会话失败后，先停止回放并销毁
+引用该算法实例的所有图，再对其租约调用 `end_get_graph(..., discard_result=True)`。
+尚有同实例租约未进入丢弃流程时，返回 Busy 并保留资源。最后一个租约关闭会话后，
+重试此前收到 Busy 的租约，再调用 `recover(config)`。
 
 Profiling 和状态查询通过算法配置路由到驻留实例，默认取 Runtime 的默认 Get。
 图前启用 profile、每轮完成后读取，销毁图并结束租约后停用。保留最后成功 profile
@@ -74,6 +76,51 @@ Profiling 和状态查询通过算法配置路由到驻留实例，默认取 Run
 `--graph-replays` 控制正式计时前的动态输入、部分和零请求验证；
 性能样本数由 `--iterations` 决定。
 Host 延迟对照需使用相同的 `--get-timing` 和 profile 设置。
+
+## 4. 多图与多个 Get 节点
+
+在图外为每个节点准备一个租约。下例假设三个节点的输入和输出 Tensor、访问表
+及 Runtime 已准备好；`capacity` 是每个节点的请求数组容量。
+
+```python
+leases = [runtime.begin_get_graph(cfg, output, capacity, stream)
+          for output in (out_a, out_b, out_c)]
+graph1, graph2 = kvaf.AclGraph(), kvaf.AclGraph()
+
+def get_node(plan, output, lease):
+    indices, offsets, miss_count, output_indices = plan
+    runtime.batch_get(table, indices, offsets, miss_count, output_indices, output,
+                      execution=cfg, stream=stream, graph_lease=lease)
+
+graph1.capture_begin(stream)
+get_node(plan_a, out_a, leases[0])
+get_node(plan_b, out_b, leases[1])
+graph1.capture_end()
+graph2.capture_begin(stream)
+get_node(plan_c, out_c, leases[2])
+graph2.capture_end()
+
+graph1.replay(stream)
+graph2.replay(stream)
+graph1.replay(stream)
+graph1.synchronize(stream)
+# 校验 out_a、out_b、out_c；启用 profiling 时可按节点读取：
+# runtime.batch_get_kernel_profile(graph_lease=leases[0])
+
+graph1.reset()
+for lease in leases[:2]:
+    runtime.end_get_graph(lease, stream)
+graph2.replay(stream)
+graph2.synchronize(stream)
+graph2.reset()
+runtime.end_get_graph(leases[2], stream)
+```
+
+各节点独立保留输出注册引用、Tensor、访问表和完成报告；同算法节点共用通信会话、
+队列、工作区和连续的设备 ticket。回放不增加 Host 调度或节点间同步。
+Torch Graph 同样必须在捕获 stream 上回放；Runtime 无法拦截外部图的 replay。
+一个算法实例有多个节点时，状态和 profile 查询用 `graph_lease=lease` 指定节点；
+报告保存的是该节点最近一次完成的结果。没有跨 stream 并发回放。
 
 ## 5. 共享资源和生产目录
 
@@ -126,4 +173,7 @@ CMake、测试、脚本和公开文档路径一起迁移，库名、kernel 符�
 
 需重新配置并构建 CPU/NPU，重新安装 AICPU 包，并启动新的客户端和 CPU 服务进程。
 统一性能入口在正式计时之外验证数据与 graph 回放。
-同图多 Get 节点、图内混合算法或 Put 图模式仍不在本轮范围。
+统一性能入口仍输出单节点图的性能数据；传入 `--multi-graph-check` 可在计时前
+验收多图。测试在同一个 stream 上交替回放两张图，其中一张含两个 Get，验证完整、
+部分及零请求，并在释放双节点图后再次回放剩余图。每个成功后端打印
+`BATCH_GET_MULTI_GRAPH_PASS`。图内混合算法和 Put 图模式不在本轮验收范围。

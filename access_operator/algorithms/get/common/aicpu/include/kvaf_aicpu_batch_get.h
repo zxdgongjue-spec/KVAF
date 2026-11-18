@@ -15,7 +15,7 @@ class BatchGetTransport {
   ~BatchGetTransport();
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
-  Status Prepare(const BatchGetExecRequest&);
+  Status Prepare(const BatchGetExecRequest&, std::optional<bool> expected_capture = std::nullopt);
   Status ExecutePrepared(const BatchGetExecRequest&);
   GatherLaunchView View() const;
   static Status LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*);

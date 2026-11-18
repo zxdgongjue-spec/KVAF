@@ -133,8 +133,9 @@ struct BatchFreeRequest {
 // 类型；当前 CANN Adapter 将它解释为 aclrtStream。默认只向 stream enqueue，
 // 不替调用方同步；同一 stream 上的后续 Torch/ACL 操作天然按序执行。跨 stream
 // 依赖、buffer 生命周期与显式 synchronize 由调用方/框架负责。
-// Explicit registration/resource lease. The caller keeps output and the replay
-// stream alive until EndGetGraph succeeds and must stop replaying before release.
+// One graph node's resources. All live nodes of a Runtime use the same stream.
+// The caller keeps every captured buffer and the stream alive until
+// EndGetGraph succeeds, and destroys the containing graph before release.
 struct GetGraphOptions {
   MutableBufferView output;
   void* stream{nullptr};

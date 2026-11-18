@@ -222,7 +222,9 @@ CPU service 须预先启动。替换 `--backend` 及对应的 `--aiv-cores` / `-
 `aclmdlRICaptureBegin`、`aclmdlRICaptureEnd`、`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`；
 统一性能入口也支持 `--graph-api torch`。捕获前通过 `begin_get_graph` 准备配置、stream、
 输出和容量，捕获只提交 Get。回放前完成输入更新，计时只包含 replay 与 stream 等待。
-销毁图后结束 graph lease，再关闭 Runtime。
+同一 Runtime 可在同一 stream 上串行回放多张图，每个 Get 节点使用独立租约。
+销毁一张图后结束它的全部租约；所有租约释放后才能关闭 Runtime。
+用法见 [多图与多个 Get 节点](../docs/get_graph_evolution.md#4-多图与多个-get-节点)。
 
 `batch_get(stream=None, synchronize=False)` 默认在 `torch.npu.current_stream()` 上提交。
 同一 stream 的后续操作等待 Get；换 stream 时由调用方建立 event/wait 依赖。

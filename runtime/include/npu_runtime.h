@@ -68,10 +68,12 @@ class NpuRuntime final : public Runtime {
   // Outside capture: synchronize the execution stream and report retained
   // AICPU protocol errors, including errors from earlier graph replays.
   Status CheckBatchGetStatus(void* stream,
-                            std::optional<GetExecutionConfig> config = std::nullopt);
+                            std::optional<GetExecutionConfig> config = std::nullopt,
+                            std::uint64_t graph_lease = 0);
   Status CopyBatchGetKernelProfiles(
       std::vector<BatchGetKernelProfile>* profiles,
-      std::optional<GetExecutionConfig> config = std::nullopt) const;
+      std::optional<GetExecutionConfig> config = std::nullopt,
+      std::uint64_t graph_lease = 0) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

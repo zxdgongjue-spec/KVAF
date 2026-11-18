@@ -41,6 +41,9 @@ class SessionAccessOperator final : public AccessOperator {
   Status FinishGetGraph(void* stream, bool discard) override {
     return resources_->operation()->FinishGetGraph(stream, discard);
   }
+  bool GetGraphNeedsRecovery() const override {
+    return resources_->operation()->GetGraphNeedsRecovery();
+  }
   Status PrepareGetOutput(const GetOutputOptions& r) override {
     auto s = ValidateRequestCapacity(r.request_capacity);
     return s.ok() ? resources_->operation()->PrepareGetOutput(r) : s;

@@ -152,12 +152,11 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request
     auto status = UrmaAivGetOperator::Drain(view, call);
     if (!status.ok()) return status;
   }
-  auto status = UrmaAivGetOperator::Validate(
-      request, view, call,
-      request.host_timing ? &request.host_timing->aiv_capture_prepare_ns : nullptr);
+  KvafExecuteBatchGetKernelArgs arguments{};
+  auto status = UrmaAivGetOperator::PrepareArguments(request, view, call, &arguments);
   if (status.ok()) status = resources_->PrepareGetResources(request, call, &view);
   GetHostTimingRecord(request.host_timing, &GetProviderTiming::prepare_ns, prepare_started);
-  return status.ok() ? UrmaAivGetOperator::Launch(request, view, call) : status;
+  return status.ok() ? UrmaAivGetOperator::Launch(request, view, call, arguments) : status;
 }
 Status DefaultAccessOperator::DrainGet() {
   return UrmaAivGetOperator::Drain(resources_->GetView(), resources_->invocation());
@@ -221,7 +220,7 @@ Status DefaultAccessOperator::FinishPutInput() {
 #endif
 }
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
-  return UrmaAivGetOperator::SetProfiling(enabled, resources_->GetView());
+  return resources_->SetGetProfiling(enabled);
 }
 Status DefaultAccessOperator::CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>* profiles) const {
   const auto& call = resources_->invocation();
@@ -301,8 +300,8 @@ Status UrmaAivGetOperator::FinishGraph(void* stream, bool /*discard*/, UrmaAivGe
   return Status::OK();
 }
 
-Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetView view,
-                                    AivInvocation& invocation, std::uint64_t* capture_query_ns) {
+Status UrmaAivGetOperator::PrepareArguments(const BatchGetExecRequest& exec, UrmaAivGetView view,
+    const AivInvocation& invocation, KvafExecuteBatchGetKernelArgs* arguments) {
   if (!view.common.Validate(&invocation, ExecutionDirection::Get).ok())
     return InvalidArgument("AIV invocation does not match resource view");
   if (!view.common.ready()) {
@@ -312,13 +311,6 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
   if (exec.execution.stream == nullptr) {
     return InvalidArgument("NPU BatchGet requires a caller-owned ACL stream");
   }
-  const auto query_capture = [&](aclmdlRICaptureStatus* capture, aclmdlRI* graph) {
-    const auto started = capture_query_ns ? GetHostTimingStart(exec.host_timing) : 0;
-    const auto result = aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream),
-                                                capture, graph);
-    if (capture_query_ns) *capture_query_ns += GetHostTimingStart(exec.host_timing) - started;
-    return result;
-  };
   const bool graph_lease = invocation.graph_buffer != nullptr;
   if (graph_lease) {
     if (!exec.request || exec.request->output.data != invocation.graph_options.output.data ||
@@ -328,45 +320,29 @@ Status UrmaAivGetOperator::Validate(const BatchGetExecRequest& exec, UrmaAivGetV
             invocation.graph_options.request_capacity ||
         exec.execution.synchronize)
       return InvalidArgument("captured request differs from prepared graph lease");
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    if (query_capture(&capture, &graph) != ACL_SUCCESS)
-      return Internal("cannot query graph capture state");
-    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::InvalidState("graph lease submissions require active capture");
   }
-  if (!graph_lease) {
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    if (query_capture(&capture, &graph) != ACL_SUCCESS)
-      return Internal("cannot query graph capture state");
-    if (capture == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
-      return Status::InvalidState("call begin_get_graph before capturing a request-level Get");
-  }
-  KvafExecuteBatchGetKernelArgs arguments{};
-  Status status = BuildBatchGetKernelArgs(
+  aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+  aclmdlRI graph = nullptr;
+  const auto capture_started = GetHostTimingStart(exec.host_timing);
+  const auto queried = aclmdlRICaptureGetInfo(static_cast<aclrtStream>(exec.execution.stream), &capture, &graph);
+  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::aiv_capture_prepare_ns, capture_started);
+  if (queried != ACL_SUCCESS) return Internal("cannot query graph capture state");
+  if (capture != (graph_lease ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE))
+    return Status::InvalidState(graph_lease ? "graph lease submissions require active capture"
+        : "ordinary Get requires a stream outside graph capture");
+  return BuildBatchGetKernelArgs(
       exec, view.options.npu_core_count, view.options.jettys_per_core,
-      view.options.batch_get_max_inflight_total, view.workspace, &arguments);
-  if (!status.ok()) {
-    return status;
-  }
-
-  return Status::OK();
+      view.options.batch_get_max_inflight_total, view.workspace, arguments);
 }
 
-Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetView view, AivInvocation& invocation) {
+Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetView view,
+    AivInvocation& invocation, KvafExecuteBatchGetKernelArgs arguments) {
   const auto submit_started = GetHostTimingStart(exec.host_timing);
-  auto status = Validate(exec, view, invocation,
-                         exec.host_timing ? &exec.host_timing->aiv_capture_submit_ns : nullptr);
+  auto status = view.common.Validate(&invocation, ExecutionDirection::Get);
   if (!status.ok()) return status;
   const bool graph_lease = invocation.graph_buffer != nullptr;
   if (!graph_lease && invocation.get_issued)
     return Status::Busy("Get invocation is still in flight");
-  KvafExecuteBatchGetKernelArgs arguments{};
-  status = BuildBatchGetKernelArgs(exec, view.options.npu_core_count,
-      view.options.jettys_per_core, view.options.batch_get_max_inflight_total,
-      view.workspace, &arguments);
-  if (!status.ok()) return status;
   KvafBatchGetLocalBuffer* local_buffer = view.buffer;
   const std::uint64_t channel_entity = view.channel_entity;
   const aclrtStream stream = static_cast<aclrtStream>(exec.execution.stream);
@@ -375,7 +351,7 @@ Status UrmaAivGetOperator::Launch(const BatchGetExecRequest& exec, UrmaAivGetVie
       (!graph_lease && (exec.request->output.data != invocation.get_output.data ||
                        exec.request->output.bytes != invocation.get_output.bytes ||
                        exec.execution.stream != invocation.pending_get ||
-                       exec.request->indices.bytes / sizeof(std::int32_t) > invocation.get_capacity)))
+                       arguments.request_capacity > invocation.get_capacity)))
     return InvalidState("AIV Get registration must be prepared before Launch");
   arguments.channel_entity = channel_entity;
 

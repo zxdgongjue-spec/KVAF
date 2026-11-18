@@ -101,18 +101,26 @@ Status BatchGetTransport::BindExecutionState(ExecutionState* state) {
   return Status::OK();
 }
 GatherLaunchView BatchGetTransport::View() const {
+  const auto& call = *impl_->invocation;
+  const auto* status = call.graph_completion.get();
+  const auto* profile = call.graph_profile.get();
   return {impl_->views.View(ExecutionDirection::Get),
       {impl_->session.session(), impl_->session.owner_pid()},
       {impl_->session.config().workers, impl_->token_bytes}, impl_->direct_addresses,
       impl_->remote_workspace, impl_->workspace,
-      {impl_->execution.status, impl_->status_host, impl_->execution.status_bytes},
-      {impl_->profile_device, impl_->profile_host, impl_->session.config().workers * sizeof(BatchGetWorkerProfile)},
+      {status ? status->device : impl_->execution.status,
+       status ? status->host : impl_->status_host, impl_->execution.status_bytes},
+      {profile ? profile->device : impl_->profile_device,
+       profile ? profile->host : impl_->profile_host,
+       impl_->session.config().workers * sizeof(BatchGetWorkerProfile)},
       impl_->control, impl_->profiling};
 }
 Status BatchGetTransport::Impl::Drain(const char* stage, bool check_status) {
   GatherLaunchView view;
   view.options.workers = session.config().workers; view.direct_addresses = direct_addresses;
-  view.completion = {execution.status, status_host, execution.status_bytes};
+  const auto* report = invocation->graph_completion.get();
+  view.completion = {report ? report->device : execution.status,
+                     report ? report->host : status_host, execution.status_bytes};
   return DrainGather(view, *invocation, stage, false, check_status);
 }
 Status BatchGetTransport::Drain(bool check_status) { return impl_->Drain("drain", check_status); }
@@ -136,14 +144,27 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
   auto ready = kvaf::detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), true, false, &capturing);
   if (!ready.ok()) return ready;
   ready = impl_->Drain("graph_prepare");
-  if (ready.ok()) ready = Warmup();
-  if (ready.ok()) ready = impl_->session.Ensure(impl_->remote_workspace.base, options.output.data, options.output.bytes);
+  if (ready.ok() && call.graph_node &&
+      aclrtSynchronizeStream(static_cast<aclrtStream>(options.stream)) != ACL_SUCCESS)
+    return Status::CompletionUnknown("Gather graph preparation could not fence its stream");
+  if (ready.ok() && !impl_->cpu_enabled) ready = Warmup();
   if (!ready.ok()) return ready;
   GatherExecutionControl control{};
   if (aclrtMemcpy(&control, sizeof(control), impl_->control, sizeof(control), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
     return Internal("cannot read Gather graph sequence baseline");
   if (control.failed || control.claimed % impl_->session.config().workers)
     return Status::InvalidState("Gather execution failed or incomplete; shutdown required");
+  if (call.graph_node) {
+    call.graph_completion = std::make_unique<GetGraphReport>();
+    ready = call.graph_completion->Allocate(impl_->execution.status_bytes);
+    if (ready.ok() && impl_->profiling) {
+      call.graph_profile = std::make_unique<GetGraphReport>();
+      ready = call.graph_profile->Allocate(impl_->session.config().workers * sizeof(BatchGetWorkerProfile));
+    }
+    if (!ready.ok()) return ready;
+  }
+  ready = impl_->session.PinGraphBuffer(impl_->remote_workspace.base, options.output.data, options.output.bytes);
+  if (!ready.ok()) return ready;
   call.graph_start_sequence = control.claimed / impl_->session.config().workers;
   call.graph_stream = static_cast<aclrtStream>(options.stream);
   call.graph_active = true;
@@ -173,13 +194,17 @@ Status BatchGetTransport::FinishGraph(void* stream, bool discard) {
     const auto sequence = control.claimed / view.options.workers;
     if (control.failed || control.claimed % view.options.workers || sequence < call.graph_start_sequence)
       return call.failure = Internal("Gather graph device failed or ticket sequence is incomplete");
-    if (sequence == call.graph_start_sequence) {
+    const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
+    const bool replayed = call.graph_node ? std::any_of(reports, reports + view.options.workers,
+        [&](const auto& report) { return report.sequence > call.graph_start_sequence; })
+        : sequence > call.graph_start_sequence;
+    if (!replayed) {
       if (!discard) return Status::InvalidState("Gather graph has not been replayed");
     } else {
       ready = ValidateGather(view, call);
       if (!ready.ok()) return ready;
-      if (call.sequence != sequence)
-        return call.failure = Internal("Gather graph status does not match its latest replay");
+      if (call.sequence > sequence || (!call.graph_node && call.sequence != sequence))
+        return call.failure = Internal("Gather graph status is inconsistent with shared tickets");
       replay_completed = true;
     }
   }
@@ -218,7 +243,8 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
     auto ready = kvaf::detail::BatchGetCapture(call.last_stream, true, false, &capturing);
     if (!ready.ok()) return ready;
   }
-  return kvaf::detail::CopyAicpuProfiles(impl_->profile_device, impl_->profile_host,
+  const auto view = View();
+  return kvaf::detail::CopyAicpuProfiles(view.profile.device, view.profile.host,
       impl_->session.config().workers, profiles);
 }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
@@ -295,7 +321,7 @@ Status BatchGetTransport::Warmup() {
   }
   return s;
 }
-Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec) {
+Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional<bool> expected_capture) {
   impl_->views.Prepare();
   auto& call = *impl_->invocation;
   call.prepared = nullptr;
@@ -309,7 +335,7 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec) {
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   bool capturing = false;
   auto allowed = kvaf::detail::BatchGetCapture(stream, exec.execution.synchronize,
-                                              exec.execution.profile != nullptr, &capturing);
+                                              exec.execution.profile != nullptr, &capturing, expected_capture);
   if (!allowed.ok()) return allowed;
   if (call.captured_stream && call.captured_stream != stream)
     return InvalidArgument("captured AICPU transport must use its capture stream");

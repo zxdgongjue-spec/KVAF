@@ -7,7 +7,8 @@ KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备�
 当前支持 AIV URMA、AIV UBmem、AICPU Put/Gather 和 AICPU Put/Scatter。
 CPU 端使用同一个服务程序，NPU 端默认构建一份包含全部后端的 Python 包，
 通过 `NpuRuntime` 配置默认及启用的实现；per-call 模式允许在调用时选择算法，
-每种 Get 的资源和执行状态首次准备后驻留复用。四种 Get 均提供单节点图租约。
+每种 Get 的通信资源首次准备后驻留复用。四种 Get 均可在同一 stream 上保留多张图，
+每张图可通过多个节点租约捕获多个 Get。
 
 实现边界与部署步骤见 [Get 图模式演进](docs/get_graph_evolution.md)，
 功能和性能验证见 [验证指南](docs/cache_transport_execution_validation.md)。

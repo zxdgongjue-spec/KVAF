@@ -52,7 +52,9 @@ struct GetExecutionContext {
   void* warmed_stream{nullptr};
   std::uint64_t output_id{0};
   GetOutputOptions output_options;
-  GetGraphOptions graph_options;
+  std::vector<BatchGetKernelProfile> last_graph_profile;
+  bool profiling_enabled{false};
+  bool graph_recovery_required{false};
   GetResourceView view() const { return resources ? resources.view() : lease.view(); }
   Status Bind() {
     state = view().CreateState();
@@ -68,5 +70,14 @@ struct GetExecutionContext {
     lease = {};
   }
   BatchGetExecRequest invocation() const { return {table, &request, options}; }
+};
+
+struct GetGraphNode {
+  GetExecutionContext* instance{};
+  GetGraphOptions options;
+  std::unique_ptr<ExecutionState> state;
+  bool captured{false};
+  bool ending{false};
+  bool domain_closed{false};
 };
 }  // namespace kvaf

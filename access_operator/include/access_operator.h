@@ -134,6 +134,9 @@ class AccessOperator {
   virtual Status FinishGetGraph(void*, bool) {
     return Status::NotImplemented("provider does not support graph leases");
   }
+  // True only after fencing the graph stream and establishing that the
+  // shared communication domain must be closed before releasing its pins.
+  virtual bool GetGraphNeedsRecovery() const { return false; }
   virtual Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*) {
     return Status::NotImplemented("graph leases require execution dispatcher");
   }

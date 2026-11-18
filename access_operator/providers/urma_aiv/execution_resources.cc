@@ -147,9 +147,11 @@ AivExecutionResources::~AivExecutionResources() {
 UrmaAivGetView AivExecutionResources::GetView() {
   const auto& call = *state_->active;
   const auto& c = state_->config;
+  auto workspace = state_->get.workspace;
+  if (call.graph_report.device) workspace.status = call.graph_report.device;
   return {state_->views.View(ExecutionDirection::Get),
           {c.npu_core_count, c.jettys_per_core, c.batch_get_max_inflight_total},
-          state_->get.workspace,
+          workspace,
           call.graph_buffer ? call.graph_buffer : call.pending_buffer,
           call.graph_buffer ? call.graph_entity : call.get_entity};
 }
@@ -170,7 +172,8 @@ Status AivExecutionResources::Bind(ExecutionState* state) {
   if (!typed || typed->owner != this)
     return Status::InvalidArgument("AIV execution state belongs to another resource");
   const auto& active = *state_->active;
-  if (typed != state_->active && (active.pending_get || active.pending_buffer || active.graph_buffer || active.output_buffer
+  if (typed != state_->active && !active.graph_node &&
+      (active.pending_get || active.pending_buffer || active.graph_buffer || active.output_buffer
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
       || active.pending_put || active.pending_put_buffer || active.input_buffer
 #endif
@@ -256,6 +259,18 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   if (call.owner != this || state_->active != &call)
     return InvalidArgument("graph preparation requires the bound AIV invocation");
   if (call.graph_buffer) return Status::Busy("graph binding already exists");
+  if (call.graph_node) {
+    if (aclrtSynchronizeStream(static_cast<aclrtStream>(options.stream)) != ACL_SUCCESS)
+      return Status::CompletionUnknown("Get graph stream is still pending");
+    const auto& shared = state_->get.workspace;
+    auto s = call.graph_report.Allocate(shared.status_bytes, 0, false);
+    if (!s.ok()) return s;
+    if (shared.profiling) {
+      auto view = GetView();
+      s = UrmaAivGetOperator::SetProfiling(true, view);
+      if (!s.ok()) return s;
+    }
+  }
   BatchGetRequest request;
   request.output = options.output;
   BatchGetExecRequest exec;
@@ -263,7 +278,11 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   exec.execution.stream = options.stream;
   auto view = GetView();
   auto status = PrepareGetResources(exec, call, &view);
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    if (!call.pending_buffer) return status;
+    auto retired = UrmaAivGetOperator::Drain(view, call);
+    return retired.ok() ? status : Status::CompletionUnknown(retired.message());
+  }
   call.graph_buffer = call.pending_buffer;
   call.graph_entity = call.get_entity;
   call.graph_options = options;
@@ -271,6 +290,11 @@ Status AivExecutionResources::PrepareGraph(const GetGraphOptions& options, AivIn
   call.pending_get = nullptr;
   call.get_entity = 0;
   return Status::OK();
+}
+Status AivExecutionResources::SetGetProfiling(bool enabled) {
+  auto s = UrmaAivGetOperator::SetProfiling(enabled, GetView());
+  if (s.ok()) state_->get.workspace.profiling = enabled;
+  return s;
 }
 Status AivExecutionResources::PrepareOutput(const GetOutputOptions& options, AivInvocation& call) {
   if (call.output_buffer || call.graph_buffer || !options.request_capacity || !options.stream ||
