@@ -17,7 +17,6 @@ constexpr uint32_t kScatterLocalMemoryBytes = 64U * 1024U;
 // bits must fail validation rather than silently select a different algorithm.
 constexpr uint32_t kScatterOptionsV1 = 0x53430100U;
 constexpr uint32_t kScatterDeviceSequence = 1U;
-constexpr uint32_t kScatterReadyRefresh = 2U;
 constexpr uint32_t kScatterProfiling = 4U;
 // Host's existing trusted-input contract also applies to device list contents.
 constexpr uint32_t kScatterTrustedInputs = 8U;
@@ -25,12 +24,12 @@ constexpr uint32_t kScatterConfiguredJettys = 16U;
 constexpr uint32_t kScatterPipeline = 32U;
 constexpr uint32_t kScatterJettyCursors = 64U;
 constexpr uint32_t kScatterOverlapHeadCq = 128U;
-// The low option byte is full. This bit is outside the version byte.
+// Graph mailbox selection uses a bit outside the version byte.
 constexpr uint32_t kScatterGraphMailbox = 1U << 31;
 constexpr uint32_t kScatterMailboxWqesPerBatch = 16U;
 constexpr uint32_t kScatterOptionsMask =
     kScatterProfiling | kScatterTrustedInputs | kScatterConfiguredJettys | kScatterPipeline | kScatterJettyCursors |
-    kScatterOverlapHeadCq | kScatterReadyRefresh | kScatterDeviceSequence | kScatterGraphMailbox;
+    kScatterOverlapHeadCq | kScatterDeviceSequence | kScatterGraphMailbox;
 KVAF_SCATTER_OPTIONS_INLINE constexpr bool ScatterOptionsValid(uint32_t value) {
   return value == 0 || value == kScatterProfileFlag ||
       (value & ~kScatterOptionsMask) == kScatterOptionsV1;

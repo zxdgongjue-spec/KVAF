@@ -450,7 +450,7 @@ def run_case(args):
                                          contiguous_source_token_ids)
 
         if args.fixed_request_plan:
-            # The peer can seed staging on the first successful request.
+            # Keep each node's request plan fixed across preflight and samples.
             fixed_inputs = request_plan()
         else:
             preflight_slots = contiguous_source_token_ids % args.tokens_per_block
@@ -715,7 +715,7 @@ def main(argv=None, runner=None):
         expected = {key: getattr(case, key) for key in (
             "request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
             "aiv_cores", "jettys_per_core", "source_access_pattern", "output_access_pattern",
-            "sort_input_indices", "pipeline", "jetty_cursors", "overlap_head_cq", "ready_refresh",
+            "sort_input_indices", "pipeline", "jetty_cursors", "overlap_head_cq",
             "fixed_request_plan")}
         expected.update(submission_config(case))
         expected["cpu_jettys"] = scatter_payload_jettys(case)

@@ -26,11 +26,6 @@ AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 两组可直接对比端到端耗时和 AIV 墙钟。profiled CSV 中的 `aiv_cross_chunk_shards`
 统计本批跨过尚未消费的早期 chunk 提交的分片数。
 
-N 端可设置 `KVAF_SCATTER_READY_REFRESH=1`，配合 `--pipeline 1 --jetty-cursors 1`
-对照默认值 `0`。AIV 即将跨过未消费的前序分片时，最多为每个目标 chunk 额外读取一次
-Ready，让本次读取发现的前序分片优先进入 Scatter。profiled CSV 中的
-`aiv_ready_refreshes` 统计额外读取次数，`aiv_ready_refresh_hits` 统计选中更早 chunk 的次数。
-
 Scatter 默认在每个会话创建 4 条共享 payload Jetty。N 端在初始化前设置
 `KVAF_SCATTER_JETTYS_PER_CORE`，或给两个 Scatter 性能脚本传入 `--jettys-per-core`，
 可按 `AIV 核数 × jettys-per-core` 设置共享 Jetty 总数，上限为 32。
@@ -211,9 +206,10 @@ CSV 标记为 `caller_acl_graph`。脚本只捕获 BatchGet，状态校验在样
 
 ### 多次 BatchGet 共用一次 Graph 提交
 
-使用 `--caller-acl-graph --graph-calls 32 --completion-scope stream`，一次捕获 32 个
+使用 `--caller-acl-graph --graph-calls 8 --completion-scope stream`，一次捕获 8 个
 BatchGet kernel，每次 replay 统一等待整图完成。`--iterations 20` 对应 20 次 replay，正式
-样本总计 640 次 BatchGet。`--graph-calls` 默认 1，大于 1 时使用调用方图路径。
+样本总计 160 次 BatchGet。当前实测在 8 个节点附近已取得主要摊销收益，继续增大收益较小。
+`--graph-calls` 默认仍为 1，大于 1 时使用调用方图路径，可在不同设备和请求尺寸下重新对照。
 
 每个节点有独立的源索引、偏移和输出行清单。随机请求模式下，在样本计时外刷新所有节点的
 输入。输出分配按 stream 顺序复用，读回最终节点的输出。捕获前逐节点验证请求数据及 guard，
@@ -300,13 +296,18 @@ cache line 时，会先提交这个分片，沿用原有 Ready 信号。每批�
 
 在 N 端保持 `KVAF_SCATTER_CPU_GATHER=1`，用以下组合对照。K 端开关在启动服务时设置。
 
-| N 端 `--pipeline` | K 端 `KVAF_CPU_GATHER_INTERLEAVE` | K 端 `KVAF_CPU_GATHER_JETTY_SUPPLY` | CPU 提交 | AIV scatter |
-| --- | --- | --- | --- | --- |
-| 0 | 0 | 0 | 整批 gather 后提交 | 等 Done |
-| 0 | 1 | 0 | 交错分波 | 等 Done |
-| 1 | 0 | 0 | 按连续行分波 | 按 Ready |
-| 1 | 1 | 0 | 交错分波 | 按 Ready |
-| 1 | 任意 | 1 | 首段提前提交，后缀按 Jetty 提交 | 按 Ready，可启用 Jetty cursor |
+| N 端 `--pipeline` | K 端 `KVAF_CPU_GATHER_INTERLEAVE` | CPU 提交 | AIV scatter |
+| --- | --- | --- | --- |
+| 0 | 0 | 整批 gather 后提交 | 等 Done |
+| 0 | 1 | 首段提前提交，交错 gather，后缀按 Jetty 独立提交 | 等 Done |
+| 1 | 0 | 按连续行分波 | 按 Ready |
+| 1 | 1 | 首段提前提交，交错 gather，后缀按 Jetty 独立提交 | 按 Ready，可启用 Jetty cursor |
+
+K 端统一使用 `KVAF_CPU_GATHER_INTERLEAVE`，默认值为 `0`。设为 `1` 对应原来的
+Interleave 与 Jetty supply 同时开启，独立于 N 端的 Scatter pipeline。旧的
+`KVAF_CPU_GATHER_JETTY_SUPPLY` 已移除，启动脚本改为设置 `KVAF_CPU_GATHER_INTERLEAVE=1`。
+`CPU_PUSH_CAP` 的 `gather_interleave` 输出配置值，Gather profile 的 `interleaved` 和
+`jetty_supply` 输出本次请求实际采用的调度方式。
 
 交错模式保留首段提前提交，后续每波优先为不同 AIV 核和 Jetty 各准备一个分片。
 分片跨越首段边界或内部边界未按 cache line 对齐时，CPU 回退到按连续行分波。
@@ -316,16 +317,15 @@ CPU profile 的 `pipeline` 表示 AIV 模式，`gather_pipeline` 表示 CPU 是�
 （首条提交前到最后一次提交返回）和 `post_tail_ns`（最后一次提交返回到完成回收）
 拆解 `cpu_comm_us`。分波时提交窗口包含供数间隔。
 
-K 端设置 `KVAF_CPU_GATHER_JETTY_SUPPLY=1` 会启用交错调度，后缀分片按 Jetty 独立提交。
+K 端设置 `KVAF_CPU_GATHER_INTERLEAVE=1` 会启用交错调度，后缀分片按 Jetty 独立提交。
 满足 cache-line 对齐且活跃 gather 线程数至少等于 Jetty 数时，每条 Jetty 有独立的 gather 线程组，
 日志记录 `jetty_supply=1`。每条 Jetty 按自身队首分片的就绪顺序提交，保留有序 Ready。
 最终 Done 在全部 payload CQE 回收后发布。N 端使用 `--pipeline 1 --jetty-cursors 1` 按 Jetty 消费 Ready。
 `waves` 记录 WRITE 计划提交次数，一个 gather 波可对应多个提交计划。
 
-K 端可用 `KVAF_CPU_PUSH_IDLE_CQ_REAP=1` 对照默认值 `0`。流水 Gather 的协调线程在等待后缀或工作线程时，
-先提交就绪 WRITE，有待回收 CQE 的情况下每 32 轮等待最多做一次非阻塞 CQ 扫描。`CPU_PUSH_GATHER_PROFILE`
-中的 `idle_cq_sweeps`、`idle_cqes`、`idle_cq_poll_ns` 分别记录扫描次数、回收数和耗时。
-空档轮询的耗时计在 `copy_ns` 内。对照 `write_ns` 和端到端耗时验证收益。
+CQ 回收保留队列信用不足时的回收和最终排空。已删除空档 CQ 扫描实验，等待后缀或 gather
+工作线程时只推进已经就绪的提交。预填 staging 和额外 Ready refresh 实验也已删除，每个
+请求均读取当前源数据并正常 gather。
 
 `max_jetty_post_gap_ns` 是同一 Jetty 相邻提交之间的最大间隔，包含在途数据仍可搬运的时间。
 对照 `post_calls`、`tail_cqes`、`post_window_ns`、`post_tail_ns`、`write_ns` 和端到端 P50/P90。
@@ -364,7 +364,7 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
 加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于
 请求和数据随样本变化的端到端性能回归。
 
-### Jetty 时间戳与预填 staging 对照
+### Jetty 时间戳诊断
 
 在 K 端启动服务时设置 `KVAF_CPU_PUSH_JETTY_TRACE_SAMPLES=8`，采集每会话前 8 个带 profiling 的请求，
 包含 profile warmup。默认值为 0。会话关闭后，`CPU_PUSH_JETTY_TRACE` 按 `session / sequence / jetty / plan`
@@ -377,17 +377,8 @@ DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
 - `pending_fences_before_post` 统计该 Jetty 提交前尚未回收的此前计划，含已完成但尚未轮询的 CQE。
   所有时间戳使用同一 K 端单调时钟。`trace_write_begin_ns` 可作请求内时间原点。
 
-K 端设置 `KVAF_CPU_PUSH_PREFILL_STAGING=1` 启用预填对照。每个会话的第一次请求正常 Gather，用 warmup
-填充 staging。后续请求复用相同的 staging、WRITE 计划与 Ready，在各段描述符可用后核对地址清单，
-清单变化会返回错误。测试期间要固定源数据和请求清单，尤其要避免原地更新源数据。K 端只核对地址。
-`staging_reused=1` 标记复用的样本。此时 `gather_ready_ns` 表示允许提交的最早时点，即 head 的
-`trace_write_begin_ns` 或 suffix 的 `suffix_seen_ns`。地址核对和实际提交仍在计时窗口内，
-`prefill_verify_ns` 单独记录地址核对的时间。
-
-分别以 `KVAF_CPU_PUSH_PREFILL_STAGING=0` 和 `1` 启动两次 K 端服务，其他配置相同。N 端两次使用同一命令，
-分别保存日志和 CSV。使用不设 `KVAF_SCATTER_JETTYS_PER_CORE` 的默认 4 条共享 Jetty。
-如果用 `tests/run_remote_cpu_scatter_miss_count_perf.sh`，两组都加 `--fixed-request-plan`。该选项让正确性预检、
-warmup 和正式采样共用一份请求清单。预填组在预检时填充 staging。
+Trace 沿用正常的 gather 路径，无需固定请求清单。以下示例固定源数据和一份请求计划，方便逐条
+对照提交间隔；也可使用 miss-count 脚本采集每次刷新的随机清单。
 
 ```bash
 python tests/python/test_aiv_scatter_perf.py --input-mode steady --plans 1 \

@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <functional>
 #include <sstream>
 #include <stdexcept>
 
@@ -20,7 +19,6 @@ constexpr std::size_t kJettyDepth = 8192;
 static_assert(kMaxJettyCount <= cpu_urma_detail::IndexedAsyncWriteTracker::kMaxQueues);
 constexpr std::size_t kGatherProfileSamples = 512;
 constexpr std::size_t kMaxJettyTraceRecords = 16384;
-constexpr std::uint32_t kIdleCqPollInterval = 32;
 #ifdef __OPTIMIZE__
 constexpr unsigned kOptimized = 1;
 #else
@@ -69,17 +67,9 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
   const auto* interleave = std::getenv("KVAF_CPU_GATHER_INTERLEAVE");
   if (interleave && ((interleave[0] != '0' && interleave[0] != '1') || interleave[1] != '\0'))
     return Status::InvalidArgument("KVAF_CPU_GATHER_INTERLEAVE must be 0 or 1");
+  // One switch selects interleaved gather and independent per-Jetty supply.
+  // Planning and copying retain their alignment and small-thread-pool fallbacks.
   gather_interleave_ = interleave && interleave[0] == '1';
-  const auto* jetty_supply = std::getenv("KVAF_CPU_GATHER_JETTY_SUPPLY");
-  if (jetty_supply && ((jetty_supply[0] != '0' && jetty_supply[0] != '1') || jetty_supply[1] != '\0'))
-    return Status::InvalidArgument("KVAF_CPU_GATHER_JETTY_SUPPLY must be 0 or 1");
-  gather_jetty_supply_ = jetty_supply && jetty_supply[0] == '1';
-  gather_interleave_ |= gather_jetty_supply_;
-  if (const auto* idle_cq_reap = std::getenv("KVAF_CPU_PUSH_IDLE_CQ_REAP")) {
-    if ((idle_cq_reap[0] != '0' && idle_cq_reap[0] != '1') || idle_cq_reap[1] != '\0')
-      return Status::InvalidArgument("KVAF_CPU_PUSH_IDLE_CQ_REAP must be 0 or 1");
-    idle_cq_reap_ = idle_cq_reap[0] == '1';
-  }
   if (const auto* value = std::getenv("KVAF_CPU_PUSH_JETTY_TRACE_SAMPLES")) {
     char* end = nullptr;
     errno = 0;
@@ -88,17 +78,11 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
       return Status::InvalidArgument("KVAF_CPU_PUSH_JETTY_TRACE_SAMPLES must be in 0..512");
     jetty_trace_budget_ = samples;
   }
-  if (const auto* value = std::getenv("KVAF_CPU_PUSH_PREFILL_STAGING")) {
-    if ((value[0] != '0' && value[0] != '1') || value[1] != '\0')
-      return Status::InvalidArgument("KVAF_CPU_PUSH_PREFILL_STAGING must be 0 or 1");
-    prefill_staging_ = value[0] == '1';
-  }
   try {
     gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
     gather_profile_samples_.reserve(kGatherProfileSamples);
     if (jetty_trace_budget_) jetty_trace_.reserve(kMaxJettyTraceRecords);
-    if (prefill_staging_) prefill_addresses_.resize(kMaxRequests);
   } catch (const std::exception& error) {
     return Status::Internal(error.what());
   }
@@ -150,9 +134,11 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     gather_write_limit = std::min<std::uint64_t>(gather_write_limit, attr.dev_cap.max_write_size);
   max_gather_write_bytes_ = static_cast<std::uint32_t>(gather_write_limit);
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u "
-               "payload_jettys=%u payload_write_bytes=%u post_batch_wrs=%u optimized=%u source_refresh=%s\n",
+               "payload_jettys=%u payload_write_bytes=%u post_batch_wrs=%u gather_interleave=%u "
+               "optimized=%u source_refresh=%s\n",
                max_sge_, max_bytes_, workers_, token_bytes_, jetty_count_,
-               gather_ ? max_gather_write_bytes_ : max_bytes_, post_batch_wrs_, kOptimized,
+               gather_ ? max_gather_write_bytes_ : max_bytes_, post_batch_wrs_,
+               unsigned(gather_interleave_), kOptimized,
                gather_ ? "cpu_gather" :
                (std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_ ? "contiguous_runs_v1" : "fragment_map"));
   urma_seg_t segment{};
@@ -321,8 +307,7 @@ std::uint32_t Transport::FirstGatherChunkRows(std::uint32_t count) const {
 
 Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave,
                              const peer::CpuGatherExecutor::FixedSuffix* suffix,
-                             const peer::CpuGatherExecutor::ShardProgress& on_shards,
-                             const peer::CpuGatherExecutor::IdleProgress& on_idle) {
+                             const peer::CpuGatherExecutor::ShardProgress& on_shards) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   try {
     std::size_t threads;
@@ -331,13 +316,13 @@ Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor:
       gather_->EnableProfiling(profile_.enabled, profile_.trace_write_begin_ns != 0U);
       threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
                                       gather_waves_, suffix,
-                                      on_shards ? gather_suffix_wave_ : SIZE_MAX, gather_jetty_supply_,
+                                      on_shards ? gather_suffix_wave_ : SIZE_MAX, gather_interleave_,
                                       jetty_count_);
     }
     if (!threads) return Status::InvalidArgument("invalid CPU push gather range");
     {
       BatchGetProfileScope timer(profile_.enabled ? &profile_.gather_copy_ns : nullptr);
-      gather_->Copy(on_wave, on_shards, on_idle);
+      gather_->Copy(on_wave, on_shards);
     }
     if (profile_.enabled) {
       profile_.cpu_threads = std::max(profile_.cpu_threads, static_cast<std::uint32_t>(threads));
@@ -513,7 +498,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         prepared_.push_back(std::move(plan));
       }
     };
-    if (wave && gather_jetty_supply_) {
+    if (wave) {
       // The Jetty gather groups publish their own shards, so each queue
       // needs a separately tracked WRITE plan for its part of the wave.
       for (std::uint32_t q = 0; q < jetty_count_; ++q)
@@ -618,17 +603,14 @@ void Transport::TraceJettyPost(PreparedWrite& plan, std::uint64_t id, std::uint3
     ++jetty_trace_dropped_;
     return;
   }
-  const bool shard = prepared_interleaved_ && gather_jetty_supply_ &&
-      plan.ready_waves > gather_suffix_wave_;
+  const bool shard = prepared_interleaved_ && plan.ready_waves > gather_suffix_wave_;
   auto ready = profile_.gather_ready_ns;
-  if (profile_.staging_reused)
-    ready = plan.suffix ? profile_.suffix_seen_ns : profile_.trace_write_begin_ns;
-  else if (plan.ready_waves)
+  if (plan.ready_waves)
     ready = gather_->FixedReadyNs(plan.ready_waves - 1U, queue, shard);
   q.trace_index = jetty_trace_.size();
   jetty_trace_.push_back({request().sequence, id, ready, now, 0, 0, plan.ready_waves,
                          tracker_.Pending(queue) - 1U, q.wrs.size(), q.markers.size(),
-                         queue, plan.suffix, profile_.staging_reused});
+                         queue, plan.suffix});
 }
 
 Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile,
@@ -756,19 +738,6 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     return status.ok() ? failure : status;
   };
   const auto count = request().count;
-  const auto head_rows = (request().reserved & kHeadStart) ? kChunkRows : 0U;
-  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  profile_.staging_reused = prefill_rows_ != 0U;
-  const auto validate_prefill = [&](std::uint32_t begin, std::uint32_t end) {
-    BatchGetProfileScope timer(profile ? &profile->prefill_verify_ns : nullptr);
-    return std::equal(addresses + begin, addresses + end, prefill_addresses_.begin() + begin);
-  };
-  const auto prefill_mismatch = [] {
-    return Status::InvalidArgument("CPU push prefill requires the same descriptor list and fixed source data");
-  };
-  if (profile_.staging_reused &&
-      (count != prefill_rows_ || !validate_prefill(0U, head_rows ? head_rows : count)))
-    return fail_gather(prefill_mismatch());
   if (gather_) {
     if (!tracker_.Empty()) return Error("grow gather staging while WRITE is in flight");
     const auto status = EnsureGatherStaging(count);
@@ -801,7 +770,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     }
     return PostPrepared(plan, refresh_for_post, profile, w + 1U);
   };
-  if (!gather_waves_.empty() && !profile_.staging_reused) {
+  if (!gather_waves_.empty()) {
     std::size_t next_plan = 0;
     std::array<std::size_t, kMaxJettyCount> next_shard{};
     std::size_t shards_left = 0U;
@@ -839,22 +808,6 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     };
     peer::CpuGatherExecutor::ShardProgress on_shards;
     if (shards_left) on_shards = [&] { return post_ready_shards(true); };
-    std::uint32_t idle_rounds = 0;
-    const auto reap_idle = [&] {
-      if (tracker_.Empty() || ++idle_rounds < kIdleCqPollInterval) return true;
-      idle_rounds = 0;
-      // Use one nonblocking sweep with the normal completion and credit checks.
-      const auto before = profile_.tail_cqes;
-      BatchGetProfileScope timer(profile ? &profile->idle_cq_poll_ns : nullptr);
-      post_status = PollPrepared(0, profile, false);
-      if (profile) {
-        ++profile->idle_cq_sweeps;
-        profile->idle_cqes += profile->tail_cqes - before;
-      }
-      return post_status.ok();
-    };
-    peer::CpuGatherExecutor::IdleProgress on_idle;
-    if (idle_cq_reap_) on_idle = std::ref(reap_idle);
     status = GatherRows(count, [&](std::size_t ready_waves) {
       while (next_plan < whole_plans && prepared_[next_plan]->ready_waves <= ready_waves) {
         post_status = submit_plan(next_plan);
@@ -862,7 +815,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
         ++next_plan;
       }
       return true;
-    }, (request().reserved & kHeadStart) ? &suffix : nullptr, on_shards, on_idle);
+    }, (request().reserved & kHeadStart) ? &suffix : nullptr, on_shards);
     if (!post_status.ok()) return post_status;
     if (!status.ok()) return fail_gather(status);
     if (next_plan != whole_plans) return fail_gather(Error("missing gather WRITE plan"));
@@ -877,32 +830,15 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     return DrainPrepared(profile);
   }
 
-  const bool prefilled_pipeline = profile_.staging_reused && !gather_waves_.empty();
   bool suffix_ready = false;
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
     if (plan.suffix && !suffix_ready) {
       status = wait_suffix();
       if (!status.ok()) return status;
-      if (profile_.staging_reused && !validate_prefill(head_rows, count))
-        return fail_gather(prefill_mismatch());
       suffix_ready = true;
     }
-    if (prefilled_pipeline) {
-      // Reuse the same per-Jetty plans and suffix gate. Once eligible, each
-      // plan can be submitted immediately because staging was filled at warmup.
-      bool submitted = false;
-      while (!submitted) {
-        status = submit_plan(w, &submitted);
-        if (!status.ok()) return status;
-        if (!submitted) {
-          status = PollPrepared(0, profile);
-          if (!status.ok()) return status;
-        }
-      }
-      continue;
-    }
-    if (plan.gather_before_post && !profile_.staging_reused) {
+    if (plan.gather_before_post) {
       status = GatherRows(count);
       if (!status.ok()) return fail_gather(status);
     }
@@ -918,13 +854,6 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
-  // Capture the warmup descriptors before publishing Done, while they still
-  // belong to this request. The benchmark keeps the source contents frozen.
-  if (prefill_staging_ && !prefill_rows_ && result == Result::kOk) {
-    const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-    prefill_rows_ = request().count;
-    std::copy_n(addresses, prefill_rows_, prefill_addresses_.begin());
-  }
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
   const bool report = profile_.enabled && (request().reserved & kInlineProfile) &&
@@ -987,15 +916,13 @@ void Transport::FlushGatherProfiles() {
         ? p.last_cqe_ns - p.last_post_return_ns : 0U;
     std::fprintf(stderr,
         "CPU_PUSH_GATHER_PROFILE session=%" PRIu64 " sequence=%" PRIu64 " rows=%u bytes=%" PRIu64
-        " pipeline=%u gather_pipeline=%u interleaved=%u waves=%u jetty_supply=%u staging_reused=%u"
+        " pipeline=%u gather_pipeline=%u interleaved=%u waves=%u jetty_supply=%u"
         " max_jetty_post_gap_ns=%" PRIu64
         " data_wrs=%u ready_wrs=%u post_calls=%u tail_cqes=%u"
         " write_ns=%" PRIu64 " post_window_ns=%" PRIu64 " post_tail_ns=%" PRIu64
         " post_ns=%" PRIu64 " cq_wait_ns=%" PRIu64
-        " idle_cq_reap=%u idle_cq_sweeps=%u idle_cqes=%u idle_cq_poll_ns=%" PRIu64
         " active_threads=%u prepare_ns=%" PRIu64 " copy_ns=%" PRIu64
         " suffix_wait_ns=%" PRIu64 " trace_write_begin_ns=%" PRIu64 " suffix_seen_ns=%" PRIu64
-        " prefill_verify_ns=%" PRIu64
         " join_wait_ns=%" PRIu64 " slow_worker=%u slow_tid=%" PRIu64 " slow_cpu=%d"
         " slow_bytes=%" PRIu64 " slow_ready_delay_ns=%" PRIu64
         " slow_start_delay_ns=%" PRIu64 " slow_copy_ns=%" PRIu64
@@ -1003,12 +930,11 @@ void Transport::FlushGatherProfiles() {
         " slow_cpu_time_valid=%u slow_wait_path=%u\n",
         session_, sample.sequence, sample.rows, std::uint64_t{sample.rows} * token_bytes_,
         unsigned(sample.pipeline), unsigned(sample.gather_pipeline), unsigned(sample.interleaved),
-        p.waves, unsigned(p.jetty_supply), unsigned(p.staging_reused), p.max_jetty_post_gap_ns,
+        p.waves, unsigned(p.jetty_supply), p.max_jetty_post_gap_ns,
         p.data_wrs, p.ready_wrs, p.post_calls, p.tail_cqes,
         p.write_ns, post_window_ns, post_tail_ns, p.post_ns, p.cq_wait_ns,
-        unsigned(idle_cq_reap_), p.idle_cq_sweeps, p.idle_cqes, p.idle_cq_poll_ns, p.cpu_threads,
-        p.gather_prepare_ns, p.gather_copy_ns,
-        p.suffix_wait_ns, p.trace_write_begin_ns, p.suffix_seen_ns, p.prefill_verify_ns,
+        p.cpu_threads, p.gather_prepare_ns, p.gather_copy_ns,
+        p.suffix_wait_ns, p.trace_write_begin_ns, p.suffix_seen_ns,
         p.gather_join_wait_ns, p.slowest_worker, slow.tid, slow.cpu, slow.bytes,
         p.slowest_ready_delay_ns, p.slowest_start_delay_ns, slow.copy_done_ns - slow.start_ns,
         slow.done_ns - slow.copy_done_ns,
@@ -1022,11 +948,11 @@ void Transport::FlushGatherProfiles() {
   for (const auto& trace : jetty_trace_) {
     std::fprintf(stderr,
         "CPU_PUSH_JETTY_TRACE session=%" PRIu64 " sequence=%" PRIu64 " jetty=%u plan=%" PRIu64
-        " wave=%zu suffix=%u staging_reused=%u wrs=%zu ready_wrs=%zu pending_fences_before_post=%zu"
+        " wave=%zu suffix=%u wrs=%zu ready_wrs=%zu pending_fences_before_post=%zu"
         " gather_ready_ns=%" PRIu64 " post_begin_ns=%" PRIu64 " post_return_ns=%" PRIu64
         " cqe_seen_ns=%" PRIu64 "\n",
         session_, trace.sequence, trace.jetty, trace.plan, trace.wave, unsigned(trace.suffix),
-        unsigned(trace.staging_reused), trace.wrs, trace.ready_wrs, trace.pending_fences,
+        trace.wrs, trace.ready_wrs, trace.pending_fences,
         trace.ready_ns, trace.post_begin_ns, trace.post_return_ns, trace.cqe_seen_ns);
   }
   if (jetty_trace_dropped_)
@@ -1088,8 +1014,6 @@ Status Transport::Shutdown() {
   for (auto& q : queues_) q.poisoned = false;
   std::free(gather_staging_); gather_staging_ = nullptr;
   gather_staging_bytes_ = 0;
-  prefill_addresses_.clear();
-  prefill_rows_ = 0;
   std::free(memory_); memory_ = nullptr;
   context_ = nullptr;
   return Status::OK();

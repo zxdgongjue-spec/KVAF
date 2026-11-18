@@ -133,11 +133,7 @@ class CpuGatherExecutor {
   // After the whole-wave prefix, on_shards can inspect the completion of
   // each shard independently. Wave indices passed to ShardReady are zero-based.
   using ShardProgress = std::function<bool()>;
-  // The coordinator can service pending work after publishing ready waves
-  // while it waits for descriptor suffixes or joins gather helpers.
-  using IdleProgress = std::function<bool()>;
-  void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {},
-            const IdleProgress& on_idle = {});
+  void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {});
   bool ShardReady(std::size_t wave, std::size_t queue) const;
   std::uint64_t FixedReadyNs(std::size_t wave, std::size_t queue, bool shard) const;
   bool UsesJettySupply() const { return fixed_jetty_supply_; }

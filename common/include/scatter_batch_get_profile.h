@@ -23,8 +23,8 @@ struct alignas(64) ScatterBatchGetCoreProfile {
   std::uint32_t pipeline{}, suffix_cq_blocked_cycles{};
   // Shards submitted while an earlier chunk still has unconsumed shards.
   std::uint32_t cross_chunk_shards{};
-  // Extra Ready scans and scans that selected an earlier chunk.
-  std::uint16_t ready_refreshes{}, ready_refresh_hits{};
+  // Keep the profile record and last-enqueue timestamp at their ABI offsets.
+  std::uint32_t reserved{};
   // Last payload enqueue/copy, before the final MTE drain in pipeline mode.
   std::uint64_t scatter_enqueue_finish_cycle{};
 };
