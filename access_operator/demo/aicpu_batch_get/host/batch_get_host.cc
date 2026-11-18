@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <utility>
 
 #include "aicpu_batch_get/include/kvaf_aicpu_batch_get.h"
@@ -108,6 +109,8 @@ struct BatchGetTransport::Impl {
   };
   std::array<StreamSlot, kMaxStreams> slots{};
   bool profiling{false}, profile_submitted{false};
+  // One-based launch number, so a crash report can be matched to a KVAF_ARGS dump.
+  unsigned launch_count{0};
   Status failure;
   bool initialized{false}, cpu_enabled{false};
 
@@ -140,6 +143,51 @@ struct BatchGetTransport::Impl {
       if (slot.stream != nullptr) return slot.stream;
     return nullptr;
   }
+  // The AICPU worker keeps its phase counter in an HBM status window, and the
+  // execution control block keeps the global claim counters. A stream error
+  // discards the queued device-to-host copy, so read both again with a plain
+  // synchronous copy: that copy does not depend on the broken stream and it is
+  // the only record of where inside the gather the worker stopped.
+  std::string DescribeStatus(std::size_t index) {
+    std::string text = "; AICPU";
+    GatherExecutionControl counters{};
+    if (aclrtMemcpy(&counters, sizeof(counters), control, sizeof(counters),
+                    ACL_MEMCPY_DEVICE_TO_HOST) == ACL_SUCCESS)
+      text += " claimed=" + std::to_string(counters.claimed) +
+              " failed=" + std::to_string(counters.failed);
+    else
+      text += " counters=unreadable";
+    if (aclrtMemcpy(StatusHostWindow(index), execution.status_bytes, StatusWindow(index),
+                    execution.status_bytes, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+      return text + " status=unreadable;" + LastLaunchText();
+    const auto* statuses = static_cast<const GatherReadStatus*>(StatusHostWindow(index));
+    for (unsigned worker = 0; worker < session.config().workers; ++worker) {
+      const auto& state = statuses[worker];
+      text += " w" + std::to_string(worker) + "{magic=" + std::to_string(state.magic) +
+              " seq=" + std::to_string(state.sequence) +
+              " phase=" + std::to_string(state.phase) +
+              " result=" + std::to_string(state.result) +
+              " ack=" + std::to_string(state.ack_seen) +
+              " cqe=" + std::to_string(state.cqe_word) + "}";
+    }
+    // phase 1=write source list 2=notify cpu 3=wait cpu ack 4=read staging
+    // 5=wait ready prefix; result uses GatherReadError.
+    return text + ";" + LastLaunchText();
+  }
+  // Identifies the launch that owned the stream when the fault was reported.
+  // DrainSlot runs before the next launch is built, so this still describes the
+  // kernel that actually failed even when the error surfaces one submit later.
+  struct LastLaunch {
+    std::string number, bytes, capacity, token_bytes, spans, workers, output, extent, sequence;
+  };
+  std::string LastLaunchText() const {
+    return " #" + last_launch.number + " bytes=" + last_launch.bytes +
+           " cap=" + last_launch.capacity + " token_bytes=" + last_launch.token_bytes +
+           " spans=" + last_launch.spans + " workers=" + last_launch.workers +
+           " output=" + last_launch.output + " extent=" + last_launch.extent +
+           " sid=" + last_launch.sequence;
+  }
+  LastLaunch last_launch;
   Status DrainSlot(StreamSlot& slot, const char* stage, bool check_status) {
     if (!slot.stream) return check_status ? failure : Status::OK();
     bool capturing = false;
@@ -152,12 +200,15 @@ struct BatchGetTransport::Impl {
       return Internal("GatherRead status enqueue failed; resources retained");
     const auto result = aclrtSynchronizeStream(slot.stream);
     if (result != ACL_SUCCESS) {
+      // aclGetRecentErrMsg stays valid only until the next runtime call, so copy
+      // it before the status read below replaces it.
       const char* detail = aclGetRecentErrMsg();
+      const std::string reason = detail ? detail : "unavailable";
       return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
                       " stage=" + stage +
                       " workers=" + std::to_string(session.config().workers) +
                       " source_mode=" + (direct_addresses ? "direct" : "table") +
-                      "; buffers retained; detail=" + (detail ? detail : "unavailable"));
+                      "; buffers retained; detail=" + reason + DescribeStatus(index));
     }
     if (check_status && !failure.ok()) return failure;
     if (check_status && slot.submitted) return ValidateStatus(index);
@@ -353,6 +404,15 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   args.worker_count = impl_->session.config().workers;
   args.profile = (profile || impl_->profiling) ? PointerValue(impl_->profile_device) : 0U;
   slot->submitted = false;
+  impl_->last_launch = {std::to_string(++impl_->launch_count),
+                        std::to_string(launch.gather.bytes),
+                        std::to_string(launch.request.request_capacity),
+                        std::to_string(launch.request.token_bytes),
+                        std::to_string(launch.gather.source_span_count),
+                        std::to_string(launch.gather.worker_count),
+                        std::to_string(launch.gather.output),
+                        std::to_string(launch.gather.output_extent),
+                        std::to_string(launch.gather.sequence)};
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
   DumpLaunchArgs(launch, stream, capturing, slot_index);
