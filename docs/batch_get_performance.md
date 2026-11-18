@@ -38,7 +38,8 @@ Get 输出正确性由计时后的 Tensor 校验验证；显式 profile 快照�
 UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 
 与 main 的异步计时边界对齐时，execution 可使用 `--get-timing async-wait`：
-提交后外部同步设备并停止计时，再单独测量 drain。该选项不降低实际的请求清理成本。
+提交后外部同步设备并停止计时，再通过 `PERF_RESULT operation=batch_get_post_wait_drain`
+单独报告 drain 耗时（毫秒）。这段包含请求清理，AICPU 还可能包含状态回读和检查。
 Graph 固定测 replay 加 stream 等待，资源准备、输出校验和 profile 读取均在计时外。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
@@ -55,7 +56,7 @@ UBMEM 同时开启地址准备、MTE 提交和最终 drain 的细分采样。
 开启后算子内打点的开销计入测得时间，profile 回读和结果打印在计时外。
 阶段可嵌套或重叠，各段 P50 不能相加得到总 P50。
 
-## 扫描负载与比较分支
+## 扫描负载
 
 扫描使用同一入口的普通循环，例如将单点命令中的 `--miss-count` 替换成
 `"$misses"`，外层使用 `for misses in 2048 4096 8192; do ...; done`。
@@ -65,8 +66,6 @@ Host 扫描器、周期扫描器及其专用结果解析格式。
 Get 性能使用本文入口，数据预检和输出校验保留在计时之外。
 多卡并发复用相同负载和图执行组件，测试独立/并发的持续吞吐；
 具体命令和与逐次采样的区别见[四种 Get 的多卡带宽测试](batch_get_multicard_performance.md)。
-跨分支自动编译、部署、服务启停及日志汇总见
-[main 对比说明](batch_get_main_comparison.md)。
 
 ## Python 入口与公共模块
 

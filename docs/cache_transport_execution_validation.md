@@ -119,7 +119,7 @@ Put 的有效载荷为 `rows * token_bytes * tokens_per_block`，不能把 rows 
 Put 预检和测后检查属于 `kind=metadata`，检查 key、长度、有效位及槽位地址。
 Get 的数据预检另行逐字节比较读回结果。
 
-## 绑定、分段定位与跨分支对比
+## 绑定与分段定位
 
 URMA AIV Direct 和 Gather 默认在预热前绑定输出，测量结束后解绑。
 设置 `KVAF_PERF_REUSE_GET_OUTPUT=0` 对照临时输出路径。
@@ -139,8 +139,6 @@ trace 在 shutdown 时落盘。Get 按算法、路径、事件分组；Put 还�
 与成功/失败。provider 内的准备、提交、完成、清理和 Runtime 外层成本可分别观察。
 分段嵌套或重叠，各段 P50 不能相加得到总 P50；最终性能对照关闭 trace。
 
-跨分支自动构建、设备包安装和 CPU 服务启停使用
-`tests/run_batch_get_main_comparison.sh`，详见[main 对比说明](batch_get_main_comparison.md)。
 多卡并发使用 `tests/run_remote_cpu_batch_get_multicard_perf.sh`，四种 backend 的命令和计时口径见
 [多卡带宽测试](batch_get_multicard_performance.md)。
 
