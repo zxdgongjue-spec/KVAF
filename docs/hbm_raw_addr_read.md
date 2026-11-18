@@ -65,7 +65,7 @@ source.release_batch(ready)  # 在 P 侧调用
 
 ready 发布本批读取许可，P 保持该 Tensor 内容稳定，直到应用确认消费者完成并调用 release。D 本地检查源、MR、批次和数组布局，直接启动 raw READ 算子；默认成功只表示提交完成，由调用方等待 stream 或建立跨 stream 依赖；Host 不回读或检查每核 status。每批不发送 AcquireRaw、Complete 或 Cancel 控制请求，Runtime 不提供完成通知接口。三数组留在读取端 NPU，不经过控制 TCP。
 
-`release_batch(ready)` 和源端 `cancel_batch(ready)` 只核对批次身份并释放本地冻结状态，不核验远端是否结束。应用先通过自己的消息通道确认读取成功，或确认读取端已经禁止该批次再发起 READ 且已排队任务全部结束，然后才能释放并覆盖源。bench 使用已有 Pipe：A 读取并校验成功后发 `reuse`，B 核对轮次后 release；通知在读取计时之外。通知丢失或 DMA 不确定时，应用继续保留源数据和 output。
+`release_batch(ready)` 和源端 `cancel_batch(ready)` 只核对批次身份并释放本地冻结状态，不核验远端是否结束。应用先通过自己的消息通道确认读取成功，或确认读取端已经禁止该批次再发起 READ 且已排队任务全部结束，然后才能释放并覆盖源。纯 NPU bench 使用独立 TCP 长连接：A 读取并校验成功后发 `reuse`，B 核对 request_id、source_id/source_epoch、sequence 和 mr_id 后 release；通知在读取计时之外。通知丢失或 DMA 不确定时，应用继续保留源数据和 output。
 
 `src_offsets` 相对本批源 Tensor，`dst_offsets` 相对 output，单位均为字节。数组和 output 必须在 D 本卡、连续、存储不重叠。调用方保证合法范围、目的区间不重叠、长度在 1..UINT32_MAX 且符合设备单次 READ 上限。一段直接生成一个 WQE，无 64 KiB 拆分；validate_ranges=True 可选启用设备端长度及边界检查，不检查目的重叠或设备能力。设备诊断仍写入 HBM status，但不会被 Host 回读或转换为接口异常；应用负责输入合法性和输出校验。
 
@@ -189,17 +189,8 @@ graph.reset()
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash
-cmake -S . -B build-shared-ddr \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF \
-  -DKVAF_BUILD_PYTHON=ON \
-  -DKVAF_ENABLE_CPU_OFFLOAD=ON \
-  -DKVAF_ENABLE_AIV_BATCH_GET=ON \
-  -DKVAF_ENABLE_AIV_BATCH_PUT=ON \
-  -DBUILD_TESTING=OFF \
-  -DPython_EXECUTABLE="$(command -v python)"
-cmake --build build-shared-ddr -j8
-export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
+PYTHON="$(command -v python)" bash build.sh npu --jobs 8
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/test_hbm_read_raw_addr.py \
   --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --rounds 3 \
   --npu-eid-a-raw '<A_FULLMESH_EID>' \
@@ -231,23 +222,24 @@ python tests/python/test_hbm_read_raw_addr.py \
 还覆盖不回读 Host status、计时事件复用/失败，以及算子提交或显式同步失败时保留源、output 和状态缓冲。
 `kvaf_hbm_read_transport_test` 运行生产 Host 注册/缓存代码，验证 78 份不同 token/EID 的描述共用 output MR 和队列、缓存命中、上传失败、部分导入和重试清理。
 `kvaf_hbm_read_control_test` 验证初始化/关闭控制帧粘连、头/正文分片、截断、旧版本/错误长度/身份及远端错误返回。
-Python bench 的无硬件测试还验证匹配的 reuse 消息才释放源；错误轮次、通知丢失或 Pipe 断开时保留冻结批次。
+Python bench 的无硬件测试还验证匹配的 reuse 消息才释放源；错误轮次、源代次/MR/sequence 不匹配、通知丢失或 TCP 断开时保留冻结批次。`test_tcp_control.py` 使用真实 loopback TCP 验证双向通知、拆包/粘包、协议校验、超时和断线，并在假 NPU 环境中运行 reader/producer 流程；读取同步失败时不发送复用许可，丢失 release 回复时也不会提前关闭被图引用的源注册。
 这些测试不替代 Linux CANN 编译和真实 A—B READ 验收。
 
 ## 随机离散包性能测试
 
 `tests/python/bench_hbm_read_raw_addr.py` 中的 A 为读取端，B 为生产端。
+默认 `--role local` 仍自动启动 B 子进程，但 receiver、测试配置和全部逐批通知均走 TCP，不再创建 Pipe。
 先按上文重新编译 NPU 扩展和 raw kernel，再执行；此脚本不需要 CPU 服务：
 
 ```bash
-export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/bench_hbm_read_raw_addr.py \
   --device-a 6 --device-b 7 \
   --npu-eid-a-raw 000000000047050000100000df00d806 \
   --npu-eid-b-raw 000000000047050000100000df00f807 \
   --packets 4096 --packet-bytes 656 --source-space-bytes 268435456 \
   --warmup 10 --iterations 100 --profile-warmup 1 --profile-iterations 20 \
-  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+  --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
 EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已删除 `--cpu`、`--cpu-candidate` 参数和占位 DDR 分配。
@@ -293,8 +285,8 @@ raw READ 对 torch.Size 只提取维数并校验维度值，避免构造 shape v
 
 ```bash
 # 构建测试辅助扩展；配置时需 KVAF_BUILD_PYTHON=ON、BUILD_TESTING=ON。
-cmake --build build-shared-ddr --target _kvaf_binding_metadata_test -j
-PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}" \
+cmake --build build-npu --target _kvaf_binding_metadata_test -j
+PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
 python tests/python/bench_npu_binding_metadata.py --device 6 --iterations 100
 ```
 
@@ -312,7 +304,7 @@ python tests/python/bench_npu_binding_metadata.py --device 6 --iterations 100
 下面一次 `batch_get_raw_addr()` 读取 1024 个 `128 × 128 B` block 和 1024 个 `128 × 4 B` block：
 
 ```bash
-export PYTHONPATH="$PWD/build-shared-ddr/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/bench_hbm_read_raw_addr.py \
   --device-a 6 --device-b 7 \
   --npu-eid-a-raw 000000000047050000100000df00d806 \
@@ -320,7 +312,7 @@ python tests/python/bench_hbm_read_raw_addr.py \
   --block-group 1024:16384 --block-group 1024:512 \
   --source-space-bytes 268435456 \
   --warmup 10 --iterations 100 --profile-warmup 1 --profile-iterations 20 \
-  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+  --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
 每批共 2048 段、17,301,504 B（16.5 MiB），只调用一次 Runtime。默认 source-count=1，两组都来自同一个源 Tensor/MR，
@@ -367,9 +359,74 @@ python tests/python/bench_hbm_read_raw_addr.py \
   --packets 1024 --packet-bytes 656 \
   --warmup 78 --iterations 156 --profile-iterations 78 \
   --validate-ranges \
-  --raw-kernel build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+  --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
 注册成功日志包含 `HBM_READ_READY ... jettys=4 mrs=78 probe=all_mrs_all_lanes_pass`。
 通过标志为 `NPU_HBM_BENCH_PASS ... source_count=78`。功能验收可保留 validate-ranges，
 比较默认快速路径性能时去掉此开关，并使用相同包数/包大小/空间大小对照 source-count=1。
+
+## TCP 通知与两机独立启动
+
+应用通知由 `python/kvaf/tcp_control.py` 提供，与内部 KVHR v8 硬件建链连接独立：
+
+| 通道 | 发起连接方向 | 消息 |
+| --- | --- | --- |
+| 应用 TCP，例如 A:29100 | B → A 建立双向长连接 | hello/connected、request/ready、reuse/released、shutdown/closed、error |
+| KVHR TCP，例如 A:29000 | B 的 source.register → A 的 listen_hbm | MR、Jetty、TP、探测、重连及硬件资源关闭 |
+| NPU 数据通道 | A 发起 READ，KV 从 B HBM 搬到 A HBM | HBM payload，不进入上述 TCP 通道 |
+
+A 先监听；B 连接应用端口后，A 发送 receiver 字典和测试配置，B 使用自身 device/EID 注册源。每轮 A 发 request，B 生产、同步 stream 并 ready，发回 `(request_id, ReadyToken)`。A 读取、等待 stream 并验证后发送 reuse；B 核对完整批次身份，release 后回复 released。A 销毁全部捕获图后才发送 shutdown；B 关闭源并回复 closed，A 最后关闭 Runtime。
+
+两机均使用同一份最新源码和已安装 torch_npu 的 Python 环境，执行以下命令。build.sh 默认输出到 build-npu，包含 raw READ kernel，并在增量构建后同步 Python 通知模块，无需手工复制：
+
+```bash
+PYTHON="$(command -v python)" bash build.sh npu --jobs 8
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+在 A 机启动 reader（将 `192.168.1.20` 替换为 B 可访问的 A 机 Host IPv4）：
+
+```bash
+python tests/python/bench_hbm_read_raw_addr.py \
+  --role reader --device-a 0 \
+  --npu-eid-a-raw '<A_VERIFIED_NPU_ROUTE_EID>' \
+  --control-listen 0.0.0.0:29100 \
+  --hbm-listen 0.0.0.0:29000 --hbm-advertise 192.168.1.20:29000 \
+  --packets 1024 --packet-bytes 656 --source-space-bytes 1048576 \
+  --warmup 10 --iterations 100 --profile-iterations 0 \
+  --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+```
+
+在 B 机启动 producer：
+
+```bash
+python tests/python/bench_hbm_read_raw_addr.py \
+  --role producer --device-b 0 \
+  --npu-eid-b-raw '<B_VERIFIED_NPU_ROUTE_EID>' \
+  --control-connect 192.168.1.20:29100
+```
+
+两机本地设备编号可以相同。producer 不要求 A 的 EID/raw kernel，也不初始化 reader Runtime；reader 不要求 B 的 EID。包布局、MR 数、随机种子及轮数由 A 通过 hello 统一下发，B 保留自身设备/EID/连接参数；测试规模和 graph/profile 等选项配置在 reader 命令上。
+
+两个 TCP 端口均须从 B 可达。TCP 连通仅说明通知可达；两端 EID 仍须对应实际可互通、支持当前 UDMA READ 的 NPU 路由。原 fullmesh 双卡配置不能直接证明跨机路由可用。运行日志应出现 `application_transport=tcp role=reader`，通过标志仍为 `NPU_HBM_BENCH_PASS`，包含实际 READ 完成和每轮完整数据校验。
+
+- `--control-timeout`：初始连接、等待对端及单次通知收发超时，单位秒，默认 180；两端可分别配置。
+- `--control-listen`：A 的应用地址，支持端口 0；实际端口打印在 `NPU_HBM_TCP_LISTEN`。独立启动时建议用固定端口。
+- `--control-connect`：B 连接的 A 应用地址；不能为 `0.0.0.0` 或端口 0。
+- `--hbm-listen` / `--hbm-advertise`：独立 KVHR 地址。默认 loopback 仅用于同机；跨机须设置 B 可访问的 advertise 地址。
+
+通知帧使用 `KVNT + version=1 + network-order payload length`，最大 4 MiB，开启 TCP_NODELAY，按绝对 deadline 处理拆包/粘包。ReadyToken 沿用匹配版本原生绑定的 pickle 状态；接收端仅允许内置数据及指定 NPU ReadyToken/source 类型，禁止任意 Python 全局对象。通道面向可信集群节点，不提供端点认证；不传 Tensor、stream、Source/Runtime 对象或 HBM payload。
+
+初始 connect 在超时内重试；活动应用会话断线/超时后不自动重连、重发 READ 或释放批次。B 已注册的源在缺少有效 shutdown 时继续保留，即使本轮已 release，也不能提前注销捕获图仍引用的通信资源。内部 KVHR 重连保持原有语义。异常日志提示保留资源时，先确认两端 stream/图和传输已停止，再处理进程。
+
+实际 Connector 可通过 `from kvaf.tcp_control import TcpControlListener, TcpControlChannel` 复用；`send((kind, payload))` / `recv()` 提供消息边界，业务层仍负责身份和完成确认。连接支持串行 sender 与串行 receiver 并行工作，不要由其他线程直接访问底层 socket。
+
+无 NPU 测试：
+
+```bash
+python tests/python/test_tcp_control.py
+python tests/python/test_pull_benchmarks.py
+```
+
+真实 TCP 测试中的 Tensor/kernel 为假实现，不替代目标机器上的跨机 HBM READ 验收。

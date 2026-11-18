@@ -2,7 +2,9 @@
 
 A reads B with batch_get_raw_addr without a CPU service or DDR allocation.
 Payload travels only from B HBM to A HBM. Setup, producer
-writes, metadata preparation, verification and application IPC are outside timing.
+writes, metadata preparation, verification and TCP notifications are outside timing.
+The default local role spawns B but exchanges all control messages over TCP.
+Use --role reader / --role producer to launch the peers on separate hosts.
 """
 import argparse
 from dataclasses import dataclass
@@ -10,9 +12,10 @@ from math import gcd
 import multiprocessing as mp
 import time
 import traceback
+import uuid
 
 from pull_bench_utils import print_stages, scattered_offsets, summarize_us
-from test_remote_cpu_offload import receive, retain
+from test_remote_cpu_offload import retain
 
 GUARD_BYTES = 64
 
@@ -29,10 +32,16 @@ def packet_group(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--role", choices=("local", "reader", "producer"), default="local")
+    parser.add_argument("--control-listen", default="127.0.0.1:0", help="reader application TCP host:port")
+    parser.add_argument("--control-connect", help="producer connects to the reader application TCP address")
+    parser.add_argument("--control-timeout", type=float, default=180, help="TCP operation timeout in seconds")
+    parser.add_argument("--hbm-listen", default="127.0.0.1:0", help="independent KVHR hardware setup listener")
+    parser.add_argument("--hbm-advertise", default="", help="producer-reachable KVHR host:port")
     parser.add_argument("--device-a", type=int, default=6, help="reader NPU")
     parser.add_argument("--device-b", type=int, default=7, help="producer NPU")
-    parser.add_argument("--npu-eid-a-raw", required=True, help="A fullmesh EID")
-    parser.add_argument("--npu-eid-b-raw", required=True, help="B fullmesh EID")
+    parser.add_argument("--npu-eid-a-raw", default="", help="A EID for the verified NPU-to-NPU route")
+    parser.add_argument("--npu-eid-b-raw", default="", help="B EID for the verified NPU-to-NPU route")
     parser.add_argument("--packets", "--blocks", type=int, help="uniform packet count (default: 4096)")
     parser.add_argument("--packet-bytes", "--block-bytes", type=int, help="uniform packet bytes (default: 656)")
     parser.add_argument("--packet-group", "--block-group", dest="packet_groups", action="append", type=packet_group,
@@ -54,6 +63,16 @@ def parse_args(argv=None):
     parser.add_argument("--max-inflight-total", type=int, default=2048)
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
     args = parser.parse_args(argv)
+    if args.role != "producer" and not args.npu_eid_a_raw:
+        parser.error("reader/local requires --npu-eid-a-raw")
+    if args.role != "reader" and not args.npu_eid_b_raw:
+        parser.error("producer/local requires --npu-eid-b-raw")
+    if args.role == "producer" and not args.control_connect:
+        parser.error("producer requires --control-connect")
+    if args.role != "producer" and args.control_connect:
+        parser.error("--control-connect is only used by the producer role")
+    if not 0 < args.control_timeout < float("inf"):
+        parser.error("control-timeout must be finite and positive")
     if args.profile_iterations is None:
         args.profile_iterations = 0 if args.graph else 20
     if args.graph and args.profile_iterations:
@@ -63,7 +82,7 @@ def parse_args(argv=None):
     # Visit every MR/output pair before timed samples; retain single-MR defaults.
     if args.source_count > 1 and args.warmup >= 0:
         args.warmup = max(args.warmup, args.source_count)
-    if args.device_a == args.device_b:
+    if args.role == "local" and args.device_a == args.device_b:
         parser.error("use two distinct NPUs")
     if args.packet_groups:
         if args.packets is not None or args.packet_bytes is not None:
@@ -88,6 +107,100 @@ def parse_args(argv=None):
             args.max_inflight_total and args.max_inflight_total < 2 * args.aiv_cores):
         parser.error("max-inflight-total must be 0 or at least twice aiv-cores, within uint32")
     return args
+
+
+_CONFIG_INTS = ("source_space_bytes", "source_count", "seed", "warmup", "iterations",
+                "profile_warmup", "profile_iterations", "aiv_cores", "jettys_per_core", "max_inflight_total")
+_CONFIG_BOOLS = ("graph", "validate_ranges")
+
+
+def benchmark_config(args):
+    return {name: getattr(args, name) for name in (*_CONFIG_INTS, *_CONFIG_BOOLS, "packet_groups")}
+
+
+def configured_producer(args, config):
+    """A chooses the workload; B retains its own device, EID and TCP settings."""
+    if not isinstance(config, dict) or set(config) != set((*_CONFIG_INTS, *_CONFIG_BOOLS, "packet_groups")):
+        raise ValueError("invalid benchmark configuration fields")
+    argv = ["--role", "producer", "--control-connect", args.control_connect,
+            "--control-timeout", str(args.control_timeout), "--device-b", str(args.device_b),
+            "--npu-eid-b-raw", args.npu_eid_b_raw]
+    for name in _CONFIG_INTS:
+        if type(config[name]) is not int:
+            raise ValueError(f"invalid benchmark integer: {name}")
+        argv.extend(("--" + name.replace("_", "-"), str(config[name])))
+    for name in _CONFIG_BOOLS:
+        if type(config[name]) is not bool:
+            raise ValueError(f"invalid benchmark flag: {name}")
+        if config[name]:
+            argv.append("--" + name.replace("_", "-"))
+    groups = config["packet_groups"]
+    if not isinstance(groups, (list, tuple)) or not 1 <= len(groups) <= 4096:
+        raise ValueError("invalid benchmark packet groups")
+    for group in groups:
+        if not isinstance(group, (list, tuple)) or len(group) != 2 or any(type(v) is not int for v in group):
+            raise ValueError("invalid benchmark packet group")
+        argv.extend(("--packet-group", f"{group[0]}:{group[1]}"))
+    return parse_args(argv)
+
+
+def receive(channel, expected):
+    kind, payload = channel.recv()
+    if kind != expected:
+        raise RuntimeError(f"expected {expected}, received {kind}: {payload}")
+    return payload
+
+
+def batch_receipt(ready, iteration):
+    """Bind completion to the exact registration/MR/batch, not just the loop ID."""
+    result = dict(request_id=iteration, source_id=ready.source.source_id,
+                  source_epoch=ready.source.source_epoch, sequence=ready.sequence, mr_id=ready.mr_id)
+    if any(type(value) is not int or value < (0 if name == "request_id" else 1)
+           for name, value in result.items()):
+        raise ValueError("invalid NPU batch identity")
+    return result
+
+
+def matches_receipt(received, expected):
+    return (isinstance(received, dict) and received == expected and
+            all(type(value) is int for value in received.values()))
+
+
+def open_reader_channel(args):
+    from kvaf.tcp_control import TcpControlListener
+
+    worker = None
+    with TcpControlListener(args.control_listen, timeout=args.control_timeout) as listener:
+        print(f"NPU_HBM_TCP_LISTEN role={args.role} address={listener.address}", flush=True)
+        if args.role == "local":
+            address = listener.address
+            if address.startswith("0.0.0.0:"):
+                address = "127.0.0.1:" + address.rsplit(":", 1)[1]
+            worker = mp.get_context("spawn").Process(target=producer_main, args=(args, address))
+            worker.start()
+        try:
+            return listener.accept(), worker
+        except BaseException:
+            # No HELLO has been sent, so B cannot have registered HBM yet.
+            if worker is not None:
+                worker.terminate()
+                worker.join(10)
+            raise
+
+
+def producer_main(args, address=None):
+    from kvaf.tcp_control import TcpControlChannel
+
+    if address is not None:
+        args = argparse.Namespace(**vars(args))
+        args.control_connect = address
+    with TcpControlChannel.connect(args.control_connect, timeout=args.control_timeout) as channel:
+        hello = receive(channel, "hello")
+        if (not isinstance(hello, dict) or hello.get("version") != 1 or
+                not isinstance(hello.get("session"), str) or len(hello["session"]) != 32):
+            raise ValueError("unsupported benchmark notification protocol")
+        args = configured_producer(args, hello["config"])
+        producer(channel, args, packet_layout(args), hello["receiver"], session=hello["session"])
 
 
 @dataclass(frozen=True)
@@ -200,7 +313,7 @@ def packet_payload(torch, offsets, packet_bytes, phase):
     return ((rows * 131 + columns * 17 + (columns >> 3) + phase * 31) & 255).to(torch.uint8)
 
 
-def producer(pipe, args, layout, receiver):
+def producer(channel, args, layout, receiver, *, session=""):
     import torch
     import torch_npu  # noqa: F401
     import kvaf
@@ -210,6 +323,8 @@ def producer(pipe, args, layout, receiver):
     stream = torch.npu.Stream(device=args.device_b)
     source = kvaf.NpuPullHbmSource(args.device_b, args.npu_eid_b_raw)
     ready = None
+    registered = False
+    shutdown_authorized = False
     stages = {"ready": [], "release_batch": []}
     try:
         tensors = [torch.zeros(args.source_space_bytes, dtype=torch.uint8, device=device)
@@ -218,9 +333,13 @@ def producer(pipe, args, layout, receiver):
                                 dtype=torch.int64, device=device) for group in layout.groups]
         torch.npu.synchronize()
         source.register(tensors if args.source_count > 1 else tensors[0], receiver=receiver, stream=stream)
-        pipe.send(("connected", None))
+        registered = True
+        channel.send(("connected", session))
         normal_rounds, total_rounds = round_counts(args)
         for iteration in range(total_rounds):
+            request = receive(channel, "request")
+            if type(request) is not int or request != iteration:
+                raise RuntimeError("request notification belongs to another round")
             hbm = tensors[iteration % args.source_count]
             phase = pattern_phase(iteration, args.source_count)
             payloads = [packet_payload(torch, group.offsets, group.packet_bytes, phase + index * 17).to(device)
@@ -235,37 +354,41 @@ def producer(pipe, args, layout, receiver):
             begin = time.perf_counter_ns()
             ready = source.ready(hbm) if args.source_count > 1 else source.ready()
             ready_us = (time.perf_counter_ns() - begin) / 1000
-            pipe.send(("ready", ready))
+            receipt = batch_receipt(ready, iteration)
+            channel.send(("ready", (iteration, ready)))
             # The application owns completion notification; Runtime only reads.
-            if receive(pipe, "reuse") != iteration:
-                raise RuntimeError("reuse notification belongs to another round")
+            if not matches_receipt(receive(channel, "reuse"), receipt):
+                raise RuntimeError("reuse notification belongs to another batch")
             begin = time.perf_counter_ns()
             source.release_batch(ready)
             release_us = (time.perf_counter_ns() - begin) / 1000
             if args.warmup <= iteration < normal_rounds:
                 stages["ready"].append(ready_us)
                 stages["release_batch"].append(release_us)
-            pipe.send(("released", iteration))
-        receive(pipe, "shutdown")
+            channel.send(("released", receipt))
+        if receive(channel, "shutdown") != session:
+            raise RuntimeError("shutdown notification belongs to another session")
+        shutdown_authorized = True
         source.shutdown()
         print_stages("NPU_HBM_BENCH_PROFILE", "producer", stages, args.warmup)
-        pipe.send(("closed", None))
+        channel.send(("closed", session))
     except BaseException:
         try:
-            pipe.send(("error", traceback.format_exc()))
-        except OSError:
+            channel.send(("error", traceback.format_exc()))
+        except Exception:
             pass  # A disconnected application channel cannot authorize reuse.
         try:
-            # No validated reuse message means the consumer may still be reading.
-            # Shutdown rejects a frozen batch and the exception path retains it.
+            # Even an unfrozen source can still be referenced by A's captured
+            # graph. Only a session shutdown after graph reset authorizes close.
+            if registered and not shutdown_authorized:
+                retain("TCP session failed without reader shutdown; retain NPU source")
             source.shutdown()
         except Exception as error:
             retain(str(error))
         raise
 
 
-def main():
-    args = parse_args()
+def reader(args):
     import torch
     import torch_npu  # noqa: F401
     import kvaf
@@ -281,17 +404,20 @@ def main():
         npu_core_count=args.aiv_cores, jettys_per_core=args.jettys_per_core,
         batch_get_max_inflight_total=args.max_inflight_total)
     worker = None
+    channel = None
+    peer_active = False
     graphs = {}
     try:
         runtime.initialize()
         assert runtime.initialized and not runtime.ddr_initialized
-        ctx = mp.get_context("spawn")
-        parent, child = ctx.Pipe()
-        receiver = runtime.listen_hbm("127.0.0.1:0", local_eid=args.npu_eid_a_raw)
-        worker = ctx.Process(target=producer, args=(child, args, layout, receiver))
-        worker.start()
-        child.close()
-        receive(parent, "connected")
+        receiver = runtime.listen_hbm(args.hbm_listen, advertise_address=args.hbm_advertise,
+                                      local_eid=args.npu_eid_a_raw)
+        channel, worker = open_reader_channel(args)
+        session = uuid.uuid4().hex
+        peer_active = True
+        channel.send(("hello", dict(version=1, session=session, receiver=receiver, config=benchmark_config(args))))
+        if receive(channel, "connected") != session:
+            raise RuntimeError("registration acknowledgement belongs to another session")
         stream = torch.npu.Stream(device=args.device_a)
         with torch.npu.stream(stream):
             output = torch.empty(payload_bytes + 2 * GUARD_BYTES, dtype=torch.uint8, device=device)
@@ -312,15 +438,25 @@ def main():
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
               "status_reset=init_only status_generation=0 status_readback=none completion=caller_stream_sync "
               f"execution={'graph' if args.graph else 'eager'} graph={int(args.graph)} binding_profile={int(not args.graph)} "
-              "completion_notification=application batch_control_rpcs=0", flush=True)
+              f"completion_notification=application application_transport=tcp role={args.role} "
+              "batch_control_rpcs=0", flush=True)
         read_stage = "graph_replay" if args.graph else "batch_get_raw_addr"
         stages = {read_stage: [], "verification": []}
         internal_stages = {}
         event_errors = set()
         normal_rounds, total_rounds = round_counts(args)
+        registration = None
+        last_sequence = 0
         for iteration in range(total_rounds):
-            ready = receive(parent, "ready")
-            assert ready.mr_id == iteration % args.source_count + 1
+            channel.send(("request", iteration))
+            request_id, ready = receive(channel, "ready")
+            if type(request_id) is not int or request_id != iteration or ready.mr_id != iteration % args.source_count + 1:
+                raise RuntimeError("ready notification belongs to another request or MR")
+            receipt = batch_receipt(ready, iteration)
+            identity = receipt["source_id"], receipt["source_epoch"]
+            if (registration is not None and identity != registration) or receipt["sequence"] <= last_sequence:
+                raise RuntimeError("ready notification changed source or replayed an old batch")
+            registration, last_sequence = identity, receipt["sequence"]
             expected = torch.full((output.numel(),), 0xCC, dtype=torch.uint8)
             phase = pattern_phase(iteration, args.source_count)
             for index, group in enumerate(layout.groups):
@@ -360,16 +496,22 @@ def main():
                     internal_stages.setdefault(name, []).append(value)
                 if result["profile"]["kernel_event_us"] is None:
                     event_errors.add(result["profile"]["kernel_event_error"])
-            parent.send(("reuse", iteration))
-            assert receive(parent, "released") == iteration
+            channel.send(("reuse", receipt))
+            if not matches_receipt(receive(channel, "released"), receipt):
+                raise RuntimeError("release acknowledgement belongs to another batch")
         capture_count = len(graphs)
         for graph in graphs.values():
             graph.reset()  # The source shutdown below retires graph communication resources.
         graphs.clear()
-        parent.send(("shutdown", None))
-        receive(parent, "closed")
-        worker.join(10)
-        assert worker.exitcode == 0
+        channel.send(("shutdown", session))
+        if receive(channel, "closed") != session:
+            raise RuntimeError("close acknowledgement belongs to another session")
+        peer_active = False
+        channel.close()
+        if worker is not None:
+            worker.join(10)
+            if worker.exitcode != 0:
+                raise RuntimeError("producer did not exit successfully after shutdown")
         runtime.shutdown()
         print_stages("NPU_HBM_BENCH_PROFILE", "reader", stages, args.warmup)
         if args.profile_iterations:
@@ -388,18 +530,28 @@ def main():
               f"mean_us={stats['mean_us']:.3f} p50_us={stats['p50_us']:.3f} "
               f"p95_us={stats['p95_us']:.3f} p99_us={stats['p99_us']:.3f} "
               f"effective_GBps={payload_bytes / stats['mean_us'] / 1000:.3f} "
-              "return_condition=caller_stream_complete completion_notification=application "
+              "return_condition=caller_stream_complete completion_notification=application application_transport=tcp "
               f"profile_iterations={args.profile_iterations} instrumented_rounds_excluded_from_bandwidth=1 "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
-              "percentile=linear verification_included=0 setup_and_producer_and_ipc_excluded=1 "
+              "percentile=linear verification_included=0 setup_and_producer_and_notifications_excluded=1 "
               "changing_inputs=1 verification=every_round_full_output npu_consumer_checked=1 guard_checked=1",
               flush=True)
     except BaseException:
         traceback.print_exc()
-        if graphs or runtime.pending_raw_addr or (worker is not None and worker.is_alive()):
+        if channel is not None:
+            channel.close()
+        if graphs or runtime.pending_raw_addr or peer_active:
             retain("NPU HBM benchmark output or source remains retained")
         runtime.shutdown()
         raise
+
+
+def main():
+    args = parse_args()
+    if args.role == "producer":
+        producer_main(args)
+    else:
+        reader(args)
 
 
 if __name__ == "__main__":

@@ -181,11 +181,15 @@ build_npu() {
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     -Dpybind11_DIR="$pybind11_dir"
   cmake --build "$build_dir" --parallel "$jobs"
+  # Python-only changes do not relink _kvaf, so its POST_BUILD copy may not
+  # execute on an incremental build. Always refresh connector modules here.
+  cmake -E copy_directory "$KVAF_ROOT/python/kvaf" "$build_dir/python/kvaf"
   echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"
   echo "[KVAF_BUILD] CPU Pull: enabled"
   if [[ "$aiv_enabled" == ON ]]; then
     echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
     echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
+    echo "[KVAF_BUILD] Raw HBM READ kernel: $build_dir/bin/kvaf_execute_batch_get_raw_addr_kernels.o"
   fi
   printf 'export PYTHONPATH="%s/python${PYTHONPATH:+:$PYTHONPATH}"\n' "$build_dir"
 }

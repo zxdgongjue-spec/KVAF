@@ -12,6 +12,11 @@ from bench_remote_cpu_offload import INTERNAL_STAGES, SUBMIT_STAGES, SERVER_STAG
 from pull_bench_utils import scattered_offsets, summarize_us
 
 
+def npu_ready(mr_id=1, sequence=1):
+    return SimpleNamespace(source=SimpleNamespace(source_id=7, source_epoch=11),
+                           sequence=sequence, mr_id=mr_id)
+
+
 class PullBenchmarks(unittest.TestCase):
     def test_raw_read_timing_includes_external_wait(self):
         clock = [0]
@@ -182,12 +187,17 @@ class PullBenchmarks(unittest.TestCase):
         ctx.Pipe.return_value = parent, child
         ctx.Process.return_value.exitcode = 0
 
+        token = npu_ready()
+
         def receive(pipe, kind):
-            return SimpleNamespace(mr_id=1) if kind == "ready" else (0 if kind == "released" else None)
+            if kind == "ready":
+                return 0, token
+            return raw_bench.batch_receipt(token, 0) if kind == "released" else "session"
 
         modules = dict(torch=torch, torch_npu=SimpleNamespace(), kvaf=SimpleNamespace(NpuRuntime=lambda **kwargs: runtime))
         with patch.dict(sys.modules, modules), patch.object(raw_bench, "parse_args", return_value=args), \
-                patch.object(raw_bench.mp, "get_context", return_value=ctx), \
+                patch.object(raw_bench, "open_reader_channel", return_value=(parent, ctx.Process.return_value)), \
+                patch.object(raw_bench.uuid, "uuid4", return_value=SimpleNamespace(hex="session")), \
                 patch.object(raw_bench, "receive", side_effect=receive), \
                 patch.object(raw_bench, "packet_payload", return_value=MagicMock()), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -224,16 +234,18 @@ class PullBenchmarks(unittest.TestCase):
         def receive(pipe, kind):
             if kind == "ready":
                 iteration[0] += 1
-                return SimpleNamespace(mr_id=iteration[0] % 2 + 1)
+                return iteration[0], npu_ready(iteration[0] % 2 + 1, iteration[0] + 1)
             if kind == "released":
-                return iteration[0]
+                return raw_bench.batch_receipt(npu_ready(iteration[0] % 2 + 1, iteration[0] + 1), iteration[0])
+            return "session"
 
         modules = dict(torch=torch, torch_npu=SimpleNamespace(),
                        kvaf=SimpleNamespace(NpuRuntime=lambda **kwargs: runtime,
                                             AclGraph=MagicMock(side_effect=graphs)))
         output = io.StringIO()
         with patch.dict(sys.modules, modules), patch.object(raw_bench, "parse_args", return_value=args), \
-                patch.object(raw_bench.mp, "get_context", return_value=ctx), \
+                patch.object(raw_bench, "open_reader_channel", return_value=(parent, ctx.Process.return_value)), \
+                patch.object(raw_bench.uuid, "uuid4", return_value=SimpleNamespace(hex="session")), \
                 patch.object(raw_bench, "receive", side_effect=receive), \
                 patch.object(raw_bench, "packet_payload", return_value=MagicMock()), \
                 patch.object(raw_bench, "measure_raw_read") as eager, contextlib.redirect_stdout(output):
@@ -354,11 +366,12 @@ class PullBenchmarks(unittest.TestCase):
         class Retained(Exception):
             pass
 
-        for mode in ("success", "wrong_round", "disconnected"):
+        for mode in ("success", "wrong_round", "wrong_epoch", "wrong_mr", "wrong_sequence", "disconnected", "timeout",
+                     "lost_release_ack"):
             with self.subTest(mode=mode):
                 source = MagicMock()
                 source.frozen = False
-                token = object()
+                token = npu_ready()
 
                 def ready():
                     source.frozen = True
@@ -380,15 +393,25 @@ class PullBenchmarks(unittest.TestCase):
 
                 def receive(actual_pipe, kind):
                     self.assertIs(actual_pipe, pipe)
+                    if kind == "request":
+                        return 0
                     if kind == "reuse":
                         if mode == "disconnected":
                             raise EOFError("application channel disconnected")
-                        return 0 if mode == "success" else 1
+                        if mode == "timeout":
+                            raise TimeoutError("completion notification timed out")
+                        receipt = raw_bench.batch_receipt(token, 0)
+                        wrong = dict(wrong_round="request_id", wrong_epoch="source_epoch",
+                                     wrong_mr="mr_id", wrong_sequence="sequence").get(mode)
+                        if wrong:
+                            receipt[wrong] += 1
+                        return receipt
                     self.assertEqual(kind, "shutdown")
+                    return ""
 
-                if mode == "disconnected":
+                if mode in ("disconnected", "lost_release_ack"):
                     def send(message):
-                        if message[0] == "error":
+                        if message[0] == "error" or (mode == "lost_release_ack" and message[0] == "released"):
                             raise BrokenPipeError()
                     pipe.send.side_effect = send
                 args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b",
@@ -406,8 +429,13 @@ class PullBenchmarks(unittest.TestCase):
                     else:
                         with self.assertRaises(Retained):
                             raw_bench.producer(pipe, args, packet_layout(args), {})
-                        source.release_batch.assert_not_called()
-                        self.assertTrue(source.frozen)
+                        if mode == "lost_release_ack":
+                            source.release_batch.assert_called_once_with(token)
+                            self.assertFalse(source.frozen)
+                        else:
+                            source.release_batch.assert_not_called()
+                            self.assertTrue(source.frozen)
+                        source.shutdown.assert_not_called()
                     source.cancel_batch.assert_not_called()
 
     def test_raw_benchmark_configuration_limits(self):

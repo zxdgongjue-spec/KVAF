@@ -5,6 +5,9 @@ target_include_directories(kvaf_cpu_pull_profile_test PRIVATE ${PROJECT_SOURCE_D
 add_test(NAME kvaf_cpu_pull_profile_test COMMAND kvaf_cpu_pull_profile_test)
 add_test(NAME kvaf_pull_benchmarks_python
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_pull_benchmarks.py")
+add_test(NAME kvaf_tcp_control_python
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_tcp_control.py")
+set_tests_properties(kvaf_tcp_control_python PROPERTIES TIMEOUT 30)
 
 add_executable(kvaf_npu_eid_discovery_test npu_eid_discovery_test.cc)
 target_include_directories(kvaf_npu_eid_discovery_test PRIVATE ${PROJECT_SOURCE_DIR}/runtime/src)
