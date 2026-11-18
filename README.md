@@ -354,6 +354,9 @@ tests/run_remote_cpu_batch_get_multicard_perf.sh "$PWD/build-npu" \
 回放。所有 worker 等上一轮完成后才发起下一轮，同一组卡完成相同轮数。计时包含轮间
 的 Host 同步等待，报告会标明此模式。Graph 数受设备和 CANN 的可用录图资源限制。
 
+使用 `--barrier-per-graph --graph-calls 256` 可以每卡把 256 次 BatchGet 录进同一张
+ACL Graph。每轮一起回放整张图，等所有卡完成后再开始下一轮。两个 barrier 参数互斥。
+
 ### 6. 无 NPU 的主机回归
 
 使用新的主机构建目录，默认不启用任何设备后端：

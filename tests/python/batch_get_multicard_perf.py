@@ -69,7 +69,9 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
     submit(plans[0], stream)
     torch.npu.synchronize()
     barrier_fd = args.contention_barrier_fd
-    plan_groups = [plans] if barrier_fd is None else [(plan,) for plan in plans]
+    plan_groups = [plans]
+    if barrier_fd is not None and not args.contention_barrier_per_graph:
+        plan_groups = [(plan,) for plan in plans]
     graphs = []
     cleanup = contextlib.ExitStack()
     try:
@@ -208,11 +210,13 @@ def run_group(args, devices, directory):
             ]
             with contextlib.ExitStack() as child_resources:
                 pass_fds = ()
-                if args.barrier_per_call:
+                if args.barrier_per_call or args.barrier_per_graph:
                     barriers[device], child_barrier = socket.socketpair()
                     child_resources.enter_context(child_barrier)
                     pass_fds = (child_barrier.fileno(),)
                     command.extend(("--contention-barrier-fd", str(child_barrier.fileno())))
+                    if args.barrier_per_graph:
+                        command.append("--contention-barrier-per-graph")
                 process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True, pass_fds=pass_fds)
             children.append((device, process, log_path))
@@ -234,7 +238,10 @@ def run_group(args, devices, directory):
         deadline = stop + 60
         if barriers:
             rounds = release_barrier_rounds(barriers, children, stop, deadline)
-            print(f"MULTICARD_BARRIER_DONE phase={directory.name} rounds={rounds}", flush=True)
+            calls_per_replay = args.graph_calls if args.barrier_per_graph else 1
+            expected_calls = rounds * calls_per_replay
+            print(f"MULTICARD_BARRIER_DONE phase={directory.name} rounds={rounds} "
+                  f"calls_per_replay={calls_per_replay}", flush=True)
         while any(process.poll() is None for _, process, _ in children):
             for device, process, log_path in children:
                 if process.poll() not in (None, 0):
@@ -249,8 +256,9 @@ def run_group(args, devices, directory):
         for device, result in zip(devices, results):
             if result["device"] != device or not result["verified"] or result["end"] <= result["start"]:
                 raise RuntimeError(f"invalid result for device {device}")
-            if barriers and result["calls"] != rounds:
-                raise RuntimeError(f"device {device} completed {result['calls']} calls for {rounds} barrier rounds")
+            if barriers and result["calls"] != expected_calls:
+                raise RuntimeError(f"device {device} completed {result['calls']} calls, "
+                                   f"expected {expected_calls} for {rounds} barrier rounds")
         return results
     finally:
         for barrier in barriers.values():
@@ -333,7 +341,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
         "transport", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
-        "seconds", "graph_calls", "barrier_per_call", "warmup", "seed", "peer",
+        "seconds", "graph_calls", "barrier_per_call", "barrier_per_graph", "warmup", "seed", "peer",
         "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
@@ -349,6 +357,8 @@ def write_summary(directory, isolated, concurrent, config=None):
               "带宽单位为十进制 GB/s；统计持续 ACL Graph 回放至完成的有效数据吞吐。", ""]
     if config.get("barrier_per_call"):
         report += ["每轮在 Host 侧同步各卡后发起一次 BatchGet，按录制顺序循环回放。吞吐计时包含轮间同步等待。", ""]
+    elif config.get("barrier_per_graph"):
+        report += ["每轮同步回放一张完整的 ACL Graph。吞吐计时包含轮间同步等待。", ""]
     if config:
         per_device = config.get("ddr_bytes_per_device",
                                 config["table_capacity"] * config["tokens_per_block"] * config["token_bytes"])
@@ -444,8 +454,11 @@ def main(argv=None):
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--graph-calls", type=int,
                         help="total calls to capture (default: 256, or 1 with --barrier-per-call)")
-    parser.add_argument("--barrier-per-call", action="store_true",
-                        help="capture a separate graph for each call and wait for all devices before each replay")
+    barrier_group = parser.add_mutually_exclusive_group()
+    barrier_group.add_argument("--barrier-per-call", action="store_true",
+                               help="capture a separate graph for each call and synchronize each replay")
+    barrier_group.add_argument("--barrier-per-graph", action="store_true",
+                               help="capture all calls in one graph and synchronize each full graph replay")
     parser.add_argument("--requests", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--table-capacity", type=int, default=4096)
@@ -496,7 +509,8 @@ def main(argv=None):
     config["aiv_cores"] = cores if len(cores) > 1 else cores[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
-          f"barrier_per_call={int(args.barrier_per_call)} graph_calls={args.graph_calls} "
+          f"barrier_per_call={int(args.barrier_per_call)} barrier_per_graph={int(args.barrier_per_graph)} "
+          f"graph_calls={args.graph_calls} "
           f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
           f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "

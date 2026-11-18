@@ -69,6 +69,8 @@ if "--contention-barrier-fd" in sys.argv:
             calls += 1
             (directory / f"done_{device}_{calls}").touch()
     assert calls > 0
+    if "--contention-barrier-per-graph" in sys.argv:
+        calls *= int(option("--contention-graph-calls"))
 else:
     time.sleep(window["stop"] - window["start"])
 rate = 15 if directory.name == "concurrent" else 30
@@ -236,6 +238,30 @@ class MulticardTests(unittest.TestCase):
             self.assertTrue((root / "results/concurrent/abort").exists())
             self.assertFalse((root / "results/summary.csv").exists())
 
+    def test_four_workers_run_256_calls_per_graph_barrier_round(self):
+        devices = range(2, 6)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, devices=devices,
+                                         options=("--barrier-per-graph", "--graph-calls", "256",
+                                                  "--seconds", "0.15"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = root / "results"
+            config = json.loads((output / "config.json").read_text())
+            self.assertTrue(config["barrier_per_graph"])
+            self.assertFalse(config["barrier_per_call"])
+            concurrent = output / "concurrent"
+            rounds = len(list(concurrent.glob("done_2_*")))
+            self.assertGreater(rounds, 1)
+            for device in devices:
+                worker = json.loads((concurrent / f"device_{device}.json").read_text())
+                self.assertEqual(worker["calls"], rounds * 256)
+            self.assertIn(f"phase=concurrent rounds={rounds} calls_per_replay=256", result.stdout)
+            report = (output / "report.md").read_text()
+            self.assertIn("每轮同步回放一张完整的 ACL Graph", report)
+            self.assertIn("| Graph 数 / 卡 | 1 |", report)
+            self.assertIn("| 每张 Graph 的 BatchGet 次数 | 256 |", report)
+
     def test_worker_waits_before_each_replay_and_until_previous_replay_completes(self):
         events = []
         graphs = [SimpleNamespace(replay=lambda _, index=index: events.append(index),
@@ -309,6 +335,7 @@ class MulticardTests(unittest.TestCase):
             (root / "start.json").write_text(json.dumps({"start": 0, "stop": 2}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
                                    contention_graph_calls=graph_count, contention_barrier_fd=3,
+                                   contention_barrier_per_graph=False,
                                    warmup=1, miss_count=4096, token_bytes=656)
             plans = iter(range(graph_count))
             with (patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()),
@@ -324,6 +351,35 @@ class MulticardTests(unittest.TestCase):
         self.assertEqual(reset, list(reversed(captured)))
         self.assertEqual(validated, captured + [1])
 
+    def test_worker_captures_one_256_call_graph_for_per_graph_barrier(self):
+        graph = Mock()
+        kvaf = SimpleNamespace(AclGraph=Mock(return_value=graph))
+        torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: 1, synchronize=lambda: None))
+        submit, check_output = Mock(), Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "start.json").write_text(json.dumps({"start": 0, "stop": 2}))
+            args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
+                                   contention_graph_calls=256, contention_barrier_fd=3,
+                                   contention_barrier_per_graph=True, warmup=1,
+                                   miss_count=4096, token_bytes=656)
+            plans = iter(range(256))
+            with (patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()),
+                  patch.object(multi, "measure_barrier_replays", return_value=(1.0, 2.0, 3)) as measure):
+                multi.run_worker(kvaf, torch, args, lambda: next(plans), submit, check_output)
+            kvaf.AclGraph.assert_called_once_with()
+            graph.capture_begin.assert_called_once_with(1)
+            graph.capture_end.assert_called_once_with()
+            graph.reset.assert_called_once_with()
+            measure.assert_called_once_with([graph], 1, 3)
+            self.assertEqual([call.args[0] for call in submit.call_args_list], [0, *range(256)])
+            self.assertEqual([call.args for call in check_output.call_args_list], [(255,), (255,)])
+            result = json.loads(args.contention_result.read_text())
+            self.assertEqual(result["calls"], 3 * 256)
+            self.assertEqual(result["payload_bytes"], result["calls"] * 4096 * 656)
+            self.assertEqual(result["graph_calls"], 256)
+            self.assertEqual(result["graph_count"], 1)
+
     def test_worker_releases_completed_graphs_when_later_capture_fails(self):
         graphs = [Mock() for _ in range(3)]
         graphs[-1].capture_end.side_effect = RuntimeError("capture resources exhausted")
@@ -332,7 +388,8 @@ class MulticardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
-                                   contention_graph_calls=len(graphs), contention_barrier_fd=3)
+                                   contention_graph_calls=len(graphs), contention_barrier_fd=3,
+                                   contention_barrier_per_graph=False)
             with patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, "graph 3/3: capture resources exhausted"):
                     multi.run_worker(kvaf, torch, args, lambda: 0, Mock(), Mock())

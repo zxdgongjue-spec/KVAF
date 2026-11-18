@@ -305,6 +305,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     parser.add_argument("--contention-barrier-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-barrier-per-graph", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.backend_explicit = args.backend is not None
     expected_transport = "ubmem" if args.backend == "ubmem" else "urma"
@@ -394,7 +395,9 @@ def validate_args(args: argparse.Namespace) -> str | None:
     if args.contention_barrier_fd is not None and (
         args.contention_control_dir is None or args.contention_barrier_fd < 0
     ):
-        return "per-call barrier requires contention mode and a valid socket descriptor"
+        return "barrier requires contention mode and a valid socket descriptor"
+    if args.contention_barrier_per_graph and args.contention_barrier_fd is None:
+        return "per-graph barrier requires a socket descriptor"
     return None
 
 
