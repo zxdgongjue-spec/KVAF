@@ -36,10 +36,11 @@ STAGES = {
     "cpu_write_ns": "cpu_write", "aiv_build_notify_ns": "build_notify",
     "aiv_scatter_ns": "scatter", "call_outside_aiv_ns": "call_outside_aiv",
     "aiv_suffix_cq_blocked_ns": "suffix_cq_blocked",
+    "graph_total_ns": "graph_total",
 }
 SUMMARY_COLUMNS = (
     "token_bytes", "miss_count", "aiv_cores", "jettys_per_core", "cpu_jettys",
-    "phase", "completion_mode", "stage", "mean_us", "p50_us", "p90_us", "p99_us",
+    "phase", "completion_mode", "calls_per_sample", "stage", "mean_us", "p50_us", "p90_us", "p99_us",
     "effective_GBps", "p50_GBps", "case_json",
 )
 
@@ -48,7 +49,7 @@ def submission_config(args):
     return dict(host_submit=("caller_acl_graph" if args.caller_acl_graph else
                              "acl_graph" if args.acl_graph else "prepared"),
                 completion_mode="reference" if args.completion_scope == "device" else args.completion_scope,
-                completion_scope=args.completion_scope)
+                completion_scope=args.completion_scope, calls_per_sample=args.graph_calls)
 
 
 def positive_list(value):
@@ -89,12 +90,14 @@ def arguments(argv=None):
     parser.add_argument("--overlap-head-cq", type=int, choices=(0, 1),
                         help="build the suffix while the head control WRITE is in flight (default: 0)")
     parser.add_argument("--fixed-request-plan", action="store_true",
-                        help="reuse one request plan for preflight, warmup and measurement")
+                        help="reuse each node's request plan across preflight, warmup and measurement")
     graph_mode = parser.add_mutually_exclusive_group()
     graph_mode.add_argument("--acl-graph", action="store_true",
                             help="capture the prepared Scatter BatchGet once and replay it per request")
     graph_mode.add_argument("--caller-acl-graph", action="store_true",
                             help="capture Scatter as a node of a graph owned by the caller")
+    parser.add_argument("--graph-calls", type=int, default=1,
+                        help="BatchGet nodes per caller-owned graph; report replay time divided by this count")
     parser.add_argument("--completion-scope", choices=("device", "stream", "native-stream"), default="device",
                         help="wait on the device, the Python stream, or the stream inside the prepared native call")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
@@ -155,6 +158,10 @@ def validate_scatter(args):
         return "host-profile requires kernel-profile"
     if args.caller_acl_graph and args.completion_scope == "native-stream":
         return "caller-acl-graph uses device or stream completion"
+    if not 1 <= args.graph_calls <= 0xFFFFFFFF:
+        return "graph-calls must be a positive uint32"
+    if args.graph_calls > 1 and not args.caller_acl_graph:
+        return "graph-calls greater than one requires caller-acl-graph"
     if args.json and args.csv and args.json.resolve() == args.csv.resolve():
         return "JSON and CSV outputs must differ"
     if args.json and (args.json.resolve() == args.json.with_suffix(".log").resolve() or
@@ -278,20 +285,35 @@ def measure_call(runtime, args, iteration, submit, wait, clock=time.perf_counter
         wait()
         completed = clock()
     sample = dict(iteration=iteration, payload_bytes=args.miss_count * args.token_bytes,
-                  end_to_end_ns=completed - begin, host_call_ns=submitted - begin)
+                  end_to_end_ns=(completed - begin) / args.graph_calls,
+                  host_call_ns=(submitted - begin) / args.graph_calls,
+                  calls_per_sample=args.graph_calls,
+                  graph_total_ns=completed - begin,
+                  graph_payload_bytes=args.graph_calls * args.miss_count * args.token_bytes)
     if wait is not None:
-        sample[f"{args.completion_scope}_sync_ns"] = completed - submitted
+        sample[f"{args.completion_scope}_sync_ns"] = (completed - submitted) / args.graph_calls
     if args.kernel_profile:
         begin = clock()
         records = complete_outside_measurement(runtime, True, args.caller_acl_graph)
-        sample.update(profile_metrics(records, args.aiv_cores, args.miss_count,
-                                      args.token_bytes, args.kernel_profile_clock_mhz))
+        metrics = profile_metrics(records, args.aiv_cores, args.miss_count,
+                                  args.token_bytes, args.kernel_profile_clock_mhz)
+        if args.graph_calls == 1:
+            sample.update(metrics)
+        else:
+            # The device profile slab is overwritten by each graph node. It
+            # describes the last call, not the average or the graph envelope.
+            sample["sequence"] = metrics["sequence"]
+            sample["sequence_first"] = metrics["sequence"] - args.graph_calls + 1
+            sample["last_call_profile"] = metrics
+            for key in ("cpu_comm_ns", "cpu_write_ns", "aiv_wall_ns", "aiv_scatter_ns"):
+                sample["last_call_" + key] = metrics[key]
         sample["workers"] = records
         sample["snapshot_ns"] = clock() - begin
     else:
         begin = clock()
         complete_outside_measurement(runtime, False, args.caller_acl_graph)
         sample["status_validation_ns"] = clock() - begin
+    sample["graph_total_gbps"] = sample["graph_payload_bytes"] / sample["graph_total_ns"]
     return sample_metrics(sample)
 
 
@@ -350,7 +372,14 @@ def run_case(args):
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
         reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
         input_mode=("steady_table_fixed_request_plan" if args.fixed_request_plan
-                    else "steady_table_new_request_plan_per_call"), calls_per_sample=1,
+                    else "steady_table_new_request_plan_per_call"),
+        request_plans_per_sample=args.graph_calls,
+        sample_timing_scope=("replay_to_completion_divided_by_calls" if graph_mode
+                             else "single_call_to_completion"),
+        profile_scope="last_call" if args.graph_calls > 1 else "single_call",
+        graph_execution="same_stream_ordered_shared_transport" if graph_mode else "eager",
+        graph_payload_bytes=payload * args.graph_calls,
+        output_storage="shared_last_call_visible",
         timing={"device": "enqueue_then_global_device_sync", "stream": "enqueue_then_stream_sync",
                 "native-stream": "enqueue_and_stream_sync_in_native_call"}[args.completion_scope],
         stream_selection="fixed_stream_per_call_task_queue_fence",
@@ -358,8 +387,9 @@ def run_case(args):
         input_storage=("fixed_buffers" if args.fixed_request_plan else "fixed_buffers_refreshed_per_call"),
         host_timing_matches_reference=False,
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",
-        verification=("fixed_plan_preflight_and_last_payload" if args.fixed_request_plan
-                      else "deterministic_preflight_prefix_and_guard_then_last_random_payload"),
+        verification=("per_node_preflight_and_last_graph_output" if args.graph_calls > 1 else
+                      "fixed_plan_preflight_and_last_payload" if args.fixed_request_plan else
+                      "deterministic_preflight_prefix_and_guard_then_last_random_payload"),
         profile_snapshot_in_sample=False, setup_in_sample=False,
         instrumentation_overhead_included=args.kernel_profile,
         cpu_profile_report_before_done=args.kernel_profile,
@@ -430,6 +460,11 @@ def run_case(args):
             if args.sort_input_indices:
                 fixed_inputs = reference.sort_request_plan_prefix(
                     torch, view.addresses, *fixed_inputs, args.miss_count)
+        input_plans = [fixed_inputs]
+        # Each node owns its input storage. Refresh all plans outside timing
+        # so consecutive calls use distinct random requests, as in inference.
+        for _ in range(1, args.graph_calls):
+            input_plans.append(request_plan())
         # Dedicated stream for capture and for the same-stream eager comparison.
         stream = torch.npu.Stream() if graph_mode or args.completion_scope != "device" else None
         native_wait = args.completion_scope == "native-stream"
@@ -438,15 +473,29 @@ def run_case(args):
         if graph_mode and args.kernel_profile:
             runtime.start_scatter_profile()  # Captured kernel options are fixed at preparation.
         with setup_phase(report, "prepare_submit"):
-            submit = runtime.prepare_scatter_batch_get(
-                view, fixed_inputs[0], fixed_inputs[1], count, fixed_inputs[2], output,
+            capture_nodes = [runtime.prepare_scatter_batch_get(
+                view, inputs[0], inputs[1], count, inputs[2], output,
                 stream=stream, synchronize=False, wait_stream=native_wait, acl_graph=args.acl_graph,
-                capture_into_graph=args.caller_acl_graph)
+                capture_into_graph=args.caller_acl_graph) for inputs in input_plans]
+            if args.graph_calls > 1:
+                # Validate every node's request/output mapping before capture.
+                # The graph reuses the same output allocation in stream order.
+                torch.npu.synchronize()
+                for inputs in input_plans:
+                    output.zero_()
+                    torch.npu.synchronize()
+                    eager = runtime.prepare_scatter_batch_get(
+                        view, inputs[0], inputs[1], count, inputs[2], output, stream=stream)
+                    eager()
+                    stream.synchronize()
+                    complete_outside_measurement(runtime, args.kernel_profile)
+                    verify(inputs, guard=True)
+            submit = capture_nodes[0]
             if args.caller_acl_graph:
                 caller_graph = kvaf.AclGraph()
-                capture_node = submit
                 caller_graph.capture_begin(stream)
-                capture_node()
+                for capture_node in capture_nodes:
+                    capture_node()
                 caller_graph.capture_end()
 
                 def submit():
@@ -458,14 +507,16 @@ def run_case(args):
         if wait is not None:
             wait()
         complete_outside_measurement(runtime, graph_mode and args.kernel_profile, args.caller_acl_graph)
-        verify(fixed_inputs, guard=True)
-        check = ("active_payload_and_guard" if args.fixed_request_plan and
+        verify(input_plans[-1], guard=args.graph_calls == 1 or args.output_access_pattern == "contiguous")
+        check = ("per_node_preflight_and_last_payload" if args.graph_calls > 1 else
+                 "active_payload_and_guard" if args.fixed_request_plan and
                  args.output_access_pattern != "contiguous" else "active_prefix_and_guard")
         print(f"SCATTER_ALIGNED_CORRECTNESS_PASS {check}=1", flush=True)
         log_phase("preflight", "end")
 
         def refresh_inputs():
-            refresh_request_buffers(request_plan(), fixed_inputs)
+            for inputs in input_plans:
+                refresh_request_buffers(request_plan(), inputs)
 
         if args.kernel_profile and not graph_mode:
             runtime.start_scatter_profile()
@@ -480,10 +531,12 @@ def run_case(args):
             report["samples"][phase].append(
                 measure_call(runtime, args, iteration, submit, wait))
         log_phase("measure", "end")
-        verify(fixed_inputs, guard=args.output_access_pattern == "contiguous")
+        verify(input_plans[-1], guard=args.output_access_pattern == "contiguous")
         samples = report["samples"][phase]
         report["summary"][phase] = {
-            key: statistics_ns([r[key] for r in samples], payload if key in PAYLOAD_TIMINGS else None)
+            key: statistics_ns([r[key] for r in samples],
+                               payload * args.graph_calls if key == "graph_total_ns" else
+                               payload if key in PAYLOAD_TIMINGS else None)
             for key in samples[0] if key.endswith("_ns")}
         if args.acl_graph:
             runtime.reset_scatter_batch_get_graph()
@@ -571,7 +624,8 @@ def case_command(args):
     for name in ("request_length", "table_capacity", "tokens_per_block", "token_bytes", "miss_count",
                  "aiv_cores", "warmup", "iterations", "populate_chunk_entries",
                  "seed", "source_access_pattern", "output_access_pattern", "kernel_profile_clock_mhz",
-                 "max_inflight_total", "pipeline", "jetty_cursors", "overlap_head_cq", "case_timeout"):
+                 "max_inflight_total", "pipeline", "jetty_cursors", "overlap_head_cq", "case_timeout",
+                 "graph_calls"):
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
     if args.jettys_per_core is not None:
         command.extend(("--jettys-per-core", str(args.jettys_per_core)))
@@ -598,6 +652,7 @@ def summary_rows(report, json_path):
     return [dict(token_bytes=config["token_bytes"], miss_count=config["miss_count"],
                  aiv_cores=config["aiv_cores"], jettys_per_core=config["jettys_per_core"],
                  cpu_jettys=config["cpu_jettys"], phase=phase, completion_mode=config["completion_mode"],
+                 calls_per_sample=config["calls_per_sample"],
                  stage=stage, case_json=str(json_path),
                  **{k: stats[k] for k in SUMMARY_COLUMNS if k in stats})
             for phase, metrics in report["summary"].items()
@@ -613,7 +668,7 @@ def main(argv=None, runner=None):
     for case in selected:
         name = f"token_{case.token_bytes}_miss_{case.miss_count}_cores_{case.aiv_cores}_reference_prepared"
         if case.caller_acl_graph:
-            name += f"_caller_graph_{case.completion_scope}"
+            name += f"_caller_graph_{case.completion_scope}_calls_{case.graph_calls}"
         elif case.acl_graph or case.completion_scope != "device":
             name += f"_{'graph' if case.acl_graph else 'eager'}_{case.completion_scope}"
         case.json = case.json or root / (name + ".json")

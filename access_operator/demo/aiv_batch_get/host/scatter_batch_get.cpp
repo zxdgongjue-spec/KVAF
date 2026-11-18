@@ -79,6 +79,8 @@ struct ScatterBatchGet::Impl {
   aclmdlRI graph{};
   aclrtStream graph_stream{}, capture_pending{};
   aclrtStream external_graph_stream{};
+  aclmdlRI external_graph{};
+  uint32_t external_graph_calls{};
   uint64_t sequence{};
   bool push_open{}, initialized{}, failed{}, profile_ready{}, graph_mailbox{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
@@ -131,13 +133,14 @@ struct ScatterBatchGet::Impl {
     return Status::OK();
   }
 
-  Status QueryCapture(aclrtStream stream, bool* capturing) const {
+  Status QueryCapture(aclrtStream stream, bool* capturing, aclmdlRI* captured = nullptr) const {
     aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI active = nullptr;
     scatter_host::Timer timer(scatter_host::kCaptureQuery);
     const auto result = aclmdlRICaptureGetInfo(stream, &capture, &active);
     if (result != ACL_SUCCESS) return Error("query stream capture state");
     *capturing = capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    if (captured) *captured = active;
     return Status::OK();
   }
 
@@ -168,8 +171,9 @@ struct ScatterBatchGet::Impl {
     auto status = QueryCapture(external_graph_stream, &capturing);
     if (!status.ok()) return status;
     if (capturing) return Status::InvalidState("check the Scatter result after capture and replay");
-    if (sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
-    ++sequence;
+    if (external_graph_calls > UINT32_MAX - sequence)
+      return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+    sequence += external_graph_calls;
     pending = external_graph_stream;
     status = Drain();
     profile_ready = status.ok() && ScatterProfileEnabled(args.reserved);
@@ -194,6 +198,8 @@ struct ScatterBatchGet::Impl {
       if (!status.ok()) return status;
     }
     external_graph_stream = nullptr;
+    external_graph = nullptr;
+    external_graph_calls = 0;
     profile_ready = false;
     return Status::OK();
   }
@@ -524,7 +530,7 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   if (!state.ok()) return state;
   if (graph_action == ScatterGraphAction::kCheck)
     return s.CheckExternalReplay(static_cast<aclrtStream>(exec.execution.stream));
-  if (s.external_graph_stream)
+  if (s.external_graph_stream && graph_action != ScatterGraphAction::kAttach)
     return Status::InvalidState("detach the caller's Scatter graph before another BatchGet");
   if (graph_action == ScatterGraphAction::kReset) {
     auto status = s.Drain();
@@ -535,13 +541,19 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   if (s.graph) return Status::InvalidState("reset the prepared Scatter graph before another BatchGet");
   const bool capture_graph = graph_action == ScatterGraphAction::kCapture;
   const bool attach_graph = graph_action == ScatterGraphAction::kAttach;
+  aclmdlRI external_capture = nullptr;
   if (capture_graph || attach_graph || !exec.execution.trusted_npu_request) {
     bool capturing = false;
-    const auto status = s.QueryCapture(stream, &capturing);
+    const auto status = s.QueryCapture(stream, &capturing, &external_capture);
     if (!status.ok()) return status;
     if (attach_graph) {
       if (!capturing || s.pending || exec.execution.synchronize)
         return Status::InvalidState("attach Scatter during active capture after draining previous work");
+      if (!external_capture || (s.external_graph_stream &&
+          (stream != s.external_graph_stream || external_capture != s.external_graph)))
+        return Status::InvalidState("attach Scatter nodes to the same caller-managed graph and stream");
+      if (s.external_graph_calls >= UINT32_MAX - s.sequence)
+        return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
     } else if (capturing) {
       return Status::NotImplemented("use capture_into_graph for caller-managed capture");
     }
@@ -572,6 +584,8 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
       return Error("attach Scatter node to caller's graph");
     }
     s.external_graph_stream = stream;
+    s.external_graph = external_capture;
+    ++s.external_graph_calls;
     s.profile_ready = false;
     return Status::OK();
   }

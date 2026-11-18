@@ -40,6 +40,9 @@ CSV_COLUMNS = (
     "host_submit", "completion_scope", "graph_mailbox",
     "host_call_us", "host_stream_resolve_us", "stream_sync_us", "device_sync_us",
     "host_native_us", "host_runtime_validation_us", "host_operator_us",
+    "calls_per_sample", "graph_total_us", "graph_payload_bytes", "graph_total_gbps",
+    "sequence_first", "last_call_cpu_comm_us", "last_call_cpu_write_us",
+    "last_call_aiv_wall_us", "last_call_aiv_scatter_us",
 )
 
 
@@ -239,6 +242,7 @@ def write_results(args, report):
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
                                   **submission, **sample_metrics(sample))
                     values.setdefault("pipeline", args.pipeline)
+                    values.setdefault("calls_per_sample", config.get("calls_per_sample", 1))
                     row = {}
                     for key in CSV_COLUMNS:
                         value = values.get(key, "")

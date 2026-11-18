@@ -197,7 +197,9 @@ graph.reset()
 runtime.detach_scatter_batch_get_graph()
 ```
 
-每个 Runtime 支持挂接一个 Scatter 节点。保留 prepared callable、Runtime、stream、Tensor 和
+每个 Runtime 支持在同一张图的同一 stream 挂接多个 Scatter 节点。各节点可以使用不同的输入
+Tensor、AccessTable 和输出，但节点间按 stream 顺序执行，共享该 Runtime 的传输工作区。
+保留 prepared callable、Runtime、stream、Tensor 和
 AccessTable，直到调用方完成回放、销毁图并 detach。每次 replay 后调用一次
 `check_scatter_graph_replay()`，再开始下一轮。检查失败时丢弃该次推理结果并结束会话。
 框架若在检查前写入持久状态，需要在设备侧门控这些写入，或提供回滚。
@@ -206,6 +208,26 @@ AccessTable，直到调用方完成回放、销毁图并 detach。每次 replay 
 性能脚本使用 `--caller-acl-graph --completion-scope stream` 验证调用方捕获、回放和校验，
 CSV 标记为 `caller_acl_graph`。脚本只捕获 BatchGet，状态校验在样本计时窗口外。
 共享提交的收益应在包含该节点的实际推理图里测量。
+
+### 多次 BatchGet 共用一次 Graph 提交
+
+使用 `--caller-acl-graph --graph-calls 32 --completion-scope stream`，一次捕获 32 个
+BatchGet kernel，每次 replay 统一等待整图完成。`--iterations 20` 对应 20 次 replay，正式
+样本总计 640 次 BatchGet。`--graph-calls` 默认 1，大于 1 时使用调用方图路径。
+
+每个节点有独立的源索引、偏移和输出行清单。随机请求模式下，在样本计时外刷新所有节点的
+输入。输出分配按 stream 顺序复用，读回最终节点的输出。捕获前逐节点验证请求数据及 guard，
+整图执行后的状态检查累计所有节点的序号，设备侧失败状态会保留到后续节点。
+
+CSV 中 `graph_total_us` 是一次 replay 到统一等待返回的总耗时，`end_to_end_us` 是它除以
+`calls_per_sample` 的每调用平均耗时。`graph_payload_bytes` 是整图有效字节数。
+`graph_total_gbps = graph_payload_bytes / graph_total_ns`，与 `end_to_end_gbps` 相等。
+Host 提交和同步时间也按调用数摊销。此时 P50 表示各次 replay 的每调用平均耗时的中位数。
+
+先用 `--no-kernel-profile --no-host-profile` 测吞吐。诊断时可启用 kernel profiling，现有
+设备 profile 缓冲区记录最后一个节点，CSV 用 `last_call_*` 字段输出它的 CPU/AIV 阶段。
+多节点模式的 `aiv_wall_us` 和 `call_outside_aiv_us` 留空，完整的末次 profile 存入 JSON 的
+`last_call_profile`。整图 Host 总耗时与单节点的 AIV profile 分别用于吞吐统计和末次请求诊断。
 
 ## 构建与完整回归
 

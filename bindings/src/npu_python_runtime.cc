@@ -506,6 +506,10 @@ class NpuPythonRuntime final {
   void ReleaseAccessTable(const AccessTableHandle& handle) {
     if (scatter_graph_storage_ && scatter_graph_table_.opaque == handle.opaque)
       throw py::value_error("reset or detach the Scatter graph before releasing its AccessTable");
+    for (const auto& node : scatter_graph_nodes_) {
+      if (node.table.opaque == handle.opaque)
+        throw py::value_error("detach the Scatter graph before releasing its AccessTable");
+    }
     ThrowIfError(native_->core().ReleaseAccessTable(handle));
   }
 
@@ -703,10 +707,19 @@ class NpuPythonRuntime final {
           const auto acl_stream = tensor_methods_->Stream(selected);
           stream_timer.Stop();
           if (capture_into_graph) {
-            if (scatter_graph_storage_) throw py::value_error("reset or detach the existing Scatter graph first");
-            SubmitScatterBatchGet(request, acl_stream, false, ScatterGraphAction::kAttach);
-            scatter_graph_storage_ = storage;
-            scatter_graph_table_ = request.access_table;
+            if (scatter_graph_storage_ && !scatter_graph_external_)
+              throw py::value_error("reset the standalone Scatter graph before caller-managed capture");
+            scatter_graph_nodes_.push_back({storage, request.access_table});
+            try {
+              SubmitScatterBatchGet(request, acl_stream, false, ScatterGraphAction::kAttach);
+            } catch (...) {
+              scatter_graph_nodes_.pop_back();
+              throw;
+            }
+            if (!scatter_graph_external_) {
+              scatter_graph_storage_ = storage;
+              scatter_graph_table_ = request.access_table;
+            }
             scatter_graph_external_ = true;
             host_profile_ready_ = false;
             return;
@@ -753,6 +766,7 @@ class NpuPythonRuntime final {
     if (!scatter_graph_external_) return;
     SubmitScatterBatchGet({}, nullptr, false, ScatterGraphAction::kDetach);
     scatter_graph_external_ = false;
+    scatter_graph_nodes_.clear();
     scatter_graph_storage_ = py::object{};
     scatter_graph_table_ = {};
     host_profile_ready_ = false;
@@ -869,8 +883,13 @@ class NpuPythonRuntime final {
   }
 
  private:
+  struct ScatterGraphNode {
+    py::tuple storage;
+    AccessTableHandle table;
+  };
   // Destroy the native graph before releasing its captured buffers and stream.
   py::object scatter_graph_storage_;
+  std::vector<ScatterGraphNode> scatter_graph_nodes_;
   AccessTableHandle scatter_graph_table_{};
   std::uint64_t scatter_graph_generation_{};
   bool scatter_graph_external_{false};
@@ -966,7 +985,7 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("reset_scatter_batch_get_graph", &NpuPythonRuntime::ResetScatterGraph,
            "Drain and destroy the prepared Scatter graph before reusing its Runtime or table.")
       .def("check_scatter_graph_replay", &NpuPythonRuntime::CheckScatterGraphReplay,
-           "Synchronize and validate exactly one caller-managed replay on the capture stream.")
+           "Synchronize and validate one caller-managed replay, including all captured Scatter nodes.")
       .def("detach_scatter_batch_get_graph", &NpuPythonRuntime::DetachScatterGraph,
            "Release a caller-managed Scatter attachment after the caller destroys its graph.")
       .def("batch_get", &NpuPythonRuntime::BatchGet,
