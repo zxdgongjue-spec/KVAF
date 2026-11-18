@@ -8,14 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "cpu_gather.h"
-#include "cpu_push_gather_schedule.h"
 
 #if defined(__linux__)
 #include <sched.h>
@@ -91,25 +89,6 @@ class CpuGatherExecutor {
                             std::uint64_t sequence, std::size_t max_spans,
                             const GatherControl* control = nullptr,
                             const std::atomic<bool>* stop = nullptr);
-  struct FixedSuffix {
-    const std::uint64_t* ready_sequence{};
-    std::uint64_t sequence{};
-    const std::atomic<bool>* stop{};
-    std::chrono::milliseconds timeout{};
-    std::size_t first_wave{};
-  };
-  // Keep the address list and destination stable through Copy. Copy reports
-  // invalid fixed source addresses after all participating workers finish.
-  // Wave ranges partition [0, count). Suffix guards first_wave and all later
-  // waves. An empty plan gathers the entire batch before returning.
-  std::size_t PrepareFixed(void* staging, const std::uint64_t* addresses,
-                           std::uint32_t count, std::uint32_t span_bytes,
-                           std::uint64_t source_bytes,
-                           const std::vector<cpu_push::GatherWave>& waves = {},
-                           const FixedSuffix* suffix = nullptr,
-                           std::size_t first_shard_wave = SIZE_MAX,
-                           bool jetty_supply = false,
-                           std::uint32_t jettys = cpu_push::kJettyCount);
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
@@ -129,15 +108,7 @@ class CpuGatherExecutor {
 #endif
   }
 
-  // The coordinator calls on_wave with the number of completed waves in
-  // plan order. Returning false stops publication and joins the helpers.
-  using WaveReady = std::function<bool(std::size_t)>;
-  // After the whole-wave prefix, on_shards can inspect the completion of
-  // each shard independently. Wave indices passed to ShardReady are zero-based.
-  using ShardProgress = std::function<bool()>;
-  void Copy(const WaveReady& on_wave = {}, const ShardProgress& on_shards = {});
-  bool ShardReady(std::size_t wave, std::size_t queue) const;
-  bool UsesJettySupply() const { return fixed_jetty_supply_; }
+  void Copy();
   // Enable before the first PrepareDirect. Disabled execution reads no clocks.
   void EnableProfiling() { thread_profiles_.resize(max_threads_); }
   std::size_t MaxThreads() const { return max_threads_; }
@@ -146,24 +117,20 @@ class CpuGatherExecutor {
   const std::vector<CpuGatherThreadProfile>& ThreadProfiles() const { return thread_profiles_; }
 
  private:
-  std::size_t PrepareJob(void* staging, const GatherSpan* spans, const std::uint64_t* addresses,
-                         std::uint32_t span_count, std::uint64_t total_bytes) {
+  std::size_t Publish(std::uint64_t staging, const GatherSpan* spans,
+                      std::uint32_t span_count, std::uint32_t total_bytes) {
     const std::size_t threads =
         std::min(max_threads_, std::max<std::size_t>(1U, total_bytes / min_bytes_per_thread_));
+    std::unique_lock<std::mutex> lock(mutex_);
     while (helpers_.size() + 1U < threads) {
       const std::size_t index = helpers_.size() + 1U;
       helpers_.emplace_back(&CpuGatherExecutor::RunHelper, this, index);
     }
     spans_ = spans;
-    addresses_ = addresses;
     span_count_ = span_count;
-    staging_ = static_cast<std::uint8_t*>(staging);
+    staging_ = memory_ + (staging - base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
-    for (auto& wave : fixed_progress_) {
-      wave.remaining = threads;
-    }
-    PrepareShardProgress();
     if (cooperative_) {
       cooperative_count_ = GatherProgressChunkCount(total_bytes_, pipeline_chunk_bytes_, first_chunk_divisor_);
       for (std::uint32_t chunk = 0; chunk < cooperative_count_; ++chunk) {
@@ -182,17 +149,15 @@ class CpuGatherExecutor {
       ready_tasks_ = 0U;
       published_bytes_ = 0U;
     }
+    phase_.store(0U, std::memory_order_release);
     if (!thread_profiles_.empty()) {
       std::fill_n(thread_profiles_.begin(), threads, CpuGatherThreadProfile{});
       copy_profile_ = {};
+      copy_profile_.publish_ns = NowNs();
     }
-    // Gather READ wakes helpers during preparation; Copy releases them after
-    // validation. Scatter keeps its existing dispatch-at-Copy timing.
-    if (!addresses_) {
-      phase_.store(0U, std::memory_order_release);
-      if (!thread_profiles_.empty()) copy_profile_.publish_ns = NowNs();
-      DispatchJob();
-    }
+    generation_.fetch_add(1U, std::memory_order_release);
+    lock.unlock();
+    ready_.notify_all();
     return threads;
   }
 
@@ -211,37 +176,26 @@ class CpuGatherExecutor {
     return cpus;
   }
 
-  std::uint64_t Boundary(std::size_t index, std::uint64_t begin, std::uint64_t end,
-                         std::size_t threads) const {
-    if (index == 0U) return begin;
-    if (index == threads) return end;
-    const auto target = begin + (end - begin) * index / threads;
-    const auto base = reinterpret_cast<std::uintptr_t>(staging_);
-    const auto boundary = ((base + target + 63U) & ~std::uintptr_t{63U}) - base;
-    return std::min<std::uint64_t>(boundary, end);
+  std::uint64_t Boundary(std::size_t index) const {
+    if (index == 0U) return 0U;
+    if (index == active_threads_) return total_bytes_;
+    const std::uint64_t target = total_bytes_ * index / active_threads_;
+    const auto address = reinterpret_cast<std::uintptr_t>(staging_) + target;
+    return ((address + 63U) & ~std::uintptr_t{63U}) - reinterpret_cast<std::uintptr_t>(staging_);
   }
 
   std::uint64_t CopyRange(std::uint64_t offset, std::uint64_t end) const;
   bool WaitSuffix() const;
-  std::uint64_t CopyFixedRange(std::uint64_t begin, std::uint64_t end);
-  void PrepareShardProgress();
-  void FinishFixedRange(std::size_t& remaining);
-  template <typename OnProgress>
-  std::uint64_t CopyFixedWave(std::size_t worker, std::size_t wave, OnProgress on_progress);
-  template <typename OnWait>
-  bool WaitFixedSuffix(OnWait on_wait);
 
   std::uint64_t ProcessSource(std::size_t worker);
   void PublishReady();
   void PublishCooperativeReady();
-  void DispatchJob();
 
   static std::uint64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
   }
-  void BeginWorker(std::size_t worker);
-  void FinishWorker(std::size_t worker, std::uint64_t bytes);
+  void CopyWorker(std::size_t worker);
   void RunHelper(std::size_t worker);
 
   std::uint8_t* memory_;
@@ -253,11 +207,9 @@ class CpuGatherExecutor {
   std::vector<std::thread> helpers_;
   std::mutex mutex_;
   std::condition_variable ready_;
-  static constexpr std::uint64_t kDispatchThreadMask = UINT32_MAX;
-  static constexpr std::uint64_t kDispatchGenerationStep = std::uint64_t{1} << 32;
+  std::atomic<std::uint64_t> generation_{0U};
   // The sender retains this descriptor until all copy threads finish and ACK is published.
   const GatherSpan* spans_{nullptr};
-  const std::uint64_t* addresses_{nullptr};
   const std::uint64_t* descriptor_suffix_{nullptr};
   const std::atomic<bool>* request_stop_{nullptr};
   std::uint64_t sequence_{}, head_bytes_{};
@@ -266,39 +218,21 @@ class CpuGatherExecutor {
   std::uint8_t* staging_{nullptr};
   std::uint64_t total_bytes_{0U};
   std::size_t active_threads_{1U};
-  std::uint64_t fixed_last_source_offset_{0U};
-  FixedSuffix fixed_suffix_{};
-  struct alignas(64) FixedWaveProgress {
-    std::size_t remaining{};
-    std::size_t first_shard{};
-    std::uint64_t aligned_bytes{};
-    cpu_push::GatherWave rows{};
-  };
-  std::vector<FixedWaveProgress> fixed_progress_;
-  struct alignas(64) FixedShardProgress {
-    std::size_t remaining{};
-  };
-  std::size_t fixed_first_shard_wave_{SIZE_MAX};
-  bool fixed_jetty_supply_{};
-  std::uint32_t fixed_jetty_count_{cpu_push::kJettyCount};
-  std::vector<FixedShardProgress> fixed_shards_;
-  enum class FixedError { kNone, kSource, kSuffix, kCancelled };
-  std::atomic<FixedError> fixed_error_{FixedError::kNone};
-  void SetFixedError(FixedError error) {
-    auto expected = FixedError::kNone;
-    fixed_error_.compare_exchange_strong(expected, error, std::memory_order_relaxed);
-  }
   std::vector<std::uint64_t> variable_offsets_;
   std::uint64_t* pipeline_ready_{nullptr};
   std::uint32_t pipeline_chunk_bytes_{0U};
   std::uint32_t first_chunk_divisor_{0U};
   bool cooperative_{};
   std::uint32_t cooperative_count_{};
+  // One completion RMW per worker/block; only the last worker scans/publishes.
+  // Blocks have separate lines and no worker waits for another block's users.
   struct alignas(64) CooperativeProgress {
     std::atomic<std::size_t> remaining{0};
     std::atomic<bool> complete{false};
   };
   std::array<CooperativeProgress, kGatherMaxProgressChunks> cooperative_progress_;
+  // Separate balanced task ownership from partial DMA-visible progress. Each
+  // slot has one writer; only the coordinator publishes the contiguous prefix.
   struct alignas(64) TaskProgress { std::uint64_t bytes{}; };
   std::vector<TaskProgress> task_progress_;
   std::uint64_t task_bytes_{0U};
@@ -307,11 +241,8 @@ class CpuGatherExecutor {
   std::vector<CpuGatherThreadProfile> thread_profiles_;
   CpuGatherCopyProfile copy_profile_{};
   alignas(64) std::atomic<std::uint32_t> phase_{0U};
-  std::atomic<bool> stopping_{false};
-  // The low bits specify the participants of this generation. An inactive
-  // helper can skip a job without reading fields the coordinator may reuse.
-  alignas(64) std::atomic<std::uint64_t> dispatch_{0U};
   alignas(64) std::atomic<std::size_t> completed_{0U};
+  std::atomic<bool> stopping_{false};
 };
 
 }  // namespace kvaf::peer

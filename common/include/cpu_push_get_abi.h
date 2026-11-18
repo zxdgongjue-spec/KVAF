@@ -46,8 +46,9 @@ struct alignas(64) Completion {
   // One aligned word publishes both sequence and result without a torn pair.
   std::uint64_t token{}, reserved[7]{};
 };
-// Each active Jetty updates only its own 8-byte progress word.
-struct alignas(64) Ready { std::uint64_t jetty[8]{}; };
+// Preserve the legacy four-Jetty record, including its reserved words. AIV
+// extended pools use ReadyStride and byte offsets for additional progress.
+struct alignas(64) Ready { std::uint64_t jetty[kJettyCount]{}, reserved[4]{}; };
 KVAF_CPU_PUSH_INLINE constexpr std::uint32_t ReadyStride(std::uint32_t jettys) {
   return (jettys + 7U) / 8U * sizeof(Ready);
 }

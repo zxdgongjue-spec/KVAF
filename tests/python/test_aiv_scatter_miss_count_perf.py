@@ -95,8 +95,8 @@ def arguments(argv=None):
                         help="capture multiple BatchGet nodes and replay them with one final synchronization")
     parser.add_argument("--graph-calls", type=int, default=8,
                         help="BatchGet nodes per graph (default: 8); eager mode always measures one call")
-    parser.add_argument("--completion-scope", choices=("device", "stream"), default="device",
-                        help="wait on the device or the selected stream")
+    parser.add_argument("--completion-scope", choices=("device", "stream", "native-stream"), default="device",
+                        help="wait on the device, the selected stream, or inside the eager prepared call")
     parser.add_argument("--host-profile", action=argparse.BooleanOptionalAction, default=None)
     extra, remaining = parser.parse_known_args(argv)
     if not any(x in remaining for x in ("--kernel-profile", "--no-kernel-profile")):
@@ -155,6 +155,8 @@ def validate_scatter(args):
         return "host-profile requires kernel-profile"
     if not 1 <= args.graph_calls <= 0xFFFFFFFF:
         return "graph-calls must be a positive uint32"
+    if args.acl_graph and args.completion_scope == "native-stream":
+        return "ACL graph completion uses --completion-scope stream or device"
     if args.json and args.csv and args.json.resolve() == args.csv.resolve():
         return "JSON and CSV outputs must differ"
     if args.json and (args.json.resolve() == args.json.with_suffix(".log").resolve() or
@@ -373,7 +375,8 @@ def run_case(args):
         graph_execution="same_stream_ordered_shared_transport" if graph_mode else "eager",
         graph_payload_bytes=payload * calls,
         output_storage="shared_last_call_visible",
-        timing={"device": "enqueue_then_global_device_sync", "stream": "enqueue_then_stream_sync"}[args.completion_scope],
+        timing={"device": "enqueue_then_global_device_sync", "stream": "enqueue_then_stream_sync",
+                "native-stream": "prepared_call_includes_stream_sync"}[args.completion_scope],
         stream_selection="fixed_stream_per_call_task_queue_fence",
         graph_mailbox=graph_mode and os.environ.get("KVAF_SCATTER_GRAPH_MAILBOX") == "1",
         input_storage="fixed_buffers_refreshed_per_call",
@@ -454,13 +457,15 @@ def run_case(args):
             input_plans.append(request_plan())
         # Dedicated stream for capture and for the same-stream eager comparison.
         stream = torch.npu.Stream() if graph_mode or args.completion_scope != "device" else None
-        wait = stream.synchronize if args.completion_scope == "stream" else torch.npu.synchronize
+        wait = (None if args.completion_scope == "native-stream" else
+                stream.synchronize if args.completion_scope == "stream" else torch.npu.synchronize)
         if graph_mode and args.kernel_profile:
             runtime.start_scatter_profile()  # Captured kernel options are fixed at preparation.
         with setup_phase(report, "prepare_submit"):
             capture_nodes = [runtime.prepare_scatter_batch_get(
                 view, inputs[0], inputs[1], count, inputs[2], output,
                 stream=stream, synchronize=False,
+                wait_stream=args.completion_scope == "native-stream",
                 capture_into_graph=args.acl_graph) for inputs in input_plans]
             if calls > 1:
                 # Validate every node's request/output mapping before capture.

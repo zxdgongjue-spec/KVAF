@@ -8,13 +8,15 @@
 
 namespace kvaf::cpu_urma_detail {
 // Track queue credits and CQE identity with slot/generation/queue contexts.
-class IndexedAsyncWriteTracker {
-  static constexpr unsigned kQueueBits = 5, kSlotBits = 6;
+template <unsigned QueueBits>
+class BasicIndexedAsyncWriteTracker {
+  static_assert(QueueBits == 4 || QueueBits == 5, "unsupported indexed CQ queue bits");
+  static constexpr unsigned kQueueBits = QueueBits, kSlotBits = 6;
  public:
   struct Fence { std::size_t queue{}, wrs{}; std::uint64_t context{}; };
   static constexpr std::size_t kMaxQueues = 1U << kQueueBits, kMaxBatches = 1U << kSlotBits;
   struct Handle { std::uint64_t token{}; };
-  explicit IndexedAsyncWriteTracker(std::size_t queues = 0, std::size_t depth = 8192)
+  explicit BasicIndexedAsyncWriteTracker(std::size_t queues = 0, std::size_t depth = 8192)
       : queues_(queues), depth_(depth) {}
   Status TryBegin(std::uint64_t id, Handle& handle, Fence* fences,
                   std::size_t count, bool* submitted) {
@@ -96,6 +98,11 @@ class IndexedAsyncWriteTracker {
   std::array<std::size_t, kMaxQueues> used_{}, pending_{};
   std::array<Batch, kMaxBatches> batches_{};
 };
+
+// Keep the legacy AICPU queue layout/context encoding; only AIV Scatter uses
+// the extended pool. Both specializations share the same credit/CQE logic.
+using IndexedAsyncWriteTracker = BasicIndexedAsyncWriteTracker<4>;
+using AivIndexedAsyncWriteTracker = BasicIndexedAsyncWriteTracker<5>;
 
 // Rotate across active CQs; bound reads by free result slots to avoid
 // overflowing the caller buffer when completions arrive out of order.

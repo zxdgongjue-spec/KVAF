@@ -741,10 +741,12 @@ class NpuPythonRuntime final {
                                    const py::object& indices, const py::object& offsets,
                                    const py::object& miss_count, const py::object& output_indices,
                                    const py::object& output, const py::object& stream,
-                                   bool synchronize, bool capture_into_graph) {
+                                   bool synchronize, bool wait_stream, bool capture_into_graph) {
     if (!trusted_scatter_inputs_ || !Initialized())
       throw py::value_error("prepare_scatter_batch_get requires initialized cpu_push_scatter");
-    if (capture_into_graph && synchronize)
+    if (synchronize && wait_stream)
+      throw py::value_error("choose synchronize (validated) or wait_stream (deferred status), not both");
+    if (capture_into_graph && (synchronize || wait_stream))
       throw py::value_error("graph capture requires an asynchronous node");
     const auto selected = tensor_methods_->SelectStream(stream);
     const auto request = TrustedScatterRequest(table.source(), table.addresses(), table.valid(),
@@ -755,7 +757,7 @@ class NpuPythonRuntime final {
                                   offsets, miss_count, output_indices, output);
     auto retained = py::make_tuple(py::cast(this, py::return_value_policy::reference), storage);
     return py::cpp_function(
-        [this, request, selected, synchronize, generation, capture_into_graph,
+        [this, request, selected, synchronize, wait_stream, generation, capture_into_graph,
          storage = std::move(storage), retained = std::move(retained)]() {
           (void)retained;
           scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
@@ -780,6 +782,12 @@ class NpuPythonRuntime final {
             return;
           }
           SubmitScatterBatchGet(request, acl_stream, synchronize);
+          if (wait_stream) {
+            // Preserve the eager prepared API: wait only for this stream's DMA;
+            // status validation remains in the ordinary drain/profile path.
+            scatter_host::Timer sync_timer(scatter_host::kStreamSync);
+            ThrowIfAclError(aclrtSynchronizeStream(acl_stream), "synchronize prepared scatter stream");
+          }
         }, py::name("submit_scatter_batch_get"));
   }
 
@@ -1001,12 +1009,15 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("device_access_table"), py::arg("indices"), py::arg("offsets"),
            py::arg("miss_count"), py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
+           py::arg("wait_stream") = false,
            py::arg("capture_into_graph") = false,
            "Return a no-argument submit callable for fixed Tensor storage and stream. "
            "In-place contents may change; do not resize/rebind storage or release the table. "
            "Retains Runtime, Tensors and stream; keep callable alive until completion. "
            "Expires on shutdown/reinitialize. "
-           "synchronize=True includes status validation. capture_into_graph=True attaches "
+           "synchronize=True includes status validation. wait_stream=True waits for DMA only; "
+           "status validation stays deferred. The two options are mutually exclusive. "
+           "capture_into_graph=True attaches "
            "one asynchronous Scatter node when called during capture. "
            "Keep the callable and Runtime alive until the caller destroys and detaches the graph. "
            "Set profiling before capture.")

@@ -46,6 +46,10 @@ K 端设置 `KVAF_CPU_GATHER_INTERLEAVE=1`，统一开启交错 Gather 和每 Je
 Scatter 默认使用 4 条共享 payload Jetty；`--jettys-per-core N` 或
 `KVAF_SCATTER_JETTYS_PER_CORE=N` 将总数设为 AIV 核数乘以 N，上限 32。
 CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 按需增长并复用。
+CPU Push 使用独立的 `CpuPushGatherExecutor`；`aiv-gather` 的
+`CpuGatherExecutor` 保留原有描述符、前缀发布和线程调度实现。默认四 Jetty 且未启用 CPU
+Gather 的 Scatter 保留 V8 握手；未启用 CPU Gather 时保留原有内存分配策略。
+显式配置非四 Jetty 数量时，只有该 Scatter 的打开命令使用 V9 扩展；AICPU Scatter 保留 V6 协议。
 
 ## 独立二进制与类型声明
 
@@ -157,6 +161,10 @@ BatchGet，P50 表示每图平均耗时的中位数。图准备、输入刷新�
 销毁并调用 `detach_scatter_batch_get_graph()`；同一 Runtime 的所有节点须使用同一图和 stream。
 profiling 开关须在捕获前设置。`KVAF_SCATTER_GRAPH_MAILBOX=1` 允许图模式在设备上按批更新
 并复用 mailbox 控制 WQE，避免每次重新构造模板。
+普通 prepared Scatter 继续支持 `wait_stream=True`，在调用内等待 DMA 完成并推迟状态校验；
+它与 `synchronize=True` 互斥。图捕获需将二者设为 false，使用 `capture_into_graph=True`。
+无图性能对照的 `--completion-scope native-stream` 继续映射到这一原有接口；图模式使用
+`--completion-scope stream` 或 `device`。
 
 ## 构建与完整回归
 

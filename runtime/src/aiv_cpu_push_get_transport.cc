@@ -16,7 +16,7 @@ namespace kvaf::cpu_push::aiv {
 namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 constexpr std::size_t kJettyDepth = 8192;
-static_assert(kMaxJettyCount <= cpu_urma_detail::IndexedAsyncWriteTracker::kMaxQueues);
+static_assert(kMaxJettyCount <= cpu_urma_detail::AivIndexedAsyncWriteTracker::kMaxQueues);
 #ifdef __OPTIMIZE__
 constexpr unsigned kOptimized = 1;
 #else
@@ -69,7 +69,7 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
   // Planning and copying retain their alignment and small-thread-pool fallbacks.
   gather_interleave_ = interleave && interleave[0] == '1';
   try {
-    gather_ = std::make_unique<peer::CpuGatherExecutor>(memory, base, threads, min_bytes,
+    gather_ = std::make_unique<peer::CpuPushGatherExecutor>(memory, base, threads, min_bytes,
                                                       mode, affinity);
   } catch (const std::exception& error) {
     return Status::Internal(error.what());
@@ -293,9 +293,9 @@ std::uint32_t Transport::FirstGatherChunkRows(std::uint32_t count) const {
   return std::uint64_t{shard.end} * token_bytes_ % 64U == 0U ? shard.end : 0U;
 }
 
-Status Transport::GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave,
-                             const peer::CpuGatherExecutor::FixedSuffix* suffix,
-                             const peer::CpuGatherExecutor::ShardProgress& on_shards) {
+Status Transport::GatherRows(std::uint32_t count, const peer::CpuPushGatherExecutor::WaveReady& on_wave,
+                             const peer::CpuPushGatherExecutor::FixedSuffix* suffix,
+                             const peer::CpuPushGatherExecutor::ShardProgress& on_shards) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
   try {
     const auto threads = gather_->PrepareFixed(gather_staging_, addresses, count, token_bytes_, source_bytes_,
@@ -688,7 +688,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     std::size_t shards_left = 0U;
     for (std::uint32_t q = 0; q < jetty_count_; ++q) shards_left += prepared_shards_[q].size();
     const auto whole_plans = prepared_.size() - shards_left;
-    const peer::CpuGatherExecutor::FixedSuffix suffix{
+    const peer::CpuPushGatherExecutor::FixedSuffix suffix{
         reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset),
         request().sequence, stop, std::chrono::milliseconds(kTimeoutMs), gather_suffix_wave_};
     Status post_status = Status::OK();
@@ -718,7 +718,7 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
       if (poll_for_credits && blocked && shards_left) post_status = PollPrepared(0, profile, false);
       return post_status.ok();
     };
-    peer::CpuGatherExecutor::ShardProgress on_shards;
+    peer::CpuPushGatherExecutor::ShardProgress on_shards;
     if (shards_left) on_shards = [&] { return post_ready_shards(true); };
     status = GatherRows(count, [&](std::size_t ready_waves) {
       while (next_plan < whole_plans && prepared_[next_plan]->ready_waves <= ready_waves) {

@@ -22,6 +22,7 @@
 #include "cpu_push_get_abi.h"
 #include "cpu_push_get_layout.h"
 #include "cpu_push_gather_schedule.h"
+#include "cpu_push_gather_executor.h"
 #include "sequential_batch_get_abi.h"
 // The CPU model exercises the kernel body, without Ascend ELF section placement.
 #define __attribute__(...)
@@ -929,7 +930,7 @@ int main() {
     for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = i;
     std::memset(staging, 0xad, sizeof(staging));
     uint64_t addresses[] = {Address(source + 3), Address(source + 6), Address(source + 3)};
-    kvaf::peer::CpuGatherExecutor executor(source, Address(source), 4, 1,
+    kvaf::peer::CpuPushGatherExecutor executor(source, Address(source), 4, 1,
                                            kvaf::peer::GatherWaitMode::kActive);
     assert(executor.PrepareFixed(staging, addresses, 3, 3, sizeof(source)) == 4);
     executor.Copy();
@@ -972,7 +973,7 @@ int main() {
         GatherWave{Range{12, 13}, Range{8, 12}}};
     std::vector<std::size_t> ready;
     alignas(8) uint64_t suffix_sequence = 0;
-    const kvaf::peer::CpuGatherExecutor::FixedSuffix suffix{
+    const kvaf::peer::CpuPushGatherExecutor::FixedSuffix suffix{
         &suffix_sequence, 1, nullptr, std::chrono::seconds(1), 2};
     std::fill(repeated + 8, repeated + 13, Address(source + 1));
     assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), waves,
@@ -995,7 +996,7 @@ int main() {
 
     // The coordinator can publish one shard from a wave before another
     // shard from that same wave is copied. With one worker this is deterministic.
-    kvaf::peer::CpuGatherExecutor shard_executor(source, Address(source), 1, 1);
+    kvaf::peer::CpuPushGatherExecutor shard_executor(source, Address(source), 1, 1);
     const std::vector<GatherWave> one_wave{GatherWave{Range{4, 8}, Range{0, 4}}};
     std::memset(staging, 0xad, sizeof(staging));
     assert(shard_executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source),
@@ -1017,7 +1018,7 @@ int main() {
     const std::vector<GatherWave> jetty_waves{
         GatherWave{Range{0, 4}, Range{4, 8}},
         GatherWave{Range{8, 12}, Range{}, Range{12, 13}}};
-    kvaf::peer::CpuGatherExecutor jetty_executor(source, Address(source), 9, 1);
+    kvaf::peer::CpuPushGatherExecutor jetty_executor(source, Address(source), 9, 1);
     std::memset(staging, 0xad, sizeof(staging));
     assert(jetty_executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
                                       jetty_waves, nullptr, 0, true) == 9);
@@ -1030,7 +1031,7 @@ int main() {
       assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
     assert(staging[13 * sizeof(source)] == 0xad);
 
-    kvaf::peer::CpuGatherExecutor small_pool(source, Address(source), 3, 1);
+    kvaf::peer::CpuPushGatherExecutor small_pool(source, Address(source), 3, 1);
     std::memset(staging, 0xad, sizeof(staging));
     assert(small_pool.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
                                    jetty_waves, nullptr, 0, true) == 3);

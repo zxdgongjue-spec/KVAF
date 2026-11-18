@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-#include "cpu_gather_executor.h"
+#include "cpu_push_gather_executor.h"
 #include "cpu_push_get_layout.h"
 #include "cpu_urma_channel.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
@@ -47,7 +47,7 @@ class Transport {
     cpu_runtime_detail::UrmaChannel channel;
     bool poisoned{};
   };
-  using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
+  using Tracker = cpu_urma_detail::AivIndexedAsyncWriteTracker;
   struct PreparedQueue {
     struct Source { std::uint32_t local, row, offset; };
     struct SourceRun { std::uint32_t local, row, count; };
@@ -74,9 +74,9 @@ class Transport {
   };
   Status EnsureGatherStaging(std::uint32_t count);
   std::uint32_t FirstGatherChunkRows(std::uint32_t count) const;
-  Status GatherRows(std::uint32_t count, const peer::CpuGatherExecutor::WaveReady& on_wave = {},
-                    const peer::CpuGatherExecutor::FixedSuffix* suffix = nullptr,
-                    const peer::CpuGatherExecutor::ShardProgress& on_shards = {});
+  Status GatherRows(std::uint32_t count, const peer::CpuPushGatherExecutor::WaveReady& on_wave = {},
+                    const peer::CpuPushGatherExecutor::FixedSuffix* suffix = nullptr,
+                    const peer::CpuPushGatherExecutor::ShardProgress& on_shards = {});
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
@@ -110,7 +110,7 @@ class Transport {
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
-  std::unique_ptr<peer::CpuGatherExecutor> gather_;
+  std::unique_ptr<peer::CpuPushGatherExecutor> gather_;
   urma_target_seg_t* gather_segment_{};
   urma_token_id_t* gather_token_{};
   std::uint8_t* gather_staging_{};
