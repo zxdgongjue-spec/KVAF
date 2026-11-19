@@ -20,17 +20,17 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
   --token-bytes 656 --tokens-per-block 128 \
   --source-access-pattern random --output-access-pattern contiguous \
   --no-sort-input-indices --seed 20260903 \
-  --graph-api torch --graphs 8 --graph-replays 5 --warmup 10 --seconds 10
+  --graph-api torch --graphs 256 --graph-replays 5 --warmup 10 --seconds 10
 ```
 
 设备号由 `--devices` 指定；每卡启动一个进程。脚本先逐卡测独立带宽，再同时启动各卡
 测并发带宽。所有阶段使用已有 CPU service，脚本不会启动或重启服务。
 每卡单独初始化 DDR 数据区；测试的是这些访问对共享 CPU、内存与通信资源的竞争。
 
-`--graphs N` 控制每卡同时保留的独立图数，默认 8。每张图捕获一个 Get，输入、输出和
+`--graphs N` 控制每卡同时保留的独立图数，默认 256。每张图捕获一个 Get，输入、输出和
 图租约各自独立，复用同一张卡的 AccessTable 和通信资源。每轮在同一 stream 上依次
 提交全部 N 张图，再统一同步一次；多张卡仍由各自进程并发运行。
-例如 `--graphs 8` 每轮执行 8 次 Get，`--graphs 1` 使用原来的逐次回放方式。
+例如 `--graphs 256` 每轮执行 256 次 Get，`--graphs 1` 使用原来的逐次回放方式。
 `--warmup 10` 表示预热 10 轮，每轮也回放全部图。
 
 测量后逐图校验完整输出。`calls = batches × graphs`，有效字节数为
@@ -65,7 +65,7 @@ for backend in aiv ubmem gather_read cpu_push_scatter; do
     --token-bytes 656 --tokens-per-block 128 \
     --source-access-pattern random --output-access-pattern contiguous \
     --no-sort-input-indices --seed 20260903 \
-    --graph-api torch --graphs 8 --graph-replays 5 --warmup 10 --seconds 10 \
+    --graph-api torch --graphs 256 --graph-replays 5 --warmup 10 --seconds 10 \
     --output "$report_root/$backend"
 done
 BASH

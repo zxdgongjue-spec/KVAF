@@ -287,8 +287,8 @@ def main(argv=None):
     add_backend_arguments(parser, sweep=True)
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
     parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
-    parser.add_argument("--graphs", type=int, default=8,
-                        help="distinct graphs per device; replay all on one stream, then synchronize once (default: 8)")
+    parser.add_argument("--graphs", type=int, default=256,
+                        help="distinct graphs per device; replay all on one stream, then synchronize once (default: 256)")
     parser.add_argument("--graph-calls", type=int, default=1, help="one Get node per graph; only 1 is supported")
     parser.add_argument("--graph-api", choices=("acl", "torch"), default="acl")
     parser.add_argument("--graph-replays", type=int, default=5, help="dynamic input checks before measurement")
