@@ -238,18 +238,21 @@ class MulticardTests(unittest.TestCase):
             self.assertTrue((root / "results/concurrent/abort").exists())
             self.assertFalse((root / "results/summary.csv").exists())
 
-    def test_four_workers_run_256_calls_per_graph_barrier_round(self):
+    def test_concurrent_only_runs_four_workers_with_a_256_call_graph(self):
         devices = range(2, 6)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = self.run_controller(root, devices=devices,
-                                         options=("--barrier-per-graph", "--graph-calls", "256",
+                                         options=("--concurrent-only", "--barrier-per-graph", "--graph-calls", "256",
                                                   "--seconds", "0.15"))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             output = root / "results"
             config = json.loads((output / "config.json").read_text())
+            self.assertTrue(config["concurrent_only"])
             self.assertTrue(config["barrier_per_graph"])
             self.assertFalse(config["barrier_per_call"])
+            self.assertFalse(list(output.glob("isolated_*")))
+            self.assertEqual(result.stdout.count("MULTICARD_MEASURE "), 1)
             concurrent = output / "concurrent"
             rounds = len(list(concurrent.glob("done_2_*")))
             self.assertGreater(rounds, 1)
@@ -261,6 +264,39 @@ class MulticardTests(unittest.TestCase):
             self.assertIn("每轮同步回放一张完整的 ACL Graph", report)
             self.assertIn("| Graph 数 / 卡 | 1 |", report)
             self.assertIn("| 每张 Graph 的 BatchGet 次数 | 256 |", report)
+            self.assertIn("| 并发总吞吐（实际窗口） | 60.000 | GB/s |", report)
+            self.assertNotIn("独立带宽之和", report)
+            self.assertNotIn("下降比例", report)
+            with (output / "summary.csv").open() as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual([row["device"] for row in rows], list(map(str, devices)))
+            self.assertEqual(set(rows[0]), {"device", "concurrent_GBps"})
+            aggregate = json.loads((output / "aggregate.json").read_text())
+            self.assertAlmostEqual(aggregate["concurrent_wall_GBps"], 60, places=5)
+            self.assertNotIn("isolated_sum_GBps", aggregate)
+            self.assertNotIn("retained_percent", aggregate)
+            with contextlib.redirect_stdout(io.StringIO()):
+                multi.summarize(output)
+            self.assertEqual((output / "report.md").read_text(), report)
+
+    def test_concurrent_only_core_sweep_regenerates_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, cores="4 8",
+                                         options=("--concurrent-only", "--aiv-cores", "4", "8"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = root / "results"
+            self.assertEqual(result.stdout.count("MULTICARD_MEASURE "), 2)
+            self.assertFalse(list(output.glob("cores_*/isolated_*")))
+            with (output / "aggregate.csv").open() as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual([row["aiv_cores"] for row in rows], ["4", "8"])
+            self.assertNotIn("isolated_sum_GBps", rows[0])
+            report = (output / "report.md").read_text()
+            self.assertIn("| AIV 核数 / 卡 | 并发总吞吐 GB/s |", report)
+            with contextlib.redirect_stdout(io.StringIO()):
+                multi.summarize(output)
+            self.assertEqual((output / "report.md").read_text(), report)
 
     def test_worker_waits_before_each_replay_and_until_previous_replay_completes(self):
         events = []

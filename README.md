@@ -357,6 +357,9 @@ tests/run_remote_cpu_batch_get_multicard_perf.sh "$PWD/build-npu" \
 使用 `--barrier-per-graph --graph-calls 256` 可以每卡把 256 次 BatchGet 录进同一张
 ACL Graph。每轮一起回放整张图，等所有卡完成后再开始下一轮。两个 barrier 参数互斥。
 
+采集多卡并发 profile 时可加 `--concurrent-only`，让 `--devices` 指定的卡直接进入
+同一组并发测试。报告会给出每卡并发带宽、总吞吐和测量窗口重叠率。
+
 ### 6. 无 NPU 的主机回归
 
 使用新的主机构建目录，默认不启用任何设备后端：

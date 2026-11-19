@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare isolated and concurrent sustained BatchGet bandwidth."""
+"""Measure concurrent BatchGet bandwidth with an optional isolated baseline."""
 
 from __future__ import annotations
 
@@ -291,34 +291,44 @@ def markdown_table(headers, rows):
 
 def write_summary(directory, isolated, concurrent, config=None):
     config = config or {}
-    rows = []
-    print("device  isolated_GB/s  concurrent_GB/s  retained_%  drop_%")
-    for solo, shared in zip(isolated, concurrent):
-        ratio = shared["bandwidth_GBps"] / solo["bandwidth_GBps"]
-        row = {
-            "device": solo["device"], "isolated_GBps": solo["bandwidth_GBps"],
-            "concurrent_GBps": shared["bandwidth_GBps"],
-            "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
-        }
-        rows.append(row)
-        print(f"{row['device']:6d}  {row['isolated_GBps']:13.3f}  {row['concurrent_GBps']:15.3f}"
-              f"  {row['retained_percent']:10.2f}  {row['drop_percent']:6.2f}")
+    if isolated:
+        rows = []
+        print("device  isolated_GB/s  concurrent_GB/s  retained_%  drop_%")
+        for solo, shared in zip(isolated, concurrent):
+            ratio = shared["bandwidth_GBps"] / solo["bandwidth_GBps"]
+            row = {
+                "device": solo["device"], "isolated_GBps": solo["bandwidth_GBps"],
+                "concurrent_GBps": shared["bandwidth_GBps"],
+                "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
+            }
+            rows.append(row)
+            print(f"{row['device']:6d}  {row['isolated_GBps']:13.3f}  {row['concurrent_GBps']:15.3f}"
+                  f"  {row['retained_percent']:10.2f}  {row['drop_percent']:6.2f}")
+    else:
+        rows = [{"device": shared["device"], "concurrent_GBps": shared["bandwidth_GBps"]}
+                for shared in concurrent]
+        print("device  concurrent_GB/s")
+        for row in rows:
+            print(f"{row['device']:6d}  {row['concurrent_GBps']:15.3f}")
     span = max(r["end"] for r in concurrent) - min(r["start"] for r in concurrent)
     overlap = max(0.0, min(r["end"] for r in concurrent) - max(r["start"] for r in concurrent))
-    aggregate = {
-        "isolated_sum_GBps": sum(r["bandwidth_GBps"] for r in isolated),
+    aggregate = {"isolated_sum_GBps": sum(r["bandwidth_GBps"] for r in isolated)} if isolated else {}
+    aggregate.update({
         "concurrent_sum_GBps": sum(r["bandwidth_GBps"] for r in concurrent),
         "concurrent_wall_GBps": sum(r["payload_bytes"] for r in concurrent) / span / 1e9,
         "measurement_span_seconds": span,
         "concurrent_payload_bytes": sum(r["payload_bytes"] for r in concurrent),
         "overlap_seconds": overlap, "overlap_percent": overlap / span * 100,
         "start_skew_ms": (max(r["start"] for r in concurrent) - min(r["start"] for r in concurrent)) * 1000,
-    }
-    aggregate["retained_percent"] = aggregate["concurrent_wall_GBps"] / aggregate["isolated_sum_GBps"] * 100
-    aggregate["drop_percent"] = 100 - aggregate["retained_percent"]
-    aggregate["lost_GBps"] = aggregate["isolated_sum_GBps"] - aggregate["concurrent_wall_GBps"]
-    print(f"{'SUM':>6}  {aggregate['isolated_sum_GBps']:13.3f}  {aggregate['concurrent_sum_GBps']:15.3f}"
-          f"  {'-':>10}  {'-':>6}")
+    })
+    if isolated:
+        aggregate["retained_percent"] = aggregate["concurrent_wall_GBps"] / aggregate["isolated_sum_GBps"] * 100
+        aggregate["drop_percent"] = 100 - aggregate["retained_percent"]
+        aggregate["lost_GBps"] = aggregate["isolated_sum_GBps"] - aggregate["concurrent_wall_GBps"]
+        print(f"{'SUM':>6}  {aggregate['isolated_sum_GBps']:13.3f}  {aggregate['concurrent_sum_GBps']:15.3f}"
+              f"  {'-':>10}  {'-':>6}")
+    else:
+        print(f"{'SUM':>6}  {aggregate['concurrent_sum_GBps']:15.3f}")
     metrics = [
         ("单卡独立带宽之和", "isolated_sum_GBps", "GB/s"),
         ("各卡并发带宽之和", "concurrent_sum_GBps", "GB/s"),
@@ -331,6 +341,7 @@ def write_summary(directory, isolated, concurrent, config=None):
         ("测量窗口重叠率", "overlap_percent", "%"),
         ("起跑偏差", "start_skew_ms", "ms"),
     ]
+    metrics = [metric for metric in metrics if metric[1] in aggregate]
     print("\naggregate_metric                         value  unit")
     for _, key, unit in metrics:
         print(f"{key:36s}  {aggregate[key]:10.3f}  {unit}")
@@ -341,12 +352,12 @@ def write_summary(directory, isolated, concurrent, config=None):
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
         "transport", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
-        "seconds", "graph_calls", "barrier_per_call", "barrier_per_graph", "warmup", "seed", "peer",
+        "seconds", "graph_calls", "barrier_per_call", "barrier_per_graph", "concurrent_only", "warmup", "seed", "peer",
         "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
     metadata["run"] = directory.name
-    metadata["device_order"] = " ".join(str(r["device"]) for r in isolated)
+    metadata["device_order"] = " ".join(str(r["device"]) for r in concurrent)
     aggregate_row = dict(metadata, **aggregate)
     with (directory / "aggregate.csv").open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=list(aggregate_row))
@@ -355,6 +366,8 @@ def write_summary(directory, isolated, concurrent, config=None):
 
     report = ["# 多卡 BatchGet 带宽测试", "", f"结果目录：`{directory.name}`", "",
               "带宽单位为十进制 GB/s；统计持续 ACL Graph 回放至完成的有效数据吞吐。", ""]
+    if config.get("concurrent_only"):
+        report += ["本轮仅测多卡并发。", ""]
     if config.get("barrier_per_call"):
         report += ["每轮在 Host 侧同步各卡后发起一次 BatchGet，按录制顺序循环回放。吞吐计时包含轮间同步等待。", ""]
     elif config.get("barrier_per_graph"):
@@ -368,7 +381,7 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("AIV 核数 / 卡", config["aiv_cores"]),
             ("每批有效搬运量", f"{config['requests']} × {config['token_bytes']} B = {config['requests'] * config['token_bytes'] / 2**20:g} MiB"),
             ("地址表布局", f"{config['table_capacity']} 个表项，{config['tokens_per_block']} token / 块"),
-            ("CPU DDR 数据区", f"每卡独立 {per_device / 2**20:g} MiB；并发合计 {len(isolated) * per_device / 2**30:g} GiB"),
+            ("CPU DDR 数据区", f"每卡独立 {per_device / 2**20:g} MiB；并发合计 {len(concurrent) * per_device / 2**30:g} GiB"),
             ("每阶段测量时长", f"{config['seconds']:g} s"),
             ("Graph 数 / 卡", config["graph_calls"] if config.get("barrier_per_call") else 1),
             ("每张 Graph 的 BatchGet 次数", 1 if config.get("barrier_per_call") else config["graph_calls"]),
@@ -382,20 +395,28 @@ def write_summary(directory, isolated, concurrent, config=None):
                 ("未完成 READ 上限 / 卡", "max_inflight_total"),
             ) if key in config]
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
-    device_rows = [
-        (r["device"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
-         f"{r['retained_percent']:.2f}", f"{r['drop_percent']:.2f}") for r in rows
-    ]
-    device_rows.append(("各卡相加", f"{aggregate['isolated_sum_GBps']:.3f}",
-                        f"{aggregate['concurrent_sum_GBps']:.3f}", "—", "—"))
+    if isolated:
+        device_headers = ["设备", "独立 GB/s", "并发 GB/s", "保留 %", "下降 %"]
+        device_rows = [
+            (r["device"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
+             f"{r['retained_percent']:.2f}", f"{r['drop_percent']:.2f}") for r in rows
+        ]
+        device_rows.append(("各卡相加", f"{aggregate['isolated_sum_GBps']:.3f}",
+                            f"{aggregate['concurrent_sum_GBps']:.3f}", "—", "—"))
+    else:
+        device_headers = ["设备", "并发 GB/s"]
+        device_rows = [(r["device"], f"{r['concurrent_GBps']:.3f}") for r in rows]
+        device_rows.append(("各卡相加", f"{aggregate['concurrent_sum_GBps']:.3f}"))
     report += ["## 每卡带宽", "",
-               markdown_table(["设备", "独立 GB/s", "并发 GB/s", "保留 %", "下降 %"], device_rows), "",
+               markdown_table(device_headers, device_rows), "",
                "## 总带宽与并发情况", "",
                markdown_table(["指标", "值", "单位"],
                               [(label, f"{aggregate[key]:.3f}", unit) for label, key, unit in metrics]), "",
                "并发总吞吐 = 所有卡有效搬运字节数之和 ÷（最晚结束时间 − 最早开始时间）。",
-               "各卡并发带宽直接相加使用了各自的测量时长，因此可能与并发总吞吐略有差别；总保留/下降比例使用并发总吞吐计算。",
+               "各卡并发带宽直接相加使用了各自的测量时长，因此可能与并发总吞吐略有差别。",
                "测量窗口共同覆盖时长取各卡主机测量窗口的交集。", ""]
+    if isolated:
+        report += ["总保留比例和下降比例使用并发总吞吐计算。", ""]
     if aggregate["overlap_percent"] < 95:
         report += ["测量窗口重叠率不足 95%，需检查子进程日志后再判断带宽竞争。", ""]
     (directory / "report.md").write_text("\n".join(report))
@@ -415,9 +436,11 @@ def write_sweep_summary(directory, cores):
             writer = csv.DictWriter(output, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-    headers = ["AIV 核数 / 卡", "独立带宽之和 GB/s", "并发总吞吐 GB/s", "保留 %", "下降 %"]
-    values = [(row["aiv_cores"], *(f"{float(row[key]):.3f}" for key in (
-        "isolated_sum_GBps", "concurrent_wall_GBps", "retained_percent", "drop_percent"))) for row in rows]
+    metrics = [("独立带宽之和 GB/s", "isolated_sum_GBps"), ("并发总吞吐 GB/s", "concurrent_wall_GBps"),
+               ("保留 %", "retained_percent"), ("下降 %", "drop_percent")]
+    metrics = [(label, key) for label, key in metrics if key in rows[0]]
+    headers = ["AIV 核数 / 卡", *(label for label, _ in metrics)]
+    values = [(row["aiv_cores"], *(f"{float(row[key]):.3f}" for _, key in metrics)) for row in rows]
     table = markdown_table(headers, values)
     report = ["# 多卡 BatchGet 核数扫描", "",
               f"协议：{rows[0]['transport']}；每批 {rows[0]['requests']} × {rows[0]['token_bytes']} B；带宽单位为十进制 GB/s。",
@@ -435,13 +458,16 @@ def summarize(directory):
             summarize(directory / f"cores_{core}")
         write_sweep_summary(directory, config["aiv_cores"])
         return
-    isolated = [json.loads((directory / f"isolated_{device}/device_{device}.json").read_text())
-                for device in config["devices"]]
+    isolated = []
+    if not config.get("concurrent_only"):
+        isolated = [json.loads((directory / f"isolated_{device}/device_{device}.json").read_text())
+                    for device in config["devices"]]
     concurrent = [json.loads((directory / f"concurrent/device_{device}.json").read_text())
                   for device in config["devices"]]
-    for device, solo, shared in zip(config["devices"], isolated, concurrent):
-        if solo["device"] != device or shared["device"] != device or not solo["verified"] or not shared["verified"]:
-            raise RuntimeError(f"invalid saved result for device {device}")
+    for results in (isolated, concurrent):
+        for device, result in zip(config["devices"], results):
+            if result["device"] != device or not result["verified"]:
+                raise RuntimeError(f"invalid saved result for device {device}")
     write_summary(directory, isolated, concurrent, config)
 
 
@@ -452,6 +478,8 @@ def main(argv=None):
     parser.add_argument("--aiv-cores", nargs="+", type=int,
                         help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
     parser.add_argument("--seconds", type=float, default=10)
+    parser.add_argument("--concurrent-only", action="store_true",
+                        help="run the selected devices together without measuring isolated baselines")
     parser.add_argument("--graph-calls", type=int,
                         help="total calls to capture (default: 256, or 1 with --barrier-per-call)")
     barrier_group = parser.add_mutually_exclusive_group()
@@ -510,7 +538,7 @@ def main(argv=None):
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
           f"barrier_per_call={int(args.barrier_per_call)} barrier_per_graph={int(args.barrier_per_graph)} "
-          f"graph_calls={args.graph_calls} "
+          f"graph_calls={args.graph_calls} concurrent_only={int(args.concurrent_only)} "
           f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
           f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
@@ -526,7 +554,9 @@ def main(argv=None):
                 case_config = dict(config, aiv_cores=core, output=str(case))
                 (case / "config.json").write_text(json.dumps(case_config, indent=2) + "\n")
             print(f"MULTICARD_CORE_SWEEP_BEGIN aiv_cores={core}", flush=True)
-            isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
+            isolated = []
+            if not args.concurrent_only:
+                isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
             concurrent = run_group(args, args.devices, case / "concurrent")
             write_summary(case, isolated, concurrent, dict(config, aiv_cores=core))
         if len(cores) > 1:
