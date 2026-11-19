@@ -40,6 +40,9 @@ UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 Graph 固定测 replay 加 stream 等待，资源准备、输出校验和 profile 读取均在计时外。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
+Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-profile` 还验证
+未回放节点没有可读 profile、各节点 profile 独立，以及其他图回放不改写其报告。
+回归命令见[执行框架验证说明](cache_transport_execution_validation.md)。
 
 默认关闭算子 profiling，只输出 `BATCH_GET_RESULT scope=end_to_end` 的 Host 延迟和带宽。
 加上 `--kernel-profile` 才开启设备打点、每轮 profile 回读和详细分段输出，

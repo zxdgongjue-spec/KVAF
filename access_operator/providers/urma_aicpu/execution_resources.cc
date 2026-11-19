@@ -80,6 +80,9 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
     return Status::Busy("release input/output binding before replacing invocation");
   auto bound = state_->put.BindExecutionState(call->put.get());
   if (!bound.ok()) return bound;
+  // The dispatcher marks graph nodes after CreateInvocation(). Forward the
+  // flag at bind time so inner transports use node-owned completion/profile.
+  call->get->graph_node = call->graph_node;
   bound = state_->get.BindExecutionState(call->get.get());
   if (!bound.ok()) {
     (void)state_->put.BindExecutionState(state_->invocation->put.get());
@@ -87,6 +90,7 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
   }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   if (state_->push) {
+    call->push->graph_node = call->graph_node;
     bound = state_->push->BindExecutionState(call->push.get());
     if (!bound.ok()) {
       (void)state_->get.BindExecutionState(state_->invocation->get.get());

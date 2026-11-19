@@ -86,8 +86,31 @@ Graph 回放不重新进入 Host Dispatcher，不能代替 eager 调度开销测
 
 可追加 `--multi-graph-check` 做计时前的串行多图验证：同一 stream 上交替回放两张图，
 其中一张含两个 Get 节点，覆盖完整、部分和零请求；释放双节点图后继续验证另一张图。
+Gather/Scatter 还验证只回放 B 时，未回放的 A 节点不能通过完成检查；
+加上 `--kernel-profile` 时，A 的 profile 查询必须拒绝，分别回放后各节点报告不能串用，
+且只回放 A 不应改写 B 的 profile 快照。另用一张未回放的临时图验证：先销毁图，
+普通结束必须拒绝，随后 `discard_result=True` 能释放保留的租约。这些检查均在正式计时之外。
 通过时输出 `BATCH_GET_MULTI_GRAPH_PASS`。正式性能样本仍为单节点图；
 该检查不验收图内混合算法或跨 stream 并发回放。
+
+针对 AICPU 图节点报告隔离的回归，可运行以下命令（CPU 服务地址和设备按现场替换）：
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+for backend in gather_read cpu_push_scatter; do
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend "$backend" --aicpu-workers 5 --execution graph \
+    --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --multi-graph-check --kernel-profile --warmup 10 --iterations 100
+done
+BASH
+```
+
+每个后端均应输出 `BATCH_GET_MULTI_GRAPH_PASS` 和 `BATCH_GET_GRAPH_PASS`。
+默认使用 torch 图接口；验证原生 ACL 图接口时追加 `--graph-api acl`。
 
 ## Put 使用同步性能入口
 

@@ -32,6 +32,7 @@ environment variables:
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import os
 from pathlib import Path
 import statistics
@@ -79,7 +80,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
     parser.add_argument("--multi-graph-check", action="store_true",
-                        help="validate two live graphs on one stream, including a graph with two Get nodes")
+                        help="validate two live graphs on one stream, including per-node AICPU status/profile isolation")
     parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
                         help="enable a hardware run; selecting --backend also enables it")
     parser.add_argument("--get-timing", choices=("async-drain", "sync-call"), default="async-drain",
@@ -221,6 +222,18 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
     execution.release_output(runtime)
     inputs = [GraphInputs(make_plan, torch.empty_like(miss_count), torch.empty_like(output), stream)
               for _ in range(3)]
+    aicpu = uses_aicpu(args)
+    unreplayed_error = ("Gather graph has not been replayed" if args.backend == "gather_read" else
+                        "Scatter graph has not replayed; replay or discard it")
+
+    def expect_value_error(operation, expected, label):
+        try:
+            operation()
+        except ValueError as error:
+            if str(error) != expected:
+                raise
+        else:
+            raise AssertionError(f"{label} accepted an unreplayed graph")
 
     def node(inp):
         def submit(options):
@@ -229,14 +242,36 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
         return inp.output, submit
 
     def check(indices, leases, counts):
+        snapshots = {}
         for i, lease, count in zip(indices, leases, counts):
-            if uses_aicpu(args):
+            if aicpu:
                 runtime.check_batch_get_status(stream, graph_lease=lease)
             check_output(inputs[i].fixed, count, result=inputs[i].output)
-            if args.kernel_profile and count:
+            if args.kernel_profile and (count or aicpu):
                 profiles = runtime.batch_get_kernel_profile(graph_lease=lease)
                 if len(profiles) != args.parallelism:
                     raise AssertionError("multi-graph profile worker count mismatch")
+                if aicpu:
+                    if [int(p["core"]) for p in profiles] != list(range(args.parallelism)):
+                        raise AssertionError("multi-graph profile worker identity mismatch")
+                    # Gather partitions requests evenly; Scatter uses cache-line groups.
+                    # Both report the node's total prefix length across all workers.
+                    if sum(int(p["active_requests"]) for p in profiles) != count:
+                        raise AssertionError(f"graph node {i} profile request count mismatch")
+                    for p in profiles:
+                        stages = p["stages"]
+                        if (int(stages["worker"]) != int(p["core"]) or
+                                int(stages["spans"]) != int(p["active_requests"]) or
+                                int(stages["bytes"]) != int(stages["spans"]) * args.token_bytes):
+                            raise AssertionError(f"graph node {i} profile worker counters mismatch")
+                    device_profile_ms(profiles, args.kernel_profile_clock_mhz)
+                    snapshots[i] = deepcopy(profiles)
+        if aicpu and args.kernel_profile:
+            timelines = [tuple((int(p["device_start_ns"]), int(p["device_finish_ns"]))
+                               for p in profiles) for profiles in snapshots.values()]
+            if len(set(timelines)) != len(timelines):
+                raise AssertionError("different graph nodes returned the same profile timeline")
+        return snapshots
 
     full = args.miss_count
     partial = full // 2
@@ -247,6 +282,20 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
     with captured_get_nodes(args, runtime, torch, kvaf, execution, stream, [node(inputs[2])]) as (b, bl):
         with captured_get_nodes(args, runtime, torch, kvaf, execution, stream,
                                 [node(inputs[0]), node(inputs[1])]) as (a, al):
+            if aicpu:
+                # A's captured nodes must remain unreplayed even when the sibling
+                # graph advances the algorithm's shared device ticket counter.
+                b.replay()
+                b.synchronize()
+                check((2,), bl, (full,))
+                for lease in al:
+                    expect_value_error(
+                        lambda: runtime.check_batch_get_status(stream, graph_lease=lease),
+                        unreplayed_error, "graph status")
+                    if args.kernel_profile:
+                        expect_value_error(
+                            lambda: runtime.batch_get_kernel_profile(graph_lease=lease),
+                            "no completed AICPU kernel profile", "graph profile")
             for i, count in enumerate((full, partial, full)):
                 inputs[i].prepare(count)
             a.replay()
@@ -259,15 +308,42 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
             b.replay()
             a.replay()
             a.synchronize()
-            check((0, 1, 2), al + bl, (0, full, partial))
+            before = check((0, 1, 2), al + bl, (0, full, partial))
+            if aicpu:
+                inputs[0].prepare(partial)
+                inputs[1].prepare(full)
+                a.replay()
+                a.synchronize()
+                after = check((0, 1, 2), al + bl, (partial, full, partial))
+                if args.kernel_profile and after[2] != before[2]:
+                    raise AssertionError("replaying graph A overwrote graph B's profile")
             a.validated = True
+        if aicpu:
+            # Use a throwaway capture for the nondiscard end check: the helper
+            # destroys it before EndGetGraph(false), leaving A's replay tests intact.
+            unreplayed_leases = []
+
+            def end_unreplayed_graph():
+                with captured_get_nodes(args, runtime, torch, kvaf, execution, stream,
+                                        [node(inputs[0])]) as (unreplayed, leases):
+                    unreplayed_leases.extend(leases)
+                    b.replay()
+                    b.synchronize()
+                    # Select the helper's nondiscard end path deliberately.
+                    unreplayed.validated = True
+
+            expect_value_error(end_unreplayed_graph, unreplayed_error, "nondiscard graph end")
+            # Rejected nondiscard end retains the lease; the graph is already destroyed.
+            runtime.end_get_graph(unreplayed_leases[0], stream, discard_result=True)
         inputs[2].prepare(full)
         b.replay()
         b.synchronize()
         check((2,), bl, (full,))
         b.validated = True
     print(f"BATCH_GET_MULTI_GRAPH_PASS backend={args.backend} api={args.graph_api} "
-          "graphs=2 max_nodes_per_graph=2 shared_stream=1 survivor_replayed=1", flush=True)
+          f"graphs={3 if aicpu else 2} max_live_graphs=2 max_nodes_per_graph=2 "
+          f"shared_stream=1 survivor_replayed=1 unreplayed_end_checked={int(aicpu)} "
+          f"profile_isolation_checked={int(aicpu and args.kernel_profile)}", flush=True)
 
 
 def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
