@@ -374,7 +374,7 @@ resources.capture(stream) + 外部 torch/ACL capture
 
 AIV Direct graph 不增加逐次 status 清零或结果回拷；UBMEM graph 不在 kernel 前追加 status memset，结束时仍同步并检查结果；AICPU 显式状态检查在 replay 完成后执行。不能用统一的“每次重放先清零并回读状态”描述四种算法。
 
-kernel profiling 在取得 graph lease 前按配置启用，每轮执行完成后读取，结束图与租约后再关闭。状态查询和 profile 路由到指定配置的驻留实例；省略配置使用 Runtime 默认 Get。图报告始终用 `graph_lease=lease` 选择节点（包括只有一个节点时），可由 `resources.leases` 取得；省略租约查询普通实例结果，避免与 eager 共存时产生歧义。性能入口默认关闭 profiling，显式 `--kernel-profile` 才开启。具体接口及结束后保留最后 profile 的规则见实现文档。
+kernel profiling 在取得 graph lease 前按配置启用，每轮执行完成后读取，结束图与租约后再关闭。状态查询和 profile 路由到指定配置的驻留实例；省略配置使用 Runtime 默认 Get。图报告始终用 `graph_lease=lease` 选择节点（包括只有一个节点时），可由 `resources.leases` 取得；省略租约查询普通实例结果，避免与 eager 共存时产生歧义。单卡性能入口默认报告算子总耗时和带宽，`--kernel-profile` 增加分段明细。具体接口及结束后保留最后 profile 的规则见实现文档。
 
 正常结束和 discard 均须保证回放已停止；同步或注销失败保留资源与租约供重试。AICPU 捕获但未重放的图正常结束会报告未完成，可显式 discard。共享 AICPU 会话失败后，先销毁引用同一算法实例的全部图，再对各租约调用 `end_get_graph(..., discard_result=True)`；尚有同实例租约未进入丢弃流程时返回 Busy。最后一个租约关闭会话后，重试此前收到 Busy 的租约；结束全部图租约后再 `recover(config)`。具体顺序见实现文档，不能复用可能损坏的队列，也不能把 discard 解释为忽略未决 DMA。
 

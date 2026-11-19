@@ -76,7 +76,7 @@ BASH
 
 | 入口 | 测量方式 | profiling |
 |---|---|---|
-| `run_remote_cpu_batch_get_perf.sh` | eager/graph 逐次采样，输出延迟分位数和带宽 | 默认关闭；`--kernel-profile` 开启设备采集、回读、kernel 指标及详细输出 |
+| `run_remote_cpu_batch_get_perf.sh` | eager/graph 逐次采样，输出延迟分位数和带宽 | 默认采集算子时间；`--kernel-profile` 增加分段明细 |
 | `run_remote_cpu_batch_get_multicard_perf.sh` | 持续回放一张 ACL 图，每次回放同步一次，按时间窗口计算独立/并发吞吐 | 关闭设备 profiling，不在循环内回读 profile |
 
 多卡控制器调用单卡入口的持续回放 worker；两者复用负载准备、建表和数据校验。

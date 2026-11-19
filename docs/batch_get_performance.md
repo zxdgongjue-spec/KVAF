@@ -47,17 +47,13 @@ Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-
 未回放节点没有可读 profile、各节点 profile 独立，以及其他图回放不改写其报告。
 回归命令见[执行框架验证说明](cache_transport_execution_validation.md)。
 
-默认关闭算子 profiling，`BATCH_GET_RESULT scope=end_to_end` 在 eager 下报告 Host 延迟和带宽，
+默认同时输出端到端和算子指标。`BATCH_GET_RESULT scope=end_to_end` 在 eager 下报告 Host 延迟和带宽，
 在 graph 下报告 Event 间隔和对应带宽。
-加上 `--kernel-profile` 才开启设备打点、每轮 profile 回读和详细分段输出，
-并增加 `scope=kernel` 的设备时间和带宽。eager 和 graph 使用同一开关。
-UBMEM 同时开启地址准备、MTE 提交和最终 drain 的细分采样。
-仅显式传入 `--kernel-profile` 时启用采集。
-关闭 profiling 时没有核内时间戳，因此不输出 kernel 指标；Graph Event 计时仍启用。
+`scope=kernel` 使用最早 worker 进入到最晚 worker 退出的时间计算有效带宽。
+`--kernel-profile` 增加阶段和 worker 明细，UBMEM 同时开启对应细分打点。
 
 时间单位为微秒，带宽使用有效载荷一次除以对应耗时；`p50_GBps` 对应 P50 延迟。
-上述示例显式启用了 profiling；测无 profiling 的端到端性能时，去掉 `--kernel-profile`。
-开启后算子内打点的开销计入测得时间，profile 回读和结果打印在计时外。
+两种模式的测得时间都包含算子内打点的开销，profile 回读和结果打印在计时外。
 阶段可嵌套或重叠，各段 P50 不能相加得到总 P50。
 
 ## 导出 CSV
@@ -75,8 +71,8 @@ DEVICE_ID=2 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 ```
 
 总结表每个执行模式一行，列名固定，可以合并不同后端的结果。`e2e_p50_GBps`
-是端到端有效带宽，`kernel_p50_GBps` 是算子有效带宽。未开启 profiling 时，
-`kernel_*` 指标留空；`aiv_cores`、`aicpu_workers` 和 Jetty 等参数只填适用项。
+是端到端有效带宽，`kernel_p50_GBps` 是算子有效带宽，两者默认都有值。
+`aiv_cores`、`aicpu_workers` 和 Jetty 等参数只填适用项。
 
 `profile.csv` 每个指标一行，
 用 `kind`、`name`、`metric` 区分阶段、AIV core 或 AICPU worker 的统计值。

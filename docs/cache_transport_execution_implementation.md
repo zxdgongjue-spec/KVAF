@@ -516,8 +516,8 @@ Scatter 不增加逐 token 资源代次检查。调用方须保证索引、offse
 
 性能入口使用唯一执行路径，保留 `--execution eager|graph|both` 及同步/异步完成选项；
 不再接受 `--execution-mode`。旧版本基线从独立 commit 构建并使用其匹配脚本与服务。
-性能入口默认关闭 kernel profiling；显式加入 `--kernel-profile` 才启用设备打点、报告回读及
-设备时间输出。数据预检、输出校验和 profile 快照在性能计时之外；多图检查通过
+单卡性能入口默认采集算子时间并计算带宽；`--kernel-profile` 增加分段明细。
+数据预检、输出校验和 profile 快照在性能计时之外；多图检查通过
 `--multi-graph-check` 在计时前执行，正式 graph 性能样本仍使用单节点图。
 端到端对照须固定同步、profile、工作规模和线程配置：同步 call-to-return 与异步
 submit-only 不能混比。当前异步 call-to-completion 直接使用 `drain_get()`，不先重复

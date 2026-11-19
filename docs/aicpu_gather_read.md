@@ -206,8 +206,7 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 设备时间包含算子中的 CPU/网络等待及 profile 打点。
 `BATCH_GET_PROFILE` 保留各 worker 阶段的统计，阶段可嵌套和重叠，不能相加为设备总时间。
 数据初始化、请求生成、预热、输出校验和 profile 快照在正式性能采样之外。
-默认不启用 profiling；去掉示例中的 `--kernel-profile` 后不打 profiling 点、不回读 profile，
-只输出 Host 端到端时间和带宽。
+去掉 `--kernel-profile` 仍报告端到端和算子时间、带宽，不输出 worker 分段明细。
 
 源池大小由 `--table-capacity` 和块布局显式决定，不再由独立后端脚本分配 100 GiB。
 扫描不同 miss 数、token 大小或 worker 数时，循环调用同一个入口。

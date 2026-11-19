@@ -6,8 +6,8 @@ dimension. The request-array length, AccessTable capacity, block layout and
 exact ``miss_count`` are independent inputs. BatchPut is used only to populate
 the remote table before measurement and is never included in the timing.
 Select implementations with --backend and eager/graph with --execution.
-Host time/bandwidth are always reported. --kernel-profile enables device
-profiling, readback and stage/per-worker diagnostics; profiling is off by default.
+Single-card runs report end-to-end and kernel time/bandwidth.
+--kernel-profile adds stage and per-worker diagnostics.
 Eager timing covers asynchronous submit plus drain (default) or one synchronous call.
 
 The five primary settings can be supplied as command-line options or through
@@ -24,7 +24,7 @@ environment variables:
     --output-access-pattern
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
-    --kernel-profile       enable device profiling, including UBMEM detail
+    --kernel-profile       report stage/worker metrics, including UBMEM detail
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
 """
@@ -66,7 +66,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
     parser.add_argument("--kernel-profile", action="store_true",
-                        help="enable device profiling and detailed output, including UBMEM address/MTE/drain timings; default: off")
+                        help="add stage/worker details, including UBMEM address/MTE/drain timings; kernel bandwidth is always reported")
     parser.add_argument("--output-dir", type=Path, help="directory for summary.csv and, with --kernel-profile, "
                         "profile.csv (default: reports/batch-get/<timestamp>-<backend>-d<device>)")
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
@@ -111,7 +111,7 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "multi-graph-check requires graph or both execution and a positive miss-count"
     if args.iterations <= 0:
         return "iterations must be positive"
-    if args.kernel_profile and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
+    if args.contention_control_dir is None and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     if args.contention_control_dir is not None:
         if args.output_dir is not None:
@@ -155,13 +155,6 @@ def device_profile_ms(profiles, clock_mhz):
     return elapsed / (1_000_000 if nanoseconds else clock_mhz * 1000)
 
 
-def start_kernel_measurement(args, runtime):
-    if not args.kernel_profile:
-        return False
-    runtime.start_batch_get_kernel_profile(detailed=args.backend == "ubmem")
-    return True
-
-
 def format_fields(fields):
     return " ".join(f"{name}={value}" for name, value in fields.items())
 
@@ -200,12 +193,10 @@ def print_aicpu_details(args, execution, samples, details=None):
 def print_measurements(args, execution, samples, profiles, report=None):
     """Keep end-to-end and operator wall time distinct; count payload once."""
     scopes = [("end_to_end", samples, "host_perf_counter")]
-    profiling = args.kernel_profile
-    if profiling and (len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles)):
+    if len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
-    if profiling:
-        scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
-                       "device_ns" if uses_aicpu(args) else "device_cycles"))
+    scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
+                   "device_ns" if uses_aicpu(args) else "device_cycles"))
     payload = args.miss_count * args.token_bytes
     measurements = {}
     timing = args.get_timing if execution == "eager" else "graph-replay-wait"
@@ -228,13 +219,13 @@ def print_measurements(args, execution, samples, profiles, report=None):
             f"request_length={args.request_length} miss_count={args.miss_count} "
             f"token_bytes={args.token_bytes} payload_bytes_per_call={payload} workers={args.parallelism} "
             f"{format_fields(metrics)} "
-            f"timing_source={source} profiling_enabled={int(profiling)} detail_output_enabled={int(args.kernel_profile)} "
+            f"timing_source={source} profiling_enabled=1 detail_output_enabled={int(args.kernel_profile)} "
             "input_updates_and_validation_excluded=1 profile_readback_excluded=1",
             flush=True,
         )
     if report is not None:
-        report.add_summary(execution, timing, len(samples), measurements)
-    if profiling:
+        report.add_summary(execution, measurements)
+    if args.kernel_profile:
         details = [] if report is not None and report.profile_path is not None else None
         if uses_aicpu(args):
             print_aicpu_details(args, execution, profiles, details)
@@ -429,8 +420,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             end_event.synchronize()
             durations.append(float(start_event.elapsed_time(end_event)))
             check_captured(inputs.fixed, args.miss_count)
-            if args.kernel_profile:
-                profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
+            profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
         graph.validated = True
         print_measurements(args, "graph", durations, profiles, report)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
@@ -824,7 +814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "FAIL: rebuild KVAF with the selected NPU backend and Python bindings."
         )
         return 2
-    if args.kernel_profile and not all(
+    if args.contention_control_dir is None and not all(
         hasattr(kvaf.NpuRuntime, method)
         for method in ("start_batch_get_kernel_profile", "stop_batch_get_kernel_profile", "batch_get_kernel_profile")
     ):
@@ -1137,11 +1127,9 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
                        create_request_plan, submit, check)
             return 0
 
-        kernel_profile_started = start_kernel_measurement(args, runtime)
-        if kernel_profile_started:
-            print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
-        else:
-            print("BATCH_GET_KERNEL_PROFILE_DISABLED")
+        runtime.start_batch_get_kernel_profile(detailed=args.kernel_profile and args.backend == "ubmem")
+        kernel_profile_started = True
+        print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
 
         print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
               "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "
@@ -1213,8 +1201,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             if uses_aicpu(args):
                 runtime.check_batch_get_status(torch.npu.current_stream())
             check_output((indices, offsets, output_indices), miss_count_value)
-            if kernel_profile_started:
-                kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
+            kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
 
         if args.get_timing != "sync-call":
             print_samples(

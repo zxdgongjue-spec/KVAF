@@ -266,8 +266,8 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 跨主机部署时将 `127.0.0.1` 替换为 CPU 服务的可达地址。
 `--backend` 支持 `aiv`、`ubmem`、`gather_read`、`cpu_push_scatter`；
 各后端的核数和完整计时范围见[统一 Get 性能测试](docs/batch_get_performance.md)。
-脚本在正式计时之外执行数据预检和输出校验。默认关闭 kernel profiling；上例显式
-使用 `--kernel-profile` 采集设备时间，测无 profiling 的端到端性能时去掉该参数。
+单卡脚本默认报告端到端和算子耗时、带宽。上例加 `--kernel-profile` 查看分段明细。
+数据预检、输出校验和设备计时回读均在 E2E 计时之外。
 追加 `--multi-graph-check` 可在计时前验证多节点报告隔离，以及自动预热/捕获、
 不同 stream 上由调用方串行执行的多图、图与普通 Get 共用输出。
 
