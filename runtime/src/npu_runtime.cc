@@ -775,7 +775,7 @@ Status NpuRuntime::Recover(GetExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
     return Status::Internal("aclrtSetDevice failed");
   if (!initialized()) return Status::NotInitialized("initialize Runtime before recovery");
-  return impl_->dispatcher->Recover(c);
+  return core().RecoverGet(c);
 }
 Status NpuRuntime::Warmup(PutExecutionConfig c, const ExecutionWarmup& request) {
   if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");

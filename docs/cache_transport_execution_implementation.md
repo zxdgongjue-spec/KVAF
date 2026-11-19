@@ -377,6 +377,34 @@ stream 顺序消费，但外部 stream 同步不会替 Dispatcher 归还执行�
 需要完成管理与释放在途引用时调用 `drain_get()`；
 它自己等待完成，不必先做一次外部同步。`synchronize=True` 则直接完成本次调用。
 
+### 普通 Get 失败与恢复
+
+`batch_get` 同步调用或异步 `drain_get()` 已报告错误时，原次输出不可作为成功结果使用。
+普通无图/无显式输出绑定的实例可调用 `runtime.recover(cfg)`：它按资源 owner 的关闭规则
+等待、停止通信并关闭旧实例，成功后重建资源，不要求原次 Drain 变为成功，也不自动重放 Get。
+资源关闭仍失败时保留请求、注册、访问表 pin 和 Python Tensor/stream 引用供重试。
+旧实例已安全关闭而新实例初始化失败时，旧请求引用可以释放，下一次 recover 重试重建。
+
+```python
+# 已收到普通 Get 错误后，在应用的错误处理路径中调用。
+# 此例没有 graph/output lease；原次 Get 仍失败，应用自行决定是否重新请求。
+runtime.recover(gather)
+```
+
+有显式输出绑定时先结束绑定，再恢复并按需重新绑定：
+
+```python
+runtime.end_get_output(output_lease)
+output_lease = 0  # 仅在 End 成功后清除本地 ID。
+runtime.recover(gather)
+output_lease = runtime.begin_get_output(gather, output, capacity, read_stream)
+```
+
+失败实例的 End 会尝试安全关闭整个资源域；关闭失败保留原 ID，应用保留 buffer 并用同一 ID
+重试 End。成功关闭后绑定结束，实例保持仅清理状态，直到 recover 重建；旧 ID 不指向新注册。
+若其他算法仍有普通请求在途，不会因结束空闲实例的输出绑定而释放其请求引用。
+仍有图租约时不走此强制关闭路径，须先停止并销毁相关图、按图模式的 discard 流程结束节点。
+
 ### 显式输出绑定
 
 两个支持注册的 Get 可分别绑定并交替调用，仍由同一 Get 调度方向顺序执行：

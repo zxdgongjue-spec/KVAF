@@ -193,6 +193,11 @@ Python Get 同时写出 `<trace路径>.host.csv`，汇总命令会自动读取�
 性能预检覆盖被测数据路径与图回放，不提供原 matrix、overlap、lifetime、resources、
 lifecycle 或故障注入测试的完整覆盖。
 
+普通 Get 恢复另有一个不依赖 SDK 的定向 Host 故障注入回归，源码及编译命令见
+[诊断目录](../tests/diagnostics/README.md#get-recovery-fault-injection-host-only)。
+它覆盖持续性设备错误、关闭/重建失败重试、表 pin 和输出绑定的保留与退役，
+不替代真实 DMA、队列关闭或设备错误后的目标机验收。
+
 ## 自动图资源变更的验证边界
 
 接口迁移与可运行代码见[实现篇最小示例](cache_transport_execution_implementation.md#python-migration)，

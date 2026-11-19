@@ -79,6 +79,9 @@ class AccessOperator {
   virtual Status Recover(PutExecutionConfig) {
     return Status::NotImplemented("resource recovery requires execution dispatcher");
   }
+  virtual Status Recover(GetExecutionConfig) {
+    return Status::NotImplemented("resource recovery requires execution dispatcher");
+  }
 
   // Synchronous implementations require no completion preparation.
   virtual Status PreparePut(const BatchPutExecutionOptions&) { return Status::OK(); }
@@ -103,6 +106,10 @@ class AccessOperator {
     return Status::NotImplemented("input bindings require execution dispatcher");
   }
   virtual Status DrainGet() { return Status::OK(); }
+  // True while a request or failed teardown may still own caller buffers.
+  // Completion-tracking adapters must positively establish safe retirement;
+  // an adapter without a query implementation conservatively retains owners.
+  virtual bool HasPendingGet() const { return TracksGetCompletion(); }
   virtual Status SetBatchGetKernelProfiling(bool) {
     return Status::NotImplemented("provider does not support Get profiling");
   }

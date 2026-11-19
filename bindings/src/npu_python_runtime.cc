@@ -824,16 +824,21 @@ class NpuPythonRuntime final {
   }
   void EndGetOutput(std::uint64_t id) {
     Status status;
+    bool pending = true;
     std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
     {
       py::gil_scoped_release release;
       lock.lock();
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS)
         status = Status::Internal("aclrtSetDevice failed");
-      else status = native_->core().EndGetOutput(id);
+      else {
+        status = native_->core().EndGetOutput(id);
+        pending = native_->core().HasPendingGet();
+      }
     }
     // Another algorithm may still be using pending tensors on the Get direction.
     if (status.ok()) output_refs_.erase(id);
+    if (!pending) pending_get_refs_.clear();
     ThrowIfError(status);
   }
   void DrainGet() {
@@ -917,9 +922,20 @@ class NpuPythonRuntime final {
     ThrowIfError(status);
   }
   void RecoverGet(GetExecutionConfig c) {
-    py::gil_scoped_release release;
-    std::lock_guard<std::mutex> lock(get_mutex_);
-    ThrowIfError(native_->Recover(c));
+    Status status;
+    bool pending = true;
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    {
+      py::gil_scoped_release release;
+      lock.lock();
+      status = native_->Recover(c);
+      pending = native_->core().HasPendingGet();
+    }
+    // Safe retirement of the old request is independent of rebuilding a new
+    // provider. Never retain stale tensors after a closed-domain init failure,
+    // or drop them while a failed close still owns DMA resources.
+    if (!pending) pending_get_refs_.clear();
+    ThrowIfError(status);
   }
   void WarmupPut(PutExecutionConfig c, std::uint32_t capacity, const py::object& stream) {
     const auto native_stream = ResolveStream(stream);

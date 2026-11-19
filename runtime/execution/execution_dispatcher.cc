@@ -385,11 +385,9 @@ Status ExecutionDispatcher::Recover(GetExecutionConfig c) {
   if (instance && instance->output_id) return Status::Busy("release this Get output lease before recovery");
   if (pending_get_ && pending_get_ != instance)
     return Status::Busy("complete the active Get before resource recovery");
-  if (pending_get_) {
-    s = DrainGetLocked();
-    if (!s.ok()) return s;
-    instance = FindGetInstanceLocked(resolved);
-  }
+  // A sticky device error can never become a successful Drain. The owner's
+  // Close fences/stops the communication domain independently of that result;
+  // only a successful Close may erase pending requests and their dependencies.
   if (instance) s = CloseGetInstanceLocked(instance);
   return s.ok() ? resources_.Recover(resolved) : s;
 }
@@ -575,6 +573,8 @@ Status ExecutionDispatcher::PrepareGetInstanceLocked(GetExecutionConfig config,
 Status ExecutionDispatcher::DrainGetLocked() {
   if (!pending_get_) return Status::OK();
   auto* instance = pending_get_;
+  if (instance->output_close_required)
+    return Status::Busy("Get output teardown is incomplete; retry end_get_output");
   GetDispatchTrace::Row row{};
   if (get_trace_) {
     row.algorithm = GetAlgorithmLabel(instance->config);
@@ -699,6 +699,11 @@ Status ExecutionDispatcher::DrainGet() {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   return DrainGetLocked();
+}
+bool ExecutionDispatcher::HasPendingGet() const {
+  std::shared_lock<std::shared_mutex> life(lifecycle_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  return pending_get_ != nullptr;
 }
 Status ExecutionDispatcher::Warmup(PutExecutionConfig c, const ExecutionWarmup& r) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
@@ -970,13 +975,31 @@ Status ExecutionDispatcher::FinishOutputLocked(GetExecutionContext& instance) {
       return Status::OK();
     }
   }
-  if (pending_get_ == &instance) {
+  if (!instance.output_close_required && pending_get_ == &instance) {
     auto s = DrainGetLocked();
-    if (!s.ok()) return s;
+    if (!s.ok()) {
+      // Live graphs need their existing explicit discard/fencing protocol.
+      if (HasGraphNodesLocked(&instance)) return s;
+      instance.output_close_required = true;
+    }
   }
-  auto s = instance.view().FinishOutput();
-  if (s.ok()) { instance.output_id = 0; instance.output_options = {}; }
-  return s;
+  if (!instance.output_close_required) {
+    auto s = instance.view().FinishOutput();
+    if (s.ok()) { instance.output_id = 0; instance.output_options = {}; return s; }
+    if (HasGraphNodesLocked(&instance)) return s;
+    instance.output_close_required = true;
+  }
+  // Do not erase the instance/binding ID on a failed close: the caller must
+  // retain its output and be able to retry EndGetOutput using the same ID.
+  instance.cleanup_only = true;
+  auto closed = resources_.Close(instance.resources);
+  if (!closed.ok()) return closed;
+  instance.ClearRequest();
+  if (pending_get_ == &instance) pending_get_ = nullptr;
+  instance.output_id = 0;
+  instance.output_options = {};
+  instance.output_close_required = false;
+  return Status::OK();
 }
 Status ExecutionDispatcher::EndGetOutput(std::uint64_t id) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);

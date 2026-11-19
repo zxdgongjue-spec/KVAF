@@ -51,6 +51,9 @@ struct GetExecutionContext {
   std::uint32_t warmed_request_capacity{0}, warmed_capacity{0};
   void* warmed_stream{nullptr};
   std::uint64_t output_id{0};
+  // A failed Drain/FinishOutput must close the domain before ending the
+  // binding. Keep its ID and invocation alive through any partial close.
+  bool output_close_required{false};
   GetOutputOptions output_options;
   std::vector<BatchGetKernelProfile> last_graph_profile;
   bool profiling_enabled{false};

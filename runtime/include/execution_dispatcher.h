@@ -27,6 +27,7 @@ class ExecutionDispatcher final : public AccessOperator {
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
   Status DrainGet() override;
+  bool HasPendingGet() const override;
   bool TracksGetCompletion() const override { return true; }
   Status Warmup(PutExecutionConfig, const ExecutionWarmup& = {});
   Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
@@ -37,7 +38,7 @@ class ExecutionDispatcher final : public AccessOperator {
   Status BeginPutInput(PutExecutionConfig, const PutInputOptions&, std::uint64_t*) override;
   Status EndPutInput(std::uint64_t) override;
   Status Recover(PutExecutionConfig) override;
-  Status Recover(GetExecutionConfig);
+  Status Recover(GetExecutionConfig) override;
   Status ResolvePut(PutExecutionConfig, PutCompletion*) override;
   Status AcknowledgePut() override;
   Status ConfigureGetProfiling(std::optional<GetExecutionConfig>, bool enabled, bool detailed);
@@ -69,7 +70,8 @@ class ExecutionDispatcher final : public AccessOperator {
   RemoteRegionDesc region_{};
   bool ready_{false};
   mutable std::shared_mutex lifecycle_;
-  std::mutex put_mutex_, get_mutex_;
+  std::mutex put_mutex_;
+  mutable std::mutex get_mutex_;
   ExecutionResourceManager resources_;
   std::unique_ptr<GetDispatchTrace> get_trace_;
   std::vector<std::unique_ptr<PutExecutionContext>> put_instances_;

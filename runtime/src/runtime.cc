@@ -499,8 +499,10 @@ Status RuntimeCore::EndGetOutput(std::uint64_t id) {
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
   // Ending an idle algorithm's output binding need not drain another algorithm.
-  // Keep the active table pin until the direction's next successful DrainGet.
-  return access_operator_.EndGetOutput(id);
+  // Release the table only if no ordinary request/teardown remains pending.
+  auto status = access_operator_.EndGetOutput(id);
+  if (!access_operator_.HasPendingGet()) pending_get_table_.reset();
+  return status;
 }
 Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
@@ -709,6 +711,21 @@ Status RuntimeCore::DrainGet() {
   std::lock_guard<std::mutex> direction(get_mutex_);
   if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
   return DrainGetLocked();
+}
+Status RuntimeCore::RecoverGet(GetExecutionConfig config) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  auto status = access_operator_.Recover(config);
+  // A failed rebuild may follow a successful close of the old domain. Its
+  // table pin is no longer needed; failed close/Busy must keep that pin.
+  if (!access_operator_.HasPendingGet()) pending_get_table_.reset();
+  return status;
+}
+bool RuntimeCore::HasPendingGet() const {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  return access_operator_.HasPendingGet();
 }
 
 RuntimeCore::AccessTableState* RuntimeCore::FindAccessTable(

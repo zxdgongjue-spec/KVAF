@@ -100,6 +100,8 @@ class RuntimeCore {
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
   Status DrainGet();
+  Status RecoverGet(GetExecutionConfig);
+  bool HasPendingGet() const;
   // Resolve the already submitted Put, without replay or closing the Runtime.
   Status RecoverPut(PutExecutionConfig);
   bool HasPendingPut() const;
@@ -159,7 +161,7 @@ class RuntimeCore {
   mutable std::shared_mutex lifecycle_mutex_;
   mutable std::mutex table_mutex_;
   mutable std::mutex put_mutex_;
-  std::mutex get_mutex_;
+  mutable std::mutex get_mutex_;
   std::shared_ptr<AccessTableState> pending_get_table_;
   std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>> graph_tables_;
   std::optional<PendingPut> pending_put_;
