@@ -18,6 +18,13 @@ def npu_ready(mr_id=1, sequence=1):
 
 
 class PullBenchmarks(unittest.TestCase):
+    def test_kernel_diagnostics_require_eager_execution(self):
+        common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]
+        with patch.dict(raw_bench.os.environ, {"KVAF_HBM_RAW_READ_DIAGNOSTICS": "1"}):
+            self.assertFalse(parse_args(common).graph)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(common + ["--graph"])
+
     def test_mismatch_reports_distinguish_guard_and_packet_corruption(self):
         class CpuBytes:
             def __init__(self, data):

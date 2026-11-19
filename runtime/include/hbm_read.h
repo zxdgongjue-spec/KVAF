@@ -40,8 +40,9 @@ struct HbmReceiverTicket {
 // kernel_event_us overlaps launch/synchronize (never add it to the Host phase sum).
 struct HbmReadProfile {
   double total_us{}, validation_us{}, buffers_us{}, register_output_us{};
-  // status_us is retained for profile compatibility and stays zero:
-  // the caller owns stream completion; there is no Host status readback.
+  // status_us is retained for profile compatibility and stays zero on the
+  // normal path. Explicit kernel diagnostics add status readback for debugging;
+  // diagnostic runs are excluded from performance comparisons.
   double event_record_us{}, launch_us{}, synchronize_us{}, event_query_us{}, status_us{};
   double cleanup_us{}, kernel_event_us{};
   bool kernel_event_valid{};

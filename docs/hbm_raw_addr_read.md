@@ -434,6 +434,10 @@ A 须能访问 B:29100，B 须能访问 A:29000。TCP 连通仅说明通知可�
 
 A 校验失败时会同时检查 NPU 比较结果与 CPU 回读，打印 `NPU_HBM_READ_MISMATCH`（实际/预期字节、首个差异、MR/sequence、expected_hbm 回读校验）、`NPU_HBM_GUARD_CHECK`、首个 `NPU_HBM_PACKET_MISMATCH` 及三组 `NPU_HBM_METADATA_CHECK`。A/B 的 `layout_digest` 应相同。B 写后校验失败指向本地生产路径；B 校验通过而 A 回读错误时继续检查数据搬运、地址/描述符和可见性；A 回读正确但 NPU 比较失败时继续检查 NPU 消费/比较路径。即使 CPU 回读正确，也不将 NPU 消费失败当作测试通过，且仍不发送 reuse。
 
+若 B 写后校验通过，而 A 的目标包仍为填充值 `0xCC`，可在 A 启动前设置 `export KVAF_HBM_RAW_READ_DIAGNOSTICS=1`。此功能需要用当前源码重新执行 `bash build.sh npu`，并加载 build-npu 中的扩展。它仅用于 eager 定位，不支持 graph：每次启动先清零设备诊断状态，同步该 READ stream 后回读状态、队列和 entity，打印 `HBM_READ_KERNEL_DIAGNOSTIC`、`HBM_READ_CORE_DIAGNOSTIC`、`HBM_READ_QUEUE_DIAGNOSTIC`、`HBM_READ_ENTITY_DIAGNOSTIC`。状态缺失、执行错误或提交数量不完整时返回 InDoubt，保留资源。它不重置持久队列、不重放 READ、不授权 B 释放。完成定位后 `unset KVAF_HBM_RAW_READ_DIAGNOSTICS` 恢复原路径；诊断模式的结果不作为正常性能数据。
+
+`input_mode=0` 为启动探针，`input_mode=1` 为实际 NPU offsets 批次，重点检查后者：`status_written=0` 表示本次未观察到有效状态；`result_name=invalid_entity/invalid_args/invalid_source_or_length/invalid_output` 且 `posted_wqes=0` 指向提交前检查；`cq_error/cq_timeout` 且已提交 WQE 指向完成路径；`invalid_queue` 需结合 poisoned/last_error 检查。错误码含义来自本项目 raw kernel 的枚举，与 RA 返回码无关。即使 result=success，也必须通过完整 payload 校验。正常模式继续不清零每次状态、不强制同步、不回读设备状态。
+
 无 NPU 测试：
 
 ```bash

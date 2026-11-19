@@ -2,9 +2,11 @@
 #include "hbm_read_protocol.h"
 #include "hbm_exporter.h"
 #include "kvaf_aiv_batch_get_raw_addr.h"
+#include "hbm_read_diagnostics.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <unistd.h>
 #include <atomic>
@@ -88,9 +90,13 @@ struct Engine {
   std::uint64_t mr_id{1};
   bool statuses_initialized{};
   bool uncertain{},kernel_finished{},cache_output{};
+  bool diagnostics{};
   aclrtStream probe_stream{};
   aclrtEvent profile_start{},profile_end{};
-  Engine(std::uint32_t c,std::uint32_t j,std::uint32_t b):cores(c),jettys(j),budget(b){}
+  Engine(std::uint32_t c,std::uint32_t j,std::uint32_t b):cores(c),jettys(j),budget(b){
+    const auto* debug=std::getenv("KVAF_HBM_RAW_READ_DIAGNOSTICS");
+    diagnostics=debug && debug[0]=='1' && debug[1]=='\0';
+  }
   Status Cleanup() {
     if(uncertain)return Status::InDoubt("raw READ transport quarantined; source and output must remain alive");
     if(cache_output) {
@@ -190,6 +196,8 @@ struct Engine {
     args.output=reinterpret_cast<std::uint64_t>(output.data);
     args.core_status=reinterpret_cast<std::uint64_t>(statuses.data);args.queue_state=reinterpret_cast<std::uint64_t>(queues.data);
     args.channel_entity=entity;args.block_count=cores;args.jettys_per_core=jettys;args.batch_get_max_inflight_total=budget;
+    if(diagnostics && aclrtMemset(statuses.data,statuses.bytes,0,statuses.bytes)!=ACL_SUCCESS)
+      return Status::Internal("clear raw READ diagnostic status");
     kernel_finished=false;
     uncertain=true; // Includes launch errors: never assume the device saw no work.
     if(profile && synchronize)profile->event_error=Timed(&profile->event_record_us,[&]{
@@ -201,11 +209,24 @@ struct Engine {
       return aclrtRecordEvent(profile_end,static_cast<aclrtStream>(stream));});
     // The default path only enqueues work, including during graph capture.
     // Synchronization and result readiness belong to the caller.
-    if(synchronize) {
+    if(synchronize || diagnostics) {
       if(Timed(profile?&profile->synchronize_us:nullptr,[&]{
           return aclrtSynchronizeStream(static_cast<aclrtStream>(stream));})!=ACL_SUCCESS)
         return Status::InDoubt("raw READ launch/stream completion uncertain");
       kernel_finished=true;
+    }
+    if(diagnostics) {
+      std::vector<KvafRawReadCoreStatus> status(cores);
+      std::vector<KvafBatchGetQueueState> queue(cores*jettys);
+      std::vector<KvafBatchGetDirectUrmaEntity> entities(cores*jettys);
+      if(aclrtMemcpy(status.data(),statuses.bytes,statuses.data,statuses.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS ||
+          aclrtMemcpy(queue.data(),queues.bytes,queues.data,queues.bytes,ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS ||
+          aclrtMemcpy(entities.data(),entities.size()*sizeof(entities.front()),reinterpret_cast<void*>(entity),
+              entities.size()*sizeof(entities.front()),ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
+        return Status::InDoubt("raw READ diagnostic snapshot failed; retain source and output");
+      std::fprintf(stderr,"%s",raw_read_debug::Format(args,status.data(),queue.data(),entities.data()).c_str());
+      if(!raw_read_debug::AllRequestsCompleted(args,status.data()))
+        return Status::InDoubt("raw READ kernel diagnostic failed; inspect HBM_READ_CORE_DIAGNOSTIC; retain source and output");
     }
     if(profile && synchronize && !profile->event_error) {
       float ms{};

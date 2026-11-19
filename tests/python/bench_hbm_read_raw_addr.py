@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 from math import gcd
 import multiprocessing as mp
+import os
 import time
 import traceback
 import uuid
@@ -67,6 +68,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-inflight-total", type=int, default=2048)
     parser.add_argument("--raw-kernel", default="build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
     args = parser.parse_args(argv)
+    if args.graph and os.environ.get("KVAF_HBM_RAW_READ_DIAGNOSTICS") == "1":
+        parser.error("KVAF_HBM_RAW_READ_DIAGNOSTICS=1 requires eager execution; remove --graph")
     if args.role != "producer" and not args.npu_eid_a_raw:
         parser.error("reader/local requires --npu-eid-a-raw")
     if args.role != "reader" and not args.npu_eid_b_raw:
@@ -504,6 +507,7 @@ def reader(args):
     import torch_npu  # noqa: F401
     import kvaf
 
+    diagnostics = os.environ.get("KVAF_HBM_RAW_READ_DIAGNOSTICS") == "1"
     layout = packet_layout(args)
     payload_bytes = args.payload_bytes
     group_description = ",".join(f"{count}x{size}" for count, size in args.packet_groups)
@@ -555,7 +559,8 @@ def reader(args):
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=producer "
               "hbm_control_listener=reader acquire_raw=0 "
-              "status_reset=init_only status_generation=0 status_readback=none completion=caller_stream_sync "
+              f"status_reset={'diagnostic_each_call' if diagnostics else 'init_only'} status_generation=0 "
+              f"status_readback={'diagnostic' if diagnostics else 'none'} completion=caller_stream_sync "
               f"execution={'graph' if args.graph else 'eager'} graph={int(args.graph)} binding_profile={int(not args.graph)} "
               f"completion_notification=application application_transport=tcp role={args.role} "
               "batch_control_rpcs=0", flush=True)

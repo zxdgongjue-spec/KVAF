@@ -1,5 +1,6 @@
 #include "kernel_operator.h"
 #include "batch_get_abi.h"
+#include "../runtime/src/hbm_read_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -121,6 +122,7 @@ struct Fixture {
       CHECK(statuses[c].execution.magic==KVAF_AIV_BATCH_GET_STATUS_MAGIC);CHECK(statuses[c].execution.result==expected);
       if(!expected)CHECK(statuses[c].execution.profile.submitted_group_count==statuses[c].execution.profile.completed_group_count);
     }
+    CHECK(kvaf::raw_read_debug::AllRequestsCompleted(args,statuses.data())==!expected);
     if(expected)return;
     for(uint32_t i=0;i<capacity;++i)for(uint32_t b=0;b<40;++b){
       auto want=i<n && b>=1 && b<=lengths[i]?reinterpret_cast<uint8_t*>(src[i])[b-1]:0xa5;
@@ -166,6 +168,7 @@ void TestFusedOffsets(std::vector<int64_t> src, std::vector<int64_t> dst,
       if(error)CHECK(f.statuses[c].execution.processed_request_count==0);
     }
     CHECK(f.output==expected);
+    CHECK(kvaf::raw_read_debug::AllRequestsCompleted(f.args,f.statuses.data())==!error);
     if(error)CHECK(aiv_model::doorbells==before);
     for(auto& h:aiv_model::hardware){CHECK(h.producer==h.completed);CHECK(h.cq_producer==h.cq_consumer);CHECK(h.checkpoints.empty());}
     for(auto& from:model_events)for(auto& to:from)for(auto e:to)CHECK(!e);
@@ -215,8 +218,27 @@ int main(){
     KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
     CHECK(f.statuses[0].execution.result==(timeout?kCqTimeout:kCqError));CHECK(f.statuses[0].posted_wqes>0);
     CHECK(f.queues[0].poisoned&&f.queues[1].poisoned);
+    const auto diagnostic=kvaf::raw_read_debug::Format(f.args,f.statuses.data(),f.queues.data(),f.entities.data());
+    CHECK(diagnostic.find(timeout?"result_name=cq_timeout":"result_name=cq_error")!=std::string::npos);
+    CHECK(diagnostic.find("poisoned=1")!=std::string::npos);
+    CHECK(diagnostic.find("posted_wqes=1")!=std::string::npos);
     auto before=aiv_model::doorbells;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
     CHECK(f.statuses[0].execution.result==kInvalidQueue);CHECK(before==aiv_model::doorbells);
+  }
+  // Distinguish an entity rejection before posting from an absent/stale
+  // status and from CQ faults after a WQE has already been submitted.
+  {Fixture f(2,2,2,2048);f.args.request_count=2;
+    const auto missing=kvaf::raw_read_debug::Format(f.args,f.statuses.data(),f.queues.data(),f.entities.data());
+    CHECK(missing.find("status_written=0")!=std::string::npos);
+    CHECK(!kvaf::raw_read_debug::AllRequestsCompleted(f.args,f.statuses.data()));
+    f.entities[0].local_hbm_address+=64;
+    const auto before=aiv_model::doorbells;
+    aiv_model::core=0;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
+    CHECK(aiv_model::doorbells==before);
+    const auto rejected=kvaf::raw_read_debug::Format(f.args,f.statuses.data(),f.queues.data(),f.entities.data());
+    CHECK(rejected.find("status_written=1 result=2 result_name=invalid_entity")!=std::string::npos);
+    CHECK(rejected.find("posted_wqes=0")!=std::string::npos);
+    CHECK(rejected.find("output_matches=0")!=std::string::npos);
   }
   // Metadata storage must not alias an output allocation.
   {Fixture f(2,2,2,2048);std::vector<int64_t> sizes{8,8};
