@@ -51,6 +51,7 @@ def run_group(args, devices, directory):
                 "--contention-control-dir", str(directory),
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
+                "--contention-graphs", str(args.graphs),
             ]
             process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
@@ -121,7 +122,8 @@ def write_summary(directory, isolated, concurrent, config=None):
         row = {
             "backend": config.get("backend", "ubmem" if config.get("transport") == "ubmem" else "aiv"),
             "execution_mode": config.get("execution_mode", "unified"),
-            "device": solo["device"], "isolated_GBps": solo["bandwidth_GBps"],
+            "device": solo["device"], "graphs": config.get("graphs", 1),
+            "isolated_GBps": solo["bandwidth_GBps"],
             "concurrent_GBps": shared["bandwidth_GBps"],
             "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
         }
@@ -166,7 +168,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
         "backend", "transport", "execution_mode", "aiv_cores", "aicpu_workers", "requests", "request_length", "miss_count", "token_bytes", "table_capacity", "tokens_per_block",
-        "seconds", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
+        "seconds", "graphs", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
     metadata["run"] = directory.name
@@ -191,12 +193,13 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("设备启动顺序", " → ".join(str(device) for device in config["devices"])),
             ("AICPU worker 数 / 卡" if field == "aicpu_workers" else "AIV 核数 / 卡", config[field]),
             ("请求容量", config.get("request_length", config["requests"])),
-            ("每批有效搬运量", f"{active} × {config['token_bytes']} B = {active * config['token_bytes'] / 2**20:g} MiB"),
+            ("每次 Get 有效搬运量", f"{active} × {config['token_bytes']} B = {active * config['token_bytes'] / 2**20:g} MiB"),
             ("地址表布局", f"{config['table_capacity']} 个表项，{config['tokens_per_block']} token / 块"),
             ("CPU DDR 数据区", f"每卡独立 {per_device / 2**20:g} MiB；并发合计 {len(isolated) * per_device / 2**30:g} GiB"),
             ("每阶段测量时长", f"{config['seconds']:g} s"),
+            ("每卡 Graph 数 / 每轮回放次数", config.get("graphs", 1)),
             ("每张 Graph 的 BatchGet 次数", config["graph_calls"]),
-            ("预热", f"{config['warmup']} 次 Graph 回放"),
+            ("预热", f"{config['warmup']} 轮，每轮回放全部图后同步一次"),
             ("访问模式 / 随机种子", f"source={config.get('source_access_pattern', 'random')} output={config.get('output_access_pattern', 'contiguous')} sort={config.get('sort_input_indices', False)} seed={config['seed']}"),
             ("CPU service", config["peer"]),
         ]
@@ -284,6 +287,8 @@ def main(argv=None):
     add_backend_arguments(parser, sweep=True)
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
     parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
+    parser.add_argument("--graphs", type=int, default=8,
+                        help="distinct graphs per device; replay all on one stream, then synchronize once (default: 8)")
     parser.add_argument("--graph-calls", type=int, default=1, help="one Get node per graph; only 1 is supported")
     parser.add_argument("--graph-api", choices=("acl", "torch"), default="acl")
     parser.add_argument("--graph-replays", type=int, default=5, help="dynamic input checks before measurement")
@@ -316,6 +321,8 @@ def main(argv=None):
         parser.error("sustained bandwidth requires positive --miss-count")
     if args.graph_calls != 1:
         parser.error("graph leases support one Get; use --graph-calls 1")
+    if args.graphs <= 0:
+        parser.error("--graphs must be positive")
     if args.graph_replays <= 0:
         parser.error("--graph-replays must be positive")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
@@ -338,7 +345,7 @@ def main(argv=None):
     config[field] = counts if len(counts) > 1 else counts[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG execution_mode={args.execution_mode} backend={args.backend} transport={args.transport} "
-          f"devices={args.devices} {field}={counts} graph_api={args.graph_api} "
+          f"devices={args.devices} {field}={counts} graph_api={args.graph_api} graphs={args.graphs} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
           f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
           "timing=sustained_graph_replay_to_completion profiling_enabled=0 units=decimal_GBps", flush=True)

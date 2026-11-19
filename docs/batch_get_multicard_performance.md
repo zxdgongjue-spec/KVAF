@@ -20,12 +20,22 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
   --token-bytes 656 --tokens-per-block 128 \
   --source-access-pattern random --output-access-pattern contiguous \
   --no-sort-input-indices --seed 20260903 \
-  --graph-api torch --graph-replays 5 --warmup 10 --seconds 10
+  --graph-api torch --graphs 8 --graph-replays 5 --warmup 10 --seconds 10
 ```
 
 设备号由 `--devices` 指定；每卡启动一个进程。脚本先逐卡测独立带宽，再同时启动各卡
 测并发带宽。所有阶段使用已有 CPU service，脚本不会启动或重启服务。
 每卡单独初始化 DDR 数据区；测试的是这些访问对共享 CPU、内存与通信资源的竞争。
+
+`--graphs N` 控制每卡同时保留的独立图数，默认 8。每张图捕获一个 Get，输入、输出和
+图租约各自独立，复用同一张卡的 AccessTable 和通信资源。每轮在同一 stream 上依次
+提交全部 N 张图，再统一同步一次；多张卡仍由各自进程并发运行。
+例如 `--graphs 8` 每轮执行 8 次 Get，`--graphs 1` 使用原来的逐次回放方式。
+`--warmup 10` 表示预热 10 轮，每轮也回放全部图。
+
+测量后逐图校验完整输出。`calls = batches × graphs`，有效字节数为
+`calls × miss_count × token_bytes`；只统计已同步完成的整轮，测量时间使用实际起止时间。
+多图会增加 NPU 上的输入、输出及图资源占用，CPU DDR 数据区每卡仍只分配一份。
 
 ## 四种后端使用相同负载
 
@@ -55,7 +65,7 @@ for backend in aiv ubmem gather_read cpu_push_scatter; do
     --token-bytes 656 --tokens-per-block 128 \
     --source-access-pattern random --output-access-pattern contiguous \
     --no-sort-input-indices --seed 20260903 \
-    --graph-api torch --graph-replays 5 --warmup 10 --seconds 10 \
+    --graph-api torch --graphs 8 --graph-replays 5 --warmup 10 --seconds 10 \
     --output "$report_root/$backend"
 done
 BASH
@@ -71,17 +81,18 @@ BASH
 | 入口 | 测量方式 | profiling |
 |---|---|---|
 | `run_remote_cpu_batch_get_perf.sh` | eager/graph 逐次采样，输出延迟分位数和带宽 | 默认关闭；`--kernel-profile` 开启设备采集、回读、kernel 指标及详细输出 |
-| `run_remote_cpu_batch_get_multicard_perf.sh` | 固定输入持续 graph replay，按时间窗口计算独立/并发吞吐 | 关闭设备 profiling，不在循环内回读 profile |
+| `run_remote_cpu_batch_get_multicard_perf.sh` | 多张图成组回放、每组同步一次，按时间窗口计算独立/并发吞吐 | 关闭设备 profiling，不在循环内回读 profile |
 
 多卡控制器调用单卡入口的持续回放 worker；两者复用负载准备、建表和数据校验。
 公共参数/校验在 `tests/python/utils/get_options.py`，图输入更新、捕获与租约释放在
 `tests/python/utils/get_graph.py`。多卡协调 worker 位于 `utils/multicard.py`，
 控制器只负责设备进程、起跑屏障、测量窗口、扫描和报告。
 
-两个入口的图模式都在测量前验证动态输入、部分请求和零请求；
-多卡进入测量后固定请求，循环中只有 replay、完成等待和中止检查。
+两个入口的图模式都在测量前验证动态输入、部分请求和零请求，多卡会逐图验证。
+进入测量后固定每张图的请求，
+循环中只有整组 replay、一次完成等待和中止检查。
 测后执行完整输出校验，Gather/Scatter 还检查设备完成状态。
-每张图只支持一个 Get 节点，`--graph-calls` 必须为 1。
+多卡测试每张图只捕获一个 Get 节点，`--graph-calls` 保持为 1，图数使用 `--graphs` 设置。
 
 单卡默认 Torch Graph，多卡保留原 ACL Graph 默认值；对照时可显式统一 `--graph-api`。
 持续吞吐包含回放、等待及循环控制成本，与单卡 `scope=kernel` 的带宽口径不同。
@@ -97,7 +108,7 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu --backend gather_read --he
 
 结果目录包含 `config.json`、各阶段/各设备日志与原始 JSON，以及：
 
-- `summary.csv`：各卡独立/并发带宽、保留比例和下降比例。
+- `summary.csv`：各卡图数、独立/并发带宽、保留比例和下降比例。
 - `aggregate.csv`、`aggregate.json`：总吞吐、窗口重叠率与起跑偏差。
 - `report.md`：配置和结果表；AICPU 单独标记 worker 数。
 

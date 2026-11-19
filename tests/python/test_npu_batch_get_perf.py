@@ -91,6 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-calls", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-graphs", type=int, default=1, help=argparse.SUPPRESS)
     configure_backend_help(parser, argv)
     args = parser.parse_args(argv)
     resolve_backend(args, parser)
@@ -120,6 +121,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "single-card CSV options do not apply to contention workers"
         if args.contention_graph_calls != 1:
             return "graph leases support one Get per graph; use --graph-calls 1"
+        if args.contention_graphs <= 0:
+            return "contention-graphs must be positive"
         if args.execution != "eager":
             return "contention worker uses its own graph execution; omit --execution"
         if args.contention_result is None or args.miss_count <= 0:
@@ -980,14 +983,15 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         if args.contention_control_dir is not None:
             from utils.multicard import run_worker
 
-            def submit(plan, stream, options):
-                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output,
+            def submit(inputs, stream, options):
+                runtime.batch_get(device_table, inputs.fixed[0], inputs.fixed[1], inputs.miss_count,
+                                  inputs.fixed[2], inputs.output,
                                   stream=stream, **options)
 
-            def check(plan, count):
+            def check(inputs, count, lease=0):
                 if uses_aicpu(args):
-                    runtime.check_batch_get_status(torch.npu.current_stream())
-                check_output(plan, count)
+                    runtime.check_batch_get_status(torch.npu.current_stream(), graph_lease=lease)
+                check_output(inputs.fixed, count, result=inputs.output)
 
             run_worker(kvaf, torch, args, runtime, execution, miss_count, output,
                        create_request_plan, submit, check)
