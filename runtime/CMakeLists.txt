@@ -37,7 +37,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
       ${ASCEND_CANN_PACKAGE_PATH}/include)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
-    PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
+    PRIVATE kvaf_peer_link kvaf_direct_hccp_session ascendcl ${CMAKE_DL_LIBS})
   if(KVAF_ENABLE_AIV_BATCH_GET)
     target_sources(kvaf_npu_runtime PRIVATE src/ubmem_allocator.cc)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator
@@ -51,6 +51,7 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
   if(KVAF_ENABLE_AICPU_CPU_PUSH)
     target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_AICPU_CPU_PUSH=1)
   endif()
+
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_execute_batch_put_host)
   endif()

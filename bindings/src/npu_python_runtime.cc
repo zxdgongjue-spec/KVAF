@@ -278,7 +278,8 @@ class NpuPythonRuntime final {
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
-                   const std::string& transport, std::string aicpu_batch_get_mode) {
+                   const std::string& transport, std::string aicpu_batch_get_mode,
+                   bool reuse_device_ra) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -292,6 +293,7 @@ class NpuPythonRuntime final {
     options.jettys_per_core = jettys_per_core;
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
+    options.reuse_device_ra = reuse_device_ra;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
     options.adaptive_ub_miss_count = adaptive_ub_miss_count;
@@ -623,6 +625,7 @@ void BindNpuPythonRuntime(py::module_& module) {
   auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
   python_binding::BindNpuRuntimeConstructor(runtime);
   runtime.def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
+
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))

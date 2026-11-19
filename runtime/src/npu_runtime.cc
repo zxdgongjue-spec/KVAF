@@ -25,6 +25,7 @@
 #include "access_operator.h"
 #include "ubmem/access_operator.h"
 #include "ubmem_allocator.h"
+#include "direct_hccp/direct_hccp_session.h"
 #include "peer_link.h"
 #include "meta_manager.h"
 #include "gather_workspace.h"
@@ -92,6 +93,8 @@ struct NpuLocalEidCandidate {
 constexpr char kUbDevIdPath[] = "/proc/asdrv_ub/dev_id";
 constexpr char kUbPairInfoPath[] = "/proc/asdrv_ub/pair_info";
 constexpr char kUbSelectorLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
+// Same PID-scoped HDC service used by the BatchGet and BatchPut transports.
+constexpr std::uint32_t kPidHdcType = 18U;
 
 std::string EidToHex(const std::array<std::uint8_t, peer::kEidBytes>& eid) {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -605,6 +608,20 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
+  }
+  if (impl_->options.reuse_device_ra) {
+    std::uint32_t physical_device_id = 0U;
+    if (!ResolvePhysicalDeviceId(impl_->options.device_id, &physical_device_id)) {
+      return Internal("cannot resolve physical NPU for caller-initialized device RA");
+    }
+    direct_hccp::DirectHccpSession* session = nullptr;
+    if (!direct_hccp::AcquireDirectHccpSession(
+            physical_device_id, kPidHdcType, &session, true)) {
+      return Internal("failed to borrow caller-initialized device RA");
+    }
+    // The shared session remains cached at refs=0 for the process lifetime.
+    // Every candidate's BatchGet/BatchPut transport acquires this same session.
+    direct_hccp::ReleaseDirectHccpSession(session);
   }
 
   if (impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()) {

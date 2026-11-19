@@ -53,6 +53,9 @@ struct NpuRuntimeOptions {
   // Optional strict K-side UB device selected by an earlier Runtime process.
   // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
   std::string peer_ub_device{};
+  // Caller already initialized device RA (for example through HCCL). Borrow
+  // it without calling RaInit again; the caller retains its lifetime.
+  bool reuse_device_ra{false};
 };
 
 // NPU role Runtime. It owns the current MetaManager, NPU AccessOperator and
