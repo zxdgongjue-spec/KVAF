@@ -831,6 +831,11 @@ __aicore__ inline void KvafBatchGetDevice(
     if (result != kSuccess && schedule.pending != 0U) {
       // A timeout/error may leave live READs or stale CQEs. No later launch
       // (including graph replay) may reuse this queue until transport rebuild.
+      // reserved[0] latches the cause that poisoned the queue, because every
+      // later launch only reports kInvalidQueue and would hide it.
+      if (queues[jetty].poisoned == 0U && queues[jetty].reserved[0] == 0U) {
+        queues[jetty].reserved[0] = result;
+      }
       queues[jetty].poisoned = 1U;
     }
   }
@@ -839,7 +844,18 @@ __aicore__ inline void KvafBatchGetDevice(
   for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
     queues[jetty].last_error = result;
   }
-  WriteStatus(status, result, active_count, queues[0].completed_batch_count,
+  // A poisoned queue rejects every launch with kInvalidQueue, so report the
+  // latched cause instead of the rejection code that stands in for it.
+  uint64_t reported_result = result;
+  if (result == kInvalidQueue) {
+    for (uint32_t jetty = 0U; jetty < jettys_per_core; ++jetty) {
+      if (queues[jetty].reserved[0] != 0U) {
+        reported_result = queues[jetty].reserved[0];
+        break;
+      }
+    }
+  }
+  WriteStatus(status, reported_result, active_count, queues[0].completed_batch_count,
               queues[0].sq_producer_index, queues[0].cq_consumer_index,
               failed_request, last_wqe);
   if (profile_enabled) {
