@@ -25,8 +25,13 @@ struct KvafExecuteBatchGetRawAddrKernelArgs {
 };
 static_assert(sizeof(KvafExecuteBatchGetRawAddrKernelArgs) == 80);
 
+// Error CQE snapshot in reserved[6]: magic, Jetty slot, then eight uint32
+// CQE words packed low/high into four uint64 entries. Preserve the existing
+// status size and kernel argument ABI. A zero magic means no CQE error captured.
+constexpr uint64_t KVAF_RAW_CQE_DIAGNOSTIC_MAGIC = 0x4b56414351454631ULL;
+
 // Device diagnostics retained for debugging and kernel-model validation.
-// The Host READ path does not copy or interpret this buffer.
+// The normal Host READ path does not copy or interpret this buffer.
 struct KvafRawReadCoreStatus {
   KvafBatchGetCoreStatus execution;
   uint64_t total_wqes;

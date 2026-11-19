@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include "batch_get_raw_addr_abi.h"
@@ -58,6 +59,20 @@ inline std::string Format(const KvafExecuteBatchGetRawAddrKernelArgs& args,
         << " total_wqes=" << status.total_wqes << " posted_wqes=" << status.posted_wqes
         << " failed_request=" << execution.failed_request_index
         << " sq_pi=" << execution.sq_producer_index << " cq_ci=" << execution.cq_consumer_index << '\n';
+    if (status.reserved[0] == KVAF_RAW_CQE_DIAGNOSTIC_MAGIC) {
+      const auto word0 = static_cast<std::uint32_t>(status.reserved[2]);
+      out << "[KVAF_NPU] HBM_READ_CQE_DIAGNOSTIC core=" << core << " jetty=" << status.reserved[1]
+          << " status=" << ((word0 >> 24U) & 255U) << " sub_status=" << ((word0 >> 16U) & 255U)
+          << " raw_words=" << std::hex << std::setfill('0');
+      for (std::uint32_t word = 0; word < 8; ++word) {
+        if (word) out << ',';
+        out << std::setw(8) << static_cast<std::uint32_t>(status.reserved[2 + word / 2] >> (32 * (word % 2)));
+      }
+      out << std::dec << std::setfill(' ') << '\n';
+    } else if (execution.result == 7) {
+      out << "[KVAF_NPU] HBM_READ_CQE_DIAGNOSTIC core=" << core
+          << " snapshot_written=0 hint=check_matched_raw_kernel_build\n";
+    }
     for (std::uint32_t jetty = 0; jetty < args.jettys_per_core; ++jetty) {
       const auto index = core * args.jettys_per_core + jetty;
       const auto& queue = queues[index];
@@ -74,7 +89,11 @@ inline std::string Format(const KvafExecuteBatchGetRawAddrKernelArgs& args,
           << " remote_base=0x" << std::hex << entity.remote_host_ddr_address << std::dec
           << " remote_bytes=" << entity.remote_host_ddr_size
           << " sq_depth=" << entity.sq_depth << " cq_depth=" << entity.cq_depth
-          << " local_token_id=" << entity.local_token_id << " remote_token_id=" << entity.remote_token_id << '\n';
+          << " local_token_id=" << entity.local_token_id << " remote_token_id=" << entity.remote_token_id
+          << " jetty_id=" << entity.jetty_id << " tpn=" << entity.tp_id << " wqe_remote_eid="
+          << std::hex << std::setfill('0');
+      for (auto byte : entity.remote_eid) out << std::setw(2) << static_cast<unsigned>(byte);
+      out << std::dec << std::setfill(' ') << '\n';
     }
   }
   return out.str();

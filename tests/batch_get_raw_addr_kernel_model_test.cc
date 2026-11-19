@@ -27,6 +27,7 @@ struct Queue {
   uint64_t producer = 0, completed = 0, cq_producer = 0, cq_consumer = 0;
   std::deque<uint64_t> checkpoints;
   bool timeout = false, error = false;
+  uint8_t error_status = 1, error_sub_status = 0;
 };
 std::vector<Queue> hardware;
 uint64_t doorbells = 0;
@@ -79,7 +80,9 @@ void Poll(void* address) {
     }
     const uint32_t owner = 1U - ((queue.cq_producer / 8) & 1U);
     queue.cq[(queue.cq_producer % 8) * 16] =
-        (owner << 2U) | (queue.error ? 1U << 24U : 0U);
+        (owner << 2U) | (queue.error ? (uint32_t(queue.error_status) << 24U) |
+            (uint32_t(queue.error_sub_status) << 16U) : 0U);
+    queue.cq[(queue.cq_producer % 8) * 16 + 1] = 0x12345678;
     ++queue.cq_producer;
     return;
   }
@@ -215,6 +218,7 @@ int main(){
     f.args.output=reinterpret_cast<uint64_t>(f.output.data());f.args.input_mode=KVAF_RAW_NPU_OFFSETS;f.args.request_count=1;
     f.args.source_addresses=reinterpret_cast<uint64_t>(src.data());f.args.destination_addresses=reinterpret_cast<uint64_t>(dst.data());f.args.lengths=reinterpret_cast<uint64_t>(sizes.data());
     aiv_model::hardware[0].timeout=timeout;aiv_model::hardware[0].error=!timeout;aiv_model::core=0;
+    aiv_model::hardware[0].error_status=3;aiv_model::hardware[0].error_sub_status=2;
     KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
     CHECK(f.statuses[0].execution.result==(timeout?kCqTimeout:kCqError));CHECK(f.statuses[0].posted_wqes>0);
     CHECK(f.queues[0].poisoned&&f.queues[1].poisoned);
@@ -222,8 +226,18 @@ int main(){
     CHECK(diagnostic.find(timeout?"result_name=cq_timeout":"result_name=cq_error")!=std::string::npos);
     CHECK(diagnostic.find("poisoned=1")!=std::string::npos);
     CHECK(diagnostic.find("posted_wqes=1")!=std::string::npos);
+    if(timeout) {
+      CHECK(f.statuses[0].reserved[0]==0);
+      CHECK(diagnostic.find("HBM_READ_CQE_DIAGNOSTIC")==std::string::npos);
+    } else {
+      CHECK(f.statuses[0].reserved[0]==KVAF_RAW_CQE_DIAGNOSTIC_MAGIC);
+      CHECK(f.statuses[0].reserved[1]==0);
+      CHECK(f.statuses[0].reserved[2]==(uint64_t(0x12345678)<<32 | 0x03020004));
+      CHECK(diagnostic.find("jetty=0 status=3 sub_status=2 raw_words=03020004,12345678")!=std::string::npos);
+    }
     auto before=aiv_model::doorbells;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
     CHECK(f.statuses[0].execution.result==kInvalidQueue);CHECK(before==aiv_model::doorbells);
+    CHECK(f.statuses[0].reserved[0]==0); // A later invalid queue cannot report a stale CQE.
   }
   // Distinguish an entity rejection before posting from an absent/stale
   // status and from CQ faults after a WQE has already been submitted.

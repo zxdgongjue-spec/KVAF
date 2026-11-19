@@ -4,6 +4,7 @@
 #include "kvaf_aiv_batch_get_raw_addr.h"
 #include "hbm_read_diagnostics.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -422,6 +423,19 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
         c.engine.mr_id=mr+1;
         const auto& memory=c.link->memories[mr];
         const auto bytes=std::min<std::uint64_t>(memory.bytes,64);
+        // A zero-filled producer and untouched zero-filled scratch must not
+        // make a failed/no-op READ appear successful. Choose a poison whose
+        // checksum differs from this MR's expectation, before EVERY MR probe.
+        std::array<std::uint8_t,64> poison{};
+        unsigned fill=0;
+        for(;fill<256;++fill) {
+          poison.fill(static_cast<std::uint8_t>(fill));
+          if(offload::Hash(poison.data(),bytes)!=c.link->checksums[mr])break;
+        }
+        if(fill==256 || aclrtMemset(c.engine.scratch.data,c.engine.scratch.bytes,
+            fill,c.engine.scratch.bytes)!=ACL_SUCCESS) {
+          s=Status::Internal("prefill raw READ probe scratch");break;
+        }
         auto base=reinterpret_cast<std::uint64_t>(c.engine.scratch.data);
         std::vector<hr::Span> probe;
         for(std::uint32_t i=0;i<rows;++i)probe.push_back({memory.base,base+i*bytes,bytes});

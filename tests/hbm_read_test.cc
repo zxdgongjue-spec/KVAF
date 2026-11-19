@@ -24,6 +24,7 @@ namespace hr=kvaf::hbm_read;
 std::atomic<int> raw_calls{0}, raw_wqes{0}, local_buffers{0}, raw_transports{0}, local_acquires{0};
 int unregister_failures=0;
 bool corrupt_probe_output=false,fail_device_status=false;
+std::atomic<int> skip_probe_payload_after{-1};
 int skip_status_core=-1;
 bool skip_all_statuses=false;
 int quiesces=0, raw_syncs=0;
@@ -135,6 +136,8 @@ void ExecuteRawKernel(const KvafExecuteBatchGetRawAddrKernelArgs* a) {
   auto* src=reinterpret_cast<uint64_t*>(a->source_addresses);auto* dst=reinterpret_cast<uint64_t*>(a->destination_addresses);
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
   uint32_t count=a->request_count;uint64_t result=0,failed=UINT64_MAX;
+  const bool skip_payload=a->input_mode==KVAF_RAW_PROBE_ADDRESSES && skip_probe_payload_after==0;
+  if(a->input_mode==KVAF_RAW_PROBE_ADDRESSES && skip_probe_payload_after>0)--skip_probe_payload_after;
   if(a->input_mode==KVAF_RAW_NPU_OFFSETS)
     ValidateRawMetadata(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
                         local->source_bytes,local->bytes,&result,&failed,a->validate_ranges);
@@ -144,7 +147,7 @@ void ExecuteRawKernel(const KvafExecuteBatchGetRawAddrKernelArgs* a) {
     const uint64_t source=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->source_base+src[i]:src[i];
     const uint64_t destination=a->input_mode==KVAF_RAW_NPU_OFFSETS?local->base+dst[i]:dst[i];
     Require(n && destination>=local->base && n<=local->bytes && destination-local->base<=local->bytes-n,"destination registration");
-    std::memcpy(reinterpret_cast<void*>(destination),reinterpret_cast<void*>(source),n);
+    if(!skip_payload)std::memcpy(reinterpret_cast<void*>(destination),reinterpret_cast<void*>(source),n);
     if(corrupt_probe_output && a->input_mode==KVAF_RAW_PROBE_ADDRESSES)
       *reinterpret_cast<std::uint8_t*>(destination)^=0x80;
     ++raw_wqes;
@@ -264,6 +267,25 @@ void RuntimeInitialization() {
   options.enable_cpu_offload=true;exercise(true,true);exercise(true,false);
 #endif
   Require(!raw_transports&&!local_buffers&&!registrations&&!sessions,"runtime resources released");raw_calls=0;
+}
+void ProbeMustOverwriteEachMemory() {
+  raw_mode=true;fake_device=0;
+  std::vector<uint8_t> first(4096,0),second(4096,0);
+  kvaf::HbmReader a(0,2,2,2048,"fake.o");kvaf::HbmReceiverTicket receiver;
+  Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));Proxy proxy(receiver);
+  kvaf::NpuPullHbmSource b(0,producer_eid);
+  std::vector<kvaf::ConstBufferView> inputs{{first.data(),first.size(),kvaf::DeviceKind::kNpu},
+                                         {second.data(),second.size(),kvaf::DeviceKind::kNpu}};
+  // The first probe leaves zeros in scratch. A skipped second READ must not
+  // pass just because the second MR has the same zero-filled contents.
+  const auto before=raw_calls.load();
+  skip_probe_payload_after=1;
+  Require(!b.Register(inputs,proxy.receiver,reinterpret_cast<void*>(1)).ok(),
+          "an untouched second MR probe cannot pass with stale zeros from the first");
+  skip_probe_payload_after=-1;
+  Require(raw_calls==before+2,"reach the second MR before rejecting the no-op READ");
+  Check(Retry([&]{return b.Shutdown();}));Check(a.Shutdown());
+  Require(!registrations&&!raw_transports&&!local_buffers,"failed no-op probe cleanup");
 }
 void ReceiverTopology() {
   raw_mode=true;fake_device=0;std::vector<uint8_t> storage(8192,0x71),output(128);
@@ -440,6 +462,7 @@ int main(int argc,char** argv){try{
   }
   AsyncAndGraphReplay();
   NoHostStatusReadback();
+  ProbeMustOverwriteEachMemory();
   ReceiverTopology();
   MultiMemory();
   RuntimeInitialization();

@@ -438,6 +438,10 @@ A 校验失败时会同时检查 NPU 比较结果与 CPU 回读，打印 `NPU_HB
 
 `input_mode=0` 为启动探针，`input_mode=1` 为实际 NPU offsets 批次，重点检查后者：`status_written=0` 表示本次未观察到有效状态；`result_name=invalid_entity/invalid_args/invalid_source_or_length/invalid_output` 且 `posted_wqes=0` 指向提交前检查；`cq_error/cq_timeout` 且已提交 WQE 指向完成路径；`invalid_queue` 需结合 poisoned/last_error 检查。错误码含义来自本项目 raw kernel 的枚举，与 RA 返回码无关。即使 result=success，也必须通过完整 payload 校验。正常模式继续不清零每次状态、不强制同步、不回读设备状态。
 
+若 `input_mode=0` 已出现 `cq_error`，失败发生在注册阶段的 READ 探针，尚未进入应用批次。`result=7` 是本项目将非零 CQE status/sub_status 汇总后的错误，不能据此区分链路、权限或 WQE 格式错误。raw kernel 会在更新 CQ doorbell 前保存出错 CQE 的前 32 B；诊断模式打印 `HBM_READ_CQE_DIAGNOSTIC core=... jetty=... status=... sub_status=... raw_words=...`，并在 entity 行补充 Jetty ID、TPN 和实际写入 WQE 的 EID。这些 status/sub_status 须结合目标驱动/provider 的对应版本解释。更新后须同步重编 Host 库和 raw kernel，原有 80 B 参数、1280 B 状态大小保持不变。
+
+每个 MR 的启动探针现在先将所有目标槽填成与 B 预期校验和不同的字节，再执行 READ 并逐槽校验；即使多个 MR 的初始数据全为零，也必须实际覆盖每个槽才能通过。旧版本未预填 scratch，未修改的零值或上个 MR 的相同内容可能导致校验误通过，因此旧日志的 `all_mrs_all_lanes_pass` 不能单独排除底层 CQ 错误。后续的 registration timeout、detach acknowledgement lost 需与原始 CQ 错误分开看待；未确认传输停止和完整清理时继续保留资源。
+
 无 NPU 测试：
 
 ```bash
