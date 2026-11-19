@@ -1,0 +1,45 @@
+{
+@KVAF_AICPU_CPU_PUSH_ENTRY@
+  "KvafAicpuGatherReadExecutionV3": {
+    "opInfo": {
+      "functionName": "KvafAicpuGatherReadExecutionV3",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUmdkControlSessionsV3": {
+    "opInfo": {
+      "functionName": "KvafAicpuUmdkControlSessionsV3",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUmdkControlSessionsV4": {
+    "opInfo": {
+      "functionName": "KvafAicpuUmdkControlSessionsV4",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUmdkControlSessionsV5": {
+    "opInfo": {
+      "functionName": "KvafAicpuUmdkControlSessionsV5",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuUmdkControl": {
+    "opInfo": {
+      "functionName": "KvafAicpuUmdkControl",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  },
+  "KvafAicpuBatchPut": {
+    "opInfo": {
+      "functionName": "KvafAicpuBatchPut",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
+  }
+}

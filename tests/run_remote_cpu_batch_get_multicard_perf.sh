@@ -3,11 +3,14 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 /absolute/path/to/build-npu [--transport ubmem|urma] [--devices 6 7] [--aiv-cores 1 2 4] [options...]" >&2
+  echo "Usage: $0 build-npu --backend aiv|ubmem|gather_read|cpu_push_scatter [--devices 1 2] [--graph-calls 256] [options...]" >&2
   exit 2
 fi
 
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$1" == --help || "$1" == -h ]]; then
+  exec "${PYTHON:-python3}" "$root/tests/python/batch_get_multicard_perf.py" --help
+fi
 build_dir="$1"
 shift
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec python3 "$root/tests/python/batch_get_multicard_perf.py" "$build_dir" "$@"
+exec "${PYTHON:-python3}" "$root/tests/python/batch_get_multicard_perf.py" "$build_dir" "$@"

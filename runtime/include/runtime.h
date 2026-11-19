@@ -2,6 +2,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -90,10 +94,23 @@ class RuntimeCore {
 
   Status BatchGet(
       const BatchGetRequest& request,
-      const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
+      const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{},
+      BatchGetHostTiming* host_timing = nullptr);
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
+  Status DrainGet();
+  Status RecoverGet(GetExecutionConfig);
+  bool HasPendingGet() const;
+  // Resolve the already submitted Put, without replay or closing the Runtime.
+  Status RecoverPut(PutExecutionConfig);
+  bool HasPendingPut() const;
+  Status BeginGetGraph(GetExecutionConfig, const GetGraphOptions&, std::uint64_t*);
+  Status EndGetGraph(std::uint64_t, void* stream, bool discard_result = false);
+  Status BeginGetOutput(GetExecutionConfig, const GetOutputOptions&, std::uint64_t*);
+  Status EndGetOutput(std::uint64_t);
+  Status BeginPutInput(PutExecutionConfig, const PutInputOptions&, std::uint64_t*);
+  Status EndPutInput(std::uint64_t);
 
  protected:
   MetaManager& meta_manager_;
@@ -119,11 +136,40 @@ class RuntimeCore {
   const AccessTableState* FindAccessTable(
       const AccessTableHandle& handle) const;
 
-  bool initialized_{false};
-  bool needs_cleanup_{false};
+  Status DrainGetLocked();
+  struct PutTraceRow;
+  Status FinalizePutLocked(PutTraceRow* timing = nullptr);
+  void FlushPutTrace();
+  struct PutTraceRow {
+    const char* event{"batch_put"};
+    const char* path{"direct"};
+    int result{};
+    std::uint64_t total_ns{}, lock_ns{}, validation_ns{}, prepare_ns{}, metadata_prepare_ns{};
+    std::uint64_t execute_ns{}, metadata_finalize_ns{}, acknowledge_ns{}, resolve_ns{};
+    PutDispatchTiming dispatch;
+    PutProviderTiming provider;
+  };
+  std::string put_trace_path_;
+  std::vector<PutTraceRow> put_trace_rows_;
+  std::uint64_t put_trace_index_{};
+  struct PendingPut {
+    PutContext transaction;
+    PutCompletion completion;
+    bool metadata_finalized{false};
+    bool input_bound{false};
+  };
+  mutable std::shared_mutex lifecycle_mutex_;
+  mutable std::mutex table_mutex_;
+  mutable std::mutex put_mutex_;
+  mutable std::mutex get_mutex_;
+  std::shared_ptr<AccessTableState> pending_get_table_;
+  std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>> graph_tables_;
+  std::optional<PendingPut> pending_put_;
+  std::atomic<bool> initialized_{false};
+  std::atomic<bool> needs_cleanup_{false};
   RemoteRegionDesc remote_region_;
   std::uint64_t next_access_table_id_{1};
-  std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
+  std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>>
       access_tables_;
 };
 
