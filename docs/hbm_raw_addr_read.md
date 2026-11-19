@@ -448,6 +448,8 @@ A 的本地 HBM 注册会打印 `DIRECT_LOCAL_HBM_SEGMENT`，核对 provider 返
 
 CQE/WQE 快照保留 80 B 参数和 1280 B 状态 ABI：出错 WQE 临时使用该核 profile 的前八个 jetty_completion_wait_cycles 槽，CQ 出错时不再写入覆盖这些槽的性能数据；通过新的快照 magic 与旧 CQE-only 状态区分。Host 库与 raw kernel 必须同步更新。旧 kernel 缺少 WQE 快照时打印 snapshot_unavailable，不再尝试 Host 读取 SQ。此路径不重放 READ、不重置队列，原有 InDoubt 和资源保留语义不变。
 
+raw READ 的本地 SGE 按 [SHMEM 的 aclshmemi_fill_sge_header_ctx 实现](https://github.com/hicann/shmem/blob/master/src/device/gm2gm/engine/shmem_device_udma.hpp) 编码为 `{uint32 length, uint32 zero, uint64 local_va}`：WQE `word[13]` 为零，不能填本地 MR 的注册 token，也不能照搬远端 20 位 token 的右移规则。旧代码把例如 `0x10e7` 填入了此字段；现在只修正 raw peer-HBM READ，普通 BatchGet/BatchPut 的已有编码保持原状。本地 MR 仍注册、校验和保留到原有关闭点，B 的远端 token、token value 和 EID 编码不变。诊断中的 `expected_local_sge_token_id=0x0` 与 `local_registration_tid=...` 分别表示实际 SGE 期望值和注册元数据，`local_token_matches` 按 SVA 零值检查；不能再将 entity 的本地注册 token 当作 SGE 的期望值。此修改针对已经观测到的 WQE 差异，仍需目标硬件通过启动探针及每轮 payload 校验确认。
+
 无 NPU 测试：
 
 ```bash

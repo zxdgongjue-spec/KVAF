@@ -52,6 +52,7 @@ void Doorbell(uint32_t value, uint32_t* address) {
       CHECK((wqe[0] >> 31U) == 1U - ((pi / 32768) & 1U));
       const bool signal = (wqe[0] & (1U << 21U)) != 0;
       CHECK(((wqe[0] >> 16U) & 3U) == (signal ? 2U : 1U));
+      CHECK(wqe[13] == 0); // SVA local SGE, independent of the registered local MR TID.
       if (signal) queue.checkpoints.push_back(queue.producer);
     }
     queue.sq_db = value;
@@ -182,6 +183,15 @@ void TestFusedOffsets(std::vector<int64_t> src, std::vector<int64_t> dst,
 
 
 int main(){
+  {Fixture f(1,1,1,2048);
+    f.entities[0].local_token_id=0x10e7;f.entities[0].remote_token_id=0x10e5;
+    f.Run(1);
+    const auto* wqe=aiv_model::hardware[0].sq.data();
+    CHECK(wqe[3]==0x10e5 && wqe[13]==0);
+    const auto log=kvaf::raw_read_debug::FormatWqe(0,0,0,f.entities[0],wqe);
+    CHECK(log.find("local_sge_token_id=0x0 expected_local_sge_token_id=0x0 local_registration_tid=0x10e7")!=std::string::npos);
+    CHECK(log.find("local_token_matches=1")!=std::string::npos);
+  }
   TestFusedOffsets({7,10000,1500},{3,90000,130000},{70001,656,2000});
   TestFusedOffsets({0,65536},{131072,0},{65536,65536});
   TestFusedOffsets({0,0},{0,100},{0,10},kInvalidLookup);

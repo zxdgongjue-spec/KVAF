@@ -203,7 +203,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->token_value = token_value;
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
-  // The local SGE uses the caller VA and allocated token. Check the actual
+  // The output registration owns the caller VA and allocated token. Check the
   // provider segment before publishing an entity with that identity, just as
   // the HBM exporter checks its remote segment. A translated local VA needs a
   // separate addressing contract; it cannot silently use the caller address.
@@ -224,7 +224,7 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   std::fprintf(stderr,
       "[KVAF_AIV] DIRECT_LOCAL_HBM_SEGMENT role=%s valid=%u key_bytes=%u "
       "requested_base=0x%llx requested_bytes=%llu segment_base=0x%llx segment_bytes=%llu "
-      "allocated_wqe_token_id=0x%x segment_raw_token_id=0x%x ra_token_id=0x%x "
+      "allocated_registration_tid=0x%x segment_raw_token_id=0x%x ra_token_id=0x%x "
       "uasid=%u attributes=0x%x registration_flags=0x%x segment_eid=%s\n",
       role,unsigned(valid),memory->key_bytes,(unsigned long long)aligned_address,
       (unsigned long long)aligned_bytes,(unsigned long long)segment_base,(unsigned long long)segment_bytes,

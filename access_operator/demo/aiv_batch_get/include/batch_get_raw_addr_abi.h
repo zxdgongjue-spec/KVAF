@@ -7,6 +7,10 @@ enum KvafRawReadInputMode : uint32_t {
 };
 constexpr uint32_t KVAF_RAW_MAX_SPANS = 4096;
 constexpr uint32_t KVAF_RAW_MAX_WQES = 1U << 20; // internal absolute-address descriptor limit
+// Raw peer-HBM READ follows the UDMA SVA SGE encoding used by SHMEM:
+// {uint32 length, uint32 zero, uint64 local_va}. The local registration TID
+// remains resource metadata; it is not the remote 20-bit token field.
+constexpr uint32_t KVAF_RAW_LOCAL_SGE_TOKEN_ID = 0U;
 
 struct KvafExecuteBatchGetRawAddrKernelArgs {
   uint64_t source_addresses;       // absolute addresses or source offsets, according to input_mode

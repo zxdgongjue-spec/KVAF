@@ -25,10 +25,11 @@ inline std::string FormatWqe(std::uint32_t core,std::uint32_t jetty,std::uint32_
   out << "[KVAF_NPU] HBM_READ_WQE_DIAGNOSTIC core=" << core << " jetty=" << jetty
       << " entry=" << entry << " snapshot_source=aiv_status opcode=" << ((words[1]>>8)&255) << " sge_count=" << (words[2]>>24)
       << " bytes=" << bytes << " local_address=0x" << std::hex << local
-      << " local_sge_token_id=0x" << words[13] << " expected_local_token_id=0x" << entity.local_token_id
+      << " local_sge_token_id=0x" << words[13] << " expected_local_sge_token_id=0x" << KVAF_RAW_LOCAL_SGE_TOKEN_ID
+      << " local_registration_tid=0x" << entity.local_token_id
       << " remote_address=0x" << remote << " remote_token_id=0x" << (words[3]&0xfffffU) << std::dec
       << " local_range_valid=" << range(entity.local_hbm_address,entity.local_hbm_size,local)
-      << " local_token_matches=" << (words[13]==entity.local_token_id)
+      << " local_token_matches=" << (words[13]==KVAF_RAW_LOCAL_SGE_TOKEN_ID)
       << " remote_range_valid=" << range(entity.remote_host_ddr_address,entity.remote_host_ddr_size,remote)
       << " remote_token_matches=" << ((words[3]&0xfffffU)==entity.remote_token_id)
       << " remote_eid_matches=" << (std::memcmp(words+4,entity.remote_eid,16)==0)
