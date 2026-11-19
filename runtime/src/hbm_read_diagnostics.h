@@ -23,7 +23,7 @@ inline std::string FormatWqe(std::uint32_t core,std::uint32_t jetty,std::uint32_
   };
   std::ostringstream out;
   out << "[KVAF_NPU] HBM_READ_WQE_DIAGNOSTIC core=" << core << " jetty=" << jetty
-      << " entry=" << entry << " opcode=" << ((words[1]>>8)&255) << " sge_count=" << (words[2]>>24)
+      << " entry=" << entry << " snapshot_source=aiv_status opcode=" << ((words[1]>>8)&255) << " sge_count=" << (words[2]>>24)
       << " bytes=" << bytes << " local_address=0x" << std::hex << local
       << " local_sge_token_id=0x" << words[13] << " expected_local_token_id=0x" << entity.local_token_id
       << " remote_address=0x" << remote << " remote_token_id=0x" << (words[3]&0xfffffU) << std::dec
@@ -91,7 +91,8 @@ inline std::string Format(const KvafExecuteBatchGetRawAddrKernelArgs& args,
         << " total_wqes=" << status.total_wqes << " posted_wqes=" << status.posted_wqes
         << " failed_request=" << execution.failed_request_index
         << " sq_pi=" << execution.sq_producer_index << " cq_ci=" << execution.cq_consumer_index << '\n';
-    if (status.reserved[0] == KVAF_RAW_CQE_DIAGNOSTIC_MAGIC) {
+    if (status.reserved[0] == KVAF_RAW_CQE_DIAGNOSTIC_MAGIC ||
+        status.reserved[0] == KVAF_RAW_CQE_WQE_DIAGNOSTIC_MAGIC) {
       const auto word0 = static_cast<std::uint32_t>(status.reserved[2]);
       out << "[KVAF_NPU] HBM_READ_CQE_DIAGNOSTIC core=" << core << " jetty=" << status.reserved[1]
           << " status=" << ((word0 >> 24U) & 255U) << " sub_status=" << ((word0 >> 16U) & 255U)
@@ -102,6 +103,17 @@ inline std::string Format(const KvafExecuteBatchGetRawAddrKernelArgs& args,
         out << std::setw(8) << static_cast<std::uint32_t>(status.reserved[2 + word / 2] >> (32 * (word % 2)));
       }
       out << std::dec << std::setfill(' ') << '\n';
+      const auto jetty = status.reserved[1];
+      const auto entry = static_cast<std::uint32_t>(status.reserved[2] >> 32U) & 0xffffU;
+      if (status.reserved[0] == KVAF_RAW_CQE_WQE_DIAGNOSTIC_MAGIC && jetty < args.jettys_per_core) {
+        std::uint32_t words[16];
+        for (unsigned word=0;word<16;++word)
+          words[word]=static_cast<std::uint32_t>(status.execution.profile.jetty_completion_wait_cycles[word/2] >> (32*(word%2)));
+        out << FormatWqe(core,static_cast<std::uint32_t>(jetty),entry,entities[core*args.jettys_per_core+jetty],words);
+      } else {
+        out << "[KVAF_NPU] HBM_READ_WQE_DIAGNOSTIC core=" << core << " jetty=" << jetty
+            << " entry=" << entry << " snapshot_unavailable=1 snapshot_source=aiv_status hint=check_matched_raw_kernel_build\n";
+      }
     } else if (execution.result == 7) {
       out << "[KVAF_NPU] HBM_READ_CQE_DIAGNOSTIC core=" << core
           << " snapshot_written=0 hint=check_matched_raw_kernel_build\n";

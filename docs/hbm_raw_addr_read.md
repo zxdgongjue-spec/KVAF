@@ -444,7 +444,9 @@ A 校验失败时会同时检查 NPU 比较结果与 CPU 回读，打印 `NPU_HB
 
 公开 [UDMA provider 的 udma_u_get_cr_status](https://github.com/openeuler-mirror/umdk/blob/master/src/urma/hw/udma/udma_u_jfc.c) 将原始 `status=2, sub_status=2` 映射为 `URMA_CR_LOC_ACCESS_ERR`，即发起端本地内存访问错误；不是把数字 2 当作 URMA 枚举直接解释。对于 A 发起 READ，先检查 A 的本地目标 SGE、HBM segment 和访问授权；单凭此码不能断定具体 token 编码、绑定关系或端口故障，目标机器的 provider 版本仍需对应核实。
 
-A 的本地 HBM 注册会打印 `DIRECT_LOCAL_HBM_SEGMENT`，核对 provider 返回的 48 B segment 与请求地址、长度和分配 token 是否匹配；不匹配时不发布 entity、不提交 READ。诊断模式在 CQ 错误后，根据保存的 CQE entry index 回读对应 SQE，打印 `HBM_READ_WQE_DIAGNOSTIC`，包含实际 local address、local SGE token、包长、范围/身份匹配和 16 个原始字。若 SQ 不支持 Host 回读，打印 snapshot_unavailable，保留原 CQ 错误。此快照只读，不重放 READ。若上述匹配均正确而仍报本地访问错误，继续结合 driver/UMMU 日志检查实际授权和地址映射；不要仅因 Jetty 与输出 MR 分配了不同 token 就直接修改 token 或 WQE。
+A 的本地 HBM 注册会打印 `DIRECT_LOCAL_HBM_SEGMENT`，核对 provider 返回的 48 B segment 与请求地址、长度和分配 token 是否匹配；不匹配时不发布 entity、不提交 READ。AIV 在 CQ 错误时根据 CQE entry index 保存对应 SQE，Host 仅回读普通 HBM 状态缓冲，打印 `HBM_READ_WQE_DIAGNOSTIC snapshot_source=aiv_status`，包含实际 local address、local SGE token、包长、范围/身份匹配和 16 个原始字。provider 返回的 SQ VA 不能直接当作 ACL 可回读的用户 Tensor 地址；之前通过 Host aclrtMemcpy 回读 SQ 的路径可能触发段错误，现已移除。若上述匹配均正确而仍报本地访问错误，继续结合 driver/UMMU 日志检查实际授权和地址映射；不要仅因 Jetty 与输出 MR 分配了不同 token 就直接修改 token 或 WQE。
+
+CQE/WQE 快照保留 80 B 参数和 1280 B 状态 ABI：出错 WQE 临时使用该核 profile 的前八个 jetty_completion_wait_cycles 槽，CQ 出错时不再写入覆盖这些槽的性能数据；通过新的快照 magic 与旧 CQE-only 状态区分。Host 库与 raw kernel 必须同步更新。旧 kernel 缺少 WQE 快照时打印 snapshot_unavailable，不再尝试 Host 读取 SQ。此路径不重放 READ、不重置队列，原有 InDoubt 和资源保留语义不变。
 
 无 NPU 测试：
 

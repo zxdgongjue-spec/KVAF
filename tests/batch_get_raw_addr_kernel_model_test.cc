@@ -63,6 +63,8 @@ void Doorbell(uint32_t value, uint32_t* address) {
 void Poll(void* address) {
   const auto probe = reinterpret_cast<uintptr_t>(address);
   for (auto& queue : hardware) {
+    const auto sq_begin = reinterpret_cast<uintptr_t>(queue.sq.data());
+    if (probe >= sq_begin && probe - sq_begin < queue.sq.size()*sizeof(uint32_t)) return;
     const auto begin = reinterpret_cast<uintptr_t>(queue.cq.data());
     if (probe < begin || probe >= begin + sizeof(queue.cq)) continue;
     // Deliver a checkpoint only when polled. This forces the initial two
@@ -82,7 +84,7 @@ void Poll(void* address) {
     queue.cq[(queue.cq_producer % 8) * 16] =
         (owner << 2U) | (queue.error ? (uint32_t(queue.error_status) << 24U) |
             (uint32_t(queue.error_sub_status) << 16U) : 0U);
-    queue.cq[(queue.cq_producer % 8) * 16 + 1] = 0x12345678;
+    queue.cq[(queue.cq_producer % 8) * 16 + 1] = 0x12340000U | uint32_t((end-1)&0xffffU);
     ++queue.cq_producer;
     return;
   }
@@ -230,15 +232,26 @@ int main(){
       CHECK(f.statuses[0].reserved[0]==0);
       CHECK(diagnostic.find("HBM_READ_CQE_DIAGNOSTIC")==std::string::npos);
     } else {
-      CHECK(f.statuses[0].reserved[0]==KVAF_RAW_CQE_DIAGNOSTIC_MAGIC);
+      CHECK(f.statuses[0].reserved[0]==KVAF_RAW_CQE_WQE_DIAGNOSTIC_MAGIC);
       CHECK(f.statuses[0].reserved[1]==0);
-      CHECK(f.statuses[0].reserved[2]==(uint64_t(0x12345678)<<32 | 0x03020004));
-      CHECK(diagnostic.find("jetty=0 status=3 sub_status=2 udma_status_name=unmapped raw_words=03020004,12345678")!=std::string::npos);
-      const auto wqe=kvaf::raw_read_debug::FormatWqe(0,0,0,f.entities[0],aiv_model::hardware[0].sq.data());
-      CHECK(wqe.find("local_range_valid=1 local_token_matches=1 remote_range_valid=1 remote_token_matches=1 remote_eid_matches=1")!=std::string::npos);
-      auto* words=aiv_model::hardware[0].sq.data();const auto saved=words[13];words[13]^=1;
-      CHECK(kvaf::raw_read_debug::FormatWqe(0,0,0,f.entities[0],words).find("local_token_matches=0")!=std::string::npos);
-      words[13]=saved;
+      CHECK(f.statuses[0].reserved[2]==(uint64_t(0x12340000)<<32 | 0x03020004));
+      CHECK(diagnostic.find("jetty=0 status=3 sub_status=2 udma_status_name=unmapped raw_words=03020004,12340000")!=std::string::npos);
+      CHECK(diagnostic.find("snapshot_source=aiv_status opcode=6")!=std::string::npos);
+      CHECK(diagnostic.find("local_range_valid=1 local_token_matches=1 remote_range_valid=1 remote_token_matches=1 remote_eid_matches=1")!=std::string::npos);
+      // Formatting uses the captured HBM bytes even if a provider has since
+      // reused its SQ and its address is inaccessible to the Host process.
+      auto* words=aiv_model::hardware[0].sq.data();std::array<uint32_t,16> saved_words;
+      std::copy(words,words+16,saved_words.begin());std::fill(words,words+16,0xdeadbeef);
+      const auto sq_va=f.entities[0].sq_va;f.entities[0].sq_va=1;
+      const auto captured=kvaf::raw_read_debug::Format(f.args,f.statuses.data(),f.queues.data(),f.entities.data());
+      CHECK(captured.find("local_range_valid=1 local_token_matches=1 remote_range_valid=1 remote_token_matches=1 remote_eid_matches=1")!=std::string::npos);
+      const auto token_pair=f.statuses[0].execution.profile.jetty_completion_wait_cycles[6];
+      f.statuses[0].execution.profile.jetty_completion_wait_cycles[6]^=uint64_t(1)<<32;
+      CHECK(kvaf::raw_read_debug::Format(f.args,f.statuses.data(),f.queues.data(),f.entities.data()).find("local_token_matches=0")!=std::string::npos);
+      f.statuses[0].execution.profile.jetty_completion_wait_cycles[6]=token_pair;
+      auto old=f.statuses;old[0].reserved[0]=KVAF_RAW_CQE_DIAGNOSTIC_MAGIC;
+      CHECK(kvaf::raw_read_debug::Format(f.args,old.data(),f.queues.data(),f.entities.data()).find("snapshot_unavailable=1 snapshot_source=aiv_status")!=std::string::npos);
+      std::copy(saved_words.begin(),saved_words.end(),words);f.entities[0].sq_va=sq_va;
     }
     auto before=aiv_model::doorbells;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
     CHECK(f.statuses[0].execution.result==kInvalidQueue);CHECK(before==aiv_model::doorbells);

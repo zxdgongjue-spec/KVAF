@@ -29,6 +29,11 @@ static_assert(sizeof(KvafExecuteBatchGetRawAddrKernelArgs) == 80);
 // CQE words packed low/high into four uint64 entries. Preserve the existing
 // status size and kernel argument ABI. A zero magic means no CQE error captured.
 constexpr uint64_t KVAF_RAW_CQE_DIAGNOSTIC_MAGIC = 0x4b56414351454631ULL;
+// Version 2 also stores the corresponding 64-byte SQE in the first eight
+// jetty_completion_wait_cycles slots. Failed calls do not publish profiling
+// data. Both records remain in this ordinary HBM status allocation, so the
+// Host never needs to read a provider-owned SQ VA. The status ABI stays 1280 B.
+constexpr uint64_t KVAF_RAW_CQE_WQE_DIAGNOSTIC_MAGIC = 0x4b56414351454632ULL;
 
 // Device diagnostics retained for debugging and kernel-model validation.
 // The normal Host READ path does not copy or interpret this buffer.
