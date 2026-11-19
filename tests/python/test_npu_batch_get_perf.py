@@ -45,7 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.backend import detect_torch_backend
 from utils.batch_get_workload import token_pattern
 from utils.dsa_keys import build_dsa_keys
-from utils.get_graph import GraphInputs, captured_get, captured_get_nodes, validate_graph_inputs
+from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
+                             captured_get_resources, validate_graph_inputs)
 from utils.get_options import (
     MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
     environment_int, resolve_backend, uses_aicpu, validate_workload,
@@ -80,7 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph-replays", type=int, default=5,
                         help="correctness replays with changing inputs before graph timing")
     parser.add_argument("--multi-graph-check", action="store_true",
-                        help="validate two live graphs on one stream, including per-node AICPU status/profile isolation")
+                        help="validate node reports, automatic scopes and caller-serialized graph/eager reuse on two streams")
     parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
                         help="enable a hardware run; selecting --backend also enables it")
     parser.add_argument("--get-timing", choices=("async-drain", "sync-call"), default="async-drain",
@@ -358,15 +359,17 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     if args.multi_graph_check:
         check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
                               miss_count, output, check_output, execution, stream)
+        check_graph_resource_scopes(args, runtime, torch, kvaf, make_plan, device_table,
+                                    miss_count, output, check_output, execution, stream)
     inputs = GraphInputs(make_plan, miss_count, output, stream)
 
     def submit(options):
         runtime.batch_get(device_table, inputs.fixed[0], inputs.fixed[1], miss_count,
                           inputs.fixed[2], output, stream=stream, **options)
 
-    def check(plan, count):
+    def check(plan, count, lease=0):
         if uses_aicpu(args):
-            runtime.check_batch_get_status(stream)
+            runtime.check_batch_get_status(stream, graph_lease=lease)
         check_output(plan, count)
 
     inputs.prepare(args.miss_count)
@@ -374,12 +377,15 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     execution.complete_async_get(runtime)
     check(inputs.fixed, args.miss_count)
     with captured_get(args, runtime, torch, kvaf, execution, output, stream, submit) as graph:
-        validate_graph_inputs(graph, inputs, check, args.miss_count, args.graph_replays)
+        def check_captured(plan, count):
+            check(plan, count, graph.leases[0])
+
+        validate_graph_inputs(graph, inputs, check_captured, args.miss_count, args.graph_replays)
         for iteration in range(args.warmup):
             inputs.prepare(args.miss_count)
             graph.replay()
             graph.synchronize()
-            check(inputs.fixed, args.miss_count)
+            check_captured(inputs.fixed, args.miss_count)
         durations, profiles = [], []
         for iteration in range(args.iterations):
             inputs.prepare(args.miss_count)
@@ -387,13 +393,79 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             graph.replay()
             graph.synchronize()
             durations.append((time.perf_counter() - start) * 1000)
-            check(inputs.fixed, args.miss_count)
+            check_captured(inputs.fixed, args.miss_count)
             if args.kernel_profile:
-                profiles.append(list(runtime.batch_get_kernel_profile()))
+                profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
         graph.validated = True
         print_measurements(args, "graph", durations, profiles)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
               "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
+
+
+def check_graph_resource_scopes(args, runtime, torch, kvaf, make_plan, device_table,
+                                miss_count, output, check_output, execution, stream):
+    """Serial graph/eager reuse on distinct streams, including a shared output MR."""
+    execution.drain_get(runtime)
+    execution.release_output(runtime)
+    stream.synchronize()
+    other_stream = torch.npu.Stream()
+    inp = GraphInputs(make_plan, torch.empty_like(miss_count), torch.empty_like(output), stream)
+    inp.prepare(args.miss_count)
+
+    def submit_on(target):
+        def submit(options):
+            runtime.batch_get(device_table, inp.fixed[0], inp.fixed[1], inp.miss_count,
+                              inp.fixed[2], inp.output, stream=target, **options)
+        return submit
+
+    def check():
+        check_output(inp.fixed, args.miss_count, result=inp.output)
+
+    def replay_checked(graph):
+        # Torch replay uses the caller's current stream. Selecting it here is
+        # part of this cross-stream correctness check, outside performance timing.
+        with torch.npu.stream(graph.stream):
+            graph.replay()
+        graph.synchronize()
+        check()
+
+    submit = submit_on(stream)
+    other_submit = submit_on(other_stream)
+    with captured_get_resources(args, runtime, torch, kvaf, execution, stream,
+                                [submit, submit]) as (first, first_resources):
+        if len(first_resources.leases) != 2 or len(set(first_resources.leases)) != 2:
+            raise AssertionError("repeated output must still produce two graph nodes")
+        # Preparing the second graph runs real eager Gets while the first lives.
+        with captured_get_resources(args, runtime, torch, kvaf, execution, other_stream,
+                                    [other_submit]) as (second, second_resources):
+            if len(second_resources.leases) != 1:
+                raise AssertionError("one warmup call must produce one graph node")
+            for graph in (second, first):
+                replay_checked(graph)  # Caller owns ordering across streams.
+            snapshots = None
+            if uses_aicpu(args) and args.kernel_profile:
+                snapshots = [deepcopy(runtime.batch_get_kernel_profile(graph_lease=lease))
+                             for lease in first_resources.leases]
+            inp.output.zero_()
+            stream.synchronize()
+            other_submit(execution.get_kwargs)
+            runtime.drain_get()
+            check()
+            if snapshots is not None:
+                for lease, snapshot in zip(first_resources.leases, snapshots):
+                    if runtime.batch_get_kernel_profile(graph_lease=lease) != snapshot:
+                        raise AssertionError("eager Get overwrote a captured node report")
+            replay_checked(first)
+            second.validated = True
+        # Retiring one graph must retain the other graph's shared registration.
+        replay_checked(first)
+        first.validated = True
+    submit(execution.get_kwargs)
+    runtime.drain_get()
+    check()
+    print(f"BATCH_GET_GRAPH_RESOURCES_PASS backend={args.backend} api={args.graph_api} "
+          "automatic_nodes=1 streams=2 caller_serialized=1 shared_output=1 "
+          "graph_eager_interleave=1 survivor_replayed=1", flush=True)
 
 
 def sort_request_plan_prefix(

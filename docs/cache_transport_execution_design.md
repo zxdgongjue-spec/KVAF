@@ -171,7 +171,7 @@ AICPU 使用显式 `UmdkQueueProfile`：当前 Put 创建 **1 条 control、0 �
 | 单次执行 | 短期租约、请求/表引用、完成信息 | Get 确认完成；Put 还须完成事务及确认 |
 | graph / 显式 buffer 绑定 | 固定 buffer、资源引用及必要调用方引用 | 对应 End 成功，或允许的安全关闭流程 |
 
-长期 `PutResourceReference` / `GetResourceReference` 固定 owner 与绑定状态，不设置执行占用；普通请求取得对应的 `PutResourceLease` / `GetResourceLease`。Put 的执行租约从准备请求保留至数据面完成、元数据事务及 Acknowledge 成功；普通 Get 在安全完成后归还。graph 节点复用驻留 owner，并由 `GetGraphNode` 单独保存状态；准备结束即归还普通 Get 执行租约，Dispatcher 在图租约存活期间禁止 eager Get。图节点依赖不能按单次 replay 归还。归还执行租约保留驻留实例。关闭失败保留 owner、状态和依赖，不能用相同身份静默创建另一份资源。
+长期 `PutResourceReference` / `GetResourceReference` 固定 owner 与绑定状态，不设置执行占用；普通请求取得对应的 `PutResourceLease` / `GetResourceLease`。Put 的执行租约从准备请求保留至数据面完成、元数据事务及 Acknowledge 成功；普通 Get 在安全完成后归还。graph 节点复用驻留 owner，并由 `GetGraphNode` 单独保存状态；准备结束即归还普通 Get 执行租约，图租约只固定依赖，普通 Get 可与图由调用方串行交叉执行。图节点依赖不能按单次 replay 归还。归还执行租约保留驻留实例。关闭失败保留 owner、状态和依赖，不能用相同身份静默创建另一份资源。
 
 “释放本次租约”表示取消执行占用，允许后续调用使用这套资源，不等于销毁上下文、关闭队列或注销显式 buffer 绑定。Get 的 `ClearRequest()` 清空 request、借用 table、options 和短期 lease，保留长期资源引用、provider ExecutionState、准备缓存及输出绑定。具体临时注册是否需要在完成阶段注销，由 provider 和绑定方式决定，不能由“释放引用”一词推断。
 
@@ -347,29 +347,34 @@ runtime.batch_get(
 
 ### 11.1 四种 Get 的 graph 契约
 
-四种已接入 Get 均有显式 graph lease：URMA AIV Direct、UBMEM AIV Direct、URMA AICPU Gather、URMA AICPU Scatter。资源及输入输出引用由 lease 保护；实现支持不代表真机图回放已经验收。
+四种已接入 Get 均可通过 Python `runtime.graph_resources()` 管理图依赖：URMA AIV Direct、UBMEM AIV Direct、URMA AICPU Gather、URMA AICPU Scatter。一个资源对象对应一张外部模型图；内部仍为每次 Get 分配独立节点租约，无需用户提供节点清单。底层显式 `begin_get_graph/end_get_graph` 保留。
 
 ```text
-begin_get_graph(config, output, capacity, stream)
-  → 每节点在捕获前准备独立租约；存活租约使 Get 方向专用于图
-  → capture: 一次 batch_get(graph_lease=lease, synchronize=False)
-  → replay: 在相同输入存储中更新请求内容并重放
-  → 停止 replay、销毁图，end_get_graph(lease, stream)
-  → 释放该节点依赖；最后一个图租约结束后恢复 eager Get，实例继续驻留
+resources.prepare(stream)
+  → 执行一次真实的模型预热 forward，按实际 batch_get 顺序收集配置、输出和容量
+  → 完成预热，在图外准备各节点租约、注册和独立报告
+resources.capture(stream) + 外部 torch/ACL capture
+  → 相同 forward 中的普通 batch_get 自动使用对应节点
+  → 验证顺序、配置、输出存储/范围、容量及节点数量；不匹配即拒绝
+原生 graph.replay()
+  → 调用方保证与其他图、普通 Get 的执行顺序
+停止 replay → 等待完成 → 销毁外部图 → resources.close()
+  → 释放该图依赖；其他图和驻留实例继续存在
 ```
 
-- 固定执行配置、stream、输出地址/大小和容量上限。indices、offsets、miss_count、output_indices 可在原存储内更新，以覆盖全量、部分及零请求；不能替换仍被图使用的 allocation。
-- 一租约只允许一个异步 Get capture；一张图可含多个节点，多张图也可同时存活，全部使用同一 stream 串行回放。图内混合算法不在本轮验收范围，Put 不进入图。捕获不携带逐调用同步 profile 输出。
-- 捕获前完成模块、注册、workspace 与 slot 准备；捕获/重放不触发首次建链、动态注册/分配或 Host Drain。AICPU 用设备 ticket 推进 replay 序号。
-- graph 持有整个 Get 方向，拒绝额外 eager Get、Get Drain/Warmup/Recover 和 Runtime 关闭。它不把 Put 变成图操作，也不取消 Put/Get 原有数据冲突与 stream 顺序约束。
-- 已有 eager 输出绑定只阻止**同一实例**进入 graph；其他实例的空闲输出绑定可以继续保留。graph 期间不解除这些绑定。
-- caller 保持 graph 使用的表、输入输出和 stream 有效，并在释放租约前停止回放。Python 与 RuntimeCore 为各节点分别保留必要 Tensor 和 AccessTable 引用；同算法节点共享会话、队列和工作区，完成报告独立。Torch Graph 的外部 replay 也须遵守捕获 stream 约束，Runtime 无法拦截该调用。
+- 只收集 `prepare` scope 中的一次目标 forward；其他预热无需放入该 scope。真实执行，不是只记录调用；相同输出出现两次也产生两个独立节点。未在预热中出现的分支不能在捕获中补注册。miss_count 的值不属于准备契约，可在原存储中更新。
+- 单张图的准备、捕获、回放、结束使用固定 stream；不同图允许不同 stream。调用方负责共享队列/工作区不会重叠执行，必要时自行同步或建立依赖；KVAF 不包装 replay、不自动插入跨 stream event、不检测任意外部图的在途状态。
+- 捕获前完成模块、注册、workspace 与 slot 准备；捕获/回放不触发首次建链、动态设备注册/分配或 Host Drain。捕获调用须异步且不携带逐调用 Host profile。AICPU 用设备 ticket 推进通信序号。
+- 图存活时允许串行普通 Get、Drain 和输出绑定；普通调用使用自己的状态，不能覆盖节点完成报告。图引用固定该实例的已准备容量及资源地址；会破坏这些依赖的扩容、恢复、profiling 切换应拒绝，其他实例不因存在无关图而被全局阻止。Runtime 关闭仍须先结束全部图。
+- URMA AIV Direct/Gather 的图与普通 Get 在同一通信上下文中复用匹配范围的输出注册，分别持有引用，最后一个引用释放才注销。UBMEM/Scatter 不因此增加输出 MR。这个共享不扩展到不同算法的不同通信上下文。
+- caller 保持图使用的表、输入输出和 stream 有效，不得 resize/替换存储。Python 保留 Tensor 和 storage，RuntimeCore 保留节点的 AccessTable 引用；引用保活不等于允许原地改变 allocation。捕获异常也必须先退出捕获并销毁外部图，再显式 close/discard；不能依靠析构推断外部 replay 已停止。
+- 图内可按各次配置使用不同 Get 算法；Put 不进入图。同方向并发回放仍不受支持，代码支持范围与真机验收结果分开记录。
 
 ### 11.2 状态、profiling 与释放
 
 AIV Direct graph 不增加逐次 status 清零或结果回拷；UBMEM graph 不在 kernel 前追加 status memset，结束时仍同步并检查结果；AICPU 显式状态检查在 replay 完成后执行。不能用统一的“每次重放先清零并回读状态”描述四种算法。
 
-kernel profiling 在取得 graph lease 前按配置启用，每轮执行完成后读取，结束图与租约后再关闭。状态查询和 profile 路由到指定配置的驻留实例；省略配置使用 Runtime 默认 Get。同实例有多个图节点时须用 `graph_lease=lease` 选择节点，报告为该节点最近一次完成的结果。性能入口默认关闭 profiling，显式 `--kernel-profile` 才开启。具体接口及结束后保留最后 profile 的规则见实现文档。
+kernel profiling 在取得 graph lease 前按配置启用，每轮执行完成后读取，结束图与租约后再关闭。状态查询和 profile 路由到指定配置的驻留实例；省略配置使用 Runtime 默认 Get。图报告始终用 `graph_lease=lease` 选择节点（包括只有一个节点时），可由 `resources.leases` 取得；省略租约查询普通实例结果，避免与 eager 共存时产生歧义。性能入口默认关闭 profiling，显式 `--kernel-profile` 才开启。具体接口及结束后保留最后 profile 的规则见实现文档。
 
 正常结束和 discard 均须保证回放已停止；同步或注销失败保留资源与租约供重试。AICPU 捕获但未重放的图正常结束会报告未完成，可显式 discard。共享 AICPU 会话失败后，先销毁引用同一算法实例的全部图，再对各租约调用 `end_get_graph(..., discard_result=True)`；尚有同实例租约未进入丢弃流程时返回 Busy。最后一个租约关闭会话后，重试此前收到 Busy 的租约；结束全部图租约后再 `recover(config)`。具体顺序见实现文档，不能复用可能损坏的队列，也不能把 discard 解释为忽略未决 DMA。
 

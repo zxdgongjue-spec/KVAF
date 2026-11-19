@@ -58,6 +58,7 @@ class ExecutionDispatcher final : public AccessOperator {
   Status PrepareGetInstanceLocked(GetExecutionConfig, const BatchGetRequest*, const ExecutionWarmup&,
                                   GetExecutionContext**, GetPreparationTiming* = nullptr);
   Status CloseGetInstanceLocked(GetExecutionContext*);
+  bool HasGraphNodesLocked(const GetExecutionContext*) const;
   Status DrainGetLocked();
   Status FindGraphNode(GetExecutionContext*, std::uint64_t, GetGraphNode**);
   Status FinishOutputLocked(GetExecutionContext&);
@@ -85,7 +86,6 @@ class ExecutionDispatcher final : public AccessOperator {
   std::vector<std::unique_ptr<GetExecutionContext>> get_instances_;
   GetExecutionContext* pending_get_{nullptr};
   std::uint64_t next_graph_id_{1};
-  void* graph_stream_{nullptr};
   std::unordered_map<std::uint64_t, GetGraphNode> graph_nodes_;
   std::uint64_t next_output_id_{1};
 };

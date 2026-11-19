@@ -51,8 +51,10 @@ class UmdkSession {
   Status Drain();
   Status ReleaseBuffers();
   Status ReleaseBuffer(void* buffer, std::size_t bytes);
-  Status PinGraphBuffer(std::uint64_t region_base, void*, std::size_t);
-  Status UnpinGraphBuffer(void*, std::size_t);
+  // A graph node, an eager invocation and an explicit output binding each
+  // retain one reference to the covering MR. Only the last unpin retires it.
+  Status PinBuffer(std::uint64_t region_base, void*, std::size_t);
+  Status UnpinBuffer(void*, std::size_t);
   struct WriteState {
     bool attempted{false};
     PutCompletion completion;
@@ -71,6 +73,7 @@ class UmdkSession {
   Status Run(UmdkControlOp op, UmdkControlStatus& status, aclrtStream stream = nullptr,
              Launch launch = nullptr, PutProviderTiming* timing = nullptr);
   Status CompletePending(UmdkControlStatus& status);
+  Status RetireBuffer(void* buffer, std::size_t bytes);
   UmdkSessionConfig config_;
   UmdkControlArgs args_{};
   aclrtStream stream_{nullptr};
@@ -79,7 +82,7 @@ class UmdkSession {
   bool kernel_loaded_{false};
   std::vector<std::pair<std::uint64_t, std::size_t>> registered_buffers_;
   using BufferRange = std::pair<std::uint64_t, std::size_t>;
-  std::map<BufferRange, std::size_t> graph_buffer_pins_;
+  std::map<BufferRange, std::size_t> buffer_pins_;
   const BufferRange* FindBuffer(void*, std::size_t) const;
   WriteState default_write_;
   WriteState* write_{&default_write_};

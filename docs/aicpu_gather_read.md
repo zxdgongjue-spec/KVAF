@@ -269,10 +269,11 @@ BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待�
 Tensor 和 stream，按实现文档执行恢复或关闭重试。
 普通请求的 Tensor 保持至完成；显式输入/输出绑定保持至绑定结束，图资源保持至图销毁并结束图租约。
 当前 AICPU 进程支持多个 session，Put/Get 分别持有自己的 session/队列。
-Gather 已支持 ACL Graph capture/replay，使用 `begin_get_graph/end_get_graph`；
+Gather 已支持 ACL Graph capture/replay，可用 `graph_resources().prepare/capture` 自动收集节点，
+也保留 `begin_get_graph/end_get_graph` 底层接口；
 设备 ticket 在每次 replay 推进序号，图内不执行 Host 注册或同步。
-每个 Get 节点使用独立租约，同一 Runtime 的存活图共用一个 stream；同一算法存在多个节点时，
-profile 或状态查询须指定 `graph_lease`。多图验证可在统一性能入口加 `--multi-graph-check`。
+每个 Get 节点使用独立租约和报告，单图固定 stream；不同图与 eager 由调用方串行安排，
+可使用不同 stream。图 profile 或状态查询始终指定 `graph_lease`，省略则查询 eager。多图验证可在统一性能入口加 `--multi-graph-check`。
 
 本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。
 

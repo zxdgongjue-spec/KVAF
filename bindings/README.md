@@ -74,7 +74,7 @@ NPU packed input 和每条 block 的 CPU 整数 metadata，同步写入及事务
 AIV Put 使用默认或显式指定的可读 kernel，不再回退到 ACL D2H mock。
 
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
-stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
+stream 时使用 `torch.npu.current_stream()`。KVAF 保留执行所需的 stream 引用，但不创建或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
 
@@ -83,10 +83,15 @@ Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Acces
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
 
 异步 Get 的设备完成和框架回收通过 `drain_get()` 完成；外部 stream 同步不会自动
-归还执行租约及引用。下一次普通 Get 会先完成前一次 Get。Graph 需显式申请图租约，
-一个租约只允许捕获一个 Get 节点；可为多个节点分别申请租约，并在同一 stream 上串行回放多张图。
-停止 replay、同步并销毁关联 graph 后结束对应租约。同算法有多个节点时，状态及 profile
-查询须传 `graph_lease` 选择节点；profiling 在申请图租约前开启，结束租约后关闭。
+归还执行租约及引用。下一次普通 Get 会先完成前一次 Get。Graph 可使用
+`resources = runtime.graph_resources()`，在一次真实模型预热的 `resources.prepare(stream)`
+scope 中自动收集 Get 节点，再在 `resources.capture(stream)` scope 中进行外部 Torch/ACL
+捕获；模型仍调用普通 `batch_get`，无需传节点租约。保留底层显式 begin/end_get_graph 接口。
+单张图保持固定 stream，不同图可使用不同 stream，调用方负责与普通 Get 串行执行；
+KVAF 不代理外部 replay 或自动安排跨 stream event。停止 replay、同步并销毁关联 graph
+后调用 `resources.close()`；失败保留依赖，未回放或捕获失败可用 `discard_result=True`。
+状态及 profile 的图查询须传 `graph_lease`（由 `resources.leases` 取得），不传则查询 eager；
+profiling 在申请该实例图租约前开启，全部结束后关闭。
 
 ### 重复 Get 的输出绑定
 

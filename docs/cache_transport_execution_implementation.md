@@ -19,7 +19,7 @@
 | 输入绑定 | URMA AIV、AICPU Put 显式保留输入注册；整个 Put 方向同时只能有一个绑定 |
 | 混合池 | `urma+ubmem` 初始化时分配同一份 Fabric DDR，URMA 注册与 UBMEM 映射使用同一 allocation |
 | 并发 | Put/Get 两方向独立；同方向串行，多个实例驻留不增加同方向并发请求数 |
-| Graph | 四种 Get 均支持显式图租约；每租约一个 Get 节点，多图及多节点在同一 stream 串行执行，存活租约专用 Get 方向 |
+| Graph | 四种 Get 支持预热自动收集节点及底层显式租约；不同图可用不同 stream，与普通 Get 由调用方串行调度 |
 | 恢复 | 资源重建、幂等控制协议、原次 Put 完成查询及事务恢复、失败保留资源以供重试 |
 | 诊断 | Get/Put Host 分段计时、四种 Get kernel profile、AICPU 显式结果检查 |
 
@@ -81,7 +81,7 @@ RuntimeCore 管理 DDR 生命周期、AccessTable pin 和 Put 事务；Dispatche
 | `PutResourceReference` / `GetResourceReference` | 长期固定对应 owner 和绑定状态，不占用执行；随驻留实例保留 |
 | `PutResourceLease` / `GetResourceLease` | 普通调用的独占执行占用；Put 保留至事务及确认成功，普通 Get 保留至安全完成 |
 | `GetExecutionContext` | 每 Get 配置一个驻留实例；含 provider 状态、预热容量/stream、输出绑定和当前请求字段 |
-| `GetGraphNode` | 每图租约独立保存节点状态和完成报告，复用驻留实例的 owner；Dispatcher 在任何图租约存活时禁止 eager Get |
+| `GetGraphNode` | 每图租约独立保存节点状态和完成报告，固定驻留实例资源地址；与普通 Get 串行共存 |
 | `PutExecutionContext` | 每 Put 配置一个驻留实例；含长期资源引用、provider 状态和准备缓存；短期租约及完成记录按次保留到事务确认 |
 | Python Runtime | 持有在途、输入/输出绑定和 graph 所需 Tensor/stream 强引用 |
 
@@ -266,7 +266,7 @@ Commit/Abort、确认完成。元数据准备返回错误或抛异常时，`Canc
 远端 WR 错误/CQ 超时不自动等于安全失败。元数据已完成而 ACK 失败时，重试只确认，
 不重复 Commit/Abort。不能用重建队列或重放 Put 消除 Unknown。无未决事务时，recover
 才关闭并重建该配置资源；Put 输入绑定须先结束。Get recover 要求该实例无输出绑定、
-整个 Get 域无 graph，且其他实例无在途 Get；失败保留原依赖。
+该实例无 graph，且普通在途 Get 已安全处理；无关实例的图不阻止恢复。失败保留原依赖。
 
 ```python
 # 原次 batch_put 返回未决完成错误后，保留 source/stream，查询同一配置。
@@ -392,8 +392,9 @@ runtime.end_get_output(lg)
 绑定后该实例的请求必须传匹配 lease、配置、输出地址/大小/device，容量不超上限。
 普通 eager Get 可切换 stream，切换时重新准备所需执行槽位。结束空闲实例的绑定不影响
 其他在途实例；结束正在执行的实例则先 Drain。失败保留绑定。UBMEM/Scatter 不需要
-应用输出注册，不支持此输出绑定接口。输出绑定不阻止其他实例进入 graph，但阻止
-同一实例进入 graph；存在任何 graph 时不能开始/结束 eager 绑定。
+应用输出注册，不支持此输出绑定接口。输出绑定可与图共存；同上下文内图和 eager
+各自持有注册引用，结束其中一个不会注销另一个仍引用的 MR。显式输出绑定的 eager
+调用仍需携带其 output_lease；图节点使用自己的 graph_lease。
 
 ### 显式输入绑定
 
@@ -414,54 +415,60 @@ UBMEM 不需要输入 MR，使用普通 Put。URMA Put 的普通调用临时注�
 
 ## Get 图模式
 
-四种 Get 使用同一套 `begin_get_graph/batch_get/end_get_graph` 接口。开始租约前准备固定
-配置、stream、输出地址及容量；捕获阶段只提交准备好的设备任务，不注册、不分配、不
-执行 Host 同步或 Drain。每个节点在图外准备独立租约，一个租约只记录一个 KVAF Get 节点；
-一张图可使用多个租约，多张图也可同时存活，但必须在同一 stream 串行回放。任何租约存活期间
-额外 eager Get、Drain、Get 预热/恢复、profile 开关及 Runtime 关闭返回 Busy。Put 仍可
-在其他合法 key 上执行，不进入这张图。
-
-下面使用绑定层提供的 `AclGraph`，`cfg` 可分别选 direct/mapped/gather/scatter：
+四种 Get 推荐通过 `runtime.graph_resources()` 自动管理一张模型图的 Get 节点。用户不需要
+逐层写准备清单或向模型 forward 传入 lease；普通 `batch_get` 在准备/捕获 scope 内自动路由。
 
 ```python
-cfg = gather
-runtime.start_batch_get_kernel_profile(execution=cfg)  # 可选；在申请租约前启用
-lease = runtime.begin_get_graph(cfg, output, request_capacity=capacity, stream=read_stream)
-graph = kvaf.AclGraph()
-graph.capture_begin(read_stream)
-runtime.batch_get(table, indices, offsets, miss_count, output_indices, output,
-                  stream=read_stream, execution=cfg, graph_lease=lease,
-                  synchronize=False, profile=False)
-graph.capture_end()
+resources = runtime.graph_resources()
+# 只包住一次与目标捕获路径相同的预热；内部的 batch_get 真实执行。
+with torch.npu.stream(read_stream):
+    with resources.prepare(read_stream):
+        model_forward(dummy_inputs)
 
-# 保持输入 Tensor 地址不变，可按 read_stream 顺序更新其内容，再 replay。
-graph.replay(read_stream)
-graph.synchronize(read_stream)
-# cfg 为 gather/scatter 时可显式检查这一轮结果：
-runtime.check_batch_get_status(read_stream, execution=cfg, graph_lease=lease)
-profiles = runtime.batch_get_kernel_profile(execution=cfg, graph_lease=lease)
+# 此 scope 不启动 torch capture，只关联 KVAF 的准备结果。
+graph = torch.npu.NPUGraph()
+with resources.capture(read_stream):
+    with torch.npu.graph(graph, stream=read_stream):
+        model_forward(dummy_inputs)
 
-# 此后不再 replay；先销毁 graph，再结束租约。
+# 更新固定输入内容；调用方保证共享通信资源上无其他在途执行。
+with torch.npu.stream(read_stream):
+    graph.replay()
+read_stream.synchronize()
+# 可选报告查询（先在 prepare 前启用 profiling）：
+# profiles = runtime.batch_get_kernel_profile(graph_lease=resources.leases[0])
+
+# 不再 replay，先销毁图，再释放它持有的资源。
 graph.reset()
-runtime.end_get_graph(lease, stream=read_stream)
-runtime.stop_batch_get_kernel_profile(execution=cfg)
+resources.close()
 ```
 
-示例的显式 `check_batch_get_status` 仅用于 AICPU Gather/Scatter；使用 direct/mapped
-时省去该行。profile 读取也应只在已启用且本次执行完成后进行。非捕获的 AICPU 单次
-分段 profile 可使用 `batch_get(..., synchronize=True, profile=True)`，与上述持续
-kernel profile 开关是两种接口。
+每个资源对象只 prepare/capture 一次。prepare 结束时完成普通 Get 并在图外创建节点，
+capture 检查调用配置、输出 storage/地址/大小、请求容量和节点顺序/数量；不匹配时拒绝，
+不会在 capture 内补资源。相同输出的两次调用仍有两个节点。固定输出须在预热时已存在；
+捕获期间才新分配的输出不满足此接口契约。capture 内 Get 必须 `synchronize=False`、
+`profile=False`，不混用显式 `graph_lease/output_lease`。
 
-准备、捕获、回放和 `end_get_graph` 使用同一 stream；同一 Runtime 的所有存活图租约也
-必须使用该 stream。Torch Graph 的外部 replay 无法由 Runtime 拦截，调用方须遵守此约束。
-请求 Tensor 存储/输出地址保持固定；可原地更新 indices、offsets、miss_count、
-output_indices，覆盖全量、部分和零请求。调用方保证所有更新/重放顺序，停止后续 replay
-并完成所有已提交 replay 后才能释放。Runtime/Python 持有 graph 所需表和 Tensor 引用；
-不能因释放公共 AccessTable handle 就重用其槽位。
+模型预热可更新工作数据，但不能把预热结果当作已回放的图报告。每个图节点拥有独立报告；
+索引、offset、miss_count、output_indices 的内容可变，存储地址必须保持有效。
+Python 对输出及 storage 的保活不允许调用方 resize/set_ 或回收其底层 allocation。
 
-各节点分别保留输出注册引用、Tensor、AccessTable 和完成报告；同算法节点共用通信会话、
-队列、工作区及连续的设备 ticket。回放不增加 Host 调度或节点间同步。销毁一张图并结束
-其全部租约后，其他正常图仍可回放；Get 方向在最后一个图租约结束后才恢复 eager 调用。
+一个图固定一个 stream，不同图可以使用不同 stream。外部原生 `graph.replay()` 保留，
+KVAF 不代理 replay、不自动记录 event 或维护跨 stream 依赖。应用负责在共享队列/工作区上
+串行执行图与普通 Get，例如先 `stream.synchronize()` 再切换到另一条 stream。图存活期间
+普通 Get/Drain 可以工作，使用自己的状态；预热只能使用已固定容量，不能扩容图依赖。
+profiling 切换和 recover 的阻塞按算法实例判断；关闭 Runtime 前仍须结束全部图。
+
+显式 `begin_get_graph(cfg, output, request_capacity, stream)` →
+`batch_get(..., execution=cfg, graph_lease=lease)` → `end_get_graph(lease, stream)`
+仍是可用的底层接口，单个 lease 只捕获一次 Get；不使用自动 scope 时由调用者自己管理。
+图与 eager 的输出绑定可以共存；AIV Direct/Gather 匹配同上下文已有注册时保留引用，
+没有匹配项才新增注册，最后引用结束后注销。UBMEM/Scatter 不需要应用输出 MR。
+
+无论正常结束还是 capture 异常，调用者都必须先退出 capture、停止 replay、确认在途完成、
+销毁外部 graph，再调用 `resources.close()`。失败路径或未回放的图可使用
+`resources.close(discard_result=True)`；失败保留未释放节点供重试，成功 close 可重复调用。
+释放公共 AccessTable handle 不会回收仍由图节点固定的 DDR 槽位。
 
 AICPU Gather/Scatter 用设备侧 ticket 推进每次 replay 的通信序号。正常结束检查该节点
 最后一次 replay 状态；未 replay 的图可能报未完成，可明确 `discard_result=True` 取消。
@@ -490,8 +497,9 @@ eager 完成路径的状态处理不适用于 Put 事务，Put 仍必须确认�
 
 `start_batch_get_kernel_profile`、`batch_get_kernel_profile`、`stop_batch_get_kernel_profile`
 按 `execution=cfg` 路由至相应实例，省略时取默认 Get。图前启用、每轮安全完成后读取、
-结束租约后停用。同一算法实例有多个图节点时，profile 和 AICPU 状态查询须传
-`graph_lease=lease`，报告对应该节点最近一次完成的结果；也可仅传租约定位节点。
+结束该实例全部租约后停用。图 profile 和 AICPU 状态查询始终传
+`graph_lease=lease`（也可由 `resources.leases` 取得），报告对应该节点最近一次完成的结果。
+不传租约查询普通 eager 实例，避免同一实例的图/eager 共存时混淆。
 正常结束租约时保存最后成功的 profile 供结束后按配置读取；不能在 capture 内复制或
 切换 profiling。AICPU 的 `check_batch_get_status(stream, execution=cfg, graph_lease=lease)`
 检查具体节点，保留首个失败结果；它不代替 Dispatcher 的图租约回收。

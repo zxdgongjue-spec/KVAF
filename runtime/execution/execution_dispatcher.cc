@@ -377,11 +377,11 @@ Status ExecutionDispatcher::Recover(GetExecutionConfig c) {
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (!graph_nodes_.empty()) return Status::Busy("release Get graph leases before recovery");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (!s.ok()) return s;
   auto* instance = FindGetInstanceLocked(resolved);
+  if (HasGraphNodesLocked(instance)) return Status::Busy("release this Get instance's graph leases before recovery");
   if (instance && instance->output_id) return Status::Busy("release this Get output lease before recovery");
   if (pending_get_ && pending_get_ != instance)
     return Status::Busy("complete the active Get before resource recovery");
@@ -483,6 +483,8 @@ GetExecutionContext* ExecutionDispatcher::FindGetInstanceLocked(GetExecutionConf
 }
 Status ExecutionDispatcher::CloseGetInstanceLocked(GetExecutionContext* instance) {
   if (!instance) return Status::OK();
+  if (HasGraphNodesLocked(instance))
+    return Status::Busy("release this Get instance's graph leases before closing its resources");
   auto s = resources_.Close(instance->resources);
   if (!s.ok()) {
     instance->cleanup_only = true;
@@ -494,11 +496,22 @@ Status ExecutionDispatcher::CloseGetInstanceLocked(GetExecutionContext* instance
       [instance](const auto& entry) { return entry.get() == instance; }));
   return Status::OK();
 }
+bool ExecutionDispatcher::HasGraphNodesLocked(const GetExecutionContext* instance) const {
+  return instance && std::any_of(graph_nodes_.begin(), graph_nodes_.end(),
+      [instance](const auto& entry) { return entry.second.instance == instance; });
+}
 Status ExecutionDispatcher::PrepareGetInstanceLocked(GetExecutionConfig config,
     const BatchGetRequest* request, const ExecutionWarmup& warmup,
     GetExecutionContext** out, GetPreparationTiming* timing) {
   auto* instance = FindGetInstanceLocked(config);
   if (instance && instance->cleanup_only) return Status::Busy("Get instance requires cleanup");
+  if (instance && instance->graph_recovery_required)
+    return Status::Busy("retire this Get instance's failed graphs before reuse");
+  const bool graph_pinned = HasGraphNodesLocked(instance);
+  // Graphs retain device addresses, not execution occupancy. A new stream may
+  // prepare its own slot, but it must not grow shared captured workspaces.
+  if (graph_pinned && warmup.request_capacity > instance->warmed_request_capacity)
+    return Status::Busy("Get graph resources are pinned; warm up the maximum capacity before preparing graphs");
   const bool prepare = !instance || !instance->warmed ||
       instance->warmed_stream != warmup.stream ||
       instance->warmed_request_capacity < warmup.request_capacity;
@@ -516,6 +529,8 @@ Status ExecutionDispatcher::PrepareGetInstanceLocked(GetExecutionConfig config,
     } else if (instance) s = instance->view().ValidateCapacity(capacity);
     if (timing) timing->describe_ns += TraceNowNs() - started;
     if (!s.ok()) return s;
+    if (graph_pinned && capacity > instance->warmed_capacity)
+      return Status::Busy("Get graph resources are pinned; shared workspace cannot grow");
   }
   if (!instance) {
     auto started = timing ? TraceNowNs() : 0;
@@ -558,7 +573,6 @@ Status ExecutionDispatcher::PrepareGetInstanceLocked(GetExecutionConfig config,
   return Status::OK();
 }
 Status ExecutionDispatcher::DrainGetLocked() {
-  if (!graph_nodes_.empty()) return Status::Busy("Get graph leases own this direction");
   if (!pending_get_) return Status::OK();
   auto* instance = pending_get_;
   GetDispatchTrace::Row row{};
@@ -597,9 +611,7 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
   if (r.indices.bytes % sizeof(std::int32_t) || r.indices.bytes / sizeof(std::int32_t) > UINT32_MAX)
     return Status::InvalidArgument("invalid Get request capacity");
   const auto capacity = static_cast<std::uint32_t>(r.indices.bytes / sizeof(std::int32_t));
-  if (!graph_nodes_.empty() || request.execution.graph_lease) {
-    if (!request.execution.graph_lease)
-      return Status::Busy("Get graph leases own this direction");
+  if (request.execution.graph_lease) {
     auto it = graph_nodes_.find(request.execution.graph_lease);
     if (it == graph_nodes_.end()) return Status::NotFound("Get graph lease not found");
     auto& node = it->second;
@@ -720,9 +732,10 @@ Status ExecutionDispatcher::ConfigureGetProfiling(std::optional<GetExecutionConf
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (!graph_nodes_.empty()) return Status::Busy("configure profiling before acquiring Get graph leases");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, config, &resolved);
+  if (s.ok() && HasGraphNodesLocked(FindGetInstanceLocked(resolved)))
+    return Status::Busy("configure profiling before acquiring this Get instance's graph leases");
   if (s.ok()) s = DrainGetLocked();
   GetExecutionContext* instance = nullptr;
   if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, {}, &instance);
@@ -744,12 +757,6 @@ Status ExecutionDispatcher::FindGraphNode(GetExecutionContext* instance, std::ui
     if (instance && instance != it->second.instance)
       return Status::InvalidArgument("Get graph lease/configuration mismatch");
     *out = &it->second;
-  } else {
-    for (auto& [key, node] : graph_nodes_) {
-      if (node.instance != instance) continue;
-      if (*out) return Status::InvalidArgument("select a graph_lease for this Get query");
-      *out = &node;
-    }
   }
   if (*out && ((*out)->ending || !(*out)->captured || (*out)->instance->graph_recovery_required))
     return Status::InvalidState("Get graph has no queryable capture");
@@ -816,22 +823,16 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
-  if (graph_stream_ && graph_stream_ != r.stream)
-    return Status::InvalidArgument("all live Get graphs of a Runtime must use the same stream");
-  for (const auto& [key, node] : graph_nodes_)
-    if (node.instance->graph_recovery_required)
-      return Status::Busy("retire failed Get graphs before preparing new nodes");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (!s.ok()) return s;
   auto* instance = FindGetInstanceLocked(resolved);
-  if (instance && instance->output_id) return Status::Busy("release this Get output lease before graph capture");
+  if (instance && (instance->cleanup_only || instance->graph_recovery_required))
+    return Status::Busy("retire this Get instance's failed resources before preparing new nodes");
   if (!next_graph_id_) return Status::InvalidState("graph lease ID exhausted");
-  const bool has_siblings = std::any_of(graph_nodes_.begin(), graph_nodes_.end(),
-      [&](const auto& e) { return e.second.instance == instance; });
-  if (graph_nodes_.empty()) s = DrainGetLocked();
-  if (s.ok() && has_siblings) s = instance->view().ValidateCapacity(r.request_capacity);
-  else if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, {r.request_capacity, r.stream}, &instance);
+  const bool has_siblings = HasGraphNodesLocked(instance);
+  s = DrainGetLocked();
+  if (s.ok()) s = PrepareGetInstanceLocked(resolved, nullptr, {r.request_capacity, r.stream}, &instance);
   if (!s.ok()) return s;
   auto entry = graph_nodes_.try_emplace(next_graph_id_).first;
   auto& node = entry->second;
@@ -851,7 +852,7 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
   instance->lease = {};
   if (!s.ok()) {
     graph_nodes_.erase(entry);
-    if (has_siblings) {
+    if (has_siblings || instance->output_id) {
       if (s.code() == StatusCode::kCompletionUnknown) instance->graph_recovery_required = true;
     } else {
       (void)CloseGetInstanceLocked(instance);
@@ -859,7 +860,6 @@ Status ExecutionDispatcher::BeginGetGraph(GetExecutionConfig c, const GetGraphOp
     return s;
   }
   instance->last_graph_profile.clear();
-  graph_stream_ = r.stream;
   *id = next_graph_id_++;
   return Status::OK();
 }
@@ -872,6 +872,18 @@ Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool dis
   auto* instance = node.instance;
   if (stream != node.options.stream)
     return Status::InvalidArgument("Get graph must end on its capture stream");
+  // Eager calls may borrow a graph's output registration. Retire their own
+  // pending references before removing a graph pin. External replay ordering
+  // remains the caller's responsibility; no cross-stream events are inserted.
+  auto drained = pending_get_ == instance ? DrainGetLocked() : Status::OK();
+  if (!drained.ok()) {
+    if (pending_get_ != instance) return drained;
+    // A failed eager request may share this graph's queues. Discard must still
+    // fence every graph and close the entire domain before dropping any eager
+    // references; retrying the same failed completion report cannot recover it.
+    instance->graph_recovery_required = true;
+    if (!discard) return drained;
+  }
   if (!node.domain_closed) {
     if (instance->graph_recovery_required && !discard)
       return Status::InvalidState("failed Get graph must be destroyed and ended with discard_result=True");
@@ -895,6 +907,8 @@ Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool dis
           return Status::Busy("discard remaining Get graph leases, then retry this lease");
       s = resources_.Close(instance->resources);
       if (!s.ok()) return s;
+      instance->ClearRequest();
+      if (pending_get_ == instance) pending_get_ = nullptr;
       instance->cleanup_only = true;
       for (auto& [key, sibling] : graph_nodes_)
         if (sibling.instance == instance) sibling.domain_closed = true;
@@ -903,7 +917,6 @@ Status ExecutionDispatcher::EndGetGraph(std::uint64_t id, void* stream, bool dis
     }
   }
   graph_nodes_.erase(it);
-  if (graph_nodes_.empty()) graph_stream_ = nullptr;
   return Status::OK();
 }
 Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutputOptions& r,
@@ -931,7 +944,13 @@ Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutput
   try { s = instance->view().PrepareOutput(r); }
   catch (const std::exception& e) { s = Status::Internal(std::string("output preparation failed: ") + e.what()); }
   catch (...) { s = Status::Internal("output preparation failed"); }
-  if (!s.ok()) { (void)CloseGetInstanceLocked(instance); return s; }
+  if (!s.ok()) {
+    instance->lease = {};
+    if (HasGraphNodesLocked(instance)) {
+      if (s.code() == StatusCode::kCompletionUnknown) instance->graph_recovery_required = true;
+    } else (void)CloseGetInstanceLocked(instance);
+    return s;
+  }
   instance->output_options = r;
   instance->output_id = next_output_id_++;
   instance->ClearRequest();
@@ -939,7 +958,18 @@ Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutput
   return Status::OK();
 }
 Status ExecutionDispatcher::FinishOutputLocked(GetExecutionContext& instance) {
-  if (!graph_nodes_.empty()) return Status::Busy("Get graph leases own this direction");
+  // A graph discard can safely close a failed shared domain. Keep the explicit
+  // binding ID (and its caller-owned allocation references) until EndGetOutput;
+  // there is no remaining MR to unregister after that successful close.
+  if (instance.cleanup_only && instance.graph_recovery_required) {
+    const bool closed = std::all_of(graph_nodes_.begin(), graph_nodes_.end(),
+        [&](const auto& entry) { return entry.second.instance != &instance || entry.second.domain_closed; });
+    if (closed && pending_get_ != &instance) {
+      instance.output_id = 0;
+      instance.output_options = {};
+      return Status::OK();
+    }
+  }
   if (pending_get_ == &instance) {
     auto s = DrainGetLocked();
     if (!s.ok()) return s;

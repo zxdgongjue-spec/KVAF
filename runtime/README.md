@@ -230,16 +230,18 @@ CPU service 须预先启动。替换 `--backend` 及对应的 `--aiv-cores` / `-
 独立功能测试及其 CMake 注册已移除，数据预检和输出校验继续在性能计时外执行。
 默认关闭 kernel profiling；上例显式使用 `--kernel-profile` 开启设备打点与报告读取，
 测无 profiling 的端到端性能时去掉该参数。`--multi-graph-check` 可在计时前验证
-同 stream 上两张图（其中一张含两个 Get）及其中一张释放后的继续回放。
+多节点报告隔离、自动收集/捕获、两条 stream 上由调用方串行执行的图与 eager 共用输出。
 
 图对象由 Python 持有；Runtime 不创建或保存图。`kvaf.AclGraph` 直接封装
 `aclmdlRICaptureBegin`、`aclmdlRICaptureEnd`、`aclmdlRIExecuteAsync` 和 `aclmdlRIDestroy`；
-统一性能入口也支持 `--graph-api torch`。捕获前通过 `begin_get_graph` 准备配置、stream、
-输出和容量，捕获只提交 Get。回放前完成输入更新，计时只包含 replay 与 stream 等待。
-同一 Runtime 可在同一 stream 上串行回放多张图，每个 Get 节点使用独立租约。
-销毁一张图后结束它的全部租约；所有租约释放后才能关闭 Runtime。图租约存活时，
-Get 方向专用于图。同算法有多个图节点时，状态和 profile 查询通过 `graph_lease`
-选择节点；profiling 在准备图前开启，在销毁图并结束租约后关闭。
+统一性能入口也支持 `--graph-api torch`。`runtime.graph_resources()` 通过一次真实预热的
+`prepare(stream)` 自动收集各 Get，再用 `capture(stream)` 包住外部图捕获；模型继续
+调用普通 `batch_get`。底层显式 begin/end_get_graph 接口仍保留。
+单张图固定 stream，不同图可使用不同 stream；调用方保证图与普通 Get 不重叠使用共享资源，
+KVAF 不代理原生 replay 或自动安排跨 stream event。回放前完成输入更新，计时只包含
+replay 与 stream 等待。图销毁后 close 对应资源；所有图租约释放后才能关闭 Runtime。
+图状态和 profile 查询始终通过 `graph_lease` 选择节点（可从 `resources.leases` 取得）；
+省略租约查询 eager。profiling 在准备该实例图前开启，在全部租约结束后关闭。
 用法见 [Get 图模式](../docs/cache_transport_execution_implementation.md#get-图模式)。
 
 `batch_get(stream=None, synchronize=False)` 默认在 `torch.npu.current_stream()` 上提交。

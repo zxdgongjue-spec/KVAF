@@ -93,11 +93,13 @@ Status UmdkSession::Shutdown() {
   stream_ = nullptr;
   failed_ = false;
   registered_buffers_.clear();
-  graph_buffer_pins_.clear();
+  buffer_pins_.clear();
   return Status::OK();
 }
 
 Status UmdkSession::ReleaseBuffers() {
+  if (!buffer_pins_.empty())
+    return Status::Busy("output registrations are still referenced");
   if (failed_ && args_.op == UmdkControlOp::kUnregisterBuffers && pending_) {
     UmdkControlStatus status{};
     auto completed = CompletePending(status);
@@ -122,47 +124,52 @@ const UmdkSession::BufferRange* UmdkSession::FindBuffer(void* buffer, std::size_
       return &range;
   return nullptr;
 }
-Status UmdkSession::PinGraphBuffer(std::uint64_t region_base, void* buffer, std::size_t bytes) {
+Status UmdkSession::PinBuffer(std::uint64_t region_base, void* buffer, std::size_t bytes) {
   if (!connected_ || args_.remote_address != region_base)
-    return Status::InvalidState("prepare the Gather session before pinning a graph output");
+    return Status::InvalidState("prepare the Gather session before pinning an output");
   const auto* covering = FindBuffer(buffer, bytes);
   const BufferRange range = covering ? *covering
       : BufferRange{reinterpret_cast<std::uint64_t>(buffer), bytes};
   if (!covering) {
-    // A captured node must never depend on an overlapping registration owned
-    // by another node. Reuse a covering MR or register a disjoint range.
+    // Reuse a covering MR or register a disjoint range. Overlapping
+    // replacement would invalidate an existing consumer's registration.
     for (const auto& other : registered_buffers_) {
       const bool overlaps = range.first >= other.first
           ? range.first - other.first < other.second
           : other.first - range.first < range.second;
-      if (overlaps) return Status::InvalidArgument("Gather graph output partially overlaps an existing registration");
+      if (overlaps) return Status::InvalidArgument("Gather output partially overlaps an existing registration");
     }
     registered_buffers_.reserve(registered_buffers_.size() + 1);
   }
   // Allocate bookkeeping before the control kernel can register the buffer.
-  auto pin = graph_buffer_pins_.try_emplace(range, 0).first;
+  auto pin = buffer_pins_.try_emplace(range, 0).first;
   auto s = Ensure(region_base, buffer, bytes);
   if (s.ok()) ++pin->second;
   else {
-    if (!pin->second) graph_buffer_pins_.erase(pin);
+    if (!pin->second) buffer_pins_.erase(pin);
     if (failed_) return Status::CompletionUnknown(s.message());
   }
   return s;
 }
-Status UmdkSession::UnpinGraphBuffer(void* buffer, std::size_t bytes) {
+Status UmdkSession::UnpinBuffer(void* buffer, std::size_t bytes) {
   const auto* covering = FindBuffer(buffer, bytes);
-  if (!covering) return Status::NotFound("Gather graph output registration not found");
-  auto pin = graph_buffer_pins_.find(*covering);
-  if (pin == graph_buffer_pins_.end()) return Status::NotFound("Gather graph output pin not found");
+  if (!covering) return Status::NotFound("Gather output registration not found");
+  auto pin = buffer_pins_.find(*covering);
+  if (pin == buffer_pins_.end()) return Status::NotFound("Gather output pin not found");
   if (pin->second > 1) {
     --pin->second;
     return Status::OK();
   }
-  auto s = ReleaseBuffer(reinterpret_cast<void*>(pin->first.first), pin->first.second);
-  if (s.ok()) graph_buffer_pins_.erase(pin);
+  auto s = RetireBuffer(reinterpret_cast<void*>(pin->first.first), pin->first.second);
+  if (s.ok()) buffer_pins_.erase(pin);
   return s;
 }
 Status UmdkSession::ReleaseBuffer(void* buffer, std::size_t bytes) {
+  const auto* covering = FindBuffer(buffer, bytes);
+  if (covering && buffer_pins_.count(*covering)) return Status::OK();
+  return RetireBuffer(buffer, bytes);
+}
+Status UmdkSession::RetireBuffer(void* buffer, std::size_t bytes) {
   const auto address = reinterpret_cast<std::uint64_t>(buffer);
   const auto found = std::find(registered_buffers_.begin(), registered_buffers_.end(),
                               std::make_pair(address, bytes));
@@ -213,6 +220,15 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
     if (FindBuffer(output, output_bytes)) return Status::OK();
     if (prepared_only)
       return Status::InvalidState("AICPU BatchGet output is not registered; warm up outside capture");
+    // The device registration cache may replace overlapping entries. Never
+    // invalidate an MR still held by a graph, binding, or pending eager call.
+    for (const auto& [range, references] : buffer_pins_) {
+      const bool overlaps = address >= range.first
+          ? address - range.first < range.second
+          : range.first - address < output_bytes;
+      if (references && overlaps)
+        return Status::Busy("output overlaps a pinned Gather registration");
+    }
     args_.local_buffer = address;
     args_.buffer_bytes = output_bytes;
     UmdkControlStatus registered{};
@@ -222,6 +238,8 @@ Status UmdkSession::Ensure(std::uint64_t region_base, void* output, std::size_t 
   }
   if (prepared_only)
     return Status::InvalidState("AICPU BatchGet session is not prepared; warm up outside capture");
+  if (!buffer_pins_.empty())
+    return Status::Busy("cannot replace a session with pinned output registrations");
   auto result = Shutdown();
   if (!result.ok()) return result;
   peer::PeerRegion region;

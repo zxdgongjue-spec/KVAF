@@ -75,9 +75,9 @@ Status AicpuExecutionResources::Bind(ExecutionState* state) {
   if (!call || call->owner != this)
     return Status::InvalidArgument("AICPU invocation belongs to another resource");
   if (state_->invocation != call &&
-      (state_->invocation->output_bound || state_->invocation->input_bound ||
+      (state_->invocation->input_bound ||
        (state_->invocation->graph_active && !state_->invocation->graph_node)))
-    return Status::Busy("release input/output binding before replacing invocation");
+    return Status::Busy("release input binding before replacing invocation");
   auto bound = state_->put.BindExecutionState(call->put.get());
   if (!bound.ok()) return bound;
   // The dispatcher marks graph nodes after CreateInvocation(). Forward the
@@ -155,8 +155,14 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
       (request.request->output.data != state_->invocation->get_output.data ||
        request.request->output.bytes != state_->invocation->get_output.bytes))
     return Status::InvalidArgument("request differs from bound Get output");
-  state_->invocation->get_output = request.request->output;
-  return state_->get.Prepare(request, call.graph_active);
+  call.get_output = request.request->output;
+  auto ready = state_->get.Prepare(request, call.graph_active);
+  if (ready.ok() && !call.graph_active && !call.output_bound && !call.output_pinned) {
+    ready = state_->get_session.PinBuffer(state_->get.View().remote_workspace.base,
+                                         call.get_output.data, call.get_output.bytes);
+    if (ready.ok()) call.output_pinned = true;
+  }
+  return ready;
 }
 Status AicpuExecutionResources::ReleasePutBuffers() {
   // Ordinary calls retire temporary input; explicit bindings own it until End.
@@ -207,8 +213,10 @@ Status AicpuExecutionResources::FinishPutInput() {
 Status AicpuExecutionResources::ReleaseGetBuffers() {
   auto& call = *state_->invocation;
   if (call.output_bound || call.graph_active || !call.get_output.valid()) return Status::OK();
-  auto s = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
-  if (s.ok()) call.get_output = {};
+  auto s = call.output_pinned
+      ? state_->get_session.UnpinBuffer(call.get_output.data, call.get_output.bytes)
+      : state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
+  if (s.ok()) { call.get_output = {}; call.output_pinned = false; }
   return s;
 }
 Status AicpuExecutionResources::PrepareGetGraph(const GetGraphOptions& options) {
@@ -277,8 +285,15 @@ Status AicpuExecutionResources::FinishGetGraph(void* stream, bool discard) {
     return Close();
   }
   if (!scatter()) {
-    auto retired = state_->get_session.UnpinGraphBuffer(call.get_output.data, call.get_output.bytes);
-    if (!retired.ok()) return retired;
+    auto retired = state_->get_session.UnpinBuffer(call.get_output.data, call.get_output.bytes);
+    if (!retired.ok()) {
+      // FinishGraph already fenced this node. A failed registration control
+      // operation can make individual unpins permanently unavailable; retain
+      // the output and let the dispatcher close the whole shared session once
+      // every graph using it has stopped.
+      call.graph_close_required = true;
+      return retired;
+    }
   }
   call.graph_active = call.graph_recorded = call.graph_retiring = false;
   call.graph_options = {};
@@ -305,9 +320,9 @@ Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options
   if (s.ok()) s = state_->get.Warmup();
   if (!s.ok()) return s;
   call.get_output = options.output;
-  s = state_->get_session.Ensure(state_->get.View().remote_workspace.base,
-                                 options.output.data, options.output.bytes);
-  if (s.ok()) call.output_bound = true;
+  s = state_->get_session.PinBuffer(state_->get.View().remote_workspace.base,
+                                    options.output.data, options.output.bytes);
+  if (s.ok()) call.output_bound = call.output_pinned = true;
   return s;
 }
 Status AicpuExecutionResources::FinishGetOutput() {
@@ -316,8 +331,8 @@ Status AicpuExecutionResources::FinishGetOutput() {
   auto s = state_->DrainGet();
   if (!s.ok()) return s;
   auto& call = *state_->invocation;
-  s = state_->get_session.ReleaseBuffer(call.get_output.data, call.get_output.bytes);
-  if (s.ok()) { call.get_output = {}; call.output_bound = false; }
+  s = state_->get_session.UnpinBuffer(call.get_output.data, call.get_output.bytes);
+  if (s.ok()) { call.get_output = {}; call.output_bound = call.output_pinned = false; }
   return s;
 }
 UrmaAicpuPutView AicpuExecutionResources::PutView() {
@@ -404,7 +419,7 @@ Status AicpuExecutionResources::Close() {
   }
   state_->initialized = false;
   state_->invocation->get_output = {};
-  state_->invocation->output_bound = false;
+  state_->invocation->output_bound = state_->invocation->output_pinned = false;
   state_->invocation->graph_active = state_->invocation->graph_recorded = false;
   state_->invocation->graph_retiring = state_->invocation->graph_close_required = false;
   state_->invocation->graph_options = {};

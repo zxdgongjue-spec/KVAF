@@ -167,7 +167,8 @@ ready 用高 32 位 sequence、低 32 位 chunk 数编码；done 在同一个 64
 请求序号由设备 ticket 推进，达到 uint32 上限后要求重建相应执行资源。
 空前缀不通知 CPU、不修改输出；CPU 允许此类调用造成的序号间隔。
 普通 stream enqueue 和 graph replay 使用相同的设备序号机制；图租约固定
-算法、stream、输出和容量；每个 Get 节点使用独立租约，同一 Runtime 的存活图共用一个 stream。
+算法、stream、输出和容量；每个 Get 节点使用独立租约和报告。可用 `graph_resources()`
+自动收集节点；不同图可使用不同 stream，与普通 Get 的串行顺序由调用方保证。
 捕获与结束流程见实现文档。
 
 CPU 数据面沿用该提交 V24 的 prepared WRITE、indexed CQ 和轮转 CQ 扫描，

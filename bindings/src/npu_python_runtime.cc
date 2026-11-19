@@ -1,5 +1,6 @@
 #include <mutex>
 #include <unordered_map>
+#include <thread>
 #include "npu_python_runtime.h"
 
 #include <pybind11/stl.h>
@@ -266,6 +267,8 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
   result["device_span_us"] = profile.worker_count ? (last - first) / 1000.0 : 0.0;
   return result;
 }
+
+class PythonGetGraphResources;
 
 class NpuPythonRuntime final {
  public:
@@ -629,6 +632,8 @@ class NpuPythonRuntime final {
       py::gil_scoped_release release;
       direction.lock();
     }
+    ApplyGraphScope(output, output_view, index_view.bytes / sizeof(std::int32_t),
+                    acl_stream, synchronize, profile, execution, graph_lease, output_lease);
     if (graph_lease) {
       graph_ref = graph_refs_.find(graph_lease);
       if (graph_ref != graph_refs_.end())
@@ -648,6 +653,7 @@ class NpuPythonRuntime final {
       if (status.ok()) pending_get_refs_.clear();  // Native completed the preceding Get.
       if (!status.ok() || !synchronize) pending_get_refs_.push_back(std::move(refs));
     }
+    FinishGraphScopeGet(status.ok());
     ThrowIfError(status);
     if (!profile) return py::none();
     const auto end = BatchGetProfileNowNs();
@@ -890,6 +896,12 @@ class NpuPythonRuntime final {
   }
 
  private:
+  friend class PythonGetGraphResources;
+  void ApplyGraphScope(const py::object&, const NpuTensorView&, std::size_t, aclrtStream,
+                       bool, bool, std::optional<GetExecutionConfig>&, std::uint64_t&,
+                       std::uint64_t);
+  void FinishGraphScopeGet(bool success);
+  PythonGetGraphResources* active_graph_scope_{nullptr};
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   std::mutex get_mutex_, put_mutex_;
   std::vector<py::object> pending_get_refs_;
@@ -899,6 +911,263 @@ class NpuPythonRuntime final {
   std::unordered_map<std::uint64_t, py::object> put_input_refs_;
   std::vector<py::object> pending_put_input_refs_;
 };
+
+// One owner per external model graph. It records a real eager forward, then
+// routes ordinary Python Get calls to independently prepared native nodes.
+// Scheduling and graph destruction remain the caller's responsibility.
+class PythonGetGraphResources : public std::enable_shared_from_this<PythonGetGraphResources> {
+ public:
+  explicit PythonGetGraphResources(py::object runtime)
+      : runtime_owner_(std::move(runtime)), runtime_(runtime_owner_.cast<NpuPythonRuntime*>()) {}
+  ~PythonGetGraphResources() {
+    // No implicit EndGraph: the external graph might still replay. Native graph
+    // refs retain allocations until explicit close or safe Runtime cleanup.
+    if (runtime_->active_graph_scope_ == this) runtime_->active_graph_scope_ = nullptr;
+  }
+
+  void Enter(bool capture, py::object stream) {
+    if (runtime_->active_graph_scope_)
+      throw py::value_error("a Get graph preparation/capture scope is already active on this Runtime");
+    if (capture ? state_ != State::Prepared : state_ != State::New)
+      throw py::value_error(capture ? "capture requires one successfully prepared forward"
+                                   : "graph resources may prepare only once; create a new owner");
+    if (stream.is_none()) stream = py::module_::import("torch").attr("npu").attr("current_stream")();
+    const auto native_stream = ResolveStream(stream);
+    RequireOutsideCapture(native_stream);
+    if (capture && native_stream != native_stream_)
+      throw py::value_error("one graph must prepare and capture on the same stream");
+    if (!capture) {
+      stream_ = std::move(stream);
+      native_stream_ = native_stream;
+    }
+    thread_ = std::this_thread::get_id();
+    cursor_ = 0;
+    state_ = capture ? State::Capturing : State::Preparing;
+    runtime_->active_graph_scope_ = this;
+  }
+
+  void Exit(bool capture, bool exception) {
+    if (runtime_->active_graph_scope_ != this || thread_ != std::this_thread::get_id())
+      throw py::value_error("Get graph scope must exit on its entering thread");
+    runtime_->active_graph_scope_ = nullptr;
+    const bool failed = exception || call_failed_ || pending_call_;
+    state_ = State::Failed;  // Every exception below keeps the owner retryable by close().
+    if (capture) {
+      capture_failed_ = true;
+      if (exception) return;
+      RequireOutsideCapture(native_stream_);
+      if (failed || cursor_ != nodes_.size())
+        throw py::value_error("Get capture did not match its prepared forward; destroy the graph and close(discard_result=True)");
+      state_ = State::Captured;
+      capture_failed_ = false;
+      return;
+    }
+    // A real warm-up may submit asynchronously. Complete it before registering
+    // graph nodes; never reinterpret a dry record as a completed warm-up.
+    try {
+      runtime_->DrainGet();
+      {
+        py::gil_scoped_release release;
+        ThrowIfAclError(aclrtSynchronizeStream(native_stream_), "complete graph warm-up forward");
+      }
+    } catch (...) {
+      if (!exception) throw;
+      return;
+    }
+    if (exception) return;
+    if (failed) throw py::value_error("a Get failed during preparation; close these resources and prepare a new owner");
+    if (nodes_.empty()) throw py::value_error("prepare must execute at least one BatchGet");
+    for (auto& node : nodes_) {
+      ValidateStorage(node.output, node);
+      node.lease = runtime_->BeginGetGraph(node.config, node.output, node.capacity, stream_);
+      // Retain the allocation itself as well as Tensor wrappers. A caller must
+      // still not resize/change storage through any alias while graph is live.
+      runtime_->graph_refs_.at(node.lease).push_back(node.storage);
+    }
+    state_ = State::Prepared;
+  }
+
+  void BeforeGet(const py::object& output, const NpuTensorView& view, std::size_t capacity,
+                 aclrtStream stream, bool synchronize, bool profile,
+                 std::optional<GetExecutionConfig>& execution, std::uint64_t& lease,
+                 std::uint64_t output_lease) {
+    try {
+      if (thread_ != std::this_thread::get_id())
+        throw py::value_error("Get graph scope may only submit from its entering thread");
+      if (call_failed_ || pending_call_)
+        throw py::value_error("Get graph scope already contains a failed call");
+      if (stream != native_stream_)
+        throw py::value_error("Get stream differs from the graph preparation/capture stream");
+      if (lease || output_lease)
+        throw py::value_error("automatic graph scopes cannot mix explicit graph/output leases");
+      const auto selected = execution ? execution : runtime_->native_->default_get();
+      if (!selected) throw py::value_error("graph Get requires an execution config or Runtime default");
+      if (!capacity || capacity > UINT32_MAX)
+        throw py::value_error("graph Get request capacity must fit uint32");
+      if (state_ == State::Preparing) {
+        RequireOutsideCapture(stream);
+        auto storage = Storage(output);
+        nodes_.push_back(Node{*selected, output, storage, StorageIdentity(storage),
+            StoragePointer(storage), StorageBytes(storage), view.data, view.bytes,
+            static_cast<std::uint32_t>(capacity), 0});
+      } else if (state_ == State::Capturing) {
+        if (synchronize || profile)
+          throw py::value_error("captured BatchGet requires synchronize=False and profile=False");
+        if (cursor_ == nodes_.size()) throw py::value_error("capture contains more Get nodes than prepare");
+        auto& node = nodes_[cursor_];
+        if (!(*selected == node.config) || capacity != node.capacity ||
+            view.data != node.data || view.bytes != node.bytes)
+          throw py::value_error("Get capture algorithm/output/capacity or call order differs from prepare");
+        ValidateStorage(output, node);
+        aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+        aclmdlRI graph = nullptr;
+        ThrowIfAclError(aclmdlRICaptureGetInfo(stream, &status, &graph), "query Get capture");
+        if (status != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE)
+          throw py::value_error("resources.capture must enclose an actual external graph capture");
+        if (captured_graph_ && captured_graph_ != graph)
+          throw py::value_error("one graph_resources owner cannot capture multiple external graphs");
+        captured_graph_ = graph;
+        execution = node.config;
+        lease = node.lease;
+        ++cursor_;
+      } else {
+        throw py::value_error("Get graph scope is not active");
+      }
+      pending_call_ = true;
+    } catch (...) {
+      call_failed_ = true;
+      throw;
+    }
+  }
+  void AfterGet(bool success) {
+    pending_call_ = false;
+    call_failed_ = call_failed_ || !success;
+  }
+
+  py::tuple Leases() const {
+    const auto count = std::count_if(nodes_.begin(), nodes_.end(), [](const Node& n) { return n.lease != 0; });
+    py::tuple ids(count);
+    std::size_t i = 0;
+    for (const auto& node : nodes_) if (node.lease) ids[i++] = node.lease;
+    return ids;
+  }
+
+  void Close(bool discard) {
+    if (state_ == State::Closed) return;
+    if (runtime_->active_graph_scope_)
+      throw py::value_error("exit the active Get graph scope before closing resources");
+    if (native_stream_) RequireOutsideCapture(native_stream_);
+    if (capture_failed_ && !discard)
+      throw py::value_error("failed capture requires graph destruction and close(discard_result=True)");
+    if (std::none_of(nodes_.begin(), nodes_.end(), [](const Node& n) { return n.lease != 0; }))
+      runtime_->DrainGet();
+    std::exception_ptr error;
+    // On a shared poisoned domain all nodes must first enter discard before
+    // any one may finish. Visit every node, then retry survivors once.
+    for (int pass = 0; pass < 2; ++pass) {
+      error = nullptr;
+      for (auto& node : nodes_) {
+        if (!node.lease) continue;
+        try {
+          runtime_->EndGetGraph(node.lease, stream_, discard || state_ == State::Prepared || !captured_graph_);
+          node.lease = 0;
+        } catch (...) {
+          if (!error) error = std::current_exception();
+        }
+      }
+      if (!error) break;
+    }
+    if (error) std::rethrow_exception(error);
+    nodes_.clear();
+    stream_ = py::object{};
+    state_ = State::Closed;
+  }
+
+ private:
+  enum class State { New, Preparing, Prepared, Capturing, Captured, Failed, Closed };
+  struct Node {
+    GetExecutionConfig config;
+    py::object output, storage;
+    std::uint64_t storage_id, storage_pointer, storage_bytes;
+    void* data;
+    std::size_t bytes;
+    std::uint32_t capacity;
+    std::uint64_t lease;
+  };
+  static py::object Storage(const py::object& output) {
+    if (!py::hasattr(output, "untyped_storage"))
+      throw py::type_error("automatic Get graph preparation requires a Tensor with untyped_storage");
+    return output.attr("untyped_storage")();
+  }
+  static std::uint64_t StorageIdentity(const py::object& storage) {
+    return storage.attr("_cdata").cast<std::uint64_t>();
+  }
+  static std::uint64_t StoragePointer(const py::object& storage) {
+    return storage.attr("data_ptr")().cast<std::uint64_t>();
+  }
+  static std::uint64_t StorageBytes(const py::object& storage) {
+    return storage.attr("nbytes")().cast<std::uint64_t>();
+  }
+  static void ValidateStorage(const py::object& output, const Node& node) {
+    auto storage = Storage(output);
+    const auto view = GetNpuTensorView(output, "graph output");
+    if (StorageIdentity(storage) != node.storage_id ||
+        StoragePointer(storage) != node.storage_pointer || StorageBytes(storage) != node.storage_bytes ||
+        view.data != node.data || view.bytes != node.bytes)
+      throw py::value_error("Get graph output allocation/range changed after preparation");
+  }
+  void RequireOutsideCapture(aclrtStream stream) const {
+    ThrowIfAclError(aclrtSetDevice(runtime_->DeviceId()), "select Get graph device");
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI graph = nullptr;
+    ThrowIfAclError(aclmdlRICaptureGetInfo(stream, &status, &graph), "query Get graph scope");
+    if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
+      throw py::value_error("prepare/close must run outside graph capture; enter resources.capture before torch.npu.graph");
+  }
+  py::object runtime_owner_, stream_;
+  NpuPythonRuntime* runtime_;
+  State state_{State::New};
+  std::thread::id thread_;
+  aclrtStream native_stream_{nullptr};
+  aclmdlRI captured_graph_{nullptr};
+  std::vector<Node> nodes_;
+  std::size_t cursor_{0};
+  bool call_failed_{false}, pending_call_{false}, capture_failed_{false};
+};
+
+class PythonGetGraphScope {
+ public:
+  PythonGetGraphScope(std::shared_ptr<PythonGetGraphResources> owner, py::object stream, bool capture)
+      : owner_(std::move(owner)), stream_(std::move(stream)), capture_(capture) {}
+  std::shared_ptr<PythonGetGraphResources> Enter() {
+    if (entered_) throw py::value_error("Get graph scope may only be entered once");
+    owner_->Enter(capture_, stream_);
+    entered_ = true;
+    return owner_;
+  }
+  bool Exit(const py::object& type, const py::object&, const py::object&) {
+    if (!entered_ || exited_) throw py::value_error("Get graph scope is not active");
+    exited_ = true;
+    owner_->Exit(capture_, !type.is_none());
+    return false;
+  }
+ private:
+  std::shared_ptr<PythonGetGraphResources> owner_;
+  py::object stream_;
+  bool capture_, entered_{false}, exited_{false};
+};
+
+void NpuPythonRuntime::ApplyGraphScope(const py::object& output, const NpuTensorView& view,
+                                     std::size_t capacity, aclrtStream stream, bool synchronize,
+                                     bool profile, std::optional<GetExecutionConfig>& config,
+                                     std::uint64_t& lease, std::uint64_t output_lease) {
+  if (active_graph_scope_)
+    active_graph_scope_->BeforeGet(output, view, capacity, stream, synchronize, profile,
+                                  config, lease, output_lease);
+}
+void NpuPythonRuntime::FinishGraphScopeGet(bool success) {
+  if (active_graph_scope_) active_graph_scope_->AfterGet(success);
+}
 
 }  // namespace
 
@@ -910,9 +1179,27 @@ void BindNpuPythonRuntime(py::module_& module) {
         return table.source().opaque;
       });
 
+  py::class_<PythonGetGraphScope, std::shared_ptr<PythonGetGraphScope>>(module, "_GetGraphScope")
+      .def("__enter__", &PythonGetGraphScope::Enter)
+      .def("__exit__", &PythonGetGraphScope::Exit);
+  py::class_<PythonGetGraphResources, std::shared_ptr<PythonGetGraphResources>>(module, "GetGraphResources")
+      .def("prepare", [](std::shared_ptr<PythonGetGraphResources> self, py::object stream) {
+        return std::make_shared<PythonGetGraphScope>(std::move(self), std::move(stream), false);
+      }, py::arg("stream") = py::none(), "Run one real eager forward and prepare its Get nodes on scope exit.")
+      .def("capture", [](std::shared_ptr<PythonGetGraphResources> self, py::object stream) {
+        return std::make_shared<PythonGetGraphScope>(std::move(self), std::move(stream), true);
+      }, py::arg("stream") = py::none(), "Enclose external graph capture; ordinary Gets consume prepared nodes in order.")
+      .def_property_readonly("leases", &PythonGetGraphResources::Leases,
+          "Native node leases in forward order, for per-node status/profile queries.")
+      .def("close", &PythonGetGraphResources::Close, py::kw_only(), py::arg("discard_result") = false,
+          "Stop replay, synchronize and destroy the external graph before close. Failure retains resources for retry.");
+
   auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
   python_binding::BindNpuRuntimeConstructor(runtime);
   runtime
+      .def("graph_resources", [](py::object self) {
+        return std::make_shared<PythonGetGraphResources>(std::move(self));
+      }, "Create resources for one model graph. Caller orders graph/eager execution and destroys the graph before close.")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"), py::arg("slot_size"))
