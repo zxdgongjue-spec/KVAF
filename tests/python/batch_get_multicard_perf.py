@@ -16,13 +16,16 @@ import subprocess
 import sys
 import time
 
+import batch_get_profiler_overlap as profiler_overlap
+
 
 ARRIVED = b"R"
 REPLAY = b"G"
 STOP = b"S"
+REPLAY_TIMEOUT_SECONDS = 60
 
 
-def measure_barrier_replays(graphs, stream, barrier_fd):
+def measure_barrier_replays(graphs, stream, barrier_fd, profiler=None):
     begin = end = 0.0
     replays = 0
     with socket.socket(fileno=barrier_fd) as barrier:
@@ -36,9 +39,18 @@ def measure_barrier_replays(graphs, stream, barrier_fd):
                 raise RuntimeError("BatchGet barrier closed before the round was released")
             if replays == 0:
                 begin = time.monotonic()
-            graph.replay(stream)
-            graph.synchronize(stream)
+            profiling_round = profiler is not None and replays < profiler.total_steps
+            if not profiling_round:
+                graph.replay(stream)
+                graph.synchronize(stream)
+            else:
+                with profiler.range(replays, "graph_replay"):
+                    graph.replay(stream)
+                with profiler.range(replays, "wait_completion"):
+                    graph.synchronize(stream)
             end = time.monotonic()
+            if profiling_round:
+                profiler.step()
             replays += 1
 
 
@@ -95,31 +107,35 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
                 graph.replay(stream)
                 graph.synchronize(stream)
 
-        print(f"MULTICARD_READY device={device}", flush=True)
-        (control / f"ready_{device}").touch()
-        while not (control / "start.json").exists():
-            if (control / "abort").exists():
-                raise RuntimeError("multi-card run aborted before start")
-            time.sleep(0.02)
-        window = json.loads((control / "start.json").read_text())
-        remaining = window["start"] - time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
-        if barrier_fd is not None:
-            begin, end, replays = measure_barrier_replays(graphs, stream, barrier_fd)
-        else:
-            graph = graphs[0]
-            begin = time.monotonic()
-            replays = 0
-            while time.monotonic() < window["stop"]:
+        profiler = None
+        if args.torch_npu_profiler:
+            profiler = profiler_overlap.BatchGetProfiler(
+                torch, control / f"profiler_device_{device}", device, args.profiler_warmup, args.profiler_active)
+        with profiler if profiler is not None else contextlib.nullcontext():
+            print(f"MULTICARD_READY device={device}", flush=True)
+            (control / f"ready_{device}").touch()
+            while not (control / "start.json").exists():
                 if (control / "abort").exists():
-                    raise RuntimeError("multi-card run aborted during measurement")
-                graph.replay(stream)
-                graph.synchronize(stream)
-                replays += 1
-            end = time.monotonic()
-        if not replays:
-            raise RuntimeError("worker missed the measurement window")
+                    raise RuntimeError("multi-card run aborted before start")
+                time.sleep(0.02)
+            window = json.loads((control / "start.json").read_text())
+            remaining = window["start"] - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            if barrier_fd is not None:
+                begin, end, replays = measure_barrier_replays(graphs, stream, barrier_fd, profiler)
+            else:
+                graph = graphs[0]
+                replays = window["graph_replays"]
+                begin = time.monotonic()
+                for _ in range(replays):
+                    if (control / "abort").exists():
+                        raise RuntimeError("multi-card run aborted during measurement")
+                    graph.replay(stream)
+                    graph.synchronize(stream)
+                end = time.monotonic()
+        if replays != window["graph_replays"]:
+            raise RuntimeError(f"completed {replays} graph replays, expected {window['graph_replays']}")
         check_output(plan_groups[(replays - 1) % len(graphs)][-1])
         calls_per_graph = len(plan_groups[0])
         calls = replays * calls_per_graph
@@ -128,10 +144,12 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output):
             "device": device, "start": begin, "end": end,
             "calls": calls, "payload_bytes": payload_bytes,
             "bandwidth_GBps": payload_bytes / (end - begin) / 1e9,
-            "graph_calls": calls_per_graph, "graph_count": len(graphs), "verified": True,
+            "graph_calls": calls_per_graph, "graph_count": len(graphs), "graph_replays": replays, "verified": True,
         }
         args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
         print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)
+        if profiler is not None:
+            profiler.export(replays)
     finally:
         try:
             if graphs:
@@ -147,9 +165,9 @@ def worker_error(device, process, log_path, phase):
     )
 
 
-def release_barrier_rounds(barriers, children, stop, deadline):
-    rounds = 0
-    while True:
+def release_barrier_rounds(barriers, children, replays):
+    for completed in range(replays + 1):
+        deadline = time.monotonic() + REPLAY_TIMEOUT_SECONDS
         for device, process, log_path in children:
             barrier = barriers[device]
             remaining = deadline - time.monotonic()
@@ -163,17 +181,13 @@ def release_barrier_rounds(barriers, children, stop, deadline):
             if arrived != ARRIVED:
                 raise worker_error(device, process, log_path, "left the BatchGet barrier")
 
-        # Every worker has finished the previous replay. Make the stop decision
-        # once for the entire group so all workers complete the same rounds.
-        command = REPLAY if time.monotonic() < stop else STOP
+        # All workers arrive once more after completing the last replay.
+        command = STOP if completed == replays else REPLAY
         for device, process, log_path in children:
             try:
                 barriers[device].sendall(command)
             except OSError as error:
                 raise worker_error(device, process, log_path, f"BatchGet barrier send failed ({error})") from error
-        if command == STOP:
-            return rounds
-        rounds += 1
 
 
 def run_group(args, devices, directory):
@@ -185,6 +199,11 @@ def run_group(args, devices, directory):
     children = []
     logs = []
     barriers = {}
+    profile = args.torch_npu_profiler and len(devices) > 1
+    export_timeout = profiler_overlap.PROFILER_EXPORT_TIMEOUT_SECONDS if profile else 0
+    measurement_timeout = (args.graph_replays + 1) * REPLAY_TIMEOUT_SECONDS
+    calls_per_replay = 1 if args.barrier_per_call else args.graph_calls
+    expected_calls = args.graph_replays * calls_per_replay
     try:
         for device in devices:
             log_path = directory / f"device_{device}.log"
@@ -192,7 +211,8 @@ def run_group(args, devices, directory):
             logs.append(log)
             env = dict(os.environ, DEVICE_ID=str(device),
                        KVAF_CPU_SERVICE_ADDR=args.peer, PYTHONUNBUFFERED="1")
-            env["KVAF_REMOTE_CPU_PERF_TIMEOUT"] = str(math.ceil(args.ready_timeout + args.seconds + 60))
+            env["KVAF_REMOTE_CPU_PERF_TIMEOUT"] = str(
+                math.ceil(args.ready_timeout) + measurement_timeout + REPLAY_TIMEOUT_SECONDS + export_timeout)
             command = [
                 str(runner), str(args.build_dir),
                 "--transport", args.transport,
@@ -208,6 +228,9 @@ def run_group(args, devices, directory):
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
             ]
+            if profile:
+                command.extend(("--torch-npu-profiler", "--profiler-warmup", str(args.profiler_warmup),
+                                "--profiler-active", str(args.profiler_active)))
             with contextlib.ExitStack() as child_resources:
                 pass_fds = ()
                 if args.barrier_per_call or args.barrier_per_graph:
@@ -231,17 +254,17 @@ def run_group(args, devices, directory):
             time.sleep(0.05)
         start = time.monotonic() + 0.25
         temporary = directory / "start.tmp"
-        stop = start + args.seconds
-        temporary.write_text(json.dumps({"start": start, "stop": stop}))
+        temporary.write_text(json.dumps({"start": start, "graph_replays": args.graph_replays}))
         temporary.replace(directory / "start.json")
-        print(f"MULTICARD_MEASURE phase={directory.name} devices={devices} seconds={args.seconds}", flush=True)
-        deadline = stop + 60
+        print(f"MULTICARD_MEASURE phase={directory.name} devices={devices} graph_replays={args.graph_replays}",
+              flush=True)
+        deadline = start + measurement_timeout
         if barriers:
-            rounds = release_barrier_rounds(barriers, children, stop, deadline)
-            calls_per_replay = args.graph_calls if args.barrier_per_graph else 1
-            expected_calls = rounds * calls_per_replay
-            print(f"MULTICARD_BARRIER_DONE phase={directory.name} rounds={rounds} "
+            release_barrier_rounds(barriers, children, args.graph_replays)
+            deadline = time.monotonic() + REPLAY_TIMEOUT_SECONDS
+            print(f"MULTICARD_BARRIER_DONE phase={directory.name} rounds={args.graph_replays} "
                   f"calls_per_replay={calls_per_replay}", flush=True)
+        deadline += export_timeout
         while any(process.poll() is None for _, process, _ in children):
             for device, process, log_path in children:
                 if process.poll() not in (None, 0):
@@ -256,9 +279,9 @@ def run_group(args, devices, directory):
         for device, result in zip(devices, results):
             if result["device"] != device or not result["verified"] or result["end"] <= result["start"]:
                 raise RuntimeError(f"invalid result for device {device}")
-            if barriers and result["calls"] != expected_calls:
+            if result["calls"] != expected_calls:
                 raise RuntimeError(f"device {device} completed {result['calls']} calls, "
-                                   f"expected {expected_calls} for {rounds} barrier rounds")
+                                   f"expected {expected_calls} for {args.graph_replays} graph replays")
         return results
     finally:
         for barrier in barriers.values():
@@ -287,6 +310,37 @@ def markdown_table(headers, rows):
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
     lines += ["| " + " | ".join(str(value) for value in row) + " |" for row in rows]
     return "\n".join(lines)
+
+
+def write_overlap_summary(directory, concurrent, config, report_path):
+    first = config["profiler_warmup"]
+    stop = first + config["profiler_active"]
+    round_indices = range(first, stop)
+    kernel_name = profiler_overlap.KERNEL_NAMES[config["transport"]]
+    timelines = {}
+    for result in concurrent:
+        device, ring = result["device"], result["graph_calls"]
+        replays = result["calls"] // ring
+        if replays < stop:
+            raise RuntimeError(f"device {device}: profiler needs {stop} replay rounds, completed {replays}. "
+                               "Increase the run length or reduce --profiler-warmup/--profiler-active.")
+        timelines[device] = profiler_overlap.load_device_rounds(
+            directory / "concurrent" / f"profiler_device_{device}", device, kernel_name, ring, round_indices)
+    stats = profiler_overlap.overlap_bandwidth(timelines, round_indices, config["requests"] * config["token_bytes"])
+    print(f"\nMULTICARD_PROFILER_OVERLAP rounds={len(round_indices)} kernel={kernel_name}")
+    print("device  overlap_selected_gets  overlap_selected_kernel_ns  overlap_mean_GBps")
+    rows = []
+    for device, values in stats.items():
+        rate = values["overlap_mean_GBps"]
+        bandwidth = f"{rate:.3f}" if rate is not None else "n/a"
+        selected = values["overlap_selected_gets"]
+        duration = values["overlap_selected_kernel_ns"]
+        print(f"{device:6d}  {selected:21d}  {duration:26d}  {bandwidth:>17s}")
+        rows.append((device, selected, duration, bandwidth))
+    with report_path.open("a", encoding="utf-8") as output:
+        output.write(f"\n## 公共设备窗口内的 BatchGet 带宽\n\n"
+                     f"统计 {len(round_indices)} 轮，每卡完整落入公共窗口的 Get 有效字节数除以其 kernel 耗时之和。\n\n")
+        output.write(markdown_table(["设备", "入选 Get 数", "kernel 总耗时（ns）", "带宽（GB/s）"], rows) + "\n")
 
 
 def write_summary(directory, isolated, concurrent, config=None):
@@ -352,7 +406,8 @@ def write_summary(directory, isolated, concurrent, config=None):
     (directory / "aggregate.json").write_text(json.dumps(aggregate, indent=2) + "\n")
     metadata = {key: config[key] for key in (
         "transport", "aiv_cores", "requests", "token_bytes", "table_capacity", "tokens_per_block",
-        "seconds", "graph_calls", "barrier_per_call", "barrier_per_graph", "concurrent_only", "warmup", "seed", "peer",
+        "graph_replays", "seconds", "graph_calls", "barrier_per_call", "barrier_per_graph", "concurrent_only",
+        "warmup", "seed", "peer",
         "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total",
     ) if key in config}
@@ -382,13 +437,16 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("每批有效搬运量", f"{config['requests']} × {config['token_bytes']} B = {config['requests'] * config['token_bytes'] / 2**20:g} MiB"),
             ("地址表布局", f"{config['table_capacity']} 个表项，{config['tokens_per_block']} token / 块"),
             ("CPU DDR 数据区", f"每卡独立 {per_device / 2**20:g} MiB；并发合计 {len(concurrent) * per_device / 2**30:g} GiB"),
-            ("每阶段测量时长", f"{config['seconds']:g} s"),
             ("Graph 数 / 卡", config["graph_calls"] if config.get("barrier_per_call") else 1),
             ("每张 Graph 的 BatchGet 次数", 1 if config.get("barrier_per_call") else config["graph_calls"]),
             ("预热", f"{config['warmup']} 次 Graph 回放"),
             ("访问模式 / 随机种子", f"随机读取、连续输出；seed={config['seed']}"),
             ("CPU service", config["peer"]),
         ]
+        if "graph_replays" in config:
+            settings.append(("每阶段计时回放次数 / 卡", config["graph_replays"]))
+        else:
+            settings.append(("每阶段测量时长", f"{config['seconds']:g} s"))
         if config["transport"] == "urma":
             settings += [(label, config[key]) for label, key in (
                 ("Jetty 数 / AIV 核", "jettys_per_core"),
@@ -419,9 +477,12 @@ def write_summary(directory, isolated, concurrent, config=None):
         report += ["总保留比例和下降比例使用并发总吞吐计算。", ""]
     if aggregate["overlap_percent"] < 95:
         report += ["测量窗口重叠率不足 95%，需检查子进程日志后再判断带宽竞争。", ""]
-    (directory / "report.md").write_text("\n".join(report))
+    report_path = directory / "report.md"
+    report_path.write_text("\n".join(report), encoding="utf-8")
     print("MULTICARD_AGGREGATE " + " ".join(f"{k}={v:.3f}" for k, v in aggregate.items()))
-    print(f"MULTICARD_REPORT path={directory / 'report.md'}")
+    if config.get("torch_npu_profiler"):
+        write_overlap_summary(directory, concurrent, config, report_path)
+    print(f"MULTICARD_REPORT path={report_path}")
     if aggregate["overlap_percent"] < 95:
         raise RuntimeError("measurement windows overlapped less than 95%; inspect worker logs before judging contention")
 
@@ -477,7 +538,8 @@ def main(argv=None):
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
     parser.add_argument("--aiv-cores", nargs="+", type=int,
                         help="AIV cores per card to sweep; environment: KVAF_BATCH_GET_AIV_CORES (default: 16)")
-    parser.add_argument("--seconds", type=float, default=10)
+    parser.add_argument("--graph-replays", type=int, default=100,
+                        help="timed graph replays per card in each phase (default: 100)")
     parser.add_argument("--concurrent-only", action="store_true",
                         help="run the selected devices together without measuring isolated baselines")
     parser.add_argument("--graph-calls", type=int,
@@ -487,6 +549,7 @@ def main(argv=None):
                                help="capture a separate graph for each call and synchronize each replay")
     barrier_group.add_argument("--barrier-per-graph", action="store_true",
                                help="capture all calls in one graph and synchronize each full graph replay")
+    profiler_overlap.add_profiler_args(parser, enabled_by_default=True)
     parser.add_argument("--requests", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--table-capacity", type=int, default=4096)
@@ -519,9 +582,19 @@ def main(argv=None):
         parser.error("--aiv-cores requires distinct positive core counts")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
+    if args.graph_replays < 1:
+        parser.error("--graph-replays must be positive")
+    if args.torch_npu_profiler:
+        if not args.barrier_per_call:
+            args.barrier_per_graph = True
+        error = profiler_overlap.validate_profiler_args(args)
+        if error:
+            parser.error(error)
+        args.profiler_warmup = min(args.profiler_warmup, args.graph_replays - 1)
+        args.profiler_active = min(args.profiler_active, args.graph_replays - args.profiler_warmup)
     if args.graph_calls is None:
         args.graph_calls = 1 if args.barrier_per_call else 256
-    for name in ("seconds", "graph_calls", "requests", "token_bytes", "table_capacity", "tokens_per_block", "ready_timeout"):
+    for name in ("graph_calls", "requests", "token_bytes", "table_capacity", "tokens_per_block", "ready_timeout"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -538,7 +611,8 @@ def main(argv=None):
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
           f"barrier_per_call={int(args.barrier_per_call)} barrier_per_graph={int(args.barrier_per_graph)} "
-          f"graph_calls={args.graph_calls} concurrent_only={int(args.concurrent_only)} "
+          f"graph_calls={args.graph_calls} graph_replays={args.graph_replays} "
+          f"concurrent_only={int(args.concurrent_only)} torch_npu_profiler={int(args.torch_npu_profiler)} "
           f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "
           f"max_inflight_total={args.max_inflight_total if args.transport == 'urma' else 'n/a'} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "

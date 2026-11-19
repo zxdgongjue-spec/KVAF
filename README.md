@@ -341,13 +341,14 @@ AICPU 性能测试分别使用 [Gather sweep](tests/run_aicpu_gather_read_sweep.
 [Scatter sweep](tests/run_aicpu_cpu_push_scatter_sweep.sh)，构建目录参数均可填写
 `"$PWD/build-npu"`。默认按 100 GiB DDR 预算计算源池容量，`--table-capacity` 可指定源块数量。
 
-多卡 BatchGet 默认只在测量窗口开始前对齐各卡。需要在每次计时的 BatchGet 前同步时，
-启用 `--barrier-per-call`：
+多卡 BatchGet 使用 `--graph-replays` 指定每卡每阶段的计时回放次数，默认 100 次。
+校验和 benchmark 预热的回放另计。需要在每次计时的 BatchGet 前同步时，启用
+`--barrier-per-call`。
 
 ```bash
 tests/run_remote_cpu_batch_get_multicard_perf.sh "$PWD/build-npu" \
   --transport ubmem --peer 127.0.0.1:28999 --devices 0 1 2 3 4 5 6 7 \
-  --table-capacity 64 --barrier-per-call --graph-calls 256
+  --table-capacity 64 --barrier-per-call --graph-calls 256 --graph-replays 512
 ```
 
 此模式将 `--graph-calls` 组请求分别录成单次 BatchGet Graph，计时阶段按录制顺序循环
@@ -355,10 +356,21 @@ tests/run_remote_cpu_batch_get_multicard_perf.sh "$PWD/build-npu" \
 的 Host 同步等待，报告会标明此模式。Graph 数受设备和 CANN 的可用录图资源限制。
 
 使用 `--barrier-per-graph --graph-calls 256` 可以每卡把 256 次 BatchGet 录进同一张
-ACL Graph。每轮一起回放整张图，等所有卡完成后再开始下一轮。两个 barrier 参数互斥。
+ACL Graph。每轮一起回放整张图，等所有卡完成后再开始下一轮。例如 `--graph-replays 100`
+对应每卡执行 25,600 次计时 BatchGet。两个 barrier 参数互斥。
 
 采集多卡并发 profile 时可加 `--concurrent-only`，让 `--devices` 指定的卡直接进入
 同一组并发测试。报告会给出每卡并发带宽、总吞吐和测量窗口重叠率。
+
+并发阶段默认开启 `--torch-npu-profiler`，并选择 `--barrier-per-graph`，也可显式选择
+`--barrier-per-call`。终端和 `report.md` 会追加每卡的 kernel 带宽。关闭采集可用
+`--no-torch-npu-profiler`，此时可按需显式指定 barrier。
+默认跳过 1 轮 profiler 预热（`--profiler-warmup`），采集接下来的 3 轮（`--profiler-active`）。
+回放次数较少时会缩短采集计划，至少采集 1 轮。
+每轮用各卡首尾 Get 的设备执行区间取交集，只统计完整落入交集的 Get。
+`overlap_mean_GBps` 用入选 Get 的有效字节总数除以 kernel 耗时之和，单位为十进制 GB/s。
+没有完整 Get 的卡会显示 `n/a`。采集只在并发阶段开启，采集开销会影响本次墙钟吞吐。
+该选项由脚本自身采集时间线，请直接运行脚本。
 
 ### 6. 无 NPU 的主机回归
 

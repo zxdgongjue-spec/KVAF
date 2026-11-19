@@ -44,6 +44,7 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backend import detect_torch_backend
+from batch_get_profiler_overlap import add_profiler_args, validate_profiler_args
 from dsa_keys import build_dsa_keys
 from npu_eids import parse_npu_eids
 from batch_get_workload import token_pattern
@@ -306,6 +307,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     parser.add_argument("--contention-barrier-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--contention-barrier-per-graph", action="store_true", help=argparse.SUPPRESS)
+    add_profiler_args(parser, hidden=True)
     args = parser.parse_args(argv)
     args.backend_explicit = args.backend is not None
     expected_transport = "ubmem" if args.backend == "ubmem" else "urma"
@@ -398,6 +400,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "barrier requires contention mode and a valid socket descriptor"
     if args.contention_barrier_per_graph and args.contention_barrier_fd is None:
         return "per-graph barrier requires a socket descriptor"
+    if args.torch_npu_profiler:
+        if args.contention_barrier_fd is None:
+            return "--torch-npu-profiler requires a synchronized multi-card replay"
+        return validate_profiler_args(args)
     return None
 
 

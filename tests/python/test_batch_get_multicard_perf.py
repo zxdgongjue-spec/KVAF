@@ -29,6 +29,8 @@ device = int(os.environ["DEVICE_ID"])
 assert option("--token-bytes") == "656"
 assert option("--table-capacity") == "4096"
 assert "--no-kernel-profile" in sys.argv
+profile = "--torch-npu-profiler" in sys.argv
+assert directory.name == "concurrent" or not profile
 transport = option("--transport")
 assert transport == os.environ["EXPECTED_TRANSPORT"]
 assert option("--aiv-cores") in os.environ["EXPECTED_CORES"].split()
@@ -47,12 +49,14 @@ while not (directory / "start.json").exists():
 devices = os.environ["EXPECTED_DEVICES"].split() if directory.name == "concurrent" else [device]
 assert all((directory / f"ready_{d}").exists() for d in devices)
 window = json.loads((directory / "start.json").read_text())
-# Synthetic results use the coordinator's timestamps; no worker clock is needed.
-calls = 100
+# Synthetic results use the same interval across workers.
+replays = window["graph_replays"]
+graph_calls = int(option("--contention-graph-calls"))
+time.sleep(max(0, window["start"] - time.monotonic()))
 if "--contention-barrier-fd" in sys.argv:
-    assert int(option("--contention-graph-calls")) > 0
-    calls = 0
-    time.sleep(max(0, window["start"] - time.monotonic()))
+    if "--contention-barrier-per-graph" not in sys.argv:
+        graph_calls = 1
+    completed = 0
     with socket.socket(fileno=int(option("--contention-barrier-fd"))) as barrier:
         while True:
             barrier.sendall(b"R")
@@ -60,32 +64,54 @@ if "--contention-barrier-fd" in sys.argv:
             if action == b"S":
                 break
             assert action == b"G"
+            assert completed < replays
             if directory.name == "concurrent" and device == int(os.environ.get("FAIL_BARRIER_DEVICE", "-1")):
                 print("FAKE_BARRIER_DEVICE_ERROR", flush=True)
                 sys.exit(4)
-            if calls:
-                assert all((directory / f"done_{d}_{calls}").exists() for d in devices)
+            if completed:
+                assert all((directory / f"done_{d}_{completed}").exists() for d in devices)
             time.sleep(0.001 * (device + 1))
-            calls += 1
-            (directory / f"done_{device}_{calls}").touch()
-    assert calls > 0
-    if "--contention-barrier-per-graph" in sys.argv:
-        calls *= int(option("--contention-graph-calls"))
-else:
-    time.sleep(window["stop"] - window["start"])
+            completed += 1
+            (directory / f"done_{device}_{completed}").touch()
+    assert completed == replays
 rate = 15 if directory.name == "concurrent" else 30
-elapsed = window["stop"] - window["start"]
-result = dict(device=device, start=window["start"], end=window["stop"],
+elapsed = 0.05
+result = dict(device=device, start=window["start"], end=window["start"] + elapsed,
               bandwidth_GBps=rate, payload_bytes=round(elapsed * rate * 1e9),
-              p50_call_us=90, calls=calls, verified=True)
+              p50_call_us=90, calls=replays * graph_calls, graph_calls=graph_calls, graph_replays=replays, verified=True)
 pathlib.Path(option("--contention-result")).write_text(json.dumps(result))
+if profile:
+    warmup, active = int(option("--profiler-warmup")), int(option("--profiler-active"))
+    assert "--contention-barrier-per-graph" in sys.argv and warmup + active <= replays
+    host_pid, device_pid = 1, 2
+    events = []
+    def event(name, begin, end, pid, category):
+        events.append(dict(ph="X", name=name, ts=begin, dur=end - begin, pid=pid, tid=1, cat=category))
+    kernel = "KvafExecuteBatchGetUbmemKernelV2"
+    timings = [
+        [[(100, 120), (140, 160), (170, 190)], [(110, 130), (135, 145), (150, 175)]],
+        [[(100, 110), (120, 130), (140, 150)], [(110, 115), (120, 125), (135, 140)]],
+    ]
+    for sample in range(active):
+        iteration = warmup + sample
+        tasks_by_device = timings[sample % len(timings)]
+        base = iteration * 1000
+        prefix = f"KVAF/device{device}/round{iteration}"
+        event(f"{prefix}/graph_replay", base, base + 2, host_pid, "user_annotation")
+        event(f"{prefix}/wait_completion", base + 2, base + 200, host_pid, "user_annotation")
+        event(kernel, base + 100, base + 101, host_pid, "cpu_op")
+        for begin, end in tasks_by_device[device]:
+            event(kernel, base + begin, base + end, device_pid, "kernel")
+    traces = directory / f"profiler_device_{device}" / "ASCEND_PROFILER_OUTPUT"
+    traces.mkdir(parents=True)
+    (traces / "trace_view.json").write_text(json.dumps(events))
 '''
 
 
 class MulticardTests(unittest.TestCase):
     def run_controller(self, root, fail=None, transport="ubmem", options=(), cores=16,
                        jettys=2, inflight=2048, expected_transport=None, core_env="16",
-                       devices=(0, 1), fail_barrier=None):
+                       devices=(0, 1), fail_barrier=None, replays=5, profiler=False):
         runner = root / "runner"
         runner.write_text(FAKE_RUNNER)
         runner.chmod(0o755)
@@ -99,9 +125,11 @@ class MulticardTests(unittest.TestCase):
             env["FAIL_DEVICE"] = str(fail)
         if fail_barrier is not None:
             env["FAIL_BARRIER_DEVICE"] = str(fail_barrier)
+        replay_options = ("--graph-replays", str(replays)) if replays is not None else ()
+        profiler_options = () if profiler else ("--no-torch-npu-profiler",)
         return subprocess.run([
             str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_multicard_perf.sh"),
-            str(root / "build"), "--devices", *map(str, devices), "--seconds", "0.05",
+            str(root / "build"), "--devices", *map(str, devices), *replay_options, *profiler_options,
             "--ready-timeout", "10", "--output", str(root / "results"),
             "--transport", transport,
             *options,
@@ -145,6 +173,55 @@ class MulticardTests(unittest.TestCase):
             self.assertIn("MULTICARD_REPORT", regenerated.stdout)
             self.assertNotIn("MULTICARD_MEASURE", regenerated.stdout)
             self.assertEqual((output / "report.md").read_text(), report)
+            config_path = output / "config.json"
+            old_config = json.loads(config_path.read_text())
+            old_config.pop("graph_replays")
+            config_path.write_text(json.dumps(dict(old_config, seconds=0.05)))
+            with contextlib.redirect_stdout(io.StringIO()):
+                multi.summarize(output)
+            self.assertIn("| 每阶段测量时长 | 0.05 s |", (output / "report.md").read_text())
+
+    def test_overlap_bandwidth_is_appended_and_can_be_regenerated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, replays=None, profiler=True, options=(
+                "--graph-calls", "3", "--requests", "1", "--profiler-active", "2",
+            ))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            log = result.stdout
+            self.assertLess(log.index("MULTICARD_AGGREGATE"), log.index("MULTICARD_PROFILER_OVERLAP"))
+            self.assertIn("rounds=2 kernel=KvafExecuteBatchGetUbmemKernelV2", log)
+            self.assertIn("phase=concurrent rounds=100 calls_per_replay=3", log)
+            output = root / "results"
+            report = (output / "report.md").read_text(encoding="utf-8")
+            self.assertIn("| 0 | 2 | 30000 | 0.044 |", report)
+            self.assertIn("| 1 | 6 | 70000 | 0.056 |", report)
+            (root / "runner").unlink()
+            with contextlib.redirect_stdout(io.StringIO()) as offline:
+                self.assertEqual(multi.main([str(root / "build"), "--summarize", str(output)]), 0)
+            self.assertIn("MULTICARD_PROFILER_OVERLAP", offline.getvalue())
+            self.assertEqual((output / "report.md").read_text(encoding="utf-8"), report)
+
+            trace, = (output / "concurrent" / "profiler_device_1").rglob("trace_view.json")
+            events = json.loads(trace.read_text())
+            events.pop()  # A CPU annotation cannot substitute for a missing kernel task.
+            trace.write_text(json.dumps(events))
+            with contextlib.redirect_stderr(io.StringIO()) as errors, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(multi.main([str(root / "build"), "--summarize", str(output)]), 1)
+            self.assertIn("round 2 needs 3 complete KvafExecuteBatchGetUbmemKernelV2 device tasks", errors.getvalue())
+
+    def test_default_profiler_adapts_to_one_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_controller(root, replays=1, profiler=True,
+                                         options=("--concurrent-only", "--graph-calls", "3"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            config = json.loads((root / "results/config.json").read_text())
+            self.assertTrue(config["torch_npu_profiler"])
+            self.assertTrue(config["barrier_per_graph"])
+            self.assertEqual((config["profiler_warmup"], config["profiler_active"]), (0, 1))
+            self.assertIn("phase=concurrent rounds=1 calls_per_replay=3", result.stdout)
+            self.assertIn("MULTICARD_PROFILER_OVERLAP rounds=1", result.stdout)
 
     def test_urma_core_sweep_and_offline_summary(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -210,9 +287,8 @@ class MulticardTests(unittest.TestCase):
     def test_eight_workers_finish_the_same_barrier_rounds(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            result = self.run_controller(root, devices=range(8),
-                                         options=("--barrier-per-call", "--graph-calls", "256",
-                                                  "--seconds", "0.2"))
+            result = self.run_controller(root, devices=range(8), replays=7,
+                                         options=("--barrier-per-call", "--graph-calls", "256"))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             output = root / "results"
             config = json.loads((output / "config.json").read_text())
@@ -220,9 +296,8 @@ class MulticardTests(unittest.TestCase):
             self.assertEqual(config["graph_calls"], 256)
             calls = [json.loads((output / "concurrent" / f"device_{device}.json").read_text())["calls"]
                      for device in range(8)]
-            self.assertGreater(calls[0], 1)
-            self.assertEqual(calls, [calls[0]] * 8)
-            self.assertIn(f"MULTICARD_BARRIER_DONE phase=concurrent rounds={calls[0]}", result.stdout)
+            self.assertEqual(calls, [7] * 8)
+            self.assertIn("MULTICARD_BARRIER_DONE phase=concurrent rounds=7", result.stdout)
             report = (output / "report.md").read_text()
             self.assertIn("吞吐计时包含轮间同步等待", report)
             self.assertIn("| Graph 数 / 卡 | 256 |", report)
@@ -242,9 +317,8 @@ class MulticardTests(unittest.TestCase):
         devices = range(2, 6)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            result = self.run_controller(root, devices=devices,
-                                         options=("--concurrent-only", "--barrier-per-graph", "--graph-calls", "256",
-                                                  "--seconds", "0.15"))
+            result = self.run_controller(root, devices=devices, replays=9,
+                                         options=("--concurrent-only", "--barrier-per-graph", "--graph-calls", "256"))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             output = root / "results"
             config = json.loads((output / "config.json").read_text())
@@ -255,9 +329,10 @@ class MulticardTests(unittest.TestCase):
             self.assertEqual(result.stdout.count("MULTICARD_MEASURE "), 1)
             concurrent = output / "concurrent"
             rounds = len(list(concurrent.glob("done_2_*")))
-            self.assertGreater(rounds, 1)
+            self.assertEqual(rounds, 9)
             for device in devices:
                 worker = json.loads((concurrent / f"device_{device}.json").read_text())
+                self.assertEqual(worker["graph_replays"], 9)
                 self.assertEqual(worker["calls"], rounds * 256)
             self.assertIn(f"phase=concurrent rounds={rounds} calls_per_replay=256", result.stdout)
             report = (output / "report.md").read_text()
@@ -303,17 +378,28 @@ class MulticardTests(unittest.TestCase):
         graphs = [SimpleNamespace(replay=lambda _, index=index: events.append(index),
                                   synchronize=lambda _: events.append("completed"))
                   for index in range(2)]
+
+        @contextlib.contextmanager
+        def mark(iteration, phase):
+            events.append((iteration, phase))
+            yield
+
+        profiler = SimpleNamespace(total_steps=1, range=mark, step=lambda: events.append("profiler_step"))
         controller, worker = socket.socketpair()
         with controller, worker, ThreadPoolExecutor(max_workers=1) as executor:
             controller.settimeout(2)
-            outcome = executor.submit(multi.measure_barrier_replays, graphs, None, worker.detach())
+            outcome = executor.submit(multi.measure_barrier_replays, graphs, None, worker.detach(), profiler)
             try:
                 expected = []
-                for index in (0, 1, 0):
+                for replay, index in enumerate((0, 1, 0)):
                     self.assertEqual(controller.recv(1), b"R")
                     self.assertEqual(events, expected)
                     controller.sendall(b"G")
-                    expected.extend((index, "completed"))
+                    if replay == 0:
+                        expected.extend(((0, "graph_replay"), index, (0, "wait_completion"),
+                                         "completed", "profiler_step"))
+                    else:
+                        expected.extend((index, "completed"))
                 self.assertEqual(controller.recv(1), b"R")
                 self.assertEqual(events, expected)
                 controller.sendall(b"S")
@@ -359,7 +445,7 @@ class MulticardTests(unittest.TestCase):
             self.assertEqual(output, [plan])
             validated.append(plan)
 
-        def measure(graphs, stream, barrier_fd):
+        def measure(graphs, stream, barrier_fd, profiler):
             self.assertEqual(len(graphs), graph_count)
             for index in range(measured):
                 graphs[index % graph_count].replay(stream)
@@ -368,10 +454,10 @@ class MulticardTests(unittest.TestCase):
         torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: 1, synchronize=lambda: None))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "start.json").write_text(json.dumps({"start": 0, "stop": 2}))
+            (root / "start.json").write_text(json.dumps({"start": 0, "graph_replays": measured}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
                                    contention_graph_calls=graph_count, contention_barrier_fd=3,
-                                   contention_barrier_per_graph=False,
+                                   contention_barrier_per_graph=False, torch_npu_profiler=False,
                                    warmup=1, miss_count=4096, token_bytes=656)
             plans = iter(range(graph_count))
             with (patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()),
@@ -394,10 +480,10 @@ class MulticardTests(unittest.TestCase):
         submit, check_output = Mock(), Mock()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "start.json").write_text(json.dumps({"start": 0, "stop": 2}))
+            (root / "start.json").write_text(json.dumps({"start": 0, "graph_replays": 3}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
                                    contention_graph_calls=256, contention_barrier_fd=3,
-                                   contention_barrier_per_graph=True, warmup=1,
+                                   contention_barrier_per_graph=True, warmup=1, torch_npu_profiler=False,
                                    miss_count=4096, token_bytes=656)
             plans = iter(range(256))
             with (patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()),
@@ -407,7 +493,7 @@ class MulticardTests(unittest.TestCase):
             graph.capture_begin.assert_called_once_with(1)
             graph.capture_end.assert_called_once_with()
             graph.reset.assert_called_once_with()
-            measure.assert_called_once_with([graph], 1, 3)
+            measure.assert_called_once_with([graph], 1, 3, None)
             self.assertEqual([call.args[0] for call in submit.call_args_list], [0, *range(256)])
             self.assertEqual([call.args for call in check_output.call_args_list], [(255,), (255,)])
             result = json.loads(args.contention_result.read_text())
@@ -474,10 +560,10 @@ class MulticardTests(unittest.TestCase):
         torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: 1, synchronize=lambda: None))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            root.joinpath("start.json").write_text(json.dumps({"start": time.monotonic(), "stop": time.monotonic() + 0.1}))
+            root.joinpath("start.json").write_text(json.dumps({"start": 0, "graph_replays": 3}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
                                    contention_graph_calls=4, contention_barrier_fd=None,
-                                   warmup=3, miss_count=4096, token_bytes=656)
+                                   warmup=3, miss_count=4096, token_bytes=656, torch_npu_profiler=False)
             plans = iter(range(4))
             with patch.dict(os.environ, DEVICE_ID="6"), contextlib.redirect_stdout(io.StringIO()):
                 multi.run_worker(SimpleNamespace(AclGraph=Graph), torch, args, lambda: next(plans),
@@ -485,7 +571,8 @@ class MulticardTests(unittest.TestCase):
             result = json.loads(args.contention_result.read_text())
             self.assertEqual(submitted, [0, "capture", 0, 1, 2, 3, "end_capture", "reset"])
             self.assertEqual(validated, [3, 3])
-            self.assertEqual(result["calls"] % 4, 0)
+            self.assertEqual(result["graph_replays"], 3)
+            self.assertEqual(result["calls"], 12)
             self.assertEqual(result["payload_bytes"], result["calls"] * 4096 * 656)
             self.assertTrue(result["verified"])
 
@@ -499,6 +586,8 @@ class MulticardTests(unittest.TestCase):
             args = perf.parse_args(["--contention-control-dir", "/tmp/run",
                                     "--contention-result", "/tmp/result.json", "--kernel-profile"])
             self.assertIn("--no-kernel-profile", perf.validate_args(args))
+            args = perf.parse_args(["--torch-npu-profiler"])
+            self.assertIn("synchronized multi-card replay", perf.validate_args(args))
 
 
 if __name__ == "__main__":
