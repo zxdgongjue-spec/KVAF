@@ -228,7 +228,7 @@ Python bench 的无硬件测试还验证匹配的 reuse 消息才释放源；错
 ## 随机离散包性能测试
 
 `tests/python/bench_hbm_read_raw_addr.py` 中的 A 为读取端，B 为生产端。
-默认 `--role local` 仍自动启动 B 子进程，但 receiver、测试配置和全部逐批通知均走 TCP，不再创建 Pipe。
+默认 `--role local` 自动启动 B 子进程作为应用 TCP server，A 主动连接；receiver、测试配置和全部逐批通知均走 TCP，不再创建 Pipe。默认应用端口为 127.0.0.1:29100，同时运行多个本机测试时用 `--control-listen` 指定不同的非零端口。
 先按上文重新编译 NPU 扩展和 raw kernel，再执行；此脚本不需要 CPU 服务：
 
 ```bash
@@ -372,11 +372,11 @@ python tests/python/bench_hbm_read_raw_addr.py \
 
 | 通道 | 发起连接方向 | 消息 |
 | --- | --- | --- |
-| 应用 TCP，例如 A:29100 | B → A 建立双向长连接 | hello/connected、request/ready、reuse/released、shutdown/closed、error |
+| 应用 TCP，例如 B:29100 | B 监听，A → B 建立双向长连接 | hello/connected、request/ready、reuse/released、shutdown/closed、error |
 | KVHR TCP，例如 A:29000 | B 的 source.register → A 的 listen_hbm | MR、Jetty、TP、探测、重连及硬件资源关闭 |
 | NPU 数据通道 | A 发起 READ，KV 从 B HBM 搬到 A HBM | HBM payload，不进入上述 TCP 通道 |
 
-A 先监听；B 连接应用端口后，A 发送 receiver 字典和测试配置，B 使用自身 device/EID 注册源。每轮 A 发 request，B 生产、同步 stream 并 ready，发回 `(request_id, ReadyToken)`。A 读取、等待 stream 并验证后发送 reuse；B 核对完整批次身份，release 后回复 released。A 销毁全部捕获图后才发送 shutdown；B 关闭源并回复 closed，A 最后关闭 Runtime。
+B producer 先启动应用 TCP server 等待 A。A reader 初始化 Runtime 和 KVHR 监听后主动连接 B，发送 receiver 字典和测试配置；B 收到后才使用自身 device/EID 注册源，按原流程反向连接 A 的 KVHR 端口。每轮 A 发 request，B 生产、同步 stream 并 ready，发回 `(request_id, ReadyToken)`。A 读取、等待 stream 并验证后发送 reuse；B 核对完整批次身份，release 后回复 released。A 销毁全部捕获图后才发送 shutdown；B 关闭源并回复 closed，A 最后关闭 Runtime。
 
 两机均使用同一份最新源码和已安装 torch_npu 的 Python 环境，执行以下命令。build.sh 默认输出到 build-npu，包含 raw READ kernel，并在增量构建后同步 Python 通知模块，无需手工复制：
 
@@ -385,35 +385,37 @@ PYTHON="$(command -v python)" bash build.sh npu --jobs 8
 export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-在 A 机启动 reader（将 `192.168.1.20` 替换为 B 可访问的 A 机 Host IPv4）：
+先在 B 机启动 producer；以下假设 A 的 Host IPv4 为 `192.168.1.20`，B 为 `192.168.1.21`，请替换为实际可达地址：
+
+```bash
+python tests/python/bench_hbm_read_raw_addr.py \
+  --role producer --device-b 0 \
+  --npu-eid-b-raw '<B_VERIFIED_NPU_ROUTE_EID>' \
+  --control-listen 0.0.0.0:29100 \
+  --control-timeout 300
+```
+
+看到 `NPU_HBM_TCP_LISTEN role=producer` 后，在 A 机启动 reader：
 
 ```bash
 python tests/python/bench_hbm_read_raw_addr.py \
   --role reader --device-a 0 \
   --npu-eid-a-raw '<A_VERIFIED_NPU_ROUTE_EID>' \
-  --control-listen 0.0.0.0:29100 \
+  --control-connect 192.168.1.21:29100 \
+  --control-timeout 300 \
   --hbm-listen 0.0.0.0:29000 --hbm-advertise 192.168.1.20:29000 \
   --packets 1024 --packet-bytes 656 --source-space-bytes 1048576 \
   --warmup 10 --iterations 100 --profile-iterations 0 \
   --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
-在 B 机启动 producer：
-
-```bash
-python tests/python/bench_hbm_read_raw_addr.py \
-  --role producer --device-b 0 \
-  --npu-eid-b-raw '<B_VERIFIED_NPU_ROUTE_EID>' \
-  --control-connect 192.168.1.20:29100
-```
-
 两机本地设备编号可以相同。producer 不要求 A 的 EID/raw kernel，也不初始化 reader Runtime；reader 不要求 B 的 EID。包布局、MR 数、随机种子及轮数由 A 通过 hello 统一下发，B 保留自身设备/EID/连接参数；测试规模和 graph/profile 等选项配置在 reader 命令上。
 
-两个 TCP 端口均须从 B 可达。TCP 连通仅说明通知可达；两端 EID 仍须对应实际可互通、支持当前 UDMA READ 的 NPU 路由。原 fullmesh 双卡配置不能直接证明跨机路由可用。运行日志应出现 `application_transport=tcp role=reader`，通过标志仍为 `NPU_HBM_BENCH_PASS`，包含实际 READ 完成和每轮完整数据校验。
+A 须能访问 B:29100，B 须能访问 A:29000。TCP 连通仅说明通知可达；两端 EID 仍须对应实际可互通、支持当前 UDMA READ 的 NPU 路由。原 fullmesh 双卡配置不能直接证明跨机路由可用。运行日志应出现 `control_listener=producer hbm_control_listener=reader` 和 `application_transport=tcp role=reader`，通过标志仍为 `NPU_HBM_BENCH_PASS`，包含实际 READ 完成和每轮完整数据校验。
 
 - `--control-timeout`：初始连接、等待对端及单次通知收发超时，单位秒，默认 180；两端可分别配置。
-- `--control-listen`：A 的应用地址，支持端口 0；实际端口打印在 `NPU_HBM_TCP_LISTEN`。独立启动时建议用固定端口。
-- `--control-connect`：B 连接的 A 应用地址；不能为 `0.0.0.0` 或端口 0。
+- `--control-listen`：producer/local 使用的 B 应用监听地址，默认 127.0.0.1:29100。独立 producer 可使用端口 0，实际端口打印在 `NPU_HBM_TCP_LISTEN`，再由 reader 显式连接该端口；local 模式须使用非零端口。
+- `--control-connect`：reader 必须指定的 B 应用地址；不能为 `0.0.0.0` 或端口 0。producer/local 不接受此参数；reader 不接受 `--control-listen`。
 - `--hbm-listen` / `--hbm-advertise`：独立 KVHR 地址。默认 loopback 仅用于同机；跨机须设置 B 可访问的 advertise 地址。
 
 通知帧使用 `KVNT + version=1 + network-order payload length`，最大 4 MiB，开启 TCP_NODELAY，按绝对 deadline 处理拆包/粘包。ReadyToken 沿用匹配版本原生绑定的 pickle 状态；接收端仅允许内置数据及指定 NPU ReadyToken/source 类型，禁止任意 Python 全局对象。通道面向可信集群节点，不提供端点认证；不传 Tensor、stream、Source/Runtime 对象或 HBM payload。

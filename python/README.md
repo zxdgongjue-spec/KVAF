@@ -4,7 +4,7 @@
 
 当前 Python 包只承担调用入口和模块导出，不承担 KVAF Runtime、Meta Manager 或 KV Access Operator 的业务实现。
 
-`kvaf.tcp_control` 额外提供独立的应用 TCP 通知通道，供 Connector 传递 receiver、NPU ReadyToken 和业务消息。`TcpControlListener` / `TcpControlChannel` 支持长度分帧、超时和双向通知；活动会话断线时不自动重放 READ 或释放源。纯 NPU benchmark 已使用该通道替代 Pipe，支持同机自动启动及两机 reader/producer 独立启动，见 [TCP 通知使用说明](../docs/hbm_raw_addr_read.md#tcp-通知与两机独立启动)。
+`kvaf.tcp_control` 额外提供独立的应用 TCP 通知通道，供 Connector 传递 receiver、NPU ReadyToken 和业务消息。`TcpControlListener` / `TcpControlChannel` 支持长度分帧、超时和双向通知；活动会话断线时不自动重放 READ 或释放源。纯 NPU benchmark 已使用该通道替代 Pipe，producer 监听应用 TCP，reader 主动连接并发送请求；独立 KVHR 硬件建链仍由 reader 监听、producer 注册接入。支持同机自动启动及两机独立启动，见 [TCP 通知使用说明](../docs/hbm_raw_addr_read.md#tcp-通知与两机独立启动)。
 
 ## 共享池 CPU Pull
 

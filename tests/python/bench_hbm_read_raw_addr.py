@@ -3,6 +3,7 @@
 A reads B with batch_get_raw_addr without a CPU service or DDR allocation.
 Payload travels only from B HBM to A HBM. Setup, producer
 writes, metadata preparation, verification and TCP notifications are outside timing.
+The producer listens for application TCP connections; the reader connects to it.
 The default local role spawns B but exchanges all control messages over TCP.
 Use --role reader / --role producer to launch the peers on separate hosts.
 """
@@ -33,8 +34,8 @@ def packet_group(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("local", "reader", "producer"), default="local")
-    parser.add_argument("--control-listen", default="127.0.0.1:0", help="reader application TCP host:port")
-    parser.add_argument("--control-connect", help="producer connects to the reader application TCP address")
+    parser.add_argument("--control-listen", help="producer application TCP host:port (default: 127.0.0.1:29100)")
+    parser.add_argument("--control-connect", help="reader connects to the producer application TCP address")
     parser.add_argument("--control-timeout", type=float, default=180, help="TCP operation timeout in seconds")
     parser.add_argument("--hbm-listen", default="127.0.0.1:0", help="independent KVHR hardware setup listener")
     parser.add_argument("--hbm-advertise", default="", help="producer-reachable KVHR host:port")
@@ -61,16 +62,27 @@ def parse_args(argv=None):
     parser.add_argument("--aiv-cores", type=int, default=2)
     parser.add_argument("--jettys-per-core", type=int, default=2)
     parser.add_argument("--max-inflight-total", type=int, default=2048)
-    parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
+    parser.add_argument("--raw-kernel", default="build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
     args = parser.parse_args(argv)
     if args.role != "producer" and not args.npu_eid_a_raw:
         parser.error("reader/local requires --npu-eid-a-raw")
     if args.role != "reader" and not args.npu_eid_b_raw:
         parser.error("producer/local requires --npu-eid-b-raw")
-    if args.role == "producer" and not args.control_connect:
-        parser.error("producer requires --control-connect")
-    if args.role != "producer" and args.control_connect:
-        parser.error("--control-connect is only used by the producer role")
+    if args.role == "reader" and not args.control_connect:
+        parser.error("reader requires --control-connect")
+    if args.role != "reader" and args.control_connect:
+        parser.error("--control-connect is only used by the reader role")
+    if args.role == "reader" and args.control_listen:
+        parser.error("--control-listen is only used by producer/local roles")
+    if args.role != "reader":
+        args.control_listen = args.control_listen or "127.0.0.1:29100"
+    if args.role == "local":
+        try:
+            local_port = int(args.control_listen.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            parser.error("local role requires --control-listen host:port")
+        if not 1 <= local_port <= 65535:
+            parser.error("local role requires a producer port in 1..65535")
     if not 0 < args.control_timeout < float("inf"):
         parser.error("control-timeout must be finite and positive")
     if args.profile_iterations is None:
@@ -122,7 +134,7 @@ def configured_producer(args, config):
     """A chooses the workload; B retains its own device, EID and TCP settings."""
     if not isinstance(config, dict) or set(config) != set((*_CONFIG_INTS, *_CONFIG_BOOLS, "packet_groups")):
         raise ValueError("invalid benchmark configuration fields")
-    argv = ["--role", "producer", "--control-connect", args.control_connect,
+    argv = ["--role", "producer", "--control-listen", args.control_listen,
             "--control-timeout", str(args.control_timeout), "--device-b", str(args.device_b),
             "--npu-eid-b-raw", args.npu_eid_b_raw]
     for name in _CONFIG_INTS:
@@ -167,40 +179,36 @@ def matches_receipt(received, expected):
 
 
 def open_reader_channel(args):
-    from kvaf.tcp_control import TcpControlListener
-
-    worker = None
-    with TcpControlListener(args.control_listen, timeout=args.control_timeout) as listener:
-        print(f"NPU_HBM_TCP_LISTEN role={args.role} address={listener.address}", flush=True)
-        if args.role == "local":
-            address = listener.address
-            if address.startswith("0.0.0.0:"):
-                address = "127.0.0.1:" + address.rsplit(":", 1)[1]
-            worker = mp.get_context("spawn").Process(target=producer_main, args=(args, address))
-            worker.start()
-        try:
-            return listener.accept(), worker
-        except BaseException:
-            # No HELLO has been sent, so B cannot have registered HBM yet.
-            if worker is not None:
-                worker.terminate()
-                worker.join(10)
-            raise
-
-
-def producer_main(args, address=None):
     from kvaf.tcp_control import TcpControlChannel
 
-    if address is not None:
-        args = argparse.Namespace(**vars(args))
-        args.control_connect = address
-    with TcpControlChannel.connect(args.control_connect, timeout=args.control_timeout) as channel:
-        hello = receive(channel, "hello")
-        if (not isinstance(hello, dict) or hello.get("version") != 1 or
-                not isinstance(hello.get("session"), str) or len(hello["session"]) != 32):
-            raise ValueError("unsupported benchmark notification protocol")
-        args = configured_producer(args, hello["config"])
-        producer(channel, args, packet_layout(args), hello["receiver"], session=hello["session"])
+    if args.role == "reader":
+        return TcpControlChannel.connect(args.control_connect, timeout=args.control_timeout), None
+    address = args.control_listen
+    if address.startswith("0.0.0.0:"):
+        address = "127.0.0.1:" + address.rsplit(":", 1)[1]
+    worker = mp.get_context("spawn").Process(target=producer_main, args=(args,))
+    worker.start()
+    try:
+        return TcpControlChannel.connect(address, timeout=args.control_timeout), worker
+    except BaseException:
+        # No HELLO has been sent, so B cannot have registered HBM yet.
+        worker.terminate()
+        worker.join(10)
+        raise
+
+
+def producer_main(args):
+    from kvaf.tcp_control import TcpControlListener
+
+    with TcpControlListener(args.control_listen, timeout=args.control_timeout) as listener:
+        print(f"NPU_HBM_TCP_LISTEN role=producer address={listener.address}", flush=True)
+        with listener.accept() as channel:
+            hello = receive(channel, "hello")
+            if (not isinstance(hello, dict) or hello.get("version") != 1 or
+                    not isinstance(hello.get("session"), str) or len(hello["session"]) != 32):
+                raise ValueError("unsupported benchmark notification protocol")
+            args = configured_producer(args, hello["config"])
+            producer(channel, args, packet_layout(args), hello["receiver"], session=hello["session"])
 
 
 @dataclass(frozen=True)
@@ -435,7 +443,8 @@ def reader(args):
               f"max_inflight_total={args.max_inflight_total} "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
-              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=reader acquire_raw=0 "
+              "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=producer "
+              "hbm_control_listener=reader acquire_raw=0 "
               "status_reset=init_only status_generation=0 status_readback=none completion=caller_stream_sync "
               f"execution={'graph' if args.graph else 'eager'} graph={int(args.graph)} binding_profile={int(not args.graph)} "
               f"completion_notification=application application_transport=tcp role={args.role} "

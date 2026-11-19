@@ -23,13 +23,14 @@ control = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(control)
 
 
-def tcp_process_peer(args, address):
+def tcp_process_peer(args):
     """Spawn target with no NPU dependency; bootstrapping also uses TCP."""
-    with control.TcpControlChannel.connect(address, timeout=2) as channel:
-        message = channel.recv()
-        channel.send(("connected", message[1]))
-        request = channel.recv()
-        channel.send(("ready", request[1]))
+    with control.TcpControlListener(args.control_listen, timeout=5) as listener:
+        with listener.accept() as channel:
+            message = channel.recv()
+            channel.send(("connected", message[1]))
+            request = channel.recv()
+            channel.send(("ready", request[1]))
 
 
 class TcpNotifications(unittest.TestCase):
@@ -147,10 +148,11 @@ class TcpNotifications(unittest.TestCase):
 
     def test_reader_configuration_is_validated_and_preserves_local_device(self):
         reader = bench.parse_args(["--role", "reader", "--device-a", "0", "--device-b", "0",
+                                   "--control-connect", "127.0.0.1:29100",
                                    "--npu-eid-a-raw", "a", "--graph", "--source-count", "2",
                                    "--packet-group", "2:16", "--packet-group", "2:4"])
         producer = bench.parse_args(["--role", "producer", "--device-b", "0", "--npu-eid-b-raw", "b",
-                                     "--control-connect", "127.0.0.1:29100"])
+                                     "--control-listen", "127.0.0.1:29100"])
         adopted = bench.configured_producer(producer, bench.benchmark_config(reader))
         self.assertEqual(bench.packet_layout(reader), bench.packet_layout(adopted))
         self.assertEqual(bench.round_counts(reader), bench.round_counts(adopted))
@@ -159,13 +161,22 @@ class TcpNotifications(unittest.TestCase):
         for change in ({"device_b": 7}, {"iterations": "2"}, {"packet_groups": []}, {"graph": 1}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 bench.configured_producer(producer, {**bench.benchmark_config(reader), **change})
-        for argv in (["--role", "producer", "--npu-eid-b-raw", "b"],
-                     ["--role", "reader", "--npu-eid-a-raw", "a", "--control-timeout", "nan"]):
+        for argv in (["--role", "reader", "--npu-eid-a-raw", "a"],
+                     ["--role", "producer", "--npu-eid-b-raw", "b", "--control-connect", "127.0.0.1:29100"],
+                     ["--role", "reader", "--npu-eid-a-raw", "a", "--control-connect", "127.0.0.1:29100",
+                      "--control-listen", "127.0.0.1:29101"],
+                     ["--role", "reader", "--npu-eid-a-raw", "a", "--control-connect", "127.0.0.1:29100",
+                      "--control-timeout", "nan"],
+                     ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--control-listen", "127.0.0.1:0"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 bench.parse_args(argv)
 
     def test_default_local_role_spawns_peer_and_exchanges_bootstrap_over_tcp(self):
-        args = bench.parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--control-timeout", "2"])
+        # Reserve a test port briefly; the spawned producer itself binds/listens.
+        with control.TcpControlListener("127.0.0.1:0", timeout=5) as probe:
+            address = probe.address
+        args = bench.parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b",
+                                 "--control-listen", address, "--control-timeout", "5"])
         package = types.ModuleType("kvaf")
         package.__path__ = []
         with patch.dict(sys.modules, {"kvaf": package, "kvaf.tcp_control": control}), \
@@ -251,14 +262,21 @@ class TcpNotifications(unittest.TestCase):
         package.NpuRuntime = lambda **kwargs: runtime
         modules = {"kvaf": package, "kvaf._kvaf": native, "kvaf.tcp_control": control,
                    "torch": torch, "torch_npu": types.SimpleNamespace()}
-        reader_args = bench.parse_args(["--role", "reader", "--npu-eid-a-raw", "a", "--device-a", "0",
+        reader_argv = ["--role", "reader", "--npu-eid-a-raw", "a", "--device-a", "0",
                                         "--device-b", "0", "--packets", "2", "--packet-bytes", "8",
                                         "--source-space-bytes", "64", "--source-count", "2", "--warmup", "2",
-                                        "--iterations", "2", "--profile-iterations", "0", "--control-timeout", "2"])
-        torch.empty.return_value.numel.return_value = reader_args.payload_bytes + 2 * bench.GUARD_BYTES
+                       "--iterations", "2", "--profile-iterations", "0", "--control-timeout", "2"]
         with control.TcpControlListener("127.0.0.1:0", timeout=2) as listener:
+            reader_args = bench.parse_args(reader_argv + ["--control-connect", listener.address])
+            torch.empty.return_value.numel.return_value = reader_args.payload_bytes + 2 * bench.GUARD_BYTES
             producer_args = bench.parse_args(["--role", "producer", "--npu-eid-b-raw", "b", "--device-b", "0",
-                                              "--control-connect", listener.address, "--control-timeout", "2"])
+                                              "--control-listen", listener.address, "--control-timeout", "2"])
+            listening = threading.Event()
+
+            def listen(*args, **kwargs):
+                self.assertEqual(threading.current_thread().name, "tcp-producer")
+                listening.set()
+                return listener
 
             def produce():
                 try:
@@ -266,19 +284,22 @@ class TcpNotifications(unittest.TestCase):
                 except BaseException as error:
                     producer_errors.append(error)
 
-            with patch.dict(sys.modules, modules), patch.object(control, "TcpControlListener", return_value=listener), \
+            with patch.dict(sys.modules, modules), patch.object(control, "TcpControlListener", side_effect=listen) as server, \
                     patch.object(bench, "packet_payload", return_value=MagicMock()), \
                     patch.object(bench, "retain", side_effect=Retained), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 worker = threading.Thread(target=produce, name="tcp-producer", daemon=True)
                 worker.start()
                 try:
+                    self.assertTrue(listening.wait(2), "producer did not start its server")
+                    source.register.assert_not_called()  # Wait for the reader's HELLO/receiver ticket first.
                     bench.reader(reader_args)
                 except BaseException as error:
                     reader_errors.append(error)
                 finally:
                     worker.join(5)
                 self.assertFalse(worker.is_alive(), "TCP peer did not finish")
+                server.assert_called_once_with(producer_args.control_listen, timeout=producer_args.control_timeout)
         if fail_wait:
             self.assertEqual(len(reader_errors), 1)
             self.assertEqual(len(producer_errors), 1)
