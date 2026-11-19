@@ -195,6 +195,31 @@ lifecycle 或故障注入测试的完整覆盖。
 
 ## 自动图资源变更的验证边界
 
+接口迁移与可运行代码见[实现篇最小示例](cache_transport_execution_implementation.md#python-migration)，
+两节点模型图、固定输入更新及关闭顺序见[完整图示例](cache_transport_execution_implementation.md#get-graph-example)。
+可将最小示例代码块与图示例代码块按顺序保存为 `kvaf_api_examples.py`，在匹配 NPU 构建的环境中运行：
+
+```bash
+PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}" \
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+KVAF_EXAMPLE_BACKEND=aiv python3 kvaf_api_examples.py
+```
+
+分别改为 `ubmem`、`gather_read`、`cpu_push_scatter`，各次应同时输出
+`KVAF_EAGER_EXAMPLE_PASS` 与 `KVAF_GRAPH_EXAMPLE_PASS`。示例验证小规模真实 Put/Get、
+两节点加普通算子捕获、动态 offset、部分/零请求和正常释放，不替代上面的规模与性能回归。
+
+vLLM/adaptor 集成验收还需要使用框架实际 forward：
+
+- 每个图 key 的预热和 capture 具有相同的 Get 顺序、配置、固定输出和请求容量；
+  未发生 cache miss 的调用点仍用 `miss_count=0` 执行，不跳过节点。
+- 在模型自己的静态输入更新后回放，与相同输入的 eager 有效输出对比；覆盖完整、部分及
+  零请求，不能只以单节点 benchmark 的 PASS 代替模型校验。
+- 先预热同实例的最大请求容量，再准备多个图；用框架的等待或事件依赖串行验证图 A、
+  图 B、eager fallback，以及淘汰 B 后继续回放 A。
+- 捕获失败或未回放图按外部图销毁、`close(discard_result=True)` 的顺序清理；失败保留
+  graph entry 并重试，不直接清除资源 owner。全部图结束后才能关闭 Runtime。
+
 本次新增的 `graph_resources`、图/eager 共存和不同图独立 stream，需重新执行上述真机回归；
 旧版本的 PASS 和性能数字不构成本次变更的硬件验收。prepare 内普通调用真实执行，
 capture 不应再产生输出注册或 workspace 扩容；回放仍调用原生 graph，不加入 Host 代理。

@@ -290,6 +290,11 @@ bash tests/run_remote_cpu_runtime_perf.sh build-npu
 
 ## Python 调用流程
 
+从 main 迁移时，先读[接口迁移与最小 Put/Get 示例](docs/cache_transport_execution_implementation.md#python-migration)。
+vLLM/模型图适配见[多节点捕获、回放与释放示例](docs/cache_transport_execution_implementation.md#get-graph-example)
+及[框架接入位置](docs/cache_transport_execution_implementation.md#framework-graph-integration)：
+图 runner 管理每张图的资源 owner，层内仍调用普通 `batch_get`。
+
 `NpuRuntime(batch_get_token_bytes, batch_get_tokens_per_block, *, device_id=0,
 transport_mode="urma", default_put=None, default_get=None, put_resources=None,
 get_resources=None, npu_eids=[], peer_ub_device="")` 以两个必填参数描述 token 布局，

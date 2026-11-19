@@ -1,11 +1,15 @@
 # 缓存访问执行框架：实现与使用
 
-本文描述 `codex/cache-transport-execution` 的 `5cce05e7`：算法首次使用准备、
-统一执行路径、同 stream 多图及多个 Get 节点均已接入；实现状态不代表真机或性能验收通过。
+本文接口与 `codex/cache-transport-execution` 的 `17002f3e` 对齐：算法首次使用准备、
+统一执行路径、预热自动收集图节点、多图与普通 Get 串行共存均已接入；实现状态不代表真机或性能验收通过。
 初始开发基线为
 `1c13103`，本分支已合入 main 的 `de4fd37e02fa86357f71fe4fcbbbecc3e75d1d58`。
 设计与后续边界见[框架设计](cache_transport_execution_design.md)；构建、性能入口及
 验证覆盖边界集中在[验证步骤](cache_transport_execution_validation.md)。
+
+应用适配先读[从 main 迁移与最小示例](#python-migration)；vLLM/模型框架适配重点见
+[Get 图模式完整示例](#get-graph-example)和[框架接入位置](#framework-graph-integration)。
+下文 Python API 的签名以当前 binding 为准，示例不会自动修改或适配外部 vLLM 源码。
 
 ## 当前范围
 
@@ -413,35 +417,398 @@ URMA AIV/AICPU Put 都支持。绑定固定输入地址、大小、device、stre
 UBMEM 不需要输入 MR，使用普通 Put。URMA Put 的普通调用临时注册与显式绑定的
 长期注册需区分，不再保留旧 AICPU Put 的隐式 MR 缓存路径。
 
+<a id="python-migration"></a>
+
+## 从 main 迁移与最小示例
+
+本节面向使用 Python binding 的应用和 vLLM adaptor。对照基线为本文开头列出的已合入
+main 提交，不假设其他 main 版本仍有相同签名。接口失败通过 Python 异常返回；只有成功
+返回才能按下述契约释放依赖，不能把完成未知的异常当成 DMA 已停止。
+
+### main 调用方式与当前方式
+
+| 适配位置 | main 基线 | 当前分支 |
+|---|---|---|
+| Runtime 构造 | 第一个参数为 Get kernel 路径；全局核数、Jetty 和 `aicpu_batch_get_mode` 选实现 | 两个布局参数必填，其余关键字；默认算法及每算法预算分别配置 |
+| Put/Get 算法选择 | 主要在构造时确定 | `default_put/default_get` 作为默认；调用可传 `execution=cfg` |
+| 读取全局并行度 | `runtime.npu_core_count/jettys_per_core` | 这些全局属性已移除；adaptor 自行保存各配置及资源预算，不假设全部算法共用一个值 |
+| 普通异步 Get | 主要由调用方的 stream 完成边界管理 | `batch_get` 仍默认异步；方向完成/请求引用回收使用 `drain_get()`，或改用 `synchronize=True` |
+| 重复使用固定输入/输出 | 后端自行处理注册生命周期 | 可选 `begin_put_input/end_put_input`、`begin_get_output/end_get_output`；它们不负责分配应用 Tensor |
+| 外部图捕获 | 预热后在 Torch/ACL capture 中直接调用 Get | 每张图建立 `graph_resources`，先包住一次真实预热，再包住实际 capture；模型内仍调用普通 Get |
+| 图回放 | 外部图原生 replay | 继续原生 replay；回放不经过 Host Dispatcher，不逐次申请 lease，也不逐次 `drain_get()` |
+| 图状态/profile 查询 | 按 Runtime 当前后端查询 | 用 `graph_lease=resources.leases[node_index]` 选择具体节点；省略 lease 查询 eager 实例 |
+| 图缓存淘汰/关闭 | 外部框架销毁图 | 先停止提交并完成在途、销毁外部图，再 `resources.close()`；全部图结束后关闭 Runtime |
+
+原 `aicpu_batch_get_mode="gather_read"` 对应
+`GetExecutionConfig("urma", "aicpu", "gather")`，`"cpu_push_scatter"` 对应
+`GetExecutionConfig("urma", "aicpu", "scatter")`。它们不再隐式决定 Put executor，
+需要 AICPU Put 时单独使用 `PutExecutionConfig("urma", "aicpu")`。
+
+例如，main 的 URMA AIV 构造形式：
+
+```python
+# main 基线；不要在当前分支执行此旧签名。
+runtime = kvaf.NpuRuntime(
+    get_kernel_path, 656, 128, device_id=device_id, npu_core_count=2,
+    batch_put_kernel_object_path=put_kernel_path, jettys_per_core=2,
+    transport="urma",
+)
+```
+
+迁移为：
+
+```python
+put_cfg = kvaf.PutExecutionConfig("urma", "aiv")
+get_cfg = kvaf.GetExecutionConfig("urma", "aiv", "direct")
+runtime = kvaf.NpuRuntime(
+    656, 128, device_id=device_id, transport_mode="urma",
+    default_put=put_cfg, default_get=get_cfg,
+    put_resources=[(put_cfg, kvaf.ExecutionResources(cores=2, jettys=2))],
+    get_resources=[(get_cfg, kvaf.ExecutionResources(cores=2, jettys=2))],
+)
+# 默认从本次构建目录寻找 kernel；需要覆盖路径时给相应资源项传 kernel_path。
+```
+
+### 公开接口速查
+
+以下 `cfg` 分别是 Put/Get 配置，`capacity` 是请求数组容量或 Put 条目数预算，不是字节数。
+`stream=None` 使用调用线程的 `torch.npu.current_stream()`。未列出的 keyword-only 参数见
+后面的完整 Get 签名；表中的返回值指成功路径。
+
+```text
+PutExecutionConfig(transport, executor)
+GetExecutionConfig(transport, executor, algorithm)
+ExecutionResources(*, cores=0, jettys=0, request_capacity=65536,
+                   max_inflight_total=None, kernel_path="", cpu_threads=0)
+```
+
+配置字段的合法组合和默认值见[配置、预热与普通调用](#配置预热与普通调用)。
+调用传入 `execution=cfg` 是选择一份完整配置，不是合并部分字段；资源预算属于 Runtime
+构造配置，不能通过修改 cfg 临时调整核数、容量或 kernel。
+
+| 接口 | 返回值及适配要求 |
+|---|---|
+| `link_to(address)` / `initialize(ddr_bytes, slot_size)` | `None`；连接先于初始化，字节数与槽位布局由应用指定 |
+| `batch_put(keys, source, input_offsets, lengths, stream=None, *, execution=None, input_lease=0)` | `None`；同步写入和事务确认，offset/length 均为字节 |
+| `prepare_access_table(keys)` | Host 表 handle；调用方保存并最终 `release_access_table(handle)` |
+| `access_table_view(handle, device="cpu", capacity=0)` | 默认返回 Host memoryview 字典；`device="npu"` 返回可传给 Get 的 `DeviceAccessTable`，不要遗漏 `device` |
+| `batch_get(...)` | 默认返回 `None`，写入调用方的 output；不会返回新输出 Tensor。仅 AICPU `profile=True, synchronize=True` 返回 Host 分段字典 |
+| `drain_get()` | `None`；等待当前普通 Get 并回收本次执行引用，不销毁驻留上下文；不用于驱动图回放 |
+| `warmup(cfg, *, request_capacity=0, stream=None)` | `None`；可选的资源预热，不代替图节点的真实 forward 预热 |
+| `begin_get_output(execution, output, request_capacity, stream=None)` / `end_get_output(lease)` | begin 返回整数 lease；可选，仅 URMA AIV Direct/Gather 支持，调用携带 `output_lease` |
+| `begin_put_input(execution, input, request_capacity, stream=None)` / `end_put_input(lease)` | begin 返回整数 lease；可选，仅 URMA AIV/AICPU Put 支持，调用携带 `input_lease` |
+| `graph_resources()` | 一张外部图的资源 owner；含 `prepare(stream)`、`capture(stream)`、只读 `leases`、`close(*, discard_result=False)` |
+| `begin_get_graph(execution, output, request_capacity, stream=None)` / `end_get_graph(lease, stream=None, *, discard_result=False)` | 底层显式节点接口，begin 返回整数 lease；采用自动图 scope 的适配器无需逐节点调用 |
+| `check_batch_get_status(stream=None, *, execution=None, graph_lease=0)` | `None`；AICPU 显式完成检查，图查询传具体节点 lease，在 capture 外调用 |
+| `start_batch_get_kernel_profile(detailed=False, *, execution=None)` | `None`；在准备该配置的图节点前启用 |
+| `batch_get_kernel_profile(*, execution=None, graph_lease=0)` | per-worker 报告列表；图查询传具体节点 lease，在完成后、capture 外读取 |
+| `stop_batch_get_kernel_profile(*, execution=None)` | 最后一次报告列表；结束该配置全部图节点后停用 |
+| `recover(cfg)` / `batch_free(keys)` / `shutdown()` | `None`；分别处理指定实例恢复、释放 key、关闭 Runtime，受在途事务及表/图引用约束 |
+
+Get 推荐使用 Runtime 生成的设备表，完整签名如下：
+
+```text
+batch_get(
+    device_access_table, indices, offsets, miss_count, output_indices, output,
+    stream=None, synchronize=False, profile=False, *,
+    execution=None, graph_lease=0, output_lease=0,
+)
+```
+
+上面 `*` 表示签名的关键字参数边界，不是实际调用时传入的字符。另一个重载的前两个参数为
+`addresses, valid`，其后为相同请求参数；使用裸表 Tensor 时，由 adaptor 自行保证映射、DDR
+槽位及有效性，不会因复制设备表而自动建立 Host 表 pin。
+
+| Get Tensor | 设备、形状与单位 |
+|---|---|
+| `indices` | 连续 NPU `int32[capacity]`；取设备表的行号，不是 key 本身 |
+| `offsets` | 连续 NPU `int32[capacity]`；源 block 内字节偏移 |
+| `miss_count` | 连续 NPU `int32[1]`；有效前缀长度，取值 `0..capacity` |
+| `output_indices` | 连续 NPU `int32[capacity]`；每个有效请求的输出行号 |
+| `output` | 连续 NPU Tensor，至少二维，每行实际字节数等于 token_bytes；示例为 `uint8[capacity, token_bytes]` |
+| 裸表 `addresses / valid` | 连续 NPU `int64[N] / uint8[N]`；Runtime 生成的地址 Tensor 为 int64，绑定也接受同宽 uint64，索引及地址有效性仍由调用方保证 |
+
+只有有效前缀对应的输出位置会被写入，Get 不自动清空其他行。`capacity`、输出行数和
+`miss_count` 各有含义；源偏移及目标行号必须在实际 buffer 范围内。
+
+### 最小 Put → Get：公共准备与普通调用
+
+以下公共准备函数也供下一节图示例使用。将代码保存为 Python 文件，在已加载 CANN、
+已启动匹配 CPU 服务、已将 `<build-dir>/python` 加入 `PYTHONPATH` 的 NPU 进程运行。
+环境变量 `KVAF_EXAMPLE_BACKEND` 可选 `aiv`、`ubmem`、`gather_read`、`cpu_push_scatter`；
+每次示例使用同一种 Get，Put 固定选择相同 transport 的 AIV。示例不是性能测试。
+
+```python
+import os
+import torch
+import torch_npu
+import kvaf
+
+TOKEN_BYTES = 656
+TOKENS_PER_BLOCK = 128
+BLOCK_BYTES = TOKEN_BYTES * TOKENS_PER_BLOCK
+
+
+def make_demo_runtime():
+    device_id = int(os.environ.get("DEVICE_ID", "0"))
+    torch.npu.set_device(device_id)
+    device = f"npu:{device_id}"
+    backend = os.environ.get("KVAF_EXAMPLE_BACKEND", "aiv")
+    choices = {
+        "aiv": ("urma", "aiv", "direct"),
+        "ubmem": ("ubmem", "aiv", "direct"),
+        "gather_read": ("urma", "aicpu", "gather"),
+        "cpu_push_scatter": ("urma", "aicpu", "scatter"),
+    }
+    transport, executor, algorithm = choices[backend]
+    put_cfg = kvaf.PutExecutionConfig(transport, "aiv")
+    get_cfg = kvaf.GetExecutionConfig(transport, executor, algorithm)
+    runtime = kvaf.NpuRuntime(
+        TOKEN_BYTES, TOKENS_PER_BLOCK, device_id=device_id,
+        transport_mode=transport, default_put=put_cfg, default_get=get_cfg,
+    )
+    runtime.link_to(os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:38999"))
+    slot_bytes = (BLOCK_BYTES + 4095) // 4096 * 4096
+    runtime.initialize(ddr_bytes=32 * slot_bytes, slot_size=slot_bytes)
+    # 此小例只有一层/一个 pool row，DSA key 为 0、1。
+    source = (torch.arange(2 * BLOCK_BYTES, dtype=torch.int64, device=device)
+              .remainder(251).to(torch.uint8).reshape(2, BLOCK_BYTES))
+    keys = torch.tensor([0, 1], dtype=torch.int64)  # CPU metadata
+    runtime.batch_put(keys, source, [0, BLOCK_BYTES], [BLOCK_BYTES, BLOCK_BYTES])
+    table = runtime.prepare_access_table(keys)
+    device_table = runtime.access_table_view(table, device="npu")
+    torch.npu.current_stream().synchronize()
+    return runtime, get_cfg, table, device_table, source
+
+
+def close_demo_runtime(runtime, table):
+    # 图示例必须先结束外部图与它的 resources，才能执行此收尾。
+    runtime.drain_get()
+    runtime.release_access_table(table)
+    runtime.batch_free([0, 1])
+    runtime.shutdown()
+
+
+runtime, get_cfg, table, device_table, source = make_demo_runtime()
+device = source.device
+stream = torch.npu.current_stream()
+indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+offsets = torch.tensor([0, 0, TOKEN_BYTES, TOKEN_BYTES], dtype=torch.int32, device=device)
+miss_count = torch.tensor([4], dtype=torch.int32, device=device)
+output_indices = torch.arange(4, dtype=torch.int32, device=device)
+output = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8, device=device)
+
+runtime.batch_get(device_table, indices, offsets, miss_count, output_indices, output,
+                  stream=stream, execution=get_cfg)
+# 同 stream 消费可先排入其他算子，再在框架的完成边界 Drain。
+runtime.drain_get()
+expected = torch.stack([source[0, :TOKEN_BYTES], source[1, :TOKEN_BYTES],
+                        source[0, TOKEN_BYTES:2 * TOKEN_BYTES],
+                        source[1, TOKEN_BYTES:2 * TOKEN_BYTES]])
+assert torch.equal(output, expected)
+close_demo_runtime(runtime, table)
+print("KVAF_EAGER_EXAMPLE_PASS")
+```
+
+固定 output 的 eager 性能需要复用注册时，可按[显式输出绑定](#显式输出绑定)包住循环；
+图模式无需另行调用 `begin_get_output`。未使用显式绑定时，普通 Get 仍按相应后端的临时
+注册规则处理；使用图 owner 不能解释为所有 eager 输出自动永久缓存。
+
+<a id="get-graph-example"></a>
+
 ## Get 图模式
 
 四种 Get 推荐通过 `runtime.graph_resources()` 自动管理一张模型图的 Get 节点。用户不需要
 逐层写准备清单或向模型 forward 传入 lease；普通 `batch_get` 在准备/捕获 scope 内自动路由。
 
+### 两个 Get 与其他算子一起捕获的完整示例
+
+本段接在上一节公共准备函数之后执行，重新创建一个小缓存。它在同一模型 forward 中
+执行两次同算法 Get，并在中间及末尾加入普通 Torch copy 算子。实际适配时将这个
+`model_forward` 换成模型已有 forward；Get 所在层只需要按 `DemoReadSite.__call__` 的方式
+提交，不感知自己处于 eager、prepare 还是 capture，也不接收 graph lease。
+
+固定 buffer 必须在 prepare 前存在。若现有模型每次 forward 临时分配 Get output，adaptor
+需先将该 output 调整为对应图 entry 持有的稳定 buffer；自动 scope 不会替应用创建 output，
+也不能将预热分配和 capture 分配视作同一 allocation。
+
 ```python
+class DemoReadSite:
+    """示例中的一个 Get 调用点；实际框架可由每层 adaptor 持有。"""
+    def __init__(self, runtime, get_cfg, device_table, device):
+        self.runtime, self.get_cfg, self.device_table = runtime, get_cfg, device_table
+        self.indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+        self.offsets = torch.zeros(4, dtype=torch.int32, device=device)
+        self.miss_count = torch.tensor([4], dtype=torch.int32, device=device)
+        self.output_indices = torch.arange(4, dtype=torch.int32, device=device)
+        self.output = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8, device=device)
+
+    def __call__(self):
+        self.runtime.batch_get(
+            self.device_table, self.indices, self.offsets, self.miss_count,
+            self.output_indices, self.output, stream=torch.npu.current_stream(),
+            execution=self.get_cfg, synchronize=False, profile=False,
+        )
+        return self.output
+
+
+runtime, get_cfg, table, device_table, source = make_demo_runtime()
+read_stream = torch.npu.Stream()
+with torch.npu.stream(read_stream):
+    first = DemoReadSite(runtime, get_cfg, device_table, source.device)
+    second = DemoReadSite(runtime, get_cfg, device_table, source.device)
+    intermediate = torch.empty_like(first.output)
+    model_output = torch.empty_like(second.output)
+read_stream.synchronize()
+
+
+def model_forward():
+    intermediate.copy_(first())  # Get 节点 0 后的普通算子
+    model_output.copy_(second())  # Get 节点 1 后的普通算子
+    return model_output
+
+
 resources = runtime.graph_resources()
-# 只包住一次与目标捕获路径相同的预热；内部的 batch_get 真实执行。
+# 在进入 prepare 前保存 owner；框架在捕获失败时也需要它完成清理。
+graph = torch.npu.NPUGraph()
+graph_entry = {
+    "graph": graph, "kvaf_resources": resources, "stream": read_stream,
+    "sites": (first, second), "table": table, "device_table": device_table,
+    "intermediate": intermediate, "output": model_output,
+}
+
+# 1. 在所有外部 capture 之外，只包住一次与目标路径相同的真实预热。
+# 框架其他普通预热可在此之前进行，不要在同一个 prepare 内循环多次 forward。
 with torch.npu.stream(read_stream):
     with resources.prepare(read_stream):
-        model_forward(dummy_inputs)
+        model_forward()
+# scope 退出时完成普通 Get，并为上面两次调用各准备一个图节点。
+assert len(resources.leases) == 2
 
-# 此 scope 不启动 torch capture，只关联 KVAF 的准备结果。
-graph = torch.npu.NPUGraph()
+# 2. capture scope 包在框架原有的实际图捕获上下文外面。
+# KVAF 的 scope 自己不启动 Torch capture；一个 owner 只对应一张外部图。
 with resources.capture(read_stream):
     with torch.npu.graph(graph, stream=read_stream):
-        model_forward(dummy_inputs)
+        model_forward()
 
-# 更新固定输入内容；调用方保证共享通信资源上无其他在途执行。
+# 3. 原地更新固定输入并回放。不要把 first.offsets 替换为新的 Tensor。
+# 示例为便于校验在每次回放后等待；框架可在自己的消费/调度边界建立完成依赖。
 with torch.npu.stream(read_stream):
+    first.offsets.fill_(TOKEN_BYTES)       # 节点 0 改读各 block 的 token 1
+    second.offsets.fill_(2 * TOKEN_BYTES)  # 节点 1 改读各 block 的 token 2
     graph.replay()
 read_stream.synchronize()
-# 可选报告查询（先在 prepare 前启用 profiling）：
-# profiles = runtime.batch_get_kernel_profile(graph_lease=resources.leases[0])
 
-# 不再 replay，先销毁图，再释放它持有的资源。
+source_cpu = source.cpu().reshape(2, TOKENS_PER_BLOCK, TOKEN_BYTES)
+expected_first = source_cpu[[0, 1, 0, 1], 1]
+expected_second = source_cpu[[0, 1, 0, 1], 2]
+assert torch.equal(first.output.cpu(), expected_first)
+assert torch.equal(intermediate.cpu(), expected_first)
+assert torch.equal(model_output.cpu(), expected_second)
+
+# 4. 仍使用同一张图，令两个节点分别处理部分请求和零请求。
+# 清零属于本例的校验准备，实际模型应自行处理未写入行及其有效 mask。
+with torch.npu.stream(read_stream):
+    first.output.zero_()
+    second.output.zero_()
+    first.miss_count.fill_(2)
+    second.miss_count.fill_(0)
+    graph.replay()
+read_stream.synchronize()
+expected_partial = torch.zeros_like(expected_first)
+expected_partial[:2].copy_(expected_first[:2])
+assert torch.equal(intermediate.cpu(), expected_partial)
+assert torch.count_nonzero(model_output).item() == 0
+
+# 不为每次 replay 调用 drain_get/begin_get_output/begin_get_graph。
+# 5. 图缓存淘汰或退出：停止提交、等待、销毁外部图，然后结束 KVAF 资源。
 graph.reset()
 resources.close()
+close_demo_runtime(runtime, table)
+print("KVAF_GRAPH_EXAMPLE_PASS")
 ```
+
+`resources.leases` 的顺序是 prepare 中的 Get 调用顺序，本例为 first、second。
+该列表只用于显式诊断，正常模型 forward 和 replay 无需传递它。
+上述示例是两个相同算法节点；替换模型回调不等于已完成真实模型或图内混合算法的硬件验收。
+
+<a id="framework-graph-integration"></a>
+
+### vLLM/模型框架应接入的位置
+
+下面的 graph entry、graph key、model forward 都指框架现有概念，具体函数名随 vLLM/
+vllm-ascend 版本而异；KVAF 不提供名为 model_forward 或 graph_cache 的 vLLM 接口。
+适配器应把外层生命周期接入图 runner/图缓存，把普通 Get 放在层内 adaptor 中。
+
+| 框架阶段 | 需要接入的动作 |
+|---|---|
+| Worker/adaptor 初始化 | 每设备建立 Runtime、连接 CPU 服务、初始化池，保存执行配置和资源预算 |
+| 图 entry 静态输入准备 | 确定容量、设备表、每个 Get 的固定输入及输出；按图 key 保存必要对象 |
+| 框架已有的常规预热 | 可以保留；为目标图选一次真实 forward 包入 `resources.prepare(stream)`，其 Get 数量和顺序必须与 capture 一致 |
+| 框架已有的 capture | 在实际 Torch/ACL capture 的外层增加 `resources.capture(stream)`；层内继续调用普通 `batch_get` |
+| 运行时 replay | 在该图的 stream 上原地更新静态输入，使用框架原生 replay；沿用框架的输出消费和完成依赖 |
+| eager fallback | 用普通 `batch_get`，在普通请求完成边界执行 `drain_get()` 或同步调用；与其他图由框架保证资源串行 |
+| 图缓存淘汰/重捕获 | 保留旧 entry，先完成并销毁旧图，再 close 旧资源；为新图建立新的 owner |
+| Worker shutdown | 所有图停止并完成、逐张销毁和 close，结束显式绑定，释放表，最后 shutdown Runtime |
+
+图缓存可以保存如下关联；无需为每轮 decode 创建新的资源对象：
+
+```python
+# graph_key 使用框架自己的静态形状/执行路径 key；示意对象均由上述捕获流程取得。
+graph_cache[graph_key] = graph_entry
+
+# 正常淘汰的顺序；只有全部成功才移除 entry，以便失败后保留依赖并重试。
+entry = graph_cache[graph_key]
+entry["stream"].synchronize()
+entry["graph"].reset()
+entry["kvaf_resources"].close()
+del graph_cache[graph_key]
+```
+
+框架若在一轮预热中执行不同分支，不能将它们全部放入同一个 prepare，然后只捕获其中
+一条。一次 prepare 对应一次目标 forward；不同容量或不同执行路径的图各用一个 owner。
+Python scope 在同一 Runtime 上不可嵌套，也不能跨线程进入/退出。
+
+### 静态地址、动态请求与容量
+
+| 图存续期间保持固定 | 可以在正确依赖下原地更新 |
+|---|---|
+| 每个节点的算法配置、调用顺序/数量、请求数组容量 | indices、offsets、output_indices 的内容 |
+| Get output 的地址、storage、大小和 device | miss_count 的值，包含 0；但不能超过请求容量 |
+| 捕获到的输入/设备表 Tensor 地址和形状 | 固定 input/output 的数据；框架保证不存在重叠使用 |
+| 每张图的 stream，以及图节点引用的工作区地址 | 图 A 完成后串行执行图 B 或 eager，再执行 A |
+
+零请求时仍调用该 Get，传入 `miss_count=0`，不要用 Python 条件跳过节点。回放不会重新
+执行 Python，不能靠回放前更换 Python 属性或重新构造 DeviceAccessTable 改变图内指针。
+本例固定 key 和表；实际框架若动态更新设备表内容，必须维护映射与 DDR 槽位 pin 的一致性，
+不能释放/复用图仍引用的缓存槽位。裸 addresses/valid 重载的这部分责任在 adaptor。
+
+同算法多个图要先准备最大请求容量：可在首图前调用
+`runtime.warmup(cfg, request_capacity=max_capacity, stream=stream)`，随后每个图仍各自
+执行真实 `resources.prepare`。只填 `ExecutionResources(request_capacity=max_capacity)`
+声明预算不能代替实际预热；已有图固定工作区后，再要求更大容量可能返回 Busy。
+构建图的容量顺序和模型 dummy 输入应由框架统一管理。
+
+同一 Runtime 的不同图可以有不同 stream，但当前不自动保护共享队列/工作区免于重叠。
+可以先等待前一 stream 完成再切换；已有事件依赖也可用于建立等价的执行顺序。
+仅在 Host 上先后调用两张图的异步 replay 不代表设备上已串行。
+
+### 诊断与失败处理
+
+正常回放只提交图和建立消费依赖。需要按节点检查时，在 capture 外、完成后使用
+`runtime.check_batch_get_status(stream, graph_lease=resources.leases[i])`（AICPU）。
+profiling 则在 prepare 前对该配置 start，完成后调用
+`runtime.batch_get_kernel_profile(graph_lease=resources.leases[i])`；结束该配置全部图后 stop。
+`batch_get(profile=True)` 是 AICPU 同步调用的 Host 分段接口，不能放入 capture，也不等于
+kernel profiling 开关。
+
+prepare/capture/回放发生异常时，框架继续持有 entry。先退出 capture，停止相关回放、确认
+在途工作安全完成并销毁外部图，再 `resources.close(discard_result=True)`。discard 只取消
+结果要求，不跳过 DMA 安全要求；close 失败仍保留 owner、Tensor 和 stream，不能直接删除
+entry。共享实例故障涉及其他图时，先停止和销毁引用该实例的全部图，再按下述恢复规则结束
+各 owner；完成未知不能通过强行清缓存来恢复。
+
+### 图资源契约及底层显式接口
 
 每个资源对象只 prepare/capture 一次。prepare 结束时完成普通 Get 并在图外创建节点，
 capture 检查调用配置、输出 storage/地址/大小、请求容量和节点顺序/数量；不匹配时拒绝，

@@ -1,5 +1,11 @@
 # Python Bindings
 
+应用接口以[实现与使用](../docs/cache_transport_execution_implementation.md)为详细入口：
+[main 接口迁移、签名及最小示例](../docs/cache_transport_execution_implementation.md#python-migration)，
+[Get 图模式完整示例](../docs/cache_transport_execution_implementation.md#get-graph-example)，
+[vLLM/模型框架接入位置](../docs/cache_transport_execution_implementation.md#framework-graph-integration)。
+下文是绑定布局与使用约束摘要，不要求应用阅读测试脚本才能构造请求。
+
 本目录是 KVAF C++ 核心与 Python 之间的可选绑定层，使用 Pybind11 构建 `_kvaf` 原生扩展。
 
 `./build.sh npu` 默认将 AIV URMA、UBmem 和 AICPU Gather/Scatter 构建进同一个
@@ -102,5 +108,6 @@ request_capacity, stream=None)`，将返回 ID 作为后续 `batch_get(..., outp
 底层 storage；Python 引用保活不等于 storage 不可变。
 
 每种 Get 配置可持有一个输出绑定，固定该配置和输出分配；不同配置的绑定可共存，
-Get 仍串行完成，Put 不受影响。未绑定调用按次完成后注销输出。完整例子、错误处理和性能计时方式见
+Get 仍串行完成，Put 不受影响。未绑定调用按临时注册规则完成并退役自身引用；匹配的注册若仍被图持有则保留。
+完整例子、错误处理和性能计时方式见
 [实现与使用](../docs/cache_transport_execution_implementation.md#显式输出绑定)。

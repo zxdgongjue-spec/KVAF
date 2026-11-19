@@ -8,6 +8,10 @@
 | [实现与使用](cache_transport_execution_implementation.md) | 代码如何分层；资源和调用如何流转；如何使用输入/输出绑定、四种 Get 图租约、状态检查与 profiling。 |
 | [验证步骤](cache_transport_execution_validation.md) | 如何部署、运行当前性能入口及数据预检，并按相同版本、API 路径和完成口径比较性能；说明已移除的独立测试覆盖。 |
 
+调用方从 main 升级时直接读[接口迁移与最小示例](cache_transport_execution_implementation.md#python-migration)。
+vLLM/模型框架适配见[两个 Get 与普通算子混合捕获的示例](cache_transport_execution_implementation.md#get-graph-example)
+和[图 runner、层内 adaptor、回放及图缓存淘汰的接入位置](cache_transport_execution_implementation.md#framework-graph-integration)。
+
 设计文档末尾保留的资源共享与上下文驻留草稿不是全量已实现清单；其当前落地范围以正文的状态对照为准。
 
 其他文档按主题补充：
