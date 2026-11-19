@@ -332,6 +332,11 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     check(inputs.fixed, args.miss_count)
     with captured_get(args, runtime, torch, kvaf, execution, output, stream, submit) as graph:
         validate_graph_inputs(graph, inputs, check, args.miss_count, args.graph_replays)
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+        start_event.record(stream)
+        end_event.record(stream)
+        end_event.synchronize()
         for iteration in range(args.warmup):
             inputs.prepare(args.miss_count)
             graph.replay()
@@ -340,10 +345,11 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         durations, profiles = [], []
         for iteration in range(args.iterations):
             inputs.prepare(args.miss_count)
-            start = time.perf_counter()
+            start_event.record(stream)
             graph.replay()
-            graph.synchronize()
-            durations.append((time.perf_counter() - start) * 1000)
+            end_event.record(stream)
+            end_event.synchronize()
+            durations.append(float(start_event.elapsed_time(end_event)))
             check(inputs.fixed, args.miss_count)
             if args.kernel_profile:
                 profiles.append(list(runtime.batch_get_kernel_profile()))
