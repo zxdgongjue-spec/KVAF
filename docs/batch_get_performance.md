@@ -53,6 +53,29 @@ UBMEM 同时开启地址准备、MTE 提交和最终 drain 的细分采样。
 开启后算子内打点的开销计入测得时间，profile 回读和结果打印在计时外。
 阶段可嵌套或重叠，各段 P50 不能相加得到总 P50。
 
+## 导出 CSV
+
+在原性能命令上加 `--summary-csv`。例如在 Device 2 上测 UBMEM 的 eager 和 graph，
+同时导出算子分段明细：
+
+```bash
+DEVICE_ID=2 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --peer 127.0.0.1:21111 --backend ubmem --aiv-cores 16 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --warmup 10 --iterations 100 --kernel-profile \
+  --summary-csv reports/get-ubmem-4096.csv \
+  --profile-csv reports/get-ubmem-4096-profile.csv
+```
+
+总结表每个执行模式一行，列名固定，可以合并不同后端的结果。`e2e_p50_GBps`
+是端到端有效带宽，`kernel_p50_GBps` 是算子有效带宽。未开启 profiling 时，
+`kernel_*` 指标留空；`aiv_cores`、`aicpu_workers` 和 Jetty 等参数只填适用项。
+
+`--profile-csv` 可选，须与 `--kernel-profile` 一起使用。明细表每个指标一行，
+用 `kind`、`name`、`metric` 区分阶段、AIV core 或 AICPU worker 的统计值。
+时间、周期和带宽单位在指标名中标明。CSV 在测试成功后写出；扫描时给每组用例不同的
+文件名，同名文件会被覆盖。
+
 ## 扫描负载
 
 扫描使用同一入口的普通循环，例如将单点命令中的 `--miss-count` 替换成

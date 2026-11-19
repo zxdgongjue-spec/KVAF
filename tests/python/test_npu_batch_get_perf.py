@@ -42,6 +42,7 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.backend import detect_torch_backend
+from utils.batch_get_csv import BatchGetCsv
 from utils.batch_get_workload import token_pattern
 from utils.dsa_keys import build_dsa_keys
 from utils.get_graph import GraphInputs, captured_get, captured_get_nodes, validate_graph_inputs
@@ -64,6 +65,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
     parser.add_argument("--kernel-profile", action="store_true",
                         help="enable device profiling and detailed output, including UBMEM address/MTE/drain timings; default: off")
+    parser.add_argument("--summary-csv", type=Path, help="write latency and bandwidth by execution mode to CSV")
+    parser.add_argument("--profile-csv", type=Path, help="write device stage and worker metrics to CSV; requires --kernel-profile")
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
                             environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
@@ -108,7 +111,13 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "iterations must be positive"
     if args.kernel_profile and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.profile_csv is not None and not args.kernel_profile:
+        return "profile-csv requires --kernel-profile"
+    if args.summary_csv is not None and args.profile_csv is not None and args.summary_csv.resolve() == args.profile_csv.resolve():
+        return "summary-csv and profile-csv must use different paths"
     if args.contention_control_dir is not None:
+        if args.summary_csv is not None or args.profile_csv is not None:
+            return "single-card CSV options do not apply to contention workers"
         if args.contention_graph_calls != 1:
             return "graph leases support one Get per graph; use --graph-calls 1"
         if args.execution != "eager":
@@ -155,7 +164,21 @@ def start_kernel_measurement(args, runtime):
     return True
 
 
-def print_aicpu_details(args, execution, samples):
+def format_fields(fields):
+    return " ".join(f"{name}={value}" for name, value in fields.items())
+
+
+def collect_profile_metrics(details, kind, name, metrics):
+    if details is not None:
+        details.extend((kind, name, metric, value) for metric, value in metrics.items())
+
+
+def print_profile_row(prefix, labels, metrics, details, kind, name):
+    print(f"{prefix} {format_fields(labels)} {format_fields(metrics)}")
+    collect_profile_metrics(details, kind, name, metrics)
+
+
+def print_aicpu_details(args, execution, samples, details=None):
     fields = ("request_us", "descriptor_cache_us", "source_write_us", "notify_us", "read_us",
               "read_setup_us", "wr_build_us", "ready_wait_us", "post_us", "cq_wait_us", "scatter_us", "ack_us")
     if any("stages" not in worker for sample in samples for worker in sample):
@@ -164,16 +187,19 @@ def print_aicpu_details(args, execution, samples):
           "aggregation=per_sample_worker_max stages_overlap=1 profiling_overhead_included=1")
     for field in fields:
         values = [max(float(worker["stages"][field]) for worker in sample) for sample in samples]
-        print(f"BATCH_GET_PROFILE backend={args.backend} execution={execution} stage={field[:-3]} "
-              f"mean_us={statistics.mean(values):.6f} p50_us={percentile(values, .5):.6f} "
-              f"p99_us={percentile(values, .99):.6f}")
+        stage = field[:-3]
+        metrics = dict(mean_us=f"{statistics.mean(values):.6f}", p50_us=f"{percentile(values, .5):.6f}",
+                       p99_us=f"{percentile(values, .99):.6f}")
+        print_profile_row("BATCH_GET_PROFILE", dict(backend=args.backend, execution=execution, stage=stage),
+                          metrics, details, "stage", stage)
     for worker in range(args.parallelism):
-        print(f"BATCH_GET_PROFILE_WORKER backend={args.backend} execution={execution} worker={worker} " +
-              " ".join(f"{field}_mean={statistics.mean(float(sample[worker]['stages'][field]) for sample in samples):.6f}"
-                       for field in fields))
+        metrics = {f"{field}_mean": f"{statistics.mean(float(sample[worker]['stages'][field]) for sample in samples):.6f}"
+                   for field in fields}
+        print_profile_row("BATCH_GET_PROFILE_WORKER", dict(backend=args.backend, execution=execution, worker=worker),
+                          metrics, details, "worker", worker)
 
 
-def print_measurements(args, execution, samples, profiles):
+def print_measurements(args, execution, samples, profiles, report=None):
     """Keep end-to-end and operator wall time distinct; count payload once."""
     scopes = [("end_to_end", samples, "host_perf_counter")]
     profiling = args.kernel_profile
@@ -183,12 +209,18 @@ def print_measurements(args, execution, samples, profiles):
         scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
                        "device_ns" if uses_aicpu(args) else "device_cycles"))
     payload = args.miss_count * args.token_bytes
+    measurements = {}
+    timing = args.get_timing if execution == "eager" else "graph-replay-wait"
     for scope, durations, source in scopes:
         mean = statistics.mean(durations)
         if mean <= 0:
             raise AssertionError("nonpositive BatchGet timing")
         p50, p90, p99 = (percentile(durations, q) for q in (.5, .9, .99))
-        timing = args.get_timing if execution == "eager" else "graph-replay-wait"
+        metrics = dict(mean_us=f"{mean * 1000:.6f}", p50_us=f"{p50 * 1000:.6f}",
+                       p90_us=f"{p90 * 1000:.6f}", p99_us=f"{p99 * 1000:.6f}",
+                       mean_GBps=f"{payload / mean / 1e6:.6f}", p50_GBps=f"{payload / p50 / 1e6:.6f}",
+                       p99_GBps=f"{payload / p99 / 1e6:.6f}", mean_GiBps=f"{payload / (mean / 1000) / 1024**3:.6f}")
+        measurements["e2e" if scope == "end_to_end" else scope] = metrics
         cleanup_excluded = scope == "kernel" or execution == "graph"
         print(
             f"BATCH_GET_RESULT backend={args.backend} execution={execution} "
@@ -197,22 +229,23 @@ def print_measurements(args, execution, samples, profiles):
             f"samples={len(durations)} table_capacity={args.table_capacity} "
             f"request_length={args.request_length} miss_count={args.miss_count} "
             f"token_bytes={args.token_bytes} payload_bytes_per_call={payload} workers={args.parallelism} "
-            f"mean_us={mean * 1000:.6f} p50_us={p50 * 1000:.6f} "
-            f"p90_us={p90 * 1000:.6f} p99_us={p99 * 1000:.6f} "
-            f"mean_GBps={payload / mean / 1e6:.6f} p50_GBps={payload / p50 / 1e6:.6f} "
-            f"p99_GBps={payload / p99 / 1e6:.6f} "
-            f"mean_GiBps={payload / (mean / 1000) / 1024**3:.6f} "
+            f"{format_fields(metrics)} "
             f"timing_source={source} profiling_enabled={int(profiling)} detail_output_enabled={int(args.kernel_profile)} "
             "input_updates_and_validation_excluded=1 profile_readback_excluded=1",
             flush=True,
         )
-    if args.kernel_profile:
+    if report is not None and report.summary_path is not None:
+        report.add_summary(execution, timing, len(samples), measurements)
+    if profiling:
+        details = [] if report is not None and report.profile_path is not None else None
         if uses_aicpu(args):
-            print_aicpu_details(args, execution, profiles)
+            print_aicpu_details(args, execution, profiles, details)
         else:
             print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.parallelism,
                                  args.jettys_per_core, args.request_length, args.miss_count,
-                                 args.token_bytes, args.transport)
+                                 args.token_bytes, args.transport, details)
+        if details is not None:
+            report.add_profile(execution, details)
 
 
 def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
@@ -271,7 +304,7 @@ def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
 
 
 def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
-                         miss_count, output, check_output, execution=None):
+                         miss_count, output, check_output, execution=None, report=None):
     execution = execution or BenchmarkExecution(
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
@@ -315,7 +348,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             if args.kernel_profile:
                 profiles.append(list(runtime.batch_get_kernel_profile()))
         graph.validated = True
-        print_measurements(args, "graph", durations, profiles)
+        print_measurements(args, "graph", durations, profiles, report)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
               "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
 
@@ -386,9 +419,18 @@ def print_samples(
     print(result)
 
 
+def kernel_stage_metrics(milliseconds, cycles, precision):
+    metrics = {}
+    for unit, samples, digits in (("ms", milliseconds, precision), ("cycles", cycles, 3)):
+        metrics[f"mean_{unit}"] = f"{statistics.mean(samples):.{digits}f}"
+        for q in (50, 90, 99):
+            metrics[f"p{q}_{unit}"] = f"{percentile(samples, q / 100):.{digits}f}"
+    return metrics
+
+
 def print_ubmem_kernel_profile(
     samples: list[list[dict[str, object]]], warmup: int, clock_mhz: int,
-    miss_count: int, token_bytes: int,
+    miss_count: int, token_bytes: int, details=None,
 ) -> None:
     # Take every stage from the same slowest core in each sample. Independent
     # stage maxima can come from different cores and would not sum to total.
@@ -436,24 +478,15 @@ def print_ubmem_kernel_profile(
         )
     for stage, cycles in stages.items():
         milliseconds = [value / clock_mhz / 1000.0 for value in cycles]
-        result = (
-            f"PERF_RESULT operation=batch_get_{stage} "
-            f"samples={len(samples)} warmup_excluded={warmup} "
-            f"mean_ms={statistics.mean(milliseconds):.6f} "
-            f"p50_ms={percentile(milliseconds, 0.50):.6f} "
-            f"p90_ms={percentile(milliseconds, 0.90):.6f} "
-            f"p99_ms={percentile(milliseconds, 0.99):.6f} "
-            f"mean_cycles={statistics.mean(cycles):.3f} "
-            f"p50_cycles={percentile(cycles, 0.50):.3f} "
-            f"p90_cycles={percentile(cycles, 0.90):.3f} "
-            f"p99_cycles={percentile(cycles, 0.99):.3f} "
-            f"detail={int(detailed)} transport=ubmem"
-        )
+        metrics = kernel_stage_metrics(milliseconds, cycles, 6)
+        fields = dict(metrics, detail=int(detailed), transport="ubmem")
         if stage == "kernel_total":
             useful_bytes = len(samples) * miss_count * token_bytes
             gibps = useful_bytes / (1024.0**3) / (sum(milliseconds) / 1000.0)
-            result += f" useful_GiBps={gibps:.3f}"
-        print(result)
+            metrics["useful_GiBps"] = fields["useful_GiBps"] = f"{gibps:.3f}"
+        print(f"PERF_RESULT operation=batch_get_{stage} samples={len(samples)} warmup_excluded={warmup} "
+              f"{format_fields(fields)}")
+        collect_profile_metrics(details, "stage", stage, metrics)
 
 
 def print_kernel_profile(
@@ -466,12 +499,13 @@ def print_kernel_profile(
     miss_count: int,
     token_bytes: int,
     transport: str = "urma",
+    details=None,
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
 
     if transport == "ubmem":
-        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes)
+        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes, details)
         return
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
@@ -598,36 +632,20 @@ def print_kernel_profile(
     total_useful_bytes = len(samples) * miss_count * token_bytes
     for stage, values in stage_samples.items():
         cycle_values = [value * clock_mhz * 1000.0 for value in values]
-        useful_gibps = ""
+        metrics = kernel_stage_metrics(values, cycle_values, 3)
+        fields = dict(metrics, units=f"{request_length}_requests_per_call")
         if stage == "kernel_total":
-            useful_gibps = (
-                " useful_GiBps="
+            metrics["useful_GiBps"] = fields["useful_GiBps"] = (
                 f"{total_useful_bytes / (1024.0**3) / (sum(values) / 1000.0):.3f}"
             )
-        print(
-            "PERF_RESULT "
-            f"operation=batch_get_{stage} samples={len(values)} "
-            f"warmup_excluded={warmup} "
-            f"mean_ms={statistics.mean(values):.3f} "
-            f"p50_ms={percentile(values, 0.50):.3f} "
-            f"p90_ms={percentile(values, 0.90):.3f} "
-            f"p99_ms={percentile(values, 0.99):.3f} "
-            f"mean_cycles={statistics.mean(cycle_values):.3f} "
-            f"p50_cycles={percentile(cycle_values, 0.50):.3f} "
-            f"p90_cycles={percentile(cycle_values, 0.90):.3f} "
-            f"p99_cycles={percentile(cycle_values, 0.99):.3f} "
-            f"units={request_length}_requests_per_call{useful_gibps}"
-        )
+        print(f"PERF_RESULT operation=batch_get_{stage} samples={len(values)} warmup_excluded={warmup} "
+              f"{format_fields(fields)}")
+        collect_profile_metrics(details, "stage", stage, metrics)
     divisor = float(len(samples))
     for core, accumulator in enumerate(per_core):
-        print(
-            "KERNEL_PROFILE_CORE "
-            f"core={core} samples={len(samples)} "
-            + " ".join(
-                f"{name}_mean={value / divisor:.6f}"
-                for name, value in accumulator.items()
-            )
-        )
+        metrics = {f"{name}_mean": f"{value / divisor:.6f}" for name, value in accumulator.items()}
+        print_profile_row("KERNEL_PROFILE_CORE", dict(core=core, samples=len(samples)),
+                          metrics, details, "core", core)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -705,13 +723,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch = backend.torch
     assert torch is not None
     torch.npu.set_device(args.device_id)
+    report = BatchGetCsv(args) if args.summary_csv is not None or args.profile_csv is not None else None
     if args.execution != "eager" or args.contention_control_dir is not None:
         with torch.npu.stream(torch.npu.Stream(device=args.device_id)):
-            return run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service)
-    return run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service)
+            result = run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report)
+    else:
+        result = run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report)
+    if result == 0 and report is not None:
+        try:
+            report.write()
+        except OSError as error:
+            print(f"FAIL: could not write BatchGet CSV: {error}", file=sys.stderr)
+            return 1
+    return result
 
 
-def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
+def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report=None):
     device_id = args.device_id
     request_length = args.request_length
     token_bytes = args.token_bytes
@@ -973,7 +1000,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
               "bandwidth=useful_payload_once")
         if args.execution == "graph":
             run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
-                                device_table, miss_count, output, check_output, execution)
+                                device_table, miss_count, output, check_output, execution, report)
             return 0
 
         execution.bind_output(runtime, output)
@@ -1067,10 +1094,10 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
             token_bytes,
             execution_mode=args.execution_mode,
         )
-        print_measurements(args, "eager", batch_get_samples, kernel_profile_samples)
+        print_measurements(args, "eager", batch_get_samples, kernel_profile_samples, report)
         if args.execution == "both":
             run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
-                                device_table, miss_count, output, check_output, execution)
+                                device_table, miss_count, output, check_output, execution, report)
         if kernel_profile_started:
             runtime.stop_batch_get_kernel_profile()
             print("BATCH_GET_KERNEL_PROFILE_DISABLED")
