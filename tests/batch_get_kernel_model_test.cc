@@ -13,7 +13,7 @@
 #define __attribute__(...)
 #include "../access_operator/demo/aiv_batch_get/kernel/execute_batch_get_aiv.asc"
 #undef __attribute__
-using namespace kvaf_device;
+#include "kvaf_batch_get_device.h"
 
 #define CHECK(condition) do { if (!(condition)) { \
   std::cerr << "line " << __LINE__ << ": " #condition "\n"; std::exit(1); \
