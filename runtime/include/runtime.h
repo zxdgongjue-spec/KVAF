@@ -94,7 +94,8 @@ class RuntimeCore {
 
   Status BatchGet(
       const BatchGetRequest& request,
-      const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
+      const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{},
+      BatchGetHostTiming* host_timing = nullptr);
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);

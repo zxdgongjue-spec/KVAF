@@ -7,7 +7,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -27,6 +30,57 @@ namespace py = pybind11;
 
 namespace kvaf {
 namespace {
+
+class GetCallTrace {
+ public:
+  struct Row {
+    GetExecutionConfig config;
+    const char* path;
+    BatchGetHostTiming timing;
+  };
+  explicit GetCallTrace(std::string path) : path_(std::move(path)) { rows_.reserve(256); }
+  ~GetCallTrace() { Flush(); }
+  void Record(GetExecutionConfig config, const char* path, BatchGetHostTiming timing) {
+    rows_.push_back({config, path, timing});
+  }
+  void Flush() {
+    if (rows_.empty()) return;
+    std::ofstream output(path_, std::ios::app);
+    if (!output) {
+      std::fprintf(stderr, "[KVAF] cannot write Get call trace: %s\n", path_.c_str());
+      return;
+    }
+    const std::pair<const char*, std::uint64_t BatchGetHostTiming::*> fields[] = {
+#define HOST_FIELD(name) {#name, &BatchGetHostTiming::name}
+        HOST_FIELD(tensor_views_ns), HOST_FIELD(request_validation_ns), HOST_FIELD(stream_ns),
+        HOST_FIELD(refs_ns), HOST_FIELD(binding_lock_ns), HOST_FIELD(set_device_ns),
+        HOST_FIELD(core_call_ns), HOST_FIELD(owner_update_ns), HOST_FIELD(total_ns),
+        HOST_FIELD(core_lifecycle_ns), HOST_FIELD(core_table_ns), HOST_FIELD(core_direction_ns),
+        HOST_FIELD(core_previous_drain_ns), HOST_FIELD(core_validate_ns), HOST_FIELD(core_dispatch_ns),
+        HOST_FIELD(core_finish_ns), HOST_FIELD(core_total_ns),
+#undef HOST_FIELD
+    };
+    output.seekp(0, std::ios::end);
+    if (output.tellp() == 0) {
+      output << "event,index,algorithm,path";
+      for (const auto& field : fields) output << ',' << field.first;
+      output << '\n';
+    }
+    for (const auto& row : rows_) {
+      const char* algorithm = row.config.transport == Transport::Ubmem ? "ubmem" :
+          row.config.executor == Executor::Aiv ? "aiv_direct" :
+          row.config.algorithm == GetAlgorithm::Scatter ? "scatter" : "gather";
+      output << "submit," << ++next_index_ << ',' << algorithm << ',' << row.path;
+      for (const auto& field : fields) output << ',' << row.timing.*(field.second);
+      output << '\n';
+    }
+    rows_.clear();
+  }
+ private:
+  std::string path_;
+  std::vector<Row> rows_;
+  std::uint64_t next_index_{};
+};
 
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
@@ -289,6 +343,8 @@ class NpuPythonRuntime final {
     options.npu_eids = std::move(npu_eids);
     options.peer_ub_device = std::move(peer_ub_device);
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
+    if (const char* path = std::getenv("KVAF_GET_DISPATCH_TRACE"); path && *path)
+      get_call_trace_ = std::make_unique<GetCallTrace>(std::string(path) + ".host.csv");
   }
 
   void LinkTo(std::string address) {
@@ -567,6 +623,15 @@ class NpuPythonRuntime final {
                           const py::object& stream, bool synchronize, bool profile,
                           std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease,
                           std::uint64_t output_lease) {
+    BatchGetHostTiming host{};
+    const auto host_begin = get_call_trace_ ? BatchGetProfileNowNs() : 0;
+    auto phase = host_begin;
+    const auto mark = [&](std::uint64_t BatchGetHostTiming::*field) {
+      if (!get_call_trace_) return;
+      const auto now = BatchGetProfileNowNs();
+      host.*field += now - phase;
+      phase = now;
+    };
     if (profile) {
       const auto selected = execution ? execution : native_->default_get();
       if (!synchronize || !selected || selected->executor != Executor::Aicpu)
@@ -582,6 +647,7 @@ class NpuPythonRuntime final {
     const NpuTensorView output_view = GetNpuTensorView(output, "output");
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+    mark(&BatchGetHostTiming::tensor_views_ns);
     if (index_view.shape.size() != 1 || offset_view.shape.size() != 1 ||
         output_index_view.shape.size() != 1 || output_view.shape.size() < 2 ||
         index_view.element_bytes != sizeof(std::int32_t) ||
@@ -618,10 +684,13 @@ class NpuPythonRuntime final {
         AccessTableDeviceView{
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
+    mark(&BatchGetHostTiming::request_validation_ns);
     const aclrtStream acl_stream = ResolveStream(stream);
+    mark(&BatchGetHostTiming::stream_ns);
     auto timings = profile ? std::make_unique<BatchGetProfile>() : nullptr;
     const auto native_begin = profile ? BatchGetProfileNowNs() : 0U;
     auto refs = py::make_tuple(addresses, valid, indices, offsets, miss_count, output_indices, output, stream);
+    mark(&BatchGetHostTiming::refs_ns);
     Status status;
     std::unique_lock<std::mutex> direction(get_mutex_, std::defer_lock);
     decltype(graph_refs_)::iterator graph_ref;
@@ -629,6 +698,7 @@ class NpuPythonRuntime final {
       py::gil_scoped_release release;
       direction.lock();
     }
+    mark(&BatchGetHostTiming::binding_lock_ns);
     if (graph_lease) {
       graph_ref = graph_refs_.find(graph_lease);
       if (graph_ref != graph_refs_.end())
@@ -636,12 +706,20 @@ class NpuPythonRuntime final {
     }
     {
       py::gil_scoped_release release;
-      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
-      else
+      aclError device_status;
+      {
+        BatchGetProfileScope device(get_call_trace_ ? &host.set_device_ns : nullptr);
+        device_status = aclrtSetDevice(native_->device_id());
+      }
+      if (device_status != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
+      else {
+        BatchGetProfileScope call(get_call_trace_ ? &host.core_call_ns : nullptr);
         status = native_->core().BatchGet(
             request, BatchGetExecutionOptions{acl_stream, synchronize, timings.get(), execution,
-                                              graph_lease, output_lease});
+                                              graph_lease, output_lease}, get_call_trace_ ? &host : nullptr);
+      }
     }
+    const auto owner_begin = get_call_trace_ ? BatchGetProfileNowNs() : 0;
     if (graph_lease) {
       if (graph_ref != graph_refs_.end()) graph_ref->second.push_back(std::move(refs));
     } else {
@@ -649,6 +727,12 @@ class NpuPythonRuntime final {
       if (!status.ok() || !synchronize) pending_get_refs_.push_back(std::move(refs));
     }
     ThrowIfError(status);
+    if (get_call_trace_) {
+      host.owner_update_ns = BatchGetProfileNowNs() - owner_begin;
+      host.total_ns = BatchGetProfileNowNs() - host_begin;
+      const auto selected = execution ? execution : native_->default_get();
+      if (selected) get_call_trace_->Record(*selected, graph_lease ? "graph" : output_lease ? "output" : "ordinary", host);
+    }
     if (!profile) return py::none();
     const auto end = BatchGetProfileNowNs();
     auto result = BatchGetProfileDict(*timings);
@@ -856,6 +940,7 @@ class NpuPythonRuntime final {
       pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{};
       put_input_refs_.clear(); pending_put_input_refs_.clear();
     }
+    if (get_call_trace_) get_call_trace_->Flush();
     ThrowIfError(status);
   }
   ~NpuPythonRuntime() {
@@ -891,6 +976,7 @@ class NpuPythonRuntime final {
 
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
+  std::unique_ptr<GetCallTrace> get_call_trace_;
   std::mutex get_mutex_, put_mutex_;
   std::vector<py::object> pending_get_refs_;
   py::object pending_put_ref_;

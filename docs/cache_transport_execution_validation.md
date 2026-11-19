@@ -138,6 +138,20 @@ trace 在 shutdown 时落盘。Get 按算法、路径、事件分组；Put 还�
 与成功/失败。provider 内的准备、提交、完成、清理和 Runtime 外层成本可分别观察。
 分段嵌套或重叠，各段 P50 不能相加得到总 P50；最终性能对照关闭 trace。
 
+Python Get 同时写出 `<trace路径>.host.csv`，汇总命令会自动读取并输出 `GET_HOST_TIMING`。
+只记录成功的提交调用，不增加设备同步或状态回读，未设置 trace 时不读取计时器。
+`total` 是绑定函数内的提交耗时；`tensor_views` 读取七个 Tensor 的元数据和指针，
+`request_validation` 检查布局并组装请求，`stream` 获取 ACL stream，`refs` 保留 Python 引用，
+`binding_lock` 包含绑定层等待锁及对应的 GIL 切换，`set_device` 是 `aclrtSetDevice`，
+`owner_update` 是提交后保存请求引用。`binding_other` 包含剩余 GIL 切换和未单独计时的收尾。
+
+`core_call` 包含 RuntimeCore 的全部调用；其中 `core_table` 查找 AccessTable，
+`core_direction` 等待 Get 方向锁，`core_previous_drain` 收尾前一笔请求，
+`core_validate` 校验请求并保留表引用，`core_dispatch` 是 Dispatcher 的调用，
+`core_finish` 是返回前的请求状态处理。`core_*` 是 `core_call` 内部的分段，不能再加到外层。
+绑定入口前的 Pybind 参数转换和返回转换不在 `total` 内，仍以 Python 的 `batch_get_submit`
+为完整调用计时。异步提交后的等待仍看 Dispatcher `event=drain`，不计入这些提交字段。
+
 多卡并发使用 `tests/run_remote_cpu_batch_get_multicard_perf.sh`，四种 backend 的命令和计时口径见
 [多卡带宽测试](batch_get_multicard_performance.md)。
 

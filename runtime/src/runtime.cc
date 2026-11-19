@@ -333,13 +333,23 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
 }
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
-                             const BatchGetExecutionOptions& execution) {
+                             const BatchGetExecutionOptions& execution,
+                             BatchGetHostTiming* host_timing) {
+  BatchGetProfileScope total(host_timing ? &host_timing->core_total_ns : nullptr);
+  auto phase = host_timing ? BatchGetProfileNowNs() : 0;
+  const auto mark = [&](std::uint64_t BatchGetHostTiming::*field) {
+    if (!host_timing) return;
+    const auto now = BatchGetProfileNowNs();
+    host_timing->*field += now - phase;
+    phase = now;
+  };
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (execution.config && !access_operator_.TracksGetCompletion())
     return Status::NotImplemented("this operator does not support execution configuration or resource leases");
+  mark(&BatchGetHostTiming::core_lifecycle_ns);
   std::shared_ptr<AccessTableState> table_ref;
   {
     std::lock_guard<std::mutex> lock(table_mutex_);
@@ -349,14 +359,17 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   const AccessTableState* table = table_ref.get();
   if (request.access_table.opaque != 0 && !table)
     return Status::NotFound("AccessTable handle was not found");
+  mark(&BatchGetHostTiming::core_table_ns);
   // Pin before any resource wait. This lock serializes only Get submissions.
   std::lock_guard<std::mutex> direction(get_mutex_);
   if (execution.graph_lease && !graph_tables_.count(execution.graph_lease))
     return Status::NotFound("Get graph lease not found");
+  mark(&BatchGetHostTiming::core_direction_ns);
   if (access_operator_.TracksGetCompletion() && !execution.graph_lease) {
     const auto drained = DrainGetLocked();
     if (!drained.ok()) return drained;
   }
+  mark(&BatchGetHostTiming::core_previous_drain_ns);
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
@@ -444,13 +457,16 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     pinned = table_ref;
   } else if (access_operator_.TracksGetCompletion())
     pending_get_table_ = table_ref;
+  mark(&BatchGetHostTiming::core_validate_ns);
   const auto status = access_operator_.ExecuteBatchGet({view, &request, execution});
+  mark(&BatchGetHostTiming::core_dispatch_ns);
   if (status.ok() && execution.synchronize && !execution.graph_lease) pending_get_table_.reset();
   if (!status.ok() && access_operator_.TracksGetCompletion() && !execution.graph_lease) {
     // Preparation failures have no outstanding DMA. Failed submissions retain
     // their pin unless the provider can positively establish completion.
     (void)DrainGetLocked();
   }
+  mark(&BatchGetHostTiming::core_finish_ns);
   return status;
 }
 
