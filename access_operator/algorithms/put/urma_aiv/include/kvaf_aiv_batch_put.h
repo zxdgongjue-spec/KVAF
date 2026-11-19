@@ -1,0 +1,71 @@
+#ifndef KVAF_AIV_BATCH_PUT_H_
+#define KVAF_AIV_BATCH_PUT_H_
+
+#include <stdint.h>
+
+#include "acl/acl.h"
+#include "batch_put_abi.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum KvafBatchPutResult {
+  KVAF_BATCH_PUT_SUCCESS = 0,
+  KVAF_BATCH_PUT_INVALID_ARGUMENT = -1,
+  KVAF_BATCH_PUT_RUNTIME_ERROR = -2,
+  KVAF_BATCH_PUT_EID_ERROR = -3,
+  KVAF_BATCH_PUT_DIRECT_HCCP_ERROR = -4,
+  KVAF_BATCH_PUT_KERNEL_ERROR = -5,
+};
+
+typedef struct KvafBatchPutTransport KvafBatchPutTransport;
+typedef struct KvafBatchPutLocalBuffer KvafBatchPutLocalBuffer;
+
+// On creation failure, a non-null *transport owns partially initialized
+// resources whose cleanup failed. Retain it and retry TransportClose.
+int32_t KvafBatchPutTransportCreateWithPeerLink(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *peer_link,
+    const uint8_t *peer_local_eid, KvafBatchPutTransport **transport);
+// Caller must stop submitting work and synchronize kernel streams first.
+// SUCCESS destroys transport. Failure keeps its handles for Close retry; no
+// further acquisitions/launches are allowed after a close attempt.
+int32_t KvafBatchPutTransportClose(KvafBatchPutTransport *transport);
+// Compatibility wrapper: retain on failure, with no status/retry guarantee.
+void KvafBatchPutTransportDestroy(KvafBatchPutTransport *transport);
+
+// On error, a non-null *local_buffer retains a partially created registration.
+// Keep the caller's HBM alive until LocalBufferRetire or TransportClose succeeds;
+// the partial handle must not be submitted or released into the reusable cache.
+int32_t KvafBatchPutLocalBufferAcquire(KvafBatchPutTransport *transport,
+                                       void *input_device, uint64_t input_device_bytes,
+                                       KvafBatchPutLocalBuffer **local_buffer);
+void KvafBatchPutLocalBufferRelease(KvafBatchPutLocalBuffer *local_buffer);
+// Requires exclusive reference and completed DMA; unregisters without caching.
+int32_t KvafBatchPutLocalBufferRetire(KvafBatchPutLocalBuffer *local_buffer);
+
+int32_t KvafExecuteBatchPutLoadKernel(const char *kernel_object_path);
+
+// Synchronous eager execution: status initialization, launch, status D2H, one
+// stream synchronization, and core-status checking finish before this function
+// returns.
+int32_t KvafExecuteBatchPutSync(KvafBatchPutLocalBuffer *local_buffer,
+                               const KvafExecuteBatchPutKernelArgs *arguments,
+                               aclrtStream stream,
+                               KvafBatchPutCoreStatus *core_status,
+                               uint32_t core_status_count);
+// Optional host diagnostics. Fields accumulate nanoseconds; submit includes
+// status reset, launch and report-copy enqueue, completion includes wait/check.
+int32_t KvafExecuteBatchPutSyncTimed(KvafBatchPutLocalBuffer *local_buffer,
+                                    const KvafExecuteBatchPutKernelArgs *arguments,
+                                    aclrtStream stream,
+                                    KvafBatchPutCoreStatus *core_status,
+                                    uint32_t core_status_count,
+                                    uint64_t *submit_ns, uint64_t *completion_ns);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // KVAF_AIV_BATCH_PUT_H_

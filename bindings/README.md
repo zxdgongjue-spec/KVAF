@@ -1,10 +1,16 @@
 # Python Bindings
 
+应用接口以[实现与使用](../docs/cache_transport_execution_implementation.md)为详细入口：
+[main 接口迁移、签名及最小示例](../docs/cache_transport_execution_implementation.md#python-migration)，
+[Get 图模式完整示例](../docs/cache_transport_execution_implementation.md#get-graph-example)，
+[vLLM/模型框架接入位置](../docs/cache_transport_execution_implementation.md#framework-graph-integration)。
+下文是绑定布局与使用约束摘要，不要求应用阅读测试脚本才能构造请求。
+
 本目录是 KVAF C++ 核心与 Python 之间的可选绑定层，使用 Pybind11 构建 `_kvaf` 原生扩展。
 
 `./build.sh npu` 默认将 AIV URMA、UBmem 和 AICPU Gather/Scatter 构建进同一个
-`build-npu/python/kvaf` 包，并自动安装 AICPU 设备包。运行时按 `transport` 和
-`aicpu_batch_get_mode` 选择后端；仅需 AIV/UBmem 时使用 `--without-aicpu`。
+`build-npu/python/kvaf` 包，并自动安装 AICPU 设备包。运行时按 `transport_mode`、默认 Put/Get 配置及请求的
+`execution` 选择实现；仅需 AIV/UBmem 时使用 `--without-aicpu`。
 
 `include/` 存放 Binding 内部共享头，`src/` 存放扩展实现；Python 包与构建后导入校验脚本保留在本目录。
 
@@ -14,7 +20,7 @@
 C++ 编译 → Python 原生扩展 → Python 导入
 ```
 
-CPU 构建提供进程内 Mock Runtime。启用 `KVAF_ENABLE_AIV_BATCH_GET=ON` 时，额外提供
+CPU 构建提供进程内 Mock Runtime。启用 `KVAF_ENABLE_AIV_BATCH_GET=ON` 或 `KVAF_ENABLE_AICPU_URMA=ON` 时，额外提供
 `NpuRuntime` 与 `AclGraph`：后者是 Python-owned 的 ACL Runtime Graph 薄封装，直接
 暴露 capture / replay / synchronize / destroy 生命周期，用于 Python 集成测试或上层
 Adaptor 的图编排；它不保存 KVAF 请求、Tensor 或 Operator 状态。
@@ -38,46 +44,43 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 一致。`miss_count` 必须是单元素 `torch.int32` NPU Tensor，仅请求数组的
 `[0, miss_count)` 前缀参与搬运。
 
-`NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
-batch_get_tokens_per_block, device_id=0, npu_core_count=2,
-batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
-adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
-adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048,
-transport="urma", *, aicpu_batch_get_mode="")`
-要求显式传入单 token KV
-字节数和每个 KV block 中的 token 数，两个参数均无默认值；
-每个 AccessTable entry 大小为两者乘积。
+```text
+NpuRuntime(batch_get_token_bytes, batch_get_tokens_per_block, *,
+           device_id=0, transport_mode="urma", default_put=None, default_get=None,
+           put_resources=None, get_resources=None, npu_eids=[], peer_ub_device="")
+```
 
-`transport="urma"`、`aicpu_batch_get_mode=""` 使用 AIV Get/Put；
-显式指定 `gather_read` 或 `cpu_push_scatter` 使用 AICPU Get 及配套 AICPU Put。
-`transport="ubmem"` 要求 mode 为空；`gather_read_direct` 不对外开放。
-AICPU 包由 Runtime 从 CANN 安装目录自动定位，删除了公开 JSON 路径参数。
-Gather 和 Scatter 都支持 `npu_eids` 候选列表，按顺序尝试并选用一个 EID，
-不指定时自动发现；AIV 的多 EID 条带语义不变。
-保留原有参数直到 `transport` 的位置参数调用方式；新增的 `aicpu_batch_get_mode`
-仅接受关键字传参。新代码建议使用关键字明确各项配置。
+两个 token 布局参数必须提供；每个 AccessTable entry 的大小为两者乘积。
+其余参数仅接受关键字。`transport_mode` 可为 `"urma"`、`"ubmem"` 或 `"urma+ubmem"`，
+默认算法由 `PutExecutionConfig` / `GetExecutionConfig` 指定，单次调用的 `execution`
+可覆盖默认配置。构建支持且符合 transport 模式的全部 provider 自动可选，无 enable 列表。
+未指定默认配置时优先选当前构建可用的实现；显式选择不可用实现会在首次使用时失败。
 
-`transport` 默认使用 URMA；传入 `transport="ubmem"` 使用 UBmem。UBmem 的 CPU
-内存分配依赖 Ascend HAL 与驱动；CPU 服务根据分配请求选择后端，无需指定协议。
+`put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
+预算按 provider 配置：`cores=0` 使用该算法默认值，URMA AIV Put/Get 为 2、UBMEM AIV
+Put/Get 为 16、AICPU Put 为 1、AICPU Gather/Scatter Get 为 5。URMA AIV 的 `jettys` 默认为 2，Get 支持 1..64、
+Put 支持 1..2；仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 关闭限制，非零须至少为
+`2 * cores`。`request_capacity` 默认 65536，Gather 可额外指定 `cpu_threads`。
+AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
+`bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
+`./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，
+不依赖应用启动目录。资源项中非空的 `kernel_path` 覆盖默认值；移动构建产物后须重新构建
+或显式指定新路径。不使用的算法不检查 kernel 文件。
+AICPU 首次准备时从 CANN 安装目录定位包，不接受资源项 kernel 路径。
+预算变化需新建 Runtime/graph，详见[在途控制](../docs/batch_get_inflight_control.md)。
 
-`jettys_per_core` 配置 BatchGet 每个 AIV core 使用的 Jetty 数量，可选 1 到 64 个独立
-Jetty。BatchPut 保持原有实现：该值为 1 或 2 时使用相同数量，BatchGet 配置为 3 到
-64 时 BatchPut 仍使用 2 个。
-`batch_get_max_inflight_total` 是单次 BatchGet 所有 AIV 核的总请求预算，默认
-2048；0 使用整批提交基线，非零值须至少为 `2 * npu_core_count`。大请求采用
-双组交叠提交，预算变化需新建 Runtime/graph，详见
-[在途控制](../docs/batch_get_inflight_control.md)。
-远程 CPU DDR 只增加 `runtime.link_to("CPU_IP:port")`，必须在 `initialize` 前调用。
-`npu_eids=[]` 时 EID、UMDK device 与候选 RMA 验证由 C++ Runtime 自动完成；
-显式传入多个 32 位十六进制 EID 时，Runtime 为每个 EID 创建独立
-BatchGet 路径，并把 core/Jetty worker 轮转分配到这些路径。BatchPut
-保持原有单 EID 实现，使用列表第一项。该列表是严格配置，不会静默回退。
-`batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收 caller-owned
-NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
-BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
+必须先 `runtime.link_to("CPU_IP:port")` 再 `initialize()`。初始化只建立缓存区域与
+元数据，不执行探测 Put 或启动带宽测速；算法及通信资源在首次使用或 warmup 时准备。
+`npu_eids=[]` 使用首个自动发现的候选；显式列表不回退到自动发现，AIV Get 按自身的
+`cores * jettys` 预算使用整组 EID 条带，Put/AICPU 使用首项。`peer_ub_device` 可固定
+CPU 侧设备。UBmem 不使用 EID，CPU 内存分配依赖 Ascend HAL 与驱动。
+
+`batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收调用方的
+NPU packed input 和每条 block 的 CPU 整数 metadata，同步写入及事务提交完成后返回。
+AIV Put 使用默认或显式指定的可读 kernel，不再回退到 ACL D2H mock。
 
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
-stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
+stream 时使用 `torch.npu.current_stream()`。KVAF 保留执行所需的 stream 引用，但不创建或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
 
@@ -85,9 +88,26 @@ Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Acces
 
 CacheOS-vLLM Adaptor 属于 vLLM 侧实现，不放在本目录。
 
-`adaptive_ub_device=True` 在启动时进行 BatchGet 标定，token 大小沿用
-`batch_get_token_bytes`，请求数由 `adaptive_ub_miss_count` 指定，并为当前 Runtime
-固定最佳组合。K 端未指定设备时，性能脚本从 `KVAF_ADAPTIVE_UB_DEVICES` 中筛选；
-K 端指定单个 `--ub-device` 时走原生路径。`peer_ub_device="NAME"` 用于跨进程复用
-选择结果且不重新标定。默认关闭；用法与协议升级要求见
-[Runtime 启动选优说明](../runtime/README.md#可选启动-ub-device-选优)。
+异步 Get 的设备完成和框架回收通过 `drain_get()` 完成；外部 stream 同步不会自动
+归还执行租约及引用。下一次普通 Get 会先完成前一次 Get。Graph 可使用
+`resources = runtime.graph_resources()`，在一次真实模型预热的 `resources.prepare(stream)`
+scope 中自动收集 Get 节点，再在 `resources.capture(stream)` scope 中进行外部 Torch/ACL
+捕获；模型仍调用普通 `batch_get`，无需传节点租约。保留底层显式 begin/end_get_graph 接口。
+单张图保持固定 stream，不同图可使用不同 stream，调用方负责与普通 Get 串行执行；
+KVAF 不代理外部 replay 或自动安排跨 stream event。停止 replay、同步并销毁关联 graph
+后调用 `resources.close()`；失败保留依赖，未回放或捕获失败可用 `discard_result=True`。
+状态及 profile 的图查询须传 `graph_lease`（由 `resources.leases` 取得），不传则查询 eager；
+profiling 在申请该实例图租约前开启，全部结束后关闭。
+
+### 重复 Get 的输出绑定
+
+URMA AIV Direct / AICPU Gather 可使用 `begin_get_output(execution, output,
+request_capacity, stream=None)`，将返回 ID 作为后续 `batch_get(..., output_lease=id)`
+的参数。`drain_get()` 完成本次调用但保留注册；`end_get_output(id)` 等待并注销。
+成功 shutdown 也会释放绑定。输出绑定期间不得 resize/set_ 或通过别名替换、释放
+底层 storage；Python 引用保活不等于 storage 不可变。
+
+每种 Get 配置可持有一个输出绑定，固定该配置和输出分配；不同配置的绑定可共存，
+Get 仍串行完成，Put 不受影响。未绑定调用按临时注册规则完成并退役自身引用；匹配的注册若仍被图持有则保留。
+完整例子、错误处理和性能计时方式见
+[实现与使用](../docs/cache_transport_execution_implementation.md#显式输出绑定)。

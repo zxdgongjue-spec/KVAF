@@ -4,12 +4,19 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <mutex>
 #include <unordered_map>
+#include <memory>
+#include "execution_config.h"
 
 #include "peer_protocol.h"
 #include "cpu_gather.h"
 #include "status.h"
 
+namespace kvaf::execution {
+struct Request;
+struct Response;
+}  // namespace kvaf::execution
 namespace kvaf::peer {
 
 struct PeerRegion {
@@ -23,6 +30,8 @@ struct PeerRegion {
   std::array<uint8_t, kSegKeyBytes> segment_key{};
   std::array<uint8_t, 128> fabric_handle{};
   uint64_t fabric_mapping_bytes{};
+  // Local descriptor identity; wire encoding remains unchanged.
+  uint64_t epoch = 0U, region_id = 0U;
 };
 
 struct PeerCandidateInfo {
@@ -34,9 +43,19 @@ struct PeerCandidateInfo {
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
 // receives it through LinkTo and never reads process environment.
-class PeerLink {
+class PeerLink : public std::enable_shared_from_this<PeerLink> {
  public:
   explicit PeerLink(std::string address);
+  ~PeerLink() = default;
+  Status AllocateCacheRegion(std::uint64_t logical_bytes, std::uint64_t slot_size,
+                             std::uint64_t auxiliary_bytes, TransportMode, PeerRegion*);
+  std::shared_ptr<PeerLink> ExecutionSession(const execution::Request& config);
+  Status PrepareExecution();
+  Status CloseExecution();
+  Status ResolveExecutionControl();
+  Status QueryExecution(execution::Response*) const;
+  // Typed legacy commands are encapsulated in an idempotent session request.
+  bool Control(const void*, std::size_t, void*, std::size_t, std::string*) const;
 
   const std::string& address() const { return address_; }
   bool has_region() const { return !regions_.empty(); }
@@ -51,6 +70,7 @@ class PeerLink {
   void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);
   Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  Status PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes, PeerRegion* workspace);
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
   Status OpenCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
@@ -76,8 +96,12 @@ class PeerLink {
       uint32_t* peer_psn, bool share_tp);
 
  private:
+  struct ExecutionState;
+  std::shared_ptr<ExecutionState> execution_;
+  std::shared_ptr<PeerLink> parent_;
   std::string address_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
+  mutable std::mutex mapping_mutex_;
   std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;
 };
 

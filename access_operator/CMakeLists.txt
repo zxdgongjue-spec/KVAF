@@ -19,33 +19,34 @@ if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA) AND NOT ASCEND_CANN_PAC
   endif()
   set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_CANN_PACKAGE_PATH}" CACHE PATH "CANN toolkit")
 endif()
-add_subdirectory(src/ubmem)
+add_subdirectory(transports/ubmem)
 
 if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH)
-  add_subdirectory(src/direct_hccp)
+  add_subdirectory(transports/direct_hccp)
 endif()
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  add_subdirectory(demo/aiv_batch_get)
+  add_subdirectory(algorithms/get/direct)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
-    add_subdirectory(demo/aiv_batch_put)
+    add_subdirectory(algorithms/put/urma_aiv)
   endif()
 
   add_library(kvaf_default_access_operator
-    src/access_operator.cc
+    providers/urma_aiv/access_operator.cc
+    providers/urma_aiv/execution_resources.cc
   )
 
   target_include_directories(kvaf_default_access_operator
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_get/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/get/direct/urma_aiv/include
       ${ASCEND_CANN_PACKAGE_PATH}/include
   )
 
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_include_directories(kvaf_default_access_operator
-      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_put/include)
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/put/urma_aiv/include)
   endif()
 
   target_compile_definitions(kvaf_default_access_operator
@@ -78,11 +79,15 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
 endif()
 
 if(KVAF_ENABLE_AICPU_URMA)
-  add_subdirectory(src/aicpu_urma)
-  add_subdirectory(demo/aicpu_batch_get)
-  add_subdirectory(demo/aicpu_batch_put)
-  add_subdirectory(src/aicpu_urma/kernel)
-  add_library(kvaf_aicpu_access_operator STATIC src/aicpu_access_operator.cc)
+  add_subdirectory(transports/aicpu_urma)
+  add_subdirectory(algorithms/get/common/aicpu)
+  add_subdirectory(algorithms/put/urma_aicpu)
+  add_subdirectory(transports/aicpu_urma/kernel)
+  add_library(kvaf_aicpu_access_operator STATIC
+    providers/urma_aicpu/access_operator.cc
+    providers/urma_aicpu/execution_resources.cc)
+  target_include_directories(kvaf_aicpu_access_operator PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/providers/common")
   if(KVAF_ENABLE_AICPU_CPU_PUSH)
     target_compile_definitions(kvaf_aicpu_access_operator PRIVATE KVAF_ENABLE_AICPU_CPU_PUSH=1)
   endif()

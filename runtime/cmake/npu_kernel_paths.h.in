@@ -1,0 +1,8 @@
+#pragma once
+
+namespace kvaf::detail {
+inline constexpr char kDefaultBatchGetKernelPath[] =
+    R"kvaf(@CMAKE_BINARY_DIR@/bin/kvaf_execute_batch_get_kernels.o)kvaf";
+inline constexpr char kDefaultBatchPutKernelPath[] =
+    R"kvaf(@CMAKE_BINARY_DIR@/bin/kvaf_execute_batch_put_kernels.o)kvaf";
+}  // namespace kvaf::detail

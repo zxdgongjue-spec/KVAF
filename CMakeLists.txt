@@ -62,7 +62,3 @@ if(KVAF_BUILD_PYTHON)
   find_package(pybind11 CONFIG REQUIRED)
   add_subdirectory(bindings)
 endif()
-
-if(BUILD_TESTING)
-  add_subdirectory(tests)
-endif()

@@ -169,11 +169,11 @@ build_npu() {
   [[ -n "$cann_root" ]] || die "CANN toolkit not found; source CANN set_env.sh first"
   if [[ "$kernel_action" == check || "$kernel_action" == uninstall ]]; then
     local -a artifact_options=()
-    local artifact_dir="$build_dir/access_operator/src/aicpu_urma"
+    local artifact_dir="$build_dir/access_operator/transports/aicpu_urma"
     if [[ "$kernel_action" == check && -s "$artifact_dir/kernel.json" && -s "$artifact_dir/kvaf-aicpu-urma.tar.gz" ]]; then
       artifact_options+=("$artifact_dir")
     fi
-    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" \
+    bash "$KVAF_ROOT/access_operator/transports/aicpu_urma/package/install_kernel.sh" \
       ${package_options[@]+"${package_options[@]}"} "--$kernel_action" "$cann_root" \
       ${artifact_options[@]+"${artifact_options[@]}"}
     return
@@ -215,9 +215,9 @@ build_npu() {
     ${cmake_options[@]+"${cmake_options[@]}"}
   cmake --build "$build_dir" --parallel "$jobs"
   if [[ "$build_aicpu" == ON ]]; then
-    bash "$KVAF_ROOT/access_operator/src/aicpu_urma/package/install_kernel.sh" \
+    bash "$KVAF_ROOT/access_operator/transports/aicpu_urma/package/install_kernel.sh" \
       ${package_options[@]+"${package_options[@]}"} --install \
-      "$build_dir/access_operator/src/aicpu_urma" "$cann_root"
+      "$build_dir/access_operator/transports/aicpu_urma" "$cann_root"
   fi
   if [[ "$build_python" == ON ]]; then echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"; fi
   if [[ "$build_aiv" == ON ]]; then

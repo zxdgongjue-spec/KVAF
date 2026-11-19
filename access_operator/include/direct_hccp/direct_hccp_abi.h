@@ -51,7 +51,7 @@ enum TargetType : uint32_t {
 };
 
 // HccpEid carries a uint64_t representation in addition to raw bytes, so its
-// ABI alignment is eight even when this demo uses only raw[16].
+// ABI alignment is eight even when this transport uses only raw[16].
 struct alignas(8) Eid {
   uint8_t raw[kEidBytes];
 };
@@ -295,7 +295,7 @@ struct RtNetServiceOpenArgs {
   uint64_t ext_param_count;
 };
 
-// libhccp.so C entry points.  They are loaded with dlsym so this demo does
+// libhccp.so C entry points.  They are loaded with dlsym so this transport does
 // not link HCOMM or need an HCOMM source tree.
 using CtxInitFn = int (*)(CtxInitCfg *, CtxInitAttr *, void **);
 using CtxDeinitFn = int (*)(void *);

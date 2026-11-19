@@ -11,20 +11,23 @@ import sys
 def instrument(source):
     replacements = [
         ('        for _ in range(args.iterations):\n',
-         '        scope_events = []\n        for _ in range(args.iterations):\n'),
+         '        scope_events = []\n        scope_submits = []\n'
+         '        for _ in range(args.iterations):\n'),
         ('            begin = time.perf_counter()\n',
          '            scope_start = torch.npu.Event(enable_timing=True)\n'
          '            scope_end = torch.npu.Event(enable_timing=True)\n'
          '            begin = time.perf_counter()\n'
          '            scope_start.record()\n'),
         ('            submitted = time.perf_counter()\n',
-         '            submitted = time.perf_counter()\n            scope_end.record()\n'),
-        ('            completed = time.perf_counter()\n',
-         '            completed = time.perf_counter()\n'
+         '            submitted = time.perf_counter()\n            scope_end.record()\n'
+         '            scope_submits.append((submitted - begin) * 1000.0)\n'),
+        ('            batch_get_samples.append((completed - begin) * 1000.0)\n',
+         '            batch_get_samples.append((completed - begin) * 1000.0)\n'
+         '            scope_end.synchronize()\n'
          '            scope_events.append(float(scope_start.elapsed_time(scope_end))*1000)\n'),
-        ('        print_samples(\n            "batch_get_submit",',
-         '        scope_save(args, batch_get_samples, submit_samples, scope_events, kernel_profile_samples)\n'
-         '        print_samples(\n            "batch_get_submit",'),
+        ('        print_measurements(args, "eager", batch_get_samples, kernel_profile_samples, report)\n',
+         '        scope_save(args, batch_get_samples, scope_submits, scope_events, kernel_profile_samples)\n'
+         '        print_measurements(args, "eager", batch_get_samples, kernel_profile_samples, report)\n'),
     ]
     for old, new in replacements:
         if source.count(old) != 1:

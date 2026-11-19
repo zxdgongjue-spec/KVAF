@@ -13,45 +13,27 @@ namespace kvaf {
 
 struct BatchGetKernelProfile;
 
-struct NpuRuntimeOptions {
-  NpuRuntimeOptions(std::string kernel_object_path,
-                    std::uint32_t token_bytes,
+struct NpuRuntimeOptions : ExecutionPolicy {
+  // Providers are discovered from the build and prepared on first use.
+  // Defaults select an algorithm; resource entries do not pre-enable providers.
+  // Unspecified defaults prefer an available implementation for transport_mode.
+  std::vector<std::pair<PutExecutionConfig, ExecutionResources>> put_resources;
+  std::vector<std::pair<GetExecutionConfig, ExecutionResources>> get_resources;
+  NpuRuntimeOptions(std::uint32_t token_bytes,
                     std::uint32_t tokens_per_block)
-      : batch_get_kernel_object_path(std::move(kernel_object_path)),
-        batch_get_token_bytes(token_bytes),
+      : batch_get_token_bytes(token_bytes),
         batch_get_tokens_per_block(tokens_per_block) {}
 
-  // Select once per Runtime; existing callers use URMA by default.
-  Transport transport{Transport::kUrma};
-  std::string batch_get_kernel_object_path;
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
-  std::string batch_put_kernel_object_path;
   std::uint32_t device_id{0U};
-  std::uint32_t npu_core_count{2U};
-  std::uint32_t jettys_per_core{2U};
-  // Empty selects AIV. gather_read / cpu_push_scatter select AICPU Get and Put.
-  // The AICPU kernel package is resolved from the CANN installation internally.
-  std::string aicpu_batch_get_mode{};
-  // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
-  std::uint32_t batch_get_max_inflight_total{2048U};
-  // Optional strict local-EID list. Empty preserves automatic discovery and
-  // selects one working EID. For AIV, multiple entries create simultaneous BatchGet
+  // Optional strict local-EID list. Empty uses the first automatically discovered
+  // candidate. For AIV, multiple entries create simultaneous BatchGet
   // paths and stripe core/Jetty workers over them in list order. BatchPut
-  // remains on the first EID. Both AICPU modes try explicit EIDs one at a time
-  // as connectivity fallbacks; Get and Put share the selected EID.
+  // remains on the first EID. AICPU uses a single EID. AIV Get validates this
+  // list against its own resource budget when that provider is first prepared.
   std::vector<std::string> npu_eids{};
-  // Opt-in startup BatchGet tuning over adaptive_peer_ub_devices. A K-side
-  // explicit device uses the native first-working path without tuning.
-  bool adaptive_ub_device{false};
-  // BatchGet request count used by adaptive tuning. Performance scripts can
-  // override it independently from the measured shape.
-  std::uint32_t adaptive_ub_miss_count{2048U};
-  // Optional N-side peer-device allowlist for adaptive tuning. It is ignored
-  // when the K-side service applies an explicit --ub-device filter.
-  std::vector<std::string> adaptive_peer_ub_devices{};
-  // Optional strict K-side UB device selected by an earlier Runtime process.
-  // Its EIDs remain connectivity fallbacks, but no bandwidth tuning is run.
+  // Optional strict K-side UB device. No startup bandwidth tuning is run.
   std::string peer_ub_device{};
 };
 
@@ -70,19 +52,28 @@ class NpuRuntime final : public Runtime {
   const RuntimeCore& core() const;
 
   std::uint32_t device_id() const;
-  bool uses_aicpu() const;
-  std::uint32_t npu_core_count() const;
-  std::uint32_t jettys_per_core() const;
+  std::optional<GetExecutionConfig> default_get() const;
   const std::vector<std::string>& npu_eids() const;
   std::uint32_t batch_get_token_bytes() const;
   std::uint32_t batch_get_tokens_per_block() const;
 
-  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false);
+  Status Warmup(PutExecutionConfig, const ExecutionWarmup& = {});
+  Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
+  Status DrainGet();
+  Status Recover(PutExecutionConfig);
+  Status Recover(GetExecutionConfig);
+
+  Status SetBatchGetKernelProfiling(bool enabled, bool detailed = false,
+                                    std::optional<GetExecutionConfig> config = std::nullopt);
   // Outside capture: synchronize the execution stream and report retained
   // AICPU protocol errors, including errors from earlier graph replays.
-  Status CheckBatchGetStatus(void* stream);
+  Status CheckBatchGetStatus(void* stream,
+                            std::optional<GetExecutionConfig> config = std::nullopt,
+                            std::uint64_t graph_lease = 0);
   Status CopyBatchGetKernelProfiles(
-      std::vector<BatchGetKernelProfile>* profiles) const;
+      std::vector<BatchGetKernelProfile>* profiles,
+      std::optional<GetExecutionConfig> config = std::nullopt,
+      std::uint64_t graph_lease = 0) const;
 
   Status LinkTo(const LinkTarget& target) override;
   Status AcceptLink(const LinkTarget& peer) override;

@@ -8,6 +8,7 @@ the benchmark source in memory and refuses unknown source layouts.
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:29876 DEVICE_ID=0 \
 python3 tests/diagnostics/bandwidth_scopes.py \
   --build build-npu --output bandwidth-5000.json --clock-mhz 1000 \
+  --backend aiv --execution eager --get-timing async-drain \
   --token-bytes 656 --request-length 32768 --miss-count 5000 \
   --aiv-cores 2 --jettys-per-core 1 --warmup 3 --iterations 30
 ```
@@ -23,5 +24,36 @@ min/max timestamps, so it requires a common clock. Transfer overlaps posting:
 do not add those durations. Original correctness preflight remains active.
 The independent upstream script remains the uninstrumented control.
 
+Instrumentation follows the current eager sampling loop, including its
+`async-drain` / `sync-call` completion branches. It exports paired samples after
+the loop, independently of the optional submit-only output. The Event end is
+waited outside the measured Host interval before reading elapsed time; input
+generation, output validation, and profile snapshots remain in their existing
+locations. Use `--get-timing sync-call` to diagnose the synchronous call path.
+This diagnostic pairs eager samples; use the main benchmark for Graph timing.
+
 Validation: python3 -m unittest discover -s tests/diagnostics -p 'test_*.py'.
 Actual device execution must be validated on an NPU.
+
+## Get recovery fault injection (Host only)
+
+`get_recovery.cc` uses the real Dispatcher, RuntimeCore and MetaManager with a
+fault-injecting operator. Run from the repository root without CANN or URMA:
+
+```bash
+c++ -std=c++17 -pthread \
+  -Icommon/include -Iaccess_operator/include -Iruntime/include -Imeta_manager/include \
+  tests/diagnostics/get_recovery.cc \
+  runtime/execution/execution_config.cc \
+  runtime/execution/execution_dispatcher.cc \
+  runtime/execution/execution_resource_manager.cc \
+  runtime/src/runtime.cc meta_manager/src/in_memory_meta_manager.cc \
+  -o /tmp/kvaf-get-recovery
+/tmp/kvaf-get-recovery
+```
+
+It checks persistent synchronous/asynchronous device failures, close and rebuild
+retries, table pin retention/release, failed output unbinding, unrelated pending
+requests and live-graph recovery guards. Add `-fsanitize=address,undefined -g`
+with a supporting compiler for sanitizer checks. This standalone regression does
+not test real DMA completion or restore the removed full C++ test suite.

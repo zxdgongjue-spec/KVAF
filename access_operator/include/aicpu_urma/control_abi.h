@@ -1,24 +1,36 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 namespace kvaf::aicpu_urma {
 
 constexpr std::uint64_t kUmdkControlMagic = 0x4b564146554d444bULL;
 // Setup slot for the control queue; data worker indices remain 0..7.
 constexpr std::uint32_t kUmdkControlQueueIndex = 8;
+enum class UmdkQueueProfile : std::uint32_t { Gather = 0, Put = 1 };
+inline constexpr std::uint32_t UmdkDataQueueCount(UmdkQueueProfile profile, std::uint32_t workers) {
+  return profile == UmdkQueueProfile::Put ? 0U : workers;
+}
+inline constexpr std::uint32_t UmdkControlQueueCount(UmdkQueueProfile profile, std::uint32_t workers) {
+  return profile == UmdkQueueProfile::Put ? 1U : workers;
+}
 enum class UmdkControlOp : std::uint32_t {
   kPrepare,
   kConnect,
   kDestroy,
   kQueryWorker,
   kRegisterBuffer,
-  kWrite
+  kWrite,
+  kUnregisterBuffers,
+  kUnregisterBuffer
 };
 
 struct UmdkControlArgs {
   std::uint64_t status;
   std::uint32_t worker_count;
+  // V5 consumes the old padding; every existing field and Put ABI stay fixed.
+  UmdkQueueProfile queue_profile;
   std::uint64_t session;
   std::uint64_t owner_pid;
   std::uint64_t local_buffer;
@@ -40,6 +52,8 @@ struct UmdkControlArgs {
   // Selected by NpuRuntime; device/index are resolved internally from this EID.
   std::uint8_t local_eid[16];
 };
+static_assert(sizeof(UmdkControlArgs) == 680 && offsetof(UmdkControlArgs, session) == 16 &&
+              offsetof(UmdkControlArgs, local_eid) == 660, "UMDK control/Put ABI changed");
 
 struct alignas(64) UmdkControlStatus {
   std::uint64_t magic, session, owner_pid, tp, cq_context;

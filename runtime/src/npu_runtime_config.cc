@@ -1,4 +1,5 @@
 #include "npu_runtime_config.h"
+#include "npu_kernel_paths.h"
 
 #include <array>
 #include <cstdlib>
@@ -9,23 +10,45 @@
 #include <utility>
 
 namespace kvaf::detail {
-Status ResolveRuntimeBackend(Transport transport, const std::string& mode,
-                             RuntimeBackend* backend) {
-  if (!backend) return Status::InvalidArgument("backend output is null");
-  if (transport != Transport::kUrma && transport != Transport::kUbmem)
-    return Status::InvalidArgument("transport must be urma or ubmem");
-  if (!mode.empty() && mode != "gather_read" && mode != "cpu_push_scatter")
-    return Status::InvalidArgument(
-        "aicpu_batch_get_mode must be empty, gather_read or cpu_push_scatter");
-  if (transport == Transport::kUbmem) {
-    if (!mode.empty()) return Status::InvalidArgument(
-        "ubmem requires an empty aicpu_batch_get_mode");
-    *backend = RuntimeBackend::kUbmem;
-  } else if (mode.empty()) {
-    *backend = RuntimeBackend::kUrmaAiv;
+
+ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get,
+                                             const ExecutionResources* configured) {
+  ExecutionResources resources;
+  resources.cores = transport == Transport::Ubmem ? 16U :
+      executor == Executor::Aicpu ? (get ? 5U : 1U) : 2U;
+  resources.jettys = 2U;
+  resources.max_inflight_total = 2048U;
+  if (executor == Executor::Aiv)
+    resources.kernel_path = get ? kDefaultBatchGetKernelPath : kDefaultBatchPutKernelPath;
+  if (configured) {
+    if (configured->cores) resources.cores = configured->cores;
+    if (configured->jettys) resources.jettys = configured->jettys;
+    if (configured->max_inflight_total)
+      resources.max_inflight_total = configured->max_inflight_total;
+    resources.cpu_threads = configured->cpu_threads;
+    resources.request_capacity = configured->request_capacity;
+    if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
+  }
+  return resources;
+}
+
+Status SelectProviderEids(Transport transport, Executor executor, bool get,
+                          bool explicit_eids, const ExecutionResources& resources,
+                          const std::vector<NpuEid>& candidates,
+                          std::vector<NpuEid>* selected) {
+  if (!selected) return Status::InvalidArgument("EID output is null");
+  if (transport == Transport::Ubmem) {
+    selected->clear();
+    return Status::OK();
+  }
+  if (candidates.empty()) return Status::NotInitialized("URMA local EIDs are not initialized");
+  if (get && executor == Executor::Aiv && explicit_eids) {
+    const auto workers = static_cast<std::uint64_t>(resources.cores) * resources.jettys;
+    if (candidates.size() > workers)
+      return Status::InvalidArgument("npu_eids count exceeds selected AIV Get cores * jettys workers");
+    *selected = candidates;
   } else {
-    *backend = mode == "gather_read" ? RuntimeBackend::kUrmaAicpuGather
-                                     : RuntimeBackend::kUrmaAicpuScatter;
+    selected->assign(1, candidates.front());
   }
   return Status::OK();
 }
