@@ -173,7 +173,7 @@ Status AivExecutionResources::Bind(ExecutionState* state) {
     return Status::InvalidArgument("AIV execution state belongs to another resource");
   const auto& active = *state_->active;
   if (typed != state_->active && !active.graph_node &&
-      (active.pending_get || active.pending_buffer || active.graph_buffer || active.output_buffer
+      (active.pending_get || active.pending_buffer || active.graph_buffer
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
       || active.pending_put || active.pending_put_buffer || active.input_buffer
 #endif

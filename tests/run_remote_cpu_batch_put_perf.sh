@@ -14,6 +14,8 @@ Options:
 Shape and sampling use KVAF_NPU_REQUESTS, KVAF_NPU_TOKEN_BYTES,
 KVAF_NPU_TOKENS_PER_BLOCK, KVAF_NPU_CORE_COUNT, KVAF_NPU_JETTYS_PER_CORE,
 KVAF_NPU_WARMUP and KVAF_NPU_ITERATIONS. The CPU service must be running.
+Without a core-count override, URMA AIV uses 2 cores, UBMEM AIV 16,
+and URMA AICPU 1 worker.
 KVAF_CPU_SERVICE_ADDR defaults to 127.0.0.1:28999; DEVICE_ID defaults to 0.
 KVAF_REMOTE_CPU_PERF_TIMEOUT defaults to 600 seconds.
 URMA AIV/AICPU reuse an input binding by default; set

@@ -36,16 +36,61 @@ class GetGraph:
 
 @contextmanager
 def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit):
-    """Capture one Get, destroy the graph before releasing its resource lease."""
+    """Use a real warmup forward to prepare the single-node benchmark graph."""
     execution.drain_get(runtime)
     execution.release_output(runtime)
-    with captured_get_nodes(args, runtime, torch, kvaf, execution, stream, [(output, submit)]) as (graph, _):
+    with captured_get_resources(args, runtime, torch, kvaf, execution, stream,
+                                [submit]) as (graph, _):
         yield graph
 
 
 @contextmanager
+def captured_get_resources(args, runtime, torch, kvaf, execution, stream, submits):
+    """Exercise automatic node collection without changing replay timing."""
+    options = dict(execution.get_kwargs)
+    options.pop("output_lease", None)
+    options.pop("graph_lease", None)
+    resources = runtime.graph_resources()
+    graph = None
+    capturing = False
+    replay = None
+    try:
+        with torch.npu.stream(stream):
+            with resources.prepare(stream):
+                for submit in submits:
+                    submit(options)
+        graph = kvaf.AclGraph() if args.graph_api == "acl" else torch.npu.NPUGraph()
+        replay = GetGraph(graph, args.graph_api, stream)
+        replay.leases = resources.leases
+        with resources.capture(stream):
+            if args.graph_api == "acl":
+                graph.capture_begin(stream)
+                capturing = True
+                for submit in submits:
+                    submit(options)
+                capturing = False
+                graph.capture_end()
+            else:
+                with torch.npu.graph(graph, stream=stream):
+                    for submit in submits:
+                        submit(options)
+        yield replay, resources
+    finally:
+        try:
+            if capturing:
+                graph.capture_end()
+        finally:
+            # Direct replay is intentionally owned by the caller. Never release
+            # captured addresses before the stream and native graph are retired.
+            stream.synchronize()
+            if graph is not None:
+                graph.reset()
+            resources.close(discard_result=not (replay and replay.validated))
+
+
+@contextmanager
 def captured_get_nodes(args, runtime, torch, kvaf, execution, stream, nodes):
-    """Capture prepared (output, submit) pairs on the Runtime's graph stream."""
+    """Keep explicit leases available for the per-node report regression."""
     options = dict(execution.get_kwargs)
     options.pop("output_lease", None)
     leases = []

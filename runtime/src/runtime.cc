@@ -475,10 +475,8 @@ Status RuntimeCore::BeginGetGraph(GetExecutionConfig config, const GetGraphOptio
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
-  if (graph_tables_.empty()) {
-    auto s = DrainGetLocked();
-    if (!s.ok()) return s;
-  }
+  auto drained = DrainGetLocked();
+  if (!drained.ok()) return drained;
   // Reserve the table pin before publishing a provider lease.
   auto node = graph_tables_.extract(graph_tables_.emplace(0, nullptr).first);
   auto s = access_operator_.BeginGetGraph(config, request, id);
@@ -508,6 +506,9 @@ Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);
   if (!graph_tables_.count(id)) return Status::NotFound("Get graph lease not found");
+  // The dispatcher drains only eager work sharing this node's instance. Keep
+  // the active table pin until the next successful DrainGet, as EndGetOutput
+  // does; ending another algorithm's graph must not release that table.
   auto s = access_operator_.EndGetGraph(id, stream, discard);
   if (s.ok()) graph_tables_.erase(id);
   return s;

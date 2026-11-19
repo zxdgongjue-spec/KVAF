@@ -18,7 +18,7 @@ struct AicpuInvocation final : ExecutionState {
   aicpu_urma::UmdkSession::WriteState write;
   std::unique_ptr<ExecutionState> put, get, push;
   MutableBufferView get_output;
-  bool output_bound{false};
+  bool output_bound{false}, output_pinned{false};
   GetGraphOptions graph_options;
   bool graph_active{false}, graph_recorded{false};
   bool graph_retiring{false}, graph_close_required{false};

@@ -163,7 +163,7 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
     }
     if (!ready.ok()) return ready;
   }
-  ready = impl_->session.PinGraphBuffer(impl_->remote_workspace.base, options.output.data, options.output.bytes);
+  ready = impl_->session.PinBuffer(impl_->remote_workspace.base, options.output.data, options.output.bytes);
   if (!ready.ok()) return ready;
   call.graph_start_sequence = control.claimed / impl_->session.config().workers;
   call.graph_stream = static_cast<aclrtStream>(options.stream);

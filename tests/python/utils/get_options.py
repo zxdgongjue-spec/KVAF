@@ -8,6 +8,7 @@ from .npu_eids import parse_npu_eids
 
 
 BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter")
+DEFAULT_PARALLELISM = {"aiv": 2, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
 MAX_JETTYS_PER_CORE = 64
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
@@ -118,12 +119,13 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
         parser.error("conflicting parallelism options")
     counts = selected if selected is not None else compat
     if counts is None:
+        default_count = DEFAULT_PARALLELISM[args.backend]
         if sweep:
             env_name = "KVAF_BATCH_GET_AICPU_WORKERS" if uses_aicpu(args) else "KVAF_BATCH_GET_AIV_CORES"
-            counts = [int(v) for v in os.environ.get(env_name, "5" if uses_aicpu(args) else "16").split()]
+            counts = [int(v) for v in os.environ.get(env_name, str(default_count)).split()]
         else:
             env_name = "KVAF_BATCH_GET_PERF_AICPU_WORKERS" if uses_aicpu(args) else "KVAF_BATCH_GET_PERF_AIV_CORES"
-            counts = environment_int(env_name, environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", 2))
+            counts = environment_int(env_name, environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", default_count))
     setattr(args, field, counts)
     args.parallelism = counts
     del args.compat_workers

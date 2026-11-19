@@ -1,4 +1,5 @@
 #include "npu_runtime_config.h"
+#include "npu_kernel_paths.h"
 
 #include <array>
 #include <cstdlib>
@@ -9,6 +10,27 @@
 #include <utility>
 
 namespace kvaf::detail {
+
+ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get,
+                                             const ExecutionResources* configured) {
+  ExecutionResources resources;
+  resources.cores = transport == Transport::Ubmem ? 16U :
+      executor == Executor::Aicpu ? (get ? 5U : 1U) : 2U;
+  resources.jettys = 2U;
+  resources.max_inflight_total = 2048U;
+  if (executor == Executor::Aiv)
+    resources.kernel_path = get ? kDefaultBatchGetKernelPath : kDefaultBatchPutKernelPath;
+  if (configured) {
+    if (configured->cores) resources.cores = configured->cores;
+    if (configured->jettys) resources.jettys = configured->jettys;
+    if (configured->max_inflight_total)
+      resources.max_inflight_total = configured->max_inflight_total;
+    resources.cpu_threads = configured->cpu_threads;
+    resources.request_capacity = configured->request_capacity;
+    if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
+  }
+  return resources;
+}
 
 Status SelectProviderEids(Transport transport, Executor executor, bool get,
                           bool explicit_eids, const ExecutionResources& resources,

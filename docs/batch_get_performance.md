@@ -23,6 +23,8 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 | `cpu_push_scatter` | URMA AICPU Scatter | `--aicpu-workers 5` |
 
 四种后端共用请求生成、建表、预检、预热、输出校验、eager/graph 测量和结果格式。
+未显式设置并行度时，AIV Direct 使用 2 核、UBMEM 使用 16 核、Gather/Scatter 使用
+5 个 worker，与 Runtime 的算法默认值一致；命令行参数或环境变量可覆盖。
 `--aiv-cores` 表示 AIV 核数，`--aicpu-workers` 表示 AICPU worker 数（1..8）；
 旧 `--workers` 写法仍接受以兼容已有命令。
 UBMEM 不使用 Jetty 参数。`--table-capacity` 是源块数量，
@@ -37,16 +39,21 @@ AIV、UBMEM 的 eager 完成路径只等待并释放资源，不清零、回读�
 Get 输出正确性由计时后的 Tensor 校验验证；显式 profile 快照仍读取并验证设备报告。
 UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 
-Graph 固定测 replay 加 stream 等待，资源准备、输出校验和 profile 读取均在计时外。
+Graph 的 E2E 使用同一 stream 上 replay 前后两个 NPU Event 的间隔，
+资源准备、输入更新及同步、输出校验和 profile 读取均在计时外。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
+Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-profile` 还验证
+未回放节点没有可读 profile、各节点 profile 独立，以及其他图回放不改写其报告。
+回归命令见[执行框架验证说明](cache_transport_execution_validation.md)。
 
-默认关闭算子 profiling，只输出 `BATCH_GET_RESULT scope=end_to_end` 的 Host 延迟和带宽。
+默认关闭算子 profiling，`BATCH_GET_RESULT scope=end_to_end` 在 eager 下报告 Host 延迟和带宽，
+在 graph 下报告 Event 间隔和对应带宽。
 加上 `--kernel-profile` 才开启设备打点、每轮 profile 回读和详细分段输出，
 并增加 `scope=kernel` 的设备时间和带宽。eager 和 graph 使用同一开关。
 UBMEM 同时开启地址准备、MTE 提交和最终 drain 的细分采样。
 仅显式传入 `--kernel-profile` 时启用采集。
-关闭 profiling 时没有设备时间戳，因此不输出 kernel 指标。
+关闭 profiling 时没有核内时间戳，因此不输出 kernel 指标；Graph Event 计时仍启用。
 
 时间单位为微秒，带宽使用有效载荷一次除以对应耗时；`p50_GBps` 对应 P50 延迟。
 上述示例显式启用了 profiling；测无 profiling 的端到端性能时，去掉 `--kernel-profile`。

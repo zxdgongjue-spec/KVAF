@@ -23,11 +23,10 @@ import kvaf
 from utils.backend import detect_torch_backend
 from utils.dsa_keys import build_dsa_keys
 from utils.npu_eids import parse_npu_eids
-from utils.perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.perf_execution import BenchmarkExecution, add_execution_metadata, default_put_cores
 from utils.statistics import percentile
 
 
-AIV_CORES = 32
 JETTYS_PER_CORE = 2
 PUT_BATCH_SIZE = 128
 WARMUP = 3
@@ -85,7 +84,8 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     assert torch is not None
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     batch = int(os.environ.get("KVAF_RUNTIME_PERF_BATCH", str(batch)))
-    npu_core_count = int(os.environ.get("KVAF_RUNTIME_PERF_AIV_CORES", str(AIV_CORES)))
+    npu_core_count = int(os.environ.get(
+        "KVAF_RUNTIME_PERF_AIV_CORES", str(default_put_cores(transport, "aiv"))))
     jettys_per_core = int(
         os.environ.get(
             "KVAF_RUNTIME_PERF_JETTYS_PER_CORE",

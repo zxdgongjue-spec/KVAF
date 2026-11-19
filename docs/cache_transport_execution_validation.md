@@ -78,11 +78,46 @@ Get 性能测试的具体计时与带宽定义见[统一 Get 性能测试](batch
 
 AIV/UBMEM eager 完成路径不清零、回读或检查 Get 状态报告；ACL 失败仍返回错误。
 显式 profile 快照在计时外读取并验证设备报告。UBMEM Put 和 graph 释放保留各自检查。
-默认关闭 profiling，仅 `scope=end_to_end` 报告 Host 时间和带宽。
+默认关闭 profiling，`scope=end_to_end` 在 eager 下报告 Host 时间和带宽，
+在 graph 下报告 replay 前后两个 NPU Event 的间隔及对应带宽。
 上面的命令显式加入 `--kernel-profile`，开启算子打点、profile 回读及详细输出，
 并增加 `scope=kernel` 的设备时间与带宽；UBMEM 同时采集地址/MTE/drain 细分时间。
 测无 profiling 的端到端性能时去掉该参数，eager 和 graph 均适用。
 Graph 回放不重新进入 Host Dispatcher，不能代替 eager 调度开销测量。
+
+可追加 `--multi-graph-check` 做计时前的串行多图验证：同一 stream 上交替回放两张图，
+其中一张含两个 Get 节点，覆盖完整、部分和零请求；释放双节点图后继续验证另一张图。
+Gather/Scatter 还验证只回放 B 时，未回放的 A 节点不能通过完成检查；
+加上 `--kernel-profile` 时，A 的 profile 查询必须拒绝，分别回放后各节点报告不能串用，
+且只回放 A 不应改写 B 的 profile 快照。另用一张未回放的临时图验证：先销毁图，
+普通结束必须拒绝，随后 `discard_result=True` 能释放保留的租约。这些检查均在正式计时之外。
+通过时输出 `BATCH_GET_MULTI_GRAPH_PASS`。随后执行自动资源 scope 检查：
+在两条 stream 上分别准备/捕获图，共用一个输出，第一张图包含两个使用相同输出的节点；
+串行执行 B → A → 普通 Get/Drain → A，销毁 B 后再回放 A，最后结束所有图后执行 eager。
+检查输出及 AICPU 图报告隔离，通过时输出 `BATCH_GET_GRAPH_RESOURCES_PASS`。
+跨 stream 切换前由脚本明确等待，不依赖 KVAF 自动安排事件。
+正式性能图也使用 `graph_resources().prepare/capture` 自动收集，准备及结束均在计时外。
+该检查不验收图内混合算法或跨 stream 并发回放，正式性能样本仍为单节点图。
+
+针对四种 Get 的图资源与 AICPU 节点报告隔离回归，可运行以下命令（CPU 服务地址和设备按现场替换）：
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+for backend in aiv ubmem gather_read cpu_push_scatter; do
+  KVAF_CPU_SERVICE_ADDR=127.0.0.1:38999 DEVICE_ID=6 \
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend "$backend" --execution graph \
+    --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --multi-graph-check --kernel-profile --warmup 10 --iterations 100
+done
+BASH
+```
+
+每个后端均应输出 `BATCH_GET_MULTI_GRAPH_PASS`、`BATCH_GET_GRAPH_RESOURCES_PASS`
+和 `BATCH_GET_GRAPH_PASS`。核数/worker 使用该后端默认值；需要对比性能时保持原配置一致。
+默认使用 torch 图接口；验证原生 ACL 图接口时追加 `--graph-api acl`。
 
 ## Put 使用同步性能入口
 
@@ -107,7 +142,7 @@ run_put() {
 }
 run_put urma aiv 2
 run_put ubmem aiv 16
-run_put urma aicpu 5
+run_put urma aicpu 1
 BASH
 ```
 
@@ -159,3 +194,19 @@ Python Get 同时写出 `<trace路径>.host.csv`，汇总命令会自动读取�
 独立 C++/Python 功能、配置和单元测试及配套 stub/model、shell 入口、CMake 注册已移除。
 性能预检覆盖被测数据路径与图回放，不提供原 matrix、overlap、lifetime、resources、
 lifecycle 或故障注入测试的完整覆盖。
+
+## 自动图资源变更的验证边界
+
+本次新增的 `graph_resources`、图/eager 共存和不同图独立 stream，需重新执行上述真机回归；
+旧版本的 PASS 和性能数字不构成本次变更的硬件验收。prepare 内普通调用真实执行，
+capture 不应再产生输出注册或 workspace 扩容；回放仍调用原生 graph，不加入 Host 代理。
+故障时先停止/销毁图再 close/discard；设备完成未知不能当作注销成功。
+
+还需在应用的实际模型 forward 中确认预热与捕获路径一致。一次资源 prepare 只覆盖其
+收集到的节点顺序，动态 miss 数可变，新增分支、不同配置/输出 allocation 或容量应拒绝；
+先 prepare 最大规格，再准备同实例较小规格的图。图仍持有资源时请求更大容量应返回 Busy。
+
+本地检查已完成：非 NPU CMake 构建和 Python 导入检查；新增绑定全文件 C++17
+语法检查；实际新增 pybind 类配合临时 native 桩的 20 项正反例（含四算法配置混合
+与错误顺序拒绝）；Dispatcher 与 Gather 注册共享/故障释放的 ASan/UBSan 检查。
+这些检查没有真实 CANN 队列或 DMA，不能替代上述 NPU 命令和应用模型捕获验收。

@@ -10,6 +10,11 @@ namespace kvaf {
 namespace detail {
 using NpuEid = std::array<std::uint8_t, 16>;
 
+// Resolve provider-specific budgets. AIV/UBMEM kernels come from this build's
+// bin directory; AICPU uses its installed CANN package instead.
+ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get,
+                                             const ExecutionResources* configured = nullptr);
+
 // Apply routing only after selecting a provider and resolving its own budget.
 // An explicit AIV Get list is strict: never truncate it to fit worker capacity.
 Status SelectProviderEids(Transport transport, Executor executor, bool get,
