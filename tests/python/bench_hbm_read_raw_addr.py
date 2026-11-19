@@ -156,8 +156,20 @@ def configured_producer(args, config):
     return parse_args(argv)
 
 
+class ProducerStartupFailed(RuntimeError):
+    """B confirmed native registration rollback before reporting failure."""
+    def __init__(self, session, detail):
+        self.session = session
+        super().__init__("producer registration failed; source cleanup confirmed:\n" + detail)
+
+
 def receive(channel, expected):
     kind, payload = channel.recv()
+    if expected == "connected" and kind == "startup_failed":
+        if (not isinstance(payload, dict) or payload.get("cleanup") != "done" or
+                not isinstance(payload.get("session"), str) or not isinstance(payload.get("detail"), str)):
+            raise RuntimeError("invalid producer startup cleanup acknowledgement")
+        raise ProducerStartupFailed(payload["session"], payload["detail"])
     if kind != expected:
         raise RuntimeError(f"expected {expected}, received {kind}: {payload}")
     return payload
@@ -381,8 +393,27 @@ def producer(channel, args, layout, receiver, *, session=""):
         print_stages("NPU_HBM_BENCH_PROFILE", "producer", stages, args.warmup)
         channel.send(("closed", session))
     except BaseException:
+        detail = traceback.format_exc()
+        if not registered:
+            # A failed register may have created resources or run READ probes.
+            # Only native Shutdown success proves rollback; never infer it from
+            # an error code, a disconnected socket, or frozen/connected flags.
+            try:
+                source.shutdown()
+            except Exception as error:
+                try:
+                    channel.send(("error", detail + "\nSource cleanup remains unresolved: " + str(error)))
+                except Exception:
+                    pass
+                retain(str(error))
+                raise
+            try:
+                channel.send(("startup_failed", dict(session=session, cleanup="done", detail=detail)))
+            except Exception:
+                pass  # A must retain resources if this confirmation is lost.
+            raise
         try:
-            channel.send(("error", traceback.format_exc()))
+            channel.send(("error", detail))
         except Exception:
             pass  # A disconnected application channel cannot authorize reuse.
         try:
@@ -424,7 +455,13 @@ def reader(args):
         session = uuid.uuid4().hex
         peer_active = True
         channel.send(("hello", dict(version=1, session=session, receiver=receiver, config=benchmark_config(args))))
-        if receive(channel, "connected") != session:
+        try:
+            connected_session = receive(channel, "connected")
+        except ProducerStartupFailed as error:
+            if error.session == session:
+                peer_active = False
+            raise
+        if connected_session != session:
             raise RuntimeError("registration acknowledgement belongs to another session")
         stream = torch.npu.Stream(device=args.device_a)
         with torch.npu.stream(stream):

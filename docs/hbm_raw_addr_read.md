@@ -372,7 +372,7 @@ python tests/python/bench_hbm_read_raw_addr.py \
 
 | 通道 | 发起连接方向 | 消息 |
 | --- | --- | --- |
-| 应用 TCP，例如 B:29100 | B 监听，A → B 建立双向长连接 | hello/connected、request/ready、reuse/released、shutdown/closed、error |
+| 应用 TCP，例如 B:29100 | B 监听，A → B 建立双向长连接 | hello/connected、startup_failed、request/ready、reuse/released、shutdown/closed、error |
 | KVHR TCP，例如 A:29000 | B 的 source.register → A 的 listen_hbm | MR、Jetty、TP、探测、重连及硬件资源关闭 |
 | NPU 数据通道 | A 发起 READ，KV 从 B HBM 搬到 A HBM | HBM payload，不进入上述 TCP 通道 |
 
@@ -421,6 +421,10 @@ A 须能访问 B:29100，B 须能访问 A:29000。TCP 连通仅说明通知可�
 通知帧使用 `KVNT + version=1 + network-order payload length`，最大 4 MiB，开启 TCP_NODELAY，按绝对 deadline 处理拆包/粘包。ReadyToken 沿用匹配版本原生绑定的 pickle 状态；接收端仅允许内置数据及指定 NPU ReadyToken/source 类型，禁止任意 Python 全局对象。通道面向可信集群节点，不提供端点认证；不传 Tensor、stream、Source/Runtime 对象或 HBM payload。
 
 初始 connect 在超时内重试；活动应用会话断线/超时后不自动重连、重发 READ 或释放批次。B 已注册的源在缺少有效 shutdown 时继续保留，即使本轮已 release，也不能提前注销捕获图仍引用的通信资源。内部 KVHR 重连保持原有语义。异常日志提示保留资源时，先确认两端 stream/图和传输已停止，再处理进程。
+
+初始化失败时，B 先调用原生 source.shutdown 验证注册回滚；仅成功后发送带 session 的 `startup_failed(cleanup=done)`。A 核对会话后退出并关闭 Runtime，不再因已确认清理的启动失败无限保留。清理失败、回执丢失/会话不匹配，或 READ 已启动后发生异常时仍保留资源。不能仅凭异常文本、TCP 断开或 source.frozen/connected 标志判断注册资源已经清理。
+
+若报 `create HBM context: RaCtxInit ... context_nonnull=0`，失败发生在 B 本地通信上下文创建阶段，早于该源的 MR 注册、TP 协商和 READ。先核对日志中的 `physical` 与 `npu_eid` 是否属于同一张卡及正确路由；本文旧测试机示例 EID `000000000047050000100000df00d806` / `000000000047050000100000df00f807` 分别对应当时的物理卡 6 / 7，不能直接用于其他卡或其他机器，也不能靠修改 EID 末尾推导新地址。A 的 EID 同样需要独立核对。RA 返回码须结合目标机器对应版本的驱动/RA 日志解释，不能仅凭错误码判定为 TCP 故障。
 
 实际 Connector 可通过 `from kvaf.tcp_control import TcpControlListener, TcpControlChannel` 复用；`send((kind, payload))` / `recv()` 提供消息边界，业务层仍负责身份和完成确认。连接支持串行 sender 与串行 receiver 并行工作，不要由其他线程直接访问底层 socket。
 

@@ -201,7 +201,18 @@ class TcpNotifications(unittest.TestCase):
     def test_failed_read_wait_never_sends_reuse_or_releases_source(self):
         self.run_benchmark_session(fail_wait=True)
 
-    def run_benchmark_session(self, fail_wait=False):
+    def test_failed_registration_with_confirmed_rollback_closes_reader(self):
+        self.run_benchmark_session(startup_failure="clean")
+
+    def test_failed_registration_with_uncertain_rollback_retains_both_peers(self):
+        self.run_benchmark_session(startup_failure="pending")
+
+    def test_failed_registration_without_matching_cleanup_receipt_retains_reader(self):
+        for mode in ("wrong-session", "lost-ack"):
+            with self.subTest(mode=mode):
+                self.run_benchmark_session(startup_failure=mode)
+
+    def run_benchmark_session(self, fail_wait=False, startup_failure=None):
         # Same module names as the pybind classes exercise the restricted token
         # serialization. Only tensor/kernel behavior is mocked; every application
         # message, workload negotiation and batch receipt uses a real TCP socket.
@@ -257,6 +268,10 @@ class TcpNotifications(unittest.TestCase):
 
         source.ready.side_effect = ready
         source.release_batch.side_effect = release
+        if startup_failure:
+            source.register.side_effect = RuntimeError("mock HBM context initialization failed")
+            if startup_failure == "pending":
+                source.shutdown.side_effect = RuntimeError("source teardown remains InDoubt")
         runtime.batch_get_raw_addr.side_effect = lambda *a, **k: events.append(("reader", "read")) or {"state": "submitted"}
         package.NpuPullHbmSource = lambda *a: source
         package.NpuRuntime = lambda **kwargs: runtime
@@ -284,7 +299,19 @@ class TcpNotifications(unittest.TestCase):
                 except BaseException as error:
                     producer_errors.append(error)
 
+            send = control.TcpControlChannel.send
+
+            def send_message(channel, message):
+                if message[0] == "startup_failed":
+                    if startup_failure == "wrong-session":
+                        message = ("startup_failed", {**message[1], "session": "different-session"})
+                    elif startup_failure == "lost-ack":
+                        channel.close()
+                        raise BrokenPipeError("startup rollback confirmation lost")
+                return send(channel, message)
+
             with patch.dict(sys.modules, modules), patch.object(control, "TcpControlListener", side_effect=listen) as server, \
+                    patch.object(control.TcpControlChannel, "send", new=send_message), \
                     patch.object(bench, "packet_payload", return_value=MagicMock()), \
                     patch.object(bench, "retain", side_effect=Retained), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -300,6 +327,24 @@ class TcpNotifications(unittest.TestCase):
                     worker.join(5)
                 self.assertFalse(worker.is_alive(), "TCP peer did not finish")
                 server.assert_called_once_with(producer_args.control_listen, timeout=producer_args.control_timeout)
+        if startup_failure:
+            self.assertEqual(len(reader_errors), 1)
+            self.assertEqual(len(producer_errors), 1)
+            source.shutdown.assert_called_once()
+            source.release_batch.assert_not_called()
+            runtime.batch_get_raw_addr.assert_not_called()
+            if startup_failure == "clean":
+                self.assertIsInstance(reader_errors[0], bench.ProducerStartupFailed)
+                runtime.shutdown.assert_called_once()
+            else:
+                self.assertIsInstance(reader_errors[0], Retained)
+                runtime.shutdown.assert_not_called()
+            if startup_failure == "pending":
+                self.assertIsInstance(producer_errors[0], Retained)
+            else:
+                self.assertIsInstance(producer_errors[0], RuntimeError)
+                self.assertIn("HBM context initialization failed", str(producer_errors[0]))
+            return
         if fail_wait:
             self.assertEqual(len(reader_errors), 1)
             self.assertEqual(len(producer_errors), 1)
