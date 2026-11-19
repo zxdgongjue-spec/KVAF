@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -264,6 +265,21 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
   return result;
 }
 
+py::dict FusedContextDict(const FusedBatchGetContext& context) {
+  py::dict result;
+  result["lease_id"] = context.lease_id;
+  result["device_channel_entity"] = context.device_channel_entity;
+  result["device_queue_state"] = context.device_queue_state;
+  result["device_core_status"] = context.device_core_status;
+  result["output_address"] = context.output_address;
+  result["output_bytes"] = context.output_bytes;
+  result["worker_count"] = context.worker_count;
+  result["jettys_per_core"] = context.jettys_per_core;
+  result["token_bytes"] = context.token_bytes;
+  result["tokens_per_block"] = context.tokens_per_block;
+  return result;
+}
+
 class NpuPythonRuntime final {
  public:
   NpuPythonRuntime(std::string batch_get_kernel_object_path,
@@ -303,6 +319,22 @@ class NpuPythonRuntime final {
     aicpu_backend_ = native_->uses_aicpu();
   }
 
+  ~NpuPythonRuntime() {
+    if (fused_context_.lease_id != 0U) {
+      // GC is not proof that caller-launched DMA finished. Keep both the
+      // registered storage and its native owner until process exit. Native
+      // teardown refusing a lease must not be followed by DECREF of output.
+      std::fprintf(stderr,
+          "[KVAF_AIV] FUSED_PYTHON_LEASE_RETAINED_ON_DESTRUCTION "
+          "lease_id=%llu reason=explicit_release_required "
+          "output_and_stream_retained=1 teardown_not_safe=1\n",
+          static_cast<unsigned long long>(fused_context_.lease_id));
+      (void)fused_output_.release();
+      (void)fused_stream_.release();
+      (void)native_.release();
+    }
+  }
+
   void LinkTo(std::string address) {
     ThrowIfError(native_->LinkTo(LinkTarget{std::move(address)}));
   }
@@ -321,6 +353,82 @@ class NpuPythonRuntime final {
   }
   std::uint32_t BatchGetTokensPerBlock() const {
     return native_->batch_get_tokens_per_block();
+  }
+
+  py::dict AcquireFusedBatchGetContext(const py::object& output,
+                                      const py::object& stream) {
+    if (fused_context_.lease_id != 0U) {
+      throw py::value_error("Runtime already owns a fused BatchGet lease");
+    }
+    if (!Initialized()) {
+      throw std::runtime_error("Runtime has not been initialized");
+    }
+    const NpuTensorView view = GetNpuTensorView(output, "fused output");
+    const std::string device = "npu:" + std::to_string(DeviceId());
+    if (py::str(output.attr("device")).cast<std::string>() != device ||
+        view.shape.size() < 2 || view.shape.front() <= 0 ||
+        view.bytes % static_cast<std::size_t>(view.shape.front()) != 0 ||
+        view.bytes / static_cast<std::size_t>(view.shape.front()) !=
+            BatchGetTokenBytes()) {
+      throw py::value_error(
+          "fused output must be on the Runtime device with one token_bytes-sized row per slot");
+    }
+    py::object launch_stream = stream;
+    if (launch_stream.is_none()) {
+      py::module_ torch = py::module_::import("torch");
+      if (!py::hasattr(torch, "npu")) {
+        throw std::runtime_error("torch.npu is unavailable for the default KVAF stream");
+      }
+      launch_stream = torch.attr("npu").attr("current_stream")(DeviceId());
+    }
+    if (!py::hasattr(launch_stream, "device") ||
+        py::str(launch_stream.attr("device")).cast<std::string>() != device) {
+      throw py::value_error("fused stream must belong to the Runtime device");
+    }
+    const aclrtStream acl_stream = acl_python::StreamFromPython(launch_stream);
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before fused acquire");
+    FusedBatchGetContext context;
+    ThrowIfError(native_->AcquireFusedBatchGetContext(view.data, view.bytes,
+                                                      &context));
+    // Track ownership before allocating the dict: even an allocation failure
+    // must leave a retained native lease rather than unowned registered HBM.
+    fused_output_ = output;
+    fused_stream_ = std::move(launch_stream);
+    fused_acl_stream_ = acl_stream;
+    fused_context_ = context;
+    return FusedContextDict(fused_context_);
+  }
+
+  void ReleaseFusedBatchGetContext(const py::dict& context,
+                                   const py::object& stream) {
+    if (fused_context_.lease_id == 0U) {
+      throw py::value_error("Runtime has no active fused BatchGet lease");
+    }
+    // Never forward user-modified pointers or an old lease to native code.
+    const py::dict expected = FusedContextDict(fused_context_);
+    for (const auto& item : expected) {
+      if (!context.contains(item.first) ||
+          context[item.first].cast<std::uint64_t>() !=
+              item.second.cast<std::uint64_t>()) {
+        throw py::value_error("fused context does not match this Runtime's active lease");
+      }
+    }
+    if (!stream.is_none() &&
+        acl_python::StreamFromPython(stream) != fused_acl_stream_) {
+      throw py::value_error("fused release must use the stream selected at acquire");
+    }
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before fused release");
+    // Native release fences this exact stream, then checks queue statuses.
+    // Failed completion quarantines the native lease. Keep Python references
+    // and surface the error, without retrying teardown or freeing the buffer.
+    ThrowIfError(native_->ReleaseFusedBatchGetContext(fused_context_,
+                                                      fused_acl_stream_));
+    fused_context_ = FusedBatchGetContext{};
+    fused_acl_stream_ = nullptr;
+    fused_output_ = py::object{};
+    fused_stream_ = py::object{};
   }
 
   py::dict RemoteRegion() const {
@@ -597,6 +705,11 @@ class NpuPythonRuntime final {
 
  public:
   void Shutdown() {
+    if (fused_context_.lease_id != 0U) {
+      throw py::value_error(
+          "release the fused BatchGet context successfully before shutdown; "
+          "uncertain DMA completion requires retaining output and Runtime until process teardown");
+    }
     ThrowIfError(native_->Shutdown());
   }
 
@@ -610,6 +723,10 @@ class NpuPythonRuntime final {
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
+  FusedBatchGetContext fused_context_;
+  py::object fused_output_;
+  py::object fused_stream_;
+  aclrtStream fused_acl_stream_{nullptr};
 };
 
 }  // namespace
@@ -630,6 +747,22 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),
            py::arg("slot_size"))
       .def("shutdown", &NpuPythonRuntime::Shutdown)
+      .def("acquire_fused_batch_get_context",
+           &NpuPythonRuntime::AcquireFusedBatchGetContext,
+           py::arg("output"), py::arg("stream") = py::none(),
+           "Exclusively lease native BatchGet queues and register output HBM. "
+           "Returns integer fields matching FusedBatchGetContext, including lease_id. "
+           "output and stream are retained until successful release. All fused launches "
+           "must run sequentially on this stream; do not resize/rebind output storage, "
+           "reset queue cursors, or free source DDR while the lease is in use. "
+           "stream=None captures the Runtime device's current torch.npu stream.")
+      .def("release_fused_batch_get_context",
+           &NpuPythonRuntime::ReleaseFusedBatchGetContext,
+           py::arg("context"), py::arg("stream") = py::none(),
+           "Fence the acquire stream and check native queue completion before release. "
+           "Pass the unmodified acquire dict. stream=None uses the retained acquire "
+           "stream, not the current stream. Failure retains all resources and blocks "
+           "shutdown; unknown DMA completion requires process/device teardown.")
       .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,
            py::arg("stream") = py::none(),
            "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
