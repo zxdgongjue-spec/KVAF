@@ -47,11 +47,10 @@ def run_group(args, devices, directory):
             command = [
                 str(runner), str(args.build_dir),
                 *workload_command(args),
-                "--graph-api", args.graph_api, "--graph-replays", str(args.graph_replays),
+                "--graph-api", "acl",
                 "--contention-control-dir", str(directory),
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
-                "--contention-graphs", str(args.graphs),
             ]
             process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
@@ -287,11 +286,7 @@ def main(argv=None):
     add_backend_arguments(parser, sweep=True)
     parser.add_argument("--devices", nargs="+", type=int, default=list(range(8)))
     parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
-    parser.add_argument("--graphs", type=int, default=256,
-                        help="distinct graphs per device; replay all on one stream, then synchronize once (default: 256)")
-    parser.add_argument("--graph-calls", type=int, default=1, help="one Get node per graph; only 1 is supported")
-    parser.add_argument("--graph-api", choices=("acl", "torch"), default="acl")
-    parser.add_argument("--graph-replays", type=int, default=5, help="dynamic input checks before measurement")
+    parser.add_argument("--graph-calls", type=int, default=256, help="Get calls in each device's ACL graph (default: 256)")
     add_execution_metadata(parser)
     parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"))
     parser.add_argument("--ready-timeout", type=float, default=600)
@@ -319,12 +314,8 @@ def main(argv=None):
             parser.error(error)
     if args.miss_count <= 0:
         parser.error("sustained bandwidth requires positive --miss-count")
-    if args.graph_calls != 1:
-        parser.error("graph leases support one Get; use --graph-calls 1")
-    if args.graphs <= 0:
-        parser.error("--graphs must be positive")
-    if args.graph_replays <= 0:
-        parser.error("--graph-replays must be positive")
+    if args.graph_calls <= 0:
+        parser.error("--graph-calls must be positive")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
     for name in ("seconds", "ready_timeout"):
@@ -334,6 +325,7 @@ def main(argv=None):
     directory = (args.output or Path.cwd() / time.strftime(f"kvaf_multicard_{args.backend}_%Y%m%d_%H%M%S")).resolve()
     directory.mkdir(parents=True)
     config = vars(args).copy()
+    config.update(graph_api="acl", graphs=1)
     config.pop("summarize")
     config.pop("parallelism")
     config.pop("aicpu_workers" if field == "aiv_cores" else "aiv_cores")
@@ -345,7 +337,7 @@ def main(argv=None):
     config[field] = counts if len(counts) > 1 else counts[0]
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     print(f"MULTICARD_CONFIG execution_mode={args.execution_mode} backend={args.backend} transport={args.transport} "
-          f"devices={args.devices} {field}={counts} graph_api={args.graph_api} graphs={args.graphs} "
+          f"devices={args.devices} {field}={counts} graph_api=acl graph_calls={args.graph_calls} "
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
           f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
           "timing=sustained_graph_replay_to_completion profiling_enabled=0 units=decimal_GBps", flush=True)

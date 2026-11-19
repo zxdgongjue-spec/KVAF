@@ -67,8 +67,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
     parser.add_argument("--kernel-profile", action="store_true",
                         help="enable device profiling and detailed output, including UBMEM address/MTE/drain timings; default: off")
-    parser.add_argument("--summary-csv", type=Path, help="write latency and bandwidth by execution mode to CSV")
-    parser.add_argument("--profile-csv", type=Path, help="write device stage and worker metrics to CSV; requires --kernel-profile")
+    parser.add_argument("--output-dir", type=Path, help="directory for summary.csv and, with --kernel-profile, "
+                        "profile.csv (default: reports/batch-get/<timestamp>-<backend>-d<device>)")
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
                             environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
@@ -92,8 +92,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_execution_metadata(parser)
     parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--contention-graph-calls", type=int, default=1, help=argparse.SUPPRESS)
-    parser.add_argument("--contention-graphs", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     configure_backend_help(parser, argv)
     args = parser.parse_args(argv)
     resolve_backend(args, parser)
@@ -114,17 +113,11 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "iterations must be positive"
     if args.kernel_profile and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
-    if args.profile_csv is not None and not args.kernel_profile:
-        return "profile-csv requires --kernel-profile"
-    if args.summary_csv is not None and args.profile_csv is not None and args.summary_csv.resolve() == args.profile_csv.resolve():
-        return "summary-csv and profile-csv must use different paths"
     if args.contention_control_dir is not None:
-        if args.summary_csv is not None or args.profile_csv is not None:
-            return "single-card CSV options do not apply to contention workers"
-        if args.contention_graph_calls != 1:
-            return "graph leases support one Get per graph; use --graph-calls 1"
-        if args.contention_graphs <= 0:
-            return "contention-graphs must be positive"
+        if args.output_dir is not None:
+            return "--output-dir is for single-card benchmarks, not contention workers"
+        if args.contention_graph_calls <= 0:
+            return "contention-graph-calls must be positive"
         if args.execution != "eager":
             return "contention worker uses its own graph execution; omit --execution"
         if args.contention_result is None or args.miss_count <= 0:
@@ -239,7 +232,7 @@ def print_measurements(args, execution, samples, profiles, report=None):
             "input_updates_and_validation_excluded=1 profile_readback_excluded=1",
             flush=True,
         )
-    if report is not None and report.summary_path is not None:
+    if report is not None:
         report.add_summary(execution, timing, len(samples), measurements)
     if profiling:
         details = [] if report is not None and report.profile_path is not None else None
@@ -880,7 +873,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch = backend.torch
     assert torch is not None
     torch.npu.set_device(args.device_id)
-    report = BatchGetCsv(args) if args.summary_csv is not None or args.profile_csv is not None else None
+    report = BatchGetCsv(args) if args.contention_control_dir is None else None
     if args.execution != "eager" or args.contention_control_dir is not None:
         with torch.npu.stream(torch.npu.Stream(device=args.device_id)):
             result = run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report)
@@ -1131,17 +1124,16 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         if args.contention_control_dir is not None:
             from utils.multicard import run_worker
 
-            def submit(inputs, stream, options):
-                runtime.batch_get(device_table, inputs.fixed[0], inputs.fixed[1], inputs.miss_count,
-                                  inputs.fixed[2], inputs.output,
+            def submit(plan, stream, options):
+                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output,
                                   stream=stream, **options)
 
-            def check(inputs, count, lease=0):
+            def check(plan, lease):
                 if uses_aicpu(args):
                     runtime.check_batch_get_status(torch.npu.current_stream(), graph_lease=lease)
-                check_output(inputs.fixed, count, result=inputs.output)
+                check_output(plan, args.miss_count, full=False)
 
-            run_worker(kvaf, torch, args, runtime, execution, miss_count, output,
+            run_worker(kvaf, torch, args, runtime, execution, output,
                        create_request_plan, submit, check)
             return 0
 

@@ -1,6 +1,8 @@
 """CSV reports for one BatchGet benchmark invocation."""
 
 import csv
+from datetime import datetime
+from pathlib import Path
 
 
 METRICS = ("mean_us", "p50_us", "p90_us", "p99_us", "mean_GBps", "p50_GBps", "p99_GBps", "mean_GiBps")
@@ -26,8 +28,12 @@ def write_csv(path, fields, rows):
 
 class BatchGetCsv:
     def __init__(self, args):
-        self.summary_path = args.summary_csv
-        self.profile_path = args.profile_csv
+        directory = args.output_dir
+        if directory is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            directory = Path("reports/batch-get") / f"{stamp}-{args.backend}-d{args.device_id}"
+        self.summary_path = directory / "summary.csv"
+        self.profile_path = directory / "profile.csv" if args.kernel_profile else None
         self.summary_rows = []
         self.profile_rows = []
         self.config = {name: getattr(args, name) for name in (
@@ -60,7 +66,6 @@ class BatchGetCsv:
                                  for kind, name, metric, value in details)
 
     def write(self):
-        if self.summary_path is not None:
-            write_csv(self.summary_path, SUMMARY_FIELDS, self.summary_rows)
+        write_csv(self.summary_path, SUMMARY_FIELDS, self.summary_rows)
         if self.profile_path is not None:
             write_csv(self.profile_path, PROFILE_FIELDS, self.profile_rows)
