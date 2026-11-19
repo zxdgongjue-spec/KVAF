@@ -94,6 +94,9 @@ class NpuRuntime final : public Runtime {
   // context must run sequentially on one caller stream.
   Status AcquireFusedBatchGetContext(void* output, std::uint64_t output_bytes,
                                     FusedBatchGetContext* context);
+  Status RegisterFusedBatchGetOutput(
+      const FusedBatchGetContext& owner, void* output,
+      std::uint64_t output_bytes, FusedBatchGetContext* view);
   Status ReleaseFusedBatchGetContext(const FusedBatchGetContext& context,
                                     void* stream);
 

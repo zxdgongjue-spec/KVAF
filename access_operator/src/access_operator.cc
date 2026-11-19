@@ -313,6 +313,7 @@ struct DefaultAccessOperator::Impl {
   std::mutex batch_get_mutex;
   FusedBatchGetContext fused_context;
   KvafBatchGetLocalBuffer* fused_local_buffer{nullptr};
+  std::vector<KvafBatchGetLocalBuffer*> fused_output_buffers;
   bool fused_completion_uncertain{false};
   std::uint64_t next_fused_lease_id{1};
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
@@ -621,6 +622,45 @@ Status DefaultAccessOperator::AcquireFusedBatchGetContext(
   return Status::OK();
 }
 
+Status DefaultAccessOperator::RegisterFusedBatchGetOutput(
+    const FusedBatchGetContext& owner, void* output,
+    std::uint64_t output_bytes, FusedBatchGetContext* view) {
+  std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
+  const auto& active = impl_->fused_context;
+  if (active.lease_id == 0U || owner.lease_id != active.lease_id ||
+      owner.device_channel_entity != active.device_channel_entity ||
+      owner.device_queue_state != active.device_queue_state ||
+      owner.output_address != active.output_address ||
+      owner.output_bytes != active.output_bytes) {
+    return InvalidArgument("output registration requires the original live fused lease");
+  }
+  if (impl_->fused_completion_uncertain) {
+    return Internal("fused BatchGet context is quarantined");
+  }
+  if (view == nullptr || output == nullptr || output_bytes == 0U ||
+      output_bytes % active.token_bytes != 0U ||
+      output_bytes > std::numeric_limits<std::uint64_t>::max() - PointerValue(output)) {
+    return InvalidArgument("invalid fused output view");
+  }
+  // Reserve before registration so allocation failure cannot orphan a native
+  // reference. Registering HBM does not reset or synchronize leased queues.
+  impl_->fused_output_buffers.reserve(impl_->fused_output_buffers.size() + 1U);
+  KvafBatchGetLocalBuffer* buffer = nullptr;
+  std::uint64_t entity = 0U;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, output, output_bytes,
+                                    &buffer, &entity) != KVAF_BATCH_GET_SUCCESS ||
+      buffer == nullptr || entity == 0U) {
+    if (buffer != nullptr) KvafBatchGetLocalBufferRelease(buffer);
+    return Internal("failed to register fused output view");
+  }
+  impl_->fused_output_buffers.push_back(buffer);
+  *view = active;
+  view->device_channel_entity = entity;
+  view->output_address = PointerValue(output);
+  view->output_bytes = output_bytes;
+  return Status::OK();
+}
+
 Status DefaultAccessOperator::ReleaseFusedBatchGetContext(
     const FusedBatchGetContext& context, void* stream) {
   std::lock_guard<std::mutex> lock(impl_->batch_get_mutex);
@@ -648,6 +688,10 @@ Status DefaultAccessOperator::ReleaseFusedBatchGetContext(
     return status;
   }
   KvafBatchGetLocalBufferRelease(impl_->fused_local_buffer);
+  for (auto* buffer : impl_->fused_output_buffers) {
+    KvafBatchGetLocalBufferRelease(buffer);
+  }
+  impl_->fused_output_buffers.clear();
   impl_->fused_local_buffer = nullptr;
   impl_->fused_context = FusedBatchGetContext{};
   return Status::OK();

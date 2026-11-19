@@ -330,6 +330,7 @@ class NpuPythonRuntime final {
           "output_and_stream_retained=1 teardown_not_safe=1\n",
           static_cast<unsigned long long>(fused_context_.lease_id));
       (void)fused_output_.release();
+      for (auto& output : fused_output_views_) (void)output.release();
       (void)fused_stream_.release();
       (void)native_.release();
     }
@@ -400,6 +401,37 @@ class NpuPythonRuntime final {
     return FusedContextDict(fused_context_);
   }
 
+  py::dict RegisterFusedBatchGetOutput(const py::dict& context,
+                                      const py::object& output) {
+    if (fused_context_.lease_id == 0U) {
+      throw py::value_error("output registration requires a live fused lease");
+    }
+    const py::dict expected = FusedContextDict(fused_context_);
+    for (const auto& item : expected) {
+      if (!context.contains(item.first) ||
+          context[item.first].cast<std::uint64_t>() !=
+              item.second.cast<std::uint64_t>()) {
+        throw py::value_error("pass the unmodified original fused lease");
+      }
+    }
+    const auto tensor = GetNpuTensorView(output, "fused output view");
+    const std::string device = "npu:" + std::to_string(DeviceId());
+    if (py::str(output.attr("device")).cast<std::string>() != device ||
+        tensor.shape.size() < 2 || tensor.shape.front() <= 0 ||
+        tensor.bytes % static_cast<std::size_t>(tensor.shape.front()) != 0 ||
+        tensor.bytes / static_cast<std::size_t>(tensor.shape.front()) != BatchGetTokenBytes()) {
+      throw py::value_error("fused output view must have one token_bytes-sized row per slot on the Runtime device");
+    }
+    ThrowIfAclError(aclrtSetDevice(static_cast<int32_t>(DeviceId())),
+                    "aclrtSetDevice before fused output registration");
+    // Retain before native registration; failures cannot free registered HBM.
+    fused_output_views_.push_back(output);
+    FusedBatchGetContext view;
+    ThrowIfError(native_->RegisterFusedBatchGetOutput(
+        fused_context_, tensor.data, tensor.bytes, &view));
+    return FusedContextDict(view);
+  }
+
   void ReleaseFusedBatchGetContext(const py::dict& context,
                                    const py::object& stream) {
     if (fused_context_.lease_id == 0U) {
@@ -428,6 +460,7 @@ class NpuPythonRuntime final {
     fused_context_ = FusedBatchGetContext{};
     fused_acl_stream_ = nullptr;
     fused_output_ = py::object{};
+    fused_output_views_.clear();
     fused_stream_ = py::object{};
   }
 
@@ -725,6 +758,7 @@ class NpuPythonRuntime final {
   BatchPutRequest batch_put_request_;
   FusedBatchGetContext fused_context_;
   py::object fused_output_;
+  std::vector<py::object> fused_output_views_;
   py::object fused_stream_;
   aclrtStream fused_acl_stream_{nullptr};
 };
@@ -756,6 +790,13 @@ void BindNpuPythonRuntime(py::module_& module) {
            "must run sequentially on this stream; do not resize/rebind output storage, "
            "reset queue cursors, or free source DDR while the lease is in use. "
            "stream=None captures the Runtime device's current torch.npu stream.")
+      .def("register_fused_batch_get_output",
+           &NpuPythonRuntime::RegisterFusedBatchGetOutput,
+           py::arg("context"), py::arg("output"),
+           "Setup-only output registration under the original fused lease. "
+           "Returns a view with shared persistent queues; all launches must use "
+           "the acquire stream sequentially. Register before capture. Release "
+           "the original lease to release all views; do not resize their tensors.")
       .def("release_fused_batch_get_context",
            &NpuPythonRuntime::ReleaseFusedBatchGetContext,
            py::arg("context"), py::arg("stream") = py::none(),

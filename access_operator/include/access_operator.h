@@ -159,6 +159,12 @@ class DefaultAccessOperator final : public AccessOperator {
   Status AcquireFusedBatchGetContext(
       void* output, std::uint64_t output_bytes, std::uint32_t token_bytes,
       std::uint32_t tokens_per_block, FusedBatchGetContext* context);
+  // Setup-only registration of another output using the same exclusive queue
+  // lease. All views share cursors and must execute on the owner's stream.
+  // Release the original context, not a view; it releases all registrations.
+  Status RegisterFusedBatchGetOutput(
+      const FusedBatchGetContext& owner, void* output,
+      std::uint64_t output_bytes, FusedBatchGetContext* view);
   // Synchronizes the supplied stream and checks the device queue result.
   // A failed release keeps the lease and registrations alive. In particular,
   // a CQ timeout cannot be treated as proof that DMA has stopped. Shutdown

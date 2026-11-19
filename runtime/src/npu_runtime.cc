@@ -1031,6 +1031,16 @@ Status NpuRuntime::AcquireFusedBatchGetContext(
       impl_->options.batch_get_tokens_per_block, context);
 }
 
+Status NpuRuntime::RegisterFusedBatchGetOutput(
+    const FusedBatchGetContext& owner, void* output,
+    std::uint64_t output_bytes, FusedBatchGetContext* view) {
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("Runtime has no fused BatchGet context");
+  }
+  return impl_->access_operator->RegisterFusedBatchGetOutput(
+      owner, output, output_bytes, view);
+}
+
 Status NpuRuntime::ReleaseFusedBatchGetContext(
     const FusedBatchGetContext& context, void* stream) {
   if (!initialized() || impl_->access_operator == nullptr) {

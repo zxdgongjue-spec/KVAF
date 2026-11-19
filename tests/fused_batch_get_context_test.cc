@@ -131,12 +131,20 @@ void TestFailedCompletionRetainsRegistration(bool stream_failure) {
   kvaf::FusedBatchGetContext context;
   Require(op->AcquireFusedBatchGetContext(output.data(), output.size(), 656, 128,
                                          &context).ok(), "failure fixture acquire");
+  std::vector<std::uint8_t> second_output(656 * 8);
+  kvaf::FusedBatchGetContext view;
+  Require(op->RegisterFusedBatchGetOutput(context, second_output.data(),
+                                         second_output.size(), &view).ok(),
+          "failure fixture output view");
   auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(context.device_queue_state);
   int stream_marker = 0;
   if (stream_failure) driver.fail_stream_sync = true;
   else queues[3].last_error = 7;
   Require(!op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(),
           "completion failure must not release context");
+  Require(!op->RegisterFusedBatchGetOutput(context, second_output.data(),
+                                          second_output.size(), &view).ok(),
+          "quarantine rejects new views");
   driver.fail_stream_sync = false;
   queues[3].last_error = 0;
   Require(!op->ReleaseFusedBatchGetContext(context, &stream_marker).ok(),
@@ -145,6 +153,49 @@ void TestFailedCompletionRetainsRegistration(bool stream_failure) {
   op.reset();
   Require(driver.releases == 0 && driver.destroys == 0,
           "destructor never deregisters potentially live DMA resources");
+}
+
+void TestSharedLeaseOutputViews() {
+  driver = {};
+  kvaf::DefaultAccessOperator op(Config());
+  std::vector<std::uint8_t> ddr(4096), first(656 * 4), second(656 * 8);
+  Require(op.Initialize({reinterpret_cast<std::uint64_t>(ddr.data()), ddr.size(),
+                         256, kvaf::DeviceKind::kCpu}).ok(), "view fixture init");
+  kvaf::FusedBatchGetContext owner, view;
+  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
+          "reject view without lease");
+  Require(op.AcquireFusedBatchGetContext(first.data(), first.size(), 656, 128, &owner).ok(),
+          "view fixture acquire");
+  auto* queues = reinterpret_cast<KvafBatchGetQueueState*>(owner.device_queue_state);
+  queues[0].sq_producer_index = 73;
+  auto wrong = owner;
+  ++wrong.lease_id;
+  Require(!op.RegisterFusedBatchGetOutput(wrong, second.data(), second.size(), &view).ok(),
+          "reject stale owner");
+  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size() - 1, &view).ok(),
+          "reject partial token row");
+  driver.fail_acquire = true;
+  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
+          "propagate view registration failure");
+  Require(view.lease_id == 0, "failed view not published");
+  driver.fail_acquire = false;
+  Require(op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
+          "register second output");
+  Require(view.lease_id == owner.lease_id &&
+              view.device_queue_state == owner.device_queue_state &&
+              view.device_core_status == owner.device_core_status &&
+              view.output_address == reinterpret_cast<std::uint64_t>(second.data()) &&
+              view.output_bytes == second.size() &&
+              view.device_channel_entity != owner.device_channel_entity &&
+              queues[0].sq_producer_index == 73 && driver.device_syncs == 1,
+          "view shares cursors without synchronization or reset");
+  int stream_marker = 0;
+  Require(!op.ReleaseFusedBatchGetContext(view, &stream_marker).ok(), "view cannot release owner");
+  Require(op.ReleaseFusedBatchGetContext(owner, &stream_marker).ok(), "owner releases all views");
+  Require(driver.releases == 2, "both registrations released once");
+  Require(!op.RegisterFusedBatchGetOutput(owner, second.data(), second.size(), &view).ok(),
+          "released owner cannot register views");
+  Require(op.Shutdown().ok(), "view fixture shutdown");
 }
 }  // namespace
 
@@ -208,6 +259,7 @@ int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs*, aclrtStr
 int main() {
   try {
     TestLeaseAndRuntimeTeardown();
+    TestSharedLeaseOutputViews();
     TestFailedCompletionRetainsRegistration(false);
     TestFailedCompletionRetainsRegistration(true);
     std::cout << "fused BatchGet host lifecycle tests passed (mock transport only)\n";
