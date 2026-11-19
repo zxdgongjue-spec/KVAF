@@ -1,11 +1,43 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string>
 #include "batch_get_raw_addr_abi.h"
 
 namespace kvaf::raw_read_debug {
+// Raw CQE fields are not urma_cr_status_t enum values. This mapping is from
+// UMDK udma_u_jfc.c, udma_u_get_cr_status(), indexed by status/substatus.
+inline const char* UdmaStatusName(std::uint32_t status,std::uint32_t sub_status) {
+  return status==2 && sub_status==2 ? "URMA_CR_LOC_ACCESS_ERR" : "unmapped";
+}
+
+inline std::string FormatWqe(std::uint32_t core,std::uint32_t jetty,std::uint32_t entry,
+                             const KvafBatchGetDirectUrmaEntity& entity,const std::uint32_t* words) {
+  const auto local=std::uint64_t(words[14]) | (std::uint64_t(words[15])<<32);
+  const auto remote=std::uint64_t(words[10]) | (std::uint64_t(words[11])<<32);
+  const auto bytes=words[12];
+  auto range=[&](std::uint64_t base,std::uint64_t size,std::uint64_t address) {
+    return bytes && address>=base && bytes<=size && address-base<=size-bytes;
+  };
+  std::ostringstream out;
+  out << "[KVAF_NPU] HBM_READ_WQE_DIAGNOSTIC core=" << core << " jetty=" << jetty
+      << " entry=" << entry << " opcode=" << ((words[1]>>8)&255) << " sge_count=" << (words[2]>>24)
+      << " bytes=" << bytes << " local_address=0x" << std::hex << local
+      << " local_sge_token_id=0x" << words[13] << " expected_local_token_id=0x" << entity.local_token_id
+      << " remote_address=0x" << remote << " remote_token_id=0x" << (words[3]&0xfffffU) << std::dec
+      << " local_range_valid=" << range(entity.local_hbm_address,entity.local_hbm_size,local)
+      << " local_token_matches=" << (words[13]==entity.local_token_id)
+      << " remote_range_valid=" << range(entity.remote_host_ddr_address,entity.remote_host_ddr_size,remote)
+      << " remote_token_matches=" << ((words[3]&0xfffffU)==entity.remote_token_id)
+      << " remote_eid_matches=" << (std::memcmp(words+4,entity.remote_eid,16)==0)
+      << " raw_words=" << std::hex << std::setfill('0');
+  for(unsigned word=0;word<16;++word) {if(word)out << ',';out << std::setw(8) << words[word];}
+  out << std::dec << std::setfill(' ') << '\n';
+  return out.str();
+}
+
 inline const char* ResultName(std::uint64_t result) {
   switch (result) {
     case 0: return "success";
@@ -63,6 +95,7 @@ inline std::string Format(const KvafExecuteBatchGetRawAddrKernelArgs& args,
       const auto word0 = static_cast<std::uint32_t>(status.reserved[2]);
       out << "[KVAF_NPU] HBM_READ_CQE_DIAGNOSTIC core=" << core << " jetty=" << status.reserved[1]
           << " status=" << ((word0 >> 24U) & 255U) << " sub_status=" << ((word0 >> 16U) & 255U)
+          << " udma_status_name=" << UdmaStatusName((word0>>24)&255,(word0>>16)&255)
           << " raw_words=" << std::hex << std::setfill('0');
       for (std::uint32_t word = 0; word < 8; ++word) {
         if (word) out << ',';

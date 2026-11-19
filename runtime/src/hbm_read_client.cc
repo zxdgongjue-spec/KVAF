@@ -226,6 +226,23 @@ struct Engine {
               entities.size()*sizeof(entities.front()),ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS)
         return Status::InDoubt("raw READ diagnostic snapshot failed; retain source and output");
       std::fprintf(stderr,"%s",raw_read_debug::Format(args,status.data(),queue.data(),entities.data()).c_str());
+      for(std::uint32_t core=0;core<cores;++core) {
+        const auto& snapshot=status[core];
+        if(snapshot.reserved[0]!=KVAF_RAW_CQE_DIAGNOSTIC_MAGIC || snapshot.reserved[1]>=jettys)continue;
+        const auto jetty=static_cast<std::uint32_t>(snapshot.reserved[1]);
+        const auto entry=static_cast<std::uint32_t>(snapshot.reserved[2]>>32)&0xffffU;
+        const auto& e=entities[core*jettys+jetty];
+        std::array<std::uint32_t,16> words{};
+        const auto offset=e.sq_depth ? std::uint64_t(entry%e.sq_depth)*e.wqe_size : 0;
+        if(!e.sq_va || !e.sq_depth || e.wqe_size!=sizeof(words) || e.sq_va>UINT64_MAX-offset ||
+            aclrtMemcpy(words.data(),sizeof(words),reinterpret_cast<void*>(e.sq_va+offset),
+                sizeof(words),ACL_MEMCPY_DEVICE_TO_HOST)!=ACL_SUCCESS) {
+          std::fprintf(stderr,"[KVAF_NPU] HBM_READ_WQE_DIAGNOSTIC core=%u jetty=%u entry=%u snapshot_unavailable=1\n",
+              core,jetty,entry);
+          continue; // Preserve the original CQ failure if reading the SQ is unsupported.
+        }
+        std::fprintf(stderr,"%s",raw_read_debug::FormatWqe(core,jetty,entry,e,words.data()).c_str());
+      }
       if(!raw_read_debug::AllRequestsCompleted(args,status.data()))
         return Status::InDoubt("raw READ kernel diagnostic failed; inspect HBM_READ_CORE_DIAGNOSTIC; retain source and output");
     }

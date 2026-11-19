@@ -442,6 +442,10 @@ A 校验失败时会同时检查 NPU 比较结果与 CPU 回读，打印 `NPU_HB
 
 每个 MR 的启动探针现在先将所有目标槽填成与 B 预期校验和不同的字节，再执行 READ 并逐槽校验；即使多个 MR 的初始数据全为零，也必须实际覆盖每个槽才能通过。旧版本未预填 scratch，未修改的零值或上个 MR 的相同内容可能导致校验误通过，因此旧日志的 `all_mrs_all_lanes_pass` 不能单独排除底层 CQ 错误。后续的 registration timeout、detach acknowledgement lost 需与原始 CQ 错误分开看待；未确认传输停止和完整清理时继续保留资源。
 
+公开 [UDMA provider 的 udma_u_get_cr_status](https://github.com/openeuler-mirror/umdk/blob/master/src/urma/hw/udma/udma_u_jfc.c) 将原始 `status=2, sub_status=2` 映射为 `URMA_CR_LOC_ACCESS_ERR`，即发起端本地内存访问错误；不是把数字 2 当作 URMA 枚举直接解释。对于 A 发起 READ，先检查 A 的本地目标 SGE、HBM segment 和访问授权；单凭此码不能断定具体 token 编码、绑定关系或端口故障，目标机器的 provider 版本仍需对应核实。
+
+A 的本地 HBM 注册会打印 `DIRECT_LOCAL_HBM_SEGMENT`，核对 provider 返回的 48 B segment 与请求地址、长度和分配 token 是否匹配；不匹配时不发布 entity、不提交 READ。诊断模式在 CQ 错误后，根据保存的 CQE entry index 回读对应 SQE，打印 `HBM_READ_WQE_DIAGNOSTIC`，包含实际 local address、local SGE token、包长、范围/身份匹配和 16 个原始字。若 SQ 不支持 Host 回读，打印 snapshot_unavailable，保留原 CQ 错误。此快照只读，不重放 READ。若上述匹配均正确而仍报本地访问错误，继续结合 driver/UMMU 日志检查实际授权和地址映射；不要仅因 Jetty 与输出 MR 分配了不同 token 就直接修改 token 或 WQE。
+
 无 NPU 测试：
 
 ```bash

@@ -7,6 +7,7 @@
 
 namespace {
 int device_allocations{}, local_mrs{}, tokens{}, remote_mrs{}, import_calls{}, fail_import{}, fail_unimport{}, fail_copy{};
+int bad_local_segment{};
 void Check(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 class Link final:public kvaf::peer::PeerLink {
  public:
@@ -38,7 +39,15 @@ KvafBatchGetTransport* Transport(Link& link) {
   t->api.token_free=[](void*,void* p){--tokens;delete static_cast<int*>(p);return 0;};
   t->api.lmem_register=[](void*,hccp::MrRegInfo* info,void** out){
     Check(!(info->in.mem.addr%4096),"aligned output registration");
-    *out=new int;++local_mrs;info->out.key.size=48;return 0;};
+    *out=new int;++local_mrs;info->out.key.size=bad_local_segment==1?47:48;
+    auto base=info->in.mem.addr+(bad_local_segment==2?4096:0);
+    auto bytes=bad_local_segment==3?uint64_t(1):info->in.mem.size;
+    const uint32_t token=bad_local_segment==4?0x6600:0x5500;
+    std::memcpy(info->out.key.value+20,&base,8);
+    std::memcpy(info->out.key.value+32,&bytes,8);
+    std::memcpy(info->out.key.value+44,&token,4);
+    info->out.ub.token_id=token;
+    return 0;};
   t->api.lmem_unregister=[](void*,void* p){--local_mrs;delete static_cast<int*>(p);return 0;};
   t->api.rmem_import=[](void*,hccp::MrImportInfo*,void** out){
     *out=new int;++remote_mrs;return ++import_calls==fail_import?-1:0;};
@@ -95,5 +104,13 @@ int main(){try{
   Check(!KvafBatchGetTransportAddRemoteMemory(t,2,0x20000,4098),"import for legacy destroy");
   KvafBatchGetTransportDestroy(t);t=nullptr;
   Check(!remote_mrs && !local_mrs && !device_allocations,"legacy destroy also retires multi-MR imports");
+  for(int bad=1;bad<=4;++bad) {
+    t=Transport(link);bad_local_segment=bad;local=nullptr;pointer=0;
+    Check(KvafBatchGetLocalBufferAcquireForRemote(t,1,output.data(),output.size(),&local,&pointer)!=0,
+          "invalid provider local segment is rejected before publishing any entity");
+    Check(!local && !local_mrs && !tokens && !device_allocations,"failed registration owns and releases its resources");
+    bad_local_segment=0;
+    Check(!KvafBatchGetTransportClose(&t) && !remote_mrs,"invalid local segment transport cleanup");
+  }
   std::cout<<"NPU multi-MR production transport cache: identity, output reuse and teardown passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

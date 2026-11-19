@@ -233,12 +233,19 @@ int main(){
       CHECK(f.statuses[0].reserved[0]==KVAF_RAW_CQE_DIAGNOSTIC_MAGIC);
       CHECK(f.statuses[0].reserved[1]==0);
       CHECK(f.statuses[0].reserved[2]==(uint64_t(0x12345678)<<32 | 0x03020004));
-      CHECK(diagnostic.find("jetty=0 status=3 sub_status=2 raw_words=03020004,12345678")!=std::string::npos);
+      CHECK(diagnostic.find("jetty=0 status=3 sub_status=2 udma_status_name=unmapped raw_words=03020004,12345678")!=std::string::npos);
+      const auto wqe=kvaf::raw_read_debug::FormatWqe(0,0,0,f.entities[0],aiv_model::hardware[0].sq.data());
+      CHECK(wqe.find("local_range_valid=1 local_token_matches=1 remote_range_valid=1 remote_token_matches=1 remote_eid_matches=1")!=std::string::npos);
+      auto* words=aiv_model::hardware[0].sq.data();const auto saved=words[13];words[13]^=1;
+      CHECK(kvaf::raw_read_debug::FormatWqe(0,0,0,f.entities[0],words).find("local_token_matches=0")!=std::string::npos);
+      words[13]=saved;
     }
     auto before=aiv_model::doorbells;KvafExecuteBatchGetRawAddrAivKernelV2(f.args);
     CHECK(f.statuses[0].execution.result==kInvalidQueue);CHECK(before==aiv_model::doorbells);
     CHECK(f.statuses[0].reserved[0]==0); // A later invalid queue cannot report a stale CQE.
   }
+  CHECK(std::string(kvaf::raw_read_debug::UdmaStatusName(2,2))=="URMA_CR_LOC_ACCESS_ERR");
+  CHECK(std::string(kvaf::raw_read_debug::UdmaStatusName(2,1))=="unmapped");
   // Distinguish an entity rejection before posting from an absent/stale
   // status and from CQ faults after a WQE has already been submitted.
   {Fixture f(2,2,2,2048);f.args.request_count=2;

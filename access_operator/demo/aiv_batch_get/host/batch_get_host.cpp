@@ -203,6 +203,34 @@ bool RegisterMemory(const DirectHccpApi &api, void *context, void *token_handle,
   memory->token_value = token_value;
   memory->key_bytes = info.out.key.size;
   std::memcpy(memory->key, info.out.key.value, memory->key_bytes);
+  // The local SGE uses the caller VA and allocated token. Check the actual
+  // provider segment before publishing an entity with that identity, just as
+  // the HBM exporter checks its remote segment. A translated local VA needs a
+  // separate addressing contract; it cannot silently use the caller address.
+  uint64_t segment_base=0,segment_bytes=0;
+  uint32_t segment_token=0,segment_uasid=0,segment_attributes=0;
+  if(memory->key_bytes==48) {
+    std::memcpy(&segment_uasid,memory->key+16,4);
+    std::memcpy(&segment_base,memory->key+20,8);
+    std::memcpy(&segment_bytes,memory->key+32,8);
+    std::memcpy(&segment_attributes,memory->key+40,4);
+    std::memcpy(&segment_token,memory->key+44,4);
+  }
+  std::array<uint8_t,hccp::kEidBytes> segment_eid{};
+  if(memory->key_bytes>=segment_eid.size())std::memcpy(segment_eid.data(),memory->key,segment_eid.size());
+  const bool valid=memory->key_bytes==48 && segment_base==aligned_address &&
+      segment_bytes>=aligned_bytes && segment_bytes<=UINT64_MAX-segment_base &&
+      token_id && (segment_token>>kTokenIdShift)==token_id;
+  std::fprintf(stderr,
+      "[KVAF_AIV] DIRECT_LOCAL_HBM_SEGMENT role=%s valid=%u key_bytes=%u "
+      "requested_base=0x%llx requested_bytes=%llu segment_base=0x%llx segment_bytes=%llu "
+      "allocated_wqe_token_id=0x%x segment_raw_token_id=0x%x ra_token_id=0x%x "
+      "uasid=%u attributes=0x%x registration_flags=0x%x segment_eid=%s\n",
+      role,unsigned(valid),memory->key_bytes,(unsigned long long)aligned_address,
+      (unsigned long long)aligned_bytes,(unsigned long long)segment_base,(unsigned long long)segment_bytes,
+      token_id,segment_token,info.out.ub.token_id,segment_uasid,segment_attributes,
+      info.in.ub.flags,EidToHex(segment_eid).c_str());
+  if(!valid)return false;
   std::fprintf(stderr,
                "[KVAF_AIV] DIRECT_MEMORY_REGISTERED role=%s token_id=0x%x host_or_hbm_va=0x%llx bytes=%llu\n",
                role, memory->token_id, static_cast<unsigned long long>(aligned_address),
