@@ -150,7 +150,7 @@ class TcpNotifications(unittest.TestCase):
         reader = bench.parse_args(["--role", "reader", "--device-a", "0", "--device-b", "0",
                                    "--control-connect", "127.0.0.1:29100",
                                    "--npu-eid-a-raw", "a", "--graph", "--source-count", "2",
-                                   "--packet-group", "2:16", "--packet-group", "2:4"])
+                                   "--packet-group", "2:16", "--packet-group", "2:4", "--verify-source"])
         producer = bench.parse_args(["--role", "producer", "--device-b", "0", "--npu-eid-b-raw", "b",
                                      "--control-listen", "127.0.0.1:29100"])
         adopted = bench.configured_producer(producer, bench.benchmark_config(reader))
@@ -158,7 +158,8 @@ class TcpNotifications(unittest.TestCase):
         self.assertEqual(bench.round_counts(reader), bench.round_counts(adopted))
         self.assertEqual((adopted.device_b, adopted.npu_eid_b_raw), (0, "b"))
         self.assertTrue(adopted.graph)
-        for change in ({"device_b": 7}, {"iterations": "2"}, {"packet_groups": []}, {"graph": 1}):
+        self.assertTrue(adopted.verify_source)
+        for change in ({"device_b": 7}, {"iterations": "2"}, {"packet_groups": []}, {"graph": 1}, {"verify_source": 1}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 bench.configured_producer(producer, {**bench.benchmark_config(reader), **change})
         for argv in (["--role", "reader", "--npu-eid-a-raw", "a"],
@@ -212,7 +213,10 @@ class TcpNotifications(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.run_benchmark_session(startup_failure=mode)
 
-    def run_benchmark_session(self, fail_wait=False, startup_failure=None):
+    def test_consumer_mismatch_keeps_source_frozen_without_reuse(self):
+        self.run_benchmark_session(fail_compare=True)
+
+    def run_benchmark_session(self, fail_wait=False, startup_failure=None, fail_compare=False):
         # Same module names as the pybind classes exercise the restricted token
         # serialization. Only tensor/kernel behavior is mocked; every application
         # message, workload negotiation and batch receipt uses a real TCP socket.
@@ -225,7 +229,7 @@ class TcpNotifications(unittest.TestCase):
         torch = MagicMock()
         torch.npu.stream.side_effect = lambda stream: contextlib.nullcontext()
         torch.tensor.side_effect = lambda values, **kwargs: tuple(values)
-        torch.equal.return_value = True
+        torch.equal.return_value = not fail_compare
         events = []
         source, runtime = MagicMock(), MagicMock()
         runtime.initialized, runtime.ddr_initialized, runtime.pending_raw_addr = True, False, False
@@ -313,6 +317,7 @@ class TcpNotifications(unittest.TestCase):
             with patch.dict(sys.modules, modules), patch.object(control, "TcpControlListener", side_effect=listen) as server, \
                     patch.object(control.TcpControlChannel, "send", new=send_message), \
                     patch.object(bench, "packet_payload", return_value=MagicMock()), \
+                    patch.object(bench, "report_read_mismatch") as diagnostic, \
                     patch.object(bench, "retain", side_effect=Retained), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 worker = threading.Thread(target=produce, name="tcp-producer", daemon=True)
@@ -345,7 +350,7 @@ class TcpNotifications(unittest.TestCase):
                 self.assertIsInstance(producer_errors[0], RuntimeError)
                 self.assertIn("HBM context initialization failed", str(producer_errors[0]))
             return
-        if fail_wait:
+        if fail_wait or fail_compare:
             self.assertEqual(len(reader_errors), 1)
             self.assertEqual(len(producer_errors), 1)
             self.assertIsInstance(reader_errors[0], Retained)
@@ -354,6 +359,8 @@ class TcpNotifications(unittest.TestCase):
             source.shutdown.assert_not_called()
             runtime.shutdown.assert_not_called()
             self.assertTrue(source.frozen)
+            if fail_compare:
+                diagnostic.assert_called_once()
         else:
             self.assertEqual(reader_errors, [])
             self.assertEqual(producer_errors, [])

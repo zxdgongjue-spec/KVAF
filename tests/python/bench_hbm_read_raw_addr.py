@@ -9,6 +9,7 @@ Use --role reader / --role producer to launch the peers on separate hosts.
 """
 import argparse
 from dataclasses import dataclass
+import hashlib
 from math import gcd
 import multiprocessing as mp
 import time
@@ -59,6 +60,8 @@ def parse_args(argv=None):
                         help="eager-only instrumented rounds (default: 20 eager, 0 graph); 0 disables")
     parser.add_argument("--validate-ranges", action="store_true",
                         help="enable optional length/source/output bounds diagnostics; no overlap detection")
+    parser.add_argument("--verify-source", action="store_true",
+                        help="diagnostic: copy B's source to CPU and verify written packets before each ready")
     parser.add_argument("--aiv-cores", type=int, default=2)
     parser.add_argument("--jettys-per-core", type=int, default=2)
     parser.add_argument("--max-inflight-total", type=int, default=2048)
@@ -123,7 +126,7 @@ def parse_args(argv=None):
 
 _CONFIG_INTS = ("source_space_bytes", "source_count", "seed", "warmup", "iterations",
                 "profile_warmup", "profile_iterations", "aiv_cores", "jettys_per_core", "max_inflight_total")
-_CONFIG_BOOLS = ("graph", "validate_ranges")
+_CONFIG_BOOLS = ("graph", "validate_ranges", "verify_source")
 
 
 def benchmark_config(args):
@@ -333,6 +336,70 @@ def packet_payload(torch, offsets, packet_bytes, phase):
     return ((rows * 131 + columns * 17 + (columns >> 3) + phase * 31) & 255).to(torch.uint8)
 
 
+def layout_digest(layout):
+    return hashlib.sha256(repr((layout.sources, layout.destinations, layout.lengths)).encode("ascii")).hexdigest()[:16]
+
+
+def byte_mismatch(actual, expected, *, limit=8):
+    """Bounded report from CPU byte buffers; no NPU comparison/gather needed."""
+    actual, expected = memoryview(actual).cast("B"), memoryview(expected).cast("B")
+    if len(actual) != len(expected):
+        return f"actual_bytes={len(actual)} expected_bytes={len(expected)}"
+    differences = []
+    for offset, (got, want) in enumerate(zip(actual, expected)):
+        if got != want:
+            differences.append(f"{offset}:{got:02x}/{want:02x}")
+            if len(differences) == limit:
+                break
+    if not differences:
+        return "host_equal=1"
+    first = int(differences[0].split(":", 1)[0])
+    end = min(first + 32, len(actual))
+    return (f"host_equal=0 first_offset={first} "
+            f"actual_hex={actual[first:end].hex()} expected_hex={expected[first:end].hex()} "
+            f"differences_offset_actual_expected={','.join(differences)}")
+
+
+def verify_source_packets(torch, hbm, payloads, layout, iteration, mr_id, registered_address):
+    # Diagnostic only: the source-space copy and CPU verification are outside
+    # timing, and their payload never enters the TCP control channel.
+    if hbm.data_ptr() != registered_address:
+        raise RuntimeError(f"NPU producer storage changed at iteration {iteration}, mr_id={mr_id}")
+    source = hbm.cpu()
+    for group_index, (group, payload) in enumerate(zip(layout.groups, payloads)):
+        for row, offset in enumerate(group.offsets):
+            start = group.source_base + offset
+            actual = source[start:start + group.packet_bytes]
+            expected = payload[row]
+            if not torch.equal(actual, expected):
+                detail = byte_mismatch(actual.numpy(), expected.numpy())
+                raise RuntimeError(f"NPU producer write mismatch at iteration {iteration}, mr_id={mr_id}, "
+                                   f"group={group_index}, row={row}, source_offset={start}: {detail}")
+    print(f"NPU_HBM_SOURCE_CHECK_PASS iteration={iteration} mr_id={mr_id} "
+          f"packets={len(layout.sources)} layout_digest={layout_digest(layout)}", flush=True)
+
+
+def report_read_mismatch(torch, output_cpu, expected, expected_hbm, layout, iteration, ready, npu_equal):
+    # Do not classify a failed NPU equal as payload corruption until the CPU
+    # readback is compared too. Preserve the NPU consumer failure either way.
+    host_equal = torch.equal(output_cpu, expected)
+    expected_equal = torch.equal(expected_hbm.cpu(), expected)
+    print(f"NPU_HBM_READ_MISMATCH iteration={iteration} mr_id={ready.mr_id} sequence={ready.sequence} "
+          f"npu_equal={int(npu_equal)} expected_hbm_host_equal={int(expected_equal)} "
+          f"layout_digest={layout_digest(layout)} {byte_mismatch(output_cpu.numpy(), expected.numpy())}", flush=True)
+    actual = memoryview(output_cpu.numpy()).cast("B")
+    wanted = memoryview(expected.numpy()).cast("B")
+    print(f"NPU_HBM_GUARD_CHECK prefix_ok={int(actual[:GUARD_BYTES] == wanted[:GUARD_BYTES])} "
+          f"suffix_ok={int(actual[-GUARD_BYTES:] == wanted[-GUARD_BYTES:])}", flush=True)
+    if not host_equal:
+        for request, (src, dst, length) in enumerate(zip(layout.sources, layout.destinations, layout.lengths)):
+            if actual[dst:dst + length] != wanted[dst:dst + length]:
+                detail = byte_mismatch(actual[dst:dst + length], wanted[dst:dst + length])
+                print(f"NPU_HBM_PACKET_MISMATCH request={request} source_offset={src} "
+                      f"output_offset={dst} packet_bytes={length} {detail}", flush=True)
+                break
+
+
 def producer(channel, args, layout, receiver, *, session=""):
     import torch
     import torch_npu  # noqa: F401
@@ -349,6 +416,7 @@ def producer(channel, args, layout, receiver, *, session=""):
     try:
         tensors = [torch.zeros(args.source_space_bytes, dtype=torch.uint8, device=device)
                    for _ in range(args.source_count)]
+        registered_addresses = [tensor.data_ptr() for tensor in tensors]
         indices = [torch.tensor([offset // group.packet_bytes for offset in group.offsets],
                                 dtype=torch.int64, device=device) for group in layout.groups]
         torch.npu.synchronize()
@@ -362,8 +430,9 @@ def producer(channel, args, layout, receiver, *, session=""):
                 raise RuntimeError("request notification belongs to another round")
             hbm = tensors[iteration % args.source_count]
             phase = pattern_phase(iteration, args.source_count)
-            payloads = [packet_payload(torch, group.offsets, group.packet_bytes, phase + index * 17).to(device)
-                        for index, group in enumerate(layout.groups)]
+            cpu_payloads = [packet_payload(torch, group.offsets, group.packet_bytes, phase + index * 17)
+                            for index, group in enumerate(layout.groups)]
+            payloads = [payload.to(device) for payload in cpu_payloads]
             torch.npu.synchronize()
             with torch.npu.stream(stream):
                 for group, index, payload in zip(layout.groups, indices, payloads):
@@ -371,6 +440,9 @@ def producer(channel, args, layout, receiver, *, session=""):
                     rows = hbm[group.source_base:group.source_base + slots * group.packet_bytes].view(slots, group.packet_bytes)
                     rows.index_copy_(0, index, payload)
             stream.synchronize()
+            if args.verify_source:
+                mr = iteration % args.source_count
+                verify_source_packets(torch, hbm, cpu_payloads, layout, iteration, mr + 1, registered_addresses[mr])
             begin = time.perf_counter_ns()
             ready = source.ready(hbm) if args.source_count > 1 else source.ready()
             ready_us = (time.perf_counter_ns() - begin) / 1000
@@ -479,6 +551,7 @@ def reader(args):
               f"aiv_cores={args.aiv_cores} jettys_per_core={args.jettys_per_core} "
               f"max_inflight_total={args.max_inflight_total} "
               f"validate_ranges={int(args.validate_ranges)} output_registration_cache=1 "
+              f"verify_source={int(args.verify_source)} layout_digest={layout_digest(layout)} "
               "source_pattern=random_disjoint_slots output_pattern=contiguous metadata=npu_int64 "
               "payload_uses_cpu_ddr=0 ddr_initialized=0 cpu_service_required=0 control_listener=producer "
               "hbm_control_listener=reader acquire_raw=0 "
@@ -529,10 +602,22 @@ def reader(args):
                 result, elapsed_us = measure_raw_read(runtime, ready, src, dst, lengths, output, stream,
                                                      profile=instrumented, validate_ranges=args.validate_ranges)
             verify_begin = time.perf_counter_ns()
-            if not torch.equal(output, expected_hbm):
-                raise RuntimeError(f"NPU consumer mismatch at iteration {iteration}")
-            if not torch.equal(output.cpu(), expected):
-                raise RuntimeError(f"payload/guard mismatch at iteration {iteration}")
+            npu_equal = torch.equal(output, expected_hbm)
+            output_cpu = output.cpu()
+            host_equal = torch.equal(output_cpu, expected)
+            if not npu_equal or not host_equal:
+                try:
+                    report_read_mismatch(torch, output_cpu, expected, expected_hbm, layout, iteration, ready, npu_equal)
+                    for name, tensor, values in (("source", src, layout.sources),
+                                                 ("destination", dst, layout.destinations),
+                                                 ("length", lengths, layout.lengths)):
+                        actual_values = tuple(tensor.cpu().tolist())
+                        print(f"NPU_HBM_METADATA_CHECK array={name} matches={int(actual_values == values)} "
+                              f"actual_head={actual_values[:8]} expected_head={values[:8]}", flush=True)
+                except Exception as error:
+                    print(f"NPU_HBM_MISMATCH_DIAGNOSTIC_FAILED error={error}", flush=True)
+                kind = "NPU consumer" if not npu_equal else "payload/guard"
+                raise RuntimeError(f"{kind} mismatch at iteration {iteration}")
             verify_us = (time.perf_counter_ns() - verify_begin) / 1000
             if args.warmup <= iteration < normal_rounds:
                 stages[read_stage].append(elapsed_us)

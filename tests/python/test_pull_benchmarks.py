@@ -18,6 +18,81 @@ def npu_ready(mr_id=1, sequence=1):
 
 
 class PullBenchmarks(unittest.TestCase):
+    def test_mismatch_reports_distinguish_guard_and_packet_corruption(self):
+        class CpuBytes:
+            def __init__(self, data):
+                self.data = bytes(data)
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return self.data
+
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--packets", "2",
+                           "--packet-bytes", "8", "--source-space-bytes", "64"])
+        layout = packet_layout(args)
+        expected = CpuBytes(bytes([0xCC] * GUARD_BYTES + [1] * 16 + [0xCC] * GUARD_BYTES))
+        torch = SimpleNamespace(equal=lambda a, b: a.data == b.data)
+        for position, guards, packet in [(0, "prefix_ok=0 suffix_ok=1", False),
+                                         (GUARD_BYTES + 8, "prefix_ok=1 suffix_ok=1", True),
+                                         (len(expected.data) - 1, "prefix_ok=1 suffix_ok=0", False)]:
+            actual = bytearray(expected.data)
+            actual[position] ^= 1
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                raw_bench.report_read_mismatch(torch, CpuBytes(actual), expected, expected, layout, 0, npu_ready(), False)
+            self.assertIn(f"first_offset={position}", log.getvalue())
+            self.assertIn("expected_hbm_host_equal=1", log.getvalue())
+            self.assertIn(guards, log.getvalue())
+            self.assertEqual("NPU_HBM_PACKET_MISMATCH" in log.getvalue(), packet)
+            if packet:
+                self.assertIn(f"request=1 source_offset={layout.sources[1]}", log.getvalue())
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            raw_bench.report_read_mismatch(torch, expected, expected, expected, layout, 0, npu_ready(), False)
+        self.assertIn("npu_equal=0", log.getvalue())
+        self.assertIn("host_equal=1", log.getvalue())
+        self.assertNotIn("PACKET_MISMATCH", log.getvalue())
+        detail = raw_bench.byte_mismatch(bytes(100), bytes([1] * 100))
+        self.assertEqual(len(detail.split("differences_offset_actual_expected=")[1].split(",")), 8)
+
+    def test_source_verification_checks_actual_storage_before_ready(self):
+        class CpuBytes:
+            def __init__(self, data):
+                self.data = bytes(data)
+
+            def __getitem__(self, key):
+                return CpuBytes(self.data[key])
+
+            def numpy(self):
+                return self.data
+
+        args = parse_args(["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b", "--packet-group", "2:8",
+                           "--packet-group", "1:4", "--source-space-bytes", "128", "--verify-source"])
+        layout = packet_layout(args)
+        data, payloads = bytearray(args.source_space_bytes), []
+        for group_id, group in enumerate(layout.groups):
+            payload = []
+            for row, offset in enumerate(group.offsets):
+                value = bytes([group_id * 32 + row + 1] * group.packet_bytes)
+                start = group.source_base + offset
+                data[start:start + group.packet_bytes] = value
+                payload.append(CpuBytes(value))
+            payloads.append(payload)
+        hbm = SimpleNamespace(data_ptr=lambda: 1234, cpu=lambda: CpuBytes(data))
+        torch = SimpleNamespace(equal=lambda a, b: a.data == b.data)
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            raw_bench.verify_source_packets(torch, hbm, payloads, layout, 0, 1, 1234)
+        self.assertIn("SOURCE_CHECK_PASS iteration=0 mr_id=1", log.getvalue())
+        start = layout.groups[1].source_base + layout.groups[1].offsets[0]
+        data[start] = 0
+        with self.assertRaisesRegex(RuntimeError, f"group=1, row=0, source_offset={start}.*host_equal=0"):
+            raw_bench.verify_source_packets(torch, hbm, payloads, layout, 0, 1, 1234)
+        with self.assertRaisesRegex(RuntimeError, "storage changed"):
+            raw_bench.verify_source_packets(torch, hbm, payloads, layout, 0, 1, 5678)
+
     def test_raw_read_timing_includes_external_wait(self):
         clock = [0]
         calls = []

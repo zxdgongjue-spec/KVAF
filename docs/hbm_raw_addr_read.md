@@ -428,6 +428,12 @@ A 须能访问 B:29100，B 须能访问 A:29000。TCP 连通仅说明通知可�
 
 实际 Connector 可通过 `from kvaf.tcp_control import TcpControlListener, TcpControlChannel` 复用；`send((kind, payload))` / `recv()` 提供消息边界，业务层仍负责身份和完成确认。连接支持串行 sender 与串行 receiver 并行工作，不要由其他线程直接访问底层 socket。
 
+若已出现 `HBM_READ_READY ... probe=all_mrs_all_lanes_pass`，随后报 `NPU consumer mismatch`，说明初始化探针已通过，仍需定位实际批次。探针从每个 MR 起始地址读取最多 64 B，与随机偏移、实际包长及写后数据的完整校验不同。B 的 `TCP session failed without reader shutdown` 可能是 A 校验失败后关闭通知连接的结果，不能据此认定 TCP 是原始故障。
+
+定位时在 reader 原命令上增加 `--verify-source`，先使用 16 包、1 MiB 源空间、`--profile-iterations 0` 的小规模配置，保留原 MR 数及核/Jetty 配置以复现。两端须同步更新脚本。该选项由 A 下发给 B：B 每次写后同步 stream，将所选源 Tensor 完整回读到 CPU，核对所有请求包及注册地址，再发送 ready；通过时打印 `NPU_HBM_SOURCE_CHECK_PASS` 和布局摘要。源内容仅在 B 本机用于诊断，不通过 TCP 发送。此模式有额外的 CPU 内存和同步开销，用于定位，不作为正常性能数据。
+
+A 校验失败时会同时检查 NPU 比较结果与 CPU 回读，打印 `NPU_HBM_READ_MISMATCH`（实际/预期字节、首个差异、MR/sequence、expected_hbm 回读校验）、`NPU_HBM_GUARD_CHECK`、首个 `NPU_HBM_PACKET_MISMATCH` 及三组 `NPU_HBM_METADATA_CHECK`。A/B 的 `layout_digest` 应相同。B 写后校验失败指向本地生产路径；B 校验通过而 A 回读错误时继续检查数据搬运、地址/描述符和可见性；A 回读正确但 NPU 比较失败时继续检查 NPU 消费/比较路径。即使 CPU 回读正确，也不将 NPU 消费失败当作测试通过，且仍不发送 reuse。
+
 无 NPU 测试：
 
 ```bash
