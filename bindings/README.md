@@ -51,10 +51,15 @@ NpuRuntime(batch_get_token_bytes, batch_get_tokens_per_block, *,
 未指定默认配置时优先选当前构建可用的实现；显式选择不可用实现会在首次使用时失败。
 
 `put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
-预算按 provider 配置：`cores` 默认为 2；URMA AIV 的 `jettys` 默认为 2，Get 支持 1..64、
+预算按 provider 配置：`cores=0` 使用该算法默认值，URMA AIV Put/Get 为 2、UBMEM AIV
+Put/Get 为 16、AICPU Put 为 1、AICPU Gather/Scatter Get 为 5。URMA AIV 的 `jettys` 默认为 2，Get 支持 1..64、
 Put 支持 1..2；仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 关闭限制，非零须至少为
 `2 * cores`。`request_capacity` 默认 65536，Gather 可额外指定 `cpu_threads`。
-AIV/UBmem 的 `kernel_path` 在相应资源项中提供；不使用的算法不要求提供路径。
+AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
+`bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
+`./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，
+不依赖应用启动目录。资源项中非空的 `kernel_path` 覆盖默认值；移动构建产物后须重新构建
+或显式指定新路径。不使用的算法不检查 kernel 文件。
 AICPU 首次准备时从 CANN 安装目录定位包，不接受资源项 kernel 路径。
 预算变化需新建 Runtime/graph，详见[在途控制](../docs/batch_get_inflight_control.md)。
 
@@ -66,7 +71,7 @@ CPU 侧设备。UBmem 不使用 EID，CPU 内存分配依赖 Ascend HAL 与驱�
 
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收调用方的
 NPU packed input 和每条 block 的 CPU 整数 metadata，同步写入及事务提交完成后返回。
-AIV Put 必须在其资源项中提供可读 kernel，不再回退到 ACL D2H mock。
+AIV Put 使用默认或显式指定的可读 kernel，不再回退到 ACL D2H mock。
 
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；

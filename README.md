@@ -296,20 +296,22 @@ get_resources=None, npu_eids=[], peer_ub_device="")` 以两个必填参数描述
 
 算法选择通过 `default_put/default_get` 和单次调用的 `execution` 完成。
 `put_resources/get_resources` 是 `(config, ExecutionResources(...))` 列表，提供该实现的
-核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认 cores=2、URMA AIV
+核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认核数/worker 数为 URMA AIV
+Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；URMA AIV
 jettys=2、URMA AIV Get max_inflight_total=2048。未使用算法不会要求预算或 kernel 有效。
 
 | 资源项 | AIV URMA / UBmem | AICPU Gather/Scatter / Put |
 | --- | --- | --- |
-| `kernel_path` | 相应 Put/Get 首次使用前提供可读 `.o` | 不设置；首次准备时解析 CANN 安装包 |
+| `kernel_path` | 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o`；非空值覆盖 | 不设置；首次准备时解析 CANN 安装包 |
 | `cores` | AIV core 数，1..48 | AICPU worker 数，1..8 |
 | `jettys` | 仅 URMA AIV：Get 1..64，Put 1..2 | 不设置 |
 
-下面使用 AIV URMA；UBmem 改用 `transport_mode="ubmem"`、对应 Put/Get 配置及 kernel 路径。
+默认 kernel 路径在构建时记录为绝对路径，`./build.sh npu --build-dir DIR` 自动使用
+`DIR/bin/`，不依赖应用启动目录。移动构建产物后须重新构建或显式覆盖 `kernel_path`。
+下面使用 AIV URMA 的默认预算和路径；UBmem 改用 `transport_mode="ubmem"` 及对应 Put/Get 配置。
 
 ```python
 import os
-from pathlib import Path
 
 import torch
 import torch_npu
@@ -317,7 +319,6 @@ import kvaf
 
 device_id = int(os.environ.get("DEVICE_ID", "0"))
 torch.npu.set_device(device_id)
-build_dir = Path("build-npu").resolve()
 put = kvaf.PutExecutionConfig("urma", "aiv")
 get = kvaf.GetExecutionConfig("urma", "aiv", "direct")
 runtime = kvaf.NpuRuntime(
@@ -325,10 +326,6 @@ runtime = kvaf.NpuRuntime(
     batch_get_tokens_per_block=128,
     device_id=device_id,
     transport_mode="urma", default_put=put, default_get=get,
-    put_resources=[(put, kvaf.ExecutionResources(
-        cores=2, jettys=2, kernel_path=str(build_dir / "bin/kvaf_execute_batch_put_kernels.o")))],
-    get_resources=[(get, kvaf.ExecutionResources(
-        cores=2, jettys=2, kernel_path=str(build_dir / "bin/kvaf_execute_batch_get_kernels.o")))],
     npu_eids=[],  # URMA 默认自动发现；UBmem 不使用 EID。
 )
 runtime.link_to(os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28999"))

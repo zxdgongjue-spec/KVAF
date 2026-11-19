@@ -95,8 +95,6 @@ runtime = kvaf.NpuRuntime(
     batch_get_tokens_per_block=128,
     device_id=0,
     transport_mode="urma", default_put=put, default_get=get,
-    put_resources=[(put, kvaf.ExecutionResources(kernel_path=batch_put_kernel))],
-    get_resources=[(get, kvaf.ExecutionResources(kernel_path=batch_get_kernel))],
 )
 runtime.link_to("141.61.92.71:28999")
 runtime.initialize(ddr_bytes, kv_block_bytes)
@@ -111,8 +109,12 @@ CLOS PG EID，并尝试追加 `/proc/asdrv_ub/pair_info` 的候选；未指定 E
 包在首次使用或显式 warmup 时准备，初始化成功不代表数据面已通过 RMA 验证。
 未建立 CPU 服务 Link 时，`initialize` 返回 `InvalidState`。
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，构造时必须提供；
-其他构造参数仅支持关键字。算法、核数、Jetty、在途预算及 kernel 路径通过默认执行配置
-和 `put_resources/get_resources` 指定，不再提供旧全局后端参数或 adaptive 启动选优参数。
+其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
+为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；
+URMA AIV Jetty 数默认 2、URMA AIV Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
+AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
+`./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
+和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
 
 ### 固定 UB device 后测量
 

@@ -32,9 +32,10 @@ struct ExecutionWarmup {
   void* stream{nullptr};
 };
 struct ExecutionResources {
-  // Zero cores/Jettys use the provider defaults (2 each); an absent in-flight
-  // budget uses 2048 and an explicit zero disables the limiter. AIV kernel
-  // paths are supplied per provider; AICPU packages resolve through CANN.
+  // Zero cores selects provider defaults: URMA AIV 2, UBMEM AIV 16,
+  // AICPU Put 1, AICPU Get 5. Zero Jettys selects 2 for URMA AIV. An absent
+  // in-flight budget uses 2048; explicit zero disables the limiter. Empty AIV
+  // kernel paths use this build's bin output; AICPU packages resolve through CANN.
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};
   std::optional<std::uint32_t> max_inflight_total;
   std::string kernel_path;

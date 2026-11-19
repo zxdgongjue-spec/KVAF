@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.backend import detect_torch_backend
 from utils.npu_eids import parse_npu_eids
-from utils.perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.perf_execution import BenchmarkExecution, add_execution_metadata, default_put_cores
 from utils.statistics import percentile
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
@@ -158,7 +158,7 @@ def main(transport: str = "urma", execution_mode: str = "unified",
         ))
         npu_core_count = int(os.environ.get(
             "KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES",
-                                                 "5" if executor == "aicpu" else "32")
+                                                 str(default_put_cores(transport, executor)))
         ))
         jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
         warmup = int(os.environ.get("KVAF_NPU_WARMUP", "20"))

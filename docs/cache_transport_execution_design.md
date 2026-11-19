@@ -68,7 +68,9 @@ struct GetExecutionConfig {
 | Ubmem | UBMEM AIV | UBMEM AIV Direct |
 | UrmaAndUbmem | URMA AIV | URMA AIV Direct |
 
-上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。核数、Jetty、在途预算和 kernel 路径只由各 provider 的资源项配置。
+上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。各 provider 的默认核数/worker 数为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；URMA AIV Jetty 数默认 2，URMA AIV Get 在途上限默认 2048。资源项可以逐配置覆盖。
+
+AIV/UBMEM 的空 `kernel_path` 使用构建时记录的绝对路径：Get 为 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为 `<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。标准 `./build.sh npu` 使用 `build-npu`，自定义 `--build-dir` 自动生效，不依赖应用当前目录。非空路径严格覆盖默认值；默认或显式文件均在首次准备时检查，缺失时返回错误。移动构建产物后需显式覆盖路径或重新构建。AICPU 保持首次使用时从 CANN 安装目录解析包。
 
 C++ 以 `NpuRuntimeOptions(token_bytes, tokens_per_block)` 描述布局；Python 以 `NpuRuntime(batch_get_token_bytes, batch_get_tokens_per_block, *, ...)` 构造，设备、transport 模式、默认配置和资源预算使用关键字参数。旧 `aicpu_batch_get_mode`、`per_call_execution` 及全局核数/队列/kernel 配置不再接受。`default_put/default_get` 只决定省略本次配置时选哪个算法，不启用资源，也不限制其他已构建算法的调用。
 

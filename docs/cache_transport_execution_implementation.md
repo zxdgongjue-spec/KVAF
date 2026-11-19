@@ -341,12 +341,31 @@ miss_count 为 NPU int32[1]；offsets 使用字节，只有 `[0, miss_count)` �
 输出每行大小须符合 token_bytes。使用 Runtime 生成的 DeviceAccessTable 时保留 Host
 表生命周期；直接传 addresses/valid Tensor 时，调用方承担该地址表的有效性。
 
-`cores=0/jettys=0` 使用 provider 默认值 2；`max_inflight_total=None` 使用默认 2048，
-显式 0 关闭限流。AIV/UBmem 的 kernel 路径必须由对应资源项提供，无全局路径回退。
+`cores=0` 使用下表对应算法的默认核数/worker 数；URMA AIV 的 `jettys=0` 使用默认 2。
+`max_inflight_total=None` 使用默认 2048，显式 0 关闭限流。AIV/UBmem 的
+`kernel_path=""` 使用构建时记录的默认绝对路径：Get 为
+`<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为
+`<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。`./build.sh npu` 默认构建到
+`build-npu`，自定义 `--build-dir` 自动生效；应用可从其他目录启动。
+非空 `kernel_path` 覆盖默认路径；移动构建产物后需重新构建或显式指定新路径。
+AICPU 不设置 `kernel_path`，首次准备时从 CANN 安装目录定位包。
 配置的 request_capacity 范围为 1..65536，是 provider 请求上限；Gather/Scatter 内部
 工作区仍按固定 ABI 最大容量准备。`cpu_threads=0` 使用服务默认值。Jetty 参数用于
 URMA AIV，in-flight 用于 URMA AIV Get，CPU 线程预算用于 AICPU Gather；其他后端拒绝
 无效调优字段。标准构建的同一方向 `.o` 含 URMA/UBMEM 入口，也可按配置覆盖 kernel_path。
+
+| 算法 | 默认核数/worker | 默认每核 Jetty | 默认在途上限 | 默认 kernel 来源 |
+|---|---:|---:|---:|---|
+| URMA AIV Put | 2 | 2 | 不适用 | 构建目录 Put `.o` |
+| UBMEM AIV Put | 16 | 不适用 | 不适用 | 构建目录 Put `.o` |
+| URMA AICPU Put | 1 | 内部管理 | 不适用 | CANN 安装包 |
+| URMA AIV Direct Get | 2 | 2 | 2048 | 构建目录 Get `.o` |
+| UBMEM AIV Direct Get | 16 | 不适用 | 不适用 | 构建目录 Get `.o` |
+| AICPU Gather Get | 5 | 内部管理 | 不适用 | CANN 安装包 |
+| AICPU Scatter Get | 5 | 内部管理 | 不适用 | CANN 安装包 |
+
+本分支新增的 `request_capacity` 默认 65536。Gather 的 `cpu_threads=0` 沿用 CPU 服务
+配置，与 main 一样服务默认 10 个线程；服务启动参数 `--gather-threads` 可覆盖。
 
 预热不提交 key、不搬运应用 payload，也不注册未提供的应用 buffer。Put/Get 预热同时准备
 对应配置的驻留执行状态，完成后归还短期执行租约。`batch_get` 默认异步；调用方可用同

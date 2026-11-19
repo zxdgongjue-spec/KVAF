@@ -488,10 +488,6 @@ struct NpuRuntime::Impl {
 
   ExecutionResources Resources(Transport transport, Executor executor, GetAlgorithm algorithm,
                                bool get) const {
-    ExecutionResources r;
-    r.cores = 2U;
-    r.jettys = 2U;
-    r.max_inflight_total = 2048U;
     const ExecutionResources* selected = nullptr;
     if (get) {
       for (const auto& entry : options.get_resources)
@@ -501,15 +497,7 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    if (selected) {
-      if (selected->cores) r.cores = selected->cores;
-      if (selected->jettys) r.jettys = selected->jettys;
-      if (selected->max_inflight_total) r.max_inflight_total = selected->max_inflight_total;
-      r.cpu_threads = selected->cpu_threads;
-      r.request_capacity = selected->request_capacity;
-      if (!selected->kernel_path.empty()) r.kernel_path = selected->kernel_path;
-    }
-    return r;
+    return detail::ResolveExecutionResources(transport, executor, get, selected);
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {

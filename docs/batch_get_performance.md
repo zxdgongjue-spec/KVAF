@@ -23,6 +23,8 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 | `cpu_push_scatter` | URMA AICPU Scatter | `--aicpu-workers 5` |
 
 四种后端共用请求生成、建表、预检、预热、输出校验、eager/graph 测量和结果格式。
+未显式设置并行度时，AIV Direct 使用 2 核、UBMEM 使用 16 核、Gather/Scatter 使用
+5 个 worker，与 Runtime 的算法默认值一致；命令行参数或环境变量可覆盖。
 `--aiv-cores` 表示 AIV 核数，`--aicpu-workers` 表示 AICPU worker 数（1..8）；
 旧 `--workers` 写法仍接受以兼容已有命令。
 UBMEM 不使用 Jetty 参数。`--table-capacity` 是源块数量，

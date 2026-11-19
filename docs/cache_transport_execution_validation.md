@@ -135,7 +135,7 @@ run_put() {
 }
 run_put urma aiv 2
 run_put ubmem aiv 16
-run_put urma aicpu 5
+run_put urma aicpu 1
 BASH
 ```
 

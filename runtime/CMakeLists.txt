@@ -1,4 +1,9 @@
 find_package(Threads REQUIRED)
+
+# Match the kernel outputs of build.sh npu, including a custom --build-dir.
+# Record absolute paths so applications need not run from the source tree.
+configure_file(cmake/npu_kernel_paths.h.in generated/npu_kernel_paths.h @ONLY)
+
 add_library(kvaf_peer_link STATIC peer/peer_link.cc peer/execution_protocol.cc)
 
 target_include_directories(kvaf_peer_link
@@ -25,6 +30,7 @@ target_include_directories(kvaf_runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 target_link_libraries(kvaf_runtime

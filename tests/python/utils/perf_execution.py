@@ -9,10 +9,14 @@ def add_execution_metadata(parser):
     parser.set_defaults(execution_mode="unified")
 
 
+def default_put_cores(transport, executor):
+    return 16 if transport == "ubmem" else 1 if executor == "aicpu" else 2
+
+
 class BenchmarkExecution:
     def __init__(self, kvaf, *, transport="urma", executor="aiv",
                  algorithm="direct", put_capacity=128, get_capacity=65536,
-                 cores=2, jettys=2, get_kernel="", put_kernel="",
+                 cores=0, jettys=2, get_kernel="", put_kernel="",
                  max_inflight_total=2048):
         if not 1 <= put_capacity <= 65536 or not 1 <= get_capacity <= 65536:
             raise ValueError("Put/Get request capacities must be in [1, 65536]")
