@@ -358,7 +358,10 @@ Status BatchGetTransport::Execute(const BatchGetExecRequest& exec) {
   if (profile) profile->prepare_ns = stamp - begin;
   if (LaunchBatchGet(&launch, stream))
     return impl_->failure = Internal("UMDK BatchGet launch failed; shutdown required");
-  slot->submitted = true;
+  // A captured launch is recorded, not executed. Marking it submitted would force
+  // the next eager Drain to copy back a status window that the kernel never wrote
+  // (all zeros), and Put drains every width before it reuses the session.
+  slot->submitted = !capturing;
   impl_->profile_submitted = args.profile != 0;
   if (profile) {
     const auto now = BatchGetProfileNowNs();
