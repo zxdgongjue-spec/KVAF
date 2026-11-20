@@ -91,10 +91,6 @@ if queued_replays:
     result["end"] = window["start"] + 0.5
     result["payload_bytes"] = result["calls"] * 16384 * 656
     result["bandwidth_GBps"] = result["payload_bytes"] / 0.5e9
-    result["device_event_seconds"] = 0.5
-    if "--contention-graph-event-breakdown" in sys.argv:
-        result["graph_event_breakdown"] = dict(graph_ms=[50] * replays, gap_ms=[0] * (replays - 1),
-                                                  host_submit_batch_ms=1.1, host_replay_ms=[0.1] * replays)
 pathlib.Path(option("--contention-result")).write_text(json.dumps(result))
 if profile:
     warmup, active = int(option("--profiler-warmup")), int(option("--profiler-active"))
@@ -157,8 +153,8 @@ class MulticardTests(unittest.TestCase):
                            EXPECTED_CORES="32", EXPECTED_JETTYS="2", EXPECTED_INFLIGHT="2048",
                            KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048", EXPECTED_DEVICES="2 3 4 5",
                            EXPECTED_SYNC_PER_GRAPH=str(int(sync_per_graph)), EXPECTED_OUTPUT_PATTERN=output_pattern)
-                result = subprocess.run(["bash", str(script), str(root / "build"), "--graph-event-breakdown",
-                                         "--output", str(output), *flags], env=env, capture_output=True,
+                result = subprocess.run(["bash", str(script), str(root / "build"), "--output", str(output), *flags],
+                                         env=env, capture_output=True,
                                         text=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 config = json.loads((output / "config.json").read_text())
@@ -170,63 +166,36 @@ class MulticardTests(unittest.TestCase):
                 self.assertIn(f"sync_per_graph={int(sync_per_graph)}", result.stdout)
                 self.assertFalse(list(output.glob("isolated_*")))
                 self.assertEqual(result.stdout.count("GRAPH_BANDWIDTH "), 4)
-                self.assertEqual(result.stdout.count("device_event_bandwidth_gbps=55.029"), 4)
-                self.assertEqual(result.stdout.count("GRAPH_TIMING "), 4)
-                self.assertEqual(result.stdout.count("GRAPH_SUBMIT "), 4)
+                self.assertEqual(result.stdout.count("bandwidth_gbps=55.029"), 4)
+                self.assertNotIn("device_event_bandwidth_gbps", result.stdout)
+                self.assertNotIn("GRAPH_TIMING ", result.stdout)
                 self.assertEqual(result.stdout.count("profiled_kernel_calls=2560"), 4 if profile else 0)
                 self.assertEqual(result.stdout.count(f"PROFILE_DIR {output / 'concurrent' / 'profiles'}"), int(profile))
 
-    def test_queued_measure_records_events_and_syncs_once(self):
+    def test_queued_measure_times_submission_through_completion_on_host(self):
         actions = []
         stream = object()
         graph = SimpleNamespace(replay=lambda stream: actions.append("replay"),
                                 synchronize=lambda stream: actions.append("sync"))
+        timestamps = iter((10.0, 10.5))
 
-        class Event:
-            def __init__(self, timestamp):
-                self.timestamp = timestamp
-
-            def elapsed_time(self, other):
-                self.assert_synced()
-                return other.timestamp - self.timestamp
-
-            @staticmethod
-            def assert_synced():
-                if actions[-2:] != ["sync", "step"]:
-                    raise AssertionError("timing read before synchronization or profiler stop")
-
-        timestamps = iter((0, 10, 12, 22, 23, 33))
-
-        def record_event():
-            actions.append("event")
-            return Event(next(timestamps))
+        def read_host_time():
+            actions.append("timer")
+            return next(timestamps)
 
         profiler = SimpleNamespace(range=lambda *args: contextlib.nullcontext(), step=lambda: actions.append("step"))
-        _, _, timing = queued.measure(graph, stream, record_event, 3, event_breakdown=True, profiler=profiler)
-        self.assertEqual(actions, ["event", "replay", "event"] * 3 + ["sync", "step"])
-        self.assertEqual(timing["device_event_seconds"], 0.033)
-        self.assertEqual(timing["graph_event_breakdown"]["graph_ms"], [10, 10, 10])
-        self.assertEqual(timing["graph_event_breakdown"]["gap_ms"], [2, 1])
+        with patch.object(queued.time, "monotonic", side_effect=read_host_time):
+            begin, end = queued.measure(graph, stream, 3, profiler=profiler)
+        self.assertEqual(actions, ["timer", "replay", "replay", "replay", "sync", "timer", "step"])
+        self.assertEqual((begin, end), (10.0, 10.5))
 
     def test_queued_measure_can_sync_the_local_stream_after_each_graph(self):
-        for breakdown in (False, True):
-            with self.subTest(event_breakdown=breakdown):
-                actions = []
-                stream = object()
-                graph = SimpleNamespace(replay=lambda stream: actions.append("replay"),
-                                        synchronize=lambda stream: actions.append("sync"))
-
-                def record_event():
-                    actions.append("event")
-                    return SimpleNamespace(elapsed_time=lambda other: 10)
-
-                profiler = SimpleNamespace(range=lambda *args: contextlib.nullcontext(),
-                                           step=lambda: actions.append("step"))
-                queued.measure(graph, stream, record_event, 3, event_breakdown=breakdown,
-                               sync_per_graph=True, profiler=profiler)
-                expected = (["event", "replay", "event", "sync"] * 3 if breakdown else
-                            ["event", "replay", "sync", "replay", "sync", "replay", "event", "sync"])
-                self.assertEqual(actions, expected + ["step"])
+        actions = []
+        stream = object()
+        graph = SimpleNamespace(replay=lambda stream: actions.append("replay"),
+                                synchronize=lambda stream: actions.append("sync"))
+        queued.measure(graph, stream, 3, sync_per_graph=True)
+        self.assertEqual(actions, ["replay", "sync"] * 3)
 
     def test_queued_worker_captures_and_times_on_the_current_stream(self):
         actions = []
@@ -238,20 +207,7 @@ class MulticardTests(unittest.TestCase):
                                 synchronize=Mock(side_effect=lambda stream: actions.append("stream_sync")))
         kvaf = SimpleNamespace(AclGraph=Mock(return_value=graph))
 
-        class Event:
-            def __init__(self, *, enable_timing):
-                if not enable_timing:
-                    raise AssertionError("expected timing event")
-
-            def record(self, selected_stream):
-                if selected_stream is not stream:
-                    raise AssertionError("event recorded on the wrong stream")
-                actions.append("event")
-
-            def elapsed_time(self, other):
-                return 500.0
-
-        torch = SimpleNamespace(npu=SimpleNamespace(current_stream=Mock(return_value=stream), Event=Event,
+        torch = SimpleNamespace(npu=SimpleNamespace(current_stream=Mock(return_value=stream),
                                                     synchronize=lambda: actions.append("device_sync")))
         submit = Mock()
         with tempfile.TemporaryDirectory() as folder:
@@ -259,7 +215,7 @@ class MulticardTests(unittest.TestCase):
             root.joinpath("start.json").write_text(json.dumps({"start": 0, "graph_replays": 10}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
                                    contention_graph_calls=256, contention_barrier_fd=None, contention_queued_replays=True,
-                                   contention_graph_event_breakdown=False, contention_sync_per_graph=False,
+                                   contention_sync_per_graph=False,
                                    warmup=3, miss_count=16384, token_bytes=656, torch_npu_profiler=False)
             validate_output = Mock()
             with patch.dict(os.environ, DEVICE_ID="2"), contextlib.redirect_stdout(io.StringIO()):
@@ -275,12 +231,12 @@ class MulticardTests(unittest.TestCase):
             self.assertEqual(graph.synchronize.call_args_list, [unittest.mock.call(stream)] * 3)
             self.assertEqual(submit.call_args_list, [unittest.mock.call(plan, stream) for plan in [plans[0], *plans]])
             self.assertEqual(actions, ["device_sync", "replay", "replay", "replay", "stream_sync",
-                                       "reset_output", "device_sync", "event"] + ["replay"] * 10 +
-                             ["event", "stream_sync", "stream_sync"])
+                                       "reset_output", "device_sync"] + ["replay"] * 10 +
+                              ["stream_sync", "stream_sync"])
             validate_output.assert_called_once_with(plans[-1])
             result = json.loads(args.contention_result.read_text())
             self.assertEqual(result["calls"], 2560)
-            self.assertEqual(result["device_event_seconds"], 0.5)
+            self.assertGreater(result["end"], result["start"])
 
     def run_controller(self, root, fail=None, transport="ubmem", options=(), cores=16,
                        jettys=2, inflight=2048, expected_transport=None, core_env="16",
@@ -763,8 +719,7 @@ class MulticardTests(unittest.TestCase):
             self.assertIn("synchronized multi-card replay", perf.validate_args(args))
             args = perf.parse_args(["--contention-control-dir", "/tmp/run", "--contention-result", "/tmp/result.json",
                                     "--no-kernel-profile", "--contention-queued-replays",
-                                    "--contention-graph-event-breakdown", "--contention-sync-per-graph",
-                                    "--torch-npu-profiler"])
+                                    "--contention-sync-per-graph", "--torch-npu-profiler"])
             self.assertIsNone(perf.validate_args(args))
             args = perf.parse_args(["--contention-sync-per-graph"])
             self.assertIn("requires queued replays", perf.validate_args(args))
