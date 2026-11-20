@@ -77,13 +77,11 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output, reset_output=
     control = args.contention_control_dir
     device = int(os.environ["DEVICE_ID"])
     queued = getattr(args, "contention_queued_replays", False)
+    plans = [make_plan() for _ in range(args.contention_graph_calls)]
     if queued:
-        # Replay the same request plan for all nodes, as copy-bench does with offsets.
-        plans = [make_plan()] * args.contention_graph_calls
         torch.npu.synchronize()
         stream = torch.npu.Stream()
     else:
-        plans = [make_plan() for _ in range(args.contention_graph_calls)]
         stream = torch.npu.current_stream()
     # Allocate/cache the stream's runtime state before entering capture.
     with torch.npu.stream(stream) if queued else contextlib.nullcontext():
@@ -611,8 +609,8 @@ def main(argv=None):
                          help="with queued replays, wait on the local stream after each replay (default: wait once)")
     parser.add_argument("--graph-event-breakdown", action="store_true",
                         help="print per-graph device times, gaps and host replay times for queued replays")
-    parser.add_argument("--output-access-pattern", choices=("random", "contiguous"),
-                        help="destination order (default: random for queued replays, contiguous otherwise)")
+    parser.add_argument("--output-access-pattern", choices=("random", "contiguous"), default="contiguous",
+                         help="destination order (default: contiguous)")
     profiler_overlap.add_profiler_args(parser, enabled_by_default=None)
     parser.add_argument("--requests", type=int, default=4096)
     parser.add_argument("--token-bytes", type=int, default=656)
@@ -648,8 +646,6 @@ def main(argv=None):
         parser.error("--devices requires at least two distinct nonnegative device IDs")
     if args.graph_replays < 1:
         parser.error("--graph-replays must be positive")
-    if args.output_access_pattern is None:
-        args.output_access_pattern = "random" if args.queued_replays else "contiguous"
     if args.torch_npu_profiler is None:
         args.torch_npu_profiler = not args.queued_replays
     if args.graph_event_breakdown and not args.queued_replays:

@@ -34,7 +34,8 @@ if queued_replays:
     assert "--contention-barrier-fd" not in sys.argv
     assert ("--contention-sync-per-graph" in sys.argv) == (os.environ["EXPECTED_SYNC_PER_GRAPH"] == "1")
     assert option("--request-length") == "16384"
-    assert option("--output-access-pattern") == "random"
+    assert option("--source-access-pattern") == "random"
+    assert option("--output-access-pattern") == os.environ["EXPECTED_OUTPUT_PATTERN"]
 assert "--no-kernel-profile" in sys.argv
 profile = "--torch-npu-profiler" in sys.argv
 assert directory.name == "concurrent" or not profile
@@ -139,11 +140,13 @@ if profile:
 class MulticardTests(unittest.TestCase):
     def test_queued_entrypoint_profiles_one_batch_and_reports_matching_metrics(self):
         script = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_queued_perf.sh"
-        for flags in ((), ("--torch-npu-profiler",), ("--no-torch-npu-profiler",),
+        for flags in ((), ("--torch-npu-profiler",),
+                      ("--no-torch-npu-profiler", "--output-access-pattern", "random"),
                       ("--sync-per-graph", "--torch-npu-profiler"),
                       ("--sync-per-graph", "--no-torch-npu-profiler")):
             profile = "--torch-npu-profiler" in flags
             sync_per_graph = "--sync-per-graph" in flags
+            output_pattern = "random" if "--output-access-pattern" in flags else "contiguous"
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 output = root / "results" / "queued"
@@ -153,7 +156,7 @@ class MulticardTests(unittest.TestCase):
                 env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner), EXPECTED_TRANSPORT="ubmem",
                            EXPECTED_CORES="32", EXPECTED_JETTYS="2", EXPECTED_INFLIGHT="2048",
                            KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048", EXPECTED_DEVICES="2 3 4 5",
-                           EXPECTED_SYNC_PER_GRAPH=str(int(sync_per_graph)))
+                           EXPECTED_SYNC_PER_GRAPH=str(int(sync_per_graph)), EXPECTED_OUTPUT_PATTERN=output_pattern)
                 result = subprocess.run(["bash", str(script), str(root / "build"), "--graph-event-breakdown",
                                          "--output", str(output), *flags], env=env, capture_output=True,
                                         text=True, timeout=20)
@@ -163,6 +166,7 @@ class MulticardTests(unittest.TestCase):
                 self.assertEqual((config["graph_replays"], config["graph_calls"]), (10, 256))
                 self.assertEqual(config["torch_npu_profiler"], profile)
                 self.assertEqual(config["sync_per_graph"], sync_per_graph)
+                self.assertEqual(config["output_access_pattern"], output_pattern)
                 self.assertIn(f"sync_per_graph={int(sync_per_graph)}", result.stdout)
                 self.assertFalse(list(output.glob("isolated_*")))
                 self.assertEqual(result.stdout.count("GRAPH_BANDWIDTH "), 4)
@@ -225,8 +229,8 @@ class MulticardTests(unittest.TestCase):
     def test_queued_worker_times_one_submission_batch_on_its_graph_stream(self):
         actions = []
         active_stream = None
-        plan = object()
-        make_plan = Mock(return_value=plan)
+        plans = [object() for _ in range(256)]
+        make_plan = Mock(side_effect=plans)
         stream = SimpleNamespace(synchronize=lambda: actions.append("stream_sync"))
 
         @contextlib.contextmanager
@@ -273,14 +277,14 @@ class MulticardTests(unittest.TestCase):
             with patch.dict(os.environ, DEVICE_ID="2"), contextlib.redirect_stdout(io.StringIO()):
                 multi.run_worker(None, torch, args, make_plan, submit,
                                  validate_output, lambda: actions.append("reset_output"))
-            make_plan.assert_called_once_with()
+            self.assertEqual(make_plan.call_count, 256)
             capture.assert_called_once_with(graph, stream=stream)
             graph.reset.assert_called_once_with()
-            self.assertEqual(submit.call_args_list, [unittest.mock.call(plan, stream)] * 257)
+            self.assertEqual(submit.call_args_list, [unittest.mock.call(plan, stream) for plan in [plans[0], *plans]])
             self.assertEqual(actions, ["device_sync", "device_sync", "replay", "replay", "replay", "stream_sync",
                                        "reset_output", "device_sync", "event"] + ["replay"] * 10 +
                              ["event", "stream_sync", "stream_sync"])
-            validate_output.assert_called_once_with(plan)
+            validate_output.assert_called_once_with(plans[-1])
             result = json.loads(args.contention_result.read_text())
             self.assertEqual(result["calls"], 2560)
             self.assertEqual(result["device_event_seconds"], 0.5)
