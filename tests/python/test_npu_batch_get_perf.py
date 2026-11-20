@@ -303,6 +303,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
     parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--contention-main-baseline", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     parser.add_argument("--contention-barrier-fd", type=int, help=argparse.SUPPRESS)
@@ -389,6 +390,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
+    if args.contention_main_baseline and args.contention_control_dir is None:
+        return "main baseline requires contention mode"
     if args.contention_control_dir is not None:
         if args.execution != "eager" or args.backend in ("gather_read", "cpu_push_scatter"):
             return "contention controller currently supports AIV/UBmem with its own graph execution"
@@ -1199,13 +1202,20 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 raise AssertionError(f"BatchGet output mismatch: backend={args.backend}, miss_count={count}")
 
         if args.contention_control_dir is not None:
-            from batch_get_multicard_perf import run_worker
-
             def submit(plan, stream):
                 runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
 
-            run_worker(kvaf, torch, args, create_request_plan, submit,
-                       lambda plan: check_output(plan, miss_count_value, full=False), reset_output=output.zero_)
+            def validate_plan(plan):
+                check_output(plan, miss_count_value, full=False)
+
+            if args.contention_main_baseline:
+                from batch_get_multicard_main_perf import run_worker
+
+                run_worker(kvaf, torch, args, create_request_plan, submit, validate_plan)
+            else:
+                from batch_get_multicard_perf import run_worker
+
+                run_worker(kvaf, torch, args, create_request_plan, submit, validate_plan, reset_output=output.zero_)
             return 0
 
         start_kernel_measurement(args, runtime)

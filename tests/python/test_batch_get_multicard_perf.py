@@ -28,6 +28,7 @@ def option(name):
 directory = pathlib.Path(option("--contention-control-dir"))
 device = int(os.environ["DEVICE_ID"])
 queued_replays = "--contention-queued-replays" in sys.argv
+main_baseline = "--contention-main-baseline" in sys.argv
 assert option("--token-bytes") == "656"
 assert option("--table-capacity") == ("64" if queued_replays else "4096")
 if queued_replays:
@@ -58,7 +59,14 @@ devices = os.environ["EXPECTED_DEVICES"].split() if directory.name == "concurren
 assert all((directory / f"ready_{d}").exists() for d in devices)
 window = json.loads((directory / "start.json").read_text())
 # Synthetic results use the same interval across workers.
-replays = window["graph_replays"]
+if main_baseline:
+    assert set(window) == {"start", "stop"} and window["stop"] > window["start"]
+    assert not queued_replays and not profile and "--contention-barrier-fd" not in sys.argv
+    assert option("--source-access-pattern") == "random"
+    assert option("--output-access-pattern") == "contiguous"
+    replays = 2
+else:
+    replays = window["graph_replays"]
 graph_calls = int(option("--contention-graph-calls"))
 time.sleep(max(0, window["start"] - time.monotonic()))
 if "--contention-barrier-fd" in sys.argv:
@@ -134,6 +142,29 @@ if profile:
 
 
 class MulticardTests(unittest.TestCase):
+    def test_main_baseline_entrypoint_uses_a_time_window_and_runs_isolated_first(self):
+        script = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_multicard_main_perf.sh"
+        devices = (0, 1, 6, 7)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output = root / "main"
+            runner = root / "runner"
+            runner.write_text(FAKE_RUNNER)
+            runner.chmod(0o755)
+            env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner), EXPECTED_TRANSPORT="ubmem",
+                       EXPECTED_CORES="32", EXPECTED_JETTYS="2", EXPECTED_INFLIGHT="2048",
+                       KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048", EXPECTED_DEVICES="0 1 6 7")
+            result = subprocess.run(["bash", str(script), str(root / "build"), "--devices", *map(str, devices),
+                                     "--aiv-cores", "32", "--seconds", "0.1", "--output", str(output)],
+                                    env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for device in devices:
+                self.assertIn(f"phase=isolated_{device}", result.stdout.split("phase=concurrent", 1)[0])
+                self.assertTrue((output / "concurrent" / f"device_{device}.json").is_file())
+            window = json.loads((output / "concurrent" / "start.json").read_text())
+            self.assertAlmostEqual(window["stop"] - window["start"], 0.1)
+            self.assertTrue((output / "summary.csv").is_file())
+
     def test_queued_entrypoint_profiles_one_batch_and_reports_matching_metrics(self):
         script = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_queued_perf.sh"
         for flags in ((), ("--torch-npu-profiler",),
@@ -723,6 +754,11 @@ class MulticardTests(unittest.TestCase):
             self.assertIsNone(perf.validate_args(args))
             args = perf.parse_args(["--contention-sync-per-graph"])
             self.assertIn("requires queued replays", perf.validate_args(args))
+            args = perf.parse_args(["--contention-main-baseline"])
+            self.assertIn("requires contention mode", perf.validate_args(args))
+            args = perf.parse_args(["--contention-main-baseline", "--contention-control-dir", "/tmp/run",
+                                    "--contention-result", "/tmp/result.json", "--no-kernel-profile"])
+            self.assertIsNone(perf.validate_args(args))
 
 
 if __name__ == "__main__":
