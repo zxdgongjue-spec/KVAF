@@ -525,10 +525,7 @@ def run_case(args):
                                payload * calls if key == "graph_total_ns" else
                                payload if key in PAYLOAD_TIMINGS else None)
             for key in samples[0] if key.endswith("_ns")}
-        if caller_graph is not None:
-            close_caller_graph(runtime, caller_graph, stream)
-            caller_graph = None
-        if args.kernel_profile:
+        if caller_graph is None and args.kernel_profile:
             runtime.stop_scatter_profile()
         write_results(args, report)
         for key, stage in STAGES.items():
@@ -545,10 +542,12 @@ def run_case(args):
         try:
             if caller_graph is not None:
                 close_caller_graph(runtime, caller_graph, stream)
+                if original is None and args.kernel_profile:
+                    runtime.stop_scatter_profile()
         except Exception as error:
             if original is None:
                 raise
-            print(f"[KVAF_TEST] caller graph teardown also failed: {error}", file=sys.stderr, flush=True)
+            print(f"[KVAF_TEST] scatter teardown also failed: {error}", file=sys.stderr, flush=True)
         finally:
             close_case(runtime, table)
         log_phase("teardown", "end")

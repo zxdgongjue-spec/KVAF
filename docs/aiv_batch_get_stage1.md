@@ -169,6 +169,38 @@ profiling 开关须在捕获前设置。`KVAF_SCATTER_GRAPH_MAILBOX=1` 允许图
 无图性能对照的 `--completion-scope native-stream` 继续映射到这一原有接口；图模式使用
 `--completion-scope stream` 或 `device`。
 
+最小调用流程如下。`input_plans` 为 8 组固定存储的输入，Runtime、表、输出和 stream 已初始化。
+无需在重放循环内重新 prepare 或 capture；只原地更新输入内容。
+
+```python
+nodes = [runtime.prepare_scatter_batch_get(
+    view, indices, offsets, count, output_indices, output,
+    stream=stream, capture_into_graph=True)
+    for indices, offsets, output_indices in input_plans]
+graph = kvaf.AclGraph()
+try:
+    graph.capture_begin(stream)
+    for node in nodes:
+        node()
+    graph.capture_end()
+
+    for _ in range(iterations):
+        refresh_inputs_in_place()  # 生产新输入并保证其已就绪；存储地址保持不变。
+        graph.replay(stream)
+        stream.synchronize()
+        runtime.check_scatter_graph_replay()
+finally:
+    if graph.capturing:
+        graph.capture_end()
+    if graph.ready:
+        graph.synchronize(stream)
+        graph.reset()
+    runtime.detach_scatter_batch_get_graph()
+```
+
+核心保持一次 capture、多次 `aclmdlRIExecuteAsync`。每图节点数、每次重放的同步与检查次数、
+设备端递增序号、失败传播、Graph mailbox 和数据流水均不因 Host 状态管理的精简而改变。
+
 ## 构建与完整回归
 
 CPU 端使用与部署环境匹配的 UMDK 重编并启动服务：

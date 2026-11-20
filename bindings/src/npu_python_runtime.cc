@@ -755,11 +755,10 @@ class NpuPythonRuntime final {
     const auto generation = generation_;
     auto storage = py::make_tuple(selected, table.addresses(), table.valid(), indices,
                                   offsets, miss_count, output_indices, output);
-    auto retained = py::make_tuple(py::cast(this, py::return_value_policy::reference), storage);
     return py::cpp_function(
         [this, request, selected, synchronize, wait_stream, generation, capture_into_graph,
-         storage = std::move(storage), retained = std::move(retained)]() {
-          (void)retained;
+         storage = std::move(storage), owner = py::cast(this, py::return_value_policy::reference)]() {
+          (void)owner;  // Keep Runtime alive for the prepared callable.
           scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
           scatter_host::Timer binding_timer(scatter_host::kBinding);
           host_profile_ready_ = false;
