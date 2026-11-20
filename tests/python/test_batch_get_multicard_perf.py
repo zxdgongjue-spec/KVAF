@@ -178,8 +178,9 @@ class MulticardTests(unittest.TestCase):
 
     def test_queued_measure_records_events_and_syncs_once(self):
         actions = []
-        graph = SimpleNamespace(replay=lambda: actions.append("replay"))
-        stream = SimpleNamespace(synchronize=lambda: actions.append("sync"))
+        stream = object()
+        graph = SimpleNamespace(replay=lambda stream: actions.append("replay"),
+                                synchronize=lambda stream: actions.append("sync"))
 
         class Event:
             def __init__(self, timestamp):
@@ -211,8 +212,9 @@ class MulticardTests(unittest.TestCase):
         for breakdown in (False, True):
             with self.subTest(event_breakdown=breakdown):
                 actions = []
-                graph = SimpleNamespace(replay=lambda: actions.append("replay"))
-                stream = SimpleNamespace(synchronize=lambda: actions.append("sync"))
+                stream = object()
+                graph = SimpleNamespace(replay=lambda stream: actions.append("replay"),
+                                        synchronize=lambda stream: actions.append("sync"))
 
                 def record_event():
                     actions.append("event")
@@ -226,44 +228,30 @@ class MulticardTests(unittest.TestCase):
                             ["event", "replay", "sync", "replay", "sync", "replay", "event", "sync"])
                 self.assertEqual(actions, expected + ["step"])
 
-    def test_queued_worker_times_one_submission_batch_on_its_graph_stream(self):
+    def test_queued_worker_captures_and_times_on_the_current_stream(self):
         actions = []
-        active_stream = None
         plans = [object() for _ in range(256)]
         make_plan = Mock(side_effect=plans)
-        stream = SimpleNamespace(synchronize=lambda: actions.append("stream_sync"))
-
-        @contextlib.contextmanager
-        def use_stream(selected):
-            nonlocal active_stream
-            active_stream = selected
-            try:
-                yield
-            finally:
-                active_stream = None
-
-        def replay():
-            self.assertIs(active_stream, stream)
-            actions.append("replay")
-
-        graph = SimpleNamespace(reset=Mock(), replay=replay)
-        capture = Mock(side_effect=lambda graph, *, stream: use_stream(stream))
+        stream = object()
+        graph = SimpleNamespace(capture_begin=Mock(), capture_end=Mock(), reset=Mock(),
+                                replay=Mock(side_effect=lambda stream: actions.append("replay")),
+                                synchronize=Mock(side_effect=lambda stream: actions.append("stream_sync")))
+        kvaf = SimpleNamespace(AclGraph=Mock(return_value=graph))
 
         class Event:
             def __init__(self, *, enable_timing):
                 if not enable_timing:
                     raise AssertionError("expected timing event")
 
-            def record(self):
-                if active_stream is not stream:
+            def record(self, selected_stream):
+                if selected_stream is not stream:
                     raise AssertionError("event recorded on the wrong stream")
                 actions.append("event")
 
             def elapsed_time(self, other):
                 return 500.0
 
-        torch = SimpleNamespace(npu=SimpleNamespace(Stream=lambda: stream, Event=Event, stream=use_stream,
-                                                    NPUGraph=lambda: graph, graph=capture,
+        torch = SimpleNamespace(npu=SimpleNamespace(current_stream=Mock(return_value=stream), Event=Event,
                                                     synchronize=lambda: actions.append("device_sync")))
         submit = Mock()
         with tempfile.TemporaryDirectory() as folder:
@@ -275,13 +263,18 @@ class MulticardTests(unittest.TestCase):
                                    warmup=3, miss_count=16384, token_bytes=656, torch_npu_profiler=False)
             validate_output = Mock()
             with patch.dict(os.environ, DEVICE_ID="2"), contextlib.redirect_stdout(io.StringIO()):
-                multi.run_worker(None, torch, args, make_plan, submit,
+                multi.run_worker(kvaf, torch, args, make_plan, submit,
                                  validate_output, lambda: actions.append("reset_output"))
             self.assertEqual(make_plan.call_count, 256)
-            capture.assert_called_once_with(graph, stream=stream)
+            torch.npu.current_stream.assert_called_once_with()
+            kvaf.AclGraph.assert_called_once_with()
+            graph.capture_begin.assert_called_once_with(stream)
+            graph.capture_end.assert_called_once_with()
             graph.reset.assert_called_once_with()
+            self.assertEqual(graph.replay.call_args_list, [unittest.mock.call(stream)] * 13)
+            self.assertEqual(graph.synchronize.call_args_list, [unittest.mock.call(stream)] * 3)
             self.assertEqual(submit.call_args_list, [unittest.mock.call(plan, stream) for plan in [plans[0], *plans]])
-            self.assertEqual(actions, ["device_sync", "device_sync", "replay", "replay", "replay", "stream_sync",
+            self.assertEqual(actions, ["device_sync", "replay", "replay", "replay", "stream_sync",
                                        "reset_output", "device_sync", "event"] + ["replay"] * 10 +
                              ["event", "stream_sync", "stream_sync"])
             validate_output.assert_called_once_with(plans[-1])

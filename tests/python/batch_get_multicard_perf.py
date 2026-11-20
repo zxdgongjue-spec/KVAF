@@ -78,14 +78,9 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output, reset_output=
     device = int(os.environ["DEVICE_ID"])
     queued = getattr(args, "contention_queued_replays", False)
     plans = [make_plan() for _ in range(args.contention_graph_calls)]
-    if queued:
-        torch.npu.synchronize()
-        stream = torch.npu.Stream()
-    else:
-        stream = torch.npu.current_stream()
+    stream = torch.npu.current_stream()
     # Allocate/cache the stream's runtime state before entering capture.
-    with torch.npu.stream(stream) if queued else contextlib.nullcontext():
-        submit(plans[0], stream)
+    submit(plans[0], stream)
     torch.npu.synchronize()
     barrier_fd = args.contention_barrier_fd
     plan_groups = [plans]
@@ -95,25 +90,17 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output, reset_output=
     cleanup = contextlib.ExitStack()
     try:
         print(f"MULTICARD_GRAPH_CAPTURE_BEGIN calls={len(plans)} graphs={len(plan_groups)}", flush=True)
-        if queued:
-            graph = torch.npu.NPUGraph()
-            cleanup.callback(graph.reset)
-            with torch.npu.graph(graph, stream=stream):
-                for plan in plans:
-                    submit(plan, stream)
-            graphs.append(graph)
-        else:
-            for index, group in enumerate(plan_groups, 1):
-                try:
-                    graphs.append(capture_graph(kvaf, stream, group, submit, cleanup))
-                except Exception as error:
-                    raise RuntimeError(f"BatchGet capture failed for graph {index}/{len(plan_groups)}: {error}") from error
+        for index, group in enumerate(plan_groups, 1):
+            try:
+                graphs.append(capture_graph(kvaf, stream, group, submit, cleanup))
+            except Exception as error:
+                raise RuntimeError(f"BatchGet capture failed for graph {index}/{len(plan_groups)}: {error}") from error
         print(f"MULTICARD_GRAPH_CAPTURE_DONE graphs={len(graphs)}", flush=True)
         if queued:
-            with torch.npu.stream(stream):
-                for _ in range(args.warmup):
-                    graph.replay()
-            stream.synchronize()
+            graph = graphs[0]
+            for _ in range(args.warmup):
+                graph.replay(stream)
+            graph.synchronize(stream)
             reset_output()
             torch.npu.synchronize()
         else:
@@ -154,14 +141,13 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output, reset_output=
 
                 def record_event():
                     event = torch.npu.Event(enable_timing=True)
-                    event.record()
+                    event.record(stream)
                     return event
 
-                with torch.npu.stream(stream):
-                    begin, end, timing = queued_perf.measure(
-                        graph, stream, record_event, replays,
-                        event_breakdown=args.contention_graph_event_breakdown,
-                        sync_per_graph=args.contention_sync_per_graph, profiler=profiler)
+                begin, end, timing = queued_perf.measure(
+                    graph, stream, record_event, replays,
+                    event_breakdown=args.contention_graph_event_breakdown,
+                    sync_per_graph=args.contention_sync_per_graph, profiler=profiler)
             else:
                 graph = graphs[0]
                 replays = window["graph_replays"]
@@ -192,10 +178,7 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output, reset_output=
     finally:
         try:
             if graphs:
-                if queued:
-                    stream.synchronize()
-                else:
-                    graphs[0].synchronize(stream)
+                graphs[0].synchronize(stream)
         finally:
             cleanup.close()
 

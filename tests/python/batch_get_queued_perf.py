@@ -18,15 +18,15 @@ def measure(graph, stream, record_event, replays, *, event_breakdown=False, sync
             if event_breakdown:
                 graph_start = record_event()
                 replay_begin_ns = time.monotonic_ns()
-                graph.replay()
+                graph.replay(stream)
                 replay_ns = time.monotonic_ns() - replay_begin_ns
                 samples.append((graph_start, record_event(), replay_ns))
             else:
-                graph.replay()
+                graph.replay(stream)
             # The final wait uses the shared path below, after the last timing event.
             if sync_per_graph and index + 1 < replays:
                 wait_begin_ns = time.monotonic_ns()
-                stream.synchronize()
+                graph.synchronize(stream)
                 intermediate_wait_ns += time.monotonic_ns() - wait_begin_ns
         submit_ns = time.monotonic_ns() - submit_begin_ns - intermediate_wait_ns
     if event_breakdown:
@@ -34,7 +34,7 @@ def measure(graph, stream, record_event, replays, *, event_breakdown=False, sync
     else:
         end = record_event()
     with profiler.range(0, "wait_completion") if profiler is not None else nullcontext():
-        stream.synchronize()
+        graph.synchronize(stream)
     end_ns = time.monotonic_ns()
     if profiler is not None:
         profiler.step()
