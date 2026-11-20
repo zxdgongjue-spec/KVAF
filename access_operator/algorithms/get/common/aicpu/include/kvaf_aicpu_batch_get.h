@@ -19,7 +19,7 @@ class BatchGetTransport {
   Status ExecutePrepared(const BatchGetExecRequest&);
   GatherLaunchView View() const;
   static Status LaunchPrepared(const BatchGetExecRequest&, const GatherLaunchView&, ExecutionState*);
-  Status Drain(bool check_status = true);
+  Status Drain(bool check_status = true, GetProviderTiming* = nullptr);
   Status Check(aclrtStream);
   Status PrepareGraph(const GetGraphOptions&);
   Status FinishGraph(void* stream, bool discard);

@@ -23,7 +23,7 @@ class CpuPushTransport {
   Status ExecutePrepared(const BatchGetExecRequest&);
   aicpu_urma::ScatterLaunchView View() const;
   static Status LaunchPrepared(const BatchGetExecRequest&, const aicpu_urma::ScatterLaunchView&, ExecutionState*);
-  Status Drain();
+  Status Drain(GetProviderTiming* = nullptr);
   Status PrepareGraph(const GetGraphOptions&);
   Status FinishGraph(void* stream, bool discard);
   std::unique_ptr<ExecutionState> CreateExecutionState();

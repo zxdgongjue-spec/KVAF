@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.backend import detect_torch_backend
 from utils.batch_get_csv import BatchGetCsv
+from utils.batch_get_host_profile import eager_host_sample, graph_host_sample, summarize_host_samples
 from utils.batch_get_workload import token_pattern
 from utils.dsa_keys import build_dsa_keys
 from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
@@ -66,7 +67,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
     parser.add_argument("--kernel-profile", action="store_true",
-                        help="add stage/worker details, including UBMEM address/MTE/drain timings; kernel bandwidth is always reported")
+                        help="add stage/worker and AICPU Host submit/drain/gap details; kernel bandwidth is always reported")
     parser.add_argument("--output-dir", type=Path, help="directory for summary.csv and, with --kernel-profile, "
                         "profile.csv (default: reports/batch-get/<timestamp>-<backend>-d<device>)")
     parser.add_argument("--kernel-profile-clock-mhz", type=int,
@@ -192,7 +193,7 @@ def print_aicpu_details(args, execution, samples, details=None):
 
 def print_measurements(args, execution, samples, profiles, report=None):
     """Keep end-to-end and operator wall time distinct; count payload once."""
-    scopes = [("end_to_end", samples, "host_perf_counter")]
+    scopes = [("end_to_end", samples, "host_perf_counter" if execution == "eager" else "npu_event")]
     if len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
@@ -235,6 +236,23 @@ def print_measurements(args, execution, samples, profiles, report=None):
                                  args.token_bytes, args.transport, details)
         if details is not None:
             report.add_profile(execution, details)
+
+
+def print_host_breakdown(args, execution, samples, report):
+    if not samples:
+        return
+    details = summarize_host_samples(samples)
+    print(f"BATCH_GET_HOST_PROFILE_CONTRACT backend={args.backend} execution={execution} "
+          f"samples={len(samples)} paired=1 inclusive_subspans=1 profiling_overhead_included=1 "
+          "eager_gap_sum=python_boundary+before_launch+runtime_outside_kernel+after_completion "
+          "runtime_outside_kernel=enqueue_dispatch_status_dma_and_completion_overhead "
+          "graph_host_not_additive_to_event=1")
+    for kind in dict.fromkeys(row[0] for row in details):
+        means = " ".join(f"{name}_us={value}" for group, name, metric, value in details
+                         if group == kind and metric == "mean_us")
+        print(f"BATCH_GET_HOST_PROFILE backend={args.backend} execution={execution} kind={kind} {means}")
+    if report is not None:
+        report.add_profile(execution, details)
 
 
 def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
@@ -411,18 +429,34 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             graph.replay()
             graph.synchronize()
             check_captured(inputs.fixed, args.miss_count)
-        durations, profiles = [], []
+        durations, profiles, host_profiles = [], [], []
+        record_host = args.kernel_profile and uses_aicpu(args)
         for iteration in range(args.iterations):
             inputs.prepare(args.miss_count)
+            host_begin = time.perf_counter_ns() if record_host else 0
             start_event.record(stream)
+            start_recorded = time.perf_counter_ns() if record_host else 0
             graph.replay()
+            replayed = time.perf_counter_ns() if record_host else 0
             end_event.record(stream)
+            end_recorded = time.perf_counter_ns() if record_host else 0
             end_event.synchronize()
+            host_end = time.perf_counter_ns() if record_host else 0
             durations.append(float(start_event.elapsed_time(end_event)))
             check_captured(inputs.fixed, args.miss_count)
             profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
+            if record_host:
+                host_profiles.append(dict(
+                    start_event_record=start_recorded - host_begin, replay_submit=replayed - start_recorded,
+                    end_event_record=end_recorded - replayed, event_sync=host_end - end_recorded,
+                    replay_and_wait=host_end - host_begin))
+        if record_host:
+            host_profiles = [graph_host_sample(host, elapsed * 1000,
+                device_profile_ms(profile, args.kernel_profile_clock_mhz) * 1000)
+                for host, elapsed, profile in zip(host_profiles, durations, profiles)]
         graph.validated = True
         print_measurements(args, "graph", durations, profiles, report)
+        print_host_breakdown(args, "graph", host_profiles, report)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
               "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
 
@@ -823,6 +857,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.kernel_profile and uses_aicpu(args) and not hasattr(kvaf.NpuRuntime, "batch_get_host_profile"):
+        print("FAIL: rebuild the NPU binding for AICPU Host profile support", file=sys.stderr)
+        return 2
     if not (args.run or args.backend_explicit):
         print("SKIP: select --backend or pass --run on the A5/CANN target")
         return 0
@@ -1127,7 +1164,10 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
                        create_request_plan, submit, check)
             return 0
 
-        runtime.start_batch_get_kernel_profile(detailed=args.kernel_profile and args.backend == "ubmem")
+        profile_options = dict(detailed=args.kernel_profile and args.backend == "ubmem")
+        if args.kernel_profile and uses_aicpu(args):
+            profile_options["host_timing"] = True
+        runtime.start_batch_get_kernel_profile(**profile_options)
         kernel_profile_started = True
         print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
 
@@ -1172,6 +1212,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         synchronize_samples: list[float] = []
         batch_get_samples: list[float] = []
         kernel_profile_samples: list[list[dict[str, object]]] = []
+        host_profile_samples = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
             output.zero_()
@@ -1202,6 +1243,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
                 runtime.check_batch_get_status(torch.npu.current_stream())
             check_output((indices, offsets, output_indices), miss_count_value)
             kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
+            if uses_aicpu(args) and args.kernel_profile:
+                host_profile_samples.append(runtime.batch_get_host_profile())
 
         if args.get_timing != "sync-call":
             print_samples(
@@ -1231,7 +1274,12 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             token_bytes,
             execution_mode=args.execution_mode,
         )
+        if host_profile_samples:
+            host_profile_samples = [eager_host_sample(host, elapsed * 1000,
+                device_profile_ms(profile, args.kernel_profile_clock_mhz) * 1000)
+                for host, elapsed, profile in zip(host_profile_samples, batch_get_samples, kernel_profile_samples)]
         print_measurements(args, "eager", batch_get_samples, kernel_profile_samples, report)
+        print_host_breakdown(args, "eager", host_profile_samples, report)
         if args.execution == "both":
             run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
                                 device_table, miss_count, output, check_output, execution, report)

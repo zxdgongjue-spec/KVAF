@@ -24,6 +24,7 @@ def main() -> int:
             or not hasattr(kvaf.NpuRuntime, "check_batch_get_status")
             or not hasattr(kvaf.NpuRuntime, "start_batch_get_kernel_profile")
             or not hasattr(kvaf.NpuRuntime, "batch_get_kernel_profile")
+            or not hasattr(kvaf.NpuRuntime, "batch_get_host_profile")
             or not hasattr(kvaf.NpuRuntime, "stop_batch_get_kernel_profile")
         ):
             raise RuntimeError(

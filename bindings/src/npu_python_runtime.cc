@@ -514,8 +514,50 @@ class NpuPythonRuntime final {
     }
     ThrowIfError(status);
   }
-  void StartBatchGetKernelProfile(bool detailed, std::optional<GetExecutionConfig> config) {
+  void StartBatchGetKernelProfile(bool detailed, std::optional<GetExecutionConfig> config, bool host_timing) {
     ConfigureGetKernelProfile(true, detailed, config);
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; lock.lock(); }
+    host_profiling_ = host_timing;
+    last_host_valid_ = false;
+  }
+
+  py::dict BatchGetHostProfileSnapshot() {
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; lock.lock(); }
+    if (!host_profiling_ || !last_host_valid_ || !last_host_timing_.provider.sync_end_ns)
+      throw py::value_error("no completed profiled eager BatchGet; enable host_timing and drain the request");
+    const auto& p = last_host_timing_;
+    py::dict result;
+#define HOST_VALUE(name) result[#name] = p.name
+    HOST_VALUE(tensor_views_ns); HOST_VALUE(request_validation_ns); HOST_VALUE(stream_ns); HOST_VALUE(refs_ns);
+    HOST_VALUE(binding_lock_ns); HOST_VALUE(set_device_ns); HOST_VALUE(core_call_ns); HOST_VALUE(owner_update_ns);
+    HOST_VALUE(total_ns); HOST_VALUE(gil_reacquire_ns);
+    HOST_VALUE(core_lifecycle_ns); HOST_VALUE(core_table_ns); HOST_VALUE(core_direction_ns);
+    HOST_VALUE(core_previous_drain_ns); HOST_VALUE(core_validate_ns); HOST_VALUE(core_dispatch_ns);
+    HOST_VALUE(core_finish_ns); HOST_VALUE(core_total_ns); HOST_VALUE(begin_ns); HOST_VALUE(end_ns);
+    HOST_VALUE(drain_begin_ns); HOST_VALUE(drain_end_ns); HOST_VALUE(drain_binding_lock_ns);
+    HOST_VALUE(drain_set_device_ns); HOST_VALUE(drain_core_call_ns); HOST_VALUE(drain_owner_update_ns);
+    HOST_VALUE(drain_total_ns); HOST_VALUE(drain_gil_reacquire_ns);
+    HOST_VALUE(core_drain_lock_ns); HOST_VALUE(core_drain_operator_ns);
+    HOST_VALUE(core_drain_release_ns); HOST_VALUE(core_drain_total_ns); HOST_VALUE(dispatch_lock_ns);
+    HOST_VALUE(dispatch_resolve_ns); HOST_VALUE(dispatch_output_check_ns); HOST_VALUE(dispatch_previous_drain_ns);
+    HOST_VALUE(dispatch_context_ns); HOST_VALUE(dispatch_describe_ns); HOST_VALUE(dispatch_acquire_ns);
+    HOST_VALUE(dispatch_bind_ns); HOST_VALUE(dispatch_warmup_ns); HOST_VALUE(dispatch_provider_ns);
+    HOST_VALUE(dispatch_context_release_ns); HOST_VALUE(dispatch_total_ns);
+    HOST_VALUE(dispatch_drain_lock_ns); HOST_VALUE(dispatch_drain_provider_ns);
+    HOST_VALUE(dispatch_drain_release_ns); HOST_VALUE(dispatch_drain_total_ns);
+#undef HOST_VALUE
+#define PROVIDER_VALUE(name) result["provider_" #name] = p.provider.name
+    PROVIDER_VALUE(prepare_ns); PROVIDER_VALUE(submit_ns); PROVIDER_VALUE(completion_ns); PROVIDER_VALUE(cleanup_ns);
+    PROVIDER_VALUE(lock_ns);
+    PROVIDER_VALUE(capture_check_ns); PROVIDER_VALUE(status_enqueue_ns); PROVIDER_VALUE(stream_sync_ns);
+    PROVIDER_VALUE(status_check_ns); PROVIDER_VALUE(launch_begin_ns); PROVIDER_VALUE(launch_end_ns);
+    PROVIDER_VALUE(sync_begin_ns); PROVIDER_VALUE(sync_end_ns);
+    PROVIDER_VALUE(prepare_capture_ns); PROVIDER_VALUE(previous_completion_ns); PROVIDER_VALUE(input_build_ns);
+    PROVIDER_VALUE(profile_buffers_ns); PROVIDER_VALUE(registration_ns);
+#undef PROVIDER_VALUE
+    return result;
   }
 
   py::list BatchGetKernelProfileSnapshot(std::optional<GetExecutionConfig> config,
@@ -579,6 +621,9 @@ class NpuPythonRuntime final {
   py::list StopBatchGetKernelProfile(std::optional<GetExecutionConfig> config) {
     py::list result = BatchGetKernelProfileSnapshot(config);
     ConfigureGetKernelProfile(false, false, config);
+    std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; lock.lock(); }
+    host_profiling_ = last_host_valid_ = false;
     return result;
   }
 
@@ -620,10 +665,12 @@ class NpuPythonRuntime final {
                           std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease,
                           std::uint64_t output_lease) {
     BatchGetHostTiming host{};
-    const auto host_begin = get_call_trace_ ? BatchGetProfileNowNs() : 0;
+    const bool host_enabled = get_call_trace_ || host_profiling_;
+    const auto host_begin = host_enabled ? BatchGetProfileNowNs() : 0;
+    host.begin_ns = host_begin;
     auto phase = host_begin;
     const auto mark = [&](std::uint64_t BatchGetHostTiming::*field) {
-      if (!get_call_trace_) return;
+      if (!host_enabled) return;
       const auto now = BatchGetProfileNowNs();
       host.*field += now - phase;
       phase = now;
@@ -692,6 +739,7 @@ class NpuPythonRuntime final {
       direction.lock();
     }
     mark(&BatchGetHostTiming::binding_lock_ns);
+    last_host_valid_ = false;
     ApplyGraphScope(output, output_view, index_view.bytes / sizeof(std::int32_t),
                     acl_stream, synchronize, profile, execution, graph_lease, output_lease);
     if (graph_lease) {
@@ -699,22 +747,25 @@ class NpuPythonRuntime final {
       if (graph_ref != graph_refs_.end())
         graph_ref->second.reserve(graph_ref->second.size() + 1);
     }
+    std::uint64_t native_returned = 0;
     {
       py::gil_scoped_release release;
       aclError device_status;
       {
-        BatchGetProfileScope device(get_call_trace_ ? &host.set_device_ns : nullptr);
+        BatchGetProfileScope device(host_enabled ? &host.set_device_ns : nullptr);
         device_status = aclrtSetDevice(native_->device_id());
       }
       if (device_status != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else {
-        BatchGetProfileScope call(get_call_trace_ ? &host.core_call_ns : nullptr);
+        BatchGetProfileScope call(host_enabled ? &host.core_call_ns : nullptr);
         status = native_->core().BatchGet(
             request, BatchGetExecutionOptions{acl_stream, synchronize, timings.get(), execution,
-                                              graph_lease, output_lease}, get_call_trace_ ? &host : nullptr);
+                                              graph_lease, output_lease}, host_enabled ? &host : nullptr);
       }
+      if (host_enabled) native_returned = BatchGetProfileNowNs();
     }
-    const auto owner_begin = get_call_trace_ ? BatchGetProfileNowNs() : 0;
+    if (host_enabled) host.gil_reacquire_ns = BatchGetProfileNowNs() - native_returned;
+    const auto owner_begin = host_enabled ? BatchGetProfileNowNs() : 0;
     if (graph_lease) {
       if (graph_ref != graph_refs_.end()) graph_ref->second.push_back(std::move(refs));
     } else {
@@ -723,11 +774,15 @@ class NpuPythonRuntime final {
     }
     FinishGraphScopeGet(status.ok());
     ThrowIfError(status);
-    if (get_call_trace_) {
+    if (host_enabled) {
       host.owner_update_ns = BatchGetProfileNowNs() - owner_begin;
-      host.total_ns = BatchGetProfileNowNs() - host_begin;
+      host.end_ns = BatchGetProfileNowNs();
+      host.total_ns = host.end_ns - host_begin;
       const auto selected = execution ? execution : native_->default_get();
-      if (selected) get_call_trace_->Record(*selected, graph_lease ? "graph" : output_lease ? "output" : "ordinary", host);
+      if (get_call_trace_ && selected)
+        get_call_trace_->Record(*selected, graph_lease ? "graph" : output_lease ? "output" : "ordinary", host);
+      last_host_valid_ = host_profiling_ && !graph_lease;
+      if (last_host_valid_) last_host_timing_ = host;
     }
     if (!profile) return py::none();
     const auto end = BatchGetProfileNowNs();
@@ -833,14 +888,40 @@ class NpuPythonRuntime final {
   }
   void DrainGet() {
     Status status;
+    const auto begin = host_profiling_ ? BatchGetProfileNowNs() : 0;
+    BatchGetHostTiming* timing = nullptr;
+    std::uint64_t native_returned = 0;
     std::unique_lock<std::mutex> direction(get_mutex_, std::defer_lock);
     {
       py::gil_scoped_release release;
       direction.lock();
-      if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
-      else status = native_->DrainGet();
+      if (host_profiling_ && last_host_valid_ && !last_host_timing_.provider.sync_end_ns)
+        timing = &last_host_timing_;
+      if (timing) {
+        timing->drain_begin_ns = begin;
+        timing->drain_binding_lock_ns = BatchGetProfileNowNs() - begin;
+      }
+      aclError device_status;
+      {
+        BatchGetProfileScope device(timing ? &timing->drain_set_device_ns : nullptr);
+        device_status = aclrtSetDevice(native_->device_id());
+      }
+      if (device_status != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
+      else {
+        BatchGetProfileScope call(timing ? &timing->drain_core_call_ns : nullptr);
+        status = native_->DrainGet(timing);
+      }
+      if (timing) native_returned = BatchGetProfileNowNs();
     }
+    if (timing) timing->drain_gil_reacquire_ns = BatchGetProfileNowNs() - native_returned;
+    const auto owner_begin = host_profiling_ ? BatchGetProfileNowNs() : 0;
     if (status.ok()) pending_get_refs_.clear();
+    if (timing) {
+      last_host_timing_.drain_owner_update_ns = BatchGetProfileNowNs() - owner_begin;
+      last_host_timing_.drain_end_ns = BatchGetProfileNowNs();
+      last_host_timing_.drain_total_ns = last_host_timing_.drain_end_ns - begin;
+      if (!status.ok()) last_host_valid_ = false;
+    }
     ThrowIfError(status);
   }
   std::uint64_t BeginGetGraph(GetExecutionConfig config, const py::object& output,
@@ -995,6 +1076,8 @@ class NpuPythonRuntime final {
   PythonGetGraphResources* active_graph_scope_{nullptr};
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   std::unique_ptr<GetCallTrace> get_call_trace_;
+  bool host_profiling_{false}, last_host_valid_{false};
+  BatchGetHostTiming last_host_timing_;
   std::mutex get_mutex_, put_mutex_;
   std::vector<py::object> pending_get_refs_;
   py::object pending_put_ref_;
@@ -1347,7 +1430,10 @@ void BindNpuPythonRuntime(py::module_& module) {
            "CPU torch.int64 Tensor.")
       .def("start_batch_get_kernel_profile", &NpuPythonRuntime::StartBatchGetKernelProfile,
            py::arg("detailed") = false, py::kw_only(), py::arg("execution") = py::none(),
+           py::arg("host_timing") = false,
            "Enable the selected Get instance's per-core kernel timeline.")
+      .def("batch_get_host_profile", &NpuPythonRuntime::BatchGetHostProfileSnapshot,
+           "Copy the latest eager submit/drain Host timings without device readback.")
       .def("batch_get_kernel_profile", &NpuPythonRuntime::BatchGetKernelProfileSnapshot,
            py::kw_only(), py::arg("execution") = py::none(), py::arg("graph_lease") = 0,
            "Copy the latest completed per-core timeline; select a node with graph_lease.")

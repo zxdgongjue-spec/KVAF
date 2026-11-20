@@ -27,6 +27,7 @@ class ExecutionDispatcher final : public AccessOperator {
   Status ExecuteBatchPut(const BatchPutExecRequest&) override;
   Status ExecuteBatchGet(const BatchGetExecRequest&) override;
   Status DrainGet() override;
+  Status DrainGet(BatchGetHostTiming*) override;
   bool HasPendingGet() const override;
   bool TracksGetCompletion() const override { return true; }
   Status Warmup(PutExecutionConfig, const ExecutionWarmup& = {});
@@ -60,7 +61,7 @@ class ExecutionDispatcher final : public AccessOperator {
                                   GetExecutionContext**, GetPreparationTiming* = nullptr);
   Status CloseGetInstanceLocked(GetExecutionContext*);
   bool HasGraphNodesLocked(const GetExecutionContext*) const;
-  Status DrainGetLocked();
+  Status DrainGetLocked(BatchGetHostTiming* = nullptr);
   Status FindGraphNode(GetExecutionContext*, std::uint64_t, GetGraphNode**);
   Status FinishOutputLocked(GetExecutionContext&);
   Status ValidateInputLocked(const BatchPutRequest&, const BatchPutExecutionOptions&,

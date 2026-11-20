@@ -61,7 +61,7 @@ class AicpuExecutionResources final : public ExecutionResourceOwner {
   Status FinishPutInput();
   Status ResolvePut(PutCompletion*);
   Status AcknowledgePut();
-  Status DrainGet();
+  Status DrainGet(GetProviderTiming* = nullptr);
   Status CheckBatchGetStatus(void*);
   Status SetBatchGetKernelProfiling(bool);
   Status CopyBatchGetKernelProfiles(std::vector<BatchGetKernelProfile>*) const;

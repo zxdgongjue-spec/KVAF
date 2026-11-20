@@ -458,7 +458,7 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
   } else if (access_operator_.TracksGetCompletion())
     pending_get_table_ = table_ref;
   mark(&BatchGetHostTiming::core_validate_ns);
-  const auto status = access_operator_.ExecuteBatchGet({view, &request, execution});
+  const auto status = access_operator_.ExecuteBatchGet({view, &request, execution, nullptr, host_timing});
   mark(&BatchGetHostTiming::core_dispatch_ns);
   if (status.ok() && execution.synchronize && !execution.graph_lease) pending_get_table_.reset();
   if (!status.ok() && access_operator_.TracksGetCompletion() && !execution.graph_lease) {
@@ -701,16 +701,25 @@ Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
   return meta_manager_.BatchFree(request.keys);
 }
 
-Status RuntimeCore::DrainGetLocked() {
-  auto status = access_operator_.DrainGet();
+Status RuntimeCore::DrainGetLocked(BatchGetHostTiming* timing) {
+  const auto begin = timing ? BatchGetProfileNowNs() : 0;
+  auto status = timing ? access_operator_.DrainGet(timing) : access_operator_.DrainGet();
+  const auto drained = timing ? BatchGetProfileNowNs() : 0;
   if (status.ok()) pending_get_table_.reset();
+  if (timing) {
+    timing->core_drain_operator_ns += drained - begin;
+    timing->core_drain_release_ns += BatchGetProfileNowNs() - drained;
+  }
   return status;
 }
-Status RuntimeCore::DrainGet() {
+Status RuntimeCore::DrainGet(BatchGetHostTiming* timing) {
+  BatchGetProfileScope total(timing ? &timing->core_drain_total_ns : nullptr);
+  const auto begin = timing ? BatchGetProfileNowNs() : 0;
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   std::lock_guard<std::mutex> direction(get_mutex_);
   if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-  return DrainGetLocked();
+  if (timing) timing->core_drain_lock_ns += BatchGetProfileNowNs() - begin;
+  return DrainGetLocked(timing);
 }
 Status RuntimeCore::RecoverGet(GetExecutionConfig config) {
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);

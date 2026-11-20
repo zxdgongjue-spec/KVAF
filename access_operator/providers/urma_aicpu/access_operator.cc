@@ -55,6 +55,9 @@ Status UmdkAccessOperator::Shutdown() { return resources_->Close(); }
 Status UmdkAccessOperator::ResolvePut(PutCompletion* result) { return resources_->ResolvePut(result); }
 Status UmdkAccessOperator::AcknowledgePut() { return resources_->AcknowledgePut(); }
 Status UmdkAccessOperator::DrainGet() { return resources_->DrainGet(); }
+Status UmdkAccessOperator::DrainGet(BatchGetHostTiming* timing) {
+  return resources_->DrainGet(timing ? &timing->provider : nullptr);
+}
 Status UmdkAccessOperator::PrepareGetGraph(const GetGraphOptions& options) { return resources_->PrepareGetGraph(options); }
 Status UmdkAccessOperator::FinishGetGraph(void* stream, bool discard) { return resources_->FinishGetGraph(stream, discard); }
 bool UmdkAccessOperator::GetGraphNeedsRecovery() const { return resources_->GetGraphNeedsRecovery(); }
@@ -83,7 +86,9 @@ Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& request) {
   return result;
 }
 Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& request) {
+  const auto lock_started = GetHostTimingStart(request.host_timing);
   std::lock_guard<std::mutex> lock(resources_->get_mutex());
+  GetHostTimingRecord(request.host_timing, &GetProviderTiming::lock_ns, lock_started);
   const auto prepare_started = GetHostTimingStart(request.host_timing);
   auto ready = resources_->PrepareGetResources(request);
   GetHostTimingRecord(request.host_timing, &GetProviderTiming::prepare_ns, prepare_started);

@@ -120,7 +120,9 @@ class GetResourceView {
     }
     return s;
   }
-  Status Drain() const { return op_->DrainGet(); }
+  Status Drain(BatchGetHostTiming* timing = nullptr) const {
+    return timing ? op_->DrainGet(timing) : op_->DrainGet();
+  }
   Status PrepareOutput(const GetOutputOptions& r) const {
     return op_->PrepareGetOutput(r);
   }
