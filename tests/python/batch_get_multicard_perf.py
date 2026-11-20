@@ -162,7 +162,8 @@ def run_worker(kvaf, torch, args, make_plan, submit, check_output, reset_output=
                 with torch.npu.stream(stream):
                     begin, end, timing = queued_perf.measure(
                         graph, stream, record_event, replays,
-                        event_breakdown=args.contention_graph_event_breakdown, profiler=profiler)
+                        event_breakdown=args.contention_graph_event_breakdown,
+                        sync_per_graph=args.contention_sync_per_graph, profiler=profiler)
             else:
                 graph = graphs[0]
                 replays = window["graph_replays"]
@@ -278,6 +279,8 @@ def run_group(args, devices, directory):
                 command.append("--contention-queued-replays")
                 if args.graph_event_breakdown:
                     command.append("--contention-graph-event-breakdown")
+                if args.sync_per_graph:
+                    command.append("--contention-sync-per-graph")
             if profile:
                 command.extend(("--torch-npu-profiler", "--profiler-warmup", str(args.profiler_warmup),
                                 "--profiler-active", str(args.profiler_active)))
@@ -603,7 +606,9 @@ def main(argv=None):
     barrier_group.add_argument("--barrier-per-graph", action="store_true",
                                help="capture all calls in one graph and synchronize each full graph replay")
     barrier_group.add_argument("--queued-replays", action="store_true",
-                               help="run concurrent cards and queue all graph replays before synchronizing once")
+                                help="run concurrent cards without an inter-card barrier between graph replays")
+    parser.add_argument("--sync-per-graph", action="store_true",
+                         help="with queued replays, wait on the local stream after each replay (default: wait once)")
     parser.add_argument("--graph-event-breakdown", action="store_true",
                         help="print per-graph device times, gaps and host replay times for queued replays")
     parser.add_argument("--output-access-pattern", choices=("random", "contiguous"),
@@ -649,6 +654,8 @@ def main(argv=None):
         args.torch_npu_profiler = not args.queued_replays
     if args.graph_event_breakdown and not args.queued_replays:
         parser.error("--graph-event-breakdown requires queued replays")
+    if args.sync_per_graph and not args.queued_replays:
+        parser.error("--sync-per-graph requires queued replays")
     if args.queued_replays:
         args.concurrent_only = True
         args.profiler_warmup, args.profiler_active = 0, 1
@@ -680,6 +687,7 @@ def main(argv=None):
     print(f"MULTICARD_CONFIG transport={args.transport} devices={args.devices} aiv_cores={cores} "
           f"barrier_per_call={int(args.barrier_per_call)} barrier_per_graph={int(args.barrier_per_graph)} "
           f"queued_replays={int(args.queued_replays)} graph_event_breakdown={int(args.graph_event_breakdown)} "
+          f"sync_per_graph={int(args.sync_per_graph)} "
           f"graph_calls={args.graph_calls} graph_replays={args.graph_replays} "
           f"concurrent_only={int(args.concurrent_only)} torch_npu_profiler={int(args.torch_npu_profiler)} "
           f"jettys_per_core={args.jettys_per_core if args.transport == 'urma' else 'n/a'} "

@@ -309,6 +309,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-barrier-per-graph", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--contention-queued-replays", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-event-breakdown", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--contention-sync-per-graph", action="store_true", help=argparse.SUPPRESS)
     add_profiler_args(parser, hidden=True)
     args = parser.parse_args(argv)
     args.backend_explicit = args.backend is not None
@@ -406,6 +407,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "queued replays require contention mode without a replay barrier"
     if args.contention_graph_event_breakdown and not args.contention_queued_replays:
         return "graph event breakdown requires queued replays"
+    if args.contention_sync_per_graph and not args.contention_queued_replays:
+        return "local per-graph synchronization requires queued replays"
     if args.torch_npu_profiler:
         if args.contention_barrier_fd is None and not args.contention_queued_replays:
             return "--torch-npu-profiler requires a synchronized multi-card replay"

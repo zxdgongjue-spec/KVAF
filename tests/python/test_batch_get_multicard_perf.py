@@ -32,6 +32,7 @@ assert option("--token-bytes") == "656"
 assert option("--table-capacity") == ("64" if queued_replays else "4096")
 if queued_replays:
     assert "--contention-barrier-fd" not in sys.argv
+    assert ("--contention-sync-per-graph" in sys.argv) == (os.environ["EXPECTED_SYNC_PER_GRAPH"] == "1")
     assert option("--request-length") == "16384"
     assert option("--output-access-pattern") == "random"
 assert "--no-kernel-profile" in sys.argv
@@ -138,8 +139,11 @@ if profile:
 class MulticardTests(unittest.TestCase):
     def test_queued_entrypoint_profiles_one_batch_and_reports_matching_metrics(self):
         script = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_queued_perf.sh"
-        for flags in ((), ("--torch-npu-profiler",), ("--no-torch-npu-profiler",)):
+        for flags in ((), ("--torch-npu-profiler",), ("--no-torch-npu-profiler",),
+                      ("--sync-per-graph", "--torch-npu-profiler"),
+                      ("--sync-per-graph", "--no-torch-npu-profiler")):
             profile = "--torch-npu-profiler" in flags
+            sync_per_graph = "--sync-per-graph" in flags
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 output = root / "results" / "queued"
@@ -148,7 +152,8 @@ class MulticardTests(unittest.TestCase):
                 runner.chmod(0o755)
                 env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner), EXPECTED_TRANSPORT="ubmem",
                            EXPECTED_CORES="32", EXPECTED_JETTYS="2", EXPECTED_INFLIGHT="2048",
-                           KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048", EXPECTED_DEVICES="2 3 4 5")
+                           KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048", EXPECTED_DEVICES="2 3 4 5",
+                           EXPECTED_SYNC_PER_GRAPH=str(int(sync_per_graph)))
                 result = subprocess.run(["bash", str(script), str(root / "build"), "--graph-event-breakdown",
                                          "--output", str(output), *flags], env=env, capture_output=True,
                                         text=True, timeout=20)
@@ -157,6 +162,8 @@ class MulticardTests(unittest.TestCase):
                 self.assertTrue(config["concurrent_only"])
                 self.assertEqual((config["graph_replays"], config["graph_calls"]), (10, 256))
                 self.assertEqual(config["torch_npu_profiler"], profile)
+                self.assertEqual(config["sync_per_graph"], sync_per_graph)
+                self.assertIn(f"sync_per_graph={int(sync_per_graph)}", result.stdout)
                 self.assertFalse(list(output.glob("isolated_*")))
                 self.assertEqual(result.stdout.count("GRAPH_BANDWIDTH "), 4)
                 self.assertEqual(result.stdout.count("device_event_bandwidth_gbps=55.029"), 4)
@@ -195,6 +202,25 @@ class MulticardTests(unittest.TestCase):
         self.assertEqual(timing["device_event_seconds"], 0.033)
         self.assertEqual(timing["graph_event_breakdown"]["graph_ms"], [10, 10, 10])
         self.assertEqual(timing["graph_event_breakdown"]["gap_ms"], [2, 1])
+
+    def test_queued_measure_can_sync_the_local_stream_after_each_graph(self):
+        for breakdown in (False, True):
+            with self.subTest(event_breakdown=breakdown):
+                actions = []
+                graph = SimpleNamespace(replay=lambda: actions.append("replay"))
+                stream = SimpleNamespace(synchronize=lambda: actions.append("sync"))
+
+                def record_event():
+                    actions.append("event")
+                    return SimpleNamespace(elapsed_time=lambda other: 10)
+
+                profiler = SimpleNamespace(range=lambda *args: contextlib.nullcontext(),
+                                           step=lambda: actions.append("step"))
+                queued.measure(graph, stream, record_event, 3, event_breakdown=breakdown,
+                               sync_per_graph=True, profiler=profiler)
+                expected = (["event", "replay", "event", "sync"] * 3 if breakdown else
+                            ["event", "replay", "sync", "replay", "sync", "replay", "event", "sync"])
+                self.assertEqual(actions, expected + ["step"])
 
     def test_queued_worker_times_one_submission_batch_on_its_graph_stream(self):
         actions = []
@@ -241,8 +267,8 @@ class MulticardTests(unittest.TestCase):
             root.joinpath("start.json").write_text(json.dumps({"start": 0, "graph_replays": 10}))
             args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
                                    contention_graph_calls=256, contention_barrier_fd=None, contention_queued_replays=True,
-                                   contention_graph_event_breakdown=False, warmup=3, miss_count=16384, token_bytes=656,
-                                   torch_npu_profiler=False)
+                                   contention_graph_event_breakdown=False, contention_sync_per_graph=False,
+                                   warmup=3, miss_count=16384, token_bytes=656, torch_npu_profiler=False)
             validate_output = Mock()
             with patch.dict(os.environ, DEVICE_ID="2"), contextlib.redirect_stdout(io.StringIO()):
                 multi.run_worker(None, torch, args, make_plan, submit,
@@ -740,8 +766,11 @@ class MulticardTests(unittest.TestCase):
             self.assertIn("synchronized multi-card replay", perf.validate_args(args))
             args = perf.parse_args(["--contention-control-dir", "/tmp/run", "--contention-result", "/tmp/result.json",
                                     "--no-kernel-profile", "--contention-queued-replays",
-                                    "--contention-graph-event-breakdown", "--torch-npu-profiler"])
+                                    "--contention-graph-event-breakdown", "--contention-sync-per-graph",
+                                    "--torch-npu-profiler"])
             self.assertIsNone(perf.validate_args(args))
+            args = perf.parse_args(["--contention-sync-per-graph"])
+            self.assertIn("requires queued replays", perf.validate_args(args))
 
 
 if __name__ == "__main__":

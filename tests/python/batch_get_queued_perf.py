@@ -1,4 +1,4 @@
-"""Time an asynchronously queued batch of KVAF graph replays."""
+"""Time KVAF graph replays on each card's own stream."""
 
 from contextlib import nullcontext
 import time
@@ -6,14 +6,15 @@ import time
 import batch_get_profiler_overlap as profiler_overlap
 
 
-def measure(graph, stream, record_event, replays, *, event_breakdown=False, profiler=None):
+def measure(graph, stream, record_event, replays, *, event_breakdown=False, sync_per_graph=False, profiler=None):
     samples = []
     begin_ns = time.monotonic_ns()
     if not event_breakdown:
         start = record_event()
     with profiler.range(0, "graph_replay") if profiler is not None else nullcontext():
         submit_begin_ns = time.monotonic_ns()
-        for _ in range(replays):
+        intermediate_wait_ns = 0
+        for index in range(replays):
             if event_breakdown:
                 graph_start = record_event()
                 replay_begin_ns = time.monotonic_ns()
@@ -22,7 +23,12 @@ def measure(graph, stream, record_event, replays, *, event_breakdown=False, prof
                 samples.append((graph_start, record_event(), replay_ns))
             else:
                 graph.replay()
-        submit_ns = time.monotonic_ns() - submit_begin_ns
+            # The final wait uses the shared path below, after the last timing event.
+            if sync_per_graph and index + 1 < replays:
+                wait_begin_ns = time.monotonic_ns()
+                stream.synchronize()
+                intermediate_wait_ns += time.monotonic_ns() - wait_begin_ns
+        submit_ns = time.monotonic_ns() - submit_begin_ns - intermediate_wait_ns
     if event_breakdown:
         start, end = samples[0][0], samples[-1][1]
     else:
