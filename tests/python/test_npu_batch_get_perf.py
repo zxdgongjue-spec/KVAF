@@ -307,6 +307,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     parser.add_argument("--contention-barrier-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--contention-barrier-per-graph", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--contention-queued-replays", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--contention-graph-event-breakdown", action="store_true", help=argparse.SUPPRESS)
     add_profiler_args(parser, hidden=True)
     args = parser.parse_args(argv)
     args.backend_explicit = args.backend is not None
@@ -400,8 +402,12 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "barrier requires contention mode and a valid socket descriptor"
     if args.contention_barrier_per_graph and args.contention_barrier_fd is None:
         return "per-graph barrier requires a socket descriptor"
+    if args.contention_queued_replays and (args.contention_control_dir is None or args.contention_barrier_fd is not None):
+        return "queued replays require contention mode without a replay barrier"
+    if args.contention_graph_event_breakdown and not args.contention_queued_replays:
+        return "graph event breakdown requires queued replays"
     if args.torch_npu_profiler:
-        if args.contention_barrier_fd is None:
+        if args.contention_barrier_fd is None and not args.contention_queued_replays:
             return "--torch-npu-profiler requires a synchronized multi-card replay"
         return validate_profiler_args(args)
     return None
@@ -1199,7 +1205,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service):
                 runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
 
             run_worker(kvaf, torch, args, create_request_plan, submit,
-                       lambda plan: check_output(plan, miss_count_value, full=False))
+                       lambda plan: check_output(plan, miss_count_value, full=False), reset_output=output.zero_)
             return 0
 
         start_kernel_measurement(args, runtime)

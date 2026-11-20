@@ -17,7 +17,7 @@ PROFILER_EXPORT_TIMEOUT_SECONDS = 300
 def add_profiler_args(parser, *, hidden=False, enabled_by_default=False):
     toggle = parser.add_mutually_exclusive_group()
     toggle.add_argument("--torch-npu-profiler", action="store_true",
-                        help=SUPPRESS if hidden else "report shared-window kernel bandwidth (default: enabled)")
+                        help=SUPPRESS if hidden else "capture the kernel timeline (on by default outside queued mode)")
     toggle.add_argument("--no-torch-npu-profiler", dest="torch_npu_profiler", action="store_false",
                         help=SUPPRESS if hidden else "disable kernel timeline collection")
     parser.set_defaults(torch_npu_profiler=enabled_by_default)

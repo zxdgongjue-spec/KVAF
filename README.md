@@ -370,6 +370,20 @@ ACL Graph。每轮一起回放整张图，等所有卡完成后再开始下一�
 每轮用各卡首尾 Get 的设备执行区间取交集，只统计完整落入交集的 Get。
 `overlap_mean_GBps` 用入选 Get 的有效字节总数除以 kernel 耗时之和，单位为十进制 GB/s。
 没有完整 Get 的卡会显示 `n/a`。采集只在并发阶段开启，采集开销会影响本次墙钟吞吐。
+
+和 `ascend-copy-bench` 对照时，使用连续回放脚本。默认在设备 2、3、4、5 上各用 32 个 AIV 核，
+用 `torch.npu.NPUGraph` 把同一份 16,384 条请求录成每图 256 次 BatchGet。各卡预热完成后一起开跑，各自连续提交 10 次回放，
+整批只同步一次。每卡每次 BatchGet 默认搬 `16384 × 656 B`。KVAF 使用自己的 DDR 地址表和 HBM 输出布局，
+默认随机读、离散写，可用 `--output-access-pattern contiguous` 改为连续写。
+
+```bash
+tests/run_remote_cpu_batch_get_queued_perf.sh "$PWD/build-npu" \
+  --transport ubmem --peer 127.0.0.1:28999 --graph-event-breakdown --no-torch-npu-profiler
+```
+
+终端 `GRAPH_BANDWIDTH` 打印 Host 和设备 Event 带宽，`--graph-event-breakdown` 还打印
+`GRAPH_TIMING` 和 `GRAPH_SUBMIT`。默认关闭采集，使用 `--torch-npu-profiler` 会采集预热后的整批图，
+并在终端打印 `PROFILE_DIR`、采集到的算子次数和算子带宽。运行前需要启动对应的 KVAF CPU service。
 该选项由脚本自身采集时间线，请直接运行脚本。
 
 ### 6. 无 NPU 的主机回归

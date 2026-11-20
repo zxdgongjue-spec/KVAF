@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import batch_get_multicard_perf as multi
+import batch_get_queued_perf as queued
 import test_npu_batch_get_perf as perf
 
 
@@ -26,8 +27,13 @@ def option(name):
     return sys.argv[sys.argv.index(name) + 1]
 directory = pathlib.Path(option("--contention-control-dir"))
 device = int(os.environ["DEVICE_ID"])
+queued_replays = "--contention-queued-replays" in sys.argv
 assert option("--token-bytes") == "656"
-assert option("--table-capacity") == "4096"
+assert option("--table-capacity") == ("64" if queued_replays else "4096")
+if queued_replays:
+    assert "--contention-barrier-fd" not in sys.argv
+    assert option("--request-length") == "16384"
+    assert option("--output-access-pattern") == "random"
 assert "--no-kernel-profile" in sys.argv
 profile = "--torch-npu-profiler" in sys.argv
 assert directory.name == "concurrent" or not profile
@@ -79,9 +85,30 @@ elapsed = 0.05
 result = dict(device=device, start=window["start"], end=window["start"] + elapsed,
               bandwidth_GBps=rate, payload_bytes=round(elapsed * rate * 1e9),
               p50_call_us=90, calls=replays * graph_calls, graph_calls=graph_calls, graph_replays=replays, verified=True)
+if queued_replays:
+    result["end"] = window["start"] + 0.5
+    result["payload_bytes"] = result["calls"] * 16384 * 656
+    result["bandwidth_GBps"] = result["payload_bytes"] / 0.5e9
+    result["device_event_seconds"] = 0.5
+    if "--contention-graph-event-breakdown" in sys.argv:
+        result["graph_event_breakdown"] = dict(graph_ms=[50] * replays, gap_ms=[0] * (replays - 1),
+                                                  host_submit_batch_ms=1.1, host_replay_ms=[0.1] * replays)
 pathlib.Path(option("--contention-result")).write_text(json.dumps(result))
 if profile:
     warmup, active = int(option("--profiler-warmup")), int(option("--profiler-active"))
+    if queued_replays:
+        assert (warmup, active) == (0, 1)
+        count = replays * graph_calls
+        prefix = f"KVAF/device{device}/round0"
+        events = [dict(ph="X", name=f"{prefix}/graph_replay", ts=1, dur=1, pid=1, tid=1),
+                  dict(ph="X", name=f"{prefix}/wait_completion", ts=2, dur=count * 200 + 20, pid=1, tid=1)]
+        for i in range(count):
+            events.append(dict(ph="X", name="KvafExecuteBatchGetUbmemKernelV2", ts=10+i*200, dur=100,
+                               pid=2, tid=1, cat="kernel"))
+        traces = directory / "profiles" / f"device{device}"
+        traces.mkdir()
+        (traces / "trace_view.json").write_text(json.dumps(events))
+        sys.exit(0)
     assert "--contention-barrier-per-graph" in sys.argv and warmup + active <= replays
     host_pid, device_pid = 1, 2
     events = []
@@ -109,6 +136,129 @@ if profile:
 
 
 class MulticardTests(unittest.TestCase):
+    def test_queued_entrypoint_profiles_one_batch_and_reports_matching_metrics(self):
+        script = Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_queued_perf.sh"
+        for flags in ((), ("--torch-npu-profiler",), ("--no-torch-npu-profiler",)):
+            profile = "--torch-npu-profiler" in flags
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                output = root / "results" / "queued"
+                runner = root / "runner"
+                runner.write_text(FAKE_RUNNER)
+                runner.chmod(0o755)
+                env = dict(os.environ, KVAF_BATCH_GET_PERF_RUNNER=str(runner), EXPECTED_TRANSPORT="ubmem",
+                           EXPECTED_CORES="32", EXPECTED_JETTYS="2", EXPECTED_INFLIGHT="2048",
+                           KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL="2048", EXPECTED_DEVICES="2 3 4 5")
+                result = subprocess.run(["bash", str(script), str(root / "build"), "--graph-event-breakdown",
+                                         "--output", str(output), *flags], env=env, capture_output=True,
+                                        text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                config = json.loads((output / "config.json").read_text())
+                self.assertTrue(config["concurrent_only"])
+                self.assertEqual((config["graph_replays"], config["graph_calls"]), (10, 256))
+                self.assertEqual(config["torch_npu_profiler"], profile)
+                self.assertFalse(list(output.glob("isolated_*")))
+                self.assertEqual(result.stdout.count("GRAPH_BANDWIDTH "), 4)
+                self.assertEqual(result.stdout.count("device_event_bandwidth_gbps=55.029"), 4)
+                self.assertEqual(result.stdout.count("GRAPH_TIMING "), 4)
+                self.assertEqual(result.stdout.count("GRAPH_SUBMIT "), 4)
+                self.assertEqual(result.stdout.count("profiled_kernel_calls=2560"), 4 if profile else 0)
+                self.assertEqual(result.stdout.count(f"PROFILE_DIR {output / 'concurrent' / 'profiles'}"), int(profile))
+
+    def test_queued_measure_records_events_and_syncs_once(self):
+        actions = []
+        graph = SimpleNamespace(replay=lambda: actions.append("replay"))
+        stream = SimpleNamespace(synchronize=lambda: actions.append("sync"))
+
+        class Event:
+            def __init__(self, timestamp):
+                self.timestamp = timestamp
+
+            def elapsed_time(self, other):
+                self.assert_synced()
+                return other.timestamp - self.timestamp
+
+            @staticmethod
+            def assert_synced():
+                if actions[-2:] != ["sync", "step"]:
+                    raise AssertionError("timing read before synchronization or profiler stop")
+
+        timestamps = iter((0, 10, 12, 22, 23, 33))
+
+        def record_event():
+            actions.append("event")
+            return Event(next(timestamps))
+
+        profiler = SimpleNamespace(range=lambda *args: contextlib.nullcontext(), step=lambda: actions.append("step"))
+        _, _, timing = queued.measure(graph, stream, record_event, 3, event_breakdown=True, profiler=profiler)
+        self.assertEqual(actions, ["event", "replay", "event"] * 3 + ["sync", "step"])
+        self.assertEqual(timing["device_event_seconds"], 0.033)
+        self.assertEqual(timing["graph_event_breakdown"]["graph_ms"], [10, 10, 10])
+        self.assertEqual(timing["graph_event_breakdown"]["gap_ms"], [2, 1])
+
+    def test_queued_worker_times_one_submission_batch_on_its_graph_stream(self):
+        actions = []
+        active_stream = None
+        plan = object()
+        make_plan = Mock(return_value=plan)
+        stream = SimpleNamespace(synchronize=lambda: actions.append("stream_sync"))
+
+        @contextlib.contextmanager
+        def use_stream(selected):
+            nonlocal active_stream
+            active_stream = selected
+            try:
+                yield
+            finally:
+                active_stream = None
+
+        def replay():
+            self.assertIs(active_stream, stream)
+            actions.append("replay")
+
+        graph = SimpleNamespace(reset=Mock(), replay=replay)
+        capture = Mock(side_effect=lambda graph, *, stream: use_stream(stream))
+
+        class Event:
+            def __init__(self, *, enable_timing):
+                if not enable_timing:
+                    raise AssertionError("expected timing event")
+
+            def record(self):
+                if active_stream is not stream:
+                    raise AssertionError("event recorded on the wrong stream")
+                actions.append("event")
+
+            def elapsed_time(self, other):
+                return 500.0
+
+        torch = SimpleNamespace(npu=SimpleNamespace(Stream=lambda: stream, Event=Event, stream=use_stream,
+                                                    NPUGraph=lambda: graph, graph=capture,
+                                                    synchronize=lambda: actions.append("device_sync")))
+        submit = Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            root.joinpath("start.json").write_text(json.dumps({"start": 0, "graph_replays": 10}))
+            args = SimpleNamespace(contention_control_dir=root, contention_result=root / "result.json",
+                                   contention_graph_calls=256, contention_barrier_fd=None, contention_queued_replays=True,
+                                   contention_graph_event_breakdown=False, warmup=3, miss_count=16384, token_bytes=656,
+                                   torch_npu_profiler=False)
+            validate_output = Mock()
+            with patch.dict(os.environ, DEVICE_ID="2"), contextlib.redirect_stdout(io.StringIO()):
+                multi.run_worker(None, torch, args, make_plan, submit,
+                                 validate_output, lambda: actions.append("reset_output"))
+            make_plan.assert_called_once_with()
+            capture.assert_called_once_with(graph, stream=stream)
+            graph.reset.assert_called_once_with()
+            self.assertEqual(submit.call_args_list, [unittest.mock.call(plan, stream)] * 257)
+            self.assertEqual(actions, ["device_sync", "device_sync", "replay", "replay", "replay", "stream_sync",
+                                       "reset_output", "device_sync", "event"] + ["replay"] * 10 +
+                             ["event", "stream_sync", "stream_sync"])
+            validate_output.assert_called_once_with(plan)
+            result = json.loads(args.contention_result.read_text())
+            self.assertEqual(result["calls"], 2560)
+            self.assertEqual(result["device_event_seconds"], 0.5)
+
     def run_controller(self, root, fail=None, transport="ubmem", options=(), cores=16,
                        jettys=2, inflight=2048, expected_transport=None, core_env="16",
                        devices=(0, 1), fail_barrier=None, replays=5, profiler=False):
@@ -588,6 +738,10 @@ class MulticardTests(unittest.TestCase):
             self.assertIn("--no-kernel-profile", perf.validate_args(args))
             args = perf.parse_args(["--torch-npu-profiler"])
             self.assertIn("synchronized multi-card replay", perf.validate_args(args))
+            args = perf.parse_args(["--contention-control-dir", "/tmp/run", "--contention-result", "/tmp/result.json",
+                                    "--no-kernel-profile", "--contention-queued-replays",
+                                    "--contention-graph-event-breakdown", "--torch-npu-profiler"])
+            self.assertIsNone(perf.validate_args(args))
 
 
 if __name__ == "__main__":
