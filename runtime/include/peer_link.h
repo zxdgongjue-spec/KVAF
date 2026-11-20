@@ -7,6 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <memory>
+#include <optional>
 #include "execution_config.h"
 
 #include "peer_protocol.h"
@@ -39,6 +40,12 @@ struct PeerCandidateInfo {
   uint32_t device_id = 0U;
   uint32_t eid_index = 0U;
   std::string device_name;
+  std::array<uint8_t, kEidBytes> eid{};
+};
+
+struct PeerCandidateTable {
+  uint32_t count{}, device_count{};
+  bool device_fixed{}, local{};
 };
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
@@ -63,6 +70,10 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   Status GetCandidateCount(uint32_t* candidate_count, uint32_t* device_count = nullptr,
                            bool* device_filter_applied = nullptr) const;
   Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
+  Status DiscoverCandidates(PeerCandidateTable* table);
+  Status SelectCpuCandidate(const PeerCandidateTable&, const std::string& device,
+                            const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
+                            PeerCandidateInfo* selected);
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);
@@ -100,6 +111,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   std::shared_ptr<ExecutionState> execution_;
   std::shared_ptr<PeerLink> parent_;
   std::string address_;
+  std::optional<std::array<uint8_t, kEidBytes>> selected_cpu_eid_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
   mutable std::mutex mapping_mutex_;
   std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;

@@ -6,6 +6,7 @@
 namespace kvaf {
 // Allocation-scoped CPU context and DDR registration owner. Execution
 // backends keep independent channels, gather workers and Scatter state.
+class CpuUrmaDiscovery;
 class CpuUrmaMemoryPool {
  public:
   CpuUrmaMemoryPool(const CpuRuntimeOptions&, void* memory, std::uint64_t bytes,
@@ -22,6 +23,7 @@ class UrmaCpuBackend {
   UrmaCpuBackend();
   ~UrmaCpuBackend();
   Status Initialize(const CpuRuntimeOptions&, std::uint64_t& next_session,
+                    const std::shared_ptr<CpuUrmaDiscovery>& discovery,
                     std::shared_ptr<CpuUrmaMemoryPool> memory_pool = {});
   Status AttachRegion(void* memory, std::uint64_t bytes, std::uint64_t slot_size,
                       std::uint32_t candidate, peer::PeerRegion* binding);

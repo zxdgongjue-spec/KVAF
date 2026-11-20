@@ -81,8 +81,13 @@ CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范�
 `page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
-默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
-`--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
+服务启动时记录 CPU 亲和性。使用匹配的 `--cpunodebind N --membind N` 时，通过 Linux CPU topology 确定节点所属的 CPU Chip，只枚举该 Chip 上所有 FE 的非零 EID。
+未绑定时枚举所有 UB 设备。候选按设备名和 EID index 排序。服务端 `--ub-device NAME` 选该设备首项，
+加 `--eid-index N` 可精确固定。设备超出绑定范围或候选为空时返回错误。
+例如 Node 0、1 同属于 Chip 0，绑定两者中任一节点得到相同的 Chip 0 候选表。部署设备 `udmac<C>d<D>e<E>` 的 `C` 对应 Linux `physical_package_id`。
+其他设备可通过 Linux `numa_node` 确认所属 Chip。只提供固件邻近域时，通过 ACPI SRAT 和 CPU firmware UID 转换为 Linux 节点。
+无法确定归属或属于其他 Chip 的设备记为 `NUMA_DEVICE_SKIPPED`。
+CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
 
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
@@ -103,8 +108,13 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 已知设备名时可设置 `peer_ub_device="udmac0d1e2"`，固定 CPU 侧候选设备。
 Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写入。
 
-`link_to` 必须在 `initialize` 前调用。URMA 初始化从 HCCL root-info 读取当前物理卡的
-CLOS PG EID，并尝试追加 `/proc/asdrv_ub/pair_info` 的候选；未指定 EID 时采用首项。
+`link_to` 必须在 `initialize` 前调用。URMA 通过候选数量查询的 TCP 对端地址判断场景。直连服务使用回环地址或本机网卡地址时判为本机，
+其他地址判为远端。端口转发会改变可见对端。
+本机自动选择 NPU 的 `pair_info.remote_eid`，缺失或通道不唯一时使用该物理卡首个有效 CLOS；
+远端只使用 CLOS。显式 `npu_eids` 始终优先。本机且两侧均未固定 CPU 设备时，在已过滤的候选中匹配同一活动通道的
+`pair_info.local_eid`，未命中取首项。显式 CPU 设备优先，远端默认取候选首项。
+`PEER_LINK_EID_SELECTED` 日志记录两端 EID、场景、物理卡号、CPU 候选及选择原因。
+新 NPU 客户端需要能返回原始候选 EID 的 CPU Service，滚动升级时先更新服务端。
 初始化建立 CacheRegion 和元数据；具体 transport、MR、队列、Gather 工作区及 AICPU
 包在首次使用或显式 warmup 时准备，初始化成功不代表数据面已通过 RMA 验证。
 未建立 CPU 服务 Link 时，`initialize` 返回 `InvalidState`。

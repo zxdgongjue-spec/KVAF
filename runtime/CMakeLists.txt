@@ -23,6 +23,7 @@ add_library(kvaf_runtime
   src/runtime.cc
   cpu_service/runtime_service.cc
   src/npu_runtime_config.cc
+  src/npu_eid_selection.cc
 )
 
 target_include_directories(kvaf_runtime
@@ -43,6 +44,17 @@ target_link_libraries(kvaf_runtime
 )
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
+
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(kvaf_eid_selection_test tests/eid_selection_test.cc)
+  target_include_directories(kvaf_eid_selection_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(kvaf_eid_selection_test PRIVATE kvaf_runtime)
+  add_test(NAME kvaf_eid_selection COMMAND kvaf_eid_selection_test)
+  add_executable(kvaf_cpu_numa_scope_test tests/cpu_numa_scope_test.cc cpu_service/urma/cpu_numa_scope.cc)
+  target_include_directories(kvaf_cpu_numa_scope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(kvaf_cpu_numa_scope_test PRIVATE kvaf_common)
+  add_test(NAME kvaf_cpu_numa_scope COMMAND kvaf_cpu_numa_scope_test)
+endif()
 
 if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
   add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
@@ -98,6 +110,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     target_link_libraries(kvaf_cpu_gather_executor PUBLIC kvaf_common kvaf_access_operator Threads::Threads)
     target_compile_options(kvaf_cpu_gather_executor PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
     target_sources(kvaf_cpu_runtime PRIVATE cpu_service/backends/urma_cpu_backend.cc cpu_service/urma/cpu_urma_discovery.cc
+      cpu_service/urma/cpu_numa_scope.cc
       cpu_service/push/cpu_push_get_transport.cc cpu_service/push/cpu_push_get_worker.cc)
     target_link_libraries(kvaf_cpu_runtime PRIVATE Threads::Threads OpenMP::OpenMP_CXX kvaf_cpu_gather_executor)
     target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2;-g>")

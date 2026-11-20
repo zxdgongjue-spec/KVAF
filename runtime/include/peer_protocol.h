@@ -77,6 +77,12 @@ struct CandidateInfoRequest {
   uint32_t candidate_id;
 };
 
+// Extended readers request the raw CPU EID using the same v6 command.
+struct CandidateEidRequest {
+  CandidateInfoRequest info;
+  uint32_t response_bytes;
+};
+
 struct CandidateInfoResponse {
   MessageHeader header;
   int32_t result;
@@ -84,6 +90,11 @@ struct CandidateInfoResponse {
   uint32_t device_id;
   uint32_t eid_index;
   char device_name[kDeviceNameBytes];
+};
+
+struct CandidateEidResponse {
+  CandidateInfoResponse info;
+  uint8_t eid[kEidBytes];
 };
 
 struct AllocateRegionResponse {
@@ -204,6 +215,7 @@ static_assert(sizeof(PrepareGatherWorkspaceRequest) == 28U, "Gather workspace re
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
+static_assert(sizeof(CandidateEidRequest) == 20U && sizeof(CandidateEidResponse) == 108U);
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");

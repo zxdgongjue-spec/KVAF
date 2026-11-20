@@ -122,8 +122,8 @@ URMA、UBmem 请求，后端资源按需初始化。URMA 依赖 UB 驱动、UMDK
 `NpuRuntime` 在连接 CPU 服务后初始化远端 DDR。
 
 - 先 `link_to(cpu_ip:port)`，再由 `initialize()` 申请 CacheRegion 和初始化元数据；
-- URMA 自动发现 NPU 本端 EID：优先使用 HCCL rootinfo 中与当前物理卡匹配的 CLOS PG EID，
-  不可用时回退到 `/proc/asdrv_ub/pair_info`；
+- URMA 自动选路时，本机 NPU 优先使用 Pair Info 的 `remote_eid`，缺失时使用当前物理卡的首个有效 CLOS EID。
+  远端 NPU 只使用 CLOS。CPU 端优先遵循显式设备设置，本机自动选择时优先匹配 Pair Info 的 `local_eid`；
 - AIV URMA Get 将显式 `npu_eids` 列表作为多路径条带；Put 和 AICPU 使用首项；
 - 初始化不执行探测写入；算法及数据面资源在首次使用或 warmup 时准备；
 - `BatchPut`：将 NPU Tensor 中的 KV block 写入 CPU DDR，并提交元数据；

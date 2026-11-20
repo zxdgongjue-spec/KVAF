@@ -60,9 +60,9 @@ struct NativeApi {
   decltype(&::urma_create_jetty) urma_create_jetty = &::urma_create_jetty;
 };
 
-template <typename Api, typename Visit>
+template <typename Api, typename Visit, typename AcceptDevice>
 bool EnumerateEndpoints(const Api& api, const char* requested_device, std::uint32_t eid_index,
-                        Visit visit) {
+                        Visit visit, AcceptDevice accept_device) {
   int count = 0;
   auto** devices = api.urma_get_device_list(&count);
   if (!devices) return false;
@@ -70,7 +70,7 @@ bool EnumerateEndpoints(const Api& api, const char* requested_device, std::uint3
   for (int i = 0; i < count && !done; ++i) {
     auto* device = devices[i];
     if (!device || device->type != URMA_TRANSPORT_UB ||
-        (*requested_device && std::strcmp(requested_device, device->name)))
+        (*requested_device && std::strcmp(requested_device, device->name)) || !accept_device(device))
       continue;
     std::uint32_t eid_count = 0;
     auto* eids = api.urma_get_eid_list(device, &eid_count);
@@ -86,6 +86,11 @@ bool EnumerateEndpoints(const Api& api, const char* requested_device, std::uint3
   }
   api.urma_free_device_list(devices);
   return true;
+}
+
+template <typename Api, typename Visit>
+bool EnumerateEndpoints(const Api& api, const char* device, std::uint32_t index, Visit visit) {
+  return EnumerateEndpoints(api, device, index, visit, [](auto*) { return true; });
 }
 
 struct QueueOptions {

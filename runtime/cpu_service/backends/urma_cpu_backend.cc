@@ -216,14 +216,14 @@ class UrmaResourcePool {
  public:
   ~UrmaResourcePool() { Shutdown(); }
 
-  bool Initialize(const std::string& requested_device, bool eid_index_requested,
-                  uint32_t requested_eid_index) {
-    const Status status = discovery_.Initialize(requested_device, eid_index_requested, requested_eid_index);
+  bool Initialize(const std::shared_ptr<CpuUrmaDiscovery>& discovery) {
+    const Status status = discovery->Initialize();
     if (!status.ok()) {
       Log("[KVAF_CPU] candidate discovery failed: %s\n", status.message().c_str());
       return false;
     }
-    for (const auto& discovered : discovery_.candidates()) {
+    discovery_ = discovery;
+    for (const auto& discovered : discovery_->candidates()) {
       UrmaCandidate candidate;
       static_cast<CpuUrmaCandidate&>(candidate) = discovered;
       candidates_.push_back(std::move(candidate));
@@ -311,12 +311,12 @@ class UrmaResourcePool {
     for (auto& candidate : candidates_)
       if (candidate.resources && !candidate.resources->Shutdown()) return false;
     candidates_.clear();
-    discovery_.Shutdown();
+    discovery_.reset();
     return true;
   }
 
  private:
-  CpuUrmaDiscovery discovery_;
+  std::shared_ptr<CpuUrmaDiscovery> discovery_;
   std::vector<UrmaCandidate> candidates_;
 };
 
@@ -328,7 +328,7 @@ class SharedUrmaMemory {
                    std::uint64_t epoch, std::uint64_t allocation)
       : options_(std::move(options)), memory_(memory), bytes_(bytes), epoch_(epoch),
         allocation_(allocation), generation_(NewBindingGeneration()) {}
-  Status Initialize(const CpuRuntimeOptions& options) {
+  Status Initialize(const CpuRuntimeOptions& options, const std::shared_ptr<CpuUrmaDiscovery>& discovery) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closing_) return Status::InvalidState("CPU URMA memory pool is closing");
     if (options.ub_device != options_.ub_device || options.has_eid_index != options_.has_eid_index ||
@@ -336,7 +336,7 @@ class SharedUrmaMemory {
       return Status::InvalidArgument("CPU URMA memory pool endpoint configuration mismatch");
     if (!attempted_) {
       attempted_ = true;
-      ready_ = resources.Initialize(options_.ub_device, options_.has_eid_index, options_.eid_index);
+      ready_ = resources.Initialize(discovery);
     }
     return ready_ ? Status::OK() : Status::Internal("shared CPU URMA discovery failed; close pool");
   }
@@ -504,9 +504,8 @@ class CpuService {
 
   bool DeviceFilterApplied() const { return device_filter_applied_; }
 
-  Result GetCandidateInfo(uint32_t candidate_id,
-                          CandidateInfoResponse* response) const {
-    if (response == nullptr || resource_pool_ == nullptr) {
+  Result GetCandidateInfo(uint32_t candidate_id, peer::CandidateEidResponse& record) const {
+    if (resource_pool_ == nullptr) {
       return Result::kInvalidRequest;
     }
     UrmaCandidate candidate{};
@@ -517,10 +516,11 @@ class CpuService {
         candidate.device_name.size() >= kDeviceNameBytes) {
       return Result::kResourceError;
     }
-    response->candidate_id = candidate.id;
-    response->device_id = candidate.device_id;
-    response->eid_index = candidate.eid_index;
-    std::memcpy(response->device_name, candidate.device_name.c_str(),
+    record.info.candidate_id = candidate.id;
+    record.info.device_id = candidate.device_id;
+    record.info.eid_index = candidate.eid_index;
+    std::copy(candidate.eid.begin(), candidate.eid.end(), record.eid);
+    std::memcpy(record.info.device_name, candidate.device_name.c_str(),
                 candidate.device_name.size());
     return Result::kOk;
   }
@@ -1117,22 +1117,23 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       return;
     }
     case Command::kGetCandidateInfo: {
-      CandidateInfoRequest request{};
-      std::memcpy(&request, &header, sizeof(header));
-      if (!IsValidHeader(header, command, sizeof(request)) ||
+      const bool extended = IsValidHeader(header, command, sizeof(peer::CandidateEidRequest));
+      peer::CandidateEidRequest request{};
+      if ((!extended && !IsValidHeader(header, command, sizeof(CandidateInfoRequest))) ||
           !ReadAll(fd, reinterpret_cast<uint8_t*>(&request) + sizeof(header),
-                   sizeof(request) - sizeof(header))) {
+                   header.bytes - sizeof(header)) ||
+          (extended && request.response_bytes != sizeof(peer::CandidateEidResponse))) {
         SendStatus(fd, command, Result::kInvalidRequest);
         return;
       }
-      CandidateInfoResponse response{};
-      response.header = MakeHeader(command, sizeof(response));
-      response.header.command = ResponseCommand(command);
-      response.result = static_cast<int32_t>(
-          service == nullptr
-              ? Result::kResourceError
-              : service->GetCandidateInfo(request.candidate_id, &response));
-      (void)WriteAll(fd, &response, sizeof(response));
+      const auto bytes = extended ? sizeof(peer::CandidateEidResponse) : sizeof(CandidateInfoResponse);
+      peer::CandidateEidResponse response{};
+      response.info.header = MakeHeader(command, bytes);
+      response.info.header.command = ResponseCommand(command);
+      response.info.result = static_cast<int32_t>(
+          service == nullptr ? Result::kResourceError
+                             : service->GetCandidateInfo(request.info.candidate_id, response));
+      (void)WriteAll(fd, &response, bytes);
       return;
     }
     case Command::kCreateChannel: {
@@ -1251,6 +1252,7 @@ UrmaCpuBackend::UrmaCpuBackend() = default;
 UrmaCpuBackend::~UrmaCpuBackend() { if (!Shutdown().ok()) (void)impl_.release(); }
 
 Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& next_session,
+                                  const std::shared_ptr<CpuUrmaDiscovery>& discovery,
                                   std::shared_ptr<CpuUrmaMemoryPool> memory_pool) {
   if (impl_ != nullptr) return Status::InvalidState("CpuRuntime has already been initialized");
   if (options.has_eid_index && options.ub_device.empty()) {
@@ -1267,11 +1269,11 @@ Status UrmaCpuBackend::Initialize(const CpuRuntimeOptions& options, uint64_t& ne
   std::shared_ptr<SharedUrmaMemory> shared_memory;
   if (memory_pool) {
     shared_memory = memory_pool->impl_->memory;
-    auto ready = shared_memory->Initialize(options);
+    auto ready = shared_memory->Initialize(options, discovery);
     if (!ready.ok()) return ready;
     resources = &shared_memory->resources;
     impl->memory_pool = std::move(memory_pool);
-  } else if (!impl->resources.Initialize(options.ub_device, options.has_eid_index, options.eid_index)) {
+  } else if (!impl->resources.Initialize(discovery)) {
     return Status::Internal("CpuRuntime failed to initialize UMDK resources");
   }
   const std::size_t min_bytes_per_thread = options.gather_threads == 0U

@@ -15,7 +15,7 @@ void PrintUsage(const char* program) {
                "[--gather-threads N] [--gather-mode adaptive|active|passive] "
                "[--memory-page-mode default|thp] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates are discovered automatically. Gather threads default to 10, "
+               "candidates in the service CPU affinity scope are discovered automatically. Gather threads default to 10, "
                "mode to active; memory page mode defaults to thp. "
                "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
                program);

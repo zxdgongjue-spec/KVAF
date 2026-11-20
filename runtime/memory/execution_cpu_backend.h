@@ -2,5 +2,7 @@
 #include "cache_region_service.h"
 #include "cpu_runtime.h"
 namespace kvaf {
-std::unique_ptr<execution::CacheRegionService> CreateExecutionService(const CpuRuntimeOptions&);
+class CpuUrmaDiscovery;
+std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
+    const CpuRuntimeOptions&, std::shared_ptr<CpuUrmaDiscovery>);
 }

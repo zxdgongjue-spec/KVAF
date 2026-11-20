@@ -1,10 +1,15 @@
 #include "cpu_service/backends/cpu_backends.h"
 #include "memory/execution_cpu_backend.h"
 #include <mutex>
+#ifdef KVAF_CPU_HAS_URMA
+#include "cpu_service/urma/cpu_urma_discovery.h"
+#endif
 
 #include <sys/socket.h>
 #include <cerrno>
 #include <cstdio>
+#include <array>
+#include <cstring>
 
 namespace kvaf {
 namespace {
@@ -20,12 +25,16 @@ bool Read(int fd, void* data, std::size_t bytes) {
 }
 template <class Response>
 Status Reply(int fd, peer::Command command, peer::Result result) {
-  Response response{};
-  response.header = peer::MakeHeader(command, sizeof(response));
-  response.header.command = peer::ResponseCommand(command);
-  response.result = static_cast<int>(result);
-  const auto* data = reinterpret_cast<const char*>(&response);
-  std::size_t left = sizeof(response);
+  // All fixed-size CPU replies start with the same header and result.
+  peer::StatusResponse status{};
+  status.header = peer::MakeHeader(command, sizeof(Response));
+  status.header.command = peer::ResponseCommand(command);
+  status.result = static_cast<int>(result);
+  std::array<char, sizeof(Response)> response{};
+  static_assert(sizeof(Response) >= sizeof(status));
+  std::memcpy(response.data(), &status, sizeof(status));
+  const char* data = response.data();
+  std::size_t left = response.size();
   while (left) {
     const auto n = send(fd, data, left, MSG_NOSIGNAL);
     if (n < 0 && errno == EINTR) continue;
@@ -39,9 +48,14 @@ Status Reply(int fd, peer::Command command, peer::Result result) {
 struct CpuRuntime::Impl {
   explicit Impl(CpuRuntimeOptions value)
       : options(std::move(value)),
+#ifdef KVAF_CPU_HAS_URMA
+        discovery(std::make_shared<CpuUrmaDiscovery>(options.ub_device, options.has_eid_index,
+                                                     options.eid_index)),
+#endif
         ubmem(options, next_session),
-        execution(CreateExecutionService(options)) {}
+        execution(CreateExecutionService(options, discovery)) {}
   CpuRuntimeOptions options;
+  std::shared_ptr<CpuUrmaDiscovery> discovery;
   std::uint64_t next_session{1};
   UbmemCpuBackend ubmem;
   std::unique_ptr<execution::CacheRegionService> execution;
@@ -56,7 +70,9 @@ Status CpuRuntime::Initialize(const CpuRuntimeOptions& options) {
   std::unique_lock<std::shared_mutex> life(lifecycle_);
   if (impl_) return Status::InvalidState("CpuRuntime already initialized");
   if (options.has_eid_index && options.ub_device.empty())
-    return Status::InvalidArgument("invalid CPU runtime options");
+    return Status::InvalidArgument("CPU eid_index requires ub_device");
+  if (options.has_eid_index && options.eid_index == UINT32_MAX)
+    return Status::InvalidArgument("CPU eid_index cannot be the wildcard UINT32_MAX");
   if (options.gather_threads > 64U)
     return Status::InvalidArgument("CpuRuntime gather_threads must be in [1,64] or auto");
   impl_ = std::make_unique<Impl>(options);
@@ -130,7 +146,7 @@ Status CpuRuntime::ServeConnection(int fd) {
   }
 #ifdef KVAF_CPU_HAS_URMA
   auto status = impl_->urma.initialized() ? Status::OK()
-      : impl_->urma.Initialize(impl_->options, impl_->next_session);
+      : impl_->urma.Initialize(impl_->options, impl_->next_session, impl_->discovery);
   if (status.ok()) return impl_->urma.ServeConnection(fd, header);
   std::fprintf(stderr, "[KVAF_CPU] %s\n", status.message().c_str());
 #endif
@@ -142,6 +158,8 @@ Status CpuRuntime::ServeConnection(int fd) {
     case peer::Command::kGetCandidateCount:
       return Reply<peer::CandidateCountResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kGetCandidateInfo:
+      if (header.bytes == sizeof(peer::CandidateEidRequest))
+        return Reply<peer::CandidateEidResponse>(fd, command, peer::Result::kResourceError);
       return Reply<peer::CandidateInfoResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kCreateChannel:
       return Reply<peer::CreateChannelResponse>(fd, command, peer::Result::kResourceError);

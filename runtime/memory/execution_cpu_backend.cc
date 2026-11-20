@@ -56,7 +56,8 @@ class FabricSession final : public execution::Session {
 #ifdef KVAF_CPU_HAS_URMA
 class UrmaSession final : public execution::Session {
  public:
-  explicit UrmaSession(CpuRuntimeOptions options) : options_(std::move(options)) {}
+  UrmaSession(CpuRuntimeOptions options, std::shared_ptr<CpuUrmaDiscovery> discovery)
+      : options_(std::move(options)), discovery_(std::move(discovery)) {}
   Status Open(const execution::Request& q, execution::Allocation& pool,
               peer::PeerRegion* out) override {
     profile_ = q;
@@ -64,7 +65,7 @@ class UrmaSession final : public execution::Session {
     auto* allocation = dynamic_cast<PoolAllocation*>(&pool);
     if (!allocation || !allocation->urma_memory)
       return Status::InvalidState("allocation has no shared CPU URMA memory owner");
-    auto s = backend_.Initialize(options_, next_, allocation->urma_memory);
+    auto s = backend_.Initialize(options_, next_, discovery_, allocation->urma_memory);
     if (s.ok())
       s = backend_.AttachRegion(reinterpret_cast<void*>(pool.descriptor.base),
                                 pool.descriptor.length, 1, q.candidate, out);
@@ -91,6 +92,7 @@ class UrmaSession final : public execution::Session {
 
  private:
   CpuRuntimeOptions options_;
+  std::shared_ptr<CpuUrmaDiscovery> discovery_;
   execution::Request profile_;
   std::uint64_t next_ = 1;
   UrmaCpuBackend backend_;
@@ -98,7 +100,7 @@ class UrmaSession final : public execution::Session {
 #endif
 }  // namespace
 std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
-    const CpuRuntimeOptions& options) {
+    const CpuRuntimeOptions& options, std::shared_ptr<CpuUrmaDiscovery> discovery) {
   auto allocate = [options](const execution::Request& q,
                             std::unique_ptr<execution::Allocation>* out) -> Status {
     auto pool = std::make_unique<PoolAllocation>();
@@ -147,10 +149,10 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
                   q.auxiliary_bytes);
     return Status::OK();
   };
-  auto create = [options](const execution::Request& q) -> std::unique_ptr<execution::Session> {
+  auto create = [options, discovery](const execution::Request& q) -> std::unique_ptr<execution::Session> {
     if (q.transport == Transport::Ubmem) return std::make_unique<FabricSession>();
 #ifdef KVAF_CPU_HAS_URMA
-    return std::make_unique<UrmaSession>(options);
+    return std::make_unique<UrmaSession>(options, discovery);
 #else
     return {};
 #endif

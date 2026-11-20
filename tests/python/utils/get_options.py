@@ -93,7 +93,7 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 disables the limit)")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
-                       help="comma-separated NPU EIDs; AIV stripes across them, AICPU tries candidates in order")
+                       help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")
     group.add_argument("--peer-ub-device", default="", help="CPU UB device; URMA backends only")
     return group
 
