@@ -72,7 +72,10 @@ KVAF_AIV_GATHER_CHUNK_BYTES=0 KVAF_AIV_GATHER_PREPARE_AHEAD=1 \
   KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=0 python -u tests/python/test_aiv_gather_batch_get_perf.py
 # 提前准备 + 均分协作块；分别比较 2/4/8/16/32
 KVAF_AIV_GATHER_CHUNK_BYTES=131072 KVAF_AIV_GATHER_PREPARE_AHEAD=1 \
-  KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=4 python -u tests/python/test_aiv_gather_batch_get_perf.py
+  KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=0 KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=4 \
+  python -u tests/python/test_aiv_gather_batch_get_perf.py
+# 默认小首块：1/32 + 4 个尾块，READ WQE 提前准备
+python -u tests/python/test_aiv_gather_batch_get_perf.py
 # 小首块：1/16 + 6 个尾块；分别调整 D/N
 KVAF_AIV_GATHER_CHUNK_BYTES=131072 KVAF_AIV_GATHER_PREPARE_AHEAD=1 \
   KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR=16 KVAF_AIV_GATHER_COOPERATIVE_CHUNKS=6 \

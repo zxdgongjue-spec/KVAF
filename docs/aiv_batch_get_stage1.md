@@ -17,7 +17,8 @@ Gather 当前实现与配置见 [Gather 实现与配置](aiv_gather_prepared_pre
 Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 后，CPU 省略
 分片 Ready，AIV 等到整批 done 成功再开始搬运。两种模式下，可信请求超过 1024 个有效行时，
 内核都会先发布首段清单，再合批发布剩余清单。
-Gather 默认使用 128 KiB byte-prefix；可信输入超过每核 1024 行时，在首段清单发布后通知 CPU，
+Gather 默认启用 READ WQE 预构建，首块为每核 payload 的 1/32，剩余分成四个协作尾块；
+可信输入超过每核 1024 行时，在首段清单发布后通知 CPU，
 剩余清单通过 suffix 通知完成。`KVAF_AIV_GATHER_CHUNK_BYTES=0` 保留整批 ACK 对照。
 AIV 不调用 UMDK；两端通过注册内存和现有 CPU 控制协议通信。
 
@@ -265,8 +266,8 @@ KVAF_RUN_NPU_TESTS=1 python3 tests/python/test_aiv_gather_batch_get.py --graph
 
 测试先连续回放两次满批，每次改变源索引、偏移和输出行，再覆盖零请求、单请求、
 小批和满批。逐轮比对整块输出，包括未写行的哨兵。可分别用
-`KVAF_AIV_GATHER_CHUNK_BYTES=0` 和默认 chunk 跑 ACK 与 prefix 两条路径，再以
-`KVAF_AIV_GATHER_PREPARE_AHEAD=1` 验证预构建。用同一脚本加 `--eager` 覆盖 eager 回归。
+`KVAF_AIV_GATHER_CHUNK_BYTES=0` 和默认配置跑整批 ACK 与小首块流水两条路径。
+用同一脚本加 `--eager` 覆盖 eager 回归。
 
 ### 图模式与 eager 性能对比
 
@@ -288,7 +289,7 @@ eager 由 Runtime 解析当前 stream，graph 在同一当前 stream 捕获和�
 `status_check_us` 和从提交到完成状态检查的 `checked_e2e_us`，后者包含这次显式
 设备同步。每轮输出的 `p50_saved_us` 和 `submit_p50_saved_us` 均为 eager P50
 减 graph P50，正值表示图更快。阶段 profiling 由 eager 执行。graph 计时前连续
-两次核对 payload 和 guard。默认 chunk 走原前缀流水，可设置
+两次核对 payload 和 guard。默认使用 1/32 首块、四个尾块及 WQE 预构建，可设置
 `KVAF_AIV_GATHER_CHUNK_BYTES=0` 对两边运行整批 ACK 对照。
 
 排查超时可单次设置 `KVAF_AIV_GATHER_MAX_POLLS=10000`，让软件轮询更早返回。

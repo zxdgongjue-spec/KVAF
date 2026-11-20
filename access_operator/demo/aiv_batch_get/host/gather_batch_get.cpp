@@ -415,12 +415,15 @@ Status GatherBatchGet::Initialize(const RemoteRegionDesc& region) {
   // Probes and split-token reads retain whole-batch ACK semantics.
   if (s.args.probe || !fast_read)
     s.args.pipeline_chunk_bytes = 0;
+  // Prefix mode defaults to a short first chunk and four cooperative tails.
+  s.args.cooperative_chunks = s.args.pipeline_chunk_bytes ? 4U : 0U;
   const char* cooperative = std::getenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
   if (cooperative && *cooperative) {
     const auto parsed = std::from_chars(cooperative, cooperative + std::strlen(cooperative), s.args.cooperative_chunks);
     if (parsed.ec != std::errc{} || *parsed.ptr != '\0')
       return Status::InvalidArgument("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer");
   }
+  s.args.first_chunk_divisor = s.args.cooperative_chunks ? 32U : 0U;
   const char* first = std::getenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
   if (first && *first) {
     const auto parsed = std::from_chars(first, first + std::strlen(first), s.args.first_chunk_divisor);

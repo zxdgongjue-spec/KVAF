@@ -71,15 +71,13 @@ def configured_chunk_bytes() -> int:
 
 
 def configured_cooperative_chunks() -> int:
-    value = os.environ.get("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "0") or "0"
+    default = "4" if configured_chunk_bytes() and TOKEN_BYTES * GATHER_SGL_SIZE <= 65536 else "0"
+    value = os.environ.get("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "") or default
     if not value.isascii() or not value.isdecimal():
         raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be an unsigned integer")
     count = int(value)
-    if configured_first_chunk_divisor():
-        if not 1 <= count <= 32:
-            raise ValueError("COOPERATIVE_CHUNKS must be 1..32 with FIRST_CHUNK_DIVISOR>=2")
-    elif count not in (0, 2, 4, 8, 16, 32):
-        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode")
+    if not 0 <= count <= 32:
+        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be in 0..32")
     return count
 
 
@@ -91,7 +89,8 @@ def configured_prepare_ahead() -> int:
 
 
 def configured_first_chunk_divisor() -> int:
-    value = os.environ.get("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "0") or "0"
+    default = "32" if configured_cooperative_chunks() else "0"
+    value = os.environ.get("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "") or default
     if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= (1 << 32) - 1 or int(value) == 1:
         raise ValueError("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR must be 0 or a uint32 >=2")
     return int(value)
@@ -127,6 +126,11 @@ def validate_config(cores: int) -> None:
     """Reject invalid shapes before allocating memory or connecting to the CPU."""
     cooperative = configured_cooperative_chunks()
     prepare = configured_prepare_ahead()
+    if configured_first_chunk_divisor():
+        if not cooperative:
+            raise ValueError("COOPERATIVE_CHUNKS must be 1..32 with FIRST_CHUNK_DIVISOR>=2")
+    elif cooperative not in (0, 2, 4, 8, 16, 32):
+        raise ValueError("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS must be 0/2/4/8/16/32 in equal mode")
     if cooperative and (not prepare or not configured_chunk_bytes()):
         raise ValueError("COOPERATIVE_CHUNKS requires PREPARE_AHEAD=1 and nonzero CHUNK_BYTES")
     configured_chunk_bytes()

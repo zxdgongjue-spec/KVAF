@@ -69,15 +69,18 @@ ready_bytes 仍只表示已完成的 payload。超时/停止会中止等待，�
 | 环境变量（前缀 `KVAF_AIV_GATHER_`） | 默认值及范围 |
 | --- | --- |
 | `CHUNK_BYTES` | 131072；0 关闭 CPU chunk 消费，其他值须为 uint32 范围内的 64 B 倍数。 |
-| `PREPARE_AHEAD` | 普通模式默认 0，协作模式默认 1；显式值只接受 0/1。 |
-| `COOPERATIVE_CHUNKS` | 0 关闭；均分模式接受 2/4/8/16/32；小首块模式表示后续块数 N，接受 1..32。 |
-| `FIRST_CHUNK_DIVISOR` | 0 关闭小首块；D≥2 且不超过 UINT32_MAX，首块取每 lane 实际 payload 的 1/D。 |
+| `PREPARE_AHEAD` | 默认协作模式下为 1；关闭协作分块后默认 0；显式值只接受 0/1。 |
+| `COOPERATIVE_CHUNKS` | 前缀流水默认 4；0 关闭；均分模式接受 2/4/8/16/32；小首块模式表示后续块数 N，接受 1..32。 |
+| `FIRST_CHUNK_DIVISOR` | 协作模式默认 32；关闭协作分块后默认 0；显式 0 选择均分块，D≥2 且不超过 UINT32_MAX 时首块取每 lane 实际 payload 的 1/D。 |
 | `COALESCE_SGES` | 0；1 开启上述合并，要求 token_bytes*SGL≤65536。 |
 | `CHECK_STATUS` | 1 恢复异步逐批状态回收和复用前检查；正式性能脚本拒绝该设置。 |
 | `PROBE` | 空值正常执行；ack/wqe/sq/first_read 仅用于同步诊断。 |
 
-默认是旧 GDR2、128 KiB byte-prefix、PREPARE_AHEAD=0、COOPERATIVE_CHUNKS=0。
+默认使用 GDR6，CHUNK_BYTES=131072、FIRST_CHUNK_DIVISOR=32、
+COOPERATIVE_CHUNKS=4、PREPARE_AHEAD=1，首块为每 lane payload 的 1/32，剩余分成四个尾块。
+设置 COOPERATIVE_CHUNKS=0 后，未显式设置的 FIRST_CHUNK_DIVISOR 和 PREPARE_AHEAD 自动取 0。
 `CHUNK_BYTES=0` 仍保留 AIV 内部 READ 流水，使用整批 ACK 就绪条件。
+整批 ACK、probe 和大 token 回退路径默认关闭协作块、小首块和预构建。
 prepare-ahead 可独立用于整批 ACK、普通 prefix 或协作 prefix。
 协作模式要求非零 CHUNK_BYTES 和 PREPARE_AHEAD=1，此时实际块大小覆盖 CHUNK_BYTES。
 

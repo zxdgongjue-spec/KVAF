@@ -338,6 +338,11 @@ int main() {
   unsetenv("KVAF_AIV_GATHER_PROBE");
   unsetenv("KVAF_AIV_GATHER_COALESCE_SGES");
   unsetenv("KVAF_AIV_GATHER_GRAPH");
+  unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
+  unsetenv("KVAF_AIV_GATHER_PREPARE_AHEAD");
+  // These cases exercise the ordinary prefix path explicitly.
+  setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", "0", 1);
+  setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "0", 1);
   // Keep strict status-failure coverage, now an explicit async diagnostic mode.
   setenv("KVAF_AIV_GATHER_CHECK_STATUS", "1", 1);
   AccessOperatorConfig config;
@@ -876,7 +881,7 @@ int main() {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", value, 1);
     auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
   }
-  unsetenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
+  setenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR", "0", 1);
   for (const char* count : {"1", "3", "24", "33", "64", "-2", "4x"}) {
     setenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS", count, 1);
     auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok());
@@ -889,5 +894,41 @@ int main() {
   { auto owner = CreateSequentialBatchGet(config); assert(!owner->Initialize(region).ok()); }
   unsetenv("KVAF_AIV_GATHER_CHUNK_BYTES");
   unsetenv("KVAF_AIV_GATHER_COOPERATIVE_CHUNKS");
+  unsetenv("KVAF_AIV_GATHER_FIRST_CHUNK_DIVISOR");
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->Execute(exec).ok());
+    assert(last_pipeline_chunk_bytes == 131072 && last_cooperative_chunks == 4);
+    assert(last_first_divisor == 32 && last_prepare_ahead == 1);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  for (const char* override : {"KVAF_AIV_GATHER_CHUNK_BYTES", "KVAF_AIV_GATHER_COOPERATIVE_CHUNKS"}) {
+    setenv(override, "0", 1);
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok() && owner->Execute(exec).ok());
+    assert(!last_cooperative_chunks && !last_first_divisor && !last_prepare_ahead);
+    assert(last_pipeline_chunk_bytes == (std::strcmp(override, "KVAF_AIV_GATHER_CHUNK_BYTES") ? 131072U : 0U));
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+    unsetenv(override);
+  }
+  setenv("KVAF_AIV_GATHER_PROBE", "ack", 1);
+  {
+    auto owner = CreateSequentialBatchGet(config);
+    assert(owner->Initialize(region).ok());
+    assert(owner->Execute(exec).code() == StatusCode::kNotImplemented);
+    assert(!last_pipeline_chunk_bytes && !last_cooperative_chunks && !last_prepare_ahead);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
+  unsetenv("KVAF_AIV_GATHER_PROBE");
+  {
+    config.batch_get_token_bytes = 65535;
+    auto owner = CreateSequentialBatchGet(config);
+    const auto result = owner->Initialize(region);
+    // The large-token fallback passes scheduling validation, then exceeds
+    // this fixture's 16-MiB remote workspace.
+    assert(result.code() == StatusCode::kInvalidArgument);
+    assert(result.message().find("remote DDR lacks reserved gather workspace") != std::string::npos);
+    assert(owner->Shutdown().ok() && !allocations && !refs);
+  }
   std::cout << "sequential Host lifecycle: PASS\n";
 }
