@@ -86,6 +86,7 @@ static Status DrainScatter(const aicpu_urma::ScatterLaunchView& view, aicpu_urma
       return call.failure = Status::Internal("CPU push worker " + std::to_string(w) + " result=" +
           std::to_string(statuses[w].result) + " sequence=" + std::to_string(statuses[w].sequence));
     }
+  call.completion_checked = true;
   return Status::OK();
 }
 CpuPushTransport::CpuPushTransport(Config config) : impl_(std::make_unique<Impl>(std::move(config))) {}
@@ -158,7 +159,7 @@ Status CpuPushTransport::PrepareGraph(const GetGraphOptions& options) {
   call.graph_start_sequence = coordination.claimed.value / s.config.workers;
   call.graph_stream = static_cast<aclrtStream>(options.stream);
   call.graph_active = true;
-  call.submitted = call.profile_submitted = call.profile_complete = false;
+  call.submitted = call.profile_submitted = call.profile_complete = call.completion_checked = false;
   call.last_stream = nullptr;
   return Status::OK();
 }
@@ -219,6 +220,7 @@ Status CpuPushTransport::FinishGraph(void* stream, bool discard) {
   call.profile_complete = call.profile_submitted && replayed;
   call.profile_submitted = call.profile_complete;
   call.prepared_capturing = call.submitted = false;
+  call.completion_checked = false;
   return Status::OK();
 }
 Status CpuPushTransport::Check(void* stream) {
@@ -227,6 +229,8 @@ Status CpuPushTransport::Check(void* stream) {
     return Status::InvalidState("no AICPU BatchGet has been submitted");
   if (stream != s.invocation->last_stream)
     return Status::InvalidArgument("check_batch_get_status requires the BatchGet execution stream");
+  if (!s.invocation->captured_stream && s.invocation->completion_checked && !s.health.failed)
+    return s.invocation->failure;
   s.invocation->pending = static_cast<aclrtStream>(stream);
   return s.Drain();
 }
@@ -375,10 +379,9 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec, std::optional<
     ready = s.Drain();
     if (!ready.ok()) return ready;
   }
-  KernelArgs checked{};
-  ready = detail::BuildBatchGetKernelArgs(exec, &checked.request);
+  ready = detail::BuildBatchGetKernelArgs(exec, &call.prepared_input);
   if (!ready.ok()) return ready;
-  if (checked.request.request_capacity > kMaxRequests || checked.request.token_bytes != s.config.token_bytes)
+  if (call.prepared_input.request_capacity > kMaxRequests || call.prepared_input.token_bytes != s.config.token_bytes)
     return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
   const auto bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
   if (exec.execution.profile || s.profiling) {
@@ -414,15 +417,11 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     return Status::InvalidState("Scatter resources were not prepared for this request");
   call.prepared = nullptr;
   const auto begin = call.prepare_started;
-  Status result;
 
   KernelArgs args{};
-  result = detail::BuildBatchGetKernelArgs(exec, &args.request);
+  args.request = call.prepared_input;
   args.request.canonical_base = view.common.region().canonical_base;
   args.request.logical_bytes = view.common.region().logical_bytes;
-  if (!result.ok()) return result;
-  if (args.request.request_capacity > kMaxRequests || args.request.token_bytes != view.options.token_bytes)
-    return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
   const auto profile_bytes = view.options.workers * sizeof(BatchGetWorkerProfile);
   args.workspace = detail::PointerValue(view.workspace);
   args.output = detail::PointerValue(exec.request->output.data);
@@ -432,6 +431,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  call.completion_checked = false;
   call.pending = call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0;
@@ -451,7 +451,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     view.health->failed = true; return call.failure = Error("enqueue profiling result");
   }
   if (profile) { const auto now = BatchGetProfileNowNs(); profile->status_enqueue_ns = now - stamp; stamp = now; }
-  result = DrainScatter(view, call);
+  auto result = DrainScatter(view, call);
   if (!result.ok()) return result;
   if (profile) {
     const auto now = BatchGetProfileNowNs(); profile->wait_ns = now - stamp; stamp = now;

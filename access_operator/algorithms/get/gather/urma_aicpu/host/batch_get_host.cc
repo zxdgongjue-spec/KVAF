@@ -83,7 +83,9 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
   call.pending = nullptr;
   if (!check_status || !call.submitted) return Status::OK();
   if (!call.failure.ok()) return call.failure;
-  return ValidateGather(view, call);
+  auto checked = ValidateGather(view, call);
+  call.completion_checked = checked.ok();
+  return checked;
 }
 
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
@@ -130,6 +132,7 @@ Status BatchGetTransport::Check(aclrtStream stream) {
     return Status::InvalidState("no AICPU BatchGet has been submitted");
   if (stream != call.last_stream)
     return InvalidArgument("check_batch_get_status requires the BatchGet execution stream");
+  if (!call.captured_stream && call.completion_checked) return call.failure;
   call.pending = stream;
   return impl_->Drain("check");
 }
@@ -168,7 +171,7 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
   call.graph_start_sequence = control.claimed / impl_->session.config().workers;
   call.graph_stream = static_cast<aclrtStream>(options.stream);
   call.graph_active = true;
-  call.submitted = call.profile_submitted = call.profile_complete = false;
+  call.submitted = call.profile_submitted = call.profile_complete = call.completion_checked = false;
   call.last_stream = nullptr;
   return Status::OK();
 }
@@ -217,6 +220,7 @@ Status BatchGetTransport::FinishGraph(void* stream, bool discard) {
   call.prepared_profile = nullptr;
   call.prepared_capturing = false;
   call.submitted = false;
+  call.completion_checked = false;
   call.profile_complete = call.profile_submitted && replay_completed;
   call.profile_submitted = call.profile_complete;
   return Status::OK();
@@ -346,13 +350,12 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
     auto drained = impl_->Drain("previous_request");
     if (!drained.ok()) return drained;
   }
-  UmdkBatchGetArgs checked{};
-  auto valid = BuildBatchGetKernelArgs(exec, &checked.request);
+  auto valid = BuildBatchGetKernelArgs(exec, &call.prepared_input);
   if (!valid.ok()) return valid;
-  if (checked.request.request_capacity > kGatherMaxRequests || checked.request.token_bytes != impl_->token_bytes)
+  if (call.prepared_input.request_capacity > kGatherMaxRequests || call.prepared_input.token_bytes != impl_->token_bytes)
     return InvalidArgument("UMDK BatchGet exceeds requests or configured token size");
   if (impl_->direct_addresses && (exec.request->access_table.opaque != 0U ||
-      checked.request.table_capacity < checked.request.request_capacity))
+      call.prepared_input.table_capacity < call.prepared_input.request_capacity))
     return InvalidArgument("invalid direct address request");
   const auto profile_bytes = impl_->session.config().workers * sizeof(BatchGetWorkerProfile);
   if (exec.execution.profile || impl_->profiling) {
@@ -401,20 +404,10 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   call.prepared = nullptr;
   const auto begin = call.prepare_started;
   UmdkBatchGetArgs launch{};
-  auto valid = BuildBatchGetKernelArgs(exec, &launch.request);
-  if (!valid.ok()) return valid;
+  launch.request = call.prepared_input;
   launch.request.canonical_base = view.common.region().canonical_base;
   launch.request.logical_bytes = view.common.region().logical_bytes;
-  if (launch.request.request_capacity > kGatherMaxRequests ||
-      launch.request.token_bytes != view.options.token_bytes)
-    return InvalidArgument("UMDK BatchGet exceeds 65536 requests or configured token size");
-  if (view.direct_addresses) {
-    if (exec.request->access_table.opaque != 0U)
-      return InvalidArgument("gather_read_direct requires the addresses Tensor overload");
-    if (launch.request.table_capacity < launch.request.request_capacity)
-      return InvalidArgument("direct addresses must cover the request capacity");
-    launch.request.indices = launch.request.offsets = 0U;
-  }
+  if (view.direct_addresses) launch.request.indices = launch.request.offsets = 0U;
   const auto workers = view.options.workers;
   const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
   const auto staging = view.remote_workspace.base;
@@ -436,6 +429,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.worker_count = view.options.workers;
   args.profile = (profile || view.profiling) ? PointerValue(view.profile.device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  call.completion_checked = false;
   call.pending = stream;
   call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;

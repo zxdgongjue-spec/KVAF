@@ -4,6 +4,7 @@
 #include <acl/acl.h>
 #include "access_operator.h"
 #include "execution_view.h"
+#include "get/common/aicpu/include/batch_get_abi.h"
 #include "aicpu_urma/control_abi.h"
 #include "aicpu_urma/session.h"
 
@@ -35,12 +36,14 @@ struct AicpuGetInvocation final : ExecutionState {
   aclrtStream captured_stream{}, last_stream{};
   bool prepared_capturing{false}, submitted{false}, profile_submitted{false};
   Status failure;
-  bool profile_complete{false};
+  bool profile_complete{false}, completion_checked{false};
   bool graph_active{false};
   aclrtStream graph_stream{};
   std::uint64_t graph_start_sequence{};
   std::unique_ptr<GetGraphReport> graph_completion, graph_profile;
   const BatchGetRequest* prepared{};
+  // Prepare/Launch share one immutable request and its validated input.
+  AicpuBatchGetInput prepared_input{};
   void* prepared_stream{};
   BatchGetProfile* prepared_profile{};
   std::uint64_t prepare_started{};
