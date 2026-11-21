@@ -502,6 +502,10 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request_.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
+    // No Python objects are accessed while the synchronous native transfer waits,
+    // so drop the GIL: a background Put on its own stream must not stall the
+    // thread that is driving compute and Get.
+    py::gil_scoped_release release;
     ThrowIfError(native_->core().BatchPut(
         batch_put_request_, BatchPutExecutionOptions{acl_stream}));
   }
@@ -823,6 +827,10 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("batch_get_tokens_per_block",
                              &NpuPythonRuntime::BatchGetTokensPerBlock)
       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
+      // batch_put already takes a stream, so a caller-managed side stream is
+      // enough to run the decode Put under compute; advertise that capability.
+      .def_property_readonly("supports_background_put",
+                             [](const NpuPythonRuntime&) { return true; })
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
            py::arg("stream") = py::none(),
