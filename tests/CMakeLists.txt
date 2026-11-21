@@ -1,4 +1,6 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME kvaf_batch_get_ranges_perf_host
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_ranges_perf.py")
 add_executable(kvaf_batch_get_ranges_runtime_test batch_get_ranges_runtime_test.cc)
 target_link_libraries(kvaf_batch_get_ranges_runtime_test PRIVATE kvaf_runtime)
 add_test(NAME kvaf_batch_get_ranges_runtime_test COMMAND kvaf_batch_get_ranges_runtime_test)
