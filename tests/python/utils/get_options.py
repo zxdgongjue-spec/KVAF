@@ -94,7 +94,9 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")
-    group.add_argument("--peer-ub-device", default="", help="CPU UB device; URMA backends only")
+    group.add_argument("--peer-ub-device", default="", metavar="DEVICE[,DEVICE...]",
+                       help="CPU UB device or ordered remote Direct Get FE list (URMA). "
+                            "Automatic remote FE count: KVAF_DEFAULT_PEER_FE_COUNT (default 2).")
     return group
 
 

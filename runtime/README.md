@@ -112,7 +112,7 @@ Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写
 其他地址判为远端。端口转发会改变可见对端。
 本机自动选择 NPU 的 `pair_info.remote_eid`，缺失或通道不唯一时使用该物理卡首个有效 CLOS；
 远端只使用 CLOS。显式 `npu_eids` 始终优先。本机且两侧均未固定 CPU 设备时，在已过滤的候选中匹配同一活动通道的
-`pair_info.local_eid`，未命中取首项。显式 CPU 设备优先，远端默认取候选首项。
+`pair_info.local_eid`，未命中取首项。显式 CPU 设备优先，远端 Put 和 AICPU 默认使用候选首项。
 `PEER_LINK_EID_SELECTED` 日志记录两端 EID、场景、物理卡号、CPU 候选及选择原因。
 新 NPU 客户端需要能返回原始候选 EID 的 CPU Service，滚动升级时先更新服务端。
 初始化建立 CacheRegion 和元数据；具体 transport、MR、队列、Gather 工作区及 AICPU
@@ -125,6 +125,24 @@ URMA AIV Jetty 数默认 2、URMA AIV Get 在途上限默认 2048。显式资源
 AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
+
+### 远端 A+K 的多 FE BatchGet
+
+远端 URMA AIV Direct Get 默认从 CPU service 公布的候选中，按顺序选择两个不同 UB device 的
+`eid_index=0`。在 NPU 进程设置 `KVAF_DEFAULT_PEER_FE_COUNT=1` 即可默认走单 FE，也可设置
+其他正整数。自动模式按可用设备数和总 Jetty 数收缩。服务端固定设备或 index 时尊重其选择。
+
+通过 Python 的 `peer_ub_device="devC,devA,devB"` 或测试入口的
+`--peer-ub-device devC,devA,devB` 可显式指定有序 FE 列表，覆盖环境变量。各设备必须有
+index 0，总 Jetty 数必须覆盖整个列表。单设备参数仍取该设备的首个候选，兼容非零 index。
+显式列表首项供 Put 和 AICPU 使用。本机链路和显式多个 NPU EID 的配置分别使用一个 CPU FE，
+同时指定多个 CPU FE 会返回错误。
+
+每个 FE 注册同一块 DDR。各 Jetty 按 `(core * jettys_per_core + slot) % active_fes` 选路，
+一次 Get 只提交一个 kernel。小 batch 可能只用到部分 Jetty。初始化后首次使用或 warmup
+时查看 `DIRECT_GET_FE_SELECTION` 和 `DIRECT_GET_FE` 核对数量、设备和 EID，再按
+`DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty。部署时同步更新 NPU host 库
+和 Direct Get kernel。多 FE 复用当前 CPU service 的 execution session 协议。
 
 ### 固定 UB device 后测量
 

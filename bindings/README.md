@@ -73,7 +73,10 @@ AICPU 首次准备时从 CANN 安装目录定位包，不接受资源项 kernel 
 元数据，不执行探测 Put 或启动带宽测速；算法及通信资源在首次使用或 warmup 时准备。
 `npu_eids=[]` 使用首个自动发现的候选；显式列表不回退到自动发现，AIV Get 按自身的
 `cores * jettys` 预算使用整组 EID 条带，Put/AICPU 使用首项。`peer_ub_device` 可固定
-CPU 侧设备。UBmem 不使用 EID，CPU 内存分配依赖 Ascend HAL 与驱动。
+CPU 侧设备。远端 URMA AIV Direct Get 默认选两个不同的 CPU FE，可在 NPU 进程设置
+`KVAF_DEFAULT_PEER_FE_COUNT=1` 改为一个，也可用 `peer_ub_device="devC,devA,devB"`
+按顺序显式选路。每次 `batch_get` 仍提交整个请求。详见[远端多 FE](../runtime/README.md#远端-ak-的多-fe-batchget)。
+UBmem 不使用 EID，CPU 内存分配依赖 Ascend HAL 与驱动。
 
 `batch_put(keys, packed_input, input_offsets, lengths, stream=None)` 接收调用方的
 NPU packed input 和每条 block 的 CPU 整数 metadata，同步写入及事务提交完成后返回。

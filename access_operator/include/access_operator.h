@@ -185,6 +185,8 @@ struct AccessOperatorConfig {
   std::vector<std::array<std::uint8_t, 16>> peer_local_eids{};
   std::shared_ptr<PeerLink> peer_link;
   bool enable_get{true};
+  // Ordered per-FE execution sessions for remote Direct Get. Empty uses peer_link.
+  std::vector<std::shared_ptr<PeerLink>> peer_get_links;
 };
 
 struct BatchGetKernelProfile {

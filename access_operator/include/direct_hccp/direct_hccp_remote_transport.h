@@ -102,6 +102,13 @@ static_assert(EidPathIndexForWorker(0U, 15U, 1U, 16U) == 15U);
 static_assert(EidPathIndexForWorker(0U, 32U, 1U, 64U) == 32U);
 static_assert(EidPathIndexForWorker(0U, 63U, 1U, 64U) == 63U);
 
+// Remote sessions are in CPU-device order. Continue the rotation across core boundaries.
+inline constexpr std::uint32_t GetPathForWorker(std::uint32_t worker, std::uint32_t cores,
+    std::uint32_t jettys_per_core, std::uint32_t local_paths, std::uint32_t remote_fes) {
+  if (remote_fes > 1) return worker % remote_fes;
+  return EidPathIndexForWorker(worker / jettys_per_core, worker % jettys_per_core, cores, local_paths);
+}
+
 // One peer channel is bound to one local AIV Jetty. Runtime has already
 // selected the local EID assigned to this worker; this adapter only creates
 // the transport resources required by that selected path.
@@ -136,7 +143,7 @@ bool GetPeerTp(const DirectHccpApi&, void* context,
 // only when populating the device entity.
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
                     UrmaRemoteMemoryDesc* memory,
-                    std::array<std::uint8_t, kEidBytes>* peer_eid);
+                    std::array<std::uint8_t, kEidBytes>* peer_eid = nullptr);
 
 bool ImportPeerJetty(const DirectHccpApi& api, void* context,
                      const std::uint8_t* peer_key, std::uint32_t peer_key_bytes,

@@ -252,7 +252,23 @@ struct NpuRuntime::Impl {
     q.put = !get;
     const auto budget = Resources(transport, executor, algorithm, get);
     ValidateProviderResources(transport, executor, algorithm, get, budget);
-    q.candidate = selected_candidate;
+    std::vector<peer::PeerCandidateInfo> candidates;
+    if (transport == Transport::Urma) {
+      if (get && executor == Executor::Aiv && algorithm == GetAlgorithm::Direct) {
+        const auto workers = static_cast<uint64_t>(budget.cores) * budget.jettys;
+        const auto s = cpu_fes.ForDirectGet(workers, &candidates);
+        if (!s.ok()) throw std::invalid_argument(s.message());
+        std::fprintf(stderr, "[KVAF] DIRECT_GET_FE_SELECTION requested=%u candidates=%zu active=%zu jettys=%llu\n",
+                     cpu_fes.requested_count, cpu_fes.direct_get.size(), candidates.size(),
+                     static_cast<unsigned long long>(workers));
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+          std::fprintf(stderr, "[KVAF] DIRECT_GET_FE path=%zu ub_device=%s eid_index=%u cpu_eid=%s\n",
+                       i, candidates[i].device_name.c_str(), candidates[i].eid_index,
+                       detail::EidToHex(candidates[i].eid).c_str());
+      } else {
+        candidates.push_back(cpu_fes.primary);
+      }
+    }
     q.workers = budget.cores;
     q.jettys = budget.jettys;
     q.request_capacity = budget.request_capacity;
@@ -262,9 +278,9 @@ struct NpuRuntime::Impl {
     const auto eids = ProviderEids(transport, executor, get, budget);
     if (!eids.empty()) q.local_eid = eids.front();
     return std::make_unique<SessionAccessOperator>(
-        peer_link, q,
-        [this, transport, executor, algorithm, get](std::shared_ptr<peer::PeerLink> link) {
-          return MakeLocalProvider(transport, executor, algorithm, get, std::move(link));
+        peer_link, q, std::move(candidates),
+        [this, transport, executor, algorithm, get](const PeerExecutionResources::Links& links) {
+          return MakeLocalProvider(transport, executor, algorithm, get, links);
         },
         budget.request_capacity);
   }
@@ -278,7 +294,8 @@ struct NpuRuntime::Impl {
   }
   std::unique_ptr<AccessOperator> MakeLocalProvider(Transport transport, Executor executor,
                                                     GetAlgorithm algorithm, bool get,
-                                                    std::shared_ptr<peer::PeerLink> link) {
+                                                    const PeerExecutionResources::Links& links) {
+    const auto& link = links.front();
     const auto budget = Resources(transport, executor, algorithm, get);
     const auto eids = ProviderEids(transport, executor, get, budget);
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -290,6 +307,7 @@ struct NpuRuntime::Impl {
     if (executor == Executor::Aiv) {
       AccessOperatorConfig c;
       c.peer_link = link;
+      if (links.size() > 1) c.peer_get_links = links;
       c.peer_local_eids = eids;
       c.peer_local_eid = eids.front();
       c.npu_core_count = budget.cores;
@@ -320,7 +338,7 @@ struct NpuRuntime::Impl {
   detail::AicpuKernelPackage kernel_package;
   std::mutex aicpu_package_mutex;
   bool aicpu_package_ready{false};
-  std::uint32_t selected_candidate = 0;
+  peer::CpuFeSelection cpu_fes;
   std::vector<detail::NpuEid> local_eids;
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
@@ -383,7 +401,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   // Keep the entire explicit EID list until the selected provider applies its
   // own routing and worker budget; the default Get must not choose that policy.
   impl_->local_eids.clear();
-  impl_->selected_candidate = 0;
+  impl_->cpu_fes = {};
   if (impl_->options.transport_mode != TransportMode::Ubmem) {
     peer::PeerCandidateTable table;
     auto status = impl_->peer_link->DiscoverCandidates(&table);
@@ -398,10 +416,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
       pair = detail::ReadDevicePair(physical_device);
     status = detail::SelectNpuEids(physical_device, options.npu_eids, pair, &impl_->local_eids);
     if (!status.ok()) return status;
-    peer::PeerCandidateInfo cpu;
-    status = impl_->peer_link->SelectCpuCandidate(table, options.peer_ub_device, pair.cpu, &cpu);
+    status = impl_->peer_link->SelectCpuFes(table, options.peer_ub_device, pair.cpu,
+                                           impl_->local_eids.size() > 1, &impl_->cpu_fes);
     if (!status.ok()) return status;
-    impl_->selected_candidate = cpu.candidate_id;
+    const auto& cpu = impl_->cpu_fes.primary;
     const char* reason = "first_candidate";
     if (!automatic_cpu) reason = "fixed_device";
     else if (table.local) reason = pair.cpu && *pair.cpu == cpu.eid ? "pair_match" : "pair_fallback";

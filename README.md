@@ -247,7 +247,8 @@ AIV/UBmem 的 `.o` 仍需显式传入，参数要求见下方 Python 调用说�
 其他后端不使用这两个 `--gather-*` 参数。服务启动后打印 `LISTEN`。
 按实际路由可增加 `--ub-device NAME --eid-index N`。
 CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
-NPU 端可通过 `--peer-ub-device NAME` 固定 CPU 设备，不执行 adaptive 启动选优。
+远端 A+K 的 URMA AIV Direct BatchGet 默认使用两个 CPU FE。NPU 端可用
+`KVAF_DEFAULT_PEER_FE_COUNT=1` 改为单 FE，或用 `--peer-ub-device devA,devB,devC` 指定设备顺序。
 初始化与首次使用的边界见 [Runtime](runtime/README.md)；两端需使用匹配产物。
 
 在 NPU 主机加载 CANN 环境、构建并安装设备包后，从仓库根目录运行：

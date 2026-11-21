@@ -9,6 +9,14 @@ target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(kvaf_multi_fe_kernel_test ../tests/aiv_model/multi_fe_batch_get.cc)
+  target_link_libraries(kvaf_multi_fe_kernel_test PRIVATE kvaf_access_operator)
+  target_include_directories(kvaf_multi_fe_kernel_test PRIVATE
+    ../tests/aiv_model algorithms/get/direct/urma_aiv/include algorithms/get/direct/urma_aiv/kernel)
+  add_test(NAME kvaf_multi_fe_kernel COMMAND kvaf_multi_fe_kernel_test)
+endif()
+
 if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA) AND NOT ASCEND_CANN_PACKAGE_PATH)
   if(DEFINED ENV{ASCEND_CANN_PACKAGE_PATH})
     set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_CANN_PACKAGE_PATH}")

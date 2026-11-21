@@ -224,7 +224,7 @@ bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
                     UrmaRemoteMemoryDesc* memory,
                     std::array<std::uint8_t, kEidBytes>* peer_eid) {
   PeerRegion region{};
-  if (link == nullptr || memory == nullptr || peer_eid == nullptr) return false;
+  if (link == nullptr || memory == nullptr) return false;
   const Status link_status = link->LookupRegion(peer_base, &region);
   if (!link_status.ok() || region.length == 0U || region.token_id == 0U || region.token_value == 0U ||
       region.segment_key_bytes == 0U || region.segment_key_bytes > kMemKeyBytes) {
@@ -251,7 +251,7 @@ bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
   memory->token_value = region.token_value;
   memory->key_bytes = region.segment_key_bytes;
   std::memcpy(memory->key.data(), region.segment_key.data(), memory->key_bytes);
-  std::memcpy(peer_eid->data(), region.eid.data(), peer_eid->size());
+  if (peer_eid) *peer_eid = region.eid;
   return true;
 }
 

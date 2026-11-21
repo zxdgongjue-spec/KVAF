@@ -39,6 +39,13 @@ int32_t KvafBatchGetTransportCreateWithPeerLinkMultiEid(
     uint32_t jettys_per_core, void *peer_link,
     const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
     KvafBatchGetTransport **transport);
+// Direct Get may stripe one local EID over several CPU FE sessions, or several
+// local EIDs over one CPU session. Each session binds the same logical DDR.
+int32_t KvafBatchGetTransportCreateWithPeerLinks(
+    void *host_ddr, uint64_t host_ddr_bytes, uint32_t aiv_core_count,
+    uint32_t jettys_per_core, void *const *peer_links, uint32_t peer_link_count,
+    const uint8_t *peer_local_eids, uint32_t peer_local_eid_count,
+    KvafBatchGetTransport **transport);
 // Caller must stop submitting work and synchronize kernel streams first.
 // SUCCESS destroys transport. Failure keeps its handles for Close retry; no
 // further acquisitions/launches are allowed after a close attempt.

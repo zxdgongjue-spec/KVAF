@@ -11,7 +11,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -406,12 +408,19 @@ Status PeerLink::AllocateCacheRegion(std::uint64_t bytes, std::uint64_t slot, st
   if (s.ok()) *out = execution_->reply.binding;
   return s;
 }
-std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& config) {
+std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& config,
+                                                     const PeerCandidateInfo* candidate) {
   auto child = std::make_shared<PeerLink>(address_);
   child->parent_ = shared_from_this();
   child->execution_ = std::make_shared<ExecutionState>();
   auto& q = child->execution_->create;
   q = config;
+  if (candidate) {
+    q.candidate = candidate->candidate_id;
+    child->selected_cpu_eid_ = candidate->eid;
+  } else if (config.transport == Transport::Urma) {
+    child->selected_cpu_eid_ = selected_cpu_eid_;
+  }
   q.op = execution::Op::OpenSession;
   q.client = ClientId();
   q.request = NextRequest();
@@ -447,8 +456,7 @@ Status PeerLink::PrepareExecution() {
                    state.reply.slot_size != parent_->execution_->reply.slot_size ||
                    b.length != parent_->execution_->reply.binding.length)))
     return Status::Internal("execution identity or binding differs from negotiated region");
-  if (parent_ && state.create.transport == Transport::Urma && parent_->selected_cpu_eid_ &&
-      b.eid != *parent_->selected_cpu_eid_)
+  if (selected_cpu_eid_ && b.eid != *selected_cpu_eid_)
     return Status::InvalidState("registered CPU EID differs from the selected candidate");
   const auto canonical =
       parent_ ? parent_->execution_->reply.binding.base : state.reply.binding.base;
@@ -580,24 +588,117 @@ Status PeerLink::DiscoverCandidates(PeerCandidateTable* table) {
   return Status::OK();
 }
 
+namespace {
+Status ParseDevices(const std::string& csv, std::vector<std::string>* devices) {
+  if (csv.empty()) return Status::OK();
+  std::size_t start = 0;
+  for (;;) {
+    const auto end = csv.find(',', start);
+    auto name = csv.substr(start, end - start);
+    const char* spaces = " \t\r\n";
+    const auto first = name.find_first_not_of(spaces);
+    if (first == std::string::npos)
+      return Status::InvalidArgument("empty device in peer_ub_device");
+    name = name.substr(first, name.find_last_not_of(spaces) - first + 1);
+    if (std::find(devices->begin(), devices->end(), name) != devices->end())
+      return Status::InvalidArgument("duplicate UB device in peer_ub_device: " + name);
+    devices->push_back(std::move(name));
+    if (end == std::string::npos) return Status::OK();
+    start = end + 1;
+  }
+}
+
+Status DefaultFeCount(uint32_t* count) {
+  constexpr uint32_t kDefaultPeerFeCount = 2;
+  *count = kDefaultPeerFeCount;
+  const char* value = std::getenv("KVAF_DEFAULT_PEER_FE_COUNT");
+  if (!value) return Status::OK();
+  const char* end = value + std::strlen(value);
+  const auto parsed = std::from_chars(value, end, *count);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !*count)
+    return Status::InvalidArgument("KVAF_DEFAULT_PEER_FE_COUNT must be a positive uint32");
+  return Status::OK();
+}
+}  // namespace
+
+Status PeerLink::SelectCpuFes(const PeerCandidateTable& table, const std::string& csv,
+                              const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
+                              bool multiple_local_eids, CpuFeSelection* selected) const {
+  if (!selected || !table.count) return Status::InvalidArgument("empty CPU candidate selection");
+  std::vector<std::string> devices;
+  auto status = ParseDevices(csv, &devices);
+  if (!status.ok()) return status;
+  if (devices.size() > 1 && (table.local || multiple_local_eids))
+    return Status::InvalidArgument("multiple peer UB devices require a remote CPU and one local NPU EID");
+
+  CpuFeSelection result;
+  result.explicit_devices = !devices.empty();
+  const bool automatic_multi = devices.empty() && !table.local && !table.device_fixed && !multiple_local_eids;
+  const bool match_pair = devices.empty() && table.local && !table.device_fixed && pair_cpu_eid;
+  result.requested_count = devices.empty() ? 1U : static_cast<uint32_t>(devices.size());
+  if (automatic_multi) {
+    status = DefaultFeCount(&result.requested_count);
+    if (!status.ok()) return status;
+  }
+  // Slots preserve the caller's order even when the service enumerates in a different order.
+  result.direct_get.resize(devices.size());
+  std::size_t found = 0;
+  for (uint32_t index = 0; index < table.count; ++index) {
+    PeerCandidateInfo info;
+    status = GetCandidateInfo(index, &info);
+    if (!status.ok()) return status;
+    if (info.device_id >= table.device_count) return Status::Internal("invalid CPU device index");
+    if (!index) result.primary = info;
+    if (!devices.empty()) {
+      // Legacy single-device pin accepts the first advertised index, including a service pin.
+      if (devices.size() > 1 && info.eid_index != 0) continue;
+      const auto it = std::find(devices.begin(), devices.end(), info.device_name);
+      if (it == devices.end()) continue;
+      auto& slot = result.direct_get[it - devices.begin()];
+      if (slot.device_name.empty()) {
+        slot = std::move(info);
+        ++found;
+      }
+      if (found == devices.size()) break;
+    } else if (automatic_multi) {
+      // Candidates are ordered by device and index by the CPU service.
+      if (info.eid_index == 0 && (result.direct_get.empty() ||
+                                  result.direct_get.back().device_id != info.device_id))
+        result.direct_get.push_back(info);
+      if (result.direct_get.size() == result.requested_count) break;
+    } else if (!match_pair || info.eid == *pair_cpu_eid) {
+      result.primary = info;
+      break;
+    }
+  }
+  for (std::size_t i = 0; i < devices.size(); ++i)
+    if (result.direct_get[i].device_name.empty())
+      return Status::NotFound("CPU service did not advertise requested UB device " + devices[i] +
+                              (devices.size() > 1 ? " with eid_index=0" : ""));
+  if (!automatic_multi && devices.empty()) result.direct_get.push_back(result.primary);
+  if (result.explicit_devices) result.primary = result.direct_get.front();
+  *selected = std::move(result);
+  return Status::OK();
+}
+
+Status CpuFeSelection::ForDirectGet(uint64_t workers, std::vector<PeerCandidateInfo>* active) const {
+  if (!active) return Status::InvalidArgument("missing Direct Get FE selection output");
+  if (direct_get.empty()) return Status::NotFound("no advertised CPU UB device with eid_index=0");
+  if (!workers || (explicit_devices && direct_get.size() > workers))
+    return Status::InvalidArgument("Direct Get has " + std::to_string(workers) +
+        " Jetty workers for " + std::to_string(direct_get.size()) + " peer UB devices");
+  active->assign(direct_get.begin(), direct_get.begin() + std::min<uint64_t>(workers, direct_get.size()));
+  return Status::OK();
+}
+
 Status PeerLink::SelectCpuCandidate(const PeerCandidateTable& table, const std::string& device,
                                     const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
                                     PeerCandidateInfo* selected) {
-  if (!selected || !table.count) return Status::InvalidArgument("empty CPU candidate selection");
-  const bool match_pair = table.local && device.empty() && !table.device_fixed && pair_cpu_eid;
-  for (uint32_t index = 0; index < table.count; ++index) {
-    PeerCandidateInfo info;
-    auto status = GetCandidateInfo(index, &info);
-    if (!status.ok()) return status;
-    if (info.device_id >= table.device_count) return Status::Internal("invalid CPU device index");
-    if (!index) *selected = info;
-    if (!device.empty() && info.device_name != device) continue;
-    if (match_pair && info.eid != *pair_cpu_eid) continue;
-    *selected = std::move(info);
-    break;
-  }
-  if (!device.empty() && selected->device_name != device)
-    return Status::NotFound("CPU service did not advertise requested UB device " + device);
+  if (!selected) return Status::InvalidArgument("missing CPU candidate selection output");
+  CpuFeSelection selection;
+  auto status = SelectCpuFes(table, device, pair_cpu_eid, true, &selection);
+  if (!status.ok()) return status;
+  *selected = std::move(selection.primary);
   selected_cpu_eid_ = selected->eid;
   return Status::OK();
 }

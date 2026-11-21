@@ -33,7 +33,8 @@ struct NpuRuntimeOptions : ExecutionPolicy {
   // remains on the first EID. AICPU uses a single EID. AIV Get validates this
   // list against its own resource budget when that provider is first prepared.
   std::vector<std::string> npu_eids{};
-  // Optional strict K-side UB device. No startup bandwidth tuning is run.
+  // A device name pins the peer. An ordered CSV selects remote Direct Get FEs.
+  // Empty selects automatically; KVAF_DEFAULT_PEER_FE_COUNT controls remote Get.
   std::string peer_ub_device{};
 };
 
