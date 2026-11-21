@@ -38,6 +38,13 @@ def parse_args(argv=None, *, mode="gather_read"):
                         "0 disables the barrier. Populate and warmup still happen "
                         "before it, so concurrent runs overlap for the whole "
                         "measured window instead of drifting apart.")
+    p.add_argument("--go-file", default="",
+                   help="wait for this path to appear after warmup, then measure. A "
+                        "fixed epoch cannot cover uneven startup; this handshake can")
+    p.add_argument("--no-verify", action="store_true",
+                   help="skip building and comparing the full expected output each "
+                        "round; the round then costs the kernel plus fill only, so "
+                        "device duty cycle stays near 100 percent")
     a = p.parse_args(argv)
     if not 1 <= a.workers <= 8 or not 0 <= a.miss_count <= 65536:
         p.error("workers must be in 1..8 and miss_count in 0..65536")
@@ -183,10 +190,12 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
     def run_round(count, profile=False):
         indices, offsets, rows = create_request_plan(torch, a, length, device)
         miss_count = torch.tensor([count], dtype=torch.int32, device=device)
-        expected = torch.full_like(output, 0xA5)
-        if count:
-            token_ids = indices[:count].to(torch.int64) * a.tokens_per_block + offsets[:count].to(torch.int64) // a.token_bytes
-            expected.index_copy_(0, rows[:count].to(torch.int64), token_pattern(torch, token_ids, byte_ids))
+        expected = None
+        if not a.no_verify:
+            expected = torch.full_like(output, 0xA5)
+            if count:
+                token_ids = indices[:count].to(torch.int64) * a.tokens_per_block + offsets[:count].to(torch.int64) // a.token_bytes
+                expected.index_copy_(0, rows[:count].to(torch.int64), token_pattern(torch, token_ids, byte_ids))
         output.fill_(0xA5)
         inputs = (device_table, indices, offsets, miss_count, rows, output)
         stream.synchronize()
@@ -195,7 +204,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         # Auxiliary Python duration; headline metrics use the kernel profile span.
         elapsed_us = (time.perf_counter_ns() - begin) / 1000
         # NPU comparison consumes BatchGet results and checks every row, including untouched rows.
-        if not torch.equal(output, expected):
+        if not a.no_verify and not torch.equal(output, expected):
             raise AssertionError(f"{mode} output mismatch: miss_count={count}, workers={a.workers}")
         if profile:
             measured["python_call_us"] = elapsed_us
@@ -223,7 +232,11 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         for _ in range(a.warmup):
             run_round(a.miss_count, profile=True)
         profiles.clear()
-        if a.start_epoch:
+        if a.go_file:
+            print(f"{prefix}_READY waiting_for={a.go_file}", flush=True)
+            while not os.path.exists(a.go_file):
+                time.sleep(0.002)
+        elif a.start_epoch:
             print(f"{prefix}_BARRIER_READY now={time.time():.3f} start={a.start_epoch:.3f}",
                   flush=True)
             while time.time() < a.start_epoch:
