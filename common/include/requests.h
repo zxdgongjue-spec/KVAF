@@ -41,11 +41,31 @@ struct AccessTableView {
 struct AccessTableDeviceView {
   ConstBufferView addresses;
   ConstBufferView valid;
+  // Optional for legacy fixed-token Get; required by range Get (uint64[N]).
+  ConstBufferView lengths;
 
   bool empty() const {
     return addresses.data == nullptr && addresses.bytes == 0 &&
-           valid.data == nullptr && valid.bytes == 0;
+           valid.data == nullptr && valid.bytes == 0 &&
+           lengths.data == nullptr && lengths.bytes == 0;
   }
+};
+
+// Byte ranges within committed objects. Integer arrays are int64[R], indices
+// int32[R], request_count int32[1]. Only the active prefix is consumed. Output
+// intervals must not overlap; callers retain every buffer through completion.
+struct BatchGetRangesRequest {
+  AccessTableHandle access_table;
+  ConstBufferView indices;
+  ConstBufferView source_offsets;
+  ConstBufferView lengths;
+  ConstBufferView request_count;
+  ConstBufferView output_offsets;
+  MutableBufferView output;
+  AccessTableDeviceView device_access_table;
+  // AIV physical READ size policy, in bytes. Zero adds no software split
+  // below the uint32 WQE length limit. Caller must respect device limits.
+  std::uint32_t read_chunk_bytes{0};
 };
 
 struct BatchGetRequest {
@@ -109,6 +129,12 @@ struct BatchGetExecRequest {
   // 直接传入 NPU addresses/valid Tensor 时 Host view 可为空。
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
+  BatchGetExecutionOptions execution;
+};
+
+struct BatchGetRangesExecRequest {
+  AccessTableView host_access_table;
+  const BatchGetRangesRequest* request{nullptr};
   BatchGetExecutionOptions execution;
 };
 

@@ -14,6 +14,7 @@
 #include "batch_get_abi.h"
 #include "kvaf_aiv_batch_get.h"
 #include "meta_manager.h"
+#include "aicpu_batch_get_capture.h"
 
 #if defined(KVAF_ENABLE_AIV_BATCH_PUT)
 #include "batch_put_abi.h"
@@ -295,6 +296,39 @@ struct DefaultAccessOperator::Impl {
   BatchPutExecutionState batch_put_execution;
 #endif
   bool initialized{false};
+  aclrtStream range_stream{nullptr};
+  bool range_pending{false};
+  Status range_status;
+
+  Status FinishRanges(bool check) {
+    if (range_pending) {
+      if (aclrtSynchronizeStream(range_stream) != ACL_SUCCESS)
+        return Internal("range Get stream synchronization failed; resources retained");
+      range_pending = false;
+      if (check && range_status.ok()) {
+        std::vector<KvafBatchGetCoreStatus> statuses(config.npu_core_count);
+        if (aclrtMemcpy(statuses.data(), statuses.size() * sizeof(statuses[0]),
+                        execution.status, execution.status_bytes,
+                        ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
+          return range_status = Internal("failed to read range Get completion status");
+        for (std::size_t core = 0; core < statuses.size(); ++core) {
+          const auto& s = statuses[core];
+          if (s.magic != KVAF_AIV_BATCH_GET_STATUS_MAGIC || s.result) {
+            const auto message = "range Get failed: core=" + std::to_string(core) +
+                " result=" + std::to_string(s.result) +
+                " request=" + std::to_string(s.failed_request_index);
+            // Device codes 1/4/8 are argument/lookup/output errors. Transport
+            // errors poison queues and require Runtime reconstruction.
+            range_status = (s.magic == KVAF_AIV_BATCH_GET_STATUS_MAGIC &&
+                            (s.result == 1 || s.result == 4 || s.result == 8))
+                ? InvalidArgument(message) : Internal(message);
+            break;
+          }
+        }
+      }
+    }
+    return check ? range_status : Status::OK();
+  }
 };
 
 DefaultAccessOperator::DefaultAccessOperator(AccessOperatorConfig config)
@@ -457,6 +491,8 @@ Status DefaultAccessOperator::Shutdown() {
   if (!impl_->initialized) {
     return Status::OK();
   }
+  const auto drained = impl_->FinishRanges(false);
+  if (!drained.ok()) return drained;
 
   // Callers must complete all submitted streams before Runtime::Shutdown,
   // including the default enqueue-only Python BatchGet path.
@@ -479,11 +515,17 @@ Status DefaultAccessOperator::Shutdown() {
   impl_->transport = nullptr;
   impl_->execution = BatchGetExecutionState{};
   impl_->remote_region = RemoteRegionDesc{};
+  impl_->range_stream = nullptr;
+  impl_->range_status = Status::OK();
   impl_->initialized = false;
   return Status::OK();
 }
 
 Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
+  if (impl_->range_pending) {
+    const auto drained = impl_->FinishRanges(true);
+    if (!drained.ok()) return drained;
+  }
   if (!impl_->initialized || impl_->transport == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
@@ -532,7 +574,79 @@ Status DefaultAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   return Status::OK();
 }
 
+Status DefaultAccessOperator::ExecuteBatchGetRanges(const BatchGetRangesExecRequest& exec) {
+  if (!impl_->initialized || !impl_->transport)
+    return Status::NotInitialized("range Get requires an initialized AIV URMA operator");
+  if (!exec.request || !exec.execution.stream || exec.execution.profile)
+    return InvalidArgument("range Get requires a stream; stage profiling is not supported");
+  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  bool capturing = false;
+  const auto capture = detail::BatchGetCapture(stream, false, false, &capturing);
+  if (!capture.ok()) return capture;
+  if (capturing) return Status::NotImplemented("range Get currently supports eager execution only");
+  if (impl_->range_pending) {
+    const auto drained = impl_->FinishRanges(true);
+    if (!drained.ok()) return drained;
+  }
+  const auto& r = *exec.request;
+  const auto& t = r.device_access_table;
+  const auto requests = r.indices.bytes / sizeof(std::int32_t);
+  const auto entries = t.addresses.bytes / sizeof(Address);
+  if (requests > INT32_MAX || entries > UINT32_MAX)
+    return InvalidArgument("range Get dimensions exceed the AIV ABI");
+  KvafExecuteBatchGetRangesKernelArgs a{};
+  a.address_table = PointerValue(t.addresses.data);
+  a.valid_table = PointerValue(t.valid.data);
+  a.table_lengths = PointerValue(t.lengths.data);
+  a.indices = PointerValue(r.indices.data);
+  a.source_offsets = PointerValue(r.source_offsets.data);
+  a.lengths = PointerValue(r.lengths.data);
+  a.request_count = PointerValue(r.request_count.data);
+  a.output_offsets = PointerValue(r.output_offsets.data);
+  a.output = PointerValue(r.output.data);
+  a.core_status = PointerValue(impl_->execution.status);
+  a.queue_state = PointerValue(impl_->execution.queue_state);
+  a.table_capacity = static_cast<std::uint32_t>(entries);
+  a.request_capacity = static_cast<std::uint32_t>(requests);
+  a.block_count = impl_->config.npu_core_count;
+  a.jettys_per_core = impl_->config.jettys_per_core;
+  a.max_inflight_total = impl_->config.batch_get_max_inflight_total;
+  a.read_chunk_bytes = r.read_chunk_bytes;
+  KvafBatchGetLocalBuffer* buffer = nullptr;
+  if (KvafBatchGetLocalBufferAcquire(impl_->transport, r.output.data, r.output.bytes,
+                                    &buffer, &a.channel_entity) != KVAF_BATCH_GET_SUCCESS ||
+      buffer == nullptr || a.channel_entity == 0)
+    return Internal("failed to register range Get output");
+  // A missing/unwritten status cannot be mistaken for a successful prior call.
+  const auto cleared = aclrtMemsetAsync(impl_->execution.status, impl_->execution.status_bytes,
+                                      0xff, impl_->execution.status_bytes, stream);
+  // Even a failed launch may leave the status reset enqueued. Track that work
+  // so shutdown cannot free status memory before the stream has drained.
+  impl_->range_stream = stream;
+  impl_->range_pending = true;
+  impl_->range_status = Status::OK();
+  const auto launched = cleared == ACL_SUCCESS ? KvafExecuteBatchGetRangesLaunch(&a, stream)
+                                               : KVAF_BATCH_GET_RUNTIME_ERROR;
+  KvafBatchGetLocalBufferRelease(buffer);  // transport retains cached registration
+  if (launched != KVAF_BATCH_GET_SUCCESS)
+    return impl_->range_status = Internal(
+        "failed to launch range Get; rebuild matching Host/kernel binaries");
+  return exec.execution.synchronize ? impl_->FinishRanges(true) : Status::OK();
+}
+
+Status DefaultAccessOperator::CheckBatchGetRangesStatus(void* stream) {
+  if (!impl_->initialized || !impl_->range_stream)
+    return Status::InvalidState("no AIV range Get has been submitted");
+  if (stream != impl_->range_stream)
+    return InvalidArgument("range Get status requires its execution stream");
+  return impl_->FinishRanges(true);
+}
+
 Status DefaultAccessOperator::SetBatchGetKernelProfiling(bool enabled) {
+  if (impl_->range_pending) {
+    const auto drained = impl_->FinishRanges(true);
+    if (!drained.ok()) return drained;
+  }
   if (!impl_->initialized || impl_->execution.status == nullptr) {
     return Status::Error(StatusCode::kNotInitialized,
                          "AccessOperator has not been initialized");
@@ -621,6 +735,10 @@ Status DefaultAccessOperator::CopyBatchGetKernelProfiles(
 }
 
 Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
+  if (impl_->range_pending) {
+    const auto drained = impl_->FinishRanges(true);
+    if (!drained.ok()) return drained;
+  }
   if (!impl_->initialized) {
     return Status::NotInitialized("AccessOperator has not been initialized");
   }
@@ -638,6 +756,10 @@ Status DefaultAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
     const std::uint64_t offset = exec.request->input_offsets[index];
     const std::uint64_t length = exec.request->lengths[index];
     const PutAllocation& destination = exec.put_desc->entries[index];
+#if defined(KVAF_ENABLE_AIV_BATCH_PUT)
+    if (impl_->batch_put_transport != nullptr && length > UINT32_MAX)
+      return InvalidArgument("AIV BatchPut packet exceeds its 32-bit WQE length; split the packet");
+#endif
     if (length == 0 || offset > exec.request->input.bytes ||
         length > exec.request->input.bytes - offset ||
         exec.request->input.device != DeviceKind::kNpu ||

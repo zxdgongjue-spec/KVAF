@@ -135,7 +135,21 @@ typedef struct KvafExecuteBatchGetKernelArgs {
   uint32_t batch_get_max_inflight_total;
 } KvafExecuteBatchGetKernelArgs;
 
+// Separate entry/ABI: legacy V2 layout and its fixed-token fast path stay intact.
+// All byte offsets/lengths are signed int64; only request_count's prefix is read.
+typedef struct KvafExecuteBatchGetRangesKernelArgs {
+  uint64_t address_table, valid_table, table_lengths;
+  uint64_t indices, source_offsets, lengths, request_count, output_offsets;
+  uint64_t output, core_status, channel_entity, queue_state;
+  uint32_t table_capacity, request_capacity, block_count, jettys_per_core;
+  uint32_t max_inflight_total;
+  // Zero: no artificial splitting; uint32 WQE length remains the ceiling.
+  uint32_t read_chunk_bytes;
+} KvafExecuteBatchGetRangesKernelArgs;
+
 #if defined(__cplusplus)
+static_assert(sizeof(KvafExecuteBatchGetRangesKernelArgs) == 120,
+              "range Get ABI changed");
 static_assert(sizeof(KvafBatchGetCoreStatus) == KVAF_AIV_BATCH_GET_STATUS_BYTES,
               "KvafBatchGetCoreStatus ABI changed");
 static_assert(sizeof(KvafBatchGetCoreProfile) == 1152,

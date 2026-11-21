@@ -27,6 +27,10 @@ namespace {
 
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
+  if (status.code() == StatusCode::kNotImplemented) {
+    PyErr_SetString(PyExc_NotImplementedError, status.message().c_str());
+    throw py::error_already_set();
+  }
   const std::string message = status.message().empty()
                                   ? "KVAF NPU operation failed"
                                   : status.message();
@@ -186,17 +190,20 @@ void CopyCpuUint64SequenceInto(const py::object& values, const char* name,
 class DeviceAccessTable final {
  public:
   DeviceAccessTable(AccessTableHandle source, py::object addresses,
-                    py::object valid)
-      : source_(source), addresses_(std::move(addresses)), valid_(std::move(valid)) {}
+                    py::object valid, py::object lengths)
+      : source_(source), addresses_(std::move(addresses)), valid_(std::move(valid)),
+        lengths_(std::move(lengths)) {}
 
   const AccessTableHandle& source() const { return source_; }
   py::object addresses() const { return addresses_; }
   py::object valid() const { return valid_; }
+  py::object lengths() const { return lengths_; }
 
  private:
   AccessTableHandle source_;
   py::object addresses_;
   py::object valid_;
+  py::object lengths_;
 };
 
 aclrtStream ResolveStream(const py::object& stream) {
@@ -397,8 +404,12 @@ class NpuPythonRuntime final {
     py::object valid = torch.attr("empty")(
         py::make_tuple(capacity), py::arg("dtype") = torch.attr("uint8"),
         py::arg("device") = npu_device);
+    py::object lengths = torch.attr("empty")(
+        py::make_tuple(capacity), py::arg("dtype") = torch.attr("int64"),
+        py::arg("device") = npu_device);
     const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
     const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+    const NpuTensorView length_view = GetNpuTensorView(lengths, "lengths");
     if (address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         address_view.bytes < capacity * sizeof(Address) ||
@@ -408,6 +419,9 @@ class NpuPythonRuntime final {
     ThrowIfAclError(aclrtMemset(valid_view.data, valid_view.bytes, 0,
                                  valid_view.bytes),
                     "aclrtMemset NPU AccessTable valid");
+    ThrowIfAclError(aclrtMemset(length_view.data, length_view.bytes, 0,
+                                 length_view.bytes),
+                    "aclrtMemset NPU AccessTable lengths");
     ThrowIfAclError(
         aclrtMemcpy(address_view.data, address_view.bytes,
                     const_cast<Address*>(view.addresses),
@@ -418,8 +432,13 @@ class NpuPythonRuntime final {
                     const_cast<std::uint8_t*>(view.valid), view.size,
                     ACL_MEMCPY_HOST_TO_DEVICE),
         "aclrtMemcpy NPU AccessTable valid");
+    ThrowIfAclError(
+        aclrtMemcpy(length_view.data, length_view.bytes,
+                    const_cast<std::uint64_t*>(view.lengths),
+                    view.size * sizeof(std::uint64_t), ACL_MEMCPY_HOST_TO_DEVICE),
+        "aclrtMemcpy NPU AccessTable lengths");
     return py::cast(DeviceAccessTable{handle, std::move(addresses),
-                                      std::move(valid)});
+                                      std::move(valid), std::move(lengths)});
   }
 
   void ReleaseAccessTable(const AccessTableHandle& handle) {
@@ -522,6 +541,45 @@ class NpuPythonRuntime final {
                  output_indices, output, stream, synchronize, profile);
   }
 
+  void BatchGetRanges(const DeviceAccessTable& table, const py::object& indices,
+                      const py::object& source_offsets, const py::object& lengths,
+                      const py::object& request_count, const py::object& output_offsets,
+                      const py::object& output, const py::object& stream,
+                      bool synchronize, bool profile, std::int64_t read_chunk_bytes) {
+    if (profile) throw py::value_error("range Get does not support stage profiling");
+    if (read_chunk_bytes < 0 || static_cast<std::uint64_t>(read_chunk_bytes) > UINT32_MAX)
+      throw py::value_error("read_chunk_bytes must be in [0, UINT32_MAX]; 0 disables software splitting");
+    const std::string device = "npu:" + std::to_string(native_->device_id());
+    auto tensor = [&](const py::object& value, const char* name, const char* dtype) {
+      const auto view = GetNpuTensorView(value, name);
+      if (view.shape.size() != 1 || py::str(value.attr("dtype")).cast<std::string>() != dtype ||
+          py::str(value.attr("device")).cast<std::string>() != device)
+        throw py::value_error(std::string(name) + " must be a 1D " + dtype + " Tensor on " + device);
+      return view;
+    };
+    const auto i = tensor(indices, "indices", "torch.int32");
+    const auto s = tensor(source_offsets, "source_offsets", "torch.int64");
+    const auto l = tensor(lengths, "lengths", "torch.int64");
+    const auto c = tensor(request_count, "request_count", "torch.int32");
+    const auto d = tensor(output_offsets, "output_offsets", "torch.int64");
+    const auto o = tensor(output, "output", "torch.uint8");
+    const auto a = tensor(table.addresses(), "addresses", "torch.int64");
+    const auto v = tensor(table.valid(), "valid", "torch.uint8");
+    const auto z = tensor(table.lengths(), "table lengths", "torch.int64");
+    auto buffer = [](const NpuTensorView& t) {
+      return ConstBufferView{t.data, t.bytes, DeviceKind::kNpu};
+    };
+    const BatchGetRangesRequest request{table.source(), buffer(i), buffer(s), buffer(l),
+        buffer(c), buffer(d), {o.data, o.bytes, DeviceKind::kNpu},
+        {buffer(a), buffer(v), buffer(z)}, static_cast<std::uint32_t>(read_chunk_bytes)};
+    ThrowIfError(native_->core().BatchGetRanges(
+        request, {ResolveStream(stream), synchronize, nullptr}));
+  }
+
+  void CheckBatchGetRangesStatus(const py::object& stream) {
+    ThrowIfError(native_->core().CheckBatchGetRangesStatus(ResolveStream(stream)));
+  }
+
  private:
   py::object BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
@@ -616,12 +674,22 @@ void BindNpuPythonRuntime(py::module_& module) {
   py::class_<DeviceAccessTable>(module, "DeviceAccessTable")
       .def_property_readonly("addresses", &DeviceAccessTable::addresses)
       .def_property_readonly("valid", &DeviceAccessTable::valid)
+      .def_property_readonly("lengths", &DeviceAccessTable::lengths)
       .def_property_readonly("source_id", [](const DeviceAccessTable& table) {
         return table.source().opaque;
       });
 
   auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
   python_binding::BindNpuRuntimeConstructor(runtime);
+  runtime.def("batch_get_ranges", &NpuPythonRuntime::BatchGetRanges,
+      py::arg("device_access_table"), py::arg("indices"), py::arg("source_offsets"),
+      py::arg("lengths"), py::arg("request_count"), py::arg("output_offsets"),
+      py::arg("output"), py::arg("stream") = py::none(),
+      py::arg("synchronize") = false, py::arg("profile") = false,
+      py::kw_only(), py::arg("read_chunk_bytes") = 0,
+      "Read variable byte ranges on AIV URMA. Caller owns Tensor lifetimes and disjoint output ranges.")
+      .def("check_batch_get_ranges_status", &NpuPythonRuntime::CheckBatchGetRangesStatus,
+           py::arg("stream") = py::none(), "Wait and check the latest range Get on its execution stream.");
   runtime.def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Connect this NPU Runtime to a CPU Runtime service before initialize.")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"),

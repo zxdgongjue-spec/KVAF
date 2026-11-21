@@ -38,6 +38,13 @@ class AccessOperator {
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
+  virtual Status ExecuteBatchGetRanges(const BatchGetRangesExecRequest&) {
+    return Status::NotImplemented("range Get is not implemented by this backend");
+  }
+  virtual Status CheckBatchGetRangesStatus(void*) {
+    return Status::NotImplemented("range Get status is not implemented by this backend");
+  }
+
 };
 
 // Configuration for the current NPU-backed default implementation. Transport
@@ -121,6 +128,8 @@ class DefaultAccessOperator final : public AccessOperator {
   Status Shutdown() override;
   Status ExecuteBatchGet(const BatchGetExecRequest& request) override;
   Status ExecuteBatchPut(const BatchPutExecRequest& request) override;
+  Status ExecuteBatchGetRanges(const BatchGetRangesExecRequest& request) override;
+  Status CheckBatchGetRangesStatus(void* stream) override;
 
   // Profiling is opt-in and uses the reserved per-core status area. Callers
   // must complete the BatchGet stream before copying the latest snapshot.

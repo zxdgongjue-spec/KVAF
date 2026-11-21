@@ -56,6 +56,8 @@ void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer *local_buffer);
 int32_t KvafExecuteBatchGetLoadKernel(const char *kernel_object_path);
 int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs *arguments,
                                   aclrtStream stream);
+int32_t KvafExecuteBatchGetRangesLaunch(
+    const KvafExecuteBatchGetRangesKernelArgs *arguments, aclrtStream stream);
 
 #ifdef __cplusplus
 }

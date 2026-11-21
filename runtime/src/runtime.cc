@@ -341,6 +341,66 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
       BatchGetExecRequest{view, &request, execution});
 }
 
+Status RuntimeCore::BatchGetRanges(const BatchGetRangesRequest& r,
+                                  const BatchGetExecutionOptions& execution) {
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  const auto* table = FindAccessTable(r.access_table);
+  if (table == nullptr) return Status::NotFound("range Get requires a live AccessTable handle");
+  const auto device = r.indices.device;
+  const auto count = r.indices.bytes / sizeof(std::int32_t);
+  if (!r.indices.has_elements<std::int32_t>() || count > INT32_MAX ||
+      !r.source_offsets.has_elements<std::int64_t>() ||
+      !r.lengths.has_elements<std::int64_t>() ||
+      !r.output_offsets.has_elements<std::int64_t>() ||
+      r.source_offsets.bytes / sizeof(std::int64_t) != count ||
+      r.lengths.bytes != r.source_offsets.bytes ||
+      r.output_offsets.bytes != r.source_offsets.bytes ||
+      !r.request_count.has_elements<std::int32_t>() ||
+      r.request_count.bytes != sizeof(std::int32_t) || !r.output.valid() ||
+      r.output.bytes == 0 || r.source_offsets.device != device ||
+      r.lengths.device != device || r.request_count.device != device ||
+      r.output_offsets.device != device || r.output.device != device || execution.profile) {
+    return Status::InvalidArgument("invalid range Get buffer layout (profiling is not supported)");
+  }
+  if (device == DeviceKind::kNpu) {
+    const auto& d = r.device_access_table;
+    if (!d.addresses.has_elements<Address>() ||
+        d.addresses.bytes / sizeof(Address) < table->addresses.size() ||
+        d.addresses.bytes / sizeof(Address) > UINT32_MAX ||
+        d.valid.data == nullptr || d.valid.bytes != d.addresses.bytes / sizeof(Address) ||
+        !d.lengths.has_elements<std::uint64_t>() || d.lengths.bytes != d.addresses.bytes ||
+        d.addresses.device != device || d.valid.device != device || d.lengths.device != device)
+      return Status::InvalidArgument("range Get requires device addresses, lengths and valid tables");
+  } else if (device == DeviceKind::kCpu) {
+    if (!r.device_access_table.empty())
+      return Status::InvalidArgument("CPU range Get must not provide a device table");
+    const auto active = *static_cast<const std::int32_t*>(r.request_count.data);
+    if (active < 0 || static_cast<std::size_t>(active) > count)
+      return Status::InvalidArgument("range Get request_count exceeds capacity");
+    const auto* indices = static_cast<const std::int32_t*>(r.indices.data);
+    const auto* offsets = static_cast<const std::int64_t*>(r.source_offsets.data);
+    const auto* lengths = static_cast<const std::int64_t*>(r.lengths.data);
+    const auto* destinations = static_cast<const std::int64_t*>(r.output_offsets.data);
+    for (std::int32_t i = 0; i < active; ++i) {
+      const auto index = indices[i];
+      if (index < 0 || static_cast<std::size_t>(index) >= table->addresses.size() ||
+          !table->valid[index] || offsets[i] < 0 || lengths[i] <= 0 || destinations[i] < 0)
+        return Status::InvalidArgument("invalid active range Get request");
+      const auto src = static_cast<std::uint64_t>(offsets[i]);
+      const auto len = static_cast<std::uint64_t>(lengths[i]);
+      const auto dst = static_cast<std::uint64_t>(destinations[i]);
+      if (src > table->lengths[index] || len > table->lengths[index] - src ||
+          dst > r.output.bytes || len > r.output.bytes - dst)
+        return Status::InvalidArgument("range Get source/output range is out of bounds");
+    }
+  } else {
+    return Status::InvalidArgument("unsupported range Get device");
+  }
+  const AccessTableView view{table->addresses.data(), table->lengths.data(),
+                             table->valid.data(), table->addresses.size()};
+  return access_operator_.ExecuteBatchGetRanges({view, &r, execution});
+}
+
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
                              BatchPutExecutionOptions execution) {
   if (!initialized_) {

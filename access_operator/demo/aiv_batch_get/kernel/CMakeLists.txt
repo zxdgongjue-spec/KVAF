@@ -16,6 +16,7 @@ add_custom_command(
   COMMAND "${KVAF_LLD}" ${KVAF_AIV_LINK_OPTIONS} "${KVAF_EXECUTE_KERNEL_TMP}"
           -o "${KVAF_EXECUTE_KERNEL_OBJECT}"
   DEPENDS "${KVAF_EXECUTE_KERNEL_SOURCE}" "${KVAF_URMA_SOURCE}" "${KVAF_UBMEM_SOURCE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/execute_batch_get_ranges_aiv.asc"
           "${KVAF_OPERATOR_INCLUDE}/ubmem/copy.h" "${KVAF_OPERATOR_INCLUDE}/ubmem/batch_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_abi.h"
           "${KVAF_AIV_DEMO_INCLUDE_DIR}/batch_get_schedule.h"

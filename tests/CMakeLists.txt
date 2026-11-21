@@ -1,4 +1,14 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_executable(kvaf_batch_get_ranges_runtime_test batch_get_ranges_runtime_test.cc)
+target_link_libraries(kvaf_batch_get_ranges_runtime_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_batch_get_ranges_runtime_test COMMAND kvaf_batch_get_ranges_runtime_test)
+add_executable(kvaf_batch_get_ranges_operator_test batch_get_ranges_operator_test.cc
+  ${PROJECT_SOURCE_DIR}/access_operator/src/access_operator.cc)
+target_include_directories(kvaf_batch_get_ranges_operator_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/aiv_host_model
+  ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include)
+target_link_libraries(kvaf_batch_get_ranges_operator_test PRIVATE kvaf_meta_manager kvaf_access_operator)
+add_test(NAME kvaf_batch_get_ranges_operator_test COMMAND kvaf_batch_get_ranges_operator_test)
 
 add_executable(kvaf_npu_runtime_config_test npu_runtime_config_test.cc)
 target_link_libraries(kvaf_npu_runtime_config_test PRIVATE kvaf_runtime)
@@ -58,6 +68,11 @@ if(KVAF_BUILD_PYTHON)
   )
 
   if(KVAF_ENABLE_AIV_BATCH_GET)
+    add_test(NAME kvaf_npu_batch_get_ranges_python
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_batch_get_ranges.py")
+    set_tests_properties(kvaf_npu_batch_get_ranges_python PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+      SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_test(
       NAME kvaf_npu_batch_get_python
       COMMAND "${Python3_EXECUTABLE}"

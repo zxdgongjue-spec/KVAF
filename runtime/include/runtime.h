@@ -93,6 +93,12 @@ class RuntimeCore {
       const BatchGetExecutionOptions& execution = BatchGetExecutionOptions{});
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
+  Status BatchGetRanges(const BatchGetRangesRequest& request,
+                       const BatchGetExecutionOptions& execution = {});
+  Status CheckBatchGetRangesStatus(void* stream) {
+    if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+    return access_operator_.CheckBatchGetRangesStatus(stream);
+  }
   Status BatchFree(const BatchFreeRequest& request);
 
  protected:

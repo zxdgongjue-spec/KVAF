@@ -17,6 +17,7 @@ std::mutex g_mutex;
 bool g_loaded = false;
 aclrtBinHandle g_binary = nullptr;
 aclrtFuncHandle g_function = nullptr;
+aclrtFuncHandle g_ranges_function = nullptr;
 std::vector<char> g_binary_bytes;
 
 bool ReadBinary(const char *path) {
@@ -75,4 +76,35 @@ extern "C" int32_t KvafExecuteBatchGetLaunch(const KvafExecuteBatchGetKernelArgs
                                                      const_cast<KvafExecuteBatchGetKernelArgs *>(arguments),
                                                      sizeof(*arguments), nullptr, 0U);
   return ret == ACL_SUCCESS ? KVAF_BATCH_GET_SUCCESS : KVAF_BATCH_GET_RUNTIME_ERROR;
+}
+
+extern "C" int32_t KvafExecuteBatchGetRangesLaunch(
+    const KvafExecuteBatchGetRangesKernelArgs* arguments, aclrtStream stream) {
+  if (!g_loaded || !arguments || !stream || !arguments->block_count ||
+      arguments->block_count > KVAF_AIV_BATCH_GET_MAX_AIV_CORES)
+    return KVAF_BATCH_GET_INVALID_ARGUMENT;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_ranges_function && aclrtBinaryGetFunction(g_binary,
+          "KvafExecuteBatchGetRangesAivKernelV2", &g_ranges_function) != ACL_SUCCESS) {
+      std::fprintf(stderr, "[KVAF_AIV] missing range Get kernel; rebuild the NPU kernel object\n");
+      return KVAF_BATCH_GET_RUNTIME_ERROR;
+    }
+  }
+  aclrtLaunchKernelAttr attrs[4]{};
+  attrs[0].id = ACL_RT_LAUNCH_KERNEL_ATTR_SCHEM_MODE;
+  attrs[0].value.schemMode = 1;
+  attrs[1].id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;
+  attrs[1].value.dynUBufSize = kKernelLocalMemoryBytes;
+  attrs[2].id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT_US;
+  attrs[2].value.timeoutUs.timeoutLow = kKernelTimeoutSeconds * 1000000U;
+  attrs[3].id = ACL_RT_LAUNCH_KERNEL_ATTR_ENGINE_TYPE;
+  attrs[3].value.engineType = ACL_RT_ENGINE_TYPE_AIV;
+  aclrtLaunchKernelCfg config{};
+  config.numAttrs = 4;
+  config.attrs = attrs;
+  const auto result = aclrtLaunchKernelWithHostArgs(g_ranges_function, arguments->block_count,
+      stream, &config, const_cast<KvafExecuteBatchGetRangesKernelArgs*>(arguments),
+      sizeof(*arguments), nullptr, 0);
+  return result == ACL_SUCCESS ? KVAF_BATCH_GET_SUCCESS : KVAF_BATCH_GET_RUNTIME_ERROR;
 }
