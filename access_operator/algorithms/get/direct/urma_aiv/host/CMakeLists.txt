@@ -9,7 +9,9 @@ target_link_libraries(kvaf_execute_batch_get_host PRIVATE
   kvaf_direct_hccp_session
   kvaf_peer_link
   -Wl,--no-as-needed c_sec unified_dlog ascendc_runtime ascendalog ascendcl runtime error_manager dl pthread)
-add_dependencies(kvaf_execute_batch_get_host kvaf_execute_batch_get_kernel)
+if(TARGET kvaf_execute_batch_get_kernel)
+  add_dependencies(kvaf_execute_batch_get_host kvaf_execute_batch_get_kernel)
+endif()
 add_custom_command(TARGET kvaf_execute_batch_get_host POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${KVAF_AIV_ALGORITHM_BIN_DIR}"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:kvaf_execute_batch_get_host>"

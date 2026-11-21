@@ -35,6 +35,15 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
   Python 默认不在 KVAF 内同步；同一 stream 的后续操作自然按序执行。
 - `BatchFree`：将删除请求交给 MetaManager；仍被 AccessTable 持有的 Key
   会返回 `kBusy`。
+- `BatchCpuPull` / 显式 `PreparePut`：独立 CPU Pull executor 借用同一个 DDR 池，
+  与普通 Put 共用写事务和恢复入口的互斥规则；不会占用 Get 队列。
+- `NpuRuntime::Initialize()` 只初始化基础状态；`InitializeDdr()` 初始化缓存池。
+  `ListenHbm` / `BatchGetRawAddr` 可在无 CPU、无 DDR 的 Runtime 上使用，
+  `DrainRawAddr` 回收异步引用；图捕获通过 `BeginRawGraph` / `EndRawGraph` 固定资源。
+
+CPU Pull 的目的 MR 通过 `GetOffloadRegion()` 首次准备并独立授权；源注册和建链
+显式进行。具体合同见 [CPU Pull](../docs/cpu_pull_offload_usage.md)、
+[NPU raw READ](../docs/hbm_raw_addr_read.md) 与 [建链流程](../docs/connection_handshake_flows.md)。
 
 Get 支持异步提交和显式 Drain；每个图节点使用独立租约，同一 Runtime 可在同一
 stream 上串行回放多张图，每张图可包含多个 Get。图对象生命周期由上层管理，

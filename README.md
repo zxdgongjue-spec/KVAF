@@ -451,3 +451,12 @@ runtime.shutdown()
 更详细的数据流和性能说明见 [GatherRead](docs/aicpu_gather_read.md) 与
 [CPU Push Scatter](docs/aicpu_cpu_push_scatter.md)。升级时使用同次源码构建 Host 库和设备包，
 安装后重启 NPU 客户端，避免 Host/设备 ABI 不一致。
+
+### CPU Pull 与 NPU Pull
+
+`NpuRuntime.batch_cpu_pull()` 将已注册的本卡或跨卡 HBM 拉到共享 CPU DDR，
+与普通 BatchPut 使用同一个元数据写事务；`batch_get_raw_addr()` 直接读取远端 HBM，
+不要求初始化 DDR。普通 Get/Put 继续使用各自的执行配置和首调准备机制。
+默认 NPU 构建包含两种 Pull；单独构建可用 `--cpu-pull-only` 或 `--raw-pull-only`。
+接口、恢复和源内存生命周期见 [CPU Pull](docs/cpu_pull_offload_usage.md)、
+[NPU raw READ](docs/hbm_raw_addr_read.md) 和 [建链流程](docs/connection_handshake_flows.md)。

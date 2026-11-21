@@ -3,6 +3,7 @@
 #include "peer_protocol.h"
 #include "peer_link.h"
 
+namespace kvaf::offload { class Backend; }
 namespace kvaf {
 // Allocation-scoped CPU context and DDR registration owner. Execution
 // backends keep independent channels, gather workers and Scatter state.
@@ -12,6 +13,9 @@ class CpuUrmaMemoryPool {
                     std::uint64_t epoch, std::uint64_t allocation_request);
   ~CpuUrmaMemoryPool();
   Status Close();
+  Status PrepareCpuPull(std::uint32_t candidate, std::uint32_t token,
+                        std::uint64_t logical_bytes, peer::PeerRegion*);
+  std::unique_ptr<offload::Backend> CreateCpuPullBackend(std::shared_ptr<void> lease);
  private:
   friend class UrmaCpuBackend;
   struct Impl;

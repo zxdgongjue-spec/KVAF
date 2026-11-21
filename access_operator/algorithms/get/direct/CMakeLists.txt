@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(kvaf_execute_batch_get LANGUAGES CXX)
 
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  option(KVAF_ENABLE_AIV_BATCH_GET "Build the standalone ordinary Get kernel" ON)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -30,5 +34,7 @@ if(NOT TARGET kvaf_direct_hccp_session)
     "${CMAKE_CURRENT_BINARY_DIR}/direct_hccp_session")
 endif()
 
-add_subdirectory(common/kernel)
+if(KVAF_ENABLE_AIV_BATCH_GET)
+  add_subdirectory(common/kernel)
+endif()
 add_subdirectory(urma_aiv/host)

@@ -9,10 +9,11 @@ namespace py = pybind11;
 namespace kvaf::acl_python {
 
 aclrtStream StreamFromPython(const py::object& stream) {
-  if (!py::hasattr(stream, "npu_stream")) {
+  const auto handle = py::getattr(stream, "npu_stream", py::object{});
+  if (!handle) {
     throw py::type_error("ACL stream must be a torch.npu.Stream");
   }
-  const std::uint64_t pointer = stream.attr("npu_stream").cast<std::uint64_t>();
+  const std::uint64_t pointer = handle.cast<std::uint64_t>();
   if (pointer == 0) {
     throw py::value_error("ACL stream must not be null");
   }

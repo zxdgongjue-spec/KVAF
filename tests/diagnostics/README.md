@@ -37,6 +37,15 @@ Actual device execution must be validated on an NPU.
 
 ## Get recovery fault injection (Host only)
 
+CPU/NPU Pull integration checks are available through
+`tests/diagnostics/run_pull_host_checks.sh /tmp/kvaf-pull-checks`. They build the
+portable Core and exercise real control protocols, metadata transactions, Region
+leases, raw Host/kernel models and Python helpers. CMake and a C++17 compiler are
+required; TCP cases need local loopback access. Set `PYBIND11_INCLUDE` for binding
+metadata checks and `KVAF_TEST_URMA_INCLUDE_DIR` for the UMDK 24.12 fake provider
+check. Missing optional dependencies are reported as skipped. These tests do not
+replace two-card Ascend/URMA correctness and performance runs.
+
 `get_recovery.cc` uses the real Dispatcher, RuntimeCore and MetaManager with a
 fault-injecting operator. Run from the repository root without CANN or URMA:
 
@@ -47,7 +56,8 @@ c++ -std=c++17 -pthread \
   runtime/execution/execution_config.cc \
   runtime/execution/execution_dispatcher.cc \
   runtime/execution/execution_resource_manager.cc \
-  runtime/src/runtime.cc meta_manager/src/in_memory_meta_manager.cc \
+  runtime/src/runtime.cc runtime/src/connector_runtime.cc \
+  meta_manager/src/in_memory_meta_manager.cc \
   -o /tmp/kvaf-get-recovery
 /tmp/kvaf-get-recovery
 ```

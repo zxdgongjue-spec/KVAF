@@ -9,7 +9,7 @@ target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
-if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA) AND NOT ASCEND_CANN_PACKAGE_PATH)
+if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL) AND NOT ASCEND_CANN_PACKAGE_PATH)
   if(DEFINED ENV{ASCEND_CANN_PACKAGE_PATH})
     set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_CANN_PACKAGE_PATH}")
   elseif(DEFINED ENV{ASCEND_HOME_PATH})
@@ -21,12 +21,18 @@ if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA) AND NOT ASCEND_CANN_PAC
 endif()
 add_subdirectory(transports/ubmem)
 
-if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH OR KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL)
   add_subdirectory(transports/direct_hccp)
 endif()
 
-if(KVAF_ENABLE_AIV_BATCH_GET)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_NPU_PULL)
   add_subdirectory(algorithms/get/direct)
+endif()
+if(KVAF_ENABLE_NPU_PULL)
+  add_subdirectory(algorithms/get/raw_addr/urma_aiv)
+endif()
+
+if(KVAF_ENABLE_AIV_BATCH_GET)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     add_subdirectory(algorithms/put/urma_aiv)
   endif()
