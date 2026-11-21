@@ -33,6 +33,11 @@ def parse_args(argv=None, *, mode="gather_read"):
     p.add_argument("--tokens-per-block", type=int, default=DEFAULT_TOKENS_PER_BLOCK)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iterations", type=int, default=100)
+    p.add_argument("--start-epoch", type=float, default=0.0,
+                   help="unix timestamp at which every process begins measuring; "
+                        "0 disables the barrier. Populate and warmup still happen "
+                        "before it, so concurrent runs overlap for the whole "
+                        "measured window instead of drifting apart.")
     a = p.parse_args(argv)
     if not 1 <= a.workers <= 8 or not 0 <= a.miss_count <= 65536:
         p.error("workers must be in 1..8 and miss_count in 0..65536")
@@ -216,8 +221,16 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         for _ in range(a.warmup):
             run_round(a.miss_count, profile=True)
         profiles.clear()
+        if a.start_epoch:
+            print(f"{prefix}_BARRIER_READY now={time.time():.3f} start={a.start_epoch:.3f}",
+                  flush=True)
+            while time.time() < a.start_epoch:
+                time.sleep(0.002)
+        span_begin = time.time()
         for _ in range(a.iterations):
             run_round(a.miss_count, profile=True)
+        span_end = time.time()
+        print(f"{prefix}_MEASURE_SPAN start={span_begin:.3f} end={span_end:.3f}", flush=True)
     except BaseException:
         try:
             runtime.shutdown()
