@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import hashlib
 import itertools
 import json
 import math
@@ -12,14 +14,47 @@ import os
 from pathlib import Path
 import random
 import statistics
+import subprocess
 import sys
-import tempfile
 import time
 
 from npu_eids import parse_npu_eids
 from test_npu_batch_get_ranges import pattern
 
 U32 = (1 << 32) - 1
+DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "result"
+
+
+def prepare_output(a):
+    if getattr(a, "run_directory", None) is not None:
+        return a.run_directory
+    root = (a.output_dir or DEFAULT_OUTPUT_ROOT).resolve()
+    config = {k: v for k, v in vars(a).items()
+              if k not in {"layouts", "output_dir", "worker_directory", "run", "dry_run"}}
+    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
+    def label(values):
+        text = "-".join(map(str, values[:3]))
+        return text + (f"-n{len(values)}" if len(values) > 3 else "")
+    stamp = datetime.now(timezone(timedelta(hours=8)))
+    name = (f"ranges_d{a.device}_t{label(a.tensor_bytes)}_r{a.repeat}_p{a.pack_count}"
+            f"_c{label(a.cores)}_j{label(a.jettys)}_k{label(a.read_chunk_bytes)}"
+            f"_{stamp:%Y%m%d_%H%M%S_%f}_{digest}")
+    # Keep each path component comfortably below the filesystem name limit.
+    if len(name) > 200:
+        name = f"ranges_d{a.device}_{stamp:%Y%m%d_%H%M%S_%f}_{digest}"
+    root.mkdir(parents=True, exist_ok=True)
+    directory, suffix = root / name, 0
+    while True:
+        try:
+            directory.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
+            directory = root / f"{name}_{suffix}"
+    (directory / "config.json").write_text(json.dumps(dict(
+        timestamp=stamp.isoformat(), timezone="Asia/Shanghai", config=config), indent=2) + "\n")
+    a.run_directory = directory
+    return directory
 
 
 def align_up(value, alignment):
@@ -124,7 +159,9 @@ def parse_args(argv=None):
     p.add_argument("--device", type=int, default=int(os.environ.get("DEVICE_ID", "0")))
     p.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR"))
     p.add_argument("--npu-eids", type=parse_npu_eids, default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")))
-    p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="result root; default: result beside KVAF; creates a configuration/time subdirectory")
+    p.add_argument("--worker-directory", type=Path, default=None, help=argparse.SUPPRESS)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1")
     a = p.parse_args(argv)
@@ -202,8 +239,7 @@ def run(a):
     put = Path(os.environ["KVAF_BATCH_PUT_KERNEL"])
     if not get.is_file() or not put.is_file():
         raise FileNotFoundError("matching AIV Get/Put kernel objects required")
-    directory = a.output_dir or Path(tempfile.mkdtemp(prefix="kvaf-range-perf."))
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = prepare_output(a)
     summary_path, raw_path = directory / "summary.csv", directory / "samples.jsonl"
     print(f"RANGE_PERF_OUTPUT directory={directory.resolve()}", flush=True)
     print("RANGE_PERF_CONTRACT backend=aiv+urma execution=eager fixed_inputs=1 "
@@ -354,9 +390,39 @@ def run(a):
     return 0
 
 
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    a = parse_args(argv)
+    if a.worker_directory is not None:
+        a.run_directory = a.worker_directory.resolve()
+        return run(a)
+    if a.dry_run or not a.run:
+        return run(a)
+    directory = prepare_output(a)
+    log_path = directory / f"{directory.name}.log"
+    print(f"RANGE_PERF_LOG path={log_path}", flush=True)
+    # A separate worker lets this capture native CANN stdout/stderr as well as
+    # Python output and tracebacks, without redirecting process-global FDs.
+    with log_path.open("xb") as log:
+        log.write(f"RANGE_PERF_LOG path={log_path}\n".encode())
+        command = [sys.executable, str(Path(__file__).resolve()), *argv,
+                   "--worker-directory", str(directory)]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              bufsize=0) as worker:
+            while True:
+                block = worker.stdout.read(65536)
+                if not block:
+                    break
+                log.write(block)
+                log.flush()
+                sys.stdout.buffer.write(block)
+                sys.stdout.buffer.flush()
+            return worker.wait()
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(run(parse_args()))
+        sys.exit(main())
     except Exception as error:
         print(f"RANGE_PERF_FAIL {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         raise

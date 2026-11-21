@@ -166,7 +166,10 @@ class PerfTests(unittest.TestCase):
                  patch.dict(os.environ, KVAF_BATCH_GET_KERNEL=str(kernel), KVAF_BATCH_PUT_KERNEL=str(kernel)), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(perf.run(a), 0)
-            with (root/"summary.csv").open() as f:
+            directory = a.run_directory
+            self.assertEqual(directory.parent, root.resolve())
+            self.assertTrue((directory/"config.json").is_file())
+            with (directory/"summary.csv").open() as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 14)  # 2 alignments * (Put + 2 chunks * 3 scopes)
             self.assertTrue(all(r["verified"] == "True" for r in rows))
@@ -174,13 +177,45 @@ class PerfTests(unittest.TestCase):
                                 for r in rows if r["operation"] == "put"))
             self.assertTrue(all(not r["mean_GBps"] for r in rows if r["scope"] == "submit"))
             self.assertTrue(all(float(r["mean_us"]) == 125 for r in rows if r["scope"] == "stream_event"))
-            samples = [json.loads(line) for line in (root/"samples.jsonl").read_text().splitlines()]
+            samples = [json.loads(line) for line in (directory/"samples.jsonl").read_text().splitlines()]
             self.assertEqual(len(samples), len(rows))
             self.assertTrue(all(len(s["samples_ns"]) == 2 for s in samples))
             self.assertEqual(len(instances), 1)
             self.assertEqual(set(instances[0].chunks), {0, 4})
             self.assertGreater(instances[0].checks, 0)
             self.assertIn("RANGE_PERF_PASS configs=4", output.getvalue())
+
+    def test_output_default_location_configuration_time_and_no_overwrite(self):
+        self.assertEqual(perf.DEFAULT_OUTPUT_ROOT,
+                         Path(__file__).resolve().parents[3]/"result")
+        with tempfile.TemporaryDirectory() as d:
+            args = ["--device", "7", "--tensor-bytes", "656", "--read-chunk-bytes", "0",
+                    "--output-dir", d]
+            first = perf.prepare_output(perf.parse_args(args))
+            second = perf.prepare_output(perf.parse_args(args))
+            self.assertNotEqual(first, second)
+            self.assertRegex(first.name, r"ranges_d7_t656_r1_p2_c2_j2_k0_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}")
+            config = json.loads((first/"config.json").read_text())
+            self.assertEqual(config["config"]["tensor_bytes"], [656])
+            self.assertTrue(config["timestamp"].endswith("+08:00"))
+
+    def test_worker_log_captures_failure_and_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Deterministic pre-import failure: no NPU is needed to test logging.
+            env = dict(os.environ)
+            env.pop("KVAF_CPU_SERVICE_ADDR", None)
+            result = subprocess.run([sys.executable, str(Path(perf.__file__)), "--run",
+                "--output-dir", d, "--tensor-bytes", "656"], env=env,
+                capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            logs = list(Path(d).glob("*/*.log"))
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0].stem, logs[0].parent.name)
+            content = logs[0].read_text()
+            self.assertIn("RANGE_PERF_PLAN", content)
+            self.assertIn("RANGE_PERF_FAIL", content)
+            self.assertIn("Traceback", content)
+            self.assertNotIn("RANGE_PERF_PASS", content)
 
 
 if __name__ == "__main__":

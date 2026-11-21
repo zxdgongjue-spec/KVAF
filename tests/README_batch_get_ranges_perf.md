@@ -12,7 +12,7 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
   --tensor-bytes 1048576 33554432 --pack-count 2 \
   --cores 2 --jettys 2 --inflight 2048 \
   --read-chunk-bytes 0 65536 1048576 4194304 \
-  --warmup 5 --iterations 30 --output-dir /tmp/kvaf-range-perf
+  --warmup 5 --iterations 30
 ```
 
 默认远端 DDR 约 66MiB，HBM 和 CPU 还需存放 source、output、预期字节及框架缓存；实际总内存占用高于 DDR 大小。`--slot-size 0` 自动取能覆盖最大包的 4096B 对齐容量，DDR 总容量是 slot_size×pack_count。初始化和建链按每个 core/Jetty/inflight 组合进行一次，随后复用 Runtime 测所有 alignment 和 chunk。
@@ -46,7 +46,7 @@ python3 tests/python/batch_get_ranges_perf.py --dry-run
 | `--guard-bytes` | 默认 0，输出默认紧密排列；可设为 16 等值插入不应写入的间隙做边界检查，间隙不计入有效 payload。alignment 造成的空隙也会检查。 |
 | `--warmup`、`--iterations` | 默认 5、30。首次注册、预先验证、warmup 都不计入正式样本。 |
 | `--no-events` | 只测 CPU 调用到完成，不采集 NPU Event；适合运行环境不支持 timing Event 的情况。 |
-| `--output-dir` | CSV 和原始样本目录，不指定则创建临时目录并打印路径；同目录再次运行会覆盖文件。 |
+| `--output-dir` | 结果根目录。默认是 KVAF 同级的 `result`，每次按配置和北京时间创建独立子目录，不覆盖历史结果。显式指定时在指定根目录内创建同样的运行子目录。 |
 
 例如扫描 core 与 Jetty：
 
@@ -72,6 +72,21 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
 ## 结果和计时边界
 
 成功要求退出码为 0，并在最后出现 `RANGE_PERF_PASS`。`RANGE_PERF_FAIL`、超时退出和没有 PASS 的部分 CSV 均不能算完成验收。`--dry-run` 只打印 PLAN，不会生成硬件 PASS。未授权运行时 Python 脚本退出 77；wrapper 自动设置运行开关，缺依赖或不可用 NPU 会报错。wrapper 默认 1200 秒超时，可用 `KVAF_RANGE_PERF_TIMEOUT` 调整。
+
+默认输出位置不依赖执行命令时的工作目录，例如：
+
+```text
+dynamicIO/
+├── KVAF/
+└── result/
+    └── ranges_d7_t1048576-33554432_r1_p2_c2_j2_k0-65536-1048576-n4_20261121_183000_123456_配置摘要/
+        ├── 同目录名.log
+        ├── config.json
+        ├── summary.csv
+        └── samples.jsonl
+```
+
+运行名含设备、tensor 大小、repeat、包数、core/Jetty、chunk 列表、北京时间（精确到微秒）和完整配置的摘要。过长名称使用设备、时间和摘要；完整参数始终保存在 `config.json`。`.log` 同时保存 Python 与原生 CANN 的 stdout/stderr，包括异常堆栈，终端仍同步显示输出；失败返回码会传回调用方。dry-run 和未开启运行的 skip 不创建结果目录。
 
 输出 `summary.csv`、`samples.jsonl` 和 `RANGE_PERF_RESULT` 行：
 
