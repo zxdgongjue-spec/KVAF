@@ -240,3 +240,23 @@ python3 -m unittest test_build_script test_dsa_keys test_batch_get_inflight_conf
 ```
 
 本机没有 CANN、torch_npu 和 NPU，尚未完成真实 CANN 编译和硬件端到端验收。此处不提供延迟、带宽或 padding 效率结论；拿到硬件测试最后的 `RANGE_GET_HARDWARE_PASS` 后，才算完成 AIV + URMA 功能验收。
+
+## 6 功能日志与旧性能脚本的判断
+
+目标机提供的运行日志末尾为 `RANGE_GET_HARDWARE_PASS cases=49 ... large_tensors=False`，说明默认小 tensor 集合在三种 alignment 下已通过功能验收。标为 `RANGE_GET_CASE_PASS ... expected=ValueError/KeyError` 的行属于故意输入非法参数的负例通过，不是未处理的运行失败。这份日志尚未覆盖 1MiB 和 32MiB，需要带 `--large-tensors` 重新运行；它也不包含旧性能测试的带宽数据。
+
+`run_remote_cpu_batch_get_miss_count_perf.sh` 沿用定长 `batch_get`，每条 READ 搬运 token_bytes。656B token 不触发 range 分段，8192 是该 sweep 的有效请求数量。`read_chunk_bytes` 只用于 `batch_get_ranges`，不能用于调节旧性能脚本的带宽。当前旧性能脚本及其参数默认值与方案 B 改动前相同。
+
+为排除共享 helper 导致的编译变化，定长 kernel 的源文件恢复为方案 B 改动前的版本；变长的动态 CQ 轮询预算由独立 helper 处理。此隔离不代表已经确认性能下降原因或验证带宽恢复，仍需目标机对比。聚焦 656B、8192 个请求、保留原 core/Jetty 扫描，可运行：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
+KVAF_BATCH_GET_TOKEN_BYTES=656 KVAF_BATCH_GET_MISS_COUNTS=8192 \
+KVAF_BATCH_GET_MISS_SWEEP_LOG_DIR=/tmp/kvaf-656-8192-after \
+  bash tests/run_remote_cpu_batch_get_miss_count_perf.sh "$PWD/build-npu" \
+  --warmup 5 --iterations 30
+```
+
+如果原命令还带有后端、graph、访问顺序或设备选择参数，复测时继续保留。默认在途预算仍为 2048；可用 `--max-inflight-total 0` 与 `--max-inflight-total 2048` 单独比较 whole-batch 和窗口调度，但它是独立实验，不能把切换预算后的结果当作同配置代码回归的证明。
+
+每个配置的日志会保存 `BATCH_GET_PERF_CONFIG`、`BATCH_GET_RESULT` 及 kernel total/post/completion_wait 三类 profile。比较同一 core、Jetty、EID/UB device、时钟换算值和相同统计口径；区分 GB/s 与 GiB/s、kernel 带宽与端到端带宽。先对比原始 cycles 和 post/CQ 等待的变化，再判断是否是提交或网络完成等待增加。
