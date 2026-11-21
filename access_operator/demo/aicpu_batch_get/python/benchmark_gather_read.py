@@ -85,8 +85,10 @@ def create_request_plan(torch, a, length, device):
 
 
 def summarize_measurements(profiles, payload_bytes, *, mode="gather_read"):
-    timing = timing_stats([sample["device_span_us"] for sample in profiles], payload_bytes)
+    spans = [sample["device_span_us"] for sample in profiles]
+    timing = timing_stats(spans, payload_bytes)
     summary = dict(metric="kernel_wall",
+                   min_us=min(spans), max_us=max(spans),
                    mean_us=timing["mean_us"], mean_GBps=timing["mean_GBps"],
                    p50_us=timing["p50_us"], p50_GBps=timing["p50_GBps"],
                    p99_us=timing["p99_us"], p99_GBps=timing["p99_GBps"])
