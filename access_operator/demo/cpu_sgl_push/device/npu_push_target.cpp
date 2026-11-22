@@ -254,9 +254,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // RA context bound to the local EID.
+  // Device-side RA contexts use the HDC mode (peer-online is the CPU-side
+  // resource-agent mode), matching KVAF's BatchGet transport.
   hccp::CtxInitCfg cfg{};
-  cfg.mode = hccp::kPeerOnline;
+  cfg.mode = hccp::kOfflineHdc;
   hccp::CtxInitAttr attr{};
   attr.phy_id = args.device_id;
   attr.ub.eid_index = 0U;

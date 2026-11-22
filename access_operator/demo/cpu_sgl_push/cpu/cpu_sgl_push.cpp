@@ -132,13 +132,14 @@ bool LoadKeyfile(const std::string &path, Keyfile *out) {
     if (eq == nullptr) continue;
     *eq = 0;
     const std::string key = line;
-    const std::string value = eq + 1;
+    std::string value = eq + 1;
+    while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) value.pop_back();
     if (key == "mem_key") {
-      out->mem_key_bytes = uint32_t(value.size() - 1) / 2;
+      out->mem_key_bytes = uint32_t(value.size()) / 2;
       if (out->mem_key_bytes > sizeof(out->mem_key) ||
           !kvaf::demo::ReadHex(value.c_str(), out->mem_key, out->mem_key_bytes)) return false;
     } else if (key == "jetty_key") {
-      out->jetty_key_bytes = uint32_t(value.size() - 1) / 2;
+      out->jetty_key_bytes = uint32_t(value.size()) / 2;
       if (out->jetty_key_bytes > sizeof(out->jetty_key) ||
           !kvaf::demo::ReadHex(value.c_str(), out->jetty_key, out->jetty_key_bytes)) return false;
     } else if (key == "mem_token_value") out->mem_token_value = std::stoul(value);
@@ -398,7 +399,14 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
   FILE *csv = args.csv != nullptr ? std::fopen(args.csv, "w") : nullptr;
   if (csv != nullptr) std::fprintf(csv, "seq,t0_ns,t_posted_ns,t_jfc_ns,runs,miss,group\n");
 
-  const uint64_t remote_data_base = key.hbm_addr + key.data_offset;
+  // URMA WRITE destinations use the segment UBVA (bus address), not the
+  // acl malloc VA. This mirrors the KVAF pull path where address_table
+  // entries are seg.ubva.va based.
+  const uint64_t remote_base = remote_seg.ubva.va != 0 ? remote_seg.ubva.va : key.hbm_addr;
+  std::fprintf(stderr, "[SGL_PUSH] remote_base=0x%llx hbm_addr=0x%llx\n",
+               static_cast<unsigned long long>(remote_base),
+               static_cast<unsigned long long>(key.hbm_addr));
+  const uint64_t remote_data_base = remote_base + key.data_offset;
   uint64_t seq = 0;
   for (uint32_t iter = 0; iter < args.iters + args.warmup; ++iter) {
     ++seq;
@@ -444,7 +452,7 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     flag_src.len = 8;
     flag_src.tseg = flag_seg;
     urma_sge_t flag_dst{};
-    flag_dst.addr = key.hbm_addr;  // flag at offset 0
+    flag_dst.addr = remote_base;  // flag at offset 0
     flag_dst.len = 8;
     flag_dst.tseg = remote_tseg;
     urma_jfs_wr_t &fwr = wrs[run_count];
@@ -489,7 +497,7 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
   flag_src.len = 8;
   flag_src.tseg = flag_seg;
   urma_sge_t flag_dst{};
-  flag_dst.addr = key.hbm_addr;
+  flag_dst.addr = remote_base;
   flag_dst.len = 8;
   flag_dst.tseg = remote_tseg;
   urma_jfs_wr_t swr{};
