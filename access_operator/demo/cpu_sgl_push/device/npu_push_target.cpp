@@ -19,12 +19,159 @@
 namespace hccp = kvaf::direct_hccp;
 using kvaf::demo::NowNs;
 
-// Defined in direct_hccp_remote_transport.cc (non-static, no header decl).
-namespace kvaf::direct_hccp {
-std::uint32_t MakePeerCtpPsn(const DirectHccpApi& api, std::uint32_t physical_device_id, const char* role);
-bool GetPeerCtp(const DirectHccpApi& api, void* context, const std::array<std::uint8_t, kEidBytes>& local_eid,
-                const std::array<std::uint8_t, kEidBytes>& peer_eid, const char* role, std::uint64_t* tp_handle);
-}  // namespace kvaf::direct_hccp
+// Self-contained copies of the direct-hccp helpers (same logic as
+// direct_hccp_remote_transport.cc; that TU pulls in runtime headers whose
+// optional gather helpers are absent from some checkouts, so the demo keeps
+// its own minimal versions).
+namespace {
+
+constexpr int kHccpAsyncAgain = 128301;
+constexpr uint32_t kCtpTpCount = 1U;
+constexpr uint32_t kCtpQueryPollMs = 1U;
+constexpr uint32_t kCtpQueryTimeoutMs = 10000U;
+constexpr uint32_t kDeviceAivRqDepth = 256U;
+constexpr uint32_t kAivWqeBytes = 64U;
+constexpr uint32_t kAivWqebbsPerWqe = 4U;
+
+template <typename Function>
+bool LoadSymbol(void *library, const char *name, Function **function) {
+  *function = reinterpret_cast<Function *>(dlsym(library, name));
+  if (*function != nullptr) return true;
+  std::fprintf(stderr, "[KVAF_AIV] direct ABI missing symbol %s: %s\n", name, dlerror());
+  return false;
+}
+
+bool LoadDirectHccpLocal(hccp::DirectHccpApi *api) {
+  if (api == nullptr) return false;
+  for (const char *candidate : {"libra.so", "libra.so.0", "libhccp.so", "libhccp.so.0"}) {
+    api->library = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
+    if (api->library != nullptr) break;
+  }
+  if (api->library == nullptr) {
+    std::fprintf(stderr, "[PUSH_TARGET] dlopen libra.so failed: %s\n", dlerror());
+    return false;
+  }
+  const bool loaded =
+      LoadSymbol(api->library, "RaCtxInit", &api->ctx_init) &&
+      LoadSymbol(api->library, "RaCtxDeinit", &api->ctx_deinit) &&
+      LoadSymbol(api->library, "RaCtxTokenIdAlloc", &api->token_alloc) &&
+      LoadSymbol(api->library, "RaCtxTokenIdFree", &api->token_free) &&
+      LoadSymbol(api->library, "RaCtxLmemRegister", &api->lmem_register) &&
+      LoadSymbol(api->library, "RaCtxLmemUnregister", &api->lmem_unregister) &&
+      LoadSymbol(api->library, "RaCtxRmemImport", &api->rmem_import) &&
+      LoadSymbol(api->library, "RaCtxRmemUnimport", &api->rmem_unimport) &&
+      LoadSymbol(api->library, "RaCtxCqCreate", &api->cq_create) &&
+      LoadSymbol(api->library, "RaCtxCqDestroy", &api->cq_destroy) &&
+      LoadSymbol(api->library, "RaCtxQpCreate", &api->qp_create) &&
+      LoadSymbol(api->library, "RaCtxQpDestroy", &api->qp_destroy) &&
+      LoadSymbol(api->library, "RaCtxQpImport", &api->qp_import) &&
+      LoadSymbol(api->library, "RaCtxQpUnimport", &api->qp_unimport) &&
+      LoadSymbol(api->library, "RaCtxGetTpInfoList", &api->get_tp_info) &&
+      LoadSymbol(api->library, "RaGetTpInfoListAsync", &api->get_tp_info_async) &&
+      LoadSymbol(api->library, "RaGetAsyncReqResult", &api->get_async_req_result);
+  api->get_random = reinterpret_cast<hccp::GetRandomFn>(dlsym(api->library, "RaGetSecRandom"));
+  if (!loaded) {
+    dlclose(api->library);
+    *api = {};
+    return false;
+  }
+  return true;
+}
+
+uint32_t MakePsn(const hccp::DirectHccpApi &api, uint32_t phy_id) {
+  uint32_t psn = static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count() ^
+                                       static_cast<int64_t>(getpid()));
+  if (psn == 0U) psn = 1U;
+  if (api.get_random != nullptr) {
+    hccp::RaInfo info{};
+    info.mode = hccp::kOfflineHdc;
+    info.phy_id = phy_id;
+    if (api.get_random(&info, &psn) != 0 || psn == 0U) {
+      psn = static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count() ^
+                                  static_cast<int64_t>(getpid()));
+      if (psn == 0U) psn = 1U;
+    }
+  }
+  return psn;
+}
+
+bool GetPeerCtpLocal(const hccp::DirectHccpApi &api, void *context,
+                     const std::array<uint8_t, hccp::kEidBytes> &local_eid,
+                     const std::array<uint8_t, hccp::kEidBytes> &peer_eid, uint64_t *tp_handle) {
+  hccp::GetTpCfg cfg{};
+  cfg.flag = hccp::CtpFlag();
+  cfg.transport_mode = hccp::kReliableMessage;
+  std::memcpy(cfg.local_eid.raw, local_eid.data(), local_eid.size());
+  std::memcpy(cfg.peer_eid.raw, peer_eid.data(), peer_eid.size());
+  hccp::TpInfo info{};
+  uint32_t count = kCtpTpCount;
+  void *async_request = nullptr;
+  int ret = api.get_tp_info_async(context, &cfg, &info, &count, &async_request);
+  if (ret != 0 || async_request == nullptr) {
+    std::fprintf(stderr, "[PUSH_TARGET] ctp async submit failed ret=%d\n", ret);
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCtpQueryTimeoutMs);
+  while (true) {
+    int request_result = 0;
+    ret = api.get_async_req_result(async_request, &request_result);
+    if (ret == kHccpAsyncAgain) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        std::fprintf(stderr, "[PUSH_TARGET] ctp async timeout\n");
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(kCtpQueryPollMs));
+      continue;
+    }
+    async_request = nullptr;
+    if (ret != 0 || request_result != 0) {
+      std::fprintf(stderr, "[PUSH_TARGET] ctp async complete failed ret=%d req=%d\n", ret, request_result);
+      return false;
+    }
+    break;
+  }
+  if (count == 0U || info.tp_handle == 0U) {
+    std::fprintf(stderr, "[PUSH_TARGET] ctp empty result\n");
+    return false;
+  }
+  *tp_handle = info.tp_handle;
+  return true;
+}
+
+bool CreateTargetJetty(const hccp::DirectHccpApi &api, void *context, void *cq_handle, void *token_handle,
+                       uint32_t token_value, uint32_t sq_depth, hccp::QpCreateInfo *jetty_info,
+                       void **jetty_handle) {
+  const uint64_t sq_bytes = static_cast<uint64_t>(sq_depth) * kAivWqebbsPerWqe * kAivWqeBytes;
+  hccp::QpCreateAttr attr{};
+  attr.scq_handle = cq_handle;
+  attr.rcq_handle = cq_handle;
+  attr.srq_handle = cq_handle;
+  attr.sq_depth = sq_depth;
+  attr.rq_depth = kDeviceAivRqDepth;
+  attr.transport_mode = hccp::kReliableMessage;
+  attr.ub.mode = hccp::kJettyUserCtlNormal;
+  attr.ub.jetty_id = 0U;
+  attr.ub.flag = hccp::JettyFlagShareJfr();
+  attr.ub.jfs_flag = hccp::JfsFlagErrorSuspend();
+  attr.ub.token_id_handle = token_handle;
+  attr.ub.token_value = token_value;
+  attr.ub.priority = 15U;
+  attr.ub.rnr_retry = 7U;
+  attr.ub.err_timeout = 16U;
+  attr.ub.ext_mode.sqebb_num = sq_depth;
+  attr.ub.ext_mode.sq.buffer_size = static_cast<uint32_t>(sq_bytes);
+  attr.ub.ext_mode.sq.buffer_va = 0U;
+  attr.ub.ext_mode.cstm_flag = 0U;
+  *jetty_info = {};
+  *jetty_handle = nullptr;
+  const int ret = api.qp_create(context, &attr, jetty_info, jetty_handle);
+  if (ret != 0 || *jetty_handle == nullptr || jetty_info->key.size == 0U ||
+      jetty_info->key.size > hccp::kQpKeyBytes) {
+    std::fprintf(stderr, "[PUSH_TARGET] qp_create failed ret=%d key_bytes=%u\n", ret, jetty_info->key.size);
+    return false;
+  }
+  return true;
+}
 
 namespace {
 
@@ -92,7 +239,7 @@ int main(int argc, char **argv) {
   CHECK_ACL(aclrtSetDevice(static_cast<int32_t>(args.device_id)));
 
   hccp::DirectHccpApi api{};
-  if (!hccp::LoadDirectHccp(&api)) {
+  if (!LoadDirectHccpLocal(&api)) {
     std::fprintf(stderr, "[PUSH_TARGET] LoadDirectHccp failed\n");
     return 1;
   }
@@ -120,7 +267,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "[PUSH_TARGET] token_alloc failed\n");
     return 1;
   }
-  const uint32_t token_value = hccp::MakePeerCtpPsn(api, args.device_id, "push_target");
+  const uint32_t token_value = MakePsn(api, args.device_id);
 
   // HBM buffer: [flag 4K][data area].
   void *hot = nullptr;
@@ -153,18 +300,17 @@ int main(int argc, char **argv) {
   }
   hccp::QpCreateInfo jetty_info{};
   void *jetty_handle = nullptr;
-  if (!hccp::CreateDeviceAivJetty(api, ctx, cq_handle, token_handle, token_value, kSqDepth, "push_target",
-                                  &jetty_info, &jetty_handle)) {
+  if (!CreateTargetJetty(api, ctx, cq_handle, token_handle, token_value, kSqDepth, &jetty_info, &jetty_handle)) {
     std::fprintf(stderr, "[PUSH_TARGET] CreateDeviceAivJetty failed\n");
     return 1;
   }
 
   uint64_t tp_handle = 0;
-  if (!hccp::GetPeerCtp(api, ctx, local_eid, peer_eid, "push_target", &tp_handle)) {
+  if (!GetPeerCtpLocal(api, ctx, local_eid, peer_eid, &tp_handle)) {
     std::fprintf(stderr, "[PUSH_TARGET] GetPeerCtp failed\n");
     return 1;
   }
-  const uint32_t psn = hccp::MakePeerCtpPsn(api, args.device_id, "push_target_psn");
+  const uint32_t psn = MakePsn(api, args.device_id);
 
   {
     FILE *kf = std::fopen(args.keyfile.c_str(), "w");
