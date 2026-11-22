@@ -7,7 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "acl/acl.h"
@@ -172,6 +175,8 @@ bool CreateTargetJetty(const hccp::DirectHccpApi &api, void *context, void *cq_h
   }
   return true;
 }
+
+}  // namespace
 
 namespace {
 
@@ -404,7 +409,7 @@ int main(int argc, char **argv) {
   aclrtFreeHost(verify_host);
   aclrtFree(hot);
   if (api.qp_destroy != nullptr && jetty_handle != nullptr) (void)api.qp_destroy(jetty_handle);
-  if (api.cq_destroy != nullptr && cq_handle != nullptr) (void)api.cq_destroy(cq_handle);
+  if (api.cq_destroy != nullptr && cq_handle != nullptr) (void)api.cq_destroy(ctx, cq_handle);
   if (api.lmem_unregister != nullptr && mr_handle != nullptr) (void)api.lmem_unregister(ctx, mr_handle);
   if (api.token_free != nullptr && token_handle != nullptr) (void)api.token_free(ctx, token_handle);
   if (api.ctx_deinit != nullptr && ctx != nullptr) (void)api.ctx_deinit(ctx);

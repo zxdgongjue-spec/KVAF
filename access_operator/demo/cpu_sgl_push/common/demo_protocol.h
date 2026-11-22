@@ -32,7 +32,8 @@ inline void FillRow(uint8_t *row, uint32_t token_bytes, uint64_t token_id) {
 inline uint64_t VerifyRow(const uint8_t *row, uint32_t token_bytes) {
   uint64_t token_id = 0;
   std::memcpy(&token_id, row, 8);
-  for (uint64_t off : {0ULL, uint64_t(token_bytes / 2) & ~7ULL, uint64_t(token_bytes - 8)}) {
+  const uint64_t offs[3] = {0, uint64_t(token_bytes / 2) & ~7ULL, uint64_t(token_bytes - 8)};
+  for (uint64_t off : offs) {
     uint64_t word = 0;
     std::memcpy(&word, row + off, 8);
     if (word != RowWord(token_id, off / 8)) return ~0ULL;

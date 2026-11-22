@@ -238,11 +238,12 @@ int main(int argc, char **argv) {
   urma_reg_seg_flag_t seg_flag{};
   seg_flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
   seg_flag.bs.cacheable = URMA_NON_CACHEABLE;
-// Compatibility: older UMDK headers spell remote access bits without REMOTE_.
-#ifndef URMA_ACCESS_REMOTE_ATOMIC
-#define URMA_ACCESS_REMOTE_ATOMIC URMA_ACCESS_ATOMIC
-#endif
-  seg_flag.bs.access = URMA_ACCESS_REMOTE_READ | URMA_ACCESS_REMOTE_WRITE | URMA_ACCESS_REMOTE_ATOMIC;
+// ABI-stable access bit values; UMDK renames the enum members across
+// releases (REMOTE_* vs plain), so use the documented bit positions directly.
+constexpr uint32_t kAccessRead = 0x1U << 1;
+constexpr uint32_t kAccessWrite = 0x1U << 2;
+constexpr uint32_t kAccessAtomic = 0x1U << 3;
+  seg_flag.bs.access = kAccessRead | kAccessWrite | kAccessAtomic;
   seg_flag.bs.non_pin = 1U;
   seg_flag.bs.token_id_valid = 1U;
   urma_seg_cfg_t seg_cfg{};
