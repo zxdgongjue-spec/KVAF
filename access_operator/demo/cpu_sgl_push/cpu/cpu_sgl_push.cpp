@@ -245,7 +245,9 @@ constexpr uint32_t kAccessRead = 0x1U << 1;
 constexpr uint32_t kAccessWrite = 0x1U << 2;
 constexpr uint32_t kAccessAtomic = 0x1U << 3;
   seg_flag.bs.access = kAccessRead | kAccessWrite | kAccessAtomic;
-  seg_flag.bs.non_pin = 1U;
+  // 18's UMDK/driver faults DMA on non-pinned registrations (LOC_ACCESS_ERR);
+  // let the driver pin the pages (non_pin=0).
+  seg_flag.bs.non_pin = 0U;
   seg_flag.bs.token_id_valid = 1U;
   urma_seg_cfg_t seg_cfg{};
   seg_cfg.va = reinterpret_cast<uint64_t>(ddr);
