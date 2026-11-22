@@ -175,7 +175,7 @@ int PrintEid() {
 
 int main(int argc, char **argv) {
   if (argc == 2 && std::string(argv[1]) == "--print-eid") return PrintEid();
-  const Args args = ParseArgs(argc, argv);
+  Args args = ParseArgs(argc, argv);
   Keyfile key{};
   if (!LoadKeyfile(args.keyfile, &key)) {
     std::fprintf(stderr, "[SGL_PUSH] keyfile load failed: %s\n", args.keyfile.c_str());
@@ -270,15 +270,6 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     std::fprintf(stderr, "[SGL_PUSH] create_jfc failed errno=%d\n", errno);
     return 1;
   }
-  urma_jfs_cfg_t jfs{};
-  jfs.depth = 1024;
-  jfs.flag.bs.error_suspend = 1U;
-  jfs.trans_mode = URMA_TM_RM;
-  jfs.priority = 15U;
-  jfs.max_sge = kMaxGroup;
-  jfs.rnr_retry = 7U;
-  jfs.err_timeout = 16U;
-  jfs.jfc = jfc;
   urma_jfr_cfg_t jfr_cfg{};
   jfr_cfg.depth = 256;
   jfr_cfg.trans_mode = URMA_TM_RM;
@@ -291,15 +282,37 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     std::fprintf(stderr, "[SGL_PUSH] create_jfr failed errno=%d\n", errno);
     return 1;
   }
-  urma_jetty_cfg_t jetty_cfg{};
-  jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
-  jetty_cfg.jfs_cfg = jfs;
-  jetty_cfg.shared.jfr = jfr;
-  jetty_cfg.shared.jfc = jfc;
-  urma_jetty_t *jetty = urma_create_jetty(ctx, &jetty_cfg);
+  // max_sge caps vary across UMDK/driver builds; probe downward until the
+  // jetty is accepted. The demo needs at least 2 sge per run WR.
+  urma_jetty_t *jetty = nullptr;
+  uint32_t max_sge_accepted = 0;
+  for (uint32_t probe = kMaxGroup; probe >= 2U && jetty == nullptr; probe >>= 1U) {
+    urma_jetty_cfg_t jetty_cfg{};
+    jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
+    jetty_cfg.jfs_cfg.depth = 1024;
+    jetty_cfg.jfs_cfg.flag.bs.error_suspend = 1U;
+    jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+    jetty_cfg.jfs_cfg.priority = 15U;
+    jetty_cfg.jfs_cfg.max_sge = probe;
+    jetty_cfg.jfs_cfg.rnr_retry = 7U;
+    jetty_cfg.jfs_cfg.err_timeout = 16U;
+    jetty_cfg.jfs_cfg.jfc = jfc;
+    jetty_cfg.shared.jfr = jfr;
+    jetty_cfg.shared.jfc = jfc;
+    jetty = urma_create_jetty(ctx, &jetty_cfg);
+    if (jetty != nullptr) max_sge_accepted = probe;
+  }
   if (jetty == nullptr) {
-    std::fprintf(stderr, "[SGL_PUSH] create_jetty failed errno=%d\n", errno);
+    std::fprintf(stderr, "[SGL_PUSH] create_jetty failed for all max_sge errno=%d\n", errno);
     return 1;
+  }
+  std::fprintf(stderr, "[SGL_PUSH] jetty ready max_sge=%u\n", max_sge_accepted);
+  if (max_sge_accepted < args.group) {
+    std::fprintf(stderr, "[SGL_PUSH] WARNING: group=%u exceeds max_sge=%u; runs will be split\n",
+                 args.group, max_sge_accepted);
+    // Split each run into ceil(group/max_sge) sub-WRs sharing the contiguous
+    // destination; simplest correct approach: clamp the effective group.
+    args.group = max_sge_accepted;
   }
 
   // CTP + import of the NPU target jetty.
