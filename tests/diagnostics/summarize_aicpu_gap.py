@@ -1002,7 +1002,47 @@ def msprof_device_clock(root, tasks, frequency, diagnostics=None, raw_clock=Fals
     return convert
 
 
-def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5):
+def cann_execution_boundaries(selected, execution_rows, workers, tolerance=1.0):
+    """CANN CSV Timestamp is sys_start; Task_time is sys_end - sys_start.
+
+    See Ascend/msprof analysis/viewer/aicpu_viewer.py and
+    analysis/msparser/add_info/aicpu_add_info_bean.py. Custom entry/return
+    lie inside these callbacks; their duration bounds the remaining wrapper.
+    """
+    values = []
+    for p in selected:
+        rows = execution_rows.get(id(p["task"]), [])
+        if len(rows) != workers:
+            return dict(status="incomplete_worker_rows", expected_workers=workers,
+                        matched_rows=len(rows), round=p["round"], node=p["node"])
+        start, end = min(row[0] for row in rows), max(row[1] for row in rows)
+        if start < -tolerance or end > p["task_span"] + tolerance:
+            return dict(status="cann_execution_outside_task", round=p["round"], node=p["node"],
+                        execution_start_us=round(start, 3), execution_end_us=round(end, 3))
+        extra = end - start - p["entry_span"]
+        if extra < -tolerance:
+            return dict(status="custom_span_exceeds_cann_execution", round=p["round"], node=p["node"],
+                        cann_execution_span_us=round(end - start, 3), custom_entry_span_us=round(p["entry_span"], 3))
+        front, back, gap = start, p["task_span"] - end, p["task_outside_entry"]
+        values.append(dict(round=p["round"], node=p["node"], front=front, back=back,
+            execution_span=end - start, extra=extra,
+            front_low=max(0.0, front - tolerance), front_high=max(0.0, gap - back + tolerance),
+            back_low=max(0.0, back - tolerance), back_high=max(0.0, gap - front + tolerance)))
+    means = {key: statistics.mean(v[key] for v in values) for key in ("front_low", "front_high", "back_low", "back_high")}
+    dominant = ("before_entry" if means["front_low"] > means["back_high"] else
+                "after_return" if means["back_low"] > means["front_high"] else "unresolved_within_bounds")
+    return dict(status="available", source="cann_aicpu_csv_execution_envelope", selected_nodes=len(values),
+        workers_per_node=workers, tolerance_us=tolerance,
+        stats_us={name: stats([v[key] for v in values]) for name, key in (
+            ("task_begin_to_cann_execution", "front"), ("cann_execution_to_task_end", "back"),
+            ("cann_execution_span", "execution_span"), ("cann_execution_outside_custom_entry", "extra"))},
+        user_boundary_mean_bounds_us=dict(task_begin_to_first_entry=[round(means[k], 3) for k in ("front_low", "front_high")],
+                                          last_return_to_task_end=[round(means[k], 3) for k in ("back_low", "back_high")]),
+        dominant_boundary=dominant,
+        note="CANN callback boundaries are measured on the trace clock. Custom entry/return positions are bounded by the callback envelope minus the custom duration, not clock-fitted point estimates.")
+
+
+def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5, execution_rows=None):
     if data is None:
         return dict(status="samples_missing", note="Rerun the benchmark with --kernel-profile to export aicpu_samples.json.")
     if timeline.get("sample_selection") != "formal_rounds_by_serial_replay_contract":
@@ -1056,6 +1096,15 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
     indexes = sorted({round(i * (len(representatives) - 1) / max(1, sample_limit - 1)) for i in range(sample_limit)})
     result["representative_nodes"] = [dict(round=representatives[i]["round"], node=representatives[i]["node"],
         **{key + "_us": round(representatives[i][key], 3) for key in fields}) for i in indexes]
+    if execution_rows is not None and clock_map is None:
+        cann = cann_execution_boundaries(selected, execution_rows, data["aicpu_workers"])
+        result["cann_execution_boundary"] = cann
+        if cann["status"] == "available":
+            result["clock"] = dict(status="same_domain_cann_execution_envelope", split_available=True,
+                point_estimates_available=False, source="CANN Timestamp + Task_time; custom timestamps used only for durations")
+            result["dominant_boundary"] = cann["dominant_boundary"]
+            result["user_boundary_mean_bounds_us"] = cann["user_boundary_mean_bounds_us"]
+            return result
     convert, counter_mode, mapping_diagnostics = None, False, {}
     raw_clock = data["device_clock"] == "aicpu_monotonic_raw_ns"
     if clock_map is not None:
@@ -1170,19 +1219,19 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
     return result
 
 
-def column_time(row, stems):
+def column_time(row, stems, precise=False):
     for key, value in row.items():
         key = norm(key)
         for stem in stems:
             if key in (stem, stem + "us", stem + "ns", stem + "ms", stem + "s"):
-                value = number(value)
-                if value is not None:
+                parsed = number(value)
+                if parsed is not None:
                     scale = .001 if key.endswith("ns") else 1000 if key.endswith("ms") else 1e6 if key == stem + "s" else 1
-                    return value * scale
+                    return Decimal(str(value).replace(",", "")) * Decimal(str(scale)) if precise else parsed * scale
     return None
 
 
-def csv_report(root, selected_tasks=None, selected_events=None):
+def csv_report(root, selected_tasks=None, selected_events=None, execution_rows=None):
     durations, api_totals, files, warnings = defaultdict(list), defaultdict(lambda: [0, 0]), Counter(), Counter()
     selected, matched, selected_rows = defaultdict(list), set(), 0
     selected_tasks = selected_tasks or {}
@@ -1232,6 +1281,13 @@ def csv_report(root, selected_tasks=None, selected_events=None):
                     if match:
                         matched.add(match_key)
                         selected_rows += 1
+                        if execution_rows is not None and isinstance(match_key, tuple):
+                            start = column_time(row, ("timestamp", "starttime", "taskstarttime"), precise=True)
+                            duration = column_time(row, ("tasktime",), precise=True)
+                            if start is not None and duration is not None and duration > 0:
+                                event = selected_events[match_key[1]]
+                                relative = start - Decimal(str(event.start))
+                                execution_rows.setdefault(id(event), []).append((float(relative), float(relative + duration)))
                     for field in ("dispatchtime", "totaltime", "tasktime", "computetime", "memcpytime"):
                         value = column_time(row, (field,))
                         if value is not None:
@@ -1341,7 +1397,8 @@ def main(argv=None):
                 raise ValueError("INPUT_SAMPLE_BENCHMARK_CONFIG_MISMATCH")
         timeline = trace.report(args.last, args.samples, args.kernel_pattern is not None, execution, gets, samples_data)
         graph_scope_comparison(benchmark, timeline)
-        supplement = csv_report(root, trace.selected_csv_tasks, trace.selected_task_events)
+        execution_rows = {}
+        supplement = csv_report(root, trace.selected_csv_tasks, trace.selected_task_events, execution_rows)
         if supplement["selected_aicpu_rows"]["matched_tasks"] == len(trace.selected_task_events):
             timeline.get("warnings", {}).pop("SELECTED_CSV_IDS_MISSING_OR_REUSED", None)
         report = dict(format="kvaf-aicpu-gap-core-v1", units="us", last_linked_launches=args.last,
@@ -1355,13 +1412,14 @@ def main(argv=None):
                              "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",
                              "Aggregate benchmark means and trace task means are separate scopes; entry_boundary uses per-round samples when available.",
-                             "Version-3 device timestamps use CLOCK_MONOTONIC_RAW and the capture's device/Host monotonic-raw anchors. CNTFRQ and HWTS frequency are not assumed equal. No task boundary is used as a clock anchor.",
+                             "CANN AICPU CSV Timestamp + Task_time provide execution intervals on the exported trace clock. Complete worker rows and custom entry durations bound the user boundaries without converting custom absolute timestamps.",
+                             "When CANN execution rows are unavailable, version-3 timestamps use device/Host monotonic-raw anchors with containment checks. CNTFRQ and HWTS frequency are not assumed equal. No task boundary is used as a clock anchor.",
                              "Legacy counter samples require a matching clock domain or an independent --clock-map. Boundary uncertainty covers trace quantization, not an independently measured hardware synchronization error."],
                       benchmark=benchmark,
                       timeline=timeline,
                       csv_supplement=supplement)
         if execution == "graph":
-            report["entry_boundary"] = entry_boundary_report(trace, timeline, samples_data, args.clock_map, args.samples)
+            report["entry_boundary"] = entry_boundary_report(trace, timeline, samples_data, args.clock_map, args.samples, execution_rows)
         if not trace.files:
             report["notes"].append("No readable timeline JSON: CSVs alone cannot localize dispatch/completion gaps.")
         text = bounded_report(report, args.max_chars)

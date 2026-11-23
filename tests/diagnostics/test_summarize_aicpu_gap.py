@@ -129,7 +129,106 @@ def add_raw_samples(root, data, shift_ns=0):
     return load_graph_samples(root)
 
 
+def write_cann_execution_csv(root, trace, workers, shift=0):
+    rows = ["Task ID,Timestamp(us),Task_time(us)"]
+    for event in trace.selected_task_events:
+        for worker in range(workers):
+            start = Decimal(str(event.start)) + Decimal("9.9") + shift + Decimal(worker) / 2
+            duration = Decimal("70.2") - worker
+            rows.append(f"{event.ids['task']},{start},{duration}")
+    (root / "aicpu_execution.csv").write_text("\n".join(rows) + "\n")
+
+
 class GapExtractorTest(unittest.TestCase):
+    def test_cann_callback_bounds_resolve_front_and_back_for_one_and_six_workers(self):
+        for workers in (1, 6):
+            for shift, dominant in ((0, "after_return"), (10, "before_entry")):
+                with self.subTest(workers=workers, shift=shift), TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    trace, timeline, data = sample_trace(root, gets=2, last=1)
+                    data["aicpu_workers"] = workers
+                    for sample in data["rounds"]:
+                        for node in sample["nodes"]:
+                            base = node["workers"][0]["device_entry_ns"]
+                            node["workers"] = [dict(worker=w, device_entry_ns=base + w * 500,
+                                device_start_ns=base + 5000 + w * 500,
+                                device_finish_ns=base + 65000 - w * 500,
+                                device_return_ns=base + 70000 - w * 500) for w in range(workers)]
+                    write_cann_execution_csv(root, trace, workers, shift)
+                    execution = {}
+                    csv_report(root, trace.selected_csv_tasks, trace.selected_task_events, execution)
+                    result = entry_boundary_report(trace, timeline, data, execution_rows=execution)
+                    self.assertEqual(result["clock"]["status"], "same_domain_cann_execution_envelope")
+                    self.assertFalse(result["clock"]["point_estimates_available"])
+                    self.assertEqual(result["dominant_boundary"], dominant)
+                    self.assertEqual(result["user_boundary_mean_bounds_us"]["task_begin_to_first_entry"],
+                                     [round(v + shift, 3) for v in (8.9, 11.1)])
+                    self.assertEqual(result["user_boundary_mean_bounds_us"]["last_return_to_task_end"],
+                                     [round(v - shift, 3) for v in (18.9, 21.1)])
+                    self.assertEqual(result["cann_execution_boundary"]["selected_nodes"], 2)
+                    self.assertNotIn("9000000000000", json.dumps(result))
+
+    def test_cann_callback_does_not_force_a_dominant_side_for_a_wide_wrapper(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            execution = {id(event): [(2.5, 97.5)] * 2 for event in trace.selected_task_events}
+            result = entry_boundary_report(trace, timeline, data, execution_rows=execution)
+            self.assertEqual(result["dominant_boundary"], "unresolved_within_bounds")
+            self.assertEqual(result["user_boundary_mean_bounds_us"]["task_begin_to_first_entry"], [1.5, 28.5])
+            self.assertEqual(result["user_boundary_mean_bounds_us"]["last_return_to_task_end"], [1.5, 28.5])
+
+    def test_cann_callback_preserves_fractional_epoch_timestamps(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            for event in trace.selected_task_events:
+                event.start += 1_700_000_000_000_000
+            write_cann_execution_csv(root, trace, 2)
+            execution = {}
+            csv_report(root, trace.selected_csv_tasks, trace.selected_task_events, execution)
+            for event in trace.selected_task_events:
+                self.assertAlmostEqual(execution[id(event)][0][0], 9.9)
+                self.assertAlmostEqual(execution[id(event)][0][1], 80.1)
+
+    def test_cann_callback_rejects_missing_rows_and_inconsistent_scopes(self):
+        for failure in ("missing", "short", "outside"):
+            with self.subTest(failure=failure), TemporaryDirectory() as folder:
+                root = Path(folder)
+                trace, timeline, data = sample_trace(root)
+                write_cann_execution_csv(root, trace, 2)
+                execution = {}
+                csv_report(root, trace.selected_csv_tasks, trace.selected_task_events, execution)
+                rows = execution[id(trace.selected_task_events[0])]
+                if failure == "missing":
+                    rows.pop()
+                elif failure == "short":
+                    rows[:] = [(10.0, 11.0)] * 2
+                else:
+                    rows[0] = (10.0, 110.0)
+                result = entry_boundary_report(trace, timeline, data, execution_rows=execution)
+                self.assertEqual(result["cann_execution_boundary"]["status"], {
+                    "missing": "incomplete_worker_rows", "short": "custom_span_exceeds_cann_execution",
+                    "outside": "cann_execution_outside_task"}[failure])
+                self.assertNotIn("dominant_boundary", result)
+
+    def test_cann_callback_cli_does_not_need_device_clock_mapping(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            write_cann_execution_csv(root, trace, 2, shift=10)
+            (root / "summary.csv").write_text(
+                "backend,execution,gets_per_replay,kernel_mean_us,e2e_mean_us,graph_api,graph_submit\n"
+                "gather_read,graph,1,60,160,acl,native\n")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--msprof-dir", str(root), "--benchmark-dir", str(root), "--last", "1"])
+            self.assertEqual(code, 0)
+            result = json.loads(output.getvalue())["entry_boundary"]
+            self.assertEqual(result["clock"]["status"], "same_domain_cann_execution_envelope")
+            self.assertEqual(result["dominant_boundary"], "before_entry")
+            self.assertNotIn(str(root), output.getvalue())
+
     def test_raw_clock_alignment_is_independent_of_hwts_frequency(self):
         for shift_ns, front, tail, dominant in ((0, 10, 20, "after_return"), (10000, 20, 10, "before_entry")):
             with self.subTest(shift_ns=shift_ns), TemporaryDirectory() as folder:
