@@ -163,9 +163,9 @@ def event_from_raw(raw, process_names, pattern):
     direction = ("d2h" if any(s in direction for s in ("d2h", "devicetohost", "device2host")) else
                  "h2d" if any(s in direction for s in ("h2d", "hosttodevice", "host2device")) else "unknown")
     ids = {key: identifier(pick(args, *aliases)) for key, aliases in {
-        "stream": ("streamid", "stream"), "task": ("taskid",),
+        "stream": ("streamid", "stream", "physicstreamid", "physicalstreamid"), "task": ("taskid",),
         "device": ("deviceid", "device"), "connection": ("connectionid",),
-        "correlation": ("correlationid", "correlation")}.items()}
+        "correlation": ("correlationid", "correlation"), "event": ("eventid", "eventhandle", "event")}.items()}
     for key in ("connection", "correlation"):
         if ids[key] in ("0", "18446744073709551615"):
             ids[key] = None
@@ -177,6 +177,7 @@ class Trace:
     def __init__(self, root, pattern):
         self.events, self.flows = [], defaultdict(list)
         self.warnings, self.files = Counter(), 0
+        self.stream_tracks = set()
         processes, raw_events, seen = {}, [], {}
         files = sorted(set(root.rglob("msprof_*.json")) | set(root.rglob("msprof_*.json.gz")))
         for source, path in enumerate(files):
@@ -196,6 +197,9 @@ class Trace:
                     phase = raw.get("ph")
                     if phase == "M" and raw.get("name") == "process_name":
                         processes[str(raw.get("pid", ""))] = norm((raw.get("args") or {}).get("name", ""))
+                    if phase == "M" and raw.get("name") == "thread_name" and re.fullmatch(
+                            r"Stream\s+\d+", str((raw.get("args") or {}).get("name", "")).strip(), re.I):
+                        self.stream_tracks.add((str(raw.get("pid", "")), str(raw.get("tid", ""))))
                     if phase in ("s", "t", "f"):
                         value = raw.get("id2", raw.get("id"))
                         if value is not None and number(raw.get("ts")) is not None:
@@ -279,12 +283,17 @@ class Trace:
                     edges[index].add(previous)
                     previous = index if phase == "t" else None
         result, api_ids = {}, defaultdict(list)
+        model_starts = defaultdict(list)
+        for event in self.events:
+            if event.kind == "launch" and "execute" in norm(event.label):
+                model_starts[event.track].append(event.start)
         def capture_only(host_index, event):
             host = self.events[host_index]
             # A capture-time kernel ID does not identify a later model replay.
-            stale = event.kind == "aicpu" and "launch" in norm(host.label) and any(
-                e.track == host.track and e.kind == "launch" and "execute" in norm(e.label)
-                and host.end <= e.start <= event.start for e in self.events)
+            starts = model_starts[host.track]
+            position = bisect_right(starts, event.start)
+            stale = (event.kind == "aicpu" and "launch" in norm(host.label) and
+                     position > 0 and starts[position - 1] >= host.end)
             if stale:
                 self.warnings["CAPTURE_LAUNCH_NOT_REPLAY_LINK"] += 1
             return stale
@@ -355,7 +364,12 @@ class Trace:
                     self.warnings["AMBIGUOUS_ID_LINK"] += 1
         return result
 
-    def report(self, last, samples, explicit_pattern):
+    def report(self, last, samples, explicit_pattern, execution="eager", gets_per_replay=1):
+        if execution == "graph":
+            return self.graph_report(last, samples, gets_per_replay)
+        return self.eager_report(last, samples, explicit_pattern)
+
+    def eager_report(self, last, samples, explicit_pattern):
         links = self.links()
         targets = [i for i, event in enumerate(self.events) if event.target]
         selection = "kernel_name"
@@ -369,11 +383,6 @@ class Trace:
         launches = sorted(groups, key=lambda i: self.events[i].start)
         selected = launches[-last:] if last else launches
         tasks = [self.events[i] for launch in selected for i in groups[launch]]
-        # CSV Task IDs can be reused by graph replays. Filter only unambiguous IDs.
-        occurrences = Counter(e.ids["task"] for e in self.events if e.kind == "aicpu" and e.ids["task"] is not None)
-        self.selected_csv_tasks = {e.ids["task"]: e.ids for e in tasks if occurrences[e.ids["task"]] == 1}
-        if len(self.selected_csv_tasks) < len(tasks):
-            self.warnings["SELECTED_CSV_IDS_MISSING_OR_REUSED"] += len(tasks) - len(self.selected_csv_tasks)
         if not groups:
             tasks = [self.events[i] for i in targets]
             if last:
@@ -438,6 +447,162 @@ class Trace:
                                               (not copies or (copy_begin >= task_end - 1 and copy_end <= sync.end + 1)))
             chain["metrics_us"] = {key: round(value, 3) for key, value in metrics.items()}
             chains.append(chain)
+        result = self.chain_report(targets, groups, selected, chains, tasks, selection, samples)
+        result["execution"] = "eager"
+        return result
+
+    def graph_report(self, last, samples, gets_per_replay):
+        links = self.links()
+        targets = [i for i, event in enumerate(self.events) if event.target]
+        roots = {self.outer_api(i, e.kind) for i, e in enumerate(self.events)
+                 if e.kind in ("launch", "event_api", "sync")}
+        roots.discard(None)
+        by_process = defaultdict(list)
+        records = defaultdict(list)
+        models = []
+        outer_end = {}
+        for i in sorted(roots, key=lambda i: (self.events[i].start, -self.events[i].duration)):
+            event = self.events[i]
+            # Ignore nested Runtime calls, including sync inside another API kind.
+            if event.end <= outer_end.get(event.track, -math.inf):
+                continue
+            outer_end[event.track] = event.end
+            by_process[event.pid].append(i)
+            if event.kind == "launch" and "execute" in norm(event.label):
+                models.append(i)
+        for device, (host, _) in links.items():
+            if self.events[device].kind == "device_event":
+                records[host].append(device)
+        rejects, groups, candidates = Counter(), {}, {}
+        occupied = set()
+        for model in models:
+            launch = self.events[model]
+            # The benchmark records Events immediately around one replay. Allow
+            # serialized Torch Host-queue threads, but no intervening submission.
+            hosts = by_process[launch.pid]
+            position = hosts.index(model)
+            if position == 0 or position + 2 >= len(hosts):
+                rejects["missing_host_bracket"] += 1
+                continue
+            start_host, end_host, sync_host = hosts[position - 1], hosts[position + 1], hosts[position + 2]
+            start, end, sync = (self.events[i] for i in (start_host, end_host, sync_host))
+            if (start.kind != "event_api" or end.kind != "event_api" or sync.kind != "sync" or
+                    "event" not in norm(sync.label) or
+                    not start.end <= launch.start <= launch.end <= end.start <= end.end <= sync.start):
+                rejects["not_timed_record_model_record_event_sync"] += 1
+                continue
+            if end.ids.get("event") and sync.ids.get("event") and end.ids["event"] != sync.ids["event"]:
+                rejects["end_event_identity_mismatch"] += 1
+                continue
+            if len(records[start_host]) != 1 or len(records[end_host]) != 1:
+                rejects["missing_or_ambiguous_device_event_links"] += 1
+                continue
+            first, final = self.events[records[start_host][0]], self.events[records[end_host][0]]
+            if first.track != final.track or first.end > final.start:
+                rejects["device_event_stream_or_order_mismatch"] += 1
+                continue
+            if (any(first.ids[key] and final.ids[key] and first.ids[key] != final.ids[key]
+                    for key in ("stream", "device")) or
+                    (not (first.ids["stream"] and final.ids["stream"]) and first.track not in self.stream_tracks)):
+                rejects["unknown_or_inconsistent_device_stream"] += 1
+                continue
+            def same_stream(event):
+                if any(first.ids[key] and event.ids[key] and first.ids[key] != event.ids[key]
+                       for key in ("stream", "device")):
+                    return False
+                return event.track == first.track
+            lane = self.tracks[first.track]
+            begin = bisect_right(self.starts[first.track], first.end - .001)
+            stop = bisect_right(self.starts[first.track], final.start + .001)
+            window = lane[begin:stop]
+            position = begin - 1
+            crosses_start = False
+            while position >= 0 and self.max_ends[first.track][position] > first.end + .001:
+                event = self.events[lane[position]]
+                crosses_start |= event.kind in ("aicpu", "device_copy") and event.end > first.end + .001
+                position -= 1
+            if crosses_start:
+                rejects["device_work_crosses_start_event"] += 1
+                continue
+            task_ids = [i for i in window if self.events[i].target and same_stream(self.events[i]) and
+                        self.events[i].end <= final.start + .001]
+            device_tasks = [self.events[i] for i in task_ids]
+            if len(task_ids) != gets_per_replay:
+                rejects["unexpected_get_task_count"] += 1
+                continue
+            if occupied.intersection(task_ids):
+                rejects["task_in_multiple_replays"] += 1
+                continue
+            if any(self.events[i].kind in ("aicpu", "device_copy") and not self.events[i].target
+                   and same_stream(self.events[i]) for i in window):
+                rejects["unrelated_device_work_in_bracket"] += 1
+                continue
+            if any(self.events[i].kind in ("aicpu", "device_copy") and self.events[i].end > final.start + .001
+                   for i in window):
+                rejects["device_work_crosses_end_event"] += 1
+                continue
+            occupied.update(task_ids)
+            groups[model] = task_ids
+            task_begin, task_end = min(e.start for e in device_tasks), max(e.end for e in device_tasks)
+            union = interval_union(device_tasks)
+            metrics = dict(
+                launch_api=launch.duration, sync_call=sync.duration,
+                launch_return_to_sync_begin=sync.start - launch.end,
+                launch_to_sync_return=sync.end - launch.start,
+                host_record_begin_to_sync_return=sync.end - start.start,
+                host_start_event_record=start.duration, host_end_event_record=end.duration,
+                task_envelope=task_end - task_begin, task_union=union,
+                task_sum=sum(e.duration for e in device_tasks),
+                task_overlap=sum(e.duration for e in device_tasks) - union,
+                inter_task_gaps=task_end - task_begin - union,
+                device_event_record_inner_window=final.start - first.end,
+                device_event_record_outer_window=final.end - first.start,
+                device_event_start_to_task=task_begin - first.end,
+                device_task_to_end_event=final.start - task_end,
+                device_end_event_record=final.duration,
+                aligned_start_record_begin_to_device_event_end=first.end - start.start,
+                aligned_end_event_end_to_sync_return=sync.end - final.end,
+                aligned_launch_to_task_begin=task_begin - launch.start,
+                aligned_task_end_to_sync_return=sync.end - task_end)
+            metrics.update({key + "_per_get": metrics[key] / gets_per_replay for key in (
+                "task_union", "task_sum", "inter_task_gaps", "device_event_record_inner_window",
+                "device_event_record_outer_window", "device_event_start_to_task", "device_task_to_end_event")})
+            relative = lambda e: [round(e.start - launch.start, 3), round(e.end - launch.start, 3)]
+            candidates[model] = dict(
+                launch_api=launch.label, sync_api=sync.label, workers_or_task_events=len(task_ids),
+                link_methods=["event_bracket_same_stream"],
+                stream_identity="explicit_stream_and_track" if first.ids["stream"] and final.ids["stream"] else "stream_track_metadata",
+                event_link_methods=sorted({links[records[h][0]][1] for h in (start_host, end_host)}),
+                host_order="thread" if start.track == launch.track == end.track == sync.track else "process_serial",
+                host_launch_us=relative(launch), host_sync_us=relative(sync),
+                host_event_records_us=[relative(start), relative(end)],
+                device_event_bracket_us=[relative(first), relative(final)],
+                device_task_us=[round(task_begin - launch.start, 3), round(task_end - launch.start, 3)],
+                device_task_intervals_us=[relative(e) for e in device_tasks],
+                cross_clock_order_ok=(first.start >= start.start - 1 and launch.start <= task_begin + 1 and
+                                      task_end <= sync.end + 1 and final.end <= sync.end + 1),
+                metrics_us={key: round(value, 3) for key, value in metrics.items()})
+        selected = list(groups)[-last:] if last else list(groups)
+        if not selected:
+            self.warnings["NO_VALIDATED_GRAPH_REPLAY_BRACKETS"] += 1
+        if last and len(selected) < last:
+            self.warnings["GRAPH_REPLAYS_FEWER_THAN_REQUESTED"] += last - len(selected)
+        chains = [dict(candidates[i], launch_ordinal=models.index(i) + 1) for i in selected]
+        tasks = [self.events[i] for model in selected for i in groups[model]]
+        result = self.chain_report(targets, groups, selected, chains, tasks, "kernel_name", samples)
+        result.update(execution="graph", association="validated_device_event_containment",
+                      model_execute_calls=len(models), timed_replay_brackets=len(groups),
+                      selected_replays=len(selected), expected_gets_per_replay=gets_per_replay,
+                      replay_rejections=dict(rejects), linked_device_event_records=sum(map(len, records.values())),
+                      metrics_scope="per_replay; fields ending _per_get are divided by Get count")
+        return result
+
+    def chain_report(self, targets, groups, selected, chains, tasks, selection, samples):
+        # Replayed CSV Task IDs can repeat. Filter only unambiguous identities.
+        occurrences = Counter(e.ids["task"] for e in self.events if e.kind == "aicpu" and e.ids["task"] is not None)
+        self.selected_csv_tasks = {e.ids["task"]: e.ids for e in tasks if occurrences[e.ids["task"]] == 1}
+        if len(self.selected_csv_tasks) < len(tasks):
+            self.warnings["SELECTED_CSV_IDS_MISSING_OR_REUSED"] += len(tasks) - len(self.selected_csv_tasks)
         ordered = sorted(chains, key=lambda c: c["metrics_us"]["launch_to_sync_return"])
         positions = sorted({round(i * (len(ordered) - 1) / max(1, samples - 1)) for i in range(samples)}) if ordered else []
         apis = defaultdict(list)
@@ -453,7 +618,7 @@ class Trace:
         return dict(json_files=self.files, complete_events=len(self.events), target_selection=selection,
                     flow_groups=len(self.flows), link_field_coverage=coverage,
                     target_events=len(targets), linked_target_events=sum(map(len, groups.values())),
-                    linked_launches=len(launches), selected_launches=len(selected), complete_chains=len(chains),
+                    linked_launches=len(groups), selected_launches=len(selected), complete_chains=len(chains),
                     chains_with_device_copy=sum("device_copy_us" in c for c in chains),
                     cross_clock_order_warnings=sum(not c["cross_clock_order_ok"] for c in chains),
                     target_task_duration_us=stats([e.duration for e in tasks]),
@@ -498,6 +663,55 @@ def benchmark_report(root):
                 key = row["backend"] + "/" + row["execution"]
                 result[key].setdefault("profile_us", {}).setdefault(kind + "." + name, {})[row["metric"]] = round(value, 3)
     return dict(result)
+
+
+def report_execution(benchmark, requested):
+    modes = {key.rsplit("/", 1)[1] for key in benchmark}
+    if requested == "auto":
+        if len(modes) > 1:
+            raise ValueError("INPUT_MIXED_EXECUTION: specify --execution eager or graph")
+        requested = next(iter(modes), "eager")
+    if modes and requested not in modes:
+        raise ValueError("INPUT_EXECUTION_MISMATCH")
+    counts = {item.get("summary", {}).get("gets_per_replay", 1)
+              for key, item in benchmark.items() if key.endswith("/" + requested)}
+    if len(counts) > 1:
+        raise ValueError("INPUT_MIXED_GET_COUNTS")
+    count = next(iter(counts), 1)
+    if count != int(count) or not 1 <= count <= 16:
+        raise ValueError("INPUT_INVALID_GET_COUNT")
+    return requested, int(count)
+
+
+def graph_scope_comparison(benchmark, timeline):
+    if timeline.get("execution") != "graph":
+        return
+    trace_stats = timeline["chain_stats_us"]
+    task = trace_stats.get("task_sum_per_get", {}).get("mean")
+    inner = trace_stats.get("device_event_record_inner_window_per_get", {}).get("mean")
+    outer = trace_stats.get("device_event_record_outer_window_per_get", {}).get("mean")
+    if task is None:
+        return
+    comparisons = {}
+    for key, item in benchmark.items():
+        if not key.endswith("/graph"):
+            continue
+        profile = item.get("profile_us", {})
+        body = item.get("summary", {}).get("kernel_mean_us")
+        entry = profile.get("device_boundary.entry_span", {}).get("mean_us")
+        event = item.get("summary", {}).get("e2e_mean_us")
+        values = {"trace_task_mean_per_get": task,
+                  "trace_event_record_window_low_per_get": inner,
+                  "trace_event_record_window_high_per_get": outer}
+        if body is not None:
+            values["trace_task_minus_benchmark_body"] = round(task - body, 3)
+        if entry is not None:
+            values["trace_task_minus_benchmark_entry"] = round(task - entry, 3)
+        if event is not None:
+            values["benchmark_event_mean"] = event
+        comparisons[key] = values
+    timeline["scope_mean_comparison_us"] = comparisons
+    timeline["scope_comparison_note"] = "Selected trace means versus benchmark means; not paired per-call body/task timers. Record-task windows approximate hardware Event timestamps."
 
 
 def column_time(row, stems):
@@ -589,6 +803,16 @@ def bounded_report(report, limit):
         elif "chain_stats_us" in trace:
             trace.pop("chain_stats_us")
             section = "chain_stats_us"
+        elif "link_field_coverage" in trace:
+            trace.pop("link_field_coverage")
+            section = "link_field_coverage"
+        elif "scope_mean_comparison_us" in trace:
+            trace.pop("scope_mean_comparison_us")
+            trace.pop("scope_comparison_note", None)
+            section = "scope_mean_comparison_us"
+        elif len(report.get("notes", [])) > 3:
+            report["notes"].pop()
+            section = "notes_detail"
         else:
             raise ValueError("REPORT_LIMIT_TOO_SMALL")
         if section not in report["omitted_sections"]:
@@ -599,7 +823,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--msprof-dir", type=Path, required=True)
     parser.add_argument("--benchmark-dir", type=Path)
-    parser.add_argument("--last", type=int, default=0, help="select the last N linked kernel launches; 0 keeps all")
+    parser.add_argument("--execution", choices=("auto", "eager", "graph"), default="auto",
+                        help="infer from benchmark CSV; graph selects validated replay Event brackets")
+    parser.add_argument("--last", type=int, default=0, help="last N linked eager launches or validated timed graph replays; 0 keeps all")
     parser.add_argument("--samples", type=int, default=5, help="representative chains (1..10)")
     parser.add_argument("--kernel-pattern", help="optional device kernel-name regular expression")
     parser.add_argument("--max-chars", type=int, default=60000, help="ASCII report limit, including newline (4096..65535)")
@@ -618,18 +844,23 @@ def main(argv=None):
         root = captures[0] if captures else root
         pattern = re.compile(args.kernel_pattern or GET_PATTERN, re.IGNORECASE)
         trace = Trace(root, pattern)
+        benchmark = benchmark_report(args.benchmark_dir)
+        execution, gets = report_execution(benchmark, args.execution)
+        timeline = trace.report(args.last, args.samples, args.kernel_pattern is not None, execution, gets)
+        graph_scope_comparison(benchmark, timeline)
         report = dict(format="kvaf-aicpu-gap-core-v1", units="us", last_linked_launches=args.last,
                       notes=["Timing fields only; no paths, payloads, addresses, EIDs or original args are emitted.",
                              "Trace timestamps use Chrome trace microseconds; displayTimeUnit does not change them.",
                              "Representative intervals are relative to each Host launch start; IDs are not exported.",
                              "aligned_* gaps use msprof alignment; order-violating chains are excluded from aligned statistics but retained in samples.",
-                             "Only explicit flows or matching IDs link Host/device tasks; no nearest-task guessing.",
-                             "Graph chains use model execute plus Event/stream sync. Event brackets require linked record tasks; absence is not zero overhead.",
+                             "Direct Host/device links use flows/IDs. Graph tasks may be grouped by validated same-stream device Event containment, labeled event_bracket_same_stream; no nearest-task matching.",
+                             "Graph requires record/model/record/Event-sync Host order, explicitly linked device Events, and the expected Get count. It never substitutes eager warmup chains.",
+                             "Device Event task begin/end windows approximate hardware Event timestamp bounds; they are not exact torch Event timestamps.",
                              "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",
                              "Benchmark kernel body and CANN task duration are separate scopes, not paired per-call samples."],
-                      benchmark=benchmark_report(args.benchmark_dir),
-                      timeline=trace.report(args.last, args.samples, args.kernel_pattern is not None),
+                      benchmark=benchmark,
+                      timeline=timeline,
                       csv_supplement=csv_report(root, trace.selected_csv_tasks))
         if not trace.files:
             report["notes"].append("No readable timeline JSON: CSVs alone cannot localize dispatch/completion gaps.")

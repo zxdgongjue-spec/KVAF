@@ -62,10 +62,11 @@ JSON may be a Chrome trace array or a `traceEvents` object; split exports and
 CSV time units are supported. `displayTimeUnit` is a viewer preference, not a
 conversion of Chrome trace microseconds.
 
-Host/device pairing requires flows or matching correlation/connection IDs or
-Stream/Task IDs. Unlinked data stays unlinked. `--last` selects linked launch
-groups, rather than individual worker events; without links, all target-task
-statistics are retained with a warning. A missing known kernel name triggers
+Direct Host/device pairing requires flows or matching correlation/connection
+IDs or Stream/Task IDs. In eager mode, `--last` selects linked launch groups,
+rather than individual worker events; without links, all target-task statistics
+are retained with a warning. Graph mode selects validated timed replay Event
+brackets, described below. A missing known kernel name in eager mode triggers
 an explicitly marked all-AICPU fallback; `--kernel-pattern` can restrict the
 selection to a locally known device kernel name. All-trace API and CSV totals
 include setup/warmup/readback and must not be treated as measured-round latency.
@@ -104,24 +105,51 @@ done
 ```
 
 Graph defaults remain one Get per replay with Torch capture. Diagnose this
-single-Get path before trying any amortization experiment:
+single-Get path before trying any amortization experiment. The following capture
+keeps the measured device-1/six-worker/8192-row configuration. Keep the CPU
+service placement and settings unchanged:
 
 ```bash
-msprof --output=results/cann-gap-gather-graph \
+numactl --cpunodebind=1 --membind=1 ./build-cpu/runtime/kvaf_cpu_service \
+  --listen 127.0.0.1 --port 28990 --gather-threads 12 --gather-mode active
+```
+
+In the NPU terminal:
+
+```bash
+msprof --output=results/cann-gap-gather-d1-w6 \
   --ascendcl=on --runtime-api=on --task-time=on --aicpu=on \
-  --application="bash tests/run_remote_cpu_batch_get_perf.sh build-npu --peer 127.0.0.1:28990 --device-id 7 --backend gather_read --aicpu-workers 4 --execution graph --graph-api torch --request-length 32768 --table-capacity 4096 --miss-count 4096 --token-bytes 656 --tokens-per-block 128 --warmup 20 --iterations 50 --kernel-profile --output-dir results/gap-gather-graph"
+  --application="bash tests/run_remote_cpu_batch_get_perf.sh build-npu --peer 127.0.0.1:28990 --device-id 1 --backend gather_read --aicpu-workers 6 --execution graph --graph-api torch --graph-get-count 1 --graph-replays 5 --request-length 32768 --table-capacity 16384 --miss-count 8192 --token-bytes 656 --tokens-per-block 128 --warmup 100 --iterations 1000 --kernel-profile --output-dir results/gap-gather-d1-w6"
 
 python3 tests/diagnostics/summarize_aicpu_gap.py \
-  --msprof-dir results/cann-gap-gather-graph \
-  --benchmark-dir results/gap-gather-graph --last 50 --samples 5 \
-  --max-chars 60000 --output results/gather-graph-gap-core.txt
+  --execution graph --msprof-dir results/cann-gap-gather-d1-w6 \
+  --benchmark-dir results/gap-gather-d1-w6 --last 1000 --samples 5 \
+  --max-chars 60000 --output results/gather-d1-w6-gap-core.txt
 ```
 
 Repeat with `--backend cpu_push_scatter` and separate result directories.
-Export msprof JSON/CSVs before extraction, as with the eager capture. If replay
-flows/IDs are absent, the report keeps tasks unlinked; capture-time launch IDs
-alone cannot establish replay ownership. Missing Event-record links also remain
-missing, rather than being treated as zero overhead.
+If JSON/CSV export did not run automatically, run
+`msprof --export=on --output=results/cann-gap-gather-d1-w6` before extraction.
+Use fresh directories per capture, or pass the exact `PROF_*` directory.
+Updating only the extractor requires no compilation; existing exports can be
+reprocessed. No workload or tests were run locally.
+
+The script infers execution and Get count from `summary.csv`; `--execution graph`
+is explicit and also handles a benchmark directory containing both modes.
+Capture-time launch IDs do not identify a replay. Graph grouping uses the
+benchmark's record/model/record/Event-sync Host order, explicitly linked device
+Events, the same device Stream track and the expected Get count. The report
+labels this containment inference `event_bracket_same_stream`, separately from
+direct model/task ID links. Physical Stream IDs and `Stream N` metadata are
+recognized. Ambiguous brackets and unrelated in-window work are rejected.
+Missing associations never fall back to eager preparation/warmup chains.
+
+For a fully associated capture above, expect `timeline.execution=graph`,
+`selected_replays=1000`, `complete_chains=1000`, `expected_gets_per_replay=1`.
+`model_execute_calls` includes validation/warmup. Inspect `replay_rejections` and
+`linked_device_event_records` if selection is incomplete.
+`CAPTURE_LAUNCH_NOT_REPLAY_LINK` can still count rejected capture-ID links even
+when Event-based grouping succeeds; it does not measure remaining replay coverage.
 
 Read the following intervals together; inclusive subspans must not be added:
 
@@ -137,6 +165,19 @@ Read the following intervals together; inclusive subspans must not be added:
 | msprof report | `aligned_task_end_to_sync_return` | Last task end to Event/stream sync return |
 | msprof report | `device_event_start_to_task`, `device_task_to_end_event` | Device gaps between linked Event record tasks and AICPU tasks, when exported |
 | msprof report | `task_envelope`, `task_union`, `inter_task_gaps` | Full target-task span, union of task intervals, and gaps between tasks |
+| msprof report | `task_sum_per_get`, `task_overlap` | Mean CANN task duration per Get and overlapping task time |
+| msprof report | `aligned_start_record_begin_to_device_event_end` | Host start-record API begin to device start-record end |
+| msprof report | `aligned_end_event_end_to_sync_return` | Device end-record end to Host Event-sync return |
+| msprof report | `scope_mean_comparison_us` | Selected CANN task mean minus benchmark body/entry means; not paired per-call timers |
+
+For the supplied baseline, Event E2E minus body is `228.313 - 178.787 = 49.526 us`;
+Host replay/wait minus Event E2E is another `287.062 - 228.313 = 58.750 us`.
+The device-record inner/outer windows approximate the hardware Event interval;
+trace record-task boundaries are not exact Torch Event timestamps. The inner
+window equals start-to-task + task union + inter-task gaps + task-to-end-record.
+Host record-to-sync time includes aligned start-record delay, that inner window,
+end-record duration and aligned return tail. Keep Host and device clock domains
+separate. A zero selected-replay count means missing association, not zero overhead.
 
 The body metric is unchanged: `kernel_mean_us` still excludes setup before its
 old entry timestamp and cleanup after its old exit timestamp. Compare CANN's

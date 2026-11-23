@@ -7,7 +7,7 @@ import re
 from tempfile import TemporaryDirectory
 import unittest
 
-from summarize_aicpu_gap import Trace, bounded_report, csv_report, main
+from summarize_aicpu_gap import Trace, bounded_report, csv_report, main, report_execution
 
 
 def event(name, start, duration, pid=1, tid=1, **args):
@@ -34,7 +34,8 @@ def trace_round(start=100, token=10, flows=False):
 
 def write_trace(root, rows, filename="msprof_1.json", wrapped=True):
     metadata = [dict(ph="M", name="process_name", pid=1, args=dict(name="CANN")),
-                dict(ph="M", name="process_name", pid=2, args=dict(name="Ascend Hardware"))]
+                dict(ph="M", name="process_name", pid=2, args=dict(name="Ascend Hardware")),
+                dict(ph="M", name="thread_name", pid=2, tid=3, args=dict(name="Stream 3"))]
     data = dict(traceEvents=metadata + rows, displayTimeUnit="ns") if wrapped else metadata + rows
     (root / filename).write_text(json.dumps(data), encoding="utf-8-sig")
 
@@ -43,7 +44,107 @@ def report(root, last=0):
     return Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(last, 5, False)
 
 
+def graph_round(start=100, count=1, token=100):
+    end = start + 30 + count * 120
+    rows = [event("aclrtRecordEvent", start - 20, 2, **{"Connection Id": token}),
+            event("aclmdlRIExecuteAsync", start, 8, **{"Connection Id": token + 1}),
+            event("aclrtRecordEvent", start + 10, 2, **{"Connection Id": token + 2}),
+            event("aclrtSynchronizeEvent", start + 14, end + 20 - start - 14),
+            event("EVENT_RECORD", start - 10, 2, 2, 3,
+                  **{"Task Type": "EVENT_RECORD", "Connection Id": token}),
+            event("EVENT_RECORD", end, 2, 2, 3,
+                  **{"Task Type": "EVENT_RECORD", "Connection Id": token + 2})]
+    rows.extend(event("KvafAicpuGatherReadExecutionV4", start + 20 + i * 120, 100, 2, 3,
+                      **{"Connection Id": 7, "Task Id": i + 1}) for i in range(count))
+    return rows
+
+
 class GapExtractorTest(unittest.TestCase):
+    def test_graph_event_brackets_recover_replay_without_model_task_id_links(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            capture = [event("aclrtLaunchKernelWithHostArgs", 10, 5, **{"Connection Id": 7})]
+            write_trace(root, capture + graph_round(count=2) + graph_round(600, 2, 200))
+            trace = Trace(root, re.compile("KvafAicpuGatherRead", re.I))
+            result = trace.report(1, 5, False, "graph", 2)
+            self.assertEqual(result["model_execute_calls"], 2)
+            self.assertEqual(result["timed_replay_brackets"], 2)
+            self.assertEqual(result["selected_replays"], 1)
+            self.assertEqual(result["linked_target_events"], 4)
+            chain = result["representative_chains"][0]
+            self.assertEqual(chain["launch_api"], "aclmdlRIExecuteAsync")
+            self.assertEqual(chain["link_methods"], ["event_bracket_same_stream"])
+            self.assertEqual(chain["metrics_us"]["task_union_per_get"], 100)
+            self.assertEqual(chain["metrics_us"]["inter_task_gaps"], 20)
+            self.assertEqual(chain["metrics_us"]["device_event_start_to_task"], 28)
+            self.assertEqual(chain["metrics_us"]["device_task_to_end_event"], 30)
+            self.assertEqual(chain["metrics_us"]["aligned_end_event_end_to_sync_return"], 18)
+            self.assertEqual(trace.selected_csv_tasks, {})  # Replay Task IDs repeat.
+
+    def test_graph_does_not_fall_back_to_eager_when_brackets_are_missing(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            rows = trace_round() + [row for row in graph_round(500) if row["name"] != "EVENT_RECORD"]
+            write_trace(root, rows)
+            result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
+            self.assertEqual(result["complete_chains"], 0)
+            self.assertEqual(result["target_task_duration_us"], {"n": 0})
+            self.assertEqual(result["replay_rejections"]["missing_or_ambiguous_device_event_links"], 1)
+
+    def test_graph_requires_expected_task_count_and_same_stream(self):
+        for change in ("count", "stream", "unrelated"):
+            with self.subTest(change=change), TemporaryDirectory() as folder:
+                root = Path(folder)
+                rows = graph_round(count=2 if change == "count" else 1)
+                if change == "stream":
+                    next(row for row in rows if row["name"].startswith("Kvaf"))["tid"] = 4
+                if change == "unrelated":
+                    rows.append(event("MemcpyAsync", 225, 3, 2, 3, **{"Task Type": "MEMCPY_ASYNC"}))
+                write_trace(root, rows)
+                result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
+                self.assertEqual(result["selected_replays"], 0)
+
+    def test_graph_execution_is_selected_from_benchmark_metadata(self):
+        graph = {"gather_read/graph": {"summary": {"gets_per_replay": 8}}}
+        self.assertEqual(report_execution(graph, "auto"), ("graph", 8))
+        with self.assertRaises(ValueError):
+            report_execution(graph, "eager")
+        with self.assertRaises(ValueError):
+            report_execution(dict(graph, **{"gather_read/eager": {}}), "auto")
+
+    def test_graph_ignores_nested_runtime_sync_and_allows_serial_host_queue_thread(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            rows = graph_round()
+            next(row for row in rows if row["name"] == "aclmdlRIExecuteAsync")["tid"] = 2
+            rows.append(event("rtStreamSynchronize", 80.5, .5))  # Inside the start RecordEvent API.
+            write_trace(root, rows)
+            result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
+            self.assertEqual(result["selected_replays"], 1)
+            self.assertEqual(result["representative_chains"][0]["host_order"], "process_serial")
+
+    def test_graph_cli_auto_selection_and_controlled_fields_remain_private(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            rows = graph_round()
+            for row in rows:
+                row["args"]["payload"] = "CONTROLLED_PAYLOAD"
+                row["args"]["address"] = "CONTROLLED_ADDRESS"
+            write_trace(root, rows)
+            (root / "summary.csv").write_text(
+                "backend,execution,gets_per_replay,kernel_mean_us,e2e_mean_us\n"
+                "gather_read,graph,1,90,160\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--msprof-dir", str(root), "--benchmark-dir", str(root), "--last", "1"])
+            self.assertEqual(code, 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["timeline"]["execution"], "graph")
+            self.assertEqual(result["timeline"]["selected_replays"], 1)
+            self.assertEqual(result["timeline"]["scope_mean_comparison_us"]["gather_read/graph"][
+                "trace_task_minus_benchmark_body"], 10)
+            self.assertNotIn("CONTROLLED", output.getvalue())
+
     def test_id_links_nested_apis_and_completion_chain(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
