@@ -35,6 +35,44 @@ This diagnostic pairs eager samples; use the main benchmark for Graph timing.
 Validation: python3 -m unittest discover -s tests/diagnostics -p 'test_*.py'.
 Actual device execution must be validated on an NPU.
 
+## Compact AICPU gap report
+
+After exporting msprof JSON/CSVs, extract only core diagnostic information locally:
+
+```bash
+python3 tests/diagnostics/summarize_aicpu_gap.py \
+  --msprof-dir results/cann-gap-gather \
+  --benchmark-dir results/gap-gather \
+  --last 50 --samples 5 --max-chars 60000 \
+  --output results/gather-gap-report.txt
+```
+
+Copy the contents of `gather-gap-report.txt`. It contains selected benchmark
+gap/Host metrics, critical API/task duration statistics and up to five linked
+launch/task/copy/sync timelines, with counts and P50/P99. It does not export
+source paths, payloads, addresses, EIDs or arbitrary event arguments. Unknown
+operator names are replaced by category labels. The same ASCII JSON is written
+to stdout and the output file, within the requested character limit (up to
+65535); omitted detail is identified in `omitted_sections`.
+
+The script uses only Python's standard library and reads the existing files;
+it does not compile, run a workload or change source reports. If the root has
+multiple `PROF_*` captures, point `--msprof-dir` to one exact capture instead.
+JSON may be a Chrome trace array or a `traceEvents` object; split exports and
+CSV time units are supported. `displayTimeUnit` is a viewer preference, not a
+conversion of Chrome trace microseconds.
+
+Host/device pairing requires flows or matching correlation/connection IDs or
+Stream/Task IDs. Unlinked data stays unlinked. `--last` selects linked launch
+groups, rather than individual worker events; without links, all target-task
+statistics are retained with a warning. A missing known kernel name triggers
+an explicitly marked all-AICPU fallback; `--kernel-pattern` can restrict the
+selection to a locally known device kernel name. All-trace API and CSV totals
+include setup/warmup/readback and must not be treated as measured-round latency.
+Relative Host/device gaps use msprof's clock alignment and report invalid time
+ordering; benchmark function-body time is not substituted for a paired CANN
+task duration. CSVs alone cannot resolve the full dispatch/completion timeline.
+
 ## Get recovery fault injection (Host only)
 
 `get_recovery.cc` uses the real Dispatcher, RuntimeCore and MetaManager with a
