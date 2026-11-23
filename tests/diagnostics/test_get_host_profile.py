@@ -2,6 +2,7 @@ import ast
 from collections import defaultdict
 from contextlib import nullcontext
 import csv
+import json
 import statistics
 from itertools import count
 from pathlib import Path
@@ -218,6 +219,30 @@ class GetHostProfileTest(unittest.TestCase):
         self.assertEqual((row["graph_submit"], row["gets_per_replay"], row["latency_scope"]),
                          ("native", 4, "amortized_per_get"))
         self.assertEqual(row["host_replay_mean_us"], "220")
+
+    def test_graph_raw_samples_keep_nodes_workers_and_warmup_metadata(self):
+        with TemporaryDirectory() as directory:
+            args = SimpleNamespace(output_dir=Path(directory), kernel_profile=True,
+                backend="gather_read", transport="urma", request_length=32768,
+                table_capacity=16384, miss_count=8192, token_bytes=656, tokens_per_block=128,
+                aiv_cores=None, aicpu_workers=2, jettys_per_core=2, max_inflight_total=2048,
+                get_binding="ordinary", graph_api="acl", graph_submit="native", graph_get_count=2,
+                device_id=1, warmup=3, iterations=1, graph_replays=8)
+            report = BatchGetCsv(args)
+            nodes = [[dict(device_entry_ns=base, device_start_ns=base + 1000,
+                           device_finish_ns=base + 9000, device_return_ns=base + 10000),
+                      dict(device_entry_ns=base + 500, device_start_ns=base + 1500,
+                           device_finish_ns=base + 8000, device_return_ns=base + 9000)]
+                     for base in (100000, 200000)]
+            report.add_graph_samples([nodes], [(1000, 300000)], [.1])
+            report.write()
+            data = json.loads((Path(directory) / "aicpu_samples.json").read_text())
+            self.assertEqual(data["timed_prefix_replays"], 4)
+            self.assertEqual(data["iterations"], 1)
+            self.assertEqual(data["rounds"][0]["event_elapsed_ns"], 200000)
+            self.assertEqual(data["rounds"][0]["nodes"][1]["workers"][1]["device_entry_ns"], 200500)
+            self.assertEqual(data["device_clock"], "aicpu_steady_ns")
+            self.assertNotIn("graph_lease", json.dumps(data))
 
 
 if __name__ == "__main__":

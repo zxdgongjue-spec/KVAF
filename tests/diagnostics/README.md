@@ -224,6 +224,90 @@ preserves the trace pattern above. The extractor includes `graph_submit`,
 latency as well as Event-minus-body: stream resolution is before the native
 start Event. See [the comparison commands](../../docs/batch_get_performance.md#acl-原生提交与同图多-get).
 
+### Split CANN task-to-entry and return-to-task-end
+
+Graph AICPU runs with `--kernel-profile` now also save `aicpu_samples.json`
+beside the CSVs. It retains each measured round/node/worker's existing entry,
+body and return timestamps, Host call bounds, Event elapsed time and warmup
+metadata. Sample serialization and file writes happen after measured calls.
+Reusing an output directory replaces this file; runs without raw sample export
+remove a previous `aicpu_samples.json` to avoid analyzing stale timing samples.
+No kernel, ABI or native binding change is required. The local sample file
+contains absolute timing values; share the bounded summary, not this raw file.
+
+For the six-worker empty-Get experiment keep the CPU service unchanged and run:
+
+```bash
+msprof --output=results/cann-native-empty \
+  --ascendcl=on --runtime-api=on --task-time=on --aicpu=on \
+  --application="bash tests/run_remote_cpu_batch_get_perf.sh build-npu --peer 127.0.0.1:28990 --device-id 1 --backend gather_read --aicpu-workers 6 --execution graph --graph-api acl --graph-submit native --graph-get-count 1 --graph-replays 8 --request-length 32768 --table-capacity 16384 --miss-count 0 --token-bytes 656 --tokens-per-block 128 --warmup 20 --iterations 50 --kernel-profile --output-dir results/native-empty"
+
+python3 tests/diagnostics/summarize_aicpu_gap.py \
+  --execution graph --msprof-dir results/cann-native-empty \
+  --benchmark-dir results/native-empty --last 50 --samples 5 \
+  --max-chars 60000 --output results/native-empty-gap.txt
+```
+
+Use new directories for each capture. Repeat with `--miss-count 8192` and
+separate directories. The command and workload above are for the server;
+no compilation, tests or workloads were run locally.
+
+Read `entry_boundary` in the resulting report:
+
+| Field | Meaning |
+|---|---|
+| `status=paired` | Formal replay count/order, node/worker layout, Event windows and Host call cadence agree. No nearest-task matching is used. |
+| `stats_us.task_outside_entry` | Per-node CANN task duration minus that node's entry span, paired before aggregation. |
+| `stats_us.worker_start_skew` | Last worker entry minus first entry, independent of the trace clock. |
+| `stats_us.worker_wall_mean/max` | Individual worker entry-to-return durations, distinguishing work from worker-start skew. |
+| `clock.status=bounds_only_no_independent_calibration` | Only conditional bounds are available; no measured before/after point split. |
+| `clock.task_begin_to_first_entry_mean_bounds_us` | Possible mean time before user entry, under a common unit-rate clock-offset assumption. |
+| `clock.last_return_to_task_end_mean_bounds_us` | Possible mean time after user return, under the same unknown offset. |
+| `clock.status=no_consistent_unit_rate_offset` | A constant-offset, unit-rate mapping cannot fit all samples; check clock drift, timing domains or run association. |
+
+All timing-shaped native warmups have the same trace pattern as measured
+replays. The sample metadata identifies the `warmup + 1` native prefix (including
+Event initialization replay) before formal iterations. Thus 71 validated
+brackets can correctly contain 21 warmups and 50 measured rounds. `--last` is
+applied to formal rounds, and a shorter selection uses the corresponding tail
+of the raw samples. Missing brackets, changed run cadence or inconsistent Event
+windows cause an explicit association failure. Older reports without the sample
+file remain supported but cannot produce paired boundary analysis.
+
+Containment bounds do **not** calibrate the clock. They constrain one unknown
+offset using every formal task and a 1 us boundary tolerance. The lower/upper
+bounds are coupled: one offset moves time from the front to the back. A broad
+range means the split is still unknown; its midpoint is never reported as a
+measurement. Samples alone cannot establish the absolute offset between
+`std::chrono::steady_clock` on AICPU and exported msprof timestamps.
+
+If an independent clock synchronization record is available, pass
+`--clock-map clock-map.json`. Its schema is:
+
+```text
+format:       kvaf-aicpu-clock-map-v1
+device_id:    same logical device ID as the benchmark
+source_clock: aicpu_steady_ns
+target_clock: msprof_trace_us
+provenance:   msprof_clock_sync or independent_timestamp_calibration
+anchors:      exactly two objects containing device_ns, trace_us, uncertainty_us
+```
+
+The anchors must come from an independent calibration, bracket the device
+timestamps being analyzed and belong to this capture. Do not construct them by
+placing user entry at task start or return at task end: that assumes the answer.
+No automatic conversion from unknown CANN clock-sync file formats is attempted.
+The extractor interpolates these anchors and checks task containment. It then
+emits `stats_us.task_begin_to_first_entry`, `last_return_to_task_end`, their sum,
+and calibration uncertainty. Without independent anchors, exact front/back
+attribution remains unavailable; the sum and conditional ranges are still useful.
+
+AICPU CSV rows with reused Task IDs can now be selected by ID plus a unique
+exported timestamp contained in the corresponding selected task. Rows without
+enough identity/time evidence remain unmatched. `timestamp_matched_rows` shows
+how many rows used this disambiguation. These durations help investigate
+dispatch but do not replace user entry/return timestamp alignment.
+
 ## Get recovery fault injection (Host only)
 
 `get_recovery.cc` uses the real Dispatcher, RuntimeCore and MetaManager with a

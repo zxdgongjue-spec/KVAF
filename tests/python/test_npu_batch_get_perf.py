@@ -497,7 +497,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
                 graph.replay()
                 graph.synchronize()
             check_captured(inputs.fixed, args.miss_count)
-        durations, profiles, host_profiles, host_samples = [], [], [], []
+        durations, profiles, host_profiles, host_samples, host_bounds = [], [], [], [], []
         record_host = args.kernel_profile and uses_aicpu(args)
         for iteration in range(args.iterations):
             inputs.prepare(args.miss_count)
@@ -530,9 +530,12 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             nodes = [list(runtime.batch_get_kernel_profile(graph_lease=lease)) for lease in graph.leases]
             profiles.append(nodes[0] if args.graph_get_count == 1 else nodes)
             if record_host:
+                host_bounds.append((host_begin, host_end))
                 host["replay_and_wait"] = host_end - host_begin
                 host_profiles.append(host)
         if record_host:
+            if report is not None:
+                report.add_graph_samples(profiles, host_bounds, durations)
             host_profiles = [add_device_boundaries(graph_host_sample(host, elapsed * 1000,
                 device_profile_ms(profile, args.kernel_profile_clock_mhz) * 1000, args.graph_get_count),
                 profile, elapsed * 1000, device_profile_ms(profile, args.kernel_profile_clock_mhz) * 1000)

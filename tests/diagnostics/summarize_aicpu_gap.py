@@ -191,6 +191,8 @@ def event_from_raw(raw, process_names, pattern):
 class Trace:
     def __init__(self, root, pattern):
         self.events, self.flows = [], defaultdict(list)
+        self.graph_replays, self.sample_rounds, self.selected_task_events = [], {}, []
+        self.selected_csv_tasks = {}
         self.warnings, self.files = Counter(), 0
         self.stream_tracks = set()
         processes, raw_events, seen = {}, [], {}
@@ -407,9 +409,9 @@ class Trace:
                     self.warnings["AMBIGUOUS_ID_LINK"] += 1
         return result
 
-    def report(self, last, samples, explicit_pattern, execution="eager", gets_per_replay=1):
+    def report(self, last, samples, explicit_pattern, execution="eager", gets_per_replay=1, timing_layout=None):
         if execution == "graph":
-            return self.graph_report(last, samples, gets_per_replay)
+            return self.graph_report(last, samples, gets_per_replay, timing_layout)
         return self.eager_report(last, samples, explicit_pattern)
 
     def eager_report(self, last, samples, explicit_pattern):
@@ -494,7 +496,7 @@ class Trace:
         result["execution"] = "eager"
         return result
 
-    def graph_report(self, last, samples, gets_per_replay):
+    def graph_report(self, last, samples, gets_per_replay, timing_layout=None):
         links = self.links()
         targets = [i for i, event in enumerate(self.events) if event.target]
         roots = {self.outer_api(i, e.kind) for i, e in enumerate(self.events)
@@ -668,7 +670,23 @@ class Trace:
                 cross_clock_order_ok=(first.start >= start.start - 1 and launch.start <= task_begin + 1 and
                                       task_end <= sync.end + 1 and final.end <= sync.end + 1),
                 metrics_us={key: round(value, 3) for key, value in metrics.items()})
-        selected = list(groups)[-last:] if last else list(groups)
+        self.graph_replays = [dict(model=model, tasks=[self.events[i] for i in task_ids],
+            host_start_us=self.events[model].start + candidates[model]["host_event_records_us"][0][0],
+            host_end_us=self.events[model].start + candidates[model]["host_sync_us"][1],
+            event_low_us=candidates[model]["metrics_us"]["device_event_record_inner_window"],
+            event_high_us=candidates[model]["metrics_us"]["device_event_record_outer_window"])
+            for model, task_ids in groups.items()]
+        formal = list(groups)
+        selection_status = "no_sample_metadata"
+        if timing_layout is not None:
+            prefix, rounds = timing_layout["timed_prefix_replays"], len(timing_layout["rounds"])
+            if len(formal) == prefix + rounds and gets_per_replay == timing_layout["gets_per_replay"]:
+                formal = formal[prefix:]
+                self.sample_rounds = {model: ordinal for ordinal, model in enumerate(formal, 1)}
+                selection_status = "formal_rounds_by_serial_replay_contract"
+            else:
+                selection_status = "sample_trace_replay_count_mismatch"
+        selected = formal[-last:] if last else formal
         if not selected:
             self.warnings["NO_VALIDATED_GRAPH_REPLAY_BRACKETS"] += 1
         if last and len(selected) < last:
@@ -683,6 +701,9 @@ class Trace:
                       selected_replays=len(selected), expected_gets_per_replay=gets_per_replay,
                       replay_rejections=dict(rejects), linked_device_event_records=sum(map(len, records.values())),
                       internal_stream_replays=internal_stream_matches,
+                      sample_selection=selection_status,
+                      formal_timed_replays=len(self.sample_rounds),
+                      excluded_timing_warmup_replays=(timing_layout["timed_prefix_replays"] if self.sample_rounds else 0),
                       graph_match_diagnostics={key: dict(value) for key, value in match_counts.items()},
                       graph_match_examples=match_examples,
                       metrics_scope="per_replay; fields ending _per_get are divided by Get count")
@@ -691,6 +712,7 @@ class Trace:
     def chain_report(self, targets, groups, selected, chains, tasks, selection, samples):
         # Replayed CSV Task IDs can repeat. Filter only unambiguous identities.
         occurrences = Counter(e.ids["task"] for e in self.events if e.kind == "aicpu" and e.ids["task"] is not None)
+        self.selected_task_events = tasks
         self.selected_csv_tasks = {e.ids["task"]: e.ids for e in tasks if occurrences[e.ids["task"]] == 1}
         if len(self.selected_csv_tasks) < len(tasks):
             self.warnings["SELECTED_CSV_IDS_MISSING_OR_REUSED"] += len(tasks) - len(self.selected_csv_tasks)
@@ -780,7 +802,9 @@ def graph_scope_comparison(benchmark, timeline):
     if timeline.get("execution") != "graph":
         return
     selected = timeline["selected_replays"]
-    complete = (selected > 0 and selected == timeline.get("timed_replay_candidates", selected) and
+    total = (timeline["formal_timed_replays"] if timeline.get("sample_selection") ==
+             "formal_rounds_by_serial_replay_contract" else timeline.get("timed_replay_candidates", selected))
+    complete = (selected > 0 and selected == total and
                 (not timeline.get("requested_replays") or selected >= timeline["requested_replays"]))
     timeline["scope_comparison_selection_complete"] = complete
     if not complete:
@@ -814,6 +838,186 @@ def graph_scope_comparison(benchmark, timeline):
     timeline["scope_comparison_note"] = "Selected trace means versus benchmark means; not paired per-call body/task timers. Record-task windows approximate hardware Event timestamps."
 
 
+def require(condition):
+    if not condition:
+        raise ValueError
+
+
+def load_graph_samples(root):
+    if root is None:
+        return None
+    paths = list(root.rglob("aicpu_samples.json"))
+    if not paths:
+        return None
+    if len(paths) != 1:
+        raise ValueError("INPUT_MULTIPLE_SAMPLE_FILES")
+    data = json.loads(paths[0].read_text(encoding="utf-8-sig"))
+    integer = lambda v: isinstance(v, int) and not isinstance(v, bool)
+    try:
+        require(data["format"] == "kvaf-aicpu-samples-v1" and data["execution"] == "graph")
+        require(data["device_clock"] == "aicpu_steady_ns")
+        require(data["host_clock"] == "python_perf_counter_ns")
+        require(data["backend"] in ("gather_read", "cpu_push_scatter"))
+        require(data["graph_submit"] in ("native", "python") and data["graph_api"] in ("acl", "torch"))
+        require(integer(data["device_id"]) and data["device_id"] >= 0)
+        require(integer(data["iterations"]) and data["iterations"] == len(data["rounds"]) > 0)
+        require(integer(data["warmup"]) and data["warmup"] >= 0)
+        require(integer(data["gets_per_replay"]) and 1 <= data["gets_per_replay"] <= 16)
+        require(integer(data["aicpu_workers"]) and 1 <= data["aicpu_workers"] <= 8)
+        require(data["timed_prefix_replays"] == (data["warmup"] + 1 if data["graph_submit"] == "native" else 0))
+        previous_host, previous_device = 0, 0
+        for ordinal, sample in enumerate(data["rounds"], 1):
+            require(sample["round"] == ordinal)
+            require(all(integer(sample[k]) for k in ("host_begin_ns", "host_end_ns", "event_elapsed_ns")))
+            require(previous_host <= sample["host_begin_ns"] < sample["host_end_ns"])
+            require(sample["event_elapsed_ns"] > 0)
+            previous_host = sample["host_end_ns"]
+            require(len(sample["nodes"]) == data["gets_per_replay"])
+            for node_index, node in enumerate(sample["nodes"]):
+                require(node["node"] == node_index and len(node["workers"]) == data["aicpu_workers"])
+                for worker_index, worker in enumerate(node["workers"]):
+                    require(worker["worker"] == worker_index)
+                    values = [worker[k] for k in ("device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns")]
+                    require(all(integer(v) for v in values) and 0 < values[0] <= values[1] <= values[2] <= values[3])
+                require(previous_device <= min(w["device_entry_ns"] for w in node["workers"]))
+                previous_device = max(w["device_return_ns"] for w in node["workers"])
+    except (ValueError, KeyError, TypeError):
+        raise ValueError("INPUT_INVALID_GRAPH_SAMPLES") from None
+    return data
+
+
+def calibrated_clock(path, device_id):
+    """An independent calibration supplies two bracketing clock anchors."""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    try:
+        require(data["format"] == "kvaf-aicpu-clock-map-v1" and data["device_id"] == device_id)
+        require(data["source_clock"] == "aicpu_steady_ns" and data["target_clock"] == "msprof_trace_us")
+        require(data["provenance"] in ("msprof_clock_sync", "independent_timestamp_calibration"))
+        anchors = data["anchors"]
+        require(len(anchors) == 2)
+        require(all(isinstance(a["device_ns"], int) and not isinstance(a["device_ns"], bool) for a in anchors))
+        require(all(isinstance(a[key], (float, int)) and not isinstance(a[key], bool) and number(a[key]) is not None
+                    for a in anchors for key in ("trace_us", "uncertainty_us")))
+        require(all(a["uncertainty_us"] >= 0 for a in anchors))
+        first, last = anchors
+        span = last["device_ns"] - first["device_ns"]
+        require(span > 0 and last["trace_us"] > first["trace_us"])
+    except (ValueError, KeyError, TypeError):
+        raise ValueError("INPUT_INVALID_CLOCK_MAP") from None
+
+    def convert(value):
+        if not first["device_ns"] <= value <= last["device_ns"]:
+            raise ValueError("INPUT_CLOCK_MAP_DOES_NOT_COVER_SAMPLES")
+        fraction = (value - first["device_ns"]) / span
+        return (first["trace_us"] + fraction * (last["trace_us"] - first["trace_us"]),
+                (1 - fraction) * first["uncertainty_us"] + fraction * last["uncertainty_us"])
+    return convert
+
+
+def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5):
+    if data is None:
+        return dict(status="samples_missing", note="Rerun the benchmark with --kernel-profile to export aicpu_samples.json.")
+    if timeline.get("sample_selection") != "formal_rounds_by_serial_replay_contract":
+        return dict(status="sample_trace_replay_count_mismatch", measured_rounds=len(data["rounds"]),
+                    expected_brackets=data["timed_prefix_replays"] + len(data["rounds"]),
+                    observed_brackets=len(trace.graph_replays))
+    pairs, errors, host_lower, host_upper = [], [], [], []
+    for replay in trace.graph_replays:
+        ordinal = trace.sample_rounds.get(replay["model"])
+        if ordinal is None:
+            continue
+        sample = data["rounds"][ordinal - 1]
+        elapsed = sample["event_elapsed_ns"] / 1000
+        error = max(replay["event_low_us"] - elapsed, elapsed - replay["event_high_us"], 0)
+        errors.append(error)
+        host_lower.append(replay["host_end_us"] - sample["host_end_ns"] / 1000 - 1.0)
+        host_upper.append(replay["host_start_us"] - sample["host_begin_ns"] / 1000 + 1.0)
+        for node, task in zip(sample["nodes"], sorted(replay["tasks"], key=lambda e: e.start)):
+            workers = node["workers"]
+            entry = min(w["device_entry_ns"] for w in workers)
+            returned = max(w["device_return_ns"] for w in workers)
+            body = (max(w["device_finish_ns"] for w in workers) - min(w["device_start_ns"] for w in workers)) / 1000
+            pairs.append(dict(round=ordinal, node=node["node"], entry=entry, returned=returned,
+                task=task, entry_span=(returned - entry) / 1000, body_span=body,
+                worker_start_skew=(max(w["device_entry_ns"] for w in workers) - entry) / 1000,
+                worker_wall_mean=statistics.mean((w["device_return_ns"] - w["device_entry_ns"]) / 1000 for w in workers),
+                worker_wall_max=max((w["device_return_ns"] - w["device_entry_ns"]) / 1000 for w in workers)))
+    # Record-task windows are approximate; reject a changed run/order rather than aligning it by duration.
+    if any(error > 2.0 for error in errors):
+        return dict(status="sample_trace_event_window_mismatch", window_error_us=stats(errors))
+    if max(host_lower) > min(host_upper):
+        return dict(status="sample_trace_host_cadence_mismatch",
+                    note="No constant unit-rate Host offset contains the corresponding API calls; check run identity, missing replays or clock drift.")
+    selected_first = len(data["rounds"]) - timeline["selected_replays"] + 1
+    selected = [p for p in pairs if p["round"] >= selected_first]
+    if not selected:
+        return dict(status="no_selected_sample_pairs")
+    for p in pairs:
+        p["task_span"] = p["task"].end - p["task"].start
+        p["task_outside_entry"] = p["task_span"] - p["entry_span"]
+    fields = ("task_span", "entry_span", "body_span", "task_outside_entry", "worker_start_skew", "worker_wall_mean", "worker_wall_max")
+    result = dict(status="paired", association="formal_serial_replay_ordinal_and_event_window_check",
+        selected_rounds=timeline["selected_replays"], selected_nodes=len(selected), workers=data["aicpu_workers"],
+        event_window_error_us=stats(errors),
+        host_pairing_check="common_unit_rate_offset_contains_each_replay_API_envelope",
+        stats_us={key: stats([p[key] for p in selected]) for key in fields},
+        per_node_stats_us={str(node): {key: stats([p[key] for p in selected if p["node"] == node])
+                                     for key in ("body_span", "task_outside_entry")}
+                           for node in range(data["gets_per_replay"])})
+    representatives = sorted(selected, key=lambda p: p["task_outside_entry"])
+    indexes = sorted({round(i * (len(representatives) - 1) / max(1, sample_limit - 1)) for i in range(sample_limit)})
+    result["representative_nodes"] = [dict(round=representatives[i]["round"], node=representatives[i]["node"],
+        **{key + "_us": round(representatives[i][key], 3) for key in fields}) for i in indexes]
+    if clock_map is not None:
+        convert = calibrated_clock(clock_map, data["device_id"])
+        before, after, uncertainty, mapped_outside = [], [], [], []
+        try:
+            for p in selected:
+                entry, u1 = convert(p["entry"])
+                returned, u2 = convert(p["returned"])
+                before.append(entry - p["task"].start)
+                after.append(p["task"].end - returned)
+                uncertainty.append(max(u1, u2) + 1.0)
+                mapped_outside.append(p["task_span"] - (returned - entry))
+        except ValueError:
+            result["clock"] = dict(status="calibration_does_not_cover_samples")
+            return result
+        if any(a < -u or b < -u for a, b, u in zip(before, after, uncertainty)):
+            result["clock"] = dict(status="calibration_inconsistent_with_task_containment")
+            return result
+        result["clock"] = dict(status="independently_calibrated", boundary_uncertainty_us=max(uncertainty))
+        result["stats_us"].update(task_begin_to_first_entry=stats(before), last_return_to_task_end=stats(after),
+            calibrated_task_outside_entry=stats(mapped_outside),
+            boundary_reconciliation_error=stats([a + b - c for a, b, c in zip(before, after, mapped_outside)]))
+        for item in result["representative_nodes"]:
+            index = next(i for i, p in enumerate(selected) if (p["round"], p["node"]) == (item["round"], item["node"]))
+            item.update(task_begin_to_first_entry_us=round(before[index], 3), last_return_to_task_end_us=round(after[index], 3))
+    else:
+        # Containment bounds a common offset; it cannot identify a clock offset or a unique split.
+        origin = pairs[0]["entry"]
+        lower = max(p["task"].start - (p["entry"] - origin) / 1000 - 1.0 for p in pairs)
+        upper = min(p["task"].end - (p["returned"] - origin) / 1000 + 1.0 for p in pairs)
+        if lower > upper:
+            result["clock"] = dict(status="no_consistent_unit_rate_offset", split_available=False)
+            return result
+        pre = [((p["entry"] - origin) / 1000 - p["task"].start) for p in selected]
+        post = [(p["task"].end - (p["returned"] - origin) / 1000) for p in selected]
+        result["clock"] = dict(status="bounds_only_no_independent_calibration", split_available=False,
+            assumption="unit_rate_constant_offset_for_this_device_run", containment_tolerance_us=1.0,
+            constraint_nodes=len(pairs), offset_range_width_us=round(upper - lower, 3),
+            task_begin_to_first_entry_mean_bounds_us=[round(statistics.mean(pre) + o, 3) for o in (lower, upper)],
+            last_return_to_task_end_mean_bounds_us=[round(statistics.mean(post) - o, 3) for o in (upper, lower)],
+            note="Bounds share one unknown offset; no midpoint is a measured split. Independent calibration is required for point estimates.")
+        lookup = {(p["round"], p["node"]): p for p in selected}
+        for item in result["representative_nodes"]:
+            p = lookup[item["round"], item["node"]]
+            item["task_begin_to_first_entry_bounds_us"] = [round(
+                (p["entry"] - origin) / 1000 + o - p["task"].start, 3) for o in (lower, upper)]
+            item["last_return_to_task_end_bounds_us"] = [round(
+                p["task"].end - (p["returned"] - origin) / 1000 - o, 3) for o in (upper, lower)]
+    return result
+
+
 def column_time(row, stems):
     for key, value in row.items():
         key = norm(key)
@@ -826,10 +1030,12 @@ def column_time(row, stems):
     return None
 
 
-def csv_report(root, selected_tasks=None):
+def csv_report(root, selected_tasks=None, selected_events=None):
     durations, api_totals, files, warnings = defaultdict(list), defaultdict(lambda: [0, 0]), Counter(), Counter()
     selected, matched, selected_rows = defaultdict(list), set(), 0
     selected_tasks = selected_tasks or {}
+    selected_events = selected_events or []
+    timestamp_matches = 0
     prefixes = ("task_time_", "op_summary_", "api_statistic_", "acl_statistic_", "aicpu_")
     for path in sorted(root.rglob("*.csv")):
         source = next((p[:-1] for p in prefixes if path.name.startswith(p)), None)
@@ -856,8 +1062,23 @@ def csv_report(root, selected_tasks=None):
                     match = identity is not None and all(
                         not identity[key] or identifier(pick(row, key + "id")) in (None, identity[key])
                         for key in ("stream", "device"))
+                    match_key = task
+                    if match and selected_events:
+                        indexes = [i for i, event in enumerate(selected_events) if event.ids["task"] == task]
+                        if len(indexes) == 1:
+                            match_key = ("event", indexes[0])
+                    timestamp = column_time(row, ("timestamp", "starttime", "taskstarttime"))
+                    if selected_events and timestamp is not None:
+                        candidates = [i for i, event in enumerate(selected_events) if task is not None and event.ids["task"] == task
+                            and all(not event.ids[key] or identifier(pick(row, key + "id")) in (None, event.ids[key])
+                                    for key in ("stream", "device"))
+                            and event.start - 1 <= timestamp <= event.end + 1]
+                        match = len(candidates) == 1
+                        if match:
+                            match_key = ("event", candidates[0])
+                            timestamp_matches += 1
                     if match:
-                        matched.add(task)
+                        matched.add(match_key)
                         selected_rows += 1
                     for field in ("dispatchtime", "totaltime", "tasktime", "computetime", "memcpytime"):
                         value = column_time(row, (field,))
@@ -875,8 +1096,10 @@ def csv_report(root, selected_tasks=None):
         except (OSError, ValueError, TypeError) as error:
             warnings["CSV_READ_" + type(error).__name__] += 1
     return dict(files=dict(files), all_rows_duration_us={key: stats(value) for key, value in sorted(durations.items())},
-                selected_aicpu_rows=dict(requested_unique_tasks=len(selected_tasks), matched_tasks=len(matched),
-                    rows=selected_rows, row_duration_us={key: stats(value) for key, value in sorted(selected.items())}),
+                selected_aicpu_rows=dict(requested_unique_tasks=len(selected_events) if selected_events else len(selected_tasks),
+                    matched_tasks=len(matched), rows=selected_rows, timestamp_matched_rows=timestamp_matches,
+                    match_method="IDs_and_unique_exported_timestamp_containment_or_unique_ID",
+                    row_duration_us={key: stats(value) for key, value in sorted(selected.items())}),
                 aggregate_api_us={key: dict(calls=int(value[0]), total=round(value[1], 3), mean=round(value[1] / value[0], 3))
                                   for key, value in sorted(api_totals.items())}, warnings=dict(warnings))
 
@@ -894,6 +1117,12 @@ def bounded_report(report, limit):
         elif trace.get("graph_match_examples"):
             trace["graph_match_examples"].pop()
             section = "one_graph_match_example"
+        elif report.get("entry_boundary", {}).get("representative_nodes"):
+            report["entry_boundary"]["representative_nodes"].pop()
+            section = "one_entry_boundary_example"
+        elif "per_node_stats_us" in report.get("entry_boundary", {}):
+            report["entry_boundary"].pop("per_node_stats_us")
+            section = "entry_boundary_per_node_stats"
         elif "all_trace_api_us" in trace:
             trace.pop("all_trace_api_us")
             section = "all_trace_api_us"
@@ -926,6 +1155,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--msprof-dir", type=Path, required=True)
     parser.add_argument("--benchmark-dir", type=Path)
+    parser.add_argument("--clock-map", type=Path,
+                        help="independent two-anchor aicpu_steady_ns to msprof_trace_us calibration; never fit task boundaries")
     parser.add_argument("--execution", choices=("auto", "eager", "graph"), default="auto",
                         help="infer from benchmark CSV; graph selects validated replay Event brackets")
     parser.add_argument("--last", type=int, default=0, help="last N linked eager launches or validated timed graph replays; 0 keeps all")
@@ -949,8 +1180,18 @@ def main(argv=None):
         trace = Trace(root, pattern)
         benchmark = benchmark_report(args.benchmark_dir)
         execution, gets = report_execution(benchmark, args.execution)
-        timeline = trace.report(args.last, args.samples, args.kernel_pattern is not None, execution, gets)
+        samples_data = load_graph_samples(args.benchmark_dir) if execution == "graph" else None
+        if samples_data:
+            item = benchmark.get(samples_data["backend"] + "/graph", {})
+            if (not item or gets != samples_data["gets_per_replay"] or any(
+                    item.get("configuration", {}).get(k) not in (None, samples_data[k])
+                    for k in ("graph_api", "graph_submit"))):
+                raise ValueError("INPUT_SAMPLE_BENCHMARK_CONFIG_MISMATCH")
+        timeline = trace.report(args.last, args.samples, args.kernel_pattern is not None, execution, gets, samples_data)
         graph_scope_comparison(benchmark, timeline)
+        supplement = csv_report(root, trace.selected_csv_tasks, trace.selected_task_events)
+        if supplement["selected_aicpu_rows"]["matched_tasks"] == len(trace.selected_task_events):
+            timeline.get("warnings", {}).pop("SELECTED_CSV_IDS_MISSING_OR_REUSED", None)
         report = dict(format="kvaf-aicpu-gap-core-v1", units="us", last_linked_launches=args.last,
                       notes=["Timing fields only; no paths, payloads, addresses, EIDs or original args are emitted.",
                              "Trace timestamps use Chrome trace microseconds; displayTimeUnit does not change them.",
@@ -961,10 +1202,13 @@ def main(argv=None):
                              "Device Event task begin/end windows approximate hardware Event timestamp bounds; they are not exact torch Event timestamps.",
                              "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",
-                             "Benchmark kernel body and CANN task duration are separate scopes, not paired per-call samples."],
+                             "Aggregate benchmark means and trace task means are separate scopes; entry_boundary uses per-round samples when available.",
+                             "Entry boundary splits require an independent clock map. Without it, containment yields only bounds under a constant unit-rate offset assumption; no midpoint is reported."],
                       benchmark=benchmark,
                       timeline=timeline,
-                      csv_supplement=csv_report(root, trace.selected_csv_tasks))
+                      csv_supplement=supplement)
+        if execution == "graph":
+            report["entry_boundary"] = entry_boundary_report(trace, timeline, samples_data, args.clock_map, args.samples)
         if not trace.files:
             report["notes"].append("No readable timeline JSON: CSVs alone cannot localize dispatch/completion gaps.")
         text = bounded_report(report, args.max_chars)

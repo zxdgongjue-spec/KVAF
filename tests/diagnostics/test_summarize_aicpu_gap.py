@@ -7,7 +7,8 @@ import re
 from tempfile import TemporaryDirectory
 import unittest
 
-from summarize_aicpu_gap import Trace, bounded_report, csv_report, main, report_execution, graph_scope_comparison
+from summarize_aicpu_gap import (Trace, bounded_report, csv_report, main, report_execution,
+                                graph_scope_comparison, load_graph_samples, entry_boundary_report)
 
 
 def event(name, start, duration, pid=1, tid=1, **args):
@@ -59,7 +60,138 @@ def graph_round(start=100, count=1, token=100):
     return rows
 
 
+def sample_document(starts=(600, 1100), gets=1):
+    origin = 9_000_000_000_000
+    rounds = []
+    for ordinal, start in enumerate(starts, 1):
+        nodes = []
+        for node in range(gets):
+            base = origin + (start + 30 + node * 120) * 1000
+            nodes.append(dict(node=node, workers=[dict(worker=worker,
+                device_entry_ns=base + worker * 5000, device_start_ns=base + 5000 + worker * 5000,
+                device_finish_ns=base + 65000 - worker * 5000, device_return_ns=base + 70000 - worker * 5000)
+                for worker in range(2)]))
+        rounds.append(dict(round=ordinal, host_begin_ns=1_000_000_000 + (start - 25) * 1000,
+            host_end_ns=1_000_000_000 + (start + gets * 120 + 60) * 1000,
+            event_elapsed_ns=(gets * 120 + 40) * 1000, nodes=nodes))
+    return dict(format="kvaf-aicpu-samples-v1", execution="graph", backend="gather_read",
+        graph_api="acl", graph_submit="native", device_clock="aicpu_steady_ns", host_clock="python_perf_counter_ns",
+        device_id=1, warmup=0, iterations=len(starts), graph_replays=8, aicpu_workers=2,
+        gets_per_replay=gets, timed_prefix_replays=1, rounds=rounds)
+
+
+def sample_trace(root, gets=1, last=0):
+    rows = []
+    for token, start in enumerate((100, 600, 1100), 1):
+        rows.extend(graph_round(start, gets, token * 100))
+    write_trace(root, rows)
+    data = sample_document(gets=gets)
+    (root / "aicpu_samples.json").write_text(json.dumps(data))
+    data = load_graph_samples(root)
+    trace = Trace(root, re.compile("KvafAicpuGatherRead", re.I))
+    timeline = trace.report(last, 5, False, "graph", gets, data)
+    return trace, timeline, data
+
+
 class GapExtractorTest(unittest.TestCase):
+    def test_formal_rounds_exclude_native_event_warmup(self):
+        with TemporaryDirectory() as folder:
+            trace, timeline, data = sample_trace(Path(folder))
+            self.assertEqual(timeline["timed_replay_candidates"], 3)
+            self.assertEqual(timeline["selected_replays"], 2)
+            self.assertEqual(timeline["formal_timed_replays"], 2)
+            graph_scope_comparison({}, timeline)
+            self.assertTrue(timeline["scope_comparison_selection_complete"])
+            result = entry_boundary_report(trace, timeline, data)
+            self.assertEqual(result["stats_us"]["task_outside_entry"]["mean"], 30)
+            self.assertEqual(result["clock"]["status"], "bounds_only_no_independent_calibration")
+            self.assertNotIn("task_begin_to_first_entry", result["stats_us"])
+            low, high = result["clock"]["task_begin_to_first_entry_mean_bounds_us"]
+            self.assertLessEqual(low, 10)
+            self.assertGreaterEqual(high, 10)
+
+    def test_calibrated_boundaries_last_and_multiple_nodes(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root, gets=2, last=1)
+            path = root / "clock.json"
+            path.write_text(json.dumps(dict(format="kvaf-aicpu-clock-map-v1", device_id=1,
+                source_clock="aicpu_steady_ns", target_clock="msprof_trace_us",
+                provenance="independent_timestamp_calibration", anchors=[
+                    dict(device_ns=9_000_000_000_000, trace_us=0, uncertainty_us=.1),
+                    dict(device_ns=9_000_002_000_000, trace_us=2000, uncertainty_us=.1)])))
+            result = entry_boundary_report(trace, timeline, data, path)
+            self.assertEqual(result["selected_rounds"], 1)
+            self.assertEqual(result["selected_nodes"], 2)
+            self.assertEqual(result["stats_us"]["task_begin_to_first_entry"]["mean"], 10)
+            self.assertEqual(result["stats_us"]["last_return_to_task_end"]["mean"], 20)
+            self.assertEqual(result["stats_us"]["calibrated_task_outside_entry"]["mean"], 30)
+            self.assertEqual(result["stats_us"]["boundary_reconciliation_error"]["mean"], 0)
+            self.assertEqual(result["representative_nodes"][0]["round"], 2)
+            mapping = json.loads(path.read_text())
+            for anchor in mapping["anchors"]:
+                anchor["trace_us"] += 100
+            path.write_text(json.dumps(mapping))
+            failed = entry_boundary_report(trace, timeline, data, path)
+            self.assertEqual(failed["clock"]["status"], "calibration_inconsistent_with_task_containment")
+            self.assertNotIn("task_begin_to_first_entry", failed["stats_us"])
+
+    def test_changed_event_sample_and_host_cadence_are_rejected(self):
+        with TemporaryDirectory() as folder:
+            trace, timeline, data = sample_trace(Path(folder))
+            data["rounds"][0]["event_elapsed_ns"] += 10000
+            self.assertEqual(entry_boundary_report(trace, timeline, data)["status"], "sample_trace_event_window_mismatch")
+            data["rounds"][0]["event_elapsed_ns"] -= 10000
+            for field in ("host_begin_ns", "host_end_ns"):
+                data["rounds"][1][field] += 500000
+            self.assertEqual(entry_boundary_report(trace, timeline, data)["status"], "sample_trace_host_cadence_mismatch")
+
+    def test_missing_replay_and_clock_drift_do_not_create_a_split(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            for worker in data["rounds"][1]["nodes"][0]["workers"]:
+                for key in ("device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns"):
+                    worker[key] += 100000
+            result = entry_boundary_report(trace, timeline, data)
+            self.assertEqual(result["clock"]["status"], "no_consistent_unit_rate_offset")
+            write_trace(root, graph_round(100) + graph_round(1100, token=200))
+            trace = Trace(root, re.compile("KvafAicpuGatherRead", re.I))
+            timeline = trace.report(1, 5, False, "graph", 1, data)
+            self.assertEqual(entry_boundary_report(trace, timeline, data)["status"], "sample_trace_replay_count_mismatch")
+
+    def test_reused_csv_task_identity_uses_exported_timestamp(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root, last=1)
+            (root / "aicpu_1.csv").write_text(
+                "Task ID,Stream ID,Timestamp(us),Dispatch Time(us)\n"
+                "1,3,130,99\n1,3,630,88\n1,3,1130,5\n")
+            result = csv_report(root, trace.selected_csv_tasks, trace.selected_task_events)["selected_aicpu_rows"]
+            self.assertEqual(result["matched_tasks"], 1)
+            self.assertEqual(result["timestamp_matched_rows"], 1)
+            self.assertEqual(result["row_duration_us"]["dispatchtime"]["mean"], 5)
+
+    def test_boundary_cli_keeps_absolute_times_and_payload_private(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            data["payload"] = "CONTROLLED_PAYLOAD"
+            (root / "aicpu_samples.json").write_text(json.dumps(data))
+            (root / "summary.csv").write_text(
+                "backend,execution,gets_per_replay,kernel_mean_us,e2e_mean_us,graph_api,graph_submit\n"
+                "gather_read,graph,1,60,160,acl,native\n")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--msprof-dir", str(root), "--benchmark-dir", str(root), "--last", "1"])
+            self.assertEqual(code, 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["entry_boundary"]["selected_rounds"], 1)
+            self.assertEqual(report["entry_boundary"]["stats_us"]["task_outside_entry"]["mean"], 30)
+            self.assertNotIn("CONTROLLED", output.getvalue())
+            self.assertNotIn("9000000000000", output.getvalue())
+            self.assertNotIn(str(root), output.getvalue())
+
     def test_unique_event_identity_survives_host_device_clock_inversion(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
