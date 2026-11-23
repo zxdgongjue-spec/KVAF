@@ -29,9 +29,13 @@ inline void FillRow(uint8_t *row, uint32_t token_bytes, uint64_t token_id) {
 }
 
 // Returns token_id on success, ~0 on mismatch. Checks head/mid/tail words.
+// token_id is recovered from word 0 via the modular inverse of the RowWord
+// multiplier (odd constant, invertible mod 2^64).
 inline uint64_t VerifyRow(const uint8_t *row, uint32_t token_bytes) {
+  constexpr uint64_t kRowWordMulInv = 0xf1de83e19937733dULL;
   uint64_t token_id = 0;
   std::memcpy(&token_id, row, 8);
+  token_id *= kRowWordMulInv;
   const uint64_t offs[3] = {0, uint64_t(token_bytes / 2) & ~7ULL, uint64_t(token_bytes - 8)};
   for (uint64_t off : offs) {
     uint64_t word = 0;
