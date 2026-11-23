@@ -62,7 +62,7 @@ cd /path/to/kvaf
 CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
-CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
+URMA DDR 区域支持 `default`、`thp`、`hugetlb-2m` 和 `hugetlb-1g`，默认使用 `thp`。
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -73,12 +73,22 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 # 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
+
+# 显式使用 2 MiB 或 1 GiB HugeTLB 页。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
 ```
+
+显式 HugeTLB 模式需要在目标 NUMA 节点预留对应大小的页。实际映射按页大小向上取整，
+客户端可用容量和 URMA 注册长度仍为请求长度。页池不足时申请失败。
+`DDR_ALLOCATED` 日志记录 `page_mode` 和 `backing_bytes`。`urma+ubmem` 混合模式的共享 DDR 由 UBmem 分配器提供。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的
-CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。`REGION_ALLOCATED` 日志会记录
-`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。默认 THP 模式还应通过
+`/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
