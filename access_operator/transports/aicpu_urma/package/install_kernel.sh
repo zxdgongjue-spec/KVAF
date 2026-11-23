@@ -28,10 +28,10 @@ check_artifacts() {
   [[ -s "$dir/$package" && -s "$dir/kernel.json" ]] || die "missing build artifacts in $dir"
   check_archive "$dir/$package"
   grep -Fq '"KvafAicpuBatchPut"' "$dir/kernel.json" || die "BatchPut missing from $dir/kernel.json"
-  grep -Fq '"KvafAicpuGatherReadExecutionV4"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
+  grep -Fq '"KvafAicpuGatherReadExecutionV5"' "$dir/kernel.json" || die "GatherRead missing from $dir/kernel.json"
   grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$dir/kernel.json" || die "UMDK control missing from $dir/kernel.json"
   if [[ "$require_scatter" == true ]]; then
-    grep -Fq '"KvafAicpuCpuPushScatterExecutionV4"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
+    grep -Fq '"KvafAicpuCpuPushScatterExecutionV5"' "$dir/kernel.json" || die "Scatter missing from $dir/kernel.json; rebuild with --cpu-push"
   fi
 }
 
@@ -41,10 +41,10 @@ check_installed() {
   [[ -s "$kernel_dir/$package" && -s "$config_dir/$json" ]] || die "package or JSON missing under $cann_root"
   check_archive "$kernel_dir/$package"
   grep -Fq '"KvafAicpuBatchPut"' "$config_dir/$json" || die "installed JSON lacks BatchPut"
-  grep -Fq '"KvafAicpuGatherReadExecutionV4"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
+  grep -Fq '"KvafAicpuGatherReadExecutionV5"' "$config_dir/$json" || die "installed JSON lacks GatherRead"
   grep -Fq '"KvafAicpuUmdkControlSessionsV5"' "$config_dir/$json" || die "installed JSON lacks UMDK control"
   if [[ "$require_scatter" == true ]]; then
-    grep -Fq '"KvafAicpuCpuPushScatterExecutionV4"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
+    grep -Fq '"KvafAicpuCpuPushScatterExecutionV5"' "$config_dir/$json" || die "installed JSON lacks Scatter; rebuild and reinstall with --cpu-push"
   fi
   count="$(grep -Fxc "$header" "$load_config" || true)"
   [[ "$count" == 1 ]] || die "expected one $header entry in $load_config, found $count"

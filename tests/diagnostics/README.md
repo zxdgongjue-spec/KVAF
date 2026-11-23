@@ -227,13 +227,17 @@ start Event. See [the comparison commands](../../docs/batch_get_performance.md#a
 ### Split CANN task-to-entry and return-to-task-end
 
 Graph AICPU runs with `--kernel-profile` now also save `aicpu_samples.json`
-beside the CSVs. It retains each measured round/node/worker's existing entry,
-body and return timestamps, Host call bounds, Event elapsed time and warmup
-metadata. Sample serialization and file writes happen after measured calls.
+beside the CSVs. Version 2 retains each measured round/node/worker's steady-clock
+timestamps plus entry/return `CNTVCT_EL0` values and `CNTFRQ_EL0` frequency.
+Host call bounds, Event elapsed time and warmup metadata identify formal rounds.
+Sample serialization and file writes happen after measured calls.
 Reusing an output directory replaces this file; runs without raw sample export
 remove a previous `aicpu_samples.json` to avoid analyzing stale timing samples.
-No kernel, ABI or native binding change is required. The local sample file
-contains absolute timing values; share the bounded summary, not this raw file.
+Rebuild the NPU binding and AICPU package, reinstall the package and restart the
+NPU process. Get entry symbols are now `ExecutionV5`, guarding the expanded
+profile ABI against an older installed kernel. Counter reads run only with
+profiling enabled. The local sample file contains absolute timing values;
+share the bounded summary, not this raw file.
 
 For the six-worker empty-Get experiment keep the CPU service unchanged and run:
 
@@ -260,6 +264,16 @@ Read `entry_boundary` in the resulting report:
 | `stats_us.task_outside_entry` | Per-node CANN task duration minus that node's entry span, paired before aggregation. |
 | `stats_us.worker_start_skew` | Last worker entry minus first entry, independent of the trace clock. |
 | `stats_us.worker_wall_mean/max` | Individual worker entry-to-return durations, distinguishing work from worker-start skew. |
+| `clock.status=msprof_counter_aligned`, `split_available=true` | Hardware timestamps were aligned using this capture's synchronization metadata, without fitted task boundaries. |
+| `stats_us.task_begin_to_first_entry` | CANN task start to the first worker's counter entry timestamp. |
+| `stats_us.last_return_to_task_end` | Last worker's counter return timestamp to CANN task end. |
+| `stats_us.calibrated_entry_span` | Earliest counter entry to latest counter return; the two boundary gaps plus this span equal the task duration. |
+| `stats_us.counter_minus_steady_entry` | Counter span minus steady span; captures the small extra interval between the separate clock reads. |
+| `dominant_boundary` | `before_entry`, `after_return`, or `similar_within_uncertainty`. |
+| `clock.status=sync_metadata_*` | Preserve the original capture's device directory and pass its PROF root; copied JSON/CSVs alone cannot align counters. |
+| `clock.status=sync_counter_frequency_mismatch` | Sampled CNTFRQ does not match the capture's HWTS frequency; no split is emitted. |
+| `clock.status=calibration_inconsistent_with_task_containment` | Converted entry/return timestamps fall outside their associated task; no split is emitted. |
+| `clock.status=counter_and_steady_durations_disagree` | Hardware and steady spans disagree beyond the clock-read tolerance; no split is emitted. |
 | `clock.status=bounds_only_no_independent_calibration` | Only conditional bounds are available; no measured before/after point split. |
 | `clock.task_begin_to_first_entry_mean_bounds_us` | Possible mean time before user entry, under a common unit-rate clock-offset assumption. |
 | `clock.last_return_to_task_end_mean_bounds_us` | Possible mean time after user return, under the same unknown offset. |
@@ -274,12 +288,26 @@ of the raw samples. Missing brackets, changed run cadence or inconsistent Event
 windows cause an explicit association failure. Older reports without the sample
 file remain supported but cannot produce paired boundary analysis.
 
-Containment bounds do **not** calibrate the clock. They constrain one unknown
-offset using every formal task and a 1 us boundary tolerance. The lower/upper
-bounds are coupled: one offset moves time from the front to the back. A broad
-range means the split is still unknown; its midpoint is never reported as a
-measurement. Samples alone cannot establish the absolute offset between
-`std::chrono::steady_clock` on AICPU and exported msprof timestamps.
+New runs align counters automatically using `dev_start.log*`, `host_start.log*`,
+`info.json*` and `start_info*` in the original capture's device directory. Keep
+these files locally and pass the capture root to `--msprof-dir`; no extra
+benchmark flag or hand-written `--clock-map` is needed. Conversion follows
+[msprof InfoConfReader](https://github.com/Ascend/msprof/blob/master/analysis/common_func/info_conf_reader.py):
+device counter delta / HWTS frequency, plus the synchronized Host monotonic-raw
+anchor and the export's local-time offset. `cntvct_diff` is accounted for using
+the Host CPU frequency. Decimal arithmetic preserves sub-microsecond differences
+when export timestamps are large. Multiple device directories require an
+unambiguous device identity in the selected trace tasks.
+
+The sampled counter frequency must match the capture. Converted boundaries must
+contain the user entry/return within each task, and their span must agree with
+the independent steady-clock span. The 1 us boundary tolerance covers trace
+quantization; it is not a measured hardware synchronization error. No raw clock
+anchor, absolute timestamp or source path is emitted in the bounded report.
+
+Version-1 samples remain readable. Their containment bounds do **not** calibrate
+the clock: the coupled ranges share an unknown offset, and their midpoint is
+never reported as a measurement.
 
 If an independent clock synchronization record is available, pass
 `--clock-map clock-map.json`. Its schema is:
@@ -296,11 +324,11 @@ anchors:      exactly two objects containing device_ns, trace_us, uncertainty_us
 The anchors must come from an independent calibration, bracket the device
 timestamps being analyzed and belong to this capture. Do not construct them by
 placing user entry at task start or return at task end: that assumes the answer.
-No automatic conversion from unknown CANN clock-sync file formats is attempted.
+Unknown CANN clock-sync formats are rejected rather than guessed.
 The extractor interpolates these anchors and checks task containment. It then
 emits `stats_us.task_begin_to_first_entry`, `last_return_to_task_end`, their sum,
-and calibration uncertainty. Without independent anchors, exact front/back
-attribution remains unavailable; the sum and conditional ranges are still useful.
+and calibration uncertainty. This manual mapping is for old steady-clock-only
+samples; current version-2 samples normally use the automatic counter path.
 
 AICPU CSV rows with reused Task IDs can now be selected by ID plus a unique
 exported timestamp contained in the corresponding selected task. Rows without

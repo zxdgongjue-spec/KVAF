@@ -27,6 +27,8 @@ struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t scatter_ns{}, output_cache_ns{};
   std::uint64_t scatter_copies{};
   std::uint64_t entry_ns{}, return_ns{};
+  // Raw hardware clock for alignment with msprof's task timestamps.
+  std::uint64_t entry_syscnt{}, return_syscnt{}, syscnt_frequency{};
 };
 
 // Caller-owned result, valid after a successful synchronous AICPU BatchGet.

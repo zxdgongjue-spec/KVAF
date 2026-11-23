@@ -7,6 +7,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 import csv
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import gzip
 import json
 import math
@@ -190,6 +191,7 @@ def event_from_raw(raw, process_names, pattern):
 
 class Trace:
     def __init__(self, root, pattern):
+        self.root = root
         self.events, self.flows = [], defaultdict(list)
         self.graph_replays, self.sample_rounds, self.selected_task_events = [], {}, []
         self.selected_csv_tasks = {}
@@ -854,7 +856,10 @@ def load_graph_samples(root):
     data = json.loads(paths[0].read_text(encoding="utf-8-sig"))
     integer = lambda v: isinstance(v, int) and not isinstance(v, bool)
     try:
-        require(data["format"] == "kvaf-aicpu-samples-v1" and data["execution"] == "graph")
+        require(data["format"] in ("kvaf-aicpu-samples-v1", "kvaf-aicpu-samples-v2") and data["execution"] == "graph")
+        counters = data["format"] == "kvaf-aicpu-samples-v2"
+        if counters:
+            require(data["boundary_clock"] == "aarch64_cntvct")
         require(data["device_clock"] == "aicpu_steady_ns")
         require(data["host_clock"] == "python_perf_counter_ns")
         require(data["backend"] in ("gather_read", "cpu_push_scatter"))
@@ -879,6 +884,10 @@ def load_graph_samples(root):
                     require(worker["worker"] == worker_index)
                     values = [worker[k] for k in ("device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns")]
                     require(all(integer(v) for v in values) and 0 < values[0] <= values[1] <= values[2] <= values[3])
+                    if counters:
+                        ticks = [worker[k] for k in ("device_entry_syscnt", "device_return_syscnt", "device_syscnt_frequency")]
+                        require(all(integer(v) for v in ticks))
+                        require(ticks == [0, 0, 0] or (0 < ticks[0] <= ticks[1] and ticks[2] > 0))
                 require(previous_device <= min(w["device_entry_ns"] for w in node["workers"]))
                 previous_device = max(w["device_return_ns"] for w in node["workers"])
     except (ValueError, KeyError, TypeError):
@@ -914,6 +923,63 @@ def calibrated_clock(path, device_id):
     return convert
 
 
+def msprof_counter_clock(root, tasks, frequency):
+    """Use the capture's CNTVCT synchronization, never fitted task boundaries.
+
+    Mirrors msprof InfoConfReader.time_from_syscnt/trans_into_local_time:
+    https://github.com/Ascend/msprof/blob/master/analysis/common_func/info_conf_reader.py
+    """
+    if root.name == "mindstudio_profiler_output":
+        root = root.parent
+    directories = sorted({p.parent for p in root.rglob("dev_start.log*") if p.is_file()})
+    devices = {p.ids.get("device") for p in tasks} - {None}
+    if devices:
+        directories = [p for p in directories if p.name.removeprefix("device_") in devices]
+    if not directories:
+        raise ValueError("sync_metadata_missing")
+    if len(directories) != 1:
+        raise ValueError("sync_metadata_ambiguous_device")
+    directory = directories[0]
+
+    def metadata(pattern):
+        paths = [p for p in directory.glob(pattern) if p.is_file()]
+        if len(paths) != 1:
+            raise ValueError("sync_metadata_missing_or_ambiguous")
+        return paths[0].read_text(encoding="utf-8-sig")
+
+    def numeric_fields(text):
+        fields = re.findall(r"^\s*([a-zA-Z_]+)\s*[:=]\s*([-+\d.eE]+)\s*$", text, re.M)
+        if len({key.lower() for key, _ in fields}) != len(fields):
+            raise ValueError("sync_ambiguous_metadata_fields")
+        return {key.lower(): Decimal(value) for key, value in fields}
+
+    try:
+        dev = numeric_fields(metadata("dev_start.log*"))
+        host = numeric_fields(metadata("host_start.log*"))
+        info = json.loads(metadata("info.json*"), parse_float=Decimal)
+        start = json.loads(metadata("start_info*"), parse_float=Decimal)
+        device_frequency = Decimal(str(info["DeviceInfo"][0]["hwts_frequency"])) * 1000000
+        if device_frequency <= 0 or abs(device_frequency - frequency) > 1:
+            raise ValueError("sync_counter_frequency_mismatch")
+        counter_origin = dev["cntvct"]
+        host_ns = host["clock_monotonic_raw"]
+        if host.get("cntvct_diff", 0):
+            host_frequency = Decimal(str(info["CPU"][0]["Frequency"])) * 1000000
+            if host_frequency <= 0:
+                raise ValueError("sync_invalid_host_frequency")
+            host_ns += host["cntvct_diff"] * 1000000000 / host_frequency
+        local_offset_us = Decimal(str(start["collectionTimeBegin"])) - Decimal(str(start["clockMonotonicRaw"])) / 1000
+        trace_origin_us = host_ns / 1000 + local_offset_us
+        if not all(v.is_finite() for v in (counter_origin, trace_origin_us, device_frequency)) or counter_origin <= 0:
+            raise ValueError("sync_invalid_metadata")
+    except (KeyError, IndexError, TypeError, InvalidOperation, ZeroDivisionError):
+        raise ValueError("sync_invalid_metadata") from None
+
+    def convert(counter):
+        return trace_origin_us + (Decimal(counter) - counter_origin) * 1000000 / device_frequency, 0.0
+    return convert
+
+
 def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5):
     if data is None:
         return dict(status="samples_missing", note="Rerun the benchmark with --kernel-profile to export aicpu_samples.json.")
@@ -938,7 +1004,7 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
             returned = max(w["device_return_ns"] for w in workers)
             body = (max(w["device_finish_ns"] for w in workers) - min(w["device_start_ns"] for w in workers)) / 1000
             pairs.append(dict(round=ordinal, node=node["node"], entry=entry, returned=returned,
-                task=task, entry_span=(returned - entry) / 1000, body_span=body,
+                task=task, workers=workers, entry_span=(returned - entry) / 1000, body_span=body,
                 worker_start_skew=(max(w["device_entry_ns"] for w in workers) - entry) / 1000,
                 worker_wall_mean=statistics.mean((w["device_return_ns"] - w["device_entry_ns"]) / 1000 for w in workers),
                 worker_wall_max=max((w["device_return_ns"] - w["device_entry_ns"]) / 1000 for w in workers)))
@@ -968,30 +1034,63 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
     indexes = sorted({round(i * (len(representatives) - 1) / max(1, sample_limit - 1)) for i in range(sample_limit)})
     result["representative_nodes"] = [dict(round=representatives[i]["round"], node=representatives[i]["node"],
         **{key + "_us": round(representatives[i][key], 3) for key in fields}) for i in indexes]
+    convert, counter_mode = None, False
     if clock_map is not None:
         convert = calibrated_clock(clock_map, data["device_id"])
+    elif data["format"] == "kvaf-aicpu-samples-v2":
+        frequencies = {w["device_syscnt_frequency"] for p in pairs for w in p["workers"]}
+        if len(frequencies) != 1 or not next(iter(frequencies)):
+            result["clock"] = dict(status="hardware_counter_unavailable_or_inconsistent", split_available=False)
+            return result
+        try:
+            convert = msprof_counter_clock(trace.root, [p["task"] for p in pairs], next(iter(frequencies)))
+        except ValueError as error:
+            code = str(error)
+            result["clock"] = dict(status=code if code.startswith("sync_") else "sync_invalid_metadata", split_available=False)
+            return result
+        counter_mode = True
+    if convert is not None:
         before, after, uncertainty, mapped_outside = [], [], [], []
+        counter_span_delta = []
         try:
             for p in selected:
-                entry, u1 = convert(p["entry"])
-                returned, u2 = convert(p["returned"])
-                before.append(entry - p["task"].start)
-                after.append(p["task"].end - returned)
+                entry_value = min(w["device_entry_syscnt"] for w in p["workers"]) if counter_mode else p["entry"]
+                return_value = max(w["device_return_syscnt"] for w in p["workers"]) if counter_mode else p["returned"]
+                entry, u1 = convert(entry_value)
+                returned, u2 = convert(return_value)
+                entry, returned = Decimal(str(entry)), Decimal(str(returned))
+                before.append(float(entry - Decimal(str(p["task"].start))))
+                after.append(float(Decimal(str(p["task"].end)) - returned))
                 uncertainty.append(max(u1, u2) + 1.0)
-                mapped_outside.append(p["task_span"] - (returned - entry))
+                mapped_outside.append(p["task_span"] - float(returned - entry))
+                counter_span_delta.append(float(returned - entry) - p["entry_span"])
         except ValueError:
-            result["clock"] = dict(status="calibration_does_not_cover_samples")
+            result["clock"] = dict(status="calibration_does_not_cover_samples", split_available=False)
             return result
         if any(a < -u or b < -u for a, b, u in zip(before, after, uncertainty)):
-            result["clock"] = dict(status="calibration_inconsistent_with_task_containment")
+            result["clock"] = dict(status="calibration_inconsistent_with_task_containment", split_available=False)
             return result
-        result["clock"] = dict(status="independently_calibrated", boundary_uncertainty_us=max(uncertainty))
+        if counter_mode and any(abs(delta) > max(2.0, p["entry_span"] * .001)
+                                for delta, p in zip(counter_span_delta, selected)):
+            result["clock"] = dict(status="counter_and_steady_durations_disagree", split_available=False)
+            return result
+        result["clock"] = dict(status="msprof_counter_aligned" if counter_mode else "independently_calibrated",
+                               split_available=True, boundary_uncertainty_us=max(uncertainty))
+        if counter_mode:
+            result["clock"]["source"] = "capture_dev_start_host_start_info_start_info"
+            result["stats_us"]["counter_minus_steady_entry"] = stats(counter_span_delta)
         result["stats_us"].update(task_begin_to_first_entry=stats(before), last_return_to_task_end=stats(after),
+            calibrated_entry_span=stats([p["task_span"] - outside for p, outside in zip(selected, mapped_outside)]),
             calibrated_task_outside_entry=stats(mapped_outside),
             boundary_reconciliation_error=stats([a + b - c for a, b, c in zip(before, after, mapped_outside)]))
+        before_mean, after_mean = statistics.mean(before), statistics.mean(after)
+        margin = max(uncertainty) * 2
+        result["dominant_boundary"] = ("before_entry" if before_mean - after_mean > margin else
+                                       "after_return" if after_mean - before_mean > margin else "similar_within_uncertainty")
         for item in result["representative_nodes"]:
             index = next(i for i, p in enumerate(selected) if (p["round"], p["node"]) == (item["round"], item["node"]))
-            item.update(task_begin_to_first_entry_us=round(before[index], 3), last_return_to_task_end_us=round(after[index], 3))
+            item.update(task_begin_to_first_entry_us=round(before[index], 3), last_return_to_task_end_us=round(after[index], 3),
+                        calibrated_entry_span_us=round(selected[index]["task_span"] - mapped_outside[index], 3))
     else:
         # Containment bounds a common offset; it cannot identify a clock offset or a unique split.
         origin = pairs[0]["entry"]
@@ -1203,7 +1302,8 @@ def main(argv=None):
                              "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",
                              "Aggregate benchmark means and trace task means are separate scopes; entry_boundary uses per-round samples when available.",
-                             "Entry boundary splits require an independent clock map. Without it, containment yields only bounds under a constant unit-rate offset assumption; no midpoint is reported."],
+                             "Entry boundaries use sampled CNTVCT plus the capture's msprof synchronization metadata automatically; --clock-map remains available for older steady-clock samples. No task boundary is used as a clock anchor.",
+                             "Counter and steady timestamps bracket separate clock reads. Compare calibrated_entry_span with entry_span; boundary uncertainty covers trace quantization, not an independently measured hardware synchronization error."],
                       benchmark=benchmark,
                       timeline=timeline,
                       csv_supplement=supplement)

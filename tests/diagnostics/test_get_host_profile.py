@@ -230,9 +230,13 @@ class GetHostProfileTest(unittest.TestCase):
                 device_id=1, warmup=3, iterations=1, graph_replays=8)
             report = BatchGetCsv(args)
             nodes = [[dict(device_entry_ns=base, device_start_ns=base + 1000,
-                           device_finish_ns=base + 9000, device_return_ns=base + 10000),
+                           device_finish_ns=base + 9000, device_return_ns=base + 10000,
+                           device_entry_syscnt=base // 20, device_return_syscnt=(base + 10000) // 20,
+                           device_syscnt_frequency=50000000),
                       dict(device_entry_ns=base + 500, device_start_ns=base + 1500,
-                           device_finish_ns=base + 8000, device_return_ns=base + 9000)]
+                           device_finish_ns=base + 8000, device_return_ns=base + 9000,
+                           device_entry_syscnt=(base + 500) // 20, device_return_syscnt=(base + 9000) // 20,
+                           device_syscnt_frequency=50000000)]
                      for base in (100000, 200000)]
             report.add_graph_samples([nodes], [(1000, 300000)], [.1])
             report.write()
@@ -242,6 +246,9 @@ class GetHostProfileTest(unittest.TestCase):
             self.assertEqual(data["rounds"][0]["event_elapsed_ns"], 200000)
             self.assertEqual(data["rounds"][0]["nodes"][1]["workers"][1]["device_entry_ns"], 200500)
             self.assertEqual(data["device_clock"], "aicpu_steady_ns")
+            self.assertEqual(data["format"], "kvaf-aicpu-samples-v2")
+            self.assertEqual(data["boundary_clock"], "aarch64_cntvct")
+            self.assertEqual(data["rounds"][0]["nodes"][0]["workers"][0]["device_entry_syscnt"], 5000)
             self.assertNotIn("graph_lease", json.dumps(data))
 
 
