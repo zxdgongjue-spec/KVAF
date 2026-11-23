@@ -422,6 +422,59 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
                static_cast<unsigned long long>(remote_base),
                static_cast<unsigned long long>(key.hbm_addr));
   const uint64_t remote_data_base = remote_base + key.data_offset;
+
+  // Self-test ladder: 8B flag-only write, then 656B single-sge write, then
+  // 8-sge SGL write. Each uses its own seq so failures localize cleanly.
+  {
+    uint64_t probe_seq = 1;
+    auto post_one = [&](uint32_t src_n, urma_sge_t *src, uint64_t dst_addr, uint32_t dst_len,
+                        const char *name) -> int {
+      urma_sge_t dst{};
+      dst.addr = dst_addr;
+      dst.len = dst_len;
+      dst.tseg = remote_tseg;
+      urma_jfs_wr_t wr{};
+      wr.opcode = URMA_OPC_WRITE;
+      wr.flag.bs.complete_enable = 1;
+      wr.flag.bs.place_order = 2;
+      wr.tjetty = target;
+      wr.user_ctx = probe_seq++;
+      wr.rw.src = {src, src_n};
+      wr.rw.dst = {&dst, 1U};
+      urma_jfs_wr_t *bad = nullptr;
+      if (urma_post_jetty_send_wr(jetty, &wr, &bad) != 0) {
+        std::fprintf(stderr, "[SELFTEST] %s post failed errno=%d\n", name, errno);
+        return 1;
+      }
+      urma_cr_t cr{};
+      while (urma_poll_jfc(jfc, 1, &cr) == 0) {
+      }
+      std::fprintf(stderr, "[SELFTEST] %s status=%d user_ctx=%llu len=%u\n", name, cr.status,
+                   static_cast<unsigned long long>(cr.user_ctx), cr.completion_len);
+      return cr.status == URMA_CR_SUCCESS ? 0 : 1;
+    };
+    // (a) 8B flag write: flag buf -> remote_base
+    std::memcpy(flag_buf, &probe_seq, 8);
+    urma_sge_t fa{reinterpret_cast<uint64_t>(flag_buf), 8, flag_seg, nullptr};
+    int fail = post_one(1, &fa, remote_base, 8, "flag8");
+    // (b) single 656B token row from the DDR seg
+    urma_sge_t sa{reinterpret_cast<uint64_t>(ddr), args.token_bytes, local_seg, nullptr};
+    if (!fail) fail = post_one(1, &sa, remote_base + key.data_offset, args.token_bytes, "row656");
+    // (c) 8-sge SGL run (8 rows -> contiguous dst)
+    static urma_sge_t sg8[8];
+    for (int i = 0; i < 8; ++i) {
+      sg8[i].addr = reinterpret_cast<uint64_t>(ddr) + uint64_t(i) * args.token_bytes;
+      sg8[i].len = args.token_bytes;
+      sg8[i].tseg = local_seg;
+      sg8[i].user_tseg = nullptr;
+    }
+    if (!fail) fail = post_one(8, sg8, remote_base + key.data_offset + 65536, 8 * args.token_bytes, "sgl8");
+    if (fail) {
+      std::fprintf(stderr, "[SGL_PUSH] selftest failed\n");
+      return 1;
+    }
+  }
+
   uint64_t seq = 0;
   for (uint32_t iter = 0; iter < args.iters + args.warmup; ++iter) {
     ++seq;
@@ -493,7 +546,8 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     while ((got = urma_poll_jfc(jfc, 1, &cr)) == 0) {
     }
     if (cr.status != URMA_CR_SUCCESS) {
-      std::fprintf(stderr, "[SGL_PUSH] completion error iter=%u status=%d\n", iter, cr.status);
+      std::fprintf(stderr, "[SGL_PUSH] completion error iter=%u status=%d user_ctx=%llu completion_len=%u\n",
+                   iter, cr.status, static_cast<unsigned long long>(cr.user_ctx), cr.completion_len);
       return 1;
     }
     const uint64_t t_jfc = kvaf::demo::NowNs();
