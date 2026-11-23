@@ -28,9 +28,9 @@ set(cpu_push_libraries "${KVAF_AICPU_SECUREC_LIBRARY}")
 set(cpu_push_dependencies "${KVAF_AICPU_SECUREC_LIBRARY}" "${KVAF_AICPU_SECUREC_INCLUDE_DIR}/securec.h")
 set(cpu_push_commands COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${KVAF_AICPU_SECUREC_LIBRARY}" "${kernel_dir}/${securec_library_name}")
-set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV3": {
+set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV4": {
     "opInfo": {
-      "functionName": "KvafAicpuCpuPushScatterExecutionV3",
+      "functionName": "KvafAicpuCpuPushScatterExecutionV4",
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }

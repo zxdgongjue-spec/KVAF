@@ -35,12 +35,12 @@ class GetGraph:
 
 
 @contextmanager
-def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit):
-    """Use a real warmup forward to prepare the single-node benchmark graph."""
+def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit, count=1):
+    """Use real warmup forwards to prepare independently owned Get nodes."""
     execution.drain_get(runtime)
     execution.release_output(runtime)
     with captured_get_resources(args, runtime, torch, kvaf, execution, stream,
-                                [submit]) as (graph, _):
+                                [submit] * count) as (graph, _):
         yield graph
 
 

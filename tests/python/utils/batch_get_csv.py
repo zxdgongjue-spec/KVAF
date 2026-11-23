@@ -10,6 +10,7 @@ SUMMARY_FIELDS = (
     "backend", "transport", "execution",
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
     "payload_bytes_per_call", "aiv_cores", "aicpu_workers", "jettys_per_core", "max_inflight_total",
+    "get_binding", "graph_api", "gets_per_replay", "latency_scope",
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
@@ -26,6 +27,7 @@ def write_csv(path, fields, rows):
 
 class BatchGetCsv:
     def __init__(self, args):
+        self.get_binding, self.graph_api, self.graph_get_count = args.get_binding, args.graph_api, args.graph_get_count
         directory = args.output_dir
         if directory is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -47,6 +49,10 @@ class BatchGetCsv:
     def add_summary(self, execution, measurements):
         self.summary_rows.append(dict(
             self.config, execution=execution,
+            get_binding=self.get_binding if execution == "eager" else "capture",
+            graph_api=self.graph_api if execution == "graph" else None,
+            gets_per_replay=self.graph_get_count if execution == "graph" else 1,
+            latency_scope="amortized_per_get" if execution == "graph" and self.graph_get_count > 1 else "single_get",
             **{f"{scope}_{key}": value for scope, metrics in measurements.items() for key, value in metrics.items()},
         ))
 

@@ -31,6 +31,7 @@ def eager_host_sample(host, e2e_us, kernel_us):
         "stream_sync", "status_check", "prepare_capture", "previous_completion", "input_build",
         "profile_buffers", "registration")}
     groups["provider"]["launch_api"] = (launched - launch) / 1000
+    groups["stream"] = {name: host["stream_" + name + "_ns"] / 1000 for name in ("select", "handle")}
     provider = groups["provider"]
     for total, parts in (("prepare", ("prepare_capture", "previous_completion", "input_build", "profile_buffers", "registration")),
                          ("submit", ("launch_api",)),
@@ -56,10 +57,13 @@ def eager_host_sample(host, e2e_us, kernel_us):
             for kind, values in groups.items() for name, value in values.items()}
 
 
-def graph_host_sample(host, e2e_us, kernel_us):
+def graph_host_sample(host, e2e_us, kernel_us, gets=1):
     sample = {("host_graph", key): value / 1000 for key, value in host.items()}
+    # Host durations above are per replay; Event/kernel durations are per Get.
+    sample.update({("host_graph_per_get", key): value / 1000 / gets for key, value in host.items()})
     sample.update({("gap", "e2e"): e2e_us, ("gap", "kernel"): kernel_us,
-                   ("gap", "graph_event_outside_kernel"): e2e_us - kernel_us})
+                   ("gap", "graph_event_outside_kernel"): e2e_us - kernel_us,
+                   ("gap", "graph_host_outside_event"): host["replay_and_wait"] / 1000 / gets - e2e_us})
     return sample
 
 

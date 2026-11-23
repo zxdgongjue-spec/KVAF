@@ -929,7 +929,7 @@ CPU 服务进程。库名和 `build-npu/bin` 产物位置保留；AICPU 构建�
 |---|---|
 | AIV Get / Put | `KvafExecuteBatchGetAivKernelV3` / `KvafExecuteBatchPutAivKernelV2` |
 | AICPU Control | 新 Host 要求 `KvafAicpuUmdkControlSessionsV5`，支持 QueueProfile |
-| AICPU Gather / Scatter | `KvafAicpuGatherReadExecutionV3` / `KvafAicpuCpuPushScatterExecutionV3` |
+| AICPU Gather / Scatter | `KvafAicpuGatherReadExecutionV4` / `KvafAicpuCpuPushScatterExecutionV4` |
 | Control 兼容入口 | 旧 Control/V3/V4 保留原 Gather 队列布局；新 Host 不静默降级 |
 | CPU 服务 | 请求级能力协商拒绝不兼容服务；`--gather-affinity` 已移除，使用当前线程调度参数 |
 

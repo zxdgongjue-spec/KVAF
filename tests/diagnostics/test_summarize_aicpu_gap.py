@@ -68,6 +68,32 @@ class GapExtractorTest(unittest.TestCase):
             self.assertEqual(result["chains_with_device_copy"], 1)
             self.assertEqual(result["representative_chains"][0]["link_methods"], ["flow"])
 
+    def test_graph_model_event_sync_and_linked_record_boundaries(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            rows = [
+                event("aclrtRecordEvent", 80, 2, **{"Connection Id": 9}),
+                event("aclmdlRIExecuteAsync", 100, 8, **{"Connection Id": 10}),
+                event("aclrtRecordEvent", 110, 2, **{"Connection Id": 11}),
+                event("aclrtSynchronizeEvent", 114, 251),
+                event("EVENT_RECORD", 90, 2, 2, 3, **{"Task Type": "EVENT_RECORD", "Connection Id": 9}),
+                event("KvafAicpuGatherReadExecutionV4", 120, 100, 2, 3, **{"Connection Id": 10}),
+                event("KvafAicpuGatherReadExecutionV4", 240, 100, 2, 3, **{"Connection Id": 10}),
+                event("EVENT_RECORD", 343, 2, 2, 3, **{"Task Type": "EVENT_RECORD", "Connection Id": 11}),
+            ]
+            write_trace(root, rows)
+            result = report(root, 1)
+            self.assertEqual(result["selected_launches"], 1)
+            chain = result["representative_chains"][0]
+            self.assertEqual(chain["launch_api"], "aclmdlRIExecuteAsync")
+            self.assertEqual(chain["sync_api"], "aclrtSynchronizeEvent")
+            self.assertEqual(chain["metrics_us"]["task_union"], 200)
+            self.assertEqual(chain["metrics_us"]["inter_task_gaps"], 20)
+            self.assertEqual(chain["metrics_us"]["aligned_task_end_to_sync_return"], 25)
+            self.assertEqual(chain["metrics_us"]["device_event_start_to_task"], 28)
+            self.assertEqual(chain["metrics_us"]["device_task_to_end_event"], 3)
+            self.assertTrue(chain["event_bracket_order_ok"])
+
     def test_last_counts_launches_not_worker_events_and_shards_are_deduped(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -101,6 +127,19 @@ class GapExtractorTest(unittest.TestCase):
             self.assertEqual(result["linked_launches"], 2)
             self.assertEqual(result["chain_stats_us"]["aligned_launch_to_task_begin"]["mean"], 20)
 
+    def test_capture_kernel_id_is_not_a_replay_link(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_trace(root, [
+                event("aclrtLaunchKernelWithHostArgs", 100, 10, **{"Connection Id": 7}),
+                event("aclmdlRIExecuteAsync", 300, 10, **{"Connection Id": 9}),
+                event("KvafAicpuGatherReadExecutionV4", 320, 100, 2, 3, **{"Connection Id": 7}),
+                event("aclrtSynchronizeEvent", 315, 120),
+            ])
+            result = report(root, 1)
+            self.assertEqual(result["linked_target_events"], 0)
+            self.assertGreater(result["warnings"]["CAPTURE_LAUNCH_NOT_REPLAY_LINK"], 0)
+
     def test_begin_end_api_events_and_nan_are_handled(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -120,6 +159,23 @@ class GapExtractorTest(unittest.TestCase):
             result = csv_report(root)
             self.assertEqual(result["all_rows_duration_us"]["task_time.aicpu"]["mean"], 110)
             self.assertEqual(result["aggregate_api_us"]["aclrtMemcpyAsync"], dict(calls=10, total=180, mean=18))
+
+    def test_selected_csv_does_not_include_other_task_rows(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_trace(root, trace_round() + trace_round(300, 20))
+            trace = Trace(root, re.compile("KvafAicpuGatherRead", re.I))
+            trace.report(1, 1, False)
+            (root / "aicpu_1.csv").write_text(
+                "Task ID,Stream ID,Dispatch Time(us)\n10,3,50\n20,3,5\n20,4,99\n", encoding="utf-8")
+            selected = csv_report(root, trace.selected_csv_tasks)["selected_aicpu_rows"]
+            self.assertEqual(selected["matched_tasks"], 1)
+            self.assertEqual(selected["row_duration_us"]["dispatchtime"]["mean"], 5)
+            write_trace(root, trace_round() + trace_round(300))
+            trace = Trace(root, re.compile("KvafAicpuGatherRead", re.I))
+            result = trace.report(1, 1, False)
+            self.assertEqual(trace.selected_csv_tasks, {})
+            self.assertEqual(result["warnings"]["SELECTED_CSV_IDS_MISSING_OR_REUSED"], 1)
 
     def test_cli_report_is_bounded_and_does_not_export_controlled_fields(self):
         with TemporaryDirectory() as folder:

@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -54,6 +55,7 @@ class GetCallTrace {
     const std::pair<const char*, std::uint64_t BatchGetHostTiming::*> fields[] = {
 #define HOST_FIELD(name) {#name, &BatchGetHostTiming::name}
         HOST_FIELD(tensor_views_ns), HOST_FIELD(request_validation_ns), HOST_FIELD(stream_ns),
+        HOST_FIELD(stream_select_ns), HOST_FIELD(stream_handle_ns),
         HOST_FIELD(refs_ns), HOST_FIELD(binding_lock_ns), HOST_FIELD(set_device_ns),
         HOST_FIELD(core_call_ns), HOST_FIELD(owner_update_ns), HOST_FIELD(total_ns),
         HOST_FIELD(core_lifecycle_ns), HOST_FIELD(core_table_ns), HOST_FIELD(core_direction_ns),
@@ -119,33 +121,46 @@ struct NpuTensorView {
   py::ssize_t rows{0};
 };
 
-NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
-  if (!tensor.attr("is_contiguous")().cast<bool>()) {
-    throw py::value_error(std::string(name) + " must be contiguous");
+class TensorMetadataMethods {
+ public:
+  py::object Call(const py::object& tensor, const py::str& method) const {
+#if PY_VERSION_HEX >= 0x03090000
+    auto* result = PyObject_CallMethodNoArgs(tensor.ptr(), method.ptr());
+    if (!result) throw py::error_already_set();
+    return py::reinterpret_steal<py::object>(result);
+#else
+    return tensor.attr(method)();
+#endif
   }
-  const std::string device = py::str(tensor.attr("device")).cast<std::string>();
-  if (device.rfind("npu", 0) != 0) {
-    throw py::value_error(std::string(name) + " must reside on an NPU");
+  py::object SelectStream(const py::object& stream) {
+    if (!stream.is_none()) return stream;
+    if (!current_stream_) current_stream_ = py::module_::import("torch").attr("npu").attr("current_stream");
+    return current_stream_();
   }
-  const std::uint64_t pointer = tensor.attr("data_ptr")().cast<std::uint64_t>();
-  const std::uint64_t elements = tensor.attr("numel")().cast<std::uint64_t>();
-  const std::uint64_t element_bytes =
-      tensor.attr("element_size")().cast<std::uint64_t>();
-  if (pointer == 0 || elements == 0 || element_bytes == 0 ||
-      elements > std::numeric_limits<std::size_t>::max() ||
-      element_bytes > std::numeric_limits<std::size_t>::max() ||
-      static_cast<std::size_t>(elements) >
-          std::numeric_limits<std::size_t>::max() /
-              static_cast<std::size_t>(element_bytes)) {
-    throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
+  NpuTensorView View(const py::object& tensor, const char* name) const {
+    if (!Call(tensor, contiguous_).cast<bool>())
+      throw py::value_error(std::string(name) + " must be contiguous");
+    if (tensor.attr("device").attr("type").cast<std::string>() != "npu")
+      throw py::value_error(std::string(name) + " must reside on an NPU");
+    const auto pointer = Call(tensor, data_ptr_).cast<std::uint64_t>();
+    const auto elements = Call(tensor, numel_).cast<std::uint64_t>();
+    const auto element_bytes = Call(tensor, element_size_).cast<std::uint64_t>();
+    if (!pointer || !elements || !element_bytes ||
+        elements > std::numeric_limits<std::size_t>::max() ||
+        element_bytes > std::numeric_limits<std::size_t>::max() ||
+        elements > std::numeric_limits<std::size_t>::max() / element_bytes)
+      throw py::value_error(std::string(name) + " must be a non-empty NPU Tensor");
+    const auto shape = tensor.attr("shape").cast<py::tuple>();
+    return {PointerFromValue(pointer), static_cast<std::size_t>(elements * element_bytes),
+            static_cast<std::size_t>(element_bytes),
+            shape.size(), shape.size() ? shape[0].cast<py::ssize_t>() : 0};
   }
-  const auto shape = tensor.attr("shape").cast<py::tuple>();
-  return NpuTensorView{
-      PointerFromValue(pointer),
-      static_cast<std::size_t>(elements) * static_cast<std::size_t>(element_bytes),
-      static_cast<std::size_t>(element_bytes),
-      shape.size(), shape.size() ? shape[0].cast<py::ssize_t>() : 0};
-}
+ private:
+  py::str contiguous_{"is_contiguous"}, data_ptr_{"data_ptr"}, numel_{"numel"}, element_size_{"element_size"};
+  py::object current_stream_;
+};
+
+using GetTensorViews = std::array<NpuTensorView, 7>;
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
   if (result == nullptr) {
@@ -253,14 +268,6 @@ class DeviceAccessTable final {
   py::object valid_;
 };
 
-aclrtStream ResolveStream(const py::object& stream) {
-  if (!stream.is_none()) {
-    return acl_python::StreamFromPython(stream);
-  }
-  py::module_ torch = py::module_::import("torch");
-  return acl_python::StreamFromPython(torch.attr("npu").attr("current_stream")());
-}
-
 py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
   py::dict result, host;
 #define HOST_TIME(name) host[#name "_us"] = profile.name##_ns / 1000.0
@@ -286,6 +293,9 @@ py::dict BatchGetProfileDict(const BatchGetProfile& profile) {
     worker["entry_us"] = (sample.enter_ns - first) / 1000.0;
     worker["exit_us"] = (sample.exit_ns - first) / 1000.0;
     worker["wall_us"] = (sample.exit_ns - sample.enter_ns) / 1000.0;
+    worker["entry_to_body_us"] = (sample.enter_ns - sample.entry_ns) / 1000.0;
+    worker["body_to_return_us"] = (sample.return_ns - sample.exit_ns) / 1000.0;
+    worker["entry_wall_us"] = (sample.return_ns - sample.entry_ns) / 1000.0;
 #define WORKER_TIME(name) worker[#name "_us"] = sample.name##_ns / 1000.0
     WORKER_TIME(request);
     WORKER_TIME(input_cache);
@@ -351,6 +361,16 @@ class NpuPythonRuntime final {
     ThrowIfError(native_->Initialize(ddr_bytes, slot_size));
   }
 
+  aclrtStream ResolveStream(const py::object& stream, BatchGetHostTiming* timing = nullptr) {
+    py::object selected;
+    {
+      BatchGetProfileScope scope(timing ? &timing->stream_select_ns : nullptr);
+      selected = metadata_.SelectStream(stream);
+    }
+    BatchGetProfileScope scope(timing ? &timing->stream_handle_ns : nullptr);
+    return acl_python::StreamFromPython(selected);
+  }
+
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
@@ -395,7 +415,7 @@ class NpuPythonRuntime final {
       throw py::value_error(
           "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
     }
-    const NpuTensorView source_view = GetNpuTensorView(source, "BatchPut source");
+    const NpuTensorView source_view = metadata_.View(source, "BatchPut source");
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
@@ -463,8 +483,8 @@ class NpuPythonRuntime final {
     py::object valid = torch.attr("empty")(
         py::make_tuple(capacity), py::arg("dtype") = torch.attr("uint8"),
         py::arg("device") = npu_device);
-    const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
-    const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+    const NpuTensorView address_view = metadata_.View(addresses, "addresses");
+    const NpuTensorView valid_view = metadata_.View(valid, "valid");
     if (address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         address_view.bytes < capacity * sizeof(Address) ||
@@ -531,6 +551,7 @@ class NpuPythonRuntime final {
     py::dict result;
 #define HOST_VALUE(name) result[#name] = p.name
     HOST_VALUE(tensor_views_ns); HOST_VALUE(request_validation_ns); HOST_VALUE(stream_ns); HOST_VALUE(refs_ns);
+    HOST_VALUE(stream_select_ns); HOST_VALUE(stream_handle_ns);
     HOST_VALUE(binding_lock_ns); HOST_VALUE(set_device_ns); HOST_VALUE(core_call_ns); HOST_VALUE(owner_update_ns);
     HOST_VALUE(total_ns); HOST_VALUE(gil_reacquire_ns);
     HOST_VALUE(core_lifecycle_ns); HOST_VALUE(core_table_ns); HOST_VALUE(core_direction_ns);
@@ -581,6 +602,8 @@ class NpuPythonRuntime final {
       if (profile.device_start_ns) {
         item["device_start_ns"] = profile.device_start_ns;
         item["device_finish_ns"] = profile.device_finish_ns;
+        item["device_entry_ns"] = profile.aicpu_profile.entry_ns;
+        item["device_return_ns"] = profile.aicpu_profile.return_ns;
         BatchGetProfile detailed{};
         detailed.worker_count = 1;
         detailed.workers[0] = profile.aicpu_profile;
@@ -656,6 +679,35 @@ class NpuPythonRuntime final {
                         graph_lease, output_lease);
   }
 
+  py::object PrepareBatchGet(const DeviceAccessTable& table, const py::object& indices,
+                            const py::object& offsets, const py::object& miss_count,
+                            const py::object& output_indices, const py::object& output,
+                            const py::object& stream, bool synchronize,
+                            std::optional<GetExecutionConfig> execution, std::uint64_t output_lease) {
+    if (!Initialized()) throw py::value_error("Runtime has not been initialized");
+    const auto selected = metadata_.SelectStream(stream);
+    const auto addresses = table.addresses(), valid = table.valid();
+    const auto source = table.source();
+    const auto views = ReadGetViews(indices, offsets, miss_count, output_indices, output, addresses, valid);
+    const auto generation = get_generation_;
+    return py::cpp_function([this, owner = py::cast(this, py::return_value_policy::reference),
+                            source, addresses, valid, indices, offsets, miss_count, output_indices,
+                            output, selected, views, generation, synchronize, execution, output_lease]() {
+      (void)owner;
+      return BatchGetImpl(source, addresses, valid, indices, offsets, miss_count, output_indices,
+                          output, selected, synchronize, false, execution, 0, output_lease,
+                          &views, generation);
+    });
+  }
+
+  GetTensorViews ReadGetViews(const py::object& indices, const py::object& offsets,
+                             const py::object& miss_count, const py::object& output_indices,
+                             const py::object& output, const py::object& addresses, const py::object& valid) {
+    return {metadata_.View(indices, "indices"), metadata_.View(offsets, "offsets"),
+            metadata_.View(miss_count, "miss_count"), metadata_.View(output_indices, "output_indices"),
+            metadata_.View(output, "output"), metadata_.View(addresses, "addresses"), metadata_.View(valid, "valid")};
+  }
+
  private:
   py::object BatchGetImpl(const AccessTableHandle& access_table, const py::object& addresses,
                           const py::object& valid, const py::object& indices,
@@ -663,7 +715,8 @@ class NpuPythonRuntime final {
                           const py::object& output_indices, const py::object& output,
                           const py::object& stream, bool synchronize, bool profile,
                           std::optional<GetExecutionConfig> execution, std::uint64_t graph_lease,
-                          std::uint64_t output_lease) {
+                          std::uint64_t output_lease, const GetTensorViews* prepared = nullptr,
+                          std::uint64_t generation = 0) {
     BatchGetHostTiming host{};
     const bool host_enabled = get_call_trace_ || host_profiling_;
     const auto host_begin = host_enabled ? BatchGetProfileNowNs() : 0;
@@ -681,15 +734,15 @@ class NpuPythonRuntime final {
         throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
     }
     const auto begin = profile ? BatchGetProfileNowNs() : 0U;
-    const NpuTensorView index_view = GetNpuTensorView(indices, "indices");
-    const NpuTensorView offset_view = GetNpuTensorView(offsets, "offsets");
-    const NpuTensorView miss_count_view =
-        GetNpuTensorView(miss_count, "miss_count");
-    const NpuTensorView output_index_view =
-        GetNpuTensorView(output_indices, "output_indices");
-    const NpuTensorView output_view = GetNpuTensorView(output, "output");
-    const NpuTensorView address_view = GetNpuTensorView(addresses, "addresses");
-    const NpuTensorView valid_view = GetNpuTensorView(valid, "valid");
+    const auto views = prepared ? *prepared : ReadGetViews(
+        indices, offsets, miss_count, output_indices, output, addresses, valid);
+    const auto& index_view = views[0];
+    const auto& offset_view = views[1];
+    const auto& miss_count_view = views[2];
+    const auto& output_index_view = views[3];
+    const auto& output_view = views[4];
+    const auto& address_view = views[5];
+    const auto& valid_view = views[6];
     mark(&BatchGetHostTiming::tensor_views_ns);
     if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
         output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
@@ -725,7 +778,7 @@ class NpuPythonRuntime final {
             ConstBufferView{address_view.data, address_view.bytes, DeviceKind::kNpu},
             ConstBufferView{valid_view.data, valid_view.bytes, DeviceKind::kNpu}}};
     mark(&BatchGetHostTiming::request_validation_ns);
-    const aclrtStream acl_stream = ResolveStream(stream);
+    const aclrtStream acl_stream = ResolveStream(stream, host_enabled ? &host : nullptr);
     mark(&BatchGetHostTiming::stream_ns);
     auto timings = profile ? std::make_unique<BatchGetProfile>() : nullptr;
     const auto native_begin = profile ? BatchGetProfileNowNs() : 0U;
@@ -739,6 +792,8 @@ class NpuPythonRuntime final {
       direction.lock();
     }
     mark(&BatchGetHostTiming::binding_lock_ns);
+    if (prepared && (generation != get_generation_ || !Initialized()))
+      throw py::value_error("prepared BatchGet was invalidated by Runtime shutdown");
     last_host_valid_ = false;
     ApplyGraphScope(output, output_view, index_view.bytes / sizeof(std::int32_t),
                     acl_stream, synchronize, profile, execution, graph_lease, output_lease);
@@ -796,7 +851,7 @@ class NpuPythonRuntime final {
  public:
   std::uint64_t BeginPutInput(PutExecutionConfig config, const py::object& input,
                               std::uint32_t capacity, const py::object& stream) {
-    const auto view = GetNpuTensorView(input, "Put input");
+    const auto view = metadata_.View(input, "Put input");
     const auto native_stream = ResolveStream(stream);
     std::unique_lock<std::mutex> lock(put_mutex_, std::defer_lock);
     { py::gil_scoped_release release; lock.lock(); }
@@ -840,7 +895,7 @@ class NpuPythonRuntime final {
   }
   std::uint64_t BeginGetOutput(GetExecutionConfig config, const py::object& output,
                               std::uint32_t capacity, const py::object& stream) {
-    const auto view = GetNpuTensorView(output, "output");
+    const auto view = metadata_.View(output, "output");
     const auto native_stream = ResolveStream(stream);
     std::unique_lock<std::mutex> lock(get_mutex_, std::defer_lock);
     { py::gil_scoped_release release; lock.lock(); }
@@ -926,7 +981,7 @@ class NpuPythonRuntime final {
   }
   std::uint64_t BeginGetGraph(GetExecutionConfig config, const py::object& output,
                               std::uint32_t capacity, const py::object& stream) {
-    const auto view = GetNpuTensorView(output, "output");
+    const auto view = metadata_.View(output, "output");
     const auto native_stream = ResolveStream(stream);
     auto refs = py::make_tuple(output, stream);
     std::uint64_t id = 0;
@@ -1030,6 +1085,7 @@ class NpuPythonRuntime final {
       else status = native_->Shutdown();
     }
     if (status.ok()) {
+      ++get_generation_;
       pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{};
       put_input_refs_.clear(); pending_put_input_refs_.clear();
     }
@@ -1074,6 +1130,8 @@ class NpuPythonRuntime final {
                        std::uint64_t);
   void FinishGraphScopeGet(bool success);
   PythonGetGraphResources* active_graph_scope_{nullptr};
+  TensorMetadataMethods metadata_;
+  std::uint64_t get_generation_{};
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   std::unique_ptr<GetCallTrace> get_call_trace_;
   bool host_profiling_{false}, last_host_valid_{false};
@@ -1107,7 +1165,7 @@ class PythonGetGraphResources : public std::enable_shared_from_this<PythonGetGra
       throw py::value_error(capture ? "capture requires one successfully prepared forward"
                                    : "graph resources may prepare only once; create a new owner");
     if (stream.is_none()) stream = py::module_::import("torch").attr("npu").attr("current_stream")();
-    const auto native_stream = ResolveStream(stream);
+    const auto native_stream = runtime_->ResolveStream(stream);
     RequireOutsideCapture(native_stream);
     if (capture && native_stream != native_stream_)
       throw py::value_error("one graph must prepare and capture on the same stream");
@@ -1283,9 +1341,9 @@ class PythonGetGraphResources : public std::enable_shared_from_this<PythonGetGra
   static std::uint64_t StorageBytes(const py::object& storage) {
     return storage.attr("nbytes")().cast<std::uint64_t>();
   }
-  static void ValidateStorage(const py::object& output, const Node& node) {
+  void ValidateStorage(const py::object& output, const Node& node) const {
     auto storage = Storage(output);
-    const auto view = GetNpuTensorView(output, "graph output");
+    const auto view = runtime_->metadata_.View(output, "graph output");
     if (StorageIdentity(storage) != node.storage_id ||
         StoragePointer(storage) != node.storage_pointer || StorageBytes(storage) != node.storage_bytes ||
         view.data != node.data || view.bytes != node.bytes)
@@ -1439,6 +1497,13 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Copy the latest completed per-core timeline; select a node with graph_lease.")
       .def("stop_batch_get_kernel_profile", &NpuPythonRuntime::StopBatchGetKernelProfile,
            py::kw_only(), py::arg("execution") = py::none(), "Copy the latest timeline and disable BatchGet kernel profiling.")
+      .def("prepare_batch_get", &NpuPythonRuntime::PrepareBatchGet, py::arg("device_access_table"),
+           py::arg("indices"), py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
+           py::arg("output"), py::arg("stream") = py::none(), py::kw_only(),
+           py::arg("synchronize") = false, py::arg("execution") = py::none(), py::arg("output_lease") = 0,
+           "Return a zero-argument Get callable for fixed Tensor storage, layout and stream. "
+           "Contents may change in place; do not resize, rebind storage or release the table/output lease. "
+           "Uses the ordinary execution and lifetime path; shutdown invalidates the callable.")
       .def("batch_get", &NpuPythonRuntime::BatchGet, py::arg("device_access_table"),
            py::arg("indices"), py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(), py::arg("synchronize") = false,

@@ -24,7 +24,8 @@ inline Status CopyAicpuProfiles(void* device, void* host, std::uint32_t workers,
   profiles->clear();
   const auto* source = static_cast<const BatchGetWorkerProfile*>(host);
   for (unsigned w = 0; w < workers; ++w) {
-    if (!source[w].enter_ns || source[w].exit_ns < source[w].enter_ns)
+    if (!source[w].entry_ns || source[w].entry_ns > source[w].enter_ns ||
+        source[w].exit_ns < source[w].enter_ns || source[w].return_ns < source[w].exit_ns)
       return Status::InvalidState("no completed AICPU kernel profile");
     BatchGetKernelProfile p{};
     p.device_start_ns = source[w].enter_ns;

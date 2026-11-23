@@ -1,6 +1,7 @@
 import ast
 from collections import defaultdict
 import csv
+import statistics
 from itertools import count
 from pathlib import Path
 import sys
@@ -12,6 +13,16 @@ from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 from utils.batch_get_csv import BatchGetCsv
 from utils.batch_get_host_profile import eager_host_sample, graph_host_sample, summarize_host_samples
+
+
+def device_helpers():
+    source = Path(__file__).resolve().parents[1] / "python/test_npu_batch_get_perf.py"
+    tree = ast.parse(source.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in
+                 ("profile_nodes", "device_profile_ms", "device_boundary_us", "add_device_boundaries")]
+    environment = dict(statistics=statistics)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), environment)
+    return environment
 
 
 def host_timing(asynchronous=True):
@@ -54,7 +65,7 @@ class GetHostProfileTest(unittest.TestCase):
         self.assertEqual(sample["gap", "e2e_minus_kernel"], 50)
 
     def test_percentiles_use_paired_differences(self):
-        samples = [graph_host_sample({}, e2e, kernel)
+        samples = [graph_host_sample(dict(replay_and_wait=500_000), e2e, kernel)
                    for e2e, kernel in ((400, 150), (200, 175), (300, 125))]
         metrics = {(kind, name, metric): float(value)
                    for kind, name, metric, value in summarize_host_samples(samples)}
@@ -62,11 +73,26 @@ class GetHostProfileTest(unittest.TestCase):
         self.assertEqual(metrics["gap", "e2e", "p50_us"] - metrics["gap", "kernel", "p50_us"], 150)
 
     def test_graph_host_has_its_own_scope(self):
-        sample = graph_host_sample(dict(replay_submit=10_000, event_sync=200_000), 160, 120)
+        sample = graph_host_sample(dict(replay_submit=10_000, event_sync=200_000, replay_and_wait=220_000), 160, 120)
         self.assertEqual(sample["host_graph", "replay_submit"], 10)
         self.assertEqual(sample["host_graph", "event_sync"], 200)
         self.assertEqual(sample["gap", "graph_event_outside_kernel"], 40)
         self.assertNotIn(("gap", "before_launch"), sample)
+
+    def test_multi_get_excludes_inter_task_gaps_from_body(self):
+        helpers = device_helpers()
+        nodes = [[dict(device_entry_ns=base, device_start_ns=base + 10_000,
+                       device_finish_ns=base + 110_000, device_return_ns=base + 120_000)]
+                 for base in (1_000_000, 1_500_000)]
+        kernel = helpers["device_profile_ms"](nodes, 1000) * 1000
+        self.assertEqual(kernel, 100)
+        sample = graph_host_sample(dict(replay_and_wait=600_000), 250, kernel, gets=2)
+        helpers["add_device_boundaries"](sample, nodes, 250, kernel)
+        self.assertEqual(sample["device_boundary", "entry_span"], 120)
+        self.assertEqual(sample["gap", "entry_outside_body"], 20)
+        self.assertEqual(sample["gap", "e2e_outside_entry"], 130)
+        self.assertEqual(sample["host_graph_per_get", "replay_and_wait"], 300)
+        self.assertEqual(sample["gap", "graph_host_outside_event"], 50)
 
     def test_eager_loop_reads_host_snapshot_after_timing(self):
         source = Path(__file__).resolve().parents[1] / "python/test_npu_batch_get_perf.py"
@@ -95,15 +121,18 @@ class GetHostProfileTest(unittest.TestCase):
                 runtime.batch_get_host_profile.side_effect = snapshot
                 environment = dict(
                     args=SimpleNamespace(iterations=3, warmup=0, get_timing=timing,
-                        kernel_profile=True, kernel_profile_clock_mhz=1000, execution_mode="unified"),
+                        kernel_profile=True, kernel_profile_clock_mhz=1000, execution_mode="unified", miss_count=4096),
                     runtime=runtime, execution=SimpleNamespace(get_kwargs={}, complete_async_get=Mock()),
                     torch=SimpleNamespace(npu=SimpleNamespace(synchronize=Mock(), current_stream=Mock())),
                     time=SimpleNamespace(perf_counter=timer), create_request_plan=lambda: (0, 0, 0),
+                    eager_inputs=SimpleNamespace(prepare=Mock()),
+                    submit_get=runtime.batch_get, indices=0, offsets=0, output_indices=0,
                     output=SimpleNamespace(zero_=Mock()), device_table=object(), miss_count=object(),
                     request_length=32768, miss_count_value=4096, token_bytes=656,
                     uses_aicpu=lambda _: True, check_output=Mock(), print_samples=Mock(), print_measurements=Mock(),
                     report=None, eager_host_sample=eager_host_sample,
                     device_profile_ms=lambda p, _: (p[0]["device_finish_ns"] - p[0]["device_start_ns"]) / 1e6,
+                    add_device_boundaries=lambda sample, *args: sample,
                 )
                 exec(loop, environment)
                 self.assertEqual(runtime.batch_get_host_profile.call_count, 3)
@@ -114,7 +143,8 @@ class GetHostProfileTest(unittest.TestCase):
             args = SimpleNamespace(output_dir=Path(directory), kernel_profile=True,
                 backend="gather_read", transport="urma", request_length=32768,
                 table_capacity=4096, miss_count=4096, token_bytes=656, tokens_per_block=128,
-                aiv_cores=None, aicpu_workers=4, jettys_per_core=2, max_inflight_total=2048)
+                aiv_cores=None, aicpu_workers=4, jettys_per_core=2, max_inflight_total=2048,
+                get_binding="ordinary", graph_api="torch", graph_get_count=1)
             report = BatchGetCsv(args)
             source = Path(__file__).resolve().parents[1] / "python/test_npu_batch_get_perf.py"
             tree = ast.parse(source.read_text())

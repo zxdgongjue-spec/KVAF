@@ -49,7 +49,7 @@ class ScopesTest(unittest.TestCase):
                         return 0.25
 
                 args = SimpleNamespace(iterations=3, warmup=0, get_timing=timing,
-                                       execution_mode='unified')
+                                       execution_mode='unified', miss_count=1)
                 runtime = SimpleNamespace(batch_get=Mock(), batch_get_kernel_profile=Mock())
                 runtime.batch_get_kernel_profile.side_effect = lambda: [dict(sample=runtime.batch_get.call_count)]
                 execution = SimpleNamespace(get_kwargs={}, complete_async_get=Mock())
@@ -59,6 +59,8 @@ class ScopesTest(unittest.TestCase):
                     torch=SimpleNamespace(npu=SimpleNamespace(Event=Event, synchronize=Mock())),
                     time=SimpleNamespace(perf_counter=lambda: next(clock)),
                     create_request_plan=lambda: (0, 0, 0), output=SimpleNamespace(zero_=Mock()),
+                    eager_inputs=SimpleNamespace(prepare=Mock()), indices=0, offsets=0, output_indices=0,
+                    submit_get=lambda: runtime.batch_get(synchronize=timing == 'sync-call'),
                     device_table=object(), miss_count=object(), request_length=1,
                     miss_count_value=1, token_bytes=656, uses_aicpu=lambda _: False,
                     check_output=check, scope_save=save, print_samples=Mock(),

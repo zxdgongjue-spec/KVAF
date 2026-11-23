@@ -20,6 +20,7 @@ API_NAMES = (
     "aclrtLaunchKernelWithHostArgs", "aclrtLaunchCpuKernel", "aclrtLaunchKernel",
     "aclmdlRIExecuteAsync", "aclmdlExecuteAsync", "rtCpuKernelLaunch", "rtKernelLaunch",
     "rtModelExecute", "aclrtSynchronizeStreamWithTimeout", "aclrtSynchronizeStream",
+    "aclrtSynchronizeEvent", "rtEventSynchronize", "aclrtRecordEvent", "rtEventRecord",
     "rtStreamSynchronizeWithTimeout", "rtStreamSynchronize", "aclrtMemcpyAsync",
     "aclrtMemcpy", "rtMemcpyAsync", "rtMemcpy",
 )
@@ -27,11 +28,17 @@ GET_PATTERN = r"KvafAicpu(?:GatherRead|CpuPushScatter)Execution"
 CORE_PROFILE = {
     "gap": {"e2e", "kernel", "e2e_minus_kernel", "python_boundary", "before_launch",
             "runtime_window", "runtime_outside_kernel", "after_completion", "intercall",
-            "graph_event_outside_kernel"},
+            "graph_event_outside_kernel", "graph_host_outside_event", "entry_outside_body", "e2e_outside_entry"},
+    "device_boundary": {"entry_span", "entry_to_body", "body_to_return"},
     "host_binding": {"tensor_views", "stream", "set_device", "total", "gil_reacquire"},
+    "host_stream": {"select", "handle"},
+    "host_core": {"lifecycle", "table", "direction", "previous_drain", "validate", "dispatch", "finish", "other"},
+    "host_dispatch": {"lock", "resolve", "output_check", "previous_drain", "context", "describe",
+                      "acquire", "bind", "warmup", "provider", "context_release", "other"},
     "host_provider": {"prepare", "launch_api", "status_enqueue", "stream_sync", "status_check", "cleanup"},
     "host_binding_drain": {"set_device", "total", "gil_reacquire"},
-    "host_graph": {"replay_submit", "event_sync", "replay_and_wait"},
+    "host_graph": {"start_event_record", "replay_submit", "end_event_record", "event_sync", "replay_and_wait"},
+    "host_graph_per_get": {"start_event_record", "replay_submit", "end_event_record", "event_sync", "replay_and_wait"},
     "stage": {"read", "ready_wait", "cq_wait", "scatter"},
 }
 
@@ -82,9 +89,19 @@ def api_name(name):
 
 def api_kind(api):
     key = norm(api)
+    if "recordevent" in key or "eventrecord" in key:
+        return "event_api"
     if "launch" in key or "execute" in key:
         return "launch"
     return "sync" if "synchronize" in key else "copy_api"
+
+
+def interval_union(events):
+    end, total = -math.inf, 0.0
+    for event in sorted(events, key=lambda e: e.start):
+        total += max(0.0, event.end - max(end, event.start))
+        end = max(end, event.end)
+    return total
 
 
 def task_label(name, kind="aicpu"):
@@ -136,6 +153,8 @@ def event_from_raw(raw, process_names, pattern):
         kind, label = api_kind(api), api
     elif "aicpu" in task_type or ("aicpu" in norm(name) and "cann" not in role):
         kind, label = "aicpu", task_label(kernel)
+    elif any(key in task_type for key in ("eventrecord", "recordevent")):
+        kind, label = "device_event", "device_event"
     elif ("memcpy" in norm(name) or "memcpy" in task_type) and (device_track or task_type):
         kind, label = "device_copy", "device_copy"
     else:
@@ -235,7 +254,7 @@ class Trace:
             index = indexes[position]
             event = self.events[index]
             if event.start <= timestamp + .001 and event.end >= timestamp - .001:
-                preferred = event.kind in (("aicpu", "device_copy") if device else ("launch", "copy_api"))
+                preferred = event.kind in (("aicpu", "device_copy", "device_event") if device else ("launch", "copy_api", "event_api"))
                 candidates.append((not preferred, event.duration, index))
             position -= 1
         return min(candidates)[2] if candidates else None
@@ -260,10 +279,19 @@ class Trace:
                     edges[index].add(previous)
                     previous = index if phase == "t" else None
         result, api_ids = {}, defaultdict(list)
+        def capture_only(host_index, event):
+            host = self.events[host_index]
+            # A capture-time kernel ID does not identify a later model replay.
+            stale = event.kind == "aicpu" and "launch" in norm(host.label) and any(
+                e.track == host.track and e.kind == "launch" and "execute" in norm(e.label)
+                and host.end <= e.start <= event.start for e in self.events)
+            if stale:
+                self.warnings["CAPTURE_LAUNCH_NOT_REPLAY_LINK"] += 1
+            return stale
         device_ids = {e.ids["device"] for e in self.events
                       if e.kind in ("aicpu", "device_copy") and e.ids["device"] is not None}
         for index, event in enumerate(self.events):
-            if event.kind not in ("launch", "copy_api"):
+            if event.kind not in ("launch", "copy_api", "event_api"):
                 continue
             for key in ("connection", "correlation"):
                 if event.ids[key] is not None:
@@ -271,9 +299,9 @@ class Trace:
             if event.ids["stream"] is not None and event.ids["task"] is not None:
                 api_ids["stream_task", event.ids["stream"], event.ids["task"]].append(index)
         for index, event in enumerate(self.events):
-            if event.kind not in ("aicpu", "device_copy"):
+            if event.kind not in ("aicpu", "device_copy", "device_event"):
                 continue
-            kind = "launch" if event.kind == "aicpu" else "copy_api"
+            kind = {"aicpu": "launch", "device_copy": "copy_api", "device_event": "event_api"}[event.kind]
             pending, visited, hosts = list(edges[index]), set(), set()
             while pending:
                 source = pending.pop()
@@ -285,8 +313,10 @@ class Trace:
                     hosts.add(outer)
                 pending.extend(edges[source])
             if len(hosts) == 1:
-                result[index] = (hosts.pop(), "flow")
-                continue
+                host_index = hosts.pop()
+                if not capture_only(host_index, event):
+                    result[index] = (host_index, "flow")
+                    continue
             if len(hosts) > 1:
                 self.warnings["AMBIGUOUS_FLOW_LINK"] += 1
                 continue
@@ -311,6 +341,8 @@ class Trace:
                         event.ids[key] == host.ids[key] for key in ("task", "stream")):
                     matching.append("stream_task")
                 if matching:
+                    if capture_only(host_index, event):
+                        continue
                     candidates.append((host.start, host_index, matching[0]))
             if candidates:
                 latest = max(row[0] for row in candidates)
@@ -337,6 +369,11 @@ class Trace:
         launches = sorted(groups, key=lambda i: self.events[i].start)
         selected = launches[-last:] if last else launches
         tasks = [self.events[i] for launch in selected for i in groups[launch]]
+        # CSV Task IDs can be reused by graph replays. Filter only unambiguous IDs.
+        occurrences = Counter(e.ids["task"] for e in self.events if e.kind == "aicpu" and e.ids["task"] is not None)
+        self.selected_csv_tasks = {e.ids["task"]: e.ids for e in tasks if occurrences[e.ids["task"]] == 1}
+        if len(self.selected_csv_tasks) < len(tasks):
+            self.warnings["SELECTED_CSV_IDS_MISSING_OR_REUSED"] += len(tasks) - len(self.selected_csv_tasks)
         if not groups:
             tasks = [self.events[i] for i in targets]
             if last:
@@ -364,12 +401,32 @@ class Trace:
             metrics = dict(launch_api=launch.duration, launch_return_to_sync_begin=sync.start - launch.end,
                            sync_call=sync.duration, launch_to_sync_return=sync.end - launch.start,
                            task_envelope=task_end - task_start,
+                           task_union=interval_union(device_tasks),
+                           inter_task_gaps=task_end - task_start - interval_union(device_tasks),
+                           aligned_task_end_to_sync_return=sync.end - task_end,
                            aligned_launch_to_task_begin=task_start - launch.start)
             chain = dict(launch_ordinal=launches.index(launch_index) + 1, workers_or_task_events=len(device_tasks),
+                         launch_api=launch.label, sync_api=sync.label,
                          link_methods=sorted({links[i][1] for i in groups[launch_index]}),
                          host_launch_us=relative(launch), device_task_us=[round(task_start - launch.start, 3),
                          round(task_end - launch.start, 3)], host_sync_us=relative(sync),
                          host_copy_enqueue_us=[relative(self.events[i]) for i in copy_indexes[:4]])
+            if "execute" in norm(launch.label):
+                previous_launch = max((e.end for e in self.events if e.track == launch.track and
+                                       e.kind == "launch" and e.end <= launch.start), default=-math.inf)
+                records = [i for i, e in enumerate(self.events) if e.track == launch.track and e.kind == "event_api"]
+                before = [i for i in records if previous_launch <= self.events[i].start and self.events[i].end <= launch.start]
+                after = [i for i in records if launch.end <= self.events[i].start < sync.start]
+                if before and after:
+                    record_hosts = [max(before, key=lambda i: self.events[i].start), min(after, key=lambda i: self.events[i].start)]
+                    records = [[self.events[i] for i, (host, _) in links.items()
+                                if host == record and self.events[i].kind == "device_event"] for record in record_hosts]
+                    if all(len(events) == 1 for events in records):
+                        first, final = records[0][0], records[1][0]
+                        chain["device_event_bracket_us"] = [relative(first), relative(final)]
+                        metrics.update(device_event_start_to_task=task_start - first.end,
+                                       device_task_to_end_event=final.start - task_end)
+                        chain["event_bracket_order_ok"] = first.end <= task_start + 1 and task_end <= final.start + 1
             if copies:
                 copy_begin, copy_end = min(e.start for e in copies), max(e.end for e in copies)
                 metrics.update(device_copy_envelope=copy_end - copy_begin,
@@ -385,10 +442,10 @@ class Trace:
         positions = sorted({round(i * (len(ordered) - 1) / max(1, samples - 1)) for i in range(samples)}) if ordered else []
         apis = defaultdict(list)
         for event in self.events:
-            if event.kind in ("launch", "sync", "copy_api"):
+            if event.kind in ("launch", "sync", "copy_api", "event_api"):
                 apis[event.label].append(event.duration)
         coverage = {}
-        for kind in ("launch", "copy_api", "aicpu", "device_copy"):
+        for kind in ("launch", "copy_api", "event_api", "aicpu", "device_copy", "device_event"):
             events = [e for e in self.events if e.kind == kind]
             coverage[kind] = dict(events=len(events), **{
                 key: sum(e.ids[key] is not None for e in events)
@@ -425,8 +482,10 @@ def benchmark_report(root):
             if "summary" in result[key]:
                 raise ValueError("INPUT_BENCHMARK_MULTIPLE_RUNS")
             result[key]["summary"] = {k: round(number(v), 3) for k, v in row.items() if number(v) is not None
-                and (k in ("miss_count", "token_bytes", "aicpu_workers") or
+                and (k in ("miss_count", "token_bytes", "aicpu_workers", "gets_per_replay") or
                      k in ("e2e_mean_us", "kernel_mean_us", "e2e_p99_us", "kernel_p99_us", "e2e_mean_GBps"))}
+            result[key]["configuration"] = {k: row[k] for k in ("get_binding", "graph_api", "latency_scope")
+                if row.get(k) in ("ordinary", "prepared", "capture", "torch", "acl", "single_get", "amortized_per_get")}
     for path in sorted(root.rglob("profile.csv")):
         for row in read_csv(path):
             if row.get("backend") not in ("gather_read", "cpu_push_scatter") or row.get("execution") not in ("eager", "graph"):
@@ -453,8 +512,10 @@ def column_time(row, stems):
     return None
 
 
-def csv_report(root):
+def csv_report(root, selected_tasks=None):
     durations, api_totals, files, warnings = defaultdict(list), defaultdict(lambda: [0, 0]), Counter(), Counter()
+    selected, matched, selected_rows = defaultdict(list), set(), 0
+    selected_tasks = selected_tasks or {}
     prefixes = ("task_time_", "op_summary_", "api_statistic_", "acl_statistic_", "aicpu_")
     for path in sorted(root.rglob("*.csv")):
         source = next((p[:-1] for p in prefixes if path.name.startswith(p)), None)
@@ -476,10 +537,20 @@ def csv_report(root):
                         api_totals[api][1] += total if total is not None else mean * count
                     continue
                 if source == "aicpu":
+                    task = identifier(pick(row, "taskid"))
+                    identity = selected_tasks.get(task)
+                    match = identity is not None and all(
+                        not identity[key] or identifier(pick(row, key + "id")) in (None, identity[key])
+                        for key in ("stream", "device"))
+                    if match:
+                        matched.add(task)
+                        selected_rows += 1
                     for field in ("dispatchtime", "totaltime", "tasktime", "computetime", "memcpytime"):
                         value = column_time(row, (field,))
                         if value is not None:
                             durations[source + "." + field].append(value)
+                            if match:
+                                selected[field].append(value)
                     continue
                 if "aicpu" not in task_type and "aicpu" not in norm(name) and "memcpy" not in task_type and "memcpy" not in norm(name):
                     continue
@@ -490,6 +561,8 @@ def csv_report(root):
         except (OSError, ValueError, TypeError) as error:
             warnings["CSV_READ_" + type(error).__name__] += 1
     return dict(files=dict(files), all_rows_duration_us={key: stats(value) for key, value in sorted(durations.items())},
+                selected_aicpu_rows=dict(requested_unique_tasks=len(selected_tasks), matched_tasks=len(matched),
+                    rows=selected_rows, row_duration_us={key: stats(value) for key, value in sorted(selected.items())}),
                 aggregate_api_us={key: dict(calls=int(value[0]), total=round(value[1], 3), mean=round(value[1] / value[0], 3))
                                   for key, value in sorted(api_totals.items())}, warnings=dict(warnings))
 
@@ -551,11 +624,13 @@ def main(argv=None):
                              "Representative intervals are relative to each Host launch start; IDs are not exported.",
                              "aligned_* gaps use msprof alignment; order-violating chains are excluded from aligned statistics but retained in samples.",
                              "Only explicit flows or matching IDs link Host/device tasks; no nearest-task guessing.",
+                             "Graph chains use model execute plus Event/stream sync. Event brackets require linked record tasks; absence is not zero overhead.",
+                             "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",
                              "Benchmark kernel body and CANN task duration are separate scopes, not paired per-call samples."],
                       benchmark=benchmark_report(args.benchmark_dir),
                       timeline=trace.report(args.last, args.samples, args.kernel_pattern is not None),
-                      csv_supplement=csv_report(root))
+                      csv_supplement=csv_report(root, trace.selected_csv_tasks))
         if not trace.files:
             report["notes"].append("No readable timeline JSON: CSVs alone cannot localize dispatch/completion gaps.")
         text = bounded_report(report, args.max_chars)

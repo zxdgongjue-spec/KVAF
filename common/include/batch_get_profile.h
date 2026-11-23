@@ -26,6 +26,7 @@ struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t bytes{}, spans{}, read_wqes{}, post_calls{}, ready_queries{};
   std::uint64_t scatter_ns{}, output_cache_ns{};
   std::uint64_t scatter_copies{};
+  std::uint64_t entry_ns{}, return_ns{};
 };
 
 // Caller-owned result, valid after a successful synchronous AICPU BatchGet.
@@ -40,6 +41,7 @@ struct BatchGetProfile {
 // only until each call returns; execution resources never retain the pointer.
 struct BatchGetHostTiming {
   std::uint64_t tensor_views_ns{}, request_validation_ns{}, stream_ns{}, refs_ns{};
+  std::uint64_t stream_select_ns{}, stream_handle_ns{};
   std::uint64_t binding_lock_ns{}, set_device_ns{}, core_call_ns{}, owner_update_ns{}, total_ns{};
   std::uint64_t gil_reacquire_ns{};
   std::uint64_t core_lifecycle_ns{}, core_table_ns{}, core_direction_ns{}, core_previous_drain_ns{};

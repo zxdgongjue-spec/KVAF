@@ -72,6 +72,94 @@ include setup/warmup/readback and must not be treated as measured-round latency.
 Relative Host/device gaps use msprof's clock alignment and report invalid time
 ordering; benchmark function-body time is not substituted for a paired CANN
 task duration. CSVs alone cannot resolve the full dispatch/completion timeline.
+`csv_supplement.selected_aicpu_rows` filters only unique selected Task IDs;
+reused or missing IDs are excluded with coverage counts. These CSV statistics
+are per exported row (possibly per worker), not a replacement for the full task
+envelope or an additive partition of it.
+
+### AICPU binding and graph gap comparisons
+
+Update the Host library, device SO and kernel JSON together (`./build.sh npu`
+installs the package), then restart the NPU process. The Get entries are V4;
+the CPU push wire protocol stays V3. These changes have not been compiled or
+run locally.
+
+Eager binding A/B uses the same fixed request storage, updating its contents
+outside measurement. The prepared callable reads Tensor metadata once and keeps
+the Tensor/stream owners; do not resize or replace any captured storage. Every
+submission still reads `npu_stream` once and uses the normal execution, lease
+and completion path. Compare both backends without msprof first:
+
+```bash
+for backend in gather_read cpu_push_scatter; do
+  for binding in ordinary prepared; do
+    bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+      --peer 127.0.0.1:28990 --device-id 7 --backend "$backend" \
+      --aicpu-workers 4 --execution eager --get-binding "$binding" \
+      --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+      --token-bytes 656 --tokens-per-block 128 --warmup 20 --iterations 100 \
+      --kernel-profile --output-dir "results/binding-$backend-$binding"
+  done
+done
+```
+
+Graph defaults remain one Get per replay with Torch capture. Diagnose this
+single-Get path before trying any amortization experiment:
+
+```bash
+msprof --output=results/cann-gap-gather-graph \
+  --ascendcl=on --runtime-api=on --task-time=on --aicpu=on \
+  --application="bash tests/run_remote_cpu_batch_get_perf.sh build-npu --peer 127.0.0.1:28990 --device-id 7 --backend gather_read --aicpu-workers 4 --execution graph --graph-api torch --request-length 32768 --table-capacity 4096 --miss-count 4096 --token-bytes 656 --tokens-per-block 128 --warmup 20 --iterations 50 --kernel-profile --output-dir results/gap-gather-graph"
+
+python3 tests/diagnostics/summarize_aicpu_gap.py \
+  --msprof-dir results/cann-gap-gather-graph \
+  --benchmark-dir results/gap-gather-graph --last 50 --samples 5 \
+  --max-chars 60000 --output results/gather-graph-gap-core.txt
+```
+
+Repeat with `--backend cpu_push_scatter` and separate result directories.
+Export msprof JSON/CSVs before extraction, as with the eager capture. If replay
+flows/IDs are absent, the report keeps tasks unlinked; capture-time launch IDs
+alone cannot establish replay ownership. Missing Event-record links also remain
+missing, rather than being treated as zero overhead.
+
+Read the following intervals together; inclusive subspans must not be added:
+
+| Source | Metric | Meaning |
+|---|---|---|
+| `profile.csv` | `host_stream.select`, `host_stream.handle` | Current-stream selection versus stream getter/queue boundary |
+| `profile.csv` | `device_boundary.entry_to_body`, `body_to_return` | Instrumented device entry/setup and exit/unlock/profile publication |
+| `profile.csv` | `device_boundary.entry_span` | Earliest instrumented entry to latest instrumented return |
+| `profile.csv` | `gap.entry_outside_body` | Entry span minus the original kernel body span |
+| `profile.csv` | `gap.e2e_outside_entry` | Remaining E2E gap outside that entry span |
+| `profile.csv` | `gap.graph_host_outside_event` | Host replay-and-wait minus Event elapsed; not part of Event E2E |
+| msprof report | `aligned_launch_to_task_begin` | Model execute start to first linked AICPU task |
+| msprof report | `aligned_task_end_to_sync_return` | Last task end to Event/stream sync return |
+| msprof report | `device_event_start_to_task`, `device_task_to_end_event` | Device gaps between linked Event record tasks and AICPU tasks, when exported |
+| msprof report | `task_envelope`, `task_union`, `inter_task_gaps` | Full target-task span, union of task intervals, and gaps between tasks |
+
+The body metric is unchanged: `kernel_mean_us` still excludes setup before its
+old entry timestamp and cleanup after its old exit timestamp. Compare CANN's
+full task envelope with the new entry span to locate the previously uncovered
+~26 us. This remaining difference includes framework code outside the exported
+entry and is an aggregate scope comparison, not a per-call paired timer.
+The return timestamp is immediately before its final store/C return, not after
+the CANN task finishes. Host and device absolute clocks must not be mixed.
+
+If the gap is mainly before/after the task, compare `--graph-api acl` with
+`--graph-api torch`, keeping the workload and single Get unchanged. Use
+unprofiled runs to assess gains; msprof itself changes Host timings. If task
+envelope minus entry span dominates, additional Python binding optimizations
+will not remove that device framework overhead.
+
+Optional `--graph-get-count 4` or `16` captures sequential Get nodes in one
+replay to test amortization of fixed replay/Event costs. The default is `1`.
+With multiple nodes, `summary.csv` explicitly reports `amortized_per_get`:
+Event duration is divided by node count; kernel duration is the mean of each
+node's body span, excluding inter-node gaps. All nodes' status/profiles are read
+outside timing. `host_graph` stays per replay and `host_graph_per_get` is divided
+by node count. This experiment does not reduce single-Get latency or establish
+that per-task AICPU framework costs are eliminated.
 
 ## Get recovery fault injection (Host only)
 
