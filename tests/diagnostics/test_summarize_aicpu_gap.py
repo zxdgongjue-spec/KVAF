@@ -114,6 +114,34 @@ def add_counter_samples(root, data, shift_ticks=0):
 
 
 class GapExtractorTest(unittest.TestCase):
+    def test_counter_sync_ignores_done_markers_for_all_metadata_and_device_discovery(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            data = add_counter_samples(root, data)
+            for path in list((root / "device_1").iterdir()):
+                path.with_name(path.name + ".done").write_text("NOT_CALIBRATION_DATA")
+            other = root / "device_2"
+            other.mkdir()
+            (other / "dev_start.log.2.done").write_text("")
+            result = entry_boundary_report(trace, timeline, data)
+            self.assertEqual(result["clock"]["status"], "msprof_counter_aligned")
+            self.assertEqual(result["stats_us"]["task_begin_to_first_entry"]["mean"], 10)
+            self.assertEqual(result["stats_us"]["last_return_to_task_end"]["mean"], 20)
+
+    def test_counter_sync_done_marker_does_not_replace_a_missing_log(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            data = add_counter_samples(root, data)
+            path = root / "device_1" / "host_start.log.1"
+            path.with_name(path.name + ".done").write_text("")
+            path.unlink()
+            result = entry_boundary_report(trace, timeline, data)
+            self.assertEqual(result["clock"]["status"], "sync_metadata_missing_or_ambiguous")
+            self.assertEqual(result["clock"]["metadata_diagnostics"], dict(
+                required_file_pattern="host_start.log*", matches_in_counter_directory=0, matches_in_capture=0))
+
     def test_counter_conversion_preserves_ticks_at_epoch_timestamps(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)

@@ -299,6 +299,8 @@ anchor and the export's local-time offset. `cntvct_diff` is accounted for using
 the Host CPU frequency. Decimal arithmetic preserves sub-microsecond differences
 when export timestamps are large. Multiple device directories require an
 unambiguous device identity in the selected trace tasks.
+Files ending in `.done` are completion markers and are excluded from metadata
+discovery and match counts; they do not replace the corresponding log or JSON.
 
 The sampled counter frequency must match the capture. Converted boundaries must
 contain the user entry/return within each task, and their span must agree with

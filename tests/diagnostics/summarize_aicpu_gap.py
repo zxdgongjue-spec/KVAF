@@ -931,7 +931,11 @@ def msprof_counter_clock(root, tasks, frequency, diagnostics=None):
     """
     if root.name == "mindstudio_profiler_output":
         root = root.parent
-    directories = sorted({p.parent for p in root.rglob("dev_start.log*") if p.is_file()})
+
+    def is_metadata(path):
+        return path.is_file() and path.suffix != ".done"
+
+    directories = sorted({p.parent for p in root.rglob("dev_start.log*") if is_metadata(p)})
     devices = {p.ids.get("device") for p in tasks} - {None}
     if devices:
         directories = [p for p in directories if p.name.removeprefix("device_") in devices]
@@ -942,12 +946,12 @@ def msprof_counter_clock(root, tasks, frequency, diagnostics=None):
     directory = directories[0]
 
     def metadata(pattern):
-        paths = [p for p in directory.glob(pattern) if p.is_file()]
+        paths = [p for p in directory.glob(pattern) if is_metadata(p)]
         if len(paths) != 1:
             if diagnostics is not None:
                 diagnostics.update(required_file_pattern=pattern,
                     matches_in_counter_directory=len(paths),
-                    matches_in_capture=sum(p.is_file() for p in root.rglob(pattern)))
+                    matches_in_capture=sum(is_metadata(p) for p in root.rglob(pattern)))
             raise ValueError("sync_metadata_missing_or_ambiguous")
         return paths[0].read_text(encoding="utf-8-sig")
 
