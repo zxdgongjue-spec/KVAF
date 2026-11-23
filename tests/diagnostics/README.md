@@ -57,3 +57,16 @@ retries, table pin retention/release, failed output unbinding, unrelated pending
 requests and live-graph recovery guards. Add `-fsanitize=address,undefined -g`
 with a supporting compiler for sanitizer checks. This standalone regression does
 not test real DMA completion or restore the removed full C++ test suite.
+
+## URMA DDR page modes (Host only)
+
+The regression wraps Linux mapping calls to check HugeTLB flags, rounded
+mapping lengths, release retries, and allocation failures without huge pages
+or an NPU. It also checks the ordinary and THP allocation paths.
+
+```bash
+c++ -std=c++17 -Icommon/include -Iaccess_operator/include -Imeta_manager/include -Iruntime/include -Iruntime \
+  tests/diagnostics/cpu_ddr_page_modes.cc runtime/memory/cpu_ddr_allocation.cc \
+  -Wl,--wrap=mmap,--wrap=munmap,--wrap=madvise -o /tmp/kvaf-cpu-ddr-page-modes
+/tmp/kvaf-cpu-ddr-page-modes
+```
