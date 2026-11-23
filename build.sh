@@ -15,7 +15,11 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N] [mode-specific options]
+Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--build-type TYPE] [--jobs N] [mode-specific options]
+
+Build type defaults to RelWithDebInfo and is applied on every configuration,
+including reused build directories. Override with --build-type Debug, Release,
+RelWithDebInfo or MinSizeRel.
 
 cpu  Builds the CPU Runtime service with liburma and OpenMP. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -128,8 +132,9 @@ build_cpu() {
     -DKVAF_ENABLE_CPU_OFFLOAD=OFF -DKVAF_ENABLE_NPU_PULL=OFF -DKVAF_BUILD_PYTHON=OFF)
   if [[ "$without_urma" == ON ]]; then
     cmake -S "$KVAF_ROOT" -B "$build_dir" -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
+      -DCMAKE_BUILD_TYPE="$build_type" \
       -DKVAF_CPU_ENABLE_URMA=OFF -DBUILD_TESTING=ON "${cpu_only_options[@]}"
-    cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
+    cmake --build "$build_dir" --config "$build_type" --target kvaf_cpu_service --parallel "$jobs"
     echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
     return
   fi
@@ -138,18 +143,20 @@ build_cpu() {
   if [[ -z "$urma_library" ]]; then
     echo "[KVAF_BUILD] liburma.so not found; building bundled UMDK without TPS/HW drivers"
     cmake -S "$umdk_root" -B "$umdk_build_dir" \
+      -DCMAKE_BUILD_TYPE="$build_type" \
       -DTPS=disable -DHW=disable -DURMA_INSTALL=disable
-    cmake --build "$umdk_build_dir" --target urma --parallel "$jobs"
+    cmake --build "$umdk_build_dir" --config "$build_type" --target urma --parallel "$jobs"
     urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
   fi
   [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE="$build_type" \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_CPU_ENABLE_URMA=ON -DBUILD_TESTING=ON "${cpu_only_options[@]}" \
     -DKVAF_ENABLE_AICPU_URMA=OFF \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
-  cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
+  cmake --build "$build_dir" --config "$build_type" --target kvaf_cpu_service --parallel "$jobs"
   echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
 }
 
@@ -219,6 +226,7 @@ build_npu() {
   # Set every backend switch explicitly so reusing a build directory cannot
   # retain AICPU/Scatter (or a CPU service) after selecting a trimmed build.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE="$build_type" \
     -DBUILD_TESTING="$build_testing" -DKVAF_BUILD_PYTHON="$build_python" \
     -DKVAF_ENABLE_AIV_BATCH_GET="$build_aiv" -DKVAF_ENABLE_AIV_BATCH_PUT="$build_aiv" \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA="$build_aicpu" \
@@ -226,7 +234,7 @@ build_npu() {
     -DKVAF_ENABLE_CPU_OFFLOAD="$build_cpu_pull" -DKVAF_ENABLE_NPU_PULL="$build_raw_pull" \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     ${cmake_options[@]+"${cmake_options[@]}"}
-  cmake --build "$build_dir" --parallel "$jobs"
+  cmake --build "$build_dir" --config "$build_type" --parallel "$jobs"
   if [[ "$build_aicpu" == ON ]]; then
     bash "$KVAF_ROOT/access_operator/transports/aicpu_urma/package/install_kernel.sh" \
       ${package_options[@]+"${package_options[@]}"} --install \
@@ -250,6 +258,7 @@ case "$mode" in
 esac
 
 build_dir="$KVAF_ROOT/build-$mode"
+build_type=RelWithDebInfo
 jobs="$(default_jobs)"
 kernel_action=build
 cpu_push=OFF
@@ -284,6 +293,14 @@ while [[ $# -gt 0 ]]; do
       build_dir="$2"
       shift 2
       ;;
+    --build-type)
+      [[ $# -ge 2 ]] || die "--build-type requires a value"
+      case "$2" in
+        Debug|Release|RelWithDebInfo|MinSizeRel) build_type="$2" ;;
+        *) die "--build-type must be Debug, Release, RelWithDebInfo or MinSizeRel" ;;
+      esac
+      shift 2
+      ;;
     --jobs)
       [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || die "--jobs requires a positive integer"
       jobs="$2"
@@ -305,6 +322,9 @@ done
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
 if [[ ( "$without_aicpu" == ON || "$pull_only" != none ) && "$kernel_action" != build ]]; then
   die "AICPU package actions cannot be combined with --without-aicpu or Pull-only modes"
+fi
+if [[ "$kernel_action" == build || "$kernel_action" == install ]]; then
+  echo "[KVAF_BUILD] mode=$mode build_type=$build_type build_dir=$build_dir"
 fi
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"

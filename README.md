@@ -165,6 +165,11 @@ Put 和 Get 分别使用 `PutExecutionConfig`、`GetExecutionConfig`，可独立
 
 以下命令均在仓库根目录执行。
 
+`build.sh` 默认使用 `RelWithDebInfo`（常见 GCC/Clang 配置为 `-O2 -g -DNDEBUG`），
+CPU、NPU 和 AICPU 模式均显式设置构建类型；复用目录时也会覆盖旧缓存中的空值或其他类型。
+需要其他构建类型时显式指定，例如 `./build.sh npu --build-type Release` 或
+`./build.sh cpu --build-type Debug`。独立设置编译参数的目标和设备 kernel 仍沿用各自配置。
+
 ### 构建 CPU 服务
 
 ```bash
