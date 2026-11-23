@@ -172,6 +172,24 @@ class GapExtractorTest(unittest.TestCase):
             result = entry_boundary_report(trace, timeline, data)
             self.assertEqual(result["clock"]["status"], "sync_metadata_missing_or_ambiguous")
             self.assertFalse(result["clock"]["split_available"])
+            self.assertEqual(result["clock"]["metadata_diagnostics"], dict(
+                required_file_pattern="info.json*", matches_in_counter_directory=0, matches_in_capture=0))
+
+    def test_missing_sync_file_reports_other_capture_locations_without_paths(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            data = add_counter_samples(root, data)
+            host = root / "host"
+            host.mkdir()
+            path = root / "device_1" / "host_start.log.1"
+            (host / path.name).write_text(path.read_text())
+            path.unlink()
+            result = entry_boundary_report(trace, timeline, data)
+            diagnostics = result["clock"]["metadata_diagnostics"]
+            self.assertEqual(diagnostics, dict(required_file_pattern="host_start.log*",
+                matches_in_counter_directory=0, matches_in_capture=1))
+            self.assertNotIn(str(root), json.dumps(result))
 
     def test_counter_sync_rejects_bad_anchor_and_wrong_counter_rate(self):
         for shift_ticks, multiplier, status in ((5000, 1, "calibration_inconsistent_with_task_containment"),

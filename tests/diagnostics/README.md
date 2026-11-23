@@ -271,6 +271,7 @@ Read `entry_boundary` in the resulting report:
 | `stats_us.counter_minus_steady_entry` | Counter span minus steady span; captures the small extra interval between the separate clock reads. |
 | `dominant_boundary` | `before_entry`, `after_return`, or `similar_within_uncertainty`. |
 | `clock.status=sync_metadata_*` | Preserve the original capture's device directory and pass its PROF root; copied JSON/CSVs alone cannot align counters. |
+| `clock.metadata_diagnostics` | Failed file pattern and match counts in the counter directory and entire capture; identifies missing, relocated or duplicate metadata without exporting paths or clock values. |
 | `clock.status=sync_counter_frequency_mismatch` | Sampled CNTFRQ does not match the capture's HWTS frequency; no split is emitted. |
 | `clock.status=calibration_inconsistent_with_task_containment` | Converted entry/return timestamps fall outside their associated task; no split is emitted. |
 | `clock.status=counter_and_steady_durations_disagree` | Hardware and steady spans disagree beyond the clock-read tolerance; no split is emitted. |

@@ -923,7 +923,7 @@ def calibrated_clock(path, device_id):
     return convert
 
 
-def msprof_counter_clock(root, tasks, frequency):
+def msprof_counter_clock(root, tasks, frequency, diagnostics=None):
     """Use the capture's CNTVCT synchronization, never fitted task boundaries.
 
     Mirrors msprof InfoConfReader.time_from_syscnt/trans_into_local_time:
@@ -944,6 +944,10 @@ def msprof_counter_clock(root, tasks, frequency):
     def metadata(pattern):
         paths = [p for p in directory.glob(pattern) if p.is_file()]
         if len(paths) != 1:
+            if diagnostics is not None:
+                diagnostics.update(required_file_pattern=pattern,
+                    matches_in_counter_directory=len(paths),
+                    matches_in_capture=sum(p.is_file() for p in root.rglob(pattern)))
             raise ValueError("sync_metadata_missing_or_ambiguous")
         return paths[0].read_text(encoding="utf-8-sig")
 
@@ -1042,11 +1046,14 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
         if len(frequencies) != 1 or not next(iter(frequencies)):
             result["clock"] = dict(status="hardware_counter_unavailable_or_inconsistent", split_available=False)
             return result
+        diagnostics = {}
         try:
-            convert = msprof_counter_clock(trace.root, [p["task"] for p in pairs], next(iter(frequencies)))
+            convert = msprof_counter_clock(trace.root, [p["task"] for p in pairs], next(iter(frequencies)), diagnostics)
         except ValueError as error:
             code = str(error)
             result["clock"] = dict(status=code if code.startswith("sync_") else "sync_invalid_metadata", split_available=False)
+            if diagnostics:
+                result["clock"]["metadata_diagnostics"] = diagnostics
             return result
         counter_mode = True
     if convert is not None:
