@@ -11,7 +11,7 @@
 
 namespace kvaf::detail {
 
-ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get,
+ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get, bool peer_local,
                                              const ExecutionResources* configured) {
   ExecutionResources resources;
   resources.jettys = 2U;
@@ -20,8 +20,9 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
   } else if (executor == Executor::Aicpu) {
     resources.cores = get ? 5U : 1U;
   } else {
-    resources.cores = get ? kDefaultUrmaAivGetCores : 2U;
-    if (get) resources.jettys = kDefaultUrmaAivGetJettysPerCore;
+    const auto defaults = DefaultUrmaAivParallelism(get, peer_local);
+    resources.cores = defaults.cores;
+    resources.jettys = defaults.jettys_per_core;
   }
   resources.max_inflight_total = 2048U;
   if (executor == Executor::Aiv)

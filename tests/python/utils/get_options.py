@@ -8,15 +8,15 @@ from .npu_eids import parse_npu_eids
 
 
 BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter")
-DEFAULT_PARALLELISM = {"aiv": 4, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
-DEFAULT_AIV_JETTYS_PER_CORE = 1
+DEFAULT_PARALLELISM = {"aiv": None, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
 MAX_JETTYS_PER_CORE = 64
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
 
 
 def environment_int(name, default):
-    return int(os.environ.get(name, str(default)))
+    value = os.environ.get(name)
+    return default if value is None else int(value)
 
 
 def environment_bool(name, default=False):
@@ -84,13 +84,13 @@ def add_backend_arguments(parser, *, sweep=False):
     if sweep:
         count_options["nargs"] = "+"
     group.add_argument("--aiv-cores", **count_options,
-                       help="AIV cores per device (1..48; defaults: aiv 4, ubmem 16)")
+                       help="AIV cores per device (1..48; defaults: local URMA 2, remote URMA 4, ubmem 16)")
     group.add_argument("--aicpu-workers", **count_options,
                        help="AICPU workers per device; gather_read/cpu_push_scatter only (1..8)")
     # Preserve old commands while keeping distinct hardware concepts in help.
     group.add_argument("--workers", dest="compat_workers", **count_options, help=argparse.SUPPRESS)
     group.add_argument("--jettys-per-core", type=int, default=None,
-                       help=f"Jettys per AIV core; aiv only (1..64, default: {DEFAULT_AIV_JETTYS_PER_CORE})")
+                       help="Jettys per AIV core; aiv only (1..64; defaults: local 2, remote 1)")
     group.add_argument("--max-inflight-total", type=int, default=None,
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 disables the limit)")
     group.add_argument("--npu-eids", type=parse_npu_eids,
@@ -126,7 +126,8 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
         default_count = DEFAULT_PARALLELISM[args.backend]
         if sweep:
             env_name = "KVAF_BATCH_GET_AICPU_WORKERS" if uses_aicpu(args) else "KVAF_BATCH_GET_AIV_CORES"
-            counts = [int(v) for v in os.environ.get(env_name, str(default_count)).split()]
+            value = os.environ.get(env_name)
+            counts = [default_count] if value is None else [int(v) for v in value.split()]
         else:
             env_name = "KVAF_BATCH_GET_PERF_AICPU_WORKERS" if uses_aicpu(args) else "KVAF_BATCH_GET_PERF_AIV_CORES"
             counts = environment_int(env_name, environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", default_count))
@@ -143,7 +144,7 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
         args.jettys_per_core, args.max_inflight_total = 2, 2048
     else:
         if args.jettys_per_core is None:
-            args.jettys_per_core = environment_int("KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", DEFAULT_AIV_JETTYS_PER_CORE)
+            args.jettys_per_core = environment_int("KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", None)
         if args.max_inflight_total is None:
             args.max_inflight_total = environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048)
     if args.miss_count is None:
@@ -164,20 +165,21 @@ def validate_workload(args):
     if not 0 <= args.miss_count <= args.request_length:
         return "miss-count must be between zero and request-length"
     maximum = 8 if uses_aicpu(args) else 48
-    if not 1 <= args.parallelism <= maximum:
+    if args.parallelism is not None and not 1 <= args.parallelism <= maximum:
         return f"{parallelism_field(args.backend).replace('_', '-')} must be in [1, {maximum}]"
     if uses_aicpu(args) and max(args.token_bytes * 65536, args.token_bytes * args.tokens_per_block) > 0xFFFFFFFF:
         return "AICPU token workspace and block bytes must fit uint32"
     if args.transport == "ubmem" and args.peer_ub_device:
         return "peer-ub-device applies only to URMA"
-    if not 1 <= args.jettys_per_core <= MAX_JETTYS_PER_CORE:
+    if args.jettys_per_core is not None and not 1 <= args.jettys_per_core <= MAX_JETTYS_PER_CORE:
         return "jettys-per-core must be in [1, 64]"
     if args.backend == "aiv":
-        if len(args.npu_eids) > args.parallelism * args.jettys_per_core:
+        if (args.parallelism is not None and args.jettys_per_core is not None
+                and len(args.npu_eids) > args.parallelism * args.jettys_per_core):
             return "npu-eids count must not exceed aiv-cores * jettys-per-core"
         if not 0 <= args.max_inflight_total <= 0xFFFFFFFF:
             return "max-inflight-total must fit uint32"
-        if args.max_inflight_total and args.max_inflight_total < 2 * args.parallelism:
+        if args.parallelism is not None and args.max_inflight_total and args.max_inflight_total < 2 * args.parallelism:
             return "max-inflight-total must be zero or at least twice aiv-cores"
     if args.warmup < 0:
         return "warmup must be non-negative"
@@ -194,10 +196,13 @@ def workload_command(args):
     command = []
     for name in fields:
         command.extend(("--" + name.replace("_", "-"), str(getattr(args, name))))
-    command.extend(("--" + field.replace("_", "-"), str(args.parallelism)))
+    if args.parallelism is not None:
+        command.extend(("--" + field.replace("_", "-"), str(args.parallelism)))
     command.append("--sort-input-indices" if args.sort_input_indices else "--no-sort-input-indices")
     if args.backend == "aiv":
-        command += ["--jettys-per-core", str(args.jettys_per_core), "--max-inflight-total", str(args.max_inflight_total)]
+        if args.jettys_per_core is not None:
+            command += ["--jettys-per-core", str(args.jettys_per_core)]
+        command += ["--max-inflight-total", str(args.max_inflight_total)]
     if args.npu_eids:
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:

@@ -68,7 +68,7 @@ struct GetExecutionConfig {
 | Ubmem | UBMEM AIV | UBMEM AIV Direct |
 | UrmaAndUbmem | URMA AIV | URMA AIV Direct |
 
-上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。URMA AIV Get 默认 4 核、每核 1 个 Jetty，在途上限为 2048。URMA AIV Put 默认 2 核、每核 2 个 Jetty。UBMEM AIV Put/Get 默认 16 核，AICPU Put 默认 1 个 worker，AICPU Gather/Scatter Get 默认 5 个。资源项可以逐配置覆盖。
+上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。URMA AIV Get 在本机默认 2 核、每核 2 个 Jetty，在远端 A+K 默认 4 核、每核 1 个 Jetty，在途上限为 2048。URMA AIV Put 默认 2 核、每核 2 个 Jetty。UBMEM AIV Put/Get 默认 16 核，AICPU Put 默认 1 个 worker，AICPU Gather/Scatter Get 默认 5 个。资源项可以逐配置覆盖。
 
 AIV/UBMEM 的空 `kernel_path` 使用构建时记录的绝对路径：Get 为 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为 `<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。标准 `./build.sh npu` 使用 `build-npu`，自定义 `--build-dir` 自动生效，不依赖应用当前目录。非空路径严格覆盖默认值；默认或显式文件均在首次准备时检查，缺失时返回错误。移动构建产物后需显式覆盖路径或重新构建。AICPU 保持首次使用时从 CANN 安装目录解析包。
 

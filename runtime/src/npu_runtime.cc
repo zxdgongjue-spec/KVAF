@@ -195,7 +195,7 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    return detail::ResolveExecutionResources(transport, executor, get, selected);
+    return detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {
@@ -347,6 +347,7 @@ struct NpuRuntime::Impl {
     }
     if (executor == Executor::Aiv) {
       AccessOperatorConfig c;
+      c.peer_local = cache_peer_local;
       c.peer_link = link;
       if (links.size() > 1) c.peer_get_links = links;
       c.peer_local_eids = eids;
@@ -523,6 +524,10 @@ const RuntimeCore& NpuRuntime::core() const {
   return *impl_->runtime_core;
 }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
+ExecutionResources NpuRuntime::GetResources(GetExecutionConfig config) const {
+  if (!ddr_initialized()) throw std::logic_error("Get resources require initialized DDR");
+  return impl_->Resources(config.transport, config.executor, config.algorithm, true);
+}
 const std::vector<std::string>& NpuRuntime::npu_eids() const {
   return impl_->options.npu_eids;
 }

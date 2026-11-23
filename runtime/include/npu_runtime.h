@@ -71,6 +71,8 @@ class NpuRuntime final : public Runtime {
   // Keep HBM reader connections and the configured CPU target alive.
   Status ShutdownDdr();
   bool ddr_initialized() const;
+  // Effective Get budget after DDR peer discovery, including caller overrides.
+  ExecutionResources GetResources(GetExecutionConfig config) const;
   RuntimeCore& core();
   const RuntimeCore& core() const;
   Status GetOffloadRegion(OffloadRegionTicket*);

@@ -22,7 +22,6 @@ import kvaf
 
 from utils.backend import detect_torch_backend
 from utils.dsa_keys import build_dsa_keys
-from utils.get_options import DEFAULT_AIV_JETTYS_PER_CORE, DEFAULT_PARALLELISM
 from utils.npu_eids import parse_npu_eids
 from utils.perf_execution import BenchmarkExecution, add_execution_metadata, default_put_cores
 from utils.statistics import percentile
@@ -86,12 +85,8 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     batch = int(os.environ.get("KVAF_RUNTIME_PERF_BATCH", str(batch)))
     core_override = os.environ.get("KVAF_RUNTIME_PERF_AIV_CORES")
     jetty_override = os.environ.get("KVAF_RUNTIME_PERF_JETTYS_PER_CORE", os.environ.get("KVAF_NPU_JETTYS_PER_CORE"))
-    get_backend = "ubmem" if transport == "ubmem" else "aiv"
-    npu_core_count = int(core_override) if core_override is not None else DEFAULT_PARALLELISM[get_backend]
-    default_get_jettys = DEFAULT_AIV_JETTYS_PER_CORE if transport == "urma" else 2
-    jettys_per_core = int(jetty_override) if jetty_override is not None else default_get_jettys
-    put_cores = npu_core_count if core_override is not None else default_put_cores(transport, "aiv")
-    put_jettys = jettys_per_core if jetty_override is not None else 2
+    put_cores = int(core_override) if core_override is not None else default_put_cores(transport, "aiv")
+    put_jettys = int(jetty_override) if jetty_override is not None else 2
     max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     warmup = int(os.environ.get("KVAF_RUNTIME_PERF_WARMUP", str(WARMUP)))
@@ -126,9 +121,8 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     total_put_batches = table_capacity // PUT_BATCH_SIZE
     if not (
         batch > 0
-        and npu_core_count > 0
-        and 1 <= jettys_per_core <= 2
-        and len(npu_eids) <= npu_core_count * jettys_per_core
+        and put_cores > 0
+        and 1 <= put_jettys <= 2
         and warmup >= 0
         and iterations > 0
         and 1 <= active_percent <= 100
@@ -143,7 +137,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     ):
         print(
             "FAIL: invalid KVAF_RUNTIME_PERF_* configuration "
-            f"(requests={requests}, aiv_cores={npu_core_count})",
+            f"(requests={requests}, aiv_cores={core_override or 'auto'})",
             file=sys.stderr,
         )
         return 2
@@ -204,7 +198,8 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
     execution = BenchmarkExecution(kvaf, transport=transport,
                                    put_capacity=PUT_BATCH_SIZE, get_capacity=max(requests, PUT_BATCH_SIZE),
-                                   get_cores=npu_core_count, get_jettys=jettys_per_core,
+                                   get_cores=put_cores if core_override is not None else 0,
+                                   get_jettys=put_jettys if jetty_override is not None else 0,
                                    put_cores=put_cores, put_jettys=put_jettys,
                                    get_kernel=str(kernel), put_kernel=str(batch_put_kernel),
                                    max_inflight_total=max_inflight_total)
@@ -221,6 +216,17 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     device_table = None
     preflight_table = None
     try:
+        print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
+        begin = time.perf_counter()
+        runtime.initialize(ddr_bytes, source_stride)
+        initialize_ms = (time.perf_counter() - begin) * 1000.0
+        print(f"PERF_RESULT execution_mode={execution_mode} operation=initialize "
+              f"samples=1 elapsed_ms={initialize_ms:.3f} kind=lifecycle")
+        print("RUNTIME_PERF_PHASE_DONE phase=initialize")
+        resources = runtime.get_execution_resources(execution.get_config)
+        npu_core_count, jettys_per_core = resources.cores, resources.jettys
+        if len(npu_eids) > npu_core_count * jettys_per_core:
+            raise ValueError("npu_eids count exceeds the Get Jetty budget")
         print(
             "RUNTIME_PERF_CONFIG "
             f"execution_mode={execution_mode} "
@@ -239,14 +245,6 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
             f"batch_put_backend={'ubmem' if transport == 'ubmem' else 'aiv_direct_hccp'} "
             "get_timing=async_submit_to_drain put_timing=synchronous_batch_put"
         )
-
-        print("RUNTIME_PERF_PHASE_BEGIN phase=initialize")
-        begin = time.perf_counter()
-        runtime.initialize(ddr_bytes, source_stride)
-        initialize_ms = (time.perf_counter() - begin) * 1000.0
-        print(f"PERF_RESULT execution_mode={execution_mode} operation=initialize "
-              f"samples=1 elapsed_ms={initialize_ms:.3f} kind=lifecycle")
-        print("RUNTIME_PERF_PHASE_DONE phase=initialize")
 
         # Verify the complete CPU-DDR data path before accepting steady-state samples.
         print("RUNTIME_PERF_PHASE_BEGIN phase=correctness_preflight")

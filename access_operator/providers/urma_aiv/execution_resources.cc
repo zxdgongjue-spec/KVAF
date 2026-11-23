@@ -128,10 +128,10 @@ Status EnsureBatchPutMetadataCapacity(std::size_t rows,
 struct AivExecutionResources::State {
   State(AccessOperatorConfig value, const AivExecutionResources* owner)
       : config(std::move(value)), default_invocation(owner), active(&default_invocation) {
-    if (!config.npu_core_count)
-      config.npu_core_count = config.enable_get ? kDefaultUrmaAivGetCores : 2U;
+    const auto defaults = DefaultUrmaAivParallelism(config.enable_get, config.peer_local);
+    if (!config.npu_core_count) config.npu_core_count = defaults.cores;
     if (!config.jettys_per_core) {
-      config.jettys_per_core = config.enable_get ? kDefaultUrmaAivGetJettysPerCore : 2U;
+      config.jettys_per_core = defaults.jettys_per_core;
       if (!config.batch_put_jettys_per_core) config.batch_put_jettys_per_core = 2U;
     }
     views.Bind(active);

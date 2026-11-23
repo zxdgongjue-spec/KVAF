@@ -64,8 +64,8 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 未指定默认配置时优先选当前构建可用的实现；显式选择不可用实现会在首次使用时失败。
 
 `put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
-预算按 provider 配置。`cores=0` 时，URMA AIV Put 用 2 核、Get 用 4 核，UBMEM AIV
-Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 5 个。URMA AIV Get 每核默认 1 个 Jetty（支持 1..64），
+预算按 provider 配置。`cores=0` 时，URMA AIV Put 用 2 核、Get 在本机用 2 核、远端 A+K 用 4 核，UBMEM AIV
+Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 5 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
 Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 关闭限制，非零须至少为
 `2 * cores`。`request_capacity` 默认 65536，Gather 可额外指定 `cpu_threads`。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
