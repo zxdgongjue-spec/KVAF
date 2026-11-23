@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from summarize_aicpu_gap import (Trace, bounded_report, csv_report, main, report_execution,
-                                graph_scope_comparison, load_graph_samples, entry_boundary_report, msprof_counter_clock)
+                                graph_scope_comparison, load_graph_samples, entry_boundary_report, msprof_device_clock)
 
 
 def event(name, start, duration, pid=1, tid=1, **args):
@@ -113,7 +113,52 @@ def add_counter_samples(root, data, shift_ticks=0):
     return load_graph_samples(root)
 
 
+def add_raw_samples(root, data, shift_ns=0):
+    data = add_counter_samples(root, data)
+    data.update(format="kvaf-aicpu-samples-v3", device_clock="aicpu_monotonic_raw_ns")
+    data.pop("boundary_clock")
+    for sample in data["rounds"]:
+        for node in sample["nodes"]:
+            for worker in node["workers"]:
+                for key in ("device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns"):
+                    worker[key] += 987_654_321_000 - 9_000_000_000_000 + shift_ns
+                for key in ("device_entry_syscnt", "device_return_syscnt", "device_syscnt_frequency"):
+                    worker.pop(key)
+    (root / "device_1" / "dev_start.log.1").write_text("clock_monotonic_raw:987654321000\n")
+    (root / "aicpu_samples.json").write_text(json.dumps(data))
+    return load_graph_samples(root)
+
+
 class GapExtractorTest(unittest.TestCase):
+    def test_raw_clock_alignment_is_independent_of_hwts_frequency(self):
+        for shift_ns, front, tail, dominant in ((0, 10, 20, "after_return"), (10000, 20, 10, "before_entry")):
+            with self.subTest(shift_ns=shift_ns), TemporaryDirectory() as folder:
+                root = Path(folder)
+                trace, timeline, data = sample_trace(root, gets=2, last=1)
+                data = add_raw_samples(root, data, shift_ns)
+                # No HWTS counter/frequency is needed for CLOCK_MONOTONIC_RAW.
+                (root / "device_1" / "info.json.1").write_text(json.dumps(dict(CPU=[dict(Frequency="100")])))
+                for path in list((root / "device_1").iterdir()):
+                    path.with_name(path.name + ".done").write_text("NOT_CALIBRATION_DATA")
+                result = entry_boundary_report(trace, timeline, data)
+                self.assertEqual(result["clock"]["status"], "msprof_monotonic_raw_aligned")
+                self.assertTrue(result["clock"]["split_available"])
+                self.assertEqual(result["selected_nodes"], 2)
+                self.assertEqual(result["stats_us"]["task_begin_to_first_entry"]["mean"], front)
+                self.assertEqual(result["stats_us"]["last_return_to_task_end"]["mean"], tail)
+                self.assertEqual(result["stats_us"]["boundary_reconciliation_error"]["mean"], 0)
+                self.assertEqual(result["dominant_boundary"], dominant)
+
+    def test_raw_clock_rejects_an_incorrect_device_anchor(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            data = add_raw_samples(root, data)
+            (root / "device_1" / "dev_start.log.1").write_text("clock_monotonic_raw:987655321000\n")
+            result = entry_boundary_report(trace, timeline, data)
+            self.assertEqual(result["clock"]["status"], "calibration_inconsistent_with_task_containment")
+            self.assertFalse(result["clock"]["split_available"])
+
     def test_counter_sync_ignores_done_markers_for_all_metadata_and_device_discovery(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -149,7 +194,7 @@ class GapExtractorTest(unittest.TestCase):
             add_counter_samples(root, data)
             path = root / "device_1" / "start_info.1"
             path.write_text(json.dumps(dict(collectionTimeBegin="1700000000000000.001", clockMonotonicRaw="123456790000")))
-            convert = msprof_counter_clock(root, trace.selected_task_events, 50_000_000)
+            convert = msprof_device_clock(root, trace.selected_task_events, 50_000_000)
             first, _ = convert(500_000_000_000)
             second, _ = convert(500_000_000_001)
             self.assertEqual(second - first, Decimal("0.02"))
@@ -195,6 +240,9 @@ class GapExtractorTest(unittest.TestCase):
             path.write_text(json.dumps(dict(DeviceInfo=[dict(hwts_frequency="25")], CPU=[dict(Frequency="100")])))
             result = entry_boundary_report(trace, timeline, data)
             self.assertEqual(result["clock"]["status"], "sync_counter_frequency_mismatch")
+            self.assertEqual(result["clock"]["metadata_diagnostics"], dict(
+                sampled_counter_frequency_hz=50000000, metadata_hwts_frequency_hz=25000000,
+                requires_raw_clock_samples=True))
             self.assertNotIn("task_begin_to_first_entry", result["stats_us"])
             path.unlink()
             result = entry_boundary_report(trace, timeline, data)
@@ -350,6 +398,25 @@ class GapExtractorTest(unittest.TestCase):
             self.assertEqual(result["stats_us"]["last_return_to_task_end"]["mean"], 20)
             self.assertNotIn("500000000000", output.getvalue())
             self.assertNotIn("123456788920", output.getvalue())
+            self.assertNotIn(str(root), output.getvalue())
+
+    def test_raw_clock_cli_aligns_without_counter_calibration(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            add_raw_samples(root, data)
+            (root / "summary.csv").write_text(
+                "backend,execution,gets_per_replay,kernel_mean_us,e2e_mean_us,graph_api,graph_submit\n"
+                "gather_read,graph,1,60,160,acl,native\n")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--msprof-dir", str(root), "--benchmark-dir", str(root), "--last", "1"])
+            self.assertEqual(code, 0)
+            result = json.loads(output.getvalue())["entry_boundary"]
+            self.assertEqual(result["clock"]["status"], "msprof_monotonic_raw_aligned")
+            self.assertEqual(result["stats_us"]["task_begin_to_first_entry"]["mean"], 10)
+            self.assertEqual(result["stats_us"]["last_return_to_task_end"]["mean"], 20)
+            self.assertNotIn("987654321000", output.getvalue())
             self.assertNotIn(str(root), output.getvalue())
 
     def test_unique_event_identity_survives_host_device_clock_inversion(self):

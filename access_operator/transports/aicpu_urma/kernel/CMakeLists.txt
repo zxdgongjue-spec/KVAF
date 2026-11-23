@@ -28,9 +28,9 @@ set(cpu_push_libraries "${KVAF_AICPU_SECUREC_LIBRARY}")
 set(cpu_push_dependencies "${KVAF_AICPU_SECUREC_LIBRARY}" "${KVAF_AICPU_SECUREC_INCLUDE_DIR}/securec.h")
 set(cpu_push_commands COMMAND "${CMAKE_COMMAND}" -E copy_if_different
     "${KVAF_AICPU_SECUREC_LIBRARY}" "${kernel_dir}/${securec_library_name}")
-set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV5": {
+set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV6": {
     "opInfo": {
-      "functionName": "KvafAicpuCpuPushScatterExecutionV5",
+      "functionName": "KvafAicpuCpuPushScatterExecutionV6",
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
@@ -75,6 +75,7 @@ if(KVAF_ENABLE_AICPU_CPU_PUSH)
   add_custom_command(OUTPUT "${cpu_push_object}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}"
     COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O3 -fPIC -c -DKVAF_CPU_PUSH_DEVICE_KERNEL=1
+      -DKVAF_AICPU_PROFILE_MONOTONIC_RAW=1
       -I "${CMAKE_CURRENT_SOURCE_DIR}"
       -I "${CMAKE_SOURCE_DIR}/access_operator/include"
       -I "${CMAKE_SOURCE_DIR}/access_operator/algorithms"
@@ -88,6 +89,7 @@ endif()
 add_custom_command(OUTPUT "${kernel_so}"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${kernel_dir}"
   COMMAND "${KVAF_AICPU_CXX}" -std=c++17 -O2 -shared -fPIC
+    -DKVAF_AICPU_PROFILE_MONOTONIC_RAW=1
     -I "${CMAKE_CURRENT_SOURCE_DIR}"
     -I "${CMAKE_SOURCE_DIR}/access_operator/include"
     -I "${CMAKE_SOURCE_DIR}/access_operator/algorithms"

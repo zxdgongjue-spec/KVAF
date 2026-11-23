@@ -856,11 +856,11 @@ def load_graph_samples(root):
     data = json.loads(paths[0].read_text(encoding="utf-8-sig"))
     integer = lambda v: isinstance(v, int) and not isinstance(v, bool)
     try:
-        require(data["format"] in ("kvaf-aicpu-samples-v1", "kvaf-aicpu-samples-v2") and data["execution"] == "graph")
+        require(data["format"] in ("kvaf-aicpu-samples-v1", "kvaf-aicpu-samples-v2", "kvaf-aicpu-samples-v3") and data["execution"] == "graph")
         counters = data["format"] == "kvaf-aicpu-samples-v2"
         if counters:
             require(data["boundary_clock"] == "aarch64_cntvct")
-        require(data["device_clock"] == "aicpu_steady_ns")
+        require(data["device_clock"] == ("aicpu_monotonic_raw_ns" if data["format"] == "kvaf-aicpu-samples-v3" else "aicpu_steady_ns"))
         require(data["host_clock"] == "python_perf_counter_ns")
         require(data["backend"] in ("gather_read", "cpu_push_scatter"))
         require(data["graph_submit"] in ("native", "python") and data["graph_api"] in ("acl", "torch"))
@@ -895,12 +895,12 @@ def load_graph_samples(root):
     return data
 
 
-def calibrated_clock(path, device_id):
+def calibrated_clock(path, device_id, source_clock="aicpu_steady_ns"):
     """An independent calibration supplies two bracketing clock anchors."""
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     try:
         require(data["format"] == "kvaf-aicpu-clock-map-v1" and data["device_id"] == device_id)
-        require(data["source_clock"] == "aicpu_steady_ns" and data["target_clock"] == "msprof_trace_us")
+        require(data["source_clock"] == source_clock and data["target_clock"] == "msprof_trace_us")
         require(data["provenance"] in ("msprof_clock_sync", "independent_timestamp_calibration"))
         anchors = data["anchors"]
         require(len(anchors) == 2)
@@ -923,10 +923,10 @@ def calibrated_clock(path, device_id):
     return convert
 
 
-def msprof_counter_clock(root, tasks, frequency, diagnostics=None):
-    """Use the capture's CNTVCT synchronization, never fitted task boundaries.
+def msprof_device_clock(root, tasks, frequency, diagnostics=None, raw_clock=False):
+    """Use independent capture clock anchors, never fitted task boundaries.
 
-    Mirrors msprof InfoConfReader.time_from_syscnt/trans_into_local_time:
+    Mirrors msprof InfoConfReader.get_delta_time/trans_into_local_time:
     https://github.com/Ascend/msprof/blob/master/analysis/common_func/info_conf_reader.py
     """
     if root.name == "mindstudio_profiler_output":
@@ -966,10 +966,17 @@ def msprof_counter_clock(root, tasks, frequency, diagnostics=None):
         host = numeric_fields(metadata("host_start.log*"))
         info = json.loads(metadata("info.json*"), parse_float=Decimal)
         start = json.loads(metadata("start_info*"), parse_float=Decimal)
-        device_frequency = Decimal(str(info["DeviceInfo"][0]["hwts_frequency"])) * 1000000
-        if device_frequency <= 0 or abs(device_frequency - frequency) > 1:
-            raise ValueError("sync_counter_frequency_mismatch")
-        counter_origin = dev["cntvct"]
+        if raw_clock:
+            device_frequency = Decimal(1000000000)
+            counter_origin = dev["clock_monotonic_raw"]
+        else:
+            device_frequency = Decimal(str(info["DeviceInfo"][0]["hwts_frequency"])) * 1000000
+            if device_frequency <= 0 or abs(device_frequency - frequency) > 1:
+                if diagnostics is not None:
+                    diagnostics.update(sampled_counter_frequency_hz=frequency,
+                        metadata_hwts_frequency_hz=float(device_frequency), requires_raw_clock_samples=True)
+                raise ValueError("sync_counter_frequency_mismatch")
+            counter_origin = dev["cntvct"]
         host_ns = host["clock_monotonic_raw"]
         if host.get("cntvct_diff", 0):
             host_frequency = Decimal(str(info["CPU"][0]["Frequency"])) * 1000000
@@ -1043,23 +1050,27 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
     result["representative_nodes"] = [dict(round=representatives[i]["round"], node=representatives[i]["node"],
         **{key + "_us": round(representatives[i][key], 3) for key in fields}) for i in indexes]
     convert, counter_mode = None, False
+    raw_clock = data["device_clock"] == "aicpu_monotonic_raw_ns"
     if clock_map is not None:
-        convert = calibrated_clock(clock_map, data["device_id"])
-    elif data["format"] == "kvaf-aicpu-samples-v2":
-        frequencies = {w["device_syscnt_frequency"] for p in pairs for w in p["workers"]}
-        if len(frequencies) != 1 or not next(iter(frequencies)):
-            result["clock"] = dict(status="hardware_counter_unavailable_or_inconsistent", split_available=False)
-            return result
+        convert = calibrated_clock(clock_map, data["device_id"], data["device_clock"])
+    elif raw_clock or data["format"] == "kvaf-aicpu-samples-v2":
+        frequency = 1000000000
+        if not raw_clock:
+            frequencies = {w["device_syscnt_frequency"] for p in pairs for w in p["workers"]}
+            if len(frequencies) != 1 or not next(iter(frequencies)):
+                result["clock"] = dict(status="hardware_counter_unavailable_or_inconsistent", split_available=False)
+                return result
+            frequency = next(iter(frequencies))
         diagnostics = {}
         try:
-            convert = msprof_counter_clock(trace.root, [p["task"] for p in pairs], next(iter(frequencies)), diagnostics)
+            convert = msprof_device_clock(trace.root, [p["task"] for p in pairs], frequency, diagnostics, raw_clock)
         except ValueError as error:
             code = str(error)
             result["clock"] = dict(status=code if code.startswith("sync_") else "sync_invalid_metadata", split_available=False)
             if diagnostics:
                 result["clock"]["metadata_diagnostics"] = diagnostics
             return result
-        counter_mode = True
+        counter_mode = not raw_clock
     if convert is not None:
         before, after, uncertainty, mapped_outside = [], [], [], []
         counter_span_delta = []
@@ -1085,8 +1096,11 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
                                 for delta, p in zip(counter_span_delta, selected)):
             result["clock"] = dict(status="counter_and_steady_durations_disagree", split_available=False)
             return result
-        result["clock"] = dict(status="msprof_counter_aligned" if counter_mode else "independently_calibrated",
+        result["clock"] = dict(status=("msprof_monotonic_raw_aligned" if raw_clock and clock_map is None else
+                                      "msprof_counter_aligned" if counter_mode else "independently_calibrated"),
                                split_available=True, boundary_uncertainty_us=max(uncertainty))
+        if raw_clock and clock_map is None:
+            result["clock"]["source"] = "capture_device_monotonic_raw_to_host_monotonic_raw"
         if counter_mode:
             result["clock"]["source"] = "capture_dev_start_host_start_info_start_info"
             result["stats_us"]["counter_minus_steady_entry"] = stats(counter_span_delta)
@@ -1313,8 +1327,8 @@ def main(argv=None):
                              "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",
                              "Aggregate benchmark means and trace task means are separate scopes; entry_boundary uses per-round samples when available.",
-                             "Entry boundaries use sampled CNTVCT plus the capture's msprof synchronization metadata automatically; --clock-map remains available for older steady-clock samples. No task boundary is used as a clock anchor.",
-                             "Counter and steady timestamps bracket separate clock reads. Compare calibrated_entry_span with entry_span; boundary uncertainty covers trace quantization, not an independently measured hardware synchronization error."],
+                             "Version-3 device timestamps use CLOCK_MONOTONIC_RAW and the capture's device/Host monotonic-raw anchors. CNTFRQ and HWTS frequency are not assumed equal. No task boundary is used as a clock anchor.",
+                             "Legacy counter samples require a matching clock domain or an independent --clock-map. Boundary uncertainty covers trace quantization, not an independently measured hardware synchronization error."],
                       benchmark=benchmark,
                       timeline=timeline,
                       csv_supplement=supplement)

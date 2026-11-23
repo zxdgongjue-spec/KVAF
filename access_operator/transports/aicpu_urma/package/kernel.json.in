@@ -1,8 +1,8 @@
 {
 @KVAF_AICPU_CPU_PUSH_ENTRY@
-  "KvafAicpuGatherReadExecutionV5": {
+  "KvafAicpuGatherReadExecutionV6": {
     "opInfo": {
-      "functionName": "KvafAicpuGatherReadExecutionV5",
+      "functionName": "KvafAicpuGatherReadExecutionV6",
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }

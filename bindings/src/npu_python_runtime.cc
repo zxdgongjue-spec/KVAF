@@ -600,13 +600,11 @@ class NpuPythonRuntime final {
       py::dict item;
       item["core"] = core;
       if (profile.device_start_ns) {
+        item["device_clock"] = "aicpu_monotonic_raw_ns";
         item["device_start_ns"] = profile.device_start_ns;
         item["device_finish_ns"] = profile.device_finish_ns;
         item["device_entry_ns"] = profile.aicpu_profile.entry_ns;
         item["device_return_ns"] = profile.aicpu_profile.return_ns;
-        item["device_entry_syscnt"] = profile.aicpu_profile.entry_syscnt;
-        item["device_return_syscnt"] = profile.aicpu_profile.return_syscnt;
-        item["device_syscnt_frequency"] = profile.aicpu_profile.syscnt_frequency;
         BatchGetProfile detailed{};
         detailed.worker_count = 1;
         detailed.workers[0] = profile.aicpu_profile;

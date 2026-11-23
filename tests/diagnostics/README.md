@@ -227,29 +227,35 @@ start Event. See [the comparison commands](../../docs/batch_get_performance.md#a
 ### Split CANN task-to-entry and return-to-task-end
 
 Graph AICPU runs with `--kernel-profile` now also save `aicpu_samples.json`
-beside the CSVs. Version 2 retains each measured round/node/worker's steady-clock
-timestamps plus entry/return `CNTVCT_EL0` values and `CNTFRQ_EL0` frequency.
+beside the CSVs. Version 3 records all AICPU entry/body/return timestamps using
+`clock_gettime(CLOCK_MONOTONIC_RAW)`, matching the device raw-clock anchor in
+`dev_start.log`. Host profiling continues to use `steady_clock`.
 Host call bounds, Event elapsed time and warmup metadata identify formal rounds.
 Sample serialization and file writes happen after measured calls.
 Reusing an output directory replaces this file; runs without raw sample export
 remove a previous `aicpu_samples.json` to avoid analyzing stale timing samples.
 Rebuild the NPU binding and AICPU package, reinstall the package and restart the
-NPU process. Get entry symbols are now `ExecutionV5`, guarding the expanded
-profile ABI against an older installed kernel. Counter reads run only with
-profiling enabled. The local sample file contains absolute timing values;
+NPU process. Get entry symbols are now `ExecutionV6`, guarding the clock source
+and profile layout against an older installed kernel. Raw-clock reads run only
+with profiling enabled. The local sample file contains absolute timing values;
 share the bounded summary, not this raw file.
 
-For the six-worker empty-Get experiment keep the CPU service unchanged and run:
+Version-2 samples with mismatched CNTFRQ/HWTS frequencies cannot be repaired by
+rescaling their counter values: the clock origins are not known to coincide.
+Keep the old `results/can-native-empty-entry-v2` capture and collect a new v3
+capture after rebuilding. Keep the CPU service unchanged and run:
 
 ```bash
-msprof --output=results/cann-native-empty \
+bash build.sh npu
+
+msprof --output=results/can-native-empty-entry-v3 \
   --ascendcl=on --runtime-api=on --task-time=on --aicpu=on \
-  --application="bash tests/run_remote_cpu_batch_get_perf.sh build-npu --peer 127.0.0.1:28990 --device-id 1 --backend gather_read --aicpu-workers 6 --execution graph --graph-api acl --graph-submit native --graph-get-count 1 --graph-replays 8 --request-length 32768 --table-capacity 16384 --miss-count 0 --token-bytes 656 --tokens-per-block 128 --warmup 20 --iterations 50 --kernel-profile --output-dir results/native-empty"
+  --application="bash tests/run_remote_cpu_batch_get_perf.sh build-npu --peer 127.0.0.1:28990 --device-id 1 --backend gather_read --aicpu-workers 6 --execution graph --graph-api acl --graph-submit native --graph-get-count 1 --graph-replays 8 --request-length 32768 --table-capacity 16384 --miss-count 0 --token-bytes 656 --tokens-per-block 128 --warmup 20 --iterations 50 --kernel-profile --output-dir results/native-empty-entry-v3"
 
 python3 tests/diagnostics/summarize_aicpu_gap.py \
-  --execution graph --msprof-dir results/cann-native-empty \
-  --benchmark-dir results/native-empty --last 50 --samples 5 \
-  --max-chars 60000 --output results/native-empty-gap.txt
+  --execution graph --msprof-dir results/can-native-empty-entry-v3 \
+  --benchmark-dir results/native-empty-entry-v3 --last 50 --samples 5 \
+  --max-chars 60000 --output results/native-empty-entry-v3-gap.txt
 ```
 
 Use new directories for each capture. Repeat with `--miss-count 8192` and
@@ -264,17 +270,16 @@ Read `entry_boundary` in the resulting report:
 | `stats_us.task_outside_entry` | Per-node CANN task duration minus that node's entry span, paired before aggregation. |
 | `stats_us.worker_start_skew` | Last worker entry minus first entry, independent of the trace clock. |
 | `stats_us.worker_wall_mean/max` | Individual worker entry-to-return durations, distinguishing work from worker-start skew. |
-| `clock.status=msprof_counter_aligned`, `split_available=true` | Hardware timestamps were aligned using this capture's synchronization metadata, without fitted task boundaries. |
-| `stats_us.task_begin_to_first_entry` | CANN task start to the first worker's counter entry timestamp. |
-| `stats_us.last_return_to_task_end` | Last worker's counter return timestamp to CANN task end. |
-| `stats_us.calibrated_entry_span` | Earliest counter entry to latest counter return; the two boundary gaps plus this span equal the task duration. |
-| `stats_us.counter_minus_steady_entry` | Counter span minus steady span; captures the small extra interval between the separate clock reads. |
+| `clock.status=msprof_monotonic_raw_aligned`, `split_available=true` | Version-3 raw timestamps were aligned using this capture's device/Host raw-clock anchors. |
+| `stats_us.task_begin_to_first_entry` | CANN task start to the first worker's raw-clock entry timestamp. |
+| `stats_us.last_return_to_task_end` | Last worker's raw-clock return timestamp to CANN task end. |
+| `stats_us.calibrated_entry_span` | Earliest entry to latest return; the two boundary gaps plus this span equal the task duration. |
 | `dominant_boundary` | `before_entry`, `after_return`, or `similar_within_uncertainty`. |
 | `clock.status=sync_metadata_*` | Preserve the original capture's device directory and pass its PROF root; copied JSON/CSVs alone cannot align counters. |
 | `clock.metadata_diagnostics` | Failed file pattern and match counts in the counter directory and entire capture; identifies missing, relocated or duplicate metadata without exporting paths or clock values. |
-| `clock.status=sync_counter_frequency_mismatch` | Sampled CNTFRQ does not match the capture's HWTS frequency; no split is emitted. |
+| `clock.status=sync_counter_frequency_mismatch` | Legacy v2 samples use a different counter frequency; diagnostics show both Hz values and request raw-clock samples. Rebuild and recapture v3. |
 | `clock.status=calibration_inconsistent_with_task_containment` | Converted entry/return timestamps fall outside their associated task; no split is emitted. |
-| `clock.status=counter_and_steady_durations_disagree` | Hardware and steady spans disagree beyond the clock-read tolerance; no split is emitted. |
+| `clock.status=counter_and_steady_durations_disagree` | Legacy v2 hardware and steady spans disagree beyond the clock-read tolerance; no split is emitted. |
 | `clock.status=bounds_only_no_independent_calibration` | Only conditional bounds are available; no measured before/after point split. |
 | `clock.task_begin_to_first_entry_mean_bounds_us` | Possible mean time before user entry, under a common unit-rate clock-offset assumption. |
 | `clock.last_return_to_task_end_mean_bounds_us` | Possible mean time after user return, under the same unknown offset. |
@@ -289,26 +294,26 @@ of the raw samples. Missing brackets, changed run cadence or inconsistent Event
 windows cause an explicit association failure. Older reports without the sample
 file remain supported but cannot produce paired boundary analysis.
 
-New runs align counters automatically using `dev_start.log*`, `host_start.log*`,
+New runs align raw timestamps automatically using `dev_start.log*`, `host_start.log*`,
 `info.json*` and `start_info*` in the original capture's device directory. Keep
 these files locally and pass the capture root to `--msprof-dir`; no extra
 benchmark flag or hand-written `--clock-map` is needed. Conversion follows
 [msprof InfoConfReader](https://github.com/Ascend/msprof/blob/master/analysis/common_func/info_conf_reader.py):
-device counter delta / HWTS frequency, plus the synchronized Host monotonic-raw
-anchor and the export's local-time offset. `cntvct_diff` is accounted for using
+device raw nanoseconds minus the device `clock_monotonic_raw` anchor, plus the
+synchronized Host monotonic-raw anchor and export local-time offset. The HWTS
+counter and its frequency are not used for v3 timestamps. `cntvct_diff` is accounted for using
 the Host CPU frequency. Decimal arithmetic preserves sub-microsecond differences
 when export timestamps are large. Multiple device directories require an
 unambiguous device identity in the selected trace tasks.
 Files ending in `.done` are completion markers and are excluded from metadata
 discovery and match counts; they do not replace the corresponding log or JSON.
 
-The sampled counter frequency must match the capture. Converted boundaries must
-contain the user entry/return within each task, and their span must agree with
-the independent steady-clock span. The 1 us boundary tolerance covers trace
+Converted boundaries must contain user entry/return within each associated task;
+their durations must reconcile with the original raw-clock spans. The 1 us boundary tolerance covers trace
 quantization; it is not a measured hardware synchronization error. No raw clock
 anchor, absolute timestamp or source path is emitted in the bounded report.
 
-Version-1 samples remain readable. Their containment bounds do **not** calibrate
+Version-1 and version-2 samples remain readable. Version-1 containment bounds do **not** calibrate
 the clock: the coupled ranges share an unknown offset, and their midpoint is
 never reported as a measurement.
 
@@ -331,7 +336,8 @@ Unknown CANN clock-sync formats are rejected rather than guessed.
 The extractor interpolates these anchors and checks task containment. It then
 emits `stats_us.task_begin_to_first_entry`, `last_return_to_task_end`, their sum,
 and calibration uncertainty. This manual mapping is for old steady-clock-only
-samples; current version-2 samples normally use the automatic counter path.
+samples; current version-3 samples use the automatic monotonic-raw path. A manual
+mapping for v3 must name `aicpu_monotonic_raw_ns` as its source clock.
 
 AICPU CSV rows with reused Task IDs can now be selected by ID plus a unique
 exported timestamp contained in the corresponding selected task. Rows without

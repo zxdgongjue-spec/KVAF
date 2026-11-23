@@ -76,17 +76,16 @@ class BatchGetCsv:
         rounds = []
         for ordinal, (profile, bounds, elapsed) in enumerate(zip(profiles, host_bounds, event_ms), 1):
             nodes = profile if profile and isinstance(profile[0], list) else [profile]
+            if any(p.get("device_clock") != "aicpu_monotonic_raw_ns" for node in nodes for p in node):
+                raise AssertionError("AICPU raw-clock profiling requires the rebuilt NPU binding and ExecutionV6 kernel")
             rounds.append(dict(round=ordinal, host_begin_ns=bounds[0], host_end_ns=bounds[1],
                 event_elapsed_ns=round(elapsed * self.graph_get_count * 1e6), nodes=[dict(
                     node=node, workers=[dict(worker=worker, **{field: int(p[field]) for field in (
-                        "device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns")},
-                        **{field: int(p.get(field, 0)) for field in (
-                            "device_entry_syscnt", "device_return_syscnt", "device_syscnt_frequency")})
+                        "device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns")})
                         for worker, p in enumerate(workers)]) for node, workers in enumerate(nodes)]))
-        self.graph_samples = dict(format="kvaf-aicpu-samples-v2", execution="graph",
+        self.graph_samples = dict(format="kvaf-aicpu-samples-v3", execution="graph",
             backend=self.config["backend"], graph_api=self.graph_api, graph_submit=self.graph_submit,
-            device_clock="aicpu_steady_ns", host_clock="python_perf_counter_ns",
-            boundary_clock="aarch64_cntvct",
+            device_clock="aicpu_monotonic_raw_ns", host_clock="python_perf_counter_ns",
             gets_per_replay=self.graph_get_count, **self.graph_sample_metadata,
             timed_prefix_replays=(self.graph_sample_metadata["warmup"] + 1
                                   if self.graph_submit == "native" else 0), rounds=rounds)

@@ -3,6 +3,9 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#if defined(KVAF_AICPU_PROFILE_MONOTONIC_RAW)
+#include <time.h>
+#endif
 
 namespace kvaf {
 
@@ -27,8 +30,6 @@ struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t scatter_ns{}, output_cache_ns{};
   std::uint64_t scatter_copies{};
   std::uint64_t entry_ns{}, return_ns{};
-  // Raw hardware clock for alignment with msprof's task timestamps.
-  std::uint64_t entry_syscnt{}, return_syscnt{}, syscnt_frequency{};
 };
 
 // Caller-owned result, valid after a successful synchronous AICPU BatchGet.
@@ -62,8 +63,15 @@ struct BatchGetHostTiming {
 };
 
 inline std::uint64_t BatchGetProfileNowNs() {
+#if defined(KVAF_AICPU_PROFILE_MONOTONIC_RAW)
+  // Match dev_start.log's clock_monotonic_raw anchor, independently of HWTS.
+  timespec timestamp{};
+  if (clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) != 0) return 0;
+  return static_cast<std::uint64_t>(timestamp.tv_sec) * UINT64_C(1000000000) + timestamp.tv_nsec;
+#else
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
 }
 
 // No clock reads when profiling is disabled. Nested durations are inclusive.

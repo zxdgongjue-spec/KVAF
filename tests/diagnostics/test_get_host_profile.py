@@ -231,12 +231,10 @@ class GetHostProfileTest(unittest.TestCase):
             report = BatchGetCsv(args)
             nodes = [[dict(device_entry_ns=base, device_start_ns=base + 1000,
                            device_finish_ns=base + 9000, device_return_ns=base + 10000,
-                           device_entry_syscnt=base // 20, device_return_syscnt=(base + 10000) // 20,
-                           device_syscnt_frequency=50000000),
+                           device_clock="aicpu_monotonic_raw_ns"),
                       dict(device_entry_ns=base + 500, device_start_ns=base + 1500,
                            device_finish_ns=base + 8000, device_return_ns=base + 9000,
-                           device_entry_syscnt=(base + 500) // 20, device_return_syscnt=(base + 9000) // 20,
-                           device_syscnt_frequency=50000000)]
+                           device_clock="aicpu_monotonic_raw_ns")]
                      for base in (100000, 200000)]
             report.add_graph_samples([nodes], [(1000, 300000)], [.1])
             report.write()
@@ -245,11 +243,13 @@ class GetHostProfileTest(unittest.TestCase):
             self.assertEqual(data["iterations"], 1)
             self.assertEqual(data["rounds"][0]["event_elapsed_ns"], 200000)
             self.assertEqual(data["rounds"][0]["nodes"][1]["workers"][1]["device_entry_ns"], 200500)
-            self.assertEqual(data["device_clock"], "aicpu_steady_ns")
-            self.assertEqual(data["format"], "kvaf-aicpu-samples-v2")
-            self.assertEqual(data["boundary_clock"], "aarch64_cntvct")
-            self.assertEqual(data["rounds"][0]["nodes"][0]["workers"][0]["device_entry_syscnt"], 5000)
+            self.assertEqual(data["device_clock"], "aicpu_monotonic_raw_ns")
+            self.assertEqual(data["format"], "kvaf-aicpu-samples-v3")
+            self.assertNotIn("device_entry_syscnt", data["rounds"][0]["nodes"][0]["workers"][0])
             self.assertNotIn("graph_lease", json.dumps(data))
+            nodes[0][0].pop("device_clock")
+            with self.assertRaisesRegex(AssertionError, "rebuilt NPU binding"):
+                report.add_graph_samples([nodes], [(1000, 300000)], [.1])
 
 
 if __name__ == "__main__":
