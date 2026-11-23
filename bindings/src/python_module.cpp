@@ -1,4 +1,5 @@
 #include "execution_config_python.h"
+#include "connector_python.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -17,9 +18,11 @@
 #include "meta_manager.h"
 #include "runtime.h"
 
-#if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_AICPU_URMA)
+#if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_AICPU_URMA) || defined(KVAF_ENABLE_CPU_OFFLOAD) || defined(KVAF_ENABLE_NPU_PULL)
 #include "acl_graph_python.h"
 #include "npu_python_runtime.h"
+#include "hbm_read_python.h"
+#include "remote_offload_python.h"
 #endif
 
 namespace py = pybind11;
@@ -343,6 +346,7 @@ class PythonRuntime final {
 
 PYBIND11_MODULE(_kvaf, m) {
   kvaf::python_binding::BindExecutionConfigs(m);
+  kvaf::BindConnectorTypes(m);
   m.doc() = "Synchronous KVAF Runtime Python bindings";
 
   py::class_<kvaf::AccessTableHandle>(m, "AccessTable")
@@ -391,8 +395,14 @@ PYBIND11_MODULE(_kvaf, m) {
   m.def_submodule("meta_manager");
   m.def_submodule("access_operator");
 
-#if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_AICPU_URMA)
+#if defined(KVAF_ENABLE_AIV_BATCH_GET) || defined(KVAF_ENABLE_AICPU_URMA) || defined(KVAF_ENABLE_CPU_OFFLOAD) || defined(KVAF_ENABLE_NPU_PULL)
   kvaf::BindNpuPythonRuntime(m);
   kvaf::BindAclGraph(m);
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  kvaf::BindCpuPullHbmSource(m);
+#endif
+#if defined(KVAF_ENABLE_CPU_OFFLOAD) || defined(KVAF_ENABLE_NPU_PULL)
+  kvaf::BindNpuPullHbmSource(m);
+#endif
 #endif
 }

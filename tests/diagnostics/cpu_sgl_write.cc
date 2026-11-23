@@ -164,8 +164,10 @@ int main() {
   assert(!ValidateExecution(TransportMode::Urma,
       GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::CpuSglWrite}).ok());
   execution::Request request;
+  request.op = execution::Op::PrepareCpuPullRegion;
   request.algorithm = config.algorithm;
   execution::Request decoded;
   assert(execution::Decode(execution::Encode(request), &decoded).ok());
+  assert(decoded.op == request.op);
   assert(decoded.algorithm == config.algorithm);
 }

@@ -145,7 +145,7 @@ Status Decode(const std::vector<std::uint8_t>& bytes, Request* out) {
   v.payload = r.Blob();
   if (!r.Done() || capacity > UINT32_MAX || token_bytes > UINT32_MAX || cpu_threads > UINT32_MAX ||
       put > 1 || candidate > UINT32_MAX || workers > UINT32_MAX || jettys > UINT32_MAX ||
-      v.op > Op::Fence || v.mode > TransportMode::UrmaAndUbmem || v.transport > Transport::Ubmem ||
+      v.op > Op::PrepareCpuPullRegion || v.mode > TransportMode::UrmaAndUbmem || v.transport > Transport::Ubmem ||
       v.executor > Executor::Aicpu || v.algorithm > GetAlgorithm::CpuSglWrite)
     return Status::InvalidArgument("malformed execution request");
   *out = std::move(v);

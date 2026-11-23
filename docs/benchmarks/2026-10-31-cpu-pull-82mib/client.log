@@ -1,0 +1,31 @@
+python tests/python/bench_remote_cpu_offload.py --cpu 127.0.0.1:28999 --device-a 6 --device-b 7  --blocks 1024 --block-bytes 83968 --warmup 10 --iterations 100
+[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERED physical_device=7 source=hccl_clos_pg_0 eid=00000000003f030000100000df00eb00
+[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERED physical_device=7 source=asdrv_pair_info_device_eid eid=000000000000020000100000df00e100
+[KVAF_AIV] DIRECT_HCCP_TRANSPORT_API_READY backend=RaCtx_no_HCOMM
+[KVAF_AIV] DIRECT_HCCP_SESSION_API_READY ra_library=libra.so device_ra_policy=ra_init_ret_328002_reuse
+[KVAF_AIV] DIRECT_HCCP_SESSION_RA_OWNED role=device_aiv physical=7 hdc_type=18
+[KVAF_NPU] HBM_EXPORT_RANGE input_base=0x12004da00000 input_bytes=86051840 registered_base=0x12004da00000 registered_bytes=86051840 input_offset=0 exported_base=0x12004da00000 exported_bytes=86051840 source_base=0x12004da00000
+[KVAF_NPU] CPU_PULL_REFERENCE commit=8bc5a2a protocol=2 jettys=4 physical=7 npu_eid=00000000003f030000100000df00eb00 cpu_eid=00000000003f020000100000df080b00 hbm_flags=0x29c1 psn=1
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800000 peer_tp=0x820000000800027 tx_psn=0x1 rx_psn=0x2
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388608
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800000 peer_tp=0x820000000800027 tx_psn=0x1 rx_psn=0x2
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388608
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800000 peer_tp=0x820000000800027 tx_psn=0x1 rx_psn=0x2
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388608
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800000 peer_tp=0x820000000800027 tx_psn=0x1 rx_psn=0x2
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388608
+[KVAF_NPU] REMOTE_SOURCE_REJECTED npu_eid=00000000003f030000100000df00eb00 detail=Remote Offload: Probe rejected; result=4 state=5
+[KVAF_AIV] DIRECT_HCCP_TRANSPORT_API_READY backend=RaCtx_no_HCOMM
+[KVAF_NPU] HBM_EXPORT_RANGE input_base=0x12004da00000 input_bytes=86051840 registered_base=0x12004da00000 registered_bytes=86051840 input_offset=0 exported_base=0x12004da00000 exported_bytes=86051840 source_base=0x12004da00000
+[KVAF_NPU] CPU_PULL_REFERENCE commit=8bc5a2a protocol=2 jettys=4 physical=7 npu_eid=000000000000020000100000df00e100 cpu_eid=00000000003f020000100000df080b00 hbm_flags=0x29c1 psn=1
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800029 peer_tp=0x820000000800028 tx_psn=0x1 rx_psn=0x3
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388649
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800029 peer_tp=0x820000000800028 tx_psn=0x1 rx_psn=0x3
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388649
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800029 peer_tp=0x820000000800028 tx_psn=0x1 rx_psn=0x3
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388649
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_ATTEMPT role=cpu_pull local_tp=0x820000000800029 peer_tp=0x820000000800028 tx_psn=0x1 rx_psn=0x3
+[KVAF_AIV] PEER_LINK_JETTY_IMPORT_READY role=cpu_pull tpn=8388649
+[KVAF_NPU] REMOTE_SOURCE_READY region=2 source=16033127080588242434 device=7 npu_eid=000000000000020000100000df00e100 probe=scratch_checksum_pass
+CPU_PULL_BENCH_READY cpu_candidate=0 b_eid=000000000000020000100000df00e100 blocks=1024 block_bytes=83968
+CPU_PULL_BENCH_PASS metric=python_offload_from_to_commit iterations=100 mean_us=2607.1 p50_us=2580.7 p95_us=2627.6 p99_us=3662.3 effective_GBps=32.981 cpu_checksum_included=0 registration_and_producer_and_free_excluded=1 verification_mean_us=150477.4 changing_inputs=1 verification=every_round_checksum

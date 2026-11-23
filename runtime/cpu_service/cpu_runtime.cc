@@ -1,5 +1,6 @@
 #include "cpu_service/backends/cpu_backends.h"
 #include "memory/execution_cpu_backend.h"
+#include "remote_pull_service.h"
 #include <mutex>
 
 #include <sys/socket.h>
@@ -40,11 +41,17 @@ struct CpuRuntime::Impl {
   explicit Impl(CpuRuntimeOptions value)
       : options(std::move(value)),
         ubmem(options, next_session),
-        execution(CreateExecutionService(options)) {}
+        execution(CreateExecutionService(options)),
+        pull([this](std::uint64_t id, remote_pull::RegionInfo* info) {
+          return execution->DescribeCpuPullRegion(id, info);
+        }, [this](const remote_pull::RegionInfo& info) {
+          return execution->AcquireCpuPullBackend(info);
+        }) {}
   CpuRuntimeOptions options;
   std::uint64_t next_session{1};
   UbmemCpuBackend ubmem;
   std::unique_ptr<execution::CacheRegionService> execution;
+  remote_pull::Service pull;
   std::recursive_mutex legacy_mutex;
 #ifdef KVAF_CPU_HAS_URMA
   UrmaCpuBackend urma;
@@ -87,8 +94,13 @@ Status CpuRuntime::ServeConnection(int fd) {
   if (!impl_) return Status::NotInitialized("CpuRuntime not initialized");
   if (fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
   peer::MessageHeader header{};
-  if (!Read(fd, &header, sizeof(header)) || header.magic != peer::kProtocolMagic ||
-      header.version != peer::kProtocolVersion)
+  if (!Read(fd, &header, sizeof(header)))
+    return Status::InvalidArgument("incomplete CPU control header");
+  if (header.magic == remote_pull::kMagic) {
+    impl_->pull.Serve(fd, header);
+    return Status::OK();
+  }
+  if (header.magic != peer::kProtocolMagic || header.version != peer::kProtocolVersion)
     return Status::InvalidArgument("invalid CPU control header");
   if (header.command == execution::kCommand) {
     if (header.bytes < sizeof(header) || header.bytes > 16384)
@@ -158,7 +170,11 @@ Status CpuRuntime::ServeConnection(int fd) {
 Status CpuRuntime::Shutdown() {
   std::unique_lock<std::shared_mutex> life(lifecycle_);
   if (!impl_) return Status::OK();
-  auto status = impl_->execution->Shutdown();
+  // Keep the service reachable for Query/Cancel/Detach after a failed shutdown.
+  // Registered sources retain region leases even when they are idle.
+  auto status = impl_->pull.Shutdown();
+  if (!status.ok()) return status;
+  status = impl_->execution->Shutdown();
   if (!status.ok()) return status;
   status = impl_->ubmem.Shutdown();
   if (!status.ok()) return status;

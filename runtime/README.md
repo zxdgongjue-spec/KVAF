@@ -4,7 +4,7 @@
 
 公共 C++ 头文件继续放在 `include/`，包含方式与构建 target 不变。实现按职责组织：
 
-- `src/`：`RuntimeCore`、`NpuRuntime` 入口和 NPU 配置。
+- `src/`：`RuntimeCore`、`NpuRuntime` 入口和 NPU 配置，以及 CPU Pull executor、源注册、READ 控制服务与 NPU raw READ 实现。
 - `execution/`：执行配置解析、Dispatcher 与执行资源管理；驻留上下文及绑定的公共定义仍在 `include/`。
 - `memory/`：缓存池服务、池分配与 session 工厂、CPU DDR 注册复用、UBMEM allocator。
 - `peer/`：NPU/CPU 链路和 execution 控制协议。
@@ -19,6 +19,7 @@
 KVAF Runtime 是对外的 KV 控制面入口。它不处理 Prefix Key 或
 Forward 语义；它只拥有内部 DDR 的生命周期，编排 MetaManager 与
 AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数据面。
+独立 NPU Pull 管理 HBM 注册及连接，不要求创建 DDR 缓存池。
 
 ## 已实现能力
 
@@ -35,8 +36,17 @@ AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数
   Python 默认不在 KVAF 内同步；同一 stream 的后续操作自然按序执行。
 - `BatchFree`：将删除请求交给 MetaManager；仍被 AccessTable 持有的 Key
   会返回 `kBusy`。
+- `BatchCpuPull` / 显式 `PreparePut`：独立 CPU Pull executor 借用同一个 DDR 池，
+  与普通 Put 共用写事务和恢复入口的互斥规则；不会占用 Get 队列。
+- `NpuRuntime::Initialize()` 只初始化基础状态；`InitializeDdr()` 初始化缓存池。
+  `ListenHbm` / `BatchGetRawAddr` 可在无 CPU、无 DDR 的 Runtime 上使用，
+  正常 raw 异步输入和 stream 由应用保活并同步；关闭 source/runtime 前由应用销毁全部捕获图。
 
-Get 支持异步提交和显式 Drain；每个图节点使用独立租约，同一 Runtime 可在同一
+CPU Pull 的目的 MR 通过 `GetOffloadRegion()` 首次准备并独立授权；源注册和建链
+显式进行。具体合同见 [CPU Pull](../docs/cpu_pull_offload_usage.md)、
+[NPU raw READ](../docs/hbm_raw_addr_read.md) 与 [建链流程](../docs/connection_handshake_flows.md)。
+
+普通缓存 Get 支持异步提交和显式 Drain；每个图节点使用独立租约，同一 Runtime 可在同一
 stream 上串行回放多张图，每张图可包含多个 Get。图对象生命周期由上层管理，
 BatchPut 图模式未接入；不支持跨 stream 并发回放。
 
@@ -59,10 +69,12 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
+统一构建默认使用 `RelWithDebInfo`，可通过 `--build-type` 覆盖。
+
 CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
-CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
+URMA DDR 区域支持 `default`、`thp`、`hugetlb-2m` 和 `hugetlb-1g`，默认使用 `thp`。
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -73,12 +85,22 @@ CPU DDR region 支持两种页分配模式；未指定时默认使用 `thp`：
 # 保留原始普通内存行为：4 KiB 对齐，操作系统仍可能自行使用 THP。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
+
+# 显式使用 2 MiB 或 1 GiB HugeTLB 页。
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
 ```
+
+显式 HugeTLB 模式需要在目标 NUMA 节点预留对应大小的页。实际映射按页大小向上取整，
+客户端可用容量和 URMA 注册长度仍为请求长度。页池不足时申请失败。
+`DDR_ALLOCATED` 日志记录 `page_mode` 和 `backing_bytes`。`urma+ubmem` 混合模式的共享 DDR 由 UBmem 分配器提供。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如
 `numactl --cpunodebind=N --membind=N ...`。Gather 线程继承外部 CPU 亲和性，在允许的
-CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。`REGION_ALLOCATED` 日志会记录
-`page_mode`。默认 THP 模式还应通过 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
+CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范围。默认 THP 模式还应通过
+`/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
 默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
@@ -103,12 +125,16 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 已知设备名时可设置 `peer_ub_device="udmac0d1e2"`，固定 CPU 侧候选设备。
 Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写入。
 
-`link_to` 必须在 `initialize` 前调用。URMA 初始化从 HCCL root-info 读取当前物理卡的
+`link_to` 必须在 `initialize_ddr(ddr_bytes, slot_size)` 或带 DDR 参数的 `initialize` 前调用；
+无参数 `initialize()` 只初始化基础设备，可用于无 DDR 的 NPU Pull。
+显式调用 `initialize_ddr()` 前须先完成无参数 `initialize()`；带 DDR 参数的兼容入口会自动完成基础初始化。
+URMA 初始化从 HCCL root-info 读取当前物理卡的
 CLOS PG EID，并尝试追加 `/proc/asdrv_ub/pair_info` 的候选；未指定 EID 时采用首项。
 初始化建立 CacheRegion 和元数据；具体 transport、MR、队列、Gather 工作区及 AICPU
 包在首次使用或显式 warmup 时准备，初始化成功不代表数据面已通过 RMA 验证。
-未建立 CPU 服务 Link 时，`initialize` 返回 `InvalidState`。
-`batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，构造时必须提供；
+未建立 CPU 服务 Link 时，DDR 初始化返回 `InvalidState`。
+`batch_get_token_bytes` 和 `batch_get_tokens_per_block` 可同时省略，用于独立 Pull；
+普通缓存 Get 在 provider 首次准备时要求有效布局。显式布局必须同时为正数，
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
 为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；
 URMA AIV Jetty 数默认 2、URMA AIV Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
@@ -227,7 +253,8 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 CPU service 须预先启动。替换 `--backend` 及对应的 `--aiv-cores` / `--aicpu-workers` 可测 UBMEM、Gather、Scatter，
 具体参数及计时范围见[统一 Get 性能测试](../docs/batch_get_performance.md)。
-独立功能测试及其 CMake 注册已移除，数据预检和输出校验继续在性能计时外执行。
+普通 Get 的数据预检和输出校验随性能入口执行，位于性能计时外；Pull 功能和
+Host 故障注入验证见 [诊断入口](../tests/diagnostics/README.md)。
 默认关闭 kernel profiling；上例显式使用 `--kernel-profile` 开启设备打点与报告读取，
 测无 profiling 的端到端性能时去掉该参数。`--multi-graph-check` 可在计时前验证
 多节点报告隔离、自动收集/捕获、两条 stream 上由调用方串行执行的图与 eager 共用输出。

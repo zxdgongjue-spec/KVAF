@@ -1,0 +1,245 @@
+"""Portable identity contracts; NPU-specific cases require a usable CANN device."""
+import pickle
+import unittest
+
+import numpy as np
+import kvaf
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+
+def restored(cls, state):
+    # Exercise the same reconstruction entrypoint used by Connector pickle IPC.
+    obj = cls.__new__(cls)
+    obj.__setstate__(state)
+    return obj
+
+
+class NpuTensorLayout:
+    """Host storage with NPU metadata for layout checks only; never executes DMA."""
+    class Device:
+        def __init__(self, index):
+            self.index = index
+
+        def __str__(self):
+            return f"npu:{self.index}"
+
+    def __init__(self, shape=(2,), dtype="torch.int64", contiguous=True, device=0):
+        self.storage = np.zeros(shape, dtype=np.int64)
+        self.shape = shape
+        self.dtype = dtype
+        self.device = self.Device(device)
+        self.contiguous = contiguous
+
+    def data_ptr(self):
+        return self.storage.ctypes.data
+
+    def numel(self):
+        return self.storage.size
+
+    def element_size(self):
+        return 8
+
+    def is_contiguous(self):
+        return self.contiguous
+
+
+class ConnectorBindings(unittest.TestCase):
+    @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
+    def test_base_and_ddr_initialization_are_independent(self):
+        runtime = kvaf.NpuRuntime()
+        self.assertFalse(runtime.initialized)
+        self.assertFalse(runtime.ddr_initialized)
+        with self.assertRaisesRegex(RuntimeError, "initialize base device before DDR"):
+            runtime.initialize_ddr(4096, 4096)
+        self.assertIsNone(runtime.initialize())
+        self.assertIsNone(runtime.initialize())
+        self.assertTrue(runtime.initialized)
+        self.assertFalse(runtime.ddr_initialized)
+        with self.assertRaisesRegex(ValueError, "LinkTo before Initialize"):
+            runtime.initialize(ddr_bytes=4096, slot_size=4096)
+        with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+            runtime.prepare_put([0], [8])
+        with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+            _ = runtime.remote_region
+        with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+            runtime.batch_put([0], None, [0], [8])
+        self.assertIsNone(runtime.shutdown_ddr())
+        self.assertTrue(runtime.initialized)
+        self.assertFalse(runtime.ddr_initialized)
+        self.assertIsNone(runtime.shutdown())
+        self.assertFalse(runtime.initialized)
+        self.assertIsNone(runtime.shutdown())
+
+    def test_descriptors_and_ready_survive_connector_ipc(self):
+        cpu = restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096))
+        npu = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        for source in (cpu, npu):
+            ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 78))
+            copy = pickle.loads(pickle.dumps(ready))
+            self.assertEqual(copy.sequence, 7)
+            self.assertEqual(copy.mr_id, 78)
+            self.assertEqual(type(copy.source), type(source))
+            self.assertEqual(copy.source.source_id, source.source_id)
+            for name in ("readable_ranges", "mr_bytes", "mr_count", "source_bytes"):
+                self.assertFalse(hasattr(copy.source, name))
+            with self.assertRaises(AttributeError):
+                copy.sequence = 8
+            with self.assertRaises(AttributeError):
+                copy.mr_id = 1
+        self.assertEqual(pickle.loads(pickle.dumps(cpu)).region_epoch, 99)
+        self.assertEqual(pickle.loads(pickle.dumps(cpu)).mr_length, 4096)
+        with self.assertRaises(AttributeError):
+            cpu.mr_length = 8
+        self.assertEqual(pickle.loads(pickle.dumps(npu)).source_epoch, 88)
+        self.assertFalse(hasattr(npu, "mr_length"))
+
+    def test_ready_size_does_not_grow_with_registered_mrs(self):
+        for source in (restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096)),
+                       restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))):
+            lengths = []
+            for mr in (1, 78, 4096):
+                ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, mr))
+                wire = pickle.dumps(ready)
+                self.assertEqual(pickle.loads(wire).mr_id, mr)
+                lengths.append(len(wire))
+            # Only the integer encoding of mr_id may grow, never an MR list.
+            self.assertLessEqual(max(lengths) - min(lengths), 2)
+
+    def test_old_identity_formats_are_rejected(self):
+        for cls, states in ((kvaf.CpuPullSourceDesc, ((12, 4096, 2, 99), (2, 4096, 2, 99, [4096]))),
+                            (kvaf.NpuPullSourceDesc, ((13, 8192, 88), (2, 8192, 88), (13, 8192, 88, [8192])))):
+            for state in states:
+                with self.subTest(cls=cls, state=state):
+                    with self.assertRaisesRegex(ValueError, "version"):
+                        restored(cls, state)
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        for state in ((source, 7), (source, 7, 1)):
+            with self.assertRaisesRegex(ValueError, "version"):
+                restored(kvaf.ReadyToken, state)
+
+    @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
+    def test_only_current_pull_interfaces_are_exported(self):
+        for name in ("HbmSource", "HbmReadSource", "OffloadRuntime", "CpuPullSourceHandle", "CpuPullTask"):
+            self.assertFalse(hasattr(kvaf, name))
+        self.assertFalse(hasattr(kvaf.PutHandle, "task"))
+        self.assertTrue(hasattr(kvaf.PutHandle, "submitted"))
+        for name in ("offload", "offload_from", "resolve_offload", "release_offload_source"):
+            self.assertFalse(hasattr(kvaf.NpuRuntime, name))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "batch_cpu_pull"))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "resolve_cpu_pull"))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "listen_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuRuntime, "attach_cpu_source"))
+        self.assertFalse(hasattr(kvaf.NpuRuntime, "attach_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuRuntime, "detach_hbm"))
+        self.assertFalse(hasattr(kvaf.NpuPullHbmSource, "listen"))
+        with self.assertRaises(TypeError):
+            kvaf.NpuPullHbmSource(0).register(None)  # receiver is mandatory
+        for cls in (kvaf.CpuPullHbmSource, kvaf.NpuPullHbmSource):
+            source = cls(0)
+            with self.assertRaises(TypeError):
+                source.ready([0], [8])
+            with self.assertRaises(TypeError):
+                source.release_batch()
+            with self.assertRaises(TypeError):
+                source.cancel_batch()
+        with self.assertRaises(TypeError):
+            kvaf.NpuRuntime().batch_get_raw_addr(1, {}, None, [0])
+
+    @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
+    def test_raw_pull_uses_application_lifecycle_without_host_leases(self):
+        for name in ("drain_raw_addr", "raw_inflight", "begin_raw_graph", "end_raw_graph"):
+            self.assertFalse(hasattr(kvaf.NpuRuntime, name))
+        # Raw lifecycle changes must not remove ordinary Get graph resources.
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "graph_resources"))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "drain_get"))
+        options = kvaf.NpuPullOptions(max_output_bindings=7)
+        self.assertEqual(options.max_output_bindings, 7)
+        self.assertFalse(hasattr(options, "max_host_inflight"))
+        with self.assertRaises(TypeError):
+            kvaf.NpuPullOptions(max_host_inflight=7)
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 1))
+        with self.assertRaises(TypeError):
+            kvaf.NpuRuntime().batch_get_raw_addr(ready, None, None, None, None, graph_lease=7)
+
+    def call_with_arrays(self, arrays):
+        runtime = kvaf.NpuRuntime()
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 1))
+        runtime.batch_get_raw_addr(ready, *arrays, output=None)
+
+    @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
+    def test_recovery_and_cancel_accept_connector_identity_objects(self):
+        runtime = kvaf.NpuRuntime()
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 1))
+        # Typed arguments reach Runtime without an application-local link ID.
+        with self.assertRaisesRegex(RuntimeError, "NPU Pull is not initialized"):
+            runtime.resolve_raw_addr(ready=ready)
+        with self.assertRaisesRegex(RuntimeError, "NPU Pull is not initialized"):
+            runtime.cancel_raw_addr(ready=ready)
+        for method in (runtime.resolve_raw_addr, runtime.cancel_raw_addr):
+            with self.assertRaises(TypeError):
+                method(1)
+
+    @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
+    def test_cpu_pull_lengths_remain_batch_put_compatible(self):
+        runtime = kvaf.NpuRuntime()
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096)), 1, 1))
+        accepted = [[8, 8], (8, 8), np.array([8, 8], dtype=np.uint64),
+                    np.array([8, 8], dtype=np.int64), np.arange(4, dtype=np.uint64)[::2] + 1]
+        if torch is not None:
+            accepted.append(torch.tensor([8, 8], dtype=torch.int64, device="cpu"))
+        for value in accepted:
+            with self.subTest(value=repr(value)):
+                with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+                    runtime.prepare_put([1, 2], value)
+                with self.assertRaisesRegex(RuntimeError, "initialize DDR before CPU Pull"):
+                    runtime.batch_cpu_pull([1, 2], ready, [0, 64], value, timeout=0)
+
+    @unittest.skipUnless(hasattr(kvaf, "CpuPullHbmSource"), "CPU Offload binding not built")
+    def test_batch_cpu_pull_requires_ready_instead_of_local_tensor(self):
+        runtime = kvaf.NpuRuntime()
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", restored(kvaf.CpuPullSourceDesc, ("kvaf.cpu-source.v2", 12, 2, 99, 4096)), 1, 1))
+        with self.assertRaises(TypeError):
+            runtime.batch_cpu_pull([0], NpuTensorLayout(), [0], [8])
+        with self.assertRaises(TypeError):
+            runtime.batch_cpu_pull([0], ready, [0], [8], stream=None)
+        with self.assertRaisesRegex(RuntimeError, "initialize DDR before CPU Pull"):
+            runtime.batch_cpu_pull([0], ready, [0], [8], profile=True)
+        with self.assertRaisesRegex(RuntimeError, "DDR is not initialized"):
+            runtime.resolve_cpu_pull(timeout=0)
+
+    @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
+    def test_raw_arrays_require_npu_layout(self):
+        valid = NpuTensorLayout()
+        rejected = [[0, 8], np.array([0, 8], dtype=np.uint64),
+                    NpuTensorLayout(dtype="torch.float64"), NpuTensorLayout(shape=(1, 2)),
+                    NpuTensorLayout(contiguous=False), NpuTensorLayout(device=1),
+                    NpuTensorLayout(shape=(0,))]
+        if torch is not None:
+            rejected.append(torch.tensor([0, 8], dtype=torch.int64, device="cpu"))
+        for position, name in enumerate(("src_offsets", "dst_offsets", "lengths")):
+            for value in rejected:
+                arrays = [valid, valid, valid]
+                arrays[position] = value
+                with self.subTest(array=name, value=repr(value)):
+                    with self.assertRaisesRegex((ValueError, TypeError), name):
+                        self.call_with_arrays(arrays)
+        with self.assertRaisesRegex(TypeError, "output"):
+            self.call_with_arrays([valid, valid, valid])
+
+    @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
+    def test_raw_arrays_require_equal_bounded_counts(self):
+        for arrays in ((NpuTensorLayout(), NpuTensorLayout(shape=(1,)), NpuTensorLayout()),
+                       (NpuTensorLayout(shape=(4097,)),) * 3):
+            with self.assertRaisesRegex(ValueError, "equal lengths"):
+                self.call_with_arrays(arrays)
+
+
+if __name__ == "__main__":
+    unittest.main()

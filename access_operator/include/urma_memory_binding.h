@@ -18,6 +18,7 @@ struct UrmaRemoteMemoryDesc {
   std::uint64_t registered_address{}, registered_bytes{};
   std::uint32_t token_id{}, token_value{}, key_bytes{};
   std::array<std::uint8_t, 16> eid{};
+  std::array<std::uint8_t, 16> wqe_eid{};
   std::array<std::uint8_t, 256> key{};
   std::uint32_t wqe_token_id() const { return token_id >> 8U; }
   bool valid() const {
