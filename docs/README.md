@@ -16,6 +16,8 @@ vLLM/模型框架适配见[两个 Get 与普通算子混合捕获的示例](cach
 
 其他文档按主题补充：
 
+- [CPU Pull 构建与验证](cpu_pull_offload_usage.md)：共享 DDR 写事务、源注册、单 RPC READ、恢复和阶段性能统计。
+- [NPU raw READ](hbm_raw_addr_read.md)：独立 HBM 建链、应用保活与同步、图捕获和双机测试；[建链流程](connection_handshake_flows.md)汇总各条路径的注册及握手顺序。
 - [原始 POC 架构设计](kvaf_architecture_design.md) 与 [Meta Manager 地址管理](meta_manager_address_management_design.md)：背景、目标和元数据设计；当前执行 API 以三篇主文档及源码为准。
 - [AICPU Gather Read](aicpu_gather_read.md) 与 [CPU Push Scatter](aicpu_cpu_push_scatter.md)：算法数据流、性能入口与部署说明。
 - [AIV BatchGet 在途控制](batch_get_inflight_control.md)：设备侧窗口和队列预算。

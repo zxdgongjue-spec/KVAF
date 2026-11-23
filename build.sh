@@ -15,7 +15,11 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--jobs N] [mode-specific options]
+Usage: ./build.sh <cpu|npu|aicpu-urma> [--build-dir DIR] [--build-type TYPE] [--jobs N] [mode-specific options]
+
+Build type defaults to RelWithDebInfo and is applied on every configuration,
+including reused build directories. Override with --build-type Debug, Release,
+RelWithDebInfo or MinSizeRel.
 
 cpu  Builds the CPU Runtime service with liburma and OpenMP. If liburma is not installed,
      it clones and builds the pinned UMDK source beside this repository.
@@ -24,7 +28,9 @@ aicpu-urma Builds and installs AICPU gather_read, BatchPut and Python bindings.
      --cpu-push adds Host direct HCCP and the CPU push/scatter kernel (needs device securec).
 npu  Builds all backends (AIV URMA, UBmem, AICPU Gather/Scatter and BatchPut),
      outputs one Python package and installs the AICPU device package into CANN.
-     --without-aicpu builds only AIV/UBmem, without AICPU dependencies or installation.
+     --without-aicpu omits AICPU dependencies and installation.
+     --cpu-pull-only builds CPU Pull without AIV/AICPU device kernels.
+     --raw-pull-only builds peer-HBM Pull without ordinary DDR providers.
      --without-python builds NPU C++ libraries and tests without the binding.
 Both NPU modes install pybind11 for the selected Python interpreter when necessary.
      --check-kernel / --uninstall-kernel manage the AICPU package without building.
@@ -121,10 +127,14 @@ build_cpu() {
   local urma_library
 
   require_command cmake
+  local -a cpu_only_options=(-DKVAF_ENABLE_AIV_BATCH_GET=OFF -DKVAF_ENABLE_AIV_BATCH_PUT=OFF
+    -DKVAF_ENABLE_AICPU_URMA=OFF -DKVAF_ENABLE_AICPU_CPU_PUSH=OFF
+    -DKVAF_ENABLE_CPU_OFFLOAD=OFF -DKVAF_ENABLE_NPU_PULL=OFF -DKVAF_BUILD_PYTHON=OFF)
   if [[ "$without_urma" == ON ]]; then
     cmake -S "$KVAF_ROOT" -B "$build_dir" -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON \
-      -DKVAF_CPU_ENABLE_URMA=OFF -DBUILD_TESTING=ON
-    cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
+      -DCMAKE_BUILD_TYPE="$build_type" \
+      -DKVAF_CPU_ENABLE_URMA=OFF -DBUILD_TESTING=ON "${cpu_only_options[@]}"
+    cmake --build "$build_dir" --config "$build_type" --target kvaf_cpu_service --parallel "$jobs"
     echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
     return
   fi
@@ -133,18 +143,20 @@ build_cpu() {
   if [[ -z "$urma_library" ]]; then
     echo "[KVAF_BUILD] liburma.so not found; building bundled UMDK without TPS/HW drivers"
     cmake -S "$umdk_root" -B "$umdk_build_dir" \
+      -DCMAKE_BUILD_TYPE="$build_type" \
       -DTPS=disable -DHW=disable -DURMA_INSTALL=disable
-    cmake --build "$umdk_build_dir" --target urma --parallel "$jobs"
+    cmake --build "$umdk_build_dir" --config "$build_type" --target urma --parallel "$jobs"
     urma_library="$(find_urma_library "$umdk_root" "$umdk_build_dir")"
   fi
   [[ -n "$urma_library" ]] || die "unable to find liburma.so after UMDK setup"
 
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
-    -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_CPU_ENABLE_URMA=ON -DBUILD_TESTING=ON \
+    -DCMAKE_BUILD_TYPE="$build_type" \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=ON -DKVAF_CPU_ENABLE_URMA=ON -DBUILD_TESTING=ON "${cpu_only_options[@]}" \
     -DKVAF_ENABLE_AICPU_URMA=OFF \
     -DKVAF_URMA_ROOT="$umdk_root" \
     -DKVAF_URMA_LIBRARY="$urma_library"
-  cmake --build "$build_dir" --target kvaf_cpu_service --parallel "$jobs"
+  cmake --build "$build_dir" --config "$build_type" --target kvaf_cpu_service --parallel "$jobs"
   echo "[KVAF_BUILD] CPU service: $build_dir/runtime/kvaf_cpu_service"
 }
 
@@ -159,10 +171,17 @@ build_npu() {
   local cann_root
   local build_python=OFF
   local build_aiv=ON build_aicpu=ON build_testing=ON
+  local build_cpu_pull=ON build_raw_pull=ON
   local umdk_root="${KVAF_UMDK_ROOT:-$KVAF_ROOT/../third_party/umdk}"
   local -a cmake_options=()
   local -a package_options=()
-  if [[ "$mode" == aicpu-urma ]]; then build_aiv=OFF; build_testing=OFF; fi
+  if [[ "$mode" == aicpu-urma ]]; then
+    build_aiv=OFF; build_testing=OFF; build_cpu_pull=OFF; build_raw_pull=OFF
+  fi
+  if [[ "$pull_only" != none ]]; then
+    build_aiv=OFF; build_aicpu=OFF; cpu_push=OFF
+    if [[ "$pull_only" == cpu ]]; then build_raw_pull=OFF; else build_cpu_pull=OFF; fi
+  fi
   if [[ "$without_aicpu" == ON ]]; then build_aicpu=OFF; fi
   if [[ "$cpu_push" == ON ]]; then package_options+=(--require-scatter); fi
   cann_root="$(find_cann_root)"
@@ -207,19 +226,24 @@ build_npu() {
   # Set every backend switch explicitly so reusing a build directory cannot
   # retain AICPU/Scatter (or a CPU service) after selecting a trimmed build.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE="$build_type" \
     -DBUILD_TESTING="$build_testing" -DKVAF_BUILD_PYTHON="$build_python" \
     -DKVAF_ENABLE_AIV_BATCH_GET="$build_aiv" -DKVAF_ENABLE_AIV_BATCH_PUT="$build_aiv" \
     -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA="$build_aicpu" \
     -DKVAF_ENABLE_AICPU_CPU_PUSH="$cpu_push" \
+    -DKVAF_ENABLE_CPU_OFFLOAD="$build_cpu_pull" -DKVAF_ENABLE_NPU_PULL="$build_raw_pull" \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     ${cmake_options[@]+"${cmake_options[@]}"}
-  cmake --build "$build_dir" --parallel "$jobs"
+  cmake --build "$build_dir" --config "$build_type" --parallel "$jobs"
   if [[ "$build_aicpu" == ON ]]; then
     bash "$KVAF_ROOT/access_operator/transports/aicpu_urma/package/install_kernel.sh" \
       ${package_options[@]+"${package_options[@]}"} --install \
       "$build_dir/access_operator/transports/aicpu_urma" "$cann_root"
   fi
   if [[ "$build_python" == ON ]]; then echo "[KVAF_BUILD] NPU Python package: $build_dir/python/kvaf"; fi
+  if [[ "$build_raw_pull" == ON ]]; then
+    echo "[KVAF_BUILD] Raw READ kernel: $build_dir/bin/kvaf_execute_batch_get_raw_addr_kernels.o"
+  fi
   if [[ "$build_aiv" == ON ]]; then
     echo "[KVAF_BUILD] BatchGet kernel: $build_dir/bin/kvaf_execute_batch_get_kernels.o"
     echo "[KVAF_BUILD] BatchPut kernel: $build_dir/bin/kvaf_execute_batch_put_kernels.o"
@@ -234,6 +258,7 @@ case "$mode" in
 esac
 
 build_dir="$KVAF_ROOT/build-$mode"
+build_type=RelWithDebInfo
 jobs="$(default_jobs)"
 kernel_action=build
 cpu_push=OFF
@@ -241,8 +266,14 @@ if [[ "$mode" == npu ]]; then cpu_push=ON; fi
 without_urma=OFF
 without_aicpu=OFF
 without_python=OFF
+pull_only=none
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --cpu-pull-only|--raw-pull-only)
+      [[ "$mode" == npu ]] || die "$1 is only valid for npu"
+      [[ "$pull_only" == none ]] || die "select only one Pull-only mode"
+      if [[ "$1" == --cpu-pull-only ]]; then pull_only=cpu; else pull_only=raw; fi
+      shift ;;
     --without-urma)
       [[ "$mode" == cpu ]] || die "--without-urma is only valid for cpu"
       without_urma=ON; shift ;;
@@ -260,6 +291,14 @@ while [[ $# -gt 0 ]]; do
     --build-dir)
       [[ $# -ge 2 ]] || die "--build-dir requires a value"
       build_dir="$2"
+      shift 2
+      ;;
+    --build-type)
+      [[ $# -ge 2 ]] || die "--build-type requires a value"
+      case "$2" in
+        Debug|Release|RelWithDebInfo|MinSizeRel) build_type="$2" ;;
+        *) die "--build-type must be Debug, Release, RelWithDebInfo or MinSizeRel" ;;
+      esac
       shift 2
       ;;
     --jobs)
@@ -281,8 +320,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die "KVAF_BUILD_JOBS must be a positive integer"
-if [[ "$without_aicpu" == ON && "$kernel_action" != build ]]; then
-  die "AICPU package actions cannot be combined with --without-aicpu"
+if [[ ( "$without_aicpu" == ON || "$pull_only" != none ) && "$kernel_action" != build ]]; then
+  die "AICPU package actions cannot be combined with --without-aicpu or Pull-only modes"
+fi
+if [[ "$kernel_action" == build || "$kernel_action" == install ]]; then
+  echo "[KVAF_BUILD] mode=$mode build_type=$build_type build_dir=$build_dir"
 fi
 if [[ "$mode" == cpu ]]; then
   build_cpu "$build_dir" "$jobs"

@@ -245,6 +245,7 @@ bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
   memory->region_id = region.region_id;
   memory->session_id = region.session_id;
   memory->eid = region.eid;
+  memory->wqe_eid = region.has_memory_eid ? region.memory_eid : region.eid;
   memory->registered_address = region.base;
   memory->registered_bytes = region.length;
   memory->token_id = region.token_id;
