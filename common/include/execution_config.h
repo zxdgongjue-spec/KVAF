@@ -11,7 +11,7 @@ enum class TransportMode { Urma, Ubmem, UrmaAndUbmem };
 // Keep the original enumerators source compatible.
 enum class Transport { Urma, Ubmem, kUrma = Urma, kUbmem = Ubmem };
 enum class Executor { Aiv, Aicpu };
-enum class GetAlgorithm { Direct, Gather, Scatter };
+enum class GetAlgorithm { Direct, Gather, Scatter, CpuSglWrite };
 struct PutExecutionConfig {
   Transport transport{Transport::Urma};
   Executor executor{Executor::Aiv};

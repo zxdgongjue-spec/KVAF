@@ -37,6 +37,7 @@ void Fail(Coordination& c, Result result) {
 }
 struct Execution {
   const KernelArgs& args;
+  const OutputTarget* output_target;
   Layout layout;
   Coordination& coordination;
   std::uint64_t start, timeout;
@@ -109,6 +110,9 @@ struct Execution {
         !args.output || r.request_capacity > kMaxRequests) return false;
     const auto active = *reinterpret_cast<const volatile std::int32_t*>(r.miss_count);
     if (active < 0 || static_cast<std::uint32_t>(active) > r.request_capacity) return false;
+    const bool direct = output_target != nullptr;
+    if (direct && std::uint64_t{static_cast<std::uint32_t>(active)} * r.token_bytes > args.output_bytes)
+      return false;
     *count = active;
     *range = WorkerRange(*count, r.token_bytes, worker, args.workers);
     if (range->begin == range->end) return true;
@@ -116,11 +120,18 @@ struct Execution {
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
-    for (auto i = range->begin; i < range->end; ++i)
+    const auto* rows = reinterpret_cast<const std::int32_t*>(r.output_indices);
+    // Reject the whole request before notify, so unsupported mappings never
+    // cause partial DMA writes. Inactive output_indices remain irrelevant.
+    for (auto i = range->begin; i < range->end; ++i) {
+      if (direct && rows[i] != static_cast<std::int32_t>(i)) return false;
       sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
+    }
     if (!worker) {
       auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
-      *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, 0, {}};
+      *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, direct ? kDirectOutput : kScatterOutput, {}};
+      if (direct)
+        *reinterpret_cast<OutputTarget*>(Memory() + layout.output_target) = *output_target;
     }
     Barrier();
     return true;
@@ -134,10 +145,10 @@ struct Execution {
 };
 }  // namespace
 
-std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
+static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
-      !MakeLayout(args->request.token_bytes, args->workers, &layout)) return 1;
+      !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.
   if (Load(c.result)) return 1;
@@ -151,7 +162,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   BatchGetWorkerProfile measured{};
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
-  Execution io{*args, layout, c, CounterNow(),
+  Execution io{*args, output_target, layout, c, CounterNow(),
       CounterFrequency() * args->timeout_ms / 1000, profile};
   std::uint32_t count = 0;
   Range range{};
@@ -168,7 +179,7 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     io.Wait(c.published, args->sequence, false);
   }
   std::uint32_t consumed = 0;
-  if (io.Status() == Result::kPending && range.begin < range.end) {
+  if (io.Status() == Result::kPending && range.begin < range.end && !output_target) {
     BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
     const auto result = Consume(count, args->request.token_bytes, args->workers, worker,
                                 args->sequence, io.start, io.timeout, io, &consumed);
@@ -190,6 +201,8 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     }
     Store(c.finished, args->sequence);
   } else io.Wait(c.finished, args->sequence);
+  // Order observations of done against subsequent output reads on this core.
+  Barrier();
   auto* status = reinterpret_cast<WorkerStatus*>(args->status) + worker;
   *status = {kMagic, args->sequence, Load(c.result) ? Load(c.result) : std::uint64_t(Result::kOk),
              worker, consumed, {}};
@@ -203,5 +216,9 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
     *destination = measured;
   }
   return status->result == std::uint64_t(Result::kOk) ? 0 : 1;
+}
+std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) { return ExecuteCpuPush(args, nullptr); }
+std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
+  return args ? ExecuteCpuPush(&args->execution, &args->output_target) : 1;
 }
 }  // namespace kvaf::cpu_push

@@ -59,7 +59,7 @@ from utils.statistics import percentile
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         allow_abbrev=False,
-        description="Measure four Get backends with the same workload and eager/graph timing.",
+        description="Measure Get backends with the same workload and eager/graph timing.",
     )
     add_workload_arguments(parser)
     add_backend_arguments(parser)
@@ -372,7 +372,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
     execution = execution or BenchmarkExecution(
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
-        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
+        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
         get_capacity=args.request_length,
     )
     stream = torch.npu.current_stream()
@@ -896,7 +896,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
     execution = BenchmarkExecution(
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
-        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
+        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
         put_capacity=min(args.populate_chunk_entries, table_capacity),
         get_capacity=request_length, cores=args.parallelism, jettys=args.jettys_per_core,
         get_kernel="" if uses_aicpu(args) else str(kernel),

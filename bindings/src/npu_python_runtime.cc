@@ -70,6 +70,7 @@ class GetCallTrace {
     for (const auto& row : rows_) {
       const char* algorithm = row.config.transport == Transport::Ubmem ? "ubmem" :
           row.config.executor == Executor::Aiv ? "aiv_direct" :
+          row.config.algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
           row.config.algorithm == GetAlgorithm::Scatter ? "scatter" : "gather";
       output << "submit," << ++next_index_ << ',' << algorithm << ',' << row.path;
       for (const auto& field : fields) output << ',' << row.timing.*(field.second);

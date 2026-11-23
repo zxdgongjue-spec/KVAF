@@ -12,7 +12,7 @@ namespace kvaf {
 struct AicpuExecutionResources::State {
   State(AicpuExecutionResources* owner, UmdkAccessOperatorConfig config)
       : default_invocation(owner), valid_mode(config.batch_get_mode == "gather_read" ||
-                   config.batch_get_mode == "cpu_push_scatter"),
+                   config.batch_get_mode == "cpu_push_scatter" || config.batch_get_mode == "cpu_sgl_write"),
         get_session({config.kernel_json, config.workers,
                  config.peer_link, config.local_eid}),
         put_session({config.kernel_json, config.workers, config.peer_link, config.local_eid,
@@ -20,9 +20,10 @@ struct AicpuExecutionResources::State {
         get(get_session, config.token_bytes),
         put(put_session), enable_get(config.enable_get) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-    if (config.batch_get_mode == "cpu_push_scatter")
+    if (config.batch_get_mode == "cpu_push_scatter" || config.batch_get_mode == "cpu_sgl_write")
       push = std::make_unique<cpu_push::CpuPushTransport>(cpu_push::Config{
-          config.peer_link, config.kernel_json, config.local_eid, config.token_bytes, config.workers});
+          config.peer_link, config.kernel_json, config.local_eid, config.token_bytes, config.workers,
+          config.batch_get_mode == "cpu_sgl_write"});
 #else
     valid_mode = config.batch_get_mode == "gather_read";
 #endif
@@ -149,7 +150,12 @@ Status AicpuExecutionResources::PrepareGetResources(const BatchGetExecRequest& r
       return Status::InvalidArgument("captured request differs from prepared graph lease");
   }
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  if (state_->push) return state_->push->Prepare(request, call.graph_active);
+  if (state_->push) {
+    if (call.output_bound && (request.request->output.data != call.get_output.data ||
+                             request.request->output.bytes != call.get_output.bytes))
+      return Status::InvalidArgument("request differs from bound CPU SGL output");
+    return state_->push->Prepare(request, call.graph_active);
+  }
 #endif
   if (state_->invocation->output_bound &&
       (request.request->output.data != state_->invocation->get_output.data ||
@@ -212,6 +218,12 @@ Status AicpuExecutionResources::FinishPutInput() {
 }
 Status AicpuExecutionResources::ReleaseGetBuffers() {
   auto& call = *state_->invocation;
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) {
+    if (call.output_bound || call.graph_active) return Status::OK();
+    return state_->push->ReleaseOutput();
+  }
+#endif
   if (call.output_bound || call.graph_active || !call.get_output.valid()) return Status::OK();
   auto s = call.output_pinned
       ? state_->get_session.UnpinBuffer(call.get_output.data, call.get_output.bytes)
@@ -306,10 +318,14 @@ bool AicpuExecutionResources::GetGraphNeedsRecovery() const {
 Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options) {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
   auto& call = *state_->invocation;
-  if (!state_->initialized || !state_->enable_get || scatter() || call.output_bound || call.graph_active ||
+  bool supports_output = !scatter();
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) supports_output = state_->push->direct_output();
+#endif
+  if (!state_->initialized || !state_->enable_get || !supports_output || call.output_bound || call.graph_active ||
       !options.stream || !options.request_capacity ||
       !options.output.valid() || options.output.device != DeviceKind::kNpu)
-    return Status::InvalidArgument("invalid Gather output binding");
+    return Status::InvalidArgument("invalid AICPU output binding");
   aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
   aclmdlRI graph = nullptr;
   if (aclmdlRICaptureGetInfo(static_cast<aclrtStream>(options.stream), &capture, &graph) != ACL_SUCCESS)
@@ -317,6 +333,13 @@ Status AicpuExecutionResources::PrepareGetOutput(const GetOutputOptions& options
   if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
     return Status::InvalidState("bind Get output before graph capture");
   auto s = state_->DrainGet();
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) {
+    if (s.ok()) s = state_->push->RegisterOutput(options.output);
+    if (s.ok()) { call.get_output = options.output; call.output_bound = true; }
+    return s;
+  }
+#endif
   if (s.ok()) s = state_->get.Warmup();
   if (!s.ok()) return s;
   call.get_output = options.output;
@@ -331,6 +354,13 @@ Status AicpuExecutionResources::FinishGetOutput() {
   auto s = state_->DrainGet();
   if (!s.ok()) return s;
   auto& call = *state_->invocation;
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (state_->push) {
+    s = state_->push->ReleaseOutput();
+    if (s.ok()) { call.get_output = {}; call.output_bound = false; }
+    return s;
+  }
+#endif
   s = state_->get_session.UnpinBuffer(call.get_output.data, call.get_output.bytes);
   if (s.ok()) { call.get_output = {}; call.output_bound = call.output_pinned = false; }
   return s;
@@ -354,6 +384,7 @@ Status AicpuExecutionResources::Initialize(const RemoteRegionDesc& region) {
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   auto loaded = state_->enable_get && state_->push
       ? aicpu_urma::PrepareUmdkKernel(state_->get_session.config().kernel_json,
+                                    state_->push->direct_output() ? aicpu_urma::UmdkKernelKind::CpuSglWrite :
                                     aicpu_urma::UmdkKernelKind::Scatter)
       : state_->enable_get ? state_->get_session.Load() : state_->put_session.Load();
 #else

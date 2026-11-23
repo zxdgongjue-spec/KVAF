@@ -30,7 +30,7 @@ class BenchmarkExecution:
         self.input_binding = ("not-needed" if not reusable_input
                               else "transient" if os.environ.get("KVAF_PERF_REUSE_PUT_INPUT", "1") == "0"
                               else "reused")
-        supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aicpu", "gather"))
+        supported = transport == "urma" and (executor, algorithm) in (("aiv", "direct"), ("aicpu", "gather"), ("aicpu", "cpu_sgl_write"))
         self.output_binding = ("not-needed" if not supported
                                else "transient" if os.environ.get("KVAF_PERF_REUSE_GET_OUTPUT", "1") == "0"
                                else "reused")

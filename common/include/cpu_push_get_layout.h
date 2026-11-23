@@ -9,15 +9,20 @@ namespace kvaf::cpu_push {
 inline constexpr std::uint64_t Align64(std::uint64_t n) { return (n + 63) & ~std::uint64_t{63}; }
 struct Layout {
   std::uint64_t request{0}, notify{64}, done{128}, ready{192};
-  std::uint64_t descriptor{}, staging{}, bytes{};
+  std::uint64_t output_target{}, descriptor{}, staging{}, bytes{};
 };
-inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out) {
+inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out,
+                       bool direct_output = false) {
   if (!out || !token_bytes || !workers || workers > kMaxWorkers ||
       std::uint64_t{token_bytes} * kMaxRequests > UINT32_MAX) return false;
   Layout l;
   l.descriptor = l.ready + workers * sizeof(Ready);
+  if (direct_output) {
+    l.output_target = l.descriptor;
+    l.descriptor += sizeof(OutputTarget);
+  }
   l.staging = Align64(l.descriptor + kMaxRequests * sizeof(std::uint64_t));
-  l.bytes = Align64(l.staging + std::uint64_t{token_bytes} * kMaxRequests);
+  l.bytes = direct_output ? l.staging : Align64(l.staging + std::uint64_t{token_bytes} * kMaxRequests);
   *out = l;
   return true;
 }

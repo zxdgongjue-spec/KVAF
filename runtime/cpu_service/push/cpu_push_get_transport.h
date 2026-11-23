@@ -51,6 +51,8 @@ class Transport {
     std::vector<urma::Sge> local, remote;
     std::vector<urma_jfs_wr_t> wrs;
     std::vector<Post> posts;
+    struct Destination { std::uint32_t wr; std::uint64_t offset; };
+    std::vector<Destination> destinations;
     std::vector<Source> sources;
     std::vector<SourceRun> source_runs;
     std::vector<Marker> markers;
@@ -62,6 +64,7 @@ class Transport {
     Tracker::Handle handle;
   };
   Status PrepareWrites(std::uint32_t count);
+  void RetargetWrites();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
@@ -83,6 +86,9 @@ class Transport {
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};
+  urma_target_seg_t* output_remote_{};
+  OutputTarget output_;
+  bool direct_output_{};
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};

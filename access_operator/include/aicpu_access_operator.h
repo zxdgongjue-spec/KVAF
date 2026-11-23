@@ -12,7 +12,7 @@ struct UmdkAccessOperatorConfig {
   bool enable_get{true};
 };
 // Runtime adapter with independent UMDK Put/Get sessions;
-// cpu_push_scatter owns an independent Host-side direct HCCP target.
+// cpu_push_scatter/cpu_sgl_write own an independent Host-side direct HCCP target.
 class AicpuExecutionResources;
 struct AicpuInvocation;
 

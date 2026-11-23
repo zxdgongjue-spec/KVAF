@@ -16,7 +16,8 @@ inline GetAlgorithm ParseAlgorithm(const std::string& s) {
   if (s == "direct") return GetAlgorithm::Direct;
   if (s == "gather") return GetAlgorithm::Gather;
   if (s == "scatter") return GetAlgorithm::Scatter;
-  throw pybind11::value_error("algorithm must be direct, gather or scatter");
+  if (s == "cpu_sgl_write") return GetAlgorithm::CpuSglWrite;
+  throw pybind11::value_error("algorithm must be direct, gather, scatter or cpu_sgl_write");
 }
 inline void BindExecutionConfigs(pybind11::module_& m) {
   namespace py = pybind11;
@@ -55,7 +56,8 @@ inline void BindExecutionConfigs(pybind11::module_& m) {
       .def_property_readonly("transport", [](GetExecutionConfig c) { return c.transport == Transport::Urma ? "urma" : "ubmem"; })
       .def_property_readonly("executor", [](GetExecutionConfig c) { return c.executor == Executor::Aiv ? "aiv" : "aicpu"; })
       .def_property_readonly("algorithm", [](GetExecutionConfig c) {
-        return c.algorithm == GetAlgorithm::Direct ? "direct" : c.algorithm == GetAlgorithm::Gather ? "gather" : "scatter";
+        return c.algorithm == GetAlgorithm::Direct ? "direct" : c.algorithm == GetAlgorithm::Gather ? "gather" :
+               c.algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" : "scatter";
       });
 }
 }  // namespace kvaf::python_binding

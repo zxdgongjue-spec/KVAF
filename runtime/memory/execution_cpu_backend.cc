@@ -83,7 +83,8 @@ class UrmaSession final : public execution::Session {
       return Status::InvalidArgument("session has no Gather profile");
     if ((command == peer::Command::kOpenCpuPushGet || command == peer::Command::kStartCpuPushGet ||
          command == peer::Command::kStopCpuPushGet) &&
-        (profile_.put || profile_.algorithm != GetAlgorithm::Scatter))
+        (profile_.put || (profile_.algorithm != GetAlgorithm::Scatter &&
+                          profile_.algorithm != GetAlgorithm::CpuSglWrite)))
       return Status::InvalidArgument("session has no Scatter profile");
     return backend_.Call(in, out);
   }

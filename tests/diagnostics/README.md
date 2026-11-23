@@ -57,3 +57,26 @@ retries, table pin retention/release, failed output unbinding, unrelated pending
 requests and live-graph recovery guards. Add `-fsanitize=address,undefined -g`
 with a supporting compiler for sanitizer checks. This standalone regression does
 not test real DMA completion or restore the removed full C++ test suite.
+
+## CPU SGL Write kernel model (Host only)
+
+Run the actual AICPU request/completion kernel against a simulated CPU producer:
+
+```bash
+c++ -std=c++17 -pthread -fsanitize=address,undefined -g \
+  -Icommon/include -Iaccess_operator/include -Iaccess_operator/algorithms -Iruntime/include \
+  tests/diagnostics/cpu_sgl_write.cc \
+  access_operator/algorithms/get/scatter/urma_aicpu/kernel/cpu_push_scatter.cc \
+  runtime/execution/execution_config.cc runtime/peer/execution_protocol.cc \
+  -o /tmp/kvaf-cpu-sgl-write-test
+/tmp/kvaf-cpu-sgl-write-test
+```
+
+Checks 1/4/8 workers, repeated device tickets, changing source inputs, full,
+partial and empty prefixes, untouched output tails, completion waits without
+ready/scatter, invalid output mappings, insufficient output capacity and the
+new execution configuration's wire round trip, plus the original Scatter's
+arbitrary destination mapping. It does not test real URMA
+imports, DMA visibility, Host registration retirement or CANN graph replay.
+Run the commands in [CPU SGL Write](../../docs/cpu_sgl_write.md) on the target
+machines for those checks.

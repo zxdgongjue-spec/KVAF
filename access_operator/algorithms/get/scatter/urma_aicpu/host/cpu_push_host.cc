@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <utility>
 #include <urma_api.h>
 
@@ -42,6 +43,16 @@ struct CpuPushTransport::Impl {
   Invocation default_invocation{this};
   Invocation* invocation{&default_invocation};
   bool peer_open{}, initialized{}, profiling{};
+  std::uint32_t token_value{};
+  using OutputKey = std::pair<std::uintptr_t, std::size_t>;
+  struct OutputRegistration {
+    OutputTarget target;
+    void* handle{};
+    std::size_t users{};
+  };
+  // Registration ownership is independent of invocation and graph lifetimes.
+  std::map<OutputKey, OutputRegistration> outputs;
+  std::map<Invocation*, OutputKey> bound_outputs;
   ExecutionHealth health;
 
   Status Drain();
@@ -111,7 +122,70 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
       {status ? status->device : s.status_device, status ? status->host : s.status_host,
        s.config.workers * sizeof(WorkerStatus)},
       {profile ? profile->device : s.profile_device, profile ? profile->host : s.profile_host,
-       s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling};
+       s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling, s.config.direct_output,
+      s.bound_outputs.count(s.invocation) ? s.outputs.at(s.bound_outputs.at(s.invocation)).target : OutputTarget{}};
+}
+bool CpuPushTransport::direct_output() const { return impl_->config.direct_output; }
+Status CpuPushTransport::RegisterOutput(const MutableBufferView& output) {
+  auto& s = *impl_;
+  if (!s.config.direct_output) return Status::OK();
+  if (!s.initialized || !output.valid() || output.device != DeviceKind::kNpu)
+    return Status::InvalidArgument("CPU SGL Write requires a valid NPU output");
+  if (s.health.failed) return Status::InvalidState("CPU push failed; shutdown required");
+  const Impl::OutputKey key{reinterpret_cast<std::uintptr_t>(output.data), output.bytes};
+  const auto bound = s.bound_outputs.find(s.invocation);
+  if (bound != s.bound_outputs.end()) {
+    if (bound->second == key) return Status::OK();
+    if (s.invocation->graph_active)
+      return Status::InvalidArgument("CPU SGL output differs from graph lease");
+    auto ready = ReleaseOutput();
+    if (!ready.ok()) return ready;
+  }
+  auto found = s.outputs.find(key);
+  if (found == s.outputs.end()) {
+    auto& registration = s.outputs[key];
+    d::MrRegInfo mr{};
+    mr.in.mem.addr = key.first;
+    mr.in.mem.size = key.second;
+    mr.in.ub.flags = d::MemRegFlags(true);
+    mr.in.ub.token_value = s.token_value;
+    mr.in.ub.token_id_handle = s.token;
+    if (s.api.lmem_register(s.context, &mr, &registration.handle) || !registration.handle) {
+      // Retain a partially returned handle for Shutdown to retry its release.
+      if (!registration.handle) s.outputs.erase(key);
+      else s.health.failed = true;
+      return Error("register output");
+    }
+    if (mr.out.key.size < sizeof(urma_seg_t) || mr.out.key.size > kOutputSegmentBytes) {
+      s.health.failed = true;
+      return Error("unexpected output segment ABI; shutdown required");
+    }
+    registration.target.base = key.first;
+    registration.target.bytes = key.second;
+    registration.target.token_value = s.token_value;
+    registration.target.segment_bytes = sizeof(urma_seg_t);
+    std::memcpy(registration.target.segment, mr.out.key.value, sizeof(urma_seg_t));
+    found = s.outputs.find(key);
+  }
+  ++found->second.users;
+  s.bound_outputs[s.invocation] = key;
+  return Status::OK();
+}
+Status CpuPushTransport::ReleaseOutput() {
+  auto& s = *impl_;
+  const auto bound = s.bound_outputs.find(s.invocation);
+  if (bound == s.bound_outputs.end()) return Status::OK();
+  // Callers fence execution first. Failed transports retain all registrations
+  // until STOP destroys the CPU DMA queues in Shutdown.
+  if (s.health.failed || s.invocation->pending)
+    return Status::InvalidState("CPU SGL output is still in use; drain or shutdown required");
+  auto found = s.outputs.find(bound->second);
+  if (found->second.users == 1) {
+    if (s.api.lmem_unregister(s.context, found->second.handle)) return Error("unregister output");
+    s.outputs.erase(found);
+  } else --found->second.users;
+  s.bound_outputs.erase(bound);
+  return Status::OK();
 }
 Status CpuPushTransport::Impl::Drain() {
   aicpu_urma::ScatterLaunchView view;
@@ -155,6 +229,8 @@ Status CpuPushTransport::PrepareGraph(const GetGraphOptions& options) {
     }
     if (!ready.ok()) return ready;
   }
+  ready = RegisterOutput(options.output);
+  if (!ready.ok()) return ready;
   call.graph_start_sequence = coordination.claimed.value / s.config.workers;
   call.graph_stream = static_cast<aclrtStream>(options.stream);
   call.graph_active = true;
@@ -209,6 +285,9 @@ Status CpuPushTransport::FinishGraph(void* stream, bool discard) {
             std::to_string(statuses[worker].result) + " sequence=" +
             std::to_string(statuses[worker].sequence));
   }
+  call.pending = nullptr;
+  ready = ReleaseOutput();
+  if (!ready.ok()) return ready;
   // Graph destruction/discard is the caller's responsibility. These buffers
   // and cumulative device tickets remain resident for the next execution.
   call.graph_active = false;
@@ -260,7 +339,7 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
 Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   auto& s = *impl_;
   if (s.context || s.memory || s.initialized) return Status::InvalidState("CPU push already initialized");
-  if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout) ||
+  if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.config.direct_output) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
       !aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str()))
     return Status::InvalidArgument("CPU push requires kernel JSON, PeerLink, local EID and valid shape");
@@ -290,6 +369,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
     return Error("allocate workspace");
   // Match the probe's HBM registration contract; the token is session-local.
   const auto token_value = region.token_value;
+  s.token_value = token_value;
   d::MrRegInfo mr{};
   mr.in.mem.addr = reinterpret_cast<std::uint64_t>(s.memory);
   mr.in.mem.size = s.layout.bytes;
@@ -312,6 +392,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.segment_bytes = sizeof(segment);
   open.token_bytes = s.config.token_bytes;
   open.workers = s.config.workers;
+  open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
   std::uint64_t npu_tp = 0;
@@ -343,8 +424,8 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   s.views.Bind(s.invocation);
   s.views.Initialize(s.source);
   std::fprintf(stderr, "[KVAF_AICPU] CPU_PUSH_REFERENCE commit=%s protocol=3 "
-      "copy=per_row_memcpy_sp barrier=dsb_sy device_optimization=O3 "
-      "workspace_policy=huge_first\n", kReferenceCommit);
+      "copy=%s barrier=dsb_sy device_optimization=O3 workspace_policy=huge_first\n",
+      kReferenceCommit, s.config.direct_output ? "none_direct_output" : "per_row_memcpy_sp");
   return Status::OK();
 }
 
@@ -380,6 +461,8 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec, std::optional<
   if (!ready.ok()) return ready;
   if (checked.request.request_capacity > kMaxRequests || checked.request.token_bytes != s.config.token_bytes)
     return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
+  ready = RegisterOutput(exec.request->output);
+  if (!ready.ok()) return ready;
   const auto bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
   if (exec.execution.profile || s.profiling) {
     if (capturing && (!s.profile_device || !s.profile_host))
@@ -431,12 +514,13 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.status = detail::PointerValue(view.completion.device);
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
+  const CpuSglWriteArgs direct_args{args, view.output_target};
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0;
   if (profile) profile->prepare_ns = stamp - begin;
-  if (LaunchCpuPushScatter(&args, stream)) {
+  if (view.direct_output ? LaunchCpuSglWrite(&direct_args, stream) : LaunchCpuPushScatter(&args, stream)) {
     view.health->failed = true;
     return call.failure = Error("launch kernel");
   }
@@ -490,6 +574,12 @@ Status CpuPushTransport::Shutdown() {
     if (!closed.ok()) return closed;
     channel.reset();
   }
+  for (auto it = s.outputs.begin(); it != s.outputs.end();) {
+    if (it->second.handle && s.api.lmem_unregister(s.context, it->second.handle))
+      return Error("unregister retained output");
+    it = s.outputs.erase(it);
+  }
+  s.bound_outputs.clear();
   if (s.memory_handle) {
     if (s.api.lmem_unregister(s.context, s.memory_handle)) return Error("unregister HBM");
     s.memory_handle = nullptr;

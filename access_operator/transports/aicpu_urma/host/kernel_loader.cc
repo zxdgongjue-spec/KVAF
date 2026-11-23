@@ -71,14 +71,16 @@ Status PrepareUmdkKernel(const std::string& json, UmdkKernelKind kind) {
     case UmdkKernelKind::Put: mode = "put"; entry = "KvafAicpuBatchPut"; break;
     case UmdkKernelKind::Gather: mode = "gather_read"; entry = "KvafAicpuGatherReadExecutionV3"; break;
     case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV3"; break;
+    case UmdkKernelKind::CpuSglWrite: mode = "cpu_sgl_write"; entry = "KvafAicpuCpuSglWriteExecutionV1"; break;
     default: return Status::InvalidArgument("unknown AICPU kernel kind");
   }
   const std::string context = "AICPU mode=" + std::string(mode) + " json=" + json;
   if (!LoadUmdkKernel(json.c_str()))
     return Status::Internal(context + ": failed to load installed device package");
   std::lock_guard<std::mutex> lock(kernel_mutex);
-  // Scatter uses its Host RA transport, not the AICPU URMA control session.
-  for (const char* name : {kind == UmdkKernelKind::Scatter ? nullptr : "KvafAicpuUmdkControlSessionsV5",
+  // CPU push algorithms use their Host RA transport.
+  const bool cpu_push = kind == UmdkKernelKind::Scatter || kind == UmdkKernelKind::CpuSglWrite;
+  for (const char* name : {cpu_push ? nullptr : "KvafAicpuUmdkControlSessionsV5",
                           entry}) {
     if (!name) continue;
     if (functions.find(name) != functions.end()) continue;

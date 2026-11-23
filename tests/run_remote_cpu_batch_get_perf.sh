@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: bash $0 build-npu --backend aiv|ubmem|gather_read|cpu_push_scatter [options...]" >&2
+  echo "Usage: bash $0 build-npu --backend aiv|ubmem|gather_read|cpu_push_scatter|cpu_sgl_write [options...]" >&2
   exit 2
 fi
 

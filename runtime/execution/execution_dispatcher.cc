@@ -60,7 +60,8 @@ namespace {
 const char* GetAlgorithmLabel(GetExecutionConfig c) {
   if (c.transport == Transport::Ubmem) return "ubmem";
   if (c.executor == Executor::Aicpu)
-    return c.algorithm == GetAlgorithm::Scatter ? "scatter" : "gather";
+    return c.algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
+          c.algorithm == GetAlgorithm::Scatter ? "scatter" : "gather";
   return "aiv_direct";
 }
 std::uint64_t TraceNowNs() {
@@ -935,8 +936,9 @@ Status ExecutionDispatcher::BeginGetOutput(GetExecutionConfig c, const GetOutput
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   if (c.transport != Transport::Urma ||
       !((c.executor == Executor::Aiv && c.algorithm == GetAlgorithm::Direct) ||
-        (c.executor == Executor::Aicpu && c.algorithm == GetAlgorithm::Gather)))
-    return Status::NotImplemented("output binding supports URMA AIV Direct and AICPU Gather");
+        (c.executor == Executor::Aicpu && (c.algorithm == GetAlgorithm::Gather ||
+                                         c.algorithm == GetAlgorithm::CpuSglWrite))))
+    return Status::NotImplemented("output binding supports URMA AIV Direct, AICPU Gather and CPU SGL Write");
   GetExecutionConfig resolved;
   auto s = ResolveExecution(policy_, c, &resolved);
   if (!s.ok()) return s;

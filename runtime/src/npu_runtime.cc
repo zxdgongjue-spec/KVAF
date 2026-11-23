@@ -434,6 +434,7 @@ std::vector<GetExecutionConfig> BuiltGetConfigs(TransportMode mode) {
   add({Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather});
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   add({Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter});
+  add({Transport::Urma, Executor::Aicpu, GetAlgorithm::CpuSglWrite});
 #endif
 #endif
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -619,6 +620,7 @@ struct NpuRuntime::Impl {
     EnsureAicpuPackage();
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
+        algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
         eids.front(), get});
 #else

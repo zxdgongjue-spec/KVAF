@@ -10,4 +10,8 @@ extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuCpuPush
     kvaf::cpu_push::KernelArgs* args) {
   return kvaf::cpu_push::ExecuteCpuPushScatter(args);
 }
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuCpuSglWriteExecutionV1(
+    kvaf::cpu_push::CpuSglWriteArgs* args) {
+  return kvaf::cpu_push::ExecuteCpuSglWrite(args);
+}
 #endif

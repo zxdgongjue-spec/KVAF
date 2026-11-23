@@ -42,7 +42,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      !MakeLayout(setup.token_bytes, setup.workers, &layout_) ||
+      setup.output_mode > kDirectOutput ||
+      !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode == kDirectOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
@@ -53,6 +54,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
+  direct_output_ = setup.output_mode == kDirectOutput;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
@@ -233,7 +235,8 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
-      r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
+      r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_ ||
+      r.mode != (direct_output_ ? kDirectOutput : kScatterOutput))
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
   auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
@@ -242,6 +245,28 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   for (std::uint32_t i = 0; i < r.count; ++i)
     if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
       return Status::InvalidArgument("CPU push source outside cache region");
+  if (direct_output_) {
+    if (output_remote_) return Error("previous output is still imported");
+    read = Transfer(false, layout_.output_target, sizeof(OutputTarget));
+    if (!read.ok()) return read;
+    output_ = *reinterpret_cast<const OutputTarget*>(memory_ + layout_.output_target);
+    if (!output_.base || !output_.token_value || output_.segment_bytes != sizeof(urma_seg_t) ||
+        std::uint64_t{r.count} * token_bytes_ > output_.bytes ||
+        output_.base > UINT64_MAX - output_.bytes)
+      return Status::InvalidArgument("invalid CPU SGL output descriptor");
+    urma_seg_t segment{};
+    std::memcpy(&segment, output_.segment, sizeof(segment));
+    if (!SourceRange(segment.ubva.va, segment.len, output_.base, output_.bytes))
+      return Status::InvalidArgument("CPU SGL output outside exported segment");
+    urma_import_seg_flag_t flag{};
+    flag.bs.cacheable = URMA_NON_CACHEABLE;
+    flag.bs.access = 1U << 2U;
+    flag.bs.mapping = URMA_SEG_NOMAP;
+    urma_token_t token{};
+    token.token = output_.token_value;
+    output_remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
+    if (!output_remote_) return Error("import output segment");
+  }
   return Status::OK();
 }
 
@@ -264,9 +289,11 @@ void Transport::SealPrepared(PreparedWrite& plan) {
     auto& q = plan.queues[index];
     if (q.wrs.empty()) continue;
     std::uint32_t local = 0, payloads = 0;
+    std::size_t destination = 0;
     for (std::uint32_t i = 0; i < q.wrs.size(); ++i) {
       auto& wr = q.wrs[i];
-      const bool payload = q.remote[i].addr >= hbm_base_ + layout_.staging;
+      const bool payload = destination < q.destinations.size() && q.destinations[destination].wr == i;
+      destination += payload;
       // Keep a trailing ordered Ready in the same post when payload hits the budget.
       if (!i || (payload && payloads == kPostPayloadWrs)) {
         if (i) { q.wrs[i - 1].next = nullptr; q.posts.back().end_sge = local; }
@@ -289,6 +316,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
   if (prepared_count_ == count) {
     profile_.plan_reused = true;
+    RetargetWrites();
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
@@ -310,7 +338,8 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           auto& q = waves.back();
           const auto first_local = static_cast<std::uint32_t>(q.local.size());
           const auto first_row = row;
-          const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
+          const auto destination_offset = std::uint64_t{row} * token_bytes_ + offset;
+          const auto destination = (direct_output_ ? output_.base : hbm_base_ + layout_.staging) + destination_offset;
           std::uint32_t bytes = 0, sges = 0;
           while (row < end && sges < max_sge_ && bytes < max_bytes_) {
             const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
@@ -329,6 +358,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
             else
               q.source_runs.push_back({first_local, first_row, sges});
           }
+          q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), destination_offset});
           AppendPrepared(q, queue, destination, bytes, sges);
         }
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
@@ -352,7 +382,18 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     if (plan->fence_count) prepared_.push_back(std::move(plan));
   }
   prepared_count_ = count;
+  RetargetWrites();
   return Status::OK();
+}
+void Transport::RetargetWrites() {
+  if (!direct_output_) return;
+  for (auto& plan : prepared_)
+    for (auto& q : plan->queues)
+      for (const auto& destination : q.destinations) {
+        auto& remote = q.remote[destination.wr];
+        remote.addr = output_.base + destination.offset;
+        remote.tseg = output_remote_;
+      }
 }
 void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& post) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
@@ -485,6 +526,13 @@ Status Transport::WriteBatch() {
 }
 Status Transport::Complete(std::uint64_t sequence, Result result) {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.done_ns : nullptr);
+  // No imported output survives done. Host may unregister/release it as soon
+  // as the kernel observes completion; cached plans are retargeted next round.
+  if (output_remote_) {
+    if (!tracker_.Empty()) return Error("output WRITE is still in flight");
+    if (urma_unimport_seg(output_remote_)) return Error("unimport output segment");
+    output_remote_ = nullptr;
+  }
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
   auto status = BeginPrepared(done_, UINT64_MAX);
@@ -538,6 +586,10 @@ Status Transport::Shutdown() {
       if (urma_delete_jfc(c.local_jfc)) return Error("delete CQ");
       c.local_jfc = nullptr;
     }
+  }
+  if (output_remote_) {
+    if (urma_unimport_seg(output_remote_)) return Error("unimport output");
+    output_remote_ = nullptr;
   }
   if (remote_) { if (urma_unimport_seg(remote_)) return Error("unimport HBM"); remote_ = nullptr; }
   if (control_) { if (urma_unregister_seg(control_)) return Error("unregister controls"); control_ = nullptr; }

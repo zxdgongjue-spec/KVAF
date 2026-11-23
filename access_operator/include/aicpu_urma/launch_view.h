@@ -6,6 +6,7 @@
 #include "execution_view.h"
 #include "aicpu_urma/control_abi.h"
 #include "aicpu_urma/session.h"
+#include "cpu_push_get_abi.h"
 
 namespace kvaf::aicpu_urma {
 struct PutPreparation final : ExecutionState {
@@ -66,5 +67,7 @@ struct ScatterLaunchView {
   AicpuBufferView completion, profile;
   ExecutionHealth* health{};
   bool profiling{false};
+  bool direct_output{false};
+  cpu_push::OutputTarget output_target;
 };
 }  // namespace kvaf::aicpu_urma

@@ -7,8 +7,8 @@ import sys
 from .npu_eids import parse_npu_eids
 
 
-BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter")
-DEFAULT_PARALLELISM = {"aiv": 2, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
+BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter", "cpu_sgl_write")
+DEFAULT_PARALLELISM = {"aiv": 2, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5, "cpu_sgl_write": 5}
 MAX_JETTYS_PER_CORE = 64
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
@@ -31,11 +31,11 @@ def environment_bool(name, default=False):
 
 
 def uses_aicpu(args):
-    return args.backend in ("gather_read", "cpu_push_scatter")
+    return args.backend in ("gather_read", "cpu_push_scatter", "cpu_sgl_write")
 
 
 def parallelism_field(backend):
-    return "aicpu_workers" if backend in ("gather_read", "cpu_push_scatter") else "aiv_cores"
+    return "aicpu_workers" if backend in ("gather_read", "cpu_push_scatter", "cpu_sgl_write") else "aiv_cores"
 
 
 def add_workload_arguments(parser, *, defaults=None, request_aliases=()):
@@ -84,7 +84,7 @@ def add_backend_arguments(parser, *, sweep=False):
         count_options["nargs"] = "+"
     group.add_argument("--aiv-cores", **count_options, help="AIV cores per device; aiv/ubmem only (1..48)")
     group.add_argument("--aicpu-workers", **count_options,
-                       help="AICPU workers per device; gather_read/cpu_push_scatter only (1..8)")
+                       help="AICPU workers per device; gather_read/cpu_push_scatter/cpu_sgl_write only (1..8)")
     # Preserve old commands while keeping distinct hardware concepts in help.
     group.add_argument("--workers", dest="compat_workers", **count_options, help=argparse.SUPPRESS)
     group.add_argument("--jettys-per-core", type=int, default=None,
@@ -175,6 +175,11 @@ def validate_workload(args):
             return "max-inflight-total must fit uint32"
         if args.max_inflight_total and args.max_inflight_total < 2 * args.parallelism:
             return "max-inflight-total must be zero or at least twice aiv-cores"
+    if args.backend == "cpu_sgl_write":
+        if args.output_access_pattern != "contiguous":
+            return "cpu_sgl_write requires --output-access-pattern contiguous"
+        if args.sort_input_indices:
+            return "cpu_sgl_write requires --no-sort-input-indices (output_indices must equal request positions)"
     if args.warmup < 0:
         return "warmup must be non-negative"
     if args.populate_chunk_entries <= 0 or min(args.populate_chunk_entries, args.table_capacity) > 65536:
@@ -210,7 +215,7 @@ def configure_backend_help(parser, argv=None):
     backend = selected.backend or {"urma": "aiv", "ubmem": "ubmem"}.get(selected.transport)
     if backend is None:
         return
-    aicpu = backend in ("gather_read", "cpu_push_scatter")
+    aicpu = backend in ("gather_read", "cpu_push_scatter", "cpu_sgl_write")
     hidden = set()
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":

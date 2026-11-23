@@ -34,6 +34,13 @@ set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV3": {
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }
+  },
+  "KvafAicpuCpuSglWriteExecutionV1": {
+    "opInfo": {
+      "functionName": "KvafAicpuCpuSglWriteExecutionV1",
+      "kernelSo": "libkvaf_aicpu_urma.so",
+      "opKernelLib": "AICPUKernel"
+    }
   },]=])
 endif()
 find_path(KVAF_AICPU_UMDK_RUNTIME_DIR NAMES liburma.so.0 liburma.so HINTS "${KVAF_URMA_ROOT}/lib64" PATHS /usr/lib64 /usr/lib)

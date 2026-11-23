@@ -10,6 +10,15 @@ constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
 // Runtime additionally carries the opt-in profile bit with the request sequence.
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
+// Scatter retains the V3 workspace. Direct output adds an exported target
+// descriptor to control storage, and allocates no HBM payload staging.
+constexpr std::uint32_t kScatterOutput = 0, kDirectOutput = 1, kOutputSegmentBytes = 64;
+struct alignas(64) OutputTarget {
+  std::uint64_t base{}, bytes{};
+  std::uint32_t token_value{}, segment_bytes{};
+  std::uint8_t segment[kOutputSegmentBytes]{};
+};
+static_assert(sizeof(OutputTarget) == 128);
 
 enum class Result : std::uint64_t {
   kPending = 0, kOk = 1, kInvalidRequest = 2, kTimeout = 3,
@@ -20,7 +29,7 @@ enum class Result : std::uint64_t {
 struct alignas(64) Word { std::uint64_t value{}, reserved[7]{}; };
 struct alignas(64) Request {
   std::uint64_t magic{kMagic}, sequence{};
-  std::uint32_t count{}, token_bytes{}, workers{}, reserved{};
+  std::uint32_t count{}, token_bytes{}, workers{}, mode{};
   std::uint64_t reserved_words[4]{};
 };
 struct alignas(64) Completion {
@@ -35,6 +44,8 @@ struct alignas(64) Coordination {
   Word claimed, built, arrivals, finished, result, published;
 };
 struct alignas(64) WorkerStatus {
+  // consumed is the number of consumed pipeline chunks; direct output waits
+  // only for done and leaves it zero.
   std::uint64_t magic{kMagic}, sequence{}, result{}, worker{}, consumed{}, reserved[3]{};
 };
 inline constexpr std::uint64_t Progress(std::uint64_t sequence, std::uint32_t chunks) {

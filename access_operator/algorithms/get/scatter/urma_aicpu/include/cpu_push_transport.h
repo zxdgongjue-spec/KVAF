@@ -12,6 +12,7 @@ struct Config {
   std::string kernel_json;
   std::array<std::uint8_t, 16> local_eid{};
   std::uint32_t token_bytes{}, workers{1};
+  bool direct_output{false};
 };
 class CpuPushTransport {
  public:
@@ -24,6 +25,9 @@ class CpuPushTransport {
   aicpu_urma::ScatterLaunchView View() const;
   static Status LaunchPrepared(const BatchGetExecRequest&, const aicpu_urma::ScatterLaunchView&, ExecutionState*);
   Status Drain();
+  bool direct_output() const;
+  Status RegisterOutput(const MutableBufferView&);
+  Status ReleaseOutput();
   Status PrepareGraph(const GetGraphOptions&);
   Status FinishGraph(void* stream, bool discard);
   std::unique_ptr<ExecutionState> CreateExecutionState();

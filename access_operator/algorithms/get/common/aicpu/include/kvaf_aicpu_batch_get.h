@@ -39,4 +39,5 @@ int32_t LaunchBatchGet(const UmdkBatchGetArgs*, aclrtStream);
 }  // namespace kvaf::aicpu_urma
 namespace kvaf::cpu_push {
 int32_t LaunchCpuPushScatter(const KernelArgs*, aclrtStream);
+int32_t LaunchCpuSglWrite(const CpuSglWriteArgs*, aclrtStream);
 }  // namespace kvaf::cpu_push

@@ -79,4 +79,10 @@ struct KernelArgs {
   std::uint64_t sequence{};  // Assigned in each instance's local copy after claiming a ticket.
   std::uint32_t workers{}, timeout_ms{kTimeoutMs};
 };
+// Keep the Scatter V3 launch ABI unchanged. The direct-write entry owns its
+// additional exported-output argument.
+struct CpuSglWriteArgs {
+  KernelArgs execution;
+  OutputTarget output_target;
+};
 }  // namespace kvaf::cpu_push

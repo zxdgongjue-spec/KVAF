@@ -1,5 +1,8 @@
 # AICPU CPU Push Scatter：构建、调用与验证
 
+需要 CPU SGL 直接写调用方连续 output、跳过 AICPU scatter 时，见
+[CPU SGL Write](cpu_sgl_write.md)。
+
 本页描述 Scatter 数据流和兼容接口示例。按调用选择算法、驻留资源和 Get 图模式见
 [实现与使用](cache_transport_execution_implementation.md)；统一功能与性能比较见
 [验证步骤](cache_transport_execution_validation.md)。
