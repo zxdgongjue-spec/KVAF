@@ -279,6 +279,9 @@ Read `entry_boundary` in the resulting report:
 | `clock.metadata_diagnostics` | Failed file pattern and match counts in the counter directory and entire capture; identifies missing, relocated or duplicate metadata without exporting paths or clock values. |
 | `clock.status=sync_counter_frequency_mismatch` | Legacy v2 samples use a different counter frequency; diagnostics show both Hz values and request raw-clock samples. Rebuild and recapture v3. |
 | `clock.status=calibration_inconsistent_with_task_containment` | Converted entry/return timestamps fall outside their associated task; no split is emitted. |
+| `clock.diagnostics.candidate_stats_us` | Signed before/after differences retained on alignment failure. Negative values reveal the direction and size of misalignment; these are unvalidated diagnostics, not latency attribution. |
+| `clock.diagnostics.additional_offset_bounds_us` | Coupled range of extra offsets that could restore task containment; never applied automatically. An empty range cannot be explained by one constant offset. |
+| `clock.diagnostics.clock_reference_durations_us` | First selected entry/task elapsed times relative to their metadata anchors, plus the Host counter correction. All are durations, with no absolute anchors exported. |
 | `clock.status=counter_and_steady_durations_disagree` | Legacy v2 hardware and steady spans disagree beyond the clock-read tolerance; no split is emitted. |
 | `clock.status=bounds_only_no_independent_calibration` | Only conditional bounds are available; no measured before/after point split. |
 | `clock.task_begin_to_first_entry_mean_bounds_us` | Possible mean time before user entry, under a common unit-rate clock-offset assumption. |

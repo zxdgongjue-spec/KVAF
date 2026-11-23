@@ -923,7 +923,7 @@ def calibrated_clock(path, device_id, source_clock="aicpu_steady_ns"):
     return convert
 
 
-def msprof_device_clock(root, tasks, frequency, diagnostics=None, raw_clock=False):
+def msprof_device_clock(root, tasks, frequency, diagnostics=None, raw_clock=False, first_sample=None):
     """Use independent capture clock anchors, never fitted task boundaries.
 
     Mirrors msprof InfoConfReader.get_delta_time/trans_into_local_time:
@@ -978,15 +978,22 @@ def msprof_device_clock(root, tasks, frequency, diagnostics=None, raw_clock=Fals
                 raise ValueError("sync_counter_frequency_mismatch")
             counter_origin = dev["cntvct"]
         host_ns = host["clock_monotonic_raw"]
+        host_correction_ns = Decimal(0)
         if host.get("cntvct_diff", 0):
             host_frequency = Decimal(str(info["CPU"][0]["Frequency"])) * 1000000
             if host_frequency <= 0:
                 raise ValueError("sync_invalid_host_frequency")
-            host_ns += host["cntvct_diff"] * 1000000000 / host_frequency
+            host_correction_ns = host["cntvct_diff"] * 1000000000 / host_frequency
+            host_ns += host_correction_ns
         local_offset_us = Decimal(str(start["collectionTimeBegin"])) - Decimal(str(start["clockMonotonicRaw"])) / 1000
         trace_origin_us = host_ns / 1000 + local_offset_us
         if not all(v.is_finite() for v in (counter_origin, trace_origin_us, device_frequency)) or counter_origin <= 0:
             raise ValueError("sync_invalid_metadata")
+        if diagnostics is not None and first_sample is not None:
+            diagnostics.update(first_entry_since_device_anchor_us=round(float(
+                (Decimal(first_sample[0]) - counter_origin) * 1000000 / device_frequency), 3),
+                first_task_since_host_anchor_us=round(float(Decimal(str(first_sample[1])) - trace_origin_us), 3),
+                host_counter_correction_us=round(float(host_correction_ns / 1000), 3))
     except (KeyError, IndexError, TypeError, InvalidOperation, ZeroDivisionError):
         raise ValueError("sync_invalid_metadata") from None
 
@@ -1049,7 +1056,7 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
     indexes = sorted({round(i * (len(representatives) - 1) / max(1, sample_limit - 1)) for i in range(sample_limit)})
     result["representative_nodes"] = [dict(round=representatives[i]["round"], node=representatives[i]["node"],
         **{key + "_us": round(representatives[i][key], 3) for key in fields}) for i in indexes]
-    convert, counter_mode = None, False
+    convert, counter_mode, mapping_diagnostics = None, False, {}
     raw_clock = data["device_clock"] == "aicpu_monotonic_raw_ns"
     if clock_map is not None:
         convert = calibrated_clock(clock_map, data["device_id"], data["device_clock"])
@@ -1063,7 +1070,9 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
             frequency = next(iter(frequencies))
         diagnostics = {}
         try:
-            convert = msprof_device_clock(trace.root, [p["task"] for p in pairs], frequency, diagnostics, raw_clock)
+            first_value = selected[0]["entry"] if raw_clock else min(w["device_entry_syscnt"] for w in selected[0]["workers"])
+            convert = msprof_device_clock(trace.root, [p["task"] for p in pairs], frequency, diagnostics, raw_clock,
+                                          (first_value, selected[0]["task"].start))
         except ValueError as error:
             code = str(error)
             result["clock"] = dict(status=code if code.startswith("sync_") else "sync_invalid_metadata", split_available=False)
@@ -1071,6 +1080,7 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
                 result["clock"]["metadata_diagnostics"] = diagnostics
             return result
         counter_mode = not raw_clock
+        mapping_diagnostics = diagnostics
     if convert is not None:
         before, after, uncertainty, mapped_outside = [], [], [], []
         counter_span_delta = []
@@ -1089,8 +1099,26 @@ def entry_boundary_report(trace, timeline, data, clock_map=None, sample_limit=5)
         except ValueError:
             result["clock"] = dict(status="calibration_does_not_cover_samples", split_available=False)
             return result
-        if any(a < -u or b < -u for a, b, u in zip(before, after, uncertainty)):
-            result["clock"] = dict(status="calibration_inconsistent_with_task_containment", split_available=False)
+        invalid_before = [value < -u for value, u in zip(before, uncertainty)]
+        invalid_after = [value < -u for value, u in zip(after, uncertainty)]
+        if any(invalid_before) or any(invalid_after):
+            lower = max(-u - value for value, u in zip(before, uncertainty))
+            upper = min(value + u for value, u in zip(after, uncertainty))
+            result["clock"] = dict(status="calibration_inconsistent_with_task_containment", split_available=False,
+                source_clock=data["device_clock"], boundary_uncertainty_us=max(uncertainty),
+                diagnostics=dict(selected_nodes=len(selected),
+                    entry_before_task_nodes=sum(invalid_before), return_after_task_nodes=sum(invalid_after),
+                    candidate_stats_us=dict(task_begin_to_first_entry=stats(before), last_return_to_task_end=stats(after),
+                                            mapped_minus_sample_entry_span=stats(counter_span_delta)),
+                    constant_offset_could_restore_containment=lower <= upper,
+                    additional_offset_bounds_us=[round(lower, 3), round(upper, 3)],
+                    note="Unvalidated signed differences, not measured front/back attribution. No additional offset is applied."))
+            if mapping_diagnostics:
+                result["clock"]["diagnostics"]["clock_reference_durations_us"] = mapping_diagnostics
+            for item in result["representative_nodes"]:
+                index = next(i for i, p in enumerate(selected) if (p["round"], p["node"]) == (item["round"], item["node"]))
+                item.update(candidate_task_begin_to_first_entry_us=round(before[index], 3),
+                            candidate_last_return_to_task_end_us=round(after[index], 3))
             return result
         if counter_mode and any(abs(delta) > max(2.0, p["entry_span"] * .001)
                                 for delta, p in zip(counter_span_delta, selected)):

@@ -158,6 +158,34 @@ class GapExtractorTest(unittest.TestCase):
             result = entry_boundary_report(trace, timeline, data)
             self.assertEqual(result["clock"]["status"], "calibration_inconsistent_with_task_containment")
             self.assertFalse(result["clock"]["split_available"])
+            diagnostics = result["clock"]["diagnostics"]
+            self.assertEqual(diagnostics["entry_before_task_nodes"], 2)
+            self.assertEqual(diagnostics["return_after_task_nodes"], 0)
+            self.assertEqual(diagnostics["candidate_stats_us"]["task_begin_to_first_entry"]["mean"], -990)
+            self.assertEqual(diagnostics["candidate_stats_us"]["last_return_to_task_end"]["mean"], 1020)
+            self.assertEqual(diagnostics["additional_offset_bounds_us"], [989, 1021])
+            self.assertTrue(diagnostics["constant_offset_could_restore_containment"])
+            self.assertEqual(diagnostics["clock_reference_durations_us"], dict(
+                first_entry_since_device_anchor_us=-370, first_task_since_host_anchor_us=620,
+                host_counter_correction_us=.08))
+            self.assertNotIn("dominant_boundary", result)
+            self.assertNotIn("task_begin_to_first_entry", result["stats_us"])
+            self.assertNotIn("987655321000", json.dumps(result))
+
+    def test_failed_alignment_reports_when_one_offset_cannot_fit_all_rounds(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            trace, timeline, data = sample_trace(root)
+            data = add_raw_samples(root, data)
+            for worker in data["rounds"][1]["nodes"][0]["workers"]:
+                for key in ("device_entry_ns", "device_start_ns", "device_finish_ns", "device_return_ns"):
+                    worker[key] += 100000
+            result = entry_boundary_report(trace, timeline, data)
+            self.assertEqual(result["clock"]["status"], "calibration_inconsistent_with_task_containment")
+            diagnostics = result["clock"]["diagnostics"]
+            self.assertFalse(diagnostics["constant_offset_could_restore_containment"])
+            self.assertEqual(diagnostics["return_after_task_nodes"], 1)
+            self.assertNotIn("dominant_boundary", result)
 
     def test_counter_sync_ignores_done_markers_for_all_metadata_and_device_discovery(self):
         with TemporaryDirectory() as folder:
