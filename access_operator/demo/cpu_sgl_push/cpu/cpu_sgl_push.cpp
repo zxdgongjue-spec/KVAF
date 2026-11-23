@@ -447,7 +447,12 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
         return 1;
       }
       urma_cr_t cr{};
+      const uint64_t deadline = kvaf::demo::NowNs() + 3000ULL * 1000 * 1000;
       while (urma_poll_jfc(jfc, 1, &cr) == 0) {
+        if (kvaf::demo::NowNs() > deadline) {
+          std::fprintf(stderr, "[SELFTEST] %s TIMEOUT (no completion in 3s)\n", name);
+          return 1;
+        }
       }
       std::fprintf(stderr, "[SELFTEST] %s status=%d user_ctx=%llu len=%u\n", name, cr.status,
                    static_cast<unsigned long long>(cr.user_ctx), cr.completion_len);
@@ -457,28 +462,6 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     std::memcpy(flag_buf, &probe_seq, 8);
     urma_sge_t fa{reinterpret_cast<uint64_t>(flag_buf), 8, flag_seg, nullptr};
     int fail = post_one(1, &fa, remote_base, 8, "flag8");
-    // (a2) reverse direction: 8B READ from remote HBM into the flag seg.
-    {
-      urma_sge_t ldst{reinterpret_cast<uint64_t>(flag_buf), 8, flag_seg, nullptr};
-      urma_sge_t rsrc{remote_base, 8, remote_tseg, nullptr};
-      urma_jfs_wr_t wr{};
-      wr.opcode = URMA_OPC_READ;
-      wr.flag.bs.complete_enable = 1;
-      wr.tjetty = target;
-      wr.user_ctx = probe_seq++;
-      wr.rw.src = {&rsrc, 1U};
-      wr.rw.dst = {&ldst, 1U};
-      urma_jfs_wr_t *bad = nullptr;
-      if (urma_post_jetty_send_wr(jetty, &wr, &bad) != 0) {
-        std::fprintf(stderr, "[SELFTEST] read8 post failed errno=%d\n", errno);
-      } else {
-        urma_cr_t cr{};
-        while (urma_poll_jfc(jfc, 1, &cr) == 0) {
-        }
-        std::fprintf(stderr, "[SELFTEST] read8 status=%d user_ctx=%llu len=%u\n", cr.status,
-                     static_cast<unsigned long long>(cr.user_ctx), cr.completion_len);
-      }
-    }
     // (a3) flag write sourced from a seg registered with the LOCAL_ONLY bit
     // added (some UDMA builds gate local DMA on it).
     {
@@ -513,6 +496,37 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
       sg8[i].user_tseg = nullptr;
     }
     if (!fail) fail = post_one(8, sg8, remote_base + key.data_offset + 65536, 8 * args.token_bytes, "sgl8");
+    // (d) reverse direction probe LAST: 8B READ from remote HBM into the flag
+    // seg. Bounded and non-fatal -- an unsupported READ must not hang or mask
+    // the write-path results above.
+    {
+      urma_sge_t ldst{reinterpret_cast<uint64_t>(flag_buf), 8, flag_seg, nullptr};
+      urma_sge_t rsrc{remote_base, 8, remote_tseg, nullptr};
+      urma_jfs_wr_t wr{};
+      wr.opcode = URMA_OPC_READ;
+      wr.flag.bs.complete_enable = 1;
+      wr.tjetty = target;
+      wr.user_ctx = probe_seq++;
+      wr.rw.src = {&rsrc, 1U};
+      wr.rw.dst = {&ldst, 1U};
+      urma_jfs_wr_t *bad = nullptr;
+      if (urma_post_jetty_send_wr(jetty, &wr, &bad) != 0) {
+        std::fprintf(stderr, "[SELFTEST] read8 post failed errno=%d\n", errno);
+      } else {
+        urma_cr_t cr{};
+        const uint64_t deadline = kvaf::demo::NowNs() + 3000ULL * 1000 * 1000;
+        bool got = false;
+        while (urma_poll_jfc(jfc, 1, &cr) == 0) {
+          if (kvaf::demo::NowNs() > deadline) {
+            break;
+          }
+        }
+        got = cr.user_ctx != 0 || cr.completion_len != 0 || cr.status != 0;
+        std::fprintf(stderr, "[SELFTEST] read8 %s status=%d user_ctx=%llu len=%u\n",
+                     got ? "done" : "TIMEOUT", cr.status,
+                     static_cast<unsigned long long>(cr.user_ctx), cr.completion_len);
+      }
+    }
     if (fail) {
       std::fprintf(stderr, "[SGL_PUSH] selftest failed\n");
       return 1;
@@ -587,7 +601,12 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     const uint64_t t_posted = kvaf::demo::NowNs();
     urma_cr_t cr{};
     int got = 0;
+    const uint64_t deadline = kvaf::demo::NowNs() + 5000ULL * 1000 * 1000;
     while ((got = urma_poll_jfc(jfc, 1, &cr)) == 0) {
+      if (kvaf::demo::NowNs() > deadline) {
+        std::fprintf(stderr, "[SGL_PUSH] completion TIMEOUT iter=%u\n", iter);
+        return 1;
+      }
     }
     if (cr.status != URMA_CR_SUCCESS) {
       std::fprintf(stderr, "[SGL_PUSH] completion error iter=%u status=%d user_ctx=%llu completion_len=%u\n",
@@ -626,7 +645,14 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     return 1;
   }
   urma_cr_t cr{};
-  while (urma_poll_jfc(jfc, 1, &cr) == 0) {
+  {
+    const uint64_t deadline = kvaf::demo::NowNs() + 5000ULL * 1000 * 1000;
+    while (urma_poll_jfc(jfc, 1, &cr) == 0) {
+      if (kvaf::demo::NowNs() > deadline) {
+        std::fprintf(stderr, "[SGL_PUSH] stop flag completion TIMEOUT\n");
+        break;
+      }
+    }
   }
   if (csv != nullptr) std::fclose(csv);
   std::fprintf(stderr, "[SGL_PUSH] DONE iters=%u miss=%u group=%u runs_per_iter=%u\n", args.iters, args.miss,
