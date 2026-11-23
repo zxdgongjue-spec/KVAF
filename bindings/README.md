@@ -14,6 +14,8 @@
 `--cpu-pull-only` / `--raw-pull-only`，不会构建普通 DDR 算子的设备内核。
 
 `include/` 存放 Binding 内部共享头，`src/` 存放扩展实现；Python 包与构建后导入校验脚本保留在本目录。
+`build.sh` 默认使用 `RelWithDebInfo`，每次构建同步 Python 模块并校验扩展导入。
+运行时将所选构建目录的 `python/` 加入 `PYTHONPATH`，见 [Python 包构建说明](../python/README.md)。
 
 当前 Binding 用于验证以下链路：
 
@@ -21,7 +23,8 @@
 C++ 编译 → Python 原生扩展 → Python 导入
 ```
 
-CPU 构建提供进程内 Mock Runtime。启用 `KVAF_ENABLE_AIV_BATCH_GET`、`KVAF_ENABLE_AICPU_URMA`、`KVAF_ENABLE_CPU_OFFLOAD`
+启用 `KVAF_BUILD_PYTHON` 的便携构建提供进程内 Mock Runtime；`./build.sh cpu` 只构建
+CPU 服务，不生成 Python 包。启用 `KVAF_ENABLE_AIV_BATCH_GET`、`KVAF_ENABLE_AICPU_URMA`、`KVAF_ENABLE_CPU_OFFLOAD`
 或 `KVAF_ENABLE_NPU_PULL` 时，额外提供
 `NpuRuntime` 与 `AclGraph`：后者是 Python-owned 的 ACL Runtime Graph 薄封装，直接
 暴露 capture / replay / synchronize / destroy 生命周期，用于 Python 集成测试或上层

@@ -4,7 +4,7 @@
 
 公共 C++ 头文件继续放在 `include/`，包含方式与构建 target 不变。实现按职责组织：
 
-- `src/`：`RuntimeCore`、`NpuRuntime` 入口和 NPU 配置。
+- `src/`：`RuntimeCore`、`NpuRuntime` 入口和 NPU 配置，以及 CPU Pull executor、源注册、READ 控制服务与 NPU raw READ 实现。
 - `execution/`：执行配置解析、Dispatcher 与执行资源管理；驻留上下文及绑定的公共定义仍在 `include/`。
 - `memory/`：缓存池服务、池分配与 session 工厂、CPU DDR 注册复用、UBMEM allocator。
 - `peer/`：NPU/CPU 链路和 execution 控制协议。
@@ -19,6 +19,7 @@
 KVAF Runtime 是对外的 KV 控制面入口。它不处理 Prefix Key 或
 Forward 语义；它只拥有内部 DDR 的生命周期，编排 MetaManager 与
 AccessOperator，并把调用方已经准备好的输入/输出 buffer 交给数据面。
+独立 NPU Pull 管理 HBM 注册及连接，不要求创建 DDR 缓存池。
 
 ## 已实现能力
 
@@ -68,6 +69,8 @@ cd /path/to/kvaf
   --listen 0.0.0.0 --port 28999
 ```
 
+统一构建默认使用 `RelWithDebInfo`，可通过 `--build-type` 覆盖。
+
 CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
@@ -112,12 +115,16 @@ runtime.initialize(ddr_bytes, kv_block_bytes)
 已知设备名时可设置 `peer_ub_device="udmac0d1e2"`，固定 CPU 侧候选设备。
 Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写入。
 
-`link_to` 必须在 `initialize` 前调用。URMA 初始化从 HCCL root-info 读取当前物理卡的
+`link_to` 必须在 `initialize_ddr(ddr_bytes, slot_size)` 或带 DDR 参数的 `initialize` 前调用；
+无参数 `initialize()` 只初始化基础设备，可用于无 DDR 的 NPU Pull。
+显式调用 `initialize_ddr()` 前须先完成无参数 `initialize()`；带 DDR 参数的兼容入口会自动完成基础初始化。
+URMA 初始化从 HCCL root-info 读取当前物理卡的
 CLOS PG EID，并尝试追加 `/proc/asdrv_ub/pair_info` 的候选；未指定 EID 时采用首项。
 初始化建立 CacheRegion 和元数据；具体 transport、MR、队列、Gather 工作区及 AICPU
 包在首次使用或显式 warmup 时准备，初始化成功不代表数据面已通过 RMA 验证。
-未建立 CPU 服务 Link 时，`initialize` 返回 `InvalidState`。
-`batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，构造时必须提供；
+未建立 CPU 服务 Link 时，DDR 初始化返回 `InvalidState`。
+`batch_get_token_bytes` 和 `batch_get_tokens_per_block` 可同时省略，用于独立 Pull；
+普通缓存 Get 在 provider 首次准备时要求有效布局。显式布局必须同时为正数，
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
 为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；
 URMA AIV Jetty 数默认 2、URMA AIV Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
@@ -236,7 +243,8 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 CPU service 须预先启动。替换 `--backend` 及对应的 `--aiv-cores` / `--aicpu-workers` 可测 UBMEM、Gather、Scatter，
 具体参数及计时范围见[统一 Get 性能测试](../docs/batch_get_performance.md)。
-独立功能测试及其 CMake 注册已移除，数据预检和输出校验继续在性能计时外执行。
+普通 Get 的数据预检和输出校验随性能入口执行，位于性能计时外；Pull 功能和
+Host 故障注入验证见 [诊断入口](../tests/diagnostics/README.md)。
 默认关闭 kernel profiling；上例显式使用 `--kernel-profile` 开启设备打点与报告读取，
 测无 profiling 的端到端性能时去掉该参数。`--multi-graph-check` 可在计时前验证
 多节点报告隔离、自动收集/捕获、两条 stream 上由调用方串行执行的图与 eager 共用输出。
