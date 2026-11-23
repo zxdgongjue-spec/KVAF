@@ -1,6 +1,6 @@
 # 面向应用 Connector 的 CPU Pull 与 NPU Pull 接口设计
 
-状态：本文保留 cpu-npu-pull-opt 的接口演进记录。合入 main 后，构造配置、Region 授权、统一写事务、raw Drain 和 graph lease 已更新；当前使用方式以 [CPU Pull 使用说明](cpu_pull_offload_usage.md)、[共享 DDR](shared_ddr_remote_offload.md)、[NPU raw READ](hbm_raw_addr_read.md) 和 [建链流程](connection_handshake_flows.md) 为准。本文历史示例不应直接作为当前版本的完整调用合同。
+状态：本文保留 cpu-npu-pull-opt 的接口演进记录。合入 main 后，构造配置、Region 授权和统一写事务已更新；raw NPU Pull 沿用应用负责正常输入保活、同步和销图的约定，并保留独立 NpuPullOptions。当前使用方式以 [CPU Pull 使用说明](cpu_pull_offload_usage.md)、[共享 DDR](shared_ddr_remote_offload.md)、[NPU raw READ](hbm_raw_addr_read.md) 和 [建链流程](connection_handshake_flows.md) 为准。本文历史示例不应直接作为当前版本的完整调用合同。
 
 应用在 A、B 两台机器上分别运行 Connector。A 生产 HBM 数据并发送业务元数据，B 根据元数据组织源和目的地址，调用 KVAF 拉取。KVAF 向 B 返回结果，后续业务通知由两个 Connector 自行处理。
 

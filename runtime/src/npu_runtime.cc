@@ -940,7 +940,7 @@ Status NpuRuntime::ListenHbm(const std::string& address,const std::string& adver
     if(kernel.empty())kernel=detail::kDefaultRawReadKernelPath;
     if(kernel.empty())return Status::InvalidArgument("configure npu_pull_options.kernel_path");
     impl_->hbm_reader=std::make_shared<HbmReader>(device_id(),o.cores,o.jettys,
-        o.max_inflight_total,kernel,o.max_host_inflight,o.max_output_bindings,o.diagnostics);
+        o.max_inflight_total,kernel,o.max_output_bindings,o.diagnostics);
   }
   return impl_->hbm_reader->Listen(address,advertised,local_eid,receiver);
 #else
@@ -949,41 +949,16 @@ Status NpuRuntime::ListenHbm(const std::string& address,const std::string& adver
 }
 Status NpuRuntime::BatchGetRawAddr(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
     NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
-    bool validate_ranges,bool synchronize,std::uint64_t graph_lease,RawReadLifetime lifetime) {
+    bool validate_ranges,bool synchronize) {
 #if defined(KVAF_ENABLE_NPU_PULL)
   auto reader=impl_->Reader();
   if(!initialized() || !reader)return Status::NotInitialized("listen and register source before raw READ");
   if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
   return reader->Read(ready,src,dst,lengths,output,stream,profile,validate_ranges,
-                                 synchronize,graph_lease,std::move(lifetime));
+                      synchronize);
 #else
   return Status::NotImplemented("NPU Pull was not built");
 #endif
-}
-Status NpuRuntime::DrainRawAddr(const ReadyToken& ready) {
-#if defined(KVAF_ENABLE_NPU_PULL)
-  auto reader=impl_->Reader();
-  if(reader)return reader->Drain(ready);
-#endif
-  return Status::NotInitialized("NPU Pull is not initialized");
-}
-Status NpuRuntime::BeginRawGraph(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
-    NpuInt64ArrayView lengths,MutableBufferView output,void* stream,std::uint64_t* lease,RawReadLifetime lifetime) {
-#if defined(KVAF_ENABLE_NPU_PULL)
-  auto reader=impl_->Reader();
-  if(!initialized() || !reader)return Status::NotInitialized("NPU Pull is not initialized");
-  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
-  return reader->BeginGraph(ready,src,dst,lengths,output,stream,lease,std::move(lifetime));
-#else
-  return Status::NotImplemented("NPU Pull was not built");
-#endif
-}
-Status NpuRuntime::EndRawGraph(std::uint64_t lease) {
-#if defined(KVAF_ENABLE_NPU_PULL)
-  auto reader=impl_->Reader();
-  if(reader)return reader->EndGraph(lease);
-#endif
-  return Status::NotInitialized("NPU Pull is not initialized");
 }
 Status NpuRuntime::ResolveRawAddr(const ReadyToken& ready) {
 #if defined(KVAF_ENABLE_NPU_PULL)
@@ -1003,14 +978,6 @@ bool NpuRuntime::pending_raw_addr() const {
 #if defined(KVAF_ENABLE_NPU_PULL)
   auto reader=impl_->Reader();
   return reader && reader->pending();
-#else
-  return false;
-#endif
-}
-bool NpuRuntime::raw_inflight() const {
-#if defined(KVAF_ENABLE_NPU_PULL)
-  auto reader=impl_->Reader();
-  return reader && reader->inflight();
 #else
   return false;
 #endif

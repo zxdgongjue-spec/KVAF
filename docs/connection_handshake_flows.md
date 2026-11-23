@@ -1,8 +1,8 @@
 # A、B 与 CPU Service：建链和实际数据拉取交互
 
-更新日期：2026-11-21。本文描述此次合入后的代码：普通缓存保留 main 的按配置执行框架，CPU/NPU Pull 接入独立资源与生命周期。
+更新日期：2026-11-23。本文描述此次合入后的代码：普通缓存保留 main 的按配置执行框架，CPU/NPU Pull 接入独立资源与生命周期。
 
-CPU Pull 正常成功批次使用一次 KVRP v8 `SubmitAndWait` RPC；NPU Pull 默认异步入队，使用显式 Drain 和独立图节点租约管理引用。两条路径的源复用均由应用通知协调，源端 `ReleaseBatch` 不查询远端 DMA。KVHR v8 负责 NPU 注册、重连和硬件资源关闭，不承担逐批 Complete／Cancel 通知。
+CPU Pull 正常成功批次使用一次 KVRP v8 `SubmitAndWait` RPC；NPU Pull 默认异步入队，由应用负责正常输入保活、同步和销毁捕获图。两条路径的源复用均由应用通知协调，源端 `ReleaseBatch` 不查询远端 DMA。KVHR v8 负责 NPU 注册、重连和硬件资源关闭，不承担逐批 Complete／Cancel 通知。
 
 下文描述接口和资源合同；可移植测试不能代替目标硬件的 URMA、UBMEM 可见性及吞吐验收。
 
@@ -348,7 +348,7 @@ sequenceDiagram
 
 便利入口的未决状态用 `resolve_cpu_pull()` 恢复；显式接口使用原 PutHandle。主动放弃未使用 token 调 `cancel_cpu_pull(ready)`；若已 Prepare 但尚未 Submit，先 `abort_put(put)`。B 的 `cancel_batch()` 只是本地解冻，不能替代 A 的取消操作。独立 `last_offload_checksum()` 只诊断当前 DDR 数据，须在槽位被释放、覆盖或源进入下一批前使用。
 
-## 7. NPU Pull：默认异步、连接级 Drain 和图租约
+## 7. NPU Pull：默认异步、应用负责保活和同步
 
 ### 7.1 正常读取和引用
 
@@ -357,44 +357,43 @@ sequenceDiagram
 ready = source.ready(tensor)
 runtime.batch_get_raw_addr(ready, src, dst, lengths, output, stream=read_stream)
 # 默认 state="submitted"；同一 stream 可以继续排入消费者。
-runtime.drain_raw_addr(ready)
+read_stream.synchronize()
 # 等待其他消费者，禁止迟到提交/replay，再发送匹配批次的 reuse。
 source.release_batch(ready)  # B 收到应用通知后执行
 ```
 
-A 校验源身份、MR、取消围栏、数组布局，然后直接启动 raw kernel；设备三数组不经 Host 回读。每段一个 READ WQE，不拆成 64 KiB 子段。默认无逐批 KVAF RPC、无 Host status D2H、无内部 stream 同步。`synchronize=True` 显式等待；成功表示登记工作完成，不增加完整 payload 正确性检查承诺。
+A 校验源身份、MR、取消围栏、数组布局，然后直接启动 raw kernel；设备三数组不经 Host 回读。每段一个 READ WQE，不拆成 64 KiB 子段。默认无逐批 KVAF RPC、无 Host status D2H、无内部 stream 同步。`synchronize=True` 显式等待 stream 完成，不增加完整 payload 正确性检查承诺。
 
-每个 source connection 的多 MR 共用持久队列。Host 提交使用该连接的锁，同 stream 可连续入队；切换 stream 前必须 Drain。不同连接不相互排空。Python 在 launch 前保留三数组 Tensor/storage、output/storage 和 stream：按次引用到同步或 Drain 成功，output 的注册引用到 binding/connection 安全关闭。C++ 非拥有 view 仍由调用方保活；强引用不允许应用在执行期间 resize、换 storage 或改写正在使用的元数据。
+每个 source connection 的多 MR 共用持久队列。Host 提交使用该连接的锁，同 stream 可连续入队；切换 stream 时，应用先等待旧任务完成或建立使共享队列串行执行的依赖。正常成功调用不保留按次输入，应用须保持三数组 Tensor/storage 和 stream 有效到执行结束。output 的 MR 缓存到连接安全关闭，Python output Tensor/storage 引用保守保留到 Runtime shutdown 成功。C++ 非拥有 view 仍由调用方保活；执行期间不得 resize、换 storage 或改写正在使用的元数据。
 
-`drain_raw_addr(ready)` 按源连接操作，在短锁内设置 Draining 并冻结 invocation 水位，阻止同连接的新提交，释放锁后等待 stream，再清理已完成记录。失败保留引用。Host 在途和 output binding 各有预算，达到上限返回 Busy；不会偷偷同步或淘汰在途资源。`raw_inflight` 描述正常登记在途，`pending_raw_addr` 只描述失败隔离，false 不是完成证明。
+`NpuPullOptions` 独立配置 raw kernel、核数、Jetty 数、设备在途窗口、output 注册缓存上限和 diagnostics。`max_output_bindings` 默认 64，达到缓存上限时拒绝新注册并保留旧缓存；`max_inflight_total` 控制设备 READ 窗口，不是 Host 调用计数。正常异步调用不登记 invocation，排队数量和完成由应用管理。提交或显式同步失败且执行未决时，绑定额外保留输入和 stream；`pending_raw_addr` 只描述失败隔离，false 不是完成证明。
 
-### 7.2 图节点准备、捕获和跨批次复用
+### 7.2 图预热、捕获和跨批次复用
 
-先取得有效 ReadyToken，保持该批源冻结；图节点准备发生在 capture 外，不执行 READ：
+先取得有效 ReadyToken，保持该批源冻结；相同 MR/output 的 eager 预热和同步发生在 capture 外：
 
 ```python
-runtime.drain_raw_addr(ready)  # 清理此前 eager 工作
-lease = runtime.begin_raw_graph(ready, src, dst, lengths, output, stream=read_stream)
+runtime.batch_get_raw_addr(ready, src, dst, lengths, output, stream=read_stream)
+read_stream.synchronize()  # 完成资源预热后才开始捕获
 graph = kvaf.AclGraph()
 graph.capture_begin(read_stream)
 runtime.batch_get_raw_addr(ready, src, dst, lengths, output,
-                           stream=read_stream, graph_lease=lease)
+                           stream=read_stream, synchronize=False, profile=False)
 graph.capture_end()
 graph.replay(read_stream)
 read_stream.synchronize()
 # 应用完成消费者并发送本轮 reuse；B release，之后可发布下一轮 Ready。
-# 所有轮次结束：停止 replay、完成 stream，销毁框架图，再归还租约。
+# 所有轮次结束：停止 replay、完成全部 stream，在 source/runtime 关闭前销毁所有图。
 graph.reset()
-runtime.end_raw_graph(lease)
 ```
 
-一个 lease 对应一个节点；多个节点分别 Begin，不能重复捕获同一个 lease。节点固定 source 代次、MR、output、三数组地址和数量、stream 及队列地址，持有独立 status 和引用；不固定 Ready sequence。相同 MR 可跨生产批次复用，应用每轮核对新 Ready、等待上一轮完成后更新数组内容。同一连接的 eager、多个图与 MR 由应用串行调度；当前存活图租约固定该连接的 stream。
+应用固定 source 代次、MR、output、三数组地址和数量以及通信资源，并保留图引用的 Tensor/storage 和 stream 到图销毁。相同 MR 可跨生产批次复用，应用每轮核对新 Ready、等待上一轮完成后更新数组内容，并保证更新对 replay 可见。每次读取和消费者结束后才通知源复用。同一连接的 eager、多个图与 MR 共享队列，由应用串行调度。
 
-外部框架 replay 不经过 KVAF Host API，取消不能拦截它。Drain、End 和关闭前应用必须停止并发 replay；停止、同步并销毁框架图后才能 End。存活 lease 阻止 detach。准备失败可能已返回非零 lease：原生调用方应 End 重试；Python 先尝试清理，仍失败时异常的 `graph_lease` 保存待清理句柄。
+外部框架 replay 不经过 KVAF Host API，取消不能拦截它。应用必须停止 replay、同步全部执行并销毁所有框架图，之后才能关闭 source/runtime 或释放图引用的存储；KVAF 不检测外部图寿命，也不在关闭时隐式等待正常 raw 任务。raw 不提供图租约；普通缓存 Get 的 Drain、图资源租约和 AccessTable 引用机制保持不变。
 
 ### 7.3 诊断与 ABI
 
-`KVAF_HBM_RAW_READ_DIAGNOSTICS=1` 或 `npu_pull_options.diagnostics=True` 只用于显式 eager 定位：清零诊断状态、同步、回读状态/队列/entity，并核对提交和完成。失败返回 `CompletionUnknown` 并保留资源；graph Prepare 拒绝诊断模式。正常性能采样关闭诊断，payload/guard 校验另计。
+`KVAF_HBM_RAW_READ_DIAGNOSTICS=1` 或 `npu_pull_options.diagnostics=True` 只用于显式 eager 定位：清零诊断状态、同步、回读状态/队列/entity，并核对提交和完成。失败返回 `CompletionUnknown` 并保留资源。图捕获与回放必须关闭诊断，并使用 `synchronize=False, profile=False`。正常性能采样关闭诊断，payload/guard 校验另计。
 
 raw kernel 入口仍为 `KvafExecuteBatchGetRawAddrAivKernelV2`，参数 80 B、每核 status 1280 B；与 main Host 共用版本 2 的 DirectUrmaEntity。多 MR view 更新完整 MR 身份及 registered_base，保持相同 SQ/CQ。原来的 local SGE `word[13]=0` 修复保留，MR 注册 token 仍有效；普通 Get/Put WQE 不随此修改。CQE/WQE 快照由设备写入普通 HBM status，Host 不直接读取 provider SQ 地址。
 
@@ -459,7 +458,7 @@ sequenceDiagram
 
 普通 Get 可以读取其他已经提交并 pin 的槽位，不因 CPU Pull pending 全局停用。Pending 槽位不能读；Free 拒绝 Pending 或仍被 AccessTable/图引用的记录。调用方直接使用裸地址时必须自行保护所指数据范围。
 
-普通 Get 的异步 drain、方向恢复、graph_resources 多节点及 lease 生命周期保留 main 行为。raw graph 使用独立 API，不复用依赖 CacheRegion/AccessTable 的普通 Get 图类型。准确参数与例子见[缓存执行框架使用说明](cache_transport_execution_implementation.md)。
+普通 Get 的异步 drain、方向恢复、graph_resources 多节点及 lease 生命周期保留 main 行为。raw graph 直接捕获 `batch_get_raw_addr()`，不复用依赖 CacheRegion/AccessTable 的普通 Get 图类型。准确参数与例子见[缓存执行框架使用说明](cache_transport_execution_implementation.md)。
 
 ## 10. 失败、取消与正常关闭
 
@@ -481,18 +480,18 @@ sequenceDiagram
 | CPU READ 正在运行时取消 | 不强行终止 DMA，保留资源并查询／重试同一取消；已确定 Abort 不因稍后 Done 改成 Commit |
 | NPU cancel_raw_addr | 只更新本地取消围栏，阻止该批及更早批次未来的 Host 提交；不发通知、不撤回队列、不使旧 graph 失效 |
 | NPU 提交／同步／诊断失败 | pending_raw_addr 表示失败隔离；resolve_raw_addr 校验原失败 token 并报告未决，不同步、不重放、不发通知 |
-| 正常异步 NPU READ 已提交 | raw_inflight 保存登记记录；同步或 Drain 清理，pending_raw_addr=false 不是完成证明 |
+| 正常异步 NPU READ 已提交 | 应用保持输入和 stream 有效并等待执行／消费者完成；pending_raw_addr=false 不是完成证明 |
 | 应用 reuse 通知或 released 回复丢失 | 保留原批次／会话身份处理，不把断连或消息发送成功当作源释放许可 |
 
 同一个冻结 NPU 批次允许重复 READ；成功提交不会推进“已消费 sequence”围栏。旧 Ready 消息和图回放由应用协调，不能按 CPU Pull 的一次任务状态机处理。
 
 ### 10.3 正常关闭顺序
 
-1. 停止新业务请求和图回放。正常 raw 请求 Drain；图 replay 由应用同步并销毁框架图，再成功 End 对应 lease。
+1. 停止新业务请求和图回放。应用等待全部 raw 请求及消费者完成，并销毁全部 raw 捕获图；普通缓存 Get 继续按其 Drain 和图租约规则收尾。
 2. 完成普通 Put/CPU Pull 原事务，继续已确定的 Commit/Abort 和收尾；未知 DMA 不自动转为 Abort。
 3. 等待读取及必要消费者完成、禁止迟到读取，然后通知 B 结束匹配的冻结批次。共享源 Tensor 的所有消费者都须结束。
 4. B CPU source Shutdown/Detach：CPU 停 worker、退役队列和 imports，归还目的 binding/RegionLease；B 才关闭 exporter。
-5. B NPU source Shutdown，或 A 全 Shutdown：A 检查 graph/未知状态并退役 initiator，Close 请求关闭 B exporter，最后 Retire；B 结束控制线程和源引用。正常登记 raw 工作可在显式 Runtime Shutdown 中 drain，未知或存活图不会被丢弃。
+5. B NPU source Shutdown，或 A 全 Shutdown：应用完成第 1 步后，A 检查失败未决状态并退役 initiator，Close 请求关闭 B exporter，最后 Retire；B 结束控制线程和源引用。KVAF 不跟踪正常 raw 工作或外部图寿命，不能以 Shutdown 代替应用同步／销图；失败未决或注销失败继续保留资源。
 6. A `shutdown_ddr()` 在全部 DDR 事务、session、Pull child 和映射退出后释放池。失败保留原记录以供重试；它不关闭独立 NPU Pull。全 `shutdown()` 另关闭 raw 和基础设备。
 
 控制 TCP 断开、`pending_raw_addr=false`、仅本地解冻或消息发送成功都不能单独证明资源可释放。NPU 重连保持原 receiver/source/MR 身份；已退役会话不能自动重新建链。CPU source 由 B 注销，A 不能把活跃 Region 的 child 当作可遗忘对象。
@@ -504,15 +503,15 @@ sequenceDiagram
 | A DDR RuntimeCore | MetaManager、统一写事务、普通 execution dispatcher 和 CPU Pull executor |
 | CPU CacheRegionService | 固定 allocation、普通注册及独立 Pull 目的 profile、Region 代次和 child lease |
 | CPU Pull source session | 多 MR imports、4 Jetty、首批启动后常驻的 READ worker、原 operation/请求/取消围栏；成功 Detach 归还 RegionLease |
-| A raw connection | 导入 MR、队列、output 注册及长引用、取消围栏、失败身份、按次 Invocation 和 graph node lease |
+| A raw connection | 导入 MR、队列、output 注册、取消围栏和失败身份；Python 保留 output storage 及执行未决时的输入引用 |
 | B CPU/NPU source | 各自的源存储、MR/Exporter/端点及本地冻结批次；成功 Shutdown 后释放 |
-| 应用 Connector | Ready 与 request 身份、生产/消费完成、reuse/released、外部图 replay 调度 |
+| 应用 Connector | Ready 与 request 身份、正常 raw 输入／stream 保活、生产／消费完成、reuse/released、外部图调度和销毁 |
 
 CPU 服务使用有界持久连接处理循环；默认普通连接预算 256，额外恢复连接预算 32。接纳前有界读取并分类首帧，恢复预留仅供 Query/Cancel/Detach、相关描述及普通执行关闭/查询，不允许长 SubmitAndWait 占用。连接达到上限不会丢弃已接受的 DMA 任务。
 
 SubmitAndWait 等待不占全局 Region/index 锁，条件变量等待释放源状态锁；恢复请求可从另一条连接查询原任务。普通 Put 与 CPU Pull 使用同一写槽位，Get 方向独立。CPU 同 Region 中 Running/InDoubt 的其他源仍采用保守接纳规则，不在本次增加并行写任务。
 
-NPU READ 的 Host 提交、Drain 和关闭按 source connection 协调；长 stream 等待或控制往返不持全部连接的索引锁。每个连接的多 MR 仍共享队列，不承诺同连接跨 stream 并发。未决 invocation、存活 graph 或失败注销均保留相应依赖。
+NPU READ 的 Host 提交和关闭按 source connection 协调；长 stream 等待或控制往返不持全部连接的索引锁。每个连接的多 MR 仍共享队列，不承诺同连接跨 stream 并发。应用负责使正常任务、图回放和关闭有序；执行失败未决或注销失败时，KVAF 保留相应依赖。
 
 ## 12. 源码入口和配套说明
 

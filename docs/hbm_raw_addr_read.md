@@ -10,7 +10,7 @@ runtime = kvaf.NpuRuntime(
     device_id=6,
     npu_pull_options={
         "kernel_path": raw_kernel, "cores": 2, "jettys": 2,
-        "max_host_inflight": 1024, "max_output_bindings": 64,
+        "max_output_bindings": 64,
     },
 )
 runtime.initialize()
@@ -59,24 +59,24 @@ with torch.npu.stream(a_stream):
 runtime.batch_get_raw_addr(ready, src, dst, sizes, output, stream=a_stream)
 # 默认 synchronize=False，与普通 batch_get 一样，返回只表示已入队。
 # 同一 stream 上可直接接消费者算子；Host 使用结果或通知源复用前先等待完成。
-runtime.drain_raw_addr(ready)  # 等待该连接登记的工作并清理按次引用
+a_stream.synchronize()  # 应用等待 READ 及该 stream 的消费者完成
 # 其他 stream 的消费者也必须完成。
 connector.send(("reuse", ready))  # D 的应用通过自己的通道通知 P。
 # P 收到并核对本批的 reuse 消息后：
 source.release_batch(ready)  # 在 P 侧调用
 ```
 
-ready 发布本批读取许可，P 保持该 Tensor 内容稳定，直到应用确认消费者完成并调用 release。D 本地检查源、MR、批次和数组布局，直接启动 raw READ 算子；默认成功只表示提交完成，通过显式同步调用或 drain_raw_addr 确认登记工作完成；同连接切换 stream 前先 Drain。默认 Host 不回读或检查每核 status。每批不发送 AcquireRaw、Complete 或 Cancel 控制请求，KVAF 不向生产端自动发送完成通知。三数组留在读取端 NPU，不经过控制 TCP。
+ready 发布本批读取许可，P 保持该 Tensor 内容稳定，直到应用确认消费者完成并调用 release。D 本地检查源、MR、批次和数组布局，直接启动 raw READ 算子；默认成功只表示提交完成，通过应用同步 stream 或显式同步调用确认执行完成。同连接切换 stream 时，应用必须先完成旧 stream 的任务，或建立使共享队列串行执行的依赖。默认 Host 不回读或检查每核 status。每批不发送 AcquireRaw、Complete 或 Cancel 控制请求，KVAF 不向生产端自动发送完成通知。三数组留在读取端 NPU，不经过控制 TCP。
 
 `release_batch(ready)` 和源端 `cancel_batch(ready)` 只核对批次身份并释放本地冻结状态，不核验远端是否结束。应用先通过自己的消息通道确认读取成功，或确认读取端已经禁止该批次再发起 READ 且已排队任务全部结束，然后才能释放并覆盖源。纯 NPU bench 使用独立 TCP 长连接：A 读取并校验成功后发 `reuse`，B 核对 request_id、source_id/source_epoch、sequence 和 mr_id 后 release；通知在读取计时之外。通知丢失或 DMA 不确定时，应用继续保留源数据和 output。
 
 `src_offsets` 相对本批源 Tensor，`dst_offsets` 相对 output，单位均为字节。数组和 output 必须在 D 本卡、连续、存储不重叠。调用方保证合法范围、目的区间不重叠、长度在 1..UINT32_MAX 且符合设备单次 READ 上限。一段直接生成一个 WQE，无 64 KiB 拆分；validate_ranges=True 可选启用设备端长度及边界检查，不检查目的重叠或设备能力。设备诊断仍写入 HBM status，但不会被 Host 回读或转换为接口异常；应用负责输入合法性和输出校验。
 
-默认返回 `{"state": "submitted", "sequence": ready.sequence}`；`synchronize=True` 显式等待并返回 `state="done"`。同一冻结批次可重复 READ。每次成功异步提交都有本地 invocation，Python 在启动前保留三数组 Tensor/storage、output/storage 和 stream；同步或 `drain_raw_addr(ready)` 成功后清除已完成的按次引用。
+默认返回 `{"state": "submitted", "sequence": ready.sequence}`；`synchronize=True` 显式等待并返回 `state="done"`。同一冻结批次可重复 READ。正常成功调用不登记按次在途记录，也不由绑定保留输入：应用负责保持三数组 Tensor、底层 storage 和 stream 有效，直到执行完成；图引用的存储须保持到图销毁。提交或显式同步失败且执行状态不确定时，绑定额外保留本次输入、output 和 stream，并隔离连接。
 
-output 的本地 MR 按连接和地址/大小缓存，按 MR ID/output 组合复用实体；其存储引用一直保持到连接安全注销 MR。Drain 不注销缓存。`raw_inflight` 与 `pending_raw_addr` 分别表示正常登记在途与失败隔离。强引用不会阻止应用主动修改 Tensor，执行期间仍不能 resize、替换 storage 或改写正在读取的元数据；C++ 非拥有 view 由调用方保证存活。
+output 的本地 MR 按连接和地址/大小缓存，按 MR ID/output 组合复用实体；注册保留到连接安全关闭，Python 的 output Tensor 和实际 storage 引用保守保留到 Runtime shutdown 成功。`pending_raw_addr` 仅表示失败隔离，不提供正常异步任务的完成查询。强引用不会阻止应用主动修改 Tensor，执行期间仍不能 resize、替换 storage 或改写正在读取的元数据；C++ 非拥有 view 由调用方保证存活。
 
-同连接同 stream 可连续异步提交；换 stream 前必须 Drain。Drain 设置连接级 admission gate 和 invocation 水位，等待期间该连接新提交返回 Busy，不排空其他连接。`max_host_inflight` 达到预算时要求显式 Drain；output binding 达到 `max_output_bindings` 时拒绝新增，保持旧注册，不淘汰在途/图引用。默认值分别为 1024 和 64。
+同连接同 stream 可连续异步提交，应用负责控制排队数量和执行顺序。独立 `NpuPullOptions` 配置 raw kernel、核数、Jetty 数、设备在途窗口、output 注册缓存上限和 diagnostics；`max_inflight_total` 是设备 READ 窗口，不是 Host 调用计数。`max_output_bindings` 默认为 64，达到缓存上限时拒绝新增 output 注册并保留旧注册，不自动淘汰；复用已有 output 不消耗新的注册名额。
 
 ### 取消、断线和关闭
 
@@ -85,7 +85,7 @@ output 的本地 MR 按连接和地址/大小缓存，按 MR ID/output 组合复
 - `pending_raw_addr` 只表示提交或显式同步失败后的隔离状态，不表示正常入队任务是否完成。`resolve_raw_addr` 校验失败批次并报告未决状态，不重发 READ、不发送通知，也不执行外层同步；不确定期间继续保留资源。
 - 初始化后，控制 TCP 只用于注册、重连和关闭，不阻塞正常数据读取。P 后台重新建立 TCP 时，D 校验同一接收端代次、源身份和 MR 清单，复用原硬件连接。
 - DMA 状态不确定仍保留资源并返回 CompletionUnknown，TCP 断开不代表 DMA 已结束。接收端重启或会话退役后，旧连接不能自动创建一套新硬件资源。
-- 正常关闭：应用停读/停 replay，正常请求 Drain，图同步并销毁后成功 end_raw_graph → P release_batch → P source.shutdown() → D runtime.shutdown()。source.shutdown 内部通知 D 关闭发起端资源，再关闭 P 导出资源并确认退役，无需应用持有 export_ticket。失败继续保留对象并重试；D 全局 shutdown 会 drain 已登记的正常 raw 请求；存活 graph lease 或未决执行仍阻止连接关闭。shutdown_ddr 不影响独立 NPU Pull。
+- 正常关闭：应用停读/停 replay，等待所有相关 stream 和消费者完成，销毁全部捕获图 → P release_batch → P source.shutdown() → D runtime.shutdown()。source.shutdown 内部通知 D 关闭发起端资源，再关闭 P 导出资源并确认退役，无需应用持有 export_ticket。KVAF 不跟踪正常异步调用或外部图寿命，关闭不会替应用等待这些工作；应用必须先完成上述步骤。失败未决或注销失败继续保留对象并重试。shutdown_ddr 不影响独立 NPU Pull。
 - NPU 控制协议升级为 KVHR v8，要求 A/B 两端一起更新，旧版本拒绝连接。CPU Pull 独立使用 KVRP v8，其同步提交与长连接说明见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 可选 `profile=True` 在成功结果中增加 Host 阶段计时。默认异步调用不创建计时事件、不等待设备，`kernel_event_us=None`。同时显式传 `synchronize=True` 才测设备区间，单位均为微秒：
@@ -118,9 +118,9 @@ print(result["profile"])
 | `binding_src_us` / `binding_dst_us` / `binding_lengths_us` | 分别提取三个描述 Tensor 的地址、数量、元素大小和 shape，检查连续性、dtype 和设备；不回读数组内容 |
 | `binding_output_us` | 提取 output Tensor 信息并检查设备 |
 | `binding_stream_us` | 获取/检查 stream 并提取 ACL stream 指针；显式传入 stream 时不获取默认 stream |
-| `binding_retain_us` | 保存本次 metadata/stream 与 output storage 的拥有引用，准备 profile 结构 |
+| `binding_retain_us` | 缓存 output Tensor/storage 引用并准备 profile 结构 |
 | `binding_native_us` | 整个 NpuRuntime::BatchGetRawAddr 调用，包含 `host_total_us` |
-| `binding_release_us` | 检查原生返回状态；原生 owner 按完成/失败状态保留必要引用 |
+| `binding_release_us` | 检查原生返回状态；正常成功不保留按次输入，执行未决时转入失败引用保留 |
 | `binding_result_us` | 构造正常返回的 state/sequence 字典 |
 | `binding_profile_us` | 构造原有原生计时字典并挂到返回结果；仅 profile 调用产生 |
 | `binding_report_us` | 将新增绑定阶段计时写入字典的开销；仅 profile 调用产生 |
@@ -140,7 +140,7 @@ print(result["profile"])
 `kernel_event_error` 提供 ACL 返回码。事件创建失败发生在发起 READ 之前，接口返回异常。
 只有 `profile=True, synchronize=True` 才创建/记录计时事件；计时事件按 reader 复用，detach 时销毁。
 
-默认 Host 路径为登记引用、复用注册/缓冲 → 提交 kernel → 释放临时注册句柄引用 → 返回；注册及通信描述保留供设备执行。显式同步或 Drain 负责确认普通在途完成；图 replay 由应用同步。显式同步诊断路径为 kernel → 结束计时事件（仅 profile）→ stream 同步 → 释放临时注册引用。
+默认 Host 路径为缓存 output 引用、复用注册/缓冲 → 提交 kernel → 释放临时注册句柄引用 → 返回；正常成功不保存按次输入，输入由应用保活，注册及通信描述保留供设备执行。普通异步执行和图 replay 均由应用同步。显式同步诊断路径为 kernel → 结束计时事件（仅 profile）→ stream 同步 → 释放临时注册引用；执行未决时绑定另保存失败输入和 stream。
 默认 Host 不提交 status D2H，也不检查启动编号、执行结果或 WQE 数量；`status_us` 保留为 0。显式 diagnostics 是例外，且不进入正常性能基线。
 算子提交或 stream 同步失败时继续返回 CompletionUnknown 并保留源、output 和通信资源，恢复不重放 READ。
 同步成功后，设备侧范围检查或 CQ 错误不再通过 Host status 检查上报为异常，应用沿用普通 BatchGet
@@ -162,35 +162,35 @@ KVHR v8 只负责初始化、硬件资源交换、重连和关闭，不承担每
 
 初始化和关闭控制请求复用 TCP 连接，双方启用 TCP_NODELAY。A 按当前命令的回复长度接收，B 先读取请求共有的 72 B 前缀，再按消息种类读取尾部；分片、粘连、版本和身份校验仍保留。完成通知由应用自己的 Pipe/Connector 等通道传递。
 
-每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 1 核 × 4 Jetty，总计最多 4 个 Jetty。默认只入队；同一连接共用设备队列状态，任务必须在同一 stream 上顺序执行，同连接跨 stream 切换前显式 Drain；Host 提交锁按连接隔离。图准备和租约见下节。
+每批最多 4096 段，对应最多 4096 个 WQE，每段长度由 WQE 的 32 位字节数字段表示（1..UINT32_MAX），实际还受设备单次 READ 能力限制；每个源绑定一个 reader，同时一个活动批次，默认 1 核 × 4 Jetty，总计最多 4 个 Jetty。默认只入队；同一连接共用设备队列状态，应用须保证 eager、不同 MR 和图任务串行执行；切换 stream 时先同步旧任务或建立明确的执行依赖。Host 提交锁按连接隔离，但不代替设备执行排序。图预热和生命周期见下节。
 
 统一使用 `KvafExecuteBatchGetRawAddrAivKernelV2` 入口，启动参数为 80 B，core status 为 1280 B，DirectUrmaEntity 与 main Host 共用版本 2。Host 运行库和 raw kernel object 必须使用当前源码一起重新编译。底层 provider 返回的内存身份与路由 EID 分开保留；不手动改写 MR/Jetty 的导出身份。
 
-## 图模式：显式准备节点和资源租约
+## 图模式：应用负责预热、保活和销图
 
-先获得当前 ReadyToken 并保持源冻结；capture 外准备全部资源。预热若调用普通异步 READ，先 Drain：
+先获得当前 ReadyToken 并保持源冻结；在 capture 外使用相同 MR/output 预热注册、通信描述和设备缓冲，再由应用等待预热完成。raw 捕获直接调用读取接口：
 
 ```python
-runtime.drain_raw_addr(ready)
-lease = runtime.begin_raw_graph(ready, src, dst, sizes, output, stream=a_stream)
+runtime.batch_get_raw_addr(ready, src, dst, sizes, output, stream=a_stream)
+a_stream.synchronize()  # 预热必须在 capture 外完成
 graph = kvaf.AclGraph()
 graph.capture_begin(a_stream)
 runtime.batch_get_raw_addr(ready, src, dst, sizes, output,
-                           stream=a_stream, graph_lease=lease)
+                           stream=a_stream, synchronize=False, profile=False)
 graph.capture_end()
-# 可以捕获同一 stream 上的消费者。每个 raw 节点使用自己的 lease。
+# 可以捕获同一 stream 上的消费者。
 graph.replay(a_stream)
 a_stream.synchronize()
-# 停止 replay、确认消费者完成、销毁框架图，然后归还节点租约：
+# 等待其他消费者后，通过应用通知源端释放本轮批次。
+# 最后停止 replay、完成全部执行，并在关闭 source/runtime 前销毁所有图：
 graph.reset()
-runtime.end_raw_graph(lease)
 ```
 
-每个 lease 只捕获一次节点。固定 source 代次、MR、output storage、三数组地址/数量和 stream，节点持有独立参数/status/引用；队列仍属于 connection。lease 不固定 Ready sequence，同一 MR 可跨批次复用图。应用在上轮完成后修改数组内容，每轮收到并核对新 Ready 后才 replay，完成读取及消费者后才通知源复用。
+应用固定 source 代次、MR、output storage、三数组地址/数量及相应通信资源，并保留所有图引用的 Tensor/storage 和 stream 到图销毁。图不包含逐轮 Ready 校验；同一 MR 可跨批次复用图，但每轮必须先收到并核对新的 ReadyToken，等待上一轮执行结束后才能更新数组内容，并保证更新对 replay 可见。每轮读取及消费者完成后才通知源复用。
 
-同一连接的 eager 与多个图由应用串行调度；当前存活 graph lease 固定连接 stream。外部 replay 不经过 Host 校验，`cancel_raw_addr` 无法使旧图失效。Drain/End/关闭前必须停止并发 replay；销毁框架图且 End 成功后才释放图引用，存活 lease 阻止 detach/关闭。
+同一连接的 eager、不同 MR 和多个图共享队列，由应用串行调度。外部 replay 不经过 KVAF Host 校验，`cancel_raw_addr` 无法使旧图失效。停止 replay、同步所有相关执行并销毁全部图后，才能关闭 source/runtime 或释放图所引用的存储；KVAF 不检测或托管外部图寿命，也不提供 raw 图租约。
 
-Begin 不执行 READ；准备失败也可能已经持有部分注册和 lease。Python 会先尝试安全 End，仍失败则异常对象的 `graph_lease` 保存待清理 ID，可重试 `end_raw_graph(error.graph_lease)`。原生调用方同样不能丢弃失败时非零的 lease。诊断模式不能 Begin graph。
+图捕获与回放必须关闭 diagnostics，使用 `synchronize=False, profile=False`；诊断只用于 eager 定位。这里的应用职责仅适用于 raw NPU Pull，普通缓存 Get 原有的 Drain 和图资源租约保持不变。
 
 ## 编译与硬件验证
 
@@ -215,7 +215,7 @@ python tests/python/test_hbm_read_raw_addr.py \
 3. A 直接 READ 同一个 B tensor 的 1/656/100001 字节三段，检查目的位置间隔、padding 和 NPU 消费者可见性。
    两条路径独立注册相同的 tensor 列表；tensor 使用页内偏移为 `0xc00` 的连续 view，覆盖非页对齐的注册场景。
 4. 每轮只生产一次数据，两条路径分别对照同一份期望值验证。A 在 CPU Pull 和 NPU Pull 均完成且校验通过后通知 B，B 释放两条路径的批次后才复用源；内容每轮变化。
-5. 先 Drain 普通请求，或同步/销毁图并 End lease，再释放批次、B shutdown，最后关闭 A runtime。
+5. 应用等待所有普通 raw 请求及消费者完成，停止 replay 并同步/销毁全部图，再释放批次、B shutdown，最后关闭 A runtime。
 
 可独立指定 `--npu-eid-a`（DDR）、`--npu-eid-a-raw`（A—B，A 的 fullmesh）、
 `--npu-eid-b-cpu`（CPU—B）、`--npu-eid-b-raw`（A—B，B 的 fullmesh）。
@@ -266,7 +266,7 @@ EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已
 - `--aiv-cores` / `--jettys-per-core`：默认 2/2，总 Jetty 数不超过 4。
 - `--max-inflight-total`：默认 2048，含义与 BatchGet 一致。
 - `--profile-warmup` / `--profile-iterations`：普通调用的单独内部计时轮次，默认 1/20；设为 `--profile-iterations 0` 即只运行未插桩的带宽测试。图模式默认 profile-iterations=0，不接受非零值，因为回放不执行 Host 调用入口。
-- `--graph`：每个 MR 先预热注册并捕获一次 raw READ，后续通过 `kvaf.AclGraph.replay()` 执行。带宽计时包含 replay 提交和外层 stream 同步；首次预热/捕获、源写入、输出清空及校验在计时之外。源数据每轮改变，完整 output/guard 每轮校验，全部执行完成、销毁图并 End lease 后才关闭源连接。
+- `--graph`：每个 MR 先预热注册并捕获一次 raw READ，后续通过 `kvaf.AclGraph.replay()` 执行。带宽计时包含 replay 提交和外层 stream 同步；首次预热/捕获、源写入、输出清空及校验在计时之外。源数据每轮改变，完整 output/guard 每轮校验，全部执行完成并销毁所有图后才关闭源连接。
 - `--validate-ranges`：打开可选正长度、32 位长度字段及源/目的边界诊断，默认关闭；不包含目的重叠检测。日志标记 `validate_ranges` 和 `output_registration_cache=1`，首次 output 注册计入 warmup（warmup 为 0 时计入测量）。
 
 输出 `NPU_HBM_BENCH_PASS` 的吞吐和分位数只使用 `--iterations` 轮的
@@ -282,7 +282,7 @@ Python `batch_get_raw_addr()` 调用开始至外层 `stream.synchronize()` 返�
 差额保留正负号，便于发现计时问题；按同一次调用计算后再统计，不能用未插桩轮次减去 profile 轮次。
 逐轮可按 `python_total = binding_total_us + python_and_binding_other` 对账，
 `binding_native_us = host_total_us + binding_native_other`；各分位数仍不能相加。
-读取端函数在原生调用期间继续持有 GIL，不存在该边界的 GIL 释放/重新获取耗时。
+读取端函数在原生调用期间释放 GIL；`binding_native_us` 还包含该边界的 GIL 释放/重新获取开销，原生 `host_total_us` 不包含它。
 内部计时轮次不混入带宽统计；各分位数按 `(N-1)*p` 线性插值，不能将不同阶段的 P99 相加。
 `NPU_HBM_INTERNAL_PROFILE_INFO` 列出有效设备计时样本数和计时错误码，缺失的设备计时不会作为零值统计。
 
@@ -385,7 +385,7 @@ python tests/python/bench_hbm_read_raw_addr.py \
 | KVHR TCP，例如 A:29000 | B 的 source.register → A 的 listen_hbm | MR、Jetty、TP、探测、重连及硬件资源关闭 |
 | NPU 数据通道 | A 发起 READ，KV 从 B HBM 搬到 A HBM | HBM payload，不进入上述 TCP 通道 |
 
-B producer 先启动应用 TCP server 等待 A。A reader 初始化 Runtime 和 KVHR 监听后主动连接 B，发送 receiver 字典和测试配置；B 收到后才使用自身 device/EID 注册源，按原流程反向连接 A 的 KVHR 端口。每轮 A 发 request，B 生产、同步 stream 并 ready，发回 `(request_id, ReadyToken)`。A 读取、等待 stream 并验证后发送 reuse；B 核对完整批次身份，release 后回复 released。A 销毁全部捕获图并 End lease、清理普通在途记录后才发送 shutdown；B 关闭源并回复 closed，A 最后关闭 Runtime。
+B producer 先启动应用 TCP server 等待 A。A reader 初始化 Runtime 和 KVHR 监听后主动连接 B，发送 receiver 字典和测试配置；B 收到后才使用自身 device/EID 注册源，按原流程反向连接 A 的 KVHR 端口。每轮 A 发 request，B 生产、同步 stream 并 ready，发回 `(request_id, ReadyToken)`。A 读取、等待 stream 并验证后发送 reuse；B 核对完整批次身份，release 后回复 released。A 停止提交/replay、等待全部执行并销毁全部捕获图后才发送 shutdown；B 关闭源并回复 closed，A 最后关闭 Runtime。
 
 两机均使用同一份最新源码和已安装 torch_npu 的 Python 环境，执行以下命令。build.sh 默认输出到 build-npu，包含 raw READ kernel，并在增量构建后同步 Python 通知模块，无需手工复制：
 

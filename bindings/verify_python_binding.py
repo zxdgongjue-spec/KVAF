@@ -36,7 +36,7 @@ def main() -> int:
         (options.require_offload, ("CpuPullOptions", "CpuPullHbmSource", "ReadyToken", "PutHandle"),
          ("initialize_ddr", "batch_cpu_pull", "resolve_cpu_pull", "prepare_put", "commit_put")),
         (options.require_raw, ("NpuPullOptions", "NpuPullHbmSource", "ReadyToken"),
-         ("listen_hbm", "batch_get_raw_addr", "drain_raw_addr", "begin_raw_graph", "end_raw_graph")),
+         ("listen_hbm", "batch_get_raw_addr", "cancel_raw_addr", "resolve_raw_addr")),
     ):
         if required and (any(not hasattr(kvaf, name) for name in exports) or
                          any(not hasattr(kvaf.NpuRuntime, name) for name in methods)):

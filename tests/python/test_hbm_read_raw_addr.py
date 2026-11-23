@@ -146,7 +146,6 @@ def main():
             raw_lengths = torch.tensor(RAW_LENGTHS, dtype=torch.int64, device=output.device)
         stream.synchronize()
         graphs = {}
-        graph_leases = {}
         for round_id in range(args.rounds):
             cpu_batch, raw_batch = receive(parent, "ready")
             assert cpu_batch.mr_id == raw_batch.mr_id == round_id % args.hbm_mrs + 1
@@ -169,7 +168,7 @@ def main():
                 if raw_batch.mr_id not in graphs:
                     from bench_hbm_read_raw_addr import capture_raw_read
                     graph = kvaf.AclGraph()
-                    graph_leases[raw_batch.mr_id] = capture_raw_read(
+                    capture_raw_read(
                         runtime, graph, raw_batch, raw_sources, raw_destinations,
                         raw_lengths, output, stream)
                     graphs[raw_batch.mr_id] = graph
@@ -181,8 +180,6 @@ def main():
                 runtime.batch_get_raw_addr(raw_batch, raw_sources, raw_destinations,
                                           raw_lengths, output, stream=stream)
             stream.synchronize()  # Completion belongs to the caller, in both modes.
-            if not args.graph:
-                runtime.drain_raw_addr(raw_batch)
             raw_expected = cpu_expected  # Both paths read this round's same tensor contents.
             expected = torch.full((110000,), 0xCC, dtype=torch.uint8)
             for src, dst, n in zip(OFFSETS, RAW_DESTINATIONS, RAW_LENGTHS):
@@ -199,9 +196,8 @@ def main():
             print(f"HBM_RAW_ROUND_PASS round={round_id} mr_id={raw_batch.mr_id} raw_bytes={sum(RAW_LENGTHS)} "
                   f"graph={int(args.graph)} ddr_batch_get=1 cpu_pull=1 shared_source_tensors=1 "
                   "padding_checked=1 npu_consumer_checked=1", flush=True)
-        for mr_id, graph in graphs.items():
+        for graph in graphs.values():
             graph.reset()
-            runtime.end_raw_graph(graph_leases.pop(mr_id))
         graphs.clear()
         parent.send(("shutdown", None))
         receive(parent, "closed")

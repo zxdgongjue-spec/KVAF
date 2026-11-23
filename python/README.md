@@ -13,12 +13,18 @@
 DDR ticket 当前为 version=2，仅含 `version/address/region_id/epoch/token/eid`；读取端 DDR 布局仍从 `runtime.remote_region` 获取。ReadyToken 不再携带完整 MR 列表：CPU 源描述为 `source_id/region_id/region_epoch/mr_length`，NPU 源描述为 `source_id/source_epoch`，两种 Ready 均含 `sequence/mr_id`。对象仍可 pickle，旧序列化格式会被拒绝。当前 CPU Pull 为 KVRP v8，成功批次只有一次 SubmitAndWait，读取端本地提交元数据后由应用通知生产端解冻，CPU service 与 NPU 扩展需配套重编译、重启。显式 Submit/Wait 接口保留。NPU Pull 为 KVHR v8，NPU 两端需一起更新。
 
 NPU 直读由读取端 `runtime.listen_hbm()` 监听，生产端 `NpuPullHbmSource.register(tensors, receiver=receiver)` 一次完成注册建链。`batch_get_raw_addr()` 接受三个连续 NPU int64 Tensor，与普通 `batch_get()` 一样默认 `synchronize=False`，只入队并返回 `state="submitted"`；调用方负责同 stream 消费或外层同步后使用结果、通知源端复用。显式 `synchronize=True` 才内部等待并返回 done。Host 不生成启动编号、不回读 status；应用负责输入合法性和输出校验，每批没有 AcquireRaw、Complete 或 Cancel RPC。
-正常异步调用由 KVAF 保留 metadata/storage/stream；外部同步后仍需 `drain_raw_addr(ready)`
-退役引用。output 注册和 storage 按源连接缓存。图模式先对同一 MR/output 预热、同步并 Drain，
-再 `begin_raw_graph(...)` 准备节点，捕获时传 `graph_lease=lease`；图回放不执行 Host ReadyToken 检查，应用匹配每批的源/MR，保持元数据 Tensor、stream、源/输出和通信资源存活，全部执行完成并销毁图后调用 `end_raw_graph(lease)`，然后才能注销源/关闭 Runtime。成功读取不消费 ReadyToken，同一冻结源可重复读取。cancel_raw_addr 只拦截后续 Host 提交，不能撤回已入队任务或捕获图；pending_raw_addr 仅表示提交/显式等待失败后的隔离状态，不是异步完成查询。source.release_batch 仍由应用在确认消费者完成后调用。
+正常异步调用由应用保留 metadata Tensor、storage、stream 和源直到完成；KVAF 将 output
+Tensor 及其实际 storage 保留到 Runtime 成功关闭。图模式先对同一 MR/output 预热并外部同步，
+再用框架捕获普通 raw 调用，无须额外的 KVAF Begin/End 或 graph lease。图回放不执行 Host
+ReadyToken 检查，应用匹配每批的源/MR，保持元数据、stream、源/输出和通信资源存活；停止
+replay、同步并销毁图后，才能注销源/关闭 Runtime。Runtime 关闭不隐式完成上述步骤。
+成功读取不消费 ReadyToken，同一冻结源可重复读取。cancel_raw_addr 只拦截后续 Host 提交，
+不能撤回已入队任务或捕获图；pending_raw_addr 仅表示提交/显式等待失败后的隔离状态，
+不是异步完成查询。只有本次调用完成状态未知时，KVAF 才保留其 metadata/storage/stream
+至安全关闭。source.release_batch 仍由应用在确认消费者完成后调用。
 旧类名、旧重载及独立 OffloadRuntime 已删除。完整接口见 [Connector 设计](../docs/connector_pull_api_design.md)。
 
 基础初始化与 DDR 分开：无布局的 `NpuRuntime(device_id=..., npu_pull_options=NpuPullOptions(...))`
 加 `initialize()` 即可 `listen_hbm()`；CPU Pull 需要 `link_to()` 和 `initialize_ddr()`。
 原来带布局的构造、普通 Put/Get、`initialize(ddr_bytes, slot_size)` 和 Get graph 接口继续可用。
-普通执行配置、Pull 选项、Drain 与 graph lease 说明见 [Bindings](../bindings/README.md)。
+普通执行配置及其 Drain/graph lease、独立的 Pull 选项与生命周期说明见 [Bindings](../bindings/README.md)。

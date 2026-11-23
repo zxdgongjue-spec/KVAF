@@ -306,30 +306,25 @@ def measure_raw_read(runtime, ready, src, dst, lengths, output, stream, *, profi
     if not profile:
         stream.synchronize()
     elapsed_us = (time.perf_counter_ns() - begin) / 1000
-    runtime.drain_raw_addr(ready)  # Retire metadata holders after completion; outside the READ metric.
     return result, elapsed_us
 
 
 def capture_raw_read(runtime, graph, ready, src, dst, lengths, output, stream, *, validate_ranges=False):
-    """Prepare resources and pin one graph lease outside capture."""
+    """Warm up outside capture; the caller owns buffers, stream and graph."""
     runtime.batch_get_raw_addr(ready, src, dst, lengths, output, stream=stream,
                                profile=False, validate_ranges=validate_ranges, synchronize=False)
     stream.synchronize()
-    runtime.drain_raw_addr(ready)
-    lease = runtime.begin_raw_graph(ready, src, dst, lengths, output, stream=stream)
     try:
         graph.capture_begin(stream)
         try:
             runtime.batch_get_raw_addr(ready, src, dst, lengths, output, stream=stream,
                                        profile=False, validate_ranges=validate_ranges,
-                                       synchronize=False, graph_lease=lease)
+                                       synchronize=False)
         finally:
             graph.capture_end()
     except BaseException:
         graph.reset()
-        runtime.end_raw_graph(lease)
         raise
-    return lease
 
 
 def measure_graph_read(graph, stream):
@@ -531,7 +526,6 @@ def reader(args):
     channel = None
     peer_active = False
     graphs = {}
-    graph_leases = {}
     try:
         runtime.initialize()
         assert runtime.initialized and not runtime.ddr_initialized
@@ -604,7 +598,7 @@ def reader(args):
                 # one graph per MR, sharing stable output and metadata buffers.
                 graph = kvaf.AclGraph()
                 graphs[ready.mr_id] = graph
-                graph_leases[ready.mr_id] = capture_raw_read(runtime, graph, ready, src, dst, lengths, output, stream,
+                capture_raw_read(runtime, graph, ready, src, dst, lengths, output, stream,
                                  validate_ranges=args.validate_ranges)
             # Clear even after capture warmup so stale warmup output cannot pass.
             with torch.npu.stream(stream):
@@ -646,9 +640,8 @@ def reader(args):
             if not matches_receipt(receive(channel, "released"), receipt):
                 raise RuntimeError("release acknowledgement belongs to another batch")
         capture_count = len(graphs)
-        for mr_id, graph in graphs.items():
+        for graph in graphs.values():
             graph.reset()
-            runtime.end_raw_graph(graph_leases.pop(mr_id))
         graphs.clear()
         channel.send(("shutdown", session))
         if receive(channel, "closed") != session:

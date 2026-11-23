@@ -8,12 +8,6 @@
 #include "connector_types.h"
 
 namespace kvaf {
-// Optional owning handles for language bindings. C++ borrowed views remain the
-// caller's responsibility. Owners must use thread-safe deleters (Python: GIL).
-struct RawReadLifetime {
-  std::shared_ptr<void> invocation; // metadata, stream and temporary call owners
-  std::shared_ptr<void> output;     // allocation retained until MR unregister
-};
 // Internal registration manifest. Single and multiple MRs use the same layout.
 struct HbmReadTicket {
   std::uint64_t source_id{}, epoch{};

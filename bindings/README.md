@@ -98,21 +98,21 @@ Put/Get provider 的通信资源。通过 `cpu_pull_options=` 传入选项，无
 或 `cpu_candidate` 构造参数；CPU 设备选择使用 `peer_ub_device`。
 
 `NpuPullOptions(kernel_path="", cores=1, jettys=4, max_inflight_total=0,
-max_host_inflight=1024, max_output_bindings=64, diagnostics=False)` 通过
-`npu_pull_options=` 传入；raw 预算与普通 Get 的 `get_resources` 独立。
+max_output_bindings=64, diagnostics=False)` 通过 `npu_pull_options=` 传入；raw 的设备
+inflight 预算和 output 注册缓存预算与普通 Get 的 `get_resources` 独立。
 `batch_get_raw_addr(ready, src_offsets, dst_offsets, lengths, output, stream=None,
-profile=False, validate_ranges=False, synchronize=False, graph_lease=0)` 默认只入队。
-KVAF 保留三组 metadata Tensor、底层 storage 和 stream，直到 `drain_raw_addr(ready)`
-完成；外部 `stream.synchronize()` 后仍须 Drain 来释放调用引用。output 注册及 storage
-引用缓存到源连接关闭。保留引用不允许调用方并发修改或 resize 注册内存。
+profile=False, validate_ranges=False, synchronize=False)` 默认只入队，不隐式等待。
+应用负责保留三组 metadata Tensor 及其 storage、stream 和源，直到执行完成；图模式则
+保持到全部 replay 完成并销图。KVAF 将 output Tensor 及其实际 storage 保留到 Runtime
+成功关闭，应用仍不能提前修改 metadata、resize 或重新绑定注册内存。
 
-raw 图先预热、同步、Drain，再用 `begin_raw_graph(ready, src, dst, lengths, output,
-stream=stream)` 准备独立节点，capture 中向 raw 调用传 `graph_lease=lease`。
-停止 replay、同步并销毁框架图后调用 `end_raw_graph(lease)`，然后关闭源/Runtime。
-图回放固定源 MR 与缓冲地址，不重新执行 Host ReadyToken 检查。Begin 失败会尝试清理；
-若清理仍不确定，异常的 `graph_lease` 属性给出必须重试 End 的句柄。
-应用只有确认消费完成后才能通知生产端复用。`pending_raw_addr` 表示失败隔离，
-`raw_inflight` 包括正常异步调用和图租约。完整握手见 [NPU raw READ](../docs/hbm_raw_addr_read.md)。
+raw 图先对相同源 MR/output 预热并外部同步，再用框架 capture 普通 raw 调用；不需要
+额外的 KVAF Begin/End 接口或 graph lease。应用负责 replay 后的 stream 同步、销毁框架图，
+然后才能关闭源/Runtime；关闭 Runtime 不代替这些同步和销图步骤。图回放固定源 MR 与
+缓冲地址，不重新执行 Host ReadyToken 检查。应用确认消费完成后才能通知生产端复用。
+`pending_raw_addr` 仅表示未决失败隔离，不是正常异步工作的完成状态或计数；只有本次调用
+返回完成状态未知时，KVAF 才额外保留它的 metadata/storage/stream，直到 Runtime 安全关闭。
+完整握手见 [NPU raw READ](../docs/hbm_raw_addr_read.md)。
 
 Binding 不负责 vLLM 适配。后续只在 Runtime、Meta Manager 和 KV Access Operator 的 C++ 接口稳定后，将需要暴露的类和方法注册到 Python。
 

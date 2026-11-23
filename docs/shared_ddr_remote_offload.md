@@ -10,6 +10,7 @@
 旧 `link_to(...) → initialize(ddr_bytes, slot_size)` 保留为组合入口。
 `shutdown_ddr()` 在任务和 CPU 源租约退役后释放 DDR 及其通信资源，保留独立 NPU Pull 链路和 CPU 目标；失败可原地重试，不重发 READ。
 随后可重新 initialize_ddr；旧 PutHandle 不适用于新的 DDR core。纯 NPU Pull 读取端只需无参数 initialize 和 listen_hbm，生产端 register(receiver=...) 自动建链。
+raw NPU Pull 的正常异步输入、stream 和捕获图由应用保活、同步并销毁；关闭 source/runtime 前须完成全部执行和销图。此约定不改变 CPU Pull 的事务恢复和 Region 租约。
 
 ## 跨卡调用
 

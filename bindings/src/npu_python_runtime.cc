@@ -1,4 +1,5 @@
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <thread>
 #include "npu_python_runtime.h"
@@ -117,25 +118,7 @@ void* PointerFromValue(std::uint64_t pointer) {
 using python_binding::NpuTensorView;
 using python_binding::GetNpuTensorView;
 
-// Native completion and connection owners can retire on background threads.
-// Store both Tensor and storage owners; releasing them must always hold the GIL.
-std::shared_ptr<void> RetainPython(py::object value) {
-  return {new py::object(std::move(value)), [](void* pointer) {
-    auto* owner = static_cast<py::object*>(pointer);
-    if (!Py_IsInitialized()) { (void)owner->release(); delete owner; return; }
-    py::gil_scoped_acquire acquire;
-    delete owner;
-  }};
-}
 using python_binding::TensorStorageOwner;
-
-RawReadLifetime RawLifetime(const py::object& src, const py::object& dst,
-                            const py::object& lengths, const py::object& output,
-                            const py::object& stream) {
-  return {RetainPython(py::make_tuple(TensorStorageOwner(src), TensorStorageOwner(dst),
-                                     TensorStorageOwner(lengths), stream)),
-          RetainPython(TensorStorageOwner(output))};
-}
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
   if (result == nullptr) {
@@ -509,7 +492,7 @@ class NpuPythonRuntime final {
   }
   py::dict BatchGetRawArrays(const ReadyToken& ready,const py::object& src,const py::object& dst,
                          const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges,
-                         bool synchronize, std::uint64_t graph_lease) {
+                         bool synchronize) {
     using Clock = std::chrono::steady_clock;
     const auto begin=profiling?Clock::now():Clock::time_point{};
     auto previous=begin;
@@ -549,7 +532,19 @@ class NpuPythonRuntime final {
       throw py::value_error("raw READ stream belongs to another NPU");
     const auto acl_stream=acl_python::StreamFromPython(stream);
     mark(binding.stream);
-    auto lifetime = RawLifetime(src, dst, lengths, output, stream);
+    // Keep registered output storage until successful Runtime shutdown. Normal
+    // asynchronous metadata/stream ownership remains with the application.
+    // This Host lock only orders submission/owner publication against shutdown;
+    // it does not wait for device completion or extend captured graph lifetime.
+    std::shared_lock<std::shared_mutex> raw(raw_lifecycle_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; raw.lock(); }
+    const auto source_key = py::make_tuple(source->source_id, source->source_epoch);
+    if (!raw_outputs_.contains(source_key)) raw_outputs_[source_key] = py::dict();
+    auto outputs = raw_outputs_[source_key].cast<py::dict>();
+    // Retain before native setup: even a failed diagnostic step can leave a
+    // cached output registration. Match opt's conservative shutdown lifetime.
+    outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data), view.bytes)] =
+        TensorStorageOwner(output);
     HbmReadProfile profile;
     mark(binding.retain);
     Status status;
@@ -557,10 +552,16 @@ class NpuPythonRuntime final {
       py::gil_scoped_release release;
       status = native_->BatchGetRawAddr(ready, sources, destinations, sizes,
           {view.data, view.bytes, DeviceKind::kNpu}, acl_stream,
-          profiling ? &profile : nullptr, validate_ranges, synchronize,
-          graph_lease, std::move(lifetime));
+          profiling ? &profile : nullptr, validate_ranges, synchronize);
     }
     mark(binding.native);
+    // Only this call's CompletionUnknown means its metadata may still be in
+    // use. A concurrent Busy rejection must not claim this source's owners.
+    if (status.code() == StatusCode::kCompletionUnknown) {
+      if (!raw_failed_inputs_.contains(source_key)) raw_failed_inputs_[source_key] = py::list();
+      raw_failed_inputs_[source_key].cast<py::list>().append(py::make_tuple(TensorStorageOwner(src),
+          TensorStorageOwner(dst), TensorStorageOwner(lengths), TensorStorageOwner(output), stream));
+    }
     ThrowIfError(status);
     mark(binding.release);
     py::dict result; result["state"]=synchronize?"done":"submitted"; result["sequence"]=ready.sequence;
@@ -596,56 +597,6 @@ class NpuPythonRuntime final {
   bool PendingRawAddr() const { py::gil_scoped_release release; return native_->pending_raw_addr(); }
 
   bool DdrInitialized() const { return native_->ddr_initialized(); }
-  bool RawInflight() const { py::gil_scoped_release release; return native_->raw_inflight(); }
-  void DrainRawAddr(const ReadyToken& ready) {
-    Status status;
-    { py::gil_scoped_release release; status = native_->DrainRawAddr(ready); }
-    ThrowIfError(status);
-  }
-  std::uint64_t BeginRawGraph(const ReadyToken& ready, const py::object& src,
-      const py::object& dst, const py::object& lengths, const py::object& output,
-      py::object stream) {
-    auto array = [&](const py::object& tensor, const char* name) {
-      const auto view = python_binding::GetNpuInt64TensorView(tensor, name, native_->device_id());
-      return NpuInt64ArrayView{static_cast<const std::int64_t*>(view.data), view.bytes / sizeof(std::int64_t)};
-    };
-    const auto sources = array(src, "src_offsets"), destinations = array(dst, "dst_offsets"),
-               sizes = array(lengths, "lengths");
-    const auto output_view = GetNpuTensorView(output, "output", false);
-    if (output_view.device.attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("raw graph output belongs to another NPU");
-    if (stream.is_none()) stream = py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
-    const auto stream_device = py::getattr(stream, "device", py::object{});
-    if (stream_device && stream_device.attr("index").cast<std::uint32_t>() != native_->device_id())
-      throw py::value_error("raw graph stream belongs to another NPU");
-    const auto native_stream = acl_python::StreamFromPython(stream);
-    auto lifetime = RawLifetime(src, dst, lengths, output, stream);
-    std::uint64_t lease = 0; Status status;
-    { py::gil_scoped_release release;
-      status = native_->BeginRawGraph(ready, sources, destinations, sizes,
-          {output_view.data, output_view.bytes, DeviceKind::kNpu}, native_stream,
-          &lease, std::move(lifetime)); }
-    if (!status.ok() && lease != 0) {
-      Status cleanup;
-      { py::gil_scoped_release release; cleanup = native_->EndRawGraph(lease); }
-      if (!cleanup.ok()) {
-        // Preserve the native retry handle in a machine-readable exception field.
-        py::object error = py::module_::import("builtins").attr("RuntimeError")(
-            status.message() + "; cleanup remains pending; retry end_raw_graph(" +
-            std::to_string(lease) + "): " + cleanup.message());
-        error.attr("graph_lease") = lease;
-        PyErr_SetObject(PyExc_RuntimeError, error.ptr());
-        throw py::error_already_set();
-      }
-    }
-    ThrowIfError(status); return lease;
-  }
-  void EndRawGraph(std::uint64_t lease) {
-    Status status;
-    { py::gil_scoped_release release; status = native_->EndRawGraph(lease); }
-    ThrowIfError(status);
-  }
-
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
@@ -1241,15 +1192,17 @@ class NpuPythonRuntime final {
   void Shutdown() {
     Status status;
     std::unique_lock<std::mutex> get(get_mutex_, std::defer_lock), put(put_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> raw(raw_lifecycle_mutex_, std::defer_lock);
     {
       py::gil_scoped_release release;
-      std::lock(get, put);
+      std::lock(get, put, raw);
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else status = native_->Shutdown();
     }
     if (status.ok()) {
       pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{};
       put_input_refs_.clear(); pending_put_input_refs_.clear();
+      raw_outputs_ = py::dict(); raw_failed_inputs_ = py::dict();
     }
     if (get_call_trace_) get_call_trace_->Flush();
     ThrowIfError(status);
@@ -1269,6 +1222,7 @@ class NpuPythonRuntime final {
       for (auto& entry : output_refs_) (void)entry.second.release();
       for (auto& entry : put_input_refs_) (void)entry.second.release();
       for (auto& ref : pending_put_input_refs_) (void)ref.release();
+      (void)raw_outputs_.release(); (void)raw_failed_inputs_.release();
       (void)native_.release();
     }
   }
@@ -1298,6 +1252,8 @@ class NpuPythonRuntime final {
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   std::unique_ptr<GetCallTrace> get_call_trace_;
   std::mutex get_mutex_, put_mutex_;
+  std::shared_mutex raw_lifecycle_mutex_;
+  py::dict raw_outputs_, raw_failed_inputs_;
   std::vector<py::object> pending_get_refs_;
   py::object pending_put_ref_;
   std::unordered_map<std::uint64_t, std::vector<py::object>> graph_refs_;
@@ -1595,20 +1551,18 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_readonly("timeout_ms", &CpuPullOptions::timeout_ms);
   py::class_<NpuPullOptions>(module, "NpuPullOptions")
       .def(py::init([](std::string kernel_path, std::uint32_t cores, std::uint32_t jettys,
-                       std::uint32_t inflight, std::uint32_t host_inflight,
-                       std::uint32_t output_bindings, bool diagnostics) {
+                       std::uint32_t inflight, std::uint32_t output_bindings, bool diagnostics) {
         NpuPullOptions value; value.kernel_path = std::move(kernel_path);
         value.cores = cores; value.jettys = jettys; value.max_inflight_total = inflight;
-        value.max_host_inflight = host_inflight; value.max_output_bindings = output_bindings;
+        value.max_output_bindings = output_bindings;
         value.diagnostics = diagnostics; return value;
       }), py::kw_only(), py::arg("kernel_path") = "", py::arg("cores") = 1,
           py::arg("jettys") = 4, py::arg("max_inflight_total") = 0,
-          py::arg("max_host_inflight") = 1024, py::arg("max_output_bindings") = 64,
+          py::arg("max_output_bindings") = 64,
           py::arg("diagnostics") = false)
       .def_readonly("kernel_path", &NpuPullOptions::kernel_path)
       .def_readonly("cores", &NpuPullOptions::cores).def_readonly("jettys", &NpuPullOptions::jettys)
       .def_readonly("max_inflight_total", &NpuPullOptions::max_inflight_total)
-      .def_readonly("max_host_inflight", &NpuPullOptions::max_host_inflight)
       .def_readonly("max_output_bindings", &NpuPullOptions::max_output_bindings)
       .def_readonly("diagnostics", &NpuPullOptions::diagnostics);
 
@@ -1623,13 +1577,14 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
            py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
            py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
-           py::arg("synchronize")=false, py::kw_only(), py::arg("graph_lease")=0,
+           py::arg("synchronize")=false,
            "Enqueue peer HBM READ on the caller's stream, like batch_get. Default success means submitted. "
            "Warm up registrations before graph capture; synchronize=False supports capture and replay. "
-           "KVAF retains metadata through completion; caller owns stream ordering, graph lifetime and producer reuse. "
+           "Caller keeps metadata/storage and stream alive through completion and graph destruction, "
+           "and owns stream ordering, graph lifetime and producer reuse. "
            "synchronize=True waits for completion. profile=True adds Host timings; device event timing "
            "is available only with synchronize=True. Device status is not read back. "
-           "Output storage is retained until its connection closes; do not resize storage while registered. "
+           "Output storage is retained until successful Runtime shutdown; do not resize storage while registered. "
            "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
            "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
       .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
@@ -1671,15 +1626,6 @@ void BindNpuPythonRuntime(py::module_& module) {
            "overwriting the destination slots, the source's next ready(), or source shutdown.")
       .def_property_readonly("pending_offload", &NpuPythonRuntime::PendingOffload)
 #endif
-      .def("drain_raw_addr", &NpuPythonRuntime::DrainRawAddr, py::arg("ready"),
-           "Wait for this source connection's queued raw reads and retire their request owners.")
-      .def_property_readonly("raw_inflight", &NpuPythonRuntime::RawInflight)
-      .def("begin_raw_graph", &NpuPythonRuntime::BeginRawGraph, py::arg("ready"),
-           py::arg("src_offsets"), py::arg("dst_offsets"), py::arg("lengths"),
-           py::arg("output"), py::arg("stream") = py::none(),
-           "Prepare a raw graph node outside capture. Retains MR, input/output storage and stream.")
-      .def("end_raw_graph", &NpuPythonRuntime::EndRawGraph, py::arg("lease"),
-           "Stop replay, synchronize and destroy the external graph before ending its raw lease.")
       .def("initialize", &NpuPythonRuntime::InitializeBase)
       .def("initialize_ddr", &NpuPythonRuntime::InitializeDdr, py::arg("ddr_bytes"), py::arg("slot_size"))
       .def("shutdown_ddr", &NpuPythonRuntime::ShutdownDdr)

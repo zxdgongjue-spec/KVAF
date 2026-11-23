@@ -116,9 +116,9 @@ class PullBenchmarks(unittest.TestCase):
 
         with patch.object(raw_bench.time, "perf_counter_ns", side_effect=lambda: clock[0]):
             result, elapsed = raw_bench.measure_raw_read(
-                SimpleNamespace(batch_get_raw_addr=submit, drain_raw_addr=lambda ready: calls.append("drain")), object(), (), (), (), object(),
+                SimpleNamespace(batch_get_raw_addr=submit), object(), (), (), (), object(),
                 SimpleNamespace(synchronize=synchronize))
-        self.assertEqual(calls, ["enqueue", "wait", "drain"])
+        self.assertEqual(calls, ["enqueue", "wait"])
         self.assertEqual(result["state"], "submitted")
         self.assertEqual(elapsed, 50)
 
@@ -166,14 +166,26 @@ class PullBenchmarks(unittest.TestCase):
             capturing = False
             calls.append("end")
 
-        raw_bench.capture_raw_read(SimpleNamespace(batch_get_raw_addr=enqueue,
-                                                  drain_raw_addr=lambda ready: calls.append("drain"),
-                                                  begin_raw_graph=lambda *args, **kwargs: calls.append("lease") or 7,
-                                                  end_raw_graph=lambda lease: calls.append("release")),
+        raw_bench.capture_raw_read(SimpleNamespace(batch_get_raw_addr=enqueue),
                                   SimpleNamespace(capture_begin=begin, capture_end=end),
                                   object(), (), (), (), object(), SimpleNamespace(synchronize=synchronize),
                                   validate_ranges=True)
-        self.assertEqual(calls, ["warmup_read", "warmup_wait", "drain", "lease", "begin", "capture_read", "end"])
+        self.assertEqual(calls, ["warmup_read", "warmup_wait", "begin", "capture_read", "end"])
+
+    def test_failed_raw_capture_ends_and_destroys_framework_graph(self):
+        calls = []
+        def enqueue(*args, **kwargs):
+            calls.append("enqueue")
+            if calls.count("enqueue") == 2:
+                raise RuntimeError("capture submit failed")
+        graph = SimpleNamespace(capture_begin=lambda stream: calls.append("begin"),
+                                capture_end=lambda: calls.append("end"),
+                                reset=lambda: calls.append("reset"))
+        with self.assertRaisesRegex(RuntimeError, "capture submit failed"):
+            raw_bench.capture_raw_read(SimpleNamespace(batch_get_raw_addr=enqueue), graph,
+                                      object(), (), (), (), object(),
+                                      SimpleNamespace(synchronize=lambda: calls.append("wait")))
+        self.assertEqual(calls, ["enqueue", "wait", "begin", "enqueue", "end", "reset"])
 
     def test_percentiles_and_single_sample(self):
         result = summarize_us([100, 0, 20, 10])

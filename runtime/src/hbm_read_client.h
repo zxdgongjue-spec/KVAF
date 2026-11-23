@@ -8,7 +8,7 @@ namespace kvaf {
 class HbmReader {
  public:
   HbmReader(std::uint32_t device, std::uint32_t cores, std::uint32_t jettys,
-            std::uint32_t budget, std::string kernel, std::uint32_t max_inflight = 1024,
+            std::uint32_t budget, std::string kernel,
             std::uint32_t max_outputs = 64, bool diagnostics = false);
   ~HbmReader();
   Status Listen(const std::string& address, const std::string& advertise_address,
@@ -17,15 +17,7 @@ class HbmReader {
   Status Read(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
               NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
               HbmReadProfile* profile = nullptr, bool validate_ranges = false,
-              bool synchronize = false, std::uint64_t graph_lease = 0,
-              RawReadLifetime lifetime = {});
-  Status Drain(const ReadyToken&);
-  bool inflight() const;
-  // A nonzero lease on failure must be passed to EndGraph for checked cleanup.
-  Status BeginGraph(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
-                    NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
-                    std::uint64_t* lease, RawReadLifetime lifetime = {});
-  Status EndGraph(std::uint64_t lease);
+              bool synchronize = false);
   Status Resolve(const ReadyToken&);
   Status Detach(const HbmReadTicket&);
   Status Shutdown();

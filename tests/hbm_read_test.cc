@@ -252,7 +252,8 @@ void RuntimeInitialization() {
     Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},receiver,reinterpret_cast<void*>(1)));
     auto read=[&] {
       kvaf::ReadyToken ready;Check(b.Ready(&ready));int64_t src=11,dst=7,n=64;
-      Check(a.BatchGetRawAddr(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,false,true));
+      Check(a.BatchGetRawAddr(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
+      Require(aclrtSynchronizeStream(reinterpret_cast<aclrtStream>(1))==ACL_SUCCESS,"application completes Runtime raw READ");
       Require(!std::memcmp(output.data()+dst,source.data()+src,n),"raw payload survives DDR lifecycle");Check(b.ReleaseBatch(ready));
     };
     read();
@@ -261,10 +262,12 @@ void RuntimeInitialization() {
     if(with_ddr){Check(a.ShutdownDdr());read();Check(a.InitializeDdr(4096,256));Check(a.ReleaseLink(1));}
 #endif
     Check(a.ShutdownDdr());read();
+    const auto completed_syncs=raw_syncs;
     unregister_failures=1;
     Require(!a.Shutdown().ok()&&a.initialized(),"failed teardown retains runtime");
     Require(!a.Initialize().ok(),"closing runtime cannot reinitialize");
     Check(a.Shutdown());Check(b.Shutdown());
+    Require(raw_syncs==completed_syncs,"Runtime shutdown and cleanup retry never synchronize completed application work");
     Require(!a.initialized()&&!a.ddr_initialized(),"global teardown complete");
     Check(a.Initialize());Check(a.ListenHbm("127.0.0.1:0","",reader_eid,&receiver));Check(a.Shutdown());
   };
@@ -404,19 +407,14 @@ void AsyncAndGraphReplay() {
   Require(raw_syncs==syncs&&!a.pending()&&profile.synchronize_us==0&&!profile.kernel_event_valid,
           "default call only enqueues, including Host-only profiling");
   Require(std::all_of(output.begin(),output.end(),[](auto byte){return byte==0xcc;}),"queued READ has not executed on return");
-  Require(a.inflight(),"successful async call is tracked separately from quarantine");
-  Check(a.Drain(token));
-  Require(!a.inflight(),"Drain clears completed invocation records");
+  Require(aclrtSynchronizeStream(stream)==ACL_SUCCESS,"application completes eager READ");
   Require(!std::memcmp(output.data()+dst,source.data()+src,n),"external sync makes output ready");
   Check(b.ReleaseBatch(token));
 
   std::fill(source.begin(),source.end(),0x51);Check(b.Ready(&token));
-  std::uint64_t lease{};
-  Check(a.BeginGraph(token,{&src,1},{&dst,1},{&n,1},
-      {output.data(),output.size(),kvaf::DeviceKind::kNpu},stream,&lease));
   const auto allocations=acl_allocation_calls.load();const int acquired=local_acquires,sync_before_capture=raw_syncs;
   capturing_stream=stream;
-  Check(a.Read(token,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},stream,nullptr,false,false,lease));
+  Check(a.Read(token,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},stream));
   // A consumer captured after READ must see each replay's current data.
   EnqueueRawTask(stream,[&]{Require(!std::memcmp(output.data()+dst,source.data()+src,n),"same-stream graph consumer sees READ data");});
   capturing_stream=nullptr;
@@ -434,56 +432,75 @@ void AsyncAndGraphReplay() {
     Require(raw_calls==host_launches&&raw_wqes==wqes+1,"graph replay executes READ without running Host submission or batch state");
     Check(b.ReleaseBatch(token));
   }
-  Require(!b.Shutdown().ok(),"live graph lease blocks source detach");
-  captured_raw_tasks.clear(); // Destroy graph before retiring cached registrations.
-  Check(a.EndGraph(lease));
+  // Application destroys the graph before retiring cached registrations.
+  captured_raw_tasks.clear();
   Check(b.Shutdown());Check(a.Shutdown());
 }
 
-void InvocationLifetimes() {
+void ApplicationManagedPipeline() {
   raw_mode=true;fake_device=0;
-  std::vector<uint8_t> source(4096,0x39),output(128,0xcc);
-  kvaf::HbmReader a(0,1,4,2048,"fake.o",2,1);kvaf::HbmReceiverTicket receiver;
+  // More calls than the removed Host invocation budget. Metadata stays alive in
+  // application storage until the stream is completed; no per-call owner API.
+  constexpr std::size_t count=1030,span_bytes=16;
+  std::vector<uint8_t> source(4096),output(count*span_bytes,0xcc),other_output(128);
+  for(std::size_t i=0;i<source.size();++i)source[i]=i%251;
+  std::vector<std::array<int64_t,3>> metadata(count);
+  kvaf::HbmReader a(0,1,4,2048,"fake.o",1);kvaf::HbmReceiverTicket receiver;
   Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));
   kvaf::NpuPullHbmSource b(0,producer_eid);
   Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},receiver,reinterpret_cast<void*>(1)));
-  kvaf::ReadyToken ready;Check(b.Ready(&ready));int64_t src=7,dst=3,n=64;
-  auto inputs=std::make_shared<int>(1),storage=std::make_shared<int>(2);
-  std::weak_ptr<int> inputs_weak=inputs,storage_weak=storage;
-  auto stream=reinterpret_cast<void*>(1);
-  Check(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},
-      stream,nullptr,false,false,0,{inputs,storage}));
-  inputs.reset();storage.reset();
-  Require(!inputs_weak.expired() && !storage_weak.expired(),"normal async retains invocation and output owners");
-  Check(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},stream));
-  Require(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},stream).code()==kvaf::StatusCode::kBusy,
-      "bounded same-stream pipeline does not silently synchronize");
-  Require(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(2)).code()==kvaf::StatusCode::kBusy,
-      "source connection cannot switch streams while work is registered");
-  Check(a.Drain(ready));
-  Require(inputs_weak.expired() && !storage_weak.expired(),"Drain retires call owners but keeps registered storage");
-  Check(a.Read(ready,{&src,1},{&dst,1},{&n,1},{output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(2)));
-  Check(a.Drain(ready));Check(b.ReleaseBatch(ready));Check(b.Shutdown());Check(a.Shutdown());
-  Require(storage_weak.expired(),"output owner lives through checked MR close");
+  kvaf::ReadyToken ready;Check(b.Ready(&ready));
+  auto stream=reinterpret_cast<aclrtStream>(1);
+  const auto syncs=raw_syncs;
+  for(std::size_t i=0;i<count;++i) {
+    auto& m=metadata[i];m={static_cast<int64_t>(i%256),static_cast<int64_t>(i*span_bytes),span_bytes};
+    Check(a.Read(ready,{&m[0],1},{&m[1],1},{&m[2],1},
+        {output.data(),output.size(),kvaf::DeviceKind::kNpu},stream));
+  }
+  Require(raw_syncs==syncs && !a.pending(),"pipeline only enqueues without normal invocation tracking");
+  Require(std::all_of(output.begin(),output.end(),[](auto byte){return byte==0xcc;}),
+      "pipeline output remains pending until application synchronization");
+  auto& m=metadata.front();const auto launches=raw_calls.load();
+  Require(a.Read(ready,{&m[0],1},{&m[1],1},{&m[2],1},
+      {other_output.data(),other_output.size(),kvaf::DeviceKind::kNpu},stream).code()==kvaf::StatusCode::kBusy,
+      "distinct output storage consumes the registration cache budget");
+  Require(a.Read(ready,{&m[0],1},{&m[1],1},{&m[2],1},
+      {output.data(),output.size()-1,kvaf::DeviceKind::kNpu},stream).code()==kvaf::StatusCode::kBusy,
+      "output registration budget includes address and size");
+  Require(raw_calls==launches && raw_syncs==syncs,"registration budget rejection does not launch or synchronize");
+  Require(aclrtSynchronizeStream(stream)==ACL_SUCCESS,"application synchronizes the whole pipeline");
+  for(const auto& item:metadata)
+    Require(!std::memcmp(output.data()+item[1],source.data()+item[0],item[2]),"each queued call uses retained application metadata");
+  // The application completed the previous stream before choosing another one.
+  auto next_stream=reinterpret_cast<aclrtStream>(2);
+  Check(a.Read(ready,{&m[0],1},{&m[1],1},{&m[2],1},
+      {output.data(),output.size(),kvaf::DeviceKind::kNpu},next_stream));
+  Require(aclrtSynchronizeStream(next_stream)==ACL_SUCCESS,"application completes the new stream");
+  Check(b.ReleaseBatch(ready));
+  const auto completed_syncs=raw_syncs;
+  Check(a.Shutdown());
+  Require(raw_syncs==completed_syncs,"normal reader shutdown never implicitly synchronizes application streams");
+  Check(b.Shutdown());
 }
 
-void GraphPreparationFailure() {
+void PartialOutputRegistrationFailure() {
   raw_mode=true;fake_device=0;
   std::vector<uint8_t> source(4096,0x29),output(128);
-  kvaf::HbmReader a(0,1,4,2048,"fake.o");kvaf::HbmReceiverTicket receiver;
+  kvaf::HbmReader a(0,1,4,2048,"fake.o",1);kvaf::HbmReceiverTicket receiver;
   Check(a.Listen("127.0.0.1:0","",reader_eid,&receiver));
   kvaf::NpuPullHbmSource b(0,producer_eid);
   Check(b.Register({source.data(),source.size(),kvaf::DeviceKind::kNpu},receiver,reinterpret_cast<void*>(1)));
   kvaf::ReadyToken ready;Check(b.Ready(&ready));int64_t src=7,dst=3,n=64;
-  auto owner=std::make_shared<int>(1);std::weak_ptr<int> weak=owner;std::uint64_t lease{};
-  fail_local_registration=true;
-  Require(!a.BeginGraph(ready,{&src,1},{&dst,1},{&n,1},
-      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),&lease,{owner,{}}).ok() && lease,
-      "partial graph preparation publishes a retryable cleanup lease");
-  owner.reset();Require(!weak.expired(),"failed prepare retains node owners");
-  unregister_failures=1;
-  Require(!a.EndGraph(lease).ok() && !weak.expired(),"failed unregister preserves graph cleanup lease");
-  Check(a.EndGraph(lease));Require(weak.expired(),"successful graph cleanup releases node owner");
+  auto read=[&] {return a.Read(ready,{&src,1},{&dst,1},{&n,1},
+      {output.data(),output.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1),nullptr,false,true);};
+  const auto calls=raw_calls.load();
+  fail_local_registration=true;unregister_failures=1;
+  Require(!read().ok() && local_buffers==1 && raw_calls==calls && !a.pending(),
+      "failed partial registration retains its cleanup resource without submitting READ");
+  Require(!read().ok() && !local_buffers && raw_calls==calls,
+      "retry finishes partial registration cleanup before admitting new READ");
+  Check(read());
+  Require(!std::memcmp(output.data()+dst,source.data()+src,n),"same output registration can be retried after cleanup");
   Check(b.ReleaseBatch(ready));Check(b.Shutdown());Check(a.Shutdown());
 }
 
@@ -522,8 +539,8 @@ int main(int argc,char** argv){try{
     SubmissionFailure(mode);
   }
   AsyncAndGraphReplay();
-  InvocationLifetimes();
-  GraphPreparationFailure();
+  ApplicationManagedPipeline();
+  PartialOutputRegistrationFailure();
   NoHostStatusReadback();
   ProbeMustOverwriteEachMemory();
   ReceiverTopology();
@@ -658,5 +675,5 @@ int main(int argc,char** argv){try{
   proxy.drop=unsigned(hr::Command::Close);Require(!b.Shutdown().ok(),"lost Close response retains teardown");
   Check(Retry([&]{return b.Shutdown();}));Check(a.Shutdown());
   Require(!registrations && !contexts && !sessions && !cqs && !jetties && !peer_imports && !probe_allocations && !raw_transports && !local_buffers && !events && !pinned_buffers && fake_stream_tasks.empty(),"all resources and profiling events retired");
-  std::cout<<"HBM raw READ: real TCP/source/client, one WQE per span, leases, lost ACKs and cleanup passed\n";
+  std::cout<<"HBM raw READ: real TCP/source/client, one WQE per span, application-managed pipeline/graphs, lost ACKs and cleanup passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

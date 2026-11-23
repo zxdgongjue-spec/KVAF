@@ -21,7 +21,8 @@ struct CpuPullOptions {
 struct NpuPullOptions {
   std::string kernel_path;
   std::uint32_t cores{1}, jettys{4}, max_inflight_total{0};
-  std::uint32_t max_host_inflight{1024}, max_output_bindings{64};
+  // Per-source cache capacity for distinct output address/size registrations.
+  std::uint32_t max_output_bindings{64};
   bool diagnostics{false};
 };
 struct NpuRuntimeOptions : ExecutionPolicy {
@@ -114,21 +115,14 @@ class NpuRuntime final : public Runtime {
   // Default success means submitted, not completed. Warm up registrations before
   // graph capture; keep metadata/output/source and communication resources alive
   // until all work finishes and captured graphs are destroyed. The caller owns
-  // synchronization and producer reuse. Optional synchronize waits on this stream.
+  // synchronization and producer reuse. Serialize work on each source connection,
+  // including across streams. Detach/shutdown does not synchronize or destroy
+  // application graphs. Optional synchronize waits on this stream.
   // validate_ranges checks lengths/bounds on device; no Host status readback.
   Status BatchGetRawAddr(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
                          NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
                          HbmReadProfile* profile = nullptr, bool validate_ranges = false,
-                         bool synchronize = false, std::uint64_t graph_lease = 0,
-                         RawReadLifetime lifetime = {});
-  Status DrainRawAddr(const ReadyToken&);
-  bool raw_inflight() const;
-  // A nonzero output lease remains owned on preparation failure; EndRawGraph
-  // safely retries its cleanup. Each lease captures exactly one node.
-  Status BeginRawGraph(const ReadyToken&, NpuInt64ArrayView src, NpuInt64ArrayView dst,
-                       NpuInt64ArrayView lengths, MutableBufferView output, void* stream,
-                       std::uint64_t* lease, RawReadLifetime lifetime = {});
-  Status EndRawGraph(std::uint64_t lease);
+                         bool synchronize = false);
   // Reports quarantined submission/wait failures; never replays READ or notifies.
   Status ResolveRawAddr(const ReadyToken&);
   // Failure quarantine only, not a completion query for normally queued work.

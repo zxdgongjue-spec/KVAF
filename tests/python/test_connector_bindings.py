@@ -149,6 +149,23 @@ class ConnectorBindings(unittest.TestCase):
         with self.assertRaises(TypeError):
             kvaf.NpuRuntime().batch_get_raw_addr(1, {}, None, [0])
 
+    @unittest.skipUnless(hasattr(kvaf, "NpuRuntime"), "NPU Runtime binding not built")
+    def test_raw_pull_uses_application_lifecycle_without_host_leases(self):
+        for name in ("drain_raw_addr", "raw_inflight", "begin_raw_graph", "end_raw_graph"):
+            self.assertFalse(hasattr(kvaf.NpuRuntime, name))
+        # Raw lifecycle changes must not remove ordinary Get graph resources.
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "graph_resources"))
+        self.assertTrue(hasattr(kvaf.NpuRuntime, "drain_get"))
+        options = kvaf.NpuPullOptions(max_output_bindings=7)
+        self.assertEqual(options.max_output_bindings, 7)
+        self.assertFalse(hasattr(options, "max_host_inflight"))
+        with self.assertRaises(TypeError):
+            kvaf.NpuPullOptions(max_host_inflight=7)
+        source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
+        ready = restored(kvaf.ReadyToken, ("kvaf.ready.v2", source, 7, 1))
+        with self.assertRaises(TypeError):
+            kvaf.NpuRuntime().batch_get_raw_addr(ready, None, None, None, None, graph_lease=7)
+
     def call_with_arrays(self, arrays):
         runtime = kvaf.NpuRuntime()
         source = restored(kvaf.NpuPullSourceDesc, ("kvaf.npu-source.v2", 13, 88))
