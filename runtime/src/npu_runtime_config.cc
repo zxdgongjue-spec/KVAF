@@ -26,6 +26,7 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
     if (configured->max_inflight_total)
       resources.max_inflight_total = configured->max_inflight_total;
     resources.cpu_threads = configured->cpu_threads;
+    resources.sge_per_wr = configured->sge_per_wr;
     resources.request_capacity = configured->request_capacity;
     if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
   }

@@ -178,7 +178,7 @@ struct CpuPushChannelKey {
 struct OpenCpuPushGetRequest {
   MessageHeader header;
   uint64_t session_id, source_bytes, hbm_base, hbm_bytes, npu_tp;
-  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers, output_mode;
+  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers, output_mode, sge_per_wr;
   uint8_t eid[kEidBytes], segment[kSegKeyBytes];
   CpuPushChannelKey channels[4];
 };
@@ -208,7 +208,7 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
-static_assert(sizeof(OpenCpuPushGetRequest) == 428U, "CPU push setup ABI changed");
+static_assert(sizeof(OpenCpuPushGetRequest) == 432U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 

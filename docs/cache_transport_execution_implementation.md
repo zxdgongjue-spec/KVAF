@@ -507,7 +507,7 @@ runtime = kvaf.NpuRuntime(
 PutExecutionConfig(transport, executor)
 GetExecutionConfig(transport, executor, algorithm)
 ExecutionResources(*, cores=0, jettys=0, request_capacity=65536,
-                   max_inflight_total=None, kernel_path="", cpu_threads=0)
+                   max_inflight_total=None, kernel_path="", cpu_threads=0, sge_per_wr=0)
 ```
 
 配置字段的合法组合和默认值见[配置、预热与普通调用](#配置预热与普通调用)。

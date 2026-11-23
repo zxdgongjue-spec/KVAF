@@ -91,6 +91,9 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="Jettys per AIV core; aiv only (1..64, default: 2)")
     group.add_argument("--max-inflight-total", type=int, default=None,
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 disables the limit)")
+    group.add_argument("--sge-per-wr", type=int,
+                       default=environment_int("KVAF_BATCH_GET_PERF_SGE_PER_WR", 0),
+                       help="maximum source SGEs per WRITE WR; cpu_sgl_write only (0=auto, 1..16)")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU tries candidates in order")
@@ -147,6 +150,10 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
+    if not 0 <= args.sge_per_wr <= 16:
+        return "sge-per-wr must be in [0, 16] (0 selects the device limit)"
+    if args.sge_per_wr and args.backend != "cpu_sgl_write":
+        return "sge-per-wr is configurable only for --backend cpu_sgl_write"
     if not 1 <= args.request_length <= 65536:
         return "request-length must be in [1, 65536]"
     if not 1 <= args.table_capacity <= MAX_INT32:
@@ -199,6 +206,8 @@ def workload_command(args):
     command.append("--sort-input-indices" if args.sort_input_indices else "--no-sort-input-indices")
     if args.backend == "aiv":
         command += ["--jettys-per-core", str(args.jettys_per_core), "--max-inflight-total", str(args.max_inflight_total)]
+    if args.backend == "cpu_sgl_write":
+        command += ["--sge-per-wr", str(args.sge_per_wr)]
     if args.npu_eids:
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:
@@ -220,6 +229,8 @@ def configure_backend_help(parser, argv=None):
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
+    if backend != "cpu_sgl_write":
+        hidden.add("sge_per_wr")
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

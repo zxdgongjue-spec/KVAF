@@ -39,6 +39,9 @@ struct ExecutionResources {
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};
   std::optional<std::uint32_t> max_inflight_total;
   std::string kernel_path;
+  // CPU SGL Write only: maximum source SGEs per data WRITE WR. Zero selects
+  // min(16, device max_jfs_sge); explicit values must fit the device limit.
+  std::uint32_t sge_per_wr{0};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

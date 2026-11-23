@@ -13,6 +13,7 @@ struct Config {
   std::array<std::uint8_t, 16> local_eid{};
   std::uint32_t token_bytes{}, workers{1};
   bool direct_output{false};
+  std::uint32_t sge_per_wr{0};
 };
 class CpuPushTransport {
  public:

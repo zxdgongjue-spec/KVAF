@@ -373,7 +373,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
-        get_capacity=args.request_length,
+        get_capacity=args.request_length, sge_per_wr=args.sge_per_wr,
     )
     stream = torch.npu.current_stream()
     if args.multi_graph_check:
@@ -901,7 +901,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         get_capacity=request_length, cores=args.parallelism, jettys=args.jettys_per_core,
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
-        max_inflight_total=args.max_inflight_total,
+        max_inflight_total=args.max_inflight_total, sge_per_wr=args.sge_per_wr,
     )
     runtime = kvaf.NpuRuntime(
         **runtime_options(args),
@@ -926,6 +926,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} aicpu_workers={args.aicpu_workers} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
+            f"sge_per_wr={args.sge_per_wr} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "

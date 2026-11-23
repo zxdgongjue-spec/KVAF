@@ -168,7 +168,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     metadata = {key: config[key] for key in (
         "backend", "transport", "execution_mode", "aiv_cores", "aicpu_workers", "requests", "request_length", "miss_count", "token_bytes", "table_capacity", "tokens_per_block",
         "seconds", "graphs", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
-        "jettys_per_core", "max_inflight_total",
+        "jettys_per_core", "max_inflight_total", "sge_per_wr",
     ) if key in config}
     metadata["run"] = directory.name
     metadata["device_order"] = " ".join(str(r["device"]) for r in isolated)
@@ -207,6 +207,8 @@ def write_summary(directory, isolated, concurrent, config=None):
                 ("Jetty 数 / AIV 核", "jettys_per_core"),
                 ("未完成 READ 上限 / 卡", "max_inflight_total"),
             ) if key in config]
+        if backend == "cpu_sgl_write":
+            settings.append(("每个 WRITE WR 的源 SGE 上限（0=自动）", config.get("sge_per_wr", 0)))
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
     device_rows = [
         (r["device"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",

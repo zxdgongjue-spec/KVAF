@@ -91,6 +91,24 @@ imports, DMA visibility, Host registration retirement or CANN graph replay.
 Run the commands in [CPU SGL Write](../../docs/cpu_sgl_write.md) on the target
 machines for those checks.
 
+`cpu_sgl_transport.cc` links the real CPU WRITE transport to a fake URMA
+provider. With public UMDK headers, it checks the queue SGE setting, actual
+4/8/automatic SGE chains and WR counts, payloads, cached-plan output changes,
+64 KiB splitting, explicit limits above hardware capacity, and import retirement:
+
+```bash
+c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined \
+  -Icommon/include -Iaccess_operator/include -Iruntime/include -Iruntime \
+  -I"$KVAF_TEST_URMA_INCLUDE_DIR" \
+  tests/diagnostics/cpu_sgl_transport.cc runtime/cpu_service/push/cpu_push_get_transport.cc \
+  -o /tmp/kvaf-cpu-sgl-transport-test
+/tmp/kvaf-cpu-sgl-transport-test
+```
+
+The fake provider completes transfers synchronously and does not measure
+hardware bandwidth or prove DMA visibility. CLI/resource/CSV forwarding tests
+run with `python3 -m unittest discover -s tests/diagnostics -p 'test_*.py'`.
+
 ## URMA DDR page modes (Host only)
 
 The regression wraps Linux mapping calls to check HugeTLB flags, rounded

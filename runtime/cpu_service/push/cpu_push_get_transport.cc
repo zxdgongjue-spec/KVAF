@@ -43,6 +43,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
       setup.output_mode > kDirectOutput ||
+      setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode != kDirectOutput) ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode == kDirectOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
@@ -59,11 +60,17 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
     return Error("query device");
-  max_sge_ = std::min(16U, attr.dev_cap.max_jfs_sge);
+  const auto device_max_sge = std::min(16U, attr.dev_cap.max_jfs_sge);
+  if (setup.sge_per_wr > device_max_sge)
+    return Status::InvalidArgument("requested sge_per_wr=" + std::to_string(setup.sge_per_wr) +
+        " exceeds device limit=" + std::to_string(device_max_sge));
+  max_sge_ = setup.sge_per_wr ? setup.sge_per_wr : device_max_sge;
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
-  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u message_bytes=%u workers=%u token_bytes=%u"
-               " post_payload_wrs=%u\n", max_sge_, max_bytes_, workers_, token_bytes_, kPostPayloadWrs);
+  std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u device_max_sge=%u requested_sge=%u "
+               "message_bytes=%u workers=%u token_bytes=%u"
+               " post_payload_wrs=%u\n", max_sge_, device_max_sge, setup.sge_per_wr,
+               max_bytes_, workers_, token_bytes_, kPostPayloadWrs);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))
