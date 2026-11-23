@@ -1,5 +1,6 @@
 #include "cpu_service/backends/cpu_backends.h"
 #include "memory/execution_cpu_backend.h"
+#include "remote_pull_service.h"
 #include <mutex>
 #ifdef KVAF_CPU_HAS_URMA
 #include "cpu_service/urma/cpu_urma_discovery.h"
@@ -51,17 +52,25 @@ struct CpuRuntime::Impl {
 #ifdef KVAF_CPU_HAS_URMA
         discovery(std::make_shared<CpuUrmaDiscovery>(options.ub_device, options.has_eid_index,
                                                      options.eid_index)),
+        pull_discovery(std::make_shared<CpuUrmaDiscovery>(options.ub_device, options.has_eid_index,
+            options.eid_index, CpuUrmaDiscovery::Scope::AllDevices)),
 #endif
         ubmem(options, next_session),
-        execution(CreateExecutionService(options, discovery)) {}
+        execution(CreateExecutionService(options, discovery, pull_discovery)),
+        pull([this](std::uint64_t id, remote_pull::RegionInfo* info) {
+          return execution->DescribeCpuPullRegion(id, info);
+        }, [this](const remote_pull::RegionInfo& info) {
+          return execution->AcquireCpuPullBackend(info);
+        }) {}
   CpuRuntimeOptions options;
-  std::shared_ptr<CpuUrmaDiscovery> discovery;
+  std::shared_ptr<CpuUrmaDiscovery> discovery, pull_discovery;
   std::uint64_t next_session{1};
   UbmemCpuBackend ubmem;
   std::unique_ptr<execution::CacheRegionService> execution;
+  remote_pull::Service pull;
   std::recursive_mutex legacy_mutex;
 #ifdef KVAF_CPU_HAS_URMA
-  UrmaCpuBackend urma;
+  UrmaCpuBackend urma, cache_metadata;
 #endif
 };
 CpuRuntime::CpuRuntime() = default;
@@ -103,8 +112,13 @@ Status CpuRuntime::ServeConnection(int fd) {
   if (!impl_) return Status::NotInitialized("CpuRuntime not initialized");
   if (fd < 0) return Status::InvalidArgument("CpuRuntime connection fd is invalid");
   peer::MessageHeader header{};
-  if (!Read(fd, &header, sizeof(header)) || header.magic != peer::kProtocolMagic ||
-      header.version != peer::kProtocolVersion)
+  if (!Read(fd, &header, sizeof(header)))
+    return Status::InvalidArgument("incomplete CPU control header");
+  if (header.magic == remote_pull::kMagic) {
+    impl_->pull.Serve(fd, header);
+    return Status::OK();
+  }
+  if (header.magic != peer::kProtocolMagic || header.version != peer::kProtocolVersion)
     return Status::InvalidArgument("invalid CPU control header");
   if (header.command == execution::kCommand) {
     if (header.bytes < sizeof(header) || header.bytes > 16384)
@@ -145,9 +159,15 @@ Status CpuRuntime::ServeConnection(int fd) {
         status.code() == StatusCode::kNotFound ? peer::Result::kNotFound : peer::Result::kResourceError);
   }
 #ifdef KVAF_CPU_HAS_URMA
-  auto status = impl_->urma.initialized() ? Status::OK()
-      : impl_->urma.Initialize(impl_->options, impl_->next_session, impl_->discovery);
-  if (status.ok()) return impl_->urma.ServeConnection(fd, header);
+  // CPU Pull uses main's single-candidate protocol. Its indices refer to
+  // the full device list; ordinary cache providers use the service-affinity list.
+  const bool cache_query = command == peer::Command::kGetCacheCandidateCount ||
+      (command == peer::Command::kGetCandidateInfo && header.bytes == sizeof(peer::CandidateEidRequest));
+  auto& backend = cache_query ? impl_->cache_metadata : impl_->urma;
+  auto status = backend.initialized() ? Status::OK()
+      : backend.Initialize(impl_->options, impl_->next_session,
+                           cache_query ? impl_->discovery : impl_->pull_discovery);
+  if (status.ok()) return backend.ServeConnection(fd, header);
   std::fprintf(stderr, "[KVAF_CPU] %s\n", status.message().c_str());
 #endif
   // Match the requested response layout even when this backend is unavailable.
@@ -155,6 +175,7 @@ Status CpuRuntime::ServeConnection(int fd) {
     case peer::Command::kAllocateRegion:
     case peer::Command::kPrepareGatherWorkspace:
       return Reply<peer::AllocateRegionResponse>(fd, command, peer::Result::kResourceError);
+    case peer::Command::kGetCacheCandidateCount:
     case peer::Command::kGetCandidateCount:
       return Reply<peer::CandidateCountResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kGetCandidateInfo:
@@ -176,11 +197,17 @@ Status CpuRuntime::ServeConnection(int fd) {
 Status CpuRuntime::Shutdown() {
   std::unique_lock<std::shared_mutex> life(lifecycle_);
   if (!impl_) return Status::OK();
-  auto status = impl_->execution->Shutdown();
+  // Keep the service reachable for Query/Cancel/Detach after a failed shutdown.
+  // Registered sources retain region leases even when they are idle.
+  auto status = impl_->pull.Shutdown();
+  if (!status.ok()) return status;
+  status = impl_->execution->Shutdown();
   if (!status.ok()) return status;
   status = impl_->ubmem.Shutdown();
   if (!status.ok()) return status;
 #ifdef KVAF_CPU_HAS_URMA
+  status = impl_->cache_metadata.Shutdown();
+  if (!status.ok()) return status;
   status = impl_->urma.Shutdown();
   if (!status.ok()) return status;
 #endif

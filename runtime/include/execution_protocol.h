@@ -9,6 +9,7 @@ namespace kvaf::execution {
 constexpr std::uint16_t kCommand = 20;
 constexpr std::uint32_t kVersion = 1;
 constexpr std::uint64_t kRegions = 1, kSessions = 2, kIdempotent = 4, kFabric = 8, kUrma = 16;
+constexpr std::uint64_t kCpuPull = 32;
 constexpr std::uint64_t kRequired = kRegions | kSessions | kIdempotent;
 enum class Op : std::uint32_t {
   Capabilities,
@@ -18,7 +19,8 @@ enum class Op : std::uint32_t {
   CloseSession,
   ReleaseRegion,
   SessionCall,
-  Fence
+  Fence,
+  PrepareCpuPullRegion
 };
 enum class State : std::uint32_t { Creating, Ready, Failed, Recovering, Closed };
 struct Request {

@@ -1,4 +1,5 @@
 #include "cpu_service/backends/cpu_backends.h"
+#include "memory/cpu_ddr_allocation.h"
 #include "memory/cpu_ddr_registration.h"
 #include "memory/cpu_shared_registration.h"
 #include "cpu_service/urma/cpu_urma_channel.h"
@@ -10,9 +11,9 @@
 #include "cpu_gather_executor.h"
 #include "gather_workspace.h"
 #include "cpu_service/push/cpu_push_get_worker.h"
+#include "cpu_pull_urma.h"
 
 #include <dlfcn.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -29,7 +30,6 @@
 #include <cstdarg>
 #include <cinttypes>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -85,8 +85,6 @@ constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transp
 // and transport mode; the trailing four bytes are retained on the wire.
 constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
-constexpr std::size_t kBasePageBytes = 4096U;
-constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -324,10 +322,11 @@ class UrmaResourcePool {
 // and context setup here; data-plane calls continue on independent sessions.
 class SharedUrmaMemory {
  public:
-  SharedUrmaMemory(CpuRuntimeOptions options, void* memory, std::uint64_t bytes,
+  SharedUrmaMemory(CpuRuntimeOptions options, std::shared_ptr<CpuUrmaDiscovery> pull_discovery,
+                   void* memory, std::uint64_t bytes,
                    std::uint64_t epoch, std::uint64_t allocation)
       : options_(std::move(options)), memory_(memory), bytes_(bytes), epoch_(epoch),
-        allocation_(allocation), generation_(NewBindingGeneration()) {}
+        allocation_(allocation), generation_(NewBindingGeneration()), pull_discovery_(std::move(pull_discovery)) {}
   Status Initialize(const CpuRuntimeOptions& options, const std::shared_ptr<CpuUrmaDiscovery>& discovery) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closing_) return Status::InvalidState("CPU URMA memory pool is closing");
@@ -364,11 +363,48 @@ class SharedUrmaMemory {
   Status Close() {
     std::lock_guard<std::mutex> lock(mutex_);
     closing_ = true;
-    auto status = registrations_.Close();
+    auto status = offload::CloseUrmaDestination(pull_destination_);
     if (!status.ok()) return status;
-    if (!resources.Shutdown()) return Status::Internal("shared CPU URMA context close failed");
+    pull_destination_.reset();
+    status = registrations_.Close();
+    if (!status.ok()) return status;
+    if (!pull_resources_.Shutdown() || !resources.Shutdown())
+      return Status::Internal("shared CPU URMA context close failed");
     ready_ = false;
     return Status::OK();
+  }
+  Status PreparePull(std::uint32_t candidate, std::uint32_t token,
+                     std::uint64_t logical_bytes, peer::PeerRegion* out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_ || !out || !logical_bytes || logical_bytes > bytes_)
+      return Status::InvalidArgument("invalid CPU Pull destination range");
+    if (pull_destination_)
+      return Status::InvalidState("CPU Pull destination already prepared");
+    if (pull_resources_.CandidateCount() == 0 && !pull_resources_.Initialize(pull_discovery_))
+      return Status::Internal("CPU Pull candidate discovery failed");
+    auto* context = pull_resources_.Get(candidate);
+    if (!context) return Status::Internal("CPU Pull context initialization failed");
+    pull_context_ = context->context();
+    pull_bytes_ = logical_bytes;
+    pull_token_ = token;
+    // CPU READ destination requires LOCAL_WRITE/non_pin=0. Ordinary remote
+    // access uses a different flags profile and retains its own registration.
+    pull_destination_ = offload::CreateUrmaDestination(pull_context_, memory_, pull_bytes_, token);
+    auto status = offload::PrepareUrmaDestination(pull_destination_);
+    if (!status.ok()) return status;
+    *out = {};
+    out->base = reinterpret_cast<std::uintptr_t>(memory_);
+    out->length = logical_bytes;
+    out->token_value = token;
+    std::memcpy(out->eid.data(), pull_context_->eid.raw, out->eid.size());
+    pull_ready_ = true;
+    return Status::OK();
+  }
+  std::unique_ptr<offload::Backend> CreatePullBackend(std::shared_ptr<void> lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_ || !pull_ready_) return {};
+    return offload::CreateBorrowedUrmaBackend(pull_context_, memory_, pull_bytes_,
+        pull_token_, std::move(lease), pull_destination_);
   }
   UrmaResourcePool resources;
  private:
@@ -378,6 +414,13 @@ class SharedUrmaMemory {
   bool attempted_{false}, ready_{false}, closing_{false};
   std::mutex mutex_;
   CpuDdrRegistrationPool registrations_;
+  std::shared_ptr<CpuUrmaDiscovery> pull_discovery_;
+  UrmaResourcePool pull_resources_;
+  std::shared_ptr<offload::UrmaDestination> pull_destination_;
+  urma_context_t* pull_context_{nullptr};
+  std::uint64_t pull_bytes_{0};
+  std::uint32_t pull_token_{0};
+  bool pull_ready_{false};
 };
 
 using Channel = cpu_runtime_detail::UrmaChannel;
@@ -459,6 +502,7 @@ class CpuGatherWorker {
 
 struct GatherWorkspace {
   void* memory = nullptr;
+  std::size_t mapped_bytes = 0U;
   uint64_t bytes = 0U, base = 0U;
   std::unique_ptr<CpuDdrRegistration> registration;
 };
@@ -468,6 +512,7 @@ struct Region {
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
+  std::size_t mapped_bytes = 0U;
   bool borrowed = false;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
@@ -548,8 +593,8 @@ class CpuService {
     region->bytes = bytes;
     region->borrowed = borrowed != nullptr;
     region->memory = borrowed;
-    if (!borrowed && !AllocateMemory(&region->memory, region->bytes)) {
-      return Result::kResourceError;
+    if (!borrowed && !AllocateMemory(region->memory, bytes, region->mapped_bytes)) {
+      return fail();
     }
     region->bytes = bytes;
     if (!borrowed && bytes >= 64U)
@@ -588,11 +633,16 @@ class CpuService {
         response->peer_base, response->token_id);
       return fail();
     }
-    regions_.emplace(id, std::move(region));
+    const auto& allocated = *regions_.emplace(id, std::move(region)).first->second;
+    const std::size_t backing_bytes = allocated.mapped_bytes != 0U
+        ? allocated.mapped_bytes : static_cast<std::size_t>(bytes);
+    const char* page_mode = borrowed ? "shared" : CpuMemoryPageModeName(memory_page_mode_);
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s "
+        "memory=%p backing_bytes=%zu\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, MemoryPageModeName());
+        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, page_mode,
+        allocated.memory, backing_bytes);
     return Result::kOk;
   }
 
@@ -613,7 +663,8 @@ class CpuService {
     }
     auto& workspace = *region.gather_workspace;
     if (bytes > workspace.bytes) return Result::kInvalidRequest;
-    if (!workspace.memory && !AllocateMemory(&workspace.memory, workspace.bytes))
+    if (!workspace.base && !workspace.registration &&
+        !AllocateMemory(workspace.memory, workspace.bytes, workspace.mapped_bytes))
       return Result::kResourceError;
     if (!workspace.base) {
       // A failed registration can retain a token. Retire it before retrying,
@@ -846,48 +897,18 @@ class CpuService {
   }
 
  private:
-  const char* MemoryPageModeName() const {
-    switch (memory_page_mode_) {
-      case CpuMemoryPageMode::kDefault:
-        return "default";
-      case CpuMemoryPageMode::kTransparentHugePage:
-        return "thp";
-    }
-    return "unknown";
+  bool AllocateMemory(void*& memory, std::size_t bytes, std::size_t& mapped_bytes) {
+    // A previous prefault failure may have left an unregistered mapping.
+    if (memory && !ReleaseMemory(memory, mapped_bytes)) return false;
+    const auto status = AllocateCpuDdr(memory_page_mode_, bytes, memory, mapped_bytes);
+    if (!status.ok()) Log("[KVAF_CPU] REGION_ALLOCATE_FAILED %s\n", status.message().c_str());
+    return status.ok();
   }
 
-  bool AllocateMemory(void** memory, uint64_t requested_bytes) {
-    if (memory == nullptr || requested_bytes == 0U ||
-        requested_bytes > std::numeric_limits<std::size_t>::max()) {
-      return false;
-    }
-    const std::size_t bytes = static_cast<std::size_t>(requested_bytes);
-    const std::size_t alignment =
-        memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
-            ? kHugePage2MBytes
-            : kBasePageBytes;
-    const int allocation_status = posix_memalign(memory, alignment, bytes);
-    if (allocation_status != 0 || *memory == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
-          " alignment=%zu status=%d memory=%p page_mode=%s\n",
-          requested_bytes, alignment, allocation_status, *memory,
-          MemoryPageModeName());
-      return false;
-    }
-    if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
-      if (madvise(*memory, bytes, MADV_HUGEPAGE) != 0) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
-            " errno=%d\n",
-            requested_bytes, errno);
-        free(*memory);
-        *memory = nullptr;
-        return false;
-      }
-      // Fault the range while huge-page advice is active. Launching the service
-      // under a NUMA memory policy makes placement deterministic as well.
-      std::memset(*memory, 0, bytes);
-    }
-    return true;
+  bool ReleaseMemory(void*& memory, std::size_t& mapped_bytes) {
+    const auto status = ReleaseCpuDdr(memory, mapped_bytes);
+    if (!status.ok()) Log("[KVAF_CPU] REGION_RELEASE_FAILED %s\n", status.message().c_str());
+    return status.ok();
   }
 
   uint32_t NextToken() {
@@ -998,7 +1019,7 @@ class CpuService {
       auto& workspace = *region->gather_workspace;
       if (workspace.registration && !workspace.registration->Close().ok()) return false;
       workspace.registration.reset();
-      free(workspace.memory);
+      if (!ReleaseMemory(workspace.memory, workspace.mapped_bytes)) return false;
       region->gather_workspace.reset();
     }
     if (region->registration) {
@@ -1006,7 +1027,7 @@ class CpuService {
       region->registration.reset();
     }
     if (region->memory != nullptr) {
-      if (!region->borrowed) free(region->memory);
+      if (!region->borrowed && !ReleaseMemory(region->memory, region->mapped_bytes)) return false;
       region->memory = nullptr;
     }
     return true;
@@ -1098,6 +1119,7 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
       (void)WriteAll(fd, &response, sizeof(response));
       return;
     }
+    case Command::kGetCacheCandidateCount:
     case Command::kGetCandidateCount: {
       if (!IsValidHeader(header, command, sizeof(CandidateCountRequest))) {
         SendStatus(fd, command, Result::kInvalidRequest);
@@ -1229,16 +1251,24 @@ void HandleClient(IO fd, CpuService* service, const MessageHeader& header) {
 struct CpuUrmaMemoryPool::Impl {
   std::shared_ptr<SharedUrmaMemory> memory;
 };
-CpuUrmaMemoryPool::CpuUrmaMemoryPool(const CpuRuntimeOptions& options, void* memory,
+CpuUrmaMemoryPool::CpuUrmaMemoryPool(const CpuRuntimeOptions& options,
+    std::shared_ptr<CpuUrmaDiscovery> pull_discovery, void* memory,
     std::uint64_t bytes, std::uint64_t epoch, std::uint64_t allocation_request)
     : impl_(std::make_unique<Impl>()) {
-  impl_->memory = std::make_shared<SharedUrmaMemory>(options, memory, bytes, epoch, allocation_request);
+  impl_->memory = std::make_shared<SharedUrmaMemory>(options, std::move(pull_discovery), memory, bytes, epoch, allocation_request);
 }
 CpuUrmaMemoryPool::~CpuUrmaMemoryPool() { if (!Close().ok()) (void)impl_.release(); }
 Status CpuUrmaMemoryPool::Close() {
   if (impl_->memory.use_count() != 1)
     return Status::Busy("CPU URMA memory pool still has execution sessions");
   return impl_->memory->Close();
+}
+Status CpuUrmaMemoryPool::PrepareCpuPull(std::uint32_t candidate, std::uint32_t token,
+    std::uint64_t logical_bytes, peer::PeerRegion* out) {
+  return impl_->memory->PreparePull(candidate, token, logical_bytes, out);
+}
+std::unique_ptr<offload::Backend> CpuUrmaMemoryPool::CreateCpuPullBackend(std::shared_ptr<void> lease) {
+  return impl_->memory->CreatePullBackend(std::move(lease));
 }
 
 struct UrmaCpuBackend::Impl {

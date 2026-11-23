@@ -15,8 +15,8 @@ std::mutex provider_mutex;
 std::size_t provider_users = 0;
 bool provider_owned = false;
 }  // namespace
-CpuUrmaDiscovery::CpuUrmaDiscovery(std::string device, bool has_eid_index, std::uint32_t eid_index)
-    : scope_status_(scope_.Capture()), device_(std::move(device)), has_eid_index_(has_eid_index),
+CpuUrmaDiscovery::CpuUrmaDiscovery(std::string device, bool has_eid_index, std::uint32_t eid_index, Scope scope)
+    : device_scope_(scope), scope_status_(scope == Scope::ServiceAffinity ? scope_.Capture() : Status::OK()), device_(std::move(device)), has_eid_index_(has_eid_index),
       eid_index_(eid_index) {}
 
 Status CpuUrmaDiscovery::Initialize() {
@@ -44,7 +44,7 @@ Status CpuUrmaDiscovery::Initialize() {
         discovered.push_back(std::move(candidate));
         return false;
       }, [&](auto* device) {
-        if (scope_.Allows(device->name)) return true;
+        if (device_scope_ == Scope::AllDevices || scope_.Allows(device->name)) return true;
         std::fprintf(stderr, "[KVAF_CPU] NUMA_DEVICE_SKIPPED device=%s reason=outside_or_unknown_chip\n",
                      device->name);
         return false;

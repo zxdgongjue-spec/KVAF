@@ -2,10 +2,18 @@
 #include "npu_eid_selection.h"
 #include "execution_dispatcher.h"
 #include "session_access_operator.h"
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+#include "remote_pull_operator.h"
+#endif
+#if defined(KVAF_ENABLE_NPU_PULL)
+#include "hbm_read_client.h"
+#include "npu_kernel_paths.h"
+#endif
 
 #include <acl/acl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -251,9 +259,12 @@ struct NpuRuntime::Impl {
     q.algorithm = algorithm;
     q.put = !get;
     const auto budget = Resources(transport, executor, algorithm, get);
+    if (get && (!options.batch_get_token_bytes || !options.batch_get_tokens_per_block))
+      throw std::invalid_argument("ordinary cache Get requires a token layout");
     ValidateProviderResources(transport, executor, algorithm, get, budget);
     std::vector<peer::PeerCandidateInfo> candidates;
     if (transport == Transport::Urma) {
+      EnsureCacheEids();
       if (get && executor == Executor::Aiv && algorithm == GetAlgorithm::Direct) {
         const auto workers = static_cast<uint64_t>(budget.cores) * budget.jettys;
         const auto s = cpu_fes.ForDirectGet(workers, &candidates);
@@ -284,8 +295,38 @@ struct NpuRuntime::Impl {
         },
         budget.request_capacity);
   }
+  void EnsureCacheEids() {
+    std::lock_guard<std::mutex> lock(cache_eid_mutex);
+    if (cache_eids_ready) return;
+    peer::PeerCandidateTable table;
+    table.local = cache_peer_local;
+    auto status = peer_link->GetCacheCandidateCount(&table);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    std::uint32_t physical_device;
+    if (!ResolvePhysicalDeviceId(options.device_id, &physical_device))
+      throw std::invalid_argument("cannot resolve physical NPU from device " + std::to_string(options.device_id));
+    const bool automatic_cpu = !table.device_fixed && options.peer_ub_device.empty();
+    detail::PairEids pair;
+    if (table.local && (options.npu_eids.empty() || automatic_cpu))
+      pair = detail::ReadDevicePair(physical_device);
+    status = detail::SelectNpuEids(physical_device, options.npu_eids, pair, &local_eids);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    status = peer_link->SelectCpuFes(table, options.peer_ub_device, pair.cpu,
+                                     local_eids.size() > 1, &cpu_fes);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    const auto& cpu = cpu_fes.primary;
+    const char* reason = "first_candidate";
+    if (!automatic_cpu) reason = "fixed_device";
+    else if (table.local) reason = pair.cpu && *pair.cpu == cpu.eid ? "pair_match" : "pair_fallback";
+    std::fprintf(stderr, "[KVAF] PEER_LINK_EID_SELECTED scene=%s physical_device=%u candidate=%u "
+                 "ub_device=%s eid_index=%u cpu_eid=%s npu_eid=%s cpu_selection=%s\n",
+                 table.local ? "local" : "remote", physical_device, cpu.candidate_id,
+                 cpu.device_name.c_str(), cpu.eid_index, detail::EidToHex(cpu.eid).c_str(),
+                 detail::EidToHex(local_eids.front()).c_str(), reason);
+    cache_eids_ready = true;
+  }
   std::vector<detail::NpuEid> ProviderEids(Transport transport, Executor executor, bool get,
-                                         const ExecutionResources& budget) const {
+                                         const ExecutionResources& budget) {
     std::vector<detail::NpuEid> selected;
     const auto status = detail::SelectProviderEids(transport, executor, get,
         !options.npu_eids.empty(), budget, local_eids, &selected);
@@ -334,12 +375,27 @@ struct NpuRuntime::Impl {
 #endif
   }
 
+  std::atomic<bool> base_initialized{false};
+  std::atomic<bool> closing{false};
+  std::atomic<bool> ddr_closing{false};
+  mutable std::mutex base_mutex;
+#if defined(KVAF_ENABLE_NPU_PULL)
+  std::shared_ptr<HbmReader> hbm_reader;
+  std::shared_ptr<HbmReader> Reader() const {
+    std::lock_guard<std::mutex> lock(base_mutex);
+    return hbm_reader;
+  }
+#endif
   NpuRuntimeOptions options;
   detail::AicpuKernelPackage kernel_package;
   std::mutex aicpu_package_mutex;
   bool aicpu_package_ready{false};
   peer::CpuFeSelection cpu_fes;
+  bool cache_peer_local{};
+  std::uint32_t pull_candidate{};
   std::vector<detail::NpuEid> local_eids;
+  std::mutex cache_eid_mutex;
+  bool cache_eids_ready{false};
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
   std::shared_ptr<peer::PeerLink> peer_link;
@@ -349,11 +405,15 @@ struct NpuRuntime::Impl {
 #endif
   std::unique_ptr<ExecutionDispatcher> dispatcher;
   std::unique_ptr<RuntimeCore> runtime_core;
+  std::mutex cpu_pull_prepare_mutex;
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  std::unique_ptr<RemotePullOperator> cpu_pull;
+#endif
 };
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& config = impl_->options;
-  if (config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0)
+  if ((config.batch_get_token_bytes == 0) != (config.batch_get_tokens_per_block == 0))
     throw std::invalid_argument("invalid NPU Runtime token layout");
   if (aclrtSetDevice(config.device_id) != ACL_SUCCESS)
     throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
@@ -373,7 +433,7 @@ NpuRuntime::~NpuRuntime() {
 
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
-  if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
+  if (ddr_initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize_ddr");
   if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link, impl_->options.transport_mode);
@@ -383,9 +443,23 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   return Status::OK();
 }
 
-Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+Status NpuRuntime::Initialize() {
+  std::lock_guard<std::mutex> lock(impl_->base_mutex);
+  if (impl_->closing) return Status::InvalidState("retry incomplete Runtime shutdown");
+  if (impl_->base_initialized) return Status::OK();
+  if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
+    return Status::Internal("aclrtSetDevice failed");
+  impl_->base_initialized = true;
+  return Status::OK();
+}
+Status NpuRuntime::Initialize(std::uint64_t bytes, std::uint64_t slot) {
+  auto status = Initialize();
+  return status.ok() ? InitializeDdr(bytes, slot) : status;
+}
+Status NpuRuntime::InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+  if (!initialized()) return Status::NotInitialized("initialize base device before DDR");
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
-  if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
+  if (ddr_initialized()) return Status::InvalidState("DDR has already been initialized");
   if (impl_->peer_link == nullptr || impl_->allocator == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
   }
@@ -394,7 +468,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   }
 
   if (impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()) {
-    const Status status = Shutdown();
+    const Status status = ShutdownDdr();
     if (!status.ok()) return status;
   }
   // Cache allocation does not initialize a transport or prepare an algorithm.
@@ -402,32 +476,32 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   // own routing and worker budget; the default Get must not choose that policy.
   impl_->local_eids.clear();
   impl_->cpu_fes = {};
+  impl_->cache_eids_ready = false;
+  impl_->pull_candidate = 0;
   if (impl_->options.transport_mode != TransportMode::Ubmem) {
     peer::PeerCandidateTable table;
-    auto status = impl_->peer_link->DiscoverCandidates(&table);
+    auto status = impl_->peer_link->DiscoverCandidates(&table, false);
     if (!status.ok()) return status;
-    const auto& options = impl_->options;
-    std::uint32_t physical_device;
-    if (!ResolvePhysicalDeviceId(options.device_id, &physical_device))
-      return Status::InvalidArgument("cannot resolve physical NPU from device " + std::to_string(options.device_id));
-    const bool automatic_cpu = !table.device_fixed && options.peer_ub_device.empty();
-    detail::PairEids pair;
-    if (table.local && (options.npu_eids.empty() || automatic_cpu))
-      pair = detail::ReadDevicePair(physical_device);
-    status = detail::SelectNpuEids(physical_device, options.npu_eids, pair, &impl_->local_eids);
-    if (!status.ok()) return status;
-    status = impl_->peer_link->SelectCpuFes(table, options.peer_ub_device, pair.cpu,
-                                           impl_->local_eids.size() > 1, &impl_->cpu_fes);
-    if (!status.ok()) return status;
-    const auto& cpu = impl_->cpu_fes.primary;
-    const char* reason = "first_candidate";
-    if (!automatic_cpu) reason = "fixed_device";
-    else if (table.local) reason = pair.cpu && *pair.cpu == cpu.eid ? "pair_match" : "pair_fallback";
-    std::fprintf(stderr, "[KVAF] PEER_LINK_EID_SELECTED scene=%s physical_device=%u candidate=%u "
-                 "ub_device=%s eid_index=%u cpu_eid=%s npu_eid=%s cpu_selection=%s\n",
-                 table.local ? "local" : "remote", physical_device, cpu.candidate_id,
-                 cpu.device_name.c_str(), cpu.eid_index, detail::EidToHex(cpu.eid).c_str(),
-                 detail::EidToHex(impl_->local_eids.front()).c_str(), reason);
+    impl_->cache_peer_local = table.local;
+    const auto& devices = impl_->options.peer_ub_device;
+    // A list configures cache Direct Get only. CPU Pull retains its single-device pin.
+    if (!devices.empty() && devices.find(',') == std::string::npos) {
+      const auto first = devices.find_first_not_of(" \t\r\n");
+      if (first == std::string::npos) return Status::InvalidArgument("empty peer UB device");
+      const auto device = devices.substr(first, devices.find_last_not_of(" \t\r\n") - first + 1);
+      std::uint32_t candidate = 0;
+      for (; candidate < table.count; ++candidate) {
+        peer::PeerCandidateInfo info;
+        status = impl_->peer_link->GetCandidateInfo(candidate, &info, false);
+        if (!status.ok()) return status;
+        if (info.device_id >= table.device_count)
+          return Status::Internal("peer Runtime returned invalid candidate metadata");
+        if (info.device_name == device) break;
+      }
+      if (candidate == table.count)
+        return Status::NotFound("peer Runtime did not advertise fixed UB device " + device);
+      impl_->pull_candidate = candidate;
+    }
   }
   impl_->runtime_core.reset();
   impl_->dispatcher.reset();
@@ -460,40 +534,40 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
 }
 
 Status NpuRuntime::DrainGet() {
-  if (!initialized()) return Status::NotInitialized("initialize Runtime before draining Get");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before draining Get");
   return core().DrainGet();
 }
 Status NpuRuntime::Recover(PutExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
     return Status::Internal("aclrtSetDevice failed");
-  if (!initialized()) return Status::NotInitialized("initialize Runtime before recovery");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before recovery");
   return core().RecoverPut(c);
 }
 Status NpuRuntime::Recover(GetExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)
     return Status::Internal("aclrtSetDevice failed");
-  if (!initialized()) return Status::NotInitialized("initialize Runtime before recovery");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before recovery");
   return core().RecoverGet(c);
 }
 Status NpuRuntime::Warmup(PutExecutionConfig c, const ExecutionWarmup& request) {
-  if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before warmup");
   return impl_->dispatcher->Warmup(c, request);
 }
 Status NpuRuntime::Warmup(GetExecutionConfig c, const ExecutionWarmup& request) {
-  if (!initialized()) return Status::NotInitialized("initialize DDR before warmup");
+  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before warmup");
   return impl_->dispatcher->Warmup(c, request);
 }
 
 Status NpuRuntime::SetBatchGetKernelProfiling(
     bool enabled, bool detailed, std::optional<GetExecutionConfig> config) {
-  if (!initialized() || !impl_->dispatcher)
+  if (!ddr_initialized() || !impl_->dispatcher)
     return Status::NotInitialized("initialize Runtime before configuring Get profiling");
   return impl_->dispatcher->ConfigureGetProfiling(config, enabled, detailed);
 }
 
 Status NpuRuntime::CheckBatchGetStatus(void* stream, std::optional<GetExecutionConfig> config,
                                       std::uint64_t graph_lease) {
-  if (!initialized() || !impl_->dispatcher)
+  if (!ddr_initialized() || !impl_->dispatcher)
     return Status::NotInitialized("NpuRuntime is not initialized");
   return impl_->dispatcher->CheckGetStatus(config, stream, graph_lease);
 }
@@ -501,9 +575,136 @@ Status NpuRuntime::CheckBatchGetStatus(void* stream, std::optional<GetExecutionC
 Status NpuRuntime::CopyBatchGetKernelProfiles(
     std::vector<BatchGetKernelProfile>* profiles, std::optional<GetExecutionConfig> config,
     std::uint64_t graph_lease) const {
-  if (!initialized() || !impl_->dispatcher)
+  if (!ddr_initialized() || !impl_->dispatcher)
     return Status::NotInitialized("initialize Runtime before reading Get profiling");
   return impl_->dispatcher->CopyGetProfiles(config, profiles, graph_lease);
+}
+
+Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* out) {
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if(!out)return Status::InvalidArgument("missing CPU Pull region ticket");
+  if(!ddr_initialized())return Status::NotInitialized("initialize DDR before CPU Pull");
+  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
+  if(impl_->options.transport_mode==TransportMode::Ubmem)
+    return Status::InvalidState("CPU Pull requires DDR URMA capability");
+  std::lock_guard<std::mutex> lock(impl_->cpu_pull_prepare_mutex);
+  if(impl_->ddr_closing)return Status::InvalidState("retry DDR shutdown before exporting a ticket");
+  if(impl_->cpu_pull && impl_->cpu_pull->ticket().region_id) {
+    *out=impl_->cpu_pull->ticket();return Status::OK();
+  }
+  if (!impl_->cpu_pull)
+    impl_->cpu_pull = std::make_unique<RemotePullOperator>(impl_->peer_link, impl_->pull_candidate);
+  auto status=core().SetCpuPullExecutor(impl_->cpu_pull.get());
+  if(!status.ok())return status;
+  status=impl_->cpu_pull->Initialize(core().remote_region());
+  if(!status.ok())return status;
+  *out=impl_->cpu_pull->ticket();return Status::OK();
+#else
+  return Status::NotImplemented("CPU Pull was not built");
+#endif
+}
+Status NpuRuntime::BatchCpuPull(const std::vector<KeyId>& keys,const ReadyToken& ready,
+    Uint64ArrayView src,const std::vector<std::uint64_t>& lengths,std::uint32_t timeout,CpuPullProfile* profile) {
+  if(!ddr_initialized())return Status::NotInitialized("initialize DDR before CPU Pull");
+  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
+  if(timeout==UINT32_MAX)timeout=impl_->options.cpu_pull_options.timeout_ms;
+  return core().BatchCpuPull(keys,ready,src,lengths,timeout,profile);
+}
+Status NpuRuntime::ResolveCpuPull(std::uint32_t timeout) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  if(timeout==UINT32_MAX)timeout=impl_->options.cpu_pull_options.timeout_ms;
+  return core().ResolveCpuPull(timeout);
+}
+Status NpuRuntime::CancelCpuPull(const ReadyToken& ready) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  return core().CancelCpuPull(ready);
+}
+bool NpuRuntime::pending_offload() const { return ddr_initialized() && core().pending_offload(); }
+Status NpuRuntime::LastOffloadChecksum(std::uint64_t* out) const {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  return core().LastOffloadChecksum(out);
+}
+Status NpuRuntime::PreparePut(const std::vector<KeyId>& keys,const std::vector<std::uint64_t>& lengths,PutHandle* out) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
+  return core().PreparePut(keys,lengths,out);
+}
+Status NpuRuntime::SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,Uint64ArrayView src,
+    Uint64ArrayView dst,Uint64ArrayView lengths) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
+  return core().SubmitCpuPull(ready,put,src,dst,lengths);
+}
+Status NpuRuntime::QueryCpuPull(const PutHandle& put,CpuPullState* state) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  return core().QueryCpuPull(put,state);
+}
+Status NpuRuntime::WaitCpuPull(const PutHandle& put,std::uint32_t timeout,CpuPullState* state) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  return core().WaitCpuPull(put,timeout,state);
+}
+Status NpuRuntime::CommitPut(const PutHandle& put) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  return core().CommitPut(put);
+}
+Status NpuRuntime::AbortPut(const PutHandle& put) {
+  if(!ddr_initialized())return Status::NotInitialized("DDR is not initialized");
+  return core().AbortPut(put);
+}
+
+Status NpuRuntime::ListenHbm(const std::string& address,const std::string& advertised,
+    const std::string& local_eid,HbmReceiverTicket* receiver) {
+#if defined(KVAF_ENABLE_NPU_PULL)
+  std::lock_guard<std::mutex> lock(impl_->base_mutex);
+  if(!initialized())return Status::NotInitialized("initialize base device before listen_hbm");
+  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
+  if(!impl_->hbm_reader) {
+    const auto& o=impl_->options.npu_pull_options;
+    auto kernel=o.kernel_path;
+    if(kernel.empty())kernel=detail::kDefaultRawReadKernelPath;
+    if(kernel.empty())return Status::InvalidArgument("configure npu_pull_options.kernel_path");
+    impl_->hbm_reader=std::make_shared<HbmReader>(device_id(),o.cores,o.jettys,
+        o.max_inflight_total,kernel,o.max_output_bindings,o.diagnostics);
+  }
+  return impl_->hbm_reader->Listen(address,advertised,local_eid,receiver);
+#else
+  return Status::NotImplemented("NPU Pull was not built");
+#endif
+}
+Status NpuRuntime::BatchGetRawAddr(const ReadyToken& ready,NpuInt64ArrayView src,NpuInt64ArrayView dst,
+    NpuInt64ArrayView lengths,MutableBufferView output,void* stream,HbmReadProfile* profile,
+    bool validate_ranges,bool synchronize) {
+#if defined(KVAF_ENABLE_NPU_PULL)
+  auto reader=impl_->Reader();
+  if(!initialized() || !reader)return Status::NotInitialized("listen and register source before raw READ");
+  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
+  return reader->Read(ready,src,dst,lengths,output,stream,profile,validate_ranges,
+                      synchronize);
+#else
+  return Status::NotImplemented("NPU Pull was not built");
+#endif
+}
+Status NpuRuntime::ResolveRawAddr(const ReadyToken& ready) {
+#if defined(KVAF_ENABLE_NPU_PULL)
+  auto reader=impl_->Reader();
+  if(reader)return reader->Resolve(ready);
+#endif
+  return Status::NotInitialized("NPU Pull is not initialized");
+}
+Status NpuRuntime::CancelRawAddr(const ReadyToken& ready) {
+#if defined(KVAF_ENABLE_NPU_PULL)
+  auto reader=impl_->Reader();
+  if(reader)return reader->Cancel(ready);
+#endif
+  return Status::NotInitialized("NPU Pull is not initialized");
+}
+bool NpuRuntime::pending_raw_addr() const {
+#if defined(KVAF_ENABLE_NPU_PULL)
+  auto reader=impl_->Reader();
+  return reader && reader->pending();
+#else
+  return false;
+#endif
 }
 
 Status NpuRuntime::AcceptLink(const LinkTarget&) {
@@ -512,7 +713,7 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
 
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
   if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
-  const Status shutdown = Shutdown();
+  const Status shutdown = ShutdownDdr();
   if (!shutdown.ok()) return shutdown;
   impl_->runtime_core.reset();
   impl_->dispatcher.reset();
@@ -528,21 +729,57 @@ Status NpuRuntime::ServeConnection(int) {
 
 Status NpuRuntime::Shutdown() {
   if (impl_ == nullptr) return Status::OK();
+  impl_->closing = true;
+  if (impl_->base_initialized && aclrtSetDevice(impl_->options.device_id)!=ACL_SUCCESS)
+    return Status::Internal("select Runtime device for shutdown");
+#if defined(KVAF_ENABLE_NPU_PULL)
+  if (auto reader = impl_->Reader()) {
+    auto s = reader->Shutdown();
+    if (!s.ok()) return s;
+    std::lock_guard<std::mutex> lock(impl_->base_mutex);
+    impl_->hbm_reader.reset();
+  }
+#endif
+  auto s = ShutdownDdr();
+  if (!s.ok()) return s;
+  impl_->base_initialized = false;
+  impl_->closing = false;
+  return Status::OK();
+}
+Status NpuRuntime::ShutdownDdr() {
+  if (impl_ == nullptr) return Status::OK();
+  std::lock_guard<std::mutex> prepare_lock(impl_->cpu_pull_prepare_mutex);
+  impl_->ddr_closing=true;
+  if (impl_->runtime_core && impl_->runtime_core->needs_cleanup() &&
+      aclrtSetDevice(impl_->options.device_id)!=ACL_SUCCESS)
+    return Status::Internal("select Runtime device for DDR shutdown");
   Status status = impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()
                       ? impl_->runtime_core->Shutdown()
                       : Status::OK();
   if (status.ok() && impl_->peer_link)
     status = impl_->peer_link->CloseExecution();
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  if (status.ok()) impl_->cpu_pull.reset();
+#endif
+  if (status.ok()) impl_->ddr_closing=false;
   return status;
 }
 
-bool NpuRuntime::initialized() const {
+bool NpuRuntime::initialized() const { return impl_ && impl_->base_initialized; }
+bool NpuRuntime::ddr_initialized() const {
   return impl_ != nullptr && impl_->runtime_core != nullptr && impl_->runtime_core->initialized();
 }
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
-  return RuntimeCapabilities{!BuiltGetConfigs(impl_->options.transport_mode).empty(),
+  RuntimeCapabilities result{!BuiltGetConfigs(impl_->options.transport_mode).empty(),
       !BuiltPutConfigs(impl_->options.transport_mode).empty(), false, true};
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  result.cpu_offload=impl_->options.transport_mode!=TransportMode::Ubmem;
+#endif
+#if defined(KVAF_ENABLE_NPU_PULL)
+  result.npu_pull=true;
+#endif
+  return result;
 }
 
 std::optional<GetExecutionConfig> NpuRuntime::default_get() const {

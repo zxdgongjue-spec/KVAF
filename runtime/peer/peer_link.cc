@@ -180,16 +180,17 @@ bool Exchange(const PeerLink& link, const Request& request, Response* response,
 bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
                          uint32_t* device_count,
                          bool* device_filter_applied,
-                         std::string* error, ConnectedPeer* peer = nullptr) {
+                         std::string* error, ConnectedPeer* peer = nullptr,
+                         Command command = Command::kGetCandidateCount) {
   if (candidate_count == nullptr) {
     SetError(error, "candidate count output must not be null");
     return false;
   }
   CandidateCountRequest request{};
-  request.header = MakeHeader(Command::kGetCandidateCount, sizeof(request));
+  request.header = MakeHeader(command, sizeof(request));
   CandidateCountResponse response{};
   if (!Exchange(endpoint, request, &response, error, peer) ||
-      !IsValidResponseHeader(response.header, Command::kGetCandidateCount, sizeof(response)) ||
+      !IsValidResponseHeader(response.header, command, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error) || response.candidate_count == 0U) {
     if (error != nullptr && error->empty()) *error = "peer service returned no usable UMDK/EID candidates";
     return false;
@@ -208,20 +209,28 @@ bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
 }
 
 bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
-                        PeerCandidateInfo* info, std::string* error) {
+                        PeerCandidateInfo* info, bool with_eid, std::string* error) {
   if (info == nullptr) {
     SetError(error, "candidate info output must not be null");
     return false;
   }
-  CandidateEidRequest request{};
-  request.info.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
-  request.info.candidate_id = candidate_id;
-  request.response_bytes = sizeof(CandidateEidResponse);
   CandidateEidResponse record{};
-  const auto& response = record.info;
-  if (!Exchange(endpoint, request, &record, error) ||
-      !IsValidResponseHeader(response.header, Command::kGetCandidateInfo,
-                             sizeof(record)) ||
+  auto& response = record.info;
+  bool received;
+  if (with_eid) {
+    CandidateEidRequest request{};
+    request.info.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
+    request.info.candidate_id = candidate_id;
+    request.response_bytes = sizeof(record);
+    received = Exchange(endpoint, request, &record, error);
+  } else {
+    CandidateInfoRequest request{};
+    request.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
+    request.candidate_id = candidate_id;
+    received = Exchange(endpoint, request, &response, error);
+  }
+  if (!received || !IsValidResponseHeader(response.header, Command::kGetCandidateInfo,
+                                          with_eid ? sizeof(record) : sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error) ||
       response.candidate_id != candidate_id) {
     if (error != nullptr && error->empty()) {
@@ -242,7 +251,7 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
       response.device_name,
       static_cast<const char*>(name_end) - response.device_name);
   std::copy_n(record.eid, candidate.eid.size(), candidate.eid.begin());
-  if (candidate.eid == decltype(candidate.eid){}) {
+  if (with_eid && candidate.eid == decltype(candidate.eid){}) {
     SetError(error, "CPU candidate has zero EID");
     return false;
   }
@@ -353,6 +362,10 @@ struct PeerLink::ExecutionState {
   execution::Response reply;
   std::vector<std::uint8_t> pending;
   std::uint64_t pending_id = 0;
+  std::uint64_t pull_request = 0;
+  std::uint32_t pull_candidate = 0;
+  bool pull_ready = false;
+  PeerRegion pull_binding;
   bool confirmed = false, closed = false;
 };
 namespace {
@@ -417,6 +430,7 @@ std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& c
   q = config;
   if (candidate) {
     q.candidate = candidate->candidate_id;
+    q.payload.assign(candidate->eid.begin(), candidate->eid.end());
     child->selected_cpu_eid_ = candidate->eid;
   } else if (config.transport == Transport::Urma) {
     child->selected_cpu_eid_ = selected_cpu_eid_;
@@ -430,6 +444,44 @@ std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& c
     q.epoch = execution_->reply.epoch;
   }
   return child;
+}
+Status PeerLink::PrepareCpuPullRegion(uint64_t base, uint32_t candidate, PeerRegion* out) {
+  if (!out || !execution_ || parent_) return Status::InvalidArgument("CPU Pull requires an owned cache region");
+  auto& state = *execution_;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (!state.confirmed || state.closed || !state.reply.status.ok() ||
+      state.reply.binding.base != base || state.create.mode == TransportMode::Ubmem)
+    return Status::InvalidState("CPU Pull requires a ready URMA-enabled region");
+  if (state.pull_request && state.pull_candidate != candidate)
+    return Status::InvalidState("CPU Pull destination route is immutable");
+  if (state.pull_ready) { *out = state.pull_binding; return Status::OK(); }
+  if (!state.pull_request) {
+    execution::Request caps_request;
+    execution::Response caps;
+    auto status = SendExecution(address_, caps_request, &caps);
+    if (!status.ok()) return status;
+    if (!caps.status.ok()) return caps.status;
+    if (caps.epoch != state.reply.epoch) return Status::CompletionUnknown("CPU service epoch changed");
+    if (!(caps.capabilities & execution::kCpuPull))
+      return Status::NotImplemented("CPU service has no CPU Pull registration capability");
+    state.pull_request = NextRequest(); state.pull_candidate = candidate;
+  }
+  auto q = state.create;
+  q.op = execution::Op::PrepareCpuPullRegion;
+  q.request = state.pull_request; q.candidate = candidate;
+  q.region = state.reply.region; q.epoch = state.reply.epoch; q.session = 0;
+  execution::Response response;
+  auto status = SendExecution(address_, q, &response);
+  if (!status.ok()) return status;
+  if (!response.status.ok()) return response.status;
+  if (response.state != execution::State::Ready || response.region != q.region || response.epoch != q.epoch ||
+      response.binding.base != base || response.binding.length != state.reply.logical_bytes ||
+      response.slot_size != state.reply.slot_size || !response.binding.token_value)
+    return Status::CompletionUnknown("CPU Pull destination response identity mismatch");
+  state.pull_binding = response.binding;
+  state.pull_binding.epoch = response.epoch; state.pull_binding.region_id = response.region;
+  state.pull_ready = true; *out = state.pull_binding;
+  return Status::OK();
 }
 Status PeerLink::PrepareExecution() {
   if (!execution_) return Status::InvalidState("no execution identity");
@@ -576,12 +628,19 @@ Status PeerLink::GetCandidateCount(uint32_t* candidate_count, uint32_t* device_c
              : ToStatus("peer candidate discovery failed", std::move(error));
 }
 
-Status PeerLink::DiscoverCandidates(PeerCandidateTable* table) {
+Status PeerLink::GetCacheCandidateCount(PeerCandidateTable* table) const {
+  if (!table) return Status::InvalidArgument("missing CPU candidate table");
+  std::string error;
+  return GetCandidateCountAt(address_, &table->count, &table->device_count, &table->device_fixed,
+                             &error, nullptr, Command::kGetCacheCandidateCount)
+             ? Status::OK() : ToStatus("cache candidate discovery failed", std::move(error));
+}
+Status PeerLink::DiscoverCandidates(PeerCandidateTable* table, bool cache_scope) {
   if (!table) return Status::InvalidArgument("missing CPU candidate table");
   ConnectedPeer peer;
   std::string error;
   if (!GetCandidateCountAt(address_, &table->count, &table->device_count, &table->device_fixed,
-                           &error, &peer))
+                           &error, &peer, cache_scope ? Command::kGetCacheCandidateCount : Command::kGetCandidateCount))
     return ToStatus("CPU candidate discovery failed", std::move(error));
   table->local = peer.local;
   address_ = std::move(peer.endpoint);  // Keep metadata and execution on the same resolved address.
@@ -704,9 +763,9 @@ Status PeerLink::SelectCpuCandidate(const PeerCandidateTable& table, const std::
 }
 
 Status PeerLink::GetCandidateInfo(uint32_t candidate_id,
-                                  PeerCandidateInfo* info) const {
+                                  PeerCandidateInfo* info, bool with_eid) const {
   std::string error;
-  return GetCandidateInfoAt(address_, candidate_id, info, &error)
+  return GetCandidateInfoAt(address_, candidate_id, info, with_eid, &error)
              ? Status::OK()
              : ToStatus("peer candidate metadata query failed", std::move(error));
 }

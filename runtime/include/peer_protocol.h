@@ -32,6 +32,7 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kPrepareGatherWorkspace = 14U,
+  kGetCacheCandidateCount = 15U,  // Service-affinity view used by ordinary cache providers.
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };

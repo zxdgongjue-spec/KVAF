@@ -13,10 +13,10 @@ void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
                "[--gather-threads N] [--gather-mode adaptive|active|passive] "
-               "[--memory-page-mode default|thp] [--hal-library PATH]\n"
+               "[--memory-page-mode default|thp|hugetlb-2m|hugetlb-1g] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
                "candidates in the service CPU affinity scope are discovered automatically. Gather threads default to 10, "
-               "mode to active; memory page mode defaults to thp. "
+               "mode to active; URMA memory page mode defaults to thp. "
                "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
                program);
 }
@@ -39,6 +39,14 @@ bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode)
   }
   if (text == "thp") {
     *mode = kvaf::CpuMemoryPageMode::kTransparentHugePage;
+    return true;
+  }
+  if (text == "hugetlb-2m") {
+    *mode = kvaf::CpuMemoryPageMode::kHugeTlb2M;
+    return true;
+  }
+  if (text == "hugetlb-1g") {
+    *mode = kvaf::CpuMemoryPageMode::kHugeTlb1G;
     return true;
   }
   return false;
@@ -102,7 +110,8 @@ int main(int argc, char** argv) {
       cpu_options.hal_library = argv[++index];
     } else if (argument == "--memory-page-mode") {
       if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
-        std::fprintf(stderr, "invalid --memory-page-mode; expected default or thp\n");
+        std::fprintf(stderr,
+                     "invalid --memory-page-mode (expected default|thp|hugetlb-2m|hugetlb-1g)\n");
         return 2;
       }
     } else {

@@ -141,7 +141,7 @@ void CpuSelection() {
       peer::MessageHeader h{};
       Check(recv(fd, &h, sizeof(h), MSG_WAITALL) == sizeof(h), "read request header");
       const auto command = static_cast<peer::Command>(h.command);
-      if (command == peer::Command::kGetCandidateCount) {
+      if (command == peer::Command::kGetCacheCandidateCount) {
         peer::CandidateCountResponse reply{peer::MakeHeader(command, sizeof(reply)), 0, 5, 4, 0};
         reply.header.command = peer::ResponseCommand(command);
         Check(send(fd, &reply, sizeof(reply), 0) == sizeof(reply), "reply candidate count");

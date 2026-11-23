@@ -1,9 +1,7 @@
-"""Python API for the synchronous KVAF Runtime.
+"""KVAF Runtime, per-call cache execution and independent CPU/NPU Pull APIs.
 
-The default in-tree binding is an in-process CPU MockRuntime.  It exercises
-the real Runtime and MetaManager lifecycle without a subprocess or a concrete
-hardware AccessOperator. The optional CANN build additionally exposes
-``NpuRuntime`` for the current synchronous BatchGet implementation.
+The portable binding exposes MockRuntime. CANN builds additionally expose
+NpuRuntime, device access tables, graph support and the enabled Pull sources.
 """
 
 try:
@@ -28,7 +26,6 @@ access_operator = _native.access_operator
 
 if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
-    AclGraph = _native.AclGraph
     DeviceAccessTable = _native.DeviceAccessTable
 
 __all__ = [
@@ -47,6 +44,16 @@ __all__ = [
 if hasattr(_native, "NpuRuntime"):
     __all__ += [
         "NpuRuntime",
-        "AclGraph",
         "DeviceAccessTable",
     ]
+
+if hasattr(_native, "AclGraph"):
+    AclGraph = _native.AclGraph
+    __all__.append("AclGraph")
+
+for _name in ("CpuPullSourceDesc", "NpuPullSourceDesc", "ReadyToken", "CpuPullState",
+              "PutEntry", "PutHandle",
+              "CpuPullHbmSource", "NpuPullHbmSource", "CpuPullOptions", "NpuPullOptions"):
+    if hasattr(_native, _name):
+        globals()[_name] = getattr(_native, _name)
+        __all__.append(_name)

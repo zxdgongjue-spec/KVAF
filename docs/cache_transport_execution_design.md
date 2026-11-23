@@ -384,7 +384,9 @@ Runtime 关闭前先显式结束 graph。关闭在 provider 执行状态仍绑�
 
 恢复 Get 时目标实例不能持有输出/graph 绑定；当前方向的在途工作必须先安全处理。旧资源关闭成功后才重建，新资源/view 使用新的有效性状态。实例驻留不意味着绑定 ID 可以隐式转向新资源。
 
-独立 CPU Pull / HBM Pull 模块按当前范围暂未合入，不纳入本版普通 Put/Get 或 graph 能力声明。后续 CPU Pull 若写同一 DDR，必须有独立源注册、队列和事务/范围引用；HBM Pull 属于独立 HBM → HBM 路径。这些是边界要求，不能把历史参考接口当作本分支已有模块。
+CPU Pull / NPU Pull 已接入。CPU Pull 写同一 DDR，使用独立源注册、队列、目的 MR 和统一写事务；NPU Pull 属于独立 HBM → HBM 路径。NPU raw Pull 由应用负责正常异步 metadata/storage/stream 保活、同步和销图；KVAF 保留 output 注册及实际 storage 到 Runtime 安全关闭。raw 捕获使用普通调用，无须额外 Begin/End 或图租约；普通缓存 Get 使用既有图资源管理。
+
+当前接口、生命周期及验证入口见 [CPU Pull](cpu_pull_offload_usage.md)、[NPU raw READ](hbm_raw_addr_read.md) 和 [建链流程](connection_handshake_flows.md)。
 
 ## 12 已实现范围与后续工作
 
