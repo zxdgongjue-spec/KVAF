@@ -1,13 +1,12 @@
 #include "memory/execution_cpu_backend.h"
 #include "cpu_service/backends/cpu_backends.h"
+#include "memory/cpu_ddr_allocation.h"
 #include "ubmem/hal.h"
 #include "offload_service.h"
-#include <cstdlib>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
-#if defined(__linux__)
-#include <sys/mman.h>
-#endif
 namespace kvaf {
 namespace {
 class PoolAllocation final : public execution::Allocation {
@@ -28,11 +27,7 @@ class PoolAllocation final : public execution::Allocation {
       if (!s.ok()) return s;
       mapping.reset();
     }
-    if (memory) {
-      std::free(memory);
-      memory = nullptr;
-    }
-    return Status::OK();
+    return ReleaseCpuDdr(memory, mapped_bytes);
   }
 #ifdef KVAF_CPU_HAS_URMA
   Status PrepareCpuPull(std::uint32_t candidate, std::uint32_t token,
@@ -45,6 +40,7 @@ class PoolAllocation final : public execution::Allocation {
   }
 #endif
   void* memory = nullptr;
+  std::size_t mapped_bytes = 0U;
   std::unique_ptr<ubmem::Mapping> mapping;
 #ifdef KVAF_CPU_HAS_URMA
   std::shared_ptr<CpuUrmaMemoryPool> urma_memory;
@@ -132,19 +128,13 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
       p->descriptor.base = p->mapping->address();
       p->descriptor.fabric_mapping_bytes = p->mapping->bytes();
     } else {
-      const std::size_t alignment =
-          options.memory_page_mode == CpuMemoryPageMode::kTransparentHugePage ? 2U * 1024U * 1024U
-                                                                              : 4096U;
-      if (posix_memalign(&p->memory, alignment, bytes))
-        return Status::Internal("DDR allocation failed");
-#if defined(__linux__)
-      if (options.memory_page_mode == CpuMemoryPageMode::kTransparentHugePage &&
-          madvise(p->memory, bytes, MADV_HUGEPAGE))
-        return Status::Internal("DDR huge-page advice failed");
-#endif
-      if (options.memory_page_mode == CpuMemoryPageMode::kTransparentHugePage)
-        std::memset(p->memory, 0, bytes);
+      auto s = AllocateCpuDdr(options.memory_page_mode, bytes, p->memory, p->mapped_bytes);
+      if (!s.ok()) return s;
       p->descriptor.base = reinterpret_cast<std::uintptr_t>(p->memory);
+      std::fprintf(stderr, "[KVAF_CPU] DDR_ALLOCATED bytes=%" PRIu64 " backing_bytes=%" PRIu64
+                   " page_mode=%s memory=%p\n", bytes,
+                   p->mapped_bytes != 0U ? static_cast<std::uint64_t>(p->mapped_bytes) : bytes,
+                   CpuMemoryPageModeName(options.memory_page_mode), p->memory);
     }
     p->descriptor.length = bytes;
 #ifdef KVAF_CPU_HAS_URMA

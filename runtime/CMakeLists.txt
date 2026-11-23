@@ -108,7 +108,8 @@ endif()
 
 option(KVAF_CPU_ENABLE_URMA "Include the URMA CPU backend" ON)
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
-  add_library(kvaf_cpu_runtime STATIC cpu_service/cpu_runtime.cc cpu_service/backends/ubmem_cpu_backend.cc memory/execution_cpu_backend.cc src/remote_pull_service.cc)
+  add_library(kvaf_cpu_runtime STATIC cpu_service/cpu_runtime.cc cpu_service/backends/ubmem_cpu_backend.cc
+    memory/cpu_ddr_allocation.cc memory/execution_cpu_backend.cc src/remote_pull_service.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)

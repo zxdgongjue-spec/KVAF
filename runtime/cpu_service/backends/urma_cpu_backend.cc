@@ -1,4 +1,5 @@
 #include "cpu_service/backends/cpu_backends.h"
+#include "memory/cpu_ddr_allocation.h"
 #include "memory/cpu_ddr_registration.h"
 #include "memory/cpu_shared_registration.h"
 #include "cpu_service/urma/cpu_urma_channel.h"
@@ -13,7 +14,6 @@
 #include "cpu_pull_urma.h"
 
 #include <dlfcn.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -30,7 +30,6 @@
 #include <cstdarg>
 #include <cinttypes>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -86,8 +85,6 @@ constexpr uint32_t kJettyKeyBytes = sizeof(urma_jetty_id_t) + sizeof(urma_transp
 // and transport mode; the trailing four bytes are retained on the wire.
 constexpr uint32_t kNpuJettyKeyBytes = 32U;
 constexpr uint32_t kSegBytes = sizeof(urma_seg_t);
-constexpr std::size_t kBasePageBytes = 4096U;
-constexpr std::size_t kHugePage2MBytes = 2U * 1024U * 1024U;
 
 static_assert(sizeof(urma_jetty_id_t) == 24U, "UMDK Jetty id ABI changed");
 static_assert(kJettyKeyBytes == 28U, "HCCP UMDK Jetty key ABI changed");
@@ -501,6 +498,7 @@ class CpuGatherWorker {
 
 struct GatherWorkspace {
   void* memory = nullptr;
+  std::size_t mapped_bytes = 0U;
   uint64_t bytes = 0U, base = 0U;
   std::unique_ptr<CpuDdrRegistration> registration;
 };
@@ -510,6 +508,7 @@ struct Region {
   uint32_t candidate_id = 0U;
   UrmaResources* resources = nullptr;
   void* memory = nullptr;
+  std::size_t mapped_bytes = 0U;
   bool borrowed = false;
   uint64_t bytes = 0U;
   uint64_t base = 0U;
@@ -590,8 +589,8 @@ class CpuService {
     region->bytes = bytes;
     region->borrowed = borrowed != nullptr;
     region->memory = borrowed;
-    if (!borrowed && !AllocateMemory(&region->memory, region->bytes)) {
-      return Result::kResourceError;
+    if (!borrowed && !AllocateMemory(region->memory, bytes, region->mapped_bytes)) {
+      return fail();
     }
     region->bytes = bytes;
     if (!borrowed && bytes >= 64U)
@@ -630,11 +629,16 @@ class CpuService {
         response->peer_base, response->token_id);
       return fail();
     }
-    regions_.emplace(id, std::move(region));
+    const auto& allocated = *regions_.emplace(id, std::move(region)).first->second;
+    const std::size_t backing_bytes = allocated.mapped_bytes != 0U
+        ? allocated.mapped_bytes : static_cast<std::size_t>(bytes);
+    const char* page_mode = borrowed ? "shared" : CpuMemoryPageModeName(memory_page_mode_);
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
-        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s\n",
+        "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s "
+        "memory=%p backing_bytes=%zu\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, MemoryPageModeName());
+        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, page_mode,
+        allocated.memory, backing_bytes);
     return Result::kOk;
   }
 
@@ -655,7 +659,8 @@ class CpuService {
     }
     auto& workspace = *region.gather_workspace;
     if (bytes > workspace.bytes) return Result::kInvalidRequest;
-    if (!workspace.memory && !AllocateMemory(&workspace.memory, workspace.bytes))
+    if (!workspace.base && !workspace.registration &&
+        !AllocateMemory(workspace.memory, workspace.bytes, workspace.mapped_bytes))
       return Result::kResourceError;
     if (!workspace.base) {
       // A failed registration can retain a token. Retire it before retrying,
@@ -888,48 +893,18 @@ class CpuService {
   }
 
  private:
-  const char* MemoryPageModeName() const {
-    switch (memory_page_mode_) {
-      case CpuMemoryPageMode::kDefault:
-        return "default";
-      case CpuMemoryPageMode::kTransparentHugePage:
-        return "thp";
-    }
-    return "unknown";
+  bool AllocateMemory(void*& memory, std::size_t bytes, std::size_t& mapped_bytes) {
+    // A previous prefault failure may have left an unregistered mapping.
+    if (memory && !ReleaseMemory(memory, mapped_bytes)) return false;
+    const auto status = AllocateCpuDdr(memory_page_mode_, bytes, memory, mapped_bytes);
+    if (!status.ok()) Log("[KVAF_CPU] REGION_ALLOCATE_FAILED %s\n", status.message().c_str());
+    return status.ok();
   }
 
-  bool AllocateMemory(void** memory, uint64_t requested_bytes) {
-    if (memory == nullptr || requested_bytes == 0U ||
-        requested_bytes > std::numeric_limits<std::size_t>::max()) {
-      return false;
-    }
-    const std::size_t bytes = static_cast<std::size_t>(requested_bytes);
-    const std::size_t alignment =
-        memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage
-            ? kHugePage2MBytes
-            : kBasePageBytes;
-    const int allocation_status = posix_memalign(memory, alignment, bytes);
-    if (allocation_status != 0 || *memory == nullptr) {
-      Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=posix_memalign bytes=%" PRIu64
-          " alignment=%zu status=%d memory=%p page_mode=%s\n",
-          requested_bytes, alignment, allocation_status, *memory,
-          MemoryPageModeName());
-      return false;
-    }
-    if (memory_page_mode_ == CpuMemoryPageMode::kTransparentHugePage) {
-      if (madvise(*memory, bytes, MADV_HUGEPAGE) != 0) {
-        Log("[KVAF_CPU] REGION_ALLOCATE_FAILED stage=madvise_hugepage bytes=%" PRIu64
-            " errno=%d\n",
-            requested_bytes, errno);
-        free(*memory);
-        *memory = nullptr;
-        return false;
-      }
-      // Fault the range while huge-page advice is active. Launching the service
-      // under a NUMA memory policy makes placement deterministic as well.
-      std::memset(*memory, 0, bytes);
-    }
-    return true;
+  bool ReleaseMemory(void*& memory, std::size_t& mapped_bytes) {
+    const auto status = ReleaseCpuDdr(memory, mapped_bytes);
+    if (!status.ok()) Log("[KVAF_CPU] REGION_RELEASE_FAILED %s\n", status.message().c_str());
+    return status.ok();
   }
 
   uint32_t NextToken() {
@@ -1040,7 +1015,7 @@ class CpuService {
       auto& workspace = *region->gather_workspace;
       if (workspace.registration && !workspace.registration->Close().ok()) return false;
       workspace.registration.reset();
-      free(workspace.memory);
+      if (!ReleaseMemory(workspace.memory, workspace.mapped_bytes)) return false;
       region->gather_workspace.reset();
     }
     if (region->registration) {
@@ -1048,7 +1023,7 @@ class CpuService {
       region->registration.reset();
     }
     if (region->memory != nullptr) {
-      if (!region->borrowed) free(region->memory);
+      if (!region->borrowed && !ReleaseMemory(region->memory, region->mapped_bytes)) return false;
       region->memory = nullptr;
     }
     return true;
