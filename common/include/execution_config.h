@@ -31,9 +31,11 @@ struct ExecutionWarmup {
   std::uint32_t request_capacity{0};
   void* stream{nullptr};
 };
+inline constexpr std::uint32_t kDefaultUrmaAivGetCores = 4;
+inline constexpr std::uint32_t kDefaultUrmaAivGetJettysPerCore = 1;
 struct ExecutionResources {
-  // Zero cores selects provider defaults: URMA AIV 2, UBMEM AIV 16,
-  // AICPU Put 1, AICPU Get 5. Zero Jettys selects 2 for URMA AIV. An absent
+  // Zero cores selects provider defaults: URMA AIV Put 2 / Get 4, UBMEM AIV 16,
+  // AICPU Put 1 / Get 5. Zero Jettys selects URMA AIV Put 2 / Get 1. An absent
   // in-flight budget uses 2048; explicit zero disables the limiter. Empty AIV
   // kernel paths use this build's bin output; AICPU packages resolve through CANN.
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};

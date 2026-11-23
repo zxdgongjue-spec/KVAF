@@ -120,8 +120,8 @@ Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写
 未建立 CPU 服务 Link 时，`initialize` 返回 `InvalidState`。
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，构造时必须提供；
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
-为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；
-URMA AIV Jetty 数默认 2、URMA AIV Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
+为 URMA AIV Put 2、Get 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+URMA AIV Get 每核默认 1 个 Jetty，Put 每核默认 2 个。Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
 AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
@@ -153,7 +153,7 @@ index 0，总 Jetty 数必须覆盖整个列表。单设备参数仍取该设备
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
   --backend aiv --peer-ub-device udmac0d1e2 \
-  --aiv-cores 2 --request-length 32768 --table-capacity 4096 \
+  --aiv-cores 4 --request-length 32768 --table-capacity 4096 \
   --miss-count 4096 --token-bytes 656 --tokens-per-block 128 \
   --warmup 10 --iterations 100
 ```
@@ -247,7 +247,7 @@ entry，`offsets[i]` 给出 entry 内
 ./build.sh npu
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
-  --backend aiv --aiv-cores 2 --execution both \
+  --backend aiv --aiv-cores 4 --execution both \
   --request-length 32768 --table-capacity 4096 --miss-count 4096 \
   --token-bytes 656 --tokens-per-block 128 \
   --warmup 10 --iterations 100 --kernel-profile
@@ -326,16 +326,15 @@ tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
 ```
 
 测试默认 `batch=16`、`token_bytes=656`、`tokens_per_block=128`，
-全表为 2,097,152 个 83,968B entry，每次 BatchGet 32,768 requests、32 个 AIV core、
-每 core 2 个 Jetty、3 次 warmup 与
+全表按 `batch × 1024 × 78` 个 83,968B entry 分配，每次 BatchGet 32,768 requests。URMA AIV Get 默认每卡 4 核、每核 1 个 Jetty，
+Put 默认每卡 2 核、每核 2 个 Jetty。测试执行 3 次 warmup 与
 100 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、
 `KVAF_RUNTIME_PERF_AIV_CORES`、`KVAF_RUNTIME_PERF_WARMUP`、
 `KVAF_RUNTIME_PERF_ITERATIONS`、`KVAF_RUNTIME_PERF_ACTIVE_PERCENT`、
 `KVAF_RUNTIME_PERF_TOKEN_BYTES` 和 `KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK` 覆盖；
 Jetty 数量可通过
-`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。全量 data population 会写入 2,097,152 个
-逻辑 KV entry；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
+`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。脚本通过 AIV Direct-HCCP BatchPut 填充全表，BatchPut 性能样本
 测量 Runtime metadata upload、AIV WRITE 及其 caller-stream 完成，不包含全量数据
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染

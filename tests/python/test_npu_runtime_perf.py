@@ -22,12 +22,12 @@ import kvaf
 
 from utils.backend import detect_torch_backend
 from utils.dsa_keys import build_dsa_keys
+from utils.get_options import DEFAULT_AIV_JETTYS_PER_CORE, DEFAULT_PARALLELISM
 from utils.npu_eids import parse_npu_eids
 from utils.perf_execution import BenchmarkExecution, add_execution_metadata, default_put_cores
 from utils.statistics import percentile
 
 
-JETTYS_PER_CORE = 2
 PUT_BATCH_SIZE = 128
 WARMUP = 3
 ITERATIONS = 100
@@ -84,14 +84,14 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     assert torch is not None
     device_id = int(os.environ.get("DEVICE_ID", "0"))
     batch = int(os.environ.get("KVAF_RUNTIME_PERF_BATCH", str(batch)))
-    npu_core_count = int(os.environ.get(
-        "KVAF_RUNTIME_PERF_AIV_CORES", str(default_put_cores(transport, "aiv"))))
-    jettys_per_core = int(
-        os.environ.get(
-            "KVAF_RUNTIME_PERF_JETTYS_PER_CORE",
-            os.environ.get("KVAF_NPU_JETTYS_PER_CORE", str(JETTYS_PER_CORE)),
-        )
-    )
+    core_override = os.environ.get("KVAF_RUNTIME_PERF_AIV_CORES")
+    jetty_override = os.environ.get("KVAF_RUNTIME_PERF_JETTYS_PER_CORE", os.environ.get("KVAF_NPU_JETTYS_PER_CORE"))
+    get_backend = "ubmem" if transport == "ubmem" else "aiv"
+    npu_core_count = int(core_override) if core_override is not None else DEFAULT_PARALLELISM[get_backend]
+    default_get_jettys = DEFAULT_AIV_JETTYS_PER_CORE if transport == "urma" else 2
+    jettys_per_core = int(jetty_override) if jetty_override is not None else default_get_jettys
+    put_cores = npu_core_count if core_override is not None else default_put_cores(transport, "aiv")
+    put_jettys = jettys_per_core if jetty_override is not None else 2
     max_inflight_total = int(os.environ.get("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", "2048"))
     npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
     warmup = int(os.environ.get("KVAF_RUNTIME_PERF_WARMUP", str(WARMUP)))
@@ -204,7 +204,8 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
     output = torch.empty((requests, token_bytes), dtype=torch.uint8, device=device)
     execution = BenchmarkExecution(kvaf, transport=transport,
                                    put_capacity=PUT_BATCH_SIZE, get_capacity=max(requests, PUT_BATCH_SIZE),
-                                   cores=npu_core_count, jettys=jettys_per_core,
+                                   get_cores=npu_core_count, get_jettys=jettys_per_core,
+                                   put_cores=put_cores, put_jettys=put_jettys,
                                    get_kernel=str(kernel), put_kernel=str(batch_put_kernel),
                                    max_inflight_total=max_inflight_total)
     runtime = kvaf.NpuRuntime(
@@ -231,6 +232,7 @@ def main(batch: int = 16, transport: str = "urma", execution_mode: str = "unifie
             f"tokens_per_block={tokens_per_block} block_bytes={block_bytes} "
             f"source_stride={source_stride} "
             f"aiv_cores={npu_core_count} jettys_per_core={jettys_per_core} "
+            f"put_aiv_cores={put_cores} put_jettys_per_core={put_jettys} "
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
             f"warmup={warmup} iterations={iterations} "

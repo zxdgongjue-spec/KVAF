@@ -14,9 +14,15 @@ namespace kvaf::detail {
 ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get,
                                              const ExecutionResources* configured) {
   ExecutionResources resources;
-  resources.cores = transport == Transport::Ubmem ? 16U :
-      executor == Executor::Aicpu ? (get ? 5U : 1U) : 2U;
   resources.jettys = 2U;
+  if (transport == Transport::Ubmem) {
+    resources.cores = 16U;
+  } else if (executor == Executor::Aicpu) {
+    resources.cores = get ? 5U : 1U;
+  } else {
+    resources.cores = get ? kDefaultUrmaAivGetCores : 2U;
+    if (get) resources.jettys = kDefaultUrmaAivGetJettysPerCore;
+  }
   resources.max_inflight_total = 2048U;
   if (executor == Executor::Aiv)
     resources.kernel_path = get ? kDefaultBatchGetKernelPath : kDefaultBatchPutKernelPath;

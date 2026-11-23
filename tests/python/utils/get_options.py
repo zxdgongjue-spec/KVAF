@@ -8,7 +8,8 @@ from .npu_eids import parse_npu_eids
 
 
 BACKENDS = ("aiv", "ubmem", "gather_read", "cpu_push_scatter")
-DEFAULT_PARALLELISM = {"aiv": 2, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
+DEFAULT_PARALLELISM = {"aiv": 4, "ubmem": 16, "gather_read": 5, "cpu_push_scatter": 5}
+DEFAULT_AIV_JETTYS_PER_CORE = 1
 MAX_JETTYS_PER_CORE = 64
 MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
@@ -82,13 +83,14 @@ def add_backend_arguments(parser, *, sweep=False):
     count_options = dict(type=int, default=None)
     if sweep:
         count_options["nargs"] = "+"
-    group.add_argument("--aiv-cores", **count_options, help="AIV cores per device; aiv/ubmem only (1..48)")
+    group.add_argument("--aiv-cores", **count_options,
+                       help="AIV cores per device (1..48; defaults: aiv 4, ubmem 16)")
     group.add_argument("--aicpu-workers", **count_options,
                        help="AICPU workers per device; gather_read/cpu_push_scatter only (1..8)")
     # Preserve old commands while keeping distinct hardware concepts in help.
     group.add_argument("--workers", dest="compat_workers", **count_options, help=argparse.SUPPRESS)
     group.add_argument("--jettys-per-core", type=int, default=None,
-                       help="Jettys per AIV core; aiv only (1..64, default: 2)")
+                       help=f"Jettys per AIV core; aiv only (1..64, default: {DEFAULT_AIV_JETTYS_PER_CORE})")
     group.add_argument("--max-inflight-total", type=int, default=None,
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 disables the limit)")
     group.add_argument("--npu-eids", type=parse_npu_eids,
@@ -141,7 +143,7 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
         args.jettys_per_core, args.max_inflight_total = 2, 2048
     else:
         if args.jettys_per_core is None:
-            args.jettys_per_core = environment_int("KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", 2)
+            args.jettys_per_core = environment_int("KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", DEFAULT_AIV_JETTYS_PER_CORE)
         if args.max_inflight_total is None:
             args.max_inflight_total = environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048)
     if args.miss_count is None:

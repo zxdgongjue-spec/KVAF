@@ -256,9 +256,9 @@ CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
 ```bash
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
-  --backend aiv --aiv-cores 2 --execution both \
+  --backend aiv --aiv-cores 4 --execution both \
   --request-length 32768 --table-capacity 4096 --miss-count 4096 \
-  --token-bytes 656 --tokens-per-block 128 --jettys-per-core 2 \
+  --token-bytes 656 --tokens-per-block 128 --jettys-per-core 1 \
   --seed 20260903 --no-sort-input-indices \
   --source-access-pattern random --output-access-pattern contiguous \
   --warmup 10 --iterations 100 --kernel-profile
@@ -304,8 +304,8 @@ get_resources=None, npu_eids=[], peer_ub_device="")` 以两个必填参数描述
 算法选择通过 `default_put/default_get` 和单次调用的 `execution` 完成。
 `put_resources/get_resources` 是 `(config, ExecutionResources(...))` 列表，提供该实现的
 核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认核数/worker 数为 URMA AIV
-Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；URMA AIV
-jettys=2、URMA AIV Get max_inflight_total=2048。未使用算法不会要求预算或 kernel 有效。
+Put 2、Get 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+URMA AIV 每核 Jetty 数默认为 Get 1、Put 2。Get 默认共 4 个 Jetty，`max_inflight_total=2048`。未使用算法不会要求预算或 kernel 有效。
 
 | 资源项 | AIV URMA / UBmem | AICPU Gather/Scatter / Put |
 | --- | --- | --- |

@@ -168,13 +168,12 @@ struct AccessOperatorConfig {
   // not establish a shared Direct-HCCP ABI.
   std::string batch_get_kernel_object_path;
   std::string batch_put_kernel_object_path;
+  // Zero selects the provider defaults: Get 4 cores x 1 Jetty, Put 2 x 2.
   std::uint32_t npu_core_count{0};
-  // Direct-HCCP Jettys assigned to each BatchGet AIV core.
-  std::uint32_t jettys_per_core{2};
+  std::uint32_t jettys_per_core{0};
   // Per-launch total READ budget; 0 selects the original whole-batch path.
   std::uint32_t batch_get_max_inflight_total{2048U};
-  // BatchPut retains its independent one-or-two-Jetty implementation. Zero
-  // derives min(jettys_per_core, 2); a direct caller may explicitly select 1/2.
+  // Zero inherits an explicit jettys_per_core (capped at 2) or the Put default.
   std::uint32_t batch_put_jettys_per_core{0};
   // Legacy single-EID input. Kept for source compatibility; peer_local_eids
   // takes precedence when it is non-empty.
