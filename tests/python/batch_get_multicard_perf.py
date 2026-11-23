@@ -28,8 +28,9 @@ def worker_error(device, process, log_path, phase):
     )
 
 
-def run_group(args, devices, directory):
+def run_group(args, device_peers, directory):
     directory.mkdir()
+    devices = list(device_peers)
     runner = Path(os.environ.get(
         "KVAF_BATCH_GET_PERF_RUNNER",
         str(Path(__file__).resolve().parents[1] / "run_remote_cpu_batch_get_perf.sh"),
@@ -37,12 +38,12 @@ def run_group(args, devices, directory):
     children = []
     logs = []
     try:
-        for device in devices:
+        for device, peer in device_peers.items():
             log_path = directory / f"device_{device}.log"
             log = log_path.open("w")
             logs.append(log)
             env = dict(os.environ, DEVICE_ID=str(device),
-                       KVAF_CPU_SERVICE_ADDR=args.peer, PYTHONUNBUFFERED="1")
+                       KVAF_CPU_SERVICE_ADDR=peer, PYTHONUNBUFFERED="1")
             env["KVAF_REMOTE_CPU_PERF_TIMEOUT"] = str(math.ceil(args.ready_timeout + args.seconds + 60))
             command = [
                 str(runner), str(args.build_dir),
@@ -288,7 +289,9 @@ def main(argv=None):
     parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
     parser.add_argument("--graph-calls", type=int, default=256, help="Get calls in each device's ACL graph (default: 256)")
     add_execution_metadata(parser)
-    parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"))
+    parser.add_argument("--peer", nargs="+", metavar="HOST:PORT",
+                        default=[os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888")],
+                        help="one CPU service for all devices, or one address per device in --devices order")
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summarize", type=Path,
@@ -318,18 +321,27 @@ def main(argv=None):
         parser.error("--graph-calls must be positive")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
+    if len(args.peer) == 1:
+        device_peers = dict.fromkeys(args.devices, args.peer[0])
+    elif len(args.peer) == len(args.devices):
+        device_peers = dict(zip(args.devices, args.peer))
+    else:
+        parser.error("--peer requires one shared address or one address per device in --devices order")
     for name in ("seconds", "ready_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     args.build_dir = args.build_dir.resolve()
     directory = (args.output or Path.cwd() / time.strftime(f"kvaf_multicard_{args.backend}_%Y%m%d_%H%M%S")).resolve()
     directory.mkdir(parents=True)
+    peer_summary = " ".join(f"{device}={peer}" for device, peer in device_peers.items())
     config = vars(args).copy()
     config.update(graph_api="acl", graphs=1)
     config.pop("summarize")
     config.pop("parallelism")
     config.pop("aicpu_workers" if field == "aiv_cores" else "aiv_cores")
     config["requests"] = args.request_length  # Existing report consumers use this capacity field.
+    config["peer"] = args.peer[0] if len(args.peer) == 1 else peer_summary
+    config["device_peers"] = device_peers
     config["build_dir"] = str(args.build_dir)
     config["output"] = str(directory)
     config["ddr_bytes_per_device"] = args.table_capacity * args.tokens_per_block * args.token_bytes
@@ -341,6 +353,7 @@ def main(argv=None):
           f"ddr_bytes_per_device={config['ddr_bytes_per_device']} "
           f"peak_concurrent_ddr_bytes={config['peak_concurrent_ddr_bytes']} "
           "timing=sustained_graph_replay_to_completion profiling_enabled=0 units=decimal_GBps", flush=True)
+    print(f"MULTICARD_PEERS {peer_summary}", flush=True)
     print(f"MULTICARD_RESULTS path={directory}", flush=True)
     try:
         for count in counts:
@@ -351,8 +364,9 @@ def main(argv=None):
                 case.mkdir()
                 (case / "config.json").write_text(json.dumps(dict(config, **{field: count}, output=str(case)), indent=2) + "\n")
             print(f"MULTICARD_SWEEP_BEGIN {field}={count}", flush=True)
-            isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
-            concurrent = run_group(args, args.devices, case / "concurrent")
+            isolated = [run_group(args, {device: peer}, case / f"isolated_{device}")[0]
+                        for device, peer in device_peers.items()]
+            concurrent = run_group(args, device_peers, case / "concurrent")
             write_summary(case, isolated, concurrent, dict(config, **{field: count}))
         if len(counts) > 1:
             write_sweep_summary(directory, counts, field)
