@@ -100,7 +100,7 @@ commit_put / abort_put` 提供显式事务。它们使用与普通 Put 相同的
 Put/Get provider 的通信资源。通过 `cpu_pull_options=` 传入选项，无 `enable_cpu_offload`
 或 `cpu_candidate` 构造参数；CPU 设备选择使用 `peer_ub_device`。
 
-`NpuPullOptions(kernel_path="", cores=1, jettys=4, max_inflight_total=0,
+`NpuPullOptions(kernel_path="", cores=2, jettys=2, max_inflight_total=0,
 max_output_bindings=64, diagnostics=False)` 通过 `npu_pull_options=` 传入；raw 的设备
 inflight 预算和 output 注册缓存预算与普通 Get 的 `get_resources` 独立。
 `batch_get_raw_addr(ready, src_offsets, dst_offsets, lengths, output, stream=None,

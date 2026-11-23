@@ -20,7 +20,7 @@ struct CpuPullOptions {
 };
 struct NpuPullOptions {
   std::string kernel_path;
-  std::uint32_t cores{1}, jettys{4}, max_inflight_total{0};
+  std::uint32_t cores{2}, jettys{2}, max_inflight_total{0};
   // Per-source cache capacity for distinct output address/size registrations.
   std::uint32_t max_output_bindings{64};
   bool diagnostics{false};

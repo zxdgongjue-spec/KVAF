@@ -1556,8 +1556,8 @@ void BindNpuPythonRuntime(py::module_& module) {
         value.cores = cores; value.jettys = jettys; value.max_inflight_total = inflight;
         value.max_output_bindings = output_bindings;
         value.diagnostics = diagnostics; return value;
-      }), py::kw_only(), py::arg("kernel_path") = "", py::arg("cores") = 1,
-          py::arg("jettys") = 4, py::arg("max_inflight_total") = 0,
+      }), py::kw_only(), py::arg("kernel_path") = "", py::arg("cores") = 2,
+          py::arg("jettys") = 2, py::arg("max_inflight_total") = 0,
           py::arg("max_output_bindings") = 64,
           py::arg("diagnostics") = false)
       .def_readonly("kernel_path", &NpuPullOptions::kernel_path)
