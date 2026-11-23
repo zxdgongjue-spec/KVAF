@@ -32,6 +32,8 @@ struct PeerRegion {
   uint64_t fabric_mapping_bytes{};
   // Local descriptor identity; wire encoding remains unchanged.
   uint64_t epoch = 0U, region_id = 0U;
+  bool has_memory_eid{false};
+  std::array<uint8_t, kEidBytes> memory_eid{};
 };
 
 struct PeerCandidateInfo {
@@ -46,11 +48,12 @@ struct PeerCandidateInfo {
 class PeerLink : public std::enable_shared_from_this<PeerLink> {
  public:
   explicit PeerLink(std::string address);
-  ~PeerLink() = default;
+  virtual ~PeerLink() = default;
   Status AllocateCacheRegion(std::uint64_t logical_bytes, std::uint64_t slot_size,
                              std::uint64_t auxiliary_bytes, TransportMode, PeerRegion*);
   std::shared_ptr<PeerLink> ExecutionSession(const execution::Request& config);
   Status PrepareExecution();
+  Status PrepareCpuPullRegion(uint64_t base, uint32_t candidate, PeerRegion*);
   Status CloseExecution();
   Status ResolveExecutionControl();
   Status QueryExecution(execution::Response*) const;
@@ -69,7 +72,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   Status RetainUbmemMapping(uint64_t base);
   void ReleaseUbmemMapping(uint64_t base);
   Status ReleaseRegion(uint64_t base);
-  Status LookupRegion(uint64_t base, PeerRegion* region) const;
+  virtual Status LookupRegion(uint64_t base, PeerRegion* region) const;
   Status PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes, PeerRegion* workspace);
   Status EnableDirectGather(uint64_t region_base) const;
   Status EnableGatherLanes(uint64_t region_base, uint64_t control_address, uint32_t lanes) const;
@@ -77,7 +80,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
                         OpenCpuPushGetResponse* response) const;
   Status StartCpuPushGet(uint64_t region_base) const;
   Status StopCpuPushGet(uint64_t region_base) const;
-  Status CreateChannel(
+  virtual Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
       uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,
@@ -87,7 +90,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
 
   // Shared TP is negotiated explicitly; keep the original overload for callers
   // using the existing per-channel transport setup.
-  Status CreateChannel(
+  virtual Status CreateChannel(
       uint64_t region_base, const uint8_t local_qp_key[kQpKeyBytes],
       uint32_t local_qp_key_bytes, const uint8_t local_eid[kEidBytes],
       uint32_t peer_token_value, uint64_t local_tp_handle, uint32_t local_psn,

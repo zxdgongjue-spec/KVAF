@@ -11,6 +11,7 @@
 #include "cpu_gather_executor.h"
 #include "gather_workspace.h"
 #include "cpu_service/push/cpu_push_get_worker.h"
+#include "cpu_pull_urma.h"
 
 #include <dlfcn.h>
 #include <sys/socket.h>
@@ -361,11 +362,47 @@ class SharedUrmaMemory {
   Status Close() {
     std::lock_guard<std::mutex> lock(mutex_);
     closing_ = true;
-    auto status = registrations_.Close();
+    auto status = offload::CloseUrmaDestination(pull_destination_);
+    if (!status.ok()) return status;
+    pull_destination_.reset();
+    status = registrations_.Close();
     if (!status.ok()) return status;
     if (!resources.Shutdown()) return Status::Internal("shared CPU URMA context close failed");
     ready_ = false;
     return Status::OK();
+  }
+  Status PreparePull(std::uint32_t candidate, std::uint32_t token,
+                     std::uint64_t logical_bytes, peer::PeerRegion* out) {
+    auto status = Initialize(options_);
+    if (!status.ok()) return status;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_ || !out || !logical_bytes || logical_bytes > bytes_)
+      return Status::InvalidArgument("invalid CPU Pull destination range");
+    if (pull_destination_)
+      return Status::InvalidState("CPU Pull destination already prepared");
+    auto* context = resources.Get(candidate);
+    if (!context) return Status::Internal("CPU Pull context initialization failed");
+    pull_context_ = context->context();
+    pull_bytes_ = logical_bytes;
+    pull_token_ = token;
+    // CPU READ destination requires LOCAL_WRITE/non_pin=0. Ordinary remote
+    // access uses a different flags profile and retains its own registration.
+    pull_destination_ = offload::CreateUrmaDestination(pull_context_, memory_, pull_bytes_, token);
+    status = offload::PrepareUrmaDestination(pull_destination_);
+    if (!status.ok()) return status;
+    *out = {};
+    out->base = reinterpret_cast<std::uintptr_t>(memory_);
+    out->length = logical_bytes;
+    out->token_value = token;
+    std::memcpy(out->eid.data(), pull_context_->eid.raw, out->eid.size());
+    pull_ready_ = true;
+    return Status::OK();
+  }
+  std::unique_ptr<offload::Backend> CreatePullBackend(std::shared_ptr<void> lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closing_ || !pull_ready_) return {};
+    return offload::CreateBorrowedUrmaBackend(pull_context_, memory_, pull_bytes_,
+        pull_token_, std::move(lease), pull_destination_);
   }
   UrmaResourcePool resources;
  private:
@@ -375,6 +412,11 @@ class SharedUrmaMemory {
   bool attempted_{false}, ready_{false}, closing_{false};
   std::mutex mutex_;
   CpuDdrRegistrationPool registrations_;
+  std::shared_ptr<offload::UrmaDestination> pull_destination_;
+  urma_context_t* pull_context_{nullptr};
+  std::uint64_t pull_bytes_{0};
+  std::uint32_t pull_token_{0};
+  bool pull_ready_{false};
 };
 
 using Channel = cpu_runtime_detail::UrmaChannel;
@@ -1213,6 +1255,13 @@ Status CpuUrmaMemoryPool::Close() {
   if (impl_->memory.use_count() != 1)
     return Status::Busy("CPU URMA memory pool still has execution sessions");
   return impl_->memory->Close();
+}
+Status CpuUrmaMemoryPool::PrepareCpuPull(std::uint32_t candidate, std::uint32_t token,
+    std::uint64_t logical_bytes, peer::PeerRegion* out) {
+  return impl_->memory->PreparePull(candidate, token, logical_bytes, out);
+}
+std::unique_ptr<offload::Backend> CpuUrmaMemoryPool::CreateCpuPullBackend(std::shared_ptr<void> lease) {
+  return impl_->memory->CreatePullBackend(std::move(lease));
 }
 
 struct UrmaCpuBackend::Impl {

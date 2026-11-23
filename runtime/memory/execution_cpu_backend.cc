@@ -2,6 +2,7 @@
 #include "cpu_service/backends/cpu_backends.h"
 #include "memory/cpu_ddr_allocation.h"
 #include "ubmem/hal.h"
+#include "offload_service.h"
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +29,16 @@ class PoolAllocation final : public execution::Allocation {
     }
     return ReleaseCpuDdr(memory, mapped_bytes);
   }
+#ifdef KVAF_CPU_HAS_URMA
+  Status PrepareCpuPull(std::uint32_t candidate, std::uint32_t token,
+                        std::uint64_t bytes, peer::PeerRegion* out) override {
+    return urma_memory ? urma_memory->PrepareCpuPull(candidate, token, bytes, out)
+                       : Status::NotImplemented("allocation has no CPU URMA owner");
+  }
+  std::unique_ptr<offload::Backend> CreateCpuPullBackend(std::shared_ptr<void> lease) override {
+    return urma_memory ? urma_memory->CreateCpuPullBackend(std::move(lease)) : nullptr;
+  }
+#endif
   void* memory = nullptr;
   std::size_t mapped_bytes = 0U;
   std::unique_ptr<ubmem::Mapping> mapping;
@@ -147,7 +158,7 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
   };
   return std::make_unique<execution::CacheRegionService>(execution::kFabric
 #ifdef KVAF_CPU_HAS_URMA
-                                                             | execution::kUrma
+                                                             | execution::kUrma | execution::kCpuPull
 #endif
                                                          ,
                                                          std::move(allocate), std::move(create));

@@ -15,12 +15,18 @@ target_include_directories(kvaf_peer_link
 target_link_libraries(kvaf_peer_link PUBLIC kvaf_common pthread)
 target_compile_features(kvaf_peer_link PUBLIC cxx_std_17)
 
+# Wire control has no ACL dependency; the CPU service and NPU roles share it.
+add_library(kvaf_offload_control STATIC src/offload_client.cc src/remote_pull_client.cc src/hbm_read_protocol.cc)
+target_include_directories(kvaf_offload_control PUBLIC include PRIVATE src)
+target_link_libraries(kvaf_offload_control PUBLIC kvaf_common Threads::Threads)
+
 add_library(kvaf_runtime
   memory/cache_region_service.cc
   execution/execution_config.cc
   execution/execution_dispatcher.cc
   execution/execution_resource_manager.cc
   src/runtime.cc
+  src/connector_runtime.cc
   cpu_service/runtime_service.cc
   src/npu_runtime_config.cc
 )
@@ -30,6 +36,7 @@ target_include_directories(kvaf_runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
@@ -40,18 +47,42 @@ target_link_libraries(kvaf_runtime
     Threads::Threads
     kvaf_meta_manager
     kvaf_access_operator
+  PRIVATE
+    kvaf_offload_control
 )
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
-if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL)
   add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
+  if(KVAF_ENABLE_CPU_OFFLOAD)
+    add_library(kvaf_remote_offload STATIC src/remote_offload.cc src/remote_pull_operator.cc)
+    target_include_directories(kvaf_remote_offload PUBLIC include PRIVATE src "${ASCEND_CANN_PACKAGE_PATH}/include")
+    target_link_directories(kvaf_remote_offload PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+    target_link_libraries(kvaf_remote_offload PUBLIC kvaf_runtime PRIVATE kvaf_offload_control kvaf_peer_link kvaf_direct_hccp_session ascendcl ${CMAKE_DL_LIBS})
+    target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_CPU_OFFLOAD=1)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_remote_offload)
+  endif()
+  if(KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL)
+    add_library(kvaf_hbm_read_source STATIC src/hbm_read_source.cc)
+    target_include_directories(kvaf_hbm_read_source PUBLIC include PRIVATE src "${ASCEND_CANN_PACKAGE_PATH}/include")
+    target_link_directories(kvaf_hbm_read_source PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")
+    target_link_libraries(kvaf_hbm_read_source PUBLIC kvaf_runtime PRIVATE kvaf_offload_control kvaf_peer_link kvaf_direct_hccp_session ascendcl ${CMAKE_DL_LIBS})
+  endif()
+  if(KVAF_ENABLE_NPU_PULL)
+    target_sources(kvaf_npu_runtime PRIVATE src/hbm_read_client.cc)
+    target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_NPU_PULL=1)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_offload_control kvaf_execute_batch_get_raw_addr_host kvaf_direct_hccp_session)
+    target_include_directories(kvaf_npu_runtime PRIVATE "${CMAKE_SOURCE_DIR}/access_operator/algorithms/get/raw_addr/urma_aiv/include")
+  endif()
   target_include_directories(kvaf_npu_runtime
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/../access_operator/algorithms/get/direct/urma_aiv/include
-      ${ASCEND_CANN_PACKAGE_PATH}/include)
+      ${ASCEND_CANN_PACKAGE_PATH}/include
+      ${CMAKE_CURRENT_BINARY_DIR}/generated
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
     PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
@@ -78,11 +109,11 @@ endif()
 option(KVAF_CPU_ENABLE_URMA "Include the URMA CPU backend" ON)
 if(KVAF_BUILD_REMOTE_CPU_SERVICE)
   add_library(kvaf_cpu_runtime STATIC cpu_service/cpu_runtime.cc cpu_service/backends/ubmem_cpu_backend.cc
-    memory/cpu_ddr_allocation.cc memory/execution_cpu_backend.cc)
+    memory/cpu_ddr_allocation.cc memory/execution_cpu_backend.cc src/remote_pull_service.cc)
   target_include_directories(kvaf_cpu_runtime
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(kvaf_cpu_runtime PUBLIC kvaf_runtime PRIVATE kvaf_ubmem_hal kvaf_peer_link)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(kvaf_cpu_runtime PUBLIC kvaf_runtime PRIVATE kvaf_ubmem_hal kvaf_peer_link kvaf_offload_control)
   if(KVAF_CPU_ENABLE_URMA)
     set(KVAF_URMA_ROOT "" CACHE PATH "UMDK source or installation root")
     find_path(KVAF_URMA_INCLUDE_DIR urma_api.h HINTS "${KVAF_URMA_ROOT}/include"
@@ -98,7 +129,7 @@ if(KVAF_BUILD_REMOTE_CPU_SERVICE)
     target_include_directories(kvaf_cpu_gather_executor PUBLIC include)
     target_link_libraries(kvaf_cpu_gather_executor PUBLIC kvaf_common kvaf_access_operator Threads::Threads)
     target_compile_options(kvaf_cpu_gather_executor PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2>")
-    target_sources(kvaf_cpu_runtime PRIVATE cpu_service/backends/urma_cpu_backend.cc cpu_service/urma/cpu_urma_discovery.cc
+    target_sources(kvaf_cpu_runtime PRIVATE src/cpu_pull_urma.cc cpu_service/backends/urma_cpu_backend.cc cpu_service/urma/cpu_urma_discovery.cc
       cpu_service/push/cpu_push_get_transport.cc cpu_service/push/cpu_push_get_worker.cc)
     target_link_libraries(kvaf_cpu_runtime PRIVATE Threads::Threads OpenMP::OpenMP_CXX kvaf_cpu_gather_executor)
     target_compile_options(kvaf_cpu_runtime PRIVATE "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2;-g>")

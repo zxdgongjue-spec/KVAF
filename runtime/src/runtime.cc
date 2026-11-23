@@ -185,51 +185,55 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
     return status;
   }
 
+  closing_ = false;
+  connector_owner_ = std::make_shared<const int>(0);
   initialized_ = true;
   return Status::OK();
 }
 
 Status RuntimeCore::Shutdown() {
   std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-  if (!needs_cleanup_) {
-    return Status::NotInitialized("Runtime has not been initialized");
-  }
+  if (!needs_cleanup_) return Status::NotInitialized("Runtime has not been initialized");
+  closing_ = true; // Recovery/release APIs remain available on the original records.
   if (!graph_tables_.empty()) return Status::Busy("release graph leases before shutdown");
-  // Stop accepting work, but keep ownership until cleanup has succeeded.
-  initialized_ = false;
-
-  // Pending transfers may still reference the region and access tables.
-  // Keep ownership intact if the operator cannot drain or close its session.
-  const Status operator_status = access_operator_.Shutdown();
+  if (pending_put_) {
+    if (pending_put_->cpu) {
+      PutHandle handle; handle.state_ = pending_put_;
+      if (!pending_put_->decision && pending_put_->submitted)
+        return Status::Busy("finish the original CPU Pull decision before shutdown");
+      const auto result = FinishConnectorPutLocked(handle, pending_put_->decision.value_or(false));
+      if (!result.ok()) return result;
+    } else {
+      if (pending_put_->completion.outcome == PutOutcome::Unknown)
+        return Status::CompletionUnknown("recover the original Put before shutdown");
+      const auto result = FinalizePutLocked();
+      if (pending_put_) return result;
+    }
+  }
+  if (cpu_pull_) {
+    auto status = cpu_pull_->Shutdown();
+    if (!status.ok()) return status;
+  }
+  const auto status = access_operator_.Shutdown();
   FlushPutTrace();
-  if (!operator_status.ok()) return operator_status;
-
+  if (!status.ok()) return status;
   pending_get_table_.reset();
   access_tables_.clear();
-  if (pending_put_) {
-    if (!pending_put_->metadata_finalized) {
-      const auto aborted = meta_manager_.AbortPut(pending_put_->transaction);
-      if (!aborted.ok()) return aborted;
-    }
-    pending_put_.reset();
-  }
-  Status first_error = Status::OK();
-
-  const Status release_status = ddr_allocator_.Release(remote_region_);
-  if (!release_status.ok()) {
-    return first_error.ok() ? release_status : first_error;
-  }
-
+  const auto released = ddr_allocator_.Release(remote_region_);
+  if (!released.ok()) return released;
+  cpu_pull_ = nullptr;
+  batch_pull_put_ = {};
   needs_cleanup_ = false;
-  remote_region_ = RemoteRegionDesc{};
-  return first_error;
+  initialized_ = false;
+  remote_region_ = {};
+  return Status::OK();
 }
 
 Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
                                        AccessTableHandle* handle) {
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(table_mutex_);
-  if (!initialized_) {
+  if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (handle == nullptr) {
@@ -344,7 +348,7 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     phase = now;
   };
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-  if (!initialized_) {
+  if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (execution.config && !access_operator_.TracksGetCompletion())
@@ -474,7 +478,7 @@ Status RuntimeCore::BeginGetGraph(GetExecutionConfig config, const GetGraphOptio
                                   std::uint64_t* id) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  if (!initialized_ || closing_) return Status::NotInitialized("Runtime is not initialized");
   auto drained = DrainGetLocked();
   if (!drained.ok()) return drained;
   // Reserve the table pin before publishing a provider lease.
@@ -490,7 +494,7 @@ Status RuntimeCore::BeginGetOutput(GetExecutionConfig config, const GetOutputOpt
                                     std::uint64_t* id) {
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  if (!initialized_ || closing_) return Status::NotInitialized("Runtime is not initialized");
   auto s = DrainGetLocked();
   return s.ok() ? access_operator_.BeginGetOutput(config, request, id) : s;
 }
@@ -521,7 +525,7 @@ Status RuntimeCore::BeginPutInput(PutExecutionConfig config, const PutInputOptio
   if (id) *id = 0;
   std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
   std::lock_guard<std::mutex> lock(put_mutex_);
-  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  if (!initialized_ || closing_) return Status::NotInitialized("Runtime is not initialized");
   if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
   return access_operator_.BeginPutInput(config, request, id);
 }
@@ -558,7 +562,7 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
   };
   auto run = [&]() -> Status {
     auto validated = measure(row.validation_ns, [&]() -> Status {
-      if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+      if (!initialized_ || closing_) return Status::NotInitialized("Runtime has not been initialized");
       if (request.keys.empty() || request.input.data == nullptr || request.input.bytes == 0 ||
           request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
         return Status::InvalidArgument("BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
@@ -582,16 +586,20 @@ Status RuntimeCore::BatchPut(const BatchPutRequest& request,
     PutPreparationGuard preparation_guard(access_operator_);
     // Allocate the completion record before reserving metadata; retain it until
     // data-plane completion, metadata finalization and provider acknowledgement.
-    PendingPut pending;
+    auto pending = ordinary_write_;
+    pending->completion = {};
+    pending->decision.reset();
+    pending->metadata_finalized = false;
     PutContext put_context;
     PutAccessDesc put_desc;
     auto status = measure(row.metadata_prepare_ns, [&] {
       return meta_manager_.PreparePut(request.keys, request.lengths, &put_context, &put_desc);
     });
     if (!status.ok()) return status;
-    pending.transaction = put_context;
-    pending.input_bound = execution.input_lease != 0;
-    pending_put_.emplace(std::move(pending));
+    pending->transaction = put_context;
+    pending->config = execution.config;
+    pending->input_bound = execution.input_lease != 0;
+    pending_put_ = std::move(pending);
     status = measure(row.execute_ns, [&]() -> Status {
       const auto provider_started = tracing ? DispatchTraceNowNs() : 0;
       Status result;
@@ -627,9 +635,9 @@ Status RuntimeCore::FinalizePutLocked(PutTraceRow* timing) {
     return Status::CompletionUnknown("Put data-plane completion remains unresolved");
   if (!pending.metadata_finalized) {
     const auto started = timing ? DispatchTraceNowNs() : 0;
-    const auto status = pending.completion.outcome == PutOutcome::Succeeded
-                            ? meta_manager_.CommitPut(pending.transaction)
-                            : meta_manager_.AbortPut(pending.transaction);
+    if (!pending.decision) pending.decision = pending.completion.outcome == PutOutcome::Succeeded;
+    const auto status = *pending.decision ? meta_manager_.CommitPut(pending.transaction)
+                                         : meta_manager_.AbortPut(pending.transaction);
     if (timing) timing->metadata_finalize_ns += DispatchTraceNowNs() - started;
     if (!status.ok()) return status;
     pending.metadata_finalized = true;
@@ -637,10 +645,13 @@ Status RuntimeCore::FinalizePutLocked(PutTraceRow* timing) {
   // An acknowledgement retry must not repeat CommitPut/AbortPut. Input leases
   // also remain pinned if either metadata finalization or acknowledgement fails.
   const auto started = timing ? DispatchTraceNowNs() : 0;
-  const auto acknowledged = access_operator_.AcknowledgePut();
+  const auto acknowledged = pending.cpu
+      ? (pending.submitted ? cpu_pull_->CompleteOffload(*pending.decision) : Status::OK())
+      : access_operator_.AcknowledgePut();
   if (timing) timing->acknowledge_ns += DispatchTraceNowNs() - started;
   if (!acknowledged.ok()) return acknowledged;
-  const auto result = pending.completion.result;
+  const auto result = pending.cpu ? Status::OK() : pending.completion.result;
+  if (pending.cpu) pending.state = *pending.decision ? CpuPullState::Committed : CpuPullState::Aborted;
   pending_put_.reset();
   return result;
 }
@@ -661,6 +672,7 @@ Status RuntimeCore::RecoverPut(PutExecutionConfig config) {
     const auto phase = tracing ? DispatchTraceNowNs() : 0;
     PutCompletion completion;
     // Never replay the Put, or recover a route different from the original.
+    if (pending_put_ && pending_put_->cpu) return Status::Busy("use CPU Pull recovery for the active write");
     const auto resolved = pending_put_ ? access_operator_.ResolvePut(config, &completion)
                                        : access_operator_.Recover(config);
     if (tracing) row.resolve_ns = DispatchTraceNowNs() - phase;
@@ -687,12 +699,12 @@ Status RuntimeCore::RecoverPut(PutExecutionConfig config) {
 bool RuntimeCore::HasPendingPut() const {
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   std::lock_guard<std::mutex> direction(put_mutex_);
-  return pending_put_.has_value();
+  return bool(pending_put_);
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
   std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-  if (!initialized_) {
+  if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (request.keys.empty()) {

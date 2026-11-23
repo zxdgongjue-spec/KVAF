@@ -289,6 +289,10 @@ struct PeerLink::ExecutionState {
   execution::Response reply;
   std::vector<std::uint8_t> pending;
   std::uint64_t pending_id = 0;
+  std::uint64_t pull_request = 0;
+  std::uint32_t pull_candidate = 0;
+  bool pull_ready = false;
+  PeerRegion pull_binding;
   bool confirmed = false, closed = false;
 };
 namespace {
@@ -359,6 +363,44 @@ std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& c
     q.epoch = execution_->reply.epoch;
   }
   return child;
+}
+Status PeerLink::PrepareCpuPullRegion(uint64_t base, uint32_t candidate, PeerRegion* out) {
+  if (!out || !execution_ || parent_) return Status::InvalidArgument("CPU Pull requires an owned cache region");
+  auto& state = *execution_;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  if (!state.confirmed || state.closed || !state.reply.status.ok() ||
+      state.reply.binding.base != base || state.create.mode == TransportMode::Ubmem)
+    return Status::InvalidState("CPU Pull requires a ready URMA-enabled region");
+  if (state.pull_request && state.pull_candidate != candidate)
+    return Status::InvalidState("CPU Pull destination route is immutable");
+  if (state.pull_ready) { *out = state.pull_binding; return Status::OK(); }
+  if (!state.pull_request) {
+    execution::Request caps_request;
+    execution::Response caps;
+    auto status = SendExecution(address_, caps_request, &caps);
+    if (!status.ok()) return status;
+    if (!caps.status.ok()) return caps.status;
+    if (caps.epoch != state.reply.epoch) return Status::CompletionUnknown("CPU service epoch changed");
+    if (!(caps.capabilities & execution::kCpuPull))
+      return Status::NotImplemented("CPU service has no CPU Pull registration capability");
+    state.pull_request = NextRequest(); state.pull_candidate = candidate;
+  }
+  auto q = state.create;
+  q.op = execution::Op::PrepareCpuPullRegion;
+  q.request = state.pull_request; q.candidate = candidate;
+  q.region = state.reply.region; q.epoch = state.reply.epoch; q.session = 0;
+  execution::Response response;
+  auto status = SendExecution(address_, q, &response);
+  if (!status.ok()) return status;
+  if (!response.status.ok()) return response.status;
+  if (response.state != execution::State::Ready || response.region != q.region || response.epoch != q.epoch ||
+      response.binding.base != base || response.binding.length != state.reply.logical_bytes ||
+      response.slot_size != state.reply.slot_size || !response.binding.token_value)
+    return Status::CompletionUnknown("CPU Pull destination response identity mismatch");
+  state.pull_binding = response.binding;
+  state.pull_binding.epoch = response.epoch; state.pull_binding.region_id = response.region;
+  state.pull_ready = true; *out = state.pull_binding;
+  return Status::OK();
 }
 Status PeerLink::PrepareExecution() {
   if (!execution_) return Status::InvalidState("no execution identity");

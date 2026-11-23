@@ -15,8 +15,39 @@
 #include "requests.h"
 #include "status.h"
 #include "types.h"
+#include "cpu_pull_executor.h"
 
 namespace kvaf {
+
+// One write record for ordinary Put and CPU Pull. Handles retain completed CPU
+// records; ordinary Put reuses a private record to keep steady-state allocation flat.
+struct ConnectorPutState {
+  std::shared_ptr<const int> owner;
+  PutContext transaction;
+  PutAccessDesc allocation;
+  RemoteRegionDesc region;
+  CpuPullRequest request;
+  PutCompletion completion;
+  // Public handle progress can be read while a Core operation is running.
+  // Transaction decisions and all other mutations remain under put_mutex_.
+  std::atomic<CpuPullState> state{CpuPullState::Prepared};
+  std::atomic<bool> submitted{false}, abort_requested{false};
+  std::optional<bool> decision;
+  std::optional<PutExecutionConfig> config;
+  bool cpu{false}, metadata_finalized{false}, input_bound{false};
+};
+class PutHandle {
+ public:
+  std::uint64_t id() const;
+  const std::vector<PutAllocation>& entries() const;
+  CpuPullState state() const;
+  bool submitted() const;
+  bool aborting() const;
+ private:
+  friend class RuntimeCore;
+  std::shared_ptr<ConnectorPutState> state_;
+};
+
 
 // Runtime roles share Link lifecycle but do not necessarily support the same
 // data-plane operations. A target intentionally carries only host:port for
@@ -32,6 +63,8 @@ struct RuntimeCapabilities {
   bool batch_put{false};
   bool incoming_links{false};
   bool outgoing_links{false};
+  bool cpu_offload{false};
+  bool npu_pull{false};
 };
 
 // Role-neutral Runtime interface. RuntimeService dispatches incoming control
@@ -112,6 +145,23 @@ class RuntimeCore {
   Status BeginPutInput(PutExecutionConfig, const PutInputOptions&, std::uint64_t*);
   Status EndPutInput(std::uint64_t);
 
+  Status SetCpuPullExecutor(CpuPullExecutor*);
+  bool pending_offload() const;
+  Status PreparePut(const std::vector<KeyId>&, const std::vector<std::uint64_t>&, PutHandle*);
+  Status SubmitCpuPull(const ReadyToken&, const PutHandle&, Uint64ArrayView, Uint64ArrayView, Uint64ArrayView);
+  Status SubmitCpuPullAndWait(const ReadyToken&, const PutHandle&, Uint64ArrayView, Uint64ArrayView,
+                              Uint64ArrayView, std::uint32_t, CpuPullSubmitTiming* = nullptr);
+  Status QueryCpuPull(const PutHandle&, CpuPullState*);
+  Status WaitCpuPull(const PutHandle&, std::uint32_t, CpuPullState*);
+  Status CancelCpuPull(const ReadyToken&);
+  Status CommitPut(const PutHandle&);
+  Status AbortPut(const PutHandle&);
+  Status BatchCpuPull(const std::vector<KeyId>&, const ReadyToken&, Uint64ArrayView,
+                      const std::vector<std::uint64_t>&, std::uint32_t, CpuPullProfile* = nullptr);
+  Status ResolveCpuPull(std::uint32_t);
+  Status LastOffloadChecksum(std::uint64_t*) const;
+
+
  protected:
   MetaManager& meta_manager_;
   AccessOperator& access_operator_;
@@ -152,19 +202,22 @@ class RuntimeCore {
   std::string put_trace_path_;
   std::vector<PutTraceRow> put_trace_rows_;
   std::uint64_t put_trace_index_{};
-  struct PendingPut {
-    PutContext transaction;
-    PutCompletion completion;
-    bool metadata_finalized{false};
-    bool input_bound{false};
-  };
+  Status SubmitCpuPullImpl(const ReadyToken&, const PutHandle&, Uint64ArrayView, Uint64ArrayView,
+                           Uint64ArrayView, const std::uint32_t*, CpuPullSubmitTiming*);
+  Status QueryCpuPullLocked(const PutHandle&, CpuPullState*);
+  Status FinishConnectorPutLocked(const PutHandle&, bool commit);
+  CpuPullExecutor* cpu_pull_{nullptr};
+  std::shared_ptr<const int> connector_owner_{std::make_shared<const int>(0)};
+  std::shared_ptr<ConnectorPutState> ordinary_write_{std::make_shared<ConnectorPutState>()};
+  PutHandle batch_pull_put_;
+  bool closing_{false};
   mutable std::shared_mutex lifecycle_mutex_;
   mutable std::mutex table_mutex_;
   mutable std::mutex put_mutex_;
   mutable std::mutex get_mutex_;
   std::shared_ptr<AccessTableState> pending_get_table_;
   std::unordered_map<std::uint64_t, std::shared_ptr<AccessTableState>> graph_tables_;
-  std::optional<PendingPut> pending_put_;
+  std::shared_ptr<ConnectorPutState> pending_put_;
   std::atomic<bool> initialized_{false};
   std::atomic<bool> needs_cleanup_{false};
   RemoteRegionDesc remote_region_;

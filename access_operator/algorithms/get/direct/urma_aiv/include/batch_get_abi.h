@@ -6,6 +6,7 @@
 // Shared host/AIV ABI for the graph-safe ExecuteBatchGet kernel.  These
 // records are copied verbatim between host code, HBM and the AIV kernel.
 enum {
+  KVAF_AIV_DIRECT_URMA_ENTITY_VERSION = 2,
   KVAF_AIV_BATCH_GET_STATUS_BYTES = 1216,
   KVAF_AIV_BATCH_GET_QUEUE_STATE_BYTES = 64,
   KVAF_AIV_BATCH_GET_MAX_AIV_CORES = 48,

@@ -17,6 +17,8 @@ enum class StatusCode {
   kOutOfMemory,
   kInternal,
   kCompletionUnknown,
+  // Source compatibility for Pull; wire states remain protocol-specific.
+  kInDoubt = kCompletionUnknown,
 };
 
 class Status {
@@ -67,6 +69,10 @@ class Status {
 
   static Status CompletionUnknown(std::string message) {
     return Error(StatusCode::kCompletionUnknown, std::move(message));
+  }
+
+  static Status InDoubt(std::string message) {
+    return CompletionUnknown(std::move(message));
   }
 
   bool ok() const { return code_ == StatusCode::kOk; }
