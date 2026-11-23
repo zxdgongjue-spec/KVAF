@@ -41,6 +41,8 @@ UBMEM Put 事务确认和 graph 释放时的状态检查有各自用途。
 
 Graph 的 E2E 使用同一 stream 上 replay 前后两个 NPU Event 的间隔，
 资源准备、输入更新及同步、输出校验和 profile 读取均在计时外。
+`scope=host_replay` / `host_replay_*` 另记从开始提交到等待完成、读取 Event 耗时并返回的
+完整 Host 时间；多 Get 时也按每 Get 摊销。未开 `--kernel-profile` 仍记录这两个 Host 边界。
 可在 `--execution graph` 或 `both` 下加 `--multi-graph-check`，在单节点图计时前
 验证两张图交替回放、多个 Get 的数据正确性，以及释放其中一张后另一张继续回放。
 Gather/Scatter 额外检查未回放节点不能误报完成；配合 `--kernel-profile` 还验证
@@ -91,7 +93,7 @@ DEVICE_ID=2 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 Gather/Scatter 加 `--kernel-profile` 后，同一份 `profile.csv` 自动记录 Host 分段，
 无需设置 trace 环境变量或生成 `dispatch-summary.txt`。快照在每轮计时后读取，
-不增加设备任务或 D2H；Host 读钟的开销包含在结果内。未开启该参数或显式 trace 时不读 Host 计时钟。
+不增加设备任务或 D2H；Host 读钟的开销包含在结果内。细分 Host 打点只在该参数或显式 trace 下开启。
 
 | `kind` | 内容 |
 |---|---|
@@ -125,6 +127,52 @@ Replay 不重新执行 Tensor 绑定和 Runtime Prepare，因此不复用 eager 
 框架派发、kernel 函数体外的任务执行、状态 D2H 的设备执行和完成回报仍属于 runtime
 剩余区间；这些部分要结合 CANN task/timeline 才能继续拆开，本 profile 不将它们猜作 Python 或通信开销。
 所有差值只对**时长**做运算，不相减 Host 与设备的绝对时间戳。
+
+### ACL 原生提交与同图多 Get
+
+`--graph-api acl --graph-submit native` 使用 `AclGraph.replay_timed(stream, profile=False)`：
+一次绑定调用内依次执行 `aclrtRecordEvent → aclmdlRIExecuteAsync → aclrtRecordEvent →
+aclrtSynchronizeEvent → aclrtEventElapsedTime`。两个 Event 在计时前创建并预热，后续复用；
+每轮在第一个 Event 前解析一次 stream，保留 Torch Host 队列刷新，等待时释放 GIL。
+同一个图正在使用时，拒绝其他线程并发 reset/replay；图仍由调用者在捕获的 device/stream 上执行。
+
+默认 `--graph-submit python` 保留原来的分次调用，`--graph-get-count 1` 保持单 Get。
+`--graph-submit native` 仅支持 ACL 图，不能用于 Torch 图；`--graph-api` 不会隐式切换。
+同图多个 Get 复用 `--graph-get-count 2|4|16`，按顺序捕获独立节点、租约和 profile，
+同 stream 串行执行。当前对照重复相同请求/输出，输入更新及所有节点的状态/profile 检查均在计时外。
+`--graph-replays 5` 仍只控制计时前的正确性回放次数，与图内 Get 数量无关。
+
+保持 CPU service 配置不变，先采不带 msprof 的三组对照：
+
+```bash
+for variant in python-1 native-1 native-4; do
+  submit=${variant%-*}
+  gets=${variant##*-}
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --peer 127.0.0.1:28990 --device-id 1 \
+    --backend gather_read --aicpu-workers 6 --execution graph \
+    --graph-api acl --graph-submit "$submit" --graph-get-count "$gets" --graph-replays 5 \
+    --request-length 32768 --table-capacity 16384 --miss-count 8192 \
+    --token-bytes 656 --tokens-per-block 128 \
+    --warmup 100 --iterations 1000 --kernel-profile \
+    --output-dir "results/graph-submit/$variant"
+done
+```
+
+单 Get 比较前两组的 `e2e_mean_us − kernel_mean_us` 和 `host_replay_mean_us`，多次交错运行查看 P99。
+Event 前的 stream 解析计入 Host 时间；原生提交减少 Event 到模型提交之间的绑定/排队，
+因此不能只凭 Event 间隔下降认定完整调用变快。`profile.csv` 的 `host_graph` 在 native 下额外记录
+`stream_resolve`、`timing_prepare`、`elapsed_time`、`gil_reacquire`、`native_total`、`binding_other`；
+最后一项含 Python/pybind 进出和返回结果构造，`native_total` 是其余 native 分段的合计。
+
+`native-4` 的 `gets_per_replay=4`、`latency_scope=amortized_per_get`，Event/Host 时间均除以 4；
+kernel 时间取各节点 body 时长的均值，节点间隙仍计入 gap。它验证模型提交成本能否摊薄，
+不能当作单 Get 延迟。`profile.csv` 的 `host_graph` 保持每 replay，`host_graph_per_get` 才除以节点数。
+如果 gap 不随 Get 数明显下降，剩余成本更可能按任务重复发生，需要继续用 CANN trace 区分。
+
+三组均可沿用 msprof 和 `tests/diagnostics/summarize_aicpu_gap.py --execution graph`。
+每组使用独立目录，汇总脚本自动读取 `graph_submit` / `gets_per_replay` 及新增 Host 指标。
+原生提交仍保留 record/model/record/Event-sync 序列，无需改变关联规则。
 
 保持相同参数，分别测试两条 eager 完成路径和 graph：
 

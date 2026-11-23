@@ -82,6 +82,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph", dest="execution", action="store_const", const="graph",
                         help="shorthand for --execution graph")
     parser.add_argument("--graph-api", choices=("acl", "torch"), default="torch")
+    parser.add_argument("--graph-submit", choices=("python", "native"), default="python",
+                        help="graph: separate Python Event/replay calls or fused ACL record/replay/record/wait")
     parser.add_argument("--graph-get-count", type=int, default=1,
                         help="sequential Gets per replay; values >1 report amortized per-Get time")
     parser.add_argument("--graph-replays", type=int, default=5,
@@ -116,6 +118,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "graph-get-count must be in [1, 16]"
     if args.graph_get_count != 1 and (args.execution == "eager" or not uses_aicpu(args)):
         return "multiple Gets per replay require AICPU graph execution"
+    if args.graph_submit == "native" and (args.execution == "eager" or args.graph_api != "acl"):
+        return "native graph submission requires --execution graph|both --graph-api acl"
     if args.multi_graph_check and (args.execution == "eager" or args.miss_count <= 0):
         return "multi-graph-check requires graph or both execution and a positive miss-count"
     if args.iterations <= 0:
@@ -135,6 +139,8 @@ def validate_args(args: argparse.Namespace) -> str | None:
             return "contention mode measures sustained graph throughput without device profiling"
         if args.get_binding != "ordinary" or args.graph_get_count != 1:
             return "binding/replay comparisons are for single-card benchmarks"
+        if args.graph_submit != "python":
+            return "native timed submission is for single-card graph benchmarks"
     return None
 
 
@@ -232,13 +238,15 @@ def print_aicpu_details(args, execution, samples, details=None):
                           metrics, details, "worker", worker)
 
 
-def print_measurements(args, execution, samples, profiles, report=None):
+def print_measurements(args, execution, samples, profiles, report=None, host_samples=None):
     """Keep end-to-end and operator wall time distinct; count payload once."""
     scopes = [("end_to_end", samples, "host_perf_counter" if execution == "eager" else "npu_event")]
     if len(profiles) != len(samples) or any(len(node) != args.parallelism for p in profiles for node in profile_nodes(p)):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
                    "device_ns" if uses_aicpu(args) else "device_cycles"))
+    if host_samples is not None:
+        scopes.append(("host_replay", host_samples, "host_perf_counter"))
     payload = args.miss_count * args.token_bytes
     measurements = {}
     timing = args.get_timing if execution == "eager" else "graph-replay-wait"
@@ -256,6 +264,7 @@ def print_measurements(args, execution, samples, profiles, report=None):
         print(
             f"BATCH_GET_RESULT backend={args.backend} execution={execution} "
             f"execution_mode={args.execution_mode} scope={scope} "
+            f"graph_submit={args.graph_submit if execution == 'graph' else 'none'} "
             f"gets_per_replay={args.graph_get_count if execution == 'graph' else 1} "
             f"latency_scope={'amortized_per_get' if execution == 'graph' and args.graph_get_count > 1 else 'single_get'} "
             f"get_timing={timing} completion_cleanup_excluded={int(cleanup_excluded)} "
@@ -468,47 +477,71 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             check_output(plan, count)
 
         validate_graph_inputs(graph, inputs, check_captured, args.miss_count, args.graph_replays)
-        start_event = torch.npu.Event(enable_timing=True)
-        end_event = torch.npu.Event(enable_timing=True)
-        start_event.record(stream)
-        end_event.record(stream)
-        end_event.synchronize()
+        native_submit = args.graph_submit == "native"
+        if native_submit:
+            # Create/warm native timing Events before either measured loop.
+            inputs.prepare(args.miss_count)
+            graph.replay_timed()
+            check_captured(inputs.fixed, args.miss_count)
+        else:
+            start_event = torch.npu.Event(enable_timing=True)
+            end_event = torch.npu.Event(enable_timing=True)
+            start_event.record(stream)
+            end_event.record(stream)
+            end_event.synchronize()
         for iteration in range(args.warmup):
             inputs.prepare(args.miss_count)
-            graph.replay()
-            graph.synchronize()
+            if native_submit:
+                graph.replay_timed()
+            else:
+                graph.replay()
+                graph.synchronize()
             check_captured(inputs.fixed, args.miss_count)
-        durations, profiles, host_profiles = [], [], []
+        durations, profiles, host_profiles, host_samples = [], [], [], []
         record_host = args.kernel_profile and uses_aicpu(args)
         for iteration in range(args.iterations):
             inputs.prepare(args.miss_count)
-            host_begin = time.perf_counter_ns() if record_host else 0
-            start_event.record(stream)
-            start_recorded = time.perf_counter_ns() if record_host else 0
-            graph.replay()
-            replayed = time.perf_counter_ns() if record_host else 0
-            end_event.record(stream)
-            end_recorded = time.perf_counter_ns() if record_host else 0
-            end_event.synchronize()
-            host_end = time.perf_counter_ns() if record_host else 0
-            durations.append(float(start_event.elapsed_time(end_event)) / args.graph_get_count)
+            host_begin = time.perf_counter_ns()
+            if native_submit:
+                result = graph.replay_timed(profile=record_host)
+                host_end = time.perf_counter_ns()
+                elapsed = float(result["elapsed_ms"])
+                host = result["host_ns"]
+                if record_host:
+                    host["binding_other"] = host_end - host_begin - host["native_total"]
+            else:
+                start_event.record(stream)
+                start_recorded = time.perf_counter_ns() if record_host else 0
+                graph.replay()
+                replayed = time.perf_counter_ns() if record_host else 0
+                end_event.record(stream)
+                end_recorded = time.perf_counter_ns() if record_host else 0
+                end_event.synchronize()
+                synced = time.perf_counter_ns() if record_host else 0
+                elapsed = float(start_event.elapsed_time(end_event))
+                host_end = time.perf_counter_ns()
+                host = dict(start_event_record=start_recorded - host_begin,
+                            replay_submit=replayed - start_recorded,
+                            end_event_record=end_recorded - replayed, event_sync=synced - end_recorded,
+                            elapsed_time=host_end - synced) if record_host else {}
+            durations.append(elapsed / args.graph_get_count)
+            host_samples.append((host_end - host_begin) / 1e6 / args.graph_get_count)
             check_captured(inputs.fixed, args.miss_count)
             nodes = [list(runtime.batch_get_kernel_profile(graph_lease=lease)) for lease in graph.leases]
             profiles.append(nodes[0] if args.graph_get_count == 1 else nodes)
             if record_host:
-                host_profiles.append(dict(
-                    start_event_record=start_recorded - host_begin, replay_submit=replayed - start_recorded,
-                    end_event_record=end_recorded - replayed, event_sync=host_end - end_recorded,
-                    replay_and_wait=host_end - host_begin))
+                host["replay_and_wait"] = host_end - host_begin
+                host_profiles.append(host)
         if record_host:
             host_profiles = [add_device_boundaries(graph_host_sample(host, elapsed * 1000,
                 device_profile_ms(profile, args.kernel_profile_clock_mhz) * 1000, args.graph_get_count),
                 profile, elapsed * 1000, device_profile_ms(profile, args.kernel_profile_clock_mhz) * 1000)
                 for host, elapsed, profile in zip(host_profiles, durations, profiles)]
         graph.validated = True
-        print_measurements(args, "graph", durations, profiles, report)
+        print_measurements(args, "graph", durations, profiles, report, host_samples=host_samples)
         print_host_breakdown(args, "graph", host_profiles, report)
-        print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
+        print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} submit={args.graph_submit} "
+              f"gets_per_replay={args.graph_get_count} "
               "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
 
 
@@ -1007,6 +1040,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             "BATCH_GET_PERF_CONFIG "
             f"execution_mode={args.execution_mode} "
             f"backend={args.backend} execution={args.execution} "
+            f"graph_api={args.graph_api} graph_submit={args.graph_submit} graph_get_count={args.graph_get_count} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "

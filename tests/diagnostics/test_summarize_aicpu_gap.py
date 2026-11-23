@@ -7,7 +7,7 @@ import re
 from tempfile import TemporaryDirectory
 import unittest
 
-from summarize_aicpu_gap import Trace, bounded_report, csv_report, main, report_execution
+from summarize_aicpu_gap import Trace, bounded_report, csv_report, main, report_execution, graph_scope_comparison
 
 
 def event(name, start, duration, pid=1, tid=1, **args):
@@ -60,6 +60,26 @@ def graph_round(start=100, count=1, token=100):
 
 
 class GapExtractorTest(unittest.TestCase):
+    def test_unique_event_identity_survives_host_device_clock_inversion(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            rows = graph_round()
+            for row in rows:
+                if row["pid"] == 2:
+                    row["ts"] -= 13
+            write_trace(root, rows)
+            result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
+            self.assertEqual(result["selected_replays"], 1)
+            self.assertEqual(result["cross_clock_order_warnings"], 1)
+            self.assertEqual(result["chain_stats_us"]["device_event_start_to_task"]["mean"], 28)
+            self.assertEqual(result["chain_stats_us"]["aligned_launch_to_task_begin"], {"n": 0})
+
+    def test_partial_graph_selection_does_not_subtract_full_benchmark_means(self):
+        timeline = dict(execution="graph", selected_replays=2, timed_replay_candidates=50, requested_replays=50)
+        graph_scope_comparison({}, timeline)
+        self.assertFalse(timeline["scope_comparison_selection_complete"])
+        self.assertNotIn("scope_mean_comparison_us", timeline)
+
     def test_graph_event_brackets_recover_replay_without_model_task_id_links(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -174,8 +194,11 @@ class GapExtractorTest(unittest.TestCase):
                 row["args"]["address"] = "CONTROLLED_ADDRESS"
             write_trace(root, rows)
             (root / "summary.csv").write_text(
-                "backend,execution,gets_per_replay,kernel_mean_us,e2e_mean_us\n"
-                "gather_read,graph,1,90,160\n", encoding="utf-8")
+                "backend,execution,gets_per_replay,kernel_mean_us,e2e_mean_us,graph_submit,host_replay_mean_us\n"
+                "gather_read,graph,1,90,160,native,180\n", encoding="utf-8")
+            (root / "profile.csv").write_text(
+                "backend,execution,kind,name,metric,value\n"
+                "gather_read,graph,host_graph,stream_resolve,mean_us,2\n", encoding="utf-8")
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = main(["--msprof-dir", str(root), "--benchmark-dir", str(root), "--last", "1"])
@@ -185,6 +208,10 @@ class GapExtractorTest(unittest.TestCase):
             self.assertEqual(result["timeline"]["selected_replays"], 1)
             self.assertEqual(result["timeline"]["scope_mean_comparison_us"]["gather_read/graph"][
                 "trace_task_minus_benchmark_body"], 10)
+            benchmark = result["benchmark"]["gather_read/graph"]
+            self.assertEqual(benchmark["configuration"]["graph_submit"], "native")
+            self.assertEqual(benchmark["summary"]["host_replay_mean_us"], 180)
+            self.assertEqual(benchmark["profile_us"]["host_graph.stream_resolve"]["mean_us"], 2)
             self.assertNotIn("CONTROLLED", output.getvalue())
 
     def test_id_links_nested_apis_and_completion_chain(self):

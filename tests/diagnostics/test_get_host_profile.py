@@ -1,5 +1,6 @@
 import ast
 from collections import defaultdict
+from contextlib import nullcontext
 import csv
 import statistics
 from itertools import count
@@ -94,6 +95,48 @@ class GetHostProfileTest(unittest.TestCase):
         self.assertEqual(sample["host_graph_per_get", "replay_and_wait"], 300)
         self.assertEqual(sample["gap", "graph_host_outside_event"], 50)
 
+    def test_native_graph_submission_keeps_all_node_profiles_outside_timing(self):
+        source = Path(__file__).resolve().parents[1] / "python/test_npu_batch_get_perf.py"
+        tree = ast.parse(source.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "run_graph_benchmark")
+        timer = Mock(side_effect=count(0, 1000))
+        graph = SimpleNamespace(leases=[11, 12], replay_timed=Mock(side_effect=lambda **_: dict(
+            elapsed_ms=.2, host_ns=dict(start_event_record=50, replay_submit=100,
+                end_event_record=50, event_sync=250, native_total=500))))
+        runtime = SimpleNamespace(batch_get_kernel_profile=Mock(), check_batch_get_status=Mock(), batch_get=Mock())
+
+        def snapshot(graph_lease):
+            self.assertEqual(timer.call_count, 2 * ((runtime.batch_get_kernel_profile.call_count + 1) // 2))
+            base = graph_lease * 1_000_000
+            return [dict(device_entry_ns=base, device_start_ns=base + 1000,
+                         device_finish_ns=base + 101000, device_return_ns=base + 102000)]
+
+        runtime.batch_get_kernel_profile.side_effect = snapshot
+        inputs = SimpleNamespace(fixed=(1, 2, 3), prepare=Mock())
+        measurements, breakdown = Mock(), Mock()
+        environment = dict(device_helpers(),
+            captured_get=lambda *_, **__: nullcontext(graph), GraphInputs=lambda *_: inputs,
+            validate_graph_inputs=Mock(), uses_aicpu=lambda _: True,
+            graph_host_sample=graph_host_sample, print_measurements=measurements,
+            print_host_breakdown=breakdown, print=Mock(), time=SimpleNamespace(perf_counter_ns=timer))
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), environment)
+        args = SimpleNamespace(multi_graph_check=False, miss_count=10, graph_get_count=2,
+            graph_submit="native", graph_replays=5, warmup=1, iterations=2, kernel_profile=True,
+            kernel_profile_clock_mhz=1000, backend="gather_read", graph_api="acl")
+        environment["run_graph_benchmark"](args, runtime,
+            SimpleNamespace(npu=SimpleNamespace(current_stream=Mock())), object(), Mock(),
+            object(), object(), object(), Mock(),
+            execution=SimpleNamespace(get_kwargs={}, complete_async_get=Mock()))
+        self.assertEqual(graph.replay_timed.call_count, 4)  # Event warmup, workload warmup, two samples.
+        self.assertEqual(measurements.call_args.args[2], [.1, .1])
+        self.assertEqual(measurements.call_args.kwargs["host_samples"], [.0005, .0005])
+        self.assertEqual(runtime.batch_get_kernel_profile.call_count, 4)
+        sample = breakdown.call_args.args[2][0]
+        self.assertEqual(sample["gap", "kernel"], 100)
+        self.assertEqual(sample["host_graph", "binding_other"], .5)
+        self.assertTrue(graph.validated)
+
     def test_eager_loop_reads_host_snapshot_after_timing(self):
         source = Path(__file__).resolve().parents[1] / "python/test_npu_batch_get_perf.py"
         tree = ast.parse(source.read_text())
@@ -144,7 +187,7 @@ class GetHostProfileTest(unittest.TestCase):
                 backend="gather_read", transport="urma", request_length=32768,
                 table_capacity=4096, miss_count=4096, token_bytes=656, tokens_per_block=128,
                 aiv_cores=None, aicpu_workers=4, jettys_per_core=2, max_inflight_total=2048,
-                get_binding="ordinary", graph_api="torch", graph_get_count=1)
+                get_binding="ordinary", graph_api="torch", graph_submit="python", graph_get_count=1)
             report = BatchGetCsv(args)
             source = Path(__file__).resolve().parents[1] / "python/test_npu_batch_get_perf.py"
             tree = ast.parse(source.read_text())
@@ -162,6 +205,19 @@ class GetHostProfileTest(unittest.TestCase):
                        and row["metric"] == "mean_us")
             self.assertEqual(float(gap["value"]), 100)
             self.assertTrue(all(row["execution"] == "eager" for row in rows))
+
+    def test_graph_csv_labels_native_amortization_and_host_latency(self):
+        args = SimpleNamespace(output_dir=Path("unused"), kernel_profile=False,
+            backend="gather_read", transport="urma", request_length=32768,
+            table_capacity=16384, miss_count=8192, token_bytes=656, tokens_per_block=128,
+            aiv_cores=None, aicpu_workers=6, jettys_per_core=2, max_inflight_total=2048,
+            get_binding="ordinary", graph_api="acl", graph_submit="native", graph_get_count=4)
+        report = BatchGetCsv(args)
+        report.add_summary("graph", dict(e2e=dict(mean_us="200"), host_replay=dict(mean_us="220")))
+        row = report.summary_rows[0]
+        self.assertEqual((row["graph_submit"], row["gets_per_replay"], row["latency_scope"]),
+                         ("native", 4, "amortized_per_get"))
+        self.assertEqual(row["host_replay_mean_us"], "220")
 
 
 if __name__ == "__main__":

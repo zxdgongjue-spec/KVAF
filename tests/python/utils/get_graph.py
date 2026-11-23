@@ -33,6 +33,11 @@ class GetGraph:
     def synchronize(self):
         self.stream.synchronize()
 
+    def replay_timed(self, profile=False):
+        if self.api != "acl":
+            raise ValueError("native timed submission requires --graph-api acl")
+        return self.graph.replay_timed(self.stream, profile=profile)
+
 
 @contextmanager
 def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit, count=1):

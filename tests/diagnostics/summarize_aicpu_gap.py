@@ -37,10 +37,12 @@ CORE_PROFILE = {
                       "acquire", "bind", "warmup", "provider", "context_release", "other"},
     "host_provider": {"prepare", "launch_api", "status_enqueue", "stream_sync", "status_check", "cleanup"},
     "host_binding_drain": {"set_device", "total", "gil_reacquire"},
-    "host_graph": {"start_event_record", "replay_submit", "end_event_record", "event_sync", "replay_and_wait"},
-    "host_graph_per_get": {"start_event_record", "replay_submit", "end_event_record", "event_sync", "replay_and_wait"},
+    "host_graph": {"stream_resolve", "timing_prepare", "start_event_record", "replay_submit",
+                   "end_event_record", "event_sync", "elapsed_time", "gil_reacquire", "native_total",
+                   "binding_other", "replay_and_wait"},
     "stage": {"read", "ready_wait", "cq_wait", "scatter"},
 }
+CORE_PROFILE["host_graph_per_get"] = CORE_PROFILE["host_graph"]
 
 
 def norm(value):
@@ -350,6 +352,30 @@ class Trace:
             for key in ("connection", "correlation"):
                 if event.ids[key] is not None:
                     possible.update(api_ids[key, event.ids[key]])
+            if event.kind == "device_event":
+                unique = {}
+                for key in ("connection", "correlation"):
+                    if event.ids[key] is None:
+                        continue
+                    roots = {self.outer_api(i, "event_api") for i in api_ids[key, event.ids[key]]
+                             if self.events[i].kind == "event_api"}
+                    roots.discard(None)
+                    if len(roots) == 1:
+                        unique[next(iter(roots))] = key
+                if len(unique) == 1:
+                    host_index, method = next(iter(unique.items()))
+                    host = self.events[host_index]
+                    if ((len(device_ids) <= 1 or host.ids["device"] is not None) and
+                            not (host.ids["device"] and event.ids["device"] and host.ids["device"] != event.ids["device"])):
+                        # Identity is independent of Host/device clock alignment.
+                        # Preserve the pair; flag clock order instead of losing it.
+                        result[index] = (host_index, method + "_unique")
+                        if event.start < host.start - 1:
+                            self.warnings["UNIQUE_EVENT_ID_CLOCK_ORDER_WARNING"] += 1
+                        continue
+                elif len(unique) > 1:
+                    self.warnings["CONFLICTING_UNIQUE_EVENT_IDS"] += 1
+                    continue
             if event.ids["stream"] is not None and event.ids["task"] is not None:
                 possible.update(api_ids["stream_task", event.ids["stream"], event.ids["task"]])
             candidates = []
@@ -494,6 +520,7 @@ class Trace:
         match_counts = {key: Counter() for key in ("same_stream", "same_device_inner", "same_device_overlap")}
         match_examples = []
         internal_stream_matches = 0
+        timed_candidates = 0
         targets_by_device = defaultdict(list)
         for i in targets:
             targets_by_device[self.events[i].pid].append(i)
@@ -515,6 +542,7 @@ class Trace:
                     not start.end <= launch.start <= launch.end <= end.start <= end.end <= sync.start):
                 rejects["not_timed_record_model_record_event_sync"] += 1
                 continue
+            timed_candidates += 1
             if end.ids.get("event") and sync.ids.get("event") and end.ids["event"] != sync.ids["event"]:
                 rejects["end_event_identity_mismatch"] += 1
                 continue
@@ -651,6 +679,7 @@ class Trace:
         result.update(execution="graph", association="validated_device_event_containment",
                       association_contract="serialized_batch_get_benchmark_replay",
                       model_execute_calls=len(models), timed_replay_brackets=len(groups),
+                      timed_replay_candidates=timed_candidates, requested_replays=last,
                       selected_replays=len(selected), expected_gets_per_replay=gets_per_replay,
                       replay_rejections=dict(rejects), linked_device_event_records=sum(map(len, records.values())),
                       internal_stream_replays=internal_stream_matches,
@@ -710,9 +739,11 @@ def benchmark_report(root):
                 raise ValueError("INPUT_BENCHMARK_MULTIPLE_RUNS")
             result[key]["summary"] = {k: round(number(v), 3) for k, v in row.items() if number(v) is not None
                 and (k in ("miss_count", "token_bytes", "aicpu_workers", "gets_per_replay") or
-                     k in ("e2e_mean_us", "kernel_mean_us", "e2e_p99_us", "kernel_p99_us", "e2e_mean_GBps"))}
-            result[key]["configuration"] = {k: row[k] for k in ("get_binding", "graph_api", "latency_scope")
-                if row.get(k) in ("ordinary", "prepared", "capture", "torch", "acl", "single_get", "amortized_per_get")}
+                     k in ("e2e_mean_us", "kernel_mean_us", "e2e_p99_us", "kernel_p99_us", "e2e_mean_GBps",
+                           "host_replay_mean_us", "host_replay_p99_us", "host_replay_mean_GBps"))}
+            result[key]["configuration"] = {k: row[k] for k in ("get_binding", "graph_api", "graph_submit", "latency_scope")
+                if row.get(k) in ("ordinary", "prepared", "capture", "torch", "acl", "python", "native",
+                                 "single_get", "amortized_per_get")}
     for path in sorted(root.rglob("profile.csv")):
         for row in read_csv(path):
             if row.get("backend") not in ("gather_read", "cpu_push_scatter") or row.get("execution") not in ("eager", "graph"):
@@ -747,6 +778,13 @@ def report_execution(benchmark, requested):
 
 def graph_scope_comparison(benchmark, timeline):
     if timeline.get("execution") != "graph":
+        return
+    selected = timeline["selected_replays"]
+    complete = (selected > 0 and selected == timeline.get("timed_replay_candidates", selected) and
+                (not timeline.get("requested_replays") or selected >= timeline["requested_replays"]))
+    timeline["scope_comparison_selection_complete"] = complete
+    if not complete:
+        timeline["scope_comparison_note"] = "Skipped task-minus-body/entry mean differences: selected trace replays do not cover the complete timed selection."
         return
     trace_stats = timeline["chain_stats_us"]
     task = trace_stats.get("task_sum_per_get", {}).get("mean")

@@ -153,6 +153,11 @@ For a fully associated capture above, expect `timeline.execution=graph`,
 `selected_replays=1000`, `complete_chains=1000`, `expected_gets_per_replay=1`.
 `model_execute_calls` includes validation/warmup. Inspect `replay_rejections` and
 `linked_device_event_records` if selection is incomplete.
+Unique Event connection/correlation IDs are paired independently of cross-clock
+timestamp order. Clock inversions are flagged; invalid aligned Host/device gaps
+are excluded, while device-only intervals remain available. Reused/ambiguous
+identities still require disambiguation. Task-minus-body/entry mean comparisons
+are omitted when the selected trace does not cover the complete timed selection.
 `graph_match_diagnostics` gives actual same-stream, same-device-contained and
 overlapping Get counts. `graph_match_examples` emits bounded relative intervals
 and identity-equality flags, without original Stream/Task IDs. These distinguish
@@ -210,6 +215,14 @@ node's body span, excluding inter-node gaps. All nodes' status/profiles are read
 outside timing. `host_graph` stays per replay and `host_graph_per_get` is divided
 by node count. This experiment does not reduce single-Get latency or establish
 that per-task AICPU framework costs are eliminated.
+
+For submission A/B tests use `--graph-api acl --graph-submit python|native`,
+keeping `--graph-get-count 1` first, then try `2` or `4` with native submission.
+The native call fuses record/replay/record/wait and reuses timing Events; it
+preserves the trace pattern above. The extractor includes `graph_submit`,
+`host_replay_mean_us`/`host_replay_p99_us` and native Host phases. Compare Host
+latency as well as Event-minus-body: stream resolution is before the native
+start Event. See [the comparison commands](../../docs/batch_get_performance.md#acl-原生提交与同图多-get).
 
 ## Get recovery fault injection (Host only)
 
