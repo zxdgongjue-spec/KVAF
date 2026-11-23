@@ -104,6 +104,48 @@ class GapExtractorTest(unittest.TestCase):
                 result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
                 self.assertEqual(result["selected_replays"], 0)
 
+    def test_graph_physical_stream_identity_can_cross_logical_tracks(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            rows = graph_round()
+            for row in rows:
+                if row["pid"] == 2:
+                    row["args"]["Physic Stream Id"] = 3
+                    row["args"]["Stream Id"] = 3
+                if row["name"].startswith("Kvaf"):
+                    row["tid"] = 4
+                    row["args"]["Stream Id"] = 99
+            write_trace(root, rows)
+            result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
+            self.assertEqual(result["selected_replays"], 1)
+            self.assertEqual(result["internal_stream_replays"], 0)
+            self.assertEqual(result["representative_chains"][0]["stream_identity"], "physical_stream")
+
+    def test_graph_internal_stream_requires_captured_origin_in_same_host_process(self):
+        for owner in (1, 99):
+            with self.subTest(owner=owner), TemporaryDirectory() as folder:
+                root = Path(folder)
+                rows = [event("aclrtLaunchKernelWithHostArgs", 10, 5, owner, 1, **{"Connection Id": 7})] + graph_round()
+                for row in rows:
+                    if row["pid"] == 2:
+                        row["args"]["Physic Stream Id"] = 3
+                    if row["name"].startswith("Kvaf"):
+                        row["tid"] = 4
+                        row["args"]["Physic Stream Id"] = 9
+                write_trace(root, rows)
+                result = Trace(root, re.compile("KvafAicpuGatherRead", re.I)).report(1, 1, False, "graph", 1)
+                self.assertEqual(result["selected_replays"], 1 if owner == 1 else 0)
+                self.assertEqual(result["graph_match_diagnostics"]["same_stream"], {"0": 1})
+                self.assertEqual(result["graph_match_diagnostics"]["same_device_inner"], {"1": 1})
+                if owner == 1:
+                    self.assertEqual(result["internal_stream_replays"], 1)
+                    self.assertEqual(result["representative_chains"][0]["link_methods"],
+                                     ["event_bracket_captured_get_internal_stream"])
+                else:
+                    example = result["graph_match_examples"][0]["candidates"][0]
+                    self.assertFalse(example["physical_stream_equal"])
+                    self.assertFalse(example["captured_origin_same_host_process"])
+
     def test_graph_execution_is_selected_from_benchmark_metadata(self):
         graph = {"gather_read/graph": {"summary": {"gets_per_replay": 8}}}
         self.assertEqual(report_execution(graph, "auto"), ("graph", 8))

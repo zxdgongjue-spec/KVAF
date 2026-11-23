@@ -136,6 +136,18 @@ class Event:
         return self.pid, self.tid
 
 
+def stream_evidence(first, event, stream_tracks):
+    if first.pid != event.pid or (first.ids["device"] and event.ids["device"] and
+                                   first.ids["device"] != event.ids["device"]):
+        return None
+    # Physical and logical Stream IDs are different namespaces. A known
+    # physical identity also allows different logical/display tracks.
+    for key in ("physical_stream", "stream"):
+        if first.ids.get(key) is not None and event.ids.get(key) is not None:
+            return key if first.ids[key] == event.ids[key] else None
+    return "stream_track_metadata" if first.track == event.track and first.track in stream_tracks else None
+
+
 def event_from_raw(raw, process_names, pattern):
     start, duration = number(raw.get("ts")), number(raw.get("dur"))
     if start is None or duration is None or duration < 0:
@@ -163,10 +175,11 @@ def event_from_raw(raw, process_names, pattern):
     direction = ("d2h" if any(s in direction for s in ("d2h", "devicetohost", "device2host")) else
                  "h2d" if any(s in direction for s in ("h2d", "hosttodevice", "host2device")) else "unknown")
     ids = {key: identifier(pick(args, *aliases)) for key, aliases in {
-        "stream": ("streamid", "stream", "physicstreamid", "physicalstreamid"), "task": ("taskid",),
+        "stream": ("streamid", "stream"), "physical_stream": ("physicstreamid", "physicalstreamid"),
+        "task": ("taskid",), "model": ("modelid",),
         "device": ("deviceid", "device"), "connection": ("connectionid",),
         "correlation": ("correlationid", "correlation"), "event": ("eventid", "eventhandle", "event")}.items()}
-    for key in ("connection", "correlation"):
+    for key in ("connection", "correlation", "model"):
         if ids[key] in ("0", "18446744073709551615"):
             ids[key] = None
     return Event(pid, tid, start, duration, kind, label, ids, direction,
@@ -272,6 +285,7 @@ class Trace:
         return max(candidates, key=lambda i: (self.events[i].label.startswith("acl"), self.events[i].duration))
 
     def links(self):
+        self.capture_sources = defaultdict(set)
         edges = defaultdict(set)
         for points in self.flows.values():
             previous = None
@@ -287,8 +301,11 @@ class Trace:
         for event in self.events:
             if event.kind == "launch" and "execute" in norm(event.label):
                 model_starts[event.track].append(event.start)
-        def capture_only(host_index, event):
+        def capture_only(host_index, event_index):
             host = self.events[host_index]
+            event = self.events[event_index]
+            if event.target and "launch" in norm(host.label):
+                self.capture_sources[event_index].add(host_index)
             # A capture-time kernel ID does not identify a later model replay.
             starts = model_starts[host.track]
             position = bisect_right(starts, event.start)
@@ -323,7 +340,7 @@ class Trace:
                 pending.extend(edges[source])
             if len(hosts) == 1:
                 host_index = hosts.pop()
-                if not capture_only(host_index, event):
+                if not capture_only(host_index, index):
                     result[index] = (host_index, "flow")
                     continue
             if len(hosts) > 1:
@@ -350,7 +367,7 @@ class Trace:
                         event.ids[key] == host.ids[key] for key in ("task", "stream")):
                     matching.append("stream_task")
                 if matching:
-                    if capture_only(host_index, event):
+                    if capture_only(host_index, index):
                         continue
                     candidates.append((host.start, host_index, matching[0]))
             if candidates:
@@ -474,6 +491,13 @@ class Trace:
             if self.events[device].kind == "device_event":
                 records[host].append(device)
         rejects, groups, candidates = Counter(), {}, {}
+        match_counts = {key: Counter() for key in ("same_stream", "same_device_inner", "same_device_overlap")}
+        match_examples = []
+        internal_stream_matches = 0
+        targets_by_device = defaultdict(list)
+        for i in targets:
+            targets_by_device[self.events[i].pid].append(i)
+        target_starts = {pid: [self.events[i].start for i in indexes] for pid, indexes in targets_by_device.items()}
         occupied = set()
         for model in models:
             launch = self.events[model]
@@ -498,19 +522,15 @@ class Trace:
                 rejects["missing_or_ambiguous_device_event_links"] += 1
                 continue
             first, final = self.events[records[start_host][0]], self.events[records[end_host][0]]
-            if first.track != final.track or first.end > final.start:
+            if first.end > final.start:
                 rejects["device_event_stream_or_order_mismatch"] += 1
                 continue
-            if (any(first.ids[key] and final.ids[key] and first.ids[key] != final.ids[key]
-                    for key in ("stream", "device")) or
-                    (not (first.ids["stream"] and final.ids["stream"]) and first.track not in self.stream_tracks)):
+            record_stream = stream_evidence(first, final, self.stream_tracks)
+            if not record_stream:
                 rejects["unknown_or_inconsistent_device_stream"] += 1
                 continue
             def same_stream(event):
-                if any(first.ids[key] and event.ids[key] and first.ids[key] != event.ids[key]
-                       for key in ("stream", "device")):
-                    return False
-                return event.track == first.track
+                return bool(stream_evidence(first, event, self.stream_tracks))
             lane = self.tracks[first.track]
             begin = bisect_right(self.starts[first.track], first.end - .001)
             stop = bisect_right(self.starts[first.track], final.start + .001)
@@ -524,12 +544,49 @@ class Trace:
             if crosses_start:
                 rejects["device_work_crosses_start_event"] += 1
                 continue
-            task_ids = [i for i in window if self.events[i].target and same_stream(self.events[i]) and
-                        self.events[i].end <= final.start + .001]
-            device_tasks = [self.events[i] for i in task_ids]
+            device_indexes = targets_by_device[first.pid]
+            low = bisect_right(target_starts.get(first.pid, []), first.end - .001)
+            high = bisect_right(target_starts.get(first.pid, []), final.start + .001)
+            inside = [i for i in device_indexes[low:high] if self.events[i].end <= final.start + .001 and
+                      not (first.ids["device"] and self.events[i].ids["device"] and
+                           first.ids["device"] != self.events[i].ids["device"])]
+            task_ids = [i for i in inside if same_stream(self.events[i])]
+            overlaps = [i for i in device_indexes if self.events[i].start < final.end and self.events[i].end > first.start]
+            for key, count in (("same_stream", len(task_ids)), ("same_device_inner", len(inside)),
+                               ("same_device_overlap", len(overlaps))):
+                match_counts[key][str(count)] += 1
+            def captured_origin(i):
+                return any(self.events[h].pid == launch.pid and self.events[h].end <= start.start
+                           for h in self.capture_sources[i])
+            def model_origin(i):
+                return (links.get(i, (None,))[0] == model or
+                        bool(launch.ids.get("model") and launch.ids["model"] == self.events[i].ids.get("model")))
+            def stream_relation(i):
+                event = self.events[i]
+                def equal_id(key):
+                    return None if first.ids.get(key) is None or event.ids.get(key) is None else first.ids[key] == event.ids[key]
+                return dict(same_trace_track=first.track == event.track,
+                            physical_stream_equal=equal_id("physical_stream"), logical_stream_equal=equal_id("stream"),
+                            captured_origin_same_host_process=captured_origin(i), model_origin=model_origin(i))
+            method = "event_bracket_same_stream"
+            if len(task_ids) != gets_per_replay and len(inside) == gets_per_replay:
+                # Graph nodes may use internal streams. Under this benchmark's
+                # serial replay contract, require capture/model provenance as
+                # well as the unique expected task set inside the Event window.
+                if all(model_origin(i) or captured_origin(i) for i in inside):
+                    task_ids = inside
+                    method = "event_bracket_captured_get_internal_stream"
             if len(task_ids) != gets_per_replay:
                 rejects["unexpected_get_task_count"] += 1
+                if len(match_examples) < samples:
+                    relative = lambda e: [round(e.start - launch.start, 3), round(e.end - launch.start, 3)]
+                    match_examples.append(dict(
+                        model_ordinal=models.index(model) + 1, expected_gets=gets_per_replay,
+                        device_event_bracket_us=[relative(first), relative(final)],
+                        candidates=[dict(stream_relation(i), interval_us=relative(self.events[i]),
+                            inside_inner_window=i in inside) for i in overlaps[:8]]))
                 continue
+            device_tasks = [self.events[i] for i in task_ids]
             if occupied.intersection(task_ids):
                 rejects["task_in_multiple_replays"] += 1
                 continue
@@ -543,6 +600,7 @@ class Trace:
                 continue
             occupied.update(task_ids)
             groups[model] = task_ids
+            internal_stream_matches += method == "event_bracket_captured_get_internal_stream"
             task_begin, task_end = min(e.start for e in device_tasks), max(e.end for e in device_tasks)
             union = interval_union(device_tasks)
             metrics = dict(
@@ -570,8 +628,8 @@ class Trace:
             relative = lambda e: [round(e.start - launch.start, 3), round(e.end - launch.start, 3)]
             candidates[model] = dict(
                 launch_api=launch.label, sync_api=sync.label, workers_or_task_events=len(task_ids),
-                link_methods=["event_bracket_same_stream"],
-                stream_identity="explicit_stream_and_track" if first.ids["stream"] and final.ids["stream"] else "stream_track_metadata",
+                link_methods=[method], stream_identity=record_stream,
+                task_stream_relations=[stream_relation(i) for i in task_ids],
                 event_link_methods=sorted({links[records[h][0]][1] for h in (start_host, end_host)}),
                 host_order="thread" if start.track == launch.track == end.track == sync.track else "process_serial",
                 host_launch_us=relative(launch), host_sync_us=relative(sync),
@@ -591,9 +649,13 @@ class Trace:
         tasks = [self.events[i] for model in selected for i in groups[model]]
         result = self.chain_report(targets, groups, selected, chains, tasks, "kernel_name", samples)
         result.update(execution="graph", association="validated_device_event_containment",
+                      association_contract="serialized_batch_get_benchmark_replay",
                       model_execute_calls=len(models), timed_replay_brackets=len(groups),
                       selected_replays=len(selected), expected_gets_per_replay=gets_per_replay,
                       replay_rejections=dict(rejects), linked_device_event_records=sum(map(len, records.values())),
+                      internal_stream_replays=internal_stream_matches,
+                      graph_match_diagnostics={key: dict(value) for key, value in match_counts.items()},
+                      graph_match_examples=match_examples,
                       metrics_scope="per_replay; fields ending _per_get are divided by Get count")
         return result
 
@@ -614,7 +676,7 @@ class Trace:
             events = [e for e in self.events if e.kind == kind]
             coverage[kind] = dict(events=len(events), **{
                 key: sum(e.ids[key] is not None for e in events)
-                for key in ("stream", "task", "device", "connection", "correlation")})
+                for key in ("stream", "physical_stream", "model", "task", "device", "connection", "correlation")})
         return dict(json_files=self.files, complete_events=len(self.events), target_selection=selection,
                     flow_groups=len(self.flows), link_field_coverage=coverage,
                     target_events=len(targets), linked_target_events=sum(map(len, groups.values())),
@@ -791,6 +853,9 @@ def bounded_report(report, limit):
         if trace.get("representative_chains"):
             trace["representative_chains"].pop()
             section = "one_representative_chain"
+        elif trace.get("graph_match_examples"):
+            trace["graph_match_examples"].pop()
+            section = "one_graph_match_example"
         elif "all_trace_api_us" in trace:
             trace.pop("all_trace_api_us")
             section = "all_trace_api_us"
@@ -853,8 +918,8 @@ def main(argv=None):
                              "Trace timestamps use Chrome trace microseconds; displayTimeUnit does not change them.",
                              "Representative intervals are relative to each Host launch start; IDs are not exported.",
                              "aligned_* gaps use msprof alignment; order-violating chains are excluded from aligned statistics but retained in samples.",
-                             "Direct Host/device links use flows/IDs. Graph tasks may be grouped by validated same-stream device Event containment, labeled event_bracket_same_stream; no nearest-task matching.",
-                             "Graph requires record/model/record/Event-sync Host order, explicitly linked device Events, and the expected Get count. It never substitutes eager warmup chains.",
+                             "Direct Host/device links use flows/IDs. Graph grouping uses Event containment plus same-stream evidence or unique model/captured-kernel provenance under serialized replay; methods are labeled and no nearest-task matching is used.",
+                             "Graph requires record/model/record/Event-sync Host order, explicitly linked device Events, and the expected Get count. Internal-stream inference requires the serial BatchGet benchmark contract; it never substitutes eager warmup chains.",
                              "Device Event task begin/end windows approximate hardware Event timestamp bounds; they are not exact torch Event timestamps.",
                              "Body and entry spans stay separate. Multi-Get Event/kernel metrics are per Get; Host graph durations are per replay unless marked per_get.",
                              "All-trace API and CSV statistics include setup/warmup/readback; selected chains use --last.",

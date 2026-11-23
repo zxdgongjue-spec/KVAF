@@ -139,15 +139,24 @@ is explicit and also handles a benchmark directory containing both modes.
 Capture-time launch IDs do not identify a replay. Graph grouping uses the
 benchmark's record/model/record/Event-sync Host order, explicitly linked device
 Events, the same device Stream track and the expected Get count. The report
-labels this containment inference `event_bracket_same_stream`, separately from
-direct model/task ID links. Physical Stream IDs and `Stream N` metadata are
-recognized. Ambiguous brackets and unrelated in-window work are rejected.
+labels same-stream containment `event_bracket_same_stream`, separately from
+direct model/task ID links. Physical and logical Stream IDs stay separate;
+matching physical IDs can span different display tracks. Graph-internal streams
+can be grouped as `event_bracket_captured_get_internal_stream` only when the
+exact expected task set lies within the Event window and each task has model
+or captured-kernel provenance from the same Host process. This inference relies
+on this benchmark's serialized replay contract, not arbitrary concurrent models.
+Ambiguous brackets and unrelated work on the Event stream are rejected.
 Missing associations never fall back to eager preparation/warmup chains.
 
 For a fully associated capture above, expect `timeline.execution=graph`,
 `selected_replays=1000`, `complete_chains=1000`, `expected_gets_per_replay=1`.
 `model_execute_calls` includes validation/warmup. Inspect `replay_rejections` and
 `linked_device_event_records` if selection is incomplete.
+`graph_match_diagnostics` gives actual same-stream, same-device-contained and
+overlapping Get counts. `graph_match_examples` emits bounded relative intervals
+and identity-equality flags, without original Stream/Task IDs. These distinguish
+an internal stream from missing tasks or a record-window boundary mismatch.
 `CAPTURE_LAUNCH_NOT_REPLAY_LINK` can still count rejected capture-ID links even
 when Event-based grouping succeeds; it does not measure remaining replay coverage.
 
