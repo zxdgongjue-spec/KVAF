@@ -457,6 +457,50 @@ constexpr uint32_t kAccessAtomic = 0x1U << 3;
     std::memcpy(flag_buf, &probe_seq, 8);
     urma_sge_t fa{reinterpret_cast<uint64_t>(flag_buf), 8, flag_seg, nullptr};
     int fail = post_one(1, &fa, remote_base, 8, "flag8");
+    // (a2) reverse direction: 8B READ from remote HBM into the flag seg.
+    {
+      urma_sge_t ldst{reinterpret_cast<uint64_t>(flag_buf), 8, flag_seg, nullptr};
+      urma_sge_t rsrc{remote_base, 8, remote_tseg, nullptr};
+      urma_jfs_wr_t wr{};
+      wr.opcode = URMA_OPC_READ;
+      wr.flag.bs.complete_enable = 1;
+      wr.tjetty = target;
+      wr.user_ctx = probe_seq++;
+      wr.rw.src = {&rsrc, 1U};
+      wr.rw.dst = {&ldst, 1U};
+      urma_jfs_wr_t *bad = nullptr;
+      if (urma_post_jetty_send_wr(jetty, &wr, &bad) != 0) {
+        std::fprintf(stderr, "[SELFTEST] read8 post failed errno=%d\n", errno);
+      } else {
+        urma_cr_t cr{};
+        while (urma_poll_jfc(jfc, 1, &cr) == 0) {
+        }
+        std::fprintf(stderr, "[SELFTEST] read8 status=%d user_ctx=%llu len=%u\n", cr.status,
+                     static_cast<unsigned long long>(cr.user_ctx), cr.completion_len);
+      }
+    }
+    // (a3) flag write sourced from a seg registered with the LOCAL_ONLY bit
+    // added (some UDMA builds gate local DMA on it).
+    {
+      urma_seg_cfg_t lc{};
+      void *lbuf = nullptr;
+      if (posix_memalign(&lbuf, 4096, 4096) == 0) {
+        std::memset(lbuf, 0, 4096);
+        lc.va = reinterpret_cast<uint64_t>(lbuf);
+        lc.len = 4096;
+        lc.token_id = token_id;
+        lc.token_value.token = local_token_value;
+        lc.flag = seg_flag;
+        lc.flag.bs.access = 0x1U | kAccessRead | kAccessWrite | kAccessAtomic;
+        urma_target_seg_t *lseg = urma_register_seg(ctx, &lc);
+        if (lseg == nullptr) {
+          std::fprintf(stderr, "[SELFTEST] localbit seg register failed errno=%d\n", errno);
+        } else {
+          urma_sge_t ls{reinterpret_cast<uint64_t>(lbuf), 8, lseg, nullptr};
+          post_one(1, &ls, remote_base, 8, "flag8_localbit");
+        }
+      }
+    }
     // (b) single 656B token row from the DDR seg
     urma_sge_t sa{reinterpret_cast<uint64_t>(ddr), args.token_bytes, local_seg, nullptr};
     if (!fail) fail = post_one(1, &sa, remote_base + key.data_offset, args.token_bytes, "row656");
