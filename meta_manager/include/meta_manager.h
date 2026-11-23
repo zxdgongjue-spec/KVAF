@@ -2,12 +2,31 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "status.h"
 #include "types.h"
 
 namespace kvaf {
+
+enum class AllocationMode { kFixed, kAppendOnly };
+
+inline const char* AllocationModeName(AllocationMode mode) {
+  switch (mode) {
+    case AllocationMode::kFixed: return "fixed";
+    case AllocationMode::kAppendOnly: return "append_only";
+  }
+  return "unknown";
+}
+
+inline Status ParseAllocationMode(const std::string& name, AllocationMode* mode) {
+  if (mode == nullptr) return Status::InvalidArgument("allocation mode output is null");
+  if (name == "fixed") *mode = AllocationMode::kFixed;
+  else if (name == "append_only") *mode = AllocationMode::kAppendOnly;
+  else return Status::InvalidArgument("allocation_mode must be fixed or append_only");
+  return Status::OK();
+}
 
 // 读锁模式。当前 POC 只支持“稳定读 + 允许后续追加新 key”这一种语义。
 enum class MetaManagerLockMode {
@@ -54,11 +73,11 @@ class MetaManager {
  public:
   virtual ~MetaManager() = default;
 
-  // 注册远端区域；DSA Key 必须位于 [0, length / slot_size)。
-  // 固定映射 slot_id = key，地址为 base + key * slot_size。
+  // 注册远端区域。默认 fixed 模式下 slot_id = key，Key 必须在 slot 数范围内。
+  // append_only 模式下 Key 独立于 slot，按真实长度紧密追加，单 Key 不跨 slot。
   virtual Status RegisterRemoteRegion(const RemoteRegionDesc& region) = 0;
 
-  // 为一批 key 预留远端 slot。
+  // 为一批 key 预留远端空间，具体 slot/offset 由分配模式决定。
   // 该阶段只分配地址，不暴露映射；只有 CommitPut 之后读路径才能看到这些 key。
   virtual Status PreparePut(const std::vector<KeyId>& flat_keys,
                             const std::vector<std::uint64_t>& lengths,
@@ -68,7 +87,8 @@ class MetaManager {
   // 将 PreparePut 预留的地址正式提交为可见映射。
   virtual Status CommitPut(const PutContext& put_context) = 0;
 
-  // 放弃一次尚未提交的 put，使该 Key 对应的 slot 恢复空闲。
+  // 放弃一次尚未提交的 put。append_only 只在整个 slot 无引用时回收空间，
+  // 不回退仍有其他预留/已提交对象的 slot 游标。
   virtual Status AbortPut(const PutContext& put_context) = 0;
 
   // 为一批 key 建立稳定读快照。
@@ -86,11 +106,14 @@ class MetaManager {
   // 释放稳定读快照，解除对应记录的 pin。
   virtual Status UnlockKeys(const LockContext& lock_context) = 0;
 
-  // 释放一批 key 当前占用的 slot，使相同 Key 可以复用该 slot。
+  // 删除一批未被 pin 的 key。fixed 回收各 Key 的 slot；append_only
+  // 只有在最后一个预留/已提交对象被移除后才回收整个 slot。
   virtual Status BatchFree(const std::vector<KeyId>& flat_keys) = 0;
 };
 
 // 创建一个基于内存数据结构的 MetaManager POC 实现。
 std::unique_ptr<MetaManager> CreateInMemoryMetaManager();
+// Opt-in policy. No-argument factory above keeps the existing DSA implementation.
+std::unique_ptr<MetaManager> CreateInMemoryMetaManager(AllocationMode mode);
 
 }  // namespace kvaf

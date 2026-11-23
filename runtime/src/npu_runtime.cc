@@ -456,7 +456,7 @@ struct NpuRuntime::Impl {
   }
 
   void CreateCore() {
-    meta_manager = CreateInMemoryMetaManager();
+    meta_manager = CreateInMemoryMetaManager(options.allocation_mode);
     urma_operator = nullptr;
     if (backend == detail::RuntimeBackend::kUbmem) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -512,6 +512,9 @@ struct NpuRuntime::Impl {
 
 NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
   const auto& config = impl_->options;
+  if (config.allocation_mode != AllocationMode::kFixed &&
+      config.allocation_mode != AllocationMode::kAppendOnly)
+    throw std::invalid_argument("invalid allocation mode");
   const bool aicpu = detail::UsesAicpu(impl_->backend);
 #if !defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!aicpu)
@@ -556,6 +559,7 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
   std::fprintf(stderr, "[KVAF] NPU_RUNTIME transport=%s aicpu_mode=%s device=%u cores=%u\n",
       config.transport == Transport::kUbmem ? "ubmem" : "urma",
       aicpu ? config.aicpu_batch_get_mode.c_str() : "off", config.device_id, config.npu_core_count);
+  std::fprintf(stderr, "[KVAF] ALLOCATION_MODE mode=%s\n", AllocationModeName(config.allocation_mode));
   if (aicpu) std::fprintf(stderr, "[KVAF] AICPU_PACKAGE root=%s json=%s\n",
       impl_->kernel_package.cann_root.c_str(), impl_->kernel_package.json_path.c_str());
 }
@@ -757,7 +761,8 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
           probe_offsets.reserve(static_cast<std::size_t>(probe_rows));
           probe_lengths.reserve(static_cast<std::size_t>(probe_rows));
           for (std::uint64_t row = 0U; row < probe_rows; ++row) {
-            // MetaManager maps each bounded DSA key directly to its slot.
+            // These keys work in both policies. The allocator supplies the
+            // actual addresses; append_only probes may share a slot.
             probe_keys.push_back(row);
             probe_offsets.push_back(row * probe_bytes);
             probe_lengths.push_back(probe_bytes);
@@ -932,6 +937,7 @@ const RuntimeCore& NpuRuntime::core() const {
   return *impl_->runtime_core;
 }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
+AllocationMode NpuRuntime::allocation_mode() const { return impl_->options.allocation_mode; }
 std::uint32_t NpuRuntime::npu_core_count() const { return impl_->options.npu_core_count; }
 std::uint32_t NpuRuntime::jettys_per_core() const { return impl_->options.jettys_per_core; }
 const std::vector<std::string>& NpuRuntime::npu_eids() const {

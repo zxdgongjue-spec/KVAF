@@ -38,7 +38,7 @@ def prepare_output(a):
     stamp = datetime.now(timezone(timedelta(hours=8)))
     name = (f"ranges_d{a.device}_t{label(a.tensor_bytes)}_r{a.repeat}_p{a.pack_count}"
             f"_c{label(a.cores)}_j{label(a.jettys)}_k{label(a.read_chunk_bytes)}"
-            f"_{stamp:%Y%m%d_%H%M%S_%f}_{digest}")
+            f"_m{a.allocation_mode}_{stamp:%Y%m%d_%H%M%S_%f}_{digest}")
     # Keep each path component comfortably below the filesystem name limit.
     if len(name) > 200:
         name = f"ranges_d{a.device}_{stamp:%Y%m%d_%H%M%S_%f}_{digest}"
@@ -150,6 +150,7 @@ def parse_args(argv=None):
     p.add_argument("--jettys", type=int, nargs="+", default=[2])
     p.add_argument("--inflight", type=int, nargs="+", default=[2048])
     p.add_argument("--slot-size", type=int, default=0, help="0: largest packet rounded up to 4096B")
+    p.add_argument("--allocation-mode", choices=["fixed", "append_only"], default="fixed")
     p.add_argument("--request-order", choices=["sequential", "reverse", "random"], default="reverse")
     p.add_argument("--guard-bytes", type=int, default=0, help="optional untouched output gaps, excluded from payload")
     p.add_argument("--seed", type=int, default=20261121)
@@ -205,6 +206,7 @@ def plan_records(a):
                 core_bytes = [sum(r[2] for r in requests[len(requests)*c//cores:
                               len(requests)*(c+1)//cores]) for c in range(cores)]
                 yield dict(cores=cores, jettys=jettys, inflight=inflight, alignment=alignment,
+                           allocation_mode=a.allocation_mode,
                            put_jettys_per_core=min(jettys, 2),
                            device=a.device, tensor_bytes=",".join(map(str, a.tensor_bytes)),
                            repeat=a.repeat, pack_count=a.pack_count, seed=a.seed,
@@ -277,7 +279,8 @@ def run(a):
         for cores, jettys, inflight in itertools.product(a.cores, a.jettys, a.inflight):
             runtime = kvaf.NpuRuntime(str(get), 656, 1, device_id=a.device, npu_core_count=cores,
                 jettys_per_core=jettys, batch_put_kernel_object_path=str(put), transport="urma",
-                aicpu_batch_get_mode="", batch_get_max_inflight_total=inflight, npu_eids=a.npu_eids)
+                aicpu_batch_get_mode="", batch_get_max_inflight_total=inflight, npu_eids=a.npu_eids,
+                allocation_mode=a.allocation_mode)
             table = None
             try:
                 runtime.link_to(a.peer)

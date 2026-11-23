@@ -33,6 +33,9 @@ struct NpuRuntimeOptions {
   // Empty selects AIV. gather_read / cpu_push_scatter select AICPU Get and Put.
   // The AICPU kernel package is resolved from the CANN installation internally.
   std::string aicpu_batch_get_mode{};
+  // Address allocation policy, selected once per Runtime. Data-plane APIs
+  // remain unchanged; fixed preserves the existing DSA Key == slot mapping.
+  AllocationMode allocation_mode{AllocationMode::kFixed};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and
@@ -70,6 +73,7 @@ class NpuRuntime final : public Runtime {
   const RuntimeCore& core() const;
 
   std::uint32_t device_id() const;
+  AllocationMode allocation_mode() const;
   bool uses_aicpu() const;
   std::uint32_t npu_core_count() const;
   std::uint32_t jettys_per_core() const;

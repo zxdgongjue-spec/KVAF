@@ -285,7 +285,8 @@ class NpuPythonRuntime final {
                    std::string peer_ub_device,
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
-                   const std::string& transport, std::string aicpu_batch_get_mode) {
+                   const std::string& transport, std::string aicpu_batch_get_mode,
+                   std::string allocation_mode) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
@@ -298,6 +299,7 @@ class NpuPythonRuntime final {
     options.npu_core_count = npu_core_count;
     options.jettys_per_core = jettys_per_core;
     options.aicpu_batch_get_mode = std::move(aicpu_batch_get_mode);
+    ThrowIfError(ParseAllocationMode(allocation_mode, &options.allocation_mode));
     options.batch_get_max_inflight_total = batch_get_max_inflight_total;
     options.npu_eids = std::move(npu_eids);
     options.adaptive_ub_device = adaptive_ub_device;
@@ -318,6 +320,7 @@ class NpuPythonRuntime final {
 
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
+  std::string AllocationModeValue() const { return AllocationModeName(native_->allocation_mode()); }
   std::uint32_t NpuCoreCount() const { return native_->npu_core_count(); }
   std::uint32_t JettysPerCore() const { return native_->jettys_per_core(); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
@@ -700,6 +703,7 @@ void BindNpuPythonRuntime(py::module_& module) {
            "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
+      .def_property_readonly("allocation_mode", &NpuPythonRuntime::AllocationModeValue)
       .def_property_readonly("npu_core_count", &NpuPythonRuntime::NpuCoreCount)
       .def_property_readonly("jettys_per_core", &NpuPythonRuntime::JettysPerCore)
       .def_property_readonly("npu_eids", &NpuPythonRuntime::NpuEids)

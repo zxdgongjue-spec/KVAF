@@ -1,4 +1,10 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_executable(kvaf_append_only_meta_test append_only_meta_manager_test.cc)
+target_link_libraries(kvaf_append_only_meta_test PRIVATE kvaf_meta_manager)
+add_test(NAME kvaf_append_only_meta_test COMMAND kvaf_append_only_meta_test)
+add_executable(kvaf_append_only_runtime_test append_only_runtime_test.cc)
+target_link_libraries(kvaf_append_only_runtime_test PRIVATE kvaf_runtime)
+add_test(NAME kvaf_append_only_runtime_test COMMAND kvaf_append_only_runtime_test)
 add_test(NAME kvaf_batch_get_ranges_perf_host
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_batch_get_ranges_perf.py")
 add_executable(kvaf_batch_get_ranges_runtime_test batch_get_ranges_runtime_test.cc)
@@ -70,6 +76,11 @@ if(KVAF_BUILD_PYTHON)
   )
 
   if(KVAF_ENABLE_AIV_BATCH_GET)
+    add_test(NAME kvaf_npu_append_only_python
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_append_only.py")
+    set_tests_properties(kvaf_npu_append_only_python PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+      SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_test(NAME kvaf_npu_batch_get_ranges_python
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_batch_get_ranges.py")
     set_tests_properties(kvaf_npu_batch_get_ranges_python PROPERTIES

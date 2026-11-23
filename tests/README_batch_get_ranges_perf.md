@@ -4,7 +4,7 @@
 
 ## 运行性能测试
 
-CPU 服务沿用已启动的实例；NPU 机器使用包含 range Get 的构建。新增内容是 Python 和 shell 脚本，无需为它们修改 kernel：
+CPU 服务沿用已启动的实例；NPU 机器使用包含 range Get 和 `allocation_mode` 构造参数的最新构建。性能脚本不修改 kernel；新增分配模式需要重新构建 Host 库和 Python binding：
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
@@ -39,6 +39,7 @@ python3 tests/python/batch_get_ranges_perf.py --dry-run
 | `--tensor-bytes` | `1048576 33554432`，每个包内的逻辑 tensor 字节长度列表，可混合长度。 |
 | `--repeat` | 1，在同一包内重复上述列表；不是跨 stream 并发提交数。 |
 | `--pack-count` | 2，包数量，也是 Put 的 Key 数量。 |
+| `--allocation-mode` | fixed；可选 append_only。只切换 Key 的分配方式，保持同样的打包与 Get 请求。每 tensor 独立 Key 的例子见 [append_only 说明](README_append_only.md)。 |
 | `--alignments` | 1，可传 `1 64 512` 扫描包内 tensor 起点及 output 起点的相对对齐；真实 length 不补齐。 |
 | `--read-chunk-bytes` | `0 65536 1048576 4194304`，逐个测试，0 表示取消软件分段。该参数不改变 Put。 |
 | `--cores`、`--jettys`、`--inflight` | 各接受整数列表，扫描笛卡尔积；默认分别是 2、2、2048。非零 inflight 必须不小于 2×core 数。Put 使用独立 transport，Jetty 数为 min(Get Jetty 数, 2)。 |
@@ -79,14 +80,14 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
 dynamicIO/
 ├── KVAF/
 └── result/
-    └── ranges_d7_t1048576-33554432_r1_p2_c2_j2_k0-65536-1048576-n4_20261121_183000_123456_配置摘要/
+    └── ranges_d7_t1048576-33554432_r1_p2_c2_j2_k0-65536-1048576-n4_mfixed_20261121_183000_123456_配置摘要/
         ├── 同目录名.log
         ├── config.json
         ├── summary.csv
         └── samples.jsonl
 ```
 
-运行名含设备、tensor 大小、repeat、包数、core/Jetty、chunk 列表、北京时间（精确到微秒）和完整配置的摘要。过长名称使用设备、时间和摘要；完整参数始终保存在 `config.json`。`.log` 同时保存 Python 与原生 CANN 的 stdout/stderr，包括异常堆栈，终端仍同步显示输出；失败返回码会传回调用方。dry-run 和未开启运行的 skip 不创建结果目录。
+运行名含设备、tensor 大小、repeat、包数、core/Jetty、chunk 列表、分配模式、北京时间（精确到微秒）和完整配置的摘要。过长名称使用设备、时间和摘要；完整参数始终保存在 `config.json`。`.log` 同时保存 Python 与原生 CANN 的 stdout/stderr，包括异常堆栈，终端仍同步显示输出；失败返回码会传回调用方。dry-run 和未开启运行的 skip 不创建结果目录。
 
 输出 `summary.csv`、`samples.jsonl` 和 `RANGE_PERF_RESULT` 行：
 

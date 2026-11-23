@@ -35,7 +35,9 @@ class PerfTests(unittest.TestCase):
         self.assertEqual([perf.expected_reads(sizes, c) for c in [0, 65536, 1048576, 4194304]],
                          [2, 528, 33, 9])
         a = perf.parse_args(["--dry-run"])
+        self.assertEqual(a.allocation_mode, "fixed")
         plans = list(perf.plan_records(a))
+        self.assertTrue(all(p["allocation_mode"] == "fixed" for p in plans))
         self.assertEqual([p["read_wqes_expected"] for p in plans], [4, 1056, 66, 18])
         self.assertTrue(all(sum(p["core_read_wqes_expected"]) == p["read_wqes_expected"] for p in plans))
 
@@ -65,7 +67,8 @@ class PerfTests(unittest.TestCase):
         for args in [["--read-chunk-bytes", "-1"], ["--read-chunk-bytes", str(1 << 32)],
                      ["--cores", "4", "--inflight", "7"], ["--slot-size", "1"],
                      ["--tensor-bytes", "0"], ["--tensor-bytes", str(1 << 32)],
-                     ["--iterations", "0"], ["--alignments", "0"]]:
+                     ["--iterations", "0"], ["--alignments", "0"],
+                     ["--allocation-mode", "invalid"]]:
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 perf.parse_args(args)
 
@@ -122,6 +125,7 @@ class PerfTests(unittest.TestCase):
         class Runtime:
             def __init__(self, *a, **kw):
                 self.store, self.pinned, self.chunks, self.checks = {}, False, [], 0
+                self.allocation_mode = kw["allocation_mode"]
                 instances.append(self)
             def link_to(self, peer): pass
             def initialize(self, ddr, slot): self.slot = slot
@@ -160,7 +164,8 @@ class PerfTests(unittest.TestCase):
             kernel.write_bytes(b"simulated")
             a = perf.parse_args(["--run", "--peer", "fake:1", "--tensor-bytes", "3", "7",
                 "--alignments", "1", "8", "--read-chunk-bytes", "0", "4", "--warmup", "1",
-                "--iterations", "2", "--guard-bytes", "16", "--output-dir", d])
+                "--iterations", "2", "--guard-bytes", "16", "--output-dir", d,
+                "--allocation-mode", "append_only"])
             with patch.dict(sys.modules, {"torch": torch, "torch_npu": SimpleNamespace(),
                                            "kvaf": SimpleNamespace(NpuRuntime=Runtime)}), \
                  patch.dict(os.environ, KVAF_BATCH_GET_KERNEL=str(kernel), KVAF_BATCH_PUT_KERNEL=str(kernel)), \
@@ -173,6 +178,7 @@ class PerfTests(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), 14)  # 2 alignments * (Put + 2 chunks * 3 scopes)
             self.assertTrue(all(r["verified"] == "True" for r in rows))
+            self.assertTrue(all(r["allocation_mode"] == "append_only" for r in rows))
             self.assertTrue(all(r["logical_requests"] == "2" and not r["read_wqes_expected"]
                                 for r in rows if r["operation"] == "put"))
             self.assertTrue(all(not r["mean_GBps"] for r in rows if r["scope"] == "submit"))
@@ -181,6 +187,7 @@ class PerfTests(unittest.TestCase):
             self.assertEqual(len(samples), len(rows))
             self.assertTrue(all(len(s["samples_ns"]) == 2 for s in samples))
             self.assertEqual(len(instances), 1)
+            self.assertEqual(instances[0].allocation_mode, "append_only")
             self.assertEqual(set(instances[0].chunks), {0, 4})
             self.assertGreater(instances[0].checks, 0)
             self.assertIn("RANGE_PERF_PASS configs=4", output.getvalue())
@@ -194,7 +201,7 @@ class PerfTests(unittest.TestCase):
             first = perf.prepare_output(perf.parse_args(args))
             second = perf.prepare_output(perf.parse_args(args))
             self.assertNotEqual(first, second)
-            self.assertRegex(first.name, r"ranges_d7_t656_r1_p2_c2_j2_k0_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}")
+            self.assertRegex(first.name, r"ranges_d7_t656_r1_p2_c2_j2_k0_mfixed_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}")
             config = json.loads((first/"config.json").read_text())
             self.assertEqual(config["config"]["tensor_bytes"], [656])
             self.assertTrue(config["timestamp"].endswith("+08:00"))

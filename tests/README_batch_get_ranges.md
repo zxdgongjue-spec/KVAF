@@ -4,6 +4,8 @@
 
 性能测试、FP16 完整调用示例和分段性能解释见 [Packed Put 和 Get range 性能测试与调用方式](README_batch_get_ranges_perf.md)。
 
+可选的“一 tensor 一 Key、多 Key 共用 slot、只追加分配”见 [append_only 分配模式](README_append_only.md)。默认仍为 fixed，Put/Get range 接口保持不变。
+
 当前版本支持 eager 执行、同包多次读取、多包混合读取、不同长度、乱序请求和独立的输出 byte offset。AICPU gather_read、UBmem、Graph capture、range Get 的 stage/kernel profile 尚未适配。CPU 模型检查功能正确性，真实 NPU 上的 CANN 编译、URMA 连通性、缓存可见性及性能需要另行验收。
 
 ## 1 数据布局和接口变化

@@ -29,6 +29,12 @@ void Write(const fs::path& path, const std::string& contents) {
 
 int main() {
   NpuRuntimeOptions defaults{"get.o", 656, 2};
+  CHECK(defaults.allocation_mode == AllocationMode::kFixed);
+  AllocationMode allocation;
+  CHECK(ParseAllocationMode("fixed", &allocation).ok() && allocation == AllocationMode::kFixed);
+  CHECK(ParseAllocationMode("append_only", &allocation).ok() && allocation == AllocationMode::kAppendOnly);
+  CHECK(!ParseAllocationMode("append", &allocation).ok());
+  CHECK(!ParseAllocationMode("append_only", nullptr).ok());
   RuntimeBackend backend;
   CHECK(defaults.aicpu_batch_get_mode.empty());
   CHECK(ResolveRuntimeBackend(defaults.transport, defaults.aicpu_batch_get_mode, &backend).ok());
