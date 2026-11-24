@@ -19,10 +19,13 @@
 
 namespace {
 std::vector<std::function<void()>> work;
+struct AllocationPolicy { void* address; int policy; };
+std::vector<AllocationPolicy> allocation_policies;
 int allocations{}, refs{}, launches{}, completed{}, stopped{}, quiesced{}, hccp_refs{}, push_stopped{};
 bool fail_sync{}, fail_copy{}, fail_quiesce{}, fail_enable{}, capturing{};
 void* mailbox_jetty{};
 bool fail_mailbox_destroy{}, fail_mailbox_import{};
+bool opened_cpu_gather{};
 bool old_probe_kernel{}, wrong_probe_phase{}, legacy_load_kernel{}, zero_probe_requests{};
 bool wrong_gather_probe_wrs{};
 uint32_t last_coalesce_sges{};
@@ -35,18 +38,24 @@ uint32_t profile_fault{};
 std::vector<uint64_t> sequences;
 std::vector<uint32_t> launch_options;
 }
-int aclrtMalloc(void** p, size_t n, int) {
+int aclrtMalloc(void** p, size_t n, int policy) {
 #ifdef _WIN32
   *p = _aligned_malloc(n, 64); const int rc = *p ? 0 : 1;
 #else
   const int rc = posix_memalign(p, 64, n);
 #endif
-  if (!rc) ++allocations; return rc;
+  if (!rc) {
+    ++allocations;
+    allocation_policies.push_back({*p, policy});
+  }
+  return rc;
 }
 int aclrtMallocHost(void** p, size_t n) { return aclrtMalloc(p, n, 0); }
 int aclrtFree(void* p) {
   if (p) {
     --allocations;
+    allocation_policies.erase(std::remove_if(allocation_policies.begin(), allocation_policies.end(),
+        [p](const AllocationPolicy& allocation) { return allocation.address == p; }), allocation_policies.end());
 #ifdef _WIN32
     _aligned_free(p);
 #else
@@ -103,8 +112,16 @@ int Launch(const KvafScatterBatchGetArgs* a) {
 }
 extern "C" int32_t KvafScatterBatchGetLaunch(const KvafScatterBatchGetArgs* a, void*) {
   assert(loaded_mode == KVAF_SEQ_SCATTER);
+  // CPU_GATHER=0 must retain the original SGL WRITE target's huge-page
+  // preference. Cover eager/graph and gather-enabled launches as well.
+  const auto allocation = std::find_if(allocation_policies.begin(), allocation_policies.end(),
+      [a](const AllocationPolicy& item) {
+        return item.address == reinterpret_cast<void*>(a->workspace);
+      });
+  assert(allocation != allocation_policies.end() && allocation->policy == ACL_MEM_MALLOC_HUGE_FIRST);
   kvaf::cpu_push::Layout layout;
-  assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout));
+  assert(kvaf::cpu_push::MakeLayout(a->request.token_bytes, a->request.block_count, &layout,
+                                   kvaf::ScatterPayloadJettys(*a)));
   assert(a->descriptor_offset == layout.descriptor && a->staging_offset == layout.staging);
   assert(a->workspace_bytes == layout.bytes + sizeof(KvafScatterMailboxContext) +
          uint64_t(a->request.block_count + 1) * 64);
@@ -230,7 +247,12 @@ Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }
-Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenCpuPushGetRequest, OpenAivCpuPushGetResponse* r) const {
+Status PeerLink::OpenAivCpuPushGet(uint64_t, OpenAivCpuPushJettyRequest request,
+                                  OpenAivCpuPushJettyResponse* reply, bool cpu_gather) const {
+  opened_cpu_gather = cpu_gather;
+  for (uint32_t q = 0; q < request.payload_jettys; ++q)
+    assert(request.Channel(q).bytes == 32);
+  auto* r = &reply->base;
   r->mailbox_base = 0x1000000; r->mailbox_bytes = 0x100000;
   r->mailbox_segment_bytes = 48; r->mailbox_token_id = 0x800; r->max_write_bytes = 65536;
   return Status::OK();
@@ -306,6 +328,9 @@ bool ImportPeerJetty(const DirectHccpApi&, void*, const uint8_t*, uint32_t, uint
 int main() {
   using namespace kvaf;
   unsetenv("KVAF_SCATTER_PIPELINE");
+  unsetenv("KVAF_SCATTER_JETTY_CURSORS");
+  unsetenv("KVAF_SCATTER_CPU_GATHER");
+  unsetenv("KVAF_SCATTER_JETTYS_PER_CORE");
   unsetenv("KVAF_AIV_SCATTER_PROBE");
   unsetenv("KVAF_AIV_GATHER_PROBE");
   unsetenv("KVAF_AIV_GATHER_COALESCE_SGES");
@@ -435,6 +460,20 @@ int main() {
   config.aiv_batch_get_mode = "cpu_push_scatter";
   config.aiv_gather_sgl_size = 0; // A gather-only option must not affect scatter.
   {
+    auto configured = config;
+    configured.npu_core_count = 4;
+    auto owner = CreateSequentialBatchGet(configured);
+    setenv("KVAF_SCATTER_JETTYS_PER_CORE", "9", 1);
+    assert(owner->Initialize(region).code() == StatusCode::kInvalidArgument);
+    setenv("KVAF_SCATTER_JETTYS_PER_CORE", "8", 1);
+    assert(owner->Initialize(region).ok());
+    unsetenv("KVAF_SCATTER_JETTYS_PER_CORE");
+    assert(owner->Execute(exec).ok());
+    assert(launch_options.back() & kScatterConfiguredJettys);
+    assert(owner->Shutdown().ok());
+    assert(!allocations && !hccp_refs);
+  }
+  {
     auto owner = CreateSequentialBatchGet(config);
     fail_mailbox_import = true;
     assert(!owner->Initialize(region).ok());
@@ -442,6 +481,7 @@ int main() {
     assert(owner->Shutdown().ok());
     assert(!allocations && !hccp_refs && !mailbox_jetty);
     assert(owner->Initialize(region).ok());
+    assert(!opened_cpu_gather);
     kernel_result = KVAF_SEQ_CQ_ERROR;
     exec.execution.synchronize = true;
     assert(!owner->Execute(exec).ok());
@@ -455,7 +495,12 @@ int main() {
     kernel_result = 0;
   }
   {
+    setenv("KVAF_SCATTER_CPU_GATHER", "1", 1);
+    setenv("KVAF_SCATTER_JETTY_CURSORS", "1", 1);
     auto owner = CreateSequentialBatchGet(config); assert(owner->Initialize(region).ok());
+    assert(opened_cpu_gather);
+    unsetenv("KVAF_SCATTER_CPU_GATHER");
+    unsetenv("KVAF_SCATTER_JETTY_CURSORS");
     const auto before = launches;
     const auto memsets_before = async_memsets;
     exec.execution.synchronize = false;
@@ -464,7 +509,7 @@ int main() {
     exec.execution.synchronize = true;
     assert(owner->Execute(exec).ok()); assert(completed == before + 3);
     assert(async_memsets == memsets_before); // No extra device task per call.
-    assert(launch_options.back() == (kScatterOptionsV1 | kScatterPipeline));
+    assert(launch_options.back() == (kScatterOptionsV1 | kScatterPipeline | kScatterJettyCursors));
     capturing = true; assert(!owner->Execute(exec).ok()); capturing = false;
     count = 0; assert(owner->Execute(exec).ok()); count = 1;
     assert(owner->Shutdown().ok()); assert(owner->Shutdown().ok());

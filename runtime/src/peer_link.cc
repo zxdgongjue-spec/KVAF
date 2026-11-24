@@ -494,6 +494,28 @@ Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenCpuPushGetRequest request,
     return ToStatus("AIV CPU push setup failed", std::move(error));
   return Status::OK();
 }
+Status PeerLink::OpenAivCpuPushGet(uint64_t base, OpenAivCpuPushJettyRequest request,
+                                  OpenAivCpuPushJettyResponse* response, bool cpu_gather) const {
+  // Preserve the original V8 open path for the default, non-gather Scatter.
+  if (!cpu_gather && request.payload_jettys == cpu_push::kJettyCount)
+    return OpenAivCpuPushGet(base, request.base, &response->base);
+  const auto found = regions_.find(base);
+  if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");
+  const auto command = cpu_gather ? Command::kOpenAivCpuGatherPushGet : Command::kOpenCpuPushGet;
+  const bool extended = request.payload_jettys != cpu_push::kJettyCount;
+  const auto version = extended ? kAivCpuPushJettyProtocolVersion : kAivCpuPushProtocolVersion;
+  request.base.header = MakeHeader(command, extended ? sizeof(request) : sizeof(request.base), version);
+  request.base.session_id = found->second.session_id;
+  std::string error;
+  const bool exchanged = extended ? Exchange(address_, request, response, &error)
+                                  : Exchange(address_, request.base, &response->base, &error);
+  if (!exchanged || !IsValidResponseHeader(response->base.header, command,
+          extended ? sizeof(*response) : sizeof(response->base), version) ||
+      !ResultOk(static_cast<Result>(response->base.result), &error))
+    return ToStatus(cpu_gather ? "AIV CPU gather push setup failed" : "AIV CPU push setup failed",
+                    std::move(error));
+  return Status::OK();
+}
 Status PeerLink::StartAivCpuPushGet(uint64_t base) const {
   const auto found = regions_.find(base);
   if (found == regions_.end()) return Status::NotFound("peer DDR region was not found");

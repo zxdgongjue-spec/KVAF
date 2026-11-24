@@ -1,11 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
+#include "cpu_push_gather_executor.h"
 #include "cpu_push_get_layout.h"
 #include "cpu_urma_channel.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
@@ -13,13 +15,16 @@
 #include "status.h"
 
 namespace kvaf::cpu_push::aiv {
-// One service thread owns and submits the four prepared Jetty chains.
+// One service thread owns and submits the prepared Jetty chains.
 class Transport {
  public:
   ~Transport();
+  Status ConfigureGather(void* memory, std::uint64_t base, std::size_t threads,
+                         std::size_t min_bytes, bool affinity, peer::GatherWaitMode mode);
+  void BindWorker() const { if (gather_) gather_->BindWorker(0); }
   Status Initialize(urma_context_t*, urma_target_seg_t* source,
-                    const peer::OpenCpuPushGetRequest&, urma::GetTpList,
-                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushGetResponse*);
+                    const peer::OpenAivCpuPushJettyRequest&, urma::GetTpList,
+                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushJettyResponse*);
   Status ReadRequest(std::uint64_t* sequence);
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch(const std::atomic<bool>* stop = nullptr);
@@ -42,7 +47,7 @@ class Transport {
     cpu_runtime_detail::UrmaChannel channel;
     bool poisoned{};
   };
-  using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
+  using Tracker = cpu_urma_detail::AivIndexedAsyncWriteTracker;
   struct PreparedQueue {
     struct Source { std::uint32_t local, row, offset; };
     struct SourceRun { std::uint32_t local, row, count; };
@@ -60,32 +65,45 @@ class Transport {
     std::uint32_t first_row{UINT32_MAX};
   };
   struct PreparedWrite {
-    std::array<PreparedQueue, kJettyCount> queues;
-    std::array<Tracker::Fence, kJettyCount> fences;
+    std::array<PreparedQueue, kMaxJettyCount> queues;
+    std::array<Tracker::Fence, kMaxJettyCount> fences;
     std::size_t fence_count{};
     Tracker::Handle handle;
-    bool suffix{};
+    std::size_t ready_waves{};
+    bool suffix{}, gather_before_post{};
   };
+  Status EnsureGatherStaging(std::uint32_t count);
+  std::uint32_t FirstGatherChunkRows(std::uint32_t count) const;
+  Status GatherRows(std::uint32_t count, const peer::CpuPushGatherExecutor::WaveReady& on_wave = {},
+                    const peer::CpuPushGatherExecutor::FixedSuffix* suffix = nullptr,
+                    const peer::CpuPushGatherExecutor::ShardProgress& on_shards = {});
+  Status WriteSglBatch(const std::atomic<bool>* stop);
   Status PrepareWrites(std::uint32_t count);
   void PrepareCompletions();
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
+  Status TryBeginPrepared(PreparedWrite&, std::uint64_t id, bool* submitted);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id, Profile* drain_profile = nullptr,
                        bool drain_for_credits = false);
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false,
                       std::uint64_t* first_post_ns = nullptr);
-  Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
+  Status PollPrepared(std::uint64_t id, Profile* profile = nullptr, bool wait = true);
   Status DrainPrepared(Profile* profile = nullptr);
   Status WaitSuffix(const std::atomic<bool>* stop);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
-  std::array<Queue, kJettyCount> queues_;
+  std::array<Queue, kMaxJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
+  std::array<std::vector<std::size_t>, kMaxJettyCount> prepared_shards_;
+  std::vector<GatherWave> gather_waves_;
+  std::size_t gather_suffix_wave_{};
   PreparedWrite done_;
   PreparedWrite profiled_done_;
   Tracker tracker_{kJettyCount, 8192};
+  std::uint32_t jetty_count_{kJettyCount};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
+  bool gather_interleave_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
@@ -93,8 +111,14 @@ class Transport {
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
+  std::unique_ptr<peer::CpuPushGatherExecutor> gather_;
+  urma_target_seg_t* gather_segment_{};
+  urma_token_id_t* gather_token_{};
+  std::uint8_t* gather_staging_{};
+  std::uint64_t gather_staging_bytes_{}, source_bytes_{};
   std::uint64_t hbm_base_{}, session_{};
-  std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
+  std::uint32_t max_sge_{}, max_bytes_{}, max_gather_write_bytes_{}, workers_{}, token_bytes_{};
+  std::uint32_t token_value_{};
   std::uint32_t post_batch_wrs_{128};
   Layout layout_;
 };

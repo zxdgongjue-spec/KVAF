@@ -16,6 +16,8 @@ from scatter_perf_common import (HOST_TIMINGS, PAYLOAD_TIMINGS, RANDOM_SOURCE_CH
                                  fill_random_bytes, percentile, profile_metrics,
                                  request_values, sample_metrics, summarize)
 
+SCATTER_DEFAULT_JETTYS = 4
+SCATTER_MAX_JETTYS = 32
 
 # Stable compact layout, including for baseline-only or profiled-only runs.
 # Raw ns, worker cycles and less common diagnostics remain in the JSON report.
@@ -29,7 +31,40 @@ CSV_COLUMNS = (
     "aiv_scatter_tail_us", "aiv_ready_wait_us", "call_outside_aiv_us",
     "host_tensor_metadata_us", "host_launch_us", "host_status_copy_enqueue_us",
     "host_stream_sync_us", "host_python_dispatch_us",
+    "jetty_cursors",
+    "overlap_head_cq",
+    "jettys_per_core", "cpu_jettys",
+    "host_submit", "completion_scope",
+    "host_call_us", "stream_sync_us", "device_sync_us",
+    "calls_per_sample", "graph_total_us", "graph_payload_bytes", "graph_total_gbps",
+    "sequence_first", "last_call_cpu_comm_us", "last_call_cpu_write_us",
+    "last_call_aiv_wall_us", "last_call_aiv_scatter_us",
 )
+
+
+def resolve_scatter_options(parser, args):
+    if args.jettys_per_core is None:
+        per_core = os.environ.get("KVAF_SCATTER_JETTYS_PER_CORE")
+        if per_core is not None:
+            if per_core not in tuple(map(str, range(1, SCATTER_MAX_JETTYS + 1))):
+                parser.error(f"KVAF_SCATTER_JETTYS_PER_CORE must be in 1..{SCATTER_MAX_JETTYS}")
+            args.jettys_per_core = int(per_core)
+    if args.jetty_cursors is None:
+        value = os.environ.get("KVAF_SCATTER_JETTY_CURSORS", "0")
+        if value not in ("0", "1"):
+            parser.error("KVAF_SCATTER_JETTY_CURSORS must be 0 or 1")
+        args.jetty_cursors = int(value)
+    if args.jetty_cursors and not args.pipeline:
+        parser.error("--jetty-cursors 1 requires --pipeline 1")
+    if args.overlap_head_cq is None:
+        overlap = os.environ.get("KVAF_SCATTER_OVERLAP_HEAD_CQ", "0")
+        if overlap not in ("0", "1"):
+            parser.error("KVAF_SCATTER_OVERLAP_HEAD_CQ must be 0 or 1")
+        args.overlap_head_cq = int(overlap)
+
+
+def scatter_payload_jettys(args):
+    return args.cores * args.jettys_per_core if args.jettys_per_core else SCATTER_DEFAULT_JETTYS
 
 
 def arguments(argv=None):
@@ -43,8 +78,14 @@ def arguments(argv=None):
                         help="percentage of workload tokens; use instead of --miss-count")
     parser.add_argument("--token-bytes", type=int, default=656)
     parser.add_argument("--cores", type=int, default=1)
+    parser.add_argument("--jettys-per-core", type=int, choices=range(1, SCATTER_MAX_JETTYS + 1),
+                        help="size the shared CPU payload pool as cores times Jettys (default: 4 total)")
     parser.add_argument("--pipeline", type=int, choices=(0, 1),
                         help="overlap CPU WRITE and AIV scatter with chunk Ready (default: 1)")
+    parser.add_argument("--jetty-cursors", type=int, choices=(0, 1),
+                        help="consume ready shards independently per Jetty (default: 0)")
+    parser.add_argument("--overlap-head-cq", type=int, choices=(0, 1),
+                        help="build the suffix while the head control WRITE is in flight (default: 0)")
     parser.add_argument("--blocks", type=int, default=1024)
     parser.add_argument("--tokens-per-block", type=int, default=4)
     parser.add_argument("--plans", type=int, default=2)
@@ -73,10 +114,13 @@ def arguments(argv=None):
         if value not in ("0", "1"):
             parser.error("KVAF_SCATTER_PIPELINE must be 0 or 1")
         args.pipeline = int(value)
+    resolve_scatter_options(parser, args)
     for field, lo, hi in (("token_bytes", 1, 65535), ("cores", 1, 8),
                           ("blocks", 1, 65536), ("tokens_per_block", 1, 65536), ("plans", 1, 64)):
         if not lo <= getattr(args, field) <= hi:
             parser.error(f"{field} must be in [{lo}, {hi}]")
+    if scatter_payload_jettys(args) > SCATTER_MAX_JETTYS:
+        parser.error(f"cores times jettys-per-core must be at most {SCATTER_MAX_JETTYS}")
     if not 1 <= args.active_percent <= 100:
         parser.error("active-percent must be in [1, 100] for a nonempty performance call")
     if args.miss_count is not None and args.active_percent != 100:
@@ -173,13 +217,19 @@ def write_results(args, report):
         with args.csv.open("w", newline="", encoding="utf-8") as output:
             writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
             writer.writeheader()
+            config = report["config"]
+            submission = {key: config.get(key, "") for key in ("host_submit", "completion_scope")}
             for phase, samples in report["samples"].items():
                 for sample in samples:
-                    values = dict(phase=phase, cores=args.cores,
+                    values = dict(phase=phase, cores=args.cores, jetty_cursors=args.jetty_cursors,
+                                  overlap_head_cq=args.overlap_head_cq,
+                                  jettys_per_core=args.jettys_per_core or "",
+                                  cpu_jettys=scatter_payload_jettys(args),
                                   request_length=args.request_length,
                                   miss_count=args.miss_count, token_bytes=args.token_bytes,
-                                  **sample_metrics(sample))
+                                  **submission, **sample_metrics(sample))
                     values.setdefault("pipeline", args.pipeline)
+                    values.setdefault("calls_per_sample", config.get("calls_per_sample", 1))
                     row = {}
                     for key in CSV_COLUMNS:
                         value = values.get(key, "")
@@ -218,8 +268,10 @@ def main(argv=None):
                   scatter_max_stages=3, scatter_max_tile_rows=32, scatter_ub_bytes=65536,
                   scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar")
     config.update(device_id=device_id, mode="cpu_push_scatter",
+                  cpu_jettys=scatter_payload_jettys(args),
                   pipeline_chunk_rows=SCATTER_CHUNK_ROWS,
-                  pipeline_consumer=("jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
+                  pipeline_consumer=("independent_jetty_cursors" if args.jetty_cursors else
+                                     "jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
                   units="decimal GB/s; sample durations ns/us; summary durations ms",
                   cpu_service=os.environ.get("KVAF_CPU_SERVICE_ADDR"),
                   npu_eids=os.environ.get("KVAF_NPU_EIDS"),
@@ -271,6 +323,10 @@ def main(argv=None):
         # CLI overrides the environment. Host snapshots these during initialize;
         # baseline/profiled phases then use the same algorithms and binary.
         os.environ["KVAF_SCATTER_PIPELINE"] = str(args.pipeline)
+        os.environ["KVAF_SCATTER_JETTY_CURSORS"] = str(args.jetty_cursors)
+        os.environ["KVAF_SCATTER_OVERLAP_HEAD_CQ"] = str(args.overlap_head_cq)
+        if args.jettys_per_core is not None:
+            os.environ["KVAF_SCATTER_JETTYS_PER_CORE"] = str(args.jettys_per_core)
         os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
         begin = time.perf_counter_ns()
         runtime.initialize((args.blocks * 2 + 1) * block_bytes, block_bytes)
@@ -350,7 +406,7 @@ def main(argv=None):
                 records = [dict(r) for r in runtime.scatter_profile()]
                 if args.host_profile and "host_profile" not in records[0]:
                     raise RuntimeError("rebuild Python binding, Runtime and Host for --host-profile")
-                return dict(workers=records, sequence=records[0]["sequence"],
+                return dict(workers=records,
                             **profile_metrics(records, args.cores, args.miss_count,
                                                               args.token_bytes, args.aiv_clock_mhz))
             samples, wall_ns = measure_pass(call, iterations, payload, snapshot if profiling else None,

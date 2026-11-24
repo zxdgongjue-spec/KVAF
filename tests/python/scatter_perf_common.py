@@ -171,6 +171,7 @@ def profile_metrics(records, cores, requests, token_bytes, clock_mhz):
     result = {key: cpu[key] for key in ("cpu_header_ns", "cpu_descriptor_ns", "cpu_write_ns",
                                        "cpu_comm_ns", "cpu_post_ns", "cpu_cq_wait_ns")}
     result.update(
+        sequence=sequence,
         pipeline=pipeline,
         aiv_body_ns=max(r["finish_cycle"] - r["start_cycle"] for r in records) * ns_per_cycle,
         aiv_input_ns=max(r["inputs_ready_cycle"] - r["start_cycle"] for r in records) * ns_per_cycle,

@@ -20,7 +20,13 @@ void Exchange(kvaf::CpuRuntime& runtime, kvaf::peer::Command command,
   int sockets[2];
   CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
   Request request{};
-  request.header = kvaf::peer::MakeHeader(command, sizeof(request), version);
+  const auto header = kvaf::peer::MakeHeader(command, sizeof(request), version);
+  if constexpr (std::is_same_v<Request, kvaf::peer::OpenAivCpuPushJettyRequest>) {
+    request.base.header = header;
+    request.payload_jettys = 32;
+  } else {
+    request.header = header;
+  }
   if constexpr (std::is_same_v<Request, kvaf::peer::AllocateUbmemRegionRequest>) {
     request.ddr_bytes = 4096;
     request.slot_size = 64;
@@ -30,10 +36,14 @@ void Exchange(kvaf::CpuRuntime& runtime, kvaf::peer::Command command,
   CHECK(served.ok() != (std::is_same_v<Request, kvaf::peer::AllocateUbmemRegionRequest>));
   Response response{};
   CHECK(recv(sockets[0], &response, sizeof(response), MSG_WAITALL) == sizeof(response));
-  CHECK(response.header.command == kvaf::peer::ResponseCommand(command));
-  CHECK(response.header.version == version);
-  CHECK(response.header.bytes == sizeof(response));
-  CHECK(response.result == static_cast<int>(expected));
+  const auto& prefix = [&]() -> const auto& {
+    if constexpr (std::is_same_v<Response, kvaf::peer::OpenAivCpuPushJettyResponse>) return response.base;
+    else return response;
+  }();
+  CHECK(prefix.header.command == kvaf::peer::ResponseCommand(command));
+  CHECK(prefix.header.version == version);
+  CHECK(prefix.header.bytes == sizeof(response));
+  CHECK(prefix.result == static_cast<int>(expected));
   close(sockets[0]);
   close(sockets[1]);
 }
@@ -56,6 +66,12 @@ int main() {
       runtime, Command::kOpenCpuPushGet, Result::kResourceError);
   Exchange<OpenCpuPushGetRequest, OpenAivCpuPushGetResponse>(
       runtime, Command::kOpenCpuPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
+  Exchange<OpenCpuPushGetRequest, OpenAivCpuPushGetResponse>(
+      runtime, Command::kOpenAivCpuGatherPushGet, Result::kResourceError, kAivCpuPushProtocolVersion);
+  for (const auto command : {Command::kOpenCpuPushGet, Command::kOpenAivCpuGatherPushGet})
+    Exchange<OpenAivCpuPushJettyRequest, OpenAivCpuPushJettyResponse>(
+        runtime, command, Result::kResourceError, kAivCpuPushJettyProtocolVersion);
+  CHECK(!IsSupportedProtocolVersion(Command::kOpenAivCpuGatherPushGet, kProtocolVersion));
   Exchange<EnableDirectGatherRequest, StatusResponse>(
       runtime, Command::kEnableDirectGather, Result::kResourceError);
   Exchange<EnableGatherLanesRequest, StatusResponse>(

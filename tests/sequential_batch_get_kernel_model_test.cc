@@ -1,14 +1,18 @@
 // Executes the production .asc against decoded SQ/CQ and a real CPU gather executor.
 // DMA cache visibility and CANN code generation still require hardware tests.
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <malloc.h>
@@ -17,6 +21,8 @@
 #include "cpu_gather_executor.h"
 #include "cpu_push_get_abi.h"
 #include "cpu_push_get_layout.h"
+#include "cpu_push_gather_schedule.h"
+#include "cpu_push_gather_executor.h"
 #include "sequential_batch_get_abi.h"
 // The CPU model exercises the kernel body, without Ascend ELF section placement.
 #define __attribute__(...)
@@ -60,11 +66,13 @@ struct ModelArgs {
   uint32_t prepare_ahead{}, cooperative_chunks{}, first_chunk_divisor{};
   uint32_t head_start{};
 };
+KvafScatterBatchGetArgs ScatterLaunchArgs(const ModelArgs& a) {
+  return {a.request, a.workspace, a.workspace_bytes, a.descriptor_offset,
+          a.staging_offset, a.source_base, a.source_bytes, a.sequence, a.max_polls, a.reserved};
+}
 void Launch(const ModelArgs& a) {
   if (a.mode == KVAF_SEQ_SCATTER) {
-    KvafScatterBatchGetAivKernelV1({a.request, a.workspace, a.workspace_bytes,
-      a.descriptor_offset, a.staging_offset, a.source_base, a.source_bytes,
-      a.sequence, a.max_polls, a.reserved});
+    KvafScatterBatchGetAivKernelV1(ScatterLaunchArgs(a));
   } else {
     KvafGatherBatchGetAivKernelV10({a.request, a.workspace, a.workspace_bytes,
       a.workspace_entity, a.descriptor_offset, a.lane_descriptor_bytes,
@@ -146,13 +154,17 @@ struct Fixture {
   std::vector<bool> cpu_done;
   bool push_done{}, timeout{}, remote_error{}, cq_error{}, data_cq_error{}, future_done{};
   bool hold_done_until_scatter{}, copied_before_done{};
+  bool jetty_lookahead{}, copied_across_chunk{};
   struct PushPart { uint32_t worker, chunk; kvaf::cpu_push::Range range; };
   std::vector<PushPart> push_parts;
   struct HeadPart { uint32_t worker, chunk, queue; kvaf::cpu_push::Range range; bool suffix, ready; };
   std::vector<HeadPart> head_parts;
   bool head_started_early{};
+  bool check_head_cq_overlap{}, saw_head_cq{}, built_suffix_before_head_cq{};
   std::vector<bool> payload_read;
   uint32_t push_step{}, read_rows{};
+  uint32_t payload_jettys{kvaf::cpu_push::kJettyCount};
+  uint32_t lookahead_polls{};
   uint32_t push_polls{}, push_requests{}, data_reads{}, max_sges{}, completions{};
   std::mutex poll_mutex;
   bool data_timeout{};
@@ -166,13 +178,14 @@ struct Fixture {
   bool hold_data_cq_for_ack{}, delay_progress_cq{}, ack_with_data_inflight{}, prefetched_during_vf{};
   bool delay_first_control_cq{};
 
-  Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl)
+  Fixture(uint32_t n, uint32_t bytes, uint32_t cores, uint32_t mode, uint32_t sgl,
+          uint32_t jettys = kvaf::cpu_push::kJettyCount)
       : count(n), token(bytes), workers(cores), active(n), valid(n, 1), addresses(n),
         indices(n), offsets(n), rows(n), status(cores), profiles(cores), states(cores * 2),
         control_entities(cores * 2), data_entities(cores * 2), notified(cores),
         read_vf_begin(cores), read_overlap_begin(cores),
         scratch_cache_lines(cores), ack_reads(cores), ready_reads(cores),
-        first_read_ready(cores), cpu_done(cores) {
+        first_read_ready(cores), cpu_done(cores), payload_jettys(jettys) {
     fixture = this;
     aiv_model::payload_observer = [](const void* p, uint64_t bytes) { fixture->PayloadRead(p, bytes); };
     payload_read.resize(n);
@@ -207,7 +220,8 @@ struct Fixture {
     args.remote_staging = Address(remote.data()) + staging_offset;
     args.remote_descriptor = Address(remote.data()) + descriptor_offset;
     args.remote_control = Address(remote.data()) + control_offset;
-    args.descriptor_offset = mode == KVAF_SEQ_SCATTER ? 192 + cores * 64 : cores * kvaf::kGatherScratchBytes;
+    args.descriptor_offset = mode == KVAF_SEQ_SCATTER
+        ? 192 + cores * kvaf::cpu_push::ReadyStride(jettys) : cores * kvaf::kGatherScratchBytes;
     args.staging_offset = Align(args.descriptor_offset + n * 8ULL);
     args.workspace_bytes = mode == KVAF_SEQ_SCATTER ?
         Align(args.staging_offset + n * uint64_t(bytes)) + sizeof(mailbox) + uint64_t(cores + 1) * 64 :
@@ -239,6 +253,9 @@ struct Fixture {
       r.channel_entity = Address(&mailbox);
       r.queue_state = Address(&mailbox.queue);
     }
+  }
+  uint64_t ReadyWord(uint32_t worker, uint32_t queue) const {
+    return args.workspace + 192 + worker * kvaf::cpu_push::ReadyStride(payload_jettys) + queue * 8;
   }
   void CheckGuard() { assert(std::all_of(output.begin(), output.end(), [](uint8_t b) { return b == 0xad; })); }
   void ConsecutiveReadRows(bool segmented) {
@@ -315,14 +332,20 @@ struct Fixture {
         assert(aiv_model::AtomicLoadWord(base + core * 64) == args.sequence);
     }
     const auto* src = reinterpret_cast<const uint64_t*>(mailbox_memory.data() + args.descriptor_offset);
+    if (check_head_cq_overlap && control_cq && head && !saw_head_cq) {
+      const auto row = uint32_t(request->reserved_words[0]);
+      const auto* local = reinterpret_cast<const uint64_t*>(workspace.data() + args.descriptor_offset);
+      saw_head_cq = true;
+      built_suffix_before_head_cq = local[row] == addresses[indices[row]] + offsets[row];
+    }
     if (head) {
       const auto cut = uint32_t(request->reserved_words[0]);
       if (head_parts.empty()) {
         for (uint32_t phase = 0; phase < 2; ++phase)
           kvaf::cpu_push::ForEachPipelineChunk(active, token, workers,
             [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
-              for (uint32_t q = 0; q < 4; ++q) {
-                const auto shard = kvaf::cpu_push::JettyRange(range, q);
+              for (uint32_t q = 0; q < payload_jettys; ++q) {
+                const auto shard = kvaf::cpu_push::JettyRange(range, q, payload_jettys);
                 const auto first = std::max(shard.begin, phase ? cut : 0U);
                 const auto last = std::min(shard.end, phase ? uint32_t(active) : cut);
                 if (first < last) head_parts.push_back({worker, chunk, q, {first, last},
@@ -341,7 +364,7 @@ struct Fixture {
           std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
                       reinterpret_cast<void*>(src[row]), token);
         if (pipeline && part.ready) aiv_model::AtomicStoreWord(
-            args.workspace + 192 + part.worker * 64 + part.queue * 8,
+            ReadyWord(part.worker, part.queue),
             kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
         ++push_step;
         return;
@@ -353,15 +376,26 @@ struct Fixture {
           [&](uint32_t worker, uint32_t chunk, kvaf::cpu_push::Range range) {
             push_parts.push_back({worker, chunk, range});
           });
-      if (push_step < push_parts.size() * kvaf::cpu_push::kJettyCount) {
-        const auto& part = push_parts[push_step / kvaf::cpu_push::kJettyCount];
-        const auto q = push_step % kvaf::cpu_push::kJettyCount;
-        const auto shard = kvaf::cpu_push::JettyRange(part.range, q);
+      if (push_step < push_parts.size() * payload_jettys) {
+        const auto jetty_count = payload_jettys;
+        auto step = push_step;
+        if (jetty_lookahead && step == jetty_count - 1) {
+          // Jetty 0 delivers chunk 1 before Jetty 3 delivers chunk 0.
+          step = jetty_count;
+        } else if (jetty_lookahead && step == jetty_count) {
+          copied_across_chunk = payload_read[kvaf::cpu_push::kChunkRows];
+          if (!copied_across_chunk && ++lookahead_polls < 8) return;
+          step = jetty_count - 1;
+        }
+        const auto& part = push_parts[step / jetty_count];
+        const auto q = step % jetty_count;
+        const auto shard = kvaf::cpu_push::JettyRange(part.range, q, jetty_count);
         for (auto row = shard.begin; row < shard.end; ++row)
           std::memcpy(workspace.data() + args.staging_offset + uint64_t(row) * token,
                       reinterpret_cast<void*>(src[row]), token);
-        aiv_model::AtomicStoreWord(args.workspace + 192 + part.worker * 64 + q * 8,
-                                   kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
+        if (shard.begin < shard.end)
+          aiv_model::AtomicStoreWord(ReadyWord(part.worker, q),
+                                     kvaf::cpu_push::Progress(args.sequence, part.chunk + 1));
         ++push_step;
         return; // Delay other queues/chunks and final done until later polls.
       }
@@ -388,13 +422,14 @@ struct Fixture {
         if (i < range.begin || i >= range.end) continue;
         const auto chunk = (i - range.begin) / kvaf::cpu_push::kChunkRows + 1;
         const auto part = kvaf::cpu_push::ChunkRange(range, chunk - 1);
-        for (uint32_t q = 0; q < kvaf::cpu_push::kJettyCount; ++q) {
-          const auto progress = aiv_model::AtomicLoadWord(args.workspace + 192 + worker * 64 + q * 8);
+        for (uint32_t q = 0; q < payload_jettys; ++q) {
+          const auto progress = aiv_model::AtomicLoadWord(ReadyWord(worker, q));
           const bool ready = progress >> 32 == args.sequence && uint32_t(progress) >= chunk;
-          const auto shard = kvaf::cpu_push::JettyRange(part, q);
+          const auto shard = kvaf::cpu_push::JettyRange(part, q, payload_jettys);
           if (i >= shard.begin && i < shard.end) assert(ready);
         }
       }
+      if (jetty_lookahead) assert(!payload_read[i]);
       if (!payload_read[i]) { payload_read[i] = true; ++read_rows; }
     }
     copied_before_done |= !push_done;
@@ -489,7 +524,7 @@ struct Fixture {
       }
       if (p != &m.db) continue;
       const bool scatter = args.mode == KVAF_SEQ_SCATTER;
-      if (scatter) assert(q == 0 && aiv_model::mte3.empty());
+      if (scatter) assert(q == 0 && aiv_model::mte3.empty() && m.cq_pi == m.cq_db);
       const uint32_t worker = q / 2;
       const uint32_t depth = m.sq.size() / 16;
       // Already published headers/data must never be patched or overwritten
@@ -831,7 +866,9 @@ struct Fixture {
     std::fill(first_read_ready.begin(), first_read_ready.end(), 0);
     push_done = false; push_polls = 0;
     push_parts.clear(); head_parts.clear(); push_step = read_rows = 0; copied_before_done = false;
+    lookahead_polls = 0; copied_across_chunk = false;
     head_started_early = false;
+    saw_head_cq = built_suffix_before_head_cq = false;
     std::fill(payload_read.begin(), payload_read.end(), false);
     // Keep old notify/done/ACK and persistent PI/CI to exercise sequence isolation.
     for (uint64_t i = 0; i < args.source_bytes; ++i) remote[i] ^= 0x35;
@@ -854,6 +891,192 @@ void Poll(void* p) {
 void Doorbell(uint32_t value, uint32_t* p) { fixture->Doorbell(value, p); }
 }
 int main() {
+  {
+    using namespace kvaf::cpu_push;
+    const auto waves = InterleavedGatherWaves(8192, 656, 4, 1024);
+    assert(!waves.empty());
+    // Each Jetty starts with a shard from a different AIV core.
+    const std::array<uint32_t, 4> first{1024, 2304, 4608, 6912};
+    for (std::size_t q = 0; q < first.size(); ++q) {
+      assert(waves.front()[q].begin == first[q]);
+      assert(waves.front()[q].end == first[q] + 256);
+    }
+    std::vector<bool> covered(8192, false);
+    std::fill_n(covered.begin(), 1024, true);
+    std::array<std::array<uint32_t, kJettyCount>, 4> next_chunk{};
+    next_chunk[0].fill(1);  // Lane 0's first chunk was sent in the head.
+    for (const auto& wave : waves) {
+      for (std::size_t q = 0; q < wave.size(); ++q) {
+        const auto rows = wave[q];
+        if (rows.begin == rows.end) continue;
+        const auto lane = rows.begin / 2048U;
+        const auto chunk = ChunkRange(WorkerRange(8192, 656, lane, 4), next_chunk[lane][q]++);
+        const auto shard = JettyRange(chunk, q);
+        assert(rows.begin == shard.begin && rows.end == shard.end);
+        for (auto row = rows.begin; row < rows.end; ++row) {
+          assert(!covered[row]);
+          covered[row] = true;
+        }
+      }
+    }
+    assert(std::all_of(covered.begin(), covered.end(), [](bool seen) { return seen; }));
+    assert(InterleavedGatherWaves(8200, 656, 4, 1024).empty());
+  }
+  {
+    // Scatter gathers packed rows into a separate MR. In a short batch,
+    // cache-line rounding must leave the bytes past its tail untouched.
+    alignas(64) uint8_t staging[256];
+    uint8_t source[16];
+    for (uint32_t i = 0; i < sizeof(source); ++i) source[i] = i;
+    std::memset(staging, 0xad, sizeof(staging));
+    uint64_t addresses[] = {Address(source + 3), Address(source + 6), Address(source + 3)};
+    kvaf::peer::CpuPushGatherExecutor executor(source, Address(source), 4, 1,
+                                           kvaf::peer::GatherWaitMode::kActive);
+    assert(executor.PrepareFixed(staging, addresses, 3, 3, sizeof(source)) == 4);
+    executor.Copy();
+    const uint8_t expected[] = {3, 4, 5, 6, 7, 8, 3, 4, 5};
+    assert(!std::memcmp(staging, expected, sizeof(expected)));
+    assert(std::all_of(staging + sizeof(expected), staging + sizeof(staging),
+                       [](uint8_t byte) { return byte == 0xad; }));
+
+    // Reuse the pool with fewer participants, then include all helpers again.
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(executor.PrepareFixed(staging, addresses, 1, 2, sizeof(source)) == 2);
+    executor.Copy();
+    assert(!std::memcmp(staging, source + 3, 2));
+    assert(staging[2] == 0xad);
+
+    // Place the invalid source in a helper's cache-line slice.
+    uint64_t repeated[13];
+    std::fill_n(repeated, 13, Address(source));
+    repeated[4] = Address(source + 1);
+    assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source)) == 4);
+    try {
+      executor.Copy();
+      assert(false && "invalid fixed source was accepted");
+    } catch (const std::invalid_argument&) {
+      assert(std::all_of(staging + 64, staging + sizeof(staging),
+                         [](uint8_t byte) { return byte == 0xad; }));
+    }
+    repeated[4] = Address(source);
+    assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source)) == 4);
+    executor.Copy();
+    for (uint32_t i = 0; i < 8; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+
+    // A prefix callback may submit DMA while helpers are copying the tail.
+    std::memset(staging, 0xad, sizeof(staging));
+    using kvaf::cpu_push::GatherWave;
+    using kvaf::cpu_push::Range;
+    const std::vector<GatherWave> waves{
+        GatherWave{Range{0, 4}}, GatherWave{Range{4, 8}},
+        GatherWave{Range{12, 13}, Range{8, 12}}};
+    std::vector<std::size_t> ready;
+    alignas(8) uint64_t suffix_sequence = 0;
+    const kvaf::peer::CpuPushGatherExecutor::FixedSuffix suffix{
+        &suffix_sequence, 1, nullptr, std::chrono::seconds(1), 2};
+    std::fill(repeated + 8, repeated + 13, Address(source + 1));
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), waves,
+                                 &suffix) == 4);
+    executor.Copy([&](std::size_t completed) {
+      ready.push_back(completed);
+      const auto rows = completed == 3U ? 13U : completed * 4U;
+      for (uint32_t i = 0; i < rows; ++i)
+        assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+      if (completed == 2U) {
+        // No worker may consume these descriptors until their sequence is visible.
+        std::fill(repeated + 8, repeated + 13, Address(source));
+        __atomic_store_n(&suffix_sequence, suffix.sequence, __ATOMIC_RELEASE);
+      }
+      return true;
+    });
+    assert((ready == std::vector<std::size_t>{1, 2, 3}));
+    assert(std::all_of(staging + 13 * sizeof(source), staging + sizeof(staging),
+                       [](uint8_t byte) { return byte == 0xad; }));
+
+    // The coordinator can publish one shard from a wave before another
+    // shard from that same wave is copied. With one worker this is deterministic.
+    kvaf::peer::CpuPushGatherExecutor shard_executor(source, Address(source), 1, 1);
+    const std::vector<GatherWave> one_wave{GatherWave{Range{4, 8}, Range{0, 4}}};
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(shard_executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source),
+                                       one_wave, nullptr, 0) == 1);
+    bool first_shard_seen = false;
+    shard_executor.Copy({}, [&] {
+      if (!first_shard_seen && shard_executor.ShardReady(0, 0)) {
+        assert(!shard_executor.ShardReady(0, 1));
+        assert(staging[0] == 0xad);
+        assert(!std::memcmp(staging + 4 * sizeof(source), source, sizeof(source)));
+        first_shard_seen = true;
+      }
+      return true;
+    });
+    assert(first_shard_seen && shard_executor.ShardReady(0, 1));
+
+    // Fixed Jetty groups must handle an empty shard and a short last slice.
+    using kvaf::cpu_push::kJettyCount;
+    const std::vector<GatherWave> jetty_waves{
+        GatherWave{Range{0, 4}, Range{4, 8}},
+        GatherWave{Range{8, 12}, Range{}, Range{12, 13}}};
+    kvaf::peer::CpuPushGatherExecutor jetty_executor(source, Address(source), 9, 1);
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(jetty_executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
+                                      jetty_waves, nullptr, 0, true) == 9);
+    assert(jetty_executor.UsesJettySupply());
+    jetty_executor.Copy({}, [] { return true; });
+    for (std::size_t w = 0; w < jetty_waves.size(); ++w)
+      for (std::size_t q = 0; q < kJettyCount; ++q)
+        assert(jetty_executor.ShardReady(w, q) == (jetty_waves[w][q].begin < jetty_waves[w][q].end));
+    for (uint32_t i = 0; i < 13; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+    assert(staging[13 * sizeof(source)] == 0xad);
+
+    kvaf::peer::CpuPushGatherExecutor small_pool(source, Address(source), 3, 1);
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(small_pool.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
+                                   jetty_waves, nullptr, 0, true) == 3);
+    assert(!small_pool.UsesJettySupply());
+    small_pool.Copy({}, [] { return true; });
+    for (uint32_t i = 0; i < 13; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+    assert(staging[13 * sizeof(source)] == 0xad);
+
+    // Reuse the pool with a wider schedule and exercise the last progress
+    // word in more than one wave.
+    auto wide_waves = jetty_waves;
+    const auto jettys = kvaf::cpu_push::kMaxJettyCount;
+    wide_waves[0].back() = std::exchange(wide_waves[0][1], Range{});
+    wide_waves[1].back() = std::exchange(wide_waves[1][2], Range{});
+    std::memset(staging, 0xad, sizeof(staging));
+    assert(small_pool.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source),
+                                   wide_waves, nullptr, 0, true, jettys) == 3);
+    small_pool.Copy({}, [] { return true; });
+    assert(small_pool.ShardReady(0, jettys - 1) && small_pool.ShardReady(1, jettys - 1));
+    for (uint32_t i = 0; i < 13; ++i)
+      assert(!std::memcmp(staging + i * sizeof(source), source, sizeof(source)));
+
+    // In multi-worker mode an invalid contributor must keep its shard from
+    // being submitted even after all the other contributors complete.
+    repeated[4] = Address(source + 1);
+    assert(executor.PrepareFixed(staging, repeated, 8, sizeof(source), sizeof(source),
+                                 one_wave, nullptr, 0) == 4);
+    try {
+      executor.Copy({}, [&] { assert(!executor.ShardReady(0, 0)); return true; });
+      assert(false && "invalid gather shard was accepted");
+    } catch (const std::invalid_argument&) {
+      assert(!executor.ShardReady(0, 0));
+    }
+    repeated[4] = Address(source);
+
+    repeated[12] = Address(source + 1);
+    const std::vector<GatherWave> contiguous{GatherWave{Range{0, 8}}, GatherWave{Range{8, 13}}};
+    assert(executor.PrepareFixed(staging, repeated, 13, sizeof(source), sizeof(source), contiguous) == 4);
+    try {
+      executor.Copy([](std::size_t completed) { assert(completed == 1U); return true; });
+      assert(false && "invalid fixed chunk was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+  }
   const auto& metadata = KvafGatherBatchGetAivKernelV10_kernel_type_section.value;
   assert(metadata.type == F_TYPE_KTYPE && metadata.bytes == sizeof(unsigned int) && metadata.kind == K_TYPE_AIV);
   // Stage 1: WQEs precede the final ACK, but no payload READ does. Stage 2's
@@ -1465,7 +1688,8 @@ int main() {
       assert(gather.completions && gather.data_reads);
     }
   // Exercise the benchmark's Scatter path with and without payload overlap.
-  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline}) {
+  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline,
+                            kvaf::kScatterPipeline | kvaf::kScatterJettyCursors}) {
     Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6);
     scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs | pipeline;
     scatter.args.max_polls = 1000000;
@@ -1476,6 +1700,50 @@ int main() {
       assert(scatter.head_started_early == (count > kvaf::cpu_push::kChunkRows));
       if (pipeline && count)
         assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == count);
+    }
+  }
+  for (uint32_t cursors : {0U, kvaf::kScatterJettyCursors}) {
+    // Three chunks with a one-row tail. Keep the full mailbox path so the
+    // producer can deliberately deliver a later chunk ahead of a lagging Jetty.
+    Fixture scatter(2 * kvaf::cpu_push::kChunkRows + 1, 656, 1, KVAF_SEQ_SCATTER, 6);
+    scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterPipeline | cursors;
+    scatter.args.max_polls = 1000;
+    scatter.jetty_lookahead = scatter.hold_done_until_scatter = true;
+    scatter.Run();
+    assert(scatter.copied_across_chunk == (cursors != 0));
+    assert(scatter.copied_before_done && scatter.push_done && scatter.read_rows == scatter.count);
+  }
+  for (uint32_t pipeline : {0U, kvaf::kScatterPipeline,
+                            kvaf::kScatterPipeline | kvaf::kScatterJettyCursors}) {
+    Fixture scatter(8193, 656, 4, KVAF_SEQ_SCATTER, 6, 32);
+    scatter.args.request.jettys_per_core = 8;
+    scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs |
+        kvaf::kScatterConfiguredJettys | pipeline;
+    assert(kvaf::ScatterPayloadJettys(ScatterLaunchArgs(scatter.args)) == scatter.payload_jettys);
+    scatter.args.max_polls = 1000000;
+    scatter.hold_done_until_scatter = pipeline != 0;
+    for (uint32_t count : {7U, 8193U, 8193U}) {
+      scatter.Next(count);
+      scatter.Run();
+      assert(scatter.push_done);
+      if (pipeline) assert(scatter.copied_before_done && scatter.read_rows == count);
+    }
+  }
+  for (uint32_t overlap : {0U, kvaf::kScatterOverlapHeadCq}) {
+    for (bool head_cq_error : {false, true}) {
+      Fixture scatter(kvaf::cpu_push::kChunkRows + 1, 656, 1, KVAF_SEQ_SCATTER, 6);
+      scatter.args.reserved = kvaf::kScatterOptionsV1 | kvaf::kScatterTrustedInputs |
+          kvaf::kScatterPipeline | kvaf::kScatterJettyCursors | overlap;
+      scatter.args.max_polls = 1000;
+      scatter.check_head_cq_overlap = true;
+      scatter.cq_error = head_cq_error;
+      scatter.Run(!head_cq_error);
+      assert(scatter.saw_head_cq && scatter.built_suffix_before_head_cq == (overlap != 0));
+      assert(scatter.mailbox.queue.poisoned == uint64_t(head_cq_error));
+      assert(scatter.mailbox.queue.cq_consumer_index == (head_cq_error ? 1U : 2U));
+      assert(scatter.mailbox.queue.completed_batch_count == (head_cq_error ? 0U : 2U));
+      const auto suffix = Address(scatter.mailbox_memory.data()) + kvaf::cpu_push::kSuffixNotifyOffset;
+      assert(aiv_model::AtomicLoadWord(suffix) == (head_cq_error ? 0 : scatter.args.sequence));
     }
   }
   {

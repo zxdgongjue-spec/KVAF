@@ -22,6 +22,7 @@ Status Worker::Stop() {
   return transport_ ? transport_->Shutdown() : Status::OK();
 }
 void Worker::Run() {
+  transport_->BindWorker();
   std::uint64_t last = 0;
   const auto report = [&](const char* phase, const Status& status) {
     std::fprintf(stderr,

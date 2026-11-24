@@ -17,12 +17,7 @@ bool Read(int fd, void* data, std::size_t bytes) {
   return true;
 }
 template <class Response>
-Status Reply(int fd, peer::Command command, peer::Result result,
-             uint16_t version = peer::kProtocolVersion) {
-  Response response{};
-  response.header = peer::MakeHeader(command, sizeof(response), version);
-  response.header.command = peer::ResponseCommand(command);
-  response.result = static_cast<int>(result);
+Status WriteReply(int fd, const Response& response) {
   const auto* data = reinterpret_cast<const char*>(&response);
   std::size_t left = sizeof(response);
   while (left) {
@@ -32,6 +27,15 @@ Status Reply(int fd, peer::Command command, peer::Result result,
     data += n; left -= n;
   }
   return Status::OK();
+}
+template <class Response>
+Status Reply(int fd, peer::Command command, peer::Result result,
+             uint16_t version = peer::kProtocolVersion) {
+  Response response{};
+  response.header = peer::MakeHeader(command, sizeof(response), version);
+  response.header.command = peer::ResponseCommand(command);
+  response.result = static_cast<int>(result);
+  return WriteReply(fd, response);
 }
 }  // namespace
 
@@ -108,6 +112,14 @@ Status CpuRuntime::ServeConnection(int fd) {
     case peer::Command::kCreateChannel:
       return Reply<peer::CreateChannelResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kOpenCpuPushGet:
+    case peer::Command::kOpenAivCpuGatherPushGet:
+      if (header.version == peer::kAivCpuPushJettyProtocolVersion) {
+        peer::OpenAivCpuPushJettyResponse response{};
+        response.base.header = peer::MakeHeader(command, sizeof(response), header.version);
+        response.base.header.command = peer::ResponseCommand(command);
+        response.base.result = static_cast<int32_t>(peer::Result::kResourceError);
+        return WriteReply(fd, response);
+      }
       if (header.version == peer::kAivCpuPushProtocolVersion)
         return Reply<peer::OpenAivCpuPushGetResponse>(fd, command, peer::Result::kResourceError,
                                                       header.version);

@@ -24,6 +24,11 @@ CPU 构建提供进程内 Mock Runtime。启用 `KVAF_ENABLE_AIV_BATCH_GET=ON` �
 暴露 capture / replay / synchronize / destroy 生命周期，用于 Python 集成测试或上层
 Adaptor 的图编排；它不保存 KVAF 请求、Tensor 或 Operator 状态。
 
+`graph.replay()` 直接使用捕获时保存的原生 stream 调用 `aclmdlRIExecuteAsync`；
+`graph.synchronize()` 直接调用 `aclrtSynchronizeStream`。无参入口不会重复读取
+`torch.npu.Stream.npu_stream`，调用方在 replay 前提交输入生产任务并建立 stream 依赖。
+`graph.replay(stream)` / `graph.synchronize(stream)` 保留原有的 stream getter 与身份检查。
+
 `AclGraph.copy_host_to_device_async(destination, destination_bytes, source, stream)` 是图
 回放前的原生 ACL H2D 输入更新：调用方在已 capture 的同一 stream 上，把 host staging
 buffer 写入地址稳定的 NPU tensor，再调用 `replay`。`source` 的所有权仍属于 Python，必须
@@ -85,7 +90,8 @@ NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
 
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
-stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
+stream 时使用 `torch.npu.current_stream()`。KVAF 不创建或主动销毁调用方的 stream；
+`AclGraph` 在捕获成功后保留 stream 对象，直到图 reset 或释放，以保持缓存句柄有效。
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作
 自然按序；跨 stream 依赖由调用方建立。
 

@@ -11,7 +11,7 @@ Gather 当前实现与配置见 [Gather 实现与配置](aiv_gather_prepared_pre
 
 | 模式 | 执行顺序 |
 | --- | --- |
-| `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 四路 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
+| `cpu_push_scatter` | AIV 多核 SIMT 生成清单并 WRITE 到 CPU mailbox → 多条 Jetty WRITE payload → AIV 按 Ready scatter 到目标 HBM → 等待最终 done 和 DMA 排空 |
 | `gather_read` | AIV 流式发布清单、command、notify → CPU 按连续前缀 gather → AIV 随 ready prefix 提交多 SGE READ → 最终 ACK 与 CQ 完成 |
 
 Scatter 默认按 Jetty 分片的 Ready 提前消费。设置 `KVAF_SCATTER_PIPELINE=0` 后，CPU 省略
@@ -27,6 +27,44 @@ Scatter 使用 64 KiB UB stage ring 执行 GM→UB→GM，通过 MTE3→MTE2 事
 旧纯 SIMD loader 的零动态 UB 配置不适用于这个混合二进制。
 GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 
+### 连续 staging 与流水供数
+
+N 端设置 `KVAF_SCATTER_CPU_GATHER=1`，CPU 将离散源数据 gather 到连续注册 DDR staging，
+再通过 payload Jetty WRITE 到连续 HBM staging，AIV scatter 到请求指定的输出行。
+完整流程如下：
+
+1. AIV 读取请求的源索引、offset 和输出行索引，SIMT 生成源地址清单。core 0 将首段清单与
+   notify WRITE 到 K 端 mailbox，随后发布后缀清单；K 端可以在后缀清单到齐前开始处理首段。
+2. K 端 Gather 线程将离散 CPU 源数据复制到连续注册 DDR staging。分片复制完成并发布
+   就绪状态后，提交线程可以提交该分片已准备好的 payload WRITE。
+3. 各 payload Jetty 将 CPU staging 写入连续 HBM staging。同一 Jetty 内按顺序发布
+   payload 和对应 Ready；提交线程发送已就绪分片时，Gather 线程可以继续复制后续分片。
+4. AIV 根据 Ready 消费已到达的 HBM 分片，经 GM→UB→GM 搬运到离散输出行。
+   启用独立 Jetty 游标后，一个 Jetty 等待下一分片不会阻止其他 Jetty 消费已就绪分片。
+5. K 端回收全部 payload CQE 后发布整批 Done。AIV 检查 Done 成功且完成所有输出 DMA
+   后返回；Ready 用于提前消费，Done 用于确认整批请求结果。
+
+K 端设置 `KVAF_CPU_GATHER_INTERLEAVE=1`，统一开启交错 Gather 和每 Jetty 独立供数。
+该开关默认 0，与 N 端 `--pipeline` 独立；线程不足或边界未对齐时保留回退路径。
+Gather→WRITE 的交错发生在不同就绪分片之间；一个分片的 payload WRITE 在该分片
+Gather 完成后提交。三个阶段可以同时处理不同分片。
+
+| Scatter pipeline | CPU interleave | 行为 |
+| --- | --- | --- |
+| 0 | 0 | 整批 Gather 后 WRITE，AIV 等 Done 再 scatter |
+| 0 | 1 | Gather 与 WRITE 重叠，AIV 等 Done 再 scatter |
+| 1 | 0 | 连续行分波供数，AIV 按 Ready scatter |
+| 1 | 1 | 交错 Gather、每 Jetty 独立提交，AIV 按 Ready scatter |
+
+`--jetty-cursors 1` 让各 Jetty 的消费游标独立推进，`--overlap-head-cq 1` 让后缀清单构造
+与首段控制 WRITE 的 CQ 等待重叠。二者默认 0。
+Scatter 默认使用 4 条共享 payload Jetty；`--jettys-per-core N` 或
+`KVAF_SCATTER_JETTYS_PER_CORE=N` 将总数设为 AIV 核数乘以 N，上限 32。
+CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 按需增长并复用。
+`KVAF_SCATTER_CPU_GATHER=0` 时，CPU 使用源地址 SGL 直接 WRITE 到 HBM staging，
+省去 CPU staging Gather；Scatter pipeline、Jetty 游标、head CQ 重叠和 ACL 图仍可单独配置。
+两种通路的 HBM staging 均使用 `ACL_MEM_MALLOC_HUGE_FIRST`。
+
 ## 独立二进制与类型声明
 
 以下路径相对于 `access_operator/demo/aiv_batch_get/`：
@@ -41,7 +79,8 @@ GM→UB 普通模式恢复、MTE2/MTE3 事件同步及退出屏障保留。
 | 二进制 | `kvaf_scatter_batch_get_kernels.o` | `kvaf_gather_batch_get_kernels.o` |
 
 Scatter 参数末尾使用版本化选项字段。176 B 参数和 64 B 业务状态之外，计时使用独立的
-每核 192 B 区域。AIV Scatter mailbox 的打开、启动和停止命令使用 V8，握手响应为 392 B。
+每核 192 B 区域。默认四条 payload Jetty 的 AIV Scatter mailbox 使用 V8 打开，握手响应为
+392 B；显式配置非四 Jetty 数量时使用 V9 扩展打开，响应为 2296 B。启动和停止命令使用 V8。
 V8 由 AIV 把地址清单和通知 WRITE 到 CPU DDR mailbox，CPU 从本地读取。
 AICPU Scatter 使用 V6，握手响应为 300 B，CPU 从 NPU HBM READ 通知、请求头和地址清单。
 两条路径分别通过 `aiv_batch_get_mode` 和 `aicpu_batch_get_mode` 选择。Gather 和公共控制命令
@@ -88,8 +127,8 @@ runtime.link_to(cpu_service_address)
 runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 ```
 
-- 支持 1～8 核、单 EID 和 eager 执行。可信 Scatter 入口由调用方保证 stream 未处于
-  graph capture 中，带校验的入口会检查 capture 状态并拒绝 capture。
+- 支持 1～8 核和单 EID。普通 Scatter 入口使用 eager 执行；图捕获使用下面的
+  `capture_into_graph=True` prepared 入口。
 - 请求容量 1～65536，固定 token 长度 1～65535 B；`miss_count=0` 是合法空批次。
 - 仅搬运有效前缀，允许重复源和不连续输出行；输出行必须唯一，offset 不能越过源 block。
 - Gather 每核两条 Jetty，SGE 数为 1～6；`--gather-threads` 至少覆盖其 AIV 核数。
@@ -101,6 +140,68 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 - done 轮询有次数上限，loader 的 kernel 超时为 180 秒；轮询次数不是毫秒。
 - Scatter HBM workspace 按最大 65536 请求配置，包括 `65536 * token_bytes` staging、
   512 KiB 地址清单和控制区。大 token 回归使用较小请求容量以缩小测试输出，workspace 仍按上限分配。
+
+## Scatter ACL 图模式
+
+性能脚本统一使用 `--acl-graph`，每张图的 `--graph-calls` 默认 8。
+一次捕获多次 BatchGet，一次 replay 后统一同步；同一 stream 上按序执行，共享传输工作区。
+每个节点有独立输入清单，每次 replay 前在计时窗口外刷新；输出按顺序复用，保留末次结果。
+不启用图模式时，每个样本仍只执行一次 BatchGet，`--graph-calls` 不参与计时。
+图模式在捕获结束后直接绑定 `graph.replay` 和原生 stream 同步方法；样本内通过
+`aclmdlRIExecuteAsync` 重放，不再逐次解析 Python stream 或经过 Python 转发函数。
+`--completion-scope stream` 使用 `aclrtSynchronizeStream`，`device` 保留原有整设备同步。
+
+`graph_total_us` 是整图提交到同步返回的总耗时，`end_to_end_us` 是总耗时除以
+`calls_per_sample`；带宽使用整图有效字节数除以整图总耗时。例如每图 8 次调用、20 个计时
+样本执行 160 次 BatchGet，不含预检和 warmup。P50 表示每图平均耗时的中位数，
+不等于单独提交一次 BatchGet 的 P50。图准备、输入刷新和状态检查在样本计时之外。
+启用 kernel profiling 时，多节点图的阶段数据保存在 `last_call_*` 和 JSON 的
+`last_call_profile`，只描述末次调用；平均值的 `aiv_wall_us` 和 `call_outside_aiv_us` 留空。
+
+推理框架可以把多个 prepared 节点挂到已有图中，调用
+`prepare_scatter_batch_get(..., stream=stream, capture_into_graph=True)` 获取节点，在捕获期间
+调用这些节点。每次 replay 后调用一次 `check_scatter_graph_replay()` 验证累计序号与状态。
+设备失败状态会传递到后续节点。保留 Runtime、stream、Tensor 和 AccessTable，直到图完成、
+销毁并调用 `detach_scatter_batch_get_graph()`；同一 Runtime 的所有节点须使用同一图和 stream。
+profiling 开关须在捕获前设置。
+普通 prepared Scatter 继续支持 `wait_stream=True`，在调用内等待 DMA 完成并推迟状态校验；
+它与 `synchronize=True` 互斥。图捕获需将二者设为 false，使用 `capture_into_graph=True`。
+无图性能对照的 `--completion-scope native-stream` 继续映射到这一原有接口；图模式使用
+`--completion-scope stream` 或 `device`。
+
+最小调用流程如下。`input_plans` 为 8 组固定存储的输入，Runtime、表、输出和 stream 已初始化。
+无需在重放循环内重新 prepare 或 capture；只原地更新输入内容。
+
+```python
+nodes = [runtime.prepare_scatter_batch_get(
+    view, indices, offsets, count, output_indices, output,
+    stream=stream, capture_into_graph=True)
+    for indices, offsets, output_indices in input_plans]
+graph = kvaf.AclGraph()
+try:
+    graph.capture_begin(stream)
+    for node in nodes:
+        node()
+    graph.capture_end()
+
+    for _ in range(iterations):
+        refresh_inputs_in_place()  # 生产新输入并保证其已就绪；存储地址保持不变。
+        graph.replay()
+        graph.synchronize()
+        runtime.check_scatter_graph_replay()
+finally:
+    if graph.capturing:
+        graph.capture_end()
+    if graph.ready:
+        graph.synchronize()
+        graph.reset()
+    runtime.detach_scatter_batch_get_graph()
+```
+
+图只捕获一次，随后多次执行 `aclmdlRIExecuteAsync`；每次重放后同步并检查整图状态。
+无参原生入口要求 replay 前输入生产任务已提交并建立正确的 stream 依赖；性能脚本通过
+计时窗口外的 `torch.npu.synchronize()` 保证输入就绪。需要保留原有 stream getter 提交屏障时，
+仍可使用 `graph.replay(stream)`。捕获的 stream 对象由图持有，reset 后无参入口会拒绝重放。
 
 ## 构建与完整回归
 
@@ -157,16 +258,62 @@ Gather 使用 `test_aiv_gather_batch_get.py` 和对应 gather `.o`。兼容入�
 
 ## Scatter 性能回归
 
-miss-count 脚本固定使用 prepared 提交，提交后调用 `torch.npu.synchronize()`，
-并将 profile 快照放在计时区间之外。以下示例使用每 block 128 个 token。
+miss-count 脚本默认使用 prepared 提交；`--acl-graph` 启用多节点图，完成后按所选范围同步，
+并将 profile 快照放在计时区间之外。
+
+### 当前实测最优配置
+
+下面是当前测试使用的 N 端配置：4 核 AIV、每图 8 次 BatchGet、pipeline、独立 Jetty
+游标和 head CQ 重叠，同时启用 kernel/host profiling。CPU 服务地址按实际部署设置。
+该配置是当前环境的实测选择，其他机器上的核数、Jetty 数和 Gather 线程数需结合实测确定。
 
 ```bash
-DEVICE_ID=7 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28990 \
-  bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
-    --single --token-bytes 656 --tokens-per-block 128 --table-capacity 16384 \
-    --request-length 32768 --miss-count 8192 --aiv-cores 4 --pipeline 1 \
-    --warmup 3 --iterations 100 \
-    --json results/scatter-aligned.json --csv results/scatter-aligned.csv
+export PYTHONPATH="$PWD/build-npu/python"
+export KVAF_RUN_NPU_TESTS=1
+export DEVICE_ID=0
+export KVAF_SCATTER_CPU_GATHER=1
+export KVAF_CPU_SERVICE_ADDR=141.62.38.71:28890
+export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_scatter_batch_get_kernels.o"
+export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
+
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --single --token-bytes 656 --miss-count 8192 --aiv-cores 4 \
+  --table-capacity 16384 --tokens-per-block 128 \
+  --acl-graph --graph-calls 8 \
+  --completion-scope stream \
+  --pipeline 1 \
+  --jetty-cursors 1 \
+  --overlap-head-cq 1 \
+  --json results/aligned-t656-test2.json \
+  --csv results/aligned-t656-test2.csv
+```
+
+Gather 与 WRITE 的交错需要在 **K 端启动 CPU 服务前** 设置
+`export KVAF_CPU_GATHER_INTERLEAVE=1`；仅在 N 端设置不会改变远端服务的配置。
+Gather 线程数量、亲和性和等待方式由 K 端服务参数决定。
+上述命令未指定 payload Jetty 数，因此在没有 `KVAF_SCATTER_JETTYS_PER_CORE` 环境覆盖时
+使用 4 条共享 payload Jetty。
+
+每次 BatchGet 的有效数据为 `8192 * 656 = 5,373,952 B`，每图为 `42,991,616 B`。
+端到端耗时按整图耗时除以 8 计算，带宽按整图有效数据量除以整图耗时计算。
+kernel profiling 只保留末节点的阶段数据，不能将末节点 `last_call_aiv_wall_us` 从整图单次
+平均耗时中相减，得到平均 `call_outside_aiv_us`。阶段耗时定位使用末节点 profile；
+单次 eager 的完整耗时拆解使用下面的无图对照。
+
+### 单次 eager 对照
+
+保留相同数据布局、Gather、流水、核数和 profiling 配置，只移除 `--acl-graph --graph-calls 8`，
+使用同一 stream 完成范围：
+
+```bash
+bash tests/run_remote_cpu_scatter_miss_count_perf.sh "$PWD/build-npu" \
+  --single --token-bytes 656 --miss-count 8192 --aiv-cores 4 \
+  --table-capacity 16384 --tokens-per-block 128 \
+  --completion-scope stream \
+  --kernel-profile --host-profile \
+  --pipeline 1 --jetty-cursors 1 --overlap-head-cq 1 \
+  --json results/aligned-t656-eager.json \
+  --csv results/aligned-t656-eager.csv
 ```
 
 加 `--dry-run` 可查看配置。另一个入口 `tests/run_remote_cpu_scatter_perf.sh` 用于

@@ -59,7 +59,9 @@ class PeerLink {
   Status StartCpuPushGet(uint64_t region_base) const;
   Status StopCpuPushGet(uint64_t region_base) const;
   Status OpenAivCpuPushGet(uint64_t region_base, OpenCpuPushGetRequest request,
-                           OpenAivCpuPushGetResponse* response) const;
+                          OpenAivCpuPushGetResponse* response) const;
+  Status OpenAivCpuPushGet(uint64_t region_base, OpenAivCpuPushJettyRequest request,
+                          OpenAivCpuPushJettyResponse* response, bool cpu_gather = false) const;
   Status StartAivCpuPushGet(uint64_t region_base) const;
   Status StopAivCpuPushGet(uint64_t region_base) const;
   Status CreateChannel(

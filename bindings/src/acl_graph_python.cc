@@ -74,6 +74,7 @@ class AclGraph final {
     ThrowIfAclError(
         aclmdlRICaptureBegin(stream_, ACL_MODEL_RI_CAPTURE_MODE_RELAXED),
         "aclmdlRICaptureBegin");
+    stream_owner_ = stream;
     capturing_ = true;
   }
 
@@ -86,10 +87,12 @@ class AclGraph final {
     capturing_ = false;
     if (error != ACL_SUCCESS) {
       stream_ = nullptr;
+      stream_owner_ = py::none();
       ThrowIfAclError(error, "aclmdlRICaptureEnd");
     }
     if (captured_graph == nullptr) {
       stream_ = nullptr;
+      stream_owner_ = py::none();
       throw std::runtime_error("aclmdlRICaptureEnd returned a null graph");
     }
     graph_ = captured_graph;
@@ -99,22 +102,24 @@ class AclGraph final {
     if (capturing_ || graph_ == nullptr) {
       throw py::value_error("ACLGraph has no completed capture to replay");
     }
-    const aclrtStream replay_stream = acl_python::StreamFromPython(stream);
-    if (replay_stream != stream_) {
+    // The no-argument path uses the native capture stream directly. The caller
+    // submits/fences input producers before replay; no torch task-queue getter
+    // or Python stream conversion is needed here.
+    if (!stream.is_none() && acl_python::StreamFromPython(stream) != stream_) {
       throw py::value_error(
           "ACLGraph replay must use the same ACL stream as capture");
     }
-    ThrowIfAclError(aclmdlRIExecuteAsync(graph_, replay_stream),
+    ThrowIfAclError(aclmdlRIExecuteAsync(graph_, stream_),
                     "aclmdlRIExecuteAsync");
   }
 
   void Synchronize(const py::object& stream) const {
-    const aclrtStream target_stream = acl_python::StreamFromPython(stream);
-    if (capturing_ || graph_ == nullptr || target_stream != stream_) {
+    if (capturing_ || graph_ == nullptr ||
+        (!stream.is_none() && acl_python::StreamFromPython(stream) != stream_)) {
       throw py::value_error(
           "ACLGraph synchronize requires a completed graph and its capture stream");
     }
-    ThrowIfAclError(aclrtSynchronizeStream(target_stream),
+    ThrowIfAclError(aclrtSynchronizeStream(stream_),
                     "aclrtSynchronizeStream");
   }
 
@@ -158,10 +163,10 @@ class AclGraph final {
           "ACLGraph capture is active; call capture_end before reset");
     }
     if (graph_ != nullptr) {
-      const aclError error = aclmdlRIDestroy(graph_);
+      ThrowIfAclError(aclmdlRIDestroy(graph_), "aclmdlRIDestroy");
       graph_ = nullptr;
       stream_ = nullptr;
-      ThrowIfAclError(error, "aclmdlRIDestroy");
+      stream_owner_ = py::none();
     }
   }
 
@@ -187,6 +192,7 @@ class AclGraph final {
 
   aclmdlRI graph_{nullptr};
   aclrtStream stream_{nullptr};
+  py::object stream_owner_{py::none()};
   bool capturing_{false};
 };
 
@@ -199,10 +205,12 @@ void BindAclGraph(py::module_& module) {
            "Begin raw ACL Runtime Graph capture on a caller-owned ACL stream.")
       .def("capture_end", &AclGraph::CaptureEnd,
            "Finish capture and retain the resulting ACL graph.")
-      .def("replay", &AclGraph::Replay, py::arg("stream"),
-           "Submit the captured ACL graph to its capture stream.")
-      .def("synchronize", &AclGraph::Synchronize, py::arg("stream"),
-           "Wait for graph work on its capture stream.")
+      .def("replay", &AclGraph::Replay, py::arg("stream") = py::none(),
+           "Submit through aclmdlRIExecuteAsync. Omitting stream uses the retained native "
+           "capture stream; the caller must submit/fence input producers before replay. "
+           "Passing stream preserves the torch stream getter fence and identity check.")
+      .def("synchronize", &AclGraph::Synchronize, py::arg("stream") = py::none(),
+           "Wait through aclrtSynchronizeStream on the native capture stream.")
       .def("copy_host_to_device_async", &AclGraph::CopyHostToDeviceAsync,
            py::arg("destination"), py::arg("destination_bytes"),
            py::arg("source"), py::arg("stream"),

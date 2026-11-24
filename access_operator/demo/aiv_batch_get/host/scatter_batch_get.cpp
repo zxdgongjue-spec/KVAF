@@ -72,12 +72,24 @@ struct ScatterBatchGet::Impl {
   void* memory_handle{};
   void* mailbox_import{};
   uint64_t mailbox_context{};
-  std::array<std::unique_ptr<d::TargetChannel>, 4> channels;
+  std::array<std::unique_ptr<d::TargetChannel>, cpu_push::kMaxJettyCount> channels;
+  uint32_t payload_jettys{cpu_push::kJettyCount}, payload_jettys_per_core{};
   aclrtStream pending{};
+  struct Graph {
+    aclrtStream stream{};
+    aclmdlRI id{};
+    uint32_t nodes{};
+  } graph;
   uint64_t sequence{};
   bool push_open{}, initialized{}, failed{}, profile_ready{};
   uint64_t StatusBytes() const { return config.npu_core_count * sizeof(KvafSequentialStatus); }
   uint64_t ProfileBytes() const { return config.npu_core_count * sizeof(ScatterBatchGetCoreProfile); }
+
+  Status CheckExecutionState() const {
+    if (!initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
+    if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
+    return Status::OK();
+  }
 
   Status AclFailure(const char* phase, aclError code) const {
     return Status::DeviceError("AIV sequential BatchGet: mode=" + config.aiv_batch_get_mode +
@@ -86,7 +98,7 @@ struct ScatterBatchGet::Impl {
         "; resources retained");
   }
 
-  Status Drain() {
+  Status Drain(bool allow_initial_status = false) {
     if (failed) return Status::InvalidState("sequential BatchGet failed; shutdown/reinitialize required");
     if (!pending) return Status::OK();
     scatter_host::Timer copy_timer(scatter_host::kStatusCopy);
@@ -107,6 +119,7 @@ struct ScatterBatchGet::Impl {
     const auto* statuses = static_cast<const KvafSequentialStatus*>(status_host);
     for (uint32_t i = 0; i < config.npu_core_count; ++i) {
       const auto& s = statuses[i];
+      if (allow_initial_status && sequence == 0 && s.sequence == 0) continue;
       if (s.magic != KVAF_SEQ_STATUS_MAGIC || s.sequence != sequence ||
           s.result != KVAF_SEQ_OK || s.phase != KVAF_SEQ_COMPLETE) {
         failed = true;
@@ -119,17 +132,60 @@ struct ScatterBatchGet::Impl {
     return Status::OK();
   }
 
-  Status InitializePush(const peer::PeerRegion& peer) {
+  Status QueryCapture(aclrtStream stream, bool* capturing, aclmdlRI* captured = nullptr) const {
+    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI active = nullptr;
+    scatter_host::Timer timer(scatter_host::kCaptureQuery);
+    const auto result = aclmdlRICaptureGetInfo(stream, &capture, &active);
+    if (result != ACL_SUCCESS) return Error("query stream capture state");
+    *capturing = capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    if (captured) *captured = active;
+    return Status::OK();
+  }
+
+  // Replay validation and detach share the same stream/capture guard. The
+  // caller owns graph destruction; only its Scatter attachment is reset here.
+  Status ControlGraph(ScatterGraphAction action, aclrtStream stream) {
+    const bool detach = action == ScatterGraphAction::kDetach;
+    if (!graph.stream || (!detach && stream != graph.stream))
+      return Status::InvalidState("Scatter graph requires its capture stream");
+    bool capturing = false;
+    auto status = QueryCapture(graph.stream, &capturing);
+    if (!status.ok()) return status;
+    if (capturing) return Status::InvalidState("end graph capture before checking or detaching Scatter");
+    if (!detach) {
+      if (graph.nodes > UINT32_MAX - sequence)
+        return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+      sequence += graph.nodes;
+    }
+    if (detach && failed) {
+      const auto result = aclrtSynchronizeStream(graph.stream);
+      if (result != ACL_SUCCESS) return AclFailure("external_graph_synchronize", result);
+      pending = nullptr;
+    } else {
+      pending = graph.stream;
+      status = Drain(/*allow_initial_status=*/detach);
+      if (!detach) profile_ready = status.ok() && ScatterProfileEnabled(args.reserved);
+      if (!status.ok()) return status;
+    }
+    if (detach) {
+      graph = {};
+      profile_ready = false;
+    }
+    return Status::OK();
+  }
+
+  Status InitializePush(const peer::PeerRegion& peer, bool cpu_gather) {
     cpu_push::Layout layout;
-    if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout))
+    if (!cpu_push::MakeLayout(config.batch_get_token_bytes, config.npu_core_count, &layout, payload_jettys))
       return Status::InvalidArgument("invalid scatter workspace shape");
     args.descriptor_offset = layout.descriptor; args.staging_offset = layout.staging;
-    // Queue context precedes the private build-ready/failure lines. Shared
-    // request/descriptor/staging offsets and the launch ABI remain unchanged.
+    // Queue context follows the shared layout and precedes the private
+    // build-ready/failure lines.
     args.workspace_bytes = layout.bytes + sizeof(KvafScatterMailboxContext) +
                            uint64_t(config.npu_core_count + 1) * 64;
-    // Prefer huge pages for the persistent CPU WRITE target and scatter staging;
-    // ACL may fall back to normal pages when huge pages are unavailable.
+    // Keep the original Scatter policy for both payload sources. This HBM
+    // region is the persistent CPU WRITE target, including the SGL path.
     if (aclrtMalloc(&workspace, args.workspace_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
         aclrtMemset(workspace, args.workspace_bytes, 0, args.workspace_bytes) != ACL_SUCCESS)
       return Error("allocate scatter workspace");
@@ -149,7 +205,9 @@ struct ScatterBatchGet::Impl {
     if (api.lmem_register(context, &mr, &memory_handle) || !memory_handle ||
         mr.out.key.size < kSegmentBytes || mr.out.key.size > peer::kSegKeyBytes)
       return Error("register scatter HBM segment");
-    peer::OpenCpuPushGetRequest open{};
+    peer::OpenAivCpuPushJettyRequest request{};
+    request.payload_jettys = payload_jettys;
+    auto& open = request.base;
     open.source_bytes = region.length; open.hbm_bytes = args.workspace_bytes;
     std::memcpy(&open.hbm_base, mr.out.key.value + 20, sizeof(open.hbm_base));
     uint64_t exported_bytes = 0;
@@ -165,19 +223,21 @@ struct ScatterBatchGet::Impl {
     if (!d::GetPeerTp(api, context, config.peer_local_eid, peer.eid, "aiv_scatter", &npu_tp))
       return Error("query scatter TP");
     open.npu_tp = npu_tp;
-    for (uint32_t q = 0; q < 4; ++q) {
+    for (uint32_t q = 0; q < payload_jettys; ++q) {
       channels[q] = std::make_unique<d::TargetChannel>(api, context);
       // Queue 0 is bidirectional: CPU payload target and AIV mailbox initiator.
       auto result = q == 0 ? channels[q]->InitializeAiv(token, peer.token_value, 1024, 16384)
                            : channels[q]->Initialize(token, peer.token_value, 1024, 1024, 16384);
       if (!result.ok()) return result;
       const auto& key = channels[q]->jetty_info().key;
-      open.channels[q].bytes = key.size;
-      std::memcpy(open.channels[q].key, key.value, key.size);
+      auto& channel = request.Channel(q);
+      channel.bytes = key.size;
+      std::memcpy(channel.key, key.value, key.size);
     }
-    peer::OpenAivCpuPushGetResponse response{};
+    peer::OpenAivCpuPushJettyResponse reply{};
+    const auto& response = reply.base;
     push_open = true;  // A lost response can still leave a live remote session.
-    auto result = config.peer_link->OpenAivCpuPushGet(region.base, open, &response);
+    auto result = config.peer_link->OpenAivCpuPushGet(region.base, request, &reply, cpu_gather);
     if (!result.ok()) return result;
     if (response.mailbox_segment_bytes != kSegmentBytes || !response.mailbox_base ||
         response.mailbox_bytes < layout.staging || !(response.mailbox_token_id >> 8) ||
@@ -200,9 +260,10 @@ struct ScatterBatchGet::Impl {
     e.remote_token_value = peer.token_value;
     e.local_hbm_address = Ptr(workspace); e.local_hbm_size = args.workspace_bytes;
     e.local_token_id = id.token_id; e.local_token_value = peer.token_value;
-    for (uint32_t q = 0; q < 4; ++q) {
+    for (uint32_t q = 0; q < payload_jettys; ++q) {
       d::QpImportInfoT info{};
-      if (!d::ImportPeerJetty(api, context, response.channels[q].key, response.channels[q].bytes,
+      const auto& channel = reply.Channel(q);
+      if (!d::ImportPeerJetty(api, context, channel.key, channel.bytes,
           peer.token_value, open.npu_tp, response.cpu_tp, open.npu_psn, response.cpu_psn,
           "aiv_scatter", &info, channels[q]->peer_jetty_output())) return Error("import CPU Jetty");
       if (!q) e.tp_id = info.out.ub.tpn;
@@ -227,6 +288,8 @@ struct ScatterBatchGet::Impl {
   }
 
   Status Shutdown() {
+    if (graph.stream)
+      return Status::InvalidState("destroy and detach the caller's Scatter graph before shutdown");
     // A normal close must let the CPU finish serving the pending request first.
     // On execution errors, keep closing the transports before releasing memory.
     const auto execution_status = failed ? Status::OK() : Drain();
@@ -296,7 +359,36 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
   if (pipeline_option && std::strcmp(pipeline_option, "0") && std::strcmp(pipeline_option, "1"))
     return Status::InvalidArgument("KVAF_SCATTER_PIPELINE must be 0 or 1");
   const bool pipeline = !pipeline_option || pipeline_option[0] == '1';
-  s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U);
+  const char* cursor_option = std::getenv("KVAF_SCATTER_JETTY_CURSORS");
+  if (cursor_option && std::strcmp(cursor_option, "0") && std::strcmp(cursor_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_JETTY_CURSORS must be 0 or 1");
+  const bool jetty_cursors = cursor_option && cursor_option[0] == '1';
+  if (jetty_cursors && !pipeline)
+    return Status::InvalidArgument("KVAF_SCATTER_JETTY_CURSORS=1 requires KVAF_SCATTER_PIPELINE=1");
+  const char* overlap_option = std::getenv("KVAF_SCATTER_OVERLAP_HEAD_CQ");
+  if (overlap_option && std::strcmp(overlap_option, "0") && std::strcmp(overlap_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_OVERLAP_HEAD_CQ must be 0 or 1");
+  const bool overlap_head_cq = overlap_option && overlap_option[0] == '1';
+  const char* cpu_gather_option = std::getenv("KVAF_SCATTER_CPU_GATHER");
+  if (cpu_gather_option && std::strcmp(cpu_gather_option, "0") && std::strcmp(cpu_gather_option, "1"))
+    return Status::InvalidArgument("KVAF_SCATTER_CPU_GATHER must be 0 or 1");
+  const bool cpu_gather = cpu_gather_option && cpu_gather_option[0] == '1';
+  s.payload_jettys = cpu_push::kJettyCount;
+  s.payload_jettys_per_core = 0;
+  if (const auto* value = std::getenv("KVAF_SCATTER_JETTYS_PER_CORE")) {
+    char* end = nullptr;
+    const auto per_core = std::strtoul(value, &end, 10);
+    if (value[0] < '1' || value[0] > '9' || *end || !per_core || per_core > cpu_push::kMaxJettyCount)
+      return Status::InvalidArgument("KVAF_SCATTER_JETTYS_PER_CORE must be in 1..32");
+    if (s.config.npu_core_count * per_core > cpu_push::kMaxJettyCount)
+      return Status::InvalidArgument("Scatter AIV core count times Jettys per core must be at most 32");
+    s.payload_jettys_per_core = per_core;
+    s.payload_jettys = s.config.npu_core_count * per_core;
+  }
+  s.args.reserved = kScatterOptionsV1 | (pipeline ? kScatterPipeline : 0U) |
+      (jetty_cursors ? kScatterJettyCursors : 0U) |
+      (overlap_head_cq ? kScatterOverlapHeadCq : 0U) |
+      (s.payload_jettys != cpu_push::kJettyCount ? kScatterConfiguredJettys : 0U);
   s.region = region;
   if (s.config.peer_local_eids.size() == 1) s.config.peer_local_eid = s.config.peer_local_eids.front();
   peer::PeerRegion peer;
@@ -317,11 +409,12 @@ Status ScatterBatchGet::Initialize(const RemoteRegionDesc& region) {
     return Error("initialize statuses");
   s.args.max_polls = 100000000U;
   s.args.source_base = region.base; s.args.source_bytes = region.length;
-  result = s.InitializePush(peer);
+  result = s.InitializePush(peer, cpu_gather);
   if (!result.ok()) return result;
   s.args.workspace = Ptr(s.workspace);
   s.initialized = true;
-  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u\n", unsigned(pipeline));
+  std::fprintf(stderr, "[KVAF_AIV] SCATTER_OPTIONS pipeline=%u cpu_gather=%u payload_jettys=%u\n",
+               unsigned(pipeline), unsigned(cpu_gather), s.payload_jettys);
   return Status::OK();
 }
 Status ScatterBatchGet::Drain() {
@@ -329,24 +422,38 @@ Status ScatterBatchGet::Drain() {
   return impl_->Drain();
 }
 Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
+  const auto graph_action = exec.execution.scatter_graph;
   scatter_host::Timer operator_timer(scatter_host::kOperator);
   auto& s = *impl_;
   scatter_host::Timer mutex_timer(scatter_host::kMutexWait);
   std::lock_guard<std::mutex> lock(s.mutex);
   mutex_timer.Stop();
-  if (!s.initialized) return Status::NotInitialized("sequential BatchGet is not initialized");
+  if (graph_action == ScatterGraphAction::kDetach) return s.ControlGraph(graph_action, nullptr);
+  auto state = s.CheckExecutionState();
+  if (!state.ok()) return state;
+  if (graph_action == ScatterGraphAction::kCheck)
+    return s.ControlGraph(graph_action, static_cast<aclrtStream>(exec.execution.stream));
+  if (s.graph.stream && graph_action != ScatterGraphAction::kAttach)
+    return Status::InvalidState("detach the caller's Scatter graph before another BatchGet");
   if (!exec.execution.stream) return Status::InvalidArgument("BatchGet needs a stream");
-  if (!exec.execution.trusted_npu_request) {
-    aclmdlRICaptureStatus capture = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    aclmdlRI graph = nullptr;
-    scatter_host::Timer capture_timer(scatter_host::kCaptureQuery);
-    const auto capture_result = aclmdlRICaptureGetInfo(
-        static_cast<aclrtStream>(exec.execution.stream), &capture, &graph);
-    capture_timer.Stop();
-    if (capture_result != ACL_SUCCESS)
-      return Error("query stream capture state");
-    if (capture != ACL_MODEL_RI_CAPTURE_STATUS_NONE)
-      return Status::NotImplemented("sequential BatchGet supports eager execution only");
+  const auto stream = static_cast<aclrtStream>(exec.execution.stream);
+  const bool attach_graph = graph_action == ScatterGraphAction::kAttach;
+  aclmdlRI external_capture = nullptr;
+  if (attach_graph || !exec.execution.trusted_npu_request) {
+    bool capturing = false;
+    const auto status = s.QueryCapture(stream, &capturing, &external_capture);
+    if (!status.ok()) return status;
+    if (attach_graph) {
+      if (!capturing || s.pending || exec.execution.synchronize)
+        return Status::InvalidState("attach Scatter during active capture after draining previous work");
+      if (!external_capture || (s.graph.stream &&
+          (stream != s.graph.stream || external_capture != s.graph.id)))
+        return Status::InvalidState("attach Scatter nodes to the same caller-managed graph and stream");
+      if (s.graph.nodes >= UINT32_MAX - s.sequence)
+        return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
+    } else if (capturing) {
+      return Status::NotImplemented("use capture_into_graph for caller-managed capture");
+    }
   }
   scatter_host::Timer prior_timer(scatter_host::kPriorDrain);
   auto result = s.Drain();
@@ -359,13 +466,27 @@ Status ScatterBatchGet::Execute(const BatchGetExecRequest& exec) {
   else result = Input(exec, s.config, &args.request);
   input_timer.Stop();
   if (!result.ok()) return result;
+  if (s.payload_jettys_per_core) args.request.jettys_per_core = s.payload_jettys_per_core;
   if (s.sequence == UINT32_MAX) return Status::InvalidState("BatchGet sequence exhausted; rebuild Runtime");
   args.request.core_status = Ptr(s.status_device);
   args.request.channel_entity = s.mailbox_context;
   args.request.queue_state = s.mailbox_context + offsetof(KvafScatterMailboxContext, queue);
+  if (attach_graph) {
+    args.sequence = 0;
+    args.reserved |= kScatterDeviceSequence;
+    if (KvafScatterBatchGetLaunch(&args, stream)) {
+      s.failed = true;
+      return Error("attach Scatter node to caller's graph");
+    }
+    s.graph.stream = stream;
+    s.graph.id = external_capture;
+    ++s.graph.nodes;
+    s.profile_ready = false;
+    return Status::OK();
+  }
   args.sequence = ++s.sequence;
   s.profile_ready = false;
-  s.pending = static_cast<aclrtStream>(exec.execution.stream);
+  s.pending = stream;
   // Every launched core overwrites its complete status. Drain checks this
   // request's monotonically increasing sequence, so an old status cannot pass.
   // Avoid submitting a separate device memset task before every kernel.
@@ -384,6 +505,8 @@ Status ScatterBatchGet::SetScatterProfiling(bool enabled) {
   if (!s.initialized) return Status::NotInitialized("scatter is not initialized");
   auto result = s.Drain();
   if (!result.ok()) return result;
+  if (s.graph.stream && enabled != ScatterProfileEnabled(s.args.reserved))
+    return Status::InvalidState("detach the Scatter graph before changing profiling");
   s.args.reserved = ScatterWithProfiling(s.args.reserved, enabled);
   s.profile_ready = false;
   return Status::OK();

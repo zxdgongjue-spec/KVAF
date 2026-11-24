@@ -250,9 +250,22 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
                              const BatchGetExecutionOptions& execution) {
   if (execution.trusted_npu_request) {
     scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
-    if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
-    if (request.indices.device != DeviceKind::kNpu || !execution.stream)
-      return Status::InvalidArgument("trusted BatchGet requires NPU inputs and an eager stream");
+    const auto action = execution.scatter_graph;
+    if (action == ScatterGraphAction::kNone) {
+      // Preserve the ordinary Gather/Scatter trusted-input contract.
+      if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+      if (request.indices.device != DeviceKind::kNpu || !execution.stream)
+        return Status::InvalidArgument("trusted BatchGet requires NPU inputs and an eager stream");
+    } else {
+      // Graph controls are Scatter-only. A failed shutdown can still detach
+      // the graph before retrying cleanup, without supplying input tensors.
+      const bool detach_for_cleanup = needs_cleanup_ && action == ScatterGraphAction::kDetach;
+      if (!initialized_ && !detach_for_cleanup)
+        return Status::NotInitialized("Runtime has not been initialized");
+      if ((action == ScatterGraphAction::kAttach && request.indices.device != DeviceKind::kNpu) ||
+          (action != ScatterGraphAction::kDetach && !execution.stream))
+        return Status::InvalidArgument("Scatter graph control requires valid inputs/stream");
+    }
     validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
   }

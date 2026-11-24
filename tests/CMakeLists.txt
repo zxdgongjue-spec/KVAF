@@ -56,7 +56,8 @@ add_test(NAME kvaf_batch_get_kernel_model_test COMMAND kvaf_batch_get_kernel_mod
 
 add_executable(kvaf_sequential_batch_get_kernel_model_test
   sequential_batch_get_kernel_model_test.cc
-  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc)
+  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_gather_executor.cc
+  ${PROJECT_SOURCE_DIR}/runtime/src/cpu_push_gather_executor.cc)
 target_include_directories(kvaf_sequential_batch_get_kernel_model_test PRIVATE
   aiv_model ${PROJECT_SOURCE_DIR}/access_operator/demo/aiv_batch_get/include
   ${PROJECT_SOURCE_DIR}/runtime/include ${PROJECT_SOURCE_DIR}/common/include)

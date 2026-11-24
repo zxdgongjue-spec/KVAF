@@ -1,5 +1,6 @@
 #include "aicpu_batch_get/kernel/cpu_push_scatter.h"
 #include "aicpu_batch_get/kernel/cpu_push_pipeline.h"
+#include "cpu_urma/indexed_async_write_tracker.h"
 
 #include <algorithm>
 #include <array>
@@ -220,7 +221,28 @@ void CheckRemoteFailure(std::uint64_t done_token, Result expected) {
   CHECK(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xA5; }));
 }
 
+template <class Tracker>
+void CheckWriteTracker() {
+  constexpr auto last = Tracker::kMaxQueues - 1;
+  Tracker tracker(Tracker::kMaxQueues, 4);
+  typename Tracker::Handle handle;
+  typename Tracker::Fence fences[]{{0, 3, 0}, {last, 4, 0}};
+  bool submitted = false;
+  CHECK(tracker.TryBegin(1, handle, fences, 2, &submitted).ok() && submitted);
+  const auto first = fences[1].context;
+  std::uint64_t done = 0;
+  CHECK(!tracker.Complete(0, first, &done).ok());
+  CHECK(tracker.Complete(last, first, &done).ok() && !done);
+  CHECK(tracker.Complete(0, fences[0].context, &done).ok() && done == 1 && tracker.Empty());
+  CHECK(tracker.TryBegin(2, handle, fences, 2, &submitted).ok() && submitted);
+  CHECK(!tracker.Complete(last, first, &done).ok());
+  CHECK(tracker.Complete(last, fences[1].context, &done).ok() && !done);
+  CHECK(tracker.Complete(0, fences[0].context, &done).ok() && done == 2 && tracker.Empty());
+}
+
 int main() {
+  CheckWriteTracker<kvaf::cpu_urma_detail::IndexedAsyncWriteTracker>();
+  CheckWriteTracker<kvaf::cpu_urma_detail::AivIndexedAsyncWriteTracker>();
   CheckPipeline();
   CheckRemoteFailure(Progress(1, static_cast<std::uint32_t>(Result::kTransportError)), Result::kTransportError);
   CheckRemoteFailure(Progress(2, 1), Result::kSequenceError);

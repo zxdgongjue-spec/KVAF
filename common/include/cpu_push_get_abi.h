@@ -12,6 +12,7 @@ namespace kvaf::cpu_push {
 constexpr std::uint64_t kMagic = 0x4b56414650555333ULL;
 inline constexpr char kReferenceCommit[] = "a12bb16c120e885eb18ed61581739e1c212c32e8";
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
+constexpr std::uint32_t kMaxJettyCount = 32;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
 // Runtime additionally carries the opt-in profile bit with the request sequence.
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
@@ -45,8 +46,12 @@ struct alignas(64) Completion {
   // One aligned word publishes both sequence and result without a torn pair.
   std::uint64_t token{}, reserved[7]{};
 };
-// CPU owns all four words; each Jetty updates only its own 8-byte progress.
+// Preserve the legacy four-Jetty record, including its reserved words. AIV
+// extended pools use ReadyStride and byte offsets for additional progress.
 struct alignas(64) Ready { std::uint64_t jetty[kJettyCount]{}, reserved[4]{}; };
+KVAF_CPU_PUSH_INLINE constexpr std::uint32_t ReadyStride(std::uint32_t jettys) {
+  return (jettys + 7U) / 8U * sizeof(Ready);
+}
 struct alignas(64) Coordination {
   Word claimed, built, arrivals, finished, result;
 };
@@ -93,10 +98,11 @@ KVAF_CPU_PUSH_INLINE Range ChunkRange(Range r, std::uint32_t chunk) {
   return {begin, r.end < begin + kChunkRows ? r.end : begin + kChunkRows};
 }
 // A Ready word covers only this Jetty's exact shard of a worker/chunk.
-// Consumers may copy that shard without waiting for the other three Jettys.
-KVAF_CPU_PUSH_INLINE Range JettyRange(Range r, std::uint32_t queue) {
+// Consumers may copy that shard without waiting for other Jettys.
+KVAF_CPU_PUSH_INLINE Range JettyRange(Range r, std::uint32_t queue,
+                                    std::uint32_t jettys = kJettyCount) {
   const auto rows = r.end - r.begin;
-  const auto base = rows / kJettyCount, remainder = rows % kJettyCount;
+  const auto base = rows / jettys, remainder = rows % jettys;
   const auto begin = r.begin + queue * base + (queue < remainder ? queue : remainder);
   return {begin, begin + base + (queue < remainder ? 1U : 0U)};
 }
