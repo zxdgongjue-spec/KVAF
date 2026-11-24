@@ -3,6 +3,7 @@
 import csv
 from datetime import datetime
 from pathlib import Path
+from .get_options import gather_read_wave_settings
 
 
 METRICS = ("mean_us", "p50_us", "p90_us", "p99_us", "mean_GBps", "p50_GBps", "p99_GBps", "mean_GiBps")
@@ -10,6 +11,7 @@ SUMMARY_FIELDS = (
     "backend", "transport", "execution",
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
     "payload_bytes_per_call", "aiv_cores", "aicpu_workers", "jettys_per_core", "max_inflight_total",
+    "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs", "gather_read_wave_wrs_mode",
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
@@ -42,6 +44,9 @@ class BatchGetCsv:
             payload_bytes_per_call=args.miss_count * args.token_bytes,
             jettys_per_core=args.jettys_per_core if args.backend == "aiv" else None,
             max_inflight_total=args.max_inflight_total if args.backend == "aiv" else None,
+            gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0),
+            scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
+            **gather_read_wave_settings(args),
         )
 
     def add_summary(self, execution, measurements):

@@ -33,6 +33,12 @@ add_library(kvaf_runtime
   src/npu_device_pair.cc
 )
 
+if(BUILD_TESTING)
+  add_executable(kvaf_batch_get_capacity_test ../tests/batch_get_capacity_test.cc)
+  target_link_libraries(kvaf_batch_get_capacity_test PRIVATE kvaf_runtime)
+  add_test(NAME batch_get_capacity COMMAND kvaf_batch_get_capacity_test)
+endif()
+
 target_include_directories(kvaf_runtime
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

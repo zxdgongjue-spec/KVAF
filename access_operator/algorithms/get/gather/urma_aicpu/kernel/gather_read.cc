@@ -18,8 +18,6 @@ void EnsureSlots(std::vector<T>& slots, std::size_t count) {
   if (count > slots.size()) slots.resize(count);
 }
 
-constexpr std::uint32_t kGatherWaveWrs = 4096U;
-
 void BeginGatherWave(RequestBuffer& queue, std::uint32_t sgl_size, std::uint32_t wave_wrs) {
   EnsureSlots(queue.wrs, wave_wrs);
   EnsureSlots(queue.local_sges, queue.wrs.size() * sgl_size);
@@ -57,7 +55,8 @@ struct GatherBuildLayout {
 
 void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_t& span_index,
                     std::uint32_t last, std::uint32_t& span_offset, std::uint64_t& source_offset,
-                    std::uint32_t batch_wrs, std::uint32_t& local_index) {
+                    std::uint32_t batch_wrs, std::uint32_t wave_wrs,
+                    std::uint32_t& local_index) {
   auto& queue = worker.requests;
   auto index = span_index;
   auto offset = span_offset;
@@ -67,7 +66,6 @@ void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_
   auto* requests = queue.wrs.data();
   auto sequence = worker.sequence;
   auto wr_count = queue.wr_count;
-  const auto wave_wrs = static_cast<std::uint32_t>(queue.wrs.size());
   const auto wr_limit = wr_count + std::min(batch_wrs, wave_wrs - wr_count);
   while (index < last && wr_count < wr_limit) {
     const auto wr_index = wr_count++;
@@ -183,7 +181,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
   // A WR ends at the SGL limit, the 64 KiB limit, or the end of this request.
   const auto max_wrs = (static_cast<std::uint64_t>(args.bytes) + 65535U) / 65536U +
                        (args.source_span_count + layout.sgl_size - 1U) / layout.sgl_size;
-  const auto wave_wrs = static_cast<std::uint32_t>(std::min<std::uint64_t>(kGatherWaveWrs, max_wrs));
+  const auto wave_wrs = static_cast<std::uint32_t>(std::min<std::uint64_t>(args.read_wave_wrs, max_wrs));
   std::uint32_t span_offset = 0;
   std::uint64_t remote_offset = 0;
   while (first < last) {
@@ -199,7 +197,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
       {
         BatchGetProfileScope timer(profile ? &profile->wr_build_ns : nullptr);
         BuildReadBatch(worker, layout, first, last, span_offset, remote_offset,
-                          args.sq_batch_wqes, local_index);
+                          args.sq_batch_wqes, wave_wrs, local_index);
       }
       auto* tail = &queue.wrs[queue.wr_count - 1U];
       bool ready = true;
@@ -220,7 +218,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
         profile->read_wqes += queue.wr_count - batch_first;
         ++profile->post_calls;
       }
-    } while (first < last && queue.wr_count < queue.wrs.size());
+    } while (first < last && queue.wr_count < wave_wrs);
     // Retain every WR/SGL slot until the final ordered CQE for this wave.
     {
       BatchGetProfileScope timer(profile ? &profile->cq_wait_ns : nullptr);
@@ -278,7 +276,7 @@ bool BuildCurrentRequest(const UmdkBatchGetArgs& launch, GatherReadArgs& args,
   const auto& request = launch.request;
   if (!request.address_table || (request.indices && !request.offsets) || !request.miss_count ||
       !request.output_indices || !args.output || !request.token_bytes ||
-      request.request_capacity > kGatherMaxSpans)
+      last < first || last - first > GatherLaneCapacity(args.worker_count, args.window_capacity))
     return false;
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(request.address_table);
   const auto* indices = reinterpret_cast<const std::int32_t*>(request.indices);
@@ -341,8 +339,9 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
 std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (!launch || !launch->request.miss_count || !launch->gather.core_status || !launch->gather.scratch ||
       !launch->gather.execution_control ||
-      !launch->gather.worker_count ||
-      launch->gather.worker_count > kGatherMaxWorkers)
+      !launch->gather.worker_count || !ValidGatherReadWaveConfig(launch->gather.read_wave_wrs) ||
+      !ValidGatherWindow(launch->request.token_bytes, launch->gather.worker_count,
+                         launch->gather.window_capacity))
     return 1U;
   auto args = launch->gather;
   auto& control = *reinterpret_cast<GatherExecutionControl*>(args.execution_control);
@@ -363,10 +362,10 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   args.worker_index = worker;
   args.core_status += worker * sizeof(GatherReadStatus);
   args.scratch += worker * 64U;
-  args.source_descriptor += worker * GatherLaneDescriptorBytes(args.worker_count);
+  args.source_descriptor += worker * GatherLaneDescriptorBytes(args.worker_count, args.window_capacity);
   args.remote_staging += worker * GatherLaneStagingBytes(launch->request.token_bytes,
-                                                       args.worker_count);
-  args.remote_descriptor += worker * GatherLaneDescriptorBytes(args.worker_count);
+                                                       args.worker_count, args.window_capacity);
+  args.remote_descriptor += worker * GatherLaneDescriptorBytes(args.worker_count, args.window_capacity);
   args.remote_notify += worker * sizeof(kvaf::peer::GatherControl);
   args.remote_ack += worker * sizeof(kvaf::peer::GatherControl);
   args.remote_command += worker * sizeof(kvaf::peer::GatherControl);
@@ -374,6 +373,7 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   status = {};
   status.magic = kGatherStatusMagic;
   status.sequence = args.sequence;
+  status.failed_request = UINT64_MAX;
   if (session->state.queue_profile != UmdkQueueProfile::Gather ||
       args.worker_count != session->state.worker_count ||
       args.context.owner_pid != static_cast<std::uint64_t>(getpid()) ||
@@ -396,32 +396,57 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
     return 1U;
   }
   const auto count = static_cast<std::uint32_t>(active);
-  const auto first = static_cast<std::uint64_t>(count) * worker / args.worker_count;
-  const auto last = static_cast<std::uint64_t>(count) * (worker + 1U) / args.worker_count;
-  bool built;
-  {
-    BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
-    built = BuildCurrentRequest(*launch, args, first, last, profile);
-  }
-  if (!built)
-    status.result = kInvalidGatherRequest;
-  else if (!args.bytes)
-    status.ack_seen = args.sequence;
-  else if (StartGather(args, status, profile)) {
+  // Resolve from this launch's total active count, independently of tensor
+  // capacity, worker slices and memory windows. The captured args retain auto.
+  args.read_wave_wrs = ResolveGatherReadWaveWrs(args.read_wave_wrs, count);
+  // Each lane advances independently through the same global windows. Only
+  // window-local descriptors/staging are reused; all input/output indices stay global.
+  for (std::uint64_t base = 0; base < count; base += args.window_capacity) {
+    const auto window_count = std::min<std::uint64_t>(args.window_capacity, count - base);
+    const auto first = static_cast<std::uint32_t>(base + window_count * worker / args.worker_count);
+    const auto last = static_cast<std::uint32_t>(base + window_count * (worker + 1U) / args.worker_count);
+    if (__atomic_load_n(&control.failed, __ATOMIC_ACQUIRE)) {
+      status.result = kGatherTransportFailed;
+      status.failed_request = first;
+      break;
+    }
+    if (first == last) continue;
+    auto& wire_sequence = control.window_sequence[worker];
+    const auto previous = __atomic_load_n(&wire_sequence, __ATOMIC_ACQUIRE);
+    if (previous >= peer::kGatherErrorBit - 1U) {
+      status.result = kGatherSequenceExhausted;
+      status.failed_request = first;
+      break;
+    }
+    args.sequence = previous + 1U;
+    __atomic_store_n(&wire_sequence, args.sequence, __ATOMIC_RELEASE);
+    args.bytes = args.source_span_count = 0U;
+    status.ack_seen = status.cqe_word = 0U;
+    bool built;
     {
-      BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
-      status.phase = kReadStaging;
-      status.result = ReadStaging(*session, launch->request, args, status, first, last, profile);
+      BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
+      built = BuildCurrentRequest(*launch, args, first, last, profile);
     }
-    if (!status.result && args.pipeline_chunk_bytes) {
-      BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
-      WaitAck(args, status);
+    if (profile) { profile->bytes += args.bytes; profile->spans += args.source_span_count; }
+    if (!built)
+      status.result = kInvalidGatherRequest;
+    else if (StartGather(args, status, profile)) {
+      {
+        BatchGetProfileScope timer(profile ? &profile->read_ns : nullptr);
+        status.phase = kReadStaging;
+        status.result = ReadStaging(*session, launch->request, args, status, first, last, profile);
+      }
+      if (!status.result && args.pipeline_chunk_bytes) {
+        BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
+        WaitAck(args, status);
+      }
     }
+    if (status.result) { status.failed_request = first; break; }
+    // Both READ completions and the CPU's terminal ACK have been observed.
+    status.completed_requests += last - first;
   }
   // Status/profile are consumed by CANN D2H after kernel completion on this stream.
   if (profile) {
-    profile->bytes = args.bytes;
-    profile->spans = args.source_span_count;
     profile->exit_ns = BatchGetProfileNowNs();
     auto* destination = reinterpret_cast<BatchGetWorkerProfile*>(args.profile) + worker;
     *destination = *profile;

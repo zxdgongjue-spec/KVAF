@@ -17,9 +17,24 @@ class BenchmarkExecution:
     def __init__(self, kvaf, *, transport="urma", executor="aiv",
                  algorithm="direct", put_capacity=128, get_capacity=65536,
                  get_cores=0, get_jettys=0, put_cores=0, put_jettys=0, get_kernel="", put_kernel="",
-                 max_inflight_total=2048):
-        if not 1 <= put_capacity <= 65536 or not 1 <= get_capacity <= 65536:
-            raise ValueError("Put/Get request capacities must be in [1, 65536]")
+                 max_inflight_total=2048, gather_ddr_bytes=0, scatter_hbm_bytes=0,
+                 gather_read_wave_wrs=None):
+        if not 1 <= put_capacity <= 65536:
+            raise ValueError("Put request capacity must be in [1, 65536]")
+        get_max = (1 << 31) - 1
+        if not 1 <= get_capacity <= get_max:
+            raise ValueError(f"Get request capacity must be in [1, {get_max}]")
+        for name, value, expected in (("gather_ddr_bytes", gather_ddr_bytes, "gather"),
+                                      ("scatter_hbm_bytes", scatter_hbm_bytes, "scatter")):
+            if not 0 <= value <= (1 << 64) - 1:
+                raise ValueError(f"{name} must fit uint64")
+            if value and (transport != "urma" or executor != "aicpu" or algorithm != expected):
+                raise ValueError(f"{name} requires AICPU {expected} Get")
+        if gather_read_wave_wrs is not None:
+            if not 1 <= gather_read_wave_wrs <= 4096:
+                raise ValueError("gather_read_wave_wrs must be in [1, 4096]")
+            if (transport, executor, algorithm) != ("urma", "aicpu", "gather"):
+                raise ValueError("gather_read_wave_wrs requires AICPU Gather Get")
         self.mode = "unified"
         self.put_capacity = put_capacity
         self.get_capacity = get_capacity
@@ -38,6 +53,12 @@ class BenchmarkExecution:
         self.get_config = get = kvaf.GetExecutionConfig(transport, executor, algorithm)
         put_budget = dict(cores=put_cores, request_capacity=put_capacity)
         get_budget = dict(cores=get_cores, request_capacity=get_capacity)
+        if gather_ddr_bytes:
+            get_budget["gather_ddr_bytes"] = gather_ddr_bytes
+        if scatter_hbm_bytes:
+            get_budget["scatter_hbm_bytes"] = scatter_hbm_bytes
+        if gather_read_wave_wrs is not None:
+            get_budget["gather_read_wave_wrs"] = gather_read_wave_wrs
         if executor == "aiv":
             put_budget["kernel_path"] = put_kernel
             get_budget["kernel_path"] = get_kernel

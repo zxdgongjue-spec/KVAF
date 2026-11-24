@@ -87,7 +87,7 @@ class Transport {
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};
   std::uint64_t hbm_base_{}, source_base_{}, source_bytes_{};
-  std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
+  std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{}, window_capacity_{}, max_chunks_{};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push

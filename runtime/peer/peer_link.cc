@@ -1,5 +1,6 @@
 #include "peer_link.h"
 #include "execution_protocol.h"
+#include "gather_workspace.h"
 #include <atomic>
 #include <random>
 
@@ -897,6 +898,45 @@ Status PeerLink::PrepareGatherWorkspace(uint64_t region_base, uint64_t bytes,
   std::memcpy(prepared.segment_key.data(), response.segment_key, prepared.segment_key_bytes);
   regions_[prepared.base] = prepared;
   *workspace = prepared;
+  return Status::OK();
+}
+
+Status PeerLink::PrepareGatherWindow(uint64_t region_base, uint64_t budget, uint32_t token_bytes,
+                                    uint32_t workers, PeerRegion* workspace, uint32_t* capacity) {
+  if (!workspace || !capacity || !token_bytes || !workers || workers > kGatherMaxWorkers)
+    return Status::InvalidArgument("invalid Gather window configuration");
+  PeerRegion source;
+  auto status = LookupRegion(region_base, &source);
+  if (!status.ok()) return status;
+  PrepareGatherWindowRequest request{};
+  request.header = MakeHeader(Command::kPrepareGatherWindow, sizeof(request));
+  request.session_id = source.session_id; request.budget = budget;
+  request.token_bytes = token_bytes; request.workers = workers;
+  PrepareGatherWindowResponse response{};
+  std::string error;
+  if (!Exchange(*this, request, &response, &error) ||
+      !IsValidResponseHeader(response.header, Command::kPrepareGatherWindow, sizeof(response)) ||
+      !ResultOk(static_cast<Result>(response.result), &error))
+    return ToStatus("Gather DDR budget cannot prepare a window (minimum 4096 rows)", std::move(error));
+  const auto& allocation = response.workspace;
+  if (!ValidGatherWindow(token_bytes, workers, response.window_capacity) ||
+      (!budget && response.window_capacity != kDefaultGetWindow) ||
+      allocation.session_id != source.session_id || !allocation.peer_base || allocation.peer_base % 64U ||
+      allocation.peer_length != GatherRemoteWorkspaceBytes(token_bytes, workers, response.window_capacity) ||
+      allocation.peer_base > UINT64_MAX - allocation.peer_length ||
+      response.backing_bytes < allocation.peer_length || (budget && response.backing_bytes > budget) ||
+      !allocation.token_id || !allocation.token_value || !allocation.segment_key_bytes ||
+      allocation.segment_key_bytes > kSegKeyBytes)
+    return Status::Internal("peer returned an invalid Gather window");
+  PeerRegion prepared{};
+  prepared.session_id = allocation.session_id; prepared.base = allocation.peer_base;
+  prepared.length = allocation.peer_length; prepared.token_id = allocation.token_id;
+  prepared.token_value = allocation.token_value; prepared.segment_key_bytes = allocation.segment_key_bytes;
+  prepared.epoch = source.epoch; prepared.region_id = source.region_id;
+  std::memcpy(prepared.eid.data(), allocation.peer_eid, prepared.eid.size());
+  std::memcpy(prepared.segment_key.data(), allocation.segment_key, prepared.segment_key_bytes);
+  regions_[prepared.base] = prepared;
+  *workspace = prepared; *capacity = response.window_capacity;
   return Status::OK();
 }
 

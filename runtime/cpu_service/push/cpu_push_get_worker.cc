@@ -41,16 +41,25 @@ void Worker::Run() {
       return;
     }
     last = sequence;
-    status = transport_->ReadDescriptor(sequence);
-    if (!status.ok()) {
-      // Header errors occur before any data WRITE. A transport error may
-      // leave the queue poisoned; Complete then fails without reusing its slots.
-      (void)transport_->Complete(sequence, Result::kInvalidRequest);
-      std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str());
+    try {
+      status = transport_->ReadDescriptor(sequence);
+      if (!status.ok()) {
+        // Header errors occur before data WRITE. Complete itself refuses any
+        // poisoned/in-flight queue, so an unsafe transport cannot reuse slots.
+        (void)transport_->Complete(sequence, Result::kInvalidRequest);
+        std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str());
+        return;
+      }
+      status = transport_->WriteBatch();
+      if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
+      else (void)transport_->Complete(sequence, Result::kTransportError);
+    } catch (const std::exception& error) {
+      // Larger user windows may exhaust CPU descriptor/SGE allocation. Keep
+      // one failed execution from terminating the entire CPU service process.
+      try { (void)transport_->Complete(sequence, Result::kTransportError); } catch (...) {}
+      std::fprintf(stderr, "CPU_PUSH: window failed: %s\n", error.what());
       return;
     }
-    status = transport_->WriteBatch();
-    if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
     if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
     transport_->PrintProfile();
   }

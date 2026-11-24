@@ -71,6 +71,8 @@ class PeerExecutionResources final : public ExecutionResourceOwner {
     return Status::OK();
   }
   Status ValidateCapacity(std::uint32_t count) const {
+    if (!config_.put && IsWindowedGet({config_.transport, config_.executor, config_.algorithm}))
+      return Status::OK();
     return count <= capacity_ ? Status::OK()
                              : Status::InvalidArgument("request exceeds execution resource capacity");
   }

@@ -1,5 +1,27 @@
 add_library(kvaf_access_operator INTERFACE)
 
+if(BUILD_TESTING)
+  add_executable(kvaf_aicpu_get_window_test ../tests/aicpu_get_window_test.cc)
+  target_link_libraries(kvaf_aicpu_get_window_test PRIVATE kvaf_common)
+  add_test(NAME aicpu_get_window COMMAND kvaf_aicpu_get_window_test)
+  add_executable(kvaf_aicpu_scatter_window_test ../tests/aicpu_scatter_window_test.cc
+    algorithms/get/scatter/urma_aicpu/kernel/cpu_push_scatter.cc)
+  target_include_directories(kvaf_aicpu_scatter_window_test PRIVATE algorithms include)
+  target_link_libraries(kvaf_aicpu_scatter_window_test PRIVATE kvaf_common pthread)
+  add_test(NAME aicpu_scatter_window COMMAND kvaf_aicpu_scatter_window_test)
+  add_executable(kvaf_aicpu_gather_window_test ../tests/aicpu_gather_window_test.cc
+    algorithms/get/gather/urma_aicpu/kernel/gather_read.cc
+    ../runtime/cpu_service/gather/cpu_gather_executor.cc)
+  target_include_directories(kvaf_aicpu_gather_window_test PRIVATE
+    ../tests/aicpu_gather_model algorithms include ../runtime/include)
+  target_link_libraries(kvaf_aicpu_gather_window_test PRIVATE kvaf_common pthread)
+  add_test(NAME aicpu_gather_window COMMAND kvaf_aicpu_gather_window_test)
+  add_executable(kvaf_batch_get_window_model_test ../tests/batch_get_window_model_test.cc)
+  target_include_directories(kvaf_batch_get_window_model_test PRIVATE
+    ../tests/aiv_model include algorithms/get/direct/urma_aiv/include)
+  add_test(NAME batch_get_window_model COMMAND kvaf_batch_get_window_model_test)
+endif()
+
 target_include_directories(kvaf_access_operator
   INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
