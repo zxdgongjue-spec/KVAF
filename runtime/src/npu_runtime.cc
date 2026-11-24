@@ -527,20 +527,22 @@ struct NpuRuntime::Impl {
         throw std::invalid_argument("CPU thread budget requires AICPU Gather");
       if (!r.kernel_path.empty() && e == Executor::Aicpu)
         throw std::invalid_argument("AICPU kernel package is resolved through the CANN installation");
+      if (r.gather_ddr_bytes && (!get || t != Transport::Urma || e != Executor::Aicpu ||
+                                  algorithm != GetAlgorithm::Gather))
+        throw std::invalid_argument("gather_ddr_bytes requires AICPU Gather Get");
+      if (r.scatter_hbm_bytes && (!get || t != Transport::Urma || e != Executor::Aicpu ||
+                                   algorithm != GetAlgorithm::Scatter))
+        throw std::invalid_argument("scatter_hbm_bytes requires AICPU Scatter Get");
     }
     if (!budget.cores || budget.cores > (e == Executor::Aicpu ? 8U : 48U) ||
         !budget.request_capacity ||
         (budget.request_capacity > 65536U &&
-         !(get && IsAivDirectGet({t, e, algorithm}))) || budget.cpu_threads > 64U ||
+         !(get && IsWindowedGet({t, e, algorithm}))) || budget.cpu_threads > 64U ||
         (t == Transport::Urma && e == Executor::Aiv &&
          (!budget.jettys || budget.jettys > (get ? 64U : 2U) ||
           (get && *budget.max_inflight_total && *budget.max_inflight_total < 2U * budget.cores))))
       throw std::invalid_argument("invalid execution resource budget");
-    if (e == Executor::Aicpu) {
-      if (get && algorithm == GetAlgorithm::Gather &&
-          GatherStagingBytes(options.batch_get_token_bytes) > UINT32_MAX)
-        throw std::invalid_argument("AICPU Gather payload must fit uint32");
-    } else {
+    if (e != Executor::Aicpu) {
       if (budget.kernel_path.empty())
         throw std::invalid_argument("selected AIV provider requires its kernel path");
       if (!std::ifstream(budget.kernel_path, std::ios::binary).good())
@@ -648,7 +650,7 @@ struct NpuRuntime::Impl {
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        eids.front(), get});
+        eids.front(), get, budget.gather_ddr_bytes, budget.scatter_hbm_bytes});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif

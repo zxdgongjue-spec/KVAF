@@ -56,7 +56,8 @@ Host/Kernel 混用会在加载符号时失败。必须整体重编 Host、Python
 AIV Direct Get（URMA/UBMEM）移除 65536 条 provider 总量限制，`request_capacity` 配置仅作
 预热提示。实际调用仍受输入张量、int32 `miss_count` 以及 ABI 字段宽度约束；图和输出绑定
 必须按最大调用容量预热/准备。URMA 的临时 WQE bank、UBMEM 的地址批次与 MTE 缓冲区
-保持固定大小，不随总请求数增长。Gather/Scatter 和 Put 的容量限制保持原样。
+保持固定大小，不随总请求数增长。Gather/Scatter 也移除批次总量限制，并在一次 launch 内
+循环使用由字节预算决定的工作区，见 [AICPU 窗口](aicpu_get_windows.md)。Put 容量限制保持原样。
 
 性能入口接受 `--max-inflight-total`，环境变量为
 `KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`，默认 2048。通过统一性能入口扫描该参数。比较预算时固定核数、Jetty 数、请求分布、token 大小和 EID/UB 设备。

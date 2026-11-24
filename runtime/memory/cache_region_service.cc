@@ -124,7 +124,7 @@ Response CacheRegionService::CreateRecord(const Request& q) {
               (!q.workers || q.workers > (q.executor == Executor::Aicpu ? 8U : 48U) || !q.jettys ||
                q.jettys > 64 || !q.request_capacity ||
                (q.request_capacity > 65536 &&
-                (q.put || !IsAivDirectGet({q.transport, q.executor, q.algorithm}))) ||
+                (q.put || !IsWindowedGet({q.transport, q.executor, q.algorithm}))) ||
                q.cpu_threads > 64 || q.auxiliary_bytes > parent->request.auxiliary_bytes))
             status = Status::InvalidArgument("invalid execution capacity");
           if (status.ok()) {

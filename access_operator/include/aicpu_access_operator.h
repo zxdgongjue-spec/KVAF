@@ -10,6 +10,7 @@ struct UmdkAccessOperatorConfig {
   std::string batch_get_mode{"gather_read"};
   std::array<std::uint8_t, 16> local_eid{};
   bool enable_get{true};
+  std::uint64_t gather_ddr_bytes{0}, scatter_hbm_bytes{0};
 };
 // Runtime adapter with independent UMDK Put/Get sessions;
 // cpu_push_scatter owns an independent Host-side direct HCCP target.

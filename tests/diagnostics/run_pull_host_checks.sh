@@ -71,7 +71,7 @@ if [[ -n "$pybind_include" ]]; then
   extension_suffix="$("$KVAF_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
   module_flags=(-shared -fPIC)
   if [[ "$(uname -s)" == Darwin ]]; then module_flags+=(-undefined dynamic_lookup); fi
-  "$KVAF_CXX" -std=c++17 "${module_flags[@]}" -Ibindings/include -Itests/offload_fake_acl \
+  "$KVAF_CXX" -std=c++17 "${module_flags[@]}" -Ibindings/include -Itests/offload_fake_acl -Icommon/include \
     -I"$pybind_include" -I"$python_include" tests/npu_binding_metadata_module.cc bindings/src/acl_python_utils.cc \
     -o "$KVAF_CHECK_BUILD/_kvaf_binding_metadata_test$extension_suffix"
   PYTHONPATH="$KVAF_CHECK_BUILD:$PYTHONPATH" run "$KVAF_PYTHON" -m unittest test_npu_binding_metadata

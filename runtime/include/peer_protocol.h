@@ -32,6 +32,7 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kPrepareGatherWorkspace = 14U,
+  kPrepareGatherWindow = 15U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
@@ -107,6 +108,20 @@ struct PrepareGatherWorkspaceRequest {
   uint64_t session_id;
   uint64_t bytes;
 };
+// Size negotiation happens on the CPU so explicit HugeTLB rounding is included
+// in the caller's DDR budget. Zero budget preserves the 65536-row layout.
+struct PrepareGatherWindowRequest {
+  MessageHeader header;
+  uint64_t session_id, budget;
+  uint32_t token_bytes, workers;
+};
+struct PrepareGatherWindowResponse {
+  MessageHeader header;
+  int32_t result;
+  uint32_t window_capacity;
+  uint64_t backing_bytes;
+  AllocateRegionResponse workspace;
+};
 
 struct CreateChannelRequest {
   MessageHeader header;
@@ -136,7 +151,7 @@ struct ReleaseRegionRequest {
 };
 
 // UBmem allocation shares the service and session namespace with URMA.
-// Existing URMA v6 records and entry points stay usable.
+// Header byte counts reject peers with incompatible window-setup layouts.
 struct AllocateUbmemRegionRequest {
   MessageHeader header;
   uint64_t ddr_bytes;
@@ -178,7 +193,7 @@ struct CpuPushChannelKey {
 struct OpenCpuPushGetRequest {
   MessageHeader header;
   uint64_t session_id, source_bytes, hbm_base, hbm_bytes, npu_tp;
-  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers;
+  uint32_t npu_psn, token_value, segment_bytes, token_bytes, workers, window_capacity;
   uint8_t eid[kEidBytes], segment[kSegKeyBytes];
   CpuPushChannelKey channels[4];
 };
@@ -201,6 +216,8 @@ static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
 static_assert(sizeof(PrepareGatherWorkspaceRequest) == 28U, "Gather workspace request ABI changed");
+static_assert(sizeof(PrepareGatherWindowRequest) == 36U, "Gather window request ABI changed");
+static_assert(sizeof(PrepareGatherWindowResponse) == 160U, "Gather window response ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
@@ -208,7 +225,7 @@ static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
-static_assert(sizeof(OpenCpuPushGetRequest) == 424U, "CPU push setup ABI changed");
+static_assert(sizeof(OpenCpuPushGetRequest) == 428U, "CPU push setup ABI changed");
 static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 

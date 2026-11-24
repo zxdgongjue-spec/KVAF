@@ -91,6 +91,12 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="Jettys per AIV core; aiv only (1..64, default: 2)")
     group.add_argument("--max-inflight-total", type=int, default=None,
                        help="unconfirmed READ budget; aiv only (default: 2048; 0 uses SQ/CQ capacity)")
+    group.add_argument("--gather-ddr-bytes", type=int,
+                       default=environment_int("KVAF_BATCH_GET_GATHER_DDR_BYTES", 0),
+                       help="Gather extra CPU DDR budget including metadata; 0 keeps the 65536-row layout")
+    group.add_argument("--scatter-hbm-bytes", type=int,
+                       default=environment_int("KVAF_BATCH_GET_SCATTER_HBM_BYTES", 0),
+                       help="Scatter contiguous HBM budget including metadata; 0 keeps the 65536-row layout")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU tries candidates in order")
@@ -147,7 +153,7 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
-    request_max = 65536 if uses_aicpu(args) else MAX_INT32
+    request_max = MAX_INT32
     if not 1 <= args.request_length <= request_max:
         return f"request-length must be in [1, {request_max}]"
     if not 1 <= args.table_capacity <= MAX_INT32:
@@ -163,8 +169,14 @@ def validate_workload(args):
     maximum = 8 if uses_aicpu(args) else 48
     if not 1 <= args.parallelism <= maximum:
         return f"{parallelism_field(args.backend).replace('_', '-')} must be in [1, {maximum}]"
-    if uses_aicpu(args) and max(args.token_bytes * 65536, args.token_bytes * args.tokens_per_block) > 0xFFFFFFFF:
-        return "AICPU token workspace and block bytes must fit uint32"
+    if uses_aicpu(args) and args.token_bytes * args.tokens_per_block > 0xFFFFFFFF:
+        return "AICPU source block bytes must fit uint32"
+    for name, backend in (("gather_ddr_bytes", "gather_read"), ("scatter_hbm_bytes", "cpu_push_scatter")):
+        value = getattr(args, name, 0)
+        if not 0 <= value <= MAX_UINT64:
+            return f"{name.replace('_', '-')} must fit uint64"
+        if value and args.backend != backend:
+            return f"{name.replace('_', '-')} requires --backend {backend}"
     if args.transport == "ubmem" and args.peer_ub_device:
         return "peer-ub-device applies only to URMA"
     if not 1 <= args.jettys_per_core <= MAX_JETTYS_PER_CORE:
@@ -199,6 +211,9 @@ def workload_command(args):
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:
         command += ["--peer-ub-device", args.peer_ub_device]
+    for name in ("gather_ddr_bytes", "scatter_hbm_bytes"):
+        if getattr(args, name, 0):
+            command += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     return command
 
 
@@ -216,6 +231,10 @@ def configure_backend_help(parser, argv=None):
     hidden.add("aiv_cores" if aicpu else "aicpu_workers")
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
+    if backend != "gather_read":
+        hidden.add("gather_ddr_bytes")
+    if backend != "cpu_push_scatter":
+        hidden.add("scatter_hbm_bytes")
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

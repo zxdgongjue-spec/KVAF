@@ -5,12 +5,18 @@
 using aclError = int;
 using aclrtStream = void*;
 using aclrtEvent = void*;
+using aclmdlRI = void*;
+enum aclmdlRICaptureStatus { ACL_MODEL_RI_CAPTURE_STATUS_NONE, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE,
+                              ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED };
 constexpr int ACL_SUCCESS = 0;
 constexpr std::uint32_t ACL_EVENT_TIME_LINE = 8;
 constexpr int ACL_MEM_MALLOC_NORMAL_ONLY = 0;
+constexpr int ACL_MEM_MALLOC_HUGE_FIRST = 1;
 constexpr int ACL_MEMCPY_DEVICE_TO_HOST = 2;
 constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
 extern "C" {
+const char* aclGetRecentErrMsg();
+aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus*, aclmdlRI*);
 aclError aclrtSetDevice(int32_t);
 aclError aclrtMemcpy(void*, std::size_t, const void*, std::size_t, int);
 aclError aclrtMemcpyAsync(void*, std::size_t, const void*, std::size_t, int, aclrtStream);

@@ -48,7 +48,7 @@ CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
 当前 push 协议为 V3，逐行复制源于 `codex/aicpu-ordered-write` 的
 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24），Ready 由 AICPU 按 Jetty 分片消费。
-当前设备入口为 `KvafAicpuCpuPushScatterExecutionV3`。主机库和设备 SO 必须一起更新，
+当前设备入口为 `KvafAicpuCpuPushScatterExecutionV4`。主机库和设备 SO 必须一起更新，
 包括移除废弃排序字段后的 profile 布局。以下命令从各自仓库根目录执行。
 CPU 端构建服务：
 
@@ -135,7 +135,8 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
 
 ## 请求与数据流
 
-一次调用处理 `int32 miss_count` 指定的有效前缀，最多 65536 项。
+一次调用处理 `int32 miss_count` 指定的有效前缀，全部窗口在同一次 kernel launch 内执行。
+总量不再限制为 65536；窗口由 `scatter_hbm_bytes` 选择，见 [窗口与预算](aicpu_get_windows.md)。
 每项读取 `addresses[indices[i]] + offsets[i]` 的 `token_bytes` 字节，
 目标为 `output + output_indices[i] * token_bytes`。
 调用方继续负责有效 key、token 布局、输出映射及这些资源在操作完成前的生命周期。
@@ -205,11 +206,13 @@ ready 热循环与 V24 一样只读 worker 协调状态；Runtime 的远端错�
 
 HBM workspace 包含独立缓存行上的请求头、notify、done、各 worker 的四路 ready，
 随后是源清单和连续 staging。
-staging 容量为 `65536 * token_bytes`，另有 512 KiB 的源地址数组；
-workspace 在初始化时分配，每轮复用，总 payload 必须能用 uint32 表示。
+默认 staging 容量为 `65536 * token_bytes`，另有 512 KiB 的源地址数组；显式配置
+`scatter_hbm_bytes` 时选择预算内最大的 4096 倍数窗口，源数组按窗口条数乘 8 字节准备。
+workspace 在初始化时分配，窗口间复用，每个窗口 payload 必须能用 uint32 表示。
 此路径不预留远端 DDR gather staging，也不注册调用方 output 为 URMA 目标。
 
-此路径使用部署环境提供的 DMA 可见性，不执行手动缓存行刷新。
+首窗口沿用部署环境提供的 DMA 可见性；同一次 launch 中复用 staging 的后续窗口，
+在 ready 确认后对即将读取的源区间做缓存维护和屏障，避免上一窗口的缓存残留。
 算子只遍历输入生成源清单和执行 scatter，不逐项校验 Tensor 内容或校验 payload。
 调用方须提供有效的索引、偏移、源地址和输出行；保留请求容量和有效前缀长度检查。
 

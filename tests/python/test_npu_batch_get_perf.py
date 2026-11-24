@@ -374,6 +374,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
         get_capacity=args.request_length,
+        gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0), scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
     )
     stream = torch.npu.current_stream()
     if args.multi_graph_check:
@@ -902,6 +903,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
         max_inflight_total=args.max_inflight_total,
+        gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0), scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
     )
     runtime = kvaf.NpuRuntime(
         **runtime_options(args),

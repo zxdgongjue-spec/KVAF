@@ -24,6 +24,11 @@ struct GetExecutionConfig {
 inline bool IsAivDirectGet(GetExecutionConfig config) {
   return config.executor == Executor::Aiv && config.algorithm == GetAlgorithm::Direct;
 }
+inline bool IsWindowedGet(GetExecutionConfig config) {
+  return IsAivDirectGet(config) ||
+      (config.transport == Transport::Urma && config.executor == Executor::Aicpu &&
+       (config.algorithm == GetAlgorithm::Gather || config.algorithm == GetAlgorithm::Scatter));
+}
 inline bool operator==(PutExecutionConfig a, PutExecutionConfig b) {
   return a.transport == b.transport && a.executor == b.executor;
 }
@@ -38,12 +43,16 @@ struct ExecutionResources {
   // Zero cores selects provider defaults: URMA AIV 2, UBMEM AIV 16,
   // AICPU Put 1, AICPU Get 5. Zero Jettys selects 2 for URMA AIV. An absent
   // in-flight budget uses 2048; explicit zero uses SQ/CQ capacity for URMA AIV Get.
-  // AIV Direct Get derives total capacity from each invocation's buffers;
-  // request_capacity is a warmup hint there, a provider limit for other paths.
+  // Get derives total capacity from each invocation's buffers; request_capacity
+  // is a warmup hint for Get and a provider limit for Put.
   // Empty AIV kernel paths use this build's bin output; AICPU packages resolve through CANN.
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};
   std::optional<std::uint32_t> max_inflight_total;
   std::string kernel_path;
+  // AICPU Get workspace budgets, in bytes, including its descriptors/control.
+  // Zero preserves the legacy 65536-row workspace. The chosen global window
+  // is the largest multiple of 4096 fitting the selected memory budget.
+  std::uint64_t gather_ddr_bytes{0}, scatter_hbm_bytes{0};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

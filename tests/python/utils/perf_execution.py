@@ -17,12 +17,18 @@ class BenchmarkExecution:
     def __init__(self, kvaf, *, transport="urma", executor="aiv",
                  algorithm="direct", put_capacity=128, get_capacity=65536,
                  cores=0, jettys=2, get_kernel="", put_kernel="",
-                 max_inflight_total=2048):
+                 max_inflight_total=2048, gather_ddr_bytes=0, scatter_hbm_bytes=0):
         if not 1 <= put_capacity <= 65536:
             raise ValueError("Put request capacity must be in [1, 65536]")
-        get_max = (1 << 31) - 1 if executor == "aiv" and algorithm == "direct" else 65536
+        get_max = (1 << 31) - 1
         if not 1 <= get_capacity <= get_max:
             raise ValueError(f"Get request capacity must be in [1, {get_max}]")
+        for name, value, expected in (("gather_ddr_bytes", gather_ddr_bytes, "gather"),
+                                      ("scatter_hbm_bytes", scatter_hbm_bytes, "scatter")):
+            if not 0 <= value <= (1 << 64) - 1:
+                raise ValueError(f"{name} must fit uint64")
+            if value and (transport != "urma" or executor != "aicpu" or algorithm != expected):
+                raise ValueError(f"{name} requires AICPU {expected} Get")
         self.mode = "unified"
         self.put_capacity = put_capacity
         self.get_capacity = get_capacity
@@ -41,6 +47,10 @@ class BenchmarkExecution:
         self.get_config = get = kvaf.GetExecutionConfig(transport, executor, algorithm)
         put_budget = dict(cores=cores, request_capacity=put_capacity)
         get_budget = dict(cores=cores, request_capacity=get_capacity)
+        if gather_ddr_bytes:
+            get_budget["gather_ddr_bytes"] = gather_ddr_bytes
+        if scatter_hbm_bytes:
+            get_budget["scatter_hbm_bytes"] = scatter_hbm_bytes
         if executor == "aiv":
             put_budget["kernel_path"] = put_kernel
             get_budget["kernel_path"] = get_kernel

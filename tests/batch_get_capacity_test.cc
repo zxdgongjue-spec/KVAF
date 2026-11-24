@@ -63,8 +63,8 @@ int main() {
   };
   check(Transport::Urma, Executor::Aiv, GetAlgorithm::Direct, false, true);
   check(Transport::Ubmem, Executor::Aiv, GetAlgorithm::Direct, false, true);
-  check(Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather, false, false);
-  check(Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter, false, false);
+  check(Transport::Urma, Executor::Aicpu, GetAlgorithm::Gather, false, true);
+  check(Transport::Urma, Executor::Aicpu, GetAlgorithm::Scatter, false, true);
   check(Transport::Urma, Executor::Aiv, GetAlgorithm::Direct, true, false);
   check(Transport::Ubmem, Executor::Aiv, GetAlgorithm::Direct, true, false);
   check(Transport::Urma, Executor::Aicpu, GetAlgorithm::Direct, true, false);

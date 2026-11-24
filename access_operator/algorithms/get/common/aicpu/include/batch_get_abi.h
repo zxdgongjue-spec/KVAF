@@ -32,9 +32,11 @@ enum GatherReadError : std::uint64_t {
 
 struct alignas(64) GatherReadStatus {
   std::uint64_t magic, result, phase, ack_seen, cqe_word, sequence;
+  std::uint64_t completed_requests, failed_request;
 };
 struct alignas(64) GatherExecutionControl {
   std::uint64_t claimed{}, failed{}, reserved[6]{};
+  alignas(64) std::uint64_t window_sequence[kGatherMaxWorkers]{};
 };
 struct GatherReadArgs {
   UmdkContext context;
@@ -48,13 +50,15 @@ struct GatherReadArgs {
   std::uint32_t sgl_size{6U}, worker_count{1U}, sq_batch_wqes{32U};
   std::uint32_t worker_index{0U};
   std::uint32_t pipeline_chunk_bytes{kGatherChunkBytes};
+  std::uint32_t window_capacity{kDefaultGetWindow};
   std::uint64_t profile{0U};
   std::uint64_t execution_control{0U};
 };
 // One stable registered HBM workspace, independent of caller output allocations.
 constexpr std::uint64_t kGatherDescriptorOffset = kGatherMaxWorkers * 64U;
-inline constexpr std::uint64_t GatherWorkspaceBytes(std::uint32_t workers) {
-  return kGatherDescriptorOffset + workers * GatherLaneDescriptorBytes(workers);
+inline constexpr std::uint64_t GatherWorkspaceBytes(
+    std::uint32_t workers, std::uint32_t capacity = kDefaultGetWindow) {
+  return kGatherDescriptorOffset + workers * GatherLaneDescriptorBytes(workers, capacity);
 }
 static_assert(sizeof(GatherReadArgs) <= 256U);
 struct AicpuBatchGetInput {
@@ -78,5 +82,7 @@ struct KernelArgs {
   std::uint64_t workspace{}, output{}, output_bytes{}, coordination{}, status{}, profile{};
   std::uint64_t sequence{};  // Assigned in each instance's local copy after claiming a ticket.
   std::uint32_t workers{}, timeout_ms{kTimeoutMs};
+  std::uint32_t window_capacity{kDefaultGetWindow};
+  std::uint64_t window_base{};
 };
 }  // namespace kvaf::cpu_push

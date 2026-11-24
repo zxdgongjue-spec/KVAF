@@ -37,6 +37,7 @@ struct CpuPushTransport::Impl {
   void* profile_host{};
   std::array<std::unique_ptr<d::TargetChannel>, kJettyCount> channels;
   Layout layout;
+  std::uint32_t window_capacity{};
   using Invocation = aicpu_urma::AicpuGetInvocation;
   ExecutionViewState views;
   Invocation default_invocation{this};
@@ -106,7 +107,7 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
   auto& s = *impl_;
   const auto* status = s.invocation->graph_completion.get();
   const auto* profile = s.invocation->graph_profile.get();
-  return {s.views.View(ExecutionDirection::Get), {s.config.workers, s.config.token_bytes},
+  return {s.views.View(ExecutionDirection::Get), {s.config.workers, s.config.token_bytes, s.window_capacity},
       s.memory, s.coordination,
       {status ? status->device : s.status_device, status ? status->host : s.status_host,
        s.config.workers * sizeof(WorkerStatus)},
@@ -127,8 +128,7 @@ Status CpuPushTransport::PrepareGraph(const GetGraphOptions& options) {
   auto& call = *s.invocation;
   if (!s.initialized) return Status::NotInitialized("CPU push is not initialized");
   if (!options.stream || !options.output.data || !options.output.bytes ||
-      options.output.device != DeviceKind::kNpu || !options.request_capacity ||
-      options.request_capacity > kMaxRequests)
+      options.output.device != DeviceKind::kNpu || !options.request_capacity)
     return Status::InvalidArgument("invalid Scatter graph options");
   if (call.graph_active || call.captured_stream)
     return Status::Busy("Scatter capture already owns this execution state");
@@ -260,10 +260,16 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
 Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   auto& s = *impl_;
   if (s.context || s.memory || s.initialized) return Status::InvalidState("CPU push already initialized");
-  if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout) ||
+  s.window_capacity = ScatterWindowCapacity(s.config.token_bytes, s.config.workers, s.config.hbm_bytes);
+  if (!s.window_capacity)
+    return Status::InvalidArgument("Scatter HBM budget cannot fit a window (minimum 4096 rows)");
+  if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.window_capacity) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
       !aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str()))
     return Status::InvalidArgument("CPU push requires kernel JSON, PeerLink, local EID and valid shape");
+  std::fprintf(stderr, "[KVAF] SCATTER_WINDOW capacity=%u budget=%llu bytes=%llu\n",
+      s.window_capacity, static_cast<unsigned long long>(s.config.hbm_bytes),
+      static_cast<unsigned long long>(s.layout.bytes));
   s.source = source;
   peer::PeerRegion region;
   auto result = s.config.peer_link->LookupRegion(source.base, &region);
@@ -312,6 +318,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.segment_bytes = sizeof(segment);
   open.token_bytes = s.config.token_bytes;
   open.workers = s.config.workers;
+  open.window_capacity = s.window_capacity;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);
   std::uint64_t npu_tp = 0;
@@ -378,8 +385,8 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec, std::optional<
   KernelArgs checked{};
   ready = detail::BuildBatchGetKernelArgs(exec, &checked.request);
   if (!ready.ok()) return ready;
-  if (checked.request.request_capacity > kMaxRequests || checked.request.token_bytes != s.config.token_bytes)
-    return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
+  if (checked.request.token_bytes != s.config.token_bytes)
+    return Status::InvalidArgument("CPU push differs from configured token size");
   const auto bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
   if (exec.execution.profile || s.profiling) {
     if (capturing && (!s.profile_device || !s.profile_host))
@@ -421,8 +428,8 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.request.canonical_base = view.common.region().canonical_base;
   args.request.logical_bytes = view.common.region().logical_bytes;
   if (!result.ok()) return result;
-  if (args.request.request_capacity > kMaxRequests || args.request.token_bytes != view.options.token_bytes)
-    return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
+  if (args.request.token_bytes != view.options.token_bytes)
+    return Status::InvalidArgument("CPU push differs from configured token size");
   const auto profile_bytes = view.options.workers * sizeof(BatchGetWorkerProfile);
   args.workspace = detail::PointerValue(view.workspace);
   args.output = detail::PointerValue(exec.request->output.data);
@@ -431,6 +438,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.status = detail::PointerValue(view.completion.device);
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
+  args.window_capacity = view.options.window_capacity;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;

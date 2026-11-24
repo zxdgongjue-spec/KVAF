@@ -25,7 +25,7 @@ struct PutLaunchView {
 };
 
 // Shared execution-only pieces. No MR, context, session owner or setup API.
-struct AicpuKernelOptions { std::uint32_t workers{}, token_bytes{}; };
+struct AicpuKernelOptions { std::uint32_t workers{}, token_bytes{}, window_capacity{}; };
 struct AicpuBufferView { void* device{}; void* host{}; std::size_t bytes{}; };
 struct AicpuGetInvocation final : ExecutionState {
   explicit AicpuGetInvocation(const void* value) : owner(value) {}

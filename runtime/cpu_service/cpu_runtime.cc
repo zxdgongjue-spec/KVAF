@@ -159,6 +159,8 @@ Status CpuRuntime::ServeConnection(int fd) {
       return Reply<peer::CreateChannelResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kOpenCpuPushGet:
       return Reply<peer::OpenCpuPushGetResponse>(fd, command, peer::Result::kResourceError);
+    case peer::Command::kPrepareGatherWindow:
+      return Reply<peer::PrepareGatherWindowResponse>(fd, command, peer::Result::kResourceError);
     case peer::Command::kEnableDirectGather:
     case peer::Command::kEnableGatherLanes:
     case peer::Command::kStartCpuPushGet:

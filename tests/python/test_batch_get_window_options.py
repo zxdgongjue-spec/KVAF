@@ -1,9 +1,9 @@
-"""Large Direct Get workloads remain distinct from bounded Gather/Scatter/Put."""
+"""All Get paths accept large batches; workspace windows and Put remain bounded."""
 import argparse
 import unittest
 from types import SimpleNamespace
 
-from utils.get_options import add_backend_arguments, add_workload_arguments, resolve_backend, validate_workload
+from utils.get_options import add_backend_arguments, add_workload_arguments, resolve_backend, validate_workload, workload_command
 from utils.perf_execution import BenchmarkExecution
 
 
@@ -24,10 +24,11 @@ class WindowOptions(unittest.TestCase):
                 self.assertIsNone(validate_workload(workload(backend, count)))
             self.assertIsNotNone(validate_workload(workload(backend, 1 << 31)))
 
-    def test_aicpu_capacity_stays_bounded(self):
+    def test_large_aicpu_get(self):
         for backend in ("gather_read", "cpu_push_scatter"):
-            self.assertIsNone(validate_workload(workload(backend, 65536)))
-            self.assertIsNotNone(validate_workload(workload(backend, 65537)))
+            for count in (65536, 65537, 1000000):
+                self.assertIsNone(validate_workload(workload(backend, count)))
+            self.assertIsNotNone(validate_workload(workload(backend, 1 << 31)))
 
     def test_benchmark_resources_and_put_limit(self):
         kvaf = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
@@ -38,8 +39,28 @@ class WindowOptions(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Put request"):
                 BenchmarkExecution(kvaf, transport=transport, put_capacity=65537)
         for algorithm in ("gather", "scatter"):
-            with self.assertRaisesRegex(ValueError, "Get request"):
-                BenchmarkExecution(kvaf, executor="aicpu", algorithm=algorithm, get_capacity=65537)
+            run = BenchmarkExecution(kvaf, executor="aicpu", algorithm=algorithm, get_capacity=65537)
+            self.assertEqual(run.get_capacity, 65537)
+
+    def test_workspace_budgets_and_child_command(self):
+        kvaf = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                               ExecutionResources=lambda **kw: kw)
+        for backend, algorithm, name in (("gather_read", "gather", "gather_ddr_bytes"),
+                                         ("cpu_push_scatter", "scatter", "scatter_hbm_bytes")):
+            args = workload(backend, 1000000)
+            self.assertEqual(getattr(args, name), 0)
+            setattr(args, name, 64 << 20)
+            self.assertIsNone(validate_workload(args))
+            command = workload_command(args)
+            self.assertIn("--" + name.replace("_", "-"), command)
+            run = BenchmarkExecution(kvaf, executor="aicpu", algorithm=algorithm, **{name: 64 << 20})
+            self.assertEqual(run.runtime_kwargs["get_resources"][0][1][name], 64 << 20)
+            setattr(args, name, -1)
+            self.assertIsNotNone(validate_workload(args))
+            with self.assertRaises(ValueError):
+                BenchmarkExecution(kvaf, **{name: 1})
+            with self.assertRaises(ValueError):
+                BenchmarkExecution(kvaf, executor="aicpu", algorithm=algorithm, **{name: 1 << 64})
 
 
 if __name__ == "__main__":
