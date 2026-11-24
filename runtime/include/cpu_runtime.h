@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "runtime.h"
 
@@ -12,9 +13,12 @@ enum class CpuGatherMode { kAdaptive, kActive, kPassive };
 enum class CpuMemoryPageMode {
   kDefault,
   kTransparentHugePage,
-  kHugeTlb2M,
-  kHugeTlb1G,
+  // Explicit HugeTLB modes use log2(page size in bytes).
+  kHugeTlb2M = 21,
+  kHugeTlb1G = 30,
 };
+
+bool ParseCpuMemoryPageMode(std::string_view text, CpuMemoryPageMode& mode);
 
 struct CpuRuntimeOptions {
   std::string ub_device;

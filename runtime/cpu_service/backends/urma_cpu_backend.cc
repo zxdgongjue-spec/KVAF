@@ -636,12 +636,12 @@ class CpuService {
     const auto& allocated = *regions_.emplace(id, std::move(region)).first->second;
     const std::size_t backing_bytes = allocated.mapped_bytes != 0U
         ? allocated.mapped_bytes : static_cast<std::size_t>(bytes);
-    const char* page_mode = borrowed ? "shared" : CpuMemoryPageModeName(memory_page_mode_);
+    const std::string page_mode = borrowed ? "shared" : CpuMemoryPageModeName(memory_page_mode_);
     Log("[KVAF_CPU] REGION_ALLOCATED session=%" PRIu64 " candidate=%u ub_device=%s eid_index=%u "
         "bytes=%" PRIu64 " base=0x%" PRIx64 " token_id=0x%x reg_flags=0x%x page_mode=%s "
         "memory=%p backing_bytes=%zu\n",
         id, candidate_id, resources->device_name().c_str(), resources->eid_index(), bytes,
-        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, page_mode,
+        response->peer_base, response->token_id, CpuDdrRegistration::Flags().value, page_mode.c_str(),
         allocated.memory, backing_bytes);
     return Result::kOk;
   }
