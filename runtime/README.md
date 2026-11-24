@@ -95,6 +95,21 @@ import、CTP、双侧 Jetty 和真实 RMA 写路径。`link_to` 是 NPU Runtime 
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 无默认值，
 构造 `NpuRuntime` 时必须显式传入。
 
+### 可选单机多进程初始化串行化
+
+同机、同一用户下，多个 worker 连接同一 CPU endpoint 时，可在启动 worker 前设置
+`KVAF_SERIALIZE_INITIALIZE=1`，让 `NpuRuntime::Initialize` 依次执行，缓解并发启动压力。
+默认关闭；不需要修改 Python/vLLM 调用或更新 CPU service，只需重建 NPU Runtime/binding
+（`./build.sh npu`）。
+
+锁在参数校验后、启动 RPC 前获取，在 `Initialize` 返回时释放，不影响后续读写。
+`KVAF_INITIALIZE_LOCK_TIMEOUT_SECONDS` 默认为 1800，只限制等锁时长，超时则本次初始化失败。
+`[KVAF_INIT_GATE]` 日志分别记录等锁和持锁耗时；比较多卡启动时也应看所有 worker 的总就绪时间。
+
+默认锁文件按用户和 endpoint 区分。若 worker 使用不同 endpoint 别名，可将
+`KVAF_INITIALIZE_LOCK_PATH` 设置为同一个绝对路径；容器中的 worker 必须共享同一锁文件。
+不要删除或替换正在使用的锁文件。此开关不协调跨主机启动，也不保证按卡号执行。
+
 ### 可选启动 UB device 选优
 
 `--adaptive-ub-device` 仅在 K 端未指定 `--ub-device` 时启用启动测速：N 端脚本从

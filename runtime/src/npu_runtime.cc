@@ -34,6 +34,7 @@
 #endif
 #include "startup_bandwidth_probe.h"
 #include "startup_selection.h"
+#include "initialize_gate.h"
 
 namespace kvaf {
 namespace {
@@ -610,6 +611,11 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
     return Status::InvalidArgument("DDR size must be a nonzero multiple of slot_size");
   }
+
+  detail::InitializeGate initialize_gate;
+  const Status gate_status = initialize_gate.AcquireFromEnvironment(
+      impl_->peer_link->address(), impl_->options.device_id, kUbSelectorLockPath);
+  if (!gate_status.ok()) return gate_status;
 
   if (impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()) {
     const Status status = Shutdown();

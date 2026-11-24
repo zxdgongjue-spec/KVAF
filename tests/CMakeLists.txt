@@ -1,4 +1,13 @@
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Threads REQUIRED)
+
+add_executable(kvaf_initialize_gate_test initialize_gate_test.cc)
+target_include_directories(kvaf_initialize_gate_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/runtime/src)
+target_link_libraries(kvaf_initialize_gate_test PRIVATE kvaf_common Threads::Threads)
+add_test(NAME kvaf_initialize_gate_test COMMAND kvaf_initialize_gate_test)
+set_tests_properties(kvaf_initialize_gate_test PROPERTIES TIMEOUT 30)
+
 add_executable(kvaf_append_only_meta_test append_only_meta_manager_test.cc)
 target_link_libraries(kvaf_append_only_meta_test PRIVATE kvaf_meta_manager)
 add_test(NAME kvaf_append_only_meta_test COMMAND kvaf_append_only_meta_test)
