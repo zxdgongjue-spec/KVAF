@@ -44,40 +44,28 @@ struct CpuPushTransport::Impl {
   bool peer_open{}, initialized{}, profiling{};
   ExecutionHealth health;
 
-  Status Drain(GetProviderTiming* = nullptr);
+  Status Drain();
 };
-static Status DrainScatter(const aicpu_urma::ScatterLaunchView& view, aicpu_urma::AicpuGetInvocation& call,
-                           GetProviderTiming* timing = nullptr) {
+static Status DrainScatter(const aicpu_urma::ScatterLaunchView& view, aicpu_urma::AicpuGetInvocation& call) {
   const auto stream = call.pending ? call.pending : call.captured_stream;
   if (!stream) return view.health->failed ? (call.failure.ok() ?
       Status::InvalidState("CPU push failed; shutdown required") : call.failure) : Status::OK();
   bool capturing = false;
-  const auto capture_start = GetHostTimingStart(timing);
   auto allowed = detail::BatchGetCapture(stream, true, false, &capturing);
-  GetHostTimingRecord(timing, &GetProviderTiming::capture_check_ns, capture_start);
   if (!allowed.ok()) return allowed;
   const auto bytes = view.options.workers * sizeof(WorkerStatus);
-  const auto enqueue_start = GetHostTimingStart(timing);
   if (!view.health->failed && aclrtMemcpyAsync(view.completion.host, bytes, view.completion.device, bytes,
                        ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS) {
     view.health->failed = true;
     return call.failure = Error("cannot enqueue execution status; resources retained");
   }
-  GetHostTimingRecord(timing, &GetProviderTiming::status_enqueue_ns, enqueue_start);
-  if (timing) timing->sync_begin_ns = BatchGetProfileNowNs();
-  const auto synchronized = aclrtSynchronizeStream(stream);
-  if (timing) {
-    timing->sync_end_ns = BatchGetProfileNowNs();
-    timing->stream_sync_ns += timing->sync_end_ns - timing->sync_begin_ns;
-  }
-  if (synchronized != ACL_SUCCESS) {
+  if (aclrtSynchronizeStream(stream) != ACL_SUCCESS) {
     view.health->failed = true;
     return call.failure = Error("stream failed; resources retained");
   }
   call.pending = nullptr;
   if (view.health->failed) return call.failure.ok() ?
       Status::InvalidState("CPU push failed; shutdown required") : call.failure;
-  BatchGetProfileScope check(timing ? &timing->status_check_ns : nullptr);
   const auto* statuses = static_cast<const WorkerStatus*>(view.completion.host);
   const auto sequence = statuses[0].sequence;
   if (call.graph_active && std::all_of(statuses, statuses + view.options.workers,
@@ -126,15 +114,15 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
       {profile ? profile->device : s.profile_device, profile ? profile->host : s.profile_host,
        s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling};
 }
-Status CpuPushTransport::Impl::Drain(GetProviderTiming* timing) {
+Status CpuPushTransport::Impl::Drain() {
   aicpu_urma::ScatterLaunchView view;
   view.options.workers = config.workers; view.health = &health;
   const auto* report = invocation->graph_completion.get();
   view.completion = {report ? report->device : status_device,
                      report ? report->host : status_host, config.workers * sizeof(WorkerStatus)};
-  return DrainScatter(view, *invocation, timing);
+  return DrainScatter(view, *invocation);
 }
-Status CpuPushTransport::Drain(GetProviderTiming* timing) { return impl_->Drain(timing); }
+Status CpuPushTransport::Drain() { return impl_->Drain(); }
 Status CpuPushTransport::PrepareGraph(const GetGraphOptions& options) {
   auto& s = *impl_;
   auto& call = *s.invocation;
@@ -379,10 +367,8 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec, std::optional<
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.profile_complete = false;
   bool capturing = false;
-  auto phase = GetHostTimingStart(exec.host_timing);
   auto ready = detail::BatchGetCapture(stream, exec.execution.synchronize,
                                        exec.execution.profile != nullptr, &capturing, expected_capture);
-  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::prepare_capture_ns, phase);
   if (!ready.ok()) return ready;
   if (call.captured_stream && call.captured_stream != stream)
     return Status::InvalidArgument("captured AICPU transport must use its capture stream");
@@ -390,19 +376,15 @@ Status CpuPushTransport::Prepare(const BatchGetExecRequest& exec, std::optional<
     if (call.pending && call.pending != stream)
       return Status::InvalidState("drain previous AICPU work outside capture on its stream");
   } else {
-    BatchGetProfileScope previous(exec.host_timing ? &exec.host_timing->previous_completion_ns : nullptr);
     ready = s.Drain();
     if (!ready.ok()) return ready;
   }
-  phase = GetHostTimingStart(exec.host_timing);
   ready = detail::BuildBatchGetKernelArgs(exec, &call.prepared_input);
-  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::input_build_ns, phase);
   if (!ready.ok()) return ready;
   if (call.prepared_input.request_capacity > kMaxRequests || call.prepared_input.token_bytes != s.config.token_bytes)
     return Status::InvalidArgument("CPU push exceeds request capacity or configured token size");
   const auto bytes = s.config.workers * sizeof(BatchGetWorkerProfile);
   if (exec.execution.profile || s.profiling) {
-    BatchGetProfileScope buffers(exec.host_timing ? &exec.host_timing->profile_buffers_ns : nullptr);
     if (capturing && (!s.profile_device || !s.profile_host))
       return Status::InvalidState("enable kernel profiling before capture");
     ready = detail::AllocateAicpuProfiles(&s.profile_device, &s.profile_host, bytes);
@@ -454,10 +436,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   if (call.prepared_capturing) call.captured_stream = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0;
   if (profile) profile->prepare_ns = stamp - begin;
-  if (exec.host_timing) exec.host_timing->launch_begin_ns = BatchGetProfileNowNs();
-  const auto launched = LaunchCpuPushScatter(&args, stream);
-  if (exec.host_timing) exec.host_timing->launch_end_ns = BatchGetProfileNowNs();
-  if (launched) {
+  if (LaunchCpuPushScatter(&args, stream)) {
     view.health->failed = true;
     return call.failure = Error("launch kernel");
   }
@@ -472,7 +451,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     view.health->failed = true; return call.failure = Error("enqueue profiling result");
   }
   if (profile) { const auto now = BatchGetProfileNowNs(); profile->status_enqueue_ns = now - stamp; stamp = now; }
-  auto result = DrainScatter(view, call, exec.host_timing);
+  auto result = DrainScatter(view, call);
   if (!result.ok()) return result;
   if (profile) {
     const auto now = BatchGetProfileNowNs(); profile->wait_ns = now - stamp; stamp = now;

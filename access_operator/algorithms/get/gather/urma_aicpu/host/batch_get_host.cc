@@ -37,7 +37,7 @@ struct BatchGetTransport::Impl {
   Invocation* invocation{&default_invocation};
   bool profiling{false};
   bool initialized{false}, cpu_enabled{false};
-  Status Drain(const char* stage = "drain", bool check_status = true, GetProviderTiming* = nullptr);
+  Status Drain(const char* stage = "drain", bool check_status = true);
 };
 static Status ValidateGather(const GatherLaunchView& view, AicpuGetInvocation& call) {
   const auto* reports = static_cast<const GatherReadStatus*>(view.completion.host);
@@ -62,27 +62,17 @@ static Status ValidateGather(const GatherLaunchView& view, AicpuGetInvocation& c
   return Status::OK();
 }
 static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call, const char* stage,
-                           bool completion_enqueued = false, bool check_status = true,
-                           GetProviderTiming* timing = nullptr) {
+                           bool completion_enqueued = false, bool check_status = true) {
   const auto stream = call.pending ? call.pending : call.captured_stream;
   if (!stream) return check_status ? call.failure : Status::OK();
   bool capturing = false;
-  const auto capture_start = GetHostTimingStart(timing);
   auto allowed = kvaf::detail::BatchGetCapture(stream, true, false, &capturing);
-  GetHostTimingRecord(timing, &GetProviderTiming::capture_check_ns, capture_start);
   if (!allowed.ok()) return allowed;
-  const auto enqueue_start = GetHostTimingStart(timing);
   if (check_status && call.failure.ok() && call.submitted && !completion_enqueued &&
       aclrtMemcpyAsync(view.completion.host, view.completion.bytes, view.completion.device,
                        view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream) != ACL_SUCCESS)
     return Internal("GatherRead status enqueue failed; resources retained");
-  GetHostTimingRecord(timing, &GetProviderTiming::status_enqueue_ns, enqueue_start);
-  if (timing) timing->sync_begin_ns = BatchGetProfileNowNs();
   const auto result = aclrtSynchronizeStream(stream);
-  if (timing) {
-    timing->sync_end_ns = BatchGetProfileNowNs();
-    timing->stream_sync_ns += timing->sync_end_ns - timing->sync_begin_ns;
-  }
   if (result != ACL_SUCCESS) {
     const char* detail = aclGetRecentErrMsg();
     return Internal("GatherRead stream synchronization failed: acl=" + std::to_string(result) +
@@ -93,7 +83,6 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
   call.pending = nullptr;
   if (!check_status || !call.submitted) return Status::OK();
   if (!call.failure.ok()) return call.failure;
-  BatchGetProfileScope check(timing ? &timing->status_check_ns : nullptr);
   auto checked = ValidateGather(view, call);
   call.completion_checked = checked.ok();
   return checked;
@@ -128,17 +117,15 @@ GatherLaunchView BatchGetTransport::View() const {
        impl_->session.config().workers * sizeof(BatchGetWorkerProfile)},
       impl_->control, impl_->profiling};
 }
-Status BatchGetTransport::Impl::Drain(const char* stage, bool check_status, GetProviderTiming* timing) {
+Status BatchGetTransport::Impl::Drain(const char* stage, bool check_status) {
   GatherLaunchView view;
   view.options.workers = session.config().workers; view.direct_addresses = direct_addresses;
   const auto* report = invocation->graph_completion.get();
   view.completion = {report ? report->device : execution.status,
                      report ? report->host : status_host, execution.status_bytes};
-  return DrainGather(view, *invocation, stage, false, check_status, timing);
+  return DrainGather(view, *invocation, stage, false, check_status);
 }
-Status BatchGetTransport::Drain(bool check_status, GetProviderTiming* timing) {
-  return impl_->Drain("drain", check_status, timing);
-}
+Status BatchGetTransport::Drain(bool check_status) { return impl_->Drain("drain", check_status); }
 Status BatchGetTransport::Check(aclrtStream stream) {
   auto& call = *impl_->invocation;
   if (!impl_->initialized || !call.submitted)
@@ -351,10 +338,8 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
   if (!call.failure.ok()) return call.failure;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   bool capturing = false;
-  auto phase = GetHostTimingStart(exec.host_timing);
   auto allowed = kvaf::detail::BatchGetCapture(stream, exec.execution.synchronize,
                                               exec.execution.profile != nullptr, &capturing, expected_capture);
-  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::prepare_capture_ns, phase);
   if (!allowed.ok()) return allowed;
   if (call.captured_stream && call.captured_stream != stream)
     return InvalidArgument("captured AICPU transport must use its capture stream");
@@ -362,13 +347,10 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
     if (call.pending && call.pending != stream)
       return Status::InvalidState("drain previous AICPU work outside capture on its stream");
   } else {
-    BatchGetProfileScope previous(exec.host_timing ? &exec.host_timing->previous_completion_ns : nullptr);
     auto drained = impl_->Drain("previous_request");
     if (!drained.ok()) return drained;
   }
-  phase = GetHostTimingStart(exec.host_timing);
   auto valid = BuildBatchGetKernelArgs(exec, &call.prepared_input);
-  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::input_build_ns, phase);
   if (!valid.ok()) return valid;
   if (call.prepared_input.request_capacity > kGatherMaxRequests || call.prepared_input.token_bytes != impl_->token_bytes)
     return InvalidArgument("UMDK BatchGet exceeds requests or configured token size");
@@ -377,13 +359,11 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
     return InvalidArgument("invalid direct address request");
   const auto profile_bytes = impl_->session.config().workers * sizeof(BatchGetWorkerProfile);
   if (exec.execution.profile || impl_->profiling) {
-    BatchGetProfileScope buffers(exec.host_timing ? &exec.host_timing->profile_buffers_ns : nullptr);
     if (capturing && (!impl_->profile_device || !impl_->profile_host))
       return Status::InvalidState("enable kernel profiling before capture");
     auto allocated = kvaf::detail::AllocateAicpuProfiles(&impl_->profile_device, &impl_->profile_host, profile_bytes);
     if (!allocated.ok()) return allocated;
   }
-  BatchGetProfileScope registration(exec.host_timing ? &exec.host_timing->registration_ns : nullptr);
   auto ready = impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace,
       GatherWorkspaceBytes(impl_->session.config().workers), capturing);
   if (!ready.ok()) return ready;
@@ -455,10 +435,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   if (call.prepared_capturing) call.captured_stream = stream;
   auto stamp = profile ? BatchGetProfileNowNs() : 0U;
   if (profile) profile->prepare_ns = stamp - begin;
-  if (exec.host_timing) exec.host_timing->launch_begin_ns = BatchGetProfileNowNs();
-  const auto launched = LaunchBatchGet(&launch, stream);
-  if (exec.host_timing) exec.host_timing->launch_end_ns = BatchGetProfileNowNs();
-  if (launched)
+  if (LaunchBatchGet(&launch, stream))
     return call.failure = Internal("UMDK BatchGet launch failed; shutdown required");
   call.submitted = true;
   call.profile_submitted = args.profile != 0;
@@ -471,7 +448,6 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     stamp = now;
   }
   if (!exec.execution.synchronize) return Status::OK();
-  const auto enqueue_start = GetHostTimingStart(exec.host_timing);
   if (aclrtMemcpyAsync(view.completion.host, view.completion.bytes, view.completion.device,
                        view.completion.bytes, ACL_MEMCPY_DEVICE_TO_HOST,
                        stream) != ACL_SUCCESS)
@@ -484,8 +460,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
     profile->status_enqueue_ns = now - stamp;
     stamp = now;
   }
-  GetHostTimingRecord(exec.host_timing, &GetProviderTiming::status_enqueue_ns, enqueue_start);
-  auto completed = DrainGather(view, call, "completion", true, true, exec.host_timing);
+  auto completed = DrainGather(view, call, "completion", true);
   if (profile) {
     const auto now = BatchGetProfileNowNs();
     profile->wait_ns = now - stamp;

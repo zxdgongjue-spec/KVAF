@@ -134,8 +134,7 @@ struct Execution {
 };
 }  // namespace
 
-std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, BatchGetWorkerProfile* profile,
-                                    BatchGetWorkerProfile** destination) {
+std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout)) return 1;
@@ -144,12 +143,13 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, BatchGetWorkerProfile* pro
   if (Load(c.result)) return 1;
   const auto ticket = ClaimBatchGetTicket(&c.claimed.value, args->workers);
   const auto worker = ticket.worker;
-  if (profile) *destination = reinterpret_cast<BatchGetWorkerProfile*>(args->profile) + worker;
   auto current = *args;
   current.sequence = ticket.sequence;
   args = &current;
   if (args->sequence > UINT32_MAX) Fail(c, Result::kSequenceError);
   const auto target = args->sequence * args->workers;
+  BatchGetWorkerProfile measured{};
+  auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   Execution io{*args, layout, c, CounterNow(),
       CounterFrequency() * args->timeout_ms / 1000, profile};
@@ -199,6 +199,8 @@ std::uint32_t ExecuteCpuPushScatter(KernelArgs* args, BatchGetWorkerProfile* pro
     profile->bytes = profile->spans * args->request.token_bytes;
     profile->ready_wait_ns = profile->read_ns - profile->scatter_ns;
     profile->exit_ns = BatchGetProfileNowNs();
+    auto* destination = reinterpret_cast<BatchGetWorkerProfile*>(args->profile) + worker;
+    *destination = measured;
   }
   return status->result == std::uint64_t(Result::kOk) ? 0 : 1;
 }

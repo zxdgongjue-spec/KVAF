@@ -59,7 +59,7 @@ class NpuRuntime final : public Runtime {
 
   Status Warmup(PutExecutionConfig, const ExecutionWarmup& = {});
   Status Warmup(GetExecutionConfig, const ExecutionWarmup& = {});
-  Status DrainGet(BatchGetHostTiming* = nullptr);
+  Status DrainGet();
   Status Recover(PutExecutionConfig);
   Status Recover(GetExecutionConfig);
 

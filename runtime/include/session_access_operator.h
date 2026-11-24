@@ -68,10 +68,6 @@ class SessionAccessOperator final : public AccessOperator {
     auto* op = resources_->operation();
     return op ? op->DrainGet() : Status::OK();
   }
-  Status DrainGet(BatchGetHostTiming* timing) override {
-    auto* op = resources_->operation();
-    return op ? op->DrainGet(timing) : Status::OK();
-  }
   Status ResolvePut(PutCompletion* result) override {
     auto* op = resources_->operation();
     return op ? op->ResolvePut(result) : Status::NotInitialized("session not initialized");

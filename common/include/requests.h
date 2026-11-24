@@ -6,9 +6,18 @@
 
 #include "types.h"
 #include "execution_config.h"
-#include "batch_get_profile.h"
 
 namespace kvaf {
+
+struct BatchGetProfile;
+// Optional Host diagnostics for one Get launch. The caller owns this storage;
+// providers write it only before ExecuteBatchGet returns.
+struct GetProviderTiming {
+  std::uint64_t prepare_ns{}, submit_ns{}, completion_ns{}, cleanup_ns{};
+  // AIV Direct diagnostics nested within prepare/submit. Zero for other providers.
+  std::uint64_t aiv_capture_prepare_ns{}, aiv_capture_submit_ns{};
+  std::uint64_t aiv_status_reset_ns{}, aiv_kernel_launch_ns{};
+};
 
 // Optional host-only diagnostics. Pointers to this storage are borrowed only
 // until the public Put call returns, never by retained/recovery state.
@@ -159,8 +168,6 @@ struct BatchGetExecRequest {
   const BatchGetRequest* request{nullptr};
   BatchGetExecutionOptions execution;
   GetProviderTiming* host_timing{nullptr};
-  // Borrowed only during ExecuteBatchGet; never retained by an invocation.
-  BatchGetHostTiming* call_timing{nullptr};
 };
 
 // Runtime 向 AccessOperator 提交的同步 BatchPut 描述。put_desc 的具体

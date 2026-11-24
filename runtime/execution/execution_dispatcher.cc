@@ -570,7 +570,7 @@ Status ExecutionDispatcher::PrepareGetInstanceLocked(GetExecutionConfig config,
   *out = instance;
   return Status::OK();
 }
-Status ExecutionDispatcher::DrainGetLocked(BatchGetHostTiming* timing) {
+Status ExecutionDispatcher::DrainGetLocked() {
   if (!pending_get_) return Status::OK();
   auto* instance = pending_get_;
   if (instance->output_close_required)
@@ -580,39 +580,33 @@ Status ExecutionDispatcher::DrainGetLocked(BatchGetHostTiming* timing) {
     row.algorithm = GetAlgorithmLabel(instance->config);
     row.path = instance->output_id ? "output" : "ordinary";
   }
-  const bool tracing = get_trace_ || timing;
-  const auto started = tracing ? TraceNowNs() : 0;
-  auto s = instance->cleanup_only ? CloseGetInstanceLocked(instance) : instance->view().Drain(timing);
-  const auto drained = tracing ? TraceNowNs() : 0;
+  const auto started = get_trace_ ? TraceNowNs() : 0;
+  auto s = instance->cleanup_only ? CloseGetInstanceLocked(instance) : instance->view().Drain();
+  const auto drained = get_trace_ ? TraceNowNs() : 0;
   if (s.ok() && pending_get_) {
     instance->ClearRequest();
     pending_get_ = nullptr;
   }
-  if (tracing) {
+  if (get_trace_) {
     row.event = "drain";
     row.drain_provider_ns = drained - started;
     row.drain_release_ns = TraceNowNs() - drained;
     row.total_ns = TraceNowNs() - started;
-    if (timing) {
-      timing->dispatch_drain_provider_ns += row.drain_provider_ns;
-      timing->dispatch_drain_release_ns += row.drain_release_ns;
-    }
-    if (get_trace_) get_trace_->Record(row);
+    get_trace_->Record(row);
   }
   return s;
 }
 Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) {
-  const bool tracing = get_trace_ || request.call_timing;
-  const auto started = tracing ? TraceNowNs() : 0;
+  const auto started = get_trace_ ? TraceNowNs() : 0;
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  const auto locked = tracing ? TraceNowNs() : 0;
+  const auto locked = get_trace_ ? TraceNowNs() : 0;
   if (!ready_) return Status::NotInitialized("dispatcher is not accepting work");
   if (!request.request) return Status::InvalidArgument("missing Get request");
   GetExecutionConfig c;
   auto s = ResolveExecution(policy_, request.execution.config, &c);
   if (!s.ok()) return s;
-  const auto resolved = tracing ? TraceNowNs() : 0;
+  const auto resolved = get_trace_ ? TraceNowNs() : 0;
   const auto& r = *request.request;
   if (r.indices.bytes % sizeof(std::int32_t) || r.indices.bytes / sizeof(std::int32_t) > UINT32_MAX)
     return Status::InvalidArgument("invalid Get request capacity");
@@ -657,7 +651,7 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
       return Status::InvalidArgument("request differs from bound Get output/capacity");
   }
   GetDispatchTrace::Row row{};
-  if (tracing) {
+  if (get_trace_) {
     row.event = "submit";
     row.algorithm = GetAlgorithmLabel(c);
     row.path = output_bound ? "output" : "ordinary";
@@ -665,67 +659,46 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
     row.resolve_ns = resolved - locked;
     row.output_check_ns = TraceNowNs() - resolved;
   }
-  auto phase = tracing ? TraceNowNs() : 0;
+  auto phase = get_trace_ ? TraceNowNs() : 0;
   s = DrainGetLocked();
   if (!s.ok()) return s;
-  if (tracing) row.previous_drain_ns = TraceNowNs() - phase;
+  if (get_trace_) row.previous_drain_ns = TraceNowNs() - phase;
   GetPreparationTiming preparation{};
   s = PrepareGetInstanceLocked(c, &r, {capacity, request.execution.stream}, &instance,
-                              tracing ? &preparation : nullptr);
+                              get_trace_ ? &preparation : nullptr);
   if (!s.ok()) return s;
-  if (tracing) {
+  if (get_trace_) {
     row.context_ns = preparation.context_ns;
     row.describe_ns = preparation.describe_ns;
     row.acquire_ns = preparation.acquire_ns;
     row.bind_ns = preparation.bind_ns;
     row.launch.warmup_ns = preparation.warmup_ns;
   }
-  phase = tracing ? TraceNowNs() : 0;
+  phase = get_trace_ ? TraceNowNs() : 0;
   instance->request = r;
   instance->table = request.host_access_table;
   instance->options = request.execution;
   instance->options.config = c;
-  if (tracing) row.context_ns += TraceNowNs() - phase;
+  if (get_trace_) row.context_ns += TraceNowNs() - phase;
   pending_get_ = instance;
   instance->last_graph_profile.clear();
-  s = LaunchGet(*instance, tracing ? &row.launch : nullptr);
-  phase = tracing ? TraceNowNs() : 0;
+  s = LaunchGet(*instance, get_trace_ ? &row.launch : nullptr);
+  phase = get_trace_ ? TraceNowNs() : 0;
   if (s.ok() && request.execution.synchronize) {
     instance->ClearRequest();
     pending_get_ = nullptr;
   }
-  if (tracing) {
+  if (get_trace_) {
     row.context_release_ns = TraceNowNs() - phase;
     row.total_ns = TraceNowNs() - started;
-    if (auto* timing = request.call_timing) {
-      timing->dispatch_lock_ns = row.lock_ns;
-      timing->dispatch_resolve_ns = row.resolve_ns;
-      timing->dispatch_output_check_ns = row.output_check_ns;
-      timing->dispatch_previous_drain_ns = row.previous_drain_ns;
-      timing->dispatch_context_ns = row.context_ns;
-      timing->dispatch_describe_ns = row.describe_ns;
-      timing->dispatch_acquire_ns = row.acquire_ns;
-      timing->dispatch_bind_ns = row.bind_ns;
-      timing->dispatch_warmup_ns = row.launch.warmup_ns;
-      timing->dispatch_provider_ns = row.launch.provider_ns;
-      timing->dispatch_context_release_ns = row.context_release_ns;
-      timing->dispatch_total_ns = row.total_ns;
-      timing->provider = row.launch.provider_detail;
-    }
-    if (get_trace_) get_trace_->Record(row);
+    get_trace_->Record(row);
   }
   return s;
 }
 Status ExecutionDispatcher::DrainGet() {
-  return DrainGet(nullptr);
-}
-Status ExecutionDispatcher::DrainGet(BatchGetHostTiming* timing) {
-  BatchGetProfileScope total(timing ? &timing->dispatch_drain_total_ns : nullptr);
-  const auto begin = timing ? TraceNowNs() : 0;
   std::shared_lock<std::shared_mutex> life(lifecycle_);
   std::lock_guard<std::mutex> lock(get_mutex_);
-  if (timing) timing->dispatch_drain_lock_ns += TraceNowNs() - begin;
-  return DrainGetLocked(timing);
+  return DrainGetLocked();
 }
 bool ExecutionDispatcher::HasPendingGet() const {
   std::shared_lock<std::shared_mutex> life(lifecycle_);

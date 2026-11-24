@@ -1,6 +1,5 @@
 #include "acl_graph_python.h"
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -105,57 +104,26 @@ class AclGraph final {
                     "aclmdlRIExecuteAsync");
   }
 
-  py::dict ReplayTimed(const py::object& stream, bool profile) {
+  float ReplayTimed(const py::object& stream) {
     Use use(in_use_);
-    const auto stamp = [profile]() -> std::uint64_t {
-      return profile ? std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
-    };
-    const auto begin = stamp();
     const aclrtStream replay_stream = ReplayStream(stream);
-    const auto resolved = stamp();
-    if (start_event_ == nullptr) {
+    if (!start_event_)
       ThrowIfAclError(aclrtCreateEventWithFlag(&start_event_, ACL_EVENT_TIME_LINE),
                       "aclrtCreateEventWithFlag start");
-    }
-    if (end_event_ == nullptr) {
+    if (!end_event_)
       ThrowIfAclError(aclrtCreateEventWithFlag(&end_event_, ACL_EVENT_TIME_LINE),
                       "aclrtCreateEventWithFlag end");
-    }
-    const auto prepared = stamp();
     ThrowIfAclError(aclrtRecordEvent(start_event_, replay_stream), "aclrtRecordEvent start");
-    const auto recorded = stamp();
     ThrowIfAclError(aclmdlRIExecuteAsync(graph_, replay_stream), "aclmdlRIExecuteAsync");
-    const auto replayed = stamp();
     ThrowIfAclError(aclrtRecordEvent(end_event_, replay_stream), "aclrtRecordEvent end");
-    const auto end_recorded = stamp();
-    std::uint64_t synced = 0, measured = 0;
     float milliseconds = 0;
     {
       py::gil_scoped_release release;
       ThrowIfAclError(aclrtSynchronizeEvent(end_event_), "aclrtSynchronizeEvent");
-      synced = stamp();
       ThrowIfAclError(aclrtEventElapsedTime(&milliseconds, start_event_, end_event_),
                       "aclrtEventElapsedTime");
-      measured = stamp();
     }
-    const auto returned = stamp();
-    py::dict host;
-    if (profile) {
-      host["stream_resolve"] = resolved - begin;
-      host["timing_prepare"] = prepared - resolved;
-      host["start_event_record"] = recorded - prepared;
-      host["replay_submit"] = replayed - recorded;
-      host["end_event_record"] = end_recorded - replayed;
-      host["event_sync"] = synced - end_recorded;
-      host["elapsed_time"] = measured - synced;
-      host["gil_reacquire"] = returned - measured;
-      host["native_total"] = returned - begin;
-    }
-    py::dict result;
-    result["elapsed_ms"] = milliseconds;
-    result["host_ns"] = host;
-    return result;
+    return milliseconds;
   }
 
   void Synchronize(const py::object& stream) const {
@@ -223,7 +191,7 @@ class AclGraph final {
   bool Ready() const { return graph_ != nullptr; }
 
  private:
-  // A timed replay releases the GIL while waiting; reject concurrent reset/reuse.
+  // Timed replay releases the GIL while waiting; prevent concurrent graph reuse.
   struct Use {
     explicit Use(bool& active) : active_(active) {
       if (active_) throw py::value_error("ACLGraph is already in use");
@@ -234,13 +202,11 @@ class AclGraph final {
   };
 
   aclrtStream ReplayStream(const py::object& stream) const {
-    if (capturing_ || graph_ == nullptr) {
+    if (capturing_ || graph_ == nullptr)
       throw py::value_error("ACLGraph has no completed capture to replay");
-    }
     const aclrtStream target = acl_python::StreamFromPython(stream);
-    if (target != stream_) {
+    if (target != stream_)
       throw py::value_error("ACLGraph replay must use the same ACL stream as capture");
-    }
     return target;
   }
 
@@ -286,9 +252,8 @@ void BindAclGraph(py::module_& module) {
            "Finish capture and retain the resulting ACL graph.")
       .def("replay", &AclGraph::Replay, py::arg("stream"),
            "Submit the captured ACL graph to its capture stream.")
-      .def("replay_timed", &AclGraph::ReplayTimed, py::arg("stream"), py::arg("profile") = false,
-           "Record/replay/record/wait in one native call; return elapsed_ms and optional Host ns. "
-           "The first call creates reusable timing events. Use the capture device and stream.")
+      .def("replay_timed", &AclGraph::ReplayTimed, py::arg("stream"),
+           "Record/replay/record/wait in one native call; return Event elapsed milliseconds.")
       .def("synchronize", &AclGraph::Synchronize, py::arg("stream"),
            "Wait for graph work on its capture stream.")
       .def("copy_host_to_device_async", &AclGraph::CopyHostToDeviceAsync,

@@ -44,9 +44,9 @@ struct AicpuExecutionResources::State {
   aicpu_urma::BatchPutTransport put;
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
   std::unique_ptr<cpu_push::CpuPushTransport> push;
-  Status DrainGet(GetProviderTiming* timing = nullptr) { return push ? push->Drain(timing) : get.Drain(true, timing); }
+  Status DrainGet() { return push ? push->Drain() : get.Drain(); }
 #else
-  Status DrainGet(GetProviderTiming* timing = nullptr) { return get.Drain(true, timing); }
+  Status DrainGet() { return get.Drain(); }
 #endif
   bool enable_get;
   RemoteRegionDesc region;
@@ -451,19 +451,10 @@ Status AicpuExecutionResources::AcknowledgePut() {
   call.write = {};
   return Status::OK();
 }
-Status AicpuExecutionResources::DrainGet(GetProviderTiming* timing) {
-  const auto lock_started = timing ? BatchGetProfileNowNs() : 0;
+Status AicpuExecutionResources::DrainGet() {
   std::lock_guard<std::mutex> lock(state_->get_mutex);
-  if (timing) timing->lock_ns += BatchGetProfileNowNs() - lock_started;
-  Status status;
-  {
-    BatchGetProfileScope completion(timing ? &timing->completion_ns : nullptr);
-    status = state_->DrainGet(timing);
-  }
-  if (status.ok()) {
-    BatchGetProfileScope cleanup(timing ? &timing->cleanup_ns : nullptr);
-    status = ReleaseGetBuffers();
-  }
+  auto status = state_->DrainGet();
+  if (status.ok()) status = ReleaseGetBuffers();
   return status;
 }
 Status AicpuExecutionResources::CheckBatchGetStatus(void* stream) {

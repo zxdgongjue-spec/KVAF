@@ -99,7 +99,7 @@ class RuntimeCore {
   Status BatchPut(const BatchPutRequest& request,
                   BatchPutExecutionOptions execution = {});
   Status BatchFree(const BatchFreeRequest& request);
-  Status DrainGet(BatchGetHostTiming* = nullptr);
+  Status DrainGet();
   Status RecoverGet(GetExecutionConfig);
   bool HasPendingGet() const;
   // Resolve the already submitted Put, without replay or closing the Runtime.
@@ -136,7 +136,7 @@ class RuntimeCore {
   const AccessTableState* FindAccessTable(
       const AccessTableHandle& handle) const;
 
-  Status DrainGetLocked(BatchGetHostTiming* = nullptr);
+  Status DrainGetLocked();
   struct PutTraceRow;
   Status FinalizePutLocked(PutTraceRow* timing = nullptr);
   void FlushPutTrace();

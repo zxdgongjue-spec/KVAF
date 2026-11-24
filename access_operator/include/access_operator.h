@@ -106,7 +106,6 @@ class AccessOperator {
     return Status::NotImplemented("input bindings require execution dispatcher");
   }
   virtual Status DrainGet() { return Status::OK(); }
-  virtual Status DrainGet(BatchGetHostTiming*) { return DrainGet(); }
   // True while a request or failed teardown may still own caller buffers.
   // Completion-tracking adapters must positively establish safe retirement;
   // an adapter without a query implementation conservatively retains owners.

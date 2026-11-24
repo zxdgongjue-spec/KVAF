@@ -48,8 +48,8 @@ CPU 使用四路 Jetty，由所属服务线程按批轮转提交预构建链；
 两端代码、设备 SO 和 kernel JSON 一起更新，重启 CPU 服务及 NPU 进程。
 当前 push 协议为 V3，逐行复制源于 `codex/aicpu-ordered-write` 的
 `a12bb16c120e885eb18ed61581739e1c212c32e8`（V24），Ready 由 AICPU 按 Jetty 分片消费。
-当前设备入口为 `KvafAicpuCpuPushScatterExecutionV4`。主机库、设备 SO 和 JSON 必须一起更新，
-V4 profile 保留 body 耗时并增加设备入口/返回边界。以下命令从各自仓库根目录执行。
+当前设备入口为 `KvafAicpuCpuPushScatterExecutionV3`。主机库和设备 SO 必须一起更新，
+包括移除废弃排序字段后的 profile 布局。以下命令从各自仓库根目录执行。
 CPU 端构建服务：
 
 ```bash

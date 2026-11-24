@@ -28,7 +28,6 @@ class UmdkAccessOperator final : public AccessOperator {
   Status Initialize(const RemoteRegionDesc&) override;
   Status Shutdown() override;
   Status DrainGet() override;
-  Status DrainGet(BatchGetHostTiming*) override;
   Status PrepareGetGraph(const GetGraphOptions&) override;
   Status FinishGetGraph(void*, bool) override;
   bool GetGraphNeedsRecovery() const override;

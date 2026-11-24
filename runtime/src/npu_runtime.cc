@@ -761,9 +761,9 @@ std::uint32_t NpuRuntime::batch_get_tokens_per_block() const {
   return impl_->options.batch_get_tokens_per_block;
 }
 
-Status NpuRuntime::DrainGet(BatchGetHostTiming* timing) {
+Status NpuRuntime::DrainGet() {
   if (!initialized()) return Status::NotInitialized("initialize Runtime before draining Get");
-  return core().DrainGet(timing);
+  return core().DrainGet();
 }
 Status NpuRuntime::Recover(PutExecutionConfig c) {
   if (aclrtSetDevice(impl_->options.device_id) != ACL_SUCCESS)

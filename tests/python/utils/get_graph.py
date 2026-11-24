@@ -33,19 +33,17 @@ class GetGraph:
     def synchronize(self):
         self.stream.synchronize()
 
-    def replay_timed(self, profile=False):
-        if self.api != "acl":
-            raise ValueError("native timed submission requires --graph-api acl")
-        return self.graph.replay_timed(self.stream, profile=profile)
+    def replay_timed(self):
+        return self.graph.replay_timed(self.stream)
 
 
 @contextmanager
-def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit, count=1):
-    """Use real warmup forwards to prepare independently owned Get nodes."""
+def captured_get(args, runtime, torch, kvaf, execution, output, stream, submit):
+    """Use a real warmup forward to prepare the single-node benchmark graph."""
     execution.drain_get(runtime)
     execution.release_output(runtime)
     with captured_get_resources(args, runtime, torch, kvaf, execution, stream,
-                                [submit] * count) as (graph, _):
+                                [submit]) as (graph, _):
         yield graph
 
 

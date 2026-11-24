@@ -338,8 +338,7 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
 }
 }  // namespace
 
-std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch, BatchGetWorkerProfile* profile,
-                                BatchGetWorkerProfile** destination) {
+std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (!launch || !launch->request.miss_count || !launch->gather.core_status || !launch->gather.scratch ||
       !launch->gather.execution_control ||
       !launch->gather.worker_count ||
@@ -348,6 +347,8 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch, BatchGetWorkerProfile*
   auto args = launch->gather;
   auto& control = *reinterpret_cast<GatherExecutionControl*>(args.execution_control);
   if (__atomic_load_n(&control.failed, __ATOMIC_ACQUIRE)) return 1U;
+  BatchGetWorkerProfile measured{};
+  auto* profile = args.profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   auto session = detail::FindSession(args.context.session);
   if (!session) return 1U;
@@ -358,7 +359,6 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch, BatchGetWorkerProfile*
   const auto ticket = ClaimBatchGetTicket(&control.claimed, args.worker_count);
   args.sequence = ticket.sequence;
   const auto worker = ticket.worker;
-  if (profile) *destination = reinterpret_cast<BatchGetWorkerProfile*>(args.profile) + worker;
 
   args.worker_index = worker;
   args.core_status += worker * sizeof(GatherReadStatus);
@@ -423,6 +423,8 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch, BatchGetWorkerProfile*
     profile->bytes = args.bytes;
     profile->spans = args.source_span_count;
     profile->exit_ns = BatchGetProfileNowNs();
+    auto* destination = reinterpret_cast<BatchGetWorkerProfile*>(args.profile) + worker;
+    *destination = *profile;
   }
   if (status.result) __atomic_store_n(&control.failed, std::uint64_t{1}, __ATOMIC_RELEASE);
   return status.result ? 1U : 0U;
