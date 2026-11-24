@@ -34,7 +34,7 @@ CSV_COLUMNS = (
     "jetty_cursors",
     "overlap_head_cq",
     "jettys_per_core", "cpu_jettys",
-    "host_submit", "completion_scope", "graph_mailbox",
+    "host_submit", "completion_scope",
     "host_call_us", "stream_sync_us", "device_sync_us",
     "calls_per_sample", "graph_total_us", "graph_payload_bytes", "graph_total_gbps",
     "sequence_first", "last_call_cpu_comm_us", "last_call_cpu_write_us",
@@ -218,9 +218,7 @@ def write_results(args, report):
             writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
             writer.writeheader()
             config = report["config"]
-            submission = {key: config.get(key, "") for key in ("host_submit", "completion_scope", "graph_mailbox")}
-            if "graph_mailbox" in config:
-                submission["graph_mailbox"] = int(config["graph_mailbox"])
+            submission = {key: config.get(key, "") for key in ("host_submit", "completion_scope")}
             for phase, samples in report["samples"].items():
                 for sample in samples:
                     values = dict(phase=phase, cores=args.cores, jetty_cursors=args.jetty_cursors,

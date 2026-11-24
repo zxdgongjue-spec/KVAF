@@ -163,8 +163,7 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 调用这些节点。每次 replay 后调用一次 `check_scatter_graph_replay()` 验证累计序号与状态。
 设备失败状态会传递到后续节点。保留 Runtime、stream、Tensor 和 AccessTable，直到图完成、
 销毁并调用 `detach_scatter_batch_get_graph()`；同一 Runtime 的所有节点须使用同一图和 stream。
-profiling 开关须在捕获前设置。`KVAF_SCATTER_GRAPH_MAILBOX=1` 允许图模式在设备上按批更新
-并复用 mailbox 控制 WQE，避免每次重新构造模板。
+profiling 开关须在捕获前设置。
 普通 prepared Scatter 继续支持 `wait_stream=True`，在调用内等待 DMA 完成并推迟状态校验；
 它与 `synchronize=True` 互斥。图捕获需将二者设为 false，使用 `capture_into_graph=True`。
 无图性能对照的 `--completion-scope native-stream` 继续映射到这一原有接口；图模式使用
@@ -293,8 +292,7 @@ Gather 与 WRITE 的交错需要在 **K 端启动 CPU 服务前** 设置
 `export KVAF_CPU_GATHER_INTERLEAVE=1`；仅在 N 端设置不会改变远端服务的配置。
 Gather 线程数量、亲和性和等待方式由 K 端服务参数决定。
 上述命令未指定 payload Jetty 数，因此在没有 `KVAF_SCATTER_JETTYS_PER_CORE` 环境覆盖时
-使用 4 条共享 payload Jetty。命令未额外开启 `KVAF_SCATTER_GRAPH_MAILBOX`，其默认值为 0；
-复现时也应核对该值是否被已有环境覆盖。
+使用 4 条共享 payload Jetty。
 
 每次 BatchGet 的有效数据为 `8192 * 656 = 5,373,952 B`，每图为 `42,991,616 B`。
 端到端耗时按整图耗时除以 8 计算，带宽按整图有效数据量除以整图耗时计算。

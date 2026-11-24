@@ -379,7 +379,6 @@ def run_case(args):
                 "native-stream": "prepared_call_includes_stream_sync"}[args.completion_scope],
         stream_selection=("cached_capture_stream_inputs_ready_before_replay" if graph_mode
                           else "fixed_stream_per_call_task_queue_fence"),
-        graph_mailbox=graph_mode and os.environ.get("KVAF_SCATTER_GRAPH_MAILBOX") == "1",
         input_storage="fixed_buffers_refreshed_per_call",
         host_timing_matches_reference=False,
         reference_host_timing="async_BatchGet_then_torch.npu.synchronize",

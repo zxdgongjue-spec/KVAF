@@ -9,14 +9,11 @@ using namespace kvaf_aiv;
 enum class MailboxPhase { Full, Head, Suffix };
 
 __aicore__ inline uint64_t WaitMailboxCqe(const KvafScatterBatchGetArgs& a,
-    const __gm__ KvafBatchGetDirectUrmaEntity* e, __gm__ KvafBatchGetQueueState* state,
-    bool* pending = nullptr) {
+    const __gm__ KvafBatchGetDirectUrmaEntity* e, __gm__ KvafBatchGetQueueState* state) {
   const auto ci = state->cq_consumer_index;
   const auto cqe = e->cq_va + (ci % e->cq_depth) * e->cqe_size;
   uint64_t result = KVAF_SEQ_TIMEOUT;
-  // The Ready wait can try one poll without blocking on this control CQE.
-  const auto polls = pending ? 1U : a.max_polls;
-  for (uint32_t poll = 0; poll < polls; ++poll) {
+  for (uint32_t poll = 0; poll < a.max_polls; ++poll) {
     Flush(cqe, 32);
     const auto word = *reinterpret_cast<__gm__ volatile uint32_t*>(cqe);
     if (((word >> 2) & 1) == ((ci / e->cq_depth) & 1)) continue;
@@ -25,10 +22,6 @@ __aicore__ inline uint64_t WaitMailboxCqe(const KvafScatterBatchGetArgs& a,
            reinterpret_cast<__gm__ uint32_t*>(e->cq_db_va), 0);
     result = (word & 0xffff0000U) ? KVAF_SEQ_CQ_ERROR : KVAF_SEQ_OK;
     break;
-  }
-  if (pending) {
-    if (result == KVAF_SEQ_TIMEOUT) return KVAF_SEQ_OK;
-    *pending = false;
   }
   if (result) {
     state->last_error = result;
@@ -43,38 +36,34 @@ __aicore__ inline void MarkMailboxPhaseComplete(__gm__ KvafBatchGetQueueState* s
   Flush(reinterpret_cast<uint64_t>(state), sizeof(*state));
 }
 
-__aicore__ inline uint64_t RetireDeferredMailbox(const KvafScatterBatchGetArgs& a, bool* pending = nullptr) {
+__aicore__ inline uint64_t RetireDeferredMailbox(const KvafScatterBatchGetArgs& a) {
   auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
-  const auto result = WaitMailboxCqe(a, &context->entity, state, pending);
-  if (result == KVAF_SEQ_OK && (!pending || !*pending)) MarkMailboxPhaseComplete(state);
+  const auto result = WaitMailboxCqe(a, &context->entity, state);
+  if (result == KVAF_SEQ_OK) MarkMailboxPhaseComplete(state);
   return result;
 }
 
 __aicore__ inline uint64_t PushRequest(const KvafScatterBatchGetArgs& a, uint32_t count,
     __gm__ kvaf::ScatterBatchGetCoreProfile* profile,
-    MailboxPhase phase = MailboxPhase::Full, bool defer_tail_cqe = false,
-    bool mailbox_prepared = false) {
+    MailboxPhase phase = MailboxPhase::Full, bool defer_tail_cqe = false) {
   auto* context = reinterpret_cast<__gm__ KvafScatterMailboxContext*>(a.request.channel_entity);
   auto* state = reinterpret_cast<__gm__ KvafBatchGetQueueState*>(a.request.queue_state);
-  if (!mailbox_prepared) {
-    if (!context || !state) return KVAF_SEQ_QUEUE_ERROR;
-    // Templates are read by DMA, not Scalar cache.
-    Flush(reinterpret_cast<uint64_t>(context), kvaf::kScatterMailboxTemplateOffset);
-    const auto& e = context->entity;
-    if (e.magic != 0x4b564155U || e.version != 1 || !e.sq_va || !e.sq_db_va ||
-        !e.cq_va || !e.cq_db_va || e.sq_depth < 4 || e.sq_depth % 4 ||
-        !e.cq_depth || e.cqe_size < 32 || e.wqe_size != 64 || !e.local_token_id ||
-        !context->max_write_bytes || context->max_write_bytes > 65536)
-      return KVAF_SEQ_QUEUE_ERROR;
-    if (state->initialized && (state->magic != 0x4b564151U || state->poisoned))
-      return KVAF_SEQ_QUEUE_ERROR;
-    if (!state->initialized) {
-      state->magic = 0x4b564151U; state->initialized = 1;
-      state->sq_producer_index = state->cq_consumer_index = 0;
-    }
-  }
+  if (!context || !state) return KVAF_SEQ_QUEUE_ERROR;
+  // Templates are read by DMA, not Scalar cache.
+  Flush(reinterpret_cast<uint64_t>(context), kvaf::kScatterMailboxTemplateOffset);
   const auto& e = context->entity;
+  if (e.magic != 0x4b564155U || e.version != 1 || !e.sq_va || !e.sq_db_va ||
+      !e.cq_va || !e.cq_db_va || e.sq_depth < 4 || e.sq_depth % 4 ||
+      !e.cq_depth || e.cqe_size < 32 || e.wqe_size != 64 || !e.local_token_id ||
+      !context->max_write_bytes || context->max_write_bytes > 65536)
+    return KVAF_SEQ_QUEUE_ERROR;
+  if (state->initialized && (state->magic != 0x4b564151U || state->poisoned))
+    return KVAF_SEQ_QUEUE_ERROR;
+  if (!state->initialized) {
+    state->magic = 0x4b564151U; state->initialized = 1;
+    state->sq_producer_index = state->cq_consumer_index = 0;
+  }
   const auto max_write_bytes = context->max_write_bytes;
   // Never copy the intervening done/Ready lines: CPU owns them as WRITE
   // sources and could still be retiring the previous request's final CQE.
