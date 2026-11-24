@@ -23,6 +23,9 @@
 
 #include "batch_get_abi.h"
 #include "access_operator.h"
+#if defined(KVAF_ENABLE_ROCE_NPU)
+#include "roce_npu_transport.h"
+#endif
 #include "ubmem/access_operator.h"
 #include "ubmem_allocator.h"
 #include "peer_link.h"
@@ -466,7 +469,13 @@ struct NpuRuntime::Impl {
   void CreateCore() {
     meta_manager = CreateInMemoryMetaManager(options.allocation_mode);
     urma_operator = nullptr;
-    if (backend == detail::RuntimeBackend::kUbmem) {
+    if (backend == detail::RuntimeBackend::kRoceHost) {
+#if defined(KVAF_ENABLE_ROCE_NPU)
+      access_operator = CreateRoceOperator(roce_session);
+#else
+      throw std::invalid_argument("RoCE Host support was not built");
+#endif
+    } else if (backend == detail::RuntimeBackend::kUbmem) {
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
       access_operator = std::make_unique<ubmem::AccessOperator>(ubmem::OperatorOptions{
           options.batch_get_kernel_object_path, options.batch_put_kernel_object_path,
@@ -512,6 +521,9 @@ struct NpuRuntime::Impl {
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
   std::shared_ptr<peer::PeerLink> peer_link;
+#if defined(KVAF_ENABLE_ROCE_NPU)
+  std::shared_ptr<RoceSession> roce_session;
+#endif
   std::unique_ptr<AccessOperator> access_operator;
   DefaultAccessOperator* urma_operator{nullptr};
   std::unique_ptr<RuntimeCore> runtime_core;
@@ -525,6 +537,20 @@ NpuRuntime::NpuRuntime(NpuRuntimeOptions options) : impl_(std::make_unique<Impl>
       config.allocation_mode != AllocationMode::kAppendOnly)
     throw std::invalid_argument("invalid allocation mode");
   const bool aicpu = detail::UsesAicpu(impl_->backend);
+  if (config.transport == Transport::kRoce) {
+#if defined(KVAF_ENABLE_ROCE_NPU)
+    if (config.rdma_device.empty() || config.rdma_port == 0 ||
+        config.gid_index < 0 || config.gid_index > 255 ||
+        config.batch_get_token_bytes == 0 || config.batch_get_tokens_per_block == 0) {
+      throw std::invalid_argument("invalid RoCE endpoint or BatchGet layout");
+    }
+    if (aclrtSetDevice(config.device_id) != ACL_SUCCESS)
+      throw std::runtime_error("aclrtSetDevice failed for NpuRuntime");
+    return;
+#else
+    throw std::invalid_argument("RoCE Host support was not built");
+#endif
+  }
 #if !defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (!aicpu)
     throw std::invalid_argument("AIV/UBmem support was not built; select gather_read or cpu_push_scatter");
@@ -585,7 +611,17 @@ NpuRuntime::~NpuRuntime() {
 Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
-  if (impl_->peer_link != nullptr) return Status::InvalidState("NpuRuntime already has a PeerLink");
+  if (impl_->allocator != nullptr) return Status::InvalidState("NpuRuntime already has a peer");
+#if defined(KVAF_ENABLE_ROCE_NPU)
+  if (impl_->options.transport == Transport::kRoce) {
+    const auto& options = impl_->options;
+    impl_->roce_session = CreateRoceSession(target.address,
+        {options.rdma_device, options.rdma_port, options.gid_index}, options.device_id);
+    impl_->allocator = CreateRoceAllocator(impl_->roce_session);
+    impl_->CreateCore();
+    return Status::OK();
+  }
+#endif
   if (impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
       impl_->config.batch_put_kernel_object_path.empty()) {
     return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
@@ -614,7 +650,7 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
 Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
   const RuntimeInitRequest request{ddr_bytes, slot_size, DeviceKind::kCpu};
   if (initialized()) return Status::InvalidState("NpuRuntime has already been initialized");
-  if (impl_->peer_link == nullptr || impl_->allocator == nullptr) {
+  if (impl_->allocator == nullptr) {
     return Status::InvalidState("NpuRuntime requires LinkTo before Initialize");
   }
   if (ddr_bytes == 0U || slot_size == 0U || ddr_bytes % slot_size != 0U) {
@@ -637,7 +673,10 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
     if (!ready.ok()) return ready;
   }
 #endif
-  if (impl_->options.transport == Transport::kUbmem) {
+  if (impl_->options.transport == Transport::kRoce ||
+      impl_->options.transport == Transport::kUbmem) {
+    if (impl_->options.transport == Transport::kRoce && aclrtSetDevice(device_id()) != ACL_SUCCESS)
+      return Status::Internal("cannot select NPU for RoCE initialization");
     impl_->runtime_core.reset();
     impl_->access_operator.reset();
     impl_->CreateCore();
@@ -939,6 +978,30 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
 }
 
 
+Status NpuRuntime::RegisterHbm(const ConstBufferView& buffer,
+                               const std::shared_ptr<void>& owner,
+                               ConstBufferView storage,
+                               std::shared_ptr<HbmRegion>* region) {
+  if (region == nullptr) return Status::InvalidArgument("HBM region output must not be null");
+  if (!initialized() || impl_->access_operator == nullptr) {
+    return Status::NotInitialized("NpuRuntime must be initialized before registering HBM");
+  }
+  if (impl_->options.transport != Transport::kRoce) {
+    return Status::NotImplemented("explicit HBM registration is currently available only for RoCE");
+  }
+  return impl_->access_operator->RegisterHbm(buffer, owner, storage, region);
+}
+
+Status NpuRuntime::UnregisterHbm(std::shared_ptr<HbmRegion>* region) {
+  if (region == nullptr || !*region) {
+    return Status::InvalidArgument("HBM region handle must not be null");
+  }
+  if (impl_ == nullptr || impl_->access_operator == nullptr) {
+    return Status::InvalidState("NpuRuntime no longer owns the HBM region session");
+  }
+  return impl_->access_operator->UnregisterHbm(region);
+}
+
 RuntimeCore& NpuRuntime::core() {
   if (impl_->runtime_core == nullptr) {
     throw std::logic_error("NpuRuntime requires LinkTo before core access");
@@ -976,6 +1039,8 @@ Status NpuRuntime::SetBatchGetKernelProfiling(bool enabled, bool detailed) {
     return static_cast<UmdkAccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled);
   }
 #endif
+  if (impl_->backend == detail::RuntimeBackend::kRoceHost)
+    return Status::NotImplemented("RoCE Host does not provide BatchGet kernel profiling");
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).SetBatchGetKernelProfiling(enabled, detailed);
@@ -1006,6 +1071,8 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
   if (detail::UsesAicpu(impl_->backend))
     return static_cast<UmdkAccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
 #endif
+  if (impl_->backend == detail::RuntimeBackend::kRoceHost)
+    return Status::NotImplemented("RoCE Host does not provide BatchGet kernel profiling");
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
   if (impl_->options.transport == Transport::kUbmem)
     return static_cast<ubmem::AccessOperator&>(*impl_->access_operator).CopyBatchGetKernelProfiles(profiles);
@@ -1020,7 +1087,7 @@ Status NpuRuntime::AcceptLink(const LinkTarget&) {
 }
 
 Status NpuRuntime::ReleaseLink(LinkId link_id) {
-  if (link_id != 1U || impl_->peer_link == nullptr) return Status::NotFound("PeerLink was not found");
+  if (link_id != 1U || impl_->allocator == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
   if (!shutdown.ok()) return shutdown;
   impl_->peer_link.reset();
@@ -1029,6 +1096,9 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   impl_->config.peer_local_eids.clear();
   impl_->peer_allocator = nullptr;
   impl_->allocator.reset();
+#if defined(KVAF_ENABLE_ROCE_NPU)
+  impl_->roce_session.reset();
+#endif
   impl_->runtime_core.reset();
   impl_->access_operator.reset();
   return Status::OK();
@@ -1053,7 +1123,7 @@ bool NpuRuntime::initialized() const {
 
 RuntimeCapabilities NpuRuntime::capabilities() const {
   return RuntimeCapabilities{true, !impl_->config.batch_put_kernel_object_path.empty() ||
-      uses_aicpu(), false, true};
+      uses_aicpu() || impl_->backend == detail::RuntimeBackend::kRoceHost, false, true};
 }
 
 bool NpuRuntime::uses_aicpu() const { return detail::UsesAicpu(impl_->backend); }

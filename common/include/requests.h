@@ -2,8 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
+#include "hbm_region.h"
 #include "types.h"
 
 namespace kvaf {
@@ -107,6 +109,15 @@ struct BatchPutRequest {
 // before the remote WRITE. stream is ignored by CPU/mock implementations.
 struct BatchPutExecutionOptions {
   void* stream{nullptr};
+  // Optional owner of a stable HBM allocation, with one identity per allocation.
+  // Its backing address must remain valid until KVAF releases this reference.
+  std::shared_ptr<void> hbm_owner{};
+  // Optional owned subrange of the ACL allocation, e.g. a Tensor storage.
+  // With an owner and no subrange, the owner covers the entire ACL allocation.
+  ConstBufferView hbm_storage{};
+  // Optional explicitly registered local HBM region. When provided, RoCE
+  // reuses its MR and does not register the input for this call.
+  std::shared_ptr<HbmRegion> hbm_region{};
 };
 
 struct BatchFreeRequest {
@@ -122,6 +133,11 @@ struct BatchGetExecutionOptions {
   bool synchronize{false};
   // Optional AICPU stage timings; requires synchronize=true.
   BatchGetProfile* profile{nullptr};
+  // Same allocation ownership contract as BatchPutExecutionOptions.
+  std::shared_ptr<void> hbm_owner{};
+  ConstBufferView hbm_storage{};
+  // Optional explicitly registered local HBM region for the output buffer.
+  std::shared_ptr<HbmRegion> hbm_region{};
 };
 
 // Runtime 向 AccessOperator 提交的 BatchGet 描述。

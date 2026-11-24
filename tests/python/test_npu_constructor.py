@@ -29,6 +29,17 @@ class ConstructorTests(unittest.TestCase):
                 self.assertEqual(NpuRuntime("", 656, 2, 7, 5, aicpu_batch_get_mode=mode).values,
                                  runtime.values)
 
+    def test_roce_keywords_and_optional_kernel(self):
+        runtime = NpuRuntime(batch_get_token_bytes=656, batch_get_tokens_per_block=2,
+                             transport="roce", rdma_device="hrn5_4", gid_index=1)
+        self.assertEqual(runtime.values[0], "")
+        self.assertEqual(runtime.values[-2:], ("roce", ""))
+        self.assertEqual(runtime.roce, ("hrn5_4", 1, 1))
+        self.assertFalse(runtime.roce_cache_hbm)
+        self.assertTrue(NpuRuntime("", 656, 2, transport="roce",
+                                   roce_cache_hbm=True).roce_cache_hbm)
+        self.assertEqual(NpuRuntime("get.o", 656, 2).roce, ("", 1, -1))
+
     def test_new_mode_is_keyword_only(self):
         with self.assertRaises(TypeError):
             NpuRuntime("", 656, 2, 7, 5, "", 2, [], False, 2048, "", [], 2048,

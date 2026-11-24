@@ -7,10 +7,10 @@
 
 namespace kvaf {
 
-enum class Transport { kUrma, kUbmem };
+enum class Transport { kUrma, kUbmem, kRoce };
 
 namespace detail {
-enum class RuntimeBackend { kUrmaAiv, kUrmaAicpuGather, kUrmaAicpuScatter, kUbmem };
+enum class RuntimeBackend { kUrmaAiv, kUrmaAicpuGather, kUrmaAicpuScatter, kUbmem, kRoceHost };
 
 Status ResolveRuntimeBackend(Transport transport, const std::string& mode,
                              RuntimeBackend* backend);

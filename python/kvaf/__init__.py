@@ -27,6 +27,8 @@ if hasattr(_native, "NpuRuntime"):
     NpuRuntime = _native.NpuRuntime
     AclGraph = _native.AclGraph
     DeviceAccessTable = _native.DeviceAccessTable
+    if hasattr(_native, "HbmRegion"):
+        HbmRegion = _native.HbmRegion
 
 __all__ = [
     "AccessTable",
@@ -44,3 +46,5 @@ if hasattr(_native, "NpuRuntime"):
         "AclGraph",
         "DeviceAccessTable",
     ]
+    if hasattr(_native, "HbmRegion"):
+        __all__.append("HbmRegion")

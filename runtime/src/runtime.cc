@@ -1,5 +1,6 @@
 #include "runtime.h"
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -12,6 +13,9 @@
 namespace kvaf {
 
 namespace {
+
+// Keep stale handles from aliasing a table in a reinitialized Runtime.
+std::atomic<std::uint64_t> next_access_table_id{1};
 
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
@@ -194,7 +198,7 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
     }
   }
 
-  const std::uint64_t id = next_access_table_id_++;
+  const std::uint64_t id = next_access_table_id.fetch_add(1, std::memory_order_relaxed);
   if (id == 0) {
     (void)meta_manager_.UnlockKeys(lock_context);
     return Status::InvalidState("AccessTable handle space is exhausted");
@@ -237,7 +241,9 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (table == nullptr) {
     return Status::NotFound("AccessTable handle was not found");
   }
-  const Status status = meta_manager_.UnlockKeys(table->lock_context);
+  Status status = access_operator_.WaitForAccessTable(handle);
+  if (!status.ok()) return status;
+  status = meta_manager_.UnlockKeys(table->lock_context);
   if (!status.ok()) {
     return status;
   }

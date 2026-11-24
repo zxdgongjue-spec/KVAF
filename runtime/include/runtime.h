@@ -128,7 +128,6 @@ class RuntimeCore {
   bool initialized_{false};
   bool needs_cleanup_{false};
   RemoteRegionDesc remote_region_;
-  std::uint64_t next_access_table_id_{1};
   std::unordered_map<std::uint64_t, std::unique_ptr<AccessTableState>>
       access_tables_;
 };

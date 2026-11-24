@@ -27,7 +27,23 @@ target_link_libraries(kvaf_runtime
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
 
-if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
+if(KVAF_ENABLE_ROCE_NPU OR KVAF_BUILD_ROCE_CPU_SERVICE)
+  find_path(KVAF_VERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
+  find_library(KVAF_VERBS_LIBRARY ibverbs REQUIRED)
+  add_library(kvaf_roce_connection STATIC src/roce_connection.cc)
+  target_include_directories(kvaf_roce_connection PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src "${KVAF_VERBS_INCLUDE_DIR}")
+  target_link_libraries(kvaf_roce_connection PUBLIC kvaf_common "${KVAF_VERBS_LIBRARY}")
+  target_compile_features(kvaf_roce_connection PUBLIC cxx_std_17)
+endif()
+
+if(KVAF_BUILD_ROCE_CPU_SERVICE)
+  find_package(Threads REQUIRED)
+  add_executable(kvaf_roce_cpu_service src/roce_cpu_service_main.cc)
+  target_link_libraries(kvaf_roce_cpu_service PRIVATE kvaf_runtime kvaf_roce_connection Threads::Threads)
+endif()
+
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_ROCE_NPU)
   add_library(kvaf_npu_runtime STATIC src/npu_runtime.cc)
   target_include_directories(kvaf_npu_runtime
     PUBLIC
@@ -38,6 +54,15 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA)
   target_link_libraries(kvaf_npu_runtime
     PUBLIC kvaf_runtime
     PRIVATE kvaf_peer_link ascendcl ${CMAKE_DL_LIBS})
+  if(KVAF_ENABLE_ROCE_NPU)
+    find_library(KVAF_ASCEND_HAL_LIBRARY ascend_hal
+      HINTS "${ASCEND_DRIVER_PATH}/lib64/driver" "${ASCEND_DRIVER_PATH}/lib64"
+            "$ENV{ASCEND_DRIVER_PATH}/lib64/driver" "$ENV{ASCEND_DRIVER_PATH}/lib64"
+            /usr/local/Ascend/driver/lib64/driver "${ASCEND_CANN_PACKAGE_PATH}/lib64" REQUIRED)
+    target_sources(kvaf_npu_runtime PRIVATE src/roce_npu_transport.cc)
+    target_compile_definitions(kvaf_npu_runtime PRIVATE KVAF_ENABLE_ROCE_NPU=1)
+    target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_roce_connection "${KVAF_ASCEND_HAL_LIBRARY}")
+  endif()
   if(KVAF_ENABLE_AIV_BATCH_GET)
     target_sources(kvaf_npu_runtime PRIVATE src/ubmem_allocator.cc)
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_default_access_operator

@@ -12,12 +12,15 @@ namespace kvaf::detail {
 Status ResolveRuntimeBackend(Transport transport, const std::string& mode,
                              RuntimeBackend* backend) {
   if (!backend) return Status::InvalidArgument("backend output is null");
-  if (transport != Transport::kUrma && transport != Transport::kUbmem)
-    return Status::InvalidArgument("transport must be urma or ubmem");
+  if (transport != Transport::kUrma && transport != Transport::kUbmem && transport != Transport::kRoce)
+    return Status::InvalidArgument("transport must be urma, ubmem or roce");
   if (!mode.empty() && mode != "gather_read" && mode != "cpu_push_scatter")
     return Status::InvalidArgument(
         "aicpu_batch_get_mode must be empty, gather_read or cpu_push_scatter");
-  if (transport == Transport::kUbmem) {
+  if (transport == Transport::kRoce) {
+    if (!mode.empty()) return Status::InvalidArgument("roce requires an empty aicpu_batch_get_mode");
+    *backend = RuntimeBackend::kRoceHost;
+  } else if (transport == Transport::kUbmem) {
     if (!mode.empty()) return Status::InvalidArgument(
         "ubmem requires an empty aicpu_batch_get_mode");
     *backend = RuntimeBackend::kUbmem;

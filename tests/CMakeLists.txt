@@ -92,6 +92,14 @@ if(KVAF_BUILD_PYTHON)
     ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
   )
 
+  if(KVAF_ENABLE_ROCE_NPU)
+    add_test(NAME kvaf_npu_roce_python
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_batch_get.py"
+              --transport roce)
+    set_tests_properties(kvaf_npu_roce_python PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python" TIMEOUT 240)
+  endif()
+
   if(KVAF_ENABLE_AIV_BATCH_GET)
     add_test(NAME kvaf_npu_append_only_python
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_append_only.py")

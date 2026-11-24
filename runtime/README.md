@@ -225,6 +225,41 @@ Put/Get 生命周期、AccessTable 锁定、slot 回收、参数校验和 Operat
 用于在本机生成 caller-side 测试数据，然后直接传给 CPU Mock。MPS 不是 CANN
 AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
 
+## RoCE 显式 HBM 注册句柄冒烟与时延
+
+`tests/python/test_npu_hbm_region_roce.py` 是较小的 A5 端到端用例：它创建
+NPU 输入/输出 Tensor，显式调用 `register_hbm()`，重复执行 BatchPut 和 BatchGet，
+检查读回数据，并打印两条路径的批次时延统计。每轮计时不包含 access table
+准备、数据校验和 slot 释放；BatchGet 计时包含 stream 同步。
+
+先在提供 DDR 的服务器启动 CPU 服务：
+
+```bash
+./build-roce-npu/runtime/kvaf_roce_cpu_service \
+  --listen <server-ip> --port 29999 \
+  --rdma-device <cpu-rdma-device> --rdma-port 1 --gid-index <cpu-gid-index>
+```
+
+再在 A5 客户端运行：
+
+```bash
+export PYTHONPATH="$PWD/build-roce-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+export KVAF_CPU_SERVICE_ADDR=<server-ip>:29999
+export DEVICE_ID=0
+export KVAF_ROCE_DEVICE=<npu0-rdma-device>
+export KVAF_ROCE_PORT=1
+export KVAF_ROCE_GID_INDEX=<npu0-gid-index>
+python3 tests/python/test_npu_hbm_region_roce.py
+```
+
+默认使用 8 个 slot、每个 slot 4096 字节、1 次预热和 5 次采样。可通过
+`KVAF_HBM_TEST_BLOCKS`、`KVAF_HBM_TEST_TOKEN_BYTES`、
+`KVAF_HBM_TEST_TOKENS_PER_BLOCK`、`KVAF_HBM_TEST_WARMUP` 和
+`KVAF_HBM_TEST_ITERATIONS` 调整规模。配合 `KVAF_ROCE_MR_TIMING=1`，应能看到源和
+目标 HBM 各自注册一次、循环传输时不重复注册，显式注销时对应释放；脚本输出
+`HBM_REGION_DATA_VALIDATION_PASS`、`PERF_RESULT operation=WRITE/READ` 和
+`HBM_REGION_UNREGISTER_PASS` 表示流程走完。
+
 ## A5 / CANN BatchGet 集成
 
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 配合 `KVAF_BUILD_PYTHON=ON` 会构建 merged

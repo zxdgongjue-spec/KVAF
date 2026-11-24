@@ -53,6 +53,10 @@ int main() {
   }
   CHECK(ResolveRuntimeBackend(Transport::kUbmem, "", &backend).ok());
   CHECK(backend == RuntimeBackend::kUbmem && !UsesAicpu(backend));
+  CHECK(ResolveRuntimeBackend(Transport::kRoce, "", &backend).ok());
+  CHECK(backend == RuntimeBackend::kRoceHost && !UsesAicpu(backend));
+  CHECK(!StripesEids(backend, true));
+  CHECK(!ResolveRuntimeBackend(Transport::kRoce, "gather_read", &backend).ok());
   for (const auto& mode : {"gather_read_direct", "GATHER_READ", " ", "auto", "scatter"}) {
     CHECK(!ResolveRuntimeBackend(Transport::kUrma, mode, &backend).ok());
     CHECK(!ResolveRuntimeBackend(Transport::kUbmem, mode, &backend).ok());

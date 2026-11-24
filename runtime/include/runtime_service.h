@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "runtime.h"
@@ -20,6 +21,8 @@ class RuntimeService {
   explicit RuntimeService(RuntimeServiceOptions options);
 
   Status Serve(Runtime& runtime) const;
+  // The handler owns the accepted socket.
+  Status ServeConnections(const std::function<void(int)>& handler) const;
 
  private:
   RuntimeServiceOptions options_;

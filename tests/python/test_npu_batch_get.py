@@ -107,11 +107,11 @@ def main(transport: str = "urma") -> int:
             os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", ""),
         )
     )
-    if not kernel.is_file():
+    if transport != "roce" and not kernel.is_file():
         print("FAIL: KVAF_BATCH_GET_KERNEL must name the built kernel object", file=sys.stderr)
         return 2
     batch_put_kernel = Path(os.environ.get("KVAF_BATCH_PUT_KERNEL", ""))
-    if not batch_put_kernel.is_file():
+    if transport != "roce" and not batch_put_kernel.is_file():
         print("FAIL: KVAF_BATCH_PUT_KERNEL must name the built kernel object", file=sys.stderr)
         return 2
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
@@ -206,6 +206,8 @@ def main(transport: str = "urma") -> int:
     variable_lengths: list[int] = []
     variable_input_host = bytearray()
     for payload in variable_payloads:
+        if transport == "roce":
+            variable_input_host.extend(b"\x00" * 3)
         variable_offsets.append(len(variable_input_host))
         variable_lengths.append(len(payload))
         variable_input_host.extend(payload)
@@ -215,27 +217,40 @@ def main(transport: str = "urma") -> int:
     variable_keys = build_dsa_keys(len(variable_payloads), q_capacity=slot_count)
     ddr_bytes = slot_count * source_stride
 
+    roce_options = {}
+    if transport == "roce":
+        roce_device = os.environ.get("KVAF_ROCE_DEVICE")
+        roce_gid = os.environ.get("KVAF_ROCE_GID_INDEX")
+        if not roce_device or roce_gid is None:
+            print("FAIL: set KVAF_ROCE_DEVICE and KVAF_ROCE_GID_INDEX", file=sys.stderr)
+            return 2
+        roce_options = dict(rdma_device=roce_device, gid_index=int(roce_gid),
+                            rdma_port=int(os.environ.get("KVAF_ROCE_PORT", "1")),
+                            roce_cache_hbm=os.environ.get("KVAF_ROCE_CACHE_HBM", "1") == "1")
+
     # torch_npu owns ACL process initialization. Select the device before
     # passing its caller-owned streams through the pybind Runtime.
     torch.npu.set_device(device_id)
     device = f"npu:{device_id}"
     runtime = kvaf.NpuRuntime(
-        str(kernel),
+        str(kernel) if transport != "roce" else "",
         transport=transport,
         batch_get_token_bytes=token_bytes,
         batch_get_tokens_per_block=tokens_per_block,
         device_id=device_id,
         npu_core_count=npu_core_count,
-        batch_put_kernel_object_path=str(batch_put_kernel),
+        batch_put_kernel_object_path=str(batch_put_kernel) if transport != "roce" else "",
         jettys_per_core=jettys_per_core,
         batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
+        **roce_options,
     )
     runtime.link_to(remote_cpu_service)
     table = None
     graph = None
     graph_stream = None
     try:
+        put_backend = "roce_host" if transport == "roce" else "aiv_direct_hccp"
         print(
             "RUNTIME_NPU_SPARSE_LAYOUT "
             f"table_capacity={table_capacity} requests={requests} "
@@ -245,7 +260,7 @@ def main(transport: str = "urma") -> int:
             f"npu_cores={npu_core_count} jettys_per_core={jettys_per_core} "
             f"eid_paths={len(npu_eids) or 1} "
             f"npu_eids={','.join(npu_eids) or 'auto'} "
-            "batch_put_backend=aiv_direct_hccp"
+            f"batch_put_backend={put_backend}"
         )
         if graph_replays:
             # Create the caller-owned framework stream before Direct-HCCP
@@ -371,17 +386,36 @@ def main(transport: str = "urma") -> int:
             payload_slots, token_bytes
         )
         print(f"RUNTIME_NPU_BATCH_GET_VALIDATION_PASS requests={requests}")
+        if transport == "roce":
+            with torch.npu.stream(torch.npu.Stream(device=device_id)):
+                output_b.zero_()
+                miss_count.fill_(active_requests)
+                runtime.batch_get(device_table, indices, offsets, miss_count,
+                                  output_indices, output_b)
+                consumed = output_b.clone()
+                miss_count.zero_()
+                output_b.zero_()
+                runtime.batch_get(address_table, valid_table, indices, offsets, miss_count,
+                                  output_indices, output_b, synchronize=True)
+                if any(tensor_to_bytes(output_b)):
+                    raise AssertionError("RoCE Get modified output for miss_count=0")
+            validate_output(tensor_to_bytes(consumed), mask_values, output_indices_values,
+                            payload_slots, token_bytes)
+            miss_count.fill_(active_requests)
+            torch.npu.synchronize()
+            print("RUNTIME_NPU_ROCE_STREAM_VALIDATION_PASS")
 
-        # Runtime must acquire A and B independently, then reuse A's cached
-        # local HBM registration on the third call. The transport is owned by
-        # the operator and remains unchanged throughout this sequence.
+        # Exercise distinct output allocations and a return to the first output
+        # within the same transport session.
         execute(output_b)
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_b), mask_values, output_indices_values,
             payload_slots, token_bytes
         )
-        execute(output_a)
+        # RoCE also exercises a distinct Tensor view of the same storage.
+        reuse_output = output_a.view_as(output_a) if roce_options.get("roce_cache_hbm") else output_a
+        execute(reuse_output)
         torch.npu.synchronize()
         validate_output(
             tensor_to_bytes(output_a), mask_values, output_indices_values,
@@ -704,14 +738,14 @@ def main(transport: str = "urma") -> int:
             )
             graph.reset()
             graph = None
-        if transport == "ubmem":
+        if transport in ("ubmem", "roce"):
             runtime.release_access_table(table)
             table = None
             runtime.shutdown()
             for _ in range(2):
                 runtime.initialize(ddr_bytes, source_stride)
                 runtime.shutdown()
-            print("RUNTIME_NPU_UBMEM_REINITIALIZE_PASS")
+            print(f"RUNTIME_NPU_{transport.upper()}_REINITIALIZE_PASS")
         return 0
     except Exception as error:
         print(
@@ -740,5 +774,5 @@ def main(transport: str = "urma") -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
+    parser.add_argument("--transport", choices=("urma", "ubmem", "roce"), default="urma")
     raise SystemExit(main(parser.parse_args().transport))

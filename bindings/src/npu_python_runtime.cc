@@ -3,12 +3,14 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -24,6 +26,8 @@ namespace py = pybind11;
 
 namespace kvaf {
 namespace {
+
+std::atomic<std::uint64_t> next_python_runtime_identity{1};
 
 void ThrowIfError(const Status& status) {
   if (status.ok()) return;
@@ -62,6 +66,25 @@ struct NpuTensorView {
   std::size_t bytes{0};
   std::size_t element_bytes{0};
   std::vector<py::ssize_t> shape;
+};
+
+class PythonHbmRegion final {
+ public:
+  PythonHbmRegion() = default;
+  PythonHbmRegion(std::uint64_t runtime_identity,
+                  std::shared_ptr<HbmRegion> region)
+      : runtime_identity_(runtime_identity), region_(std::move(region)) {}
+
+  std::uint64_t runtime_identity() const { return runtime_identity_; }
+  bool closed() const { return !region_ || region_->closed(); }
+  std::uint32_t device_id() const { return region_ ? region_->device_id() : 0; }
+  std::uintptr_t base() const { return region_ ? region_->base() : 0; }
+  std::size_t bytes() const { return region_ ? region_->bytes() : 0; }
+
+ private:
+  friend class NpuPythonRuntime;
+  std::uint64_t runtime_identity_{};
+  std::shared_ptr<HbmRegion> region_;
 };
 
 NpuTensorView GetNpuTensorView(const py::object& tensor, const char* name) {
@@ -286,13 +309,23 @@ class NpuPythonRuntime final {
                    std::vector<std::string> adaptive_peer_ub_devices,
                    std::uint32_t batch_get_max_inflight_total,
                    const std::string& transport, std::string aicpu_batch_get_mode,
-                   std::string allocation_mode) {
+                   std::string allocation_mode, std::string rdma_device,
+                   int rdma_port, int gid_index,
+                   bool roce_cache_hbm)
+      : roce_cache_hbm_(transport == "roce" && roce_cache_hbm),
+        runtime_identity_(next_python_runtime_identity.fetch_add(1, std::memory_order_relaxed)) {
     NpuRuntimeOptions options{std::move(batch_get_kernel_object_path),
                               batch_get_token_bytes,
                               batch_get_tokens_per_block};
     if (transport == "urma") options.transport = Transport::kUrma;
     else if (transport == "ubmem") options.transport = Transport::kUbmem;
-    else throw py::value_error("transport must be urma or ubmem");
+    else if (transport == "roce") options.transport = Transport::kRoce;
+    else throw py::value_error("transport must be urma, ubmem or roce");
+    if (rdma_port < 1 || rdma_port > 255 || gid_index < -1 || gid_index > 255)
+      throw py::value_error("RDMA port or GID index is out of range");
+    options.rdma_device = std::move(rdma_device);
+    options.rdma_port = static_cast<std::uint8_t>(rdma_port);
+    options.gid_index = gid_index;
     options.batch_put_kernel_object_path =
         std::move(batch_put_kernel_object_path);
     options.device_id = device_id;
@@ -347,7 +380,7 @@ class NpuPythonRuntime final {
   // the Direct-HCCP implementation synchronously completes this stream.
   void BatchPut(const py::object& keys, const py::object& source,
                 const py::object& input_offsets, const py::object& lengths,
-                const py::object& stream) {
+                const py::object& stream, const py::object& hbm_region) {
     if (!Initialized()) {
       throw std::runtime_error("Runtime has not been initialized");
     }
@@ -367,8 +400,36 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request_.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
-    ThrowIfError(native_->core().BatchPut(
-        batch_put_request_, BatchPutExecutionOptions{acl_stream}));
+    BatchPutExecutionOptions execution{acl_stream};
+    if (hbm_region.is_none()) {
+      execution.hbm_owner = AcquireHbmOwner(source, source_view, &execution.hbm_storage);
+    } else {
+      execution.hbm_region = ResolveHbmRegion(hbm_region);
+    }
+    ThrowIfError(native_->core().BatchPut(batch_put_request_, std::move(execution)));
+  }
+
+  PythonHbmRegion RegisterHbm(const py::object& tensor) {
+    if (!Initialized()) throw std::runtime_error("Runtime has not been initialized");
+    const NpuTensorView view = GetNpuTensorView(tensor, "HBM region Tensor");
+    ConstBufferView storage;
+    auto owner = AcquireHbmOwner(tensor, view, &storage, false);
+    if (!owner || storage.empty()) {
+      throw py::value_error("register_hbm requires a Tensor with a stable NPU untyped_storage");
+    }
+    std::shared_ptr<HbmRegion> region;
+    ThrowIfError(native_->RegisterHbm(
+        ConstBufferView{view.data, view.bytes, DeviceKind::kNpu}, owner,
+        storage, &region));
+    return PythonHbmRegion(runtime_identity_, std::move(region));
+  }
+
+  void UnregisterHbm(PythonHbmRegion& region) {
+    if (region.runtime_identity_ != runtime_identity_) {
+      throw py::value_error("HBM region belongs to a different NpuRuntime");
+    }
+    if (!region.region_) throw py::value_error("HBM region is already unregistered");
+    ThrowIfError(native_->UnregisterHbm(&region.region_));
   }
 
   AccessTableHandle PrepareAccessTable(const py::object& keys) {
@@ -523,10 +584,11 @@ class NpuPythonRuntime final {
                 const py::object& indices, const py::object& offsets,
                 const py::object& miss_count,
                 const py::object& output_indices, const py::object& output,
-                const py::object& stream, bool synchronize, bool profile) {
+                const py::object& stream, bool synchronize, bool profile,
+                const py::object& hbm_region) {
     return BatchGetImpl(access_table.source(), access_table.addresses(),
                  access_table.valid(), indices, offsets, miss_count, output_indices,
-                 output, stream, synchronize, profile);
+                 output, stream, synchronize, profile, hbm_region);
   }
 
   // This overload accepts a caller-owned device table directly. Since bare
@@ -539,9 +601,10 @@ class NpuPythonRuntime final {
                            const py::object& miss_count,
                            const py::object& output_indices,
                            const py::object& output,
-                           const py::object& stream, bool synchronize, bool profile) {
+                           const py::object& stream, bool synchronize, bool profile,
+                           const py::object& hbm_region) {
     return BatchGetImpl(AccessTableHandle{}, addresses, valid, indices, offsets, miss_count,
-                 output_indices, output, stream, synchronize, profile);
+                 output_indices, output, stream, synchronize, profile, hbm_region);
   }
 
   void BatchGetRanges(const DeviceAccessTable& table, const py::object& indices,
@@ -584,13 +647,62 @@ class NpuPythonRuntime final {
   }
 
  private:
+  std::shared_ptr<HbmRegion> ResolveHbmRegion(const py::object& object) const {
+    if (!py::isinstance<PythonHbmRegion>(object)) {
+      throw py::type_error("hbm_region must be a kvaf.HbmRegion returned by this Runtime");
+    }
+    const auto& handle = py::cast<const PythonHbmRegion&>(object);
+    if (handle.runtime_identity_ != runtime_identity_) {
+      throw py::value_error("HBM region belongs to a different NpuRuntime");
+    }
+    if (!handle.region_ || handle.region_->closed()) {
+      throw py::value_error("HBM region is closed or unregistered");
+    }
+    return handle.region_;
+  }
+
+  std::shared_ptr<void> AcquireHbmOwner(const py::object& tensor, const NpuTensorView& view,
+                                        ConstBufferView* range,
+                                        bool require_cache_option = true) {
+    if ((require_cache_option && !roce_cache_hbm_) ||
+        !py::hasattr(tensor, "untyped_storage")) return {};
+    py::object storage = tensor.attr("untyped_storage")();
+    if (!py::hasattr(storage, "_cdata") || !py::hasattr(storage, "data_ptr") ||
+        !py::hasattr(storage, "nbytes")) return {};
+    const auto identity = storage.attr("_cdata").cast<std::uintptr_t>();
+    const auto base = storage.attr("data_ptr")().cast<std::uintptr_t>();
+    const auto bytes = storage.attr("nbytes")().cast<std::size_t>();
+    const auto address = reinterpret_cast<std::uintptr_t>(view.data);
+    if (identity == 0 || base == 0 || address < base || view.bytes > bytes ||
+        address - base > bytes - view.bytes) return {};
+    *range = {reinterpret_cast<const void*>(base), bytes, DeviceKind::kNpu};
+
+    // Tensor views share a StorageImpl. Its identity is stable while the
+    // strong Python storage reference owned by the MR is alive.
+    const auto existing = hbm_owners_.find(identity);
+    if (existing != hbm_owners_.end()) {
+      if (auto owner = existing->second.lock()) return owner;
+    }
+    for (auto it = hbm_owners_.begin(); it != hbm_owners_.end();) {
+      if (it->second.expired()) it = hbm_owners_.erase(it);
+      else ++it;
+    }
+    auto owner = std::shared_ptr<void>(storage.release().ptr(), [](void* object) {
+      py::gil_scoped_acquire gil;
+      Py_DECREF(static_cast<PyObject*>(object));
+    });
+    hbm_owners_.emplace(identity, owner);
+    return owner;
+  }
+
   py::object BatchGetImpl(const AccessTableHandle& access_table,
                     const py::object& addresses, const py::object& valid,
                     const py::object& indices, const py::object& offsets,
                     const py::object& miss_count,
                     const py::object& output_indices,
                     const py::object& output, const py::object& stream,
-                    bool synchronize, bool profile) {
+                    bool synchronize, bool profile,
+                    const py::object& hbm_region) {
     if (profile && (!synchronize || !aicpu_backend_))
       throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
     const auto begin = profile ? BatchGetProfileNowNs() : 0U;
@@ -642,9 +754,13 @@ class NpuPythonRuntime final {
     const aclrtStream acl_stream = ResolveStream(stream);
     auto timings = profile ? std::make_unique<BatchGetProfile>() : nullptr;
     const auto native_begin = profile ? BatchGetProfileNowNs() : 0U;
-    ThrowIfError(native_->core().BatchGet(
-        request, BatchGetExecutionOptions{acl_stream,
-                                           synchronize, timings.get()}));
+    BatchGetExecutionOptions execution{acl_stream, synchronize, timings.get()};
+    if (hbm_region.is_none()) {
+      execution.hbm_owner = AcquireHbmOwner(output, output_view, &execution.hbm_storage);
+    } else {
+      execution.hbm_region = ResolveHbmRegion(hbm_region);
+    }
+    ThrowIfError(native_->core().BatchGet(request, execution));
     if (!profile) return py::none();
     const auto end = BatchGetProfileNowNs();
     auto result = BatchGetProfileDict(*timings);
@@ -657,6 +773,7 @@ class NpuPythonRuntime final {
  public:
   void Shutdown() {
     ThrowIfError(native_->Shutdown());
+    hbm_owners_.clear();
   }
 
   void CheckBatchGetStatus(const py::object& stream) {
@@ -666,6 +783,9 @@ class NpuPythonRuntime final {
  private:
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   bool aicpu_backend_{false};
+  const bool roce_cache_hbm_;
+  const std::uint64_t runtime_identity_;
+  std::unordered_map<std::uintptr_t, std::weak_ptr<void>> hbm_owners_;
   // Runtime::BatchPut is synchronous, so these vectors can be reused after
   // each call and avoid allocator churn in the measured loop.
   BatchPutRequest batch_put_request_;
@@ -674,6 +794,12 @@ class NpuPythonRuntime final {
 }  // namespace
 
 void BindNpuPythonRuntime(py::module_& module) {
+  py::class_<PythonHbmRegion>(module, "HbmRegion")
+      .def_property_readonly("closed", &PythonHbmRegion::closed)
+      .def_property_readonly("device_id", &PythonHbmRegion::device_id)
+      .def_property_readonly("base", &PythonHbmRegion::base)
+      .def_property_readonly("bytes", &PythonHbmRegion::bytes);
+
   py::class_<DeviceAccessTable>(module, "DeviceAccessTable")
       .def_property_readonly("addresses", &DeviceAccessTable::addresses)
       .def_property_readonly("valid", &DeviceAccessTable::valid)
@@ -702,6 +828,10 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,
            py::arg("stream") = py::none(),
            "Synchronize and check AICPU BatchGet results outside capture. Retains the first failed replay.")
+      .def("register_hbm", &NpuPythonRuntime::RegisterHbm, py::arg("tensor"),
+           "Register a Tensor's full NPU storage for reuse by RoCE BatchPut/Get.")
+      .def("unregister_hbm", &NpuPythonRuntime::UnregisterHbm, py::arg("region"),
+           "Stop new uses and wait for in-flight RoCE operations before deregistering HBM.")
       .def_property_readonly("initialized", &NpuPythonRuntime::Initialized)
       .def_property_readonly("device_id", &NpuPythonRuntime::DeviceId)
       .def_property_readonly("allocation_mode", &NpuPythonRuntime::AllocationModeValue)
@@ -715,11 +845,12 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def_property_readonly("remote_region", &NpuPythonRuntime::RemoteRegion)
       .def("batch_put", &NpuPythonRuntime::BatchPut, py::arg("keys"),
            py::arg("source"), py::arg("input_offsets"), py::arg("lengths"),
-           py::arg("stream") = py::none(),
+           py::arg("stream") = py::none(), py::arg("hbm_region") = py::none(),
            "Synchronously write variable-size packed NPU blocks. keys, input_offsets, and "
            "lengths are CPU integer sequences or contiguous CPU int64 tensors "
            "with one entry per key; "
-           "stream=None uses torch.npu.current_stream().")
+           "stream=None uses torch.npu.current_stream(). An optional hbm_region reuses "
+           "an explicitly registered source allocation.")
       .def("prepare_access_table", &NpuPythonRuntime::PrepareAccessTable,
            py::arg("keys"))
       .def("access_table_view", &NpuPythonRuntime::AccessTableView,
@@ -746,20 +877,22 @@ void BindNpuPythonRuntime(py::module_& module) {
            py::arg("miss_count"),
            py::arg("output_indices"), py::arg("output"),
            py::arg("stream") = py::none(), py::arg("synchronize") = false,
-           py::arg("profile") = false,
+           py::arg("profile") = false, py::arg("hbm_region") = py::none(),
            "Submit BatchGet from NPU Tensors. stream=None uses torch.npu.current_stream(); "
            "the default returns after enqueueing work on that stream. AICPU profile=True "
-           "requires synchronize=True and returns a stage timing dictionary.")
+           "requires synchronize=True and returns a stage timing dictionary. An optional "
+           "hbm_region reuses an explicitly registered output allocation.")
       .def("batch_get", &NpuPythonRuntime::BatchGetFromTensors,
            py::arg("addresses"), py::arg("valid"), py::arg("indices"),
            py::arg("offsets"), py::arg("miss_count"), py::arg("output_indices"),
            py::arg("output"), py::arg("stream") = py::none(),
            py::arg("synchronize") = false,
-           py::arg("profile") = false,
+           py::arg("profile") = false, py::arg("hbm_region") = py::none(),
            "Submit BatchGet from caller-owned NPU addresses and valid Tensors. "
            "stream=None uses torch.npu.current_stream(); the default returns "
            "after enqueueing work on that stream. AICPU profile=True requires "
-           "synchronize=True and returns a stage timing dictionary.");
+           "synchronize=True and returns a stage timing dictionary. An optional "
+           "hbm_region reuses an explicitly registered output allocation.");
 }
 
 }  // namespace kvaf

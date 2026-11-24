@@ -18,8 +18,9 @@ void BindNpuRuntimeConstructor(pybind11::class_<Runtime>& runtime) {
                        std::uint32_t, std::string, std::uint32_t,
                        std::vector<std::string>, bool, std::uint32_t,
                        std::string, std::vector<std::string>, std::uint32_t,
-                       const std::string&, std::string, std::string>(),
-              py::arg("batch_get_kernel_object_path"),
+                       const std::string&, std::string, std::string, std::string,
+                       int, int, bool>(),
+              py::arg("batch_get_kernel_object_path") = "",
               py::arg("batch_get_token_bytes"),
               py::arg("batch_get_tokens_per_block"), py::arg("device_id") = 0,
               py::arg("npu_core_count") = 2,
@@ -33,7 +34,9 @@ void BindNpuRuntimeConstructor(pybind11::class_<Runtime>& runtime) {
               py::arg("batch_get_max_inflight_total") = 2048,
               py::arg("transport") = "urma", py::kw_only(),
               py::arg("aicpu_batch_get_mode") = "",
-              py::arg("allocation_mode") = "fixed");
+              py::arg("allocation_mode") = "fixed",
+              py::arg("rdma_device") = "", py::arg("rdma_port") = 1,
+              py::arg("gid_index") = -1, py::arg("roce_cache_hbm") = false);
 }
 
 }  // namespace kvaf::python_binding
