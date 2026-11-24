@@ -53,6 +53,7 @@ struct GatherReadArgs {
   std::uint32_t window_capacity{kDefaultGetWindow};
   std::uint64_t profile{0U};
   std::uint64_t execution_control{0U};
+  // Zero selects the policy from each launch's total device miss_count.
   std::uint32_t read_wave_wrs{kGatherDefaultReadWaveWrs};
 };
 // One stable registered HBM workspace, independent of caller output allocations.

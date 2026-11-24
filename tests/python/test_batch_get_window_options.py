@@ -8,7 +8,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from utils.get_options import add_backend_arguments, add_workload_arguments, resolve_backend, validate_workload, workload_command
+from utils.get_options import (
+    add_backend_arguments, add_workload_arguments, gather_read_wave_settings,
+    resolve_backend, validate_workload, workload_command,
+)
 from utils.perf_execution import BenchmarkExecution
 from utils.batch_get_csv import BatchGetCsv
 
@@ -27,7 +30,7 @@ class WindowOptions(unittest.TestCase):
     def test_gather_read_wave_limits_forwarding_and_csv(self):
         kvaf = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
                                ExecutionResources=lambda **kw: kw)
-        self.assertEqual(workload("gather_read", 1000000).gather_read_wave_wrs, 4096)
+        self.assertIsNone(workload("gather_read", 1000000).gather_read_wave_wrs)
         for limit in (1, 31, 32, 64, 96, 128, 256, 512, 4096):
             args = workload("gather_read", 1000000)
             args.gather_read_wave_wrs = limit
@@ -64,7 +67,51 @@ class WindowOptions(unittest.TestCase):
             report.add_summary("graph", {})
             report.write()
             with report.summary_path.open(newline="") as output:
-                self.assertEqual(next(csv.DictReader(output))["gather_read_wave_wrs"], "64")
+                row = next(csv.DictReader(output))
+                self.assertEqual(row["gather_read_wave_wrs"], "64")
+                self.assertEqual(row["gather_read_wave_wrs_mode"], "fixed")
+
+    def test_gather_read_auto_default_and_child_command(self):
+        kvaf = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                               ExecutionResources=lambda **kw: kw)
+        args = workload("gather_read", 1000000)
+        for count in (0, 8191, 8192, 8193, 1000000):
+            args.miss_count = count
+            self.assertIsNone(validate_workload(args))
+            expected = 512 if count <= 8192 else 64
+            self.assertEqual(gather_read_wave_settings(args), dict(
+                gather_read_wave_wrs=expected, gather_read_wave_wrs_mode="auto"))
+            self.assertIsNone(args.gather_read_wave_wrs)
+            command = workload_command(args)
+            self.assertNotIn("--gather-read-wave-wrs", command)
+            parser = argparse.ArgumentParser()
+            add_backend_arguments(parser)
+            add_workload_arguments(parser)
+            child = parser.parse_args(command)
+            resolve_backend(child, parser)
+            self.assertIsNone(child.gather_read_wave_wrs)
+            self.assertEqual(child.miss_count, count)
+        run = BenchmarkExecution(kvaf, executor="aicpu", algorithm="gather")
+        self.assertNotIn("gather_read_wave_wrs", run.runtime_kwargs["get_resources"][0][1])
+        for count, limit in ((1000000, 512), (8192, 64)):
+            args.miss_count, args.gather_read_wave_wrs = count, limit
+            self.assertEqual(gather_read_wave_settings(args), dict(
+                gather_read_wave_wrs=limit, gather_read_wave_wrs_mode="fixed"))
+
+    def test_gather_read_auto_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = workload("gather_read", 1000000)
+            args.output_dir = Path(directory)
+            args.kernel_profile = False
+            for count, expected in ((8192, "512"), (8193, "64")):
+                args.miss_count = count
+                report = BatchGetCsv(args)
+                report.add_summary("graph", {})
+                report.write()
+                with report.summary_path.open(newline="") as output:
+                    row = next(csv.DictReader(output))
+                self.assertEqual(row["gather_read_wave_wrs"], expected)
+                self.assertEqual(row["gather_read_wave_wrs_mode"], "auto")
 
     def test_large_direct_get(self):
         for backend in ("aiv", "ubmem"):

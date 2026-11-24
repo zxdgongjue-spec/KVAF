@@ -257,7 +257,7 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
 }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
-  if (!ValidGatherReadWaveWrs(impl_->read_wave_wrs))
+  if (!ValidGatherReadWaveConfig(impl_->read_wave_wrs))
     return InvalidArgument("gather_read_wave_wrs must be in [1, 4096]");
   const auto workers = impl_->session.config().workers;
   if (!impl_->session.config().peer_link || !impl_->token_bytes || !workers ||
@@ -271,8 +271,14 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (!workspace.base || (workspace.base & 63U) || workspace.length != workspace_bytes ||
       workspace.base > UINT64_MAX - workspace.length)
     return InvalidArgument("Gather received an invalid remote workspace");
-  std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=%u window_capacity=%u\n",
-      workers, impl_->read_wave_wrs, impl_->window_capacity);
+  if (impl_->read_wave_wrs == kGatherDefaultReadWaveWrs)
+    std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=auto "
+        "miss_count_threshold=8192 small_wave_wrs=512 large_wave_wrs=64 window_capacity=%u\n",
+        workers, impl_->window_capacity);
+  else
+    std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=%u "
+        "read_wave_mode=fixed window_capacity=%u\n", workers, impl_->read_wave_wrs,
+        impl_->window_capacity);
   impl_->region = region;
   impl_->remote_workspace = {workspace.base, workspace.length, 0, DeviceKind::kCpu};
   auto& state = impl_->execution;

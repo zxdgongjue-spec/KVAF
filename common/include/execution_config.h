@@ -60,7 +60,8 @@ struct ExecutionResources {
   // is the largest multiple of 4096 fitting the selected memory budget.
   std::uint64_t gather_ddr_bytes{0}, scatter_hbm_bytes{0};
   // URMA AICPU Gather only: maximum unretired data READ WRs per worker/wave.
-  // An absent value preserves 4096; explicit values must be in [1, 4096].
+  // An absent value selects 512 for miss_count <= 8192, otherwise 64, on device
+  // for every launch/replay. Explicit [1, 4096] values override that policy.
   std::optional<std::uint32_t> gather_read_wave_wrs;
 };
 struct ExecutionPolicy {

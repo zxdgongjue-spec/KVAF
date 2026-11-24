@@ -8,9 +8,18 @@ inline constexpr std::uint32_t kGatherMaxRequests = kDefaultGetWindow;
 inline constexpr std::uint32_t kGatherMaxWorkers = 8U;
 inline constexpr std::uint32_t kGatherChunkBytes = 131072U;
 inline constexpr std::uint32_t kGatherMaxReadWaveWrs = 4096U;
-inline constexpr std::uint32_t kGatherDefaultReadWaveWrs = kGatherMaxReadWaveWrs;
+// Internal zero selects the per-launch policy; public ExecutionResources uses None.
+inline constexpr std::uint32_t kGatherDefaultReadWaveWrs = 0U;
 inline constexpr bool ValidGatherReadWaveWrs(std::uint32_t wrs) {
   return wrs != 0U && wrs <= kGatherMaxReadWaveWrs;
+}
+inline constexpr bool ValidGatherReadWaveConfig(std::uint32_t wrs) {
+  return wrs == kGatherDefaultReadWaveWrs || ValidGatherReadWaveWrs(wrs);
+}
+inline constexpr std::uint32_t ResolveGatherReadWaveWrs(std::uint32_t configured,
+                                                      std::uint32_t miss_count) {
+  if (configured != kGatherDefaultReadWaveWrs) return configured;
+  return miss_count <= 8192U ? 512U : 64U;
 }
 inline constexpr std::uint32_t GatherLaneCapacity(
     std::uint32_t workers, std::uint32_t capacity = kDefaultGetWindow) {

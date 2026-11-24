@@ -339,7 +339,7 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
 std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (!launch || !launch->request.miss_count || !launch->gather.core_status || !launch->gather.scratch ||
       !launch->gather.execution_control ||
-      !launch->gather.worker_count || !ValidGatherReadWaveWrs(launch->gather.read_wave_wrs) ||
+      !launch->gather.worker_count || !ValidGatherReadWaveConfig(launch->gather.read_wave_wrs) ||
       !ValidGatherWindow(launch->request.token_bytes, launch->gather.worker_count,
                          launch->gather.window_capacity))
     return 1U;
@@ -396,6 +396,9 @@ std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
     return 1U;
   }
   const auto count = static_cast<std::uint32_t>(active);
+  // Resolve from this launch's total active count, independently of tensor
+  // capacity, worker slices and memory windows. The captured args retain auto.
+  args.read_wave_wrs = ResolveGatherReadWaveWrs(args.read_wave_wrs, count);
   // Each lane advances independently through the same global windows. Only
   // window-local descriptors/staging are reused; all input/output indices stay global.
   for (std::uint64_t base = 0; base < count; base += args.window_capacity) {

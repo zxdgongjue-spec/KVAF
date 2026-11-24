@@ -14,6 +14,17 @@ MAX_INT32 = (1 << 31) - 1
 MAX_UINT64 = (1 << 64) - 1
 
 
+def gather_read_wave_settings(args):
+    """Report the setting for the timed miss_count; the kernel resolves each replay."""
+    if args.backend != "gather_read":
+        return dict(gather_read_wave_wrs=None, gather_read_wave_wrs_mode=None)
+    configured = getattr(args, "gather_read_wave_wrs", None)
+    return dict(
+        gather_read_wave_wrs=(512 if args.miss_count <= 8192 else 64) if configured is None else configured,
+        gather_read_wave_wrs_mode="auto" if configured is None else "fixed",
+    )
+
+
 def environment_int(name, default):
     value = os.environ.get(name)
     return default if value is None else int(value)
@@ -98,7 +109,8 @@ def add_backend_arguments(parser, *, sweep=False):
                        help="Gather extra CPU DDR budget including metadata; 0 keeps the 65536-row layout")
     group.add_argument("--gather-read-wave-wrs", type=int,
                        default=environment_int("KVAF_BATCH_GET_GATHER_READ_WAVE_WRS", None),
-                       help="Gather data READ WR limit per worker/wave (1..4096, default: 4096)")
+                       help="Gather data READ WR limit per worker/wave (1..4096); default auto: "
+                            "miss-count <= 8192 uses 512, otherwise 64")
     group.add_argument("--scatter-hbm-bytes", type=int,
                        default=environment_int("KVAF_BATCH_GET_SCATTER_HBM_BYTES", 0),
                        help="Scatter contiguous HBM budget including metadata; 0 keeps the 65536-row layout")
@@ -118,8 +130,6 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
     if args.transport is not None and args.transport != expected:
         parser.error("--backend conflicts with --transport")
     args.transport = expected
-    if args.backend == "gather_read" and args.gather_read_wave_wrs is None:
-        args.gather_read_wave_wrs = 4096
     field = parallelism_field(args.backend)
     other = "aiv_cores" if uses_aicpu(args) else "aicpu_workers"
     legacy = getattr(args, other)

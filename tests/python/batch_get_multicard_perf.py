@@ -15,7 +15,7 @@ import sys
 import time
 
 from utils.get_options import (
-    add_backend_arguments, add_workload_arguments, configure_backend_help, parallelism_field,
+    add_backend_arguments, add_workload_arguments, configure_backend_help, gather_read_wave_settings, parallelism_field,
     resolve_backend, validate_workload, workload_command,
 )
 from utils.perf_execution import add_execution_metadata
@@ -173,6 +173,8 @@ def write_summary(directory, isolated, concurrent, config=None):
         "seconds", "graphs", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
         "jettys_per_core", "max_inflight_total", "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs",
     ) if key in config}
+    if config.get("backend") == "gather_read":
+        metadata.update(gather_read_wave_settings(argparse.Namespace(**config)))
     metadata["run"] = directory.name
     metadata["device_order"] = " ".join(str(r["device"]) for r in isolated)
     aggregate_row = dict(metadata, **aggregate)

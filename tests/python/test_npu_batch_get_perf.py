@@ -50,7 +50,7 @@ from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
                              captured_get_resources, validate_graph_inputs)
 from utils.get_options import (
     MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
-    environment_int, resolve_backend, uses_aicpu, validate_workload,
+    environment_int, resolve_backend, uses_aicpu, validate_workload, gather_read_wave_settings,
 )
 from utils.perf_execution import BenchmarkExecution, add_execution_metadata
 from utils.statistics import percentile
@@ -943,7 +943,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} aicpu_workers={args.aicpu_workers} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
-            f"gather_read_wave_wrs={getattr(args, 'gather_read_wave_wrs', None)} "
+            f"{format_fields(gather_read_wave_settings(args))} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "

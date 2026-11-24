@@ -97,7 +97,8 @@ struct Fixture {
       CHECK(reports[w].magic == kGatherStatusMagic && reports[w].sequence == launches && reports[w].result == 0);
       CHECK(reports[w].failed_request == UINT64_MAX);
       completed += reports[w].completed_requests; spans += profiles[w].spans;
-      CHECK(pending_wrs[w] == 0 && peak_wrs[w] <= args.gather.read_wave_wrs);
+      CHECK(pending_wrs[w] == 0 &&
+            peak_wrs[w] <= ResolveGatherReadWaveWrs(args.gather.read_wave_wrs, uint32_t(n)));
     }
     CHECK(completed == uint32_t(n) && spans == uint32_t(n));
     for (uint32_t i = 0; i < capacity; ++i) for (uint32_t b = 0; b < token; ++b)
@@ -123,7 +124,8 @@ bool PostBatch(Queue& queue, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkCont
   for (auto* wr = first;; wr = wr->next) {
     const auto live = ++current->pending_wrs[worker];
     current->peak_wrs[worker] = std::max(current->peak_wrs[worker], live);
-    CHECK(live <= current->args.gather.read_wave_wrs);
+    CHECK(live <= ResolveGatherReadWaveWrs(current->args.gather.read_wave_wrs,
+                                         uint32_t(current->count)));
     CHECK(wr && wr->rw.src.num_sge == 1 && wr->rw.dst.num_sge <= 6);
     auto source = wr->rw.src.sge[0].addr;
     const auto bytes = wr->rw.src.sge[0].len;
@@ -188,10 +190,36 @@ int main() {
       f.Run(0);
     }
   }
-  { Fixture f(1000000, 5, 65536); f.args.gather.read_wave_wrs = 64; f.Run(1000000); }
+  // Auto is resolved anew from the total device count on every replay, even
+  // when queues retain storage sized for the previous, larger wave.
+  { Fixture f(20001, 5, 65536, 656);
+    for (int32_t n : {8192, 8193, 8192, 0, 1, 20001, 8192}) {
+      f.Run(n);
+      CHECK(f.args.gather.read_wave_wrs == 0);
+      if (n == 8192) CHECK(f.peak_wrs[0] == 273 && f.cq_waits[0] == 1);
+      if (n == 8193) CHECK(f.peak_wrs[0] == 64 && f.cq_waits[0] == 5);
+      if (n == 20001) CHECK(f.peak_wrs[0] == 64 && f.cq_waits[0] == 11);
+    }
+    f.args.gather.read_wave_wrs = 256;
+    f.Run(20001);
+    CHECK(f.peak_wrs[0] == 256 && f.cq_waits[0] == 3);
+    f.args.gather.read_wave_wrs = 64;
+    f.Run(8192);
+    CHECK(f.peak_wrs[0] == 64 && f.cq_waits[0] == 5);
+  }
+  { Fixture f(1000000, 5, 65536);
+    f.Run(1000000); CHECK(f.peak_wrs[0] == 64);
+    f.Run(8192); CHECK(f.peak_wrs[0] == 273);
+    f.Run(1000000); CHECK(f.peak_wrs[0] == 64);
+  }
+  // Small memory windows do not select the small-total-count policy.
+  { Fixture f(20000, 5, 4096);
+    f.Run(20000); CHECK(f.peak_wrs[0] == 64);
+    f.Run(8192); CHECK(f.peak_wrs[0] == 137);
+  }
   { Fixture f(20000, 5, 4096); f.args.gather.read_wave_wrs = 32; f.Run(20000); }
   { Fixture f(1, 1, 4096);
-    for (uint32_t invalid : {0U, 4097U, UINT32_MAX}) {
+    for (uint32_t invalid : {4097U, UINT32_MAX}) {
       f.args.gather.read_wave_wrs = invalid;
       CHECK(ExecuteGatherRead(&f.args) != 0 && f.control.claimed == 0);
     }

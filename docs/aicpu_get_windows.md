@@ -11,8 +11,7 @@ gather = kvaf.GetExecutionConfig("urma", "aicpu", "gather")
 scatter = kvaf.GetExecutionConfig("urma", "aicpu", "scatter")
 
 get_resources = [
-    (gather, kvaf.ExecutionResources(cores=5, gather_ddr_bytes=64 * 1024**2,
-                                   gather_read_wave_wrs=64)),
+    (gather, kvaf.ExecutionResources(cores=5, gather_ddr_bytes=64 * 1024**2)),
     (scatter, kvaf.ExecutionResources(cores=5, scatter_hbm_bytes=64 * 1024**2)),
 ]
 # 传给 NpuRuntime(get_resources=get_resources, ...)，其他初始化参数沿用现有配置。
@@ -34,31 +33,39 @@ HBM 预算约束的是传给 ACL 的申请字节数，不是驱动内部保留�
 Scatter 默认连续 HBM 工作区为 43516416 字节；默认窗口仍是 65536 条。
 资源初始化日志 `GATHER_WINDOW` / `SCATTER_WINDOW` 输出有效窗口、预算与申请大小。
 
-`gather_read_wave_wrs` 控制每个 worker 每个 READ 波次最多提交多少个数据 WR，范围为
-1..4096。`ExecutionResources` 未设置（`None`）时沿用 4096，仅 URMA AICPU Gather Get
-接受该参数。它独立于 DDR 内存窗口、每次 post 的 32 WR 和 CPU 的 128 KiB ready 块。
+`gather_read_wave_wrs` 控制每个 worker 每个 READ 波次最多提交多少个数据 WR，显式值范围为
+1..4096。`ExecutionResources` 未设置（`None`）时，kernel 按本次调用设备上的总有效
+`miss_count` 自动选择：`miss_count <= 8192` 使用 512 WR，否则使用 64 WR。
+判断依据是总有效请求数，不是输入张量容量、单 worker 片段或内存窗口大小。
+显式配置如 `gather_read_wave_wrs=128` 时始终使用该值，优先于自动策略；仅 URMA AICPU
+Gather Get 接受该参数。它独立于 DDR 内存窗口、每次 post 的 32 WR 和 CPU 的 128 KiB ready 块。
 每波末尾 CQE 确认后才复用该波 WR/SGE；硬件可能已经提前完成部分 WR。
 例如 5 workers、每 WR 合并 6 条 token 时，64 WR 对应全局最多 320 个未确认数据 READ WR，
 即最多 1920 条逻辑请求。工作区容量和总请求数不因该参数改变。
 
 预算和 WR 上限都在 NPU 客户端的 `ExecutionResources` 配置，通过 `NpuRuntime` 的
 `get_resources` 传入；DDR 预算会在初始化时协商给 CPU 服务，WR 上限仅传入 Gather kernel。
-已捕获的图保留该值；改变它需重建执行资源和捕获图。阶段耗时、日志和 CSV 用于对照每组配置。
+已捕获的图保留自动模式或显式固定值。自动模式在每次 replay 时读取当前设备 `miss_count`，
+所以同一张图可以随计数切换 512/64，且一次调用内所有内存窗口使用同一上限。
+调用方须在 replay 前按流顺序更新原计数张量内容，保持图绑定的地址有效；无需增加 kernel
+节点或 Host 读取计数。改变自动/固定模式或显式固定值需重建执行资源和捕获图。
 
 测试入口接受 `--gather-read-wave-wrs`，环境变量为 `KVAF_BATCH_GET_GATHER_READ_WAVE_WRS`：
 
 ```bash
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
   --backend gather_read --aicpu-workers 5 --gather-ddr-bytes 67108864 \
-  --gather-read-wave-wrs 64 --request-length 1000000 --miss-count 1000000 \
+  --request-length 1000000 --miss-count 1000000 \
   --table-capacity 16384 --tokens-per-block 128 --token-bytes 656 \
   --execution graph --graph-replays 10 --warmup 5 --iterations 20 --kernel-profile \
-  --output-dir reports/gather-wave-64
+  --output-dir reports/gather-wave-auto
 ```
 
-同一构建中将该参数改为 32、128、256 等即可对照，无需逐次改源码重编。
-`BATCH_GET_PERF_CONFIG` 和 summary.csv 的 `gather_read_wave_wrs` 记录有效值。
-NPU 初始化执行资源时的 `GATHER_READ_CONFIG` 也输出实际 `read_wave_wrs` 和窗口容量。
+上述命令省略 WR 参数以测试自动默认值；改为 `--miss-count 8192` 时自动选择 512。
+同一构建中添加 `--gather-read-wave-wrs 32`、128、256 等即可固定上限对照，无需逐次改源码重编。
+`BATCH_GET_PERF_CONFIG` 和 summary.csv 的 `gather_read_wave_wrs` 记录计时用 `miss_count`
+对应的有效值，`gather_read_wave_wrs_mode` 记录 `auto` 或 `fixed`。
+NPU 初始化执行资源时的 `GATHER_READ_CONFIG` 输出自动策略或固定值及窗口容量。
 
 ## 精确选择窗口
 
@@ -117,6 +124,7 @@ Scatter 软件超时按窗口重新计时；CANN 单次 launch 的总时限仍�
 
 Gather 的 READ 波次参数使用新入口 `KvafAicpuGatherReadExecutionV5`；Scatter 保持
 `KvafAicpuCpuPushScatterExecutionV4`。
+自动策略沿用 V5 布局，以内部 0 表示自动模式；部署本次默认值变更也须重编并更新 AICPU 包。
 必须一起更新 CPU 服务、Host 库、Python binding 和 AICPU 包并重启进程，避免旧布局混用。
 新增的 Gather 窗口协商消息和 Scatter setup 的窗口字段在初始化阶段传递，不增加逐窗 Host RPC
 或 kernel launch。窗口边界仍有 CPU 通知、ACK 和屏障成本，不保证所有预算下吞吐相同。
@@ -126,4 +134,4 @@ Gather 的 READ 波次参数使用新入口 `KvafAicpuGatherReadExecutionV5`；S
 窗口、百万条总请求、动态/零请求回放、全局输出映射、尾片段和中间窗口故障。
 模型以 memcpy 代替 DMA，不能替代 A5 的缓存可见性、并发时序和大批次图回放验证。
 Gather 模型还检查不同 WR 上限、非 32 倍数、缩小已分配缓冲区后的逻辑波次限制、
-末尾 CQ 检查点及百万请求回放。
+8192/8193 自动切换、显式覆盖、跨内存窗口策略、末尾 CQ 检查点及百万请求回放。

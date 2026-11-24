@@ -167,11 +167,7 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    auto resources = detail::ResolveExecutionResources(transport, executor, get, peer_candidates.local, selected);
-    if (get && transport == Transport::Urma && executor == Executor::Aicpu &&
-        algorithm == GetAlgorithm::Gather && !resources.gather_read_wave_wrs)
-      resources.gather_read_wave_wrs = kGatherDefaultReadWaveWrs;
-    return resources;
+    return detail::ResolveExecutionResources(transport, executor, get, peer_candidates.local, selected);
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {

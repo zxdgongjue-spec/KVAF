@@ -74,7 +74,9 @@ Gather 可设置 `gather_ddr_bytes`，Scatter 可设置 `scatter_hbm_bytes`；�
 对应工作区的元数据和控制区，自动选择预算内最大的 4096 倍数窗口。默认 0 保留现有
 65536 条布局的内存占用，所有窗口在一次 kernel launch 内处理。见 [AICPU 窗口配置](../docs/aicpu_get_windows.md)。
 Gather 还可设置 `gather_read_wave_wrs=64`，限制每 worker 每波的数据 READ WR 数；支持
-1..4096，默认 `None` 使用 4096。该参数独立于内存预算，改变后需重建执行资源和捕获图。
+1..4096。默认 `None` 在每次 kernel 执行时按设备总 `miss_count` 自动选择：不超过 8192 用
+512 WR，否则用 64 WR；同一张图可随计数变化自动切换。显式值始终覆盖自动策略。
+该参数独立于内存预算，改变自动/固定配置后需重建执行资源和捕获图。
 这些字段均配置在 NPU 侧 `ExecutionResources`，由 `NpuRuntime(get_resources=...)` 接收。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
 `bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
