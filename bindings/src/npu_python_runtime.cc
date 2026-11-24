@@ -1271,12 +1271,12 @@ class NpuPythonRuntime final {
         address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         valid_view.bytes != address_view.bytes / sizeof(Address) ||
-        output_view.first_dimension <= 0 ||
-        output_view.bytes % static_cast<std::size_t>(output_view.first_dimension) != 0) {
+        output_view.shape.front() <= 0 ||
+        output_view.bytes % static_cast<std::size_t>(output_view.shape.front()) != 0) {
       throw py::value_error("BatchGet Tensors do not satisfy the NPU layout contract");
     }
     const std::uint64_t output_rows =
-        static_cast<std::uint64_t>(output_view.first_dimension);
+        static_cast<std::uint64_t>(output_view.shape.front());
     const std::uint64_t output_block_bytes = output_view.bytes / output_rows;
     if (output_block_bytes != native_->batch_get_token_bytes()) {
       throw py::value_error(
