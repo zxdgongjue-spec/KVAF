@@ -14,6 +14,7 @@ void Lifecycle(){
   kvaf::NpuRuntimeOptions options;options.peer_ub_device="fake-1";
   kvaf::NpuRuntime a(options);Ok(a.LinkTo({server.address}));Ok(a.Initialize(1024,256));
   kvaf::OffloadRegionTicket ticket;Ok(a.GetOffloadRegion(&ticket));
+  Require(server.info.candidate == 1, "CPU Pull preserves the explicitly pinned single device");
   std::vector<std::uint8_t> hbm(4096);for(unsigned i=0;i<hbm.size();++i)hbm[i]=i*3+7;
   aclrtSetDevice(7);kvaf::CpuPullHbmSource b(7,"00000000000000000000000000000001");
   Ok(b.Register(ticket,{hbm.data(),hbm.size(),kvaf::DeviceKind::kNpu},reinterpret_cast<void*>(1)));
@@ -511,6 +512,7 @@ void DetailedTiming(){
 }
 void InitializationRecovery() {
   SharedServer server;kvaf::NpuRuntimeOptions options;
+  options.peer_ub_device = "fake-1,fake-0";
   kvaf::NpuRuntime a(options);Ok(a.LinkTo({server.address}));Ok(a.Initialize(1024,256));
   Require(server.pull_preparations==0,"DDR initialization does not prepare CPU Pull resources");
   server.drop_execution=static_cast<std::uint32_t>(kvaf::execution::Op::PrepareCpuPullRegion);
@@ -518,6 +520,7 @@ void InitializationRecovery() {
   Require(!a.GetOffloadRegion(&ticket).ok()&&a.ddr_initialized(),"lost preparation reply retains existing DDR");
   const auto token=server.info.token;
   Ok(a.GetOffloadRegion(&ticket));
+  Require(server.info.candidate == 0, "Direct Get's FE list does not select the CPU Pull destination");
   Require(ticket.token==token&&server.pull_preparations==1&&server.pool_allocations==1,
           "preparation retry returns the same grant without registration or allocation replay");
   server.drop_execution=static_cast<std::uint32_t>(kvaf::execution::Op::ReleaseRegion);
