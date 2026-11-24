@@ -124,8 +124,8 @@ URMA、UBmem 请求，后端资源按需初始化。URMA 依赖 UB 驱动、UMDK
 - `initialize()` 只初始化基础设备；DDR 路径先 `link_to(cpu_ip:port)`，再调用
   `initialize(ddr_bytes, slot_size)` 完成基础设备和 DDR 初始化；也可先调用无参数
   `initialize()`，再单独调用 `initialize_ddr(ddr_bytes, slot_size)`；
-- URMA 自动发现 NPU 本端 EID：优先使用 HCCL rootinfo 中与当前物理卡匹配的 CLOS PG EID，
-  不可用时回退到 `/proc/asdrv_ub/pair_info`；
+- 普通缓存 URMA 自动选路时，本机 NPU 优先使用 Pair Info 的 `remote_eid`，缺失时使用当前物理卡的首个有效 CLOS EID。
+  远端 NPU 只使用 CLOS。CPU 端优先遵循显式设备设置，本机自动选择时优先匹配 Pair Info 的 `local_eid`；
 - AIV URMA Get 将显式 `npu_eids` 列表作为多路径条带；Put 和 AICPU 使用首项；
 - 初始化不执行探测写入；算法及数据面资源在首次使用或 warmup 时准备；
 - `BatchPut`：将 NPU Tensor 中的 KV block 写入 CPU DDR，并提交元数据；
@@ -264,7 +264,8 @@ NPU raw Pull 默认使用本次构建目录下的 `.o`，可通过 `NpuPullOptio
 其他后端不使用这两个 `--gather-*` 参数。服务启动后打印 `LISTEN`。
 按实际路由可增加 `--ub-device NAME --eid-index N`。
 CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
-NPU 端可通过 `--peer-ub-device NAME` 固定 CPU 设备，不执行 adaptive 启动选优。
+远端 A+K 的 URMA AIV Direct BatchGet 默认使用两个 CPU FE。NPU 端可用
+`KVAF_DEFAULT_PEER_FE_COUNT=1` 改为单 FE，或用 `--peer-ub-device devA,devB,devC` 指定设备顺序。
 初始化与首次使用的边界见 [Runtime](runtime/README.md)；两端需使用匹配产物。
 
 在 NPU 主机加载 CANN 环境、构建并安装设备包后，从仓库根目录运行：
@@ -272,9 +273,9 @@ NPU 端可通过 `--peer-ub-device NAME` 固定 CPU 设备，不执行 adaptive 
 ```bash
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
-  --backend aiv --aiv-cores 2 --execution both \
+  --backend aiv --execution both \
   --request-length 32768 --table-capacity 4096 --miss-count 4096 \
-  --token-bytes 656 --tokens-per-block 128 --jettys-per-core 2 \
+  --token-bytes 656 --tokens-per-block 128 \
   --seed 20260903 --no-sort-input-indices \
   --source-access-pattern random --output-access-pattern contiguous \
   --warmup 10 --iterations 100 --kernel-profile
@@ -323,8 +324,8 @@ npu_pull_options=None)` 的两个 token 布局参数可同时省略，用于独�
 算法选择通过 `default_put/default_get` 和单次调用的 `execution` 完成。
 `put_resources/get_resources` 是 `(config, ExecutionResources(...))` 列表，提供该实现的
 核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认核数/worker 数为 URMA AIV
-Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；URMA AIV
-jettys=2、URMA AIV Get max_inflight_total=2048。未使用算法不会要求预算或 kernel 有效。
+Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。两种 Get 场景每卡均为 4 个 Jetty，`max_inflight_total=2048`。未使用算法不会要求预算或 kernel 有效。
 
 | 资源项 | AIV URMA / UBmem | AICPU Gather/Scatter / Put |
 | --- | --- | --- |

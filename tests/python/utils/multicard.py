@@ -62,5 +62,7 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
             "profiling_enabled": False,
             "execution_mode": args.execution_mode,
         }
+        if args.backend == "aiv":
+            result["jettys_per_core"] = args.jettys_per_core
     args.contention_result.write_text(json.dumps(result, indent=2) + "\n")
     print("MULTICARD_RESULT " + " ".join(f"{k}={v}" for k, v in result.items()), flush=True)

@@ -12,7 +12,7 @@ using NpuEid = std::array<std::uint8_t, 16>;
 
 // Resolve provider-specific budgets. AIV/UBMEM kernels come from this build's
 // bin directory; AICPU uses its installed CANN package instead.
-ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get,
+ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get, bool peer_local,
                                              const ExecutionResources* configured = nullptr);
 
 // Apply routing only after selecting a provider and resolving its own budget.

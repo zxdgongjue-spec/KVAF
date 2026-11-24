@@ -103,8 +103,13 @@ CPU 范围内由系统调度；也可用 `taskset -c CPU_LIST` 限定调度范�
 `/proc/<pid>/smaps` 的 `AnonHugePages` 验证实际
 合并量；Linux 使用大页并不保证 UDMA/IOMMU 一定保留相同的页表粒度。
 
-默认自动枚举所有可用 UMDK UB device/EID；`--ub-device NAME` 和
-`--eid-index N` 仅用于诊断。CPU 端可同时保持多个 NPU session，NPU 正常
+服务启动时记录 CPU 亲和性。普通 URMA 缓存操作使用匹配的 `--cpunodebind N --membind N` 时，通过 Linux CPU topology 确定节点所属的 CPU Chip，只枚举该 Chip 上所有 FE 的非零 EID。
+未绑定时枚举所有 UB 设备。候选按设备名和 EID index 排序。服务端 `--ub-device NAME` 选该设备首项，
+加 `--eid-index N` 可精确固定。设备超出绑定范围或候选为空时返回错误。
+例如 Node 0、1 同属于 Chip 0，绑定两者中任一节点得到相同的 Chip 0 候选表。部署设备 `udmac<C>d<D>e<E>` 的 `C` 对应 Linux `physical_package_id`。
+其他设备可通过 Linux `numa_node` 确认所属 Chip。只提供固件邻近域时，通过 ACPI SRAT 和 CPU firmware UID 转换为 Linux 节点。
+无法确定归属或属于其他 Chip 的设备记为 `NUMA_DEVICE_SKIPPED`。
+CPU 端可同时保持多个 NPU session，NPU 正常
 `shutdown` 后会释放对应 DDR、segment、token 与 Jetty。
 
 NPU 应用默认只配置 CPU 服务地址，不配置 EID 或 UDMA device：
@@ -128,19 +133,44 @@ Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写
 `link_to` 必须在 `initialize_ddr(ddr_bytes, slot_size)` 或带 DDR 参数的 `initialize` 前调用；
 无参数 `initialize()` 只初始化基础设备，可用于无 DDR 的 NPU Pull。
 显式调用 `initialize_ddr()` 前须先完成无参数 `initialize()`；带 DDR 参数的兼容入口会自动完成基础初始化。
-URMA 初始化从 HCCL root-info 读取当前物理卡的
-CLOS PG EID，并尝试追加 `/proc/asdrv_ub/pair_info` 的候选；未指定 EID 时采用首项。
+普通缓存 URMA 通过候选数量查询的 TCP 对端地址判断场景。直连服务使用回环地址或本机网卡地址时判为本机，
+其他地址判为远端。端口转发会改变可见对端。
+本机自动选择 NPU 的 `pair_info.remote_eid`，缺失或通道不唯一时使用该物理卡首个有效 CLOS；
+远端只使用 CLOS。显式 `npu_eids` 始终优先。本机且两侧均未固定 CPU 设备时，在已过滤的候选中匹配同一活动通道的
+`pair_info.local_eid`，未命中取首项。显式 CPU 设备优先，远端 Put 和 AICPU 默认使用候选首项。
+`PEER_LINK_EID_SELECTED` 日志记录两端 EID、场景、物理卡号、CPU 候选及选择原因。
+普通 URMA 缓存客户端要求 CPU Service 支持缓存候选计数和原始候选 EID，滚动升级时先更新服务端。CPU Pull 继续使用原有的单设备查询协议。
 初始化建立 CacheRegion 和元数据；具体 transport、MR、队列、Gather 工作区及 AICPU
 包在首次使用或显式 warmup 时准备，初始化成功不代表数据面已通过 RMA 验证。
 未建立 CPU 服务 Link 时，DDR 初始化返回 `InvalidState`。
 `batch_get_token_bytes` 和 `batch_get_tokens_per_block` 可同时省略，用于独立 Pull；
 普通缓存 Get 在 provider 首次准备时要求有效布局。显式布局必须同时为正数，
 其他构造参数仅支持关键字。算法通过默认执行配置或本次 `execution` 指定。默认核数/worker 数
-为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；
-URMA AIV Jetty 数默认 2、URMA AIV Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
+为 URMA AIV Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。Get 在途上限默认 2048。显式资源项可覆盖各自默认值。
 AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对路径，自定义
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
+
+CPU Pull 使用默认候选 0，也可用单个 `peer_ub_device` 固定设备。逗号分隔的设备列表仅供远端 Direct BatchGet 使用。NPU Pull 独立建立 HBM 连接并注册内存。
+
+### 远端 A+K 的多 FE BatchGet
+
+远端 URMA AIV Direct Get 默认从 CPU service 公布的候选中，按顺序选择两个不同 UB device 的
+`eid_index=0`。在 NPU 进程设置 `KVAF_DEFAULT_PEER_FE_COUNT=1` 即可默认走单 FE，也可设置
+其他正整数。自动模式按可用设备数和总 Jetty 数收缩。服务端固定设备或 index 时尊重其选择。
+
+通过 Python 的 `peer_ub_device="devC,devA,devB"` 或测试入口的
+`--peer-ub-device devC,devA,devB` 可显式指定有序 FE 列表，覆盖环境变量。各设备必须有
+index 0，总 Jetty 数必须覆盖整个列表。单设备参数仍取该设备的首个候选，兼容非零 index。
+显式列表首项供 Put 和 AICPU 使用。本机链路和显式多个 NPU EID 的配置分别使用一个 CPU FE，
+同时指定多个 CPU FE 会返回错误。
+
+每个 FE 注册同一块 DDR。各 Jetty 按 `(core * jettys_per_core + slot) % active_fes` 选路，
+一次 Get 只提交一个 kernel。小 batch 可能只用到部分 Jetty。初始化后首次使用或 warmup
+时查看 `DIRECT_GET_FE_SELECTION` 和 `DIRECT_GET_FE` 核对数量、设备和 EID，再按
+`DIRECT_AIV_ENTITY_TEMPLATE_READY` 的 `eid_path` 核对各 Jetty。部署时同步更新 NPU host 库
+和 Direct Get kernel。多 FE 复用当前 CPU service 的 execution session 协议。
 
 ### 固定 UB device 后测量
 
@@ -151,7 +181,7 @@ AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
   --backend aiv --peer-ub-device udmac0d1e2 \
-  --aiv-cores 2 --request-length 32768 --table-capacity 4096 \
+  --request-length 32768 --table-capacity 4096 \
   --miss-count 4096 --token-bytes 656 --tokens-per-block 128 \
   --warmup 10 --iterations 100
 ```
@@ -245,7 +275,7 @@ entry，`offsets[i]` 给出 entry 内
 ./build.sh npu
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
 bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
-  --backend aiv --aiv-cores 2 --execution both \
+  --backend aiv --execution both \
   --request-length 32768 --table-capacity 4096 --miss-count 4096 \
   --token-bytes 656 --tokens-per-block 128 \
   --warmup 10 --iterations 100 --kernel-profile
@@ -325,16 +355,15 @@ tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
 ```
 
 测试默认 `batch=16`、`token_bytes=656`、`tokens_per_block=128`，
-全表为 2,097,152 个 83,968B entry，每次 BatchGet 32,768 requests、32 个 AIV core、
-每 core 2 个 Jetty、3 次 warmup 与
+全表按 `batch × 1024 × 78` 个 83,968B entry 分配，每次 BatchGet 32,768 requests。URMA AIV Get 在本机默认每卡 2 核、每核 2 个 Jetty，在远端 A+K 默认每卡 4 核、每核 1 个 Jetty，
+Put 默认每卡 2 核、每核 2 个 Jetty。测试执行 3 次 warmup 与
 100 个样本。可用
 `KVAF_RUNTIME_PERF_BATCH`、
 `KVAF_RUNTIME_PERF_AIV_CORES`、`KVAF_RUNTIME_PERF_WARMUP`、
 `KVAF_RUNTIME_PERF_ITERATIONS`、`KVAF_RUNTIME_PERF_ACTIVE_PERCENT`、
 `KVAF_RUNTIME_PERF_TOKEN_BYTES` 和 `KVAF_RUNTIME_PERF_TOKENS_PER_BLOCK` 覆盖；
 Jetty 数量可通过
-`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。全量 data population 会写入 2,097,152 个
-逻辑 KV entry；脚本显式配置 AIV Direct-HCCP BatchPut kernel，BatchPut 性能样本
+`KVAF_RUNTIME_PERF_JETTYS_PER_CORE` 覆盖。脚本通过 AIV Direct-HCCP BatchPut 填充全表，BatchPut 性能样本
 测量 Runtime metadata upload、AIV WRITE 及其 caller-stream 完成，不包含全量数据
 填充。
 脚本以 CPU `torch.int64` Tensor 传入全量 Prepare key，避免 Python `list[int]` 转换污染
