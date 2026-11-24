@@ -103,7 +103,7 @@ class Transport {
   std::uint32_t jetty_count_{kJettyCount};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
   bool prepared_batch_done_only_{};
-  bool gather_interleave_{}, prepared_interleaved_{};
+  bool gather_interleave_{};
   std::uint32_t prepared_head_rows_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};

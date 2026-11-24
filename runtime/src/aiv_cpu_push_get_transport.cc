@@ -370,7 +370,6 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   for (auto& shards : prepared_shards_) shards.clear();
   gather_waves_.clear();
   gather_suffix_wave_ = 0U;
-  prepared_interleaved_ = false;
   const bool clip_to_stage = head_rows || gather_pipeline;
   const auto build_stage = [&](Range stage, bool suffix, const GatherWave* wave = nullptr) {
     std::array<std::vector<PreparedQueue>, kMaxJettyCount> shards;
@@ -475,8 +474,8 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     const auto interleaved = gather_interleave_
         ? InterleavedGatherWaves(count, token_bytes_, workers_, head_rows, jetty_count_)
         : std::vector<GatherWave>{};
-    prepared_interleaved_ = !interleaved.empty();
-    const auto contiguous_end = prepared_interleaved_ ? head_rows : count;
+    const bool interleave = !interleaved.empty();
+    const auto contiguous_end = interleave ? head_rows : count;
     const auto build_contiguous = [&](Range rows) {
       gather_waves_.push_back(GatherWave{rows});
       build_stage(rows, head_rows && rows.begin >= head_rows);
@@ -489,7 +488,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
       build_contiguous({begin, end});
       begin = end;
     }
-    if (prepared_interleaved_) gather_suffix_wave_ = gather_waves_.size();
+    if (interleave) gather_suffix_wave_ = gather_waves_.size();
     for (const auto& wave : interleaved) {
       gather_waves_.push_back(wave);
       build_stage({}, head_rows != 0U, &wave);
@@ -558,7 +557,8 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id, Profile* 
 Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources,
                                std::uint64_t* first_post_ns) {
   std::size_t largest = 0;
-  for (const auto& q : plan.queues) largest = std::max(largest, q.posts.size());
+  for (std::uint32_t q = 0; q < jetty_count_; ++q)
+    largest = std::max(largest, plan.queues[q].posts.size());
   // Start every Jetty before posting the next slice of any queue.
   for (std::size_t batch = 0; batch < largest; ++batch) {
     for (std::uint32_t q = 0; q < jetty_count_; ++q) {
@@ -663,7 +663,8 @@ Status Transport::WriteSglBatch(const std::atomic<bool>* stop) {
     if (profile) {
       profile->cpu_threads = 1;
       ++profile->waves;
-      for (const auto& q : plan.queues) {
+      for (std::uint32_t index = 0; index < jetty_count_; ++index) {
+        const auto& q = plan.queues[index];
         profile->ready_wrs += q.markers.size();
         profile->data_wrs += q.wrs.size() - q.markers.size();
         profile->post_calls += q.posts.size();
@@ -696,25 +697,23 @@ Status Transport::WriteBatch(const std::atomic<bool>* stop) {
     return status.ok() ? failure : status;
   };
   const auto count = request().count;
-  if (gather_) {
-    if (!tracker_.Empty()) return Error("grow gather staging while WRITE is in flight");
-    const auto status = EnsureGatherStaging(count);
-    if (!status.ok()) return fail_gather(status);
-  }
-  auto status = PrepareWrites(count);
+  if (!tracker_.Empty()) return Error("grow gather staging while WRITE is in flight");
+  auto status = EnsureGatherStaging(count);
+  if (!status.ok()) return fail_gather(status);
+  status = PrepareWrites(count);
   if (!status.ok()) return status;
   // Gather plans already point into the registered staging buffer. Only
   // Ready markers need a refresh when the AIV consumes per-shard progress.
-  const bool refresh_for_post = !gather_ || !(request().reserved & kBatchDoneOnly);
+  const bool refresh_for_post = !(request().reserved & kBatchDoneOnly);
   const auto submit_plan = [&](std::size_t w, bool* submitted = nullptr) {
     auto& plan = *prepared_[w];
     auto status = submitted ? TryBeginPrepared(plan, w + 1, submitted)
                             : BeginPrepared(plan, w + 1, profile, true);
     if (!status.ok() || (submitted && !*submitted)) return status;
     if (profile) {
-      if (!gather_) profile->cpu_threads = 1;
       ++profile->waves;
-      for (const auto& q : plan.queues) {
+      for (std::uint32_t index = 0; index < jetty_count_; ++index) {
+        const auto& q = plan.queues[index];
         profile->ready_wrs += q.markers.size();
         profile->data_wrs += q.wrs.size() - q.markers.size();
         profile->post_calls += q.posts.size();
@@ -892,7 +891,6 @@ Status Transport::Shutdown() {
   profiled_done_ = {};
   prepared_count_ = UINT32_MAX;
   prepared_batch_done_only_ = false;
-  prepared_interleaved_ = false;
   prepared_head_rows_ = 0;
   post_batch_wrs_ = 128;
   next_poll_queue_ = 0;
