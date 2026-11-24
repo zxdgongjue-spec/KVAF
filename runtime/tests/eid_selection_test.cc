@@ -29,7 +29,8 @@ NpuEid Eid(unsigned id) {
 }
 
 void NpuSelection() {
-  const std::string channel = "Dev id info. (dev_id=2;slot_id=1)\nchan_id=0;flag=1;hop=1\n";
+  const std::string device = "Dev id info. (dev_id=2;slot_id=1)\n";
+  const std::string channel = device + "chan_id=0;flag=1;hop=1\n";
   const std::string cpu = "local_eid: 0000:0000:0000:0000:0000:0000:0000:0001\n";
   const std::string npu = "remote_eid: " + detail::EidToHex(Eid(2)) + "\n";
   const auto parse = [&](const std::string& content) {
@@ -38,6 +39,19 @@ void NpuSelection() {
   };
   auto pair = parse(channel + cpu + npu + "Dev id info. (dev_id=3;slot_id=1)\n" + cpu);
   Check(pair.cpu == Eid(1) && pair.npu == Eid(2), "both sides of the selected card/channel");
+  for (const char* fields : {"chan_id=0, flag=1", "chan_id=0\tflag=1 hop=1",
+                             "flag = 1; chan_id = 0"}) {
+    const auto parsed = parse(device + fields + "\n" + cpu + npu);
+    Check(parsed.cpu == Eid(1) && parsed.npu == Eid(2), fields);
+  }
+  for (const char* fields : {"chan_id=0, flag=10", "chan_id=0, flag=1x",
+                             "chan_id=0, other_flag=1", "chan_id=0, flag=0"}) {
+    const auto parsed = parse(device + fields + "\n" + cpu + npu);
+    Check(!parsed.cpu && !parsed.npu, fields);
+  }
+  const auto mixed = parse("Dev id info. (dev_id=20, slot_id=1)\nchan_id=0, flag=1\n" + cpu +
+                           "Dev id info. (slot_id=1, dev_id = 2)\nchan_id=0; flag=1\n" + cpu + npu);
+  Check(mixed.cpu == Eid(1) && mixed.npu == Eid(2), "exact device ID with comma-separated fields");
   Check(!parse(channel + cpu + npu + channel + cpu).cpu, "ambiguous active channels");
   auto partial = parse(channel + cpu + "remote_eid: invalid\n");
   Check(partial.cpu == Eid(1) && !partial.npu, "independent CPU and NPU fallback");

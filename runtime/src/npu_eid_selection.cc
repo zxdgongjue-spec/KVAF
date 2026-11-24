@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <limits>
+#include <string_view>
 #include <sys/file.h>
 #include <unistd.h>
 
@@ -101,6 +102,20 @@ std::string Trim(std::string text) {
   return text.substr(first, last - first + 1U);
 }
 
+std::optional<std::string_view> PairInfoField(std::string_view line, std::string_view key) {
+  constexpr std::string_view whitespace = " \t\r\n\f\v";
+  constexpr std::string_view boundaries = "(),; \t\r\n\f\v";
+  for (auto pos = line.find(key); pos != line.npos; pos = line.find(key, pos + key.size())) {
+    if (pos != 0 && boundaries.find(line[pos - 1]) == boundaries.npos) continue;
+    const auto equal = line.find_first_not_of(whitespace, pos + key.size());
+    if (equal == line.npos || line[equal] != '=') continue;
+    const auto first = line.find_first_not_of(whitespace, equal + 1);
+    if (first == line.npos) return std::string_view{};
+    return line.substr(first, line.find_first_of(boundaries, first) - first);
+  }
+  return std::nullopt;
+}
+
 bool ReadHcclClosEids(const std::string& path, std::uint32_t physical_device_id,
                       std::vector<NpuEid>* eids,
                       std::string* error) {
@@ -160,17 +175,17 @@ bool ReadHcclClosEids(const std::string& path, std::uint32_t physical_device_id,
 }  // namespace
 
 PairEids ParsePairInfo(std::istream& input, std::uint32_t physical_device) {
-  const std::string marker = "dev_id=" + std::to_string(physical_device) + ";";
+  const std::string device_id = std::to_string(physical_device);
   PairEids pair;
   bool selected = false, active = false;
   unsigned active_channels = 0, local_fields = 0, remote_fields = 0;
   std::string line;
   while (std::getline(input, line)) {
     if (line.find("Dev id info.") != std::string::npos) {
-      selected = line.find(marker) != std::string::npos;
+      selected = PairInfoField(line, "dev_id") == device_id;
       active = false;
-    } else if (selected && line.find("chan_id=") != std::string::npos) {
-      active = (";" + Trim(line) + ";").find(";flag=1;") != std::string::npos;
+    } else if (selected && PairInfoField(line, "chan_id")) {
+      active = PairInfoField(line, "flag") == "1";
       if (active) ++active_channels;
     } else if (active) {
       const auto colon = line.find(':');
