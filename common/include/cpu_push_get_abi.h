@@ -53,7 +53,9 @@ KVAF_CPU_PUSH_INLINE constexpr std::uint32_t ReadyStride(std::uint32_t jettys) {
   return (jettys + 7U) / 8U * sizeof(Ready);
 }
 struct alignas(64) Coordination {
-  Word claimed, built, arrivals, finished, result;
+  // Cumulative counts/epochs, initialized once per transport. result retains
+  // the first error; failed transports must be rebuilt, never reset in place.
+  Word claimed, built, arrivals, finished, result, published;
 };
 struct alignas(64) WorkerStatus {
   std::uint64_t magic{kMagic}, sequence{}, result{}, worker{}, consumed{}, reserved[3]{};

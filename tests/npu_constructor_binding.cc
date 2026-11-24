@@ -19,6 +19,6 @@ struct ConstructorProbe {
 
 PYBIND11_MODULE(_kvaf_constructor_test, module) {
   auto runtime = py::class_<ConstructorProbe>(module, "NpuRuntime");
-  kvaf::python_binding::BindNpuRuntimeConstructor(runtime);
+  kvaf::python_binding::BindLegacyNpuRuntimeConstructor(runtime);
   runtime.def_readonly("values", &ConstructorProbe::values);
 }

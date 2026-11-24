@@ -233,7 +233,7 @@ extern "C" int32_t KvafBatchGetLocalBufferAcquire(KvafBatchGetTransport*, void*,
   ++refs; *b = new KvafBatchGetLocalBuffer; *e = 1; return 0;
 }
 extern "C" void KvafBatchGetLocalBufferRelease(KvafBatchGetLocalBuffer* b) { --refs; delete b; }
-extern "C" int32_t KvafBatchGetTransportQuiesce(KvafBatchGetTransport*) {
+extern "C" int32_t KvafGatherBatchGetTransportQuiesce(KvafBatchGetTransport*) {
   assert(work.empty()); if (fail_quiesce) return 1; ++quiesced; return 0;
 }
 extern "C" void KvafBatchGetTransportDestroy(KvafBatchGetTransport* t) { delete t; }
@@ -243,7 +243,23 @@ PeerLink::PeerLink(std::string a) : address_(std::move(a)) {}
 Status PeerLink::LookupRegion(uint64_t base, PeerRegion* r) const {
   *r = {}; r->base = base; r->length = 16 * 1024 * 1024; r->token_value = 3; return Status::OK();
 }
-Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t) const {
+Status PeerLink::PrepareGatherWorkspace(uint64_t, uint64_t bytes, PeerRegion* workspace) {
+  *workspace = {};
+  workspace->base = 0x2000000;
+  workspace->length = bytes;
+  return Status::OK();
+}
+Status PeerLink::CreateChannel(uint64_t, const uint8_t*, uint32_t, const uint8_t*,
+                               uint32_t, uint64_t, uint32_t, std::array<uint8_t, kQpKeyBytes>*,
+                               uint32_t*, uint64_t*, uint32_t*) {
+  return Status::NotImplemented("host test uses the transport stub");
+}
+Status PeerLink::CreateChannel(uint64_t, const uint8_t*, uint32_t, const uint8_t*,
+                               uint32_t, uint64_t, uint32_t, std::array<uint8_t, kQpKeyBytes>*,
+                               uint32_t*, uint64_t*, uint32_t*, bool) {
+  return Status::NotImplemented("host test uses the transport stub");
+}
+Status PeerLink::EnableGatherLanes(uint64_t, uint64_t, uint32_t, bool) const {
   return fail_enable ? Status::Internal("lost enable response") : Status::OK();
 }
 Status PeerLink::StopGatherLanes(uint64_t) const { assert(work.empty()); ++stopped; return Status::OK(); }

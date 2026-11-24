@@ -1,5 +1,9 @@
 # KVAF 架构设计
 
+本文保留原始 POC 目标与接口设计，不代表当前分支全部已实现。当前执行框架的资源所有权、
+驻留实例、算法混用及四种 Get 图模式，以 [执行框架设计](cache_transport_execution_design.md)、
+[实现与使用](cache_transport_execution_implementation.md) 和 [验证步骤](cache_transport_execution_validation.md) 为准。
+
 ## 1. 背景
 
 在 Agent 场景下，随着大模型推理序列长度不断增长，KV 数据规模持续扩大，带来了日益突出的存储压力。由于 HBM 容量有限，无法容纳全部 KV 数据，因此需要将部分 KV 数据从当前设备卸载到远端设备的 DDR 中保存，并在后续计算需要时恢复到本地 HBM。

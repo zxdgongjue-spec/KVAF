@@ -26,11 +26,11 @@
 #include "sequential_batch_get_abi.h"
 // The CPU model exercises the kernel body, without Ascend ELF section placement.
 #define __attribute__(...)
-#include "../access_operator/demo/aiv_batch_get/kernel/execute_scatter_batch_get_aiv.asc"
+#include "../access_operator/algorithms/get/direct/urma_aiv/kernel/execute_scatter_batch_get_aiv.asc"
 // The production Ascend metadata section is not a valid native Mach-O section.
 // Keep the metadata object/value in this model, as in the direct kernel model.
 #define __attribute__(...)
-#include "../access_operator/demo/aiv_batch_get/kernel/execute_gather_batch_get_aiv.asc"
+#include "../access_operator/algorithms/get/direct/urma_aiv/kernel/execute_gather_batch_get_aiv.asc"
 #undef __attribute__
 #include "scatter_mailbox_templates.h"
 

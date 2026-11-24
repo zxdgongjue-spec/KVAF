@@ -14,6 +14,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <cstdio>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "cpu_gather_executor.h"
 #include "cpu_push_gather_schedule.h"
 

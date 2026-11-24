@@ -1,16 +1,20 @@
 # AICPU GatherRead：构建、调用与验证
 
+本页保留 Gather 算法数据流和兼容接口示例。按调用选择算法、驻留实例、输出绑定与
+Graph 租约的完整用法见 [实现与使用](cache_transport_execution_implementation.md)；
+四算法统一验收和性能口径见 [验证步骤](cache_transport_execution_validation.md)。
+
 已有的 `NpuRuntime.batch_get` 可以选择 UMDK 后端。一次 launch 启动 N 个 AICPU 实例，
 各自从本轮 NPU Tensor 的输入区间生成源清单，请求 CPU gather 到自己的 DDR staging 区间，
 查询自己的就绪前缀、提交 READ，并等待自己的完成通知和 CPU ACK。
 indices、offsets、miss_count、output_indices 和数据可以每轮变化，不缓存上一轮内容。
-本页描述 `transport="urma"`、`aicpu_batch_get_mode="gather_read"` 的用法；
-mode 默认空，表示使用 AIV。`transport="ubmem"` 不能与非空 mode 组合。
+本页使用 `GetExecutionConfig("urma", "aicpu", "gather")` 选择 Gather，Runtime 的
+`transport_mode` 须允许 URMA。Put 使用独立的执行配置，未显式选择时按构建能力确定默认值。
 Host direct HCCP 建链的 `cpu_push_scatter` 路径见 [CPU 回推说明](aicpu_cpu_push_scatter.md)。
 与顶层 BatchGet 一致，`int32[1] miss_count` 指定输入数组的有效前缀长度；
 只处理前 `miss_count` 项，取值范围为 0 到输入数组容量。
 AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使用调用方的 `output_indices` 组 SGL。
-源地址直接取 `addresses[indices[i]] + offsets[i]`，调用方保证有效条目的索引、
+源地址由 `addresses[indices[i]] + offsets[i]` 得到规范地址，再转换到当前 session 的注册地址；调用方保证有效条目的索引、
 块内偏移、地址有效性及输出行号正确，输入元数据在本轮完成前保持不变。
 
 ## 构建和启动
@@ -46,12 +50,14 @@ CPU 服务使用新二进制重启：
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28990 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --gather-threads 8 --gather-mode active
 ```
 
 同一服务也可供 AIV、UBmem 和 Scatter 使用。`--gather-threads` 是每个 Gather
-session 的 CPU 线程总预算，须不小于客户端 AICPU worker 数；`active` 使用主动等待，
-`--gather-affinity off` 不主动绑核。这些参数不改变其他后端的执行。
+session 的 CPU 线程总预算，默认 10，须不小于客户端 AICPU worker 数；等待模式默认
+`active`，使用主动等待。上例显式将线程预算覆盖为 8。
+这两个参数不改变其他后端的执行。Gather 线程继承外部 CPU 亲和性；需要限定 NUMA 节点时，
+使用 `numactl --cpunodebind=N --membind=N` 启动服务，或使用 `taskset -c CPU_LIST` 指定 CPU。
 示例使用设备 7 和本机服务 `127.0.0.1:28990`，跨主机部署时替换为实际设备号和 CPU 地址。
 
 NPU 进程先加载 CANN 环境，再使用现有 Tensor 接口：
@@ -62,14 +68,15 @@ import torch_npu
 import kvaf
 
 torch.npu.set_device(7)
+put = kvaf.PutExecutionConfig("urma", "aicpu")
+get = kvaf.GetExecutionConfig("urma", "aicpu", "gather")
 runtime = kvaf.NpuRuntime(
-    batch_get_kernel_object_path="",
     batch_get_token_bytes=656,
     batch_get_tokens_per_block=1,
     device_id=7,
-    npu_core_count=1,
-    transport="urma",
-    aicpu_batch_get_mode="gather_read",
+    transport_mode="urma", default_put=put, default_get=get,
+    put_resources=[(put, kvaf.ExecutionResources(cores=1))],
+    get_resources=[(get, kvaf.ExecutionResources(cores=1))],
 )
 runtime.link_to("127.0.0.1:28990")
 runtime.initialize(ddr_bytes=656 * 8192, slot_size=656)
@@ -92,21 +99,18 @@ runtime.shutdown()
 ```
 
 UMDK device/index 由 Host EID 匹配，不再作为 `NpuRuntime` 参数提供。
-`batch_get_kernel_object_path` 仍是必传参数，但 AICPU 填 `""` 即可；
-`batch_put_kernel_object_path` 可省略。两者均不用于加载 AICPU 内核。
-原来的 `addresses/valid` Tensor 重载也可直接使用。
-`NpuRuntime` 通过 `transport` 和 `aicpu_batch_get_mode` 选择后端：
-`transport="urma"` 且 mode 为空时使用 AIV；mode 为 `gather_read` 或
-`cpu_push_scatter` 时，Get 和 Put 都使用 AICPU。`transport="ubmem"` 要求 mode 为空。
+AICPU 的 `ExecutionResources` 不提供 kernel 路径；`cores` 配置各 Put/Get 的 worker 数。
+原来的 `addresses/valid` Tensor 重载也可直接使用。`default_get` 决定省略 `execution`
+时使用的 Get 配置，单次调用可显式选择另一个已构建且符合 transport 模式的配置。
 AICPU kernel JSON 由 Runtime 从选定 CANN 根目录的
 `opp/vendors/cust/op_impl/aicpu/config/kvaf_aicpu_urma.json` 加载，无需传路径。
 环境变量 `ASCEND_HOME_PATH` 和 `ASCEND_CANN_PACKAGE_PATH` 若同时设置，必须指向同一真实目录。
 只有一个非空时使用它；都未设置时，依次检查 `/usr/local/Ascend/ascend-toolkit/latest`
 和 `/usr/local/Ascend/cann/aarch64-linux/asc`。显式无效目录直接报错；根目录一旦确定，
 缺包也不会转到另一套 CANN 安装中搜索。
-Runtime 还检查设备 tar 包及 `conf/ascend_package_load.ini` 注册配置，并在远端 DDR 分配前
-加载内核、检查所需入口。缺包、缺入口或未构建后端时直接报错，不回退到 AIV。
-AICPU-only 构建也必须显式填写 mode；公开 JSON 路径参数已删除。
+Runtime 在首次准备 AICPU 时检查设备 tar 包及 `conf/ascend_package_load.ini` 注册配置，
+并加载内核、检查所需入口；未使用 AICPU 时不触发包准备。缺包、缺入口或未构建后端时直接报错，不回退到 AIV。
+AICPU-only 构建也使用执行配置选择算法；公开 JSON 路径参数已删除。
 
 如果调用方已经持有 NPU 地址表，直接调用现有 Tensor 重载，不必再创建 Host AccessTable 或重新上传地址表：
 
@@ -121,16 +125,14 @@ Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制
 ## 与 AIV 共用 Host EID 发现
 
 GatherRead 和 CPU Push Scatter 都由 `NpuRuntime` 的现有
-EID 发现流程选路：逻辑设备号映射到物理设备号，读取 CLOS 与 pair_info 候选，
-再沿用原有候选验证流程选择可用连接。AICPU 不再自行选择第一个可见 UMDK EID。
+EID 发现流程选路。本机自动使用该物理卡的 Pair Info remote_eid，缺失时回退到首个有效 CLOS；
+远端自动使用首个有效 CLOS。显式 NPU EID 优先。
 
 Host 将选定 EID 传入 UMDK Prepare，设备端只匹配该 EID 对应的 UB device/index 并创建 context；
-没有匹配项时报告失败，交回 Runtime 尝试下一个候选，不改用其他 EID。
+没有匹配项或准备失败时直接报错，不改用其他 EID。
 UMDK device/index 完全由选定 EID 自动匹配，不再提供单独的设备/索引过滤参数。
-测试脚本复用原有 `parse_npu_eids()`，通过 `--npu-eids` 或 `KVAF_NPU_EIDS` 指定 EID；
-不指定时自动发现。Python 的 `npu_eids` 在 GatherRead 下按顺序作为候选尝试，
-CPU Push Scatter 同样将列表作为按顺序尝试的候选；每次只使用一个 EID。AIV 原有的多 EID 条带语义不变。
-候选失败后完成资源清理再尝试下一项，清理失败则停止并保留资源供重试。
+统一性能入口通过 `--npu-eids` 或 `KVAF_NPU_EIDS` 指定严格 EID 列表；不指定时自动发现。
+GatherRead 和 CPU Push Scatter 均只使用列表首项；AIV Get 的显式多 EID 条带语义不变。
 `KVAF_NPU_EIDS` 由测试脚本解析后传给 Runtime，Runtime 本身不读取该环境变量。
 
 同一个 Runtime 的 GatherRead/BatchPut 共用选定 EID；CPU Push Scatter 的 HCCP 回推通道
@@ -150,44 +152,13 @@ AICPU 初始化输出 `UMDK_EID_SELECTED source=host device=... eid_index=... ei
 ## 公开输入模式
 
 公开 Runtime 只提供查表输入，`gather_read_direct` 不再是合法 mode，
-测试及 sweep 不再提供 `--source-mode direct`。裸 `addresses/valid` Tensor 重载
+统一性能入口不提供 `--source-mode direct`。裸 `addresses/valid` Tensor 重载
 仍表示地址表，源地址为 `addresses[indices[i]] + offsets[i]`，不能传入逐请求最终地址替代。
 
-## 用 Python 检查正确性和比较 worker 数
+## Python 分段采样
 
-CPU 服务启动后，在仓库根目录运行：
-
-```bash
-export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --modes gather_read --workers 1 2 4 5 \
-  --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
-  --output-row-step 2 --warmup 3 --iterations 20
-```
-
-为与 Scatter 对照配置保持一致，本例使用 1、2、4、5 个 worker。
-实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，暂不推荐 Scatter 使用该配置。
-
-Runtime 统一定位已安装的 AICPU 包；脚本不再接受 `--kernel-json`。
-每轮重新生成源数据、输入索引、偏移和输出行号；先完成 BatchPut，再执行 BatchGet，
-逐字节检查整个输出，包括未写入的行和间隔；还在 NPU 上执行转换和加法，检查后续算子读取结果。
-预检覆盖两种 Python 重载、完整/部分/空前缀，以及异步 BatchGet 后同 stream 的 NPU 消费者。
-源和输出 Tensor 的注册地址持续有效到 Runtime 关闭；每轮释放 AccessTable 和 key 后重新写入，
-不依赖上一轮数据或远端地址保持不变。设置 `--active-percent 75` 可测试前 75% 的请求。
-
-上例应输出 4 条 `AICPU_BATCH_GET_PASS mode=gather_read`。
-改用 `--output-row-step 1` 检查相邻输出行；增加测量轮次可做性能复测。
-多候选验证可追加 `--npu-eids "实际EID1,实际EID2"`。若要检查失败回退，第一项应是
-格式合法但对当前连接不可用的候选，后面放已确认可用的候选，并检查最终选中 EID 的日志。
-
-每个 worker 配置的通过日志包含 mean、p50、p95、p99（µs，小数点后 1 位）和有效载荷 GB/s。
-计时覆盖 Python `batch_get(..., synchronize=True)` 调用至完成，包含 Host/AICPU/CPU 和同步开销；
-输入准备、BatchPut、AccessTable 创建与上传、输出下载和正确性检查均在计时之外。
-正常带宽统计不启用 profile。需要定位阶段耗时时，在同一命令末尾加 `--profile-rounds 100`：
-脚本会在正常测量后另跑 100 轮采样，打印平均阶段耗时，不逐轮刷日志。
-
-Python 也可直接获取单次采样：
+使用下一节的统一性能入口比较 worker 数和 eager/graph。
+若需在应用中分析单次同步 AICPU 调用，可使用原生 profile 返回值：
 
 ```python
 profile = runtime.batch_get(device_table, indices, offsets, miss_count, output_indices, output,
@@ -215,93 +186,31 @@ print(profile["workers"])
 provider 提交包含编码、写 SQ 和 doorbell，不能单独当作写 SQ 耗时。
 Host wait 包含排队的设备执行和 D2H；Host 与设备的绝对时间戳不相减。
 
-## 全量性能扫描
+## 使用统一性能入口
 
-按前文完成构建和安装并保持 CPU 服务运行，在 NPU 终端加载 CANN 环境后执行：
-
-```bash
-./tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
-  --device-id 7 --peer 127.0.0.1:28990
-```
-
-Shell 脚本循环调用
-[benchmark_gather_read.py](../access_operator/demo/aicpu_batch_get/python/benchmark_gather_read.py)，
-通过 `NpuRuntime.batch_get` 测量。
-默认扫描 252 组：
-
-| 参数 | 扫描值 |
-| --- | --- |
-| token_bytes | 128、256、512、656、1024、2048、4096 B |
-| miss_count | 32、64、128、256、512、1024、2048、4096、8192 |
-| workers | 1、2、4、5 |
-
-每组预热 10 轮、测量 100 轮，均开启 profile。汇总输出算子时间和各阶段耗时，
-不把该采样带宽等同于正确性脚本中关闭 profile 的 Python 端到端带宽。
-只记录一个带宽 `p50_GBps`，计算为 `token_bytes × miss_count / 算子P50耗时(µs) / 1000`。
-算子耗时仍取最早 worker 进入至最后 worker 退出的墙钟时间；各阶段每轮取 worker 最大耗时，再对测量轮次求均值。
-
-通信 DDR 总预算固定为 100 GiB，包含源数据池和 GatherRead 的 staging、描述符、控制区。
-按当前 token 大小和每块 token 数计算源块数量，先扣除按 1..8 worker 最大需求预留的工作区，
-再按完整块向下取整。同一 token 大小下，不同 worker 使用相同的源地址池。
-每块默认 128 个 token，数据和地址表初始化一次。
-每轮有放回随机选择源块和块内 token，输出随机选择互不重复的 HBM 行，没有固定隔行保护区。
-输入数组和输出行数为 `max(32768, miss_count)`，每轮校验整个输出和未写入行。
-准备数据、BatchPut、生成请求和结果校验在计时之外。
-
-缩小扫描范围和源池时，设置三个列表并传入 `--table-capacity`：
+CPU 服务启动并加载 CANN 环境后，运行四种 Get 共用的入口：
 
 ```bash
-KVAF_AICPU_TOKEN_BYTES="656" \
-KVAF_AICPU_MISS_COUNTS="32 4096" \
-KVAF_AICPU_WORKERS="1 2 4" \
-./tests/run_aicpu_gather_read_sweep.sh "$PWD/build-npu" \
-  --device-id 7 --peer 127.0.0.1:28990 \
-  --table-capacity 4096 --warmup 3 --iterations 20
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend gather_read --aicpu-workers 5 --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --seed 20260903 --no-sort-input-indices \
+  --source-access-pattern random --output-access-pattern contiguous \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
-`--table-capacity` 仅用于选择更小的源池，不能超出上述预算；`--tokens-per-block` 控制每块 token 数。
-`miss_count` 只决定本轮从源池读取多少个 token，不决定源池分配大小。
-每组日志打印源池 GiB、工作区预算 MiB 和总预算，避免字节数用科学计数法显示。
-CPU 线程预算和绑定策略在同一次扫描中保持一致；SGL 6、每批 32 条 WR、128 KiB 流水前缀保持当前实现配置。
+`BATCH_GET_RESULT scope=end_to_end` 报告 Host 调用到完成的延迟和带宽；
+`scope=kernel` 报告最早 worker 进入到最晚 worker 退出的设备时间和带宽。
+设备时间包含算子中的 CPU/网络等待及 profile 打点。
+`BATCH_GET_PROFILE` 保留各 worker 阶段的统计，阶段可嵌套和重叠，不能相加为设备总时间。
+数据初始化、请求生成、预热、输出校验和 profile 快照在正式性能采样之外。
+去掉 `--kernel-profile` 仍报告端到端和算子时间、带宽，不输出 worker 分段明细。
 
-结果只有每组 `.log` 和一个 `summary.csv`，默认保存在 `reports/aicpu-gather-read/<时间戳>`；
-可用 `KVAF_AICPU_SWEEP_LOG_DIR` 指定一个新目录。任一组失败后停止，已完成结果保留。
-终端按现有 profile 的执行顺序显示每组配置的一份汇总，省略 worker 明细、缓存细项、计数和 Host/Python 杂项：
-
-- 准备 CPU 读取请求（地址查表、填写清单并交给 DMA）、发送地址清单、通知 CPU。
-- 流水 READ 总时间，以及其中的 WR/SGL 构建、等待 CPU 就绪前缀、提交 READ、等待 READ CQE。
-
-上述阶段直接使用现有打点，每轮取各 worker 的最大耗时，再对测量轮次求均值。
-请求准备包含地址查表、填写地址/长度清单及发送前的清单缓存维护；READ 下的子项包含在 READ 总时间内。
-阶段最大值可能来自不同 worker，且存在嵌套和重叠，不能相加为算子时间。
-
-CSV 每组配置一行，使用英文表头，时间单位为微秒，阶段列为均值，算子耗时列为 P50：
-
-| 表头 | 含义 |
-| --- | --- |
-| source_mode | `table` 为查表输入，`direct` 为本轮完整源地址输入 |
-| token_bytes / miss_count / workers | 测试配置 |
-| device_p50_us / p50_GBps | 算子耗时中位数及对应的有效载荷带宽 |
-| lookup_table_us | 按索引和偏移计算 CPU 源地址，填写清单，并在交给 URMA DMA 前清理清单缓存 |
-| prepare_request_us | 裸地址模式下替代 `lookup_table_us`：顺序读取源地址、填写清单并清理清单缓存 |
-| address_send_us | AICPU 将地址/长度清单 WRITE 到 CPU DDR 并等完成 |
-| notify_cpu_us | WRITE 清单指针和请求编号，通知 CPU 开始 gather |
-| read_total_us | 从 staging READ 到输出 HBM 的整个流水阶段 |
-| build_wqe_us | 构建 URMA READ 请求及目标分散地址 |
-| cpu_gather_wait_us | 等待 CPU 完成当前需要的 staging 前缀 |
-| post_us | provider 编码、SQ 写入及 doorbell |
-| cq_wait_us | 等待已提交 READ 完成 |
-
-`build_wqe_us`、`cpu_gather_wait_us`、`post_us` 和 `cq_wait_us` 已经包含在 `read_total_us` 中。阶段为每轮 worker 最大耗时的均值，不与总时间的 P50 相加。
-耗时保留 1 位小数，带宽为十进制 GB/s。上述 8 个阶段字段表示均值（微秒），`device_p50_us` 表示算子耗时中位数（微秒）。`lookup_table_us` 沿用请求准备阶段打点，包含查表、填清单和清单缓存维护；`cpu_gather_wait_us` 是 AICPU 等待就绪前缀的时间，不是 CPU gather 的独立执行耗时。
-
-当前 BatchGet 输入是地址表、索引和块内偏移，AICPU 计算 `addresses[indices[i]] + offsets[i]` 后，
-把该地址及 token 长度写入 CPU 可读的清单。CPU 依次按清单 gather 到 staging。
-这一步只准备请求元数据，不搬运实际 payload。地址表、索引、偏移、输出行号和 miss_count
-遵循 CANN 输入 Tensor 的交接方式，AICPU 直接读取，不再额外刷新地址表或逐项刷新输入。
-输入内容可以每轮更新，不依赖上一轮内容不变。
-
-原 `python/test_batch_get.py` 继续用于逐轮改变源数据、保护行和异步调用的正确性测试。
+源池大小由 `--table-capacity` 和块布局显式决定，不再由独立后端脚本分配 100 GiB。
+扫描不同 miss 数、token 大小或 worker 数时，循环调用同一个入口。
+详细口径及其他后端参数见 [统一 Get 性能测试](batch_get_performance.md)。
 
 ## 执行和资源约定
 
@@ -324,9 +233,10 @@ CPU 服务的 `--gather-threads` 是全部 worker 的总预算，须不小于 AI
 预算在 worker 之间均分，余数从 worker 0 开始分配。每个 worker 每完成 128 KiB 连续前缀即可开始 READ。
 
 每次最多 65536 项；token 大小由构造参数指定，最大总载荷须能用 uint32 表示。
-Runtime 在用户指定 DDR 数据容量之外按 worker 数预留 staging、源描述符和控制区，
+首次 Gather 准备时，CPU 在独立工作区中按 worker 数分配 staging、源描述符和控制区，
 每个 staging 区间可容纳 `ceil(65536 / worker_count)` 个 token，并单独对齐到 64 字节。
-这些空间不进入 KV slot 分配。HBM 仅保留发给 CPU 的源描述符和控制 scratch，输出 Tensor 无需额外尾部空间。
+主缓存池无需尾部预留，这些空间不进入 KV slot 分配；工作区在该 Gather session 关闭时释放。
+HBM 仅保留发给 CPU 的源描述符和控制 scratch，输出 Tensor 无需额外尾部空间。
 READ 使用 SGL 6、每次提交 32 条 WR；每波最多 4096 条 WR，只请求最后一条的有序 CQE。
 WR/SGL 工作区按本轮请求的上界增长，完成后复用容量；每轮仍重新填写全部有效请求。
 会话用独立数组保存数据队列和控制队列，worker 0 与其他 worker 使用相同的存储和访问方式。
@@ -353,12 +263,16 @@ GatherRead 只在以下 kernel 内部 URMA DMA 交接处保留缓存维护：
 连续性、设备、元素宽度、长度以及队列完成/错误检查仍在相应入口执行。
 
 BatchPut 同步完成；BatchGet 默认只 enqueue，`synchronize=True` 等待完成并读取错误状态。
-内部 workspace 在下一次操作或 Shutdown 前排空；跨 stream 依赖由调用方负责。
-UMDK 控制/Put 的启动或完成处理失败后，会话拒绝后续 Get/Put；应关闭并重新初始化 Runtime。
-Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资源。若仍无法确认完成，保留缓冲区并返回错误，
-调用方需继续保留已注册的源/输出 Tensor 和对应 stream。
-调用方须保留元数据 Tensor 至执行结束，已注册的源/输出 Tensor 至 Shutdown 前保持有效。
-同一 AICPU 进程只支持一个活动 UMDK 会话。目前该后端使用 eager 调用，不支持 ACL Graph capture/replay。
+同一 Get 方向的下一次普通调用会先完成上一笔；也可以显式 `drain_get()`。
+跨 stream 依赖由调用方负责。完成或资源释放失败时保留相关资源，调用方须继续保留
+Tensor 和 stream，按实现文档执行恢复或关闭重试。
+普通请求的 Tensor 保持至完成；显式输入/输出绑定保持至绑定结束，图资源保持至图销毁并结束图租约。
+当前 AICPU 进程支持多个 session，Put/Get 分别持有自己的 session/队列。
+Gather 已支持 ACL Graph capture/replay，可用 `graph_resources().prepare/capture` 自动收集节点，
+也保留 `begin_get_graph/end_get_graph` 底层接口；
+设备 ticket 在每次 replay 推进序号，图内不执行 Host 注册或同步。
+每个 Get 节点使用独立租约和报告，单图固定 stream；不同图与 eager 由调用方串行安排，
+可使用不同 stream。图 profile 或状态查询始终指定 `graph_lease`，省略则查询 eager。多图验证可在统一性能入口加 `--multi-graph-check`。
 
 本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。
 
@@ -366,18 +280,20 @@ Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资
 
 | 目录/文件 | 职责 |
 | --- | --- |
-| `access_operator/src/aicpu_access_operator.cc` | Runtime 适配、Get/Put 共享会话和跨操作同步 |
-| `access_operator/demo/aicpu_batch_get/host/` | BatchGet workspace、参数和 kernel 提交 |
-| `access_operator/demo/aicpu_batch_get/kernel/gather_read.cc` | 当前流水算法、READ WR/SGL 组装和调度 |
-| `access_operator/demo/aicpu_batch_put/` | 原有同步 BatchPut 的 Host/设备实现 |
+| `access_operator/providers/urma_aicpu/` | Runtime 适配、资源 owner；Put/Get 按执行方向和配置隔离 |
+| `access_operator/algorithms/get/gather/urma_aicpu/host/` | Gather workspace、参数和 kernel 提交 |
+| `access_operator/algorithms/get/common/aicpu/host/` | Gather/Scatter 共享参数构造、加载和 capture 辅助代码 |
+| `access_operator/algorithms/get/gather/urma_aicpu/kernel/gather_read.cc` | 当前流水算法、READ WR/SGL 组装和调度 |
+| `access_operator/algorithms/put/urma_aicpu/` | 原有同步 BatchPut 的 Host/设备实现 |
 | `access_operator/include/aicpu_urma/` | Host 会话、算子加载、Host/设备控制 ABI、设备通信接口和缓存工具 |
-| `access_operator/src/aicpu_urma/host/` | Host 侧会话组织和 kernel 加载 |
-| `access_operator/src/aicpu_urma/kernel/session.cc` | AICPU 加载 liburma、创建/连接队列、注册内存和资源释放 |
-| `access_operator/src/aicpu_urma/kernel/transfer.cc` | READ/WRITE WR 构建、提交和 CQ 完成处理 |
-| `access_operator/src/aicpu_urma/kernel/control_kernel.cc` | Host 控制命令的设备入口和分发 |
-| `access_operator/src/aicpu_urma/package/` | 算子 JSON、UMDK 库打包和安装脚本 |
+| `access_operator/transports/aicpu_urma/host/` | Host 侧会话组织和 kernel 加载 |
+| `access_operator/transports/aicpu_urma/kernel/session.cc` | AICPU 加载 liburma、创建/连接队列、注册内存和资源释放 |
+| `access_operator/transports/aicpu_urma/kernel/transfer.cc` | READ/WRITE WR 构建、提交和 CQ 完成处理 |
+| `access_operator/transports/aicpu_urma/kernel/control_kernel.cc` | Host 控制命令的设备入口和分发 |
+| `access_operator/transports/aicpu_urma/package/` | 算子 JSON、UMDK 库打包和安装脚本 |
 
-BatchGet 还提供 `cpu_push_scatter` 入口，通过 `aicpu_batch_get_mode` 在 Runtime 构造时选择；
-两条路径使用相同的输入前缀和输出地址语义。
-两个 demo 均按 `include/host/kernel` 分层，共用一个设备包。Gather 与 Put 共用 UMDK
-会话；Scatter Get 使用独立的 Host HCCP 通道，配套 Put 仍使用 UMDK，会话生命周期分别管理。
+BatchGet 还提供 Scatter，通过 `GetExecutionConfig("urma", "aicpu", "scatter")` 设置
+默认或本次执行配置；两条路径使用相同的输入前缀和输出地址语义。
+两个算法模块共用一个设备包，按首次使用的算法解析所需入口。Gather 和 Put
+使用独立 UMDK session，资源按执行方向和配置隔离。Scatter Get 使用 Host HCCP 通道，AICPU Put
+使用 UMDK。进程级 API 环境和 CPU DDR 注册的共享范围见实现文档。

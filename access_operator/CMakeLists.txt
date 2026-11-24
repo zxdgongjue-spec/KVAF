@@ -9,7 +9,15 @@ target_link_libraries(kvaf_access_operator INTERFACE kvaf_common)
 
 target_compile_features(kvaf_access_operator INTERFACE cxx_std_17)
 
-if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA) AND NOT ASCEND_CANN_PACKAGE_PATH)
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(kvaf_multi_fe_kernel_test ../tests/aiv_model/multi_fe_batch_get.cc)
+  target_link_libraries(kvaf_multi_fe_kernel_test PRIVATE kvaf_access_operator)
+  target_include_directories(kvaf_multi_fe_kernel_test PRIVATE
+    ../tests/aiv_model algorithms/get/direct/urma_aiv/include algorithms/get/direct/urma_aiv/kernel)
+  add_test(NAME kvaf_multi_fe_kernel COMMAND kvaf_multi_fe_kernel_test)
+endif()
+
+if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL) AND NOT ASCEND_CANN_PACKAGE_PATH)
   if(DEFINED ENV{ASCEND_CANN_PACKAGE_PATH})
     set(ASCEND_CANN_PACKAGE_PATH "$ENV{ASCEND_CANN_PACKAGE_PATH}")
   elseif(DEFINED ENV{ASCEND_HOME_PATH})
@@ -19,33 +27,40 @@ if((KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA) AND NOT ASCEND_CANN_PAC
   endif()
   set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_CANN_PACKAGE_PATH}" CACHE PATH "CANN toolkit")
 endif()
-add_subdirectory(src/ubmem)
+add_subdirectory(transports/ubmem)
 
-if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH)
-  add_subdirectory(src/direct_hccp)
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_CPU_PUSH OR KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL)
+  add_subdirectory(transports/direct_hccp)
+endif()
+
+if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_NPU_PULL)
+  add_subdirectory(algorithms/get/direct)
+endif()
+if(KVAF_ENABLE_NPU_PULL)
+  add_subdirectory(algorithms/get/raw_addr/urma_aiv)
 endif()
 
 if(KVAF_ENABLE_AIV_BATCH_GET)
-  add_subdirectory(demo/aiv_batch_get)
   if(KVAF_ENABLE_AIV_BATCH_PUT)
-    add_subdirectory(demo/aiv_batch_put)
+    add_subdirectory(algorithms/put/urma_aiv)
   endif()
 
   add_library(kvaf_default_access_operator
-    src/access_operator.cc
+    providers/urma_aiv/access_operator.cc
+    providers/urma_aiv/execution_resources.cc
   )
 
   target_include_directories(kvaf_default_access_operator
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_get/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/get/direct/urma_aiv/include
       ${ASCEND_CANN_PACKAGE_PATH}/include
   )
 
   if(KVAF_ENABLE_AIV_BATCH_PUT)
     target_include_directories(kvaf_default_access_operator
-      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/demo/aiv_batch_put/include)
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/algorithms/put/urma_aiv/include)
   endif()
 
   target_compile_definitions(kvaf_default_access_operator
@@ -78,11 +93,15 @@ if(KVAF_ENABLE_AIV_BATCH_GET)
 endif()
 
 if(KVAF_ENABLE_AICPU_URMA)
-  add_subdirectory(src/aicpu_urma)
-  add_subdirectory(demo/aicpu_batch_get)
-  add_subdirectory(demo/aicpu_batch_put)
-  add_subdirectory(src/aicpu_urma/kernel)
-  add_library(kvaf_aicpu_access_operator STATIC src/aicpu_access_operator.cc)
+  add_subdirectory(transports/aicpu_urma)
+  add_subdirectory(algorithms/get/common/aicpu)
+  add_subdirectory(algorithms/put/urma_aicpu)
+  add_subdirectory(transports/aicpu_urma/kernel)
+  add_library(kvaf_aicpu_access_operator STATIC
+    providers/urma_aicpu/access_operator.cc
+    providers/urma_aicpu/execution_resources.cc)
+  target_include_directories(kvaf_aicpu_access_operator PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/providers/common")
   if(KVAF_ENABLE_AICPU_CPU_PUSH)
     target_compile_definitions(kvaf_aicpu_access_operator PRIVATE KVAF_ENABLE_AICPU_CPU_PUSH=1)
   endif()

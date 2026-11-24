@@ -35,8 +35,11 @@ enum class Command : uint16_t {
   kOpenCpuPushGet = 11U,
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
-  kStopGatherLanes = 14U,
-  kOpenAivCpuGatherPushGet = 15U,
+  kPrepareGatherWorkspace = 14U,
+  kGetCacheCandidateCount = 15U,  // Service-affinity view used by ordinary cache providers.
+  kStopGatherLanes = 16U,
+  kOpenAivCpuGatherPushGet = 17U,
+  kEnableAivGatherLanes = 18U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
@@ -94,6 +97,12 @@ struct CandidateInfoRequest {
   uint32_t candidate_id;
 };
 
+// Extended readers request the raw CPU EID using the same v6 command.
+struct CandidateEidRequest {
+  CandidateInfoRequest info;
+  uint32_t response_bytes;
+};
+
 struct CandidateInfoResponse {
   MessageHeader header;
   int32_t result;
@@ -101,6 +110,11 @@ struct CandidateInfoResponse {
   uint32_t device_id;
   uint32_t eid_index;
   char device_name[kDeviceNameBytes];
+};
+
+struct CandidateEidResponse {
+  CandidateInfoResponse info;
+  uint8_t eid[kEidBytes];
 };
 
 struct AllocateRegionResponse {
@@ -114,6 +128,15 @@ struct AllocateRegionResponse {
   uint32_t token_value;
   uint8_t peer_eid[kEidBytes];
   uint8_t segment_key[kSegKeyBytes];
+};
+
+// The workspace belongs to this session; its registration is independent of
+// the cache allocation. Replies use AllocateRegionResponse with the same
+// session_id and the workspace's registered base/length/key.
+struct PrepareGatherWorkspaceRequest {
+  MessageHeader header;
+  uint64_t session_id;
+  uint64_t bytes;
 };
 
 struct CreateChannelRequest {
@@ -238,9 +261,11 @@ static_assert(sizeof(AllocateUbmemRegionResponse) == 432U, "UBmem descriptor ABI
 
 static_assert(sizeof(MessageHeader) == 12U, "wire header ABI changed");
 static_assert(sizeof(AllocateRegionRequest) == 36U, "allocate request ABI changed");
+static_assert(sizeof(PrepareGatherWorkspaceRequest) == 28U, "Gather workspace request ABI changed");
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
+static_assert(sizeof(CandidateEidRequest) == 20U && sizeof(CandidateEidResponse) == 108U);
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");

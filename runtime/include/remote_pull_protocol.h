@@ -1,0 +1,68 @@
+#pragma once
+#include "offload_protocol.h"
+#include "cpu_pull_timing.h"
+
+namespace kvaf::remote_pull {
+// Shared DDR with atomic first-submit admission and application-coordinated source reuse.
+constexpr std::uint32_t kMagic = 0x4b565250; // KVRP
+constexpr std::uint16_t kVersion = 8;
+constexpr std::uint32_t kMaxSourceMrs = 4096;
+constexpr std::uint32_t kSubmitProfile = 1;
+constexpr std::uint64_t kTimingMagic = 0x4b56525054494d31ULL;
+using MemoryDesc = offload::MemoryDesc;
+using ConnectionDesc = offload::ConnectionDesc;
+using Span = offload::Span;
+using Result = offload::Result;
+constexpr auto kMaxSpans = offload::kMaxSpans;
+enum class Command : std::uint16_t { Describe = 1, Attach, Bind, Probe, Submit = 6, Query, Cancel = 9, Detach, Checksum, InspectSource, AddMemory, SubmitAndWait };
+enum class State : std::uint32_t { Connecting, Idle, Running, Done, Failed, InDoubt, Cancelled, Closed, NotSeen };
+// NotSeen is a Query reply within a live registered session, never a stored state.
+struct RegionInfo {
+  std::uint64_t epoch{}, id{}, base{}, bytes{}, slot_size{};
+  std::uint32_t candidate{}, token{}, closing{};
+  std::uint8_t eid[16]{};
+};
+struct Request {
+  peer::MessageHeader header{};
+  std::uint32_t count{};
+  std::uint64_t region{}, epoch{}, source_id{}, task{}; // task = B's ready sequence
+  std::uint64_t operation{}; // Per-Put identity within the reader-owned DDR pool. Zero for an unused-token Cancel.
+  std::uint32_t token{}, flags{}; // SubmitAndWait: kSubmitProfile bit.
+  std::uint64_t mr_id{1};
+  std::uint32_t memory_count{1}, timeout_ms{}; // SubmitAndWait: wait budget after acceptance.
+  MemoryDesc source{};
+  ConnectionDesc connection{}; // Wire tail present only for Attach.
+};
+struct Response {
+  peer::MessageHeader header{};
+  Result result{Result::Invalid};
+  std::uint64_t region{}, epoch{}, source_id{}, task{}, operation{}, checksum{};
+  State state{State::Connecting};
+  std::uint32_t reserved{}; // Submit/SubmitAndWait: 1 if this operation was accepted (even if still running).
+  std::uint64_t mr_id{1};
+  RegionInfo pool{};
+  MemoryDesc memory{}; // SubmitAndWait profiling uses this otherwise-unused response payload.
+  ConnectionDesc connection{}; // Wire tail present only for Attach.
+};
+static_assert(sizeof(CpuPullServerTiming) <= sizeof(MemoryDesc));
+inline CpuPullServerTiming ServerTiming(const Response& response) {
+  CpuPullServerTiming timing{};
+  std::memcpy(&timing, &response.memory, sizeof(timing));
+  return timing;
+}
+inline void SetServerTiming(Response* response, const CpuPullServerTiming& timing) {
+  std::memcpy(&response->memory, &timing, sizeof(timing));
+}
+inline std::uint32_t RequestBytes(std::uint16_t command) {
+  return command == static_cast<std::uint16_t>(Command::Attach) ? sizeof(Request) : offsetof(Request, connection);
+}
+inline std::uint32_t ResponseBytes(std::uint16_t command) {
+  return (command & 0x7fffU) == static_cast<std::uint16_t>(Command::Attach) ? sizeof(Response) : offsetof(Response, connection);
+}
+inline Request MakeRequest(Command command) {
+  Request r{}; r.header = {kMagic, kVersion, static_cast<std::uint16_t>(command), RequestBytes(static_cast<std::uint16_t>(command))}; return r;
+}
+inline bool SameSpans(const std::vector<Span>& a, const std::vector<Span>& b) {
+  return a.size() == b.size() && (a.empty() || !std::memcmp(a.data(), b.data(), a.size()*sizeof(Span)));
+}
+}

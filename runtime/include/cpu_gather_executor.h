@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -8,21 +10,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-#include "cpu_gather.h"
-
 #if defined(__linux__)
 #include <sched.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-#include <cerrno>
-#include <cstdio>
 #endif
+
+#include "cpu_gather.h"
 
 namespace kvaf::peer {
 
@@ -62,14 +58,17 @@ class CpuGatherExecutor {
  public:
   CpuGatherExecutor(void* memory, std::uint64_t base, std::size_t max_threads,
                 std::size_t min_bytes_per_thread = 256U * 1024U,
-                GatherWaitMode wait_mode = GatherWaitMode::kPassive, bool bind_cores = false,
-                std::size_t cpu_offset = 0U)
+                GatherWaitMode wait_mode = GatherWaitMode::kPassive,
+                void* workspace_memory = nullptr, std::uint64_t workspace_base = 0U,
+                bool bind_cores = false, std::size_t cpu_offset = 0U)
       : memory_(static_cast<std::uint8_t*>(memory)),
         base_(base),
+        workspace_memory_(static_cast<std::uint8_t*>(workspace_memory ? workspace_memory : memory)),
+        workspace_base_(workspace_memory ? workspace_base : base),
         cpu_ids_(bind_cores ? AllowedCpus(cpu_offset) : std::vector<int>{}),
-        max_threads_(
-            std::min(std::max<std::size_t>(1U, max_threads),
-                     cpu_ids_.empty() ? std::max<std::size_t>(1U, max_threads) : cpu_ids_.size())),
+        max_threads_(std::min(std::max<std::size_t>(1U, max_threads),
+                              cpu_ids_.empty() ? std::max<std::size_t>(1U, max_threads)
+                                               : cpu_ids_.size())),
         min_bytes_per_thread_(std::max<std::size_t>(1U, min_bytes_per_thread)),
         wait_mode_(wait_mode) {}
 
@@ -92,7 +91,6 @@ class CpuGatherExecutor {
 
   void BindWorker(std::size_t worker) const {
 #if defined(__linux__)
-    const long tid = syscall(SYS_gettid);
     if (worker >= cpu_ids_.size()) {
       return;
     }
@@ -101,7 +99,7 @@ class CpuGatherExecutor {
     CPU_SET(cpu_ids_[worker], &mask);
     const int result = sched_setaffinity(0, sizeof(mask), &mask);
     if (result)
-      std::fprintf(stderr, "[KVAF_CPU] gather affinity failed tid=%ld cpu=%d errno=%d\n", tid,
+      std::fprintf(stderr, "[KVAF_CPU] gather affinity failed cpu=%d errno=%d\n",
                    cpu_ids_[worker], errno);
 #else
     (void)worker;
@@ -128,7 +126,7 @@ class CpuGatherExecutor {
     }
     spans_ = spans;
     span_count_ = span_count;
-    staging_ = memory_ + (staging - base_);
+    staging_ = workspace_memory_ + (staging - workspace_base_);
     total_bytes_ = total_bytes;
     active_threads_ = threads;
     if (cooperative_) {
@@ -161,21 +159,6 @@ class CpuGatherExecutor {
     return threads;
   }
 
-  static std::vector<int> AllowedCpus(std::size_t offset) {
-    std::vector<int> cpus;
-#if defined(__linux__)
-    cpu_set_t mask{};
-    if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
-      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
-        if (CPU_ISSET(cpu, &mask)) cpus.push_back(cpu);
-#endif
-    if (offset < cpus.size())
-      cpus.erase(cpus.begin(), cpus.begin() + offset);
-    else
-      cpus.clear();
-    return cpus;
-  }
-
   std::uint64_t Boundary(std::size_t index) const {
     if (index == 0U) return 0U;
     if (index == active_threads_) return total_bytes_;
@@ -198,8 +181,27 @@ class CpuGatherExecutor {
   void CopyWorker(std::size_t worker);
   void RunHelper(std::size_t worker);
 
+  static std::vector<int> AllowedCpus(std::size_t offset) {
+    std::vector<int> cpus;
+#if defined(__linux__)
+    cpu_set_t mask{};
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &mask)) cpus.push_back(cpu);
+#endif
+    if (offset < cpus.size())
+      cpus.erase(cpus.begin(), cpus.begin() + offset);
+    else
+      cpus.clear();
+    return cpus;
+  }
+
   std::uint8_t* memory_;
   std::uint64_t base_;
+  // Source addresses remain cache-canonical; descriptor/staging addresses are
+  // relative to the independently registered Gather workspace.
+  std::uint8_t* workspace_memory_;
+  std::uint64_t workspace_base_;
   std::vector<int> cpu_ids_;
   std::size_t max_threads_;
   std::size_t min_bytes_per_thread_;

@@ -67,7 +67,7 @@ CPU Gather 使用服务的 `--gather-threads`、绑核和等待配置，staging 
 
 ## 独立二进制与类型声明
 
-以下路径相对于 `access_operator/demo/aiv_batch_get/`：
+以下路径相对于 `access_operator/algorithms/get/direct/urma_aiv/`：
 
 | 层次 | Scatter | Gather |
 | --- | --- | --- |

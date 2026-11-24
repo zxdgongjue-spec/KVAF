@@ -42,7 +42,8 @@ CPU Mock 仅用于本地功能验证；它不等同于 A5/CANN 的设备内存�
 传输。AIV operator 的直接 Python binding 会作为独立后端提供，不能用 MPS
 代替 NPU 集成验证。vLLM 的 CacheOS-vLLM Adaptor 不在此处实现。
 
-启用 AIV CANN 构建时，额外导出 `kvaf.NpuRuntime`、`kvaf.DeviceAccessTable` 与
+启用 AIV、AICPU、CPU Pull 或 NPU Pull 任一硬件路径时，额外导出
+`kvaf.NpuRuntime`、`kvaf.DeviceAccessTable` 与
 `kvaf.AclGraph`。使用 NPU BatchGet 时先调用
 `runtime.access_table_view(table, device="npu", capacity=N)` 得到
 `DeviceAccessTable`，再调用：
@@ -69,7 +70,11 @@ Tensor，只有三个请求数组的 `[0, miss_count)` 前缀会被执行。输�
 使用 `torch.npu.current_stream()` 且只提交不主动同步。AIV 内部 status/queue 不属于
 Python API。`NpuRuntime` 的 `batch_get_token_bytes` 配置单 token KV 大小，
 `batch_get_tokens_per_block` 配置每个 block 的 token 数；AccessTable entry 大小为
-两者乘积。这两个构造参数无默认值，必须显式传入。`offsets`
+两者乘积。这两个构造参数可同时省略，用于独立 Pull；普通缓存 Get 首次准备时要求有效布局。`offsets`
 是表项内字节偏移。直接传 `addresses` / `valid` 时，调用方负责表项布局和
 Tensor 生命周期。`AclGraph` 由 Python 调用方持有，直接封装 ACL Runtime Graph 的
 capture / replay / synchronize / reset；图对象不属于 Runtime 或 Operator。
+
+CPU Pull 与 NPU raw Pull 的接口及生命周期见 [Bindings](../../bindings/README.md)。
+raw 图由应用负责 metadata/storage/stream 保活、同步和销图，使用普通 raw 调用捕获，
+无须额外 KVAF Begin/End 或图租约。

@@ -61,7 +61,7 @@ class ModeIsolationTests(unittest.TestCase):
         # Stop at the first hardware import; gather has its own binary contract.
         original_import = __import__
         def importing(name, *args, **kwargs):
-            if name == 'backend':
+            if name == 'utils.backend':
                 raise RuntimeError('reached hardware setup')
             return original_import(name, *args, **kwargs)
         with patch.dict(os.environ, {'KVAF_RUN_NPU_TESTS': '1'}), \

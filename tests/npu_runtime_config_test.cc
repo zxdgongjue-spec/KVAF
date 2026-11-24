@@ -28,37 +28,15 @@ void Write(const fs::path& path, const std::string& contents) {
 }
 
 int main() {
-  NpuRuntimeOptions defaults{"get.o", 656, 2};
-  RuntimeBackend backend;
-  CHECK(defaults.aicpu_batch_get_mode.empty());
-  CHECK(ResolveRuntimeBackend(defaults.transport, defaults.aicpu_batch_get_mode, &backend).ok());
-  CHECK(backend == RuntimeBackend::kUrmaAiv);
-  CHECK(StripesEids(backend, true));
-  CHECK(!StripesEids(backend, false));
-  for (const auto& mode : {"gather_read", "cpu_push_scatter"}) {
-    CHECK(ResolveRuntimeBackend(Transport::kUrma, mode, &backend).ok());
-    CHECK(backend == (std::string(mode) == "gather_read"
-        ? RuntimeBackend::kUrmaAicpuGather : RuntimeBackend::kUrmaAicpuScatter));
-    CHECK(UsesAicpu(backend));
-    // An explicit list is iterated one EID at a time for both modes.
-    CHECK(!StripesEids(backend, true));
-    CHECK(!StripesEids(backend, false));
-    CHECK(!ResolveRuntimeBackend(Transport::kUbmem, mode, &backend).ok());
+  NpuRuntimeOptions defaults{656, 2};
+  CHECK(NormalizeExecutionPolicy(&defaults).ok());
+  CHECK((defaults.default_get == GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Direct}));
+  for (const auto algorithm : {GetAlgorithm::Gather, GetAlgorithm::Scatter}) {
+    for (const auto executor : {Executor::Aiv, Executor::Aicpu}) {
+      CHECK(ValidateExecution(TransportMode::Urma, GetExecutionConfig{Transport::Urma, executor, algorithm}).ok());
+      CHECK(!ValidateExecution(TransportMode::Ubmem, GetExecutionConfig{Transport::Ubmem, executor, algorithm}).ok());
+    }
   }
-  CHECK(ResolveRuntimeBackend(Transport::kUbmem, "", &backend).ok());
-  CHECK(backend == RuntimeBackend::kUbmem && !UsesAicpu(backend));
-  for (const auto& mode : {"gather_read", "cpu_push_scatter"}) {
-    CHECK(ResolveRuntimeBackend(Transport::kUrma, "", &backend, mode).ok());
-    CHECK(backend == RuntimeBackend::kUrmaAiv && !UsesAicpu(backend));
-    CHECK(!ResolveRuntimeBackend(Transport::kUrma, "cpu_push_scatter", &backend, mode).ok());
-    CHECK(!ResolveRuntimeBackend(Transport::kUbmem, "", &backend, mode).ok());
-  }
-  for (const auto& mode : {"gather_read_direct", "GATHER_READ", " ", "auto", "scatter"}) {
-    CHECK(!ResolveRuntimeBackend(Transport::kUrma, mode, &backend).ok());
-    CHECK(!ResolveRuntimeBackend(Transport::kUbmem, mode, &backend).ok());
-  }
-  CHECK(!ResolveRuntimeBackend(static_cast<Transport>(99), "", &backend).ok());
-  CHECK(!ResolveRuntimeBackend(Transport::kUrma, "", nullptr).ok());
 
   char pattern[] = "/tmp/kvaf-config-XXXXXX";
   const auto* directory = mkdtemp(pattern);

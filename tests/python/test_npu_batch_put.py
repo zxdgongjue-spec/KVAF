@@ -16,15 +16,59 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import kvaf
-
-from backend import detect_torch_backend
-from npu_eids import parse_npu_eids
+from utils.backend import detect_torch_backend
+from utils.npu_eids import parse_npu_eids
+from utils.perf_execution import BenchmarkExecution, add_execution_metadata, default_put_cores
+from utils.statistics import percentile
 
 DEFAULT_BATCH_GET_TOKEN_BYTES = 656
 DEFAULT_BATCH_GET_TOKENS_PER_BLOCK = 128
 DDR_SLOT_ALIGNMENT = 4096  # vLLM-DSA M0_DDR_LAYER_ALIGNMENT_BYTES.
 MAX_AIV_CORES = 48  # batch_put_abi.h.
+
+
+def put_backend(transport: str, executor: str) -> str:
+    if transport not in ("urma", "ubmem") or executor not in ("aiv", "aicpu"):
+        raise ValueError("unsupported Put transport/executor")
+    if transport == "ubmem" and executor != "aiv":
+        raise ValueError("UBMEM Put requires --executor aiv")
+    return f"{transport}_{executor}"
+
+
+def kernel_paths(executor: str) -> tuple[str, str]:
+    # AICPU loads its installed package and must work in an AICPU-only build.
+    if executor == "aicpu":
+        return "", ""
+    put = Path(os.environ.get("KVAF_BATCH_PUT_KERNEL", ""))
+    if not put.is_file():
+        raise ValueError("KVAF_BATCH_PUT_KERNEL must name the built BatchPut kernel object")
+    return "", str(put)
+
+
+def format_measurements(samples: list[float], *, execution_mode: str,
+                        transport: str, executor: str, warmup: int, rows: int,
+                        block_bytes: int, cores: int, input_binding: str = "transient",
+                        binding_setup_us: float = 0, binding_teardown_us: float = 0) -> str:
+    mean_ms = statistics.mean(samples)
+    p50_ms = percentile(samples, 0.50)
+    payload = rows * block_bytes
+    # Keep useful_GBps mean-based for existing consumers; label the p50 rate
+    # explicitly so latency and bandwidth comparisons use the same statistic.
+    return (
+        "PERF_RESULT metric=runtime_batch_put_sync_call_to_return "
+        f"execution_mode={execution_mode} operation=batch_put "
+        f"transport={transport} executor={executor} backend={put_backend(transport, executor)} "
+        f"input_binding={input_binding} binding_setup_us={binding_setup_us:.3f} "
+        f"binding_teardown_us={binding_teardown_us:.3f} "
+        "timing=synchronous_batch_put "
+        f"samples={len(samples)} warmup_excluded={warmup} rows={rows} "
+        f"block_bytes={block_bytes} npu_cores={cores} payload_bytes_per_call={payload} "
+        f"mean_ms={mean_ms:.6f} p50_ms={p50_ms:.6f} "
+        f"p90_ms={percentile(samples, 0.90):.6f} "
+        f"p99_ms={percentile(samples, 0.99):.6f} "
+        f"useful_GBps={payload / mean_ms / 1_000_000:.3f} "
+        f"p50_GBps={payload / p50_ms / 1_000_000:.3f}"
+    )
 
 
 def build_keys(
@@ -46,14 +90,6 @@ def build_keys(
     ]
 
 
-def percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
-    position = fraction * (len(ordered) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
-
 def validate_batch(
     runtime: object,
     keys: list[int],
@@ -71,15 +107,20 @@ def validate_batch(
         slot_bytes = runtime.remote_region["slot_size"]
         if list(view["addresses"]) != [base + key * slot_bytes for key in keys]:
             raise AssertionError("BatchPut addresses must follow DSA key_id == slot_id")
-        # DDR belongs to the CPU service process. The companion BatchGet
-        # integration test validates the bytes through AIV UB rather than
-        # dereferencing a remote process address from Python.
+        # DDR belongs to the CPU service process. Payload validation is done
+        # by the Get benchmark, not by dereferencing remote addresses here.
         print("RUNTIME_NPU_REMOTE_CPU_DIRECT_DEREFERENCE_SKIPPED")
     finally:
         runtime.release_access_table(table)
 
 
-def main(transport: str = "urma") -> int:
+def main(transport: str = "urma", execution_mode: str = "unified",
+         executor: str = "aiv") -> int:
+    try:
+        provider = put_backend(transport, executor)
+    except ValueError as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 2
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
@@ -87,40 +128,19 @@ def main(transport: str = "urma") -> int:
             f"detected {backend.name} ({backend.reason})."
         )
         return 0
+    import kvaf
+
     if not hasattr(kvaf, "NpuRuntime"):
         print(
-            "SKIP: kvaf was not built with -DKVAF_ENABLE_AIV_BATCH_GET=ON, "
-            "-DKVAF_ENABLE_AIV_BATCH_PUT=ON, and -DKVAF_BUILD_PYTHON=ON."
+            "SKIP: build NpuRuntime with Python bindings and the selected Put backend."
         )
         return 0
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the CANN target")
         return 0
 
-    batch_put_kernel = Path(os.environ.get("KVAF_BATCH_PUT_KERNEL", ""))
-    if not batch_put_kernel.is_file():
-        print(
-            "FAIL: KVAF_BATCH_PUT_KERNEL must name the built BatchPut kernel object",
-            file=sys.stderr,
-        )
-        return 2
-    batch_get_kernel = Path(
-        os.environ.get(
-            "KVAF_BATCH_GET_KERNEL",
-            os.environ.get(
-                "KVAF_AIV_BATCH_GET_KERNEL",
-                str(batch_put_kernel.with_name("kvaf_execute_batch_get_kernels.o")),
-            ),
-        )
-    )
-    if not batch_get_kernel.is_file():
-        print(
-            "FAIL: KVAF_BATCH_GET_KERNEL must name the built BatchGet kernel object",
-            file=sys.stderr,
-        )
-        return 2
-
     try:
+        batch_get_kernel, batch_put_kernel = kernel_paths(executor)
         device_id = int(os.environ.get("DEVICE_ID", "0"))
         peer_ub_device = os.environ.get("KVAF_PEER_UB_DEVICE", "").strip()
         npu_eids = parse_npu_eids(os.environ.get("KVAF_NPU_EIDS"))
@@ -137,17 +157,18 @@ def main(transport: str = "urma") -> int:
             "KVAF_NPU_BLOCK_BYTES", str(token_bytes * tokens_per_block)
         ))
         npu_core_count = int(os.environ.get(
-            "KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES", "32")
+            "KVAF_NPU_CORE_COUNT", os.environ.get("KVAF_NPU_AIV_CORES",
+                                                 str(default_put_cores(transport, executor)))
         ))
         jettys_per_core = int(os.environ.get("KVAF_NPU_JETTYS_PER_CORE", "2"))
         warmup = int(os.environ.get("KVAF_NPU_WARMUP", "20"))
         iterations = int(os.environ.get("KVAF_NPU_ITERATIONS", "500"))
         if not (
-            device_id >= 0 and 0 < rows <= (1 << 32) - 1
+            device_id >= 0 and 0 < rows <= 65536
             and 0 < block_bytes <= (1 << 32) - 1
             and token_bytes > 0 and tokens_per_block > 0
             and block_bytes == token_bytes * tokens_per_block
-            and 0 < npu_core_count <= min(rows, MAX_AIV_CORES)
+            and 0 < npu_core_count <= min(rows, 8 if executor == "aicpu" else MAX_AIV_CORES)
             and 1 <= jettys_per_core <= 2 and warmup >= 0 and iterations > 0
         ):
             raise ValueError("invalid shape, core count or sampling configuration; "
@@ -198,17 +219,15 @@ def main(transport: str = "urma") -> int:
     torch.npu.synchronize()
     stream = torch.npu.current_stream()
 
+    execution = BenchmarkExecution(kvaf, transport=transport,
+                                   executor=executor,
+                                   algorithm="gather" if executor == "aicpu" else "direct",
+                                   put_capacity=rows, put_cores=npu_core_count, put_jettys=jettys_per_core,
+                                   get_kernel=batch_get_kernel, put_kernel=batch_put_kernel)
     runtime = kvaf.NpuRuntime(
-        str(batch_get_kernel),
-        transport=transport,
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=npu_core_count,
-        batch_put_kernel_object_path=str(batch_put_kernel),
-        jettys_per_core=jettys_per_core,
-        peer_ub_device=peer_ub_device,
-        npu_eids=npu_eids,
+        batch_get_token_bytes=token_bytes, batch_get_tokens_per_block=tokens_per_block,
+        device_id=device_id, peer_ub_device=peer_ub_device, npu_eids=npu_eids,
+        **execution.runtime_kwargs,
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:
@@ -219,6 +238,7 @@ def main(transport: str = "urma") -> int:
     try:
         print(
             "RUNTIME_NPU_BATCH_PUT_CONFIG "
+            f"execution_mode={execution_mode} transport={transport} executor={executor} "
             f"rows={rows} block_bytes={block_bytes} npu_cores={npu_core_count} "
             f"scenario={'dsa_single_layer' if configured else 'bandwidth_baseline'} "
             f"pool_rows={pool_rows} n_layers={n_layers} q_capacity={q_capacity} "
@@ -229,21 +249,23 @@ def main(transport: str = "urma") -> int:
             f"batch_get_token_bytes={token_bytes} "
             f"batch_get_tokens_per_block={tokens_per_block} "
             f"jettys_per_core={jettys_per_core} warmup={warmup} "
-            f"iterations={iterations} backend=aiv_direct_hccp"
+            f"iterations={iterations} backend={provider} timing=synchronous_batch_put"
         )
         min_rows_per_core = rows // npu_core_count
         max_rows_per_core = (rows + npu_core_count - 1) // npu_core_count
-        print(
-            "RUNTIME_NPU_BATCH_PUT_COVERAGE "
-            f"requests_per_core={min_rows_per_core}..{max_rows_per_core} "
-            f"active_jettys_per_core={min(jettys_per_core, (min_rows_per_core + 31) // 32)}"
-            f"..{min(jettys_per_core, (max_rows_per_core + 31) // 32)}"
-        )
+        if transport == "urma" and executor == "aiv":
+            print(
+                "RUNTIME_NPU_BATCH_PUT_COVERAGE "
+                f"requests_per_core={min_rows_per_core}..{max_rows_per_core} "
+                f"active_jettys_per_core={min(jettys_per_core, (min_rows_per_core + 31) // 32)}"
+                f"..{min(jettys_per_core, (max_rows_per_core + 31) // 32)}"
+            )
         runtime.initialize(ddr_bytes, slot_bytes)
+        execution.bind_input(runtime, source, stream)
 
         def execute() -> None:
             nonlocal committed
-            runtime.batch_put(keys, source, offsets, lengths, stream)
+            runtime.batch_put(keys, source, offsets, lengths, stream, **execution.put_kwargs)
             committed = True
 
         def release() -> None:
@@ -277,19 +299,12 @@ def main(transport: str = "urma") -> int:
         validate_batch(runtime, keys, rows, block_bytes)
         release()
         print("RUNTIME_NPU_PHASE_DONE phase=post_perf_validation")
+        execution.release_input(runtime)
 
-        mean_ms = statistics.mean(samples)
-        useful_gbps = rows * block_bytes / 1_000_000_000.0 / (mean_ms / 1000.0)
-        print(
-            "PERF_RESULT metric=runtime_batch_put_sync_call_to_return "
-            f"samples={iterations} warmup_excluded={warmup} rows={rows} "
-            f"block_bytes={block_bytes} npu_cores={npu_core_count} "
-            f"mean_ms={mean_ms:.3f} "
-            f"p50_ms={percentile(samples, 0.50):.3f} "
-            f"p90_ms={percentile(samples, 0.90):.3f} "
-            f"p99_ms={percentile(samples, 0.99):.3f} "
-            f"useful_GBps={useful_gbps:.3f}"
-        )
+        print(format_measurements(samples, execution_mode=execution_mode,
+            transport=transport, executor=executor, warmup=warmup, rows=rows,
+            block_bytes=block_bytes, cores=npu_core_count, input_binding=execution.input_binding,
+            binding_setup_us=execution.input_setup_us, binding_teardown_us=execution.input_teardown_us))
         return 0
     except Exception as error:
         print(
@@ -309,4 +324,8 @@ def main(transport: str = "urma") -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
-    raise SystemExit(main(parser.parse_args().transport))
+    parser.add_argument("--executor", choices=("aiv", "aicpu"), default="aiv",
+                        help="Put executor; aicpu requires URMA and the installed AICPU package")
+    add_execution_metadata(parser)
+    args = parser.parse_args()
+    raise SystemExit(main(args.transport, args.execution_mode, args.executor))

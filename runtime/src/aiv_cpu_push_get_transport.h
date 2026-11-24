@@ -9,7 +9,7 @@
 
 #include "cpu_push_gather_executor.h"
 #include "cpu_push_get_layout.h"
-#include "cpu_urma_channel.h"
+#include "cpu_service/urma/cpu_urma_channel.h"
 #include "cpu_urma/indexed_async_write_tracker.h"
 #include "peer_protocol.h"
 #include "status.h"
@@ -24,7 +24,7 @@ class Transport {
   void BindWorker() const { if (gather_) gather_->BindWorker(0); }
   Status Initialize(urma_context_t*, urma_target_seg_t* source,
                     const peer::OpenAivCpuPushJettyRequest&, urma::GetTpList,
-                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushJettyResponse*);
+                    urma::ImportJettyEx, std::uint32_t psn, peer::OpenAivCpuPushJettyResponse*, std::uint64_t canonical_base = 0);
   Status ReadRequest(std::uint64_t* sequence);
   Status ReadDescriptor(std::uint64_t sequence);
   Status WriteBatch(const std::atomic<bool>* stop = nullptr);
@@ -115,7 +115,7 @@ class Transport {
   urma_target_seg_t* gather_segment_{};
   urma_token_id_t* gather_token_{};
   std::uint8_t* gather_staging_{};
-  std::uint64_t gather_staging_bytes_{}, source_bytes_{};
+  std::uint64_t gather_staging_bytes_{}, source_bytes_{}, source_base_{};
   std::uint64_t hbm_base_{}, session_{};
   std::uint32_t max_sge_{}, max_bytes_{}, max_gather_write_bytes_{}, workers_{}, token_bytes_{};
   std::uint32_t token_value_{};

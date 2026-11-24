@@ -248,9 +248,9 @@ def main(argv=None):
         return 77
     kernel, put_kernel = kernel_paths("cpu_push_scatter")
     check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
-    from backend import detect_torch_backend
-    from dsa_keys import build_dsa_keys
-    from npu_eids import parse_npu_eids
+    from utils.backend import detect_torch_backend
+    from utils.dsa_keys import build_dsa_keys
+    from utils.npu_eids import parse_npu_eids
     import kvaf
     backend = detect_torch_backend()
     if backend.name != "npu" or not hasattr(kvaf, "NpuRuntime"):

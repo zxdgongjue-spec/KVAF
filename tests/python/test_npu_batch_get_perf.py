@@ -5,6 +5,10 @@ Unlike ``test_npu_runtime_perf.py``, this benchmark has no derived ``batch``
 dimension. The request-array length, AccessTable capacity, block layout and
 exact ``miss_count`` are independent inputs. BatchPut is used only to populate
 the remote table before measurement and is never included in the timing.
+Select implementations with --backend and eager/graph with --execution.
+Single-card runs report end-to-end and kernel time/bandwidth.
+--kernel-profile adds stage and per-worker diagnostics.
+Eager timing covers asynchronous submit plus drain (default) or one synchronous call.
 
 The five primary settings can be supplied as command-line options or through
 environment variables:
@@ -20,17 +24,15 @@ environment variables:
     --output-access-pattern
                            KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN
     --sort-input-indices   KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES=1
-    --kernel-profile       KVAF_BATCH_GET_PERF_KERNEL_PROFILE=1
-    --ubmem-profile-detail  per-row diagnostic timing (requires --kernel-profile)
+    --kernel-profile       report stage/worker metrics, including UBMEM detail
     --kernel-profile-clock-mhz
                            KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ
-    adaptive UB devices    KVAF_ADAPTIVE_UB_DEVICES
-    adaptive miss count    KVAF_ADAPTIVE_UB_MISS_COUNT
 """
 
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import os
 from pathlib import Path
 import statistics
@@ -40,327 +42,455 @@ from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backend import detect_torch_backend
-from dsa_keys import build_dsa_keys
-from npu_eids import parse_npu_eids
-
-
-DEFAULT_REQUEST_LENGTH = 32_768
-DEFAULT_TABLE_CAPACITY = 16_384 * 78
-DEFAULT_TOKENS_PER_BLOCK = 128
-DEFAULT_TOKEN_BYTES = 656
-DEFAULT_AIV_CORES = 2
-DEFAULT_JETTYS_PER_CORE = 2
-MAX_JETTYS_PER_CORE = 64
-DEFAULT_WARMUP = 3
-DEFAULT_ITERATIONS = 100
-DEFAULT_POPULATE_CHUNK_ENTRIES = 128
-DEFAULT_KERNEL_PROFILE_CLOCK_MHZ = 1000
-DEFAULT_ADAPTIVE_UB_MISS_COUNT = 2048
-DEFAULT_ADAPTIVE_PEER_UB_DEVICES = (
-    "udmac0d1e2",
-    "udmac0d1e3",
-    "udmac1d1e2",
-    "udmac1d1e3",
+from utils.backend import detect_torch_backend
+from utils.batch_get_csv import BatchGetCsv
+from utils.batch_get_workload import token_pattern
+from utils.dsa_keys import build_dsa_keys
+from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
+                             captured_get_resources, validate_graph_inputs)
+from utils.get_options import (
+    MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
+    environment_int, resolve_backend, uses_aicpu, validate_workload,
 )
-MAX_INT32 = (1 << 31) - 1
-MAX_UINT64 = (1 << 64) - 1
-
-
-def environment_int(name: str, default: int) -> int:
-    return int(os.environ.get(name, str(default)))
-
-
-def environment_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, or on/off")
-
-
-def configured_adaptive_ub_devices() -> list[str]:
-    configured = os.environ.get(
-        "KVAF_ADAPTIVE_UB_DEVICES",
-        ",".join(DEFAULT_ADAPTIVE_PEER_UB_DEVICES),
-    )
-    return [device.strip() for device in configured.split(",")]
+from utils.perf_execution import BenchmarkExecution, add_execution_metadata
+from utils.statistics import percentile
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Measure NPU BatchGet performance with an independently configurable "
-            "request length, table capacity, block layout and exact miss count."
-        )
+        allow_abbrev=False,
+        description="Measure four Get backends with the same workload and eager/graph timing.",
     )
-    parser.add_argument(
-        "--request-length",
-        type=int,
-        default=environment_int(
-            "KVAF_BATCH_GET_PERF_REQUEST_LENGTH", DEFAULT_REQUEST_LENGTH
-        ),
-        help="length/capacity of indices, offsets and output_indices",
-    )
-    parser.add_argument(
-        "--table-capacity",
-        type=int,
-        default=environment_int(
-            "KVAF_BATCH_GET_PERF_TABLE_CAPACITY", DEFAULT_TABLE_CAPACITY
-        ),
-        help="number of valid AccessTable entries",
-    )
-    parser.add_argument(
-        "--tokens-per-block",
-        type=int,
-        default=environment_int(
-            "KVAF_BATCH_GET_PERF_TOKENS_PER_BLOCK", DEFAULT_TOKENS_PER_BLOCK
-        ),
-        help="number of tokens stored in each AccessTable entry",
-    )
-    parser.add_argument(
-        "--token-bytes",
-        type=int,
-        default=environment_int("KVAF_BATCH_GET_PERF_TOKEN_BYTES", DEFAULT_TOKEN_BYTES),
-        help="bytes transferred for each valid request",
-    )
-    parser.add_argument(
-        "--miss-count",
-        type=int,
-        default=(
-            int(os.environ["KVAF_BATCH_GET_PERF_MISS_COUNT"])
-            if "KVAF_BATCH_GET_PERF_MISS_COUNT" in os.environ
-            else None
-        ),
-        help="exact valid request-prefix length; defaults to request-length",
-    )
-    parser.add_argument(
-        "--source-access-pattern",
-        choices=("random", "contiguous", "shuffled-contiguous"),
-        default=os.environ.get(
-            "KVAF_BATCH_GET_PERF_SOURCE_ACCESS_PATTERN", "random"
-        ),
-        help=(
-            "remote CPU DDR read order: random samples the full table, "
-            "contiguous reads an ascending token range, and shuffled-contiguous "
-            "sends the same contiguous range in random order"
-        ),
-    )
-    parser.add_argument(
-        "--output-access-pattern",
-        choices=("random", "contiguous"),
-        default=os.environ.get(
-            "KVAF_BATCH_GET_PERF_OUTPUT_ACCESS_PATTERN", "contiguous"
-        ),
-        help=(
-            "local NPU HBM output order; use contiguous while comparing source "
-            "patterns to isolate remote CPU DDR access behavior"
-        ),
-    )
-    parser.add_argument(
-        "--aiv-cores",
-        type=int,
-        default=environment_int("KVAF_BATCH_GET_PERF_AIV_CORES", DEFAULT_AIV_CORES),
-    )
-    parser.add_argument(
-        "--jettys-per-core",
-        type=int,
-        choices=range(1, MAX_JETTYS_PER_CORE + 1),
-        default=environment_int(
-            "KVAF_BATCH_GET_PERF_JETTYS_PER_CORE", DEFAULT_JETTYS_PER_CORE
-        ),
-    )
-    parser.add_argument(
-        "--npu-eids",
-        type=parse_npu_eids,
-        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
-        help=(
-            "comma-separated local NPU EIDs; workers are striped over all "
-            "listed EIDs (environment: KVAF_NPU_EIDS)"
-        ),
-    )
-    parser.add_argument(
-        "--adaptive-ub-device", action="store_true",
-        help=(
-            "startup tuning over the N-side peer-device allowlist when K has "
-            "no explicit device filter"
-        ),
-    )
-    parser.add_argument(
-        "--peer-ub-device",
-        default="",
-        help="strict K-side UB device selected by an earlier process",
-    )
-    parser.add_argument(
-        "--adaptive-calibration-only",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=environment_int("KVAF_BATCH_GET_PERF_WARMUP", DEFAULT_WARMUP),
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", DEFAULT_ITERATIONS),
-    )
-    parser.add_argument(
-        "--populate-chunk-entries",
-        type=int,
-        default=environment_int(
-            "KVAF_BATCH_GET_PERF_POPULATE_CHUNK_ENTRIES",
-            DEFAULT_POPULATE_CHUNK_ENTRIES,
-        ),
-        help="setup-only BatchPut chunk size; it does not affect BatchGet shape",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=environment_int("KVAF_BATCH_GET_PERF_SEED", 20260903),
-    )
-    input_order = parser.add_mutually_exclusive_group()
-    input_order.add_argument(
-        "--sort-input-indices",
-        dest="sort_input_indices",
-        action="store_true",
-        help=(
-            "sort the active request prefix by the table-resolved entry and then offsets; "
-            "offsets and output_indices follow the same permutation"
-        ),
-    )
-    input_order.add_argument(
-        "--no-sort-input-indices",
-        dest="sort_input_indices",
-        action="store_false",
-        help="keep the generated request prefix in its configured order",
-    )
-    kernel_profile = parser.add_mutually_exclusive_group()
-    kernel_profile.add_argument(
-        "--kernel-profile",
-        dest="kernel_profile",
-        action="store_true",
-        help="collect the per-core AIV kernel timeline for every measured sample",
-    )
-    kernel_profile.add_argument(
-        "--no-kernel-profile",
-        dest="kernel_profile",
-        action="store_false",
-        help="disable AIV kernel cycle profiling",
-    )
-    parser.add_argument(
-        "--ubmem-profile-detail", action="store_true",
-        help="measure UBmem address preparation, MTE submission and final drain; adds timing overhead",
-    )
-    parser.add_argument(
-        "--kernel-profile-clock-mhz",
-        type=int,
-        default=environment_int(
-            "KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
-            environment_int(
-                "KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ",
-                DEFAULT_KERNEL_PROFILE_CLOCK_MHZ,
-            ),
-        ),
-        help="AIV clock used to convert profile cycles to milliseconds",
-    )
-    parser.add_argument("--transport", choices=("urma", "ubmem"), default="urma")
-    parser.set_defaults(
-        adaptive_peer_ub_devices=configured_adaptive_ub_devices(),
-        kernel_profile=environment_bool("KVAF_BATCH_GET_PERF_KERNEL_PROFILE"),
-        sort_input_indices=environment_bool(
-            "KVAF_BATCH_GET_PERF_SORT_INPUT_INDICES"
-        ),
-    )
-    parser.add_argument(
-        "--max-inflight-total", type=int,
-        default=environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048),
-        help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
-    )
+    add_workload_arguments(parser)
+    add_backend_arguments(parser)
+    parser.add_argument("--iterations", type=int,
+                        default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
+    parser.add_argument("--kernel-profile", action="store_true",
+                        help="add stage/worker details, including UBMEM address/MTE/drain timings; kernel bandwidth is always reported")
+    parser.add_argument("--output-dir", type=Path, help="directory for summary.csv and, with --kernel-profile, "
+                        "profile.csv (default: reports/batch-get/<timestamp>-<backend>-d<device>)")
+    parser.add_argument("--kernel-profile-clock-mhz", type=int,
+                        default=environment_int("KVAF_BATCH_GET_PERF_KERNEL_PROFILE_CLOCK_MHZ",
+                            environment_int("KVAF_RUNTIME_PERF_KERNEL_PROFILE_CLOCK_MHZ", 1000)),
+                        help="AIV clock for converting cycles to time; unused by AICPU")
+    parser.add_argument("--build-dir", type=Path,
+                        help="build directory containing python/kvaf and, for AIV/UBMEM, bin/*.o")
+    parser.add_argument("--device-id", type=int, default=environment_int("DEVICE_ID", 0))
+    parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28999"))
+    parser.add_argument("--execution", choices=("eager", "graph", "both"), default="eager")
+    parser.add_argument("--graph", dest="execution", action="store_const", const="graph",
+                        help="shorthand for --execution graph")
+    parser.add_argument("--graph-api", choices=("acl", "torch"), default="torch")
+    parser.add_argument("--graph-replays", type=int, default=5,
+                        help="correctness replays with changing inputs before graph timing")
+    parser.add_argument("--multi-graph-check", action="store_true",
+                        help="validate node reports, automatic scopes and caller-serialized graph/eager reuse on two streams")
+    parser.add_argument("--run", action="store_true", default=os.environ.get("KVAF_RUN_NPU_TESTS") == "1",
+                        help="enable a hardware run; selecting --backend also enables it")
+    parser.add_argument("--get-timing", choices=("async-drain", "sync-call"), default="async-drain",
+                        help="eager: submit+drain (default) or one synchronous call")
+    add_execution_metadata(parser)
     parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
+    configure_backend_help(parser, argv)
     args = parser.parse_args(argv)
-    if args.miss_count is None:
-        args.miss_count = args.request_length
-    args.adaptive_ub_miss_count = environment_int(
-        "KVAF_ADAPTIVE_UB_MISS_COUNT", DEFAULT_ADAPTIVE_UB_MISS_COUNT
-    )
+    resolve_backend(args, parser)
     return args
 
 
 def validate_args(args: argparse.Namespace) -> str | None:
-    if args.transport == "ubmem" and (args.adaptive_ub_device or args.peer_ub_device):
-        return "adaptive-ub-device and peer-ub-device apply only to URMA"
-    if args.ubmem_profile_detail and (args.transport != "ubmem" or not args.kernel_profile):
-        return "ubmem-profile-detail requires --transport ubmem and --kernel-profile"
-    block_bytes = args.token_bytes * args.tokens_per_block
-    ddr_bytes = args.table_capacity * block_bytes
-    if args.request_length <= 0 or args.request_length > MAX_INT32:
-        return "request-length must be in [1, INT32_MAX]"
-    if args.table_capacity <= 0 or args.table_capacity > MAX_INT32:
-        return "table-capacity must be in [1, INT32_MAX]"
-    if args.tokens_per_block <= 0 or args.tokens_per_block > MAX_INT32:
-        return "tokens-per-block must be in [1, INT32_MAX]"
-    if args.token_bytes <= 0 or args.token_bytes > MAX_INT32:
-        return "token-bytes must be in [1, INT32_MAX]"
-    if (args.tokens_per_block - 1) * args.token_bytes > MAX_INT32:
-        return "the largest per-block token offset must fit int32"
-    if block_bytes <= 0 or ddr_bytes > MAX_UINT64:
-        return "configured table size must fit uint64"
-    if args.miss_count < 0 or args.miss_count > args.request_length:
-        return "miss-count must be between zero and request-length"
-    if args.adaptive_ub_device and args.miss_count == 0:
-        return "adaptive UB device tuning requires a positive miss-count"
-    if args.adaptive_ub_device and (
-        args.adaptive_ub_miss_count <= 0 or args.adaptive_ub_miss_count > MAX_INT32
-    ):
-        return "KVAF_ADAPTIVE_UB_MISS_COUNT must be in [1, INT32_MAX]"
-    if args.adaptive_ub_device and args.peer_ub_device:
-        return "adaptive-ub-device and peer-ub-device are mutually exclusive"
-    if args.adaptive_calibration_only and not args.adaptive_ub_device:
-        return "adaptive-calibration-only requires adaptive-ub-device"
-    if args.adaptive_ub_device and (
-        any(not device for device in args.adaptive_peer_ub_devices)
-        or len(set(args.adaptive_peer_ub_devices))
-        != len(args.adaptive_peer_ub_devices)
-    ):
-        return "KVAF_ADAPTIVE_UB_DEVICES must contain unique non-empty names"
-    if args.aiv_cores <= 0 or args.aiv_cores > 48:
-        return "aiv-cores must be in [1, 48]"
-    if len(args.npu_eids) > args.aiv_cores * args.jettys_per_core:
-        return "npu-eids count must not exceed aiv-cores * jettys-per-core"
-    if not 0 <= args.max_inflight_total <= 0xFFFFFFFF:
-        return "max-inflight-total must fit uint32"
-    if args.max_inflight_total and args.max_inflight_total < 2 * args.aiv_cores:
-        return "max-inflight-total must be zero or at least twice aiv-cores"
-    if args.warmup < 0:
-        return "warmup must be non-negative"
+    error = validate_workload(args)
+    if error:
+        return error
+    if args.device_id < 0:
+        return "device-id must be non-negative"
+    if args.graph_replays <= 0:
+        return "graph-replays must be positive"
+    if args.multi_graph_check and (args.execution == "eager" or args.miss_count <= 0):
+        return "multi-graph-check requires graph or both execution and a positive miss-count"
     if args.iterations <= 0:
         return "iterations must be positive"
-    if args.populate_chunk_entries <= 0:
-        return "populate-chunk-entries must be positive"
-    if args.kernel_profile_clock_mhz <= 0:
+    if args.contention_control_dir is None and not uses_aicpu(args) and args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
     if args.contention_control_dir is not None:
-        if args.contention_result is None or args.contention_graph_calls <= 0 or args.miss_count <= 0:
-            return "contention mode requires a result path, positive graph calls and positive miss-count"
+        if args.output_dir is not None:
+            return "--output-dir is for single-card benchmarks, not contention workers"
+        if args.contention_graph_calls <= 0:
+            return "contention-graph-calls must be positive"
+        if args.execution != "eager":
+            return "contention worker uses its own graph execution; omit --execution"
+        if args.contention_result is None or args.miss_count <= 0:
+            return "contention mode requires a result path and positive miss-count"
         if args.kernel_profile:
-            return "contention mode measures graph throughput and requires --no-kernel-profile"
+            return "contention mode measures sustained graph throughput without device profiling"
     return None
 
 
-def percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
-    position = fraction * (len(ordered) - 1)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+def runtime_options(args):
+    return dict(
+        batch_get_token_bytes=args.token_bytes, batch_get_tokens_per_block=args.tokens_per_block,
+        device_id=args.device_id, npu_eids=args.npu_eids, peer_ub_device=args.peer_ub_device,
+    )
+
+
+def device_profile_ms(profiles, clock_mhz):
+    if not profiles:
+        raise AssertionError("missing BatchGet device timestamps")
+    nanoseconds = "device_start_ns" in profiles[0]
+    begin, end = (("device_start_ns", "device_finish_ns") if nanoseconds else
+                  ("kernel_start_cycle", "kernel_finish_cycle"))
+    starts, finishes = [], []
+    for p in profiles:
+        if ("device_start_ns" in p) != nanoseconds:
+            raise AssertionError("cannot mix AICPU nanoseconds with AIV cycles")
+        start, finish = int(p[begin]), int(p[end])
+        if start <= 0 or finish < start:
+            raise AssertionError("invalid BatchGet device timeline")
+        starts.append(start)
+        finishes.append(finish)
+    elapsed = max(finishes) - min(starts)
+    if elapsed <= 0:
+        raise AssertionError("empty BatchGet device timeline")
+    return elapsed / (1_000_000 if nanoseconds else clock_mhz * 1000)
+
+
+def format_fields(fields):
+    return " ".join(f"{name}={value}" for name, value in fields.items())
+
+
+def collect_profile_metrics(details, kind, name, metrics):
+    if details is not None:
+        details.extend((kind, name, metric, value) for metric, value in metrics.items())
+
+
+def print_profile_row(prefix, labels, metrics, details, kind, name):
+    print(f"{prefix} {format_fields(labels)} {format_fields(metrics)}")
+    collect_profile_metrics(details, kind, name, metrics)
+
+
+def print_aicpu_details(args, execution, samples, details=None):
+    fields = ("request_us", "descriptor_cache_us", "source_write_us", "notify_us", "read_us",
+              "read_setup_us", "wr_build_us", "ready_wait_us", "post_us", "cq_wait_us", "scatter_us", "ack_us")
+    if any("stages" not in worker for sample in samples for worker in sample):
+        raise AssertionError("missing detailed AICPU profiling; rebuild the matching Host/device package")
+    print(f"BATCH_GET_PROFILE_CONTRACT backend={args.backend} execution={execution} "
+          "aggregation=per_sample_worker_max stages_overlap=1 profiling_overhead_included=1")
+    for field in fields:
+        values = [max(float(worker["stages"][field]) for worker in sample) for sample in samples]
+        stage = field[:-3]
+        metrics = dict(mean_us=f"{statistics.mean(values):.6f}", p50_us=f"{percentile(values, .5):.6f}",
+                       p99_us=f"{percentile(values, .99):.6f}")
+        print_profile_row("BATCH_GET_PROFILE", dict(backend=args.backend, execution=execution, stage=stage),
+                          metrics, details, "stage", stage)
+    for worker in range(args.parallelism):
+        metrics = {f"{field}_mean": f"{statistics.mean(float(sample[worker]['stages'][field]) for sample in samples):.6f}"
+                   for field in fields}
+        print_profile_row("BATCH_GET_PROFILE_WORKER", dict(backend=args.backend, execution=execution, worker=worker),
+                          metrics, details, "worker", worker)
+
+
+def print_measurements(args, execution, samples, profiles, report=None):
+    """Keep end-to-end and operator wall time distinct; count payload once."""
+    scopes = [("end_to_end", samples, "host_perf_counter")]
+    if len(profiles) != len(samples) or any(len(p) != args.parallelism for p in profiles):
+        raise AssertionError("BatchGet profile sample/worker count mismatch")
+    scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
+                   "device_ns" if uses_aicpu(args) else "device_cycles"))
+    payload = args.miss_count * args.token_bytes
+    measurements = {}
+    timing = args.get_timing if execution == "eager" else "graph-replay-wait"
+    for scope, durations, source in scopes:
+        mean = statistics.mean(durations)
+        if mean <= 0:
+            raise AssertionError("nonpositive BatchGet timing")
+        p50, p90, p99 = (percentile(durations, q) for q in (.5, .9, .99))
+        metrics = dict(mean_us=f"{mean * 1000:.6f}", p50_us=f"{p50 * 1000:.6f}",
+                       p90_us=f"{p90 * 1000:.6f}", p99_us=f"{p99 * 1000:.6f}",
+                       mean_GBps=f"{payload / mean / 1e6:.6f}", p50_GBps=f"{payload / p50 / 1e6:.6f}",
+                       p99_GBps=f"{payload / p99 / 1e6:.6f}", mean_GiBps=f"{payload / (mean / 1000) / 1024**3:.6f}")
+        measurements["e2e" if scope == "end_to_end" else scope] = metrics
+        cleanup_excluded = scope == "kernel" or execution == "graph"
+        print(
+            f"BATCH_GET_RESULT backend={args.backend} execution={execution} "
+            f"execution_mode={args.execution_mode} scope={scope} "
+            f"get_timing={timing} completion_cleanup_excluded={int(cleanup_excluded)} "
+            f"samples={len(durations)} table_capacity={args.table_capacity} "
+            f"request_length={args.request_length} miss_count={args.miss_count} "
+            f"token_bytes={args.token_bytes} payload_bytes_per_call={payload} workers={args.parallelism} "
+            f"{format_fields(metrics)} "
+            f"timing_source={source} profiling_enabled=1 detail_output_enabled={int(args.kernel_profile)} "
+            "input_updates_and_validation_excluded=1 profile_readback_excluded=1",
+            flush=True,
+        )
+    if report is not None:
+        report.add_summary(execution, measurements)
+    if args.kernel_profile:
+        details = [] if report is not None and report.profile_path is not None else None
+        if uses_aicpu(args):
+            print_aicpu_details(args, execution, profiles, details)
+        else:
+            print_kernel_profile(profiles, args.warmup, args.kernel_profile_clock_mhz, args.parallelism,
+                                 args.jettys_per_core, args.request_length, args.miss_count,
+                                 args.token_bytes, args.transport, details)
+        if details is not None:
+            report.add_profile(execution, details)
+
+
+def check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
+                         miss_count, output, check_output, execution, stream):
+    execution.drain_get(runtime)
+    execution.release_output(runtime)
+    inputs = [GraphInputs(make_plan, torch.empty_like(miss_count), torch.empty_like(output), stream)
+              for _ in range(3)]
+    aicpu = uses_aicpu(args)
+    unreplayed_error = ("Gather graph has not been replayed" if args.backend == "gather_read" else
+                        "Scatter graph has not replayed; replay or discard it")
+
+    def expect_value_error(operation, expected, label):
+        try:
+            operation()
+        except ValueError as error:
+            if str(error) != expected:
+                raise
+        else:
+            raise AssertionError(f"{label} accepted an unreplayed graph")
+
+    def node(inp):
+        def submit(options):
+            runtime.batch_get(device_table, inp.fixed[0], inp.fixed[1], inp.miss_count,
+                              inp.fixed[2], inp.output, stream=stream, **options)
+        return inp.output, submit
+
+    def check(indices, leases, counts):
+        snapshots = {}
+        for i, lease, count in zip(indices, leases, counts):
+            if aicpu:
+                runtime.check_batch_get_status(stream, graph_lease=lease)
+            check_output(inputs[i].fixed, count, result=inputs[i].output)
+            if args.kernel_profile and (count or aicpu):
+                profiles = runtime.batch_get_kernel_profile(graph_lease=lease)
+                if len(profiles) != args.parallelism:
+                    raise AssertionError("multi-graph profile worker count mismatch")
+                if aicpu:
+                    if [int(p["core"]) for p in profiles] != list(range(args.parallelism)):
+                        raise AssertionError("multi-graph profile worker identity mismatch")
+                    # Gather partitions requests evenly; Scatter uses cache-line groups.
+                    # Both report the node's total prefix length across all workers.
+                    if sum(int(p["active_requests"]) for p in profiles) != count:
+                        raise AssertionError(f"graph node {i} profile request count mismatch")
+                    for p in profiles:
+                        stages = p["stages"]
+                        if (int(stages["worker"]) != int(p["core"]) or
+                                int(stages["spans"]) != int(p["active_requests"]) or
+                                int(stages["bytes"]) != int(stages["spans"]) * args.token_bytes):
+                            raise AssertionError(f"graph node {i} profile worker counters mismatch")
+                    device_profile_ms(profiles, args.kernel_profile_clock_mhz)
+                    snapshots[i] = deepcopy(profiles)
+        if aicpu and args.kernel_profile:
+            timelines = [tuple((int(p["device_start_ns"]), int(p["device_finish_ns"]))
+                               for p in profiles) for profiles in snapshots.values()]
+            if len(set(timelines)) != len(timelines):
+                raise AssertionError("different graph nodes returned the same profile timeline")
+        return snapshots
+
+    full = args.miss_count
+    partial = full // 2
+    # Capture the graph that must survive first, then give the two-node graph
+    # its own scope so it can be destroyed without disturbing the survivor.
+    for inp in inputs:
+        inp.prepare(full)
+    with captured_get_nodes(args, runtime, torch, kvaf, execution, stream, [node(inputs[2])]) as (b, bl):
+        with captured_get_nodes(args, runtime, torch, kvaf, execution, stream,
+                                [node(inputs[0]), node(inputs[1])]) as (a, al):
+            if aicpu:
+                # A's captured nodes must remain unreplayed even when the sibling
+                # graph advances the algorithm's shared device ticket counter.
+                b.replay()
+                b.synchronize()
+                check((2,), bl, (full,))
+                for lease in al:
+                    expect_value_error(
+                        lambda: runtime.check_batch_get_status(stream, graph_lease=lease),
+                        unreplayed_error, "graph status")
+                    if args.kernel_profile:
+                        expect_value_error(
+                            lambda: runtime.batch_get_kernel_profile(graph_lease=lease),
+                            "no completed AICPU kernel profile", "graph profile")
+            for i, count in enumerate((full, partial, full)):
+                inputs[i].prepare(count)
+            a.replay()
+            b.replay()
+            a.replay()
+            a.synchronize()
+            check((0, 1, 2), al + bl, (full, partial, full))
+            for i, count in enumerate((0, full, partial)):
+                inputs[i].prepare(count)
+            b.replay()
+            a.replay()
+            a.synchronize()
+            before = check((0, 1, 2), al + bl, (0, full, partial))
+            if aicpu:
+                inputs[0].prepare(partial)
+                inputs[1].prepare(full)
+                a.replay()
+                a.synchronize()
+                after = check((0, 1, 2), al + bl, (partial, full, partial))
+                if args.kernel_profile and after[2] != before[2]:
+                    raise AssertionError("replaying graph A overwrote graph B's profile")
+            a.validated = True
+        if aicpu:
+            # Use a throwaway capture for the nondiscard end check: the helper
+            # destroys it before EndGetGraph(false), leaving A's replay tests intact.
+            unreplayed_leases = []
+
+            def end_unreplayed_graph():
+                with captured_get_nodes(args, runtime, torch, kvaf, execution, stream,
+                                        [node(inputs[0])]) as (unreplayed, leases):
+                    unreplayed_leases.extend(leases)
+                    b.replay()
+                    b.synchronize()
+                    # Select the helper's nondiscard end path deliberately.
+                    unreplayed.validated = True
+
+            expect_value_error(end_unreplayed_graph, unreplayed_error, "nondiscard graph end")
+            # Rejected nondiscard end retains the lease; the graph is already destroyed.
+            runtime.end_get_graph(unreplayed_leases[0], stream, discard_result=True)
+        inputs[2].prepare(full)
+        b.replay()
+        b.synchronize()
+        check((2,), bl, (full,))
+        b.validated = True
+    print(f"BATCH_GET_MULTI_GRAPH_PASS backend={args.backend} api={args.graph_api} "
+          f"graphs={3 if aicpu else 2} max_live_graphs=2 max_nodes_per_graph=2 "
+          f"shared_stream=1 survivor_replayed=1 unreplayed_end_checked={int(aicpu)} "
+          f"profile_isolation_checked={int(aicpu and args.kernel_profile)}", flush=True)
+
+
+def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
+                         miss_count, output, check_output, execution=None, report=None):
+    execution = execution or BenchmarkExecution(
+        kvaf, transport=args.transport,
+        executor="aicpu" if uses_aicpu(args) else "aiv",
+        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
+        get_capacity=args.request_length,
+    )
+    stream = torch.npu.current_stream()
+    if args.multi_graph_check:
+        check_multiple_graphs(args, runtime, torch, kvaf, make_plan, device_table,
+                              miss_count, output, check_output, execution, stream)
+        check_graph_resource_scopes(args, runtime, torch, kvaf, make_plan, device_table,
+                                    miss_count, output, check_output, execution, stream)
+    inputs = GraphInputs(make_plan, miss_count, output, stream)
+
+    def submit(options):
+        runtime.batch_get(device_table, inputs.fixed[0], inputs.fixed[1], miss_count,
+                          inputs.fixed[2], output, stream=stream, **options)
+
+    def check(plan, count, lease=0):
+        if uses_aicpu(args):
+            runtime.check_batch_get_status(stream, graph_lease=lease)
+        check_output(plan, count)
+
+    inputs.prepare(args.miss_count)
+    submit(execution.get_kwargs)  # Prepare fixed output/state before capture.
+    execution.complete_async_get(runtime)
+    check(inputs.fixed, args.miss_count)
+    with captured_get(args, runtime, torch, kvaf, execution, output, stream, submit) as graph:
+        def check_captured(plan, count):
+            check(plan, count, graph.leases[0])
+
+        validate_graph_inputs(graph, inputs, check_captured, args.miss_count, args.graph_replays)
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+        start_event.record(stream)
+        end_event.record(stream)
+        end_event.synchronize()
+        for iteration in range(args.warmup):
+            inputs.prepare(args.miss_count)
+            graph.replay()
+            graph.synchronize()
+            check_captured(inputs.fixed, args.miss_count)
+        durations, profiles = [], []
+        for iteration in range(args.iterations):
+            inputs.prepare(args.miss_count)
+            start_event.record(stream)
+            graph.replay()
+            end_event.record(stream)
+            end_event.synchronize()
+            durations.append(float(start_event.elapsed_time(end_event)))
+            check_captured(inputs.fixed, args.miss_count)
+            profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
+        graph.validated = True
+        print_measurements(args, "graph", durations, profiles, report)
+        print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
+              "mutable_inputs=1 partial_and_empty_prefixes=1 verification=every_replay_full_output", flush=True)
+
+
+def check_graph_resource_scopes(args, runtime, torch, kvaf, make_plan, device_table,
+                                miss_count, output, check_output, execution, stream):
+    """Serial graph/eager reuse on distinct streams, including a shared output MR."""
+    execution.drain_get(runtime)
+    execution.release_output(runtime)
+    stream.synchronize()
+    other_stream = torch.npu.Stream()
+    inp = GraphInputs(make_plan, torch.empty_like(miss_count), torch.empty_like(output), stream)
+    inp.prepare(args.miss_count)
+
+    def submit_on(target):
+        def submit(options):
+            runtime.batch_get(device_table, inp.fixed[0], inp.fixed[1], inp.miss_count,
+                              inp.fixed[2], inp.output, stream=target, **options)
+        return submit
+
+    def check():
+        check_output(inp.fixed, args.miss_count, result=inp.output)
+
+    def replay_checked(graph):
+        # Torch replay uses the caller's current stream. Selecting it here is
+        # part of this cross-stream correctness check, outside performance timing.
+        with torch.npu.stream(graph.stream):
+            graph.replay()
+        graph.synchronize()
+        check()
+
+    submit = submit_on(stream)
+    other_submit = submit_on(other_stream)
+    with captured_get_resources(args, runtime, torch, kvaf, execution, stream,
+                                [submit, submit]) as (first, first_resources):
+        if len(first_resources.leases) != 2 or len(set(first_resources.leases)) != 2:
+            raise AssertionError("repeated output must still produce two graph nodes")
+        # Preparing the second graph runs real eager Gets while the first lives.
+        with captured_get_resources(args, runtime, torch, kvaf, execution, other_stream,
+                                    [other_submit]) as (second, second_resources):
+            if len(second_resources.leases) != 1:
+                raise AssertionError("one warmup call must produce one graph node")
+            for graph in (second, first):
+                replay_checked(graph)  # Caller owns ordering across streams.
+            snapshots = None
+            if uses_aicpu(args) and args.kernel_profile:
+                snapshots = [deepcopy(runtime.batch_get_kernel_profile(graph_lease=lease))
+                             for lease in first_resources.leases]
+            inp.output.zero_()
+            stream.synchronize()
+            other_submit(execution.get_kwargs)
+            runtime.drain_get()
+            check()
+            if snapshots is not None:
+                for lease, snapshot in zip(first_resources.leases, snapshots):
+                    if runtime.batch_get_kernel_profile(graph_lease=lease) != snapshot:
+                        raise AssertionError("eager Get overwrote a captured node report")
+            replay_checked(first)
+            second.validated = True
+        # Retiring one graph must retain the other graph's shared registration.
+        replay_checked(first)
+        first.validated = True
+    submit(execution.get_kwargs)
+    runtime.drain_get()
+    check()
+    print(f"BATCH_GET_GRAPH_RESOURCES_PASS backend={args.backend} api={args.graph_api} "
+          "automatic_nodes=1 streams=2 caller_serialized=1 shared_output=1 "
+          "graph_eager_interleave=1 survivor_replayed=1", flush=True)
 
 
 def sort_request_plan_prefix(
@@ -402,10 +532,12 @@ def print_samples(
     request_length: int,
     miss_count: int,
     token_bytes: int,
+    *, execution_mode: str = "unified",
 ) -> None:
     mean_ms = statistics.mean(samples)
     result = (
         "PERF_RESULT "
+        f"execution_mode={execution_mode} "
         f"operation={operation} samples={len(samples)} warmup_excluded={warmup} "
         f"request_length={request_length} miss_count={miss_count} "
         f"mean_ms={mean_ms:.3f} "
@@ -427,9 +559,18 @@ def print_samples(
     print(result)
 
 
+def kernel_stage_metrics(milliseconds, cycles, precision):
+    metrics = {}
+    for unit, samples, digits in (("ms", milliseconds, precision), ("cycles", cycles, 3)):
+        metrics[f"mean_{unit}"] = f"{statistics.mean(samples):.{digits}f}"
+        for q in (50, 90, 99):
+            metrics[f"p{q}_{unit}"] = f"{percentile(samples, q / 100):.{digits}f}"
+    return metrics
+
+
 def print_ubmem_kernel_profile(
     samples: list[list[dict[str, object]]], warmup: int, clock_mhz: int,
-    miss_count: int, token_bytes: int,
+    miss_count: int, token_bytes: int, details=None,
 ) -> None:
     # Take every stage from the same slowest core in each sample. Independent
     # stage maxima can come from different cores and would not sum to total.
@@ -477,24 +618,15 @@ def print_ubmem_kernel_profile(
         )
     for stage, cycles in stages.items():
         milliseconds = [value / clock_mhz / 1000.0 for value in cycles]
-        result = (
-            f"PERF_RESULT operation=batch_get_{stage} "
-            f"samples={len(samples)} warmup_excluded={warmup} "
-            f"mean_ms={statistics.mean(milliseconds):.6f} "
-            f"p50_ms={percentile(milliseconds, 0.50):.6f} "
-            f"p90_ms={percentile(milliseconds, 0.90):.6f} "
-            f"p99_ms={percentile(milliseconds, 0.99):.6f} "
-            f"mean_cycles={statistics.mean(cycles):.3f} "
-            f"p50_cycles={percentile(cycles, 0.50):.3f} "
-            f"p90_cycles={percentile(cycles, 0.90):.3f} "
-            f"p99_cycles={percentile(cycles, 0.99):.3f} "
-            f"detail={int(detailed)} transport=ubmem"
-        )
+        metrics = kernel_stage_metrics(milliseconds, cycles, 6)
+        fields = dict(metrics, detail=int(detailed), transport="ubmem")
         if stage == "kernel_total":
             useful_bytes = len(samples) * miss_count * token_bytes
             gibps = useful_bytes / (1024.0**3) / (sum(milliseconds) / 1000.0)
-            result += f" useful_GiBps={gibps:.3f}"
-        print(result)
+            metrics["useful_GiBps"] = fields["useful_GiBps"] = f"{gibps:.3f}"
+        print(f"PERF_RESULT operation=batch_get_{stage} samples={len(samples)} warmup_excluded={warmup} "
+              f"{format_fields(fields)}")
+        collect_profile_metrics(details, "stage", stage, metrics)
 
 
 def print_kernel_profile(
@@ -507,12 +639,13 @@ def print_kernel_profile(
     miss_count: int,
     token_bytes: int,
     transport: str = "urma",
+    details=None,
 ) -> None:
     if not samples or any(len(sample) != npu_core_count for sample in samples):
         raise AssertionError("BatchGet kernel profile sample/core count mismatch")
 
     if transport == "ubmem":
-        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes)
+        print_ubmem_kernel_profile(samples, warmup, clock_mhz, miss_count, token_bytes, details)
         return
 
     def elapsed_ms(profile: dict[str, object], begin: str, end: str) -> float:
@@ -639,36 +772,20 @@ def print_kernel_profile(
     total_useful_bytes = len(samples) * miss_count * token_bytes
     for stage, values in stage_samples.items():
         cycle_values = [value * clock_mhz * 1000.0 for value in values]
-        useful_gibps = ""
+        metrics = kernel_stage_metrics(values, cycle_values, 3)
+        fields = dict(metrics, units=f"{request_length}_requests_per_call")
         if stage == "kernel_total":
-            useful_gibps = (
-                " useful_GiBps="
+            metrics["useful_GiBps"] = fields["useful_GiBps"] = (
                 f"{total_useful_bytes / (1024.0**3) / (sum(values) / 1000.0):.3f}"
             )
-        print(
-            "PERF_RESULT "
-            f"operation=batch_get_{stage} samples={len(values)} "
-            f"warmup_excluded={warmup} "
-            f"mean_ms={statistics.mean(values):.3f} "
-            f"p50_ms={percentile(values, 0.50):.3f} "
-            f"p90_ms={percentile(values, 0.90):.3f} "
-            f"p99_ms={percentile(values, 0.99):.3f} "
-            f"mean_cycles={statistics.mean(cycle_values):.3f} "
-            f"p50_cycles={percentile(cycle_values, 0.50):.3f} "
-            f"p90_cycles={percentile(cycle_values, 0.90):.3f} "
-            f"p99_cycles={percentile(cycle_values, 0.99):.3f} "
-            f"units={request_length}_requests_per_call{useful_gibps}"
-        )
+        print(f"PERF_RESULT operation=batch_get_{stage} samples={len(values)} warmup_excluded={warmup} "
+              f"{format_fields(fields)}")
+        collect_profile_metrics(details, "stage", stage, metrics)
     divisor = float(len(samples))
     for core, accumulator in enumerate(per_core):
-        print(
-            "KERNEL_PROFILE_CORE "
-            f"core={core} samples={len(samples)} "
-            + " ".join(
-                f"{name}_mean={value / divisor:.6f}"
-                for name, value in accumulator.items()
-            )
-        )
+        metrics = {f"{name}_mean": f"{value / divisor:.6f}" for name, value in accumulator.items()}
+        print_profile_row("KERNEL_PROFILE_CORE", dict(core=core, samples=len(samples)),
+                          metrics, details, "core", core)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -684,60 +801,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     backend = detect_torch_backend()
     if backend.name != "npu":
         print(
-            "SKIP: NPU benchmark requires torch_npu; "
+            ("FAIL: " if args.backend_explicit else "SKIP: ") + "NPU benchmark requires torch_npu; "
             f"detected {backend.name} ({backend.reason})."
         )
-        return 0
+        return 2 if args.backend_explicit else 0
+    if args.build_dir is not None:
+        sys.path.insert(0, str(args.build_dir.resolve() / "python"))
     import kvaf
 
     if not hasattr(kvaf, "NpuRuntime"):
         print(
-            "SKIP: rebuild KVAF with KVAF_ENABLE_AIV_BATCH_GET=ON "
-            "and KVAF_BUILD_PYTHON=ON."
+            "FAIL: rebuild KVAF with the selected NPU backend and Python bindings."
         )
-        return 0
-    if args.kernel_profile and not all(
+        return 2
+    if args.contention_control_dir is None and not all(
         hasattr(kvaf.NpuRuntime, method)
-        for method in (
-            "start_batch_get_kernel_profile",
-            "batch_get_kernel_profile",
-            "stop_batch_get_kernel_profile",
-        )
+        for method in ("start_batch_get_kernel_profile", "stop_batch_get_kernel_profile", "batch_get_kernel_profile")
     ):
         print(
             "FAIL: the loaded KVAF binding does not expose BatchGet kernel profiling",
             file=sys.stderr,
         )
         return 2
-    if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
-        print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the A5/CANN target")
+    if not (args.run or args.backend_explicit):
+        print("SKIP: select --backend or pass --run on the A5/CANN target")
         return 0
 
-    kernel = Path(
+    build_dir = args.build_dir or Path(__file__).resolve().parents[2] / "build-npu"
+    kernel = (build_dir / "bin/kvaf_execute_batch_get_kernels.o" if args.build_dir is not None else Path(
         os.environ.get(
             "KVAF_BATCH_GET_KERNEL",
-            os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", ""),
+            os.environ.get("KVAF_AIV_BATCH_GET_KERNEL", str(build_dir / "bin/kvaf_execute_batch_get_kernels.o")),
         )
-    )
-    if not kernel.is_file():
+    ))
+    if not uses_aicpu(args) and not kernel.is_file():
         print(
             "FAIL: KVAF_BATCH_GET_KERNEL must name the built kernel object",
             file=sys.stderr,
         )
         return 2
-    batch_put_kernel = Path(
+    batch_put_kernel = (build_dir / "bin/kvaf_execute_batch_put_kernels.o" if args.build_dir is not None else Path(
         os.environ.get(
             "KVAF_BATCH_PUT_KERNEL",
             str(kernel.with_name("kvaf_execute_batch_put_kernels.o")),
         )
-    )
-    if not batch_put_kernel.is_file():
+    ))
+    if not uses_aicpu(args) and not batch_put_kernel.is_file():
         print(
             "FAIL: KVAF_BATCH_PUT_KERNEL must name the built BatchPut kernel object",
             file=sys.stderr,
         )
         return 2
-    remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
+    remote_cpu_service = args.peer
     if not remote_cpu_service:
         print(
             "FAIL: KVAF_CPU_SERVICE_ADDR must name the separately running CPU service",
@@ -747,7 +862,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     torch = backend.torch
     assert torch is not None
-    device_id = int(os.environ.get("DEVICE_ID", "0"))
+    torch.npu.set_device(args.device_id)
+    report = BatchGetCsv(args) if args.contention_control_dir is None else None
+    if args.execution != "eager" or args.contention_control_dir is not None:
+        with torch.npu.stream(torch.npu.Stream(device=args.device_id)):
+            result = run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report)
+    else:
+        result = run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report)
+    if result == 0 and report is not None:
+        try:
+            report.write()
+        except OSError as error:
+            print(f"FAIL: could not write BatchGet CSV: {error}", file=sys.stderr)
+            return 1
+    return result
+
+
+def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, report=None):
+    device_id = args.device_id
     request_length = args.request_length
     token_bytes = args.token_bytes
     tokens_per_block = args.tokens_per_block
@@ -761,74 +893,69 @@ def main(argv: Sequence[str] | None = None) -> int:
     torch.manual_seed(args.seed)
     device = f"npu:{device_id}"
 
-    runtime = kvaf.NpuRuntime(
-        str(kernel),
-        batch_get_token_bytes=token_bytes,
-        batch_get_tokens_per_block=tokens_per_block,
-        device_id=device_id,
-        npu_core_count=args.aiv_cores,
-        batch_put_kernel_object_path=str(batch_put_kernel),
-        jettys_per_core=args.jettys_per_core,
-        batch_get_max_inflight_total=args.max_inflight_total,
-        npu_eids=args.npu_eids,
-        adaptive_ub_device=args.adaptive_ub_device,
-        adaptive_ub_miss_count=args.adaptive_ub_miss_count,
-        peer_ub_device=args.peer_ub_device,
-        adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
-        transport=args.transport,
+    execution = BenchmarkExecution(
+        kvaf, transport=args.transport,
+        executor="aicpu" if uses_aicpu(args) else "aiv",
+        algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
+        put_capacity=min(args.populate_chunk_entries, table_capacity),
+        get_capacity=request_length, get_cores=args.parallelism or 0, get_jettys=args.jettys_per_core or 0,
+        put_cores=0 if args.backend == "aiv" else args.parallelism,
+        get_kernel="" if uses_aicpu(args) else str(kernel),
+        put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
+        max_inflight_total=args.max_inflight_total,
     )
+    runtime = kvaf.NpuRuntime(
+        **runtime_options(args),
+        **execution.runtime_kwargs)
     runtime.link_to(remote_cpu_service)
     table = None
     device_table = None
     kernel_profile_started = False
     try:
+        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
+        runtime.initialize(ddr_bytes, block_bytes)
+        print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
+        if args.backend == "aiv":
+            resources = runtime.get_execution_resources(execution.get_config)
+            args.parallelism = args.aiv_cores = resources.cores
+            args.jettys_per_core = resources.jettys
+            error = validate_workload(args)
+            if error:
+                raise ValueError(error)
+            if report is not None:
+                report.config.update(aiv_cores=resources.cores, jettys_per_core=resources.jettys)
+        timing = {
+            "sync-call": "synchronous_batch_get",
+            "async-drain": "async_submit_to_drain",
+        }[args.get_timing]
         print(
             "BATCH_GET_PERF_CONFIG "
+            f"execution_mode={args.execution_mode} "
+            f"backend={args.backend} execution={args.execution} "
             f"request_length={request_length} table_capacity={table_capacity} "
             f"tokens_per_block={tokens_per_block} token_bytes={token_bytes} "
             f"block_bytes={block_bytes} miss_count={miss_count_value} "
             f"source_access_pattern={args.source_access_pattern} "
             f"output_access_pattern={args.output_access_pattern} "
-            f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} transport={args.transport} "
+            f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} aicpu_workers={args.aicpu_workers} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
-            f"adaptive_ub_device={int(args.adaptive_ub_device)} "
-            f"adaptive_ub_miss_count={args.adaptive_ub_miss_count} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
             f"iterations={args.iterations} seed={args.seed} "
             f"sort_input_indices={int(args.sort_input_indices)} "
             f"kernel_profile={int(args.kernel_profile)} "
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
-            "timing=call_to_stream_completion"
+            f"get_timing={args.get_timing} timing={timing}"
         )
 
-        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
-        runtime.initialize(ddr_bytes, block_bytes)
-        print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
-        if args.adaptive_calibration_only:
-            print("BATCH_GET_PERF_ADAPTIVE_CALIBRATION_DONE")
-            return 0
-
-        # Every table entry contains the same deterministic token pattern. Reusing
-        # a bounded source Tensor keeps setup memory independent of table capacity;
-        # each BatchPut still allocates a distinct remote entry for every key.
-        token_rows = torch.arange(
-            tokens_per_block, dtype=torch.int64, device=device
-        ).unsqueeze(1)
+        # Distinct global token IDs expose wrong-block reads and stale staging.
+        # Populate in bounded chunks even when the table is much larger than HBM.
         token_byte_indices = torch.arange(
             token_bytes, dtype=torch.int64, device=device
         ).unsqueeze(0)
-        entry_pattern = (
-            (
-                (token_rows * 131 + token_byte_indices * 17 + (token_byte_indices >> 3))
-                & 0xFF
-            )
-            .to(torch.uint8)
-            .contiguous()
-        )
         populate_entries = min(args.populate_chunk_entries, table_capacity)
-        populate_source = entry_pattern.reshape(1, block_bytes).repeat(populate_entries, 1)
+        populate_source = torch.empty((populate_entries, block_bytes), dtype=torch.uint8, device=device)
         populate_offsets = [row * block_bytes for row in range(populate_entries)]
         populate_lengths = [block_bytes] * populate_entries
         output = torch.empty(
@@ -840,12 +967,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         populated = 0
         while populated < table_capacity:
             count = min(populate_entries, table_capacity - populated)
+            token_ids = torch.arange(populated * tokens_per_block, (populated + count) * tokens_per_block,
+                                     dtype=torch.int64, device=device)
+            populate_source[:count].copy_(token_pattern(torch, token_ids, token_byte_indices).reshape(count, block_bytes))
             keys = build_dsa_keys(count, start=populated, q_capacity=table_capacity)
             runtime.batch_put(
                 keys,
                 populate_source[:count],
                 populate_offsets[:count],
                 populate_lengths[:count],
+                **execution.put_kwargs,
             )
             populated += count
         torch.npu.synchronize()
@@ -898,11 +1029,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             miss_count,
             preflight_output_indices,
             output,
+            **execution.get_kwargs,
         )
-        torch.npu.synchronize()
+        execution.complete_async_get(runtime)
         if miss_count_value > 0 and not torch.equal(
             output[:miss_count_value],
-            entry_pattern[preflight_token_slots[:miss_count_value]],
+            token_pattern(torch, preflight_token_ids[:miss_count_value], token_byte_indices),
         ):
             raise AssertionError("BatchGet preflight payload validation failed")
         if miss_count_value < request_length and bool(
@@ -970,29 +1102,55 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return indices, offsets, output_indices
 
+        def check_output(plan, count, full=True, *, result=output):
+            if not count:
+                if bool(torch.count_nonzero(result).item()):
+                    raise AssertionError("BatchGet modified output for an empty request")
+                return
+            ids = plan[0][:count].to(torch.int64) * tokens_per_block + plan[1][:count].to(torch.int64) // token_bytes
+            destinations = plan[2][:count].to(torch.int64)
+            pattern = token_pattern(torch, ids, token_byte_indices)
+            if full:
+                expected = torch.zeros_like(result)
+                if count:
+                    expected.index_copy_(0, destinations, pattern)
+                valid = torch.equal(result, expected)
+            else:
+                valid = torch.equal(result.index_select(0, destinations), pattern)
+            if not valid:
+                raise AssertionError(f"BatchGet output mismatch: backend={args.backend}, miss_count={count}")
+
         if args.contention_control_dir is not None:
-            from batch_get_multicard_perf import run_worker
+            from utils.multicard import run_worker
 
-            def submit(plan, stream):
-                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output, stream=stream)
+            def submit(plan, stream, options):
+                runtime.batch_get(device_table, plan[0], plan[1], miss_count, plan[2], output,
+                                  stream=stream, **options)
 
-            def check_output(plan):
-                slots = (plan[1][:miss_count_value] // token_bytes).to(torch.int64)
-                destinations = plan[2][:miss_count_value].to(torch.int64)
-                if not torch.equal(output.index_select(0, destinations), entry_pattern.index_select(0, slots)):
-                    raise AssertionError("contention graph replay payload validation failed")
+            def check(plan, lease):
+                if uses_aicpu(args):
+                    runtime.check_batch_get_status(torch.npu.current_stream(), graph_lease=lease)
+                check_output(plan, args.miss_count, full=False)
 
-            run_worker(kvaf, torch, args, create_request_plan, submit, check_output)
+            run_worker(kvaf, torch, args, runtime, execution, output,
+                       create_request_plan, submit, check)
             return 0
 
-        if args.kernel_profile:
-            if args.ubmem_profile_detail:
-                runtime.start_batch_get_kernel_profile(detailed=True)
-            else:
-                runtime.start_batch_get_kernel_profile()
-            kernel_profile_started = True
-            print("BATCH_GET_KERNEL_PROFILE_ENABLED units=cycles")
+        runtime.start_batch_get_kernel_profile(detailed=args.kernel_profile and args.backend == "ubmem")
+        kernel_profile_started = True
+        print("BATCH_GET_KERNEL_PROFILE_ENABLED units=" + ("ns" if uses_aicpu(args) else "cycles"))
 
+        print("BATCH_GET_TIMING_CONTRACT end_to_end=call_to_device_completion "
+              "kernel=first_worker_entry_to_last_worker_exit kernel_includes_cpu_and_network_waits=1 "
+              f"profile_overhead_included={int(kernel_profile_started)} detail_output_enabled={int(args.kernel_profile)} "
+              f"eager_get_timing={args.get_timing} "
+              "bandwidth=useful_payload_once")
+        if args.execution == "graph":
+            run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
+                                device_table, miss_count, output, check_output, execution, report)
+            return 0
+
+        execution.bind_output(runtime, output)
         print("BATCH_GET_PERF_PHASE_BEGIN phase=warmup")
         for _ in range(args.warmup):
             indices, offsets, output_indices = create_request_plan()
@@ -1004,10 +1162,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count,
                 output_indices,
                 output,
+                synchronize=args.get_timing == "sync-call",
+                **execution.get_kwargs,
             )
             # Keep caller-owned request Tensors alive through completion.
-            torch.npu.synchronize()
+            if args.get_timing == "sync-call":
+                torch.npu.synchronize()
+                execution.drain_get(runtime)
+            else:
+                execution.complete_async_get(runtime)
         print("BATCH_GET_PERF_PHASE_DONE phase=warmup " f"iterations={args.warmup}")
+        if uses_aicpu(args):
+            # Do not charge deferred warmup status D2H to the first sample.
+            runtime.check_batch_get_status(torch.npu.current_stream())
 
         print("BATCH_GET_PERF_PHASE_BEGIN phase=batch_get")
         submit_samples: list[float] = []
@@ -1016,6 +1183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         kernel_profile_samples: list[list[dict[str, object]]] = []
         for _ in range(args.iterations):
             indices, offsets, output_indices = create_request_plan()
+            output.zero_()
             # Request generation and Tensor work are deliberately excluded.
             torch.npu.synchronize()
 
@@ -1027,34 +1195,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 miss_count,
                 output_indices,
                 output,
+                synchronize=args.get_timing == "sync-call",
+                **execution.get_kwargs,
             )
             submitted = time.perf_counter()
-            torch.npu.synchronize()
-            completed = time.perf_counter()
-            submit_samples.append((submitted - begin) * 1000.0)
-            synchronize_samples.append((completed - submitted) * 1000.0)
+            if args.get_timing == "sync-call":
+                completed = submitted
+            else:
+                execution.complete_async_get(runtime)
+                completed = time.perf_counter()
+                submit_samples.append((submitted - begin) * 1000.0)
+                synchronize_samples.append((completed - submitted) * 1000.0)
             batch_get_samples.append((completed - begin) * 1000.0)
-            if args.kernel_profile:
-                kernel_profile_samples.append(
-                    list(runtime.batch_get_kernel_profile())
-                )
+            if uses_aicpu(args):
+                runtime.check_batch_get_status(torch.npu.current_stream())
+            check_output((indices, offsets, output_indices), miss_count_value)
+            kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
 
-        print_samples(
-            "batch_get_submit",
-            submit_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
-        )
-        print_samples(
-            "batch_get_synchronize",
-            synchronize_samples,
-            args.warmup,
-            request_length,
-            miss_count_value,
-            token_bytes,
-        )
+        if args.get_timing != "sync-call":
+            print_samples(
+                "batch_get_submit",
+                submit_samples,
+                args.warmup,
+                request_length,
+                miss_count_value,
+                token_bytes,
+                execution_mode=args.execution_mode,
+            )
+            print_samples(
+                "batch_get_synchronize",
+                synchronize_samples,
+                args.warmup,
+                request_length,
+                miss_count_value,
+                token_bytes,
+                execution_mode=args.execution_mode,
+            )
         print_samples(
             "batch_get",
             batch_get_samples,
@@ -1062,23 +1238,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_length,
             miss_count_value,
             token_bytes,
+            execution_mode=args.execution_mode,
         )
-        if args.kernel_profile:
-            print_kernel_profile(
-                kernel_profile_samples,
-                args.warmup,
-                args.kernel_profile_clock_mhz,
-                args.aiv_cores,
-                args.jettys_per_core,
-                request_length,
-                miss_count_value,
-                token_bytes,
-                args.transport,
-            )
+        print_measurements(args, "eager", batch_get_samples, kernel_profile_samples, report)
+        if args.execution == "both":
+            run_graph_benchmark(args, runtime, torch, kvaf, create_request_plan,
+                                device_table, miss_count, output, check_output, execution, report)
+        if kernel_profile_started:
             runtime.stop_batch_get_kernel_profile()
-            kernel_profile_started = False
             print("BATCH_GET_KERNEL_PROFILE_DISABLED")
+        kernel_profile_started = False
         print("BATCH_GET_PERF_PHASE_DONE phase=batch_get")
+        execution.release_output(runtime)
         return 0
     except Exception as error:
         print(

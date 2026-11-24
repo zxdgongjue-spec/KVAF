@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <vector>
 
-#include "runtime.h"
+#include "access_operator.h"
+#include "npu_runtime.h"
 #include "startup_selection.h"
 
 namespace kvaf::detail {
@@ -22,8 +24,8 @@ class StartupBandwidthProbe {
     for (void* buffer : buffers_) (void)aclrtFree(buffer);
   }
 
-  template <class ProfiledOperator>
-  Status Run(RuntimeCore& core, ProfiledOperator& op, double* median_cycles) {
+  Status Run(NpuRuntime& runtime, double* median_cycles) {
+    auto& core = runtime.core();
     StartupProbeLayout layout{};
     Status status = BuildStartupProbeLayout(config_, &layout);
     if (!status.ok()) return status;
@@ -96,7 +98,7 @@ class StartupBandwidthProbe {
     get.output = MutableBufferView{output, payload, DeviceKind::kNpu};
     get.output_block_bytes = config_.token_bytes;
     get.tokens_per_block = config_.tokens_per_block;
-    status = op.SetBatchGetKernelProfiling(true);
+    status = runtime.SetBatchGetKernelProfiling(true, false);
     if (!status.ok()) return status;
 
     std::vector<double> samples;
@@ -104,7 +106,7 @@ class StartupBandwidthProbe {
       status = core.BatchGet(get, BatchGetExecutionOptions{stream_, true});
       if (!status.ok()) return status;
       std::vector<BatchGetKernelProfile> profiles;
-      status = op.CopyBatchGetKernelProfiles(&profiles);
+      status = runtime.CopyBatchGetKernelProfiles(&profiles);
       if (!status.ok()) return status;
       std::uint64_t critical_cycles = 0U;
       std::uint64_t active_requests = 0U;

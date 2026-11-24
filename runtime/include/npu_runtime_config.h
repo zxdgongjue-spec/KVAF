@@ -1,29 +1,26 @@
 #pragma once
 
+#include <array>
 #include <string>
 #include <vector>
 
 #include "status.h"
-
+#include "execution_config.h"
 namespace kvaf {
-
-enum class Transport { kUrma, kUbmem };
-
 namespace detail {
-enum class RuntimeBackend { kUrmaAiv, kUrmaAicpuGather, kUrmaAicpuScatter, kUbmem };
+using NpuEid = std::array<std::uint8_t, 16>;
 
-Status ResolveRuntimeBackend(Transport transport, const std::string& mode,
-                             RuntimeBackend* backend,
-                             const std::string& aiv_mode = "direct_read");
-inline bool UsesAicpu(RuntimeBackend backend) {
-  return backend == RuntimeBackend::kUrmaAicpuGather ||
-         backend == RuntimeBackend::kUrmaAicpuScatter;
-}
-// Only AIV groups explicit EIDs into simultaneous paths. Both AICPU modes
-// try one candidate at a time, including when the caller supplies a list.
-inline bool StripesEids(RuntimeBackend backend, bool explicit_eids) {
-  return backend == RuntimeBackend::kUrmaAiv && explicit_eids;
-}
+// Resolve provider-specific budgets. AIV/UBMEM kernels come from this build's
+// bin directory; AICPU uses its installed CANN package instead.
+ExecutionResources ResolveExecutionResources(Transport transport, Executor executor, bool get, bool peer_local,
+                                             const ExecutionResources* configured = nullptr);
+
+// Apply routing only after selecting a provider and resolving its own budget.
+// An explicit AIV Get list is strict: never truncate it to fit worker capacity.
+Status SelectProviderEids(Transport transport, Executor executor, bool get,
+                          bool explicit_eids, const ExecutionResources& resources,
+                          const std::vector<NpuEid>& candidates,
+                          std::vector<NpuEid>* selected);
 
 struct AicpuPackageSearch {
   std::string ascend_home_path;
@@ -38,8 +35,8 @@ struct AicpuKernelPackage {
   std::string json_path;
 };
 
-// No ACL calls or device/session state: package discovery can fail before
-// allocating remote DDR. Explicit roots never fall back to another install.
+// No ACL calls or device/session state. Called on first AICPU preparation;
+// explicit roots never fall back to another install.
 Status ResolveAicpuKernelPackage(const AicpuPackageSearch& search,
                                 AicpuKernelPackage* package);
 }  // namespace detail

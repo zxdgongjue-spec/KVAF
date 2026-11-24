@@ -66,9 +66,9 @@ def run(mode: str) -> int:
     gather_probe = os.environ.get("KVAF_AIV_GATHER_PROBE", "") if mode == "gather_read" else ""
     if gather_probe and gather_probe not in ("ack", "wqe", "sq", "first_read"):
         raise ValueError("gather probe must be ack/wqe/sq/first_read")
-    from backend import detect_torch_backend
-    from dsa_keys import build_dsa_keys
-    from npu_eids import parse_npu_eids
+    from utils.backend import detect_torch_backend
+    from utils.dsa_keys import build_dsa_keys
+    from utils.npu_eids import parse_npu_eids
     import kvaf
 
     if gather_probe:

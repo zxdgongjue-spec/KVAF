@@ -1,7 +1,12 @@
 #include "runtime.h"
 #include "scatter_host_profile.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
@@ -13,6 +18,28 @@
 namespace kvaf {
 
 namespace {
+
+std::uint64_t DispatchTraceNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+class PutPreparationGuard {
+ public:
+  explicit PutPreparationGuard(AccessOperator& operation) : operation_(operation) {}
+  ~PutPreparationGuard() noexcept {
+    try {
+      (void)operation_.CancelPreparedPut();
+    } catch (...) {
+      // Preserve the original failure during metadata exception unwinding.
+      std::fprintf(stderr, "[KVAF] unsubmitted Put preparation cleanup threw\n");
+    }
+  }
+  PutPreparationGuard(const PutPreparationGuard&) = delete;
+  PutPreparationGuard& operator=(const PutPreparationGuard&) = delete;
+ private:
+  AccessOperator& operation_;
+};
 
 class HostDdrMemoryAllocator final : public DdrMemoryAllocator {
  public:
@@ -67,15 +94,60 @@ RuntimeCore::RuntimeCore(MetaManager& meta_manager, AccessOperator& access_opera
                          DdrMemoryAllocator& ddr_allocator)
     : meta_manager_(meta_manager),
       access_operator_(access_operator),
-      ddr_allocator_(ddr_allocator) {}
-
-RuntimeCore::~RuntimeCore() {
-  if (needs_cleanup_) {
-    (void)Shutdown();
+      ddr_allocator_(ddr_allocator) {
+  if (const char* path = std::getenv("KVAF_PUT_DISPATCH_TRACE"); path && *path) {
+    put_trace_path_ = path;
+    put_trace_rows_.reserve(256);
   }
 }
 
+RuntimeCore::~RuntimeCore() {
+  if (needs_cleanup_ && !Shutdown().ok()) {
+    // The allocation owner must also retain its resources. Do not unpin keys
+    // as an incidental consequence of destroying the public handle registry.
+    auto* retained = new decltype(access_tables_)(std::move(access_tables_));
+    (void)retained;
+    if (pending_get_table_) (void)new std::shared_ptr<AccessTableState>(std::move(pending_get_table_));
+    if (!graph_tables_.empty()) (void)new decltype(graph_tables_)(std::move(graph_tables_));
+  }
+  FlushPutTrace();
+}
+
+void RuntimeCore::FlushPutTrace() {
+  if (put_trace_rows_.empty()) return;
+  std::ofstream output(put_trace_path_, std::ios::app);
+  if (!output) {
+    std::fprintf(stderr, "[KVAF] cannot write Put dispatch trace: %s\n", put_trace_path_.c_str());
+    return;
+  }
+  output.seekp(0, std::ios::end);
+  if (output.tellp() == 0)
+    output << "event,index,transport,executor,path,result,total_ns,lock_ns,validation_ns,prepare_ns,"
+              "metadata_prepare_ns,execute_ns,metadata_finalize_ns,acknowledge_ns,resolve_ns,"
+              "dispatch_lock_ns,dispatch_resolve_ns,context_ns,describe_ns,acquire_ns,bind_ns,provider_ns,"
+              "provider_prepare_ns,provider_registration_ns,provider_metadata_ns,provider_submit_ns,"
+              "provider_completion_ns,provider_cleanup_ns,provider_other_ns\n";
+  for (const auto& row : put_trace_rows_) {
+    const auto& d = row.dispatch;
+    const auto& p = row.provider;
+    const char* transport = d.config ? (d.config->transport == Transport::Ubmem ? "ubmem" : "urma") : p.transport;
+    const char* executor = d.config ? (d.config->executor == Executor::Aicpu ? "aicpu" : "aiv") : p.executor;
+    const auto phases = p.prepare_ns + p.metadata_ns + p.submit_ns + p.completion_ns + p.cleanup_ns;
+    output << row.event << ',' << ++put_trace_index_ << ',' << transport << ',' << executor << ','
+           << row.path << ',' << row.result << ',' << row.total_ns << ',' << row.lock_ns << ','
+           << row.validation_ns << ',' << row.prepare_ns << ',' << row.metadata_prepare_ns << ','
+           << row.execute_ns << ',' << row.metadata_finalize_ns << ',' << row.acknowledge_ns << ','
+           << row.resolve_ns << ',' << d.lock_ns << ',' << d.resolve_ns << ',' << d.context_ns << ','
+           << d.describe_ns << ',' << d.acquire_ns << ',' << d.bind_ns << ',' << d.provider_ns << ','
+           << p.prepare_ns << ',' << p.registration_ns << ',' << p.metadata_ns << ',' << p.submit_ns << ','
+           << p.completion_ns << ',' << p.cleanup_ns << ','
+           << (d.provider_ns > phases ? d.provider_ns - phases : 0) << '\n';
+  }
+  put_trace_rows_.clear();
+}
+
 Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
+  std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (initialized_) {
     return Status::InvalidState("Runtime has already been initialized");
   }
@@ -95,60 +167,74 @@ Status RuntimeCore::Initialize(const RuntimeInitRequest& request) {
   needs_cleanup_ = true;
   if (remote_region.length == 0 || remote_region.slot_size == 0 ||
       remote_region.length % remote_region.slot_size != 0) {
+    lifecycle.unlock();
     (void)Shutdown();
     return Status::InvalidArgument("DDR allocator returned an invalid remote region");
   }
 
   status = access_operator_.Initialize(remote_region);
   if (!status.ok()) {
+    lifecycle.unlock();
     (void)Shutdown();
     return status;
   }
 
   status = meta_manager_.RegisterRemoteRegion(remote_region);
   if (!status.ok()) {
+    lifecycle.unlock();
     (void)Shutdown();
     return status;
   }
 
+  closing_ = false;
+  connector_owner_ = std::make_shared<const int>(0);
   initialized_ = true;
   return Status::OK();
 }
 
 Status RuntimeCore::Shutdown() {
-  if (!needs_cleanup_) {
-    return Status::NotInitialized("Runtime has not been initialized");
-  }
-  // Stop accepting work, but keep ownership until cleanup has succeeded.
-  initialized_ = false;
-
-  // Pending transfers may still reference the region and access tables.
-  // Keep ownership intact if the operator cannot drain or close its session.
-  const Status operator_status = access_operator_.Shutdown();
-  if (!operator_status.ok()) return operator_status;
-
-  Status first_error = Status::OK();
-  for (const auto& entry : access_tables_) {
-    const Status status = meta_manager_.UnlockKeys(entry.second->lock_context);
-    if (!status.ok() && first_error.ok()) {
-      first_error = status;
+  std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  if (!needs_cleanup_) return Status::NotInitialized("Runtime has not been initialized");
+  closing_ = true; // Recovery/release APIs remain available on the original records.
+  if (!graph_tables_.empty()) return Status::Busy("release graph leases before shutdown");
+  if (pending_put_) {
+    if (pending_put_->cpu) {
+      PutHandle handle; handle.state_ = pending_put_;
+      if (!pending_put_->decision && pending_put_->submitted)
+        return Status::Busy("finish the original CPU Pull decision before shutdown");
+      const auto result = FinishConnectorPutLocked(handle, pending_put_->decision.value_or(false));
+      if (!result.ok()) return result;
+    } else {
+      if (pending_put_->completion.outcome == PutOutcome::Unknown)
+        return Status::CompletionUnknown("recover the original Put before shutdown");
+      const auto result = FinalizePutLocked();
+      if (pending_put_) return result;
     }
   }
-  access_tables_.clear();
-
-  const Status release_status = ddr_allocator_.Release(remote_region_);
-  if (!release_status.ok()) {
-    return first_error.ok() ? release_status : first_error;
+  if (cpu_pull_) {
+    auto status = cpu_pull_->Shutdown();
+    if (!status.ok()) return status;
   }
-
+  const auto status = access_operator_.Shutdown();
+  FlushPutTrace();
+  if (!status.ok()) return status;
+  pending_get_table_.reset();
+  access_tables_.clear();
+  const auto released = ddr_allocator_.Release(remote_region_);
+  if (!released.ok()) return released;
+  cpu_pull_ = nullptr;
+  batch_pull_put_ = {};
   needs_cleanup_ = false;
-  remote_region_ = RemoteRegionDesc{};
-  return first_error;
+  initialized_ = false;
+  remote_region_ = {};
+  return Status::OK();
 }
 
 Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
                                        AccessTableHandle* handle) {
-  if (!initialized_) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(table_mutex_);
+  if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (handle == nullptr) {
@@ -200,7 +286,12 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
     (void)meta_manager_.UnlockKeys(lock_context);
     return Status::InvalidState("AccessTable handle space is exhausted");
   }
-  auto table = std::make_unique<AccessTableState>();
+  // Public handles and in-flight requests independently own this pin.
+  auto table = std::shared_ptr<AccessTableState>(new AccessTableState,
+      [this](AccessTableState* state) {
+        (void)meta_manager_.UnlockKeys(state->lock_context);
+        delete state;
+      });
   table->lock_context = lock_context;
   table->addresses = std::move(lookup.addresses);
   table->lengths = std::move(lookup.lengths);
@@ -215,6 +306,8 @@ Status RuntimeCore::PrepareAccessTable(const AccessTablePrepareRequest& request,
 
 Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
                                        AccessTableView* view) const {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(table_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -231,6 +324,8 @@ Status RuntimeCore::GetAccessTableView(const AccessTableHandle& handle,
 }
 
 Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(table_mutex_);
   if (!initialized_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
@@ -238,29 +333,35 @@ Status RuntimeCore::ReleaseAccessTable(const AccessTableHandle& handle) {
   if (table == nullptr) {
     return Status::NotFound("AccessTable handle was not found");
   }
-  const Status status = meta_manager_.UnlockKeys(table->lock_context);
-  if (!status.ok()) {
-    return status;
-  }
   access_tables_.erase(handle.opaque);
   return Status::OK();
 }
 
 Status RuntimeCore::BatchGet(const BatchGetRequest& request,
-                             const BatchGetExecutionOptions& execution) {
+                             const BatchGetExecutionOptions& execution,
+                             BatchGetHostTiming* host_timing) {
+  BatchGetProfileScope total(host_timing ? &host_timing->core_total_ns : nullptr);
+  auto phase = host_timing ? BatchGetProfileNowNs() : 0;
+  const auto mark = [&](std::uint64_t BatchGetHostTiming::*field) {
+    if (!host_timing) return;
+    const auto now = BatchGetProfileNowNs();
+    host_timing->*field += now - phase;
+    phase = now;
+  };
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
   if (execution.trusted_npu_request) {
     scatter_host::Timer validation_timer(scatter_host::kRuntimeValidation);
     const auto action = execution.scatter_graph;
     if (action == ScatterGraphAction::kNone) {
       // Preserve the ordinary Gather/Scatter trusted-input contract.
-      if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+      if (!initialized_ || closing_) return Status::NotInitialized("Runtime has not been initialized");
       if (request.indices.device != DeviceKind::kNpu || !execution.stream)
         return Status::InvalidArgument("trusted BatchGet requires NPU inputs and an eager stream");
     } else {
       // Graph controls are Scatter-only. A failed shutdown can still detach
       // the graph before retrying cleanup, without supplying input tensors.
       const bool detach_for_cleanup = needs_cleanup_ && action == ScatterGraphAction::kDetach;
-      if (!initialized_ && !detach_for_cleanup)
+      if ((!initialized_ || closing_) && !detach_for_cleanup)
         return Status::NotInitialized("Runtime has not been initialized");
       if ((action == ScatterGraphAction::kAttach && request.indices.device != DeviceKind::kNpu) ||
           (action != ScatterGraphAction::kDetach && !execution.stream))
@@ -269,16 +370,32 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     validation_timer.Stop();
     return access_operator_.ExecuteBatchGet(BatchGetExecRequest{{}, &request, execution});
   }
-  if (!initialized_) {
+  if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
-  const AccessTableState* table = nullptr;
-  if (request.access_table.opaque != 0) {
-    table = FindAccessTable(request.access_table);
-    if (table == nullptr) {
-      return Status::NotFound("AccessTable handle was not found");
-    }
+  if (execution.config && !access_operator_.TracksGetCompletion())
+    return Status::NotImplemented("this operator does not support execution configuration or resource leases");
+  mark(&BatchGetHostTiming::core_lifecycle_ns);
+  std::shared_ptr<AccessTableState> table_ref;
+  {
+    std::lock_guard<std::mutex> lock(table_mutex_);
+    const auto it = access_tables_.find(request.access_table.opaque);
+    if (it != access_tables_.end()) table_ref = it->second;
   }
+  const AccessTableState* table = table_ref.get();
+  if (request.access_table.opaque != 0 && !table)
+    return Status::NotFound("AccessTable handle was not found");
+  mark(&BatchGetHostTiming::core_table_ns);
+  // Pin before any resource wait. This lock serializes only Get submissions.
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  if (execution.graph_lease && !graph_tables_.count(execution.graph_lease))
+    return Status::NotFound("Get graph lease not found");
+  mark(&BatchGetHostTiming::core_direction_ns);
+  if (access_operator_.TracksGetCompletion() && !execution.graph_lease) {
+    const auto drained = DrainGetLocked();
+    if (!drained.ok()) return drained;
+  }
+  mark(&BatchGetHostTiming::core_previous_drain_ns);
   if (!request.indices.has_elements<std::int32_t>() ||
       !request.offsets.has_elements<std::int32_t>() ||
       !request.output_indices.has_elements<std::int32_t>() ||
@@ -359,61 +476,290 @@ Status RuntimeCore::BatchGet(const BatchGetRequest& request,
     view = AccessTableView{table->addresses.data(), table->lengths.data(),
                            table->valid.data(), table->addresses.size()};
   }
-  return access_operator_.ExecuteBatchGet(
-      BatchGetExecRequest{view, &request, execution});
+  if (execution.graph_lease) {
+    auto& pinned = graph_tables_.at(execution.graph_lease);
+    if (pinned && pinned != table_ref)
+      return Status::InvalidState("graph lease already pins another table");
+    pinned = table_ref;
+  } else if (access_operator_.TracksGetCompletion())
+    pending_get_table_ = table_ref;
+  mark(&BatchGetHostTiming::core_validate_ns);
+  const auto status = access_operator_.ExecuteBatchGet({view, &request, execution});
+  mark(&BatchGetHostTiming::core_dispatch_ns);
+  if (status.ok() && execution.synchronize && !execution.graph_lease) pending_get_table_.reset();
+  if (!status.ok() && access_operator_.TracksGetCompletion() && !execution.graph_lease) {
+    // Preparation failures have no outstanding DMA. Failed submissions retain
+    // their pin unless the provider can positively establish completion.
+    (void)DrainGetLocked();
+  }
+  mark(&BatchGetHostTiming::core_finish_ns);
+  return status;
+}
+
+Status RuntimeCore::BeginGetGraph(GetExecutionConfig config, const GetGraphOptions& request,
+                                  std::uint64_t* id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!initialized_ || closing_) return Status::NotInitialized("Runtime is not initialized");
+  auto drained = DrainGetLocked();
+  if (!drained.ok()) return drained;
+  // Reserve the table pin before publishing a provider lease.
+  auto node = graph_tables_.extract(graph_tables_.emplace(0, nullptr).first);
+  auto s = access_operator_.BeginGetGraph(config, request, id);
+  if (s.ok()) {
+    node.key() = *id;
+    graph_tables_.insert(std::move(node));
+  }
+  return s;
+}
+Status RuntimeCore::BeginGetOutput(GetExecutionConfig config, const GetOutputOptions& request,
+                                    std::uint64_t* id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!initialized_ || closing_) return Status::NotInitialized("Runtime is not initialized");
+  auto s = DrainGetLocked();
+  return s.ok() ? access_operator_.BeginGetOutput(config, request, id) : s;
+}
+Status RuntimeCore::EndGetOutput(std::uint64_t id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  // Ending an idle algorithm's output binding need not drain another algorithm.
+  // Release the table only if no ordinary request/teardown remains pending.
+  auto status = access_operator_.EndGetOutput(id);
+  if (!access_operator_.HasPendingGet()) pending_get_table_.reset();
+  return status;
+}
+Status RuntimeCore::EndGetGraph(std::uint64_t id, void* stream, bool discard) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(get_mutex_);
+  if (!graph_tables_.count(id)) return Status::NotFound("Get graph lease not found");
+  // The dispatcher drains only eager work sharing this node's instance. Keep
+  // the active table pin until the next successful DrainGet, as EndGetOutput
+  // does; ending another algorithm's graph must not release that table.
+  auto s = access_operator_.EndGetGraph(id, stream, discard);
+  if (s.ok()) graph_tables_.erase(id);
+  return s;
+}
+
+Status RuntimeCore::BeginPutInput(PutExecutionConfig config, const PutInputOptions& request,
+                                   std::uint64_t* id) {
+  if (id) *id = 0;
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  if (!initialized_ || closing_) return Status::NotInitialized("Runtime is not initialized");
+  if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
+  return access_operator_.BeginPutInput(config, request, id);
+}
+Status RuntimeCore::EndPutInput(std::uint64_t id) {
+  std::shared_lock<std::shared_mutex> life(lifecycle_mutex_);
+  std::lock_guard<std::mutex> lock(put_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime is not initialized");
+  if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
+  return access_operator_.EndPutInput(id);
 }
 
 Status RuntimeCore::BatchPut(const BatchPutRequest& request,
                              BatchPutExecutionOptions execution) {
-  if (!initialized_) {
-    return Status::NotInitialized("Runtime has not been initialized");
+  const bool tracing = !put_trace_path_.empty();
+  const auto started = tracing ? DispatchTraceNowNs() : 0;
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
+  PutTraceRow row;
+  row.path = !access_operator_.TracksGetCompletion() ? "direct" : execution.input_lease ? "input" : "ordinary";
+  row.dispatch.config = execution.config;
+  if (tracing) {
+    row.lock_ns = DispatchTraceNowNs() - started;
+    execution.host_timing = &row.provider;
+    execution.dispatch_timing = &row.dispatch;
   }
-  if (request.keys.empty() || request.input.data == nullptr ||
-      request.input.bytes == 0 ||
-      request.keys.size() != request.input_offsets.size() ||
-      request.keys.size() != request.lengths.size()) {
-    return Status::InvalidArgument(
-        "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
+  // The trace is buffered only after the operation has finished. No CSV I/O
+  // occurs in the measured path. Each phase also records early failures.
+  auto measure = [&](std::uint64_t& elapsed, auto&& work) {
+    if (!tracing) return work();
+    const auto phase = DispatchTraceNowNs();
+    auto result = work();
+    elapsed += DispatchTraceNowNs() - phase;
+    return result;
+  };
+  auto run = [&]() -> Status {
+    auto validated = measure(row.validation_ns, [&]() -> Status {
+      if (!initialized_ || closing_) return Status::NotInitialized("Runtime has not been initialized");
+      if (request.keys.empty() || request.input.data == nullptr || request.input.bytes == 0 ||
+          request.keys.size() != request.input_offsets.size() || request.keys.size() != request.lengths.size())
+        return Status::InvalidArgument("BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
+      for (std::size_t index = 0; index < request.keys.size(); ++index) {
+        const std::uint64_t offset = request.input_offsets[index];
+        const std::uint64_t length = request.lengths[index];
+        if (length == 0 || offset > request.input.bytes || length > request.input.bytes - offset)
+          return Status::InvalidArgument("BatchPut input_offsets and lengths must describe bytes inside input");
+      }
+      if ((execution.config || execution.input_lease) && !access_operator_.TracksGetCompletion())
+        return Status::NotImplemented("this operator does not support execution configuration or resource leases");
+      if (pending_put_) return Status::Busy("Put transaction awaits completion recovery");
+      return Status::OK();
+    });
+    if (!validated.ok()) return validated;
+    auto prepared = measure(row.prepare_ns, [&] { return access_operator_.PreparePut(request, execution); });
+    if (!prepared.ok()) return prepared;
+    // Metadata can reject or throw after preparation. Execute consumes the
+    // reservation on submission; cancellation then becomes a no-op, including
+    // unresolved DMA and metadata/acknowledgement recovery paths.
+    PutPreparationGuard preparation_guard(access_operator_);
+    // Allocate the completion record before reserving metadata; retain it until
+    // data-plane completion, metadata finalization and provider acknowledgement.
+    auto pending = ordinary_write_;
+    pending->completion = {};
+    pending->decision.reset();
+    pending->metadata_finalized = false;
+    PutContext put_context;
+    PutAccessDesc put_desc;
+    auto status = measure(row.metadata_prepare_ns, [&] {
+      return meta_manager_.PreparePut(request.keys, request.lengths, &put_context, &put_desc);
+    });
+    if (!status.ok()) return status;
+    pending->transaction = put_context;
+    pending->config = execution.config;
+    pending->input_bound = execution.input_lease != 0;
+    pending_put_ = std::move(pending);
+    status = measure(row.execute_ns, [&]() -> Status {
+      const auto provider_started = tracing ? DispatchTraceNowNs() : 0;
+      Status result;
+      try {
+        result = access_operator_.ExecuteBatchPut({&request, &put_desc, execution});
+      } catch (const std::exception& error) {
+        result = Status::CompletionUnknown(std::string("Put execution threw after preparation: ") + error.what());
+      } catch (...) {
+        result = Status::CompletionUnknown("Put execution threw after preparation");
+      }
+      if (tracing && !access_operator_.TracksGetCompletion())
+        row.dispatch.provider_ns += DispatchTraceNowNs() - provider_started;
+      return result;
+    });
+    if (!status.ok()) {
+      if (status.code() == StatusCode::kCompletionUnknown) return status;
+      pending_put_->completion = {PutOutcome::Failed, status};
+    } else pending_put_->completion = {PutOutcome::Succeeded, Status::OK()};
+    return FinalizePutLocked(tracing ? &row : nullptr);
+  };
+  const auto result = run();
+  if (tracing) {
+    row.total_ns = DispatchTraceNowNs() - started;
+    row.result = static_cast<int>(result.code());
+    put_trace_rows_.push_back(row);
   }
+  return result;
+}
 
-  for (std::size_t index = 0; index < request.keys.size(); ++index) {
-    const std::uint64_t offset = request.input_offsets[index];
-    const std::uint64_t length = request.lengths[index];
-    if (length == 0 || offset > request.input.bytes ||
-        length > request.input.bytes - offset) {
-      return Status::InvalidArgument(
-          "BatchPut input_offsets and lengths must describe bytes inside input");
-    }
+Status RuntimeCore::FinalizePutLocked(PutTraceRow* timing) {
+  auto& pending = *pending_put_;
+  if (pending.completion.outcome == PutOutcome::Unknown)
+    return Status::CompletionUnknown("Put data-plane completion remains unresolved");
+  if (!pending.metadata_finalized) {
+    const auto started = timing ? DispatchTraceNowNs() : 0;
+    if (!pending.decision) pending.decision = pending.completion.outcome == PutOutcome::Succeeded;
+    const auto status = *pending.decision ? meta_manager_.CommitPut(pending.transaction)
+                                         : meta_manager_.AbortPut(pending.transaction);
+    if (timing) timing->metadata_finalize_ns += DispatchTraceNowNs() - started;
+    if (!status.ok()) return status;
+    pending.metadata_finalized = true;
   }
-  PutContext put_context;
-  PutAccessDesc put_desc;
-  Status status = meta_manager_.PreparePut(request.keys, request.lengths,
-                                           &put_context, &put_desc);
-  if (!status.ok()) {
-    return status;
-  }
+  // An acknowledgement retry must not repeat CommitPut/AbortPut. Input leases
+  // also remain pinned if either metadata finalization or acknowledgement fails.
+  const auto started = timing ? DispatchTraceNowNs() : 0;
+  const auto acknowledged = pending.cpu
+      ? (pending.submitted ? cpu_pull_->CompleteOffload(*pending.decision) : Status::OK())
+      : access_operator_.AcknowledgePut();
+  if (timing) timing->acknowledge_ns += DispatchTraceNowNs() - started;
+  if (!acknowledged.ok()) return acknowledged;
+  const auto result = pending.cpu ? Status::OK() : pending.completion.result;
+  if (pending.cpu) pending.state = *pending.decision ? CpuPullState::Committed : CpuPullState::Aborted;
+  pending_put_.reset();
+  return result;
+}
 
-  status = access_operator_.ExecuteBatchPut(
-      BatchPutExecRequest{&request, &put_desc, execution});
-  if (!status.ok()) {
-    (void)meta_manager_.AbortPut(put_context);
-    return status;
+Status RuntimeCore::RecoverPut(PutExecutionConfig config) {
+  const bool tracing = !put_trace_path_.empty();
+  const auto started = tracing ? DispatchTraceNowNs() : 0;
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
+  PutTraceRow row;
+  row.event = "recover";
+  row.path = !access_operator_.TracksGetCompletion() ? "direct"
+             : pending_put_ && pending_put_->input_bound ? "input" : "ordinary";
+  row.dispatch.config = config;
+  if (tracing) row.lock_ns = DispatchTraceNowNs() - started;
+  auto run = [&]() -> Status {
+    if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+    const auto phase = tracing ? DispatchTraceNowNs() : 0;
+    PutCompletion completion;
+    // Never replay the Put, or recover a route different from the original.
+    if (pending_put_ && pending_put_->cpu) return Status::Busy("use CPU Pull recovery for the active write");
+    const auto resolved = pending_put_ ? access_operator_.ResolvePut(config, &completion)
+                                       : access_operator_.Recover(config);
+    if (tracing) row.resolve_ns = DispatchTraceNowNs() - phase;
+    if (!resolved.ok() || !pending_put_) return resolved;
+    if (completion.outcome == PutOutcome::Unknown)
+      return Status::CompletionUnknown("Put data-plane completion remains unresolved");
+    if ((completion.outcome == PutOutcome::Succeeded) != completion.result.ok())
+      return Status::Internal("inconsistent Put completion result");
+    if (pending_put_->completion.outcome == PutOutcome::Unknown)
+      pending_put_->completion = completion;
+    else if (pending_put_->completion.outcome != completion.outcome)
+      return Status::Internal("Put completion changed after it was resolved");
+    return FinalizePutLocked(tracing ? &row : nullptr);
+  };
+  auto result = run();
+  if (tracing) {
+    row.total_ns = DispatchTraceNowNs() - started;
+    row.result = static_cast<int>(result.code());
+    put_trace_rows_.push_back(row);
   }
-  status = meta_manager_.CommitPut(put_context);
-  if (!status.ok()) {
-    return status;
-  }
-  return Status::OK();
+  return result;
+}
+
+bool RuntimeCore::HasPendingPut() const {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(put_mutex_);
+  return bool(pending_put_);
 }
 
 Status RuntimeCore::BatchFree(const BatchFreeRequest& request) {
-  if (!initialized_) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  if (!initialized_ || closing_) {
     return Status::NotInitialized("Runtime has not been initialized");
   }
   if (request.keys.empty()) {
     return Status::InvalidArgument("BatchFree requires at least one key");
   }
   return meta_manager_.BatchFree(request.keys);
+}
+
+Status RuntimeCore::DrainGetLocked() {
+  auto status = access_operator_.DrainGet();
+  if (status.ok()) pending_get_table_.reset();
+  return status;
+}
+Status RuntimeCore::DrainGet() {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  return DrainGetLocked();
+}
+Status RuntimeCore::RecoverGet(GetExecutionConfig config) {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  if (!initialized_) return Status::NotInitialized("Runtime has not been initialized");
+  auto status = access_operator_.Recover(config);
+  // A failed rebuild may follow a successful close of the old domain. Its
+  // table pin is no longer needed; failed close/Busy must keep that pin.
+  if (!access_operator_.HasPendingGet()) pending_get_table_.reset();
+  return status;
+}
+bool RuntimeCore::HasPendingGet() const {
+  std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+  std::lock_guard<std::mutex> direction(get_mutex_);
+  return access_operator_.HasPendingGet();
 }
 
 RuntimeCore::AccessTableState* RuntimeCore::FindAccessTable(

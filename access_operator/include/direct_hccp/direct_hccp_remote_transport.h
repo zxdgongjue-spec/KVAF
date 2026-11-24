@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "direct_hccp/direct_hccp_abi.h"
+#include "direct_hccp/remote_memory_binding.h"
 
 namespace kvaf::peer {
 class PeerLink;
@@ -47,6 +48,7 @@ struct DirectMemory {
   std::uint32_t token_value{0};
   std::uint8_t key[kMemKeyBytes]{};
   std::uint32_t key_bytes{0};
+  std::array<std::uint8_t, kEidBytes> wqe_eid{};
 };
 
 // NPU-side resources shared by the BatchGet and BatchPut transport teardown.
@@ -73,21 +75,8 @@ struct DeviceAivPathResources {
   std::array<std::uint8_t, kEidBytes> local_eid{};
   void* device_context{nullptr};
   void* device_transport_token_handle{nullptr};
-  void* device_peer_memory_import{nullptr};
-};
-
-struct DeviceAivTransportResources {
-  DirectHccpApi* api{nullptr};
-  DirectHccpSession* session{nullptr};
-  // Legacy single-context fields are retained so BatchPut remains unchanged.
-  void* device_context{nullptr};
-  void* device_transport_token_handle{nullptr};
-  void* device_peer_memory_import{nullptr};
-  DeviceAivWorkerResources* workers{nullptr};
-  std::uint32_t worker_count{0U};
-  // BatchGet uses these fields when more than one local EID is configured.
-  DeviceAivPathResources* paths{nullptr};
-  std::uint32_t path_count{0U};
+  std::uint64_t context_generation{NewBindingGeneration()};
+  std::shared_ptr<HccpRemoteMemoryBinding> peer_binding;
 };
 
 // Queue arrays remain core-major for the AIV ABI, but path assignment is
@@ -114,6 +103,13 @@ static_assert(EidPathIndexForWorker(0U, 15U, 1U, 16U) == 15U);
 static_assert(EidPathIndexForWorker(0U, 32U, 1U, 64U) == 32U);
 static_assert(EidPathIndexForWorker(0U, 63U, 1U, 64U) == 63U);
 
+// Remote sessions are in CPU-device order. Continue the rotation across core boundaries.
+inline constexpr std::uint32_t GetPathForWorker(std::uint32_t worker, std::uint32_t cores,
+    std::uint32_t jettys_per_core, std::uint32_t local_paths, std::uint32_t remote_fes) {
+  if (remote_fes > 1) return worker % remote_fes;
+  return EidPathIndexForWorker(worker / jettys_per_core, worker % jettys_per_core, cores, local_paths);
+}
+
 // One peer channel is bound to one local AIV Jetty. Runtime has already
 // selected the local EID assigned to this worker; this adapter only creates
 // the transport resources required by that selected path.
@@ -123,7 +119,7 @@ struct PeerChannelRequest {
   void* device_context{nullptr};
   std::uint32_t physical_device_id{0};
   std::uint64_t peer_base{0};
-  const DirectMemory* peer_memory{nullptr};
+  const UrmaRemoteMemoryDesc* peer_memory{nullptr};
   const std::array<std::uint8_t, kEidBytes>* local_eid{nullptr};
   const std::array<std::uint8_t, kEidBytes>* peer_eid{nullptr};
   const QpCreateInfo* local_jetty_info{nullptr};
@@ -143,12 +139,12 @@ bool GetPeerTp(const DirectHccpApi&, void* context,
                const std::array<std::uint8_t, kEidBytes>& local_eid,
                const std::array<std::uint8_t, kEidBytes>& peer_eid,
                const char* role, std::uint64_t* tp);
-void ReleaseDeviceAivTransport(const DeviceAivTransportResources& resources);
 
-// Converts the Link descriptor's raw UMDK token to the AIV WQE token format.
+// Loads the raw peer registration descriptor; WQE token encoding is applied
+// only when populating the device entity.
 bool LoadPeerMemory(PeerLink* link, std::uint64_t peer_base,
-                    DirectMemory* memory,
-                    std::array<std::uint8_t, kEidBytes>* peer_eid);
+                    UrmaRemoteMemoryDesc* memory,
+                    std::array<std::uint8_t, kEidBytes>* peer_eid = nullptr);
 
 bool ImportPeerJetty(const DirectHccpApi& api, void* context,
                      const std::uint8_t* peer_key, std::uint32_t peer_key_bytes,

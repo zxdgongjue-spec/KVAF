@@ -504,8 +504,8 @@ def main() -> int:
         print(f"FAIL: {error}", file=sys.stderr)
         return 2
 
-    from backend import detect_torch_backend
-    from npu_eids import parse_npu_eids
+    from utils.backend import detect_torch_backend
+    from utils.npu_eids import parse_npu_eids
     import kvaf
 
     backend = detect_torch_backend()

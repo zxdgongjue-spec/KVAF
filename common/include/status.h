@@ -16,6 +16,9 @@ enum class StatusCode {
   kInvalidState,
   kOutOfMemory,
   kInternal,
+  kCompletionUnknown,
+  // Source compatibility for Pull; wire states remain protocol-specific.
+  kInDoubt = kCompletionUnknown,
   // Local device execution/ACL failure: changing the peer EID is not a retry.
   kDeviceError,
 };
@@ -64,6 +67,14 @@ class Status {
 
   static Status Internal(std::string message) {
     return Error(StatusCode::kInternal, std::move(message));
+  }
+
+  static Status CompletionUnknown(std::string message) {
+    return Error(StatusCode::kCompletionUnknown, std::move(message));
+  }
+
+  static Status InDoubt(std::string message) {
+    return CompletionUnknown(std::move(message));
   }
 
   static Status DeviceError(std::string message) {

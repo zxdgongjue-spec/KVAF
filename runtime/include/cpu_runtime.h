@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "runtime.h"
 
@@ -12,17 +13,22 @@ enum class CpuGatherMode { kAdaptive, kActive, kPassive };
 enum class CpuMemoryPageMode {
   kDefault,
   kTransparentHugePage,
+  // Explicit HugeTLB modes use log2(page size in bytes).
+  kHugeTlb2M = 21,
+  kHugeTlb1G = 30,
 };
+
+bool ParseCpuMemoryPageMode(std::string_view text, CpuMemoryPageMode& mode);
 
 struct CpuRuntimeOptions {
   std::string ub_device;
   bool has_eid_index{false};
   std::uint32_t eid_index{0};
-  std::uint32_t gather_threads{0U};
-  bool gather_affinity{true};
-  CpuGatherMode gather_mode{CpuGatherMode::kAdaptive};
+  std::uint32_t gather_threads{10U};
+  CpuGatherMode gather_mode{CpuGatherMode::kActive};
   CpuMemoryPageMode memory_page_mode{CpuMemoryPageMode::kTransparentHugePage};
   std::string hal_library{"libascend_hal.so"};
+  bool gather_affinity{true};
 };
 
 // CPU endpoint Runtime. Allocation requests select URMA or UBmem per session;
@@ -46,6 +52,8 @@ class CpuRuntime final : public Runtime {
   RuntimeCapabilities capabilities() const override;
 
  private:
+  Status ReleaseLinkUnlocked(LinkId);
+  mutable std::shared_mutex lifecycle_;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

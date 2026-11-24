@@ -19,9 +19,9 @@ import subprocess
 import sys
 import time
 
-import test_npu_batch_get_perf as reference
+import aiv_scatter_perf_reference as reference
 from aiv_batch_get_test_common import shutdown_runtime
-from dsa_keys import build_dsa_keys
+from utils.dsa_keys import build_dsa_keys
 from scatter_perf_common import PAYLOAD_TIMINGS, SCATTER_CHUNK_ROWS, profile_metrics, sample_metrics
 from test_aiv_scatter_perf import (SCATTER_MAX_JETTYS, resolve_scatter_options,
                                    scatter_payload_jettys, write_results)
@@ -317,7 +317,7 @@ def run_case(args):
         print("SKIP: set KVAF_RUN_NPU_TESTS=1 on the NPU host")
         return 77
     from aiv_kernel_metadata import check_aiv_kernel_metadata
-    from backend import detect_torch_backend
+    from utils.backend import detect_torch_backend
     kernel = args.build / "bin/kvaf_scatter_batch_get_kernels.o"
     put_kernel = args.build / "bin/kvaf_execute_batch_put_kernels.o"
     check_aiv_kernel_metadata(kernel, "KvafScatterBatchGetAivKernelV1")
@@ -366,7 +366,7 @@ def run_case(args):
                                              if cpu_jettys % args.aiv_cores == 0 else None),
         read_inflight_budget_applies=False, device_id=device_id,
         cpu_service=os.environ["KVAF_CPU_SERVICE_ADDR"], torch_version=str(torch.__version__),
-        reference="tests/run_remote_cpu_batch_get_miss_count_perf.sh",
+        reference="tests/python/aiv_scatter_perf_reference.py",
         input_mode="steady_table_new_request_plan_per_call",
         request_plans_per_sample=calls,
         sample_timing_scope=("replay_to_completion_divided_by_calls" if graph_mode

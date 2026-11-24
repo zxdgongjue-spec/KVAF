@@ -339,7 +339,7 @@ CPU 公共代码应与 AICPU 设备接口解耦，AIV 构建不依赖 AICPU kern
 
 主要参考位置：
 
-- main：`access_operator/demo/aiv_batch_get/` 的 READ、CQ 和现有 ABI。
+- main：`access_operator/algorithms/get/direct/urma_aiv/` 的 READ、CQ 和现有 ABI。
 - main：`access_operator/demo/aiv_batch_put/kernel/execute_batch_put_aiv.asc` 的
   单 SGE WRITE 和 SQ 提交。
 - aicpu-urma：`docs/aicpu_cpu_push_scatter.md`、`docs/aicpu_gather_read.md`。

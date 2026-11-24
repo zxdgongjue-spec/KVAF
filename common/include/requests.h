@@ -5,10 +5,33 @@
 #include <vector>
 
 #include "types.h"
+#include "execution_config.h"
 
 namespace kvaf {
 
 struct BatchGetProfile;
+// Optional Host diagnostics for one Get launch. The caller owns this storage;
+// providers write it only before ExecuteBatchGet returns.
+struct GetProviderTiming {
+  std::uint64_t prepare_ns{}, submit_ns{}, completion_ns{}, cleanup_ns{};
+  // AIV Direct diagnostics nested within prepare/submit. Zero for other providers.
+  std::uint64_t aiv_capture_prepare_ns{}, aiv_capture_submit_ns{};
+  std::uint64_t aiv_status_reset_ns{}, aiv_kernel_launch_ns{};
+};
+
+// Optional host-only diagnostics. Pointers to this storage are borrowed only
+// until the public Put call returns, never by retained/recovery state.
+struct PutProviderTiming {
+  const char* transport{"unknown"};
+  const char* executor{"unknown"};
+  std::uint64_t prepare_ns{}, registration_ns{}, metadata_ns{};
+  std::uint64_t submit_ns{}, completion_ns{}, cleanup_ns{};
+};
+struct PutDispatchTiming {
+  std::optional<PutExecutionConfig> config;
+  std::uint64_t lock_ns{}, resolve_ns{}, context_ns{}, describe_ns{}, acquire_ns{}, bind_ns{};
+  std::uint64_t provider_ns{};
+};
 
 // Runtime 初始化时由 Runtime 自己申请并注册的远端 DDR 资源规格。
 // BatchGet 的调用方 buffer 不属于这里：它们由上层在每次调用前准备。
@@ -87,6 +110,19 @@ struct BatchPutRequest {
 // before the remote WRITE. stream is ignored by CPU/mock implementations.
 struct BatchPutExecutionOptions {
   void* stream{nullptr};
+  std::optional<PutExecutionConfig> config;
+  std::uint64_t input_lease{0};
+  PutProviderTiming* host_timing{nullptr};
+  PutDispatchTiming* dispatch_timing{nullptr};
+};
+
+// Eager input registration lease. The caller keeps the allocation and stream
+// alive until EndPutInput/Shutdown succeeds; request keys/offsets may change.
+// A failed Put must be resolved before this binding can be released.
+struct PutInputOptions {
+  ConstBufferView input;
+  void* stream{nullptr};
+  std::uint32_t request_capacity{0};
 };
 
 struct BatchFreeRequest {
@@ -99,11 +135,32 @@ struct BatchFreeRequest {
 // 依赖、buffer 生命周期与显式 synchronize 由调用方/框架负责。
 enum class ScatterGraphAction { kNone, kAttach, kCheck, kDetach };
 
+// One graph node's resources. Each containing graph keeps its own fixed stream;
+// callers serialize shared queues/workspaces across graphs and ordinary Gets.
+// The caller keeps every captured buffer and the stream alive until
+// EndGetGraph succeeds, and destroys the containing graph before release.
+struct GetGraphOptions {
+  MutableBufferView output;
+  void* stream{nullptr};
+  std::uint32_t request_capacity{0};
+};
+// Reusable eager output registration. Keep this allocation (including aliases)
+// alive and at the same address/size until EndGetOutput or Shutdown succeeds.
+// One binding belongs to one Get algorithm instance. Bindings of different
+// configurations may coexist; requests may change but output/config may not.
+struct GetOutputOptions {
+  MutableBufferView output;
+  void* stream{nullptr};
+  std::uint32_t request_capacity{0};
+};
 struct BatchGetExecutionOptions {
   void* stream{nullptr};
   bool synchronize{false};
   // Optional AICPU stage timings; requires synchronize=true.
   BatchGetProfile* profile{nullptr};
+  std::optional<GetExecutionConfig> config;
+  std::uint64_t graph_lease{0};
+  std::uint64_t output_lease{0};
   // Scatter/Gather callers guarantee live contiguous, correctly typed NPU
   // tensors, valid indices/offsets, unique output rows and a valid stream.
   // Gather uses eager submission; Scatter capture uses scatter_graph actions.
@@ -117,6 +174,7 @@ struct BatchGetExecRequest {
   AccessTableView host_access_table;
   const BatchGetRequest* request{nullptr};
   BatchGetExecutionOptions execution;
+  GetProviderTiming* host_timing{nullptr};
 };
 
 // Runtime 向 AccessOperator 提交的同步 BatchPut 描述。put_desc 的具体

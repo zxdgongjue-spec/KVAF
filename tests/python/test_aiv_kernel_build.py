@@ -46,13 +46,13 @@ def run(args):
 def main():
     cmake = sys.argv[1]
     repo = Path(__file__).resolve().parents[2]
-    demo = repo / 'access_operator/demo/aiv_batch_get'
+    operator = repo / 'access_operator'
     with tempfile.TemporaryDirectory(prefix='kvaf kernel build-') as directory:
         root = Path(directory)
-        kernel = root / 'access_operator/demo/aiv_batch_get/kernel'
-        shutil.copytree(demo / 'kernel', kernel)
+        shutil.copytree(operator / 'algorithms/get/direct', root / 'access_operator/algorithms/get/direct')
         shutil.copytree(repo / 'access_operator/cmake', root / 'access_operator/cmake')
         shutil.copytree(repo / 'access_operator/include/ubmem', root / 'access_operator/include/ubmem')
+        shutil.copytree(repo / 'common/include', root / 'common/include')
         sdk = root / 'sdk'
         (sdk / 'include/simt_api').mkdir(parents=True)
         (sdk / 'include/kernel_operator.h').touch()
@@ -68,11 +68,12 @@ project(kernel_build_check NONE)
 set(ASCEND_CANN_PACKAGE_PATH "{sdk.as_posix()}")
 set(KVAF_KERNEL_OPERATOR_DIR "{sdk.as_posix()}/include")
 set(KVAF_SIMT_API_DIR "{sdk.as_posix()}/include")
-set(KVAF_AIV_DEMO_INCLUDE_DIR "{demo.as_posix()}/include")
-set(KVAF_AIV_DEMO_BIN_DIR "${{CMAKE_BINARY_DIR}}/bin")
+set(KVAF_ACCESS_OPERATOR_SOURCE_DIR "{(root / 'access_operator').as_posix()}")
+set(KVAF_AIV_ALGORITHM_INCLUDE_DIR "${{KVAF_ACCESS_OPERATOR_SOURCE_DIR}}/algorithms/get/direct/urma_aiv/include")
+set(KVAF_AIV_ALGORITHM_BIN_DIR "${{CMAKE_BINARY_DIR}}/bin")
 set(KVAF_CCEC "{root.as_posix()}/ccec")
 set(KVAF_LLD "{root.as_posix()}/ld.lld")
-add_subdirectory(access_operator/demo/aiv_batch_get/kernel kernel)
+add_subdirectory(access_operator/algorithms/get/direct/common/kernel kernel)
 ''')
         build = root / 'build'
         run([cmake, '-S', root, '-B', build])
@@ -99,7 +100,7 @@ add_subdirectory(access_operator/demo/aiv_batch_get/kernel kernel)
         assert direct.stat().st_mtime_ns == old_mtime
         gather = build / 'kernel/kvaf_gather_batch_get_kernels.o'
         gather_before = (gather.read_bytes(), gather.stat().st_mtime_ns)
-        scatter_source = kernel / 'execute_scatter_batch_get_aiv.asc'
+        scatter_source = root / 'access_operator/algorithms/get/direct/urma_aiv/kernel/execute_scatter_batch_get_aiv.asc'
         scatter_source.write_text(scatter_source.read_text() + '\n// isolation rebuild\n')
         run([cmake, '--build', build, '--target', 'kvaf_scatter_batch_get_kernel', '-j4'])
         assert (gather.read_bytes(), gather.stat().st_mtime_ns) == gather_before

@@ -80,7 +80,7 @@ Status Transport::ConfigureGather(void* memory, std::uint64_t base, std::size_t 
 Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     const peer::OpenAivCpuPushJettyRequest& request,
     urma::GetTpList query, urma::ImportJettyEx import, std::uint32_t psn,
-    peer::OpenAivCpuPushJettyResponse* result) {
+    peer::OpenAivCpuPushJettyResponse* result, std::uint64_t canonical_base) {
   const auto& setup = request.base;
   const auto jettys = request.payload_jettys;
   if (context_ || !context || !source || !query || !import || !result || !psn ||
@@ -105,6 +105,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   context_ = context;
   session_ = setup.session_id;
   source_ = source;
+  source_base_ = canonical_base ? canonical_base : source->seg.ubva.va;
   source_bytes_ = setup.source_bytes;
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
@@ -517,13 +518,13 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
     for (; it != q.source_runs.end() && it->local < post.end_sge; ++it) {
       const auto first = std::max(it->local, post.first_sge);
       const auto end = std::min(it->local + it->count, post.end_sge);
-      for (auto i = first; i < end; ++i) q.local[i].addr = addresses[it->row + i - it->local];
+      for (auto i = first; i < end; ++i) q.local[i].addr = source_->seg.ubva.va + (addresses[it->row + i - it->local] - source_base_);
     }
   } else {
     auto it = std::lower_bound(q.sources.begin(), q.sources.end(), post.first_sge,
         [](const PreparedQueue::Source& s, std::uint32_t i) { return s.local < i; });
     for (; it != q.sources.end() && it->local < post.end_sge; ++it)
-      q.local[it->local].addr = addresses[it->row] + it->offset;
+      q.local[it->local].addr = source_->seg.ubva.va + (addresses[it->row] - source_base_) + it->offset;
   }
   auto marker = std::lower_bound(q.markers.begin(), q.markers.end(), post.first_sge,
       [](const PreparedQueue::Marker& m, std::uint32_t i) { return m.local < i; });

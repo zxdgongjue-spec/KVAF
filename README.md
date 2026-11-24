@@ -6,7 +6,12 @@ KVAF 是面向 KV Cache 的 Runtime。它负责管理 KV block 在存储设备�
 
 当前支持 AIV URMA、AIV UBmem、AICPU Put/Gather 和 AICPU Put/Scatter。
 CPU 端使用同一个服务程序，NPU 端默认构建一份包含全部后端的 Python 包，
-通过 `NpuRuntime` 构造参数选择本次 Runtime 使用的实现。
+通过 `NpuRuntime` 配置默认实现和各 provider 预算；每次调用可通过 `execution` 选择算法，
+每种 Get 的资源和执行状态首次准备后驻留复用。四种 Get 均可在同一 stream 上保留多张图，
+每张图可通过多个节点租约捕获多个 Get。
+
+实现边界、四种 Get 图模式与部署步骤见 [实现与使用](docs/cache_transport_execution_implementation.md)，
+性能入口与验证范围见 [验证指南](docs/cache_transport_execution_validation.md)。
 
 
 ## KVAF-Runtime 核心能力
@@ -16,11 +21,11 @@ CPU 端使用同一个服务程序，NPU 端默认构建一份包含全部后端
 
 | 接口 | 语义 |
 | --- | --- |
-| `Initialize` | 申请并注册远端 DDR，初始化数据面并注册 region。失败时清理已获得资源；清理失败则保留状态供重试。 |
-| `BatchPut` | 先由 MetaManager 为 Key 预留 slot，再由 Operator 搬运数据；搬运成功后提交映射，失败则回滚预留 slot。 |
+| `Initialize` | 申请 CacheRegion 并初始化元数据；具体 provider 的数据面资源在首次使用或 warmup 时准备。失败时清理已获得资源；清理失败则保留状态供重试。 |
+| `BatchPut` | 先由 MetaManager 为 Key 预留 slot，再由 Operator 搬运数据；成功后提交映射，确定失败则回滚，完成状态未决则保留事务供恢复。 |
 | `PrepareAccessTable` | 对一批 Key 建立稳定读快照，生成扁平的 address/length/valid 访问表。 |
 | `BatchGet` | 使用 AccessTable 和调用方输入提交批量读取；NPU 路径默认只向指定 stream 入队。 |
-| `ReleaseAccessTable` | 释放稳定读快照，解除 Key 的 pin。 |
+| `ReleaseAccessTable` | 归还调用方的读快照引用；仍被在途 Get 或图租约持有的快照继续保护 Key，最后一个引用释放后才解除 pin。 |
 | `BatchFree` | 回收 Key 的 DDR slot；仍被 AccessTable 持有的 Key 不会被提前释放。 |
 | `Shutdown` | 先停止并排空传输，再释放远端 DDR 和内部资源；清理失败可重试。 |
 
@@ -36,15 +41,30 @@ AccessTable 锁和内部传输资源。调用方必须在同一 BatchGet stream 
 
 ```text
 kvaf/
-├── common/include/        # 模块间共享的类型、请求与 Status
-├── runtime/               # KVAF Runtime
-├── meta_manager/          # Meta Manager
-├── access_operator/       # KV Access Operator
-├── bindings/              # 可选的 Python/Pybind 注册入口
-├── python/kvaf/           # Python 包入口
-├── scripts/               # 构建辅助脚本
-└── tests/                 # 主机回归、硬件功能及性能测试
+├── common/include/          # 跨模块的类型、请求、Status 和协议布局
+├── meta_manager/            # Key → DDR 元数据、slot 与访问表锁
+├── runtime/
+│   ├── include/             # 公共 Runtime 接口
+│   ├── src/                 # RuntimeCore、NpuRuntime 入口和配置
+│   ├── execution/           # 调度、执行资源管理；上下文和绑定接口在 include/
+│   ├── memory/              # 缓存池、DDR 注册与分配
+│   ├── peer/                # 链路与控制协议
+│   └── cpu_service/         # 服务入口、backends、URMA 基础、Gather/Push worker
+├── access_operator/
+│   ├── algorithms/get/      # Direct、Gather、Scatter，按执行实现细分
+│   ├── algorithms/put/      # URMA AIV、URMA AICPU、UBMEM AIV
+│   ├── providers/           # Runtime adapter 和算法资源 owner
+│   ├── transports/          # Direct-HCCP、AICPU URMA、UBMEM
+│   └── include/             # 公共接口与资源视图
+├── bindings/                # Python/Pybind 注册入口
+├── python/kvaf/             # Python 包入口
+├── scripts/                 # 构建辅助脚本
+└── tests/                   # 性能入口、数据预检和诊断工具
 ```
+
+具体算法的 Host、ABI、kernel 分布见 [AccessOperator 目录](access_operator/README.md#目录)，
+Runtime 的内部划分见 [Runtime 源码目录](runtime/README.md#源码目录)。AIV Gather/Scatter
+尚未实现；CPU Pull 与 NPU Pull 已接入，控制和源注册实现位于 `runtime/src/`。
 
 ```text
 调用方 / vLLM Adapter（仓外）
@@ -62,15 +82,6 @@ Key → DDR 地址    BatchPut / BatchGet 数据面
          远端 DDR region
 ```
 `CacheOS-vLLM Adaptor` 在 vLLM 侧实现，不属于当前代码仓。
-
-| 模块 | 职责 |
-| --- | --- |
-| `common/` | 跨模块共享的类型、请求和 `Status`。 |
-| `meta_manager/` | Key 到远端 DDR 地址的内存态元数据、slot 分配、访问表锁定和释放。 |
-| `access_operator/` | AIV URMA、UBmem、AICPU Gather/Scatter/Put 算子，以及 HCCP/UMDK 和内存映射资源。 |
-| `runtime/` | `Runtime` 接口、`RuntimeCore`、`NpuRuntime`、`CpuRuntime`、TCP `RuntimeService` 与 peer 控制协议。 |
-| `bindings/` | 可选的 pybind 模块，导出 Python `kvaf.NpuRuntime` 和 Mock Runtime。 |
-| `tests/` | 配置、构建和清理回归，Python Mock 测试，CPU/NPU 端到端及性能测试。 |
 
 ## CPU/NPU 分离部署
 
@@ -110,33 +121,36 @@ URMA、UBmem 请求，后端资源按需初始化。URMA 依赖 UB 驱动、UMDK
 
 `NpuRuntime` 在连接 CPU 服务后初始化远端 DDR。
 
-- 先 `link_to(cpu_ip:port)`，再由 `initialize()` 申请 DDR 并初始化所选数据面；
-- URMA 自动发现 NPU 本端 EID：优先使用 HCCL rootinfo 中与当前物理卡匹配的 CLOS PG EID，
-  不可用时回退到 `/proc/asdrv_ub/pair_info`；
-- AIV URMA 将显式 `npu_eids` 列表作为多路径条带；AICPU Gather/Scatter 将列表
-  作为逐一尝试的候选，最终选用一个 EID；
-- URMA 候选初始化使用所选后端的 BatchPut 验证链路，失败并完成清理后尝试下一候选；
+- `initialize()` 只初始化基础设备；DDR 路径先 `link_to(cpu_ip:port)`，再调用
+  `initialize(ddr_bytes, slot_size)` 完成基础设备和 DDR 初始化；也可先调用无参数
+  `initialize()`，再单独调用 `initialize_ddr(ddr_bytes, slot_size)`；
+- 普通缓存 URMA 自动选路时，本机 NPU 优先使用 Pair Info 的 `remote_eid`，缺失时使用当前物理卡的首个有效 CLOS EID。
+  远端 NPU 只使用 CLOS。CPU 端优先遵循显式设备设置，本机自动选择时优先匹配 Pair Info 的 `local_eid`；
+- AIV URMA Get 将显式 `npu_eids` 列表作为多路径条带；Put 和 AICPU 使用首项；
+- 初始化不执行探测写入；算法及数据面资源在首次使用或 warmup 时准备；
 - `BatchPut`：将 NPU Tensor 中的 KV block 写入 CPU DDR，并提交元数据；
 - `PrepareAccessTable` / `access_table_view`：为 BatchGet 生成稳定的 CPU 或 NPU
   AccessTable；
 - `BatchGet`：通过所选后端搬运数据；默认仅入队到调用方 stream；
 - `BatchFree`：释放 Key 对应的 slot。仍被 AccessTable 持有的 Key 会返回 busy。
 
-一个 `NpuRuntime` 连接一个 CPU 服务并使用一个远端 DDR region。后端在构造时固定，
-Get/Put 成对使用；本期不支持同一 Runtime 混用 UBmem 和 URMA，也不支持按次切换算法。
-切换配置需关闭原 Runtime 后创建新 Runtime，缓存数据不会自动迁移。
+普通缓存和 CPU Pull 在一个 `NpuRuntime` 内使用同一个 CPU 服务和远端 DDR 缓存池。
+普通 Put/Get 经过 Dispatcher，默认配置可由每次调用的 `execution` 覆盖；`transport_mode="urma+ubmem"`
+允许在同一池上使用 URMA 和 UBMEM。执行上下文按配置驻留，输入/输出长期注册绑定可选。
+NPU Pull 使用独立 HBM 建链，不要求连接 CPU 服务或初始化 DDR。
 
-### 后端选择
+### 执行配置
 
-| `transport` | `aicpu_batch_get_mode` | BatchPut | BatchGet |
+| 操作 | transport | executor | Get algorithm |
 | --- | --- | --- | --- |
-| `"urma"`（默认） | `""`（默认） | AIV URMA | AIV URMA |
-| `"urma"` | `"gather_read"` | AICPU UMDK | CPU Gather + AICPU READ |
-| `"urma"` | `"cpu_push_scatter"` | AICPU UMDK | CPU Push + AICPU Scatter |
-| `"ubmem"` | `""` | AIV UBmem | AIV UBmem |
+| AIV URMA Put/Get | `"urma"` | `"aiv"` | `"direct"` |
+| AICPU Put/Gather | `"urma"` | `"aicpu"` | `"gather"` |
+| AICPU Put/Scatter | `"urma"` | `"aicpu"` | `"scatter"` |
+| AIV UBmem Put/Get | `"ubmem"` | `"aiv"` | `"direct"` |
 
-`ubmem` 搭配非空 mode、未知 mode 以及 `gather_read_direct` 都会报错。
-AICPU-only 构建也需要显式填写 mode；空 mode 始终表示请求 AIV，不会自动改选。
+Put 和 Get 分别使用 `PutExecutionConfig`、`GetExecutionConfig`，可独立选择。
+未指定默认配置时选择当前构建可用的实现；显式指定的未构建 provider 在首次使用时报错，
+不自动替换算法。AIV Gather/Scatter 尚未实现；没有 enable 列表或第二条 legacy 执行路径。
 
 ## 环境要求
 
@@ -153,6 +167,13 @@ AICPU-only 构建也需要显式填写 mode；空 mode 始终表示请求 AIV，
 ## 构建
 
 以下命令均在仓库根目录执行。
+
+`build.sh` 默认使用 `RelWithDebInfo`（常见 GCC/Clang 配置为 `-O2 -g -DNDEBUG`），
+CPU、NPU 和 AICPU 模式均显式设置构建类型；复用目录时也会覆盖旧缓存中的空值或其他类型。
+需要其他构建类型时显式指定，例如 `./build.sh npu --build-type Release` 或
+`./build.sh cpu --build-type Debug`。独立设置编译参数的目标和设备 kernel 仍沿用各自配置。
+直接使用 `cmake` 时不会自动选择 `build.sh` 的角色和默认选项；应显式设置构建类型、
+后端及 `KVAF_BUILD_PYTHON` 等开关，不能仅指定 `CMAKE_BUILD_TYPE` 来代替完整 NPU 配置。
 
 ### 构建 CPU 服务
 
@@ -178,10 +199,13 @@ build-cpu/runtime/kvaf_cpu_service
 ```bash
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
-./build.sh npu
+PYTHON="$(command -v python)" ./build.sh npu
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+python -c 'import torch; import torch_npu; import kvaf; print(kvaf.__file__)'
 ```
 
-默认同时构建 AIV URMA、UBmem、AICPU Put/Gather/Scatter，输出一份 Python 包。
+使用安装了 `torch_npu` 的同一个 Python 构建和运行。默认同时构建 AIV URMA、UBmem、
+AICPU Put/Gather/Scatter 及 CPU/NPU Pull，输出一份 Python 包。
 构建成功后自动将 AICPU 设备包安装到所选 CANN 根目录；无需 `--install-kernel`。
 `ASCEND_HOME_PATH` 和 `ASCEND_CANN_PACKAGE_PATH` 同时设置时必须指向同一真实目录。
 安装完成后重启 NPU 客户端进程。
@@ -189,7 +213,9 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 按需裁剪或检查安装：
 
 ```bash
-./build.sh npu --without-aicpu      # 原来的 AIV/UBmem 构建，不安装 AICPU 包
+./build.sh npu --without-aicpu      # AIV/UBmem 和两种 Pull，不安装 AICPU 包
+./build.sh npu --cpu-pull-only      # CPU Pull 与 Python 包，不构建设备 kernel
+./build.sh npu --raw-pull-only      # NPU Pull 与 Python 包，只构建 raw READ kernel
 ./build.sh npu --without-python     # 全部后端及设备包，不构建 Python binding
 ./build.sh npu --check-kernel       # 检查已安装的 Gather/Scatter 包，不重新构建
 ./build.sh aicpu-urma               # 仅 AICPU Put/Gather，构建后自动安装
@@ -197,8 +223,8 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ```
 
 这些是按需选择的不同命令，不需要依次执行。`aicpu-urma` 默认输出到
-`build-aicpu-urma`；统一构建使用 `build-npu`，运行时通过 `transport` 和
-`aicpu_batch_get_mode` 选择后端，无需切换 Python 包。
+`build-aicpu-urma`；统一构建使用 `build-npu`，运行时通过 `transport_mode` 和
+Put/Get 执行配置选择实现，无需切换 Python 包。
 `--without-aicpu` 不检查 AICPU 依赖，也不修改已经安装的 AICPU 包；需要卸载时单独执行
 `./build.sh npu --uninstall-kernel`。原 `--install-kernel` 参数保留兼容。
 
@@ -207,10 +233,12 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ```text
 build-npu/python/kvaf/
 build-npu/bin/kvaf_execute_batch_get_kernels.o
-build-npu/bin/kvaf_sequential_batch_get_kernels.o
+build-npu/bin/kvaf_scatter_batch_get_kernels.o
+build-npu/bin/kvaf_gather_batch_get_kernels.o
 build-npu/bin/kvaf_execute_batch_put_kernels.o
-build-npu/access_operator/src/aicpu_urma/kernel.json
-build-npu/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz
+build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
+build-npu/access_operator/transports/aicpu_urma/kernel.json
+build-npu/access_operator/transports/aicpu_urma/kvaf-aicpu-urma.tar.gz
 ```
 
 构建与运行选择相同的 CANN 根目录。AICPU 的固定安装位置为：
@@ -221,162 +249,98 @@ build-npu/access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz
 ```
 
 Runtime 自动定位已安装的 AICPU 包，不再接受 `aicpu_urma_kernel_json_path`。
-AIV/UBmem 的 `.o` 仍需显式传入，参数要求见下方 Python 调用说明。
+AIV/UBmem 默认使用本次构建目录下的 Put/Get `.o`，可通过 `ExecutionResources.kernel_path` 覆盖。
+NPU raw Pull 默认使用本次构建目录下的 `.o`，可通过 `NpuPullOptions.kernel_path` 覆盖。
 
-## 启动与端到端验证
+## 启动与性能测试
 
-### 1. 启动 CPU 服务
-
-在 CPU 主机上执行：
+在 CPU 主机上启动与 NPU 构建来自同一提交的服务：
 
 ```bash
 ./build-cpu/runtime/kvaf_cpu_service \
-  --listen 0.0.0.0 --port 28999 \
-  --gather-threads 8 --gather-mode active --gather-affinity off
+  --listen 0.0.0.0 --port 21111 \
+  --gather-threads 8 --gather-mode active
 ```
 
-此启动命令可供全部四种后端共用。三个 `--gather-*` 参数仅控制 CPU Gather 的
-线程预算、等待方式和绑核行为，不影响 AIV、UBmem 或 CPU Push Scatter 的执行。
-Gather 的 CPU 线程预算须不小于客户端 AICPU worker 数；上例支持后续的 1/2/4/5 worker 测试。
+四种 Get 共用这个服务。Gather 的 CPU 线程预算须不小于客户端 AICPU worker 数；
+其他后端不使用这两个 `--gather-*` 参数。服务启动后打印 `LISTEN`。
+按实际路由可增加 `--ub-device NAME --eid-index N`。
+CPU 亲和性由外部 `numactl` 或 `taskset` 设置。
+远端 A+K 的 URMA AIV Direct BatchGet 默认使用两个 CPU FE。NPU 端可用
+`KVAF_DEFAULT_PEER_FE_COUNT=1` 改为单 FE，或用 `--peer-ub-device devA,devB,devC` 指定设备顺序。
+初始化与首次使用的边界见 [Runtime](runtime/README.md)；两端需使用匹配产物。
 
-服务启动后打印 `LISTEN`；首次 URMA 请求触发 device/EID 枚举并打印 `CANDIDATE_DISCOVERED`。
-也可按需要传入 `--ub-device NAME --eid-index N` 来选定 URMA 端口。
-AIV N 端性能脚本开启 `--adaptive-ub-device` 后，K 端未指定设备时会从脚本配置的
-`KVAF_ADAPTIVE_UB_DEVICES` 中测速选优；K 端指定单个 `--ub-device` 时走原生路径。
-详见 [Runtime 启动选优](runtime/README.md#可选启动-ub-device-选优)；N/K 两端需同时升级至控制协议 v6。
-
-### 2. 验证 AIV URMA
-
-在 NPU 主机上加载 CANN 环境后执行。以下用本机 CPU 服务举例；跨主机部署时将
-`127.0.0.1` 替换为 CPU 服务的可达地址，`DEVICE_ID` 改为实际设备号。
+在 NPU 主机加载 CANN 环境、构建并安装设备包后，从仓库根目录运行：
 
 ```bash
-export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-export KVAF_CPU_SERVICE_ADDR="127.0.0.1:28999"
-export DEVICE_ID=0
-
-tests/run_remote_cpu_e2e.sh "$PWD/build-npu"
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend aiv --execution both \
+  --request-length 32768 --table-capacity 4096 --miss-count 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --seed 20260903 --no-sort-input-indices \
+  --source-access-pattern random --output-access-pattern contiguous \
+  --warmup 10 --iterations 100 --kernel-profile
 ```
 
-测试会依次验证 Runtime 初始化、CPU DDR 分配、EID/Jetty 建链、AIV BatchPut、
-BatchGet 结果和 teardown。正常完成时：
+跨主机部署时将 `127.0.0.1` 替换为 CPU 服务的可达地址。
+`--backend` 支持 `aiv`、`ubmem`、`gather_read`、`cpu_push_scatter`；
+各后端的核数和完整计时范围见[统一 Get 性能测试](docs/batch_get_performance.md)。
+单卡脚本默认报告端到端和算子耗时、带宽。上例加 `--kernel-profile` 查看分段明细。
+数据预检、输出校验和设备计时回读均在 E2E 计时之外。
+追加 `--multi-graph-check` 可在计时前验证多节点报告隔离，以及自动预热/捕获、
+不同 stream 上由调用方串行执行的多图、图与普通 Get 共用输出。
 
-- NPU 侧输出 Runtime 初始化和正确性通过信息；
-- CPU 侧出现 `REGION_ALLOCATED`、`CHANNEL_CREATED` 与 `REGION_RELEASE`。
+Put 使用 `tests/run_remote_cpu_batch_put_perf.sh`，支持 URMA AIV、UBMEM AIV、URMA AICPU。
+三种 Put 的命令、输入复用及验证范围见[性能验证步骤](docs/cache_transport_execution_validation.md)。
 
-该入口调用 [test_npu_batch_get.py](tests/python/test_npu_batch_get.py)，mode 省略时验证
-默认 AIV 路径。硬件测试出现 `SKIP` 表示未实际执行，不应视为通过。
-
-### 3. 验证 AICPU Gather / Scatter
-
-保持同一个 CPU 服务和上面的 NPU 环境，使用统一构建的 Python 包：
+需要分析整个 Runtime 的 API 成本时运行：
 
 ```bash
-python3 access_operator/demo/aicpu_batch_get/python/test_batch_get.py \
-  --device-id "$DEVICE_ID" --peer "$KVAF_CPU_SERVICE_ADDR" \
-  --modes gather_read cpu_push_scatter --workers 1 2 4 5 \
-  --blocks 4096 --token-bytes 656 --tokens-per-block 2 \
-  --output-row-step 1 --warmup 3 --iterations 20
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2 \
+bash tests/run_remote_cpu_runtime_perf.sh build-npu
 ```
 
-实测 CPU Push Scatter 在 8 个 AICPU worker 时存在问题，当前测试示例统一使用
-1、2、4、5 个 worker，暂不推荐 Scatter 使用 8 个 worker。
+该性能脚本测量初始化、BatchPut、AccessTable 准备和上传、BatchGet、BatchFree、shutdown，
+输出各 API 的 `PERF_RESULT`。追加 `--transport ubmem` 可测 UBMEM。
+默认总超时 600 秒，可通过 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 调整。
 
-[test_batch_get.py](access_operator/demo/aicpu_batch_get/python/test_batch_get.py)
-每轮先执行 AICPU BatchPut，再执行 Gather/Scatter 并比较整个输出。它还检查两种
-Table 重载、空/部分请求前缀、随机输入和输出行、异步调用后同 stream 的 NPU 消费。
-两种模式乘以四种 worker 数，应输出 8 条 `AICPU_BATCH_GET_PASS`。
-将 `--output-row-step` 改为 `2` 可进一步检查输出间隔未被误写。
-
-可追加 `--npu-eids "实际EID1,实际EID2"`，或设置 `KVAF_NPU_EIDS`。Gather 和 Scatter
-都会逐一尝试候选，最终选用一个 EID。要验证失败回退，应将格式合法但对当前连接
-不可用的候选放在前面，已确认可用的候选放在后面，并检查 `UMDK_EID_SELECTED` 日志。
-脚本不再接受 `--kernel-json` 或 `--source-mode direct`。
-
-### 4. 验证 UBmem
-
-使用支持 Host P2P DDR/Fabric 映射的硬件和驱动，保持上述 CPU 服务运行：
-
-```bash
-export KVAF_RUN_NPU_TESTS=1
-export KVAF_BATCH_GET_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_get_kernels.o"
-export KVAF_BATCH_PUT_KERNEL="$PWD/build-npu/bin/kvaf_execute_batch_put_kernels.o"
-
-python3 tests/python/test_npu_batch_get.py --transport ubmem
-```
-
-同一个测试文件覆盖 UBmem Put/Get 和数据校验；不设置 AICPU mode。
-
-### 5. Runtime 性能测试
-
-CPU 服务保持运行，在 NPU 主机执行：
-
-```bash
-tests/run_remote_cpu_runtime_perf.sh "$PWD/build-npu"
-```
-
-此脚本默认测 AIV URMA；追加 `--transport ubmem` 可测 UBmem。
-脚本先执行完整数据路径正确性 preflight；通过后输出各 Runtime API 的
-`PERF_RESULT`，包括初始化、BatchPut、AccessTable、BatchGet、BatchFree 和 shutdown。
-默认总超时为 600 秒，可通过 `KVAF_REMOTE_CPU_PERF_TIMEOUT` 调整。
-
-性能场景可通过以下变量调整：
-
-```text
-KVAF_RUNTIME_PERF_BATCH
-KVAF_RUNTIME_PERF_TABLE_CAPACITY
-KVAF_RUNTIME_PERF_REQUESTS
-KVAF_RUNTIME_PERF_ACTIVE_PERCENT
-KVAF_RUNTIME_PERF_BLOCK_BYTES
-KVAF_RUNTIME_PERF_SOURCE_STRIDE
-KVAF_RUNTIME_PERF_AIV_CORES
-KVAF_RUNTIME_PERF_JETTYS_PER_CORE
-KVAF_NPU_EIDS
-KVAF_RUNTIME_PERF_WARMUP
-KVAF_RUNTIME_PERF_ITERATIONS
-```
-
-AICPU 性能测试分别使用 [Gather sweep](tests/run_aicpu_gather_read_sweep.sh) 和
-[Scatter sweep](tests/run_aicpu_cpu_push_scatter_sweep.sh)，构建目录参数均可填写
-`"$PWD/build-npu"`。默认扫描较大的源池；小规模验证可用 `--table-capacity` 缩小源池。
-
-### 6. 无 NPU 的主机回归
-
-使用新的主机构建目录，默认不启用任何设备后端：
-
-```bash
-cmake -S . -B build-host-tests -DBUILD_TESTING=ON -DKVAF_BUILD_PYTHON=OFF
-cmake --build build-host-tests --parallel 4
-ctest --test-dir build-host-tests --output-on-failure
-```
-
-其中 [npu_runtime_config_test.cc](tests/npu_runtime_config_test.cc) 验证后端和安装路径，
-[aicpu_kernel_loader_test.cc](tests/aicpu_kernel_loader_test.cc) 用 ACL 桩检查内核入口，
-[test_aicpu_configuration.py](tests/python/test_aicpu_configuration.py) 验证 CLI 与包检查，
-[test_build_script.py](tests/python/test_build_script.py) 模拟编译步骤并实际执行临时目录安装。
-这些回归不能替代 CANN 设备编译和真机 Put/Get 验证。
+普通缓存测试以性能入口的数据预检和输出校验为主，公共模块位于 `tests/python/utils/`。
+Pull 功能、协议和故障注入验证见 [CPU Pull](docs/cpu_pull_offload_usage.md)、
+[NPU raw READ](docs/hbm_raw_addr_read.md) 和 [Host 诊断](tests/diagnostics/README.md)。
 
 ## Python 调用流程
 
-通过 `transport` 和 `aicpu_batch_get_mode` 选择前述四种组合。前三个基础参数
-`batch_get_kernel_object_path`、`batch_get_token_bytes`、`batch_get_tokens_per_block`
-必须传入。原有参数直到 `transport` 仍支持位置传参；新增的
-`aicpu_batch_get_mode` 仅接受关键字传参，其他配置也建议使用关键字。
+从 main 迁移时，先读[接口迁移与最小 Put/Get 示例](docs/cache_transport_execution_implementation.md#python-migration)。
+vLLM/模型图适配见[多节点捕获、回放与释放示例](docs/cache_transport_execution_implementation.md#get-graph-example)
+及[框架接入位置](docs/cache_transport_execution_implementation.md#framework-graph-integration)：
+图 runner 管理每张图的资源 owner，层内仍调用普通 `batch_get`。
 
-| 内核路径参数 | AIV URMA | UBmem | AICPU Gather/Scatter |
-| --- | --- | --- | --- |
-| `batch_get_kernel_object_path` | 必须提供有效 `.o` | 必须提供有效 `.o` | 必须传参，填 `""` 即可 |
-| `batch_put_kernel_object_path` | 必须提供，初始化时用于 Put 探测 | 使用 Put 时必须提供；只用 Get 可省略 | 可省略，不使用 |
+`NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *, device_id=0,
+transport_mode="urma", default_put=None, default_get=None, put_resources=None,
+get_resources=None, npu_eids=[], peer_ub_device="", cpu_pull_options=None,
+npu_pull_options=None)` 的两个 token 布局参数可同时省略，用于独立 Pull；普通缓存 Get
+在 provider 首次准备时要求有效布局。显式布局必须同时为正数，其余参数只接受关键字。
+`transport_mode` 可取 `urma`、`ubmem` 或 `urma+ubmem`。
 
-AIV/UBmem 的 `.o` 不会自动定位。AICPU 从 CANN 安装目录定位自己的设备包，
-Get/Put 不使用上述 `.o`。`npu_core_count` 表示 AIV core 数或 AICPU worker 数，
-AICPU 的参数校验范围为 1 到 8；推荐测试配置及 Scatter 的已知限制见前文验证示例。
+算法选择通过 `default_put/default_get` 和单次调用的 `execution` 完成。
+`put_resources/get_resources` 是 `(config, ExecutionResources(...))` 列表，提供该实现的
+核数、容量、kernel 路径等预算，不控制 provider 是否可选。默认核数/worker 数为 URMA AIV
+Put 2、Get 本机 2 / 远端 A+K 4、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5。
+URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1，Put 每核默认 2 个。两种 Get 场景每卡均为 4 个 Jetty，`max_inflight_total=2048`。未使用算法不会要求预算或 kernel 有效。
 
-下面使用默认 AIV URMA；改成 `transport="ubmem"` 可使用 UBmem，mode 保持为空。
+| 资源项 | AIV URMA / UBmem | AICPU Gather/Scatter / Put |
+| --- | --- | --- |
+| `kernel_path` | 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o`；非空值覆盖 | 不设置；首次准备时解析 CANN 安装包 |
+| `cores` | AIV core 数，1..48 | AICPU worker 数，1..8 |
+| `jettys` | 仅 URMA AIV：Get 1..64，Put 1..2 | 不设置 |
+
+默认 kernel 路径在构建时记录为绝对路径，`./build.sh npu --build-dir DIR` 自动使用
+`DIR/bin/`，不依赖应用启动目录。移动构建产物后须重新构建或显式覆盖 `kernel_path`。
+下面使用 AIV URMA 的默认预算和路径；UBmem 改用 `transport_mode="ubmem"` 及对应 Put/Get 配置。
 
 ```python
 import os
-from pathlib import Path
 
 import torch
 import torch_npu
@@ -384,17 +348,13 @@ import kvaf
 
 device_id = int(os.environ.get("DEVICE_ID", "0"))
 torch.npu.set_device(device_id)
-build_dir = Path("build-npu").resolve()
+put = kvaf.PutExecutionConfig("urma", "aiv")
+get = kvaf.GetExecutionConfig("urma", "aiv", "direct")
 runtime = kvaf.NpuRuntime(
-    batch_get_kernel_object_path=str(build_dir / "bin/kvaf_execute_batch_get_kernels.o"),
     batch_get_token_bytes=656,
     batch_get_tokens_per_block=128,
     device_id=device_id,
-    npu_core_count=2,
-    batch_put_kernel_object_path=str(build_dir / "bin/kvaf_execute_batch_put_kernels.o"),
-    transport="urma",
-    aicpu_batch_get_mode="",
-    jettys_per_core=2,
+    transport_mode="urma", default_put=put, default_get=get,
     npu_eids=[],  # URMA 默认自动发现；UBmem 不使用 EID。
 )
 runtime.link_to(os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28999"))
@@ -409,25 +369,26 @@ runtime.initialize(ddr_bytes=4096 * 656 * 128, slot_size=656 * 128)
 runtime.shutdown()
 ```
 
-`link_to()` 必须先于 `initialize()`。调用方需要在 BatchGet 所在 stream 完成前保持
-输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 管理内部 DDR、元数据和传输资源。
+DDR 路径的 `link_to()` 必须先于 `initialize_ddr()` 或带 DDR 参数的 `initialize()`。
+调用方需要在普通 BatchGet 所在 stream 完成前保持
+输入/输出 Tensor 和 `DeviceAccessTable` 有效；Runtime 管理内部 DDR、元数据和传输资源。异步调用以 `drain_get()`
+完成并回收执行租约；外部 stream 同步不能代替框架回收。
 
 ### EID 与调优参数
 
 | 后端 | `npu_eids=[]` | 显式 `npu_eids=[eid1, eid2, ...]` |
 | --- | --- | --- |
-| AIV URMA | 自动发现，选用一个可用 EID | BatchGet 多 EID 条带，BatchPut 使用第一项 |
-| AICPU Gather/Scatter | 自动发现候选 | 按顺序尝试，最终选用一个；Get/Put 共用选定 EID |
+| AIV URMA | 使用首个自动发现候选 | BatchGet 多 EID 条带，BatchPut 使用第一项 |
+| AICPU Gather/Scatter | 使用首个自动发现候选 | 使用首项；Get/Put 共用选定 EID |
 | UBmem | 不使用 EID | 不用于该后端 |
 
-显式 EID 使用 32 位连续十六进制字符串。AICPU 候选失败后先清理资源，再尝试下一项；
-清理失败则停止并保留资源供重试。`urma_device` 和 `urma_eid_index` 已从
+显式 EID 使用非零、无重复的 32 位连续十六进制字符串；不会回退到自动发现。`urma_device` 和 `urma_eid_index` 已从
 `NpuRuntime` 参数中删除，设备侧 UMDK 根据 Host 选定的 EID 匹配 device/index。
 
 对 AIV URMA，显式列表是原子配置：所有 EID 都必须属于当前物理 NPU，并成功创建
-BatchGet context/MR/channel；任一路径失败都会使该 CPU EID 候选失败，不会回退到
-rootinfo 或 `pair_info`。启动 AIV WRITE/CQ 探测由 BatchPut 在列表第一个 EID
-上完成。EID 数不能超过 `npu_core_count * jettys_per_core`。当前多 EID 指多个
+BatchGet context/MR/channel；任一路径失败会使该 provider 准备失败，不会回退到
+rootinfo 或 `pair_info`，也不会截短列表。EID 数在首次准备 AIV Get 时检查，不能超过
+该 Get 资源项解析后的 `cores * jettys`；默认 Get 是哪种算法不影响此规则。当前多 EID 指多个
 NPU 本端 EID，它们连接到同一个已选 CPU EID/DDR region；CPU 侧多 EID region striping
 不在这一实现中。
 
@@ -448,8 +409,7 @@ Jetty，则不会产生足够 post 使用所有配置路径。
 远端地址和 slot 内 offset 排序，并同步重排 `indices`、`offsets` 和
 `output_indices`；请求构造和排序不计入 BatchGet 计时。
 
-Jetty 数、BatchGet 在途预算和启动带宽调优属于 AIV URMA 配置；AICPU 不启用
-`adaptive_ub_device`。测试脚本读取 `KVAF_NPU_EIDS` 后传给 Runtime，Runtime 本身
+Jetty 数和 BatchGet 在途预算属于 URMA AIV 资源配置；不再提供启动带宽自动调优。测试脚本读取 `KVAF_NPU_EIDS` 后传给 Runtime，Runtime 本身
 不读取该环境变量。
 
 ### UBmem 传输
@@ -465,13 +425,13 @@ CPU DDR 地址空间为 328 MiB；远程部署时替换服务地址。
 ```bash
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999 \
 tests/run_remote_cpu_batch_get_perf.sh "$PWD/build-npu" \
-  --transport ubmem --request-length 4096 --table-capacity 4096 \
+  --backend ubmem --request-length 4096 --table-capacity 4096 \
   --aiv-cores 16 --output-access-pattern contiguous
 ```
 
 ### URMA BatchGet 总在途请求预算
 
-`NpuRuntime(..., batch_get_max_inflight_total=2048)` 默认限制单次 BatchGet 所有
+URMA AIV Get 的 `ExecutionResources(max_inflight_total=2048)` 限制单次 BatchGet 所有
 AIV 核合计的未确认 READ 数。小请求保留整批路径；大请求每核使用两个交叠组，
 完成最老组后补发。设为 0 可对照原实现。性能脚本接受 `--max-inflight-total`，
 或环境变量 `KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`。修改预算需要重新 capture。
@@ -480,7 +440,7 @@ Host、Python binding 和 Kernel 必须一起重编。详见
 
 ### AICPU Gather / Scatter
 
-使用与 AIV/UBmem 相同的 `build-npu/python` 包，显式指定 mode 即可：
+使用与 AIV/UBmem 相同的 `build-npu/python` 包，分别配置 Put 和 Get：
 
 ```python
 import os
@@ -490,14 +450,15 @@ import kvaf
 
 device_id = int(os.environ.get("DEVICE_ID", "0"))
 torch.npu.set_device(device_id)
+put = kvaf.PutExecutionConfig("urma", "aicpu")
+get = kvaf.GetExecutionConfig("urma", "aicpu", "gather")  # Scatter 改为 "scatter"。
 runtime = kvaf.NpuRuntime(
-    batch_get_kernel_object_path="",
     batch_get_token_bytes=656,
     batch_get_tokens_per_block=2,
     device_id=device_id,
-    npu_core_count=4,
-    transport="urma",
-    aicpu_batch_get_mode="gather_read",  # Scatter 改为 "cpu_push_scatter"。
+    transport_mode="urma", default_put=put, default_get=get,
+    put_resources=[(put, kvaf.ExecutionResources(cores=4))],
+    get_resources=[(get, kvaf.ExecutionResources(cores=4))],
     npu_eids=[],
 )
 runtime.link_to(os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28999"))
@@ -506,11 +467,21 @@ runtime.initialize(ddr_bytes=4096 * 656 * 2, slot_size=656 * 2)
 runtime.shutdown()
 ```
 
-两个 mode 都使用 AICPU BatchPut；`gather_read` 使用 CPU gather + AICPU UMDK READ，
-`cpu_push_scatter` 使用 CPU SGL WRITE 到 HBM staging，再由 AICPU scatter 到输出。
+示例显式选择 AICPU BatchPut；`gather` 使用 CPU gather + AICPU UMDK READ，
+`scatter` 使用 CPU SGL WRITE 到 HBM staging，再由 AICPU scatter 到输出。
 两种公开 Table 重载都按 `addresses[indices[i]] + offsets[i]` 解释源地址，
 `gather_read_direct` 不对外开放。
 
 更详细的数据流和性能说明见 [GatherRead](docs/aicpu_gather_read.md) 与
 [CPU Push Scatter](docs/aicpu_cpu_push_scatter.md)。升级时使用同次源码构建 Host 库和设备包，
 安装后重启 NPU 客户端，避免 Host/设备 ABI 不一致。
+
+### CPU Pull 与 NPU Pull
+
+`NpuRuntime.batch_cpu_pull()` 将已注册的本卡或跨卡 HBM 拉到共享 CPU DDR，
+与普通 BatchPut 使用同一个元数据写事务；`batch_get_raw_addr()` 直接读取远端 HBM，
+不要求初始化 DDR。raw NPU Pull 沿用应用负责正常输入保活、同步和销毁捕获图的约定；
+普通 Get/Put 继续使用各自的执行配置和首调准备机制，普通 Get 的图资源租约保持不变。
+默认 NPU 构建包含两种 Pull；单独构建可用 `--cpu-pull-only` 或 `--raw-pull-only`。
+接口、恢复和源内存生命周期见 [CPU Pull](docs/cpu_pull_offload_usage.md)、
+[NPU raw READ](docs/hbm_raw_addr_read.md) 和 [建链流程](docs/connection_handshake_flows.md)。
