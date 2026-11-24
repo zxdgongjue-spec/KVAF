@@ -34,7 +34,7 @@ void BindNpuRuntimeConstructor(pybind11::class_<Runtime>& runtime) {
               py::arg("batch_get_max_inflight_total") = 2048,
               py::arg("transport") = "urma", py::kw_only(),
               py::arg("aicpu_batch_get_mode") = "",
-              py::arg("allocation_mode") = "fixed",
+              py::arg("allocation_mode") = "append_only",
               py::arg("rdma_device") = "", py::arg("rdma_port") = 1,
               py::arg("gid_index") = -1, py::arg("roce_cache_hbm") = false);
 }
