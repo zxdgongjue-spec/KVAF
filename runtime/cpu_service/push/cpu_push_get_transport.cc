@@ -233,18 +233,28 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
   return Status::OK();
 }
 Status Transport::ReadRequest(std::uint64_t* sequence) {
+  // The profile bit is known only after the READ. Measure just this probe,
+  // never the idle interval spent repeatedly reading an unchanged sequence.
+  const auto start = payload_only_ ? BatchGetProfileNowNs() : 0;
   auto result = Transfer(false, layout_.notify, sizeof(Word));
   if (result.ok()) {
     const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
     *sequence = notify & ~kProfileNotify;
     profile_.enabled = (notify & kProfileNotify) != 0;
+    if (payload_only_ && profile_.enabled) {
+      profile_.notify_read_ns = BatchGetProfileNowNs() - start;
+      profile_.cpu_start_ns = start;
+    }
   }
   return result;
 }
 Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (profile_.enabled) {
+    const auto notify_read_ns = profile_.notify_read_ns, cpu_start_ns = profile_.cpu_start_ns;
     profile_ = {};
     profile_.enabled = true;
+    profile_.notify_read_ns = notify_read_ns;
+    profile_.cpu_start_ns = cpu_start_ns;
   }
   Status result;
   {
@@ -258,15 +268,26 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
       r.mode != (direct_output_ ? kDirectOutput : kScatterOutput))
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+  const bool detail = payload_only_ && profile_.enabled;
+  Status read;
+  {
+    BatchGetProfileScope stage(detail ? &profile_.address_list_read_ns : nullptr);
+    read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+  }
   if (!read.ok()) return read;
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  for (std::uint32_t i = 0; i < r.count; ++i)
-    if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
-      return Status::InvalidArgument("CPU push source outside cache region");
+  {
+    BatchGetProfileScope stage(detail ? &profile_.address_validate_ns : nullptr);
+    for (std::uint32_t i = 0; i < r.count; ++i)
+      if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
+        return Status::InvalidArgument("CPU push source outside cache region");
+  }
   if (direct_output_) {
     if (output_remote_) return Error("previous output is still imported");
-    read = Transfer(false, layout_.output_target, sizeof(OutputTarget));
+    {
+      BatchGetProfileScope stage(detail ? &profile_.output_desc_read_ns : nullptr);
+      read = Transfer(false, layout_.output_target, sizeof(OutputTarget));
+    }
     if (!read.ok()) return read;
     output_ = *reinterpret_cast<const OutputTarget*>(memory_ + layout_.output_target);
     if (!output_.base || !output_.token_value || output_.segment_bytes != sizeof(urma_seg_t) ||
@@ -283,7 +304,10 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     flag.bs.mapping = URMA_SEG_NOMAP;
     urma_token_t token{};
     token.token = output_.token_value;
-    output_remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
+    {
+      BatchGetProfileScope stage(detail ? &profile_.output_import_ns : nullptr);
+      output_remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
+    }
     if (!output_remote_) return Error("import output segment");
   }
   return Status::OK();
@@ -407,6 +431,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
 }
 void Transport::RetargetWrites() {
   if (!direct_output_) return;
+  BatchGetProfileScope timer(payload_only_ && profile_.enabled ? &profile_.target_update_ns : nullptr);
   for (auto& plan : prepared_)
     for (auto& q : plan->queues)
       for (const auto& destination : q.destinations) {
@@ -524,18 +549,31 @@ Status Transport::WritePayloadOnly() {
   const bool measure = profile_.enabled && prepared_.size() == 1;
   for (std::size_t w = 0; w < prepared_.size(); ++w) {
     auto& plan = *prepared_[w];
-    for (auto& q : plan.queues) {
-      for (const auto& post : q.posts) RefreshPrepared(q, post);
-      payload_sample_.data_wrs += static_cast<std::uint32_t>(q.wrs.size());
+    {
+      BatchGetProfileScope timer(profile_.enabled ? &profile_.source_sge_update_ns : nullptr);
+      for (auto& q : plan.queues) {
+        for (const auto& post : q.posts) RefreshPrepared(q, post);
+        payload_sample_.data_wrs += static_cast<std::uint32_t>(q.wrs.size());
+      }
     }
-    auto status = BeginPrepared(plan, w + 1);
+    Status status;
+    {
+      BatchGetProfileScope timer(profile_.enabled ? &profile_.data_begin_ns : nullptr);
+      status = BeginPrepared(plan, w + 1);
+    }
     if (!status.ok()) return status;
     std::uint64_t first_post_ns = 0;
     status = PostPrepared(plan, false, nullptr, measure ? &first_post_ns : nullptr);
+    const auto posted = measure ? BatchGetProfileNowNs() : 0;
     if (!status.ok()) return status;
     status = PollPrepared(w + 1);
     if (!status.ok()) return status;
-    if (measure) payload_sample_.elapsed_ns = BatchGetProfileNowNs() - first_post_ns;
+    if (measure) {
+      const auto completed = BatchGetProfileNowNs();
+      payload_sample_.elapsed_ns = completed - first_post_ns;
+      profile_.payload_post_ns = posted - first_post_ns;
+      profile_.payload_cq_wait_ns = completed - posted;
+    }
     // PollPrepared succeeds only after every participating queue's tail CQE.
     payload_sample_.tail_cqes += static_cast<std::uint16_t>(plan.fence_count);
   }
@@ -543,7 +581,11 @@ Status Transport::WritePayloadOnly() {
 }
 Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
-  auto status = PrepareWrites(request().count);
+  Status status;
+  {
+    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.prepare_writes_ns : nullptr);
+    status = PrepareWrites(request().count);
+  }
   if (!status.ok()) return status;
   if (payload_only_) return WritePayloadOnly();
   // Match the ordered-WRITE probe: short submissions to all four queues from
@@ -579,6 +621,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   // as the kernel observes completion; cached plans are retargeted next round.
   if (output_remote_) {
     if (!tracker_.Empty()) return Error("output WRITE is still in flight");
+    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.output_unimport_ns : nullptr);
     if (urma_unimport_seg(output_remote_)) return Error("unimport output segment");
     output_remote_ = nullptr;
   }
@@ -586,8 +629,16 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
   if (payload_only_ && result == Result::kOk) done->cpu_sgl_write = payload_sample_;
   auto status = BeginPrepared(done_, UINT64_MAX);
-  if (status.ok()) status = PostPrepared(done_);
-  if (status.ok()) status = PollPrepared(UINT64_MAX);
+  if (status.ok()) {
+    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.done_post_ns : nullptr);
+    status = PostPrepared(done_);
+  }
+  if (status.ok()) {
+    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.done_cq_wait_ns : nullptr);
+    status = PollPrepared(UINT64_MAX);
+  }
+  if (payload_only_ && profile_.enabled && profile_.cpu_start_ns)
+    profile_.cpu_total_ns = BatchGetProfileNowNs() - profile_.cpu_start_ns;
   return status;
 }
 
@@ -599,6 +650,23 @@ void Transport::PrintProfile() const {
                  request().sequence, std::uint64_t{request().count} * token_bytes_,
                  payload_sample_.elapsed_ns, payload_sample_.data_wrs,
                  unsigned(payload_sample_.waves), unsigned(payload_sample_.tail_cqes));
+    const auto& p = profile_;
+    std::fprintf(stderr,
+        "CPU_SGL_WRITE_STAGES sequence=%" PRIu64 " rows=%u"
+        " notify_read_us=%.3f header_read_us=%.3f address_list_read_us=%.3f address_validate_us=%.3f"
+        " output_desc_read_us=%.3f output_import_us=%.3f plan_us=%.3f target_update_us=%.3f"
+        " source_sge_update_us=%.3f data_begin_us=%.3f payload_post_us=%.3f payload_cq_wait_us=%.3f"
+        " output_unimport_us=%.3f done_post_us=%.3f done_cq_wait_us=%.3f cpu_total_us=%.3f"
+        " plan_reused=%u\n",
+        request().sequence, request().count,
+        p.notify_read_ns / 1000.0, p.header_read_ns / 1000.0,
+        p.address_list_read_ns / 1000.0, p.address_validate_ns / 1000.0,
+        p.output_desc_read_ns / 1000.0, p.output_import_ns / 1000.0,
+        (p.prepare_writes_ns - p.target_update_ns) / 1000.0, p.target_update_ns / 1000.0,
+        p.source_sge_update_ns / 1000.0, p.data_begin_ns / 1000.0,
+        p.payload_post_ns / 1000.0, p.payload_cq_wait_ns / 1000.0,
+        p.output_unimport_ns / 1000.0, p.done_post_ns / 1000.0,
+        p.done_cq_wait_ns / 1000.0, p.cpu_total_ns / 1000.0, unsigned(p.plan_reused));
     return;
   }
 #ifdef __OPTIMIZE__

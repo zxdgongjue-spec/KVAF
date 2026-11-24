@@ -4,10 +4,17 @@
 #include "urma_device_abi.h"
 
 #include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -15,6 +22,7 @@ using kvaf::urma::Sge;
 std::uint32_t device_sges = 13, queue_sges{}, data_wrs{}, data_sges{}, segments{};
 std::uint64_t output_base{}, output_bytes{}, done_address{};
 std::uint32_t ready_wrs{}, data_tails{};
+bool delay_output_import{};
 std::map<urma_jfc_t*, std::deque<std::uint64_t>> completions;
 int QueryTp(urma_context_t*, kvaf::urma::TpQuery*, std::uint32_t* count, kvaf::urma::TpInfo* info) {
   *count = 1; info->tp_handle = 1; return 0;
@@ -51,12 +59,16 @@ urma_status_t urma_unregister_seg(urma_target_seg_t* segment) {
 }
 urma_target_seg_t* urma_import_seg(urma_context_t*, urma_seg_t* value, urma_token_t*,
                                   std::uint64_t, urma_import_seg_flag_t) {
+  if (delay_output_import && value->ubva.va == output_base)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
   auto* segment = new urma_target_seg_t{};
   segment->seg = *value;
   ++segments;
   return segment;
 }
 urma_status_t urma_unimport_seg(urma_target_seg_t* segment) {
+  if (delay_output_import && segment->seg.ubva.va == output_base)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
   --segments; delete segment; return URMA_SUCCESS;
 }
 urma_jfc_t* urma_create_jfc(urma_context_t*, urma_jfc_cfg_t*) {
@@ -124,8 +136,60 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
 }  // extern "C"
 
 namespace {
+void CheckProfile(const kvaf::cpu_push::Transport& transport,
+                  const kvaf::CpuSglWriteSample& sample, std::uint32_t sequence,
+                  bool payload_only, bool profiling) {
+  auto* capture = std::tmpfile();
+  assert(capture);
+  std::fflush(stderr);
+  const auto saved = dup(fileno(stderr));
+  assert(saved >= 0 && dup2(fileno(capture), fileno(stderr)) >= 0);
+  transport.PrintProfile();
+  std::fflush(stderr);
+  assert(dup2(saved, fileno(stderr)) >= 0);
+  close(saved);
+  std::rewind(capture);
+  std::string log;
+  char buffer[4096];
+  while (const auto bytes = std::fread(buffer, 1, sizeof(buffer), capture)) log.append(buffer, bytes);
+  std::fclose(capture);
+  if (!profiling) { assert(log.empty()); return; }
+  if (!payload_only) {
+    assert(log.find("CPU_PUSH_PROFILE ") != std::string::npos);
+    assert(log.find("CPU_SGL_WRITE_STAGES ") == std::string::npos);
+    return;
+  }
+  assert(log.find("CPU_SGL_WRITE_SAMPLE sequence=" + std::to_string(sequence)) == 0);
+  const auto stages = log.find("CPU_SGL_WRITE_STAGES ");
+  assert(stages != std::string::npos);
+  std::istringstream fields(log.substr(stages));
+  std::map<std::string, double> values;
+  std::string field;
+  while (fields >> field) {
+    const auto equals = field.find('=');
+    if (equals != std::string::npos) values[field.substr(0, equals)] = std::stod(field.substr(equals + 1));
+  }
+  assert(values.at("sequence") == sequence);
+  assert(values.at("plan_reused") == (sequence == 2));
+  double accounted = 0;
+  for (const auto* name : {"notify_read_us", "header_read_us", "address_list_read_us", "address_validate_us",
+                           "output_desc_read_us", "output_import_us", "plan_us", "target_update_us",
+                           "source_sge_update_us", "data_begin_us", "payload_post_us", "payload_cq_wait_us",
+                           "output_unimport_us", "done_post_us", "done_cq_wait_us"}) {
+    assert(values.at(name) >= 0 && std::isfinite(values.at(name)));
+    accounted += values.at(name);
+  }
+  assert(accounted <= values.at("cpu_total_us") + 0.02);  // Allow printed rounding.
+  assert(std::abs(values.at("payload_post_us") + values.at("payload_cq_wait_us") -
+                  sample.elapsed_ns / 1000.0) <= 0.002);
+  if (delay_output_import) {
+    assert(values.at("output_import_us") >= 2000);
+    assert(values.at("output_unimport_us") >= 2000);
+    assert(values.at("cpu_total_us") >= sample.elapsed_ns / 1000.0 + 4000);
+  }
+}
 void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 4096,
-         std::uint32_t token_bytes = 656, bool payload_only = false) {
+         std::uint32_t token_bytes = 656, bool payload_only = false, bool profiling = true) {
   using namespace kvaf::cpu_push;
   Layout layout;
   assert(MakeLayout(token_bytes, 4, &layout, true));
@@ -172,7 +236,7 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
     for (std::uint32_t i = 0; i < count; ++i)
       addresses[i] = source_segment.seg.ubva.va + ((count - i + sequence - 1) % count) * token_bytes;
     data_wrs = data_sges = ready_wrs = data_tails = 0;
-    reinterpret_cast<Word*>(hbm + layout.notify)->value = sequence | kProfileNotify;
+    reinterpret_cast<Word*>(hbm + layout.notify)->value = sequence | (profiling ? kProfileNotify : 0);
     std::uint64_t received = 0;
     assert(transport.ReadRequest(&received).ok() && received == sequence);
     assert(transport.ReadDescriptor(sequence).ok());
@@ -182,11 +246,12 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
     if (payload_only) {
       assert(ready_wrs == 0 && sample.data_wrs == data_wrs && sample.tail_cqes == data_tails);
       assert(sample.waves == (count == 65536 ? 2 : 1));
-      assert((sample.elapsed_ns > 0) == (sample.waves == 1));
+      assert((sample.elapsed_ns > 0) == (sample.waves == 1 && profiling));
       assert(data_tails == (count == 1 ? 1 : 4 * sample.waves));
     } else {
       assert(ready_wrs > 0 && sample.waves == 0 && sample.elapsed_ns == 0);
     }
+    CheckProfile(transport, sample, sequence, payload_only, profiling);
     if (count == 4096 && token_bytes == 656) {
       assert(data_wrs == (expected == 4 ? 1024 : expected == 8 ? 512 : 320));
       assert(data_sges == count);
@@ -229,6 +294,10 @@ int main() {
   Run(8, 8, 65, 10000, true);
   Run(4, 4, 1, 656, true);  // Only one Jetty has payload.
   Run(4, 4, 65536, 16, true);  // Complete both waves, leave elapsed_ns unset.
+  Run(4, 4, 4096, 656, true, false);  // No diagnostic output without profiling.
+  delay_output_import = true;
+  Run(4, 4, 4096, 656, true);  // Import/retirement delay stays outside the payload window.
+  delay_output_import = false;
   Reject(8, 4, kvaf::cpu_push::kDirectOutput);
   Reject(17, 32, kvaf::cpu_push::kDirectOutput);
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);

@@ -94,7 +94,9 @@ machines for those checks.
 `cpu_sgl_transport.cc` links the real CPU WRITE transport to a fake URMA
 provider. With public UMDK headers, it checks the queue SGE setting, actual
 4/8/automatic SGE chains and WR counts, payloads, cached-plan output changes,
-64 KiB splitting, explicit limits above hardware capacity, and import retirement:
+64 KiB splitting, explicit limits above hardware capacity, and import retirement.
+It also validates payload stage logs, per-request reset/reuse, profiling-disabled
+silence, and injected output import/retirement delays outside the payload window:
 
 ```bash
 c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined \

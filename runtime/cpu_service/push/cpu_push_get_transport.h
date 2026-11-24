@@ -32,6 +32,12 @@ class Transport {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
     std::uint64_t first_post_ns{}, last_cqe_ns{};
+    // CPU-only payload diagnostics; these do not change the device/wire ABI.
+    std::uint64_t notify_read_ns{}, cpu_start_ns{}, cpu_total_ns{};
+    std::uint64_t address_list_read_ns{}, address_validate_ns{}, output_desc_read_ns{}, output_import_ns{};
+    std::uint64_t prepare_writes_ns{}, target_update_ns{}, source_sge_update_ns{}, data_begin_ns{};
+    std::uint64_t payload_post_ns{}, payload_cq_wait_ns{};
+    std::uint64_t output_unimport_ns{}, done_post_ns{}, done_cq_wait_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
   } profile_;

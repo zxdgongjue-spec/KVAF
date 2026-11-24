@@ -151,3 +151,46 @@ done
 两组均应为 0 ready WR、1 wave、4 个数据尾 CQE。CPU 服务端的
 `CPU_SGL_WRITE_SAMPLE` 按 sequence 给出原始纳秒及计数，包含启用 profile 的预热轮次。
 诊断结果由 CPU 服务、NPU Host/Python 和 AICPU 设备包共同传回，三者均须更新。
+
+### CPU 分段耗时
+
+启用 `--sgl-payload-only` 和 kernel profiling 时，CPU 服务端在原有
+`CPU_SGL_WRITE_SAMPLE` 后额外输出同一 sequence 的 `CPU_SGL_WRITE_STAGES`。
+统一单卡 benchmark 已自动开启 profiling；`--kernel-profile` 还会打印 NPU worker 明细。
+新增分段仅保存在 CPU 侧，不修改协议或设备 profile 布局；已有 payload 版本只需
+重建 CPU 服务并重启，测试命令保持不变。
+
+| 字段（单位 µs） | 计时范围 |
+| --- | --- |
+| `notify_read_us` | 读到本轮新 sequence 的那一次 notify READ，包含等待 CQE |
+| `header_read_us` | 请求头 READ，包含等待 CQE |
+| `address_list_read_us` | 源地址清单 READ，包含等待 CQE |
+| `address_validate_us` | 检查源地址范围 |
+| `output_desc_read_us` | output 描述 READ，包含等待 CQE |
+| `output_import_us` | 本轮 `urma_import_seg` |
+| `plan_us` | 构建或复用 WRITE 计划，扣除目标更新耗时 |
+| `target_update_us` | 更新目标地址及 segment |
+| `source_sge_update_us` | 更新所有源 SGE，并统计数据 WR 数 |
+| `data_begin_us` | 设置本 wave 的完成跟踪及尾 WR context |
+| `payload_post_us` | 第一次数据 post 前到全部数据 post 返回 |
+| `payload_cq_wait_us` | 全部数据 post 返回到所有数据尾 CQE 校验完成 |
+| `output_unimport_us` | 本轮 `urma_unimport_seg` |
+| `done_post_us` | 提交统计报告和 done 控制链 |
+| `done_cq_wait_us` | 等待并校验 done 控制链尾 CQE |
+| `cpu_total_us` | 本轮 notify READ 开始到 done 控制链 CQE 校验完成 |
+
+`plan_reused=1` 表示复用数据链。单 wave 时，`payload_post_us + payload_cq_wait_us`
+等于 `CPU_SGL_WRITE_SAMPLE.elapsed_ns / 1000`（允许打印舍入误差）。两段是 CPU 时间窗口，
+传输可在提交期间推进；`payload_cq_wait_us` 只表示提交完之后剩余的完成等待。
+多 wave 不生成有效 payload 耗时，这两个字段保持零，其他 CPU 分段按本轮累计。
+
+`notify_read_us` 不包含此前的空闲轮询，也无法测出 NPU 发布 notify 到 CPU 发现它的
+完整延迟。`cpu_total_us` 包含各分段之间的控制和打点开销，不能再与各分段相加。
+其起点可能早于 kernel 进入，done CQE 的 CPU 观察也可能晚于 kernel 退出，因此不能
+直接从 kernel 时间减去 `cpu_total_us`。AICPU 请求构建、worker 同步和 done 可见性等待
+仍需结合 NPU `request_us`、`ack_us` 和设备起止时间分析；`ack_us` 包含 payload 等待。
+打印在本轮控制链完成之后，日志包含预热；不要将 CPU/NPU 两种时钟的绝对时间相减。
+
+```bash
+rg 'CPU_SGL_WRITE_(SAMPLE|STAGES)' cpu-service.log
+```
