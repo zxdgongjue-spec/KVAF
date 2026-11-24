@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdio>
 #include <type_traits>
 
 #include "cpu_gather.h"
