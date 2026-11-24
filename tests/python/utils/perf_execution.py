@@ -18,8 +18,11 @@ class BenchmarkExecution:
                  algorithm="direct", put_capacity=128, get_capacity=65536,
                  cores=0, jettys=2, get_kernel="", put_kernel="",
                  max_inflight_total=2048):
-        if not 1 <= put_capacity <= 65536 or not 1 <= get_capacity <= 65536:
-            raise ValueError("Put/Get request capacities must be in [1, 65536]")
+        if not 1 <= put_capacity <= 65536:
+            raise ValueError("Put request capacity must be in [1, 65536]")
+        get_max = (1 << 31) - 1 if executor == "aiv" and algorithm == "direct" else 65536
+        if not 1 <= get_capacity <= get_max:
+            raise ValueError(f"Get request capacity must be in [1, {get_max}]")
         self.mode = "unified"
         self.put_capacity = put_capacity
         self.get_capacity = get_capacity

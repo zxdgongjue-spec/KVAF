@@ -529,7 +529,9 @@ struct NpuRuntime::Impl {
         throw std::invalid_argument("AICPU kernel package is resolved through the CANN installation");
     }
     if (!budget.cores || budget.cores > (e == Executor::Aicpu ? 8U : 48U) ||
-        !budget.request_capacity || budget.request_capacity > 65536U || budget.cpu_threads > 64U ||
+        !budget.request_capacity ||
+        (budget.request_capacity > 65536U &&
+         !(get && IsAivDirectGet({t, e, algorithm}))) || budget.cpu_threads > 64U ||
         (t == Transport::Urma && e == Executor::Aiv &&
          (!budget.jettys || budget.jettys > (get ? 64U : 2U) ||
           (get && *budget.max_inflight_total && *budget.max_inflight_total < 2U * budget.cores))))

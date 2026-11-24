@@ -1,5 +1,12 @@
 add_library(kvaf_access_operator INTERFACE)
 
+if(BUILD_TESTING)
+  add_executable(kvaf_batch_get_window_model_test ../tests/batch_get_window_model_test.cc)
+  target_include_directories(kvaf_batch_get_window_model_test PRIVATE
+    ../tests/aiv_model include algorithms/get/direct/urma_aiv/include)
+  add_test(NAME batch_get_window_model COMMAND kvaf_batch_get_window_model_test)
+endif()
+
 target_include_directories(kvaf_access_operator
   INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

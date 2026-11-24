@@ -90,7 +90,7 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--jettys-per-core", type=int, default=None,
                        help="Jettys per AIV core; aiv only (1..64, default: 2)")
     group.add_argument("--max-inflight-total", type=int, default=None,
-                       help="unconfirmed READ budget; aiv only (default: 2048; 0 disables the limit)")
+                       help="unconfirmed READ budget; aiv only (default: 2048; 0 uses SQ/CQ capacity)")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU tries candidates in order")
@@ -147,8 +147,9 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
-    if not 1 <= args.request_length <= 65536:
-        return "request-length must be in [1, 65536]"
+    request_max = 65536 if uses_aicpu(args) else MAX_INT32
+    if not 1 <= args.request_length <= request_max:
+        return f"request-length must be in [1, {request_max}]"
     if not 1 <= args.table_capacity <= MAX_INT32:
         return "table-capacity must be in [1, INT32_MAX]"
     if not 1 <= args.tokens_per_block <= MAX_INT32 or not 1 <= args.token_bytes <= MAX_INT32:

@@ -21,6 +21,9 @@ struct GetExecutionConfig {
   Executor executor{Executor::Aiv};
   GetAlgorithm algorithm{GetAlgorithm::Direct};
 };
+inline bool IsAivDirectGet(GetExecutionConfig config) {
+  return config.executor == Executor::Aiv && config.algorithm == GetAlgorithm::Direct;
+}
 inline bool operator==(PutExecutionConfig a, PutExecutionConfig b) {
   return a.transport == b.transport && a.executor == b.executor;
 }
@@ -34,8 +37,10 @@ struct ExecutionWarmup {
 struct ExecutionResources {
   // Zero cores selects provider defaults: URMA AIV 2, UBMEM AIV 16,
   // AICPU Put 1, AICPU Get 5. Zero Jettys selects 2 for URMA AIV. An absent
-  // in-flight budget uses 2048; explicit zero disables the limiter. Empty AIV
-  // kernel paths use this build's bin output; AICPU packages resolve through CANN.
+  // in-flight budget uses 2048; explicit zero uses SQ/CQ capacity for URMA AIV Get.
+  // AIV Direct Get derives total capacity from each invocation's buffers;
+  // request_capacity is a warmup hint there, a provider limit for other paths.
+  // Empty AIV kernel paths use this build's bin output; AICPU packages resolve through CANN.
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};
   std::optional<std::uint32_t> max_inflight_total;
   std::string kernel_path;

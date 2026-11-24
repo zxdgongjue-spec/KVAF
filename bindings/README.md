@@ -66,8 +66,10 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 `put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
 预算按 provider 配置：`cores=0` 使用该算法默认值，URMA AIV Put/Get 为 2、UBMEM AIV
 Put/Get 为 16、AICPU Put 为 1、AICPU Gather/Scatter Get 为 5。URMA AIV 的 `jettys` 默认为 2，Get 支持 1..64、
-Put 支持 1..2；仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 关闭限制，非零须至少为
-`2 * cores`。`request_capacity` 默认 65536，Gather 可额外指定 `cpu_threads`。
+Put 支持 1..2；仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 按 SQ/CQ 容量自动分组，非零须至少为
+`2 * cores`。`request_capacity` 默认 65536；AIV Direct Get（URMA/UBMEM）仅把它作为预热提示，
+总请求量由调用方张量和 ABI 决定，不受此配置限制。其他 Get 和 Put 仍受配置容量及 65536 上限约束。
+图/输出绑定仍须预先准备足够的请求容量。Gather 可额外指定 `cpu_threads`。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
 `bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
 `./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，

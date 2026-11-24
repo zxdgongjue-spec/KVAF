@@ -57,6 +57,8 @@ class PeerExecutionResources final : public ExecutionResourceOwner {
     return s;
   }
   Status ValidateCapacity(std::uint32_t count) const {
+    if (!config_.put && IsAivDirectGet({config_.transport, config_.executor, config_.algorithm}))
+      return Status::OK();
     return count <= capacity_ ? Status::OK()
                              : Status::InvalidArgument("request exceeds execution resource capacity");
   }

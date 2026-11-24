@@ -3,14 +3,20 @@
 `batch_get_max_inflight_total` 默认 2048，控制一次 BatchGet 调用中所有 AIV 核
 合计的“已提交、尚未确认完成”的 READ 数。它是保守的软件上限，不是硬件实时
 在途计数。多个独立 Runtime 的预算会叠加；同一个 Runtime 的共享队列仍须由调用方
-串行使用。设为 0 可恢复整批提交基线。
+串行使用。普通 URMA AIV Direct Get 设为 0 时，使用 SQ/CQ 容量窗口，不额外施加
+全局软件预算。独立 raw-address Pull 的零预算语义保持原样。
 
 ## 提交和回收
 
 - `miss_count <= 总预算`：每核仍提交完整请求区间，只在各参与 Jetty 的最后
-  一条 READ 请求 CQE。预算为 0 时所有请求都使用此路径。
+  一条 READ 请求 CQE。零预算时，只有各队列能整体容纳的区间才使用此路径。
 - 大请求：每核预算为 `W / C + (core < W % C)`；按两个 FIFO 槽位拆成
   `floor(Wc / 2)`、`ceil(Wc / 2)`，两个槽位交替复用。非零预算必须至少为 `2*C`。
+- 零预算大请求：每条 SQ 每组容量取 `floor((sq_depth - 1) / (2 * 128)) * 128`，
+  使用最小队列容量乘以每核 Jetty 数作为组大小。当前深度 32768 时，每 Jetty 每组
+  16256 条；默认 2 核、每核 2 Jetty，进入容量分组后的两组全局保守窗口为 130048 条。
+  每次仍按实际轮转分配核对 SQ 和 CQ 额度，空间不足先回收最老组再重试。
+  CQ 只能容纳一组时自动串行提交/回收；不会因整个批次超过 SQ 容量而直接拒绝。
 - 先提交两组，确认最老组在所有参与 Jetty 上完成后再补一组；各核独立推进，
   不增加全局屏障。四核、总预算 2048 时，每核至多 512 条，每组 256 条。
 - 每个检查点沿用原来的 completion 和 `place_order=2`。每个组的每个参与
@@ -35,17 +41,22 @@ runtime = kvaf.NpuRuntime(
     batch_get_tokens_per_block=128,
     npu_core_count=4,
     jettys_per_core=4,
-    batch_get_max_inflight_total=2048,  # 0: baseline
+    batch_get_max_inflight_total=2048,  # 0: SQ/CQ capacity windows
 )
 ```
 
 C++ 使用 `NpuRuntimeOptions` / `AccessOperatorConfig` 的同名字段。底层直接
-构造 `KvafExecuteBatchGetKernelArgs` 的调用方须显式填写该字段，零初始化表示基线。
+构造 `KvafExecuteBatchGetKernelArgs` 的调用方须显式填写该字段，零初始化表示容量窗口。
 Kernel 参数仍为 112 字节，新增字段占用原尾部 padding；profile/queue 大小也保持
 不变，但字段语义已更新。当前 Kernel 符号为 `KvafExecuteBatchGetAivKernelV3`，在
 V2 的窗口控制基础上增加规范地址到会话注册基址的转换。旧
 Host/Kernel 混用会在加载符号时失败。必须整体重编 Host、Python binding 和 Kernel。
 预算按值 capture，改变预算需重建 Runtime/graph；`miss_count` 内容仍可动态更新。
+
+AIV Direct Get（URMA/UBMEM）移除 65536 条 provider 总量限制，`request_capacity` 配置仅作
+预热提示。实际调用仍受输入张量、int32 `miss_count` 以及 ABI 字段宽度约束；图和输出绑定
+必须按最大调用容量预热/准备。URMA 的临时 WQE bank、UBMEM 的地址批次与 MTE 缓冲区
+保持固定大小，不随总请求数增长。Gather/Scatter 和 Put 的容量限制保持原样。
 
 性能入口接受 `--max-inflight-total`，环境变量为
 `KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL`，默认 2048。通过统一性能入口扫描该参数。比较预算时固定核数、Jetty 数、请求分布、token 大小和 EID/UB 设备。
@@ -88,9 +99,13 @@ done
 BASH
 ```
 
-改为 `--max-inflight-total 0` 测整批提交基线；使用 `3/3/2049` 的核/Jetty/预算组合
+改为 `--max-inflight-total 0` 测容量窗口；使用 `3/3/2049` 的核/Jetty/预算组合
 观察预算余数。检查完整输出和 profile 中的组数、CQE 数及峰值在途统计。
 图性能采样之前还会验证动态输入、部分请求和零请求回放。
 
-独立参数检查、C++ 调度和 kernel CPU 模型测试已移除。
-CQ 错误与超时恢复需要目标设备上的故障注入证据，性能预检不覆盖这些路径。
+`BUILD_TESTING=ON` 提供 `batch_get_window_model` 和 `batch_get_capacity` 测试。
+前者执行真实 URMA/UBMEM kernel 控制流，覆盖百万条请求、SQ/CQ 回绕、单 CQ 槽位、
+动态计数及错误/超时后的队列隔离；后者检查客户端和 CPU 服务端的容量策略及 ABI 收窄。
+Python 参数检查可运行 `PYTHONPATH=tests/python python3 -m unittest test_batch_get_window_options`。
+模型不模拟真实 DMA/cache 可见性和流水线时序；CANN 编译及 A5 大批次 eager/graph、
+CQ 故障注入和耗时测试仍是部署前的硬件验证项。

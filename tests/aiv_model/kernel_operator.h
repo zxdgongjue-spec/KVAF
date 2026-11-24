@@ -48,6 +48,24 @@ inline void st_dev(uint32_t value, uint32_t* address, int) {
 }
 
 namespace AscendC {
+enum class TPosition { VECIN };
+enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S };
+inline bool hard_events[3][8]{};
+template <HardEvent Event> void SetFlag(event_t event) {
+  auto& flag = hard_events[static_cast<unsigned>(Event)][event];
+  if (flag) std::abort();
+  flag = true;
+}
+template <HardEvent Event> void WaitFlag(event_t event) {
+  auto& flag = hard_events[static_cast<unsigned>(Event)][event];
+  if (!flag) std::abort();
+  flag = false;
+}
+template <typename T> struct LocalTensor {
+  struct { uint8_t logicPos; uint32_t bufferAddr, dataLen; } address_{};
+};
+struct DataCopyExtParams { uint32_t blocks, bytes, src_stride, dst_stride, reserved; };
+template <typename T> struct DataCopyPadExtParams { bool pad; T left, right, value; };
 inline uint32_t GetBlockIdx() { return aiv_model::core; }
 inline uint64_t GetSystemCycle() { return ++aiv_model::cycle; }
 enum class CacheLine { SINGLE_CACHE_LINE };
@@ -57,6 +75,15 @@ template <typename T> struct GlobalTensor {
   void SetGlobalBuffer(T* value) { data = value; }
   GlobalTensor operator[](uint64_t offset) { return GlobalTensor{data + offset}; }
 };
+template <typename T>
+void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams params,
+                 DataCopyPadExtParams<T>) {
+  std::memcpy(aiv_model::ub + dst.address_.bufferAddr, src.data, params.bytes);
+}
+template <typename T>
+void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams params) {
+  std::memcpy(dst.data, aiv_model::ub + src.address_.bufferAddr, params.bytes);
+}
 template <typename T, CacheLine, DcciDst>
 void DataCacheCleanAndInvalid(GlobalTensor<T> tensor) {
   aiv_model::Poll(tensor.data);
