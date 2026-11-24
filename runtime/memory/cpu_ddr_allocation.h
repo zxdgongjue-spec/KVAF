@@ -6,7 +6,7 @@
 
 namespace kvaf {
 
-const char* CpuMemoryPageModeName(CpuMemoryPageMode mode);
+std::string CpuMemoryPageModeName(CpuMemoryPageMode mode);
 
 // Keep any allocation owned by the caller if prefaulting fails. The mapping
 // length is tracked separately from the logical length used for registration.

@@ -134,7 +134,7 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
       std::fprintf(stderr, "[KVAF_CPU] DDR_ALLOCATED bytes=%" PRIu64 " backing_bytes=%" PRIu64
                    " page_mode=%s memory=%p\n", bytes,
                    p->mapped_bytes != 0U ? static_cast<std::uint64_t>(p->mapped_bytes) : bytes,
-                   CpuMemoryPageModeName(options.memory_page_mode), p->memory);
+                   CpuMemoryPageModeName(options.memory_page_mode).c_str(), p->memory);
     }
     p->descriptor.length = bytes;
 #ifdef KVAF_CPU_HAS_URMA
