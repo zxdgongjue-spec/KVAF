@@ -44,7 +44,7 @@ void SourceFrames() {
   // Buffer mixed frame kinds together, including Result followed immediately
   // by another request. A receiver must consume exactly one frame each time.
   std::vector<hr::Request> sent;
-  for(auto command:{hr::Command::Memory,hr::Command::Open,hr::Command::Channel,hr::Command::Confirm}) {
+  for(auto command:{hr::Command::Discover,hr::Command::Memory,hr::Command::Open,hr::Command::Channel,hr::Command::Confirm}) {
     sent.push_back(MakeRequest(command));const auto& r=sent.back();
     Require(off::WriteBytes(sockets.fd[0],&r,r.header.bytes),"queue source frame");
   }

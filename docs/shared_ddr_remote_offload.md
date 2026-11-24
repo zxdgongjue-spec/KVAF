@@ -65,9 +65,9 @@ runtime.batch_cpu_pull(keys, ready, src_offsets, lengths, timeout=30000)
 
 ## 建链与协议
 
-Runtime 先分配共享 DDR，首次取票时固定 CPU candidate。源注册在同一池上使用 scratch READ 验证所选 CPU↔源卡 EID。NPU↔NPU raw READ 的 fullmesh 链路独立配置。
+Runtime 先分配共享 DDR，首次取票时固定 CPU candidate。源注册在同一池上使用 scratch READ 验证所选 CPU↔源卡 EID。NPU↔NPU raw READ 独立选取同机 fullmesh 或跨机 CLOS 链路。
 
-CPU Pull 控制协议 KVRP v8，支持一个源连接下多个 HBM MR，同步入口通过 TCP 长连接提交并等待完成回复；NPU Pull 控制协议为 KVHR v8，每批完成/取消通知由应用提供。NPU 两端需一起更新；CPU service 和 NPU 扩展需配套重编译、重启。共享 DDR 使用 main 的 execution Region 生命周期；`offload_region()` 通过新增 `PrepareCpuPullRegion` 操作取得独立授权和 LOCAL_WRITE MR，服务端通过能力位拒绝不支持此操作的版本。源注册后持有 Region 引用，即使当前没有 READ 也会阻止释放 DDR。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+CPU Pull 控制协议 KVRP v8，支持一个源连接下多个 HBM MR，同步入口通过 TCP 长连接提交并等待完成回复；NPU Pull 控制协议为 KVHR v9，每批完成/取消通知由应用提供。NPU 两端需一起更新；CPU service 和 NPU 扩展需配套重编译、重启。共享 DDR 使用 main 的 execution Region 生命周期；`offload_region()` 通过新增 `PrepareCpuPullRegion` 操作取得独立授权和 LOCAL_WRITE MR，服务端通过能力位拒绝不支持此操作的版本。源注册后持有 Region 引用，即使当前没有 READ 也会阻止释放 DDR。多 MR 接口和验收命令见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 普通 Put 和 CPU Pull 共用一个写事务入口；未决任务恢复、Commit 或 Abort 完成前不能开始下一次写入。已提交 key 的普通 Get 仍可执行，Put/Get 不共享执行队列。`shutdown()` 或 `shutdown_ddr()` 开始后拒绝新任务；关闭失败时允许在原对象上查询、取消、完成原事务和释放资源，然后重试关闭。
 

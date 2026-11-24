@@ -20,6 +20,13 @@ def npu_ready(mr_id=1, sequence=1):
 
 
 class PullBenchmarks(unittest.TestCase):
+    def test_raw_eids_are_optional_for_each_role(self):
+        for role in ([], ["--role", "producer"], ["--role", "reader", "--control-connect", "host:29100"]):
+            args = parse_args(role)
+            self.assertEqual((args.npu_eid_a_raw, args.npu_eid_b_raw), ("", ""))
+        args = parse_args(["--npu-eid-b-raw", "producer-eid"])
+        self.assertEqual((args.npu_eid_a_raw, args.npu_eid_b_raw), ("", "producer-eid"))
+
     def test_physical_source_uses_cann_mapping(self):
         signature = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32))
 
