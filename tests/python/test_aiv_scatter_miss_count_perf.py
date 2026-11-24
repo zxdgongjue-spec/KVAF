@@ -248,11 +248,8 @@ def complete_outside_measurement(runtime, profiling, caller_graph=False):
     if profiling:
         # Snapshot drains/checks all business statuses before copying records.
         return list(runtime.scatter_profile())
-    # SetScatterProfiling(false) also drains/checks pending scatter work even
-    # when profiling was already disabled. Reuse this existing public contract
-    # for baseline validation, without enabling clocks or adding a native API.
     if not caller_graph:
-        runtime.stop_scatter_profile()
+        runtime.drain_get()
     return None
 
 
@@ -341,6 +338,8 @@ def run_case(args):
     if args.jettys_per_core is not None:
         os.environ["KVAF_SCATTER_JETTYS_PER_CORE"] = str(args.jettys_per_core)
     os.environ["KVAF_SCATTER_HOST_PROFILE"] = "1" if args.host_profile else "0"
+    cpu_gather = os.environ.get("KVAF_SCATTER_CPU_GATHER", "0") == "1"
+    cpu_transfer = "CPU_GATHER_CONTIGUOUS_WRITE" if cpu_gather else "CPU_SGL_WRITE"
     graph_mode = args.acl_graph
     calls = graph_call_count(args)
     runtime = kvaf.NpuRuntime(str(kernel), args.token_bytes, args.tokens_per_block,
@@ -351,13 +350,14 @@ def run_case(args):
     runtime.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "worker"}
     cpu_jettys = scatter_payload_jettys(args)
-    config.update(mode="cpu_push_scatter", source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
+    config.update(mode="cpu_push_scatter", cpu_gather=cpu_gather,
+        source_list_builder="parallel_simt", scatter_copy="ub_mte_stage_ring",
         request_control=("AIV_WRITE_prefix_then_suffix" if args.miss_count > SCATTER_CHUNK_ROWS
                          else "AIV_WRITE_mailbox_then_ordered_notify"),
         control_wqe="host_template_ub_patch", cpu_post_budget="payload_wrs_ready_attached",
         scatter_max_stages=3, scatter_max_tile_rows=32, scatter_ub_bytes=65536,
         scatter_stage_recycle="MTE3_to_MTE2", scatter_row_indices="ub_if_space_else_scalar",
-        transport=("CPU_SGL_WRITE_overlapped_AIV_scatter" if args.pipeline else "CPU_SGL_WRITE_then_AIV_scatter"),
+        transport=f"{cpu_transfer}_{'overlapped' if args.pipeline else 'then'}_AIV_scatter",
         pipeline_chunk_rows=SCATTER_CHUNK_ROWS,
         pipeline_consumer=("independent_jetty_cursors" if args.jetty_cursors else
                            "jetty_ready_persistent_ub" if args.pipeline else "batch_done"),
@@ -462,11 +462,6 @@ def run_case(args):
         if graph_mode and args.kernel_profile:
             runtime.start_scatter_profile()  # Captured kernel options are fixed at preparation.
         with setup_phase(report, "prepare_submit"):
-            capture_nodes = [runtime.prepare_scatter_batch_get(
-                view, inputs[0], inputs[1], count, inputs[2], output,
-                stream=stream, synchronize=False,
-                wait_stream=args.completion_scope == "native-stream",
-                capture_into_graph=args.acl_graph) for inputs in input_plans]
             if calls > 1:
                 # Validate every node's request/output mapping before capture.
                 # The graph reuses the same output allocation in stream order.
@@ -480,6 +475,11 @@ def run_case(args):
                     stream.synchronize()
                     complete_outside_measurement(runtime, args.kernel_profile)
                     verify(inputs, guard=True)
+            capture_nodes = [runtime.prepare_scatter_batch_get(
+                view, inputs[0], inputs[1], count, inputs[2], output,
+                stream=stream, synchronize=False,
+                wait_stream=args.completion_scope == "native-stream",
+                capture_into_graph=args.acl_graph) for inputs in input_plans]
             submit = capture_nodes[0]
             if args.acl_graph:
                 caller_graph = kvaf.AclGraph()
@@ -536,7 +536,7 @@ def run_case(args):
                 operation = "batch_get" if stage == "end_to_end" else "batch_get_" + stage
                 print("PERF_RESULT operation=" + operation + " " + " ".join(
                     f"{k}={v:.6f}" for k, v in report["summary"][phase][key].items()), flush=True)
-        print("PASS: reference-aligned steady-table CPU SGL + AIV scatter", flush=True)
+        print(f"PASS: reference-aligned steady-table {cpu_transfer} + AIV scatter", flush=True)
         return 0
     finally:
         # Preserve the execution exception if an aborted device also fails teardown.

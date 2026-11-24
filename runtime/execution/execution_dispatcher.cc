@@ -604,8 +604,15 @@ Status ExecutionDispatcher::WithSequentialGet(
   const GetExecutionConfig config{Transport::Urma, Executor::Aiv, algorithm};
   if (!prepare) {
     auto* instance = FindGetInstanceLocked(config);
-    return instance ? action(*instance->view().operation())
-                    : Status::NotInitialized("sequential Get has not been prepared");
+    if (!instance) return Status::NotInitialized("sequential Get has not been prepared");
+    if (instance->cleanup_only) return Status::Busy("Get instance requires cleanup");
+    // Scatter snapshots also complete asynchronous Scatter calls. Retire the
+    // invocation here so the dispatcher and provider agree on completion.
+    if (algorithm == GetAlgorithm::Scatter && pending_get_ == instance) {
+      const auto status = DrainGetLocked();
+      if (!status.ok()) return status;
+    }
+    return action(*instance->view().operation());
   }
   auto status = DrainGetLocked();
   if (!status.ok()) return status;
