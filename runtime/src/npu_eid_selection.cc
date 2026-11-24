@@ -4,12 +4,9 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
-#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <string_view>
-#include <sys/file.h>
-#include <unistd.h>
 
 namespace kvaf::detail {
 std::string EidToHex(const NpuEid& eid) {
@@ -24,10 +21,6 @@ std::string EidToHex(const NpuEid& eid) {
 }
 
 namespace {
-constexpr char kUbDevIdPath[] = "/proc/asdrv_ub/dev_id";
-constexpr char kUbPairInfoPath[] = "/proc/asdrv_ub/pair_info";
-constexpr char kUbSelectorLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
-
 bool ParseJsonUnsigned(const std::string& line, const char* field, std::uint32_t* value) {
   if (value == nullptr) return false;
   const std::string marker = std::string{"\""} + field + "\"";
@@ -202,25 +195,6 @@ PairEids ParsePairInfo(std::istream& input, std::uint32_t physical_device) {
   if (input.bad() || active_channels != 1) return {};
   if (local_fields != 1) pair.cpu.reset();
   if (remote_fields != 1) pair.npu.reset();
-  return pair;
-}
-
-PairEids ReadDevicePair(std::uint32_t physical_device) {
-  PairEids pair;
-  const int fd = open(kUbSelectorLockPath, O_CREAT | O_RDWR, 0600);
-  if (fd >= 0 && flock(fd, LOCK_EX) == 0) {
-    std::ofstream selector(kUbDevIdPath);
-    selector << physical_device << '\n';
-    selector.close();
-    if (selector) {
-      std::ifstream input(kUbPairInfoPath);
-      pair = ParsePairInfo(input, physical_device);
-    }
-  }
-  if (fd >= 0) close(fd);  // Releases the selector lock.
-  std::fprintf(stderr, "[KVAF] PAIR_INFO device=%u cpu=%s npu=%s\n", physical_device,
-               pair.cpu ? EidToHex(*pair.cpu).c_str() : "unavailable",
-               pair.npu ? EidToHex(*pair.npu).c_str() : "unavailable");
   return pair;
 }
 

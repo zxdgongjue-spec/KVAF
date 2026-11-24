@@ -17,19 +17,18 @@ runtime.initialize()
 receiver = runtime.listen_hbm(
     listen_address="0.0.0.0:29000",
     advertise_address="192.168.1.20:29000",  # P 可访问的 D 地址
-    local_eid=a_fullmesh_eid,
 )
 # 应用发现/Connector 将 receiver 原样提供给 P；不解析内部字段。
 
 # P / B：register 成功返回 None，表示 D 已经保存连接并完成全部探测。
-source = kvaf.NpuPullHbmSource(device_id=7, npu_eid=b_fullmesh_eid)
+source = kvaf.NpuPullHbmSource(device_id=7)
 source.register(tensors, receiver=receiver, stream=producer_stream)
 # tensors 也可以是单个连续 NPU Tensor。
 ```
 
 receiver 是可序列化字典，包含 version=1、control_address、receiver_id 和 receiver_epoch。绑定 0.0.0.0 时必须给 advertise_address；本机测试可用 listen_hbm("127.0.0.1:0", local_eid=...) 自动选择端口。此端口只交换控制消息，HBM payload 通过 NPU READ 搬运。
 
-NPU↔NPU 两端分别配置 fullmesh EID；TCP 地址与 EID 独立，CPU 路由的 CLOS/pair-info EID 不能替代 fullmesh。
+注册时两端交换 Linux 内核的 `/proc/sys/kernel/random/boot_id` 和物理卡号。同一 boot ID 选择本机 fullmesh，不同 boot ID 选择跨机 CLOS。容器使用自动模式时应能读到宿主机的 boot ID。任一端都可以独立显式指定 EID。
 
 D 自动保存 `(source_id, source_epoch) → 连接`，包括控制 TCP、MR 表、Jetty/CQ/TP 和批次状态。D 的监听线程串行处理初始化，运行时复用每个源的长连接；P 的源对象运行后台控制响应线程，无监听端口。一次接入只绑定一个 D，多 D 使用各自的源对象，通信资源独立。
 
@@ -86,7 +85,7 @@ output 的本地 MR 按连接和地址/大小缓存，按 MR ID/output 组合复
 - 初始化后，控制 TCP 只用于注册、重连和关闭，不阻塞正常数据读取。P 后台重新建立 TCP 时，D 校验同一接收端代次、源身份和 MR 清单，复用原硬件连接。
 - DMA 状态不确定仍保留资源并返回 CompletionUnknown，TCP 断开不代表 DMA 已结束。接收端重启或会话退役后，旧连接不能自动创建一套新硬件资源。
 - 正常关闭：应用停读/停 replay，等待所有相关 stream 和消费者完成，销毁全部捕获图 → P release_batch → P source.shutdown() → D runtime.shutdown()。source.shutdown 内部通知 D 关闭发起端资源，再关闭 P 导出资源并确认退役，无需应用持有 export_ticket。KVAF 不跟踪正常异步调用或外部图寿命，关闭不会替应用等待这些工作；应用必须先完成上述步骤。失败未决或注销失败继续保留对象并重试。shutdown_ddr 不影响独立 NPU Pull。
-- NPU 控制协议升级为 KVHR v8，要求 A/B 两端一起更新，旧版本拒绝连接。CPU Pull 独立使用 KVRP v8，其同步提交与长连接说明见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
+- NPU 控制协议升级为 KVHR v9，要求 A/B 两端一起更新，旧版本拒绝连接。CPU Pull 独立使用 KVRP v8，其同步提交与长连接说明见 [CPU Pull 使用说明](cpu_pull_offload_usage.md)。
 
 可选 `profile=True` 在成功结果中增加 Host 阶段计时。默认异步调用不创建计时事件、不等待设备，`kernel_event_us=None`。同时显式传 `synchronize=True` 才测设备区间，单位均为微秒：
 
@@ -146,7 +145,12 @@ print(result["profile"])
 同步成功后，设备侧范围检查或 CQ 错误不再通过 Host status 检查上报为异常，应用沿用普通 BatchGet
 的数据校验及错误处理方式。初始化仍回读 scratch 数据并逐 MR/通道校验 checksum；失败探测先退役队列再释放 scratch。
 
-双方必须显式配置 fullmesh EID：B 构造源时的 npu_eid 和 A listen_hbm 的 local_eid。CPU↔NPU 路由独立配置，自动 CLOS/pair-info 发现不能替代 fullmesh。
+两端各自按物理 `device_id` 读取 `/etc/hccl_rootinfo.json`，路径可用 `KVAF_HCCL_ROOTINFO_PATH` 覆盖。
+
+- 同机从 layer 0 的 MESH 条目获取 EID。若 `topo_file_path` 提供两卡间的 `PEER2PEER` 边，优先尝试该边两端端口对应的 EID。对 `TOPO_FILE_DESC`，有可用的直连端口表时按表筛选，否则按 layer 0 条目顺序尝试。
+- 跨机从 layer 1 的 CLOS 条目获取 EID，优先尝试相同的非空 `plane_id`。两台服务器需有可达的 layer 1 CLOS 网络。
+- 其余同层组合按 B 外层、A 内层的文件顺序尝试。通过所有 MR 和 Jetty 的 READ 探测后，读端 `HBM_READ_READY` 输出 `A_eid`、`B_eid` 和每端的选择来源 `A_route/B_route`（`fullmesh`、`clos` 或 `explicit`）。缺少候选或所有候选失败时注册返回错误。
+- A 的 `listen_hbm(local_eid=...)` 和 B 的 `NpuPullHbmSource(npu_eid=...)` 可分别固定对应端。NPU Pull 自动候选仅来自 rootinfo。
 
 ## 算子与资源
 
@@ -158,7 +162,7 @@ Host 不再生成或校验 kernel 启动编号，也不分配固定页 Host stat
 
 NPU ReadyToken.source 只包含 source_id 和 source_epoch，ReadyToken 另含 sequence 与 mr_id。完整 MR 长度列表保存在 KVAF 内部，单 MR 也使用非空列表；初始化及 TCP 重连仍检查完整清单。连接描述与 MR 描述分别存储，新增 MR 的 Memory 请求/响应不再携带 Jetty/TP 描述。
 
-KVHR v8 只负责初始化、硬件资源交换、重连和关闭，不承担每批完成或取消通知。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和本地取消围栏；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和应用管理的冻结批次。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
+KVHR v9 只负责初始化、硬件资源交换、重连和关闭，不承担每批完成或取消通知。A 的 HbmReader 保存连接/导入 MR、USER_CTL Jetty/CQ、队列和本地取消围栏；B 的 NpuPullHbmSource 保存 Tensor、导出 MR、目标 Jetty、客户端身份和应用管理的冻结批次。各通道分别协商 TP，CPU Pull 的共享 TP 路径独立。
 
 初始化和关闭控制请求复用 TCP 连接，双方启用 TCP_NODELAY。A 按当前命令的回复长度接收，B 先读取请求共有的 72 B 前缀，再按消息种类读取尾部；分片、粘连、版本和身份校验仍保留。完成通知由应用自己的 Pipe/Connector 等通道传递。
 
@@ -194,19 +198,17 @@ graph.reset()
 
 ## 编译与硬件验证
 
-本次更新需重编译 A/B 两端 NPU 运行库、Python 扩展和 V2 raw kernel，并重启进程。控制协议仍为 KVHR v8，NPU receiver ticket 仍为 version=1；同时使用 CPU Pull 时，CPU service 继续使用匹配的 KVRP v8。
+本次选路更新需重新编译并重启 A/B 两端 NPU 运行库和 Python 扩展。Host 构建需要 Boost 的 PropertyTree 头文件。KVHR v9 用于协商路由，应用交换的 NPU receiver ticket 版本仍为 1。
 在 Linux 测试机已有的 CANN、torch_npu 和 liburma 环境中更新源码，然后重新编译 NPU 侧：
 
 ```bash
 PYTHON="$(command -v python)" bash build.sh npu --jobs 8
 export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/test_hbm_read_raw_addr.py \
-  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --rounds 3 \
-  --npu-eid-a-raw '<A_FULLMESH_EID>' \
-  --npu-eid-b-raw '<B_FULLMESH_EID>'
+  --cpu 127.0.0.1:28999 --device-a 6 --device-b 7 --rounds 3
 ```
 
-运行前将两个占位符替换为对应卡的实际 fullmesh EID。
+如需复现指定路径，增加 `--npu-eid-a-raw` 或 `--npu-eid-b-raw` 固定相应端。
 
 脚本自动启动 B 子进程，B 主动连接 A 的控制监听入口。在同一个 A runtime 中逐轮验证：
 
@@ -244,14 +246,12 @@ Python bench 的无硬件测试还验证匹配的 reuse 消息才释放源；错
 export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 python tests/python/bench_hbm_read_raw_addr.py \
   --device-a 6 --device-b 7 \
-  --npu-eid-a-raw 000000000047050000100000df00d806 \
-  --npu-eid-b-raw 000000000047050000100000df00f807 \
   --packets 4096 --packet-bytes 656 --source-space-bytes 268435456 \
   --warmup 10 --iterations 100 --profile-warmup 1 --profile-iterations 20 \
   --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
-EID 对应此前测试机的 fullmesh 配置，其他机器需替换。脚本已删除 `--cpu`、`--cpu-candidate` 参数和占位 DDR 分配。
+此示例让 Runtime 为 6、7 号卡自动选择 EID，日志中的 `A_route=fullmesh B_route=fullmesh` 表示两端都使用了同机默认策略。
 初始化日志包含 `ddr_initialized=0 cpu_service_required=0`；数据直接从 B HBM 读取到 A HBM。
 纯 NPU 部署可用 `KVAF_ENABLE_AIV_BATCH_GET=ON`、`KVAF_ENABLE_AIV_BATCH_PUT=OFF`、
 `KVAF_ENABLE_CPU_OFFLOAD=OFF`、`KVAF_BUILD_REMOTE_CPU_SERVICE=OFF` 构建。
@@ -377,7 +377,7 @@ python tests/python/bench_hbm_read_raw_addr.py \
 
 ## TCP 通知与两机独立启动
 
-应用通知由 `python/kvaf/tcp_control.py` 提供，与内部 KVHR v8 硬件建链连接独立：
+应用通知由 `python/kvaf/tcp_control.py` 提供，与内部 KVHR v9 硬件建链连接独立：
 
 | 通道 | 发起连接方向 | 消息 |
 | --- | --- | --- |
@@ -399,7 +399,6 @@ export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 ```bash
 python tests/python/bench_hbm_read_raw_addr.py \
   --role producer --device-b 0 \
-  --npu-eid-b-raw '<B_VERIFIED_NPU_ROUTE_EID>' \
   --control-listen 0.0.0.0:29100 \
   --control-timeout 300
 ```
@@ -409,7 +408,6 @@ python tests/python/bench_hbm_read_raw_addr.py \
 ```bash
 python tests/python/bench_hbm_read_raw_addr.py \
   --role reader --device-a 0 \
-  --npu-eid-a-raw '<A_VERIFIED_NPU_ROUTE_EID>' \
   --control-connect 192.168.1.21:29100 \
   --control-timeout 300 \
   --hbm-listen 0.0.0.0:29000 --hbm-advertise 192.168.1.20:29000 \
@@ -418,7 +416,7 @@ python tests/python/bench_hbm_read_raw_addr.py \
   --raw-kernel build-npu/bin/kvaf_execute_batch_get_raw_addr_kernels.o
 ```
 
-两机本地设备编号可以相同。producer 不要求 A 的 EID/raw kernel，也不初始化 reader Runtime；reader 不要求 B 的 EID。包布局、MR 数、随机种子及轮数由 A 通过 hello 统一下发，B 保留自身设备/EID/连接参数；测试规模和 graph/profile 等选项配置在 reader 命令上。
+两机本地设备编号可以相同。上述命令让两端自动选择 CLOS，确认读端打印 `A_route=clos B_route=clos`。包布局、MR 数、随机种子及轮数由 A 通过 hello 统一下发，B 保留自身设备、EID 和连接参数。
 
 A 须能访问 B:29100，B 须能访问 A:29000。TCP 连通仅说明通知可达；两端 EID 仍须对应实际可互通、支持当前 UDMA READ 的 NPU 路由。原 fullmesh 双卡配置不能直接证明跨机路由可用。运行日志应出现 `control_listener=producer hbm_control_listener=reader` 和 `application_transport=tcp role=reader`，通过标志仍为 `NPU_HBM_BENCH_PASS`，包含实际 READ 完成和每轮完整数据校验。
 

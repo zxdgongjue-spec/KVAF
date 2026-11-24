@@ -1,6 +1,23 @@
-"""Parse explicit NPU EID path lists for hardware benchmarks."""
+"""Resolve physical NPUs and parse explicit EIDs for hardware benchmarks."""
 
 from __future__ import annotations
+
+import ctypes
+
+
+def source_physical_device_id(device_id: int) -> int:
+    """Resolve a torch/CANN device index in this process without changing devices."""
+    acl = ctypes.CDLL("libascendcl.so")
+    resolve = getattr(acl, "aclrtGetPhyDevIdByUserDevId", None)
+    if resolve is None:
+        resolve = acl.aclrtGetPhyDevIdByLogicDevId
+    resolve.argtypes = (ctypes.c_int32, ctypes.POINTER(ctypes.c_int32))
+    resolve.restype = ctypes.c_int
+    physical = ctypes.c_int32(-1)
+    rc = resolve(device_id, ctypes.byref(physical))
+    if rc != 0 or physical.value < 0:
+        raise RuntimeError(f"cannot resolve physical NPU for device {device_id} (ACL rc={rc})")
+    return physical.value
 
 
 def parse_npu_eids(value: str | None) -> list[str]:

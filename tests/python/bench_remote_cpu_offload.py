@@ -13,6 +13,7 @@ import traceback
 from test_cpu_offload import fnv64
 from test_remote_cpu_offload import receive, retain
 from pull_bench_utils import print_stages, summarize_us
+from utils.npu_eids import source_physical_device_id
 
 
 INTERNAL_STAGES = ("binding_prepare", "native_total", "validation", "prepare_put", "dst_offsets",
@@ -141,7 +142,7 @@ def main():
         runtime.link_to(args.cpu)
         slot = ((args.block_bytes + 4095) // 4096) * 4096
         runtime.initialize(ddr_bytes=args.blocks * slot, slot_size=slot)
-        ticket = runtime.offload_region()
+        ticket = runtime.offload_region(source_physical_device_id=source_physical_device_id(args.device_b))
         assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
         assert ticket["version"] == 2
         ctx = mp.get_context("spawn")

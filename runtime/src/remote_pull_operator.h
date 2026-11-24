@@ -11,7 +11,8 @@ namespace kvaf {
 // separate connections but consume exactly the same RemoteRegionDesc.
 class RemotePullOperator final : public CpuPullExecutor {
  public:
-  explicit RemotePullOperator(std::shared_ptr<peer::PeerLink> link, std::uint32_t candidate = 0);
+  explicit RemotePullOperator(std::shared_ptr<peer::PeerLink> link, peer::PeerCandidateInfo candidate);
+  const peer::PeerCandidateInfo& candidate() const { return candidate_; }
   Status Initialize(const RemoteRegionDesc&);
   Status CanShutdown() const override;
   Status Shutdown() override;
@@ -30,7 +31,7 @@ class RemotePullOperator final : public CpuPullExecutor {
   Status InspectTask(remote_pull::Command, CpuPullState*);
   Status BuildSpans(const CpuPullRequest&, std::vector<remote_pull::Span>*, bool prepared = false) const;
   Status SubmitImpl(const CpuPullRequest&, remote_pull::Command, std::uint32_t, CpuPullState*, CpuPullSubmitTiming*, bool prepared);
-  std::uint32_t candidate_{};
+  peer::PeerCandidateInfo candidate_;
   std::shared_ptr<peer::PeerLink> link_;
   OffloadRegionTicket ticket_;
   remote_pull::RegionInfo region_{}; // Complete reader-local DDR description.

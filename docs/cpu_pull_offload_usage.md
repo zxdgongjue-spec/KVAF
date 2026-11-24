@@ -122,9 +122,11 @@ python tests/python/test_remote_cpu_offload.py \
   --tensors 78 --rounds 156 --pull-api batch
 ```
 
-本卡测试可用 `--npu-eid` 固定 CPU↔本卡路由。CPU 设备沿用 main 的 `peer_ub_device` 选择方式；测试脚本不再接受旧的 `--cpu-candidate` 数字参数，默认自动选择。共享池首先由 Runtime 分配并固定设备，源注册在该池上尝试 NPU EID；不会为每个源重建 DDR 池。
+首次调用 `runtime.offload_region(source_physical_device_id=None)` 时，Runtime 为该 DDR region 选择一个 CPU 端点，核对实际绑定的 EID 后才返回 version 2 ticket。本机自动选择时，用指定源物理卡的 `pair_info.local_eid` 匹配 CPU 候选，省略时用 Runtime 所在卡。跨卡脚本从已有的 `--device-b` 转换成源物理卡号。远端或本机未命中时取过滤后首项。无参重复取票返回原 ticket，显式源卡需要不同端点时返回冲突。
 
-源 EID 自动发现先尝试 CLOS，再尝试 asdrv pair-info。注册对每个 MR 在四个 Jetty 上各做最多 64 字节的 scratch READ 和 checksum 探测，逐个等待完成，不覆盖已经分配的 DDR 槽位。此前测试机器上 CLOS 路由被拒绝，`000000000000020000100000df00e100` 路由成功；具体选择以当前硬件为准。
+CPU 服务公布其 CPU 亲和性所覆盖芯片的候选，未绑核时公布全部候选。服务参数 `--ub-device`、`--eid-index` 进一步限定范围。客户端可用单个 `peer_ub_device` 选择设备首项。显式设备或 index 在范围外时返回错误。
+
+生产端根据自己连接的 CPU 服务判断拓扑。本机优先使用源卡的 `pair_info.remote_eid`，缺失时取首个有效 CLOS，远端直接取首个有效 CLOS。显式 `CpuPullHbmSource(npu_eid=...)` 优先，对应跨卡 benchmark 的 `--npu-eid-b`。每个 MR 在选定路由的四个 Jetty 上分别执行 scratch READ 和 checksum 探测，任何一次失败都会报告注册失败。
 
 本卡验收成功标记为 `LOCAL_CPU_PULL_PASS`，跨卡为 `REMOTE_OFFLOAD_PASS`。建链导入成功不能代替数据校验。
 
@@ -151,8 +153,7 @@ python tests/python/test_remote_cpu_offload.py \
 CPU 的 `CPU_PULL_PROBE_END` 记录每个 MR 的探测结果，失败时包含具体阶段、Jetty 和 CQ 错误名。
 例如 `cq_status=9 cq_status_name=URMA_CR_ACK_TIMEOUT_ERR` 表示传输重试后仍未获得预期确认，
 与 `cq_status=4` 的本地访问错误不同。四个单条探测全部通过仍不等于正式多 Jetty 并行读取已验证。
-跨机时应对齐已验证的 CPU/NPU EID 配对；仅启用 CPU Pull、未加载 BatchGet kernel 的初始化
-会选择第一个能分配 DDR 的 CPU candidate，不会遍历全部 CPU candidate 执行跨机 READ 探测。
+CPU 日志的 `CANDIDATE_DISCOVERED` 展示有效候选，读取端的 `CPU_PULL_EID_SELECTED` 记录所选设备、index、EID 和选择原因。
 `REMOTE_PULL_DONE` 中的 `mr` 随所选 tensor 改变；验收终行应有
 `REMOTE_OFFLOAD_PASS ... tensors=78 single_mr_per_batch=1`。
 每轮 checksum 校验继续保留，显式模式另外验证重复提交，且两种模式都不重新注册或重建连接。

@@ -11,6 +11,7 @@ import time
 import traceback
 
 from test_cpu_offload import fnv64
+from utils.npu_eids import source_physical_device_id
 
 OFFSETS = [7, 100003, 250019]
 SOURCE_BYTES = 400128
@@ -134,7 +135,7 @@ def main():
         npu_eids=[args.npu_eid_a] if args.npu_eid_a else [])
     runtime.link_to(args.cpu)
     runtime.initialize(ddr_bytes=8 * 131072, slot_size=131072)
-    ticket = runtime.offload_region()
+    ticket = runtime.offload_region(source_physical_device_id=source_physical_device_id(args.device_b))
     assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
     assert ticket["version"] == 2
     ddr_base = runtime.remote_region["base"]

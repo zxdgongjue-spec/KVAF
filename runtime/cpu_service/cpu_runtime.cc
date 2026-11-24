@@ -52,25 +52,23 @@ struct CpuRuntime::Impl {
 #ifdef KVAF_CPU_HAS_URMA
         discovery(std::make_shared<CpuUrmaDiscovery>(options.ub_device, options.has_eid_index,
                                                      options.eid_index)),
-        pull_discovery(std::make_shared<CpuUrmaDiscovery>(options.ub_device, options.has_eid_index,
-            options.eid_index, CpuUrmaDiscovery::Scope::AllDevices)),
 #endif
         ubmem(options, next_session),
-        execution(CreateExecutionService(options, discovery, pull_discovery)),
+        execution(CreateExecutionService(options, discovery)),
         pull([this](std::uint64_t id, remote_pull::RegionInfo* info) {
           return execution->DescribeCpuPullRegion(id, info);
         }, [this](const remote_pull::RegionInfo& info) {
           return execution->AcquireCpuPullBackend(info);
         }) {}
   CpuRuntimeOptions options;
-  std::shared_ptr<CpuUrmaDiscovery> discovery, pull_discovery;
+  std::shared_ptr<CpuUrmaDiscovery> discovery;
   std::uint64_t next_session{1};
   UbmemCpuBackend ubmem;
   std::unique_ptr<execution::CacheRegionService> execution;
   remote_pull::Service pull;
   std::recursive_mutex legacy_mutex;
 #ifdef KVAF_CPU_HAS_URMA
-  UrmaCpuBackend urma, cache_metadata;
+  UrmaCpuBackend urma;
 #endif
 };
 CpuRuntime::CpuRuntime() = default;
@@ -159,14 +157,9 @@ Status CpuRuntime::ServeConnection(int fd) {
         status.code() == StatusCode::kNotFound ? peer::Result::kNotFound : peer::Result::kResourceError);
   }
 #ifdef KVAF_CPU_HAS_URMA
-  // CPU Pull uses main's single-candidate protocol. Its indices refer to
-  // the full device list; ordinary cache providers use the service-affinity list.
-  const bool cache_query = command == peer::Command::kGetCacheCandidateCount ||
-      (command == peer::Command::kGetCandidateInfo && header.bytes == sizeof(peer::CandidateEidRequest));
-  auto& backend = cache_query ? impl_->cache_metadata : impl_->urma;
+  auto& backend = impl_->urma;
   auto status = backend.initialized() ? Status::OK()
-      : backend.Initialize(impl_->options, impl_->next_session,
-                           cache_query ? impl_->discovery : impl_->pull_discovery);
+      : backend.Initialize(impl_->options, impl_->next_session, impl_->discovery);
   if (status.ok()) return backend.ServeConnection(fd, header);
   std::fprintf(stderr, "[KVAF_CPU] %s\n", status.message().c_str());
 #endif
@@ -206,8 +199,6 @@ Status CpuRuntime::Shutdown() {
   status = impl_->ubmem.Shutdown();
   if (!status.ok()) return status;
 #ifdef KVAF_CPU_HAS_URMA
-  status = impl_->cache_metadata.Shutdown();
-  if (!status.ok()) return status;
   status = impl_->urma.Shutdown();
   if (!status.ok()) return status;
 #endif
