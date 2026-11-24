@@ -20,7 +20,9 @@ endif()
 add_executable(kvaf_cpu_push_scatter_test cpu_push_scatter_test.cc
   ${PROJECT_SOURCE_DIR}/access_operator/algorithms/get/scatter/urma_aicpu/kernel/cpu_push_scatter.cc)
 target_include_directories(kvaf_cpu_push_scatter_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/access_operator ${PROJECT_SOURCE_DIR}/access_operator/include)
+  ${PROJECT_SOURCE_DIR}/access_operator
+  ${PROJECT_SOURCE_DIR}/access_operator/algorithms
+  ${PROJECT_SOURCE_DIR}/access_operator/include)
 target_link_libraries(kvaf_cpu_push_scatter_test PRIVATE kvaf_common Threads::Threads)
 add_test(NAME kvaf_cpu_push_scatter_test COMMAND kvaf_cpu_push_scatter_test)
 
