@@ -27,7 +27,7 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
             graph.replay()
             graph.synchronize()
 
-        print(f"MULTICARD_READY device={device}", flush=True)
+        print(f"MULTICARD_READY device={device} peer={args.peer}", flush=True)
         (control / f"ready_{device}").touch()
         while not (control / "start.json").exists():
             if (control / "abort").exists():
@@ -53,7 +53,7 @@ def run_worker(kvaf, torch, args, runtime, execution, output,
         calls = batches * len(plans)
         payload_bytes = calls * args.miss_count * args.token_bytes
         result = {
-            "device": device, "backend": args.backend, "graph_api": args.graph_api,
+            "device": device, "peer": args.peer, "backend": args.backend, "graph_api": args.graph_api,
             "start": begin, "end": end, "calls": calls, "payload_bytes": payload_bytes,
             "bandwidth_GBps": payload_bytes / (end - begin) / 1e9,
             "graph_calls": len(plans), "graphs": 1, "batches": batches, "verified": True,

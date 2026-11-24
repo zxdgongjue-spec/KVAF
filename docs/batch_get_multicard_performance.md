@@ -27,6 +27,46 @@ bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
 测并发带宽。所有阶段使用已有 CPU service，脚本不会启动或重启服务。
 每卡单独初始化 DDR 数据区；测试的是这些访问对共享 CPU、内存与通信资源的竞争。
 
+## 每张卡连接独立的 CPU service
+
+使用可重复的 `--device-peer DEVICE=HOST:PORT` 按设备号指定服务，映射与 `--devices`
+中的顺序无关。可以连接同一主机不同端口的服务，也可以连接不同 CPU 主机。
+例如先在 CPU 主机分别启动两个服务进程：
+
+```bash
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 21111 \
+  --gather-threads 8 --gather-mode active >cpu-service-21111.log 2>&1 &
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 21112 \
+  --gather-threads 8 --gather-mode active >cpu-service-21112.log 2>&1 &
+```
+
+在 NPU 端指定 device 1、2 各自的服务（将 `cpu-host` 替换为 CPU 主机地址）：
+
+```bash
+bash tests/run_remote_cpu_batch_get_multicard_perf.sh build-npu \
+  --backend gather_read --devices 1 2 --aicpu-workers 5 \
+  --device-peer 1=cpu-host:21111 --device-peer 2=cpu-host:21112 \
+  --request-length 32768 --miss-count 4096 --table-capacity 4096 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --warmup 10 --seconds 10 --output reports/multicard-per-service
+```
+
+未设置 `--device-peer` 的卡使用 `--peer`；省略 `--peer` 时沿用
+`KVAF_CPU_SERVICE_ADDR`，再回退到 `127.0.0.1:28888`。例如
+`--devices 1 2 3 --peer cpu-host:21111 --device-peer 3=cpu-host:21112`
+让 1、2 卡共享服务，3 卡使用另一个服务。同一设备重复配置、配置未参与测试的设备，
+以及无效的 `DEVICE=HOST:PORT` 都会在启动 worker 前报错。
+
+独立、并发和并行度扫描的所有阶段使用相同映射，四种后端均支持。
+每个服务可独立配置线程数、内存页模式与外部 CPU/NUMA 亲和性，
+设置方式见 [CPU service 说明](../runtime/README.md#cpu-runtime-服务与-npu-link)。
+独立服务进程仍可能共享主机的 CPU、内存或链路资源；需要区分这些资源的竞争时，
+应在启动服务时选择对应亲和性或主机。
+
+## 持续 Graph 测量
+
 每卡捕获一张 ACL 图，默认图内串行执行 256 个 Get。各 Get 使用独立的请求方案，
 共用输出缓冲区。只有需要改变图大小时才传 `--graph-calls N`。
 预热和测量都每轮回放一次、同步一次。测量前后按最后一个 Get 的请求检查对应输出行。
@@ -99,9 +139,12 @@ bash tests/run_remote_cpu_batch_get_perf.sh build-npu --backend gather_read --he
 
 结果目录包含 `config.json`、各阶段/各设备日志与原始 JSON，以及：
 
-- `summary.csv`：各卡图数、独立/并发带宽、保留比例和下降比例。
-- `aggregate.csv`、`aggregate.json`：总吞吐、窗口重叠率与起跑偏差。
-- `report.md`：配置和结果表；AICPU 单独标记 worker 数。
+- `summary.csv`：各卡 CPU service（`peer`）、图数、独立/并发带宽、保留比例和下降比例。
+- `aggregate.csv`、`aggregate.json`：总吞吐、窗口重叠率与起跑偏差；CSV 额外记录 `device_peers` 映射。
+- `report.md`：配置、每卡服务地址和结果表；AICPU 单独标记 worker 数。
+
+`config.json` 的 `device_peers` 保存所有参与设备的实际服务地址，原始 worker JSON
+也记录 `peer`。重新汇总时使用保存的映射，不受当前环境变量影响；旧的单服务结果目录仍可汇总。
 
 并发总吞吐使用所有卡的有效字节之和除以最早开始至最晚结束的实际窗口。
 窗口重叠率低于 95% 时保留报告并返回失败，需检查日志后再判断竞争。

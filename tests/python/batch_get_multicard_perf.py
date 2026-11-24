@@ -21,6 +21,38 @@ from utils.get_options import (
 from utils.perf_execution import add_execution_metadata
 
 
+def parse_device_peer(value):
+    device, separator, peer = value.partition("=")
+    try:
+        device = int(device)
+    except ValueError:
+        device = -1
+    host, colon, port = peer.rpartition(":")
+    if (not separator or device < 0 or not host or not colon or not port.isascii()
+            or not port.isdecimal() or not 1 <= int(port) <= 65535
+            or any(character.isspace() for character in peer)):
+        raise argparse.ArgumentTypeError("expected DEVICE=HOST:PORT with a nonnegative device ID and port 1..65535")
+    return device, peer
+
+
+def resolve_device_peers(args, parser):
+    overrides = {}
+    for device, peer in args.device_peer:
+        if device not in args.devices:
+            parser.error(f"--device-peer device {device} is not in --devices")
+        if device in overrides:
+            parser.error(f"--device-peer specified more than once for device {device}")
+        overrides[device] = peer
+    args.device_peers = {str(device): overrides.get(device, args.peer) for device in args.devices}
+    if any(not peer.strip() for peer in args.device_peers.values()):
+        parser.error("each device requires a CPU service via --peer or --device-peer")
+
+
+def peer_for_device(config, device):
+    # JSON object keys are strings; old result directories only stored one peer.
+    return config.get("device_peers", {}).get(str(device), config.get("peer", ""))
+
+
 def worker_error(device, process, log_path, phase):
     tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-60:])
     return RuntimeError(
@@ -38,11 +70,12 @@ def run_group(args, devices, directory):
     logs = []
     try:
         for device in devices:
+            peer = args.device_peers[str(device)]
             log_path = directory / f"device_{device}.log"
             log = log_path.open("w")
             logs.append(log)
             env = dict(os.environ, DEVICE_ID=str(device),
-                       KVAF_CPU_SERVICE_ADDR=args.peer, PYTHONUNBUFFERED="1")
+                       KVAF_CPU_SERVICE_ADDR=peer, PYTHONUNBUFFERED="1")
             if args.backend == "aiv" and args.parallelism is None:
                 # The controller uses KVAF_BATCH_GET_AIV_CORES for sweeps.
                 env.pop("KVAF_BATCH_GET_PERF_AIV_CORES", None)
@@ -50,11 +83,13 @@ def run_group(args, devices, directory):
             command = [
                 str(runner), str(args.build_dir),
                 *workload_command(args),
+                "--peer", peer,
                 "--graph-api", "acl",
                 "--contention-control-dir", str(directory),
                 "--contention-result", str(directory / f"device_{device}.json"),
                 "--contention-graph-calls", str(args.graph_calls),
             ]
+            print(f"MULTICARD_WORKER phase={directory.name} device={device} peer={peer} log={log_path}", flush=True)
             process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
             children.append((device, process, log_path))
@@ -87,6 +122,8 @@ def run_group(args, devices, directory):
         for device, result in zip(devices, results):
             if result["device"] != device or not result["verified"] or result["end"] <= result["start"]:
                 raise RuntimeError(f"invalid result for device {device}")
+            if result.get("peer") != args.device_peers[str(device)]:
+                raise RuntimeError(f"CPU service mismatch for device {device}; see {directory}")
         return results
     finally:
         # Let healthy workers leave their barrier/loop and release remote DDR.
@@ -117,21 +154,23 @@ def markdown_table(headers, rows):
 
 def write_summary(directory, isolated, concurrent, config=None):
     config = config or {}
+    device_peers = {str(result["device"]): peer_for_device(config, result["device"]) for result in isolated}
     rows = []
-    print("device  isolated_GB/s  concurrent_GB/s  retained_%  drop_%")
+    print("device  isolated_GB/s  concurrent_GB/s  retained_%  drop_%  CPU_service")
     for solo, shared in zip(isolated, concurrent):
         ratio = shared["bandwidth_GBps"] / solo["bandwidth_GBps"]
         row = {
             "backend": config.get("backend", "ubmem" if config.get("transport") == "ubmem" else "aiv"),
             "execution_mode": config.get("execution_mode", "unified"),
-            "device": solo["device"], "graphs": config.get("graphs", 1),
+            "device": solo["device"], "peer": device_peers[str(solo["device"])],
+            "graphs": config.get("graphs", 1),
             "isolated_GBps": solo["bandwidth_GBps"],
             "concurrent_GBps": shared["bandwidth_GBps"],
             "retained_percent": ratio * 100, "drop_percent": (1 - ratio) * 100,
         }
         rows.append(row)
         print(f"{row['device']:6d}  {row['isolated_GBps']:13.3f}  {row['concurrent_GBps']:15.3f}"
-              f"  {row['retained_percent']:10.2f}  {row['drop_percent']:6.2f}")
+              f"  {row['retained_percent']:10.2f}  {row['drop_percent']:6.2f}  {row['peer']}")
     span = max(r["end"] for r in concurrent) - min(r["start"] for r in concurrent)
     overlap = max(0.0, min(r["end"] for r in concurrent) - max(r["start"] for r in concurrent))
     aggregate = {
@@ -177,6 +216,7 @@ def write_summary(directory, isolated, concurrent, config=None):
         metadata.update(gather_read_wave_settings(argparse.Namespace(**config)))
     metadata["run"] = directory.name
     metadata["device_order"] = " ".join(str(r["device"]) for r in isolated)
+    metadata["device_peers"] = json.dumps(device_peers)
     aggregate_row = dict(metadata, **aggregate)
     with (directory / "aggregate.csv").open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=list(aggregate_row))
@@ -205,7 +245,7 @@ def write_summary(directory, isolated, concurrent, config=None):
             ("每张 Graph 的 BatchGet 次数", config["graph_calls"]),
             ("预热", f"{config['warmup']} 轮，每轮回放全部图后同步一次"),
             ("访问模式 / 随机种子", f"source={config.get('source_access_pattern', 'random')} output={config.get('output_access_pattern', 'contiguous')} sort={config.get('sort_input_indices', False)} seed={config['seed']}"),
-            ("CPU service", config["peer"]),
+            ("CPU service / 卡", "; ".join(f"{device} → {peer}" for device, peer in device_peers.items())),
         ]
         if backend == "aiv":
             settings += [(label, config[key]) for label, key in (
@@ -214,13 +254,13 @@ def write_summary(directory, isolated, concurrent, config=None):
             ) if key in config]
         report += ["## 测试配置", "", markdown_table(["参数", "值"], settings), ""]
     device_rows = [
-        (r["device"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
+        (r["device"], r["peer"], f"{r['isolated_GBps']:.3f}", f"{r['concurrent_GBps']:.3f}",
          f"{r['retained_percent']:.2f}", f"{r['drop_percent']:.2f}") for r in rows
     ]
-    device_rows.append(("各卡相加", f"{aggregate['isolated_sum_GBps']:.3f}",
+    device_rows.append(("各卡相加", "—", f"{aggregate['isolated_sum_GBps']:.3f}",
                         f"{aggregate['concurrent_sum_GBps']:.3f}", "—", "—"))
     report += ["## 每卡带宽", "",
-               markdown_table(["设备", "独立 GB/s", "并发 GB/s", "保留 %", "下降 %"], device_rows), "",
+               markdown_table(["设备", "CPU service", "独立 GB/s", "并发 GB/s", "保留 %", "下降 %"], device_rows), "",
                "## 总带宽与并发情况", "",
                markdown_table(["指标", "值", "单位"],
                               [(label, f"{aggregate[key]:.3f}", unit) for label, key, unit in metrics]), "",
@@ -258,6 +298,9 @@ def write_sweep_summary(directory, counts, field="aiv_cores"):
     report = ["# 多卡 BatchGet 并行度扫描", "",
               f"后端：{rows[0].get('backend', rows[0]['transport'])}；每批 {rows[0].get('miss_count', rows[0]['requests'])} × {rows[0]['token_bytes']} B；带宽单位为十进制 GB/s。",
               "", table, ""]
+    if rows[0].get("device_peers"):
+        report += ["## CPU service 映射", "",
+                   markdown_table(["设备", "CPU service"], json.loads(rows[0]["device_peers"]).items()), ""]
     report += [f"- [{count} 详细结果]({sweep_case(directory, field, count).name}/report.md)" for count in counts]
     (directory / "report.md").write_text("\n".join(report) + "\n")
     print(f"MULTICARD_SWEEP_SUMMARY\n{table}")
@@ -279,6 +322,9 @@ def summarize(directory):
     for device, solo, shared in zip(config["devices"], isolated, concurrent):
         if solo["device"] != device or shared["device"] != device or not solo["verified"] or not shared["verified"]:
             raise RuntimeError(f"invalid saved result for device {device}")
+        for result in (solo, shared):
+            if "peer" in result and result["peer"] != peer_for_device(config, device):
+                raise RuntimeError(f"CPU service mismatch in saved result for device {device}")
     write_summary(directory, isolated, concurrent, config)
 
 
@@ -293,7 +339,10 @@ def main(argv=None):
     parser.add_argument("--seconds", type=float, default=10, help="measurement window per phase")
     parser.add_argument("--graph-calls", type=int, default=256, help="Get calls in each device's ACL graph (default: 256)")
     add_execution_metadata(parser)
-    parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"))
+    parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR", "127.0.0.1:28888"),
+                        help="default CPU service HOST:PORT for devices without --device-peer")
+    parser.add_argument("--device-peer", action="append", type=parse_device_peer, default=[],
+                        metavar="DEVICE=HOST:PORT", help="CPU service for one device; repeat for multiple devices")
     parser.add_argument("--ready-timeout", type=float, default=600)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--summarize", type=Path,
@@ -323,6 +372,7 @@ def main(argv=None):
         parser.error("--graph-calls must be positive")
     if len(args.devices) < 2 or len(set(args.devices)) != len(args.devices) or min(args.devices) < 0:
         parser.error("--devices requires at least two distinct nonnegative device IDs")
+    resolve_device_peers(args, parser)
     for name in ("seconds", "ready_timeout"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -332,6 +382,7 @@ def main(argv=None):
     config = vars(args).copy()
     config.update(graph_api="acl", graphs=1)
     config.pop("summarize")
+    config.pop("device_peer")
     config.pop("parallelism")
     config.pop("aicpu_workers" if field == "aiv_cores" else "aiv_cores")
     config["requests"] = args.request_length  # Existing report consumers use this capacity field.
