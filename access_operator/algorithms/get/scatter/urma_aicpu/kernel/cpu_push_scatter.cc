@@ -208,6 +208,10 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
              worker, consumed, {}};
   Barrier();
   if (profile) {
+    if (output_target && !worker && count && status->result == std::uint64_t(Result::kOk)) {
+      const auto& sample = reinterpret_cast<const volatile Completion*>(io.Memory() + layout.done)->cpu_sgl_write;
+      profile->cpu_sgl_write = {sample.elapsed_ns, sample.data_wrs, sample.waves, sample.tail_cqes};
+    }
     profile->spans = range.end - range.begin;
     profile->bytes = profile->spans * args->request.token_bytes;
     profile->ready_wait_ns = profile->read_ns - profile->scatter_ns;

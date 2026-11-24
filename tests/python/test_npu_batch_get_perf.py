@@ -63,6 +63,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_workload_arguments(parser)
     add_backend_arguments(parser)
+    parser.add_argument("--sgl-payload-only", action="store_true",
+                        help="measure prepared DDR-to-HBM data WRITEs from first CPU post to all tail CQEs (cpu_sgl_write)")
     parser.add_argument("--iterations", type=int,
                         default=environment_int("KVAF_BATCH_GET_PERF_ITERATIONS", 100))
     parser.add_argument("--kernel-profile", action="store_true",
@@ -103,6 +105,10 @@ def validate_args(args: argparse.Namespace) -> str | None:
     error = validate_workload(args)
     if error:
         return error
+    if args.sgl_payload_only and (
+        args.backend != "cpu_sgl_write" or args.miss_count <= 0 or args.contention_control_dir is not None
+    ):
+        return "--sgl-payload-only requires a single-card cpu_sgl_write benchmark with positive miss-count"
     if args.device_id < 0:
         return "device-id must be non-negative"
     if args.graph_replays <= 0:
@@ -190,6 +196,17 @@ def print_aicpu_details(args, execution, samples, details=None):
                           metrics, details, "worker", worker)
 
 
+def validate_sgl_payload_sample(workers, rows):
+    if not workers or "cpu_sgl_waves" not in workers[0]:
+        raise RuntimeError("missing CPU SGL sample; rebuild the matching CPU service, NPU host and AICPU kernel")
+    sample = workers[0]
+    if sample["cpu_sgl_waves"] != 1:
+        raise ValueError(f"CPU SGL sample has {sample['cpu_sgl_waves']} waves; reduce --miss-count to fit one wave")
+    if not (sample["cpu_sgl_elapsed_ns"] > 0 and sample["cpu_sgl_data_wrs"] > 0
+            and 1 <= sample["cpu_sgl_tail_cqes"] <= 4 and sum(w["active_requests"] for w in workers) == rows):
+        raise ValueError("incomplete CPU SGL payload timing, rows or tail completions")
+
+
 def print_measurements(args, execution, samples, profiles, report=None):
     """Keep end-to-end and operator wall time distinct; count payload once."""
     scopes = [("end_to_end", samples, "host_perf_counter")]
@@ -197,6 +214,12 @@ def print_measurements(args, execution, samples, profiles, report=None):
         raise AssertionError("BatchGet profile sample/worker count mismatch")
     scopes.append(("kernel", [device_profile_ms(p, args.kernel_profile_clock_mhz) for p in profiles],
                    "device_ns" if uses_aicpu(args) else "device_cycles"))
+    if args.sgl_payload_only:
+        sgl_counts = {(p[0]["cpu_sgl_data_wrs"], p[0]["cpu_sgl_tail_cqes"]) for p in profiles}
+        if len(sgl_counts) != 1:
+            raise ValueError("CPU SGL WR or completion counts changed at fixed workload size")
+        data_wrs, tail_cqes = sgl_counts.pop()
+        scopes.append(("sgl_payload", [p[0]["cpu_sgl_elapsed_ns"] / 1e6 for p in profiles], "cpu_steady_clock_ns"))
     payload = args.miss_count * args.token_bytes
     measurements = {}
     timing = args.get_timing if execution == "eager" else "graph-replay-wait"
@@ -209,8 +232,12 @@ def print_measurements(args, execution, samples, profiles, report=None):
                        p90_us=f"{p90 * 1000:.6f}", p99_us=f"{p99 * 1000:.6f}",
                        mean_GBps=f"{payload / mean / 1e6:.6f}", p50_GBps=f"{payload / p50 / 1e6:.6f}",
                        p99_GBps=f"{payload / p99 / 1e6:.6f}", mean_GiBps=f"{payload / (mean / 1000) / 1024**3:.6f}")
+        if scope == "sgl_payload":
+            metrics.update(p95_us=f"{percentile(durations, .95) * 1000:.6f}",
+                           data_wrs=data_wrs, tail_cqes=tail_cqes,
+                           ready_wrs=0, waves=1)
         measurements["e2e" if scope == "end_to_end" else scope] = metrics
-        cleanup_excluded = scope == "kernel" or execution == "graph"
+        cleanup_excluded = scope in ("kernel", "sgl_payload") or execution == "graph"
         print(
             f"BATCH_GET_RESULT backend={args.backend} execution={execution} "
             f"execution_mode={args.execution_mode} scope={scope} "
@@ -373,7 +400,7 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         kvaf, transport=args.transport,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
-        get_capacity=args.request_length, sge_per_wr=args.sge_per_wr,
+        get_capacity=args.request_length, sge_per_wr=args.sge_per_wr, sgl_payload_only=args.sgl_payload_only,
     )
     stream = torch.npu.current_stream()
     if args.multi_graph_check:
@@ -421,6 +448,8 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
             durations.append(float(start_event.elapsed_time(end_event)))
             check_captured(inputs.fixed, args.miss_count)
             profiles.append(list(runtime.batch_get_kernel_profile(graph_lease=graph.leases[0])))
+            if args.sgl_payload_only:
+                validate_sgl_payload_sample(profiles[-1], args.miss_count)
         graph.validated = True
         print_measurements(args, "graph", durations, profiles, report)
         print(f"BATCH_GET_GRAPH_PASS backend={args.backend} api={args.graph_api} "
@@ -902,7 +931,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         put_cores=0 if args.backend == "aiv" else args.parallelism,
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
-        max_inflight_total=args.max_inflight_total, sge_per_wr=args.sge_per_wr,
+        max_inflight_total=args.max_inflight_total, sge_per_wr=args.sge_per_wr, sgl_payload_only=args.sgl_payload_only,
     )
     runtime = kvaf.NpuRuntime(
         **runtime_options(args),
@@ -1212,6 +1241,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
                 runtime.check_batch_get_status(torch.npu.current_stream())
             check_output((indices, offsets, output_indices), miss_count_value)
             kernel_profile_samples.append(list(runtime.batch_get_kernel_profile()))
+            if args.sgl_payload_only:
+                validate_sgl_payload_sample(kernel_profile_samples[-1], miss_count_value)
 
         if args.get_timing != "sync-call":
             print_samples(

@@ -69,7 +69,9 @@ class Transport {
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
-  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
+  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr,
+                      std::uint64_t* first_post_ns = nullptr);
+  Status WritePayloadOnly();
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
@@ -89,6 +91,8 @@ class Transport {
   urma_target_seg_t* output_remote_{};
   OutputTarget output_;
   bool direct_output_{};
+  bool payload_only_{};
+  CpuSglWriteSample payload_sample_{};
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};
   std::uint8_t* memory_{};

@@ -107,3 +107,47 @@ done
 加 `--kernel-profile` 并用较少迭代可检查 CPU 的 `data_wrs`。
 4096×656 B、4 worker、当前 1024 行 chunk/四路 Jetty 划分下，
 4 SGE 应为 1024 个数据 WR，8 SGE 应为 512 个；均另有 16 个 ready WR。
+
+## 测 CPU SGL 写入 HBM 的有效载荷带宽
+
+在单卡 benchmark 加 `--sgl-payload-only`。这个开关对应 Get 资源的
+`sgl_payload_only=True`。CPU 先读描述符、导入本轮 output、填完所有源/目标 SGE，
+再用原有 Jetty 分片和 post 大小提交数据链。诊断链省去 chunk 的 ready WRITE，
+每条非空 Jetty 的最后一个数据 WR 使用强序并产生一个 CQE。
+
+CPU 单调时钟从第一次调用 `urma_post_jetty_send_wr` 前计到最后一条数据链尾 CQE
+验证成功。窗口包括 CPU 提交、DMA 及轮询观察完成的耗时。报告和 done 在窗口结束后传输。
+只为非空、单 wave 请求报告带宽。请求需要多个 wave 时，benchmark 会提示缩小
+`--miss-count`。每轮通过输出校验才纳入统计，预热轮次排除。
+
+CPU 端在仓库根目录重建，并用新二进制启动服务：
+
+```bash
+./build.sh cpu
+./build-cpu/runtime/kvaf_cpu_service --listen 0.0.0.0 --port 21111
+```
+
+NPU 端加载部署所用 CANN 环境后，在同一版本的仓库根目录执行。跨主机时将
+`127.0.0.1` 换成可达的 CPU 服务地址，按实际卡号设置 `DEVICE_ID`。
+
+```bash
+./build.sh npu
+./build.sh npu --check-kernel
+export KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=2
+for sge in 4 8; do
+  bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+    --backend cpu_sgl_write --sgl-payload-only --sge-per-wr "$sge" --aicpu-workers 4 \
+    --execution eager --request-length 4096 --table-capacity 4096 --miss-count 4096 \
+    --token-bytes 656 --tokens-per-block 1 --seed 20260903 \
+    --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+    --warmup 50 --iterations 1000 --output-dir "reports/sgl-payload-${sge}sge"
+done
+```
+
+看终端的 `scope=sgl_payload` 或各目录的 `summary.csv`。
+`sgl_payload_mean_GBps` 是有效字节总数除以 CPU 窗口总纳秒数（十进制 GB/s），
+`sgl_payload_p50_us` 和 `sgl_payload_p95_us` 给出单轮耗时分位数。
+上述配置每轮 2,686,976 B，4/8 SGE 应分别对应 1024/512 个数据 WR，
+两组均应为 0 ready WR、1 wave、4 个数据尾 CQE。CPU 服务端的
+`CPU_SGL_WRITE_SAMPLE` 按 sequence 给出原始纳秒及计数，包含启用 profile 的预热轮次。
+诊断结果由 CPU 服务、NPU Host/Python 和 AICPU 设备包共同传回，三者均须更新。

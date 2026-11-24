@@ -14,6 +14,7 @@ namespace {
 using kvaf::urma::Sge;
 std::uint32_t device_sges = 13, queue_sges{}, data_wrs{}, data_sges{}, segments{};
 std::uint64_t output_base{}, output_bytes{}, done_address{};
+std::uint32_t ready_wrs{}, data_tails{};
 std::map<urma_jfc_t*, std::deque<std::uint64_t>> completions;
 int QueryTp(urma_context_t*, kvaf::urma::TpQuery*, std::uint32_t* count, kvaf::urma::TpInfo* info) {
   *count = 1; info->tp_handle = 1; return 0;
@@ -94,7 +95,14 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
     if (wr->opcode == URMA_OPC_WRITE && dst->addr >= output_base && dst->addr < output_base + output_bytes) {
       assert(wr->rw.src.num_sge <= queue_sges);
       ++data_wrs; data_sges += wr->rw.src.num_sge;
+      if (wr->flag.bs.complete_enable) {
+        assert(wr->flag.bs.place_order == URMA_STRONG_ORDER);
+        ++data_tails;
+      }
     }
+    if (wr->opcode == URMA_OPC_WRITE && dst->addr >= done_address + sizeof(kvaf::cpu_push::Completion)
+        && dst->addr < done_address + sizeof(kvaf::cpu_push::Completion) + 4 * sizeof(kvaf::cpu_push::Ready))
+      ++ready_wrs;
     if (wr->opcode == URMA_OPC_WRITE && dst->addr == done_address)
       assert(segments == 2);  // Workspace + control; output is unimported before done.
     if (wr->flag.bs.complete_enable)
@@ -117,7 +125,7 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
 
 namespace {
 void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 4096,
-         std::uint32_t token_bytes = 656) {
+         std::uint32_t token_bytes = 656, bool payload_only = false) {
   using namespace kvaf::cpu_push;
   Layout layout;
   assert(MakeLayout(token_bytes, 4, &layout, true));
@@ -139,7 +147,7 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
   setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = layout.bytes;
   setup.npu_tp = 1; setup.npu_psn = 1; setup.token_value = 7;
   setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = 4;
-  setup.output_mode = kDirectOutput; setup.sge_per_wr = requested;
+  setup.output_mode = payload_only ? kPayloadOnlyOutput : kDirectOutput; setup.sge_per_wr = requested;
   std::memcpy(setup.segment, &hbm_segment, sizeof(hbm_segment));
   for (auto& channel : setup.channels) channel.bytes = 28;
   kvaf::peer::OpenCpuPushGetResponse response{};
@@ -163,10 +171,22 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
     auto* addresses = reinterpret_cast<std::uint64_t*>(hbm + layout.descriptor);
     for (std::uint32_t i = 0; i < count; ++i)
       addresses[i] = source_segment.seg.ubva.va + ((count - i + sequence - 1) % count) * token_bytes;
-    data_wrs = data_sges = 0;
+    data_wrs = data_sges = ready_wrs = data_tails = 0;
+    reinterpret_cast<Word*>(hbm + layout.notify)->value = sequence | kProfileNotify;
+    std::uint64_t received = 0;
+    assert(transport.ReadRequest(&received).ok() && received == sequence);
     assert(transport.ReadDescriptor(sequence).ok());
     assert(transport.WriteBatch().ok());
     assert(transport.Complete(sequence, Result::kOk).ok());
+    const auto& sample = reinterpret_cast<Completion*>(hbm + layout.done)->cpu_sgl_write;
+    if (payload_only) {
+      assert(ready_wrs == 0 && sample.data_wrs == data_wrs && sample.tail_cqes == data_tails);
+      assert(sample.waves == (count == 65536 ? 2 : 1));
+      assert((sample.elapsed_ns > 0) == (sample.waves == 1));
+      assert(data_tails == (count == 1 ? 1 : 4 * sample.waves));
+    } else {
+      assert(ready_wrs > 0 && sample.waves == 0 && sample.elapsed_ns == 0);
+    }
     if (count == 4096 && token_bytes == 656) {
       assert(data_wrs == (expected == 4 ? 1024 : expected == 8 ? 512 : 320));
       assert(data_sges == count);
@@ -204,6 +224,11 @@ int main() {
   Run(8, 8);
   Run(0, 13);
   Run(8, 8, 65, 10000);  // Byte-limited WRs and split-token source offsets.
+  Run(4, 4, 4096, 656, true);
+  Run(8, 8, 4096, 656, true);
+  Run(8, 8, 65, 10000, true);
+  Run(4, 4, 1, 656, true);  // Only one Jetty has payload.
+  Run(4, 4, 65536, 16, true);  // Complete both waves, leave elapsed_ns unset.
   Reject(8, 4, kvaf::cpu_push::kDirectOutput);
   Reject(17, 32, kvaf::cpu_push::kDirectOutput);
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);

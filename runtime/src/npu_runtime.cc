@@ -216,9 +216,9 @@ struct NpuRuntime::Impl {
         throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
       if (r.cpu_threads && (!get || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
         throw std::invalid_argument("CPU thread budget requires AICPU Gather");
-      if (r.sge_per_wr && (!get || t != Transport::Urma || e != Executor::Aicpu ||
+      if ((r.sge_per_wr || r.sgl_payload_only) && (!get || t != Transport::Urma || e != Executor::Aicpu ||
                            algorithm != GetAlgorithm::CpuSglWrite))
-        throw std::invalid_argument("sge_per_wr requires URMA AICPU CPU SGL Write Get");
+        throw std::invalid_argument("SGL write resources require URMA AICPU CPU SGL Write Get");
       if (!r.kernel_path.empty() && e == Executor::Aicpu)
         throw std::invalid_argument("AICPU kernel package is resolved through the CANN installation");
     }
@@ -376,7 +376,7 @@ struct NpuRuntime::Impl {
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        eids.front(), get, budget.sge_per_wr});
+        eids.front(), get, budget.sge_per_wr, budget.sgl_payload_only});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif

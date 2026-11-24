@@ -786,6 +786,13 @@ class NpuPythonRuntime final {
       py::dict item;
       item["core"] = core;
       if (profile.device_start_ns) {
+        const auto& sgl = profile.aicpu_profile.cpu_sgl_write;
+        if (sgl.waves) {
+          item["cpu_sgl_elapsed_ns"] = sgl.elapsed_ns;
+          item["cpu_sgl_data_wrs"] = sgl.data_wrs;
+          item["cpu_sgl_waves"] = sgl.waves;
+          item["cpu_sgl_tail_cqes"] = sgl.tail_cqes;
+        }
         item["device_start_ns"] = profile.device_start_ns;
         item["device_finish_ns"] = profile.device_finish_ns;
         BatchGetProfile detailed{};

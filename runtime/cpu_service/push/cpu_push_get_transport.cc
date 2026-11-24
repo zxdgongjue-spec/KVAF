@@ -3,6 +3,7 @@
 #include "batch_get_profile.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -42,9 +43,9 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      setup.output_mode > kDirectOutput ||
-      setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode != kDirectOutput) ||
-      !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode == kDirectOutput) ||
+      setup.output_mode > kPayloadOnlyOutput ||
+      setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode == kScatterOutput) ||
+      !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode != kScatterOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
@@ -55,7 +56,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
-  direct_output_ = setup.output_mode == kDirectOutput;
+  direct_output_ = setup.output_mode != kScatterOutput;
+  payload_only_ = setup.output_mode == kPayloadOnlyOutput;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
@@ -139,9 +141,19 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
                 sizeof(urma_transport_mode_t));
   }
   auto& done = done_.queues[0];
+  // Publish the report before the ordered done token. The NPU may observe
+  // the token before a CPU-side CQ poll or a subsequent control WRITE.
+  auto done_bytes = static_cast<std::uint32_t>(sizeof(Completion));
+  if (payload_only_) {
+    const auto offset = layout_.done + offsetof(Completion, cpu_sgl_write);
+    done.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset),
+                          sizeof(CpuSglWriteSample), control_, nullptr});
+    AppendPrepared(done, 0, hbm_base_ + offset, sizeof(CpuSglWriteSample), 1);
+    done_bytes = sizeof(Completion::token);
+  }
   done.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + layout_.done),
-                        sizeof(Completion), control_, nullptr});
-  AppendPrepared(done, 0, hbm_base_ + layout_.done, sizeof(Completion), 1, true);
+                        done_bytes, control_, nullptr});
+  AppendPrepared(done, 0, hbm_base_ + layout_.done, done_bytes, 1, true);
   SealPrepared(done_);
   Stage("ready");
   return Status::OK();
@@ -368,6 +380,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
           q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), destination_offset});
           AppendPrepared(q, queue, destination, bytes, sges);
         }
+        if (payload_only_) return;  // Direct output consumes only the final done token.
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
@@ -439,7 +452,8 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   }
   return Status::OK();
 }
-Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile) {
+Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile,
+                               std::uint64_t* first_post_ns) {
   std::size_t posts = 0;
   for (const auto& q : plan.queues) posts = std::max(posts, q.posts.size());
   // Give every Jetty a doorbell before preparing the next slice of any Jetty.
@@ -449,7 +463,7 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
       if (batch >= q.posts.size()) continue;
       const auto& post = q.posts[batch];
       if (refresh_sources) RefreshPrepared(q, post);
-      const auto start = profile ? BatchGetProfileNowNs() : 0;
+      const auto start = (profile || first_post_ns) ? BatchGetProfileNowNs() : 0;
       urma_jfs_wr_t* bad = nullptr;
       if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[post.wr], &bad)) {
         queues_[queue].poisoned = true;
@@ -459,6 +473,10 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
         if (!profile->first_post_ns) profile->first_post_ns = start;
         profile->post_ns += BatchGetProfileNowNs() - start;
         ++profile->post_calls;
+      }
+      if (first_post_ns) {
+        *first_post_ns = start;
+        first_post_ns = nullptr;
       }
     }
   }
@@ -500,10 +518,34 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
     }
   }
 }
+Status Transport::WritePayloadOnly() {
+  payload_sample_ = {};
+  payload_sample_.waves = static_cast<std::uint16_t>(prepared_.size());
+  const bool measure = profile_.enabled && prepared_.size() == 1;
+  for (std::size_t w = 0; w < prepared_.size(); ++w) {
+    auto& plan = *prepared_[w];
+    for (auto& q : plan.queues) {
+      for (const auto& post : q.posts) RefreshPrepared(q, post);
+      payload_sample_.data_wrs += static_cast<std::uint32_t>(q.wrs.size());
+    }
+    auto status = BeginPrepared(plan, w + 1);
+    if (!status.ok()) return status;
+    std::uint64_t first_post_ns = 0;
+    status = PostPrepared(plan, false, nullptr, measure ? &first_post_ns : nullptr);
+    if (!status.ok()) return status;
+    status = PollPrepared(w + 1);
+    if (!status.ok()) return status;
+    if (measure) payload_sample_.elapsed_ns = BatchGetProfileNowNs() - first_post_ns;
+    // PollPrepared succeeds only after every participating queue's tail CQE.
+    payload_sample_.tail_cqes += static_cast<std::uint16_t>(plan.fence_count);
+  }
+  return Status::OK();
+}
 Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   auto status = PrepareWrites(request().count);
   if (!status.ok()) return status;
+  if (payload_only_) return WritePayloadOnly();
   // Match the ordered-WRITE probe: short submissions to all four queues from
   // their owner, then poll their tails together. Avoid waking an OpenMP team
   // and crossing several team barriers for each short request.
@@ -542,6 +584,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   }
   auto* done = reinterpret_cast<Completion*>(memory_ + layout_.done);
   *done = {Progress(sequence, static_cast<std::uint32_t>(result)), {}};
+  if (payload_only_ && result == Result::kOk) done->cpu_sgl_write = payload_sample_;
   auto status = BeginPrepared(done_, UINT64_MAX);
   if (status.ok()) status = PostPrepared(done_);
   if (status.ok()) status = PollPrepared(UINT64_MAX);
@@ -550,6 +593,14 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
 
 void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
+  if (payload_only_) {
+    std::fprintf(stderr, "CPU_SGL_WRITE_SAMPLE sequence=%" PRIu64 " bytes=%" PRIu64
+                 " elapsed_ns=%" PRIu64 " data_wrs=%u ready_wrs=0 waves=%u tail_cqes=%u\n",
+                 request().sequence, std::uint64_t{request().count} * token_bytes_,
+                 payload_sample_.elapsed_ns, payload_sample_.data_wrs,
+                 unsigned(payload_sample_.waves), unsigned(payload_sample_.tail_cqes));
+    return;
+  }
 #ifdef __OPTIMIZE__
   constexpr unsigned optimized = 1;
 #else

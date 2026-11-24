@@ -48,6 +48,7 @@ struct ExecutionResources {
   // CPU SGL Write only: maximum source SGEs per data WRITE WR. Zero selects
   // min(16, device max_jfs_sge); explicit values must fit the device limit.
   std::uint32_t sge_per_wr{0};
+  bool sgl_payload_only{false};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

@@ -32,6 +32,10 @@ class BatchGetCsv:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             directory = Path("reports/batch-get") / f"{stamp}-{args.backend}-d{args.device_id}"
         self.summary_path = directory / "summary.csv"
+        self.summary_fields = SUMMARY_FIELDS
+        if args.sgl_payload_only:
+            self.summary_fields += tuple(f"sgl_payload_{metric}" for metric in
+                                         (*METRICS, "p95_us", "data_wrs", "ready_wrs", "waves", "tail_cqes"))
         self.profile_path = directory / "profile.csv" if args.kernel_profile else None
         self.summary_rows = []
         self.profile_rows = []
@@ -58,6 +62,6 @@ class BatchGetCsv:
                                  for kind, name, metric, value in details)
 
     def write(self):
-        write_csv(self.summary_path, SUMMARY_FIELDS, self.summary_rows)
+        write_csv(self.summary_path, self.summary_fields, self.summary_rows)
         if self.profile_path is not None:
             write_csv(self.profile_path, PROFILE_FIELDS, self.profile_rows)

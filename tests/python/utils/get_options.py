@@ -239,7 +239,7 @@ def configure_backend_help(parser, argv=None):
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
     if backend != "cpu_sgl_write":
-        hidden.add("sge_per_wr")
+        hidden.update(("sge_per_wr", "sgl_payload_only"))
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

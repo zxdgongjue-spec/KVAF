@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "batch_get_profile.h"
 
 namespace kvaf::cpu_push {
 // V3 ports the a12bb16 V24 per-row pipeline and removes the V2 sort workspace.
@@ -13,6 +14,8 @@ constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
 // Scatter retains the V3 workspace. Direct output adds an exported target
 // descriptor to control storage, and allocates no HBM payload staging.
 constexpr std::uint32_t kScatterOutput = 0, kDirectOutput = 1, kOutputSegmentBytes = 64;
+// Setup-only mode. The device still issues normal kDirectOutput requests.
+constexpr std::uint32_t kPayloadOnlyOutput = 2;
 struct alignas(64) OutputTarget {
   std::uint64_t base{}, bytes{};
   std::uint32_t token_value{}, segment_bytes{};
@@ -34,7 +37,9 @@ struct alignas(64) Request {
 };
 struct alignas(64) Completion {
   // One aligned word publishes both sequence and result without a torn pair.
-  std::uint64_t token{}, reserved[7]{};
+  std::uint64_t token{};
+  CpuSglWriteSample cpu_sgl_write{};
+  std::uint64_t reserved[5]{};
 };
 // CPU owns all four words; each Jetty updates only its own 8-byte progress.
 struct alignas(64) Ready { std::uint64_t jetty[kJettyCount]{}, reserved[4]{}; };

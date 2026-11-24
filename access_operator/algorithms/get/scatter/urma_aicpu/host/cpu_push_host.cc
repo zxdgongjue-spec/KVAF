@@ -341,6 +341,8 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   if (s.context || s.memory || s.initialized) return Status::InvalidState("CPU push already initialized");
   if (s.config.sge_per_wr > 16 || (s.config.sge_per_wr && !s.config.direct_output))
     return Status::InvalidArgument("sge_per_wr requires CPU SGL Write and must be in [0,16]");
+  if (s.config.sgl_payload_only && !s.config.direct_output)
+    return Status::InvalidArgument("sgl_payload_only requires CPU SGL Write");
   if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.config.direct_output) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
       !aicpu_urma::LoadUmdkKernel(s.config.kernel_json.c_str()))
@@ -395,6 +397,7 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   open.token_bytes = s.config.token_bytes;
   open.workers = s.config.workers;
   open.output_mode = s.config.direct_output ? kDirectOutput : kScatterOutput;
+  if (s.config.sgl_payload_only) open.output_mode = kPayloadOnlyOutput;
   open.sge_per_wr = s.config.sge_per_wr;
   std::copy(s.config.local_eid.begin(), s.config.local_eid.end(), open.eid);
   std::memcpy(open.segment, mr.out.key.value, open.segment_bytes);

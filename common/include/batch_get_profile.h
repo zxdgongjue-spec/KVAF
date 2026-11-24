@@ -6,6 +6,13 @@
 
 namespace kvaf {
 
+// CPU-clock window for one prepared DDR -> HBM SGL WRITE. Only worker 0 reports it.
+struct CpuSglWriteSample {
+  std::uint64_t elapsed_ns{};
+  std::uint32_t data_wrs{};
+  std::uint16_t waves{}, tail_cqes{};
+};
+
 // Device timestamps share a clock across workers, not with the Host clock.
 struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t enter_ns{}, exit_ns{};
@@ -15,7 +22,9 @@ struct alignas(64) BatchGetWorkerProfile {
   std::uint64_t bytes{}, spans{}, read_wqes{}, post_calls{}, ready_queries{};
   std::uint64_t scatter_ns{}, output_cache_ns{};
   std::uint64_t scatter_copies{};
+  CpuSglWriteSample cpu_sgl_write{};
 };
+static_assert(sizeof(BatchGetWorkerProfile) == 192);
 
 // Caller-owned result, valid after a successful synchronous AICPU BatchGet.
 struct BatchGetProfile {

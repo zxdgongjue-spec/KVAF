@@ -14,6 +14,7 @@ struct Config {
   std::uint32_t token_bytes{}, workers{1};
   bool direct_output{false};
   std::uint32_t sge_per_wr{0};
+  bool sgl_payload_only{false};
 };
 class CpuPushTransport {
  public:

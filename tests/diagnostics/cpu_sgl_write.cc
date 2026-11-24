@@ -94,6 +94,7 @@ struct Fixture {
       for (int i = 0; i < count; ++i)
         std::memcpy(output.data() + i * kBytes, reinterpret_cast<void*>(sources[i]), kBytes);
       auto* done = reinterpret_cast<Completion*>(memory() + layout.done);
+      done->cpu_sgl_write = {sequence * 1000, 10, 1, 4};
       __atomic_store_n(&done->token, Progress(sequence, std::uint32_t(Result::kOk)), __ATOMIC_RELEASE);
     }
     for (auto& kernel : kernels) assert((kernel.get() == 0) == success);
@@ -106,6 +107,13 @@ struct Fixture {
       assert(statuses[w].sequence == sequence && statuses[w].result == std::uint64_t(Result::kOk));
       assert(profiles[w].scatter_ns == 0 && profiles[w].scatter_copies == 0);
       assert(profiles[w].ready_queries == 0);
+      const auto& sample = profiles[w].cpu_sgl_write;
+      if (w == 0 && count) {
+        assert(sample.elapsed_ns == sequence * 1000 && sample.waves == 1);
+        assert(sample.data_wrs == 10 && sample.tail_cqes == 4);
+      } else {
+        assert(sample.elapsed_ns == 0 && sample.waves == 0);
+      }
     }
     for (int i = 0; i < count; ++i)
       assert(std::memcmp(output.data() + i * kBytes,

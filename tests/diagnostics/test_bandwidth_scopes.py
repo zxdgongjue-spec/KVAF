@@ -48,7 +48,7 @@ class ScopesTest(unittest.TestCase):
                         case.assertTrue(end.completed)
                         return 0.25
 
-                args = SimpleNamespace(iterations=3, warmup=0, get_timing=timing,
+                args = SimpleNamespace(iterations=3, warmup=0, get_timing=timing, sgl_payload_only=False,
                                        execution_mode='unified')
                 runtime = SimpleNamespace(batch_get=Mock(), batch_get_kernel_profile=Mock())
                 runtime.batch_get_kernel_profile.side_effect = lambda: [dict(sample=runtime.batch_get.call_count)]
