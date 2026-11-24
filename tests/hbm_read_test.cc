@@ -142,7 +142,7 @@ void ExecuteRawKernel(const KvafExecuteBatchGetRawAddrKernelArgs* a) {
   auto* sizes=reinterpret_cast<uint32_t*>(a->lengths);auto* local=reinterpret_cast<KvafBatchGetLocalBuffer*>(a->channel_entity);
   uint32_t count=a->request_count;uint64_t result=0,failed=UINT64_MAX;
   const bool skip_payload=a->input_mode==KVAF_RAW_PROBE_ADDRESSES && skip_probe_payload_after==0;
-  if(a->input_mode==KVAF_RAW_PROBE_ADDRESSES && skip_probe_payload_after>0)--skip_probe_payload_after;
+  if(a->input_mode==KVAF_RAW_PROBE_ADDRESSES && skip_probe_payload_after>=0)--skip_probe_payload_after;
   if(a->input_mode==KVAF_RAW_NPU_OFFSETS)
     ValidateRawMetadata(src,dst,reinterpret_cast<const int64_t*>(sizes),a->request_count,
                         local->source_bytes,local->bytes,&result,&failed,a->validate_ranges);
@@ -182,14 +182,14 @@ class Proxy {
   void Disconnect() { std::lock_guard<std::mutex> l(mutex);for(int s:sockets)shutdown(s,SHUT_RDWR); }
   int fd=-1;std::atomic<bool> stop{false};std::atomic<unsigned> drop{0},requests{0};
   std::thread thread;std::mutex mutex;std::vector<int> sockets;std::vector<std::thread> workers;
-  explicit Proxy(kvaf::HbmReceiverTicket target):receiver(target) {
+  explicit Proxy(kvaf::HbmReceiverTicket target, bool remote_host=false):receiver(target) {
     uint16_t port;Require(hr::Listen("127.0.0.1:0",&fd,&port).ok(),"listen reverse proxy");
     receiver.control_address="127.0.0.1:"+std::to_string(port);
-    thread=std::thread([this,target]{while(!stop){pollfd p{fd,POLLIN,0};if(poll(&p,1,20)<=0)continue;
+    thread=std::thread([this,target,remote_host]{while(!stop){pollfd p{fd,POLLIN,0};if(poll(&p,1,20)<=0)continue;
       int client=accept(fd,nullptr,nullptr);if(client<0)continue;
       int server=hr::Connect(target.control_address);Require(server>=0,"connect receiver");
       {std::lock_guard<std::mutex> l(mutex);sockets.push_back(client);sockets.push_back(server);}
-      workers.emplace_back([this,client,server,target]{
+      workers.emplace_back([this,client,server,target,remote_host]{
         kvaf::offload::SetSocketTimeout(client);hr::Hello hello{};kvaf::HbmReadTicket ticket;
         if(hr::ReadHello(client,&hello,&ticket).ok() && hr::SendHello(server,static_cast<hr::Admission>(hello.header.command),target,ticket).ok()) {
           {std::lock_guard<std::mutex> l(mutex);manifest=ticket;}
@@ -207,7 +207,9 @@ class Proxy {
             Require(h.bytes==hr::RequestBytes(h.command) && h.command!=9,"no AcquireRaw or metadata on control path");
             if(!kvaf::offload::ReadBytes(server,reinterpret_cast<char*>(&request)+sizeof(h),h.bytes-sizeof(h)))break;
             ++requests;hr::Response response{};
+            if (remote_host && h.command == unsigned(hr::Command::Discover)) request.reader.boot_id[0] ^= 1;
             if(!kvaf::offload::WriteBytes(client,&request,h.bytes) || !kvaf::offload::ReadBytes(client,&response,hr::ResponseBytes(h.command)))break;
+            if (remote_host && h.command == unsigned(hr::Command::Discover)) response.producer.boot_id[0] ^= 1;
             Require(response.header.bytes==hr::ResponseBytes(h.command),"exact NPU response frame size");
             if(h.command==unsigned(hr::Command::Memory)) {
               Require(h.bytes==offsetof(hr::Request,connection) &&
@@ -233,6 +235,50 @@ template<class F> Status Retry(F f) {
 }
 const char* producer_eid="00000000000000000000000000000001";
 const char* reader_eid="00000000000000000000000000000002";
+#if defined(__linux__)
+void AutomaticRoutes() {
+  EidFixture fixture;
+  const char* prior = std::getenv("KVAF_HCCL_ROOTINFO_PATH");
+  const std::string previous = prior ? prior : "";
+  setenv("KVAF_HCCL_ROOTINFO_PATH", fixture.paths.rootinfo.c_str(), 1);
+  raw_mode = true;
+  std::vector<std::uint8_t> memory(4096, 0x51);
+  auto register_route = [&](bool remote, bool pin_a, bool pin_b) {
+    const auto layer = remote ? R"("net_layer":1,"net_type":"CLOS")" : R"("net_layer":0,"net_type":"MESH")";
+    const bool reject_first = !remote && !pin_a && !pin_b;
+    auto rank = [&](unsigned device, const char* eid) {
+      std::string addrs;
+      if (reject_first && device == 7)
+        addrs = R"({"addr_type":"EID","addr":"01000000000000000000000000000001"},)";
+      return "{\"device_id\":" + std::to_string(device) + ",\"level_list\":[{" + layer +
+             ",\"rank_addr_list\":[" + addrs + "{\"addr_type\":\"EID\",\"addr\":\"" + eid + "\"}]}]}";
+    };
+    // A pinned endpoint must work even if its rank is absent.
+    EidFixture::Write(fixture.paths.rootinfo, "{\"rank_list\":[" +
+        rank(pin_a ? 99 : 6, reader_eid) + "," + rank(pin_b ? 99 : 7, producer_eid) + "]}");
+    fake_device = 6;
+    kvaf::HbmReader a(6, 2, 2, 2048, "fake.o");
+    kvaf::HbmReceiverTicket receiver;
+    Check(a.Listen("127.0.0.1:0", "", pin_a ? reader_eid : "", &receiver));
+    Proxy proxy(receiver, remote);
+    fake_device = 7;
+    kvaf::NpuPullHbmSource b(7, pin_b ? producer_eid : "");
+    if (reject_first) skip_probe_payload_after = 0;
+    Check(b.Register({memory.data(),memory.size(),kvaf::DeviceKind::kNpu},proxy.receiver,reinterpret_cast<void*>(1)));
+    Require(b.selected_npu_eid() == producer_eid, "automatic route confirmed after HBM probes");
+    Check(b.Shutdown());
+    fake_device = 6;
+    Check(a.Shutdown());
+  };
+  register_route(false,false,false);
+  register_route(true,false,false);
+  register_route(false,true,false);
+  register_route(true,false,true);
+  if (prior) setenv("KVAF_HCCL_ROOTINFO_PATH",previous.c_str(),1);
+  else unsetenv("KVAF_HCCL_ROOTINFO_PATH");
+  fake_device = 0;
+}
+#endif
 #if !defined(KVAF_TEST_HBM_ENGINE_ONLY)
 void RuntimeInitialization() {
   raw_mode=true;fake_device=0;
@@ -538,6 +584,9 @@ int main(int argc,char** argv){try{
     Require(mode=="launch-failure"||mode=="sync-failure","known ACL fault mode");
     SubmissionFailure(mode);
   }
+#if defined(__linux__)
+  AutomaticRoutes();
+#endif
   AsyncAndGraphReplay();
   ApplicationManagedPipeline();
   PartialOutputRegistrationFailure();

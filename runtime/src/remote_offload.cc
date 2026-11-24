@@ -1,6 +1,7 @@
 #include "remote_offload.h"
 #include "remote_pull_service.h"
 #include "hbm_exporter.h"
+#include "npu_eid_selection.h"
 #include <mutex>
 
 namespace kvaf {
@@ -85,75 +86,80 @@ Status CpuPullHbmSource::Register(const OffloadRegionTicket& ticket, const std::
     if (ranges[i].first < ranges[i-1].first+ranges[i-1].second)
       return Status::InvalidArgument("CPU Pull tensors must have distinct, non-overlapping ranges");
   impl_->ticket = ticket;
-  std::vector<npu_eid::NpuLocalEidCandidate> candidates;
+  detail::NpuEid local_eid{};
   if (impl_->eid.empty()) {
-    std::uint32_t physical{}; std::string error;
+    std::uint32_t physical{};
     if (!direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical)) return Error("resolve card B physical device");
-    if (!npu_eid::DiscoverPhysicalNpuEids(physical, &candidates, &error)) return Error(error);
-  } else {
-    npu_eid::NpuLocalEidCandidate candidate{};
-    if (!detail::ParseEid(impl_->eid, candidate.eid.data())) return Status::InvalidArgument("invalid B NPU EID");
-    candidate.source = "explicit"; candidates.push_back(candidate);
+    // Locality is relative to this HBM producer, which can differ from the DDR owner.
+    peer::PeerLink link(ticket.address);
+    peer::PeerCandidateTable table;
+    status = link.DiscoverCandidates(&table);
+    if (!status.ok()) return status;
+    const auto pair = table.local ? detail::ReadDevicePair(physical) : detail::PairEids{};
+    std::vector<detail::NpuEid> selected;
+    status = detail::SelectNpuEids(physical, {}, pair, &selected);
+    if (!status.ok()) return status;
+    local_eid = selected.front();
+  } else if (!detail::ParseEid(impl_->eid, local_eid.data())) {
+    return Status::InvalidArgument("invalid B NPU EID");
   }
   offload::ConnectionDesc cpu{};
   cpu.token = ticket.token; std::memcpy(cpu.eid, ticket.eid.data(), 16);
-  for (const auto& candidate : candidates) {
-    impl_->inputs = inputs; impl_->id = detail::Nonce(); impl_->sequence = 0; impl_->mr_id = 1;
-    impl_->exporter = std::make_unique<detail::Exporter>();
-    const auto eid = npu_eid::EidToHex(candidate.eid);
-    status = impl_->exporter->Open(inputs.front(), eid, cpu);
-    if (status.ok()) {
-      impl_->memories.push_back(impl_->exporter->descriptor);
-      for (std::size_t i = 1; status.ok() && i < inputs.size(); ++i) {
-        offload::MemoryDesc memory{};
-        status = impl_->exporter->AddMemory(inputs[i], &memory);
-        if (status.ok()) impl_->memories.push_back(memory);
-      }
+  const auto eid = detail::EidToHex(local_eid);
+  impl_->inputs = inputs; impl_->id = detail::Nonce(); impl_->sequence = 0; impl_->mr_id = 1;
+  impl_->exporter = std::make_unique<detail::Exporter>();
+  status = impl_->exporter->Open(inputs.front(), eid, cpu);
+  if (status.ok()) {
+    impl_->memories.push_back(impl_->exporter->descriptor);
+    for (std::size_t i = 1; status.ok() && i < inputs.size(); ++i) {
+      offload::MemoryDesc memory{};
+      status = impl_->exporter->AddMemory(inputs[i], &memory);
+      if (status.ok()) impl_->memories.push_back(memory);
     }
-    if (status.ok()) {
-      impl_->attached = true; // The CPU may attach even when its reply is lost.
-      rp::Response response{};
-      status = impl_->Call(rp::Command::Attach, {}, &response, false);
-      if (status.ok()) status = Result(response, "Attach");
-      if (status.ok()) status = impl_->exporter->Bind(response.connection);
-      for (std::size_t i = 1; status.ok() && i < inputs.size(); ++i) {
-        impl_->mr_id = i+1;
-        status = impl_->Call(rp::Command::AddMemory, {}, &response, false);
-        if (status.ok()) status = Result(response, "AddMemory");
-      }
-      impl_->mr_id = 1;
-      if (status.ok()) status = impl_->exporter->Ready(stream);
-      if (status.ok()) {
-        status = impl_->Call(rp::Command::Bind, {}, &response, false);
-        if (status.ok()) status = Result(response, "Bind");
-      }
-      for (std::size_t i = 0; status.ok() && i < inputs.size(); ++i) {
-        impl_->mr_id = i+1;
-        const auto& input = inputs[i];
-        const std::uint64_t offset = input.bytes >= 128 ? 64 : 0;
-        const auto length = std::min<std::uint64_t>(64, input.bytes-offset);
-        std::array<std::uint8_t, 64> expected{};
-        if (aclrtMemcpy(expected.data(), expected.size(), static_cast<const std::uint8_t*>(input.data)+offset,
-                        length, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) status = Error("copy B probe expectation");
-        if (status.ok()) {
-          status = impl_->Call(rp::Command::Probe, {{offset, 0, length}}, &response, false);
-          if (status.ok()) status = Result(response, "Probe");
-          if (status.ok() && response.checksum != offload::Hash(expected.data(), length)) status = Error("B probe checksum mismatch");
-        }
-      }
-    }
-    if (status.ok()) {
-      impl_->bound = true; impl_->selected = eid;
-      impl_->mr_id = 1;
-      std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_READY region=%llu source=%llu device=%u npu_eid=%s mrs=%zu jettys=4 probe=all_mrs_all_jettys_scratch_checksum_pass\n",
-          (unsigned long long)ticket.region_id, (unsigned long long)impl_->id, impl_->device, eid.c_str(), inputs.size());
-      return status;
-    }
-    if (status.code() == StatusCode::kCompletionUnknown) return status;
-    const auto cleanup = impl_->Shutdown();
-    if (!cleanup.ok()) return Status::CompletionUnknown("B candidate cleanup unresolved: " + cleanup.message());
-    std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_REJECTED npu_eid=%s detail=%s\n", eid.c_str(), status.message().c_str());
   }
+  if (status.ok()) {
+    impl_->attached = true; // The CPU may attach even when its reply is lost.
+    rp::Response response{};
+    status = impl_->Call(rp::Command::Attach, {}, &response, false);
+    if (status.ok()) status = Result(response, "Attach");
+    if (status.ok()) status = impl_->exporter->Bind(response.connection);
+    for (std::size_t i = 1; status.ok() && i < inputs.size(); ++i) {
+      impl_->mr_id = i+1;
+      status = impl_->Call(rp::Command::AddMemory, {}, &response, false);
+      if (status.ok()) status = Result(response, "AddMemory");
+    }
+    impl_->mr_id = 1;
+    if (status.ok()) status = impl_->exporter->Ready(stream);
+    if (status.ok()) {
+      status = impl_->Call(rp::Command::Bind, {}, &response, false);
+      if (status.ok()) status = Result(response, "Bind");
+    }
+    for (std::size_t i = 0; status.ok() && i < inputs.size(); ++i) {
+      impl_->mr_id = i+1;
+      const auto& input = inputs[i];
+      const std::uint64_t offset = input.bytes >= 128 ? 64 : 0;
+      const auto length = std::min<std::uint64_t>(64, input.bytes-offset);
+      std::array<std::uint8_t, 64> expected{};
+      if (aclrtMemcpy(expected.data(), expected.size(), static_cast<const std::uint8_t*>(input.data)+offset,
+                      length, ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) status = Error("copy B probe expectation");
+      if (status.ok()) {
+        status = impl_->Call(rp::Command::Probe, {{offset, 0, length}}, &response, false);
+        if (status.ok()) status = Result(response, "Probe");
+        if (status.ok() && response.checksum != offload::Hash(expected.data(), length)) status = Error("B probe checksum mismatch");
+      }
+    }
+  }
+  if (status.ok()) {
+    impl_->bound = true; impl_->selected = eid;
+    impl_->mr_id = 1;
+    std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_READY region=%llu source=%llu device=%u npu_eid=%s mrs=%zu jettys=4 probe=all_mrs_all_jettys_scratch_checksum_pass\n",
+        (unsigned long long)ticket.region_id, (unsigned long long)impl_->id, impl_->device, eid.c_str(), inputs.size());
+    return status;
+  }
+  if (status.code() == StatusCode::kCompletionUnknown) return status;
+  const auto cleanup = impl_->Shutdown();
+  if (!cleanup.ok()) return Status::CompletionUnknown("B candidate cleanup unresolved: " + cleanup.message());
+  std::fprintf(stderr, "[KVAF_NPU] REMOTE_SOURCE_REJECTED npu_eid=%s detail=%s\n", eid.c_str(), status.message().c_str());
   return status;
 }
 Status CpuPullHbmSource::GetDescriptor(CpuPullSourceDesc* out) const {

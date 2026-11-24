@@ -4,6 +4,5 @@
 namespace kvaf {
 class CpuUrmaDiscovery;
 std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
-    const CpuRuntimeOptions&, std::shared_ptr<CpuUrmaDiscovery> discovery,
-    std::shared_ptr<CpuUrmaDiscovery> pull_discovery);
+    const CpuRuntimeOptions&, std::shared_ptr<CpuUrmaDiscovery> discovery);
 }

@@ -39,7 +39,7 @@ std::atomic<int> pools{0}, allocations{0}, candidate_queries{0};
 std::mutex attempts_mutex;
 std::vector<std::pair<unsigned, unsigned>> attempted_pairs;
 bool Route(unsigned eid) { return eid == 1 || (auto_mode && eid == 5); }
-int fake_device=0;
+thread_local int fake_device=0;
 enum class BadSegment { None, ZeroBase, Short, Overflow, Abi };
 BadSegment bad_segment = BadSegment::None;
 void Require(bool ok,const char* text){if(!ok)throw std::runtime_error(text);}

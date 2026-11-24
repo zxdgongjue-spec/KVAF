@@ -43,8 +43,8 @@ def parse_args(argv=None):
     parser.add_argument("--hbm-advertise", default="", help="producer-reachable KVHR host:port")
     parser.add_argument("--device-a", type=int, default=6, help="reader NPU")
     parser.add_argument("--device-b", type=int, default=7, help="producer NPU")
-    parser.add_argument("--npu-eid-a-raw", default="", help="A EID for the verified NPU-to-NPU route")
-    parser.add_argument("--npu-eid-b-raw", default="", help="B EID for the verified NPU-to-NPU route")
+    parser.add_argument("--npu-eid-a-raw", default="", help="pin reader EID (default: local fullmesh or remote CLOS)")
+    parser.add_argument("--npu-eid-b-raw", default="", help="pin producer EID (default: local fullmesh or remote CLOS)")
     parser.add_argument("--packets", "--blocks", type=int, help="uniform packet count (default: 4096)")
     parser.add_argument("--packet-bytes", "--block-bytes", type=int, help="uniform packet bytes (default: 656)")
     parser.add_argument("--packet-group", "--block-group", dest="packet_groups", action="append", type=packet_group,
@@ -70,10 +70,6 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.graph and os.environ.get("KVAF_HBM_RAW_READ_DIAGNOSTICS") == "1":
         parser.error("KVAF_HBM_RAW_READ_DIAGNOSTICS=1 requires eager execution; remove --graph")
-    if args.role != "producer" and not args.npu_eid_a_raw:
-        parser.error("reader/local requires --npu-eid-a-raw")
-    if args.role != "reader" and not args.npu_eid_b_raw:
-        parser.error("producer/local requires --npu-eid-b-raw")
     if args.role == "reader" and not args.control_connect:
         parser.error("reader requires --control-connect")
     if args.role != "reader" and args.control_connect:

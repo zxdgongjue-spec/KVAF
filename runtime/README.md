@@ -150,7 +150,7 @@ Runtime 使用该设备的首个候选，不进行启动带宽测速或探测写
 远端只使用 CLOS。显式 `npu_eids` 始终优先。本机且两侧均未固定 CPU 设备时，在已过滤的候选中匹配同一活动通道的
 `pair_info.local_eid`，未命中取首项。显式 CPU 设备优先，远端 Put 和 AICPU 默认使用候选首项。
 `PEER_LINK_EID_SELECTED` 日志记录两端 EID、场景、物理卡号、CPU 候选及选择原因。
-普通 URMA 缓存客户端要求 CPU Service 支持缓存候选计数和原始候选 EID，滚动升级时先更新服务端。CPU Pull 继续使用原有的单设备查询协议。
+普通 URMA 缓存与 CPU Pull 共用 CPU Service 按亲和性过滤的候选表，通过扩展候选查询取得完整 EID。部署时先更新 CPU Service。
 初始化建立 CacheRegion 和元数据；具体 transport、MR、队列、Gather 工作区及 AICPU
 包在首次使用或显式 warmup 时准备，初始化成功不代表数据面已通过 RMA 验证。
 未建立 CPU 服务 Link 时，DDR 初始化返回 `InvalidState`。
@@ -163,7 +163,7 @@ AIV/UBMEM 默认使用本次构建目录 `bin/` 下相应 Put/Get `.o` 的绝对
 `./build.sh npu --build-dir DIR` 自动生效。`put_resources/get_resources` 可按配置覆盖预算
 和路径；AICPU 仍从 CANN 安装目录定位设备包。不再提供旧全局后端参数或 adaptive 启动选优参数。
 
-CPU Pull 使用默认候选 0，也可用单个 `peer_ub_device` 固定设备。逗号分隔的设备列表仅供远端 Direct BatchGet 使用。NPU Pull 独立建立 HBM 连接并注册内存。
+CPU Pull 每个 DDR region 绑定一个 CPU 端点。本机首次 `offload_region(source_physical_device_id=...)` 用指定源物理卡的 `pair_info.local_eid` 匹配候选，省略时采用 Runtime 所在卡。未命中或远端自动选择时取表中首项。单个 `peer_ub_device` 或服务端设备配置优先。逗号分隔的设备列表仅供远端 Direct BatchGet 使用。
 
 ### 远端 A+K 的多 FE BatchGet
 

@@ -20,9 +20,7 @@ struct CpuUrmaCandidate {
 class CpuUrmaDiscovery {
  public:
   ~CpuUrmaDiscovery();
-  enum class Scope { ServiceAffinity, AllDevices };
-  CpuUrmaDiscovery(std::string device, bool has_eid_index, std::uint32_t eid_index,
-                   Scope scope = Scope::ServiceAffinity);
+  CpuUrmaDiscovery(std::string device, bool has_eid_index, std::uint32_t eid_index);
   CpuUrmaDiscovery(const CpuUrmaDiscovery&) = delete;
   CpuUrmaDiscovery& operator=(const CpuUrmaDiscovery&) = delete;
 
@@ -32,7 +30,6 @@ class CpuUrmaDiscovery {
  private:
   bool initialized_{false};
   std::mutex mutex_;
-  Scope device_scope_;
   CpuNumaScope scope_;
   Status scope_status_;
   std::string device_;

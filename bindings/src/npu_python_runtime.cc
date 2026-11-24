@@ -428,9 +428,9 @@ class NpuPythonRuntime final {
     { py::gil_scoped_release release; status = native_->ResolveCpuPull(timeout_ms); }
     ThrowIfError(status);
   }
-  py::dict OffloadRegion() {
+  py::dict OffloadRegion(std::optional<std::uint32_t> source_physical_device_id) {
     OffloadRegionTicket ticket; Status status;
-    { py::gil_scoped_release release; status = native_->GetOffloadRegion(&ticket); }
+    { py::gil_scoped_release release; status = native_->GetOffloadRegion(&ticket, source_physical_device_id); }
     ThrowIfError(status); return remote_python::Pack(ticket);
   }
   PutHandle PreparePut(const py::object& keys,const py::object& lengths) {
@@ -1609,7 +1609,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("resolve_cpu_pull", &NpuPythonRuntime::ResolveCpuPull, py::kw_only(), py::arg("timeout") = py::none(),
            "Finish the internally retained batch_cpu_pull, without replaying READ. Returns None "
            "only after successful commit; failure raises. Does not recover explicit PutHandle transactions.")
-      .def("offload_region", &NpuPythonRuntime::OffloadRegion)
+      .def("offload_region", &NpuPythonRuntime::OffloadRegion,
+           py::arg("source_physical_device_id") = py::none())
       .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
       .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("ready"),py::arg("put"),
            py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
