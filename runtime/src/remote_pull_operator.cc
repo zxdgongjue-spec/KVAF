@@ -10,8 +10,8 @@ rp::Request Request(const OffloadRegionTicket& ticket, const CpuPullRequest& cur
 }
 
 }
-RemotePullOperator::RemotePullOperator(std::shared_ptr<peer::PeerLink> link, std::uint32_t candidate)
-    : candidate_(candidate), link_(std::move(link)) {}
+RemotePullOperator::RemotePullOperator(std::shared_ptr<peer::PeerLink> link, peer::PeerCandidateInfo candidate)
+    : candidate_(std::move(candidate)), link_(std::move(link)) {}
 Status RemotePullOperator::Initialize(const RemoteRegionDesc& region) {
   if (closed_) return Status::InvalidState("CPU Pull executor is closed");
   if (ticket_.region_id) {
@@ -19,13 +19,15 @@ Status RemotePullOperator::Initialize(const RemoteRegionDesc& region) {
         ? Status::OK() : Status::InvalidState("CPU Pull destination already bound");
   }
   peer::PeerRegion peer{};
-  auto status = link_->PrepareCpuPullRegion(region.base, candidate_, &peer);
+  auto status = link_->PrepareCpuPullRegion(region.base, candidate_.candidate_id, &peer);
   if (!status.ok()) return status;
   if (!peer.region_id || !peer.epoch || peer.length != region.length)
     return Status::CompletionUnknown("CPU Pull destination identity mismatch");
+  if (peer.eid != candidate_.eid)
+    return Status::InvalidState("prepared CPU Pull EID differs from the advertised candidate");
   region_.id = peer.region_id; region_.epoch = peer.epoch;
   region_.base = region.base; region_.bytes = region.length; region_.slot_size = region.slot_size;
-  region_.candidate = candidate_; region_.token = peer.token_value;
+  region_.candidate = candidate_.candidate_id; region_.token = peer.token_value;
   std::copy(peer.eid.begin(), peer.eid.end(), region_.eid);
   ticket_ = {link_->address(), region_.id, region_.epoch, region_.token, peer.eid};
   return Status::OK();

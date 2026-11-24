@@ -23,7 +23,8 @@ struct NpuPullHbmSource::Impl {
   std::vector<offload::MemoryDesc> memories;
   std::vector<std::uint64_t> checksums;
   HbmReadTicket ticket{};
-  std::vector<npu_eid::NpuLocalEidCandidate> candidates;
+  hr::RoutePeer route_peer;
+  std::vector<hr::RouteCandidate> candidates;
   std::unique_ptr<detail::Exporter> exporter;
   std::array<offload::ConnectionDesc,offload::kChannelCount> peers{};
   std::array<bool,offload::kChannelCount> bound{};
@@ -52,8 +53,14 @@ struct NpuPullHbmSource::Impl {
       return Status::NotFound("HBM ticket is stale or belongs to another source");
     auto command=static_cast<hr::Command>(r.header.command);
     if(command==hr::Command::Discover) {
+      if (candidates.empty()) {
+        auto status = hr::RouteCandidates(route_peer, r.reader, eid, &candidates);
+        if (!status.ok()) { candidates.clear(); return status; }
+      }
       response->candidates=candidates.size();
       if(r.candidate>=candidates.size()) return Status::NotFound("HBM EID candidate not found");
+      response->producer = route_peer;
+      response->route = candidates[r.candidate];
       return Status::OK();
     }
     if(!r.client) return Status::InvalidArgument("missing HBM reader identity");
@@ -69,7 +76,8 @@ struct NpuPullHbmSource::Impl {
         return open_result;
       }
       if(frozen || r.candidate>=candidates.size()) return Status::Busy("cannot attach while HBM is frozen");
-      if(retired.size()>=256) return Status::Busy("HBM connection history full; recreate source");
+      if(retired.size()>=hr::kMaxRouteCandidates * hr::kMaxRouteCandidates)
+        return Status::Busy("HBM connection history full; recreate source");
       peer_retired=false;client=r.client; candidate=r.candidate; initiator=r.connection; initiator.token=ticket.token;
       exporter=std::make_unique<detail::Exporter>();
       selected=npu_eid::EidToHex(candidates[candidate].eid);
@@ -206,14 +214,13 @@ Status NpuPullHbmSource::Register(const std::vector<ConstBufferView>& inputs,con
     return Status::InvalidArgument("HBM tensors must not overlap");
   s=detail::Exporter::Ready(stream); if(!s.ok()) return s;
   impl_->candidates.clear();
-  if(impl_->eid.empty()) {
-    std::uint32_t physical{};std::string error;
-    if(!direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical)) return Status::Internal("resolve B physical device");
-    if(!npu_eid::DiscoverPhysicalNpuEids(physical,&impl_->candidates,&error)) return Status::Internal(error);
-  } else {
-    npu_eid::NpuLocalEidCandidate c{};
-    if(!detail::ParseEid(impl_->eid,c.eid.data())) return Status::InvalidArgument("invalid B EID");
-    impl_->candidates.push_back(c);
+  std::uint32_t physical{};
+  const bool resolved = direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical);
+  impl_->route_peer = hr::LocalRoutePeer(resolved ? physical : UINT32_MAX);
+  impl_->route_peer.pinned = !impl_->eid.empty();
+  if (!impl_->eid.empty()) {
+    std::uint8_t parsed[16];
+    if (!detail::ParseEid(impl_->eid, parsed)) return Status::InvalidArgument("invalid B EID");
   }
   impl_->inputs=inputs;impl_->closing=false;impl_->sequence=0;impl_->mr_id=1;
   impl_->ticket={detail::Nonce(),detail::Nonce(),std::uint32_t(detail::Nonce())|1U,{}};

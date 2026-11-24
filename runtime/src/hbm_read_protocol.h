@@ -1,11 +1,12 @@
 #pragma once
 #include "hbm_read.h"
+#include "hbm_read_route.h"
 #include "offload_protocol.h"
 #include <mutex>
 
 namespace kvaf::hbm_read {
 constexpr std::uint32_t kMagic = 0x4b564852; // KVHR, independent of KVCP/KVRP
-constexpr std::uint16_t kVersion = 8; // Application owns batch completion/reuse notifications.
+constexpr std::uint16_t kVersion = 9; // Discover exchanges host identity and route candidates.
 enum class Command : std::uint16_t { Discover=1, Open, Channel, Confirm, Close=8, Memory=10, Retire };
 enum class State : std::uint32_t { Registered, Connected, Ready };
 using Span = offload::Span;
@@ -14,6 +15,7 @@ struct Request {
   std::uint32_t token{}, candidate{}, channel{}, count{};
   std::uint64_t source_id{}, epoch{}, client{}, sequence{}, mr_id{1};
   offload::ConnectionDesc connection{};
+  RoutePeer reader{};
 };
 struct Response {
   peer::MessageHeader header{};
@@ -22,15 +24,20 @@ struct Response {
   offload::MemoryDesc memory{};
   char detail[256]{};
   offload::ConnectionDesc connection{};
+  RoutePeer producer{};
+  RouteCandidate route{};
 };
-static_assert(sizeof(Request) == 368 && sizeof(Response) == 728, "KVHR wire ABI changed");
+static_assert(offsetof(Request, reader) == 368 && offsetof(Response, producer) == 728 &&
+              sizeof(Request) == 392 && sizeof(Response) == 1032, "KVHR wire ABI changed");
 inline std::uint32_t RequestBytes(std::uint16_t command) {
   const auto c=static_cast<Command>(command);
-  return c==Command::Open || c==Command::Channel ? sizeof(Request) : offsetof(Request, connection);
+  if (c == Command::Discover) return sizeof(Request);
+  return c==Command::Open || c==Command::Channel ? offsetof(Request, reader) : offsetof(Request, connection);
 }
 inline std::uint32_t ResponseBytes(std::uint16_t command) {
   const auto c=static_cast<Command>(command & 0x7fffU);
-  return c==Command::Open || c==Command::Channel ? sizeof(Response) : offsetof(Response, connection);
+  if (c == Command::Discover) return sizeof(Response);
+  return c==Command::Open || c==Command::Channel ? offsetof(Response, producer) : offsetof(Response, connection);
 }
 inline Request Make(Command c, const HbmReadTicket& t, std::uint64_t client) {
   Request r{};

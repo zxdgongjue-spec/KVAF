@@ -91,7 +91,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
                             PeerCandidateInfo* selected);
   Status SelectCpuFes(const PeerCandidateTable&, const std::string& devices,
                       const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
-                      bool multiple_local_eids, CpuFeSelection* selected) const;
+                      bool single_cpu_fe, CpuFeSelection* selected) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);

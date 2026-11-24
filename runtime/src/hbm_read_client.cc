@@ -303,7 +303,7 @@ Status HbmReader::Listen(const std::string& address,const std::string& advertise
   if(!impl_->cores || !impl_->jettys || impl_->cores*std::uint64_t(impl_->jettys)>offload::kChannelCount ||
      (impl_->budget && impl_->budget<impl_->cores*2) || !impl_->max_outputs || impl_->kernel.empty())
     return Status::InvalidArgument("configure raw kernel and 1..4 total Jettys before listen_hbm");
-  if(!eid.empty()) {std::uint8_t parsed[16];if(!detail::ParseEid(eid,parsed))return Status::InvalidArgument("invalid receiver fullmesh EID");}
+  if(!eid.empty()) {std::uint8_t parsed[16];if(!detail::ParseEid(eid,parsed))return Status::InvalidArgument("invalid receiver NPU Pull EID");}
   if(KvafExecuteBatchGetRawAddrLoadKernel(impl_->kernel.c_str()))return Status::Internal("load batch_get_raw_addr kernel");
   auto endpoint=advertised.empty()?address:advertised;
   const auto split=endpoint.rfind(':');
@@ -399,16 +399,30 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
     return c.ready ? Status::OK() : Status::CompletionUnknown("HBM attach/close incomplete; retry producer shutdown");
   }
   if(KvafExecuteBatchGetRawAddrLoadKernel(impl_->kernel.c_str()))return Status::Internal("load batch_get_raw_addr kernel");
-  std::vector<npu_eid::NpuLocalEidCandidate> candidates;
-  if(local_eid.empty()) {
-    std::uint32_t physical{};std::string error;
-    if(!direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical))return Status::Internal("resolve A physical device");
-    if(!npu_eid::DiscoverPhysicalNpuEids(physical,&candidates,&error))return Status::Internal(error);
-  } else { npu_eid::NpuLocalEidCandidate c{};if(!detail::ParseEid(local_eid,c.eid.data()))return Status::InvalidArgument("invalid A EID");candidates.push_back(c); }
+  std::uint32_t physical{};
+  const bool resolved = direct_hccp::GetCurrentNpuPhysicalDeviceId(&physical);
   auto discover=hr::Make(hr::Command::Discover,ticket,0);hr::Response info{};
+  discover.reader = hr::LocalRoutePeer(resolved ? physical : UINT32_MAX);
+  discover.reader.pinned = !local_eid.empty();
   s=control->Exchange(discover,&info);if(!s.ok())return s;
-  if(!info.candidates || info.candidates>256)return Status::Internal("invalid B EID candidate count");
-  for(std::uint32_t b=0;b<info.candidates;++b)for(const auto& a:candidates) {
+  const auto count = info.candidates;
+  if(!count || count>hr::kMaxRouteCandidates)return Status::Internal("invalid B EID candidate count");
+  std::vector<hr::RouteCandidate> candidates, producer_candidates;
+  const auto scope = hr::ClassifyRoute(discover.reader, info.producer);
+  s = hr::RouteCandidates(discover.reader, info.producer, local_eid, &candidates);
+  if (!s.ok()) return s;
+  for (unsigned i = 0; i < count; ++i) {
+    if (i) {
+      discover.candidate = i;
+      s = control->Exchange(discover, &info);
+      if (!s.ok()) return s;
+    }
+    if (info.candidates != count || !std::memchr(info.route.plane, 0, sizeof(info.route.plane)) ||
+        info.route.eid == hr::RouteId{}) return Status::Internal("invalid B EID candidate");
+    producer_candidates.push_back(info.route);
+  }
+  for(const auto& [index, b] : hr::RoutePairs(scope, candidates, producer_candidates)) {
+    const auto& a = candidates[index];
     auto owned=std::make_shared<Connection>(control,ticket,local_eid,impl_->cores,impl_->jettys,impl_->budget);
     auto& c=*owned;
     c.engine.diagnostics=c.engine.diagnostics || impl_->diagnostics;
@@ -423,6 +437,7 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
       c.link->connection=response.connection;
       const auto& connection=c.link->connection;
       if(response.mr_count!=count || connection.key_bytes!=32 || connection.token!=ticket.token ||
+          std::memcmp(connection.eid, producer_candidates[b].eid.data(), producer_candidates[b].eid.size()) ||
           !connection.tp || !connection.psn) s=Status::Internal("invalid B HBM connection or MR count");
       for(std::uint64_t mr=1;s.ok() && mr<=count;++mr) {
         if(mr>1) s=c.link->Call(hr::Command::Memory,&response,0,mr);
@@ -500,8 +515,9 @@ Status HbmReader::Attach(std::shared_ptr<hr::ControlChannel> control,const HbmRe
     }
     if(s.ok()) {
       c.ready=true;
-      std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY source=%llu epoch=%llu A_eid=%s B_eid=%s jettys=%u mrs=%zu probe=all_mrs_all_lanes_pass\n",
-          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->connection.eid).c_str(),impl_->cores*impl_->jettys,ticket.mr_count());
+      std::fprintf(stderr,"[KVAF_NPU] HBM_READ_READY source=%llu epoch=%llu A_eid=%s B_eid=%s jettys=%u mrs=%zu probe=all_mrs_all_lanes_pass A_route=%s B_route=%s\n",
+          (unsigned long long)ticket.source_id,(unsigned long long)ticket.epoch,npu_eid::EidToHex(a.eid).c_str(),detail::EidHex(c.link->connection.eid).c_str(),impl_->cores*impl_->jettys,ticket.mr_count(),
+          a.pinned ? "explicit" : hr::RouteName(scope), producer_candidates[b].pinned ? "explicit" : hr::RouteName(scope));
       return s;
     }
     std::fprintf(stderr,"[KVAF_NPU] HBM_READ_CANDIDATE_REJECTED source=%llu A_eid=%s B_candidate=%u detail=%s\n",

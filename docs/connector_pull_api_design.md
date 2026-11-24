@@ -44,7 +44,7 @@ B 的普通 BatchPut、BatchGet、本卡 Offload 和跨卡 CPU Pull 共用一个
 | 初始化关联 | 指定的 CPU DDR region | NPU reader 连接 |
 | 目的内存确定时机 | 初始化时确定 DDR 池，每批通过 PreparePut 确定槽位 | 每次读取时由 B 提供 output 缓冲 |
 | 完成条件 | READ 完成后，B 在本地提交或撤销写事务 | 算子提交和 stream 同步成功；应用负责数据校验并通知源端 |
-| 路由 | CPU↔NPU 路由 EID | NPU↔NPU fullmesh EID |
+| 路由 | CPU↔NPU 路由 EID | 同机 fullmesh 或跨机 CLOS EID |
 
 两个对象共用底层 `Exporter` 的 HBM 注册、地址对齐、资源创建和清理代码，但分别持有注册、连接和状态。CPU 与 NPU 对端的描述符格式、TP 绑定和控制协议仍分别处理，不合并资源实例。
 
@@ -209,7 +209,7 @@ NPU 源不提前绑定 B 的目标 HBM，是因为 `batch_get_raw_addr()` 每次
 
 CPU 源在 register 内完成与 CPU 的注册、建链和全部 MR 探测，CPU 已保存真实源信息；不再向 B 单独发送 source_desc，也不要求 B 调用 attach_cpu_source。ReadyToken.source 在运行阶段携带提交所需身份。NPU 源在 register 内主动连接 B，随后由 KVAF 完成 Open/Memory/Channel/Confirm 和全部 MR 探测，返回时可直接 ready。
 
-纯 NPU Pull 使用 initialize → listen_hbm，仅需 raw kernel，无 CPU service 或 DDR 依赖。initialized 表示基础就绪，ddr_initialized 表示 DDR 就绪。普通 BatchGet/BatchPut、MetaManager 和 CPU Pull 要求 DDR 就绪；shutdown_ddr 不销毁 NPU Pull 链路。两端 fullmesh EID 分别配置在 A 的源对象和 B 的 listen_hbm 上。
+纯 NPU Pull 使用 initialize → listen_hbm，仅需 raw kernel，无 CPU service 或 DDR 依赖。initialized 表示基础就绪，ddr_initialized 表示 DDR 就绪。普通 BatchGet/BatchPut、MetaManager 和 CPU Pull 要求 DDR 就绪；shutdown_ddr 不销毁 NPU Pull 链路。省略 EID 时自动选择同机 fullmesh 或跨机 CLOS。可在 A 的源对象和 B 的 listen_hbm 上分别固定本端 EID。
 
 应用只转发 receiver ticket，不转发 NPU export_ticket。TCP 重连必须匹配原接收端代次、源身份及 MR 清单，不重建硬件或重放 READ。注册/探测期间保持源数据稳定，失败保留源对象并重试 source.shutdown。
 
@@ -305,7 +305,7 @@ source.release_batch(ready)
 
 多 MR NPU Pull：生产端 register(tensors, receiver=receiver) 固定 1～4096 个 Tensor，自动连接读取端并导入全部 MR、完成逐 MR 全通道探测。ready(tensor) 选中本批唯一源，batch_get_raw_addr 的 src_offsets 相对该 Tensor，dst_offsets 相对 output，三组 NPU int64 数组不变。
 
-每个 NPU 源只有一组 Jetty/CQ/TP，各 MR 保留自己的内存身份。AIV Host 缓存“MR ID + output 注册”对应的轻量通信描述，复用 output 的本地 MR 和队列计数；现有 raw READ 算子及 ABI 不变。单 tensor 使用 register(tensor, receiver=receiver)/ready()。内部注册清单包含 mr_bytes，KVHR v8 负责注册、重连和关闭，批次完成通知由应用提供；应用不查询或传递 MR 句柄。注册约束、失败保留和硬件测试见 [NPU 多 MR 说明](hbm_raw_addr_read.md)。
+每个 NPU 源只有一组 Jetty/CQ/TP，各 MR 保留自己的内存身份。AIV Host 缓存“MR ID + output 注册”对应的轻量通信描述，复用 output 的本地 MR 和队列计数；现有 raw READ 算子及 ABI 不变。单 tensor 使用 register(tensor, receiver=receiver)/ready()。内部注册清单包含 mr_bytes，KVHR v9 负责注册、重连和关闭，批次完成通知由应用提供；应用不查询或传递 MR 句柄。注册约束、失败保留和硬件测试见 [NPU 多 MR 说明](hbm_raw_addr_read.md)。
 
 ## 7. A 端批次接口
 
@@ -567,7 +567,7 @@ CPU Pull 当前使用 `src_offsets + dst_offsets`，在提取 PreparePut 的 add
 | CPU 目的地址必须落在 slot 起点 | 支持本次预留有效范围内的拆分和槽内偏移，保持覆盖、归属及不重叠检查 |
 | batch_get_raw_addr 的源地址列表来自 Ready batch | 扩展入口由 B 提供三个连续、等长数组，保留原算子和通信实现 |
 
-CPU Pull 控制协议 KVRP 使用 v8，NPU 直读控制协议 KVHR 使用 v8。移除 NPU 每批通知需更新两个 NPU 应用及运行库，CPU Pull 服务与读取端使用匹配的 KVRP 版本。协议版本不符时拒绝通信。两种 Ready 都发布源身份、批次号及本批 MR 身份。
+CPU Pull 控制协议 KVRP 使用 v8，NPU 直读控制协议 KVHR 使用 v9。移除 NPU 每批通知需更新两个 NPU 应用及运行库，CPU Pull 服务与读取端使用匹配的 KVRP 版本。协议版本不符时拒绝通信。两种 Ready 都发布源身份、批次号及本批 MR 身份。
 
 已删除：旧类名别名、`ready(offsets, lengths, stream)`、无 token 的 release/cancel、`offload_from()`、`offload()`、`resolve_offload()`、`release_offload_source()`、旧 raw READ 重载、独立 OffloadRuntime 及 KVOF 服务、直接传本卡 tensor 的 batch_cpu_pull 重载。
 

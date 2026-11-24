@@ -17,9 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -75,32 +73,6 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
   TransportMode mode_{TransportMode::Urma};
   peer::PeerRegion allocated_{};
 };
-
-using AclrtGetPhyDevIdByLogicDevId = int (*)(int32_t, int32_t*);
-
-bool ResolvePhysicalDeviceId(std::uint32_t logical_device_id, std::uint32_t* physical_device_id) {
-  if (physical_device_id == nullptr ||
-      logical_device_id > static_cast<std::uint32_t>(std::numeric_limits<int32_t>::max())) {
-    return false;
-  }
-  auto get_physical = reinterpret_cast<AclrtGetPhyDevIdByLogicDevId>(
-      dlsym(RTLD_DEFAULT, "aclrtGetPhyDevIdByLogicDevId"));
-  if (get_physical == nullptr) {
-    void* ascendcl = dlopen("libascendcl.so", RTLD_NOW | RTLD_NOLOAD);
-    if (ascendcl == nullptr) ascendcl = dlopen("libascendcl.so", RTLD_NOW | RTLD_LOCAL);
-    if (ascendcl != nullptr) {
-      get_physical = reinterpret_cast<AclrtGetPhyDevIdByLogicDevId>(
-          dlsym(ascendcl, "aclrtGetPhyDevIdByLogicDevId"));
-    }
-  }
-  int32_t physical = -1;
-  if (get_physical == nullptr ||
-      get_physical(static_cast<int32_t>(logical_device_id), &physical) != 0 || physical < 0) {
-    return false;
-  }
-  *physical_device_id = static_cast<std::uint32_t>(physical);
-  return true;
-}
 
 // Register only compiled implementations. Registration stores factories and does
 // not load kernels, open communication sessions, or reserve algorithm workspace.
@@ -195,7 +167,7 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    auto resources = detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
+    auto resources = detail::ResolveExecutionResources(transport, executor, get, peer_candidates.local, selected);
     if (get && transport == Transport::Urma && executor == Executor::Aicpu &&
         algorithm == GetAlgorithm::Gather && !resources.gather_read_wave_wrs)
       resources.gather_read_wave_wrs = kGatherDefaultReadWaveWrs;
@@ -312,11 +284,11 @@ struct NpuRuntime::Impl {
     std::lock_guard<std::mutex> lock(cache_eid_mutex);
     if (cache_eids_ready) return;
     peer::PeerCandidateTable table;
-    table.local = cache_peer_local;
+    table.local = peer_candidates.local;
     auto status = peer_link->GetCacheCandidateCount(&table);
     if (!status.ok()) throw std::invalid_argument(status.message());
     std::uint32_t physical_device;
-    if (!ResolvePhysicalDeviceId(options.device_id, &physical_device))
+    if (!detail::ResolvePhysicalDeviceId(options.device_id, &physical_device))
       throw std::invalid_argument("cannot resolve physical NPU from device " + std::to_string(options.device_id));
     const bool automatic_cpu = !table.device_fixed && options.peer_ub_device.empty();
     detail::PairEids pair;
@@ -360,7 +332,7 @@ struct NpuRuntime::Impl {
     }
     if (executor == Executor::Aiv) {
       AccessOperatorConfig c;
-      c.peer_local = cache_peer_local;
+      c.peer_local = peer_candidates.local;
       c.peer_link = link;
       if (links.size() > 1) c.peer_get_links = links;
       c.peer_local_eids = eids;
@@ -406,8 +378,7 @@ struct NpuRuntime::Impl {
   std::mutex aicpu_package_mutex;
   bool aicpu_package_ready{false};
   peer::CpuFeSelection cpu_fes;
-  bool cache_peer_local{};
-  std::uint32_t pull_candidate{};
+  peer::PeerCandidateTable peer_candidates;
   std::vector<detail::NpuEid> local_eids;
   std::mutex cache_eid_mutex;
   bool cache_eids_ready{false};
@@ -423,6 +394,7 @@ struct NpuRuntime::Impl {
   std::mutex cpu_pull_prepare_mutex;
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
   std::unique_ptr<RemotePullOperator> cpu_pull;
+  std::optional<std::uint32_t> pull_source_physical;
 #endif
 };
 
@@ -492,31 +464,9 @@ Status NpuRuntime::InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_siz
   impl_->local_eids.clear();
   impl_->cpu_fes = {};
   impl_->cache_eids_ready = false;
-  impl_->pull_candidate = 0;
   if (impl_->options.transport_mode != TransportMode::Ubmem) {
-    peer::PeerCandidateTable table;
-    auto status = impl_->peer_link->DiscoverCandidates(&table, false);
+    auto status = impl_->peer_link->DiscoverCandidates(&impl_->peer_candidates);
     if (!status.ok()) return status;
-    impl_->cache_peer_local = table.local;
-    const auto& devices = impl_->options.peer_ub_device;
-    // A list configures cache Direct Get only. CPU Pull retains its single-device pin.
-    if (!devices.empty() && devices.find(',') == std::string::npos) {
-      const auto first = devices.find_first_not_of(" \t\r\n");
-      if (first == std::string::npos) return Status::InvalidArgument("empty peer UB device");
-      const auto device = devices.substr(first, devices.find_last_not_of(" \t\r\n") - first + 1);
-      std::uint32_t candidate = 0;
-      for (; candidate < table.count; ++candidate) {
-        peer::PeerCandidateInfo info;
-        status = impl_->peer_link->GetCandidateInfo(candidate, &info, false);
-        if (!status.ok()) return status;
-        if (info.device_id >= table.device_count)
-          return Status::Internal("peer Runtime returned invalid candidate metadata");
-        if (info.device_name == device) break;
-      }
-      if (candidate == table.count)
-        return Status::NotFound("peer Runtime did not advertise fixed UB device " + device);
-      impl_->pull_candidate = candidate;
-    }
   }
   impl_->runtime_core.reset();
   impl_->dispatcher.reset();
@@ -599,25 +549,58 @@ Status NpuRuntime::CopyBatchGetKernelProfiles(
   return impl_->dispatcher->CopyGetProfiles(config, profiles, graph_lease);
 }
 
-Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* out) {
+Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* out,
+                                    std::optional<std::uint32_t> source_physical_device_id) {
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
-  if(!out)return Status::InvalidArgument("missing CPU Pull region ticket");
-  if(!ddr_initialized())return Status::NotInitialized("initialize DDR before CPU Pull");
-  if(impl_->closing)return Status::InvalidState("retry Runtime shutdown");
-  if(impl_->options.transport_mode==TransportMode::Ubmem)
-    return Status::InvalidState("CPU Pull requires DDR URMA capability");
+  if (!out) return Status::InvalidArgument("missing CPU Pull region ticket");
   std::lock_guard<std::mutex> lock(impl_->cpu_pull_prepare_mutex);
-  if(impl_->ddr_closing)return Status::InvalidState("retry DDR shutdown before exporting a ticket");
-  if(impl_->cpu_pull && impl_->cpu_pull->ticket().region_id) {
-    *out=impl_->cpu_pull->ticket();return Status::OK();
+  if (!ddr_initialized()) return Status::NotInitialized("initialize DDR before CPU Pull");
+  if (impl_->closing || impl_->ddr_closing) return Status::InvalidState("Runtime or DDR is closing");
+  if (impl_->options.transport_mode == TransportMode::Ubmem)
+    return Status::InvalidState("CPU Pull requires DDR URMA capability");
+
+  // A CSV configures cache Direct Get only. Pull always selects a single endpoint.
+  const auto& configured = impl_->options.peer_ub_device;
+  const std::string device = configured.find(',') == std::string::npos ? configured : "";
+  const auto& table = impl_->peer_candidates;
+  const bool match_source = table.local && !table.device_fixed && device.empty();
+  auto& pull = impl_->cpu_pull;
+  if (!pull || (match_source && source_physical_device_id &&
+                impl_->pull_source_physical != source_physical_device_id)) {
+    detail::PairEids pair;
+    if (match_source) {
+      if (!source_physical_device_id) {
+        std::uint32_t physical{};
+        if (!detail::ResolvePhysicalDeviceId(impl_->options.device_id, &physical))
+          return Status::Internal("cannot resolve runtime NPU physical device for CPU Pull");
+        source_physical_device_id = physical;
+      }
+      pair = detail::ReadDevicePair(*source_physical_device_id);
+    }
+    peer::CpuFeSelection selection;
+    auto status = impl_->peer_link->SelectCpuFes(table, device, pair.cpu, /*single_cpu_fe=*/true, &selection);
+    if (!status.ok()) return status;
+    const auto& cpu = selection.primary;
+    if (pull && (pull->candidate().candidate_id != cpu.candidate_id || pull->candidate().eid != cpu.eid))
+      return Status::InvalidState("source requires a different CPU EID for an already bound CPU Pull region");
+    if (!pull) {
+      const char* reason = !device.empty() || table.device_fixed ? "fixed_device" :
+          !match_source ? "first_candidate" : pair.cpu == cpu.eid ? "pair_match" : "pair_fallback";
+      std::fprintf(stderr, "[KVAF] CPU_PULL_EID_SELECTED scene=%s candidate=%u ub_device=%s eid_index=%u "
+                   "cpu_eid=%s cpu_selection=%s\n", table.local ? "local" : "remote", cpu.candidate_id,
+                   cpu.device_name.c_str(), cpu.eid_index, detail::EidToHex(cpu.eid).c_str(), reason);
+      pull = std::make_unique<RemotePullOperator>(impl_->peer_link, cpu);
+      impl_->pull_source_physical = source_physical_device_id;
+    }
   }
-  if (!impl_->cpu_pull)
-    impl_->cpu_pull = std::make_unique<RemotePullOperator>(impl_->peer_link, impl_->pull_candidate);
-  auto status=core().SetCpuPullExecutor(impl_->cpu_pull.get());
-  if(!status.ok())return status;
-  status=impl_->cpu_pull->Initialize(core().remote_region());
-  if(!status.ok())return status;
-  *out=impl_->cpu_pull->ticket();return Status::OK();
+  if (!pull->ticket().region_id) {
+    auto status = core().SetCpuPullExecutor(pull.get());
+    if (!status.ok()) return status;
+    status = pull->Initialize(core().remote_region());
+    if (!status.ok()) return status;
+  }
+  *out = pull->ticket();
+  return Status::OK();
 #else
   return Status::NotImplemented("CPU Pull was not built");
 #endif

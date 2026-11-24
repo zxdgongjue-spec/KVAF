@@ -30,6 +30,7 @@ add_library(kvaf_runtime
   cpu_service/runtime_service.cc
   src/npu_runtime_config.cc
   src/npu_eid_selection.cc
+  src/npu_device_pair.cc
 )
 
 if(BUILD_TESTING)
@@ -56,6 +57,7 @@ target_link_libraries(kvaf_runtime
     kvaf_access_operator
   PRIVATE
     kvaf_offload_control
+    ${CMAKE_DL_LIBS}
 )
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)
@@ -82,6 +84,9 @@ if(KVAF_ENABLE_AIV_BATCH_GET OR KVAF_ENABLE_AICPU_URMA OR KVAF_ENABLE_CPU_OFFLOA
     target_link_libraries(kvaf_npu_runtime PRIVATE kvaf_remote_offload)
   endif()
   if(KVAF_ENABLE_CPU_OFFLOAD OR KVAF_ENABLE_NPU_PULL)
+    find_package(Boost REQUIRED)
+    target_sources(kvaf_offload_control PRIVATE src/hbm_read_route.cc)
+    target_link_libraries(kvaf_offload_control PRIVATE Boost::boost)
     add_library(kvaf_hbm_read_source STATIC src/hbm_read_source.cc)
     target_include_directories(kvaf_hbm_read_source PUBLIC include PRIVATE src "${ASCEND_CANN_PACKAGE_PATH}/include")
     target_link_directories(kvaf_hbm_read_source PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/lib64")

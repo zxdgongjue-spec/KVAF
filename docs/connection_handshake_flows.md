@@ -2,7 +2,7 @@
 
 更新日期：2026-11-23。本文描述此次合入后的代码：普通缓存保留 main 的按配置执行框架，CPU/NPU Pull 接入独立资源与生命周期。
 
-CPU Pull 正常成功批次使用一次 KVRP v8 `SubmitAndWait` RPC；NPU Pull 默认异步入队，由应用负责正常输入保活、同步和销毁捕获图。两条路径的源复用均由应用通知协调，源端 `ReleaseBatch` 不查询远端 DMA。KVHR v8 负责 NPU 注册、重连和硬件资源关闭，不承担逐批 Complete／Cancel 通知。
+CPU Pull 正常成功批次使用一次 KVRP v8 `SubmitAndWait` RPC；NPU Pull 默认异步入队，由应用负责正常输入保活、同步和销毁捕获图。两条路径的源复用均由应用通知协调，源端 `ReleaseBatch` 不查询远端 DMA。KVHR v9 负责 NPU 注册、重连和硬件资源关闭，不承担逐批 Complete／Cancel 通知。
 
 下文描述接口和资源合同；可移植测试不能代替目标硬件的 URMA、UBMEM 可见性及吞吐验收。
 
@@ -231,7 +231,7 @@ sequenceDiagram
 ```
 
 - **KVHR TCP 监听在 A，B 的 KVAF 源对象没有监听端口**；B 的源对象运行后台连接／响应线程。TCP 发起方向不改变实际 READ 由 A NPU 发起这一点。
-- A 在 `listen_hbm(..., local_eid=...)` 中指定 fullmesh EID；B 在 `NpuPullHbmSource(device_id, npu_eid=...)` 中指定其 fullmesh EID。两者与 CPU Pull EID 独立。
+- A 和 B 在 Discover 时交换主机 boot ID 和物理卡号，默认选取同机 fullmesh 或跨机 CLOS。A 可用 `listen_hbm(..., local_eid=...)` 固定读端 EID，B 可用 `NpuPullHbmSource(device_id, npu_eid=...)` 固定源端 EID。
 - B 的 `register()` 是完整、阻塞的初始化接口。实际 HCCP 注册发生在内部收到 `Open` 后，但应用只需等 `register()` 返回。
 - B 准备 4 个目标 Jetty，A 按 `npu_pull_options.cores × npu_pull_options.jettys` 使用其中 1～4 个。各通道分别协商 TP 参数，provider 是否返回相同底层 TP 由其实现决定。
 - 全部 MR 共用该 source 的 raw READ transport 和队列；切换 MR 更换远端注册信息，不重建通道。
@@ -419,7 +419,7 @@ CPU Pull 和 NPU Pull 的源端 release／cancel 都只核对本地 token。通�
 | 通道 | 建立方向 | 承载内容 |
 |---|---|---|
 | 应用 KVNT v1 TCP，示例 B:29100 | B producer 监听，A reader 主动连接 B | receiver ticket、配置、request/ready、reuse/released、shutdown/closed、error |
-| 内部 KVHR v8 TCP，示例 A:29000 | A `listen_hbm`，B `source.register` 主动连接 A | MR／Jetty／TP、探测、重连和硬件关闭 |
+| 内部 KVHR v9 TCP，示例 A:29000 | A `listen_hbm`，B `source.register` 主动连接 A | MR／Jetty／TP、探测、重连和硬件关闭 |
 | NPU 数据通道 | A 发起 READ | B HBM → A output；payload 不经过上述 TCP |
 
 ```mermaid
@@ -530,7 +530,7 @@ NPU READ 的 Host 提交和关闭按 source connection 协调；长 stream 等�
 | CPU 持久连接服务循环 | [runtime_service.cc](../runtime/cpu_service/runtime_service.cc)：ServeControlConnections |
 | HBM 注册／导出及端点 | [hbm_exporter.h](../runtime/src/hbm_exporter.h) |
 | NPU 注册探针、异步 READ、取消和关闭 | [hbm_read_client.cc](../runtime/src/hbm_read_client.cc) |
-| KVHR v8 编解码与关闭握手 | [hbm_read_protocol.h](../runtime/src/hbm_read_protocol.h)、[hbm_read_protocol.cc](../runtime/src/hbm_read_protocol.cc) |
+| KVHR v9 编解码与关闭握手 | [hbm_read_protocol.h](../runtime/src/hbm_read_protocol.h)、[hbm_read_protocol.cc](../runtime/src/hbm_read_protocol.cc) |
 | output MR 缓存、选 MR 实体、本地 segment 校验 | [batch_get_host.cpp](../access_operator/algorithms/get/direct/urma_aiv/host/batch_get_host.cpp)：KvafBatchGetLocalBufferAcquireForRemote |
 | raw READ 算子、本地 SGE 与 CQE／WQE 快照 | [execute_batch_get_raw_addr_aiv.asc](../access_operator/algorithms/get/raw_addr/urma_aiv/kernel/execute_batch_get_raw_addr_aiv.asc)、[hbm_read_diagnostics.h](../runtime/src/hbm_read_diagnostics.h) |
 | 标准 BatchPut 事务 | [runtime.cc](../runtime/src/runtime.cc)、[in_memory_meta_manager.cc](../meta_manager/src/in_memory_meta_manager.cc) |

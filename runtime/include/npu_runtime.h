@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,7 +76,10 @@ class NpuRuntime final : public Runtime {
   ExecutionResources GetResources(GetExecutionConfig config) const;
   RuntimeCore& core();
   const RuntimeCore& core() const;
-  Status GetOffloadRegion(OffloadRegionTicket*);
+  // A local CPU route uses the source card's pair_info. Omission on the first
+  // call selects the runtime's device. Later calls reuse the same DDR binding.
+  Status GetOffloadRegion(OffloadRegionTicket*,
+                          std::optional<std::uint32_t> source_physical_device_id = std::nullopt);
   // One source span per key, from the CPU source MR selected by ReadyToken. Prepare,
   // Submit-and-wait uses one persistent control RPC; success includes metadata publication.
   // The producer owns registration, synchronization, Ready and ReleaseBatch on

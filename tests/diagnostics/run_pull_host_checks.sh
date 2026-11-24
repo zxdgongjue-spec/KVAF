@@ -35,6 +35,7 @@ PY
 compile get_recovery tests/diagnostics/get_recovery.cc
 compile profile tests/cpu_pull_profile_test.cc
 compile eid tests/npu_eid_discovery_test.cc
+compile hbm_route tests/hbm_read_route_test.cc runtime/src/hbm_read_route.cc
 compile wire tests/hbm_read_control_test.cc
 compile region tests/diagnostics/cpu_pull_region_lease.cc runtime/src/remote_pull_service.cc
 compile recovery tests/diagnostics/cpu_control_recovery_capacity.cc
@@ -44,10 +45,10 @@ compile raw_transport tests/hbm_read_transport_test.cc \
   access_operator/transports/direct_hccp/direct_hccp_remote_transport.cc \
   access_operator/transports/direct_hccp/direct_hccp_session.cc
 compile raw_runtime -DKVAF_ENABLE_NPU_PULL=1 tests/hbm_read_test.cc runtime/src/npu_runtime.cc \
-  runtime/src/hbm_read_source.cc runtime/src/hbm_read_client.cc
+  runtime/src/hbm_read_source.cc runtime/src/hbm_read_client.cc runtime/src/hbm_read_route.cc
 compile remote -DKVAF_ENABLE_CPU_OFFLOAD=1 tests/remote_offload_test.cc runtime/src/npu_runtime.cc \
   runtime/src/remote_offload.cc runtime/src/remote_pull_operator.cc runtime/src/remote_pull_service.cc
-for check in get_recovery profile eid wire region recovery transaction raw_model raw_transport raw_runtime remote; do
+for check in get_recovery profile eid hbm_route wire region recovery transaction raw_model raw_transport raw_runtime remote; do
   run "$KVAF_CHECK_BUILD/$check"
 done
 run "$KVAF_CHECK_BUILD/raw_runtime" launch-failure

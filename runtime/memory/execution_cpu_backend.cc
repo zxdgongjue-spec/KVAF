@@ -112,9 +112,8 @@ class UrmaSession final : public execution::Session {
 #endif
 }  // namespace
 std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
-    const CpuRuntimeOptions& options, std::shared_ptr<CpuUrmaDiscovery> discovery,
-    std::shared_ptr<CpuUrmaDiscovery> pull_discovery) {
-  auto allocate = [options, pull_discovery](const execution::Request& q,
+    const CpuRuntimeOptions& options, std::shared_ptr<CpuUrmaDiscovery> discovery) {
+  auto allocate = [options, discovery](const execution::Request& q,
                             std::unique_ptr<execution::Allocation>* out) -> Status {
     auto pool = std::make_unique<PoolAllocation>();
     auto* p = pool.get();
@@ -147,7 +146,7 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
     p->descriptor.length = bytes;
 #ifdef KVAF_CPU_HAS_URMA
     if (q.mode != TransportMode::Ubmem)
-      p->urma_memory = std::make_shared<CpuUrmaMemoryPool>(options, pull_discovery,
+      p->urma_memory = std::make_shared<CpuUrmaMemoryPool>(options, discovery,
           reinterpret_cast<void*>(p->descriptor.base), bytes, q.epoch, q.request);
 #endif
     // Initialize auxiliary controls once, never on each registration of this pool.
@@ -156,11 +155,10 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
                   q.auxiliary_bytes);
     return Status::OK();
   };
-  auto create = [options, discovery, pull_discovery](const execution::Request& q) -> std::unique_ptr<execution::Session> {
+  auto create = [options, discovery](const execution::Request& q) -> std::unique_ptr<execution::Session> {
     if (q.transport == Transport::Ubmem) return std::make_unique<FabricSession>();
 #ifdef KVAF_CPU_HAS_URMA
-    // Legacy OpenSession requests use the same full device list as legacy metadata.
-    return std::make_unique<UrmaSession>(options, q.payload.empty() ? pull_discovery : discovery);
+    return std::make_unique<UrmaSession>(options, discovery);
 #else
     return {};
 #endif

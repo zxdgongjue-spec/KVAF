@@ -10,6 +10,7 @@ import multiprocessing as mp
 import traceback
 
 from test_cpu_offload import fnv64
+from utils.npu_eids import source_physical_device_id
 from test_remote_cpu_offload import OFFSETS, SOURCE_BYTES, KEYS, pattern, receive, retain, verify_aiv
 
 RAW_LENGTHS = [1, 656, 100001]
@@ -86,9 +87,9 @@ def main():
     parser.add_argument("--device-a", type=int, default=6)
     parser.add_argument("--device-b", type=int, default=7)
     parser.add_argument("--npu-eid-a", default="", help="A-to-DDR EID")
-    parser.add_argument("--npu-eid-a-raw", default="", help="A fullmesh EID for A-to-B; automatic discovery does not include fullmesh")
+    parser.add_argument("--npu-eid-a-raw", default="", help="optional A EID override for NPU Pull")
     parser.add_argument("--npu-eid-b-cpu", default="")
-    parser.add_argument("--npu-eid-b-raw", default="", help="B fullmesh EID for A-to-B; independent of CPU-to-B")
+    parser.add_argument("--npu-eid-b-raw", default="", help="optional B EID override for NPU Pull")
     parser.add_argument("--batch-get-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_kernels.o")
     parser.add_argument("--batch-put-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_put_kernels.o")
     parser.add_argument("--raw-kernel", default="build-shared-ddr/bin/kvaf_execute_batch_get_raw_addr_kernels.o")
@@ -124,7 +125,7 @@ def main():
     runtime.link_to(args.cpu)
     runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
     assert runtime.ddr_initialized
-    ticket = runtime.offload_region()
+    ticket = runtime.offload_region(source_physical_device_id=source_physical_device_id(args.device_b))
     assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
     assert ticket["version"] == 2
     ddr_base = runtime.remote_region["base"]
