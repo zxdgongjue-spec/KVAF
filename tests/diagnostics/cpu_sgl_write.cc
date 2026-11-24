@@ -3,6 +3,7 @@
 #include "execution_config.h"
 #include "execution_protocol.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -17,6 +18,7 @@ namespace {
 using namespace kvaf;
 using namespace kvaf::cpu_push;
 constexpr std::uint32_t kCapacity = 37, kBytes = 656;
+constexpr std::uint32_t kOutputRows = 2 * kCapacity;
 struct Fixture {
   Layout layout;
   void* workspace{};
@@ -29,9 +31,9 @@ struct Fixture {
   std::int32_t count{kCapacity};
   CpuSglWriteArgs direct_args;
   KernelArgs& args{direct_args.execution};
-  explicit Fixture(std::uint32_t workers = 4)
+  explicit Fixture(std::uint32_t workers = 4, std::uint32_t rows_per_wr = 4)
       : statuses(workers), profiles(workers), source(8 * 4 * kBytes),
-        output(kCapacity * kBytes, 0xA5), addresses(8),
+        output(kOutputRows * kBytes, 0xA5), addresses(8),
         indices(kCapacity), offsets(kCapacity), rows(kCapacity) {
     assert(MakeLayout(kBytes, workers, &layout, true));
     assert(layout.bytes == layout.staging);  // No payload staging allocation.
@@ -63,9 +65,33 @@ struct Fixture {
     args.timeout_ms = 1000;
     direct_args.output_target.base = args.output;
     direct_args.output_target.bytes = output.size();
+    direct_args.rows_per_wr = rows_per_wr;
   }
   ~Fixture() { std::free(workspace); }
   std::uint8_t* memory() { return static_cast<std::uint8_t*>(workspace); }
+  std::vector<Range> Writes() const {
+    std::vector<Range> writes;
+    for (std::uint32_t worker = 0; worker < args.workers; ++worker) {
+      const auto range = WorkerRange(count, kBytes, worker, args.workers);
+      for (std::uint32_t chunk = 0; chunk < ChunkCount(range); ++chunk) {
+        for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+          const auto shard = JettyRange(ChunkRange(range, chunk), q);
+          for (auto row = shard.begin; row < shard.end; row += direct_args.rows_per_wr)
+            writes.push_back({row, std::min(shard.end, row + direct_args.rows_per_wr)});
+        }
+      }
+    }
+    return writes;
+  }
+  void SetGappedRows(bool reverse) {
+    std::uint32_t first = 0;
+    for (const auto& write : Writes()) {
+      const auto length = write.end - write.begin;
+      const auto dst = reverse ? kOutputRows - first - length - 1 : first;
+      for (auto row = write.begin; row < write.end; ++row) rows[row] = dst + row - write.begin;
+      first += length + 1;
+    }
+  }
   std::vector<std::future<std::uint32_t>> Launch() {
     std::vector<std::future<std::uint32_t>> result;
     for (std::uint32_t w = 0; w < args.workers; ++w)
@@ -73,6 +99,7 @@ struct Fixture {
     return result;
   }
   void Run(bool success, bool produce = true) {
+    auto expected = output;
     const auto sequence = coordination.claimed.value / args.workers + 1;
     auto kernels = Launch();
     if (produce && count) {
@@ -84,6 +111,8 @@ struct Fixture {
       }
       const auto* request = reinterpret_cast<Request*>(memory());
       assert(request->mode == kDirectOutput && request->count == count);
+      const auto writes = Writes();
+      assert(request->layout_version == kDirectLayoutVersion && request->wr_count == writes.size());
       const auto* target = reinterpret_cast<OutputTarget*>(memory() + layout.output_target);
       assert(target->base == args.output && target->bytes == output.size());
       // Every worker must remain pending without done, even though no scatter
@@ -91,8 +120,17 @@ struct Fixture {
       for (auto& kernel : kernels)
         assert(kernel.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout);
       const auto* sources = reinterpret_cast<const std::uint64_t*>(memory() + layout.descriptor);
-      for (int i = 0; i < count; ++i)
-        std::memcpy(output.data() + i * kBytes, reinterpret_cast<void*>(sources[i]), kBytes);
+      const auto* dest = reinterpret_cast<const std::uint32_t*>(memory() + layout.DstRows(count));
+      for (std::size_t wr = 0; wr < writes.size(); ++wr) {
+        const auto& range = writes[wr];
+        assert(dest[wr] == std::uint32_t(rows[range.begin]));
+        for (auto i = range.begin; i < range.end; ++i) {
+          std::memcpy(output.data() + (dest[wr] + i - range.begin) * kBytes,
+                      reinterpret_cast<void*>(sources[i]), kBytes);
+          std::memcpy(expected.data() + rows[i] * kBytes,
+                      reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), kBytes);
+        }
+      }
       auto* done = reinterpret_cast<Completion*>(memory() + layout.done);
       __atomic_store_n(&done->token, Progress(sequence, std::uint32_t(Result::kOk)), __ATOMIC_RELEASE);
     }
@@ -107,10 +145,7 @@ struct Fixture {
       assert(profiles[w].scatter_ns == 0 && profiles[w].scatter_copies == 0);
       assert(profiles[w].ready_queries == 0);
     }
-    for (int i = 0; i < count; ++i)
-      assert(std::memcmp(output.data() + i * kBytes,
-          reinterpret_cast<void*>(addresses[indices[i]] + offsets[i]), kBytes) == 0);
-    for (std::size_t i = count * kBytes; i < output.size(); ++i) assert(output[i] == 0xA5);
+    assert(output == expected);
   }
 };
 }  // namespace
@@ -124,9 +159,21 @@ int main() {
     f.indices[0] = 7;
     f.Run(true);  // Replay uses a new device ticket and dynamic inputs.
   }
+  for (auto sges : {4U, 8U}) {
+    Fixture f(1, sges);
+    const auto writes = f.Writes();
+    assert(writes[1].end - writes[1].begin == (sges == 4 ? 4 : 2));
+    f.SetGappedRows(false);
+    f.Run(true);
+    f.SetGappedRows(true);
+    f.indices[0] = 7;
+    f.Run(true);
+  }
   { Fixture f; f.count = 0; f.rows[0] = -1; f.Run(true, false); }
   { Fixture f; f.count = 1; f.rows[1] = -1; f.Run(true); }
   { Fixture f; f.rows[17] = 0; f.Run(false, false); }
+  { Fixture f(1); f.rows[1] = -1; f.Run(false, false); }
+  { Fixture f(1); f.rows[0] = kOutputRows; f.Run(false, false); }
   { Fixture f; f.args.output_bytes = kBytes; f.Run(false, false); }
   {
     // The shared kernel must retain Scatter's arbitrary destination mapping.

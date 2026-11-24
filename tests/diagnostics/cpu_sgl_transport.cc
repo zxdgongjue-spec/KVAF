@@ -3,16 +3,21 @@
 #include "cpu_service/push/cpu_push_get_transport.h"
 #include "urma_device_abi.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace {
 using kvaf::urma::Sge;
+using kvaf::cpu_push::kMaxWriteBytes;
 std::uint32_t device_sges = 13, queue_sges{}, data_wrs{}, data_sges{}, segments{};
+std::uint32_t device_message_bytes = kMaxWriteBytes, payload_token_bytes{}, read_wrs{};
+std::uint64_t read_bytes{};
 std::uint64_t output_base{}, output_bytes{}, done_address{};
 std::map<urma_jfc_t*, std::deque<std::uint64_t>> completions;
 int QueryTp(urma_context_t*, kvaf::urma::TpQuery*, std::uint32_t* count, kvaf::urma::TpInfo* info) {
@@ -33,7 +38,7 @@ urma_status_t urma_query_device(urma_device_t*, urma_device_attr_t* attributes) 
   auto& value = *reinterpret_cast<kvaf::urma::UbDeviceAttributes*>(attributes);
   value = {};
   value.dev_cap.max_jfs_sge = device_sges;
-  value.dev_cap.max_msg_size = 65536;
+  value.dev_cap.max_msg_size = device_message_bytes;
   return URMA_SUCCESS;
 }
 urma_token_id_t* urma_alloc_token_id(urma_context_t*) { return new urma_token_id_t{}; }
@@ -90,9 +95,10 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
       std::memcpy(reinterpret_cast<void*>(dst->addr + bytes), reinterpret_cast<void*>(src[i].addr), src[i].len);
       bytes += src[i].len;
     }
-    assert(bytes == dst->len && bytes <= 65536);
+    assert(bytes == dst->len && bytes <= device_message_bytes);
+    if (wr->opcode == URMA_OPC_READ) { ++read_wrs; read_bytes += bytes; }
     if (wr->opcode == URMA_OPC_WRITE && dst->addr >= output_base && dst->addr < output_base + output_bytes) {
-      assert(wr->rw.src.num_sge <= queue_sges);
+      for (std::uint32_t i = 0; i < wr->rw.src.num_sge; ++i) assert(src[i].len == payload_token_bytes);
       ++data_wrs; data_sges += wr->rw.src.num_sge;
     }
     if (wr->opcode == URMA_OPC_WRITE && dst->addr == done_address)
@@ -117,14 +123,31 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
 
 namespace {
 void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 4096,
-         std::uint32_t token_bytes = 656) {
+         std::uint32_t token_bytes = 656, std::uint32_t message_bytes = kMaxWriteBytes) {
   using namespace kvaf::cpu_push;
+  device_message_bytes = message_bytes;
+  payload_token_bytes = token_bytes;
+  constexpr std::uint32_t workers = 4;
+  const auto per_wr = std::min(expected, message_bytes / token_bytes);
+  std::vector<Range> writes;
+  for (std::uint32_t worker = 0; worker < workers; ++worker) {
+    const auto range = WorkerRange(count, token_bytes, worker, workers);
+    for (std::uint32_t chunk = 0; chunk < ChunkCount(range); ++chunk) {
+      for (std::uint32_t q = 0; q < kJettyCount; ++q) {
+        const auto shard = JettyRange(ChunkRange(range, chunk), q);
+        for (auto row = shard.begin; row < shard.end; row += per_wr)
+          writes.push_back({row, std::min(shard.end, row + per_wr)});
+      }
+    }
+  }
+  const auto wr_count = static_cast<std::uint32_t>(writes.size());
+  const auto pool_rows = count + wr_count;
   Layout layout;
-  assert(MakeLayout(token_bytes, 4, &layout, true));
+  assert(MakeLayout(token_bytes, workers, &layout, true));
   auto* hbm = static_cast<std::uint8_t*>(std::aligned_alloc(64, layout.bytes));
   assert(hbm);
   std::memset(hbm, 0, layout.bytes);
-  std::vector<std::uint8_t> source(count * token_bytes), output(source.size()), second(output.size());
+  std::vector<std::uint8_t> source(count * token_bytes), output(pool_rows * token_bytes), second(output.size());
   for (std::size_t i = 0; i < source.size(); ++i) source[i] = (i * 17 + i / token_bytes) % 251;
   urma_device_t device{};
   urma_context_t context{};
@@ -138,7 +161,7 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
   kvaf::peer::OpenCpuPushGetRequest setup{};
   setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = layout.bytes;
   setup.npu_tp = 1; setup.npu_psn = 1; setup.token_value = 7;
-  setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = 4;
+  setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = workers;
   setup.output_mode = kDirectOutput; setup.sge_per_wr = requested;
   std::memcpy(setup.segment, &hbm_segment, sizeof(hbm_segment));
   for (auto& channel : setup.channels) channel.bytes = 28;
@@ -146,40 +169,89 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
   Transport transport;
   assert(transport.Initialize(&context, &source_segment, setup, QueryTp, ImportJetty, 1, &response).ok());
   assert(queue_sges == expected);
+  assert(response.max_sge == expected && response.max_message_bytes == message_bytes);
   done_address = setup.hbm_base + layout.done;
-  for (auto sequence : {1U, 2U}) {
-    auto& result = sequence == 1 ? output : second;
+  auto* request = reinterpret_cast<Request*>(hbm);
+  auto* target = reinterpret_cast<OutputTarget*>(hbm + layout.output_target);
+  auto* addresses = reinterpret_cast<std::uint64_t*>(hbm + layout.descriptor);
+  auto* destinations = reinterpret_cast<std::uint32_t*>(hbm + layout.DstRows(count));
+  for (auto sequence : {1U, 2U, 3U}) {
+    // Same request count and pool for the first two rounds, but different source
+    // and destination indices. The third round also changes the output segment.
+    auto& result = sequence < 3 ? output : second;
     std::fill(result.begin(), result.end(), 0xA5);
+    auto expected_output = result;
     output_base = reinterpret_cast<std::uint64_t>(result.data()); output_bytes = result.size();
-    auto* request = reinterpret_cast<Request*>(hbm);
-    *request = {kMagic, sequence, count, token_bytes, 4, kDirectOutput, {}};
-    auto* target = reinterpret_cast<OutputTarget*>(hbm + layout.output_target);
+    *request = {kMagic, sequence, count, token_bytes, workers, kDirectOutput, wr_count, kDirectLayoutVersion, {}};
     *target = {};
     target->base = output_base; target->bytes = result.size(); target->token_value = 7;
     target->segment_bytes = sizeof(urma_seg_t);
     urma_seg_t output_segment{};
     output_segment.ubva.va = target->base; output_segment.len = target->bytes;
     std::memcpy(target->segment, &output_segment, sizeof(output_segment));
-    auto* addresses = reinterpret_cast<std::uint64_t*>(hbm + layout.descriptor);
     for (std::uint32_t i = 0; i < count; ++i)
       addresses[i] = source_segment.seg.ubva.va + ((count - i + sequence - 1) % count) * token_bytes;
+    std::uint32_t next_row = 0;
+    for (std::uint32_t wr = 0; wr < wr_count; ++wr) {
+      const auto range = writes[wr];
+      const auto length = range.end - range.begin;
+      destinations[wr] = sequence == 2 ? pool_rows - next_row - length - 1 : next_row;
+      for (auto i = range.begin; i < range.end; ++i)
+        std::memcpy(expected_output.data() + (destinations[wr] + i - range.begin) * token_bytes,
+                    reinterpret_cast<const void*>(addresses[i]), token_bytes);
+      next_row += length + 1;
+    }
     data_wrs = data_sges = 0;
+    auto* notify = reinterpret_cast<Word*>(hbm + layout.notify);
+    notify->value = sequence | kProfileNotify;
+    std::uint64_t observed = 0;
+    assert(transport.ReadRequest(&observed).ok() && observed == sequence);
+    read_wrs = 0;
+    read_bytes = 0;
     assert(transport.ReadDescriptor(sequence).ok());
+    const auto descriptor_bytes = layout.DstRows(count) + wr_count * sizeof(std::uint32_t) - layout.output_target;
+    assert(read_bytes == sizeof(Request) + descriptor_bytes);
+    assert(read_wrs == 1 + (descriptor_bytes + message_bytes - 1) / message_bytes);
     assert(transport.WriteBatch().ok());
     assert(transport.Complete(sequence, Result::kOk).ok());
+    if (sequence == 2) transport.PrintProfile();
+    assert(data_wrs == wr_count && data_sges == count);
     if (count == 4096 && token_bytes == 656) {
       assert(data_wrs == (expected == 4 ? 1024 : expected == 8 ? 512 : 320));
-      assert(data_sges == count);
     }
-    for (std::uint32_t i = 0; i < count; ++i)
-      assert(std::memcmp(result.data() + i * token_bytes, reinterpret_cast<void*>(addresses[i]), token_bytes) == 0);
+    assert(result == expected_output);
   }
+  const auto before = second;
+  const auto reject = [&](std::uint64_t sequence, const char* message) {
+    request->sequence = sequence;
+    data_wrs = 0;
+    const auto status = transport.ReadDescriptor(sequence);
+    assert(!status.ok() && status.message().find(message) != std::string::npos);
+    assert(!transport.WriteBatch().ok());
+    assert(data_wrs == 0 && second == before && segments == 2);
+    assert(transport.Complete(sequence, Result::kInvalidRequest).ok());
+  };
+  const auto last_dst = destinations[wr_count - 1];
+  destinations[wr_count - 1] = destinations[0];
+  reject(4, "overlap");
+  destinations[wr_count - 1] = last_dst;
+  const auto first_dst = destinations[0];
+  destinations[0] = pool_rows;
+  reject(5, "outside output");
+  destinations[0] = first_dst;
+  ++request->wr_count;
+  reject(6, "WR count mismatch");
+  --request->wr_count;
+  --request->layout_version;
+  reject(7, "layout");
   assert(transport.Shutdown().ok());
   assert(segments == 0 && completions.empty());
   std::free(hbm);
 }
-void Reject(std::uint32_t requested, std::uint32_t device_limit, std::uint32_t mode) {
+void Reject(std::uint32_t requested, std::uint32_t device_limit, std::uint32_t mode,
+            std::uint32_t message_bytes = kMaxWriteBytes) {
   device_sges = device_limit;
+  device_message_bytes = message_bytes;
   urma_context_t context{};
   urma_device_t device{};
   context.dev = &device;
@@ -203,9 +275,12 @@ int main() {
   Run(4, 4);
   Run(8, 8);
   Run(0, 13);
-  Run(8, 8, 65, 10000);  // Byte-limited WRs and split-token source offsets.
+  Run(8, 8, 257, 10000, 31000);  // The byte limit allows three complete tokens per WR.
+  Run(4, 4, 32769, 64);  // A tail WR and multiple drained SQ waves.
+  Run(1, 1, kvaf::cpu_push::kMaxRequests, 64);  // The largest packed destination list.
   Reject(8, 4, kvaf::cpu_push::kDirectOutput);
   Reject(17, 32, kvaf::cpu_push::kDirectOutput);
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);
   Reject(4, 13, kvaf::cpu_push::kScatterOutput);
+  Reject(4, 13, kvaf::cpu_push::kDirectOutput, 512);  // A full token cannot fit.
 }

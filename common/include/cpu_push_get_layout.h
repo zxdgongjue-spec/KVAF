@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 
 #include "cpu_push_get_abi.h"
@@ -10,6 +11,9 @@ inline constexpr std::uint64_t Align64(std::uint64_t n) { return (n + 63) & ~std
 struct Layout {
   std::uint64_t request{0}, notify{64}, done{128}, ready{192};
   std::uint64_t output_target{}, descriptor{}, staging{}, bytes{};
+  std::uint64_t DstRows(std::uint32_t count) const {
+    return Align64(descriptor + std::uint64_t{count} * sizeof(std::uint64_t));
+  }
 };
 inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout* out,
                        bool direct_output = false) {
@@ -21,7 +25,8 @@ inline bool MakeLayout(std::uint32_t token_bytes, std::uint32_t workers, Layout*
     l.output_target = l.descriptor;
     l.descriptor += sizeof(OutputTarget);
   }
-  l.staging = Align64(l.descriptor + kMaxRequests * sizeof(std::uint64_t));
+  l.staging = l.DstRows(kMaxRequests);
+  if (direct_output) l.staging = Align64(l.staging + kMaxRequests * sizeof(std::uint32_t));
   l.bytes = direct_output ? l.staging : Align64(l.staging + std::uint64_t{token_bytes} * kMaxRequests);
   *out = l;
   return true;
@@ -61,6 +66,51 @@ inline Range JettyRange(Range range, std::uint32_t queue) {
   const auto begin = range.begin + queue * base + std::min(queue, remainder);
   return {begin, begin + base + (queue < remainder ? 1U : 0U)};
 }
+inline std::uint32_t DirectRowsPerWrite(std::uint32_t token_bytes, std::uint32_t max_sge,
+                                        std::uint32_t max_bytes) {
+  return token_bytes ? std::min(max_sge, max_bytes / token_bytes) : 0;
+}
+
+// IDs follow worker, chunk, Jetty, then row order, independently of posting order.
+struct DirectWriteGrouping {
+  std::uint32_t rows_per_wr;
+
+  std::uint32_t Count(Range rows) const {
+    return (rows.end - rows.begin + rows_per_wr - 1) / rows_per_wr;
+  }
+
+  std::uint32_t ChunkWrCount(std::uint32_t rows) const {
+    std::uint32_t total = 0;
+    for (std::uint32_t jetty = 0; jetty < kJettyCount; ++jetty)
+      total += Count(JettyRange({0, rows}, jetty));
+    return total;
+  }
+
+  std::array<std::uint32_t, kMaxWorkers + 1> WorkerOffsets(
+      std::uint32_t count, std::uint32_t token_bytes, std::uint32_t workers) const {
+    std::array<std::uint32_t, kMaxWorkers + 1> offsets{};
+    const auto full_chunk_wrs = ChunkWrCount(kChunkRows);
+    for (std::uint32_t worker = 0; worker < workers; ++worker) {
+      const auto range = WorkerRange(count, token_bytes, worker, workers);
+      const auto rows = range.end - range.begin;
+      offsets[worker + 1] = offsets[worker] + rows / kChunkRows * full_chunk_wrs +
+          ChunkWrCount(rows % kChunkRows);
+    }
+    return offsets;
+  }
+
+  template <class Emit>
+  bool ForEachWrite(std::uint32_t worker_offset, std::uint32_t chunk, Range rows,
+                    std::uint32_t jetty, Emit emit) const {
+    auto id = worker_offset + chunk * ChunkWrCount(kChunkRows);
+    for (std::uint32_t q = 0; q < jetty; ++q) id += Count(JettyRange(rows, q));
+    const auto shard = JettyRange(rows, jetty);
+    for (auto first = shard.begin; first < shard.end; first += rows_per_wr)
+      if (!emit(id++, Range{first, std::min(shard.end, first + rows_per_wr)})) return false;
+    return true;
+  }
+};
+
 template <class Emit>
 void ForEachPipelineChunk(std::uint32_t count, std::uint32_t bytes,
                           std::uint32_t workers, Emit emit) {

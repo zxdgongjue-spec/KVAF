@@ -43,7 +43,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
       setup.output_mode > kDirectOutput ||
-      setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode != kDirectOutput) ||
+      setup.sge_per_wr > kMaxSourceSges || (setup.sge_per_wr && setup.output_mode != kDirectOutput) ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode == kDirectOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
@@ -60,13 +60,16 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
     return Error("query device");
-  const auto device_max_sge = std::min(16U, attr.dev_cap.max_jfs_sge);
+  const auto device_max_sge = std::min(kMaxSourceSges, attr.dev_cap.max_jfs_sge);
   if (setup.sge_per_wr > device_max_sge)
     return Status::InvalidArgument("requested sge_per_wr=" + std::to_string(setup.sge_per_wr) +
         " exceeds device limit=" + std::to_string(device_max_sge));
   max_sge_ = setup.sge_per_wr ? setup.sge_per_wr : device_max_sge;
-  max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(65536, attr.dev_cap.max_msg_size));
+  max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(kMaxWriteBytes, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
+  grouping_.rows_per_wr = DirectRowsPerWrite(token_bytes_, max_sge_, max_bytes_);
+  if (direct_output_ && !grouping_.rows_per_wr)
+    return Status::InvalidArgument("CPU SGL Write requires one whole token to fit in a WRITE");
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u device_max_sge=%u requested_sge=%u "
                "message_bytes=%u workers=%u token_bytes=%u"
                " post_payload_wrs=%u\n", max_sge_, device_max_sge, setup.sge_per_wr,
@@ -115,6 +118,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
   response->cpu_tp = cpu_tp;
   response->cpu_psn = psn;
+  response->max_sge = max_sge_;
+  response->max_message_bytes = max_bytes_;
   for (std::uint32_t q = 0; q < kJettyCount; ++q) {
     if (setup.channels[q].bytes != 28 && setup.channels[q].bytes != 32)
       return Error("invalid NPU Jetty key");
@@ -246,25 +251,49 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
       r.mode != (direct_output_ ? kDirectOutput : kScatterOutput))
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
-  if (!read.ok()) return read;
-  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  for (std::uint32_t i = 0; i < r.count; ++i)
-    if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
-      return Status::InvalidArgument("CPU push source outside cache region");
+  auto begin = layout_.descriptor;
+  auto end = begin + r.count * sizeof(std::uint64_t);
   if (direct_output_) {
+    BatchGetProfileScope check(profile_.enabled ? &profile_.descriptor_validation_ns : nullptr);
     if (output_remote_) return Error("previous output is still imported");
-    read = Transfer(false, layout_.output_target, sizeof(OutputTarget));
-    if (!read.ok()) return read;
+    if (r.layout_version != kDirectLayoutVersion || !r.wr_count || r.wr_count > r.count ||
+        r.wr_count != grouping_.WorkerOffsets(r.count, token_bytes_, workers_)[workers_])
+      return Status::InvalidArgument("CPU SGL Write layout or WR count mismatch");
+    begin = layout_.output_target;
+    end = layout_.DstRows(r.count) + r.wr_count * sizeof(std::uint32_t);
+  }
+  {
+    BatchGetProfileScope read_time(profile_.enabled && direct_output_ ? &profile_.descriptor_read_ns : nullptr);
+    result = Transfer(false, begin, end - begin);
+  }
+  if (!result.ok()) return result;
+  {
+    BatchGetProfileScope check(profile_.enabled && direct_output_ ? &profile_.descriptor_validation_ns : nullptr);
+    const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
+    for (std::uint32_t i = 0; i < r.count; ++i)
+      if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
+        return Status::InvalidArgument("CPU push source outside cache region");
+  }
+  if (direct_output_) {
     output_ = *reinterpret_cast<const OutputTarget*>(memory_ + layout_.output_target);
-    if (!output_.base || !output_.token_value || output_.segment_bytes != sizeof(urma_seg_t) ||
-        std::uint64_t{r.count} * token_bytes_ > output_.bytes ||
-        output_.base > UINT64_MAX - output_.bytes)
-      return Status::InvalidArgument("invalid CPU SGL output descriptor");
     urma_seg_t segment{};
-    std::memcpy(&segment, output_.segment, sizeof(segment));
-    if (!SourceRange(segment.ubva.va, segment.len, output_.base, output_.bytes))
-      return Status::InvalidArgument("CPU SGL output outside exported segment");
+    {
+      BatchGetProfileScope check(profile_.enabled ? &profile_.descriptor_validation_ns : nullptr);
+      if (!output_.base || !output_.token_value || output_.segment_bytes != sizeof(urma_seg_t) ||
+          std::uint64_t{r.count} * token_bytes_ > output_.bytes ||
+          output_.base > UINT64_MAX - output_.bytes)
+        return Status::InvalidArgument("invalid CPU SGL output descriptor");
+      std::memcpy(&segment, output_.segment, sizeof(segment));
+      if (!SourceRange(segment.ubva.va, segment.len, output_.base, output_.bytes))
+        return Status::InvalidArgument("CPU SGL output outside exported segment");
+    }
+    {
+      BatchGetProfileScope build(profile_.enabled ? &profile_.plan_build_ns : nullptr);
+      result = PrepareWrites(r.count);
+    }
+    if (!result.ok()) return result;
+    result = ValidateDestinations();
+    if (!result.ok()) return result;
     urma_import_seg_flag_t flag{};
     flag.bs.cacheable = URMA_NON_CACHEABLE;
     flag.bs.access = 1U << 2U;
@@ -274,6 +303,31 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     output_remote_ = urma_import_seg(context_, &segment, &token, 0, flag);
     if (!output_remote_) return Error("import output segment");
   }
+  return Status::OK();
+}
+
+const std::uint32_t* Transport::DestinationRows() const {
+  return reinterpret_cast<const std::uint32_t*>(memory_ + layout_.DstRows(request().count));
+}
+
+Status Transport::ValidateDestinations() {
+  BatchGetProfileScope check(profile_.enabled ? &profile_.descriptor_validation_ns : nullptr);
+  const auto* rows = DestinationRows();
+  const auto output_rows = output_.bytes / token_bytes_;
+  output_ranges_.clear();
+  output_ranges_.reserve(request().wr_count);
+  for (const auto& plan : prepared_)
+    for (const auto& queue : plan->queues)
+      for (const auto& destination : queue.destinations) {
+        const std::uint64_t first = rows[destination.id];
+        const auto end = first + queue.wrs[destination.wr].rw.src.num_sge;
+        if (end > output_rows) return Status::InvalidArgument("CPU SGL WRITE destination outside output");
+        output_ranges_.emplace_back(first, end);
+      }
+  std::sort(output_ranges_.begin(), output_ranges_.end());
+  for (std::size_t i = 1; i < output_ranges_.size(); ++i)
+    if (output_ranges_[i].first < output_ranges_[i - 1].second)
+      return Status::InvalidArgument("CPU SGL WRITE destinations overlap");
   return Status::OK();
 }
 
@@ -303,8 +357,12 @@ void Transport::SealPrepared(PreparedWrite& plan) {
       destination += payload;
       // Keep a trailing ordered Ready in the same post when payload hits the budget.
       if (!i || (payload && payloads == kPostPayloadWrs)) {
-        if (i) { q.wrs[i - 1].next = nullptr; q.posts.back().end_sge = local; }
-        q.posts.push_back({i, local, 0});
+        if (i) {
+          q.wrs[i - 1].next = nullptr;
+          q.posts.back().end_wr = i;
+          q.posts.back().end_sge = local;
+        }
+        q.posts.push_back({i, 0, local, 0});
         payloads = 0;
       }
       payloads += payload;
@@ -313,6 +371,7 @@ void Transport::SealPrepared(PreparedWrite& plan) {
       local += wr.rw.src.num_sge;
       wr.next = i + 1 < q.wrs.size() ? &q.wrs[i + 1] : nullptr;
     }
+    q.posts.back().end_wr = static_cast<std::uint32_t>(q.wrs.size());
     q.posts.back().end_sge = local;
     q.wrs.back().flag.bs.complete_enable = 1;
     q.wrs.back().flag.bs.place_order = URMA_STRONG_ORDER;
@@ -323,50 +382,62 @@ Status Transport::PrepareWrites(std::uint32_t count) {
   if (!tracker_.Empty()) return Error("prepare while WRITE is in flight");
   if (prepared_count_ == count) {
     profile_.plan_reused = true;
-    RetargetWrites();
     return Status::OK();
   }
   std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+  const auto wr_offsets = direct_output_ ? grouping_.WorkerOffsets(count, token_bytes_, workers_) :
+      std::array<std::uint32_t, kMaxWorkers + 1>{};
   const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
+  const auto add_source_run = [](PreparedQueue& q, std::uint32_t local, std::uint32_t row, std::uint32_t count) {
+    if (!q.source_runs.empty() && q.source_runs.back().local + q.source_runs.back().count == local &&
+        q.source_runs.back().row + q.source_runs.back().count == row)
+      q.source_runs.back().count += count;
+    else
+      q.source_runs.push_back({local, row, count});
+  };
   for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
     auto& waves = shards[queue];
     waves.emplace_back();
     ForEachPipelineChunk(count, token_bytes_, workers_,
       [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
-        const auto shard = JettyRange(range, queue);
-        auto row = shard.begin;
-        const auto end = shard.end;
-        std::uint32_t offset = 0;
-        while (row < end) {
-          // The probe budgets source SGEs as well as WRs against SQ depth.
-          // Continue large requests in another drained wave without narrowing
-          // BatchGet's existing maximum request/token sizes.
-          if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
-          auto& q = waves.back();
-          const auto first_local = static_cast<std::uint32_t>(q.local.size());
-          const auto first_row = row;
-          const auto destination_offset = std::uint64_t{row} * token_bytes_ + offset;
-          const auto destination = (direct_output_ ? output_.base : hbm_base_ + layout_.staging) + destination_offset;
-          std::uint32_t bytes = 0, sges = 0;
-          while (row < end && sges < max_sge_ && bytes < max_bytes_) {
-            const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-            if (!unsplit)
-              q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
-            q.local.push_back({0, length, source_, nullptr});
-            ++sges; bytes += length; offset += length;
-            if (offset == token_bytes_) { ++row; offset = 0; }
+        const auto next_queue = [&](std::uint32_t sges) -> PreparedQueue& {
+          // Budget source SGEs as well as WRs against SQ depth.
+          if (waves.back().local.size() + sges > kJettyDepth) waves.emplace_back();
+          return waves.back();
+        };
+        if (direct_output_) {
+          grouping_.ForEachWrite(wr_offsets[worker], chunk, range, queue,
+              [&](std::uint32_t id, Range rows) {
+                const auto sges = rows.end - rows.begin;
+                auto& q = next_queue(sges);
+                add_source_run(q, static_cast<std::uint32_t>(q.local.size()), rows.begin, sges);
+                q.local.insert(q.local.end(), sges, {0, token_bytes_, source_, nullptr});
+                q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), id});
+                AppendPrepared(q, queue, 0, sges * token_bytes_, sges);
+                return true;
+              });
+        } else {
+          const auto shard = JettyRange(range, queue);
+          auto row = shard.begin;
+          std::uint32_t offset = 0;
+          while (row < shard.end) {
+            auto& q = next_queue(max_sge_);
+            const auto first_local = static_cast<std::uint32_t>(q.local.size());
+            const auto first_row = row;
+            const auto destination = hbm_base_ + layout_.staging + std::uint64_t{row} * token_bytes_ + offset;
+            std::uint32_t bytes = 0, sges = 0;
+            while (row < shard.end && sges < max_sge_ && bytes < max_bytes_) {
+              const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
+              if (!unsplit)
+                q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
+              q.local.push_back({0, length, source_, nullptr});
+              ++sges; bytes += length; offset += length;
+              if (offset == token_bytes_) { ++row; offset = 0; }
+            }
+            if (unsplit) add_source_run(q, first_local, first_row, sges);
+            q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), 0});
+            AppendPrepared(q, queue, destination, bytes, sges);
           }
-          if (unsplit) {
-            // Walk the contiguous descriptor entries directly for whole-token SGEs.
-            if (!q.source_runs.empty() &&
-                q.source_runs.back().local + q.source_runs.back().count == first_local &&
-                q.source_runs.back().row + q.source_runs.back().count == first_row)
-              q.source_runs.back().count += sges;
-            else
-              q.source_runs.push_back({first_local, first_row, sges});
-          }
-          q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), destination_offset});
-          AppendPrepared(q, queue, destination, bytes, sges);
         }
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
@@ -389,18 +460,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     if (plan->fence_count) prepared_.push_back(std::move(plan));
   }
   prepared_count_ = count;
-  RetargetWrites();
   return Status::OK();
-}
-void Transport::RetargetWrites() {
-  if (!direct_output_) return;
-  for (auto& plan : prepared_)
-    for (auto& q : plan->queues)
-      for (const auto& destination : q.destinations) {
-        auto& remote = q.remote[destination.wr];
-        remote.addr = output_.base + destination.offset;
-        remote.tseg = output_remote_;
-      }
 }
 void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& post) {
   const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
@@ -419,6 +479,16 @@ void Transport::RefreshPrepared(PreparedQueue& q, const PreparedQueue::Post& pos
     for (; source != q.sources.end() && source->local < post.end_sge; ++source)
       q.local[source->local].addr = source_->seg.ubva.va +
           (addresses[source->row] - source_base_) + source->offset;
+  }
+  if (direct_output_) {
+    const auto* rows = DestinationRows();
+    auto destination = std::lower_bound(q.destinations.begin(), q.destinations.end(), post.first_wr,
+        [](const PreparedQueue::Destination& d, std::uint32_t i) { return d.wr < i; });
+    for (; destination != q.destinations.end() && destination->wr < post.end_wr; ++destination) {
+      auto& remote = q.remote[destination->wr];
+      remote.addr = output_.base + std::uint64_t{rows[destination->id]} * token_bytes_;
+      remote.tseg = output_remote_;
+    }
   }
   auto marker = std::lower_bound(q.markers.begin(), q.markers.end(), post.first_sge,
       [](const PreparedQueue::Marker& m, std::uint32_t i) { return m.local < i; });
@@ -439,7 +509,7 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
   }
   return Status::OK();
 }
-Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile) {
+Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_data, Profile* profile) {
   std::size_t posts = 0;
   for (const auto& q : plan.queues) posts = std::max(posts, q.posts.size());
   // Give every Jetty a doorbell before preparing the next slice of any Jetty.
@@ -448,10 +518,10 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
       auto& q = plan.queues[queue];
       if (batch >= q.posts.size()) continue;
       const auto& post = q.posts[batch];
-      if (refresh_sources) RefreshPrepared(q, post);
+      if (refresh_data) RefreshPrepared(q, post);
       const auto start = profile ? BatchGetProfileNowNs() : 0;
       urma_jfs_wr_t* bad = nullptr;
-      if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[post.wr], &bad)) {
+      if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[post.first_wr], &bad)) {
         queues_[queue].poisoned = true;
         return Error("post prepared WRITE chain");
       }
@@ -502,8 +572,14 @@ Status Transport::PollPrepared(std::uint64_t id, Profile* profile) {
 }
 Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
-  auto status = PrepareWrites(request().count);
-  if (!status.ok()) return status;
+  Status status;
+  if (direct_output_) {
+    if (!output_remote_ || prepared_count_ != request().count)
+      return Error("CPU SGL WRITE descriptors are not prepared");
+  } else {
+    status = PrepareWrites(request().count);
+    if (!status.ok()) return status;
+  }
   // Match the ordered-WRITE probe: short submissions to all four queues from
   // their owner, then poll their tails together. Avoid waking an OpenMP team
   // and crossing several team barriers for each short request.
@@ -557,16 +633,19 @@ void Transport::PrintProfile() const {
 #endif
   const auto& p = profile_;
   const auto& r = request();
-  const auto build_ns = p.write_ns - p.post_ns - p.cq_wait_ns;
+  const auto write_ns = p.plan_build_ns + p.write_ns;
+  const auto build_ns = write_ns - p.post_ns - p.cq_wait_ns;
   const auto submit_ns = p.first_post_ns ? p.last_cqe_ns - p.first_post_ns : 0;
   std::fprintf(stderr,
       "CPU_PUSH_PROFILE sequence=%" PRIu64 " workers=%u rows=%u bytes=%" PRIu64
-      " header_read_us=%.1f address_read_us=%.1f build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
+      " header_read_us=%.1f address_read_us=%.1f descriptor_read_us=%.1f descriptor_validation_us=%.1f"
+      " build_us=%.1f post_us=%.1f cq_wait_us=%.1f"
       " write_us=%.1f submit_to_cqe_us=%.1f done_us=%.1f"
       " data_wrs=%u ready_wrs=%u post_calls=%u waves=%u tail_cqes=%u cpu_threads=%u plan_reused=%u optimized=%u\n",
       r.sequence, r.workers, r.count, std::uint64_t{r.count} * token_bytes_,
-      p.header_read_ns / 1000.0, p.address_read_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
-      p.cq_wait_ns / 1000.0, p.write_ns / 1000.0, submit_ns / 1000.0, p.done_ns / 1000.0,
+      p.header_read_ns / 1000.0, (p.address_read_ns - p.plan_build_ns) / 1000.0,
+      p.descriptor_read_ns / 1000.0, p.descriptor_validation_ns / 1000.0, build_ns / 1000.0, p.post_ns / 1000.0,
+      p.cq_wait_ns / 1000.0, write_ns / 1000.0, submit_ns / 1000.0, p.done_ns / 1000.0,
       p.data_wrs, p.ready_wrs, p.post_calls, p.waves, p.tail_cqes, p.cpu_threads,
       unsigned(p.plan_reused), optimized);
 }
@@ -603,6 +682,7 @@ Status Transport::Shutdown() {
   if (control_token_) { if (urma_free_token_id(control_token_)) return Error("free token"); control_token_ = nullptr; }
   tracker_ = Tracker(kJettyCount, kJettyDepth);
   prepared_.clear();
+  output_ranges_.clear();
   done_ = {};
   prepared_count_ = UINT32_MAX;
   next_poll_queue_ = 0;

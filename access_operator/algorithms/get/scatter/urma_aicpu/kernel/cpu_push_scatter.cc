@@ -38,6 +38,7 @@ void Fail(Coordination& c, Result result) {
 struct Execution {
   const KernelArgs& args;
   const OutputTarget* output_target;
+  DirectWriteGrouping grouping;
   Layout layout;
   Coordination& coordination;
   std::uint64_t start, timeout;
@@ -120,16 +121,36 @@ struct Execution {
     const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
     const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
     auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
-    const auto* rows = reinterpret_cast<const std::int32_t*>(r.output_indices);
-    // Reject the whole request before notify, so unsupported mappings never
-    // cause partial DMA writes. Inactive output_indices remain irrelevant.
-    for (auto i = range->begin; i < range->end; ++i) {
-      if (direct && rows[i] != static_cast<std::int32_t>(i)) return false;
+    for (auto i = range->begin; i < range->end; ++i)
       sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
+    std::uint32_t wr_count = 0;
+    if (direct) {
+      const auto* rows = reinterpret_cast<const std::int32_t*>(r.output_indices);
+      auto* destinations = reinterpret_cast<std::uint32_t*>(Memory() + layout.DstRows(*count));
+      const auto wr_offsets = grouping.WorkerOffsets(*count, r.token_bytes, args.workers);
+      wr_count = wr_offsets[args.workers];
+      const auto output_rows = args.output_bytes / r.token_bytes;
+      for (std::uint32_t chunk = 0; chunk < ChunkCount(*range); ++chunk) {
+        const auto chunk_rows = ChunkRange(*range, chunk);
+        for (std::uint32_t jetty = 0; jetty < kJettyCount; ++jetty) {
+          const auto valid = grouping.ForEachWrite(wr_offsets[worker], chunk, chunk_rows, jetty,
+              [&](std::uint32_t wr, Range span) {
+                if (rows[span.begin] < 0) return false;
+                const auto dst = static_cast<std::uint32_t>(rows[span.begin]);
+                if (std::uint64_t{dst} + (span.end - span.begin) > output_rows) return false;
+                for (auto i = span.begin + 1; i < span.end; ++i)
+                  if (std::int64_t{rows[i]} != std::int64_t{dst} + i - span.begin) return false;
+                destinations[wr] = dst;
+                return true;
+              });
+          if (!valid) return false;
+        }
+      }
     }
     if (!worker) {
       auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
-      *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, direct ? kDirectOutput : kScatterOutput, {}};
+      *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers,
+                 direct ? kDirectOutput : kScatterOutput, wr_count, direct ? kDirectLayoutVersion : 0, {}};
       if (direct)
         *reinterpret_cast<OutputTarget*>(Memory() + layout.output_target) = *output_target;
     }
@@ -145,9 +166,11 @@ struct Execution {
 };
 }  // namespace
 
-static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target) {
+static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target,
+                                    std::uint32_t rows_per_wr) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
+      (output_target && (!rows_per_wr || rows_per_wr > kMaxSourceSges)) ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
   auto& c = *reinterpret_cast<Coordination*>(args->coordination);
   // Preserve the failed execution's reports across later graph replays.
@@ -162,7 +185,7 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   BatchGetWorkerProfile measured{};
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
-  Execution io{*args, output_target, layout, c, CounterNow(),
+  Execution io{*args, output_target, {rows_per_wr}, layout, c, CounterNow(),
       CounterFrequency() * args->timeout_ms / 1000, profile};
   std::uint32_t count = 0;
   Range range{};
@@ -217,8 +240,8 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   }
   return status->result == std::uint64_t(Result::kOk) ? 0 : 1;
 }
-std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) { return ExecuteCpuPush(args, nullptr); }
+std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) { return ExecuteCpuPush(args, nullptr, 0); }
 std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
-  return args ? ExecuteCpuPush(&args->execution, &args->output_target) : 1;
+  return args ? ExecuteCpuPush(&args->execution, &args->output_target, args->rows_per_wr) : 1;
 }
 }  // namespace kvaf::cpu_push

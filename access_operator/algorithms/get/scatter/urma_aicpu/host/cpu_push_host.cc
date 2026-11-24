@@ -44,6 +44,7 @@ struct CpuPushTransport::Impl {
   Invocation* invocation{&default_invocation};
   bool peer_open{}, initialized{}, profiling{};
   std::uint32_t token_value{};
+  std::uint32_t rows_per_wr{};
   using OutputKey = std::pair<std::uintptr_t, std::size_t>;
   struct OutputRegistration {
     OutputTarget target;
@@ -123,7 +124,8 @@ aicpu_urma::ScatterLaunchView CpuPushTransport::View() const {
        s.config.workers * sizeof(WorkerStatus)},
       {profile ? profile->device : s.profile_device, profile ? profile->host : s.profile_host,
        s.config.workers * sizeof(BatchGetWorkerProfile)}, &s.health, s.profiling, s.config.direct_output,
-      s.bound_outputs.count(s.invocation) ? s.outputs.at(s.bound_outputs.at(s.invocation)).target : OutputTarget{}};
+      s.bound_outputs.count(s.invocation) ? s.outputs.at(s.bound_outputs.at(s.invocation)).target : OutputTarget{},
+      s.rows_per_wr};
 }
 bool CpuPushTransport::direct_output() const { return impl_->config.direct_output; }
 Status CpuPushTransport::RegisterOutput(const MutableBufferView& output) {
@@ -339,7 +341,7 @@ Status CpuPushTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>* 
 Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   auto& s = *impl_;
   if (s.context || s.memory || s.initialized) return Status::InvalidState("CPU push already initialized");
-  if (s.config.sge_per_wr > 16 || (s.config.sge_per_wr && !s.config.direct_output))
+  if (s.config.sge_per_wr > kMaxSourceSges || (s.config.sge_per_wr && !s.config.direct_output))
     return Status::InvalidArgument("sge_per_wr requires CPU SGL Write and must be in [0,16]");
   if (!s.config.peer_link || !MakeLayout(s.config.token_bytes, s.config.workers, &s.layout, s.config.direct_output) ||
       std::all_of(s.config.local_eid.begin(), s.config.local_eid.end(), [](auto b) { return b == 0; }) ||
@@ -415,6 +417,12 @@ Status CpuPushTransport::Initialize(const RemoteRegionDesc& source) {
   s.peer_open = true;
   result = s.config.peer_link->OpenCpuPushGet(source.base, open, &reply);
   if (!result.ok()) return result;
+  if (s.config.direct_output) {
+    s.rows_per_wr = DirectRowsPerWrite(s.config.token_bytes, reply.max_sge, reply.max_message_bytes);
+    if (!s.rows_per_wr || reply.max_sge > kMaxSourceSges || reply.max_message_bytes > kMaxWriteBytes ||
+        (open.sge_per_wr && reply.max_sge != open.sge_per_wr))
+      return Error("invalid CPU SGL WRITE limits");
+  }
   for (std::uint32_t q = 0; q < kJettyCount; ++q) {
     d::QpImportInfoT info{};
     if (!d::ImportPeerJetty(s.api, s.context, reply.channels[q].key, reply.channels[q].bytes,
@@ -517,7 +525,7 @@ Status CpuPushTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.status = detail::PointerValue(view.completion.device);
   args.profile = (profile || view.profiling) ? detail::PointerValue(view.profile.device) : 0;
   args.workers = view.options.workers;
-  const CpuSglWriteArgs direct_args{args, view.output_target};
+  const CpuSglWriteArgs direct_args{args, view.output_target, view.rows_per_wr};
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = call.last_stream = stream;
   if (call.prepared_capturing) call.captured_stream = stream;

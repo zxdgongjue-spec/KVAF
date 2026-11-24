@@ -8,11 +8,13 @@ constexpr std::uint64_t kMagic = 0x4b56414650555333ULL;
 inline constexpr char kReferenceCommit[] = "a12bb16c120e885eb18ed61581739e1c212c32e8";
 constexpr std::uint32_t kMaxRequests = 65536, kMaxWorkers = 8, kJettyCount = 4;
 constexpr std::uint32_t kChunkRows = 1024, kTimeoutMs = 30000;
+constexpr std::uint32_t kMaxSourceSges = 16, kMaxWriteBytes = 64 * 1024;
 // Runtime additionally carries the opt-in profile bit with the request sequence.
 constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
 // Scatter retains the V3 workspace. Direct output adds an exported target
 // descriptor to control storage, and allocates no HBM payload staging.
 constexpr std::uint32_t kScatterOutput = 0, kDirectOutput = 1, kOutputSegmentBytes = 64;
+constexpr std::uint32_t kDirectLayoutVersion = 2;
 struct alignas(64) OutputTarget {
   std::uint64_t base{}, bytes{};
   std::uint32_t token_value{}, segment_bytes{};
@@ -30,7 +32,8 @@ struct alignas(64) Word { std::uint64_t value{}, reserved[7]{}; };
 struct alignas(64) Request {
   std::uint64_t magic{kMagic}, sequence{};
   std::uint32_t count{}, token_bytes{}, workers{}, mode{};
-  std::uint64_t reserved_words[4]{};
+  std::uint32_t wr_count{}, layout_version{};
+  std::uint64_t reserved_words[3]{};
 };
 struct alignas(64) Completion {
   // One aligned word publishes both sequence and result without a torn pair.

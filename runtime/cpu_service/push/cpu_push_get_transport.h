@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "cpu_push_get_layout.h"
@@ -31,6 +32,7 @@ class Transport {
   struct Profile {
     bool enabled{};
     std::uint64_t header_read_ns{}, address_read_ns{}, write_ns{}, post_ns{}, cq_wait_ns{}, done_ns{};
+    std::uint64_t descriptor_read_ns{}, descriptor_validation_ns{}, plan_build_ns{};
     std::uint64_t first_post_ns{}, last_cqe_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
@@ -44,14 +46,14 @@ class Transport {
   };
   using Tracker = cpu_urma_detail::IndexedAsyncWriteTracker;
   struct PreparedQueue {
-    struct Post { std::uint32_t wr, first_sge, end_sge; };
+    struct Post { std::uint32_t first_wr, end_wr, first_sge, end_sge; };
     struct Source { std::uint32_t local, row, offset; };
     struct SourceRun { std::uint32_t local, row, count; };
     struct Marker { std::uint64_t* value; std::uint32_t progress, local; };
     std::vector<urma::Sge> local, remote;
     std::vector<urma_jfs_wr_t> wrs;
     std::vector<Post> posts;
-    struct Destination { std::uint32_t wr; std::uint64_t offset; };
+    struct Destination { std::uint32_t wr, id; };
     std::vector<Destination> destinations;
     std::vector<Source> sources;
     std::vector<SourceRun> source_runs;
@@ -64,12 +66,13 @@ class Transport {
     Tracker::Handle handle;
   };
   Status PrepareWrites(std::uint32_t count);
-  void RetargetWrites();
+  Status ValidateDestinations();
+  const std::uint32_t* DestinationRows() const;
   void AppendPrepared(PreparedQueue&, std::uint32_t queue, std::uint64_t remote,
                       std::uint32_t bytes, std::uint32_t sges, bool ordered = false);
   void SealPrepared(PreparedWrite&);
   Status BeginPrepared(PreparedWrite&, std::uint64_t id);
-  Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr);
+  Status PostPrepared(PreparedWrite&, bool refresh_data = false, Profile* profile = nullptr);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
@@ -80,6 +83,7 @@ class Transport {
   void ResetRequests(Queue&);
   std::array<Queue, kJettyCount> queues_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> output_ranges_;
   PreparedWrite done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
@@ -94,6 +98,7 @@ class Transport {
   std::uint8_t* memory_{};
   std::uint64_t hbm_base_{}, source_base_{}, source_bytes_{};
   std::uint32_t max_sge_{}, max_bytes_{}, workers_{}, token_bytes_{};
+  DirectWriteGrouping grouping_{};
   Layout layout_;
 };
 }  // namespace kvaf::cpu_push

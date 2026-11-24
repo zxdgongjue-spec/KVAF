@@ -35,9 +35,9 @@ set(KVAF_AICPU_CPU_PUSH_ENTRY [=[  "KvafAicpuCpuPushScatterExecutionV3": {
       "opKernelLib": "AICPUKernel"
     }
   },
-  "KvafAicpuCpuSglWriteExecutionV1": {
+  "KvafAicpuCpuSglWriteExecutionV2": {
     "opInfo": {
-      "functionName": "KvafAicpuCpuSglWriteExecutionV1",
+      "functionName": "KvafAicpuCpuSglWriteExecutionV2",
       "kernelSo": "libkvaf_aicpu_urma.so",
       "opKernelLib": "AICPUKernel"
     }

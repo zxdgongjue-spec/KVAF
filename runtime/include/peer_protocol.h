@@ -200,6 +200,7 @@ struct OpenCpuPushGetResponse {
   uint64_t cpu_tp;
   uint32_t cpu_psn;
   CpuPushChannelKey channels[4];
+  uint32_t max_sge, max_message_bytes;
 };
 struct CpuPushGetSessionRequest {
   MessageHeader header;
@@ -222,7 +223,7 @@ static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");
 static_assert(sizeof(EnableGatherLanesRequest) == 32U, "gather lanes request ABI changed");
 static_assert(sizeof(OpenCpuPushGetRequest) == 432U, "CPU push setup ABI changed");
-static_assert(sizeof(OpenCpuPushGetResponse) == 300U, "CPU push setup response ABI changed");
+static_assert(sizeof(OpenCpuPushGetResponse) == 308U, "CPU push setup response ABI changed");
 static_assert(sizeof(CpuPushGetSessionRequest) == 20U, "CPU push session ABI changed");
 
 inline constexpr uint16_t ResponseCommand(Command command) {

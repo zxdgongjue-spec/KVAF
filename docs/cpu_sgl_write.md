@@ -1,9 +1,9 @@
-# CPU SGL Write：连续输出的 BatchGet
+# CPU SGL Write：按 WR 指定输出位置的 BatchGet
 
 `GetExecutionConfig("urma", "aicpu", "cpu_sgl_write")` 复用 CPU Push Scatter
 的请求构建、四路 Jetty、预构建 WRITE 链和 done 协议。CPU 将离散 DDR 源直接
-SGL WRITE 到调用方注册的 HBM output，AICPU 不执行 scatter，也不分配 payload staging。
-原 `scatter` 模式保持原有输出映射能力。
+SGL WRITE 到调用方注册的 HBM output。每个数据 WR 写入一个连续目标区间，各 WR 可以写到
+同一 output 中不同的位置。AICPU 负责构建请求，不执行 scatter，也不分配 payload staging。
 
 ## 接口和限制
 
@@ -16,27 +16,35 @@ output_indices = torch.arange(request_length, dtype=torch.int32, device="npu")
 ```
 
 两种 AccessTable 重载、普通 stream 调用、同步/异步完成以及 Get 图租约共用现有接口。
-有效前缀中的 `output_indices[i]` 必须等于 `i`，每项写入
-`output + i * token_bytes`；源索引和偏移仍可随机。有效输出前缀必须容纳
-`miss_count * token_bytes` 字节，后缀保持不变。`miss_count=0` 不通知 CPU、不修改 output。
-请求容量上限仍为 65536，token 大小固定为 Runtime 配置值。
+`output_indices` 在 `miss_count` 指定的有效前缀内给出每个 token 的目标行。若一条 WR 的
+首个请求项为 `first`、实际源 SGE 数为 `k`，则该 WR 的 `output_indices[first + j]`
+必须等于 `output_indices[first] + j`，其中 `0 <= j < k`。不同 WR 的目标区间可以留空隙或
+换顺序，必须互不重叠且落在 output 内。源索引和偏移可随机。`miss_count=0` 不通知 CPU、
+不修改 output。请求容量上限为 65536，token 大小固定为 Runtime 配置值。
 
-AICPU 在发布 notify 前由各 worker 检查本分片的输出映射。任一分片不合法时不会
-通知 CPU，避免部分写入；错误随现有同步、drain 或 status 检查报告。
+AICPU 在发布 notify 前检查 WR 内连续性和目标范围，CPU 在提交数据 WRITE 前检查全部 WR
+的目标越界与重叠。错误随现有同步、drain 或 status 检查报告。
 设备执行错误与原 Scatter 一样使该执行资源失效，须按原 Get 恢复/关闭流程重建。
 
 `ExecutionResources.sge_per_wr` 只用于 CPU SGL Write Get，配置单个数据 WRITE WR 的
 源 SGE 上限。默认 `0` 自动选 `min(16, max_jfs_sge)`；显式值允许 1..16，超过设备
 上限时初始化报错，不静默缩小。此配置在执行资源准备时固定，切换 4/8 使用新的 Runtime。
-目标 SGE 始终为 1。分片末尾或 64 KiB 消息上限可使实际源 SGE 数少于配置值；
-ready、done 和请求描述传输仍使用单 SGE。
+一条数据 WR 包含 `min(有效 SGE 上限, 有效消息字节上限 / token_bytes)` 个完整 token，
+分片末尾可更短。有效消息字节上限为 `min(65536, max_msg_size)`，一个 token 放不下时
+初始化报错。先按 worker、chunk、Jetty 分片，再按这个上限切分，每个分片单独处理尾 WR。
+WR 编号依次按 worker、chunk、Jetty 和分片内次序分配。ready、done 和描述读取使用单 SGE。
+
+例如 `cores=1`、`sge_per_wr=4`、`miss_count=32`、`token_bytes=656`，设备消息上限足够时，
+4 个 Jetty 各有 8 行，每个 Jetty 有 2 条数据 WR。`output_indices = i + (i // 4) * 4`
+会让 8 条 WR 分别写入第 0–3、8–11、…、56–59 行，output 需要至少 60 行。
 
 ## 内存和完成
 
-Host 用 direct HCCP 注册 output，控制 workspace 额外携带一份导出的 segment 描述。
-CPU 每轮读取并导入该 output，复用 WRITE 计划时同时更新目标地址和 segment。
-同一 WR 仍为多个源 SGE、一个连续目标 SGE，源上限为
-`sge_per_wr` 的配置值（0 时自动选择），单 WR 总字节最多为 `min(65536, max_msg_size)`。
+Host 用 direct HCCP 注册整块 output。AICPU 发布的请求头带布局版本和数据 WR 数，
+描述区依次存放 `OutputTarget`、`sources[]` 和按缓存行对齐的 `dst_row[]`。CPU 读取头部后，
+批量读取三者的有效描述区，校验后导入 output。每个 post 前只刷新该 post 的源 SGE 和
+目标 SGE。目标地址为 `output_base + dst_row[wr_id] * token_bytes`，长度由预构建 WR
+的 `num_sge` 决定。相同请求数可以复用 WRITE 计划，并在每轮指定不同目的行。
 
 本版保留原 chunk/Jetty 划分和 ready WRITE，AICPU 不轮询 ready。
 CPU 收齐全部数据链尾 CQE，释放本轮导入的 output 后，再发布 done；AICPU 等待
@@ -50,15 +58,17 @@ done 并执行可见性屏障后结束。异步调用仍须等待完成才可读
 由于本版增加了 output 描述 READ 和每轮 CPU segment 导入/释放，端到端耗时包含
 这些成本，与 Scatter 的差值不应直接视为 scatter 复制耗时。
 设备 profile 的 `scatter_us`、`scatter_copies` 和 ready 查询数为零，最终等待计入 `ack_us`。
-CPU profile 的 `address_read_us` 包含本轮 output 描述读取/导入，`done_us` 包含释放。
+CPU profile 的 `descriptor_read_us` 统计 output 描述和两份有效数组的批量读取，
+`descriptor_validation_us` 统计布局、源地址、目标范围和重叠校验。两项都包含在
+`address_read_us` 内，后者还包含 output segment 导入。`done_us` 包含释放。
+带宽分子只计 `miss_count * token_bytes` 的有效 payload。
 
 ## 构建和真机验证
 
-CPU 服务、NPU Host/Python 库须使用匹配版本重建并重启。首次引入直接输出时也须更新设备包。
-CPU Push setup 增加 `output_mode` 和 `sge_per_wr`，请求结构从 424 B 变为 432 B
-（先前无 SGE 配置的直接输出版本为 428 B）；旧 CPU 服务与新 Host 不兼容，不会自动回退。
-Scatter 的 V3 设备入口和 launch 参数布局保留；新设备入口为
-`KvafAicpuCpuSglWriteExecutionV1`，启动时检查，缺失则报错。
+CPU 服务、NPU Host/Python 库和 AICPU 设备包须使用匹配版本重建，服务和进程须重启。
+CPU Push setup 回包从 300 B 变为 308 B，携带实际 SGE 和消息字节上限。
+Scatter 的 V3 设备入口和 launch 参数布局保留，直接输出使用
+`KvafAicpuCpuSglWriteExecutionV2`，启动时检查该入口。
 
 ```bash
 # CPU 端

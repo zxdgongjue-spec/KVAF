@@ -71,7 +71,7 @@ Status PrepareUmdkKernel(const std::string& json, UmdkKernelKind kind) {
     case UmdkKernelKind::Put: mode = "put"; entry = "KvafAicpuBatchPut"; break;
     case UmdkKernelKind::Gather: mode = "gather_read"; entry = "KvafAicpuGatherReadExecutionV3"; break;
     case UmdkKernelKind::Scatter: mode = "cpu_push_scatter"; entry = "KvafAicpuCpuPushScatterExecutionV3"; break;
-    case UmdkKernelKind::CpuSglWrite: mode = "cpu_sgl_write"; entry = "KvafAicpuCpuSglWriteExecutionV1"; break;
+    case UmdkKernelKind::CpuSglWrite: mode = "cpu_sgl_write"; entry = "KvafAicpuCpuSglWriteExecutionV2"; break;
     default: return Status::InvalidArgument("unknown AICPU kernel kind");
   }
   const std::string context = "AICPU mode=" + std::string(mode) + " json=" + json;

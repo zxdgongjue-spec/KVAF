@@ -83,8 +83,9 @@ c++ -std=c++17 -pthread -fsanitize=address,undefined -g \
 ```
 
 Checks 1/4/8 workers, repeated device tickets, changing source inputs, full,
-partial and empty prefixes, untouched output tails, completion waits without
-ready/scatter, invalid output mappings, insufficient output capacity and the
+partial and empty prefixes, 4/8 SGE WRs and short tails, per-WR destinations,
+untouched output gaps, completion waits without ready/scatter, invalid output
+mappings, insufficient output capacity and the
 new execution configuration's wire round trip, plus the original Scatter's
 arbitrary destination mapping. It does not test real URMA
 imports, DMA visibility, Host registration retirement or CANN graph replay.
@@ -93,8 +94,10 @@ machines for those checks.
 
 `cpu_sgl_transport.cc` links the real CPU WRITE transport to a fake URMA
 provider. With public UMDK headers, it checks the queue SGE setting, actual
-4/8/automatic SGE chains and WR counts, payloads, cached-plan output changes,
-64 KiB splitting, explicit limits above hardware capacity, and import retirement:
+4/8/automatic SGE chains and WR counts, whole-token message limits, tail WRs,
+different destinations in the same pool with a cached plan, unchanged gaps,
+output segment changes, compact descriptor reads, overlap and bounds rejection,
+multiple SQ waves, explicit limits above hardware capacity, and import retirement:
 
 ```bash
 c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined \

@@ -84,5 +84,6 @@ struct KernelArgs {
 struct CpuSglWriteArgs {
   KernelArgs execution;
   OutputTarget output_target;
+  std::uint32_t rows_per_wr{};
 };
 }  // namespace kvaf::cpu_push

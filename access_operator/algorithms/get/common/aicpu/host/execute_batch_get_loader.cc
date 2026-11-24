@@ -15,7 +15,7 @@ int32_t LaunchCpuPushScatter(const KernelArgs* args, aclrtStream stream) {
 }
 int32_t LaunchCpuSglWrite(const CpuSglWriteArgs* args, aclrtStream stream) {
   if (!args) return -1;
-  return aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuSglWriteExecutionV1", args, sizeof(*args), stream,
+  return aicpu_urma::LaunchUmdkKernel("KvafAicpuCpuSglWriteExecutionV2", args, sizeof(*args), stream,
                                     args->execution.workers);
 }
 }  // namespace kvaf::cpu_push
