@@ -156,6 +156,7 @@ def run_case(a, torch, kvaf, *, mode="gather_read"):
         batch_get_kernel_object_path="", batch_get_token_bytes=a.token_bytes,
         batch_get_tokens_per_block=a.tokens_per_block, device_id=a.device_id,
         npu_core_count=a.workers, aicpu_batch_get_mode=mode, npu_eids=a.npu_eids,
+        allocation_mode="fixed",
     )
     profiles = []
     # Source and output allocations stay alive until the session is closed.

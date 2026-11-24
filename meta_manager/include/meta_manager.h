@@ -73,7 +73,7 @@ class MetaManager {
  public:
   virtual ~MetaManager() = default;
 
-  // 注册远端区域。默认 fixed 模式下 slot_id = key，Key 必须在 slot 数范围内。
+  // 注册远端区域。fixed 模式下 slot_id = key，Key 必须在 slot 数范围内。
   // append_only 模式下 Key 独立于 slot，按真实长度紧密追加，单 Key 不跨 slot。
   virtual Status RegisterRemoteRegion(const RemoteRegionDesc& region) = 0;
 

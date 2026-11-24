@@ -150,7 +150,7 @@ def parse_args(argv=None):
     p.add_argument("--jettys", type=int, nargs="+", default=[2])
     p.add_argument("--inflight", type=int, nargs="+", default=[2048])
     p.add_argument("--slot-size", type=int, default=0, help="0: largest packet rounded up to 4096B")
-    p.add_argument("--allocation-mode", choices=["fixed", "append_only"], default="fixed")
+    p.add_argument("--allocation-mode", choices=["fixed", "append_only"], default="append_only")
     p.add_argument("--request-order", choices=["sequential", "reverse", "random"], default="reverse")
     p.add_argument("--guard-bytes", type=int, default=0, help="optional untouched output gaps, excluded from payload")
     p.add_argument("--seed", type=int, default=20261121)

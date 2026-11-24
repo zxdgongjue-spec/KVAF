@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hardware acceptance of default fixed and opt-in append_only allocation."""
+"""Hardware acceptance of default append_only and explicit fixed allocation."""
 import argparse
 import os
 from pathlib import Path
@@ -85,8 +85,8 @@ def main():
         finally:
             rt.release_access_table(handle)
 
-    # The omitted option must retain the old bounded DSA Key/slot mapping.
-    rt = runtime()
+    # Explicit fixed mode retains the bounded DSA Key/slot mapping.
+    rt = runtime("fixed")
     try:
         assert rt.allocation_mode == "fixed"
         data = pattern(1, 656)
@@ -94,12 +94,12 @@ def main():
         read_objects(rt, [1], [data], [rt.remote_region["base"]+slot])
         rt.batch_free([1])
         expect(ValueError, lambda: put_objects(rt, [1000], [data]), "slot ID")
-        print("APPEND_ONLY_CASE_PASS fixed_default_unchanged", flush=True)
+        print("APPEND_ONLY_CASE_PASS explicit_fixed", flush=True)
     finally:
         stream.synchronize()
         rt.shutdown()
 
-    rt = runtime("append_only")
+    rt = runtime()
     pinned = None
     try:
         assert rt.allocation_mode == "append_only"
@@ -149,7 +149,7 @@ def main():
         if pinned is not None:
             rt.release_access_table(pinned)
         rt.shutdown()
-    print("APPEND_ONLY_HARDWARE_PASS fixed_default=1 append_only=1", flush=True)
+    print("APPEND_ONLY_HARDWARE_PASS fixed_explicit=1 append_only_default=1", flush=True)
     return 0
 
 

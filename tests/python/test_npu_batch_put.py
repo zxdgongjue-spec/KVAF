@@ -209,6 +209,7 @@ def main(transport: str = "urma") -> int:
         jettys_per_core=jettys_per_core,
         peer_ub_device=peer_ub_device,
         npu_eids=npu_eids,
+        allocation_mode="fixed",
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:

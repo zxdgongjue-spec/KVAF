@@ -10,6 +10,7 @@ from test_npu_batch_get_ranges import pattern
 
 MIB = 1024 * 1024
 SLOT = 64 * MIB
+TOKEN_BYTES = 656
 
 
 def expect_value_error(action, message):
@@ -41,29 +42,33 @@ def main():
     torch.npu.set_device(args.device)
     device = f"npu:{args.device}"
     stream = torch.npu.current_stream()
-    rt = kvaf.NpuRuntime("", 656, 1, device_id=args.device, npu_core_count=args.workers,
+    rt = kvaf.NpuRuntime("", TOKEN_BYTES, 1, device_id=args.device, npu_core_count=args.workers,
                          transport="urma", aicpu_batch_get_mode="gather_read",
-                         allocation_mode="append_only",
                          npu_eids=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")))
     rt.link_to(args.peer)
-    handle = None
+    handle = fixed_handle = None
     # Reuse the registered allocations and keep them alive through shutdown.
     source = None
     output = None
     fixed_output = None
     request_tensors = []
     try:
+        assert rt.allocation_mode == "append_only"
         rt.initialize(2 * SLOT, SLOT)
-        keys = [101, 202, 303]
-        payloads = [pattern(1, MIB + 17), pattern(2, 32 * MIB), pattern(3, 32 * MIB)]
+        range_keys = [101, 202, 303]
+        fixed_key = 404
+        fixed_payload = pattern(4, TOKEN_BYTES)
+        payloads = [pattern(1, MIB + 17), pattern(2, 32 * MIB), pattern(3, 32 * MIB),
+                    fixed_payload]
         sizes = [len(p) for p in payloads]
+        offsets = [0, sizes[0], sizes[0] + sizes[1], sum(sizes[:3])]
         source = torch.frombuffer(bytearray(b"".join(payloads)), dtype=torch.uint8).to(device)
-        rt.batch_put(keys, source, [0, sizes[0], sizes[0] + sizes[1]], sizes, stream=stream)
-        handle = rt.prepare_access_table(keys)
+        rt.batch_put([*range_keys, fixed_key], source, offsets, sizes, stream=stream)
+        handle = rt.prepare_access_table(range_keys)
         view = rt.access_table_view(handle)
         base = rt.remote_region["base"]
         assert list(view["addresses"]) == [base, base + sizes[0], base + SLOT]
-        assert list(view["lengths"]) == sizes
+        assert list(view["lengths"]) == sizes[:3]
         table = rt.access_table_view(handle, device="npu")
         output = torch.empty((SLOT + MIB,), dtype=torch.uint8, device=device)
 
@@ -129,16 +134,22 @@ def main():
         verify([], targets, used)
         print("AICPU_GATHER_RANGES_CASE_PASS bounds_empty_and_recovery", flush=True)
 
-        # Fixed Get uses the same session and the old staging stride.
-        i = tensor([1], torch.int32)
+        # Fixed Get uses the same session, with a table of 656-byte entries.
+        fixed_handle = rt.prepare_access_table([fixed_key])
+        fixed_table = rt.access_table_view(fixed_handle, device="npu")
         zero = tensor([0], torch.int32)
         count = tensor([1], torch.int32)
-        fixed_output = torch.empty((1, 656), dtype=torch.uint8, device=device)
-        rt.batch_get(table, i, zero, count, zero, fixed_output, stream=stream, synchronize=True)
-        assert fixed_output.cpu().numpy().tobytes() == payloads[1][:656]
+        fixed_output = torch.empty((1, TOKEN_BYTES), dtype=torch.uint8, device=device)
+        expect_value_error(lambda: rt.batch_get(table, zero, zero, count, zero, fixed_output,
+                           stream=stream, synchronize=True), "entries do not match the configured layout")
+        rt.batch_get(fixed_table, zero, zero, count, zero, fixed_output,
+                     stream=stream, synchronize=True)
+        assert fixed_output.cpu().numpy().tobytes() == fixed_payload
         print("AICPU_GATHER_RANGES_CASE_PASS fixed_get_after_ranges", flush=True)
     finally:
         stream.synchronize()
+        if fixed_handle is not None:
+            rt.release_access_table(fixed_handle)
         if handle is not None:
             rt.release_access_table(handle)
         rt.shutdown()

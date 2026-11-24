@@ -24,10 +24,11 @@ kvaf.NpuRuntime(
     transport="urma",
     *,
     aicpu_batch_get_mode="",
+    allocation_mode="append_only",
 )
 ```
 
-前三个参数必填。`aicpu_batch_get_mode` 只接受关键字传参。其余参数也可通过对应关键字传入。
+前三个参数必填。`aicpu_batch_get_mode` 和 `allocation_mode` 只接受关键字传参。其余参数也可通过对应关键字传入。
 
 | 参数 | 类型 | 默认值 | 含义与约束 |
 | --- | --- | --- | --- |
@@ -46,6 +47,7 @@ kvaf.NpuRuntime(
 | `batch_get_max_inflight_total` | `int` | `2048` | AIV URMA 单次 Get 所有核合计的在途 READ 预算。`0` 使用整批提交，非零值至少为 `2 * npu_core_count`。详见[在途控制](batch_get_inflight_control.md)。 |
 | `transport` | `str` | `"urma"` | 传输类型，可选 `"urma"` 或 `"ubmem"`。 |
 | `aicpu_batch_get_mode` | `str` | `""` | 选择配套的 Get 和 Put 实现。可选值与 `transport` 的组合见下表。 |
+| `allocation_mode` | `str` | `"append_only"` | 按对象真实长度追加，多个 Key 可共用一个 slot。依赖 `key == slot_id` 的调用方显式传 `"fixed"`。 |
 
 | `transport` | `aicpu_batch_get_mode` | BatchPut | BatchGet |
 | --- | --- | --- | --- |
@@ -64,7 +66,7 @@ kvaf.NpuRuntime(
 
 ## BatchPut
 
-将连续 NPU Tensor 中的字节范围写入远端 DDR 的指定 slot。成功返回 `None` 时，写入和元数据提交都已完成。
+将连续 NPU Tensor 中的字节范围写入远端 DDR。成功返回 `None` 时，写入和元数据提交都已完成。
 
 ```python
 runtime.batch_put(keys, source, input_offsets, lengths, stream=None)
@@ -72,13 +74,13 @@ runtime.batch_put(keys, source, input_offsets, lengths, stream=None)
 
 | 参数 | 类型 | 含义与约束 |
 | --- | --- | --- |
-| `keys` | Python 整数序列，或一维连续 CPU `torch.int64` Tensor | 第 `i` 项指定目标 slot。Key 须满足 `0 <= key < ddr_bytes // slot_size`，同一批中须唯一，且对应 slot 须为空。 |
+| `keys` | Python 整数序列，或一维连续 CPU `torch.int64` Tensor | 同一批内 Key 须唯一，且每个 Key 须未占用。`append_only` 的 Key 独立于 slot；`fixed` 的 Key 同时是 slot ID，范围为 `[0, ddr_bytes // slot_size)`。 |
 | `source` | 非空、连续的 NPU Tensor | 整批数据的源 buffer。绑定将其视为连续字节，`torch.uint8` 便于直接按字节构造数据。 |
 | `input_offsets` | Python 整数序列，或一维连续 CPU `torch.int64` Tensor | 每块在 `source` 内的起始字节偏移，须大于等于 0。 |
 | `lengths` | Python 整数序列，或一维连续 CPU `torch.int64` Tensor | 每块的字节长度，须满足 `0 < lengths[i] <= slot_size`。同一批可写入不同长度的块。 |
 | `stream` | `torch.npu.Stream` 或 `None` | 默认使用 `torch.npu.current_stream()`。在该 stream 上等待 Put 完成后提交元数据。 |
 
-`keys`、`input_offsets` 和 `lengths` 必须非空且等长。Runtime 将 `source` 的字节区间 `[input_offsets[i], input_offsets[i] + lengths[i])` 写入第 `i` 个 Key 对应的 slot，该区间须完整落在源 buffer 内。Runtime 先预留 slot，再提交数据搬运。搬运成功后才让映射对 Get 可见，搬运失败则回滚预留。
+`keys`、`input_offsets` 和 `lengths` 必须非空且等长。Runtime 将 `source` 的字节区间 `[input_offsets[i], input_offsets[i] + lengths[i])` 写入为第 `i` 个 Key 预留的连续地址，该区间须完整落在源 buffer 内。搬运成功后才让映射对 Get 可见，搬运失败则放弃预留。
 
 Python 关键字用 `source`，它映射到 C++ `BatchPutRequest::input`。对应校验见 [BatchPut 绑定](../bindings/src/npu_python_runtime.cc#L338)、[BatchPutRequest](../common/include/requests.h#L73)、[RuntimeCore::BatchPut](../runtime/src/runtime.cc#L344)和 [MetaManager slot 校验](../meta_manager/src/in_memory_meta_manager.cc#L157)。
 
@@ -93,7 +95,7 @@ Python 关键字用 `source`，它映射到 C++ `BatchPutRequest::input`。对�
 | `prepare_access_table(keys)` | 接受非空的扁平 Python 整数序列或一维连续 CPU `torch.int64` Tensor。按输入顺序锁定已提交的 Key 并返回 `AccessTable` handle。缺失 Key 会触发 `KeyError`。 |
 | `access_table_view(access_table, device="cpu", capacity=0)` | CPU 模式返回含 `addresses`、`lengths`、`valid` 和 `size` 的字典，前三项为依赖 handle 生命周期的只读 memoryview。指定 `device="npu"` 时返回 `DeviceAccessTable`，包含 `addresses: torch.int64[N]` 和 `valid: torch.uint8[N]` 两个 NPU Tensor。`capacity=0` 使用实际表长，也可指定更大的设备表容量，补齐位置的 `valid=0`。 |
 | `release_access_table(access_table)` | 释放 handle 和 Key 锁。调用方须等所有使用该表的 Get 完成后再调用。 |
-| `batch_free(keys)` | 回收已提交的 Key 对应的 slot。参数类型与建表相同，同一批中 Key 须唯一。仍被 AccessTable 锁定时返回 `kBusy`，Python 抛出 `ValueError`。 |
+| `batch_free(keys)` | 释放已提交的 Key。共享 slot 在最后一个对象释放后回收。参数类型与建表相同，同一批中 Key 须唯一。仍被 AccessTable 锁定时返回 `kBusy`，Python 抛出 `ValueError`。 |
 
 实现入口见 [AccessTable 绑定](../bindings/src/npu_python_runtime.cc#L364)、[CPU view 字段](../bindings/include/access_table_python.h#L14)和 [MetaManager::BatchFree](../meta_manager/src/in_memory_meta_manager.cc#L386)。
 

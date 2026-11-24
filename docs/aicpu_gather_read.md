@@ -16,7 +16,7 @@ AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使�
 ## 变长 tensor 读取
 
 `transport="urma", aicpu_batch_get_mode="gather_read"` 支持 eager
-`batch_get_ranges`。可同时选择 `allocation_mode="append_only"`，让不同 tensor
+`batch_get_ranges`。默认的 `allocation_mode="append_only"` 让不同 tensor
 使用独立 Key 并共用 slot。Put 继续使用 `batch_put(keys, source, input_offsets, lengths)`。
 读取整个 tensor 时，`indices` 填 AccessTable 行号，`source_offsets` 填 0，
 `lengths` 填每个 tensor 的实际字节数。`output_offsets` 是一维 uint8 输出里的字节位置，
@@ -25,7 +25,7 @@ AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使�
 staging 在 `initialize(ddr_bytes, slot_size)` 时按 worker 固定预留，位于用户 KV 区之后。
 原定长预留是 `align64(token_bytes × ceil(65536 / workers))`。使用
 `allocation_mode="append_only"` 时，每个 worker 的预留至少为一个 slot，按 64 B 对齐，
-计算时 slot 大小最多取 `UINT32_MAX`。默认 `fixed` 分配模式沿用原定长预留；
+计算时 slot 大小最多取 `UINT32_MAX`。显式选择 `fixed` 时沿用原定长预留；
 两种模式都支持 range Get。实际可用字节数还受每个 worker 描述头的 `uint32` 上限约束。
 远端额外分配包含所有 worker 的 staging、描述符和控制区，并按 slot_size 向上取整。
 
@@ -61,6 +61,37 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999 \
 `AICPU_GATHER_RANGES_HARDWARE_PASS`。脚本使用两个 64 MiB 的 KV slot，
 另按上述公式预留额外 DDR。CPU 服务的 `--gather-threads` 须不小于 `--workers`。
 需要配套更新 Host 库和 AICPU 设备包并重启客户端，CPU 服务继续使用版本 6 协议。
+
+定长回归在同一 Runtime 中另建一张只含 656 B 对象的表。定长 `batch_get` 的所有
+有效表项须等于 `batch_get_token_bytes × batch_get_tokens_per_block`；混合长度表
+使用 `batch_get_ranges`。
+
+### 变长性能测试
+
+性能脚本把每个 tensor 写成一个独立 Key，复用原有 AICPU 设备包。可在同次运行里
+扫描 worker 数和 READ 分段大小：
+
+```bash
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
+  tests/run_remote_cpu_aicpu_gather_ranges_perf.sh "$PWD/build-aicpu-urma" \
+  --workers 2 4 6 --tensor-bytes 1048576 33554432 --repeat 6 \
+  --slot-size 134217728 --read-chunk-bytes 0 16384 32768 \
+  --warmup 5 --iterations 30 --output-csv /tmp/aicpu_ranges_perf.csv
+```
+
+`--slot-size 0` 根据本次扫描中最重 worker 的字节量自动选 slot 大小。
+显式指定 slot 时，脚本在启动 NPU 前检查各 worker 的容量。使用 Python 入口的
+`--dry-run` 可离线查看各 worker 负载、KV DDR 和额外 workspace：
+
+```bash
+python3 tests/python/aicpu_gather_ranges_perf.py --dry-run --workers 2 4 6 --repeat 6
+```
+
+结果包括同步 Put 完成时间、range Get 提交时间和从调用到 stream 完成的时间。
+Put 的 Key 回收、Get 的状态回传及逐字节核对均在计时之外。每个采样均检查 Get 状态，
+每个配置在计时前后核对输出。带宽以有效 payload 字节计算，提交时间只报告延迟。
+终端输出 `AICPU_GATHER_RANGES_PERF_RESULT`，可通过 `--output-csv` 保存汇总。
+每个 worker 仍按请求数量切分，`worker_payload_bytes` 可用于判断负载倾斜或空闲。
 
 ## 构建和启动
 

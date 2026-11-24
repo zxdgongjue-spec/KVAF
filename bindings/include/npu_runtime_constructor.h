@@ -33,7 +33,7 @@ void BindNpuRuntimeConstructor(pybind11::class_<Runtime>& runtime) {
               py::arg("batch_get_max_inflight_total") = 2048,
               py::arg("transport") = "urma", py::kw_only(),
               py::arg("aicpu_batch_get_mode") = "",
-              py::arg("allocation_mode") = "fixed");
+              py::arg("allocation_mode") = "append_only");
 }
 
 }  // namespace kvaf::python_binding

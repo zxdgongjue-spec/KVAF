@@ -35,7 +35,7 @@ struct NpuRuntimeOptions {
   std::string aicpu_batch_get_mode{};
   // Address allocation policy, selected once per Runtime. Data-plane APIs
   // remain unchanged; fixed preserves the existing DSA Key == slot mapping.
-  AllocationMode allocation_mode{AllocationMode::kFixed};
+  AllocationMode allocation_mode{AllocationMode::kAppendOnly};
   // Total submitted, unconfirmed READs per BatchGet launch; 0 disables control.
   std::uint32_t batch_get_max_inflight_total{2048U};
   // Optional strict local-EID list. Empty preserves automatic discovery and

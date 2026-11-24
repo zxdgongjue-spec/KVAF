@@ -9,9 +9,13 @@
 using namespace kvaf;
 struct Operator : AccessOperator {
   bool fail_write = false;
+  int fixed_get_calls = 0;
   Status Initialize(const RemoteRegionDesc&) override { return Status::OK(); }
   Status Shutdown() override { return Status::OK(); }
-  Status ExecuteBatchGet(const BatchGetExecRequest&) override { return Status::OK(); }
+  Status ExecuteBatchGet(const BatchGetExecRequest&) override {
+    ++fixed_get_calls;
+    return Status::OK();
+  }
   Status ExecuteBatchPut(const BatchPutExecRequest& e) override {
     for (std::size_t i = 0; i < e.request->keys.size(); ++i)
       std::memcpy(reinterpret_cast<void*>(e.put_desc->entries[i].address),
@@ -64,6 +68,26 @@ int main() {
   CHECK(runtime.BatchGetRanges(r).ok());
   CHECK(!std::memcmp(output.data(), source.data()+20,30));
   CHECK(!std::memcmp(output.data()+30, source.data(),20) && output[50] == 0xa5);
+
+  // Fixed NPU Get validates the entire table, even if the active prefix
+  // references only an object with the requested token size.
+  int32_t row = 0, active = 1;
+  const auto npu = DeviceKind::kNpu;
+  const ConstBufferView row_buffer{&row, sizeof(row), npu};
+  BatchGetRequest fixed{h, row_buffer, row_buffer, {&active, sizeof(active), npu},
+      row_buffer, {output.data(), 30, npu}, 30, 1,
+      {{view.addresses, view.size * sizeof(Address), npu}, {view.valid, view.size, npu}, {}}};
+  CHECK(runtime.BatchGet(fixed).code() == StatusCode::kInvalidArgument);
+  CHECK(op.fixed_get_calls == 0);
+  AccessTableHandle fixed_handle;
+  CHECK(runtime.PrepareAccessTable({{200}}, &fixed_handle).ok());
+  CHECK(runtime.GetAccessTableView(fixed_handle, &view).ok());
+  fixed.access_table = fixed_handle;
+  fixed.device_access_table = {{view.addresses, sizeof(Address), npu}, {view.valid, 1, npu}, {}};
+  CHECK(runtime.BatchGet(fixed).ok());
+  CHECK(op.fixed_get_calls == 1);
+  CHECK(runtime.ReleaseAccessTable(fixed_handle).ok());
+
   CHECK(runtime.ReleaseAccessTable(h).ok());
   CHECK(runtime.BatchFree({{200,100}}).ok());
   std::vector<uint8_t> full(64, 0xcc);

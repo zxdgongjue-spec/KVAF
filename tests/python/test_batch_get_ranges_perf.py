@@ -35,9 +35,9 @@ class PerfTests(unittest.TestCase):
         self.assertEqual([perf.expected_reads(sizes, c) for c in [0, 65536, 1048576, 4194304]],
                          [2, 528, 33, 9])
         a = perf.parse_args(["--dry-run"])
-        self.assertEqual(a.allocation_mode, "fixed")
+        self.assertEqual(a.allocation_mode, "append_only")
         plans = list(perf.plan_records(a))
-        self.assertTrue(all(p["allocation_mode"] == "fixed" for p in plans))
+        self.assertTrue(all(p["allocation_mode"] == "append_only" for p in plans))
         self.assertEqual([p["read_wqes_expected"] for p in plans], [4, 1056, 66, 18])
         self.assertTrue(all(sum(p["core_read_wqes_expected"]) == p["read_wqes_expected"] for p in plans))
 
@@ -201,7 +201,7 @@ class PerfTests(unittest.TestCase):
             first = perf.prepare_output(perf.parse_args(args))
             second = perf.prepare_output(perf.parse_args(args))
             self.assertNotEqual(first, second)
-            self.assertRegex(first.name, r"ranges_d7_t656_r1_p2_c2_j2_k0_mfixed_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}")
+            self.assertRegex(first.name, r"ranges_d7_t656_r1_p2_c2_j2_k0_mappend_only_\d{8}_\d{6}_\d{6}_[0-9a-f]{8}")
             config = json.loads((first/"config.json").read_text())
             self.assertEqual(config["config"]["tensor_bytes"], [656])
             self.assertTrue(config["timestamp"].endswith("+08:00"))

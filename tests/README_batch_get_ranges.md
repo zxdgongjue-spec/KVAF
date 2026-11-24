@@ -4,7 +4,7 @@
 
 性能测试、FP16 完整调用示例和分段性能解释见 [Packed Put 和 Get range 性能测试与调用方式](README_batch_get_ranges_perf.md)。
 
-可选的“一 tensor 一 Key、多 Key 共用 slot、只追加分配”见 [append_only 分配模式](README_append_only.md)。默认仍为 fixed，Put/Get range 接口保持不变。
+默认分配模式为 [append_only](README_append_only.md)。每个 tensor 可以使用独立 Key，多个 Key 可以共用 slot，Put/Get range 接口相同。
 
 本文说明 AIV + URMA 的变长读取，支持 eager、同包多次读取、多包混合读取、不同长度、乱序请求和独立的输出 byte offset。AICPU 的 staging 容量、READ 分段和独立验收脚本见 [GatherRead 变长读取](../docs/aicpu_gather_read.md#变长-tensor-读取)。Range Get 的 Graph capture 和 stage/kernel profile 暂不可用。
 

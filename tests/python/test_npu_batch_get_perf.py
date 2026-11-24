@@ -413,7 +413,7 @@ def runtime_options(args, put_kernel):
         batch_get_max_inflight_total=args.max_inflight_total, npu_eids=args.npu_eids,
         adaptive_ub_device=args.adaptive_ub_device, adaptive_ub_miss_count=args.adaptive_ub_miss_count,
         peer_ub_device=args.peer_ub_device, adaptive_peer_ub_devices=args.adaptive_peer_ub_devices,
-        transport=args.transport,
+        transport=args.transport, allocation_mode="fixed",
     )
     if uses_aicpu(args):
         options["aicpu_batch_get_mode"] = args.backend

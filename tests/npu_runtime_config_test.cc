@@ -29,7 +29,7 @@ void Write(const fs::path& path, const std::string& contents) {
 
 int main() {
   NpuRuntimeOptions defaults{"get.o", 656, 2};
-  CHECK(defaults.allocation_mode == AllocationMode::kFixed);
+  CHECK(defaults.allocation_mode == AllocationMode::kAppendOnly);
   AllocationMode allocation;
   CHECK(ParseAllocationMode("fixed", &allocation).ok() && allocation == AllocationMode::kFixed);
   CHECK(ParseAllocationMode("append_only", &allocation).ok() && allocation == AllocationMode::kAppendOnly);

@@ -1,13 +1,13 @@
 # append_only：每个 tensor 一个 Key，多 Key 共用 slot
 
-默认仍为 `allocation_mode="fixed"`。`allocation_mode="append_only"` 在创建
-`NpuRuntime` 时选择，一次 Runtime 生命周期内保持不变。可与 AIV URMA 或
+默认分配模式为 `allocation_mode="append_only"`。依赖 `key == slot_id` 的调用方
+可以在创建 `NpuRuntime` 时显式传 `allocation_mode="fixed"`。可与 AIV URMA 或
 AICPU GatherRead 的 `batch_get_ranges` 配合使用。AICPU 的容量与测试入口见
 [GatherRead 变长读取](../docs/aicpu_gather_read.md#变长-tensor-读取)。
 
 ## 分配与回收规则
 
-| 行为 | fixed（默认） | append_only（可选） |
+| 行为 | fixed（可选） | append_only（默认） |
 | --- | --- | --- |
 | Key 与 slot | Key 就是 slot_id，范围为 `[0, slot_count)` | Key 独立于 slot，可用 uint64 ID；Key 数可多于 slot 数 |
 | 地址 | `base + key * slot_size` | `base + slot_id * slot_size + 对象在 slot 内的 byte offset` |
@@ -37,7 +37,7 @@ Key 202 的实际地址是 `base + 656`，但 Get 的 `source_offsets=0` 已经�
 ```python
 rt = kvaf.NpuRuntime(..., allocation_mode="append_only")
 assert rt.allocation_mode == "append_only"
-# 省略 allocation_mode 或传 "fixed"，继续使用原固定映射。
+# 省略 allocation_mode 时同样使用 append_only；显式传 "fixed" 使用固定映射。
 ```
 
 `initialize(ddr_bytes, slot_size)` 不变，DDR 仍一次分配整片区域，ddr_bytes 必须是 slot_size 的非零整数倍。自动换 slot 是这片区域内的地址管理，不会重新建链、增加 DDR 容量或为每个 tensor 创建 Runtime。
@@ -154,13 +154,13 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
   bash tests/run_remote_cpu_append_only.sh "$PWD/build-npu"
 ```
 
-目标机脚本先检查省略参数仍为 fixed，再用 append_only 验证非对齐小对象紧密存放、两 slot 内多于两个 Key、逐 Key 整份变长 Get、自动换槽、pin 期间追加、OOM 回滚、删除空洞不重用、整 slot 回收以及邻居 payload 完整性。每次 Get 均比较完整字节并检查输出 guard。只有退出 0 且末尾出现 `APPEND_ONLY_HARDWARE_PASS fixed_default=1 append_only=1` 才算硬件验收通过；`APPEND_ONLY_HARDWARE_FAIL`、超时或缺少末尾 PASS 均不通过。wrapper 默认超时 300 秒，可用 `KVAF_APPEND_TEST_TIMEOUT` 调整。未设置硬件运行开关而直接运行 Python 时返回 77，并输出 `APPEND_ONLY_SKIP`。
+目标机脚本先检查显式 fixed，再省略参数验证默认 append_only。覆盖非对齐小对象紧密存放、两 slot 内多于两个 Key、逐 Key 整份变长 Get、自动换槽、pin 期间追加、OOM 回滚、删除空洞不重用、整 slot 回收以及邻居 payload 完整性。每次 Get 均比较完整字节并检查输出 guard。退出 0 且末尾出现 `APPEND_ONLY_HARDWARE_PASS fixed_explicit=1 append_only_default=1` 表示通过。wrapper 默认超时 300 秒，可用 `KVAF_APPEND_TEST_TIMEOUT` 调整。未设置硬件运行开关而直接运行 Python 时返回 77，并输出 `APPEND_ONLY_SKIP`。
 
 2026-11-23 本地 Host 检查通过；两个新 C++ 测试通过 AddressSanitizer/UndefinedBehaviorSanitizer；52 项相关 Python 测试和 6 项构造参数兼容性测试通过。本机没有 CANN/NPU，尚未执行目标机编译与硬件验收，不据此提供带宽结论。
 
 ## 与 fixed 对比性能
 
-现有性能脚本新增 `--allocation-mode`，默认 fixed。配置、CSV/JSONL 和日志目录名均记录模式；输出默认仍为 KVAF 同级 `result`，按配置和时间命名。分别运行：
+现有性能脚本的 `--allocation-mode` 默认 append_only。配置、CSV/JSONL 和日志目录名均记录模式；输出默认仍为 KVAF 同级 `result`，按配置和时间命名。分别运行：
 
 ```bash
 KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \

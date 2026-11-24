@@ -217,6 +217,7 @@ def main(batch: int = 16, transport: str = "urma") -> int:
         jettys_per_core=jettys_per_core,
         batch_get_max_inflight_total=max_inflight_total,
         npu_eids=npu_eids,
+        allocation_mode="fixed",
     )
     remote_cpu_service = os.environ.get("KVAF_CPU_SERVICE_ADDR")
     if not remote_cpu_service:

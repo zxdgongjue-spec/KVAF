@@ -39,7 +39,7 @@ python3 tests/python/batch_get_ranges_perf.py --dry-run
 | `--tensor-bytes` | `1048576 33554432`，每个包内的逻辑 tensor 字节长度列表，可混合长度。 |
 | `--repeat` | 1，在同一包内重复上述列表；不是跨 stream 并发提交数。 |
 | `--pack-count` | 2，包数量，也是 Put 的 Key 数量。 |
-| `--allocation-mode` | fixed；可选 append_only。只切换 Key 的分配方式，保持同样的打包与 Get 请求。每 tensor 独立 Key 的例子见 [append_only 说明](README_append_only.md)。 |
+| `--allocation-mode` | append_only，另可选 fixed。只切换 Key 的分配方式，保持同样的打包与 Get 请求。每 tensor 独立 Key 的例子见 [append_only 说明](README_append_only.md)。 |
 | `--alignments` | 1，可传 `1 64 512` 扫描包内 tensor 起点及 output 起点的相对对齐；真实 length 不补齐。 |
 | `--read-chunk-bytes` | `0 65536 1048576 4194304`，逐个测试，0 表示取消软件分段。该参数不改变 Put。 |
 | `--cores`、`--jettys`、`--inflight` | 各接受整数列表，扫描笛卡尔积；默认分别是 2、2、2048。非零 inflight 必须不小于 2×core 数。Put 使用独立 transport，Jetty 数为 min(Get Jetty 数, 2)。 |
@@ -80,7 +80,7 @@ KVAF_CPU_SERVICE_ADDR=127.0.0.1:34555 DEVICE_ID=7 \
 dynamicIO/
 ├── KVAF/
 └── result/
-    └── ranges_d7_t1048576-33554432_r1_p2_c2_j2_k0-65536-1048576-n4_mfixed_20261121_183000_123456_配置摘要/
+    └── ranges_d7_t1048576-33554432_r1_p2_c2_j2_k0-65536-1048576-n4_mappend_only_20261121_183000_123456_配置摘要/
         ├── 同目录名.log
         ├── config.json
         ├── summary.csv
