@@ -76,6 +76,23 @@ BatchGet 路径，并把 core/Jetty worker 轮转分配到这些路径。BatchPu
 NPU packed input 和每条 block 的 CPU 整数 metadata；同步写入完成后才返回。未传
 BatchPut kernel 时，该方法保留 ACL D2H mock，便于只验证 BatchGet 的构建。
 
+RoCE 可选使用显式 HBM 注册句柄，避免每次 `batch_put/get` 调用都创建 MR：
+
+```python
+source_region = runtime.register_hbm(source_tensor)
+output_region = runtime.register_hbm(output_tensor)
+
+runtime.batch_put(keys, source_tensor, input_offsets, lengths,
+                  hbm_region=source_region)
+runtime.batch_get(device_table, indices, offsets, miss_count, output_indices,
+                  output_tensor, hbm_region=output_region)
+
+runtime.unregister_hbm(source_region)
+runtime.unregister_hbm(output_region)
+```
+
+`register_hbm()` 必须在 Runtime 初始化后调用，注册 Tensor 的完整 NPU `untyped_storage()`；该 storage 及其底层地址在注销前必须保持有效、稳定。每次传输仍只读写由 offsets/lengths 或 BatchGet 请求决定的范围。句柄只适用于创建它的 Runtime、NPU device 和 RoCE session。`unregister_hbm()` 会阻止新请求，并等待正在进行的 RoCE 访问完成后注销 MR。Runtime shutdown 会关闭剩余句柄。此 API 当前只支持 `transport="roce"`；不传 `hbm_region` 时保留原有自动注册/缓存路径。
+
 `AclGraph` 与 `NpuRuntime.batch_get` 可接收调用方持有的 `torch.npu.Stream`；后者省略
 stream 时使用 `torch.npu.current_stream()`。KVAF 不创建、不保存或销毁调用方的 stream；
 图 capture、replay 和生命周期仍由上层框架负责。同一 stream 上的后续 Torch/ACL 操作

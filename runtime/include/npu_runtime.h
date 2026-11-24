@@ -23,6 +23,9 @@ struct NpuRuntimeOptions {
 
   // Select once per Runtime; existing callers use URMA by default.
   Transport transport{Transport::kUrma};
+  std::string rdma_device;
+  std::uint8_t rdma_port{1};
+  int gid_index{-1};
   std::string batch_get_kernel_object_path;
   std::uint32_t batch_get_token_bytes;
   std::uint32_t batch_get_tokens_per_block;
@@ -69,6 +72,11 @@ class NpuRuntime final : public Runtime {
   NpuRuntime& operator=(const NpuRuntime&) = delete;
 
   Status Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size);
+  Status RegisterHbm(const ConstBufferView& buffer,
+                     const std::shared_ptr<void>& owner,
+                     ConstBufferView storage,
+                     std::shared_ptr<HbmRegion>* region);
+  Status UnregisterHbm(std::shared_ptr<HbmRegion>* region);
   RuntimeCore& core();
   const RuntimeCore& core() const;
 

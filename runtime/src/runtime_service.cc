@@ -42,6 +42,13 @@ RuntimeService::RuntimeService(RuntimeServiceOptions options) : options_(std::mo
 
 Status RuntimeService::Serve(Runtime& runtime) const {
   if (!runtime.initialized()) return Status::NotInitialized("RuntimeService requires an initialized Runtime");
+  return ServeConnections([&runtime](int connection) {
+    (void)runtime.ServeConnection(connection);
+    close(connection);
+  });
+}
+
+Status RuntimeService::ServeConnections(const std::function<void(int)>& handler) const {
   const int listener = Listen(options_);
   if (listener < 0) {
     return Status::Internal("cannot listen on " + options_.address + ":" +
@@ -55,8 +62,7 @@ Status RuntimeService::Serve(Runtime& runtime) const {
       close(listener);
       return Status::Internal("accept failed: " + std::string(std::strerror(errno)));
     }
-    (void)runtime.ServeConnection(connection);
-    close(connection);
+    handler(connection);
   }
 }
 

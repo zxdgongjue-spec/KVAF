@@ -13,12 +13,16 @@ using namespace kvaf;
 struct Operator final : AccessOperator {
   bool fail_initialize{false}, fail_shutdown{false};
   int shutdown_calls{0};
+  bool fail_table_wait{false};
   Status Initialize(const RemoteRegionDesc&) override {
     return fail_initialize ? Status::Internal("initialize failed") : Status::OK();
   }
   Status Shutdown() override {
     ++shutdown_calls;
     return fail_shutdown ? Status::Internal("drain failed") : Status::OK();
+  }
+  Status WaitForAccessTable(AccessTableHandle) override {
+    return fail_table_wait ? Status::Internal("table still in use") : Status::OK();
   }
   Status ExecuteBatchGet(const BatchGetExecRequest&) override { return Status::OK(); }
   Status ExecuteBatchPut(const BatchPutExecRequest&) override { return Status::OK(); }
@@ -69,6 +73,28 @@ void CheckDrainFailurePreservesTable() {
   CHECK(!runtime.needs_cleanup() && !allocator.allocated);
 }
 
+void CheckAccessTableReleaseWaitsBeforeUnlocking() {
+  auto meta = CreateInMemoryMetaManager();
+  Operator op;
+  Allocator allocator;
+  RuntimeCore runtime(*meta, op, allocator);
+  CHECK(runtime.Initialize({128, 64, DeviceKind::kCpu}).ok());
+  PutContext put;
+  PutAccessDesc desc;
+  CHECK(meta->PreparePut({0}, {64}, &put, &desc).ok());
+  CHECK(meta->CommitPut(put).ok());
+  AccessTableHandle table;
+  CHECK(runtime.PrepareAccessTable({{0}}, &table).ok());
+
+  op.fail_table_wait = true;
+  CHECK(!runtime.ReleaseAccessTable(table).ok());
+  CHECK(!meta->BatchFree({0}).ok());
+  op.fail_table_wait = false;
+  CHECK(runtime.ReleaseAccessTable(table).ok());
+  CHECK(meta->BatchFree({0}).ok());
+  CHECK(runtime.Shutdown().ok());
+}
+
 void CheckReleaseRetry() {
   auto meta = CreateInMemoryMetaManager();
   Operator op;
@@ -109,6 +135,7 @@ void CheckPartialInitializationRetry() {
 
 int main() {
   CheckDrainFailurePreservesTable();
+  CheckAccessTableReleaseWaitsBeforeUnlocking();
   CheckReleaseRetry();
   CheckPartialInitializationRetry();
   std::cout << "Runtime cleanup ordering and retry tests passed\n";

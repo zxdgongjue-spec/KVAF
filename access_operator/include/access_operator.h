@@ -27,7 +27,7 @@ struct BatchPutExecRequest {
 };
 
 // KV Access Operator 是 Runtime 的数据面依赖。Runtime 管理远端 DDR
-// 生命周期和 Meta 可见性；Operator 只负责初始化链路并执行同步搬运。
+// 生命周期和 Meta 可见性；Operator 负责链路、搬运和异步任务的完成。
 class AccessOperator {
  public:
   virtual ~AccessOperator() = default;
@@ -36,6 +36,8 @@ class AccessOperator {
   virtual Status Shutdown() = 0;
 
   virtual Status ExecuteBatchGet(const BatchGetExecRequest& request) = 0;
+  // Called before Runtime unlocks slots referenced by this handle.
+  virtual Status WaitForAccessTable(AccessTableHandle) { return Status::OK(); }
   virtual Status ExecuteBatchPut(const BatchPutExecRequest& request) = 0;
 
   virtual Status ExecuteBatchGetRanges(const BatchGetRangesExecRequest&) {
@@ -43,6 +45,20 @@ class AccessOperator {
   }
   virtual Status CheckBatchGetRangesStatus(void*) {
     return Status::NotImplemented("range Get status is not implemented by this backend");
+  }
+  virtual Status RegisterHbm(const ConstBufferView& buffer,
+                             const std::shared_ptr<void>& owner,
+                             ConstBufferView storage,
+                             std::shared_ptr<HbmRegion>* region) {
+    (void)buffer;
+    (void)owner;
+    (void)storage;
+    (void)region;
+    return Status::NotImplemented("explicit HBM registration is not supported by this operator");
+  }
+  virtual Status UnregisterHbm(std::shared_ptr<HbmRegion>* region) {
+    (void)region;
+    return Status::NotImplemented("explicit HBM registration is not supported by this operator");
   }
 
 };
