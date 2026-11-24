@@ -74,7 +74,16 @@ cd /path/to/kvaf
 CPU Gather 默认线程总预算为 10，等待模式为 `active`；可用 `--gather-threads N` 和
 `--gather-mode adaptive|active|passive` 显式覆盖。
 
-URMA DDR 区域支持 `default`、`thp`、`hugetlb-2m` 和 `hugetlb-1g`，默认使用 `thp`。
+URMA DDR 区域支持 `default`、`thp` 和 `hugetlb-<size>`，默认使用 `thp`。
+`<size>` 使用 `k/m/g/t/p/e` 二进制单位，换算成字节后必须是 2 的幂。
+例如 `hugetlb-64k`、`hugetlb-2m`、`hugetlb-16m`、`hugetlb-32m`、`hugetlb-512m`、
+`hugetlb-1g` 和 `hugetlb-16g`。在 CPU 侧宿主机查看内核支持的实际页大小，例如
+`hugepages-32768kB` 对应 `hugetlb-32m`。
+
+```bash
+ls /sys/kernel/mm/hugepages
+ls /sys/devices/system/node/node3/hugepages
+```
 
 ```bash
 # 默认模式：2 MiB 对齐，MADV_HUGEPAGE，并在注册前主动触页；
@@ -86,15 +95,17 @@ URMA DDR 区域支持 `default`、`thp`、`hugetlb-2m` 和 `hugetlb-1g`，默认
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode default
 
-# 显式使用 2 MiB 或 1 GiB HugeTLB 页。
+# 显式使用 2 MiB、32 MiB 或 1 GiB HugeTLB 页，按宿主机页池选择。
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-2m
+./build-cpu/runtime/kvaf_cpu_service \
+  --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-32m
 ./build-cpu/runtime/kvaf_cpu_service \
   --listen 0.0.0.0 --port 28999 --memory-page-mode hugetlb-1g
 ```
 
 显式 HugeTLB 模式需要在目标 NUMA 节点预留对应大小的页。实际映射按页大小向上取整，
-客户端可用容量和 URMA 注册长度仍为请求长度。页池不足时申请失败。
+客户端可用容量和 URMA 注册长度仍为请求长度。内核不支持所选页大小或页池不足时，DDR 申请会返回错误。
 `DDR_ALLOCATED` 日志记录 `page_mode` 和 `backing_bytes`。`urma+ubmem` 混合模式的共享 DDR 由 UBmem 分配器提供。
 
 需要固定 NUMA 位置时，应在 UB device 所在 node 启动服务，例如

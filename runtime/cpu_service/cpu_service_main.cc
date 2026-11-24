@@ -13,10 +13,13 @@ void PrintUsage(const char* program) {
   std::fprintf(stderr,
                "Usage: %s [--listen ADDRESS] [--port PORT] [--ub-device NAME] [--eid-index N] "
                "[--gather-threads N] [--gather-mode adaptive|active|passive] "
-               "[--memory-page-mode default|thp|hugetlb-2m|hugetlb-1g] [--hal-library PATH]\n"
+               "[--memory-page-mode default|thp|hugetlb-<size>] [--hal-library PATH]\n"
                "Default listener is 127.0.0.1:28999. Without --ub-device/--eid-index, all UB EID "
-               "candidates in the service CPU affinity scope are discovered automatically. Gather threads default to 10, "
-               "mode to active; URMA memory page mode defaults to thp. "
+               "candidates in the service CPU affinity scope are discovered automatically. "
+               "Gather threads default to 10, "
+               "mode to active; URMA memory page mode defaults to thp.\n"
+               "HugeTLB sizes use binary units (k/m/g/t/p/e), e.g. hugetlb-2m, hugetlb-32m, hugetlb-1g. "
+               "See /sys/kernel/mm/hugepages for sizes supported by the kernel.\n"
                "Allocation requests select URMA or UBmem; backend resources are initialized on demand.\n",
                program);
 }
@@ -29,27 +32,6 @@ bool ParseUnsigned(const char* text, std::uint32_t maximum, std::uint32_t* value
   if (errno != 0 || end == text || *end != '\0' || parsed > maximum) return false;
   *value = static_cast<std::uint32_t>(parsed);
   return true;
-}
-
-bool ParseMemoryPageMode(const std::string& text, kvaf::CpuMemoryPageMode* mode) {
-  if (mode == nullptr) return false;
-  if (text == "default") {
-    *mode = kvaf::CpuMemoryPageMode::kDefault;
-    return true;
-  }
-  if (text == "thp") {
-    *mode = kvaf::CpuMemoryPageMode::kTransparentHugePage;
-    return true;
-  }
-  if (text == "hugetlb-2m") {
-    *mode = kvaf::CpuMemoryPageMode::kHugeTlb2M;
-    return true;
-  }
-  if (text == "hugetlb-1g") {
-    *mode = kvaf::CpuMemoryPageMode::kHugeTlb1G;
-    return true;
-  }
-  return false;
 }
 
 }  // namespace
@@ -109,9 +91,10 @@ int main(int argc, char** argv) {
     } else if (argument == "--hal-library") {
       cpu_options.hal_library = argv[++index];
     } else if (argument == "--memory-page-mode") {
-      if (!ParseMemoryPageMode(argv[++index], &cpu_options.memory_page_mode)) {
-        std::fprintf(stderr,
-                     "invalid --memory-page-mode (expected default|thp|hugetlb-2m|hugetlb-1g)\n");
+      const char* value = argv[++index];
+      if (!kvaf::ParseCpuMemoryPageMode(value, cpu_options.memory_page_mode)) {
+        std::fprintf(stderr, "invalid --memory-page-mode '%s' (expected default, thp, or an encodable "
+                             "power-of-two size such as hugetlb-32m)\n", value);
         return 2;
       }
     } else {
