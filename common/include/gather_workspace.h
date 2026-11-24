@@ -7,6 +7,11 @@ namespace kvaf {
 inline constexpr std::uint32_t kGatherMaxRequests = kDefaultGetWindow;
 inline constexpr std::uint32_t kGatherMaxWorkers = 8U;
 inline constexpr std::uint32_t kGatherChunkBytes = 131072U;
+inline constexpr std::uint32_t kGatherMaxReadWaveWrs = 4096U;
+inline constexpr std::uint32_t kGatherDefaultReadWaveWrs = kGatherMaxReadWaveWrs;
+inline constexpr bool ValidGatherReadWaveWrs(std::uint32_t wrs) {
+  return wrs != 0U && wrs <= kGatherMaxReadWaveWrs;
+}
 inline constexpr std::uint32_t GatherLaneCapacity(
     std::uint32_t workers, std::uint32_t capacity = kDefaultGetWindow) {
   return capacity / workers + (capacity % workers != 0U);

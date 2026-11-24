@@ -3,7 +3,7 @@
 namespace kvaf::aicpu_urma {
 int32_t LaunchBatchGet(const UmdkBatchGetArgs* args, aclrtStream stream) {
   if (!args) return -1;
-  return LaunchUmdkKernel("KvafAicpuGatherReadExecutionV4", args, sizeof(*args), stream,
+  return LaunchUmdkKernel("KvafAicpuGatherReadExecutionV5", args, sizeof(*args), stream,
                           args->gather.worker_count);
 }
 }  // namespace kvaf::aicpu_urma

@@ -1,7 +1,7 @@
 #include "get/gather/urma_aicpu/kernel/gather_read.h"
 #include "get/scatter/urma_aicpu/kernel/cpu_push_scatter.h"
-// V4 separates launch/window sequences and consumes dynamic workspace capacity.
-extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuGatherReadExecutionV4(
+// Gather V5 carries the per-worker READ wave limit; Scatter retains its V4 ABI.
+extern "C" __attribute__((visibility("default"))) std::uint32_t KvafAicpuGatherReadExecutionV5(
     kvaf::aicpu_urma::UmdkBatchGetArgs* args) {
   return kvaf::aicpu_urma::ExecuteGatherRead(args);
 }

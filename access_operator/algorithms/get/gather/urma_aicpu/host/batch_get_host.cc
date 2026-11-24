@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 
 #include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
@@ -18,12 +19,15 @@ using kvaf::detail::PointerValue;
 
 }  // namespace
 struct BatchGetTransport::Impl {
-  Impl(UmdkSession& shared, std::uint32_t token, bool direct, std::uint64_t budget)
-      : session(shared), token_bytes(token), direct_addresses(direct), ddr_bytes(budget) {}
+  Impl(UmdkSession& shared, std::uint32_t token, bool direct, std::uint64_t budget,
+       std::uint32_t wave_wrs)
+      : session(shared), token_bytes(token), direct_addresses(direct), ddr_bytes(budget),
+        read_wave_wrs(wave_wrs) {}
   UmdkSession& session;
   std::uint32_t token_bytes;
   bool direct_addresses;
   std::uint64_t ddr_bytes;
+  std::uint32_t read_wave_wrs;
   std::uint32_t window_capacity{};
   RemoteRegionDesc region;
   RemoteRegionDesc remote_workspace;
@@ -89,8 +93,9 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
 }
 
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
-                                     bool direct_addresses, std::uint64_t ddr_bytes)
-    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses, ddr_bytes)) {}
+                                     bool direct_addresses, std::uint64_t ddr_bytes,
+                                     std::uint32_t read_wave_wrs)
+    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses, ddr_bytes, read_wave_wrs)) {}
 BatchGetTransport::~BatchGetTransport() = default;
 std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
   return std::make_unique<Impl::Invocation>(impl_.get());
@@ -108,7 +113,8 @@ GatherLaunchView BatchGetTransport::View() const {
   const auto* profile = call.graph_profile.get();
   return {impl_->views.View(ExecutionDirection::Get),
       {impl_->session.session(), impl_->session.owner_pid()},
-      {impl_->session.config().workers, impl_->token_bytes, impl_->window_capacity}, impl_->direct_addresses,
+      {impl_->session.config().workers, impl_->token_bytes, impl_->window_capacity,
+       impl_->read_wave_wrs}, impl_->direct_addresses,
       impl_->remote_workspace, impl_->workspace,
       {status ? status->device : impl_->execution.status,
        status ? status->host : impl_->status_host, impl_->execution.status_bytes},
@@ -251,6 +257,8 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
 }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
+  if (!ValidGatherReadWaveWrs(impl_->read_wave_wrs))
+    return InvalidArgument("gather_read_wave_wrs must be in [1, 4096]");
   const auto workers = impl_->session.config().workers;
   if (!impl_->session.config().peer_link || !impl_->token_bytes || !workers ||
       workers > kGatherMaxWorkers)
@@ -263,6 +271,8 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (!workspace.base || (workspace.base & 63U) || workspace.length != workspace_bytes ||
       workspace.base > UINT64_MAX - workspace.length)
     return InvalidArgument("Gather received an invalid remote workspace");
+  std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=%u window_capacity=%u\n",
+      workers, impl_->read_wave_wrs, impl_->window_capacity);
   impl_->region = region;
   impl_->remote_workspace = {workspace.base, workspace.length, 0, DeviceKind::kCpu};
   auto& state = impl_->execution;
@@ -432,6 +442,7 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.remote_command = args.remote_notify + 16U;
   args.worker_count = view.options.workers;
   args.window_capacity = view.options.window_capacity;
+  args.read_wave_wrs = view.options.read_wave_wrs;
   args.profile = (profile || view.profiling) ? PointerValue(view.profile.device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = stream;

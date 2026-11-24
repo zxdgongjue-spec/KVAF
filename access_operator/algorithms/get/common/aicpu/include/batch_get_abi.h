@@ -53,6 +53,7 @@ struct GatherReadArgs {
   std::uint32_t window_capacity{kDefaultGetWindow};
   std::uint64_t profile{0U};
   std::uint64_t execution_control{0U};
+  std::uint32_t read_wave_wrs{kGatherDefaultReadWaveWrs};
 };
 // One stable registered HBM workspace, independent of caller output allocations.
 constexpr std::uint64_t kGatherDescriptorOffset = kGatherMaxWorkers * 64U;
@@ -61,6 +62,7 @@ inline constexpr std::uint64_t GatherWorkspaceBytes(
   return kGatherDescriptorOffset + workers * GatherLaneDescriptorBytes(workers, capacity);
 }
 static_assert(sizeof(GatherReadArgs) <= 256U);
+static_assert(sizeof(GatherReadArgs) == 160U, "Gather V5 argument ABI changed");
 struct AicpuBatchGetInput {
   // GatherRead with indices == 0 reads address_table[i] as a complete source
   // address; offsets is unused. Other callers use address_table[indices[i]] + offsets[i].

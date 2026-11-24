@@ -96,6 +96,9 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--gather-ddr-bytes", type=int,
                        default=environment_int("KVAF_BATCH_GET_GATHER_DDR_BYTES", 0),
                        help="Gather extra CPU DDR budget including metadata; 0 keeps the 65536-row layout")
+    group.add_argument("--gather-read-wave-wrs", type=int,
+                       default=environment_int("KVAF_BATCH_GET_GATHER_READ_WAVE_WRS", None),
+                       help="Gather data READ WR limit per worker/wave (1..4096, default: 4096)")
     group.add_argument("--scatter-hbm-bytes", type=int,
                        default=environment_int("KVAF_BATCH_GET_SCATTER_HBM_BYTES", 0),
                        help="Scatter contiguous HBM budget including metadata; 0 keeps the 65536-row layout")
@@ -115,6 +118,8 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
     if args.transport is not None and args.transport != expected:
         parser.error("--backend conflicts with --transport")
     args.transport = expected
+    if args.backend == "gather_read" and args.gather_read_wave_wrs is None:
+        args.gather_read_wave_wrs = 4096
     field = parallelism_field(args.backend)
     other = "aiv_cores" if uses_aicpu(args) else "aicpu_workers"
     legacy = getattr(args, other)
@@ -182,6 +187,12 @@ def validate_workload(args):
             return f"{name.replace('_', '-')} must fit uint64"
         if value and args.backend != backend:
             return f"{name.replace('_', '-')} requires --backend {backend}"
+    wave_wrs = getattr(args, "gather_read_wave_wrs", None)
+    if wave_wrs is not None:
+        if not 1 <= wave_wrs <= 4096:
+            return "gather-read-wave-wrs must be in [1, 4096]"
+        if args.backend != "gather_read":
+            return "gather-read-wave-wrs requires --backend gather_read"
     if args.transport == "ubmem" and args.peer_ub_device:
         return "peer-ub-device applies only to URMA"
     if args.jettys_per_core is not None and not 1 <= args.jettys_per_core <= MAX_JETTYS_PER_CORE:
@@ -223,6 +234,8 @@ def workload_command(args):
     for name in ("gather_ddr_bytes", "scatter_hbm_bytes"):
         if getattr(args, name, 0):
             command += ["--" + name.replace("_", "-"), str(getattr(args, name))]
+    if getattr(args, "gather_read_wave_wrs", None) is not None:
+        command += ["--gather-read-wave-wrs", str(args.gather_read_wave_wrs)]
     return command
 
 
@@ -241,7 +254,7 @@ def configure_backend_help(parser, argv=None):
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
     if backend != "gather_read":
-        hidden.add("gather_ddr_bytes")
+        hidden.update(("gather_ddr_bytes", "gather_read_wave_wrs"))
     if backend != "cpu_push_scatter":
         hidden.add("scatter_hbm_bytes")
     if backend == "ubmem":

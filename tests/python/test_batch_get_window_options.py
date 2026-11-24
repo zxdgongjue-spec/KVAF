@@ -1,10 +1,16 @@
 """All Get paths accept large batches; workspace windows and Put remain bounded."""
 import argparse
+import csv
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from utils.get_options import add_backend_arguments, add_workload_arguments, resolve_backend, validate_workload, workload_command
 from utils.perf_execution import BenchmarkExecution
+from utils.batch_get_csv import BatchGetCsv
 
 
 def workload(backend, count):
@@ -18,6 +24,48 @@ def workload(backend, count):
 
 
 class WindowOptions(unittest.TestCase):
+    def test_gather_read_wave_limits_forwarding_and_csv(self):
+        kvaf = SimpleNamespace(PutExecutionConfig=lambda *a: a, GetExecutionConfig=lambda *a: a,
+                               ExecutionResources=lambda **kw: kw)
+        self.assertEqual(workload("gather_read", 1000000).gather_read_wave_wrs, 4096)
+        for limit in (1, 31, 32, 64, 96, 128, 256, 512, 4096):
+            args = workload("gather_read", 1000000)
+            args.gather_read_wave_wrs = limit
+            self.assertIsNone(validate_workload(args))
+            parser = argparse.ArgumentParser()
+            add_backend_arguments(parser)
+            add_workload_arguments(parser)
+            child = parser.parse_args(workload_command(args))
+            resolve_backend(child, parser)
+            self.assertEqual(child.gather_read_wave_wrs, limit)
+            run = BenchmarkExecution(kvaf, executor="aicpu", algorithm="gather", gather_read_wave_wrs=limit)
+            self.assertEqual(run.runtime_kwargs["get_resources"][0][1]["gather_read_wave_wrs"], limit)
+            self.assertNotIn("gather_read_wave_wrs", run.runtime_kwargs["put_resources"][0][1])
+        for limit in (-1, 0, 4097, 1 << 32):
+            args.gather_read_wave_wrs = limit
+            self.assertIsNotNone(validate_workload(args))
+            with self.assertRaisesRegex(ValueError, "gather_read_wave_wrs"):
+                BenchmarkExecution(kvaf, executor="aicpu", algorithm="gather", gather_read_wave_wrs=limit)
+        for backend in ("aiv", "ubmem", "cpu_push_scatter"):
+            args = workload(backend, 8192)
+            self.assertNotIn("--gather-read-wave-wrs", workload_command(args))
+            args.gather_read_wave_wrs = 64
+            self.assertIsNotNone(validate_workload(args))
+        with self.assertRaisesRegex(ValueError, "requires AICPU Gather"):
+            BenchmarkExecution(kvaf, gather_read_wave_wrs=64)
+        with patch.dict(os.environ, {"KVAF_BATCH_GET_GATHER_READ_WAVE_WRS": "96"}):
+            self.assertEqual(workload("gather_read", 1000000).gather_read_wave_wrs, 96)
+        with tempfile.TemporaryDirectory() as directory:
+            args = workload("gather_read", 1000000)
+            args.output_dir = Path(directory)
+            args.kernel_profile = False
+            args.gather_read_wave_wrs = 64
+            report = BatchGetCsv(args)
+            report.add_summary("graph", {})
+            report.write()
+            with report.summary_path.open(newline="") as output:
+                self.assertEqual(next(csv.DictReader(output))["gather_read_wave_wrs"], "64")
+
     def test_large_direct_get(self):
         for backend in ("aiv", "ubmem"):
             for count in (65537, 130815, 1000000, (1 << 31) - 1):

@@ -195,7 +195,11 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    return detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
+    auto resources = detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
+    if (get && transport == Transport::Urma && executor == Executor::Aicpu &&
+        algorithm == GetAlgorithm::Gather && !resources.gather_read_wave_wrs)
+      resources.gather_read_wave_wrs = kGatherDefaultReadWaveWrs;
+    return resources;
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {
@@ -223,7 +227,12 @@ struct NpuRuntime::Impl {
       if (r.scatter_hbm_bytes && (!get || t != Transport::Urma || e != Executor::Aicpu ||
                                    algorithm != GetAlgorithm::Scatter))
         throw std::invalid_argument("scatter_hbm_bytes requires AICPU Scatter Get");
+      if (r.gather_read_wave_wrs && (!get || t != Transport::Urma || e != Executor::Aicpu ||
+                                      algorithm != GetAlgorithm::Gather))
+        throw std::invalid_argument("gather_read_wave_wrs requires AICPU Gather Get");
     }
+    if (budget.gather_read_wave_wrs && !ValidGatherReadWaveWrs(*budget.gather_read_wave_wrs))
+      throw std::invalid_argument("gather_read_wave_wrs must be in [1, 4096]");
     if (!budget.cores || budget.cores > (e == Executor::Aicpu ? 8U : 48U) ||
         !budget.request_capacity ||
         (budget.request_capacity > 65536U &&
@@ -374,7 +383,8 @@ struct NpuRuntime::Impl {
     return std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        eids.front(), get, budget.gather_ddr_bytes, budget.scatter_hbm_bytes});
+        eids.front(), get, budget.gather_ddr_bytes, budget.scatter_hbm_bytes,
+        budget.gather_read_wave_wrs.value_or(kGatherDefaultReadWaveWrs)});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif

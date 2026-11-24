@@ -1,5 +1,6 @@
 #pragma once
 #include "access_operator.h"
+#include "gather_workspace.h"
 #include <array>
 namespace kvaf {
 struct UmdkAccessOperatorConfig {
@@ -11,6 +12,7 @@ struct UmdkAccessOperatorConfig {
   std::array<std::uint8_t, 16> local_eid{};
   bool enable_get{true};
   std::uint64_t gather_ddr_bytes{0}, scatter_hbm_bytes{0};
+  std::uint32_t gather_read_wave_wrs{kGatherDefaultReadWaveWrs};
 };
 // Runtime adapter with independent UMDK Put/Get sessions;
 // cpu_push_scatter owns an independent Host-side direct HCCP target.

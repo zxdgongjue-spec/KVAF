@@ -59,6 +59,9 @@ struct ExecutionResources {
   // Zero preserves the legacy 65536-row workspace. The chosen global window
   // is the largest multiple of 4096 fitting the selected memory budget.
   std::uint64_t gather_ddr_bytes{0}, scatter_hbm_bytes{0};
+  // URMA AICPU Gather only: maximum unretired data READ WRs per worker/wave.
+  // An absent value preserves 4096; explicit values must be in [1, 4096].
+  std::optional<std::uint32_t> gather_read_wave_wrs;
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

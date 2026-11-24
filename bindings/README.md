@@ -73,6 +73,9 @@ Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_
 Gather 可设置 `gather_ddr_bytes`，Scatter 可设置 `scatter_hbm_bytes`；均为字节预算，包含
 对应工作区的元数据和控制区，自动选择预算内最大的 4096 倍数窗口。默认 0 保留现有
 65536 条布局的内存占用，所有窗口在一次 kernel launch 内处理。见 [AICPU 窗口配置](../docs/aicpu_get_windows.md)。
+Gather 还可设置 `gather_read_wave_wrs=64`，限制每 worker 每波的数据 READ WR 数；支持
+1..4096，默认 `None` 使用 4096。该参数独立于内存预算，改变后需重建执行资源和捕获图。
+这些字段均配置在 NPU 侧 `ExecutionResources`，由 `NpuRuntime(get_resources=...)` 接收。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
 `bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
 `./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，

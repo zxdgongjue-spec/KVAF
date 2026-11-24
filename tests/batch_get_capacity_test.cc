@@ -1,5 +1,6 @@
 #include "cache_region_service.h"
 #include "session_access_operator.h"
+#include "npu_runtime_config.h"
 #include <array>
 #include <cstdlib>
 #include <iostream>
@@ -22,6 +23,12 @@ struct Session final : execution::Session {
 };
 
 int main() {
+  ExecutionResources configured;
+  CHECK(!configured.gather_read_wave_wrs);
+  configured.gather_read_wave_wrs = 64;
+  const auto resources = detail::ResolveExecutionResources(Transport::Urma, Executor::Aicpu,
+                                                           true, true, &configured);
+  CHECK(resources.gather_read_wave_wrs && *resources.gather_read_wave_wrs == 64);
   std::array<uint8_t, 64> memory{};
   execution::CacheRegionService service(execution::kUrma | execution::kFabric,
       [&](const execution::Request& q, std::unique_ptr<execution::Allocation>* out) {

@@ -171,7 +171,7 @@ def write_summary(directory, isolated, concurrent, config=None):
     metadata = {key: config[key] for key in (
         "backend", "transport", "execution_mode", "aiv_cores", "aicpu_workers", "requests", "request_length", "miss_count", "token_bytes", "table_capacity", "tokens_per_block",
         "seconds", "graphs", "graph_calls", "graph_api", "graph_replays", "warmup", "seed", "source_access_pattern", "output_access_pattern", "sort_input_indices", "peer", "ddr_bytes_per_device", "peak_concurrent_ddr_bytes",
-        "jettys_per_core", "max_inflight_total", "gather_ddr_bytes", "scatter_hbm_bytes",
+        "jettys_per_core", "max_inflight_total", "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs",
     ) if key in config}
     metadata["run"] = directory.name
     metadata["device_order"] = " ".join(str(r["device"]) for r in isolated)

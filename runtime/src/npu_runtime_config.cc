@@ -36,6 +36,7 @@ ExecutionResources ResolveExecutionResources(Transport transport, Executor execu
     resources.request_capacity = configured->request_capacity;
     resources.gather_ddr_bytes = configured->gather_ddr_bytes;
     resources.scatter_hbm_bytes = configured->scatter_hbm_bytes;
+    resources.gather_read_wave_wrs = configured->gather_read_wave_wrs;
     if (!configured->kernel_path.empty()) resources.kernel_path = configured->kernel_path;
   }
   return resources;

@@ -18,8 +18,6 @@ void EnsureSlots(std::vector<T>& slots, std::size_t count) {
   if (count > slots.size()) slots.resize(count);
 }
 
-constexpr std::uint32_t kGatherWaveWrs = 4096U;
-
 void BeginGatherWave(RequestBuffer& queue, std::uint32_t sgl_size, std::uint32_t wave_wrs) {
   EnsureSlots(queue.wrs, wave_wrs);
   EnsureSlots(queue.local_sges, queue.wrs.size() * sgl_size);
@@ -57,7 +55,8 @@ struct GatherBuildLayout {
 
 void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_t& span_index,
                     std::uint32_t last, std::uint32_t& span_offset, std::uint64_t& source_offset,
-                    std::uint32_t batch_wrs, std::uint32_t& local_index) {
+                    std::uint32_t batch_wrs, std::uint32_t wave_wrs,
+                    std::uint32_t& local_index) {
   auto& queue = worker.requests;
   auto index = span_index;
   auto offset = span_offset;
@@ -67,7 +66,6 @@ void BuildReadBatch(Queue& worker, const GatherBuildLayout& layout, std::uint32_
   auto* requests = queue.wrs.data();
   auto sequence = worker.sequence;
   auto wr_count = queue.wr_count;
-  const auto wave_wrs = static_cast<std::uint32_t>(queue.wrs.size());
   const auto wr_limit = wr_count + std::min(batch_wrs, wave_wrs - wr_count);
   while (index < last && wr_count < wr_limit) {
     const auto wr_index = wr_count++;
@@ -183,7 +181,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
   // A WR ends at the SGL limit, the 64 KiB limit, or the end of this request.
   const auto max_wrs = (static_cast<std::uint64_t>(args.bytes) + 65535U) / 65536U +
                        (args.source_span_count + layout.sgl_size - 1U) / layout.sgl_size;
-  const auto wave_wrs = static_cast<std::uint32_t>(std::min<std::uint64_t>(kGatherWaveWrs, max_wrs));
+  const auto wave_wrs = static_cast<std::uint32_t>(std::min<std::uint64_t>(args.read_wave_wrs, max_wrs));
   std::uint32_t span_offset = 0;
   std::uint64_t remote_offset = 0;
   while (first < last) {
@@ -199,7 +197,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
       {
         BatchGetProfileScope timer(profile ? &profile->wr_build_ns : nullptr);
         BuildReadBatch(worker, layout, first, last, span_offset, remote_offset,
-                          args.sq_batch_wqes, local_index);
+                          args.sq_batch_wqes, wave_wrs, local_index);
       }
       auto* tail = &queue.wrs[queue.wr_count - 1U];
       bool ready = true;
@@ -220,7 +218,7 @@ bool ReadBatches(Queue& worker, const AicpuBatchGetInput& request,
         profile->read_wqes += queue.wr_count - batch_first;
         ++profile->post_calls;
       }
-    } while (first < last && queue.wr_count < queue.wrs.size());
+    } while (first < last && queue.wr_count < wave_wrs);
     // Retain every WR/SGL slot until the final ordered CQE for this wave.
     {
       BatchGetProfileScope timer(profile ? &profile->cq_wait_ns : nullptr);
@@ -341,7 +339,7 @@ bool StartGather(GatherReadArgs& args, GatherReadStatus& status, BatchGetWorkerP
 std::uint32_t ExecuteGatherRead(UmdkBatchGetArgs* launch) {
   if (!launch || !launch->request.miss_count || !launch->gather.core_status || !launch->gather.scratch ||
       !launch->gather.execution_control ||
-      !launch->gather.worker_count ||
+      !launch->gather.worker_count || !ValidGatherReadWaveWrs(launch->gather.read_wave_wrs) ||
       !ValidGatherWindow(launch->request.token_bytes, launch->gather.worker_count,
                          launch->gather.window_capacity))
     return 1U;

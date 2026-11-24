@@ -4,6 +4,7 @@
 #include <acl/acl.h>
 #include "access_operator.h"
 #include "execution_view.h"
+#include "gather_workspace.h"
 #include "aicpu_urma/control_abi.h"
 #include "aicpu_urma/session.h"
 
@@ -25,7 +26,10 @@ struct PutLaunchView {
 };
 
 // Shared execution-only pieces. No MR, context, session owner or setup API.
-struct AicpuKernelOptions { std::uint32_t workers{}, token_bytes{}, window_capacity{}; };
+struct AicpuKernelOptions {
+  std::uint32_t workers{}, token_bytes{}, window_capacity{};
+  std::uint32_t read_wave_wrs{kGatherDefaultReadWaveWrs};
+};
 struct AicpuBufferView { void* device{}; void* host{}; std::size_t bytes{}; };
 struct AicpuGetInvocation final : ExecutionState {
   explicit AicpuGetInvocation(const void* value) : owner(value) {}

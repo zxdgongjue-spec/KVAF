@@ -10,7 +10,7 @@ SUMMARY_FIELDS = (
     "backend", "transport", "execution",
     "request_length", "table_capacity", "miss_count", "token_bytes", "tokens_per_block",
     "payload_bytes_per_call", "aiv_cores", "aicpu_workers", "jettys_per_core", "max_inflight_total",
-    "gather_ddr_bytes", "scatter_hbm_bytes",
+    "gather_ddr_bytes", "scatter_hbm_bytes", "gather_read_wave_wrs",
     *(f"{scope}_{metric}" for scope in ("e2e", "kernel") for metric in METRICS),
 )
 PROFILE_FIELDS = ("backend", "execution", "miss_count", "kind", "name", "metric", "value")
@@ -45,6 +45,7 @@ class BatchGetCsv:
             max_inflight_total=args.max_inflight_total if args.backend == "aiv" else None,
             gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0),
             scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
+            gather_read_wave_wrs=getattr(args, "gather_read_wave_wrs", None),
         )
 
     def add_summary(self, execution, measurements):

@@ -11,7 +11,8 @@ gather = kvaf.GetExecutionConfig("urma", "aicpu", "gather")
 scatter = kvaf.GetExecutionConfig("urma", "aicpu", "scatter")
 
 get_resources = [
-    (gather, kvaf.ExecutionResources(cores=5, gather_ddr_bytes=64 * 1024**2)),
+    (gather, kvaf.ExecutionResources(cores=5, gather_ddr_bytes=64 * 1024**2,
+                                   gather_read_wave_wrs=64)),
     (scatter, kvaf.ExecutionResources(cores=5, scatter_hbm_bytes=64 * 1024**2)),
 ]
 # 传给 NpuRuntime(get_resources=get_resources, ...)，其他初始化参数沿用现有配置。
@@ -32,6 +33,32 @@ HBM 预算约束的是传给 ACL 的申请字节数，不是驱动内部保留�
 默认 5 workers、656 字节/token 时，Gather 默认逻辑 DDR 工作区为 44043648 字节，
 Scatter 默认连续 HBM 工作区为 43516416 字节；默认窗口仍是 65536 条。
 资源初始化日志 `GATHER_WINDOW` / `SCATTER_WINDOW` 输出有效窗口、预算与申请大小。
+
+`gather_read_wave_wrs` 控制每个 worker 每个 READ 波次最多提交多少个数据 WR，范围为
+1..4096。`ExecutionResources` 未设置（`None`）时沿用 4096，仅 URMA AICPU Gather Get
+接受该参数。它独立于 DDR 内存窗口、每次 post 的 32 WR 和 CPU 的 128 KiB ready 块。
+每波末尾 CQE 确认后才复用该波 WR/SGE；硬件可能已经提前完成部分 WR。
+例如 5 workers、每 WR 合并 6 条 token 时，64 WR 对应全局最多 320 个未确认数据 READ WR，
+即最多 1920 条逻辑请求。工作区容量和总请求数不因该参数改变。
+
+预算和 WR 上限都在 NPU 客户端的 `ExecutionResources` 配置，通过 `NpuRuntime` 的
+`get_resources` 传入；DDR 预算会在初始化时协商给 CPU 服务，WR 上限仅传入 Gather kernel。
+已捕获的图保留该值；改变它需重建执行资源和捕获图。阶段耗时、日志和 CSV 用于对照每组配置。
+
+测试入口接受 `--gather-read-wave-wrs`，环境变量为 `KVAF_BATCH_GET_GATHER_READ_WAVE_WRS`：
+
+```bash
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend gather_read --aicpu-workers 5 --gather-ddr-bytes 67108864 \
+  --gather-read-wave-wrs 64 --request-length 1000000 --miss-count 1000000 \
+  --table-capacity 16384 --tokens-per-block 128 --token-bytes 656 \
+  --execution graph --graph-replays 10 --warmup 5 --iterations 20 --kernel-profile \
+  --output-dir reports/gather-wave-64
+```
+
+同一构建中将该参数改为 32、128、256 等即可对照，无需逐次改源码重编。
+`BATCH_GET_PERF_CONFIG` 和 summary.csv 的 `gather_read_wave_wrs` 记录有效值。
+NPU 初始化执行资源时的 `GATHER_READ_CONFIG` 也输出实际 `read_wave_wrs` 和窗口容量。
 
 ## 精确选择窗口
 
@@ -88,7 +115,8 @@ Scatter 软件超时按窗口重新计时；CANN 单次 launch 的总时限仍�
 
 ## 部署和验证
 
-AICPU 入口升级到 `KvafAicpuGatherReadExecutionV4` / `KvafAicpuCpuPushScatterExecutionV4`。
+Gather 的 READ 波次参数使用新入口 `KvafAicpuGatherReadExecutionV5`；Scatter 保持
+`KvafAicpuCpuPushScatterExecutionV4`。
 必须一起更新 CPU 服务、Host 库、Python binding 和 AICPU 包并重启进程，避免旧布局混用。
 新增的 Gather 窗口协商消息和 Scatter setup 的窗口字段在初始化阶段传递，不增加逐窗 Host RPC
 或 kernel launch。窗口边界仍有 CPU 通知、ACK 和屏障成本，不保证所有预算下吞吐相同。
@@ -97,3 +125,5 @@ AICPU 入口升级到 `KvafAicpuGatherReadExecutionV4` / `KvafAicpuCpuPushScatte
 `aicpu_gather_window` / `aicpu_scatter_window` 执行真实 kernel 控制流，覆盖小于/大于 65536 的
 窗口、百万条总请求、动态/零请求回放、全局输出映射、尾片段和中间窗口故障。
 模型以 memcpy 代替 DMA，不能替代 A5 的缓存可见性、并发时序和大批次图回放验证。
+Gather 模型还检查不同 WR 上限、非 32 倍数、缩小已分配缓冲区后的逻辑波次限制、
+末尾 CQ 检查点及百万请求回放。

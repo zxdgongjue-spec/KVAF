@@ -7,6 +7,11 @@
 using namespace kvaf;
 
 int main() {
+  CHECK(kGatherDefaultReadWaveWrs == 4096);
+  for (uint32_t limit : {1U, 31U, 32U, 64U, 96U, 128U, 256U, 512U, 4096U})
+    CHECK(ValidGatherReadWaveWrs(limit));
+  CHECK(!ValidGatherReadWaveWrs(0) && !ValidGatherReadWaveWrs(4097) &&
+        !ValidGatherReadWaveWrs(UINT32_MAX));
   for (uint32_t workers : {1U, 3U, 5U, 8U}) {
     for (uint32_t token : {1U, 7U, 656U, 4096U}) {
       CHECK(GatherWindowCapacity(token, workers, 0) == 65536);

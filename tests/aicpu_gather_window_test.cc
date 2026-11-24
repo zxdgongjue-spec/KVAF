@@ -30,6 +30,7 @@ struct Fixture {
   std::vector<BatchGetWorkerProfile> profiles;
   std::vector<std::unique_ptr<peer::CpuGatherExecutor>> cpu;
   std::array<uint64_t, 8> last{}, calls{};
+  std::array<uint32_t, 8> pending_wrs{}, peak_wrs{}, cq_waits{};
   GatherExecutionControl control{};
   UmdkBatchGetArgs args{};
   int32_t count{};
@@ -83,6 +84,7 @@ struct Fixture {
   }
   void Run(int32_t n, bool success = true, bool direct = false) {
     count = n; ++launches;
+    pending_wrs.fill(0); peak_wrs.fill(0); cq_waits.fill(0);
     args.request.indices = direct ? 0 : reinterpret_cast<uint64_t>(indices.data());
     std::fill(output.begin(), output.end(), 0xa5);
     std::vector<std::thread> tasks;
@@ -95,6 +97,7 @@ struct Fixture {
       CHECK(reports[w].magic == kGatherStatusMagic && reports[w].sequence == launches && reports[w].result == 0);
       CHECK(reports[w].failed_request == UINT64_MAX);
       completed += reports[w].completed_requests; spans += profiles[w].spans;
+      CHECK(pending_wrs[w] == 0 && peak_wrs[w] <= args.gather.read_wave_wrs);
     }
     CHECK(completed == uint32_t(n) && spans == uint32_t(n));
     for (uint32_t i = 0; i < capacity; ++i) for (uint32_t b = 0; b < token; ++b)
@@ -115,7 +118,12 @@ urma_target_seg_t* LocalSegment(std::uint64_t address, std::uint64_t bytes) {
       ? &segment : nullptr;
 }
 bool PostBatch(Queue& queue, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkControlStatus&) {
+  const auto worker = static_cast<std::size_t>(&queue - current->session->state.data_queues.data());
+  CHECK(worker < current->workers);
   for (auto* wr = first;; wr = wr->next) {
+    const auto live = ++current->pending_wrs[worker];
+    current->peak_wrs[worker] = std::max(current->peak_wrs[worker], live);
+    CHECK(live <= current->args.gather.read_wave_wrs);
     CHECK(wr && wr->rw.src.num_sge == 1 && wr->rw.dst.num_sge <= 6);
     auto source = wr->rw.src.sge[0].addr;
     const auto bytes = wr->rw.src.sge[0].len;
@@ -127,12 +135,19 @@ bool PostBatch(Queue& queue, urma_jfs_wr_t* first, urma_jfs_wr_t* tail, UmdkCont
       std::memcpy(reinterpret_cast<void*>(dst.addr), reinterpret_cast<void*>(source + copied), dst.len); copied += dst.len;
     }
     CHECK(copied == bytes); queue.completed = wr->user_ctx;
+    // Every wave must end at a signaled, strongly ordered checkpoint.
+    if (wr->flag.bs.complete_enable) CHECK(wr == tail && wr->flag.bs.place_order == URMA_STRONG_ORDER);
     if (wr == tail) break;
   }
   return true;
 }
 bool WaitCompletion(Queue& q, std::uint64_t context, std::uint64_t, std::uint32_t, UmdkControlStatus&) {
-  CHECK(q.completed == context); return true;
+  CHECK(q.completed == context);
+  const auto worker = static_cast<std::size_t>(&q - current->session->state.data_queues.data());
+  CHECK(current->pending_wrs[worker] && q.requests.wrs[q.requests.wr_count - 1].flag.bs.complete_enable);
+  current->pending_wrs[worker] = 0;
+  ++current->cq_waits[worker];
+  return true;
 }
 std::uint32_t TransferControlSync(bool write, const UmdkTransfer* transfers, std::uint32_t count, std::uint32_t worker) {
   bool notify = false;
@@ -161,6 +176,26 @@ int main() {
   { Fixture f(1000000, 5, 4096); f.Run(1000000); }
   { Fixture f(8193, 5, 4096, 656); f.Run(8193); }
   { Fixture f(8193, 5, 4096, 4096); f.Run(8193); }
+  // Replay the same retained transport buffers with smaller/larger wave limits.
+  // Also exercise limits below/non-multiples of the 32-WR post batch.
+  { Fixture f(20001, 5, 65536, 656);
+    for (uint32_t limit : {4096U, 256U, 64U, 1U, 31U, 32U, 96U, 128U, 512U, 4096U}) {
+      f.args.gather.read_wave_wrs = limit;
+      f.Run(20001);
+      CHECK(f.peak_wrs[0] == std::min(limit, 667U));
+      CHECK(f.cq_waits[0] == (667U + limit - 1U) / limit);
+      f.Run(8192, true, true);
+      f.Run(0);
+    }
+  }
+  { Fixture f(1000000, 5, 65536); f.args.gather.read_wave_wrs = 64; f.Run(1000000); }
+  { Fixture f(20000, 5, 4096); f.args.gather.read_wave_wrs = 32; f.Run(20000); }
+  { Fixture f(1, 1, 4096);
+    for (uint32_t invalid : {0U, 4097U, UINT32_MAX}) {
+      f.args.gather.read_wave_wrs = invalid;
+      CHECK(ExecuteGatherRead(&f.args) != 0 && f.control.claimed == 0);
+    }
+  }
   { Fixture f(20000, 5, 4096); f.fail_at = 2; f.Run(20000, false);
     auto before = f.control.claimed; f.Run(1, false); CHECK(f.control.claimed == before); }
   { Fixture f(1, 5, 4096); f.Run(-1, false); }

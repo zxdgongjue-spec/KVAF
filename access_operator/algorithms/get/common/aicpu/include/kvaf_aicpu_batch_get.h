@@ -12,7 +12,8 @@ class UmdkSession;
 class BatchGetTransport {
  public:
   BatchGetTransport(UmdkSession&, std::uint32_t token_bytes, bool direct_addresses = false,
-                    std::uint64_t ddr_bytes = 0);
+                    std::uint64_t ddr_bytes = 0,
+                    std::uint32_t read_wave_wrs = kGatherDefaultReadWaveWrs);
   ~BatchGetTransport();
   Status Initialize(const RemoteRegionDesc&);
   Status Execute(const BatchGetExecRequest&);
