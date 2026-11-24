@@ -377,7 +377,8 @@ def run_case(args):
         output_storage="shared_last_call_visible",
         timing={"device": "enqueue_then_global_device_sync", "stream": "enqueue_then_stream_sync",
                 "native-stream": "prepared_call_includes_stream_sync"}[args.completion_scope],
-        stream_selection="fixed_stream_per_call_task_queue_fence",
+        stream_selection=("cached_capture_stream_inputs_ready_before_replay" if graph_mode
+                          else "fixed_stream_per_call_task_queue_fence"),
         graph_mailbox=graph_mode and os.environ.get("KVAF_SCATTER_GRAPH_MAILBOX") == "1",
         input_storage="fixed_buffers_refreshed_per_call",
         host_timing_matches_reference=False,
@@ -488,8 +489,11 @@ def run_case(args):
                     capture_node()
                 caller_graph.capture_end()
 
-                def submit():
-                    caller_graph.replay(stream)
+                # Inputs are made ready by the existing pre-call torch sync.
+                # Bind native entry points once, outside sample timing.
+                submit = caller_graph.replay
+                if args.completion_scope == "stream":
+                    wait = caller_graph.synchronize
         output.zero_()
         if stream is not None:
             torch.npu.synchronize()  # Default-stream fixtures must precede the first replay.
@@ -541,7 +545,7 @@ def run_case(args):
         original = sys.exc_info()[1]
         try:
             if caller_graph is not None:
-                close_caller_graph(runtime, caller_graph, stream)
+                close_caller_graph(runtime, caller_graph)
                 if original is None and args.kernel_profile:
                     runtime.stop_scatter_profile()
         except Exception as error:
@@ -553,11 +557,11 @@ def run_case(args):
         log_phase("teardown", "end")
 
 
-def close_caller_graph(runtime, graph, stream):
+def close_caller_graph(runtime, graph):
     if graph.capturing:
         graph.capture_end()
     if graph.ready:
-        graph.synchronize(stream)
+        graph.synchronize()
         graph.reset()
     runtime.detach_scatter_batch_get_graph()
 

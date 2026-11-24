@@ -135,6 +135,9 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 一次捕获多次 BatchGet，一次 replay 后统一同步；同一 stream 上按序执行，共享传输工作区。
 每个节点有独立输入清单，每次 replay 前在计时窗口外刷新；输出按顺序复用，保留末次结果。
 不启用图模式时，每个样本仍只执行一次 BatchGet，`--graph-calls` 不参与计时。
+图模式在捕获结束后直接绑定 `graph.replay` 和原生 stream 同步方法；样本内通过
+`aclmdlRIExecuteAsync` 重放，不再逐次解析 Python stream 或经过 Python 转发函数。
+`--completion-scope stream` 使用 `aclrtSynchronizeStream`，`device` 保留原有整设备同步。
 
 ```bash
 # K 端启动 CPU 服务前
@@ -186,20 +189,23 @@ try:
 
     for _ in range(iterations):
         refresh_inputs_in_place()  # 生产新输入并保证其已就绪；存储地址保持不变。
-        graph.replay(stream)
-        stream.synchronize()
+        graph.replay()
+        graph.synchronize()
         runtime.check_scatter_graph_replay()
 finally:
     if graph.capturing:
         graph.capture_end()
     if graph.ready:
-        graph.synchronize(stream)
+        graph.synchronize()
         graph.reset()
     runtime.detach_scatter_batch_get_graph()
 ```
 
 核心保持一次 capture、多次 `aclmdlRIExecuteAsync`。每图节点数、每次重放的同步与检查次数、
 设备端递增序号、失败传播、Graph mailbox 和数据流水均不因 Host 状态管理的精简而改变。
+无参原生入口要求 replay 前输入生产任务已提交并建立正确的 stream 依赖；性能脚本通过
+计时窗口外的 `torch.npu.synchronize()` 保证输入就绪。需要保留原有 stream getter 提交屏障时，
+仍可使用 `graph.replay(stream)`。捕获的 stream 对象由图持有，reset 后无参入口会拒绝重放。
 
 ## 构建与完整回归
 
