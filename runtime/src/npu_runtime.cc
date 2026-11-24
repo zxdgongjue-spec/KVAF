@@ -43,8 +43,11 @@ Status Internal(std::string message) { return Status::Internal(std::move(message
 
 class PeerDdrAllocator final : public DdrMemoryAllocator {
  public:
-  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link, std::uint64_t workspace = 0U)
-      : link_(std::move(link)), workspace_(workspace) {}
+  explicit PeerDdrAllocator(std::shared_ptr<peer::PeerLink> link,
+                            std::uint32_t gather_token_bytes = 0U,
+                            std::uint32_t gather_workers = 0U, bool slot_sized_staging = false)
+      : link_(std::move(link)), gather_token_bytes_(gather_token_bytes),
+        gather_workers_(gather_workers), slot_sized_staging_(slot_sized_staging) {}
 
   void SetCandidate(std::uint32_t candidate_id) { candidate_id_ = candidate_id; }
   bool has_allocation() const { return allocated_.base != 0U; }
@@ -56,9 +59,12 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
       return Status::InvalidArgument("invalid peer DDR allocation request");
     }
     if (allocated_.base != 0U) return Status::InvalidState("peer DDR is already allocated");
-    if (workspace_ > UINT64_MAX - (request.slot_size - 1U))
+    const auto workspace = gather_workers_ == 0U ? 0U :
+        GatherRemoteWorkspaceBytes(gather_token_bytes_, gather_workers_,
+                                   slot_sized_staging_ ? request.slot_size : 0U);
+    if (workspace > UINT64_MAX - (request.slot_size - 1U))
       return Status::InvalidArgument("gather workspace size overflow");
-    const auto reserved = (workspace_ + request.slot_size - 1U) / request.slot_size * request.slot_size;
+    const auto reserved = (workspace + request.slot_size - 1U) / request.slot_size * request.slot_size;
     if (request.ddr_bytes > UINT64_MAX - reserved)
       return Status::InvalidArgument("DDR allocation size overflow");
     Status status = link_->AllocateRegion(request.ddr_bytes + reserved, request.slot_size, candidate_id_, &allocated_);
@@ -78,7 +84,8 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
  private:
   std::shared_ptr<peer::PeerLink> link_;
-  std::uint64_t workspace_{0U};
+  std::uint32_t gather_token_bytes_, gather_workers_;
+  bool slot_sized_staging_;
   std::uint32_t candidate_id_{0U};
   peer::PeerRegion allocated_{};
 };
@@ -472,7 +479,8 @@ struct NpuRuntime::Impl {
       access_operator = std::make_unique<UmdkAccessOperator>(UmdkAccessOperatorConfig{
           kernel_package.json_path, options.npu_core_count,
           peer_link, options.batch_get_token_bytes,
-          options.aicpu_batch_get_mode, config.peer_local_eid});
+          options.aicpu_batch_get_mode, config.peer_local_eid,
+          options.allocation_mode == AllocationMode::kAppendOnly});
 #else
       throw std::invalid_argument("AICPU UMDK support was not built");
 #endif
@@ -589,10 +597,11 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
     impl_->allocator = std::make_unique<ubmem::DdrAllocator>(impl_->peer_link);
 #endif
   } else {
-    auto allocator = std::make_unique<PeerDdrAllocator>(impl_->peer_link,
-        impl_->backend != detail::RuntimeBackend::kUrmaAicpuGather ? 0U :
-            GatherRemoteWorkspaceBytes(impl_->options.batch_get_token_bytes,
-                                       impl_->options.npu_core_count));
+    const bool gather = impl_->backend == detail::RuntimeBackend::kUrmaAicpuGather;
+    auto allocator = std::make_unique<PeerDdrAllocator>(
+        impl_->peer_link, impl_->options.batch_get_token_bytes,
+        gather ? impl_->options.npu_core_count : 0U,
+        impl_->options.allocation_mode == AllocationMode::kAppendOnly);
     impl_->peer_allocator = allocator.get();
     impl_->allocator = std::move(allocator);
   }

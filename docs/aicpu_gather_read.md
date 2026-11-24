@@ -13,6 +13,55 @@ AICPU 读取这个计数，将有效前缀均分给各 worker；READ 直接使�
 源地址直接取 `addresses[indices[i]] + offsets[i]`，调用方保证有效条目的索引、
 块内偏移、地址有效性及输出行号正确，输入元数据在本轮完成前保持不变。
 
+## 变长 tensor 读取
+
+`transport="urma", aicpu_batch_get_mode="gather_read"` 支持 eager
+`batch_get_ranges`。可同时选择 `allocation_mode="append_only"`，让不同 tensor
+使用独立 Key 并共用 slot。Put 继续使用 `batch_put(keys, source, input_offsets, lengths)`。
+读取整个 tensor 时，`indices` 填 AccessTable 行号，`source_offsets` 填 0，
+`lengths` 填每个 tensor 的实际字节数。`output_offsets` 是一维 uint8 输出里的字节位置，
+各条输出区间须互不重叠。可参考 [append_only 调用示例](../tests/README_append_only.md)。
+
+staging 在 `initialize(ddr_bytes, slot_size)` 时按 worker 固定预留，位于用户 KV 区之后。
+原定长预留是 `align64(token_bytes × ceil(65536 / workers))`。使用
+`allocation_mode="append_only"` 时，每个 worker 的预留至少为一个 slot，按 64 B 对齐，
+计算时 slot 大小最多取 `UINT32_MAX`。默认 `fixed` 分配模式沿用原定长预留；
+两种模式都支持 range Get。实际可用字节数还受每个 worker 描述头的 `uint32` 上限约束。
+远端额外分配包含所有 worker 的 staging、描述符和控制区，并按 slot_size 向上取整。
+
+请求数组最多 65536 项。本轮有效前缀按条数均分给 worker，每个 worker 将分到的实际
+读取长度相加。例如每 worker 有 64 MiB，两个 worker 读取 `[48, 48, 1, 1] MiB`
+时，第一个 worker 需要 96 MiB，会返回 `ValueError`。请按字节拆批后再次调用。
+报错包含触发超限的 worker、请求序号、最低所需字节数和容量。发生参数或容量错误时，
+其他 worker 可能已经写入输出，整次输出应丢弃。同一 Runtime 可继续执行合法请求。
+
+`synchronize=True` 时调用会等待并检查结果。异步时用
+`check_batch_get_ranges_status(stream)` 在相同 stream 上获取错误，
+并在下一次 Get 之前检查本次结果。保留表和请求 Tensor 到执行完成，保留经注册的
+Put 源和 Get 输出 Tensor 到 Runtime 关闭。Range Get 使用 eager，工作区与定长 Get 共用，
+使用该 Runtime 捕获过定长图后应换用新 Runtime 执行 range。Range API 的 `profile=True`
+不可用。
+
+物理 READ 每条最多 64 KiB。传 `read_chunk_bytes=0` 使用这个默认值，非零值取
+`min(read_chunk_bytes, 64 KiB)`。例如单独读取 32 MiB 时默认提交 512 条 READ。
+这个分段影响 READ 提交，staging 容量仍按整个 worker 的请求总量检查。
+
+在已启动 URMA CPU 服务、加载 CANN 环境的目标机上，从仓库根目录执行：
+
+```bash
+./build.sh aicpu-urma
+./build.sh aicpu-urma --check-kernel
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:28999 \
+  bash tests/run_remote_cpu_aicpu_gather_ranges.sh "$PWD/build-aicpu-urma" \
+  --device 7 --workers 2
+```
+
+全量构建也可使用 `build-npu`。脚本验证共享 slot、1 MiB 和 32 MiB 读取、每 worker
+恰好用满及超限 1 B、邻居 Key 边界、错误后恢复和定长 Get 回归。通过时打印
+`AICPU_GATHER_RANGES_HARDWARE_PASS`。脚本使用两个 64 MiB 的 KV slot，
+另按上述公式预留额外 DDR。CPU 服务的 `--gather-threads` 须不小于 `--workers`。
+需要配套更新 Host 库和 AICPU 设备包并重启客户端，CPU 服务继续使用版本 6 协议。
+
 ## 构建和启动
 
 当前控制协议使用版本 6，CPU 服务和 NPU 客户端使用配套版本构建并重启。
@@ -376,7 +425,8 @@ UMDK 控制/Put 的启动或完成处理失败后，会话拒绝后续 Get/Put�
 Shutdown 会先等待尚未确认完成的控制/Put 操作，再销毁通信资源。若仍无法确认完成，保留缓冲区并返回错误，
 调用方需继续保留已注册的源/输出 Tensor 和对应 stream。
 调用方须保留元数据 Tensor 至执行结束，已注册的源/输出 Tensor 至 Shutdown 前保持有效。
-同一 AICPU 进程只支持一个活动 UMDK 会话。目前该后端使用 eager 调用，不支持 ACL Graph capture/replay。
+同一 AICPU 进程只支持一个活动 UMDK 会话。定长 BatchGet 可使用 Graph capture/replay，
+变长 Get 使用 eager。
 
 本地验证使用 ACL/provider 替身；本分支的 NPU 兼容性与性能需要服务器验证。
 

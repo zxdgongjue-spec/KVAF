@@ -6,7 +6,7 @@
 
 可选的“一 tensor 一 Key、多 Key 共用 slot、只追加分配”见 [append_only 分配模式](README_append_only.md)。默认仍为 fixed，Put/Get range 接口保持不变。
 
-当前版本支持 eager 执行、同包多次读取、多包混合读取、不同长度、乱序请求和独立的输出 byte offset。AICPU gather_read、UBmem、Graph capture、range Get 的 stage/kernel profile 尚未适配。CPU 模型检查功能正确性，真实 NPU 上的 CANN 编译、URMA 连通性、缓存可见性及性能需要另行验收。
+本文说明 AIV + URMA 的变长读取，支持 eager、同包多次读取、多包混合读取、不同长度、乱序请求和独立的输出 byte offset。AICPU 的 staging 容量、READ 分段和独立验收脚本见 [GatherRead 变长读取](../docs/aicpu_gather_read.md#变长-tensor-读取)。Range Get 的 Graph capture 和 stage/kernel profile 暂不可用。
 
 ## 1 数据布局和接口变化
 

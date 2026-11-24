@@ -11,6 +11,7 @@ struct UmdkAccessOperator::Impl {
   explicit Impl(UmdkAccessOperatorConfig config)
       : valid_mode(config.batch_get_mode == "gather_read" ||
                    config.batch_get_mode == "cpu_push_scatter"),
+        slot_sized_staging(config.slot_sized_staging),
         session({config.kernel_json, config.workers,
                  config.peer_link, config.local_eid}),
         get(session, config.token_bytes),
@@ -24,6 +25,7 @@ struct UmdkAccessOperator::Impl {
 #endif
   }
   bool valid_mode;
+  bool slot_sized_staging;
   aicpu_urma::UmdkSession session;
   aicpu_urma::BatchGetTransport get;
   aicpu_urma::BatchPutTransport put;
@@ -46,9 +48,10 @@ Status UmdkAccessOperator::Initialize(const RemoteRegionDesc& region) {
   auto loaded = impl_->session.Load();
   if (!loaded.ok()) return loaded;
 #if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
-  auto ready = impl_->push ? impl_->push->Initialize(region) : impl_->get.Initialize(region);
+  auto ready = impl_->push ? impl_->push->Initialize(region)
+                           : impl_->get.Initialize(region, impl_->slot_sized_staging);
 #else
-  auto ready = impl_->get.Initialize(region);
+  auto ready = impl_->get.Initialize(region, impl_->slot_sized_staging);
 #endif
   if (!ready.ok()) return ready;
   impl_->region = region;
@@ -84,6 +87,22 @@ Status UmdkAccessOperator::ExecuteBatchGet(const BatchGetExecRequest& exec) {
   if (impl_->push) return impl_->push->Execute(exec);
 #endif
   return impl_->get.Execute(exec);
+}
+Status UmdkAccessOperator::ExecuteBatchGetRanges(const BatchGetRangesExecRequest& exec) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->initialized) return Status::NotInitialized("AICPU operator is not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) return AccessOperator::ExecuteBatchGetRanges(exec);
+#endif
+  return impl_->get.ExecuteRanges(exec);
+}
+Status UmdkAccessOperator::CheckBatchGetRangesStatus(void* stream) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (!impl_->initialized) return Status::NotInitialized("AICPU operator is not initialized");
+#if defined(KVAF_ENABLE_AICPU_CPU_PUSH)
+  if (impl_->push) return AccessOperator::CheckBatchGetRangesStatus(stream);
+#endif
+  return impl_->get.CheckRanges(static_cast<aclrtStream>(stream));
 }
 Status UmdkAccessOperator::ExecuteBatchPut(const BatchPutExecRequest& exec) {
   std::lock_guard<std::mutex> lock(impl_->mutex);

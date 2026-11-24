@@ -66,6 +66,14 @@ add_test(
 )
 
 if(KVAF_BUILD_PYTHON)
+  if(KVAF_ENABLE_AICPU_URMA)
+    add_test(NAME kvaf_npu_aicpu_gather_ranges_python
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/python/test_npu_aicpu_gather_ranges.py")
+    set_tests_properties(kvaf_npu_aicpu_gather_ranges_python PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+      SKIP_RETURN_CODE 77 TIMEOUT 300)
+  endif()
+
   pybind11_add_module(_kvaf_constructor_test npu_constructor_binding.cc)
   target_include_directories(_kvaf_constructor_test PRIVATE ${PROJECT_SOURCE_DIR}/bindings/include)
   set_target_properties(_kvaf_constructor_test PROPERTIES

@@ -28,11 +28,18 @@ enum GatherReadError : std::uint64_t {
   kCpuGatherFailed = 10,
   kGatherTransportFailed = 16,
   kGatherSequenceExhausted = 17,
+  kGatherStagingExceeded = 18,
 };
+
+inline bool IsGatherRangeArgumentError(std::uint64_t result) {
+  return result == kInvalidGatherRequest || result == kGatherStagingExceeded;
+}
 
 struct alignas(64) GatherReadStatus {
   std::uint64_t magic, result, phase, ack_seen, cqe_word, sequence;
+  std::uint64_t failed_request, required_bytes;
 };
+static_assert(sizeof(GatherReadStatus) == 64U);
 struct alignas(64) GatherExecutionControl {
   std::uint64_t claimed{}, failed{}, reserved[6]{};
 };
@@ -66,6 +73,16 @@ struct AicpuBatchGetInput {
 struct UmdkBatchGetArgs {
   AicpuBatchGetInput request;
   GatherReadArgs gather;
+};
+struct AicpuBatchGetRangesInput {
+  std::uint64_t address_table{}, valid_table{}, table_lengths{};
+  std::uint64_t indices{}, source_offsets{}, lengths{}, request_count{}, output_offsets{};
+  std::uint32_t table_capacity{}, request_capacity{}, read_chunk_bytes{};
+};
+struct UmdkBatchGetRangesArgs {
+  AicpuBatchGetRangesInput request;
+  GatherReadArgs gather;
+  std::uint64_t kv_base{}, kv_bytes{}, lane_staging_bytes{};
 };
 }  // namespace kvaf::aicpu_urma
 

@@ -1,6 +1,9 @@
 # append_only：每个 tensor 一个 Key，多 Key 共用 slot
 
-默认仍为 `allocation_mode="fixed"`。新增 `allocation_mode="append_only"`，在创建 `NpuRuntime` 时选择，一次 Runtime 生命周期内保持不变。该选项与 AIV/AICPU 后端选择独立；本次变长端到端验收针对 **AIV + URMA + batch_get_ranges**，没有新增 AICPU range Get 能力。
+默认仍为 `allocation_mode="fixed"`。`allocation_mode="append_only"` 在创建
+`NpuRuntime` 时选择，一次 Runtime 生命周期内保持不变。可与 AIV URMA 或
+AICPU GatherRead 的 `batch_get_ranges` 配合使用。AICPU 的容量与测试入口见
+[GatherRead 变长读取](../docs/aicpu_gather_read.md#变长-tensor-读取)。
 
 ## 分配与回收规则
 

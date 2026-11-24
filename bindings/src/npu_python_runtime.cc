@@ -690,7 +690,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       py::arg("output"), py::arg("stream") = py::none(),
       py::arg("synchronize") = false, py::arg("profile") = false,
       py::kw_only(), py::arg("read_chunk_bytes") = 0,
-      "Read variable byte ranges on AIV URMA. Caller owns Tensor lifetimes and disjoint output ranges.")
+      "Read variable byte ranges on AIV URMA or AICPU GatherRead in eager mode. "
+      "Caller owns Tensor lifetimes and disjoint output ranges.")
       .def("check_batch_get_ranges_status", &NpuPythonRuntime::CheckBatchGetRangesStatus,
            py::arg("stream") = py::none(), "Wait and check the latest range Get on its execution stream.");
   runtime.def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
