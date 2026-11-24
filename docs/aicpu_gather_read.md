@@ -232,7 +232,9 @@ Host 每轮直接提交算子，不再分配 HBM 编号缓冲或提交清零任�
 CPU 服务的 `--gather-threads` 是全部 worker 的总预算，须不小于 AICPU worker 数；
 预算在 worker 之间均分，余数从 worker 0 开始分配。每个 worker 每完成 128 KiB 连续前缀即可开始 READ。
 
-每次最多 65536 项；token 大小由构造参数指定，最大总载荷须能用 uint32 表示。
+每次调用的总量不再限制为 65536；全部窗口在同一次 kernel launch 内执行。
+`gather_ddr_bytes` 选择预算内最大的 4096 倍数窗口，默认仍为 65536。
+token 大小由构造参数指定，每个 lane 的窗口载荷须能用 uint32 表示，见 [窗口与预算](aicpu_get_windows.md)。
 首次 Gather 准备时，CPU 在独立工作区中按 worker 数分配 staging、源描述符和控制区，
 每个 staging 区间可容纳 `ceil(65536 / worker_count)` 个 token，并单独对齐到 64 字节。
 主缓存池无需尾部预留，这些空间不进入 KV slot 分配；工作区在该 Gather session 关闭时释放。

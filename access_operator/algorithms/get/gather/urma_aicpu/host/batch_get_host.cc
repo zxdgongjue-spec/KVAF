@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 
 #include "get/common/aicpu/include/kvaf_aicpu_batch_get.h"
@@ -18,11 +19,16 @@ using kvaf::detail::PointerValue;
 
 }  // namespace
 struct BatchGetTransport::Impl {
-  Impl(UmdkSession& shared, std::uint32_t token, bool direct)
-      : session(shared), token_bytes(token), direct_addresses(direct) {}
+  Impl(UmdkSession& shared, std::uint32_t token, bool direct, std::uint64_t budget,
+       std::uint32_t wave_wrs)
+      : session(shared), token_bytes(token), direct_addresses(direct), ddr_bytes(budget),
+        read_wave_wrs(wave_wrs) {}
   UmdkSession& session;
   std::uint32_t token_bytes;
   bool direct_addresses;
+  std::uint64_t ddr_bytes;
+  std::uint32_t read_wave_wrs;
+  std::uint32_t window_capacity{};
   RemoteRegionDesc region;
   RemoteRegionDesc remote_workspace;
   BatchGetExecutionState execution;
@@ -87,8 +93,9 @@ static Status DrainGather(const GatherLaunchView& view, AicpuGetInvocation& call
 }
 
 BatchGetTransport::BatchGetTransport(UmdkSession& session, std::uint32_t token_bytes,
-                                     bool direct_addresses)
-    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses)) {}
+                                     bool direct_addresses, std::uint64_t ddr_bytes,
+                                     std::uint32_t read_wave_wrs)
+    : impl_(std::make_unique<Impl>(session, token_bytes, direct_addresses, ddr_bytes, read_wave_wrs)) {}
 BatchGetTransport::~BatchGetTransport() = default;
 std::unique_ptr<ExecutionState> BatchGetTransport::CreateExecutionState() {
   return std::make_unique<Impl::Invocation>(impl_.get());
@@ -106,7 +113,8 @@ GatherLaunchView BatchGetTransport::View() const {
   const auto* profile = call.graph_profile.get();
   return {impl_->views.View(ExecutionDirection::Get),
       {impl_->session.session(), impl_->session.owner_pid()},
-      {impl_->session.config().workers, impl_->token_bytes}, impl_->direct_addresses,
+      {impl_->session.config().workers, impl_->token_bytes, impl_->window_capacity,
+       impl_->read_wave_wrs}, impl_->direct_addresses,
       impl_->remote_workspace, impl_->workspace,
       {status ? status->device : impl_->execution.status,
        status ? status->host : impl_->status_host, impl_->execution.status_bytes},
@@ -138,7 +146,7 @@ Status BatchGetTransport::PrepareGraph(const GetGraphOptions& options) {
   if (!impl_->initialized) return Status::NotInitialized("Gather is not initialized");
   if (call.graph_active || call.captured_stream) return Status::Busy("Gather capture already bound");
   if (!options.output.valid() || options.output.device != DeviceKind::kNpu ||
-      !options.request_capacity || options.request_capacity > kGatherMaxRequests)
+      !options.request_capacity)
     return InvalidArgument("Gather graph requires output and valid request capacity");
   bool capturing = false;
   auto ready = kvaf::detail::BatchGetCapture(static_cast<aclrtStream>(options.stream), true, false, &capturing);
@@ -249,14 +257,34 @@ Status BatchGetTransport::CopyKernelProfiles(std::vector<BatchGetKernelProfile>*
 }
 Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
   if (impl_->initialized) return Status::InvalidState("UMDK operator already initialized");
+  if (!ValidGatherReadWaveConfig(impl_->read_wave_wrs))
+    return InvalidArgument("gather_read_wave_wrs must be in [1, 4096]");
   const auto workers = impl_->session.config().workers;
   if (!impl_->session.config().peer_link || !impl_->token_bytes || !workers ||
       workers > kGatherMaxWorkers)
     return InvalidArgument("Gather requires a peer link, token size and valid worker count");
+  peer::PeerRegion workspace;
+  auto found = impl_->session.config().peer_link->PrepareGatherWindow(
+      region.base, impl_->ddr_bytes, impl_->token_bytes, workers, &workspace, &impl_->window_capacity);
+  if (!found.ok()) return found;
+  const auto workspace_bytes = GatherRemoteWorkspaceBytes(impl_->token_bytes, workers, impl_->window_capacity);
+  if (!workspace.base || (workspace.base & 63U) || workspace.length != workspace_bytes ||
+      workspace.base > UINT64_MAX - workspace.length)
+    return InvalidArgument("Gather received an invalid remote workspace");
+  if (impl_->read_wave_wrs == kGatherDefaultReadWaveWrs)
+    std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=auto "
+        "miss_count_threshold=8192 small_wave_wrs=512 large_wave_wrs=64 window_capacity=%u\n",
+        workers, impl_->window_capacity);
+  else
+    std::fprintf(stderr, "[KVAF] GATHER_READ_CONFIG workers=%u read_wave_wrs=%u "
+        "read_wave_mode=fixed window_capacity=%u\n", workers, impl_->read_wave_wrs,
+        impl_->window_capacity);
+  impl_->region = region;
+  impl_->remote_workspace = {workspace.base, workspace.length, 0, DeviceKind::kCpu};
   auto& state = impl_->execution;
   state.status_bytes = impl_->session.config().workers * sizeof(GatherReadStatus);
   if (aclrtMalloc(&state.status, state.status_bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS ||
-      aclrtMalloc(&impl_->workspace, GatherWorkspaceBytes(impl_->session.config().workers),
+      aclrtMalloc(&impl_->workspace, GatherWorkspaceBytes(workers, impl_->window_capacity),
                   ACL_MEM_MALLOC_HUGE_FIRST) !=
           ACL_SUCCESS ||
       aclrtMallocHost(&impl_->status_host, state.status_bytes) != ACL_SUCCESS ||
@@ -266,21 +294,6 @@ Status BatchGetTransport::Initialize(const RemoteRegionDesc& region) {
     (void)Shutdown();
     return Internal("failed to allocate UMDK execution buffers");
   }
-  peer::PeerRegion workspace;
-  const auto workspace_bytes = GatherRemoteWorkspaceBytes(impl_->token_bytes, workers);
-  auto found = impl_->session.config().peer_link->PrepareGatherWorkspace(
-      region.base, workspace_bytes, &workspace);
-  if (!found.ok()) {
-    (void)Shutdown();
-    return found;
-  }
-  if (!workspace.base || (workspace.base & 63U) || workspace.length < workspace_bytes ||
-      workspace.base > UINT64_MAX - workspace.length) {
-    (void)Shutdown();
-    return InvalidArgument("Gather received an invalid remote workspace");
-  }
-  impl_->region = region;
-  impl_->remote_workspace = {workspace.base, workspace.length, 0, DeviceKind::kCpu};
   impl_->initialized = true;
   impl_->views.Bind(impl_->invocation);
   impl_->views.Initialize(region);
@@ -310,12 +323,13 @@ Status BatchGetTransport::Warmup() {
   if (!impl_->initialized) return Status::NotInitialized("Gather not initialized");
   const auto workers = impl_->session.config().workers;
   auto s =
-      impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace, GatherWorkspaceBytes(workers));
+      impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace,
+                            GatherWorkspaceBytes(workers, impl_->window_capacity));
   if (!s.ok()) return s;
   if (!impl_->cpu_enabled) {
     const auto staging = impl_->remote_workspace.base;
-    const auto controls = staging + GatherStagingBytes(impl_->token_bytes, workers) +
-                          workers * GatherLaneDescriptorBytes(workers);
+    const auto controls = staging + GatherStagingBytes(impl_->token_bytes, workers, impl_->window_capacity) +
+                          workers * GatherLaneDescriptorBytes(workers, impl_->window_capacity);
     s = impl_->session.config().peer_link->EnableGatherLanes(impl_->region.base, controls, workers);
     if (s.ok()) impl_->cpu_enabled = true;
   }
@@ -349,8 +363,8 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
   UmdkBatchGetArgs checked{};
   auto valid = BuildBatchGetKernelArgs(exec, &checked.request);
   if (!valid.ok()) return valid;
-  if (checked.request.request_capacity > kGatherMaxRequests || checked.request.token_bytes != impl_->token_bytes)
-    return InvalidArgument("UMDK BatchGet exceeds requests or configured token size");
+  if (checked.request.token_bytes != impl_->token_bytes)
+    return InvalidArgument("UMDK BatchGet differs from configured token size");
   if (impl_->direct_addresses && (exec.request->access_table.opaque != 0U ||
       checked.request.table_capacity < checked.request.request_capacity))
     return InvalidArgument("invalid direct address request");
@@ -362,7 +376,7 @@ Status BatchGetTransport::Prepare(const BatchGetExecRequest& exec, std::optional
     if (!allocated.ok()) return allocated;
   }
   auto ready = impl_->session.Ensure(impl_->remote_workspace.base, impl_->workspace,
-      GatherWorkspaceBytes(impl_->session.config().workers), capturing);
+      GatherWorkspaceBytes(impl_->session.config().workers, impl_->window_capacity), capturing);
   if (!ready.ok()) return ready;
   ready = impl_->session.Ensure(impl_->remote_workspace.base, exec.request->output.data,
                                 exec.request->output.bytes, capturing);
@@ -405,9 +419,8 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   if (!valid.ok()) return valid;
   launch.request.canonical_base = view.common.region().canonical_base;
   launch.request.logical_bytes = view.common.region().logical_bytes;
-  if (launch.request.request_capacity > kGatherMaxRequests ||
-      launch.request.token_bytes != view.options.token_bytes)
-    return InvalidArgument("UMDK BatchGet exceeds 65536 requests or configured token size");
+  if (launch.request.token_bytes != view.options.token_bytes)
+    return InvalidArgument("UMDK BatchGet differs from configured token size");
   if (view.direct_addresses) {
     if (exec.request->access_table.opaque != 0U)
       return InvalidArgument("gather_read_direct requires the addresses Tensor overload");
@@ -418,8 +431,8 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   const auto workers = view.options.workers;
   const auto profile_bytes = workers * sizeof(BatchGetWorkerProfile);
   const auto staging = view.remote_workspace.base;
-  const auto descriptors = staging + GatherStagingBytes(view.options.token_bytes, workers);
-  const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers);
+  const auto descriptors = staging + GatherStagingBytes(view.options.token_bytes, workers, view.options.window_capacity);
+  const auto controls = descriptors + workers * GatherLaneDescriptorBytes(workers, view.options.window_capacity);
   auto& args = launch.gather;
   args.execution_control = PointerValue(view.control);
   args.context = {view.context.session, view.context.owner_pid};
@@ -434,6 +447,8 @@ Status BatchGetTransport::LaunchPrepared(const BatchGetExecRequest& exec,
   args.remote_ack = args.remote_notify + 8U;
   args.remote_command = args.remote_notify + 16U;
   args.worker_count = view.options.workers;
+  args.window_capacity = view.options.window_capacity;
+  args.read_wave_wrs = view.options.read_wave_wrs;
   args.profile = (profile || view.profiling) ? PointerValue(view.profile.device) : 0U;
   const auto stream = static_cast<aclrtStream>(exec.execution.stream);
   call.pending = stream;

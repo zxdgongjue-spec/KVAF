@@ -12,6 +12,7 @@ struct Config {
   std::string kernel_json;
   std::array<std::uint8_t, 16> local_eid{};
   std::uint32_t token_bytes{}, workers{1};
+  std::uint64_t hbm_bytes{0};
 };
 class CpuPushTransport {
  public:

@@ -66,8 +66,18 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 `put_resources/get_resources` 是 `(execution_config, ExecutionResources(...))` 列表。
 预算按 provider 配置。`cores=0` 时，URMA AIV Put 用 2 核、Get 在本机用 2 核、远端 A+K 用 4 核，UBMEM AIV
 Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 5 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
-Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 关闭限制，非零须至少为
-`2 * cores`。`request_capacity` 默认 65536，Gather 可额外指定 `cpu_threads`。
+Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 按 SQ/CQ 容量自动分组，非零须至少为
+`2 * cores`。`request_capacity` 默认 65536；所有 Get 仅把它作为预热提示，
+总请求量由调用方张量和 ABI 决定，不受此配置限制。Put 仍受配置容量及 65536 上限约束。
+图/输出绑定仍须预先准备足够的请求容量。Gather 可额外指定 `cpu_threads`。
+Gather 可设置 `gather_ddr_bytes`，Scatter 可设置 `scatter_hbm_bytes`；均为字节预算，包含
+对应工作区的元数据和控制区，自动选择预算内最大的 4096 倍数窗口。默认 0 保留现有
+65536 条布局的内存占用，所有窗口在一次 kernel launch 内处理。见 [AICPU 窗口配置](../docs/aicpu_get_windows.md)。
+Gather 还可设置 `gather_read_wave_wrs=64`，限制每 worker 每波的数据 READ WR 数；支持
+1..4096。默认 `None` 在每次 kernel 执行时按设备总 `miss_count` 自动选择：不超过 8192 用
+512 WR，否则用 64 WR；同一张图可随计数变化自动切换。显式值始终覆盖自动策略。
+该参数独立于内存预算，改变自动/固定配置后需重建执行资源和捕获图。
+这些字段均配置在 NPU 侧 `ExecutionResources`，由 `NpuRuntime(get_resources=...)` 接收。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
 `bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
 `./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，

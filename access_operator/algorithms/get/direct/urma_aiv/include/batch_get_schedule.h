@@ -7,6 +7,9 @@
 #ifndef KVAF_BATCH_GET_SCHEDULE_INLINE
 #define KVAF_BATCH_GET_SCHEDULE_INLINE inline
 #endif
+#ifndef KVAF_BATCH_GET_SCHEDULE_GM
+#define KVAF_BATCH_GET_SCHEDULE_GM
+#endif
 
 namespace kvaf_batch_get {
 
@@ -36,9 +39,41 @@ KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t AssignedRequests(
          (relative == full_posts % jettys ? group.count % kWqesPerPost : 0U);
 }
 
+// Completion checkpoints retire SQ entries in groups, not one CQE per READ.
+// Keep one SQ entry free and count a CQ slot only for participating Jettys.
+template <typename Entity>
+KVAF_BATCH_GET_SCHEDULE_INLINE bool FitsQueues(
+    const Group &next, const Group *outstanding, uint32_t jettys,
+    KVAF_BATCH_GET_SCHEDULE_GM const Entity *entities) {
+  for (uint32_t jetty = 0U; jetty < jettys; ++jetty) {
+    const uint32_t added = AssignedRequests(next, jetty, jettys);
+    const uint32_t live = outstanding ? AssignedRequests(*outstanding, jetty, jettys) : 0U;
+    if (static_cast<uint64_t>(live) + added >= entities[jetty].sq_depth ||
+        static_cast<uint32_t>(live != 0U) + (added != 0U) > entities[jetty].cq_depth)
+      return false;
+  }
+  return true;
+}
+
+// Two equally sized groups fit even when the 128-WQE routing rotates. Actual
+// queue assignments are still checked before posting, including CQ capacity.
+template <typename Entity>
+KVAF_BATCH_GET_SCHEDULE_INLINE uint32_t QueueGroupCapacity(
+    uint32_t jettys, KVAF_BATCH_GET_SCHEDULE_GM const Entity *entities) {
+  uint32_t per_jetty = UINT32_MAX;
+  for (uint32_t jetty = 0U; jetty < jettys; ++jetty) {
+    const uint32_t half = (entities[jetty].sq_depth - 1U) / 2U;
+    const uint32_t aligned = half / kWqesPerPost * kWqesPerPost;
+    if (aligned < per_jetty) per_jetty = aligned;
+  }
+  // Tiny queues can still make progress with a single READ followed by a drain.
+  return per_jetty ? per_jetty * jettys : 1U;
+}
+
 // Two FIFO slots. A slot is reused only after ALL of its Jetty checkpoints
 // succeed. Odd budgets alternate floor/ceil halves, so any two adjacent
-// groups fit. budget == 0 retains a single, whole-slice submission.
+// groups fit. budget == 0 proposes the remaining slice; the ordinary Direct
+// Get kernel limits it to queue capacity before posting.
 struct Schedule {
   Group groups[2];
   uint32_t cursor;

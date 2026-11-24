@@ -7,6 +7,7 @@
 
 #include "acl_python_utils.h"
 #include "npu_tensor_python.h"
+#include "execution_config_python.h"
 
 namespace py = pybind11;
 namespace binding = kvaf::python_binding;
@@ -26,6 +27,7 @@ py::dict Describe(const binding::NpuTensorView& view) {
 
 // Test-only module: the production metadata helpers run without ACL or DMA.
 PYBIND11_MODULE(_kvaf_binding_metadata_test, module) {
+  binding::BindExecutionConfigs(module);
   module.def("retain_storage", &binding::TensorStorageOwner);
   module.def("view", [](const py::object& tensor, bool keep_shape) {
     return Describe(binding::GetNpuTensorView(tensor, "tensor", keep_shape));

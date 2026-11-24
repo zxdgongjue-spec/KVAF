@@ -70,6 +70,13 @@ std::string CpuMemoryPageModeName(CpuMemoryPageMode mode) {
   return std::string(kHugeTlbPrefix) + std::to_string(count) + unit;
 }
 
+std::size_t CpuDdrBackingAlignment(CpuMemoryPageMode mode) {
+  if (mode == CpuMemoryPageMode::kDefault || mode == CpuMemoryPageMode::kTransparentHugePage)
+    return 1U;
+  const int page_shift = static_cast<int>(mode);
+  return IsHugeTlbShift(page_shift) ? std::size_t{1} << page_shift : 0U;
+}
+
 Status AllocateCpuDdr(CpuMemoryPageMode mode, std::size_t bytes, void*& memory,
                       std::size_t& mapped_bytes) {
   if (memory != nullptr || bytes == 0U)
@@ -77,8 +84,8 @@ Status AllocateCpuDdr(CpuMemoryPageMode mode, std::size_t bytes, void*& memory,
   const bool thp = mode == CpuMemoryPageMode::kTransparentHugePage;
   if (mode != CpuMemoryPageMode::kDefault && !thp) {
     const int page_shift = static_cast<int>(mode);
-    if (!IsHugeTlbShift(page_shift)) return Status::InvalidArgument("invalid CPU DDR page mode");
-    const std::size_t page_bytes = std::size_t{1} << page_shift;
+    const auto page_bytes = CpuDdrBackingAlignment(mode);
+    if (!page_bytes) return Status::InvalidArgument("invalid CPU DDR page mode");
     const std::size_t padding = (page_bytes - bytes % page_bytes) % page_bytes;
     if (bytes > std::numeric_limits<std::size_t>::max() - padding)
       return Status::InvalidArgument("HugeTLB DDR mapping size overflow");

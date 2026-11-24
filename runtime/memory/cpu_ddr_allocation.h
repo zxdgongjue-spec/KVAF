@@ -7,6 +7,9 @@
 namespace kvaf {
 
 std::string CpuMemoryPageModeName(CpuMemoryPageMode mode);
+// Explicit HugeTLB backing is rounded to this size. Heap/THP uses the logical
+// length (alignment 1); invalid page modes return zero.
+std::size_t CpuDdrBackingAlignment(CpuMemoryPageMode mode);
 
 // Keep any allocation owned by the caller if prefaulting fails. The mapping
 // length is tracked separately from the logical length used for registration.

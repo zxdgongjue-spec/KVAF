@@ -16,7 +16,6 @@ namespace {
 Status Error(const char* operation) { return Status::Internal(std::string("CPU push: ") + operation); }
 constexpr std::size_t kJettyDepth = 8192;
 constexpr std::uint32_t kPostPayloadWrs = 128;
-constexpr std::uint32_t kMaxChunks = (kMaxRequests + kChunkRows - 1) / kChunkRows;
 void Stage(const char* stage, std::uint32_t queue = UINT32_MAX) {
   if (queue == UINT32_MAX)
     std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_INIT stage=%s\n", stage);
@@ -42,7 +41,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      !MakeLayout(setup.token_bytes, setup.workers, &layout_) ||
+      !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.window_capacity) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
       setup.hbm_base > UINT64_MAX - setup.hbm_bytes)
     return Status::InvalidArgument("invalid CPU push setup");
@@ -53,6 +52,8 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   hbm_base_ = setup.hbm_base;
   workers_ = setup.workers;
   token_bytes_ = setup.token_bytes;
+  window_capacity_ = setup.window_capacity;
+  max_chunks_ = window_capacity_ / kChunkRows + (window_capacity_ % kChunkRows != 0U);
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
@@ -78,7 +79,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (!remote_) return Error("import HBM segment");
   void* buffer = nullptr;
   // Each in-flight ready WRITE has its own immutable registered source word.
-  const auto marker_bytes = workers_ * kMaxChunks * kJettyCount * sizeof(std::uint64_t);
+  const auto marker_bytes = std::uint64_t{workers_} * max_chunks_ * kJettyCount * sizeof(std::uint64_t);
   const auto bytes = (layout_.staging + marker_bytes + 4095) & ~std::uint64_t{4095};
   Stage("allocate_control");
   if (posix_memalign(&buffer, 4096, bytes)) return Error("allocate control buffer");
@@ -233,7 +234,7 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
   if (!result.ok()) return result;
   const auto& r = request();
   if (r.magic != kMagic || r.sequence != sequence || !sequence || sequence > UINT32_MAX ||
-      r.count > kMaxRequests || r.token_bytes != token_bytes_ || r.workers != workers_)
+      r.count > window_capacity_ || r.token_bytes != token_bytes_ || r.workers != workers_)
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
   auto read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
@@ -334,7 +335,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
         if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
         auto& q = waves.back();
         auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
-            (worker * kMaxChunks + chunk) * kJettyCount + queue;
+            (worker * max_chunks_ + chunk) * kJettyCount + queue;
         q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
         q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
         AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,

@@ -50,7 +50,7 @@ from utils.get_graph import (GraphInputs, captured_get, captured_get_nodes,
                              captured_get_resources, validate_graph_inputs)
 from utils.get_options import (
     MAX_JETTYS_PER_CORE, add_backend_arguments, add_workload_arguments, configure_backend_help,
-    environment_int, resolve_backend, uses_aicpu, validate_workload,
+    environment_int, resolve_backend, uses_aicpu, validate_workload, gather_read_wave_settings,
 )
 from utils.perf_execution import BenchmarkExecution, add_execution_metadata
 from utils.statistics import percentile
@@ -374,6 +374,8 @@ def run_graph_benchmark(args, runtime, torch, kvaf, make_plan, device_table,
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter"}.get(args.backend, "direct"),
         get_capacity=args.request_length,
+        gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0), scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
+        gather_read_wave_wrs=getattr(args, "gather_read_wave_wrs", None),
     )
     stream = torch.npu.current_stream()
     if args.multi_graph_check:
@@ -903,6 +905,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
         max_inflight_total=args.max_inflight_total,
+        gather_ddr_bytes=getattr(args, "gather_ddr_bytes", 0), scatter_hbm_bytes=getattr(args, "scatter_hbm_bytes", 0),
+        gather_read_wave_wrs=getattr(args, "gather_read_wave_wrs", None),
     )
     runtime = kvaf.NpuRuntime(
         **runtime_options(args),
@@ -939,6 +943,7 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"output_access_pattern={args.output_access_pattern} "
             f"ddr_bytes={ddr_bytes} aiv_cores={args.aiv_cores} aicpu_workers={args.aicpu_workers} transport={args.transport} "
             f"max_inflight_total={args.max_inflight_total} "
+            f"{format_fields(gather_read_wave_settings(args))} "
             f"jettys_per_core={args.jettys_per_core} eid_paths={len(args.npu_eids) or 1} "
             f"npu_eids={','.join(args.npu_eids) or 'auto'} warmup={args.warmup} "
             f"peer_ub_device={args.peer_ub_device or 'auto'} "
