@@ -22,9 +22,10 @@ cpu  Builds the CPU Runtime service with liburma and OpenMP. If liburma is not i
      --without-urma includes only the UBmem backend in the same service.
 aicpu-urma Builds and installs AICPU gather_read, BatchPut and Python bindings.
      --cpu-push adds Host direct HCCP and the CPU push/scatter kernel (needs device securec).
-npu  Builds all backends (AIV URMA, UBmem, AICPU Gather/Scatter and BatchPut),
+npu  Builds AIV URMA, UBmem, AICPU Gather/Scatter and BatchPut,
      outputs one Python package and installs the AICPU device package into CANN.
-     --without-aicpu builds only AIV/UBmem, without AICPU dependencies or installation.
+     --with-roce adds Host RoCE to the same NPU build (requires libibverbs and Ascend HAL).
+     --without-aicpu omits AICPU dependencies and device package installation.
      --without-python builds NPU C++ libraries and tests without the binding.
 Both NPU modes install pybind11 for the selected Python interpreter when necessary.
      --check-kernel / --uninstall-kernel manage the AICPU package without building.
@@ -37,6 +38,7 @@ Environment overrides:
   KVAF_UMDK_BUILD_DIR  Build directory used when building bundled UMDK
   ASCEND_HOME_PATH / ASCEND_CANN_PACKAGE_PATH
                         CANN root; both must resolve to the same directory if set
+  ASCEND_DRIVER_PATH   Optional Ascend driver root for locating libascend_hal
   PYTHON               Python interpreter for the NPU binding (default: python3)
   KVAF_AICPU_CXX       AICPU cross compiler override
   KVAF_AICPU_SECUREC_INCLUDE_DIR
@@ -205,11 +207,12 @@ build_npu() {
     fi
   fi
   # Set every backend switch explicitly so reusing a build directory cannot
-  # retain AICPU/Scatter (or a CPU service) after selecting a trimmed build.
+  # retain a previously selected optional backend or CPU service.
   cmake -S "$KVAF_ROOT" -B "$build_dir" \
     -DBUILD_TESTING="$build_testing" -DKVAF_BUILD_PYTHON="$build_python" \
     -DKVAF_ENABLE_AIV_BATCH_GET="$build_aiv" -DKVAF_ENABLE_AIV_BATCH_PUT="$build_aiv" \
-    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_ENABLE_AICPU_URMA="$build_aicpu" \
+    -DKVAF_BUILD_REMOTE_CPU_SERVICE=OFF -DKVAF_BUILD_ROCE_CPU_SERVICE=OFF \
+    -DKVAF_ENABLE_AICPU_URMA="$build_aicpu" -DKVAF_ENABLE_ROCE_NPU="$with_roce" \
     -DKVAF_ENABLE_AICPU_CPU_PUSH="$cpu_push" \
     -DASCEND_CANN_PACKAGE_PATH="$cann_root" \
     ${cmake_options[@]+"${cmake_options[@]}"}
@@ -241,8 +244,12 @@ if [[ "$mode" == npu ]]; then cpu_push=ON; fi
 without_urma=OFF
 without_aicpu=OFF
 without_python=OFF
+with_roce=OFF
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --with-roce)
+      [[ "$mode" == npu ]] || die "--with-roce is only valid for npu"
+      with_roce=ON; shift ;;
     --without-urma)
       [[ "$mode" == cpu ]] || die "--without-urma is only valid for cpu"
       without_urma=ON; shift ;;

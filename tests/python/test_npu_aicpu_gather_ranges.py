@@ -23,12 +23,12 @@ def expect_value_error(action, message):
         raise AssertionError("expected range Get to raise ValueError")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=int(os.environ.get("DEVICE_ID", "0")))
     parser.add_argument("--workers", type=int, choices=range(1, 9), default=2)
     parser.add_argument("--peer", default=os.environ.get("KVAF_CPU_SERVICE_ADDR"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if os.environ.get("KVAF_RUN_NPU_TESTS") != "1":
         print("AICPU_GATHER_RANGES_SKIP: enable KVAF_RUN_NPU_TESTS=1 on the NPU target")
         return 77

@@ -225,32 +225,74 @@ Put/Get 生命周期、AccessTable 锁定、slot 回收、参数校验和 Operat
 用于在本机生成 caller-side 测试数据，然后直接传给 CPU Mock。MPS 不是 CANN
 AIV 或 Direct-HCCP 的替身，因此不能作为 NPU 数据面验证结论。
 
-## RoCE 显式 HBM 注册句柄冒烟与时延
+## 本地 GatherRead 与远端 RoCE
 
-`tests/python/test_npu_hbm_region_roce.py` 是较小的 A5 端到端用例：它创建
-NPU 输入/输出 Tensor，显式调用 `register_hbm()`，重复执行 BatchPut 和 BatchGet，
-检查读回数据，并打印两条路径的批次时延统计。每轮计时不包含 access table
-准备、数据校验和 slot 释放；BatchGet 计时包含 stream 同步。
+在仓库根目录执行。A5 客户端加载目标 CANN 环境，安装 `libibverbs` 开发包，确保
+Ascend 驱动提供 `libascend_hal.so`。驱动在自定义目录时可设置 `ASCEND_DRIVER_PATH`。
+`--with-roce` 把 Host RoCE 编入同一份 NPU 扩展，并按标准 NPU 构建流程安装 AICPU 设备包。
 
-先在提供 DDR 的服务器启动 CPU 服务：
+在 A5 主机编译客户端和本机 URMA CPU 服务：
 
 ```bash
-./build-roce-npu/runtime/kvaf_roce_cpu_service \
-  --listen <server-ip> --port 29999 \
-  --rdma-device <cpu-rdma-device> --rdma-port 1 --gid-index <cpu-gid-index>
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+./build.sh npu --with-roce
+./build.sh cpu
+./build-cpu/runtime/kvaf_cpu_service --listen 127.0.0.1 --port 28999 \
+  --gather-threads 8 --gather-mode active
 ```
 
-再在 A5 客户端运行：
+在远端 DDR 主机安装 `libibverbs` 开发包，构建并启动 RoCE CPU 服务。把示例 IP、
+网口和 GID index 换成该主机的实际值。
 
 ```bash
-export PYTHONPATH="$PWD/build-roce-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-export KVAF_CPU_SERVICE_ADDR=<server-ip>:29999
+cmake -S . -B build-roce-cpu -DKVAF_BUILD_ROCE_CPU_SERVICE=ON -DBUILD_TESTING=OFF
+cmake --build build-roce-cpu --target kvaf_roce_cpu_service --parallel
+./build-roce-cpu/runtime/kvaf_roce_cpu_service --listen 192.0.2.10 --port 29999 \
+  --rdma-device hrn5_0 --rdma-port 1 --gid-index 1
+```
+
+在 A5 主机另开终端，加载同一个 CANN 环境并运行同进程冒烟。把远端地址和
+A5 本机 RDMA 参数换成实际值。
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+export KVAF_RUN_NPU_TESTS=1
+export KVAF_LOCAL_CPU_SERVICE_ADDR=127.0.0.1:28999
+export KVAF_CPU_SERVICE_ADDR=192.0.2.10:29999
 export DEVICE_ID=0
-export KVAF_ROCE_DEVICE=<npu0-rdma-device>
+export KVAF_ROCE_DEVICE=hrn5_4
 export KVAF_ROCE_PORT=1
-export KVAF_ROCE_GID_INDEX=<npu0-gid-index>
+export KVAF_ROCE_GID_INDEX=1
 python3 tests/python/test_npu_hbm_region_roce.py
 ```
+
+脚本在 RoCE 会话和 HBM 注册存活时运行本地 GatherRead 变长读回校验，再验证远端
+定长 BatchPut/BatchGet。`AICPU_ROCE_COEXISTENCE_PASS` 表示两条路径都通过。
+只跑 RoCE 时可用 `env -u KVAF_LOCAL_CPU_SERVICE_ADDR python3 tests/python/test_npu_hbm_region_roce.py`。
+
+业务进程对同一个 `kvaf` 包创建两个 Runtime。每条路径分别调用 `link_to` 和
+`initialize(ddr_bytes, slot_size)`，各自使用其 AccessTable 和 DDR 池。按 key 所在缓存池
+路由请求。本地实例可调用 `batch_get_ranges`，RoCE 实例当前使用图外的定长 `batch_get`。
+
+```python
+import os
+import kvaf
+
+layout = dict(batch_get_token_bytes=656, batch_get_tokens_per_block=128,
+              device_id=int(os.environ["DEVICE_ID"]))
+local = kvaf.NpuRuntime(**layout, transport="urma", aicpu_batch_get_mode="gather_read")
+remote = kvaf.NpuRuntime(**layout, transport="roce", rdma_device=os.environ["KVAF_ROCE_DEVICE"],
+                         rdma_port=int(os.environ["KVAF_ROCE_PORT"]),
+                         gid_index=int(os.environ["KVAF_ROCE_GID_INDEX"]))
+local.link_to(os.environ["KVAF_LOCAL_CPU_SERVICE_ADDR"])
+remote.link_to(os.environ["KVAF_CPU_SERVICE_ADDR"])
+slot_bytes = layout["batch_get_token_bytes"] * layout["batch_get_tokens_per_block"]
+local.initialize(16 * slot_bytes, slot_bytes)
+remote.initialize(16 * slot_bytes, slot_bytes)
+```
+
+### RoCE 显式 HBM 注册与时延
 
 默认使用 8 个 slot、每个 slot 4096 字节、1 次预热和 5 次采样。可通过
 `KVAF_HBM_TEST_BLOCKS`、`KVAF_HBM_TEST_TOKEN_BYTES`、

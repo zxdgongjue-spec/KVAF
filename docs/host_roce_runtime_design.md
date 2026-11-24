@@ -94,7 +94,7 @@
 远端 CPU 机器只需 Linux、verbs 开发库和可用的 RoCE 网口。
 
 ```bash
-cmake -S . -B build-roce-cpu -DKVAF_BUILD_ROCE_CPU_SERVICE=ON
+cmake -S . -B build-roce-cpu -DKVAF_BUILD_ROCE_CPU_SERVICE=ON -DBUILD_TESTING=OFF
 cmake --build build-roce-cpu --target kvaf_roce_cpu_service -j
 build-roce-cpu/runtime/kvaf_roce_cpu_service \
   --listen 90.96.15.111 --port 29999 \
@@ -106,13 +106,14 @@ build-roce-cpu/runtime/kvaf_roce_cpu_service \
 A5 客户端加载目标 CANN 环境后，构建 Python 绑定并运行现有 Runtime 集成用例。以下参数对应已通过 demo 的两台机器。
 
 ```bash
-cmake -S . -B build-roce-npu -DKVAF_ENABLE_ROCE_NPU=ON -DKVAF_BUILD_PYTHON=ON
-cmake --build build-roce-npu -j
-export PYTHONPATH="$PWD/build-roce-npu/python"
+./build.sh npu --with-roce
+export PYTHONPATH="$PWD/build-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 export KVAF_RUN_NPU_TESTS=1 KVAF_CPU_SERVICE_ADDR=90.96.15.111:29999
 export DEVICE_ID=0 KVAF_ROCE_DEVICE=hrn5_4 KVAF_ROCE_PORT=1 KVAF_ROCE_GID_INDEX=1
 python tests/python/test_npu_batch_get.py --transport roce
 ```
+
+两个后端在同一进程中的配置和验证命令见[本地 GatherRead 与远端 RoCE](../runtime/README.md#本地-gatherread-与远端-roce)。
 
 业务构造示例
 

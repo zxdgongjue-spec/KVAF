@@ -4,7 +4,8 @@
 
 `./build.sh npu` 默认将 AIV URMA、UBmem 和 AICPU Gather/Scatter 构建进同一个
 `build-npu/python/kvaf` 包，并自动安装 AICPU 设备包。运行时按 `transport` 和
-`aicpu_batch_get_mode` 选择后端；仅需 AIV/UBmem 时使用 `--without-aicpu`。
+`aicpu_batch_get_mode` 选择后端。`./build.sh npu --with-roce` 在同一份包中加入 Host RoCE。
+仅需 AIV/UBmem 时使用 `--without-aicpu`。
 
 `include/` 存放 Binding 内部共享头，`src/` 存放扩展实现；Python 包与构建后导入校验脚本保留在本目录。
 
@@ -38,12 +39,13 @@ output 行字节数或 AIV 的内部 status/queue buffer；output 行字节数�
 一致。`miss_count` 必须是单元素 `torch.int32` NPU Tensor，仅请求数组的
 `[0, miss_count)` 前缀参与搬运。
 
-`NpuRuntime(batch_get_kernel_object_path, batch_get_token_bytes,
+`NpuRuntime(batch_get_kernel_object_path="", batch_get_token_bytes,
 batch_get_tokens_per_block, device_id=0, npu_core_count=2,
 batch_put_kernel_object_path="", jettys_per_core=2, npu_eids=[],
 adaptive_ub_device=False, adaptive_ub_miss_count=2048, peer_ub_device="",
 adaptive_peer_ub_devices=[], batch_get_max_inflight_total=2048,
-transport="urma", *, aicpu_batch_get_mode="")`
+transport="urma", *, aicpu_batch_get_mode="", allocation_mode="append_only",
+rdma_device="", rdma_port=1, gid_index=-1, roce_cache_hbm=False)`
 要求显式传入单 token KV
 字节数和每个 KV block 中的 token 数，两个参数均无默认值；
 每个 AccessTable entry 大小为两者乘积。

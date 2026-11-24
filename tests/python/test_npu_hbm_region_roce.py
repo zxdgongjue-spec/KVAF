@@ -2,8 +2,8 @@
 """Small end-to-end test for explicit RoCE HBM registration handles.
 
 Run on an A5/CANN client with a separately running kvaf_roce_cpu_service.
-This intentionally tests only fixed-size BatchPut/BatchGet and the explicit
-register_hbm/unregister_hbm API; it does not require AIV kernel objects.
+Set KVAF_LOCAL_CPU_SERVICE_ADDR and KVAF_RUN_NPU_TESTS=1 to also exercise
+local AICPU GatherRead in the same process with the RoCE session alive.
 """
 
 from __future__ import annotations
@@ -118,6 +118,13 @@ def main() -> int:
             f"HBM_REGION_REGISTERED source_bytes={source_region.bytes} "
             f"output_bytes={output_region.bytes} device={source_region.device_id}"
         )
+        local_service = os.environ.get("KVAF_LOCAL_CPU_SERVICE_ADDR")
+        if local_service:
+            from test_npu_aicpu_gather_ranges import main as run_gather_ranges
+
+            status = run_gather_ranges(["--peer", local_service, "--device", str(device_id)])
+            if status != 0:
+                return status
 
         write_samples: list[float] = []
         read_samples: list[float] = []
@@ -142,9 +149,9 @@ def main() -> int:
                 miss_count,
                 output_indices,
                 output,
+                synchronize=True,
                 hbm_region=output_region,
             )
-            torch.npu.synchronize()
             read_ms = (time.perf_counter() - started) * 1000.0
 
             actual = output.cpu().contiguous().numpy().tobytes()
@@ -169,6 +176,8 @@ def main() -> int:
         runtime.unregister_hbm(output_region)
         output_region = None
         print("HBM_REGION_UNREGISTER_PASS")
+        if local_service:
+            print("AICPU_ROCE_COEXISTENCE_PASS")
         return 0
     finally:
         if table is not None:

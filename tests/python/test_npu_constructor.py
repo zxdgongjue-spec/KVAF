@@ -33,7 +33,7 @@ class ConstructorTests(unittest.TestCase):
         runtime = NpuRuntime(batch_get_token_bytes=656, batch_get_tokens_per_block=2,
                              transport="roce", rdma_device="hrn5_4", gid_index=1)
         self.assertEqual(runtime.values[0], "")
-        self.assertEqual(runtime.values[-2:], ("roce", ""))
+        self.assertEqual(runtime.values[-3:], ("roce", "", "append_only"))
         self.assertEqual(runtime.roce, ("hrn5_4", 1, 1))
         self.assertFalse(runtime.roce_cache_hbm)
         self.assertTrue(NpuRuntime("", 656, 2, transport="roce",

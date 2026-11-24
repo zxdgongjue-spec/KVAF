@@ -128,6 +128,7 @@ class BuildScriptTests(unittest.TestCase):
                     "KVAF_ENABLE_AICPU_URMA", "KVAF_ENABLE_AICPU_CPU_PUSH", "KVAF_BUILD_PYTHON"):
             self.assertEqual(options[key], "ON")
         self.assertEqual(options["KVAF_BUILD_REMOTE_CPU_SERVICE"], "OFF")
+        self.assertEqual(options["KVAF_ENABLE_ROCE_NPU"], "OFF")
         self.assertEqual(options["KVAF_AICPU_CXX"], "/custom compiler/cxx")
         self.assertEqual(options["Python_EXECUTABLE"], self.env["PYTHON"])
         self.assertEqual(options["Python3_EXECUTABLE"], self.env["PYTHON"])
@@ -139,6 +140,19 @@ class BuildScriptTests(unittest.TestCase):
         self.assertIn("CHECK_OK", result.stdout)
         self.assertEqual((self.cann / TAR_PATH).read_bytes(),
                          (self.build / "access_operator/src/aicpu_urma/kvaf-aicpu-urma.tar.gz").read_bytes())
+
+    def test_roce_and_aicpu_share_one_npu_build(self):
+        result = self.run_build("npu", "--with-roce")
+        self.assert_success(result)
+        options = self.options()
+        for key in ("KVAF_ENABLE_ROCE_NPU", "KVAF_ENABLE_AICPU_URMA", "KVAF_BUILD_PYTHON"):
+            self.assertEqual(options[key], "ON")
+        self.assertEqual(options["KVAF_BUILD_ROCE_CPU_SERVICE"], "OFF")
+        self.assertEqual(len(self.commands.read_text().splitlines()), 2)
+        self.assertEqual(result.stdout.count("NPU Python package:"), 1)
+        self.assertIn("KvafAicpuGatherReadRangesV1", json.loads((self.cann / JSON_PATH).read_text()))
+        self.assert_success(self.run_build())
+        self.assertEqual(self.options()["KVAF_ENABLE_ROCE_NPU"], "OFF")
 
     def test_trim_clears_cached_aicpu_flags_and_leaves_installed_package(self):
         self.assert_success(self.run_build())
@@ -197,7 +211,8 @@ class BuildScriptTests(unittest.TestCase):
         self.assertFalse((self.cann / "opp").exists())
 
     def test_conflicting_options_fail_before_build(self):
-        cases = [("cpu", "--without-aicpu"), ("aicpu-urma", "--without-aicpu")]
+        cases = [("cpu", "--without-aicpu"), ("aicpu-urma", "--without-aicpu"),
+                 ("cpu", "--with-roce"), ("aicpu-urma", "--with-roce")]
         cases += [("npu", "--without-aicpu", action) for action in
                   ("--install-kernel", "--check-kernel", "--uninstall-kernel")]
         for args in cases:

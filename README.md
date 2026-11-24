@@ -199,6 +199,9 @@ export ASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest
 这些是按需选择的不同命令，不需要依次执行。`aicpu-urma` 默认输出到
 `build-aicpu-urma`；统一构建使用 `build-npu`，运行时通过 `transport` 和
 `aicpu_batch_get_mode` 选择后端，无需切换 Python 包。
+同时使用本地 AICPU GatherRead 和远端 RoCE 时，执行 `./build.sh npu --with-roce`，
+仍从 `build-npu/python` 导入 `kvaf`。服务端启动、同进程调用和冒烟命令见
+[本地 GatherRead 与远端 RoCE](runtime/README.md#本地-gatherread-与远端-roce)。
 `--without-aicpu` 不检查 AICPU 依赖，也不修改已经安装的 AICPU 包；需要卸载时单独执行
 `./build.sh npu --uninstall-kernel`。原 `--install-kernel` 参数保留兼容。
 

@@ -520,6 +520,7 @@ struct NpuRuntime::Impl {
   std::unique_ptr<MetaManager> meta_manager;
   std::unique_ptr<DdrMemoryAllocator> allocator;
   PeerDdrAllocator* peer_allocator{nullptr};
+  std::string peer_address;
   std::shared_ptr<peer::PeerLink> peer_link;
 #if defined(KVAF_ENABLE_ROCE_NPU)
   std::shared_ptr<RoceSession> roce_session;
@@ -612,6 +613,11 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
   if (target.address.empty()) return Status::InvalidArgument("NpuRuntime LinkTo requires peer host:port");
   if (initialized()) return Status::InvalidState("NpuRuntime LinkTo must run before initialize");
   if (impl_->allocator != nullptr) return Status::InvalidState("NpuRuntime already has a peer");
+  if (impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
+      impl_->config.batch_put_kernel_object_path.empty()) {
+    return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
+  }
+  impl_->peer_address = target.address;
 #if defined(KVAF_ENABLE_ROCE_NPU)
   if (impl_->options.transport == Transport::kRoce) {
     const auto& options = impl_->options;
@@ -622,10 +628,6 @@ Status NpuRuntime::LinkTo(const LinkTarget& target) {
     return Status::OK();
   }
 #endif
-  if (impl_->backend == detail::RuntimeBackend::kUrmaAiv &&
-      impl_->config.batch_put_kernel_object_path.empty()) {
-    return Status::InvalidArgument("PeerLink requires the AIV BatchPut kernel for RMA validation");
-  }
   impl_->peer_link = std::make_shared<peer::PeerLink>(target.address);
   impl_->config.peer_link = impl_->peer_link;
   if (impl_->options.transport == Transport::kUbmem) {
@@ -659,7 +661,7 @@ Status NpuRuntime::Initialize(std::uint64_t ddr_bytes, std::uint64_t slot_size) 
 
   detail::InitializeGate initialize_gate;
   const Status gate_status = initialize_gate.AcquireFromEnvironment(
-      impl_->peer_link->address(), impl_->options.device_id, kUbSelectorLockPath);
+      impl_->peer_address, impl_->options.device_id, kUbSelectorLockPath);
   if (!gate_status.ok()) return gate_status;
 
   if (impl_->runtime_core != nullptr && impl_->runtime_core->needs_cleanup()) {
@@ -1090,6 +1092,7 @@ Status NpuRuntime::ReleaseLink(LinkId link_id) {
   if (link_id != 1U || impl_->allocator == nullptr) return Status::NotFound("PeerLink was not found");
   const Status shutdown = Shutdown();
   if (!shutdown.ok()) return shutdown;
+  impl_->peer_address.clear();
   impl_->peer_link.reset();
   impl_->config.peer_link.reset();
   impl_->config.peer_local_eid = {};
