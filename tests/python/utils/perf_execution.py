@@ -16,7 +16,7 @@ def default_put_cores(transport, executor):
 class BenchmarkExecution:
     def __init__(self, kvaf, *, transport="urma", executor="aiv",
                  algorithm="direct", put_capacity=128, get_capacity=65536,
-                 cores=0, jettys=2, get_kernel="", put_kernel="",
+                 get_cores=0, get_jettys=0, put_cores=0, put_jettys=0, get_kernel="", put_kernel="",
                  max_inflight_total=2048, sge_per_wr=0):
         if not 1 <= put_capacity <= 65536 or not 1 <= get_capacity <= 65536:
             raise ValueError("Put/Get request capacities must be in [1, 65536]")
@@ -36,16 +36,16 @@ class BenchmarkExecution:
                                else "reused")
         self.put_config = put = kvaf.PutExecutionConfig(transport, executor)
         self.get_config = get = kvaf.GetExecutionConfig(transport, executor, algorithm)
-        put_budget = dict(cores=cores, request_capacity=put_capacity)
-        get_budget = dict(cores=cores, request_capacity=get_capacity)
+        put_budget = dict(cores=put_cores, request_capacity=put_capacity)
+        get_budget = dict(cores=get_cores, request_capacity=get_capacity)
         if sge_per_wr:
             get_budget["sge_per_wr"] = sge_per_wr
         if executor == "aiv":
             put_budget["kernel_path"] = put_kernel
             get_budget["kernel_path"] = get_kernel
             if transport == "urma":
-                put_budget["jettys"] = min(jettys, 2)
-                get_budget.update(jettys=jettys, max_inflight_total=max_inflight_total)
+                put_budget["jettys"] = put_jettys
+                get_budget.update(jettys=get_jettys, max_inflight_total=max_inflight_total)
         self.runtime_kwargs = dict(
             transport_mode=transport, default_put=put, default_get=get,
             put_resources=[(put, kvaf.ExecutionResources(**put_budget))],

@@ -31,9 +31,15 @@ struct ExecutionWarmup {
   std::uint32_t request_capacity{0};
   void* stream{nullptr};
 };
+struct UrmaAivParallelism {
+  std::uint32_t cores, jettys_per_core;
+};
+constexpr UrmaAivParallelism DefaultUrmaAivParallelism(bool get, bool peer_local) {
+  return get && !peer_local ? UrmaAivParallelism{4, 1} : UrmaAivParallelism{2, 2};
+}
 struct ExecutionResources {
-  // Zero cores selects provider defaults: URMA AIV 2, UBMEM AIV 16,
-  // AICPU Put 1, AICPU Get 5. Zero Jettys selects 2 for URMA AIV. An absent
+  // Zero cores/Jettys select provider defaults: local URMA AIV Get 2 x 2,
+  // remote Get 4 x 1, Put 2 x 2. UBMEM AIV uses 16 cores, AICPU Put 1 / Get 5. An absent
   // in-flight budget uses 2048; explicit zero disables the limiter. Empty AIV
   // kernel paths use this build's bin output; AICPU packages resolve through CANN.
   std::uint32_t cores{0}, jettys{0}, request_capacity{65536}, cpu_threads{0};

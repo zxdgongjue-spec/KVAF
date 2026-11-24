@@ -12,10 +12,7 @@ namespace {
 using kvaf::CpuMemoryPageMode;
 
 constexpr std::size_t kTwoMiB = 2ULL << 20;
-constexpr std::size_t kOneGiB = 1ULL << 30;
 constexpr std::size_t kRequestBytes = kTwoMiB + 4096;
-constexpr int kTwoMiBShift = 21;
-constexpr int kOneGiBShift = 30;
 
 void Check(bool passed, const char* detail) {
   if (passed) return;
@@ -36,15 +33,23 @@ struct MmapCalls {
 void CheckLinuxPageModes() {
   void* memory = nullptr;
   std::size_t mapped_bytes = 0U;
-  const CpuMemoryPageMode modes[] = {CpuMemoryPageMode::kHugeTlb2M, CpuMemoryPageMode::kHugeTlb1G};
-  for (auto mode : modes) {
-    const bool giant = mode == CpuMemoryPageMode::kHugeTlb1G;
-    const auto expected = giant ? kOneGiB : 2 * kTwoMiB;
-    const auto shift = giant ? kOneGiBShift : kTwoMiBShift;
+  const struct {
+    const char* name;
+    unsigned int shift;
+    std::size_t page_count;
+  } cases[] = {{"hugetlb-64k", 16, 33}, {"hugetlb-2m", 21, 2}, {"hugetlb-16m", 24, 1},
+               {"hugetlb-32m", 25, 1}, {"hugetlb-512m", 29, 1}, {"hugetlb-1g", 30, 1},
+               {"hugetlb-16g", 34, 1}};
+  for (const auto& test : cases) {
+    CpuMemoryPageMode mode{};
+    Check(kvaf::ParseCpuMemoryPageMode(test.name, mode), "valid HugeTLB size rejected");
+    Check(kvaf::CpuMemoryPageModeName(mode) == test.name, "incorrect HugeTLB mode name");
+    const auto expected = test.page_count * (std::size_t{1} << test.shift);
     Check(kvaf::AllocateCpuDdr(mode, kRequestBytes, memory, mapped_bytes).ok(), "HugeTLB allocation failed");
     Check(memory == page_calls.memory && mapped_bytes == expected && page_calls.allocated_bytes == expected,
           "HugeTLB backing length was not rounded");
-    Check(page_calls.flags == (MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (shift << MAP_HUGE_SHIFT)),
+    Check(static_cast<unsigned int>(page_calls.flags) ==
+              (MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (test.shift << MAP_HUGE_SHIFT)),
           "wrong mmap flags for explicit HugeTLB mode");
     page_calls.release_error = EBUSY;
     Check(!kvaf::ReleaseCpuDdr(memory, mapped_bytes).ok() && memory && mapped_bytes == expected,
@@ -53,12 +58,26 @@ void CheckLinuxPageModes() {
     Check(kvaf::ReleaseCpuDdr(memory, mapped_bytes).ok() && !memory && !mapped_bytes &&
           page_calls.released_bytes == expected, "munmap must release the full backing length");
   }
+  for (const char* invalid : {"hugetlb-", "hugetlb-0m", "hugetlb-3m", "hugetlb-16mb", "hugetlb--2m",
+                              "hugetlb-2k", "hugetlb-16e", "hugetlb-18446744073709551616k"}) {
+    CpuMemoryPageMode mode = CpuMemoryPageMode::kDefault;
+    Check(!kvaf::ParseCpuMemoryPageMode(invalid, mode) && mode == CpuMemoryPageMode::kDefault,
+          "invalid HugeTLB size must be rejected");
+  }
+  CpuMemoryPageMode mode{};
+  Check(kvaf::ParseCpuMemoryPageMode("hugetlb-1024m", mode) && mode == CpuMemoryPageMode::kHugeTlb1G,
+        "equivalent HugeTLB sizes should produce the same page mode");
+
   Check(!kvaf::AllocateCpuDdr(CpuMemoryPageMode::kHugeTlb2M, std::numeric_limits<std::size_t>::max(),
                              memory, mapped_bytes).ok(), "HugeTLB rounding overflow must fail");
   page_calls.allocation_error = ENOMEM;
   const auto failure = kvaf::AllocateCpuDdr(CpuMemoryPageMode::kHugeTlb2M, kRequestBytes, memory, mapped_bytes);
   Check(!failure.ok() && failure.message().find("mmap_hugetlb") != std::string::npos && !memory,
         "failed HugeTLB allocation must report the error without retrying with ordinary pages");
+  page_calls.allocation_error = EINVAL;
+  const auto unsupported = kvaf::AllocateCpuDdr(mode, kRequestBytes, memory, mapped_bytes);
+  Check(!unsupported.ok() && unsupported.message().find("/sys/kernel/mm/hugepages") != std::string::npos &&
+        !memory && !mapped_bytes, "invalid HugeTLB mmap must report where to check supported sizes");
   page_calls.allocation_error = 0;
 #ifdef MADV_POPULATE_WRITE
   page_calls.prefault_error = EFAULT;

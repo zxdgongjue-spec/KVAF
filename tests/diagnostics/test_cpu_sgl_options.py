@@ -38,9 +38,23 @@ class CpuSglOptionsTest(unittest.TestCase):
                                GetExecutionConfig=lambda *args: args)
         for count in (4, 8):
             execution = BenchmarkExecution(kvaf, executor="aicpu", algorithm="cpu_sgl_write",
-                                           sge_per_wr=count)
-            self.assertEqual(execution.runtime_kwargs["get_resources"][0][1]["sge_per_wr"], count)
-            self.assertNotIn("sge_per_wr", execution.runtime_kwargs["put_resources"][0][1])
+                                           get_cores=4, put_cores=1, sge_per_wr=count)
+            get = execution.runtime_kwargs["get_resources"][0][1]
+            put = execution.runtime_kwargs["put_resources"][0][1]
+            self.assertEqual(get["sge_per_wr"], count)
+            self.assertEqual(get["cores"], 4)
+            self.assertEqual(put["cores"], 1)
+            self.assertNotIn("sge_per_wr", put)
+
+    def test_aiv_automatic_resources_survive_child_forwarding(self):
+        args = parse_args(["--backend", "aiv"])
+        self.assertIsNone(validate_args(args))
+        self.assertIsNone(args.parallelism)
+        self.assertIsNone(args.jettys_per_core)
+        child = parse_args(workload_command(args))
+        self.assertIsNone(child.parallelism)
+        self.assertIsNone(child.jettys_per_core)
+        self.assertEqual(child.sge_per_wr, 0)
 
     def test_csv_records_selected_sge(self):
         args = parse_args(["--backend", "cpu_sgl_write", "--sge-per-wr", "8"])

@@ -898,7 +898,8 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
         executor="aicpu" if uses_aicpu(args) else "aiv",
         algorithm={"gather_read": "gather", "cpu_push_scatter": "scatter", "cpu_sgl_write": "cpu_sgl_write"}.get(args.backend, "direct"),
         put_capacity=min(args.populate_chunk_entries, table_capacity),
-        get_capacity=request_length, cores=args.parallelism, jettys=args.jettys_per_core,
+        get_capacity=request_length, get_cores=args.parallelism or 0, get_jettys=args.jettys_per_core or 0,
+        put_cores=0 if args.backend == "aiv" else args.parallelism,
         get_kernel="" if uses_aicpu(args) else str(kernel),
         put_kernel="" if uses_aicpu(args) else str(batch_put_kernel),
         max_inflight_total=args.max_inflight_total, sge_per_wr=args.sge_per_wr,
@@ -911,6 +912,18 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
     device_table = None
     kernel_profile_started = False
     try:
+        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
+        runtime.initialize(ddr_bytes, block_bytes)
+        print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
+        if args.backend == "aiv":
+            resources = runtime.get_execution_resources(execution.get_config)
+            args.parallelism = args.aiv_cores = resources.cores
+            args.jettys_per_core = resources.jettys
+            error = validate_workload(args)
+            if error:
+                raise ValueError(error)
+            if report is not None:
+                report.config.update(aiv_cores=resources.cores, jettys_per_core=resources.jettys)
         timing = {
             "sync-call": "synchronous_batch_get",
             "async-drain": "async_submit_to_drain",
@@ -936,10 +949,6 @@ def run_case(args, torch, kvaf, kernel, batch_put_kernel, remote_cpu_service, re
             f"kernel_profile_clock_mhz={args.kernel_profile_clock_mhz} "
             f"get_timing={args.get_timing} timing={timing}"
         )
-
-        print("BATCH_GET_PERF_PHASE_BEGIN phase=initialize", flush=True)
-        runtime.initialize(ddr_bytes, block_bytes)
-        print("BATCH_GET_PERF_PHASE_DONE phase=initialize", flush=True)
 
         # Distinct global token IDs expose wrong-block reads and stale staging.
         # Populate in bounded chunks even when the table is much larger than HBM.

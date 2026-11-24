@@ -5,11 +5,15 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -61,6 +65,8 @@ bool SplitEndpoint(const std::string& endpoint, std::string* host, std::string* 
     return false;
   }
   *host = endpoint.substr(0U, separator);
+  if (host->size() > 1 && host->front() == '[' && host->back() == ']')
+    *host = host->substr(1, host->size() - 2);
   *port = endpoint.substr(separator + 1U);
   return true;
 }
@@ -99,9 +105,59 @@ bool ResultOk(Result result, std::string* error) {
   return false;
 }
 
+// Normalize IPv4-mapped IPv6 addresses before comparing with local interfaces.
+in6_addr IpAddress(const sockaddr* addr) {
+  if (addr->sa_family == AF_INET6) return reinterpret_cast<const sockaddr_in6*>(addr)->sin6_addr;
+  in6_addr ip{};
+  ip.s6_addr[10] = ip.s6_addr[11] = 0xff;
+  std::memcpy(ip.s6_addr + 12, &reinterpret_cast<const sockaddr_in*>(addr)->sin_addr, 4);
+  return ip;
+}
+
+struct ConnectedPeer {
+  bool local{};
+  std::string endpoint;
+};
+
+bool IdentifyPeer(int fd, ConnectedPeer* peer, std::string* error) {
+  sockaddr_storage storage{};
+  socklen_t bytes = sizeof(storage);
+  auto* addr = reinterpret_cast<sockaddr*>(&storage);
+  char host[NI_MAXHOST], port[NI_MAXSERV];
+  if (getpeername(fd, addr, &bytes) != 0 ||
+      (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) ||
+      getnameinfo(addr, bytes, host, sizeof(host), port, sizeof(port),
+                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+    SetError(error, "cannot identify connected CPU service address");
+    return false;
+  }
+  peer->endpoint = std::string(host) + ":" + port;
+  const auto ip = IpAddress(addr);
+  peer->local = IN6_IS_ADDR_LOOPBACK(&ip) || (IN6_IS_ADDR_V4MAPPED(&ip) && ip.s6_addr[12] == 127);
+  if (peer->local) return true;
+  ifaddrs* interfaces = nullptr;
+  if (getifaddrs(&interfaces) != 0) {
+    SetError(error, "cannot enumerate local network interfaces");
+    return false;
+  }
+  for (auto* it = interfaces; it; it = it->ifa_next) {
+    if (!it->ifa_addr || (it->ifa_addr->sa_family != AF_INET && it->ifa_addr->sa_family != AF_INET6))
+      continue;
+    const auto local = IpAddress(it->ifa_addr);
+    if (std::memcmp(&local, &ip, sizeof(ip)) != 0) continue;
+    if (IN6_IS_ADDR_LINKLOCAL(&ip) &&
+        reinterpret_cast<const sockaddr_in6*>(addr)->sin6_scope_id != if_nametoindex(it->ifa_name))
+      continue;
+    peer->local = true;
+    break;
+  }
+  freeifaddrs(interfaces);
+  return true;
+}
+
 template <typename Request, typename Response>
 bool Exchange(const std::string& endpoint, const Request& request, Response* response,
-              std::string* error) {
+              std::string* error, ConnectedPeer* peer = nullptr) {
   if (response == nullptr) {
     SetError(error, "response must not be null");
     return false;
@@ -109,7 +165,8 @@ bool Exchange(const std::string& endpoint, const Request& request, Response* res
   const int fd = Connect(endpoint, error);
   if (fd < 0) return false;
   const bool transferred = WriteAll(fd, &request, sizeof(request), error) &&
-                           ReadAll(fd, response, sizeof(*response), error);
+                           ReadAll(fd, response, sizeof(*response), error) &&
+                           (!peer || IdentifyPeer(fd, peer, error));
   close(fd);
   return transferred;
 }
@@ -123,16 +180,17 @@ bool Exchange(const PeerLink& link, const Request& request, Response* response,
 bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
                          uint32_t* device_count,
                          bool* device_filter_applied,
-                         std::string* error) {
+                         std::string* error, ConnectedPeer* peer = nullptr,
+                         Command command = Command::kGetCandidateCount) {
   if (candidate_count == nullptr) {
     SetError(error, "candidate count output must not be null");
     return false;
   }
   CandidateCountRequest request{};
-  request.header = MakeHeader(Command::kGetCandidateCount, sizeof(request));
+  request.header = MakeHeader(command, sizeof(request));
   CandidateCountResponse response{};
-  if (!Exchange(endpoint, request, &response, error) ||
-      !IsValidResponseHeader(response.header, Command::kGetCandidateCount, sizeof(response)) ||
+  if (!Exchange(endpoint, request, &response, error, peer) ||
+      !IsValidResponseHeader(response.header, command, sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error) || response.candidate_count == 0U) {
     if (error != nullptr && error->empty()) *error = "peer service returned no usable UMDK/EID candidates";
     return false;
@@ -151,18 +209,28 @@ bool GetCandidateCountAt(const std::string& endpoint, uint32_t* candidate_count,
 }
 
 bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
-                        PeerCandidateInfo* info, std::string* error) {
+                        PeerCandidateInfo* info, bool with_eid, std::string* error) {
   if (info == nullptr) {
     SetError(error, "candidate info output must not be null");
     return false;
   }
-  CandidateInfoRequest request{};
-  request.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
-  request.candidate_id = candidate_id;
-  CandidateInfoResponse response{};
-  if (!Exchange(endpoint, request, &response, error) ||
-      !IsValidResponseHeader(response.header, Command::kGetCandidateInfo,
-                             sizeof(response)) ||
+  CandidateEidResponse record{};
+  auto& response = record.info;
+  bool received;
+  if (with_eid) {
+    CandidateEidRequest request{};
+    request.info.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
+    request.info.candidate_id = candidate_id;
+    request.response_bytes = sizeof(record);
+    received = Exchange(endpoint, request, &record, error);
+  } else {
+    CandidateInfoRequest request{};
+    request.header = MakeHeader(Command::kGetCandidateInfo, sizeof(request));
+    request.candidate_id = candidate_id;
+    received = Exchange(endpoint, request, &response, error);
+  }
+  if (!received || !IsValidResponseHeader(response.header, Command::kGetCandidateInfo,
+                                          with_eid ? sizeof(record) : sizeof(response)) ||
       !ResultOk(static_cast<Result>(response.result), error) ||
       response.candidate_id != candidate_id) {
     if (error != nullptr && error->empty()) {
@@ -182,6 +250,11 @@ bool GetCandidateInfoAt(const std::string& endpoint, uint32_t candidate_id,
   candidate.device_name.assign(
       response.device_name,
       static_cast<const char*>(name_end) - response.device_name);
+  std::copy_n(record.eid, candidate.eid.size(), candidate.eid.begin());
+  if (with_eid && candidate.eid == decltype(candidate.eid){}) {
+    SetError(error, "CPU candidate has zero EID");
+    return false;
+  }
   *info = std::move(candidate);
   return true;
 }
@@ -348,12 +421,20 @@ Status PeerLink::AllocateCacheRegion(std::uint64_t bytes, std::uint64_t slot, st
   if (s.ok()) *out = execution_->reply.binding;
   return s;
 }
-std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& config) {
+std::shared_ptr<PeerLink> PeerLink::ExecutionSession(const execution::Request& config,
+                                                     const PeerCandidateInfo* candidate) {
   auto child = std::make_shared<PeerLink>(address_);
   child->parent_ = shared_from_this();
   child->execution_ = std::make_shared<ExecutionState>();
   auto& q = child->execution_->create;
   q = config;
+  if (candidate) {
+    q.candidate = candidate->candidate_id;
+    q.payload.assign(candidate->eid.begin(), candidate->eid.end());
+    child->selected_cpu_eid_ = candidate->eid;
+  } else if (config.transport == Transport::Urma) {
+    child->selected_cpu_eid_ = selected_cpu_eid_;
+  }
   q.op = execution::Op::OpenSession;
   q.client = ClientId();
   q.request = NextRequest();
@@ -427,6 +508,8 @@ Status PeerLink::PrepareExecution() {
                    state.reply.slot_size != parent_->execution_->reply.slot_size ||
                    b.length != parent_->execution_->reply.binding.length)))
     return Status::Internal("execution identity or binding differs from negotiated region");
+  if (selected_cpu_eid_ && b.eid != *selected_cpu_eid_)
+    return Status::InvalidState("registered CPU EID differs from the selected candidate");
   const auto canonical =
       parent_ ? parent_->execution_->reply.binding.base : state.reply.binding.base;
   regions_[canonical] = state.reply.binding;
@@ -545,10 +628,144 @@ Status PeerLink::GetCandidateCount(uint32_t* candidate_count, uint32_t* device_c
              : ToStatus("peer candidate discovery failed", std::move(error));
 }
 
-Status PeerLink::GetCandidateInfo(uint32_t candidate_id,
-                                  PeerCandidateInfo* info) const {
+Status PeerLink::GetCacheCandidateCount(PeerCandidateTable* table) const {
+  if (!table) return Status::InvalidArgument("missing CPU candidate table");
   std::string error;
-  return GetCandidateInfoAt(address_, candidate_id, info, &error)
+  return GetCandidateCountAt(address_, &table->count, &table->device_count, &table->device_fixed,
+                             &error, nullptr, Command::kGetCacheCandidateCount)
+             ? Status::OK() : ToStatus("cache candidate discovery failed", std::move(error));
+}
+Status PeerLink::DiscoverCandidates(PeerCandidateTable* table, bool cache_scope) {
+  if (!table) return Status::InvalidArgument("missing CPU candidate table");
+  ConnectedPeer peer;
+  std::string error;
+  if (!GetCandidateCountAt(address_, &table->count, &table->device_count, &table->device_fixed,
+                           &error, &peer, cache_scope ? Command::kGetCacheCandidateCount : Command::kGetCandidateCount))
+    return ToStatus("CPU candidate discovery failed", std::move(error));
+  table->local = peer.local;
+  address_ = std::move(peer.endpoint);  // Keep metadata and execution on the same resolved address.
+  return Status::OK();
+}
+
+namespace {
+Status ParseDevices(const std::string& csv, std::vector<std::string>* devices) {
+  if (csv.empty()) return Status::OK();
+  std::size_t start = 0;
+  for (;;) {
+    const auto end = csv.find(',', start);
+    auto name = csv.substr(start, end - start);
+    const char* spaces = " \t\r\n";
+    const auto first = name.find_first_not_of(spaces);
+    if (first == std::string::npos)
+      return Status::InvalidArgument("empty device in peer_ub_device");
+    name = name.substr(first, name.find_last_not_of(spaces) - first + 1);
+    if (std::find(devices->begin(), devices->end(), name) != devices->end())
+      return Status::InvalidArgument("duplicate UB device in peer_ub_device: " + name);
+    devices->push_back(std::move(name));
+    if (end == std::string::npos) return Status::OK();
+    start = end + 1;
+  }
+}
+
+Status DefaultFeCount(uint32_t* count) {
+  constexpr uint32_t kDefaultPeerFeCount = 2;
+  *count = kDefaultPeerFeCount;
+  const char* value = std::getenv("KVAF_DEFAULT_PEER_FE_COUNT");
+  if (!value) return Status::OK();
+  const char* end = value + std::strlen(value);
+  const auto parsed = std::from_chars(value, end, *count);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !*count)
+    return Status::InvalidArgument("KVAF_DEFAULT_PEER_FE_COUNT must be a positive uint32");
+  return Status::OK();
+}
+}  // namespace
+
+Status PeerLink::SelectCpuFes(const PeerCandidateTable& table, const std::string& csv,
+                              const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
+                              bool multiple_local_eids, CpuFeSelection* selected) const {
+  if (!selected || !table.count) return Status::InvalidArgument("empty CPU candidate selection");
+  std::vector<std::string> devices;
+  auto status = ParseDevices(csv, &devices);
+  if (!status.ok()) return status;
+  if (devices.size() > 1 && (table.local || multiple_local_eids))
+    return Status::InvalidArgument("multiple peer UB devices require a remote CPU and one local NPU EID");
+
+  CpuFeSelection result;
+  result.explicit_devices = !devices.empty();
+  const bool automatic_multi = devices.empty() && !table.local && !table.device_fixed && !multiple_local_eids;
+  const bool match_pair = devices.empty() && table.local && !table.device_fixed && pair_cpu_eid;
+  result.requested_count = devices.empty() ? 1U : static_cast<uint32_t>(devices.size());
+  if (automatic_multi) {
+    status = DefaultFeCount(&result.requested_count);
+    if (!status.ok()) return status;
+  }
+  // Slots preserve the caller's order even when the service enumerates in a different order.
+  result.direct_get.resize(devices.size());
+  std::size_t found = 0;
+  for (uint32_t index = 0; index < table.count; ++index) {
+    PeerCandidateInfo info;
+    status = GetCandidateInfo(index, &info);
+    if (!status.ok()) return status;
+    if (info.device_id >= table.device_count) return Status::Internal("invalid CPU device index");
+    if (!index) result.primary = info;
+    if (!devices.empty()) {
+      // Legacy single-device pin accepts the first advertised index, including a service pin.
+      if (devices.size() > 1 && info.eid_index != 0) continue;
+      const auto it = std::find(devices.begin(), devices.end(), info.device_name);
+      if (it == devices.end()) continue;
+      auto& slot = result.direct_get[it - devices.begin()];
+      if (slot.device_name.empty()) {
+        slot = std::move(info);
+        ++found;
+      }
+      if (found == devices.size()) break;
+    } else if (automatic_multi) {
+      // Candidates are ordered by device and index by the CPU service.
+      if (info.eid_index == 0 && (result.direct_get.empty() ||
+                                  result.direct_get.back().device_id != info.device_id))
+        result.direct_get.push_back(info);
+      if (result.direct_get.size() == result.requested_count) break;
+    } else if (!match_pair || info.eid == *pair_cpu_eid) {
+      result.primary = info;
+      break;
+    }
+  }
+  for (std::size_t i = 0; i < devices.size(); ++i)
+    if (result.direct_get[i].device_name.empty())
+      return Status::NotFound("CPU service did not advertise requested UB device " + devices[i] +
+                              (devices.size() > 1 ? " with eid_index=0" : ""));
+  if (!automatic_multi && devices.empty()) result.direct_get.push_back(result.primary);
+  if (result.explicit_devices) result.primary = result.direct_get.front();
+  *selected = std::move(result);
+  return Status::OK();
+}
+
+Status CpuFeSelection::ForDirectGet(uint64_t workers, std::vector<PeerCandidateInfo>* active) const {
+  if (!active) return Status::InvalidArgument("missing Direct Get FE selection output");
+  if (direct_get.empty()) return Status::NotFound("no advertised CPU UB device with eid_index=0");
+  if (!workers || (explicit_devices && direct_get.size() > workers))
+    return Status::InvalidArgument("Direct Get has " + std::to_string(workers) +
+        " Jetty workers for " + std::to_string(direct_get.size()) + " peer UB devices");
+  active->assign(direct_get.begin(), direct_get.begin() + std::min<uint64_t>(workers, direct_get.size()));
+  return Status::OK();
+}
+
+Status PeerLink::SelectCpuCandidate(const PeerCandidateTable& table, const std::string& device,
+                                    const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
+                                    PeerCandidateInfo* selected) {
+  if (!selected) return Status::InvalidArgument("missing CPU candidate selection output");
+  CpuFeSelection selection;
+  auto status = SelectCpuFes(table, device, pair_cpu_eid, true, &selection);
+  if (!status.ok()) return status;
+  *selected = std::move(selection.primary);
+  selected_cpu_eid_ = selected->eid;
+  return Status::OK();
+}
+
+Status PeerLink::GetCandidateInfo(uint32_t candidate_id,
+                                  PeerCandidateInfo* info, bool with_eid) const {
+  std::string error;
+  return GetCandidateInfoAt(address_, candidate_id, info, with_eid, &error)
              ? Status::OK()
              : ToStatus("peer candidate metadata query failed", std::move(error));
 }
