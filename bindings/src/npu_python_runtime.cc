@@ -1,4 +1,5 @@
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <thread>
 #include "npu_python_runtime.h"
@@ -26,6 +27,9 @@
 #include "acl_python_utils.h"
 #include "npu_runtime.h"
 #include "npu_runtime_constructor.h"
+#include "npu_tensor_python.h"
+#include "hbm_read_python.h"
+#include "remote_offload_python.h"
 
 namespace py = pybind11;
 
@@ -111,7 +115,8 @@ void* PointerFromValue(std::uint64_t pointer) {
   return reinterpret_cast<void*>(static_cast<std::uintptr_t>(pointer));
 }
 
-struct NpuTensorView {
+// BatchGet needs rank and row count without allocating a full shape vector.
+struct NpuTensorLayout {
   void* data{nullptr};
   std::size_t bytes{0};
   std::size_t element_bytes{0};
@@ -135,7 +140,7 @@ class TensorMetadataMethods {
     if (!current_stream_) current_stream_ = py::module_::import("torch").attr("npu").attr("current_stream");
     return current_stream_();
   }
-  NpuTensorView View(const py::object& tensor, const char* name) const {
+  NpuTensorLayout View(const py::object& tensor, const char* name) const {
     if (!Call(tensor, contiguous_).cast<bool>())
       throw py::value_error(std::string(name) + " must be contiguous");
     if (tensor.attr("device").attr("type").cast<std::string>() != "npu")
@@ -157,6 +162,9 @@ class TensorMetadataMethods {
   py::str contiguous_{"is_contiguous"}, data_ptr_{"data_ptr"}, numel_{"numel"}, element_size_{"element_size"};
   py::object current_stream_;
 };
+using python_binding::GetNpuTensorView;
+
+using python_binding::TensorStorageOwner;
 
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
   if (result == nullptr) {
@@ -322,12 +330,23 @@ class PythonGetGraphResources;
 
 class NpuPythonRuntime final {
  public:
-  NpuPythonRuntime(std::uint32_t batch_get_token_bytes,
-                   std::uint32_t batch_get_tokens_per_block, std::uint32_t device_id,
+  NpuPythonRuntime(py::object batch_get_token_bytes,
+                   py::object batch_get_tokens_per_block, std::uint32_t device_id,
                    const std::string& transport_mode, py::object default_put,
                    py::object default_get, py::object put_resources, py::object get_resources,
-                   std::vector<std::string> npu_eids, std::string peer_ub_device) {
-    NpuRuntimeOptions options{batch_get_token_bytes, batch_get_tokens_per_block};
+                   std::vector<std::string> npu_eids, std::string peer_ub_device,
+                   py::object cpu_pull_options, py::object npu_pull_options) {
+    NpuRuntimeOptions options;
+    if (batch_get_token_bytes.is_none() != batch_get_tokens_per_block.is_none())
+      throw py::value_error("cache layout requires both token_bytes and tokens_per_block");
+    if (!batch_get_token_bytes.is_none()) {
+      options.batch_get_token_bytes = batch_get_token_bytes.cast<std::uint32_t>();
+      options.batch_get_tokens_per_block = batch_get_tokens_per_block.cast<std::uint32_t>();
+      if (!options.batch_get_token_bytes || !options.batch_get_tokens_per_block)
+        throw py::value_error("explicit cache layout dimensions must be positive");
+    }
+    if (!cpu_pull_options.is_none()) options.cpu_pull_options = cpu_pull_options.cast<CpuPullOptions>();
+    if (!npu_pull_options.is_none()) options.npu_pull_options = npu_pull_options.cast<NpuPullOptions>();
     if (transport_mode == "urma") options.transport_mode = TransportMode::Urma;
     else if (transport_mode == "ubmem") options.transport_mode = TransportMode::Ubmem;
     else if (transport_mode == "urma+ubmem") options.transport_mode = TransportMode::UrmaAndUbmem;
@@ -358,8 +377,268 @@ class NpuPythonRuntime final {
     return acl_python::StreamFromPython(metadata_.SelectStream(stream));
   }
 
+  void InitializeBase() { ThrowIfError(native_->Initialize()); }
+  void InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_size) {
+    ThrowIfError(native_->InitializeDdr(ddr_bytes, slot_size));
+  }
+  void ShutdownDdr() {
+    Status status;
+    std::unique_lock<std::mutex> get(get_mutex_, std::defer_lock), put(put_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; std::lock(get, put); status = native_->ShutdownDdr(); }
+    if (status.ok()) {
+      pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{};
+      put_input_refs_.clear(); pending_put_input_refs_.clear();
+    }
+    ThrowIfError(status);
+  }
+
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+  py::object BatchCpuPull(const py::object& keys, const ReadyToken& ready, const py::object& offsets,
+                         const py::object& lengths, const py::object& timeout, bool profiling) {
+    using Clock = std::chrono::steady_clock;
+    const auto begin = profiling ? Clock::now() : Clock::time_point{};
+    const auto key_ids = CopyPrepareKeys(keys);
+    std::vector<std::uint64_t> sources, sizes;
+    CopyCpuUint64SequenceInto(offsets, "src_offsets", &sources);
+    CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
+    const auto timeout_ms = timeout.is_none() ? UINT32_MAX : timeout.cast<std::uint32_t>();
+    const double binding_prepare_us = profiling
+        ? std::chrono::duration<double, std::micro>(Clock::now() - begin).count() : 0;
+    CpuPullProfile profile;
+    Status status;
+    { py::gil_scoped_release release;
+      status = native_->BatchCpuPull(key_ids, ready, sources, sizes, timeout_ms, profiling ? &profile : nullptr); }
+    ThrowIfError(status);
+    if (!profiling) return py::none();
+    py::dict timing;
+    timing["binding_prepare_us"] = binding_prepare_us;
+    timing["native_total_us"] = profile.total_us;
+    timing["validation_us"] = profile.validation_us;
+    timing["prepare_put_us"] = profile.prepare_put_us;
+    timing["dst_offsets_us"] = profile.dst_offsets_us;
+    timing["submit_wait_cpu_pull_us"] = profile.submit_wait_cpu_pull_us;
+    timing["wait_cpu_pull_us"] = profile.wait_cpu_pull_us;
+    timing["commit_put_us"] = profile.commit_put_us;
+    timing["native_other_us"] = std::max(0.0, profile.total_us - profile.validation_us
+        - profile.prepare_put_us - profile.dst_offsets_us - profile.submit_wait_cpu_pull_us
+        - profile.wait_cpu_pull_us - profile.commit_put_us);
+    const auto& detail = profile.submit;
+    py::dict submit;
+    submit["snapshot_us"] = detail.snapshot_us;
+    submit["cover_check_us"] = detail.cover_check_us;
+    submit["span_prepare_us"] = detail.span_prepare_us;
+    submit["request_save_us"] = detail.request_save_us;
+    submit["channel_setup_us"] = detail.channel_setup_us;
+    submit["send_us"] = detail.send_us;
+    submit["receive_us"] = detail.receive_us;
+    submit["response_check_us"] = detail.response_check_us;
+    submit["other_us"] = profile.submit_wait_cpu_pull_us - detail.snapshot_us - detail.cover_check_us
+        - detail.span_prepare_us - detail.request_save_us - detail.channel_setup_us
+        - detail.send_us - detail.receive_us - detail.response_check_us;
+    timing["submit_detail"] = std::move(submit);
+    timing["server_detail"] = py::none();
+    timing["rpc_gap_us"] = py::none();
+    if (detail.server_available) {
+      const auto& cpu = detail.server;
+      py::dict server;
+      server["span_receive_us"] = cpu.receive_ns / 1000.0;
+      server["control_lock_us"] = cpu.control_lock_ns / 1000.0;
+      server["validation_us"] = cpu.validation_ns / 1000.0;
+      server["worker_start_us"] = cpu.worker_start_ns / 1000.0;
+      server["backend_read_us"] = cpu.backend_read_ns / 1000.0;
+      server["completion_us"] = cpu.completion_ns / 1000.0;
+      server["reply_prepare_us"] = cpu.reply_prepare_ns / 1000.0;
+      server["total_us"] = cpu.total_ns / 1000.0;
+      timing["server_detail"] = std::move(server);
+      timing["rpc_gap_us"] = detail.send_us + detail.receive_us - cpu.total_ns / 1000.0;
+    }
+    py::dict result;
+    result["profile"] = std::move(timing);
+    return result;
+  }
+  void CancelCpuPull(const ReadyToken& ready) {
+    Status status;
+    { py::gil_scoped_release release; status = native_->CancelCpuPull(ready); }
+    ThrowIfError(status);
+  }
+  void ResolveCpuPull(const py::object& timeout) {
+    const auto timeout_ms = timeout.is_none() ? UINT32_MAX : timeout.cast<std::uint32_t>();
+    Status status;
+    { py::gil_scoped_release release; status = native_->ResolveCpuPull(timeout_ms); }
+    ThrowIfError(status);
+  }
+  py::dict OffloadRegion() {
+    OffloadRegionTicket ticket; Status status;
+    { py::gil_scoped_release release; status = native_->GetOffloadRegion(&ticket); }
+    ThrowIfError(status); return remote_python::Pack(ticket);
+  }
+  PutHandle PreparePut(const py::object& keys,const py::object& lengths) {
+    std::vector<std::uint64_t> sizes;
+    CopyCpuUint64SequenceInto(lengths,"lengths",&sizes);
+    const auto copied_keys = CopyPrepareKeys(keys);
+    PutHandle put; Status status;
+    { py::gil_scoped_release release; status = native_->PreparePut(copied_keys,sizes,&put); }
+    ThrowIfError(status); return put;
+  }
+  void SubmitCpuPull(const ReadyToken& ready,const PutHandle& put,
+                           const py::object& src,const py::object& dst_offsets,const py::object& lengths) {
+    std::vector<std::uint64_t> sources, destinations, sizes;
+    CopyCpuUint64SequenceInto(src, "src_offsets", &sources);
+    CopyCpuUint64SequenceInto(dst_offsets, "dst_offsets", &destinations);
+    CopyCpuUint64SequenceInto(lengths, "lengths", &sizes);
+    Status status;
+    { py::gil_scoped_release release; status = native_->SubmitCpuPull(ready,put,sources,destinations,sizes); }
+    ThrowIfError(status);
+  }
+  CpuPullState QueryCpuPull(const PutHandle& put) {
+    CpuPullState state; Status status;
+    { py::gil_scoped_release release; status = native_->QueryCpuPull(put,&state); }
+    ThrowIfError(status); return state;
+  }
+  CpuPullState WaitCpuPull(const PutHandle& put,std::uint32_t timeout) {
+    CpuPullState state; Status status;
+    {py::gil_scoped_release release;status=native_->WaitCpuPull(put,timeout,&state);}
+    ThrowIfError(status); return state;
+  }
+  CpuPullState CommitPut(const PutHandle& put) {
+    Status status; { py::gil_scoped_release release; status = native_->CommitPut(put); }
+    ThrowIfError(status); return put.state();
+  }
+  CpuPullState AbortPut(const PutHandle& put) {
+    Status status; { py::gil_scoped_release release; status = native_->AbortPut(put); }
+    ThrowIfError(status); return put.state();
+  }
+  bool PendingOffload() const { py::gil_scoped_release release; return native_->pending_offload(); }
+  std::uint64_t LastChecksum() const {
+    std::uint64_t hash{}; Status status;
+    { py::gil_scoped_release release; status = native_->LastOffloadChecksum(&hash); }
+    ThrowIfError(status); return hash;
+  }
+#endif
+
+  py::dict ListenHbm(const std::string& address,const std::string& advertised,const std::string& eid) {
+    HbmReceiverTicket ticket;Status status;
+    {py::gil_scoped_release release;status=native_->ListenHbm(address,advertised,eid,&ticket);}
+    ThrowIfError(status);return hbm_read_python::Pack(ticket);
+  }
+  void CancelRawAddr(const ReadyToken& ready) {
+    Status status;{py::gil_scoped_release release;status=native_->CancelRawAddr(ready);}
+    ThrowIfError(status);
+  }
+  void ResolveRawAddr(const ReadyToken& ready) {
+    Status status;{py::gil_scoped_release release;status=native_->ResolveRawAddr(ready);}
+    ThrowIfError(status);
+  }
+  py::dict BatchGetRawArrays(const ReadyToken& ready,const py::object& src,const py::object& dst,
+                         const py::object& lengths,py::object output,py::object stream,bool profiling,bool validate_ranges,
+                         bool synchronize) {
+    using Clock = std::chrono::steady_clock;
+    const auto begin=profiling?Clock::now():Clock::time_point{};
+    auto previous=begin;
+    struct {
+      double checks{},src{},dst{},lengths{},output{},stream{},retain{},native{},release{},result{},profile{},report{};
+    } binding;
+    // Adjacent boundaries keep stages disjoint. No clock reads with profile off.
+    auto mark=[&](double& stage) {
+      if(profiling) {
+        const auto now=Clock::now();
+        stage+=std::chrono::duration<double,std::micro>(now-previous).count();previous=now;
+      }
+    };
+    const auto* source=std::get_if<NpuPullSourceDesc>(&ready.source);
+    if(!source)throw py::value_error("raw READ requires an NPU Pull ReadyToken");
+    mark(binding.checks);
+    auto array = [&](const py::object& tensor, const char* name) {
+      const auto view = python_binding::GetNpuInt64TensorView(tensor, name, native_->device_id());
+      return NpuInt64ArrayView{static_cast<const std::int64_t*>(view.data), view.bytes / sizeof(std::int64_t)};
+    };
+    const auto sources = array(src, "src_offsets");
+    mark(binding.src);
+    const auto destinations = array(dst, "dst_offsets");
+    mark(binding.dst);
+    const auto sizes = array(lengths, "lengths");
+    mark(binding.lengths);
+    if (sources.size != destinations.size || sources.size != sizes.size || sources.size > 4096)
+      throw py::value_error("raw READ metadata must have equal lengths in 1..4096");
+    mark(binding.checks);
+    const auto view=GetNpuTensorView(output,"output",false);
+    if(view.device.attr("index").cast<std::uint32_t>()!=native_->device_id())
+      throw py::value_error("raw READ output belongs to another NPU");
+    mark(binding.output);
+    if(stream.is_none())stream=py::module_::import("torch").attr("npu").attr("current_stream")(native_->device_id());
+    const auto stream_device=py::getattr(stream,"device",py::object{});
+    if(stream_device && stream_device.attr("index").cast<std::uint32_t>()!=native_->device_id())
+      throw py::value_error("raw READ stream belongs to another NPU");
+    const auto acl_stream=acl_python::StreamFromPython(stream);
+    mark(binding.stream);
+    // Keep registered output storage until successful Runtime shutdown. Normal
+    // asynchronous metadata/stream ownership remains with the application.
+    // This Host lock only orders submission/owner publication against shutdown;
+    // it does not wait for device completion or extend captured graph lifetime.
+    std::shared_lock<std::shared_mutex> raw(raw_lifecycle_mutex_, std::defer_lock);
+    { py::gil_scoped_release release; raw.lock(); }
+    const auto source_key = py::make_tuple(source->source_id, source->source_epoch);
+    if (!raw_outputs_.contains(source_key)) raw_outputs_[source_key] = py::dict();
+    auto outputs = raw_outputs_[source_key].cast<py::dict>();
+    // Retain before native setup: even a failed diagnostic step can leave a
+    // cached output registration. Match opt's conservative shutdown lifetime.
+    outputs[py::make_tuple(reinterpret_cast<std::uintptr_t>(view.data), view.bytes)] =
+        TensorStorageOwner(output);
+    HbmReadProfile profile;
+    mark(binding.retain);
+    Status status;
+    {
+      py::gil_scoped_release release;
+      status = native_->BatchGetRawAddr(ready, sources, destinations, sizes,
+          {view.data, view.bytes, DeviceKind::kNpu}, acl_stream,
+          profiling ? &profile : nullptr, validate_ranges, synchronize);
+    }
+    mark(binding.native);
+    // Only this call's CompletionUnknown means its metadata may still be in
+    // use. A concurrent Busy rejection must not claim this source's owners.
+    if (status.code() == StatusCode::kCompletionUnknown) {
+      if (!raw_failed_inputs_.contains(source_key)) raw_failed_inputs_[source_key] = py::list();
+      raw_failed_inputs_[source_key].cast<py::list>().append(py::make_tuple(TensorStorageOwner(src),
+          TensorStorageOwner(dst), TensorStorageOwner(lengths), TensorStorageOwner(output), stream));
+    }
+    ThrowIfError(status);
+    mark(binding.release);
+    py::dict result; result["state"]=synchronize?"done":"submitted"; result["sequence"]=ready.sequence;
+    mark(binding.result);
+    if(profiling) {
+      py::dict timing;
+      timing["host_total_us"]=profile.total_us;
+      double phases=0;
+#define RAW_PHASE(name) timing[#name]=profile.name; phases+=profile.name
+      RAW_PHASE(validation_us); RAW_PHASE(buffers_us); RAW_PHASE(register_output_us);
+      RAW_PHASE(event_record_us); RAW_PHASE(launch_us); RAW_PHASE(synchronize_us); RAW_PHASE(event_query_us);
+      RAW_PHASE(status_us); RAW_PHASE(cleanup_us);
+#undef RAW_PHASE
+      timing["host_other_us"]=std::max(0.0,profile.total_us-phases);
+      timing["kernel_event_us"]=profile.kernel_event_valid?py::cast(profile.kernel_event_us):py::none();
+      timing["kernel_event_error"]=profile.event_error;
+      result["profile"]=timing;
+      mark(binding.profile);
+      // Account for most of the instrumentation's own dictionary work. Only
+      // the final report/total fields and function return remain outside total.
+#define RAW_BINDING_PHASE(name) timing["binding_" #name "_us"]=binding.name
+      RAW_BINDING_PHASE(checks); RAW_BINDING_PHASE(src); RAW_BINDING_PHASE(dst);
+      RAW_BINDING_PHASE(lengths); RAW_BINDING_PHASE(output); RAW_BINDING_PHASE(stream);
+      RAW_BINDING_PHASE(retain); RAW_BINDING_PHASE(native); RAW_BINDING_PHASE(release);
+      RAW_BINDING_PHASE(result); RAW_BINDING_PHASE(profile);
+#undef RAW_BINDING_PHASE
+      mark(binding.report);
+      timing["binding_report_us"]=binding.report;
+      timing["binding_total_us"]=std::chrono::duration<double,std::micro>(previous-begin).count();
+    }
+    return result;
+  }
+  bool PendingRawAddr() const { py::gil_scoped_release release; return native_->pending_raw_addr(); }
+
+  bool DdrInitialized() const { return native_->ddr_initialized(); }
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
+  ExecutionResources GetResources(GetExecutionConfig config) const { return native_->GetResources(config); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
   std::uint32_t BatchGetTokenBytes() const {
     return native_->batch_get_token_bytes();
@@ -369,6 +648,7 @@ class NpuPythonRuntime final {
   }
 
   py::dict RemoteRegion() const {
+    if (!DdrInitialized()) throw std::runtime_error("DDR is not initialized");
     const RemoteRegionDesc& region = native_->core().remote_region();
     py::dict result;
     result["base"] = region.base;
@@ -387,8 +667,8 @@ class NpuPythonRuntime final {
                 const py::object& stream, std::optional<PutExecutionConfig> execution,
                 std::uint64_t input_lease) {
     BatchPutRequest batch_put_request;
-    if (!Initialized()) {
-      throw std::runtime_error("Runtime has not been initialized");
+    if (!DdrInitialized()) {
+      throw std::runtime_error("DDR is not initialized");
     }
     CopyPrepareKeysInto(keys, &batch_put_request.keys);
     CopyCpuUint64SequenceInto(input_offsets, "BatchPut input_offsets",
@@ -402,7 +682,7 @@ class NpuPythonRuntime final {
       throw py::value_error(
           "BatchPut keys, input_offsets, and lengths must be non-empty and equal in size");
     }
-    const NpuTensorView source_view = metadata_.View(source, "BatchPut source");
+    const NpuTensorLayout source_view = metadata_.View(source, "BatchPut source");
     const aclrtStream acl_stream = ResolveStream(stream);
     batch_put_request.input =
         ConstBufferView{source_view.data, source_view.bytes, DeviceKind::kNpu};
@@ -470,8 +750,8 @@ class NpuPythonRuntime final {
     py::object valid = torch.attr("empty")(
         py::make_tuple(capacity), py::arg("dtype") = torch.attr("uint8"),
         py::arg("device") = npu_device);
-    const NpuTensorView address_view = metadata_.View(addresses, "addresses");
-    const NpuTensorView valid_view = metadata_.View(valid, "valid");
+    const NpuTensorLayout address_view = metadata_.View(addresses, "addresses");
+    const NpuTensorLayout valid_view = metadata_.View(valid, "valid");
     if (address_view.element_bytes != sizeof(Address) ||
         valid_view.element_bytes != sizeof(std::uint8_t) ||
         address_view.bytes < capacity * sizeof(Address) ||
@@ -641,15 +921,15 @@ class NpuPythonRuntime final {
         throw py::value_error("profile=True requires the AICPU backend and synchronize=True");
     }
     const auto begin = profile ? BatchGetProfileNowNs() : 0U;
-    const NpuTensorView index_view = metadata_.View(indices, "indices");
-    const NpuTensorView offset_view = metadata_.View(offsets, "offsets");
-    const NpuTensorView miss_count_view =
+    const NpuTensorLayout index_view = metadata_.View(indices, "indices");
+    const NpuTensorLayout offset_view = metadata_.View(offsets, "offsets");
+    const NpuTensorLayout miss_count_view =
         metadata_.View(miss_count, "miss_count");
-    const NpuTensorView output_index_view =
+    const NpuTensorLayout output_index_view =
         metadata_.View(output_indices, "output_indices");
-    const NpuTensorView output_view = metadata_.View(output, "output");
-    const NpuTensorView address_view = metadata_.View(addresses, "addresses");
-    const NpuTensorView valid_view = metadata_.View(valid, "valid");
+    const NpuTensorLayout output_view = metadata_.View(output, "output");
+    const NpuTensorLayout address_view = metadata_.View(addresses, "addresses");
+    const NpuTensorLayout valid_view = metadata_.View(valid, "valid");
     mark(&BatchGetHostTiming::tensor_views_ns);
     if (index_view.dimensions != 1 || offset_view.dimensions != 1 ||
         output_index_view.dimensions != 1 || output_view.dimensions < 2 ||
@@ -949,23 +1229,28 @@ class NpuPythonRuntime final {
   void Shutdown() {
     Status status;
     std::unique_lock<std::mutex> get(get_mutex_, std::defer_lock), put(put_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> raw(raw_lifecycle_mutex_, std::defer_lock);
     {
       py::gil_scoped_release release;
-      std::lock(get, put);
+      std::lock(get, put, raw);
       if (aclrtSetDevice(native_->device_id()) != ACL_SUCCESS) status = Status::Internal("aclrtSetDevice failed");
       else status = native_->Shutdown();
     }
     if (status.ok()) {
       pending_get_refs_.clear(); output_refs_.clear(); pending_put_ref_ = py::object{};
       put_input_refs_.clear(); pending_put_input_refs_.clear();
+      raw_outputs_ = py::dict(); raw_failed_inputs_ = py::dict();
     }
     if (get_call_trace_) get_call_trace_->Flush();
     ThrowIfError(status);
   }
   ~NpuPythonRuntime() {
     if (!native_) return;
-    (void)aclrtSetDevice(native_->device_id());
-    if (!native_->Shutdown().ok()) {
+    Status close_status;
+    { py::gil_scoped_release release;
+      (void)aclrtSetDevice(native_->device_id());
+      close_status = native_->Shutdown(); }
+    if (!close_status.ok()) {
       // Preserve Python storage as well as native DMA owners on failed cleanup.
       for (auto& ref : pending_get_refs_) (void)ref.release();
       (void)pending_put_ref_.release();
@@ -974,6 +1259,7 @@ class NpuPythonRuntime final {
       for (auto& entry : output_refs_) (void)entry.second.release();
       for (auto& entry : put_input_refs_) (void)entry.second.release();
       for (auto& ref : pending_put_input_refs_) (void)ref.release();
+      (void)raw_outputs_.release(); (void)raw_failed_inputs_.release();
       (void)native_.release();
     }
   }
@@ -995,7 +1281,7 @@ class NpuPythonRuntime final {
 
  private:
   friend class PythonGetGraphResources;
-  void ApplyGraphScope(const py::object&, const NpuTensorView&, std::size_t, aclrtStream,
+  void ApplyGraphScope(const py::object&, const NpuTensorLayout&, std::size_t, aclrtStream,
                        bool, bool, std::optional<GetExecutionConfig>&, std::uint64_t&,
                        std::uint64_t);
   void FinishGraphScopeGet(bool success);
@@ -1004,6 +1290,8 @@ class NpuPythonRuntime final {
   std::unique_ptr<::kvaf::NpuRuntime> native_;
   std::unique_ptr<GetCallTrace> get_call_trace_;
   std::mutex get_mutex_, put_mutex_;
+  std::shared_mutex raw_lifecycle_mutex_;
+  py::dict raw_outputs_, raw_failed_inputs_;
   std::vector<py::object> pending_get_refs_;
   py::object pending_put_ref_;
   std::unordered_map<std::uint64_t, std::vector<py::object>> graph_refs_;
@@ -1087,7 +1375,7 @@ class PythonGetGraphResources : public std::enable_shared_from_this<PythonGetGra
     state_ = State::Prepared;
   }
 
-  void BeforeGet(const py::object& output, const NpuTensorView& view, std::size_t capacity,
+  void BeforeGet(const py::object& output, const NpuTensorLayout& view, std::size_t capacity,
                  aclrtStream stream, bool synchronize, bool profile,
                  std::optional<GetExecutionConfig>& execution, std::uint64_t& lease,
                  std::uint64_t output_lease) {
@@ -1257,7 +1545,7 @@ class PythonGetGraphScope {
   bool capture_, entered_{false}, exited_{false};
 };
 
-void NpuPythonRuntime::ApplyGraphScope(const py::object& output, const NpuTensorView& view,
+void NpuPythonRuntime::ApplyGraphScope(const py::object& output, const NpuTensorLayout& view,
                                      std::size_t capacity, aclrtStream stream, bool synchronize,
                                      bool profile, std::optional<GetExecutionConfig>& config,
                                      std::uint64_t& lease, std::uint64_t output_lease) {
@@ -1294,14 +1582,96 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("close", &PythonGetGraphResources::Close, py::kw_only(), py::arg("discard_result") = false,
           "Stop replay, synchronize and destroy the external graph before close. Failure retains resources for retry.");
 
+  py::class_<CpuPullOptions>(module, "CpuPullOptions")
+      .def(py::init([](std::uint32_t timeout_ms) {
+        CpuPullOptions value; value.timeout_ms = timeout_ms; return value;
+      }), py::kw_only(), py::arg("timeout_ms") = 30000)
+      .def_readonly("timeout_ms", &CpuPullOptions::timeout_ms);
+  py::class_<NpuPullOptions>(module, "NpuPullOptions")
+      .def(py::init([](std::string kernel_path, std::uint32_t cores, std::uint32_t jettys,
+                       std::uint32_t inflight, std::uint32_t output_bindings, bool diagnostics) {
+        NpuPullOptions value; value.kernel_path = std::move(kernel_path);
+        value.cores = cores; value.jettys = jettys; value.max_inflight_total = inflight;
+        value.max_output_bindings = output_bindings;
+        value.diagnostics = diagnostics; return value;
+      }), py::kw_only(), py::arg("kernel_path") = "", py::arg("cores") = 2,
+          py::arg("jettys") = 2, py::arg("max_inflight_total") = 0,
+          py::arg("max_output_bindings") = 64,
+          py::arg("diagnostics") = false)
+      .def_readonly("kernel_path", &NpuPullOptions::kernel_path)
+      .def_readonly("cores", &NpuPullOptions::cores).def_readonly("jettys", &NpuPullOptions::jettys)
+      .def_readonly("max_inflight_total", &NpuPullOptions::max_inflight_total)
+      .def_readonly("max_output_bindings", &NpuPullOptions::max_output_bindings)
+      .def_readonly("diagnostics", &NpuPullOptions::diagnostics);
+
   auto runtime = py::class_<NpuPythonRuntime>(module, "NpuRuntime");
   python_binding::BindNpuRuntimeConstructor(runtime);
   runtime
       .def("graph_resources", [](py::object self) {
         return std::make_shared<PythonGetGraphResources>(std::move(self));
       }, "Create resources for one model graph. Caller orders graph/eager execution and destroys the graph before close.")
+      .def("listen_hbm", &NpuPythonRuntime::ListenHbm, py::arg("listen_address"),
+           py::arg("advertise_address")="", py::arg("local_eid")="")
+      .def("batch_get_raw_addr", &NpuPythonRuntime::BatchGetRawArrays,
+           py::arg("ready"),py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
+           py::arg("output"),py::arg("stream")=py::none(),py::arg("profile")=false,py::arg("validate_ranges")=false,
+           py::arg("synchronize")=false,
+           "Enqueue peer HBM READ on the caller's stream, like batch_get. Default success means submitted. "
+           "Warm up registrations before graph capture; synchronize=False supports capture and replay. "
+           "Caller keeps metadata/storage and stream alive through completion and graph destruction, "
+           "and owns stream ordering, graph lifetime and producer reuse. "
+           "synchronize=True waits for completion. profile=True adds Host timings; device event timing "
+           "is available only with synchronize=True. Device status is not read back. "
+           "Output storage is retained until successful Runtime shutdown; do not resize storage while registered. "
+           "One WQE per request, without splitting. Callers guarantee valid, disjoint ranges and lengths in "
+           "1..UINT32_MAX within device READ limits. validate_ranges=True enables length/bounds diagnostics.")
+      .def("resolve_raw_addr", &NpuPythonRuntime::ResolveRawAddr, py::arg("ready"))
+      .def("cancel_raw_addr", &NpuPythonRuntime::CancelRawAddr, py::arg("ready"),
+           "Fence future Host submissions for this batch. Does not cancel queued work or captured graphs. "
+           "Application waits for execution and retires graphs before producer reuse; no notification is sent.")
+      .def_property_readonly("pending_raw_addr", &NpuPythonRuntime::PendingRawAddr)
+#if defined(KVAF_ENABLE_CPU_OFFLOAD)
+      .def("batch_cpu_pull", &NpuPythonRuntime::BatchCpuPull, py::arg("keys"), py::arg("ready"),
+           py::arg("src_offsets"), py::arg("lengths"), py::kw_only(), py::arg("timeout") = py::none(),
+           py::arg("profile") = false,
+           "Prepare DDR slots, submit CPU READ, wait and commit using an attached CPU ReadyToken. "
+           "One source span per key; Host metadata matches batch_put. Returns None on success. "
+           "timeout is in milliseconds (None uses cpu_pull_options.timeout_ms). On unresolved failure "
+           "retain producer data and call resolve_cpu_pull; never repeat the batch as recovery. "
+           "Producer synchronization and release_batch remain the application's responsibility. "
+           "profile=True returns a profile dictionary with Host stage timings in microseconds instead of None; "
+           "profiling is disabled by default and does not include verification or source release.")
+      .def("cancel_cpu_pull", &NpuPythonRuntime::CancelCpuPull,
+           py::arg("ready"), "Fence this batch and abort its Put before notifying the producer. Retry on an unresolved result.")
+      .def("resolve_cpu_pull", &NpuPythonRuntime::ResolveCpuPull, py::kw_only(), py::arg("timeout") = py::none(),
+           "Finish the internally retained batch_cpu_pull, without replaying READ. Returns None "
+           "only after successful commit; failure raises. Does not recover explicit PutHandle transactions.")
+      .def("offload_region", &NpuPythonRuntime::OffloadRegion)
+      .def("prepare_put",&NpuPythonRuntime::PreparePut,py::arg("keys"),py::arg("lengths"))
+      .def("submit_cpu_pull",&NpuPythonRuntime::SubmitCpuPull,py::arg("ready"),py::arg("put"),
+           py::arg("src_offsets"),py::arg("dst_offsets"),py::arg("lengths"),
+           "Submit CPU READ using an attached ReadyToken source and DDR-relative destination "
+           "offsets: put.entries[i].address minus runtime.remote_region['base'], plus any in-slot offset. "
+           "The three Host arrays must be equally sized. "
+           "Returns None; query/wait using the same put, including after a lost response.")
+      .def("query_cpu_pull",&NpuPythonRuntime::QueryCpuPull,py::arg("put"))
+      .def("wait_cpu_pull",&NpuPythonRuntime::WaitCpuPull,py::arg("put"),py::arg("timeout")=30000,
+           "Wait for DMA only; timeout is in milliseconds. Commit explicitly afterward.")
+      .def("commit_put",&NpuPythonRuntime::CommitPut,py::arg("put"))
+      .def("abort_put",&NpuPythonRuntime::AbortPut,py::arg("put"))
+      .def("last_offload_checksum", &NpuPythonRuntime::LastChecksum,
+           "Hash current CPU DDR via a separate RPC after offload. Call before freeing or "
+           "overwriting the destination slots, the source's next ready(), or source shutdown.")
+      .def_property_readonly("pending_offload", &NpuPythonRuntime::PendingOffload)
+#endif
+      .def("initialize", &NpuPythonRuntime::InitializeBase)
+      .def("initialize_ddr", &NpuPythonRuntime::InitializeDdr, py::arg("ddr_bytes"), py::arg("slot_size"))
+      .def("shutdown_ddr", &NpuPythonRuntime::ShutdownDdr)
+      .def_property_readonly("ddr_initialized", &NpuPythonRuntime::DdrInitialized)
+      .def("get_execution_resources", &NpuPythonRuntime::GetResources, py::arg("execution"),
+           "Return the effective Get resource budget after DDR initialization.")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
-           "Connect this NPU Runtime to a CPU Runtime service before initialize.")
+           "Set the CPU Runtime target before initialize_ddr or initialize(ddr_bytes, slot_size).")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"), py::arg("slot_size"))
       .def("shutdown", &NpuPythonRuntime::Shutdown)
       .def("check_batch_get_status", &NpuPythonRuntime::CheckBatchGetStatus,

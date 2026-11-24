@@ -56,8 +56,9 @@ AICPU 构建包位于 `build-npu/access_operator/transports/aicpu_urma/`，统�
 安装脚本已使用该路径。验证入口仍在仓库根目录的 `tests/run_*.sh`。
 
 后续 AIV Gather/Scatter 可分别接入 `algorithms/get/gather/urma_aiv/` 和
-`algorithms/get/scatter/urma_aiv/`，当前尚未创建这些目录。CPU Pull 的独立
-`offload/cpu_pull/` 及 CPU 服务 worker 也待代码合入时建立，不作为普通 Get 算法。
+`algorithms/get/scatter/urma_aiv/`，当前尚未创建这些目录。CPU Pull 已接入，executor、
+源注册和 CPU READ 服务位于 `runtime/src/`，不作为普通 Get provider，也不经过
+普通 Put/Get 的 `execution` 选择。NPU raw READ kernel 位于 `algorithms/get/raw_addr/urma_aiv/`。
 
 四种 Get 的显式图租约、常驻实例和资源边界见
 [实现与使用](../docs/cache_transport_execution_implementation.md)，运行方式见
@@ -125,7 +126,9 @@ tensor、AccessTable 和 Runtime。KVAF 不创建、保存或 replay 任何图�
 不带 CANN 时只构建接口和 CPU Mock，用于本地 Python 测试。启用
 `KVAF_ENABLE_AIV_BATCH_GET=ON` 时构建 `DefaultAccessOperator` 和 AIV BatchGet 算法；
 `KVAF_ENABLE_AIV_BATCH_PUT=ON`（默认随前者启用）时额外构建 AIV BatchPut 算法与
-Direct-HCCP Runtime adapter。`KVAF_ENABLE_AICPU_URMA` 启用 AICPU Gather/Put；
+Direct-HCCP Runtime adapter。`KVAF_ENABLE_CPU_OFFLOAD` 启用 CPU Pull，
+`KVAF_ENABLE_NPU_PULL` 启用独立 NPU raw READ；两者均使用共享的 Direct-HCCP 会话基础。
+`KVAF_ENABLE_AICPU_URMA` 启用 AICPU Gather/Put；
 `KVAF_ENABLE_AICPU_CPU_PUSH` 进一步启用 Scatter。
 
 图对象由调用方创建、capture、replay 和销毁。执行调度器只保留图使用的资源租约，

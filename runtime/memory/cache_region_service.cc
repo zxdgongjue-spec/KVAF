@@ -1,8 +1,11 @@
 #include "cache_region_service.h"
+#include "offload_service.h"
+#include "remote_pull_protocol.h"
 #include <chrono>
 #include <random>
 #include <atomic>
 #include <exception>
+#include <cstring>
 namespace kvaf::execution {
 namespace {
 Response Error(Status s) {
@@ -11,6 +14,23 @@ Response Error(Status s) {
   return r;
 }
 }  // namespace
+Status Allocation::PrepareCpuPull(std::uint32_t, std::uint32_t, std::uint64_t,
+                                 peer::PeerRegion*) {
+  return Status::NotImplemented("CPU Pull destination registration unavailable");
+}
+std::unique_ptr<offload::Backend> Allocation::CreateCpuPullBackend(std::shared_ptr<void>) {
+  return {};
+}
+struct CacheRegionService::RegionLease {
+  explicit RegionLease(std::shared_ptr<Record> value) : parent(std::move(value)) {}
+  ~RegionLease() {
+    if (!armed) return;
+    std::lock_guard<std::mutex> lock(parent->mutex);
+    --parent->children;
+  }
+  std::shared_ptr<Record> parent;
+  bool armed{false};
+};
 CacheRegionService::CacheRegionService(std::uint64_t capabilities, Allocate a, Create c)
     : capabilities_(capabilities | kRequired), allocate_(std::move(a)), create_(std::move(c)) {
   std::random_device random;
@@ -92,7 +112,7 @@ Response CacheRegionService::CreateRecord(const Request& q) {
       else {
         std::lock_guard<std::mutex> parent_lock(parent->mutex);
         if (parent->response.epoch != q.epoch || parent->request.client != q.client ||
-            parent->response.state != State::Ready || !parent->allocation)
+            parent->response.state != State::Ready || parent->close_requested || !parent->allocation)
           status = Status::InvalidState("region epoch, owner or state mismatch");
         else {
           status =
@@ -136,7 +156,8 @@ Response CacheRegionService::CreateRecord(const Request& q) {
 }
 Status CacheRegionService::CloseRecord(const std::shared_ptr<Record>& r) {
   if (r->response.state == State::Closed) return Status::OK();
-  if (r->children) return Status::Busy("region still has execution sessions");
+  r->close_requested = true;
+  if (r->children) return Status::Busy("region still has execution sessions or CPU Pull sources");
   auto status = r->session      ? r->session->Close()
                 : r->allocation ? r->allocation->Close()
                                 : Status::OK();
@@ -158,7 +179,8 @@ Status CacheRegionService::CloseRecord(const std::shared_ptr<Record>& r) {
 }
 Response CacheRegionService::Handle(const Request& q) {
   std::shared_lock<std::shared_mutex> lifetime(lifetime_);
-  if (closing_) return Error(Status::InvalidState("service is closing"));
+  if (closing_ && q.op != Op::Query && q.op != Op::CloseSession && q.op != Op::ReleaseRegion)
+    return Error(Status::InvalidState("service is closing"));
   if (q.op == Op::Capabilities) {
     Response r;
     r.status = Status::OK();
@@ -191,6 +213,41 @@ Response CacheRegionService::Handle(const Request& q) {
   }
   if (r->response.state != State::Ready)
     return Error(Status::InvalidState("resource is not ready"));
+  if (q.op == Op::PrepareCpuPullRegion) {
+    if (!q.request || q.epoch != r->response.epoch)
+      return Error(Status::InvalidArgument("CPU Pull preparation requires owner request and epoch"));
+    if (!(capabilities_ & kCpuPull) || !r->allocation || q.session ||
+        r->request.mode == TransportMode::Ubmem)
+      return Error(Status::NotImplemented("region does not support CPU Pull"));
+    if (r->close_requested) return Error(Status::InvalidState("region is closing"));
+    if (r->pull_attempted) {
+      if (q.candidate != r->pull_candidate)
+        return Error(Status::InvalidArgument("CPU Pull region candidate is immutable"));
+      return r->pull_response;
+    }
+    r->pull_response = r->response;
+    // Reserve a failed preparation before a side effect. A lost reply or an
+    // exception cannot create another registration/grant on a repeated call.
+    r->pull_response.status = Status::CompletionUnknown("CPU Pull preparation incomplete");
+    r->pull_response.state = State::Recovering;
+    r->pull_attempted = true;
+    r->pull_candidate = q.candidate;
+    try {
+      std::random_device random;
+      do { r->pull_token = random(); } while (!r->pull_token || r->pull_token == 2);
+      r->pull_response.status = r->allocation->PrepareCpuPull(q.candidate, r->pull_token,
+          r->request.logical_bytes, &r->pull_response.binding);
+      if (r->pull_response.status.ok() &&
+          (r->pull_response.binding.base != r->allocation->descriptor.base ||
+           r->pull_response.binding.length != r->request.logical_bytes ||
+           r->pull_response.binding.token_value != r->pull_token))
+        r->pull_response.status = Status::Internal("invalid CPU Pull destination binding");
+    } catch (const std::exception& e) {
+      r->pull_response.status = Status::Internal(e.what());
+    }
+    if (r->pull_response.status.ok()) r->pull_response.state = State::Ready;
+    return r->pull_response;
+  }
   if (q.op == Op::Fence)
     return Error(Status::NotImplemented(
         "visibility requires completed transport operations, not a control-plane CPU fence"));
@@ -217,6 +274,51 @@ Response CacheRegionService::Handle(const Request& q) {
     response.status = Status::Internal(e.what());
   }
   return response;
+}
+Status CacheRegionService::DescribeCpuPullRegion(std::uint64_t id, remote_pull::RegionInfo* out) {
+  if (!out) return Status::InvalidArgument("missing CPU Pull region output");
+  std::shared_lock<std::shared_mutex> life(lifetime_);
+  auto r = Lookup(id);
+  if (!r) return Status::NotFound("CPU Pull region not found");
+  std::lock_guard<std::mutex> lock(r->mutex);
+  if (!r->allocation || r->response.state == State::Closed || !r->pull_attempted ||
+      !r->pull_response.status.ok())
+    return Status::InvalidState("CPU Pull region is not prepared");
+  *out = {};
+  out->id = r->response.region;
+  out->epoch = r->response.epoch;
+  out->base = r->pull_response.binding.base;
+  out->bytes = r->request.logical_bytes;
+  out->slot_size = r->request.slot_size;
+  out->candidate = r->pull_candidate;
+  out->token = r->pull_token;
+  out->closing = closing_ || r->close_requested;
+  std::memcpy(out->eid, r->pull_response.binding.eid.data(), sizeof(out->eid));
+  return Status::OK();
+}
+std::unique_ptr<offload::Backend> CacheRegionService::AcquireCpuPullBackend(
+    const remote_pull::RegionInfo& info) {
+  std::shared_lock<std::shared_mutex> life(lifetime_);
+  auto r = Lookup(info.id);
+  if (!r) return {};
+  std::shared_ptr<RegionLease> lease;
+  Allocation* allocation = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(r->mutex);
+    if (closing_ || r->close_requested || !r->allocation || !r->pull_attempted ||
+        !r->pull_response.status.ok() || r->response.state != State::Ready ||
+        info.epoch != r->response.epoch || info.token != r->pull_token ||
+        info.candidate != r->pull_candidate || info.base != r->pull_response.binding.base ||
+        info.bytes != r->request.logical_bytes)
+      return {};
+    lease = std::make_shared<RegionLease>(r);
+    ++r->children;
+    lease->armed = true;
+    allocation = r->allocation.get();
+  }
+  // The lease keeps allocation/context alive across source setup, failures,
+  // in-flight DMA and final teardown, without holding the region mutex.
+  return allocation->CreateCpuPullBackend(std::move(lease));
 }
 Status CacheRegionService::Shutdown() {
   std::unique_lock<std::shared_mutex> lifetime(lifetime_);

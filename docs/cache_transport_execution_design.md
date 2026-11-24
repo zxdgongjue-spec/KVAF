@@ -68,7 +68,7 @@ struct GetExecutionConfig {
 | Ubmem | UBMEM AIV | UBMEM AIV Direct |
 | UrmaAndUbmem | URMA AIV | URMA AIV Direct |
 
-上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。各 provider 的默认核数/worker 数为 URMA AIV Put/Get 2、UBMEM AIV Put/Get 16、AICPU Put 1、AICPU Gather/Scatter Get 5；URMA AIV Jetty 数默认 2，URMA AIV Get 在途上限默认 2048。资源项可以逐配置覆盖。
+上表为完整构建的标准默认值。省略默认配置时，NpuRuntime 优先选已构建的 URMA AIV，随后是 AICPU，混合模式再考虑 UBMEM。显式默认配置不会静默回退；对应 provider 未构建时在使用时返回错误。AIV Gather/Scatter 尚未注册。所有调用统一经过 Dispatcher，不再提供旧后端构造参数或执行模式开关。URMA AIV Get 在本机默认 2 核、每核 2 个 Jetty，在远端 A+K 默认 4 核、每核 1 个 Jetty，在途上限为 2048。URMA AIV Put 默认 2 核、每核 2 个 Jetty。UBMEM AIV Put/Get 默认 16 核，AICPU Put 默认 1 个 worker，AICPU Gather/Scatter Get 默认 5 个。资源项可以逐配置覆盖。
 
 AIV/UBMEM 的空 `kernel_path` 使用构建时记录的绝对路径：Get 为 `<build-dir>/bin/kvaf_execute_batch_get_kernels.o`，Put 为 `<build-dir>/bin/kvaf_execute_batch_put_kernels.o`。标准 `./build.sh npu` 使用 `build-npu`，自定义 `--build-dir` 自动生效，不依赖应用当前目录。非空路径严格覆盖默认值；默认或显式文件均在首次准备时检查，缺失时返回错误。移动构建产物后需显式覆盖路径或重新构建。AICPU 保持首次使用时从 CANN 安装目录解析包。
 
@@ -384,7 +384,9 @@ Runtime 关闭前先显式结束 graph。关闭在 provider 执行状态仍绑�
 
 恢复 Get 时目标实例不能持有输出/graph 绑定；当前方向的在途工作必须先安全处理。旧资源关闭成功后才重建，新资源/view 使用新的有效性状态。实例驻留不意味着绑定 ID 可以隐式转向新资源。
 
-独立 CPU Pull / HBM Pull 模块按当前范围暂未合入，不纳入本版普通 Put/Get 或 graph 能力声明。后续 CPU Pull 若写同一 DDR，必须有独立源注册、队列和事务/范围引用；HBM Pull 属于独立 HBM → HBM 路径。这些是边界要求，不能把历史参考接口当作本分支已有模块。
+CPU Pull / NPU Pull 已接入。CPU Pull 写同一 DDR，使用独立源注册、队列、目的 MR 和统一写事务；NPU Pull 属于独立 HBM → HBM 路径。NPU raw Pull 由应用负责正常异步 metadata/storage/stream 保活、同步和销图；KVAF 保留 output 注册及实际 storage 到 Runtime 安全关闭。raw 捕获使用普通调用，无须额外 Begin/End 或图租约；普通缓存 Get 使用既有图资源管理。
+
+当前接口、生命周期及验证入口见 [CPU Pull](cpu_pull_offload_usage.md)、[NPU raw READ](hbm_raw_addr_read.md) 和 [建链流程](connection_handshake_flows.md)。
 
 ## 12 已实现范围与后续工作
 
