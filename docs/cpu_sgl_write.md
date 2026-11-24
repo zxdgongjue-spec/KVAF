@@ -26,12 +26,12 @@ AICPU 在发布 notify 前检查 WR 内连续性和目标范围，CPU 在提交�
 的目标越界与重叠。错误随现有同步、drain 或 status 检查报告。
 设备执行错误与原 Scatter 一样使该执行资源失效，须按原 Get 恢复/关闭流程重建。
 
-`ExecutionResources.sge_per_wr` 只用于 CPU SGL Write Get，配置单个数据 WRITE WR 的
-源 SGE 上限。默认 `0` 自动选 `min(16, max_jfs_sge)`；显式值允许 1..16，超过设备
-上限时初始化报错，不静默缩小。此配置在执行资源准备时固定，切换 4/8 使用新的 Runtime。
-一条数据 WR 包含 `min(有效 SGE 上限, 有效消息字节上限 / token_bytes)` 个完整 token，
-分片末尾可更短。有效消息字节上限为 `min(65536, max_msg_size)`，一个 token 放不下时
-初始化报错。先按 worker、chunk、Jetty 分片，再按这个上限切分，每个分片单独处理尾 WR。
+`ExecutionResources.sge_per_wr` 设置 CPU SGL Write Get 的源 SGE 上限。显式值允许 1..16，
+超过设备的 SGE 上限时初始化报错。默认 `0` 选择 `min(16, max_jfs_sge)`。
+实际分组大小 `rows_per_wr` 为 `min(SGE 上限, 消息字节上限 / token_bytes)`，除法向下取整。
+消息字节上限为 `min(65536, max_msg_size)`。每个源 SGE 搬一个完整 token，一个 token
+放不下时初始化报错。先按 worker、chunk、Jetty 分片，再按 `rows_per_wr` 切分，分片尾部
+按剩余 token 数生成 WR。配置在执行资源准备时固定，切换 4/8 使用新的 Runtime。
 WR 编号依次按 worker、chunk、Jetty 和分片内次序分配。ready、done 和描述读取使用单 SGE。
 
 例如 `cores=1`、`sge_per_wr=4`、`miss_count=32`、`token_bytes=656`，设备消息上限足够时，
@@ -66,7 +66,7 @@ CPU profile 的 `descriptor_read_us` 统计 output 描述和两份有效数组�
 ## 构建和真机验证
 
 CPU 服务、NPU Host/Python 库和 AICPU 设备包须使用匹配版本重建，服务和进程须重启。
-CPU Push setup 回包从 300 B 变为 308 B，携带实际 SGE 和消息字节上限。
+CPU Push setup 回包从 300 B 变为 308 B，携带 SGE 上限和消息字节上限。
 Scatter 的 V3 设备入口和 launch 参数布局保留，直接输出使用
 `KvafAicpuCpuSglWriteExecutionV2`，启动时检查该入口。
 
@@ -113,7 +113,9 @@ done
 同一 CPU 服务即可接受两次测试的配置。也可用环境变量
 `KVAF_BATCH_GET_PERF_SGE_PER_WR` 设置默认值；显式命令行覆盖环境变量。
 单卡 `summary.csv`、配置日志及多卡子进程命令都记录/传递 `sge_per_wr`；0 表示请求自动值，
-实际值看 CPU 的 `CPU_PUSH_CAP max_sge=... device_max_sge=... requested_sge=...`。
+CPU 日志 `CPU_PUSH_CAP` 中 `max_sge` 是生效的 SGE 上限，`rows_per_wr` 是实际分组大小。
+例如配置 8 SGE，每个 token 为 10,000 B，消息上限为 31,000 B 时，日志显示
+`max_sge=8` 和 `rows_per_wr=3`。调用方按 `rows_per_wr` 和分片边界安排 `output_indices`。
 加 `--kernel-profile` 并用较少迭代可检查 CPU 的 `data_wrs`。
 4096×656 B、4 worker、当前 1024 行 chunk/四路 Jetty 划分下，
 4 SGE 应为 1024 个数据 WR，8 SGE 应为 512 个；均另有 16 个 ready WR。

@@ -67,13 +67,13 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   max_sge_ = setup.sge_per_wr ? setup.sge_per_wr : device_max_sge;
   max_bytes_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(kMaxWriteBytes, attr.dev_cap.max_msg_size));
   if (!max_sge_ || max_bytes_ < sizeof(Request)) return Error("unsupported SGE/message limits");
-  grouping_.rows_per_wr = DirectRowsPerWrite(token_bytes_, max_sge_, max_bytes_);
+  grouping_.rows_per_wr = direct_output_ ? DirectRowsPerWrite(token_bytes_, max_sge_, max_bytes_) : 0;
   if (direct_output_ && !grouping_.rows_per_wr)
     return Status::InvalidArgument("CPU SGL Write requires one whole token to fit in a WRITE");
   std::fprintf(stderr, "[KVAF_CPU] CPU_PUSH_CAP max_sge=%u device_max_sge=%u requested_sge=%u "
                "message_bytes=%u workers=%u token_bytes=%u"
-               " post_payload_wrs=%u\n", max_sge_, device_max_sge, setup.sge_per_wr,
-               max_bytes_, workers_, token_bytes_, kPostPayloadWrs);
+               " post_payload_wrs=%u rows_per_wr=%u\n", max_sge_, device_max_sge, setup.sge_per_wr,
+               max_bytes_, workers_, token_bytes_, kPostPayloadWrs, grouping_.rows_per_wr);
   urma_seg_t segment{};
   std::memcpy(&segment, setup.segment, sizeof(segment));
   if (!SourceRange(segment.ubva.va, segment.len, hbm_base_, layout_.bytes))

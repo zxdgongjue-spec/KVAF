@@ -68,8 +68,9 @@ NpuRuntime(batch_get_token_bytes=None, batch_get_tokens_per_block=None, *,
 Put/Get 用 16 核，AICPU Put 用 1 个 worker，Gather/Scatter Get 用 5 个。URMA AIV Get 每核 Jetty 数默认为本机 2、远端 A+K 1（支持 1..64），
 Put 每核默认 2 个（支持 1..2）。仅 URMA AIV Get 接受 `max_inflight_total`，默认 2048，显式 0 关闭限制，非零须至少为
 `2 * cores`。`request_capacity` 默认 65536，Gather 可额外指定 `cpu_threads`。
-CPU SGL Write Get 可指定 `sge_per_wr=4` 或 `8`；默认 0 自动选择设备允许的上限
-（最多 16），显式值超过设备上限时报错。示例与性能命令见 [CPU SGL Write](../docs/cpu_sgl_write.md)。
+CPU SGL Write Get 可用 `sge_per_wr=4` 或 `8` 指定源 SGE 上限。默认 `0` 按设备 SGE 能力
+选择上限（最多 16）。每个 WR 还受消息字节上限和分片剩余 token 数约束。
+示例与性能命令见 [CPU SGL Write](../docs/cpu_sgl_write.md)。
 AIV/UBmem 的 `kernel_path=""` 使用构建目录的默认产物：Get 为
 `bin/kvaf_execute_batch_get_kernels.o`，Put 为 `bin/kvaf_execute_batch_put_kernels.o`。
 `./build.sh npu` 默认使用 `build-npu`；自定义 `--build-dir` 时自动记录该目录的绝对路径，

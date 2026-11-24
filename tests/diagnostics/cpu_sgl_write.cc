@@ -159,10 +159,11 @@ int main() {
     f.indices[0] = 7;
     f.Run(true);  // Replay uses a new device ticket and dynamic inputs.
   }
-  for (auto sges : {4U, 8U}) {
+  for (auto sges : {3U, 4U, 8U}) {
     Fixture f(1, sges);
     const auto writes = f.Writes();
-    assert(writes[1].end - writes[1].begin == (sges == 4 ? 4 : 2));
+    const auto first_shard = JettyRange({0, kCapacity}, 0);
+    assert(writes[1].end - writes[1].begin == std::min(sges, first_shard.end - sges));
     f.SetGappedRows(false);
     f.Run(true);
     f.SetGappedRows(true);

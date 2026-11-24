@@ -249,7 +249,7 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
   std::free(hbm);
 }
 void Reject(std::uint32_t requested, std::uint32_t device_limit, std::uint32_t mode,
-            std::uint32_t message_bytes = kMaxWriteBytes) {
+            std::uint32_t message_bytes = kMaxWriteBytes, const char* expected_error = nullptr) {
   device_sges = device_limit;
   device_message_bytes = message_bytes;
   urma_context_t context{};
@@ -265,7 +265,9 @@ void Reject(std::uint32_t requested, std::uint32_t device_limit, std::uint32_t m
   setup.output_mode = mode; setup.sge_per_wr = requested;
   kvaf::peer::OpenCpuPushGetResponse response{};
   kvaf::cpu_push::Transport transport;
-  assert(!transport.Initialize(&context, &source, setup, QueryTp, ImportJetty, 1, &response).ok());
+  const auto status = transport.Initialize(&context, &source, setup, QueryTp, ImportJetty, 1, &response);
+  assert(!status.ok());
+  if (expected_error) assert(status.message().find(expected_error) != std::string::npos);
   assert(transport.Shutdown().ok());
   assert(segments == 0 && completions.empty());
 }
@@ -275,12 +277,13 @@ int main() {
   Run(4, 4);
   Run(8, 8);
   Run(0, 13);
-  Run(8, 8, 257, 10000, 31000);  // The byte limit allows three complete tokens per WR.
+  Run(8, 8, 257, 10000, 31000);  // Explicit ceiling of eight, three whole tokens per WR.
+  Run(0, 13, 257, 10000, 31000);  // Auto ceiling of thirteen, the same message-limited grouping.
   Run(4, 4, 32769, 64);  // A tail WR and multiple drained SQ waves.
   Run(1, 1, kvaf::cpu_push::kMaxRequests, 64);  // The largest packed destination list.
   Reject(8, 4, kvaf::cpu_push::kDirectOutput);
   Reject(17, 32, kvaf::cpu_push::kDirectOutput);
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);
   Reject(4, 13, kvaf::cpu_push::kScatterOutput);
-  Reject(4, 13, kvaf::cpu_push::kDirectOutput, 512);  // A full token cannot fit.
+  Reject(4, 13, kvaf::cpu_push::kDirectOutput, 512, "one whole token");
 }
