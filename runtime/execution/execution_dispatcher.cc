@@ -689,6 +689,15 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
         r.output.device != bound.output.device || capacity > bound.request_capacity)
       return Status::InvalidArgument("request differs from bound Get output/capacity");
   }
+  if (action == ScatterGraphAction::kAttach) {
+    if (pending_get_)
+      return Status::Busy("drain pending Get before capturing Scatter");
+    if (!instance || instance->cleanup_only || !instance->warmed ||
+        instance->warmed_stream != request.execution.stream ||
+        instance->warmed_request_capacity < capacity)
+      return Status::InvalidState("prepare Scatter on the capture stream before beginning ACL capture");
+    return instance->view().operation()->ExecuteBatchGet(request);
+  }
   GetDispatchTrace::Row row{};
   if (get_trace_) {
     row.event = "submit";
@@ -714,11 +723,6 @@ Status ExecutionDispatcher::ExecuteBatchGet(const BatchGetExecRequest& request) 
     row.launch.warmup_ns = preparation.warmup_ns;
   }
   phase = get_trace_ ? TraceNowNs() : 0;
-  if (action == ScatterGraphAction::kAttach) {
-    s = instance->view().operation()->ExecuteBatchGet(request);
-    instance->ClearRequest();
-    return s;
-  }
   instance->request = r;
   instance->table = request.host_access_table;
   instance->options = request.execution;

@@ -193,26 +193,6 @@ BatchGetRequest TrustedNpuRequest(
        {methods.Pointer(valid), entries, DeviceKind::kNpu}}};
 }
 
-BatchGetRequest TrustedGatherRequest(
-    const AccessTableHandle& table, const py::object& addresses,
-    const py::object& valid, const py::object& indices, const py::object& offsets,
-    const py::object& miss_count, const py::object& output_indices,
-    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block,
-    const TensorMetadataMethods& methods) {
-  return TrustedNpuRequest(table, addresses, valid, indices, offsets, miss_count,
-      output_indices, output, token_bytes, tokens_per_block, methods);
-}
-
-BatchGetRequest TrustedScatterRequest(
-    const AccessTableHandle& table, const py::object& addresses,
-    const py::object& valid, const py::object& indices, const py::object& offsets,
-    const py::object& miss_count, const py::object& output_indices,
-    const py::object& output, std::uint32_t token_bytes, std::uint32_t tokens_per_block,
-    const TensorMetadataMethods& methods) {
-  return TrustedNpuRequest(table, addresses, valid, indices, offsets, miss_count,
-      output_indices, output, token_bytes, tokens_per_block, methods);
-}
-
 void CopyPrepareKeysInto(const py::object& keys, std::vector<KeyId>* result) {
   if (result == nullptr) {
     throw std::invalid_argument("key output must not be null");
@@ -438,6 +418,7 @@ class NpuPythonRuntime final {
     put.jettys = executor == Executor::Aiv && transport_kind == Transport::Urma ? std::min(jettys_per_core, 2U) : 0;
     if (executor == Executor::Aiv) put.kernel_path = std::move(batch_put_kernel_object_path);
     options.put_resources.emplace_back(*options.default_put, std::move(put));
+    trusted_scatter_inputs_ = true;
     trusted_gather_inputs_ = trusted_gather_inputs;
     native_ = std::make_unique<::kvaf::NpuRuntime>(std::move(options));
   }
@@ -1145,9 +1126,15 @@ class NpuPythonRuntime final {
       throw py::value_error("graph capture requires an asynchronous node");
     if (!tensor_methods_) tensor_methods_.emplace();
     const auto selected = tensor_methods_->SelectStream(stream);
-    const auto request = TrustedScatterRequest(table.source(), table.addresses(), table.valid(),
+    const auto request = TrustedNpuRequest(table.source(), table.addresses(), table.valid(),
         indices, offsets, miss_count, output_indices, output, native_->batch_get_token_bytes(),
         native_->batch_get_tokens_per_block(), *tensor_methods_);
+    if (capture_into_graph) {
+      const auto capacity = request.indices.bytes / sizeof(std::int32_t);
+      if (!capacity || capacity > UINT32_MAX)
+        throw py::value_error("Scatter graph requires a valid request capacity");
+      WarmupGet(*config, static_cast<std::uint32_t>(capacity), selected);
+    }
     const auto generation = generation_;
     auto storage = py::make_tuple(selected, table.addresses(), table.valid(), indices,
                                   offsets, miss_count, output_indices, output);
@@ -1176,7 +1163,7 @@ class NpuPythonRuntime final {
             host_profile_ready_ = false;
             return;
           }
-          SubmitScatterBatchGet(request, acl_stream, synchronize);
+          SubmitScatterBatchGet(request, acl_stream, synchronize, ScatterGraphAction::kNone, storage);
           if (wait_stream) {
             // Preserve the eager prepared API: wait only for this stream's DMA;
             // status validation remains in the ordinary drain/profile path.
@@ -1226,33 +1213,38 @@ class NpuPythonRuntime final {
     const bool sequential = selected && selected->algorithm != GetAlgorithm::Direct &&
         selected->transport == Transport::Urma &&
         selected->executor == Executor::Aiv && !graph_lease && !output_lease && !active_graph_scope_;
-    if (sequential && !tensor_methods_) tensor_methods_.emplace();
-    if (sequential && selected->algorithm == GetAlgorithm::Scatter) {
+    if (sequential && trusted_scatter_inputs_ && selected->algorithm == GetAlgorithm::Scatter) {
+      if (!tensor_methods_) tensor_methods_.emplace();
       scatter_host::Session session(host_profile_enabled_ ? &host_profile_ : nullptr);
       scatter_host::Timer binding_timer(scatter_host::kBinding);
       scatter_host::Timer tensor_timer(scatter_host::kTensorMetadata);
       host_profile_ready_ = false;
-      const auto request = TrustedScatterRequest(access_table, addresses, valid, indices, offsets,
+      const auto request = TrustedNpuRequest(access_table, addresses, valid, indices, offsets,
           miss_count, output_indices, output, native_->batch_get_token_bytes(),
           native_->batch_get_tokens_per_block(), *tensor_methods_);
       tensor_timer.Stop();
       scatter_host::Timer stream_timer(scatter_host::kStreamResolve);
-      const auto acl_stream = tensor_methods_->Stream(stream);
+      const auto stream_owner = tensor_methods_->SelectStream(stream);
+      const auto acl_stream = tensor_methods_->Stream(stream_owner);
       stream_timer.Stop();
-      SubmitScatterBatchGet(request, acl_stream, synchronize);
+      SubmitScatterBatchGet(request, acl_stream, synchronize, ScatterGraphAction::kNone,
+          py::make_tuple(addresses, valid, indices, offsets, miss_count, output_indices, output, stream_owner));
       return py::none();
     }
 
     if (sequential && selected->algorithm == GetAlgorithm::Gather && trusted_gather_inputs_) {
-      const auto request = TrustedGatherRequest(access_table, addresses, valid, indices, offsets,
+      if (!tensor_methods_) tensor_methods_.emplace();
+      const auto request = TrustedNpuRequest(access_table, addresses, valid, indices, offsets,
           miss_count, output_indices, output, native_->batch_get_token_bytes(),
           native_->batch_get_tokens_per_block(), *tensor_methods_);
       BatchGetExecutionOptions exec;
-      exec.stream = tensor_methods_->Stream(stream);
+      const auto stream_owner = tensor_methods_->SelectStream(stream);
+      exec.stream = tensor_methods_->Stream(stream_owner);
       exec.synchronize = synchronize;
       exec.trusted_npu_request = true;
       exec.config = selected;
-      ThrowIfError(native_->core().BatchGet(request, exec));
+      SubmitTrustedGet(request, exec,
+          py::make_tuple(addresses, valid, indices, offsets, miss_count, output_indices, output, stream_owner));
       return py::none();
     }
 
@@ -1364,21 +1356,40 @@ class NpuPythonRuntime final {
     return result;
   }
 
-  void SubmitScatterBatchGet(const BatchGetRequest& request, aclrtStream stream,
-                             bool synchronize, ScatterGraphAction graph = ScatterGraphAction::kNone) {
+  void SubmitTrustedGet(const BatchGetRequest& request, const BatchGetExecutionOptions& exec,
+                        const py::object& storage) {
+    std::unique_lock<std::mutex> direction(get_mutex_, std::defer_lock);
+    {
+      py::gil_scoped_release release;
+      direction.lock();
+    }
+    // Reserve before enqueueing work. A failed submission may still own the
+    // buffers until the dispatcher drains or closes its provider.
+    pending_get_refs_.reserve(pending_get_refs_.size() + 1);
     Status status;
     {
-      scatter_host::Timer native_timer(scatter_host::kNative);
-      BatchGetExecutionOptions execution;
-      execution.stream = stream;
-      execution.synchronize = synchronize;
-      execution.config = GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter};
-      execution.trusted_npu_request = true;
-      execution.scatter_graph = graph;
-      status = native_->core().BatchGet(
-          request, execution);
+      scatter_host::Timer timer(scatter_host::kNative);
+      status = native_->core().BatchGet(request, exec);
     }
+    if (status.ok()) pending_get_refs_.clear();
+    if (!status.ok() || !exec.synchronize) pending_get_refs_.push_back(storage);
     ThrowIfError(status);
+  }
+
+  void SubmitScatterBatchGet(const BatchGetRequest& request, aclrtStream stream, bool synchronize,
+                             ScatterGraphAction graph, const py::object& storage = {}) {
+    BatchGetExecutionOptions exec;
+    exec.stream = stream;
+    exec.synchronize = synchronize;
+    exec.config = GetExecutionConfig{Transport::Urma, Executor::Aiv, GetAlgorithm::Scatter};
+    exec.trusted_npu_request = true;
+    exec.scatter_graph = graph;
+    if (storage) {
+      SubmitTrustedGet(request, exec, storage);
+    } else {
+      scatter_host::Timer timer(scatter_host::kNative);
+      ThrowIfError(native_->core().BatchGet(request, exec));
+    }
     host_profile_ready_ = host_profile_enabled_;
   }
 
@@ -1651,7 +1662,8 @@ class NpuPythonRuntime final {
   std::optional<TensorMetadataMethods> tensor_methods_;
   bool host_profile_enabled_{false}, host_profile_ready_{false};
   scatter_host::Profile host_profile_{};
-  bool trusted_gather_inputs_{true};
+  bool trusted_scatter_inputs_{false};
+  bool trusted_gather_inputs_{false};
   friend class PythonGetGraphResources;
   void ApplyGraphScope(const py::object&, const NpuTensorView&, std::size_t, aclrtStream,
                        bool, bool, std::optional<GetExecutionConfig>&, std::uint64_t&,

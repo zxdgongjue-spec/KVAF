@@ -250,9 +250,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=environment_int("KVAF_BATCH_GET_MAX_INFLIGHT_TOTAL", 2048),
         help="total unconfirmed READ limit across AIV cores; 0 uses the baseline",
     )
-    parser.add_argument("--contention-control-dir", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--contention-result", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--contention-graph-calls", type=int, default=256, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.miss_count is None:
         args.miss_count = args.request_length
@@ -315,11 +312,6 @@ def validate_args(args: argparse.Namespace) -> str | None:
         return "populate-chunk-entries must be positive"
     if args.kernel_profile_clock_mhz <= 0:
         return "kernel-profile-clock-mhz must be positive"
-    if args.contention_control_dir is not None:
-        if args.contention_result is None or args.contention_graph_calls <= 0 or args.miss_count <= 0:
-            return "contention mode requires a result path, positive graph calls and positive miss-count"
-        if args.kernel_profile:
-            return "contention mode measures graph throughput and requires --no-kernel-profile"
     return None
 
 

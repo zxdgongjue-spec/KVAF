@@ -24,7 +24,6 @@ vLLM/模型框架适配见[两个 Get 与普通算子混合捕获的示例](cach
 - [AccessOperator 目录](../access_operator/README.md) 与 [Runtime 目录](../runtime/README.md)：模块索引和兼容接口示例。
 
 - [统一 Get 性能测试](batch_get_performance.md) 与 [多卡带宽测试](batch_get_multicard_performance.md)：统一入口、计时口径及 profiling 开关。
+- [AIV Scatter / Gather 实现与验证](aiv_batch_get_stage1.md)
 - [Gather 实现与配置：各阶段优化、byte-prefix、协作 chunk 与 ABI](aiv_gather_prepared_prefix.md)
 - [Gather 性能采集与排障：对照、Host/AIV/CPU 计时与 CSV](aiv_gather_serial_profile.md)
-
-当前文档主要描述 POC 阶段的 Runtime、Meta Manager 和 KV Access Operator，以及它们的接口边界、调用关系和后续扩展方向。

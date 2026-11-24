@@ -304,7 +304,7 @@ runtime = kvaf.NpuRuntime(
 | `transport` | `transport_mode` 规定池的传输范围，各次配置选择具体 transport |
 | 全局核数、Jetty、in-flight 和 Get/Put kernel 路径 | 放入对应配置的 `ExecutionResources`，分别列入 `put_resources/get_resources` |
 | `enabled_put_configs/enabled_get_configs` | 无需填写，按构建能力和 transport 模式选择；首次准备时检查具体资源 |
-| `adaptive_ub_*` | 不再启动测速选路；需要固定路由时使用 `npu_eids/peer_ub_device` |
+| `adaptive_ub_*` | 仅旧构造器的 URMA AIV Direct 模式兼容显式测速选路。新构造器按拓扑选路，可用 `npu_eids/peer_ub_device` 固定路由。 |
 
 以下片段使用已创建的 NPU Tensor、stream 和缓存内容。当前构建支持的算法自动可用，
 无需 enabled 列表；默认值只决定未传 execution 时选哪个算法，资源配置在首次使用时检查：

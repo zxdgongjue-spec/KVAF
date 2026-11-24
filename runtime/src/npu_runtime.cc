@@ -542,44 +542,37 @@ Status NpuRuntime::InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_siz
       detail::StartupProbeLayout layout{};
       status = detail::BuildStartupProbeLayout(probe, &layout);
       if (!status.ok()) return status;
-      std::vector<std::pair<double, std::string>> scores;
-      Status last = Status::NotFound("no usable CPU device for adaptive AIV Get");
-      for (const auto& device : impl_->options.adaptive_peer_ub_devices) {
+      const auto& devices = impl_->options.adaptive_peer_ub_devices;
+      std::vector<std::vector<detail::StartupCandidate>> candidates;
+      candidates.reserve(devices.size());
+      for (std::uint32_t index = 0; index < devices.size(); ++index) {
+        const auto& device = devices[index];
         if (device.empty() || device.find(',') != std::string::npos)
           return Status::InvalidArgument("adaptive CPU candidate must name one UB device");
-        impl_->adaptive_cpu_device = device;
-        auto trial = initialize({layout.ddr_bytes, layout.block_bytes, DeviceKind::kCpu});
-        double cycles = 0.0;
-        if (trial.ok()) {
-          impl_->bandwidth_probe = std::make_unique<detail::StartupBandwidthProbe>(probe);
-          trial = impl_->bandwidth_probe->Run(*this, &cycles);
-        }
-        status = ShutdownDdr();
-        if (!status.ok()) return status;
-        if (!trial.ok()) {
-          last = trial;
-          continue;
-        }
-        std::fprintf(stderr, "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u ub_device=%s "
-                             "miss_count=%u cycles=%.0f\n",
-                     impl_->options.device_id, device.c_str(), probe.miss_count, cycles);
-        scores.emplace_back(cycles, device);
+        candidates.push_back({{index, 0U}});
       }
-      std::stable_sort(scores.begin(), scores.end(),
-                       [](const auto& a, const auto& b) { return a.first < b.first; });
-      for (const auto& [cycles, device] : scores) {
-        impl_->adaptive_cpu_device = device;
-        last = initialize(request);
-        if (last.ok()) {
-          std::fprintf(stderr, "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u ub_device=%s cycles=%.0f\n",
-                       impl_->options.device_id, device.c_str(), cycles);
-          return last;
-        }
-        status = ShutdownDdr();
-        if (!status.ok()) return status;
-      }
-      impl_->adaptive_cpu_device.clear();
-      return last;
+      const RuntimeInitRequest scratch{layout.ddr_bytes, layout.block_bytes, DeviceKind::kCpu};
+      status = detail::SelectStartupDeviceCandidate(candidates,
+          [&](const detail::StartupCandidate& candidate, bool measure, double* cycles) {
+            const auto& device = devices[candidate.peer];
+            impl_->adaptive_cpu_device = device;
+            auto trial = initialize(measure ? scratch : request);
+            if (!trial.ok()) return trial;
+            if (measure) {
+              impl_->bandwidth_probe = std::make_unique<detail::StartupBandwidthProbe>(probe);
+              trial = impl_->bandwidth_probe->Run(*this, cycles);
+              if (!trial.ok()) return trial;
+              std::fprintf(stderr, "[KVAF_AIV] UB_DEVICE_PROBE_RESULT device_id=%u ub_device=%s "
+                                   "miss_count=%u cycles=%.0f\n",
+                           impl_->options.device_id, device.c_str(), probe.miss_count, *cycles);
+            } else {
+              std::fprintf(stderr, "[KVAF_AIV] UB_DEVICE_SELECTED device_id=%u ub_device=%s cycles=%.0f\n",
+                           impl_->options.device_id, device.c_str(), *cycles);
+            }
+            return trial;
+          }, [&] { return ShutdownDdr(); });
+      if (!status.ok()) impl_->adaptive_cpu_device.clear();
+      return status;
     }
   }
 #endif

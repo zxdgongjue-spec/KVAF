@@ -160,7 +160,8 @@ runtime.initialize(ddr_bytes, slot_size)  # ddr_bytes 为 slot_size 的整数倍
 
 推理框架可以把多个 prepared 节点挂到已有图中，调用
 `prepare_scatter_batch_get(..., stream=stream, capture_into_graph=True)` 获取节点，在捕获期间
-调用这些节点。每次 replay 后调用一次 `check_scatter_graph_replay()` 验证累计序号与状态。
+调用这些节点。准备节点时会在捕获开始前初始化该 stream 的 Scatter 资源。每次 replay 后调用一次
+`check_scatter_graph_replay()` 验证累计序号与状态。
 设备失败状态会传递到后续节点。保留 Runtime、stream、Tensor 和 AccessTable，直到图完成、
 销毁并调用 `detach_scatter_batch_get_graph()`；同一 Runtime 的所有节点须使用同一图和 stream。
 profiling 开关须在捕获前设置。
