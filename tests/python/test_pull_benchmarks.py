@@ -1,5 +1,6 @@
 """Timing boundaries, percentile conventions and scattered layouts without NPU hardware."""
 import contextlib
+import ctypes
 import io
 import sys
 import unittest
@@ -10,6 +11,7 @@ import bench_hbm_read_raw_addr as raw_bench
 from bench_hbm_read_raw_addr import GUARD_BYTES, packet_layout, parse_args, round_counts, pattern_phase, raw_profile_sample
 from bench_remote_cpu_offload import INTERNAL_STAGES, SUBMIT_STAGES, SERVER_STAGES, measure_pull
 from pull_bench_utils import scattered_offsets, summarize_us
+from utils.npu_eids import source_physical_device_id
 
 
 def npu_ready(mr_id=1, sequence=1):
@@ -18,6 +20,23 @@ def npu_ready(mr_id=1, sequence=1):
 
 
 class PullBenchmarks(unittest.TestCase):
+    def test_physical_source_uses_cann_mapping(self):
+        signature = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32))
+
+        @signature
+        def resolve(device_id, physical):
+            if device_id != 1:
+                return 1
+            physical[0] = 7
+            return 0
+
+        for name in ("aclrtGetPhyDevIdByUserDevId", "aclrtGetPhyDevIdByLogicDevId"):
+            library = SimpleNamespace(**{name: resolve})
+            with self.subTest(name=name), patch("utils.npu_eids.ctypes.CDLL", return_value=library):
+                self.assertEqual(source_physical_device_id(1), 7)
+                with self.assertRaisesRegex(RuntimeError, "device 3"):
+                    source_physical_device_id(3)
+
     def test_kernel_diagnostics_require_eager_execution(self):
         common = ["--npu-eid-a-raw", "a", "--npu-eid-b-raw", "b"]
         with patch.dict(raw_bench.os.environ, {"KVAF_HBM_RAW_READ_DIAGNOSTICS": "1"}):

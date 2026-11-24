@@ -10,6 +10,7 @@ import multiprocessing as mp
 import traceback
 
 from test_cpu_offload import fnv64
+from utils.npu_eids import source_physical_device_id
 from test_remote_cpu_offload import OFFSETS, SOURCE_BYTES, KEYS, pattern, receive, retain, verify_aiv
 
 RAW_LENGTHS = [1, 656, 100001]
@@ -124,7 +125,7 @@ def main():
     runtime.link_to(args.cpu)
     runtime.initialize_ddr(ddr_bytes=8 * 131072, slot_size=131072)
     assert runtime.ddr_initialized
-    ticket = runtime.offload_region()
+    ticket = runtime.offload_region(source_physical_device_id=source_physical_device_id(args.device_b))
     assert set(ticket) == {"version", "address", "region_id", "epoch", "token", "eid"}
     assert ticket["version"] == 2
     ddr_base = runtime.remote_region["base"]

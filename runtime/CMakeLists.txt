@@ -30,6 +30,7 @@ add_library(kvaf_runtime
   cpu_service/runtime_service.cc
   src/npu_runtime_config.cc
   src/npu_eid_selection.cc
+  src/npu_device_pair.cc
 )
 
 target_include_directories(kvaf_runtime
@@ -50,6 +51,7 @@ target_link_libraries(kvaf_runtime
     kvaf_access_operator
   PRIVATE
     kvaf_offload_control
+    ${CMAKE_DL_LIBS}
 )
 
 target_compile_features(kvaf_runtime PUBLIC cxx_std_17)

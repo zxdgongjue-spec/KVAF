@@ -2,11 +2,33 @@
 // CPU DMA. Hardware permissions and cache visibility require the two-card test.
 #include "offload_fake_server.h"
 #include "npu_runtime.h"
+#include "npu_eid_selection.h"
 #include "remote_pull_operator.h"
 #include "meta_manager.h"
 #include <chrono>
 #include <sys/wait.h>
 
+// The driver fixture gives source 7 a CPU endpoint different from the reader's.
+namespace kvaf::detail {
+bool ResolvePhysicalDeviceId(std::uint32_t device, std::uint32_t* physical) {
+  *physical = device + 10;
+  return true;
+}
+PairEids ReadDevicePair(std::uint32_t physical) {
+  if (physical != 7 && physical != 16) return {};
+  NpuEid cpu{}, npu{};
+  cpu[0] = physical == 7 ? 1 : 0;
+  cpu[15] = 2;
+  npu[15] = physical == 7 ? 5 : 1;
+  return {cpu, npu};
+}
+}  // namespace kvaf::detail
+
+kvaf::peer::PeerCandidateInfo FirstEndpoint() {
+  kvaf::peer::PeerCandidateInfo candidate{};
+  candidate.eid[15] = 2;
+  return candidate;
+}
 void Ok(const Status& status) { if (!status.ok()) throw std::runtime_error(status.message()); }
 void NoResources(){Require(leases==0&&registrations==0&&sessions==0&&contexts==0&&jetties==0&&cqs==0&&peer_imports==0,"all registrations and leases released");}
 void Lifecycle(){
@@ -37,6 +59,47 @@ void Lifecycle(){
   server.drop=unsigned(rp::Command::Detach);Require(!b.Shutdown().ok(),"lost detach ACK retains exporter");Ok(b.Shutdown());NoResources();
   server.fail_release=true;Require(!a.Shutdown().ok(),"DDR release can be retried");Ok(a.Shutdown());
 }
+void SourceCardTicket() {
+  SharedServer server;
+  kvaf::NpuRuntimeOptions options;
+  options.device_id = 6;
+  kvaf::NpuRuntime reader(options);
+  Ok(reader.LinkTo({server.address}));
+  Ok(reader.Initialize(1024, 256));
+  kvaf::OffloadRegionTicket ticket, again;
+  Ok(reader.GetOffloadRegion(&ticket, 7));
+  Require(server.info.candidate == 1 && ticket.eid[0] == 1 && fake_device == 6,
+          "ticket binds source 7's CPU EID without switching the reader's device");
+  Ok(reader.GetOffloadRegion(&again));
+  Ok(reader.GetOffloadRegion(&again, 7));
+  Require(again.eid == ticket.eid && again.token == ticket.token, "repeated ticket preserves endpoint and grant");
+  Require(!reader.GetOffloadRegion(&again, 16).ok() && server.pull_preparations == 1,
+          "conflicting source cannot replace a bound endpoint");
+  aclrtSetDevice(7);
+  auto_mode = true;
+  kvaf::CpuPullHbmSource source(7);
+  std::vector<std::uint8_t> hbm(4096);
+  Ok(source.Register(ticket, {hbm.data(), hbm.size(), kvaf::DeviceKind::kNpu}, reinterpret_cast<void*>(1)));
+  Require(source.selected_npu_eid() == "00000000000000000000000000000005", "local producer uses its pair NPU EID");
+  Ok(source.Shutdown());
+  auto_mode = false;
+  Ok(reader.ShutdownDdr());
+  Ok(reader.InitializeDdr(1024, 256));
+  Ok(reader.GetOffloadRegion(&again));
+  Require(server.info.candidate == 0 && again.eid[0] == 0, "new region defaults to reader card");
+  Ok(reader.Shutdown());
+  NoResources();
+
+  SharedServer stale;
+  stale.stale_pull_eid = true;
+  kvaf::NpuRuntime other(options);
+  Ok(other.LinkTo({stale.address}));
+  Ok(other.Initialize(1024, 256));
+  kvaf::OffloadRegionTicket unpublished{};
+  Require(!other.GetOffloadRegion(&unpublished, 7).ok() && !unpublished.region_id,
+          "mismatched actual binding never publishes a ticket");
+  Ok(other.Shutdown());
+}
 // The dispatcher routes both data planes through one Core/MetaManager/pool.
 struct PoolAllocator : kvaf::DdrMemoryAllocator {
   std::shared_ptr<kvaf::peer::PeerLink> link;
@@ -61,7 +124,7 @@ struct FakeAiv : kvaf::AccessOperator {
 };
 void SharedMetadata(){
   SharedServer server;auto link=std::make_shared<kvaf::peer::PeerLink>(server.address);
-  PoolAllocator allocator(link);FakeAiv aiv;kvaf::RemotePullOperator op(link);
+  PoolAllocator allocator(link);FakeAiv aiv;kvaf::RemotePullOperator op(link, FirstEndpoint());
   auto meta=kvaf::CreateInMemoryMetaManager();kvaf::RuntimeCore core(*meta,aiv,allocator);Ok(core.Initialize({1024,256,kvaf::DeviceKind::kCpu}));Ok(op.Initialize(core.remote_region()));Ok(core.SetCpuPullExecutor(&op));
   std::vector<std::uint8_t> a_data(64,0x23),b_data(1024,0x67);
   Ok(core.BatchPut({{0},{a_data.data(),a_data.size(),kvaf::DeviceKind::kNpu},{0},{64}}));
@@ -85,7 +148,7 @@ void SharedMetadata(){
 }
 void PreparedSyncRequests(){
   SharedServer server;auto link=std::make_shared<kvaf::peer::PeerLink>(server.address);
-  PoolAllocator allocator(link);FakeAiv aiv;kvaf::RemotePullOperator op(link);
+  PoolAllocator allocator(link);FakeAiv aiv;kvaf::RemotePullOperator op(link, FirstEndpoint());
   auto meta=kvaf::CreateInMemoryMetaManager();kvaf::RuntimeCore core(*meta,aiv,allocator);
   Ok(core.Initialize({1024,128,kvaf::DeviceKind::kCpu}));Ok(op.Initialize(core.remote_region()));Ok(core.SetCpuPullExecutor(&op));
   std::vector<std::uint8_t> data(4096);for(std::size_t i=0;i<data.size();++i)data[i]=(i*19+7)%251;
@@ -310,6 +373,8 @@ void UnifiedBatchCpuPull() {
   std::vector<kvaf::ConstBufferView> views{{first.data(),first.size(),kvaf::DeviceKind::kNpu},
                                          {second.data(),second.size(),kvaf::DeviceKind::kNpu}};
   aclrtSetDevice(0);kvaf::CpuPullHbmSource source(0);
+  Require(!source.Register(ticket,views,reinterpret_cast<void*>(1)).ok(), "failed CLOS probe does not rotate to another EID");
+  failed_route=0;
   Ok(source.Register(ticket,views,reinterpret_cast<void*>(1)));
   kvaf::ReadyToken ready;Ok(source.Ready(views[1],&ready));
   std::vector<std::uint64_t> offsets{32,600},lengths{64,32};
@@ -592,7 +657,7 @@ void ConnectorApi(){
     auto meta=kvaf::CreateInMemoryMetaManager();auto allocator=kvaf::CreateHostDdrMemoryAllocator();FakeAiv op;
     kvaf::RuntimeCore foreign(*meta,op,*allocator);Ok(foreign.Initialize({1024,256,kvaf::DeviceKind::kCpu}));
     auto unused_link=std::make_shared<kvaf::peer::PeerLink>(server.address);
-    kvaf::RemotePullOperator foreign_pull(unused_link);Ok(foreign.SetCpuPullExecutor(&foreign_pull));
+    kvaf::RemotePullOperator foreign_pull(unused_link, FirstEndpoint());Ok(foreign.SetCpuPullExecutor(&foreign_pull));
     kvaf::PutHandle foreign_put;Ok(foreign.PreparePut({1},{64},&foreign_put));
     Require(!reader.QueryCpuPull(foreign_put,&state).ok() && !reader.WaitCpuPull(foreign_put,0,&state).ok(),
             "foreign put cannot query or wait in this Runtime");
@@ -787,4 +852,4 @@ void MultipleMemorySource() {
           "MR switching never registers, rebuilds links, probes or replays DMA");
   Ok(source.Shutdown());Ok(reader.Shutdown());NoResources();
 }
-int main(){try{Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();RejectedCancelPreservesLastBatch();AdmissionAndReplay();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{SourceCardTicket();Lifecycle();SharedMetadata();PreparedSyncRequests();ReadWorkerReuse();RejectedCancelPreservesLastBatch();AdmissionAndReplay();UnifiedBatchCpuPull();DetailedTiming();InitializationRecovery();MultipleMemorySource();ConnectorApi();ConnectorQuarantine(false);ConnectorQuarantine(true);std::cout<<"remote offload lifecycle passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

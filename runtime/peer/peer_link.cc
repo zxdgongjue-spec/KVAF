@@ -682,17 +682,17 @@ Status DefaultFeCount(uint32_t* count) {
 
 Status PeerLink::SelectCpuFes(const PeerCandidateTable& table, const std::string& csv,
                               const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
-                              bool multiple_local_eids, CpuFeSelection* selected) const {
+                              bool single_cpu_fe, CpuFeSelection* selected) const {
   if (!selected || !table.count) return Status::InvalidArgument("empty CPU candidate selection");
   std::vector<std::string> devices;
   auto status = ParseDevices(csv, &devices);
   if (!status.ok()) return status;
-  if (devices.size() > 1 && (table.local || multiple_local_eids))
+  if (devices.size() > 1 && (table.local || single_cpu_fe))
     return Status::InvalidArgument("multiple peer UB devices require a remote CPU and one local NPU EID");
 
   CpuFeSelection result;
   result.explicit_devices = !devices.empty();
-  const bool automatic_multi = devices.empty() && !table.local && !table.device_fixed && !multiple_local_eids;
+  const bool automatic_multi = devices.empty() && !table.local && !table.device_fixed && !single_cpu_fe;
   const bool match_pair = devices.empty() && table.local && !table.device_fixed && pair_cpu_eid;
   result.requested_count = devices.empty() ? 1U : static_cast<uint32_t>(devices.size());
   if (automatic_multi) {

@@ -87,8 +87,11 @@ class SharedServer {
                           kvaf::peer::PeerRegion* out) override {
       ++owner_.pull_preparations;
       Require(bytes==owner_.info.bytes && token && token!=2,"logical DDR and independent CPU grant");
-      owner_.info.candidate=candidate; owner_.info.token=token; owner_.info.eid[15]=2;
-      *out=descriptor; out->length=bytes; out->token_value=token; out->eid[15]=2;
+      owner_.info.candidate=candidate; owner_.info.token=token;
+      owner_.info.eid[0]=candidate; owner_.info.eid[15]=2;
+      *out=descriptor; out->length=bytes; out->token_value=token;
+      std::copy_n(owner_.info.eid, out->eid.size(), out->eid.begin());
+      if (owner_.stale_pull_eid) ++out->eid[15];
       return Status::OK();
     }
     std::unique_ptr<p::Backend> CreateCpuPullBackend(std::shared_ptr<void> lease) override {
@@ -106,6 +109,7 @@ class SharedServer {
   },[this](const rp::RegionInfo& region){return regions.AcquireCpuPullBackend(region);},&control_mutex};
   std::atomic<std::uint16_t> drop{0};
   std::atomic<std::uint32_t> drop_execution{0};
+  bool stale_pull_eid{false};
   std::atomic<int> pull_preparations{0}, describe_calls{0};
   std::atomic<int> control_calls{0}, pool_allocations{0}, inspect_calls{0}, query_calls{0}, submit_calls{0}, sync_submit_calls{0}, connection_count{0};
   std::atomic<bool> stop{false}, fail_release{false}, disconnect_submit{false}, lose_before_dispatch{false}, omit_timing{false};
@@ -124,11 +128,21 @@ class SharedServer {
   void Peer(int fd,kvaf::peer::MessageHeader header){
     namespace peer=kvaf::peer;
     const auto cmd=static_cast<peer::Command>(header.command);
-    if(cmd==peer::Command::kGetCandidateCount){peer::CandidateCountResponse r{};r.candidate_count=2;r.device_count=2;Reply(fd,cmd,r);return;}
+    if(cmd==peer::Command::kGetCacheCandidateCount){peer::CandidateCountResponse r{};r.candidate_count=2;r.device_count=2;Reply(fd,cmd,r);return;}
     if(cmd==peer::Command::kGetCandidateInfo){
-      peer::CandidateInfoRequest req{};req.header=header;ReadTail(fd,&req);
-      peer::CandidateInfoResponse r{};r.candidate_id=req.candidate_id;r.device_id=req.candidate_id;
-      std::snprintf(r.device_name,sizeof(r.device_name),"fake-%u",req.candidate_id);Reply(fd,cmd,r);return;
+      peer::CandidateEidRequest req{};
+      Require(header.bytes == sizeof(req), "CPU Pull queries full candidate EIDs");
+      Require(p::ReadBytes(fd, reinterpret_cast<char*>(&req)+sizeof(header), sizeof(req)-sizeof(header)), "read candidate query");
+      peer::CandidateEidResponse record{};
+      auto& r = record.info;
+      r.header = peer::MakeHeader(cmd, sizeof(record));
+      r.header.command = peer::ResponseCommand(cmd);
+      r.candidate_id = r.device_id = req.info.candidate_id;
+      std::snprintf(r.device_name,sizeof(r.device_name),"fake-%u",r.candidate_id);
+      record.eid[0] = r.candidate_id;
+      record.eid[15] = 2;
+      Require(p::WriteBytes(fd, &record, sizeof(record)), "write candidate EID");
+      return;
     }
     if(header.command==kvaf::execution::kCommand){
       Require(header.bytes>=sizeof(header)&&header.bytes<=16384,"bounded execution frame");
