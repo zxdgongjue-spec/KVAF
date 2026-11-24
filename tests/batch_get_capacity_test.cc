@@ -40,12 +40,12 @@ int main() {
   q.op = execution::Op::OpenSession; q.region = region.region;
   auto check = [&](Transport t, Executor e, GetAlgorithm a, bool put, bool dynamic) {
     q.transport = t; q.executor = e; q.algorithm = a; q.put = put;
-    auto factory = [](std::shared_ptr<peer::PeerLink>) -> std::unique_ptr<AccessOperator> { return {}; };
-    SessionAccessOperator op({}, q, factory, 65536);
+    auto factory = [](const PeerExecutionResources::Links&) -> std::unique_ptr<AccessOperator> { return {}; };
+    SessionAccessOperator op({}, q, {}, factory, 65536);
     CHECK(op.ValidateRequestCapacity(65536).ok());
     CHECK(op.ValidateRequestCapacity(65537).ok() == dynamic);
     CHECK(op.ValidateRequestCapacity(UINT32_MAX).ok() == dynamic);
-    SessionAccessOperator small({}, q, factory, 128);
+    SessionAccessOperator small({}, q, {}, factory, 128);
     CHECK(small.ValidateRequestCapacity(128).ok());
     CHECK(small.ValidateRequestCapacity(129).ok() == dynamic);
     BatchGetRequest input;

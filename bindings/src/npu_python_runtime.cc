@@ -599,6 +599,7 @@ class NpuPythonRuntime final {
   bool DdrInitialized() const { return native_->ddr_initialized(); }
   bool Initialized() const { return native_->initialized(); }
   std::uint32_t DeviceId() const { return native_->device_id(); }
+  ExecutionResources GetResources(GetExecutionConfig config) const { return native_->GetResources(config); }
   const std::vector<std::string>& NpuEids() const { return native_->npu_eids(); }
   std::uint32_t BatchGetTokenBytes() const {
     return native_->batch_get_token_bytes();
@@ -1630,6 +1631,8 @@ void BindNpuPythonRuntime(py::module_& module) {
       .def("initialize_ddr", &NpuPythonRuntime::InitializeDdr, py::arg("ddr_bytes"), py::arg("slot_size"))
       .def("shutdown_ddr", &NpuPythonRuntime::ShutdownDdr)
       .def_property_readonly("ddr_initialized", &NpuPythonRuntime::DdrInitialized)
+      .def("get_execution_resources", &NpuPythonRuntime::GetResources, py::arg("execution"),
+           "Return the effective Get resource budget after DDR initialization.")
       .def("link_to", &NpuPythonRuntime::LinkTo, py::arg("address"),
            "Set the CPU Runtime target before initialize_ddr or initialize(ddr_bytes, slot_size).")
       .def("initialize", &NpuPythonRuntime::Initialize, py::arg("ddr_bytes"), py::arg("slot_size"))

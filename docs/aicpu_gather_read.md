@@ -125,8 +125,8 @@ Host 地址表通过整段 H2D 上传；每次 BatchGet 本身不遍历或复制
 ## 与 AIV 共用 Host EID 发现
 
 GatherRead 和 CPU Push Scatter 都由 `NpuRuntime` 的现有
-EID 发现流程选路：逻辑设备号映射到物理设备号，读取 CLOS 与 pair_info 候选，
-使用首个自动发现候选；不执行启动探测或候选自动切换。
+EID 发现流程选路。本机自动使用该物理卡的 Pair Info remote_eid，缺失时回退到首个有效 CLOS；
+远端自动使用首个有效 CLOS。显式 NPU EID 优先。
 
 Host 将选定 EID 传入 UMDK Prepare，设备端只匹配该 EID 对应的 UB device/index 并创建 context；
 没有匹配项或准备失败时直接报错，不改用其他 EID。

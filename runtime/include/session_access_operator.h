@@ -10,9 +10,10 @@ class SessionAccessOperator final : public AccessOperator {
  public:
   using Factory = PeerExecutionResources::Factory;
   SessionAccessOperator(std::shared_ptr<peer::PeerLink> root, execution::Request config,
-                        Factory factory, std::uint32_t capacity = 65536)
+                        std::vector<peer::PeerCandidateInfo> candidates, Factory factory,
+                        std::uint32_t capacity = 65536)
       : standalone_(std::make_unique<PeerExecutionResources>(
-            std::move(root), config, std::move(factory), capacity)), resources_(standalone_.get()) {}
+            std::move(root), config, std::move(candidates), std::move(factory), capacity)), resources_(standalone_.get()) {}
   std::unique_ptr<ExecutionResourceOwner> TakeResources() override { return std::move(standalone_); }
   Status ValidateRequestCapacity(std::uint32_t count) const override {
     return resources_->ValidateCapacity(count);

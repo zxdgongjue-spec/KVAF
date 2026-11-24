@@ -22,16 +22,16 @@ class Link final:public kvaf::peer::PeerLink {
 };
 KvafBatchGetTransport* Transport(Link& link) {
   auto* t=new KvafBatchGetTransport;
-  t->peer_link=&link;t->paths.resize(1);t->paths[0].device_context=new int;
+  t->paths.resize(1);t->paths[0].link=&link;t->paths[0].device_context=new int;
   std::array<uint8_t,hccp::kEidBytes> route{};
-  Check(hccp::LoadPeerMemory(&link,0x10000,&t->peer_memory,&route),"load first MR");
-  t->remote_memories.emplace(1,RemoteMemoryRegistration{t->peer_memory,0x10000,4097,{},true});
+  Check(hccp::LoadPeerMemory(&link,0x10000,&t->paths[0].peer_memory,&route),"load first MR");
+  t->remote_memories.emplace(1,RemoteMemoryRegistration{t->paths[0].peer_memory,0x10000,4097,{},true});
   t->worker_count=4;
   for(unsigned i=0;i<4;++i) {
     auto& e=t->entity_templates[i];e.magic=kDirectEntityMagic;e.version=kDirectEntityVersion;
     e.remote_host_ddr_address=0x10000;e.remote_host_ddr_size=4097;e.registered_base=0x10000;
-    e.remote_token_id=t->peer_memory.wqe_token_id();e.remote_token_value=37;
-    const auto eid=ReverseEidForAivWqe(t->peer_memory.wqe_eid);std::memcpy(e.remote_eid,eid.data(),16);
+    e.remote_token_id=t->paths[0].peer_memory.wqe_token_id();e.remote_token_value=37;
+    const auto eid=ReverseEidForAivWqe(t->paths[0].peer_memory.wqe_eid);std::memcpy(e.remote_eid,eid.data(),16);
     e.sq_va=0x100+i;e.cq_va=0x200+i;e.tp_id=0x300+i;e.jetty_id=0x400+i;
   }
   t->api.token_alloc=[](void*,hccp::TokenId* token,void** out){*out=new int;++tokens;token->token_id=0x5500;return 0;};
@@ -54,9 +54,9 @@ KvafBatchGetTransport* Transport(Link& link) {
   t->api.ctx_deinit=[](void* p){delete static_cast<int*>(p);return 0;};
   auto& path=t->paths[0];
   auto key=kvaf::UrmaBindingKey::Make(kvaf::MemoryDirection::Get,path.device_context,
-      path.context_generation,t->peer_memory,hccp::MemImportFlags());
+      path.context_generation,t->paths[0].peer_memory,hccp::MemImportFlags());
   Check(t->bindings.Acquire(key,[&](hccp::HccpRemoteMemoryBinding& b) {
-    return b.Import(path.device_context,t->api.rmem_import,t->api.rmem_unimport,t->peer_memory);
+    return b.Import(path.device_context,t->api.rmem_import,t->api.rmem_unimport,t->paths[0].peer_memory);
   },&path.peer_binding).ok(),"main remote binding owns first MR");
   return t;
 }

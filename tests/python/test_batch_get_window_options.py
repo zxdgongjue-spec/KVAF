@@ -53,8 +53,11 @@ class WindowOptions(unittest.TestCase):
             self.assertIsNone(validate_workload(args))
             command = workload_command(args)
             self.assertIn("--" + name.replace("_", "-"), command)
-            run = BenchmarkExecution(kvaf, executor="aicpu", algorithm=algorithm, **{name: 64 << 20})
+            run = BenchmarkExecution(kvaf, executor="aicpu", algorithm=algorithm,
+                                     get_cores=5, put_cores=1, **{name: 64 << 20})
             self.assertEqual(run.runtime_kwargs["get_resources"][0][1][name], 64 << 20)
+            self.assertEqual(run.runtime_kwargs["get_resources"][0][1]["cores"], 5)
+            self.assertEqual(run.runtime_kwargs["put_resources"][0][1]["cores"], 1)
             setattr(args, name, -1)
             self.assertIsNotNone(validate_workload(args))
             with self.assertRaises(ValueError):

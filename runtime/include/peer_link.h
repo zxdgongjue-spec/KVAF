@@ -7,6 +7,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <memory>
+#include <optional>
+#include <vector>
 #include "execution_config.h"
 
 #include "peer_protocol.h"
@@ -41,6 +43,21 @@ struct PeerCandidateInfo {
   uint32_t device_id = 0U;
   uint32_t eid_index = 0U;
   std::string device_name;
+  std::array<uint8_t, kEidBytes> eid{};
+};
+
+struct PeerCandidateTable {
+  uint32_t count{}, device_count{};
+  bool device_fixed{}, local{};
+};
+
+struct CpuFeSelection {
+  PeerCandidateInfo primary;
+  std::vector<PeerCandidateInfo> direct_get;
+  bool explicit_devices{};
+  uint32_t requested_count{};
+
+  Status ForDirectGet(uint64_t workers, std::vector<PeerCandidateInfo>* active) const;
 };
 
 // Per-Runtime peer control-plane client. Its endpoint is explicit: Runtime
@@ -51,7 +68,8 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   virtual ~PeerLink() = default;
   Status AllocateCacheRegion(std::uint64_t logical_bytes, std::uint64_t slot_size,
                              std::uint64_t auxiliary_bytes, TransportMode, PeerRegion*);
-  std::shared_ptr<PeerLink> ExecutionSession(const execution::Request& config);
+  std::shared_ptr<PeerLink> ExecutionSession(const execution::Request& config,
+                                             const PeerCandidateInfo* candidate = nullptr);
   Status PrepareExecution();
   Status PrepareCpuPullRegion(uint64_t base, uint32_t candidate, PeerRegion*);
   Status CloseExecution();
@@ -65,7 +83,15 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
 
   Status GetCandidateCount(uint32_t* candidate_count, uint32_t* device_count = nullptr,
                            bool* device_filter_applied = nullptr) const;
-  Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info) const;
+  Status GetCandidateInfo(uint32_t candidate_id, PeerCandidateInfo* info, bool with_eid = true) const;
+  Status GetCacheCandidateCount(PeerCandidateTable* table) const;
+  Status DiscoverCandidates(PeerCandidateTable* table, bool cache_scope = true);
+  Status SelectCpuCandidate(const PeerCandidateTable&, const std::string& device,
+                            const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
+                            PeerCandidateInfo* selected);
+  Status SelectCpuFes(const PeerCandidateTable&, const std::string& devices,
+                      const std::optional<std::array<uint8_t, kEidBytes>>& pair_cpu_eid,
+                      bool multiple_local_eids, CpuFeSelection* selected) const;
   Status AllocateRegion(uint64_t ddr_bytes, uint64_t slot_size,
                         uint32_t candidate_id, PeerRegion* region);
   Status AllocateUbmemRegion(uint64_t ddr_bytes, uint64_t slot_size, PeerRegion* region);
@@ -105,6 +131,7 @@ class PeerLink : public std::enable_shared_from_this<PeerLink> {
   std::shared_ptr<ExecutionState> execution_;
   std::shared_ptr<PeerLink> parent_;
   std::string address_;
+  std::optional<std::array<uint8_t, kEidBytes>> selected_cpu_eid_;
   std::unordered_map<uint64_t, PeerRegion> regions_;
   mutable std::mutex mapping_mutex_;
   std::unordered_map<uint64_t, std::size_t> ubmem_mappings_;

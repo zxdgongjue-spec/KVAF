@@ -1,4 +1,5 @@
 #include "npu_runtime.h"
+#include "npu_eid_selection.h"
 #include "execution_dispatcher.h"
 #include "session_access_operator.h"
 #if defined(KVAF_ENABLE_CPU_OFFLOAD)
@@ -13,9 +14,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <array>
-#include <cerrno>
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,9 +24,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -83,102 +78,6 @@ class PeerDdrAllocator final : public DdrMemoryAllocator {
 
 using AclrtGetPhyDevIdByLogicDevId = int (*)(int32_t, int32_t*);
 
-struct NpuLocalEidCandidate {
-  std::array<std::uint8_t, peer::kEidBytes> eid{};
-  std::string source;
-};
-
-constexpr char kUbDevIdPath[] = "/proc/asdrv_ub/dev_id";
-constexpr char kUbPairInfoPath[] = "/proc/asdrv_ub/pair_info";
-constexpr char kUbSelectorLockPath[] = "/tmp/kvaf_npu_runtime_asdrv_ub.lock";
-
-std::string EidToHex(const std::array<std::uint8_t, peer::kEidBytes>& eid) {
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string text;
-  text.reserve(eid.size() * 2U);
-  for (std::uint8_t byte : eid) {
-    text.push_back(kHex[byte >> 4U]);
-    text.push_back(kHex[byte & 0x0fU]);
-  }
-  return text;
-}
-
-bool ParseJsonUnsigned(const std::string& line, const char* field, std::uint32_t* value) {
-  if (value == nullptr) return false;
-  const std::string marker = std::string{"\""} + field + "\"";
-  const std::size_t field_position = line.find(marker);
-  const std::size_t colon = field_position == std::string::npos
-                                ? std::string::npos
-                                : line.find(':', field_position + marker.size());
-  const std::size_t first = colon == std::string::npos
-                                ? std::string::npos
-                                : line.find_first_of("0123456789", colon + 1U);
-  if (first == std::string::npos) return false;
-  char* end = nullptr;
-  const unsigned long parsed = std::strtoul(line.c_str() + first, &end, 10);
-  if (end == line.c_str() + first || parsed > std::numeric_limits<std::uint32_t>::max()) return false;
-  *value = static_cast<std::uint32_t>(parsed);
-  return true;
-}
-
-bool ParseJsonString(const std::string& line, const char* field, std::string* value) {
-  if (value == nullptr) return false;
-  const std::string marker = std::string{"\""} + field + "\"";
-  const std::size_t field_position = line.find(marker);
-  const std::size_t colon = field_position == std::string::npos
-                                ? std::string::npos
-                                : line.find(':', field_position + marker.size());
-  const std::size_t first_quote = colon == std::string::npos
-                                      ? std::string::npos
-                                      : line.find('"', colon + 1U);
-  const std::size_t second_quote = first_quote == std::string::npos
-                                       ? std::string::npos
-                                       : line.find('"', first_quote + 1U);
-  if (second_quote == std::string::npos) return false;
-  *value = line.substr(first_quote + 1U, second_quote - first_quote - 1U);
-  return true;
-}
-
-bool ParseEid(const std::string& text,
-              std::array<std::uint8_t, peer::kEidBytes>* eid) {
-  if (eid == nullptr || text.size() != eid->size() * 2U) return false;
-  const auto hex = [](char value) -> int {
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    return -1;
-  };
-  for (std::size_t index = 0; index < eid->size(); ++index) {
-    const int high = hex(text[index * 2U]);
-    const int low = hex(text[index * 2U + 1U]);
-    if (high < 0 || low < 0) return false;
-    (*eid)[index] = static_cast<std::uint8_t>((high << 4U) | low);
-  }
-  return true;
-}
-
-bool ParsePairInfoEid(const std::string& text,
-                      std::array<std::uint8_t, peer::kEidBytes>* eid) {
-  if (eid == nullptr) return false;
-  std::string compact;
-  compact.reserve(eid->size() * 2U);
-  for (const unsigned char value : text) {
-    if (std::isxdigit(value)) {
-      compact.push_back(static_cast<char>(value));
-    } else if (value != ':') {
-      return false;
-    }
-  }
-  return ParseEid(compact, eid);
-}
-
-std::string Trim(std::string text) {
-  const std::size_t first = text.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return {};
-  const std::size_t last = text.find_last_not_of(" \t\r\n");
-  return text.substr(first, last - first + 1U);
-}
-
 bool ResolvePhysicalDeviceId(std::uint32_t logical_device_id, std::uint32_t* physical_device_id) {
   if (physical_device_id == nullptr ||
       logical_device_id > static_cast<std::uint32_t>(std::numeric_limits<int32_t>::max())) {
@@ -200,215 +99,6 @@ bool ResolvePhysicalDeviceId(std::uint32_t logical_device_id, std::uint32_t* phy
     return false;
   }
   *physical_device_id = static_cast<std::uint32_t>(physical);
-  return true;
-}
-
-bool ReadHcclClosEids(const std::string& path, std::uint32_t physical_device_id,
-                      std::vector<std::array<std::uint8_t, peer::kEidBytes>>* eids,
-                      std::string* error) {
-  std::ifstream input(path);
-  if (!input.is_open()) {
-    *error = "cannot open " + path;
-    return false;
-  }
-  bool selected_rank = false;
-  bool found_rank = false;
-  bool clos_level_one = false;
-  bool clos_type = false;
-  bool expect_eid_address = false;
-  std::string line;
-  while (std::getline(input, line)) {
-    std::uint32_t value = 0U;
-    if (ParseJsonUnsigned(line, "device_id", &value)) {
-      selected_rank = value == physical_device_id;
-      found_rank = found_rank || selected_rank;
-      clos_level_one = clos_type = expect_eid_address = false;
-      continue;
-    }
-    if (!selected_rank) continue;
-    if (ParseJsonUnsigned(line, "net_layer", &value)) {
-      clos_level_one = value == 1U;
-      clos_type = expect_eid_address = false;
-      continue;
-    }
-    if (!clos_level_one) continue;
-    if (line.find("\"net_type\"") != std::string::npos) {
-      clos_type = line.find("\"CLOS\"") != std::string::npos;
-      continue;
-    }
-    if (clos_type && line.find("\"addr_type\"") != std::string::npos) {
-      expect_eid_address = line.find("\"EID\"") != std::string::npos;
-      continue;
-    }
-    if (!expect_eid_address) continue;
-    std::string eid_text;
-    if (!ParseJsonString(line, "addr", &eid_text)) continue;
-    expect_eid_address = false;
-    std::array<std::uint8_t, peer::kEidBytes> eid{};
-    if (!ParseEid(eid_text, &eid)) {
-      *error = "invalid CLOS EID for device_id=" + std::to_string(physical_device_id);
-      return false;
-    }
-    if (std::find(eids->begin(), eids->end(), eid) == eids->end()) eids->push_back(eid);
-  }
-  if (!found_rank || eids->empty()) {
-    *error = found_rank ? "no CLOS EID at net_layer=1 for physical device_id=" +
-                              std::to_string(physical_device_id)
-                        : "no rank for physical device_id=" + std::to_string(physical_device_id);
-    return false;
-  }
-  return true;
-}
-
-bool ReadPairInfoDeviceEid(std::uint32_t physical_device_id,
-                           std::array<std::uint8_t, peer::kEidBytes>* eid,
-                           std::string* error) {
-  if (eid == nullptr || error == nullptr) return false;
-  const int lock_fd = open(kUbSelectorLockPath, O_CREAT | O_RDWR, 0600);
-  if (lock_fd < 0 || flock(lock_fd, LOCK_EX) != 0) {
-    *error = "cannot lock " + std::string(kUbSelectorLockPath) + ": " + std::strerror(errno);
-    if (lock_fd >= 0) close(lock_fd);
-    return false;
-  }
-  bool success = false;
-  {
-    std::ofstream selector(kUbDevIdPath);
-    if (!selector.is_open()) {
-      *error = "cannot open " + std::string(kUbDevIdPath);
-    } else {
-      selector << physical_device_id << '\n';
-      selector.close();
-      std::ifstream pair_info(kUbPairInfoPath);
-      if (!pair_info.is_open()) {
-        *error = "cannot open " + std::string(kUbPairInfoPath);
-      } else {
-        const std::string selected_marker = "dev_id=" + std::to_string(physical_device_id) + ";";
-        bool selected_device = false;
-        bool active_channel = false;
-        std::uint32_t active_channels = 0U;
-        std::uint32_t device_eids = 0U;
-        std::string line;
-        while (std::getline(pair_info, line)) {
-          if (line.find("Dev id info.") != std::string::npos) {
-            selected_device = line.find(selected_marker) != std::string::npos;
-            active_channel = false;
-            continue;
-          }
-          if (!selected_device) continue;
-          if (line.find("chan_id=") != std::string::npos) {
-            active_channel = line.find("flag=1") != std::string::npos;
-            if (active_channel) ++active_channels;
-            continue;
-          }
-          constexpr char kRemotePrefix[] = "remote_eid:";
-          const std::size_t remote_pos = line.find(kRemotePrefix);
-          if (active_channel && remote_pos != std::string::npos &&
-              ParsePairInfoEid(Trim(line.substr(remote_pos + sizeof(kRemotePrefix) - 1U)), eid)) {
-            ++device_eids;
-          }
-        }
-        success = selected_device && active_channels == 1U && device_eids == 1U;
-        if (!success) {
-          *error = "expected one active pair_info device EID for physical device_id=" +
-                   std::to_string(physical_device_id) + "; active=" +
-                   std::to_string(active_channels) + " device_eids=" + std::to_string(device_eids);
-        }
-      }
-    }
-  }
-  (void)flock(lock_fd, LOCK_UN);
-  close(lock_fd);
-  return success;
-}
-
-void AddNpuLocalEidCandidate(
-    std::uint32_t physical_device_id,
-    const std::array<std::uint8_t, peer::kEidBytes>& eid,
-    std::string source, std::vector<NpuLocalEidCandidate>* candidates) {
-  if (std::find_if(candidates->begin(), candidates->end(),
-                   [&eid](const NpuLocalEidCandidate& candidate) {
-                     return candidate.eid == eid;
-                   }) != candidates->end()) {
-    return;
-  }
-  candidates->push_back(NpuLocalEidCandidate{eid, std::move(source)});
-  std::fprintf(stderr,
-               "[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERED physical_device=%u source=%s eid=%s\n",
-               physical_device_id, candidates->back().source.c_str(),
-               EidToHex(candidates->back().eid).c_str());
-}
-
-bool DiscoverNpuLocalEidCandidates(std::uint32_t logical_device_id,
-                                   std::vector<NpuLocalEidCandidate>* candidates,
-                                   std::string* error) {
-  if (candidates == nullptr || error == nullptr) return false;
-  candidates->clear();
-  std::uint32_t physical_device_id = 0U;
-  const char* configured = std::getenv("KVAF_HCCL_ROOTINFO_PATH");
-  const std::string rootinfo = configured != nullptr && configured[0] != '\0'
-                                   ? configured
-                                   : "/etc/hccl_rootinfo.json";
-  std::string clos_error;
-  std::vector<std::array<std::uint8_t, peer::kEidBytes>> clos_eids;
-  if (!ResolvePhysicalDeviceId(logical_device_id, &physical_device_id)) {
-    *error = "cannot resolve physical device from logical device " + std::to_string(logical_device_id);
-    return false;
-  } else {
-    (void)ReadHcclClosEids(rootinfo, physical_device_id, &clos_eids, &clos_error);
-  }
-  for (std::size_t index = 0; index < clos_eids.size(); ++index) {
-    AddNpuLocalEidCandidate(physical_device_id, clos_eids[index],
-                            "hccl_clos_pg_" + std::to_string(index), candidates);
-  }
-  if (clos_eids.empty()) {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_NPU_EID_DISCOVERY_UNAVAILABLE path=%s reason=%s\n",
-                 rootinfo.c_str(), clos_error.c_str());
-  }
-  std::array<std::uint8_t, peer::kEidBytes> pair_info_eid{};
-  std::string pair_info_error;
-  if (ReadPairInfoDeviceEid(physical_device_id, &pair_info_eid, &pair_info_error)) {
-    AddNpuLocalEidCandidate(physical_device_id, pair_info_eid,
-                            "asdrv_pair_info_device_eid", candidates);
-  } else {
-    std::fprintf(stderr, "[KVAF_AIV] PEER_LINK_NPU_EID_FALLBACK_UNAVAILABLE reason=%s\n",
-                 pair_info_error.c_str());
-  }
-  if (!candidates->empty()) return true;
-  *error = "no usable NPU EID candidate; CLOS=" + clos_error + "; pair_info=" + pair_info_error;
-  return false;
-}
-
-bool ParseConfiguredNpuLocalEids(
-    std::uint32_t logical_device_id, const std::vector<std::string>& configured,
-    std::vector<NpuLocalEidCandidate>* candidates, std::string* error) {
-  if (candidates == nullptr || error == nullptr || configured.empty()) return false;
-  candidates->clear();
-  std::uint32_t physical_device_id = 0U;
-  if (!ResolvePhysicalDeviceId(logical_device_id, &physical_device_id)) {
-    *error = "cannot resolve physical device from logical device " +
-             std::to_string(logical_device_id);
-    return false;
-  }
-  for (std::size_t index = 0U; index < configured.size(); ++index) {
-    std::array<std::uint8_t, peer::kEidBytes> eid{};
-    if (!ParseEid(configured[index], &eid) ||
-        std::all_of(eid.begin(), eid.end(),
-                    [](std::uint8_t byte) { return byte == 0U; })) {
-      *error = "npu_eids[" + std::to_string(index) +
-               "] must be a non-zero 32-digit hexadecimal EID";
-      return false;
-    }
-    if (std::find_if(candidates->begin(), candidates->end(),
-                     [&eid](const NpuLocalEidCandidate& candidate) {
-                       return candidate.eid == eid;
-                     }) != candidates->end()) {
-      *error = "npu_eids contains duplicate EID " + configured[index];
-      return false;
-    }
-    AddNpuLocalEidCandidate(physical_device_id, eid,
-                            "explicit_npu_eid_" + std::to_string(index),
-                            candidates);
-  }
   return true;
 }
 
@@ -505,7 +195,7 @@ struct NpuRuntime::Impl {
       for (const auto& entry : options.put_resources)
         if (entry.first == PutExecutionConfig{transport, executor}) selected = &entry.second;
     }
-    return detail::ResolveExecutionResources(transport, executor, get, selected);
+    return detail::ResolveExecutionResources(transport, executor, get, cache_peer_local, selected);
   }
   void ValidateProviderResources(Transport t, Executor e, GetAlgorithm algorithm, bool get,
                                  const ExecutionResources& budget) const {
@@ -576,7 +266,24 @@ struct NpuRuntime::Impl {
     if (get && (!options.batch_get_token_bytes || !options.batch_get_tokens_per_block))
       throw std::invalid_argument("ordinary cache Get requires a token layout");
     ValidateProviderResources(transport, executor, algorithm, get, budget);
-    q.candidate = selected_candidate;
+    std::vector<peer::PeerCandidateInfo> candidates;
+    if (transport == Transport::Urma) {
+      EnsureCacheEids();
+      if (get && executor == Executor::Aiv && algorithm == GetAlgorithm::Direct) {
+        const auto workers = static_cast<uint64_t>(budget.cores) * budget.jettys;
+        const auto s = cpu_fes.ForDirectGet(workers, &candidates);
+        if (!s.ok()) throw std::invalid_argument(s.message());
+        std::fprintf(stderr, "[KVAF] DIRECT_GET_FE_SELECTION requested=%u candidates=%zu active=%zu jettys=%llu\n",
+                     cpu_fes.requested_count, cpu_fes.direct_get.size(), candidates.size(),
+                     static_cast<unsigned long long>(workers));
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+          std::fprintf(stderr, "[KVAF] DIRECT_GET_FE path=%zu ub_device=%s eid_index=%u cpu_eid=%s\n",
+                       i, candidates[i].device_name.c_str(), candidates[i].eid_index,
+                       detail::EidToHex(candidates[i].eid).c_str());
+      } else {
+        candidates.push_back(cpu_fes.primary);
+      }
+    }
     q.workers = budget.cores;
     q.jettys = budget.jettys;
     q.request_capacity = budget.request_capacity;
@@ -586,30 +293,44 @@ struct NpuRuntime::Impl {
     const auto eids = ProviderEids(transport, executor, get, budget);
     if (!eids.empty()) q.local_eid = eids.front();
     return std::make_unique<SessionAccessOperator>(
-        peer_link, q,
-        [this, transport, executor, algorithm, get](std::shared_ptr<peer::PeerLink> link) {
-          return MakeLocalProvider(transport, executor, algorithm, get, std::move(link));
+        peer_link, q, std::move(candidates),
+        [this, transport, executor, algorithm, get](const PeerExecutionResources::Links& links) {
+          return MakeLocalProvider(transport, executor, algorithm, get, links);
         },
         budget.request_capacity);
   }
   void EnsureCacheEids() {
     std::lock_guard<std::mutex> lock(cache_eid_mutex);
-    if(cache_eids_ready)return;
-    std::vector<NpuLocalEidCandidate> candidates;
-    std::string error;
-    if (!options.npu_eids.empty()) {
-      if (!ParseConfiguredNpuLocalEids(options.device_id, options.npu_eids,
-                                      &candidates, &error))
-        throw std::invalid_argument(error);
-    } else if (!DiscoverNpuLocalEidCandidates(options.device_id, &candidates, &error)) {
-      throw std::invalid_argument(error);
-    }
-    for (const auto& candidate : candidates) local_eids.push_back(candidate.eid);
-    cache_eids_ready=true;
+    if (cache_eids_ready) return;
+    peer::PeerCandidateTable table;
+    table.local = cache_peer_local;
+    auto status = peer_link->GetCacheCandidateCount(&table);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    std::uint32_t physical_device;
+    if (!ResolvePhysicalDeviceId(options.device_id, &physical_device))
+      throw std::invalid_argument("cannot resolve physical NPU from device " + std::to_string(options.device_id));
+    const bool automatic_cpu = !table.device_fixed && options.peer_ub_device.empty();
+    detail::PairEids pair;
+    if (table.local && (options.npu_eids.empty() || automatic_cpu))
+      pair = detail::ReadDevicePair(physical_device);
+    status = detail::SelectNpuEids(physical_device, options.npu_eids, pair, &local_eids);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    status = peer_link->SelectCpuFes(table, options.peer_ub_device, pair.cpu,
+                                     local_eids.size() > 1, &cpu_fes);
+    if (!status.ok()) throw std::invalid_argument(status.message());
+    const auto& cpu = cpu_fes.primary;
+    const char* reason = "first_candidate";
+    if (!automatic_cpu) reason = "fixed_device";
+    else if (table.local) reason = pair.cpu && *pair.cpu == cpu.eid ? "pair_match" : "pair_fallback";
+    std::fprintf(stderr, "[KVAF] PEER_LINK_EID_SELECTED scene=%s physical_device=%u candidate=%u "
+                 "ub_device=%s eid_index=%u cpu_eid=%s npu_eid=%s cpu_selection=%s\n",
+                 table.local ? "local" : "remote", physical_device, cpu.candidate_id,
+                 cpu.device_name.c_str(), cpu.eid_index, detail::EidToHex(cpu.eid).c_str(),
+                 detail::EidToHex(local_eids.front()).c_str(), reason);
+    cache_eids_ready = true;
   }
   std::vector<detail::NpuEid> ProviderEids(Transport transport, Executor executor, bool get,
                                          const ExecutionResources& budget) {
-    if(transport==Transport::Urma)EnsureCacheEids();
     std::vector<detail::NpuEid> selected;
     const auto status = detail::SelectProviderEids(transport, executor, get,
         !options.npu_eids.empty(), budget, local_eids, &selected);
@@ -618,7 +339,8 @@ struct NpuRuntime::Impl {
   }
   std::unique_ptr<AccessOperator> MakeLocalProvider(Transport transport, Executor executor,
                                                     GetAlgorithm algorithm, bool get,
-                                                    std::shared_ptr<peer::PeerLink> link) {
+                                                    const PeerExecutionResources::Links& links) {
+    const auto& link = links.front();
     const auto budget = Resources(transport, executor, algorithm, get);
     const auto eids = ProviderEids(transport, executor, get, budget);
 #if defined(KVAF_ENABLE_AIV_BATCH_GET)
@@ -629,7 +351,9 @@ struct NpuRuntime::Impl {
     }
     if (executor == Executor::Aiv) {
       AccessOperatorConfig c;
+      c.peer_local = cache_peer_local;
       c.peer_link = link;
+      if (links.size() > 1) c.peer_get_links = links;
       c.peer_local_eids = eids;
       c.peer_local_eid = eids.front();
       c.npu_core_count = budget.cores;
@@ -671,7 +395,9 @@ struct NpuRuntime::Impl {
   detail::AicpuKernelPackage kernel_package;
   std::mutex aicpu_package_mutex;
   bool aicpu_package_ready{false};
-  std::uint32_t selected_candidate = 0;
+  peer::CpuFeSelection cpu_fes;
+  bool cache_peer_local{};
+  std::uint32_t pull_candidate{};
   std::vector<detail::NpuEid> local_eids;
   std::mutex cache_eid_mutex;
   bool cache_eids_ready{false};
@@ -754,35 +480,33 @@ Status NpuRuntime::InitializeDdr(std::uint64_t ddr_bytes, std::uint64_t slot_siz
   // Keep the entire explicit EID list until the selected provider applies its
   // own routing and worker budget; the default Get must not choose that policy.
   impl_->local_eids.clear();
-  impl_->cache_eids_ready=false;
-  impl_->selected_candidate = 0;
+  impl_->cpu_fes = {};
+  impl_->cache_eids_ready = false;
+  impl_->pull_candidate = 0;
   if (impl_->options.transport_mode != TransportMode::Ubmem) {
-    std::uint32_t candidate_count = 0U;
-    std::uint32_t device_count = 0U;
-    bool device_filter_applied = false;
-    auto status = impl_->peer_link->GetCandidateCount(
-        &candidate_count, &device_count, &device_filter_applied);
+    peer::PeerCandidateTable table;
+    auto status = impl_->peer_link->DiscoverCandidates(&table, false);
     if (!status.ok()) return status;
-    if (candidate_count == 0U)
-      return Status::NotFound("peer Runtime returned no UMDK/EID candidates");
-    if (!impl_->options.peer_ub_device.empty()) {
-      bool found = false;
-      for (std::uint32_t candidate = 0; candidate < candidate_count; ++candidate) {
-        peer::PeerCandidateInfo info{};
-        status = impl_->peer_link->GetCandidateInfo(candidate, &info);
+    impl_->cache_peer_local = table.local;
+    const auto& devices = impl_->options.peer_ub_device;
+    // A list configures cache Direct Get only. CPU Pull retains its single-device pin.
+    if (!devices.empty() && devices.find(',') == std::string::npos) {
+      const auto first = devices.find_first_not_of(" \t\r\n");
+      if (first == std::string::npos) return Status::InvalidArgument("empty peer UB device");
+      const auto device = devices.substr(first, devices.find_last_not_of(" \t\r\n") - first + 1);
+      std::uint32_t candidate = 0;
+      for (; candidate < table.count; ++candidate) {
+        peer::PeerCandidateInfo info;
+        status = impl_->peer_link->GetCandidateInfo(candidate, &info, false);
         if (!status.ok()) return status;
-        if (info.candidate_id != candidate || info.device_id >= device_count)
+        if (info.device_id >= table.device_count)
           return Status::Internal("peer Runtime returned invalid candidate metadata");
-        if (info.device_name == impl_->options.peer_ub_device) {
-          impl_->selected_candidate = candidate;
-          found = true;
-          break;
-        }
+        if (info.device_name == device) break;
       }
-      if (!found) return Status::NotFound(
-          "peer Runtime did not advertise fixed UB device " + impl_->options.peer_ub_device);
+      if (candidate == table.count)
+        return Status::NotFound("peer Runtime did not advertise fixed UB device " + device);
+      impl_->pull_candidate = candidate;
     }
-
   }
   impl_->runtime_core.reset();
   impl_->dispatcher.reset();
@@ -804,6 +528,10 @@ const RuntimeCore& NpuRuntime::core() const {
   return *impl_->runtime_core;
 }
 std::uint32_t NpuRuntime::device_id() const { return impl_->options.device_id; }
+ExecutionResources NpuRuntime::GetResources(GetExecutionConfig config) const {
+  if (!ddr_initialized()) throw std::logic_error("Get resources require initialized DDR");
+  return impl_->Resources(config.transport, config.executor, config.algorithm, true);
+}
 const std::vector<std::string>& NpuRuntime::npu_eids() const {
   return impl_->options.npu_eids;
 }
@@ -873,7 +601,8 @@ Status NpuRuntime::GetOffloadRegion(OffloadRegionTicket* out) {
   if(impl_->cpu_pull && impl_->cpu_pull->ticket().region_id) {
     *out=impl_->cpu_pull->ticket();return Status::OK();
   }
-  if(!impl_->cpu_pull)impl_->cpu_pull=std::make_unique<RemotePullOperator>(impl_->peer_link,impl_->selected_candidate);
+  if (!impl_->cpu_pull)
+    impl_->cpu_pull = std::make_unique<RemotePullOperator>(impl_->peer_link, impl_->pull_candidate);
   auto status=core().SetCpuPullExecutor(impl_->cpu_pull.get());
   if(!status.ok())return status;
   status=impl_->cpu_pull->Initialize(core().remote_region());

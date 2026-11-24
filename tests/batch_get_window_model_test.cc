@@ -23,6 +23,7 @@ struct Queue {
   alignas(64) std::array<uint32_t, 8 * 16> cq{};
   uint32_t sq_db{}, cq_db{}, cq_depth{8};
   uint64_t producer{}, completed{}, cq_producer{}, cq_consumer{}, peak_live{};
+  uint64_t remote_bias{};
   std::deque<uint64_t> checkpoints;
   bool error{}, timeout{};
 };
@@ -67,7 +68,7 @@ void Poll(void* address) {
       const auto* wqe = q.sq.data() + (q.completed++ % 32768) * 16;
       const uint64_t src = wqe[10] | (uint64_t(wqe[11]) << 32U);
       const uint64_t dst = wqe[14] | (uint64_t(wqe[15]) << 32U);
-      std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), wqe[12]);
+      std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src - q.remote_bias), wqe[12]);
     }
     const uint32_t owner = 1U - ((q.cq_producer / q.cq_depth) & 1U);
     q.cq[(q.cq_producer % q.cq_depth) * 16] = (owner << 2U) | (q.error ? 1U << 24U : 0U);
@@ -104,6 +105,11 @@ struct Fixture {
       auto& e = entities[i]; auto& q = aiv_model::hardware[i]; q.cq_depth = cq_depth;
       e.magic = 0x4b564155U; e.version = KVAF_AIV_DIRECT_URMA_ENTITY_VERSION;
       e.remote_host_ddr_address = e.registered_base = reinterpret_cast<uint64_t>(source.data());
+      // Distinct per-path registrations/tokens must survive queue windows and
+      // ring wraparound while all paths retain the same logical source region.
+      q.remote_bias = (uint64_t{i} + 1U) << 32U;
+      e.registered_base += q.remote_bias;
+      e.remote_token_id = i + 1U; e.remote_token_value = i + 100U;
       e.remote_host_ddr_size = source.size();
       e.local_hbm_address = reinterpret_cast<uint64_t>(output.data()); e.local_hbm_size = output.size();
       e.local_token_id = 1; e.sq_depth = 32768; e.wqe_size = 64;

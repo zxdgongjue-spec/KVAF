@@ -43,6 +43,9 @@ def run_group(args, devices, directory):
             logs.append(log)
             env = dict(os.environ, DEVICE_ID=str(device),
                        KVAF_CPU_SERVICE_ADDR=args.peer, PYTHONUNBUFFERED="1")
+            if args.backend == "aiv" and args.parallelism is None:
+                # The controller uses KVAF_BATCH_GET_AIV_CORES for sweeps.
+                env.pop("KVAF_BATCH_GET_PERF_AIV_CORES", None)
             env["KVAF_REMOTE_CPU_PERF_TIMEOUT"] = str(math.ceil(args.ready_timeout + args.seconds + 60))
             command = [
                 str(runner), str(args.build_dir),
@@ -353,7 +356,13 @@ def main(argv=None):
             print(f"MULTICARD_SWEEP_BEGIN {field}={count}", flush=True)
             isolated = [run_group(args, [device], case / f"isolated_{device}")[0] for device in args.devices]
             concurrent = run_group(args, args.devices, case / "concurrent")
-            write_summary(case, isolated, concurrent, dict(config, **{field: count}))
+            case_config = dict(config, **{field: count}, output=str(case))
+            if args.backend == "aiv":
+                for name in ("aiv_cores", "jettys_per_core"):
+                    values = {result[name] for result in isolated + concurrent}
+                    case_config[name] = values.pop() if len(values) == 1 else "per-device"
+                (case / "config.json").write_text(json.dumps(case_config, indent=2) + "\n")
+            write_summary(case, isolated, concurrent, case_config)
         if len(counts) > 1:
             write_sweep_summary(directory, counts, field)
     except (Exception, KeyboardInterrupt) as error:

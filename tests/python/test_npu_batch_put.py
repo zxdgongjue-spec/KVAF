@@ -222,7 +222,7 @@ def main(transport: str = "urma", execution_mode: str = "unified",
     execution = BenchmarkExecution(kvaf, transport=transport,
                                    executor=executor,
                                    algorithm="gather" if executor == "aicpu" else "direct",
-                                   put_capacity=rows, cores=npu_core_count, jettys=jettys_per_core,
+                                   put_capacity=rows, put_cores=npu_core_count, put_jettys=jettys_per_core,
                                    get_kernel=batch_get_kernel, put_kernel=batch_put_kernel)
     runtime = kvaf.NpuRuntime(
         batch_get_token_bytes=token_bytes, batch_get_tokens_per_block=tokens_per_block,

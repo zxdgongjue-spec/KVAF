@@ -32,7 +32,8 @@ enum class Command : uint16_t {
   kStartCpuPushGet = 12U,
   kStopCpuPushGet = 13U,
   kPrepareGatherWorkspace = 14U,
-  kPrepareGatherWindow = 15U,
+  kGetCacheCandidateCount = 15U,  // Service-affinity view used by ordinary cache providers.
+  kPrepareGatherWindow = 16U,
   kAllocateUbmemRegion = 6U,
   // Command IDs 7 and 8 belonged to removed test-only fill/check requests.
 };
@@ -78,6 +79,12 @@ struct CandidateInfoRequest {
   uint32_t candidate_id;
 };
 
+// Extended readers request the raw CPU EID using the same v6 command.
+struct CandidateEidRequest {
+  CandidateInfoRequest info;
+  uint32_t response_bytes;
+};
+
 struct CandidateInfoResponse {
   MessageHeader header;
   int32_t result;
@@ -85,6 +92,11 @@ struct CandidateInfoResponse {
   uint32_t device_id;
   uint32_t eid_index;
   char device_name[kDeviceNameBytes];
+};
+
+struct CandidateEidResponse {
+  CandidateInfoResponse info;
+  uint8_t eid[kEidBytes];
 };
 
 struct AllocateRegionResponse {
@@ -221,6 +233,7 @@ static_assert(sizeof(PrepareGatherWindowResponse) == 160U, "Gather window respon
 static_assert(sizeof(CandidateCountRequest) == 12U, "candidate count request ABI changed");
 static_assert(sizeof(CandidateCountResponse) == 28U, "candidate count response ABI changed");
 static_assert(sizeof(CandidateInfoRequest) == 16U, "candidate info request ABI changed");
+static_assert(sizeof(CandidateEidRequest) == 20U && sizeof(CandidateEidResponse) == 108U);
 static_assert(sizeof(CandidateInfoResponse) == 92U, "candidate info response ABI changed");
 static_assert(sizeof(CreateChannelRequest) == 124U, "channel request ABI changed");
 static_assert(sizeof(CreateChannelResponse) == 100U, "channel response ABI changed");

@@ -63,18 +63,23 @@ class FabricSession final : public execution::Session {
 #ifdef KVAF_CPU_HAS_URMA
 class UrmaSession final : public execution::Session {
  public:
-  explicit UrmaSession(CpuRuntimeOptions options) : options_(std::move(options)) {}
+  UrmaSession(CpuRuntimeOptions options, std::shared_ptr<CpuUrmaDiscovery> discovery)
+      : options_(std::move(options)), discovery_(std::move(discovery)) {}
   Status Open(const execution::Request& q, execution::Allocation& pool,
               peer::PeerRegion* out) override {
+    if (!q.payload.empty() && q.payload.size() != peer::kEidBytes)
+      return Status::InvalidArgument("invalid cache session EID");
     profile_ = q;
     if (q.cpu_threads) options_.gather_threads = q.cpu_threads;
     auto* allocation = dynamic_cast<PoolAllocation*>(&pool);
     if (!allocation || !allocation->urma_memory)
       return Status::InvalidState("allocation has no shared CPU URMA memory owner");
-    auto s = backend_.Initialize(options_, next_, allocation->urma_memory);
+    auto s = backend_.Initialize(options_, next_, discovery_, allocation->urma_memory);
     if (s.ok())
       s = backend_.AttachRegion(reinterpret_cast<void*>(pool.descriptor.base),
                                 pool.descriptor.length, 1, q.candidate, out);
+    if (s.ok() && !q.payload.empty() && std::memcmp(q.payload.data(), out->eid.data(), out->eid.size()) != 0)
+      return Status::InvalidState("CPU cache registration differs from the selected EID");
     return s;
   }
   Status Call(const std::vector<std::uint8_t>& in, std::vector<std::uint8_t>* out) override {
@@ -99,6 +104,7 @@ class UrmaSession final : public execution::Session {
 
  private:
   CpuRuntimeOptions options_;
+  std::shared_ptr<CpuUrmaDiscovery> discovery_;
   execution::Request profile_;
   std::uint64_t next_ = 1;
   UrmaCpuBackend backend_;
@@ -106,8 +112,9 @@ class UrmaSession final : public execution::Session {
 #endif
 }  // namespace
 std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
-    const CpuRuntimeOptions& options) {
-  auto allocate = [options](const execution::Request& q,
+    const CpuRuntimeOptions& options, std::shared_ptr<CpuUrmaDiscovery> discovery,
+    std::shared_ptr<CpuUrmaDiscovery> pull_discovery) {
+  auto allocate = [options, pull_discovery](const execution::Request& q,
                             std::unique_ptr<execution::Allocation>* out) -> Status {
     auto pool = std::make_unique<PoolAllocation>();
     auto* p = pool.get();
@@ -135,12 +142,12 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
       std::fprintf(stderr, "[KVAF_CPU] DDR_ALLOCATED bytes=%" PRIu64 " backing_bytes=%" PRIu64
                    " page_mode=%s memory=%p\n", bytes,
                    p->mapped_bytes != 0U ? static_cast<std::uint64_t>(p->mapped_bytes) : bytes,
-                   CpuMemoryPageModeName(options.memory_page_mode), p->memory);
+                   CpuMemoryPageModeName(options.memory_page_mode).c_str(), p->memory);
     }
     p->descriptor.length = bytes;
 #ifdef KVAF_CPU_HAS_URMA
     if (q.mode != TransportMode::Ubmem)
-      p->urma_memory = std::make_shared<CpuUrmaMemoryPool>(options,
+      p->urma_memory = std::make_shared<CpuUrmaMemoryPool>(options, pull_discovery,
           reinterpret_cast<void*>(p->descriptor.base), bytes, q.epoch, q.request);
 #endif
     // Initialize auxiliary controls once, never on each registration of this pool.
@@ -149,10 +156,11 @@ std::unique_ptr<execution::CacheRegionService> CreateExecutionService(
                   q.auxiliary_bytes);
     return Status::OK();
   };
-  auto create = [options](const execution::Request& q) -> std::unique_ptr<execution::Session> {
+  auto create = [options, discovery, pull_discovery](const execution::Request& q) -> std::unique_ptr<execution::Session> {
     if (q.transport == Transport::Ubmem) return std::make_unique<FabricSession>();
 #ifdef KVAF_CPU_HAS_URMA
-    return std::make_unique<UrmaSession>(options);
+    // Legacy OpenSession requests use the same full device list as legacy metadata.
+    return std::make_unique<UrmaSession>(options, q.payload.empty() ? pull_discovery : discovery);
 #else
     return {};
 #endif
