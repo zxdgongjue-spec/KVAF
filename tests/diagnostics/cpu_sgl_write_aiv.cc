@@ -47,10 +47,18 @@ struct Fixture {
     a.profile = reinterpret_cast<uint64_t>(profiles.data());
     a.output = reinterpret_cast<uint64_t>(output.data()); a.output_bytes = output.size(); a.workers = workers;
     args.output_target.base = a.output; args.output_target.bytes = a.output_bytes;
+    args.output_target.token_value = 0x12345678;
+    args.output_target.segment_bytes = 48;
+    for (uint32_t i = 0; i < kOutputSegmentBytes; ++i) args.output_target.segment[i] = uint8_t(i * 3 + 7);
     sgl_model::descriptor = a.workspace + layout.descriptor;
     sgl_model::descriptor_end = a.workspace + layout.staging;
   }
   std::vector<std::future<void>> Launch() {
+    // Catch scalar publication that omits a field on a reused invocation.
+    std::memset(statuses.data(), 0xa5, statuses.size() * sizeof(WorkerStatus));
+    std::memset(profiles.data(), 0xa5, profiles.size() * sizeof(kvaf::BatchGetWorkerProfile));
+    auto* request = reinterpret_cast<Request*>(workspace.data());
+    for (auto& reserved : request->reserved_words) reserved = UINT64_MAX;
     std::vector<std::future<void>> work;
     for (uint32_t w = 0; w < args.execution.workers; ++w)
       work.push_back(std::async(std::launch::async, [this, w] {
@@ -67,8 +75,13 @@ struct Fixture {
     const auto* request = reinterpret_cast<Request*>(workspace.data());
     assert(request->magic == kMagic && request->sequence == sequence && request->count == uint32_t(count));
     assert(request->mode == kDirectOutput && request->workers == args.execution.workers);
+    assert(request->token_bytes == kBytes);
+    for (auto reserved : request->reserved_words) assert(reserved == 0);
     const auto* target = reinterpret_cast<OutputTarget*>(args.execution.workspace + layout.output_target);
     assert(target->base == args.execution.output && target->bytes == output.size());
+    assert(target->token_value == args.output_target.token_value);
+    assert(target->segment_bytes == args.output_target.segment_bytes);
+    assert(!std::memcmp(target->segment, args.output_target.segment, kOutputSegmentBytes));
   }
   void Complete(uint64_t sequence, Result result = Result::kOk) {
     if (result == Result::kOk) {
@@ -88,7 +101,18 @@ struct Fixture {
     for (uint32_t w = 0; w < args.execution.workers; ++w) {
       assert(statuses[w].magic == kMagic && statuses[w].sequence == sequence && statuses[w].worker == w);
       assert(statuses[w].result == uint64_t(result) && statuses[w].consumed == 0);
+      for (auto reserved : statuses[w].reserved) assert(reserved == 0);
       assert(profiles[w].scatter_ns == 0 && profiles[w].scatter_copies == 0 && profiles[w].ready_queries == 0);
+      assert(profiles[w].enter_ns && profiles[w].exit_ns >= profiles[w].enter_ns);
+      assert(profiles[w].bytes == profiles[w].spans * kBytes);
+      assert(profiles[w].input_cache_ns == 0 && profiles[w].descriptor_cache_ns == 0 && profiles[w].source_write_ns == 0);
+      assert(profiles[w].read_ns == 0 && profiles[w].read_setup_ns == 0 && profiles[w].wr_build_ns == 0);
+      assert(profiles[w].ready_wait_ns == 0 && profiles[w].post_ns == 0 && profiles[w].cq_wait_ns == 0);
+      assert(profiles[w].read_wqes == 0 && profiles[w].post_calls == 0 && profiles[w].output_cache_ns == 0);
+      const auto& sample = profiles[w].cpu_sgl_write;
+      if (w == 0 && count > 0 && result == Result::kOk)
+        assert(sample.elapsed_ns == 1234 && sample.data_wrs == 100 && sample.waves == 1 && sample.tail_cqes == 4);
+      else assert(sample.elapsed_ns == 0 && sample.data_wrs == 0 && sample.waves == 0 && sample.tail_cqes == 0);
       spans += profiles[w].spans;
     }
     if (result == Result::kOk) assert(spans == uint32_t(count));

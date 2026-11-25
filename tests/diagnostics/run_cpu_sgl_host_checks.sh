@@ -4,8 +4,20 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 readonly KVAF_SGL_BUILD="${1:-$(mktemp -d "${TMPDIR:-/tmp}/kvaf-sgl-host.XXXXXX")}"
 readonly KVAF_SGL_CXX="${CXX:-c++}"
+readonly KVAF_SGL_CLANGXX="${CLANGXX:-clang++}"
 mkdir -p "$KVAF_SGL_BUILD"
 includes=(-Icommon/include -Iaccess_operator/include -Iaccess_operator/algorithms -Iruntime/include)
+# Preserve GM as a distinct Clang address space. The executable model below
+# erases that qualifier and cannot catch local/GM struct assignment errors.
+if command -v "$KVAF_SGL_CLANGXX" >/dev/null 2>&1; then
+  "$KVAF_SGL_CLANGXX" -std=c++17 -fsyntax-only -x c++ \
+    -DKVAF_CPU_SGL_AIV_MODEL=1 -DKVAF_CPU_SGL_AIV_ADDRESS_SPACE_CHECK=1 \
+    -Itests/diagnostics/aiv_sgl_model "${includes[@]}" \
+    access_operator/algorithms/get/cpu_sgl_write/urma_aiv/kernel/cpu_sgl_write_aiv.asc
+  printf '%s\n' 'AIV CPU SGL GM address-space check passed'
+else
+  printf '%s\n' 'SKIP: AIV GM address-space check requires clang++ (or CLANGXX)'
+fi
 "$KVAF_SGL_CXX" -std=c++17 -pthread -fsanitize=address,undefined -g "${includes[@]}" \
   -Itests/diagnostics/aiv_sgl_model tests/diagnostics/cpu_sgl_write_aiv.cc -o "$KVAF_SGL_BUILD/aiv"
 "$KVAF_SGL_BUILD/aiv"

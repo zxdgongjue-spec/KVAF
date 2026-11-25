@@ -9,7 +9,12 @@
 #include <thread>
 #define __aicore__
 #define __global__
+#if defined(KVAF_CPU_SGL_AIV_ADDRESS_SPACE_CHECK)
+// Clang can enforce GM/local type separation without the CANN toolchain.
+#define __gm__ __attribute__((address_space(1)))
+#else
 #define __gm__
+#endif
 #define __ubuf__
 #define __simt_vf__
 #define LAUNCH_BOUND(n)
@@ -33,7 +38,7 @@ inline thread_local bool events[3][3][2]{};
 inline void set_flag(int from, int to, event_t e) { assert(!events[from][to][e]); events[from][to][e] = true; }
 inline void wait_flag(int from, int to, event_t e) { assert(events[from][to][e]); events[from][to][e] = false; }
 inline uintptr_t get_imm(uint32_t n) { return reinterpret_cast<uintptr_t>(sgl_model::ub + n); }
-template<class T> T asc_ldcg(T* p) { return *p; }
+template<class T> T asc_ldcg(__gm__ T* p) { return *p; }
 namespace AscendC {
 inline uint32_t GetBlockIdx() { return sgl_model::core; }
 inline uint64_t GetSystemCycle() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
@@ -42,8 +47,8 @@ enum class DcciDst { CACHELINE_OUT };
 enum class CacheMode { CACHE_MODE_DISABLE };
 enum class TPosition { VECIN };
 template<class T> struct GlobalTensor {
-  T* data{};
-  void SetGlobalBuffer(T* p) { data = p; }
+  __gm__ T* data{};
+  void SetGlobalBuffer(__gm__ T* p) { data = p; }
   void SetL2CacheHint(CacheMode) {}
   GlobalTensor operator[](uint64_t n) { return {data + n}; }
 };
@@ -59,7 +64,11 @@ inline void DataCopyPad(GlobalTensor<uint8_t> dst, LocalTensor<uint8_t> src, Dat
   assert(address >= sgl_model::descriptor && address + p.bytes <= sgl_model::descriptor_end);
   assert(p.blocks == 1);
   ++sgl_model::descriptor_copies;
+#if defined(KVAF_CPU_SGL_AIV_ADDRESS_SPACE_CHECK)
+  for (uint32_t i = 0; i < p.bytes; ++i) dst.data[i] = src.data[i];
+#else
   std::memcpy(dst.data, src.data, p.bytes);
+#endif
 }
 namespace Simt {
 struct Dim3 { uint32_t x, y, z; };

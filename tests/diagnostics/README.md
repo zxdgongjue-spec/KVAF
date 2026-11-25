@@ -129,6 +129,8 @@ c++ -std=c++17 -Icommon/include -Iaccess_operator/include -Imeta_manager/include
 `bash tests/diagnostics/run_cpu_sgl_host_checks.sh /tmp/kvaf-sgl-host-checks`
 compiles and runs both actual kernel control-flow models with ASan/UBSan, checks
 AIV-only/AICPU Host syntax using fake ACL declarations, and runs the Python option
-regressions. AIV's model verifies that its only MTE writes are source descriptors;
+regressions. With `clang++` (or `CLANGXX`) it also compiles the actual AIV source
+with GM in a distinct address space, catching unsupported local/GM struct copies
+that the executable model cannot detect. AIV's model verifies that its only MTE writes are source descriptors;
 the simulated CPU writes payload and publishes done. See
 [CPU SGL Write](../../docs/cpu_sgl_write.md#aiv-cpu-sgl-write) for hardware validation.
