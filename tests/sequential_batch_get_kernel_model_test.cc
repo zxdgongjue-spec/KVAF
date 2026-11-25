@@ -233,7 +233,9 @@ struct Fixture {
       queues.push_back(std::make_unique<ModelQueue>());
       auto& m = *queues.back();
       auto& e = control_entities[q];
-      e.magic = 0x4b564155; e.version = 1; e.local_token_id = 1 + q;
+      e.magic = 0x4b564155;
+      e.version = mode == KVAF_SEQ_GATHER ? KVAF_AIV_DIRECT_URMA_ENTITY_VERSION : 1;
+      e.local_token_id = 1 + q;
       e.sq_va = Address(m.sq.data()); e.sq_db_va = Address(&m.db); e.sq_depth = 16; e.wqe_size = 64;
       e.cq_va = Address(m.cq); e.cq_db_va = Address(&m.cq_db); e.cq_depth = 2; e.cqe_size = 64;
       e.remote_token_id = 0xab100002 + q; e.remote_token_value = 0xabcd0003 + q;
