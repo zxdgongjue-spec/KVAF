@@ -49,6 +49,7 @@ struct ExecutionResources {
   // min(16, device max_jfs_sge); explicit values must fit the device limit.
   std::uint32_t sge_per_wr{0};
   bool sgl_payload_only{false};
+  bool sgl_pipeline{false};
 };
 struct ExecutionPolicy {
   TransportMode transport_mode{TransportMode::Urma};

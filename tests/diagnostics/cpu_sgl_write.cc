@@ -16,7 +16,7 @@
 namespace {
 using namespace kvaf;
 using namespace kvaf::cpu_push;
-constexpr std::uint32_t kCapacity = 37, kBytes = 656;
+constexpr std::uint32_t kCapacity = 4097, kBytes = 656;
 struct Fixture {
   Layout layout;
   void* workspace{};
@@ -91,7 +91,17 @@ struct Fixture {
       for (auto& kernel : kernels)
         assert(kernel.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout);
       const auto* sources = reinterpret_cast<const std::uint64_t*>(memory() + layout.descriptor);
-      for (int i = 0; i < count; ++i)
+      const auto head = (args.sequence & kPipelineLaunch) ? std::min(std::uint32_t(count), kPipelineHeadRows) : 0U;
+      if ((args.sequence & kPipelineLaunch)) {
+        assert(request->reserved_words[0] == head);
+        for (std::uint32_t i = 0; i < head; ++i)
+          std::memcpy(output.data() + i * kBytes, reinterpret_cast<void*>(sources[i]), kBytes);
+        const auto* suffix = reinterpret_cast<const std::uint64_t*>(memory() + kSuffixNotifyOffset);
+        while ((__atomic_load_n(suffix, __ATOMIC_ACQUIRE) >> 32) != sequence)
+          assert(std::chrono::steady_clock::now() < deadline);
+        assert(std::uint32_t(*suffix) == std::uint32_t(Result::kOk));
+      }
+      for (int i = head; i < count; ++i)
         std::memcpy(output.data() + i * kBytes, reinterpret_cast<void*>(sources[i]), kBytes);
       auto* done = reinterpret_cast<Completion*>(memory() + layout.done);
       done->cpu_sgl_write = {sequence * 1000, 10, 1, 4};
@@ -124,15 +134,36 @@ struct Fixture {
 }  // namespace
 
 int main() {
-  for (auto workers : {1U, 4U, 8U}) {
+  for (bool pipeline : {false, true}) for (auto workers : {1U, 4U, 8U}) {
     Fixture f(workers);
+    f.args.sequence = pipeline ? kPipelineLaunch : 0;
     f.Run(true);
     std::fill(f.output.begin(), f.output.end(), 0xA5);
     f.count = 7;
     f.indices[0] = 7;
     f.Run(true);  // Replay uses a new device ticket and dynamic inputs.
   }
+  {
+    // A bad suffix must still wait for the CPU to retire the published head.
+    Fixture f(1); f.args.sequence = kPipelineLaunch; f.rows[kPipelineHeadRows + 17] = -1;
+    auto kernels = f.Launch();
+    auto* notify = reinterpret_cast<Word*>(f.memory() + f.layout.notify);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((__atomic_load_n(&notify->value, __ATOMIC_ACQUIRE) & ~kProfileNotify) != 1)
+      assert(std::chrono::steady_clock::now() < deadline);
+    auto* suffix = reinterpret_cast<std::uint64_t*>(f.memory() + kSuffixNotifyOffset);
+    while ((__atomic_load_n(suffix, __ATOMIC_ACQUIRE) >> 32) != 1)
+      assert(std::chrono::steady_clock::now() < deadline);
+    assert(std::uint32_t(*suffix) == std::uint32_t(Result::kInvalidRequest));
+    assert(kernels[0].wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout);
+    auto* done = reinterpret_cast<Completion*>(f.memory() + f.layout.done);
+    __atomic_store_n(&done->token, Progress(1, std::uint32_t(Result::kInvalidRequest)), __ATOMIC_RELEASE);
+    assert(kernels[0].get() != 0);
+    assert(f.statuses[0].result == std::uint64_t(Result::kInvalidRequest));
+  }
   { Fixture f; f.count = 0; f.rows[0] = -1; f.Run(true, false); }
+  { Fixture f; f.args.sequence = kPipelineLaunch; f.count = 0; f.rows[0] = -1; f.Run(true, false); }
+  { Fixture f; f.args.sequence = kPipelineLaunch; f.rows[17] = -1; f.Run(false, false); }
   { Fixture f; f.count = 1; f.rows[1] = -1; f.Run(true); }
   { Fixture f; f.rows[17] = 0; f.Run(false, false); }
   { Fixture f; f.args.output_bytes = kBytes; f.Run(false, false); }

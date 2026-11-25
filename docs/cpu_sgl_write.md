@@ -108,6 +108,63 @@ done
 4096×656 B、4 worker、当前 1024 行 chunk/四路 Jetty 划分下，
 4 SGE 应为 1024 个数据 WR，8 SGE 应为 512 个；均另有 16 个 ready WR。
 
+## 请求构建、描述读取和数据写入的两段流水
+
+`--sgl-pipeline` 对应 `ExecutionResources(sgl_pipeline=True)`，默认关闭。
+支持 `cpu_sgl_write`（AICPU）和 `aiv_cpu_sgl_write`（AIV），与
+`--sgl-payload-only` 互斥；开启后以 `scope=kernel` 比较总延迟和带宽。
+
+每轮由 worker/core 0 先构建前 `min(miss_count, 1024)` 项，发布请求头、output 描述及
+notify。其余 worker/core 构建各自后缀，worker/core 0 发布前缀后继续自己的后缀。
+CPU 收到 notify 后即可导入 output、读取并校验前缀源地址、更新 SGE、提交前缀 WRITE，
+与设备剩余请求构建重叠。全部构建完成后，设备在 notify 缓存行的独立字发布本轮后缀
+完成/失败 token。CPU 只在后缀成功后读取后缀描述符。
+
+CPU 保留原来的四条数据 Jetty，另建一条专用控制 Jetty 和 CQ，导入同一个 NPU target。
+后缀 READ、范围检查和源 SGE 更新可以在前缀 DMA 尚未完成时进行，控制 CQE 不与数据
+CQE 混用。准备好后缀后收齐前缀 CQE，再提交后缀数据；超出队列容量时仍逐 wave 排空。
+描述符、WRITE 链及 SGE 使用独立且保留到完成的存储。整个请求不写 chunk ready，
+不执行 scatter，只有最终数据全部完成后才释放 output 导入并发布 done。
+
+空请求不通知 CPU；不超过 1024 项的请求全部作为前缀处理。固定容量时复用两个阶段的
+WRITE 计划；冷启动的计划构建仍发生在首次提交之前。前缀大小目前固定，不自动调优。
+
+流水模式保留逐段源地址范围检查，但失败时可能已经写入合法前缀。后缀输出映射、源地址
+或构建状态非法时，不提交后缀；CPU 排空前缀后发布失败，设备等待该确认后退出。
+失败请求的 output 不可消费，并按原有执行资源失败/Shutdown 流程恢复。
+默认模式继续保留整批检查完成前不提交 payload 的行为。
+
+此功能使用新的 setup output mode 和设备端提前发布逻辑。CPU 服务、NPU Host/Python
+及所选设备 kernel 均须使用本次源码重建，重启 CPU 服务及 NPU 测试进程。
+
+```bash
+# CPU 端重建并重启服务；NPU 端重建所选后端。
+./build.sh cpu
+./build.sh npu
+
+# 同你当前的 8192×656 B、5 AICPU worker 配置，跨主机时替换服务地址。
+KVAF_CPU_SERVICE_ADDR=127.0.0.1:21111 DEVICE_ID=6 \
+bash tests/run_remote_cpu_batch_get_perf.sh build-npu \
+  --backend cpu_sgl_write --sge-per-wr 4 --aicpu-workers 5 \
+  --execution eager --request-length 32768 --table-capacity 1277952 --miss-count 8192 \
+  --token-bytes 656 --tokens-per-block 128 \
+  --source-access-pattern random --output-access-pattern contiguous --no-sort-input-indices \
+  --warmup 10 --iterations 100 --sgl-pipeline --kernel-profile
+```
+
+AIV 对照使用 `--backend aiv_cpu_sgl_write --aiv-cores 4` 替换后端和 worker 参数，
+并按实际设备设置 `--kernel-profile-clock-mhz`。图模式使用原来的 `--execution graph`
+及图租约接口；sequence 和后缀 token 随每次回放推进，不由 Host 逐次重置。
+
+CPU 日志新增 `CPU_SGL_PIPELINE_PROFILE`。`head_first_post_us` 是命中本轮 notify 的
+CPU READ 开始到首次数据 post 的时间；不含设备构建前缀的时间。
+`head_submit_us` 包含前缀 SGE 更新与提交，`suffix_wait_us` 包含轮询后缀发布，
+`suffix_read_us` 覆盖后缀 READ 的提交与完成，`head_cq_wait_us` 是准备完后缀后剩余的
+前缀完成等待，`suffix_submit_us` 和 `suffix_cq_wait_us` 分别记录后缀提交和完成等待。
+源地址校验及源/目标 SGE 更新按整轮累计。部分字段嵌套且与 DMA 重叠，不能相加成
+kernel 总时间；`cpu_total_us` 仍为本轮 notify READ 开始到 done CQE 观察完成。
+没有首尾之间的单独 payload 带宽报告，避免把等待后缀构建的时间隐藏在诊断口径之外。
+
 ## 测 CPU SGL 写入 HBM 的有效载荷带宽
 
 在单卡 benchmark 加 `--sgl-payload-only`。这个开关对应 Get 资源的

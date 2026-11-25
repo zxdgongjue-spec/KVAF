@@ -96,6 +96,8 @@ def add_backend_arguments(parser, *, sweep=False):
     group.add_argument("--sge-per-wr", type=int,
                        default=environment_int("KVAF_BATCH_GET_PERF_SGE_PER_WR", 0),
                        help="maximum source SGEs per WRITE WR; cpu_sgl_write/aiv_cpu_sgl_write (0=auto, 1..16)")
+    group.add_argument("--sgl-pipeline", action="store_true",
+                       help="overlap a 1024-row head WRITE with suffix construction; CPU SGL Write backends only")
     group.add_argument("--npu-eids", type=parse_npu_eids,
                        default=parse_npu_eids(os.environ.get("KVAF_NPU_EIDS")),
                        help="comma-separated NPU EIDs; AIV stripes across them, AICPU uses the first")
@@ -155,6 +157,8 @@ def resolve_backend(args, parser, *, default_backend="aiv", sweep=False):
 
 
 def validate_workload(args):
+    if args.sgl_pipeline and args.backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
+        return "--sgl-pipeline requires a CPU SGL Write backend"
     if not 0 <= args.sge_per_wr <= 16:
         return "sge-per-wr must be in [0, 16] (0 selects the device limit)"
     if args.sge_per_wr and args.backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
@@ -217,6 +221,8 @@ def workload_command(args):
         command += ["--max-inflight-total", str(args.max_inflight_total)]
     if args.backend in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
         command += ["--sge-per-wr", str(args.sge_per_wr)]
+        if getattr(args, "sgl_pipeline", False):
+            command += ["--sgl-pipeline"]
     if args.npu_eids:
         command += ["--npu-eids", ",".join(args.npu_eids)]
     if args.peer_ub_device:
@@ -239,7 +245,7 @@ def configure_backend_help(parser, argv=None):
     if backend != "aiv":
         hidden.update(("jettys_per_core", "max_inflight_total"))
     if backend not in ("cpu_sgl_write", "aiv_cpu_sgl_write"):
-        hidden.update(("sge_per_wr", "sgl_payload_only"))
+        hidden.update(("sge_per_wr", "sgl_payload_only", "sgl_pipeline"))
     if backend == "ubmem":
         hidden.update(("npu_eids", "peer_ub_device"))
     if aicpu:

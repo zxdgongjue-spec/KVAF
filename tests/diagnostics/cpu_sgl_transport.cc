@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -23,6 +24,9 @@ std::uint32_t device_sges = 13, queue_sges{}, data_wrs{}, data_sges{}, segments{
 std::uint64_t output_base{}, output_bytes{}, done_address{};
 std::uint32_t ready_wrs{}, data_tails{};
 bool delay_output_import{};
+std::function<void()> publish_suffix;
+std::uint64_t head_bytes{}, head_written{}, suffix_descriptor{};
+bool saw_async_suffix_read{};
 std::map<urma_jfc_t*, std::deque<std::uint64_t>> completions;
 int QueryTp(urma_context_t*, kvaf::urma::TpQuery*, std::uint32_t* count, kvaf::urma::TpInfo* info) {
   *count = 1; info->tp_handle = 1; return 0;
@@ -96,6 +100,12 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
     assert(wr->rw.dst.num_sge == 1 && wr->rw.src.num_sge <= queue_sges);
     assert(dst->addr >= dst->tseg->seg.ubva.va);
     assert(dst->len <= dst->tseg->seg.len - (dst->addr - dst->tseg->seg.ubva.va));
+    if (suffix_descriptor && wr->opcode == URMA_OPC_READ && src[0].addr == suffix_descriptor) {
+      std::size_t pending_data = 0;
+      for (const auto& cq : completions) pending_data += cq.second.size();
+      assert(!publish_suffix && pending_data > 0);  // Head CQEs have not been drained.
+      saw_async_suffix_read = true;
+    }
     std::uint32_t bytes = 0;
     for (std::uint32_t i = 0; i < wr->rw.src.num_sge; ++i) {
       assert(src[i].addr >= src[i].tseg->seg.ubva.va);
@@ -107,6 +117,15 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t* queue, urma_jfs_wr_t* wr, ur
     if (wr->opcode == URMA_OPC_WRITE && dst->addr >= output_base && dst->addr < output_base + output_bytes) {
       assert(wr->rw.src.num_sge <= queue_sges);
       ++data_wrs; data_sges += wr->rw.src.num_sge;
+      if (publish_suffix) {
+        assert(dst->addr + bytes <= output_base + head_bytes);
+        head_written += bytes;
+        if (head_written == head_bytes) {
+          auto publish = std::move(publish_suffix);
+          publish_suffix = {};
+          publish();
+        }
+      }
       if (wr->flag.bs.complete_enable) {
         assert(wr->flag.bs.place_order == URMA_STRONG_ORDER);
         ++data_tails;
@@ -138,7 +157,7 @@ int urma_poll_jfc(urma_jfc_t* cq, int capacity, urma_cr_t* result) {
 namespace {
 void CheckProfile(const kvaf::cpu_push::Transport& transport,
                   const kvaf::CpuSglWriteSample& sample, std::uint32_t sequence,
-                  bool payload_only, bool profiling) {
+                  bool payload_only, bool profiling, bool pipeline = false) {
   auto* capture = std::tmpfile();
   assert(capture);
   std::fflush(stderr);
@@ -154,6 +173,11 @@ void CheckProfile(const kvaf::cpu_push::Transport& transport,
   while (const auto bytes = std::fread(buffer, 1, sizeof(buffer), capture)) log.append(buffer, bytes);
   std::fclose(capture);
   if (!profiling) { assert(log.empty()); return; }
+  if (pipeline) {
+    assert(log.find("CPU_SGL_PIPELINE_PROFILE sequence=" + std::to_string(sequence)) == 0);
+    assert(log.find("ready_wrs=0") != std::string::npos);
+    return;
+  }
   if (!payload_only) {
     assert(log.find("CPU_PUSH_PROFILE ") != std::string::npos);
     assert(log.find("CPU_SGL_WRITE_STAGES ") == std::string::npos);
@@ -189,7 +213,9 @@ void CheckProfile(const kvaf::cpu_push::Transport& transport,
   }
 }
 void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 4096,
-         std::uint32_t token_bytes = 656, bool payload_only = false, bool profiling = true) {
+         std::uint32_t token_bytes = 656, bool payload_only = false, bool profiling = true,
+         bool pipeline = false, kvaf::cpu_push::Result suffix_result = kvaf::cpu_push::Result::kOk,
+         bool bad_suffix_address = false) {
   using namespace kvaf::cpu_push;
   Layout layout;
   assert(MakeLayout(token_bytes, 4, &layout, true));
@@ -211,7 +237,7 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
   setup.source_bytes = source.size(); setup.hbm_base = hbm_segment.ubva.va; setup.hbm_bytes = layout.bytes;
   setup.npu_tp = 1; setup.npu_psn = 1; setup.token_value = 7;
   setup.segment_bytes = sizeof(hbm_segment); setup.token_bytes = token_bytes; setup.workers = 4;
-  setup.output_mode = payload_only ? kPayloadOnlyOutput : kDirectOutput; setup.sge_per_wr = requested;
+  setup.output_mode = pipeline ? kPipelinedOutput : payload_only ? kPayloadOnlyOutput : kDirectOutput; setup.sge_per_wr = requested;
   std::memcpy(setup.segment, &hbm_segment, sizeof(hbm_segment));
   for (auto& channel : setup.channels) channel.bytes = 28;
   kvaf::peer::OpenCpuPushGetResponse response{};
@@ -235,30 +261,60 @@ void Run(std::uint32_t requested, std::uint32_t expected, std::uint32_t count = 
     auto* addresses = reinterpret_cast<std::uint64_t*>(hbm + layout.descriptor);
     for (std::uint32_t i = 0; i < count; ++i)
       addresses[i] = source_segment.seg.ubva.va + ((count - i + sequence - 1) % count) * token_bytes;
+    const auto head = std::min(count, kPipelineHeadRows);
+    if (pipeline) {
+      request->reserved_words[0] = head;
+      head_bytes = std::uint64_t{head} * token_bytes;
+      head_written = 0;
+      saw_async_suffix_read = false;
+      suffix_descriptor = head < count && suffix_result == Result::kOk
+          ? setup.hbm_base + layout.descriptor + std::uint64_t{head} * 8 : 0;
+      if (head < count) {
+        for (auto i = head; i < count; ++i) addresses[i] = UINT64_MAX;
+        publish_suffix = [&, sequence] {
+          for (auto i = head; i < count; ++i)
+            addresses[i] = source_segment.seg.ubva.va + ((count - i + sequence - 1) % count) * token_bytes;
+          if (bad_suffix_address) addresses[head] = source_segment.seg.ubva.va - 1;
+          *reinterpret_cast<std::uint64_t*>(hbm + kSuffixNotifyOffset) = Progress(sequence, std::uint32_t(suffix_result));
+        };
+      } else {
+        *reinterpret_cast<std::uint64_t*>(hbm + kSuffixNotifyOffset) = Progress(sequence, std::uint32_t(suffix_result));
+      }
+    }
     data_wrs = data_sges = ready_wrs = data_tails = 0;
     reinterpret_cast<Word*>(hbm + layout.notify)->value = sequence | (profiling ? kProfileNotify : 0);
     std::uint64_t received = 0;
     assert(transport.ReadRequest(&received).ok() && received == sequence);
     assert(transport.ReadDescriptor(sequence).ok());
     assert(transport.WriteBatch().ok());
-    assert(transport.Complete(sequence, Result::kOk).ok());
+    const auto expected_result = bad_suffix_address ? Result::kInvalidRequest : suffix_result;
+    assert(transport.batch_result() == expected_result);
+    assert(transport.Complete(sequence, transport.batch_result()).ok());
     const auto& sample = reinterpret_cast<Completion*>(hbm + layout.done)->cpu_sgl_write;
     if (payload_only) {
       assert(ready_wrs == 0 && sample.data_wrs == data_wrs && sample.tail_cqes == data_tails);
       assert(sample.waves == (count == 65536 ? 2 : 1));
       assert((sample.elapsed_ns > 0) == (sample.waves == 1 && profiling));
       assert(data_tails == (count == 1 ? 1 : 4 * sample.waves));
+    } else if (pipeline) {
+      assert(!publish_suffix && ready_wrs == 0 && sample.waves == 0 && sample.elapsed_ns == 0);
+      if (head < count && suffix_result == Result::kOk) assert(saw_async_suffix_read);
+      const auto token = reinterpret_cast<Completion*>(hbm + layout.done)->token;
+      assert(token == Progress(sequence, std::uint32_t(expected_result)));
     } else {
       assert(ready_wrs > 0 && sample.waves == 0 && sample.elapsed_ns == 0);
     }
-    CheckProfile(transport, sample, sequence, payload_only, profiling);
-    if (count == 4096 && token_bytes == 656) {
+    CheckProfile(transport, sample, sequence, payload_only, profiling, pipeline);
+    if (count == 4096 && token_bytes == 656 && expected_result == Result::kOk) {
       assert(data_wrs == (expected == 4 ? 1024 : expected == 8 ? 512 : 320));
       assert(data_sges == count);
     }
-    for (std::uint32_t i = 0; i < count; ++i)
+    const auto written = expected_result == Result::kOk ? count : head;
+    for (std::uint32_t i = 0; i < written; ++i)
       assert(std::memcmp(result.data() + i * token_bytes, reinterpret_cast<void*>(addresses[i]), token_bytes) == 0);
+    for (std::size_t i = std::size_t(written) * token_bytes; i < result.size(); ++i) assert(result[i] == 0xA5);
   }
+  suffix_descriptor = 0;
   assert(transport.Shutdown().ok());
   assert(segments == 0 && completions.empty());
   std::free(hbm);
@@ -298,6 +354,13 @@ int main() {
   delay_output_import = true;
   Run(4, 4, 4096, 656, true);  // Import/retirement delay stays outside the payload window.
   delay_output_import = false;
+  Run(4, 4, 4096, 656, false, true, true);
+  Run(8, 8, 8192, 656, false, true, true);
+  Run(4, 4, 7, 656, false, true, true);
+  Run(4, 4, 1, 656, false, false, true);
+  Run(4, 4, 65536, 16, false, true, true);
+  Run(4, 4, 4096, 656, false, true, true, kvaf::cpu_push::Result::kInvalidRequest);
+  Run(4, 4, 4096, 656, false, true, true, kvaf::cpu_push::Result::kOk, true);
   Reject(8, 4, kvaf::cpu_push::kDirectOutput);
   Reject(17, 32, kvaf::cpu_push::kDirectOutput);
   Reject(0, 0, kvaf::cpu_push::kDirectOutput);

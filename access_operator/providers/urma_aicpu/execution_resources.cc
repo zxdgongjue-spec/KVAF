@@ -23,7 +23,8 @@ struct AicpuExecutionResources::State {
     if (config.batch_get_mode == "cpu_push_scatter" || config.batch_get_mode == "cpu_sgl_write")
       push = std::make_unique<cpu_push::CpuPushTransport>(cpu_push::Config{
           config.peer_link, config.kernel_json, config.local_eid, config.token_bytes, config.workers,
-          config.batch_get_mode == "cpu_sgl_write", config.sge_per_wr, config.sgl_payload_only});
+          config.batch_get_mode == "cpu_sgl_write", config.sge_per_wr, config.sgl_payload_only, false,
+          config.sgl_pipeline});
 #else
     valid_mode = config.batch_get_mode == "gather_read";
 #endif

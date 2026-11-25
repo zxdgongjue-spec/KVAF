@@ -96,7 +96,15 @@ provider. With public UMDK headers, it checks the queue SGE setting, actual
 4/8/automatic SGE chains and WR counts, payloads, cached-plan output changes,
 64 KiB splitting, explicit limits above hardware capacity, and import retirement.
 It also validates payload stage logs, per-request reset/reuse, profiling-disabled
-silence, and injected output import/retirement delays outside the payload window:
+silence, and injected output import/retirement delays outside the payload window.
+
+Pipeline cases keep the suffix descriptors invalid until every head byte was
+written, proving early data submission rather than a renamed timing window.
+They also check suffix READs while head CQEs remain pending, cached-plan replay,
+small prefixes, multiple waves, and draining the head before reporting suffix
+validation failures. Device models check early notify and waiting for CPU done
+even after suffix validation fails. `run_cpu_sgl_host_checks.sh` runs the fake
+transport too when `KVAF_TEST_URMA_INCLUDE_DIR` is supplied.
 
 ```bash
 c++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined \

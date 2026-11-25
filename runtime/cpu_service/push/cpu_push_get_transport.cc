@@ -43,7 +43,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (context_ || !context || !source || !query || !import || !response || !psn ||
       !setup.npu_tp || !setup.npu_psn || !setup.token_value ||
       setup.segment_bytes != sizeof(urma_seg_t) || !setup.source_bytes ||
-      setup.output_mode > kPayloadOnlyOutput ||
+      setup.output_mode > kPipelinedOutput ||
       setup.sge_per_wr > 16 || (setup.sge_per_wr && setup.output_mode == kScatterOutput) ||
       !MakeLayout(setup.token_bytes, setup.workers, &layout_, setup.output_mode != kScatterOutput) ||
       setup.hbm_base % 64 || setup.hbm_bytes < layout_.bytes ||
@@ -58,6 +58,7 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   token_bytes_ = setup.token_bytes;
   direct_output_ = setup.output_mode != kScatterOutput;
   payload_only_ = setup.output_mode == kPayloadOnlyOutput;
+  pipeline_ = setup.output_mode == kPipelinedOutput;
   Stage("query_device");
   urma::UbDeviceAttributes attr{};
   if (urma_query_device(context->dev, reinterpret_cast<urma_device_attr_t*>(&attr)))
@@ -117,10 +118,11 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
   if (!urma::QueryTp(query, context_, setup.eid, &cpu_tp)) return Error("query CTP");
   response->cpu_tp = cpu_tp;
   response->cpu_psn = psn;
-  for (std::uint32_t q = 0; q < kJettyCount; ++q) {
-    if (setup.channels[q].bytes != 28 && setup.channels[q].bytes != 32)
+  for (std::uint32_t q = 0; q < kJettyCount + (pipeline_ ? 1U : 0U); ++q) {
+    const auto peer_queue = q % kJettyCount;
+    if (setup.channels[peer_queue].bytes != 28 && setup.channels[peer_queue].bytes != 32)
       return Error("invalid NPU Jetty key");
-    auto& queue = queues_[q];
+    auto& queue = q < kJettyCount ? queues_[q] : control_queue_;
     auto& c = queue.channel;
     Stage("create_queues", q);
     const auto* error = urma::CreateQueues(urma::NativeApi{}, context_, setup.token_value,
@@ -131,9 +133,10 @@ Status Transport::Initialize(urma_context_t* context, urma_target_seg_t* source,
     queue.remote.reserve(1);
     queue.wrs.reserve(1);
     Stage("import_jetty", q);
-    c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[q].key,
+    c.remote_jetty = urma::ImportJetty(import, context_, setup.channels[peer_queue].key,
         setup.token_value, cpu_tp, setup.npu_tp, psn, setup.npu_psn);
     if (!c.remote_jetty) return Error("import NPU Jetty");
+    if (q == kJettyCount) continue;  // Private control queue, same remote target as queue 0.
     auto& key = response->channels[q];
     key.bytes = sizeof(urma_jetty_id_t) + sizeof(urma_transport_mode_t);
     std::memcpy(key.key, &c.local_jetty->jetty_id, sizeof(urma_jetty_id_t));
@@ -216,7 +219,7 @@ Status Transport::Wait(Queue& q) {
 }
 
 Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes) {
-  auto& q = queues_[0];
+  auto& q = pipeline_ ? control_queue_ : queues_[0];
   if (q.poisoned || q.pending || offset > layout_.staging || bytes > layout_.staging - offset)
     return Error("invalid control transfer");
   while (bytes) {
@@ -235,13 +238,13 @@ Status Transport::Transfer(bool write, std::uint64_t offset, std::uint64_t bytes
 Status Transport::ReadRequest(std::uint64_t* sequence) {
   // The profile bit is known only after the READ. Measure just this probe,
   // never the idle interval spent repeatedly reading an unchanged sequence.
-  const auto start = payload_only_ ? BatchGetProfileNowNs() : 0;
+  const auto start = (payload_only_ || pipeline_) ? BatchGetProfileNowNs() : 0;
   auto result = Transfer(false, layout_.notify, sizeof(Word));
   if (result.ok()) {
     const auto notify = reinterpret_cast<const Word*>(memory_ + layout_.notify)->value;
     *sequence = notify & ~kProfileNotify;
     profile_.enabled = (notify & kProfileNotify) != 0;
-    if (payload_only_ && profile_.enabled) {
+    if ((payload_only_ || pipeline_) && profile_.enabled) {
       profile_.notify_read_ns = BatchGetProfileNowNs() - start;
       profile_.cpu_start_ns = start;
     }
@@ -268,19 +271,20 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
       r.mode != (direct_output_ ? kDirectOutput : kScatterOutput))
     return Status::InvalidArgument("CPU push request header mismatch");
   BatchGetProfileScope timer(profile_.enabled ? &profile_.address_read_ns : nullptr);
-  const bool detail = payload_only_ && profile_.enabled;
+  const bool detail = (payload_only_ || pipeline_) && profile_.enabled;
+  batch_result_ = Result::kOk;
+  head_count_ = pipeline_ ? static_cast<std::uint32_t>(r.reserved_words[0]) : 0;
+  if (pipeline_ && (r.reserved_words[0] != std::min(r.count, kPipelineHeadRows) || !head_count_))
+    return Status::InvalidArgument("invalid CPU SGL pipeline head");
   Status read;
-  {
+  if (!pipeline_) {
     BatchGetProfileScope stage(detail ? &profile_.address_list_read_ns : nullptr);
     read = Transfer(false, layout_.descriptor, r.count * sizeof(std::uint64_t));
+    if (!read.ok()) return read;
   }
-  if (!read.ok()) return read;
-  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
-  {
-    BatchGetProfileScope stage(detail ? &profile_.address_validate_ns : nullptr);
-    for (std::uint32_t i = 0; i < r.count; ++i)
-      if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
-        return Status::InvalidArgument("CPU push source outside cache region");
+  if (!pipeline_) {
+    auto checked = ValidateSources(0, r.count);
+    if (!checked.ok()) return checked;
   }
   if (direct_output_) {
     if (output_remote_) return Error("previous output is still imported");
@@ -310,7 +314,43 @@ Status Transport::ReadDescriptor(std::uint64_t sequence) {
     }
     if (!output_remote_) return Error("import output segment");
   }
+  if (pipeline_) {
+    {
+      BatchGetProfileScope stage(detail ? &profile_.address_list_read_ns : nullptr);
+      read = Transfer(false, layout_.descriptor, std::uint64_t{head_count_} * 8);
+    }
+    if (!read.ok()) return read;
+    return ValidateSources(0, head_count_);
+  }
   return Status::OK();
+}
+
+Status Transport::ValidateSources(std::uint32_t begin, std::uint32_t end) {
+  BatchGetProfileScope timer((payload_only_ || pipeline_) && profile_.enabled ? &profile_.address_validate_ns : nullptr);
+  const auto* addresses = reinterpret_cast<const std::uint64_t*>(memory_ + layout_.descriptor);
+  for (auto i = begin; i < end; ++i)
+    if (!SourceRange(source_base_, source_bytes_, addresses[i], token_bytes_))
+      return Status::InvalidArgument("CPU push source outside cache region");
+  return Status::OK();
+}
+
+// A separate CQ keeps descriptor READs independent from in-flight data CQEs.
+Status Transport::BeginControlRead(std::uint64_t offset, std::uint64_t bytes) {
+  auto& q = control_queue_;
+  if (q.poisoned || q.pending || !bytes || offset > layout_.staging || bytes > layout_.staging - offset)
+    return Error("invalid asynchronous descriptor READ");
+  ResetRequests(q);
+  const auto parts = (bytes + max_bytes_ - 1) / max_bytes_;
+  if (parts > kJettyDepth) return Error("descriptor READ exceeds control queue depth");
+  q.local.reserve(parts); q.remote.reserve(parts); q.wrs.reserve(parts);
+  while (bytes) {
+    const auto length = static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes, max_bytes_));
+    const auto index = static_cast<std::uint32_t>(q.local.size());
+    q.local.push_back({reinterpret_cast<std::uint64_t>(memory_ + offset), length, control_, nullptr});
+    Add(q, URMA_OPC_READ, hbm_base_ + offset, length, index, 1);
+    offset += length; bytes -= length;
+  }
+  return Post(q);
 }
 
 // Ported from hbm-sgl-probe PrepareWrite: partition each chunk into contiguous
@@ -362,68 +402,78 @@ Status Transport::PrepareWrites(std::uint32_t count) {
     RetargetWrites();
     return Status::OK();
   }
-  std::array<std::vector<PreparedQueue>, kJettyCount> shards;
-  const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
-  for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
-    auto& waves = shards[queue];
-    waves.emplace_back();
-    ForEachPipelineChunk(count, token_bytes_, workers_,
-      [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
-        const auto shard = JettyRange(range, queue);
-        auto row = shard.begin;
-        const auto end = shard.end;
-        std::uint32_t offset = 0;
-        while (row < end) {
-          // The probe budgets source SGEs as well as WRs against SQ depth.
-          // Continue large requests in another drained wave without narrowing
-          // BatchGet's existing maximum request/token sizes.
-          if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
-          auto& q = waves.back();
-          const auto first_local = static_cast<std::uint32_t>(q.local.size());
-          const auto first_row = row;
-          const auto destination_offset = std::uint64_t{row} * token_bytes_ + offset;
-          const auto destination = (direct_output_ ? output_.base : hbm_base_ + layout_.staging) + destination_offset;
-          std::uint32_t bytes = 0, sges = 0;
-          while (row < end && sges < max_sge_ && bytes < max_bytes_) {
-            const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
-            if (!unsplit)
-              q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
-            q.local.push_back({0, length, source_, nullptr});
-            ++sges; bytes += length; offset += length;
-            if (offset == token_bytes_) { ++row; offset = 0; }
-          }
-          if (unsplit) {
-            // Walk the contiguous descriptor entries directly for whole-token SGEs.
-            if (!q.source_runs.empty() &&
-                q.source_runs.back().local + q.source_runs.back().count == first_local &&
-                q.source_runs.back().row + q.source_runs.back().count == first_row)
-              q.source_runs.back().count += sges;
-            else
-              q.source_runs.push_back({first_local, first_row, sges});
-          }
-          q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), destination_offset});
-          AppendPrepared(q, queue, destination, bytes, sges);
-        }
-        if (payload_only_) return;  // Direct output consumes only the final done token.
-        if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
-        auto& q = waves.back();
-        auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
-            (worker * kMaxChunks + chunk) * kJettyCount + queue;
-        q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
-        q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
-        AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
-                       8, 1, true);
-      });
-  }
-  std::size_t waves = 0;
-  for (const auto& shard : shards) waves = std::max(waves, shard.size());
   prepared_.clear();
-  for (std::size_t w = 0; w < waves; ++w) {
-    auto plan = std::make_unique<PreparedWrite>();
-    for (std::uint32_t q = 0; q < kJettyCount; ++q)
-      if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
-    SealPrepared(*plan);
-    if (plan->fence_count) prepared_.push_back(std::move(plan));
+  head_waves_ = 0;
+  const auto phases = pipeline_ && head_count_ < count ? 2U : 1U;
+  for (std::uint32_t phase = 0; phase < phases; ++phase) {
+    std::array<std::vector<PreparedQueue>, kJettyCount> shards;
+    const bool unsplit = std::uint64_t{max_sge_} * token_bytes_ <= max_bytes_;
+    for (std::uint32_t queue = 0; queue < kJettyCount; ++queue) {
+      auto& waves = shards[queue];
+      waves.emplace_back();
+      ForEachPipelineChunk(count, token_bytes_, workers_,
+        [&](std::uint32_t worker, std::uint32_t chunk, Range range) {
+          auto shard = JettyRange(range, queue);
+          if (pipeline_) {
+            shard.begin = std::max(shard.begin, phase == 0 ? 0U : head_count_);
+            shard.end = std::min(shard.end, phase == 0 ? head_count_ : count);
+            if (shard.begin >= shard.end) return;
+          }
+          auto row = shard.begin;
+          const auto end = shard.end;
+          std::uint32_t offset = 0;
+          while (row < end) {
+            // The probe budgets source SGEs as well as WRs against SQ depth.
+            // Continue large requests in another drained wave without narrowing
+            // BatchGet's existing maximum request/token sizes.
+            if (waves.back().local.size() + max_sge_ > kJettyDepth) waves.emplace_back();
+            auto& q = waves.back();
+            const auto first_local = static_cast<std::uint32_t>(q.local.size());
+            const auto first_row = row;
+            const auto destination_offset = std::uint64_t{row} * token_bytes_ + offset;
+            const auto destination = (direct_output_ ? output_.base : hbm_base_ + layout_.staging) + destination_offset;
+            std::uint32_t bytes = 0, sges = 0;
+            while (row < end && sges < max_sge_ && bytes < max_bytes_) {
+              const auto length = std::min(token_bytes_ - offset, max_bytes_ - bytes);
+              if (!unsplit)
+                q.sources.push_back({static_cast<std::uint32_t>(q.local.size()), row, offset});
+              q.local.push_back({0, length, source_, nullptr});
+              ++sges; bytes += length; offset += length;
+              if (offset == token_bytes_) { ++row; offset = 0; }
+            }
+            if (unsplit) {
+              // Walk the contiguous descriptor entries directly for whole-token SGEs.
+              if (!q.source_runs.empty() &&
+                  q.source_runs.back().local + q.source_runs.back().count == first_local &&
+                  q.source_runs.back().row + q.source_runs.back().count == first_row)
+                q.source_runs.back().count += sges;
+              else
+                q.source_runs.push_back({first_local, first_row, sges});
+            }
+            q.destinations.push_back({static_cast<std::uint32_t>(q.wrs.size()), destination_offset});
+            AppendPrepared(q, queue, destination, bytes, sges);
+          }
+          if (payload_only_ || pipeline_) return;  // Direct output consumes only the final done token.
+          if (waves.back().local.size() == kJettyDepth) waves.emplace_back();
+          auto& q = waves.back();
+          auto* marker = reinterpret_cast<std::uint64_t*>(memory_ + layout_.staging) +
+              (worker * kMaxChunks + chunk) * kJettyCount + queue;
+          q.markers.push_back({marker, chunk + 1, static_cast<std::uint32_t>(q.local.size())});
+          q.local.push_back({reinterpret_cast<std::uint64_t>(marker), 8, control_, nullptr});
+          AppendPrepared(q, queue, hbm_base_ + layout_.ready + worker * sizeof(Ready) + queue * 8,
+                         8, 1, true);
+        });
+    }
+    std::size_t waves = 0;
+    for (const auto& shard : shards) waves = std::max(waves, shard.size());
+    for (std::size_t w = 0; w < waves; ++w) {
+      auto plan = std::make_unique<PreparedWrite>();
+      for (std::uint32_t q = 0; q < kJettyCount; ++q)
+        if (w < shards[q].size()) plan->queues[q] = std::move(shards[q][w]);
+      SealPrepared(*plan);
+      if (plan->fence_count) prepared_.push_back(std::move(plan));
+    }
+    if (!phase) head_waves_ = static_cast<std::uint32_t>(prepared_.size());
   }
   prepared_count_ = count;
   RetargetWrites();
@@ -431,7 +481,7 @@ Status Transport::PrepareWrites(std::uint32_t count) {
 }
 void Transport::RetargetWrites() {
   if (!direct_output_) return;
-  BatchGetProfileScope timer(payload_only_ && profile_.enabled ? &profile_.target_update_ns : nullptr);
+  BatchGetProfileScope timer((payload_only_ || pipeline_) && profile_.enabled ? &profile_.target_update_ns : nullptr);
   for (auto& plan : prepared_)
     for (auto& q : plan->queues)
       for (const auto& destination : q.destinations) {
@@ -479,6 +529,11 @@ Status Transport::BeginPrepared(PreparedWrite& plan, std::uint64_t id) {
 }
 Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profile* profile,
                                std::uint64_t* first_post_ns) {
+  if (pipeline_ && profile) {
+    profile->cpu_threads = 1;
+    ++profile->waves;
+    for (const auto& q : plan.queues) profile->data_wrs += static_cast<std::uint32_t>(q.wrs.size());
+  }
   std::size_t posts = 0;
   for (const auto& q : plan.queues) posts = std::max(posts, q.posts.size());
   // Give every Jetty a doorbell before preparing the next slice of any Jetty.
@@ -487,7 +542,10 @@ Status Transport::PostPrepared(PreparedWrite& plan, bool refresh_sources, Profil
       auto& q = plan.queues[queue];
       if (batch >= q.posts.size()) continue;
       const auto& post = q.posts[batch];
-      if (refresh_sources) RefreshPrepared(q, post);
+      if (refresh_sources) {
+        BatchGetProfileScope timer(pipeline_ && profile_.enabled ? &profile_.source_sge_update_ns : nullptr);
+        RefreshPrepared(q, post);
+      }
       const auto start = (profile || first_post_ns) ? BatchGetProfileNowNs() : 0;
       urma_jfs_wr_t* bad = nullptr;
       if (urma_post_jetty_send_wr(queues_[queue].channel.local_jetty, &q.wrs[post.wr], &bad)) {
@@ -579,15 +637,99 @@ Status Transport::WritePayloadOnly() {
   }
   return Status::OK();
 }
+Status Transport::WritePipeline() {
+  auto* p = profile_.enabled ? &profile_ : nullptr;
+  // Retain the last head wave in flight while consuming suffix publication.
+  for (std::uint32_t w = 0; w < head_waves_; ++w) {
+    auto& plan = *prepared_[w];
+    auto status = BeginPrepared(plan, w + 1);
+    if (!status.ok()) return status;
+    {
+      BatchGetProfileScope timer(p ? &p->head_submit_ns : nullptr);
+      status = PostPrepared(plan, true, p);
+    }
+    if (!status.ok()) return status;
+    if (w + 1 < head_waves_) {
+      BatchGetProfileScope timer(p ? &p->head_cq_wait_ns : nullptr);
+      status = PollPrepared(w + 1, p);
+      if (!status.ok()) return status;
+    }
+  }
+  Status status;
+  {
+    BatchGetProfileScope timer(p ? &p->suffix_wait_ns : nullptr);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kTimeoutMs);
+    for (;;) {
+      status = Transfer(false, kSuffixNotifyOffset, 8);
+      if (!status.ok()) return status;
+      const auto token = *reinterpret_cast<const std::uint64_t*>(memory_ + kSuffixNotifyOffset);
+      const auto sequence = token >> 32;
+      if (sequence > request().sequence) { batch_result_ = Result::kSequenceError; break; }
+      if (sequence == request().sequence) {
+        const auto result = static_cast<std::uint32_t>(token);
+        batch_result_ = result >= std::uint32_t(Result::kOk) && result <= std::uint32_t(Result::kCopyError)
+            ? static_cast<Result>(result) : Result::kInvalidRequest;
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) { batch_result_ = Result::kTimeout; break; }
+    }
+  }
+  const bool read_suffix = batch_result_ == Result::kOk && head_count_ < request().count;
+  const auto reading = p && read_suffix ? BatchGetProfileNowNs() : 0;
+  if (read_suffix) {
+    status = BeginControlRead(layout_.descriptor + std::uint64_t{head_count_} * 8,
+                              std::uint64_t{request().count - head_count_} * 8);
+    if (!status.ok()) return status;
+  }
+  if (read_suffix) {
+    status = Wait(control_queue_);
+    if (p) p->suffix_read_ns = BatchGetProfileNowNs() - reading;
+    if (!status.ok()) return status;
+    // Invalid suffix addresses never become SGE addresses or data WRs.
+    if (!ValidateSources(head_count_, request().count).ok()) batch_result_ = Result::kInvalidRequest;
+    if (batch_result_ == Result::kOk) {
+      // Prepare the suffix while the head DMA is still in flight. Every wave
+      // has independent WR/SGE storage, so no submitted entry is overwritten.
+      BatchGetProfileScope timer(p ? &p->source_sge_update_ns : nullptr);
+      for (std::size_t w = head_waves_; w < prepared_.size(); ++w)
+        for (auto& q : prepared_[w]->queues)
+          for (const auto& post : q.posts) RefreshPrepared(q, post);
+    }
+  }
+  {
+    BatchGetProfileScope timer(p ? &p->head_cq_wait_ns : nullptr);
+    status = PollPrepared(head_waves_, p);
+  }
+  if (!status.ok()) return status;
+  if (batch_result_ != Result::kOk) return Status::OK();  // Worker publishes the failure after the head drained.
+  for (std::size_t w = head_waves_; w < prepared_.size(); ++w) {
+    auto& plan = *prepared_[w];
+    status = BeginPrepared(plan, w + 1);
+    if (!status.ok()) return status;
+    {
+      BatchGetProfileScope timer(p ? &p->suffix_submit_ns : nullptr);
+      status = PostPrepared(plan, false, p);
+    }
+    if (!status.ok()) return status;
+    {
+      BatchGetProfileScope timer(p ? &p->suffix_cq_wait_ns : nullptr);
+      status = PollPrepared(w + 1, p);
+    }
+    if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
 Status Transport::WriteBatch() {
   BatchGetProfileScope timer(profile_.enabled ? &profile_.write_ns : nullptr);
   Status status;
   {
-    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.prepare_writes_ns : nullptr);
+    BatchGetProfileScope stage((payload_only_ || pipeline_) && profile_.enabled ? &profile_.prepare_writes_ns : nullptr);
     status = PrepareWrites(request().count);
   }
   if (!status.ok()) return status;
   if (payload_only_) return WritePayloadOnly();
+  if (pipeline_) return WritePipeline();
   // Match the ordered-WRITE probe: short submissions to all four queues from
   // their owner, then poll their tails together. Avoid waking an OpenMP team
   // and crossing several team barriers for each short request.
@@ -621,7 +763,7 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   // as the kernel observes completion; cached plans are retargeted next round.
   if (output_remote_) {
     if (!tracker_.Empty()) return Error("output WRITE is still in flight");
-    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.output_unimport_ns : nullptr);
+    BatchGetProfileScope stage((payload_only_ || pipeline_) && profile_.enabled ? &profile_.output_unimport_ns : nullptr);
     if (urma_unimport_seg(output_remote_)) return Error("unimport output segment");
     output_remote_ = nullptr;
   }
@@ -630,20 +772,44 @@ Status Transport::Complete(std::uint64_t sequence, Result result) {
   if (payload_only_ && result == Result::kOk) done->cpu_sgl_write = payload_sample_;
   auto status = BeginPrepared(done_, UINT64_MAX);
   if (status.ok()) {
-    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.done_post_ns : nullptr);
+    BatchGetProfileScope stage((payload_only_ || pipeline_) && profile_.enabled ? &profile_.done_post_ns : nullptr);
     status = PostPrepared(done_);
   }
   if (status.ok()) {
-    BatchGetProfileScope stage(payload_only_ && profile_.enabled ? &profile_.done_cq_wait_ns : nullptr);
+    BatchGetProfileScope stage((payload_only_ || pipeline_) && profile_.enabled ? &profile_.done_cq_wait_ns : nullptr);
     status = PollPrepared(UINT64_MAX);
   }
-  if (payload_only_ && profile_.enabled && profile_.cpu_start_ns)
+  if ((payload_only_ || pipeline_) && profile_.enabled && profile_.cpu_start_ns)
     profile_.cpu_total_ns = BatchGetProfileNowNs() - profile_.cpu_start_ns;
   return status;
 }
 
 void Transport::PrintProfile() const {
   if (!profile_.enabled) return;
+  if (pipeline_) {
+    const auto& p = profile_;
+    std::fprintf(stderr,
+        "CPU_SGL_PIPELINE_PROFILE sequence=%" PRIu64 " rows=%u head_rows=%u"
+        " notify_read_us=%.3f head_read_us=%.3f plan_us=%.3f"
+        " head_first_post_us=%.3f head_submit_us=%.3f suffix_wait_us=%.3f"
+        " suffix_read_us=%.3f head_cq_wait_us=%.3f suffix_submit_us=%.3f suffix_cq_wait_us=%.3f"
+        " header_read_us=%.3f output_desc_read_us=%.3f output_import_us=%.3f"
+        " address_validate_us=%.3f source_sge_update_us=%.3f target_update_us=%.3f"
+        " output_unimport_us=%.3f done_post_us=%.3f done_cq_wait_us=%.3f cpu_total_us=%.3f"
+        " data_wrs=%u ready_wrs=0 post_calls=%u waves=%u tail_cqes=%u plan_reused=%u result=%u\n",
+        request().sequence, request().count, head_count_,
+        p.notify_read_ns / 1000.0, p.address_list_read_ns / 1000.0,
+        (p.prepare_writes_ns - p.target_update_ns) / 1000.0,
+        (p.first_post_ns ? p.first_post_ns - p.cpu_start_ns : 0) / 1000.0,
+        p.head_submit_ns / 1000.0, p.suffix_wait_ns / 1000.0, p.suffix_read_ns / 1000.0,
+        p.head_cq_wait_ns / 1000.0, p.suffix_submit_ns / 1000.0, p.suffix_cq_wait_ns / 1000.0,
+        p.header_read_ns / 1000.0, p.output_desc_read_ns / 1000.0, p.output_import_ns / 1000.0,
+        p.address_validate_ns / 1000.0, p.source_sge_update_ns / 1000.0, p.target_update_ns / 1000.0,
+        p.output_unimport_ns / 1000.0, p.done_post_ns / 1000.0, p.done_cq_wait_ns / 1000.0,
+        p.cpu_total_ns / 1000.0, p.data_wrs, p.post_calls, p.waves, p.tail_cqes,
+        unsigned(p.plan_reused), unsigned(batch_result_));
+    return;
+  }
   if (payload_only_) {
     std::fprintf(stderr, "CPU_SGL_WRITE_SAMPLE sequence=%" PRIu64 " bytes=%" PRIu64
                  " elapsed_ns=%" PRIu64 " data_wrs=%u ready_wrs=0 waves=%u tail_cqes=%u\n",
@@ -693,7 +859,8 @@ void Transport::PrintProfile() const {
 Status Transport::Shutdown() {
   // Deleting the initiator queues stops all DMA, including partial-post failures.
   // Do not let UrmaChannel's best-effort destructor discard a failed deletion.
-  for (auto& q : queues_) {
+  for (std::uint32_t i = 0; i <= kJettyCount; ++i) {
+    auto& q = i == kJettyCount ? control_queue_ : queues_[i];
     auto& c = q.channel;
     if (c.local_jetty) {
       if (urma_delete_jetty(c.local_jetty)) return Error("delete Jetty; DMA resources retained");
@@ -726,6 +893,7 @@ Status Transport::Shutdown() {
   prepared_count_ = UINT32_MAX;
   next_poll_queue_ = 0;
   for (auto& q : queues_) { ResetRequests(q); q.poisoned = false; q.sequence = 0; }
+  ResetRequests(control_queue_); control_queue_.poisoned = false; control_queue_.sequence = 0;
   std::free(memory_); memory_ = nullptr;
   context_ = nullptr;
   return Status::OK();

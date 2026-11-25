@@ -18,6 +18,7 @@ struct Config {
   // AIV uses the same CPU producer and registration lifecycle with its own
   // device kernel. kernel_json then names an AIV binary object.
   bool aiv{false};
+  bool sgl_pipeline{false};
 };
 class CpuPushTransport {
  public:

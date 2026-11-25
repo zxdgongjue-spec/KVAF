@@ -219,9 +219,11 @@ struct NpuRuntime::Impl {
         throw std::invalid_argument("in-flight limit is configurable only for URMA AIV Get");
       if (r.cpu_threads && (!get || algorithm != GetAlgorithm::Gather || e != Executor::Aicpu))
         throw std::invalid_argument("CPU thread budget requires AICPU Gather");
-      if ((r.sge_per_wr || r.sgl_payload_only) && (!get || t != Transport::Urma ||
+      if ((r.sge_per_wr || r.sgl_payload_only || r.sgl_pipeline) && (!get || t != Transport::Urma ||
                            algorithm != GetAlgorithm::CpuSglWrite))
         throw std::invalid_argument("SGL write resources require URMA CPU SGL Write Get");
+      if (r.sgl_pipeline && r.sgl_payload_only)
+        throw std::invalid_argument("sgl_pipeline and sgl_payload_only are mutually exclusive");
       if (!r.kernel_path.empty() && e == Executor::Aicpu)
         throw std::invalid_argument("AICPU kernel package is resolved through the CANN installation");
     }
@@ -357,7 +359,7 @@ struct NpuRuntime::Impl {
       if (get && algorithm == GetAlgorithm::CpuSglWrite)
         return cpu_push::CreateAivCpuSglWriteOperator(cpu_push::Config{
             link, budget.kernel_path, eids.front(), options.batch_get_token_bytes, budget.cores,
-            true, budget.sge_per_wr, budget.sgl_payload_only, true});
+            true, budget.sge_per_wr, budget.sgl_payload_only, true, budget.sgl_pipeline});
       AccessOperatorConfig c;
       c.peer_local = cache_peer_local;
       c.peer_link = link;
@@ -383,7 +385,7 @@ struct NpuRuntime::Impl {
         kernel_package.json_path, budget.cores, link, options.batch_get_token_bytes,
         algorithm == GetAlgorithm::CpuSglWrite ? "cpu_sgl_write" :
         algorithm == GetAlgorithm::Scatter ? "cpu_push_scatter" : "gather_read",
-        eids.front(), get, budget.sge_per_wr, budget.sgl_payload_only});
+        eids.front(), get, budget.sge_per_wr, budget.sgl_payload_only, budget.sgl_pipeline});
 #else
     throw std::invalid_argument("requested execution provider was not built");
 #endif

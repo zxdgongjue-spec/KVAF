@@ -50,7 +50,7 @@ void Worker::Run() {
       return;
     }
     status = transport_->WriteBatch();
-    if (status.ok()) status = transport_->Complete(sequence, Result::kOk);
+    if (status.ok()) status = transport_->Complete(sequence, transport_->batch_result());
     if (!status.ok()) { std::fprintf(stderr, "CPU_PUSH: %s\n", status.message().c_str()); return; }
     transport_->PrintProfile();
   }

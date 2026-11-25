@@ -27,6 +27,7 @@ class Transport {
   Status Shutdown();
   const Request& request() const { return *reinterpret_cast<const Request*>(memory_); }
   const Layout& layout() const { return layout_; }
+  Result batch_result() const { return batch_result_; }
  private:
   struct Profile {
     bool enabled{};
@@ -38,6 +39,8 @@ class Transport {
     std::uint64_t prepare_writes_ns{}, target_update_ns{}, source_sge_update_ns{}, data_begin_ns{};
     std::uint64_t payload_post_ns{}, payload_cq_wait_ns{};
     std::uint64_t output_unimport_ns{}, done_post_ns{}, done_cq_wait_ns{};
+    std::uint64_t head_submit_ns{}, head_cq_wait_ns{}, suffix_wait_ns{}, suffix_read_ns{};
+    std::uint64_t suffix_submit_ns{}, suffix_cq_wait_ns{};
     std::uint32_t data_wrs{}, ready_wrs{}, post_calls{}, waves{}, tail_cqes{}, cpu_threads{};
     bool plan_reused{};
   } profile_;
@@ -78,6 +81,9 @@ class Transport {
   Status PostPrepared(PreparedWrite&, bool refresh_sources = false, Profile* profile = nullptr,
                       std::uint64_t* first_post_ns = nullptr);
   Status WritePayloadOnly();
+  Status WritePipeline();
+  Status ValidateSources(std::uint32_t begin, std::uint32_t end);
+  Status BeginControlRead(std::uint64_t offset, std::uint64_t bytes);
   Status PollPrepared(std::uint64_t id, Profile* profile = nullptr);
   void RefreshPrepared(PreparedQueue&, const PreparedQueue::Post&);
   Status Transfer(bool write, std::uint64_t offset, std::uint64_t bytes);
@@ -87,10 +93,12 @@ class Transport {
            std::uint32_t first_sge, std::uint32_t sges);
   void ResetRequests(Queue&);
   std::array<Queue, kJettyCount> queues_;
+  Queue control_queue_;
   std::vector<std::unique_ptr<PreparedWrite>> prepared_;
   PreparedWrite done_;
   Tracker tracker_{kJettyCount, 8192};
   std::uint32_t prepared_count_{UINT32_MAX}, next_poll_queue_{};
+  std::uint32_t head_count_{}, head_waves_{};
   urma_context_t* context_{};
   urma_target_seg_t* source_{};
   urma_target_seg_t* remote_{};
@@ -98,6 +106,8 @@ class Transport {
   OutputTarget output_;
   bool direct_output_{};
   bool payload_only_{};
+  bool pipeline_{};
+  Result batch_result_{Result::kOk};
   CpuSglWriteSample payload_sample_{};
   urma_target_seg_t* control_{};
   urma_token_id_t* control_token_{};

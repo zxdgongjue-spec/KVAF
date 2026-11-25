@@ -16,6 +16,29 @@ from utils.perf_execution import BenchmarkExecution
 
 
 class CpuSglOptionsTest(unittest.TestCase):
+    def test_pipeline_configuration_and_csv(self):
+        kvaf = SimpleNamespace(ExecutionResources=lambda **kw: kw,
+                               PutExecutionConfig=lambda *args: args,
+                               GetExecutionConfig=lambda *args: args)
+        for backend, executor in (("cpu_sgl_write", "aicpu"), ("aiv_cpu_sgl_write", "aiv")):
+            args = parse_args(["--backend", backend, "--sgl-pipeline"])
+            self.assertIsNone(validate_args(args))
+            self.assertTrue(parse_args(workload_command(args)).sgl_pipeline)
+            execution = BenchmarkExecution(kvaf, executor=executor, algorithm="cpu_sgl_write", sgl_pipeline=True)
+            self.assertTrue(execution.runtime_kwargs["get_resources"][0][1]["sgl_pipeline"])
+            self.assertNotIn("sgl_pipeline", execution.runtime_kwargs["put_resources"][0][1])
+            with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+                args.output_dir = Path(directory)
+                report = BatchGetCsv(args)
+                report.add_summary("eager", {})
+                report.write()
+                with report.summary_path.open() as source:
+                    self.assertEqual(next(csv.DictReader(source))["sgl_pipeline"], "1")
+            both = parse_args(["--backend", backend, "--sgl-pipeline", "--sgl-payload-only"])
+            self.assertIn("--sgl-pipeline", validate_args(both))
+        for backend in ("aiv", "ubmem", "gather_read", "cpu_push_scatter"):
+            self.assertIn("--sgl-pipeline", validate_args(parse_args(["--backend", backend, "--sgl-pipeline"])))
+
     def test_sge_values_and_worker_forwarding(self):
         for count in (0, 4, 8):
             with self.subTest(count=count):

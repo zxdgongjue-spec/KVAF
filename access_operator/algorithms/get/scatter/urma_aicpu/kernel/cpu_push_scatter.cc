@@ -42,6 +42,7 @@ struct Execution {
   Coordination& coordination;
   std::uint64_t start, timeout;
   BatchGetWorkerProfile* profile;
+  bool pipeline{};
   std::uint32_t idle_polls{};
   std::uint8_t* Memory() const { return reinterpret_cast<std::uint8_t*>(args.workspace); }
   void Relax(bool check_remote = true) {
@@ -103,6 +104,19 @@ struct Execution {
     if (profile) profile->scatter_copies += range.end - range.begin;
     return copied;
   }
+  bool FillSources(Range range) {
+    const auto& r = args.request;
+    const auto* addresses = reinterpret_cast<const std::uint64_t*>(r.address_table);
+    const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
+    const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
+    const auto* rows = reinterpret_cast<const std::int32_t*>(r.output_indices);
+    auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
+    for (auto i = range.begin; i < range.end; ++i) {
+      if (output_target && rows[i] != static_cast<std::int32_t>(i)) return false;
+      sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
+    }
+    return true;
+  }
   bool Build(std::uint32_t worker, std::uint32_t* count, Range* range) {
     const auto& r = args.request;
     BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
@@ -115,21 +129,16 @@ struct Execution {
       return false;
     *count = active;
     *range = WorkerRange(*count, r.token_bytes, worker, args.workers);
-    if (range->begin == range->end) return true;
-    const auto* addresses = reinterpret_cast<const std::uint64_t*>(r.address_table);
-    const auto* indices = reinterpret_cast<const std::int32_t*>(r.indices);
-    const auto* offsets = reinterpret_cast<const std::int32_t*>(r.offsets);
-    auto* sources = reinterpret_cast<std::uint64_t*>(Memory() + layout.descriptor);
-    const auto* rows = reinterpret_cast<const std::int32_t*>(r.output_indices);
-    // Reject the whole request before notify, so unsupported mappings never
-    // cause partial DMA writes. Inactive output_indices remain irrelevant.
-    for (auto i = range->begin; i < range->end; ++i) {
-      if (direct && rows[i] != static_cast<std::int32_t>(i)) return false;
-      sources[i] = addresses[indices[i]] + static_cast<std::uint32_t>(offsets[i]);
-    }
+    // Baseline validates the whole mapping before notify. Pipeline validates
+    // the head before notify, then publishes suffix success/failure separately.
+    const auto head = std::min(*count, kPipelineHeadRows);
+    const auto build_range = !pipeline ? *range : !worker ? Range{0, head} :
+        Range{std::max(range->begin, head), std::max(range->end, head)};
+    if (!FillSources(build_range)) return false;
     if (!worker) {
       auto* header = reinterpret_cast<Request*>(Memory() + layout.request);
       *header = {kMagic, args.sequence, *count, r.token_bytes, args.workers, direct ? kDirectOutput : kScatterOutput, {}};
+      if (pipeline) header->reserved_words[0] = head;
       if (direct)
         *reinterpret_cast<OutputTarget*>(Memory() + layout.output_target) = *output_target;
     }
@@ -145,7 +154,7 @@ struct Execution {
 };
 }  // namespace
 
-static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target) {
+static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output_target, bool pipeline = false) {
   Layout layout;
   if (!args || !args->workspace || !args->coordination || !args->status || !args->timeout_ms ||
       !MakeLayout(args->request.token_bytes, args->workers, &layout, output_target != nullptr)) return 1;
@@ -163,16 +172,33 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   auto* profile = args->profile ? &measured : nullptr;
   if (profile) profile->enter_ns = BatchGetProfileNowNs();
   Execution io{*args, output_target, layout, c, CounterNow(),
-      CounterFrequency() * args->timeout_ms / 1000, profile};
+      CounterFrequency() * args->timeout_ms / 1000, profile, pipeline};
   std::uint32_t count = 0;
   Range range{};
   if (io.Status() == Result::kPending && !io.Build(worker, &count, &range))
     Fail(c, Result::kInvalidRequest);
+  bool head_notified = false;
+  if (pipeline && !worker && count && io.Status() == Result::kPending) {
+    io.Notify();
+    head_notified = true;
+    Store(c.published, args->sequence);
+    BatchGetProfileScope timer(profile ? &profile->request_ns : nullptr);
+    if (!io.FillSources({std::max(range.begin, std::min(count, kPipelineHeadRows)), range.end}))
+      Fail(c, Result::kInvalidRequest);
+    Barrier();
+  }
   // Empty slices participate as well, keeping the target independent of shape.
   __atomic_fetch_add(&c.built.value, 1, __ATOMIC_ACQ_REL);
   if (!worker) {
-    if (io.Wait(c.built, target, false) && io.Status() == Result::kPending) {
-      if (count) io.Notify();
+    const bool built = io.Wait(c.built, target, false);
+    if (head_notified) {
+      const auto result = io.Status() == Result::kPending && built ? Result::kOk : io.Status();
+      auto* suffix = reinterpret_cast<Word*>(io.Memory() + layout.notify);
+      __atomic_store_n(&suffix->reserved[0], Progress(args->sequence, std::uint32_t(result)), __ATOMIC_RELEASE);
+      Barrier();
+    }
+    if (built && io.Status() == Result::kPending) {
+      if (count && !pipeline) io.Notify();
       Store(c.published, args->sequence);
     }
   } else {
@@ -187,15 +213,24 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
   }
   __atomic_fetch_add(&c.arrivals.value, 1, __ATOMIC_ACQ_REL);
   if (!worker) {
-    if (io.Wait(c.arrivals, target) && Load(c.result) == 0 && count) {
+    const bool arrived = io.Wait(c.arrivals, target);
+    if ((head_notified || (arrived && Load(c.result) == 0)) && count) {
       {
         BatchGetProfileScope timer(profile ? &profile->ack_ns : nullptr);
         for (;;) {
-          const auto result = io.Check();
+          // A pipelined head may already be in flight after suffix validation
+          // fails. Ignore the local failure until CPU publishes drained done.
+          const auto result = head_notified ? (io.Now() - io.start >= io.timeout ? Result::kTimeout : Result::kPending) : io.Check();
           if (result != Result::kPending) { Fail(c, result); break; }
+          Barrier();
           const auto token = reinterpret_cast<volatile Completion*>(io.Memory() + layout.done)->token;
-          if ((token >> 32) == args->sequence) break;
-          io.Relax();
+          if ((token >> 32) > args->sequence) { Fail(c, Result::kSequenceError); break; }
+          if ((token >> 32) == args->sequence) {
+            if (std::uint32_t(token) != std::uint32_t(Result::kOk))
+              Fail(c, static_cast<Result>(std::uint32_t(token)));
+            break;
+          }
+          io.Relax(!head_notified);
         }
       }
     }
@@ -223,6 +258,6 @@ static std::uint32_t ExecuteCpuPush(KernelArgs* args, const OutputTarget* output
 }
 std::uint32_t ExecuteCpuPushScatter(KernelArgs* args) { return ExecuteCpuPush(args, nullptr); }
 std::uint32_t ExecuteCpuSglWrite(CpuSglWriteArgs* args) {
-  return args ? ExecuteCpuPush(&args->execution, &args->output_target) : 1;
+  return args ? ExecuteCpuPush(&args->execution, &args->output_target, (args->execution.sequence & kPipelineLaunch) != 0) : 1;
 }
 }  // namespace kvaf::cpu_push

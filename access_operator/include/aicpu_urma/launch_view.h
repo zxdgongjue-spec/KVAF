@@ -69,5 +69,6 @@ struct ScatterLaunchView {
   bool profiling{false};
   bool direct_output{false};
   cpu_push::OutputTarget output_target;
+  bool sgl_pipeline{false};
 };
 }  // namespace kvaf::aicpu_urma

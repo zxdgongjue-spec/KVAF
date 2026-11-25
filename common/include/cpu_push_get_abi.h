@@ -16,6 +16,13 @@ constexpr std::uint64_t kProfileNotify = std::uint64_t{1} << 63;
 constexpr std::uint32_t kScatterOutput = 0, kDirectOutput = 1, kOutputSegmentBytes = 64;
 // Setup-only mode. The device still issues normal kDirectOutput requests.
 constexpr std::uint32_t kPayloadOnlyOutput = 2;
+// Head/suffix direct output. Request::reserved_words[0] commits the head
+// length; notify.reserved[0] later publishes Progress(sequence, Result).
+constexpr std::uint32_t kPipelinedOutput = 3, kPipelineHeadRows = 1024;
+constexpr std::uint64_t kSuffixNotifyOffset = 72;
+// Host launch hint in KernelArgs::sequence; device tickets still own the real
+// request sequence. Existing Hosts initialize this field to zero.
+constexpr std::uint64_t kPipelineLaunch = std::uint64_t{1} << 62;
 struct alignas(64) OutputTarget {
   std::uint64_t base{}, bytes{};
   std::uint32_t token_value{}, segment_bytes{};

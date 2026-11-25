@@ -12,6 +12,7 @@ struct UmdkAccessOperatorConfig {
   bool enable_get{true};
   std::uint32_t sge_per_wr{0};
   bool sgl_payload_only{false};
+  bool sgl_pipeline{false};
 };
 // Runtime adapter with independent UMDK Put/Get sessions;
 // cpu_push_scatter/cpu_sgl_write own an independent Host-side direct HCCP target.

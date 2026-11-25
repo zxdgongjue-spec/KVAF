@@ -46,3 +46,12 @@ cp runtime/cmake/npu_kernel_paths.h.in "$KVAF_SGL_BUILD/generated/npu_kernel_pat
   -Iaccess_operator/algorithms/get/direct/urma_aiv/include -I"$KVAF_SGL_BUILD/generated" \
   runtime/src/npu_runtime.cc
 python3 -m unittest discover -s tests/diagnostics -p 'test_*.py'
+if [[ -n "${KVAF_TEST_URMA_INCLUDE_DIR:-}" ]]; then
+  "$KVAF_SGL_CXX" -std=c++17 -O1 -g -pthread -fsanitize=address,undefined "${includes[@]}" \
+    -Iruntime -I"$KVAF_TEST_URMA_INCLUDE_DIR" \
+    tests/diagnostics/cpu_sgl_transport.cc runtime/cpu_service/push/cpu_push_get_transport.cc \
+    -o "$KVAF_SGL_BUILD/transport"
+  "$KVAF_SGL_BUILD/transport"
+else
+  printf '%s\n' 'SKIP: fake URMA transport requires KVAF_TEST_URMA_INCLUDE_DIR'
+fi

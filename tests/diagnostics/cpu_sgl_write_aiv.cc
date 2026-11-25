@@ -76,7 +76,8 @@ struct Fixture {
     assert(request->magic == kMagic && request->sequence == sequence && request->count == uint32_t(count));
     assert(request->mode == kDirectOutput && request->workers == args.execution.workers);
     assert(request->token_bytes == kBytes);
-    for (auto reserved : request->reserved_words) assert(reserved == 0);
+    assert(request->reserved_words[0] == ((args.execution.sequence & kPipelineLaunch) ? std::min(uint32_t(count), kPipelineHeadRows) : 0U));
+    for (uint32_t i = 1; i < 4; ++i) assert(request->reserved_words[i] == 0);
     const auto* target = reinterpret_cast<OutputTarget*>(args.execution.workspace + layout.output_target);
     assert(target->base == args.execution.output && target->bytes == output.size());
     assert(target->token_value == args.output_target.token_value);
@@ -84,6 +85,11 @@ struct Fixture {
     assert(!std::memcmp(target->segment, args.output_target.segment, kOutputSegmentBytes));
   }
   void Complete(uint64_t sequence, Result result = Result::kOk) {
+    if ((args.execution.sequence & kPipelineLaunch)) {
+      const auto deadline = std::chrono::steady_clock::now() + 5s;
+      while ((sgl_model::Load(args.execution.workspace + kSuffixNotifyOffset) >> 32) != sequence)
+        assert(std::chrono::steady_clock::now() < deadline);
+    }
     if (result == Result::kOk) {
       const auto* sources = reinterpret_cast<uint64_t*>(args.execution.workspace + layout.descriptor);
       for (int32_t i = 0; i < count; ++i) {
@@ -120,8 +126,9 @@ struct Fixture {
 };
 }
 int main() {
-  for (uint32_t workers : {1U, 4U, 8U}) {
+  for (bool pipeline : {false, true}) for (uint32_t workers : {1U, 4U, 8U}) {
     Fixture f(workers);
+    f.args.execution.sequence = pipeline ? kPipelineLaunch : 0;
     uint64_t sequence = 0;
     for (uint32_t count : {9001U, 7U, 0U, 1U, 4097U}) {
       f.count = count; ++sequence;
@@ -142,6 +149,17 @@ int main() {
       f.indices[0] = (f.indices[0] + 1) % kCapacity;
     }
   }
+  {
+    Fixture f(1); f.args.execution.sequence = kPipelineLaunch; f.count = kCapacity; f.rows[7000] = -1;
+    auto work = f.Launch(); f.WaitNotify(1);
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while ((sgl_model::Load(f.args.execution.workspace + kSuffixNotifyOffset) >> 32) != 1)
+      assert(std::chrono::steady_clock::now() < deadline);
+    assert(uint32_t(sgl_model::Load(f.args.execution.workspace + kSuffixNotifyOffset)) == uint32_t(Result::kInvalidRequest));
+    assert(work[0].wait_for(1ms) == std::future_status::timeout);
+    f.Complete(1, Result::kInvalidRequest);
+    f.Check(work, 1, Result::kInvalidRequest);
+  }
   for (int fault = 0; fault < 8; ++fault) {
     Fixture f(4); f.count = kCapacity;
     if (fault == 0) f.rows[7000] = 0; // Failure outside core zero's slice.
@@ -158,6 +176,12 @@ int main() {
     f.rows[7000] = 7000; // A queued replay cannot clear a prior device failure.
     work = f.Launch(); f.Check(work, 2, Result::kInvalidRequest);
     assert(sgl_model::Load(f.args.execution.workspace + f.layout.notify) == 0);
+  }
+  {
+    Fixture f(4); f.args.execution.sequence = kPipelineLaunch; f.count = kCapacity; f.rows[17] = -1;
+    auto work = f.Launch(); f.Check(work, 1, Result::kInvalidRequest);
+    assert(sgl_model::Load(f.args.execution.workspace + f.layout.notify) == 0);
+    for (auto byte : f.output) assert(byte == 0xcc);
   }
   {
     Fixture f(4); f.count = 7;
